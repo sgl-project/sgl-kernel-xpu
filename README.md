@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # SGL Kernel for XPU
 
 A fork of [Kernel Library](https://github.com/sgl-project/sglang/tree/main/sgl-kernel) for SGLang support on Intel GPU backend
@@ -47,10 +46,10 @@ CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) python -m uv build --wheel -Cbuild-dir=build
 
 Steps to add a new kernel:
 
-1. Implement the kernel in [csrc](https://github.com/sgl-project/sgl-kernel-xpu/tree/main/csrc/xpu/)
+1. Implement the kernel in [csrc](https://github.com/sgl-project/sgl-kernel-xpu/tree/main/src/)
 2. Expose the interface in [include/sgl_kernel_ops.h](https://github.com/sgl-project/sgl-kernel-xpu/blob/main/include/sgl_kernel_ops.h)
-3. Create torch extension in [csrc/common_extension.cc](https://github.com/sgl-project/sgl-kernel-xpu/blob/main/csrc/xpu/src/torch_extension_sycl.cc)
-4. Update [CMakeLists.txt](https://github.com/sgl-project/sgl-kernel-xpu/blob/main/csrc/xpu/CMakeLists.txt) to include new source files
+3. Create torch extension in [csrc/common_extension.cc](https://github.com/sgl-project/sgl-kernel-xpu/blob/main/src/torch_extension_sycl.cc)
+4. Update [CMakeLists.txt](https://github.com/sgl-project/sgl-kernel-xpu/blob/main/CMakeLists.txt) to include new source files
 5. Expose Python interface in [python](https://github.com/sgl-project/sgl-kernel-xpu/blob/main/python/sgl_kernel)
 
 ### Development Tips

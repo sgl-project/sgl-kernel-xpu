@@ -40,4 +40,8 @@
 # debug information files
 *.dwo
 
+# python build files
+*.pyc
+*.pyo
+
 build

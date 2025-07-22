@@ -31,7 +31,6 @@ exclude = [
 ]
 
 [tool.scikit-build]
-cmake.source-dir = "csrc/xpu"
 cmake.build-type = "Release"
 minimum-version = "build-system.requires"
 

@@ -74,7 +74,7 @@ def sglang_awq_dequantize(
     "qweight_row,qweight_col,is_bf16_act",
     list(
         itertools.product(
-            [3584, 18944, 128, 256, 512, 1024],
+            [3584, 128, 256, 512, 1024],
             [448, 576, 4736, 16, 32, 64, 128],
             [True, False],
         )

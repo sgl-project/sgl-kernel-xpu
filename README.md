@@ -17,9 +17,6 @@ source /PATH/TO/ONEAPI/setvars.sh
 pip install -v .
 ```
 
-Note:
-
-The `sgl-kernel` is rapidly evolving. If you experience a compilation failure, try using `make rebuild`.
 
 ### Build with [ccache](https://github.com/ccache/ccache)
 ```bash
@@ -35,8 +32,8 @@ python -m uv build --wheel -Cbuild-dir=build --color=always .
 
 ### Parallel Build
 
-We highly recommend you build sgl-kernel with Ninja. Ninja can automatically build sgl-kernel in parallel.
-And if you build the sgl-kernel with cmake, you need to add `CMAKE_BUILD_PARALLEL_LEVEL` for parallel build like:
+We highly recommend you build sgl-kernel-xpu with Ninja. Ninja can automatically build sgl-kernel in parallel.
+And if you build the sgl-kernel-xpu with cmake, you need to add `CMAKE_BUILD_PARALLEL_LEVEL` for parallel build like:
 
 ```bash
 CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) python -m uv build --wheel -Cbuild-dir=build --color=always .

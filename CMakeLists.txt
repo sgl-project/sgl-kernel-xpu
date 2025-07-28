@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.19.2)
 project(sgl_kernel)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 
 # Torch
 find_package(Python3 COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
@@ -27,20 +27,29 @@ include(${SGL_OPS_XPU_ROOT}/cmake/BuildFlags.cmake)
 
 include(FetchContent)
 
-# # cutlass
-# FetchContent_Declare(
-#     repo-cutlass-sycl
-#     GIT_REPOSITORY https://github.com/codeplaysoftware/cutlass-sycl.git
-#     GIT_TAG        ef9797f4327886ad231bfe853099ca022060c293
-#     GIT_SHALLOW    OFF
-# )
-# FetchContent_Populate(repo-cutlass-sycl)
+# SYCL support in cutlass
+add_compile_definitions(CUTLASS_ENABLE_SYCL)
+add_compile_definitions(SYCL_INTEL_TARGET)
+set(CUTLASS_ENABLE_SYCL ON CACHE BOOL "Enable SYCL in the cutlass" FORCE)
+set(CUTLASS_ENABLE_BENCHMARKS  OFF CACHE BOOL "Remove benchmark to avoid cmake version issue in google benchmark" FORCE)
+set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable headers only mode in cutlass" FORCE)
+
+# cutlass
+FetchContent_Declare(
+    repo-cutlass-sycl
+    GIT_REPOSITORY https://github.com/sunjiweiswift/cutlass-sycl.git
+    GIT_TAG        b15779b2d99bc392bfaa8209d547fbb8b2f5c807
+    GIT_SHALLOW    OFF
+)
+FetchContent_MakeAvailable(repo-cutlass-sycl)
+
 
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    # ${repo-cutlass-sycl_SOURCE_DIR}/include
-    # ${repo-cutlass-sycl_SOURCE_DIR}/tools/util/include
+    ${repo-cutlass-sycl_SOURCE_DIR}/include
+    ${repo-cutlass-sycl_SOURCE_DIR}/tools/util/include
+    ${repo-cutlass-sycl_SOURCE_DIR}/applications
 )
 
 add_subdirectory(${SGL_OPS_XPU_ROOT}/src)

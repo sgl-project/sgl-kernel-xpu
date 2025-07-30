@@ -25,6 +25,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
   m.impl("awq_dequantize", torch::kXPU, &awq_dequantize);
 
+  m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
+  m.impl("silu_and_mul", torch::kXPU, &silu_and_mul);
+
+  m.def("gelu_tanh_and_mul(Tensor! out, Tensor input) -> ()");
+  m.impl("gelu_tanh_and_mul", torch::kXPU, &gelu_tanh_and_mul);
+
+  m.def("gelu_and_mul(Tensor! out, Tensor input) -> ()");
+  m.impl("gelu_and_mul", torch::kXPU, &gelu_and_mul);
+
+  //m.def(
+  //    "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, Tensor cos_sin_cache, "
+  //    "Tensor pos_ids, bool interleave, int cuda_stream) -> ()");
+  //m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
   //   m.def(
   //       "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype,
   //       -> Tensor");

@@ -8,8 +8,6 @@
 
 using namespace at;
 
-namespace torch_ipex::xpu {
-namespace dpcpp {
 using DeviceId = at::DeviceIndex;
 
 static inline DeviceId dpcppGetDeviceIdOfCurrentQueue() {
@@ -202,6 +200,3 @@ uint32_t dpcppNativeVectorWidth(
   throw std::invalid_argument(
       "Invalid data type to fetch native vector width!");
 }
-
-} // namespace dpcpp
-} // namespace torch_ipex::xpu

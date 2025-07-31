@@ -111,8 +111,8 @@ void get_config(
     int64_t& wg_size,
     int64_t& num_group,
     int& vec_size) {
-    auto dev_id = torch_ipex::xpu::dpcpp::dpcppGetDeviceIdOfCurrentQueue();
-    int64_t max_wg_size = torch_ipex::xpu::dpcpp::dpcppMaxWorkGroupSize(dev_id);
+    auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
+    int64_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
     numel = out.numel();
     dim = out.size(-1);
     int64_t tokens = numel/dim;

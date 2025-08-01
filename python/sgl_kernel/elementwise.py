@@ -179,7 +179,7 @@ def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
             device=input.device,
             dtype=input.dtype,
         )
-    torch.ops.sgl_kernel.silu_and_mul.default(out, input)
+    torch.ops.sgl_kernel.silu_and_mul.default(out, input, get_cuda_stream())
     return out
 
 
@@ -194,7 +194,7 @@ def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Te
             device=input.device,
             dtype=input.dtype,
         )
-    torch.ops.sgl_kernel.gelu_tanh_and_mul.default(out, input)
+    torch.ops.sgl_kernel.gelu_tanh_and_mul.default(out, input, get_cuda_stream())
     return out
 
 
@@ -209,7 +209,7 @@ def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
             device=input.device,
             dtype=input.dtype,
         )
-    torch.ops.sgl_kernel.gelu_and_mul.default(out, input)
+    torch.ops.sgl_kernel.gelu_and_mul.default(out, input, get_cuda_stream())
     return out
 
 

@@ -100,12 +100,6 @@ static inline bool dpcppSupportAtomic64(
   return dev_prop->has_atomic64;
 }
 
-static inline bool dpcppSupportFP64(
-    DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue()) {
-  auto* dev_prop = at::xpu::getDeviceProperties(dev_id);
-  return dev_prop->has_fp64;
-}
-
 static inline int64_t dpcppMaxWorkItemsPerTile(
     DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue()) {
   auto* dev_prop = at::xpu::getDeviceProperties(dev_id);

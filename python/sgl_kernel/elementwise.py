@@ -3,9 +3,8 @@ from typing import Optional
 import torch
 from sgl_kernel.utils import get_cuda_stream, is_hopper_arch
 
-
-# These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
-# Kudos to @yzh119
+#These implementations extensively draw from and build upon the FlashInfer project https:  // github.com/flashinfer-ai/flashinfer
+#Kudos to @yzh119
 def rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -39,9 +38,7 @@ def rmsnorm(
     """
     if out is None:
         out = torch.empty_like(input)
-    if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
-    torch.ops.sgl_kernel.rmsnorm.default(out, input, weight, eps, enable_pdl)
+    torch.ops.sgl_kernel.rmsnorm.default(out, input, weight, eps)
     return out
 
 
@@ -75,10 +72,8 @@ def fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
         If None, will be automatically enabled on Hopper architecture.
     """
-    if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
     torch.ops.sgl_kernel.fused_add_rmsnorm.default(
-        input, residual, weight, eps, enable_pdl
+        input, residual, weight, eps
     )
 
 

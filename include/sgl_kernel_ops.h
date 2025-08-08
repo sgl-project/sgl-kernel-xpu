@@ -126,6 +126,11 @@ void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torc
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
 void gelu_and_mul(torch::Tensor& out, torch::Tensor& input);
+void topk_softmax(
+    at::Tensor& topk_weights,
+    at::Tensor& topk_indices,
+    at::Tensor& gating_output,
+    bool renormalize);
 void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor q,
     at::Tensor k,

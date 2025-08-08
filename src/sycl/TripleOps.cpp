@@ -10,6 +10,7 @@
 #include <sycl/sycl.hpp>
 #include <vector>
 
+#include "MemoryAccess.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 
@@ -23,19 +24,6 @@
     DPCPP_KER_STRING(fmt_var, fmt_str);       \
     DPCPP_KER_PRINTF(fmt_var, ##__VA_ARGS__); \
   }
-
-template <typename scalar_t, int vec_size>
-struct alignas(sizeof(scalar_t) * vec_size) aligned_vector_loop {
-  scalar_t val[vec_size];
-
-  scalar_t& operator[](int index) {
-    return val[index];
-  }
-
-  scalar_t const& operator[](int index) const {
-    return val[index];
-  }
-};
 
 template <typename scalar_t, typename accscalar_t>
 struct silu_mul_dpcpp_functor {

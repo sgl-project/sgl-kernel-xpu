@@ -34,6 +34,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gelu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("gelu_and_mul", torch::kXPU, &gelu_and_mul);
 
+  m.def("rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps) -> ()");
+  m.impl("rmsnorm", torch::kXPU, &rmsnorm);
+
+  m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps) -> ()");
+  m.impl("fused_add_rmsnorm", torch::kXPU, &sgl_fused_add_rmsnorm);
+
   //   m.def(
   //       "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype,
   //       -> Tensor");

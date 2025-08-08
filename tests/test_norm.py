@@ -94,14 +94,14 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
 
-"""
+
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("specify_out", [True, False])
 def test_gemma_norm(batch_size, hidden_size, dtype, specify_out):
-    x = torch.randn(batch_size, hidden_size).to(0).to(dtype)
-    w = torch.randn(hidden_size).to(0).to(dtype)
+    x = torch.randn(batch_size, hidden_size).to(device).to(dtype)
+    w = torch.randn(hidden_size).to(device).to(dtype)
 
     y_ref = gemma_rms_norm(x, w)
     if specify_out:
@@ -119,9 +119,9 @@ def test_gemma_norm(batch_size, hidden_size, dtype, specify_out):
 def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     eps = 1e-6
 
-    x = torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda")
+    x = torch.randn(batch_size, hidden_size, dtype=dtype, device=device)
     residual = torch.randn_like(x)
-    weight = torch.randn(hidden_size, dtype=dtype, device="cuda")
+    weight = torch.randn(hidden_size, dtype=dtype, device=device)
 
     x_native, residual_native = gemma_fused_add_rms_norm(
         x.clone(), residual.clone(), weight, eps
@@ -133,7 +133,7 @@ def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype):
 
     torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
-"""
+
 
 if __name__ == "__main__":
     pytest.main([__file__])

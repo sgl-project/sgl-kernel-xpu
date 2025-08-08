@@ -86,7 +86,7 @@ class RMSNormForward : public NormForward<scalar_t, mean_t, weight_t, true> {
         *(reinterpret_cast<vec_t*>(NF::Y_data + group_offset + plane_offset)) = Y_val;
       }
     }
-  };
+  }
 
   int64_t M;
   int64_t N;
@@ -134,6 +134,80 @@ class AddRMSNormForward : public RMSNormForward<scalar_t, mean_t, weight_t> {
   scalar_t* add_data;
 };
 
+template <typename scalar_t, typename mean_t, typename weight_t>
+class GemmaRMSNormForward : public RMSNormForward<scalar_t, mean_t, weight_t> {
+ public:
+  using accscalar_t = acc_type<scalar_t>;
+  typedef NormForward<scalar_t, mean_t, weight_t, true> NF;
+  typedef RMSNormForward<scalar_t, mean_t, weight_t> RNF;
+  GemmaRMSNormForward() = delete;
+  GemmaRMSNormForward(
+      scalar_t* X_data, scalar_t* Y_data, mean_t* var_data, weight_t* gamma_data, accscalar_t eps, int64_t M, int64_t N)
+      : RMSNormForward<scalar_t, mean_t, weight_t>(X_data, Y_data, var_data, gamma_data, eps, M, N){};
+  template <int vec_size, typename index_t, typename vec_t, typename weight_vec_t, typename nd_item_id>
+  void update(nd_item_id item_id, const NormConfig& cfg, accscalar_t sum_value = 0, accscalar_t sum_tmp = 0) const {
+    auto group_id = item_id.get_group(0);
+    auto group_id_foreach = item_id.get_group(1);
+    auto local_id = item_id.get_local_id(2);
+
+    index_t group_offset = group_id * cfg.Plane;
+    if (cfg.workgroup_num_foreach == 1) {
+      if (local_id == 0) {
+        RNF::reduce_project(item_id, sum_value, sum_tmp, cfg);
+      }
+      item_id.barrier(dpcpp_global_fence);
+    }
+
+    auto var_val = NF::var_data[group_id];
+    for (index_t j = local_id * vec_size; j < cfg.WGPlane; j += cfg.workgroup_size * vec_size) {
+      index_t plane_offset = group_id_foreach * cfg.WGPlane + j;
+      if (plane_offset < cfg.Plane) {
+        vec_t X_val = *(reinterpret_cast<vec_t*>(NF::X_data + group_offset + plane_offset));
+        vec_t Y_val;
+        weight_vec_t gamma_val = *(reinterpret_cast<weight_vec_t*>(NF::gamma_data + plane_offset));
+
+        for (int v = 0; v < vec_size; ++v) {
+          Y_val[v] = static_cast<scalar_t>((accscalar_t(1.0) + gamma_val[v]) * var_val * X_val[v]);
+        }
+        *(reinterpret_cast<vec_t*>(NF::Y_data + group_offset + plane_offset)) = Y_val;
+      }
+    }
+  }
+};
+
+template <typename scalar_t, typename mean_t, typename weight_t>
+class GemmaAddRMSNormForward : public AddRMSNormForward<scalar_t, mean_t, weight_t>,
+                               public GemmaRMSNormForward<scalar_t, mean_t, weight_t> {
+ public:
+  using accscalar_t = acc_type<scalar_t>;
+  typedef NormForward<scalar_t, mean_t, weight_t, true> NF;
+  typedef RMSNormForward<scalar_t, mean_t, weight_t> RNF;
+  typedef AddRMSNormForward<scalar_t, mean_t, weight_t> ARNF;
+  typedef GemmaRMSNormForward<scalar_t, mean_t, weight_t> GRNF;
+  GemmaAddRMSNormForward() = delete;
+  GemmaAddRMSNormForward(
+      scalar_t* X_data,
+      scalar_t* Y_data,
+      mean_t* var_data,
+      weight_t* gamma_data,
+      accscalar_t eps,
+      scalar_t* add_data,
+      int64_t M,
+      int64_t N)
+      : AddRMSNormForward<scalar_t, mean_t, weight_t>(X_data, Y_data, var_data, gamma_data, eps, add_data, M, N),
+        GemmaRMSNormForward<scalar_t, mean_t, weight_t>(X_data, Y_data, var_data, gamma_data, eps, M, N) {}
+  int get_update_vec_size(int Plane, int vec_size) {
+    return ARNF::get_update_vec_size(Plane, vec_size);
+  }
+  template <int vec_size, typename index_t, typename vec_t, typename weight_vec_t, typename nd_item_id>
+  void update(nd_item_id item_id, const NormConfig& cfg, accscalar_t sum_value = 0, accscalar_t sum_tmp = 0) const {
+    GRNF::template update<vec_size, index_t, vec_t, weight_vec_t, nd_item_id>(item_id, cfg, sum_value, sum_tmp);
+  }
+  template <int vec_size, typename vec_t, typename weight_vec_t, typename index_t, typename nd_item_id>
+  void reduce_combine(nd_item_id item_id, const NormConfig& cfg, accscalar_t& sum_value, accscalar_t& sum_tmp) const {
+    ARNF::template reduce_combine<vec_size, vec_t, weight_vec_t, index_t, nd_item_id>(item_id, cfg, sum_value, sum_tmp);
+  }
+};
 template <
     typename scalar_t,
     typename mean_t,
@@ -248,6 +322,7 @@ void launch_vectorized_fused_norm_kernel(Norm<scalar_t, mean_t, weight_t>& norm,
     }
   }
 }
+
 template <typename scalar_t, typename mean_t, typename weight_t>
 void RMSNormKernelImplInternal(
     const Tensor& X, const Tensor& gemma, int64_t M, int64_t N, acc_type<scalar_t> eps, Tensor& Y, Tensor& rstd) {
@@ -286,6 +361,48 @@ void FusedAddRMSNormKernelImplInternal(
 
   launch_vectorized_fused_norm_kernel<scalar_t, mean_t, weight_t, AddRMSNormForward, true>(
       add_rms_norm_forward, config);
+}
+
+template <typename scalar_t, typename mean_t, typename weight_t>
+void GemmaRMSNormKernelImplInternal(
+    const Tensor& X, const Tensor& gemma, int64_t M, int64_t N, acc_type<scalar_t> eps, Tensor& Y, Tensor& rstd) {
+  scalar_t* X_data = X.data_ptr<scalar_t>();
+  scalar_t* Y_data = Y.data_ptr<scalar_t>();
+  mean_t* var_data = rstd.data_ptr<mean_t>();
+  weight_t* gemma_data = gemma.defined() ? gemma.data_ptr<weight_t>() : nullptr;
+
+  auto config = NormConfig(M, N, 1, sizeof(scalar_t));
+  GemmaRMSNormForward<scalar_t, mean_t, weight_t> gemma_rms_norm_forward(
+      X_data, Y_data, var_data, gemma_data, eps, M, N);
+  config.workgroup_num_foreach = 1;
+  config.WGPlane = config.Plane;
+
+  launch_vectorized_fused_norm_kernel<scalar_t, mean_t, weight_t, GemmaRMSNormForward, true>(
+      gemma_rms_norm_forward, config);
+}
+
+template <typename scalar_t, typename mean_t, typename weight_t>
+void GemmaFusedAddRMSNormKernelImplInternal(
+    const Tensor& X,
+    const Tensor& gemma,
+    int64_t M,
+    int64_t N,
+    acc_type<scalar_t> eps,
+    Tensor& rstd,
+    Tensor& residual) {
+  scalar_t* X_data = X.data_ptr<scalar_t>();
+  mean_t* var_data = rstd.data_ptr<mean_t>();
+  weight_t* gemma_data = gemma.defined() ? gemma.data_ptr<weight_t>() : nullptr;
+  scalar_t* residual_data = residual.data_ptr<scalar_t>();
+
+  auto config = NormConfig(M, N, 1, sizeof(scalar_t));
+  GemmaAddRMSNormForward<scalar_t, mean_t, weight_t> gemma_add_rms_norm_forward(
+      X_data, X_data, var_data, gemma_data, eps, residual_data, M, N);
+  config.workgroup_num_foreach = 1;
+  config.WGPlane = config.Plane;
+
+  launch_vectorized_fused_norm_kernel<scalar_t, mean_t, weight_t, GemmaAddRMSNormForward, true>(
+      gemma_add_rms_norm_forward, config);
 }
 
 #define PRIVATE_CASE_TYPE(enum_type, type, ...) \
@@ -347,7 +464,7 @@ void sgl_fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::T
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
 
   DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "RMSNormKernelImpl", [&]() {
+      at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
         if (weight_.scalar_type() == kFloat) {
           rstd = at::empty({M}, input_.options().dtype(kFloat));
           FusedAddRMSNormKernelImplInternal<scalar_t, float, float>(
@@ -355,6 +472,58 @@ void sgl_fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::T
         } else {
           rstd = at::empty({M}, input_.options().dtype(kFloat));
           FusedAddRMSNormKernelImplInternal<scalar_t, float, scalar_t>(
+              input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual_);
+        }
+      });
+}
+
+void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps) {
+  auto M_N = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), weight, Tensor());
+  auto M = M_N.first;
+  auto N = M_N.second;
+
+  Tensor rstd;
+
+  if (input.numel() == 0) return;
+  Tensor input_ = (input.dim() == 1) ? input.reshape({M, N}) : input;
+  Tensor output_ = (output.dim() == 1) ? output.reshape({M, N}) : output;
+  Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
+
+  DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
+        if (weight_.scalar_type() == kFloat) {
+          rstd = at::empty({M}, input_.options().dtype(kFloat));
+          GemmaRMSNormKernelImplInternal<scalar_t, float, float>(
+              input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), output_, rstd);
+        } else {
+          rstd = at::empty({M}, input_.options().dtype(kFloat));
+          GemmaRMSNormKernelImplInternal<scalar_t, float, scalar_t>(
+              input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), output_, rstd);
+        }
+      });
+}
+
+void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps) {
+  auto M_N = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), weight, Tensor());
+  auto M = M_N.first;
+  auto N = M_N.second;
+
+  Tensor rstd;
+
+  if (input.numel() == 0) return;
+  Tensor input_ = (input.dim() == 1) ? input.reshape({M, N}) : input;
+  Tensor residual_ = (residual.dim() == 1) ? residual.reshape({M, N}) : residual;
+  Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
+
+  DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "GemmaFusedAddRMSNormKernelImpl", [&]() {
+        if (weight_.scalar_type() == kFloat) {
+          rstd = at::empty({M}, input_.options().dtype(kFloat));
+          GemmaFusedAddRMSNormKernelImplInternal<scalar_t, float, float>(
+              input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual_);
+        } else {
+          rstd = at::empty({M}, input_.options().dtype(kFloat));
+          GemmaFusedAddRMSNormKernelImplInternal<scalar_t, float, scalar_t>(
               input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual_);
         }
       });

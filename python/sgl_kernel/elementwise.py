@@ -110,9 +110,7 @@ def gemma_rmsnorm(
     """
     if out is None:
         out = torch.empty_like(input)
-    if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
-    torch.ops.sgl_kernel.gemma_rmsnorm.default(out, input, weight, eps, enable_pdl)
+    torch.ops.sgl_kernel.gemma_rmsnorm.default(out, input, weight, eps)
     return out
 
 
@@ -146,10 +144,8 @@ def gemma_fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
         If None, will be automatically enabled on Hopper architecture.
     """
-    if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
     torch.ops.sgl_kernel.gemma_fused_add_rmsnorm.default(
-        input, residual, weight, eps, enable_pdl
+        input, residual, weight, eps
     )
 
 

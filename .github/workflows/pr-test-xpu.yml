@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   build-and-test:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+    if: (github.repository == 'sgl-project/sgl-kernel-xpu' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false
     runs-on: sglang-pvc
     steps:
@@ -79,3 +79,4 @@ jobs:
           fi
           echo "All jobs completed successfully"
           exit 0
+

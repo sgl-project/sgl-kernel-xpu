@@ -3,13 +3,9 @@
 import pytest
 import sgl_kernel
 import torch
+import utils
 
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-elif torch.xpu.is_available():
-    device = torch.device("xpu")
-else:
-    device = torch.device("cpu")
+device = utils.get_device()
 
 def llama_rms_norm(x, w, eps=1e-6):
     orig_dtype = x.dtype

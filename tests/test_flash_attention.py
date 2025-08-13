@@ -6,7 +6,10 @@ import os
 import pytest
 import torch
 import torch.nn.functional as F
+import utils
 from einops import rearrange, repeat
+
+device = utils.get_device()
 
 apply_rotary_emb = None
 
@@ -25,10 +28,14 @@ def is_fa3_supported(device=None) -> bool:
     #  https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x
     #  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a.
     #  That means if you use A100/A*0/L20/L40/L40s/4090 you can use fa3.
-    return (
-        torch.cuda.get_device_capability(device)[0] == 9
-        or torch.cuda.get_device_capability(device)[0] == 8
-    ) and (torch.version.cuda >= "12.3")
+    if torch.cuda.is_available():
+        return (
+            torch.cuda.get_device_capability(device)[0] == 9
+            or torch.cuda.get_device_capability(device)[0] == 8
+        ) and (torch.version.cuda >= "12.3")
+    elif torch.xpu.is_available():
+        device_name = torch.xpu.get_device_properties(0).name
+        return "B580" in device_name or "e211" in device_name
 
 
 DISABLE_BACKWARD = True
@@ -551,7 +558,6 @@ def test_flash_attn_kvcache(
         pytest.skip()
     if rotary_fraction == 0.0 and has_rotary_seqlens:
         pytest.skip()
-    device = "cuda"
     # set seed
     torch.random.manual_seed(0)
     batch_size = 5
@@ -1077,7 +1083,6 @@ def test_flash_attn_varlen_output(
 ):
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 
-    device = "cuda"
     # set seed
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
     # batch_size = 40

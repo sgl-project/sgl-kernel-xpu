@@ -1,7 +1,6 @@
 [build-system]
 requires = [
   "scikit-build-core>=0.10",
-  "pytorch-triton-xpu @ https://download.pytorch.org/whl/test/pytorch_triton_xpu-3.3.1-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
   "wheel",
 ]
 build-backend = "scikit_build_core.build"

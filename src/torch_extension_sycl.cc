@@ -16,6 +16,9 @@ limitations under the License.
 #include <torch/all.h>
 #include <torch/library.h>
 
+#include "sgl_kernel_torch_shim.h"
+
+#include "sgl_flash_kernel_ops.h"
 #include "sgl_kernel_ops.h"
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {

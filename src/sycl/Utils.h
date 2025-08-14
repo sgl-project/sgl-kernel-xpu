@@ -172,3 +172,9 @@ uint32_t dpcppNativeVectorWidth(DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue
   }
   throw std::invalid_argument("Invalid data type to fetch native vector width!");
 }
+
+template <typename Func, typename... Args>
+int get_min(Func limit_func, int X, Args*... args) {
+  X = std::min({X, limit_func(X, args)...});
+  return X;
+}

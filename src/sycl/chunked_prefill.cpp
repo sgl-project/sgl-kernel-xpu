@@ -133,7 +133,6 @@ struct Flash_fwd_params {
 
   // Local window size
   int window_size_left, window_size_right;
-  int attention_chunk;
 
   // Pointer to the RNG seed (idx 0) and offset (idx 1).
   uint64_t* rng_state;
@@ -541,14 +540,13 @@ std::vector<at::Tensor> mha_fwd(
     std::optional<const at::Tensor>& rotary_cos_,      // seqlen_ro x (rotary_dim / 2)
     std::optional<const at::Tensor>& rotary_sin_,      // seqlen_ro x (rotary_dim / 2)
     std::optional<const at::Tensor>& seqlens_rotary_,  // b
-    // std::optional<at::Tensor> &q_descale_,  // (b, h_k), not (b, h)
-    // std::optional<at::Tensor> &k_descale_,  // (b, h_k)
-    // std::optional<at::Tensor> &v_descale_,  // (b, h_k)
-    std::optional<double> softmax_scale_,
+    std::optional<at::Tensor>& q_descale_,             // (b, h_k), not (b, h)
+    std::optional<at::Tensor>& k_descale_,             // (b, h_k)
+    std::optional<at::Tensor>& v_descale_,             // (b, h_k)
+    const float softmax_scale_,
     bool is_causal,
     int window_size_left,
     int window_size_right,
-    int attention_chunk,
     float const softcap,
     bool const is_rotary_interleaved,  // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
     std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
@@ -619,10 +617,8 @@ std::vector<at::Tensor> mha_fwd(
   int const total_k = !is_varlen_k ? batch_size * k.size(1) : k.size(0);
   int const num_heads_k = k.size(-2);
   int const batch_size_k = !paged_KV ? (!is_varlen_k ? k.size(0) : cu_seqlens_k.size(0) - 1) : page_table.size(0);
-  double softmax_scale = 1.0 / sqrt(double(head_size));
-  if (softmax_scale_.has_value()) {
-    softmax_scale = softmax_scale_.value();
-  }
+  float softmax_scale = softmax_scale_;
+
   if (!kv_batch_idx_.has_value()) {
     TORCH_CHECK(batch_size == batch_size_k, "batch_size must be equal to batch_size_k");
   }
@@ -791,8 +787,8 @@ std::vector<at::Tensor> mha_fwd(
 
   // Causal is the special case where window_size_right == 0 and window_size_left < 0.
   // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
-  params.is_causal = window_size_left < 0 && window_size_right == 0 && attention_chunk == 0;
-  params.is_local = (window_size_left >= 0 || window_size_right >= 0 || attention_chunk >= 1) && !params.is_causal;
+  params.is_causal = window_size_left < 0 && window_size_right == 0;
+  params.is_local = (window_size_left >= 0 || window_size_right >= 0) && !params.is_causal;
 
   // TODO: check this
   if (window_size_left < 0) {
@@ -801,13 +797,8 @@ std::vector<at::Tensor> mha_fwd(
   if (window_size_right < 0) {
     window_size_right = seqlen_q - 1;
   }
-  if (attention_chunk > 0) {
-    window_size_left = std::min(window_size_left, attention_chunk - 1);
-    window_size_right = std::min(window_size_right, attention_chunk - 1);
-  }
   params.window_size_left = window_size_left;
   params.window_size_right = window_size_right;
-  params.attention_chunk = attention_chunk;
 
   params.total_q = total_q;
   params.total_k = total_k;

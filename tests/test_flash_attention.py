@@ -16,7 +16,10 @@ apply_rotary_emb = None
 
 def is_hopper():
     #  Only Hopper supports different V headdim
-    return torch.cuda.get_device_properties(0).major >= 9
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_properties(0).major >= 9
+    else:
+        return False
 
 
 def is_fa3_supported(device=None) -> bool:

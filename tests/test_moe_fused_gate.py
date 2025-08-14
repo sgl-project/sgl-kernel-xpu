@@ -1,7 +1,6 @@
 import pytest
 import torch
 from sgl_kernel import moe_fused_gate
-
 from sglang.srt.layers.moe.topk import biased_grouped_topk
 
 

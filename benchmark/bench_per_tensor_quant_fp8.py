@@ -7,9 +7,8 @@ import torch
 import triton
 import triton.testing
 from sgl_kernel import sgl_per_tensor_quant_fp8
-from vllm import _custom_ops as ops
-
 from sglang.srt.utils import is_hip
+from vllm import _custom_ops as ops
 
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn

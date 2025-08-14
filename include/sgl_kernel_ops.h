@@ -22,7 +22,6 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <sycl/sycl.hpp>
-
 #include <tuple>
 #include <vector>
 

@@ -3,7 +3,6 @@ import itertools
 import torch
 import triton
 from sgl_kernel import ep_moe_silu_and_mul
-
 from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_triton_kernel
 
 batch_size_range = [64, 128, 256, 512, 640, 768, 1024, 2048, 4096]

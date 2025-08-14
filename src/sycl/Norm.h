@@ -5,7 +5,8 @@
 #include "comm/AccumulateType.h"
 #include "comm/Numerics.h"
 
-using namespace at;
+namespace at {
+namespace SGLXPUNorm {
 
 constexpr int SIMD = 16;
 
@@ -378,3 +379,6 @@ bool canUse32BitIndexMath(const at::Tensor& t, int64_t max_elem) {
 
   return true;
 }
+
+}  // namespace SGLXPUNorm
+}  // namespace at

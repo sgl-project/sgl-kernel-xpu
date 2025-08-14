@@ -108,3 +108,13 @@ inline int can_vectorize_up_to(at::DeviceIndex dev_id, char* pointer) {
   }
   return 1;
 }
+
+template <typename... Args>
+int get_min_vec_size(int vec_size, Args*... args) {
+  auto limit_func = [](int vec_size, auto* data) {
+    if (!data) return vec_size;
+    return can_vectorize_up_to<std::remove_pointer_t<decltype(data)>>(
+        dpcppGetDeviceIdOfCurrentQueue(), reinterpret_cast<char*>(data));
+  };
+  return get_min(limit_func, vec_size, args...);
+}

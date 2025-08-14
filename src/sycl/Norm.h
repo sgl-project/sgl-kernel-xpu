@@ -283,20 +283,7 @@ class NormForward {
   }
 
   int get_update_vec_size(int Plane, int vec_size) {
-    vec_size = std::min(
-        vec_size, can_vectorize_up_to<scalar_t>(dpcppGetDeviceIdOfCurrentQueue(), reinterpret_cast<char*>(X_data)));
-    vec_size = std::min(
-        vec_size, can_vectorize_up_to<scalar_t>(dpcppGetDeviceIdOfCurrentQueue(), reinterpret_cast<char*>(Y_data)));
-    if (gamma_data) {
-      vec_size = std::min(
-          vec_size,
-          can_vectorize_up_to<weight_t>(dpcppGetDeviceIdOfCurrentQueue(), reinterpret_cast<char*>(gamma_data)));
-    }
-    if (beta_data) {
-      vec_size = std::min(
-          vec_size,
-          can_vectorize_up_to<weight_t>(dpcppGetDeviceIdOfCurrentQueue(), reinterpret_cast<char*>(gamma_data)));
-    }
+    vec_size = get_min_vec_size(vec_size, X_data, Y_data, gamma_data, beta_data);
 
     while (Plane % vec_size != 0) {
       vec_size = vec_size >> 1;

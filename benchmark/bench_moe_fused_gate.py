@@ -5,7 +5,6 @@ import torch
 import triton
 import triton.language as tl
 from sgl_kernel import moe_fused_gate
-
 from sglang.srt.layers.moe.topk import biased_grouped_topk
 
 

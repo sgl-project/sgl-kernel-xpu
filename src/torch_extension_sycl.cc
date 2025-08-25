@@ -38,7 +38,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("rmsnorm", torch::kXPU, &at::SGLXPUNorm::rmsnorm);
 
   m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps) -> ()");
-  m.impl("fused_add_rmsnorm", torch::kXPU, &at::SGLXPUNorm::sgl_fused_add_rmsnorm);
+  m.impl("fused_add_rmsnorm", torch::kXPU, &at::SGLXPUNorm::fused_add_rmsnorm);
 
   m.def("gemma_rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps) -> ()");
   m.impl("gemma_rmsnorm", torch::kXPU, &at::SGLXPUNorm::gemma_rmsnorm);

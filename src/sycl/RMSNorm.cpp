@@ -427,7 +427,7 @@ void GemmaFusedAddRMSNormKernelImplInternal(
     }                                                                                                       \
   }
 
-void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps) {
+void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
   auto M_N = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), weight, Tensor());
   auto M = M_N.first;
   auto N = M_N.second;
@@ -453,7 +453,7 @@ void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double e
       });
 }
 
-void sgl_fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps) {
+void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps) {
   auto M_N = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), weight, Tensor());
   auto M = M_N.first;
   auto N = M_N.second;
@@ -479,7 +479,7 @@ void sgl_fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::T
       });
 }
 
-void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps) {
+void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
   auto M_N = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), weight, Tensor());
   auto M = M_N.first;
   auto N = M_N.second;
@@ -505,7 +505,7 @@ void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, do
       });
 }
 
-void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps) {
+void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps) {
   auto M_N = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), weight, Tensor());
   auto M = M_N.first;
   auto N = M_N.second;

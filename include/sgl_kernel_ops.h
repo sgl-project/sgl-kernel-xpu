@@ -117,14 +117,12 @@ int64_t cutlass_mla_get_workspace_size(
 /*
  * From csrc/elementwise
  */
-namespace at {
-namespace SGLXPUNorm {
+namespace at::native::xpu {
 void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
-}  // namespace SGLXPUNorm
-}  // namespace at
+}
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
 void gelu_and_mul(torch::Tensor& out, torch::Tensor& input);

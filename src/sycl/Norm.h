@@ -5,8 +5,7 @@
 #include "comm/AccumulateType.h"
 #include "comm/Numerics.h"
 
-namespace at {
-namespace SGLXPUNorm {
+namespace at::native::xpu{
 
 constexpr int NUM_REDUCE_STAGES = 16;
 
@@ -367,5 +366,4 @@ bool canUse32BitIndexMath(const at::Tensor& t, int64_t max_elem) {
   return true;
 }
 
-}  // namespace SGLXPUNorm
-}  // namespace at
+}

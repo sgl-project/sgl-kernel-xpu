@@ -15,8 +15,7 @@
 #include "SYCLHelpers.h"
 #include "Utils.h"
 
-namespace at {
-namespace SGLXPUNorm {
+namespace at::native::xpu {
 template <typename ScalarType, int Dims = 1>
 using dpcpp_local_acc_t = sycl::local_accessor<ScalarType, Dims>;
 
@@ -531,5 +530,4 @@ void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torc
       });
 }
 
-}  // namespace SGLXPUNorm
-}  // namespace at
+}

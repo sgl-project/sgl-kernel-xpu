@@ -3,8 +3,7 @@ from typing import Optional
 import torch
 from sgl_kernel.utils import get_cuda_stream, is_hopper_arch
 
-#These implementations extensively draw from and build upon the FlashInfer project https:  // github.com/flashinfer-ai/flashinfer
-#Kudos to @yzh119
+
 def rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,

@@ -223,7 +223,7 @@ template <
     class Norm,
     bool one_moment = false>
 struct FusedNormKernelFunctor {
-  [[sycl::reqd_sub_group_size(SIMD)]] void operator()(sycl::nd_item<3> item_id) const {
+  [[sycl::reqd_sub_group_size(NUM_REDUCE_STAGES)]] void operator()(sycl::nd_item<3> item_id) const {
     accscalar_t sum1 = 0;
     accscalar_t sum2 = 0;
     norm.template reduce_combine<vec_size, vec_t, weight_vec_t, index_t>(item_id, cfg, sum1, sum2);

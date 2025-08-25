@@ -8,7 +8,7 @@
 namespace at {
 namespace SGLXPUNorm {
 
-constexpr int SIMD = 16;
+constexpr int NUM_REDUCE_STAGES = 16;
 
 static constexpr auto dpcpp_local_fence = sycl::access::fence_space::local_space;
 static constexpr auto dpcpp_global_fence = sycl::access::fence_space::global_space;
@@ -70,7 +70,7 @@ static inline void norm_group_reduce(
     reduce_op bin_op) {
   auto sg = item_id.get_sub_group();
 #pragma unroll
-  for (int i = 1; i < SIMD; i <<= 1) {
+  for (int i = 1; i < NUM_REDUCE_STAGES; i <<= 1) {
     mean = bin_op(mean, static_cast<accscalar_t>(sycl::shift_group_left(sg, mean, i)));
     rstd = bin_op(rstd, static_cast<accscalar_t>(sycl::shift_group_left(sg, rstd, i)));
   }
@@ -96,12 +96,12 @@ static inline void norm_group_reduce(
       mean = accscalar_t(local_mean[sg_local_id]);
       rstd = accscalar_t(local_rstd[sg_local_id]);
     }
-    for (int i = sg_local_id + SIMD; i < sub_group_num; i += SIMD) {
+    for (int i = sg_local_id + NUM_REDUCE_STAGES; i < sub_group_num; i += NUM_REDUCE_STAGES) {
       mean = bin_op(mean, static_cast<accscalar_t>(local_mean[i]));
       rstd = bin_op(rstd, static_cast<accscalar_t>(local_rstd[i]));
     }
 #pragma unroll
-    for (int i = 1; i < SIMD; i <<= 1) {
+    for (int i = 1; i < NUM_REDUCE_STAGES; i <<= 1) {
       mean = bin_op(mean, static_cast<accscalar_t>(sycl::shift_group_left(sg, mean, i)));
       rstd = bin_op(rstd, static_cast<accscalar_t>(sycl::shift_group_left(sg, rstd, i)));
       if (i >= ((sub_group_num + 1) >> 1)) break;
@@ -161,7 +161,7 @@ class NormConfig {
       scratchpad = at::zeros(scratchpad_size, X.options().dtype(kAccType));
       semaphores_ptr = semaphores.data_ptr<int>();
       scratchpad_ptr = scratchpad.data_ptr();
-      sub_group_num_global = (workgroup_num_foreach + SIMD - 1) / SIMD;
+      sub_group_num_global = (workgroup_num_foreach + NUM_REDUCE_STAGES - 1) / NUM_REDUCE_STAGES;
     }
   }
 
@@ -181,11 +181,11 @@ class NormConfig {
   void get_workgroup_size() {
     auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
     int max_workgroup_size = dpcppMaxWorkGroupSize(dev_id);
-    if constexpr (SIMD == 16) {
-      // WA for BMG. The actual max work group size on BMG is 1024 (64 HW thread
-      // * 16 SIMD per SS), which conflicts with 2048 returned from SYCL
+    if constexpr (NUM_REDUCE_STAGES == 16) {
+      // WA for BMG. The actual max work group size on BMG is 512 (64 HW thread
+      // * 16 SIMD per SS), which conflicts with 1024 returned from SYCL
       // runtime.
-      max_workgroup_size = std::min(max_workgroup_size, 1024);
+      max_workgroup_size = std::min(max_workgroup_size, 512);
     }
     int total_resource = dpcppMaxWorkItemsPerTile(dev_id);
     workgroup_num = total_resource / max_workgroup_size;
@@ -204,7 +204,7 @@ class NormConfig {
     workgroup_num_foreach = std::min(workgroup_num_foreach, max_workgroup_num_foreach);
     // Reduce will waste the EU resource, then
     // minimize the workgroup_size and maximize the workgroup_num
-    while (workgroup_num << 1 <= Batch && (workgroup_size >> 1) >= SIMD) {
+    while (workgroup_num << 1 <= Batch && (workgroup_size >> 1) >= NUM_REDUCE_STAGES) {
       workgroup_num = workgroup_num << 1;
       workgroup_size = workgroup_size >> 1;
     }
@@ -212,7 +212,7 @@ class NormConfig {
     // Workgroup_num should larger or equal to Batch
     workgroup_num = std::max(workgroup_num, int(Batch));
     // At least one subgroup for reduce
-    sub_group_num = (workgroup_size + SIMD - 1) / SIMD;
+    sub_group_num = (workgroup_size + NUM_REDUCE_STAGES - 1) / NUM_REDUCE_STAGES;
   }
 
   void get_workgroup_size_row() {
@@ -222,7 +222,7 @@ class NormConfig {
     int total_resource = dpcppMaxWorkItemsPerTile(dev_id);
     workgroup_num = total_resource / max_workgroup_size;
 
-    int max_block_row = max_workgroup_size / SIMD;
+    int max_block_row = max_workgroup_size / NUM_REDUCE_STAGES;
     block_row = 1;
     while ((block_row << 2) <= Batch && (block_row << 1) <= max_block_row) {
       block_row = block_row << 1;
@@ -238,7 +238,7 @@ class NormConfig {
     }
 
     // maximize the workgroup_size, and minimize the block_row
-    while ((workgroup_size >> 1) * workgroup_num * max_vec_size > Plane && (workgroup_size >> 1) >= SIMD) {
+    while ((workgroup_size >> 1) * workgroup_num * max_vec_size > Plane && (workgroup_size >> 1) >= NUM_REDUCE_STAGES) {
       workgroup_size = workgroup_size >> 1;
     }
     while ((workgroup_size << 1) * workgroup_num * max_vec_size <= Plane &&

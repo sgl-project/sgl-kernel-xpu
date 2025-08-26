@@ -31,7 +31,7 @@ inline std::pair<int64_t, int64_t> _check_layer_norm_inputs(
 
   TENSOR_CHECK(weight)
   TENSOR_CHECK(bias)
-  
+
   unsigned int batch_size = input.size(0);
   unsigned int hidden_size = input.size(1);
 
@@ -230,7 +230,7 @@ class NormConfig {
   }
 };
 
-template <typename scalar_t, typename mean_t, typename weight_t, bool one_moment = false>
+template <typename scalar_t, typename weight_t, bool one_moment = false, typename mean_t = float>
 class NormForward {
  public:
   using accscalar_t = acc_type<scalar_t>;

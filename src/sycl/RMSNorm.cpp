@@ -413,13 +413,8 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "RMSNormKernelImpl", [&]() {
-        if (weight_.scalar_type() == kFloat) {
-          RMSNormKernelImplInternal<scalar_t, float>(
-              input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), output_, rstd);
-        } else {
           RMSNormKernelImplInternal<scalar_t, scalar_t>(
               input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), output_, rstd);
-        }
       });
 }
 
@@ -437,13 +432,8 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
 
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
-        if (weight_.scalar_type() == kFloat) {
-          FusedAddRMSNormKernelImplInternal<scalar_t, float>(
-              input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual_);
-        } else {
           FusedAddRMSNormKernelImplInternal<scalar_t, scalar_t>(
               input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual_);
-        }
       });
 }
 
@@ -461,13 +451,8 @@ void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& w
 
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
-        if (weight_.scalar_type() == kFloat) {
-          GemmaRMSNormKernelImplInternal<scalar_t, float>(
-              input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), output_, rstd);
-        } else {
           GemmaRMSNormKernelImplInternal<scalar_t, scalar_t>(
               input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), output_, rstd);
-        }
       });
 }
 
@@ -485,13 +470,8 @@ void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torc
 
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "GemmaFusedAddRMSNormKernelImpl", [&]() {
-        if (weight_.scalar_type() == kFloat) {
-          GemmaFusedAddRMSNormKernelImplInternal<scalar_t, float>(
-              input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual_);
-        } else {
           GemmaFusedAddRMSNormKernelImplInternal<scalar_t, scalar_t>(
               input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual_);
-        }
       });
 }
 

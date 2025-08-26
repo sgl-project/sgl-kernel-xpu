@@ -11,25 +11,20 @@
 #include <type_traits>
 
 #include "Utils.h"
+
 static inline int preferred_vector_width(at::DeviceIndex dev_id, int elem_sz) {
+  #define PRIVATE_CASE_SIZE(SIZE, TYPE) \
+  case SIZE: {  \
+    static_assert(sizeof(TYPE) == SIZE, "the TYPE size is not SIZE bytes"); \
+      ret = dpcppPrefVectorWidth<TYPE>(dev_id); \
+      break;  \
+  }
   size_t ret;
   switch (elem_sz) {
-    case 1:
-      static_assert(sizeof(char) == 1, "the char size is not 1 bytes");
-      ret = dpcppPrefVectorWidth<char>(dev_id);
-      break;
-    case 2:
-      static_assert(sizeof(short) == 2, "the short size is not 2 bytes");
-      ret = dpcppPrefVectorWidth<short>(dev_id);
-      break;
-    case 4:
-      ret = dpcppPrefVectorWidth<int>(dev_id);
-      static_assert(sizeof(int) == 4, "the long size is not 4 bytes");
-      break;
-    case 8:
-      static_assert(sizeof(int64_t) == 8, "the long size is not 8");
-      ret = dpcppPrefVectorWidth<int64_t>(dev_id);
-      break;
+    PRIVATE_CASE_SIZE(1, char);
+    PRIVATE_CASE_SIZE(2, short);
+    PRIVATE_CASE_SIZE(4, int);
+    PRIVATE_CASE_SIZE(8, int64_t);
     default:
       // no vectorize
       ret = 1;

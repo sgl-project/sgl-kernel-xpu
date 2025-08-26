@@ -26,9 +26,7 @@ def rmsnorm(
     out: Optional[torch.Tensor]
         The output tensor, if specified, the kernel will update this tensor inplace.
     enable_pdl: Optional[bool]
-        Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
+        Not Used on XPU.
 
     Returns
     -------
@@ -37,7 +35,7 @@ def rmsnorm(
     """
     if out is None:
         out = torch.empty_like(input)
-    torch.ops.sgl_kernel.rmsnorm.default(out, input, weight, eps)
+    torch.ops.sgl_kernel.rmsnorm(out, input, weight, eps)
     return out
 
 
@@ -67,11 +65,9 @@ def fused_add_rmsnorm(
     eps: float
         Epsilon for numerical stability.
     enable_pdl: Optional[bool]
-        Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
+        Not Used on XPU.
     """
-    torch.ops.sgl_kernel.fused_add_rmsnorm.default(
+    torch.ops.sgl_kernel.fused_add_rmsnorm(
         input, residual, weight, eps
     )
 
@@ -98,9 +94,7 @@ def gemma_rmsnorm(
     out: Optional[torch.Tensor]
         The output tensor, if specified, the kernel will update this tensor inplace.
     enable_pdl: Optional[bool]
-        Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
+        Not Used on XPU.
 
     Returns
     -------
@@ -109,7 +103,7 @@ def gemma_rmsnorm(
     """
     if out is None:
         out = torch.empty_like(input)
-    torch.ops.sgl_kernel.gemma_rmsnorm.default(out, input, weight, eps)
+    torch.ops.sgl_kernel.gemma_rmsnorm(out, input, weight, eps)
     return out
 
 
@@ -139,11 +133,9 @@ def gemma_fused_add_rmsnorm(
     eps: float
         Epsilon for numerical stability.
     enable_pdl: Optional[bool]
-        Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
+        Not Used on XPU.
     """
-    torch.ops.sgl_kernel.gemma_fused_add_rmsnorm.default(
+    torch.ops.sgl_kernel.gemma_fused_add_rmsnorm(
         input, residual, weight, eps
     )
 
@@ -169,7 +161,7 @@ def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
             device=input.device,
             dtype=input.dtype,
         )
-    torch.ops.sgl_kernel.silu_and_mul.default(out, input)
+    torch.ops.sgl_kernel.silu_and_mul(out, input)
     return out
 
 
@@ -184,7 +176,7 @@ def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Te
             device=input.device,
             dtype=input.dtype,
         )
-    torch.ops.sgl_kernel.gelu_tanh_and_mul.default(out, input)
+    torch.ops.sgl_kernel.gelu_tanh_and_mul(out, input)
     return out
 
 
@@ -199,7 +191,7 @@ def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
             device=input.device,
             dtype=input.dtype,
         )
-    torch.ops.sgl_kernel.gelu_and_mul.default(out, input)
+    torch.ops.sgl_kernel.gelu_and_mul(out, input)
     return out
 
 

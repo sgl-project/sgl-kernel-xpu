@@ -765,22 +765,22 @@ struct Numerics<at::BFloat16> {
   }
 
   static inline at::BFloat16 exp(at::BFloat16 a) {
-    return std::exp(float(a));
+    return sycl::exp(a);
   }
   static inline at::BFloat16 exp2(at::BFloat16 a) {
-    return std::exp2(float(a));
+    return sycl::exp2(a);
   }
   static inline at::BFloat16 log(at::BFloat16 a) {
-    return std::log(float(a));
+    return sycl::log(a);
   }
   static inline at::BFloat16 log10(at::BFloat16 a) {
-    return std::log10(float(a));
+    return sycl::log10(a);
   }
   static inline at::BFloat16 log1p(at::BFloat16 a) {
     return std::log1p(float(a));
   }
   static inline at::BFloat16 log2(at::BFloat16 a) {
-    return std::log2(float(a));
+    return sycl::log2(a);
   }
   static inline at::BFloat16 expm1(at::BFloat16 a) {
     return std::expm1(float(a));

@@ -178,3 +178,10 @@ int get_min(Func limit_func, int X, Args*... args) {
   X = std::min({X, limit_func(X, args)...});
   return X;
 }
+
+#define CHECK_DIM(d, x) TORCH_CHECK(x.dim() == d, #x " must be a " #d "D tensor")
+
+#define CHECK_LAST_DIM_CONTIGUOUS(x) \
+  TORCH_CHECK(x.strides()[x.strides().size() - 1] == 1, #x "must be contiguous at last dimension")
+
+#define CHECK_EQ(a, b) TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)

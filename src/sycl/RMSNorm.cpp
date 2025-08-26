@@ -70,7 +70,7 @@ class RMSNormForward : public NormForward<scalar_t, mean_t, weight_t, true> {
       if (local_id == 0) {
         reduce_project(item_id, sum_value, sum_tmp, cfg);
       }
-      item_id.barrier(dpcpp_global_fence);
+      item_id.barrier(DECLARE_SYCL_GLOBAL_FENCE);
     }
 
     auto var_val = NF::var_data[group_id];
@@ -156,7 +156,7 @@ class GemmaRMSNormForward : public RMSNormForward<scalar_t, mean_t, weight_t> {
       if (local_id == 0) {
         RNF::reduce_project(item_id, sum_value, sum_tmp, cfg);
       }
-      item_id.barrier(dpcpp_global_fence);
+      item_id.barrier(DECLARE_SYCL_GLOBAL_FENCE);
     }
 
     auto var_val = NF::var_data[group_id];
@@ -427,7 +427,9 @@ void GemmaFusedAddRMSNormKernelImplInternal(
   }
 
 void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
-  auto M_N = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), weight, Tensor());
+  std::optional<torch::Tensor> opt_weight = weight;
+  std::optional<torch::Tensor> opt_bias; 
+  auto M_N = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
   auto M = M_N.first;
   auto N = M_N.second;
 
@@ -453,7 +455,9 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 }
 
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps) {
-  auto M_N = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), weight, Tensor());
+  std::optional<torch::Tensor> opt_weight = weight;
+  std::optional<torch::Tensor> opt_bias; 
+  auto M_N = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
   auto M = M_N.first;
   auto N = M_N.second;
 
@@ -479,7 +483,9 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
 }
 
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
-  auto M_N = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), weight, Tensor());
+  std::optional<torch::Tensor> opt_weight = weight;
+  std::optional<torch::Tensor> opt_bias; 
+  auto M_N = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
   auto M = M_N.first;
   auto N = M_N.second;
 
@@ -505,7 +511,9 @@ void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& w
 }
 
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps) {
-  auto M_N = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), weight, Tensor());
+  std::optional<torch::Tensor> opt_weight = weight;
+  std::optional<torch::Tensor> opt_bias; 
+  auto M_N = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
   auto M = M_N.first;
   auto N = M_N.second;
 

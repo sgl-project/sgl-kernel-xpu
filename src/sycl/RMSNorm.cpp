@@ -17,7 +17,7 @@
 
 namespace at::native::xpu {
 template <typename ScalarType, int Dims = 1>
-using dpcpp_local_acc_t = sycl::local_accessor<ScalarType, Dims>;
+using sycl_local_acc_t = sycl::local_accessor<ScalarType, Dims>;
 
 template <typename scalar_t, typename weight_t, typename mean_t = float>
 class RMSNormForward : public NormForward<scalar_t, weight_t, true> {
@@ -238,15 +238,15 @@ struct FusedNormKernelFunctor {
     norm.template update<vec_size, index_t, vec_t, weight_vec_t>(item_id, cfg, sum1, sum2);
   }
   FusedNormKernelFunctor(
-      dpcpp_local_acc_t<accscalar_t> local_sum1_,
-      dpcpp_local_acc_t<accscalar_t> local_sum2_,
+      sycl_local_acc_t<accscalar_t> local_sum1_,
+      sycl_local_acc_t<accscalar_t> local_sum2_,
       Norm<scalar_t, weight_t, mean_t> norm_,
       NormConfig cfg_)
       : local_sum1(local_sum1_), local_sum2(local_sum2_), norm(norm_), cfg(cfg_) {}
 
  private:
-  dpcpp_local_acc_t<accscalar_t> local_sum1;
-  dpcpp_local_acc_t<accscalar_t> local_sum2;
+  sycl_local_acc_t<accscalar_t> local_sum1;
+  sycl_local_acc_t<accscalar_t> local_sum2;
   Norm<scalar_t, weight_t, mean_t> norm;
   const NormConfig cfg;
 };
@@ -273,8 +273,8 @@ void fused_norm_kernel(Norm<scalar_t, weight_t, mean_t>& norm, const NormConfig&
   auto queue = stream.queue();
 
   auto cgf = [&](sycl::handler& cgh) {
-    dpcpp_local_acc_t<accscalar_t> local_sum1(cfg.sub_group_num, cgh);
-    dpcpp_local_acc_t<accscalar_t> local_sum2(cfg.sub_group_num, cgh);
+    sycl_local_acc_t<accscalar_t> local_sum1(cfg.sub_group_num, cgh);
+    sycl_local_acc_t<accscalar_t> local_sum2(cfg.sub_group_num, cgh);
     FusedNormKernelFunctor<
         scalar_t,
         weight_t,
@@ -296,23 +296,23 @@ template <
     typename mean_t = float>
 void launch_vectorized_fused_norm_kernel(Norm<scalar_t, weight_t, mean_t>& norm, const NormConfig& config) {
   int vec_size = norm.get_update_vec_size(config.WGPlane, config.max_vec_size);
-#define vectorized_fused_norm_kernel(vec_size)                                                         \
+#define VECTORIZED_FUSED_NORM_KERNEL(vec_size)                                                         \
   {                                                                                                    \
     fused_norm_kernel<scalar_t, weight_t, vec_size, Norm, one_moment>(norm, config); \
     break;                                                                                             \
   }
   switch (vec_size) {
     case 8: {
-      vectorized_fused_norm_kernel(8);
+      VECTORIZED_FUSED_NORM_KERNEL(8);
     }
     case 4: {
-      vectorized_fused_norm_kernel(4);
+      VECTORIZED_FUSED_NORM_KERNEL(4);
     }
     case 2: {
-      vectorized_fused_norm_kernel(2);
+      VECTORIZED_FUSED_NORM_KERNEL(2);
     }
     default: {
-      vectorized_fused_norm_kernel(1);
+      VECTORIZED_FUSED_NORM_KERNEL(1);
     }
   }
 }

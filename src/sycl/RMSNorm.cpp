@@ -399,26 +399,6 @@ void GemmaFusedAddRMSNormKernelImplInternal(
       gemma_add_rms_norm_forward, config);
 }
 
-#define PRIVATE_CASE_TYPE(enum_type, type, ...) \
-  case enum_type: {                             \
-    using scalar_t = type;                      \
-    return __VA_ARGS__();                       \
-  }
-
-#define DISPATCH_FLOATING_TYPES_AND2(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)                             \
-  {                                                                                                         \
-    const auto& the_type = TYPE;                                                                            \
-    at::ScalarType _st = ::detail::scalar_type(the_type);                                                   \
-    switch (_st) {                                                                                          \
-      PRIVATE_CASE_TYPE(at::ScalarType::Double, double, __VA_ARGS__)                                        \
-      PRIVATE_CASE_TYPE(at::ScalarType::Float, float, __VA_ARGS__)                                          \
-      PRIVATE_CASE_TYPE(SCALARTYPE1, decltype(c10::impl::ScalarTypeToCPPType<SCALARTYPE1>::t), __VA_ARGS__) \
-      PRIVATE_CASE_TYPE(SCALARTYPE2, decltype(c10::impl::ScalarTypeToCPPType<SCALARTYPE2>::t), __VA_ARGS__) \
-      default:                                                                                              \
-        AT_ERROR(#NAME, " not implemented for '", toString(TYPE), "'");                                     \
-    }                                                                                                       \
-  }
-
 void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias; 
@@ -426,21 +406,17 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
   auto M = M_N.first;
   auto N = M_N.second;
 
-  Tensor rstd;
-
-  if (input.numel() == 0) return;
   Tensor input_ = (input.dim() == 1) ? input.reshape({M, N}) : input;
   Tensor output_ = (output.dim() == 1) ? output.reshape({M, N}) : output;
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
+  Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
 
-  DISPATCH_FLOATING_TYPES_AND2(
+  SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "RMSNormKernelImpl", [&]() {
         if (weight_.scalar_type() == kFloat) {
-          rstd = at::empty({M}, input_.options().dtype(kFloat));
           RMSNormKernelImplInternal<scalar_t, float>(
               input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), output_, rstd);
         } else {
-          rstd = at::empty({M}, input_.options().dtype(kFloat));
           RMSNormKernelImplInternal<scalar_t, scalar_t>(
               input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), output_, rstd);
         }
@@ -454,21 +430,17 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
   auto M = M_N.first;
   auto N = M_N.second;
 
-  Tensor rstd;
-
-  if (input.numel() == 0) return;
   Tensor input_ = (input.dim() == 1) ? input.reshape({M, N}) : input;
   Tensor residual_ = (residual.dim() == 1) ? residual.reshape({M, N}) : residual;
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
+  Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
 
-  DISPATCH_FLOATING_TYPES_AND2(
+  SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
         if (weight_.scalar_type() == kFloat) {
-          rstd = at::empty({M}, input_.options().dtype(kFloat));
           FusedAddRMSNormKernelImplInternal<scalar_t, float>(
               input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual_);
         } else {
-          rstd = at::empty({M}, input_.options().dtype(kFloat));
           FusedAddRMSNormKernelImplInternal<scalar_t, scalar_t>(
               input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual_);
         }
@@ -482,21 +454,17 @@ void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& w
   auto M = M_N.first;
   auto N = M_N.second;
 
-  Tensor rstd;
-
-  if (input.numel() == 0) return;
   Tensor input_ = (input.dim() == 1) ? input.reshape({M, N}) : input;
   Tensor output_ = (output.dim() == 1) ? output.reshape({M, N}) : output;
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
+  Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
 
-  DISPATCH_FLOATING_TYPES_AND2(
+  SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
         if (weight_.scalar_type() == kFloat) {
-          rstd = at::empty({M}, input_.options().dtype(kFloat));
           GemmaRMSNormKernelImplInternal<scalar_t, float>(
               input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), output_, rstd);
         } else {
-          rstd = at::empty({M}, input_.options().dtype(kFloat));
           GemmaRMSNormKernelImplInternal<scalar_t, scalar_t>(
               input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), output_, rstd);
         }
@@ -510,21 +478,17 @@ void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torc
   auto M = M_N.first;
   auto N = M_N.second;
 
-  Tensor rstd;
-
-  if (input.numel() == 0) return;
   Tensor input_ = (input.dim() == 1) ? input.reshape({M, N}) : input;
   Tensor residual_ = (residual.dim() == 1) ? residual.reshape({M, N}) : residual;
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
+  Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
 
-  DISPATCH_FLOATING_TYPES_AND2(
+  SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "GemmaFusedAddRMSNormKernelImpl", [&]() {
         if (weight_.scalar_type() == kFloat) {
-          rstd = at::empty({M}, input_.options().dtype(kFloat));
           GemmaFusedAddRMSNormKernelImplInternal<scalar_t, float>(
               input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual_);
         } else {
-          rstd = at::empty({M}, input_.options().dtype(kFloat));
           GemmaFusedAddRMSNormKernelImplInternal<scalar_t, scalar_t>(
               input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual_);
         }

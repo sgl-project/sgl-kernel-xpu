@@ -185,3 +185,23 @@ int get_min(Func limit_func, int X, Args*... args) {
   TORCH_CHECK(x.strides()[x.strides().size() - 1] == 1, #x "must be contiguous at last dimension")
 
 #define CHECK_EQ(a, b) TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
+
+#define PRIVATE_CASE_TYPE(enum_type, type, ...) \
+  case enum_type: {                             \
+    using scalar_t = type;                      \
+    return __VA_ARGS__();                       \
+  }
+
+#define SYCL_DISPATCH_FLOATING_TYPES(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)                             \
+  {                                                                                                         \
+    const auto& the_type = TYPE;                                                                            \
+    at::ScalarType _st = ::detail::scalar_type(the_type);                                                   \
+    switch (_st) {                                                                                          \
+      PRIVATE_CASE_TYPE(at::ScalarType::Double, double, __VA_ARGS__)                                        \
+      PRIVATE_CASE_TYPE(at::ScalarType::Float, float, __VA_ARGS__)                                          \
+      PRIVATE_CASE_TYPE(SCALARTYPE1, decltype(c10::impl::ScalarTypeToCPPType<SCALARTYPE1>::t), __VA_ARGS__) \
+      PRIVATE_CASE_TYPE(SCALARTYPE2, decltype(c10::impl::ScalarTypeToCPPType<SCALARTYPE2>::t), __VA_ARGS__) \
+      default:                                                                                              \
+        AT_ERROR(#NAME, " not implemented for '", toString(TYPE), "'");                                     \
+    }                                                                                                       \
+  }

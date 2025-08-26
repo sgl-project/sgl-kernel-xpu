@@ -5,7 +5,7 @@
 #include "comm/AccumulateType.h"
 #include "comm/Numerics.h"
 
-namespace at::native::xpu{
+namespace at::native::xpu {
 
 constexpr int NUM_REDUCE_STAGES = 16;
 
@@ -19,15 +19,15 @@ inline std::pair<int64_t, int64_t> _check_layer_norm_inputs(
     std::optional<torch::Tensor>& weight /* optional */,
     std::optional<torch::Tensor>& bias /* optional */) {
   CHECK_LAST_DIM_CONTIGUOUS(input);
-  CHECK_DIM(2, input);   // input: (batch_size, hidden_size)
-  #define TENSOR_CHECK(T) \
-  if (T.has_value()) {  \
-    CHECK_LAST_DIM_CONTIGUOUS(T.value()); \
-    auto device = input.device(); \
-    CHECK_EQ(T.value().device(), device); \
-    CHECK_DIM(1, T.value()); \
+  CHECK_DIM(2, input);  // input: (batch_size, hidden_size)
+#define TENSOR_CHECK(T)                         \
+  if (T.has_value()) {                          \
+    CHECK_LAST_DIM_CONTIGUOUS(T.value());       \
+    auto device = input.device();               \
+    CHECK_EQ(T.value().device(), device);       \
+    CHECK_DIM(1, T.value());                    \
     CHECK_EQ(input.size(1), T.value().size(0)); \
-  } 
+  }
 
   TENSOR_CHECK(weight)
   TENSOR_CHECK(bias)
@@ -346,4 +346,4 @@ bool canUse32BitIndexMath(const at::Tensor& t, int64_t max_elem) {
   return true;
 }
 
-}
+}  // namespace at::native::xpu

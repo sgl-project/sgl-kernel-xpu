@@ -122,7 +122,7 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
-}
+}  // namespace at::native::xpu
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
 void gelu_and_mul(torch::Tensor& out, torch::Tensor& input);

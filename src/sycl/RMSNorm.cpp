@@ -27,9 +27,7 @@ class RMSNormForward : public NormForward<scalar_t, weight_t, true> {
   RMSNormForward() = delete;
   RMSNormForward(
       scalar_t* X_data, scalar_t* Y_data, mean_t* var_data, weight_t* gamma_data, accscalar_t eps, int64_t M, int64_t N)
-      : NormForward<scalar_t, weight_t, true>(X_data, Y_data, nullptr, var_data, gamma_data, nullptr, eps),
-        M(M),
-        N(N) {
+      : NormForward<scalar_t, weight_t, true>(X_data, Y_data, nullptr, var_data, gamma_data, nullptr, eps), M(M), N(N) {
     numel = M * N;
   };
 
@@ -109,8 +107,7 @@ class AddRMSNormForward : public RMSNormForward<scalar_t, weight_t> {
       scalar_t* add_data,
       int64_t M,
       int64_t N)
-      : RMSNormForward<scalar_t, weight_t>(X_data, Y_data, var_data, gamma_data, eps, M, N),
-        add_data(add_data){};
+      : RMSNormForward<scalar_t, weight_t>(X_data, Y_data, var_data, gamma_data, eps, M, N), add_data(add_data){};
   template <int vec_size, typename vec_t, typename weight_vec_t, typename index_t, typename nd_item_id>
   void reduce_combine(nd_item_id item_id, const NormConfig& cfg, accscalar_t& sum_value, accscalar_t& sum_tmp) const {
     auto group_id = item_id.get_group(0);
@@ -275,13 +272,7 @@ void fused_norm_kernel(Norm<scalar_t, weight_t, mean_t>& norm, const NormConfig&
   auto cgf = [&](sycl::handler& cgh) {
     sycl_local_acc_t<accscalar_t> local_sum1(cfg.sub_group_num, cgh);
     sycl_local_acc_t<accscalar_t> local_sum2(cfg.sub_group_num, cgh);
-    FusedNormKernelFunctor<
-        scalar_t,
-        weight_t,
-        vec_size,
-        Norm,
-        one_moment>
-        kfn(local_sum1, local_sum2, norm, cfg);
+    FusedNormKernelFunctor<scalar_t, weight_t, vec_size, Norm, one_moment> kfn(local_sum1, local_sum2, norm, cfg);
     cgh.parallel_for<decltype(kfn)>(sycl::nd_range<3>(sycl::range<3>(global_range), sycl::range<3>(local_range)), kfn);
   };
   queue.submit(cgf);
@@ -296,10 +287,10 @@ template <
     typename mean_t = float>
 void launch_vectorized_fused_norm_kernel(Norm<scalar_t, weight_t, mean_t>& norm, const NormConfig& config) {
   int vec_size = norm.get_update_vec_size(config.WGPlane, config.max_vec_size);
-#define VECTORIZED_FUSED_NORM_KERNEL(vec_size)                                                         \
-  {                                                                                                    \
+#define VECTORIZED_FUSED_NORM_KERNEL(vec_size)                                       \
+  {                                                                                  \
     fused_norm_kernel<scalar_t, weight_t, vec_size, Norm, one_moment>(norm, config); \
-    break;                                                                                             \
+    break;                                                                           \
   }
   switch (vec_size) {
     case 8: {
@@ -353,8 +344,7 @@ void FusedAddRMSNormKernelImplInternal(
   config.workgroup_num_foreach = 1;
   config.WGPlane = config.Plane;
 
-  launch_vectorized_fused_norm_kernel<scalar_t, weight_t, AddRMSNormForward, true>(
-      add_rms_norm_forward, config);
+  launch_vectorized_fused_norm_kernel<scalar_t, weight_t, AddRMSNormForward, true>(add_rms_norm_forward, config);
 }
 
 template <typename scalar_t, typename weight_t, typename mean_t = float>
@@ -366,13 +356,11 @@ void GemmaRMSNormKernelImplInternal(
   weight_t* gemma_data = gemma.defined() ? gemma.data_ptr<weight_t>() : nullptr;
 
   auto config = NormConfig(M, N, 1, sizeof(scalar_t));
-  GemmaRMSNormForward<scalar_t, weight_t> gemma_rms_norm_forward(
-      X_data, Y_data, var_data, gemma_data, eps, M, N);
+  GemmaRMSNormForward<scalar_t, weight_t> gemma_rms_norm_forward(X_data, Y_data, var_data, gemma_data, eps, M, N);
   config.workgroup_num_foreach = 1;
   config.WGPlane = config.Plane;
 
-  launch_vectorized_fused_norm_kernel<scalar_t, weight_t, GemmaRMSNormForward, true>(
-      gemma_rms_norm_forward, config);
+  launch_vectorized_fused_norm_kernel<scalar_t, weight_t, GemmaRMSNormForward, true>(gemma_rms_norm_forward, config);
 }
 
 template <typename scalar_t, typename weight_t, typename mean_t = float>
@@ -401,7 +389,7 @@ void GemmaFusedAddRMSNormKernelImplInternal(
 
 void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
   std::optional<torch::Tensor> opt_weight = weight;
-  std::optional<torch::Tensor> opt_bias; 
+  std::optional<torch::Tensor> opt_bias;
   auto M_N = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
   auto M = M_N.first;
   auto N = M_N.second;
@@ -413,14 +401,14 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "RMSNormKernelImpl", [&]() {
-          RMSNormKernelImplInternal<scalar_t, scalar_t>(
-              input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), output_, rstd);
+        RMSNormKernelImplInternal<scalar_t, scalar_t>(
+            input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), output_, rstd);
       });
 }
 
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps) {
   std::optional<torch::Tensor> opt_weight = weight;
-  std::optional<torch::Tensor> opt_bias; 
+  std::optional<torch::Tensor> opt_bias;
   auto M_N = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
   auto M = M_N.first;
   auto N = M_N.second;
@@ -432,14 +420,14 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
 
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
-          FusedAddRMSNormKernelImplInternal<scalar_t, scalar_t>(
-              input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual_);
+        FusedAddRMSNormKernelImplInternal<scalar_t, scalar_t>(
+            input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual_);
       });
 }
 
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
   std::optional<torch::Tensor> opt_weight = weight;
-  std::optional<torch::Tensor> opt_bias; 
+  std::optional<torch::Tensor> opt_bias;
   auto M_N = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
   auto M = M_N.first;
   auto N = M_N.second;
@@ -451,14 +439,14 @@ void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& w
 
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
-          GemmaRMSNormKernelImplInternal<scalar_t, scalar_t>(
-              input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), output_, rstd);
+        GemmaRMSNormKernelImplInternal<scalar_t, scalar_t>(
+            input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), output_, rstd);
       });
 }
 
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps) {
   std::optional<torch::Tensor> opt_weight = weight;
-  std::optional<torch::Tensor> opt_bias; 
+  std::optional<torch::Tensor> opt_bias;
   auto M_N = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
   auto M = M_N.first;
   auto N = M_N.second;
@@ -470,9 +458,9 @@ void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torc
 
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "GemmaFusedAddRMSNormKernelImpl", [&]() {
-          GemmaFusedAddRMSNormKernelImplInternal<scalar_t, scalar_t>(
-              input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual_);
+        GemmaFusedAddRMSNormKernelImplInternal<scalar_t, scalar_t>(
+            input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual_);
       });
 }
 
-}
+}  // namespace at::native::xpu

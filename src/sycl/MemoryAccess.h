@@ -13,11 +13,11 @@
 #include "Utils.h"
 
 static inline int preferred_vector_width(at::DeviceIndex dev_id, int elem_sz) {
-  #define PRIVATE_CASE_SIZE(SIZE, TYPE) \
-  case SIZE: {  \
+#define PRIVATE_CASE_SIZE(SIZE, TYPE)                                       \
+  case SIZE: {                                                              \
     static_assert(sizeof(TYPE) == SIZE, "the TYPE size is not SIZE bytes"); \
-      ret = dpcppPrefVectorWidth<TYPE>(dev_id); \
-      break;  \
+    ret = dpcppPrefVectorWidth<TYPE>(dev_id);                               \
+    break;                                                                  \
   }
   size_t ret;
   switch (elem_sz) {

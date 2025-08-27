@@ -67,9 +67,7 @@ def fused_add_rmsnorm(
     enable_pdl: Optional[bool]
         Not Used on XPU.
     """
-    torch.ops.sgl_kernel.fused_add_rmsnorm(
-        input, residual, weight, eps
-    )
+    torch.ops.sgl_kernel.fused_add_rmsnorm(input, residual, weight, eps)
 
 
 def gemma_rmsnorm(
@@ -135,9 +133,7 @@ def gemma_fused_add_rmsnorm(
     enable_pdl: Optional[bool]
         Not Used on XPU.
     """
-    torch.ops.sgl_kernel.gemma_fused_add_rmsnorm(
-        input, residual, weight, eps
-    )
+    torch.ops.sgl_kernel.gemma_fused_add_rmsnorm(input, residual, weight, eps)
 
 
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:

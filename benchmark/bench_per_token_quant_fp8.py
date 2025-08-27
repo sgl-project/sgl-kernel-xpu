@@ -1,12 +1,13 @@
 import itertools
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import triton
 import triton.testing
 from sgl_kernel import sgl_per_token_quant_fp8
-from sglang.srt.utils import is_hip
 from vllm import _custom_ops as ops
+
+from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn

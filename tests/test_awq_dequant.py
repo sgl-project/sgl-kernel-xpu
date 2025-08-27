@@ -3,8 +3,8 @@ from typing import Optional, Tuple
 
 import pytest
 import torch
-from sgl_kernel import awq_dequantize
 import utils
+from sgl_kernel import awq_dequantize
 
 device = utils.get_device()
 

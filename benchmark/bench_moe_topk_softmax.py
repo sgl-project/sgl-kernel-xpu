@@ -1,10 +1,8 @@
 import itertools
 
-import pytest
 import torch
 import triton
 from sgl_kernel import topk_softmax
-from vllm import _custom_ops as vllm_custom_ops
 
 
 def vllm_topk_softmax(gating_output, topk):

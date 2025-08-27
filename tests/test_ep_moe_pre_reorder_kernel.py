@@ -3,6 +3,7 @@ import itertools
 import pytest
 import torch
 from sgl_kernel import ep_moe_pre_reorder
+
 from sglang.srt.layers.moe.ep_moe.kernels import pre_reorder_triton_kernel
 
 

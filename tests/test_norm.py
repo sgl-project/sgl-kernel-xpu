@@ -7,6 +7,7 @@ import utils
 
 device = utils.get_device()
 
+
 def llama_rms_norm(x, w, eps=1e-6):
     orig_dtype = x.dtype
     x = x.float()

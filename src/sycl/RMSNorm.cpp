@@ -107,7 +107,7 @@ class AddRMSNormForward : public RMSNormForward<scalar_t, weight_t> {
       scalar_t* add_data,
       int64_t M,
       int64_t N)
-      : RMSNormForward<scalar_t, weight_t>(X_data, Y_data, var_data, gamma_data, eps, M, N), add_data(add_data){};
+      : RMSNormForward<scalar_t, weight_t>(X_data, Y_data, var_data, gamma_data, eps, M, N), add_data(add_data) {};
   template <int vec_size, typename vec_t, typename weight_vec_t, typename index_t, typename nd_item_id>
   void reduce_combine(nd_item_id item_id, const NormConfig& cfg, accscalar_t& sum_value, accscalar_t& sum_tmp) const {
     auto group_id = item_id.get_group(0);
@@ -141,7 +141,7 @@ class GemmaRMSNormForward : public RMSNormForward<scalar_t, weight_t> {
   GemmaRMSNormForward() = delete;
   GemmaRMSNormForward(
       scalar_t* X_data, scalar_t* Y_data, mean_t* var_data, weight_t* gamma_data, accscalar_t eps, int64_t M, int64_t N)
-      : RMSNormForward<scalar_t, weight_t>(X_data, Y_data, var_data, gamma_data, eps, M, N){};
+      : RMSNormForward<scalar_t, weight_t>(X_data, Y_data, var_data, gamma_data, eps, M, N) {};
   template <int vec_size, typename index_t, typename vec_t, typename weight_vec_t, typename nd_item_id>
   void update(nd_item_id item_id, const NormConfig& cfg, accscalar_t sum_value = 0, accscalar_t sum_tmp = 0) const {
     auto group_id = item_id.get_group(0);

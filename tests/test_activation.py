@@ -11,6 +11,7 @@ elif torch.xpu.is_available():
 else:
     device = torch.device("cpu")
 
+
 @pytest.mark.parametrize("dim", [128, 256, 512, 2048, 4096, 11008, 16384])
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("seq_len", [1, 2, 4, 8, 16, 32, 64, 128, 512])

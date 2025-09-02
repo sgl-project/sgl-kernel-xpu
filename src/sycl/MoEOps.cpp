@@ -42,18 +42,14 @@ struct FusedTopkSoftmax {
         experts(experts),
         top_k(top_k) {}
 
-  static inline sycl::nd_range<3> get_nd_range(
-      const int tokens,
-      const int experts) {
+  static inline sycl::nd_range<3> get_nd_range(const int tokens, const int experts) {
     int calc_per_item = (experts + sub_group_size - 1) / sub_group_size;
     int group_size = (experts + calc_per_item - 1) / calc_per_item;
     group_size = group_size < sub_group_size ? sub_group_size : group_size;
     group_size = group_size < max_group_size ? group_size : max_group_size;
-    int sub_groups_per_group =
-        (group_size + sub_group_size - 1) / sub_group_size;
+    int sub_groups_per_group = (group_size + sub_group_size - 1) / sub_group_size;
     group_size = sub_groups_per_group * sub_group_size;
-    int global_size =
-        (tokens + sub_groups_per_group - 1) / sub_groups_per_group;
+    int global_size = (tokens + sub_groups_per_group - 1) / sub_groups_per_group;
 
     sycl::range<3> local(1, 1, group_size);
     sycl::range<3> global(1, 1, global_size);
@@ -66,8 +62,7 @@ struct FusedTopkSoftmax {
     return static_cast<T>(result);
   }
 
-  [[sycl::reqd_sub_group_size(sub_group_size)]] void operator()(
-      sycl::nd_item<3> item) const {
+  [[sycl::reqd_sub_group_size(sub_group_size)]] void operator()(sycl::nd_item<3> item) const {
     int group_id = item.get_group_linear_id();
     int local_range = item.get_local_range(2);
     int sub_groups_per_group = local_range / sub_group_size;
@@ -80,7 +75,7 @@ struct FusedTopkSoftmax {
     int tid = group_id * sub_groups_per_group + sg_id;
 
     if (tid >= tokens) {
-      return; // Out of bounds
+      return;  // Out of bounds
     }
 
     T local_elems[malloc_per_item];
@@ -92,7 +87,7 @@ struct FusedTopkSoftmax {
     if (start_offset + local_num >= experts) {
       local_num = experts - start_offset;
       if (local_num < 0) {
-        local_num = 0; // No elements to process
+        local_num = 0;  // No elements to process
       }
     }
 
@@ -120,8 +115,7 @@ struct FusedTopkSoftmax {
         for (int offset = sub_group_size / 2; offset > 0; offset /= 2) {
           T other_val = sycl::permute_group_by_xor(sg, my_val, offset);
           int other_idx = sycl::permute_group_by_xor(sg, my_idx, offset);
-          if (other_val > my_val ||
-              (other_val == my_val && other_idx < my_idx)) {
+          if (other_val > my_val || (other_val == my_val && other_idx < my_idx)) {
             my_val = other_val;
             my_idx = other_idx;
           }
@@ -131,7 +125,7 @@ struct FusedTopkSoftmax {
           k_max_idx = my_idx;
 
           if (k_max_idx == local_idx[e]) {
-            remove_ix = e; // Mark this index for removal
+            remove_ix = e;  // Mark this index for removal
           } else
             remove_ix = -1;
         }
@@ -197,8 +191,7 @@ struct FusedTopkSoftmax {
             int,
             sycl::memory_order_relaxed,
             sycl::memory_scope_device,
-            sycl::access::address_space::global_space>(
-            *(rows_for_experts + topk_ids_local[i]));
+            sycl::access::address_space::global_space>(*(rows_for_experts + topk_ids_local[i]));
         int old = ref_num_tokens.fetch_add(1);
         offsets[offset + i] = old;
       }
@@ -227,23 +220,22 @@ void launch_fused_topk_softmax(
     const int top_k,
     const int num_tokens,
     const int num_experts) {
-
   using Kernel = FusedTopkSoftmax<T>;
   auto range = Kernel::get_nd_range(num_tokens, num_experts);
 
   auto global_range = range.get_global_range();
   auto local_range = range.get_local_range();
 
-    Kernel task(
-        topk_weights,
-        topk_indices,
-        rows_for_experts,
-        offsets,
-        gating_output,
-        renormalize,
-        num_tokens,
-        num_experts,
-        top_k);
+  Kernel task(
+      topk_weights,
+      topk_indices,
+      rows_for_experts,
+      offsets,
+      gating_output,
+      renormalize,
+      num_tokens,
+      num_experts,
+      top_k);
 
   sycl_kernel_submit(global_range, local_range, queue, task);
   return;
@@ -260,9 +252,8 @@ void fused_topk_softmax(
     const int num_tokens,
     const int num_experts,
     const int topk) {
-
   auto stream = at::xpu::getCurrentXPUStream();
-  auto queue = stream.queue();  
+  auto queue = stream.queue();
 
   launch_fused_topk_softmax(
       queue,
@@ -276,7 +267,7 @@ void fused_topk_softmax(
       num_tokens,
       num_experts);
 };
-}; // namespace TopKSoftmaxImpl
+};  // namespace TopKSoftmaxImpl
 
 /**
  * @brief Perform topk after softmax on gating_output.
@@ -286,39 +277,22 @@ void fused_topk_softmax(
  * @param renormalize The renormalize bool whether the topk_weights needs to be renormalized.
  * @return void.
  */
-void topk_softmax(
-    at::Tensor& topk_weights,
-    at::Tensor& topk_indices,
-    at::Tensor& gating_output,
-    bool renormalize) {
+void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize) {
   auto shape = gating_output.sizes().vec();
-  TORCH_CHECK(
-      shape.size() == 2,
-      "gating_output must be 2D tensor, but got ",
-      shape.size(),
-      "D");
+  TORCH_CHECK(shape.size() == 2, "gating_output must be 2D tensor, but got ", shape.size(), "D");
   int n_tokens = shape[0];
   int n_experts = shape[1];
 
-  TORCH_CHECK(
-      n_experts <= 128,
-      "n_experts only support up to 128, but got ",
-      n_experts);
+  TORCH_CHECK(n_experts <= 128, "n_experts only support up to 128, but got ", n_experts);
 
-  int n_experts_aligned = (n_experts + 7) / 8 * 8; // align to 8
+  int n_experts_aligned = (n_experts + 7) / 8 * 8;  // align to 8
 
   int64_t n_topk = topk_weights.size(1);
 
-  auto rows_for_experts =
-      at::zeros({n_experts_aligned}, at::dtype(at::kInt).device(at::kXPU));
-  auto offsets =
-      at::empty({n_tokens, n_topk}, at::dtype(at::kInt).device(at::kXPU));
+  auto rows_for_experts = at::zeros({n_experts_aligned}, at::dtype(at::kInt).device(at::kXPU));
+  auto offsets = at::empty({n_tokens, n_topk}, at::dtype(at::kInt).device(at::kXPU));
   AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::kBFloat16,
-      at::kHalf,
-      gating_output.scalar_type(),
-      "fused_topk_softmax_kernel",
-      [&]() {
+      at::kBFloat16, at::kHalf, gating_output.scalar_type(), "fused_topk_softmax_kernel", [&]() {
         TopKSoftmaxImpl::fused_topk_softmax<scalar_t>(
             reinterpret_cast<scalar_t*>(gating_output.data_ptr()),
             reinterpret_cast<float*>(topk_weights.data_ptr()),

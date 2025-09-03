@@ -22,23 +22,24 @@ repos:
     rev: 5.13.2
     hooks:
       - id: isort
+        args: [--profile, black]
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.11.7
     hooks:
       - id: ruff
         args: [--select=F401, --fixable=F401]
-        files: ^(benchmark/|docs/|examples/)
+        files: ^(docs/|examples/)
         exclude: \.ipynb$
   - repo: https://github.com/psf/black
     rev: 24.10.0
     hooks:
-      - id: black-jupyter
+      - id: black
   - repo: https://github.com/codespell-project/codespell
     rev: v2.4.1
     hooks:
       - id: codespell
         additional_dependencies: ['tomli']
-        args: ['--toml', 'python/pyproject.toml', '-L', 'cann']
+        args: ['--toml', 'pyproject.toml', '-L', 'cann']
         exclude: |
           (?x)^(
             test/srt/test_reasoning_parser\.py|

@@ -8,8 +8,9 @@ from typing import Any, List, Optional
 import sgl_kernel.allreduce as custom_ops
 import torch
 import torch.distributed as dist
-from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from torch.distributed import ProcessGroup
+
+from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 
 
 def _run_correctness_worker(world_size, rank, distributed_init_port, test_sizes):

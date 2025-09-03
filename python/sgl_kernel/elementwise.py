@@ -4,8 +4,6 @@ import torch
 from sgl_kernel.utils import get_cuda_stream, is_hopper_arch
 
 
-# These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
-# Kudos to @yzh119
 def rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -28,9 +26,7 @@ def rmsnorm(
     out: Optional[torch.Tensor]
         The output tensor, if specified, the kernel will update this tensor inplace.
     enable_pdl: Optional[bool]
-        Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
+        Not Used on XPU.
 
     Returns
     -------
@@ -39,9 +35,7 @@ def rmsnorm(
     """
     if out is None:
         out = torch.empty_like(input)
-    if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
-    torch.ops.sgl_kernel.rmsnorm.default(out, input, weight, eps, enable_pdl)
+    torch.ops.sgl_kernel.rmsnorm(out, input, weight, eps)
     return out
 
 
@@ -71,15 +65,9 @@ def fused_add_rmsnorm(
     eps: float
         Epsilon for numerical stability.
     enable_pdl: Optional[bool]
-        Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
+        Not Used on XPU.
     """
-    if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
-    torch.ops.sgl_kernel.fused_add_rmsnorm.default(
-        input, residual, weight, eps, enable_pdl
-    )
+    torch.ops.sgl_kernel.fused_add_rmsnorm(input, residual, weight, eps)
 
 
 def gemma_rmsnorm(
@@ -104,9 +92,7 @@ def gemma_rmsnorm(
     out: Optional[torch.Tensor]
         The output tensor, if specified, the kernel will update this tensor inplace.
     enable_pdl: Optional[bool]
-        Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
+        Not Used on XPU.
 
     Returns
     -------
@@ -115,9 +101,7 @@ def gemma_rmsnorm(
     """
     if out is None:
         out = torch.empty_like(input)
-    if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
-    torch.ops.sgl_kernel.gemma_rmsnorm.default(out, input, weight, eps, enable_pdl)
+    torch.ops.sgl_kernel.gemma_rmsnorm(out, input, weight, eps)
     return out
 
 
@@ -147,15 +131,9 @@ def gemma_fused_add_rmsnorm(
     eps: float
         Epsilon for numerical stability.
     enable_pdl: Optional[bool]
-        Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
+        Not Used on XPU.
     """
-    if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
-    torch.ops.sgl_kernel.gemma_fused_add_rmsnorm.default(
-        input, residual, weight, eps, enable_pdl
-    )
+    torch.ops.sgl_kernel.gemma_fused_add_rmsnorm(input, residual, weight, eps)
 
 
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
@@ -179,7 +157,7 @@ def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
             device=input.device,
             dtype=input.dtype,
         )
-    torch.ops.sgl_kernel.silu_and_mul.default(out, input)
+    torch.ops.sgl_kernel.silu_and_mul(out, input)
     return out
 
 
@@ -194,7 +172,7 @@ def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Te
             device=input.device,
             dtype=input.dtype,
         )
-    torch.ops.sgl_kernel.gelu_tanh_and_mul.default(out, input)
+    torch.ops.sgl_kernel.gelu_tanh_and_mul(out, input)
     return out
 
 
@@ -209,7 +187,7 @@ def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
             device=input.device,
             dtype=input.dtype,
         )
-    torch.ops.sgl_kernel.gelu_and_mul.default(out, input)
+    torch.ops.sgl_kernel.gelu_and_mul(out, input)
     return out
 
 

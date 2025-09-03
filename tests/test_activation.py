@@ -3,13 +3,10 @@
 import pytest
 import sgl_kernel
 import torch
+import utils
 
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-elif torch.xpu.is_available():
-    device = torch.device("xpu")
-else:
-    device = torch.device("cpu")
+device = utils.get_device()
+
 
 @pytest.mark.parametrize("dim", [128, 256, 512, 2048, 4096, 11008, 16384])
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])

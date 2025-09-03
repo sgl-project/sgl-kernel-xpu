@@ -117,14 +117,15 @@ int64_t cutlass_mla_get_workspace_size(
 /*
  * From csrc/elementwise
  */
-void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
-void sgl_fused_add_rmsnorm(
-    torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps, bool enable_pdl);
-void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
-void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, bool enable_pdl);
-void silu_and_mul(at::Tensor& out, at::Tensor& input);
-void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input);
-void gelu_and_mul(at::Tensor& out, at::Tensor& input);
+namespace at::native::xpu {
+void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
+void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
+void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
+void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
+}  // namespace at::native::xpu
+void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
+void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
+void gelu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor q,
     at::Tensor k,

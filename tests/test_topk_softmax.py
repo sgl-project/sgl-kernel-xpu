@@ -2,13 +2,9 @@ import pytest
 import sgl_kernel
 import torch
 import torch.nn.functional as F
+import utils
 
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-elif torch.xpu.is_available():
-    device = torch.device("xpu")
-else:
-    device = torch.device("cpu")
+device = utils.get_device()
 
 
 def fused_topk_torch_native(

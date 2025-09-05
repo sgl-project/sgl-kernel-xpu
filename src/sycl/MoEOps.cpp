@@ -1,14 +1,8 @@
 #include <ATen/ATen.h>
-#include <ATen/OpMathType.h>
-#include <ATen/Parallel.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
-#include <cmath>
-#include <cstdint>
-#include <iostream>
 #include <sycl/sycl.hpp>
-#include <vector>
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
@@ -22,7 +16,7 @@ struct FusedTopkSoftmax {
   static constexpr int sub_group_size = 32;
   static constexpr int max_group_size = 1024;
   static constexpr int malloc_per_item = 8;
-  static constexpr float kNegInfinity = INFINITY * -1;
+  static constexpr float kNegInfinity = -std::numeric_limits<float>::infinity();
 
   FusedTopkSoftmax(
       float* topk_weights,

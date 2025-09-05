@@ -281,6 +281,9 @@ void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor
 
   TORCH_CHECK(n_experts <= 128, "n_experts only support up to 128, but got ", n_experts);
 
+  TORCH_CHECK(topk_weights.scalar_type() == at::kFloat, "topk_weights should be Float");
+  TORCH_CHECK(topk_indices.scalar_type() == at::kInt, "topk_indices should be Int");
+
   constexpr int64_t alignment = 8;
   int64_t n_experts_aligned = div_up(n_experts, alignment) * alignment;  // align to 8
 
@@ -290,11 +293,11 @@ void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor
   auto offsets = at::empty({n_tokens, n_topk}, at::dtype(at::kInt).device(at::kXPU));
   AT_DISPATCH_REDUCED_FLOATING_TYPES(gating_output.scalar_type(), "fused_topk_softmax_kernel", [&]() {
     TopKSoftmaxImpl::fused_topk_softmax<scalar_t>(
-        reinterpret_cast<scalar_t*>(gating_output.data_ptr()),
-        reinterpret_cast<float*>(topk_weights.data_ptr()),
-        reinterpret_cast<int*>(topk_indices.data_ptr()),
-        reinterpret_cast<int*>(rows_for_experts.data_ptr()),
-        reinterpret_cast<int*>(offsets.data_ptr()),
+        gating_output.data_ptr<scalar_t>(),
+        topk_weights.data_ptr<float>(),
+        topk_indices.data_ptr<int>(),
+        rows_for_experts.data_ptr<int>(),
+        offsets.data_ptr<int>(),
         renormalize,
         n_tokens,
         n_experts,

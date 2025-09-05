@@ -27,7 +27,7 @@ jobs:
         run: |
           docker build \
             --build-arg SG_LANG_KERNEL_BRANCH=${{ github.head_ref }} \
-            --build-arg SG_LANG_REPO=${{ github.event.pull_request.head.repo.clone_url }} \
+            --build-arg SG_LANG_KERNEL_REPO=${{ github.event.pull_request.head.repo.clone_url }} \
             --no-cache --progress=plain -f Dockerfile.xpu_kernel -t xpu_sglang:pvc .
 
       - name: Run container
@@ -81,4 +81,3 @@ jobs:
           fi
           echo "All jobs completed successfully"
           exit 0
-          

@@ -21,8 +21,6 @@ struct FusedTopkSoftmax {
   FusedTopkSoftmax(
       float* topk_weights,
       int* topk_ids,
-      int* rows_for_experts,
-      int* offsets,
       const T* gating_output,
       const bool renormalize,
       const int tokens,
@@ -30,8 +28,6 @@ struct FusedTopkSoftmax {
       const int top_k)
       : topk_weights(topk_weights),
         topk_ids(topk_ids),
-        rows_for_experts(rows_for_experts),
-        offsets(offsets),
         gating_output(gating_output),
         renormalize(renormalize),
         tokens(tokens),
@@ -179,24 +175,14 @@ struct FusedTopkSoftmax {
         if (topk_ids_local[i] < 0 || topk_ids_local[i] >= experts) {
           // Ensure valid index
           topk_ids[offset + i] = 0;
-          offsets[offset + i] = 0;
           continue;
         }
         topk_ids[offset + i] = topk_ids_local[i];
-        auto ref_num_tokens = sycl::atomic_ref<
-            int,
-            sycl::memory_order_relaxed,
-            sycl::memory_scope_device,
-            sycl::access::address_space::global_space>(*(rows_for_experts + topk_ids_local[i]));
-        int old = ref_num_tokens.fetch_add(1);
-        offsets[offset + i] = old;
       }
     }
   }
   float* topk_weights;
   int* topk_ids;
-  int* rows_for_experts;
-  int* offsets;
   const T* gating_output;
   const bool renormalize;
   const int tokens;
@@ -210,8 +196,6 @@ void launch_fused_topk_softmax(
     const T* gating_output,
     float* topk_weights,
     int* topk_indices,
-    int* rows_for_experts,
-    int* offsets,
     const bool renormalize,
     const int top_k,
     const int num_tokens,
@@ -222,16 +206,7 @@ void launch_fused_topk_softmax(
   auto global_range = range.get_global_range();
   auto local_range = range.get_local_range();
 
-  Kernel task(
-      topk_weights,
-      topk_indices,
-      rows_for_experts,
-      offsets,
-      gating_output,
-      renormalize,
-      num_tokens,
-      num_experts,
-      top_k);
+  Kernel task(topk_weights, topk_indices, gating_output, renormalize, num_tokens, num_experts, top_k);
 
   sycl_kernel_submit(global_range, local_range, queue, task);
   return;
@@ -242,8 +217,6 @@ void fused_topk_softmax(
     const T* gating_output,
     float* topk_weights,
     int* topk_indices,
-    int* rows_for_experts,
-    int* offsets,
     const bool renormalize,
     const int num_tokens,
     const int num_experts,
@@ -252,16 +225,7 @@ void fused_topk_softmax(
   auto queue = stream.queue();
 
   launch_fused_topk_softmax(
-      queue,
-      gating_output,
-      topk_weights,
-      topk_indices,
-      rows_for_experts,
-      offsets,
-      renormalize,
-      topk,
-      num_tokens,
-      num_experts);
+      queue, gating_output, topk_weights, topk_indices, renormalize, topk, num_tokens, num_experts);
 };
 };  // namespace TopKSoftmaxImpl
 
@@ -289,15 +253,11 @@ void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor
 
   int64_t n_topk = topk_weights.size(1);
 
-  auto rows_for_experts = at::zeros({n_experts_aligned}, at::dtype(at::kInt).device(at::kXPU));
-  auto offsets = at::empty({n_tokens, n_topk}, at::dtype(at::kInt).device(at::kXPU));
   AT_DISPATCH_REDUCED_FLOATING_TYPES(gating_output.scalar_type(), "fused_topk_softmax_kernel", [&]() {
     TopKSoftmaxImpl::fused_topk_softmax<scalar_t>(
         gating_output.data_ptr<scalar_t>(),
         topk_weights.data_ptr<float>(),
         topk_indices.data_ptr<int>(),
-        rows_for_experts.data_ptr<int>(),
-        offsets.data_ptr<int>(),
         renormalize,
         n_tokens,
         n_experts,

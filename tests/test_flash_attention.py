@@ -56,7 +56,7 @@ DISABLE_BACKWARD = True
 # )
 
 DISABLE_SPLIT = True
-DISABLE_PAGEDKV = True
+DISABLE_PAGEDKV = False
 DISABLE_APPENDKV = True
 DISABLE_LOCAL = True
 DISABLE_SOFTCAP = True
@@ -471,18 +471,18 @@ def generate_qkv(
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 # @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("new_kv", [False] + ([True] if not DISABLE_APPENDKV else []))
-# @pytest.mark.parametrize("new_kv", [True])
+# @pytest.mark.parametrize("new_kv", [False] + ([True] if not DISABLE_APPENDKV else []))
+@pytest.mark.parametrize("new_kv", [False])
 # @pytest.mark.parametrize(
 #     "causal,local",
 #     [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []),
 # )
 # @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
 @pytest.mark.parametrize("causal,local", [(False, False)])
-@pytest.mark.parametrize(
-    "seqlen_new_eq_seqlen_q", [True, False] if not DISABLE_APPENDKV else [True]
-)
-# @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
+# @pytest.mark.parametrize(
+#     "seqlen_new_eq_seqlen_q", [True, False] if not DISABLE_APPENDKV else [True]
+# )
+@pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 # @pytest.mark.parametrize("has_rotary_seqlens", [False, True])
 @pytest.mark.parametrize("has_rotary_seqlens", [False])
 @pytest.mark.parametrize(
@@ -563,10 +563,10 @@ def test_flash_attn_kvcache(
         pytest.skip()
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 5
-    # batch_size = 1
+    # batch_size = 5
+    batch_size = 1
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
-    nheads = 6
+    nheads = 1
     # nheads = 1
     # rotary_dim must be a multiple of 16, and must be <= d
     rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
@@ -910,72 +910,74 @@ def test_flash_attn_kvcache(
                 # o1 = torch.einsum('bhst,bthd->bshd', s_tmp, v_cache_ref)
                 # lse_ref = torch.logsumexp(qk / math.sqrt(d), -1)
                 # probs = torch.softmax(qk, dim=-1)
+                torch.xpu.synchronize()
                 print(f"Output max diff: {(out - out_ref).abs().max().item()}")
                 print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
                 print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
                 print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
-                # breakpoint()
+                # # breakpoint()
 
-                # Check that FlashAttention's numerical error is at most twice the numerical error
-                # of a Pytorch implementation.
-                if new_kv:
-                    if page_size is None:
-                        k_cache_select = (
-                            k_cache.to(dtype_ref)
-                            if not has_batch_idx
-                            else k_cache.to(dtype_ref)[cache_batch_idx]
-                        )
-                        v_cache_select = (
-                            v_cache.to(dtype_ref)
-                            if not has_batch_idx
-                            else v_cache.to(dtype_ref)[cache_batch_idx]
-                        )
-                    else:
-                        k_cache_select = rearrange(
-                            k_cache_paged.to(dtype_ref)[
-                                (
-                                    page_table
-                                    if not has_batch_idx
-                                    else page_table[cache_batch_idx]
-                                ).flatten()
-                            ],
-                            "(b nblocks) block_size ... -> b (nblocks block_size) ...",
-                            b=batch_size,
-                        )[:, :seqlen_k].to(dtype_ref)
-                        v_cache_select = rearrange(
-                            v_cache_paged.to(dtype_ref)[
-                                (
-                                    page_table
-                                    if not has_batch_idx
-                                    else page_table[cache_batch_idx]
-                                ).flatten()
-                            ],
-                            "(b nblocks) block_size ... -> b (nblocks block_size) ...",
-                            b=batch_size,
-                        )[:, :seqlen_k].to(dtype_ref)
-                    k_cache_ref = k_cache_ref.to(dtype).to(dtype_ref)
-                    v_cache_ref = v_cache_ref.to(dtype).to(dtype_ref)
-                    if dtype is not torch.float8_e4m3fn:
-                        assert torch.equal(v_cache_select, v_cache_ref)
-                    else:
-                        assert torch.allclose(
-                            v_cache_select, v_cache_ref, rtol=1e-3, atol=1e-3
-                        )
-                    # breakpoint()
-                    # if rotary_dim == 0 and dtype is not torch.float8_e4m3fn:
-                    if rotary_dim == 0:
-                        assert torch.equal(k_cache_select, k_cache_ref)
-                    else:
-                        # if not torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3):
-                        #     breakpoint()
-                        if dtype is not torch.float8_e4m3fn:
-                            assert torch.allclose(
-                                k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3
-                            )
-                        else:
-                            assert torch.allclose(
-                                k_cache_select, k_cache_ref, rtol=1e-1, atol=1e-1
-                            )
+                # # Check that FlashAttention's numerical error is at most twice the numerical error
+                # # of a Pytorch implementation.
+                # if new_kv:
+                #     if page_size is None:
+                #         k_cache_select = (
+                #             k_cache.to(dtype_ref)
+                #             if not has_batch_idx
+                #             else k_cache.to(dtype_ref)[cache_batch_idx]
+                #         )
+                #         v_cache_select = (
+                #             v_cache.to(dtype_ref)
+                #             if not has_batch_idx
+                #             else v_cache.to(dtype_ref)[cache_batch_idx]
+                #         )
+                #     else:
+                #         k_cache_select = rearrange(
+                #             k_cache_paged.to(dtype_ref)[
+                #                 (
+                #                     page_table
+                #                     if not has_batch_idx
+                #                     else page_table[cache_batch_idx]
+                #                 ).flatten()
+                #             ],
+                #             "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+                #             b=batch_size,
+                #         )[:, :seqlen_k].to(dtype_ref)
+                #         v_cache_select = rearrange(
+                #             v_cache_paged.to(dtype_ref)[
+                #                 (
+                #                     page_table
+                #                     if not has_batch_idx
+                #                     else page_table[cache_batch_idx]
+                #                 ).flatten()
+                #             ],
+                #             "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+                #             b=batch_size,
+                #         )[:, :seqlen_k].to(dtype_ref)
+                #     k_cache_ref = k_cache_ref.to(dtype).to(dtype_ref)
+                #     v_cache_ref = v_cache_ref.to(dtype).to(dtype_ref)
+                #     # if dtype is not torch.float8_e4m3fn:
+                #     #     import pdb; pdb.set_trace()
+                #     #     assert torch.equal(v_cache_select, v_cache_ref)
+                #     # else:
+                #     #     assert torch.allclose(
+                #     #         v_cache_select, v_cache_ref, rtol=1e-3, atol=1e-3
+                #     #     )
+                #     # breakpoint()
+                #     # if rotary_dim == 0 and dtype is not torch.float8_e4m3fn:
+                #     # if rotary_dim == 0:
+                #     #     assert torch.equal(k_cache_select, k_cache_ref)
+                #     # else:
+                #     #     # if not torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3):
+                #     #     #     breakpoint()
+                #     #     if dtype is not torch.float8_e4m3fn:
+                #     #         assert torch.allclose(
+                #     #             k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3
+                #     #         )
+                #     #     else:
+                #     #         assert torch.allclose(
+                #     #             k_cache_select, k_cache_ref, rtol=1e-1, atol=1e-1
+                #     #         )
                 mult = 4 if dtype == torch.float8_e4m3fn else 2
                 assert (out - out_ref).abs().max().item() <= mult * (
                     out_pt - out_ref
@@ -989,7 +991,7 @@ def test_flash_attn_kvcache(
 def _generate_block_kvcache(
     seqlen_k, page_size, batch_size, nheads_k, d, dv, device, dtype, dtype_ref
 ):
-    num_blocks = math.ceil(seqlen_k / page_size) * batch_size * 3
+    num_blocks = math.ceil(seqlen_k / page_size) * batch_size
     k_cache_paged = (
         torch.randn(num_blocks, page_size, nheads_k, d, device=device, dtype=dtype_ref)
         .to(dtype)

@@ -61,7 +61,8 @@ struct Flash_fwd_params {
 
   // The dimensions.
   int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim;
-  int total_q, total_k, total_knew;
+  int total_q, total_k;
+  int total_knew = 0;
   int b_k;             // When having KV cache and with cache_batch_idx, K & V might have larger batch size than Q
   int dv, dv_rounded;  // For the case where V headdim is different from Q/K headdim
 
@@ -117,6 +118,7 @@ struct Flash_fwd_params {
 
   // Paged KV cache
   int* __restrict__ page_table;
+  int* __restrict__ num_pages_per_seq;
   index_t page_table_batch_stride;
   int page_size;
   int num_pages;
@@ -197,29 +199,6 @@ struct ExampleRunner {
   StrideK stride_K_cache;
   StrideV stride_V_cache;
   StrideO stride_O;
-  uint64_t seed = 0;
-
-  cutlass::DeviceAllocation<ElementQ> block_Q;
-  cutlass::DeviceAllocation<ElementK> block_K;
-  cutlass::DeviceAllocation<ElementV> block_V;
-  cutlass::DeviceAllocation<ElementK> block_K_cache;
-  cutlass::DeviceAllocation<ElementV> block_V_cache;
-  cutlass::DeviceAllocation<ElementOutput> block_O;
-  cutlass::DeviceAllocation<ElementOutput> block_ref_O;
-
-  std::vector<int> cumulative_seqlen_q;
-  std::vector<int> cumulative_seqlen_kv;
-  std::vector<int> cumulative_seqlen_kv_cache;
-  cutlass::DeviceAllocation<int> device_cumulative_seqlen_q;
-  cutlass::DeviceAllocation<int> device_cumulative_seqlen_kv;
-  cutlass::DeviceAllocation<int> device_cumulative_seqlen_kv_cache;
-
-  struct PagedKVParams {
-    cutlass::DeviceAllocation<int> page_table;
-    int page_size = 0;
-    cutlass::DeviceAllocation<int> num_pages_per_seq;
-  };
-  PagedKVParams paged_kv_cache;
 
   template <class ProblemShape>
   auto initialize_varlen(const Flash_fwd_params& params, ProblemShape& problem_size) {
@@ -228,33 +207,22 @@ struct ExampleRunner {
     constexpr int AlignmentQ = cacheline_bytes / sizeof(ElementQ);   // Alignment of Q matrix in units of elements
     constexpr int AlignmentKV = cacheline_bytes / sizeof(ElementK);  // Alignment of Kand V matrix in units of elements
 
-    cumulative_seqlen_q = {0};
-    cumulative_seqlen_kv = {0};
-    cumulative_seqlen_kv_cache = {0};
-
-    int total_seqlen_q = 0;
-    int total_seqlen_kv = 0;
-    int total_seqlen_kv_cache = 0;
-    int max_seqlen_q = 0;
-    int max_seqlen_kv = 0;
-    int max_seqlen_kv_cache = 0;
-
     ProblemShape problem_size_for_init = problem_size;
     get<0>(problem_size_for_init) = 1;
     get<3>(problem_size_for_init) = params.total_q;
-    get<4>(problem_size_for_init) = params.total_knew;
+    get<4>(problem_size_for_init) = 0;
     get<5>(problem_size_for_init) = params.total_k;
 
     ProblemShapeType problem_size_for_launch;
 
-    get<3>(problem_size_for_launch) = cutlass::fmha::collective::VariableLength{params.total_q};
-    get<4>(problem_size_for_launch) = cutlass::fmha::collective::VariableLength{params.total_knew};
-    get<5>(problem_size_for_launch) = cutlass::fmha::collective::VariableLength{params.total_k};
-    get<6>(problem_size_for_launch) = get<6>(problem_size);
-    get<7>(problem_size_for_launch) = get<7>(problem_size);
     get<0>(problem_size_for_launch) = get<0>(problem_size);
     get<1>(problem_size_for_launch) = get<1>(problem_size);
     get<2>(problem_size_for_launch) = get<2>(problem_size);
+    get<3>(problem_size_for_launch) = cutlass::fmha::collective::VariableLength{params.seqlen_q};
+    get<4>(problem_size_for_launch) = cutlass::fmha::collective::VariableLength{params.seqlen_knew};
+    get<5>(problem_size_for_launch) = cutlass::fmha::collective::VariableLength{params.seqlen_k};
+    get<6>(problem_size_for_launch) = get<6>(problem_size);
+    get<7>(problem_size_for_launch) = get<7>(problem_size);
 
     return cute::make_tuple(problem_size_for_init, problem_size_for_launch);
   }
@@ -276,8 +244,8 @@ struct ExampleRunner {
 
     if constexpr (isVarLen) {
       auto [problem_shape_init, problem_shape_launch] = initialize_varlen(params, problem_shape_in);
-      problem_shape = problem_shape_launch;
       problem_size = problem_shape_init;
+      problem_shape = problem_shape_launch;
     } else {
       problem_size = problem_shape_in;
       problem_shape = problem_shape_in;
@@ -286,11 +254,8 @@ struct ExampleRunner {
     auto [batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, head_size_qk, head_size_vo] =
         problem_size;
     auto group_q_size = num_heads_q / num_heads_kv;
-    ;
     auto group_q_num = num_heads_q / group_q_size;
 
-    // stride_Q = cutlass::make_cute_packed_stride(StrideQ{}, cute::make_shape(seq_len_qo * group_q_size, head_size_qk,
-    // batch * group_q_num));
     stride_Q =
         cutlass::make_cute_packed_stride(StrideQ{}, cute::make_shape(seq_len_qo, num_heads_q * head_size_qk, batch));
     stride_K =
@@ -301,19 +266,9 @@ struct ExampleRunner {
     stride_K_cache = cutlass::make_cute_packed_stride(
         StrideK{}, cute::make_shape(seq_len_kv_cache, num_heads_kv * head_size_qk, batch));
     stride_V_cache = cutlass::make_cute_packed_stride(
-        StrideV{}, cute::make_shape(head_size_vo, seq_len_kv_cache, batch * num_heads_kv));
-    // stride_O = cutlass::make_cute_packed_stride(StrideO{}, cute::make_shape(seq_len_qo * group_q_size, head_size_vo,
-    // batch * group_q_num));
+        StrideV{}, cute::make_shape(head_size_vo * head_size_qk, seq_len_kv_cache, batch * num_heads_kv));
     stride_O = cutlass::make_cute_packed_stride(
-        StrideO{}, cute::make_shape(seq_len_qo * group_q_size, group_q_num * head_size_vo, batch));
-
-    block_Q.reset(batch * num_heads_q * seq_len_qo * head_size_qk);
-    block_K.reset(batch * num_heads_kv * seq_len_kv * head_size_qk);
-    block_V.reset(batch * num_heads_kv * seq_len_kv * head_size_vo);
-    block_K_cache.reset(batch * num_heads_kv * seq_len_kv_cache * head_size_qk);
-    block_V_cache.reset(batch * num_heads_kv * seq_len_kv_cache * head_size_vo);
-    block_O.reset(batch * num_heads_q * seq_len_qo * head_size_vo);
-    block_ref_O.reset(batch * num_heads_q * seq_len_qo * head_size_vo);
+        StrideQ{}, cute::make_shape(seq_len_qo * group_q_size, group_q_num * head_size_vo, batch));
 
     if constexpr (isVarLen) {
       get<3>(problem_shape).cumulative_length = params.cu_seqlens_q;
@@ -356,9 +311,10 @@ struct ExampleRunner {
           ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
     };
     auto q = syclcompat::get_default_queue();
-    auto event = q.submit(cgf);
+    q.submit(cgf).wait();
+    // auto event = q.submit(cgf);
 
-    EventManager::getInstance().addEvent(event);
+    // EventManager::getInstance().addEvent(event);
   }
 
   cutlass::Status run(const Flash_fwd_params& params, const cutlass::KernelHardwareInfo& hw_info) {
@@ -367,21 +323,24 @@ struct ExampleRunner {
     typename FMHAChunkPrefillKernel::Arguments arguments{
         cutlass::gemm::GemmUniversalMode::kGemm,
         problem_size,
-        {block_Q.get(),
+        {// static_cast<const ElementQ*>(params.q_ptr),
+         static_cast<const ElementQ*>(params.q_ptr),
          stride_Q,
-         block_K.get(),
+         static_cast<const ElementK*>(params.knew_ptr),
          stride_K,
-         block_V.get(),
+         static_cast<const ElementV*>(params.vnew_ptr),
          stride_V,
-         block_K_cache.get(),
+         static_cast<const ElementV*>(params.k_ptr),
          stride_K_cache,
-         block_V_cache.get(),
+         static_cast<const ElementV*>(params.v_ptr),
          stride_V_cache,
          params.page_table,
          params.page_size,
-         params.cu_seqlens_k},
-        {params.scale_softmax},
-        {block_O.get(), stride_O},
+         params.num_pages_per_seq,
+         -1,
+         -1},
+        {(ElementQ)params.scale_softmax},
+        {static_cast<const ElementOutput*>(params.o_ptr), stride_O},
         hw_info};
 
     // Define device-global scratch memory
@@ -412,6 +371,7 @@ template <
     typename TileShapeOutput,
     typename SubgroupLayout,
     int PipelineStages,
+    bool LocalMask = false,
     typename ElementInputQ = bfloat16_t,
     typename ElementInputKV = bfloat16_t,
     typename MMAOperation = XE_8x16x16_F32BF16BF16F32_TT,
@@ -420,8 +380,8 @@ template <
     typename GmemTiledCopyV = XE_2D_U16x16x32_LD_V,
     typename ElementAccumulator = float,
     typename ElementComputeEpilogue = float,
-    typename ElementOutput = float,
-    typename GmemTiledCopyStore = XE_2D_U32x8x16_ST_N>
+    typename ElementOutput = bfloat16_t,
+    typename GmemTiledCopyStore = XE_2D_U16x8x16_ST_N>
 struct FMHAConfig {
   template <bool isVarLen, bool PagedKV, class Scheduler>
   static int run(const Flash_fwd_params& params) {
@@ -442,7 +402,7 @@ struct FMHAConfig {
         ElementOutput,
         GmemTiledCopyStore>;
     using CollectiveSoftmaxEpilogue = cutlass::flash_attention::collective::
-        FlashChunkPrefillSoftmaxEpilogue<Causal, EpilogueDispatchPolicy, ElementAccumulator>;
+        FlashChunkPrefillSoftmaxEpilogue<Causal, false, EpilogueDispatchPolicy, ElementAccumulator>;
 
     using ProblemShapeRegular = cute::tuple<int, int, int, int, int, int, int, int>;
     using namespace cutlass::fmha::collective;
@@ -467,6 +427,7 @@ struct FMHAConfig {
         GmemTiledCopyK,  // K
         GmemTiledCopyV,  // V,
         Causal,
+        LocalMask,
         PagedKV>;
 
     using FMHAChunkPrefillKernel = cutlass::flash_attention::kernel::FMHAPrefillChunk<
@@ -484,7 +445,11 @@ struct FMHAConfig {
 
   static int run(const Flash_fwd_params& params) {
     // only support varlen and paged kv now
-    return run<true, true, cutlass::flash_attention::IndividualScheduler>(params);
+    if (params.page_table != nullptr && params.cu_seqlens_k != nullptr) {
+      return run<true, true, cutlass::flash_attention::IndividualScheduler>(params);
+    } else {
+      return 0;
+    }
   }
 };
 
@@ -523,18 +488,13 @@ std::vector<at::Tensor> mha_fwd(
     std::optional<const at::Tensor>&
         v_new_,  // (b, s_k_new, h_k, dv) or (total_k_new, h_k, dv) if there is cu_seqlens_k_new
     std::optional<const at::Tensor>& q_v_,           // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
-    std::optional<at::Tensor>& out_,                 // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
     std::optional<const at::Tensor>& cu_seqlens_q_,  // b+1
     std::optional<const at::Tensor>& cu_seqlens_k_,  // b+1
     std::optional<const at::Tensor>& cu_seqlens_k_new_,  // b+1
-    std::optional<const at::Tensor>&
-        seqused_q_,  // b. If given, only this many elements of each batch element's queries and outputs are used.
-    std::optional<const at::Tensor>&
-        seqused_k_,  // b. If given, only this many elements of each batch element's keys are used.
     std::optional<int> max_seqlen_q_,
-    // TODO: check if we need max_seqlen_k
     std::optional<int> max_seqlen_k_,
     std::optional<const at::Tensor>& page_table_,      // (b_k, max_num_pages_per_seq)
+    std::optional<const at::Tensor>& num_pages_,       // (b_k, )
     std::optional<const at::Tensor>& kv_batch_idx_,    // b. indices to index into the KV cache
     std::optional<const at::Tensor>& leftpad_k_,       // b
     std::optional<const at::Tensor>& rotary_cos_,      // seqlen_ro x (rotary_dim / 2)
@@ -582,7 +542,7 @@ std::vector<at::Tensor> mha_fwd(
     TORCH_CHECK(page_table.stride(-1) == 1, "page_table must have contiguous last dimension");
   }
   at::Tensor cu_seqlens_q;
-  bool const is_varlen_q = cu_seqlens_q_.has_value();
+  bool const is_varlen_q = q.dim() == 3;  // variable length if 3 dimensions
   if (is_varlen_q) {
     cu_seqlens_q = cu_seqlens_q_.value();
     CHECK_DEVICE(cu_seqlens_q);
@@ -596,10 +556,8 @@ std::vector<at::Tensor> mha_fwd(
     cu_seqlens_k = cu_seqlens_k_.value();
     CHECK_DEVICE(cu_seqlens_k);
     CHECK_CONTIGUOUS(cu_seqlens_k);
-    TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype torch.int32");
     TORCH_CHECK(max_seqlen_k_.has_value(), "max_seqlen_k must be provided if cu_seqlens_k is provided");
-    TORCH_CHECK(!paged_KV, "If cu_seqlens_k is passed in, then page table is not supported");
-    TORCH_CHECK(!kv_batch_idx_.has_value(), "If cu_seqlens_k is passed in, then page table is not supported");
+    TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype torch.int32");
   }
 
   auto const sizes = q.sizes();
@@ -614,7 +572,7 @@ std::vector<at::Tensor> mha_fwd(
   int const page_size = !paged_KV ? 1 : k.size(1);
   int const seqlen_k =
       !is_varlen_k ? (!paged_KV ? k.size(1) : max_num_pages_per_seq * page_size) : max_seqlen_k_.value();
-  int const total_k = !is_varlen_k ? batch_size * k.size(1) : k.size(0);
+  int const total_k = !is_varlen_k ? batch_size * k.size(1) : cu_seqlens_k[-1].item<int>();
   int const num_heads_k = k.size(-2);
   int const batch_size_k = !paged_KV ? (!is_varlen_k ? k.size(0) : cu_seqlens_k.size(0) - 1) : page_table.size(0);
   float softmax_scale = softmax_scale_;
@@ -664,21 +622,6 @@ std::vector<at::Tensor> mha_fwd(
     CHECK_SHAPE(page_table, batch_size_k, max_num_pages_per_seq);
   }
 
-  if (seqused_q_.has_value()) {
-    auto seqused_q = seqused_q_.value();
-    TORCH_CHECK(seqused_q.dtype() == torch::kInt32, "seqused_q must have dtype int32");
-    CHECK_DEVICE(seqused_q);
-    CHECK_CONTIGUOUS(seqused_q);
-    CHECK_SHAPE(seqused_q, batch_size);
-  }
-  if (seqused_k_.has_value()) {
-    auto seqused_k = seqused_k_.value();
-    TORCH_CHECK(seqused_k.dtype() == torch::kInt32, "seqused_k must have dtype int32");
-    CHECK_DEVICE(seqused_k);
-    CHECK_CONTIGUOUS(seqused_k);
-    CHECK_SHAPE(seqused_k, batch_size);
-  }
-
   if (leftpad_k_.has_value()) {
     auto leftpad_k = leftpad_k_.value();
     TORCH_CHECK(leftpad_k.dtype() == torch::kInt32, "leftpad_k must have dtype int32");
@@ -687,32 +630,16 @@ std::vector<at::Tensor> mha_fwd(
     CHECK_SHAPE(leftpad_k, batch_size);
   }
 
-  bool const is_varlen =
-      is_varlen_q || is_varlen_k || seqused_q_.has_value() || seqused_k_.has_value() || leftpad_k_.has_value();
+  bool const is_varlen = is_varlen_q || is_varlen_k || leftpad_k_.has_value();
 
   static constexpr int alignment = 8;
   TORCH_CHECK(head_size % alignment == 0, "head_size should be a multiple of " + std::to_string(alignment));
   TORCH_CHECK(head_size_v % alignment == 0, "head_size_v should be a multiple of " + std::to_string(alignment));
 
   auto opts = q.options();
-  auto out_type = q_type;
   at::Tensor out;
-  if (out_.has_value()) {
-    out = out_.value();
-    TORCH_CHECK(
-        out.scalar_type() == out_type,
-        "For FP16/BF16 input, output must have the same dtype as inputs. For FP8 input, output must have dtype BF16");
-    CHECK_DEVICE(out);
-    TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
-    if (!is_varlen_q) {
-      CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_v);
-    } else {
-      CHECK_SHAPE(out, total_q, num_heads, head_size_v);
-    }
-  } else {
-    out = !is_varlen_q ? torch::empty({batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(out_type))
-                       : torch::empty({total_q, num_heads, head_size_v}, opts.dtype(out_type));
-  }
+  out = !is_varlen_q ? torch::empty({batch_size, seqlen_q, num_heads, head_size_v}, opts)
+                     : torch::empty({total_q, num_heads, head_size_v}, opts);
 
   auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
   int const head_size_rounded = round_up_headdim(head_size);
@@ -731,6 +658,7 @@ std::vector<at::Tensor> mha_fwd(
     softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
   }
 
+  // align with FA3
   Flash_fwd_params params;
   params.is_bf16 = q.dtype() == torch::kBFloat16;
 
@@ -761,8 +689,6 @@ std::vector<at::Tensor> mha_fwd(
 
   params.cu_seqlens_q = !is_varlen_q ? nullptr : static_cast<int*>(cu_seqlens_q.data_ptr());
   params.cu_seqlens_k = !is_varlen_k ? nullptr : static_cast<int*>(cu_seqlens_k.data_ptr());
-  params.seqused_q = seqused_q_.has_value() ? static_cast<int*>(seqused_q_.value().data_ptr()) : nullptr;
-  params.seqused_k = seqused_k_.has_value() ? static_cast<int*>(seqused_k_.value().data_ptr()) : nullptr;
 
   // Softmax sum
   params.softmax_lse_ptr = softmax_lse.data_ptr();
@@ -805,8 +731,10 @@ std::vector<at::Tensor> mha_fwd(
   params.b_k = batch_size_k;
   params.dv = head_size_v;
   if (paged_KV) {
+    TORCH_CHECK(num_pages_.has_value(), "num_pages must be provided if page_table is provided");
     params.page_table = page_table.data_ptr<int>();
     params.page_table_batch_stride = page_table.stride(0);
+    params.num_pages_per_seq = num_pages_.value().data_ptr<int>();
   }
   params.page_size = page_size;
   params.num_pages = num_pages;
@@ -814,10 +742,9 @@ std::vector<at::Tensor> mha_fwd(
   if (k_new_.has_value()) {  // This needs to be set before get_pagedkv_tma
     at::Tensor k_new, v_new;
     TORCH_CHECK(v_new_.has_value(), "If k_new is supplied, v_new must also be passed in");
-    TORCH_CHECK(seqused_k_.has_value(), "If k_new is supplied, seqlens_k must also be passed in");
     TORCH_CHECK(seqlen_q <= seqlen_k, "If k_new is supplied, it must have seqlen <= the seqlen of the KV cache");
     at::Tensor cu_seqlens_k_new;
-    bool const is_varlen_k_new = cu_seqlens_k_new_.has_value();
+    bool const is_varlen_k_new = k_new_.value().dim() == 3;
     if (is_varlen_k_new) {
       cu_seqlens_k_new = cu_seqlens_k_new_.value();
       CHECK_DEVICE(cu_seqlens_k_new);
@@ -832,8 +759,7 @@ std::vector<at::Tensor> mha_fwd(
     CHECK_DEVICE(v_new);
     TORCH_CHECK(k_new.stride(-1) == 1, "k_new tensor must have contiguous last dimension");
     TORCH_CHECK(v_new.stride(-1) == 1, "v_new tensor must have contiguous last dimension");
-    // We don't need max_seqlen_k_new, so seqlen_k_new can be whatever when is_varlen_k_new
-    int seqlen_k_new = !is_varlen_k_new ? k_new.size(1) : 0;
+    int seqlen_k_new = !is_varlen_k_new ? k_new.size(1) : 1;
     int total_k_new = !is_varlen_k_new ? batch_size * k_new.size(1) : k_new.size(0);
     if (!is_varlen_k_new) {
       CHECK_SHAPE(k_new, batch_size, seqlen_k_new, num_heads_k, head_size);
@@ -859,6 +785,12 @@ std::vector<at::Tensor> mha_fwd(
     if (is_varlen_k_new) {
       params.cu_seqlens_knew = static_cast<int*>(cu_seqlens_k_new.data_ptr());
     }
+  } else {
+    TORCH_CHECK(cu_seqlens_k_new_.has_value(), "If k_new ");
+    params.seqlen_knew = 0;
+    params.total_knew = 0;
+    at::Tensor cu_seqlens_k_new = cu_seqlens_k_new_.value();
+    params.cu_seqlens_knew = static_cast<int*>(cu_seqlens_k_new.data_ptr());
   }
 
   if (q_v_.has_value()) {
@@ -934,7 +866,7 @@ std::vector<at::Tensor> mha_fwd(
   at::Tensor out_accum, softmax_lse_accum;
   auto outaccum_type = at::ScalarType::Float;
 
-  constexpr int PipelineStages = 2;
+  constexpr int PipelineStages = 0;
   if (params.is_causal) {
     switch (params.d) {
       case 64:

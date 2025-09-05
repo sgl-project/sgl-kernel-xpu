@@ -3,11 +3,6 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-# try:
-#     from sgl_kernel import flash_ops
-# except:
-#     raise ImportError("Can not import sgl_kernel. Please check your installation.")
-
 
 def is_fa3_supported(device=None) -> bool:
     #  There some fa3 FYI
@@ -19,9 +14,9 @@ def is_fa3_supported(device=None) -> bool:
     #  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a.
     #  That means if you use A100/A*0/L20/L40/L40s/4090 you can use fa3.
     if torch.cuda.is_available():
-      return (
-        torch.cuda.get_device_capability(device)[0] == 9
-        or torch.cuda.get_device_capability(device)[0] == 8
+        return (
+            torch.cuda.get_device_capability(device)[0] == 9
+            or torch.cuda.get_device_capability(device)[0] == 8
         ) and (torch.version.cuda >= "12.3")
     elif torch.xpu.is_available():
         device_name = torch.xpu.get_device_properties(0).name
@@ -177,20 +172,31 @@ def flash_attn_with_kvcache(
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
     rotary_seqlens = maybe_contiguous(rotary_seqlens)
 
-    if cu_seqlens_q == None: # !is_varlen_q
-        cu_seqlens_q = torch.arange(0, q.size(0)+1, dtype=torch.int, device=q.device) * q.size(1)
+    if cu_seqlens_q == None:  # !is_varlen_q
+        cu_seqlens_q = torch.arange(
+            0, q.size(0) + 1, dtype=torch.int, device=q.device
+        ) * q.size(1)
         max_seqlen_q = q.size(1)
         q = q.view(-1, q.size(-2), q.size(-1)).contiguous()
     if cu_seqlens_k_new is None and k is not None:  # !is_varlen_k_new
-        cu_seqlens_k_new = torch.arange(0, k.size(0)+1, dtype=torch.int, device=k.device)
+        cu_seqlens_k_new = torch.arange(
+            0, k.size(0) + 1, dtype=torch.int, device=k.device
+        )
     elif k is None:
-        cu_seqlens_k_new = torch.zeros_like(cu_seqlens_q, dtype=torch.int32, device=q.device)
+        cu_seqlens_k_new = torch.zeros_like(
+            cu_seqlens_q, dtype=torch.int32, device=q.device
+        )
     if cache_seqlens is not None:
         max_seqlen_k = cache_seqlens.max().item()
         assert cache_seqlens.size(0) + 1 == cu_seqlens_q.size(0)
         page_size = k_cache.size(1)
         num_pages_per_seq = (cache_seqlens + page_size - 1) // page_size
-        cu_seqlens_k = torch.concat((torch.zeros(1, dtype=torch.int32, device=cache_seqlens.device), torch.cumsum(cache_seqlens, 0))).to(torch.int32)
+        cu_seqlens_k = torch.concat(
+            (
+                torch.zeros(1, dtype=torch.int32, device=cache_seqlens.device),
+                torch.cumsum(cache_seqlens, 0),
+            )
+        ).to(torch.int32)
 
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
         q,

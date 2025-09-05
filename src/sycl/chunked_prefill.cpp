@@ -170,7 +170,7 @@ using LayoutV = cutlass::layout::RowMajor;
 using LayoutO = cutlass::layout::RowMajor;
 
 template <class FMHAChunkPrefillKernel, bool isVarLen>
-struct ExampleRunner {
+struct KernelRunner {
   using StrideQ = typename FMHAChunkPrefillKernel::StrideQ;
   using StrideK = typename FMHAChunkPrefillKernel::StrideK;
   using StrideV = typename FMHAChunkPrefillKernel::StrideV;
@@ -437,7 +437,7 @@ struct FMHAConfig {
         CollectiveEpilogue,
         Scheduler>;
 
-    ExampleRunner<FMHAChunkPrefillKernel, isVarLen> runner;
+    KernelRunner<FMHAChunkPrefillKernel, isVarLen> runner;
 
     (runner.run(params, hw_info));
     return 0;

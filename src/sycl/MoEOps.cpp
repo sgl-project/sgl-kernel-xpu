@@ -288,18 +288,17 @@ void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor
 
   auto rows_for_experts = at::zeros({n_experts_aligned}, at::dtype(at::kInt).device(at::kXPU));
   auto offsets = at::empty({n_tokens, n_topk}, at::dtype(at::kInt).device(at::kXPU));
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::kBFloat16, at::kHalf, gating_output.scalar_type(), "fused_topk_softmax_kernel", [&]() {
-        TopKSoftmaxImpl::fused_topk_softmax<scalar_t>(
-            reinterpret_cast<scalar_t*>(gating_output.data_ptr()),
-            reinterpret_cast<float*>(topk_weights.data_ptr()),
-            reinterpret_cast<int*>(topk_indices.data_ptr()),
-            reinterpret_cast<int*>(rows_for_experts.data_ptr()),
-            reinterpret_cast<int*>(offsets.data_ptr()),
-            renormalize,
-            n_tokens,
-            n_experts,
-            n_topk);
-      });
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(gating_output.scalar_type(), "fused_topk_softmax_kernel", [&]() {
+    TopKSoftmaxImpl::fused_topk_softmax<scalar_t>(
+        reinterpret_cast<scalar_t*>(gating_output.data_ptr()),
+        reinterpret_cast<float*>(topk_weights.data_ptr()),
+        reinterpret_cast<int*>(topk_indices.data_ptr()),
+        reinterpret_cast<int*>(rows_for_experts.data_ptr()),
+        reinterpret_cast<int*>(offsets.data_ptr()),
+        renormalize,
+        n_tokens,
+        n_experts,
+        n_topk);
+  });
 }
 }  // namespace at::native::xpu

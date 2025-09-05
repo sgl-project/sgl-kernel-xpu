@@ -13,6 +13,8 @@
 #include "SYCLHelpers.h"
 #include "Utils.h"
 
+namespace at::native::xpu {
+
 namespace TopKSoftmaxImpl {
 
 template <typename T>
@@ -305,3 +307,4 @@ void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor
             n_topk);
       });
 }
+}  // namespace at::native::xpu

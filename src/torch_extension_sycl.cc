@@ -47,8 +47,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gemma_fused_add_rmsnorm", torch::kXPU, &at::native::xpu::gemma_fused_add_rmsnorm);
 
   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
-  m.impl(
-      "topk_softmax", torch::kXPU, static_cast<void (*)(at::Tensor&, at::Tensor&, at::Tensor&, bool)>(&topk_softmax));
+  m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
 
   //   m.def(
   //       "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype,

@@ -39,13 +39,13 @@ struct FusedTopkSoftmax {
         top_k(top_k) {}
 
   static inline sycl::nd_range<3> get_nd_range(const int tokens, const int experts) {
-    int calc_per_item = (experts + sub_group_size - 1) / sub_group_size;
-    int group_size = (experts + calc_per_item - 1) / calc_per_item;
+    int calc_per_item = div_up(experts, sub_group_size);
+    int group_size = div_up(experts, calc_per_item);
     group_size = group_size < sub_group_size ? sub_group_size : group_size;
     group_size = group_size < max_group_size ? group_size : max_group_size;
-    int sub_groups_per_group = (group_size + sub_group_size - 1) / sub_group_size;
+    int sub_groups_per_group = div_up(group_size, sub_group_size);
     group_size = sub_groups_per_group * sub_group_size;
-    int global_size = (tokens + sub_groups_per_group - 1) / sub_groups_per_group;
+    int global_size = div_up(tokens, sub_groups_per_group);
 
     sycl::range<3> local(1, 1, group_size);
     sycl::range<3> global(1, 1, global_size);
@@ -281,7 +281,7 @@ void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor
 
   TORCH_CHECK(n_experts <= 128, "n_experts only support up to 128, but got ", n_experts);
 
-  int n_experts_aligned = (n_experts + 7) / 8 * 8;  // align to 8
+  int n_experts_aligned = div_up(n_experts, 8) * 8;  // align to 8
 
   int64_t n_topk = topk_weights.size(1);
 

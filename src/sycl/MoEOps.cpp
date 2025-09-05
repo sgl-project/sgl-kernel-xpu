@@ -276,12 +276,13 @@ void fused_topk_softmax(
 void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize) {
   auto shape = gating_output.sizes().vec();
   TORCH_CHECK(shape.size() == 2, "gating_output must be 2D tensor, but got ", shape.size(), "D");
-  int n_tokens = shape[0];
-  int n_experts = shape[1];
+  int64_t n_tokens = shape[0];
+  int64_t n_experts = shape[1];
 
   TORCH_CHECK(n_experts <= 128, "n_experts only support up to 128, but got ", n_experts);
 
-  int n_experts_aligned = div_up(n_experts, 8) * 8;  // align to 8
+  constexpr int64_t alignment = 8;
+  int64_t n_experts_aligned = div_up(n_experts, alignment) * alignment;  // align to 8
 
   int64_t n_topk = topk_weights.size(1);
 

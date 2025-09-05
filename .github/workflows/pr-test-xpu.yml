@@ -25,7 +25,7 @@ jobs:
 
       - name: Build Docker image
         run: |
-          docker build --no-cache --progress=plain -f Dockerfile.xpu_kernel -t xpu_sglang:pvc .
+          docker build --build-arg SG_LANG_KERNEL_BRANCH=${{ github.head_ref }} --no-cache --progress=plain -f Dockerfile.xpu_kernel -t xpu_sglang:pvc .
 
 
       - name: Run container
@@ -79,3 +79,4 @@ jobs:
           fi
           echo "All jobs completed successfully"
           exit 0
+

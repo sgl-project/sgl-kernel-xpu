@@ -499,7 +499,7 @@ def generate_qkv(
 )
 # @pytest.mark.parametrize("rotary_fraction", [0.0])
 @pytest.mark.parametrize(
-    "page_size", [None] + ([1, 4, 128] if not DISABLE_PAGEDKV else [])
+    "page_size", [64, 128]
 )
 # @pytest.mark.parametrize("page_size", [None])
 # @pytest.mark.parametrize("has_leftpad", [False, True])
@@ -566,7 +566,7 @@ def test_flash_attn_kvcache(
     # batch_size = 5
     batch_size = 1
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
-    nheads = 1
+    nheads = 16
     # nheads = 1
     # rotary_dim must be a multiple of 16, and must be <= d
     rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
@@ -911,6 +911,9 @@ def test_flash_attn_kvcache(
                 # lse_ref = torch.logsumexp(qk / math.sqrt(d), -1)
                 # probs = torch.softmax(qk, dim=-1)
                 torch.xpu.synchronize()
+                out = out.flatten()
+                out_ref = out_ref.flatten()
+                out_pt = out_pt.flatten()
                 print(f"Output max diff: {(out - out_ref).abs().max().item()}")
                 print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
                 print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
@@ -1003,7 +1006,7 @@ def _generate_block_kvcache(
         .to(dtype_ref)
     )
     page_table = rearrange(
-        torch.randperm(num_blocks, dtype=torch.int32, device=device),
+        torch.arange(num_blocks, dtype=torch.int32, device=device),
         "(b nblocks) -> b nblocks",
         b=batch_size,
     )

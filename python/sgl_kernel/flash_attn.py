@@ -190,7 +190,12 @@ def flash_attn_with_kvcache(
         max_seqlen_k = cache_seqlens.max().item()
         assert cache_seqlens.size(0) + 1 == cu_seqlens_q.size(0)
         page_size = k_cache.size(1)
-        num_pages_per_seq = (cache_seqlens + page_size - 1) // page_size
+        num_pages_per_seq = torch.concat(
+            (
+                torch.zeros(1, dtype=torch.int32, device=cache_seqlens.device),
+                torch.cumsum((cache_seqlens + page_size - 1) // page_size, 0),
+            )
+        ).to(torch.int32)
         cu_seqlens_k = torch.concat(
             (
                 torch.zeros(1, dtype=torch.int32, device=cache_seqlens.device),

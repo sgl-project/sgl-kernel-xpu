@@ -72,7 +72,10 @@ def test_topk_softmax(dtype, n_token, n_topk, n_expert, renormalize):
     ref = torch.zeros(n_token, n_expert, dtype=torch.float, device=hidden_states.device)
     res.scatter_(1, topk_indices.long(), topk_weights)
     ref.scatter_(1, ref_topk_indices.long(), ref_token_weights)
-    torch.testing.assert_close(res, ref, atol=3e-3, rtol=1e-3)
+    
+    atol = 3e-3
+    rtol = 1e-3
+    torch.testing.assert_close(res, ref, atol=atol, rtol=rtol)
 
 
 if __name__ == "__main__":

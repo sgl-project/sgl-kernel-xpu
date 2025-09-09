@@ -198,8 +198,6 @@ def flash_attn_with_kvcache(
             )
         ).to(torch.int32)
 
-    import pdb; pdb.set_trace()
-
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
         q,
         k_cache,

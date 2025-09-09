@@ -202,15 +202,10 @@ struct KernelRunner {
 
   template <class ProblemShape>
   auto initialize_varlen(const Flash_fwd_params& params, ProblemShape& problem_size) {
-    // Use Cacheline Size to calculate alignment
-    constexpr int cacheline_bytes = 64;
-    constexpr int AlignmentQ = cacheline_bytes / sizeof(ElementQ);   // Alignment of Q matrix in units of elements
-    constexpr int AlignmentKV = cacheline_bytes / sizeof(ElementK);  // Alignment of Kand V matrix in units of elements
-
     ProblemShape problem_size_for_init = problem_size;
-    get<0>(problem_size_for_init) = 1;
+    get<0>(problem_size_for_init) = 1;  // concentrated batch
     get<3>(problem_size_for_init) = params.total_q;
-    get<4>(problem_size_for_init) = 0;
+    get<4>(problem_size_for_init) = params.total_knew;
     get<5>(problem_size_for_init) = params.total_k;
 
     ProblemShapeType problem_size_for_launch;
@@ -218,9 +213,9 @@ struct KernelRunner {
     get<0>(problem_size_for_launch) = get<0>(problem_size);
     get<1>(problem_size_for_launch) = get<1>(problem_size);
     get<2>(problem_size_for_launch) = get<2>(problem_size);
-    get<3>(problem_size_for_launch) = cutlass::fmha::collective::VariableLength{params.seqlen_q};
-    get<4>(problem_size_for_launch) = cutlass::fmha::collective::VariableLength{params.seqlen_knew};
-    get<5>(problem_size_for_launch) = cutlass::fmha::collective::VariableLength{params.seqlen_k};
+    get<3>(problem_size_for_launch) = cutlass::fmha::collective::VariableLength{params.seqlen_q, params.total_q};
+    get<4>(problem_size_for_launch) = cutlass::fmha::collective::VariableLength{params.seqlen_knew, params.total_knew};
+    get<5>(problem_size_for_launch) = cutlass::fmha::collective::VariableLength{params.seqlen_k, params.total_k};
     get<6>(problem_size_for_launch) = get<6>(problem_size);
     get<7>(problem_size_for_launch) = get<7>(problem_size);
 
@@ -571,8 +566,9 @@ std::vector<at::Tensor> mha_fwd(
   int const num_pages = !paged_KV ? 0 : k.size(0);
   int const page_size = !paged_KV ? 1 : k.size(1);
   int const seqlen_k =
-      !is_varlen_k ? (!paged_KV ? k.size(1) : max_num_pages_per_seq * page_size) : max_seqlen_k_.value();
-  int const total_k = !is_varlen_k ? batch_size * k.size(1) : cu_seqlens_k[-1].item<int>();
+      !is_varlen_k ? k.size(1) : (!paged_KV ? max_seqlen_k_.value() : max_num_pages_per_seq * page_size);
+  int const total_k =
+      !is_varlen_k ? batch_size * k.size(1) : (!paged_KV ? cu_seqlens_k[-1].item<int>() : num_pages * page_size);
   int const num_heads_k = k.size(-2);
   int const batch_size_k = !paged_KV ? (!is_varlen_k ? k.size(0) : cu_seqlens_k.size(0) - 1) : page_table.size(0);
   float softmax_scale = softmax_scale_;

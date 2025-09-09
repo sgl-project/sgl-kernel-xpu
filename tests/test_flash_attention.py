@@ -499,7 +499,7 @@ def generate_qkv(
 )
 # @pytest.mark.parametrize("rotary_fraction", [0.0])
 @pytest.mark.parametrize(
-    "page_size", [64, 128]
+    "page_size", [64, 128, 256]
 )
 # @pytest.mark.parametrize("page_size", [None])
 # @pytest.mark.parametrize("has_leftpad", [False, True])
@@ -563,8 +563,7 @@ def test_flash_attn_kvcache(
         pytest.skip()
     # set seed
     torch.random.manual_seed(0)
-    # batch_size = 5
-    batch_size = 1
+    batch_size = 5
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
     nheads = 16
     # nheads = 1
@@ -1006,7 +1005,7 @@ def _generate_block_kvcache(
         .to(dtype_ref)
     )
     page_table = rearrange(
-        torch.arange(num_blocks, dtype=torch.int32, device=device),
+        torch.randperm(num_blocks, dtype=torch.int32, device=device),
         "(b nblocks) -> b nblocks",
         b=batch_size,
     )
@@ -1022,7 +1021,10 @@ def _generate_block_kvcache(
     )[:, :seqlen_k]
     return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
 
-
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="flash_attn at sgl-kernel-xpu only supports paged cache",
+)
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
     "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])

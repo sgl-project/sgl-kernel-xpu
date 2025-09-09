@@ -498,9 +498,7 @@ def generate_qkv(
     ),
 )
 # @pytest.mark.parametrize("rotary_fraction", [0.0])
-@pytest.mark.parametrize(
-    "page_size", [64, 128, 256]
-)
+@pytest.mark.parametrize("page_size", [64, 128, 256])
 # @pytest.mark.parametrize("page_size", [None])
 # @pytest.mark.parametrize("has_leftpad", [False, True])
 @pytest.mark.parametrize("has_leftpad", [False])
@@ -917,10 +915,10 @@ def test_flash_attn_kvcache(
                 print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
                 print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
                 print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
-                # # breakpoint()
+                # breakpoint()
 
-                # # Check that FlashAttention's numerical error is at most twice the numerical error
-                # # of a Pytorch implementation.
+                # Check that FlashAttention's numerical error is at most twice the numerical error
+                # of a Pytorch implementation.
                 if new_kv:
                     if page_size is None:
                         k_cache_select = (
@@ -959,14 +957,14 @@ def test_flash_attn_kvcache(
                     k_cache_ref = k_cache_ref.to(dtype).to(dtype_ref)
                     v_cache_ref = v_cache_ref.to(dtype).to(dtype_ref)
                     if dtype is not torch.float8_e4m3fn:
-                        import pdb; pdb.set_trace()
                         assert torch.equal(v_cache_select, v_cache_ref)
                     else:
                         assert torch.allclose(
                             v_cache_select, v_cache_ref, rtol=1e-3, atol=1e-3
                         )
-                    breakpoint()
-                    if rotary_dim == 0 and dtype is not torch.float8_e4m3fn:
+                    # breakpoint()
+                    # if rotary_dim == 0 and dtype is not torch.float8_e4m3fn:
+                    if rotary_dim == 0:
                         assert torch.equal(k_cache_select, k_cache_ref)
                     else:
                         # if not torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3):
@@ -1019,6 +1017,7 @@ def _generate_block_kvcache(
         b=batch_size,
     )[:, :seqlen_k]
     return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
+
 
 @pytest.mark.skipif(
     not torch.cuda.is_available(),

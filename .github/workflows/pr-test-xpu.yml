@@ -30,7 +30,6 @@ jobs:
             --build-arg SG_LANG_KERNEL_REPO=${{ github.event.pull_request.head.repo.clone_url }} \
             --no-cache --progress=plain -f Dockerfile.xpu_kernel -t xpu_sglang:pvc .
 
-
       - name: Run container
         run: |
           docker run -dt \

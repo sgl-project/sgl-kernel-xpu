@@ -205,3 +205,8 @@ int get_min(Func limit_func, int X, Args*... args) {
         AT_ERROR(#NAME, " not implemented for '", toString(TYPE), "'");                                     \
     }                                                                                                       \
   }
+
+template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
+inline T div_up(T x, T y) {
+  return (x + y - 1) / y;
+}

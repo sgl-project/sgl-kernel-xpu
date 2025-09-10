@@ -488,16 +488,16 @@ std::vector<at::Tensor> mha_fwd(
     std::optional<const at::Tensor>& cu_seqlens_k_new_,  // b+1
     std::optional<int> max_seqlen_q_,
     std::optional<int> max_seqlen_k_,
-    std::optional<const at::Tensor>& page_table_,      // (b_k, max_num_pages_per_seq)
-    std::optional<const at::Tensor>& num_pages_,       // (b_k, )
-    std::optional<const at::Tensor>& kv_batch_idx_,    // b. indices to index into the KV cache
-    std::optional<const at::Tensor>& leftpad_k_,       // b
-    std::optional<const at::Tensor>& rotary_cos_,      // seqlen_ro x (rotary_dim / 2)
-    std::optional<const at::Tensor>& rotary_sin_,      // seqlen_ro x (rotary_dim / 2)
-    std::optional<const at::Tensor>& seqlens_rotary_,  // b
-    std::optional<at::Tensor>& q_descale_,             // (b, h_k), not (b, h)
-    std::optional<at::Tensor>& k_descale_,             // (b, h_k)
-    std::optional<at::Tensor>& v_descale_,             // (b, h_k)
+    std::optional<const at::Tensor>& page_table_,         // (b_k, max_num_pages_per_seq)
+    std::optional<const at::Tensor>& num_pages_per_seq_,  // (b_k, )
+    std::optional<const at::Tensor>& kv_batch_idx_,       // b. indices to index into the KV cache
+    std::optional<const at::Tensor>& leftpad_k_,          // b
+    std::optional<const at::Tensor>& rotary_cos_,         // seqlen_ro x (rotary_dim / 2)
+    std::optional<const at::Tensor>& rotary_sin_,         // seqlen_ro x (rotary_dim / 2)
+    std::optional<const at::Tensor>& seqlens_rotary_,     // b
+    std::optional<at::Tensor>& q_descale_,                // (b, h_k), not (b, h)
+    std::optional<at::Tensor>& k_descale_,                // (b, h_k)
+    std::optional<at::Tensor>& v_descale_,                // (b, h_k)
     const float softmax_scale_,
     bool is_causal,
     int window_size_left,
@@ -730,10 +730,10 @@ std::vector<at::Tensor> mha_fwd(
     TORCH_CHECK(num_pages_.has_value(), "num_pages must be provided if page_table is provided");
     params.page_table = page_table.data_ptr<int>();
     params.page_table_batch_stride = page_table.stride(0);
-    params.num_pages_per_seq = num_pages_.value().data_ptr<int>();
+    params.num_pages_per_seq = num_pages_per_seq_.value().data_ptr<int>();
+    params.page_size = page_size;
+    params.num_pages = num_pages;
   }
-  params.page_size = page_size;
-  params.num_pages = num_pages;
 
   if (k_new_.has_value()) {  // This needs to be set before get_pagedkv_tma
     at::Tensor k_new, v_new;

@@ -39,6 +39,8 @@ def is_fa3_supported(device=None) -> bool:
     elif torch.xpu.is_available():
         device_name = torch.xpu.get_device_properties(0).name
         return "B580" in device_name or "e211" in device_name
+    else:
+        return False
 
 
 DISABLE_BACKWARD = True
@@ -1019,10 +1021,6 @@ def _generate_block_kvcache(
     return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="flash_attn at sgl-kernel-xpu only supports paged cache",
-)
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
     "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])

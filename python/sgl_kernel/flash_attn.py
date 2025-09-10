@@ -189,7 +189,7 @@ def flash_attn_with_kvcache(
     if cache_seqlens is not None:
         max_seqlen_k = cache_seqlens.max().item()
         assert cache_seqlens.size(0) + 1 == cu_seqlens_q.size(0)
-        max_page_size_per_seq = page_table.shape(1)
+        max_page_size_per_seq = page_table.size(1)
         num_pages_per_seq = torch.arange(
             0,
             cache_seqlens.size(0) * max_page_size_per_seq,
@@ -265,13 +265,26 @@ def flash_attn_varlen_func(
 ):
     if not is_fa3_supported():
         raise NotImplementedError(
-            "flash_attn at sgl-kernel is only supported on sm90 and above"
+            "flash_attn at sgl-kernel-xpu is only supported on BMG and later"
         )
 
     if softmax_scale is None:
         softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
             -0.5
         )
+    if cu_seqlens_q == None:  # !is_varlen_q
+        cu_seqlens_q = torch.arange(
+            0, q.size(0) + 1, dtype=torch.int, device=q.device
+        ) * q.size(1)
+        max_seqlen_q = q.size(1)
+        q = q.view(-1, q.size(-2), q.size(-1)).contiguous()
+    batch_size = cu_seqlens_q.numel() - 1
+    page_table = (
+        torch.arange(0, batch_size, device=q.device)
+        .to(torch.int32)
+        .reshape([batch_size, 1])
+        .contiguous()
+    )
 
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
         q,
@@ -280,15 +293,13 @@ def flash_attn_varlen_func(
         None,  # k_new
         None,  # v_new
         qv,  # qv
-        None,  # out
         cu_seqlens_q,
         cu_seqlens_k,
         None,  # cu_seqlens_k_new
-        seqused_q,
-        seqused_k,
         max_seqlen_q,
         max_seqlen_k,
-        None,  # page_table,
+        page_table,  # page_table,
+        page_table,  # num_pages_per_seq
         None,  # kv_batch_idx
         None,  # leftpad_k
         None,  # rotary cos

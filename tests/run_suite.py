@@ -15,6 +15,7 @@ class TestFile:
 suites = {
     "per-commit": [
         TestFile("test_awq_dequant.py"),
+        TestFile("test_topk_softmax.py"),
     ],
 }
 

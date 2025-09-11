@@ -727,7 +727,7 @@ std::vector<at::Tensor> mha_fwd(
   params.b_k = batch_size_k;
   params.dv = head_size_v;
   if (paged_KV) {
-    TORCH_CHECK(num_pages_.has_value(), "num_pages must be provided if page_table is provided");
+    TORCH_CHECK(num_pages_per_seq_.has_value(), "num_pages must be provided if page_table is provided");
     params.page_table = page_table.data_ptr<int>();
     params.page_table_batch_stride = page_table.stride(0);
     params.num_pages_per_seq = num_pages_per_seq_.value().data_ptr<int>();

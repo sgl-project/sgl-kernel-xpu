@@ -6,14 +6,20 @@ import os
 import pytest
 import torch
 import torch.nn.functional as F
+import utils
 from einops import rearrange, repeat
+
+device = utils.get_device()
 
 apply_rotary_emb = None
 
 
 def is_hopper():
     #  Only Hopper supports different V headdim
-    return torch.cuda.get_device_properties(0).major >= 9
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_properties(0).major >= 9
+    else:
+        return False
 
 
 def is_fa3_supported(device=None) -> bool:
@@ -25,10 +31,16 @@ def is_fa3_supported(device=None) -> bool:
     #  https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x
     #  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a.
     #  That means if you use A100/A*0/L20/L40/L40s/4090 you can use fa3.
-    return (
-        torch.cuda.get_device_capability(device)[0] == 9
-        or torch.cuda.get_device_capability(device)[0] == 8
-    ) and (torch.version.cuda >= "12.3")
+    if torch.cuda.is_available():
+        return (
+            torch.cuda.get_device_capability(device)[0] == 9
+            or torch.cuda.get_device_capability(device)[0] == 8
+        ) and (torch.version.cuda >= "12.3")
+    elif torch.xpu.is_available():
+        device_name = torch.xpu.get_device_properties(0).name
+        return "B580" in device_name or "e211" in device_name
+    else:
+        return False
 
 
 DISABLE_BACKWARD = True
@@ -46,7 +58,7 @@ DISABLE_BACKWARD = True
 # )
 
 DISABLE_SPLIT = True
-DISABLE_PAGEDKV = True
+DISABLE_PAGEDKV = False
 DISABLE_APPENDKV = True
 DISABLE_LOCAL = True
 DISABLE_SOFTCAP = True
@@ -461,18 +473,18 @@ def generate_qkv(
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 # @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("new_kv", [False] + ([True] if not DISABLE_APPENDKV else []))
-# @pytest.mark.parametrize("new_kv", [True])
+# @pytest.mark.parametrize("new_kv", [False] + ([True] if not DISABLE_APPENDKV else []))
+@pytest.mark.parametrize("new_kv", [False])
 # @pytest.mark.parametrize(
 #     "causal,local",
 #     [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []),
 # )
 # @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
 @pytest.mark.parametrize("causal,local", [(False, False)])
-@pytest.mark.parametrize(
-    "seqlen_new_eq_seqlen_q", [True, False] if not DISABLE_APPENDKV else [True]
-)
-# @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
+# @pytest.mark.parametrize(
+#     "seqlen_new_eq_seqlen_q", [True, False] if not DISABLE_APPENDKV else [True]
+# )
+@pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 # @pytest.mark.parametrize("has_rotary_seqlens", [False, True])
 @pytest.mark.parametrize("has_rotary_seqlens", [False])
 @pytest.mark.parametrize(
@@ -488,9 +500,7 @@ def generate_qkv(
     ),
 )
 # @pytest.mark.parametrize("rotary_fraction", [0.0])
-@pytest.mark.parametrize(
-    "page_size", [None] + ([1, 4, 128] if not DISABLE_PAGEDKV else [])
-)
+@pytest.mark.parametrize("page_size", [64, 128, 256])
 # @pytest.mark.parametrize("page_size", [None])
 # @pytest.mark.parametrize("has_leftpad", [False, True])
 @pytest.mark.parametrize("has_leftpad", [False])
@@ -551,13 +561,11 @@ def test_flash_attn_kvcache(
         pytest.skip()
     if rotary_fraction == 0.0 and has_rotary_seqlens:
         pytest.skip()
-    device = "cuda"
     # set seed
     torch.random.manual_seed(0)
     batch_size = 5
-    # batch_size = 1
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
-    nheads = 6
+    nheads = 16
     # nheads = 1
     # rotary_dim must be a multiple of 16, and must be <= d
     rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
@@ -901,6 +909,10 @@ def test_flash_attn_kvcache(
                 # o1 = torch.einsum('bhst,bthd->bshd', s_tmp, v_cache_ref)
                 # lse_ref = torch.logsumexp(qk / math.sqrt(d), -1)
                 # probs = torch.softmax(qk, dim=-1)
+                torch.xpu.synchronize()
+                out = out.flatten()
+                out_ref = out_ref.flatten()
+                out_pt = out_pt.flatten()
                 print(f"Output max diff: {(out - out_ref).abs().max().item()}")
                 print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
                 print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
@@ -980,7 +992,7 @@ def test_flash_attn_kvcache(
 def _generate_block_kvcache(
     seqlen_k, page_size, batch_size, nheads_k, d, dv, device, dtype, dtype_ref
 ):
-    num_blocks = math.ceil(seqlen_k / page_size) * batch_size * 3
+    num_blocks = math.ceil(seqlen_k / page_size) * batch_size
     k_cache_paged = (
         torch.randn(num_blocks, page_size, nheads_k, d, device=device, dtype=dtype_ref)
         .to(dtype)
@@ -1077,7 +1089,6 @@ def test_flash_attn_varlen_output(
 ):
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 
-    device = "cuda"
     # set seed
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
     # batch_size = 40

@@ -305,7 +305,8 @@ struct KernelRunner {
       cgh.parallel_for<KernelCur<FMHAChunkPrefillKernel>>(
           ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
     };
-    auto q = syclcompat::get_default_queue();
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto q = stream.queue();
     q.submit(cgf).wait();
     // auto event = q.submit(cgf);
 

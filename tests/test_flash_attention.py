@@ -1022,6 +1022,10 @@ def _generate_block_kvcache(
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.skipif(
+    True,
+    reason="flash_attn at sgl-kernel-xpu only supports paged cache",
+)
 @pytest.mark.parametrize(
     "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
 )

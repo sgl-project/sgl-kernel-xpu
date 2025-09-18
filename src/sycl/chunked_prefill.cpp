@@ -863,7 +863,7 @@ std::vector<at::Tensor> mha_fwd(
   at::Tensor out_accum, softmax_lse_accum;
   auto outaccum_type = at::ScalarType::Float;
 
-  constexpr int PipelineStages = 0;
+  constexpr int PipelineStages = 2;
   if (params.is_causal) {
     switch (params.d) {
       case 64:

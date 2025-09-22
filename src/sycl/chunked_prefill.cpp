@@ -4,16 +4,10 @@
 #include <torch/all.h>
 
 #include <cute/tensor.hpp>
-#include <random>
 
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
-#include "cutlass/gemm/device/gemm_universal_adapter.h"
-#include "cutlass/util/GPU_Clock.hpp"
-#include "cutlass/util/command_line.h"
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
-#include "cutlass/util/reference/device/gemm_complex.h"
-#include "cutlass/util/reference/device/tensor_compare.h"
 #include "cutlass/util/sycl_event_manager.hpp"
 #include "flash_attention_v2/collective/fmha_fusion.hpp"
 #include "flash_attention_v2/collective/xe_flash_attn_chunk_prefill_epilogue.hpp"
@@ -283,21 +277,21 @@ struct KernelRunner {
     // configure smem size and carveout
     int smem_size = FMHAChunkPrefillKernel::SharedStorageSize;
 
-    const auto sycl_block = syclcompat::dim3(block.x, block.y, block.z);
-    const auto sycl_grid = syclcompat::dim3(grid.x, grid.y, grid.z);
+    const auto sycl_block = compat::dim3(block.x, block.y, block.z);
+    const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
 
-    syclcompat::experimental::launch_properties launch_props{
+    using namespace compat::experimental;
+    compat::experimental::launch_properties launch_props{
         sycl::ext::oneapi::experimental::work_group_scratch_size(smem_size),
     };
-    syclcompat::experimental::kernel_properties kernel_props{
+    compat::experimental::kernel_properties kernel_props{
         sycl::ext::oneapi::experimental::sub_group_size<FMHAChunkPrefillKernel::DispatchPolicy::SubgroupSize>};
-    syclcompat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
-    // auto event = syclcompat::experimental::launch<cutlass::device_kernel<FMHAChunkPrefillKernel>>(policy, params);
+    compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
 
     sycl::ext::oneapi::experimental::launch_config config(policy.get_range(), policy.get_launch_properties());
     auto cgf = [&](::sycl::handler& cgh) {
       auto KernelFunctor =
-          syclcompat::experimental::detail::build_kernel_functor<cutlass::device_kernel<FMHAChunkPrefillKernel>>(
+          compat::experimental::detail::build_kernel_functor<cutlass::device_kernel<FMHAChunkPrefillKernel>>(
               cgh, policy, params);
       sycl::ext::oneapi::experimental::detail::
           LaunchConfigAccess<sycl::nd_range<3>, decltype(policy.get_launch_properties())>

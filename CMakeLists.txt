@@ -38,7 +38,7 @@ set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable headers only mode in cutla
 FetchContent_Declare(
     repo-cutlass-sycl
     GIT_REPOSITORY https://github.com/sunjiweiswift/cutlass-sycl.git
-    GIT_TAG        f46ae0df764a1751879ce3e22765c700b1d52eca
+    GIT_TAG        355feacef0916f277e5b3b7d02f15c9848b391df
     GIT_SHALLOW    OFF
 )
 FetchContent_MakeAvailable(repo-cutlass-sycl)

@@ -11,7 +11,7 @@ class TestFile:
     estimated_time: float = 60
 
 
-# Add Intel Xeon tests
+# Add Intel XPU Kernel tests
 suites = {
     "per-commit": [
         TestFile("test_awq_dequant.py"),
@@ -117,4 +117,5 @@ if __name__ == "__main__":
     print("The running tests are ", [f.name for f in files])
 
     exit_code = run_unittest_files(files, args.timeout_per_file)
+
     exit(exit_code)

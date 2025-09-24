@@ -479,8 +479,8 @@ def generate_qkv(
 #     "causal,local",
 #     [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []),
 # )
-# @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
-@pytest.mark.parametrize("causal,local", [(False, False)])
+@pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
+# @pytest.mark.parametrize("causal,local", [(True, False)])
 # @pytest.mark.parametrize(
 #     "seqlen_new_eq_seqlen_q", [True, False] if not DISABLE_APPENDKV else [True]
 # )
@@ -566,6 +566,8 @@ def test_flash_attn_kvcache(
     batch_size = 5
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
     nheads = 16
+    if seqlen_k <= seqlen_q:
+        seqlen_k += seqlen_q
     # nheads = 1
     # rotary_dim must be a multiple of 16, and must be <= d
     rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
@@ -694,17 +696,9 @@ def test_flash_attn_kvcache(
                 dtype_ref,
             )
         cache_seqlens = torch.randint(
-            0 if new_kv else 1,
+            seqlen_q,
             # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
-            (
-                (
-                    seqlen_k
-                    - (seqlen_q if (causal or local) and rotary_dim > 1 else seqlen_new)
-                    + 1
-                )
-                if new_kv
-                else (seqlen_k + 1)
-            ),
+            seqlen_k,
             (batch_size,),
             dtype=torch.int32,
             device=device,

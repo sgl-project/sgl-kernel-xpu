@@ -392,7 +392,7 @@ struct FMHAConfig {
         ElementOutput,
         GmemTiledCopyStore>;
     using CollectiveSoftmaxEpilogue = cutlass::flash_attention::collective::
-        FlashChunkPrefillSoftmaxEpilogue<Causal, false, EpilogueDispatchPolicy, ElementAccumulator>;
+        FlashChunkPrefillSoftmaxEpilogue<Causal, LocalMask, EpilogueDispatchPolicy, ElementAccumulator>;
 
     using ProblemShapeRegular = cute::tuple<int, int, int, int, int, int, int, int>;
     using namespace cutlass::fmha::collective;
@@ -777,7 +777,7 @@ std::vector<at::Tensor> mha_fwd(
       params.cu_seqlens_knew = static_cast<int*>(cu_seqlens_k_new.data_ptr());
     }
   } else {
-    TORCH_CHECK(cu_seqlens_k_new_.has_value(), "If k_new ");
+    TORCH_CHECK(cu_seqlens_k_new_.has_value(), "cu_seqlens_k_new all zeros");
     params.seqlen_knew = 0;
     params.total_knew = 0;
     at::Tensor cu_seqlens_k_new = cu_seqlens_k_new_.value();

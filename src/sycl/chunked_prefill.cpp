@@ -301,10 +301,7 @@ struct KernelRunner {
     };
     auto stream = at::xpu::getCurrentXPUStream();
     auto q = stream.queue();
-    q.submit(cgf).wait();
-    // auto event = q.submit(cgf);
-
-    // EventManager::getInstance().addEvent(event);
+    q.submit(cgf);
   }
 
   cutlass::Status run(const Flash_fwd_params& params, const cutlass::KernelHardwareInfo& hw_info) {

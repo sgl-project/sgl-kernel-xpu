@@ -2,8 +2,8 @@ import itertools
 
 import torch
 import triton
-from utils import parse_args
 from sgl_kernel import topk_softmax
+from utils import parse_args
 
 
 def vllm_topk_softmax(gating_output, topk):
@@ -22,7 +22,6 @@ def vllm_topk_softmax(gating_output, topk):
         topk_weights, topk_indices, token_expert_indices, gating_output
     )
     return topk_weights, topk_indices
-
 
 
 def sglang_topk_softmax(gating_output, topk):
@@ -68,10 +67,11 @@ def calculate_diff(num_tokens, num_experts, topk):
             f"❌ Implementations differ: Weights diff={weights_diff}, Indices match={indices_match}"
         )
 
-def get_benchmark(device='xpu'):
+
+def get_benchmark(device="xpu"):
     @triton.testing.perf_report(
         triton.testing.Benchmark(
-            x_names=["num_tokens", "num_experts", "topk", "dtype"], 
+            x_names=["num_tokens", "num_experts", "topk", "dtype"],
             x_vals=configs,
             line_arg="provider",
             line_vals=["sglang", "vllm"],
@@ -115,7 +115,9 @@ if __name__ == "__main__":
     print(f"Testing {len(configs)} configurations...")
     for config in configs:
         num_tokens, num_experts, topk, dtype = config
-        print(f"Config: num_tokens={num_tokens}, num_experts={num_experts}, topk={topk}, dtype={dtype}")
+        print(
+            f"Config: num_tokens={num_tokens}, num_experts={num_experts}, topk={topk}, dtype={dtype}"
+        )
 
         calculate_diff(num_tokens, num_experts, topk)
 

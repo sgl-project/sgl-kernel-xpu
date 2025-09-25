@@ -9,6 +9,15 @@ import argparse
 from transformers import AutoConfig
 
 
+def HAS_VLLM():
+    try:
+        import vllm
+
+        return True
+    except ImportError:
+        return False
+
+
 def get_model_config(args):
     """
     Get model config with priority:

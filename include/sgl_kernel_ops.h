@@ -153,7 +153,7 @@ void rotary_embedding_batched(
     const Tensor& cos_sin_cache,
     bool is_neox,
     int64_t rot_dim,
-    Tensor& cos_sin_cache_offsets  // [num_tokens]
+    Tensor& cos_sin_cache_offsets
 );
 }  // namespace at::native::xpu
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);

@@ -15,6 +15,8 @@
 #define M_2_SQRTPI 1.12837916709551257390
 #endif
 
+#define LOG_LEVEL_DEBUG 1
+
 #define IS_BFLOAT16(scalar_t) (std::is_same<scalar_t, at::BFloat16>::value)
 
 #define IS_HALF(scalar_t) (std::is_same<scalar_t, at::Half>::value)
@@ -59,3 +61,6 @@ struct NullType {
     return false;
   }
 };
+
+// Command group function implementation
+#define DPCPP_Q_CGF(h) [&](sycl::handler & h)

@@ -1,8 +1,11 @@
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pytest
+import sgl_kernel
 import torch
-from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
+import utils
+
+device = utils.get_device()
 
 
 # vLLM torch native
@@ -120,7 +123,7 @@ class RotaryEmbedding(torch.nn.Module):
 
 
 class FlashInferRotaryEmbedding(RotaryEmbedding):
-    def forward_cuda(
+    def forward_xpu(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -128,13 +131,14 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        apply_rope_with_cos_sin_cache_inplace(
-            positions=positions,
-            query=query,
-            key=key,
-            head_size=self.head_size,
-            cos_sin_cache=self.cos_sin_cache,
-            is_neox=self.is_neox_style,
+        torch.ops.sgl_kernel.rotary_embedding(
+            positions,
+            query,
+            key,
+            self.head_size,
+            self.cos_sin_cache.to(torch.bfloat16),
+            self.is_neox_style,
+            self.rotary_dim,
         )
 
         return query, key
@@ -143,12 +147,12 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
 @pytest.mark.parametrize(
     "head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype, device, batch_size, seq_len, num_q_heads, num_kv_heads",
     [
-        (64, 64, 32, 8000, True, torch.bfloat16, "cuda", 32, 32, 1, 1),
-        (256, 128, 4096, 10000, True, torch.bfloat16, "cuda", 2, 512, 4, 2),
-        (512, 128, 311, 10000, True, torch.bfloat16, "cuda", 3, 39, 4, 2),
-        (128, 128, 2048, 10000, False, torch.bfloat16, "cuda", 2, 512, 32, 8),
-        (128, 128, 2048, 10000, False, torch.bfloat16, "cuda", 2, 512, 16, 4),
-        (512, 128, 311, 10000, False, torch.bfloat16, "cuda", 3, 39, 4, 2),
+        (64, 64, 32, 8000, True, torch.bfloat16, device, 32, 32, 1, 1),
+        (256, 128, 4096, 10000, True, torch.bfloat16, device, 2, 512, 4, 2),
+        (512, 128, 311, 10000, True, torch.bfloat16, device, 3, 39, 4, 2),
+        (128, 128, 2048, 10000, False, torch.bfloat16, device, 2, 512, 32, 8),
+        (128, 128, 2048, 10000, False, torch.bfloat16, device, 2, 512, 16, 4),
+        (512, 128, 311, 10000, False, torch.bfloat16, device, 3, 39, 4, 2),
     ],
 )
 def test_correctness(
@@ -164,6 +168,7 @@ def test_correctness(
     num_q_heads: int,
     num_kv_heads: int,
 ):
+    torch.manual_seed(1024)
     rope_ref = RotaryEmbedding(
         head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
     ).to(device)
@@ -183,7 +188,7 @@ def test_correctness(
     query_flashinfer, key_flashinfer = query.clone(), key.clone()
 
     query_ref_out, key_ref_out = rope_ref.forward_native(pos_ids, query_ref, key_ref)
-    query_flashinfer_out, key_flashinfer_out = rope_flashinfer.forward_cuda(
+    query_flashinfer_out, key_flashinfer_out = rope_flashinfer.forward_xpu(
         pos_ids, query_flashinfer, key_flashinfer
     )
 

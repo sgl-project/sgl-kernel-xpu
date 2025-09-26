@@ -46,8 +46,36 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps) -> ()");
   m.impl("gemma_fused_add_rmsnorm", torch::kXPU, &at::native::xpu::gemma_fused_add_rmsnorm);
 
-  m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
-  m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
+  m.def(
+      "apply_rotary_embedding_two_qk(Tensor query, Tensor key, Tensor sin, Tensor cos, Tensor query_out, Tensor "
+      "key_out) -> ()");
+  m.impl("apply_rotary_embedding_two_qk", torch::kXPU, &at::native::xpu::apply_rotary_embedding_two_qk);
+
+  m.def("apply_rotary_embedding_two(Tensor query, Tensor sin, Tensor cos, Tensor query_out) -> ()");
+  m.impl("apply_rotary_embedding_two", torch::kXPU, &at::native::xpu::apply_rotary_embedding_two);
+
+  m.def("apply_rotary_embedding_half(Tensor query, Tensor sin, Tensor cos, Tensor query_out) -> ()");
+  m.impl("apply_rotary_embedding_half", torch::kXPU, &at::native::xpu::apply_rotary_embedding_half);
+
+  m.def(
+      "apply_rotary_embedding_half_qk(Tensor query, Tensor key, Tensor sin, Tensor cos, Tensor query_out, Tensor "
+      "key_out) -> ()");
+  m.impl("apply_rotary_embedding_half_qk", torch::kXPU, &at::native::xpu::apply_rotary_embedding_half_qk);
+
+  m.def(
+      "rotary_embedding_batched(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, bool "
+      "is_neox, int rot_dim, Tensor cos_sin_cache_offsets) -> ()");
+  m.impl("rotary_embedding_batched", torch::kXPU, &at::native::xpu::rotary_embedding_batched);
+
+  m.def(
+      "rotary_embedding(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, bool is_neox, "
+      "int rot_dim) -> ()");
+  m.impl("rotary_embedding", torch::kXPU, &at::native::xpu::rotary_embedding);
+
+  m.def(
+      "ds_rotary_embedding_qk(Tensor positions, Tensor query, Tensor key, Tensor? offsets_opt, Tensor cos_sin_cache, "
+      "int rotary_dim, bool is_neox_style) -> (Tensor, Tensor)");
+  m.impl("ds_rotary_embedding_qk", torch::kXPU, &at::native::xpu::ds_rotary_embedding_qk);
 
   //   m.def(
   //       "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype,

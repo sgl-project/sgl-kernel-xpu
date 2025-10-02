@@ -37,8 +37,7 @@ def is_fa3_supported(device=None) -> bool:
             or torch.cuda.get_device_capability(device)[0] == 8
         ) and (torch.version.cuda >= "12.3")
     elif torch.xpu.is_available():
-        device_name = torch.xpu.get_device_properties(0).name
-        return "B580" in device_name or "e211" in device_name
+        return torch.xpu.get_device_properties().has_fp64
     else:
         return False
 

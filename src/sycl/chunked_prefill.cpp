@@ -9,11 +9,11 @@
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
 #include "cutlass/util/sycl_event_manager.hpp"
-#include "flash_attention_v2/collective/fmha_fusion.hpp"
-#include "flash_attention_v2/collective/xe_flash_attn_chunk_prefill_epilogue.hpp"
-#include "flash_attention_v2/collective/xe_flash_attn_chunk_prefill_softmax_epilogue.hpp"
-#include "flash_attention_v2/kernel/tile_scheduler_chunk_prefill.hpp"
-#include "flash_attention_v2/kernel/xe_chunk_prefill.hpp"
+#include "kernels/chunk_prefill/fmha_fusion.hpp"
+#include "kernels/chunk_prefill/tile_scheduler_chunk_prefill.hpp"
+#include "kernels/chunk_prefill/xe_chunk_prefill.hpp"
+#include "kernels/chunk_prefill/xe_flash_attn_chunk_prefill_epilogue.hpp"
+#include "kernels/chunk_prefill/xe_flash_attn_chunk_prefill_softmax_epilogue.hpp"
 
 using namespace cute;
 
@@ -112,7 +112,7 @@ struct Flash_fwd_params {
 
   // Paged KV cache
   int* __restrict__ page_table;
-  int* __restrict__ num_pages_per_seq;
+  int max_num_pages_per_seq;
   index_t page_table_batch_stride;
   int page_size;
   int num_pages;
@@ -313,17 +313,17 @@ struct KernelRunner {
         {// static_cast<const ElementQ*>(params.q_ptr),
          static_cast<const ElementQ*>(params.q_ptr),
          stride_Q,
-         static_cast<const ElementK*>(params.knew_ptr),
-         stride_K,
-         static_cast<const ElementV*>(params.vnew_ptr),
-         stride_V,
+        //  static_cast<const ElementK*>(params.knew_ptr),
+        //  stride_K,
+        //  static_cast<const ElementV*>(params.vnew_ptr),
+        //  stride_V,
          static_cast<const ElementV*>(params.k_ptr),
          stride_K_cache,
          static_cast<const ElementV*>(params.v_ptr),
          stride_V_cache,
          params.page_table,
          params.page_size,
-         params.num_pages_per_seq,
+         params.max_num_pages_per_seq,
          -1,
          -1},
         {(ElementQ)params.scale_softmax},
@@ -470,18 +470,12 @@ std::vector<at::Tensor> mha_fwd(
                           // h_k, d) if there is page_table.
     const at::Tensor& v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages,
                           // page_size, h_k, dv) if there is page_table.
-    std::optional<const at::Tensor>&
-        k_new_,  // (b, s_k_new, h_k, d) or (total_k_new, h_k, d) if there is cu_seqlens_k_new
-    std::optional<const at::Tensor>&
-        v_new_,  // (b, s_k_new, h_k, dv) or (total_k_new, h_k, dv) if there is cu_seqlens_k_new
     std::optional<const at::Tensor>& q_v_,           // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
     std::optional<const at::Tensor>& cu_seqlens_q_,  // b+1
     std::optional<const at::Tensor>& cu_seqlens_k_,  // b+1
-    std::optional<const at::Tensor>& cu_seqlens_k_new_,  // b+1
     std::optional<int> max_seqlen_q_,
     std::optional<int> max_seqlen_k_,
     std::optional<const at::Tensor>& page_table_,         // (b_k, max_num_pages_per_seq)
-    std::optional<const at::Tensor>& num_pages_per_seq_,  // (b_k, )
     std::optional<const at::Tensor>& kv_batch_idx_,       // b. indices to index into the KV cache
     std::optional<const at::Tensor>& leftpad_k_,          // b
     std::optional<const at::Tensor>& rotary_cos_,         // seqlen_ro x (rotary_dim / 2)
@@ -719,67 +713,66 @@ std::vector<at::Tensor> mha_fwd(
   params.b_k = batch_size_k;
   params.dv = head_size_v;
   if (paged_KV) {
-    TORCH_CHECK(num_pages_per_seq_.has_value(), "num_pages must be provided if page_table is provided");
     params.page_table = page_table.data_ptr<int>();
     params.page_table_batch_stride = page_table.stride(0);
-    params.num_pages_per_seq = num_pages_per_seq_.value().data_ptr<int>();
+    params.max_num_pages_per_seq = max_num_pages_per_seq;
     params.page_size = page_size;
     params.num_pages = num_pages;
   }
 
-  if (k_new_.has_value()) {  // This needs to be set before get_pagedkv_tma
-    at::Tensor k_new, v_new;
-    TORCH_CHECK(v_new_.has_value(), "If k_new is supplied, v_new must also be passed in");
-    TORCH_CHECK(seqlen_q <= seqlen_k, "If k_new is supplied, it must have seqlen <= the seqlen of the KV cache");
-    at::Tensor cu_seqlens_k_new;
-    bool const is_varlen_k_new = k_new_.value().dim() == 3;
-    if (is_varlen_k_new) {
-      cu_seqlens_k_new = cu_seqlens_k_new_.value();
-      CHECK_DEVICE(cu_seqlens_k_new);
-      CHECK_CONTIGUOUS(cu_seqlens_k_new);
-      TORCH_CHECK(cu_seqlens_k_new.dtype() == torch::kInt32, "cu_seqlens_k_new must have dtype torch.int32");
-    }
-    k_new = k_new_.value();
-    v_new = v_new_.value();
-    TORCH_CHECK(k_new.dtype() == q_type, "k_new must have the same dtype as query");
-    TORCH_CHECK(v_new.dtype() == q_type, "v_new must have the same dtype as query");
-    CHECK_DEVICE(k_new);
-    CHECK_DEVICE(v_new);
-    TORCH_CHECK(k_new.stride(-1) == 1, "k_new tensor must have contiguous last dimension");
-    TORCH_CHECK(v_new.stride(-1) == 1, "v_new tensor must have contiguous last dimension");
-    int seqlen_k_new = !is_varlen_k_new ? k_new.size(1) : 1;
-    int total_k_new = !is_varlen_k_new ? batch_size * k_new.size(1) : k_new.size(0);
-    if (!is_varlen_k_new) {
-      CHECK_SHAPE(k_new, batch_size, seqlen_k_new, num_heads_k, head_size);
-      CHECK_SHAPE(v_new, batch_size, seqlen_k_new, num_heads_k, head_size_v);
-    } else {
-      CHECK_SHAPE(k_new, total_k_new, num_heads_k, head_size);
-      CHECK_SHAPE(v_new, total_k_new, num_heads_k, head_size_v);
-      CHECK_SHAPE(cu_seqlens_k_new, batch_size + 1);
-    }
-    params.seqlen_knew = seqlen_k_new;
-    params.total_knew = total_k_new;
-    params.knew_ptr = k_new.data_ptr();
-    params.vnew_ptr = v_new.data_ptr();
-    // All stride are in elements, not bytes.
-    params.knew_row_stride = k_new.stride(-3);
-    params.vnew_row_stride = v_new.stride(-3);
-    params.knew_head_stride = k_new.stride(-2);
-    params.vnew_head_stride = v_new.stride(-2);
-    if (!is_varlen_k_new) {
-      params.knew_batch_stride = k_new.stride(0);
-      params.vnew_batch_stride = v_new.stride(0);
-    }
-    if (is_varlen_k_new) {
-      params.cu_seqlens_knew = static_cast<int*>(cu_seqlens_k_new.data_ptr());
-    }
-  } else {
-    TORCH_CHECK(cu_seqlens_k_new_.has_value(), "cu_seqlens_k_new all zeros");
-    params.seqlen_knew = 0;
-    params.total_knew = 0;
-    at::Tensor cu_seqlens_k_new = cu_seqlens_k_new_.value();
-    params.cu_seqlens_knew = static_cast<int*>(cu_seqlens_k_new.data_ptr());
-  }
+  // if (k_new_.has_value()) {  // This needs to be set before get_pagedkv_tma
+    // at::Tensor k_new, v_new;
+    // TORCH_CHECK(v_new_.has_value(), "If k_new is supplied, v_new must also be passed in");
+    // TORCH_CHECK(seqlen_q <= seqlen_k, "If k_new is supplied, it must have seqlen <= the seqlen of the KV cache");
+    // at::Tensor cu_seqlens_k_new;
+    // bool const is_varlen_k_new = k_new_.value().dim() == 3;
+    // if (is_varlen_k_new) {
+    //   cu_seqlens_k_new = cu_seqlens_k_new_.value();
+    //   CHECK_DEVICE(cu_seqlens_k_new);
+    //   CHECK_CONTIGUOUS(cu_seqlens_k_new);
+    //   TORCH_CHECK(cu_seqlens_k_new.dtype() == torch::kInt32, "cu_seqlens_k_new must have dtype torch.int32");
+    // }
+    // k_new = k_new_.value();
+    // v_new = v_new_.value();
+    // TORCH_CHECK(k_new.dtype() == q_type, "k_new must have the same dtype as query");
+    // TORCH_CHECK(v_new.dtype() == q_type, "v_new must have the same dtype as query");
+    // CHECK_DEVICE(k_new);
+    // CHECK_DEVICE(v_new);
+    // TORCH_CHECK(k_new.stride(-1) == 1, "k_new tensor must have contiguous last dimension");
+    // TORCH_CHECK(v_new.stride(-1) == 1, "v_new tensor must have contiguous last dimension");
+    // int seqlen_k_new = !is_varlen_k_new ? k_new.size(1) : 1;
+    // int total_k_new = !is_varlen_k_new ? batch_size * k_new.size(1) : k_new.size(0);
+    // if (!is_varlen_k_new) {
+    //   CHECK_SHAPE(k_new, batch_size, seqlen_k_new, num_heads_k, head_size);
+    //   CHECK_SHAPE(v_new, batch_size, seqlen_k_new, num_heads_k, head_size_v);
+    // } else {
+    //   CHECK_SHAPE(k_new, total_k_new, num_heads_k, head_size);
+    //   CHECK_SHAPE(v_new, total_k_new, num_heads_k, head_size_v);
+    //   CHECK_SHAPE(cu_seqlens_k_new, batch_size + 1);
+    // }
+    // params.seqlen_knew = seqlen_k_new;
+    // params.total_knew = total_k_new;
+    // params.knew_ptr = k_new.data_ptr();
+    // params.vnew_ptr = v_new.data_ptr();
+    // // All stride are in elements, not bytes.
+    // params.knew_row_stride = k_new.stride(-3);
+    // params.vnew_row_stride = v_new.stride(-3);
+    // params.knew_head_stride = k_new.stride(-2);
+    // params.vnew_head_stride = v_new.stride(-2);
+    // if (!is_varlen_k_new) {
+    //   params.knew_batch_stride = k_new.stride(0);
+    //   params.vnew_batch_stride = v_new.stride(0);
+    // }
+    // if (is_varlen_k_new) {
+    //   params.cu_seqlens_knew = static_cast<int*>(cu_seqlens_k_new.data_ptr());
+    // }
+  // } else {
+    // TORCH_CHECK(cu_seqlens_k_new_.has_value(), "cu_seqlens_k_new all zeros");
+    // params.seqlen_knew = 0;
+    // params.total_knew = 0;
+    // at::Tensor cu_seqlens_k_new = cu_seqlens_k_new_.value();
+    // params.cu_seqlens_knew = static_cast<int*>(cu_seqlens_k_new.data_ptr());
+  // }
 
   if (q_v_.has_value()) {
     TORCH_CHECK(head_size <= 64, "q_v is only supported for head_size <= 64");
@@ -806,9 +799,6 @@ std::vector<at::Tensor> mha_fwd(
   }
 
   if (rotary_cos_.has_value()) {
-    TORCH_CHECK(
-        k_new_.has_value(),
-        "If rotary cos/sin are provided, new key / value to be appended to KV cache must also be provided");
     auto rotary_cos = rotary_cos_.value();
     CHECK_DEVICE(rotary_cos);
     CHECK_CONTIGUOUS(rotary_cos);

@@ -346,7 +346,7 @@ class FMHAPrefillChunk {
       auto mainloop_params = CollectiveMainloop::get_updated_copies(
           params.mainloop, params.problem_shape, sequence_length_shape, batch_coord, q_head_coord);
 
-      // we limit the horisontal size to two subgroup, the empirical resutls
+      // we limit the horizontal size to two subgroup, the empirical results
       // show that reading the two cacheline side by side in gives better
       // performance and anything after that does not have an effect on
       // performance. // (64 here for float b float when possible and loop over
@@ -380,7 +380,8 @@ class FMHAPrefillChunk {
       int cached_nblock = 0;
       if constexpr (PagedKV) {
         // int curr_batch_pages = ceil_div(seq_len_kv_cache, mainloop_params.page_size);// max_page_size_per_seq
-        // int batch_offset = is_var_len ? mainloop_params.num_pages_per_seq[batch_coord] : batch_coord * curr_batch_pages;
+        // int batch_offset = is_var_len ? mainloop_params.num_pages_per_seq[batch_coord] : batch_coord *
+        // curr_batch_pages;
         int batch_offset = batch_coord * mainloop_params.max_num_pages_per_seq;
         cached_nblock = mainloop_params.ptr_page_table[batch_offset  // page table for this batch
         ] * tiles_per_page;                                          // base block idx of physical page
@@ -397,11 +398,11 @@ class FMHAPrefillChunk {
       // workgroup_shape
       Tensor out_reg = make_tensor<ElementAccumulator>(AccumeShape{});
 
-      // There are 16 workitem and 16 max per subgroup, each worktime containt 1
+      // There are 16 workitem and 16 max per subgroup, each worktime contains 1
       // max and cumulatively, they calculate the max per subgroup
       ElementAccumulator max_reg{-INFINITY};
-      // The sum reg each contains a 2d tesnor for 8 x 2 This is number of
-      // sequence lenght process per subgroup
+      // The sum reg each contains a 2d tensor for 8 x 2 This is number of
+      // sequence length process per subgroup
       Tensor sum_reg = make_tensor<ElementAccumulator>(Shape<Int<Vec>, Int<FragsM>>{});
 
       clear(sum_reg);
@@ -570,7 +571,7 @@ class FMHAPrefillChunk {
 
         cached_nblock = next_cached_nblock;
         // Prefetch the next K tile
-        // there is no need to gaurd it with if statememt as prefetch will
+        // there is no need to guard it with if statement as prefetch will
         // ignore out of bound reading
         CUTLASS_PRAGMA_UNROLL
         for (int j = 0; j < size<4>(pKgK_cache); j++) {

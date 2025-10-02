@@ -110,11 +110,11 @@ class FlashChunkPrefillSoftmaxEpilogue<CausalMask_, LocalMask_, epilogue::IntelX
     auto g = compat::get_nd_item<1>().get_sub_group();
     const auto max_scale = max * params.scale;
     CUTLASS_PRAGMA_UNROLL
-    for (int indx = 0; indx < Vec * FragsM; indx++) {
-      const auto max_scale_bcast = group_broadcast(g, max_scale, indx);
+    for (int index = 0; index < Vec * FragsM; index++) {
+      const auto max_scale_bcast = group_broadcast(g, max_scale, index);
       CUTLASS_PRAGMA_UNROLL
       for (int z = 0; z < FragsN; z++) {
-        auto base_indx = indx + (z * Vec * FragsM);
+        auto base_indx = index + (z * Vec * FragsM);
         if constexpr (LocalMask) {
           if ((std::isinf(max_scale_bcast) && max_scale_bcast < 0) ||
               (std::isinf(frag_s(base_indx)) && frag_s(base_indx) < 0)) {
@@ -128,7 +128,7 @@ class FlashChunkPrefillSoftmaxEpilogue<CausalMask_, LocalMask_, epilogue::IntelX
           Element eq = frag_s(base_indx) - max_scale_bcast;
           frag_s(base_indx) = sycl::native::exp2(eq);
         }
-        sum(indx) += frag_s(base_indx);
+        sum(index) += frag_s(base_indx);
       }
     }
   }
@@ -137,16 +137,16 @@ class FlashChunkPrefillSoftmaxEpilogue<CausalMask_, LocalMask_, epilogue::IntelX
   CUTLASS_DEVICE void reduce_max(FragSrc& src, FragMax& max) {
     auto sg = compat::get_nd_item<1>().get_sub_group();
     CUTLASS_PRAGMA_UNROLL
-    for (int indx = 0; indx < Vec * FragsM; indx++) {
-      auto maxptr = group_broadcast(sg, max, indx);
+    for (int index = 0; index < Vec * FragsM; index++) {
+      auto maxptr = group_broadcast(sg, max, index);
       CUTLASS_PRAGMA_UNROLL
       for (int z = 0; z < FragsN; z++) {
-        auto base_indx = indx + (z * Vec * FragsM);
+        auto base_indx = index + (z * Vec * FragsM);
         maxptr = sycl::max(maxptr, src(base_indx));
         src(base_indx) *= params.scale;
       }
       maxptr = reduce_over_group(sg, maxptr, sycl::maximum<>());
-      if (indx == sg.get_local_id()[0]) {
+      if (index == sg.get_local_id()[0]) {
         max = maxptr;
       }
     }
@@ -178,13 +178,13 @@ class FlashChunkPrefillSoftmaxEpilogue<CausalMask_, LocalMask_, epilogue::IntelX
       }
 
       CUTLASS_PRAGMA_UNROLL
-      for (int indx = 0; indx < Vec * FragsM; indx++) {
-        auto max_scale_bcast = group_broadcast(sg, max_scale, indx);
-        auto exp_scale_bcast = group_broadcast(sg, exp_scale, indx);
-        sum(indx) *= exp_scale_bcast;
+      for (int index = 0; index < Vec * FragsM; index++) {
+        auto max_scale_bcast = group_broadcast(sg, max_scale, index);
+        auto exp_scale_bcast = group_broadcast(sg, exp_scale, index);
+        sum(index) *= exp_scale_bcast;
         CUTLASS_PRAGMA_UNROLL
         for (int z = 0; z < FragsNAcc; z++) {
-          auto base_indx = indx + (z * Vec * FragsM);
+          auto base_indx = index + (z * Vec * FragsM);
           if constexpr (LocalMask) {
             if ((std::isinf(max_scale_bcast) && max_scale_bcast < 0) ||
                 (std::isinf(frag_s(base_indx)) && frag_s(base_indx) < 0)) {
@@ -198,11 +198,11 @@ class FlashChunkPrefillSoftmaxEpilogue<CausalMask_, LocalMask_, epilogue::IntelX
             Element eq = frag_s(base_indx) - max_scale_bcast;
             frag_s(base_indx) = sycl::native::exp2(eq);
           }
-          sum(indx) += frag_s(base_indx);
+          sum(index) += frag_s(base_indx);
         }
         CUTLASS_PRAGMA_UNROLL
         for (int z = 0; z < FragsNOut; z++) {
-          auto base_indx = indx + (z * Vec * FragsM);
+          auto base_indx = index + (z * Vec * FragsM);
           out(base_indx) *= exp_scale_bcast;
         }
       }

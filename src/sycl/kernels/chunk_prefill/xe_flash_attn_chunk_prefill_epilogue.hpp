@@ -206,8 +206,8 @@ class FlashChunkPrefillEpilogue<
     for (int y = 0; y < FragsM; y++) {
       CUTLASS_PRAGMA_UNROLL
       for (int x = 0; x < Vec; x++) {
-        int indx = y * Vec + x;
-        auto cur_sum = reduce_over_group(sg, sum(indx), sycl::plus<>());
+        int index = y * Vec + x;
+        auto cur_sum = reduce_over_group(sg, sum(index), sycl::plus<>());
         auto cur_scale = (cur_sum == 0.f || cur_sum != cur_sum) ? 1.0f : sycl::native::recip(cur_sum);
         CUTLASS_PRAGMA_UNROLL
         for (int z = 0; z < FragsN; z++) {

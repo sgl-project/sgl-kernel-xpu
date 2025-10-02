@@ -53,15 +53,15 @@ std::vector<at::Tensor> mha_fwd(
     std::optional<const at::Tensor>& cu_seqlens_k_,  // b+1
     std::optional<int> max_seqlen_q_,
     std::optional<int> max_seqlen_k_,
-    std::optional<const at::Tensor>& page_table_,         // (b_k, max_num_pages_per_seq)
-    std::optional<const at::Tensor>& kv_batch_idx_,       // b. indices to index into the KV cache
-    std::optional<const at::Tensor>& leftpad_k_,          // b
-    std::optional<const at::Tensor>& rotary_cos_,         // seqlen_ro x (rotary_dim / 2)
-    std::optional<const at::Tensor>& rotary_sin_,         // seqlen_ro x (rotary_dim / 2)
-    std::optional<const at::Tensor>& seqlens_rotary_,     // b
-    std::optional<at::Tensor>& q_descale_,                // (b, h_k), not (b, h)
-    std::optional<at::Tensor>& k_descale_,                // (b, h_k)
-    std::optional<at::Tensor>& v_descale_,                // (b, h_k)
+    std::optional<const at::Tensor>& page_table_,      // (b_k, max_num_pages_per_seq)
+    std::optional<const at::Tensor>& kv_batch_idx_,    // b. indices to index into the KV cache
+    std::optional<const at::Tensor>& leftpad_k_,       // b
+    std::optional<const at::Tensor>& rotary_cos_,      // seqlen_ro x (rotary_dim / 2)
+    std::optional<const at::Tensor>& rotary_sin_,      // seqlen_ro x (rotary_dim / 2)
+    std::optional<const at::Tensor>& seqlens_rotary_,  // b
+    std::optional<at::Tensor>& q_descale_,             // (b, h_k), not (b, h)
+    std::optional<at::Tensor>& k_descale_,             // (b, h_k)
+    std::optional<at::Tensor>& v_descale_,             // (b, h_k)
     float const softmax_scale,
     bool is_causal,
     int window_size_left,

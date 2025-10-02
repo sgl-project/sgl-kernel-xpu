@@ -265,7 +265,7 @@ struct FlashChunkPrefillMma<
       FragSrc const& frag_src,
       int const& k_tile_count,
       Params const& params) {
-    auto& gmem_tiled_copy_k =  params.gmem_tiled_copy_k_cache;
+    auto& gmem_tiled_copy_k = params.gmem_tiled_copy_k_cache;
 
     int thread_idx = static_cast<int>(ThreadIdxX());
     auto thr_copy_Q = params.gmem_tiled_copy_q.get_slice(thread_idx);
@@ -342,9 +342,9 @@ struct FlashChunkPrefillMma<
   }
 
   template <int tile_count, class FragQccum, class FragS, class TensorV, class FragSrc>
-  CUTLASS_DEVICE void mmaPV(
-      FragQccum& accum, FragS const& tSr, TensorV gV, FragSrc const& frag_src, Params const& params) {
-    auto& gmem_tiled_copy_v =  params.gmem_tiled_copy_v_cache ;
+  CUTLASS_DEVICE void
+  mmaPV(FragQccum& accum, FragS const& tSr, TensorV gV, FragSrc const& frag_src, Params const& params) {
+    auto& gmem_tiled_copy_v = params.gmem_tiled_copy_v_cache;
 
     int thread_idx = static_cast<int>(ThreadIdxX());
     // Instantiate the MMA object
@@ -422,7 +422,6 @@ struct FlashChunkPrefillMma<
       offset_v_cache = kv_head_coord * head_size_vo;
       total_seq_len_kv_cache = get<5>(problem_shape).total_length;
     } else {
-      
     }
 
     auto q_traits = static_cast<traits_load_Q const&>(params.gmem_tiled_copy_q);
@@ -435,7 +434,7 @@ struct FlashChunkPrefillMma<
     // stride {seq_len*head*dim_head, head*dim_head, dim_head, 1}
     auto shape_q = make_shape(static_cast<int>(seq_len_qo), head_size_qk * num_heads_q, 1);
     StrideQ stride_q = cutlass::make_cute_packed_stride(StrideQ{}, shape_q);
-   
+
     auto shape_k_cache = make_shape(
         static_cast<int>(PagedKV ? total_seq_len_kv_cache : seq_len_kv_cache), head_size_qk * num_heads_kv, 1);
     StrideK stride_k_cache = cutlass::make_cute_packed_stride(StrideK{}, shape_k_cache);

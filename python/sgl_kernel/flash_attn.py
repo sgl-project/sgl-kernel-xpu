@@ -178,25 +178,9 @@ def flash_attn_with_kvcache(
         ) * q.size(1)
         max_seqlen_q = q.size(1)
         q = q.view(-1, q.size(-2), q.size(-1)).contiguous()
-    # if cu_seqlens_k_new is None and k is not None:  # !is_varlen_k_new
-    #     cu_seqlens_k_new = torch.arange(
-    #         0, k.size(0) + 1, dtype=torch.int, device=k.device
-    #     )
-    # elif k is None:
-    #     cu_seqlens_k_new = torch.zeros_like(
-    #         cu_seqlens_q, dtype=torch.int32, device=q.device
-    #     )
     if cache_seqlens is not None:
         max_seqlen_k = cache_seqlens.max().item()
         assert cache_seqlens.size(0) + 1 == cu_seqlens_q.size(0)
-        # max_page_size_per_seq = page_table.size(1)
-        # # will delete later
-        # num_pages_per_seq = torch.arange(
-        #     0,
-        #     cache_seqlens.size(0) * max_page_size_per_seq,
-        #     max_page_size_per_seq,
-        #     device=cache_seqlens.device,
-        # ).to(torch.int32)
         cu_seqlens_k = torch.concat(
             (
                 torch.zeros(1, dtype=torch.int32, device=cache_seqlens.device),

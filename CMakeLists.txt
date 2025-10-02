@@ -37,8 +37,8 @@ set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable headers only mode in cutla
 # cutlass
 FetchContent_Declare(
     repo-cutlass-sycl
-    GIT_REPOSITORY https://github.com/sunjiweiswift/cutlass-sycl.git
-    GIT_TAG        355feacef0916f277e5b3b7d02f15c9848b391df
+    GIT_REPOSITORY https://github.com/intel/sycl-tla.git
+    GIT_TAG        8cdf47660e5c64c0f2191b11525a87bc76d71d9a
     GIT_SHALLOW    OFF
 )
 FetchContent_MakeAvailable(repo-cutlass-sycl)
@@ -49,7 +49,6 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${repo-cutlass-sycl_SOURCE_DIR}/include
     ${repo-cutlass-sycl_SOURCE_DIR}/tools/util/include
-    ${repo-cutlass-sycl_SOURCE_DIR}/applications
 )
 
 add_subdirectory(${SGL_OPS_XPU_ROOT}/src)

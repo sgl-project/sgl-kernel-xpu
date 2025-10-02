@@ -48,18 +48,12 @@ std::vector<at::Tensor> mha_fwd(
                           // h_k, d) if there is page_table.
     const at::Tensor& v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages,
                           // page_size, h_k, dv) if there is page_table.
-    std::optional<const at::Tensor>&
-        k_new_,  // (b, s_k_new, h_k, d) or (total_k_new, h_k, d) if there is cu_seqlens_k_new
-    std::optional<const at::Tensor>&
-        v_new_,  // (b, s_k_new, h_k, dv) or (total_k_new, h_k, dv) if there is cu_seqlens_k_new
     std::optional<const at::Tensor>& q_v_,           // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
     std::optional<const at::Tensor>& cu_seqlens_q_,  // b+1
     std::optional<const at::Tensor>& cu_seqlens_k_,  // b+1
-    std::optional<const at::Tensor>& cu_seqlens_k_new_,  // b+1
     std::optional<int> max_seqlen_q_,
     std::optional<int> max_seqlen_k_,
     std::optional<const at::Tensor>& page_table_,         // (b_k, max_num_pages_per_seq)
-    std::optional<const at::Tensor>& num_pages_per_seq_,  // (b_k, )
     std::optional<const at::Tensor>& kv_batch_idx_,       // b. indices to index into the KV cache
     std::optional<const at::Tensor>& leftpad_k_,          // b
     std::optional<const at::Tensor>& rotary_cos_,         // seqlen_ro x (rotary_dim / 2)

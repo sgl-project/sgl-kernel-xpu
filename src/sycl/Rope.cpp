@@ -728,70 +728,7 @@ void launch_rotary_embedding(
 }
 }  // namespace DSRotaryEmbedding
 
-void rotary_embedding_batched(
-    const Tensor& positions,  //[batch_size, seqlen] or [num_tokens]
-    const Tensor& query,      // [(bs, seq)/num_tokens, num_head * head_dim]
-    const Tensor& key,        // [(bs, seq)/num_tokens, num_kv_head * head_dim]
-    int64_t head_size,
-    const Tensor& cos_sin_cache,  // [max_position, rot_dim]
-    bool is_neox,
-    int64_t rot_dim,
-    Tensor& cos_sin_cache_offsets  // [num_tokens]
-) {
-  int64_t num_tokens = positions.view(-1).size(0);
-  int64_t num_heads = query.size(-1) / head_size;
-  int64_t num_kv_heads = key.size(-1) / head_size;
-  int64_t query_stride = query.stride(-2);
-  int64_t key_stride = key.stride(-2);
-  auto queue = dpcppGetCurrentQueue();
-  auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
-  int64_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
-  int64_t max_group_num = dpcppMaxWorkItemsPerTile(dev_id) / max_wg_size;
-  int64_t num_groups = num_tokens;
-  int64_t group_size = std::min(num_heads * rot_dim / 2, max_wg_size);
-
-  SYCL_DISPATCH_FLOATING_TYPES(
-      at::ScalarType::Half, at::ScalarType::BFloat16, query.scalar_type(), "rotary_embedding_batched", [=]() {
-        auto cgf = DPCPP_Q_CGF(cgh) {
-          if (is_neox) {
-            RotaryEmbeddingBatched<scalar_t, EmbeddingAlgorithm::RotateHalf> kernel = {
-                .positions_ = positions.data_ptr<int64_t>(),
-                .cos_sin_cache_ = cos_sin_cache.data_ptr<scalar_t>(),
-                .cos_sin_cache_offsets_ = cos_sin_cache_offsets.data_ptr<int64_t>(),
-                .query_ = query.data_ptr<scalar_t>(),
-                .key_ = key.data_ptr<scalar_t>(),
-                .num_heads_ = num_heads,
-                .num_kv_heads_ = num_kv_heads,
-                .query_stride_ = query_stride,
-                .key_stride_ = key_stride,
-                .head_size_ = head_size,
-                .rot_dim_ = rot_dim,
-            };
-            cgh.parallel_for<decltype(kernel)>(
-                sycl::nd_range<1>(sycl::range<1>(num_groups * group_size), sycl::range<1>(group_size)), kernel);
-          } else {
-            RotaryEmbeddingBatched<scalar_t, EmbeddingAlgorithm::RotateInterleave> kernel = {
-                .positions_ = positions.data_ptr<int64_t>(),
-                .cos_sin_cache_ = cos_sin_cache.data_ptr<scalar_t>(),
-                .cos_sin_cache_offsets_ = cos_sin_cache_offsets.data_ptr<int64_t>(),
-                .query_ = query.data_ptr<scalar_t>(),
-                .key_ = key.data_ptr<scalar_t>(),
-                .num_heads_ = num_heads,
-                .num_kv_heads_ = num_kv_heads,
-                .query_stride_ = query_stride,
-                .key_stride_ = key_stride,
-                .head_size_ = head_size,
-                .rot_dim_ = rot_dim,
-            };
-            cgh.parallel_for<decltype(kernel)>(
-                sycl::nd_range<1>(sycl::range<1>(num_groups * group_size), sycl::range<1>(group_size)), kernel);
-          }
-        };
-        dpcppGetCurrentQueue().submit(cgf);
-      });
-}
-
-void rotary_embedding(
+void rotary_embedding_2D_kernel_impl(
     const Tensor& positions,  //[batch_size, seqlen] or [num_tokens]
     const Tensor& query,      // [(bs, seq)/num_tokens, num_head * head_dim]
     const Tensor& key,        // [(bs, seq)/num_tokens, num_kv_head * head_dim]
@@ -812,7 +749,7 @@ void rotary_embedding(
   int64_t group_size = std::min(max_wg_size, query.size(-1));
 
   SYCL_DISPATCH_FLOATING_TYPES(
-      at::ScalarType::Half, at::ScalarType::BFloat16, query.scalar_type(), "rotary_embedding", [=]() {
+      at::ScalarType::Half, at::ScalarType::BFloat16, query.scalar_type(), "rotary_embedding_2D_kernel_impl", [=]() {
         auto cgf = DPCPP_Q_CGF(cgh) {
           if (is_neox) {
             RotaryEmbeddingBatched<scalar_t, EmbeddingAlgorithm::RotateHalf, false> kernel = {
@@ -852,39 +789,19 @@ void rotary_embedding(
       });
 }
 
-void apply_rotary_embedding_two(const Tensor& query, const Tensor& sin, const Tensor& cos, Tensor& query_out) {
-  apply_rotary_embedding<EmbeddingAlgorithm::RotateInterleave>(sin, cos, query, query_out);
-}
-
-void apply_rotary_embedding_two_qk(
-    const Tensor& query, const Tensor& key, const Tensor& sin, const Tensor& cos, Tensor& query_out, Tensor& key_out) {
-  apply_rotary_embedding<EmbeddingAlgorithm::RotateInterleave>(sin, cos, query, key, query_out, key_out);
-}
-
-void apply_rotary_embedding_half(const Tensor& query, const Tensor& sin, const Tensor& cos, Tensor& query_out) {
-  apply_rotary_embedding<EmbeddingAlgorithm::RotateHalf>(sin, cos, query, query_out);
-}
-
-void apply_rotary_embedding_half_qk(
-    const Tensor& query, const Tensor& key, const Tensor& sin, const Tensor& cos, Tensor& query_out, Tensor& key_out) {
-  apply_rotary_embedding<EmbeddingAlgorithm::RotateHalf>(sin, cos, query, key, query_out, key_out);
-}
-
 /**
  * @brief Perform deepseek rotary embedding with q&k.
  * @param positions index of embedding [batch]
  * @param query query to be processed [batch, num_head, head_dim]
  * @param key key to be processed [batch, num_head, head_dim]
- * @param offsets optional tensor for offset with position
  * @param cos_sin_cache shared cache with cos/sin
  * @param is_neox_style choose interleave or half.
  * @return A tuple of tensors (query_out, key_out).
  */
-std::tuple<at::Tensor, at::Tensor> ds_rotary_embedding_qk(
+std::tuple<at::Tensor, at::Tensor> rotary_embedding_3D_kernel_impl(
     const Tensor& positions,
     const Tensor& query,
     const Tensor& key,
-    const c10::optional<at::Tensor>& offsets_opt,
     const Tensor& cos_sin_cache,
     int64_t rotary_dim,
     bool is_neox_style) {
@@ -909,9 +826,7 @@ std::tuple<at::Tensor, at::Tensor> ds_rotary_embedding_qk(
   }
   TORCH_CHECK(cos_sin_cache.sizes()[1] == head_size, "Rotary dim doesn't match query head_size");
   TORCH_CHECK(cos_sin_cache.sizes()[1] == k_shape[2], "Rotary dim doesn't match key head_size");
-  const c10::MaybeOwned<Tensor> offsets_maybe_owned = at::borrow_from_optional_tensor(offsets_opt);
-  const Tensor& offsets = *offsets_maybe_owned;
-  auto offsets_ptr = offsets.defined() ? offsets.data_ptr() : nullptr;
+  int64_t* offsets_ptr = nullptr;
   if (query.scalar_type() == at::kBFloat16) {
     using scalar_t = sycl::ext::oneapi::bfloat16;
     DSRotaryEmbedding::launch_rotary_embedding<scalar_t>(
@@ -953,7 +868,7 @@ std::tuple<at::Tensor, at::Tensor> ds_rotary_embedding_qk(
         k_num_head_d,
         k_batch_d);
   } else {
-    AT_DISPATCH_FLOATING_TYPES(query.scalar_type(), "ds_rotary_embedding_qk", [&]() {
+    AT_DISPATCH_FLOATING_TYPES(query.scalar_type(), "rotary_embedding_3D_kernel_impl", [&]() {
       DSRotaryEmbedding::launch_rotary_embedding<scalar_t>(
           reinterpret_cast<int64_t*>(positions.data_ptr()),
           reinterpret_cast<scalar_t*>(query.data_ptr()),
@@ -975,6 +890,26 @@ std::tuple<at::Tensor, at::Tensor> ds_rotary_embedding_qk(
     });
   }
   return {query_out, key_out};
+}
+
+std::tuple<at::Tensor, at::Tensor> rotary_embedding_xpu(
+    at::Tensor& positions,
+    at::Tensor& query,
+    at::Tensor& key,
+    int64_t head_size,
+    at::Tensor& cos_sin_cache,
+    bool is_neox) {
+  const auto input_dim = query.dim();
+  int64_t rotary_dim = cos_sin_cache.size(1);
+  TORCH_CHECK(
+      input_dim == 2 || input_dim == 3,
+      " Query/Key must be 2D [num_tokens, num_heads*head_size] or 3D [num_tokens, num_heads, head_size] tensor");
+  if (input_dim == 2) {
+    rotary_embedding_2D_kernel_impl(positions, query, key, head_size, cos_sin_cache, is_neox, rotary_dim);
+    return {query, key};
+  } else {
+    return rotary_embedding_3D_kernel_impl(positions, query, key, cos_sin_cache, rotary_dim, is_neox);
+  }
 }
 
 }  // namespace at::native::xpu

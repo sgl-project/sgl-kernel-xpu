@@ -123,38 +123,13 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
 void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize);
-std::tuple<at::Tensor, at::Tensor> ds_rotary_embedding_qk(
-    const Tensor& positions,
-    const Tensor& query,
-    const Tensor& key,
-    const c10::optional<at::Tensor>& offsets_opt,
-    const Tensor& cos_sin_cache,
-    int64_t rotary_dim,
-    bool is_neox_style);
-void apply_rotary_embedding_half_qk(
-    const Tensor& query, const Tensor& key, const Tensor& sin, const Tensor& cos, Tensor& query_out, Tensor& key_out);
-void apply_rotary_embedding_half(const Tensor& query, const Tensor& sin, const Tensor& cos, Tensor& query_out);
-void apply_rotary_embedding_two_qk(
-    const Tensor& query, const Tensor& key, const Tensor& sin, const Tensor& cos, Tensor& query_out, Tensor& key_out);
-void apply_rotary_embedding_two(const Tensor& query, const Tensor& sin, const Tensor& cos, Tensor& query_out);
-void rotary_embedding(
-    const Tensor& positions,
-    const Tensor& query,
-    const Tensor& key,
+std::tuple<at::Tensor, at::Tensor> rotary_embedding_xpu(
+    at::Tensor& positions,
+    at::Tensor& query,
+    at::Tensor& key,
     int64_t head_size,
-    const Tensor& cos_sin_cache,
-    bool is_neox,
-    int64_t rot_dim);
-void rotary_embedding_batched(
-    const Tensor& positions,
-    const Tensor& query,
-    const Tensor& key,
-    int64_t head_size,
-    const Tensor& cos_sin_cache,
-    bool is_neox,
-    int64_t rot_dim,
-    Tensor& cos_sin_cache_offsets
-);
+    at::Tensor& cos_sin_cache,
+    bool is_neox);
 }  // namespace at::native::xpu
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);

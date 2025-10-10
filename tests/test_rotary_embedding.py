@@ -137,14 +137,13 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        torch.ops.sgl_kernel.rotary_embedding(
+        query, key = torch.ops.sgl_kernel.rotary_embedding_xpu(
             positions,
             query,
             key,
             self.head_size,
             self.cos_sin_cache.to(torch.bfloat16),
             self.is_neox_style,
-            self.rotary_dim,
         )
 
         return query, key
@@ -444,13 +443,12 @@ def test_deepseek_v2_rope():
             )
 
             # fused rope kernel
-            q_pe_clone, k_pe_clone = torch.ops.sgl_kernel.ds_rotary_embedding_qk(
+            q_pe_clone, k_pe_clone = torch.ops.sgl_kernel.rotary_embedding_xpu(
                 positions,
                 q_pe_clone,
                 k_pe_clone,
-                None,
-                cos_sin_cache,
                 rope.head_size,
+                cos_sin_cache,
                 False,
             )
 

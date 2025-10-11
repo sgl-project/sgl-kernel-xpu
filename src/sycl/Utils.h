@@ -7,7 +7,10 @@
 
 #define SYCL_MAX_SUB_GROUP_SIZE dpcppMaxSubGroupSize()
 
-using namespace at;
+#define CHECK_DEVICE(x) TORCH_CHECK(x.is_xpu(), #x " must be on XPU")
+#define CHECK_SHAPE(x, ...) \
+  TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
+#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
 using DeviceId = at::DeviceIndex;
 

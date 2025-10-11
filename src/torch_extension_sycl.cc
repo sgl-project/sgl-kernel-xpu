@@ -16,7 +16,9 @@ limitations under the License.
 #include <torch/all.h>
 #include <torch/library.h>
 
+#include "sgl_flash_kernel_ops.h"
 #include "sgl_kernel_ops.h"
+#include "sgl_kernel_torch_shim.h"
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
@@ -53,6 +55,39 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   //       "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype,
   //       -> Tensor");
   //   m.impl("fp8_blockwise_scaled_mm", torch::kXPU, &fp8_blockwise_scaled_mm);
+
+  /*
+   * From cutlass attention
+   */
+  m.def(
+      "fwd(Tensor!  q,"
+      "    Tensor   k,"
+      "    Tensor   v,"
+      "    Tensor?  q_v,"
+      "    Tensor?  cu_seqlens_q,"
+      "    Tensor?  cu_seqlens_k,"
+      "    int?     max_seqlen_q,"
+      "    int?     max_seqlen_k,"
+      "    Tensor?  page_table,"
+      "    Tensor?  kv_batch_idx,"
+      "    Tensor?  leftpad_k,"
+      "    Tensor?  rotary_cos,"
+      "    Tensor?  rotary_sin,"
+      "    Tensor?  seqlens_rotary,"
+      "    Tensor?  q_descale,"
+      "    Tensor?  k_descale,"
+      "    Tensor?  v_descale,"
+      "    float    softmax_scale,"
+      "    bool     is_causal,"
+      "    int      window_size_left,"
+      "    int      window_size_right,"
+      "    float    softcap,"
+      "    bool     is_rotary_interleaved,"
+      "    Tensor?  scheduler_metadata,"
+      "    int      num_splits,"
+      "    bool?    pack_gqa,"
+      "    int      sm_margin) -> Tensor[]");
+  m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
 }
 
 REGISTER_EXTENSION(common_ops)

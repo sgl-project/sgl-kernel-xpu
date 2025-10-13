@@ -19,6 +19,7 @@ limitations under the License.
 #include "sgl_flash_kernel_ops.h"
 #include "sgl_kernel_ops.h"
 #include "sgl_kernel_torch_shim.h"
+#include "sgl_moe_kernel_ops.h"
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
@@ -50,6 +51,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
+
+  /*
+   * From fusedMoE kernels - moved to bottom with final implementation
+   */
 
   //   m.def(
   //       "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype,
@@ -88,6 +93,31 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    bool?    pack_gqa,"
       "    int      sm_margin) -> Tensor[]");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
+
+  /*
+   * MoE kernels - enabled for XPU testing
+   */
+  // Register MoE operations with explicit function pointer casting to resolve overloads
+  m.def("fused_moe_forward(Tensor hidden_states, Tensor gate_weights, Tensor up_weights, Tensor down_weights, Tensor topk_weights, Tensor topk_indices, int top_k, bool renormalize=False, bool inplace=False, bool use_grouped_topk=False) -> Tensor");
+  m.impl("fused_moe_forward", torch::kXPU, 
+         static_cast<at::Tensor(*)(const at::Tensor&, const at::Tensor&, const at::Tensor&, 
+                                  const at::Tensor&, const at::Tensor&, const at::Tensor&, 
+                                  int64_t, bool, bool, bool)>(&fused_moe_forward));
+
+  m.def("moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor(a!) sorted_token_ids, Tensor(b!) experts_ids, Tensor(c!) num_tokens_post_pad) -> ()");
+  m.impl("moe_align_block_size", torch::kXPU, 
+         static_cast<void(*)(const at::Tensor&, int64_t, int64_t, 
+                            at::Tensor&, at::Tensor&, at::Tensor&)>(&moe_align_block_size_xpu));
+
+  m.def("grouped_gemm_moe(Tensor A, Tensor B, Tensor C, Tensor(a!) D, Tensor topk_weights, Tensor topk_indices, int top_k, bool trans_b=False) -> ()");
+  m.impl("grouped_gemm_moe", torch::kXPU, 
+         static_cast<void(*)(const at::Tensor&, const at::Tensor&, const at::Tensor&, 
+                            at::Tensor&, const at::Tensor&, const at::Tensor&, 
+                            int64_t, bool)>(&moe_grouped_gemm_xpu));
+
+  m.def("silu_and_mul_moe(Tensor(a!) gate_output, Tensor up_output) -> ()");
+  m.impl("silu_and_mul_moe", torch::kXPU,
+         static_cast<void(*)(at::Tensor&, const at::Tensor&)>(&silu_and_mul_moe_xpu));
 }
 
 REGISTER_EXTENSION(common_ops)

@@ -46,9 +46,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps) -> ()");
   m.impl("gemma_fused_add_rmsnorm", torch::kXPU, &at::native::xpu::gemma_fused_add_rmsnorm);
   m.def(
-      "rotary_embedding_xpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
+      "rotary_embedding(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
       "bool is_neox) -> (Tensor, Tensor)");
-  m.impl("rotary_embedding_xpu", torch::kXPU, &at::native::xpu::rotary_embedding_xpu);
+  m.impl("rotary_embedding", torch::kXPU, &at::native::xpu::rotary_embedding);
 
   //   m.def(
   //       "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype,

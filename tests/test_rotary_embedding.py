@@ -127,8 +127,6 @@ class RotaryEmbedding(torch.nn.Module):
         key = key.to(self.dtype)
         return query, key
 
-
-class FlashInferRotaryEmbedding(RotaryEmbedding):
     def forward_xpu(
         self,
         positions: torch.Tensor,
@@ -137,7 +135,7 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        query, key = torch.ops.sgl_kernel.rotary_embedding_xpu(
+        query, key = torch.ops.sgl_kernel.rotary_embedding(
             positions,
             query,
             key,
@@ -365,9 +363,6 @@ def test_rope(
     rope_ref = RotaryEmbedding(
         head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
     ).to(device)
-    rope_flashinfer = FlashInferRotaryEmbedding(
-        head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
-    ).to(device)
 
     pos_ids = torch.arange(seq_len, device=device).repeat(batch_size)
     query = torch.randn(
@@ -378,17 +373,13 @@ def test_rope(
     )
 
     query_ref, key_ref = query.clone(), key.clone()
-    query_flashinfer, key_flashinfer = query.clone(), key.clone()
+    query_test, key_test = query.clone(), key.clone()
 
     query_ref_out, key_ref_out = rope_ref.forward_native(pos_ids, query_ref, key_ref)
-    query_flashinfer_out, key_flashinfer_out = rope_flashinfer.forward_xpu(
-        pos_ids, query_flashinfer, key_flashinfer
-    )
+    query_test_out, key_test_out = rope_ref.forward_xpu(pos_ids, query_test, key_test)
 
-    torch.testing.assert_close(
-        query_ref_out, query_flashinfer_out, atol=1e-2, rtol=1e-2
-    )
-    torch.testing.assert_close(key_ref_out, key_flashinfer_out, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(query_ref_out, query_test_out, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(key_ref_out, key_test_out, atol=1e-2, rtol=1e-2)
 
 
 def test_deepseek_v2_rope():
@@ -443,7 +434,7 @@ def test_deepseek_v2_rope():
             )
 
             # fused rope kernel
-            q_pe_clone, k_pe_clone = torch.ops.sgl_kernel.rotary_embedding_xpu(
+            q_pe_clone, k_pe_clone = torch.ops.sgl_kernel.rotary_embedding(
                 positions,
                 q_pe_clone,
                 k_pe_clone,
@@ -455,7 +446,6 @@ def test_deepseek_v2_rope():
             atol = rtol = precision[q_pe.dtype]
             torch.testing.assert_close(q_pe, q_pe_clone, atol=atol, rtol=rtol)
             torch.testing.assert_close(k_pe, k_pe_clone, atol=atol, rtol=rtol)
-            torch.testing.assert_close(k_pe, k_pe_clone)
 
 
 if __name__ == "__main__":

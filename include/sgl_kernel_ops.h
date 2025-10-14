@@ -123,7 +123,7 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
 void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize);
-std::tuple<at::Tensor, at::Tensor> rotary_embedding_xpu(
+std::tuple<at::Tensor, at::Tensor> rotary_embedding(
     at::Tensor& positions,
     at::Tensor& query,
     at::Tensor& key,

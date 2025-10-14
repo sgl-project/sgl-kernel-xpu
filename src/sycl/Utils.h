@@ -206,6 +206,27 @@ int get_min(Func limit_func, int X, Args*... args) {
     }                                                                                                       \
   }
 
+#define PRIVATE_CASE_TYPE_OUTPLACE(enum_type, type, ...) \
+  case enum_type: {                                      \
+    using scalar_t = type;                               \
+    __VA_ARGS__();                                       \
+    break;                                               \
+  }
+
+#define SYCL_DISPATCH_FLOATING_TYPES_AND2(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)    \
+  {                                                                                     \
+    const auto& the_type = TYPE;                                                        \
+    at::ScalarType _st = ::detail::scalar_type(the_type);                               \
+    switch (_st) {                                                                      \
+      PRIVATE_CASE_TYPE_OUTPLACE(at::ScalarType::Double, double, __VA_ARGS__)           \
+      PRIVATE_CASE_TYPE_OUTPLACE(at::ScalarType::Float, float, __VA_ARGS__)             \
+      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE1, sycl::ext::oneapi::bfloat16, __VA_ARGS__) \
+      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE2, sycl::half, __VA_ARGS__)                  \
+      default:                                                                          \
+        AT_ERROR(#NAME, " not implemented for '", toString(TYPE), "'");                 \
+    }                                                                                   \
+  }
+
 template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
 inline T div_up(T x, T y) {
   return (x + y - 1) / y;

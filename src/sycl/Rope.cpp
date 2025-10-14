@@ -6,12 +6,6 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
-#include <cmath>
-#include <cstdint>
-#include <iostream>
-#include <sycl/sycl.hpp>
-#include <vector>
-
 #include "MemoryAccess.h"
 #include "Norm.h"
 #include "SYCLHelpers.h"
@@ -23,408 +17,6 @@
 namespace at::native::xpu {
 
 enum class EmbeddingAlgorithm { RotateHalf = 0, RotateInterleave = 1 };
-
-// Result of div/mod operation stored together.
-template <typename Value>
-struct DivMod {
-  Value div, mod;
-
-  DivMod(Value div, Value mod) : div(div), mod(mod) {}
-};
-
-template <typename T, int size>
-struct alignas(16) Array {
-  T data[size];
-
-  T operator[](int i) const {
-    return data[i];
-  }
-  T& operator[](int i) {
-    return data[i];
-  }
-
-  Array() = default;
-  Array(const Array&) = default;
-  Array& operator=(const Array&) = default;
-
-  // Fill the array with x.
-  Array(T x) {
-    for (int i = 0; i < size; i++) {
-      data[i] = x;
-    }
-  }
-};
-// Base case: we only have an implementation for uint32_t for now.  For
-// everything else, we use plain division.
-template <typename Value>
-struct IntDivider {
-  IntDivider() {}  // Dummy constructor for arrays.
-  IntDivider(Value d) : divisor(d) {}
-
-  inline Value div(Value n) const {
-    return n / divisor;
-  }
-  inline Value mod(Value n) const {
-    return n % divisor;
-  }
-  inline DivMod<Value> divmod(Value n) const {
-    return DivMod<Value>(n / divisor, n % divisor);
-  }
-
-  Value divisor;
-};
-
-template <int NARGS, typename index_t = uint32_t, bool signed_strides = false>
-struct OffsetCalculator {
-  static constexpr int MAX_DIMS = 12;
-
-  // We allow having negative strides to implement some operations like
-  // torch.flip
-  using stride_t = std::conditional_t<signed_strides, std::make_signed_t<index_t>, index_t>;
-
-  // The offset for each argument (in bytes). Wrapper around fixed-size array.
-  using offset_type = Array<stride_t, std::max<int>(NARGS, 1)>;
-
-  // if element_sizes is nullptr, then the strides will be in bytes, otherwise
-  // the strides will be in # of elements.
-  OffsetCalculator(
-      int dims, const int64_t* sizes, const int64_t* const* strides, const int64_t* element_sizes = nullptr)
-      : dims(dims) {
-    TORCH_CHECK(dims <= MAX_DIMS, "tensor has too many (>", MAX_DIMS, ") dims");
-    for (int i = 0; i < dims; i++) {
-      sizes_[i] = IntDivider<index_t>(sizes[i]);
-      for (int arg = 0; arg < NARGS; arg++) {
-        int64_t element_size = (element_sizes == nullptr ? 1LL : element_sizes[arg]);
-        strides_[i][arg] = strides[arg][i] / element_size;
-      }
-    }
-  }
-
-  offset_type get(index_t linear_idx) const {
-    offset_type offsets;
-#pragma unroll
-    for (int arg = 0; arg < NARGS; arg++) {
-      offsets[arg] = 0;
-    }
-
-#pragma unroll
-    for (int dim = 0; dim < MAX_DIMS; ++dim) {
-      if (dim == dims) break;
-      auto divmod = sizes_[dim].divmod(linear_idx);
-      linear_idx = divmod.div;
-
-#pragma unroll
-      for (int arg = 0; arg < NARGS; arg++) {
-        offsets[arg] += divmod.mod * strides_[dim][arg];
-      }
-    }
-    return offsets;
-  }
-
-  int dims;
-  IntDivider<index_t> sizes_[MAX_DIMS];
-  stride_t strides_[MAX_DIMS][std::max<int>(NARGS, 1)];
-};
-
-// Make an OffsetCalculator with byte offsets
-template <int N, bool signed_strides = false>
-static OffsetCalculator<N, uint32_t, signed_strides> make_offset_calculator(const at::TensorIteratorBase& iter) {
-  TORCH_INTERNAL_ASSERT(N <= iter.ntensors());
-  std::array<const int64_t*, N> strides;
-  for (int i = 0; i < N; i++) {
-    strides[i] = iter.strides(i).data();
-  }
-  return OffsetCalculator<N, uint32_t, signed_strides>(iter.ndim(), iter.shape().data(), strides.data());
-}
-
-// Make an OffsetCalculator with element offsets
-template <int N, bool signed_strides = false>
-static OffsetCalculator<N, uint32_t, signed_strides>
-make_element_offset_calculator(const at::TensorIteratorBase& iter) {
-  TORCH_INTERNAL_ASSERT(N <= iter.ntensors());
-  std::array<const int64_t*, N> strides;
-  std::array<int64_t, N> element_sizes;
-  for (int i = 0; i < N; i++) {
-    strides[i] = iter.strides(i).data();
-    element_sizes[i] = iter.element_size(i);
-  }
-  return OffsetCalculator<N, uint32_t, signed_strides>(
-      iter.ndim(), iter.shape().data(), strides.data(), element_sizes.data());
-}
-
-template <typename scalar_t, int N, typename emb_scalar_t, EmbeddingAlgorithm Algo>
-struct RotaryEmbedding {};
-
-template <
-    typename scalar_t,
-    int N,
-    typename emb_scalar_t,
-    int noutput,
-    int sin_offset,
-    int cos_offset,
-    typename OffsetCalculatorType>
-struct RotaryEmbeddingKernelFunctor {
-  void operator()(sycl::nd_item<2> item_id) const {
-    auto item_idx = item_id.get_local_id(1);
-    auto item_range = item_id.get_local_range(1);
-    auto group_idx = item_id.get_group(1);
-    auto group_id = item_id.get_group(0);
-    auto sg = item_id.get_sub_group();
-
-    for (int group_num = group_idx; group_num < total_group_num; group_num += max_group_num) {
-      for (int i = item_idx; i < problem_size; i += item_range) {
-#pragma unroll
-        for (int j = 0; j < noutput; ++j) {
-          scalar_t* output_ptr = static_cast<scalar_t*>(data_ptr[j]);
-          scalar_t* input_ptr = static_cast<scalar_t*>(data_ptr[j + noutput]);
-          emb_scalar_t* sin_ptr = static_cast<emb_scalar_t*>(data_ptr[sin_offset]);
-          emb_scalar_t* cos_ptr = static_cast<emb_scalar_t*>(data_ptr[cos_offset]);
-          auto global_offset = group_num * problem_size + i;
-          const auto offset = offset_calc.get(global_offset);
-          scalar_t val = *(input_ptr + offset[j + noutput]);
-          scalar_t scale = i % 2 == 0 ? -1 : 1;
-          scalar_t shift_val = sycl::permute_group_by_xor(sg, val, 1) * scale;
-          float sin_val = static_cast<float>(*(sin_ptr + offset[sin_offset]));
-          float cos_val = static_cast<float>(*(cos_ptr + offset[cos_offset]));
-          *(output_ptr + offset[j]) = (scalar_t)((float)shift_val * sin_val + (float)val * cos_val);
-        }
-      }
-    }
-  }
-  RotaryEmbeddingKernelFunctor(
-      int64_t problem_size_,
-      int64_t max_group_num_,
-      int64_t total_group_num_,
-      OffsetCalculatorType offset_calc_,
-      void** data_ptr_)
-      : problem_size(problem_size_),
-        max_group_num(max_group_num_),
-        total_group_num(total_group_num_),
-        offset_calc(offset_calc_) {
-    for (int i = 0; i < N; ++i) {
-      data_ptr[i] = data_ptr_[i];
-    }
-  }
-
- private:
-  int64_t problem_size;
-  int64_t max_group_num;
-  int64_t total_group_num;
-  OffsetCalculatorType offset_calc;
-  void* data_ptr[N];
-};
-
-template <typename scalar_t, int N, typename emb_scalar_t>
-struct RotaryEmbedding<scalar_t, N, emb_scalar_t, EmbeddingAlgorithm::RotateInterleave> {
-  void call(TensorIteratorBase& iter, int64_t problem_size, int64_t total_size) {
-    auto& dpcpp_queue = dpcppGetCurrentQueue();
-    auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
-    int64_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
-    auto wg_size = std::min(max_wg_size, problem_size);
-
-    int64_t max_group_num = dpcppMaxWorkItemsPerTile(dev_id) / wg_size;
-    int64_t total_group_num = (total_size + problem_size - 1) / problem_size;
-    max_group_num = std::min(max_group_num, total_group_num);
-    auto offset_calc = make_element_offset_calculator<N>(iter);
-    constexpr int noutput = (N - 2) / 2;
-    constexpr int sin_offset = N - 2;
-    constexpr int cos_offset = N - 1;
-    void* data_ptr[N];
-    for (int i = 0; i < N; ++i) {
-      data_ptr[i] = iter.data_ptr(i);
-    }
-    TORCH_INTERNAL_ASSERT(2 * noutput + 2 == iter.ntensors());
-    auto cgf = DPCPP_Q_CGF(cgh) {
-      RotaryEmbeddingKernelFunctor<scalar_t, N, emb_scalar_t, noutput, sin_offset, cos_offset, decltype(offset_calc)>
-          kfn(problem_size, max_group_num, total_group_num, offset_calc, data_ptr);
-      cgh.parallel_for<decltype(kfn)>(
-          sycl::nd_range<2>(
-              sycl::range<2>({1, static_cast<size_t>(max_group_num * wg_size)}),
-              sycl::range<2>({1, static_cast<size_t>(wg_size)})),
-          kfn);
-    };
-    dpcpp_queue.submit(cgf);
-  }
-};
-
-template <typename scalar_t, int N, typename emb_scalar_t, int noutput, typename OffsetCalculatorType>
-struct RotaryEmbeddingKernelFunctor2 {
-  void operator()(sycl::nd_item<2> item_id) const {
-    auto item_idx = item_id.get_local_id(1);
-    auto group_idx = item_id.get_group(1);
-    auto group_id = item_id.get_group(0);
-
-    for (int group_num = group_idx; group_num < total_group_num; group_num += max_group_num) {
-      for (int64_t i = item_idx; i < problem_half; i += wg_size) {
-#pragma unroll
-        for (int j = 0; j < noutput; ++j) {
-          scalar_t* output_ptr = static_cast<scalar_t*>(data_ptr[j]);
-          scalar_t* input_ptr = static_cast<scalar_t*>(data_ptr[j + noutput]);
-          int64_t global_offset1 = group_num * problem_size + i;
-          int64_t global_offset2 = global_offset1 + problem_half;
-          const auto offset1 = offset_calc.get(global_offset1);
-          const auto offset2 = offset_calc.get(global_offset2);
-          float x1 = static_cast<float>(*(input_ptr + offset1[j + noutput]));
-          float x2 = static_cast<float>(*(input_ptr + offset2[j + noutput]));
-          float rotate_x1 = -x2;
-          float rotate_x2 = x1;
-          float sin_val = static_cast<float>(*(sin_ptr + offset1[2 * noutput]));
-          float cos_val = static_cast<float>(*(cos_ptr + offset1[2 * noutput + 1]));
-          float sin_val_half = static_cast<float>(*(sin_ptr + offset2[2 * noutput]));
-          float cos_val_half = static_cast<float>(*(cos_ptr + offset2[2 * noutput + 1]));
-          *(output_ptr + offset1[j]) = static_cast<scalar_t>(x1 * cos_val + rotate_x1 * sin_val);
-          *(output_ptr + offset2[j]) = static_cast<scalar_t>(x2 * cos_val_half + rotate_x2 * sin_val_half);
-        }
-      }
-    }
-  }
-  RotaryEmbeddingKernelFunctor2(
-      int64_t problem_size_,
-      int64_t problem_half_,
-      int64_t wg_size_,
-      int64_t max_group_num_,
-      int64_t total_group_num_,
-      OffsetCalculatorType offset_calc_,
-      void** data_ptr_,
-      emb_scalar_t* sin_ptr_,
-      emb_scalar_t* cos_ptr_)
-      : problem_size(problem_size_),
-        problem_half(problem_half_),
-        wg_size(wg_size_),
-        max_group_num(max_group_num_),
-        total_group_num(total_group_num_),
-        offset_calc(offset_calc_),
-        sin_ptr(sin_ptr_),
-        cos_ptr(cos_ptr_) {
-    for (int i = 0; i < N; ++i) {
-      data_ptr[i] = data_ptr_[i];
-    }
-  }
-
- private:
-  int64_t problem_size;
-  int64_t problem_half;
-  int64_t wg_size;
-  int64_t max_group_num;
-  int64_t total_group_num;
-  OffsetCalculatorType offset_calc;
-  void* data_ptr[N];
-  emb_scalar_t* sin_ptr;
-  emb_scalar_t* cos_ptr;
-};
-
-template <typename scalar_t, int N, typename emb_scalar_t>
-struct RotaryEmbedding<scalar_t, N, emb_scalar_t, EmbeddingAlgorithm::RotateHalf> {
-  void call(TensorIteratorBase& iter, int64_t problem_size, int64_t total_size) {
-    auto& dpcpp_queue = dpcppGetCurrentQueue();
-    auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
-    int64_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
-    int64_t problem_half = problem_size / 2;
-    int64_t wg_size = std::min(max_wg_size, problem_half);
-
-    int64_t max_group_num = dpcppMaxWorkItemsPerTile(dev_id) / wg_size;
-    int64_t total_group_num = (total_size + problem_size - 1) / problem_size;
-    max_group_num = std::min(max_group_num, total_group_num);
-    auto offset_calc = make_element_offset_calculator<N>(iter);
-    constexpr int noutput = (N - 2) / 2;
-
-    void* data_ptr[N];
-    for (int i = 0; i < N; ++i) {
-      data_ptr[i] = iter.data_ptr(i);
-    }
-    emb_scalar_t* sin_ptr = static_cast<emb_scalar_t*>(iter.data_ptr(N - 2));
-    emb_scalar_t* cos_ptr = static_cast<emb_scalar_t*>(iter.data_ptr(N - 1));
-
-    TORCH_INTERNAL_ASSERT(2 * noutput + 2 == iter.ntensors());
-    TORCH_INTERNAL_ASSERT(2 * noutput + 2 == iter.ntensors());
-    auto cgf = DPCPP_Q_CGF(cgh) {
-      RotaryEmbeddingKernelFunctor2<scalar_t, N, emb_scalar_t, noutput, decltype(offset_calc)> kfn(
-          problem_size, problem_half, wg_size, max_group_num, total_group_num, offset_calc, data_ptr, sin_ptr, cos_ptr);
-
-      cgh.parallel_for<decltype(kfn)>(
-          sycl::nd_range<2>(
-              sycl::range<2>({1, static_cast<size_t>(max_group_num * wg_size)}),
-              sycl::range<2>({1, static_cast<size_t>(wg_size)})),
-          kfn);
-    };
-    dpcpp_queue.submit(cgf);
-  }
-};
-
-enum class RotaryCheck {
-  CheckDim = 0,
-  CheckProblemSize = 1,
-};
-
-template <RotaryCheck check>
-struct RotaryEmbeddingCheck {};
-
-template <>
-struct RotaryEmbeddingCheck<RotaryCheck::CheckDim> {
-  template <typename... Args>
-  void call(int64_t sin_dim, Tensor& input_or_output, Args... args) {
-    TORCH_CHECK(sin_dim == input_or_output.ndimension());
-    call(sin_dim, args...);
-  }
-  void call(int64_t sin_dim) {
-    return;
-  }
-};
-
-template <>
-struct RotaryEmbeddingCheck<RotaryCheck::CheckProblemSize> {
-  template <typename... Args>
-  void call(int64_t problem_size, Tensor& input_or_output, Args... args) {
-    int64_t ndim = input_or_output.ndimension();
-    TORCH_CHECK(problem_size == input_or_output.size(ndim - 1), "The problem size of all tensor should be equal");
-    TORCH_CHECK(!(input_or_output.size(ndim - 1) & 1), "The problem size should be divisible by 2");
-    call(problem_size, args...);
-  }
-
-  void call(int64_t sin_dim) {
-    return;
-  }
-};
-
-template <int total_size, int cur_size>
-struct BuildTensorIterConfigFromArgs {
-  template <typename... Args>
-  void call(TensorIteratorConfig& config, Tensor& tensor, Args... args) {
-    BuildTensorIterConfigFromArgs<total_size, cur_size - 1>().call(config, args...);
-    // The first half should be input and the last half should be output
-    if constexpr ((total_size >> 1) < cur_size) {
-      config.add_input(tensor);
-    } else {
-      config.add_output(tensor);
-    }
-  }
-
-  void call(TensorIteratorConfig& config) {
-    return;
-  }
-};
-
-template <EmbeddingAlgorithm Algo, typename... Args>
-void apply_rotary_embedding(const Tensor& sin, const Tensor& cos, Args... args) {
-  int64_t sin_dim = sin.ndimension();
-  int64_t cos_dim = cos.ndimension();
-  int64_t sin_prob_size = sin.size(sin_dim - 1);
-  int64_t cos_prob_size = cos.size(cos_dim - 1);
-  TORCH_CHECK(sin_prob_size == cos_prob_size, "The problem size of sin and cos should be same in rotary embedding");
-  TORCH_CHECK(sin_dim == cos_dim, "The dimension of sin and cos should be the same in rotary embedding");
-  RotaryEmbeddingCheck<RotaryCheck::CheckDim>().call(sin_dim, args...);
-  RotaryEmbeddingCheck<RotaryCheck::CheckProblemSize>().call(sin.size(sin_dim - 1), args...);
-  auto config = TensorIteratorConfig();
-  BuildTensorIterConfigFromArgs<sizeof...(args), sizeof...(args)>().call(config, args...);
-  auto iter = config.add_input(sin).add_input(cos).check_all_same_dtype(false).build();
-  SYCL_DISPATCH_FLOATING_TYPES(
-      at::ScalarType::Half, at::ScalarType::BFloat16, iter.input_dtype(), "apply_rotary_embedding", [&]() {
-        if (sin.scalar_type() == at::kFloat)
-          RotaryEmbedding<scalar_t, sizeof...(args) + 2, float, Algo>().call(iter, sin_prob_size, iter.numel());
-        else
-          RotaryEmbedding<scalar_t, sizeof...(args) + 2, scalar_t, Algo>().call(iter, sin_prob_size, iter.numel());
-      });
-}
 
 template <typename scalar_t, EmbeddingAlgorithm algo = EmbeddingAlgorithm::RotateHalf, bool has_cache_offset = true>
 struct RotaryEmbeddingBatched {
@@ -729,11 +321,11 @@ void launch_rotary_embedding(
 }  // namespace DSRotaryEmbedding
 
 void rotary_embedding_2D_kernel_impl(
-    const Tensor& positions,  //[batch_size, seqlen] or [num_tokens]
-    const Tensor& query,      // [(bs, seq)/num_tokens, num_head * head_dim]
-    const Tensor& key,        // [(bs, seq)/num_tokens, num_kv_head * head_dim]
+    const at::Tensor& positions,  //[batch_size, seqlen] or [num_tokens]
+    const at::Tensor& query,      // [(bs, seq)/num_tokens, num_head * head_dim]
+    const at::Tensor& key,        // [(bs, seq)/num_tokens, num_kv_head * head_dim]
     int64_t head_size,
-    const Tensor& cos_sin_cache,  // [max_position, rot_dim]
+    const at::Tensor& cos_sin_cache,  // [max_position, rot_dim]
     bool is_neox,
     int64_t rot_dim) {
   int64_t num_tokens = positions.view(-1).size(0);
@@ -799,10 +391,10 @@ void rotary_embedding_2D_kernel_impl(
  * @return A tuple of tensors (query_out, key_out).
  */
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_3D_kernel_impl(
-    const Tensor& positions,
-    const Tensor& query,
-    const Tensor& key,
-    const Tensor& cos_sin_cache,
+    const at::Tensor& positions,
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& cos_sin_cache,
     int64_t rotary_dim,
     bool is_neox_style) {
   auto query_out = at::empty_like(query);
@@ -827,72 +419,32 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_3D_kernel_impl(
   TORCH_CHECK(cos_sin_cache.sizes()[1] == head_size, "Rotary dim doesn't match query head_size");
   TORCH_CHECK(cos_sin_cache.sizes()[1] == k_shape[2], "Rotary dim doesn't match key head_size");
   int64_t* offsets_ptr = nullptr;
-  if (query.scalar_type() == at::kBFloat16) {
-    using scalar_t = sycl::ext::oneapi::bfloat16;
-    DSRotaryEmbedding::launch_rotary_embedding<scalar_t>(
-        reinterpret_cast<int64_t*>(positions.data_ptr()),
-        reinterpret_cast<scalar_t*>(query.data_ptr()),
-        reinterpret_cast<scalar_t*>(key.data_ptr()),
-        reinterpret_cast<int64_t*>(offsets_ptr),
-        reinterpret_cast<scalar_t*>(cos_sin_cache.data_ptr()),
-        reinterpret_cast<scalar_t*>(query_out.data_ptr()),
-        reinterpret_cast<scalar_t*>(key_out.data_ptr()),
-        batch,
-        q_num_head,
-        k_num_head,
-        head_size,
-        rotary_dim,
-        is_neox_style,
-        q_num_head_d,
-        q_batch_d,
-        k_num_head_d,
-        k_batch_d);
-  } else if (query.scalar_type() == at::kHalf) {
-    using scalar_t = sycl::half;
-    DSRotaryEmbedding::launch_rotary_embedding<scalar_t>(
-        reinterpret_cast<int64_t*>(positions.data_ptr()),
-        reinterpret_cast<scalar_t*>(query.data_ptr()),
-        reinterpret_cast<scalar_t*>(key.data_ptr()),
-        reinterpret_cast<int64_t*>(offsets_ptr),
-        reinterpret_cast<scalar_t*>(cos_sin_cache.data_ptr()),
-        reinterpret_cast<scalar_t*>(query_out.data_ptr()),
-        reinterpret_cast<scalar_t*>(key_out.data_ptr()),
-        batch,
-        q_num_head,
-        k_num_head,
-        head_size,
-        rotary_dim,
-        is_neox_style,
-        q_num_head_d,
-        q_batch_d,
-        k_num_head_d,
-        k_batch_d);
-  } else {
-    AT_DISPATCH_FLOATING_TYPES(query.scalar_type(), "rotary_embedding_3D_kernel_impl", [&]() {
-      DSRotaryEmbedding::launch_rotary_embedding<scalar_t>(
-          reinterpret_cast<int64_t*>(positions.data_ptr()),
-          reinterpret_cast<scalar_t*>(query.data_ptr()),
-          reinterpret_cast<scalar_t*>(key.data_ptr()),
-          reinterpret_cast<int64_t*>(offsets_ptr),
-          reinterpret_cast<scalar_t*>(cos_sin_cache.data_ptr()),
-          reinterpret_cast<scalar_t*>(query_out.data_ptr()),
-          reinterpret_cast<scalar_t*>(key_out.data_ptr()),
-          batch,
-          q_num_head,
-          k_num_head,
-          head_size,
-          rotary_dim,
-          is_neox_style,
-          q_num_head_d,
-          q_batch_d,
-          k_num_head_d,
-          k_batch_d);
-    });
-  }
+  SYCL_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::BFloat16, at::ScalarType::Half, query.scalar_type(), "rotary_embedding_3D_kernel_impl", [&]() {
+        DSRotaryEmbedding::launch_rotary_embedding<scalar_t>(
+            reinterpret_cast<int64_t*>(positions.data_ptr()),
+            reinterpret_cast<scalar_t*>(query.data_ptr()),
+            reinterpret_cast<scalar_t*>(key.data_ptr()),
+            reinterpret_cast<int64_t*>(offsets_ptr),
+            reinterpret_cast<scalar_t*>(cos_sin_cache.data_ptr()),
+            reinterpret_cast<scalar_t*>(query_out.data_ptr()),
+            reinterpret_cast<scalar_t*>(key_out.data_ptr()),
+            batch,
+            q_num_head,
+            k_num_head,
+            head_size,
+            rotary_dim,
+            is_neox_style,
+            q_num_head_d,
+            q_batch_d,
+            k_num_head_d,
+            k_batch_d);
+      });
+
   return {query_out, key_out};
 }
 
-std::tuple<at::Tensor, at::Tensor> rotary_embedding_xpu(
+std::tuple<at::Tensor, at::Tensor> rotary_embedding(
     at::Tensor& positions,
     at::Tensor& query,
     at::Tensor& key,

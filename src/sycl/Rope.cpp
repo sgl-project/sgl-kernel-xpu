@@ -1,18 +1,10 @@
 #include <ATen/ATen.h>
-#include <ATen/Dispatch.h>
 #include <ATen/OpMathType.h>
 #include <ATen/Parallel.h>
 #include <ATen/core/Array.h>
-#include <c10/xpu/XPUStream.h>
-#include <torch/all.h>
 
-#include "MemoryAccess.h"
-#include "Norm.h"
-#include "SYCLHelpers.h"
 #include "Utils.h"
-#include "comm/AccumulateType.h"
 #include "comm/General.h"
-#include "comm/Numerics.h"
 
 namespace at::native::xpu {
 

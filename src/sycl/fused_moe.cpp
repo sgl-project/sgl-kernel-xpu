@@ -25,6 +25,7 @@ at::Tensor fused_moe_forward(
 ) {
     // For now, return input tensor as placeholder
     // The Python layer will use fallback implementation
+    std::cout << "XPU fused_moe_forward called - using placeholder implementation." << std::endl;
     return hidden_states.clone();
 }
 

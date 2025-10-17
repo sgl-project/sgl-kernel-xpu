@@ -64,6 +64,9 @@ struct Flash_fwd_params {
   // The scaling factors for the kernel.
   float scale_softmax;
   float softcap;
+  float* __restrict__ q_scale_ptr;
+  float* __restrict__ k_scale_ptr;
+  float* __restrict__ v_scale_ptr;
 
   // array of length b+1 holding starting offset of each sequence.
   int* __restrict__ cu_seqlens_q;
@@ -113,6 +116,7 @@ struct Flash_fwd_params {
 
   // Paged KV cache
   int* __restrict__ page_table;
+  int* __restrict__ num_pages_per_seq_ptr;
   int max_num_pages_per_seq;
   index_t page_table_batch_stride;
   int page_size;
@@ -136,7 +140,7 @@ struct Flash_fwd_params {
 
   bool is_bf16;
   bool is_fp32;
-  bool is_e4m3;
+  bool is_fp8;
   bool is_causal;
   bool is_local;
 
@@ -311,24 +315,26 @@ struct KernelRunner {
     typename FMHAChunkPrefillKernel::Arguments arguments{
         cutlass::gemm::GemmUniversalMode::kGemm,
         problem_size,
-        {// static_cast<const ElementQ*>(params.q_ptr),
-         static_cast<const ElementQ*>(params.q_ptr),
+        {static_cast<const ElementQ*>(params.q_ptr),
          stride_Q,
-         //  static_cast<const ElementK*>(params.knew_ptr),
-         //  stride_K,
-         //  static_cast<const ElementV*>(params.vnew_ptr),
-         //  stride_V,
-         static_cast<const ElementV*>(params.k_ptr),
+         static_cast<const ElementK*>(params.knew_ptr),
+         stride_K,
+         static_cast<const ElementV*>(params.vnew_ptr),
+         stride_V,
+         params.q_scale_ptr,
+         params.k_scale_ptr,
+         params.v_scale_ptr,
+         static_cast<const ElementK*>(params.k_ptr),
          stride_K_cache,
          static_cast<const ElementV*>(params.v_ptr),
          stride_V_cache,
          params.page_table,
          params.page_size,
-         params.max_num_pages_per_seq,
+         params.num_pages_per_seq_ptr,
          -1,
          -1},
-        {(ElementQ)params.scale_softmax},
-        {static_cast<const ElementOutput*>(params.o_ptr), stride_O},
+        {params.scale_softmax},
+        {static_cast<ElementOutput*>(params.o_ptr), stride_O},
         hw_info};
 
     // Define device-global scratch memory
@@ -496,8 +502,9 @@ std::vector<at::Tensor> mha_fwd(
 
   auto q_type = q.scalar_type();
   TORCH_CHECK(
-      q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
-      "SGL Kernel XPU only supports fp16 and bf16 type");
+      q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16 || q_type == at::ScalarType::Float8_e4m3fn ||
+          q_type == at::ScalarType::Float8_e5m2,
+      "SGL Kernel XPU only supports fp16, bf16 and fp8 types");
 
   TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
   TORCH_CHECK(v.scalar_type() == q_type, "query and value must have the same dtype");
@@ -639,6 +646,7 @@ std::vector<at::Tensor> mha_fwd(
   // align with FA3
   Flash_fwd_params params;
   params.is_bf16 = q.dtype() == torch::kBFloat16;
+  params.is_fp8 = q.dtype() == at::ScalarType::Float8_e4m3fn || q.dtype() == at::ScalarType::Float8_e5m2;
 
   // Set the pointers and strides.
   params.q_ptr = q.data_ptr();
@@ -655,6 +663,12 @@ std::vector<at::Tensor> mha_fwd(
   params.o_ptr = out.data_ptr();
   params.o_row_stride = out.stride(-3);
   params.o_head_stride = out.stride(-2);
+
+  if (params.is_fp8) {
+    params.q_scale_ptr = static_cast<float*>(q_descale_.value().data_ptr());
+    params.k_scale_ptr = static_cast<float*>(k_descale_.value().data_ptr());
+    params.v_scale_ptr = static_cast<float*>(v_descale_.value().data_ptr());
+  }
 
   if (!is_varlen_q) {
     params.q_batch_stride = q.stride(0);
@@ -708,12 +722,15 @@ std::vector<at::Tensor> mha_fwd(
   params.total_k = total_k;
   params.b_k = batch_size_k;
   params.dv = head_size_v;
+  at::Tensor num_pages_per_seq;
   if (paged_KV) {
     params.page_table = page_table.data_ptr<int>();
     params.page_table_batch_stride = page_table.stride(0);
     params.max_num_pages_per_seq = max_num_pages_per_seq;
     params.page_size = page_size;
     params.num_pages = num_pages;
+    num_pages_per_seq = torch::zeros({batch_size_k + 1}, torch::dtype(torch::kInt32).device(q.device()));
+    params.num_pages_per_seq_ptr = num_pages_per_seq.data_ptr<int>();
   }
 
   if (q_v_.has_value()) {
@@ -787,7 +804,91 @@ std::vector<at::Tensor> mha_fwd(
   auto outaccum_type = at::ScalarType::Float;
 
   constexpr int PipelineStages = 2;
-  if (params.is_causal) {
+
+  if (params.is_fp8) {
+    using ElementInputQ = cutlass::float_e4m3_t;
+    using ElementInputKV = cutlass::float_e4m3_t;
+    using MMAOperation = XE_8x16x16_F32BF16BF16F32_TT;
+    using GmemTiledCopyQ = XE_2D_U8x8x32_LD_N;
+    using GmemTiledCopyK = XE_2D_U8x16x16_LD_T;
+    using GmemTiledCopyV = XE_2D_U8x32x32_LD_V;
+
+    if (params.is_causal) {
+      switch (params.d) {
+        case 64:
+          FMHAConfig<
+              true,
+              cute::Shape<_128, _64, _64>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _64, _64>,
+              cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              false,
+              ElementInputQ,
+              ElementInputKV,
+              MMAOperation,
+              GmemTiledCopyQ,
+              GmemTiledCopyK,
+              GmemTiledCopyV>::run(params);
+          break;
+        case 128:
+          FMHAConfig<
+              true,
+              cute::Shape<_128, _64, _64>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _128, _64>,
+              cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              false,
+              ElementInputQ,
+              ElementInputKV,
+              MMAOperation,
+              GmemTiledCopyQ,
+              GmemTiledCopyK,
+              GmemTiledCopyV>::run(params);
+          break;
+        default:
+          TORCH_CHECK(false, "Unsupported head size for FP8 causal attention");
+      }
+    } else {
+      switch (params.d) {
+        case 64:
+          FMHAConfig<
+              false,
+              cute::Shape<_128, _64, _64>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _64, _64>,
+              cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              false,
+              ElementInputQ,
+              ElementInputKV,
+              MMAOperation,
+              GmemTiledCopyQ,
+              GmemTiledCopyK,
+              GmemTiledCopyV>::run(params);
+          break;
+        case 128:
+          FMHAConfig<
+              false,
+              cute::Shape<_128, _64, _64>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _128, _64>,
+              cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              false,
+              ElementInputQ,
+              ElementInputKV,
+              MMAOperation,
+              GmemTiledCopyQ,
+              GmemTiledCopyK,
+              GmemTiledCopyV>::run(params);
+          break;
+        default:
+          TORCH_CHECK(false, "Unsupported head size for FP8 attention");
+      }
+    }
+  } else if (params.is_causal) {
     switch (params.d) {
       case 64:
         FMHAConfig<

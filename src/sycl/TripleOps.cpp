@@ -88,8 +88,8 @@ struct op_and_mul_functor {
 
 template <typename T = float>
 void get_config(
-    const Tensor& input,
-    const Tensor& out,
+    const at::Tensor& input,
+    const at::Tensor& out,
     int64_t& numel,
     int64_t& dim,
     int64_t& wg_size,
@@ -111,7 +111,7 @@ void get_config(
 }
 
 template <typename T_to = float, typename T_from = float>
-void silu_and_mul_sycl(sycl::queue& q, Tensor& input, Tensor& out) {
+void silu_and_mul_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out) {
   auto _input = reinterpret_cast<T_to*>(input.data_ptr<T_from>());
   auto _out = reinterpret_cast<T_to*>(out.data_ptr<T_from>());
 
@@ -136,7 +136,7 @@ void silu_and_mul_sycl(sycl::queue& q, Tensor& input, Tensor& out) {
   return;
 }
 
-void silu_and_mul(Tensor& out, Tensor& input) {
+void silu_and_mul(at::Tensor& out, at::Tensor& input) {
   input = input.contiguous();
   out = out.contiguous();
 
@@ -152,7 +152,7 @@ void silu_and_mul(Tensor& out, Tensor& input) {
 }
 
 template <typename T_to = float, typename T_from = float>
-void gelu_tanh_and_mul_sycl(sycl::queue& q, Tensor& input, Tensor& out) {
+void gelu_tanh_and_mul_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out) {
   auto _input = reinterpret_cast<T_to*>(input.data_ptr<T_from>());
   auto _out = reinterpret_cast<T_to*>(out.data_ptr<T_from>());
 
@@ -177,7 +177,7 @@ void gelu_tanh_and_mul_sycl(sycl::queue& q, Tensor& input, Tensor& out) {
   return;
 }
 
-void gelu_tanh_and_mul(Tensor& out, Tensor& input) {
+void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input) {
   input = input.contiguous();
   out = out.contiguous();
 
@@ -193,7 +193,7 @@ void gelu_tanh_and_mul(Tensor& out, Tensor& input) {
 }
 
 template <typename T_to = float, typename T_from = float>
-void gelu_and_mul_sycl(sycl::queue& q, Tensor& input, Tensor& out) {
+void gelu_and_mul_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out) {
   auto _input = reinterpret_cast<T_to*>(input.data_ptr<T_from>());
   auto _out = reinterpret_cast<T_to*>(out.data_ptr<T_from>());
 
@@ -218,7 +218,7 @@ void gelu_and_mul_sycl(sycl::queue& q, Tensor& input, Tensor& out) {
   return;
 }
 
-void gelu_and_mul(Tensor& out, Tensor& input) {
+void gelu_and_mul(at::Tensor& out, at::Tensor& input) {
   input = input.contiguous();
   out = out.contiguous();
 

@@ -59,3 +59,6 @@ struct NullType {
     return false;
   }
 };
+
+// Command group function implementation
+#define DPCPP_Q_CGF(h) [&](sycl::handler & h)

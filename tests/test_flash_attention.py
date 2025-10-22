@@ -587,7 +587,7 @@ def test_flash_attn_kvcache(
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     if use_softmax_sink:
-        softmax_sink = torch.randn(nheads_k, device=device, dtype=dtype_ref)
+        softmax_sink = torch.randn(nheads, device=device, dtype=dtype_ref)
     if dtype == torch.float8_e4m3fn or not is_hopper():
         # for fp8 and ampere arch, we not support v head dim != qk head dim
         dv_vals = [d]

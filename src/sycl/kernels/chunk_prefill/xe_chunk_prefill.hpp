@@ -104,6 +104,9 @@ class FMHAPrefillChunk {
   using EpilogueParams = typename CollectiveEpilogue::Params;
   using TileShapeOutput = typename CollectiveEpilogue::TileShapeOutput;
   using TiledMmaOutput = typename CollectiveEpilogue::TiledMmaOutput;
+  using ElementSink = typename CollectiveEpilogue::ElementSink;
+
+  static constexpr bool Sink = CollectiveEpilogue::Sink;
 
   static_assert(
       cute::is_same_v<ElementAccumulator, typename CollectiveEpilogue::ElementAccumulator>,
@@ -585,7 +588,20 @@ class FMHAPrefillChunk {
           params.epilogue, params.problem_shape, sequence_length_shape, batch_coord, q_head_coord);
       CollectiveEpilogue epilogue{epilogue_params, shared_storage.epilogue};
       auto blk_coord_mnkl = make_coord(blk_m_coord, blk_n_coord, _, 0);
-      epilogue(params.problem_shape, sequence_length_shape, blk_coord_mnkl, out_reg, max_reg, sum_reg);
+      if constexpr (Sink) {
+        constexpr double kLog2e = 1.4426950408889634074;  // log_2(e) = M_LOG2E
+        ElementAccumulator max_scale{max_reg * params.softmax.scale};
+        epilogue(
+            params.problem_shape,
+            sequence_length_shape,
+            blk_coord_mnkl,
+            out_reg,
+            max_scale,
+            sum_reg,
+            params.epilogue.ptr_sink[q_head_coord] * kLog2e);
+      } else {
+        epilogue(params.problem_shape, sequence_length_shape, blk_coord_mnkl, out_reg, max_reg, sum_reg, 0);
+      }
     }
   }
 };

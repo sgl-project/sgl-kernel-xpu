@@ -197,6 +197,8 @@ def attention_ref(
     q,
     k,
     v,
+    softmax_scale,
+    sink=None,
     query_padding_mask=None,
     key_padding_mask=None,
     key_leftpad=None,
@@ -255,7 +257,7 @@ def attention_ref(
     v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
     d = q.shape[-1]
     dv = v.shape[-1]
-    softmax_scale = 1.0 / math.sqrt(d if qv is None else d + dv)
+
     if not reorder_ops:
         scores = torch.einsum("bthd,bshd->bhts", q * softmax_scale, k)
     else:
@@ -282,7 +284,14 @@ def attention_ref(
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
         scores = scores + attn_bias
+    if sink is not None:
+        sink_expanded = sink.view(1, sink.size()[0], 1, 1).expand(
+            scores.size()[0], scores.size()[1], scores.size()[2], 1
+        )
+        scores = torch.cat([scores, sink_expanded], dim=-1)
     attention = torch.softmax(scores, dim=-1).to(v.dtype)
+    if sink is not None:
+        attention = attention[..., :-1]
     # We want to mask here so that the attention matrix doesn't have any NaNs
     # Otherwise we'll get NaN in dV
     if query_padding_mask is not None:
@@ -480,6 +489,7 @@ def generate_qkv(
 # )
 @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
 # @pytest.mark.parametrize("causal,local", [(True, False)])
+@pytest.mark.parametrize("use_softmax_sink", [True, False])
 # @pytest.mark.parametrize(
 #     "seqlen_new_eq_seqlen_q", [True, False] if not DISABLE_APPENDKV else [True]
 # )
@@ -546,6 +556,7 @@ def test_flash_attn_kvcache(
     seqlen_new_eq_seqlen_q,
     causal,
     local,
+    use_softmax_sink,
     new_kv,
     mha_type,
     dtype,
@@ -565,6 +576,7 @@ def test_flash_attn_kvcache(
     batch_size = 5
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
     nheads = 16
+
     if seqlen_k <= seqlen_q:
         seqlen_k += seqlen_q
     # nheads = 1
@@ -574,11 +586,14 @@ def test_flash_attn_kvcache(
     assert nheads % nheads_k == 0
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
+    if use_softmax_sink:
+        softmax_sink = torch.randn(nheads_k, device=device, dtype=dtype_ref)
     if dtype == torch.float8_e4m3fn or not is_hopper():
         # for fp8 and ampere arch, we not support v head dim != qk head dim
         dv_vals = [d]
     for dv in dv_vals:
         has_qv = d == 64 and dv >= 256
+        softmax_scale = 1.0 / math.sqrt(d if has_qv is None else d + dv)
         q = (
             torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
             .to(dtype)
@@ -815,6 +830,8 @@ def test_flash_attn_kvcache(
             q_ro,
             k_cache_rep,
             v_cache_rep,
+            softmax_scale,
+            softmax_sink if use_softmax_sink else None,
             query_padding_mask,
             key_padding_mask,
             causal=causal,
@@ -826,6 +843,8 @@ def test_flash_attn_kvcache(
             q_ro,
             k_cache_rep,
             v_cache_rep,
+            softmax_scale,
+            softmax_sink if use_softmax_sink else None,
             query_padding_mask,
             key_padding_mask,
             causal=causal,
@@ -885,6 +904,8 @@ def test_flash_attn_kvcache(
                     rotary_seqlens=rotary_seqlens,
                     causal=causal,
                     window_size=window_size,
+                    softmax_scale=softmax_scale,
+                    softmax_sink=softmax_sink if use_softmax_sink else None,
                     rotary_interleaved=rotary_interleaved,
                     scheduler_metadata=scheduler_metadata,
                     num_splits=num_splits,

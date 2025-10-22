@@ -63,6 +63,7 @@ struct Flash_fwd_params {
 
   // The scaling factors for the kernel.
   float scale_softmax;
+  void* sink_softmax;
   float softcap;
 
   // array of length b+1 holding starting offset of each sequence.
@@ -175,6 +176,7 @@ struct KernelRunner {
   using ElementK = typename FMHAChunkPrefillKernel::ElementK;
   using ElementV = typename FMHAChunkPrefillKernel::ElementV;
   using ElementAcc = typename FMHAChunkPrefillKernel::ElementAccumulator;
+  using ElementSink = typename FMHAChunkPrefillKernel::ElementSink;
 
   using CollectiveEpilogue = typename FMHAChunkPrefillKernel::CollectiveEpilogue;
   using ElementOutput = typename CollectiveEpilogue::ElementOutput;
@@ -328,7 +330,9 @@ struct KernelRunner {
          -1,
          -1},
         {(ElementQ)params.scale_softmax},
-        {static_cast<const ElementOutput*>(params.o_ptr), stride_O},
+        {static_cast<const ElementOutput*>(params.o_ptr),
+         stride_O,
+         static_cast<const ElementSink*>(params.sink_softmax)},
         hw_info};
 
     // Define device-global scratch memory
@@ -359,6 +363,7 @@ template <
     typename TileShapeOutput,
     typename SubgroupLayout,
     int PipelineStages,
+    bool Sink = false,
     bool LocalMask = false,
     typename ElementInputQ = bfloat16_t,
     typename ElementInputKV = bfloat16_t,
@@ -369,6 +374,7 @@ template <
     typename ElementAccumulator = float,
     typename ElementComputeEpilogue = float,
     typename ElementOutput = bfloat16_t,
+    typename ElementSink = bfloat16_t,
     typename GmemTiledCopyStore = XE_2D_U16x8x16_ST_N>
 struct FMHAConfig {
   template <bool isVarLen, bool PagedKV, class Scheduler>
@@ -380,6 +386,7 @@ struct FMHAConfig {
     using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16<PipelineStages>;
     using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeXMX16;
     using CollectiveEpilogue = cutlass::flash_attention::collective::FlashChunkPrefillEpilogue<
+        Sink,
         EpilogueDispatchPolicy,
         MMAOperation,
         TileShapeOutput,
@@ -388,7 +395,8 @@ struct FMHAConfig {
         ElementOutput,
         cutlass::gemm::TagToStrideC_t<LayoutO>,
         ElementOutput,
-        GmemTiledCopyStore>;
+        GmemTiledCopyStore,
+        ElementSink>;
     using CollectiveSoftmaxEpilogue = cutlass::flash_attention::collective::
         FlashChunkPrefillSoftmaxEpilogue<Causal, LocalMask, EpilogueDispatchPolicy, ElementAccumulator>;
 
@@ -481,6 +489,7 @@ std::vector<at::Tensor> mha_fwd(
     std::optional<at::Tensor>& k_descale_,             // (b, h_k)
     std::optional<at::Tensor>& v_descale_,             // (b, h_k)
     const float softmax_scale_,
+    std::optional<const at::Tensor>& softmax_sink_,
     bool is_causal,
     int window_size_left,
     int window_size_right,
@@ -684,6 +693,9 @@ std::vector<at::Tensor> mha_fwd(
 
   // Set the different scale values.
   params.scale_softmax = softmax_scale;
+  bool use_sink = softmax_sink_.has_value();
+  params.sink_softmax = use_sink ? static_cast<void*>(softmax_sink_.value().data_ptr()) : nullptr;
+
   params.softcap = softcap;
 
   // Set this to probability of keeping an element to simplify things.
@@ -790,40 +802,88 @@ std::vector<at::Tensor> mha_fwd(
   if (params.is_causal) {
     switch (params.d) {
       case 64:
-        FMHAConfig<
-            true,
-            cute::Shape<_128, _64, _64>,
-            cute::Shape<_128, _32, _64>,
-            cute::Shape<_128, _64, _64>,
-            cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
+        if (use_sink) {
+          FMHAConfig<
+              true,
+              cute::Shape<_128, _64, _64>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _64, _64>,
+              cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true>::run(params);
+        } else {
+          FMHAConfig<
+              true,
+              cute::Shape<_128, _64, _64>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _64, _64>,
+              cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              false>::run(params);
+        }
         break;
       case 96:
-        FMHAConfig<
-            true,
-            cute::Shape<_128, _64, _32>,
-            cute::Shape<_128, _32, _64>,
-            cute::Shape<_128, _96, _64>,
-            cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
+        if (use_sink) {
+          FMHAConfig<
+              true,
+              cute::Shape<_128, _64, _32>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _96, _64>,
+              cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true>::run(params);
+        } else {
+          FMHAConfig<
+              true,
+              cute::Shape<_128, _64, _32>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _96, _64>,
+              cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              false>::run(params);
+        }
         break;
       case 128:
-        FMHAConfig<
-            true,
-            cute::Shape<_128, _64, _64>,
-            cute::Shape<_128, _32, _64>,
-            cute::Shape<_128, _128, _64>,
-            cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
+        if (use_sink) {
+          FMHAConfig<
+              true,
+              cute::Shape<_128, _64, _64>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _128, _64>,
+              cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true>::run(params);
+        } else {
+          FMHAConfig<
+              true,
+              cute::Shape<_128, _64, _64>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _128, _64>,
+              cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              false>::run(params);
+        }
         break;
       case 192:
-        FMHAConfig<
-            true,
-            cute::Shape<_256, _64, _64>,
-            cute::Shape<_256, _32, _64>,
-            cute::Shape<_256, _192, _64>,
-            cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
+        if (use_sink) {
+          FMHAConfig<
+              true,
+              cute::Shape<_256, _64, _64>,
+              cute::Shape<_256, _32, _64>,
+              cute::Shape<_256, _192, _64>,
+              cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true>::run(params);
+        } else {
+          FMHAConfig<
+              true,
+              cute::Shape<_256, _64, _64>,
+              cute::Shape<_256, _32, _64>,
+              cute::Shape<_256, _192, _64>,
+              cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              false>::run(params);
+        }
         break;
       default:
         TORCH_CHECK(false, "Unsupported head size for causal attention");
@@ -831,40 +891,88 @@ std::vector<at::Tensor> mha_fwd(
   } else {
     switch (params.d) {
       case 64:
-        FMHAConfig<
-            false,
-            cute::Shape<_128, _64, _64>,
-            cute::Shape<_128, _32, _64>,
-            cute::Shape<_128, _64, _64>,
-            cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
+        if (use_sink) {
+          FMHAConfig<
+              false,
+              cute::Shape<_128, _64, _64>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _64, _64>,
+              cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true>::run(params);
+        } else {
+          FMHAConfig<
+              false,
+              cute::Shape<_128, _64, _64>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _64, _64>,
+              cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              false>::run(params);
+        }
         break;
       case 96:
-        FMHAConfig<
-            false,
-            cute::Shape<_128, _64, _32>,
-            cute::Shape<_128, _32, _64>,
-            cute::Shape<_128, _96, _64>,
-            cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
+        if (use_sink) {
+          FMHAConfig<
+              false,
+              cute::Shape<_128, _64, _32>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _96, _64>,
+              cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true>::run(params);
+        } else {
+          FMHAConfig<
+              false,
+              cute::Shape<_128, _64, _32>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _96, _64>,
+              cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              false>::run(params);
+        }
         break;
       case 128:
-        FMHAConfig<
-            false,
-            cute::Shape<_128, _64, _64>,
-            cute::Shape<_128, _32, _64>,
-            cute::Shape<_128, _128, _64>,
-            cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
+        if (use_sink) {
+          FMHAConfig<
+              false,
+              cute::Shape<_128, _64, _64>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _128, _64>,
+              cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true>::run(params);
+        } else {
+          FMHAConfig<
+              false,
+              cute::Shape<_128, _64, _64>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _128, _64>,
+              cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              false>::run(params);
+        }
         break;
       case 192:
-        FMHAConfig<
-            false,
-            cute::Shape<_256, _64, _64>,
-            cute::Shape<_256, _32, _64>,
-            cute::Shape<_256, _192, _64>,
-            cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
+        if (use_sink) {
+          FMHAConfig<
+              false,
+              cute::Shape<_256, _64, _64>,
+              cute::Shape<_256, _32, _64>,
+              cute::Shape<_256, _192, _64>,
+              cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true>::run(params);
+        } else {
+          FMHAConfig<
+              false,
+              cute::Shape<_256, _64, _64>,
+              cute::Shape<_256, _32, _64>,
+              cute::Shape<_256, _192, _64>,
+              cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              false>::run(params);
+        }
         break;
       default:
         TORCH_CHECK(false, "Unsupported head size for causal attention");

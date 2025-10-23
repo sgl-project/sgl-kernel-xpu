@@ -578,7 +578,7 @@ std::vector<at::Tensor> mha_fwd(
 
   // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
   // TODO: check this
- 
+
   if (window_size_left >= seqlen_k - 1) {
     window_size_left = -1;
   }

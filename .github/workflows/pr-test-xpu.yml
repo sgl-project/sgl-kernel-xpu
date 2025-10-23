@@ -11,8 +11,7 @@ concurrency:
 
 jobs:
   build-and-test:
-    if: (github.repository == 'sgl-project/sgl-kernel-xpu' || github.event_name == 'pull_request') &&
-      github.event.pull_request.draft == false
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: sglang-pvc
     steps:
       - name: Checkout code
@@ -66,18 +65,3 @@ jobs:
         if: always()
         run: |
           docker rm -f ci_sglang_xpu || true
-
-  finish:
-    if: always()
-    needs: [build-and-test]
-    runs-on: sglang-pvc
-    steps:
-      - name: Check job status
-        run: |
-          if [ "${{ needs.build-and-test.result }}" != "success" ]; then
-            echo "Job failed with result: ${{ needs.build-and-test.result }}"
-            echo "BUILD_LOG=$(cat build.log)" >> $GITHUB_ENV
-            exit 1
-          fi
-          echo "All jobs completed successfully"
-          exit 0

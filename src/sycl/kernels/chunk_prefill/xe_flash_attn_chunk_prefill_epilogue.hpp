@@ -230,8 +230,9 @@ class FlashChunkPrefillEpilogue<
         int index = y * Vec + x;
         auto cur_sum = reduce_over_group(sg, sum(index), sycl::plus<>());
         if constexpr (Sink) {
+          constexpr double kLog2e = 1.4426950408889634074;  // log_2(e) = M_LOG2E
           auto max_scale_bcast = group_broadcast(sg, max, index);
-          cur_sum += sycl::native::exp2(static_cast<ElementAccumulator>(sink) - max_scale_bcast);
+          cur_sum += sycl::native::exp2(static_cast<ElementAccumulator>(sink * kLog2e) - max_scale_bcast);
         }
 
         auto cur_scale = (cur_sum == 0.f || cur_sum != cur_sum) ? 1.0f : sycl::native::recip(cur_sum);

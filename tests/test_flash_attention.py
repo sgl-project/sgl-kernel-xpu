@@ -487,7 +487,7 @@ def generate_qkv(
 #     "causal,local",
 #     [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []),
 # )
-@pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
+@pytest.mark.parametrize("causal,local", [(False, True), (False, False), (True, False)])
 # @pytest.mark.parametrize("causal,local", [(True, False)])
 @pytest.mark.parametrize("use_softmax_sink", [True, False])
 # @pytest.mark.parametrize(

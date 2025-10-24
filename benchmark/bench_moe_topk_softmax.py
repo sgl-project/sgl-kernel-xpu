@@ -3,6 +3,7 @@ import itertools
 import torch
 import triton
 from sgl_kernel import topk_softmax
+from utils import HAS_VLLM, parse_args
 
 
 def vllm_topk_softmax(gating_output, topk):
@@ -23,6 +24,22 @@ def vllm_topk_softmax(gating_output, topk):
     return topk_weights, topk_indices
 
 
+def navtive_topk_softmax(gating_output, topk):
+    num_tokens, num_experts = gating_output.shape
+
+    import torch.nn.functional as F
+
+    topk_weights = torch.empty(
+        (num_tokens, topk), device=gating_output.device, dtype=torch.float32
+    )
+    topk_indices = torch.empty(
+        (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+    )
+    topk_weights = F.softmax(gating_output.float(), dim=-1)
+    topk_weights, topk_indices = torch.topk(topk_weights, topk, dim=-1)
+    return topk_weights, topk_indices
+
+
 def sglang_topk_softmax(gating_output, topk):
     num_tokens, num_experts = gating_output.shape
 
@@ -37,10 +54,10 @@ def sglang_topk_softmax(gating_output, topk):
     )
 
     topk_softmax(
-        topk_weights=topk_weights,
-        topk_ids=topk_indices,
-        token_expert_indices=token_expert_indices,
-        gating_output=gating_output,
+        topk_weights,
+        topk_indices,
+        gating_output,
+        renormalize=False,
     )
 
     return topk_weights, topk_indices
@@ -48,7 +65,7 @@ def sglang_topk_softmax(gating_output, topk):
 
 def calculate_diff(num_tokens, num_experts, topk):
     gating_output = torch.randn(
-        (num_tokens, num_experts), device="cuda", dtype=torch.float32
+        (num_tokens, num_experts), device=gating_output.device, dtype=torch.float32
     )
     weights_vllm, indices_vllm = vllm_topk_softmax(gating_output.clone(), topk)
     weights_sglang, indices_sglang = sglang_topk_softmax(gating_output.clone(), topk)
@@ -67,52 +84,65 @@ def calculate_diff(num_tokens, num_experts, topk):
         )
 
 
-num_tokens_range = [128, 512, 1024, 2048, 4096, 8192, 16384, 32768]
-num_experts_range = [32, 64, 128, 256, 12, 512]
-topk_range = [1, 2, 4, 8]
-
-configs = list(itertools.product(num_tokens_range, num_experts_range, topk_range))
-
-
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["num_tokens", "num_experts", "topk"],
-        x_vals=configs,
-        line_arg="provider",
-        line_vals=["sglang", "vllm"],
-        line_names=["SGLang", "VLLM"],
-        styles=[("blue", "-"), ("green", "-")],
-        ylabel="Latency (us)",
-        plot_name="topk-softmax-performance",
-        args={},
+def get_benchmark(device="xpu"):
+    @triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=["num_tokens", "num_experts", "topk", "dtype"],
+            x_vals=configs,
+            line_arg="provider",
+            line_vals=["sglang", "native"],
+            line_names=["SGLang", "native"],
+            styles=[("blue", "-"), ("green", "-")],
+            ylabel="Latency (us)",
+            plot_name="topk-softmax-performance",
+            args={},
+        )
     )
-)
-def benchmark(num_tokens, num_experts, topk, provider):
+    def benchmark(num_tokens, num_experts, topk, dtype, provider):
 
-    gating_output = torch.randn(
-        (num_tokens, num_experts), device="cuda", dtype=torch.float32
-    )
+        gating_output = torch.randn(
+            (num_tokens, num_experts), device=device, dtype=dtype
+        )
 
-    if provider == "vllm" or provider == "vllm1":
-        fn = lambda: vllm_topk_softmax(gating_output, topk)
-    elif provider == "sglang" or provider == "sglang1":
-        fn = lambda: sglang_topk_softmax(gating_output, topk)
+        if HAS_VLLM and (provider == "vllm" or provider == "vllm1"):
+            fn = lambda: vllm_topk_softmax(gating_output, topk)
+        elif provider == "sglang" or provider == "sglang1":
+            fn = lambda: sglang_topk_softmax(gating_output, topk)
+        elif provider == "native":
+            fn = lambda: navtive_topk_softmax(gating_output, topk)
 
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
+        quantiles = [0.5, 0.2, 0.8]
+        ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
 
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+        return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+
+    return benchmark
 
 
 if __name__ == "__main__":
-    configs = [
-        (20, 256, 4),
-        (20, 256, 8),
-        (20, 12, 4),
-        (20, 12, 1),
-        (20, 512, 4),
-        (20, 512, 1),
-    ]
-    for num_tokens, num_experts, topk in configs:
-        calculate_diff(num_tokens, num_experts, topk)
-    benchmark.run(print_data=True)
+    # Run correctness test on small configs if not using a real model
+    args = parse_args()
+    sweep_params = {
+        "num_tokens": [1, 32, 128, 512],
+        "num_experts": args.num_experts or [64],
+        "top_k": args.top_k or [2, 4],
+        "dtype": [torch.float16, torch.bfloat16],
+    }
+    keys = sweep_params.keys()
+    configs = list(itertools.product(*sweep_params.values()))
+    print(f"Testing {len(configs)} configurations...")
+    for config in configs:
+        num_tokens, num_experts, topk, dtype = config
+        print(
+            f"Config: num_tokens={num_tokens}, num_experts={num_experts}, topk={topk}, dtype={dtype}"
+        )
+
+        # calculate_diff(num_tokens, num_experts, topk)
+
+    global benchmark_configs
+    benchmark_configs = configs
+
+    # Run benchmark
+    print("Starting performance benchmark...")
+    benchmark = get_benchmark()
+    benchmark.run(print_data=True, show_plots=False, save_path=".")

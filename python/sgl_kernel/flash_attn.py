@@ -49,6 +49,7 @@ def flash_attn_with_kvcache(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     softmax_scale=None,
+    softmax_sink=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0,  # 0.0 means deactivated
@@ -178,7 +179,6 @@ def flash_attn_with_kvcache(
         max_seqlen_q = q.size(1)
         q = q.view(-1, q.size(-2), q.size(-1)).contiguous()
     if cache_seqlens is not None:
-        max_seqlen_k = cache_seqlens.max().item()
         assert cache_seqlens.size(0) + 1 == cu_seqlens_q.size(0)
         cu_seqlens_k = torch.concat(
             (
@@ -195,7 +195,6 @@ def flash_attn_with_kvcache(
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_q,
-        max_seqlen_k,
         page_table,
         cache_batch_idx,
         cache_leftpad,
@@ -206,6 +205,7 @@ def flash_attn_with_kvcache(
         k_descale,
         v_descale,
         softmax_scale,
+        softmax_sink,
         causal,
         window_size[0],
         window_size[1],

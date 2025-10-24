@@ -583,9 +583,6 @@ std::vector<at::Tensor> mha_fwd(
     window_size_left = -1;
   }
   window_size_right = min(window_size_right, seqlen_q);
-  // if (window_size_right >= seqlen_q - 1) {
-  //   window_size_right = -1;
-  // }
   // causal=true is the same as causal=false in this case
   if (is_causal) {
     window_size_right = 0;

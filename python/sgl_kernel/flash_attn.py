@@ -179,7 +179,6 @@ def flash_attn_with_kvcache(
         max_seqlen_q = q.size(1)
         q = q.view(-1, q.size(-2), q.size(-1)).contiguous()
     if cache_seqlens is not None:
-        max_seqlen_k = cache_seqlens.max().item()
         assert cache_seqlens.size(0) + 1 == cu_seqlens_q.size(0)
         cu_seqlens_k = torch.concat(
             (
@@ -196,7 +195,6 @@ def flash_attn_with_kvcache(
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_q,
-        max_seqlen_k,
         page_table,
         cache_batch_idx,
         cache_leftpad,

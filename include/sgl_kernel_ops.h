@@ -215,8 +215,10 @@ void moe_align_block_size(
     torch::Tensor sorted_token_ids,
     torch::Tensor experts_ids,
     torch::Tensor num_tokens_post_pad,
-    torch::Tensor token_cnts_buffer,
-    torch::Tensor cumsum_buffer);
+    torch::Tensor cumsum_buffer,
+    bool pad_sorted_token_ids);
+
+void moe_sum(torch::Tensor& input, torch::Tensor& output);
 
 void topk_softmax(
     torch::Tensor& topk_weights,
@@ -252,6 +254,13 @@ void fp8_blockwise_scaled_grouped_mm(
     const torch::Tensor& problem_sizes,
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace);
+
+void moe_grouped_mm_nt(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& weights,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts);
 
 void prepare_moe_input(
     const torch::Tensor& topk_ids,

@@ -470,13 +470,6 @@ class FMHAPrefillChunk {
             }
           }
         }
-        if (thread(11, 0)) {
-          print("kernel mainloop_params.window_right \n");
-          print("%d \n", (int)mainloop_params.window_right);
-          print("kernel mainloop_params.window_left \n");
-          print("%d \n", (int)mainloop_params.window_left);
-          print_tensor(tSr);
-        }
         if constexpr (PagedKV) {
           int col_start = local_id + kv_start_coord;
           int col_end = col_start + (FragsN - 1) * get<1>(MmaAtomShape());

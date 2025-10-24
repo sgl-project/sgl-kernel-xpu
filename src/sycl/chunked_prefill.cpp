@@ -328,8 +328,8 @@ struct KernelRunner {
          params.page_table,
          params.page_size,
          params.max_num_pages_per_seq,
-         -1,
-         -1},
+         params.window_size_left,
+         params.window_size_right},
         {(ElementQ)params.scale_softmax},
         {static_cast<const ElementOutput*>(params.o_ptr),
          stride_O,
@@ -364,8 +364,8 @@ template <
     typename SubgroupLayout,
     int PipelineStages,
     bool Causal = false,
-    bool Sink = false,
     bool LocalMask = false,
+    bool Sink = false,
     typename ElementInputQ = bfloat16_t,
     typename ElementInputKV = bfloat16_t,
     typename MMAOperation = XE_8x16x16_F32BF16BF16F32_TT,
@@ -578,12 +578,11 @@ std::vector<at::Tensor> mha_fwd(
 
   // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
   // TODO: check this
+
   if (window_size_left >= seqlen_k - 1) {
     window_size_left = -1;
   }
-  if (window_size_right >= seqlen_q - 1) {
-    window_size_right = -1;
-  }
+  window_size_right = min(window_size_right, seqlen_q);
   // causal=true is the same as causal=false in this case
   if (is_causal) {
     window_size_right = 0;
@@ -716,7 +715,6 @@ std::vector<at::Tensor> mha_fwd(
   }
   params.window_size_left = window_size_left;
   params.window_size_right = window_size_right;
-
   params.total_q = total_q;
   params.total_k = total_k;
   params.b_k = batch_size_k;
@@ -802,68 +800,117 @@ std::vector<at::Tensor> mha_fwd(
   constexpr int PipelineStages = 2;
   switch (params.d) {
     case 64:
-      AT_DISPATCH_BOOL_NO_RETURN(
-          params.is_causal,
-          CausalMask,
+      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+        if (params.is_causal) {
+          FMHAConfig<
+              cute::Shape<_128, _64, _64>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _64, _64>,
+              cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true,
+              false,
+              Sink>::run(params);
+        } else {
           AT_DISPATCH_BOOL_NO_RETURN(
-              use_sink,
-              Sink,
+              params.is_local,
+              LocalMask,
               FMHAConfig<
                   cute::Shape<_128, _64, _64>,
                   cute::Shape<_128, _32, _64>,
                   cute::Shape<_128, _64, _64>,
                   cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
                   PipelineStages,
-                  CausalMask,
-                  Sink>::run(params)))
+                  false,
+                  LocalMask,
+                  Sink>::run(params))
+        }
+      })
       break;
     case 96:
-      AT_DISPATCH_BOOL_NO_RETURN(
-          params.is_causal,
-          CausalMask,
+      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+        if (params.is_causal) {
+          FMHAConfig<
+              cute::Shape<_128, _64, _32>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _96, _64>,
+              cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true,
+              false,
+              Sink>::run(params);
+
+        } else {
           AT_DISPATCH_BOOL_NO_RETURN(
-              use_sink,
-              Sink,
+              params.is_local,
+              LocalMask,
               FMHAConfig<
                   cute::Shape<_128, _64, _32>,
                   cute::Shape<_128, _32, _64>,
                   cute::Shape<_128, _96, _64>,
                   cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
                   PipelineStages,
-                  CausalMask,
-                  Sink>::run(params)))
+                  false,
+                  LocalMask,
+                  Sink>::run(params))
+        }
+      })
       break;
     case 128:
-      AT_DISPATCH_BOOL_NO_RETURN(
-          params.is_causal,
-          CausalMask,
+      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+        if (params.is_causal) {
+          FMHAConfig<
+              cute::Shape<_128, _64, _64>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _128, _64>,
+              cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true,
+              false,
+              Sink>::run(params);
+        } else {
           AT_DISPATCH_BOOL_NO_RETURN(
-              use_sink,
-              Sink,
+              params.is_local,
+              LocalMask,
               FMHAConfig<
                   cute::Shape<_128, _64, _64>,
                   cute::Shape<_128, _32, _64>,
                   cute::Shape<_128, _128, _64>,
                   cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
                   PipelineStages,
-                  CausalMask,
-                  Sink>::run(params)))
+                  false,
+                  LocalMask,
+                  Sink>::run(params))
+        }
+      })
       break;
     case 192:
-      AT_DISPATCH_BOOL_NO_RETURN(
-          params.is_causal,
-          CausalMask,
+      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+        if (params.is_causal) {
+          FMHAConfig<
+              cute::Shape<_256, _64, _64>,
+              cute::Shape<_256, _32, _64>,
+              cute::Shape<_256, _192, _64>,
+              cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true,
+              false,
+              Sink>::run(params);
+        } else {
           AT_DISPATCH_BOOL_NO_RETURN(
-              use_sink,
-              Sink,
+              params.is_local,
+              LocalMask,
               FMHAConfig<
                   cute::Shape<_256, _64, _64>,
                   cute::Shape<_256, _32, _64>,
                   cute::Shape<_256, _192, _64>,
                   cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
                   PipelineStages,
-                  CausalMask,
-                  Sink>::run(params)))
+                  false,
+                  LocalMask,
+                  Sink>::run(params))
+        }
+      })
       break;
     default:
       TORCH_CHECK(false, "Unsupported head size for causal attention");

@@ -470,29 +470,7 @@ class FMHAPrefillChunk {
             }
           }
         }
-
         if constexpr (PagedKV) {
-          // // if constexpr(!(CausalMask || LocalMask) && PagedKV) {
-          // // Processing Not divisible, mask padding
-          //   const int item_id = thread_idx % SubgroupSize;
-          //   int col_idx = item_id + split * cute::min(QK_BLK_N,
-          //   seq_len_kv_cache + seq_len_kv);
-          //     CUTLASS_PRAGMA_UNROLL
-          //     for (int n = 0; n < FragsN; n++, col_idx +=
-          //     get<1>(MmaAtomShape())) { // 4
-          //       CUTLASS_PRAGMA_UNROLL
-          //       for (int m = 0; m < FragsM; m++) { // 2
-          //         int row_idx = m * Vec + seq_coord;
-          //         CUTLASS_PRAGMA_UNROLL
-          //         for (int row = 0; row < Vec; row++) { // 8
-          //           if (col_idx >= seq_len_kv_cache + seq_len_kv || row_idx +
-          //           row >= seq_len_qo) {
-          //             tSr(row, m, n) = ElementAccumulator{-INFINITY};
-          //         }
-          //       }
-          //     }
-          //   }
-
           int col_start = local_id + kv_start_coord;
           int col_end = col_start + (FragsN - 1) * get<1>(MmaAtomShape());
           if (col_end >= seq_len_kv_cache) {

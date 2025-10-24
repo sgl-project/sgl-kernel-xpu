@@ -69,6 +69,7 @@ RUN --mount=type=secret,id=github_token \
     cd sgl-kernel-xpu && \
     pip install -v . &&\
     # Install required packages for sglang workloads
+    pip uninstall pytorch-triton-xpu -y && pip install --pre pytorch-triton-xpu --index-url https://download.pytorch.org/whl/xpu && \
     pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops --root-user-action=ignore && \
     conda install libsqlite=3.48.0 -y && \
     echo ". /miniforge3/bin/activate; conda activate py${PYTHON_VERSION}; cd /root/" >> /root/.bashrc;

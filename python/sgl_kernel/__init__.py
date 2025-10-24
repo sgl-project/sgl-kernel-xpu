@@ -10,6 +10,7 @@ cuda_path = f"/usr/local/cuda/targets/{SYSTEM_ARCH}-linux/lib/libcudart.so.12"
 if os.path.exists(cuda_path):
     ctypes.CDLL(cuda_path, mode=ctypes.RTLD_GLOBAL)
 
+# Load common_ops for XPU kernels
 from sgl_kernel import common_ops
 from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
@@ -54,9 +55,12 @@ from sgl_kernel.moe import (
     ep_moe_pre_reorder,
     ep_moe_silu_and_mul,
     fp8_blockwise_scaled_grouped_mm,
+    fused_moe_forward,
+    grouped_gemm_moe,
     moe_align_block_size,
     moe_fused_gate,
     prepare_moe_input,
+    silu_and_mul_moe,
     topk_softmax,
 )
 from sgl_kernel.sampling import (

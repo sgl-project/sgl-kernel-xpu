@@ -359,6 +359,7 @@ template <
     typename TileShapeOutput,
     typename SubgroupLayout,
     int PipelineStages,
+    bool RopeEmbedding = false,
     bool LocalMask = false,
     typename ElementInputQ = bfloat16_t,
     typename ElementInputKV = bfloat16_t,
@@ -416,7 +417,8 @@ struct FMHAConfig {
         GmemTiledCopyV,  // V,
         Causal,
         LocalMask,
-        PagedKV>;
+        PagedKV,
+        RopeEmbedding>;
 
     using FMHAChunkPrefillKernel = cutlass::flash_attention::kernel::FMHAPrefillChunk<
         ProblemShapeType,
@@ -796,7 +798,7 @@ std::vector<at::Tensor> mha_fwd(
             cute::Shape<_128, _32, _64>,
             cute::Shape<_128, _64, _64>,
             cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
+            PipelineStages, true>::run(params);
         break;
       case 96:
         FMHAConfig<

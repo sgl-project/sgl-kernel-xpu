@@ -127,10 +127,9 @@ def benchmark(
     max_seqlen_q = q_seq_length
     window_size = (-1, -1) if not local else torch.randint(0, kv_seq_length, (2,))
 
-    if use_softmax_sink:
-        softmax_sink = torch.randn(num_heads, device=device, dtype=dtype)
-    else:
-        softmax_sink = None
+    softmax_sink = (
+        torch.randn(num_heads, device=device, dtype=dtype) if use_softmax_sink else None
+    )
 
     softmax_scale = 1.0 / (head_dim**0.5)
 

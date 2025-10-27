@@ -38,20 +38,7 @@ RUN --mount=type=secret,id=github_token \
     conda activate py${PYTHON_VERSION} && \
     # . /opt/intel/oneapi/setvars.sh --force && \
     # Install Torch
-    pip install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/xpu
-
-# Install vllm from source
-RUN --mount=type=secret,id=github_token \
-    cd /root && \
-    . /miniforge3/bin/activate && \
-    conda activate py${PYTHON_VERSION} && \
-    echo "Building vllm/sglang from source ..." && \
-    git clone https://github.com/zhuyuhua-v/vllm.git && \
-    cd vllm && \
-    git checkout yuhua/deepseek && \
-    pip install setuptools_scm --root-user-action=ignore && \
-    pip install setuptools==75.6.0 packaging==24.2 --root-user-action=ignore && \
-    VLLM_TARGET_DEVICE=xpu python setup.py install
+    pip install torch==2.8.0 torchvision torchaudio pytorch-triton-xpu==3.4.0 --index-url https://download.pytorch.org/whl/xpu
 
 # Install SGlang from source
 RUN --mount=type=secret,id=github_token \
@@ -62,14 +49,13 @@ RUN --mount=type=secret,id=github_token \
     echo "cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} && \
     cd sglang && \
-    pip install -e "python[all_xpu]" --root-user-action=ignore && \
     # Clone sgl-kernel and build sglang-kernel...
     echo "cloning ${SG_LANG_KERNEL_REPO} from ${SG_LANG_KERNEL_BRANCH}" && \
     git clone --branch ${SG_LANG_KERNEL_BRANCH} --single-branch ${SG_LANG_KERNEL_REPO} && \
     cd sgl-kernel-xpu && \
     pip install -v . &&\
     # Install required packages for sglang workloads
-    pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops --root-user-action=ignore && \
+    pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops matplotlib pandas --root-user-action=ignore && \
     conda install libsqlite=3.48.0 -y && \
     echo ". /miniforge3/bin/activate; conda activate py${PYTHON_VERSION}; cd /root/" >> /root/.bashrc;
 

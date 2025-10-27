@@ -45,3 +45,4 @@
 *.pyo
 
 build
+.vscode/

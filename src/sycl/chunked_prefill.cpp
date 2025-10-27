@@ -66,6 +66,7 @@ struct Flash_fwd_params {
   float scale_softmax;
   void* sink_softmax;
   float softcap;
+
   float* __restrict__ q_scale_ptr;
   float* __restrict__ k_scale_ptr;
   float* __restrict__ v_scale_ptr;
@@ -118,7 +119,6 @@ struct Flash_fwd_params {
 
   // Paged KV cache
   int* __restrict__ page_table;
-  int* __restrict__ num_pages_per_seq_ptr;
   int max_num_pages_per_seq;
   index_t page_table_batch_stride;
   int page_size;
@@ -318,19 +318,20 @@ struct KernelRunner {
     typename FMHAChunkPrefillKernel::Arguments arguments{
         cutlass::gemm::GemmUniversalMode::kGemm,
         problem_size,
-        {static_cast<const ElementQ*>(params.q_ptr),
+        {// static_cast<const ElementQ*>(params.q_ptr),
+         static_cast<const ElementQ*>(params.q_ptr),
          stride_Q,
-         static_cast<const ElementK*>(params.knew_ptr),
-         stride_K,
-         static_cast<const ElementV*>(params.vnew_ptr),
-         stride_V,
-         params.q_scale_ptr,
-         params.k_scale_ptr,
-         params.v_scale_ptr,
-         static_cast<const ElementK*>(params.k_ptr),
+         //  static_cast<const ElementK*>(params.knew_ptr),
+         //  stride_K,
+         //  static_cast<const ElementV*>(params.vnew_ptr),
+         //  stride_V,
+         static_cast<const ElementV*>(params.k_ptr),
          stride_K_cache,
          static_cast<const ElementV*>(params.v_ptr),
          stride_V_cache,
+	 params.q_scale_ptr,
+         params.k_scale_ptr,
+         params.v_scale_ptr,
          params.page_table,
          params.page_size,
          params.max_num_pages_per_seq,
@@ -638,15 +639,15 @@ std::vector<at::Tensor> mha_fwd(
     params.v_scale_ptr = static_cast<float*>(v_descale_.value().data_ptr());
   }
 
-  if (!is_varlen_q) {
+  /*if (!is_varlen_q) {
     params.q_batch_stride = q.stride(0);
     params.o_batch_stride = out.stride(0);
   }
   if (!is_varlen_k) {
     params.k_batch_stride = k.stride(0);
     params.v_batch_stride = v.stride(0);
-  }
-  
+  }*/
+
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
 

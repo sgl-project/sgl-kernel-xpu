@@ -338,7 +338,7 @@ class FMHAPrefillChunk {
       // Q, K, V tensors have seperate scaling factors
       const float q_scale_val = params.mainloop.ptr_q_scale == nullptr
                                     ? 1.f
-                                    : params.mainloop.ptr_q_scale[batch_coord * num_heads_q + q_head_coord];
+                                    : params.mainloop.ptr_q_scale[batch_coord * num_heads_kv + q_head_coord];
       const float k_scale_val = params.mainloop.ptr_k_scale == nullptr
                                     ? 1.f
                                     : params.mainloop.ptr_k_scale[batch_coord * num_heads_kv + kv_head_coord];

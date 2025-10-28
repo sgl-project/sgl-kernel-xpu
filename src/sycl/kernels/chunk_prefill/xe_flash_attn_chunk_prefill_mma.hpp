@@ -298,9 +298,8 @@ struct FlashChunkPrefillMma<
     Tensor tCgK = thread_mma_k.partition_B(gK);
 
     // Create fragments
-    // TODO(Codeplay): fix this, this is probably not general
-    using TCrQ_Type = cute::conditional_t<is_fp8_v<ElementQ>, uint8_t, ElementQ>;
-    using TCrK_Type = cute::conditional_t<is_fp8_v<ElementK>, uint8_t, ElementK>;
+    using TCrQ_Type = cute::conditional_t<is_fp8_v<ElementQ>, uint8_t, bfloat16_t>;
+    using TCrK_Type = cute::conditional_t<is_fp8_v<ElementK>, uint8_t, bfloat16_t>;
     Tensor tCrQ = make_tensor<TCrQ_Type>(make_fragment_layout(params.gmem_tiled_copy_q, take<0,3>(tCgQ.shape())));
     Tensor tCrK = make_tensor<TCrK_Type>(make_fragment_layout(gmem_tiled_copy_k, take<0,3>(tCgK.shape())));
 
@@ -321,24 +320,24 @@ struct FlashChunkPrefillMma<
       copy(gmem_tiled_copy_k, tKgK(_, _, _, k_tile), tKrK);
       // FP8 path: Convert FP8 fragments to BF16
       if constexpr (is_fp8_v<ElementQ> || is_fp8_v<ElementK>) {
-	auto tCrQ_fp16 = make_fragment_like<bfloat16_t>(tCrQ);
-	auto tCrK_fp16 = make_fragment_like<bfloat16_t>(tCrK);
+	auto tCrQ_bf16 = make_fragment_like<bfloat16_t>(tCrQ);
+	auto tCrK_bf16 = make_fragment_like<bfloat16_t>(tCrK);
 
         if constexpr (is_fp8_v<ElementQ>) {
-          convert_and_descale<ElementQ>(tCrQ, tCrQ_fp16, q_scale);
+          convert_and_descale<ElementQ>(tCrQ, tCrQ_bf16, q_scale);
         } else {
           // If Q is already FP16, copy it.
-          copy(tCrQ, tCrQ_fp16);
+          copy(tCrQ, tCrQ_bf16);
         }
 
         if constexpr (is_fp8_v<ElementK>) {
-          convert_and_descale<ElementK>(tCrK, tCrK_fp16, k_scale);
+          convert_and_descale<ElementK>(tCrK, tCrK_bf16, k_scale);
         } else {
-          copy(tCrK, tCrK_fp16);
+          copy(tCrK, tCrK_bf16);
         }
 
         // GEMM is computed on the BF16 tensors
-        cute::gemm(tiled_mma, accum, tCrQ_fp16, tCrK_fp16, frag_src);
+        cute::gemm(tiled_mma, accum, tCrQ_bf16, tCrK_bf16, frag_src);
       } else {
         // BF16 path
         cute::gemm(tiled_mma, accum, tCrQ, tCrK, frag_src);
@@ -399,7 +398,7 @@ struct FlashChunkPrefillMma<
     auto first_thread_in_sg_idx = sg.get_group_id()[0] * DispatchPolicy::SubgroupSize;
     auto thread_mma = tiled_mma.get_slice(first_thread_in_sg_idx);
     Tensor tCgV = thread_mma.partition_B(gV_);
-    using TCrV_Type = cute::conditional_t<is_fp8_v<ElementV>, uint8_t, ElementV>;
+    using TCrV_Type = cute::conditional_t<is_fp8_v<ElementV>, uint8_t, bfloat16_t>;
     Tensor tCrV = make_tensor<TCrV_Type>(make_fragment_layout(gmem_tiled_copy_v, take<0,3>(tCgV.shape())));
 
     // Partition the copying of A and B tiles across the threads
@@ -428,7 +427,7 @@ struct FlashChunkPrefillMma<
 #endif
 
     // 7) Convert S to P (FP32 -> BF16)
-    Tensor tPr = convert_type<typename TiledMmaPV::ValTypeA>(tSr);
+    Tensor tPr = convert_type<bfloat16_t>(tSr);
     //
     // Mainloop
     //
@@ -516,5 +515,3 @@ struct FlashChunkPrefillMma<
 };
 
 }  // namespace cutlass::flash_attention::collective
-
-/////////////////////////////////////////////////////////////////////////////////////////////////

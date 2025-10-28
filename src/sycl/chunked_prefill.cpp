@@ -1,3 +1,33 @@
+/***************************************************************************************************
+ * Copyright (C) 2025 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ **************************************************************************************************/
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 #include <c10/xpu/XPUStream.h>
@@ -325,7 +355,7 @@ struct KernelRunner {
          //  stride_K,
          //  static_cast<const ElementV*>(params.vnew_ptr),
          //  stride_V,
-         static_cast<const ElementV*>(params.k_ptr),
+         static_cast<const ElementK*>(params.k_ptr),
          stride_K_cache,
          static_cast<const ElementV*>(params.v_ptr),
          stride_V_cache,
@@ -337,7 +367,7 @@ struct KernelRunner {
          params.max_num_pages_per_seq,
          params.window_size_left,
          params.window_size_right},
-        {(ElementAccumulator)params.scale_softmax},
+        {(ElementQ)params.scale_softmax},
         {static_cast<const ElementOutput*>(params.o_ptr),
          stride_O,
          static_cast<const ElementSink*>(params.sink_softmax)},
@@ -597,7 +627,13 @@ std::vector<at::Tensor> mha_fwd(
 
   auto opts = q.options();
   at::Tensor out;
+  // out = torch::empty({total_q, num_heads, head_size_v}, opts);
+  if (q.dtype() == at::ScalarType::Float8_e4m3fn || q.dtype() == at::ScalarType::Float8_e5m2) {
+  // Internal math & epilogue producing BF16
+  out = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(torch::kBFloat16));
+} else {
   out = torch::empty({total_q, num_heads, head_size_v}, opts);
+}
 
   auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
   int const head_size_rounded = round_up_headdim(head_size);
@@ -638,15 +674,6 @@ std::vector<at::Tensor> mha_fwd(
     params.k_scale_ptr = static_cast<float*>(k_descale_.value().data_ptr());
     params.v_scale_ptr = static_cast<float*>(v_descale_.value().data_ptr());
   }
-
-  /*if (!is_varlen_q) {
-    params.q_batch_stride = q.stride(0);
-    params.o_batch_stride = out.stride(0);
-  }
-  if (!is_varlen_k) {
-    params.k_batch_stride = k.stride(0);
-    params.v_batch_stride = v.stride(0);
-  }*/
 
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
@@ -780,9 +807,9 @@ std::vector<at::Tensor> mha_fwd(
                 XE_8x16x16_F32BF16BF16F32_TT,
                 XE_2D_U8x8x32_LD_N,
                 XE_2D_U8x16x16_LD_T,
-                XE_2D_U8x16x32_LD_T,
+                XE_2D_U8x32x32_LD_V,
                 float,
-                float>::run(params);
+                float, bfloat16_t, bfloat16_t, XE_2D_U16x8x16_ST_N>::run(params);
           } else {
             AT_DISPATCH_BOOL_NO_RETURN(
                 params.is_local,
@@ -801,9 +828,9 @@ std::vector<at::Tensor> mha_fwd(
                     XE_8x16x16_F32BF16BF16F32_TT,
                     XE_2D_U8x8x32_LD_N,
                     XE_2D_U8x16x16_LD_T,
-                    XE_2D_U8x16x32_LD_T,
+                    XE_2D_U8x32x32_LD_V,
                     float,
-                    float>::run(params))
+                    float, bfloat16_t, bfloat16_t, XE_2D_U16x8x16_ST_N>::run(params))
           }
         })
         break;
@@ -824,9 +851,9 @@ std::vector<at::Tensor> mha_fwd(
                 XE_8x16x16_F32BF16BF16F32_TT,
                 XE_2D_U8x8x32_LD_N,
                 XE_2D_U8x16x16_LD_T,
-                XE_2D_U8x16x32_LD_T,
+                XE_2D_U8x32x32_LD_V,
                 float,
-                float>::run(params);
+                float, bfloat16_t, bfloat16_t, XE_2D_U16x8x16_ST_N>::run(params);
           } else {
             AT_DISPATCH_BOOL_NO_RETURN(
                 params.is_local,
@@ -845,9 +872,9 @@ std::vector<at::Tensor> mha_fwd(
                     XE_8x16x16_F32BF16BF16F32_TT,
                     XE_2D_U8x8x32_LD_N,
                     XE_2D_U8x16x16_LD_T,
-                    XE_2D_U8x16x32_LD_T,
+                    XE_2D_U8x32x32_LD_V,
                     float,
-                    float>::run(params))
+                    float, bfloat16_t, bfloat16_t, XE_2D_U16x8x16_ST_N>::run(params))
           }
         })
         break;

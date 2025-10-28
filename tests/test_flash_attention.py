@@ -1,3 +1,4 @@
+# Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/hopper/test_flash_attn.py
 import itertools
 import math
 import os
@@ -594,13 +595,13 @@ def test_flash_attn_kvcache(
         has_qv = d == 64 and dv >= 256
         softmax_scale = 1.0 / math.sqrt(d if has_qv is None else d + dv)
         q = (
-            torch.ones(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
+            torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
             .to(dtype)
             .to(dtype_ref)
         )
         if has_qv:
             qv = (
-                torch.ones(
+                torch.randn(
                     batch_size, seqlen_q, nheads, dv, device=device, dtype=dtype_ref
                 )
                 .to(dtype)
@@ -638,14 +639,14 @@ def test_flash_attn_kvcache(
         key_new_padding_mask = None
         if new_kv:
             k = (
-                torch.ones(
+                torch.randn(
                     batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype_ref
                 )
                 .to(dtype)
                 .to(dtype_ref)
             )
             v = (
-                torch.ones(
+                torch.randn(
                     batch_size, seqlen_new, nheads_k, dv, device=device, dtype=dtype_ref
                 )
                 .to(dtype)
@@ -665,7 +666,7 @@ def test_flash_attn_kvcache(
             k, v, k_unpad, v_unpad = None, None, None, None
         if page_size is None:
             k_cache = (
-                torch.ones(
+                torch.randn(
                     batch_size_cache,
                     seqlen_k,
                     nheads_k,
@@ -677,7 +678,7 @@ def test_flash_attn_kvcache(
                 .to(dtype_ref)
             )
             v_cache = (
-                torch.ones(
+                torch.randn(
                     batch_size_cache,
                     seqlen_k,
                     nheads_k,
@@ -707,7 +708,6 @@ def test_flash_attn_kvcache(
                 device,
                 dtype,
                 dtype_ref,
-                use_ones=True,
             )
         cache_seqlens = torch.randint(
             seqlen_q,
@@ -828,7 +828,7 @@ def test_flash_attn_kvcache(
         )
         if dtype == torch.float8_e4m3fn:
             q_descale, k_descale, v_descale = [
-                torch.ones(batch_size, nheads_k, device=device, dtype=torch.float32)
+                torch.randn(batch_size, nheads_k, device=device, dtype=torch.float32)
                 for _ in range(3)
             ]
         else:
@@ -944,13 +944,6 @@ def test_flash_attn_kvcache(
                 out = out.flatten()
                 out_ref = out_ref.flatten()
                 out_pt = out_pt.flatten()
-                print(f"out =  {out}")
-                print("-----------------------------")
-                print(f"out_pt =  {out_pt}")
-                print(f"Output max diff: {(out - out_ref).abs().max().item()}")
-                print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
-                print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
-                print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
                 # breakpoint()
 
                 # Check that FlashAttention's numerical error is at most twice the numerical error
@@ -1024,10 +1017,10 @@ def test_flash_attn_kvcache(
 
 
 def _generate_block_kvcache(
-    seqlen_k, page_size, batch_size, nheads_k, d, dv, device, dtype, dtype_ref, use_ones=False
+    seqlen_k, page_size, batch_size, nheads_k, d, dv, device, dtype, dtype_ref
 ):
     num_blocks = math.ceil(seqlen_k / page_size) * batch_size
-    create_fn = torch.ones if use_ones else torch.randn
+    create_fn = torch.randn
     k_cache_paged = (
         create_fn(num_blocks, page_size, nheads_k, d, device=device, dtype=dtype_ref)
         .to(dtype)
@@ -1274,9 +1267,6 @@ def test_flash_attn_varlen_output(
             intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
         )
 
-        print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
-        print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
-
         if query_unused_mask is not None:
             q_zero_masking = rearrange(query_unused_mask, "b s -> b s 1 1")
 
@@ -1308,8 +1298,6 @@ def test_flash_attn_varlen_output(
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:
                 out.masked_fill_(q_zero_masking, 0.0)
-            print(f"Output max diff: {(out - out_ref).abs().max().item()}")
-            print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
 
             # Check that FlashAttention's numerical error is at most 3x the numerical error
             # of a Pytorch implementation.

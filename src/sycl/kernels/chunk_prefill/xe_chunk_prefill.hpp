@@ -459,7 +459,7 @@ class FMHAPrefillChunk {
         // Then modify layout to LayoutQ = ((seq_leq_q, group_head_q),
         // head_size_qk, batch* num_heads_q / group_head_q), which can be merged
         // into one gemm for (int i = 0; i < q_group_size; ++i) {
-        collective_mma.mmaQK(tSr, gQ, gK_, tSr, ceil_div(head_size_qk, QK_BLK_K), mainloop_params, true, q_scale_val, k_scale_val);
+        collective_mma.mmaQK(tSr, gQ, gK_, tSr, ceil_div(head_size_qk, QK_BLK_K), mainloop_params, q_scale_val, k_scale_val);
 
         if constexpr (LocalMask) {
           // Sliding windows
@@ -558,7 +558,7 @@ class FMHAPrefillChunk {
         softmax(split == 0, tSr, max_reg, sum_reg, out_reg);
 
         // 5) Perform GEMM O = S*V
-        collective_mma.template mmaPV<VSlicer>(out_reg, tSr, gV_, out_reg, mainloop_params, true, v_scale_val);
+        collective_mma.template mmaPV<VSlicer>(out_reg, tSr, gV_, out_reg, mainloop_params, v_scale_val);
         // ... prefetch next tile ...
         // Prefetch the next Q tile
         CUTLASS_PRAGMA_UNROLL

@@ -279,7 +279,7 @@ struct FlashChunkPrefillMma<
       TensorK gK,
       FragSrc const& frag_src,
       int const& k_tile_count,
-      Params const& params, bool is_KV_cache, float q_scale, float k_scale) {
+      Params const& params, float q_scale, float k_scale) {
     auto& gmem_tiled_copy_k = params.gmem_tiled_copy_k_cache;
 
     int thread_idx = static_cast<int>(ThreadIdxX());
@@ -298,8 +298,8 @@ struct FlashChunkPrefillMma<
     Tensor tCgK = thread_mma_k.partition_B(gK);
 
     // Create fragments
-    using TCrQ_Type = cute::conditional_t<is_fp8_v<ElementQ>, uint8_t, bfloat16_t>;
-    using TCrK_Type = cute::conditional_t<is_fp8_v<ElementK>, uint8_t, bfloat16_t>;
+    using TCrQ_Type = cute::conditional_t<is_fp8_v<ElementQ>, uint8_t, ElementQ>;
+    using TCrK_Type = cute::conditional_t<is_fp8_v<ElementK>, uint8_t, ElementK>;
     Tensor tCrQ = make_tensor<TCrQ_Type>(make_fragment_layout(params.gmem_tiled_copy_q, take<0,3>(tCgQ.shape())));
     Tensor tCrK = make_tensor<TCrK_Type>(make_fragment_layout(gmem_tiled_copy_k, take<0,3>(tCgK.shape())));
 
@@ -385,9 +385,8 @@ struct FlashChunkPrefillMma<
   // GEMM is computed in BF16 precision (FP8 not supported in BMG)
   template <int tile_count, class FragQccum, class FragS, class TensorV, class FragSrc>
   CUTLASS_DEVICE void
-  mmaPV(FragQccum& accum, FragS const& tSr, TensorV gV, FragSrc const& frag_src, Params const& params, bool is_KV_cache, float v_scale) {
+  mmaPV(FragQccum& accum, FragS const& tSr, TensorV gV, FragSrc const& frag_src, Params const& params, float v_scale) {
     auto& gmem_tiled_copy_v = params.gmem_tiled_copy_v_cache;
-
     int thread_idx = static_cast<int>(ThreadIdxX());
     // Instantiate the MMA object
     TiledMmaPV tiled_mma;
@@ -398,7 +397,7 @@ struct FlashChunkPrefillMma<
     auto first_thread_in_sg_idx = sg.get_group_id()[0] * DispatchPolicy::SubgroupSize;
     auto thread_mma = tiled_mma.get_slice(first_thread_in_sg_idx);
     Tensor tCgV = thread_mma.partition_B(gV_);
-    using TCrV_Type = cute::conditional_t<is_fp8_v<ElementV>, uint8_t, bfloat16_t>;
+    using TCrV_Type = cute::conditional_t<is_fp8_v<ElementV>, uint8_t, ElementV>;
     Tensor tCrV = make_tensor<TCrV_Type>(make_fragment_layout(gmem_tiled_copy_v, take<0,3>(tCgV.shape())));
 
     // Partition the copying of A and B tiles across the threads
@@ -427,7 +426,7 @@ struct FlashChunkPrefillMma<
 #endif
 
     // 7) Convert S to P (FP32 -> BF16)
-    Tensor tPr = convert_type<bfloat16_t>(tSr);
+    Tensor tPr = convert_type<typename TiledMmaPV::ValTypeA>(tSr);
     //
     // Mainloop
     //
@@ -515,3 +514,5 @@ struct FlashChunkPrefillMma<
 };
 
 }  // namespace cutlass::flash_attention::collective
+
+/////////////////////////////////////////////////////////////////////////////////////////////////

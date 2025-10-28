@@ -217,3 +217,23 @@ def cutlass_fp4_group_mm(
         params["blockscale_offsets"],
     )
     return c.to(dtype=out_dtype)
+
+
+def moe_grouped_mm_nt(activations, weights, total_rows_for_experts, n_experts):
+    """
+    BF16/FP16 grouped GEMM for MoE with non-transposed weights.
+    activations: (total_tokens, hidden_dim)
+    weights: (total_expert_rows, hidden_dim, output_dim)
+    total_rows_for_experts: (n_experts + 1,) prefix sum of rows for each expert
+    n_experts: number of experts
+    returns: (total_tokens, output_dim)
+    """
+    output = torch.empty(
+        (activations.size(0), weights.size(2)),
+        device=activations.device,
+        dtype=activations.dtype,
+    )
+    torch.ops.sgl_kernel.moe_grouped_mm_nt(
+        output, activations, weights, total_rows_for_experts, n_experts
+    )
+    return output

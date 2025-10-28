@@ -255,6 +255,13 @@ void fp8_blockwise_scaled_grouped_mm(
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace);
 
+void moe_grouped_mm_nt(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& weights,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts);
+
 void prepare_moe_input(
     const torch::Tensor& topk_ids,
     torch::Tensor& expert_offsets,

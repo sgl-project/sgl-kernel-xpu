@@ -386,7 +386,7 @@ struct FMHAConfig {
 
     using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16<PipelineStages>;
     using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeXMX16;
-    using CollectiveEpilogue = cutlass::flash_attention::collective::FlasSplitKVEpilogue<
+    using CollectiveEpilogue = cutlass::flash_attention::collective::FlashSplitKVEpilogue<
         Sink,
         EpilogueDispatchPolicy,
         MMAOperation,

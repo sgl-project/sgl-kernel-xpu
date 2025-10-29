@@ -74,7 +74,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -fno-sycl-instrument-device-code)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -Xspirv-translator)
 
-  # SYCL compiler in basekit after 2025.2 needs more spirv arguments. 
+  # SYCL compiler in basekit after 2025.2 needs more spirv arguments.
   if(SYCL_COMPILER_VERSION GREATER_EQUAL 20250806)
     set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate)
   else()

@@ -944,6 +944,10 @@ def test_flash_attn_kvcache(
                 out = out.flatten()
                 out_ref = out_ref.flatten()
                 out_pt = out_pt.flatten()
+                print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+                print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+                print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+                print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
                 # breakpoint()
 
                 # Check that FlashAttention's numerical error is at most twice the numerical error
@@ -1267,6 +1271,9 @@ def test_flash_attn_varlen_output(
             intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
         )
 
+        print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+        print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
+
         if query_unused_mask is not None:
             q_zero_masking = rearrange(query_unused_mask, "b s -> b s 1 1")
 
@@ -1298,6 +1305,9 @@ def test_flash_attn_varlen_output(
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:
                 out.masked_fill_(q_zero_masking, 0.0)
+
+            print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+            print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
 
             # Check that FlashAttention's numerical error is at most 3x the numerical error
             # of a Pytorch implementation.

@@ -232,3 +232,4 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input) {
   }
   return;
 }
+

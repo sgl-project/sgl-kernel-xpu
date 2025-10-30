@@ -49,7 +49,7 @@ def flash_attn_with_kvcache(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     softmax_scale=None,
-    softmax_sink=None,
+    sinks=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0,  # 0.0 means deactivated
@@ -205,7 +205,7 @@ def flash_attn_with_kvcache(
         k_descale,
         v_descale,
         softmax_scale,
-        softmax_sink,
+        sinks,
         causal,
         window_size[0],
         window_size[1],

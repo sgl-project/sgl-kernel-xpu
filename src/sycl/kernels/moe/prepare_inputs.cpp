@@ -146,7 +146,7 @@ void compute_arg_sorts_sycl(
 
         for (int i = threadIdx.x; i < topk_length; i += THREADS_PER_EXPERT) {
           if (topk_ids[i] == expert_id) {
-            int start = atomic_counter.fetch_add(occurrences);
+            int start = atomic_counter.fetch_add(1);
             input_permutation[start] = i / topk;
             output_permutation[i] = start;
           }

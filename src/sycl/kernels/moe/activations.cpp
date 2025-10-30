@@ -14,9 +14,6 @@
 #include "SYCLHelpers.h"
 #include "Utils.h"
 
-constexpr uint64_t THREADS_PER_EXPERT = 512;
-constexpr int block_size = 128
-
 #define DPCPP_CONSTANT __attribute__((opencl_constant))
 
 #define DPCPP_KER_STRING(var, str) static const DPCPP_CONSTANT char var[] = str;

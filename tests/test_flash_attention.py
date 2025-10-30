@@ -63,7 +63,7 @@ DISABLE_LOCAL = True
 DISABLE_SOFTCAP = True
 DISABLE_PACKGQA = True
 DISABLE_FP16 = True
-DISABLE_FP8 = True
+DISABLE_FP8 = False
 
 
 # Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/hopper/padding.py
@@ -826,6 +826,13 @@ def test_flash_attn_kvcache(
         v_cache_rep = repeat(
             v_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k
         )
+        if dtype == torch.float8_e4m3fn:
+            q_descale, k_descale, v_descale = [
+                torch.randn(batch_size, nheads_k, device=device, dtype=torch.float32)
+                for _ in range(3)
+            ]
+        else:
+            q_descale, k_descale, v_descale = None, None, None
         out_ref, _ = attention_ref(
             q_ro,
             k_cache_rep,
@@ -836,6 +843,9 @@ def test_flash_attn_kvcache(
             key_padding_mask,
             causal=causal,
             qv=qv,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             window_size=window_size,
             key_leftpad=cache_leftpad,
         )
@@ -849,6 +859,9 @@ def test_flash_attn_kvcache(
             key_padding_mask,
             causal=causal,
             qv=qv,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             window_size=window_size,
             upcast=False,
             reorder_ops=True,
@@ -901,6 +914,9 @@ def test_flash_attn_kvcache(
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k_new=cu_seqlens_k_new,
                     max_seqlen_q=max_seqlen_q,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
                     rotary_seqlens=rotary_seqlens,
                     causal=causal,
                     window_size=window_size,
@@ -924,6 +940,7 @@ def test_flash_attn_kvcache(
                 # lse_ref = torch.logsumexp(qk / math.sqrt(d), -1)
                 # probs = torch.softmax(qk, dim=-1)
                 torch.xpu.synchronize()
+                out = out.to(dtype_ref)
                 out = out.flatten()
                 out_ref = out_ref.flatten()
                 out_pt = out_pt.flatten()
@@ -1007,13 +1024,14 @@ def _generate_block_kvcache(
     seqlen_k, page_size, batch_size, nheads_k, d, dv, device, dtype, dtype_ref
 ):
     num_blocks = math.ceil(seqlen_k / page_size) * batch_size
+    create_fn = torch.randn
     k_cache_paged = (
-        torch.randn(num_blocks, page_size, nheads_k, d, device=device, dtype=dtype_ref)
+        create_fn(num_blocks, page_size, nheads_k, d, device=device, dtype=dtype_ref)
         .to(dtype)
         .to(dtype_ref)
     )
     v_cache_paged = (
-        torch.randn(num_blocks, page_size, nheads_k, dv, device=device, dtype=dtype_ref)
+        create_fn(num_blocks, page_size, nheads_k, dv, device=device, dtype=dtype_ref)
         .to(dtype)
         .to(dtype_ref)
     )
@@ -1287,6 +1305,7 @@ def test_flash_attn_varlen_output(
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:
                 out.masked_fill_(q_zero_masking, 0.0)
+
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
 

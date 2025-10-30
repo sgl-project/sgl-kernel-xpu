@@ -1,3 +1,33 @@
+/***************************************************************************************************
+ * Copyright (C) 2025 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ **************************************************************************************************/
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 #include <c10/xpu/XPUStream.h>
@@ -66,6 +96,10 @@ struct Flash_fwd_params {
   float scale_softmax;
   void* sink_softmax;
   float softcap;
+
+  float* __restrict__ q_scale_ptr;
+  float* __restrict__ k_scale_ptr;
+  float* __restrict__ v_scale_ptr;
 
   // array of length b+1 holding starting offset of each sequence.
   int* __restrict__ cu_seqlens_q;
@@ -138,7 +172,7 @@ struct Flash_fwd_params {
 
   bool is_bf16;
   bool is_fp32;
-  bool is_e4m3;
+  bool is_fp8;
   bool is_causal;
   bool is_local;
 
@@ -321,10 +355,13 @@ struct KernelRunner {
          //  stride_K,
          //  static_cast<const ElementV*>(params.vnew_ptr),
          //  stride_V,
-         static_cast<const ElementV*>(params.k_ptr),
+         static_cast<const ElementK*>(params.k_ptr),
          stride_K_cache,
          static_cast<const ElementV*>(params.v_ptr),
          stride_V_cache,
+	 params.q_scale_ptr,
+         params.k_scale_ptr,
+         params.v_scale_ptr,
          params.page_table,
          params.page_size,
          params.max_num_pages_per_seq,
@@ -505,8 +542,9 @@ std::vector<at::Tensor> mha_fwd(
 
   auto q_type = q.scalar_type();
   TORCH_CHECK(
-      q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
-      "SGL Kernel XPU only supports fp16 and bf16 type");
+      q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16 || q_type == at::ScalarType::Float8_e4m3fn ||
+          q_type == at::ScalarType::Float8_e5m2,
+      "SGL Kernel XPU only supports fp16, bf16 and fp8 types");
 
   TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
   TORCH_CHECK(v.scalar_type() == q_type, "query and value must have the same dtype");
@@ -589,7 +627,13 @@ std::vector<at::Tensor> mha_fwd(
 
   auto opts = q.options();
   at::Tensor out;
+  // out = torch::empty({total_q, num_heads, head_size_v}, opts);
+  if (q.dtype() == at::ScalarType::Float8_e4m3fn || q.dtype() == at::ScalarType::Float8_e5m2) {
+  // Internal math & epilogue producing BF16
+  out = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(torch::kBFloat16));
+} else {
   out = torch::empty({total_q, num_heads, head_size_v}, opts);
+}
 
   auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
   int const head_size_rounded = round_up_headdim(head_size);
@@ -607,6 +651,7 @@ std::vector<at::Tensor> mha_fwd(
   // align with FA3
   Flash_fwd_params params;
   params.is_bf16 = q.dtype() == torch::kBFloat16;
+  params.is_fp8 = q.dtype() == at::ScalarType::Float8_e4m3fn || q.dtype() == at::ScalarType::Float8_e5m2;
 
   // Set the pointers and strides.
   params.q_ptr = q.data_ptr();
@@ -623,6 +668,12 @@ std::vector<at::Tensor> mha_fwd(
   params.o_ptr = out.data_ptr();
   params.o_row_stride = out.stride(-3);
   params.o_head_stride = out.stride(-2);
+
+  if (params.is_fp8) {
+    params.q_scale_ptr = static_cast<float*>(q_descale_.value().data_ptr());
+    params.k_scale_ptr = static_cast<float*>(k_descale_.value().data_ptr());
+    params.v_scale_ptr = static_cast<float*>(v_descale_.value().data_ptr());
+  }
 
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
@@ -737,122 +788,216 @@ std::vector<at::Tensor> mha_fwd(
   auto outaccum_type = at::ScalarType::Float;
 
   constexpr int PipelineStages = 2;
-  switch (params.d) {
-    case 64:
-      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
-        if (params.is_causal) {
-          FMHAConfig<
-              cute::Shape<_128, _64, _64>,
-              cute::Shape<_128, _32, _64>,
-              cute::Shape<_128, _64, _64>,
-              cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
-              PipelineStages,
-              true,
-              false,
-              Sink>::run(params);
-        } else {
-          AT_DISPATCH_BOOL_NO_RETURN(
-              params.is_local,
-              LocalMask,
-              FMHAConfig<
-                  cute::Shape<_128, _64, _64>,
-                  cute::Shape<_128, _32, _64>,
-                  cute::Shape<_128, _64, _64>,
-                  cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
-                  PipelineStages,
-                  false,
-                  LocalMask,
-                  Sink>::run(params))
-        }
-      })
-      break;
-    case 96:
-      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
-        if (params.is_causal) {
-          FMHAConfig<
-              cute::Shape<_128, _64, _32>,
-              cute::Shape<_128, _32, _64>,
-              cute::Shape<_128, _96, _64>,
-              cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
-              PipelineStages,
-              true,
-              false,
-              Sink>::run(params);
+  if (params.is_fp8) {
+    switch (params.d) {
+      case 64:
+        AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+          if (params.is_causal) {
+            FMHAConfig<
+                cute::Shape<_128, _64, _64>,
+                cute::Shape<_128, _32, _64>,
+                cute::Shape<_128, _64, _64>,
+                cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+                PipelineStages,
+                true,
+                false,
+                Sink,
+                float_e4m3_t,
+                float_e4m3_t,
+                XE_8x16x16_F32BF16BF16F32_TT,
+                XE_2D_U8x8x32_LD_N,
+                XE_2D_U8x16x16_LD_T,
+                XE_2D_U8x32x32_LD_V,
+                float,
+                float, bfloat16_t, bfloat16_t, XE_2D_U16x8x16_ST_N>::run(params);
+          } else {
+            AT_DISPATCH_BOOL_NO_RETURN(
+                params.is_local,
+                LocalMask,
+                FMHAConfig<
+                    cute::Shape<_128, _64, _64>,
+                    cute::Shape<_128, _32, _64>,
+                    cute::Shape<_128, _64, _64>,
+                    cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+                    PipelineStages,
+                    false,
+                    LocalMask,
+                    Sink,
+                    float_e4m3_t,
+                    float_e4m3_t,
+                    XE_8x16x16_F32BF16BF16F32_TT,
+                    XE_2D_U8x8x32_LD_N,
+                    XE_2D_U8x16x16_LD_T,
+                    XE_2D_U8x32x32_LD_V,
+                    float,
+                    float, bfloat16_t, bfloat16_t, XE_2D_U16x8x16_ST_N>::run(params))
+          }
+        })
+        break;
+      case 128:
+        AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+          if (params.is_causal) {
+            FMHAConfig<
+                cute::Shape<_128, _64, _64>,
+                cute::Shape<_128, _32, _64>,
+                cute::Shape<_128, _128, _64>,
+                cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
+                PipelineStages,
+                true,
+                false,
+                Sink,
+                float_e4m3_t,
+                float_e4m3_t,
+                XE_8x16x16_F32BF16BF16F32_TT,
+                XE_2D_U8x8x32_LD_N,
+                XE_2D_U8x16x16_LD_T,
+                XE_2D_U8x32x32_LD_V,
+                float,
+                float, bfloat16_t, bfloat16_t, XE_2D_U16x8x16_ST_N>::run(params);
+          } else {
+            AT_DISPATCH_BOOL_NO_RETURN(
+                params.is_local,
+                LocalMask,
+                FMHAConfig<
+                    cute::Shape<_128, _64, _64>,
+                    cute::Shape<_128, _32, _64>,
+                    cute::Shape<_128, _128, _64>,
+                    cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
+                    PipelineStages,
+                    false,
+                    LocalMask,
+                    Sink,
+                    float_e4m3_t,
+                    float_e4m3_t,
+                    XE_8x16x16_F32BF16BF16F32_TT,
+                    XE_2D_U8x8x32_LD_N,
+                    XE_2D_U8x16x16_LD_T,
+                    XE_2D_U8x32x32_LD_V,
+                    float,
+                    float, bfloat16_t, bfloat16_t, XE_2D_U16x8x16_ST_N>::run(params))
+          }
+        })
+        break;
+      default: TORCH_CHECK(false, "Unsupported head size for FP8");
+    }
+  } else { // BF16
+    switch (params.d) {
+      case 64:
+        AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+          if (params.is_causal) {
+            FMHAConfig<
+                cute::Shape<_128, _64, _64>,
+                cute::Shape<_128, _32, _64>,
+                cute::Shape<_128, _64, _64>,
+                cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+                PipelineStages,
+                true,
+                false,
+                Sink>::run(params);
+          } else {
+            AT_DISPATCH_BOOL_NO_RETURN(
+                params.is_local,
+                LocalMask,
+                FMHAConfig<
+                    cute::Shape<_128, _64, _64>,
+                    cute::Shape<_128, _32, _64>,
+                    cute::Shape<_128, _64, _64>,
+                    cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+                    PipelineStages,
+                    false,
+                    LocalMask,
+                    Sink>::run(params))
+          }
+        })
+        break;
+      case 96:
+        AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+          if (params.is_causal) {
+            FMHAConfig<
+                cute::Shape<_128, _64, _32>,
+                cute::Shape<_128, _32, _64>,
+                cute::Shape<_128, _96, _64>,
+                cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+                PipelineStages,
+                true,
+                false,
+                Sink>::run(params);
 
-        } else {
-          AT_DISPATCH_BOOL_NO_RETURN(
-              params.is_local,
-              LocalMask,
-              FMHAConfig<
-                  cute::Shape<_128, _64, _32>,
-                  cute::Shape<_128, _32, _64>,
-                  cute::Shape<_128, _96, _64>,
-                  cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
-                  PipelineStages,
-                  false,
-                  LocalMask,
-                  Sink>::run(params))
-        }
-      })
-      break;
-    case 128:
-      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
-        if (params.is_causal) {
-          FMHAConfig<
-              cute::Shape<_128, _64, _64>,
-              cute::Shape<_128, _32, _64>,
-              cute::Shape<_128, _128, _64>,
-              cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
-              PipelineStages,
-              true,
-              false,
-              Sink>::run(params);
-        } else {
-          AT_DISPATCH_BOOL_NO_RETURN(
-              params.is_local,
-              LocalMask,
-              FMHAConfig<
-                  cute::Shape<_128, _64, _64>,
-                  cute::Shape<_128, _32, _64>,
-                  cute::Shape<_128, _128, _64>,
-                  cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
-                  PipelineStages,
-                  false,
-                  LocalMask,
-                  Sink>::run(params))
-        }
-      })
-      break;
-    case 192:
-      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
-        if (params.is_causal) {
-          FMHAConfig<
-              cute::Shape<_256, _64, _64>,
-              cute::Shape<_256, _32, _64>,
-              cute::Shape<_256, _192, _64>,
-              cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
-              PipelineStages,
-              true,
-              false,
-              Sink>::run(params);
-        } else {
-          AT_DISPATCH_BOOL_NO_RETURN(
-              params.is_local,
-              LocalMask,
-              FMHAConfig<
-                  cute::Shape<_256, _64, _64>,
-                  cute::Shape<_256, _32, _64>,
-                  cute::Shape<_256, _192, _64>,
-                  cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
-                  PipelineStages,
-                  false,
-                  LocalMask,
-                  Sink>::run(params))
-        }
-      })
-      break;
-    default:
-      TORCH_CHECK(false, "Unsupported head size for causal attention");
+          } else {
+            AT_DISPATCH_BOOL_NO_RETURN(
+                params.is_local,
+                LocalMask,
+                FMHAConfig<
+                    cute::Shape<_128, _64, _32>,
+                    cute::Shape<_128, _32, _64>,
+                    cute::Shape<_128, _96, _64>,
+                    cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+                    PipelineStages,
+                    false,
+                    LocalMask,
+                    Sink>::run(params))
+          }
+        })
+        break;
+      case 128:
+        AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+          if (params.is_causal) {
+            FMHAConfig<
+                cute::Shape<_128, _64, _64>,
+                cute::Shape<_128, _32, _64>,
+                cute::Shape<_128, _128, _64>,
+                cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
+                PipelineStages,
+                true,
+                false,
+                Sink>::run(params);
+          } else {
+            AT_DISPATCH_BOOL_NO_RETURN(
+                params.is_local,
+                LocalMask,
+                FMHAConfig<
+                    cute::Shape<_128, _64, _64>,
+                    cute::Shape<_128, _32, _64>,
+                    cute::Shape<_128, _128, _64>,
+                    cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
+                    PipelineStages,
+                    false,
+                    LocalMask,
+                    Sink>::run(params))
+          }
+        })
+        break;
+      case 192:
+        AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+          if (params.is_causal) {
+            FMHAConfig<
+                cute::Shape<_256, _64, _64>,
+                cute::Shape<_256, _32, _64>,
+                cute::Shape<_256, _192, _64>,
+                cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+                PipelineStages,
+                true,
+                false,
+                Sink>::run(params);
+          } else {
+            AT_DISPATCH_BOOL_NO_RETURN(
+                params.is_local,
+                LocalMask,
+                FMHAConfig<
+                    cute::Shape<_256, _64, _64>,
+                    cute::Shape<_256, _32, _64>,
+                    cute::Shape<_256, _192, _64>,
+                    cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+                    PipelineStages,
+                    false,
+                    LocalMask,
+                    Sink>::run(params))
+          }
+        })
+        break;
+      default:
+        TORCH_CHECK(false, "Unsupported head size for causal attention");
+    }
   }
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }

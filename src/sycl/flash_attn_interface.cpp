@@ -1,23 +1,48 @@
+/***************************************************************************************************
+ * Copyright (C) 2025 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ **************************************************************************************************/
+/*! \file
+    \brief various Flash Attention kernel interface and params
+*/
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
-
 #include <cute/tensor.hpp>
-
 #include "Utils.h"
-#include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/util/device_memory.h"
-#include "cutlass/util/packed_stride.hpp"
-#include "cutlass/util/sycl_event_manager.hpp"
-#include "kernels/chunk_prefill/fmha_fusion.hpp"
-#include "kernels/chunk_prefill/tile_scheduler_chunk_prefill.hpp"
-#include "kernels/chunk_prefill/xe_chunk_prefill.hpp"
-#include "kernels/chunk_prefill/xe_flash_attn_chunk_prefill_epilogue.hpp"
-#include "kernels/chunk_prefill/xe_flash_attn_chunk_prefill_softmax_epilogue.hpp"
+#include "flash_attn_runner.hpp"
 
 using namespace cute;
 
+/// @brief Create a structure to hold parameters for Flash Attention forward pass.
 struct Flash_fwd_params {
   using index_t = int64_t;
 
@@ -155,291 +180,40 @@ struct Flash_fwd_params {
   int num_sm;
 };
 
-template <typename Kernel>
-class KernelCur {};
+/// @brief Dispatch kernel implementation for Flash Attention.
+template<typename ElementType, int HeadSize, int PipelineStages, bool CausalMask, bool LocalMask, bool PagedKV, bool VarLen>
+void dispatch_kernel_impl(const Flash_fwd_params& params) {
+    using MMAOperation = typename runner::flash_attention::MMAOperationSelector<ElementType>::type;
+    using Shape_h = typename runner::flash_attention::ShapeSelector<HeadSize>::type;
+    using Kernel = typename runner::flash_attention::XE_Flash_Attention<
+        ElementType, float, ElementType, 
+        typename Shape_h::ShapeQK, typename Shape_h::ShapePV,
+        typename Shape_h::ShapeOutput, typename Shape_h::SubgroupLayout, 
+        MMAOperation, PipelineStages, CausalMask, VarLen, PagedKV, LocalMask>::Kernel;
+    runner::flash_attention::RunFlashAttention<Kernel, decltype(params)>(params);
+}
 
-// Flash Attention takes 3 input matrices: Keys, Queries and Values.
-using LayoutQ = cutlass::layout::RowMajor;
-using LayoutK = cutlass::layout::ColumnMajor;
-using LayoutV = cutlass::layout::RowMajor;
-using LayoutO = cutlass::layout::RowMajor;
-
-template <class FMHAChunkPrefillKernel, bool isVarLen>
-struct KernelRunner {
-  using StrideQ = typename FMHAChunkPrefillKernel::StrideQ;
-  using StrideK = typename FMHAChunkPrefillKernel::StrideK;
-  using StrideV = typename FMHAChunkPrefillKernel::StrideV;
-  using StrideO = typename FMHAChunkPrefillKernel::StrideO;
-
-  using ElementQ = typename FMHAChunkPrefillKernel::ElementQ;
-  using ElementK = typename FMHAChunkPrefillKernel::ElementK;
-  using ElementV = typename FMHAChunkPrefillKernel::ElementV;
-  using ElementAcc = typename FMHAChunkPrefillKernel::ElementAccumulator;
-
-  using CollectiveEpilogue = typename FMHAChunkPrefillKernel::CollectiveEpilogue;
-  using ElementOutput = typename CollectiveEpilogue::ElementOutput;
-  using ElementCompute = typename CollectiveEpilogue::ElementCompute;
-  using ElementAccumulator = typename CollectiveEpilogue::ElementAccumulator;
-
-  using ProblemShapeType = typename FMHAChunkPrefillKernel::ProblemShape;
-
-  //
-  // Data members
-  //
-
-  /// Initialization
-  StrideQ stride_Q;
-  StrideK stride_K;
-  StrideV stride_V;
-  StrideK stride_K_cache;
-  StrideV stride_V_cache;
-  StrideO stride_O;
-
-  template <class ProblemShape>
-  auto initialize_varlen(const Flash_fwd_params& params, ProblemShape& problem_size) {
-    ProblemShape problem_size_for_init = problem_size;
-    get<0>(problem_size_for_init) = 1;  // concentrated batch
-    get<3>(problem_size_for_init) = params.total_q;
-    get<4>(problem_size_for_init) = params.total_knew;
-    get<5>(problem_size_for_init) = params.total_k;
-
-    ProblemShapeType problem_size_for_launch;
-
-    get<0>(problem_size_for_launch) = get<0>(problem_size);
-    get<1>(problem_size_for_launch) = get<1>(problem_size);
-    get<2>(problem_size_for_launch) = get<2>(problem_size);
-    get<3>(problem_size_for_launch) = cutlass::fmha::collective::VariableLength{params.seqlen_q, params.total_q};
-    get<4>(problem_size_for_launch) = cutlass::fmha::collective::VariableLength{params.seqlen_knew, params.total_knew};
-    get<5>(problem_size_for_launch) = cutlass::fmha::collective::VariableLength{params.seqlen_k, params.total_k};
-    get<6>(problem_size_for_launch) = get<6>(problem_size);
-    get<7>(problem_size_for_launch) = get<7>(problem_size);
-
-    return cute::make_tuple(problem_size_for_init, problem_size_for_launch);
-  }
-
-  /// Initialize operands to be used in the GEMM and reference GEMM
-  ProblemShapeType initialize(const Flash_fwd_params& params) {
-    auto problem_shape_in = cute::make_tuple(
-        params.b,    // batch
-        params.h,    // num_heads_q
-        params.h_k,  // num_heads_kv
-        params.seqlen_q,
-        params.seqlen_knew,
-        params.seqlen_k,
-        params.d,
-        params.dv);
-
-    ProblemShapeType problem_shape;
-    decltype(problem_shape_in) problem_size;
-
-    if constexpr (isVarLen) {
-      auto [problem_shape_init, problem_shape_launch] = initialize_varlen(params, problem_shape_in);
-      problem_size = problem_shape_init;
-      problem_shape = problem_shape_launch;
+/// @brief Dispatch kernel based on varlen, causal, and local for Flash Attention.
+template<typename ElementType, int HeadSize, int PipelineStages>
+void dispatch_kernel(const Flash_fwd_params& params) {
+    // Determine if variable length is needed
+    bool is_varlen = (params.cu_seqlens_q != nullptr) || (params.cu_seqlens_k != nullptr);
+    
+    // Dispatch based on varlen first, then the other boolean combinations
+    if (is_varlen) {
+        if (params.is_causal) {
+            if (params.page_table != nullptr) dispatch_kernel_impl<ElementType, HeadSize, PipelineStages, true, false, true, true>(params);
+            else dispatch_kernel_impl<ElementType, HeadSize, PipelineStages, true, false, false, true>(params);
+        } else {
+            if (params.page_table != nullptr) dispatch_kernel_impl<ElementType, HeadSize, PipelineStages, false, false, true, true>(params);
+            else dispatch_kernel_impl<ElementType, HeadSize, PipelineStages, false, false, false, true>(params);
+        }
     } else {
-      problem_size = problem_shape_in;
-      problem_shape = problem_shape_in;
+      /*
+        // currently we don't support non-varlen kernels
+      */
     }
-
-    auto [batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, head_size_qk, head_size_vo] =
-        problem_size;
-    auto group_q_size = num_heads_q / num_heads_kv;
-    auto group_q_num = num_heads_q / group_q_size;
-
-    stride_Q =
-        cutlass::make_cute_packed_stride(StrideQ{}, cute::make_shape(seq_len_qo, num_heads_q * head_size_qk, batch));
-    stride_K =
-        cutlass::make_cute_packed_stride(StrideK{}, cute::make_shape(seq_len_kv, num_heads_kv * head_size_qk, batch));
-    stride_V =
-        cutlass::make_cute_packed_stride(StrideV{}, cute::make_shape(head_size_vo * num_heads_kv, seq_len_kv, batch));
-
-    stride_K_cache = cutlass::make_cute_packed_stride(
-        StrideK{}, cute::make_shape(seq_len_kv_cache, num_heads_kv * head_size_qk, batch));
-    stride_V_cache = cutlass::make_cute_packed_stride(
-        StrideV{}, cute::make_shape(head_size_vo * head_size_qk, seq_len_kv_cache, batch * num_heads_kv));
-    stride_O = cutlass::make_cute_packed_stride(
-        StrideQ{}, cute::make_shape(seq_len_qo * group_q_size, group_q_num * head_size_vo, batch));
-
-    if constexpr (isVarLen) {
-      get<3>(problem_shape).cumulative_length = params.cu_seqlens_q;
-      get<4>(problem_shape).cumulative_length = params.cu_seqlens_knew;
-      get<5>(problem_shape).cumulative_length = params.cu_seqlens_k;
-    }
-
-    return problem_shape;
-  }
-
-  // Note that the GemmUniversalAdapter currently doesn't support flash attention, which is why this
-  // secondary `run` function is required to launch the kernel.
-  static void run(typename FMHAChunkPrefillKernel::Params params) {
-    dim3 const block = FMHAChunkPrefillKernel::get_block_shape();
-    dim3 const grid = FMHAChunkPrefillKernel::get_grid_shape(params);
-
-    // configure smem size and carveout
-    int smem_size = FMHAChunkPrefillKernel::SharedStorageSize;
-
-    const auto sycl_block = compat::dim3(block.x, block.y, block.z);
-    const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
-
-    using namespace compat::experimental;
-    compat::experimental::launch_properties launch_props{
-        sycl::ext::oneapi::experimental::work_group_scratch_size(smem_size),
-    };
-    compat::experimental::kernel_properties kernel_props{
-        sycl::ext::oneapi::experimental::sub_group_size<FMHAChunkPrefillKernel::DispatchPolicy::SubgroupSize>};
-    compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
-
-    sycl::ext::oneapi::experimental::launch_config config(policy.get_range(), policy.get_launch_properties());
-    auto cgf = [&](::sycl::handler& cgh) {
-      auto KernelFunctor =
-          compat::experimental::detail::build_kernel_functor<cutlass::device_kernel<FMHAChunkPrefillKernel>>(
-              cgh, policy, params);
-      sycl::ext::oneapi::experimental::detail::
-          LaunchConfigAccess<sycl::nd_range<3>, decltype(policy.get_launch_properties())>
-              ConfigAccess(config);
-      cgh.parallel_for<KernelCur<FMHAChunkPrefillKernel>>(
-          ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
-    };
-    auto stream = at::xpu::getCurrentXPUStream();
-    auto q = stream.queue();
-    q.submit(cgf);
-  }
-
-  cutlass::Status run(const Flash_fwd_params& params, const cutlass::KernelHardwareInfo& hw_info) {
-    ProblemShapeType problem_size = initialize(params);
-
-    typename FMHAChunkPrefillKernel::Arguments arguments{
-        cutlass::gemm::GemmUniversalMode::kGemm,
-        problem_size,
-        {// static_cast<const ElementQ*>(params.q_ptr),
-         static_cast<const ElementQ*>(params.q_ptr),
-         stride_Q,
-         //  static_cast<const ElementK*>(params.knew_ptr),
-         //  stride_K,
-         //  static_cast<const ElementV*>(params.vnew_ptr),
-         //  stride_V,
-         static_cast<const ElementV*>(params.k_ptr),
-         stride_K_cache,
-         static_cast<const ElementV*>(params.v_ptr),
-         stride_V_cache,
-         params.page_table,
-         params.page_size,
-         params.max_num_pages_per_seq,
-         -1,
-         -1},
-        {(ElementQ)params.scale_softmax},
-        {static_cast<const ElementOutput*>(params.o_ptr), stride_O},
-        hw_info};
-
-    // Define device-global scratch memory
-    size_t workspace_size = FMHAChunkPrefillKernel::get_workspace_size(arguments);
-    cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
-
-    if (!FMHAChunkPrefillKernel::can_implement(arguments)) {
-      return cutlass::Status::kErrorInvalidProblem;
-    }
-
-    // Initialize the workspace
-    (FMHAChunkPrefillKernel::initialize_workspace(arguments, workspace.get()));
-
-    // Convert host-side arguments to device-side arguments to be passed to the kernel
-    auto params_kernel = FMHAChunkPrefillKernel::to_underlying_arguments(arguments, workspace.get());
-
-    // Run the Flash Attention implementation.
-    run(params_kernel);
-    return cutlass::Status::kSuccess;
-  }
-};
-
-// the default value used for the case BF16
-template <
-    bool Causal,
-    typename TileShapeQK,
-    typename TileShapePV,
-    typename TileShapeOutput,
-    typename SubgroupLayout,
-    int PipelineStages,
-    bool LocalMask = false,
-    typename ElementInputQ = bfloat16_t,
-    typename ElementInputKV = bfloat16_t,
-    typename MMAOperation = XE_8x16x16_F32BF16BF16F32_TT,
-    typename GmemTiledCopyQ = XE_2D_U16x8x32_LD_N,
-    typename GmemTiledCopyK = XE_2D_U16x16x16_LD_T,  // _T designates a transposed block load operation
-    typename GmemTiledCopyV = XE_2D_U16x16x32_LD_V,
-    typename ElementAccumulator = float,
-    typename ElementComputeEpilogue = float,
-    typename ElementOutput = bfloat16_t,
-    typename GmemTiledCopyStore = XE_2D_U16x8x16_ST_N>
-struct FMHAConfig {
-  template <bool isVarLen, bool PagedKV, class Scheduler>
-  static int run(const Flash_fwd_params& params) {
-    // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
-    // information is used by the underlying kernel.
-    cutlass::KernelHardwareInfo hw_info;
-
-    using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16<PipelineStages>;
-    using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeXMX16;
-    using CollectiveEpilogue = cutlass::flash_attention::collective::FlashChunkPrefillEpilogue<
-        EpilogueDispatchPolicy,
-        MMAOperation,
-        TileShapeOutput,
-        SubgroupLayout,
-        ElementComputeEpilogue,
-        ElementOutput,
-        cutlass::gemm::TagToStrideC_t<LayoutO>,
-        ElementOutput,
-        GmemTiledCopyStore>;
-    using CollectiveSoftmaxEpilogue = cutlass::flash_attention::collective::
-        FlashChunkPrefillSoftmaxEpilogue<Causal, LocalMask, EpilogueDispatchPolicy, ElementAccumulator>;
-
-    using ProblemShapeRegular = cute::tuple<int, int, int, int, int, int, int, int>;
-    using namespace cutlass::fmha::collective;
-    using ProblemShapeVarlen = cute::tuple<int, int, int, VariableLength, VariableLength, VariableLength, int, int>;
-    using ProblemShapeType = std::conditional_t<isVarLen, ProblemShapeVarlen, ProblemShapeRegular>;
-
-    // Mainloop
-    using CollectiveMainloop = cutlass::flash_attention::collective::FlashChunkPrefillMma<
-        GEMMDispatchPolicy,
-        ProblemShapeType,
-        ElementInputQ,
-        cutlass::gemm::TagToStrideA_t<LayoutQ>,
-        ElementInputKV,
-        cutlass::gemm::TagToStrideB_t<LayoutK>,
-        ElementInputKV,
-        cutlass::gemm::TagToStrideB_t<LayoutV>,
-        MMAOperation,
-        TileShapeQK,
-        TileShapePV,
-        SubgroupLayout,
-        GmemTiledCopyQ,  // Q
-        GmemTiledCopyK,  // K
-        GmemTiledCopyV,  // V,
-        Causal,
-        LocalMask,
-        PagedKV>;
-
-    using FMHAChunkPrefillKernel = cutlass::flash_attention::kernel::FMHAPrefillChunk<
-        ProblemShapeType,
-        CollectiveMainloop,
-        CollectiveSoftmaxEpilogue,
-        CollectiveEpilogue,
-        Scheduler>;
-
-    KernelRunner<FMHAChunkPrefillKernel, isVarLen> runner;
-
-    (runner.run(params, hw_info));
-    return 0;
-  }
-
-  static int run(const Flash_fwd_params& params) {
-    // only support varlen and paged kv now
-    if (params.page_table != nullptr && params.cu_seqlens_k != nullptr) {
-      return run<true, true, cutlass::flash_attention::IndividualScheduler>(params);
-    } else {
-      return 0;
-    }
-  }
-};
+}
 
 inline int round_up_headdim(int head_size) {
   if (head_size <= 64) {
@@ -460,6 +234,8 @@ inline int round_up_headdim(int head_size) {
   return 256;
 }
 
+
+/// @brief Dispatch kernel implementation for mha_fwd.
 std::vector<at::Tensor> mha_fwd(
     at::Tensor& q,        // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
@@ -787,89 +563,46 @@ std::vector<at::Tensor> mha_fwd(
   auto outaccum_type = at::ScalarType::Float;
 
   constexpr int PipelineStages = 2;
-  if (params.is_causal) {
-    switch (params.d) {
-      case 64:
-        FMHAConfig<
-            true,
-            cute::Shape<_128, _64, _64>,
-            cute::Shape<_128, _32, _64>,
-            cute::Shape<_128, _64, _64>,
-            cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
-        break;
-      case 96:
-        FMHAConfig<
-            true,
-            cute::Shape<_128, _64, _32>,
-            cute::Shape<_128, _32, _64>,
-            cute::Shape<_128, _96, _64>,
-            cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
-        break;
-      case 128:
-        FMHAConfig<
-            true,
-            cute::Shape<_128, _64, _64>,
-            cute::Shape<_128, _32, _64>,
-            cute::Shape<_128, _128, _64>,
-            cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
-        break;
-      case 192:
-        FMHAConfig<
-            true,
-            cute::Shape<_256, _64, _64>,
-            cute::Shape<_256, _32, _64>,
-            cute::Shape<_256, _192, _64>,
-            cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
-        break;
-      default:
-        TORCH_CHECK(false, "Unsupported head size for causal attention");
+
+  if (q_type == at::ScalarType::BFloat16) {
+    switch (head_size) {
+        case 64: dispatch_kernel<cutlass::bfloat16_t, 64, PipelineStages>(params); break;
+        case 96: dispatch_kernel<cutlass::bfloat16_t, 96, PipelineStages>(params); break;
+        case 128: dispatch_kernel<cutlass::bfloat16_t, 128, PipelineStages>(params); break;
+        case 192: dispatch_kernel<cutlass::bfloat16_t, 192, PipelineStages>(params); break;
+        default: TORCH_CHECK(false, "Unsupported head size for BFloat16: " + std::to_string(head_size));
     }
+  } else if (q_type == at::ScalarType::Half) {
+      switch (head_size) {
+          case 64: dispatch_kernel<cutlass::half_t, 64, PipelineStages>(params); break;
+          case 96: dispatch_kernel<cutlass::half_t, 96, PipelineStages>(params); break;
+          case 128: dispatch_kernel<cutlass::half_t, 128, PipelineStages>(params); break;
+          case 192: dispatch_kernel<cutlass::half_t, 192, PipelineStages>(params); break;
+          default: TORCH_CHECK(false, "Unsupported head size for Half: " + std::to_string(head_size));
+      }
   } else {
-    switch (params.d) {
-      case 64:
-        FMHAConfig<
-            false,
-            cute::Shape<_128, _64, _64>,
-            cute::Shape<_128, _32, _64>,
-            cute::Shape<_128, _64, _64>,
-            cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
-        break;
-      case 96:
-        FMHAConfig<
-            false,
-            cute::Shape<_128, _64, _32>,
-            cute::Shape<_128, _32, _64>,
-            cute::Shape<_128, _96, _64>,
-            cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
-        break;
-      case 128:
-        FMHAConfig<
-            false,
-            cute::Shape<_128, _64, _64>,
-            cute::Shape<_128, _32, _64>,
-            cute::Shape<_128, _128, _64>,
-            cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
-        break;
-      case 192:
-        FMHAConfig<
-            false,
-            cute::Shape<_256, _64, _64>,
-            cute::Shape<_256, _32, _64>,
-            cute::Shape<_256, _192, _64>,
-            cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
-        break;
-      default:
-        TORCH_CHECK(false, "Unsupported head size for causal attention");
-    }
+      TORCH_CHECK(false, "Unsupported data type");
   }
-  // return {out, softmax_lse};
   return {out, softmax_lse, out_accum, softmax_lse_accum};
+}
+
+int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches, int64_t sm_count, int64_t num_kv_splits) {
+  constexpr int PipelineStages = 2;
+  constexpr bool CausalMask = false;
+  constexpr bool VarLen = true;
+  constexpr bool PagedKV = false;
+  using MMAOperation = typename runner::flash_attention::MMAOperationSelector<cutlass::half_t>::type;
+  using Shape_h = typename runner::flash_attention::ShapeSelector<64>::type;
+  using  MlaFlashAttnType = typename runner::flash_attention::XE_Flash_Attention<cutlass::half_t, float, cutlass::half_t, 
+        typename Shape_h::ShapeQK, typename Shape_h::ShapePV,
+        typename Shape_h::ShapeOutput, typename Shape_h::SubgroupLayout, 
+        MMAOperation, PipelineStages, CausalMask, VarLen, PagedKV>;
+
+  cutlass::KernelHardwareInfo hw_info;
+  typename MlaFlashAttnType::Kernel::Arguments arguments;
+  arguments.hw_info = hw_info;
+  // need to change these parameters to match the actual use case
+  // will do later
+
+  return MlaFlashAttnType::Kernel::get_workspace_size(arguments);
 }

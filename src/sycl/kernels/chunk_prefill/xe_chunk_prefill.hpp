@@ -104,6 +104,9 @@ class FMHAPrefillChunk {
   using EpilogueParams = typename CollectiveEpilogue::Params;
   using TileShapeOutput = typename CollectiveEpilogue::TileShapeOutput;
   using TiledMmaOutput = typename CollectiveEpilogue::TiledMmaOutput;
+  using ElementSink = typename CollectiveEpilogue::ElementSink;
+
+  static constexpr bool Sink = CollectiveEpilogue::Sink;
 
   static_assert(
       cute::is_same_v<ElementAccumulator, typename CollectiveEpilogue::ElementAccumulator>,
@@ -467,29 +470,7 @@ class FMHAPrefillChunk {
             }
           }
         }
-
         if constexpr (PagedKV) {
-          // // if constexpr(!(CausalMask || LocalMask) && PagedKV) {
-          // // Processing Not divisible, mask padding
-          //   const int item_id = thread_idx % SubgroupSize;
-          //   int col_idx = item_id + split * cute::min(QK_BLK_N,
-          //   seq_len_kv_cache + seq_len_kv);
-          //     CUTLASS_PRAGMA_UNROLL
-          //     for (int n = 0; n < FragsN; n++, col_idx +=
-          //     get<1>(MmaAtomShape())) { // 4
-          //       CUTLASS_PRAGMA_UNROLL
-          //       for (int m = 0; m < FragsM; m++) { // 2
-          //         int row_idx = m * Vec + seq_coord;
-          //         CUTLASS_PRAGMA_UNROLL
-          //         for (int row = 0; row < Vec; row++) { // 8
-          //           if (col_idx >= seq_len_kv_cache + seq_len_kv || row_idx +
-          //           row >= seq_len_qo) {
-          //             tSr(row, m, n) = ElementAccumulator{-INFINITY};
-          //         }
-          //       }
-          //     }
-          //   }
-
           int col_start = local_id + kv_start_coord;
           int col_end = col_start + (FragsN - 1) * get<1>(MmaAtomShape());
           if (col_end >= seq_len_kv_cache) {
@@ -585,7 +566,19 @@ class FMHAPrefillChunk {
           params.epilogue, params.problem_shape, sequence_length_shape, batch_coord, q_head_coord);
       CollectiveEpilogue epilogue{epilogue_params, shared_storage.epilogue};
       auto blk_coord_mnkl = make_coord(blk_m_coord, blk_n_coord, _, 0);
-      epilogue(params.problem_shape, sequence_length_shape, blk_coord_mnkl, out_reg, max_reg, sum_reg);
+      if constexpr (Sink) {
+        ElementAccumulator max_scale{max_reg * params.softmax.scale};
+        epilogue(
+            params.problem_shape,
+            sequence_length_shape,
+            blk_coord_mnkl,
+            out_reg,
+            max_scale,
+            sum_reg,
+            params.epilogue.ptr_sink[q_head_coord]);
+      } else {
+        epilogue(params.problem_shape, sequence_length_shape, blk_coord_mnkl, out_reg, max_reg, sum_reg, 0);
+      }
     }
   }
 };

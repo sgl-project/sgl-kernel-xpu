@@ -51,6 +51,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
 
+  m.def(
+      "rotary_embedding(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
+      "bool is_neox) -> (Tensor, Tensor)");
+  m.impl("rotary_embedding", torch::kXPU, &at::native::xpu::rotary_embedding);
+
   //   m.def(
   //       "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype,
   //       -> Tensor");
@@ -64,11 +69,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    Tensor   k,"
       "    Tensor   v,"
       "    Tensor?  q_v,"
-      "    Tensor?  cu_seqlens_q,"
-      "    Tensor?  cu_seqlens_k,"
-      "    int?     max_seqlen_q,"
-      "    int?     max_seqlen_k,"
-      "    Tensor?  page_table,"
+      "    Tensor  cu_seqlens_q,"
+      "    Tensor  cu_seqlens_k,"
+      "    int     max_seqlen_q,"
+      "    Tensor  page_table,"
       "    Tensor?  kv_batch_idx,"
       "    Tensor?  leftpad_k,"
       "    Tensor?  rotary_cos,"
@@ -78,6 +82,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    Tensor?  k_descale,"
       "    Tensor?  v_descale,"
       "    float    softmax_scale,"
+      "    Tensor?  softmax_sink,"
       "    bool     is_causal,"
       "    int      window_size_left,"
       "    int      window_size_right,"

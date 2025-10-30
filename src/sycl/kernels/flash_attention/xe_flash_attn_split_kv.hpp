@@ -34,7 +34,7 @@
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/kernel_hardware_info.hpp"
-#include "xe_flash_attn_chunk_prefill_mma.hpp"
+#include "xe_flash_attn_split_kv_mma.hpp"
 
 namespace cutlass::flash_attention::kernel {
 
@@ -44,7 +44,7 @@ template <
     class CollectiveSoftmaxEpilogue_,
     class CollectiveEpilogue_,
     class TileScheduler_ = void>
-class FMHAPrefillChunk;
+class FMHASplitKV;
 ///////////////////////////////////////////////////////////////////////////////
 template <
     class ProblemShape_,
@@ -52,7 +52,7 @@ template <
     class CollectiveSoftmaxEpilogue_,
     class CollectiveEpilogue_,
     class TileScheduler_>
-class FMHAPrefillChunk {
+class FMHASplitKV {
  public:
   //
   // Type Aliases

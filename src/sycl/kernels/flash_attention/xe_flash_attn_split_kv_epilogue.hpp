@@ -56,7 +56,7 @@ template <
     class TileShapeOutput_,
     class SubgroupLayout_,
     class... Args>
-class FlashChunkPrefillEpilogue {
+class FlashSplitKVEpilogue {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy>, "Could not find an epilogue specialization.");
 };
 
@@ -71,7 +71,7 @@ template <
     class ElementLSE_,
     class CopyOpO_,
     class ElementSink_>
-class FlashChunkPrefillEpilogue<
+class FlashSplitKVEpilogue<
     Sink_,
     epilogue::IntelXeXMX16,
     MMAOperation_,
@@ -191,7 +191,7 @@ class FlashChunkPrefillEpilogue<
   }
 
   CUTLASS_HOST_DEVICE
-  FlashChunkPrefillEpilogue(Params const& params_, TensorStorage const&) : params(params_) {}
+  FlashSplitKVEpilogue(Params const& params_, TensorStorage const&) : params(params_) {}
 
   template <
       class ProblemShape,

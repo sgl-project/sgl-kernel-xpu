@@ -67,7 +67,7 @@ template <
     bool CausalMask_,
     bool LocalMask_,
     bool PagedKV_>
-struct FlashChunkPrefillMma {
+struct FlashSplitKVMma {
   static_assert(cutlass::detail::dependent_false<ElementQ_>, "Could not find a mainloop specialization.");
 };
 
@@ -92,7 +92,7 @@ template <
     bool CausalMask_,
     bool LocalMask_,
     bool PagedKV_>
-struct FlashChunkPrefillMma<
+struct FlashSplitKVMma<
     gemm::MainloopIntelXeXMX16<Stages>,
     ProblemShapeType_,
     ElementQ_,
@@ -224,7 +224,7 @@ struct FlashChunkPrefillMma<
   // Methods
   //
 
-  FlashChunkPrefillMma() = default;
+  FlashSplitKVMma() = default;
 
   static constexpr Params
   to_underlying_arguments(ProblemShapeType const& problem_shape, Arguments const& args, void* workspace) {

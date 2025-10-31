@@ -171,7 +171,7 @@ struct MoERunner {
   }
 };
 
-void moe_grouped_mm_nt(
+void moe_grouped_mm_nn(
     torch::Tensor& output,
     const torch::Tensor& activations,
     const torch::Tensor& weights,
@@ -195,7 +195,7 @@ void moe_grouped_mm_nt(
       activations.scalar_type() == weights.scalar_type(), "activations and weights must have the same data type");
   TORCH_CHECK(
       activations.scalar_type() == at::ScalarType::Half || activations.scalar_type() == at::ScalarType::BFloat16,
-      "Only float16 and bfloat16 are supported in moe_grouped_mm_nt");
+      "Only float16 and bfloat16 are supported in moe_grouped_mm_nn");
 
   if (activations.scalar_type() == at::ScalarType::BFloat16) {
     auto stream = at::xpu::getCurrentXPUStream();

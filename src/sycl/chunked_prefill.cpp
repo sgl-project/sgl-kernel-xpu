@@ -6,6 +6,7 @@
 #include <cute/tensor.hpp>
 
 #include "Utils.h"
+#include "comm/common.h"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
@@ -63,6 +64,7 @@ struct Flash_fwd_params {
 
   // The scaling factors for the kernel.
   float scale_softmax;
+  void* sink_softmax;
   float softcap;
 
   // array of length b+1 holding starting offset of each sequence.
@@ -175,6 +177,7 @@ struct KernelRunner {
   using ElementK = typename FMHAChunkPrefillKernel::ElementK;
   using ElementV = typename FMHAChunkPrefillKernel::ElementV;
   using ElementAcc = typename FMHAChunkPrefillKernel::ElementAccumulator;
+  using ElementSink = typename FMHAChunkPrefillKernel::ElementSink;
 
   using CollectiveEpilogue = typename FMHAChunkPrefillKernel::CollectiveEpilogue;
   using ElementOutput = typename CollectiveEpilogue::ElementOutput;
@@ -325,10 +328,12 @@ struct KernelRunner {
          params.page_table,
          params.page_size,
          params.max_num_pages_per_seq,
-         -1,
-         -1},
+         params.window_size_left,
+         params.window_size_right},
         {(ElementQ)params.scale_softmax},
-        {static_cast<const ElementOutput*>(params.o_ptr), stride_O},
+        {static_cast<const ElementOutput*>(params.o_ptr),
+         stride_O,
+         static_cast<const ElementSink*>(params.sink_softmax)},
         hw_info};
 
     // Define device-global scratch memory
@@ -353,13 +358,14 @@ struct KernelRunner {
 
 // the default value used for the case BF16
 template <
-    bool Causal,
     typename TileShapeQK,
     typename TileShapePV,
     typename TileShapeOutput,
     typename SubgroupLayout,
     int PipelineStages,
+    bool Causal = false,
     bool LocalMask = false,
+    bool Sink = false,
     typename ElementInputQ = bfloat16_t,
     typename ElementInputKV = bfloat16_t,
     typename MMAOperation = XE_8x16x16_F32BF16BF16F32_TT,
@@ -369,6 +375,7 @@ template <
     typename ElementAccumulator = float,
     typename ElementComputeEpilogue = float,
     typename ElementOutput = bfloat16_t,
+    typename ElementSink = bfloat16_t,
     typename GmemTiledCopyStore = XE_2D_U16x8x16_ST_N>
 struct FMHAConfig {
   template <bool isVarLen, bool PagedKV, class Scheduler>
@@ -380,6 +387,7 @@ struct FMHAConfig {
     using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16<PipelineStages>;
     using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeXMX16;
     using CollectiveEpilogue = cutlass::flash_attention::collective::FlashChunkPrefillEpilogue<
+        Sink,
         EpilogueDispatchPolicy,
         MMAOperation,
         TileShapeOutput,
@@ -388,7 +396,8 @@ struct FMHAConfig {
         ElementOutput,
         cutlass::gemm::TagToStrideC_t<LayoutO>,
         ElementOutput,
-        GmemTiledCopyStore>;
+        GmemTiledCopyStore,
+        ElementSink>;
     using CollectiveSoftmaxEpilogue = cutlass::flash_attention::collective::
         FlashChunkPrefillSoftmaxEpilogue<Causal, LocalMask, EpilogueDispatchPolicy, ElementAccumulator>;
 
@@ -466,12 +475,11 @@ std::vector<at::Tensor> mha_fwd(
                           // h_k, d) if there is page_table.
     const at::Tensor& v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages,
                           // page_size, h_k, dv) if there is page_table.
-    std::optional<const at::Tensor>& q_v_,           // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
-    std::optional<const at::Tensor>& cu_seqlens_q_,  // b+1
-    std::optional<const at::Tensor>& cu_seqlens_k_,  // b+1
-    std::optional<int> max_seqlen_q_,
-    std::optional<int> max_seqlen_k_,
-    std::optional<const at::Tensor>& page_table_,      // (b_k, max_num_pages_per_seq)
+    std::optional<const at::Tensor>& q_v_,  // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
+    const at::Tensor& cu_seqlens_q,         // b+1
+    const at::Tensor& cu_seqlens_k,         // b+1
+    int max_seqlen_q,
+    const at::Tensor& page_table,                      // (b_k, max_num_pages_per_seq)
     std::optional<const at::Tensor>& kv_batch_idx_,    // b. indices to index into the KV cache
     std::optional<const at::Tensor>& leftpad_k_,       // b
     std::optional<const at::Tensor>& rotary_cos_,      // seqlen_ro x (rotary_dim / 2)
@@ -481,6 +489,7 @@ std::vector<at::Tensor> mha_fwd(
     std::optional<at::Tensor>& k_descale_,             // (b, h_k)
     std::optional<at::Tensor>& v_descale_,             // (b, h_k)
     const float softmax_scale_,
+    std::optional<const at::Tensor>& softmax_sink_,
     bool is_causal,
     int window_size_left,
     int window_size_right,
@@ -510,49 +519,33 @@ std::vector<at::Tensor> mha_fwd(
   TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
   TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
 
-  at::Tensor page_table;
-  const bool paged_KV = page_table_.has_value();
-  if (paged_KV) {
-    page_table = page_table_.value();
-    CHECK_DEVICE(page_table);
-    TORCH_CHECK(page_table.dtype() == torch::kInt32, "page_table must have dtype torch.int32");
-    TORCH_CHECK(page_table.stride(-1) == 1, "page_table must have contiguous last dimension");
-  }
-  at::Tensor cu_seqlens_q;
-  bool const is_varlen_q = q.dim() == 3;  // variable length if 3 dimensions
-  if (is_varlen_q) {
-    cu_seqlens_q = cu_seqlens_q_.value();
-    CHECK_DEVICE(cu_seqlens_q);
-    CHECK_CONTIGUOUS(cu_seqlens_q);
-    TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype torch.int32");
-    TORCH_CHECK(max_seqlen_q_.has_value(), "max_seqlen_q must be provided if cu_seqlens_q is provided");
-  }
-  at::Tensor cu_seqlens_k;
-  bool const is_varlen_k = cu_seqlens_k_.has_value();
-  if (is_varlen_k) {
-    cu_seqlens_k = cu_seqlens_k_.value();
-    CHECK_DEVICE(cu_seqlens_k);
-    CHECK_CONTIGUOUS(cu_seqlens_k);
-    TORCH_CHECK(max_seqlen_k_.has_value(), "max_seqlen_k must be provided if cu_seqlens_k is provided");
-    TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype torch.int32");
-  }
+  CHECK_DEVICE(page_table);
+  TORCH_CHECK(page_table.dtype() == torch::kInt32, "page_table must have dtype torch.int32");
+  TORCH_CHECK(page_table.stride(-1) == 1, "page_table must have contiguous last dimension");
+
+  TORCH_CHECK(q.dim() == 3, "query must be in ragged format");
+  CHECK_DEVICE(cu_seqlens_q);
+  CHECK_CONTIGUOUS(cu_seqlens_q);
+  TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype torch.int32");
+
+  CHECK_DEVICE(cu_seqlens_k);
+  CHECK_CONTIGUOUS(cu_seqlens_k);
+  TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype torch.int32");
 
   auto const sizes = q.sizes();
-  const int batch_size = !is_varlen_q ? sizes[0] : cu_seqlens_q.size(0) - 1;
-  int seqlen_q = !is_varlen_q ? sizes[1] : max_seqlen_q_.value();
-  int total_q = !is_varlen_q ? batch_size * sizes[1] : sizes[0];
+  const int batch_size = cu_seqlens_q.size(0) - 1;
+  int seqlen_q = max_seqlen_q;
+  int total_q = q.size(0);
   int num_heads = q.size(-2);
   int const head_size = q.size(-1);
   int const head_size_v = v.size(-1);
-  int const max_num_pages_per_seq = !paged_KV ? 0 : page_table.size(1);
-  int const num_pages = !paged_KV ? 0 : k.size(0);
-  int const page_size = !paged_KV ? 1 : k.size(1);
-  int const seqlen_k =
-      !is_varlen_k ? k.size(1) : (!paged_KV ? max_seqlen_k_.value() : max_num_pages_per_seq * page_size);
-  int const total_k =
-      !is_varlen_k ? batch_size * k.size(1) : (!paged_KV ? cu_seqlens_k[-1].item<int>() : num_pages * page_size);
+  int const max_num_pages_per_seq = page_table.size(1);
+  int const num_pages = k.size(0);
+  int const page_size = k.size(1);
+  int const seqlen_k = max_num_pages_per_seq * page_size;
+  int const total_k = num_pages * page_size;
   int const num_heads_k = k.size(-2);
-  int const batch_size_k = !paged_KV ? (!is_varlen_k ? k.size(0) : cu_seqlens_k.size(0) - 1) : page_table.size(0);
+  int const batch_size_k = page_table.size(0);
   float softmax_scale = softmax_scale_;
 
   if (!kv_batch_idx_.has_value()) {
@@ -568,37 +561,19 @@ std::vector<at::Tensor> mha_fwd(
 
   // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
   // TODO: check this
+
   if (window_size_left >= seqlen_k - 1) {
     window_size_left = -1;
   }
-  if (window_size_right >= seqlen_q - 1) {
-    window_size_right = -1;
-  }
+  window_size_right = min(window_size_right, seqlen_q);
   // causal=true is the same as causal=false in this case
   if (is_causal) {
     window_size_right = 0;
   }
 
-  if (!is_varlen_q) {
-    CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);
-  } else {
-    CHECK_SHAPE(q, total_q, num_heads, head_size);
-    CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
-  }
-  if (!paged_KV) {
-    if (!is_varlen_k) {
-      CHECK_SHAPE(k, batch_size_k, seqlen_k, num_heads_k, head_size);
-      CHECK_SHAPE(v, batch_size_k, seqlen_k, num_heads_k, head_size_v);
-    } else {
-      CHECK_SHAPE(k, total_k, num_heads_k, head_size);
-      CHECK_SHAPE(v, total_k, num_heads_k, head_size_v);
-      CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
-    }
-  } else {
-    CHECK_SHAPE(k, num_pages, page_size, num_heads_k, head_size);
-    CHECK_SHAPE(v, num_pages, page_size, num_heads_k, head_size_v);
-    CHECK_SHAPE(page_table, batch_size_k, max_num_pages_per_seq);
-  }
+  CHECK_SHAPE(k, num_pages, page_size, num_heads_k, head_size);
+  CHECK_SHAPE(v, num_pages, page_size, num_heads_k, head_size_v);
+  CHECK_SHAPE(page_table, batch_size_k, max_num_pages_per_seq);
 
   if (leftpad_k_.has_value()) {
     auto leftpad_k = leftpad_k_.value();
@@ -608,16 +583,13 @@ std::vector<at::Tensor> mha_fwd(
     CHECK_SHAPE(leftpad_k, batch_size);
   }
 
-  bool const is_varlen = is_varlen_q || is_varlen_k || leftpad_k_.has_value();
-
   static constexpr int alignment = 8;
   TORCH_CHECK(head_size % alignment == 0, "head_size should be a multiple of " + std::to_string(alignment));
   TORCH_CHECK(head_size_v % alignment == 0, "head_size_v should be a multiple of " + std::to_string(alignment));
 
   auto opts = q.options();
   at::Tensor out;
-  out = !is_varlen_q ? torch::empty({batch_size, seqlen_q, num_heads, head_size_v}, opts)
-                     : torch::empty({total_q, num_heads, head_size_v}, opts);
+  out = torch::empty({total_q, num_heads, head_size_v}, opts);
 
   auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
   int const head_size_rounded = round_up_headdim(head_size);
@@ -630,11 +602,7 @@ std::vector<at::Tensor> mha_fwd(
   c10::DeviceGuard device_guard(q.device());
 
   at::Tensor softmax_lse;
-  if (!is_varlen_q) {
-    softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
-  } else {
-    softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
-  }
+  softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
 
   // align with FA3
   Flash_fwd_params params;
@@ -656,17 +624,8 @@ std::vector<at::Tensor> mha_fwd(
   params.o_row_stride = out.stride(-3);
   params.o_head_stride = out.stride(-2);
 
-  if (!is_varlen_q) {
-    params.q_batch_stride = q.stride(0);
-    params.o_batch_stride = out.stride(0);
-  }
-  if (!is_varlen_k) {
-    params.k_batch_stride = k.stride(0);
-    params.v_batch_stride = v.stride(0);
-  }
-
-  params.cu_seqlens_q = !is_varlen_q ? nullptr : static_cast<int*>(cu_seqlens_q.data_ptr());
-  params.cu_seqlens_k = !is_varlen_k ? nullptr : static_cast<int*>(cu_seqlens_k.data_ptr());
+  params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
+  params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
 
   // Softmax sum
   params.softmax_lse_ptr = softmax_lse.data_ptr();
@@ -684,6 +643,9 @@ std::vector<at::Tensor> mha_fwd(
 
   // Set the different scale values.
   params.scale_softmax = softmax_scale;
+  bool use_sink = softmax_sink_.has_value();
+  params.sink_softmax = use_sink ? softmax_sink_.value().data_ptr() : nullptr;
+
   params.softcap = softcap;
 
   // Set this to probability of keeping an element to simplify things.
@@ -703,18 +665,15 @@ std::vector<at::Tensor> mha_fwd(
   }
   params.window_size_left = window_size_left;
   params.window_size_right = window_size_right;
-
   params.total_q = total_q;
   params.total_k = total_k;
   params.b_k = batch_size_k;
   params.dv = head_size_v;
-  if (paged_KV) {
-    params.page_table = page_table.data_ptr<int>();
-    params.page_table_batch_stride = page_table.stride(0);
-    params.max_num_pages_per_seq = max_num_pages_per_seq;
-    params.page_size = page_size;
-    params.num_pages = num_pages;
-  }
+  params.page_table = page_table.data_ptr<int>();
+  params.page_table_batch_stride = page_table.stride(0);
+  params.max_num_pages_per_seq = max_num_pages_per_seq;
+  params.page_size = page_size;
+  params.num_pages = num_pages;
 
   if (q_v_.has_value()) {
     TORCH_CHECK(head_size <= 64, "q_v is only supported for head_size <= 64");
@@ -726,18 +685,11 @@ std::vector<at::Tensor> mha_fwd(
     TORCH_CHECK(q_v.dtype() == q_type, "q_v must have the same dtype as query");
     CHECK_DEVICE(q_v);
     TORCH_CHECK(q_v.stride(-1) == 1, "q_v tensor must have contiguous last dimension");
-    if (!is_varlen_q) {
-      CHECK_SHAPE(q_v, batch_size, seqlen_q, num_heads, head_size_v);
-    } else {
-      CHECK_SHAPE(q_v, total_q, num_heads, head_size_v);
-    }
+    CHECK_SHAPE(q_v, total_q, num_heads, head_size_v);
     params.qv_ptr = q_v.data_ptr();
     // All stride are in elements, not bytes.
     params.qv_row_stride = q_v.stride(-3);
     params.qv_head_stride = q_v.stride(-2);
-    if (!is_varlen_q) {
-      params.qv_batch_stride = q_v.stride(0);
-    }
   }
 
   if (rotary_cos_.has_value()) {
@@ -748,9 +700,7 @@ std::vector<at::Tensor> mha_fwd(
     TORCH_CHECK(params.rotary_dim <= head_size, "rotary_dim must be <= headdim");
     TORCH_CHECK(params.rotary_dim % 16 == 0, "Only rotary dimensions divisible by 16 are currently supported");
     const int seqlen_ro = rotary_cos.size(0);
-    if (paged_KV) {
-      TORCH_CHECK(seqlen_ro >= seqlen_k, "cos/sin seqlen must be at least the seqlen of KV cache");
-    }
+    TORCH_CHECK(seqlen_ro >= seqlen_k, "cos/sin seqlen must be at least the seqlen of KV cache");
     CHECK_SHAPE(rotary_cos, seqlen_ro, params.rotary_dim / 2);
     TORCH_CHECK(rotary_cos.scalar_type() == q_type, "rotary_cos must have the same dtype as query");
 
@@ -787,89 +737,122 @@ std::vector<at::Tensor> mha_fwd(
   auto outaccum_type = at::ScalarType::Float;
 
   constexpr int PipelineStages = 2;
-  if (params.is_causal) {
-    switch (params.d) {
-      case 64:
-        FMHAConfig<
-            true,
-            cute::Shape<_128, _64, _64>,
-            cute::Shape<_128, _32, _64>,
-            cute::Shape<_128, _64, _64>,
-            cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
-        break;
-      case 96:
-        FMHAConfig<
-            true,
-            cute::Shape<_128, _64, _32>,
-            cute::Shape<_128, _32, _64>,
-            cute::Shape<_128, _96, _64>,
-            cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
-        break;
-      case 128:
-        FMHAConfig<
-            true,
-            cute::Shape<_128, _64, _64>,
-            cute::Shape<_128, _32, _64>,
-            cute::Shape<_128, _128, _64>,
-            cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
-        break;
-      case 192:
-        FMHAConfig<
-            true,
-            cute::Shape<_256, _64, _64>,
-            cute::Shape<_256, _32, _64>,
-            cute::Shape<_256, _192, _64>,
-            cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
-        break;
-      default:
-        TORCH_CHECK(false, "Unsupported head size for causal attention");
-    }
-  } else {
-    switch (params.d) {
-      case 64:
-        FMHAConfig<
-            false,
-            cute::Shape<_128, _64, _64>,
-            cute::Shape<_128, _32, _64>,
-            cute::Shape<_128, _64, _64>,
-            cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
-        break;
-      case 96:
-        FMHAConfig<
-            false,
-            cute::Shape<_128, _64, _32>,
-            cute::Shape<_128, _32, _64>,
-            cute::Shape<_128, _96, _64>,
-            cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
-        break;
-      case 128:
-        FMHAConfig<
-            false,
-            cute::Shape<_128, _64, _64>,
-            cute::Shape<_128, _32, _64>,
-            cute::Shape<_128, _128, _64>,
-            cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
-        break;
-      case 192:
-        FMHAConfig<
-            false,
-            cute::Shape<_256, _64, _64>,
-            cute::Shape<_256, _32, _64>,
-            cute::Shape<_256, _192, _64>,
-            cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
-            PipelineStages>::run(params);
-        break;
-      default:
-        TORCH_CHECK(false, "Unsupported head size for causal attention");
-    }
+  switch (params.d) {
+    case 64:
+      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+        if (params.is_causal) {
+          FMHAConfig<
+              cute::Shape<_128, _64, _64>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _64, _64>,
+              cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true,
+              false,
+              Sink>::run(params);
+        } else {
+          AT_DISPATCH_BOOL_NO_RETURN(
+              params.is_local,
+              LocalMask,
+              FMHAConfig<
+                  cute::Shape<_128, _64, _64>,
+                  cute::Shape<_128, _32, _64>,
+                  cute::Shape<_128, _64, _64>,
+                  cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+                  PipelineStages,
+                  false,
+                  LocalMask,
+                  Sink>::run(params))
+        }
+      })
+      break;
+    case 96:
+      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+        if (params.is_causal) {
+          FMHAConfig<
+              cute::Shape<_128, _64, _32>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _96, _64>,
+              cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true,
+              false,
+              Sink>::run(params);
+
+        } else {
+          AT_DISPATCH_BOOL_NO_RETURN(
+              params.is_local,
+              LocalMask,
+              FMHAConfig<
+                  cute::Shape<_128, _64, _32>,
+                  cute::Shape<_128, _32, _64>,
+                  cute::Shape<_128, _96, _64>,
+                  cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+                  PipelineStages,
+                  false,
+                  LocalMask,
+                  Sink>::run(params))
+        }
+      })
+      break;
+    case 128:
+      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+        if (params.is_causal) {
+          FMHAConfig<
+              cute::Shape<_128, _64, _64>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _128, _64>,
+              cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true,
+              false,
+              Sink>::run(params);
+        } else {
+          AT_DISPATCH_BOOL_NO_RETURN(
+              params.is_local,
+              LocalMask,
+              FMHAConfig<
+                  cute::Shape<_128, _64, _64>,
+                  cute::Shape<_128, _32, _64>,
+                  cute::Shape<_128, _128, _64>,
+                  cute::Layout<cute::Shape<_16, _1, _1>, cute::Stride<_1, _1, _1>>,
+                  PipelineStages,
+                  false,
+                  LocalMask,
+                  Sink>::run(params))
+        }
+      })
+      break;
+    case 192:
+      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+        if (params.is_causal) {
+          FMHAConfig<
+              cute::Shape<_256, _64, _64>,
+              cute::Shape<_256, _32, _64>,
+              cute::Shape<_256, _192, _64>,
+              cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true,
+              false,
+              Sink>::run(params);
+        } else {
+          AT_DISPATCH_BOOL_NO_RETURN(
+              params.is_local,
+              LocalMask,
+              FMHAConfig<
+                  cute::Shape<_256, _64, _64>,
+                  cute::Shape<_256, _32, _64>,
+                  cute::Shape<_256, _192, _64>,
+                  cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+                  PipelineStages,
+                  false,
+                  LocalMask,
+                  Sink>::run(params))
+        }
+      })
+      break;
+    default:
+      TORCH_CHECK(false, "Unsupported head size for causal attention");
   }
-  // return {out, softmax_lse};
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }

@@ -27,7 +27,7 @@ jobs:
           docker build \
             --build-arg SG_LANG_KERNEL_BRANCH=${{ github.head_ref }} \
             --build-arg SG_LANG_KERNEL_REPO=${{ github.event.pull_request.head.repo.clone_url }} \
-            --no-cache --progress=plain -f Dockerfile.xpu_kernel -t xpu_sglang:pvc .
+            --no-cache --progress=plain -f Dockerfile.xpu_kernel -t xpu_sglang:kernel .
 
       - name: Run container
         run: |
@@ -35,7 +35,7 @@ jobs:
             --device /dev/dri/ \
             --name ci_sglang_xpu \
             -e HF_TOKEN=$(cat ~/huggingface_token.txt) \
-            xpu_sglang:pvc
+            xpu_sglang:kernel
 
       - name: Install Dependency
         timeout-minutes: 20
@@ -65,3 +65,4 @@ jobs:
         if: always()
         run: |
           docker rm -f ci_sglang_xpu || true
+

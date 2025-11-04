@@ -61,6 +61,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       " Tensor problem_sizes2, Tensor input_permutation, Tensor output_permutation, int num_experts, int n, int k) -> "
       "()");
   m.impl("prepare_moe_input", torch::kXPU, &prepare_moe_input);
+  m.def("shuffle_rows(Tensor input, Tensor dst2src_map, Tensor output) -> ()");
+  m.impl("shuffle_rows", torch::kCUDA, &shuffle_rows);
 
   //   m.def(
   //       "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype,

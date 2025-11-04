@@ -235,11 +235,11 @@ struct ShuffleRows {
     int gid = item.get_global_linear_id();
     // Leave it to compiler for simd sub-group
     if (gid < num_src_rows_ * num_cols_) {
-      int64_t dest_token_idx = gid % num_cols;
+      int64_t dest_token_idx = gid % num_cols_;
       int64_t const source_token_idx = dst2src_map_[dest_token_idx];
 
-      auto const* source_row_ptr = reinterpret_cast<DataElem const*>(input + source_token_idx * num_cols);
-      auto* dest_row_ptr = reinterpret_cast<DataElem*>(output + dest_token_idx * num_cols);
+      auto const* source_row_ptr = reinterpret_cast<DataElem const*>(input_ + source_token_idx * num_cols);
+      auto* dest_row_ptr = reinterpret_cast<DataElem*>(output_ + dest_token_idx * num_cols);
       *dest_row_ptr = *source_row_ptr
     }
   }

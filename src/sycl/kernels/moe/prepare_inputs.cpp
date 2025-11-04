@@ -214,3 +214,78 @@ void prepare_moe_input(
 
   return;
 }
+
+template <typename T>
+struct ShuffleRows {
+  ShuffleRows(
+      const T* input,
+      const int32_t* dst2src_map,
+      T* output,
+      int64_t num_src_rows,
+      int64_t num_dest_rows,
+      int64_t num_cols)
+      : input_(input),
+        dst2src_map_(dst2src_map),
+        output_(output),
+        num_src_rows_(num_src_rows),
+        num_dest_rows_(num_dest_rows),
+        num_cols_(num_cols) {}
+
+  void operator()(sycl::nd_item<1> item) const {
+    int gid = item.get_global_linear_id();
+    // Leave it to compiler for simd sub-group
+    if (gid < num_src_rows_ * num_cols_) {
+      int64_t dest_token_idx = gid % num_cols;
+      int64_t const source_token_idx = dst2src_map_[dest_token_idx];
+
+      auto const* source_row_ptr = reinterpret_cast<DataElem const*>(input + source_token_idx * num_cols);
+      auto* dest_row_ptr = reinterpret_cast<DataElem*>(output + dest_token_idx * num_cols);
+      *dest_row_ptr = *source_row_ptr
+    }
+  }
+  const T* input_;
+  const int32_t* dst2src_map_;
+  T* output_;
+  int64_t num_src_rows_;
+  int64_t num_dest_rows_;
+  int64_t num_cols_;
+};
+
+template <typename T>
+void shuffle_rows_caller(
+      const T* input,
+      const int32_t* dst2src_map,
+      T* output,
+      int64_t num_src_rows,
+      int64_t num_dest_rows,
+      int64_t num_cols) {
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
+
+  using Kernel = ShuffleRows<T>;
+  sycl::range<1> global_range{ num_dst_rows * num_cols };
+  sycl::range<1> local_range{ num_cols }; 
+
+  Kernel task(input, dst2src_map, output, num_src_rows, num_dest_rows, num_cols);
+
+  sycl_kernel_submit(global_range, local_range, queue, task);
+  return;
+
+}
+
+void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor) {
+  TORCH_CHECK(
+      input_tensor.scalar_type() == output_tensor.scalar_type(),
+      "Input and output tensors must have the same data type");
+    SYCL_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::BFloat16, at::ScalarType::Half, query.scalar_type(), "shuffle_rows_kernel_impl", [&]() {
+        shuffle_rows_caller<scalar_t>(
+            reinterpret_cast<int64_t*>(input_tensor.data_ptr()),
+            reinterpret_cast<int64_t*>(output_tensor.data_ptr()),
+            reinterpret_cast<int64_t*>(dst2src_map.data_ptr()),
+            input_tensor.size(0),
+            output_tensor.size(0),
+            kinput_tensor.size(1));
+      });
+  return;
+}

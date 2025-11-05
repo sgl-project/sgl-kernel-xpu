@@ -142,7 +142,6 @@ if __name__ == "__main__":
         "renormalize": [False],
     }
 
-    print("sweep_params", sweep_params)
     keys = sweep_params.keys()
     configs = list(itertools.product(*sweep_params.values()))
     print(f"Testing {len(configs)} configurations...")

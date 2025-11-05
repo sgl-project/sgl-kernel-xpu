@@ -16,6 +16,7 @@ suites = {
     "per-commit": [
         TestFile("test_awq_dequant.py"),
         TestFile("test_topk_softmax.py"),
+        TestFile("test_flash_attention.py"),
     ],
 }
 
@@ -119,3 +120,4 @@ if __name__ == "__main__":
     exit_code = run_unittest_files(files, args.timeout_per_file)
 
     exit(exit_code)
+

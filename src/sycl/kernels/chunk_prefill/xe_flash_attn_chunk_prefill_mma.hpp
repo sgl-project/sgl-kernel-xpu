@@ -195,7 +195,7 @@ struct FlashChunkPrefillMma<
   using XE_Copy_V = decltype(make_tiled_copy(atom_load_V{}, Layout<CopyThreadShape>{}, val_layout_load_V{}));
 
   template <typename T>
-  static constexpr bool is_fp8_v = cute::is_same_v<T,float_e4m3_t> || cute::is_same_v<T,float_e5m2_t>;
+  static constexpr bool is_fp8_v = cute::is_same_v<T, float_e4m3_t> || cute::is_same_v<T, float_e5m2_t>;
 
   // Host side kernel arguments
   struct Arguments {
@@ -205,9 +205,9 @@ struct FlashChunkPrefillMma<
     StrideK dK_cache;
     ElementV const* ptr_V_cache;
     StrideV dV_cache;
-    float const *ptr_q_scale;
-    float const *ptr_k_scale;
-    float const *ptr_v_scale;
+    float const* ptr_q_scale;
+    float const* ptr_k_scale;
+    float const* ptr_v_scale;
     // Paged KV Cache
     int const* ptr_page_table;
     int page_size;
@@ -220,9 +220,9 @@ struct FlashChunkPrefillMma<
     XE_Copy_Q gmem_tiled_copy_q;
     XE_Copy_K gmem_tiled_copy_k_cache;
     XE_Copy_V gmem_tiled_copy_v_cache;
-    float const *ptr_q_scale;
-    float const *ptr_k_scale;
-    float const *ptr_v_scale;
+    float const* ptr_q_scale;
+    float const* ptr_k_scale;
+    float const* ptr_v_scale;
     int const* ptr_page_table;
     int page_size;
     int max_num_pages_per_seq;
@@ -260,7 +260,7 @@ struct FlashChunkPrefillMma<
         copyQ,
         copyK_cache,
         copyV_cache,
-	args.ptr_q_scale,
+        args.ptr_q_scale,
         args.ptr_k_scale,
         args.ptr_v_scale,
         args.ptr_page_table,
@@ -279,7 +279,9 @@ struct FlashChunkPrefillMma<
       TensorK gK,
       FragSrc const& frag_src,
       int const& k_tile_count,
-      Params const& params, float q_scale, float k_scale) {
+      Params const& params,
+      float q_scale,
+      float k_scale) {
     auto& gmem_tiled_copy_k = params.gmem_tiled_copy_k_cache;
 
     int thread_idx = static_cast<int>(ThreadIdxX());
@@ -300,8 +302,8 @@ struct FlashChunkPrefillMma<
     // Create fragments
     using TCrQ_Type = cute::conditional_t<is_fp8_v<ElementQ>, uint8_t, ElementQ>;
     using TCrK_Type = cute::conditional_t<is_fp8_v<ElementK>, uint8_t, ElementK>;
-    Tensor tCrQ = make_tensor<TCrQ_Type>(make_fragment_layout(params.gmem_tiled_copy_q, take<0,3>(tCgQ.shape())));
-    Tensor tCrK = make_tensor<TCrK_Type>(make_fragment_layout(gmem_tiled_copy_k, take<0,3>(tCgK.shape())));
+    Tensor tCrQ = make_tensor<TCrQ_Type>(make_fragment_layout(params.gmem_tiled_copy_q, take<0, 3>(tCgQ.shape())));
+    Tensor tCrK = make_tensor<TCrK_Type>(make_fragment_layout(gmem_tiled_copy_k, take<0, 3>(tCgK.shape())));
 
     // Retile registers for copies
     Tensor tQrQ = thr_copy_Q.retile_D(tCrQ);
@@ -320,8 +322,8 @@ struct FlashChunkPrefillMma<
       copy(gmem_tiled_copy_k, tKgK(_, _, _, k_tile), tKrK);
       // FP8 path: Convert FP8 fragments to BF16
       if constexpr (is_fp8_v<ElementQ> || is_fp8_v<ElementK>) {
-	auto tCrQ_bf16 = make_fragment_like<bfloat16_t>(tCrQ);
-	auto tCrK_bf16 = make_fragment_like<bfloat16_t>(tCrK);
+        auto tCrQ_bf16 = make_fragment_like<bfloat16_t>(tCrQ);
+        auto tCrK_bf16 = make_fragment_like<bfloat16_t>(tCrK);
 
         if constexpr (is_fp8_v<ElementQ>) {
           convert_and_descale<ElementQ>(tCrQ, tCrQ_bf16, q_scale);
@@ -398,7 +400,7 @@ struct FlashChunkPrefillMma<
     auto thread_mma = tiled_mma.get_slice(first_thread_in_sg_idx);
     Tensor tCgV = thread_mma.partition_B(gV_);
     using TCrV_Type = cute::conditional_t<is_fp8_v<ElementV>, uint8_t, ElementV>;
-    Tensor tCrV = make_tensor<TCrV_Type>(make_fragment_layout(gmem_tiled_copy_v, take<0,3>(tCgV.shape())));
+    Tensor tCrV = make_tensor<TCrV_Type>(make_fragment_layout(gmem_tiled_copy_v, take<0, 3>(tCgV.shape())));
 
     // Partition the copying of A and B tiles across the threads
     auto gmem_thr_copy_V = gmem_tiled_copy_v.get_slice(thread_idx);
@@ -434,12 +436,12 @@ struct FlashChunkPrefillMma<
     for (int i = 0; i < tile_count; i++) {
       copy(gmem_tiled_copy_v, tVgV(_, _, _, i), tVrV);
       if constexpr (is_fp8_v<ElementV>) {
-	auto tCrV_fp16 = make_fragment_like<bfloat16_t>(tCrV);
+        auto tCrV_fp16 = make_fragment_like<bfloat16_t>(tCrV);
         convert_and_descale<ElementV>(tCrV, tCrV_fp16, v_scale);
 
-        cute::gemm(tiled_mma, accum(_,_,_,i), tPr, tCrV_fp16, frag_src(_,_,_,i));
+        cute::gemm(tiled_mma, accum(_, _, _, i), tPr, tCrV_fp16, frag_src(_, _, _, i));
       } else {
-        cute::gemm(tiled_mma, accum(_,_,_,i), tPr, tCrV, frag_src(_,_,_,i));
+        cute::gemm(tiled_mma, accum(_, _, _, i), tPr, tCrV, frag_src(_, _, _, i));
       }
     }
   }
@@ -502,7 +504,7 @@ struct FlashChunkPrefillMma<
         copyQ,
         copyK_cache,
         copyV_cache,
-	params.ptr_q_scale,
+        params.ptr_q_scale,
         params.ptr_k_scale,
         params.ptr_v_scale,
         params.ptr_page_table,

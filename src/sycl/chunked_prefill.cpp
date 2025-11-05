@@ -359,7 +359,7 @@ struct KernelRunner {
          stride_K_cache,
          static_cast<const ElementV*>(params.v_ptr),
          stride_V_cache,
-	 params.q_scale_ptr,
+         params.q_scale_ptr,
          params.k_scale_ptr,
          params.v_scale_ptr,
          params.page_table,
@@ -629,11 +629,11 @@ std::vector<at::Tensor> mha_fwd(
   at::Tensor out;
   // out = torch::empty({total_q, num_heads, head_size_v}, opts);
   if (q.dtype() == at::ScalarType::Float8_e4m3fn || q.dtype() == at::ScalarType::Float8_e5m2) {
-  // Internal math & epilogue producing BF16
-  out = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(torch::kBFloat16));
-} else {
-  out = torch::empty({total_q, num_heads, head_size_v}, opts);
-}
+    // Internal math & epilogue producing BF16
+    out = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(torch::kBFloat16));
+  } else {
+    out = torch::empty({total_q, num_heads, head_size_v}, opts);
+  }
 
   auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
   int const head_size_rounded = round_up_headdim(head_size);
@@ -809,7 +809,10 @@ std::vector<at::Tensor> mha_fwd(
                 XE_2D_U8x16x16_LD_T,
                 XE_2D_U8x32x32_LD_V,
                 float,
-                float, bfloat16_t, bfloat16_t, XE_2D_U16x8x16_ST_N>::run(params);
+                float,
+                bfloat16_t,
+                bfloat16_t,
+                XE_2D_U16x8x16_ST_N>::run(params);
           } else {
             AT_DISPATCH_BOOL_NO_RETURN(
                 params.is_local,
@@ -830,7 +833,10 @@ std::vector<at::Tensor> mha_fwd(
                     XE_2D_U8x16x16_LD_T,
                     XE_2D_U8x32x32_LD_V,
                     float,
-                    float, bfloat16_t, bfloat16_t, XE_2D_U16x8x16_ST_N>::run(params))
+                    float,
+                    bfloat16_t,
+                    bfloat16_t,
+                    XE_2D_U16x8x16_ST_N>::run(params))
           }
         })
         break;
@@ -853,7 +859,10 @@ std::vector<at::Tensor> mha_fwd(
                 XE_2D_U8x16x16_LD_T,
                 XE_2D_U8x32x32_LD_V,
                 float,
-                float, bfloat16_t, bfloat16_t, XE_2D_U16x8x16_ST_N>::run(params);
+                float,
+                bfloat16_t,
+                bfloat16_t,
+                XE_2D_U16x8x16_ST_N>::run(params);
           } else {
             AT_DISPATCH_BOOL_NO_RETURN(
                 params.is_local,
@@ -874,13 +883,17 @@ std::vector<at::Tensor> mha_fwd(
                     XE_2D_U8x16x16_LD_T,
                     XE_2D_U8x32x32_LD_V,
                     float,
-                    float, bfloat16_t, bfloat16_t, XE_2D_U16x8x16_ST_N>::run(params))
+                    float,
+                    bfloat16_t,
+                    bfloat16_t,
+                    XE_2D_U16x8x16_ST_N>::run(params))
           }
         })
         break;
-      default: TORCH_CHECK(false, "Unsupported head size for FP8");
+      default:
+        TORCH_CHECK(false, "Unsupported head size for FP8");
     }
-  } else { // BF16
+  } else {  // BF16
     switch (params.d) {
       case 64:
         AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {

@@ -11,8 +11,7 @@ concurrency:
 
 jobs:
   build-and-test:
-    if: (github.repository == 'sgl-project/sgl-kernel-xpu' || github.event_name == 'pull_request') &&
-      github.event.pull_request.draft == false
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: sglang-pvc
     steps:
       - name: Checkout code
@@ -28,7 +27,7 @@ jobs:
           docker build \
             --build-arg SG_LANG_KERNEL_BRANCH=${{ github.head_ref }} \
             --build-arg SG_LANG_KERNEL_REPO=${{ github.event.pull_request.head.repo.clone_url }} \
-            --no-cache --progress=plain -f Dockerfile.xpu_kernel -t xpu_sglang:pvc .
+            --no-cache --progress=plain -f Dockerfile.xpu_kernel -t xpu_sglang:kernel .
 
       - name: Run container
         run: |
@@ -36,7 +35,7 @@ jobs:
             --device /dev/dri/ \
             --name ci_sglang_xpu \
             -e HF_TOKEN=$(cat ~/huggingface_token.txt) \
-            xpu_sglang:pvc
+            xpu_sglang:kernel
 
       - name: Install Dependency
         timeout-minutes: 20
@@ -50,7 +49,13 @@ jobs:
         timeout-minutes: 20
         run: |
           docker exec -w /root/sglang ci_sglang_xpu \
-            /bin/bash -c "cd /root/sglang/sgl-kernel-xpu/tests &&  python3 -m pytest -v -s test_awq_dequant.py test_topk_softmax.py"
+            /bin/bash -c "cd /root/sglang/sgl-kernel-xpu/tests &&  python3 run_suite.py --suite per-commit "
+
+      - name: Run Sglang Kernel Benchmarks
+        timeout-minutes: 20
+        run: |
+          docker exec -w /root/sglang ci_sglang_xpu \
+            /bin/bash -c "cd /root/sglang/sgl-kernel-xpu/benchmark &&  python3 bench_flash_attn.py "
 
       - name: Run E2E Bfloat16 tests
         timeout-minutes: 20
@@ -66,18 +71,3 @@ jobs:
         if: always()
         run: |
           docker rm -f ci_sglang_xpu || true
-
-  finish:
-    if: always()
-    needs: [build-and-test]
-    runs-on: sglang-pvc
-    steps:
-      - name: Check job status
-        run: |
-          if [ "${{ needs.build-and-test.result }}" != "success" ]; then
-            echo "Job failed with result: ${{ needs.build-and-test.result }}"
-            echo "BUILD_LOG=$(cat build.log)" >> $GITHUB_ENV
-            exit 1
-          fi
-          echo "All jobs completed successfully"
-          exit 0

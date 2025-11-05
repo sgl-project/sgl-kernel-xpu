@@ -3,11 +3,6 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-try:
-    from sgl_kernel import flash_ops
-except:
-    raise ImportError("Can not import sgl_kernel. Please check your installation.")
-
 
 def is_fa3_supported(device=None) -> bool:
     #  There some fa3 FYI
@@ -18,10 +13,15 @@ def is_fa3_supported(device=None) -> bool:
     #  https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x
     #  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a.
     #  That means if you use A100/A*0/L20/L40/L40s/4090 you can use fa3.
-    return (
-        torch.cuda.get_device_capability(device)[0] == 9
-        or torch.cuda.get_device_capability(device)[0] == 8
-    ) and (torch.version.cuda >= "12.3")
+    if torch.cuda.is_available():
+        return (
+            torch.cuda.get_device_capability(device)[0] == 9
+            or torch.cuda.get_device_capability(device)[0] == 8
+        ) and (torch.version.cuda >= "12.3")
+    elif torch.xpu.is_available():
+        return torch.xpu.get_device_properties().has_fp64
+    else:
+        return False
 
 
 def maybe_contiguous(x):
@@ -49,6 +49,7 @@ def flash_attn_with_kvcache(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     softmax_scale=None,
+    sinks=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0,  # 0.0 means deactivated
@@ -171,21 +172,29 @@ def flash_attn_with_kvcache(
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
     rotary_seqlens = maybe_contiguous(rotary_seqlens)
 
+    if cu_seqlens_q == None:  # !is_varlen_q
+        cu_seqlens_q = torch.arange(
+            0, q.size(0) + 1, dtype=torch.int, device=q.device
+        ) * q.size(1)
+        max_seqlen_q = q.size(1)
+        q = q.view(-1, q.size(-2), q.size(-1)).contiguous()
+    if cache_seqlens is not None:
+        assert cache_seqlens.size(0) + 1 == cu_seqlens_q.size(0)
+        cu_seqlens_k = torch.concat(
+            (
+                torch.zeros(1, dtype=torch.int32, device=cache_seqlens.device),
+                torch.cumsum(cache_seqlens, 0),
+            )
+        ).to(torch.int32)
+
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
         q,
         k_cache,
         v_cache,
-        k,
-        v,
         qv,
-        None,  # out
         cu_seqlens_q,
-        None,  # cu_seqlens_k
-        cu_seqlens_k_new,
-        None,  # seqused_q
-        cache_seqlens,
+        cu_seqlens_k,
         max_seqlen_q,
-        None,  # max_seqlen_k
         page_table,
         cache_batch_idx,
         cache_leftpad,
@@ -196,6 +205,7 @@ def flash_attn_with_kvcache(
         k_descale,
         v_descale,
         softmax_scale,
+        sinks,
         causal,
         window_size[0],
         window_size[1],
@@ -235,13 +245,26 @@ def flash_attn_varlen_func(
 ):
     if not is_fa3_supported():
         raise NotImplementedError(
-            "flash_attn at sgl-kernel is only supported on sm90 and above"
+            "flash_attn at sgl-kernel-xpu is only supported on BMG and later"
         )
 
     if softmax_scale is None:
         softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
             -0.5
         )
+    if cu_seqlens_q == None:  # !is_varlen_q
+        cu_seqlens_q = torch.arange(
+            0, q.size(0) + 1, dtype=torch.int, device=q.device
+        ) * q.size(1)
+        max_seqlen_q = q.size(1)
+        q = q.view(-1, q.size(-2), q.size(-1)).contiguous()
+    batch_size = cu_seqlens_q.numel() - 1
+    page_table = (
+        torch.arange(0, batch_size, device=q.device)
+        .to(torch.int32)
+        .reshape([batch_size, 1])
+        .contiguous()
+    )
 
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
         q,
@@ -250,15 +273,13 @@ def flash_attn_varlen_func(
         None,  # k_new
         None,  # v_new
         qv,  # qv
-        None,  # out
         cu_seqlens_q,
         cu_seqlens_k,
         None,  # cu_seqlens_k_new
-        seqused_q,
-        seqused_k,
         max_seqlen_q,
         max_seqlen_k,
-        None,  # page_table,
+        page_table,  # page_table,
+        page_table,  # num_pages_per_seq
         None,  # kv_batch_idx
         None,  # leftpad_k
         None,  # rotary cos

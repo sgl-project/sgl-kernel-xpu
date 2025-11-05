@@ -3,7 +3,7 @@ import itertools
 import torch
 import triton
 from sgl_kernel import topk_softmax
-from utils import HAS_VLLM, parse_args
+from utils import get_model_config, parse_args
 
 
 def vllm_topk_softmax(gating_output, topk):
@@ -24,7 +24,11 @@ def vllm_topk_softmax(gating_output, topk):
     return topk_weights, topk_indices
 
 
-def navtive_topk_softmax(gating_output, topk):
+def navtive_topk_softmax(
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+):
     num_tokens, num_experts = gating_output.shape
 
     import torch.nn.functional as F
@@ -37,10 +41,18 @@ def navtive_topk_softmax(gating_output, topk):
     )
     topk_weights = F.softmax(gating_output.float(), dim=-1)
     topk_weights, topk_indices = torch.topk(topk_weights, topk, dim=-1)
+
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
     return topk_weights, topk_indices
 
 
-def sglang_topk_softmax(gating_output, topk):
+def sglang_topk_softmax(
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+):
     num_tokens, num_experts = gating_output.shape
 
     topk_weights = torch.empty(
@@ -57,7 +69,7 @@ def sglang_topk_softmax(gating_output, topk):
         topk_weights,
         topk_indices,
         gating_output,
-        renormalize=False,
+        renormalize=renormalize,
     )
 
     return topk_weights, topk_indices
@@ -87,7 +99,7 @@ def calculate_diff(num_tokens, num_experts, topk):
 def get_benchmark(device="xpu"):
     @triton.testing.perf_report(
         triton.testing.Benchmark(
-            x_names=["num_tokens", "num_experts", "topk", "dtype"],
+            x_names=["num_tokens", "num_experts", "topk", "dtype", "renormalize"],
             x_vals=configs,
             line_arg="provider",
             line_vals=["sglang", "native"],
@@ -98,18 +110,16 @@ def get_benchmark(device="xpu"):
             args={},
         )
     )
-    def benchmark(num_tokens, num_experts, topk, dtype, provider):
+    def benchmark(num_tokens, num_experts, topk, dtype, renormalize, provider):
 
         gating_output = torch.randn(
             (num_tokens, num_experts), device=device, dtype=dtype
         )
 
-        if HAS_VLLM and (provider == "vllm" or provider == "vllm1"):
-            fn = lambda: vllm_topk_softmax(gating_output, topk)
-        elif provider == "sglang" or provider == "sglang1":
-            fn = lambda: sglang_topk_softmax(gating_output, topk)
+        if provider == "sglang" or provider == "sglang1":
+            fn = lambda: sglang_topk_softmax(gating_output, topk, renormalize)
         elif provider == "native":
-            fn = lambda: navtive_topk_softmax(gating_output, topk)
+            fn = lambda: navtive_topk_softmax(gating_output, topk, renormalize)
 
         quantiles = [0.5, 0.2, 0.8]
         ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
@@ -122,19 +132,24 @@ def get_benchmark(device="xpu"):
 if __name__ == "__main__":
     # Run correctness test on small configs if not using a real model
     args = parse_args()
+    params = get_model_config(args)
+
     sweep_params = {
-        "num_tokens": [1, 32, 128, 512],
-        "num_experts": args.num_experts or [64],
-        "top_k": args.top_k or [2, 4],
-        "dtype": [torch.float16, torch.bfloat16],
+        "num_tokens": args.num_tokens,
+        "num_experts": params["num_experts"] or [64],
+        "top_k": params["top_k"] or [2, 4],
+        "dtype": [torch.bfloat16],
+        "renormalize": [False],
     }
+
+    print("sweep_params", sweep_params)
     keys = sweep_params.keys()
     configs = list(itertools.product(*sweep_params.values()))
     print(f"Testing {len(configs)} configurations...")
     for config in configs:
-        num_tokens, num_experts, topk, dtype = config
+        num_tokens, num_experts, topk, dtype, renormalize = config
         print(
-            f"Config: num_tokens={num_tokens}, num_experts={num_experts}, topk={topk}, dtype={dtype}"
+            f"Config: num_tokens={num_tokens}, num_experts={num_experts}, topk={topk}, dtype={dtype}, renormalize={renormalize}"
         )
 
         # calculate_diff(num_tokens, num_experts, topk)

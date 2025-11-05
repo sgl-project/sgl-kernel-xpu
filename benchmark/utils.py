@@ -54,7 +54,7 @@ def get_model_config(args):
                 or (
                     getattr(hf_config, "hidden_size", None)
                     // getattr(hf_config, "num_attention_heads", 1)
-                    if getattr(hf_config, "hidden_size")
+                    if getattr(hf_config, "hidden_size", None)
                     and getattr(hf_config, "num_attention_heads")
                     else None
                 ),
@@ -64,7 +64,7 @@ def get_model_config(args):
                 "norm_eps": getattr(hf_config, "rms_norm_eps", None)
                 or getattr(hf_config, "layer_norm_eps", 1e-6),
                 "architectures": getattr(hf_config, "architectures", ["Unknown"]),
-                "dtype": getattr(hf_config, "torch_dtype", "float16"),
+                "dtype": str(getattr(hf_config, "torch_dtype", "float16")),
             }
         )
     else:
@@ -121,7 +121,12 @@ def get_model_config(args):
     # Add model name
     config_dict["model_name"] = args.model_name
 
-    return config_dict
+    sweepable_config = {
+        k: [v] if isinstance(v, (int, float, str)) else v
+        for k, v in config_dict.items()
+    }
+
+    return sweepable_config
 
 
 def parse_args():
@@ -152,6 +157,14 @@ def parse_args():
         default=None,
         nargs="*",
         help="Top-k experts per token (multiple values allowed)",
+    )
+
+    parser.add_argument(
+        "--num-tokens",
+        type=int,
+        default=[100],
+        nargs="*",
+        help="Number of tokens (multiple values)",
     )
 
     # Transformer parameters (support list)
@@ -218,7 +231,7 @@ def parse_args():
     parser.add_argument(
         "--dtype",
         type=str,
-        default="torch.float32",
+        default="torch.bfloat16",
         choices=["torch.float32", "torch.float16", "torch.bfloat16"],
         help="Data type",
     )

@@ -120,4 +120,3 @@ if __name__ == "__main__":
     exit_code = run_unittest_files(files, args.timeout_per_file)
 
     exit(exit_code)
-

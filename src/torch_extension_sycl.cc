@@ -61,6 +61,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   //       -> Tensor");
   //   m.impl("fp8_blockwise_scaled_mm", torch::kXPU, &fp8_blockwise_scaled_mm);
 
+  m.def(
+      "fp8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? bias) "
+      "-> Tensor");
+  m.impl("fp8_scaled_mm", torch::kXPU, &fp8_scaled_mm);
+
   /*
    * From cutlass attention
    */

@@ -38,11 +38,16 @@ set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable headers only mode in cutla
 FetchContent_Declare(
     repo-cutlass-sycl
     GIT_REPOSITORY https://github.com/intel/sycl-tla.git
-    GIT_TAG        8cdf47660e5c64c0f2191b11525a87bc76d71d9a
+    GIT_TAG        d2292f0071125c32f92e8963f8dfba8ec3e491f7
     GIT_SHALLOW    OFF
 )
-FetchContent_MakeAvailable(repo-cutlass-sycl)
 
+set(FETCHCONTENT_MAKEAVAILABLE_SERIAL FALSE)
+FetchContent_MakeAvailable(repo-cutlass-sycl)
+file(COPY ${repo-cutlass-sycl_SOURCE_DIR}/cmake/onemkl.cmake
+     DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
+set(FETCHCONTENT_MAKEAVAILABLE_SERIAL TRUE)
+FetchContent_MakeAvailable(repo-cutlass-sycl)
 
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include

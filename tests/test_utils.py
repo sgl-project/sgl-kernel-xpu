@@ -1,29 +1,40 @@
 """Common utilities for testing and benchmarking"""
 
-import argparse
-import asyncio
-import copy
-import json
-import logging
 import os
-import random
-import re
 import subprocess
 import threading
 import time
-import unittest
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from functools import partial
-from pathlib import Path
-from types import SimpleNamespace
-from typing import Awaitable, Callable, List, Optional, Tuple
+from typing import Callable, List, Optional
 
-import aiohttp
-import numpy as np
-import requests
-import torch
-import torch.nn.functional as F
+
+class TestFile:
+    name: str
+    estimated_time: float = 60
+
+
+def run_with_timeout(
+    func: Callable,
+    args: tuple = (),
+    kwargs: Optional[dict] = None,
+    timeout: float = None,
+):
+    """Run a function with timeout."""
+    ret_value = []
+
+    def _target_func():
+        ret_value.append(func(*args, **(kwargs or {})))
+
+    t = threading.Thread(target=_target_func)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        raise TimeoutError()
+
+    if not ret_value:
+        raise RuntimeError()
+
+    return ret_value[0]
+
 
 def run_unittest_files(files: List[TestFile], timeout_per_file: float):
     tic = time.perf_counter()

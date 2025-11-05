@@ -62,4 +62,3 @@ RUN --mount=type=secret,id=github_token \
 # Set the default shell to bash
 SHELL ["bash", "-c"]
 CMD ["bash", "-c", "source /root/.bashrc && exec bash"]
-

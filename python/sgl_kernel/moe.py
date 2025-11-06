@@ -256,26 +256,6 @@ def cutlass_fp4_group_mm(
     return c.to(dtype=out_dtype)
 
 
-def moe_grouped_mm_nn(activations, weights, total_rows_for_experts, n_experts):
-    """
-    BF16/FP16 grouped GEMM for MoE with non-transposed weights.
-    activations: (total_tokens, hidden_dim)
-    weights: (total_expert_rows, hidden_dim, output_dim)
-    total_rows_for_experts: (n_experts + 1,) prefix sum of rows for each expert
-    n_experts: number of experts
-    returns: (total_tokens, output_dim)
-    """
-    output = torch.empty(
-        (activations.size(0), weights.size(2)),
-        device=activations.device,
-        dtype=activations.dtype,
-    )
-    torch.ops.sgl_kernel.moe_grouped_mm_nn(
-        output, activations, weights, total_rows_for_experts, n_experts
-    )
-    return output
-
-
 def fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -351,34 +331,37 @@ def fused_experts(
     # Shape check
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
     assert (
-        hidden_states.shape[-1] == w1.shape[-2]
+        hidden_states.shape[-1] == w1.shape[-1]
     ), f"hidden_states shape[-1] {hidden_states.shape} must be equal to w1 shape[-2] {w1.shape}"
     assert (
-        2 * w2.shape[1] == w1.shape[2]
-    ), f"w2 shape[1] {w2.shape[1]} must be half of w1 shape[2] {w1.shape[2]}"
+        2 * w2.shape[2] == w1.shape[1]
+    ), f"w2 shape[2] {w2.shape[2]} must be half of w1 shape[1] {w1.shape[1]}"
     assert (topk_ids.shape == topk_weights.shape) and (
         topk_ids.shape[0] == hidden_states.shape[0]
     ), f"topk_ids shape {topk_ids.shape} and topk_weights shape {topk_weights.shape} must be equal and match hidden_states shape[0] {hidden_states.shape[0]}"
 
     num_tokens, _ = hidden_states.shape
-    E, K, _ = w1.shape
-    N, OutK = w2.shape[1]
+
+    E, _, K = w1.shape
+    E, OutK, N = w2.shape
+    assert N * 2 == w1.shape[1], "w1 shape[1] must be 2x of w2 shape[2]"
 
     M = num_tokens
     TopK = topk_ids.shape[1]
 
+    # import pdb; pdb.set_trace()
     cache = torch.empty(
         M * TopK * max(2 * N, OutK),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    intermediate_cache1 = cache[:, M * TopK * 2 * N].view((M, TopK, 2 * N))
+    intermediate_cache1 = cache[: M * TopK * 2 * N].view((M * TopK, 2 * N))
     intermediate_cache2 = torch.empty(
-        (M * TopK, N // 2),
+        (M * TopK, N),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    intermediate_cache3 = cache[:, M * TopK * OutK].view((M, TopK, OutK))
+    intermediate_cache3 = cache[: M * TopK * OutK].view((M * TopK, OutK))
 
     if no_combine:
         assert not inplace
@@ -390,10 +373,11 @@ def fused_experts(
     elif inplace:
         out_hidden_states = hidden_states
     else:
-        out_hidden_states = torch.empty_like(hidden_states)
+        out_hidden_states = torch.zeros_like(hidden_states)
 
-    idxs = topk_ids.argsort()
-    counts = topk_ids.to(torch.long).bincount().cpu().numpy()
+    # import pdb; pdb.set_trace()
+    idxs = topk_ids.flatten().argsort()
+    counts = topk_ids.flatten().to(torch.long).bincount(minlength=E).cpu().numpy()
     tokens_per_expert = counts.cumsum()
     num_per_tok = TopK
     token_idxs = idxs // num_per_tok
@@ -409,25 +393,18 @@ def fused_experts(
         exp_token_idxs = token_idxs[start_idx:end_idx]
         # expert_tokens = hidden_states[exp_token_idxs]
         # grouped_input_A.append(expert_tokens)
-        input_A[start_idx:end_idx, :].copy_(hidden_states[exp_token_idxs])
-    offset = torch.tensor(offset, device="cpu", dtype=torch.int32)
+        input_A[start_idx:end_idx, :].copy_(hidden_states[exp_token_idxs].squeeze(1))
+    offset = torch.tensor(offset, device="xpu", dtype=torch.int32)
 
-    torch.ops.sglang.moe_grouped_mm_nn(
-        intermediate_cache1,
-        input_A,
-        w1,
-        offset,
-    )
+    # import pdb; pdb.set_trace()
+    torch.ops.sgl_kernel.moe_grouped_mm_nt(intermediate_cache1, input_A, w1, offset, E)
 
     gate, up_ = torch.split(intermediate_cache1, N, dim=1)
     act = torch.nn.SiLU()
     intermediate_cache2 = act(gate) * up_
 
-    torch.ops.sglang.moe_grouped_mm_nn(
-        intermediate_cache3,
-        intermediate_cache2.contiguous(),
-        w2,
-        offset,
+    torch.ops.sgl_kernel.moe_grouped_mm_nt(
+        intermediate_cache3, intermediate_cache2.contiguous(), w2, offset, E
     )
     for expert_id, end_idx in enumerate(tokens_per_expert):
         start_idx = 0 if expert_id == 0 else tokens_per_expert[expert_id - 1]
@@ -436,7 +413,8 @@ def fused_experts(
 
         exp_token_idxs = token_idxs[start_idx:end_idx]
         expert_out = intermediate_cache3[start_idx:end_idx]
-        expert_out.mul_(topk_weights[idxs[start_idx:end_idx]])
+        expert_out.mul_(topk_weights.view(-1, 1)[idxs[start_idx:end_idx]])
+        # import pdb; pdb.set_trace()
         out_hidden_states.scatter_reduce_(
             0, exp_token_idxs.view(-1, 1).repeat(1, OutK), expert_out, reduce="sum"
         )

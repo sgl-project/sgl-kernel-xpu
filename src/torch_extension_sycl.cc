@@ -63,9 +63,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("moe_sum", torch::kXPU, &moe_sum);
 
   m.def(
-      "moe_grouped_mm_nn(Tensor output, Tensor activations, Tensor weights, Tensor total_rows_for_experts, int "
+      "moe_grouped_mm_nt(Tensor output, Tensor activations, Tensor weights, Tensor total_rows_for_experts, int "
       "n_experts) -> ()");
-  m.impl("moe_grouped_mm_nn", torch::kXPU, &moe_grouped_mm_nn);
+  m.impl("moe_grouped_mm_nt", torch::kXPU, &moe_grouped_mm_nt);
 
   //   m.def(
   //       "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype,

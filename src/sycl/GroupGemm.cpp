@@ -67,9 +67,9 @@ struct MoERunner {
 
   void
   run(sycl::queue queue,
-      const scalar_t* activations,
-      const scalar_t* weights,
-      scalar_t* outputs,
+      const void* activations,
+      const void* weights,
+      void* outputs,
       const int gemm_n,
       const int gemm_k,
       const int* num_rows_per_expert_device,
@@ -82,12 +82,12 @@ struct MoERunner {
     hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
     using LayoutA = cutlass::layout::RowMajor;
-    using LayoutB = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
     using LayoutC = cutlass::layout::RowMajor;
     using LayoutD = cutlass::layout::RowMajor;
 
-    using GmemTiledCopyA = XE_2D_U16x32x32_LD_N;
-    using GmemTiledCopyB = XE_2D_U16x32x32_LD_V;
+    using GmemTiledCopyA = XE_2D_U16x8x32_LD_N;
+    using GmemTiledCopyB = XE_2D_U16x16x16_LD_T;
 
     // Workgroup-level tile
     using TileShape = Shape<_256, _256, _32>;
@@ -157,7 +157,14 @@ struct MoERunner {
 
     Gemm gemm_op;
     auto arguments = args_from_options<Gemm>(
-        hw_info, activations, weights, outputs, gemm_n, gemm_k, num_rows_per_expert_device, num_experts);
+        hw_info,
+        reinterpret_cast<const scalar_t*>(activations),
+        reinterpret_cast<const scalar_t*>(weights),
+        reinterpret_cast<scalar_t*>(outputs),
+        gemm_n,
+        gemm_k,
+        num_rows_per_expert_device,
+        num_experts);
     size_t workspace_size = Gemm::get_workspace_size(arguments);
     cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
 
@@ -171,44 +178,43 @@ struct MoERunner {
   }
 };
 
-void moe_grouped_mm_nn(
+void moe_grouped_mm_nt(
     torch::Tensor& output,
     const torch::Tensor& activations,
     const torch::Tensor& weights,
     const torch::Tensor& total_rows_for_experts,
     const int64_t n_experts) {
-  int total_m = weights.sizes()[0];
+  int total_m = activations.sizes()[0];
   int gemm_k = activations.sizes()[1];
   auto weights_shape = weights.sizes().vec();
-  int gemm_n = weights.sizes()[2];
+  int gemm_n = weights.sizes()[1];
 
   TORCH_CHECK(weights_shape.size() == 3, "weights must be 3D");
   TORCH_CHECK(weights_shape[0] == n_experts, "weights must have n_experts as the first dimension");
-  TORCH_CHECK(weights_shape[1] == gemm_k, "weights must have the same size as matrix_a in the second dimension");
+  TORCH_CHECK(weights_shape[1] == gemm_n, "weights must be gemm_n * gemm_k");
   TORCH_CHECK(
       weights_shape[0] == total_rows_for_experts.size(0),
       "rows_for_experts must have the same size as the first dimension of weights");
-  TORCH_CHECK(output.sizes()[0] == total_m, "output must have the same number of rows as weights");
-  TORCH_CHECK(output.sizes()[1] == gemm_n, "output must have the same number of columns as weights");
+  TORCH_CHECK(output.sizes()[0] == total_m, "output must have the same number of rows as activations");
+  TORCH_CHECK(output.sizes()[1] == gemm_n, "output must have the same number of columns as activations");
   TORCH_CHECK(n_experts % 8 == 0, "n_experts must be a multiple of 8 for the current implementation");
   TORCH_CHECK(
       activations.scalar_type() == weights.scalar_type(), "activations and weights must have the same data type");
   TORCH_CHECK(
       activations.scalar_type() == at::ScalarType::Half || activations.scalar_type() == at::ScalarType::BFloat16,
-      "Only float16 and bfloat16 are supported in moe_grouped_mm_nn");
+      "Only float16 and bfloat16 are supported in moe_grouped_mm_nt");
 
   if (activations.scalar_type() == at::ScalarType::BFloat16) {
     auto stream = at::xpu::getCurrentXPUStream();
     auto queue = stream.queue();
 
-    using scalar_t = at::BFloat16;
-    using Kernel = MoERunner<scalar_t>;
+    using Kernel = MoERunner<cutlass::bfloat16_t>;
     Kernel kernel;
     kernel.run(
         queue,
-        activations.data_ptr<scalar_t>(),
-        weights.data_ptr<scalar_t>(),
-        output.data_ptr<scalar_t>(),
+        activations.data_ptr(),
+        weights.data_ptr(),
+        output.data_ptr(),
         gemm_n,
         gemm_k,
         total_rows_for_experts.data_ptr<int>(),

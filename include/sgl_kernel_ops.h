@@ -255,7 +255,7 @@ void fp8_blockwise_scaled_grouped_mm(
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace);
 
-void moe_grouped_mm_nn(
+void moe_grouped_mm_nt(
     torch::Tensor& output,
     const torch::Tensor& activations,
     const torch::Tensor& weights,

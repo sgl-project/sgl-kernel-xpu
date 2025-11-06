@@ -793,8 +793,6 @@ class GemmMoEUniversalAdapter {
   using LayoutC = gemm::detail::StrideToLayoutTagC_t<typename GemmKernel::StrideC>;
   using LayoutD = gemm::detail::StrideToLayoutTagC_t<typename GemmKernel::StrideD>;
 
-  static bool const kEnableCudaHostAdapter = CUTLASS_ENABLE_CUDA_HOST_ADAPTER;
-
   static ComplexTransform const kTransformA =
       cute::is_same_v<typename GemmKernel::CollectiveMainloop::TransformA, cute::conjugate>
           ? ComplexTransform::kConjugate
@@ -965,18 +963,13 @@ class GemmMoEUniversalAdapter {
     }
     // Initialize the Params structure
     params_ = GemmKernel::to_underlying_arguments(args, workspace);
-    // Don't set the function attributes - require the CudaHostAdapter to set it.
-    if constexpr (kEnableCudaHostAdapter) {
-      CUTLASS_ASSERT(cuda_adapter);
-      return Status::kSuccess;
-    } else {
-      //
-      // Account for dynamic smem capacity if needed
-      //
-      int smem_size = GemmKernel::SharedStorageSize;
 
-      CUTLASS_ASSERT(cuda_adapter == nullptr);
-    }
+    //
+    // Account for dynamic smem capacity if needed
+    //
+    int smem_size = GemmKernel::SharedStorageSize;
+
+    CUTLASS_ASSERT(cuda_adapter == nullptr);
     return Status::kSuccess;
   }
 
@@ -997,63 +990,29 @@ class GemmMoEUniversalAdapter {
     Status launch_result{Status::kSuccess};
     cutlass::arch::synclog_setup();
 
-    if constexpr (kEnableCudaHostAdapter) {
-      CUTLASS_ASSERT(cuda_adapter);
-      if (cuda_adapter) {
-        void* kernel_params[] = {&params};
-#if (CUTLASS_DEBUG_TRACE_LEVEL > 1)
-        CUTLASS_TRACE_HOST("GemmUniversal::run: Launching kernel with CUDA host adapter");
-#endif
-        launch_result = cuda_adapter->launch(grid, block, smem_size, stream, kernel_params, 0);
-
-      } else {
-        CUTLASS_TRACE_HOST("GemmUniversal::run: CUDA host adapter is null");
-        return Status::kErrorInternal;
-      }
-    } else {
-      CUTLASS_ASSERT(cuda_adapter == nullptr);
-      sycl::queue q = *stream;
-#if !defined(SYCL_EXT_ONEAPI_WORK_GROUP_SCRATCH_MEMORY)
-      using namespace compat::experimental;
-      if constexpr (cute::is_same_v<DispatchPolicy, MainloopDeviceAgnostic>) {
-        auto event = launch<device_kernel<GemmKernel>>(
-            launch_policy{sycl_grid, sycl_block, local_mem_size{static_cast<std::size_t>(smem_size)}}, q, params);
-        EventManager::getInstance().addEvent(event);
-      } else {
-        auto event = launch<device_kernel<GemmKernel>>(
-            launch_policy{
-                sycl_grid,
-                sycl_block,
-                local_mem_size{static_cast<std::size_t>(smem_size)},
-                kernel_properties{sycl_exp::sub_group_size<DispatchPolicy::SubgroupSize>}},
-            q,
-            params);
-        EventManager::getInstance().addEvent(event);
-      }
-#else
+    CUTLASS_ASSERT(cuda_adapter == nullptr);
+    sycl::queue q = *stream;
 #if defined(SYCL_INTEL_TARGET)
-      constexpr bool allow_subgroup_size_prop = true;
+    constexpr bool allow_subgroup_size_prop = true;
 #else
-      constexpr bool allow_subgroup_size_prop = false;
+    constexpr bool allow_subgroup_size_prop = false;
 #endif
-      auto kernel_props = [] {
-        constexpr bool is_device_agnostic = cute::is_same_v<DispatchPolicy, MainloopDeviceAgnostic>;
-        if constexpr (!allow_subgroup_size_prop or is_device_agnostic) {
-          using EmptyProperties = decltype(sycl::ext::oneapi::experimental::properties());
-          return compat::experimental::kernel_properties<EmptyProperties>{};
-        } else {
-          return compat::experimental::kernel_properties{
-              sycl::ext::oneapi::experimental::sub_group_size<DispatchPolicy::SubgroupSize>};
-        }
-      }();
-      compat::experimental::launch_properties launch_props{
-          sycl::ext::oneapi::experimental::work_group_scratch_size(smem_size),
-      };
-      compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
-      auto event = compat::experimental::launch<device_kernel<GemmKernel>, GemmKernel>(policy, q, params);
-      EventManager::getInstance().addEvent(event);
-#endif  // !defined(SYCL_EXT_ONEAPI_WORK_GROUP_SCRATCH_MEMORY)
-    }
+    auto kernel_props = [] {
+      constexpr bool is_device_agnostic = cute::is_same_v<DispatchPolicy, MainloopDeviceAgnostic>;
+      if constexpr (!allow_subgroup_size_prop or is_device_agnostic) {
+        using EmptyProperties = decltype(sycl::ext::oneapi::experimental::properties());
+        return compat::experimental::kernel_properties<EmptyProperties>{};
+      } else {
+        return compat::experimental::kernel_properties{
+            sycl::ext::oneapi::experimental::sub_group_size<DispatchPolicy::SubgroupSize>};
+      }
+    }();
+    compat::experimental::launch_properties launch_props{
+        sycl::ext::oneapi::experimental::work_group_scratch_size(smem_size),
+    };
+    compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
+    auto event = compat::experimental::launch<device_kernel<GemmKernel>, GemmKernel>(policy, q, params);
+    EventManager::getInstance().addEvent(event);
     cudaError_t result = cudaGetLastError();
     if (cudaSuccess == result && Status::kSuccess == launch_result) {
 #if (CUTLASS_DEBUG_TRACE_LEVEL > 1)

@@ -334,8 +334,8 @@ class FMHAPrefillChunk {
       auto kv_head_coord = q_head_coord / q_group_size;
 
       // Descale tensors are shaped (batch size * # heads)
-      // Each head has a seperate scale factor
-      // Q, K, V tensors have seperate scaling factors
+      // Each head has a separate scale factor
+      // Q, K, V tensors have separate scaling factors
       const float q_scale_val = params.mainloop.ptr_q_scale == nullptr
                                     ? 1.f
                                     : params.mainloop.ptr_q_scale[batch_coord * num_heads_kv + q_head_coord];

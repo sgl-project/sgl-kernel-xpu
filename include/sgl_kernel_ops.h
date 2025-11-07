@@ -105,12 +105,14 @@ void merge_state(
 void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 void cutlass_mla_decode(
-    torch::Tensor const& out,
-    torch::Tensor const& q_nope_and_q_pe,
-    torch::Tensor const& kv_c_and_k_pe_cache,
-    torch::Tensor const& seq_lens,
-    torch::Tensor const& page_table,
-    torch::Tensor const& workspace,
+    torch::Tensor& out,
+    const torch::Tensor q_nope,
+    const torch::Tensor q_pe,
+    const torch::Tensor kv_c_and_k_pe_cache,
+    const torch::Tensor seq_lens,
+    const torch::Tensor page_table,
+    torch::Tensor & workspace,
+    double sm_scale,
     int64_t num_kv_splits = -1);
 int64_t cutlass_mla_get_workspace_size(
     int64_t max_seq_len, int64_t num_batches, int64_t sm_count = 0, int64_t num_kv_splits = -1);

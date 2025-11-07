@@ -95,6 +95,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
 
   m.def("cutlass_mla_get_workspace_size", &cutlass_mla_get_workspace_size);
+
+  m.def(
+      "cutlass_mla_decode(Tensor! out, Tensor q_nope, Tensor q_pe, Tensor kv_c_and_k_pe_cache, Tensor seq_lens, Tensor "
+      "page_table, Tensor! workspace, float sm_scale, int num_kv_splits) -> ()");
+  m.impl("cutlass_mla_decode", torch::kXPU, &cutlass_mla_decode);
 }
 
 REGISTER_EXTENSION(common_ops)

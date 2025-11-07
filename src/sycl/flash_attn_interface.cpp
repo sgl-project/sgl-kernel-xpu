@@ -36,10 +36,13 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 #include <cute/tensor.hpp>
+#include <optional>
+#include <cmath>
 #include "Utils.h"
 #include "comm/common.h"
 #include "cutlass/util/device_memory.h"
 #include "flash_attn_runner.hpp"
+#include <iostream>
 
 using namespace cute;
 
@@ -555,4 +558,104 @@ int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches,
   // will do later
 
   return MlaFlashAttnType::Kernel::get_workspace_size(arguments);
+}
+
+
+/// @brief Dispatch kernel implementation for MLA decode.
+void cutlass_mla_decode(
+    at::Tensor& out,        // (batch, num_heads, latent_dim)
+    const at::Tensor q_nope,  // (batch, num_heads, latent_dim)
+    const at::Tensor q_pe,  // (batch, num_heads, rope_dim)
+    const at::Tensor kv_c_and_k_pe_cache,  // (total_no_of_pages, page_size, (latent_dim + rope_dim))
+    const at::Tensor seq_lens,           // (batch_size,)
+    const at::Tensor page_table,           // (batch_size, max_num_pages_per_seq)
+    at::Tensor& workspace,
+    double sm_scale, // softmax scale
+    int64_t num_kv_splits) {
+  // Device guard
+  c10::DeviceGuard device_guard(q_nope.device());
+
+  CHECK_DEVICE(q_nope);
+  CHECK_DEVICE(q_pe);
+  CHECK_DEVICE(kv_c_and_k_pe_cache);
+  CHECK_DEVICE(seq_lens);
+  CHECK_DEVICE(page_table);
+  CHECK_DEVICE(workspace);
+
+  TORCH_CHECK(kv_c_and_k_pe_cache.stride(-1) == 1, "kv_c_and_k_pe_cache must have contiguous last dimension");
+  
+  at::Tensor q_nope_and_q_pe = torch::cat({q_nope, q_pe}, /*dim=*/-1).contiguous();
+
+  // preparing v_cache tensor (4D) 
+  using namespace torch::indexing;
+  int out_dim = out.size(-1);
+  at::Tensor v_cache = torch::unsqueeze(kv_c_and_k_pe_cache.index({Slice(), Slice(), Slice(None, out_dim)}), /*dim=*/2).contiguous();
+
+  // preparing k_cache tensor (4D) 
+  at::Tensor k_cache = torch::unsqueeze(kv_c_and_k_pe_cache, /*dim=*/2).contiguous();
+
+  // Create cu_seqlens_q from tensor shapes for standard batch processing
+  at::Tensor cu_seqlens_q = torch::arange(0, q_nope_and_q_pe.size(0) + 1, 
+                                          torch::TensorOptions().dtype(torch::kInt32).device(q_nope_and_q_pe.device())) * 1;
+  cu_seqlens_q = cu_seqlens_q.contiguous();
+  int max_seqlen_q = 1;
+
+  TORCH_CHECK(seq_lens.size(0) + 1 == cu_seqlens_q.size(0), 
+              "cache_seqlens size mismatch with cu_seqlens_q");
+
+  // Create cu_seqlens_k from seq_lens
+  at::Tensor zeros = torch::zeros({1}, torch::TensorOptions().dtype(torch::kInt32).device(seq_lens.device()));
+  at::Tensor cumsum = torch::cumsum(seq_lens, 0);
+  at::Tensor cu_seqlens_k = torch::cat({zeros, cumsum}, 0).to(torch::kInt32).contiguous();
+
+  std::optional<const at::Tensor> qv = std::nullopt;
+  std::optional<const at::Tensor> cache_batch_idx = std::nullopt;
+  std::optional<const at::Tensor> cache_leftpad = std::nullopt;
+  std::optional<const at::Tensor> rotary_cos = std::nullopt;
+  std::optional<const at::Tensor> rotary_sin = std::nullopt;
+  std::optional<const at::Tensor> rotary_seqlens = std::nullopt;
+  std::optional<at::Tensor> q_descale = std::nullopt;
+  std::optional<at::Tensor> k_descale = std::nullopt;
+  std::optional<at::Tensor> v_descale = std::nullopt;
+  float softmax_scale = static_cast<float>(sm_scale);
+  std::optional<const at::Tensor> softmax_sink = std::nullopt;
+  bool causal = false;
+  std::array<int, 2> window_size = { -1, -1 };
+  float softcap = 0.0f;
+  bool rotary_interleaved = false;
+  std::optional<at::Tensor> scheduler_metadata = std::nullopt;
+  // TODO: Implement optimized MLA decode kernel call here
+  // currently reusing mha_fwd.
+  auto output_vec = mha_fwd(
+        q_nope_and_q_pe,
+        k_cache,
+        v_cache,
+        qv,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        page_table.contiguous(),
+        cache_batch_idx,
+        cache_leftpad,
+        rotary_cos,
+        rotary_sin,
+        rotary_seqlens,
+        q_descale,
+        k_descale,
+        v_descale,
+        softmax_scale,
+        softmax_sink,
+        causal,
+        window_size[0],
+        window_size[1],
+        softcap,
+        rotary_interleaved,
+        scheduler_metadata,
+        num_kv_splits,
+        false,
+        0);
+
+  out.copy_(output_vec[0]);
+
+  return ;
 }

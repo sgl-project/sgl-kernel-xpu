@@ -43,7 +43,7 @@
 #include <cutlass/detail/helper_macros.hpp>
 
 // Helper device function for E4M3 -> BFLOAT16 bitwise conversion
-CUTLASS_DEVICE uint16_t fp8_e4m3_to_fp16_bitwise(uint8_t const& src) {
+CUTLASS_DEVICE uint16_t fp8_e4m3_to_bf16_bitwise(uint8_t const& src) {
   // E4M3 (1-4-3) constants
   constexpr uint32_t e4m3_exp_bias = 7;
   // BFLOAT16 (1-8-7) constants
@@ -65,7 +65,7 @@ CUTLASS_DEVICE uint16_t fp8_e4m3_to_fp16_bitwise(uint8_t const& src) {
 }
 
 // Helper device function for E5M2 -> BFLOAT16 bitwise conversion
-CUTLASS_DEVICE uint16_t fp8_e5m2_to_fp16_bitwise(uint8_t const& src) {
+CUTLASS_DEVICE uint16_t fp8_e5m2_to_bf16_bitwise(uint8_t const& src) {
   // E5M2 (1-5-2) constants
   constexpr uint32_t e5m2_exp_bias = 15;
   // BFLOAT16 (1-8-7) constants
@@ -107,9 +107,9 @@ CUTLASS_DEVICE void convert_and_descale(SrcTensor const& src, DstTensor& dst, fl
       // 1. Convert FP8 bits to BFLOAT16 bits
       uint16_t val_bf16_bits;
       if constexpr (std::is_same_v<Encoding, cutlass::float_e4m3_t>) {
-        val_bf16_bits = fp8_e4m3_to_fp16_bitwise(src_vec_u8[j]);
+        val_bf16_bits = fp8_e4m3_to_bf16_bitwise(src_vec_u8[j]);
       } else {
-        val_bf16_bits = fp8_e5m2_to_fp16_bitwise(src_vec_u8[j]);
+        val_bf16_bits = fp8_e5m2_to_bf16_bitwise(src_vec_u8[j]);
       }
 
       // 2. Reinterpret bits as bfloat16_t to perform math

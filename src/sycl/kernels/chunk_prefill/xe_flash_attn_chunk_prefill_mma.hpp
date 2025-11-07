@@ -30,13 +30,13 @@
  **************************************************************************************************/
 #pragma once
 
+#include "../../comm/fp8_descale.h"
 #include "cute/algorithm/functional.hpp"
 #include "cute/algorithm/gemm.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "fmha_fusion.hpp"
-#include "fp8_descale.h"
 
 ////////////////////////////////////////////////////////////
 namespace {}

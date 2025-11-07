@@ -526,7 +526,7 @@ std::vector<at::Tensor> mha_fwd(
     std::optional<at::Tensor>& k_descale_,             // (b, h_k)
     std::optional<at::Tensor>& v_descale_,             // (b, h_k)
     const float softmax_scale_,
-    std::optional<const at::Tensor>& softmax_sink_,
+    std::optional<const at::Tensor>& sinks_,
     bool is_causal,
     int window_size_left,
     int window_size_right,
@@ -694,8 +694,8 @@ std::vector<at::Tensor> mha_fwd(
 
   // Set the different scale values.
   params.scale_softmax = softmax_scale;
-  bool use_sink = softmax_sink_.has_value();
-  params.sink_softmax = use_sink ? softmax_sink_.value().data_ptr() : nullptr;
+  bool use_sink = sinks_.has_value();
+  params.sink_softmax = use_sink ? sinks_.value().data_ptr() : nullptr;
 
   params.softcap = softcap;
 

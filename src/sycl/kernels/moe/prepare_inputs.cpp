@@ -5,154 +5,267 @@
 #include <torch/all.h>
 
 #include <cmath>
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <sycl/sycl.hpp>
 #include <vector>
 
-#include "MemoryAccess.h"
-#include "SYCLHelpers.h"
-#include "Utils.h"
+#include "../../MemoryAccess.h"
+#include "../../SYCLHelpers.h"
+#include "../../Utils.h"
 
-constexpr uint64_t THREADS_PER_EXPERT = 512;
-constexpr int block_size = 128
+constexpr int64_t THREADS_PER_EXPERT = 512;
+constexpr int block_size = 128;
 
-void compute_problem_sizes_sycl(
-    sycl::queue& q,
+struct compute_problem_sizes_sycl_K {
+  compute_problem_sizes_sycl_K(
     const int* topk_ids,
     int32_t* problem_sizes1,
     int32_t* problem_sizes2,
     int32_t* atomic_buffer,
-    const int64_t num_experts,
-    const int64_t topk_length,
-    const int64_t n,
-    const int64_t k) {
+    const unsigned long num_experts,
+    const unsigned long topk_length,
+    const unsigned long n,
+    const unsigned long k)
+      : topk_ids_(topk_ids),
+        problem_sizes1_(problem_sizes1),
+        problem_sizes2_(problem_sizes2),
+        atomic_buffer_(atomic_buffer),
+        num_experts_(num_experts),
+        topk_length_(topk_length),
+        n_(n),
+        k_(k) {}
 
-  sycl::range<1> global_range{ num_experts * topk_length };
-  sycl::range<1> local_range{ topk_length }; 
-
-  // Launch kernel
-  q.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for(
-      sycl::nd_range<1>(global_range, local_range),
-      [=](sycl::nd_item<1> item) {
+    void operator()(sycl::nd_item<1> item) const {
         int expert_id = item.get_group(0);
         int occurrences = 0;
         size_t local_id = item.get_local_id(0);
-        for (int i = local_id; i < topk_length; i += THREADS_PER_EXPERT) {
-          occurrences += (topk_ids[i] == expert_id);
+        for (int i = local_id; i < topk_length_; i += THREADS_PER_EXPERT) {
+          occurrences += (topk_ids_[i] == expert_id);
         }
 
-        atomic_ref<
+        sycl::atomic_ref<
           int32_t,
           sycl::memory_order::relaxed,
           sycl::memory_scope::work_group,
           sycl::access::address_space::generic_space
-        > atomic_counter(atomic_buffer[expert_id]);
+        > atomic_counter(atomic_buffer_[expert_id]);
 
         atomic_counter.fetch_add(occurrences);
 
         if (local_id == 0) {
-          int final_occurrences = atomic_buffer[expert_id];
-          problem_sizes1[expert_id * 3] = final_occurrences;
-          problem_sizes1[expert_id * 3 + 1] = static_cast<int32_t>(2 * n);
-          problem_sizes1[expert_id * 3 + 2] = static_cast<int32_t>(k);
-          problem_sizes2[expert_id * 3] = final_occurrences;
-          problem_sizes2[expert_id * 3 + 1] = static_cast<int32_t>(k);
-          problem_sizes2[expert_id * 3 + 2] = static_cast<int32_t>(n);
+          int final_occurrences = atomic_buffer_[expert_id];
+          problem_sizes1_[expert_id * 3] = final_occurrences;
+          problem_sizes1_[expert_id * 3 + 1] = static_cast<int32_t>(2 * n_);
+          problem_sizes1_[expert_id * 3 + 2] = static_cast<int32_t>(k_);
+          problem_sizes2_[expert_id * 3] = final_occurrences;
+          problem_sizes2_[expert_id * 3 + 1] = static_cast<int32_t>(k_);
+          problem_sizes2_[expert_id * 3 + 2] = static_cast<int32_t>(n_);
         }          
-    });
-  });          
+    }
+
+    const int* topk_ids_;
+    int32_t* problem_sizes1_;
+    int32_t* problem_sizes2_;
+    int32_t* atomic_buffer_;
+    const unsigned long num_experts_;
+    const unsigned long topk_length_;
+    const unsigned long n_;
+    const unsigned long k_;
+};
+
+
+void compute_problem_sizes_sycl(
+    const int* topk_ids,
+    int32_t* problem_sizes1,
+    int32_t* problem_sizes2,
+    int32_t* atomic_buffer,
+    const unsigned long num_experts,
+    const unsigned long topk_length,
+    const unsigned long n,
+    const unsigned long k) {
+
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
+
+  using Kernel = compute_problem_sizes_sycl_K;
+  sycl::range<1> global_range{ num_experts * topk_length };
+  sycl::range<1> local_range{ topk_length };
+
+  Kernel task(topk_ids, problem_sizes1, problem_sizes2, atomic_buffer, num_experts, topk_length, n, k);
+
+  sycl_kernel_submit(global_range, local_range, queue, task);
+  return;
 }
 
+
+struct compute_expert_offsets_sycl_k {
+  compute_expert_offsets_sycl_k(
+  const int32_t* problem_sizes1,
+  int32_t* expert_offsets,
+  int32_t* atomic_buffer,
+  const int64_t num_experts)
+      : problem_sizes1_(problem_sizes1),
+        expert_offsets_(expert_offsets),
+        atomic_buffer_(atomic_buffer),
+        num_experts_(num_experts) {}
+
+    void operator()(sycl::nd_item<1> item) const {
+      int32_t tot_offset = 0;
+      expert_offsets_[0] = 0;
+      for (int i = 0; i < num_experts_; ++i) {
+        atomic_buffer_[i] = tot_offset;
+        tot_offset += problem_sizes1_[i * 3];
+        expert_offsets_[i + 1] = tot_offset;
+      }
+    }
+
+  const int32_t* problem_sizes1_;
+  int32_t* expert_offsets_;
+  int32_t* atomic_buffer_;
+  const int64_t num_experts_;
+};
+
 void compute_expert_offsets_sycl(
-    sycl::queue& q,
     const int32_t* problem_sizes1,
     int32_t* expert_offsets,
     int32_t* atomic_buffer,
     const int64_t num_experts) {
 
-  // Launch kernel
-  q.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for(
-      sycl::nd_range<1>(1, 1),
-      [=](sycl::nd_item<1> item) {
-      int32_t tot_offset = 0;
-      expert_offsets[0] = 0;
-      for (int i = 0; i < num_experts; ++i) {
-        atomic_buffer[i] = tot_offset;
-        tot_offset += problem_sizes1[i * 3];
-        expert_offsets[i + 1] = tot_offset;
-      }
-    });
-  });
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
+
+  using Kernel = compute_expert_offsets_sycl_k;
+
+  Kernel task(problem_sizes1, expert_offsets, atomic_buffer, num_experts);
+
+  sycl_kernel_submit(1, 1, queue, task);
+  return;
 }
 
+struct compute_expert_blockscale_offsets_sycl_K {
+  compute_expert_blockscale_offsets_sycl_K(
+  const int32_t* problem_sizes1,
+  int32_t* expert_offsets,
+  int32_t* blockscale_offsets,
+  int32_t* atomic_buffer,
+  const int64_t num_experts)
+      : problem_sizes1_(problem_sizes1),
+        expert_offsets_(expert_offsets),
+        blockscale_offsets_(blockscale_offsets),
+        atomic_buffer_(atomic_buffer),
+        num_experts_(num_experts) {}
+
+    void operator()(sycl::nd_item<1> item) const {
+      int32_t tot_offset = 0;
+      int32_t tot_rounded_offset = 0;
+      expert_offsets_[0] = 0;
+      blockscale_offsets_[0] = 0;
+      for (int i = 0; i < num_experts_; ++i) {
+        atomic_buffer_[i] = tot_offset;
+        int num_tokens = problem_sizes1_[i * 3];
+        int rounded_num_tokens = (num_tokens + (block_size - 1)) / block_size * block_size;
+        tot_offset += num_tokens;
+        tot_rounded_offset += rounded_num_tokens;
+        expert_offsets_[i + 1] = tot_offset;
+        blockscale_offsets_[i + 1] = tot_rounded_offset;
+      }
+    }
+
+  const int32_t* problem_sizes1_;
+  int32_t* expert_offsets_;
+  int32_t* blockscale_offsets_;
+  int32_t* atomic_buffer_;
+  const int64_t num_experts_;
+};
+
 void compute_expert_blockscale_offsets_sycl(
-  sycl::queue& q,
   const int32_t* problem_sizes1,
   int32_t* expert_offsets,
   int32_t* blockscale_offsets,
   int32_t* atomic_buffer,
   const int64_t num_experts) {
 
-  // Launch kernel
-  q.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for(
-      sycl::nd_range<1>(1, 1),
-      [=](sycl::nd_item<1> item) {
-      int32_t tot_offset = 0;
-      int32_t tot_rounded_offset = 0;
-      expert_offsets[0] = 0;
-      blockscale_offsets[0] = 0;
-      for (int i = 0; i < num_experts; ++i) {
-        atomic_buffer[i] = tot_offset;
-        int num_tokens = problem_sizes1[i * 3];
-        int rounded_num_tokens = (num_tokens + (block_size - 1)) / block_size * block_size;
-        tot_offset += num_tokens;
-        tot_rounded_offset += rounded_num_tokens;
-        expert_offsets[i + 1] = tot_offset;
-        blockscale_offsets[i + 1] = tot_rounded_offset;
-      }
-    });
-  });
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
+
+  using Kernel = compute_expert_blockscale_offsets_sycl_K;
+
+  Kernel task(problem_sizes1, expert_offsets, blockscale_offsets, atomic_buffer, num_experts);
+
+  sycl_kernel_submit(1, 1, queue, task);
+  return;
 }
 
-void compute_arg_sorts_sycl(
-    sycl::queue& q,
+
+struct compute_arg_sorts_sycl_K {
+  compute_arg_sorts_sycl_K(
     const int32_t* topk_ids,
     int32_t* input_permutation,
     int32_t* output_permutation,
     int32_t* atomic_buffer,
-    const int64_t topk_length,
-    const int64_t topk) {
+    const unsigned long topk_length,
+    const int64_t topk,
+    const unsigned long num_experts)
+      : topk_ids_(topk_ids),
+        input_permutation_(input_permutation),
+        output_permutation_(output_permutation),
+        atomic_buffer_(atomic_buffer),
+        topk_length_(topk_length),
+        topk_(topk),
+        num_experts_(num_experts) {}
 
+    void operator()(sycl::nd_item<1> item) const {
+      int expert_id = item.get_group(0);
+
+      sycl::atomic_ref<
+        int32_t,
+        sycl::memory_order::relaxed,
+        sycl::memory_scope::work_group,
+        sycl::access::address_space::generic_space
+      > atomic_counter(atomic_buffer_[expert_id]);
+
+      for (int i = item.get_local_id(0); i < topk_length_; i += THREADS_PER_EXPERT) {
+        if (topk_ids_[i] == expert_id) {
+          int start = atomic_counter.fetch_add(1);
+          input_permutation_[start] = i / topk_;
+          output_permutation_[i] = start;
+        }
+      }
+    }
+
+    const int32_t* topk_ids_;
+    int32_t* input_permutation_;
+    int32_t* output_permutation_;
+    int32_t* atomic_buffer_;
+    const unsigned long topk_length_;
+    const int64_t topk_;
+    const unsigned long num_experts_;
+};
+
+void compute_arg_sorts_sycl(
+    const int32_t* topk_ids,
+    int32_t* input_permutation,
+    int32_t* output_permutation,
+    int32_t* atomic_buffer,
+    const unsigned long topk_length,
+    const int64_t topk,
+    const unsigned long num_experts) {
+
+
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
+
+  using Kernel = compute_arg_sorts_sycl_K;
   sycl::range<1> global_range{ num_experts * topk_length };
   sycl::range<1> local_range{ topk_length }; 
 
-  // Launch kernel
-  q.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for(
-      sycl::nd_range<1>(global_range, local_range),
-      [=](sycl::nd_item<1> item) {
-        int expert_id = item.get_group(0);
+  Kernel task(topk_ids, input_permutation, output_permutation, atomic_buffer, topk_length, topk, num_experts);
 
-        atomic_ref<
-          int32_t,
-          sycl::memory_order::relaxed,
-          sycl::memory_scope::work_group,
-          sycl::access::address_space::generic_space
-        > atomic_counter(atomic_buffer[expert_id]);
+  sycl_kernel_submit(global_range, local_range, queue, task);
+  return;
 
-        for (int i = threadIdx.x; i < topk_length; i += THREADS_PER_EXPERT) {
-          if (topk_ids[i] == expert_id) {
-            int start = atomic_counter.fetch_add(1);
-            input_permutation[start] = i / topk;
-            output_permutation[i] = start;
-          }
-        }
-    });
-  });          
 }
 
 void prepare_moe_input(
@@ -167,17 +280,11 @@ void prepare_moe_input(
     const int64_t n,
     const int64_t k) {
   TORCH_CHECK(topk_ids.dtype() == torch::kInt32);
-  auto stream = at::xpu::getCurrentXPUStream();
-  auto queue = stream.queue();
 
   auto options_int32 = torch::TensorOptions().dtype(torch::kInt32).device(topk_ids.device());
   torch::Tensor atomic_buffer = torch::zeros(num_experts, options_int32);
 
-  uint32_t num_threads = static_cast<uint32_t>(min(THREADS_PER_EXPERT, topk_ids.numel()));
-  uint32_t num_blocks = static_cast<uint32_t>(num_experts);
-
   compute_problem_sizes_sycl(
-      queue,
       static_cast<const int32_t*>(topk_ids.data_ptr()),
       static_cast<int32_t*>(problem_sizes1.data_ptr()),
       static_cast<int32_t*>(problem_sizes2.data_ptr()),
@@ -196,21 +303,20 @@ void prepare_moe_input(
         num_experts);
   } else {
     compute_expert_offsets_sycl(
-        queue,
-        static_cast<int32_t*>(problem_sizes1),
-        static_cast<int32_t*>(expert_offsets),
-        static_cast<int32_t*>(atomic_buffer),
+        static_cast<int32_t*>(problem_sizes1.data_ptr()),
+        static_cast<int32_t*>(expert_offsets.data_ptr()),
+        static_cast<int32_t*>(atomic_buffer.data_ptr()),
         num_experts);
   }
 
-  compute_arg_sorts(
-      queue,
-      static_cast<const int32_t*>(topk_ids.data_ptr()),
-      static_cast<int32_t*>(input_permutation.data_ptr()),
-      static_cast<int32_t*>(output_permutation.data_ptr()),
-      static_cast<int32_t*>(atomic_buffer.data_ptr()),
-      topk_ids.numel(),
-      topk_ids.size(1));
+  compute_arg_sorts_sycl(
+    static_cast<const int32_t*>(topk_ids.data_ptr()),
+    static_cast<int32_t*>(input_permutation.data_ptr()),
+    static_cast<int32_t*>(output_permutation.data_ptr()),
+    static_cast<int32_t*>(atomic_buffer.data_ptr()),
+    topk_ids.numel(),
+    topk_ids.size(1),
+    num_experts);
 
   return;
 }
@@ -232,15 +338,15 @@ struct ShuffleRows {
         num_cols_(num_cols) {}
 
   void operator()(sycl::nd_item<1> item) const {
-    int gid = item.get_global_linear_id();
+      int gid = item.get_global_linear_id();
+      int tid = item.get_local_linear_id();
     // Leave it to compiler for simd sub-group
-    if (gid < num_src_rows_ * num_cols_) {
-      int64_t dest_token_idx = gid % num_cols_;
+    if (gid < num_dest_rows_ * num_cols_) {
+      int64_t dest_token_idx = item.get_group(0);
       int64_t const source_token_idx = dst2src_map_[dest_token_idx];
 
-      auto const* source_row_ptr = reinterpret_cast<DataElem const*>(input_ + source_token_idx * num_cols);
-      auto* dest_row_ptr = reinterpret_cast<DataElem*>(output_ + dest_token_idx * num_cols);
-      *dest_row_ptr = *source_row_ptr
+      auto source_val = input_[source_token_idx * num_cols_ + tid];
+      output_[dest_token_idx * num_cols_ + tid] = source_val;
     }
   }
   const T* input_;
@@ -252,21 +358,23 @@ struct ShuffleRows {
 };
 
 template <typename T>
-void shuffle_rows_caller(
-      const T* input,
-      const int32_t* dst2src_map,
-      T* output,
-      int64_t num_src_rows,
-      int64_t num_dest_rows,
-      int64_t num_cols) {
+void shuffle_rows_kernel_impl(const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor) {
+  auto input = reinterpret_cast<T*>(input_tensor.data_ptr());
+  auto dst2srcmap = reinterpret_cast<const int32_t*>(dst2src_map.data_ptr());
+  auto output = reinterpret_cast<T*>(output_tensor.data_ptr());
+
+  int64_t num_src_rows = input_tensor.size(0);
+  unsigned long num_dest_rows = output_tensor.size(0);
+  unsigned long num_cols = input_tensor.size(1);
+
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
 
   using Kernel = ShuffleRows<T>;
-  sycl::range<1> global_range{ num_dst_rows * num_cols };
+  sycl::range<1> global_range{ num_dest_rows * num_cols };
   sycl::range<1> local_range{ num_cols }; 
 
-  Kernel task(input, dst2src_map, output, num_src_rows, num_dest_rows, num_cols);
+  Kernel task(input, dst2srcmap, output, num_src_rows, num_dest_rows, num_cols);
 
   sycl_kernel_submit(global_range, local_range, queue, task);
   return;
@@ -278,14 +386,112 @@ void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2sr
       input_tensor.scalar_type() == output_tensor.scalar_type(),
       "Input and output tensors must have the same data type");
     SYCL_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::BFloat16, at::ScalarType::Half, query.scalar_type(), "shuffle_rows_kernel_impl", [&]() {
-        shuffle_rows_caller<scalar_t>(
-            reinterpret_cast<int64_t*>(input_tensor.data_ptr()),
-            reinterpret_cast<int64_t*>(output_tensor.data_ptr()),
-            reinterpret_cast<int64_t*>(dst2src_map.data_ptr()),
-            input_tensor.size(0),
-            output_tensor.size(0),
-            kinput_tensor.size(1));
+      at::ScalarType::BFloat16, at::ScalarType::Half, input_tensor.scalar_type(), "shuffle_rows_kernel_impl", [&]() {
+        shuffle_rows_kernel_impl<scalar_t>(input_tensor, dst2src_map, output_tensor);
       });
+  return;
+}
+
+template <typename T, typename T1>
+struct ApplyShuffleMulSum {
+  ApplyShuffleMulSum(
+      const T* input,
+      T* output,
+      const int32_t* dst2src_map,
+      const T1* factors,
+      const int64_t topk,
+      const int64_t hidden_dim)
+      : input_(input),
+        output_(output),
+        dst2src_map_(dst2src_map),
+        factors_(factors),
+        topk_(topk),
+        hidden_dim_(hidden_dim) {}
+
+  void operator()(sycl::nd_item<1> item) const {
+
+    int out_tkn_id = item.get_group(0);
+    float sum_val = 0;
+
+    for (int k = 0; k < topk_; ++k) {
+      int src_perm_offset = out_tkn_id * topk_ + k;
+      int src_index = dst2src_map_[src_perm_offset];
+      T src_val = input_[src_index * hidden_dim_ + item.get_local_id(0)];
+      T1 weight = 0;
+      if (factors_ != nullptr) {
+        weight = factors_[out_tkn_id * topk_ + k];
+      }
+      sum_val += weight * src_val;
+    }
+    output_[out_tkn_id * hidden_dim_ + item.get_local_id(0)] = sum_val;
+  }
+  const T* input_;
+  const int32_t* dst2src_map_;
+  T* output_;
+  const T1* factors_;
+  const unsigned long topk_;
+  const unsigned long hidden_dim_;
+};
+
+template <typename T, typename T1>
+void apply_shuffle_mul_sum_impl(
+      const T* input,
+      T* output,
+      const int32_t* dst2src_map,
+      const T1* factors,
+      const unsigned long out_tkns,
+      const unsigned long out_hidden_dims,
+      const int topk) {
+
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
+
+  using Kernel = ApplyShuffleMulSum<T, T1>;
+  sycl::range<1> global_range{ out_tkns * out_hidden_dims };
+  sycl::range<1> local_range{ out_hidden_dims }; 
+
+  Kernel task(input, output, dst2src_map, factors, topk, out_hidden_dims);
+
+  sycl_kernel_submit(global_range, local_range, queue, task);
+  return;
+
+}
+
+void apply_shuffle_mul_sum(
+    const torch::Tensor& input,
+    torch::Tensor& output,
+    const torch::Tensor& permutation,
+    const std::optional<torch::Tensor>& factors) {
+  int m = output.size(0);
+  int topk = int(permutation.size(0) / m);
+  SYCL_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::BFloat16, at::ScalarType::Half, input.scalar_type(), "apply_shuffle_mul_sum", [&]() {
+    using input_t = scalar_t;
+    if (factors.has_value()) {
+      SYCL_DISPATCH_FLOATING_TYPES_AND2(
+          at::ScalarType::BFloat16, at::ScalarType::Half, factors.value().scalar_type(), "factors dispatch", [&]() {
+        using factors_t = scalar_t;
+        apply_shuffle_mul_sum_impl<input_t, factors_t>(
+            input.data_ptr<input_t>(),
+            output.data_ptr<input_t>(),
+            permutation.data_ptr<int32_t>(),
+            factors->data_ptr<factors_t>(),
+            output.size(0),
+            output.size(1),
+            topk
+          );
+      });
+    } else {
+        apply_shuffle_mul_sum_impl<input_t, input_t>(
+            input.data_ptr<input_t>(),
+            output.data_ptr<input_t>(),
+            permutation.data_ptr<int32_t>(),
+            nullptr,
+            output.size(0),
+            output.size(1),
+            topk
+          );
+    }
+  });
   return;
 }

@@ -10,9 +10,9 @@
 #include <sycl/sycl.hpp>
 #include <vector>
 
-#include "MemoryAccess.h"
-#include "SYCLHelpers.h"
-#include "Utils.h"
+#include "../../MemoryAccess.h"
+#include "../../SYCLHelpers.h"
+#include "../../Utils.h"
 
 #define DPCPP_CONSTANT __attribute__((opencl_constant))
 

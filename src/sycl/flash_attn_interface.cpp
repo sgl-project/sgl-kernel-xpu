@@ -211,7 +211,9 @@ void dispatch_kernel(const Flash_fwd_params& params) {
         } else {
           AT_DISPATCH_BOOL_NO_RETURN(params.is_local, Local, {
             if (params.page_table != nullptr) dispatch_kernel_impl<ElementType, HeadSize, PipelineStages, false, Local, true, true, Sink>(params);
-            else dispatch_kernel_impl<ElementType, HeadSize, PipelineStages, false, Local, false, true, Sink>(params);
+            // currently when paged_kv=false, causal=false, Local=true is causing issue for 
+            // `compiled SIMD16 allocated 256 regs and spilled around 96`
+            // else dispatch_kernel_impl<ElementType, HeadSize, PipelineStages, false, Local, false, true, Sink>(params);
           });
         }
       });

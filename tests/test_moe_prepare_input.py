@@ -9,8 +9,6 @@ from sgl_kernel import prepare_moe_input, shuffle_rows, apply_shuffle_mul_sum
 @pytest.mark.parametrize("top_k", [2])
 @pytest.mark.parametrize("hidden_dims", [16, 32, 64])
 def test_prepare_input_moe(num_tokens, num_experts, top_k, hidden_dims):
-    #import pdb
-    #pdb.set_trace()
     torch.manual_seed(41)
     # Generate unique token
     def generate_unique_topk_ids(tokens, top_k, num_experts):

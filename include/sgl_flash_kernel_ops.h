@@ -62,7 +62,7 @@ std::vector<at::Tensor> mha_fwd(
     std::optional<at::Tensor>& k_descale_,             // (b, h_k)
     std::optional<at::Tensor>& v_descale_,             // (b, h_k)
     float const softmax_scale,
-    std::optional<const at::Tensor>& softmax_sink,
+    std::optional<const at::Tensor>& sinks,
     bool is_causal,
     int window_size_left,
     int window_size_right,

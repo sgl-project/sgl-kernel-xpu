@@ -93,6 +93,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    bool?    pack_gqa,"
       "    int      sm_margin) -> Tensor[]");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
+
+  m.def("cutlass_mla_get_workspace_size", &cutlass_mla_get_workspace_size);
 }
 
 REGISTER_EXTENSION(common_ops)

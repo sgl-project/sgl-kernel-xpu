@@ -37,6 +37,7 @@
 #include <torch/all.h>
 #include <cute/tensor.hpp>
 #include "Utils.h"
+#include "comm/common.h"
 #include "cutlass/util/device_memory.h"
 #include "flash_attn_runner.hpp"
 
@@ -182,7 +183,7 @@ struct Flash_fwd_params {
 };
 
 /// @brief Dispatch kernel implementation for Flash Attention.
-template<typename ElementType, int HeadSize, int PipelineStages, bool CausalMask, bool LocalMask, bool PagedKV, bool VarLen>
+template<typename ElementType, int HeadSize, int PipelineStages, bool CausalMask, bool LocalMask, bool PagedKV, bool VarLen, bool Sink>
 void dispatch_kernel_impl(const Flash_fwd_params& params) {
     using MMAOperation = typename runner::flash_attention::MMAOperationSelector<ElementType>::type;
     using Shape_h = typename runner::flash_attention::ShapeSelector<HeadSize>::type;
@@ -190,7 +191,7 @@ void dispatch_kernel_impl(const Flash_fwd_params& params) {
         ElementType, float, ElementType, 
         typename Shape_h::ShapeQK, typename Shape_h::ShapePV,
         typename Shape_h::ShapeOutput, typename Shape_h::SubgroupLayout, 
-        MMAOperation, PipelineStages, CausalMask, VarLen, PagedKV, LocalMask>::Kernel;
+        MMAOperation, PipelineStages, CausalMask, VarLen, PagedKV, LocalMask, Sink>::Kernel;
     runner::flash_attention::RunFlashAttention<Kernel, decltype(params)>(params);
 }
 
@@ -199,16 +200,21 @@ template<typename ElementType, int HeadSize, int PipelineStages>
 void dispatch_kernel(const Flash_fwd_params& params) {
     // Determine if variable length is needed
     bool is_varlen = (params.cu_seqlens_q != nullptr) || (params.cu_seqlens_k != nullptr);
+    bool use_sink = params.sink_softmax != nullptr;
     
     // Dispatch based on varlen first, then the other boolean combinations
     if (is_varlen) {
+      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
         if (params.is_causal) {
-            if (params.page_table != nullptr) dispatch_kernel_impl<ElementType, HeadSize, PipelineStages, true, false, true, true>(params);
-            else dispatch_kernel_impl<ElementType, HeadSize, PipelineStages, true, false, false, true>(params);
+            if (params.page_table != nullptr) dispatch_kernel_impl<ElementType, HeadSize, PipelineStages, true, false, true, true, Sink>(params);
+            else dispatch_kernel_impl<ElementType, HeadSize, PipelineStages, true, false, false, true, Sink>(params);
         } else {
-            if (params.page_table != nullptr) dispatch_kernel_impl<ElementType, HeadSize, PipelineStages, false, false, true, true>(params);
-            else dispatch_kernel_impl<ElementType, HeadSize, PipelineStages, false, false, false, true>(params);
+          AT_DISPATCH_BOOL_NO_RETURN(params.is_local, Local, {
+            if (params.page_table != nullptr) dispatch_kernel_impl<ElementType, HeadSize, PipelineStages, false, Local, true, true, Sink>(params);
+            else dispatch_kernel_impl<ElementType, HeadSize, PipelineStages, false, Local, false, true, Sink>(params);
+          });
         }
+      });
     } else {
       /*
         // currently we don't support non-varlen kernels

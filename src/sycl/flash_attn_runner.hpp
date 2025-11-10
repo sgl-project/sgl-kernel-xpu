@@ -184,7 +184,8 @@ using LayoutO = cutlass::layout::RowMajor;
 
 template<typename ElementInputType, typename ElementAccumulatorType, typename ElementOutputType,  
         typename TileShapeQK, typename TileShapePV, typename TileShapeOutput, typename SubgroupLayout, 
-        typename MMAOperation, int PipelineStages, bool CausalMask, bool isVarLen, bool PagedKV, bool LocalMask = false, class Scheduler= void>
+        typename MMAOperation, int PipelineStages, bool CausalMask, bool isVarLen, bool PagedKV, 
+        bool LocalMask = false, bool Sink = false, typename ElementSink = bfloat16_t, class Scheduler= void>
 struct XE_Flash_Attention {
   using ElementAccumulator = ElementAccumulatorType;
   using ElementComputeEpilogue = ElementAccumulatorType;
@@ -205,6 +206,7 @@ struct XE_Flash_Attention {
   using GmemTiledCopyV = typename TiledCopyConfig<cute::sizeof_bits_v<ElementInputKV>, cute::sizeof_bits_v<ElementOutput>>::GmemTiledCopyV;
   using GmemTiledCopyStore = typename TiledCopyConfig<cute::sizeof_bits_v<ElementInputQ>, cute::sizeof_bits_v<ElementOutput>>::GmemTiledCopyO;
   using CollectiveEpilogue = cutlass::flash_attention::collective::FlashChunkPrefillEpilogue<
+        Sink,
         EpilogueDispatchPolicy,
         MMAOperation,
         TileShapeOutput,
@@ -213,7 +215,8 @@ struct XE_Flash_Attention {
         ElementOutput, 
         cutlass::gemm::TagToStrideC_t<LayoutO>,
         ElementOutput,
-        GmemTiledCopyStore>;
+        GmemTiledCopyStore,
+        ElementSink>;
   using CollectiveSoftmaxEpilogue = cutlass::flash_attention::collective::FlashChunkPrefillSoftmaxEpilogue<
         CausalMask, LocalMask, EpilogueDispatchPolicy, ElementAccumulator>;
 
@@ -260,6 +263,7 @@ struct EngineImpl {
   using ElementK = typename FlashAttentionKernel::ElementK;
   using ElementV = typename FlashAttentionKernel::ElementV;
   using ElementAcc = typename FlashAttentionKernel::ElementAccumulator;
+  using ElementSink = typename FlashAttentionKernel::ElementSink;
 
   using CollectiveMainloop = typename FlashAttentionKernel::CollectiveMainloop;
   using CollectiveEpilogue = typename FlashAttentionKernel::CollectiveEpilogue;
@@ -418,10 +422,12 @@ struct EngineImpl {
          params.page_table,
          params.page_size,
          params.max_num_pages_per_seq,
-         -1,
-         -1},
+         params.window_size_left,
+         params.window_size_right},
         {(ElementQ)params.scale_softmax},
-        {static_cast<const ElementOutput*>(params.o_ptr), stride_O},
+        {static_cast<const ElementOutput*>(params.o_ptr),
+         stride_O,
+         static_cast<const ElementSink*>(params.sink_softmax)},
         hw_info};
 
     size_t workspace_size = FlashAttentionKernel::get_workspace_size(arguments);

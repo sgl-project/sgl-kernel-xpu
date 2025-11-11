@@ -47,6 +47,7 @@ def ref_mla(
 @pytest.mark.parametrize("block_size", [64, 128]) # 1, 16
 @pytest.mark.parametrize("num_heads", [16, 32, 64, 128])
 @pytest.mark.parametrize("num_kv_splits", [-1, 1])
+@pytest.mark.parametrize("d_latent_rope, d_latent", [(192, 128), (576, 512)])
 def test_cutlass_mla_decode(
     dtype: torch.dtype,
     mean_seq_len: int,
@@ -55,20 +56,21 @@ def test_cutlass_mla_decode(
     block_size: int,
     num_heads: int,
     num_kv_splits: int,
+    d_latent_rope: int,
+    d_latent: int,
 ):
     torch.set_default_dtype(dtype)
     torch.set_default_device(device)
     torch.random.manual_seed(42)
-
     # TODO: currently d = 576 and dv = 512 does not support for mla decode kernel
     # will update once the support is added in cutlass mla decode kernel
     # and remove the d = 192 and dv = 128 settings
-    # d = 576
-    # h_q = num_heads
-    # dv = 512
-    d = 192
+    if d_latent_rope==576 and d_latent == 512:
+        pytest.skip()
+
+    d = d_latent_rope
     h_q = num_heads
-    dv = 128
+    dv = d_latent
 
     q_nope_dim = 128
     q_pe_dim = 64

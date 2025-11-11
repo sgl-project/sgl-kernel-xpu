@@ -62,7 +62,7 @@ struct BmmFP8Runner {
   using ElementA = typename Gemm::ElementA;
   using ElementB = typename Gemm::ElementB;
   using ElementC = typename Gemm::ElementC;
-  using ElementD = typename Gemm::ElementOutput;
+  using ElementD = typename Gemm::ElementOutputD;
   using LayoutA = typename Gemm::LayoutA;
   using LayoutB = typename Gemm::LayoutB;
   using LayoutC = typename Gemm::LayoutC;
@@ -160,7 +160,7 @@ struct BmmFP8Config {
   using ElementInputA = ElementInputFp8;
   using ElementInputB = ElementInputFp8;
   using ElementScale = cutlass::half_t;
-  using ElementOutput = ElementOutput;
+  using ElementOutputD = ElementOutput;
 
   using LayoutA = cutlass::layout::RowMajor;
   using LayoutB = cutlass::layout::RowMajor;
@@ -292,9 +292,8 @@ static at::Tensor bmm_fp8_impl(
   TORCH_CHECK(scales_a.scalar_type() == at::ScalarType::Float, "scales_a must be Float32");
   TORCH_CHECK(scales_b.scalar_type() == at::ScalarType::Float, "scales_b must be Float32");
   TORCH_CHECK(
-      out_dtype == at::ScalarType::BFloat16 || out_dtype == at::ScalarType::Half ||
-          out_dtype == at::ScalarType::Float8_e4m3fn || out_dtype == at::ScalarType::Float8_e5m2,
-      "out_dtype must be BFloat16, Float16, Float8_e4m3fn, or Float8_e5m2");
+      out_dtype == at::ScalarType::BFloat16 || out_dtype == at::ScalarType::Half,
+      "out_dtype must be BFloat16 or Float16");
 
   CHECK_DEVICE(mat_a);
   CHECK_DEVICE(mat_b);

@@ -233,9 +233,6 @@ def test_moe_align_block_size_compare_implementations(
         block_sorted_start:block_sorted_end
     ].sort()[0]
 
-    import pdb
-
-    pdb.set_trace()
     assert torch.allclose(
         selected_sorted_ids_xpu,
         selected_sorted_ids_triton,

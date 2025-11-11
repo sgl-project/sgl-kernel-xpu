@@ -110,22 +110,6 @@ def test_cutlass_mla_decode(
     out = cutlass_mla_decode(
         q_nope, q_pe, kv_cache, seq_lens, block_table, workspace, scale, num_kv_splits
     )
-    ###########################################################
-    # test approach 1
-    # new_kv_cache = kv_cache.unsqueeze(2).contiguous()
-    # new_q = q.unsqueeze(1).contiguous()
-    # print(f"new_kv_cache : {new_kv_cache.shape}")
-    # print(f"new_q : {new_q.shape}")
-    # out1 = flash_attn_with_kvcache(
-    #                 q=new_q,                        # (batch, seq_len=1, num_heads, head_dim)
-    #                 k_cache=new_kv_cache,           # (num_blocks, block_size, 1, head_dim)
-    #                 v_cache=new_kv_cache,# (num_blocks, block_size, 1, v_head_dim)
-    #                 cache_seqlens=seq_lens,         # (batch,) - actual sequence lengths
-    #                 page_table=block_table,         # (batch, max_num_blocks) - page table
-    #                 softmax_scale=scale,            # scale: using same scale value(not getting from mla decode)
-    #                 num_splits=num_kv_splits ,      # same as mla decode
-    #             )
-    ###########################################################
     torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
 
 

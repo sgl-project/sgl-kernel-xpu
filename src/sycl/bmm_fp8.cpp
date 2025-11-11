@@ -95,15 +95,22 @@ struct BmmFP8Runner {
     auto shape_A = cute::make_shape(M, K, L);
     auto shape_B = cute::make_shape(N, K, L);
     auto shape_CD = cute::make_shape(M, N, L);
-    auto shape_scale_A = cute::make_shape(1);
-    auto shape_scale_B = cute::make_shape(1);
+    auto shape_scale_A = cute::make_shape(1, 1, 1);
+    auto shape_scale_B = cute::make_shape(1, 1, 1);
 
     StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, shape_A);
     StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, shape_B);
     StrideC stride_C = cutlass::make_cute_packed_stride(StrideC{}, shape_CD);
     StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, shape_CD);
-    StrideScale stride_SA = cutlass::make_cute_packed_stride(StrideScale{}, shape_scale_A);
-    StrideScale stride_SB = cutlass::make_cute_packed_stride(StrideScale{}, shape_scale_B);
+
+    float scale_value = scales_a.item<float>();
+    auto scale_tensora = torch::full({M},static_cast<float>(scale_value),torch::dtype(torch::kFloat16).device(torch::kXPU));
+    cutlass::half_t* ptr_scale_A = reinterpret_cast<cutlass::half_t*>(scale_tensora.data_ptr<at::Half>());
+     scale_value = scales_b.item<float>();
+     auto scale_tensorb = torch::full({N},static_cast<float>(scale_value),torch::dtype(torch::kFloat16).device(torch::kXPU));
+     cutlass::half_t* ptr_scale_B = reinterpret_cast<cutlass::half_t*>(scale_tensorb.data_ptr<at::Half>());
+    StrideScale stride_SA = cute::make_stride(Int<1>{}, 0L, 0L);
+    StrideScale stride_SB = cute::make_stride(Int<1>{}, 0L, 0L);
 
     float alpha = 1.0f;
     float beta = 0.0f;
@@ -119,9 +126,9 @@ struct BmmFP8Runner {
          stride_A,
          static_cast<ElementB*>(mat_b.data_ptr()),
          stride_B,
-         static_cast<ElementScale*>(scales_a.data_ptr()),
+         static_cast<ElementScale*>(ptr_scale_A),
          stride_SA,
-         static_cast<ElementScale*>(scales_b.data_ptr()),
+         static_cast<ElementScale*>(ptr_scale_B),
          stride_SB,
          nullptr,
          stride_SA,  // No zero point for A
@@ -269,12 +276,12 @@ static at::Tensor bmm_fp8_impl(
   return out;
 }
  void bmm_fp8(
-    at::Tensor& mat_a,
-    at::Tensor& mat_b,
-    at::Tensor& mat_d,
-    at::Tensor& scales_a,
-    at::Tensor& scales_b,
-    at::Tensor& workspace_buffer,
+    at::Tensor mat_a,
+    at::Tensor mat_b,
+    at::Tensor mat_d,
+    at::Tensor scales_a,
+    at::Tensor scales_b,
+    at::Tensor workspace_buffer,
     int64_t cublas_handle,
     int64_t cuda_stream) {
 // Main entry point

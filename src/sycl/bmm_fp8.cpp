@@ -83,10 +83,10 @@ struct BmmFP8Runner {
       const at::Tensor& scales_b,
       at::Tensor& out,
       const cutlass::KernelHardwareInfo& hw_info) {
-    int M = mat_a.size(0);
-    int N = mat_b.size(1);
-    int K = mat_a.size(1);
-    int L = mat_a.size(2);
+    int L = mat_a.size(0);
+    int N = mat_b.size(2);
+    int M = mat_a.size(1);
+    int K = mat_a.size(2);
 
     // Setup problem shape
     auto problem_shape = cute::make_shape(M, N, K, L);
@@ -95,8 +95,8 @@ struct BmmFP8Runner {
     auto shape_A = cute::make_shape(M, K, L);
     auto shape_B = cute::make_shape(N, K, L);
     auto shape_CD = cute::make_shape(M, N, L);
-    auto shape_scale_A = cute::make_shape(M, 1, L);
-    auto shape_scale_B = cute::make_shape(N, 1, L);
+    auto shape_scale_A = cute::make_shape(1);
+    auto shape_scale_B = cute::make_shape(1);
 
     StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, shape_A);
     StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, shape_B);
@@ -301,20 +301,26 @@ static at::Tensor bmm_fp8_impl(
 
 //   TORCH_CHECK(mat_a.dim() == 2, "mat_a must be 2D");
 //   TORCH_CHECK(mat_b.dim() == 2, "mat_b must be 2D");
+if(cute::thread(0,0)){
 
-  int M = mat_a.size(0);
-  int K = mat_a.size(1);
-  int L = mat_a.size(2);
-  int K_b = mat_b.size(0);
-  int N = mat_b.size(1);
-  int L_b = mat_b.size(2);
+// print(mat_a);
+// print(mat_b);
+// print(mat_d);
+}
+
+  int M = mat_a.size(1);
+  int K = mat_a.size(2);
+  int L = mat_a.size(0);
+  int K_b = mat_b.size(1);
+  int N = mat_b.size(2);
+  int L_b = mat_b.size(0);
 
   TORCH_CHECK(K == K_b, "Inner dimensions must match");
   TORCH_CHECK(L == L_b, "Batch dimension must match");
-  TORCH_CHECK(scales_a.size(0) == M, "scales_a must have size M");
-  TORCH_CHECK(scales_b.size(0) == N, "scales_b must have size N");
-  TORCH_CHECK(scales_a.is_contiguous(), "scales_a must be contiguous");
-  TORCH_CHECK(scales_b.is_contiguous(), "scales_b must be contiguous");
+  // TORCH_CHECK(scales_a.size(0) == M, "scales_a must have size M");
+  // TORCH_CHECK(scales_b.size(0) == N, "scales_b must have size N");
+  // TORCH_CHECK(scales_a.is_contiguous(), "scales_a must be contiguous");
+  // TORCH_CHECK(scales_b.is_contiguous(), "scales_b must be contiguous");
 
   // Convert scales to half precision for GEMM
   at::Tensor scales_a_half = scales_a.to(at::ScalarType::Half).contiguous();

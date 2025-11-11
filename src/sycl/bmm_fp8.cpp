@@ -57,12 +57,11 @@ template <typename Kernel>
 class BmmFP8Kernel {};
 
 // Kernel runner template
-template <typename Gemm>
+template <typename Gemm, typename ElementOutput>
 struct BmmFP8Runner {
   using ElementA = typename Gemm::ElementA;
   using ElementB = typename Gemm::ElementB;
   using ElementC = typename Gemm::ElementC;
-  using ElementD = typename Gemm::ElementOutputD;
   using LayoutA = typename Gemm::LayoutA;
   using LayoutB = typename Gemm::LayoutB;
   using LayoutC = typename Gemm::LayoutC;
@@ -129,7 +128,7 @@ struct BmmFP8Runner {
          nullptr,
          stride_SB,  // No zero point for B
          K},         // group_size = K for per-row/col scaling
-        {{alpha, beta}, dummy_C.get(), stride_C, static_cast<ElementD*>(out.data_ptr()), stride_D},
+        {{alpha, beta}, dummy_C.get(), stride_C, static_cast<ElementOutput*>(out.data_ptr()), stride_D},
         hw_info};
 
     Gemm gemm_op;
@@ -160,7 +159,6 @@ struct BmmFP8Config {
   using ElementInputA = ElementInputFp8;
   using ElementInputB = ElementInputFp8;
   using ElementScale = cutlass::half_t;
-  using ElementOutputD = ElementOutput;
 
   using LayoutA = cutlass::layout::RowMajor;
   using LayoutB = cutlass::layout::RowMajor;
@@ -194,7 +192,7 @@ struct BmmFP8Config {
       FusionCallbacks<EpilogueDispatchPolicy, EpilogueOp, TileShape, decltype(tile_shape(TiledMma()))>;
 
   // Use U16 store for FP16/BF16
-  using GmemTiledCopyStore = XE_2D_U32x8x16_ST_N;
+  using GmemTiledCopyStore = XE_2D_U16x8x16_ST_N;
 
   using CollectiveEpilogue = cutlass::epilogue::collective::CollectiveEpilogue<
       EpilogueDispatchPolicy,
@@ -256,11 +254,11 @@ static at::Tensor bmm_fp8_impl(
 
   if (out_dtype == at::ScalarType::BFloat16) {
     using Config = BmmFP8Config<ElementInputFp8, cutlass::bfloat16_t>;
-    BmmFP8Runner<typename Config::Gemm> runner;
+    BmmFP8Runner<typename Config::Gemm, cutlass::bfloat16_t> runner;
     status = runner.run(mat_a_contig, mat_b_contig, scales_a_half, scales_b_half, out, hw_info);
   } else {  // Half - used for both FP16 output and FP8 intermediate
     using Config = BmmFP8Config<ElementInputFp8, cutlass::half_t>;
-    BmmFP8Runner<typename Config::Gemm> runner;
+    BmmFP8Runner<typename Config::Gemm, cutlass::half_t> runner;
     status = runner.run(mat_a_contig, mat_b_contig, scales_a_half, scales_b_half, out, hw_info);
   }
 
@@ -327,7 +325,7 @@ static at::Tensor bmm_fp8_impl(
   at::Tensor scales_b_for_unscale = scales_b_half.to(at::ScalarType::Float);
 
   // For FP8 output, use FP16 intermediate or requested out dtype
-  // at::ScalarType intermediate_dtype;
+  at::ScalarType intermediate_dtype;
   if (is_fp8_dtype(out_dtype)) {
     intermediate_dtype = at::ScalarType::Half;
   } else {

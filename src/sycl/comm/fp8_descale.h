@@ -94,8 +94,8 @@ CUTLASS_DEVICE void convert_and_descale(SrcTensor const& src, DstTensor& dst, fl
   auto src_ptr = reinterpret_cast<SrcVec_u8 const*>(src.data());
   auto dst_ptr = reinterpret_cast<DstVec_u16*>(dst.data());
 
-  // Create a SCALAR bfloat16_t for scaling
-  const cutlass::bfloat16_t scale_bf16 = static_cast<cutlass::bfloat16_t>(scale);
+  // Keep scale as FLOAT to maintain precision for small values
+  const float scale_f32 = scale;
 
   CUTLASS_PRAGMA_UNROLL
   for (int i = 0; i < cute::size(src) / VectorizeSize; ++i) {
@@ -115,11 +115,15 @@ CUTLASS_DEVICE void convert_and_descale(SrcTensor const& src, DstTensor& dst, fl
       // 2. Reinterpret bits as bfloat16_t to perform math
       cutlass::bfloat16_t val_bf16 = reinterpret_cast<cutlass::bfloat16_t const&>(val_bf16_bits);
 
-      // 3. Apply scaling
-      val_bf16 *= scale_bf16;
+      // 3. Apply scaling in FLOAT precision (not bfloat16)
+      float val_f32 = static_cast<float>(val_bf16);
+      val_f32 *= scale_f32;
 
-      // 4. Reinterpret back to bits for storage
-      result_vec_u16[j] = reinterpret_cast<uint16_t const&>(val_bf16);
+      // 4. Convert back to bfloat16
+      cutlass::bfloat16_t scaled_bf16 = static_cast<cutlass::bfloat16_t>(val_f32);
+
+      // 5. Store as bits
+      result_vec_u16[j] = reinterpret_cast<uint16_t const&>(scaled_bf16);
     }
 
     // 5. Store the final vector of bits

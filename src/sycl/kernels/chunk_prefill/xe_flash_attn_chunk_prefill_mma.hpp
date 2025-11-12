@@ -436,10 +436,10 @@ struct FlashChunkPrefillMma<
     for (int i = 0; i < tile_count; i++) {
       copy(gmem_tiled_copy_v, tVgV(_, _, _, i), tVrV);
       if constexpr (is_fp8_v<ElementV>) {
-        auto tCrV_fp16 = make_fragment_like<bfloat16_t>(tCrV);
-        convert_and_descale<ElementV>(tCrV, tCrV_fp16, v_scale);
+        auto tCrV_bf16 = make_fragment_like<bfloat16_t>(tCrV);
+        convert_and_descale<ElementV>(tCrV, tCrV_bf16, v_scale);
 
-        cute::gemm(tiled_mma, accum(_, _, _, i), tPr, tCrV_fp16, frag_src(_, _, _, i));
+        cute::gemm(tiled_mma, accum(_, _, _, i), tPr, tCrV_bf16, frag_src(_, _, _, i));
       } else {
         cute::gemm(tiled_mma, accum(_, _, _, i), tPr, tCrV, frag_src(_, _, _, i));
       }

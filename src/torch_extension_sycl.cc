@@ -56,6 +56,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "bool is_neox) -> (Tensor, Tensor)");
   m.impl("rotary_embedding", torch::kXPU, &at::native::xpu::rotary_embedding);
 
+  m.def("moe_sum_reduce(Tensor input, Tensor output, float routed_scaling_factor) -> ()");
+  m.impl("moe_sum_reduce", torch::kCUDA, &moe_sum_reduce);
+
   //   m.def(
   //       "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype,
   //       -> Tensor");

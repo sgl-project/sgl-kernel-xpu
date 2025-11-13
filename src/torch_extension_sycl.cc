@@ -92,7 +92,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    Tensor?  k_descale,"
       "    Tensor?  v_descale,"
       "    float    softmax_scale,"
-      "    Tensor?  softmax_sink,"
+      "    Tensor?  sinks,"
       "    bool     is_causal,"
       "    int      window_size_left,"
       "    int      window_size_right,"

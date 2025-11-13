@@ -489,7 +489,7 @@ def generate_qkv(
 # )
 @pytest.mark.parametrize("causal,local", [(False, True), (False, False), (True, False)])
 # @pytest.mark.parametrize("causal,local", [(True, False)])
-@pytest.mark.parametrize("use_softmax_sink", [True, False])
+@pytest.mark.parametrize("use_sinks", [True, False])
 # @pytest.mark.parametrize(
 #     "seqlen_new_eq_seqlen_q", [True, False] if not DISABLE_APPENDKV else [True]
 # )
@@ -556,7 +556,7 @@ def test_flash_attn_kvcache(
     seqlen_new_eq_seqlen_q,
     causal,
     local,
-    use_softmax_sink,
+    use_sinks,
     new_kv,
     mha_type,
     dtype,
@@ -586,8 +586,8 @@ def test_flash_attn_kvcache(
     assert nheads % nheads_k == 0
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
-    if use_softmax_sink:
-        softmax_sink = torch.randn(nheads, device=device, dtype=dtype_ref)
+    if use_sinks:
+        sinks = torch.randn(nheads, device=device, dtype=dtype_ref)
     if dtype == torch.float8_e4m3fn or not is_hopper():
         # for fp8 and ampere arch, we not support v head dim != qk head dim
         dv_vals = [d]
@@ -831,7 +831,7 @@ def test_flash_attn_kvcache(
             k_cache_rep,
             v_cache_rep,
             softmax_scale,
-            softmax_sink if use_softmax_sink else None,
+            sinks if use_sinks else None,
             query_padding_mask,
             key_padding_mask,
             causal=causal,
@@ -844,7 +844,7 @@ def test_flash_attn_kvcache(
             k_cache_rep,
             v_cache_rep,
             softmax_scale,
-            softmax_sink if use_softmax_sink else None,
+            sinks if use_sinks else None,
             query_padding_mask,
             key_padding_mask,
             causal=causal,
@@ -905,7 +905,7 @@ def test_flash_attn_kvcache(
                     causal=causal,
                     window_size=window_size,
                     softmax_scale=softmax_scale,
-                    softmax_sink=softmax_sink if use_softmax_sink else None,
+                    sinks=sinks if use_sinks else None,
                     rotary_interleaved=rotary_interleaved,
                     scheduler_metadata=scheduler_metadata,
                     num_splits=num_splits,

@@ -1,4 +1,4 @@
-# SGL Kernel for XPU
+<img width="462" height="23" alt="image" src="https://github.com/user-attachments/assets/77e33599-3f32-4367-8f84-5f9eee561eeb" /># SGL Kernel for XPU
 
 A fork of [Kernel Library](https://github.com/sgl-project/sglang/tree/main/sgl-kernel) for SGLang support on Intel GPU backend
 
@@ -89,6 +89,11 @@ To use this with your library functions, simply wrap them with make_pytorch_shim
  */
  m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
 ```
+
+### Contributing
+
+We welcome contributions of all kinds!  
+Please read our [Contributing Guidelines](./CONTRIBUTING.md) before submitting a pull request.
 
 ### Testing & Benchmarking
 

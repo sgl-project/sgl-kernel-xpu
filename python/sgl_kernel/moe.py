@@ -375,48 +375,33 @@ def fused_experts(
     else:
         out_hidden_states = torch.zeros_like(hidden_states)
 
-    # import pdb; pdb.set_trace()
-    idxs = topk_ids.flatten().argsort()
-    counts = topk_ids.flatten().to(torch.long).bincount(minlength=E).cpu().numpy()
-    tokens_per_expert = counts.cumsum()
-    num_per_tok = TopK
-    token_idxs = idxs // num_per_tok
-    offset = []
+    flat_topk = topk_ids.flatten()
+    idxs = flat_topk.argsort()
+    sorted_expert_ids = flat_topk[idxs]
+
+    counts = torch.bincount(sorted_expert_ids, minlength=E)  # [E]
+    token_idxs = idxs // TopK  # [num_tokens * TopK]
     input_A = torch.empty(
         (num_tokens * TopK, K), device=hidden_states.device, dtype=hidden_states.dtype
     )
-    for expert_id, end_idx in enumerate(tokens_per_expert):
-        start_idx = 0 if expert_id == 0 else tokens_per_expert[expert_id - 1]
-        offset.append(end_idx - start_idx)
-        if start_idx == end_idx:
-            continue
-        exp_token_idxs = token_idxs[start_idx:end_idx]
-        # expert_tokens = hidden_states[exp_token_idxs]
-        # grouped_input_A.append(expert_tokens)
-        input_A[start_idx:end_idx, :].copy_(hidden_states[exp_token_idxs].squeeze(1))
-    offset = torch.tensor(offset, device="xpu", dtype=torch.int32)
+    input_A = hidden_states[token_idxs].squeeze(1)
+    offset = counts.to(torch.int32)
 
-    # import pdb; pdb.set_trace()
     torch.ops.sgl_kernel.moe_grouped_mm_nt(intermediate_cache1, input_A, w1, offset, E)
 
-    gate, up_ = torch.split(intermediate_cache1, N, dim=1)
-    act = torch.nn.SiLU()
-    intermediate_cache2 = act(gate) * up_
+    torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
 
     torch.ops.sgl_kernel.moe_grouped_mm_nt(
         intermediate_cache3, intermediate_cache2.contiguous(), w2, offset, E
     )
-    for expert_id, end_idx in enumerate(tokens_per_expert):
-        start_idx = 0 if expert_id == 0 else tokens_per_expert[expert_id - 1]
-        if start_idx == end_idx:
-            continue
 
-        exp_token_idxs = token_idxs[start_idx:end_idx]
-        expert_out = intermediate_cache3[start_idx:end_idx]
-        expert_out.mul_(topk_weights.view(-1, 1)[idxs[start_idx:end_idx]])
-        # import pdb; pdb.set_trace()
-        out_hidden_states.scatter_reduce_(
-            0, exp_token_idxs.view(-1, 1).repeat(1, OutK), expert_out, reduce="sum"
-        )
+    flat_weights = topk_weights.to(intermediate_cache3.dtype).flatten()[idxs]  # [N]
+    intermediate_cache3 = intermediate_cache3 * flat_weights.unsqueeze(1)
+    out_hidden_states.scatter_reduce_(
+        0,
+        token_idxs.view(-1, 1).expand(-1, OutK),
+        intermediate_cache3,
+        reduce="sum",
+    )
 
     return out_hidden_states

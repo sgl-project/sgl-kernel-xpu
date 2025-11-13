@@ -92,7 +92,7 @@ To use this with your library functions, simply wrap them with make_pytorch_shim
 
 ### Contributing
 
-We welcome contributions of all kinds!  
+We welcome contributions of all kinds!
 Please read our [Contributing Guidelines](./CONTRIBUTING.md) before submitting a pull request.
 
 ### Testing & Benchmarking

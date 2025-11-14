@@ -4,8 +4,8 @@
 
 #include <sycl/sycl.hpp>
 
-#include "SYCLHelpers.h"
-#include "Utils.h"
+#include "../../SYCLHelpers.h"
+#include "../../Utils.h"
 
 namespace at::native::xpu {
 

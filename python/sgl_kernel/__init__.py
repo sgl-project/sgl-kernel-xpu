@@ -53,7 +53,6 @@ from sgl_kernel.moe import (
     fp8_blockwise_scaled_grouped_mm,
     fused_experts,
     moe_align_block_size,
-    moe_align_block_size_impl,
     moe_fused_gate,
     moe_sum,
     moe_sum_reduce,

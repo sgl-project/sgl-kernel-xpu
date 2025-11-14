@@ -3,7 +3,7 @@ from typing import Any, Dict, Optional
 import torch
 
 
-def moe_align_block_size_impl(
+def moe_align_block_size(
     topk_ids,
     num_experts,
     block_size,
@@ -23,43 +23,6 @@ def moe_align_block_size_impl(
         cumsum_buffer,
         pad_sorted_token_ids,
     )
-
-
-def moe_align_block_size(
-    topk_ids,
-    num_experts,
-    block_size,
-    pad_sorted_token_ids=False,
-):
-    max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
-
-    sorted_ids_xpu = torch.empty(
-        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
-    )
-    if not pad_sorted_token_ids:
-        sorted_ids_xpu.fill_(topk_ids.numel())
-    max_num_m_blocks = max_num_tokens_padded // block_size
-    expert_ids_xpu = torch.zeros(
-        (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
-    )
-    num_tokens_post_pad_xpu = torch.empty(
-        (1), dtype=torch.int32, device=topk_ids.device
-    )
-    cumsum_buffer = torch.empty(
-        num_experts + 2, dtype=torch.int32, device=topk_ids.device
-    )
-    moe_align_block_size_impl(
-        topk_ids,
-        num_experts + 1,
-        block_size,
-        sorted_ids_xpu,
-        expert_ids_xpu,
-        num_tokens_post_pad_xpu,
-        cumsum_buffer,
-        pad_sorted_token_ids,
-    )
-
-    return sorted_ids_xpu, expert_ids_xpu, num_tokens_post_pad_xpu
 
 
 def topk_softmax(

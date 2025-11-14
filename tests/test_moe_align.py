@@ -4,7 +4,7 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel import moe_align_block_size_impl, moe_sum
+from sgl_kernel import moe_align_block_size, moe_sum
 
 
 def ceil_div(a, b):
@@ -180,7 +180,7 @@ def test_moe_align_block_size_compare_implementations(
     expert_ids_triton = torch.zeros_like(expert_ids_xpu)
     num_tokens_post_pad_triton = torch.empty_like(num_tokens_post_pad_xpu)
 
-    moe_align_block_size_impl(
+    moe_align_block_size(
         topk_ids,
         num_experts + 1,
         block_size,

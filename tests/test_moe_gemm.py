@@ -93,7 +93,9 @@ def test_moe_gemm(num_tokens, topk, num_experts, hidden_size, intermediate_size)
         topk_ids,
     )
     # import pdb; pdb.set_trace()
-    assert torch.allclose(torch_output, sglang_output, rtol=rtol, atol=atol * hidden_size)
+    assert torch.allclose(
+        torch_output, sglang_output, rtol=rtol, atol=atol * hidden_size
+    )
 
 
 if __name__ == "__main__":

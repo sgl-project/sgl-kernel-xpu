@@ -1,4 +1,4 @@
-<img width="462" height="23" alt="image" src="https://github.com/user-attachments/assets/77e33599-3f32-4367-8f84-5f9eee561eeb" /># SGL Kernel for XPU
+# SGL Kernel for XPU
 
 A fork of [Kernel Library](https://github.com/sgl-project/sglang/tree/main/sgl-kernel) for SGLang support on Intel GPU backend
 

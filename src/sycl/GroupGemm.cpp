@@ -65,98 +65,18 @@ struct MoERunner {
     return arguments;
   }
 
-  void
-  run(sycl::queue queue,
+  int init(
+      int device_id,
       const void* activations,
       const void* weights,
       void* outputs,
       const int gemm_n,
       const int gemm_k,
       const int* num_rows_per_expert_device,
-      const int num_experts) {
-    // The KernelHardwareInfo struct holds the number of EUs on the GPU with a
-    // given device ID. This information is used by the underlying kernel.
-    cutlass::KernelHardwareInfo hw_info;
-    // Change device_id to another value if you are running on a machine with
+      const int num_experts) {  // Change device_id to another value if you are running on a machine with
     // multiple GPUs and wish to use a GPU other than that with device ID 0.
     hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
-
-    using LayoutA = cutlass::layout::RowMajor;
-    using LayoutB = cutlass::layout::ColumnMajor;
-    using LayoutC = cutlass::layout::RowMajor;
-    using LayoutD = cutlass::layout::RowMajor;
-
-    using GmemTiledCopyA = XE_2D_U16x8x32_LD_N;
-    using GmemTiledCopyB = XE_2D_U16x16x16_LD_T;
-
-    // Workgroup-level tile
-    using TileShape = Shape<_256, _256, _32>;
-
-    using TiledMma =  // M=8,N=16,K=16, D=f32,A=bf16,B=bf16,C=f32
-        typename TiledMMAHelper<
-            MMA_Atom<XE_8x16x16_F32BF16BF16F32_TT>,
-            Layout<TileShape>,
-            Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>>::TiledMMA;
-
-    constexpr int PipelineStages = 2;
-    // Dispatch to grouped gemm algorithm
-    using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16MoE<PipelineStages, cutlass::gemm::KernelXeMoEGEMM>;
-    using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeXMX16Group;
-
-    // ScaledAcc needs to be supported in xe_builder.inl and xe_callbacks.cpp
-    // This is a workaround
-    using EpilogueOp = cutlass::epilogue::fusion::
-        LinearCombination<float_t, float_t, float_t, float_t, cutlass::FloatRoundStyle::round_to_nearest>;
-    using CopyOpG2R = XE_2D_U32x8x16_LD_N;
-    using CopyOpR2G = XE_2D_U16x8x16_ST_N;
-
-    using Stride = std::conditional_t<
-        cute::is_tuple_v<std::remove_pointer_t<LayoutC>>,
-        LayoutC,
-        cutlass::detail::TagToStrideC_t<LayoutC*>>;
-    using FusionCallbacks = typename cutlass::epilogue::collective::detail::FusionOpInfo<
-        EpilogueOp>::template FusionCallbacks<cutlass::epilogue::IntelXeXMX16Group, TileShape, TileShape, CopyOpG2R>;
-    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveEpilogue<
-        cutlass::epilogue::IntelXeXMX16MoE,
-        TileShape,
-        float,
-        Stride,
-        scalar_t,
-        Stride,
-        FusionCallbacks,
-        CopyOpG2R,
-        void,
-        void,
-        CopyOpR2G,
-        void,
-        void>;
-
-    // Mainloop
-    using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
-        GEMMDispatchPolicy,
-        TileShape,
-        scalar_t,
-        cutlass::gemm::TagToStrideA_t<LayoutA*>,
-        scalar_t,
-        cutlass::gemm::TagToStrideB_t<LayoutB*>,
-        TiledMma,
-        GmemTiledCopyA,
-        void,
-        void,
-        cute::identity,  // A
-        GmemTiledCopyB,
-        void,
-        void,
-        cute::identity  // B
-        >;
-
-    using GemmKernel = cutlass::gemm::kernel::
-        GemmMoEUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue, cutlass::gemm::GroupScheduler>;
-
-    using Gemm = cutlass::gemm::device::GemmMoEUniversalAdapter<GemmKernel>;
-
-    Gemm gemm_op;
-    auto arguments = args_from_options<Gemm>(
+    gemm_args = args_from_options<Gemm>(
         hw_info,
         reinterpret_cast<const scalar_t*>(activations),
         reinterpret_cast<const scalar_t*>(weights),
@@ -165,17 +85,94 @@ struct MoERunner {
         gemm_k,
         num_rows_per_expert_device,
         num_experts);
-    size_t workspace_size = Gemm::get_workspace_size(arguments);
-    cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+    TORCH_CHECK(gemm_op.can_implement(gemm_args) == cutlass::Status::kSuccess, "GEMM configuration not supported.");
+    return Gemm::get_workspace_size(gemm_args);
+  }
 
-    TORCH_CHECK(gemm_op.can_implement(arguments) == cutlass::Status::kSuccess, "GEMM configuration not supported.");
-
-    TORCH_CHECK(
-        gemm_op.initialize(arguments, workspace.get()) == cutlass::Status::kSuccess, "Failed to initialize GEMM.");
+  void run(sycl::queue queue, void* workspace) {
+    TORCH_CHECK(gemm_op.initialize(gemm_args, workspace) == cutlass::Status::kSuccess, "Failed to initialize GEMM.");
 
     // Run the GEMM
     TORCH_CHECK(gemm_op.run(&queue) == cutlass::Status::kSuccess, "Failed to run GEMM.");
   }
+
+ public:
+  using LayoutA = cutlass::layout::RowMajor;
+  using LayoutB = cutlass::layout::ColumnMajor;
+  using LayoutC = cutlass::layout::RowMajor;
+  using LayoutD = cutlass::layout::RowMajor;
+
+  using GmemTiledCopyA = XE_2D_U16x8x32_LD_N;
+  using GmemTiledCopyB = XE_2D_U16x16x16_LD_T;
+
+  // Workgroup-level tile
+  using TileShape = Shape<_256, _256, _32>;
+
+  using TiledMma =  // M=8,N=16,K=16, D=f32,A=bf16,B=bf16,C=f32
+      typename TiledMMAHelper<
+          MMA_Atom<XE_8x16x16_F32BF16BF16F32_TT>,
+          Layout<TileShape>,
+          Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>>::TiledMMA;
+
+  static constexpr int PipelineStages = 2;
+  // Dispatch to grouped gemm algorithm
+  using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16MoE<PipelineStages, cutlass::gemm::KernelXeMoEGEMM>;
+  using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeXMX16Group;
+
+  // ScaledAcc needs to be supported in xe_builder.inl and xe_callbacks.cpp
+  // This is a workaround
+  using EpilogueOp = cutlass::epilogue::fusion::
+      LinearCombination<float_t, float_t, float_t, float_t, cutlass::FloatRoundStyle::round_to_nearest>;
+  using CopyOpG2R = XE_2D_U32x8x16_LD_N;
+  using CopyOpR2G = XE_2D_U16x8x16_ST_N;
+
+  using StrideC = cutlass::detail::TagToStrideC_t<LayoutC*>;
+  using FusionCallbacks = typename cutlass::epilogue::collective::detail::FusionOpInfo<
+      EpilogueOp>::template FusionCallbacks<cutlass::epilogue::IntelXeXMX16Group, TileShape, TileShape, CopyOpG2R>;
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveEpilogue<
+      cutlass::epilogue::IntelXeXMX16MoE,
+      TileShape,
+      float,
+      StrideC,
+      scalar_t,
+      StrideC,
+      FusionCallbacks,
+      CopyOpG2R,
+      void,
+      void,
+      CopyOpR2G,
+      void,
+      void>;
+
+  // Mainloop
+  using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+      GEMMDispatchPolicy,
+      TileShape,
+      scalar_t,
+      cutlass::gemm::TagToStrideA_t<LayoutA*>,
+      scalar_t,
+      cutlass::gemm::TagToStrideB_t<LayoutB*>,
+      TiledMma,
+      GmemTiledCopyA,
+      void,
+      void,
+      cute::identity,  // A
+      GmemTiledCopyB,
+      void,
+      void,
+      cute::identity  // B
+      >;
+
+  using GemmKernel = cutlass::gemm::kernel::
+      GemmMoEUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue, cutlass::gemm::GroupScheduler>;
+
+  using Gemm = cutlass::gemm::device::GemmMoEUniversalAdapter<GemmKernel>;
+
+  Gemm gemm_op;
+  typename Gemm::Arguments gemm_args;
+  // The KernelHardwareInfo struct holds the number of EUs on the GPU with a
+  // given device ID. This information is used by the underlying kernel.
+  cutlass::KernelHardwareInfo hw_info;
 };
 
 void moe_grouped_mm_nt(
@@ -210,8 +207,8 @@ void moe_grouped_mm_nt(
 
     using Kernel = MoERunner<cutlass::bfloat16_t>;
     Kernel kernel;
-    kernel.run(
-        queue,
+    auto workspace_size = kernel.init(
+        activations.device().index(),
         activations.data_ptr(),
         weights.data_ptr(),
         output.data_ptr(),
@@ -219,5 +216,10 @@ void moe_grouped_mm_nt(
         gemm_k,
         total_rows_for_experts.data_ptr<int>(),
         n_experts);
+    auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(activations.device());
+    auto workspace = torch::empty(workspace_size, workspace_options);
+    kernel.run(queue, workspace.data_ptr());
+  } else {
+    TORCH_CHECK(false, "float16 is not supported yet in moe_grouped_mm_nt");
   }
 }

@@ -270,22 +270,16 @@ def benchmark(
 
     if provider == "torch_compile":
         api_func = fused_moe_torch_compile
-        api_kwargs = {
-            "x": x,
-            "w1": w1,
-            "w2": w2,
-            "input_gating": input_gating,
-            "topk": topk,
-        }
     else:
         api_func = fused_moe_sglang_api
-        api_kwargs = {
-            "x": x,
-            "w1": w1,
-            "w2": w2,
-            "input_gating": input_gating,
-            "topk": topk,
-        }
+
+    api_kwargs = {
+        "x": x,
+        "w1": w1,
+        "w2": w2,
+        "input_gating": input_gating,
+        "topk": topk,
+    }
 
     # Warmup
     for _ in range(10):

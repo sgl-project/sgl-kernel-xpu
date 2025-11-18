@@ -198,28 +198,24 @@ void moe_grouped_mm_nt(
   TORCH_CHECK(
       activations.scalar_type() == weights.scalar_type(), "activations and weights must have the same data type");
   TORCH_CHECK(
-      activations.scalar_type() == at::ScalarType::Half || activations.scalar_type() == at::ScalarType::BFloat16,
-      "Only float16 and bfloat16 are supported in moe_grouped_mm_nt");
+      activations.scalar_type() == at::ScalarType::BFloat16,
+      "Only bfloat16 are supported in moe_grouped_mm_nt currently");
 
-  if (activations.scalar_type() == at::ScalarType::BFloat16) {
-    auto stream = at::xpu::getCurrentXPUStream();
-    auto queue = stream.queue();
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
 
-    using Kernel = MoERunner<cutlass::bfloat16_t>;
-    Kernel kernel;
-    auto workspace_size = kernel.init(
-        activations.device().index(),
-        activations.data_ptr(),
-        weights.data_ptr(),
-        output.data_ptr(),
-        gemm_n,
-        gemm_k,
-        total_rows_for_experts.data_ptr<int>(),
-        n_experts);
-    auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(activations.device());
-    auto workspace = torch::empty(workspace_size, workspace_options);
-    kernel.run(queue, workspace.data_ptr());
-  } else {
-    TORCH_CHECK(false, "float16 is not supported yet in moe_grouped_mm_nt");
-  }
+  using Kernel = MoERunner<cutlass::bfloat16_t>;
+  Kernel kernel;
+  auto workspace_size = kernel.init(
+      activations.device().index(),
+      activations.data_ptr(),
+      weights.data_ptr(),
+      output.data_ptr(),
+      gemm_n,
+      gemm_k,
+      total_rows_for_experts.data_ptr<int>(),
+      n_experts);
+  auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(activations.device());
+  auto workspace = torch::empty(workspace_size, workspace_options);
+  kernel.run(queue, workspace.data_ptr());
 }

@@ -31,8 +31,6 @@ inline size_t next_pow2(size_t n) {
   return n + 1;
 }
 
-#define CEILDIV(x, y) ((x + y - 1) / y)
-
 template <typename scalar_t>
 struct CountAndSortExpertTokensFunctor {
   CountAndSortExpertTokensFunctor(
@@ -212,10 +210,6 @@ struct MOEAlignBlockSizeFunctor : public __SYCL_KER_CONFIG_CONVENTION__ {
   const int32_t scan_size;
   sycl::local_accessor<int32_t> slm_;
   sycl::local_accessor<int32_t> total_token_;
-  // int32_t* shared_counts;
-  // int32_t* prefix;
-  // int32_t* scan_buf;
-  // int32_t* s_total_tokens_post_pad;
 };
 
 template <typename scalar_t>
@@ -268,7 +262,7 @@ struct MOEAlignBlockSizeSmallBatchExpertFunctor : public __SYCL_KER_CONFIG_CONVE
     if (tid == 0) {
       cumsum[0] = 0;
       for (int i = 1; i <= num_experts; ++i) {
-        cumsum[i] = cumsum[i - 1] + CEILDIV(tokens_cnts[block_dim * num_experts + i - 1], block_size) * block_size;
+        cumsum[i] = cumsum[i - 1] + div_up(tokens_cnts[block_dim * num_experts + i - 1], block_size) * block_size;
       }
       *total_tokens_post_pad = static_cast<int32_t>(cumsum[num_experts]);
     }

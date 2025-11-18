@@ -355,7 +355,7 @@ def fused_experts(
     torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
 
     torch.ops.sgl_kernel.moe_grouped_mm_nt(
-        intermediate_cache3, intermediate_cache2.contiguous(), w2, offset, E
+        intermediate_cache3, intermediate_cache2, w2, offset, E
     )
 
     flat_weights = topk_weights.to(intermediate_cache3.dtype).flatten()[idxs]  # [N]

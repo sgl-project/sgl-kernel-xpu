@@ -180,13 +180,7 @@ def flash_attn_with_kvcache(
         q = q.view(-1, q.size(-2), q.size(-1)).contiguous()
     if cache_seqlens is not None:
         assert cache_seqlens.size(0) + 1 == cu_seqlens_q.size(0)
-        cu_seqlens_k = torch.concat(
-            (
-                torch.zeros(1, dtype=torch.int32, device=cache_seqlens.device),
-                torch.cumsum(cache_seqlens, 0),
-            )
-        ).to(torch.int32)
-
+        cu_seqlens_k = cache_seqlens
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
         q,
         k_cache,

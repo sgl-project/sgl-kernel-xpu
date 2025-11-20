@@ -86,9 +86,10 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git add benchmark/baseline.json
-          pip install pre-commit
-          pre-commit run --all-files
-          git add benchmark/baseline.json
+          if command -v pre-commit >/dev/null 2>&1; then
+              pre-commit run --all-files
+              git add benchmark/baseline.json
+          fi
 
           if git diff --cached --quiet; then
               echo "No changes in baseline.json, skipping PR creation."
@@ -101,7 +102,7 @@ jobs:
           echo "${{ secrets.PAT }}" | gh auth login --with-token || { echo "gh auth login failed"; exit 1; }
 
           git push https://${{ secrets.PAT }}@github.com/sgl-project/sgl-kernel-xpu.git update-baseline-${GITHUB_RUN_ID}
-          
+
           PR_URL=$(gh pr create \
             --repo sgl-project/sgl-kernel-xpu \
             --title "CI: Update baseline.json" \

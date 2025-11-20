@@ -107,9 +107,10 @@ jobs:
           PR_URL=$(gh pr create \
             --repo sgl-project/sgl-kernel-xpu \
             --title "CI: Update baseline.json" \
-            --body "Latest: $LATEST\nPrevious: $BASELINE" \
+            --body "$(printf 'Latest: %s\nPrevious: %s' "$LATEST" "$BASELINE")" \
             --base main \
             --head update-baseline-${GITHUB_RUN_ID}
+          )
 
           echo "PR created at $PR_URL"
 

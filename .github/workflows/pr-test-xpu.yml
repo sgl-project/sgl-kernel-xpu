@@ -70,7 +70,7 @@ jobs:
             exit 1
           else
             echo "Performance OK: $LATEST <= $BASELINE"
-          python3 - <<EOF
+python3 - <<EOF
 import json
 with open('benchmark/baseline.json', 'r') as f:
     data = json.load(f)

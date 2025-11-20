@@ -87,10 +87,9 @@ jobs:
           fi
 
           git checkout -b update-baseline-${GITHUB_RUN_ID}
-          git commit -m "Update baseline.json from CI benchmark"
-          git push --set-upstream origin update-baseline-${GITHUB_RUN_ID}
-
           echo "${{ secrets.PAT }}" | gh auth login --with-token
+          git commit -m "Update baseline.json from CI benchmark"
+          git push https://x-access-token:${{ secrets.PAT }}@github.com/sgl-project/sglang-kernel-xpu.git update-baseline-${GITHUB_RUN_ID}
 
           PR_URL=$(gh pr create \
             --title "CI: Update baseline.json" \

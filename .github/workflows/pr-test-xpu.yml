@@ -65,7 +65,7 @@ jobs:
           echo "Latest=$LATEST"
           BASELINE=$(python3 -c "import json; print(json.load(open('benchmark/baseline.json'))['bench_moe_topk_softmax_baseline'])")
           echo "Baseline=$BASELINE"
-          if (( $(echo "$LATEST > $BASELINE" | bc -l) )); then
+          if awk "BEGIN{exit !($LATEST > $BASELINE)}"; then
             echo "Performance regression detected: $LATEST > $BASELINE"
             exit 1
           else

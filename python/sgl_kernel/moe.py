@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -10,8 +10,8 @@ def moe_align_block_size(
     sorted_token_ids,
     experts_ids,
     num_tokens_post_pad,
-    token_cnts_buffer,
     cumsum_buffer,
+    pad_sorted_token_ids=False,
 ):
     torch.ops.sgl_kernel.moe_align_block_size.default(
         topk_ids,
@@ -20,8 +20,8 @@ def moe_align_block_size(
         sorted_token_ids,
         experts_ids,
         num_tokens_post_pad,
-        token_cnts_buffer,
         cumsum_buffer,
+        pad_sorted_token_ids,
     )
 
 
@@ -36,6 +36,28 @@ def topk_softmax(
     )
 
 
+def moe_sum_reduce(
+    input_tensor,
+    output_tensor,
+    routed_scaling_factor=0,
+):
+    torch.ops.sgl_kernel.moe_sum_reduce.default(
+        input_tensor,
+        output_tensor,
+        routed_scaling_factor,
+    )
+
+
+def moe_sum(
+    input_tensor: torch.Tensor,
+    output_tensor: torch.Tensor,
+):
+    torch.ops.sgl_kernel.moe_sum.default(
+        input_tensor,
+        output_tensor,
+    )
+
+
 def moe_fused_gate(
     input_tensor,
     bias,
@@ -44,6 +66,7 @@ def moe_fused_gate(
     topk,
     num_fused_shared_experts=0,
     routed_scaling_factor=0,
+    apply_routed_scaling_factor_on_output=False,
 ):
     # This fused kernel function is used to select topk expert in a hierarchical 2-layer fashion
     # it split group of expert into num_expert_group, and use top2 expert weight sum in each group
@@ -51,8 +74,13 @@ def moe_fused_gate(
     # the #experts is decided by the input tensor shape and we currently only support power of 2 #experts
     # and #experts should be divisible by num_expert_group. #expert/num_expert_group <= 32 is limited for now.
     # for non-supported case, we suggest to use the biased_grouped_topk func in sglang.srt.layers.moe.topk
-    # num_fused_shared_experts: if > 0, the last several experts will be replaced with shared experts
-    # routed_scaling_factor: if > 0, the shared experts will be scaled by this factor
+    # num_fused_shared_experts: if > 0, the last several experts will be
+    #   replaced with shared experts. the shared experts will be divided by the
+    #   routed_scaling_factor - this is intended to cancel out later when routed+shared
+    #   output is scaled so that shared experts are not scaled.
+    # routed_scaling_factor: if > 0, the experts will be scaled by this factor
+    # apply_routed_scaling_factor_on_output: if true, output will be
+    #   scaled by the routed_scaling_factor
     return torch.ops.sgl_kernel.moe_fused_gate.default(
         input_tensor,
         bias,
@@ -61,70 +89,7 @@ def moe_fused_gate(
         topk,
         num_fused_shared_experts,
         routed_scaling_factor,
-    )
-
-
-def ep_moe_pre_reorder(
-    input_tensor,
-    gateup_input,
-    src2dst,
-    topk_ids,
-    a1_scales,
-    start_expert_id,
-    end_expert_id,
-    topk,
-    use_per_token_if_dynamic,
-):
-    return torch.ops.sgl_kernel.ep_moe_pre_reorder.default(
-        input_tensor,
-        gateup_input,
-        src2dst,
-        topk_ids,
-        a1_scales,
-        start_expert_id,
-        end_expert_id,
-        topk,
-        use_per_token_if_dynamic,
-    )
-
-
-def ep_moe_silu_and_mul(
-    gateup_output,
-    down_input,
-    reorder_topk_ids,
-    scales,
-    start_expert_id,
-    end_expert_id,
-):
-    return torch.ops.sgl_kernel.ep_moe_silu_and_mul.default(
-        gateup_output,
-        down_input,
-        reorder_topk_ids,
-        scales,
-        start_expert_id,
-        end_expert_id,
-    )
-
-
-def ep_moe_post_reorder(
-    down_output,
-    output,
-    src2dst,
-    topk_ids,
-    topk_weights,
-    start_expert_id,
-    end_expert_id,
-    topk,
-):
-    return torch.ops.sgl_kernel.ep_moe_post_reorder.default(
-        down_output,
-        output,
-        src2dst,
-        topk_ids,
-        topk_weights,
-        start_expert_id,
-        end_expert_id,
-        topk,
+        apply_routed_scaling_factor_on_output,
     )
 
 
@@ -252,3 +217,154 @@ def cutlass_fp4_group_mm(
         params["blockscale_offsets"],
     )
     return c.to(dtype=out_dtype)
+
+
+def fused_experts(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    b1: Optional[torch.Tensor] = None,
+    b2: Optional[torch.Tensor] = None,
+    inplace: bool = False,
+    activation: str = "silu",
+    use_fp8_w8a8: bool = False,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_zp: Optional[torch.Tensor] = None,
+    w2_zp: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    no_combine: bool = False,
+    routed_scaling_factor: Optional[float] = None,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_limit: Optional[float] = None,
+) -> torch.Tensor:
+    """
+    This function computes a Mixture of Experts (MoE) layer using two sets of
+    weights, w1 and w2, and top-k gating mechanism.
+
+    Parameters:
+    - hidden_states [num_tokens, hidden_dim] (torch.Tensor): The input tensor to the MoE layer.
+    - w1 [num_experts, hidden_dim, output_channel] (torch.Tensor): The first set of expert weights.
+    - w2 [num_experts, output_channel, hidden_dim] (torch.Tensor): The second set of expert weights.
+    - topk_weights [num_tokens, topk] (torch.Tensor): The top-k output of the experts.
+    - topk_ids [num_tokens, topk] (torch.Tensor): The top-k indices of the experts.
+    - b1 (Optional[torch.Tensor]): Optional bias for w1.
+    - b2 (Optional[torch.Tensor]): Optional bias for w2.
+    - inplace (bool): If True, perform operations in-place to save memory. Defaults to False.
+    - activation (str): The activation function to use ('silu' or 'gelu'). Defaults to 'silu'.
+    - use_fp8_w8a8 (bool): If True, use fp8 arithmetic to compute the inner
+        products for w1 and w2. Defaults to False.
+    - w1_scale (Optional[torch.Tensor]): Optional scale to be used for
+        w1.
+    - w2_scale (Optional[torch.Tensor]): Optional scale to be used for
+        w2.
+    - a1_scale (Optional[torch.Tensor]): Optional scale to be used for
+        a1.
+    - a2_scale (Optional[torch.Tensor]): Optional scale to be used for
+        a2.
+    - block_shape: (Optional[List[int]]): Optional block size for block-wise
+        quantization.
+    - no_combine (bool): If True, skip the combine step. Defaults to False.
+    - routed_scaling_factor (Optional[float]): Optional scaling factor for routed tokens, used by Llama4 only.
+    - gemm1_alpha (Optional[float]): Optional gemm1_alpha for the activation
+        function.
+    - gemm1_limit (Optional[float]): Optional gemm1_limit for the swiglu activation
+        function.
+
+    Returns:
+    - torch.Tensor: The output tensor after applying the MoE layer.
+    """
+
+    assert use_fp8_w8a8 is False, "current MoE does not support use_fp8_w8a8"
+    assert w1_scale is None, "current MoE does not support w1_scale"
+    assert w2_scale is None, "current MoE does not support w2_scale"
+    assert a1_scale is None, "current MoE does not support a1_scale"
+    assert a2_scale is None, "current MoE does not support a2_scale"
+    assert block_shape is None, "current MoE does not support block_shape"
+
+    # type check
+    assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
+    assert w1.dtype == torch.bfloat16, "w1 must be bfloat16"
+    assert w2.dtype == torch.bfloat16, "w2 must be bfloat16"
+
+    # Shape check
+    assert hidden_states.ndim == 2, "hidden_states must be 2D"
+    assert (
+        hidden_states.shape[-1] == w1.shape[-1]
+    ), f"hidden_states shape[-1] {hidden_states.shape} must be equal to w1 shape[-2] {w1.shape}"
+    assert (
+        2 * w2.shape[2] == w1.shape[1]
+    ), f"w2 shape[2] {w2.shape[2]} must be half of w1 shape[1] {w1.shape[1]}"
+    assert (topk_ids.shape == topk_weights.shape) and (
+        topk_ids.shape[0] == hidden_states.shape[0]
+    ), f"topk_ids shape {topk_ids.shape} and topk_weights shape {topk_weights.shape} must be equal and match hidden_states shape[0] {hidden_states.shape[0]}"
+
+    num_tokens, _ = hidden_states.shape
+
+    E, _, K = w1.shape
+    E, OutK, N = w2.shape
+    assert N * 2 == w1.shape[1], "w1 shape[1] must be 2x of w2 shape[2]"
+
+    M = num_tokens
+    TopK = topk_ids.shape[1]
+
+    # import pdb; pdb.set_trace()
+    cache = torch.empty(
+        M * TopK * max(2 * N, OutK),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    intermediate_cache1 = cache[: M * TopK * 2 * N].view((M * TopK, 2 * N))
+    intermediate_cache2 = torch.empty(
+        (M * TopK, N),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    intermediate_cache3 = cache[: M * TopK * OutK].view((M * TopK, OutK))
+
+    if no_combine:
+        assert not inplace
+        out_hidden_states = torch.empty(
+            (num_tokens, OutK),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+    elif inplace:
+        out_hidden_states = hidden_states
+    else:
+        out_hidden_states = torch.zeros_like(hidden_states)
+
+    flat_topk = topk_ids.flatten()
+    idxs = flat_topk.argsort()
+    sorted_expert_ids = flat_topk[idxs]
+
+    counts = torch.bincount(sorted_expert_ids, minlength=E)  # [E]
+    token_idxs = idxs // TopK  # [num_tokens * TopK]
+    input_A = torch.empty(
+        (num_tokens * TopK, K), device=hidden_states.device, dtype=hidden_states.dtype
+    )
+    input_A = hidden_states[token_idxs].squeeze(1)
+    offset = counts.to(torch.int32)
+
+    torch.ops.sgl_kernel.moe_grouped_mm_nt(intermediate_cache1, input_A, w1, offset, E)
+
+    torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
+
+    torch.ops.sgl_kernel.moe_grouped_mm_nt(
+        intermediate_cache3, intermediate_cache2, w2, offset, E
+    )
+
+    flat_weights = topk_weights.to(intermediate_cache3.dtype).flatten()[idxs]  # [N]
+    intermediate_cache3 = intermediate_cache3 * flat_weights.unsqueeze(1)
+    out_hidden_states.scatter_reduce_(
+        0,
+        token_idxs.view(-1, 1).expand(-1, OutK),
+        intermediate_cache3,
+        reduce="sum",
+    )
+
+    return out_hidden_states

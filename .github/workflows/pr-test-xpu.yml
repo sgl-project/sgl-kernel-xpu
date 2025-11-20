@@ -91,20 +91,17 @@ jobs:
               exit 0
           fi
 
-          git checkout -b update-baseline-${GITHUB_RUN_ID}
           echo "${{ secrets.PAT }}" | gh auth login --with-token
+
+          git checkout -b update-baseline-${GITHUB_RUN_ID}
           git commit -m "Update baseline.json from CI benchmark"
-          git push https://${{ secrets.PAT }}:x-oauth-basic@github.com/sgl-project/sgl-kernel-xpu.git update-baseline-${GITHUB_RUN_ID}
-
-          PR_URL=$(gh pr create \
+          git push --set-upstream origin update-baseline-${GITHUB_RUN_ID}
+          
+          gh pr create \
             --title "CI: Update baseline.json" \
-            --body "Latest value: $LATEST\nPrevious baseline: $BASELINE\nGenerated automatically by CI." \
+            --body "Latest: $LATEST\nPrevious: $BASELINE" \
             --base main \
-            --head update-baseline-${GITHUB_RUN_ID} \
-            --json url | jq -r '.url')
-
-          echo "PR created at $PR_URL"
-
+            --head update-baseline-${GITHUB_RUN_ID}
 
       - name: Run E2E Bfloat16 tests
         timeout-minutes: 20

@@ -109,7 +109,7 @@ jobs:
             --title "CI: Update baseline.json" \
             --body "Latest: $LATEST\nPrevious: $BASELINE" \
             --base main \
-            --head update-baseline-${GITHUB_RUN_ID} \
+            --head update-baseline-${GITHUB_RUN_ID}
 
           echo "PR created at $PR_URL"
 

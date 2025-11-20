@@ -110,7 +110,6 @@ jobs:
             --body "Latest: $LATEST\nPrevious: $BASELINE" \
             --base main \
             --head update-baseline-${GITHUB_RUN_ID} \
-            --json url | jq -r '.url')
 
           echo "PR created at $PR_URL"
 

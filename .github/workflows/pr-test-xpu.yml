@@ -12,6 +12,7 @@ concurrency:
 jobs:
   build-and-test:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    permissions: write-all
     runs-on: sglang-pvc
     steps:
       - name: Checkout code

@@ -74,6 +74,11 @@ jobs:
             echo "Baseline updated to: $LATEST"
           fi
 
+      - name: Install GitHub CLI
+        run: |
+          sudo apt update
+          sudo apt install -y gh
+
       - name: Auto PR for baseline.json update
         if: success()
         run: |

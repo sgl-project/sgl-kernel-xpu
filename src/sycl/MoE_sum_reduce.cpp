@@ -4,8 +4,102 @@
 
 #include <sycl/sycl.hpp>
 
+#include "MemoryAccess.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+
+template <typename T>
+struct moe_sum_reduce_impl_sycl_k {
+  moe_sum_reduce_impl_sycl_k(
+      const T* input,
+      T* output,
+      const uint32_t token_num,
+      const uint32_t topk_num,
+      const uint32_t hidden_dim,
+      const uint32_t in_stride_token,
+      const uint32_t in_stride_topk,
+      const uint32_t out_stride_token,
+      const uint32_t max_wg_dims,
+      double routed_scaling_factor)
+      : input_(input),
+        output_(output),
+        token_num_(token_num),
+        topk_num_(topk_num),
+        hidden_dim_(hidden_dim),
+        in_stride_token_(in_stride_token),
+        in_stride_topk_(in_stride_topk),
+        out_stride_token_(out_stride_token),
+        max_wg_dims_(max_wg_dims),
+        routed_scaling_factor_(routed_scaling_factor) {}
+
+  void operator()(sycl::nd_item<1> item) const {
+    int tkn_id = item.get_group(0);
+    int thread_id = item.get_local_id(0);
+    for (int i = thread_id; i < hidden_dim_; i += max_wg_dims_) {
+      float acc = 0;
+      const int offset = tkn_id * in_stride_token_ + i;
+#pragma unroll
+      for (int k = 0; k < topk_num_; ++k) {
+        float src_val = static_cast<float>(input_[offset + k * in_stride_topk_]);
+        acc += src_val;
+      }
+      acc *= static_cast<float>(routed_scaling_factor_);
+      output_[tkn_id * out_stride_token_ + thread_id] = static_cast<T>(acc);
+    }
+  }
+
+  const T* input_;
+  T* output_;
+  const uint32_t token_num_;
+  const uint32_t topk_num_;
+  const uint32_t hidden_dim_;
+  const uint32_t in_stride_token_;
+  const uint32_t in_stride_topk_;
+  const uint32_t out_stride_token_;
+  const uint32_t max_wg_dims_;
+  double routed_scaling_factor_;
+};
+
+template <typename T>
+void moe_sum_reduce_impl(at::Tensor& input_tensor, at::Tensor& output_tensor, double routed_scaling_factor) {
+  auto input = reinterpret_cast<T*>(input_tensor.data_ptr());
+  auto output = reinterpret_cast<T*>(output_tensor.data_ptr());
+
+  const uint32_t token_num = input_tensor.size(0);
+  const uint32_t topk_num = input_tensor.size(1);
+  const uint32_t hidden_dim = input_tensor.size(2);
+
+  const uint32_t in_stride_token = input_tensor.stride(0);
+  const uint32_t in_stride_topk = input_tensor.stride(1);
+  const int64_t out_stride_token = output_tensor.stride(0);
+
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
+
+  using Kernel = moe_sum_reduce_impl_sycl_k<T>;
+
+  auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
+  uint32_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
+  uint32_t max_wg_dims = static_cast<uint32_t>(sycl::min(max_wg_size, hidden_dim));
+
+  sycl::range<1> global_range{token_num * max_wg_dims};
+  sycl::range<1> local_range{max_wg_dims};
+
+  Kernel task(
+      input,
+      output,
+      token_num,
+      topk_num,
+      hidden_dim,
+      in_stride_token,
+      in_stride_topk,
+      out_stride_token,
+      max_wg_dims,
+      routed_scaling_factor);
+
+  sycl_kernel_submit(global_range, local_range, queue, task);
+  return;
+}
 
 void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor) {
   TORCH_CHECK(input.dim() == 3, "input must be a 3D tensor like [token_num, topk_num, hidden_dim]");
@@ -16,41 +110,8 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
   TORCH_CHECK(input.is_contiguous(), "expect input to be contiguous");
   TORCH_CHECK(output.is_contiguous(), "expect output to be contiguous");
 
-  const int64_t token_num = input.size(0);
-  const int64_t topk_num = input.size(1);
-  const int64_t hidden_dim = input.size(2);
-
-  const int64_t in_stride_token = input.stride(0);
-  const int64_t in_stride_topk = input.stride(1);
-  const int64_t out_stride_token = output.stride(0);
-
-  const bool fast_bf16_vec_ok = (input.scalar_type() == at::kBFloat16) && (token_num > 256) && (hidden_dim % 8 == 0);
-
-  // Both Fast path and few tokens
-  // [toDo] per token can be reused...
-  if (fast_bf16_vec_ok || !(token_num > 128)) {
-
-    auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
-    uint32_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
-    uint32_t max_tokens = static_cast<uint32_t>(sycl::min(max_wg_size, hidden_dim));
-
-    // max tokens may not work for all condtions - [toDo]
-    const float scale = static_cast<float>(routed_scaling_factor);
-    /* singel SYCL kernel */
-#if 0
-    moe_sum_reduce_per_token_kernel_sycl(
-        reinterpret_cast<const at::BFloat16*>(input.data_ptr<at::BFloat16>()),
-        reinterpret_cast<at::BFloat16*>(output.data_ptr<at::BFloat16>()),
-        token_num,
-        hidden_dim,
-        topk_num,
-        in_stride_token,
-        in_stride_topk,
-        out_stride_token,
-        scale,
-        max_tokens);
-#endif
-    return;
-  }
+  SYCL_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::BFloat16, at::ScalarType::Half, input.scalar_type(), "moe_sum_reduce_impl", [&]() {
+        moe_sum_reduce_impl<scalar_t>(input, output, routed_scaling_factor);
+      });
 }
-

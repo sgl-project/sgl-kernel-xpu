@@ -21,9 +21,6 @@ limitations under the License.
 #include "sgl_kernel_torch_shim.h"
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
-  /*
-   * From csrc/gemm
-   */
   m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
   m.impl("awq_dequantize", torch::kXPU, &awq_dequantize);
 
@@ -56,8 +53,22 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "bool is_neox) -> (Tensor, Tensor)");
   m.impl("rotary_embedding", torch::kXPU, &at::native::xpu::rotary_embedding);
 
+
   m.def("moe_sum_reduce(Tensor input, Tensor output, float routed_scaling_factor) -> ()");
   m.impl("moe_sum_reduce", torch::kCUDA, &moe_sum_reduce);
+  m.def(
+      "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
+      "experts_ids, Tensor! num_tokens_post_pad, Tensor! cumsum_buffer, bool "
+      "pad_sorted_token_ids) -> ()");
+  m.impl("moe_align_block_size", torch::kXPU, &moe_align_block_size);
+
+  m.def("moe_sum(Tensor input, Tensor! output) -> ()");
+  m.impl("moe_sum", torch::kXPU, &moe_sum);
+
+  m.def(
+      "moe_grouped_mm_nt(Tensor output, Tensor activations, Tensor weights, Tensor total_rows_for_experts, int "
+      "n_experts) -> ()");
+  m.impl("moe_grouped_mm_nt", torch::kXPU, &moe_grouped_mm_nt);
 
   //   m.def(
   //       "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype,
@@ -85,7 +96,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    Tensor?  k_descale,"
       "    Tensor?  v_descale,"
       "    float    softmax_scale,"
-      "    Tensor?  softmax_sink,"
+      "    Tensor?  sinks,"
       "    bool     is_causal,"
       "    int      window_size_left,"
       "    int      window_size_right,"

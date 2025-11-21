@@ -50,12 +50,12 @@ from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     cutlass_fp4_group_mm,
-    ep_moe_post_reorder,
-    ep_moe_pre_reorder,
-    ep_moe_silu_and_mul,
     fp8_blockwise_scaled_grouped_mm,
+    fused_experts,
     moe_align_block_size,
     moe_fused_gate,
+    moe_sum,
+    moe_sum_reduce,
     prepare_moe_input,
     topk_softmax,
 )

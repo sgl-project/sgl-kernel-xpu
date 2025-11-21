@@ -153,8 +153,7 @@ struct Flash_fwd_params {
   int* __restrict__ num_splits_dynamic_ptr;
   bool skip_scheduler_metadata_computation;
 
-  int arch;
-  int num_sm;
+  torch::TensorOptions tensor_opts;
 };
 
 template <typename Kernel>
@@ -338,17 +337,17 @@ struct KernelRunner {
 
     // Define device-global scratch memory
     size_t workspace_size = FMHAChunkPrefillKernel::get_workspace_size(arguments);
-    cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+    auto workspace = torch::empty(workspace_size, params.tensor_opts);
 
     if (!FMHAChunkPrefillKernel::can_implement(arguments)) {
       return cutlass::Status::kErrorInvalidProblem;
     }
 
     // Initialize the workspace
-    (FMHAChunkPrefillKernel::initialize_workspace(arguments, workspace.get()));
+    (FMHAChunkPrefillKernel::initialize_workspace(arguments, workspace.data_ptr()));
 
     // Convert host-side arguments to device-side arguments to be passed to the kernel
-    auto params_kernel = FMHAChunkPrefillKernel::to_underlying_arguments(arguments, workspace.get());
+    auto params_kernel = FMHAChunkPrefillKernel::to_underlying_arguments(arguments, workspace.data_ptr());
 
     // Run the Flash Attention implementation.
     run(params_kernel);
@@ -489,7 +488,7 @@ std::vector<at::Tensor> mha_fwd(
     std::optional<at::Tensor>& k_descale_,             // (b, h_k)
     std::optional<at::Tensor>& v_descale_,             // (b, h_k)
     const float softmax_scale_,
-    std::optional<const at::Tensor>& softmax_sink_,
+    std::optional<const at::Tensor>& sinks_,
     bool is_causal,
     int window_size_left,
     int window_size_right,
@@ -643,8 +642,8 @@ std::vector<at::Tensor> mha_fwd(
 
   // Set the different scale values.
   params.scale_softmax = softmax_scale;
-  bool use_sink = softmax_sink_.has_value();
-  params.sink_softmax = use_sink ? softmax_sink_.value().data_ptr() : nullptr;
+  bool use_sink = sinks_.has_value();
+  params.sink_softmax = use_sink ? sinks_.value().data_ptr() : nullptr;
 
   params.softcap = softcap;
 
@@ -680,7 +679,7 @@ std::vector<at::Tensor> mha_fwd(
     TORCH_CHECK(
         q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
         "q_v is only supported for fp16 and bf16 data type");
-    TORCH_CHECK(params.arch == 90, "q_v is only supported for Hopper GPUs");
+    TORCH_CHECK(false, "q_v is not supported yet");
     at::Tensor q_v = q_v_.value();
     TORCH_CHECK(q_v.dtype() == q_type, "q_v must have the same dtype as query");
     CHECK_DEVICE(q_v);
@@ -732,6 +731,8 @@ std::vector<at::Tensor> mha_fwd(
     TORCH_CHECK(kv_batch_idx.scalar_type() == torch::kInt32, "kv_batch_idx must have dtype int32");
     params.kv_batch_idx = reinterpret_cast<int*>(kv_batch_idx.data_ptr());
   }
+
+  params.tensor_opts = torch::TensorOptions().dtype(torch::kUInt8).device(q.device());
 
   at::Tensor out_accum, softmax_lse_accum;
   auto outaccum_type = at::ScalarType::Float;

@@ -130,6 +130,14 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding(
     int64_t head_size,
     at::Tensor& cos_sin_cache,
     bool is_neox);
+void sgl_per_token_group_quant_8bit(
+    at::Tensor input,
+    at::Tensor output_q,
+    at::Tensor output_s,
+    int64_t group_size,
+    double eps,
+    double fp8_min,
+    double fp8_max);
 }  // namespace at::native::xpu
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);

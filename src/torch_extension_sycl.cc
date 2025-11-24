@@ -68,7 +68,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("moe_grouped_mm_nt", torch::kXPU, &moe_grouped_mm_nt);
   m.def(
       "sgl_per_token_group_quant_8bit(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
-      " float eps, float fp8_min, float fp8_max) -> ()");
+      " float eps, float fp8_min, float fp8_max, bool scale_ue8m0) -> ()");
   m.impl("sgl_per_token_group_quant_8bit", torch::kXPU, &at::native::xpu::sgl_per_token_group_quant_8bit);
 
   m.def(

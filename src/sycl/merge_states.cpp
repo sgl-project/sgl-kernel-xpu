@@ -17,7 +17,8 @@ inline float to_float(sycl::half u) {
 
 inline float to_float(sycl::ext::oneapi::bfloat16 u) {
 	    return static_cast<float>(u); // SYCL BF16 -> float conversion built-in
-					  }
+}
+
 inline void from_float(float &d, float s) {
 	    d = s;
 }
@@ -29,9 +30,9 @@ inline void from_float(sycl::half &d, float s) {
 inline void from_float(sycl::ext::oneapi::bfloat16 &d, float s) {
 	    d = static_cast<sycl::ext::oneapi::bfloat16>(s);
 }
+
 template <typename scalar_t, typename pack_128b_t>
 struct MergePrefixSuffix {
-    // 1. Members to store captured variables
     const uint64_t total_threads;
     const uint32_t threads_per_head;
     const uint32_t num_heads;
@@ -44,7 +45,6 @@ struct MergePrefixSuffix {
     const float* suffix_lse;
     float* output_lse;
 
-    // 2. Constructor to initialize members
     MergePrefixSuffix(
         uint64_t total_threads,
         uint32_t threads_per_head,
@@ -69,7 +69,6 @@ struct MergePrefixSuffix {
           suffix_lse(suffix_lse),
           output_lse(output_lse) {}
 
-    // 3. Overloaded operator() - This is the kernel execution entry point
     void operator()(sycl::nd_item<1> it) const {
         const uint64_t global_idx = it.get_global_linear_id();
         if (global_idx >= total_threads)
@@ -121,7 +120,6 @@ struct MergePrefixSuffix {
 
             #pragma unroll
             for (uint32_t i = 0; i < pack_size; ++i) {
-                // Assuming to_float and from_float are defined elsewhere for scalar_t conversion
                 const float pf = to_float(p_vals[i]);
                 const float sf = to_float(s_vals[i]);
                 const float of = pf * p_scale + sf * s_scale;
@@ -158,7 +156,6 @@ void merge_attn_states_sycl(
     const uint64_t total_threads =
         uint64_t(num_tokens) * num_heads * threads_per_head;
 
-    // Same as CUDA blockDim.x = NUM_THREADS → choose your own constant
     const uint32_t local_size = 128;
     const uint64_t global_size =
         ((total_threads + local_size - 1) / local_size) * local_size;
@@ -185,7 +182,7 @@ void merge_attn_states_sycl(
     });
 }
 
-#define SYCL_DISPATCH_BY_SCALAR_DTYPE(scalar_dtype, fn)                         \
+#define SYCL_DISPATCH_BY_SCALAR_DTYPE(scalar_dtype, fn)                          \
   {                                                                              \
     if (scalar_dtype == at::ScalarType::Float) {                                 \
       fn(float);                                                                 \
@@ -199,21 +196,7 @@ void merge_attn_states_sycl(
     }                                                                            \
   }
 
-
-// #define SYCL_LAUNCH_MERGE_ATTN_STATES(scalar_t)                                        \
-//   {                                                                                   \
-//     merge_attn_states_sycl<scalar_t>(                                                 \                                                                    \
-//         reinterpret_cast<scalar_t*>(output.data_ptr()),                              \
-//         reinterpret_cast<float*>(output_lse.data_ptr()),                                 \
-//         reinterpret_cast<const scalar_t*>(prefix_output.data_ptr()),                             \
-//         reinterpret_cast<const float*>(prefix_lse.data_ptr()),                                \
-//         reinterpret_cast<const scalar_t*>(suffix_output.data_ptr()),                             \
-//         reinterpret_cast<const float*>(suffix_lse.data_ptr()),                                \
-//         num_tokens, num_heads, head_size);                                             \
-//   }
-
-
-  template <typename scalar_t>
+template <typename scalar_t>
 void merge_attn_states_launcher_sycl(
     const at::Tensor& prefix_output,
     const at::Tensor& prefix_lse,
@@ -230,13 +213,13 @@ void merge_attn_states_launcher_sycl(
     TORCH_CHECK(head_size % pack_size == 0,
                 "head_size must be multiple of pack_size:", pack_size);
     merge_attn_states_sycl<scalar_t>(                                                                                                                   \
-                            reinterpret_cast<scalar_t*>(output.data_ptr()),
-                                    reinterpret_cast<float*>(output_lse.data_ptr()),
-                                            reinterpret_cast<const scalar_t*>(prefix_output.data_ptr()),
-                                                    reinterpret_cast<const float*>(prefix_lse.data_ptr()),
-                                                            reinterpret_cast<const scalar_t*>(suffix_output.data_ptr()),
-                                                                    reinterpret_cast<const float*>(suffix_lse.data_ptr()),
-                                                                            num_tokens, num_heads, head_size);
+        reinterpret_cast<scalar_t*>(output.data_ptr()),
+        reinterpret_cast<float*>(output_lse.data_ptr()),
+        reinterpret_cast<const scalar_t*>(prefix_output.data_ptr()),
+        reinterpret_cast<const float*>(prefix_lse.data_ptr()),
+        reinterpret_cast<const scalar_t*>(suffix_output.data_ptr()),
+        reinterpret_cast<const float*>(suffix_lse.data_ptr()),
+        num_tokens, num_heads, head_size);
 }
 
 
@@ -253,20 +236,20 @@ void merge_attn_states_launcher_sycl(
     at::Tensor v_merged,
     at::Tensor s_merged)
 {
-    // CHECK_INPUT(v_a);
-    // CHECK_INPUT(s_a);
-    // CHECK_INPUT(v_b);
-    // CHECK_INPUT(s_b);
-    // CHECK_INPUT(v_merged);
-    // CHECK_INPUT(s_merged);
+    CHECK_INPUT(v_a);
+    CHECK_INPUT(s_a);
+    CHECK_INPUT(v_b);
+    CHECK_INPUT(s_b);
+    CHECK_INPUT(v_merged);
+    CHECK_INPUT(s_merged);
 
     CHECK_DIM(3, v_a);
     CHECK_DIM(2, s_a);
     CHECK_DIM(3, v_b);
     CHECK_DIM(2, s_b);
 
-    // CHECK_SHAPE(v_a, v_b);
-    // CHECK_SHAPE(s_a, s_b);
+    CHECK_SAME_SHAPE(v_a, v_b);
+    CHECK_SAME_SHAPE(s_a, s_b);
     CHECK_EQ(v_a.size(0), s_a.size(0));
     CHECK_EQ(v_a.size(1), s_b.size(1));
 

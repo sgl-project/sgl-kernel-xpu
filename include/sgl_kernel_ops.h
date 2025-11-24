@@ -137,7 +137,8 @@ void sgl_per_token_group_quant_8bit(
     int64_t group_size,
     double eps,
     double fp8_min,
-    double fp8_max);
+    double fp8_max,
+    bool scale_ue8m0);
 }  // namespace at::native::xpu
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);

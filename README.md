@@ -90,6 +90,11 @@ To use this with your library functions, simply wrap them with make_pytorch_shim
  m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
 ```
 
+### Contributing
+
+We welcome contributions of all kinds!
+Please read our [Contributing Guidelines](./CONTRIBUTING.md) before submitting a pull request.
+
 ### Testing & Benchmarking
 
 1. Add pytest tests in [tests/](https://github.com/sgl-project/sgl-kernel-xpu/tree/main/tests), if you need to skip some test, please use `@pytest.mark.skipif`

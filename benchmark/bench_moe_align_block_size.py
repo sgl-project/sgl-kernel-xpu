@@ -5,7 +5,6 @@ import torch
 import triton
 import triton.language as tl
 from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
-from vllm import _custom_ops as ops
 
 USE_RANDOM_PERM = False
 
@@ -143,101 +142,62 @@ def moe_align_block_size_triton(
 def calculate_diff(num_tokens, num_experts=256, block_size=128, topk=8):
     topk_ids = torch.stack(
         [
-            torch.randperm(num_experts, dtype=torch.int32, device="cuda")[:topk]
+            torch.randperm(num_experts, dtype=torch.int32, device="xpu")[:topk]
             for _ in range(num_tokens)
         ]
     )
 
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
-    sorted_ids_cuda = torch.empty(
+    sorted_ids_xpu = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )
-    sorted_ids_cuda.fill_(topk_ids.numel())
+    sorted_ids_xpu.fill_(topk_ids.numel())
     max_num_m_blocks = max_num_tokens_padded // block_size
-    expert_ids_cuda = torch.zeros(
+    expert_ids_xpu = torch.zeros(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
-    num_tokens_post_pad_cuda = torch.empty(
+    num_tokens_post_pad_xpu = torch.empty(
         (1), dtype=torch.int32, device=topk_ids.device
     )
-    token_cnts_buffer = torch.zeros(
-        (num_experts + 1) * num_experts, dtype=torch.int32, device=topk_ids.device
-    )
     cumsum_buffer = torch.zeros(
-        num_experts + 1, dtype=torch.int32, device=topk_ids.device
+        num_experts + 2, dtype=torch.int32, device=topk_ids.device
     )
 
-    sorted_ids_triton = torch.empty_like(sorted_ids_cuda)
+    sorted_ids_triton = torch.empty_like(sorted_ids_xpu)
     sorted_ids_triton.fill_(topk_ids.numel())
-    expert_ids_triton = torch.zeros_like(expert_ids_cuda)
-    num_tokens_post_pad_triton = torch.empty_like(num_tokens_post_pad_cuda)
+    expert_ids_triton = torch.zeros_like(expert_ids_xpu)
+    num_tokens_post_pad_triton = torch.empty_like(num_tokens_post_pad_xpu)
 
-    sorted_ids_vllm = torch.empty_like(sorted_ids_cuda)
-    sorted_ids_vllm.fill_(topk_ids.numel())
-    expert_ids_vllm = torch.zeros_like(expert_ids_cuda)
-    num_tokens_post_pad_vllm = torch.empty_like(num_tokens_post_pad_cuda)
-
-    # compare the performance of cuda, triton and vllm implementation
+    # compare the performance of xpu and triton implementation
     sgl_moe_align_block_size(
         topk_ids,
-        num_experts,
+        num_experts + 1,
         block_size,
-        sorted_ids_cuda,
-        expert_ids_cuda,
-        num_tokens_post_pad_cuda,
-        token_cnts_buffer,
+        sorted_ids_xpu,
+        expert_ids_xpu,
+        num_tokens_post_pad_xpu,
         cumsum_buffer,
+        False,
     )
     moe_align_block_size_triton(
         topk_ids,
-        num_experts,
+        num_experts + 1,
         block_size,
         sorted_ids_triton,
         expert_ids_triton,
         num_tokens_post_pad_triton,
     )
 
-    try:
-        ops.moe_align_block_size(
-            topk_ids,
-            num_experts,
-            block_size,
-            sorted_ids_vllm,
-            expert_ids_vllm,
-            num_tokens_post_pad_vllm,
-        )
-        print(f"✅ VLLM implementation works with {num_experts} experts!")
-        vllm_works = True
-    except RuntimeError as e:
-        print(f"❌ VLLM implementation failed with {num_experts} experts: {e}")
-        vllm_works = False
-
-    if torch.allclose(expert_ids_cuda, expert_ids_triton) and torch.allclose(
-        num_tokens_post_pad_cuda, num_tokens_post_pad_triton
+    if torch.allclose(expert_ids_xpu, expert_ids_triton) and torch.allclose(
+        num_tokens_post_pad_xpu, num_tokens_post_pad_triton
     ):
         print("✅ SGL and Triton implementations match")
     else:
         print("❌ SGL and Triton implementations do not match")
-        print("SGL expert_ids:", expert_ids_cuda)
+        print("SGL expert_ids:", expert_ids_xpu)
         print("Triton expert_ids:", expert_ids_triton)
-        print("SGL num_tokens_post_pad:", num_tokens_post_pad_cuda)
+        print("SGL num_tokens_post_pad:", num_tokens_post_pad_xpu)
         print("Triton num_tokens_post_pad:", num_tokens_post_pad_triton)
-
-    if (
-        vllm_works
-        and torch.allclose(expert_ids_cuda, expert_ids_vllm)
-        and torch.allclose(num_tokens_post_pad_cuda, num_tokens_post_pad_vllm)
-    ):
-        print("✅ SGL and VLLM implementations match")
-    else:
-        if not vllm_works:
-            print("⚠️ VLLM comparison skipped due to failure")
-        else:
-            print("❌ SGL and VLLM implementations do not match")
-            print("SGL expert_ids:", expert_ids_cuda)
-            print("VLLM expert_ids:", expert_ids_vllm)
-            print("SGL num_tokens_post_pad:", num_tokens_post_pad_cuda)
-            print("VLLM num_tokens_post_pad:", num_tokens_post_pad_vllm)
 
 
 # Test range
@@ -249,9 +209,9 @@ configs = list(itertools.product(num_tokens_range, num_experts_range, topk_range
 
 
 def get_topk_ids(num_tokens: int, num_experts: int, topk: int) -> torch.Tensor:
-    topk_ids = torch.zeros((num_tokens, topk), dtype=torch.int32, device="cuda")
+    topk_ids = torch.zeros((num_tokens, topk), dtype=torch.int32, device="xpu")
     for i in range(num_tokens):
-        topk_ids[i, :] = torch.randperm(num_experts, dtype=torch.int32, device="cuda")[
+        topk_ids[i, :] = torch.randperm(num_experts, dtype=torch.int32, device="xpu")[
             :topk
         ]
     return topk_ids
@@ -262,8 +222,8 @@ def get_topk_ids(num_tokens: int, num_experts: int, topk: int) -> torch.Tensor:
         x_names=["num_tokens", "num_experts", "topk"],
         x_vals=configs,
         line_arg="provider",
-        line_vals=["sgl", "triton", "vllm"],
-        line_names=["SGL", "Triton", "VLLM"],
+        line_vals=["sgl", "triton"],
+        line_names=["SGL", "Triton"],
         styles=[("blue", "-"), ("red", "-"), ("green", "-")],
         ylabel="us",
         plot_name="moe-align-block-size-performance",
@@ -281,7 +241,7 @@ def benchmark(num_tokens, num_experts, topk, provider):
             num_experts,
             (num_tokens, topk),
             dtype=torch.int32,
-            device="cuda",
+            device="xpu",
         )
 
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
@@ -306,11 +266,6 @@ def benchmark(num_tokens, num_experts, topk, provider):
             expert_ids,
             num_tokens_post_pad,
         ):
-            token_cnts_buffer = torch.empty(
-                (num_experts + 1) * num_experts,
-                dtype=torch.int32,
-                device=topk_ids.device,
-            )
             cumsum_buffer = torch.empty(
                 num_experts + 1, dtype=torch.int32, device=topk_ids.device
             )
@@ -322,8 +277,8 @@ def benchmark(num_tokens, num_experts, topk, provider):
                 sorted_ids.clone(),
                 expert_ids.clone(),
                 num_tokens_post_pad.clone(),
-                token_cnts_buffer,
                 cumsum_buffer,
+                False,
             )
 
         ms, min_ms, max_ms = triton.testing.do_bench(
@@ -349,23 +304,6 @@ def benchmark(num_tokens, num_experts, topk, provider):
             ),
             quantiles=quantiles,
         )
-    else:  # vllm
-        try:
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: ops.moe_align_block_size(
-                    topk_ids,
-                    num_experts,
-                    block_size,
-                    sorted_ids.clone(),
-                    expert_ids.clone(),
-                    num_tokens_post_pad.clone(),
-                ),
-                quantiles=quantiles,
-            )
-        except RuntimeError as e:
-            print(f"❌ VLLM benchmark failed with {num_experts} experts: {e}")
-            # Return extreme values to indicate failure in the chart
-            return float("inf"), float("inf"), float("inf")
 
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 

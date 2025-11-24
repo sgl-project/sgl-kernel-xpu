@@ -225,7 +225,10 @@ class FMHAPrefillChunk {
   CUTLASS_DEVICE
   Shape<int, int> get_sequence_length_shape(ProblemShape const& problem_shape, int const& batch) {
     if constexpr (is_var_len) {
-      return cutlass::fmha::collective::apply_variable_length(select<3, 5>(problem_shape), batch);
+      int seq_len_q =
+          get<3>(problem_shape).cumulative_length[batch + 1] - get<3>(problem_shape).cumulative_length[batch];
+      int seq_len_k = get<5>(problem_shape).cumulative_length[batch];
+      return cute::make_tuple<int, int>(seq_len_q, seq_len_k);
     } else {
       return select<3, 5>(problem_shape);
     }

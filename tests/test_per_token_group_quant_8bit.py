@@ -150,6 +150,7 @@ class TestPerTokenGroupQuantXPU(unittest.TestCase):
         """Test column-major scale layout."""
         self._test_against_reference(128, 1024, 128, torch.float8_e4m3fn, column_major_scales=True)
 
+    @unittest.skip("scale_ue8m0 requires TMA alignment which is not available on Intel GPUs")
     def test_scale_ue8m0(self):
         """Test UE8M0 scale format with column-major layout."""
         self._test_against_reference(128, 1024, 128, torch.float8_e4m3fn,

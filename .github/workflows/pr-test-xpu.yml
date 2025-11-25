@@ -85,19 +85,21 @@ jobs:
         if: success()
         run: |
           git checkout -b update-baseline-${GITHUB_RUN_ID}
-          git add benchmark/baseline.json
-          git commit -m "Update baseline.json from CI benchmark"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          git add benchmark/baseline.json
           if command -v pre-commit >/dev/null 2>&1; then
               pre-commit run --files benchmark/baseline.json || true
               git add benchmark/baseline.json
           fi
-
-          if git diff --cached --quiet; then
+          CHANGES=$(git diff --cached --numstat | wc -l)
+          if [ "$CHANGES" -eq 0 ]; then
               echo "No changes in baseline.json, skipping PR creation."
               exit 0
+          else
+              git commit -m "Update baseline.json from CI benchmark"
+              echo "Detected changes in baseline.json: $(git diff --cached --stat)"
           fi
 
           echo "${{ secrets.PAT }}" | gh auth login --with-token || { echo "gh auth login failed"; exit 1; }

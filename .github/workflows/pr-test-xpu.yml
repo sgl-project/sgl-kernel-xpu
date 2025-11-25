@@ -72,6 +72,8 @@ jobs:
           else
             echo "Performance OK: $LATEST <= $BASELINE"
             python3 -c "import json; f=open('benchmark/baseline.json'); data=json.load(f); f.close(); data['bench_moe_topk_softmax_baseline']=float($LATEST); f=open('benchmark/baseline.json','w'); json.dump(data,f,indent=4); f.close()"
+            git add benchmark/baseline.json
+            git commit -m "Update baseline.json from CI benchmark"
             echo "Baseline updated to: $LATEST"
           fi
 
@@ -83,9 +85,6 @@ jobs:
       - name: Auto PR for baseline.json update
         if: success()
         run: |
-
-          git reset --hard
-          git clean -fdx
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 

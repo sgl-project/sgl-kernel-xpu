@@ -84,12 +84,12 @@ jobs:
       - name: Auto PR for baseline.json update
         if: success()
         run: |
+          git checkout -b update-baseline-${GITHUB_RUN_ID}
           git add benchmark/baseline.json
           git commit -m "Update baseline.json from CI benchmark"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add benchmark/baseline.json
           if command -v pre-commit >/dev/null 2>&1; then
               pre-commit run --files benchmark/baseline.json || true
               git add benchmark/baseline.json
@@ -99,9 +99,6 @@ jobs:
               echo "No changes in baseline.json, skipping PR creation."
               exit 0
           fi
-
-          git checkout -b update-baseline-${GITHUB_RUN_ID}
-          git commit -m "Update baseline.json from CI benchmark"
 
           echo "${{ secrets.PAT }}" | gh auth login --with-token || { echo "gh auth login failed"; exit 1; }
           git remote set-url origin https://x-access-token:${{ secrets.PAT }}@github.com/sgl-project/sgl-kernel-xpu.git

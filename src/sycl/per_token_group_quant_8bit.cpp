@@ -32,21 +32,9 @@ inline T GroupReduceMax(T val, sycl::nd_item<1> item, int tid) {
   return val;
 }
 
-// Simple vector type for loading data
+// Use SYCL native vector type for efficient loading
 template <typename T, uint32_t N>
-struct vec_t {
-  T data[N];
-
-  T& operator[](uint32_t i) { return data[i]; }
-  const T& operator[](uint32_t i) const { return data[i]; }
-
-  void cast_load(const T* ptr) {
-    #pragma unroll
-    for (uint32_t i = 0; i < N; ++i) {
-      data[i] = ptr[i];
-    }
-  }
-};
+using vec_t = sycl::vec<T, N>;
 
 template <
     typename T,
@@ -120,8 +108,9 @@ struct PerTokenGroupQuant8bitKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
     // First pass: find local_absmax
     for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
+      // Load vector using SYCL's native load operation
       vec_type input_vec;
-      input_vec.cast_load(group_input + i * vec_size);
+      input_vec.load(0, sycl::multi_ptr<const T, sycl::access::address_space::global_space>(group_input + i * vec_size));
 
       #pragma unroll
       for (uint32_t j = 0; j < vec_size; ++j) {
@@ -154,8 +143,9 @@ struct PerTokenGroupQuant8bitKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
     // Second pass: quantize
     for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
+      // Load vector using SYCL's native load operation
       vec_type input_vec;
-      input_vec.cast_load(group_input + i * vec_size);
+      input_vec.load(0, sycl::multi_ptr<const T, sycl::access::address_space::global_space>(group_input + i * vec_size));
 
       #pragma unroll
       for (uint32_t j = 0; j < vec_size; ++j) {

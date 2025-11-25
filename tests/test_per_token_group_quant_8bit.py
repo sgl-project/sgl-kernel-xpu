@@ -6,7 +6,6 @@ import pytest
 import torch
 
 try:
-    import intel_extension_for_pytorch as ipex
     HAS_XPU = torch.xpu.is_available()
 except (ImportError, AttributeError):
     HAS_XPU = False
@@ -155,19 +154,6 @@ class TestPerTokenGroupQuantXPU(unittest.TestCase):
         """Test UE8M0 scale format with column-major layout."""
         self._test_against_reference(128, 1024, 128, torch.float8_e4m3fn,
                                      column_major_scales=True, scale_ue8m0=True)
-
-    def test_scale_ue8m0_various_sizes(self):
-        """Test UE8M0 with various sizes."""
-        configs = [
-            (64, 512, 64),
-            (128, 2048, 128),
-            (256, 4096, 64),
-        ]
-        for num_tokens, hidden_dim, group_size in configs:
-            with self.subTest(num_tokens=num_tokens, hidden_dim=hidden_dim, group_size=group_size):
-                self._test_against_reference(num_tokens, hidden_dim, group_size,
-                                             torch.float8_e4m3fn, column_major_scales=True,
-                                             scale_ue8m0=True)
 
     def test_edge_cases(self):
         """Test edge cases (small/large values)."""

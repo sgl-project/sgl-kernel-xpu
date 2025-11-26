@@ -77,12 +77,15 @@ jobs:
           fi
 
       - name: Install GitHub CLI
+        if: contains(join(github.event.pull_request.labels.*.name, ','), 'perf')
         run: |
           sudo apt update
           sudo apt install -y gh
 
       - name: Auto PR for baseline.json update
-        if: success()
+        if: >
+          success() &&
+          contains(join(github.event.pull_request.labels.*.name, ','), 'perf')
         run: |
           git checkout -b update-baseline-${GITHUB_RUN_ID}
           git config user.name "github-actions[bot]"

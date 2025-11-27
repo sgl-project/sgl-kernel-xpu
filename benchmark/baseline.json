@@ -1,3 +1,3 @@
 {
-  "bench_moe_topk_softmax_baseline": 30.01
+    "bench_moe_topk_softmax_baseline": 27.3
 }

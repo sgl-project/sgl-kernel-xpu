@@ -118,8 +118,9 @@ shape_configs = [
 ]
 
 shape_values = [list(d.values()) for d in shape_configs]
-bs = [1, 16, 32]  # 128, 256, 512, 1024, 2048, 4096, 8192]
+bs = [1, 128, 512, 1024, 2048, 4096, 8192]
 configs = [(k, *v) for k, v in product(bs, shape_values)]
+all_results = []
 
 
 def fused_topk_native(
@@ -227,16 +228,13 @@ def fused_moe_sglang_api(
         x_vals=configs,
         line_arg="provider",
         line_vals=[
-            "torch_compile",
             "sgl_kernel",
         ],
         line_names=[
-            "torch_compile",
             "sgl_kernel",
         ],
         styles=[
             ("blue", "-"),
-            ("green", "-"),
         ],
         ylabel="Time (ms)",
         plot_name="fused-moe-performance",
@@ -289,12 +287,52 @@ def benchmark(
     bench_lambda = lambda: api_func(**api_kwargs)
 
     quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench(bench_lambda, quantiles=quantiles)
+    ms, _, _ = triton.testing.do_bench(bench_lambda, quantiles=quantiles)
     torch.xpu.empty_cache()
     del x, w1, w2, input_gating
-    return ms, min_ms, max_ms
+    flop = (
+        num_tokens
+        * topk
+        * (
+            hidden_size * shard_intermediate_size * 2
+            + shard_intermediate_size * hidden_size
+        )
+    )
+    memory = (
+        min(num_experts, num_tokens * topk)
+        * (
+            hidden_size * shard_intermediate_size
+            + hidden_size * shard_intermediate_size // 2
+        )
+        * torch.finfo(dtype).bits
+        // 8
+    )
+    tflops = flop / (ms / 1e3) / 1e12
+    bandwidth = memory / (ms / 1e3) / 1e9
+
+    all_results.append(
+        {
+            "num_tokens": num_tokens,
+            "num_experts": num_experts,
+            "topk": topk,
+            "hidden_size": hidden_size,
+            "shard_intermediate_size": shard_intermediate_size,
+            "dtype": dtype,
+            "block_shape": block_shape,
+            "provider": provider,
+            "ms": ms,
+            "tflops": tflops,
+            "bandwidth": bandwidth,
+        }
+    )
+    return ms
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    benchmark.run(print_data=False)
     print("Benchmark finished!")
+
+    import pandas as pd
+
+    df = pd.DataFrame(all_results)
+    print(df.to_markdown())

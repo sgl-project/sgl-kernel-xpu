@@ -63,7 +63,7 @@ DISABLE_LOCAL = True
 DISABLE_SOFTCAP = True
 DISABLE_PACKGQA = True
 DISABLE_FP16 = True
-DISABLE_FP8 = True
+DISABLE_FP8 = False
 
 
 # Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/hopper/padding.py
@@ -475,7 +475,9 @@ def generate_qkv(
 )
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
-    "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
+    "dtype",
+    [torch.bfloat16]
+    + ([torch.float8_e4m3fn, torch.float8_e5m2] if not DISABLE_FP8 else []),
 )
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
@@ -584,11 +586,15 @@ def test_flash_attn_kvcache(
     rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
-    dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
+    dtype_ref = (
+        torch.bfloat16
+        if (dtype == torch.float8_e4m3fn or dtype == torch.float8_e5m2)
+        else dtype
+    )
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     if use_sinks:
         sinks = torch.randn(nheads, device=device, dtype=dtype_ref)
-    if dtype == torch.float8_e4m3fn or not is_hopper():
+    if dtype == torch.float8_e4m3fn or dtype == torch.float8_e5m2 or not is_hopper():
         # for fp8 and ampere arch, we not support v head dim != qk head dim
         dv_vals = [d]
     for dv in dv_vals:
@@ -826,6 +832,13 @@ def test_flash_attn_kvcache(
         v_cache_rep = repeat(
             v_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k
         )
+        if dtype == torch.float8_e4m3fn or dtype == torch.float8_e5m2:
+            q_descale, k_descale, v_descale = [
+                torch.randn(batch_size, nheads_k, device=device, dtype=torch.float32)
+                for _ in range(3)
+            ]
+        else:
+            q_descale, k_descale, v_descale = None, None, None
         out_ref, _ = attention_ref(
             q_ro,
             k_cache_rep,
@@ -836,6 +849,9 @@ def test_flash_attn_kvcache(
             key_padding_mask,
             causal=causal,
             qv=qv,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             window_size=window_size,
             key_leftpad=cache_leftpad,
         )
@@ -849,11 +865,18 @@ def test_flash_attn_kvcache(
             key_padding_mask,
             causal=causal,
             qv=qv,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             window_size=window_size,
             upcast=False,
             reorder_ops=True,
             key_leftpad=cache_leftpad,
-            intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
+            intermediate_dtype=(
+                dtype
+                if (dtype == torch.float8_e4m3fn or dtype == torch.float8_e5m2)
+                else None
+            ),
         )
         q = q.to(dtype)
         q_unpad = q_unpad.to(dtype) if varlen_q else None
@@ -901,6 +924,9 @@ def test_flash_attn_kvcache(
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k_new=cu_seqlens_k_new,
                     max_seqlen_q=max_seqlen_q,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
                     rotary_seqlens=rotary_seqlens,
                     causal=causal,
                     window_size=window_size,
@@ -924,6 +950,7 @@ def test_flash_attn_kvcache(
                 # lse_ref = torch.logsumexp(qk / math.sqrt(d), -1)
                 # probs = torch.softmax(qk, dim=-1)
                 torch.xpu.synchronize()
+                out = out.to(dtype_ref)
                 out = out.flatten()
                 out_ref = out_ref.flatten()
                 out_pt = out_pt.flatten()
@@ -972,7 +999,10 @@ def test_flash_attn_kvcache(
                         )[:, :seqlen_k].to(dtype_ref)
                     k_cache_ref = k_cache_ref.to(dtype).to(dtype_ref)
                     v_cache_ref = v_cache_ref.to(dtype).to(dtype_ref)
-                    if dtype is not torch.float8_e4m3fn:
+                    if (
+                        dtype is not torch.float8_e4m3fn
+                        and dtype is not torch.float8_e5m2
+                    ):
                         assert torch.equal(v_cache_select, v_cache_ref)
                     else:
                         assert torch.allclose(
@@ -985,7 +1015,10 @@ def test_flash_attn_kvcache(
                     else:
                         # if not torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3):
                         #     breakpoint()
-                        if dtype is not torch.float8_e4m3fn:
+                        if (
+                            dtype is not torch.float8_e4m3fn
+                            and dtype is not torch.float8_e5m2
+                        ):
                             assert torch.allclose(
                                 k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3
                             )
@@ -993,11 +1026,16 @@ def test_flash_attn_kvcache(
                             assert torch.allclose(
                                 k_cache_select, k_cache_ref, rtol=1e-1, atol=1e-1
                             )
+                # E5M2 has large dynamic range and low precision so error range is large (standard)
                 mult = 4 if dtype == torch.float8_e4m3fn else 2
+                if dtype == torch.float8_e5m2:
+                    mult = 90
                 assert (out - out_ref).abs().max().item() <= mult * (
                     out_pt - out_ref
                 ).abs().max().item() + 1e-5
                 mult_mean = 3 if dtype == torch.float8_e4m3fn else 1.5
+                if dtype == torch.float8_e5m2:
+                    mult_mean = 40
                 assert (out - out_ref).abs().mean().item() <= mult_mean * (
                     out_pt - out_ref
                 ).abs().mean().item()
@@ -1007,13 +1045,14 @@ def _generate_block_kvcache(
     seqlen_k, page_size, batch_size, nheads_k, d, dv, device, dtype, dtype_ref
 ):
     num_blocks = math.ceil(seqlen_k / page_size) * batch_size
+    create_fn = torch.randn
     k_cache_paged = (
-        torch.randn(num_blocks, page_size, nheads_k, d, device=device, dtype=dtype_ref)
+        create_fn(num_blocks, page_size, nheads_k, d, device=device, dtype=dtype_ref)
         .to(dtype)
         .to(dtype_ref)
     )
     v_cache_paged = (
-        torch.randn(num_blocks, page_size, nheads_k, dv, device=device, dtype=dtype_ref)
+        create_fn(num_blocks, page_size, nheads_k, dv, device=device, dtype=dtype_ref)
         .to(dtype)
         .to(dtype_ref)
     )
@@ -1041,7 +1080,9 @@ def _generate_block_kvcache(
     reason="flash_attn at sgl-kernel-xpu only supports paged cache",
 )
 @pytest.mark.parametrize(
-    "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
+    "dtype",
+    [torch.bfloat16]
+    + ([torch.float8_e4m3fn, torch.float8_e5m2] if not DISABLE_FP8 else []),
 )
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
@@ -1116,9 +1157,13 @@ def test_flash_attn_varlen_output(
     # batch_size = 2
     # nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
-    dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
+    dtype_ref = (
+        torch.bfloat16
+        if (dtype == torch.float8_e4m3fn or dtype == torch.float8_e5m2)
+        else dtype
+    )
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
-    if dtype == torch.float8_e4m3fn:
+    if dtype == torch.float8_e4m3fn or dtype == torch.float8_e5m2:
         dv_vals = [d]
     for dv in dv_vals:
         q_ref = torch.randn(
@@ -1156,7 +1201,7 @@ def test_flash_attn_varlen_output(
             qv_ref = None
         # Put window_size after QKV randn so that window_size changes from test to test
         window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
-        if dtype == torch.float8_e4m3fn:
+        if dtype == torch.float8_e4m3fn or dtype == torch.float8_e5m2:
             q_descale, k_descale, v_descale = [
                 torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32)
                 * 2
@@ -1250,7 +1295,11 @@ def test_flash_attn_varlen_output(
             softcap=softcap,
             upcast=False,
             reorder_ops=True,
-            intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
+            intermediate_dtype=(
+                dtype
+                if (dtype == torch.float8_e4m3fn or dtype == torch.float8_e5m2)
+                else None
+            ),
         )
 
         print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
@@ -1287,6 +1336,7 @@ def test_flash_attn_varlen_output(
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:
                 out.masked_fill_(q_zero_masking, 0.0)
+
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
 
@@ -1296,7 +1346,11 @@ def test_flash_attn_varlen_output(
                 out_pt - out_ref
             ).abs().max().item() + fwd_atol
 
-    if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not has_qv:
+    if (
+        not DISABLE_BACKWARD
+        and (dtype != torch.float8_e4m3fn and dtype != torch.float8_e5m2)
+        and not has_qv
+    ):
         g_unpad = torch.randn_like(out_unpad)
         do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
         dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(
@@ -1332,7 +1386,11 @@ def test_flash_attn_varlen_output(
         print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
         print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
 
-    if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not has_qv:
+    if (
+        not DISABLE_BACKWARD
+        and (dtype != torch.float8_e4m3fn and dtype != torch.float8_e5m2)
+        and not has_qv
+    ):
         dq_atol = 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item() + (
             0 if softcap == 0 else 3e-4
         )

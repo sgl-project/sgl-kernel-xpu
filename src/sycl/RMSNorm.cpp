@@ -413,15 +413,12 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
   auto M = M_N.first;
   auto N = M_N.second;
 
-  Tensor input_ = (input.dim() == 1) ? input.reshape({M, N}) : input;
-  Tensor residual_ = (residual.dim() == 1) ? residual.reshape({M, N}) : residual;
-  Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
-  Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
+  Tensor rstd = at::empty({M}, input.options().dtype(kFloat));
 
   SYCL_DISPATCH_FLOATING_TYPES(
-      at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
+      at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
         FusedAddRMSNormKernelImplInternal<scalar_t, scalar_t>(
-            input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual_);
+            input, weight, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual);
       });
 }
 

@@ -54,6 +54,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("rotary_embedding", torch::kXPU, &at::native::xpu::rotary_embedding);
 
   m.def(
+      "prepare_moe_input(Tensor topk_ids, Tensor expert_offsets, Tensor? blockscale_offsets, Tensor problem_sizes1,"
+      " Tensor problem_sizes2, Tensor input_permutation, Tensor output_permutation, int num_experts, int n, int k) -> "
+      "()");
+  m.impl("prepare_moe_input", torch::kXPU, &prepare_moe_input);
+  m.def("shuffle_rows(Tensor input, Tensor dst2src_map, Tensor output) -> ()");
+  m.impl("shuffle_rows", torch::kXPU, &shuffle_rows);
+  m.def("apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, Tensor? factors) -> ()");
+  m.impl("apply_shuffle_mul_sum", torch::kXPU, &apply_shuffle_mul_sum);
       "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
       "experts_ids, Tensor! num_tokens_post_pad, Tensor! cumsum_buffer, bool "
       "pad_sorted_token_ids) -> ()");

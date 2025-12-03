@@ -12,6 +12,7 @@ concurrency:
 jobs:
   build-and-test:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    permissions: write-all
     runs-on: sglang-pvc
     steps:
       - name: Checkout code
@@ -58,10 +59,71 @@ jobs:
             /bin/bash -c "\
               /miniforge3/envs/py3.10/bin/python3 -m pip install tabulate && \
               cd /root/sglang/sgl-kernel-xpu/benchmark && \
-              python3 bench_flash_attn.py && \
-              python3 bench_moe_topk_softmax.py && \
+              python3 bench_flash_attn.py 2>&1 | tee flash.log && \
+              python3 bench_moe_topk_softmax.py 2>&1 | tee moe.log && \
               python3 bench_fused_moe.py \
             "
+
+      - name: Copy logs from container
+        timeout-minutes: 20
+        run: |
+          docker cp ci_sglang_xpu:/root/sglang/sgl-kernel-xpu/benchmark/moe.log ./moe.log
+          LATEST=$(awk '/topk-softmax-performance:/ {getline; getline; print $7}' moe.log)
+          echo "Latest=$LATEST"
+          BASELINE=$(python3 -c "import json; print(json.load(open('benchmark/baseline.json'))['bench_moe_topk_softmax_baseline'])")
+          echo "Baseline=$BASELINE"
+          if awk "BEGIN{exit !($LATEST > $BASELINE)}"; then
+            echo "Performance regression detected: $LATEST > $BASELINE"
+            exit 1
+          else
+            echo "Performance OK: $LATEST <= $BASELINE"
+            python3 -c "import json; f=open('benchmark/baseline.json'); data=json.load(f); f.close(); data['bench_moe_topk_softmax_baseline']=float($LATEST); f=open('benchmark/baseline.json','w'); json.dump(data,f,indent=4); f.write('\n'); f.close()"
+            cat benchmark/baseline.json
+            echo "Baseline updated to: $LATEST"
+          fi
+
+      - name: Install GitHub CLI
+        if: contains(join(github.event.pull_request.labels.*.name, ','), 'perf')
+        run: |
+          sudo apt update
+          sudo apt install -y gh
+
+      - name: Auto PR for baseline.json update
+        if: >
+          success() &&
+          contains(join(github.event.pull_request.labels.*.name, ','), 'perf')
+        run: |
+          git checkout -b update-baseline-${GITHUB_RUN_ID}
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add benchmark/baseline.json
+          if command -v pre-commit >/dev/null 2>&1; then
+              pre-commit run --files benchmark/baseline.json || true
+              git add benchmark/baseline.json
+          fi
+          CHANGES=$(git diff --cached --numstat | wc -l)
+          if [ "$CHANGES" -eq 0 ]; then
+              echo "No changes in baseline.json, skipping PR creation."
+              exit 0
+          else
+              git commit -m "Update baseline.json from CI benchmark"
+              echo "Detected changes in baseline.json: $(git diff --cached --stat)"
+          fi
+
+          echo "${{ secrets.PAT }}" | gh auth login --with-token || { echo "gh auth login failed"; exit 1; }
+          git remote set-url origin https://x-access-token:${{ secrets.PAT }}@github.com/sgl-project/sgl-kernel-xpu.git
+          git push -f https://${{ secrets.PAT }}@github.com/sgl-project/sgl-kernel-xpu.git update-baseline-${GITHUB_RUN_ID}
+
+          PR_URL=$(gh pr create \
+            --repo sgl-project/sgl-kernel-xpu \
+            --title "CI: Update baseline.json" \
+            --body "$(printf 'Latest: %s\nPrevious: %s' "$LATEST" "$BASELINE")" \
+            --base main \
+            --head update-baseline-${GITHUB_RUN_ID}
+          )
+
+          echo "PR created at $PR_URL"
 
       - name: Run E2E Bfloat16 tests
         timeout-minutes: 20

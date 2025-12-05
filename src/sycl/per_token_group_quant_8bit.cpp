@@ -71,6 +71,9 @@ struct PerTokenGroupQuant8bitKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   void sycl_ker_config_convention(sycl::handler& cgh) {}
 
   [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
+    // all the variable names refer to CUDA nomenclature for easier mapping
+    // so 'groups' in the kernel refer to tensor groups for quantization rather than
+    // SYCL work-groups/sub-groups
     const int threads_per_group = 16;
     const int64_t local_group_id = item.get_local_id(0) / threads_per_group;
     const int lane_id = item.get_local_id(0) % threads_per_group;
@@ -145,6 +148,7 @@ struct PerTokenGroupQuant8bitKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
       // Load vector using SYCL's native load operation
       vec_type input_vec;
+      // TODO: Optimize out the duplicate loads we do here and above for local_absmax
       input_vec.load(0, sycl::multi_ptr<const T, sycl::access::address_space::global_space>(group_input + i * vec_size));
 
       #pragma unroll
@@ -154,6 +158,7 @@ struct PerTokenGroupQuant8bitKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
         // Special handling for FP8 types using CUTLASS
         if constexpr (std::is_same_v<DST_DTYPE, cutlass::float_e4m3_t>) {
+          // TODO: Remove CUTLASS emulation of float e4m3_t and use native SYCL FP8 when available
           group_output[i * vec_size + j] = cutlass::float_e4m3_t::from_float(q_val);
         } else {
           group_output[i * vec_size + j] = static_cast<DST_DTYPE>(q_val);
@@ -219,6 +224,20 @@ void sgl_per_token_group_quant_8bit(
   const int num_groups_per_row = hidden_dim / group_size;
   const int scale_stride = output_s.stride(1);
 
+  // Check for supported dtypes to avoid silent dispatch failure
+  TORCH_CHECK(
+      input.scalar_type() == at::ScalarType::Half ||
+      input.scalar_type() == at::ScalarType::BFloat16 ||
+      input.scalar_type() == at::ScalarType::Float,
+      "sgl_per_token_group_quant_8bit: input dtype must be Float16, BFloat16, or Float32, got ",
+      input.scalar_type());
+
+  TORCH_CHECK(
+      dst_type == at::ScalarType::Char ||
+      dst_type == at::ScalarType::Float8_e4m3fn,
+      "sgl_per_token_group_quant_8bit: output_q dtype must be Int8 or Float8_e4m3fn, got ",
+      dst_type);
+
   sycl::range<1> global_range(num_blocks * num_threads);
   sycl::range<1> local_range(num_threads);
 
@@ -269,6 +288,8 @@ void sgl_per_token_group_quant_8bit(
       sycl_kernel_submit(global_range, local_range, queue, kernel);                                    \
     }                                                                                                   \
   } while (0)
+
+
 
   // Dispatch based on input and output types
    if (input.scalar_type() == at::ScalarType::Half) {

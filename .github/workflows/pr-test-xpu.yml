@@ -23,11 +23,15 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
 
+      - name: Setup env vars
+        run: echo "BUILD_TARGET_DEVICE=pvc" >> $GITHUB_ENV
+
       - name: Build Docker image
         run: |
           docker build \
             --build-arg SG_LANG_KERNEL_BRANCH=${{ github.head_ref }} \
             --build-arg SG_LANG_KERNEL_REPO=${{ github.event.pull_request.head.repo.clone_url }} \
+            --build-arg BUILD_TARGET_DEVICE=${BUILD_TARGET_DEVICE} \
             --no-cache --progress=plain -f Dockerfile.xpu_kernel -t xpu_sglang:kernel .
 
       - name: Run container

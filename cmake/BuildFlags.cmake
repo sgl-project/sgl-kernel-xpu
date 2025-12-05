@@ -22,6 +22,81 @@ function(CHECK_SYCL_FLAG FLAG VARIABLE_NAME)
   file(REMOVE_RECURSE ${TEMP_DIR})
 endfunction()
 
+function(get_device_ip_version VARIABLE_NAME)
+  # Define a C++ source file to be compiled and run
+  set(TEMP_DIR "${CMAKE_BINARY_DIR}/temp")
+  file(MAKE_DIRECTORY ${TEMP_DIR})
+  set(TEST_SRC_FILE "${TEMP_DIR}/get_device_ip_version.cpp")
+  set(TEST_EXE_FILE "${TEMP_DIR}/get_device_ip_version.out")
+
+  file(WRITE "${TEST_SRC_FILE}"
+    "
+      #include <level_zero/ze_api.h>
+      #include <iostream>
+      #include <limits>
+      #include <cassert>
+
+      int main() {
+
+        zeInit(0);
+        ze_driver_handle_t driver;
+        uint32_t driverCount = 1;
+        zeDriverGet(&driverCount, &driver);
+
+        ze_device_handle_t device;
+        uint32_t deviceCount = 1;
+        zeDeviceGet(driver, &deviceCount, &device);
+
+        ze_device_properties_t props = {ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
+
+        ze_device_ip_version_ext_t zeDeviceIpVersion = {ZE_STRUCTURE_TYPE_DEVICE_IP_VERSION_EXT};
+
+        zeDeviceIpVersion.ipVersion = std::numeric_limits<uint32_t>::max();
+        props.pNext = &zeDeviceIpVersion;
+        zeDeviceGetProperties(device, &props);
+
+        std::cout << zeDeviceIpVersion.ipVersion;
+
+        return 0;
+      }
+    "
+  )
+
+  # Compile and run the C++ program, capturing its output
+  try_run(
+    RUN_RESULT_VAR            # Variable to store the run result (0 for success)
+    COMPILE_RESULT_VAR        # Variable to store the compile result (true for success)
+    "${TEST_EXE_FILE}"        # Path to the executable (will be created)
+    "${TEST_SRC_FILE}"        # Source file to compile and run
+    RUN_OUTPUT_STDOUT_VARIABLE
+    OUTPUT_STDOUT             # Capture stdout
+    RUN_OUTPUT_STDERR_VARIABLE
+    OUTPUT_STDERR             # Capture stderr
+    LINK_LIBRARIES ze_loader  # pass required libraries to create executable
+  )
+
+  file(REMOVE_RECURSE ${TEMP_DIR})
+  # Check if compilation and execution were successful
+  if(COMPILE_RESULT_VAR AND RUN_RESULT_VAR EQUAL 0)
+    set(${VARIABLE_NAME} "${OUTPUT_STDOUT}" PARENT_SCOPE)
+  else()
+    if(NOT COMPILE_RESULT_VAR)
+        message(WARNING "Compilation failed.")
+    endif()
+    if(NOT RUN_RESULT_VAR EQUAL 0)
+        message(WARNING "Program returned non-zero exit code: ${RUN_RESULT_VAR}")
+    endif()
+    message(WARNING "Failed to compile or run the get_device_ip_version C++ program.")
+    set(BUILD_TARGET_DEVICE $ENV{BUILD_TARGET_DEVICE})
+    # no default device
+    if(NOT BUILD_TARGET_DEVICE)
+      message(FATAL_ERROR "BUILD_TARGET_DEVICE environment variable is not set")
+    endif()
+    string(TOLOWER "${BUILD_TARGET_DEVICE}" BUILD_TARGET_DEVICE)
+    set(${VARIABLE_NAME} ${BUILD_TARGET_DEVICE} PARENT_SCOPE)
+  endif()
+endfunction()
+
 # Support GCC on Linux.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   # # -- Host flags (SYCL_CXX_FLAGS)
@@ -118,7 +193,8 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(SYCL_OFFLINE_COMPILER_CG_OPTIONS "${SYCL_OFFLINE_COMPILER_CG_OPTIONS} -options -cl-intel-greater-than-4GB-buffer-required")
 
 
-  set(AOT_TARGETS "bmg")
+  get_device_ip_version(DEVICE_IP_VERSION)
+  set(AOT_TARGETS "${DEVICE_IP_VERSION}")
   set(SYCL_TARGETS_OPTION -fsycl-targets=spir64_gen)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} ${SYCL_TARGETS_OPTION})
   set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} ${SYCL_TARGETS_OPTION})

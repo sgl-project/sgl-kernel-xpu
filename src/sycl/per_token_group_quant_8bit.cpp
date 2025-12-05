@@ -241,10 +241,10 @@ void sgl_per_token_group_quant_8bit(
   sycl::range<1> global_range(num_blocks * num_threads);
   sycl::range<1> local_range(num_threads);
 
-#define LAUNCH_KERNEL(T, DST_DTYPE)                                           \
-  do {                                                                        \
-    if (is_column_major) {                                                    \
-      if (scale_ue8m0) {                                                      \
+#define LAUNCH_KERNEL(T, DST_DTYPE)                                            \
+  do {                                                                         \
+    if (is_column_major) {                                                     \
+      if (scale_ue8m0) {                                                       \
         auto kernel = PerTokenGroupQuant8bitKernel<T, DST_DTYPE, true, true>(  \
             static_cast<const T*>(input.data_ptr()),                           \
             output_q.data_ptr(),                                               \
@@ -256,43 +256,40 @@ void sgl_per_token_group_quant_8bit(
             static_cast<float>(min_8bit),                                      \
             static_cast<float>(max_8bit),                                      \
             num_groups_per_row,                                                \
-            scale_stride,
-            THREADS_PER_GROUP);
-            sycl_kernel_submit(global_range, local_range, queue, kernel);
-}
-else {
-  auto kernel = PerTokenGroupQuant8bitKernel<T, DST_DTYPE, true, false>(
-      static_cast<const T*>(input.data_ptr()),
-      output_q.data_ptr(),
-      static_cast<float*>(output_s.data_ptr()),
-      group_size,
-      num_groups,
-      groups_per_block,
-      static_cast<float>(eps),
-      static_cast<float>(min_8bit),
-      static_cast<float>(max_8bit),
-      num_groups_per_row,
-      scale_stride,
-      THREADS_PER_GROUP);
-  sycl_kernel_submit(global_range, local_range, queue, kernel);
-}
-}  // namespace at::native::xpu
-else {
-  assert(!scale_ue8m0);
-  auto kernel = PerTokenGroupQuant8bitKernel<T, DST_DTYPE, false>(
-      static_cast<const T*>(input.data_ptr()),
-      output_q.data_ptr(),
-      static_cast<float*>(output_s.data_ptr()),
-      group_size,
-      num_groups,
-      groups_per_block,
-      static_cast<float>(eps),
-      static_cast<float>(min_8bit),
-      static_cast<float>(max_8bit));
-  sycl_kernel_submit(global_range, local_range, queue, kernel);
-}
-}
-while (0)
+            scale_stride,                                                      \
+            THREADS_PER_GROUP);                                                \
+        sycl_kernel_submit(global_range, local_range, queue, kernel);          \
+      } else {                                                                 \
+        auto kernel = PerTokenGroupQuant8bitKernel<T, DST_DTYPE, true, false>( \
+            static_cast<const T*>(input.data_ptr()),                           \
+            output_q.data_ptr(),                                               \
+            static_cast<float*>(output_s.data_ptr()),                          \
+            group_size,                                                        \
+            num_groups,                                                        \
+            groups_per_block,                                                  \
+            static_cast<float>(eps),                                           \
+            static_cast<float>(min_8bit),                                      \
+            static_cast<float>(max_8bit),                                      \
+            num_groups_per_row,                                                \
+            scale_stride,                                                      \
+            THREADS_PER_GROUP);                                                \
+        sycl_kernel_submit(global_range, local_range, queue, kernel);          \
+      }                                                                        \
+    } else {                                                                   \
+      assert(!scale_ue8m0);                                                    \
+      auto kernel = PerTokenGroupQuant8bitKernel<T, DST_DTYPE, false>(         \
+          static_cast<const T*>(input.data_ptr()),                             \
+          output_q.data_ptr(),                                                 \
+          static_cast<float*>(output_s.data_ptr()),                            \
+          group_size,                                                          \
+          num_groups,                                                          \
+          groups_per_block,                                                    \
+          static_cast<float>(eps),                                             \
+          static_cast<float>(min_8bit),                                        \
+          static_cast<float>(max_8bit));                                       \
+      sycl_kernel_submit(global_range, local_range, queue, kernel);            \
+    }                                                                          \
+  } while (0)
 
   // Dispatch based on input and output types
   if (input.scalar_type() == at::ScalarType::Half) {

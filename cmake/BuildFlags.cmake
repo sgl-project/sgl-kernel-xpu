@@ -38,7 +38,10 @@ function(get_device_ip_version VARIABLE_NAME)
 
       int main() {
 
-        zeInit(0);
+        ze_result_t result = zeInit(0);
+        if (result != ZE_RESULT_SUCCESS) {
+          return 1;
+        }
         ze_driver_handle_t driver;
         uint32_t driverCount = 1;
         zeDriverGet(&driverCount, &driver);

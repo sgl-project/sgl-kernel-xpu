@@ -13,7 +13,7 @@ jobs:
   build-and-test:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     permissions: write-all
-    runs-on: sglang-pvc
+    runs-on: sglang-bmg
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

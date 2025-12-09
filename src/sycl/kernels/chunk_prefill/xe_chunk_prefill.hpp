@@ -333,6 +333,22 @@ class FMHAPrefillChunk {
 
       int tiles_per_page = params.mainloop.page_size / QK_BLK_N;
 
+      auto q_group_size = num_heads_q / num_heads_kv;
+      auto kv_head_coord = q_head_coord / q_group_size;
+
+      // Descale tensors are shaped (batch size * # heads)
+      // Each head has a separate scale factor
+      // Q, K, V tensors have separate scaling factors
+      const float q_scale_val = params.mainloop.ptr_q_scale == nullptr
+                                    ? 1.f
+                                    : params.mainloop.ptr_q_scale[batch_coord * num_heads_kv + q_head_coord];
+      const float k_scale_val = params.mainloop.ptr_k_scale == nullptr
+                                    ? 1.f
+                                    : params.mainloop.ptr_k_scale[batch_coord * num_heads_kv + kv_head_coord];
+      const float v_scale_val = params.mainloop.ptr_v_scale == nullptr
+                                    ? 1.f
+                                    : params.mainloop.ptr_v_scale[batch_coord * num_heads_kv + kv_head_coord];
+
       Tensor mQ_mkl = cute::get_xe_tensor(make_shape(seq_len_qo, head_size_qk, 1));  //(m,k,l)
 
       Tensor mK_cache_nkl = cute::get_xe_tensor(make_shape(seq_len_kv_cache, head_size_qk, 1));  // (n_cache,k,l)
@@ -446,7 +462,8 @@ class FMHAPrefillChunk {
         // Then modify layout to LayoutQ = ((seq_leq_q, group_head_q),
         // head_size_qk, batch* num_heads_q / group_head_q), which can be merged
         // into one gemm for (int i = 0; i < q_group_size; ++i) {
-        collective_mma.mmaQK(tSr, gQ, gK_, tSr, ceil_div(head_size_qk, QK_BLK_K), mainloop_params);
+        collective_mma.mmaQK(
+            tSr, gQ, gK_, tSr, ceil_div(head_size_qk, QK_BLK_K), mainloop_params, q_scale_val, k_scale_val);
 
         if constexpr (LocalMask) {
           // Sliding windows
@@ -545,7 +562,7 @@ class FMHAPrefillChunk {
         softmax(split == 0, tSr, max_reg, sum_reg, out_reg);
 
         // 5) Perform GEMM O = S*V
-        collective_mma.template mmaPV<VSlicer>(out_reg, tSr, gV_, out_reg, mainloop_params);
+        collective_mma.template mmaPV<VSlicer>(out_reg, tSr, gV_, out_reg, mainloop_params, v_scale_val);
         // ... prefetch next tile ...
         // Prefetch the next Q tile
         CUTLASS_PRAGMA_UNROLL

@@ -80,7 +80,7 @@ class PerTensorQuantFP8Kernel {
         float val = static_cast<float>(input_vec[j]) * scale_val;
         val = sycl::fmax(-FP8_E4M3_MAX, sycl::fmin(val, FP8_E4M3_MAX));
         DST_DTYPE fp8_val = static_cast<DST_DTYPE>(val);
-        output_vec[j] = *reinterpret_cast<output_storage_t*>(&fp8_val);
+        std::memcpy(&output_vec[j], &fp8_val, sizeof(DST_DTYPE));
       }
       // TODO: output_storage_t needs to be changed back to DST_DTYPE during store when fp8 type is supported in sycl
       output_vec.store(
@@ -128,8 +128,7 @@ class PerTensorAbsMaxKernel {
 
 #pragma unroll
       for (int j = 0; j < VEC_SIZE; ++j) {
-        T input_val = *reinterpret_cast<const T*>(&input_vec[j]);
-        float val = sycl::fabs(static_cast<float>(input_val));
+        float val = sycl::fabs(static_cast<float>(input_vec[j]));
         max_value = sycl::fmax(max_value, val);
       }
     }
@@ -149,7 +148,7 @@ class PerTensorAbsMaxKernel {
       float local_scale = max_value / FP8_E4M3_MAX;
       sycl::atomic_ref<
           float,
-          sycl::memory_order::relaxed,
+          sycl::memory_order::acq_rel,
           sycl::memory_scope::device,
           sycl::access::address_space::global_space>
           atomic_scale(*output_);

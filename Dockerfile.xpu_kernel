@@ -13,11 +13,15 @@ ARG PYTHON_VERSION=3.10
 
 # Set environment variables
 
+ARG BUILD_TARGET_DEVICE
+
 ARG SG_LANG_REPO=https://github.com/sgl-project/sglang.git
 ARG SG_LANG_BRANCH=main
 
 ARG SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git
 ARG SG_LANG_KERNEL_BRANCH=main
+
+RUN echo "export BUILD_TARGET_DEVICE=${BUILD_TARGET_DEVICE}" >> /root/.bashrc
 
 # Install Miniforge & PyTorch/Triton & build vllm/SGlang from source
 RUN curl -fsSL -v -o miniforge.sh -O https://github.com/conda-forge/miniforge/releases/download/25.1.1-0/Miniforge3-Linux-x86_64.sh && \

@@ -1,6 +1,6 @@
 # ATen XPU sources
 
-file(GLOB device_cpp "sycl/*.cpp" "sycl/*.sycl" "sycl/kernels/moe/*.cpp")
+file(GLOB device_cpp "sycl/*.cpp" "sycl/*.sycl")
 file(GLOB host_cpp "./*.cpp" "./*.cc")
 
 list(APPEND ATen_XPU_CPP_SRCS ${host_cpp})

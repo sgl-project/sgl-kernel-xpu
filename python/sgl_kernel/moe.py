@@ -327,8 +327,12 @@ def fused_experts(
     expert_offsets = torch.zeros((E), dtype=torch.int32, device=hidden_states.device)
     problem_sizes1 = torch.empty((E, 3), dtype=torch.int32, device=hidden_states.device)
     problem_sizes2 = torch.empty((E, 3), dtype=torch.int32, device=hidden_states.device)
-    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=hidden_states.device)
-    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=hidden_states.device)
+    a_map = torch.empty(
+        (topk_ids.numel()), dtype=torch.int32, device=hidden_states.device
+    )
+    c_map = torch.empty(
+        (topk_ids.numel()), dtype=torch.int32, device=hidden_states.device
+    )
     torch.ops.sgl_kernel.prepare_moe_input.default(
         topk_ids,
         expert_offsets,
@@ -339,18 +343,26 @@ def fused_experts(
         c_map,
         E,
         hidden_dims,
-        TopK
+        TopK,
     )
     input_A_shuffle = torch.empty(
         (num_tokens * TopK, K), device=hidden_states.device, dtype=hidden_states.dtype
     )
     torch.ops.sgl_kernel.shuffle_rows.default(hidden_states, a_map, input_A_shuffle)
 
-    intermediate_cache1 = torch.empty((M * TopK, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype)
-    intermediate_cache2 = torch.empty((M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype)
-    intermediate_cache3 = torch.empty((M * TopK, OutK), device=hidden_states.device, dtype=hidden_states.dtype)
+    intermediate_cache1 = torch.empty(
+        (M * TopK, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype
+    )
+    intermediate_cache2 = torch.empty(
+        (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
+    )
+    intermediate_cache3 = torch.empty(
+        (M * TopK, OutK), device=hidden_states.device, dtype=hidden_states.dtype
+    )
 
-    torch.ops.sgl_kernel.moe_grouped_mm_nt(intermediate_cache1, input_A_shuffle, w1, expert_offsets, E)
+    torch.ops.sgl_kernel.moe_grouped_mm_nt(
+        intermediate_cache1, input_A_shuffle, w1, expert_offsets, E
+    )
 
     torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
 
@@ -358,6 +370,8 @@ def fused_experts(
         intermediate_cache3, intermediate_cache2, w2, expert_offsets, E
     )
 
-    torch.ops.sgl_kernel.apply_shuffle_mul_sum.default(intermediate_cache3, out_hidden_states, c_map, topk_weights)
+    torch.ops.sgl_kernel.apply_shuffle_mul_sum.default(
+        intermediate_cache3, out_hidden_states, c_map, topk_weights
+    )
 
     return out_hidden_states

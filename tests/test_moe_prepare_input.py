@@ -2,7 +2,8 @@ import itertools
 
 import pytest
 import torch
-from sgl_kernel import prepare_moe_input, shuffle_rows, apply_shuffle_mul_sum
+from sgl_kernel import apply_shuffle_mul_sum, prepare_moe_input, shuffle_rows
+
 
 @pytest.mark.parametrize("num_tokens", [1, 5, 16, 128, 1024])
 @pytest.mark.parametrize("num_experts", [1, 4, 8, 32, 64, 128])
@@ -13,15 +14,27 @@ def test_prepare_input_moe(num_tokens, num_experts, top_k, hidden_dims, dtype):
     if num_experts < top_k:
         pytest.skip("invalid combination")
     torch.manual_seed(41)
+
     # Generate unique token
     def generate_unique_topk_ids(tokens, top_k, num_experts):
         topk_ids = torch.empty((tokens, top_k), dtype=torch.int32)
-        #avoid duplicate tokens
+        # avoid duplicate tokens
         for T in range(tokens):
             topk_ids[T] = torch.randperm(num_experts, dtype=torch.int32)[:top_k]
         return topk_ids
 
-    def prepare_input_moe_ref(topk_ids, expert_offsets, blockscale_offsets, problem_sizes1, problem_sizes2, input_permutation, output_permutation, num_experts, hidden_dim, top_k):
+    def prepare_input_moe_ref(
+        topk_ids,
+        expert_offsets,
+        blockscale_offsets,
+        problem_sizes1,
+        problem_sizes2,
+        input_permutation,
+        output_permutation,
+        num_experts,
+        hidden_dim,
+        top_k,
+    ):
         tokens, top_k = topk_ids.shape
         expert_cnt = torch.zeros(num_experts, dtype=torch.int32)
         for e in range(num_experts):
@@ -41,11 +54,11 @@ def test_prepare_input_moe(num_tokens, num_experts, top_k, hidden_dims, dtype):
         # compute offsets
         atomic_buffer = torch.zeros(num_experts, dtype=torch.int32)
         tot_offset = 0
-        #expert_offsets[0] = 0
+        # expert_offsets[0] = 0
         for i in range(num_experts):
             atomic_buffer[i] = tot_offset
             tot_offset += problem_sizes1[i * 3].item()
-            #expert_offsets[i + 1] = tot_offset
+            # expert_offsets[i + 1] = tot_offset
 
         # compute input/output permutes
         num_tokens = topk_ids.size(0)
@@ -60,7 +73,7 @@ def test_prepare_input_moe(num_tokens, num_experts, top_k, hidden_dims, dtype):
             input_permutation[start] = i // top_k
             output_permutation[i] = start
 
-    #routing that generate unique tokens
+    # routing that generate unique tokens
     topk_ids = generate_unique_topk_ids(num_tokens, top_k, num_experts)
     expert_offsets = torch.zeros(num_experts, dtype=torch.int32)
     my_atoimic_buffer = torch.zeros(num_experts, dtype=torch.int32)
@@ -81,21 +94,48 @@ def test_prepare_input_moe(num_tokens, num_experts, top_k, hidden_dims, dtype):
     output_permutation_xpu = torch.empty_like(flat_topk).to(device)
 
     # generate reference permutations on cpu
-    prepare_input_moe_ref(topk_ids, expert_offsets, blocksclae_offset, problem_sizes1, problem_sizes2, input_permutation, output_permutation, num_experts, hidden_dims, top_k)
+    prepare_input_moe_ref(
+        topk_ids,
+        expert_offsets,
+        blocksclae_offset,
+        problem_sizes1,
+        problem_sizes2,
+        input_permutation,
+        output_permutation,
+        num_experts,
+        hidden_dims,
+        top_k,
+    )
 
     # prepare moe inputs on xpu
-    prepare_moe_input(topk_ids_xpu, expert_offsets_xpu, problem_sizes1_xpu, problem_sizes2_xpu, input_permutation_xpu, output_permutation_xpu, num_experts, hidden_dims, top_k,blocksclae_offset)
+    prepare_moe_input(
+        topk_ids_xpu,
+        expert_offsets_xpu,
+        problem_sizes1_xpu,
+        problem_sizes2_xpu,
+        input_permutation_xpu,
+        output_permutation_xpu,
+        num_experts,
+        hidden_dims,
+        top_k,
+        blocksclae_offset,
+    )
 
     # validate expert offsets
     torch.testing.assert_close(expert_offsets, expert_offsets_xpu.to("cpu"))
 
-    input_tensor = torch.randn(num_tokens , hidden_dims, dtype=dtype)
+    input_tensor = torch.randn(num_tokens, hidden_dims, dtype=dtype)
     input_tensor_xpu = input_tensor.clone().to(device)
-    output_tensor_xpu = shuffle_rows(input_tensor_xpu, input_permutation_xpu, (num_tokens * top_k, hidden_dims))
+    output_tensor_xpu = shuffle_rows(
+        input_tensor_xpu, input_permutation_xpu, (num_tokens * top_k, hidden_dims)
+    )
     input_merge_xpu = torch.empty((num_tokens, hidden_dims), dtype=dtype, device=device)
     # apply weights
-    factors = torch.ones(top_k * num_tokens, dtype=torch.float32, device=device).fill_(1/top_k)
-    apply_shuffle_mul_sum(output_tensor_xpu, input_merge_xpu, output_permutation_xpu, factors)
+    factors = torch.ones(top_k * num_tokens, dtype=torch.float32, device=device).fill_(
+        1 / top_k
+    )
+    apply_shuffle_mul_sum(
+        output_tensor_xpu, input_merge_xpu, output_permutation_xpu, factors
+    )
     # of same order as in input
     torch.testing.assert_allclose(input_merge_xpu.to("cpu"), input_tensor)
-

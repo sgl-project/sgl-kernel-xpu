@@ -80,7 +80,7 @@ class PerTensorQuantFP8Kernel {
         float val = static_cast<float>(input_vec[j]) * scale_val;
         val = sycl::fmax(-FP8_E4M3_MAX, sycl::fmin(val, FP8_E4M3_MAX));
         DST_DTYPE fp8_val = static_cast<DST_DTYPE>(val);
-        std::memcpy(&output_vec[j], &fp8_val, sizeof(DST_DTYPE));
+        output_vec[j] = sycl::bit_cast<output_storage_t>(fp8_val);
       }
       // TODO: output_storage_t needs to be changed back to DST_DTYPE during store when fp8 type is supported in sycl
       output_vec.store(

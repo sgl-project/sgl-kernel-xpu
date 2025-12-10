@@ -253,8 +253,6 @@ def benchmark(
     block_shape,
     provider,
 ):
-    #import pdb
-    #pdb.set_trace()
     print(
         f"benchmark {provider} with batch_size={num_tokens} hidden_size={hidden_size} shard_intermediate_size={shard_intermediate_size}"
     )

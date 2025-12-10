@@ -253,6 +253,8 @@ def benchmark(
     block_shape,
     provider,
 ):
+    #import pdb
+    #pdb.set_trace()
     print(
         f"benchmark {provider} with batch_size={num_tokens} hidden_size={hidden_size} shard_intermediate_size={shard_intermediate_size}"
     )
@@ -260,7 +262,6 @@ def benchmark(
     torch.xpu.manual_seed_all(0)
 
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
-
     w1 = torch.randn(num_experts, shard_intermediate_size, hidden_size, dtype=dtype)
     w2 = torch.randn(
         num_experts, hidden_size, shard_intermediate_size // 2, dtype=dtype

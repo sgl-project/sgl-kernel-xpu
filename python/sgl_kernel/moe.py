@@ -303,7 +303,7 @@ def fused_experts(
         topk_ids.shape[0] == hidden_states.shape[0]
     ), f"topk_ids shape {topk_ids.shape} and topk_weights shape {topk_weights.shape} must be equal and match hidden_states shape[0] {hidden_states.shape[0]}"
 
-    num_tokens, _ = hidden_states.shape
+    num_tokens, hidden_dims = hidden_states.shape
 
     E, _, K = w1.shape
     E, OutK, N = w2.shape
@@ -311,20 +311,6 @@ def fused_experts(
 
     M = num_tokens
     TopK = topk_ids.shape[1]
-
-    # import pdb; pdb.set_trace()
-    cache = torch.empty(
-        M * TopK * max(2 * N, OutK),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-    intermediate_cache1 = cache[: M * TopK * 2 * N].view((M * TopK, 2 * N))
-    intermediate_cache2 = torch.empty(
-        (M * TopK, N),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-    intermediate_cache3 = cache[: M * TopK * OutK].view((M * TopK, OutK))
 
     if no_combine:
         assert not inplace
@@ -338,33 +324,40 @@ def fused_experts(
     else:
         out_hidden_states = torch.zeros_like(hidden_states)
 
-    flat_topk = topk_ids.flatten()
-    idxs = flat_topk.argsort()
-    sorted_expert_ids = flat_topk[idxs]
-
-    counts = torch.bincount(sorted_expert_ids, minlength=E)  # [E]
-    token_idxs = idxs // TopK  # [num_tokens * TopK]
-    input_A = torch.empty(
+    expert_offsets = torch.zeros((E), dtype=torch.int32, device=hidden_states.device)
+    problem_sizes1 = torch.empty((E, 3), dtype=torch.int32, device=hidden_states.device)
+    problem_sizes2 = torch.empty((E, 3), dtype=torch.int32, device=hidden_states.device)
+    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=hidden_states.device)
+    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=hidden_states.device)
+    torch.ops.sgl_kernel.prepare_moe_input.default(
+        topk_ids,
+        expert_offsets,
+        None,
+        problem_sizes1,
+        problem_sizes2,
+        a_map,
+        c_map,
+        E,
+        hidden_dims,
+        TopK
+    )
+    input_A_shuffle = torch.empty(
         (num_tokens * TopK, K), device=hidden_states.device, dtype=hidden_states.dtype
     )
-    input_A = hidden_states[token_idxs].squeeze(1)
-    offset = counts.to(torch.int32)
+    torch.ops.sgl_kernel.shuffle_rows.default(hidden_states, a_map, input_A_shuffle)
 
-    torch.ops.sgl_kernel.moe_grouped_mm_nt(intermediate_cache1, input_A, w1, offset, E)
+    intermediate_cache1 = torch.empty((M * TopK, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype)
+    intermediate_cache2 = torch.empty((M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype)
+    intermediate_cache3 = torch.empty((M * TopK, OutK), device=hidden_states.device, dtype=hidden_states.dtype)
+
+    torch.ops.sgl_kernel.moe_grouped_mm_nt(intermediate_cache1, input_A_shuffle, w1, expert_offsets, E)
 
     torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
 
     torch.ops.sgl_kernel.moe_grouped_mm_nt(
-        intermediate_cache3, intermediate_cache2, w2, offset, E
+        intermediate_cache3, intermediate_cache2, w2, expert_offsets, E
     )
 
-    flat_weights = topk_weights.to(intermediate_cache3.dtype).flatten()[idxs]  # [N]
-    intermediate_cache3 = intermediate_cache3 * flat_weights.unsqueeze(1)
-    out_hidden_states.scatter_reduce_(
-        0,
-        token_idxs.view(-1, 1).expand(-1, OutK),
-        intermediate_cache3,
-        reduce="sum",
-    )
+    torch.ops.sgl_kernel.apply_shuffle_mul_sum.default(intermediate_cache3, out_hidden_states, c_map, topk_weights)
 
     return out_hidden_states

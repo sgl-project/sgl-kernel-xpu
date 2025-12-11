@@ -81,13 +81,14 @@ class TestPerTokenGroupQuantXPU(unittest.TestCase):
         hidden_dim: int,
         group_size: int,
         dst_dtype: torch.dtype,
+        src_dtype: torch.dtype = torch.bfloat16,
         column_major_scales: bool = False,
         scale_ue8m0: bool = False,
         seed: int = 42,
     ):
         """Test XPU implementation against PyTorch reference."""
         torch.manual_seed(seed)
-        x_cpu = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16)
+        x_cpu = torch.randn(num_tokens, hidden_dim, dtype=src_dtype)
         x_xpu = x_cpu.to(self.device)
 
         # Get reference output
@@ -137,46 +138,50 @@ class TestPerTokenGroupQuantXPU(unittest.TestCase):
         rtol, atol = (1e-1, 1e-1) if dst_dtype == torch.float8_e4m3fn else (1e-2, 1e-2)
         torch.testing.assert_close(x_dq_xpu, x_dq_ref, rtol=rtol, atol=atol)
 
-    def test_fp8_basic(self):
-        """Test basic FP8 quantization."""
-        self._test_against_reference(128, 1024, 128, torch.float8_e4m3fn)
-
-    def test_int8_basic(self):
-        """Test basic INT8 quantization."""
-        self._test_against_reference(128, 1024, 128, torch.int8)
-
-    def test_various_sizes(self):
-        """Test various tensor sizes."""
-        configs = [
-            (64, 512, 64, torch.float8_e4m3fn),
-            (128, 2048, 128, torch.float8_e4m3fn),
-            (256, 4096, 64, torch.int8),
-        ]
-        for num_tokens, hidden_dim, group_size, dtype in configs:
-            with self.subTest(
-                num_tokens=num_tokens,
-                hidden_dim=hidden_dim,
-                group_size=group_size,
-                dtype=dtype,
-            ):
-                self._test_against_reference(num_tokens, hidden_dim, group_size, dtype)
-
-    def test_column_major_scales(self):
-        """Test column-major scale layout."""
+    @pytest.mark.parametrize(
+        "num_tokens,hidden_dim,group_size,dst_dtype,src_dtype,column_major_scales,scale_ue8m0",
+        [
+            # Basic FP8 quantization
+            (128, 1024, 128, torch.float8_e4m3fn, torch.bfloat16, False, False),
+            # Basic INT8 quantization
+            (128, 1024, 128, torch.int8, torch.bfloat16, False, False),
+            # Various sizes
+            (64, 512, 64, torch.float8_e4m3fn, torch.bfloat16, False, False),
+            (128, 2048, 128, torch.float8_e4m3fn, torch.bfloat16, False, False),
+            (256, 4096, 64, torch.int8, torch.bfloat16, False, False),
+            # Column-major scale layout
+            (128, 1024, 128, torch.float8_e4m3fn, torch.bfloat16, True, False),
+            # UE8M0 scale format with column-major layout
+            (128, 1024, 128, torch.float8_e4m3fn, torch.bfloat16, True, True),
+            # Float16 source dtype tests
+            (128, 1024, 128, torch.float8_e4m3fn, torch.float16, False, False),
+            (128, 1024, 128, torch.int8, torch.float16, False, False),
+            (64, 512, 64, torch.float8_e4m3fn, torch.float16, False, False),
+            # Float32 source dtype tests
+            (128, 1024, 128, torch.float8_e4m3fn, torch.float32, False, False),
+            (128, 1024, 128, torch.int8, torch.float32, False, False),
+            (64, 512, 64, torch.float8_e4m3fn, torch.float32, False, False),
+        ],
+    )
+    def test_quantization(
+        self,
+        num_tokens,
+        hidden_dim,
+        group_size,
+        dst_dtype,
+        src_dtype,
+        column_major_scales,
+        scale_ue8m0,
+    ):
+        """Test per-token group quantization with various configurations."""
         self._test_against_reference(
-            128, 1024, 128, torch.float8_e4m3fn, column_major_scales=True
-        )
-
-    # @unittest.skip("scale_ue8m0 requires TMA alignment which is not available on Intel GPUs")
-    def test_scale_ue8m0(self):
-        """Test UE8M0 scale format with column-major layout."""
-        self._test_against_reference(
-            128,
-            1024,
-            128,
-            torch.float8_e4m3fn,
-            column_major_scales=True,
-            scale_ue8m0=True,
+            num_tokens,
+            hidden_dim,
+            group_size,
+            dst_dtype,
+            src_dtype,
+            column_major_scales,
+            scale_ue8m0,
         )
 
     def test_edge_cases(self):

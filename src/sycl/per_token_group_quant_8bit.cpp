@@ -18,10 +18,6 @@ inline T QuantGroupReduceMax(T val, sycl::nd_item<1> item, int tid) {
   auto sg = item.get_sub_group();
   uint32_t lane_id = sg.get_local_id()[0];
 
-  // CUDA uses masks to operate on half-warps (16 threads)
-  // Upper half: lanes 16-31, Lower half: lanes 0-15
-  bool is_upper_half = (tid % 32) >= 16;
-
   // Perform butterfly reduction with XOR pattern
   // XOR with 8, 4, 2, 1 to reduce within 16 threads
   val = sycl::fmax(val, sycl::permute_group_by_xor(sg, val, 8));

@@ -5,10 +5,10 @@ import torch
 from sgl_kernel import apply_shuffle_mul_sum, prepare_moe_input, shuffle_rows
 
 
-@pytest.mark.parametrize("num_tokens", [1, 5, 16, 128, 1024])
-@pytest.mark.parametrize("num_experts", [1, 4, 8, 32, 64, 128])
-@pytest.mark.parametrize("top_k", [1, 2, 4, 8])
-@pytest.mark.parametrize("hidden_dims", [16, 32, 64, 128])
+@pytest.mark.parametrize("num_tokens", [1, 2, 5, 16, 64, 128, 224, 1024])
+@pytest.mark.parametrize("num_experts", [1, 4, 8, 32, 40, 64, 128, 256])
+@pytest.mark.parametrize("top_k", [1, 2, 4, 6, 8])
+@pytest.mark.parametrize("hidden_dims", [16, 32, 64, 128, 1024, 1536])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_prepare_input_moe(num_tokens, num_experts, top_k, hidden_dims, dtype):
     if num_experts < top_k:
@@ -123,7 +123,6 @@ def test_prepare_input_moe(num_tokens, num_experts, top_k, hidden_dims, dtype):
 
     # validate expert offsets
     torch.testing.assert_close(expert_offsets, expert_offsets_xpu.to("cpu"))
-
     input_tensor = torch.randn(num_tokens, hidden_dims, dtype=dtype)
     input_tensor_xpu = input_tensor.clone().to(device)
     output_tensor_xpu = shuffle_rows(

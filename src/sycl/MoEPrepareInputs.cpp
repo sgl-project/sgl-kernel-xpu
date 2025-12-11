@@ -1,28 +1,21 @@
 #include <ATen/ATen.h>
-#include <ATen/OpMathType.h>
-#include <ATen/Parallel.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <iostream>
 #include <sycl/sycl.hpp>
-#include <vector>
 
-#include "MemoryAccess.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 
 constexpr int block_size = 128;
 
-struct compute_problem_sizes_sycl_K {
-  compute_problem_sizes_sycl_K(
-      const int* topk_ids,
-      int32_t* problem_sizes1,
-      int32_t* problem_sizes2,
-      int32_t* atomic_buffer,
+template <typename T>
+struct compute_problem_sizes_sycl_K_T {
+  compute_problem_sizes_sycl_K_T(
+      const T* topk_ids,
+      T* problem_sizes1,
+      T* problem_sizes2,
+      T* atomic_buffer,
       const uint32_t num_experts,
       const uint32_t topk_length,
       const uint32_t n,
@@ -43,13 +36,13 @@ struct compute_problem_sizes_sycl_K {
     if (thread_id < topk_length_) {
       int expert_id = item.get_group(0);
 
-      int occurrences = 0;
+      T occurrences = 0;
       for (int i = thread_id; i < topk_length_; i += max_tokens_per_expert_) {
         occurrences += (topk_ids_[i] == expert_id);
       }
 
       sycl::atomic_ref<
-          int32_t,
+          T,
           sycl::memory_order::relaxed,
           sycl::memory_scope::work_group,
           sycl::access::address_space::generic_space>
@@ -60,7 +53,7 @@ struct compute_problem_sizes_sycl_K {
       item.barrier(sycl::access::fence_space::local_space);
 
       if (thread_id == 0) {
-        int final_occurrences = atomic_buffer_[expert_id];
+        T final_occurrences = atomic_buffer_[expert_id];
         problem_sizes1_[expert_id * 3] = final_occurrences;
         problem_sizes1_[expert_id * 3 + 1] = static_cast<int32_t>(2 * n_);
         problem_sizes1_[expert_id * 3 + 2] = static_cast<int32_t>(k_);
@@ -71,10 +64,10 @@ struct compute_problem_sizes_sycl_K {
     }
   }
 
-  const int* topk_ids_;
-  int32_t* problem_sizes1_;
-  int32_t* problem_sizes2_;
-  int32_t* atomic_buffer_;
+  const T* topk_ids_;
+  T* problem_sizes1_;
+  T* problem_sizes2_;
+  T* atomic_buffer_;
   const uint32_t num_experts_;
   const uint32_t topk_length_;
   const uint32_t n_;
@@ -82,21 +75,27 @@ struct compute_problem_sizes_sycl_K {
   const uint32_t max_tokens_per_expert_;
 };
 
-void compute_problem_sizes_sycl(
-    const int* topk_ids,
-    int32_t* problem_sizes1,
-    int32_t* problem_sizes2,
-    int32_t* atomic_buffer,
+template <typename T>
+void compute_problem_sizes_sycl_impl(
+    const torch::Tensor& topk_ids,
+    torch::Tensor& problem_sizes1,
+    torch::Tensor& problem_sizes2,
+    torch::Tensor& expert_offsets,
     const uint32_t num_experts,
-    const uint32_t topk_length,
     const uint32_t n,
     const uint32_t k) {
+  const T* topk_ptr = static_cast<const T*>(topk_ids.data_ptr());
+  T* problem_sizes1_ptr = static_cast<T*>(problem_sizes1.data_ptr());
+  T* problem_sizes2_ptr = static_cast<T*>(problem_sizes2.data_ptr());
+  T* atomic_buffer = static_cast<T*>(expert_offsets.data_ptr());
+
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
 
-  using Kernel = compute_problem_sizes_sycl_K;
+  using Kernel = compute_problem_sizes_sycl_K_T<T>;
 
-  auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
+  const uint32_t topk_length = topk_ids.numel();
+  auto dev_id = topk_ids.device().index();
   uint32_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
   uint32_t max_tokens_per_expert = static_cast<uint32_t>(sycl::min(max_wg_size, topk_length));
 
@@ -104,47 +103,25 @@ void compute_problem_sizes_sycl(
   sycl::range<1> local_range{max_tokens_per_expert};
 
   Kernel task(
-      topk_ids, problem_sizes1, problem_sizes2, atomic_buffer, num_experts, topk_length, n, k, max_tokens_per_expert);
+      topk_ptr,
+      problem_sizes1_ptr,
+      problem_sizes2_ptr,
+      atomic_buffer,
+      num_experts,
+      topk_length,
+      n,
+      k,
+      max_tokens_per_expert);
 
   sycl_kernel_submit(global_range, local_range, queue, task);
+
   return;
 }
 
-struct compute_expert_offsets_sycl_k {
-  compute_expert_offsets_sycl_k(int32_t* expert_offsets, int32_t* atomic_buffer, const uint32_t num_experts)
-      : expert_offsets_(expert_offsets), atomic_buffer_(atomic_buffer), num_experts_(num_experts) {}
-
-  void operator()(sycl::nd_item<1> it) const {
-    int lid = it.get_local_id(0);
-    int x = (lid < num_experts_) ? expert_offsets_[lid] : 0;
-    int scanned = exclusive_scan_over_group(it.get_group(), x, sycl::plus<int>());
-    if (lid < num_experts_) atomic_buffer_[lid] = scanned;
-  }
-
-  int32_t* expert_offsets_;
-  int32_t* atomic_buffer_;
-  const uint32_t num_experts_;
-};
-
-void compute_expert_offsets_sycl(int32_t* expert_offsets, int32_t* atomic_buffer, const uint32_t num_experts) {
-  auto stream = at::xpu::getCurrentXPUStream();
-  auto queue = stream.queue();
-
-  using Kernel = compute_expert_offsets_sycl_k;
-
-  Kernel task(expert_offsets, atomic_buffer, num_experts);
-
-  sycl_kernel_submit(num_experts, num_experts, queue, task);
-  return;
-}
-
-struct compute_expert_blockscale_offsets_sycl_K {
-  compute_expert_blockscale_offsets_sycl_K(
-      const int32_t* problem_sizes1,
-      int32_t* expert_offsets,
-      int32_t* blockscale_offsets,
-      int32_t* atomic_buffer,
-      const uint32_t num_experts)
+template <typename T, int BLOCK_SIZE>
+struct compute_expert_blockscale_offsets_sycl_K_T {
+  compute_expert_blockscale_offsets_sycl_K_T(
+      const T* problem_sizes1, T* expert_offsets, T* blockscale_offsets, T* atomic_buffer, const T num_experts)
       : problem_sizes1_(problem_sizes1),
         expert_offsets_(expert_offsets),
         blockscale_offsets_(blockscale_offsets),
@@ -152,14 +129,14 @@ struct compute_expert_blockscale_offsets_sycl_K {
         num_experts_(num_experts) {}
 
   void operator()(sycl::nd_item<1> item) const {
-    int32_t tot_offset = 0;
-    int32_t tot_rounded_offset = 0;
+    T tot_offset = 0;
+    T tot_rounded_offset = 0;
     expert_offsets_[0] = 0;
     blockscale_offsets_[0] = 0;
     for (int i = 0; i < num_experts_; ++i) {
       atomic_buffer_[i] = tot_offset;
-      int num_tokens = problem_sizes1_[i * 3];
-      int rounded_num_tokens = (num_tokens + (block_size - 1)) / block_size * block_size;
+      T num_tokens = problem_sizes1_[i * 3];
+      T rounded_num_tokens = div_up(num_tokens, static_cast<T>(BLOCK_SIZE)) * BLOCK_SIZE;  // align to block_size
       tot_offset += num_tokens;
       tot_rounded_offset += rounded_num_tokens;
       expert_offsets_[i + 1] = tot_offset;
@@ -167,36 +144,77 @@ struct compute_expert_blockscale_offsets_sycl_K {
     }
   }
 
-  const int32_t* problem_sizes1_;
-  int32_t* expert_offsets_;
-  int32_t* blockscale_offsets_;
-  int32_t* atomic_buffer_;
+  const T* problem_sizes1_;
+  T* expert_offsets_;
+  T* blockscale_offsets_;
+  T* atomic_buffer_;
   const uint32_t num_experts_;
 };
 
-void compute_expert_blockscale_offsets_sycl(
-    const int32_t* problem_sizes1,
-    int32_t* expert_offsets,
-    int32_t* blockscale_offsets,
-    int32_t* atomic_buffer,
-    const int64_t num_experts) {
+template <typename T>
+void compute_expert_blockscale_offsets_sycl_impl(
+    torch::Tensor& problem_sizes1,
+    torch::Tensor& expert_offsets,
+    const torch::Tensor& blockscale_offsets,
+    torch::Tensor& atomic_buffer,
+    const uint32_t num_experts) {
+  const T* problem_sizes1_ptr = static_cast<const T*>(problem_sizes1.data_ptr());
+  T* expert_offsets_ptr = static_cast<T*>(expert_offsets.data_ptr());
+  T* blockscale_offsets_ptr = static_cast<T*>(blockscale_offsets.data_ptr());
+  T* atomic_buffer_ptr = static_cast<T*>(atomic_buffer.data_ptr());
+
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
 
-  using Kernel = compute_expert_blockscale_offsets_sycl_K;
+  using Kernel = compute_expert_blockscale_offsets_sycl_K_T<T, block_size>;
 
-  Kernel task(problem_sizes1, expert_offsets, blockscale_offsets, atomic_buffer, num_experts);
+  Kernel task(problem_sizes1_ptr, expert_offsets_ptr, blockscale_offsets_ptr, atomic_buffer_ptr, num_experts);
 
   sycl_kernel_submit(1, 1, queue, task);
   return;
 }
 
-struct compute_arg_sorts_sycl_K {
-  compute_arg_sorts_sycl_K(
-      const int32_t* topk_ids,
-      int32_t* input_permutation,
-      int32_t* output_permutation,
-      int32_t* atomic_buffer,
+template <typename T>
+struct compute_expert_offsets_sycl_k_T {
+  compute_expert_offsets_sycl_k_T(T* expert_offsets, T* atomic_buffer, const uint32_t num_experts)
+      : expert_offsets_(expert_offsets), atomic_buffer_(atomic_buffer), num_experts_(num_experts) {}
+
+  void operator()(sycl::nd_item<1> it) const {
+    int lid = it.get_local_id(0);
+    T x = (lid < num_experts_) ? expert_offsets_[lid] : 0;
+    T scanned = exclusive_scan_over_group(it.get_group(), x, sycl::plus<T>());
+    if (lid < num_experts_) atomic_buffer_[lid] = scanned;
+  }
+
+  T* expert_offsets_;
+  T* atomic_buffer_;
+  const uint32_t num_experts_;
+};
+
+template <typename T>
+void compute_expert_offsets_sycl_impl(
+    torch::Tensor& expert_offsets, torch::Tensor& atomic_buffer, const uint32_t num_experts) {
+  T* expert_offsets_ptr = static_cast<T*>(expert_offsets.data_ptr());
+  T* atomic_buffer_ptr = static_cast<T*>(atomic_buffer.data_ptr());
+
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
+
+  using Kernel = compute_expert_offsets_sycl_k_T<T>;
+
+  Kernel task(expert_offsets_ptr, atomic_buffer_ptr, num_experts);
+
+  sycl_kernel_submit(num_experts, num_experts, queue, task);
+  return;
+}
+
+template <typename T>
+struct compute_arg_sorts_sycl_K_T {
+  compute_arg_sorts_sycl_K_T(
+      const T* topk_ids,
+      T* input_permutation,
+      T* output_permutation,
+      T* atomic_buffer,
       const int32_t topk_length,
       const int32_t topk,
       const int32_t num_experts,
@@ -214,7 +232,7 @@ struct compute_arg_sorts_sycl_K {
     int expert_id = item.get_group(0);
 
     sycl::atomic_ref<
-        int32_t,
+        T,
         sycl::memory_order::relaxed,
         sycl::memory_scope::work_group,
         sycl::access::address_space::generic_space>
@@ -222,37 +240,43 @@ struct compute_arg_sorts_sycl_K {
 
     for (int32_t i = item.get_local_id(0); i < topk_length_; i += max_tokens_per_expert_) {
       if (topk_ids_[i] == expert_id) {
-        int32_t start = atomic_counter.fetch_add(1);
+        T start = atomic_counter.fetch_add(1);
         input_permutation_[start] = i / topk_;
         output_permutation_[i] = start;
       }
     }
   }
 
-  const int32_t* topk_ids_;
-  int32_t* input_permutation_;
-  int32_t* output_permutation_;
-  int32_t* atomic_buffer_;
+  const T* topk_ids_;
+  T* input_permutation_;
+  T* output_permutation_;
+  T* atomic_buffer_;
   const uint32_t topk_length_;
   const uint32_t topk_;
   const uint32_t num_experts_;
   const uint32_t max_tokens_per_expert_;
 };
 
-void compute_arg_sorts_sycl(
-    const int32_t* topk_ids,
-    int32_t* input_permutation,
-    int32_t* output_permutation,
-    int32_t* atomic_buffer,
-    const uint32_t topk_length,
-    const uint32_t topk,
+template <typename T>
+void compute_arg_sorts_sycl_impl(
+    const torch::Tensor& topk_ids,
+    torch::Tensor& input_permutation,
+    torch::Tensor& output_permutation,
+    torch::Tensor& atomic_buffer,
     const uint32_t num_experts) {
+  const T* topk_ids_ptr = static_cast<const T*>(topk_ids.data_ptr());
+  T* input_permutation_ptr = static_cast<T*>(input_permutation.data_ptr());
+  T* output_permutation_ptr = static_cast<T*>(output_permutation.data_ptr());
+  T* atomic_buffer_ptr = static_cast<T*>(atomic_buffer.data_ptr());
+
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
 
-  using Kernel = compute_arg_sorts_sycl_K;
+  using Kernel = compute_arg_sorts_sycl_K_T<T>;
 
-  auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
+  const uint32_t topk_length = topk_ids.numel();
+  const int32_t topk = topk_ids.size(1);
+  auto dev_id = topk_ids.device().index();
   uint32_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
   uint32_t max_tokens_per_expert = static_cast<uint32_t>(sycl::min(max_wg_size, topk_length));
 
@@ -260,10 +284,10 @@ void compute_arg_sorts_sycl(
   sycl::range<1> local_range{max_tokens_per_expert};
 
   Kernel task(
-      topk_ids,
-      input_permutation,
-      output_permutation,
-      atomic_buffer,
+      topk_ids_ptr,
+      input_permutation_ptr,
+      output_permutation_ptr,
+      atomic_buffer_ptr,
       topk_length,
       topk,
       num_experts,
@@ -284,42 +308,32 @@ void prepare_moe_input(
     const int64_t num_experts,
     const int64_t n,
     const int64_t k) {
-  TORCH_CHECK(topk_ids.dtype() == torch::kInt32, "Expected topk_ids to be int32");
+  TORCH_CHECK(topk_ids.scalar_type() == problem_sizes1.scalar_type(), "problem_sizes1 must have same type as topk_ids");
+  TORCH_CHECK(topk_ids.scalar_type() == expert_offsets.scalar_type(), "expert_offsets must have same type as topk_ids");
+  TORCH_CHECK(topk_ids.scalar_type() == problem_sizes2.scalar_type(), "problem_sizes2 must have same type as topk_ids");
+  TORCH_CHECK(
+      topk_ids.scalar_type() == input_permutation.scalar_type(), "input_permutation must have same type as topk_ids");
+  TORCH_CHECK(
+      topk_ids.scalar_type() == output_permutation.scalar_type(), "output_permutation must have same type as topk_ids");
 
-  auto options_int32 = torch::TensorOptions().dtype(torch::kInt32).device(topk_ids.device());
-  torch::Tensor atomic_buffer = torch::zeros(num_experts + 1, options_int32);
+  AT_DISPATCH_INDEX_TYPES(topk_ids.scalar_type(), "prepare_moe_input", [&] {
+    using index_t = index_t;
 
-  compute_problem_sizes_sycl(
-      static_cast<const int32_t*>(topk_ids.data_ptr()),
-      static_cast<int32_t*>(problem_sizes1.data_ptr()),
-      static_cast<int32_t*>(problem_sizes2.data_ptr()),
-      static_cast<int32_t*>(expert_offsets.data_ptr()),
-      num_experts,
-      topk_ids.numel(),
-      n,
-      k);
+    auto options_type = torch::TensorOptions().dtype(topk_ids.dtype()).device(topk_ids.device());
+    torch::Tensor atomic_buffer = torch::zeros(num_experts + 1, options_type);
 
-  if (blockscale_offsets.has_value()) {
-    compute_expert_blockscale_offsets_sycl(
-        static_cast<const int32_t*>(problem_sizes1.data_ptr()),
-        static_cast<int32_t*>(expert_offsets.data_ptr()),
-        static_cast<int32_t*>(blockscale_offsets.value().data_ptr()),
-        static_cast<int32_t*>(expert_offsets.data_ptr()),
-        num_experts);
-  } else {
-    compute_expert_offsets_sycl(
-        static_cast<int32_t*>(expert_offsets.data_ptr()), static_cast<int32_t*>(atomic_buffer.data_ptr()), num_experts);
-  }
+    compute_problem_sizes_sycl_impl<index_t>(
+        topk_ids, problem_sizes1, problem_sizes2, expert_offsets, num_experts, n, k);
 
-  compute_arg_sorts_sycl(
-      static_cast<const int32_t*>(topk_ids.data_ptr()),
-      static_cast<int32_t*>(input_permutation.data_ptr()),
-      static_cast<int32_t*>(output_permutation.data_ptr()),
-      static_cast<int32_t*>(atomic_buffer.data_ptr()),
-      topk_ids.numel(),
-      topk_ids.size(1),
-      num_experts);
+    if (blockscale_offsets.has_value()) {
+      compute_expert_blockscale_offsets_sycl_impl<index_t>(
+          problem_sizes1, expert_offsets, blockscale_offsets.value(), atomic_buffer, num_experts);
+    } else {
+      compute_expert_offsets_sycl_impl<index_t>(expert_offsets, atomic_buffer, num_experts);
+    }
 
+    compute_arg_sorts_sycl_impl<index_t>(topk_ids, input_permutation, output_permutation, atomic_buffer, num_experts);
+  });
   return;
 }
 
@@ -379,7 +393,7 @@ void shuffle_rows_kernel_impl(
 
   using Kernel = ShuffleRows<T>;
 
-  auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
+  auto dev_id = input_tensor.device().index();
   uint32_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
   uint32_t max_num_cols = static_cast<uint32_t>(sycl::min(max_wg_size, num_cols));
 
@@ -423,9 +437,8 @@ struct ApplyShuffleMulSum {
 
   void operator()(sycl::nd_item<1> item) const {
     int out_tkn_id = item.get_group(0);
-    float sum_val = 0;
-
     for (int i = item.get_local_id(0); i < hidden_dim_; i += bs_hidden_dim_) {
+      float sum_val = 0;
       for (int k = 0; k < topk_; ++k) {
         int src_perm_offset = out_tkn_id * topk_ + k;
         int src_index = dst2src_map_[src_perm_offset];
@@ -456,14 +469,13 @@ void apply_shuffle_mul_sum_impl(
     const T1* factors,
     const uint32_t out_tkns,
     const uint32_t out_hidden_dims,
-    const int topk) {
+    const int topk,
+    uint32_t max_wg_size) {
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
 
   using Kernel = ApplyShuffleMulSum<T, T1>;
 
-  auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
-  uint32_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
   uint32_t max_out_hidden_dims = static_cast<uint32_t>(sycl::min(max_wg_size, out_hidden_dims));
 
   sycl::range<1> global_range{out_tkns * max_out_hidden_dims};
@@ -482,6 +494,10 @@ void apply_shuffle_mul_sum(
     const std::optional<torch::Tensor>& factors) {
   int m = output.size(0);
   int topk = int(permutation.size(0) / m);
+
+  auto dev_id = input.device().index();
+  uint32_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
+
   SYCL_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::BFloat16, at::ScalarType::Half, input.scalar_type(), "apply_shuffle_mul_sum", [&]() {
         using input_t = scalar_t;
@@ -496,7 +512,8 @@ void apply_shuffle_mul_sum(
                     reinterpret_cast<factors_t*>(factors->data_ptr()),
                     output.size(0),
                     output.size(1),
-                    topk);
+                    topk,
+                    max_wg_size);
               });
         } else {
           apply_shuffle_mul_sum_impl<input_t, input_t>(
@@ -506,7 +523,8 @@ void apply_shuffle_mul_sum(
               nullptr,
               output.size(0),
               output.size(1),
-              topk);
+              topk,
+              max_wg_size);
         }
       });
   return;

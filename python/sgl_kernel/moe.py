@@ -324,6 +324,7 @@ def fused_experts(
     else:
         out_hidden_states = torch.zeros_like(hidden_states)
 
+    topk_ids = topk_ids.int() if topk_ids.dtype == torch.long else topk_ids
     expert_offsets = torch.zeros((E), dtype=torch.int32, device=hidden_states.device)
     problem_sizes1 = torch.empty((E, 3), dtype=torch.int32, device=hidden_states.device)
     problem_sizes2 = torch.empty((E, 3), dtype=torch.int32, device=hidden_states.device)

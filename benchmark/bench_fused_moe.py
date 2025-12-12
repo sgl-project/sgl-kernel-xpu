@@ -319,9 +319,9 @@ def benchmark(
             "dtype": dtype,
             "block_shape": block_shape,
             "provider": provider,
-            "ms": ms,
             "tflops": tflops,
             "bandwidth": bandwidth,
+            "ms": ms,
         }
     )
     return ms

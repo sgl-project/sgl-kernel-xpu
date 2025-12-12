@@ -12,168 +12,99 @@
 #include "cutlass/gemm/device/gemm_universal.h"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/util/device_memory.h"
-#include "kernels/moe/dispatch_policy.hpp"
-#include "kernels/moe/xe_array_epilogue.hpp"
-#include "kernels/moe/xe_array_mma.hpp"
-#include "kernels/moe/xe_moe_gemm.hpp"
+#include "kernels/moe/moe_kernel.hpp"
 
 using namespace cute;
+using namespace MoE;
 
-template <typename scalar_t>
-struct MoERunner {
-  using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;  // <M,N,K> per group
-  template <typename Gemm>
-  typename Gemm::Arguments args_from_options(
-      const cutlass::KernelHardwareInfo& hw_info,
-      const typename Gemm::ElementA* A_ptr,
-      const typename Gemm::ElementB* B_ptr,
-      typename Gemm::CollectiveEpilogue::ElementOutput* D_ptr,
-      const int gemm_N,
-      const int gemm_K,
-      const int* num_rows_per_expert_device,
-      const int num_experts) {
-    typename Gemm::Arguments arguments;
-    decltype(arguments.fusion_args) fusion_args;
+using ElementAccumulator = float;  // <- data type of accumulator
 
-    fusion_args.alpha = 1;
-    fusion_args.beta = 0;
-    fusion_args.alpha_ptr = nullptr;
-    fusion_args.beta_ptr = nullptr;
-    fusion_args.alpha_ptr_array = nullptr;
-    fusion_args.beta_ptr_array = nullptr;
-    // One alpha and beta per each group
-    fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 1};
-    fusion_args.dBeta = {cute::_0{}, cute::_0{}, 1};
+template <typename, typename, typename, typename, typename, typename>
+class GemmCuteName;
 
-    using RasterOrderOptions =
-        typename cutlass::gemm::kernel::detail::PersistentTileSchedulerXeGroup<ProblemShape>::RasterOrderOptions;
+template <typename Tile, typename SGLayout>
+void MoEGEMMLauncher(
+    sycl::queue q,
+    const void* activations,
+    const void* weights,
+    const void* scales,
+    void* outputs,
+    const int gemm_n,
+    const int gemm_k,
+    const int* num_rows_per_expert_device,
+    const int num_experts,
+    int* workspace) {
+  using Element = cutlass::bfloat16_t;
 
-    arguments = typename Gemm::Arguments{
-        cutlass::gemm::GemmUniversalMode::kGrouped,
-        static_cast<const typename Gemm::ElementA**>((void*)A_ptr),
-        static_cast<const typename Gemm::ElementB**>((void*)B_ptr),
-        nullptr,  // static_cast<const ElementC**>((void*)D_ptr),
-        static_cast<typename Gemm::CollectiveEpilogue::ElementOutput**>((void*)D_ptr),
-        fusion_args,
-        hw_info,
-        {1, RasterOrderOptions::AlongN},
-        num_rows_per_expert_device,
-        num_experts,
-        gemm_N,
-        gemm_K};
+  auto make_dummy_tensor = [&](auto val, auto stride) {
+    return make_tensor(make_gmem_ptr(&val), make_layout(repeat<rank_v<decltype(stride)>>(1), stride));
+  };
+  using StrideA = Stride<int, _1>;
+  using StrideB = Stride<int, _1>;
+  using StrideD = Stride<int, _1>;
+  using TensorA = decltype(make_dummy_tensor(Element{}, StrideA{}));
+  using TensorB = decltype(make_dummy_tensor(Element{}, StrideB{}));
+  using TensorD = decltype(make_dummy_tensor(Element{}, StrideD{}));
 
-    return arguments;
-  }
+  using ElementA_non_CV = cutlass::platform::remove_cv_t<Element>;
+  using MMA =
+      typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, ElementA_non_CV>>, Layout<Tile>, SGLayout>::TiledMMA;
+  auto mma = MMA{};
 
-  int init(
-      int device_id,
-      const void* activations,
-      const void* weights,
-      void* outputs,
-      const int gemm_n,
-      const int gemm_k,
-      const int* num_rows_per_expert_device,
-      const int num_experts) {  // Change device_id to another value if you are running on a machine with
-    // multiple GPUs and wish to use a GPU other than that with device ID 0.
-    hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
-    gemm_args = args_from_options<Gemm>(
-        hw_info,
-        reinterpret_cast<const scalar_t*>(activations),
-        reinterpret_cast<const scalar_t*>(weights),
-        reinterpret_cast<scalar_t*>(outputs),
-        gemm_n,
-        gemm_k,
-        num_rows_per_expert_device,
-        num_experts);
-    TORCH_CHECK(gemm_op.can_implement(gemm_args) == cutlass::Status::kSuccess, "GEMM configuration not supported.");
-    return Gemm::get_workspace_size(gemm_args);
-  }
+  int sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+  auto MaxThreadsPerWorkgroup = size(mma);
 
-  void run(sycl::queue queue, void* workspace) {
-    TORCH_CHECK(gemm_op.initialize(gemm_args, workspace) == cutlass::Status::kSuccess, "Failed to initialize GEMM.");
+  static constexpr int MaxThreadsPerSM = 512;
 
-    // Run the GEMM
-    TORCH_CHECK(gemm_op.run(&queue) == cutlass::Status::kSuccess, "Failed to run GEMM.");
-  }
+  TORCH_CHECK(
+      MaxThreadsPerSM % MaxThreadsPerWorkgroup == 0, "MaxThreadsPerSM must be divisible by MaxThreadsPerWorkgroup")
 
- public:
-  using LayoutA = cutlass::layout::RowMajor;
-  using LayoutB = cutlass::layout::ColumnMajor;
-  using LayoutC = cutlass::layout::RowMajor;
-  using LayoutD = cutlass::layout::RowMajor;
+  sycl::range<3> local(1, 1, MaxThreadsPerWorkgroup);
+  sycl::range<3> global(1, sm_count * MaxThreadsPerSM / MaxThreadsPerWorkgroup, 1);
 
-  using GmemTiledCopyA = XE_2D_U16x8x32_LD_N;
-  using GmemTiledCopyB = XE_2D_U16x16x16_LD_T;
+  namespace syclex = sycl::ext::oneapi::experimental;
+  namespace intelex = sycl::ext::intel::experimental;
 
-  // Workgroup-level tile
-  using TileShape = Shape<_256, _256, _32>;
+  syclex::properties kernel_props{syclex::sub_group_size<16>, intelex::grf_size<256>};
 
-  using TiledMma =  // M=8,N=16,K=16, D=f32,A=bf16,B=bf16,C=f32
-      typename TiledMMAHelper<
-          MMA_Atom<XE_8x16x16_F32BF16BF16F32_TT>,
-          Layout<TileShape>,
-          Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>>::TiledMMA;
+  using Kernel = MoE::MoEGEMM<Tile, SGLayout, TensorA, TensorB, TensorD, MMA, Element>;
+  typename Kernel::Params params{
+      static_cast<const Element*>(activations),
+      static_cast<const Element*>(weights),
+      static_cast<Element*>(outputs),
+      num_rows_per_expert_device,
+      gemm_n,
+      gemm_k,
+      num_experts,
+      workspace,
+      mma,
+  };
 
-  static constexpr int PipelineStages = 2;
-  // Dispatch to grouped gemm algorithm
-  using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16MoE<PipelineStages, cutlass::gemm::KernelXeMoEGEMM>;
-  using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeXMX16Group;
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto Q = stream.queue();
+  auto event = Q.submit([&](sycl::handler& h) {
+    sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), h);
+    h.parallel_for<GemmCuteName<Tile, SGLayout, TensorA, TensorB, TensorD, Element>>(
+        sycl::nd_range<3>(global * local, local), kernel_props, [=](sycl::nd_item<3> item) {
+          int32_t* slm_mem =
+              static_cast<int32_t*>(local_mem.template get_multi_ptr<sycl::access::decorated::no>().get());
+          Kernel{}(params, item, slm_mem);
+        });
+  });
+}
 
-  // ScaledAcc needs to be supported in xe_builder.inl and xe_callbacks.cpp
-  // This is a workaround
-  using EpilogueOp = cutlass::epilogue::fusion::
-      LinearCombination<float_t, float_t, float_t, float_t, cutlass::FloatRoundStyle::round_to_nearest>;
-  using CopyOpG2R = XE_2D_U32x8x16_LD_N;
-  using CopyOpR2G = XE_2D_U16x8x16_ST_N;
-
-  using StrideC = cutlass::detail::TagToStrideC_t<LayoutC*>;
-  using FusionCallbacks = typename cutlass::epilogue::collective::detail::FusionOpInfo<
-      EpilogueOp>::template FusionCallbacks<cutlass::epilogue::IntelXeXMX16Group, TileShape, TileShape, CopyOpG2R>;
-  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveEpilogue<
-      cutlass::epilogue::IntelXeXMX16MoE,
-      TileShape,
-      float,
-      StrideC,
-      scalar_t,
-      StrideC,
-      FusionCallbacks,
-      CopyOpG2R,
-      void,
-      void,
-      CopyOpR2G,
-      void,
-      void>;
-
-  // Mainloop
-  using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
-      GEMMDispatchPolicy,
-      TileShape,
-      scalar_t,
-      cutlass::gemm::TagToStrideA_t<LayoutA*>,
-      scalar_t,
-      cutlass::gemm::TagToStrideB_t<LayoutB*>,
-      TiledMma,
-      GmemTiledCopyA,
-      void,
-      void,
-      cute::identity,  // A
-      GmemTiledCopyB,
-      void,
-      void,
-      cute::identity  // B
-      >;
-
-  using GemmKernel = cutlass::gemm::kernel::
-      GemmMoEUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue, cutlass::gemm::GroupScheduler>;
-
-  using Gemm = cutlass::gemm::device::GemmMoEUniversalAdapter<GemmKernel>;
-
-  Gemm gemm_op;
-  typename Gemm::Arguments gemm_args;
-  // The KernelHardwareInfo struct holds the number of EUs on the GPU with a
-  // given device ID. This information is used by the underlying kernel.
-  cutlass::KernelHardwareInfo hw_info;
-};
+#define LAUNCH_MOE(...)                       \
+  MoEGEMMLauncher<__VA_ARGS__>(               \
+      queue,                                  \
+      activations.data_ptr(),                 \
+      weights.data_ptr(),                     \
+      nullptr,                                \
+      output.data_ptr(),                      \
+      gemm_n,                                 \
+      gemm_k,                                 \
+      total_rows_for_experts.data_ptr<int>(), \
+      n_experts,                              \
+      static_cast<int*>(atomic_buffer.data_ptr()))
 
 void moe_grouped_mm_nt(
     torch::Tensor& output,
@@ -203,19 +134,15 @@ void moe_grouped_mm_nt(
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
+  at::Tensor atomic_buffer = at::empty({static_cast<long>(1)}, activations.options().dtype(at::kInt));
 
-  using Kernel = MoERunner<cutlass::bfloat16_t>;
-  Kernel kernel;
-  auto workspace_size = kernel.init(
-      activations.device().index(),
-      activations.data_ptr(),
-      weights.data_ptr(),
-      output.data_ptr(),
-      gemm_n,
-      gemm_k,
-      total_rows_for_experts.data_ptr<int>(),
-      n_experts);
-  auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(activations.device());
-  auto workspace = torch::empty(workspace_size, workspace_options);
-  kernel.run(queue, workspace.data_ptr());
+  if (total_m <= 8) {
+    LAUNCH_MOE(Shape<_8, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
+  } else if (total_m <= 16) {
+    LAUNCH_MOE(Shape<_16, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
+  } else if (total_m <= 32) {
+    LAUNCH_MOE(Shape<_32, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
+  } else {
+    LAUNCH_MOE(Shape<_256, _256, _32>, Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>);
+  }
 }

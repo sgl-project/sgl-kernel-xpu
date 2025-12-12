@@ -7,7 +7,7 @@ function(CHECK_SYCL_FLAG FLAG VARIABLE_NAME)
   set(TEST_EXE_FILE "${TEMP_DIR}/check_options.out")
   file(WRITE ${TEST_SRC_FILE} "#include <iostream>\nint main() { std::cout << \"Checking compiler options ...\" << std::endl; return 0; }\n")
   execute_process(
-      COMMAND ${SYCL_COMPILER} -fsycl ${TEST_SRC_FILE} -o ${TEST_EXE_FILE} ${FLAG}
+      COMMAND ${SYCL_COMPILER} -fsycl -ftemplate-backtrace-limit=0 ${TEST_SRC_FILE} -o ${TEST_EXE_FILE} ${FLAG}
       WORKING_DIRECTORY ${TEMP_DIR}
       OUTPUT_VARIABLE output
       ERROR_VARIABLE output
@@ -63,6 +63,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   # gcc ${CMAKE_HOST_FLAGS} host.cpp -o host.o
   # 4. Linkage:
   # gcc -shared host.o kernel.o device-code.o -o libxxx.so
+  set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -ftemplate-backtrace-limit=0)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -fno-sycl-unnamed-lambda)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -sycl-std=2020)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -fhonor-nans)

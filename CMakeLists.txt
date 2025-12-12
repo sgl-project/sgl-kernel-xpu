@@ -22,6 +22,8 @@ find_package(Torch REQUIRED)
 set(SGL_OPS_XPU_ROOT ${PROJECT_SOURCE_DIR})
 list(APPEND CMAKE_MODULE_PATH ${SGL_OPS_XPU_ROOT}/cmake/Modules)
 
+set(DPCPP_SYCL_TARGET "bmg" CACHE STRING "dpcpp target device" FORCE)
+
 include(${SGL_OPS_XPU_ROOT}/cmake/SYCL.cmake)
 include(${SGL_OPS_XPU_ROOT}/cmake/BuildFlags.cmake)
 
@@ -38,7 +40,7 @@ set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable headers only mode in cutla
 FetchContent_Declare(
     repo-cutlass-sycl
     GIT_REPOSITORY https://github.com/intel/sycl-tla.git
-    GIT_TAG        ffb0d543d420a098a13c8d4cbe0ec7d858f63c4b
+    GIT_TAG        482b40e8bed0e9204311d1569c876b4573dfb952
     GIT_SHALLOW    OFF
 )
 FetchContent_MakeAvailable(repo-cutlass-sycl)

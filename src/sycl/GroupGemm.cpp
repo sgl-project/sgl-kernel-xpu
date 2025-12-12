@@ -13,7 +13,6 @@
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/util/device_memory.h"
 #include "kernels/moe/moe_kernel.hpp"
-#include "kernels/moe/moe_tile_scheduler.hpp"
 
 using namespace cute;
 using namespace MoE;

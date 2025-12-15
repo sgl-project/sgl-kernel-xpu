@@ -103,6 +103,7 @@ struct PerTokenGroupQuant8bitKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     constexpr uint32_t vec_size = 16 / sizeof(T);
     using vec_type = vec_t<T, vec_size>;
 
+    // TODO: Handle case where group_size is not divisible by vec_size
     const int32_t num_vec_elems = group_size / vec_size;
 
     // First pass: find local_absmax

@@ -41,15 +41,17 @@ def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
         bias,
     )
 
+
 def from_float8(x_fp8, inv_scale, dtype=torch.bfloat16):
     # x_fp8 is already quantized & saturated in FP8 format
     # inv_scale is the reciprocal scale returned from to_float8
 
     # dequantize using inverse scale
-    x_deq = x_fp8.to(torch.float32) * inv_scale
+    x_deq = x_fp8.to(dtype) * inv_scale
 
     # convert to target dtype (bf16 default)
     return x_deq.to(dtype)
+
 
 def _bmm_fp8_internal(
     workspace_buffer: torch.Tensor,
@@ -59,7 +61,7 @@ def _bmm_fp8_internal(
     A_scale: torch.Tensor,
     B_scale: torch.Tensor,
 ) -> None:
-    torch.bmm(from_float8(A, A_scale), from_float8(B, B_scale), out = D)
+    torch.bmm(from_float8(A, A_scale, D.dtype), from_float8(B, B_scale, D.dtype), out=D)
     # cublas_handle = torch.cuda.current_blas_handle()
     # torch.ops.sgl_kernel.bmm_fp8.default(
     #     A,
@@ -71,6 +73,7 @@ def _bmm_fp8_internal(
     #     cublas_handle,
     #     get_cuda_stream(),
     # )
+
 
 def bmm_fp8(
     A: torch.Tensor,

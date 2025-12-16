@@ -126,14 +126,14 @@ struct PerTokenGroupQuant8bitKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
     // Calculate scale factor
     float y_s = local_absmax / max_8bit;
-    if constexpr (SCALE_UE8M0) {
-      y_s = sycl::exp2(sycl::ceil(sycl::log2(sycl::fmax(y_s, 1e-10f))));
-    }
-
-    // Quantize the scale factor
     scale_element_t y_s_quant;
+
+    // Quantize the scale factor for UE8M0 format if needed
     if constexpr (SCALE_UE8M0) {
-      y_s_quant = static_cast<uint8_t>(static_cast<int>(sycl::log2(y_s)) + 127);
+      float exp_s = sycl::ceil(sycl::log2(sycl::fmax(y_s, 1e-10f)));
+      y_s = sycl::exp2(exp_s);
+      // represent quantized scale as power of 2 exponent + 127 bias
+      y_s_quant = static_cast<scale_element_t>(static_cast<int>(exp_s) + 127);
     } else {
       y_s_quant = y_s;
     }

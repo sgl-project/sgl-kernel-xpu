@@ -89,6 +89,18 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state_v2", torch::kXPU, &merge_state_v2);
+  //   m.def(
+  //       "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype,
+  //       -> Tensor");
+  //   m.impl("fp8_blockwise_scaled_mm", torch::kXPU, &fp8_blockwise_scaled_mm);
+
+  m.def(
+      "mxfp4_blockwise_scaled_grouped_mm(Tensor! output, Tensor! a_ptrs, Tensor! b_ptrs, Tensor! out_ptrs, "
+      "Tensor! a_scales_ptrs, Tensor! b_scales_ptrs, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, "
+      "Tensor stride_a, Tensor stride_b, Tensor stride_c, Tensor layout_sfa, Tensor layout_sfb, "
+      "Tensor problem_sizes, Tensor expert_offsets, Tensor workspace) -> ()");
+  m.impl("mxfp4_blockwise_scaled_grouped_mm", torch::kXPU, &at::native::xpu::mxfp4_blockwise_scaled_grouped_mm);
+
   /*
    * From cutlass attention
    */

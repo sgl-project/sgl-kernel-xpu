@@ -99,4 +99,5 @@ def test_moe_gemm(num_tokens, topk, num_experts, hidden_size, intermediate_size)
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+    sys.exit(pytest.main([__file__]))

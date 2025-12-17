@@ -48,4 +48,5 @@ def test_topk_softmax(num_tokens, num_experts, topk):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+    sys.exit(pytest.main([__file__]))

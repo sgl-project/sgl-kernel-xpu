@@ -139,4 +139,5 @@ def test_merge_state(seq_len, num_heads, head_dim):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+    sys.exit(pytest.main([__file__]))

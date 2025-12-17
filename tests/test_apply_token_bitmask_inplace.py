@@ -20,4 +20,5 @@ def test_apply_token_bitmask_inplace_kernel():
 
 if __name__ == "__main__":
     test_apply_token_bitmask_inplace_kernel()
-    pytest.main([__file__])
+    import sys
+    sys.exit(pytest.main([__file__]))

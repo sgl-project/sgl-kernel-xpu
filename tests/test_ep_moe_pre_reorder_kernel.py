@@ -178,4 +178,5 @@ def test_ep_moe_pre_reorder_vs_triton(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+    sys.exit(pytest.main([__file__]))

@@ -96,4 +96,5 @@ def test_moe_fused_gate_combined(seq_length, dtype, params, num_fused_shared_exp
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+    sys.exit(pytest.main([__file__]))

@@ -67,7 +67,7 @@ def torch_naive_moe(
 def test_moe_gemm(num_tokens, topk, num_experts, hidden_size, intermediate_size):
     torch.xpu.manual_seed_all(0)
 
-    rtol, atol = 1e-1, 1e-2
+    rtol, atol = 1e-5, 1e-6
     a = create_random_xpu_tensor((num_tokens, hidden_size), torch.bfloat16)
     w1 = create_random_xpu_tensor(
         (num_experts, 2 * intermediate_size, hidden_size), torch.bfloat16
@@ -99,4 +99,5 @@ def test_moe_gemm(num_tokens, topk, num_experts, hidden_size, intermediate_size)
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+    sys.exit(pytest.main([__file__]))

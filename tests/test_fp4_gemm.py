@@ -151,4 +151,5 @@ def test_nvfp4_gemm(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+    sys.exit(pytest.main([__file__]))

@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from sgl_kernel import fused_experts
-
+import sys
 
 def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
     d = x.shape[-1] // 2
@@ -99,5 +99,4 @@ def test_moe_gemm(num_tokens, topk, num_experts, hidden_size, intermediate_size)
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

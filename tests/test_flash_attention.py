@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 import utils
 from einops import rearrange, repeat
+import sys
 
 device = utils.get_device()
 
@@ -1354,5 +1355,4 @@ def test_flash_attn_varlen_output(
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

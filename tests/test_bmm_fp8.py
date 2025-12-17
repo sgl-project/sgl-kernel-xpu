@@ -4,6 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from sgl_kernel import bmm_fp8
+import sys
 
 
 def to_float8(x, dtype=torch.float8_e4m3fn):
@@ -40,5 +41,4 @@ def test_bmm_fp8(input_dtype, mat2_dtype, res_dtype):
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

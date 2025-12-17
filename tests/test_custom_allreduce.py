@@ -4,7 +4,7 @@ import random
 import socket
 import unittest
 from typing import Any, List, Optional
-
+import sys
 import sgl_kernel.allreduce as custom_ops
 import torch
 import torch.distributed as dist
@@ -182,5 +182,4 @@ class TestCustomAllReduce(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

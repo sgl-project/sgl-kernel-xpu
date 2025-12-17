@@ -3,7 +3,7 @@
 import pytest
 import sgl_kernel
 import torch
-
+import sys
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
@@ -134,5 +134,4 @@ def test_min_p_sampling(batch_size, vocab_size, p):
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

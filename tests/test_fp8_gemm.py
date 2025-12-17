@@ -1,7 +1,7 @@
 import pytest
 import torch
 from sgl_kernel import fp8_scaled_mm
-
+import sys
 
 def torch_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias):
     o = torch.matmul(a.to(torch.float32), b.to(torch.float32))
@@ -46,5 +46,4 @@ def test_accuracy(M, N, K, with_bias, out_dtype):
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

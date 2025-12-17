@@ -5,7 +5,7 @@ import torch
 import triton
 import triton.language as tl
 from sgl_kernel import merge_state, merge_state_v2
-
+import sys
 
 @triton.jit
 def merge_state_kernel(
@@ -397,5 +397,4 @@ def test_merge_attn_states(
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

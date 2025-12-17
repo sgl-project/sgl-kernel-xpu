@@ -7,7 +7,7 @@ import torch
 import triton
 import triton.language as tl
 from sgl_kernel import merge_state
-
+import sys
 
 def check_input(x: torch.Tensor):
     assert x.is_cuda, f"{str(x)} must be a CUDA Tensor"
@@ -139,5 +139,4 @@ def test_merge_state(seq_len, num_heads, head_dim):
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

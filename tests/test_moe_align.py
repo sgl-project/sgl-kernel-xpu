@@ -5,7 +5,7 @@ import torch
 import triton
 import triton.language as tl
 from sgl_kernel import moe_align_block_size, moe_sum
-
+import sys
 
 def ceil_div(a, b):
     return (a + b - 1) // b
@@ -261,5 +261,4 @@ def test_moe_sum(m: int, topk: int, k: int, dtype: torch.dtype):
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

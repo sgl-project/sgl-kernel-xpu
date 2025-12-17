@@ -4,6 +4,8 @@ import pytest
 import sgl_kernel
 import torch
 import utils
+import sys
+
 
 device = utils.get_device()
 
@@ -39,5 +41,4 @@ def test_fused_gelu_mul(dim, batch_size, seq_len):
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

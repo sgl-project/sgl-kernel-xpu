@@ -3,7 +3,7 @@ import itertools
 import pytest
 import torch
 from sgl_kernel import ep_moe_post_reorder
-
+import sys
 from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_triton_kernel
 
 
@@ -160,5 +160,4 @@ def test_ep_moe_post_reorder_vs_triton(
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

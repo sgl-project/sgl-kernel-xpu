@@ -5,6 +5,7 @@ import pytest
 import torch
 import utils
 from sgl_kernel import awq_dequantize
+import sys
 
 device = utils.get_device()
 
@@ -114,5 +115,4 @@ def test_awq_dequant_compare_implementations(
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

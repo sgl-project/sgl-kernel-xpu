@@ -1,6 +1,7 @@
 import pytest
 import torch
 from sgl_kernel import scaled_fp4_quant
+import sys
 
 skip_condition = torch.cuda.get_device_capability() < (10, 0)
 
@@ -167,5 +168,4 @@ def test_quantize_to_fp4_padded(pad_shape: tuple[int, int]) -> None:
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

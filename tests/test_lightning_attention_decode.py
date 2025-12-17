@@ -1,7 +1,7 @@
 import pytest
 import torch
 from sgl_kernel import lightning_attention_decode
-
+import sys
 
 def naive_lightning_attention_decode(q, k, v, past_kv, slope):
     """Naive implementation of lightning attention decode"""
@@ -81,5 +81,4 @@ def test_lightning_attention_decode(dtype, batch_size, num_heads, dim, embed_dim
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

@@ -1,6 +1,6 @@
 import itertools
 from typing import Optional, Tuple
-
+import sys
 import pytest
 import torch
 from sgl_kernel import sgl_per_token_quant_fp8
@@ -54,5 +54,4 @@ def test_per_token_quant_compare_implementations(
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

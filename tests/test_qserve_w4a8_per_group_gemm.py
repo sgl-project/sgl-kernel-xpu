@@ -1,7 +1,7 @@
 import pytest
 import torch
 from sgl_kernel import qserve_w4a8_per_group_gemm
-
+import sys
 
 # Adapted from https://github.com/mit-han-lab/omniserve/blob/main/omniserve/modeling/layers/quantized_linear/w4a8_linear.py
 def convert_to_qserve_format(qweight, chn_scale, scale_i8, zero_i8, group_size):
@@ -180,5 +180,4 @@ def test_accuracy(M, N, K, group_size, out_dtype):
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

@@ -1,7 +1,7 @@
 import os
 import random
 from typing import Optional, Type
-
+import sys
 import pytest
 import torch
 from sgl_kernel import fp8_blockwise_scaled_mm
@@ -90,5 +90,4 @@ def test_accuracy(M, N, K, out_dtype):
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

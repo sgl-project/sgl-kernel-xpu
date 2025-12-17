@@ -3,6 +3,7 @@ import sgl_kernel
 import torch
 import torch.nn.functional as F
 import utils
+import sys
 
 device = utils.get_device()
 
@@ -80,5 +81,4 @@ def test_topk_softmax(dtype, n_token, n_topk, n_expert, renormalize):
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

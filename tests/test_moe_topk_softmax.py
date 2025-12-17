@@ -3,7 +3,7 @@ import itertools
 import pytest
 import torch
 from sgl_kernel import topk_softmax
-
+import sys
 
 @pytest.mark.parametrize(
     "num_tokens, num_experts, topk",
@@ -48,5 +48,4 @@ def test_topk_softmax(num_tokens, num_experts, topk):
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

@@ -4,6 +4,7 @@ import pytest
 import sgl_kernel
 import torch
 import utils
+import sys
 
 device = utils.get_device()
 
@@ -133,5 +134,4 @@ def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype):
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

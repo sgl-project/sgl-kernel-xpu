@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 from sgl_kernel import cutlass_mla_decode, cutlass_mla_get_workspace_size
 from torch import Tensor
+import sys
 
 if torch.cuda.get_device_capability() < (10, 0):
     pytest.skip(
@@ -96,5 +97,4 @@ def test_cutlass_mla_decode(
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

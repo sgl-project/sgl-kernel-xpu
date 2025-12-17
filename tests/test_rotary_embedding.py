@@ -5,6 +5,7 @@ import pytest
 import sgl_kernel
 import torch
 import utils
+import sys
 
 precision = {
     torch.bfloat16: 1e-2,
@@ -449,5 +450,4 @@ def test_deepseek_v2_rope():
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

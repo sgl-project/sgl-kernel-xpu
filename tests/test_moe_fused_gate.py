@@ -3,7 +3,7 @@ import torch
 from sgl_kernel import moe_fused_gate
 
 from sglang.srt.layers.moe.topk import biased_grouped_topk
-
+import sys
 
 @pytest.mark.parametrize(
     "seq_length",
@@ -96,5 +96,4 @@ def test_moe_fused_gate_combined(seq_length, dtype, params, num_fused_shared_exp
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__]))

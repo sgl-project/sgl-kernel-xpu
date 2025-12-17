@@ -1,9 +1,10 @@
+import sys
+
 import pytest
 import sgl_kernel
 import torch
 import torch.nn.functional as F
 import utils
-import sys
 
 device = utils.get_device()
 

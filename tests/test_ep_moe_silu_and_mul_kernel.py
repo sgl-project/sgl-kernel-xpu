@@ -1,9 +1,10 @@
 import itertools
+import sys
 
 import pytest
 import torch
 from sgl_kernel import ep_moe_silu_and_mul
-import sys
+
 from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_triton_kernel
 
 

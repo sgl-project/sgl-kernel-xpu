@@ -1,9 +1,10 @@
 import itertools
+import sys
 
 import pytest
 import torch
 from sgl_kernel import ep_moe_pre_reorder
-import sys
+
 from sglang.srt.layers.moe.ep_moe.kernels import pre_reorder_triton_kernel
 
 

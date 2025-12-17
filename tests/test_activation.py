@@ -1,11 +1,11 @@
 # Adapted from https://github.com/flashinfer-ai/flashinfer/blob/4e8eb1879f9c3ba6d75511e5893183bf8f289a62/tests/test_activation.py
 
+import sys
+
 import pytest
 import sgl_kernel
 import torch
 import utils
-import sys
-
 
 device = utils.get_device()
 

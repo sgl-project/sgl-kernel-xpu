@@ -1,11 +1,11 @@
 import math
+import sys
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pytest
 import sgl_kernel
 import torch
 import utils
-import sys
 
 precision = {
     torch.bfloat16: 1e-2,

@@ -1,10 +1,11 @@
 import itertools
+import sys
 
 import pytest
 import torch
 import torch.nn.functional as F
 from sgl_kernel import fused_experts
-import sys
+
 
 def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
     d = x.shape[-1] // 2

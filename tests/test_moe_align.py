@@ -1,11 +1,12 @@
 import itertools
+import sys
 
 import pytest
 import torch
 import triton
 import triton.language as tl
 from sgl_kernel import moe_align_block_size, moe_sum
-import sys
+
 
 def ceil_div(a, b):
     return (a + b - 1) // b

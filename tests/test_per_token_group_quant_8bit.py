@@ -1,6 +1,7 @@
 import itertools
-from typing import Tuple
 import sys
+from typing import Tuple
+
 import pytest
 import torch
 import triton

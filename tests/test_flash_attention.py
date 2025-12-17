@@ -2,13 +2,13 @@
 import itertools
 import math
 import os
+import sys
 
 import pytest
 import torch
 import torch.nn.functional as F
 import utils
 from einops import rearrange, repeat
-import sys
 
 device = utils.get_device()
 

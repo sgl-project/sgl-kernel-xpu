@@ -1,11 +1,11 @@
 import itertools
+import sys
 from typing import Optional, Tuple
 
 import pytest
 import torch
 import utils
 from sgl_kernel import awq_dequantize
-import sys
 
 device = utils.get_device()
 

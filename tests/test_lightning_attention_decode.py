@@ -1,7 +1,9 @@
+import sys
+
 import pytest
 import torch
 from sgl_kernel import lightning_attention_decode
-import sys
+
 
 def naive_lightning_attention_decode(q, k, v, past_kv, slope):
     """Naive implementation of lightning attention decode"""

@@ -1,6 +1,7 @@
 import math
-from typing import List, Optional, Tuple
 import sys
+from typing import List, Optional, Tuple
+
 import pytest
 import torch
 from einops import rearrange, repeat

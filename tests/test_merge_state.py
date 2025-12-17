@@ -1,5 +1,6 @@
 # Adapted from https://github.com/flashinfer-ai/flashinfer/blob/55576c626421b5ee7e7ebe74afd26465c8ae863f/flashinfer/triton/kernels/cascade.py
 
+import sys
 from typing import List
 
 import pytest
@@ -7,7 +8,7 @@ import torch
 import triton
 import triton.language as tl
 from sgl_kernel import merge_state
-import sys
+
 
 def check_input(x: torch.Tensor):
     assert x.is_cuda, f"{str(x)} must be a CUDA Tensor"

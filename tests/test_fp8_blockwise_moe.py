@@ -1,9 +1,10 @@
 import random
+import sys
 
 import pytest
 import torch
 from sgl_kernel import fp8_blockwise_scaled_grouped_mm
-import sys
+
 
 def cdiv(a: int, b: int) -> int:
     return -(a // -b)

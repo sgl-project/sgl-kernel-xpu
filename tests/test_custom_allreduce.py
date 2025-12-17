@@ -2,9 +2,10 @@ import ctypes
 import multiprocessing as mp
 import random
 import socket
+import sys
 import unittest
 from typing import Any, List, Optional
-import sys
+
 import sgl_kernel.allreduce as custom_ops
 import torch
 import torch.distributed as dist

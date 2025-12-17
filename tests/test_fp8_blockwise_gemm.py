@@ -1,7 +1,8 @@
 import os
 import random
-from typing import Optional, Type
 import sys
+from typing import Optional, Type
+
 import pytest
 import torch
 from sgl_kernel import fp8_blockwise_scaled_mm

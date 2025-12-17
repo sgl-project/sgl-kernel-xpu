@@ -1,9 +1,10 @@
 import itertools
+import sys
 
 import pytest
 import torch
 from sgl_kernel import topk_softmax
-import sys
+
 
 @pytest.mark.parametrize(
     "num_tokens, num_experts, topk",

@@ -1,7 +1,9 @@
+import sys
+
 import pytest
 import torch
 from sgl_kernel import int8_scaled_mm
-import sys
+
 
 def to_int8(tensor: torch.Tensor) -> torch.Tensor:
     return torch.round(tensor.clamp(min=-128, max=127)).to(dtype=torch.int8)

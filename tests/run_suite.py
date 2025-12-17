@@ -14,7 +14,7 @@ class TestFile:
 # Add Intel XPU Kernel tests
 suites = {
     "per-commit": [
-        TestFile("test_awq_dequant.py"),
+        TestFile("test_fp8_gemm.py"),
         TestFile("test_topk_softmax.py"),
         TestFile("test_flash_attention.py"),
         TestFile("test_moe_align.py"),

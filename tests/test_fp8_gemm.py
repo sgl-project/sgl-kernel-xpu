@@ -46,4 +46,5 @@ def test_accuracy(M, N, K, with_bias, out_dtype):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+    sys.exit(pytest.main([__file__]))

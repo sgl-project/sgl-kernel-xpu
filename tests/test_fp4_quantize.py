@@ -167,4 +167,5 @@ def test_quantize_to_fp4_padded(pad_shape: tuple[int, int]) -> None:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+    sys.exit(pytest.main([__file__]))

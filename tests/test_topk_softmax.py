@@ -80,4 +80,5 @@ def test_topk_softmax(dtype, n_token, n_topk, n_expert, renormalize):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+    sys.exit(pytest.main([__file__]))

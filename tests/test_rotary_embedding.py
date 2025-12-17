@@ -449,4 +449,5 @@ def test_deepseek_v2_rope():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+    sys.exit(pytest.main([__file__]))

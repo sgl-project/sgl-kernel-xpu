@@ -1354,4 +1354,5 @@ def test_flash_attn_varlen_output(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+    sys.exit(pytest.main([__file__]))

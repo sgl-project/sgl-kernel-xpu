@@ -1,4 +1,5 @@
 import itertools
+import sys
 
 import pytest
 import torch
@@ -99,4 +100,4 @@ def test_moe_gemm(num_tokens, topk, num_experts, hidden_size, intermediate_size)
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

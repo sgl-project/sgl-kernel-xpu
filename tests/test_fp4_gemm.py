@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
@@ -151,4 +153,4 @@ def test_nvfp4_gemm(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

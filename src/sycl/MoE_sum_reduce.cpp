@@ -8,7 +8,7 @@
 #include "SYCLHelpers.h"
 #include "Utils.h"
 
-template <typename T>
+template <typename T, int VEC = 1>
 struct moe_sum_reduce_impl_sycl_k {
   moe_sum_reduce_impl_sycl_k(
       const T* input,
@@ -32,19 +32,21 @@ struct moe_sum_reduce_impl_sycl_k {
         max_wg_dims_(max_wg_dims),
         routed_scaling_factor_(routed_scaling_factor) {}
 
-  void operator()(sycl::nd_item<1> item) const {
-    int tkn_id = item.get_group(0);
-    int thread_id = item.get_local_id(0);
+  void operator()(sycl::nd_item<1> it) const {
+    int tkn_id = it.get_group(0);
+    int thread_id = it.get_local_id(0);
+    const int src_offset = tkn_id * in_stride_token_;
+    const int dst_offset = tkn_id * out_stride_token_;
     for (int i = thread_id; i < hidden_dim_; i += max_wg_dims_) {
       float acc = 0;
-      const int offset = tkn_id * in_stride_token_ + i;
 #pragma unroll
       for (int k = 0; k < topk_num_; ++k) {
-        float src_val = static_cast<float>(input_[offset + k * in_stride_topk_]);
+        float src_val = static_cast<float>(input_[src_offset + k * in_stride_topk_ + i]);
         acc += src_val;
       }
       acc *= static_cast<float>(routed_scaling_factor_);
-      output_[tkn_id * out_stride_token_ + thread_id] = static_cast<T>(acc);
+      output_[dst_offset + i] = static_cast<T>(acc);
+
     }
   }
 
@@ -76,14 +78,15 @@ void moe_sum_reduce_impl(at::Tensor& input_tensor, at::Tensor& output_tensor, do
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
 
-  using Kernel = moe_sum_reduce_impl_sycl_k<T>;
+  constexpr int VEC = 1;
+  using Kernel = moe_sum_reduce_impl_sycl_k<T, VEC>;
 
   auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
   uint32_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
   uint32_t max_wg_dims = static_cast<uint32_t>(sycl::min(max_wg_size, hidden_dim));
 
-  sycl::range<1> global_range{token_num * max_wg_dims};
-  sycl::range<1> local_range{max_wg_dims};
+  sycl::range<1> global_range{token_num * max_wg_size };
+  sycl::range<1> local_range{max_wg_size};
 
   Kernel task(
       input,

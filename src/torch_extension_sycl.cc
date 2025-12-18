@@ -54,7 +54,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("rotary_embedding", torch::kXPU, &at::native::xpu::rotary_embedding);
 
   m.def("moe_sum_reduce(Tensor input, Tensor output, float routed_scaling_factor) -> ()");
-  m.impl("moe_sum_reduce", torch::kCUDA, &moe_sum_reduce);
+  m.impl("moe_sum_reduce", torch::kXPU, &moe_sum_reduce);
   m.def(
       "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
       "experts_ids, Tensor! num_tokens_post_pad, Tensor! cumsum_buffer, bool "

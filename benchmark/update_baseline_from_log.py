@@ -1,5 +1,6 @@
-import re
 import json
+import re
+
 
 def parse_benchmark_log(log_text: str) -> dict:
     lines = log_text.splitlines()
@@ -14,7 +15,7 @@ def parse_benchmark_log(log_text: str) -> dict:
 
     result = {}
 
-    for line in lines[start_idx + 1:]:
+    for line in lines[start_idx + 1 :]:
         line = line.strip()
 
         if not line.startswith("|"):
@@ -33,10 +34,13 @@ def parse_benchmark_log(log_text: str) -> dict:
         shard_intermediate_size = cols[5]
         ms = float(cols[-1])
 
-        key = f"{num_tokens}-{num_experts}-{topk}-{hidden_size}-{shard_intermediate_size}"
+        key = (
+            f"{num_tokens}-{num_experts}-{topk}-{hidden_size}-{shard_intermediate_size}"
+        )
         result[key] = ms
 
     return result
+
 
 def format_section(title, data):
     if not data:
@@ -70,6 +74,7 @@ def compare(log_data: dict, baseline: dict):
 
     return lower, higher, equal
 
+
 def main():
 
     with open("fused_moe.log") as f:
@@ -97,17 +102,19 @@ def main():
     print("data")
     print(data)
 
-    pr_body = "\n".join([
-        "## Benchmark Comparison",
-        "",
-        format_section("LOWER (log < baseline)", lower),
-        format_section("HIGHER (log > baseline)", higher),
-        format_section("EQUAL", equal),
-    ])
+    pr_body = "\n".join(
+        [
+            "## Benchmark Comparison",
+            "",
+            format_section("LOWER (log < baseline)", lower),
+            format_section("HIGHER (log > baseline)", higher),
+            format_section("EQUAL", equal),
+        ]
+    )
 
     if lower:
         for k, (l, _) in lower.items():
-            baseline[k]=l
+            baseline[k] = l
         with open("benchmark/baseline.json", "w") as f:
             json.dump(baseline, f, indent=4)
             f.write("\n")
@@ -118,6 +125,6 @@ def main():
 
     open("ci_pr_body.md", "w").write(pr_body)
 
+
 if __name__ == "__main__":
     main()
-

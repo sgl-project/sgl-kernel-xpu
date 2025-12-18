@@ -46,7 +46,12 @@ def format_section(title, data):
     if not data:
         return f"### {title}\n\nNone\n"
 
-    lines = [f"### {title}", "", "| key | log | baseline |", "|---|---:|---:|"]
+    lines = [
+        f"### {title}",
+        "",
+        "| num_tokens - num_experts - topk - hidden_size - shard_intermediate_size | log | baseline |",
+        "|---|---:|---:|",
+    ]
     for k, (l, b) in sorted(data.items()):
         lines.append(f"| `{k}` | {l:.3f} | {b} |")
     lines.append("")

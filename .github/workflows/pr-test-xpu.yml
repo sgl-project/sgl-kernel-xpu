@@ -88,7 +88,8 @@ jobs:
             exit 0
           fi
 
-          git checkout -b update-baseline-${GITHUB_SHA:0:8}-$(date +%s)
+          BRANCH="update-baseline-${GITHUB_SHA:0:8}-$(date +%s)"
+          git checkout -b "$BRANCH"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
@@ -103,14 +104,14 @@ jobs:
 
           echo "${{ secrets.PAT }}" | gh auth login --with-token || { echo "gh auth login failed"; exit 1; }
           git remote set-url origin https://x-access-token:${{ secrets.PAT }}@github.com/sgl-project/sgl-kernel-xpu.git
-          git push -f https://${{ secrets.PAT }}@github.com/sgl-project/sgl-kernel-xpu.git update-baseline-${GITHUB_SHA:0:8}-$(date +%s)
+          git push -f https://${{ secrets.PAT }}@github.com/sgl-project/sgl-kernel-xpu.git "$BRANCH"
 
           PR_URL=$(gh pr create \
             --repo sgl-project/sgl-kernel-xpu \
             --title "CI: Update baseline.json (${GITHUB_SHA:0:8}) " \
             --body-file ci_pr_body.md \
             --base main \
-            --head update-baseline-${GITHUB_SHA:0:8}-$(date +%s)
+            --head "$BRANCH"
           )
 
           echo "PR created at $PR_URL"

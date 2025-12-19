@@ -49,11 +49,13 @@ def format_section(title, data):
     lines = [
         f"### {title}",
         "",
-        "| num_tokens - num_experts - topk - hidden_size - shard_intermediate_size | log | baseline |",
-        "|---|---:|---:|",
+        "| num_tokens - num_experts - topk - hidden_size - shard_intermediate_size | log | baseline | ratio |",
+        "|---|---:|---:|---:|",
     ]
     for k, (l, b) in sorted(data.items()):
-        lines.append(f"| `{k}` | {l:.3f} | {b} |")
+        ratio = l / b
+        delta_pct = (ratio - 1.0) * 100.0
+        lines.append(f"| `{k}` | {l:.3f} | {b} | {delta_pct:+.2f}% |")
     lines.append("")
     return "\n".join(lines)
 
@@ -94,11 +96,15 @@ def main():
 
     print("=== LOWER (log < baseline) ===")
     for k, (l, b) in lower.items():
-        print(f"{k}: log={l:.3f}, baseline={b}")
+        ratio = l / b
+        delta_pct = (ratio - 1.0) * 100.0
+        print(f"{k}: log={l:.3f}, baseline={b}", ratio={delta_pct})
 
     print("\n=== HIGHER (log > baseline) ===")
     for k, (l, b) in higher.items():
-        print(f"{k}: log={l:.3f}, baseline={b}")
+        ratio = l / b
+        delta_pct = (ratio - 1.0) * 100.0
+        print(f"{k}: log={l:.3f}, baseline={b}", ratio={delta_pct})
 
     print("\n=== EQUAL (log == baseline) ===")
     for k, (l, b) in equal.items():
@@ -110,6 +116,8 @@ def main():
     pr_body = "\n".join(
         [
             "## Benchmark Comparison",
+            "",
+            "_Ratio = log / baseline (lower is better)_",
             "",
             format_section("LOWER (log < baseline)", lower),
             format_section("HIGHER (log > baseline)", higher),

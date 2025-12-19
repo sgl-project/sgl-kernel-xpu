@@ -104,11 +104,13 @@ def main():
     for k, (l, b) in higher.items():
         ratio = l / b
         delta_pct = (ratio - 1.0) * 100.0
-        print(f"{k}: log={l:.3f}, baseline={b}", ratio={delta_pct})
+        print(f"{k}: log={l:.3f}, baseline={b}, ratio={delta_pct}")
 
     print("\n=== EQUAL (log == baseline) ===")
     for k, (l, b) in equal.items():
-        print(f"{k}: log={l:.3f}, baseline={b}")
+        ratio = l / b
+        delta_pct = (ratio - 1.0) * 100.0
+        print(f"{k}: log={l:.3f}, baseline={b}, ratio={delta_pct}")
 
     print("data")
     print(data)

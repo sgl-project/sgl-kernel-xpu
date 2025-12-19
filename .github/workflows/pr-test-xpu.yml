@@ -68,7 +68,7 @@ jobs:
         timeout-minutes: 20
         run: |
           docker cp ci_sglang_xpu:/root/sglang/sgl-kernel-xpu/benchmark/fused_moe.log ./fused_moe.log
-          python3 benchmark/update_baseline_from_log.py
+          python3 benchmark/update_fused_moe_baseline_from_log.py
 
       - name: Install GitHub CLI
         if: contains(join(github.event.pull_request.labels.*.name, ','), 'perf')
@@ -76,12 +76,11 @@ jobs:
           sudo apt update
           sudo apt install -y gh
 
-      - name: Auto PR for baseline.json update
+      - name: Auto PR for fused_moe_baseline.json update
         if: >
           success() &&
           contains(join(github.event.pull_request.labels.*.name, ','), 'perf') &&
-          hashFiles('ci_has_lower.txt') != '' &&
-          ${{ steps.check.outputs.has_lower != '0' }}
+          hashFiles('ci_has_lower.txt') != ''
         run: |
           if [ "$(cat ci_has_lower.txt)" = "0" ]; then
             echo "No LOWER entries, skipping PR."
@@ -93,14 +92,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add benchmark/baseline.json
+          git add benchmark/fused_moe_baseline.json
           if command -v pre-commit >/dev/null 2>&1; then
-              pre-commit run --files benchmark/baseline.json || true
-              git add benchmark/baseline.json
+              pre-commit run --files benchmark/fused_moe_baseline.json || true
+              git add benchmark/fused_moe_baseline.json
           fi
 
-          git commit -m "Update baseline.json from CI benchmark"
-          echo "Detected changes in baseline.json: $(git diff --cached --stat)"
+          git commit -m "Update fused_moe_baseline.json from CI benchmark"
+          echo "Detected changes in fused_moe_baseline.json: $(git diff --cached --stat)"
 
           echo "${{ secrets.PAT }}" | gh auth login --with-token || { echo "gh auth login failed"; exit 1; }
           git remote set-url origin https://x-access-token:${{ secrets.PAT }}@github.com/sgl-project/sgl-kernel-xpu.git
@@ -108,7 +107,7 @@ jobs:
 
           PR_URL=$(gh pr create \
             --repo sgl-project/sgl-kernel-xpu \
-            --title "CI: Update baseline.json (${GITHUB_SHA:0:8}) " \
+            --title "CI: Update fused_moe_baseline.json (${GITHUB_SHA:0:8}) " \
             --body-file ci_pr_body.md \
             --base main \
             --head "$BRANCH"

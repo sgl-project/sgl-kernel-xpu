@@ -98,7 +98,7 @@ def main():
     for k, (l, b) in lower.items():
         ratio = l / b
         delta_pct = (ratio - 1.0) * 100.0
-        print(f"{k}: log={l:.3f}, baseline={b}", ratio={delta_pct})
+        print(f"{k}: log={l:.3f}, baseline={b}, ratio={delta_pct}")
 
     print("\n=== HIGHER (log > baseline) ===")
     for k, (l, b) in higher.items():

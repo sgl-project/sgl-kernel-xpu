@@ -49,7 +49,7 @@ def format_section(title, data):
     lines = [
         f"### {title}",
         "",
-        "| num_tokens - num_experts - topk - hidden_size - shard_intermediate_size | log | baseline | ratio |",
+        "| num_tokens - num_experts - topk - hidden_size - shard_intermediate_size | log | baseline | percent_regression |",
         "|---|---:|---:|---:|",
     ]
     for k, (l, b) in sorted(data.items()):
@@ -95,27 +95,30 @@ def main():
 
     print("=== LOWER (log < baseline) ===")
     for k, (l, b) in lower.items():
-        ratio = l / b
-        delta_pct = (ratio - 1.0) * 100.0
-        print(f"{k}: log={l:.3f}, baseline={b}, ratio={delta_pct}")
+        percent_regression = (l - b) / b * 100.0
+        print(
+            f"{k}: log={l:.3f}, baseline={b}, percent_regression={percent_regression:+.2f}%"
+        )
 
     print("\n=== HIGHER (log > baseline) ===")
     for k, (l, b) in higher.items():
-        ratio = l / b
-        delta_pct = (ratio - 1.0) * 100.0
-        print(f"{k}: log={l:.3f}, baseline={b}, ratio={delta_pct}")
+        percent_regression = (l - b) / b * 100.0
+        print(
+            f"{k}: log={l:.3f}, baseline={b}, percent_regression={percent_regression:+.2f}%"
+        )
 
     print("\n=== EQUAL (log == baseline) ===")
     for k, (l, b) in equal.items():
-        ratio = l / b
-        delta_pct = (ratio - 1.0) * 100.0
-        print(f"{k}: log={l:.3f}, baseline={b}, ratio={delta_pct}")
+        percent_regression = (l - b) / b * 100.0
+        print(
+            f"{k}: log={l:.3f}, baseline={b}, percent_regression={percent_regression:+.2f}%"
+        )
 
     pr_body = "\n".join(
         [
             "## Benchmark Comparison",
             "",
-            "_Ratio = log / baseline (lower is better)_",
+            "Percent regression is defined as (log - baseline) / baseline * 100; lower is better.",
             "",
             format_section("LOWER (log < baseline)", lower),
             format_section("HIGHER (log > baseline)", higher),

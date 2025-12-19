@@ -111,7 +111,6 @@ jobs:
           PR_URL=$(gh pr create \
             --repo sgl-project/sgl-kernel-xpu \
             --title "CI: Update fused_moe_baseline.json (${GITHUB_SHA:0:8}) " \
-
             --body-file ci_pr_body.md \
             --base main \
             --head "$BRANCH"

@@ -43,8 +43,13 @@ FetchContent_Declare(
     GIT_TAG        482b40e8bed0e9204311d1569c876b4573dfb952
     GIT_SHALLOW    OFF
 )
-FetchContent_MakeAvailable(repo-cutlass-sycl)
 
+set(FETCHCONTENT_MAKEAVAILABLE_SERIAL FALSE)
+FetchContent_MakeAvailable(repo-cutlass-sycl)
+file(COPY ${repo-cutlass-sycl_SOURCE_DIR}/cmake/onemkl.cmake
+     DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
+set(FETCHCONTENT_MAKEAVAILABLE_SERIAL TRUE)
+FetchContent_MakeAvailable(repo-cutlass-sycl)
 
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include

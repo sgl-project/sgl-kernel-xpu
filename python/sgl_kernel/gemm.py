@@ -50,7 +50,7 @@ def _bmm_fp8_internal(
     A_scale: torch.Tensor,
     B_scale: torch.Tensor,
 ) -> None:
-    cublas_handle = torch.cuda.current_blas_handle()
+    # cublas_handle = torch.cuda.current_blas_handle()
     torch.ops.sgl_kernel.bmm_fp8.default(
         A,
         B,
@@ -58,8 +58,8 @@ def _bmm_fp8_internal(
         A_scale,
         B_scale,
         workspace_buffer,
-        cublas_handle,
-        get_cuda_stream(),
+        0,
+        0,
     )
 
 

@@ -82,6 +82,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   //       -> Tensor");
   //   m.impl("fp8_blockwise_scaled_mm", torch::kXPU, &fp8_blockwise_scaled_mm);
 
+  m.def(
+      "fp8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? bias) "
+      "-> Tensor");
+  m.impl("fp8_scaled_mm", torch::kXPU, &fp8_scaled_mm);
+  m.def(
+      "bmm_fp8(Tensor A, Tensor B, Tensor! D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer, int "
+      "cublas_handle, int cuda_stream) -> ()",
+      {at::Tag::needs_fixed_stride_order});
+  m.impl("bmm_fp8", torch::kXPU, &bmm_fp8);
+
   /*
    * From cutlass attention
    */

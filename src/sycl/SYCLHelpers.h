@@ -69,3 +69,7 @@ sycl_kernel_submit(int64_t global_range, int64_t local_range, ::sycl::queue q, k
     SYCL_KERNEL_STRING(fmt_var, fmt_str);       \
     SYCL_KERNEL_PRINTF(fmt_var, ##__VA_ARGS__); \
   }
+
+// Use SYCL native vector type for efficient loading/storing
+template <typename T, uint32_t N>
+using vec_t = sycl::vec<T, N>;

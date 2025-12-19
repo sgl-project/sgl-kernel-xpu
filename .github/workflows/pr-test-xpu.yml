@@ -70,6 +70,7 @@ jobs:
           docker cp ci_sglang_xpu:/root/sglang/sgl-kernel-xpu/benchmark/fused_moe.log ./fused_moe.log
           python3 benchmark/update_fused_moe_baseline_from_log.py
 
+
       - name: Install GitHub CLI
         if: contains(join(github.event.pull_request.labels.*.name, ','), 'perf')
         run: |
@@ -81,6 +82,7 @@ jobs:
           success() &&
           contains(join(github.event.pull_request.labels.*.name, ','), 'perf') &&
           hashFiles('ci_has_lower.txt') != ''
+
         run: |
           if [ "$(cat ci_has_lower.txt)" = "0" ]; then
             echo "No LOWER entries, skipping PR."
@@ -98,6 +100,7 @@ jobs:
               git add benchmark/fused_moe_baseline.json
           fi
 
+
           git commit -m "Update fused_moe_baseline.json from CI benchmark"
           echo "Detected changes in fused_moe_baseline.json: $(git diff --cached --stat)"
 
@@ -108,6 +111,7 @@ jobs:
           PR_URL=$(gh pr create \
             --repo sgl-project/sgl-kernel-xpu \
             --title "CI: Update fused_moe_baseline.json (${GITHUB_SHA:0:8}) " \
+
             --body-file ci_pr_body.md \
             --base main \
             --head "$BRANCH"

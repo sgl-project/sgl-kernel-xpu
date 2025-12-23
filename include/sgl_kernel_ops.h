@@ -260,7 +260,8 @@ void moe_grouped_mm_nt(
     const torch::Tensor& activations,
     const torch::Tensor& weights,
     const torch::Tensor& total_rows_for_experts,
-    const int64_t n_experts);
+    const int64_t n_experts,
+    bool fuse_silu = false);
 
 void prepare_moe_input(
     const torch::Tensor& topk_ids,

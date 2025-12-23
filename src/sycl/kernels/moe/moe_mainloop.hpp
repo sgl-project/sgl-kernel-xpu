@@ -85,7 +85,7 @@ struct MoEMainloop<XeDefault<Stages>, TiledCopyA_, TiledCopyB_, TilesCopyD_, ATe
   using TiledCopyB = TiledCopyB_;
   using TiledCopyD = TilesCopyD_;
   using ATensor = ATensor_;
-  using BTensor = BTensor_;
+  using BTensor = BTensor_;  // cute::tuple<tensor> or cute::tuple<tensor, tensor>
   using DTensor = DTensor_;
   MoEMainloop() {}
 
@@ -190,5 +190,128 @@ struct MoEMainloop<XeDefault<Stages>, TiledCopyA_, TiledCopyB_, TilesCopyD_, ATe
     reorder(tCrC, tCrD_final_sg_tensor);
     copy(tiled_copy_d, tCrD_final_sg_tensor, tCgD);
   }
+
+  template <typename Coord>
+  CUTLASS_DEVICE void operator()(
+      ATensor& A,   // (M,K)
+      BTensor& B0,  // (N/2,K)
+      BTensor& B1,  // (N/2,K)
+      DTensor& D,   // (M,N)
+      Coord blk_coord,
+      TiledMMA mma,
+      int thr_id) {  // work-item ID
+
+    auto wg_m = get<0>(blk_coord);
+    auto wg_n = get<1>(blk_coord);
+    auto wg_n1 = get<2>(blk_coord);
+
+    /* Create proxy coordinate tensors for A/B/C */
+    Tensor cA = make_identity_tensor(A.shape());  // (M,K)
+    // Tensor cB = make_identity_tensor(make_shape(get<0>(B0.shape()) * 2, get<1>(B1.shape())));
+    Tensor cB = make_identity_tensor(B0.shape());  // (N/2,K)
+    // Tensor cB1 = make_identity_tensor(B1.shape());  // (N/2,K)
+    Tensor cD = make_identity_tensor(D.shape());  // (M,N)
+
+    /* init mma */
+    auto wg_tile = mma.tile_mnk();
+    auto wg_coord = make_coord(wg_m, wg_n, 0);
+
+    Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(wg_m, _));  // (BLK_M,BLK_K,k)
+    constexpr int BLK_N = get<1>(wg_tile);
+    constexpr int BLK_K = get<2>(wg_tile);
+    Tensor gB = local_tile(cB, select<1, 2>(wg_tile), make_coord(wg_n, _));
+    Tensor gB0 = local_tile(cB, make_shape(Int<BLK_N / 2>{}, Int<BLK_K>{}), make_coord(wg_n, _));   // (BLK_N/2,BLK_K,k)
+    Tensor gB1 = local_tile(cB, make_shape(Int<BLK_N / 2>{}, Int<BLK_K>{}), make_coord(wg_n1, _));  // (BLK_N/2,BLK_K,k)
+    Tensor gD = local_tile(cD, wg_tile, wg_coord, Step<_1, _1, X>{});                               // (BLK_M,BLK_N)
+
+    /* Create global -> register copies */
+    TiledCopyA tiled_copy_a{A};
+    TiledCopyB tiled_copy_b;
+    TiledCopyB tiled_copy_b0{B0};
+    TiledCopyB tiled_copy_b1{B1};
+    TiledCopyD tiled_copy_d{D};
+
+    /* Slice TiledCopy/TiledMMA operations down to to work-item level */
+    auto thr_copy_a = tiled_copy_a.get_slice(thr_id);
+    auto thr_copy_b0 = tiled_copy_b0.get_slice(thr_id);
+    auto thr_copy_b1 = tiled_copy_b1.get_slice(thr_id);
+    auto thr_copy_d = tiled_copy_d.get_slice(thr_id);
+    auto thr_mma = mma.get_slice(thr_id);
+
+    /* Partition coordinate tensors for copy */
+    auto tAgA = thr_copy_a.partition_S(gA);
+    auto tBgB0 = thr_copy_b0.partition_S(gB0);
+    auto tBgB1 = thr_copy_b1.partition_S(gB1);
+
+    /* Create register fragments for MMA and copies */
+    auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
+    auto tSrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
+
+    auto tBrB0 = thr_copy_b0.partition_sg_fragment_D(gB0(_, _, 0));
+    auto tBrB1 = thr_copy_b1.partition_sg_fragment_D(gB1(_, _, 0));
+
+    auto tSrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
+
+    /* Partition C */
+    SubgroupTensor tCrC = thr_mma.partition_sg_fragment_C(gD);
+
+    /* Partition D */
+    using TD = typename DTensor::element_type;
+    TD tCrD_final_frag[tCrC.size()];
+    Tensor tCrD_final_tensor = make_tensor(make_rmem_ptr(tCrD_final_frag), tCrC.layout());
+    SubgroupTensor tCrD_final_sg_tensor = make_subgroup_tensor(tCrD_final_tensor, tCrC.tv_layout());
+    Tensor tCgD = thr_mma.partition_C(gD);
+
+    /* Create TiledCopy objects for prefetches */
+    auto prefetch_a = make_block_2d_prefetch(tiled_copy_a);
+    auto prefetch_b0 = make_block_2d_prefetch(tiled_copy_b0);
+    auto prefetch_b1 = make_block_2d_prefetch(tiled_copy_b1);
+
+    /* Partition global tensors for prefetch */
+    auto pAgA = prefetch_a.get_slice(thr_id).partition_S(gA);
+    auto pBgB0 = prefetch_b0.get_slice(thr_id).partition_S(gB0);
+    auto pBgB1 = prefetch_b1.get_slice(thr_id).partition_S(gB1);
+
+    constexpr int barrier_scope = 2;
+    int k_start_idx = 0;
+    int prefetch_k = k_start_idx;
+    const int prefetch_dist = Stages;
+    int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
+
+    // ------
+    // Compute
+    // ------
+
+    CUTE_UNROLL
+    for (; prefetch_k < prefetch_dist; prefetch_k++) {
+      prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
+      prefetch(prefetch_b0, pBgB0(_, _, _, prefetch_k));
+      prefetch(prefetch_b1, pBgB1(_, _, _, prefetch_k));
+    }
+
+    for (int k_tile = k_start_idx; k_tile < k_tile_count; k_tile++, prefetch_k++) {
+      barrier_arrive(barrier_scope);
+
+      copy(tiled_copy_a, tAgA(_, _, _, k_tile), tArA);
+      copy(tiled_copy_b0, tBgB0(_, _, _, k_tile), tBrB0);
+      copy(tiled_copy_b1, tBgB1(_, _, _, k_tile), tBrB1);
+
+      if (prefetch_k < k_tile_count) {
+        prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
+        prefetch(prefetch_b0, pBgB0(_, _, _, prefetch_k));
+        prefetch(prefetch_b1, pBgB1(_, _, _, prefetch_k));
+      }
+
+      reorder(tArA, tSrA);
+      reorder(tBrB0, tSrB);
+      reorder(tBrB1, tSrB);
+
+      cute::gemm(mma, tSrA, tSrB, tCrC);
+      barrier_wait(barrier_scope);
+    }
+    reorder(tCrC, tCrD_final_sg_tensor);
+    copy(tiled_copy_d, tCrD_final_sg_tensor, tCgD);
+  }
 };
+
 }  // namespace MoE

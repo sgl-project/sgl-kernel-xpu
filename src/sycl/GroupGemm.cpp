@@ -19,10 +19,10 @@ using namespace MoE;
 
 using ElementAccumulator = float;  // <- data type of accumulator
 
-template <typename, typename, typename, typename, typename, typename>
+template <typename, typename, typename, typename, typename, typename, bool>
 class GemmCuteName;
 
-template <typename Tile, typename SGLayout>
+template <typename Tile, typename SGLayout, bool FuseSiLU>
 void MoEGEMMLauncher(
     sycl::queue q,
     const void* activations,
@@ -67,7 +67,7 @@ void MoEGEMMLauncher(
 
   syclex::properties kernel_props{syclex::sub_group_size<16>, intelex::grf_size<256>};
 
-  using Kernel = MoE::MoEGEMM<Tile, SGLayout, TensorA, TensorB, TensorD, MMA, Element>;
+  using Kernel = MoE::MoEGEMM<Tile, SGLayout, TensorA, TensorB, TensorD, MMA, FuseSiLU, Element>;
   typename Kernel::Params params{
       static_cast<const Element*>(activations),
       static_cast<const Element*>(weights),
@@ -84,7 +84,7 @@ void MoEGEMMLauncher(
   auto Q = stream.queue();
   auto event = Q.submit([&](sycl::handler& h) {
     sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), h);
-    h.parallel_for<GemmCuteName<Tile, SGLayout, TensorA, TensorB, TensorD, Element>>(
+    h.parallel_for<GemmCuteName<Tile, SGLayout, TensorA, TensorB, TensorD, Element, FuseSiLU>>(
         sycl::nd_range<3>(global * local, local), kernel_props, [=](sycl::nd_item<3> item) {
           int32_t* slm_mem =
               static_cast<int32_t*>(local_mem.template get_multi_ptr<sycl::access::decorated::no>().get());
@@ -106,12 +106,22 @@ void MoEGEMMLauncher(
       n_experts,                              \
       static_cast<int*>(atomic_buffer.data_ptr()))
 
+#define DISPATCH_MOE_BY_CONDITION(condition, ...) \
+  do {                                            \
+    if (condition) {                              \
+      LAUNCH_MOE(__VA_ARGS__, true);              \
+    } else {                                      \
+      LAUNCH_MOE(__VA_ARGS__, false);             \
+    }                                             \
+  } while (0)
+
 void moe_grouped_mm_nt(
     torch::Tensor& output,
     const torch::Tensor& activations,
     const torch::Tensor& weights,
     const torch::Tensor& total_rows_for_experts,
-    const int64_t n_experts) {
+    const int64_t n_experts,
+    bool fuse_silu) {
   int total_m = activations.sizes()[0];
   int gemm_k = activations.sizes()[1];
   auto weights_shape = weights.sizes().vec();
@@ -137,12 +147,12 @@ void moe_grouped_mm_nt(
   at::Tensor atomic_buffer = at::empty({static_cast<long>(1)}, activations.options().dtype(at::kInt));
 
   if (total_m <= 8) {
-    LAUNCH_MOE(Shape<_8, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
+    DISPATCH_MOE_BY_CONDITION(fuse_silu, Shape<_8, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
   } else if (total_m <= 16) {
-    LAUNCH_MOE(Shape<_16, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
+    DISPATCH_MOE_BY_CONDITION(fuse_silu, Shape<_16, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
   } else if (total_m <= 32) {
-    LAUNCH_MOE(Shape<_32, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
+    DISPATCH_MOE_BY_CONDITION(fuse_silu, Shape<_32, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
   } else {
-    LAUNCH_MOE(Shape<_256, _256, _32>, Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>);
+    DISPATCH_MOE_BY_CONDITION(fuse_silu, Shape<_256, _256, _32>, Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>);
   }
 }

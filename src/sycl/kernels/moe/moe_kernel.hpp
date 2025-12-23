@@ -56,12 +56,14 @@ template <
     typename TensorB,
     typename TensorD,
     typename TiledMMA,
+    bool FuseSiLU_,
     typename ElementA,
     typename ElementB = ElementA,
     typename ElementS = ElementA,
     typename ElementD = ElementA>
 class MoEGEMM {
  public:
+  constexpr static bool FuseSiLU = FuseSiLU_;
   using TiledCopyA = decltype(make_block_2d_copy_A(TiledMMA{}, TensorA{}));
   using TiledCopyB = decltype(make_block_2d_copy_B(TiledMMA{}, TensorB{}));
   using TiledCopyD = decltype(make_block_2d_copy_D(TiledMMA{}, TensorD{}));
@@ -84,6 +86,18 @@ class MoEGEMM {
     TiledMMA mma;
   };
 
+  auto make_B_tensors(ElementB* ptr_B, int N, int K) {
+    if constexpr (FuseSiLU) {
+      auto B0 = make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N / 2, K), make_stride(K, _1{})));
+      ElementB* ptr_B1 = ptr_B + (N / 2) * K;
+      auto B1 = make_tensor(make_gmem_ptr<ElementB>(ptr_B1), make_layout(make_shape(N / 2, K), make_stride(K, _1{})));
+      return cute::make_tuple(B0, B1);
+    } else {
+      auto B = make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N, K), make_stride(K, _1{})));
+      return cute::make_tuple(B);
+    }
+  }
+
   void operator()(Params const& params, sycl::nd_item<3> item, int32_t* slm_mem) {
     auto N = params.N;
     auto K = params.K;
@@ -97,7 +111,12 @@ class MoEGEMM {
     auto wg_tile_n = get<1>(wg_tile);
 
     int group_id = item.get_group_linear_id();
-    int N_pad = (N + wg_tile_n - 1) / wg_tile_n * wg_tile_n;
+    int N_pad;
+    if constexpr (FuseSiLU) {
+      N_pad = (N / 2 + wg_tile_n - 1) / wg_tile_n * wg_tile_n;
+    } else {
+      N_pad = (N + wg_tile_n - 1) / wg_tile_n * wg_tile_n;
+    }
     int group_m_id = (group_id * wg_tile_n) / N_pad;
     int group_range = item.get_group_range(1);
     int32_t thr_id = int32_t(item.get_local_linear_id());
@@ -132,18 +151,29 @@ class MoEGEMM {
 
       auto A_tensor =
           make_tensor(make_gmem_ptr<ElementA>(ptr_A_curr_batch), make_layout(make_shape(M, K), make_stride(K, _1{})));
-      auto B_tensor =
-          make_tensor(make_gmem_ptr<ElementB>(ptr_B_curr_batch), make_layout(make_shape(N, K), make_stride(K, _1{})));
+      // auto B_tensor =
+      //     make_tensor(make_gmem_ptr<ElementB>(ptr_B_curr_batch), make_layout(make_shape(N, K), make_stride(K,
+      //     _1{})));
+      auto B_tensor = make_B_tensors(ptr_B_curr_batch, N, K);
       auto D_tensor =
           make_tensor(make_gmem_ptr<ElementD>(ptr_D_curr_batch), make_layout(make_shape(M, N), make_stride(N, _1{})));
+      // auto D1_tensor =
+      //     make_tensor(make_gmem_ptr<ElementD>(ptr_D1_curr_batch), make_layout(make_shape(M, N), make_stride(N,
+      //     _1{})));
 
       while (group_m_id < cumsum_tiles_for_experts) {
         int n_coord = (group_id * wg_tile_n) % N_pad / wg_tile_n;
         int m_coord = (group_m_id - pre_tiles);
-        auto tile_coord = make_coord(m_coord, n_coord, _, 0);
 
         CollectiveMainloop mainloop;
-        mainloop(A_tensor, B_tensor, D_tensor, tile_coord, mma, thr_id);
+        if constexpr (FuseSiLU) {
+          int n1_coord = n_coord + (N / 2 + wg_tile_n - 1) / wg_tile_n;
+          auto tile_coord = make_coord(m_coord, n_coord, n1_coord, 0);
+          mainloop(A_tensor, get<0>(B_tensor), get<1>(B_tensor), D_tensor, tile_coord, mma, thr_id);
+        } else {
+          auto tile_coord = make_coord(m_coord, n_coord, _, 0);
+          mainloop(A_tensor, get<0>(B_tensor), D_tensor, tile_coord, mma, thr_id);
+        }
         if (thr_id == 0) {
           slm_mem[0] = cutlass::atomicAdd(workspace, 1);
         }

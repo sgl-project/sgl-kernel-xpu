@@ -117,6 +117,17 @@ shape_configs = [
     },
 ]
 
+# shape_configs = [
+#     {
+#         "num_experts": 64,
+#         "topk": 6,
+#         "hidden_size": 1280,
+#         "shard_intermediate_size": 1792,
+#         "dtype": torch.bfloat16,
+#         "block_shape": None,
+#     }
+# ]
+
 shape_values = [list(d.values()) for d in shape_configs]
 bs = [1, 128, 512, 1024, 2048, 4096, 8192]
 configs = [(k, *v) for k, v in product(bs, shape_values)]
@@ -286,7 +297,18 @@ def benchmark(
     bench_lambda = lambda: api_func(**api_kwargs)
 
     quantiles = [0.5, 0.2, 0.8]
+    # with torch.profiler.profile(
+    #     activities=[torch.profiler.ProfilerActivity.XPU],
+    # ) as prof:
+    #     ms, _, _ = triton.testing.do_bench(bench_lambda, quantiles=quantiles)
     ms, _, _ = triton.testing.do_bench(bench_lambda, quantiles=quantiles)
+    # events = prof.key_averages()
+
+    # from torch.autograd.profiler import EventList
+
+    # target_events = EventList([e for e in events if "Vec" not in e.key])
+
+    # print(target_events.table(sort_by="self_xpu_time_total", max_name_column_width=200))
     torch.xpu.empty_cache()
     del x, w1, w2, input_gating
     flop = (

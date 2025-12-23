@@ -362,13 +362,13 @@ def fused_experts(
     )
 
     torch.ops.sgl_kernel.moe_grouped_mm_nt(
-        intermediate_cache1, input_A_shuffle, w1, expert_offsets, E
+        intermediate_cache1, input_A_shuffle, w1, expert_offsets, E, fuse_silu=False
     )
 
     torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
 
     torch.ops.sgl_kernel.moe_grouped_mm_nt(
-        intermediate_cache3, intermediate_cache2, w2, expert_offsets, E
+        intermediate_cache3, intermediate_cache2, w2, expert_offsets, E, fuse_silu=False
     )
 
     torch.ops.sgl_kernel.apply_shuffle_mul_sum.default(

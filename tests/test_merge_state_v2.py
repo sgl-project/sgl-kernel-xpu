@@ -194,7 +194,6 @@ def test_merge_attn_states(
     num_tokens: int, num_query_heads: int, head_size: int, output_dtype: torch.dtype
 ):
 
-
     NUM_TOKENS = num_tokens
     NUM_HEADS = num_query_heads
     HEAD_SIZE = head_size
@@ -225,9 +224,7 @@ def test_merge_attn_states(
     output = torch.zeros(
         (NUM_TOKENS, NUM_HEADS, HEAD_SIZE), dtype=output_dtype, device="xpu"
     )
-    output_lse = torch.zeros(
-        (NUM_TOKENS, NUM_HEADS), dtype=torch.float32, device="xpu"
-    )
+    output_lse = torch.zeros((NUM_TOKENS, NUM_HEADS), dtype=torch.float32, device="xpu")
     prefix_output = torch.randn(
         (NUM_TOKENS, NUM_HEADS, HEAD_SIZE), dtype=output_dtype, device="xpu"
     )

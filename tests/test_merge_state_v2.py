@@ -169,21 +169,19 @@ def generate_markdown_table():
             device,
             time_torch,
             time_triton,
-            time_v1,
+            # time_v1,
             time_v2,
         ) = info
         dtype = shortly_dtype(dtype)
         device = shortly_device(device)
         improved_triton = time_triton / time_v2
-        improved_v1 = time_v1 / time_v2
+        # improved_v1 = time_v1 / time_v2
         print(
             f"| {num_tokens} | {num_heads} | {head_size} "
             f"| {dtype} | {device} | {time_torch:.4f}ms "
             f"| {time_triton:.4f}ms "
-            f"| {time_v1:.4f}ms "
             f"| {time_v2:.4f}ms "
             f"| {improved_triton:.4f}x "
-            f"| {improved_v1:.4f}x |"
         )
 
 
@@ -195,11 +193,6 @@ def generate_markdown_table():
 def test_merge_attn_states(
     num_tokens: int, num_query_heads: int, head_size: int, output_dtype: torch.dtype
 ):
-    if not torch.cuda.is_available():
-        pytest.skip(
-            "Currently only support compare triton merge_attn_states "
-            "with custom cuda merge_attn_states kernel"
-        )
 
     NUM_TOKENS = num_tokens
     NUM_HEADS = num_query_heads
@@ -208,12 +201,12 @@ def test_merge_attn_states(
     print(
         f"\nNUM_TOKENS:{NUM_TOKENS}, NUM_HEADS:{NUM_HEADS}, "
         f"HEAD_SIZE:{HEAD_SIZE}, DTYPE: {output_dtype}, "
-        f"Device: {torch.cuda.get_device_name()}"
+        f"Device: {torch.xpu.get_device_name()}"
     )
 
     # prefix_lse and suffix_lse contain inf and normal values
-    prefix_lse = torch.randn(NUM_TOKENS, NUM_HEADS, dtype=torch.float32, device="cuda")
-    suffix_lse = torch.randn(NUM_TOKENS, NUM_HEADS, dtype=torch.float32, device="cuda")
+    prefix_lse = torch.randn(NUM_TOKENS, NUM_HEADS, dtype=torch.float32, device="xpu")
+    suffix_lse = torch.randn(NUM_TOKENS, NUM_HEADS, dtype=torch.float32, device="xpu")
 
     # Generate boolean masks
     mask_prefix = torch.rand(NUM_TOKENS, NUM_HEADS) < 0.1
@@ -229,16 +222,14 @@ def test_merge_attn_states(
     # Other input tensors (need to be initialized but
     # no actual calculation needed)
     output = torch.zeros(
-        (NUM_TOKENS, NUM_HEADS, HEAD_SIZE), dtype=output_dtype, device="cuda"
+        (NUM_TOKENS, NUM_HEADS, HEAD_SIZE), dtype=output_dtype, device="xpu"
     )
-    output_lse = torch.zeros(
-        (NUM_TOKENS, NUM_HEADS), dtype=torch.float32, device="cuda"
-    )
+    output_lse = torch.zeros((NUM_TOKENS, NUM_HEADS), dtype=torch.float32, device="xpu")
     prefix_output = torch.randn(
-        (NUM_TOKENS, NUM_HEADS, HEAD_SIZE), dtype=output_dtype, device="cuda"
+        (NUM_TOKENS, NUM_HEADS, HEAD_SIZE), dtype=output_dtype, device="xpu"
     )
     suffix_output = torch.randn(
-        (NUM_TOKENS, NUM_HEADS, HEAD_SIZE), dtype=output_dtype, device="cuda"
+        (NUM_TOKENS, NUM_HEADS, HEAD_SIZE), dtype=output_dtype, device="xpu"
     )
 
     warmup_times = 2
@@ -265,8 +256,8 @@ def test_merge_attn_states(
                 return 0, output_fn, output_lse_fn
 
         total_time = 0
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start = torch.xpu.Event(enable_timing=True)
+        end = torch.xpu.Event(enable_timing=True)
 
         try:
             for _ in range(warmup_times):
@@ -278,7 +269,7 @@ def test_merge_attn_states(
                     output_fn,
                     output_lse_fn,
                 )
-            torch.cuda.synchronize()
+            torch.xpu.synchronize()
 
             for _ in range(repeat_times):
                 start.record()
@@ -291,7 +282,7 @@ def test_merge_attn_states(
                     output_lse_fn,
                 )
                 end.record()
-                torch.cuda.synchronize()
+                torch.xpu.synchronize()
                 total_time += start.elapsed_time(end)
 
             avg_time = total_time / repeat_times
@@ -317,11 +308,11 @@ def test_merge_attn_states(
     )
 
     # 2. Run the merge_state V1 kernel
-    output_v1 = output.clone()
-    output_lse_v1 = output_lse.clone()
-    time_v1, output_v1, output_lse_v1 = perf_kernel_fn(
-        output_v1, output_lse_v1, merge_state, fn_type="cuda_v1"
-    )
+    # output_v1 = output.clone()
+    # output_lse_v1 = output_lse.clone()
+    # time_v1, output_v1, output_lse_v1 = perf_kernel_fn(
+    #     output_v1, output_lse_v1, merge_state_v2, fn_type="cuda_v2"
+    # )
 
     # 3. Run the merge_state V2 kernel
     output_v2 = output.clone()
@@ -334,7 +325,6 @@ def test_merge_attn_states(
     improved = time_triton / time_v2
     print(f"  Torch time: {time_torch:.6f}ms")
     print(f" Triton time: {time_triton:.6f}ms")
-    print(f"CUDA v1 time: {time_v1:.6f}ms")
     print(f"CUDA v2 time: {time_v2:.6f}ms, Performance: {improved:.5f}x")
     print("-" * 100)
 
@@ -377,7 +367,7 @@ def test_merge_attn_states(
     )
     print("-" * 100)
 
-    device = torch.cuda.get_device_name()
+    device = torch.xpu.get_device_name()
     all_case_info.append(
         (
             NUM_TOKENS,
@@ -387,7 +377,7 @@ def test_merge_attn_states(
             device,
             time_torch,
             time_triton,
-            time_v1,
+            # time_v1,
             time_v2,
         )
     )

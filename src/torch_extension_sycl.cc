@@ -82,6 +82,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   //       -> Tensor");
   //   m.impl("fp8_blockwise_scaled_mm", torch::kXPU, &fp8_blockwise_scaled_mm);
 
+  m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
+  m.impl("merge_state_v2", torch::kXPU, &merge_state_v2);
   /*
    * From cutlass attention
    */

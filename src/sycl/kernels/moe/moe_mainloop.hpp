@@ -251,8 +251,7 @@ struct MoEMainloop<XeDefault<Stages>, TiledCopyA_, TiledCopyB_, TilesCopyD_, ATe
     auto tBrB0 = thr_copy_b0.partition_sg_fragment_D(gB0(_, _, 0));
     auto tBrB1 = thr_copy_b1.partition_sg_fragment_D(gB1(_, _, 0));
 
-    auto tSrB0 = thr_mma.partition_sg_fragment_B(gB0(_, _, 0));
-    auto tSrB1 = thr_mma.partition_sg_fragment_B(gB1(_, _, 0));
+    auto tSrB = thr_mma.partition_sg_fragment_B(gB0(_, _, 0));
 
     /* Partition C */
     SubgroupTensor tCrC0 = thr_mma.partition_sg_fragment_C(gC0);
@@ -301,20 +300,19 @@ struct MoEMainloop<XeDefault<Stages>, TiledCopyA_, TiledCopyB_, TilesCopyD_, ATe
 
       copy(tiled_copy_a, tAgA(_, _, _, k_tile), tArA);
       copy(tiled_copy_b0, tBgB0(_, _, _, k_tile), tBrB0);
+      reorder(tArA, tSrA);
+      reorder(tBrB0, tSrB);
+      cute::gemm(mma, tSrA, tSrB, tCrC0);
+
       copy(tiled_copy_b1, tBgB1(_, _, _, k_tile), tBrB1);
+      reorder(tBrB1, tSrB);
+      cute::gemm(mma, tSrA, tSrB, tCrC1);
 
       if (prefetch_k < k_tile_count) {
         prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
         prefetch(prefetch_b0, pBgB0(_, _, _, prefetch_k));
         prefetch(prefetch_b1, pBgB1(_, _, _, prefetch_k));
       }
-
-      reorder(tArA, tSrA);
-      reorder(tBrB0, tSrB0);
-      reorder(tBrB1, tSrB1);
-
-      cute::gemm(mma, tSrA, tSrB0, tCrC0);
-      cute::gemm(mma, tSrA, tSrB1, tCrC1);
 
       barrier_wait(barrier_scope);
     }

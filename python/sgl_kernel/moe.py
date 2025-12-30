@@ -362,6 +362,9 @@ def fused_experts(
         intermediate_cache1, input_A_shuffle, w1, expert_offsets, E, fuse_silu=True
     )
 
+    # silu_and_mul is fused into moe_grouped_mm_nt
+    # torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
+
     torch.ops.sgl_kernel.moe_grouped_mm_nt(
         intermediate_cache3, intermediate_cache1, w2, expert_offsets, E, fuse_silu=False
     )

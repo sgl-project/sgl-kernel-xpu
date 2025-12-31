@@ -115,6 +115,15 @@ shape_configs = [
         "dtype": torch.bfloat16,
         "block_shape": None,
     },
+    # deepseek-OCR, tp=1
+    {
+        "num_experts": 64,
+        "topk": 6,
+        "hidden_size": 1280,
+        "shard_intermediate_size": 1792,
+        "dtype": torch.bfloat16,
+        "block_shape": None,
+    },
 ]
 
 shape_values = [list(d.values()) for d in shape_configs]
@@ -287,6 +296,7 @@ def benchmark(
 
     quantiles = [0.5, 0.2, 0.8]
     ms, _, _ = triton.testing.do_bench(bench_lambda, quantiles=quantiles)
+
     torch.xpu.empty_cache()
     del x, w1, w2, input_gating
     flop = (

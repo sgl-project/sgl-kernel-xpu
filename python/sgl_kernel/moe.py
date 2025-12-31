@@ -48,6 +48,14 @@ def moe_sum_reduce(
     )
 
 
+def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
+    return torch.ops.sgl_kernel.swiglu_with_alpha_and_limit.default(
+        x,
+        gemm1_alpha,
+        gemm1_limit,
+    )
+
+
 def moe_sum(
     input_tensor: torch.Tensor,
     output_tensor: torch.Tensor,

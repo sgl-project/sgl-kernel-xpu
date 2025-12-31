@@ -211,7 +211,6 @@ struct MoEMainloop<XeDefault<Stages>, TiledCopyA_, TiledCopyB_, TilesCopyD_, ATe
     Tensor cB1 = make_identity_tensor(B1.shape());  // (N/2,K)
     Tensor cC0 = make_identity_tensor(D.shape());   // (M,N/2)
     Tensor cC1 = make_identity_tensor(D.shape());   // (M,N/2)
-    // Tensor cD = make_identity_tensor(D.shape());                                               // (M,N)
 
     /* init mma */
     auto wg_tile = mma.tile_mnk();
@@ -220,11 +219,10 @@ struct MoEMainloop<XeDefault<Stages>, TiledCopyA_, TiledCopyB_, TilesCopyD_, ATe
     constexpr int BLK_M = get<0>(wg_tile);
     constexpr int BLK_N = get<1>(wg_tile);
     constexpr int BLK_K = get<2>(wg_tile);
-    Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(wg_m, _));    // (BLK_M,BLK_K,k)
-    Tensor gB0 = local_tile(cB0, select<1, 2>(wg_tile), make_coord(wg_n, _));  // (BLK_N,BLK_K,k)
-    Tensor gB1 = local_tile(cB1, select<1, 2>(wg_tile), make_coord(wg_n, _));  // (BLK_N,BLK_K,k)
-    Tensor gC0 = local_tile(cC0, wg_tile, wg_coord, Step<_1, _1, X>{});        // (BLK_M,BLK_N)
-    Tensor gC1 = local_tile(cC1, wg_tile, wg_coord, Step<_1, _1, X>{});        // (BLK_M,BLK_N)
+    Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(wg_m, _));   // (BLK_M,BLK_K,k)
+    Tensor gB = local_tile(cB0, select<1, 2>(wg_tile), make_coord(wg_n, _));  // (BLK_N,BLK_K,k)
+    Tensor gC0 = local_tile(cC0, wg_tile, wg_coord, Step<_1, _1, X>{});       // (BLK_M,BLK_N)
+    Tensor gC1 = local_tile(cC1, wg_tile, wg_coord, Step<_1, _1, X>{});       // (BLK_M,BLK_N)
 
     /* Create global -> register copies */
     TiledCopyA tiled_copy_a{A};
@@ -241,17 +239,17 @@ struct MoEMainloop<XeDefault<Stages>, TiledCopyA_, TiledCopyB_, TilesCopyD_, ATe
 
     /* Partition coordinate tensors for copy */
     auto tAgA = thr_copy_a.partition_S(gA);
-    auto tBgB0 = thr_copy_b0.partition_S(gB0);
-    auto tBgB1 = thr_copy_b1.partition_S(gB1);
+    auto tBgB0 = thr_copy_b0.partition_S(gB);
+    auto tBgB1 = thr_copy_b1.partition_S(gB);
 
     /* Create register fragments for MMA and copies */
     auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
     auto tSrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
 
-    auto tBrB0 = thr_copy_b0.partition_sg_fragment_D(gB0(_, _, 0));
-    auto tBrB1 = thr_copy_b1.partition_sg_fragment_D(gB1(_, _, 0));
+    auto tBrB0 = thr_copy_b0.partition_sg_fragment_D(gB(_, _, 0));
+    auto tBrB1 = thr_copy_b1.partition_sg_fragment_D(gB(_, _, 0));
 
-    auto tSrB = thr_mma.partition_sg_fragment_B(gB0(_, _, 0));
+    auto tSrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
 
     /* Partition C */
     SubgroupTensor tCrC0 = thr_mma.partition_sg_fragment_C(gC0);
@@ -275,8 +273,8 @@ struct MoEMainloop<XeDefault<Stages>, TiledCopyA_, TiledCopyB_, TilesCopyD_, ATe
 
     /* Partition global tensors for prefetch */
     auto pAgA = prefetch_a.get_slice(thr_id).partition_S(gA);
-    auto pBgB0 = prefetch_b0.get_slice(thr_id).partition_S(gB0);
-    auto pBgB1 = prefetch_b1.get_slice(thr_id).partition_S(gB1);
+    auto pBgB0 = prefetch_b0.get_slice(thr_id).partition_S(gB);
+    auto pBgB1 = prefetch_b1.get_slice(thr_id).partition_S(gB);
 
     constexpr int barrier_scope = 2;
     int k_start_idx = 0;

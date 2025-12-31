@@ -31,8 +31,6 @@
  **************************************************************************************************/
 #pragma once
 
-#include <cute/util/compat.hpp>
-
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/gemm.h"

@@ -20,6 +20,7 @@ suites = {
         TestFile("test_moe_align.py"),
         TestFile("test_moe_gemm.py"),
         TestFile("test_moe_prepare_input.py"),
+        TestFile("test_per_token_group_quant_8bit.py")
     ],
 }
 

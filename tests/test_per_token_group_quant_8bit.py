@@ -1,4 +1,5 @@
 import itertools
+import sys
 from typing import Tuple
 
 import pytest

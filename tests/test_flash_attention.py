@@ -2,6 +2,7 @@
 import itertools
 import math
 import os
+import sys
 
 import pytest
 import torch
@@ -1354,4 +1355,4 @@ def test_flash_attn_varlen_output(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

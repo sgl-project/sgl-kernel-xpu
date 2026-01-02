@@ -1,4 +1,5 @@
 import random
+import sys
 
 import pytest
 import torch
@@ -167,4 +168,4 @@ def test_fp8_blockwise_scaled_grouped_mm(num_experts, out_dtype):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

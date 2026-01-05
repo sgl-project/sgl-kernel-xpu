@@ -3,6 +3,7 @@ import triton
 from sgl_kernel import moe_sum_reduce as moe_sum_reduce_sycl
 from triton.testing import do_bench
 
+all_results = []
 
 def compute_sum_scaled_baseline(
     x: torch.Tensor, out: torch.Tensor, routed_scaling_factor: float
@@ -72,6 +73,26 @@ def get_benchmark():
                 quantiles=quantiles,
             )
 
+        flop = ( num_tokens * topk * hidden_size )
+        memory = (
+            (topk + 1 ) * num_tokens * hidden_size
+            * torch.finfo(dtype).bits
+            // 8
+        )
+        tflops = flop / (ms / 1e3) / 1e12
+        bandwidth = memory / (ms / 1e3) / 1e9
+        all_results.append(
+            {
+                "num_tokens": num_tokens,
+                "topk": topk,
+                "hidden_size": hidden_size,
+                "dtype": dtype,
+                "tflops": tflops,
+                "bandwidth": bandwidth,
+                "us": 1000 * ms,
+            }
+        )
+
         return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
     return benchmark
@@ -112,3 +133,8 @@ if __name__ == "__main__":
         print_data=True,
         # save_path="./configs/benchmark_ops/sum_scaled/"
     )
+
+    print("\n ✅ sum_scaled_performance: ")
+    import pandas as pd
+    df = pd.DataFrame(all_results)
+    print(df.to_markdown())

@@ -1,4 +1,5 @@
 import math
+import sys
 from typing import List, Optional, Tuple
 
 import pytest
@@ -478,4 +479,4 @@ def test_convert_vertical_slash_indexes_mergehead(causal):
 #         f"{torch.max(torch.abs(lse - ref_lse))}"
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

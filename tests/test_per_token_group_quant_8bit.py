@@ -1,4 +1,5 @@
 import itertools
+import sys
 from typing import Tuple
 
 import pytest
@@ -313,4 +314,4 @@ def test_per_token_group_quant_with_column_major(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

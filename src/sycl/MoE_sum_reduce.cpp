@@ -46,7 +46,6 @@ struct moe_sum_reduce_impl_sycl_k {
       }
       acc *= static_cast<float>(routed_scaling_factor_);
       output_[dst_offset + i] = static_cast<T>(acc);
-
     }
   }
 
@@ -85,7 +84,7 @@ void moe_sum_reduce_impl(at::Tensor& input_tensor, at::Tensor& output_tensor, do
   uint32_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
   uint32_t max_wg_dims = static_cast<uint32_t>(sycl::min(max_wg_size, hidden_dim));
 
-  sycl::range<1> global_range{token_num * max_wg_size };
+  sycl::range<1> global_range{token_num * max_wg_size};
   sycl::range<1> local_range{max_wg_size};
 
   Kernel task(

@@ -58,7 +58,6 @@ from sgl_kernel.moe import (
     moe_sum_reduce,
     prepare_moe_input,
     topk_softmax,
-    moe_sum_reduce,
 )
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,

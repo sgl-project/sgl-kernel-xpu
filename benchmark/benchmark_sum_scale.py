@@ -1,6 +1,5 @@
 import torch
 import triton
-import triton.language as tl
 from sgl_kernel import moe_sum_reduce as moe_sum_reduce_sycl
 from triton.testing import do_bench
 
@@ -23,6 +22,7 @@ def compute_sum_scaled_compiled(
 
 def get_benchmark():
     num_tokens_range = [2**i for i in range(0, 13)]
+
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=["num_tokens"],
@@ -90,10 +90,9 @@ def verify_correctness(num_tokens=1024):
     out_xpu = torch.empty_like(out_baseline)
     moe_sum_reduce_sycl(x, out_xpu, scaling_factor)
 
-    if (
-        torch.allclose(out_baseline, out_compiled, atol=1e-2, rtol=1e-2)
-        and torch.allclose(out_baseline, out_xpu, atol=1e-2, rtol=1e-2)
-    ):
+    if torch.allclose(
+        out_baseline, out_compiled, atol=1e-2, rtol=1e-2
+    ) and torch.allclose(out_baseline, out_xpu, atol=1e-2, rtol=1e-2):
         print("✅ All implementations match")
     else:
         print("❌ Implementations differ")

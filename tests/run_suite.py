@@ -19,7 +19,7 @@ suites = {
         TestFile("test_flash_attention.py"),
         TestFile("test_moe_align.py"),
         TestFile("test_moe_gemm.py"),
-        TestFile("test_moe_reduce.py"),
+        TestFile("test_moe_sum_reduce.py"),
         TestFile("test_moe_prepare_input.py"),
     ],
 }

@@ -133,5 +133,6 @@ if __name__ == "__main__":
 
     print("\n ✅ sum_scaled_performance: ")
     import pandas as pd
+
     df = pd.DataFrame(all_results)
     print(df.to_markdown())

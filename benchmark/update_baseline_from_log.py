@@ -111,7 +111,7 @@ def main():
         delta_pct = (ratio - 1.0) * 100.0
         print(f"{k}: log={l:.3f}, baseline={b}, ratio={delta_pct}")
 
-    print("Collected benchmark data")
+    print("Collected benchmark data:")
     print(data)
 
     pr_body = "\n".join(
@@ -136,7 +136,7 @@ def main():
         open("ci_has_lower.txt", "w").write("1")
     else:
         open("ci_has_lower.txt", "w").write("0")
-
+    print("ci_has_lower.txt content:", open("ci_has_lower.txt").read().strip())
     open("ci_pr_body.md", "w").write(pr_body)
 
 

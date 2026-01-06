@@ -87,7 +87,7 @@ jobs:
           BASE="main"
           git fetch origin
           if git show-ref --verify --quiet refs/remotes/origin/$BRANCH; then
-            git checkout -B "$BRANCH" "origin/$BRANCH"
+            git checkout "$BRANCH"
           else
             git checkout -B "$BRANCH" "origin/$BASE"
           fi

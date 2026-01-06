@@ -82,11 +82,6 @@ jobs:
           contains(join(github.event.pull_request.labels.*.name, ','), 'perf') &&
           hashFiles('ci_has_lower.txt') != ''
         run: |
-          if [ "$(cat ci_has_lower.txt)" = "0" ]; then
-            echo "No LOWER entries, skipping PR."
-            exit 0
-          fi
-
           SRC_PR=${{ github.event.pull_request.number }}
           BRANCH="ci/update-baseline-pr-${SRC_PR}"
           BASE="main"
@@ -95,6 +90,11 @@ jobs:
             git checkout -B "$BRANCH" "origin/$BRANCH"
           else
             git checkout -B "$BRANCH" "origin/$BASE"
+          fi
+
+          if [ "$(cat ci_has_lower.txt)" = "0" ]; then
+            echo "No LOWER entries, skipping PR."
+            exit 0
           fi
 
           git config user.name "github-actions[bot]"

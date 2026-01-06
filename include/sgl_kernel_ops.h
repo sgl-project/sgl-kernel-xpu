@@ -220,6 +220,8 @@ void moe_align_block_size(
 
 void moe_sum(torch::Tensor& input, torch::Tensor& output);
 
+void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor);
+
 void topk_softmax(
     torch::Tensor& topk_weights,
     torch::Tensor& topk_indices,

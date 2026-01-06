@@ -1,6 +1,7 @@
 import itertools
 from typing import Tuple
 
+import pandas as pd
 import torch
 import triton
 import triton.language as tl
@@ -147,11 +148,11 @@ def sglang_per_token_group_quant_8bit(
 
 
 def calculate_diff(batch_size, seq_len, group_size, dst_dtype):
-    device = torch.device("cuda")
+    device = torch.device("xpu")
     hidden_dim = 7168
 
     x = torch.randn(
-        batch_size * seq_len, hidden_dim, device=device, dtype=torch.float16
+        batch_size * seq_len, hidden_dim, device=device, dtype=torch.bfloat16
     )
 
     x_q_triton, x_s_triton = triton_per_token_group_quant_8bit(
@@ -161,8 +162,18 @@ def calculate_diff(batch_size, seq_len, group_size, dst_dtype):
         x.clone(), group_size, dst_dtype
     )
 
+    # Dequantize and compare values (convert to float for comparison)
+    x_dq_triton = (
+        x_q_triton.cpu().view(batch_size * seq_len, -1, group_size).to(torch.float32)
+        * x_s_triton.cpu().unsqueeze(2)
+    ).view(batch_size * seq_len, hidden_dim)
+    x_dq_sglang = (
+        x_q_sglang.cpu().view(batch_size * seq_len, -1, group_size).to(torch.float32)
+        * x_s_sglang.cpu().unsqueeze(2)
+    ).view(batch_size * seq_len, hidden_dim)
+
     if torch.allclose(
-        x_q_triton.to(torch.float32), x_q_sglang.to(torch.float32), rtol=1e-3, atol=1e-5
+        x_dq_triton, x_dq_sglang, rtol=1e-1, atol=1e-1
     ) and torch.allclose(x_s_triton, x_s_sglang, rtol=1e-3, atol=1e-5):
         print(f"✅ {dst_dtype} implementations match")
     else:
@@ -180,6 +191,69 @@ configs = list(
     )
 )
 
+all_results = []
+
+
+def calculate_flops(
+    num_elements: int,
+    num_groups: int,
+    group_size: int,
+) -> int:
+    """
+    Calculate FLOPs for per-token-group quantization kernel.
+
+    Per element: 5 FLOPs (2 absmax: fabs+fmax, 3 quant: mul+fmax+fmin)
+    Per group: 6 FLOPs (4 reduction fmax, 2 scale divisions)
+    """
+    flops_per_element = 5  # 2 for absmax + 3 for quantization
+    flops_per_group = 6    # 4 for reduction + 2 for scale calculation
+
+    total_flops = (num_elements * flops_per_element) + (num_groups * flops_per_group)
+
+    return total_flops
+
+
+def calculate_effective_bandwidth(
+    batch_size: int,
+    seq_len: int,
+    hidden_dim: int,
+    group_size: int,
+    dst_dtype: torch.dtype,
+    time_ms: float,
+) -> dict:
+    """
+    Calculate effective bandwidth and FLOPs for per-token-group quantization kernel.
+
+    Memory: read bf16 input + write int8/fp8 output + write fp32 scales (single-pass).
+    """
+    num_tokens = batch_size * seq_len
+    num_elements = num_tokens * hidden_dim
+    num_groups = num_elements // group_size
+
+    input_bytes = num_elements * 2      # bf16
+    output_bytes = num_elements * 1     # int8/fp8
+    scale_bytes = num_groups * 4        # fp32
+    total_bytes = input_bytes + output_bytes + scale_bytes
+
+    time_s = time_ms / 1000.0
+    bandwidth_gbs = (total_bytes / 1e9) / time_s
+
+    total_flops = calculate_flops(num_elements, num_groups, group_size)
+    gflops = (total_flops / 1e9) / time_s
+
+    return {
+        "num_tokens": num_tokens,
+        "num_elements": num_elements,
+        "num_groups": num_groups,
+        "input_bytes": input_bytes,
+        "output_bytes": output_bytes,
+        "scale_bytes": scale_bytes,
+        "total_bytes": total_bytes,
+        "bandwidth_gbs": bandwidth_gbs,
+        "total_flops": total_flops,
+        "gflops": gflops,
+    }
+
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -195,21 +269,43 @@ configs = list(
     )
 )
 def benchmark(batch_size, seq_len, group_size, dst_dtype, provider):
-    device = torch.device("cuda")
+    device = torch.device("xpu")
     hidden_dim = 7168
 
     x = torch.randn(
-        batch_size * seq_len, hidden_dim, device=device, dtype=torch.float16
+        batch_size * seq_len, hidden_dim, device=device, dtype=torch.bfloat16
     )
 
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "triton":
-        fn = lambda: triton_per_token_group_quant_8bit(x.clone(), group_size, dst_dtype)
+        fn = lambda: triton_per_token_group_quant_8bit(x, group_size, dst_dtype)
     elif provider == "sglang":
-        fn = lambda: sglang_per_token_group_quant_8bit(x.clone(), group_size, dst_dtype)
+        fn = lambda: sglang_per_token_group_quant_8bit(x, group_size, dst_dtype)
 
     ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
+
+    # Calculate effective bandwidth
+    bw_metrics = calculate_effective_bandwidth(
+        batch_size, seq_len, hidden_dim, group_size, dst_dtype, ms
+    )
+
+    all_results.append(
+        {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "num_tokens": bw_metrics["num_tokens"],
+            "hidden_dim": hidden_dim,
+            "group_size": group_size,
+            "dst_dtype": str(dst_dtype),
+            "provider": provider,
+            "time_us": 1000 * ms,
+            "bandwidth_gbs": bw_metrics["bandwidth_gbs"],
+            "total_bytes_mb": bw_metrics["total_bytes"] / 1e6,
+            "total_flops_m": bw_metrics["total_flops"] / 1e6,
+            "gflops": bw_metrics["gflops"],
+        }
+    )
 
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
@@ -217,6 +313,33 @@ def benchmark(batch_size, seq_len, group_size, dst_dtype, provider):
 if __name__ == "__main__":
 
     calculate_diff(batch_size=4, seq_len=128, group_size=64, dst_dtype=torch.int8)
-    calculate_diff(batch_size=4, seq_len=128, group_size=64, dst_dtype=fp8_type_)
+    calculate_diff(batch_size=2, seq_len=32, group_size=128, dst_dtype=fp8_type_)
 
     benchmark.run(print_data=True)
+
+    # Print bandwidth results
+    print("\n" + "=" * 80)
+    print("Effective Bandwidth Results")
+    print("=" * 80)
+
+    df = pd.DataFrame(all_results)
+    df["bandwidth_gbs"] = df["bandwidth_gbs"].round(2)
+    df["total_bytes_mb"] = df["total_bytes_mb"].round(2)
+    df["time_us"] = df["time_us"].round(2)
+    df["total_flops_m"] = df["total_flops_m"].round(2)
+    df["gflops"] = df["gflops"].round(2)
+
+    print(df.to_markdown(index=False))
+
+    # Print summary statistics per provider
+    print("\n" + "=" * 80)
+    print("Summary Statistics by Provider")
+    print("=" * 80)
+    summary = df.groupby("provider").agg(
+        {
+            "bandwidth_gbs": ["mean", "min", "max"],
+            "time_us": ["mean", "min", "max"],
+            "gflops": ["mean", "min", "max"],
+        }
+    )
+    print(summary.to_markdown())

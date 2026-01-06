@@ -126,7 +126,7 @@ void moe_grouped_mm_nt(
   int gemm_k = activations.sizes()[1];
   auto weights_shape = weights.sizes().vec();
   int gemm_n = weights.sizes()[1];
-  int aveg_m = total_m / n_experts;
+  int avg_m = total_m / n_experts;
 
   TORCH_CHECK(weights_shape.size() == 3, "weights must be 3D");
   TORCH_CHECK(weights_shape[0] == n_experts, "weights must have n_experts as the first dimension");
@@ -151,13 +151,13 @@ void moe_grouped_mm_nt(
   auto queue = stream.queue();
   at::Tensor atomic_buffer = at::empty({static_cast<long>(1)}, activations.options().dtype(at::kInt));
 
-  if (aveg_m <= 8) {
+  if (avg_m <= 8) {
     DISPATCH_MOE_BY_CONDITION(fuse_silu, Shape<_8, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
-  } else if (aveg_m <= 16) {
+  } else if (avg_m <= 16) {
     DISPATCH_MOE_BY_CONDITION(fuse_silu, Shape<_16, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
-  } else if (aveg_m <= 32) {
+  } else if (avg_m <= 32) {
     DISPATCH_MOE_BY_CONDITION(fuse_silu, Shape<_32, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
-  } else if (aveg_m <= 128) {
+  } else if (avg_m <= 128) {
     if (fuse_silu) {
       LAUNCH_MOE(Shape<_128, _32, _32>, Layout<Shape<_2, _8, _1>, Stride<_8, _1, _0>>, true);
     } else {

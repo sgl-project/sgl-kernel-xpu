@@ -54,14 +54,13 @@ template <
     typename TensorB,
     typename TensorD,
     typename TiledMMA,
-    bool FuseSiLU_,
+    bool FuseSiLU,
     typename ElementA,
     typename ElementB = ElementA,
     typename ElementS = ElementA,
     typename ElementD = ElementA>
 class MoEGEMM {
  public:
-  constexpr static bool FuseSiLU = FuseSiLU_;
   using TiledCopyA = decltype(make_block_2d_copy_A(TiledMMA{}, TensorA{}));
   using TiledCopyB = decltype(make_block_2d_copy_B(TiledMMA{}, TensorB{}));
   using TiledCopyD = decltype(make_block_2d_copy_D(TiledMMA{}, TensorD{}));
@@ -124,9 +123,9 @@ class MoEGEMM {
     int group_id = item.get_group_linear_id();
     int N_pad;
     if constexpr (FuseSiLU) {
-      N_pad = (N / 2 + wg_tile_n - 1) / wg_tile_n * wg_tile_n;
+      N_pad = ceil_div(N / 2, wg_tile_n) * wg_tile_n;
     } else {
-      N_pad = (N + wg_tile_n - 1) / wg_tile_n * wg_tile_n;
+      N_pad = ceil_div(N, wg_tile_n) * wg_tile_n;
     }
     int group_m_id = (group_id * wg_tile_n) / N_pad;
     int group_range = item.get_group_range(1);

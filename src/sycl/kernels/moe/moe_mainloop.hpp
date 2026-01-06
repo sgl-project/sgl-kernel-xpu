@@ -319,7 +319,7 @@ struct MoEMainloop<XeDefault<Stages>, TiledCopyA_, TiledCopyB_, TilesCopyD_, ATe
     for (int i = 0; i < tCrC0.size(); ++i) {
       float x = tCrC0(i);
       float y = tCrC1(i);
-      float s = 1.0f / (1.0f + expf(-x));
+      float s = 1.0f / (1.0f + sycl::native::exp(-x));
       tCrC0(i) = x * s * y;
     }
 

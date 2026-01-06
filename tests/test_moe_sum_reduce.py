@@ -9,7 +9,7 @@ from sgl_kernel import moe_sum_reduce
 @pytest.mark.parametrize("num_experts", [4, 8, 32])
 @pytest.mark.parametrize("top_k", [2, 4, 8])
 @pytest.mark.parametrize("hidden_dims", [16, 32, 64])
-def test_prepare_input_moe(num_tokens, num_experts, top_k, hidden_dims):
+def test_moe_sum_reduce(num_tokens, num_experts, top_k, hidden_dims):
     torch.manual_seed(41)
 
     def moe_reduce_reference(inp, scaling):

@@ -95,6 +95,7 @@ jobs:
 
           TMP_BASELINE=$(mktemp)
           cp benchmark/baseline.json "$TMP_BASELINE"
+          git reset --hard
           git fetch origin
           if git show-ref --verify --quiet refs/remotes/origin/$BRANCH; then
             git checkout "$BRANCH"

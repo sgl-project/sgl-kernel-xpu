@@ -61,7 +61,8 @@ jobs:
               cd /root/sglang/sgl-kernel-xpu/benchmark && \
               python3 bench_flash_attn.py 2>&1 | tee flash.log && \
               python3 bench_moe_topk_softmax.py 2>&1 | tee moe.log && \
-              python3 bench_fused_moe.py 2>&1 | tee fused_moe.log \
+              python3 bench_fused_moe.py 2>&1 | tee fused_moe.log && \
+              python3 bench_moe_sum_reduce.py 2>&1 | tee moe_sum_reduce.log \
             "
 
       - name: Copy logs from container

@@ -64,7 +64,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def(
       "moe_grouped_mm_nt(Tensor output, Tensor activations, Tensor weights, Tensor total_rows_for_experts, int "
-      "n_experts) -> ()");
+      "n_experts, bool fuse_silu) -> ()");
   m.impl("moe_grouped_mm_nt", torch::kXPU, &moe_grouped_mm_nt);
 
   m.def(
@@ -76,11 +76,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("shuffle_rows", torch::kXPU, &shuffle_rows);
   m.def("apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, Tensor? factors) -> ()");
   m.impl("apply_shuffle_mul_sum", torch::kXPU, &apply_shuffle_mul_sum);
-
-  //   m.def(
-  //       "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype,
-  //       -> Tensor");
-  //   m.impl("fp8_blockwise_scaled_mm", torch::kXPU, &fp8_blockwise_scaled_mm);
 
   /*
    * From cutlass attention

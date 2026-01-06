@@ -126,7 +126,7 @@ jobs:
               --repo sgl-project/sgl-kernel-xpu \
               --title "CI: Update baseline.json (from PR #${SRC_PR}) " \
               --body-file ci_pr_body.md \
-              --base main \
+              --base "$BASE" \
               --head "$BRANCH"
             )
 

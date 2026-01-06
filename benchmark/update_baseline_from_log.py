@@ -69,15 +69,14 @@ def compare(log_data: dict, baseline: dict):
         if k not in baseline:
             continue
 
-        log_us = log_ms
-        base_us = baseline[k]
+        base_ms = baseline[k]
 
-        if log_us < base_us:
-            lower[k] = (log_us, base_us)
-        elif log_us > base_us:
-            higher[k] = (log_us, base_us)
+        if log_ms < base_ms:
+            lower[k] = (log_ms, base_ms)
+        elif log_ms > base_ms:
+            higher[k] = (log_ms, base_ms)
         else:
-            equal[k] = (log_us, base_us)
+            equal[k] = (log_ms, base_ms)
 
     return lower, higher, equal
 
@@ -112,7 +111,7 @@ def main():
         delta_pct = (ratio - 1.0) * 100.0
         print(f"{k}: log={l:.3f}, baseline={b}, ratio={delta_pct}")
 
-    print("data")
+    print("Collected benchmark data")
     print(data)
 
     pr_body = "\n".join(

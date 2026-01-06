@@ -80,8 +80,7 @@ jobs:
         if: >
           success() &&
           contains(join(github.event.pull_request.labels.*.name, ','), 'perf') &&
-          hashFiles('ci_has_lower.txt') != '' &&
-          steps.check.outputs.has_lower != '0'
+          hashFiles('ci_has_lower.txt') != ''
         run: |
           if [ "$(cat ci_has_lower.txt)" = "0" ]; then
             echo "No LOWER entries, skipping PR."

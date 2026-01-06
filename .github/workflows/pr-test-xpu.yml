@@ -85,11 +85,19 @@ jobs:
           SRC_PR=${{ github.event.pull_request.number }}
           BRANCH="ci/update-baseline-pr-${SRC_PR}"
           BASE="main"
+          git add benchmark/baseline.json
+          if command -v pre-commit >/dev/null 2>&1; then
+              pre-commit run --files benchmark/baseline.json || true
+              git add benchmark/baseline.json
+          fi
+          git commit -m "CI intermediate baseline update" || echo "No changes to commit"
           git fetch origin
           if git show-ref --verify --quiet refs/remotes/origin/$BRANCH; then
             git checkout "$BRANCH"
+            git merge --no-ff HEAD@{1}
           else
             git checkout -B "$BRANCH" "origin/$BASE"
+            git cherry-pick HEAD@{1} || echo "No changes to cherry-pick"
           fi
 
           if [ "$(cat ci_has_lower.txt)" = "0" ]; then
@@ -100,13 +108,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add benchmark/baseline.json
-          if command -v pre-commit >/dev/null 2>&1; then
-              pre-commit run --files benchmark/baseline.json || true
-              git add benchmark/baseline.json
-          fi
-
-          git commit -m "Update baseline.json from CI benchmark"
+          git commit -m "Update baseline.json from CI benchmark" || echo "No changes to commit"
           echo "Detected changes in baseline.json: $(git diff --cached --stat)"
 
           echo "${{ secrets.PAT }}" | gh auth login --with-token || { echo "gh auth login failed"; exit 1; }

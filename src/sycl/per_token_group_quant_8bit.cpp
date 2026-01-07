@@ -9,6 +9,8 @@
 #include "Utils.h"
 #include "cutlass/float8.h"
 
+// TODO: improve performance when FP8 native support is added
+
 namespace at::native::xpu {
 
 // SYCL helper for group reduce max using sub-groups

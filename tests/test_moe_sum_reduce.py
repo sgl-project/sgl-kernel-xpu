@@ -12,7 +12,7 @@ from sgl_kernel import moe_sum_reduce
 def test_moe_sum_reduce(num_tokens, num_experts, top_k, hidden_dims):
     torch.manual_seed(41)
 
-    def moe_reduce_reference(inp, scaling):
+    def moe_sum_reduce_reference(inp, scaling):
         if inp.dim() == 3:
             out = inp.sum(dim=1) * float(scaling)
         elif inp.dim() == 2:
@@ -25,7 +25,7 @@ def test_moe_sum_reduce(num_tokens, num_experts, top_k, hidden_dims):
     inp = torch.randn((num_tokens, top_k, hidden_dims))
     out = torch.empty((num_tokens, hidden_dims))
     scaling = 1.0 / float(top_k)
-    expected = moe_reduce_reference(inp, scaling)
+    expected = moe_sum_reduce_reference(inp, scaling)
 
     device = "xpu"
     inp_xpu = inp.clone().to(device)

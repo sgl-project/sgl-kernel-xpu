@@ -81,41 +81,70 @@ jobs:
         if: >
           success() &&
           contains(join(github.event.pull_request.labels.*.name, ','), 'perf') &&
-          hashFiles('ci_has_lower.txt') != '' &&
-          ${{ steps.check.outputs.has_lower != '0' }}
+          hashFiles('ci_has_lower.txt') != ''
         run: |
+          SRC_PR=${{ github.event.pull_request.number }}
+          BRANCH="ci/update-baseline-pr-${SRC_PR}"
+          BASE="main"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           if [ "$(cat ci_has_lower.txt)" = "0" ]; then
             echo "No LOWER entries, skipping PR."
             exit 0
           fi
 
-          BRANCH="update-baseline-${GITHUB_SHA:0:8}-$(date +%s)"
-          git checkout -b "$BRANCH"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          TMP_BASELINE=$(mktemp)
+          cp benchmark/baseline.json "$TMP_BASELINE"
 
+          TMP_BODY=$(mktemp)
+          cp ci_pr_body.md "$TMP_BODY"
+
+          git reset --hard
+          git fetch origin
+          if git show-ref --verify --quiet refs/remotes/origin/$BRANCH; then
+            git checkout "$BRANCH"
+          else
+            git checkout -B "$BRANCH" "origin/$BASE"
+          fi
+
+          cp "$TMP_BASELINE" benchmark/baseline.json
+          cp "$TMP_BODY" ci_pr_body.md
           git add benchmark/baseline.json
           if command -v pre-commit >/dev/null 2>&1; then
               pre-commit run --files benchmark/baseline.json || true
               git add benchmark/baseline.json
           fi
-
-          git commit -m "Update baseline.json from CI benchmark"
+          git commit -m "CI intermediate baseline update" || echo "No changes to commit"
           echo "Detected changes in baseline.json: $(git diff --cached --stat)"
 
           echo "${{ secrets.PAT }}" | gh auth login --with-token || { echo "gh auth login failed"; exit 1; }
           git remote set-url origin https://x-access-token:${{ secrets.PAT }}@github.com/sgl-project/sgl-kernel-xpu.git
           git push -f https://${{ secrets.PAT }}@github.com/sgl-project/sgl-kernel-xpu.git "$BRANCH"
 
-          PR_URL=$(gh pr create \
+          PR_NUMBER=$(gh pr list \
             --repo sgl-project/sgl-kernel-xpu \
-            --title "CI: Update baseline.json (${GITHUB_SHA:0:8}) " \
-            --body-file ci_pr_body.md \
-            --base main \
-            --head "$BRANCH"
-          )
+            --head "$BRANCH" \
+            --base "$BASE" \
+            --json number \
+            --jq '.[0].number')
 
-          echo "PR created at $PR_URL"
+          if [ -z "$PR_NUMBER" ]; then
+            PR_URL=$(gh pr create \
+              --repo sgl-project/sgl-kernel-xpu \
+              --title "CI: Update baseline.json (from PR #${SRC_PR}) " \
+              --body-file ci_pr_body.md \
+              --base "$BASE" \
+              --head "$BRANCH"
+            )
+
+            echo "PR created at $PR_URL"
+          else
+            echo "Baseline PR #$PR_NUMBER already exists for source PR #${SRC_PR}, updated with new commit."
+            gh pr comment "$PR_NUMBER" \
+              --repo sgl-project/sgl-kernel-xpu \
+              --body-file ci_pr_body.md
+          fi
 
       - name: Run E2E Bfloat16 tests
         timeout-minutes: 20

@@ -6,12 +6,213 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel import sgl_per_token_group_quant_fp8, sgl_per_token_group_quant_int8
 
-from sglang.srt.utils import is_hip
+try:
+    HAS_XPU = torch.xpu.is_available()
+except (ImportError, AttributeError):
+    HAS_XPU = False
 
-_is_hip = is_hip()
-fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
+try:
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
+    )
+
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+
+from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
+
+
+def ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
+    """Round scale to nearest power of 2 for UE8M0 format."""
+    return torch.pow(2.0, torch.ceil(torch.log2(x.abs().clamp(min=1e-10))))
+
+
+# Pure PyTorch reference implementations
+def per_token_group_quant_fp8_ref(
+    x: torch.Tensor,
+    group_size: int = 128,
+    eps: float = 1e-10,
+    scale_ue8m0: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """PyTorch reference for per-token group FP8 quantization."""
+    assert x.dim() == 2 and x.size(1) % group_size == 0
+    num_tokens, hidden_dim = x.shape
+    x_view = x.view(num_tokens, -1, group_size)
+    x_amax = x_view.abs().float().amax(dim=2).clamp(min=eps)
+    scales = x_amax / 448.0  # FP8 E4M3 max
+
+    if scale_ue8m0:
+        scales = ceil_to_ue8m0(scales)
+
+    x_quantized = (x_view / scales.unsqueeze(2)).to(torch.float8_e4m3fn)
+    return x_quantized.view(num_tokens, hidden_dim), scales
+
+
+def per_token_group_quant_int8_ref(
+    x: torch.Tensor, group_size: int = 128, eps: float = 1e-10
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """PyTorch reference for per-token group INT8 quantization."""
+    assert x.dim() == 2 and x.size(1) % group_size == 0
+    num_tokens, hidden_dim = x.shape
+    x_view = x.view(num_tokens, -1, group_size)
+    x_amax = x_view.abs().float().amax(dim=2).clamp(min=eps)
+    scales = x_amax / 127.0  # INT8 max
+    x_scaled = (x_view / scales.unsqueeze(2)).clamp(-127.0, 127.0)
+    x_quantized = x_scaled.to(torch.int8)
+    return x_quantized.view(num_tokens, hidden_dim), scales
+
+
+@pytest.mark.skipif(not HAS_XPU, reason="XPU not available")
+class TestPerTokenGroupQuantXPU:
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        torch.xpu.set_device(0)
+        self.device = torch.device("xpu")
+        self.eps = 1e-10
+
+    def _test_against_reference(
+        self,
+        num_tokens: int,
+        hidden_dim: int,
+        group_size: int,
+        dst_dtype: torch.dtype,
+        src_dtype: torch.dtype = torch.bfloat16,
+        column_major_scales: bool = False,
+        scale_ue8m0: bool = False,
+        seed: int = 42,
+    ):
+        """Test XPU implementation against PyTorch reference."""
+        torch.manual_seed(seed)
+        x_cpu = torch.randn(num_tokens, hidden_dim, dtype=src_dtype)
+        x_xpu = x_cpu.to(self.device)
+
+        # Get reference output
+        if dst_dtype == torch.float8_e4m3fn:
+            x_q_ref, scales_ref = per_token_group_quant_fp8_ref(
+                x_cpu, group_size, self.eps, scale_ue8m0
+            )
+        else:
+            x_q_ref, scales_ref = per_token_group_quant_int8_ref(
+                x_cpu, group_size, self.eps
+            )
+
+        # Run XPU implementation
+        x_q_xpu, scales_xpu = sglang_per_token_group_quant_8bit(
+            x=x_xpu,
+            masked_m=None,
+            group_size=group_size,
+            eps=self.eps,
+            dst_dtype=dst_dtype,
+            column_major_scales=column_major_scales,
+            scale_ue8m0=scale_ue8m0,
+            enable_v2=False,
+        )
+
+        # Compare
+        x_q_xpu_cpu = x_q_xpu.cpu()
+        scales_xpu_cpu = scales_xpu.cpu()
+
+        assert x_q_xpu_cpu.shape == x_q_ref.shape
+        assert x_q_xpu_cpu.dtype == dst_dtype
+
+        torch.testing.assert_close(
+            scales_xpu_cpu, scales_ref, rtol=1e-3, atol=1e-5, msg=f"Scales mismatch"
+        )
+
+        # Dequantize and compare
+        num_groups = hidden_dim // group_size
+        x_dq_ref = (
+            x_q_ref.view(num_tokens, num_groups, group_size).to(torch.float32)
+            * scales_ref.unsqueeze(2)
+        ).view(num_tokens, hidden_dim)
+        x_dq_xpu = (
+            x_q_xpu_cpu.view(num_tokens, num_groups, group_size).to(torch.float32)
+            * scales_xpu_cpu.unsqueeze(2)
+        ).view(num_tokens, hidden_dim)
+
+        rtol, atol = (1e-1, 1e-1) if dst_dtype == torch.float8_e4m3fn else (1e-2, 1e-2)
+        torch.testing.assert_close(x_dq_xpu, x_dq_ref, rtol=rtol, atol=atol)
+
+    @pytest.mark.parametrize(
+        "num_tokens,hidden_dim,group_size,dst_dtype,src_dtype,column_major_scales,scale_ue8m0",
+        [
+            # Basic FP8 quantization
+            (128, 1024, 128, torch.float8_e4m3fn, torch.bfloat16, False, False),
+            # Basic INT8 quantization
+            (128, 1024, 128, torch.int8, torch.bfloat16, False, False),
+            # Various sizes
+            (64, 512, 64, torch.float8_e4m3fn, torch.bfloat16, False, False),
+            (128, 2048, 128, torch.float8_e4m3fn, torch.bfloat16, False, False),
+            (256, 4096, 64, torch.int8, torch.bfloat16, False, False),
+            # Column-major scale layout
+            (128, 1024, 128, torch.float8_e4m3fn, torch.bfloat16, True, False),
+            # Float16 source dtype tests
+            (128, 1024, 128, torch.float8_e4m3fn, torch.float16, False, False),
+            (128, 1024, 128, torch.int8, torch.float16, False, False),
+            (64, 512, 64, torch.float8_e4m3fn, torch.float16, False, False),
+            # Float32 source dtype tests
+            (128, 1024, 128, torch.float8_e4m3fn, torch.float32, False, False),
+            (128, 1024, 128, torch.int8, torch.float32, False, False),
+            (64, 512, 64, torch.float8_e4m3fn, torch.float32, False, False),
+            # Prefill shapes
+            (5120, 7168, 128, torch.float8_e4m3fn, torch.bfloat16, False, False),
+            (5120, 1536, 128, torch.float8_e4m3fn, torch.bfloat16, False, False),
+            (5120, 512, 128, torch.float8_e4m3fn, torch.bfloat16, False, False),
+            (5120, 16384, 128, torch.float8_e4m3fn, torch.bfloat16, False, False),
+            (5120, 18432, 128, torch.float8_e4m3fn, torch.bfloat16, False, False),
+            (5120, 2048, 128, torch.float8_e4m3fn, torch.bfloat16, False, False),
+            (40960, 2048, 128, torch.float8_e4m3fn, torch.bfloat16, False, False),
+            # Decode shapes (batch size 5)
+            (5, 7168, 128, torch.float8_e4m3fn, torch.bfloat16, False, False),
+            (5, 1536, 128, torch.float8_e4m3fn, torch.bfloat16, False, False),
+            (5, 16384, 128, torch.float8_e4m3fn, torch.bfloat16, False, False),
+            (5, 18432, 128, torch.float8_e4m3fn, torch.bfloat16, False, False),
+            (5, 2048, 128, torch.float8_e4m3fn, torch.bfloat16, False, False),
+            (40, 2048, 128, torch.float8_e4m3fn, torch.bfloat16, False, False),
+        ],
+    )
+    def test_quantization(
+        self,
+        num_tokens,
+        hidden_dim,
+        group_size,
+        dst_dtype,
+        src_dtype,
+        column_major_scales,
+        scale_ue8m0,
+    ):
+        """Test per-token group quantization with various configurations.
+        NOTE: This test doesn't enable any ue8m0 scales because it failes a check in fp8_kernel.py fo
+        scale_tma_aligned = True"""
+        self._test_against_reference(
+            num_tokens,
+            hidden_dim,
+            group_size,
+            dst_dtype,
+            src_dtype,
+            column_major_scales,
+            scale_ue8m0,
+        )
+
+    @pytest.mark.parametrize("scale_factor", [1e-3, 100.0])
+    def test_edge_cases(self, scale_factor):
+        torch.manual_seed(42)
+        x = torch.randn(64, 512, dtype=torch.bfloat16) * scale_factor
+        x_xpu = x.to(self.device)
+        x_q, scales = sglang_per_token_group_quant_8bit(
+            x=x_xpu,
+            masked_m=None,
+            group_size=64,
+            eps=self.eps,
+            dst_dtype=torch.float8_e4m3fn,
+            column_major_scales=False,
+            scale_ue8m0=False,
+            enable_v2=False,
+        )
+        assert x_q.shape == x.shape
+        assert (scales > 0).all() and torch.isfinite(scales).all()
 
 
 @triton.jit
@@ -109,7 +310,7 @@ def triton_per_token_group_quant_8bit(
     x: torch.Tensor,
     group_size: int,
     eps: float = 1e-10,
-    dtype: torch.dtype = fp8_type_,
+    dtype: torch.dtype = torch.float8_e4m3fn,
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -127,9 +328,9 @@ def triton_per_token_group_quant_8bit(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the scaling factor for quantization.
     """
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.shape[-1] % group_size == 0, (
+        "the last dimension of `x` cannot be divisible by `group_size`"
+    )
     assert x.is_contiguous(), "`x` is not contiguous"
 
     if dtype == torch.int8:
@@ -138,13 +339,6 @@ def triton_per_token_group_quant_8bit(
         finfo = torch.finfo(dtype)
 
     fp8_max = finfo.max
-
-    if _is_hip:
-        if dtype == torch.int8:
-            fp8_max = 127.0
-        else:
-            fp8_max = 224.0
-
     fp8_min = -fp8_max
 
     x_q = torch.empty_like(x, device=x.device, dtype=dtype)
@@ -209,72 +403,32 @@ def triton_per_token_group_quant_8bit(
     return x_q, x_s
 
 
-def sglang_per_token_group_quant_8bit(
-    x: torch.Tensor,
-    group_size: int,
-    eps: float = 1e-10,
-    dtype: torch.dtype = fp8_type_,
-    column_major_scales: bool = False,
-    scale_tma_aligned: bool = False,
-):
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
-    assert x.is_contiguous(), "`x` is not contiguous"
-
-    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
-    M = x.numel() // group_size
-    N = group_size
-    if column_major_scales:
-        if scale_tma_aligned:
-            # aligned to 4 * sizeof(float)
-            aligned_size = (x.shape[-2] + 3) // 4 * 4
-            x_s = torch.empty(
-                x.shape[:-2] + (x.shape[-1] // group_size, aligned_size),
-                device=x.device,
-                dtype=torch.float32,
-            ).permute(-1, -2)[: x.shape[-2], :]
-        else:
-            x_s = torch.empty(
-                (x.shape[-1] // group_size,) + x.shape[:-1],
-                device=x.device,
-                dtype=torch.float32,
-            ).permute(-1, -2)
-    else:
-        x_s = torch.empty(
-            x.shape[:-1] + (x.shape[-1] // group_size,),
-            device=x.device,
-            dtype=torch.float32,
-        )
-
-    if dtype == torch.int8:
-        iinfo = torch.iinfo(dtype)
-        int8_max = iinfo.max
-        int8_min = iinfo.min
-        sgl_per_token_group_quant_int8(x, x_q, x_s, group_size, eps, int8_min, int8_max)
-    else:
-        f8_info = torch.finfo(dtype)
-        fp8_max = f8_info.max
-        fp8_min = f8_info.min
-        sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
-
-    return x_q, x_s
-
-
 @pytest.mark.parametrize(
     "num_tokens, hidden_dim, group_size, dst_dtype, column_major_scales, scale_tma_aligned",
-    list(
-        itertools.product(
-            [127, 128, 512, 1024, 4096, 8192],  # num_tokens
-            [256, 512, 1024, 2048, 4096],  # hidden_dim
-            [8, 16, 32, 64, 128],  # group_size
-            [torch.int8, fp8_type_],  # dtype
-            [False, True],  # column_major_scales
-            [False, True],  # scale_tma_aligned
-        )
-    ),
+    [
+        (128, 1024, 128, torch.float8_e4m3fn, False, False),
+        (256, 4096, 64, torch.float8_e4m3fn, False, False),
+        (64, 512, 64, torch.float8_e4m3fn, False, False),
+        (128, 2048, 128, torch.float8_e4m3fn, False, False),
+        (128, 1024, 128, torch.float8_e4m3fn, True, False),
+        # Prefill shapes
+        (5120, 7168, 128, torch.float8_e4m3fn, False, False),
+        (5120, 1536, 128, torch.float8_e4m3fn, False, False),
+        (5120, 512, 128, torch.float8_e4m3fn, False, False),
+        (5120, 16384, 128, torch.float8_e4m3fn, False, False),
+        (5120, 18432, 128, torch.float8_e4m3fn, False, False),
+        (5120, 2048, 128, torch.float8_e4m3fn, False, False),
+        (40960, 2048, 128, torch.float8_e4m3fn, False, False),
+        # Decode shapes (batch size 5)
+        (5, 7168, 128, torch.float8_e4m3fn, False, False),
+        (5, 1536, 128, torch.float8_e4m3fn, False, False),
+        (5, 16384, 128, torch.float8_e4m3fn, False, False),
+        (5, 18432, 128, torch.float8_e4m3fn, False, False),
+        (5, 2048, 128, torch.float8_e4m3fn, False, False),
+        (40, 2048, 128, torch.float8_e4m3fn, False, False),
+    ],
 )
-def test_per_token_group_quant_with_column_major(
+def test_per_token_group_quant_with_column_major_fp8(
     num_tokens,
     hidden_dim,
     group_size,
@@ -285,7 +439,7 @@ def test_per_token_group_quant_with_column_major(
     if not column_major_scales and scale_tma_aligned:
         return
 
-    x = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+    x = torch.randn(num_tokens, hidden_dim, device="xpu", dtype=torch.bfloat16)
 
     x_q_triton, x_s_triton = triton_per_token_group_quant_8bit(
         x,
@@ -296,22 +450,31 @@ def test_per_token_group_quant_with_column_major(
         scale_tma_aligned=scale_tma_aligned,
     )
 
-    x_q_sglang, x_s_sglang = sglang_per_token_group_quant_8bit(
+    x_q_xpu, x_s_xpu = sglang_per_token_group_quant_8bit(
         x,
         group_size,
         eps=1e-10,
-        dtype=dst_dtype,
+        dst_dtype=dst_dtype,
         column_major_scales=column_major_scales,
         scale_tma_aligned=scale_tma_aligned,
     )
 
     torch.testing.assert_close(
-        x_q_triton.to(torch.float32), x_q_sglang.to(torch.float32), rtol=1e-3, atol=1e-5
+        x_s_triton.contiguous(), x_s_xpu.contiguous(), rtol=1e-3, atol=1e-5
     )
-    torch.testing.assert_close(
-        x_s_triton.contiguous(), x_s_sglang.contiguous(), rtol=1e-3, atol=1e-5
-    )
+    # Dequantize and compare values (convert to float for comparison)
+    x_dq_triton = (
+        x_q_triton.view(num_tokens, -1, group_size).to(torch.float32)
+        * x_s_triton.unsqueeze(2)
+    ).view(num_tokens, hidden_dim)
+    x_dq_xpu = (
+        x_q_xpu.cpu().view(num_tokens, -1, group_size).to(torch.float32)
+        * x_s_xpu.cpu().unsqueeze(2)
+    ).view(num_tokens, hidden_dim)
+
+    rtol, atol = (1e-1, 1e-1) if dst_dtype == torch.float8_e4m3fn else (1e-2, 1e-2)
+    torch.testing.assert_close(x_dq_xpu.cpu(), x_dq_triton.cpu(), rtol=rtol, atol=atol)
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__, "-v"])

@@ -95,6 +95,10 @@ jobs:
 
           TMP_BASELINE=$(mktemp)
           cp benchmark/baseline.json "$TMP_BASELINE"
+
+          TMP_BODY=$(mktemp)
+          cp ci_pr_body.md "$TMP_BODY"
+
           git reset --hard
           git fetch origin
           if git show-ref --verify --quiet refs/remotes/origin/$BRANCH; then
@@ -104,7 +108,7 @@ jobs:
           fi
 
           cp "$TMP_BASELINE" benchmark/baseline.json
-
+          cp "$TMP_BODY" ci_pr_body.md
           git add benchmark/baseline.json
           if command -v pre-commit >/dev/null 2>&1; then
               pre-commit run --files benchmark/baseline.json || true
@@ -136,6 +140,9 @@ jobs:
             echo "PR created at $PR_URL"
           else
             echo "Baseline PR #$PR_NUMBER already exists for source PR #${SRC_PR}, updated with new commit."
+            gh pr comment "$PR_NUMBER" \
+              --repo sgl-project/sgl-kernel-xpu \
+              --body-file ci_pr_body.md
           fi
 
       - name: Run E2E Bfloat16 tests

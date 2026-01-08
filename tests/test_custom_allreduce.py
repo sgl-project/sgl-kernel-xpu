@@ -2,6 +2,7 @@ import ctypes
 import multiprocessing as mp
 import random
 import socket
+import sys
 import unittest
 from typing import Any, List, Optional
 
@@ -182,4 +183,4 @@ class TestCustomAllReduce(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__]))

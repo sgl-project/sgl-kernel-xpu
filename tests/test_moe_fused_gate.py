@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 from sgl_kernel import moe_fused_gate
@@ -96,4 +98,4 @@ def test_moe_fused_gate_combined(seq_length, dtype, params, num_fused_shared_exp
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

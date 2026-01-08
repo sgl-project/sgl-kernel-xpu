@@ -115,6 +115,15 @@ shape_configs = [
         "dtype": torch.bfloat16,
         "block_shape": None,
     },
+    # deepseek-OCR, tp=1
+    {
+        "num_experts": 64,
+        "topk": 6,
+        "hidden_size": 1280,
+        "shard_intermediate_size": 1792,
+        "dtype": torch.bfloat16,
+        "block_shape": None,
+    },
 ]
 
 shape_values = [list(d.values()) for d in shape_configs]
@@ -258,7 +267,6 @@ def benchmark(
     torch.xpu.manual_seed_all(0)
 
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
-
     w1 = torch.randn(num_experts, shard_intermediate_size, hidden_size, dtype=dtype)
     w2 = torch.randn(
         num_experts, hidden_size, shard_intermediate_size // 2, dtype=dtype
@@ -288,6 +296,7 @@ def benchmark(
 
     quantiles = [0.5, 0.2, 0.8]
     ms, _, _ = triton.testing.do_bench(bench_lambda, quantiles=quantiles)
+
     torch.xpu.empty_cache()
     del x, w1, w2, input_gating
     flop = (
@@ -320,9 +329,9 @@ def benchmark(
             "dtype": dtype,
             "block_shape": block_shape,
             "provider": provider,
-            "ms": ms,
             "tflops": tflops,
             "bandwidth": bandwidth,
+            "ms": ms,
         }
     )
     return ms

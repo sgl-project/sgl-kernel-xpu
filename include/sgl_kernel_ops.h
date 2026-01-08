@@ -130,6 +130,15 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding(
     int64_t head_size,
     at::Tensor& cos_sin_cache,
     bool is_neox);
+void sgl_per_token_group_quant_8bit(
+    at::Tensor input,
+    at::Tensor output_q,
+    at::Tensor output_s,
+    int64_t group_size,
+    double eps,
+    double fp8_min,
+    double fp8_max,
+    bool scale_ue8m0);
 }  // namespace at::native::xpu
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
@@ -177,22 +186,6 @@ torch::Tensor fp8_blockwise_scaled_mm(
     const torch::Dtype& out_dtype);
 void scaled_fp4_quant(
     torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_scale, torch::Tensor const& input_scale);
-void sgl_per_token_group_quant_fp8(
-    at::Tensor input,
-    at::Tensor output_q,
-    at::Tensor output_s,
-    int64_t group_size,
-    double eps,
-    double fp8_min,
-    double fp8_max);
-void sgl_per_token_group_quant_int8(
-    at::Tensor input,
-    at::Tensor output_q,
-    at::Tensor output_s,
-    int64_t group_size,
-    double eps,
-    double int8_min,
-    double int8_max);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
 void bmm_fp8(
@@ -219,6 +212,8 @@ void moe_align_block_size(
     bool pad_sorted_token_ids);
 
 void moe_sum(torch::Tensor& input, torch::Tensor& output);
+
+void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor);
 
 void topk_softmax(
     torch::Tensor& topk_weights,
@@ -260,7 +255,8 @@ void moe_grouped_mm_nt(
     const torch::Tensor& activations,
     const torch::Tensor& weights,
     const torch::Tensor& total_rows_for_experts,
-    const int64_t n_experts);
+    const int64_t n_experts,
+    bool fuse_silu = false);
 
 void prepare_moe_input(
     const torch::Tensor& topk_ids,

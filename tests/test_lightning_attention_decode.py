@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 from sgl_kernel import lightning_attention_decode
@@ -81,4 +83,4 @@ def test_lightning_attention_decode(dtype, batch_size, num_heads, dim, embed_dim
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

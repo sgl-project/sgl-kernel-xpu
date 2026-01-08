@@ -20,6 +20,7 @@ suites = {
         TestFile("test_moe_align.py"),
         TestFile("test_moe_gemm.py"),
         TestFile("test_moe_prepare_input.py"),
+        TestFile("test_swiglu_with_alpha_limit.py"),
     ],
 }
 

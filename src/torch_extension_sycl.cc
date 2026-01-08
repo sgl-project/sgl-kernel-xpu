@@ -83,6 +83,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, Tensor? factors) -> ()");
   m.impl("apply_shuffle_mul_sum", torch::kXPU, &apply_shuffle_mul_sum);
 
+  m.def("dsv3_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
+  m.impl("dsv3_router_gemm", torch::kXPU, &dsv3_router_gemm_xpu);
+
   /*
    * From cutlass attention
    */

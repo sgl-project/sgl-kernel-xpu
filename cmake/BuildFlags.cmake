@@ -22,6 +22,11 @@ function(CHECK_SYCL_FLAG FLAG VARIABLE_NAME)
   file(REMOVE_RECURSE ${TEMP_DIR})
 endfunction()
 
+# Default target architecture: BMG
+if(NOT DEFINED DPCPP_SYCL_TARGET)
+  set(DPCPP_SYCL_TARGET "bmg")
+endif()
+
 # Support GCC on Linux.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   # # -- Host flags (SYCL_CXX_FLAGS)
@@ -76,7 +81,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -Xspirv-translator)
 
   # SYCL compiler in basekit after 2025.2 needs more spirv arguments.
-  if(SYCL_COMPILER_VERSION GREATER_EQUAL 20250806)
+  if(SYCL_COMPILER_VERSION GREATER_EQUAL 20250200)
     set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate)
   else()
     set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -spirv-ext=+SPV_INTEL_split_barrier)
@@ -118,8 +123,8 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(SYCL_OFFLINE_COMPILER_CG_OPTIONS "${SYCL_OFFLINE_COMPILER_CG_OPTIONS} -options -cl-fp32-correctly-rounded-divide-sqrt")
   set(SYCL_OFFLINE_COMPILER_CG_OPTIONS "${SYCL_OFFLINE_COMPILER_CG_OPTIONS} -options -cl-intel-greater-than-4GB-buffer-required")
 
-
-  set(AOT_TARGETS "${DPCPP_SYCL_TARGET}")
+  # AOT target fixed to BMG
+  set(AOT_TARGETS "bmg")
   set(SYCL_TARGETS_OPTION -fsycl-targets=spir64_gen)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} ${SYCL_TARGETS_OPTION})
   set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} ${SYCL_TARGETS_OPTION})

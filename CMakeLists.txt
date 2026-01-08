@@ -18,11 +18,11 @@ message(STATUS ${TORCH_PY_PREFIX})
 list(APPEND CMAKE_PREFIX_PATH ${TORCH_PY_PREFIX}/Torch)
 find_package(Torch REQUIRED)
 
-
 set(SGL_OPS_XPU_ROOT ${PROJECT_SOURCE_DIR})
 list(APPEND CMAKE_MODULE_PATH ${SGL_OPS_XPU_ROOT}/cmake/Modules)
 
 set(DPCPP_SYCL_TARGET "bmg" CACHE STRING "dpcpp target device" FORCE)
+set(SKIP_SKIPK_SYCL ON CACHE BOOL "Skip SKIPK-specific SYCL kernels" FORCE)
 
 include(${SGL_OPS_XPU_ROOT}/cmake/SYCL.cmake)
 include(${SGL_OPS_XPU_ROOT}/cmake/BuildFlags.cmake)
@@ -45,12 +45,18 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(repo-cutlass-sycl)
 
-
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${repo-cutlass-sycl_SOURCE_DIR}/include
     ${repo-cutlass-sycl_SOURCE_DIR}/tools/util/include
 )
+
+# TODO: Remove marking SKIPK sources header-only when SKIPK is enabled
+file(GLOB_RECURSE SGL_SKIP_SKIPK_SOURCES "${SGL_OPS_XPU_ROOT}/src/sycl/*_skip.cpp")
+if(SGL_SKIP_SKIPK_SOURCES)
+	set_source_files_properties(${SGL_SKIP_SKIPK_SOURCES} PROPERTIES HEADER_FILE_ONLY ON)
+	message(STATUS "Skipping SKIPK sources (header-only fallback): ${SGL_SKIP_SKIPK_SOURCES}")
+endif()
 
 add_subdirectory(${SGL_OPS_XPU_ROOT}/src)

@@ -197,6 +197,7 @@ void bmm_fp8(
     at::Tensor workspace_buffer,
     int64_t cublas_handle,
     int64_t sycl_stream);
+void dsv3_router_gemm_xpu(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
 
 /*
  * From csrc/moe

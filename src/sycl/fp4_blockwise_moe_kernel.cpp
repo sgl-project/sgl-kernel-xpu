@@ -5,9 +5,6 @@
 /*! \file
     \brief MXFP4 (E2M1) Block-wise Scaled Grouped GEMM for MoE on Intel XPU (xe35)
 
-    Based on CUTLASS example: 13_xe35_block_scaled_grouped_gemm_e2m1.cpp
-    Structure based on: fp8_blockwise_moe_kernel.cpp
-
     Requirements:
       - Group scaled k size must be 32 (MXFP4 OpenCompute standard)
       - scales must be MN-major
@@ -19,7 +16,6 @@
 #include <torch/extension.h>
 
 #include <cute/tensor.hpp>
-#include <cute/arch/base_datatype.hpp>
 #include <cute/arch/mma_xe.hpp>
 
 #include "cutlass/cutlass.h"
@@ -144,20 +140,9 @@ struct MXFP4BlockwiseScaledGroupGeMMRunner {
   using UnderlyingProblemShape = ProblemShape::UnderlyingProblemShape;
 
   template <typename GemmType>
-  typename GemmType::Arguments args_from_options(
+  auto args_from_options(
       const cutlass::KernelHardwareInfo& hw_info,
-      const ElementInputA* a_ptrs,
-      const StrideA* stride_a,
-      const ElementInputB* b_ptrs,
-      const StrideB* stride_b,
-      const ElementScale* a_scales_ptrs,
-      const StrideScale* layout_sfa,
-      const ElementScale* b_scales_ptrs,
-      const StrideScale* layout_sfb,
-      const StrideC* stride_c,
-      ElementOutput* out_ptrs,
-      const StrideD* stride_d,
-      const UnderlyingProblemShape* problem_sizes_ptr,
+      UnderlyingProblemShape* problem_sizes_ptr,
       const int num_experts) {
     typename GemmType::Arguments arguments;
 
@@ -169,6 +154,7 @@ struct MXFP4BlockwiseScaledGroupGeMMRunner {
     fusion_args.beta_ptr = nullptr;
     fusion_args.alpha_ptr_array = nullptr;
     fusion_args.beta_ptr_array = nullptr;
+    // Single alpha and beta for all groups
     fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
     fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
 
@@ -176,36 +162,13 @@ struct MXFP4BlockwiseScaledGroupGeMMRunner {
     using RasterOrderOptions =
         typename cutlass::gemm::kernel::detail::PersistentTileSchedulerXeGroup<ProblemShape>::RasterOrderOptions;
 
-    // Setup mainloop arguments
-    typename GemmType::GemmKernel::MainloopArguments mainloop_args{
-        a_ptrs,
-        stride_a,
-        b_ptrs,
-        stride_b,
-        a_scales_ptrs,
-        layout_sfa,
-        b_scales_ptrs,
-        layout_sfb,
-        GROUP_SIZE};
-
-    // Setup epilogue arguments
-    typename GemmType::GemmKernel::EpilogueArguments epilogue_args{
-        fusion_args,
-        nullptr,  // C pointer (not used, beta=0)
-        stride_c,
-        out_ptrs,
-        stride_d};
-
-    // Build full arguments
-    arguments = typename GemmType::Arguments{
+    // Per-GEMM problem shape info may only exist on the device.
+    return cute::make_tuple(
         cutlass::gemm::GemmUniversalMode::kGrouped,
-        {num_experts, problem_sizes_ptr, nullptr},
-        mainloop_args,
-        epilogue_args,
+        typename GemmType::GemmKernel::ProblemShape{num_experts, problem_sizes_ptr, nullptr},
+        fusion_args,
         hw_info,
-        {1, RasterOrderOptions::AlongN}};
-
-    return arguments;
+        typename GemmType::GemmKernel::TileSchedulerArguments{1, RasterOrderOptions::AlongN});
   }
 
   int init(
@@ -226,21 +189,36 @@ struct MXFP4BlockwiseScaledGroupGeMMRunner {
     hw_info.device_id = device_id;
     hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
-    gemm_args = args_from_options<Gemm>(
+    auto args_tuple = args_from_options<Gemm>(
         hw_info,
-        static_cast<const ElementInputA*>(a_ptrs),
-        static_cast<const StrideA*>(stride_a),
-        static_cast<const ElementInputB*>(b_ptrs),
-        static_cast<const StrideB*>(stride_b),
-        static_cast<const ElementScale*>(a_scales_ptrs),
-        static_cast<const StrideScale*>(layout_sfa),
-        static_cast<const ElementScale*>(b_scales_ptrs),
-        static_cast<const StrideScale*>(layout_sfb),
-        static_cast<const StrideC*>(stride_c),
-        static_cast<ElementOutput*>(out_ptrs),
-        static_cast<const StrideD*>(stride_d),
-        static_cast<const UnderlyingProblemShape*>(problem_sizes),
+        static_cast<UnderlyingProblemShape*>(const_cast<void*>(problem_sizes)),
         num_experts);
+
+    // Assemble full arguments from tuple and mainloop/epilogue arguments
+    // Note: Grouped GEMM expects pointer-to-pointer for element arrays and
+    // non-const pointers for stride arrays (one entry per group)
+    gemm_args = typename Gemm::GemmKernel::Arguments{
+        get<0>(args_tuple),  // mode
+        get<1>(args_tuple),  // problem shape
+        typename Gemm::GemmKernel::MainloopArguments{
+            static_cast<const ElementInputA**>(const_cast<void*>(a_ptrs)),
+            static_cast<StrideA*>(const_cast<void*>(stride_a)),
+            static_cast<const ElementInputB**>(const_cast<void*>(b_ptrs)),
+            static_cast<StrideB*>(const_cast<void*>(stride_b)),
+            static_cast<const ElementScale**>(const_cast<void*>(a_scales_ptrs)),
+            static_cast<StrideScale*>(const_cast<void*>(layout_sfa)),
+            static_cast<const ElementScale**>(const_cast<void*>(b_scales_ptrs)),
+            static_cast<StrideScale*>(const_cast<void*>(layout_sfb)),
+            GROUP_SIZE},
+        typename Gemm::GemmKernel::EpilogueArguments{
+            get<2>(args_tuple),  // fusion args
+            nullptr,             // C pointer (not used, beta=0)
+            static_cast<StrideC*>(const_cast<void*>(stride_c)),
+            static_cast<ElementOutput**>(out_ptrs),
+            static_cast<StrideD*>(const_cast<void*>(stride_d))},
+        get<3>(args_tuple),  // hw_info
+        get<4>(args_tuple)   // tile scheduler args
+    };
 
     TORCH_CHECK(
         gemm_op.can_implement(gemm_args) == cutlass::Status::kSuccess,
@@ -290,16 +268,16 @@ void mxfp4_blockwise_scaled_grouped_mm(
       problem_sizes.size(0) == expert_offsets.size(0),
       "Number of experts in problem_sizes must match expert_offsets");
   TORCH_CHECK(problem_sizes.scalar_type() == torch::kInt32, "problem_sizes must be int32");
-  
+
   // MXFP4 data is packed as uint8 (two 4-bit values per byte)
   TORCH_CHECK(a.scalar_type() == torch::kUInt8, "a must be uint8 (packed MXFP4 E2M1)");
   TORCH_CHECK(b.scalar_type() == torch::kUInt8, "b must be uint8 (packed MXFP4 E2M1)");
   TORCH_CHECK(output.scalar_type() == torch::kFloat32, "output must be float32");
-  
+
   // Scales are UE8M0 format (unsigned 8-bit exponent-only), stored as uint8
   TORCH_CHECK(scales_a.scalar_type() == torch::kUInt8, "scales_a must be uint8 (UE8M0)");
   TORCH_CHECK(scales_b.scalar_type() == torch::kUInt8, "scales_b must be uint8 (UE8M0)");
-  
+
   TORCH_CHECK(stride_a.scalar_type() == torch::kInt64, "stride_a must be int64");
   TORCH_CHECK(stride_b.scalar_type() == torch::kInt64, "stride_b must be int64");
   TORCH_CHECK(stride_c.scalar_type() == torch::kInt64, "stride_c must be int64");

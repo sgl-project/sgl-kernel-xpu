@@ -148,6 +148,48 @@ def fp8_blockwise_scaled_grouped_mm(
     )
 
 
+def mxfp4_blockwise_scaled_grouped_mm(
+    output,
+    a_ptrs,
+    b_ptrs,
+    out_ptrs,
+    a_scales_ptrs,
+    b_scales_ptrs,
+    a,
+    b,
+    scales_a,
+    scales_b,
+    stride_a,
+    stride_b,
+    stride_c,
+    layout_sfa,
+    layout_sfb,
+    problem_sizes,
+    expert_offsets,
+    workspace,
+):
+    torch.ops.sgl_kernel.mxfp4_blockwise_scaled_grouped_mm.default(
+        output,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        scales_a,
+        scales_b,
+        stride_a,
+        stride_b,
+        stride_c,
+        layout_sfa,
+        layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace,
+    )
+
+
 def prepare_moe_input(
     topk_ids,
     expert_offsets,

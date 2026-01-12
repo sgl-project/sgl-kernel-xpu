@@ -83,6 +83,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, Tensor? factors) -> ()");
   m.impl("apply_shuffle_mul_sum", torch::kXPU, &apply_shuffle_mul_sum);
 
+  m.def(
+      "fp8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? bias) "
+      "-> Tensor");
+  m.impl("fp8_scaled_mm", torch::kXPU, &fp8_scaled_mm);
+
   /*
    * From cutlass attention
    */

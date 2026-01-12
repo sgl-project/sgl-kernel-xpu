@@ -115,6 +115,38 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    bool?    pack_gqa,"
       "    int      sm_margin) -> Tensor[]");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
+  /*
+   * From cutlass attention
+   */
+  m.def(
+      "flash_decode(Tensor!  q,"
+      "    Tensor   k,"
+      "    Tensor   v,"
+      "    Tensor?  q_v,"
+      "    Tensor  cu_seqlens_q,"
+      "    Tensor  cu_seqlens_k,"
+      "    int     max_seqlen_q,"
+      "    Tensor  page_table,"
+      "    Tensor?  kv_batch_idx,"
+      "    Tensor?  leftpad_k,"
+      "    Tensor?  rotary_cos,"
+      "    Tensor?  rotary_sin,"
+      "    Tensor?  seqlens_rotary,"
+      "    Tensor?  q_descale,"
+      "    Tensor?  k_descale,"
+      "    Tensor?  v_descale,"
+      "    float    softmax_scale,"
+      "    Tensor?  sinks,"
+      "    bool     is_causal,"
+      "    int      window_size_left,"
+      "    int      window_size_right,"
+      "    float    softcap,"
+      "    bool     is_rotary_interleaved,"
+      "    Tensor?  scheduler_metadata,"
+      "    int      num_splits,"
+      "    bool?    pack_gqa,"
+      "    int      sm_margin) -> Tensor[]");
+  m.impl("flash_decode", torch::kXPU, make_pytorch_shim(&flash_decode));
 }
 
 REGISTER_EXTENSION(common_ops)

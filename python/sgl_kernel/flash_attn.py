@@ -26,7 +26,10 @@ def is_fa3_supported(device=None) -> bool:
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
-def flash_attn_extended( q,
+
+
+def flash_attn_extended(
+    q,
     k_cache,
     v_cache,
     k=None,
@@ -60,7 +63,9 @@ def flash_attn_extended( q,
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
 
-def flash_attn_decode( q,
+
+def flash_attn_decode(
+    q,
     k_cache,
     v_cache,
     k=None,
@@ -93,7 +98,6 @@ def flash_attn_decode( q,
 ):
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
-
 
 
 def flash_attn_with_kvcache(

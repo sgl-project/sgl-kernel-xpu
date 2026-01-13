@@ -328,9 +328,9 @@ def triton_per_token_group_quant_8bit(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the scaling factor for quantization.
     """
-    assert x.shape[-1] % group_size == 0, (
-        "the last dimension of `x` cannot be divisible by `group_size`"
-    )
+    assert (
+        x.shape[-1] % group_size == 0
+    ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
     if dtype == torch.int8:

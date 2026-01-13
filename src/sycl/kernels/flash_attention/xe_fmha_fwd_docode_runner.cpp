@@ -31,25 +31,24 @@
  **************************************************************************************************/
 #pragma once
 
+#include <cute/tensor.hpp>
+#include <random>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/util/GPU_Clock.hpp"
+#include "cutlass/util/command_line.h"
+#include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
+#include "cutlass/util/reference/device/gemm_complex.h"
+#include "cutlass/util/reference/device/tensor_compare.h"
+#include "cutlass/util/sycl_event_manager.hpp"
 #include "flash_attention_v2/collective/fmha_fusion.hpp"
 #include "flash_attention_v2/kernel/xe_fhma_fwd_kernel.hpp"
 #include "flash_attention_v2/kernel/xe_tile_scheduler.hpp"
-#include "cutlass/util/GPU_Clock.hpp"
-#include "cutlass/util/sycl_event_manager.hpp"
-#include <cute/tensor.hpp>
-#include <random>
-
 #include "helper.h"
-#include "cutlass/util/command_line.h"
-#include "cutlass/util/device_memory.h"
-#include "cutlass/util/reference/device/gemm_complex.h"
-#include "cutlass/util/reference/device/tensor_compare.h"
 #include "sycl_common.hpp"
-
-#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 using namespace cute;
 
@@ -97,8 +96,8 @@ struct Arguments {
   int dv, dv_rounded;  // For the case where V headdim is different from Q/K headdim
 
   // The scaling factors for the kernel.
-  float scale_softmax;
-  void* sink_softmax;
+  float softmax_scale;
+  void* softmax_sink_ptr;
   float softcap;
 
   // array of length b+1 holding starting offset of each sequence.
@@ -199,7 +198,6 @@ using LayoutO = cutlass::layout::RowMajor;
 
 template <class FMHAKernel, bool isVarLen = false>
 struct KernelRunner {
-
   using StrideQ = typename FMHAKernel::StrideQ;
   using StrideK = typename FMHAKernel::StrideK;
   using StrideV = typename FMHAKernel::StrideV;
@@ -253,7 +251,7 @@ struct KernelRunner {
   // Methods
   //
 
-  template<class ProblemShape>
+  template <class ProblemShape>
   auto initialize_varlen(const ProblemShape& problem_size) {
     int num_batches = get<0>(problem_size);
 
@@ -277,7 +275,7 @@ struct KernelRunner {
   }
 
   /// Initialize operands to be used in the GEMM and reference GEMM
-  ProblemShapeType initialize(const Arguments &params) {
+  ProblemShapeType initialize(const Arguments& params) {
     int q_group_size = params.h / params.h_k;
     auto problem_shape_in = cute::make_tuple(
         params.b,
@@ -297,7 +295,8 @@ struct KernelRunner {
       problem_size = problem_shape_init;
       shape = problem_shape_launch;
     } else {
-      // problem_size = problem_shape_in;
+      problem_size = problem_shape_in;
+      shape = problem_shape_in;
       // shape.batch        = params.batch;
       // shape.num_heads_q  = params.num_heads_q;
       // shape.num_heads_kv = params.num_heads_kv;
@@ -308,94 +307,33 @@ struct KernelRunner {
       // shape.head_size_vo = params.head_size_vo;
     }
 
-    auto [batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, head_size_qk, head_size_vo] = problem_size;
-    auto shape_Q = cute::make_shape(seq_len_qo, head_size_qk, num_heads_q,  batch);
-    auto shape_K = cute::make_shape(seq_len_kv, head_size_qk, num_heads_kv, batch);
-    auto shape_V = cute::make_shape(head_size_vo, seq_len_kv, num_heads_kv, batch);
-    auto shape_K_cache = cute::make_shape(seq_len_kv_cache, head_size_qk, num_heads_kv, batch);
-    auto shape_V_cache = cute::make_shape(head_size_vo, seq_len_kv_cache, num_heads_kv, batch);
-    auto shape_O = cute::make_shape(seq_len_qo, head_size_vo, num_heads_q,  batch);
-
-    stride_Q = cutlass::make_cute_packed_stride(StrideQ{}, shape_Q);
-    stride_K = cutlass::make_cute_packed_stride(StrideK{}, shape_K);
-    stride_V = cutlass::make_cute_packed_stride(StrideV{}, shape_V);
-    stride_K_cache = cutlass::make_cute_packed_stride(StrideK{}, shape_K_cache);
-    stride_V_cache = cutlass::make_cute_packed_stride(StrideV{}, shape_V_cache);
-    stride_O = cutlass::make_cute_packed_stride(StrideO{}, shape_O);
-
-    block_Q.reset(static_cast<std::size_t>(batch) * num_heads_q * seq_len_qo * head_size_qk);
-    block_K.reset(static_cast<std::size_t>(batch) * num_heads_kv * seq_len_kv * head_size_qk);
-    block_V.reset(static_cast<std::size_t>(batch) * num_heads_kv * seq_len_kv * head_size_vo);
-    block_K_cache.reset(static_cast<std::size_t>(batch) * num_heads_kv * seq_len_kv_cache * head_size_qk);
-    block_V_cache.reset(static_cast<std::size_t>(batch) * num_heads_kv * seq_len_kv_cache * head_size_vo);
-    block_O.reset(static_cast<std::size_t>(batch) * num_heads_q * seq_len_qo * head_size_vo);
-    block_ref_O.reset(static_cast<std::size_t>(batch) * num_heads_q * seq_len_qo * head_size_vo);
-    // Zero-initialize output buffer for the kernel result
-    // block_ref_O is fully written in verify() before being read, so no initialization needed
-    compat::memset(block_O.get(), 0, block_O.size() * sizeof(ElementO));
-    if (params.use_paged_kv) {
-      paged_kv_cache.page_size = params.page_size;
-      std::vector<int> num_pages_per_seq{0};
-      int num_pages = 0;
-      for(int b = 0; b < shape.batch; b++) {
-        int seq_len_cache = isVarLen ? cumulative_seqlen_kv_cache[b + 1] - cumulative_seqlen_kv_cache[b] : seq_len_kv_cache;
-        int pages_per_seq = ceil_div(seq_len_cache, paged_kv_cache.page_size);
-        num_pages_per_seq.push_back(num_pages_per_seq.back() + pages_per_seq);
-        num_pages += pages_per_seq;
-      }
-      paged_kv_cache.page_table.reset(num_pages);
-
-      // initialize block table with random mapping for non-contiguous layout
-      std::vector<int> page_mapping(num_pages);
-      for (int b = 0; b < shape.batch; ++b) {
-        std::vector<int> physical_pages(num_pages_per_seq[b + 1] - num_pages_per_seq[b]);
-        std::iota(physical_pages.begin(), physical_pages.end(), 0);
-        // shuffle physical pages
-        std::shuffle(physical_pages.begin(), physical_pages.end(), std::mt19937{ std::random_device{}() });
-        for (int blk = 0; blk < physical_pages.size(); ++blk) {
-          int logical_idx = num_pages_per_seq[b] + blk;
-          page_mapping[logical_idx] = physical_pages[blk];
-        }
-      }
-      compat::memcpy(paged_kv_cache.page_table.get(), page_mapping.data(), page_mapping.size() * sizeof(int));
-
-      paged_kv_cache.num_pages_per_seq.reset(num_pages_per_seq.size());
-      compat::memcpy(paged_kv_cache.num_pages_per_seq.get(), num_pages_per_seq.data(), num_pages_per_seq.size() * sizeof(int));
-    }
-
-    initialize_block(block_Q, seed + 2023);
-    initialize_block(block_K, seed + 2022);
-    initialize_block(block_V, seed + 2021);
-    initialize_block(block_K_cache, seed + 2024);
-    initialize_block(block_V_cache, seed + 2025);
-
-    if (!cumulative_seqlen_q.empty()) {
-      device_cumulative_seqlen_q.reset(cumulative_seqlen_q.size());
-      device_cumulative_seqlen_q.copy_from_host(cumulative_seqlen_q.data(), cumulative_seqlen_q.size());
-    }
-
-    if (!cumulative_seqlen_kv.empty()) {
-      device_cumulative_seqlen_kv.reset(cumulative_seqlen_kv.size());
-      device_cumulative_seqlen_kv.copy_from_host(cumulative_seqlen_kv.data(), cumulative_seqlen_kv.size());
-    }
-
-    if (!cumulative_seqlen_kv_cache.empty()) {
-      device_cumulative_seqlen_kv_cache.reset(cumulative_seqlen_kv_cache.size());
-      device_cumulative_seqlen_kv_cache.copy_from_host(cumulative_seqlen_kv_cache.data(), cumulative_seqlen_kv_cache.size());
-    }
+    auto [batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, head_size_qk, head_size_vo] =
+        problem_size;
+    // NHD format
+    stride_Q = cutlass::make_stride(
+        num_heads_q * head_size_qk, Int<1>{}, head_size_qk, head_size_qk * num_heads_q * seq_len_qo);
+    stride_K = cutlass::make_stride(
+        num_heads_kv * head_size_qk, Int<1>{}, head_size_qk, head_size_qk * num_heads_kv * seq_len_kv);
+    stride_V = cutlass::make_stride(
+        Int<1>{}, num_heads_kv * head_size_vo, head_size_vo, head_size_vo * num_heads_kv * seq_len_kv);
+    stride_K_cache = cutlass::make_stride(
+        num_heads_kv * head_size_qk, Int<1>{}, head_size_qk, head_size_qk * num_heads_kv * seq_len_kv_cache);
+    stride_V_cache = cutlass::make_stride(
+        Int<1>{}, num_heads_kv * head_size_vo, head_size_vo, head_size_vo * num_heads_kv * seq_len_kv_cache);
+    stride_O = cutlass::make_stride(
+        num_heads_q * head_size_vo, Int<1>{}, head_size_vo, head_size_vo * num_heads_q * seq_len_qo);
 
     if constexpr (isVarLen) {
-      shape.seq_len_qo.cumulative_length = device_cumulative_seqlen_q.get();
-      shape.seq_len_kv.cumulative_length = device_cumulative_seqlen_kv.get();
-      shape.seq_len_kv_cache.cumulative_length = device_cumulative_seqlen_kv_cache.get();
+      shape.seq_len_qo.cumulative_length = params.cu_seqlens_q;
+      shape.seq_len_kv.cumulative_length = params.cu_seqlens_knew;
+      shape.seq_len_kv_cache.cumulative_length = params.cu_seqlens_k;
     }
     return shape;
   }
 
   // Note that the GemmUniversalAdapter currently doesn't support flash attention, which is why this
   // secondary `run` function is required to launch the kernel.
-  static void run(typename FMHAKernel::Params params)
-  {
+  static void run(typename FMHAKernel::Params params) {
     namespace syclex = sycl::ext::oneapi::experimental;
     namespace intelex = sycl::ext::intel::experimental;
 
@@ -409,51 +347,48 @@ struct KernelRunner {
     const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
 
     // Launch parameters depend on whether SYCL compiler supports work-group scratch memory extension
-    compat::experimental::launch_properties launch_props {
-      syclex::work_group_scratch_size(smem_size),
+    compat::experimental::launch_properties launch_props{
+        syclex::work_group_scratch_size(smem_size),
     };
     compat::experimental::kernel_properties kernel_props{
-      syclex::sub_group_size<cute::intel::sg_size>,
-      intelex::grf_size<256>
-    };
+        syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<256>};
     compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
     auto event = compat::experimental::launch<cutlass::device_kernel<FMHAKernel>, FMHAKernel>(policy, params);
 
     EventManager::getInstance().addEvent(event);
   }
 
-  cutlass::Status run(const Arguments &params, const cutlass::KernelHardwareInfo &hw_info) {
-
+  cutlass::Status run(const Arguments& params, const cutlass::KernelHardwareInfo& hw_info) {
     ProblemShapeType shape = initialize(params);
 
     typename FMHAKernel::Arguments arguments{
-      {
-        shape,
-        block_Q.get(), stride_Q,
-        block_K.get(), stride_K,
-        block_V.get(), stride_V,
-        block_O.get(), stride_O,
-        block_K_cache.get(), stride_K_cache,
-        block_V_cache.get(), stride_V_cache,
-      },
-      {
-        params.softmax_scale,
-        params.use_paged_kv ? paged_kv_cache.page_table.get() : nullptr,
-        params.use_paged_kv ? paged_kv_cache.page_size : 0,
-        params.use_paged_kv ? paged_kv_cache.num_pages_per_seq.get() : nullptr
-      },
-      {},
-      hw_info
-    };
+        {
+            shape,
+            static_cast<const ElementQ*>(params.q_ptr),
+            stride_Q,
+            nullptr,
+            stride_K,
+            nullptr,
+            stride_V,
+            static_cast<const ElementOutput*>(params.o_ptr),
+            stride_O,
+            static_cast<const ElementV*>(params.k_ptr),
+            stride_K_cache,
+            static_cast<const ElementV*>(params.v_ptr),
+            stride_V_cache,
+        },
+        {params.softmax_scale, params.page_table, params.page_size, params.max_num_pages_per_seq},
+        {},
+        hw_info};
 
     // Define device-global scratch memory
     size_t workspace_size = FMHAKernel::get_workspace_size(arguments);
     cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
 
     if (!FMHAKernel::can_implement(arguments)) {
-      std::cout << "Invalid Problem Size: " << params.batch << 'x' << params.num_heads_q << 'x' <<
-        params.seq_len_qo << 'x' << params.seq_len_kv << 'x' << params.head_size_qk << 'x'  << params.head_size_vo
-        << (params.is_causal ? "xCausal" : "xNonCausal") << std::endl;
+      std::cout << "Invalid Problem Size: " << params.batch << 'x' << params.num_heads_q << 'x' << params.seq_len_qo
+                << 'x' << params.seq_len_kv << 'x' << params.head_size_qk << 'x' << params.head_size_vo
+                << (params.is_causal ? "xCausal" : "xNonCausal") << std::endl;
       return cutlass::Status::kErrorInvalidProblem;
     }
 
@@ -469,43 +404,46 @@ struct KernelRunner {
   }
 };
 
-template <bool Causal,
-          typename TileShapeQK,
-          typename TileShapePV,
-          typename TileShapeOutput,
-          typename SubgroupLayoutQK,
-          typename SubgroupLayoutPV_,      /* void -> default */
-          int PipelineStages,
-          bool persistent,
-          typename ElementQ = bfloat16_t,
-          typename ElementK = bfloat16_t,
-          typename ElementV = bfloat16_t,
-          typename ElementO = float,
-          typename MMAOperation_ = void,    /* void -> default */
-          typename StrideQ = Stride<int, _1, int, int>,
-          typename StrideK = Stride<int, _1, int, int>,
-          typename StrideV = Stride<_1, int, int, int>,
-          typename StrideO = Stride<int, _1, int, int>,
-          typename GmemTiledCopyQ = void,   /* void -> default block 2D */
-          typename GmemTiledCopyK = void,
-          typename GmemTiledCopyV = void,
-          typename GmemTiledCopyO = void>
+template <
+    bool Causal,
+    bool LocalMask,
+    bool Sink,
+    typename TileShapeQK,
+    typename TileShapePV,
+    typename TileShapeOutput,
+    typename SubgroupLayoutQK,
+    typename SubgroupLayoutPV_ = void, /* void -> default */
+    int PipelineStages = 1,
+    bool persistent = false,
+    typename ElementQ = bfloat16_t,
+    typename ElementK = bfloat16_t,
+    typename ElementV = bfloat16_t,
+    typename ElementO = float,
+    typename MMAOperation_ = void, /* void -> default */
+    typename StrideQ = Stride<int, _1, int, int>,
+    typename StrideK = Stride<int, _1, int, int>,
+    typename StrideV = Stride<_1, int, int, int>,
+    typename StrideO = Stride<int, _1, int, int>,
+    typename GmemTiledCopyQ = void, /* void -> default block 2D */
+    typename GmemTiledCopyK = void,
+    typename GmemTiledCopyV = void,
+    typename GmemTiledCopyO = void>
 struct FMHAConfig {
-
   static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
-  using MMAOperation = cute::conditional_t<is_void_v<MMAOperation_>,
-                                           typename cute::conditional_t<
-                                               cute::is_same_v<ElementQ, cutlass::float_e5m2_t> || cute::is_same_v<ElementQ, cutlass::float_e4m3_t>,
-                                               XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, half_t>,
-                                               XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, ElementQ>
-                                           >,
-                                           MMAOperation_>;
-  using SubgroupLayoutPV = cute::conditional_t<is_void_v<SubgroupLayoutPV_>,
-                                               decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{})),
-                                               SubgroupLayoutPV_>;
+  using MMAOperation = cute::conditional_t<
+      is_void_v<MMAOperation_>,
+      typename cute::conditional_t<
+          cute::is_same_v<ElementQ, cutlass::float_e5m2_t> || cute::is_same_v<ElementQ, cutlass::float_e4m3_t>,
+          XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, half_t>,
+          XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, ElementQ>>,
+      MMAOperation_>;
+  using SubgroupLayoutPV = cute::conditional_t<
+      is_void_v<SubgroupLayoutPV_>,
+      decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{})),
+      SubgroupLayoutPV_>;
 
   template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
-  static int run(const Arguments &params) {
+  static int run(const Arguments& params) {
     //
     // Run examples
     //
@@ -520,13 +458,13 @@ struct FMHAConfig {
     using TiledMMAQK = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<TileShapeQK>, SubgroupLayoutQK>::TiledMMA;
     using TiledMMAPV = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<TileShapePV>, SubgroupLayoutPV>::TiledMMA;
 
-    static_assert(get<0>(TileShapeOutput{}) == get<0>(TileShapePV{}),
+    static_assert(
+        get<0>(TileShapeOutput{}) == get<0>(TileShapePV{}),
         "Output tile and P*V tile have different sizes in Q dimension");
     constexpr int VTiles = get<1>(TileShapeOutput{}) / get<1>(TileShapePV{});
 
     auto make_dummy_tensor = [&](auto val, auto stride) {
-      return make_tensor(make_gmem_ptr(&val),
-                         make_layout(repeat<rank_v<decltype(stride)>>(1), stride));
+      return make_tensor(make_gmem_ptr(&val), make_layout(repeat<rank_v<decltype(stride)>>(1), stride));
     };
 
     using TensorQ = decltype(make_dummy_tensor(ElementQ{}, StrideQ{}));
@@ -541,29 +479,34 @@ struct FMHAConfig {
     // Mainloop
     using MainloopDispatchPolicy = cutlass::fmha::XeDefault<PipelineStages>;
     using CollectiveMainloop = cutlass::fmha::collective::FMHAFwdMainloop<
-        MainloopDispatchPolicy, Causal, CachedKV, PagedKV,
-        TiledMMAQK, TiledMMAPV, VTiles,
-        TensorQ, TensorK, TensorV,
-        TensorK_cache, TensorV_cache,
-        GmemTiledCopyQ, GmemTiledCopyK, GmemTiledCopyV,
-        GmemTiledCopyK_cache, GmemTiledCopyV_cache
-    >;
+        MainloopDispatchPolicy,
+        Causal,
+        CachedKV,
+        PagedKV,
+        TiledMMAQK,
+        TiledMMAPV,
+        VTiles,
+        TensorQ,
+        TensorK,
+        TensorV,
+        TensorK_cache,
+        TensorV_cache,
+        GmemTiledCopyQ,
+        GmemTiledCopyK,
+        GmemTiledCopyV,
+        GmemTiledCopyK_cache,
+        GmemTiledCopyV_cache>;
 
     // Epilogue
-    using CollectiveEpilogue = cutlass::fmha::collective::FMHAFwdEpilogue<
-        CollectiveMainloop,
-        TileShapeOutput,
-        TensorO,
-        GmemTiledCopyO
-    >;
+    using CollectiveEpilogue =
+        cutlass::fmha::collective::FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO>;
 
     static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
-    using FMHAKernel = conditional_t<is_same_v<Scheduler, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>,
-      cutlass::fmha::kernel::XeFMHAFwdDynamicSplitKernel<
-        ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>,
-        cutlass::fmha::kernel::XeFMHAFwdKernel<
-        ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>
-        >;
+    using FMHAKernel = conditional_t<
+        is_same_v<Scheduler, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>,
+        cutlass::fmha::kernel::
+            XeFMHAFwdDynamicSplitKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>,
+        cutlass::fmha::kernel::XeFMHAFwdKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>>;
 
     KernelRunner<FMHAKernel, isVarLen> kernel;
 
@@ -571,11 +514,353 @@ struct FMHAConfig {
     return 0;
   }
 
-  static int run(const Arguments &params) {
+  static int run(const Arguments& params) {
     if (params.page_table != nullptr && params.cu_seqlens_k != nullptr) {
-        return run<true, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+      return run<true, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
     } else {
       return 0;
     }
   }
 };
+
+std::vector<at::Tensor> mha_fwd(
+    at::Tensor& q,        // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
+    const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
+                          // h_k, d) if there is page_table.
+    const at::Tensor& v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages,
+                          // page_size, h_k, dv) if there is page_table.
+    std::optional<const at::Tensor>& q_v_,  // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
+    const at::Tensor& cu_seqlens_q,         // b+1
+    const at::Tensor& cu_seqlens_k,         // b+1
+    int max_seqlen_q,
+    const at::Tensor& page_table,                      // (b_k, max_num_pages_per_seq)
+    std::optional<const at::Tensor>& kv_batch_idx_,    // b. indices to index into the KV cache
+    std::optional<const at::Tensor>& leftpad_k_,       // b
+    std::optional<const at::Tensor>& rotary_cos_,      // seqlen_ro x (rotary_dim / 2)
+    std::optional<const at::Tensor>& rotary_sin_,      // seqlen_ro x (rotary_dim / 2)
+    std::optional<const at::Tensor>& seqlens_rotary_,  // b
+    std::optional<at::Tensor>& q_descale_,             // (b, h_k), not (b, h)
+    std::optional<at::Tensor>& k_descale_,             // (b, h_k)
+    std::optional<at::Tensor>& v_descale_,             // (b, h_k)
+    const float softmax_scale_,
+    std::optional<const at::Tensor>& sinks_,
+    bool is_causal,
+    int window_size_left,
+    int window_size_right,
+    float const softcap,
+    bool const is_rotary_interleaved,  // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
+    std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
+    int num_splits,
+    std::optional<bool> pack_gqa_,
+    int const sm_margin) {
+  // TODO: check GPU support
+  // auto dprops = at::cuda::getCurrentDeviceProperties();
+  // TORCH_CHECK(drops->name.find("B580") != std::string::npos, "sgl_kernel_xpu only supports BMG+");
+
+  auto q_type = q.scalar_type();
+  TORCH_CHECK(
+      q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
+      "SGL Kernel XPU only supports fp16 and bf16 type");
+
+  TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
+  TORCH_CHECK(v.scalar_type() == q_type, "query and value must have the same dtype");
+
+  CHECK_DEVICE(q);
+  CHECK_DEVICE(k);
+  CHECK_DEVICE(v);
+
+  TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+  TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+  TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+
+  CHECK_DEVICE(page_table);
+  TORCH_CHECK(page_table.dtype() == torch::kInt32, "page_table must have dtype torch.int32");
+  TORCH_CHECK(page_table.stride(-1) == 1, "page_table must have contiguous last dimension");
+
+  TORCH_CHECK(q.dim() == 3, "query must be in ragged format");
+  CHECK_DEVICE(cu_seqlens_q);
+  CHECK_CONTIGUOUS(cu_seqlens_q);
+  TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype torch.int32");
+
+  CHECK_DEVICE(cu_seqlens_k);
+  CHECK_CONTIGUOUS(cu_seqlens_k);
+  TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype torch.int32");
+
+  auto const sizes = q.sizes();
+  const int batch_size = cu_seqlens_q.size(0) - 1;
+  int seqlen_q = max_seqlen_q;
+  int total_q = q.size(0);
+  int num_heads = q.size(-2);
+  int const head_size = q.size(-1);
+  int const head_size_v = v.size(-1);
+  int const max_num_pages_per_seq = page_table.size(1);
+  int const num_pages = k.size(0);
+  int const page_size = k.size(1);
+  int const seqlen_k = max_num_pages_per_seq * page_size;
+  int const total_k = num_pages * page_size;
+  int const num_heads_k = k.size(-2);
+  int const batch_size_k = page_table.size(0);
+  float softmax_scale = softmax_scale_;
+
+  if (!kv_batch_idx_.has_value()) {
+    TORCH_CHECK(batch_size == batch_size_k, "batch_size must be equal to batch_size_k");
+  }
+
+  // Currently only support head dims <= 256
+  static constexpr int max_headdim = 256;
+  TORCH_CHECK(
+      head_size <= max_headdim,
+      "FlashAttention forward only supports head dimension at most " + std::to_string(max_headdim));
+  TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+
+  // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
+  // TODO: check this
+
+  if (window_size_left >= seqlen_k - 1) {
+    window_size_left = -1;
+  }
+  window_size_right = min(window_size_right, seqlen_q);
+  // causal=true is the same as causal=false in this case
+  if (is_causal) {
+    window_size_right = 0;
+  }
+
+  CHECK_SHAPE(k, num_pages, page_size, num_heads_k, head_size);
+  CHECK_SHAPE(v, num_pages, page_size, num_heads_k, head_size_v);
+  CHECK_SHAPE(page_table, batch_size_k, max_num_pages_per_seq);
+
+  if (leftpad_k_.has_value()) {
+    auto leftpad_k = leftpad_k_.value();
+    TORCH_CHECK(leftpad_k.dtype() == torch::kInt32, "leftpad_k must have dtype int32");
+    CHECK_DEVICE(leftpad_k);
+    CHECK_CONTIGUOUS(leftpad_k);
+    CHECK_SHAPE(leftpad_k, batch_size);
+  }
+
+  static constexpr int alignment = 8;
+  TORCH_CHECK(head_size % alignment == 0, "head_size should be a multiple of " + std::to_string(alignment));
+  TORCH_CHECK(head_size_v % alignment == 0, "head_size_v should be a multiple of " + std::to_string(alignment));
+
+  auto opts = q.options();
+  at::Tensor out;
+  out = torch::empty({total_q, num_heads, head_size_v}, opts);
+
+  auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+  int const head_size_rounded = round_up_headdim(head_size);
+  int const head_size_v_rounded = head_size_v == head_size ? head_size_rounded : round_up_headdim(head_size_v);
+  int const seqlen_q_rounded = round_multiple(seqlen_q, 128);
+  int const seqlen_k_rounded = round_multiple(seqlen_k, 128);
+
+  // Otherwise the kernel will be launched from cuda:0 device
+  // Cast to char to avoid compiler warning about narrowing
+  c10::DeviceGuard device_guard(q.device());
+
+  at::Tensor softmax_lse;
+  softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
+
+  // align with FA3
+  Flash_fwd_params params;
+  params.is_bf16 = q.dtype() == torch::kBFloat16;
+
+  // Set the pointers and strides.
+  params.q_ptr = q.data_ptr();
+  params.k_ptr = k.data_ptr();
+  params.v_ptr = v.data_ptr();
+  // All stride are in elements, not bytes.
+  params.q_row_stride = q.stride(-3);
+  params.k_row_stride = k.stride(-3);
+  params.v_row_stride = v.stride(-3);
+  params.q_head_stride = q.stride(-2);
+  params.k_head_stride = k.stride(-2);
+  params.v_head_stride = v.stride(-2);
+  params.v_dim_stride = v.stride(-1);
+  params.o_ptr = out.data_ptr();
+  params.o_row_stride = out.stride(-3);
+  params.o_head_stride = out.stride(-2);
+
+  params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
+  params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
+
+  // Softmax sum
+  params.softmax_lse_ptr = softmax_lse.data_ptr();
+
+  // Set the dimensions.
+  params.b = batch_size;
+  params.h = num_heads;
+  params.h_k = num_heads_k;
+  params.seqlen_q = seqlen_q;
+  params.seqlen_k = seqlen_k;
+  params.seqlen_q_rounded = seqlen_q_rounded;
+  params.seqlen_k_rounded = seqlen_k_rounded;
+  params.d = head_size;
+  params.d_rounded = head_size_rounded;
+
+  // Set the different scale values.
+  params.scale_softmax = softmax_scale;
+  bool use_sink = sinks_.has_value();
+  params.sink_softmax = use_sink ? sinks_.value().data_ptr() : nullptr;
+
+  params.softcap = softcap;
+
+  // Set this to probability of keeping an element to simplify things.
+  params.p_dropout = 1.f;
+
+  // Causal is the special case where window_size_right == 0 and window_size_left < 0.
+  // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
+  params.is_causal = window_size_left < 0 && window_size_right == 0;
+  params.is_local = (window_size_left >= 0 || window_size_right >= 0) && !params.is_causal;
+
+  // TODO: check this
+  if (window_size_left < 0) {
+    window_size_left = seqlen_k - 1;
+  }
+  if (window_size_right < 0) {
+    window_size_right = seqlen_q - 1;
+  }
+  params.window_size_left = window_size_left;
+  params.window_size_right = window_size_right;
+  params.total_q = total_q;
+  params.total_k = total_k;
+  params.b_k = batch_size_k;
+  params.dv = head_size_v;
+  params.page_table = page_table.data_ptr<int>();
+  params.page_table_batch_stride = page_table.stride(0);
+  params.max_num_pages_per_seq = max_num_pages_per_seq;
+  params.page_size = page_size;
+  params.num_pages = num_pages;
+
+  if (q_v_.has_value()) {
+    TORCH_CHECK(head_size <= 64, "q_v is only supported for head_size <= 64");
+    TORCH_CHECK(
+        q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
+        "q_v is only supported for fp16 and bf16 data type");
+    TORCH_CHECK(false, "q_v is not supported yet");
+    at::Tensor q_v = q_v_.value();
+    TORCH_CHECK(q_v.dtype() == q_type, "q_v must have the same dtype as query");
+    CHECK_DEVICE(q_v);
+    TORCH_CHECK(q_v.stride(-1) == 1, "q_v tensor must have contiguous last dimension");
+    CHECK_SHAPE(q_v, total_q, num_heads, head_size_v);
+    params.qv_ptr = q_v.data_ptr();
+    // All stride are in elements, not bytes.
+    params.qv_row_stride = q_v.stride(-3);
+    params.qv_head_stride = q_v.stride(-2);
+  }
+
+  if (rotary_cos_.has_value()) {
+    auto rotary_cos = rotary_cos_.value();
+    CHECK_DEVICE(rotary_cos);
+    CHECK_CONTIGUOUS(rotary_cos);
+    params.rotary_dim = rotary_cos.size(1) * 2;
+    TORCH_CHECK(params.rotary_dim <= head_size, "rotary_dim must be <= headdim");
+    TORCH_CHECK(params.rotary_dim % 16 == 0, "Only rotary dimensions divisible by 16 are currently supported");
+    const int seqlen_ro = rotary_cos.size(0);
+    TORCH_CHECK(seqlen_ro >= seqlen_k, "cos/sin seqlen must be at least the seqlen of KV cache");
+    CHECK_SHAPE(rotary_cos, seqlen_ro, params.rotary_dim / 2);
+    TORCH_CHECK(rotary_cos.scalar_type() == q_type, "rotary_cos must have the same dtype as query");
+
+    TORCH_CHECK(rotary_sin_.has_value(), "If rotary cos is provided, rotary sin must also be provided");
+    auto rotary_sin = rotary_sin_.value();
+    CHECK_DEVICE(rotary_sin);
+    CHECK_CONTIGUOUS(rotary_sin);
+    CHECK_SHAPE(rotary_sin, seqlen_ro, params.rotary_dim / 2);
+    TORCH_CHECK(rotary_sin.scalar_type() == q_type, "rotary_cos must have the same dtype as query");
+    params.rotary_cos_ptr = rotary_cos.data_ptr();
+    params.rotary_sin_ptr = rotary_sin.data_ptr();
+    params.is_rotary_interleaved = is_rotary_interleaved;
+    if (seqlens_rotary_.has_value()) {
+      at::Tensor seqlens_rotary = seqlens_rotary_.value();
+      CHECK_DEVICE(seqlens_rotary);
+      CHECK_CONTIGUOUS(seqlens_rotary);
+      TORCH_CHECK(seqlens_rotary.dtype() == torch::kInt32, "seqlens_rotary must have dtype torch.int32");
+      CHECK_SHAPE(seqlens_rotary, batch_size);
+      params.seqlens_rotary = seqlens_rotary.data_ptr<int>();
+    }
+  } else {
+    params.rotary_dim = 0;
+  }
+
+  if (kv_batch_idx_.has_value()) {
+    auto kv_batch_idx = kv_batch_idx_.value();
+    CHECK_DEVICE(kv_batch_idx);
+    CHECK_CONTIGUOUS(kv_batch_idx);
+    TORCH_CHECK(kv_batch_idx.scalar_type() == torch::kInt32, "kv_batch_idx must have dtype int32");
+    params.kv_batch_idx = reinterpret_cast<int*>(kv_batch_idx.data_ptr());
+  }
+
+  params.tensor_opts = torch::TensorOptions().dtype(torch::kUInt8).device(q.device());
+
+  int qgroup_size = params.h / params.h_k;
+  at::Tensor out_accum, softmax_lse_accum;
+  auto outaccum_type = at::ScalarType::Float;
+
+  constexpr bool Causal = true;
+#define NUM_SG _8
+#define KV_TILE_SIZE _512
+#define FMHA_FWD_KERNEL(QG_SZ, HEAD_DIM)                                \
+  AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {                          \
+    if (params.is_causal) {                                             \
+      FMHAConfig<                                                       \
+          Causal,                                                       \
+          false,                                                        \
+          Sink,                                                         \
+          cute::Shape<_##QG_SZ, KV_TILE_SIZE, _64>,                     \
+          cute::Shape<_##QG_SZ, _32, KV_TILE_SIZE>,                     \
+          cute::Shape<_##QG_SZ, _##HEAD_DIM>,                           \
+          cute::Layout<cute::Shape<_1, NUM_SG, _1>>>::run(params);      \
+    } else {                                                            \
+      AT_DISPATCH_BOOL_NO_RETURN(                                       \
+          params.is_local,                                              \
+          LocalMask,                                                    \
+          FMHAConfig<                                                   \
+              LocalMask,                                                \
+              Sink,                                                     \
+              false,                                                    \
+              cute::Shape<_##QG_SZ, KV_TILE_SIZE, _64>,                 \
+              cute::Shape<_##QG_SZ, _32, KV_TILE_SIZE>,                 \
+              cute::Shape<_##QG_SZ, _##HEAD_DIM>,                       \
+              cute::Layout<cute::Shape<_1, NUM_SG, _1>>>::run(params)); \
+    }                                                                   \
+  })
+
+  switch (params.d) {
+    case 128: {
+      switch (qgroup_size) {
+        case 1:
+          FMHA_FWD_KERNEL(1, 128);
+          break;
+        case 2:
+          FMHA_FWD_KERNEL(2, 128);
+          break;
+        case 4:
+          FMHA_FWD_KERNEL(4, 128);
+          break;
+        case 8:
+          FMHA_FWD_KERNEL(8, 128);
+          break;
+      }
+      break;
+    }
+    case 64: {
+      switch (qgroup_size) {
+        case 1:
+          FMHA_FWD_KERNEL(1, 64);
+          break;
+        case 2:
+          FMHA_FWD_KERNEL(2, 64);
+          break;
+        case 4:
+          FMHA_FWD_KERNEL(4, 64);
+          break;
+        case 8:
+          FMHA_FWD_KERNEL(8, 64);
+          break;
+      }
+      break;
+    }
+
+    default:
+      TORCH_CHECK(false, "Unsupported head size for causal attention");
+  }
+#undef FMHA_FWD_KERNEL
+  return {out, softmax_lse, out_accum, softmax_lse_accum};
+}

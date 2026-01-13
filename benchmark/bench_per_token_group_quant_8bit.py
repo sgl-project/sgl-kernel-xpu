@@ -206,7 +206,7 @@ def calculate_flops(
     Per group: 6 FLOPs (4 reduction fmax, 2 scale divisions)
     """
     flops_per_element = 5  # 2 for absmax + 3 for quantization
-    flops_per_group = 6    # 4 for reduction + 2 for scale calculation
+    flops_per_group = 6  # 4 for reduction + 2 for scale calculation
 
     total_flops = (num_elements * flops_per_element) + (num_groups * flops_per_group)
 
@@ -230,9 +230,9 @@ def calculate_effective_bandwidth(
     num_elements = num_tokens * hidden_dim
     num_groups = num_elements // group_size
 
-    input_bytes = num_elements * 2      # bf16
-    output_bytes = num_elements * 1     # int8/fp8
-    scale_bytes = num_groups * 4        # fp32
+    input_bytes = num_elements * 2  # bf16
+    output_bytes = num_elements * 1  # int8/fp8
+    scale_bytes = num_groups * 4  # fp32
     total_bytes = input_bytes + output_bytes + scale_bytes
 
     time_s = time_ms / 1000.0

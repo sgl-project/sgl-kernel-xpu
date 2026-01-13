@@ -184,7 +184,7 @@ class TestPerTokenGroupQuantXPU:
         scale_ue8m0,
     ):
         """Test per-token group quantization with various configurations.
-        NOTE: This test doesn't enable any ue8m0 scales because it failes a check in fp8_kernel.py fo
+        NOTE: This test doesn't enable any ue8m0 scales because it fails a check in fp8_kernel.py for
         scale_tma_aligned = True"""
         self._test_against_reference(
             num_tokens,

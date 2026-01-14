@@ -12,16 +12,7 @@ try:
 except (ImportError, AttributeError):
     HAS_XPU = False
 
-try:
-    from sglang.srt.layers.quantization.fp8_kernel import (
-        per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
-    )
-
-    HAS_TRITON = True
-except ImportError:
-    HAS_TRITON = False
-
-from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
+from sgl_kernel import sgl_per_token_group_quant_8bit
 
 
 def ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
@@ -99,7 +90,7 @@ class TestPerTokenGroupQuantXPU:
             )
 
         # Run XPU implementation
-        x_q_xpu, scales_xpu = sglang_per_token_group_quant_8bit(
+        x_q_xpu, scales_xpu = sgl_per_token_group_quant_8bit(
             x=x_xpu,
             masked_m=None,
             group_size=group_size,
@@ -201,7 +192,7 @@ class TestPerTokenGroupQuantXPU:
         torch.manual_seed(42)
         x = torch.randn(64, 512, dtype=torch.bfloat16) * scale_factor
         x_xpu = x.to(self.device)
-        x_q, scales = sglang_per_token_group_quant_8bit(
+        x_q, scales = sgl_per_token_group_quant_8bit(
             x=x_xpu,
             masked_m=None,
             group_size=64,
@@ -450,7 +441,7 @@ def test_per_token_group_quant_with_column_major_fp8(
         scale_tma_aligned=scale_tma_aligned,
     )
 
-    x_q_xpu, x_s_xpu = sglang_per_token_group_quant_8bit(
+    x_q_xpu, x_s_xpu = sgl_per_token_group_quant_8bit(
         x,
         group_size,
         eps=1e-10,
@@ -477,4 +468,4 @@ def test_per_token_group_quant_with_column_major_fp8(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    sys.exit(pytest.main([__file__]))

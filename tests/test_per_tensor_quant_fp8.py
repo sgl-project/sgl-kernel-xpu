@@ -7,12 +7,9 @@ import torch
 import utils
 from sgl_kernel import sgl_per_tensor_quant_fp8
 
-from sglang.srt.utils import is_hip
-
 device = utils.get_device()
 
-_is_hip = is_hip()
-fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
+fp8_type_ = torch.float8_e4m3fn
 
 
 def sglang_scaled_fp8_quant(

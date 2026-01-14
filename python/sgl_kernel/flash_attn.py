@@ -286,7 +286,7 @@ def flash_attn_with_kvcache(
     return (out, softmax_lse, *rest) if return_softmax_lse else out
 
 
-def flash_attn_with_kvcache_decode(
+def flash_attn_decode_with_kvcache(
     q,
     k_cache,
     v_cache,

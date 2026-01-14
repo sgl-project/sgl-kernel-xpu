@@ -793,7 +793,7 @@ std::vector<at::Tensor> mha_fwd(
   at::Tensor out_accum, softmax_lse_accum;
   auto outaccum_type = at::ScalarType::Float;
 
-  constexpr bool Causal = true;
+  constexpr bool Causal = false; // The decode kernel does not support causal mode. It must be set to false.
 #define NUM_SG _8
 #define KV_TILE_SIZE _512
 #define FMHA_FWD_KERNEL(QG_SZ, HEAD_DIM)                                \

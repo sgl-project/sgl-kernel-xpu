@@ -31,10 +31,17 @@
  **************************************************************************************************/
 #pragma once
 
+#include <ATen/ATen.h>
+#include <ATen/Parallel.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/all.h>
+
 #include <cute/tensor.hpp>
 #include <random>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
+#include "../../Utils.h"
+#include "../../comm/common.h"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/util/GPU_Clock.hpp"
@@ -44,11 +51,12 @@
 #include "cutlass/util/reference/device/gemm_complex.h"
 #include "cutlass/util/reference/device/tensor_compare.h"
 #include "cutlass/util/sycl_event_manager.hpp"
-#include "flash_attention_v2/collective/fmha_fusion.hpp"
-#include "flash_attention_v2/kernel/xe_fhma_fwd_kernel.hpp"
-#include "flash_attention_v2/kernel/xe_tile_scheduler.hpp"
-#include "helper.h"
-#include "sycl_common.hpp"
+#include "fmha_fusion.hpp"
+#include "xe_fhma_fwd_kernel.hpp"
+#include "xe_tile_scheduler.hpp"
+
+// #include "helper.h"
+// #include "sycl_common.hpp"
 
 using namespace cute;
 
@@ -252,11 +260,11 @@ struct KernelRunner {
   //
 
   template <class ProblemShape>
-  auto initialize_varlen(const ProblemShape& problem_size) {
+  auto initialize_varlen(const Arguments& params, const ProblemShape& problem_size) {
     int num_batches = get<0>(problem_size);
 
     ProblemShape problem_size_for_init = problem_size;
-    get<0>(problem_size_for_init) = 1;
+    get<0>(problem_size_for_init) = 1;  // concentrated batch
     get<3>(problem_size_for_init) = params.total_q;
     get<4>(problem_size_for_init) = params.total_knew;
     get<5>(problem_size_for_init) = params.total_k;
@@ -265,9 +273,11 @@ struct KernelRunner {
     problem_size_for_launch.batch = get<0>(problem_size);
     problem_size_for_launch.num_heads_q = get<1>(problem_size);
     problem_size_for_launch.num_heads_kv = get<2>(problem_size);
-    problem_size_for_launch.seq_len_qo = cutlass::fmha::collective::VariableLength{max_seqlen_q};
-    problem_size_for_launch.seq_len_kv = cutlass::fmha::collective::VariableLength{max_seqlen_kv};
-    problem_size_for_launch.seq_len_kv_cache = cutlass::fmha::collective::VariableLength{max_seqlen_kv_cache};
+    problem_size_for_launch.seq_len_qo = cutlass::fmha::collective::VariableLength{params.seqlen_q, params.total_q};
+    problem_size_for_launch.seq_len_kv =
+        cutlass::fmha::collective::VariableLength{params.seqlen_knew, params.total_knew};
+    problem_size_for_launch.seq_len_kv_cache =
+        cutlass::fmha::collective::VariableLength{params.seqlen_k, params.total_k};
     problem_size_for_launch.head_size_qk = get<6>(problem_size);
     problem_size_for_launch.head_size_vo = get<7>(problem_size);
 
@@ -276,35 +286,19 @@ struct KernelRunner {
 
   /// Initialize operands to be used in the GEMM and reference GEMM
   ProblemShapeType initialize(const Arguments& params) {
-    int q_group_size = params.h / params.h_k;
     auto problem_shape_in = cute::make_tuple(
-        params.b,
-        params.h / q_group_size,
-        params.h_k,
-        params.seqlen_q * q_group_size,
-        params.seqlen_knew,
-        params.seqlen_k,
-        params.d,
-        params.dv);
+        params.b, params.h, params.h_k, params.seqlen_q, params.seqlen_knew, params.seqlen_k, params.d, params.dv);
     ProblemShapeType shape;
 
     decltype(problem_shape_in) problem_size;
 
     if constexpr (isVarLen) {
-      auto [problem_shape_init, problem_shape_launch] = initialize_varlen(problem_shape_in);
+      auto [problem_shape_init, problem_shape_launch] = initialize_varlen(params, problem_shape_in);
       problem_size = problem_shape_init;
       shape = problem_shape_launch;
     } else {
       problem_size = problem_shape_in;
       shape = problem_shape_in;
-      // shape.batch        = params.batch;
-      // shape.num_heads_q  = params.num_heads_q;
-      // shape.num_heads_kv = params.num_heads_kv;
-      // shape.seq_len_qo   = params.seq_len_qo;
-      // shape.seq_len_kv   = params.seq_len_kv;
-      // shape.seq_len_kv_cache = params.seq_len_kv_cache;
-      // shape.head_size_qk = params.head_size_qk;
-      // shape.head_size_vo = params.head_size_vo;
     }
 
     auto [batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, head_size_qk, head_size_vo] =
@@ -370,7 +364,7 @@ struct KernelRunner {
             stride_K,
             nullptr,
             stride_V,
-            static_cast<const ElementOutput*>(params.o_ptr),
+            static_cast<ElementO*>(params.o_ptr),
             stride_O,
             static_cast<const ElementV*>(params.k_ptr),
             stride_K_cache,
@@ -386,20 +380,20 @@ struct KernelRunner {
     cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
 
     if (!FMHAKernel::can_implement(arguments)) {
-      std::cout << "Invalid Problem Size: " << params.batch << 'x' << params.num_heads_q << 'x' << params.seq_len_qo
-                << 'x' << params.seq_len_kv << 'x' << params.head_size_qk << 'x' << params.head_size_vo
-                << (params.is_causal ? "xCausal" : "xNonCausal") << std::endl;
+      // std::cout << "Invalid Problem Size: " << params.b << 'x' << params.num_heads_q << 'x' << params.seq_len_qo
+      //           << 'x' << params.seq_len_kv << 'x' << params.head_size_qk << 'x' << params.head_size_vo
+      //           << (params.is_causal ? "xCausal" : "xNonCausal") << std::endl;
       return cutlass::Status::kErrorInvalidProblem;
     }
 
     // Initialize the workspace
-    CUTLASS_CHECK(FMHAKernel::initialize_workspace(arguments, workspace.get()));
+    FMHAKernel::initialize_workspace(arguments, workspace.get());
 
     // Convert host-side arguments to device-side arguments to be passed to the kernel
-    auto params = FMHAKernel::to_underlying_arguments(arguments, workspace.get());
+    auto kernel_params = FMHAKernel::to_underlying_arguments(arguments, workspace.get());
 
     // Run
-    run(params);
+    run(kernel_params);
     return cutlass::Status::kSuccess;
   }
 };
@@ -510,20 +504,21 @@ struct FMHAConfig {
 
     KernelRunner<FMHAKernel, isVarLen> kernel;
 
-    CUTLASS_CHECK(kernel.run(params, hw_info));
+    kernel.run(params, hw_info);
     return 0;
   }
 
   static int run(const Arguments& params) {
     if (params.page_table != nullptr && params.cu_seqlens_k != nullptr) {
-      return run<true, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+      // template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
+      return run<true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
     } else {
       return 0;
     }
   }
 };
 
-std::vector<at::Tensor> mha_fwd(
+std::vector<at::Tensor> flash_decode(
     at::Tensor& q,        // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
                           // h_k, d) if there is page_table.
@@ -589,8 +584,9 @@ std::vector<at::Tensor> mha_fwd(
   auto const sizes = q.sizes();
   const int batch_size = cu_seqlens_q.size(0) - 1;
   int seqlen_q = max_seqlen_q;
-  int total_q = q.size(0);
-  int num_heads = q.size(-2);
+  int q_group_size = q.size(-2) / k.size(-2);
+  int total_q = q.size(0) * q_group_size;
+  int num_heads = q.size(-2) / q_group_size;
   int const head_size = q.size(-1);
   int const head_size_v = v.size(-1);
   int const max_num_pages_per_seq = page_table.size(1);
@@ -645,7 +641,15 @@ std::vector<at::Tensor> mha_fwd(
   at::Tensor out;
   out = torch::empty({total_q, num_heads, head_size_v}, opts);
 
-  auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+  auto round_multiple = [](int x, int m) -> int { return (x + m - 1) / m * m; };
+
+  auto round_up_headdim = [](int head_size) -> int {
+    if (head_size <= 64) return 64;
+    if (head_size <= 96) return 96;
+    if (head_size <= 128) return 128;
+    if (head_size <= 192) return 192;
+    return 256;
+  };
   int const head_size_rounded = round_up_headdim(head_size);
   int const head_size_v_rounded = head_size_v == head_size ? head_size_rounded : round_up_headdim(head_size_v);
   int const seqlen_q_rounded = round_multiple(seqlen_q, 128);
@@ -659,7 +663,7 @@ std::vector<at::Tensor> mha_fwd(
   softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
 
   // align with FA3
-  Flash_fwd_params params;
+  Arguments params;
   params.is_bf16 = q.dtype() == torch::kBFloat16;
 
   // Set the pointers and strides.
@@ -696,9 +700,9 @@ std::vector<at::Tensor> mha_fwd(
   params.d_rounded = head_size_rounded;
 
   // Set the different scale values.
-  params.scale_softmax = softmax_scale;
+  params.softmax_scale = softmax_scale;
   bool use_sink = sinks_.has_value();
-  params.sink_softmax = use_sink ? sinks_.value().data_ptr() : nullptr;
+  params.softmax_sink_ptr = use_sink ? sinks_.value().data_ptr() : nullptr;
 
   params.softcap = softcap;
 
@@ -793,33 +797,21 @@ std::vector<at::Tensor> mha_fwd(
   at::Tensor out_accum, softmax_lse_accum;
   auto outaccum_type = at::ScalarType::Float;
 
-  constexpr bool Causal = false; // The decode kernel does not support causal mode. It must be set to false.
+  constexpr bool Causal = false;  // The decode kernel does not support causal mode. It must be set to false.
 #define NUM_SG _8
 #define KV_TILE_SIZE _512
-#define FMHA_FWD_KERNEL(QG_SZ, HEAD_DIM)                                \
-  AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {                          \
-    if (params.is_causal) {                                             \
-      FMHAConfig<                                                       \
-          Causal,                                                       \
-          false,                                                        \
-          Sink,                                                         \
-          cute::Shape<_##QG_SZ, KV_TILE_SIZE, _64>,                     \
-          cute::Shape<_##QG_SZ, _32, KV_TILE_SIZE>,                     \
-          cute::Shape<_##QG_SZ, _##HEAD_DIM>,                           \
-          cute::Layout<cute::Shape<_1, NUM_SG, _1>>>::run(params);      \
-    } else {                                                            \
-      AT_DISPATCH_BOOL_NO_RETURN(                                       \
-          params.is_local,                                              \
-          LocalMask,                                                    \
-          FMHAConfig<                                                   \
-              LocalMask,                                                \
-              Sink,                                                     \
-              false,                                                    \
-              cute::Shape<_##QG_SZ, KV_TILE_SIZE, _64>,                 \
-              cute::Shape<_##QG_SZ, _32, KV_TILE_SIZE>,                 \
-              cute::Shape<_##QG_SZ, _##HEAD_DIM>,                       \
-              cute::Layout<cute::Shape<_1, NUM_SG, _1>>>::run(params)); \
-    }                                                                   \
+#define FMHA_FWD_KERNEL(QG_SZ, HEAD_DIM)                           \
+  AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {                     \
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {       \
+      FMHAConfig<                                                  \
+          Causal,                                                  \
+          LocalMask,                                               \
+          Sink,                                                    \
+          cute::Shape<_##QG_SZ, KV_TILE_SIZE, _64>,                \
+          cute::Shape<_##QG_SZ, _32, KV_TILE_SIZE>,                \
+          cute::Shape<_##QG_SZ, _##HEAD_DIM>,                      \
+          cute::Layout<cute::Shape<_1, NUM_SG, _1>>>::run(params); \
+    });                                                            \
   })
 
   switch (params.d) {

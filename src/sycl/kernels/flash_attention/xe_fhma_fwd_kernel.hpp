@@ -36,10 +36,10 @@
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/kernel_hardware_info.hpp"
-#include "flash_attention_v2/collective/fmha_fusion.hpp"
-#include "flash_attention_v2/collective/xe_fmha_fwd_epilogue.hpp"
-#include "flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp"
-#include "flash_attention_v2/kernel/xe_tile_scheduler.hpp"
+#include "fmha_fusion.hpp"
+#include "xe_fmha_fwd_epilogue.hpp"
+#include "xe_fmha_fwd_mainloop.hpp"
+#include "xe_tile_scheduler.hpp"
 
 namespace cutlass::fmha::kernel {
 

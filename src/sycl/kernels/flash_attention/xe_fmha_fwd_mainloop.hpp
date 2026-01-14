@@ -184,7 +184,8 @@ struct FMHAFwdMainloop<
     ElementS const scale;
     int const* ptr_page_table = nullptr;
     int page_size = 0;
-    int const* num_pages_per_seq = nullptr;
+    // int const* num_pages_per_seq = nullptr;
+    int max_num_pages_per_seq = 0;
   };
 
   // Kernel-facing parameters
@@ -204,7 +205,7 @@ struct FMHAFwdMainloop<
   static constexpr Params to_underlying_arguments(Arguments const& args, void* /* workspace */) {
     constexpr double kLog2e = 1.4426950408889634074;  // log_2(e)
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
-    return Params{val, args.ptr_page_table, args.page_size, args.num_pages_per_seq};
+    return Params{val, args.ptr_page_table, args.page_size, args.max_num_pages_per_seq};
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
@@ -217,8 +218,10 @@ struct FMHAFwdMainloop<
     // get<1>(TileShapeQK{}) usually smaller than page_size.
     // assuming page_size is multiple of get<1>(TileShapeQK{})
     int tiles_per_page = params.page_size / get<1>(TileShapeQK{});
-    int batch_offset =
-        params.num_pages_per_seq ? params.num_pages_per_seq[l_coord] : l_coord * (seq_len_kv_cache / params.page_size);
+    // int batch_offset =
+    //     params.num_pages_per_seq ? params.num_pages_per_seq[l_coord] : l_coord * (seq_len_kv_cache /
+    //     params.page_size);
+    int batch_offset = l_coord * params.max_num_pages_per_seq;
 
     return params.ptr_page_table[batch_offset + next_page_logical_idx] * tiles_per_page + K % tiles_per_page;
   }

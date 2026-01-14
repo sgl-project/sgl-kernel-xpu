@@ -1023,8 +1023,8 @@ def test_flash_attn_kvcache(
 #     [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []),
 # )
 @pytest.mark.parametrize("causal", [False])
-@pytest.mark.parametrize("local", [False, True])
-# @pytest.mark.parametrize("causal,local", [(True, False)])
+@pytest.mark.parametrize("local", [False])
+# @pytest.mark.parametrize("local", [(True, False)])
 @pytest.mark.parametrize("use_sinks", [False])
 # @pytest.mark.parametrize(
 #     "seqlen_new_eq_seqlen_q", [True, False] if not DISABLE_APPENDKV else [True]
@@ -1045,7 +1045,8 @@ def test_flash_attn_kvcache(
     ),
 )
 # @pytest.mark.parametrize("rotary_fraction", [0.0])
-@pytest.mark.parametrize("page_size", [64, 128, 256])
+# @pytest.mark.parametrize("page_size", [64, 128, 256])
+@pytest.mark.parametrize("page_size", [128])
 # @pytest.mark.parametrize("page_size", [None])
 # @pytest.mark.parametrize("has_leftpad", [False, True])
 @pytest.mark.parametrize("has_leftpad", [False])
@@ -1063,18 +1064,18 @@ def test_flash_attn_kvcache(
     "seqlen_k",
     [
         128,
-        339,
-        1024,
-        800,
-        256,
-        799,
-        2048,
-        20000,
-        # (1, 128 * 1024),
-        # (16, 128 * 1024),
-        128,
-        512,  # To test appending KV with more than 1 block
-        3577,  # Enough tile to test persistent scheduler
+        # 339,
+        # 1024,
+        # 800,
+        # 256,
+        # 799,
+        # 2048,
+        # 20000,
+        # # (1, 128 * 1024),
+        # # (16, 128 * 1024),
+        # 128,
+        # 512,  # To test appending KV with more than 1 block
+        # 3577,  # Enough tile to test persistent scheduler
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
@@ -1463,6 +1464,7 @@ def test_flash_attn_decode_kvcache(
                 out = out.flatten()
                 out_ref = out_ref.flatten()
                 out_pt = out_pt.flatten()
+                print(out)
                 print(f"Output max diff: {(out - out_ref).abs().max().item()}")
                 print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
                 print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")

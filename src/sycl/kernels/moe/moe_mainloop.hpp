@@ -65,7 +65,9 @@ template <
     class ATensor_,
     class BTensor_,
     class DTensor_,
-    class TiledMMA_>
+    class BiasTensor_,
+    class TiledMMA_,
+    bool WithBias>
 struct MoEMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -78,8 +80,20 @@ template <
     class ATensor_,
     class BTensor_,
     class DTensor_,
-    class TiledMMA_>
-struct MoEMainloop<XeDefault<Stages>, TiledCopyA_, TiledCopyB_, TilesCopyD_, ATensor_, BTensor_, DTensor_, TiledMMA_> {
+    class BiasTensor_,
+    class TiledMMA_,
+    bool WithBias>
+struct MoEMainloop<
+    XeDefault<Stages>,
+    TiledCopyA_,
+    TiledCopyB_,
+    TilesCopyD_,
+    ATensor_,
+    BTensor_,
+    DTensor_,
+    BiasTensor_,
+    TiledMMA_,
+    WithBias> {
   using TiledMMA = TiledMMA_;
   using TiledCopyA = TiledCopyA_;
   using TiledCopyB = TiledCopyB_;
@@ -87,6 +101,7 @@ struct MoEMainloop<XeDefault<Stages>, TiledCopyA_, TiledCopyB_, TilesCopyD_, ATe
   using ATensor = ATensor_;
   using BTensor = BTensor_;  // cute::tuple<tensor> or cute::tuple<tensor, tensor>
   using DTensor = DTensor_;
+  using BiasTensor = BiasTensor_;
   MoEMainloop() {}
 
   template <typename Coord>
@@ -199,8 +214,9 @@ struct MoEMainloop<XeDefault<Stages>, TiledCopyA_, TiledCopyB_, TilesCopyD_, ATe
       DTensor& D,   // (M,N)
       Coord blk_coord,
       TiledMMA mma,
-      int thr_id) {  // work-item ID
-
+      int thr_id,  // work-item ID
+      BiasTensor Bias0,
+      BiasTensor Bias1) {
     auto wg_m = get<0>(blk_coord);
     auto wg_n = get<1>(blk_coord);
     auto wg_n1 = get<2>(blk_coord);
@@ -313,6 +329,16 @@ struct MoEMainloop<XeDefault<Stages>, TiledCopyA_, TiledCopyB_, TilesCopyD_, ATe
       }
 
       barrier_wait(barrier_scope);
+    }
+
+    // Add bias if needed
+    if constexpr (WithBias) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tCrC0.size(); ++i) {
+        auto n_idx = i % BLK_M;
+        tCrC0(i) = tCrC0(i) + Bias0(BLK_N * wg_n + n_idx);
+        tCrC1(i) = tCrC1(i) + Bias1(BLK_N * wg_n1 + n_idx);
+      }
     }
 
     CUTLASS_PRAGMA_UNROLL

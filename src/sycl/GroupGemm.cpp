@@ -19,15 +19,16 @@ using namespace MoE;
 
 using ElementAccumulator = float;  // <- data type of accumulator
 
-template <typename, typename, typename, typename, typename, typename, bool>
+template <typename, typename, typename, typename, typename, typename, bool, bool>
 class GemmCuteName;
 
-template <typename Tile, typename SGLayout, bool FuseSiLU>
+template <typename Tile, typename SGLayout, bool FuseSiLU, bool WithBias>
 void MoEGEMMLauncher(
     sycl::queue q,
     const void* activations,
     const void* weights,
     const void* scales,
+    const void* bias,
     void* outputs,
     const int gemm_n,
     const int gemm_k,
@@ -39,12 +40,17 @@ void MoEGEMMLauncher(
   auto make_dummy_tensor = [&](auto val, auto stride) {
     return make_tensor(make_gmem_ptr(&val), make_layout(repeat<rank_v<decltype(stride)>>(1), stride));
   };
+  auto make_dummy_bias = [&](auto val) {
+    return make_tensor(make_gmem_ptr(&val), make_layout(Shape<int>{}, Stride<_1>{}));
+  };
   using StrideA = Stride<int, _1>;
   using StrideB = Stride<int, _1>;
   using StrideD = Stride<int, _1>;
+  using StrideBias = Stride<_1>;
   using TensorA = decltype(make_dummy_tensor(Element{}, StrideA{}));
   using TensorB = decltype(make_dummy_tensor(Element{}, StrideB{}));
   using TensorD = decltype(make_dummy_tensor(Element{}, StrideD{}));
+  using TensorBias = decltype(make_dummy_bias(Element{}));
 
   using ElementA_non_CV = cutlass::platform::remove_cv_t<Element>;
   using MMA =
@@ -67,10 +73,11 @@ void MoEGEMMLauncher(
 
   syclex::properties kernel_props{syclex::sub_group_size<16>, intelex::grf_size<256>};
 
-  using Kernel = MoE::MoEGEMM<Tile, SGLayout, TensorA, TensorB, TensorD, MMA, FuseSiLU, Element>;
+  using Kernel = MoE::MoEGEMM<Tile, SGLayout, TensorA, TensorB, TensorD, TensorBias, MMA, FuseSiLU, WithBias, Element>;
   typename Kernel::Params params{
       static_cast<const Element*>(activations),
       static_cast<const Element*>(weights),
+      static_cast<const Element*>(bias),
       static_cast<Element*>(outputs),
       num_rows_per_expert_device,
       gemm_n,
@@ -84,7 +91,7 @@ void MoEGEMMLauncher(
   auto Q = stream.queue();
   auto event = Q.submit([&](sycl::handler& h) {
     sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), h);
-    h.parallel_for<GemmCuteName<Tile, SGLayout, TensorA, TensorB, TensorD, Element, FuseSiLU>>(
+    h.parallel_for<GemmCuteName<Tile, SGLayout, TensorA, TensorB, TensorD, Element, FuseSiLU, WithBias>>(
         sycl::nd_range<3>(global * local, local), kernel_props, [=](sycl::nd_item<3> item) {
           int32_t* slm_mem =
               static_cast<int32_t*>(local_mem.template get_multi_ptr<sycl::access::decorated::no>().get());
@@ -99,6 +106,7 @@ void MoEGEMMLauncher(
       activations.data_ptr(),                 \
       weights.data_ptr(),                     \
       nullptr,                                \
+      bias_ptr,                               \
       output.data_ptr(),                      \
       gemm_n,                                 \
       gemm_k,                                 \
@@ -115,10 +123,28 @@ void MoEGEMMLauncher(
     }                                             \
   } while (0)
 
+#define DISPATCH_MOE_BY_FUSE_ACT_BIAS(FuseSilu, WithBias, ...) \
+  do {                                                         \
+    if (FuseSilu) {                                            \
+      if (WithBias) {                                          \
+        LAUNCH_MOE(__VA_ARGS__, true, true);                   \
+      } else {                                                 \
+        LAUNCH_MOE(__VA_ARGS__, true, false);                  \
+      }                                                        \
+    } else {                                                   \
+      if (WithBias) {                                          \
+        LAUNCH_MOE(__VA_ARGS__, false, true);                  \
+      } else {                                                 \
+        LAUNCH_MOE(__VA_ARGS__, false, false);                 \
+      }                                                        \
+    }                                                          \
+  } while (0)
+
 void moe_grouped_mm_nt(
     torch::Tensor& output,
     const torch::Tensor& activations,
     const torch::Tensor& weights,
+    const std::optional<at::Tensor>& bias,
     const torch::Tensor& total_rows_for_experts,
     const int64_t n_experts,
     bool fuse_silu) {
@@ -146,28 +172,37 @@ void moe_grouped_mm_nt(
   TORCH_CHECK(
       activations.scalar_type() == at::ScalarType::BFloat16,
       "Only bfloat16 are supported in moe_grouped_mm_nt currently");
+  if (bias.has_value()) {
+    TORCH_CHECK(bias->size(0) == n_experts && bias->size(1) == gemm_n, "bias shape mismatch with weight");
+  }
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
   at::Tensor atomic_buffer = at::empty({static_cast<long>(1)}, activations.options().dtype(at::kInt));
+  bool with_bias = bias.has_value();
+  void* bias_ptr = with_bias ? bias->data_ptr() : nullptr;
 
   if (avg_m <= 8) {
-    DISPATCH_MOE_BY_CONDITION(fuse_silu, Shape<_8, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
+    DISPATCH_MOE_BY_FUSE_ACT_BIAS(
+        fuse_silu, with_bias, Shape<_8, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
   } else if (avg_m <= 16) {
-    DISPATCH_MOE_BY_CONDITION(fuse_silu, Shape<_16, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
+    DISPATCH_MOE_BY_FUSE_ACT_BIAS(
+        fuse_silu, with_bias, Shape<_16, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
   } else if (avg_m <= 32) {
-    DISPATCH_MOE_BY_CONDITION(fuse_silu, Shape<_32, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
+    DISPATCH_MOE_BY_FUSE_ACT_BIAS(
+        fuse_silu, with_bias, Shape<_32, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
   } else if (avg_m <= 128) {
     if (fuse_silu) {
-      LAUNCH_MOE(Shape<_128, _32, _32>, Layout<Shape<_2, _8, _1>, Stride<_8, _1, _0>>, true);
+      DISPATCH_MOE_BY_CONDITION(with_bias, Shape<_128, _32, _32>, Layout<Shape<_2, _8, _1>, Stride<_8, _1, _0>>, true);
     } else {
-      LAUNCH_MOE(Shape<_128, _64, _32>, Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>, false);
+      DISPATCH_MOE_BY_CONDITION(with_bias, Shape<_128, _64, _32>, Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>, false);
     }
   } else {
     if (fuse_silu) {
-      LAUNCH_MOE(Shape<_256, _32, _32>, Layout<Shape<_4, _8, _1>, Stride<_8, _1, _0>>, true);
+      DISPATCH_MOE_BY_CONDITION(with_bias, Shape<_256, _32, _32>, Layout<Shape<_4, _8, _1>, Stride<_8, _1, _0>>, true);
     } else {
-      LAUNCH_MOE(Shape<_256, _128, _32>, Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>, false);
+      DISPATCH_MOE_BY_CONDITION(
+          with_bias, Shape<_256, _128, _32>, Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>, false);
     }
   }
 }

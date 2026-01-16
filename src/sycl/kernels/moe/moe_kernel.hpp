@@ -53,8 +53,10 @@ template <
     typename TensorA,
     typename TensorB,
     typename TensorD,
+    typename TensorBias,
     typename TiledMMA,
     bool FuseSiLU,
+    bool WithBias,
     typename ElementA,
     typename ElementB = ElementA,
     typename ElementS = ElementA,
@@ -68,12 +70,22 @@ class MoEGEMM {
 
   constexpr static int Stages = 3;
   using MainloopDispatchPolicy = MoE::XeDefault<Stages>;
-  using CollectiveMainloop =
-      MoEMainloop<MainloopDispatchPolicy, TiledCopyA, TiledCopyB, TiledCopyD, TensorA, TensorB, TensorD, TiledMMA>;
+  using CollectiveMainloop = MoEMainloop<
+      MainloopDispatchPolicy,
+      TiledCopyA,
+      TiledCopyB,
+      TiledCopyD,
+      TensorA,
+      TensorB,
+      TensorD,
+      TensorBias,
+      TiledMMA,
+      WithBias>;
 
   struct Params {
     const ElementA* Activations;
     const ElementB* Weights;
+    const ElementD* Bias;
     ElementD* Outputs;
     const int32_t* M_per_group;
     const int32_t N;
@@ -92,6 +104,25 @@ class MoEGEMM {
     } else {
       auto B = make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N, K), make_stride(K, _1{})));
       return cute::make_tuple(B);
+    }
+  }
+
+  auto make_Bias_tensors(ElementD* ptr_Bias, int N) {
+    if constexpr (WithBias) {
+      if constexpr (FuseSiLU) {
+        auto Bias0 = make_tensor(make_gmem_ptr<ElementD>(ptr_Bias), make_layout(make_shape(N / 2), make_stride(_1{})));
+        ElementD* ptr_Bias1 = ptr_Bias + (N / 2);
+        auto Bias1 = make_tensor(make_gmem_ptr<ElementD>(ptr_Bias1), make_layout(make_shape(N / 2), make_stride(_1{})));
+        return cute::make_tuple(Bias0, Bias1);
+      } else {
+        auto Bias = make_tensor(make_gmem_ptr<ElementD>(ptr_Bias), make_layout(make_shape(N), make_stride(_1{})));
+        return cute::make_tuple(Bias);
+      }
+    } else {
+      // return a tuple of empty tensors
+      return cute::make_tuple(
+          make_tensor(make_gmem_ptr<ElementD>(nullptr), make_layout(make_shape(0), make_stride(_1{}))),
+          make_tensor(make_gmem_ptr<ElementD>(nullptr), make_layout(make_shape(0), make_stride(_1{}))));
     }
   }
 
@@ -157,11 +188,16 @@ class MoEGEMM {
       int64_t B_offset = static_cast<int64_t>(expert_id) * static_cast<int64_t>(N) * static_cast<int64_t>(K);
       ElementA* ptr_A_curr_batch = const_cast<ElementA*>(params.Activations) + pre_rows * K;
       ElementB* ptr_B_curr_batch = const_cast<ElementB*>(params.Weights) + B_offset;
+      ElementD* ptr_Bias_curr_batch = nullptr;
+      if constexpr (WithBias) {
+        ptr_Bias_curr_batch = const_cast<ElementD*>(params.Bias) + expert_id * N;
+      }
 
       auto A_tensor =
           make_tensor(make_gmem_ptr<ElementA>(ptr_A_curr_batch), make_layout(make_shape(M, K), make_stride(K, _1{})));
       auto B_tensor = make_B_tensors(ptr_B_curr_batch, N, K);
       auto D_tensor = make_D_tensors(params.Outputs, pre_rows, M, N);
+      auto Bias_tensor = make_Bias_tensors(ptr_Bias_curr_batch, N);
 
       while (group_m_id < cumsum_tiles_for_experts) {
         int n_coord = (group_id * wg_tile_n) % N_pad / wg_tile_n;
@@ -170,7 +206,16 @@ class MoEGEMM {
         CollectiveMainloop mainloop;
         if constexpr (FuseSiLU) {
           auto tile_coord = make_coord(m_coord, n_coord, 0);
-          mainloop(A_tensor, get<0>(B_tensor), get<1>(B_tensor), D_tensor, tile_coord, mma, thr_id);
+          mainloop(
+              A_tensor,
+              get<0>(B_tensor),
+              get<1>(B_tensor),
+              D_tensor,
+              tile_coord,
+              mma,
+              thr_id,
+              get<0>(Bias_tensor),
+              get<1>(Bias_tensor));
         } else {
           auto tile_coord = make_coord(m_coord, n_coord, _, 0);
           mainloop(A_tensor, get<0>(B_tensor), D_tensor, tile_coord, mma, thr_id);

@@ -85,7 +85,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("shuffle_rows", torch::kXPU, &shuffle_rows);
   m.def("apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, Tensor? factors) -> ()");
   m.impl("apply_shuffle_mul_sum", torch::kXPU, &apply_shuffle_mul_sum);
-
+  m.def(
+      "bmm_fp8(Tensor A, Tensor B, Tensor! D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer, int "
+      "cublas_handle, int cuda_stream) -> ()",
+      {at::Tag::needs_fixed_stride_order});
+  m.impl("bmm_fp8", torch::kXPU, &bmm_fp8);
   /*
    * From cutlass attention
    */

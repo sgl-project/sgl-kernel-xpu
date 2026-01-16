@@ -272,73 +272,72 @@ void sgl_per_token_group_quant_8bit(
   sycl::range<1> global_range(num_blocks * num_threads);
   sycl::range<1> local_range(num_threads);
 
-#define LAUNCH_KERNEL_WITH_GROUP_SIZE(T, DST_DTYPE, GS)                              \
-  do {                                                                               \
-    if (is_column_major) {                                                           \
-      if (scale_ue8m0) {                                                             \
-        auto kernel = PerTokenGroupQuant8bitKernel<T, DST_DTYPE, GS, true, true>(    \
-            static_cast<const T*>(input.data_ptr()),                                 \
-            output_q.data_ptr(),                                                     \
-            static_cast<uint32_t*>(output_s.data_ptr()),                             \
-            num_groups,                                                              \
-            groups_per_block,                                                        \
-            static_cast<float>(eps),                                                 \
-            static_cast<float>(min_8bit),                                            \
-            static_cast<float>(max_8bit),                                            \
-            num_groups_per_row,                                                      \
-            scale_stride);                                                           \
-        sycl_kernel_submit(global_range, local_range, queue, kernel);                \
-      } else {                                                                       \
-        auto kernel = PerTokenGroupQuant8bitKernel<T, DST_DTYPE, GS, true, false>(   \
-            static_cast<const T*>(input.data_ptr()),                                 \
-            output_q.data_ptr(),                                                     \
-            static_cast<float*>(output_s.data_ptr()),                                \
-            num_groups,                                                              \
-            groups_per_block,                                                        \
-            static_cast<float>(eps),                                                 \
-            static_cast<float>(min_8bit),                                            \
-            static_cast<float>(max_8bit),                                            \
-            num_groups_per_row,                                                      \
-            scale_stride);                                                           \
-        sycl_kernel_submit(global_range, local_range, queue, kernel);                \
-      }                                                                              \
-    } else {                                                                         \
-      assert(!scale_ue8m0);                                                          \
-      auto kernel = PerTokenGroupQuant8bitKernel<T, DST_DTYPE, GS, false>(           \
-          static_cast<const T*>(input.data_ptr()),                                   \
-          output_q.data_ptr(),                                                       \
-          static_cast<float*>(output_s.data_ptr()),                                  \
-          num_groups,                                                                \
-          groups_per_block,                                                          \
-          static_cast<float>(eps),                                                   \
-          static_cast<float>(min_8bit),                                              \
-          static_cast<float>(max_8bit));                                             \
-      sycl_kernel_submit(global_range, local_range, queue, kernel);                  \
-    }                                                                                \
+#define LAUNCH_KERNEL_WITH_GROUP_SIZE(T, DST_DTYPE, GS)                            \
+  do {                                                                             \
+    if (is_column_major) {                                                         \
+      if (scale_ue8m0) {                                                           \
+        auto kernel = PerTokenGroupQuant8bitKernel<T, DST_DTYPE, GS, true, true>(  \
+            static_cast<const T*>(input.data_ptr()),                               \
+            output_q.data_ptr(),                                                   \
+            static_cast<uint32_t*>(output_s.data_ptr()),                           \
+            num_groups,                                                            \
+            groups_per_block,                                                      \
+            static_cast<float>(eps),                                               \
+            static_cast<float>(min_8bit),                                          \
+            static_cast<float>(max_8bit),                                          \
+            num_groups_per_row,                                                    \
+            scale_stride);                                                         \
+        sycl_kernel_submit(global_range, local_range, queue, kernel);              \
+      } else {                                                                     \
+        auto kernel = PerTokenGroupQuant8bitKernel<T, DST_DTYPE, GS, true, false>( \
+            static_cast<const T*>(input.data_ptr()),                               \
+            output_q.data_ptr(),                                                   \
+            static_cast<float*>(output_s.data_ptr()),                              \
+            num_groups,                                                            \
+            groups_per_block,                                                      \
+            static_cast<float>(eps),                                               \
+            static_cast<float>(min_8bit),                                          \
+            static_cast<float>(max_8bit),                                          \
+            num_groups_per_row,                                                    \
+            scale_stride);                                                         \
+        sycl_kernel_submit(global_range, local_range, queue, kernel);              \
+      }                                                                            \
+    } else {                                                                       \
+      assert(!scale_ue8m0);                                                        \
+      auto kernel = PerTokenGroupQuant8bitKernel<T, DST_DTYPE, GS, false>(         \
+          static_cast<const T*>(input.data_ptr()),                                 \
+          output_q.data_ptr(),                                                     \
+          static_cast<float*>(output_s.data_ptr()),                                \
+          num_groups,                                                              \
+          groups_per_block,                                                        \
+          static_cast<float>(eps),                                                 \
+          static_cast<float>(min_8bit),                                            \
+          static_cast<float>(max_8bit));                                           \
+      sycl_kernel_submit(global_range, local_range, queue, kernel);                \
+    }                                                                              \
   } while (0)
 
-#define LAUNCH_KERNEL(T, DST_DTYPE)                     \
-  do {                                                  \
-    switch (group_size) {                               \
-      case 32:                                          \
-          LAUNCH_KERNEL_WITH_GROUP_SIZE(T, DST_DTYPE, 32); \
-          break;                                          \
-      case 64:                                          \
-        LAUNCH_KERNEL_WITH_GROUP_SIZE(T, DST_DTYPE, 64); \
-        break;                                          \
-      case 128:                                         \
-        LAUNCH_KERNEL_WITH_GROUP_SIZE(T, DST_DTYPE, 128); \
-        break;                                          \
-      case 256:                                         \
-        LAUNCH_KERNEL_WITH_GROUP_SIZE(T, DST_DTYPE, 256); \
-        break;                                          \
-      case 512:                                         \
-        LAUNCH_KERNEL_WITH_GROUP_SIZE(T, DST_DTYPE, 512); \
-        break;                                          \
-      default:                                          \
-        TORCH_CHECK(false, "Unsupported group_size: ", group_size, \
-                    ". Supported sizes are: 64, 128, 256, 512"); \
-    }                                                   \
+#define LAUNCH_KERNEL(T, DST_DTYPE)                                                                             \
+  do {                                                                                                          \
+    switch (group_size) {                                                                                       \
+      case 32:                                                                                                  \
+        LAUNCH_KERNEL_WITH_GROUP_SIZE(T, DST_DTYPE, 32);                                                        \
+        break;                                                                                                  \
+      case 64:                                                                                                  \
+        LAUNCH_KERNEL_WITH_GROUP_SIZE(T, DST_DTYPE, 64);                                                        \
+        break;                                                                                                  \
+      case 128:                                                                                                 \
+        LAUNCH_KERNEL_WITH_GROUP_SIZE(T, DST_DTYPE, 128);                                                       \
+        break;                                                                                                  \
+      case 256:                                                                                                 \
+        LAUNCH_KERNEL_WITH_GROUP_SIZE(T, DST_DTYPE, 256);                                                       \
+        break;                                                                                                  \
+      case 512:                                                                                                 \
+        LAUNCH_KERNEL_WITH_GROUP_SIZE(T, DST_DTYPE, 512);                                                       \
+        break;                                                                                                  \
+      default:                                                                                                  \
+        TORCH_CHECK(false, "Unsupported group_size: ", group_size, ". Supported sizes are: 64, 128, 256, 512"); \
+    }                                                                                                           \
   } while (0)
 
   // Dispatch based on input and output types

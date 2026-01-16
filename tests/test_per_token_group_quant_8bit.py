@@ -184,7 +184,7 @@ class TestPerTokenGroupQuantXPU:
         scale_ue8m0,
     ):
         """Test per-token group quantization with various configurations.
-        NOTE: This test doesn't enable any ue8m0 scales because it failes a check in fp8_kernel.py fo
+        NOTE: This test doesn't enable any ue8m0 scales because it fails a check in fp8_kernel.py of
         scale_tma_aligned = True"""
         self._test_against_reference(
             num_tokens,
@@ -328,9 +328,9 @@ def triton_per_token_group_quant_8bit(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the scaling factor for quantization.
     """
-    assert x.shape[-1] % group_size == 0, (
-        "the last dimension of `x` cannot be divisible by `group_size`"
-    )
+    assert (
+        x.shape[-1] % group_size == 0
+    ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
     if dtype == torch.int8:

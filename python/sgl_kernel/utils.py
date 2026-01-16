@@ -48,3 +48,11 @@ def is_hopper_arch() -> bool:
     device = torch.cuda.current_device()
     major, minor = torch.cuda.get_device_capability(device)
     return major == 9
+
+
+def ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y
+
+
+def ceil_align(x: int, y: int) -> int:
+    return ceil_div(x, y) * y

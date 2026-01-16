@@ -1,96 +1,128 @@
-import itertools
+from itertools import product
 from typing import Optional, Tuple
 
 import torch
 import triton
-import triton.testing
 from sgl_kernel import sgl_per_tensor_quant_fp8
-from vllm import _custom_ops as ops
-
-from sglang.srt.utils import is_hip
-
-_is_hip = is_hip()
-fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
-
-
-def vllm_scaled_fp8_quant(
-    input: torch.Tensor,
-    scale: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    return ops.scaled_fp8_quant(input, scale)
 
 
 def sglang_scaled_fp8_quant(
     input: torch.Tensor,
     scale: Optional[torch.Tensor] = None,
+    is_static: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     fp8_type_: torch.dtype = torch.float8_e4m3fn
     output = torch.empty_like(input, device=input.device, dtype=fp8_type_)
-    is_static = True
     if scale is None:
         scale = torch.zeros(1, device=input.device, dtype=torch.float32)
-        is_static = False
     sgl_per_tensor_quant_fp8(input, output, scale, is_static)
 
     return output, scale
 
 
-def calculate_diff(batch_size: int, seq_len: int):
-    """Calculate difference between VLLM and SGLang implementations."""
-    device = torch.device("cuda")
-    x = torch.rand((batch_size, seq_len), dtype=torch.float16, device=device)
-
-    vllm_out, vllm_scale = vllm_scaled_fp8_quant(x)
-    sglang_out, sglang_scale = sglang_scaled_fp8_quant(x)
-
-    scale_diff = torch.abs(vllm_scale - sglang_scale).item()
-    output_diff = torch.abs(vllm_out.float() - sglang_out.float()).mean().item()
-
-    if torch.allclose(
-        vllm_out.to(torch.float32), sglang_out.to(torch.float32), rtol=1e-3, atol=1e-5
-    ) and torch.allclose(vllm_scale, sglang_scale, rtol=1e-3, atol=1e-5):
-        print("✅ All implementations match")
-    else:
-        print("❌ Implementations differ")
-
-
 batch_size_range = [16, 32, 64, 128]
 seq_len_range = [64, 128, 256, 512, 1024, 2048]
+hidden_size = 1024
 
-configs = list(itertools.product(batch_size_range, seq_len_range))
+configs = [
+    (bs, seq_len, is_static)
+    for is_static in [True, False]
+    for bs, seq_len in product(batch_size_range, seq_len_range)
+]
+
+all_results = []
 
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["batch_size", "seq_len"],
+        x_names=["batch_size", "seq_len", "is_static"],
         x_vals=configs,
         line_arg="provider",
-        line_vals=["vllm", "sglang"],
-        line_names=["VLLM", "SGL Kernel"],
-        styles=[("blue", "-"), ("green", "-")],
-        ylabel="us",
+        line_vals=["sgl_kernel"],
+        line_names=["SGL Kernel"],
+        styles=[("blue", "-")],
+        ylabel="Time (ms)",
         plot_name="per-tensor-quant-fp8-performance",
         args={},
     )
 )
-def benchmark(batch_size, seq_len, provider):
+def benchmark(batch_size, seq_len, is_static, provider):
+    print(
+        f"benchmark {provider} with batch_size={batch_size} seq_len={seq_len} is_static={is_static}"
+    )
     dtype = torch.float16
-    device = torch.device("cuda")
+    torch.set_default_device("xpu")
+    torch.xpu.manual_seed_all(0)
 
-    x = torch.randn(batch_size * seq_len, 4096, device=device, dtype=dtype)
+    num_tokens = batch_size * seq_len
+    x = torch.randn(
+        num_tokens, hidden_size, dtype=dtype, device="xpu", requires_grad=False
+    )
 
-    quantiles = [0.5, 0.2, 0.8]
+    scale = None
+    if is_static:
+        scale = torch.tensor(
+            [0.01], dtype=torch.float32, device="xpu", requires_grad=False
+        )
+    # Warmup
+    for _ in range(10):
+        _ = sglang_scaled_fp8_quant(x, scale, is_static)
+    torch.xpu.synchronize()
 
-    if provider == "vllm":
-        fn = lambda: vllm_scaled_fp8_quant(x.clone())
-    elif provider == "sglang":
-        fn = lambda: sglang_scaled_fp8_quant(x.clone())
+    bench_lambda = lambda: sglang_scaled_fp8_quant(x, scale, is_static)
 
-    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
+    quantiles = [0.5, 0.25, 0.75]
+    ms, _, _ = triton.testing.do_bench(
+        bench_lambda, quantiles=quantiles, return_mode="median"
+    )
 
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    torch.xpu.empty_cache()
+    del x
+    if scale is not None:
+        del scale
+
+    # Calculate FLOPS and bandwidth
+    # FP8 quantization involves: reading input, computing abs max (if dynamic),
+    # scaling, and writing output
+    num_elements = batch_size * seq_len * hidden_size
+
+    # FLOPS calculation:
+    # - Static: division + clamp + cast = ~1 + (1+1) + (1+1)= 5 ops per element
+    # - Dynamic: static + abs + cast + max= ~ 5 + 1 + 1 + 1 ops per element
+
+    flops_per_elem = 8 if not is_static else 5
+    flop = num_elements * flops_per_elem
+    tflops = flop / (ms / 1e3) / 1e12
+
+    # Memory calculation:
+    # Static: Read input (fp16=2B/elem) + Write output (fp8=1B/elem) = 3 bytes/elem
+    # Dynamic: Read input for max (fp16=2B/elem) + Read input for quant (fp16=2B/elem) + Write output (fp8=1B/elem) = 5 bytes/elem
+    # Scale read/write: static=4B(1 reads), dynamic=12B(2 reads + 1 write)
+    bytes_per_elem = 5 if not is_static else 3
+    scale_read_write = 12 if not is_static else 4
+    memory = num_elements * bytes_per_elem + scale_read_write
+    bandwidth = memory / (ms / 1e3) / 1e9
+
+    all_results.append(
+        {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_size": hidden_size,
+            "is_static": is_static,
+            "provider": provider,
+            "tflops": tflops,
+            "bandwidth": bandwidth,
+            "ms": ms,
+        }
+    )
+    return ms
 
 
 if __name__ == "__main__":
-    calculate_diff(batch_size=4, seq_len=4096)
-    benchmark.run(print_data=True)
+    benchmark.run(print_data=False)
+    print("Benchmark finished!")
+
+    import pandas as pd
+
+    df = pd.DataFrame(all_results)
+    print(df.to_markdown())

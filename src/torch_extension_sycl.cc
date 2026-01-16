@@ -49,6 +49,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
 
   m.def(
+      "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int "
+      "num_fused_shared_experts, float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
+      "(Tensor[])");
+  m.impl("moe_fused_gate", torch::kXPU, &moe_fused_gate);
+
+  m.def(
       "rotary_embedding(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
       "bool is_neox) -> (Tensor, Tensor)");
   m.impl("rotary_embedding", torch::kXPU, &at::native::xpu::rotary_embedding);

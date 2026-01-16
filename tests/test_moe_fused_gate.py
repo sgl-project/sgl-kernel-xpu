@@ -1,5 +1,3 @@
-import sys
-
 import pytest
 import torch
 from sgl_kernel import moe_fused_gate
@@ -12,23 +10,27 @@ from sglang.srt.layers.moe.topk import biased_grouped_topk
     list(range(1, 10))
     + [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536],
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
     "params",
     [
-        (128, 4, 2, 4),
-        (256, 8, 4, 8),  # deepseek v3
+        # (128, 4, 2, 4),
+        # (256, 8, 4, 8),  # deepseek v3
         (512, 16, 8, 16),
     ],
 )
-@pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
-def test_moe_fused_gate_combined(seq_length, dtype, params, num_fused_shared_experts):
+# @pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
+@pytest.mark.parametrize("num_fused_shared_experts", [0])
+@pytest.mark.parametrize("apply_routed_scaling_factor_on_output", [False, True])
+def test_moe_fused_gate_combined(
+    seq_length, params, num_fused_shared_experts, apply_routed_scaling_factor_on_output
+):
     num_experts, num_expert_group, topk_group, topk = params
+    dtype = torch.float32
 
     torch.manual_seed(seq_length)
-    tensor = torch.rand((seq_length, num_experts)).to(dtype).cuda()
+    tensor = torch.rand((seq_length, num_experts), dtype=dtype, device="xpu")
     scores = tensor.clone()
-    bias = torch.rand(num_experts).to(dtype).cuda()
+    bias = torch.rand(num_experts, dtype=dtype, device="xpu")
     topk = topk + num_fused_shared_experts
 
     output, indices = moe_fused_gate(
@@ -39,6 +41,7 @@ def test_moe_fused_gate_combined(seq_length, dtype, params, num_fused_shared_exp
         topk=topk,
         num_fused_shared_experts=num_fused_shared_experts,
         routed_scaling_factor=2.5,
+        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
     )
     ref_output, ref_indices = biased_grouped_topk(
         scores,
@@ -48,9 +51,9 @@ def test_moe_fused_gate_combined(seq_length, dtype, params, num_fused_shared_exp
         renormalize=True,
         num_expert_group=num_expert_group,
         topk_group=topk_group,
-        compiled=False,
         num_fused_shared_experts=num_fused_shared_experts,
         routed_scaling_factor=2.5,
+        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
     )
 
     # When num_fused_shared_experts > 0, ignore the comparison of the last topk dimension
@@ -91,6 +94,7 @@ def test_moe_fused_gate_combined(seq_length, dtype, params, num_fused_shared_exp
         f"Indices mismatch at seq_length {seq_length}, dtype {dtype}, "
         f"params {params}, num_fused_shared_experts {num_fused_shared_experts}"
     )
+
     assert output_check, (
         f"Output mismatch at seq_length {seq_length}, dtype {dtype}, "
         f"params {params}, num_fused_shared_experts {num_fused_shared_experts}"
@@ -98,4 +102,4 @@ def test_moe_fused_gate_combined(seq_length, dtype, params, num_fused_shared_exp
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

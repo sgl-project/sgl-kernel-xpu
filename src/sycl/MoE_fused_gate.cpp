@@ -16,7 +16,7 @@ constexpr T max_value() {
   return std::numeric_limits<T>::max();
 }
 
-template <typename T, typename Params, int THREADS_PER_ROW>
+template <typename T, typename Params>
 struct moe_fused_gate_impl {
   static constexpr T TYPE_MAX_V = max_value<T>();
   moe_fused_gate_impl(
@@ -43,9 +43,9 @@ struct moe_fused_gate_impl {
         apply_routed_scaling_factor_on_output_(apply_routed_scaling_factor_on_output),
         params_(params) {}
 
-  [[sycl::reqd_sub_group_size(THREADS_PER_ROW)]]
+  [[sycl::reqd_sub_group_size(MAX_VPT)]]
   void operator()(sycl::nd_item<3> item) const {
-    if (item.get_global_linear_id() / params_.NUM_EXPERT_GROUPS >= num_rows_) return;
+    if (item.get_global_linear_id() / MAX_VPT >= num_rows_) return;
 
     // Calculate topk_excluding_share_expert_fusion from topk
     int32_t topk_excluding_share_expert_fusion = topk_ - num_fused_shared_experts_;
@@ -66,26 +66,26 @@ struct moe_fused_gate_impl {
 
     T row_chunk[MAX_VPT];
     T bias_chunk[MAX_VPT];
-
+    if (sg.get_local_id()[0] < params_.NUM_EXPERT_GROUPS) {
 #pragma unroll
-    for (int i = 0; i < params_.VPT; ++i) {
-      row_chunk[i] = thread_row_ptr[i];
-      bias_chunk[i] = bias_ptr[i];
-    }
+      for (int i = 0; i < params_.VPT; ++i) {
+        row_chunk[i] = thread_row_ptr[i];
+        bias_chunk[i] = bias_ptr[i];
+      }
 
 ////////////////////// Sigmoid //////////////////////
 #pragma unroll
-    for (int i = 0; i < params_.VPT; ++i) {
-      float x = static_cast<float>(-row_chunk[i]);
-      row_chunk[i] = static_cast<T>(1.0f / (1.0f + sycl::exp(x)));
-    }
+      for (int i = 0; i < params_.VPT; ++i) {
+        float x = static_cast<float>(-row_chunk[i]);
+        row_chunk[i] = static_cast<T>(1.0f / (1.0f + sycl::exp(x)));
+      }
 
 ////////////////////// Add Bias //////////////////////
 #pragma unroll
-    for (int i = 0; i < params_.VPT; ++i) {
-      bias_chunk[i] = row_chunk[i] + bias_chunk[i];
+      for (int i = 0; i < params_.VPT; ++i) {
+        bias_chunk[i] = row_chunk[i] + bias_chunk[i];
+      }
     }
-
     ////////////////////// Exclude Groups //////////////////////
     for (int k_idx = 0; k_idx < params_.NUM_EXPERT_GROUPS - topk_group_;
          ++k_idx) {  // QQ NOTE Here params.THREADS_PER_ROW = num_expert_group
@@ -93,14 +93,16 @@ struct moe_fused_gate_impl {
       // local argmax
       T max_val = -TYPE_MAX_V;
       T max_val_second = -TYPE_MAX_V;
+      if (sg.get_local_id()[0] < params_.NUM_EXPERT_GROUPS) {
 #pragma unroll
-      for (int i = 0; i < params_.VPT; ++i) {
-        float val = bias_chunk[i];
-        if (val > max_val) {
-          max_val_second = max_val;
-          max_val = val;
-        } else if (val > max_val_second) {
-          max_val_second = val;
+        for (int i = 0; i < params_.VPT; ++i) {
+          float val = bias_chunk[i];
+          if (val > max_val) {
+            max_val_second = max_val;
+            max_val = val;
+          } else if (val > max_val_second) {
+            max_val_second = val;
+          }
         }
       }
 
@@ -108,10 +110,22 @@ struct moe_fused_gate_impl {
       // weight to select expert groups
       T max_sum = max_val + max_val_second;
 
+      uint32_t lane = sg.get_local_id()[0];  // 0..15
+
+      // Logical subgroup of size 8
+      uint32_t logical_lane = lane & (params_.NUM_EXPERT_GROUPS - 1);  // lane % 8
+      uint32_t group_base = lane & ~(params_.NUM_EXPERT_GROUPS - 1);   // (lane / 8) * 8
+
       // sug-group shuffle to find higher indices
-      for (int mask = sg.get_local_range().size() / 2; mask > 0; mask >>= 1) {
-        T other_max_sum = sycl::permute_group_by_xor(sg, max_sum, mask);
-        int other_expert = sycl::permute_group_by_xor(sg, expert, mask);
+      for (int mask = params_.NUM_EXPERT_GROUPS / 2; mask > 0; mask >>= 1) {
+        uint32_t target_logical = logical_lane ^ mask;
+        uint32_t target_lane = group_base + target_logical;
+
+        // Convert absolute lane → xor distance
+        uint32_t xor_mask = lane ^ target_lane;
+
+        T other_max_sum = sycl::permute_group_by_xor(sg, max_sum, xor_mask);
+        int other_expert = sycl::permute_group_by_xor(sg, expert, xor_mask);
 
         // higher indices win
         if ((max_sum > other_max_sum) || ((other_max_sum == max_sum) && other_expert > expert)) {
@@ -138,26 +152,43 @@ struct moe_fused_gate_impl {
     float output_sum = 0.0f;
     int first_elt_read_by_thread = thread_id * params_.VPT;
     for (int k_idx = 0; k_idx < topk_excluding_share_expert_fusion; ++k_idx) {
-      // local argmax
-      T max_val = bias_chunk[0];
-      int expert = first_elt_read_by_thread;
-      if ((max_val != TYPE_MAX_V)) {
+      T max_val = -TYPE_MAX_V;
+      int expert = 0;
+      if (sg.get_local_id()[0] < params_.NUM_EXPERT_GROUPS) {
+        // local argmax
+        max_val = bias_chunk[0];
+        expert = first_elt_read_by_thread;
+        if ((max_val != TYPE_MAX_V)) {
 #pragma unroll
-        for (int i = 1; i < params_.VPT; ++i) {
-          T val = bias_chunk[i];
-          if ((val > max_val)) {
-            max_val = val;
-            expert = first_elt_read_by_thread + i;
+          for (int i = 1; i < params_.VPT; ++i) {
+            T val = bias_chunk[i];
+            if ((val > max_val)) {
+              max_val = val;
+              expert = first_elt_read_by_thread + i;
+            }
           }
+        } else {
+          max_val = -TYPE_MAX_V;
         }
-      } else {
-        max_val = -TYPE_MAX_V;
       }
+
+      uint32_t lane = sg.get_local_id()[0];  // 0..15
+
+      // Logical subgroup of size 8
+      uint32_t logical_lane = lane & (params_.NUM_EXPERT_GROUPS - 1);  // lane % 8
+      uint32_t group_base = lane & ~(params_.NUM_EXPERT_GROUPS - 1);   // (lane / 8) * 8
+
 // argmax reduce
 #pragma unroll
-      for (int mask = sg.get_local_range().size() / 2; mask > 0; mask >>= 1) {
-        T other_max = sycl::permute_group_by_xor(sg, max_val, mask);
-        int other_expert = sycl::permute_group_by_xor(sg, expert, mask);
+      for (int mask = params_.NUM_EXPERT_GROUPS / 2; mask > 0; mask >>= 1) {
+        uint32_t target_logical = logical_lane ^ mask;
+        uint32_t target_lane = group_base + target_logical;
+
+        // Convert absolute lane → xor distance
+        uint32_t xor_mask = lane ^ target_lane;
+
+        T other_max = sycl::permute_group_by_xor(sg, max_val, xor_mask);
+        int other_expert = sycl::permute_group_by_xor(sg, expert, xor_mask);
 
         // lower indices to win
         if ((other_max > max_val) || ((other_max == max_val) && other_expert < expert)) {
@@ -167,9 +198,11 @@ struct moe_fused_gate_impl {
       }
 
       // Select Topk indicis and weight
-      {
-        int const thread_to_clear_in_group = expert / params_.VPT;  // div thr0, thr1 .. thr7
-        int thread_row = item.get_global_linear_id() / params_.NUM_EXPERT_GROUPS;
+      if (sg.get_local_id()[0] < params_.NUM_EXPERT_GROUPS) {
+        // div thr0, thr1 .. thr7 etc..
+        int const thread_to_clear_in_group = expert / params_.VPT;
+        // Skip Logical groups
+        int thread_row = item.get_global_linear_id() / MAX_VPT;
         int idx = topk_ * thread_row + k_idx;
         ;
         int thread_group_idx = item.get_global_linear_id() % params_.NUM_EXPERT_GROUPS;  // liner % 8 t0, t1... t7
@@ -189,36 +222,40 @@ struct moe_fused_gate_impl {
       }
     }
 
-    int thread_group_idx = item.get_global_linear_id() % params_.NUM_EXPERT_GROUPS;
-    if (thread_group_idx == 0 && num_fused_shared_experts_ > 0) {
-      int thread_row = item.get_global_linear_id() / params_.NUM_EXPERT_GROUPS;
-      int32_t last_idx = topk_ * thread_row + topk_excluding_share_expert_fusion;
-      int32_t expert_offset = 0;
-      indices_[last_idx] = static_cast<int32_t>(params_.NUM_EXPERTS + expert_offset);
+    if (sg.get_local_id()[0] < params_.NUM_EXPERT_GROUPS) {
+      int thread_group_idx = item.get_global_linear_id() % params_.NUM_EXPERT_GROUPS;
+      if (thread_group_idx == 0 && num_fused_shared_experts_ > 0) {
+        // IMP Skip Logical groups
+        int thread_row = item.get_global_linear_id() / MAX_VPT;
+        int32_t last_idx = topk_ * thread_row + topk_excluding_share_expert_fusion;
+        int32_t expert_offset = 0;
+        indices_[last_idx] = static_cast<int32_t>(params_.NUM_EXPERTS + expert_offset);
 
-      // Set the weight to the sum of all weights divided by routed_scaling_factor
-      output_[last_idx] = output_sum / routed_scaling_factor_;
+        // Set the weight to the sum of all weights divided by routed_scaling_factor
+        output_[last_idx] = output_sum / routed_scaling_factor_;
 
-      if (num_fused_shared_experts_ > 1) {
-        for (int i = 1; i < num_fused_shared_experts_; ++i) {
-          ++last_idx;
-          ++expert_offset;
-          indices_[last_idx] = static_cast<int32_t>(params_.NUM_EXPERTS + expert_offset);
-          // Set the weight to the sum of all weights divided by routed_scaling_factor
-          output_[last_idx] = output_sum / routed_scaling_factor_;
+        if (num_fused_shared_experts_ > 1) {
+          for (int i = 1; i < num_fused_shared_experts_; ++i) {
+            ++last_idx;
+            ++expert_offset;
+            indices_[last_idx] = static_cast<int32_t>(params_.NUM_EXPERTS + expert_offset);
+            // Set the weight to the sum of all weights divided by routed_scaling_factor
+            output_[last_idx] = output_sum / routed_scaling_factor_;
+          }
         }
       }
-    }
 
-    ////////////////////// Rescale Output //////////////////////
-    if (thread_group_idx == 0) {
-      int thread_row = item.get_global_linear_id() / params_.NUM_EXPERT_GROUPS;
+      ////////////////////// Rescale Output //////////////////////
+      if (thread_group_idx == 0) {
+        // IMP Skip Logical groups
+        int thread_row = item.get_global_linear_id() / MAX_VPT;
 #pragma unroll
-      for (int i = 0; i < topk_; ++i) {
-        int64_t const idx = topk_ * thread_row + i;
-        output_[idx] = output_[idx] / output_sum;
-        if (apply_routed_scaling_factor_on_output_) {
-          output_[idx] *= routed_scaling_factor_;
+        for (int i = 0; i < topk_; ++i) {
+          int64_t const idx = topk_ * thread_row + i;
+          output_[idx] = output_[idx] / output_sum;
+          if (apply_routed_scaling_factor_on_output_) {
+            output_[idx] *= routed_scaling_factor_;
+          }
         }
       }
     }
@@ -268,11 +305,11 @@ void moe_fused_gate_kernel(
   auto queue = stream.queue();
 
   uint32_t num_blocks = (num_rows + ROWS_PER_WG - 1) / ROWS_PER_WG;
-  sycl::range<3> global_range{num_blocks, ROWS_PER_WG, THREADS_PER_ROW};
-  sycl::range<3> local_range{1, ROWS_PER_WG, THREADS_PER_ROW};
+  sycl::range<3> global_range{num_blocks, ROWS_PER_WG, MAX_VPT};
+  sycl::range<3> local_range{1, ROWS_PER_WG, MAX_VPT};
 
   KernelParams<VPT, NUM_EXPERTS, THREADS_PER_ROW> params;
-  using Kernel = moe_fused_gate_impl<T, decltype(params), THREADS_PER_ROW>;
+  using Kernel = moe_fused_gate_impl<T, decltype(params)>;
 
   Kernel task(
       input_ptr,
@@ -308,6 +345,63 @@ void moe_fused_gate_kernel(
         apply_routed_scaling_factor_on_output);               \
     dispatched = true;                                        \
   } while (0)
+
+//------------------------------------------------------------------------------
+// Dynamic Kernel Version (parameters computed at runtime)
+//------------------------------------------------------------------------------
+struct KernelParamsDynamic {
+  int VPT;
+  int NUM_EXPERTS;
+  int NUM_EXPERT_GROUPS;
+};
+
+template <typename T>
+void moe_fused_gate_kernel_dynamic(
+    const torch::Tensor& input,
+    const torch::Tensor& bias,
+    torch::Tensor& output,
+    torch::Tensor& indices,
+    int64_t num_rows,
+    int64_t topk_group,
+    int64_t topk,
+    int64_t num_fused_shared_experts,
+    double routed_scaling_factor,
+    bool apply_routed_scaling_factor_on_output) {
+  auto input_ptr = reinterpret_cast<T*>(input.data_ptr());
+  auto bias_ptr = reinterpret_cast<T*>(bias.data_ptr());
+  auto output_ptr = reinterpret_cast<float*>(output.data_ptr());
+  auto indices_ptr = reinterpret_cast<int32_t*>(indices.data_ptr());
+  int32_t num_experts = input.size(1);
+
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
+
+  uint32_t num_blocks = (num_rows + ROWS_PER_WG - 1) / ROWS_PER_WG;
+  sycl::range<3> global_range{num_blocks, ROWS_PER_WG, MAX_VPT};
+  sycl::range<3> local_range{1, ROWS_PER_WG, MAX_VPT};
+
+  KernelParamsDynamic params;
+  params.NUM_EXPERTS = num_experts;       // e.g, for deepseek v3, this is 256
+  params.VPT = num_experts / topk_group;  // e.g., for deepseek v3, this is 256 / 8 = 32
+  params.NUM_EXPERT_GROUPS = topk_group;  // fixed as num_expert_group, e.g., for deepseek v3, this is 8
+
+  using Kernel = moe_fused_gate_impl<T, decltype(params)>;
+
+  Kernel task(
+      input_ptr,
+      bias_ptr,
+      output_ptr,
+      indices_ptr,
+      num_rows,
+      topk_group,
+      topk,
+      num_fused_shared_experts,
+      routed_scaling_factor,
+      apply_routed_scaling_factor_on_output,
+      params);
+
+  sycl_kernel_submit(global_range, local_range, queue, task);
+}
 
 //------------------------------------------------------------------------------
 // Host Launcher Function
@@ -364,8 +458,37 @@ std::vector<at::Tensor> moe_fused_gate(
               LAUNCH_MOE_GATE_CONFIG(scalar_t, 512, 16);
             }
             break;
+          case 256:
+            if (num_expert_group == 8) {
+              LAUNCH_MOE_GATE_CONFIG(scalar_t, 256, 8);
+            } else if (num_expert_group == 16) {
+              LAUNCH_MOE_GATE_CONFIG(scalar_t, 256, 16);
+            }
+            break;
+          case 128:
+            if (num_expert_group == 4) {
+              LAUNCH_MOE_GATE_CONFIG(scalar_t, 128, 4);
+            } else if (num_expert_group == 8) {
+              LAUNCH_MOE_GATE_CONFIG(scalar_t, 128, 8);
+            }
+            break;
           default:
             break;
+        }
+        if (!dispatched) {
+          // Fallback to the dynamic kernel if none of the supported combinations match.
+          // currently only support num_experts / num_expert_group <= 32 for dynamic kernels
+          moe_fused_gate_kernel_dynamic<scalar_t>(
+              input,
+              bias,
+              output,
+              indices,
+              num_rows,
+              topk_group,
+              topk,
+              num_fused_shared_experts,
+              routed_scaling_factor,
+              apply_routed_scaling_factor_on_output);
         }
       });
   return {output, indices};

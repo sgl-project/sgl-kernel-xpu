@@ -13,8 +13,8 @@ from sglang.srt.layers.moe.topk import biased_grouped_topk
 @pytest.mark.parametrize(
     "params",
     [
-        # (128, 4, 2, 4),
-        # (256, 8, 4, 8),  # deepseek v3
+        (128, 4, 2, 4),
+        (256, 8, 4, 8),  # deepseek v3
         (512, 16, 8, 16),
     ],
 )
@@ -32,7 +32,6 @@ def test_moe_fused_gate_combined(
     scores = tensor.clone()
     bias = torch.rand(num_experts, dtype=dtype, device="xpu")
     topk = topk + num_fused_shared_experts
-
     output, indices = moe_fused_gate(
         tensor,
         bias,

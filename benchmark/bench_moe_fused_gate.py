@@ -1,11 +1,8 @@
-from typing import (
-    Optional,
-)
+from typing import Optional
 
 import torch
 import triton
 from sgl_kernel import moe_fused_gate
-
 
 all_results = []
 

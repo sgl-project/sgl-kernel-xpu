@@ -333,11 +333,12 @@ struct MoEMainloop<
 
     // Add bias if needed
     if constexpr (WithBias) {
+      auto n_idx_0 = BLK_N * wg_n + thr_id;
+      auto n_idx_1 = BLK_N * wg_n1 + thr_id;
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < tCrC0.size(); ++i) {
-        auto n_idx = i % BLK_M;
-        tCrC0(i) = tCrC0(i) + Bias0(BLK_N * wg_n + n_idx);
-        tCrC1(i) = tCrC1(i) + Bias1(BLK_N * wg_n1 + n_idx);
+        tCrC0(i) = tCrC0(i) + Bias0(n_idx_0);
+        tCrC1(i) = tCrC1(i) + Bias1(n_idx_1);
       }
     }
 

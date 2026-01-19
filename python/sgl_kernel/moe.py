@@ -313,9 +313,9 @@ def fused_experts(
     E, OutK, N = w2.shape
     assert N * 2 == w1.shape[1], "w1 shape[1] must be 2x of w2 shape[2]"
     if b1 is not None:
-        b1.shape == w1.shape[:2], "b1 shape must match w1 shape[:2]"
+        assert b1.shape == w1.shape[:2], "b1 shape must match w1 shape[:2]"
     if b2 is not None:
-        b2.shape == w2.shape[:2], "b2 shape must match w2 shape[:2]"
+        assert b2.shape == w2.shape[:2], "b2 shape must match w2 shape[:2]"
 
     M = num_tokens
     TopK = topk_ids.shape[1]

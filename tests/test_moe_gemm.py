@@ -45,12 +45,12 @@ def torch_naive_moe(
     b1 = (
         b1
         if b1 is not None
-        else torch.zeros(w1.shape[0], 1, dtype=a.dtype, device=a.device)
+        else torch.zeros(w1.shape[:2], dtype=a.dtype, device=a.device)
     )
     b2 = (
         b2
         if b2 is not None
-        else torch.zeros(w2.shape[0], 1, dtype=a.dtype, device=a.device)
+        else torch.zeros(w2.shape[:2], dtype=a.dtype, device=a.device)
     )
 
     for i in range(w1.shape[0]):
@@ -121,7 +121,6 @@ def test_moe_gemm(
         b1,
         b2,
     )
-    # import pdb; pdb.set_trace()
     torch.testing.assert_close(torch_output, sglang_output, rtol=rtol, atol=atol)
 
 

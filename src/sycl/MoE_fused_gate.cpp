@@ -57,7 +57,7 @@ struct moe_fused_gate_impl {
     int row_local_id = item.get_local_id(1);
     int thread_id = item.get_local_id(2);
 
-    // pepare row offset and chunk offset
+    // prepare row offset and chunk offset
     int64_t token_row_offset = block_id * ROWS_PER_WG * params_.NUM_EXPERTS + row_local_id * params_.NUM_EXPERTS;
     int64_t token_row_chunk_offset = token_row_offset + thread_id * params_.VPT;
 

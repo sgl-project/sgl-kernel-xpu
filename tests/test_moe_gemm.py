@@ -82,7 +82,7 @@ def test_moe_gemm(
 ):
     torch.xpu.manual_seed_all(0)
 
-    rtol, atol = 1e-1, (2e-2 if with_bias else 1e-2)
+    rtol, atol = 1e-1, 1e-2
     a = create_random_xpu_tensor((num_tokens, hidden_size), torch.bfloat16)
     w1 = create_random_xpu_tensor(
         (num_experts, 2 * intermediate_size, hidden_size), torch.bfloat16

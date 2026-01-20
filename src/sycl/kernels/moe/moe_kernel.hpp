@@ -218,7 +218,7 @@ class MoEGEMM {
               get<1>(Bias_tensor));
         } else {
           auto tile_coord = make_coord(m_coord, n_coord, _, 0);
-          mainloop(A_tensor, get<0>(B_tensor), D_tensor, tile_coord, mma, thr_id);
+          mainloop(A_tensor, get<0>(B_tensor), D_tensor, tile_coord, mma, thr_id, get<0>(Bias_tensor));
         }
         if (thr_id == 0) {
           slm_mem[0] = cutlass::atomicAdd(workspace, 1);

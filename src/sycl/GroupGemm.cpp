@@ -19,10 +19,10 @@ using namespace MoE;
 
 using ElementAccumulator = float;  // <- data type of accumulator
 
-template <typename, typename, typename, typename, typename, typename>
+template <typename, typename, typename, typename, typename, typename, bool>
 class GemmCuteName;
 
-template <typename Tile, typename SGLayout>
+template <typename Tile, typename SGLayout, bool FuseSiLU>
 void MoEGEMMLauncher(
     sycl::queue q,
     const void* activations,
@@ -67,7 +67,7 @@ void MoEGEMMLauncher(
 
   syclex::properties kernel_props{syclex::sub_group_size<16>, intelex::grf_size<256>};
 
-  using Kernel = MoE::MoEGEMM<Tile, SGLayout, TensorA, TensorB, TensorD, MMA, Element>;
+  using Kernel = MoE::MoEGEMM<Tile, SGLayout, TensorA, TensorB, TensorD, MMA, FuseSiLU, Element>;
   typename Kernel::Params params{
       static_cast<const Element*>(activations),
       static_cast<const Element*>(weights),
@@ -84,7 +84,7 @@ void MoEGEMMLauncher(
   auto Q = stream.queue();
   auto event = Q.submit([&](sycl::handler& h) {
     sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), h);
-    h.parallel_for<GemmCuteName<Tile, SGLayout, TensorA, TensorB, TensorD, Element>>(
+    h.parallel_for<GemmCuteName<Tile, SGLayout, TensorA, TensorB, TensorD, Element, FuseSiLU>>(
         sycl::nd_range<3>(global * local, local), kernel_props, [=](sycl::nd_item<3> item) {
           int32_t* slm_mem =
               static_cast<int32_t*>(local_mem.template get_multi_ptr<sycl::access::decorated::no>().get());
@@ -106,16 +106,27 @@ void MoEGEMMLauncher(
       n_experts,                              \
       static_cast<int*>(atomic_buffer.data_ptr()))
 
+#define DISPATCH_MOE_BY_CONDITION(condition, ...) \
+  do {                                            \
+    if (condition) {                              \
+      LAUNCH_MOE(__VA_ARGS__, true);              \
+    } else {                                      \
+      LAUNCH_MOE(__VA_ARGS__, false);             \
+    }                                             \
+  } while (0)
+
 void moe_grouped_mm_nt(
     torch::Tensor& output,
     const torch::Tensor& activations,
     const torch::Tensor& weights,
     const torch::Tensor& total_rows_for_experts,
-    const int64_t n_experts) {
+    const int64_t n_experts,
+    bool fuse_silu) {
   int total_m = activations.sizes()[0];
   int gemm_k = activations.sizes()[1];
   auto weights_shape = weights.sizes().vec();
   int gemm_n = weights.sizes()[1];
+  int avg_m = total_m / n_experts;
 
   TORCH_CHECK(weights_shape.size() == 3, "weights must be 3D");
   TORCH_CHECK(weights_shape[0] == n_experts, "weights must have n_experts as the first dimension");
@@ -124,7 +135,11 @@ void moe_grouped_mm_nt(
       weights_shape[0] == total_rows_for_experts.size(0),
       "rows_for_experts must have the same size as the first dimension of weights");
   TORCH_CHECK(output.sizes()[0] == total_m, "output must have the same number of rows as activations");
-  TORCH_CHECK(output.sizes()[1] == gemm_n, "output must have the same number of columns as activations");
+  if (fuse_silu) {
+    TORCH_CHECK(output.sizes()[1] == gemm_n / 2, "output must have half the number of columns as activations");
+  } else {
+    TORCH_CHECK(output.sizes()[1] == gemm_n, "output must have the same number of columns as activations");
+  }
   TORCH_CHECK(n_experts % 8 == 0, "n_experts must be a multiple of 8 for the current implementation");
   TORCH_CHECK(
       activations.scalar_type() == weights.scalar_type(), "activations and weights must have the same data type");
@@ -136,13 +151,23 @@ void moe_grouped_mm_nt(
   auto queue = stream.queue();
   at::Tensor atomic_buffer = at::empty({static_cast<long>(1)}, activations.options().dtype(at::kInt));
 
-  if (total_m <= 8) {
-    LAUNCH_MOE(Shape<_8, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
-  } else if (total_m <= 16) {
-    LAUNCH_MOE(Shape<_16, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
-  } else if (total_m <= 32) {
-    LAUNCH_MOE(Shape<_32, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
+  if (avg_m <= 8) {
+    DISPATCH_MOE_BY_CONDITION(fuse_silu, Shape<_8, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
+  } else if (avg_m <= 16) {
+    DISPATCH_MOE_BY_CONDITION(fuse_silu, Shape<_16, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
+  } else if (avg_m <= 32) {
+    DISPATCH_MOE_BY_CONDITION(fuse_silu, Shape<_32, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
+  } else if (avg_m <= 128) {
+    if (fuse_silu) {
+      LAUNCH_MOE(Shape<_128, _32, _32>, Layout<Shape<_2, _8, _1>, Stride<_8, _1, _0>>, true);
+    } else {
+      LAUNCH_MOE(Shape<_128, _64, _32>, Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>, false);
+    }
   } else {
-    LAUNCH_MOE(Shape<_256, _256, _32>, Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>);
+    if (fuse_silu) {
+      LAUNCH_MOE(Shape<_256, _32, _32>, Layout<Shape<_4, _8, _1>, Stride<_8, _1, _0>>, true);
+    } else {
+      LAUNCH_MOE(Shape<_256, _128, _32>, Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>, false);
+    }
   }
 }

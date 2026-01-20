@@ -9,12 +9,6 @@
 
 #include "Utils.h"
 
-// Helper clamp for pre-C++17
-template <typename T>
-inline T clamp(T x, T lo, T hi) {
-  return sycl::fmin(hi, sycl::fmax(lo, x));
-}
-
 template <typename scalar_t>
 struct SwigluScalarKernel {
   const scalar_t* x;
@@ -38,10 +32,8 @@ struct SwigluScalarKernel {
     float gate = static_cast<float>(gate_raw);
     float up = static_cast<float>(up_raw);
 
-    // gate.clamp(min=None, max=gemm1_limit)
     gate = sycl::fmin(gate, gemm1_limit);
 
-    // up.clamp(min=-gemm1_limit, max=gemm1_limit)
     up = sycl::fmax(-gemm1_limit, sycl::fmin(up, gemm1_limit));
 
     // gate * sigmoid(gate * gemm1_alpha) * (up + 1)
@@ -119,7 +111,6 @@ void swiglu_with_alpha_and_limit_sycl(
   const size_t remainder = pairs - remainder_start;
 
   const size_t local = 256;
-  const size_t global = ((vec_pairs + local - 1) / local) * local;
   auto stream = at::xpu::getCurrentXPUStream();
   auto q = stream.queue();
   if (vec_pairs > 0) {

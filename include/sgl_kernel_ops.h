@@ -221,7 +221,7 @@ void topk_softmax(
     torch::Tensor& topk_indices,
     torch::Tensor& token_expert_indices,
     torch::Tensor& gating_output);
-torch::Tensor swiglu_with_alpha_and_limit(torch::Tensor x, double alpha, double limit);
+
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
     at::Tensor& bias,

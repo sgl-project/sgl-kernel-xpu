@@ -1,9 +1,11 @@
 import itertools
+
 import pandas as pd
 import torch
 import triton
 import triton.testing
 from sgl_kernel import swiglu_with_alpha_and_limit
+
 
 def reference_swiglu_with_alpha_and_limit(x, alpha, limit):
     gate, up = x[..., ::2], x[..., 1::2]
@@ -11,8 +13,10 @@ def reference_swiglu_with_alpha_and_limit(x, alpha, limit):
     up = up.clamp(min=-limit, max=limit)
     return gate * torch.sigmoid(gate * alpha) * (up + 1)
 
+
 def sglang_swiglu_with_alpha_and_limit(x, alpha, limit):
     return swiglu_with_alpha_and_limit(x, alpha, limit)
+
 
 def calculate_diff(batch_size, hidden_dim, alpha, limit, dtype):
     device = torch.device("xpu")
@@ -32,14 +36,17 @@ def calculate_diff(batch_size, hidden_dim, alpha, limit, dtype):
     else:
         print(f"❌ kernel and reference differ for alpha={alpha}, limit={limit}")
 
+
 batch_size_range = [1, 4, 8, 16, 32]
 hidden_dim_range = [512, 1024, 2048, 4096]
 configs = list(itertools.product(batch_size_range, hidden_dim_range))
 all_results = []
 
+
 def calculate_flops(batch_size, hidden_dim):
     # [B, H], 5 ops per output entry
     return batch_size * hidden_dim * 5
+
 
 def calculate_effective_bandwidth(
     batch_size: int,
@@ -48,7 +55,7 @@ def calculate_effective_bandwidth(
     time_ms: float,
 ) -> dict:
     input_bytes = batch_size * hidden_dim * 2 * 4  # [B, 2H] float32
-    output_bytes = batch_size * hidden_dim * 4     # [B, H] float32
+    output_bytes = batch_size * hidden_dim * 4  # [B, H] float32
     total_bytes = input_bytes + output_bytes
     time_s = time_ms / 1000.0
     bandwidth_gbs = (total_bytes / 1e9) / time_s if time_s > 0 else 0
@@ -64,6 +71,7 @@ def calculate_effective_bandwidth(
         "total_flops": total_flops,
         "gflops": gflops,
     }
+
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -90,9 +98,7 @@ def benchmark_swiglu_alpha_limit(batch_size, hidden_dim, alpha, limit, dtype, pr
 
     ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
 
-    bw_metrics = calculate_effective_bandwidth(
-        batch_size, hidden_dim, dtype, ms
-    )
+    bw_metrics = calculate_effective_bandwidth(batch_size, hidden_dim, dtype, ms)
 
     all_results.append(
         {
@@ -111,6 +117,7 @@ def benchmark_swiglu_alpha_limit(batch_size, hidden_dim, alpha, limit, dtype, pr
     )
 
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+
 
 if __name__ == "__main__":
     # Test correctness kernel vs reference

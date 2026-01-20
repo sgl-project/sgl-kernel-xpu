@@ -154,7 +154,9 @@ torch::Tensor swiglu_with_alpha_and_limit(
     double alpha,
     double limit) {
   TORCH_CHECK(x.is_xpu(), "Unsupported device");
-  TORCH_CHECK(x.dtype() == torch::kFloat32, "Only float32 supported");
+  TORCH_CHECK(
+      x.dtype() == torch::kFloat32 || x.dtype() == torch::kFloat16 || x.dtype() == torch::kBFloat16,
+      "Only float32, float16, and bfloat16 are supported");
   TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
   TORCH_CHECK(x.dim() == 2, "x must be 2D [B, 2H]");
   TORCH_CHECK(x.size(1) % 2 == 0, "Last dim must be even");
@@ -166,8 +168,8 @@ torch::Tensor swiglu_with_alpha_and_limit(
   // output: [B, H]
   auto y = torch::empty({B, H}, x.options());
 
-  const float* x_ptr = x.data_ptr<float>();
-  float* y_ptr = y.data_ptr<float>();
+  const void* x_ptr = x.data_ptr();
+  void* y_ptr = y.data_ptr();
 
   SYCL_DISPATCH_BY_SCALAR_DTYPE(x.scalar_type(), CALL_SWIGLU_VEC4_LAUNCHER_SYCL);
 

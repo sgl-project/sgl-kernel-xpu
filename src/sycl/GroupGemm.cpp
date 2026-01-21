@@ -46,7 +46,6 @@ void MoEGEMMLauncher(
   using StrideA = Stride<int, _1>;
   using StrideB = Stride<int, _1>;
   using StrideD = Stride<int, _1>;
-  using StrideBias = Stride<_1>;
   using TensorA = decltype(make_dummy_tensor(Element{}, StrideA{}));
   using TensorB = decltype(make_dummy_tensor(Element{}, StrideB{}));
   using TensorD = decltype(make_dummy_tensor(Element{}, StrideD{}));
@@ -171,6 +170,7 @@ void moe_grouped_mm_nt(
       activations.scalar_type() == at::ScalarType::BFloat16,
       "Only bfloat16 are supported in moe_grouped_mm_nt currently");
   if (bias.has_value()) {
+    TORCH_CHECK(bias->dim() == 2, "bias must be 2D [n_experts, N]");
     TORCH_CHECK(bias->size(0) == n_experts && bias->size(1) == gemm_n, "bias shape mismatch with weight");
   }
 

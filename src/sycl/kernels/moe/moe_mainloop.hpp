@@ -65,7 +65,9 @@ template <
     class ATensor_,
     class BTensor_,
     class DTensor_,
-    class TiledMMA_>
+    class BiasTensor_,
+    class TiledMMA_,
+    bool WithBias>
 struct MoEMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -78,8 +80,20 @@ template <
     class ATensor_,
     class BTensor_,
     class DTensor_,
-    class TiledMMA_>
-struct MoEMainloop<XeDefault<Stages>, TiledCopyA_, TiledCopyB_, TilesCopyD_, ATensor_, BTensor_, DTensor_, TiledMMA_> {
+    class BiasTensor_,
+    class TiledMMA_,
+    bool WithBias>
+struct MoEMainloop<
+    XeDefault<Stages>,
+    TiledCopyA_,
+    TiledCopyB_,
+    TilesCopyD_,
+    ATensor_,
+    BTensor_,
+    DTensor_,
+    BiasTensor_,
+    TiledMMA_,
+    WithBias> {
   using TiledMMA = TiledMMA_;
   using TiledCopyA = TiledCopyA_;
   using TiledCopyB = TiledCopyB_;
@@ -87,6 +101,7 @@ struct MoEMainloop<XeDefault<Stages>, TiledCopyA_, TiledCopyB_, TilesCopyD_, ATe
   using ATensor = ATensor_;
   using BTensor = BTensor_;  // cute::tuple<tensor> or cute::tuple<tensor, tensor>
   using DTensor = DTensor_;
+  using BiasTensor = BiasTensor_;
   MoEMainloop() {}
 
   template <typename Coord>
@@ -96,8 +111,8 @@ struct MoEMainloop<XeDefault<Stages>, TiledCopyA_, TiledCopyB_, TilesCopyD_, ATe
       DTensor& D,  // (M,N)
       Coord blk_coord,
       TiledMMA mma,
-      int thr_id) {  // work-item ID
-
+      int thr_id,  // work-item ID
+      BiasTensor Bias) {
     auto wg_m = get<0>(blk_coord);
     auto wg_n = get<1>(blk_coord);
 
@@ -187,6 +202,14 @@ struct MoEMainloop<XeDefault<Stages>, TiledCopyA_, TiledCopyB_, TilesCopyD_, ATe
       cute::gemm(mma, tSrA, tSrB, tCrC);
       barrier_wait(barrier_scope);
     }
+
+    // Add bias if needed
+    if constexpr (WithBias) {
+      constexpr int BLK_M = get<0>(wg_tile);
+      constexpr int BLK_N = get<1>(wg_tile);
+      add_bias<decltype(tCrC), BLK_M, BLK_N>(Bias, tCrC, mma, wg_n, thr_id);
+    }
+
     reorder(tCrC, tCrD_final_sg_tensor);
     copy(tiled_copy_d, tCrD_final_sg_tensor, tCgD);
   }
@@ -199,8 +222,9 @@ struct MoEMainloop<XeDefault<Stages>, TiledCopyA_, TiledCopyB_, TilesCopyD_, ATe
       DTensor& D,   // (M,N)
       Coord blk_coord,
       TiledMMA mma,
-      int thr_id) {  // work-item ID
-
+      int thr_id,  // work-item ID
+      BiasTensor Bias0,
+      BiasTensor Bias1) {
     auto wg_m = get<0>(blk_coord);
     auto wg_n = get<1>(blk_coord);
     auto wg_n1 = get<2>(blk_coord);
@@ -315,6 +339,12 @@ struct MoEMainloop<XeDefault<Stages>, TiledCopyA_, TiledCopyB_, TilesCopyD_, ATe
       barrier_wait(barrier_scope);
     }
 
+    // Add bias if needed
+    if constexpr (WithBias) {
+      add_bias<decltype(tCrC0), BLK_M, BLK_N>(Bias0, tCrC0, mma, wg_n, thr_id);
+      add_bias<decltype(tCrC1), BLK_M, BLK_N>(Bias1, tCrC1, mma, wg_n1, thr_id);
+    }
+
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tCrC0.size(); ++i) {
       float x = tCrC0(i);
@@ -325,6 +355,37 @@ struct MoEMainloop<XeDefault<Stages>, TiledCopyA_, TiledCopyB_, TilesCopyD_, ATe
 
     reorder(tCrC0, tCrD_final_sg_tensor0);
     copy(tiled_copy_d, tCrD_final_sg_tensor0, tCgD);
+  }
+
+  template <
+      typename tCrC_t,  // Using SubgroupTensor requires template args
+      int tile_m,
+      int tile_n>
+  void add_bias(const BiasTensor& Bias, tCrC_t& tCrC, const TiledMMA& mma, int wg_n, int thr_id) {
+    // Reference:
+    // https://github.com/vllm-project/vllm-xpu-kernels/blob/c771759e75529b47d959809c96badfb7d5ba8c88/csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp#L178C1-L208C4
+    static constexpr auto ATOM_M = get<1>(typename TiledMMA::ThrLayoutVMNK{}.shape());  // SG replication along M
+    static constexpr auto ATOM_N = get<2>(typename TiledMMA::ThrLayoutVMNK{}.shape());  // SG replication along N
+
+    static constexpr int sg_local_range = 16;  // 16 threads in each SG
+    int sg_local_n_coord = (thr_id / sg_local_range) % ATOM_N;
+    int sg_local_id = (thr_id % sg_local_range);  // thread id in SG
+
+    static constexpr auto SG_M = tile_m / ATOM_M;
+    static constexpr auto SG_N = tile_n / ATOM_N;
+
+    int n_tile_start = wg_n * tile_n;
+    int n_sg_start = sg_local_n_coord * SG_N;
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int sn = 0; sn < SG_N / sg_local_range; ++sn) {
+      int sg_local_n = sn * sg_local_range + sg_local_id;  // n offset of thread
+      float bias = static_cast<float>(Bias(n_tile_start + n_sg_start + sg_local_n));
+      CUTLASS_PRAGMA_UNROLL
+      for (int sm = 0; sm < SG_M; ++sm) {
+        tCrC(sn * SG_M + sm) += bias;
+      }
+    }
   }
 };
 

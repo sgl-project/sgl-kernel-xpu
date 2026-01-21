@@ -128,7 +128,8 @@ shape_configs = [
 
 shape_values = [list(d.values()) for d in shape_configs]
 bs = [1, 128, 512, 1024, 2048, 4096, 8192]
-configs = [(k, *v) for k, v in product(bs, shape_values)]
+with_bias = [False, True]
+configs = [(k, *v, b) for k, v, b in product(bs, shape_values, with_bias)]
 all_results = []
 
 
@@ -182,6 +183,8 @@ def fused_moe_torch_compile(
     w2,
     input_gating,
     topk,
+    b1,
+    b2,
     use_fp8_w8a8=False,
     w1_scale=None,
     w2_scale=None,
@@ -203,6 +206,8 @@ def fused_moe_sglang_api(
     w2,
     input_gating,
     topk,
+    b1,
+    b2,
 ):
     num_tokens = x.shape[0]
     topk_weights = torch.empty(num_tokens, topk, dtype=torch.float32, device=x.device)
@@ -214,11 +219,16 @@ def fused_moe_sglang_api(
         input_gating,
         renormalize=True,
     )
-    return fused_experts(
-        x,
-        w1,
-        w2,
-        topk_weights,
+    return (
+        fused_experts(
+            x,
+            w1,
+            w2,
+            topk_weights,
+            topk_indices,
+            b1,
+            b2,
+        ),
         topk_indices,
     )
 
@@ -233,6 +243,7 @@ def fused_moe_sglang_api(
             "shard_intermediate_size",
             "dtype",
             "block_shape",
+            "with_bias",
         ],
         x_vals=configs,
         line_arg="provider",
@@ -258,10 +269,11 @@ def benchmark(
     shard_intermediate_size,
     dtype,
     block_shape,
+    with_bias,
     provider,
 ):
     print(
-        f"benchmark {provider} with batch_size={num_tokens} hidden_size={hidden_size} shard_intermediate_size={shard_intermediate_size}"
+        f"benchmark {provider} with batch_size={num_tokens} hidden_size={hidden_size} shard_intermediate_size={shard_intermediate_size} with_bias={with_bias}"
     )
     torch.set_default_device("xpu")
     torch.xpu.manual_seed_all(0)
@@ -271,6 +283,10 @@ def benchmark(
     w2 = torch.randn(
         num_experts, hidden_size, shard_intermediate_size // 2, dtype=dtype
     )
+    b1, b2 = None, None
+    if with_bias:
+        b1 = torch.randn(w1.shape[:2], dtype=dtype)
+        b2 = torch.randn(w2.shape[:2], dtype=dtype)
 
     input_gating = torch.randn(num_tokens, num_experts, dtype=dtype)
 
@@ -285,11 +301,13 @@ def benchmark(
         "w2": w2,
         "input_gating": input_gating,
         "topk": topk,
+        "b1": b1,
+        "b2": b2,
     }
 
     # Warmup
     for _ in range(10):
-        _ = api_func(**api_kwargs)
+        _, topk_ids = api_func(**api_kwargs)
     torch.xpu.synchronize()
 
     bench_lambda = lambda: api_func(**api_kwargs)
@@ -307,8 +325,11 @@ def benchmark(
             + shard_intermediate_size * hidden_size
         )
     )
+    if with_bias:
+        flop += num_tokens * topk * (shard_intermediate_size + hidden_size)
+    num_act_experts = torch.unique(topk_ids).numel()
     memory = (
-        min(num_experts, num_tokens * topk)
+        num_act_experts
         * (
             hidden_size * shard_intermediate_size
             + hidden_size * shard_intermediate_size // 2
@@ -316,6 +337,13 @@ def benchmark(
         * torch.finfo(dtype).bits
         // 8
     )
+    if with_bias:
+        memory += (
+            num_act_experts
+            * (shard_intermediate_size + hidden_size)
+            * torch.finfo(dtype).bits
+            // 8
+        )
     tflops = flop / (ms / 1e3) / 1e12
     bandwidth = memory / (ms / 1e3) / 1e9
 
@@ -328,6 +356,7 @@ def benchmark(
             "shard_intermediate_size": shard_intermediate_size,
             "dtype": dtype,
             "block_shape": block_shape,
+            "with_bias": with_bias,
             "provider": provider,
             "tflops": tflops,
             "bandwidth": bandwidth,

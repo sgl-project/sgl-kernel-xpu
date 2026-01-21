@@ -290,6 +290,10 @@ def fused_experts(
     assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
     assert w1.dtype == torch.bfloat16, "w1 must be bfloat16"
     assert w2.dtype == torch.bfloat16, "w2 must be bfloat16"
+    if b1 is not None:
+        assert b1.dtype == torch.bfloat16, "b1 must be bfloat16"
+    if b2 is not None:
+        assert b2.dtype == torch.bfloat16, "b2 must be bfloat16"
 
     # Shape check
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
@@ -308,6 +312,10 @@ def fused_experts(
     E, _, K = w1.shape
     E, OutK, N = w2.shape
     assert N * 2 == w1.shape[1], "w1 shape[1] must be 2x of w2 shape[2]"
+    if b1 is not None:
+        assert b1.shape == w1.shape[:2], "b1 shape must match w1 shape[:2]"
+    if b2 is not None:
+        assert b2.shape == w2.shape[:2], "b2 shape must match w2 shape[:2]"
 
     M = num_tokens
     TopK = topk_ids.shape[1]
@@ -359,14 +367,20 @@ def fused_experts(
     )
 
     torch.ops.sgl_kernel.moe_grouped_mm_nt(
-        intermediate_cache1, input_A_shuffle, w1, expert_offsets, E, fuse_silu=True
+        intermediate_cache1, input_A_shuffle, w1, b1, expert_offsets, E, fuse_silu=True
     )
 
     # silu_and_mul is fused into moe_grouped_mm_nt
     # torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
 
     torch.ops.sgl_kernel.moe_grouped_mm_nt(
-        intermediate_cache3, intermediate_cache1, w2, expert_offsets, E, fuse_silu=False
+        intermediate_cache3,
+        intermediate_cache1,
+        w2,
+        b2,
+        expert_offsets,
+        E,
+        fuse_silu=False,
     )
 
     torch.ops.sgl_kernel.apply_shuffle_mul_sum.default(

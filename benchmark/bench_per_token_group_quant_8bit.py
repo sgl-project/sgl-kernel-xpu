@@ -7,10 +7,7 @@ import triton
 import triton.language as tl
 from sgl_kernel import sgl_per_token_group_quant_fp8, sgl_per_token_group_quant_int8
 
-from sglang.srt.utils import is_hip
-
-_is_hip = is_hip()
-fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
+fp8_type_ = torch.float8_e4m3fn
 
 
 @triton.jit
@@ -126,23 +123,12 @@ def sglang_per_token_group_quant_8bit(
     ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
-    x_q = torch.empty_like(x, device=x.device, dtype=dst_dtype)
-    x_s = torch.empty(
-        x.shape[:-1] + (x.shape[-1] // group_size,),
-        device=x.device,
-        dtype=torch.float32,
-    )
-
     if dst_dtype == torch.int8:
         iinfo = torch.iinfo(dst_dtype)
-        int8_max = iinfo.max
-        int8_min = iinfo.min
-        sgl_per_token_group_quant_int8(x, x_q, x_s, group_size, eps, int8_min, int8_max)
+        x_q, x_s = sgl_per_token_group_quant_int8(x, group_size, eps)
     else:
         f8_info = torch.finfo(dst_dtype)
-        fp8_max = f8_info.max
-        fp8_min = f8_info.min
-        sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max)
+        x_q, x_s = sgl_per_token_group_quant_fp8(x, group_size, eps)
 
     return x_q, x_s
 
@@ -206,7 +192,7 @@ def calculate_flops(
     Per group: 6 FLOPs (4 reduction fmax, 2 scale divisions)
     """
     flops_per_element = 5  # 2 for absmax + 3 for quantization
-    flops_per_group = 6    # 4 for reduction + 2 for scale calculation
+    flops_per_group = 6  # 4 for reduction + 2 for scale calculation
 
     total_flops = (num_elements * flops_per_element) + (num_groups * flops_per_group)
 
@@ -230,9 +216,9 @@ def calculate_effective_bandwidth(
     num_elements = num_tokens * hidden_dim
     num_groups = num_elements // group_size
 
-    input_bytes = num_elements * 2      # bf16
-    output_bytes = num_elements * 1     # int8/fp8
-    scale_bytes = num_groups * 4        # fp32
+    input_bytes = num_elements * 2  # bf16
+    output_bytes = num_elements * 1  # int8/fp8
+    scale_bytes = num_groups * 4  # fp32
     total_bytes = input_bytes + output_bytes + scale_bytes
 
     time_s = time_ms / 1000.0

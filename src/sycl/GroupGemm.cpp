@@ -87,9 +87,7 @@ void MoEGEMMLauncher(
       mma,
   };
 
-  auto stream = at::xpu::getCurrentXPUStream();
-  auto Q = stream.queue();
-  auto event = Q.submit([&](sycl::handler& h) {
+  auto event = q.submit([&](sycl::handler& h) {
     sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), h);
     h.parallel_for<GemmCuteName<Tile, SGLayout, TensorA, TensorB, TensorD, Element, FuseSiLU, WithBias>>(
         sycl::nd_range<3>(global * local, local), kernel_props, [=](sycl::nd_item<3> item) {

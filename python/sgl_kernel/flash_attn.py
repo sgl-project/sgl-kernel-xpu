@@ -416,6 +416,9 @@ def flash_attn_decode_with_kvcache(
         cache_seqlens = maybe_contiguous(cache_seqlens)
 
     q, k_cache, k, v = [maybe_contiguous(x) for x in (q, k_cache, k, v)]
+    q_group_size = q.size(1) // k_cache.size(2)
+    q = q.view((q.size(0) * q_group_size, int(q.size(1) // q_group_size), q.size(2)))
+
     v_cache = (
         v_cache.contiguous()
         if v_cache.stride(-1) != 1 and v_cache.stride(-3) != 1
@@ -432,10 +435,12 @@ def flash_attn_decode_with_kvcache(
 
     if cu_seqlens_q == None:  # !is_varlen_q
         cu_seqlens_q = torch.arange(
-            0, q.size(0) + 1, dtype=torch.int, device=q.device
+            0, q.size(0) // q_group_size + 1, dtype=torch.int, device=q.device
         ) * q.size(1)
         max_seqlen_q = q.size(1)
         q = q.view(-1, q.size(-2), q.size(-1)).contiguous()
+
+    cu_seqlens_q = cu_seqlens_q * q_group_size
     if cache_seqlens is not None:
         assert cache_seqlens.size(0) + 1 == cu_seqlens_q.size(0)
         cu_seqlens_k = cache_seqlens
@@ -469,7 +474,7 @@ def flash_attn_decode_with_kvcache(
         sm_margin,
     )
     # return (out, softmax_lse) if return_softmax_lse else out
-    return (out, softmax_lse, *rest) if return_softmax_lse else out
+    return (out.view(out.size(0) // q_group_size, q.size(1) * q_group_size, q.size(2)), softmax_lse, *rest) if return_softmax_lse else out
 
 
 def flash_attn_varlen_func(

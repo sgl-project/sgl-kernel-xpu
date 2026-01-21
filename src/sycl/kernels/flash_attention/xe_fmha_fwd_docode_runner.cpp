@@ -412,7 +412,7 @@ template <
     typename ElementQ = bfloat16_t,
     typename ElementK = bfloat16_t,
     typename ElementV = bfloat16_t,
-    typename ElementO = float,
+    typename ElementO = bfloat16_t,
     typename MMAOperation_ = void, /* void -> default */
     typename StrideQ = Stride<int, _1, int, int>,
     typename StrideK = Stride<int, _1, int, int>,
@@ -584,9 +584,8 @@ std::vector<at::Tensor> flash_decode(
   auto const sizes = q.sizes();
   const int batch_size = cu_seqlens_q.size(0) - 1;
   int seqlen_q = max_seqlen_q;
-  int q_group_size = q.size(-2) / k.size(-2);
-  int total_q = q.size(0) * q_group_size;
-  int num_heads = q.size(-2) / q_group_size;
+  int total_q = q.size(0);
+  int num_heads = q.size(-2);
   int const head_size = q.size(-1);
   int const head_size_v = v.size(-1);
   int const max_num_pages_per_seq = page_table.size(1);
@@ -793,66 +792,81 @@ std::vector<at::Tensor> flash_decode(
 
   params.tensor_opts = torch::TensorOptions().dtype(torch::kUInt8).device(q.device());
 
-  int qgroup_size = params.h / params.h_k;
   at::Tensor out_accum, softmax_lse_accum;
   auto outaccum_type = at::ScalarType::Float;
 
   constexpr bool Causal = false;  // The decode kernel does not support causal mode. It must be set to false.
 #define NUM_SG _8
-#define KV_TILE_SIZE _512
-#define FMHA_FWD_KERNEL(QG_SZ, HEAD_DIM)                           \
+#define FMHA_FWD_KERNEL(QG_SZ, HEAD_DIM, PAGE_SIZE)                \
   AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {                     \
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {       \
       FMHAConfig<                                                  \
           Causal,                                                  \
           LocalMask,                                               \
           Sink,                                                    \
-          cute::Shape<_##QG_SZ, KV_TILE_SIZE, _64>,                \
-          cute::Shape<_##QG_SZ, _32, KV_TILE_SIZE>,                \
+          cute::Shape<_##QG_SZ, _##PAGE_SIZE, _64>,                \
+          cute::Shape<_##QG_SZ, _32, _##PAGE_SIZE>,                \
           cute::Shape<_##QG_SZ, _##HEAD_DIM>,                      \
           cute::Layout<cute::Shape<_1, NUM_SG, _1>>>::run(params); \
     });                                                            \
   })
 
-  switch (params.d) {
-    case 128: {
-      switch (qgroup_size) {
-        case 1:
-          FMHA_FWD_KERNEL(1, 128);
-          break;
-        case 2:
-          FMHA_FWD_KERNEL(2, 128);
-          break;
-        case 4:
-          FMHA_FWD_KERNEL(4, 128);
-          break;
-        case 8:
-          FMHA_FWD_KERNEL(8, 128);
-          break;
-      }
-      break;
-    }
-    case 64: {
-      switch (qgroup_size) {
-        case 1:
-          FMHA_FWD_KERNEL(1, 64);
-          break;
-        case 2:
-          FMHA_FWD_KERNEL(2, 64);
-          break;
-        case 4:
-          FMHA_FWD_KERNEL(4, 64);
-          break;
-        case 8:
-          FMHA_FWD_KERNEL(8, 64);
-          break;
-      }
-      break;
-    }
-
-    default:
-      TORCH_CHECK(false, "Unsupported head size for causal attention");
+#define FMHA_FWD_KERNEL_FOR_HEAD(QG_SZ, HEAD_DIM)                       \
+  switch (params.page_size) {                                           \
+    case 32:                                                            \
+      FMHA_FWD_KERNEL(QG_SZ, HEAD_DIM, 32);                             \
+      break;                                                            \
+    case 64:                                                            \
+      FMHA_FWD_KERNEL(QG_SZ, HEAD_DIM, 64);                             \
+      break;                                                            \
+    case 128:                                                           \
+      FMHA_FWD_KERNEL(QG_SZ, HEAD_DIM, 128);                            \
+      break;                                                            \
+    default:                                                            \
+      TORCH_CHECK(false, "Unsupported page size for decode attention"); \
   }
+
+#define FMHA_DISPATCH_QGROUP(HEAD_DIM)                                    \
+  switch (max_seqlen_q) {                                                  \
+    case 1:                                                               \
+      FMHA_FWD_KERNEL_FOR_HEAD(1, HEAD_DIM);                              \
+      break;                                                              \
+    case 2:                                                               \
+      FMHA_FWD_KERNEL_FOR_HEAD(2, HEAD_DIM);                              \
+      break;                                                              \
+    case 4:                                                               \
+      FMHA_FWD_KERNEL_FOR_HEAD(4, HEAD_DIM);                              \
+      break;                                                              \
+    case 8:                                                               \
+      FMHA_FWD_KERNEL_FOR_HEAD(8, HEAD_DIM);                              \
+      break;                                                              \
+    case 16:                                                              \
+      FMHA_FWD_KERNEL_FOR_HEAD(16, HEAD_DIM);                             \
+      break;                                                              \
+    default:                                                              \
+      TORCH_CHECK(false, "Unsupported qgroup_size for decode attention"); \
+  }
+
+  switch (params.d) {
+    case 64:
+      FMHA_DISPATCH_QGROUP(64);
+      break;
+    case 96:
+      FMHA_DISPATCH_QGROUP(96);
+      break;
+    case 128:
+      FMHA_DISPATCH_QGROUP(128);
+      break;
+    case 192:
+      FMHA_DISPATCH_QGROUP(192);
+      break;
+    default:
+      TORCH_CHECK(false, "Unsupported head size for decode attention");
+  }
+
+#undef FMHA_DISPATCH_HEADS
+#undef FMHA_DISPATCH_QGROUP
+#undef FMHA_FWD_KERNEL_FOR_HEAD
 #undef FMHA_FWD_KERNEL
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }

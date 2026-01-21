@@ -184,10 +184,17 @@ class XeFMHAFwdKernel {
   CUTLASS_DEVICE
   Shape<int, int, int> get_sequence_length_shape(ProblemShape const& problem_shape, int const& batch) {
     if constexpr (is_var_len) {
-      return cutlass::fmha::collective::apply_variable_length(
-          Shape<VariableLength, VariableLength, VariableLength>{
-              problem_shape.seq_len_qo, problem_shape.seq_len_kv, problem_shape.seq_len_kv_cache},
-          batch);
+      // return cutlass::fmha::collective::apply_variable_length(
+      //     Shape<VariableLength, VariableLength, VariableLength>{
+      //         problem_shape.seq_len_qo, problem_shape.seq_len_kv, problem_shape.seq_len_kv_cache},
+      //     batch);
+
+      int seq_len_q =
+          problem_shape.seq_len_qo.cumulative_length[batch + 1] - problem_shape.seq_len_qo.cumulative_length[batch];
+      int seq_len_k_new = 0;
+      int seq_len_k_cache = problem_shape.seq_len_kv_cache.cumulative_length[batch];
+      return cute::make_tuple<int, int, int>(seq_len_q, seq_len_k_new, seq_len_k_cache);
+
     } else {
       return Shape<int, int, int>{problem_shape.seq_len_qo, problem_shape.seq_len_kv, problem_shape.seq_len_kv_cache};
     }
@@ -223,7 +230,9 @@ class XeFMHAFwdKernel {
       auto sequence_length_shape = get_sequence_length_shape(s, idx_b);
       auto [seq_len_qo, seq_len_kv, seq_len_kv_cache] = sequence_length_shape;
       if (blk_q * get<0>(TileShapeQK{}) >= seq_len_qo) continue;
-
+      if (thread(0,0)) {
+        print("seq_len_qo %d  get<0>(TileShapeQK{}) %d", seq_len_qo, (int)get<0>(TileShapeQK{}));
+      }
       auto offset = cute::min(seq_len_qo, seq_len_kv);
       auto discard_seq_coord = seq_len_qo - offset;
       auto full_tile_offset = seq_len_kv - offset;
@@ -242,46 +251,103 @@ class XeFMHAFwdKernel {
         auto qo_cumulative = s.seq_len_qo.cumulative_length;
         auto kv_cumulative = s.seq_len_kv.cumulative_length;
         offset_q = s.num_heads_q * s.head_size_qk * qo_cumulative[idx_b];
-        offset_k = s.num_heads_kv * s.head_size_qk * kv_cumulative[idx_b];
-        offset_v = s.num_heads_kv * s.head_size_vo * kv_cumulative[idx_b];
+        // offset_k = s.num_heads_kv * s.head_size_qk * kv_cumulative[idx_b];
+        // offset_v = s.num_heads_kv * s.head_size_vo * kv_cumulative[idx_b];
         offset_o = s.num_heads_q * s.head_size_vo * qo_cumulative[idx_b];
         if (s.seq_len_kv_cache.cumulative_length) {
           auto kv_cumulative_cache = s.seq_len_kv_cache.cumulative_length;
-          offset_k_cache = s.num_heads_kv * s.head_size_qk * kv_cumulative_cache[idx_b];
-          offset_v_cache = s.num_heads_kv * s.head_size_vo * kv_cumulative_cache[idx_b];
+          // offset_k_cache = s.num_heads_kv * s.head_size_qk * kv_cumulative_cache[idx_b];
+          // offset_v_cache = s.num_heads_kv * s.head_size_vo * kv_cumulative_cache[idx_b];
         }
       }
 
       auto batch_dim = is_var_len ? 1 : s.batch;
       auto shape_Q = make_shape(seq_len_qo, s.head_size_qk, s.num_heads_q, batch_dim);
-      auto shape_K = make_shape(seq_len_kv, s.head_size_qk, s.num_heads_kv, batch_dim);
-      auto shape_V = make_shape(s.head_size_vo, seq_len_kv, s.num_heads_kv, batch_dim);
+      auto shape_K = make_shape(s.seq_len_kv_cache.total_length, s.head_size_qk, s.num_heads_kv, batch_dim);
+      auto shape_V = make_shape(s.head_size_vo, s.seq_len_kv_cache.total_length, s.num_heads_kv, batch_dim);
       auto shape_O = make_shape(seq_len_qo, s.head_size_vo, s.num_heads_q, batch_dim);
 
-      auto shape_K_cache = make_shape(seq_len_kv_cache, s.head_size_qk, s.num_heads_kv, batch_dim);
-      auto shape_V_cache = make_shape(s.head_size_vo, seq_len_kv_cache, s.num_heads_kv, batch_dim);
-
       auto dcQ = const_cast<ElementQ*>(p.Q + offset_q);
-      auto dcK = const_cast<ElementK*>(p.K + offset_k);
-      auto dcV = const_cast<ElementV*>(p.V + offset_v);
       auto dcK_cache = const_cast<ElementK*>(p.K_cache + offset_k_cache);
       auto dcV_cache = const_cast<ElementV*>(p.V_cache + offset_v_cache);
-      auto ptrO = p.O + offset_o;
+      auto dcO = const_cast<ElementO*>(p.O + offset_o);
+      // NHD layout for GQA
+      auto layout_q = is_var_len
+                          ? make_ordered_layout(shape_Q, Step<_1, _0, _2, _3>{})
+                          // ? make_ordered_layout(shape_Q, Step<_2, _0, _1, _3>{})
+                          : make_layout(shape_Q, p.dQ);
+      auto layout_k = is_var_len
+                          ? make_ordered_layout(shape_K, Step<_2, _0, _1, _3>{})
+                          : make_layout(shape_K, p.dK);
+      auto layout_v = is_var_len
+                          ? make_ordered_layout(shape_V, Step<_0, _2, _1, _3>{})
+                          : make_layout(shape_V, p.dV);
 
-      auto stride_q = is_var_len ? cutlass::make_cute_packed_stride(StrideQ{}, shape_Q) : p.dQ;
-      auto stride_k = is_var_len ? cutlass::make_cute_packed_stride(StrideK{}, shape_K) : p.dK;
-      auto stride_v = is_var_len ? cutlass::make_cute_packed_stride(StrideV{}, shape_V) : p.dV;
-      auto stride_o = is_var_len ? cutlass::make_cute_packed_stride(StrideO{}, shape_O) : p.dO;
-      auto stride_k_cache = is_var_len ? cutlass::make_cute_packed_stride(StrideK{}, shape_K_cache) : p.dK_cache;
-      auto stride_v_cache = is_var_len ? cutlass::make_cute_packed_stride(StrideV{}, shape_V_cache) : p.dV_cache;
+      // NHD layout for GQA
+      auto layout_o = is_var_len
+                          ? make_ordered_layout(shape_O, Step<_1, _0, _2, _3>{})
+                          // ? make_ordered_layout(shape_O, Step<_2, _0, _1, _3>{})
+                          : make_layout(shape_O, p.dO);
 
-      Tensor Q = make_tensor(make_gmem_ptr(dcQ), make_layout(shape_Q, stride_q));
-      Tensor K = make_tensor(make_gmem_ptr(dcK), make_layout(shape_K, stride_k));
-      Tensor V = make_tensor(make_gmem_ptr(dcV), make_layout(shape_V, stride_v));
-      Tensor K_cache = make_tensor(make_gmem_ptr(dcK_cache), make_layout(shape_K_cache, stride_k_cache));
-      Tensor V_cache = make_tensor(make_gmem_ptr(dcV_cache), make_layout(shape_V_cache, stride_v_cache));
-      Tensor O = make_tensor(make_gmem_ptr(ptrO), make_layout(shape_O, stride_o));
 
+      // auto shape_Q = make_shape(seq_len_qo, s.head_size_qk, s.num_heads_q, batch_dim);
+      // // auto shape_K = make_shape(seq_len_kv, s.head_size_qk, s.num_heads_kv, batch_dim);
+      // // auto shape_V = make_shape(s.head_size_vo, seq_len_kv, s.num_heads_kv, batch_dim);
+      // auto shape_O = make_shape(seq_len_qo, s.head_size_vo, s.num_heads_q, batch_dim);
+
+      // auto shape_K_cache = make_shape(seq_len_kv_cache, s.head_size_qk, s.num_heads_kv, batch_dim);
+      // auto shape_V_cache = make_shape(s.head_size_vo, seq_len_kv_cache, s.num_heads_kv, batch_dim);
+
+      // auto dcQ = const_cast<ElementQ*>(p.Q + offset_q);
+      // // auto dcK = const_cast<ElementK*>(p.K + offset_k);
+      // // auto dcV = const_cast<ElementV*>(p.V + offset_v);
+      // auto dcK_cache = const_cast<ElementK*>(p.K_cache + offset_k_cache);
+      // auto dcV_cache = const_cast<ElementV*>(p.V_cache + offset_v_cache);
+      // auto ptrO = p.O + offset_o;
+
+      // // auto stride_q = is_var_len ? cutlass::make_cute_packed_stride(StrideQ{}, shape_Q) : p.dQ;
+      // // auto stride_k = is_var_len ? cutlass::make_cute_packed_stride(StrideK{}, shape_K) : p.dK;
+      // // auto stride_v = is_var_len ? cutlass::make_cute_packed_stride(StrideV{}, shape_V) : p.dV;
+      // // auto stride_o = is_var_len ? cutlass::make_cute_packed_stride(StrideO{}, shape_O) : p.dO;
+      // // auto stride_k_cache = is_var_len ? cutlass::make_cute_packed_stride(StrideK{}, shape_K_cache) : p.dK_cache;
+      // // auto stride_v_cache = is_var_len ? cutlass::make_cute_packed_stride(StrideV{}, shape_V_cache) : p.dV_cache;
+
+      // auto stride_q = cutlass::make_stride(
+      //     s.num_heads_q * s.head_size_qk, Int<1>{}, s.head_size_qk, s.head_size_qk * s.num_heads_q * seq_len_qo);
+      // // auto stride_k = cutlass::make_stride(s.num_heads_kv * s.head_size_qk, Int<1>{}, s.head_size_qk, s.head_size_qk
+      // // * s.num_heads_kv * seq_len_kv); auto stride_v = cutlass::make_stride(Int<1>{}, s.num_heads_kv * s.head_size_vo,
+      // // s.head_size_vo, s.head_size_vo * s.num_heads_kv * seq_len_kv);
+      // auto stride_o = cutlass::make_stride(
+      //     s.num_heads_q * s.head_size_vo, Int<1>{}, s.head_size_vo, s.head_size_vo * s.num_heads_q * seq_len_qo);
+      // auto stride_k_cache = cutlass::make_stride(
+      //     s.num_heads_kv * s.head_size_qk,
+      //     Int<1>{},
+      //     s.head_size_qk,
+      //     s.head_size_qk * s.num_heads_kv * seq_len_kv_cache);
+      // auto stride_v_cache = cutlass::make_stride(
+      //     Int<1>{},
+      //     s.num_heads_kv * s.head_size_vo,
+      //     s.head_size_vo,
+      //     s.head_size_vo * s.num_heads_kv * seq_len_kv_cache);
+
+      Tensor Q = make_tensor(make_gmem_ptr(dcQ), layout_q);
+      // Tensor K = make_tensor(make_gmem_ptr(dcK), make_layout(shape_K, stride_k));
+      // Tensor V = make_tensor(make_gmem_ptr(dcV), make_layout(shape_V, stride_v));
+      Tensor K_cache = make_tensor(make_gmem_ptr(dcK_cache), layout_k);
+      Tensor V_cache = make_tensor(make_gmem_ptr(dcV_cache), layout_v);
+      Tensor O = make_tensor(make_gmem_ptr(dcO), layout_o);
+      if (thread(0,0)) {
+        print("\n Tensor Q \n");
+        print(Q);
+        print("\n shape_Q Q \n");
+        print(shape_Q);
+        print("\n Tensor K_cache \n");
+        print(K_cache);
+        print("\n Tensor V_cache \n");
+        print(V_cache);
+        print("\n Tensor O \n");
+        print(O);
+      }
       // O accumulator types
       FragA tArA;
       FragARow tA_max, tA_sum;
@@ -291,8 +357,8 @@ class XeFMHAFwdKernel {
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
       mainloop(
           Q(_, _, head_q, l_coord),
-          K(_, _, head, l_coord),
-          V(_, _, head, l_coord),
+          K_cache(_, _, head, l_coord),
+          V_cache(_, _, head, l_coord),
           tArA,
           tA_max,
           tA_sum,

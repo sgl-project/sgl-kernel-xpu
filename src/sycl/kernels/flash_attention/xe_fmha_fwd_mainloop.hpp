@@ -168,6 +168,7 @@ struct FMHAFwdMainloop<
 
   using FragS = FragC<TiledMMAQK>;
   using FragSRow = decltype(reduce<1>(FragS{}, sycl::plus<void>{}));
+  using FragSCol = decltype(reduce<0>(FragS{}, sycl::plus<void>{}));
   using ElementS = typename TiledMMAQK::ValTypeD;
 
   using SingleFragA = FragC<TiledMMAPV>;                       // (atom val,q',v')
@@ -343,21 +344,21 @@ struct FMHAFwdMainloop<
         prefetch(prefetch_q, pQgQ(_, _, _, D));
       }
 
-      for (int D = 0; D < size<4>(pKgK); D++) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int K = 0; K < Stages; K++) {
-          if (K < kblocks_cache) {
-            if constexpr (PagedKV) {
-              int physical_K_tile = get_physical_k_tile(K, l_coord, seq_len_kv_cache);
-              prefetch(prefetch_k_cache, pKgK_cache(_, _, _, physical_K_tile, D));
-            } else {
-              prefetch(prefetch_k_cache, pKgK_cache(_, _, _, K, D));
-            }
-          } else {
-            prefetch(prefetch_k, pKgK(_, _, _, K - kblocks_cache, D));
-          }
-        }
-      }
+      // for (int D = 0; D < size<4>(pKgK); D++) {
+      //   CUTLASS_PRAGMA_UNROLL
+      //   for (int K = 0; K < Stages; K++) {
+      //     if (K < kblocks_cache) {
+      //       if constexpr (PagedKV) {
+      //         int physical_K_tile = get_physical_k_tile(K, l_coord, seq_len_kv_cache);
+      //         prefetch(prefetch_k_cache, pKgK_cache(_, _, _, physical_K_tile, D));
+      //       } else {
+      //         prefetch(prefetch_k_cache, pKgK_cache(_, _, _, K, D));
+      //       }
+      //     } else {
+      //       prefetch(prefetch_k, pKgK(_, _, _, K - kblocks_cache, D));
+      //     }
+      //   }
+      // }
 
       clear(tArA);
       fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
@@ -385,7 +386,18 @@ struct FMHAFwdMainloop<
           reorder(tKrK, tSrK);
           cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
         }
-
+        if (check_remainder_k && K == total_blk - 1) {
+          FragSCol k_rem_mask;
+          int k = get<0>(tKgK_cache(0, 0, 0, K, 0)) + get_sub_group().get_local_id()[0];
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < k_rem_mask.size(); i++, k += intel::sg_size) {
+            k_rem_mask(i) = (k < seq_len) ? ElementS(sycl::nan(0u)) : ElementS(-INFINITY);
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); i++) {
+            tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(k_rem_mask, tSrS, i));
+          }
+        }
         /* V prefetch for GEMM 2 */
         prefetch(prefetch_v_cache, pVgV_cache(_, _, _, physical_K_tile));
 
@@ -402,26 +414,27 @@ struct FMHAFwdMainloop<
         }
 
         /* K prefetch */
-        for (int D = 0; D < size<4>(pKgK); D++) {
-          int K_next = K + Stages;
-          bool is_cache_next = K_next < kblocks_cache;
-          int physical_K_next = K_next;
-          if constexpr (PagedKV) {
-            if (is_cache_next) {
-              physical_K_next = get_physical_k_tile(K_next, l_coord, seq_len_kv_cache);
-            }
-          }
+        // for (int D = 0; D < size<4>(pKgK); D++) {
+        //   int K_next = K + Stages;
+        //   bool is_cache_next = K_next < kblocks_cache;
+        // int physical_K_next = K_next;
+        // if constexpr (PagedKV) {
+        //   if (is_cache_next) {
+        //     physical_K_next = get_physical_k_tile(K_next, l_coord, seq_len_kv_cache);
+        //   }
+        // }
 
-          if (is_cache_next) {
-            prefetch(prefetch_k_cache, pKgK_cache(_, _, _, physical_K_next, D));
-          } else {
-            prefetch(prefetch_k, pKgK(_, _, _, K_next - kblocks_cache, D));
-          }
-        }
+        // if (is_cache_next) {
+        //   prefetch(prefetch_k_cache, pKgK_cache(_, _, _, physical_K_next, D));
+        // } else {
+        //   prefetch(prefetch_k, pKgK(_, _, _, K_next - kblocks_cache, D));
+        // }
+        // }
       }
     }
 
     for (int K = (blk_k0 > kblocks_cache ? blk_k0 : kblocks_cache); K < blk_k1; K++) {
+      print(" kv new!!!!!!!!!!!!!!!!!");
       /* GEMM 1: S = K * Q */
       clear(tSrS);
       CUTLASS_PRAGMA_UNROLL

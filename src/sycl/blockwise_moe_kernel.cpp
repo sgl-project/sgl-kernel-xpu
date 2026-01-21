@@ -172,6 +172,70 @@ class BlockScaledGroupedGemmKernel {
     TORCH_CHECK(output.scalar_type() == torch::kFloat32, "Output must be float32");
 
     int num_groups = static_cast<int>(expert_offsets.size(0));
+    TORCH_CHECK(num_groups > 0, "Number of experts must be positive, got ", num_groups);
+
+    TORCH_CHECK(
+        a.dim() == 3, "Input tensor A must be 3-dimensional (num_experts, M, K_packed), got ", a.dim(), " dimensions");
+    TORCH_CHECK(
+        b.dim() == 3, "Input tensor B must be 3-dimensional (num_experts, N, K_packed), got ", b.dim(), " dimensions");
+    TORCH_CHECK(
+        scales_a.dim() == 3,
+        "Scales tensor A must be 3-dimensional (num_experts, M, K/BlockSize), got ",
+        scales_a.dim(),
+        " dimensions");
+    TORCH_CHECK(
+        scales_b.dim() == 3,
+        "Scales tensor B must be 3-dimensional (num_experts, N, K/BlockSize), got ",
+        scales_b.dim(),
+        " dimensions");
+    TORCH_CHECK(
+        output.dim() == 3,
+        "Output tensor must be 3-dimensional (num_experts, M, N), got ",
+        output.dim(),
+        " dimensions");
+
+    TORCH_CHECK(
+        a.size(0) == num_groups,
+        "Tensor A batch size must match num_experts: expected ",
+        num_groups,
+        " got ",
+        a.size(0));
+    TORCH_CHECK(
+        b.size(0) == num_groups,
+        "Tensor B batch size must match num_experts: expected ",
+        num_groups,
+        " got ",
+        b.size(0));
+    TORCH_CHECK(
+        scales_a.size(0) == num_groups,
+        "Scales A batch size must match num_experts: expected ",
+        num_groups,
+        " got ",
+        scales_a.size(0));
+    TORCH_CHECK(
+        scales_b.size(0) == num_groups,
+        "Scales B batch size must match num_experts: expected ",
+        num_groups,
+        " got ",
+        scales_b.size(0));
+    TORCH_CHECK(
+        output.size(0) == num_groups,
+        "Output batch size must match num_experts: expected ",
+        num_groups,
+        " got ",
+        output.size(0));
+
+    TORCH_CHECK(a.is_contiguous(), "Input tensor A must be contiguous. Use .contiguous() before calling.");
+    TORCH_CHECK(b.is_contiguous(), "Input tensor B must be contiguous. Use .contiguous() before calling.");
+    TORCH_CHECK(scales_a.is_contiguous(), "Scales tensor A must be contiguous. Use .contiguous() before calling.");
+    TORCH_CHECK(scales_b.is_contiguous(), "Scales tensor B must be contiguous. Use .contiguous() before calling.");
+    TORCH_CHECK(output.is_contiguous(), "Output tensor must be contiguous.");
+
+    TORCH_CHECK(a_ptrs.is_contiguous(), "Pointer array a_ptrs must be contiguous");
+    TORCH_CHECK(b_ptrs.is_contiguous(), "Pointer array b_ptrs must be contiguous");
+    TORCH_CHECK(out_ptrs.is_contiguous(), "Pointer array out_ptrs must be contiguous");
+    TORCH_CHECK(a_scales_ptrs.is_contiguous(), "Pointer array a_scales_ptrs must be contiguous");
+    TORCH_CHECK(b_scales_ptrs.is_contiguous(), "Pointer array b_scales_ptrs must be contiguous");
 
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = static_cast<int>(a.device().index());
@@ -200,9 +264,81 @@ class BlockScaledGroupedGemmKernel {
       int M = problem_sizes_ptr[i * 3 + 0];
       int N = problem_sizes_ptr[i * 3 + 1];
       int K = problem_sizes_ptr[i * 3 + 2];
+
+      TORCH_CHECK(M > 0, "Problem size M must be positive for expert ", i, ", got ", M);
+      TORCH_CHECK(N > 0, "Problem size N must be positive for expert ", i, ", got ", N);
+      TORCH_CHECK(K > 0, "Problem size K must be positive for expert ", i, ", got ", K);
+
+      TORCH_CHECK(
+          K % BlockSize == 0,
+          "K dimension must be divisible by block size ",
+          BlockSize,
+          " for expert ",
+          i,
+          ", got K=",
+          K);
+
+      int K_packed = K / 2;
+      TORCH_CHECK(a.size(1) == M, "Tensor A dimension mismatch for expert ", i, ": expected M=", M, " got ", a.size(1));
+      TORCH_CHECK(b.size(1) == N, "Tensor B dimension mismatch for expert ", i, ": expected N=", N, " got ", b.size(1));
+      TORCH_CHECK(
+          a.size(2) == K_packed,
+          "Tensor A K dimension mismatch for expert ",
+          i,
+          ": expected K_packed=",
+          K_packed,
+          " got ",
+          a.size(2));
+      TORCH_CHECK(
+          b.size(2) == K_packed,
+          "Tensor B K dimension mismatch for expert ",
+          i,
+          ": expected K_packed=",
+          K_packed,
+          " got ",
+          b.size(2));
+
+      TORCH_CHECK(
+          output.size(1) == M, "Output dimension mismatch for expert ", i, ": expected M=", M, " got ", output.size(1));
+      TORCH_CHECK(
+          output.size(2) == N, "Output dimension mismatch for expert ", i, ": expected N=", N, " got ", output.size(2));
+
       problem_sizes_host.push_back({M, N, K});
 
       const int scale_k = cute::ceil_div(K, BlockSize);
+
+      TORCH_CHECK(
+          scales_a.size(1) == scale_k,
+          "Scales A K dimension mismatch for expert ",
+          i,
+          ": expected scale_k=",
+          scale_k,
+          " got ",
+          scales_a.size(1));
+      TORCH_CHECK(
+          scales_b.size(1) == scale_k,
+          "Scales B K dimension mismatch for expert ",
+          i,
+          ": expected scale_k=",
+          scale_k,
+          " got ",
+          scales_b.size(1));
+      TORCH_CHECK(
+          scales_a.size(2) == M,
+          "Scales A dimension mismatch for expert ",
+          i,
+          ": expected M=",
+          M,
+          " got ",
+          scales_a.size(2));
+      TORCH_CHECK(
+          scales_b.size(2) == N,
+          "Scales B dimension mismatch for expert ",
+          i,
+          ": expected N=",
+          N,
+          " got ",
+          scales_b.size(2));
       auto shape_A = cute::make_shape(M, K, 1);
       auto shape_B = cute::make_shape(N, K, 1);
       auto shape_CD = cute::make_shape(M, N, 1);
@@ -317,6 +453,13 @@ void mxfp4_blockwise_scaled_grouped_mm(
     const torch::Tensor& problem_sizes,
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace) {
+  TORCH_CHECK(a.device().is_xpu(), "Input tensor A must be on XPU device");
+  TORCH_CHECK(b.device().is_xpu(), "Input tensor B must be on XPU device");
+  TORCH_CHECK(scales_a.device().is_xpu(), "Scales tensor A must be on XPU device");
+  TORCH_CHECK(scales_b.device().is_xpu(), "Scales tensor B must be on XPU device");
+  TORCH_CHECK(output.device().is_xpu(), "Output tensor must be on XPU device");
+  TORCH_CHECK(workspace.device().is_xpu(), "Workspace tensor must be on XPU device");
+
   TORCH_CHECK(
       a.scalar_type() == torch::kUInt8 && b.scalar_type() == torch::kUInt8, "Inputs must be uint8 (packed MXFP4)");
   TORCH_CHECK(

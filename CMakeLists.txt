@@ -31,7 +31,7 @@ include(FetchContent)
 
 # SYCL support in cutlass
 add_compile_definitions(CUTLASS_ENABLE_SYCL)
-add_compile_definitions(SYCL_INTEL_TARGET=35)
+add_compile_definitions(SYCL_INTEL_TARGET)
 set(CUTLASS_ENABLE_SYCL ON CACHE BOOL "Enable SYCL in the cutlass" FORCE)
 set(CUTLASS_ENABLE_BENCHMARKS  OFF CACHE BOOL "Remove benchmark to avoid cmake version issue in google benchmark" FORCE)
 set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable headers only mode in cutlass" FORCE)
@@ -39,8 +39,8 @@ set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable headers only mode in cutla
 # cutlass
 FetchContent_Declare(
     repo-cutlass-sycl
-    GIT_REPOSITORY https://github.com/intel-innersource/libraries.ai.cutlass.internal
-    GIT_TAG        master_next
+    GIT_REPOSITORY https://github.com/intel/sycl-tla.git
+    GIT_TAG        482b40e8bed0e9204311d1569c876b4573dfb952
     GIT_SHALLOW    OFF
 )
 FetchContent_MakeAvailable(repo-cutlass-sycl)

@@ -12,7 +12,7 @@ def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
     return F.silu(x[..., :d]) * x[..., d:]
 
 
-def create_random_xpu_tensor(shape, dtype, mean=0, std=0.01):
+def create_random_cpu_tensor(shape, dtype, mean=0, std=0.01):
     """Create a random xpu tensor
 
     Args:
@@ -24,7 +24,7 @@ def create_random_xpu_tensor(shape, dtype, mean=0, std=0.01):
     Returns:
         torch.Tensor: Randomly initialized xpu tensor
     """
-    return torch.empty(shape, dtype=dtype, device="xpu").normal_(mean, std)
+    return torch.empty(shape, dtype=dtype, device="cpu").normal_(mean, std)
 
 
 def torch_naive_moe(
@@ -69,14 +69,14 @@ def test_moe_gemm(num_tokens, topk, num_experts, hidden_size, intermediate_size)
     torch.xpu.manual_seed_all(0)
 
     rtol, atol = 1e-1, 1e-2
-    a = create_random_xpu_tensor((num_tokens, hidden_size), torch.bfloat16)
-    w1 = create_random_xpu_tensor(
+    a = create_random_cpu_tensor((num_tokens, hidden_size), torch.bfloat16)
+    w1 = create_random_cpu_tensor(
         (num_experts, 2 * intermediate_size, hidden_size), torch.bfloat16
     )
-    w2 = create_random_xpu_tensor(
+    w2 = create_random_cpu_tensor(
         (num_experts, hidden_size, intermediate_size), torch.bfloat16
     )
-    score = torch.randn([num_tokens, num_experts], dtype=torch.bfloat16).to("xpu")
+    score = torch.randn([num_tokens, num_experts], dtype=torch.bfloat16)
 
     score = torch.softmax(score, dim=-1, dtype=torch.float32)
     topk_weight, topk_ids = torch.topk(score, topk)
@@ -88,15 +88,25 @@ def test_moe_gemm(num_tokens, topk, num_experts, hidden_size, intermediate_size)
         topk_weight,
         topk,
     )
+
+    device = "xpu"
+    a_xpu = a.clone().to(device)
+    w1_xpu = w1.clone().to(device)
+    w2_xpu = w2.clone().to(device)
+    topk_weight_xpu = topk_weight.clone().to(device)
+    topk_ids_xpu = topk_ids.clone().to(device)
+
     sglang_output = fused_experts(
-        a,
-        w1,
-        w2,
-        topk_weight,
-        topk_ids,
+        a_xpu,
+        w1_xpu,
+        w2_xpu,
+        topk_weight_xpu,
+        topk_ids_xpu,
     )
-    # import pdb; pdb.set_trace()
-    torch.testing.assert_close(torch_output, sglang_output, rtol=rtol, atol=atol)
+
+    torch.testing.assert_close(
+        torch_output, sglang_output.to("cpu"), rtol=rtol, atol=atol
+    )
 
 
 if __name__ == "__main__":

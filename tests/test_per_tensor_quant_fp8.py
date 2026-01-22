@@ -47,22 +47,23 @@ def test_per_tensor_quant_compare_implementations(
     hidden_dim: int,
     dtype: torch.dtype,
 ):
-    torch.manual_seed(1234)
-    x = torch.rand((num_tokens, hidden_dim), dtype=dtype, device=device)
+    torch.manual_seed(42)
+    x = torch.rand((num_tokens, hidden_dim), dtype=dtype)
 
-    sglang_out, sglang_scale = sglang_scaled_fp8_quant(x)
-    torch_out = torch_scaled_fp8_quant(x, sglang_scale)
+    x_hpu = x.to(device)
+    sglang_out, sglang_scale = sglang_scaled_fp8_quant(x_hpu)
+    torch_out = torch_scaled_fp8_quant(x, sglang_scale.cpu())
 
     torch.testing.assert_close(
-        sglang_out.float(), torch_out.float(), rtol=1e-3, atol=1e-3
+        sglang_out.cpu().float(), torch_out.float(), rtol=1e-3, atol=1e-3
     )
 
     scale = torch.rand(1, dtype=torch.float32, device=device)
-    sglang_out, sglang_scale = sglang_scaled_fp8_quant(x, scale)
-    torch_out = torch_scaled_fp8_quant(x, scale)
+    sglang_out, sglang_scale = sglang_scaled_fp8_quant(x_hpu, scale)
+    torch_out = torch_scaled_fp8_quant(x, scale.cpu())
 
     torch.testing.assert_close(
-        sglang_out.float(), torch_out.float(), rtol=1e-3, atol=1e-3
+        sglang_out.cpu().float(), torch_out.float(), rtol=1e-3, atol=1e-3
     )
 
 

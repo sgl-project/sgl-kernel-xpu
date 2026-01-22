@@ -244,8 +244,14 @@ def test_merge_attn_states(
         # Avoid inplace inf -> -inf, we have to use prefix_lse
         # and suffix_lse for other kernel.
         if fn_type == "torch":
-            prefix_lse_ = prefix_lse.clone()
-            suffix_lse_ = suffix_lse.clone()
+            prefix_lse_ = prefix_lse.clone().cpu()
+            suffix_lse_ = suffix_lse.clone().cpu()
+            prefix_output = torch.randn(
+                (NUM_TOKENS, NUM_HEADS, HEAD_SIZE), dtype=output_dtype, device="cpu"
+            )
+            suffix_output = torch.randn(
+                (NUM_TOKENS, NUM_HEADS, HEAD_SIZE), dtype=output_dtype, device="cpu"
+            )
         else:
             prefix_lse_ = prefix_lse
             suffix_lse_ = suffix_lse
@@ -291,8 +297,8 @@ def test_merge_attn_states(
             return 0, output_fn, output_lse_fn
 
     # 0. Run the Torch kernel
-    output_torch = output.clone()
-    output_lse_torch = output_lse.clone()
+    output_torch = output.clone().cpu()
+    output_lse_torch = output_lse.clone().cpu()
     time_torch, output_torch, output_lse_torch = perf_kernel_fn(
         output_torch, output_lse_torch, merge_state_torch, fn_type="torch"
     )
@@ -315,7 +321,7 @@ def test_merge_attn_states(
     )
 
     # 3. Performance compare
-    improved = time_triton / time_v2
+    improved = time_triton / time_v2 if time_v2 > 0 else float("inf")
     print(f"Torch time: {time_torch:.6f}ms")
     print(f"Triton time: {time_triton:.6f}ms")
     print(f"XPU v2 time: {time_v2:.6f}ms, Performance: {improved:.5f}x")
@@ -340,18 +346,18 @@ def test_merge_attn_states(
         output_v2.float(), output_ref.float(), atol=1e-3, rtol=rtol
     )
     print("Output all match, max abs diff:")
-    print(f"(Triton  vs Torch) : {diff(output_torch, output_ref)}")
-    print(f"(XPU v2 vs Torch) : {diff(output_torch, output_v2)}")
-    print(f"(XPU v2 vs Triton): {diff(output_ref, output_v2)}")
+    print(f"(Triton  vs Torch) : {diff(output_torch, output_ref.cpu())}")
+    print(f"(XPU v2 vs Torch) : {diff(output_torch, output_v2.cpu())}")
+    print(f"(XPU v2 vs Triton): {diff(output_ref.cpu(), output_v2.cpu())}")
     print("-" * 100)
 
     torch.testing.assert_close(
         output_lse_v2.float(), output_lse_ref.float(), atol=1e-3, rtol=rtol
     )
     print("Output LSE all match, max abs diff:")
-    print(f"(Triton  vs Torch) : {diff(output_lse_torch, output_lse_ref)}")
-    print(f"(XPU v2 vs Torch) : {diff(output_lse_torch, output_lse_v2)}")
-    print(f"(XPU v2 vs Triton): {diff(output_lse_ref, output_lse_v2)}")
+    print(f"(Triton  vs Torch) : {diff(output_lse_torch, output_lse_ref.cpu())}")
+    print(f"(XPU v2 vs Torch) : {diff(output_lse_torch, output_lse_v2.cpu())}")
+    print(f"(XPU v2 vs Triton): {diff(output_lse_ref.cpu(), output_lse_v2.cpu())}")
     print("-" * 100)
 
     print(

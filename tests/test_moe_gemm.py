@@ -20,8 +20,19 @@ def apply_act_and_mul(
     return act_func(x[..., :d]) * x[..., d:]
 
 
-def create_random_xpu_tensor(shape, dtype, mean=0, std=0.01):
-    return torch.empty(shape, dtype=dtype, device="xpu").normal_(mean, std)
+def create_random_cpu_tensor(shape, dtype, mean=0, std=0.01):
+    """Create a random xpu tensor
+
+    Args:
+        shape: Tensor shape
+        dtype: Data type
+        mean: Mean value
+        std: Standard deviation
+
+    Returns:
+        torch.Tensor: Randomly initialized xpu tensor
+    """
+    return torch.empty(shape, dtype=dtype, device="cpu").normal_(mean, std)
 
 
 def create_random_cpu_tensor(shape, dtype, mean=0, std=0.01):
@@ -188,24 +199,25 @@ def test_moe_gemm(
     gating_factor = 1 if act_type == "relu2" else 2
 
     rtol, atol = 1e-4, 1e-3
-    a = create_random_xpu_tensor((num_tokens, hidden_size), torch.bfloat16)
-    w1 = create_random_xpu_tensor(
+    a = create_random_cpu_tensor((num_tokens, hidden_size), torch.bfloat16)
+    w1 = create_random_cpu_tensor(
         (num_experts, gating_factor * intermediate_size, hidden_size), torch.bfloat16
     )
-    w2 = create_random_xpu_tensor(
+    w2 = create_random_cpu_tensor(
         (num_experts, hidden_size, intermediate_size), torch.bfloat16
     )
     b1, b2 = None, None
     if bias_dtype:
         dtype = torch.bfloat16 if bias_dtype == "bfloat16" else torch.float32
-        b1 = create_random_xpu_tensor(
+        b1 = create_random_cpu_tensor(
             (num_experts, gating_factor * intermediate_size), dtype, std=0.005
         )
-        b2 = create_random_xpu_tensor((num_experts, hidden_size), dtype, std=0.005)
-    score = torch.randn([num_tokens, num_experts], dtype=torch.bfloat16).to("xpu")
+        b2 = create_random_cpu_tensor((num_experts, hidden_size), dtype, std=0.005)
+    score = torch.randn([num_tokens, num_experts], dtype=torch.bfloat16)
 
     score = torch.softmax(score, dim=-1, dtype=torch.float32)
     topk_weight, topk_ids = torch.topk(score, topk)
+
     torch_output = torch_naive_moe(
         a,
         w1,

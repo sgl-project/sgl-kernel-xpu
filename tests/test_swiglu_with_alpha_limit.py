@@ -31,10 +31,12 @@ def test_swiglu_gpt_oss_sigmoid_alpha(batch_size, hidden_size, alpha, limit, dty
     if hidden_size % 2 != 0:
         pytest.skip("hidden_size must be even")
 
-    x = torch.randn((batch_size, hidden_size), dtype=dtype, device="xpu")
+    x = torch.randn((batch_size, hidden_size), dtype=dtype, device="cpu")
 
+    device = "xpu"
+    x_xpu = x.clone().to(device)
     # Call the kernel
-    output = swiglu_gpt_oss_sigmoid_alpha(x, alpha, limit)
+    output = swiglu_gpt_oss_sigmoid_alpha(x_xpu, alpha, limit)
 
     # Reference implementation
     output_ref = swiglu_gpt_oss_sigmoid_alpha_ref(x, alpha, limit)
@@ -43,7 +45,7 @@ def test_swiglu_gpt_oss_sigmoid_alpha(batch_size, hidden_size, alpha, limit, dty
     atol = 1e-1 if dtype in [torch.bfloat16, torch.float16] else 1e-4
     rtol = 1e-1 if dtype in [torch.bfloat16, torch.float16] else 1e-4
     assert torch.allclose(
-        output_ref, output, atol=atol, rtol=rtol
+        output_ref, output.to("cpu"), atol=atol, rtol=rtol
     ), f"dtype = {dtype}Output mismatch: max_diff={torch.max(torch.abs(output_ref - output))}"
 
 

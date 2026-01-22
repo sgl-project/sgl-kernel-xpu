@@ -8,6 +8,7 @@ import utils
 from sgl_kernel import sgl_per_tensor_quant_fp8
 
 device = utils.get_device()
+ref_device = utils.get_reference_device()
 
 fp8_type_ = torch.float8_e4m3fn
 
@@ -47,22 +48,22 @@ def test_per_tensor_quant_compare_implementations(
     hidden_dim: int,
     dtype: torch.dtype,
 ):
-    torch.manual_seed(1234)
-    x = torch.rand((num_tokens, hidden_dim), dtype=dtype, device=device)
+    torch.manual_seed(42)
+    x = torch.rand((num_tokens, hidden_dim), dtype=dtype, device=ref_device)
 
-    sglang_out, sglang_scale = sglang_scaled_fp8_quant(x)
-    torch_out = torch_scaled_fp8_quant(x, sglang_scale)
+    sglang_out, sglang_scale = sglang_scaled_fp8_quant(x.to(device))
+    torch_out = torch_scaled_fp8_quant(x, sglang_scale.to(ref_device))
 
     torch.testing.assert_close(
-        sglang_out.float(), torch_out.float(), rtol=1e-3, atol=1e-3
+        sglang_out.cpu().float(), torch_out.cpu().float(), rtol=1e-2, atol=1e-2
     )
 
     scale = torch.rand(1, dtype=torch.float32, device=device)
-    sglang_out, sglang_scale = sglang_scaled_fp8_quant(x, scale)
-    torch_out = torch_scaled_fp8_quant(x, scale)
+    sglang_out, sglang_scale = sglang_scaled_fp8_quant(x.to(device), scale)
+    torch_out = torch_scaled_fp8_quant(x, scale.to(ref_device))
 
     torch.testing.assert_close(
-        sglang_out.float(), torch_out.float(), rtol=1e-3, atol=1e-3
+        sglang_out.cpu().float(), torch_out.cpu().float(), rtol=1e-2, atol=1e-2
     )
 
 

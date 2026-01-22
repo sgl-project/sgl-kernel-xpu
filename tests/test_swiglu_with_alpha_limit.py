@@ -3,7 +3,11 @@ import sys
 
 import pytest
 import torch
+import utils
 from sgl_kernel import swiglu_gpt_oss_sigmoid_alpha
+
+device = utils.get_device()
+ref_device = utils.get_reference_device()
 
 
 def swiglu_gpt_oss_sigmoid_alpha_ref(x, gemm1_alpha, gemm1_limit):
@@ -31,13 +35,13 @@ def test_swiglu_gpt_oss_sigmoid_alpha(batch_size, hidden_size, alpha, limit, dty
     if hidden_size % 2 != 0:
         pytest.skip("hidden_size must be even")
 
-    x = torch.randn((batch_size, hidden_size), dtype=dtype, device="xpu")
+    x = torch.randn((batch_size, hidden_size), dtype=dtype, device=ref_device)
 
     # Call the kernel
-    output = swiglu_gpt_oss_sigmoid_alpha(x, alpha, limit)
+    output = swiglu_gpt_oss_sigmoid_alpha(x.to(device), alpha, limit).cpu()
 
     # Reference implementation
-    output_ref = swiglu_gpt_oss_sigmoid_alpha_ref(x, alpha, limit)
+    output_ref = swiglu_gpt_oss_sigmoid_alpha_ref(x, alpha, limit).cpu()
 
     # Verify the outputs match
     atol = 1e-1 if dtype in [torch.bfloat16, torch.float16] else 1e-4

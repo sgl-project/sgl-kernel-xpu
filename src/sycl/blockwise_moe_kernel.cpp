@@ -11,8 +11,8 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/extension.h>
 
-#include <cute/arch/mma_xe.hpp>
 #include <cute/tensor.hpp>
+#include <cute/arch/mma_xe.hpp>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"

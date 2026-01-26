@@ -416,8 +416,14 @@ def flash_attn_decode_with_kvcache(
         cache_seqlens = maybe_contiguous(cache_seqlens)
 
     q, k_cache, k, v = [maybe_contiguous(x) for x in (q, k_cache, k, v)]
-    q_group_size = q.size(1) // k_cache.size(2)
-    q = q.view((q.size(0) * q_group_size, int(q.size(1) // q_group_size), q.size(2)))
+    if q.dim() == 3:
+        q_group_size = q.size(1) // k_cache.size(2)
+        q = q.view((q.size(0) * q_group_size, int(q.size(1) // q_group_size), q.size(2)))
+
+    if q.dim() == 4:
+        q_group_size = q.size(2) // k_cache.size(2)
+        # When MTP is applied, batch and seq_len are the highest dimension (dim 0), and q_group_size is the dim 1
+        q = q.view((q.size(0) * q.size(1), q_group_size, int(q.size(2) // q_group_size), q.size(3)))
 
     v_cache = (
         v_cache.contiguous()
@@ -433,13 +439,19 @@ def flash_attn_decode_with_kvcache(
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
     rotary_seqlens = maybe_contiguous(rotary_seqlens)
 
-    if cu_seqlens_q == None:  # !is_varlen_q
+    if cu_seqlens_q == None:  # !is_varlen_q q.dim == 4
+        assert q.dim() == 4, "Expected q to have 4 dimensions when cu_seqlens_q is None"
         cu_seqlens_q = torch.arange(
-            0, q.size(0) // q_group_size + 1, dtype=torch.int, device=q.device
-        ) * q.size(1)
-        max_seqlen_q = q.size(1)
+            0, q.size(0) * q.size(1) + 1, dtype=torch.int, device=q.device
+        )
+        # cu_seqlens_q = torch.arange(
+        #     0, q.size(0) + 1, dtype=torch.int, device=q.device
+        # ) * q.size(1)
+        max_seqlen_q = 1
         q = q.view(-1, q.size(-2), q.size(-1)).contiguous()
+        q = q.view(-1, int(q.size(-2) // q_group_size), q.size(-1))
 
+    max_seqlen_q = max_seqlen_q * q_group_size
     cu_seqlens_q = cu_seqlens_q * q_group_size
     if cache_seqlens is not None:
         assert cache_seqlens.size(0) + 1 == cu_seqlens_q.size(0)

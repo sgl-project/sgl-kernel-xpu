@@ -796,77 +796,80 @@ std::vector<at::Tensor> flash_decode(
   auto outaccum_type = at::ScalarType::Float;
 
   constexpr bool Causal = false;  // The decode kernel does not support causal mode. It must be set to false.
-#define NUM_SG _8
-#define FMHA_FWD_KERNEL(QG_SZ, HEAD_DIM, PAGE_SIZE)                \
-  AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {                     \
-    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {       \
-      FMHAConfig<                                                  \
-          Causal,                                                  \
-          LocalMask,                                               \
-          Sink,                                                    \
-          cute::Shape<_##QG_SZ, _##PAGE_SIZE, _64>,                \
-          cute::Shape<_##QG_SZ, _32, _##PAGE_SIZE>,                \
-          cute::Shape<_##QG_SZ, _##HEAD_DIM>,                      \
-          cute::Layout<cute::Shape<_1, NUM_SG, _1>>>::run(params); \
-    });                                                            \
-  })
 
-#define FMHA_FWD_KERNEL_FOR_HEAD(QG_SZ, HEAD_DIM)                       \
-  switch (params.page_size) {                                           \
-    case 32:                                                            \
-      FMHA_FWD_KERNEL(QG_SZ, HEAD_DIM, 32);                             \
-      break;                                                            \
-    case 64:                                                            \
-      FMHA_FWD_KERNEL(QG_SZ, HEAD_DIM, 64);                             \
-      break;                                                            \
-    case 128:                                                           \
-      FMHA_FWD_KERNEL(QG_SZ, HEAD_DIM, 128);                            \
-      break;                                                            \
-    default:                                                            \
-      TORCH_CHECK(false, "Unsupported page size for decode attention"); \
-  }
+  auto launch_kernel = [&](auto _QG_SZ, auto _HEAD_DIM, auto _PAGE_SIZE, auto _NUM_SG) {
+    using TileShapeQK = cute::Shape<decltype(_QG_SZ), decltype(_PAGE_SIZE), _64>;
+    using TileShapePV = cute::Shape<decltype(_QG_SZ), _32, decltype(_PAGE_SIZE)>;
+    using TileShapeOutput = cute::Shape<decltype(_QG_SZ), decltype(_HEAD_DIM)>;
+    using SubgroupLayoutQK = cute::Layout<cute::Shape<_1, decltype(_NUM_SG), _1>>;
 
-#define FMHA_DISPATCH_QGROUP(HEAD_DIM)                                    \
-  switch (max_seqlen_q) {                                                  \
-    case 1:                                                               \
-      FMHA_FWD_KERNEL_FOR_HEAD(1, HEAD_DIM);                              \
-      break;                                                              \
-    case 2:                                                               \
-      FMHA_FWD_KERNEL_FOR_HEAD(2, HEAD_DIM);                              \
-      break;                                                              \
-    case 4:                                                               \
-      FMHA_FWD_KERNEL_FOR_HEAD(4, HEAD_DIM);                              \
-      break;                                                              \
-    case 8:                                                               \
-      FMHA_FWD_KERNEL_FOR_HEAD(8, HEAD_DIM);                              \
-      break;                                                              \
-    case 16:                                                              \
-      FMHA_FWD_KERNEL_FOR_HEAD(16, HEAD_DIM);                             \
-      break;                                                              \
-    default:                                                              \
-      TORCH_CHECK(false, "Unsupported qgroup_size for decode attention"); \
-  }
+    AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+        FMHAConfig<
+            Causal,
+            LocalMask,
+            Sink,
+            TileShapeQK,
+            TileShapePV,
+            TileShapeOutput,
+            SubgroupLayoutQK>::run(params);
+      });
+    });
+  };
+
+  auto dispatch_page_size = [&](auto _QG_SZ, auto _HEAD_DIM) {
+    switch (params.page_size) {
+      case 32:
+        launch_kernel(_QG_SZ, _HEAD_DIM, _32{}, _2{});
+        break;
+      case 64:
+        launch_kernel(_QG_SZ, _HEAD_DIM, _64{}, _4{});
+        break;
+      case 128:
+        launch_kernel(_QG_SZ, _HEAD_DIM, _128{}, _8{});
+        break;
+      default:
+        TORCH_CHECK(false, "Unsupported page size for decode attention: ", params.page_size);
+    }
+  };
+
+  auto dispatch_q_group = [&](auto _HEAD_DIM) {
+    switch (max_seqlen_q) {
+      case 1:
+        dispatch_page_size(_1{}, _HEAD_DIM);
+        break;
+      case 2:
+        dispatch_page_size(_2{}, _HEAD_DIM);
+        break;
+      case 4:
+        dispatch_page_size(_4{}, _HEAD_DIM);
+        break;
+      case 8:
+        dispatch_page_size(_8{}, _HEAD_DIM);
+        break;
+      case 16:
+        dispatch_page_size(_16{}, _HEAD_DIM);
+        break;
+      default:
+        TORCH_CHECK(false, "Unsupported qgroup_size for decode attention: ", max_seqlen_q);
+    }
+  };
 
   switch (params.d) {
     case 64:
-      FMHA_DISPATCH_QGROUP(64);
+      dispatch_q_group(_64{});
       break;
     case 96:
-      FMHA_DISPATCH_QGROUP(96);
+      dispatch_q_group(_96{});
       break;
     case 128:
-      FMHA_DISPATCH_QGROUP(128);
+      dispatch_q_group(_128{});
       break;
     case 192:
-      FMHA_DISPATCH_QGROUP(192);
+      dispatch_q_group(_192{});
       break;
     default:
-      TORCH_CHECK(false, "Unsupported head size for decode attention");
+      TORCH_CHECK(false, "Unsupported head size for decode attention: ", params.d);
   }
-
-#undef FMHA_DISPATCH_HEADS
-#undef FMHA_DISPATCH_QGROUP
-#undef FMHA_FWD_KERNEL_FOR_HEAD
-#undef FMHA_FWD_KERNEL
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }

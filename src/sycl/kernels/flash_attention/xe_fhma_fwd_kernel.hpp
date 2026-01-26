@@ -230,9 +230,6 @@ class XeFMHAFwdKernel {
       auto sequence_length_shape = get_sequence_length_shape(s, idx_b);
       auto [seq_len_qo, seq_len_kv, seq_len_kv_cache] = sequence_length_shape;
       if (blk_q * get<0>(TileShapeQK{}) >= seq_len_qo) continue;
-      if (thread(0,0)) {
-        print("seq_len_qo %d  get<0>(TileShapeQK{}) %d", seq_len_qo, (int)get<0>(TileShapeQK{}));
-      }
       auto offset = cute::min(seq_len_qo, seq_len_kv);
       auto discard_seq_coord = seq_len_qo - offset;
       auto full_tile_offset = seq_len_kv - offset;
@@ -336,18 +333,6 @@ class XeFMHAFwdKernel {
       Tensor K_cache = make_tensor(make_gmem_ptr(dcK_cache), layout_k);
       Tensor V_cache = make_tensor(make_gmem_ptr(dcV_cache), layout_v);
       Tensor O = make_tensor(make_gmem_ptr(dcO), layout_o);
-      if (thread(0,0)) {
-        print("\n Tensor Q \n");
-        print(Q);
-        print("\n shape_Q Q \n");
-        print(shape_Q);
-        print("\n Tensor K_cache \n");
-        print(K_cache);
-        print("\n Tensor V_cache \n");
-        print(V_cache);
-        print("\n Tensor O \n");
-        print(O);
-      }
       // O accumulator types
       FragA tArA;
       FragARow tA_max, tA_sum;

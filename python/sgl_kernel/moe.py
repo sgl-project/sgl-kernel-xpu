@@ -49,6 +49,11 @@ def moe_sum_reduce(
 
 
 def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
+    assert gemm1_limit > 0, f"gemm1_limit must be positive, got {gemm1_limit}"
+    assert x.dim() == 2, f"x must be 2D [B, 2H], got {x.dim()}D"
+    assert (
+        x.size(1) % 2 == 0
+    ), f"Last dim must be even for gate/up split, got {x.size(1)}"
     return torch.ops.sgl_kernel.swiglu_with_alpha_and_limit.default(
         x,
         gemm1_alpha,

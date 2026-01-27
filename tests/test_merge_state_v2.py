@@ -250,7 +250,7 @@ def test_merge_attn_states(
             prefix_lse_ = prefix_lse
             suffix_lse_ = suffix_lse
 
-        if fn_type == "cuda_v1":
+        if fn_type == "xpu_v1":
             # merge_state v1 kernel not support float32
             if output_dtype not in (torch.half, torch.bfloat16):
                 return 0, output_fn, output_lse_fn
@@ -307,28 +307,21 @@ def test_merge_attn_states(
         fn_type="triton",
     )
 
-    # 2. Run the merge_state V1 kernel
-    # output_v1 = output.clone()
-    # output_lse_v1 = output_lse.clone()
-    # time_v1, output_v1, output_lse_v1 = perf_kernel_fn(
-    #     output_v1, output_lse_v1, merge_state_v2, fn_type="cuda_v2"
-    # )
-
-    # 3. Run the merge_state V2 kernel
+    # 2. Run the merge_state V2 kernel
     output_v2 = output.clone()
     output_lse_v2 = output_lse.clone()
     time_v2, output_v2, output_lse_v2 = perf_kernel_fn(
         output_v2, output_lse_v2, merge_state_v2, fn_type="xpu_v2"
     )
 
-    # 4. Performance compare
+    # 3. Performance compare
     improved = time_triton / time_v2
     print(f"Torch time: {time_torch:.6f}ms")
     print(f"Triton time: {time_triton:.6f}ms")
     print(f"XPU v2 time: {time_v2:.6f}ms, Performance: {improved:.5f}x")
     print("-" * 100)
 
-    # 5. Correctness compare
+    # 4. Correctness compare
     # Liger Kernel: Efficient Triton Kernels for LLM Training
     # https://arxiv.org/pdf/2410.10989, 3.3 Correctness
     # use rtol = 1e-2 for bfloat16.
@@ -339,7 +332,7 @@ def test_merge_attn_states(
         return max_diff
 
     # Use Triton output as reference because we want to replace
-    # the Triton kernel with custom CUDA kernel for merge attn
+    # the Triton kernel with custom XPU kernel for merge attn
     # states operation.
     output_ref = output_ref_triton
     output_lse_ref = output_lse_ref_triton

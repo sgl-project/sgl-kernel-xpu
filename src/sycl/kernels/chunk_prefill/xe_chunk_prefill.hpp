@@ -190,7 +190,7 @@ class FMHAPrefillChunk {
     return {
         args.mode,
         args.problem_shape,
-        CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop, workspace),
+        CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop, args.softmax.scale, workspace),
         CollectiveSoftmaxEpilogue::to_underlying_arguments(args.softmax),
         CollectiveEpilogue::to_underlying_arguments(args.problem_shape, args.epilogue, workspace),
         TileScheduler::to_underlying_arguments(args.problem_shape, args.hw_info, TileShapeOutput{})};

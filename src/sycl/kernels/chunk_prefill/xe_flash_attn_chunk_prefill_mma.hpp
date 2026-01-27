@@ -218,6 +218,7 @@ struct FlashChunkPrefillMma<
     int max_num_pages_per_seq;
     int window_left;
     int window_right;
+    float scale;
   };
 
   //
@@ -227,7 +228,7 @@ struct FlashChunkPrefillMma<
   FlashChunkPrefillMma() = default;
 
   static constexpr Params
-  to_underlying_arguments(ProblemShapeType const& problem_shape, Arguments const& args, void* workspace) {
+  to_underlying_arguments(ProblemShapeType const& problem_shape, Arguments const& args, float scale, void* workspace) {
     (void)workspace;
 
     auto [batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, head_size_qk, head_size_vo] =
@@ -254,7 +255,8 @@ struct FlashChunkPrefillMma<
         args.page_size,
         args.max_num_pages_per_seq,
         args.window_left,
-        args.window_right};
+        args.window_right,
+        scale};
   }
 
   template <class FragQccum, class TensorQ, class TensorK, class FragSrc>
@@ -301,6 +303,9 @@ struct FlashChunkPrefillMma<
 
     for (int k_tile = 0; k_tile < k_tile_count; ++k_tile) {
       copy(params.gmem_tiled_copy_q, tQgQ(_, _, _, k_tile), tQrQ);
+      for (int i = 0; i < size(tQrQ); i++) {
+        tQrQ[i] = tQrQ[i] * (ElementQ)(params.scale);
+      }
       copy(gmem_tiled_copy_k, tKgK(_, _, _, k_tile), tKrK);
       cute::gemm(tiled_mma, accum, tCrQ, tCrK, frag_src);
 #if 0
@@ -457,7 +462,8 @@ struct FlashChunkPrefillMma<
         params.page_size,
         params.max_num_pages_per_seq,
         params.window_left,
-        params.window_right};
+        params.window_right,
+        params.scale};
   }
 };
 

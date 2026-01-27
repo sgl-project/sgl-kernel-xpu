@@ -318,14 +318,14 @@ def test_merge_attn_states(
     output_v2 = output.clone()
     output_lse_v2 = output_lse.clone()
     time_v2, output_v2, output_lse_v2 = perf_kernel_fn(
-        output_v2, output_lse_v2, merge_state_v2, fn_type="cuda_v2"
+        output_v2, output_lse_v2, merge_state_v2, fn_type="xpu_v2"
     )
 
     # 4. Performance compare
     improved = time_triton / time_v2
-    print(f"  Torch time: {time_torch:.6f}ms")
-    print(f" Triton time: {time_triton:.6f}ms")
-    print(f"CUDA v2 time: {time_v2:.6f}ms, Performance: {improved:.5f}x")
+    print(f"Torch time: {time_torch:.6f}ms")
+    print(f"Triton time: {time_triton:.6f}ms")
+    print(f"XPU v2 time: {time_v2:.6f}ms, Performance: {improved:.5f}x")
     print("-" * 100)
 
     # 5. Correctness compare
@@ -348,8 +348,8 @@ def test_merge_attn_states(
     )
     print("Output all match, max abs diff:")
     print(f"(Triton  vs Torch) : {diff(output_torch, output_ref)}")
-    print(f"(CUDA v2 vs Torch) : {diff(output_torch, output_v2)}")
-    print(f"(CUDA v2 vs Triton): {diff(output_ref, output_v2)}")
+    print(f"(XPU v2 vs Torch) : {diff(output_torch, output_v2)}")
+    print(f"(XPU v2 vs Triton): {diff(output_ref, output_v2)}")
     print("-" * 100)
 
     torch.testing.assert_close(
@@ -357,8 +357,8 @@ def test_merge_attn_states(
     )
     print("Output LSE all match, max abs diff:")
     print(f"(Triton  vs Torch) : {diff(output_lse_torch, output_lse_ref)}")
-    print(f"(CUDA v2 vs Torch) : {diff(output_lse_torch, output_lse_v2)}")
-    print(f"(CUDA v2 vs Triton): {diff(output_lse_ref, output_lse_v2)}")
+    print(f"(XPU v2 vs Torch) : {diff(output_lse_torch, output_lse_v2)}")
+    print(f"(XPU v2 vs Triton): {diff(output_lse_ref, output_lse_v2)}")
     print("-" * 100)
 
     print(

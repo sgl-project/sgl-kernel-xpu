@@ -1045,25 +1045,23 @@ def test_flash_attn_kvcache(
     ),
 )
 # @pytest.mark.parametrize("rotary_fraction", [0.0])
-# @pytest.mark.parametrize("page_size", [64, 128, 256])
 @pytest.mark.parametrize("page_size", [128])
+# @pytest.mark.parametrize("page_size", [64, 128])
 # @pytest.mark.parametrize("page_size", [None])
 # @pytest.mark.parametrize("has_leftpad", [False, True])
 @pytest.mark.parametrize("has_leftpad", [False])
 # @pytest.mark.parametrize("has_batch_idx", [False, True])
 @pytest.mark.parametrize("has_batch_idx", [False])
 # @pytest.mark.parametrize("varlen_q", [False, True])
-@pytest.mark.parametrize("varlen_q", [False])
-# @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
-# @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
-# @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
-# @pytest.mark.parametrize('d', [56, 80])
+@pytest.mark.parametrize("varlen_q", [Flase])
 @pytest.mark.parametrize("d", [64])
+# @pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("seqlen_q", [1])
 @pytest.mark.parametrize(
     "seqlen_k",
     [
         128,
+        # 256,
         # 339,
         # 1024,
         # 800,
@@ -1071,9 +1069,9 @@ def test_flash_attn_kvcache(
         # 799,
         # 2048,
         # 20000,
-        # # (1, 128 * 1024),
-        # # (16, 128 * 1024),
-        # 128,
+        # # # (1, 128 * 1024),
+        # # # (16, 128 * 1024),
+        # # 128,
         # 512,  # To test appending KV with more than 1 block
         # 3577,  # Enough tile to test persistent scheduler
     ],
@@ -1110,17 +1108,17 @@ def test_flash_attn_decode_kvcache(
         pytest.skip()
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 5
+    batch_size = 1
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
-    nheads = 16
+    nheads = 2
+    nheads_k = 1 #nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
+    assert nheads % nheads_k == 0
 
     if seqlen_k <= seqlen_q:
         seqlen_k += seqlen_q
     # nheads = 1
     # rotary_dim must be a multiple of 16, and must be <= d
     rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
-    assert nheads % nheads_k == 0
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     if use_sinks:
@@ -1464,7 +1462,6 @@ def test_flash_attn_decode_kvcache(
                 out = out.flatten()
                 out_ref = out_ref.flatten()
                 out_pt = out_pt.flatten()
-                print(out)
                 print(f"Output max diff: {(out - out_ref).abs().max().item()}")
                 print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
                 print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")

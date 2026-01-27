@@ -416,14 +416,7 @@ def flash_attn_decode_with_kvcache(
         cache_seqlens = maybe_contiguous(cache_seqlens)
 
     q, k_cache, k, v = [maybe_contiguous(x) for x in (q, k_cache, k, v)]
-    if q.dim() == 3:
-        q_group_size = q.size(1) // k_cache.size(2)
-        q = q.view((q.size(0) * q_group_size, int(q.size(1) // q_group_size), q.size(2)))
-
-    if q.dim() == 4:
-        q_group_size = q.size(2) // k_cache.size(2)
-        # When MTP is applied, batch and seq_len are the highest dimension (dim 0), and q_group_size is the dim 1
-        q = q.view((q.size(0) * q.size(1), q_group_size, int(q.size(2) // q_group_size), q.size(3)))
+    
 
     v_cache = (
         v_cache.contiguous()
@@ -449,7 +442,16 @@ def flash_attn_decode_with_kvcache(
         # ) * q.size(1)
         max_seqlen_q = 1
         q = q.view(-1, q.size(-2), q.size(-1)).contiguous()
-        q = q.view(-1, int(q.size(-2) // q_group_size), q.size(-1))
+        # q = q.view(-1, int(q.size(-2) // q_group_size), q.size(-1))
+
+    if q.dim() == 3:
+        q_group_size = q.size(1) // k_cache.size(2)
+        q = q.view((q.size(0) * q_group_size, int(q.size(1) // q_group_size), q.size(2)))
+
+    if q.dim() == 4:
+        q_group_size = q.size(2) // k_cache.size(2)
+        # When MTP is applied, batch and seq_len are the highest dimension (dim 0), and q_group_size is the dim 1
+        q = q.view((q.size(0) * q.size(1), q_group_size, int(q.size(2) // q_group_size), q.size(3)))
 
     max_seqlen_q = max_seqlen_q * q_group_size
     cu_seqlens_q = cu_seqlens_q * q_group_size

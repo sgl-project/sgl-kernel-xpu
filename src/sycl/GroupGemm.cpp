@@ -122,7 +122,7 @@ void MoEGEMMLauncher(
     }                                                             \
   } while (0)
 
-#define DISPATCH_MOE_HLPER_FUSE_ACT(ActType, FuseAct, WithBias, ...)   \
+#define DISPATCH_MOE_HELPER_FUSE_ACT(ActType, FuseAct, WithBias, ...)  \
   do {                                                                 \
     if (FuseAct) {                                                     \
       DISPATCH_MOE_HELPER_BIAS(ActType, true, WithBias, __VA_ARGS__);  \
@@ -131,22 +131,22 @@ void MoEGEMMLauncher(
     }                                                                  \
   } while (0)
 
-#define DISPATCH_MOE_HLPER_ACT_TYPE(ActType, FuseAct, WithBias, ...)    \
-  do {                                                                  \
-    switch (ActType) {                                                  \
-      case 0:                                                           \
-        DISPATCH_MOE_HLPER_FUSE_ACT(0, FuseAct, WithBias, __VA_ARGS__); \
-        break;                                                          \
-      case 1:                                                           \
-        DISPATCH_MOE_HLPER_FUSE_ACT(1, FuseAct, WithBias, __VA_ARGS__); \
-        break;                                                          \
-      default:                                                          \
-        TORCH_CHECK(false, "Unsupported activation type");              \
-    }                                                                   \
+#define DISPATCH_MOE_HELPER_ACT_TYPE(ActType, FuseAct, WithBias, ...)    \
+  do {                                                                   \
+    switch (ActType) {                                                   \
+      case 0:                                                            \
+        DISPATCH_MOE_HELPER_FUSE_ACT(0, FuseAct, WithBias, __VA_ARGS__); \
+        break;                                                           \
+      case 1:                                                            \
+        DISPATCH_MOE_HELPER_FUSE_ACT(1, FuseAct, WithBias, __VA_ARGS__); \
+        break;                                                           \
+      default:                                                           \
+        TORCH_CHECK(false, "Unsupported activation type");               \
+    }                                                                    \
   } while (0)
 
 #define DISPATCH_MOE(ActType, FuseAct, WithBias, ...) \
-  DISPATCH_MOE_HLPER_ACT_TYPE(ActType, FuseAct, WithBias, __VA_ARGS__)
+  DISPATCH_MOE_HELPER_ACT_TYPE(ActType, FuseAct, WithBias, __VA_ARGS__)
 
 void moe_grouped_mm_nt(
     torch::Tensor& output,

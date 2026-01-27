@@ -361,7 +361,7 @@ def benchmark(
             "num_experts": num_experts,
             "topk": topk,
             "hidden_size": hidden_size,
-            "shard\nintermediate\nsize": shard_intermediate_size,
+            "shard_intermediate_size": shard_intermediate_size,
             "dtype": dtype,
             # "block_shape": block_shape,  # Always None now. disabled to reduce the number of columns
             "with_bias": with_bias,

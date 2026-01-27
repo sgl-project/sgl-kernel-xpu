@@ -241,3 +241,95 @@ def apply_rope_with_cos_sin_cache_inplace(
         (not is_neox),
         get_cuda_stream(),
     )
+
+
+def fused_qk_norm_rope(
+    qkv: torch.Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    base: float,
+    is_neox: bool,
+    position_ids: torch.Tensor,
+    factor: float = 1.0,
+    low: float = 1.0,
+    high: float = 1.0,
+    attention_factor: float = 1.0,
+    rotary_dim: int = None,
+) -> None:
+    r"""Fused QK RMS normalization and RoPE application.
+
+    This operator applies RMS normalization and RoPE (Rotary Position Embedding)
+    to Q and K tensors in a single CUDA/SYCL kernel. The operation is performed
+    in-place on the input qkv tensor.
+
+    Parameters
+    ----------
+    qkv : torch.Tensor
+        Combined QKV tensor, shape: ``(num_tokens, (num_heads_q + num_heads_k + num_heads_v) * head_dim)``.
+        The tensor is modified in-place.
+    num_heads_q : int
+        Number of query heads.
+    num_heads_k : int
+        Number of key heads.
+    num_heads_v : int
+        Number of value heads.
+    head_dim : int
+        Dimension per head.
+    eps : float
+        Epsilon for RMS normalization.
+    q_weight : torch.Tensor
+        RMSNorm weights for query, shape: ``(head_dim,)``.
+    k_weight : torch.Tensor
+        RMSNorm weights for key, shape: ``(head_dim,)``.
+    base : float
+        Base for RoPE computation.
+    is_neox : bool
+        Whether RoPE is applied in Neox style.
+
+        * If ``True``, the last dimension of the query/key tensor is not interleaved.
+        * If ``False``, the last dimension of the query/key tensor is interleaved.
+    position_ids : torch.Tensor
+        Position IDs for RoPE, shape: ``(num_tokens,)``.
+    factor : float, optional
+        Scaling factor for YARN (YaRN: Yet another RoPE extensioN method).
+        When it is not 1.0, the model is using YARN. Default: 1.0.
+    low : float, optional
+        YARN low frequency threshold. Default: 1.0.
+    high : float, optional
+        YARN high frequency threshold. Default: 1.0.
+    attention_factor : float, optional
+        Attention factor applied on cos and sin values. Default: 1.0.
+    rotary_dim : int, optional
+        Rotary dimension. If None, defaults to head_dim.
+
+    Note
+    ----
+    This is an in-place operation that modifies the qkv tensor directly.
+    Only the Q and K portions of the tensor are modified; V remains unchanged.
+    """
+    if rotary_dim is None:
+        rotary_dim = head_dim
+
+    torch.ops.sgl_kernel.fused_qk_norm_rope(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        q_weight,
+        k_weight,
+        base,
+        is_neox,
+        position_ids,
+        factor,
+        low,
+        high,
+        attention_factor,
+        rotary_dim,
+    )

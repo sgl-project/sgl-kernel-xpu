@@ -83,7 +83,7 @@ class FlashChunkPrefillSoftmaxEpilogue<CausalMask_, LocalMask_, epilogue::IntelX
 
   static constexpr Params to_underlying_arguments(Arguments const& args) {
     constexpr double kLog2e = 1.4426950408889634074;  // log_2(e) = M_LOG2E
-    Element val = args.scale * static_cast<Element>(kLog2e);
+    Element val = static_cast<Element>(kLog2e);
     return Params{val};
   }
 

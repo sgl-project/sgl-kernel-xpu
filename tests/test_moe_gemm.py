@@ -1,5 +1,6 @@
 import itertools
 import sys
+from typing import Callable
 
 import pytest
 import torch
@@ -7,9 +8,11 @@ import torch.nn.functional as F
 from sgl_kernel import fused_experts
 
 
-def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
+def apply_act_and_mul(
+    x: torch.Tensor, act_func: Callable[[torch.Tensor], torch.Tensor]
+) -> torch.Tensor:
     d = x.shape[-1] // 2
-    return F.silu(x[..., :d]) * x[..., d:]
+    return act_func(x[..., :d]) * x[..., d:]
 
 
 def create_random_xpu_tensor(shape, dtype, mean=0, std=0.01):
@@ -36,6 +39,7 @@ def torch_naive_moe(
     topk,
     b1,
     b2,
+    activations="silu",
 ):
     B, D = a.shape
     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
@@ -52,11 +56,18 @@ def torch_naive_moe(
         if b2 is not None
         else torch.zeros(w2.shape[:2], dtype=a.dtype, device=a.device)
     )
+    assert activations in [
+        "silu",
+        "gelu",
+    ], "Only silu and gelu activations are supported."
+    act_func = (
+        F.silu if activations == "silu" else lambda x: F.gelu(x, approximate="tanh")
+    )
 
     for i in range(w1.shape[0]):
         mask = topk_ids == i
         if mask.sum():
-            tmp = silu_and_mul(a[mask] @ w1[i].transpose(0, 1) + b1[i])
+            tmp = apply_act_and_mul(a[mask] @ w1[i].transpose(0, 1) + b1[i], act_func)
             out[mask] = tmp @ w2[i].transpose(0, 1) + b2[i]
 
     return (
@@ -65,7 +76,7 @@ def torch_naive_moe(
 
 
 @pytest.mark.parametrize(
-    "num_tokens,topk,num_experts,hidden_size,intermediate_size,with_bias",
+    "num_tokens,topk,num_experts,hidden_size,intermediate_size,with_bias,act_type",
     list(
         itertools.product(
             [1, 4, 33, 64, 222],  # num_tokens
@@ -74,11 +85,12 @@ def torch_naive_moe(
             [128, 1024],  # hidden_size
             [128, 512, 1024],  # intermediate_size
             [False, True],  # with_bias
+            ["silu", "gelu"],  # act_type
         )
     ),
 )
 def test_moe_gemm(
-    num_tokens, topk, num_experts, hidden_size, intermediate_size, with_bias
+    num_tokens, topk, num_experts, hidden_size, intermediate_size, with_bias, act_type
 ):
     torch.xpu.manual_seed_all(0)
 
@@ -111,6 +123,7 @@ def test_moe_gemm(
         topk,
         b1,
         b2,
+        activations=act_type,
     )
     sglang_output = fused_experts(
         a,
@@ -120,6 +133,7 @@ def test_moe_gemm(
         topk_ids,
         b1,
         b2,
+        activation=act_type,
     )
     torch.testing.assert_close(torch_output, sglang_output, rtol=rtol, atol=atol)
 

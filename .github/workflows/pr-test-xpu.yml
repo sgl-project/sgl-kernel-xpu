@@ -43,7 +43,7 @@ jobs:
         run: |
           docker exec ci_sglang_xpu /miniforge3/envs/py3.10/bin/python3 -m pip install --upgrade pip
           docker exec ci_sglang_xpu /miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub
-          docker exec ci_sglang_xpu /bin/bash -c '/miniforge3/envs/py3.10/bin/huggingface-cli login --token ${HF_TOKEN} '
+          docker exec ci_sglang_xpu /bin/bash -c '/miniforge3/envs/py3.10/bin/hf auth login --token ${HF_TOKEN} '
           docker exec ci_sglang_xpu /bin/bash -c "ln -sf /miniforge3/envs/py3.10/bin/python3 /usr/bin/python3"
 
       - name: Run Sglang Kernel Cases
@@ -161,3 +161,4 @@ jobs:
         if: always()
         run: |
           docker rm -f ci_sglang_xpu || true
+

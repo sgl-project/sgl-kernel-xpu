@@ -298,6 +298,10 @@ def fused_experts(
     assert a1_scale is None, "current MoE does not support a1_scale"
     assert a2_scale is None, "current MoE does not support a2_scale"
     assert block_shape is None, "current MoE does not support block_shape"
+    assert activation in (
+        "silu",
+        "gelu",
+    ), f"Only silu and gelu are supported but got {activation}"
 
     # type check
     assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
@@ -379,8 +383,16 @@ def fused_experts(
         (M * TopK, OutK), device=hidden_states.device, dtype=hidden_states.dtype
     )
 
+    activation_type = 0 if activation == "silu" else 1
     torch.ops.sgl_kernel.moe_grouped_mm_nt(
-        intermediate_cache1, input_A_shuffle, w1, b1, expert_offsets, E, fuse_silu=True
+        intermediate_cache1,
+        input_A_shuffle,
+        w1,
+        b1,
+        expert_offsets,
+        E,
+        activation_type,
+        fuse_act=True,
     )
 
     # silu_and_mul is fused into moe_grouped_mm_nt
@@ -393,7 +405,8 @@ def fused_experts(
         b2,
         expert_offsets,
         E,
-        fuse_silu=False,
+        activation_type,
+        fuse_act=False,
     )
 
     torch.ops.sgl_kernel.apply_shuffle_mul_sum.default(

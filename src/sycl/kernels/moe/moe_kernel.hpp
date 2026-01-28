@@ -55,7 +55,8 @@ template <
     typename TensorD,
     typename TensorBias,
     typename TiledMMA,
-    bool FuseSiLU,
+    int ActType,
+    bool FuseAct,
     bool WithBias,
     typename ElementA,
     typename ElementB = ElementA,
@@ -80,7 +81,8 @@ class MoEGEMM {
       TensorD,
       TensorBias,
       TiledMMA,
-      WithBias>;
+      WithBias,
+      ActType>;
 
   struct Params {
     const ElementA* Activations;
@@ -96,7 +98,7 @@ class MoEGEMM {
   };
 
   auto make_B_tensors(ElementB* ptr_B, int N, int K) {
-    if constexpr (FuseSiLU) {
+    if constexpr (FuseAct) {
       auto B0 = make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N / 2, K), make_stride(K, _1{})));
       ElementB* ptr_B1 = ptr_B + (N / 2) * K;
       auto B1 = make_tensor(make_gmem_ptr<ElementB>(ptr_B1), make_layout(make_shape(N / 2, K), make_stride(K, _1{})));
@@ -109,7 +111,7 @@ class MoEGEMM {
 
   auto make_Bias_tensors(ElementD* ptr_Bias, int N) {
     if constexpr (WithBias) {
-      if constexpr (FuseSiLU) {
+      if constexpr (FuseAct) {
         auto Bias0 = make_tensor(make_gmem_ptr<ElementD>(ptr_Bias), make_layout(make_shape(N / 2), make_stride(_1{})));
         ElementD* ptr_Bias1 = ptr_Bias + (N / 2);
         auto Bias1 = make_tensor(make_gmem_ptr<ElementD>(ptr_Bias1), make_layout(make_shape(N / 2), make_stride(_1{})));
@@ -127,7 +129,7 @@ class MoEGEMM {
   }
 
   auto make_D_tensors(ElementD* ptr_D, int pre_rows, int M, int N) {
-    if constexpr (FuseSiLU) {
+    if constexpr (FuseAct) {
       auto D_tensor = make_tensor(
           make_gmem_ptr<ElementD>(ptr_D + pre_rows * N / 2),
           make_layout(make_shape(M, N / 2), make_stride(N / 2, _1{})));
@@ -153,7 +155,7 @@ class MoEGEMM {
 
     int group_id = item.get_group_linear_id();
     int N_pad;
-    if constexpr (FuseSiLU) {
+    if constexpr (FuseAct) {
       N_pad = ceil_div(N / 2, wg_tile_n) * wg_tile_n;
     } else {
       N_pad = ceil_div(N, wg_tile_n) * wg_tile_n;
@@ -204,7 +206,7 @@ class MoEGEMM {
         int m_coord = (group_m_id - pre_tiles);
 
         CollectiveMainloop mainloop;
-        if constexpr (FuseSiLU) {
+        if constexpr (FuseAct) {
           auto tile_coord = make_coord(m_coord, n_coord, 0);
           mainloop(
               A_tensor,

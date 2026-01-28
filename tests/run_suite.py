@@ -24,6 +24,7 @@ suites = {
         TestFile("test_per_token_group_quant_8bit.py"),
         TestFile("test_moe_fused_gate.py"),
         TestFile("test_per_tensor_quant_fp8.py"),
+        TestFile("test_fused_qk_norm_rope.py"),
     ],
 }
 

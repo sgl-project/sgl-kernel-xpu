@@ -126,13 +126,24 @@ shape_configs = [
     },
 ]
 
+shape_configs_gelu = [
+    # grok, tp=1
+    {
+        "num_experts": 8,
+        "topk": 2,
+        "hidden_size": 8192,
+        "shard_intermediate_size": 16384,
+        "dtype": torch.bfloat16,
+        "block_shape": None,
+    }
+]
+
 shape_values = [list(d.values()) for d in shape_configs]
 bs = [1, 128, 512, 1024, 2048, 4096, 8192]
 with_bias = [False, True]
-act_type = ["silu", "gelu"]
-configs = [
-    (k, *v, b, act) for k, v, b, act in product(bs, shape_values, with_bias, act_type)
-]
+configs = [(k, *v, b, "silu") for k, v, b in product(bs, shape_values, with_bias)]
+shape_values_gelu = [list(d.values()) for d in shape_configs_gelu]
+configs += [(k, *v, b, "gelu") for k, v, b in product(bs, shape_values_gelu, with_bias)]
 all_results = []
 
 

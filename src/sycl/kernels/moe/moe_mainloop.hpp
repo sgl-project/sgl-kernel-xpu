@@ -363,7 +363,7 @@ struct MoEMainloop<
         constexpr float kAlpha = 0.044715f;
         float x_cube = x * x * x;
         float tanh_arg = kBeta * (x + kAlpha * x_cube);
-        s = 0.5f * x * (1.0f + sycl::tanh(tanh_arg));
+        s = 0.5f * x * (1.0f + std::tanh(tanh_arg));
       }
       tCrC0(i) = x * s * y;
     }

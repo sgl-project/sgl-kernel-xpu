@@ -48,6 +48,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
 
+  m.def("swiglu_with_alpha_and_limit(Tensor x, float alpha, float limit) -> Tensor");
+  m.impl("swiglu_with_alpha_and_limit", torch::kXPU, &swiglu_with_alpha_and_limit);
   m.def(
       "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int "
       "num_fused_shared_experts, float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "

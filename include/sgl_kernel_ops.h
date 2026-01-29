@@ -157,6 +157,8 @@ void fused_qk_norm_rope(
     double high,
     double attention_factor,
     int64_t rotary_dim);
+void sgl_per_token_group_quant_fp4(
+    at::Tensor input, at::Tensor output_q, at::Tensor output_s, int64_t group_size, double eps);
 }  // namespace at::native::xpu
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);

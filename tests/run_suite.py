@@ -26,6 +26,7 @@ suites = {
         TestFile("test_moe_fused_gate.py"),
         TestFile("test_per_tensor_quant_fp8.py"),
         TestFile("test_merge_state_v2.py"),
+        TestFile("test_mxfp4_blockwise_moe.py"),
     ],
 }
 

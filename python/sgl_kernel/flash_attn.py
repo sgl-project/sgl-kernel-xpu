@@ -217,6 +217,39 @@ def flash_attn_with_kvcache(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
+    if (q.dim() == 4 and max_seqlen_q == q.size(1)) or (q.dim() == 3 and max_seqlen_q * (cu_seqlens_q.size(0) - 1) == q.size(0)):
+        return flash_attn_decode_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            k,
+            v,
+            qv,
+            rotary_cos,
+            rotary_sin,
+            cache_seqlens,
+            cache_batch_idx,
+            cache_leftpad,
+            page_table,
+            cu_seqlens_q,
+            cu_seqlens_k_new,
+            max_seqlen_q,
+            rotary_seqlens,
+            q_descale,
+            k_descale,
+            v_descale,
+            softmax_scale,
+            sinks,
+            causal,
+            window_size,
+            softcap,
+            rotary_interleaved,
+            scheduler_metadata,
+            num_splits,
+            pack_gqa,
+            sm_margin,
+            return_softmax_lse,
+        )
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
     if softmax_scale is None:

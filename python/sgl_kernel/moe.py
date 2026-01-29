@@ -48,6 +48,19 @@ def moe_sum_reduce(
     )
 
 
+def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
+    assert gemm1_limit > 0, f"gemm1_limit must be positive, got {gemm1_limit}"
+    assert x.dim() == 2, f"x must be 2D [B, 2H], got {x.dim()}D"
+    assert (
+        x.size(1) % 2 == 0
+    ), f"Last dim must be even for gate/up split, got {x.size(1)}"
+    return torch.ops.sgl_kernel.swiglu_with_alpha_and_limit.default(
+        x,
+        gemm1_alpha,
+        gemm1_limit,
+    )
+
+
 def moe_sum(
     input_tensor: torch.Tensor,
     output_tensor: torch.Tensor,
@@ -285,11 +298,19 @@ def fused_experts(
     assert a1_scale is None, "current MoE does not support a1_scale"
     assert a2_scale is None, "current MoE does not support a2_scale"
     assert block_shape is None, "current MoE does not support block_shape"
+    assert activation in (
+        "silu",
+        "gelu",
+    ), f"Only silu and gelu are supported but got {activation}"
 
     # type check
     assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
     assert w1.dtype == torch.bfloat16, "w1 must be bfloat16"
     assert w2.dtype == torch.bfloat16, "w2 must be bfloat16"
+    if b1 is not None:
+        assert b1.dtype == torch.bfloat16, "b1 must be bfloat16"
+    if b2 is not None:
+        assert b2.dtype == torch.bfloat16, "b2 must be bfloat16"
 
     # Shape check
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
@@ -308,6 +329,10 @@ def fused_experts(
     E, _, K = w1.shape
     E, OutK, N = w2.shape
     assert N * 2 == w1.shape[1], "w1 shape[1] must be 2x of w2 shape[2]"
+    if b1 is not None:
+        assert b1.shape == w1.shape[:2], "b1 shape must match w1 shape[:2]"
+    if b2 is not None:
+        assert b2.shape == w2.shape[:2], "b2 shape must match w2 shape[:2]"
 
     M = num_tokens
     TopK = topk_ids.shape[1]
@@ -358,15 +383,30 @@ def fused_experts(
         (M * TopK, OutK), device=hidden_states.device, dtype=hidden_states.dtype
     )
 
+    activation_type = 0 if activation == "silu" else 1
     torch.ops.sgl_kernel.moe_grouped_mm_nt(
-        intermediate_cache1, input_A_shuffle, w1, expert_offsets, E, fuse_silu=True
+        intermediate_cache1,
+        input_A_shuffle,
+        w1,
+        b1,
+        expert_offsets,
+        E,
+        activation_type,
+        fuse_act=True,
     )
 
     # silu_and_mul is fused into moe_grouped_mm_nt
     # torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
 
     torch.ops.sgl_kernel.moe_grouped_mm_nt(
-        intermediate_cache3, intermediate_cache1, w2, expert_offsets, E, fuse_silu=False
+        intermediate_cache3,
+        intermediate_cache1,
+        w2,
+        b2,
+        expert_offsets,
+        E,
+        activation_type,
+        fuse_act=False,
     )
 
     torch.ops.sgl_kernel.apply_shuffle_mul_sum.default(

@@ -11,6 +11,9 @@
 #define CHECK_SHAPE(x, ...) \
   TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+#define CHECK_INPUT(x) \
+  CHECK_DEVICE(x);     \
+  CHECK_CONTIGUOUS(x);
 
 #define DISPATCH_CASE_INTEGRAL_TYPES(...)              \
   AT_DISPATCH_CASE(at::ScalarType::Byte, __VA_ARGS__)  \
@@ -198,6 +201,21 @@ int get_min(Func limit_func, int X, Args*... args) {
   X = std::min({X, limit_func(X, args)...});
   return X;
 }
+
+inline void check_shape(const at::Tensor& a, const at::Tensor& b, const char* a_name, const char* b_name) {
+  TORCH_CHECK(a.dim() == b.dim(), a_name, ".dim() != ", b_name, ".dim(). ", a.dim(), " vs ", b.dim());
+  for (int i = 0; i < a.dim(); ++i) {
+    TORCH_CHECK(a.size(i) == b.size(i), a_name, ".size(", i, ") != ", b_name, ".size(", i, ")");
+  }
+}
+
+#define CHECK_SAME_SHAPE(a, b) check_shape(a, b, #a, #b)
+
+#define CHECK_XPU(x) TORCH_CHECK(x.device().type() == at::kXPU, #x " must be a XPU tensor")
+
+#define CHECK_INPUT(x) \
+  CHECK_XPU(x);        \
+  CHECK_CONTIGUOUS(x)
 
 #define CHECK_DIM(d, x) TORCH_CHECK(x.dim() == d, #x " must be a " #d "D tensor")
 

@@ -48,6 +48,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
 
+  m.def("swiglu_with_alpha_and_limit(Tensor x, float alpha, float limit) -> Tensor");
+  m.impl("swiglu_with_alpha_and_limit", torch::kXPU, &swiglu_with_alpha_and_limit);
+  m.def(
+      "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int "
+      "num_fused_shared_experts, float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
+      "(Tensor[])");
+  m.impl("moe_fused_gate", torch::kXPU, &moe_fused_gate);
+
   m.def(
       "rotary_embedding(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
       "bool is_neox) -> (Tensor, Tensor)");
@@ -65,13 +73,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("moe_sum", torch::kXPU, &moe_sum);
 
   m.def(
-      "moe_grouped_mm_nt(Tensor output, Tensor activations, Tensor weights, Tensor total_rows_for_experts, int "
-      "n_experts, bool fuse_silu) -> ()");
+      "moe_grouped_mm_nt(Tensor output, Tensor activations, Tensor weights, Tensor? bias, Tensor "
+      "total_rows_for_experts, int n_experts, int activation_type, bool fuse_act) -> ()");
   m.impl("moe_grouped_mm_nt", torch::kXPU, &moe_grouped_mm_nt);
-  m.def(
-      "sgl_per_token_group_quant_8bit(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
-      " float eps, float fp8_min, float fp8_max, bool scale_ue8m0) -> ()");
-  m.impl("sgl_per_token_group_quant_8bit", torch::kXPU, &at::native::xpu::sgl_per_token_group_quant_8bit);
 
   m.def(
       "prepare_moe_input(Tensor topk_ids, Tensor expert_offsets, Tensor? blockscale_offsets, Tensor problem_sizes1,"
@@ -86,6 +90,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("dsv3_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
   m.impl("dsv3_router_gemm", torch::kXPU, &dsv3_router_gemm_xpu);
 
+  m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
+  m.impl("merge_state_v2", torch::kXPU, &merge_state_v2);
   /*
    * From cutlass attention
    */
@@ -118,6 +124,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    bool?    pack_gqa,"
       "    int      sm_margin) -> Tensor[]");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
+
+  /*
+   * From quantization ops
+   */
+  m.def(
+      "sgl_per_token_group_quant_8bit(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
+      " float eps, float fp8_min, float fp8_max, bool scale_ue8m0) -> ()");
+  m.impl("sgl_per_token_group_quant_8bit", torch::kXPU, &at::native::xpu::sgl_per_token_group_quant_8bit);
+  m.def("sgl_per_tensor_quant_fp8(Tensor input, Tensor output_q, Tensor output_s, bool is_static) -> ()");
+  m.impl("sgl_per_tensor_quant_fp8", torch::kXPU, &sgl_per_tensor_quant_fp8);
 }
 
 REGISTER_EXTENSION(common_ops)

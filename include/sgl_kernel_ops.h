@@ -123,6 +123,7 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
 void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize);
+
 std::tuple<at::Tensor, at::Tensor> rotary_embedding(
     at::Tensor& positions,
     at::Tensor& query,
@@ -221,6 +222,7 @@ void topk_softmax(
     torch::Tensor& topk_indices,
     torch::Tensor& token_expert_indices,
     torch::Tensor& gating_output);
+torch::Tensor swiglu_with_alpha_and_limit(torch::Tensor x, double alpha, double limit);
 
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
@@ -229,7 +231,8 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t topk_group,
     int64_t topk,
     int64_t num_fused_shared_experts,
-    double routed_scaling_factor);
+    double routed_scaling_factor,
+    bool apply_routed_scaling_factor_on_output);
 
 void fp8_blockwise_scaled_grouped_mm(
     torch::Tensor& output,
@@ -255,9 +258,11 @@ void moe_grouped_mm_nt(
     torch::Tensor& output,
     const torch::Tensor& activations,
     const torch::Tensor& weights,
+    const std::optional<at::Tensor>& bias,
     const torch::Tensor& total_rows_for_experts,
     const int64_t n_experts,
-    bool fuse_silu = false);
+    const int64_t activation_type = 0,  // 0=silu, 1=gelu
+    bool fuse_act = false);
 
 void prepare_moe_input(
     const torch::Tensor& topk_ids,

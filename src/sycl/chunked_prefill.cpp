@@ -329,7 +329,7 @@ struct KernelRunner {
          params.max_num_pages_per_seq,
          params.window_size_left,
          params.window_size_right},
-        {(ElementQ)params.scale_softmax},
+        {params.scale_softmax},
         {static_cast<const ElementOutput*>(params.o_ptr),
          stride_O,
          static_cast<const ElementSink*>(params.sink_softmax)},

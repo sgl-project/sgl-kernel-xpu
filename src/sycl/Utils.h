@@ -211,12 +211,6 @@ inline void check_shape(const at::Tensor& a, const at::Tensor& b, const char* a_
 
 #define CHECK_SAME_SHAPE(a, b) check_shape(a, b, #a, #b)
 
-#define CHECK_XPU(x) TORCH_CHECK(x.device().type() == at::kXPU, #x " must be a XPU tensor")
-
-#define CHECK_INPUT(x) \
-  CHECK_XPU(x);        \
-  CHECK_CONTIGUOUS(x)
-
 #define CHECK_DIM(d, x) TORCH_CHECK(x.dim() == d, #x " must be a " #d "D tensor")
 
 #define CHECK_LAST_DIM_CONTIGUOUS(x) \

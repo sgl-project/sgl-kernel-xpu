@@ -37,13 +37,20 @@ def flash_attn_baseline(
 
 
 # Benchmark configurations
-causal = [True, False]
-local = [True, False]
-use_sinks = [True, False]
-batch_size = [1, 16]
-q_seq_length_range = [1, 512, 1024]
-kv_seq_length_range = [512, 1024, 2048, 4096, 8192, 16384]
-page_size_range = [32, 64, 128]
+causal = [True]
+local = [True]
+use_sinks = [True]
+batch_size = [1]
+q_seq_length_range = [1]
+kv_seq_length_range = [512]
+page_size_range = [128]
+# causal = [True, False]
+# local = [True, False]
+# use_sinks = [True, False]
+# batch_size = [1, 16]
+# q_seq_length_range = [1, 512, 1024]
+# kv_seq_length_range = [512, 1024, 2048, 4096, 8192, 16384]
+# page_size_range = [32, 64, 128]
 configs = list(
     filter(
         lambda cfg: not (cfg[0] and cfg[1]),
@@ -58,7 +65,7 @@ configs = list(
         ),
     )
 )
-
+all_results = []
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -150,10 +157,38 @@ def benchmark(
             ),
             quantiles=quantiles,
         )
-
+    flops_qk = batch_size * num_heads * q_seq_length * kv_seq_length * head_dim * 2
+    flops_pv = batch_size * num_heads * q_seq_length * head_dim * kv_seq_length * 2
+    tflops = (flops_qk + flops_pv) * 1e-12 / (ms * 1e-3)
+    memory_qk = batch_size * (q.element_size() * num_heads * q_seq_length * head_dim +
+                              k_cache.element_size() * num_heads * kv_seq_length * head_dim)
+    memory_pv = v_cache.element_size() * batch_size * num_heads * kv_seq_length * head_dim + \
+                q.element_size() * batch_size * num_heads * q_seq_length * head_dim
+    bandwidth = (memory_qk + memory_pv) * 1e-9 / (ms * 1e-3)
+    all_results.append(
+        {
+            "batch": batch_size,
+            "q_seq_length": q_seq_length,
+            "kv_seq_length": kv_seq_length,
+            "num_heads": num_heads,
+            "head_dim": head_dim,
+            "causal": causal,
+            "local": local,
+            "use_sinks": use_sinks,
+            "page_size": page_size,
+            "provider": provider,
+            "tflops": tflops,
+            "bandwidth": bandwidth,
+            "ms": ms,
+        }
+    )
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
 
 if __name__ == "__main__":
     benchmark.run(print_data=True)
+    import pandas as pd
+
+    df = pd.DataFrame(all_results)
+    print(df.to_markdown())
     print("Benchmark finished!")

@@ -1053,7 +1053,7 @@ def test_flash_attn_kvcache(
 # @pytest.mark.parametrize("has_batch_idx", [False, True])
 @pytest.mark.parametrize("has_batch_idx", [False])
 # @pytest.mark.parametrize("varlen_q", [False, True])
-@pytest.mark.parametrize("varlen_q", [Flase])
+@pytest.mark.parametrize("varlen_q", [False])
 @pytest.mark.parametrize("d", [64])
 # @pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("seqlen_q", [1])

@@ -1,7 +1,7 @@
 from typing import List, Optional, Tuple
 
 import torch
-from sgl_kernel.utils import _get_cache_buf, ceil_align, get_cuda_stream
+from sgl_kernel.utils import _get_cache_buf, ceil_align, get_xpu_stream
 
 fp8_dtype = torch.float8_e4m3fn
 fp8_max = torch.finfo(fp8_dtype).max
@@ -63,7 +63,7 @@ def _bmm_fp8_internal(
         B_scale,
         workspace_buffer,
         cublas_handle,
-        get_cuda_stream(),
+        get_xpu_stream(),
     )
 
 

@@ -1,5 +1,5 @@
 import torch
-from sgl_kernel.utils import get_cuda_stream
+from sgl_kernel.utils import get_xpu_stream
 
 
 def tree_speculative_sampling_target_only(
@@ -31,7 +31,7 @@ def tree_speculative_sampling_target_only(
         threshold_single,
         threshold_acc,
         deterministic,
-        get_cuda_stream(),
+        get_xpu_stream(),
     )
 
 
@@ -54,7 +54,7 @@ def verify_tree_greedy(
         retrive_next_token,
         retrive_next_sibling,
         target_predict,
-        get_cuda_stream(),
+        get_xpu_stream(),
     )
 
 

@@ -40,13 +40,14 @@ def flash_attn_baseline(
 causal = [True, False]
 local = [True, False]
 use_sinks = [True, False]
-batch_size = [1, 16]
-q_seq_length_range = [1, 512, 1024]
+batch_size = [16]
+q_seq_length_range = [1, 512]
 kv_seq_length_range = [512, 1024, 2048, 4096, 8192, 16384]
 page_size_range = [32, 64, 128]
 configs = list(
     filter(
-        lambda cfg: not (cfg[0] and cfg[1]),
+        lambda cfg: not (cfg[0] and cfg[1])
+        and (cfg[4] != 1 or (not cfg[0] and not cfg[1] and not cfg[2])),
         product(
             causal,
             local,
@@ -58,6 +59,7 @@ configs = list(
         ),
     )
 )
+all_results = []
 
 
 @triton.testing.perf_report(
@@ -93,11 +95,9 @@ def benchmark(
 ):
     dtype = torch.bfloat16
     device = torch.device("xpu")
-
     # Attention parameters
     num_heads = 16
-    head_dim = 64
-
+    head_dim = 128
     # Create input tensors
     q = torch.randn(
         (batch_size * q_seq_length, num_heads, head_dim), device=device, dtype=dtype
@@ -136,9 +136,9 @@ def benchmark(
     if provider == "flash_attn":
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: flash_attn_baseline(
-                q.clone(),
-                k_cache.clone(),
-                v_cache.clone(),
+                q,
+                k_cache,
+                v_cache,
                 causal=causal,
                 window_size=window_size,
                 softmax_scale=softmax_scale,
@@ -151,9 +151,42 @@ def benchmark(
             quantiles=quantiles,
         )
 
+    flops_qk = batch_size * num_heads * q_seq_length * kv_seq_length * head_dim * 2
+    flops_pv = batch_size * num_heads * q_seq_length * head_dim * kv_seq_length * 2
+    tflops = (flops_qk + flops_pv) * 1e-12 / (ms * 1e-3)
+    memory_qk = batch_size * (
+        q.element_size() * num_heads * q_seq_length * head_dim
+        + k_cache.element_size() * num_heads * kv_seq_length * head_dim
+    )
+    memory_pv = (
+        v_cache.element_size() * batch_size * num_heads * kv_seq_length * head_dim
+        + q.element_size() * batch_size * num_heads * q_seq_length * head_dim
+    )
+    bandwidth = (memory_qk + memory_pv) * 1e-9 / (ms * 1e-3)
+    all_results.append(
+        {
+            "batch": batch_size,
+            "q_seq_length": q_seq_length,
+            "kv_seq_length": kv_seq_length,
+            "num_heads": num_heads,
+            "head_dim": head_dim,
+            "causal": causal,
+            "local": local,
+            "use_sinks": use_sinks,
+            "page_size": page_size,
+            "provider": provider,
+            "tflops": tflops,
+            "bandwidth": bandwidth,
+            "ms": ms,
+        }
+    )
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    benchmark.run(print_data=False)
+    import pandas as pd
+
+    df = pd.DataFrame(all_results)
+    print(df.to_markdown())
     print("Benchmark finished!")

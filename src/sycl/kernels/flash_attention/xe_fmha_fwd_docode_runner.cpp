@@ -197,6 +197,8 @@ struct Arguments {
   torch::TensorOptions tensor_opts;
 };
 
+template <typename Kernel>
+class KernelCur {};
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // 3 input matrices: Keys, Queries and Values.
 using LayoutQ = cutlass::layout::RowMajor;
@@ -204,19 +206,19 @@ using LayoutK = cutlass::layout::ColumnMajor;
 using LayoutV = cutlass::layout::RowMajor;
 using LayoutO = cutlass::layout::RowMajor;
 
-template <class FMHAKernel, bool isVarLen = false>
+template <class FMHADecodeKernel, bool isVarLen = false>
 struct KernelRunner {
-  using StrideQ = typename FMHAKernel::StrideQ;
-  using StrideK = typename FMHAKernel::StrideK;
-  using StrideV = typename FMHAKernel::StrideV;
-  using StrideO = typename FMHAKernel::StrideO;
+  using StrideQ = typename FMHADecodeKernel::StrideQ;
+  using StrideK = typename FMHADecodeKernel::StrideK;
+  using StrideV = typename FMHADecodeKernel::StrideV;
+  using StrideO = typename FMHADecodeKernel::StrideO;
 
-  using ElementQ = typename FMHAKernel::ElementQ;
-  using ElementK = typename FMHAKernel::ElementK;
-  using ElementV = typename FMHAKernel::ElementV;
-  using ElementO = typename FMHAKernel::ElementO;
+  using ElementQ = typename FMHADecodeKernel::ElementQ;
+  using ElementK = typename FMHADecodeKernel::ElementK;
+  using ElementV = typename FMHADecodeKernel::ElementV;
+  using ElementO = typename FMHADecodeKernel::ElementO;
 
-  using CollectiveMainloop = typename FMHAKernel::CollectiveMainloop;
+  using CollectiveMainloop = typename FMHADecodeKernel::CollectiveMainloop;
   using ElementS = typename CollectiveMainloop::ElementS;
 
   using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<isVarLen>;
@@ -327,15 +329,15 @@ struct KernelRunner {
 
   // Note that the GemmUniversalAdapter currently doesn't support flash attention, which is why this
   // secondary `run` function is required to launch the kernel.
-  static void run(typename FMHAKernel::Params params) {
+  static void run(typename FMHADecodeKernel::Params params) {
     namespace syclex = sycl::ext::oneapi::experimental;
     namespace intelex = sycl::ext::intel::experimental;
 
-    dim3 const block = FMHAKernel::get_block_shape();
-    dim3 const grid = FMHAKernel::get_grid_shape(params);
+    dim3 const block = FMHADecodeKernel::get_block_shape();
+    dim3 const grid = FMHADecodeKernel::get_grid_shape(params);
 
     // configure smem size and carveout
-    int smem_size = FMHAKernel::SharedStorageSize;
+    int smem_size = FMHADecodeKernel::SharedStorageSize;
 
     const auto sycl_block = compat::dim3(block.x, block.y, block.z);
     const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
@@ -347,15 +349,26 @@ struct KernelRunner {
     compat::experimental::kernel_properties kernel_props{
         syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<256>};
     compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
-    auto event = compat::experimental::launch<cutlass::device_kernel<FMHAKernel>, FMHAKernel>(policy, params);
 
-    EventManager::getInstance().addEvent(event);
+    sycl::ext::oneapi::experimental::launch_config config(policy.get_range(), policy.get_launch_properties());
+    auto cgf = [&](::sycl::handler& cgh) {
+      auto KernelFunctor = compat::experimental::detail::build_kernel_functor<cutlass::device_kernel<FMHADecodeKernel>>(
+          cgh, policy, params);
+      sycl::ext::oneapi::experimental::detail::
+          LaunchConfigAccess<sycl::nd_range<3>, decltype(policy.get_launch_properties())>
+              ConfigAccess(config);
+      cgh.parallel_for<KernelCur<FMHADecodeKernel>>(
+          ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
+    };
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto q = stream.queue();
+    q.submit(cgf);
   }
 
   cutlass::Status run(const Arguments& params, const cutlass::KernelHardwareInfo& hw_info) {
     ProblemShapeType shape = initialize(params);
 
-    typename FMHAKernel::Arguments arguments{
+    typename FMHADecodeKernel::Arguments arguments{
         {
             shape,
             static_cast<const ElementQ*>(params.q_ptr),
@@ -376,10 +389,10 @@ struct KernelRunner {
         hw_info};
 
     // Define device-global scratch memory
-    size_t workspace_size = FMHAKernel::get_workspace_size(arguments);
+    size_t workspace_size = FMHADecodeKernel::get_workspace_size(arguments);
     cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
 
-    if (!FMHAKernel::can_implement(arguments)) {
+    if (!FMHADecodeKernel::can_implement(arguments)) {
       // std::cout << "Invalid Problem Size: " << params.b << 'x' << params.num_heads_q << 'x' << params.seq_len_qo
       //           << 'x' << params.seq_len_kv << 'x' << params.head_size_qk << 'x' << params.head_size_vo
       //           << (params.is_causal ? "xCausal" : "xNonCausal") << std::endl;
@@ -387,10 +400,10 @@ struct KernelRunner {
     }
 
     // Initialize the workspace
-    FMHAKernel::initialize_workspace(arguments, workspace.get());
+    FMHADecodeKernel::initialize_workspace(arguments, workspace.get());
 
     // Convert host-side arguments to device-side arguments to be passed to the kernel
-    auto kernel_params = FMHAKernel::to_underlying_arguments(arguments, workspace.get());
+    auto kernel_params = FMHADecodeKernel::to_underlying_arguments(arguments, workspace.get());
 
     // Run
     run(kernel_params);
@@ -496,13 +509,13 @@ struct FMHAConfig {
         cutlass::fmha::collective::FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO>;
 
     static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
-    using FMHAKernel = conditional_t<
+    using FMHADecodeKernel = conditional_t<
         is_same_v<Scheduler, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>,
         cutlass::fmha::kernel::
             XeFMHAFwdDynamicSplitKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>,
         cutlass::fmha::kernel::XeFMHAFwdKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>>;
 
-    KernelRunner<FMHAKernel, isVarLen> kernel;
+    KernelRunner<FMHADecodeKernel, isVarLen> kernel;
 
     kernel.run(params, hw_info);
     return 0;

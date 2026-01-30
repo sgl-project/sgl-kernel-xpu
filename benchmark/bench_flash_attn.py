@@ -37,16 +37,17 @@ def flash_attn_baseline(
 
 
 # Benchmark configurations
-causal = [False]
-local = [False]
-use_sinks = [False]
-batch_size = [1, 16]
-q_seq_length_range = [1, 512, 1024]
+causal = [True, False]
+local = [True, False]
+use_sinks = [True, False]
+batch_size = [16]
+q_seq_length_range = [1, 512]
 kv_seq_length_range = [512, 1024, 2048, 4096, 8192, 16384]
 page_size_range = [32, 64, 128]
 configs = list(
     filter(
-        lambda cfg: not (cfg[0] and cfg[1]),
+        lambda cfg: not (cfg[0] and cfg[1])
+        and (cfg[4] != 1 or (not cfg[0] and not cfg[1] and not cfg[2])),
         product(
             causal,
             local,
@@ -96,7 +97,7 @@ def benchmark(
     device = torch.device("xpu")
     # Attention parameters
     num_heads = 16
-    head_dim = 64
+    head_dim = 128
     # Create input tensors
     q = torch.randn(
         (batch_size * q_seq_length, num_heads, head_dim), device=device, dtype=dtype
@@ -131,12 +132,13 @@ def benchmark(
     softmax_scale = 1.0 / (head_dim**0.5)
 
     quantiles = [0.5, 0.2, 0.8]
+
     if provider == "flash_attn":
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: flash_attn_baseline(
-                q.clone(),
-                k_cache.clone(),
-                v_cache.clone(),
+                q,
+                k_cache,
+                v_cache,
                 causal=causal,
                 window_size=window_size,
                 softmax_scale=softmax_scale,
@@ -148,6 +150,7 @@ def benchmark(
             ),
             quantiles=quantiles,
         )
+
     flops_qk = batch_size * num_heads * q_seq_length * kv_seq_length * head_dim * 2
     flops_pv = batch_size * num_heads * q_seq_length * head_dim * kv_seq_length * 2
     tflops = (flops_qk + flops_pv) * 1e-12 / (ms * 1e-3)

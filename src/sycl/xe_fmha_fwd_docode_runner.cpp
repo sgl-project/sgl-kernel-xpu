@@ -40,8 +40,8 @@
 #include <random>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
-#include "../../Utils.h"
-#include "../../comm/common.h"
+#include "Utils.h"
+#include "comm/common.h"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/util/GPU_Clock.hpp"
@@ -51,9 +51,9 @@
 #include "cutlass/util/reference/device/gemm_complex.h"
 #include "cutlass/util/reference/device/tensor_compare.h"
 #include "cutlass/util/sycl_event_manager.hpp"
-#include "fmha_fusion.hpp"
-#include "xe_fhma_fwd_kernel.hpp"
-#include "xe_tile_scheduler.hpp"
+#include "kernels/flash_attention/fmha_fusion.hpp"
+#include "kernels/flash_attention/xe_fhma_fwd_kernel.hpp"
+#include "kernels/flash_attention/xe_tile_scheduler.hpp"
 
 // #include "helper.h"
 // #include "sycl_common.hpp"

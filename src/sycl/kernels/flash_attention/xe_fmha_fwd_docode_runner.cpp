@@ -805,14 +805,7 @@ std::vector<at::Tensor> flash_decode(
 
     AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-        FMHAConfig<
-            Causal,
-            LocalMask,
-            Sink,
-            TileShapeQK,
-            TileShapePV,
-            TileShapeOutput,
-            SubgroupLayoutQK>::run(params);
+        FMHAConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(params);
       });
     });
   };

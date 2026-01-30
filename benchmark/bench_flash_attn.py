@@ -19,6 +19,9 @@ def flash_attn_baseline(
     max_seqlen_q,
 ):
     """Baseline Flash Attention implementation"""
+    import pdb
+
+    pdb.set_trace()
     out, lse, *rest = flash_attn_with_kvcache(
         q,
         k_cache,
@@ -66,6 +69,7 @@ configs = list(
     )
 )
 all_results = []
+
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -160,10 +164,14 @@ def benchmark(
     flops_qk = batch_size * num_heads * q_seq_length * kv_seq_length * head_dim * 2
     flops_pv = batch_size * num_heads * q_seq_length * head_dim * kv_seq_length * 2
     tflops = (flops_qk + flops_pv) * 1e-12 / (ms * 1e-3)
-    memory_qk = batch_size * (q.element_size() * num_heads * q_seq_length * head_dim +
-                              k_cache.element_size() * num_heads * kv_seq_length * head_dim)
-    memory_pv = v_cache.element_size() * batch_size * num_heads * kv_seq_length * head_dim + \
-                q.element_size() * batch_size * num_heads * q_seq_length * head_dim
+    memory_qk = batch_size * (
+        q.element_size() * num_heads * q_seq_length * head_dim
+        + k_cache.element_size() * num_heads * kv_seq_length * head_dim
+    )
+    memory_pv = (
+        v_cache.element_size() * batch_size * num_heads * kv_seq_length * head_dim
+        + q.element_size() * batch_size * num_heads * q_seq_length * head_dim
+    )
     bandwidth = (memory_qk + memory_pv) * 1e-9 / (ms * 1e-3)
     all_results.append(
         {

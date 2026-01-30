@@ -1,7 +1,7 @@
 from typing import Optional
 
 import torch
-from sgl_kernel.utils import get_cuda_stream, is_hopper_arch
+from sgl_kernel.utils import get_cuda_stream
 
 
 def rmsnorm(

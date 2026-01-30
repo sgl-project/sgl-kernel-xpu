@@ -518,3 +518,5 @@ void qserve_w4a8_per_group_gemm(
     const torch::Tensor& _wscales,
     const torch::Tensor& _ascales,
     torch::Tensor& _out_feats);
+
+std::tuple<int64_t, int64_t> query_device(int64_t device_index = -1);

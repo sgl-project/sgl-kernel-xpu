@@ -131,6 +131,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("sgl_per_token_group_quant_8bit", torch::kXPU, &at::native::xpu::sgl_per_token_group_quant_8bit);
   m.def("sgl_per_tensor_quant_fp8(Tensor input, Tensor output_q, Tensor output_s, bool is_static) -> ()");
   m.impl("sgl_per_tensor_quant_fp8", torch::kXPU, &sgl_per_tensor_quant_fp8);
+
+  /* utils */
+  m.def("query_device(int device_id) -> (int, int)");
+  m.impl("query_device", c10::DispatchKey::BackendSelect, &query_device);
 }
 
 REGISTER_EXTENSION(common_ops)

@@ -198,13 +198,11 @@ class FMHAFwdEpilogue {
       auto shape_A = append(append(SGTileShapeA{}, ReduceK{}), SGPerWG{} / ReduceK{});
       auto shape_A_row = make_shape(get<0>(SGTileShapeO{}), shape(ReduceSGLayout{}), ReduceK{}, SGPerWG{} / ReduceK{});
 
-      /* Physical layouts, with subtile modes broken out */
       auto sA_layout = group<2, 4>(flat_divide(make_ordered_layout(shape_A, Step<_1, _0, _2, _3>{}), SGTileShapeO{}));
       auto sA_row_stride =
           make_stride(_1{}, make_stride(get<0>(shape_A_row), _0{}), AlignedSGTileA_Q{}, AlignedSGTileA_Q{} * ReduceK{});
       auto sA_row_layout = make_layout(shape_A_row, sA_row_stride);
 
-      /* Coordinate layouts, with subtile modes broken out */
       auto basis2 = make_basis_like(SGTileShapeO{});
       auto sA_coords = make_layout(
           append(SGTileShapeO{}, shape(ReduceSGLayout{})), append(basis2, product_each(zip(SGTileShapeO{}, basis2))));

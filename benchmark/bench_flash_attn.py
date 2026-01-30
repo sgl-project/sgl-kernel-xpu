@@ -19,9 +19,6 @@ def flash_attn_baseline(
     max_seqlen_q,
 ):
     """Baseline Flash Attention implementation"""
-    import pdb
-
-    pdb.set_trace()
     out, lse, *rest = flash_attn_with_kvcache(
         q,
         k_cache,
@@ -143,7 +140,6 @@ def benchmark(
     softmax_scale = 1.0 / (head_dim**0.5)
 
     quantiles = [0.5, 0.2, 0.8]
-
     if provider == "flash_attn":
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: flash_attn_baseline(

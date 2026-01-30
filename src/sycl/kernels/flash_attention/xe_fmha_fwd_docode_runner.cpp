@@ -198,7 +198,7 @@ struct Arguments {
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-// 3 input matrices: (K)eys, (Q)ueries and (V)alues.
+// 3 input matrices: Keys, Queries and Values.
 using LayoutQ = cutlass::layout::RowMajor;
 using LayoutK = cutlass::layout::ColumnMajor;
 using LayoutV = cutlass::layout::RowMajor;

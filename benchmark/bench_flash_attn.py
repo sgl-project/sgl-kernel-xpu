@@ -37,20 +37,13 @@ def flash_attn_baseline(
 
 
 # Benchmark configurations
-causal = [True]
-local = [True]
-use_sinks = [True]
-batch_size = [1]
-q_seq_length_range = [1]
-kv_seq_length_range = [512]
-page_size_range = [128]
-# causal = [True, False]
-# local = [True, False]
-# use_sinks = [True, False]
-# batch_size = [1, 16]
-# q_seq_length_range = [1, 512, 1024]
-# kv_seq_length_range = [512, 1024, 2048, 4096, 8192, 16384]
-# page_size_range = [32, 64, 128]
+causal = [False]
+local = [False]
+use_sinks = [False]
+batch_size = [1, 16]
+q_seq_length_range = [1, 512, 1024]
+kv_seq_length_range = [512, 1024, 2048, 4096, 8192, 16384]
+page_size_range = [32, 64, 128]
 configs = list(
     filter(
         lambda cfg: not (cfg[0] and cfg[1]),
@@ -101,11 +94,9 @@ def benchmark(
 ):
     dtype = torch.bfloat16
     device = torch.device("xpu")
-
     # Attention parameters
     num_heads = 16
     head_dim = 64
-
     # Create input tensors
     q = torch.randn(
         (batch_size * q_seq_length, num_heads, head_dim), device=device, dtype=dtype
@@ -190,7 +181,7 @@ def benchmark(
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    benchmark.run(print_data=False)
     import pandas as pd
 
     df = pd.DataFrame(all_results)

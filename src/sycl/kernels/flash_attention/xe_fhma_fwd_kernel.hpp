@@ -269,23 +269,16 @@ class XeFMHAFwdKernel {
       auto dcV_cache = const_cast<ElementV*>(p.V_cache + offset_v_cache);
       auto dcO = const_cast<ElementO*>(p.O + offset_o);
       // NHD layout for GQA
-      auto layout_q = is_var_len
-                          ? make_ordered_layout(shape_Q, Step<_1, _0, _2, _3>{})
-                          // ? make_ordered_layout(shape_Q, Step<_2, _0, _1, _3>{})
-                          : make_layout(shape_Q, p.dQ);
-      auto layout_k = is_var_len
-                          ? make_ordered_layout(shape_K, Step<_2, _0, _1, _3>{})
-                          : make_layout(shape_K, p.dK);
-      auto layout_v = is_var_len
-                          ? make_ordered_layout(shape_V, Step<_0, _2, _1, _3>{})
-                          : make_layout(shape_V, p.dV);
+      auto layout_q = is_var_len ? make_ordered_layout(shape_Q, Step<_1, _0, _2, _3>{})
+                                 // ? make_ordered_layout(shape_Q, Step<_2, _0, _1, _3>{})
+                                 : make_layout(shape_Q, p.dQ);
+      auto layout_k = is_var_len ? make_ordered_layout(shape_K, Step<_2, _0, _1, _3>{}) : make_layout(shape_K, p.dK);
+      auto layout_v = is_var_len ? make_ordered_layout(shape_V, Step<_0, _2, _1, _3>{}) : make_layout(shape_V, p.dV);
 
       // NHD layout for GQA
-      auto layout_o = is_var_len
-                          ? make_ordered_layout(shape_O, Step<_1, _0, _2, _3>{})
-                          // ? make_ordered_layout(shape_O, Step<_2, _0, _1, _3>{})
-                          : make_layout(shape_O, p.dO);
-
+      auto layout_o = is_var_len ? make_ordered_layout(shape_O, Step<_1, _0, _2, _3>{})
+                                 // ? make_ordered_layout(shape_O, Step<_2, _0, _1, _3>{})
+                                 : make_layout(shape_O, p.dO);
 
       // auto shape_Q = make_shape(seq_len_qo, s.head_size_qk, s.num_heads_q, batch_dim);
       // // auto shape_K = make_shape(seq_len_kv, s.head_size_qk, s.num_heads_kv, batch_dim);
@@ -311,8 +304,10 @@ class XeFMHAFwdKernel {
 
       // auto stride_q = cutlass::make_stride(
       //     s.num_heads_q * s.head_size_qk, Int<1>{}, s.head_size_qk, s.head_size_qk * s.num_heads_q * seq_len_qo);
-      // // auto stride_k = cutlass::make_stride(s.num_heads_kv * s.head_size_qk, Int<1>{}, s.head_size_qk, s.head_size_qk
-      // // * s.num_heads_kv * seq_len_kv); auto stride_v = cutlass::make_stride(Int<1>{}, s.num_heads_kv * s.head_size_vo,
+      // // auto stride_k = cutlass::make_stride(s.num_heads_kv * s.head_size_qk, Int<1>{}, s.head_size_qk,
+      // s.head_size_qk
+      // // * s.num_heads_kv * seq_len_kv); auto stride_v = cutlass::make_stride(Int<1>{}, s.num_heads_kv *
+      // s.head_size_vo,
       // // s.head_size_vo, s.head_size_vo * s.num_heads_kv * seq_len_kv);
       // auto stride_o = cutlass::make_stride(
       //     s.num_heads_q * s.head_size_vo, Int<1>{}, s.head_size_vo, s.head_size_vo * s.num_heads_q * seq_len_qo);

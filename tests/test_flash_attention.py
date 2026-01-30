@@ -1111,7 +1111,7 @@ def test_flash_attn_decode_kvcache(
     batch_size = 1
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
     nheads = 2
-    nheads_k = 1 #nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
+    nheads_k = 1  # nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
 
     if seqlen_k <= seqlen_q:

@@ -121,9 +121,9 @@ jobs:
           git commit -m "CI intermediate baseline update" || echo "No changes to commit"
           echo "Detected changes in baseline.json: $(git diff --cached --stat)"
 
-          echo "${{ secrets.PAT }}" | gh auth login --with-token || { echo "gh auth login failed"; exit 1; }
           git remote set-url origin https://x-access-token:${{ secrets.PAT }}@github.com/sgl-project/sgl-kernel-xpu.git
-          git push -f https://${{ secrets.PAT }}@github.com/sgl-project/sgl-kernel-xpu.git "$BRANCH"
+          git push -f origin "$BRANCH"
+          gh auth setup-git --token "${{ secrets.PAT }}"
 
           PR_NUMBER=$(gh pr list \
             --repo sgl-project/sgl-kernel-xpu \
@@ -163,3 +163,4 @@ jobs:
         if: always()
         run: |
           docker rm -f ci_sglang_xpu || true
+

@@ -12,7 +12,7 @@ concurrency:
 jobs:
   build-and-test:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
-    permissions: 
+    permissions:
       contents: write
       pull-requests: write
     runs-on: sglang-bmg

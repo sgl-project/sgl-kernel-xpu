@@ -43,7 +43,7 @@ jobs:
         run: |
           docker exec ci_sglang_xpu /miniforge3/envs/py3.10/bin/python3 -m pip install --upgrade pip
           docker exec ci_sglang_xpu /miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub
-          docker exec ci_sglang_xpu /bin/bash -c '/miniforge3/envs/py3.10/bin/huggingface-cli login --token ${HF_TOKEN} '
+          docker exec ci_sglang_xpu /bin/bash -c '/miniforge3/envs/py3.10/bin/hf auth login --token ${HF_TOKEN} '
           docker exec ci_sglang_xpu /bin/bash -c "ln -sf /miniforge3/envs/py3.10/bin/python3 /usr/bin/python3"
 
       - name: Run Sglang Kernel Cases
@@ -64,6 +64,8 @@ jobs:
               python3 bench_fused_moe.py 2>&1 | tee fused_moe.log && \
               python3 bench_moe_sum_reduce.py 2>&1 | tee moe_sum_reduce.log \
               python3 bench_moe_fused_gate.py 2>&1 | tee moe_fused_gate.py.log \
+              python3 bench_merge_states_v2.py 2>&1 | tee merge_states.py.log \
+              python3 bench_swiglu_alpha_limit.py 2>&1 | tee swiglu_alpha_limit.py.log \
             "
 
       - name: Copy logs from container
@@ -119,9 +121,9 @@ jobs:
           git commit -m "CI intermediate baseline update" || echo "No changes to commit"
           echo "Detected changes in baseline.json: $(git diff --cached --stat)"
 
-          echo "${{ secrets.PAT }}" | gh auth login --with-token || { echo "gh auth login failed"; exit 1; }
           git remote set-url origin https://x-access-token:${{ secrets.PAT }}@github.com/sgl-project/sgl-kernel-xpu.git
-          git push -f https://${{ secrets.PAT }}@github.com/sgl-project/sgl-kernel-xpu.git "$BRANCH"
+          git push -f origin "$BRANCH"
+          export GITHUB_TOKEN="${{ secrets.PAT }}"
 
           PR_NUMBER=$(gh pr list \
             --repo sgl-project/sgl-kernel-xpu \

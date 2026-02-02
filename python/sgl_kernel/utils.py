@@ -19,8 +19,8 @@ from typing import Dict, Tuple
 import torch
 
 
-def get_cuda_stream() -> int:
-    return torch.cuda.current_stream().cuda_stream
+def get_xpu_stream() -> int:
+    return torch.xpu.current_stream().sycl_queue
 
 
 _cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
@@ -42,12 +42,18 @@ def _to_tensor_scalar_tuple(x):
         return (None, x)
 
 
+def get_device_capability() -> Tuple[int, int]:
+    device = torch.xpu.current_device()
+    major, minor = torch.ops.sgl_kernel.query_device.default(device)
+    return major, minor
+
+
 @functools.lru_cache(maxsize=1)
-def is_hopper_arch() -> bool:
-    # Hopper arch's compute capability == 9.0
-    device = torch.cuda.current_device()
-    major, minor = torch.cuda.get_device_capability(device)
-    return major == 9
+def is_xe2_arch() -> bool:
+    # Xe2(BMG-G21) has compute capability 20
+    device = torch.xpu.current_device()
+    major, _ = torch.ops.sgl_kernel.query_device.default(device)
+    return major == 2
 
 
 def ceil_div(x: int, y: int) -> int:

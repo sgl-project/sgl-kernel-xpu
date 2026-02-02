@@ -59,6 +59,7 @@ from sgl_kernel.moe import (
     moe_sum,
     moe_sum_reduce,
     prepare_moe_input,
+    swiglu_with_alpha_and_limit,
     topk_softmax,
 )
 from sgl_kernel.sampling import (
@@ -74,6 +75,7 @@ from sgl_kernel.speculative import (
     tree_speculative_sampling_target_only,
     verify_tree_greedy,
 )
+from sgl_kernel.utils import get_device_capability, is_xe2_arch
 from sgl_kernel.version import __version__
 
 build_tree_kernel = (

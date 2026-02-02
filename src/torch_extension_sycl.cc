@@ -48,6 +48,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
 
+  m.def("swiglu_with_alpha_and_limit(Tensor x, float alpha, float limit) -> Tensor");
+  m.impl("swiglu_with_alpha_and_limit", torch::kXPU, &swiglu_with_alpha_and_limit);
   m.def(
       "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int "
       "num_fused_shared_experts, float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
@@ -72,8 +74,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def(
       "moe_grouped_mm_nt(Tensor output, Tensor activations, Tensor weights, Tensor? bias, Tensor "
-      "total_rows_for_experts, int "
-      "n_experts, bool fuse_silu) -> ()");
+      "total_rows_for_experts, int n_experts, int activation_type, bool fuse_act) -> ()");
   m.impl("moe_grouped_mm_nt", torch::kXPU, &moe_grouped_mm_nt);
 
   m.def(
@@ -86,6 +87,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, Tensor? factors) -> ()");
   m.impl("apply_shuffle_mul_sum", torch::kXPU, &apply_shuffle_mul_sum);
 
+  m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
+  m.impl("merge_state_v2", torch::kXPU, &merge_state_v2);
   /*
    * From cutlass attention
    */
@@ -137,6 +140,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "float eps, Tensor! q_weight, Tensor! k_weight, float base, bool is_neox, Tensor! position_ids, "
       "float factor, float low, float high, float attention_factor, int rotary_dim) -> ()");
   m.impl("fused_qk_norm_rope", torch::kXPU, &at::native::xpu::fused_qk_norm_rope);
+  /* utils */
+  m.def("query_device(int device_id) -> (int, int)");
+  m.impl("query_device", c10::DispatchKey::BackendSelect, &query_device);
 }
 
 REGISTER_EXTENSION(common_ops)

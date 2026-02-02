@@ -202,6 +202,15 @@ int get_min(Func limit_func, int X, Args*... args) {
   return X;
 }
 
+inline void check_shape(const at::Tensor& a, const at::Tensor& b, const char* a_name, const char* b_name) {
+  TORCH_CHECK(a.dim() == b.dim(), a_name, ".dim() != ", b_name, ".dim(). ", a.dim(), " vs ", b.dim());
+  for (int i = 0; i < a.dim(); ++i) {
+    TORCH_CHECK(a.size(i) == b.size(i), a_name, ".size(", i, ") != ", b_name, ".size(", i, ")");
+  }
+}
+
+#define CHECK_SAME_SHAPE(a, b) check_shape(a, b, #a, #b)
+
 #define CHECK_DIM(d, x) TORCH_CHECK(x.dim() == d, #x " must be a " #d "D tensor")
 
 #define CHECK_LAST_DIM_CONTIGUOUS(x) \

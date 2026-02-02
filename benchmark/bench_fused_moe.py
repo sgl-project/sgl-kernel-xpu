@@ -126,10 +126,24 @@ shape_configs = [
     },
 ]
 
+shape_configs_gelu = [
+    # grok, tp=1
+    {
+        "num_experts": 8,
+        "topk": 2,
+        "hidden_size": 8192,
+        "shard_intermediate_size": 16384,
+        "dtype": torch.bfloat16,
+        "block_shape": None,
+    }
+]
+
 shape_values = [list(d.values()) for d in shape_configs]
 bs = [1, 128, 512, 1024, 2048, 4096, 8192]
 with_bias = [False, True]
-configs = [(k, *v, b) for k, v, b in product(bs, shape_values, with_bias)]
+configs = [(k, *v, b, "silu") for k, v, b in product(bs, shape_values, with_bias)]
+shape_values_gelu = [list(d.values()) for d in shape_configs_gelu]
+configs += [(k, *v, b, "gelu") for k, v, b in product(bs, shape_values_gelu, with_bias)]
 all_results = []
 
 
@@ -208,6 +222,7 @@ def fused_moe_sglang_api(
     topk,
     b1,
     b2,
+    act_type,
 ):
     num_tokens = x.shape[0]
     topk_weights = torch.empty(num_tokens, topk, dtype=torch.float32, device=x.device)
@@ -228,6 +243,7 @@ def fused_moe_sglang_api(
             topk_indices,
             b1,
             b2,
+            activation=act_type,
         ),
         topk_indices,
     )
@@ -244,6 +260,7 @@ def fused_moe_sglang_api(
             "dtype",
             "block_shape",
             "with_bias",
+            "act_type",
         ],
         x_vals=configs,
         line_arg="provider",
@@ -270,10 +287,11 @@ def benchmark(
     dtype,
     block_shape,
     with_bias,
+    act_type,
     provider,
 ):
     print(
-        f"benchmark {provider} with batch_size={num_tokens} hidden_size={hidden_size} shard_intermediate_size={shard_intermediate_size} with_bias={with_bias}"
+        f"benchmark {provider} with {num_tokens=} {hidden_size=} {shard_intermediate_size=} {with_bias=} {act_type=}"
     )
     torch.set_default_device("xpu")
     torch.xpu.manual_seed_all(0)
@@ -303,6 +321,7 @@ def benchmark(
         "topk": topk,
         "b1": b1,
         "b2": b2,
+        "act_type": act_type,
     }
 
     # Warmup
@@ -355,8 +374,9 @@ def benchmark(
             "hidden_size": hidden_size,
             "shard_intermediate_size": shard_intermediate_size,
             "dtype": dtype,
-            "block_shape": block_shape,
+            # "block_shape": block_shape,  # Always None now. disabled to reduce the number of columns
             "with_bias": with_bias,
+            "act_type": act_type,
             "provider": provider,
             "tflops": tflops,
             "bandwidth": bandwidth,

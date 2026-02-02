@@ -47,6 +47,9 @@
 #pragma clang diagnostic ignored "-Wpass-failed"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
+#define SILU 0
+#define GELU 1
+
 template <typename T>
 struct dump;
 
@@ -67,7 +70,8 @@ template <
     class DTensor_,
     class BiasTensor_,
     class TiledMMA_,
-    bool WithBias>
+    bool WithBias,
+    int ActType>
 struct MoEMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -82,7 +86,8 @@ template <
     class DTensor_,
     class BiasTensor_,
     class TiledMMA_,
-    bool WithBias>
+    bool WithBias,
+    int ActType>
 struct MoEMainloop<
     XeDefault<Stages>,
     TiledCopyA_,
@@ -93,7 +98,8 @@ struct MoEMainloop<
     DTensor_,
     BiasTensor_,
     TiledMMA_,
-    WithBias> {
+    WithBias,
+    ActType> {
   using TiledMMA = TiledMMA_;
   using TiledCopyA = TiledCopyA_;
   using TiledCopyB = TiledCopyB_;
@@ -349,7 +355,16 @@ struct MoEMainloop<
     for (int i = 0; i < tCrC0.size(); ++i) {
       float x = tCrC0(i);
       float y = tCrC1(i);
-      float s = 1.0f / (1.0f + sycl::native::exp(-x));
+      float s;
+      if constexpr (ActType == SILU) {
+        s = 1.0f / (1.0f + sycl::native::exp(-x));
+      } else {                                        // GELU
+        constexpr float kBeta = 0.7978845608028654f;  // sqrt(2.0f / pi)
+        constexpr float kAlpha = 0.044715f;
+        float x_cube = x * x * x;
+        float tanh_arg = kBeta * (x + kAlpha * x_cube);
+        s = 0.5f * x * (1.0f + std::tanh(tanh_arg));
+      }
       tCrC0(i) = x * s * y;
     }
 

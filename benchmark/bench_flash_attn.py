@@ -45,12 +45,12 @@ q_seq_length_range = [1, 128]
 head_dim = [64, 128]
 num_heads_q = [16]
 num_heads_kv = [2, 4, 8]
-kv_seq_length_range = [1024, 4096, 16384]
+kv_seq_length_range = [4096, 16384]
 page_size_range = [128]
 configs = list(
     filter(
         lambda cfg: not (cfg[0] and cfg[1])
-        and (cfg[4] != 1 or (not cfg[0] and not cfg[1] and not cfg[2])) # 
+        and (cfg[4] != 1 or (not cfg[0] and not cfg[1] and not cfg[2]))
         and (cfg[6] % cfg[7] == 0),
         product(
             causal,

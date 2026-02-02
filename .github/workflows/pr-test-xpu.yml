@@ -12,7 +12,9 @@ concurrency:
 jobs:
   build-and-test:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
-    permissions: write-all
+    permissions: 
+      contents: write
+      pull-requests: write
     runs-on: sglang-bmg
     steps:
       - name: Checkout code
@@ -85,6 +87,8 @@ jobs:
           success() &&
           contains(join(github.event.pull_request.labels.*.name, ','), 'perf') &&
           hashFiles('ci_has_lower.txt') != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT }}
         run: |
           SRC_PR=${{ github.event.pull_request.number }}
           BRANCH="ci/update-baseline-pr-${SRC_PR}"
@@ -99,7 +103,6 @@ jobs:
 
           TMP_BASELINE=$(mktemp)
           cp benchmark/baseline.json "$TMP_BASELINE"
-
           TMP_BODY=$(mktemp)
           cp ci_pr_body.md "$TMP_BODY"
 
@@ -121,9 +124,10 @@ jobs:
           git commit -m "CI intermediate baseline update" || echo "No changes to commit"
           echo "Detected changes in baseline.json: $(git diff --cached --stat)"
 
-          git remote set-url origin https://x-access-token:${{ secrets.PAT }}@github.com/sgl-project/sgl-kernel-xpu.git
-          git push -f origin "$BRANCH"
-          export GITHUB_TOKEN="${{ secrets.PAT }}"
+          git push -f "https://x-access-token:${{ secrets.PAT }}@github.com/sgl-project/sgl-kernel-xpu.git" HEAD:"$BRANCH"
+          # git remote set-url origin https://x-access-token:${{ secrets.PAT }}@github.com/sgl-project/sgl-kernel-xpu.git
+          # git push -f origin "$BRANCH"
+          # export GITHUB_TOKEN="${{ secrets.PAT }}"
 
           PR_NUMBER=$(gh pr list \
             --repo sgl-project/sgl-kernel-xpu \

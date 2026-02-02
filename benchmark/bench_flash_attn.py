@@ -40,20 +40,27 @@ def flash_attn_baseline(
 causal = [True, False]
 local = [True, False]
 use_sinks = [True, False]
-batch_size = [16]
-q_seq_length_range = [1, 512]
-kv_seq_length_range = [512, 1024, 2048, 4096, 8192, 16384]
-page_size_range = [32, 64, 128]
+batch_size = [16, 32]
+q_seq_length_range = [1, 128]
+head_dim = [64, 128]
+num_heads_q = [16]
+num_heads_kv = [2, 4, 8]
+kv_seq_length_range = [1024, 4096, 16384]
+page_size_range = [128]
 configs = list(
     filter(
         lambda cfg: not (cfg[0] and cfg[1])
-        and (cfg[4] != 1 or (not cfg[0] and not cfg[1] and not cfg[2])),
+        and (cfg[4] != 1 or (not cfg[0] and not cfg[1] and not cfg[2])) # 
+        and (cfg[6] % cfg[7] == 0),
         product(
             causal,
             local,
             use_sinks,
             batch_size,
             q_seq_length_range,
+            head_dim,
+            num_heads_q,
+            num_heads_kv,
             kv_seq_length_range,
             page_size_range,
         ),
@@ -70,6 +77,9 @@ all_results = []
             "use_sinks",
             "batch_size",
             "q_seq_length",
+            "head_dim",
+            "num_heads_q",
+            "num_heads_kv",
             "kv_seq_length",
             "page_size",
         ],
@@ -88,6 +98,9 @@ def benchmark(
     local,
     use_sinks,
     batch_size,
+    head_dim,
+    num_heads_q,
+    num_heads_kv,
     q_seq_length,
     kv_seq_length,
     page_size,
@@ -95,19 +108,16 @@ def benchmark(
 ):
     dtype = torch.bfloat16
     device = torch.device("xpu")
-    # Attention parameters
-    num_heads = 16
-    head_dim = 128
     # Create input tensors
     q = torch.randn(
-        (batch_size * q_seq_length, num_heads, head_dim), device=device, dtype=dtype
+        (batch_size * q_seq_length, num_heads_q, head_dim), device=device, dtype=dtype
     )
     num_pages = (batch_size * kv_seq_length + page_size - 1) // page_size
     k_cache = torch.randn(
-        (num_pages, page_size, num_heads, head_dim), device=device, dtype=dtype
+        (num_pages, page_size, num_heads_kv, head_dim), device=device, dtype=dtype
     )
     v_cache = torch.randn(
-        (num_pages, page_size, num_heads, head_dim), device=device, dtype=dtype
+        (num_pages, page_size, num_heads_kv, head_dim), device=device, dtype=dtype
     )
     cache_seqlens = (
         torch.ones(batch_size, device=device, dtype=torch.int32) * kv_seq_length
@@ -127,7 +137,7 @@ def benchmark(
     max_seqlen_q = q_seq_length
     window_size = (-1, -1) if not local else torch.randint(0, kv_seq_length, (2,))
 
-    sinks = torch.randn(num_heads, device=device, dtype=dtype) if use_sinks else None
+    sinks = torch.randn(num_heads_q, device=device, dtype=dtype) if use_sinks else None
 
     softmax_scale = 1.0 / (head_dim**0.5)
 
@@ -151,16 +161,16 @@ def benchmark(
             quantiles=quantiles,
         )
 
-    flops_qk = batch_size * num_heads * q_seq_length * kv_seq_length * head_dim * 2
-    flops_pv = batch_size * num_heads * q_seq_length * head_dim * kv_seq_length * 2
+    flops_qk = batch_size * num_heads_q * q_seq_length * kv_seq_length * head_dim * 2
+    flops_pv = batch_size * num_heads_q * q_seq_length * head_dim * kv_seq_length * 2
     tflops = (flops_qk + flops_pv) * 1e-12 / (ms * 1e-3)
     memory_qk = batch_size * (
-        q.element_size() * num_heads * q_seq_length * head_dim
-        + k_cache.element_size() * num_heads * kv_seq_length * head_dim
+        q.element_size() * num_heads_q * q_seq_length * head_dim
+        + k_cache.element_size() * num_heads_kv * kv_seq_length * head_dim
     )
     memory_pv = (
-        v_cache.element_size() * batch_size * num_heads * kv_seq_length * head_dim
-        + q.element_size() * batch_size * num_heads * q_seq_length * head_dim
+        v_cache.element_size() * batch_size * num_heads_kv * kv_seq_length * head_dim
+        + q.element_size() * batch_size * num_heads_q * q_seq_length * head_dim
     )
     bandwidth = (memory_qk + memory_pv) * 1e-9 / (ms * 1e-3)
     all_results.append(
@@ -168,7 +178,8 @@ def benchmark(
             "batch": batch_size,
             "q_seq_length": q_seq_length,
             "kv_seq_length": kv_seq_length,
-            "num_heads": num_heads,
+            "num_heads_q": num_heads_q,
+            "num_heads_kv": num_heads_kv,
             "head_dim": head_dim,
             "causal": causal,
             "local": local,

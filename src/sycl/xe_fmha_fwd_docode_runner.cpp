@@ -185,14 +185,14 @@ struct Arguments {
 
   bool is_rotary_interleaved;
 
-  int num_splits;  // For split-KV version
-  bool pack_gqa;
+  // int num_splits;  // For split-KV version
+  // bool pack_gqa;
 
-  int* __restrict__ tile_count_semaphore;
+  // int* __restrict__ tile_count_semaphore;
   // int * __restrict__ num_m_blocks_ptr;
   // int * __restrict__ num_n_blocks_ptr;
-  int* __restrict__ num_splits_dynamic_ptr;
-  bool skip_scheduler_metadata_computation;
+  // int* __restrict__ num_splits_dynamic_ptr;
+  // bool skip_scheduler_metadata_computation;
 
   torch::TensorOptions tensor_opts;
 };
@@ -526,6 +526,7 @@ struct FMHAConfig {
       // template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
       return run<true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
     } else {
+      throw std::runtime_error("Only support paged KV cache with variable length sequences");
       return 0;
     }
   }

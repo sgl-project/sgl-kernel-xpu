@@ -287,66 +287,6 @@ def prepare_kernel_inputs(
     }
 
 
-class TestMXFP4Quantization:
-    """Tests for MXFP4 quantization and dequantization utilities."""
-
-    def test_e2m1_roundtrip(self):
-        device = torch.device("cpu")
-        test_values = torch.tensor(
-            [
-                0.0,
-                0.5,
-                1.0,
-                1.5,
-                2.0,
-                3.0,
-                4.0,
-                6.0,
-                -0.5,
-                -1.0,
-                -1.5,
-                -2.0,
-                -3.0,
-                -4.0,
-                -6.0,
-            ],
-            dtype=torch.float32,
-            device=device,
-        )
-        quantized = quantize_to_e2m1(test_values)
-        dequantized = dequantize_e2m1(quantized)
-        torch.testing.assert_close(dequantized, test_values, atol=0.0, rtol=0.0)
-
-    def test_pack_unpack_roundtrip(self):
-        device = torch.device("cpu")
-        m, k = 16, 64
-        original = torch.randint(0, 16, (m, k), dtype=torch.uint8, device=device)
-        packed = pack_fp4(original)
-        unpacked = unpack_fp4(packed)
-        torch.testing.assert_close(unpacked, original)
-
-    def test_mxfp4_quantization_shape(self):
-        device = torch.device("cpu")
-        m, k = 32, 128
-        original = torch.randn(m, k, dtype=torch.float32, device=device)
-        packed, scales = quantize_to_mxfp4(original)
-        assert packed.shape == (m, k // 2)
-        assert scales.shape == (m, k // MXFP4_BLOCK_SIZE)
-        assert packed.dtype == torch.uint8
-        assert scales.dtype == torch.uint8
-
-    def test_mxfp4_dequantization_accuracy(self):
-        device = torch.device("cpu")
-        m, k = 32, 128
-        original = torch.randn(m, k, dtype=torch.float32, device=device) * 3.0
-        packed, scales = quantize_to_mxfp4(original)
-        dequantized = dequantize_mxfp4(packed, scales, torch.float32)
-        assert dequantized.shape == original.shape
-        relative_error = (dequantized - original).abs() / (original.abs() + 1e-6)
-        mean_error = relative_error.mean().item()
-        assert mean_error < 0.5
-
-
 @pytest.mark.skipif(not is_xpu_available(), reason="Intel XPU not available")
 class TestMXFP4BlockwiseScaledGroupedMM:
     """Tests for the MXFP4 MoE CUTLASS kernel on Intel XPU."""

@@ -66,6 +66,7 @@ jobs:
               python3 bench_moe_fused_gate.py 2>&1 | tee moe_fused_gate.py.log \
               python3 bench_merge_states_v2.py 2>&1 | tee merge_states.py.log \
               python3 bench_swiglu_alpha_limit.py 2>&1 | tee swiglu_alpha_limit.py.log \
+              python3 bench_fused_qk_norm_rope.py 2>&1 | tee fused_qk_norm_rope.py.log \
             "
 
       - name: Copy logs from container

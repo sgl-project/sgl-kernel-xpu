@@ -655,7 +655,11 @@ std::vector<at::Tensor> flash_decode(
   out = torch::empty({total_q, num_heads, head_size_v}, opts);
 
   auto round_multiple = [](int x, int m) -> int { return (x + m - 1) / m * m; };
-
+  auto nextPowerOf2 = [](uint32_t a) -> int {
+    if (a <= 1) return 1;
+    // __builtin_clz 找到最高位 1 前面有多少个 0
+    return 1 << (32 - __builtin_clz(a - 1));
+  };
   auto round_up_headdim = [](int head_size) -> int {
     if (head_size <= 64) return 64;
     if (head_size <= 96) return 96;
@@ -841,7 +845,7 @@ std::vector<at::Tensor> flash_decode(
   };
 
   auto dispatch_q_group = [&](auto _HEAD_DIM) {
-    switch (max_seqlen_q) {
+    switch (nextPowerOf2(max_seqlen_q)) {
       case 1:
         dispatch_page_size(_1{}, _HEAD_DIM);
         break;
@@ -856,6 +860,9 @@ std::vector<at::Tensor> flash_decode(
         break;
       case 16:
         dispatch_page_size(_16{}, _HEAD_DIM);
+        break;
+      case 32:
+        dispatch_page_size(_32{}, _HEAD_DIM);
         break;
       default:
         TORCH_CHECK(false, "Unsupported qgroup_size for decode attention: ", max_seqlen_q);

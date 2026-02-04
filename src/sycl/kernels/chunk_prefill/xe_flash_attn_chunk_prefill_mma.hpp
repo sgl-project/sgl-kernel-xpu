@@ -218,6 +218,7 @@ struct FlashChunkPrefillMma<
     int max_num_pages_per_seq;
     int window_left;
     int window_right;
+    float scale;
   };
 
   //
@@ -227,7 +228,7 @@ struct FlashChunkPrefillMma<
   FlashChunkPrefillMma() = default;
 
   static constexpr Params
-  to_underlying_arguments(ProblemShapeType const& problem_shape, Arguments const& args, void* workspace) {
+  to_underlying_arguments(ProblemShapeType const& problem_shape, Arguments const& args, float scale, void* workspace) {
     (void)workspace;
 
     auto [batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, head_size_qk, head_size_vo] =
@@ -254,7 +255,8 @@ struct FlashChunkPrefillMma<
         args.page_size,
         args.max_num_pages_per_seq,
         args.window_left,
-        args.window_right};
+        args.window_right,
+        scale};
   }
 
   template <class FragQccum, class TensorQ, class TensorK, class FragSrc>
@@ -301,6 +303,20 @@ struct FlashChunkPrefillMma<
 
     for (int k_tile = 0; k_tile < k_tile_count; ++k_tile) {
       copy(params.gmem_tiled_copy_q, tQgQ(_, _, _, k_tile), tQrQ);
+      // For certain model like LLaMA3.3-70B with bf16 dtype,
+      // an accuracy issue would occur after about 10 decoding steps,
+      // compared to the CUDA path.
+      // With analysis, we find that moving the attention scaling
+      // from post-QK gemm to pre-QK gemm can solve the issue.
+      // The result change comes from the precision conversion
+      // between fp32 and bf16:
+      // Pre-gemm scaling: bf16(Q) <- bf16(Q) * scale; fp32(QK) <- bf16(Q) * bf16(K)^T
+      // Post-gemm scaling: fp32(QK) <- bf16(Q) * bf16(K)^T; fp32(QK) <- fp32(QK) * scale
+      // This is a workaround as other paths still do the attention scaling after QK gemm.
+      // The root cause needs further investigation.
+      for (int i = 0; i < size(tQrQ); i++) {
+        tQrQ[i] = tQrQ[i] * (ElementQ)(params.scale);
+      }
       copy(gmem_tiled_copy_k, tKgK(_, _, _, k_tile), tKrK);
       cute::gemm(tiled_mma, accum, tCrQ, tCrK, frag_src);
 #if 0
@@ -457,7 +473,8 @@ struct FlashChunkPrefillMma<
         params.page_size,
         params.max_num_pages_per_seq,
         params.window_left,
-        params.window_right};
+        params.window_right,
+        params.scale};
   }
 };
 

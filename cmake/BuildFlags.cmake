@@ -117,6 +117,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} ${SYCL_TARGETS_OPTION})
   set(SYCL_OFFLINE_COMPILER_AOT_OPTIONS "-device ${AOT_TARGETS}")
   message(STATUS "Compile Intel GPU AOT Targets for ${AOT_TARGETS}")
+  
   # SYCL compiler in basekit after 2025.2 needs more spirv arguments.
   if(SYCL_COMPILER_VERSION GREATER_EQUAL 20250806)
     set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} -Xspirv-translator;-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate)

@@ -43,7 +43,7 @@ def test_per_token_quant_compare_implementations(
     num_tokens: int,
     hidden_dim: int,
 ):
-    device = torch.device("cuda")
+    device = torch.device("xpu")
     x = torch.rand((num_tokens, hidden_dim), dtype=torch.float16, device=device)
 
     sglang_out, sglang_scale = sglang_per_token_quant_fp8(x)

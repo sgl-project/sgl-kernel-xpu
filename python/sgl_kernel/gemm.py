@@ -3,10 +3,6 @@ from typing import List, Optional, Tuple
 import torch
 from sgl_kernel.utils import _get_cache_buf, ceil_align, get_xpu_stream
 
-fp8_dtype = torch.float8_e4m3fn
-fp8_max = torch.finfo(fp8_dtype).max
-fp8_min = -fp8_max
-
 
 def awq_dequantize(
     qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor
@@ -86,153 +82,35 @@ def bmm_fp8(
     return out
 
 
-def create_per_token_group_quant_fp8_output_scale(
-    x_shape,
-    device,
-    group_size,
-    column_major_scales: bool,
-    scale_tma_aligned: bool,
-    scale_ue8m0: bool,
-):
-    if scale_ue8m0:
-        assert column_major_scales and scale_tma_aligned
-        *x_batch, x_q_mn, x_q_k = x_shape
-        x_s_mn, x_s_k = x_q_mn, x_q_k // 128
-        aligned_mn = ceil_align(x_s_mn, 4)
-        aligned_k = ceil_align(x_s_k, 4)
-        return torch.empty(
-            (*x_batch, aligned_k // 4, aligned_mn),
-            device=device,
-            dtype=torch.int,
-        ).transpose(-1, -2)[..., :x_s_mn, :]
-    elif column_major_scales:
-        if scale_tma_aligned:
-            # TODO extract "align" function
-            # aligned to 4 * sizeof(float)
-            aligned_size = (x_shape[-2] + 3) // 4 * 4
-            return torch.empty(
-                x_shape[:-2] + (x_shape[-1] // group_size, aligned_size),
-                device=device,
-                dtype=torch.float32,
-            ).transpose(-1, -2)[: x_shape[-2], :]
-        else:
-            return torch.empty(
-                (x_shape[-1] // group_size,) + x_shape[:-1],
-                device=device,
-                dtype=torch.float32,
-            ).permute(-1, -2)
-    else:
-        return torch.empty(
-            x_shape[:-1] + (x_shape[-1] // group_size,),
-            device=device,
-            dtype=torch.float32,
-        )
-
-
-# aligned with sglang_per_token_group_quant_fp8
-def sgl_per_token_group_quant_fp8(
-    x: torch.Tensor,
-    group_size: int,
-    eps: float = 1e-10,
-    column_major_scales: bool = False,
-    scale_tma_aligned: bool = False,
-    scale_ue8m0: bool = False,
-    fuse_silu_and_mul: bool = False,
-    masked_m: Optional[torch.Tensor] = None,
-    enable_v2: Optional[bool] = None,
-):
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
-    assert x.is_contiguous(), "`x` is not contiguous"
-
-    out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
-
-    x_q = torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
-    x_s = create_per_token_group_quant_fp8_output_scale(
-        x_shape=out_shape,
-        device=x.device,
-        group_size=group_size,
-        column_major_scales=column_major_scales,
-        scale_tma_aligned=scale_tma_aligned,
-        scale_ue8m0=scale_ue8m0,
-    )
-
-    if x.shape[0] > 0:
-        torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit.default(
-            x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
-        )
-    return x_q, x_s
-
-
-# aligned with sglang_per_token_group_quant_int8
-def sgl_per_token_group_quant_int8(
-    x: torch.Tensor,
-    group_size: int,
-    eps: float = 1e-10,
-    dtype: torch.dtype = torch.int8,
-    enable_v2: Optional[bool] = None,
-):
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
-    assert x.is_contiguous(), "`x` is not contiguous"
-
-    iinfo = torch.iinfo(dtype)
-    int8_max = iinfo.max
-    int8_min = iinfo.min
-
-    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
-    x_s = torch.empty(
-        x.shape[:-1] + (x.shape[-1] // group_size,),
-        device=x.device,
-        dtype=torch.float32,
-    )
-
-    torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit.default(
-        x, x_q, x_s, group_size, eps, int8_min, int8_max, scale_ue8m0=False
-    )
-    return x_q, x_s
-
-
-# aligned with sglang_per_token_group_quant_8bit
 def sgl_per_token_group_quant_8bit(
-    x: torch.Tensor,
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
     group_size: int,
-    dst_dtype: torch.dtype,
-    eps: float = 1e-10,
-    column_major_scales: bool = False,
-    scale_tma_aligned: bool = False,
+    eps: float,
+    fp8_min: float,
+    fp8_max: float,
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
     enable_v2: Optional[bool] = None,
-):
+) -> None:
+    if enable_v2 is None:
+        from sglang.srt.utils import get_bool_env_var
 
-    if dst_dtype == torch.int8:
-        assert not column_major_scales
-        assert not scale_tma_aligned
-        assert not fuse_silu_and_mul
-        assert masked_m is None
-        return sgl_per_token_group_quant_int8(
-            x=x,
-            group_size=group_size,
-            eps=eps,
-            dtype=dst_dtype,
-            enable_v2=enable_v2,
-        )
+        enable_v2 = get_bool_env_var("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
+        assert not enable_v2, "v2 not yet supported on xpu!"
 
-    return sgl_per_token_group_quant_fp8(
-        x=x,
-        group_size=group_size,
-        eps=eps,
-        column_major_scales=column_major_scales,
-        scale_tma_aligned=scale_tma_aligned,
-        scale_ue8m0=scale_ue8m0,
-        fuse_silu_and_mul=fuse_silu_and_mul,
-        masked_m=masked_m,
-        enable_v2=enable_v2,
+    assert not fuse_silu_and_mul, "only v2 support fuse_silu_and_mul"
+    assert masked_m is None, "only v2 support masked_m"
+    torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit.default(
+        input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
     )
+
+
+# For legacy usage
+sgl_per_token_group_quant_fp8 = sgl_per_token_group_quant_8bit
+sgl_per_token_group_quant_int8 = sgl_per_token_group_quant_8bit
 
 
 def sgl_per_tensor_quant_fp8(

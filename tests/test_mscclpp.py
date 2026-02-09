@@ -8,6 +8,9 @@ from typing import Any
 import sgl_kernel.allreduce as custom_ops
 import torch
 import torch.distributed as dist
+import utils
+
+device = utils.get_device()
 
 
 class MscclContextSelection(IntEnum):
@@ -16,11 +19,12 @@ class MscclContextSelection(IntEnum):
 
 
 def _run_correctness_worker(world_size, rank, distributed_init_port, test_sizes):
-    device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
-    torch.cuda.set_device(device)
+    device = torch.device(f"{device}:{rank % torch.accelerator.device_count()}")
+    torch.accelerator.set_device_index(device)
     distributed_init_method = f"tcp://localhost:{distributed_init_port}"
+    backend = torch.distributed.get_default_backend_for_device(device)
     dist.init_process_group(
-        backend="nccl",
+        backend=backend,
         init_method=distributed_init_method,
         rank=rank,
         world_size=world_size,
@@ -41,13 +45,15 @@ def _run_correctness_worker(world_size, rank, distributed_init_port, test_sizes)
         rank_to_ib[r] = rank % 8
     MAX_BYTES = 2**20
     scratch = torch.empty(
-        MAX_BYTES * 8, dtype=torch.bfloat16, device=torch.cuda.current_device()
+        MAX_BYTES * 8,
+        dtype=torch.bfloat16,
+        device=torch.accelerator.current_accelerator(),
     )
     put_buffer = torch.empty(
-        MAX_BYTES, dtype=torch.bfloat16, device=torch.cuda.current_device()
+        MAX_BYTES, dtype=torch.bfloat16, device=torch.accelerator.current_accelerator()
     )
     print(f"[{rank}] start mscclpp_context init")
-    nranks_per_node = torch.cuda.device_count()
+    nranks_per_node = torch.accelerator.device_count()
     selection = int(MscclContextSelection.MSCCL1SHOT1NODELL)
     mscclpp_context = custom_ops.mscclpp_init_context(
         unique_id,
@@ -128,7 +134,7 @@ class TestMSCCLAllReduce(unittest.TestCase):
 
     def test_correctness(self):
         for world_size in self.world_sizes:
-            available_gpus = torch.cuda.device_count()
+            available_gpus = torch.accelerator.device_count()
             if world_size > available_gpus:
                 print(
                     f"Skipping world_size={world_size}, found {available_gpus} and now ray is not supported here"

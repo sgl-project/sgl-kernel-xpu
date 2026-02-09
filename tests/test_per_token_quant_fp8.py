@@ -4,10 +4,12 @@ from typing import Optional, Tuple
 
 import pytest
 import torch
+import utils
 from sgl_kernel import sgl_per_token_quant_fp8
 
 from sglang.srt.utils import is_hip
 
+device = utils.get_device()
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
@@ -37,13 +39,13 @@ def sglang_per_token_quant_fp8(
 
 @pytest.mark.parametrize(
     "num_tokens,hidden_dim",
-    list(itertools.product([128, 256, 512], [512, 2048, 4096])),
+    list(itertools.product([128, 256, 512], [512, 1076, 1368, 2048, 4096])),
 )
 def test_per_token_quant_compare_implementations(
     num_tokens: int,
     hidden_dim: int,
 ):
-    device = torch.device("cuda")
+    device = device
     x = torch.rand((num_tokens, hidden_dim), dtype=torch.float16, device=device)
 
     sglang_out, sglang_scale = sglang_per_token_quant_fp8(x)

@@ -3,7 +3,10 @@ import sys
 
 import pytest
 import torch
+import utils
 from sgl_kernel import fp8_blockwise_scaled_grouped_mm
+
+device = utils.get_device()
 
 
 def cdiv(a: int, b: int) -> int:
@@ -55,13 +58,13 @@ def is_sm100_supported(device=None) -> bool:
 
 
 @pytest.mark.skipif(
-    not is_sm100_supported(),
+    torch.cuda.is_available() and not is_sm100_supported(),
     reason="fp8_blockwise_scaled_grouped_mm at sgl-kernel is only supported on sm100",
 )
 @pytest.mark.parametrize("num_experts", [8, 16])
 @pytest.mark.parametrize("out_dtype", [torch.half, torch.bfloat16])
 def test_fp8_blockwise_scaled_grouped_mm(num_experts, out_dtype):
-    device = "cuda"
+    device = device
     alignment = 16
     n_g = alignment * random.randint(1, 5) * 128
     k_g = alignment * random.randint(1, 5) * 128

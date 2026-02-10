@@ -5,7 +5,10 @@ from typing import Optional, Type
 
 import pytest
 import torch
+import utils
 from sgl_kernel import fp8_blockwise_scaled_mm
+
+device = utils.get_device()
 
 
 def cdiv(a: int, b: int) -> int:
@@ -87,7 +90,7 @@ def _test_accuracy_once(M, N, K, out_dtype, device):
 @pytest.mark.parametrize("K", [512, 1024, 4096, 8192, 14080, 16384])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 def test_accuracy(M, N, K, out_dtype):
-    _test_accuracy_once(M, N, K, out_dtype, "cuda")
+    _test_accuracy_once(M, N, K, out_dtype, device)
 
 
 if __name__ == "__main__":

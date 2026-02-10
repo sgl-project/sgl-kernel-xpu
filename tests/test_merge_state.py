@@ -7,11 +7,16 @@ import pytest
 import torch
 import triton
 import triton.language as tl
+import utils
 from sgl_kernel import merge_state
+
+device = utils.get_device()
 
 
 def check_input(x: torch.Tensor):
-    assert x.is_cuda, f"{str(x)} must be a CUDA Tensor"
+    assert (
+        x.device.type == torch.accelerator.current_accelerator().type
+    ), f"{str(x)} must be a GPU Tensor"
     assert x.is_contiguous(), f"{str(x)} must be contiguous"
 
 
@@ -128,10 +133,10 @@ def merge_state_triton(
 @pytest.mark.parametrize("num_heads", [32])
 @pytest.mark.parametrize("head_dim", [128])
 def test_merge_state(seq_len, num_heads, head_dim):
-    va = torch.randn(seq_len, num_heads, head_dim).half().to("cuda:0")
-    sa = torch.randn(seq_len, num_heads, dtype=torch.float32).to("cuda:0")
-    vb = torch.randn(seq_len, num_heads, head_dim).half().to("cuda:0")
-    sb = torch.randn(seq_len, num_heads, dtype=torch.float32).to("cuda:0")
+    va = torch.randn(seq_len, num_heads, head_dim).half().to(f"{device}:0")
+    sa = torch.randn(seq_len, num_heads, dtype=torch.float32).to(f"{device}:0")
+    vb = torch.randn(seq_len, num_heads, head_dim).half().to(f"{device}:0")
+    sb = torch.randn(seq_len, num_heads, dtype=torch.float32).to(f"{device}:0")
     v_merged, s_merged = merge_state_triton(va, sa, vb, sb)
     v_merged_std, s_merged_std = merge_state(va, sa, vb, sb)
 

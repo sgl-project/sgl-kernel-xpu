@@ -2,7 +2,10 @@ import sys
 
 import pytest
 import torch
+import utils
 from sgl_kernel import qserve_w4a8_per_chn_gemm
+
+device = utils.get_device()
 
 
 # Adapted from https://github.com/mit-han-lab/omniserve/blob/main/omniserve/modeling/layers/quantized_linear/w4a8_linear.py
@@ -113,7 +116,7 @@ def _test_accuracy_once(M, N, K, out_dtype, device):
 @pytest.mark.parametrize("K", [512, 1024, 4096, 8192, 16384])
 @pytest.mark.parametrize("out_dtype", [torch.float16])
 def test_accuracy(M, N, K, out_dtype):
-    _test_accuracy_once(M, N, K, out_dtype, "cuda")
+    _test_accuracy_once(M, N, K, out_dtype, device)
 
 
 if __name__ == "__main__":

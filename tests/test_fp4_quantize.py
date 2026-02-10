@@ -2,9 +2,15 @@ import sys
 
 import pytest
 import torch
+import utils
 from sgl_kernel import scaled_fp4_quant
 
-skip_condition = torch.cuda.get_device_capability() < (10, 0)
+device = utils.get_device()
+
+skip_condition = torch.cuda.is_available() and torch.cuda.get_device_capability() < (
+    10,
+    0,
+)
 
 DTYPES = [torch.float16, torch.bfloat16]
 SHAPES = [(128, 64), (128, 128), (256, 64), (256, 128)]
@@ -124,7 +130,7 @@ def test_quantize_to_fp4(
     shape: tuple[int, int],
 ) -> None:
     torch.manual_seed(42)
-    torch.set_default_device("cuda:0")
+    torch.set_default_device(f"{device}:0")
 
     m, n = shape
 
@@ -149,7 +155,7 @@ def test_quantize_to_fp4(
 def test_quantize_to_fp4_padded(pad_shape: tuple[int, int]) -> None:
     torch.manual_seed(42)
     dtype = torch.float16
-    torch.set_default_device("cuda:0")
+    torch.set_default_device(f"{device}:0")
 
     m, n = pad_shape
 

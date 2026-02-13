@@ -510,7 +510,7 @@ def generate_qkv(
     ),
 )
 # @pytest.mark.parametrize("rotary_fraction", [0.0])
-@pytest.mark.parametrize("page_size", [64, 128, 256])
+@pytest.mark.parametrize("page_size", [None, 64, 128, 256])
 # @pytest.mark.parametrize("page_size", [None])
 # @pytest.mark.parametrize("has_leftpad", [False, True])
 @pytest.mark.parametrize("has_leftpad", [False])

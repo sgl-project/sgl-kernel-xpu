@@ -36,6 +36,8 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "fmha_fusion.hpp"
+#define PRINT(x) print(#x ": "); print(x); print("\n");
+#define PRINT_TENSOR(x) print(#x ": "); print_tensor(x); print("\n");
 
 ////////////////////////////////////////////////////////////
 namespace {}
@@ -433,10 +435,16 @@ struct FlashChunkPrefillMma<
       auto kv_cached_cumulative_length = get<5>(problem_shape).cumulative_length;
 
       offset_q = num_heads_q * head_size_qk * qo_cumulative_length[l_coord] + q_head_coord * head_size_qk;
-
-      offset_k_cache = kv_head_coord * head_size_qk;
-      offset_v_cache = kv_head_coord * head_size_vo;
       total_seq_len_kv_cache = get<5>(problem_shape).total_length;
+
+      if (PagedKV) {
+        offset_k_cache = kv_head_coord * head_size_qk;
+        offset_v_cache = kv_head_coord * head_size_vo;
+      } else {
+        auto kv_cumulative_length = total_seq_len_kv_cache / batch * l_coord;
+        offset_k_cache =  num_heads_kv * head_size_qk * kv_cumulative_length + kv_head_coord * head_size_qk;
+        offset_v_cache =  num_heads_kv * head_size_vo * kv_cumulative_length + kv_head_coord * head_size_vo;
+      }
     } else {
     }
 

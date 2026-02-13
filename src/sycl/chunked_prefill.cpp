@@ -440,9 +440,11 @@ struct FMHAConfig {
   }
 
   static int run(const Flash_fwd_params& params) {
-    // only support varlen and paged kv now
+    // only support varlen now
     if (params.page_table != nullptr && params.cu_seqlens_k != nullptr) {
       return run<true, true, cutlass::flash_attention::IndividualScheduler>(params);
+    } else if (params.cu_seqlens_k != nullptr) {
+      return run<true, false, cutlass::flash_attention::IndividualScheduler>(params);
     } else {
       return 0;
     }
@@ -478,7 +480,7 @@ std::vector<at::Tensor> mha_fwd(
     const at::Tensor& cu_seqlens_q,         // b+1
     const at::Tensor& cu_seqlens_k,         // b+1
     int max_seqlen_q,
-    const at::Tensor& page_table,                      // (b_k, max_num_pages_per_seq)
+    std::optional<const at::Tensor>& page_table,       // (b_k, max_num_pages_per_seq)
     std::optional<const at::Tensor>& kv_batch_idx_,    // b. indices to index into the KV cache
     std::optional<const at::Tensor>& leftpad_k_,       // b
     std::optional<const at::Tensor>& rotary_cos_,      // seqlen_ro x (rotary_dim / 2)
@@ -518,9 +520,11 @@ std::vector<at::Tensor> mha_fwd(
   TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
   TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
 
-  CHECK_DEVICE(page_table);
-  TORCH_CHECK(page_table.dtype() == torch::kInt32, "page_table must have dtype torch.int32");
-  TORCH_CHECK(page_table.stride(-1) == 1, "page_table must have contiguous last dimension");
+  if (page_table.has_value()) {
+    CHECK_DEVICE(page_table.value());
+    TORCH_CHECK(page_table.value().dtype() == torch::kInt32, "page_table must have dtype torch.int32");
+    TORCH_CHECK(page_table.value().stride(-1) == 1, "page_table must have contiguous last dimension");
+  }
 
   TORCH_CHECK(q.dim() == 3, "query must be in ragged format");
   CHECK_DEVICE(cu_seqlens_q);
@@ -538,14 +542,28 @@ std::vector<at::Tensor> mha_fwd(
   int num_heads = q.size(-2);
   int const head_size = q.size(-1);
   int const head_size_v = v.size(-1);
-  int const max_num_pages_per_seq = page_table.size(1);
-  int const num_pages = k.size(0);
-  int const page_size = k.size(1);
-  int const seqlen_k = max_num_pages_per_seq * page_size;
-  int const total_k = num_pages * page_size;
   int const num_heads_k = k.size(-2);
-  int const batch_size_k = page_table.size(0);
   float softmax_scale = softmax_scale_;
+  int num_pages = 0;
+  int page_size = 0;
+  int max_num_pages_per_seq = 0;
+  int batch_size_k = k.size(0);
+  int seqlen_k = k.size(1);
+  int total_k = batch_size_k * seqlen_k;
+  if (page_table.has_value()) {
+    num_pages = k.size(0);
+    page_size = k.size(1);
+    max_num_pages_per_seq = page_table.value().size(1);
+    batch_size_k = page_table.value().size(0);
+    seqlen_k = max_num_pages_per_seq * page_size;
+    total_k = num_pages * page_size;
+    CHECK_SHAPE(page_table.value(), batch_size_k, max_num_pages_per_seq);
+    CHECK_SHAPE(k, num_pages, page_size, num_heads_k, head_size);
+    CHECK_SHAPE(v, num_pages, page_size, num_heads_k, head_size_v);
+  } else {
+    CHECK_SHAPE(k, batch_size_k, seqlen_k, num_heads_k, head_size);
+    CHECK_SHAPE(v, batch_size_k, seqlen_k, num_heads_k, head_size_v);
+  }
 
   if (!kv_batch_idx_.has_value()) {
     TORCH_CHECK(batch_size == batch_size_k, "batch_size must be equal to batch_size_k");
@@ -569,10 +587,6 @@ std::vector<at::Tensor> mha_fwd(
   if (is_causal) {
     window_size_right = 0;
   }
-
-  CHECK_SHAPE(k, num_pages, page_size, num_heads_k, head_size);
-  CHECK_SHAPE(v, num_pages, page_size, num_heads_k, head_size_v);
-  CHECK_SHAPE(page_table, batch_size_k, max_num_pages_per_seq);
 
   if (leftpad_k_.has_value()) {
     auto leftpad_k = leftpad_k_.value();
@@ -668,8 +682,10 @@ std::vector<at::Tensor> mha_fwd(
   params.total_k = total_k;
   params.b_k = batch_size_k;
   params.dv = head_size_v;
-  params.page_table = page_table.data_ptr<int>();
-  params.page_table_batch_stride = page_table.stride(0);
+  if (page_table.has_value()) {
+    params.page_table = page_table.value().data_ptr<int>();
+    params.page_table_batch_stride = page_table.value().stride(0);
+  }
   params.max_num_pages_per_seq = max_num_pages_per_seq;
   params.page_size = page_size;
   params.num_pages = num_pages;

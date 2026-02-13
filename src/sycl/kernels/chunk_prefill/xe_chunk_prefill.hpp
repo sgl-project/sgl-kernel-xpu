@@ -35,7 +35,6 @@
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/kernel_hardware_info.hpp"
 #include "xe_flash_attn_chunk_prefill_mma.hpp"
-#define PRINT(x) print(#x ": "); print(x); print("\n");
 
 namespace cutlass::flash_attention::kernel {
 
@@ -384,11 +383,29 @@ class FMHAPrefillChunk {
       auto& prefetch_K = tiled_prefetch_k_cache;
       auto& pKgK1_ = pKgK_cache;
 
+      int cached_nblock = 0;
+      if constexpr (PagedKV) {
+        // int curr_batch_pages = ceil_div(seq_len_kv_cache, mainloop_params.page_size);// max_page_size_per_seq
+        // int batch_offset = is_var_len ? mainloop_params.num_pages_per_seq[batch_coord] : batch_coord *
+        // curr_batch_pages;
+        int batch_offset = batch_coord * mainloop_params.max_num_pages_per_seq;
+        cached_nblock = mainloop_params.ptr_page_table[batch_offset  // page table for this batch
+        ] * tiles_per_page;                                          // base block idx of physical page
+      }
       // The headsize for both cached and non-cached version is the same
-      for (int j = 0; j < size<4>(pKgK1_); j++) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < DispatchPolicy::Stages; i++) {
-          prefetch(prefetch_K, pKgK1_(_, _, _, i, j));
+      if constexpr (PagedKV) {
+        for (int j = 0; j < size<4>(pKgK1_); j++) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = cached_nblock; i < cached_nblock + DispatchPolicy::Stages; i++) {
+            prefetch(prefetch_K, pKgK1_(_, _, _, i, j));
+          }
+        }
+      } else {
+        for (int j = 0; j < size<4>(pKgK1_); j++) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < DispatchPolicy::Stages; i++) {
+            prefetch(prefetch_K, pKgK1_(_, _, _, i, j));
+          }
         }
       }
 
@@ -429,8 +446,8 @@ class FMHAPrefillChunk {
 
         //                                                               // = 0, all KV is kv_cache
         // 1) Load KV (performed inside mmaQK)
-        auto gK_ = gK_cache(_, _, split, _);
-        auto gV_ = gV_cache(_, _, split);
+        auto gK_ = PagedKV ? gK_cache(_, _, cached_nblock, _) : gK_cache(_, _, split, _);
+        auto gV_ = PagedKV ? gV_cache(_, _, cached_nblock) : gV_cache(_, _, split);
         // 2) Create Tensor S
         Tensor tSr = make_tensor<ElementAccumulator>(Shape<Int<Vec>, Int<FragsM>, Int<FragsN>>{});
         clear(tSr);
@@ -503,8 +520,36 @@ class FMHAPrefillChunk {
         }
         auto& tiled_prefetch_v_ = tiled_prefetch_v_cache;
         auto& pVgV_ = pVgV_cache;
-        for (int i = 0; i < size<1>(pVgV_); i++) {
-          prefetch(tiled_prefetch_v_, pVgV_(_, i, _, split));
+        if constexpr (PagedKV) {
+          for (int i = 0; i < size<1>(pVgV_); i++) {
+            prefetch(tiled_prefetch_v_, pVgV_(_, i, _, cached_nblock));
+          }
+        } else {
+          for (int i = 0; i < size<1>(pVgV_); i++) {
+            prefetch(tiled_prefetch_v_, pVgV_(_, i, _, split));
+          }
+        }
+        int next_cached_nblock = split + 1;
+        if constexpr (PagedKV) {
+          // int curr_batch_pages = ceil_div(seq_len_kv_cache, mainloop_params.page_size);
+          // int batch_offset =
+          //     is_var_len ? mainloop_params.num_pages_per_seq[batch_coord] : batch_coord * curr_batch_pages;
+          int curr_batch_pages = mainloop_params.max_num_pages_per_seq;  // max_page_size_per_seq
+          int batch_offset = batch_coord * curr_batch_pages;
+          int next_page_logical_idx = next_cached_nblock * QK_BLK_N / params.mainloop.page_size;
+          bool valid_page = next_page_logical_idx < curr_batch_pages;
+          // get physical page idx from page table
+          if (valid_page) {
+            next_cached_nblock = params.mainloop.ptr_page_table
+                                         [batch_offset +               // page table for this batch
+                                          next_page_logical_idx        // split (tile idx) to logical
+                                                                       // page idx
+            ] * tiles_per_page +                                       // base block idx of physical page
+                                 next_cached_nblock % tiles_per_page;  // offset within page
+          } else {
+            next_cached_nblock = curr_batch_pages * tiles_per_page;  // push idx out of bounds to respect the
+                                                                     // boundary between batches
+          }
         }
 
         // 4) Fused softmax
@@ -520,12 +565,20 @@ class FMHAPrefillChunk {
           prefetch(tiled_prefetch_q, pQgQ(_, _, _, i));
         }
 
+        cached_nblock = next_cached_nblock;
         // Prefetch the next K tile
         // there is no need to guard it with if statement as prefetch will
         // ignore out of bound reading
-        CUTLASS_PRAGMA_UNROLL
-        for (int j = 0; j < size<4>(pKgK_cache); j++) {
-          prefetch(tiled_prefetch_k_cache, pKgK_cache(_, _, _, split + DispatchPolicy::Stages, j));
+        if constexpr (PagedKV) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int j = 0; j < size<4>(pKgK_cache); j++) {
+            prefetch(tiled_prefetch_k_cache, pKgK_cache(_, _, _, cached_nblock, j));
+          }
+        } else {
+          CUTLASS_PRAGMA_UNROLL
+          for (int j = 0; j < size<4>(pKgK_cache); j++) {
+            prefetch(tiled_prefetch_k_cache, pKgK_cache(_, _, _, split + DispatchPolicy::Stages, j));
+          }
         }
         barrier_wait(barrier_scope);
       }

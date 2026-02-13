@@ -36,8 +36,6 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "fmha_fusion.hpp"
-#define PRINT(x) print(#x ": "); print(x); print("\n");
-#define PRINT_TENSOR(x) print(#x ": "); print_tensor(x); print("\n");
 
 ////////////////////////////////////////////////////////////
 namespace {}

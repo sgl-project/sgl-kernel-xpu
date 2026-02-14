@@ -710,14 +710,21 @@ def test_flash_attn_kvcache(
                 dtype,
                 dtype_ref,
             )
-        cache_seqlens = torch.randint(
-            seqlen_q,
-            # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
-            seqlen_k,
-            (batch_size,),
-            dtype=torch.int32,
-            device=device,
-        )
+        if page_size is None:
+            cache_seqlens = torch.full(
+                (batch_size,),
+                seqlen_k,
+                dtype=torch.int32,
+                device=device,)
+        else:
+            cache_seqlens = torch.randint(
+                seqlen_q,
+                # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
+                seqlen_k,
+                (batch_size,),
+                dtype=torch.int32,
+                device=device,
+            )
         if has_leftpad:
             cache_leftpad = torch.cat(
                 [

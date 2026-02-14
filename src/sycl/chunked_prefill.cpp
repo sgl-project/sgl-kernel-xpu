@@ -685,6 +685,8 @@ std::vector<at::Tensor> mha_fwd(
   if (page_table.has_value()) {
     params.page_table = page_table.value().data_ptr<int>();
     params.page_table_batch_stride = page_table.value().stride(0);
+  } else {
+    params.page_table = nullptr;
   }
   params.max_num_pages_per_seq = max_num_pages_per_seq;
   params.page_size = page_size;

@@ -393,10 +393,19 @@ class FMHAPrefillChunk {
         ] * tiles_per_page;                                          // base block idx of physical page
       }
       // The headsize for both cached and non-cached version is the same
-      for (int j = 0; j < size<4>(pKgK1_); j++) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = cached_nblock; i < cached_nblock + DispatchPolicy::Stages; i++) {
-          prefetch(prefetch_K, pKgK1_(_, _, _, i, j));
+      if constexpr (PagedKV) {
+        for (int j = 0; j < size<4>(pKgK1_); j++) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = cached_nblock; i < cached_nblock + DispatchPolicy::Stages; i++) {
+            prefetch(prefetch_K, pKgK1_(_, _, _, i, j));
+          }
+        }
+      } else {
+        for (int j = 0; j < size<4>(pKgK1_); j++) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < DispatchPolicy::Stages; i++) {
+            prefetch(prefetch_K, pKgK1_(_, _, _, i, j));
+          }
         }
       }
 
@@ -437,8 +446,8 @@ class FMHAPrefillChunk {
 
         //                                                               // = 0, all KV is kv_cache
         // 1) Load KV (performed inside mmaQK)
-        auto gK_ = gK_cache(_, _, cached_nblock, _);
-        auto gV_ = gV_cache(_, _, cached_nblock);
+        auto gK_ = PagedKV ? gK_cache(_, _, cached_nblock, _) : gK_cache(_, _, split, _);
+        auto gV_ = PagedKV ? gV_cache(_, _, cached_nblock) : gV_cache(_, _, split);
         // 2) Create Tensor S
         Tensor tSr = make_tensor<ElementAccumulator>(Shape<Int<Vec>, Int<FragsM>, Int<FragsN>>{});
         clear(tSr);
@@ -473,38 +482,36 @@ class FMHAPrefillChunk {
             }
           }
         }
-        if constexpr (PagedKV) {
-          int col_start = local_id + kv_start_coord;
-          int col_end = col_start + (FragsN - 1) * get<1>(MmaAtomShape());
-          if (col_end >= seq_len_kv_cache) {
-            int col_idx = col_start;
-            CUTLASS_PRAGMA_UNROLL
-            for (int n = 0; n < FragsN; n++, col_idx += get<1>(MmaAtomShape())) {  // 4
-              if (col_idx >= seq_len_kv_cache) {
+        int col_start = local_id + kv_start_coord;
+        int col_end = col_start + (FragsN - 1) * get<1>(MmaAtomShape());
+        if (col_end >= seq_len_kv_cache) {
+          int col_idx = col_start;
+          CUTLASS_PRAGMA_UNROLL
+          for (int n = 0; n < FragsN; n++, col_idx += get<1>(MmaAtomShape())) {  // 4
+            if (col_idx >= seq_len_kv_cache) {
+              CUTLASS_PRAGMA_UNROLL
+              for (int m = 0; m < FragsM; m++) {  // 2
                 CUTLASS_PRAGMA_UNROLL
-                for (int m = 0; m < FragsM; m++) {  // 2
-                  CUTLASS_PRAGMA_UNROLL
-                  for (int row = 0; row < Vec; row++) {  // 8
-                    tSr(row, m, n) = ElementAccumulator{-INFINITY};
-                  }
+                for (int row = 0; row < Vec; row++) {  // 8
+                  tSr(row, m, n) = ElementAccumulator{-INFINITY};
                 }
               }
             }
           }
-          if constexpr (CausalMask) {
-            int row_start = q_start_coord + sub_group_id * QK_SG_M;
-            if (row_start + seq_diff < col_end) {
-              int col_idx = col_start;
-              CUTLASS_PRAGMA_UNROLL
-              for (int n = 0; n < FragsN; n++, col_idx += get<1>(MmaAtomShape())) {  // 4
-                if (col_idx > row_start + seq_diff) {
+        }
+        if constexpr (CausalMask) {
+          int row_start = q_start_coord + sub_group_id * QK_SG_M;
+          if (row_start + seq_diff < col_end) {
+            int col_idx = col_start;
+            CUTLASS_PRAGMA_UNROLL
+            for (int n = 0; n < FragsN; n++, col_idx += get<1>(MmaAtomShape())) {  // 4
+              if (col_idx > row_start + seq_diff) {
+                CUTLASS_PRAGMA_UNROLL
+                for (int m = 0; m < FragsM; m++) {  // 2
                   CUTLASS_PRAGMA_UNROLL
-                  for (int m = 0; m < FragsM; m++) {  // 2
-                    CUTLASS_PRAGMA_UNROLL
-                    for (int row = 0; row < Vec; row++) {  // 8
-                      int row_idx = row_start + m * Vec + row;
-                      if (row_idx + seq_diff < col_idx) tSr(row, m, n) = ElementAccumulator{-INFINITY};
-                    }
+                  for (int row = 0; row < Vec; row++) {  // 8
+                    int row_idx = row_start + m * Vec + row;
+                    if (row_idx + seq_diff < col_idx) tSr(row, m, n) = ElementAccumulator{-INFINITY};
                   }
                 }
               }
@@ -513,9 +520,14 @@ class FMHAPrefillChunk {
         }
         auto& tiled_prefetch_v_ = tiled_prefetch_v_cache;
         auto& pVgV_ = pVgV_cache;
-        int v_prefetch_idx = cached_nblock;
-        for (int i = 0; i < size<1>(pVgV_); i++) {
-          prefetch(tiled_prefetch_v_, pVgV_(_, i, _, v_prefetch_idx));
+        if constexpr (PagedKV) {
+          for (int i = 0; i < size<1>(pVgV_); i++) {
+            prefetch(tiled_prefetch_v_, pVgV_(_, i, _, cached_nblock));
+          }
+        } else {
+          for (int i = 0; i < size<1>(pVgV_); i++) {
+            prefetch(tiled_prefetch_v_, pVgV_(_, i, _, split));
+          }
         }
         int next_cached_nblock = split + 1;
         if constexpr (PagedKV) {
@@ -557,9 +569,16 @@ class FMHAPrefillChunk {
         // Prefetch the next K tile
         // there is no need to guard it with if statement as prefetch will
         // ignore out of bound reading
-        CUTLASS_PRAGMA_UNROLL
-        for (int j = 0; j < size<4>(pKgK_cache); j++) {
-          prefetch(tiled_prefetch_k_cache, pKgK_cache(_, _, _, cached_nblock, j));
+        if constexpr (PagedKV) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int j = 0; j < size<4>(pKgK_cache); j++) {
+            prefetch(tiled_prefetch_k_cache, pKgK_cache(_, _, _, cached_nblock, j));
+          }
+        } else {
+          CUTLASS_PRAGMA_UNROLL
+          for (int j = 0; j < size<4>(pKgK_cache); j++) {
+            prefetch(tiled_prefetch_k_cache, pKgK_cache(_, _, _, split + DispatchPolicy::Stages, j));
+          }
         }
         barrier_wait(barrier_scope);
       }

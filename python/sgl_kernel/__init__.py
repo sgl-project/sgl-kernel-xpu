@@ -58,6 +58,7 @@ from sgl_kernel.moe import (
     moe_fused_gate,
     moe_sum,
     moe_sum_reduce,
+    mxfp4_blockwise_scaled_grouped_mm,
     prepare_moe_input,
     swiglu_with_alpha_and_limit,
     topk_softmax,

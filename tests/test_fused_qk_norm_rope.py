@@ -74,14 +74,14 @@ def compute_inv_freq_yarn(
     inv_freq = 1.0 / (
         base
         ** (
-            torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device)
+            torch.arange(0, rotary_dim, 2, dtype=torch.float32, device="cpu")
             / rotary_dim
         )
     )
 
     if factor != 1.0:
         # YARN scaling
-        dim_range = torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device)
+        dim_range = torch.arange(0, rotary_dim, 2, dtype=torch.float32, device="cpu")
 
         # Compute linear interpolation factor
         linear_func = (dim_range - low_freq_factor) / (
@@ -201,10 +201,10 @@ def test_fused_qk_norm_rope_basic(
     position_ids = torch.arange(num_tokens, dtype=torch.int32, device=device)
 
     # Create a copy for reference
-    qkv_ref = qkv.clone().float()
-    q_weight_ref = q_weight.clone().float()
-    k_weight_ref = k_weight.clone().float()
-    position_ids_ref = position_ids.clone()
+    qkv_ref = qkv.clone().float().to("cpu")
+    q_weight_ref = q_weight.clone().float().to("cpu")
+    k_weight_ref = k_weight.clone().float().to("cpu")
+    position_ids_ref = position_ids.clone().to("cpu")
 
     # Compute reference output
     output_ref = fused_qk_norm_rope_reference(
@@ -248,7 +248,7 @@ def test_fused_qk_norm_rope_basic(
 
     # Compare results
     torch.testing.assert_close(
-        qkv, output_ref, rtol=precision[dtype], atol=precision[dtype]
+        qkv.to("cpu"), output_ref, rtol=precision[dtype], atol=precision[dtype]
     )
 
 
@@ -278,10 +278,10 @@ def test_fused_qk_norm_rope_yarn(num_tokens, head_dim, is_neox, dtype):
     position_ids = torch.arange(num_tokens, dtype=torch.int32, device=device)
 
     # Create a copy for reference
-    qkv_ref = qkv.clone().float()
-    q_weight_ref = q_weight.clone().float()
-    k_weight_ref = k_weight.clone().float()
-    position_ids_ref = position_ids.clone()
+    qkv_ref = qkv.clone().float().to("cpu")
+    q_weight_ref = q_weight.clone().float().to("cpu")
+    k_weight_ref = k_weight.clone().float().to("cpu")
+    position_ids_ref = position_ids.clone().to("cpu")
 
     # Compute reference output
     output_ref = fused_qk_norm_rope_reference(
@@ -325,7 +325,7 @@ def test_fused_qk_norm_rope_yarn(num_tokens, head_dim, is_neox, dtype):
 
     # Compare results - use slightly relaxed tolerance for YARN
     torch.testing.assert_close(
-        qkv, output_ref, rtol=precision[dtype] * 2, atol=precision[dtype] * 2
+        qkv.to("cpu"), output_ref, rtol=precision[dtype] * 2, atol=precision[dtype] * 2
     )
 
 
@@ -355,10 +355,10 @@ def test_fused_qk_norm_rope_partial_rotary(num_tokens, head_dim, rotary_dim, dty
     position_ids = torch.arange(num_tokens, dtype=torch.int32, device=device)
 
     # Create a copy for reference
-    qkv_ref = qkv.clone().float()
-    q_weight_ref = q_weight.clone().float()
-    k_weight_ref = k_weight.clone().float()
-    position_ids_ref = position_ids.clone()
+    qkv_ref = qkv.clone().float().to("cpu")
+    q_weight_ref = q_weight.clone().float().to("cpu")
+    k_weight_ref = k_weight.clone().float().to("cpu")
+    position_ids_ref = position_ids.clone().to("cpu")
 
     # Compute reference output
     output_ref = fused_qk_norm_rope_reference(
@@ -402,7 +402,7 @@ def test_fused_qk_norm_rope_partial_rotary(num_tokens, head_dim, rotary_dim, dty
 
     # Compare results
     torch.testing.assert_close(
-        qkv, output_ref, rtol=precision[dtype], atol=precision[dtype]
+        qkv.to("cpu"), output_ref, rtol=precision[dtype], atol=precision[dtype]
     )
 
 

@@ -205,8 +205,8 @@ def test_merge_attn_states(
     )
 
     # prefix_lse and suffix_lse contain inf and normal values
-    prefix_lse = torch.randn(NUM_TOKENS, NUM_HEADS, dtype=torch.float32, device="xpu")
-    suffix_lse = torch.randn(NUM_TOKENS, NUM_HEADS, dtype=torch.float32, device="xpu")
+    prefix_lse = torch.randn(NUM_TOKENS, NUM_HEADS, dtype=torch.float32, device="cpu")
+    suffix_lse = torch.randn(NUM_TOKENS, NUM_HEADS, dtype=torch.float32, device="cpu")
 
     # Generate boolean masks
     mask_prefix = torch.rand(NUM_TOKENS, NUM_HEADS) < 0.1
@@ -222,14 +222,14 @@ def test_merge_attn_states(
     # Other input tensors (need to be initialized but
     # no actual calculation needed)
     output = torch.zeros(
-        (NUM_TOKENS, NUM_HEADS, HEAD_SIZE), dtype=output_dtype, device="xpu"
+        (NUM_TOKENS, NUM_HEADS, HEAD_SIZE), dtype=output_dtype, device="cpu"
     )
-    output_lse = torch.zeros((NUM_TOKENS, NUM_HEADS), dtype=torch.float32, device="xpu")
+    output_lse = torch.zeros((NUM_TOKENS, NUM_HEADS), dtype=torch.float32, device="cpu")
     prefix_output = torch.randn(
-        (NUM_TOKENS, NUM_HEADS, HEAD_SIZE), dtype=output_dtype, device="xpu"
+        (NUM_TOKENS, NUM_HEADS, HEAD_SIZE), dtype=output_dtype, device="cpu"
     )
     suffix_output = torch.randn(
-        (NUM_TOKENS, NUM_HEADS, HEAD_SIZE), dtype=output_dtype, device="xpu"
+        (NUM_TOKENS, NUM_HEADS, HEAD_SIZE), dtype=output_dtype, device="cpu"
     )
 
     warmup_times = 2
@@ -297,6 +297,7 @@ def test_merge_attn_states(
         output_torch, output_lse_torch, merge_state_torch, fn_type="torch"
     )
 
+    device = "xpu"
     # 1. Run the Triton kernel
     output_ref_triton = output.clone()
     output_lse_ref_triton = output_lse.clone()
@@ -308,28 +309,17 @@ def test_merge_attn_states(
     )
 
     # 2. Run the merge_state V2 kernel
-    output_v2 = output.clone()
-    output_lse_v2 = output_lse.clone()
+    output_v2 = output.clone().to(device)
+    output_lse_v2 = output_lse.clone().to(device)
     time_v2, output_v2, output_lse_v2 = perf_kernel_fn(
         output_v2, output_lse_v2, merge_state_v2, fn_type="xpu_v2"
     )
 
-    # 3. Performance compare
-    improved = time_triton / time_v2
-    print(f"Torch time: {time_torch:.6f}ms")
-    print(f"Triton time: {time_triton:.6f}ms")
-    print(f"XPU v2 time: {time_v2:.6f}ms, Performance: {improved:.5f}x")
-    print("-" * 100)
-
-    # 4. Correctness compare
+    # 3. Correctness compare
     # Liger Kernel: Efficient Triton Kernels for LLM Training
     # https://arxiv.org/pdf/2410.10989, 3.3 Correctness
     # use rtol = 1e-2 for bfloat16.
     rtol = 1e-2 if output_dtype == torch.bfloat16 else 1e-3
-
-    def diff(a: torch.Tensor, b: torch.Tensor):
-        max_diff = torch.max(torch.abs(a.float() - b.float()))
-        return max_diff
 
     # Use Triton output as reference because we want to replace
     # the Triton kernel with custom XPU kernel for merge attn
@@ -337,47 +327,12 @@ def test_merge_attn_states(
     output_ref = output_ref_triton
     output_lse_ref = output_lse_ref_triton
     torch.testing.assert_close(
-        output_v2.float(), output_ref.float(), atol=1e-3, rtol=rtol
+        output_v2.to("cpu").float(), output_ref.float(), atol=1e-3, rtol=rtol
     )
-    print("Output all match, max abs diff:")
-    print(f"(Triton  vs Torch) : {diff(output_torch, output_ref)}")
-    print(f"(XPU v2 vs Torch) : {diff(output_torch, output_v2)}")
-    print(f"(XPU v2 vs Triton): {diff(output_ref, output_v2)}")
-    print("-" * 100)
 
     torch.testing.assert_close(
-        output_lse_v2.float(), output_lse_ref.float(), atol=1e-3, rtol=rtol
+        output_lse_v2.to("cpu").float(), output_lse_ref.float(), atol=1e-3, rtol=rtol
     )
-    print("Output LSE all match, max abs diff:")
-    print(f"(Triton  vs Torch) : {diff(output_lse_torch, output_lse_ref)}")
-    print(f"(XPU v2 vs Torch) : {diff(output_lse_torch, output_lse_v2)}")
-    print(f"(XPU v2 vs Triton): {diff(output_lse_ref, output_lse_v2)}")
-    print("-" * 100)
-
-    print(
-        "All output values test passed! All inf values "
-        "are correctly replaced with -inf."
-    )
-    print("-" * 100)
-
-    device = torch.xpu.get_device_name()
-    all_case_info.append(
-        (
-            NUM_TOKENS,
-            NUM_HEADS,
-            HEAD_SIZE,
-            output_dtype,
-            device,
-            time_torch,
-            time_triton,
-            # time_v1,
-            time_v2,
-        )
-    )
-    if len(all_case_info) == (
-        len(NUM_BATCH_TOKENS) * len(HEAD_SIZES) * len(NUM_QUERY_HEADS) * len(DTYPES)
-    ):
-        generate_markdown_table()
 
 
 if __name__ == "__main__":

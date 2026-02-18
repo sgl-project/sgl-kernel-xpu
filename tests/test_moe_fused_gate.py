@@ -14,7 +14,6 @@ import torch
 from sgl_kernel import moe_fused_gate
 
 
-@torch.compile
 def biased_grouped_topk_native(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,

@@ -218,7 +218,7 @@ def calculate_effective_bandwidth(
 
 batch_size_range = [1, 2, 4, 8, 16, 32, 64] if not IS_CI else [1, 4, 16]
 seq_len_range = [64, 128, 256, 512, 1024, 2048] if not IS_CI else [64, 256]
-group_size_range = [32, 64, 128]
+group_size_range = [32]
 src_dtype_range = [torch.bfloat16]
 
 configs = list(

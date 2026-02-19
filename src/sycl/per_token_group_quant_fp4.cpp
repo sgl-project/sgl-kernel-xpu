@@ -209,10 +209,7 @@ void sgl_per_token_group_quant_fp4(
   CHECK_CONTIGUOUS(input);
   CHECK_CONTIGUOUS(output_q);
 
-  TORCH_CHECK(
-      group_size == 32 || group_size == 64 || group_size == 128,
-      "sgl_per_token_group_quant_fp4: group_size must be 32, 64, or 128, got ",
-      group_size);
+  TORCH_CHECK(group_size == 32, "sgl_per_token_group_quant_fp4: group_size must be 32 for MXFP4", group_size);
 
   TORCH_CHECK(
       input.scalar_type() == at::ScalarType::Half || input.scalar_type() == at::ScalarType::BFloat16 ||

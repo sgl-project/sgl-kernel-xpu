@@ -70,7 +70,7 @@ def dequantize_e2m1(
 
 
 def quantize_to_mxfp4_ref(
-    tensor: torch.Tensor, block_size: int = MXFP4_BLOCK_SIZE
+    tensor: torch.Tensor, block_size: int = MXFP4_BLOCK_SIZE, eps: float = 1e-10
 ) -> tuple:
     """Reference implementation for MXFP4 quantization."""
     assert tensor.dim() == 2
@@ -83,7 +83,7 @@ def quantize_to_mxfp4_ref(
     tensor_blocks = tensor_fp32.reshape(m, num_blocks, block_size)
 
     block_max = tensor_blocks.abs().max(dim=-1, keepdim=True).values
-    block_max = torch.clamp(block_max, min=1e-12)
+    block_max = torch.clamp(block_max, min=eps)
 
     log2_max = torch.log2(block_max / FLOAT4_E2M1_MAX)
     exponent = torch.ceil(log2_max).clamp(min=-127, max=127).to(torch.int32)
@@ -129,7 +129,7 @@ def reference_per_token_group_quant_mxfp4(
     assert x.is_contiguous()
 
     x_cpu = x.cpu().float()
-    x_q, x_s = quantize_to_mxfp4_ref(x_cpu, group_size)
+    x_q, x_s = quantize_to_mxfp4_ref(x_cpu, group_size, eps)
     return x_q.to(x.device), x_s.to(x.device)
 
 
@@ -161,16 +161,38 @@ def calculate_diff(
     x_q_ref, x_s_ref = reference_per_token_group_quant_mxfp4(x.clone(), group_size)
     x_q_sgl, x_s_sgl = sglang_per_token_group_quant_mxfp4(x.clone(), group_size)
 
+    # Compare quantized outputs directly (packed uint8 and scales)
+    q_match = torch.equal(x_q_ref.cpu(), x_q_sgl.cpu())
+    s_match = torch.equal(x_s_ref.cpu(), x_s_sgl.cpu())
+
+    if q_match and s_match:
+        print(
+            f"  ✅ Quantized values match (batch={batch_size}, seq={seq_len}, hidden={hidden_dim}, group={group_size}, dtype={src_dtype})"
+        )
+    else:
+        q_mismatches = (
+            (x_q_ref.cpu() != x_q_sgl.cpu()).sum().item() if not q_match else 0
+        )
+        s_mismatches = (
+            (x_s_ref.cpu() != x_s_sgl.cpu()).sum().item() if not s_match else 0
+        )
+        print(
+            f"  ❌ Quantized values differ: "
+            f"packed_q({q_mismatches} mismatches) "
+            f"scales({s_mismatches} mismatches)"
+        )
+
+    # Compare dequantized outputs
     x_dq_ref = dequantize_mxfp4(x_q_ref.cpu(), x_s_ref.cpu(), torch.float32, group_size)
     x_dq_sgl = dequantize_mxfp4(x_q_sgl.cpu(), x_s_sgl.cpu(), torch.float32, group_size)
 
     if torch.allclose(x_dq_ref, x_dq_sgl, rtol=0.2, atol=0.5):
         print(
-            f"✅ MXFP4 implementations match (batch={batch_size}, seq={seq_len}, hidden={hidden_dim}, group={group_size}, dtype={src_dtype})"
+            f"  ✅ Dequantized values match (batch={batch_size}, seq={seq_len}, hidden={hidden_dim}, group={group_size}, dtype={src_dtype})"
         )
     else:
         max_diff = (x_dq_ref - x_dq_sgl).abs().max().item()
-        print(f"❌ Implementations differ (max_diff={max_diff:.4f})")
+        print(f"  ❌ Dequantized values differ (max_diff={max_diff:.4f})")
 
 
 def calculate_flops(num_elements: int, num_groups: int) -> int:
@@ -235,9 +257,9 @@ all_results = []
         x_names=["batch_size", "seq_len", "group_size", "src_dtype"],
         x_vals=configs,
         line_arg="provider",
-        line_vals=["reference", "sglang"],
-        line_names=["Reference (PyTorch)", "SGL Kernel"],
-        styles=[("blue", "-"), ("green", "-")],
+        line_vals=["sglang"],
+        line_names=["SGL Kernel"],
+        styles=[("green", "-")],
         ylabel="us",
         plot_name="per-token-group-quant-mxfp4-performance",
         args={},
@@ -251,14 +273,10 @@ def benchmark(batch_size, seq_len, group_size, src_dtype, provider):
 
     quantiles = [0.5, 0.2, 0.8]
 
-    def run_reference():
-        return reference_per_token_group_quant_mxfp4(x, group_size)
-
-    def run_sglang():
-        return sglang_per_token_group_quant_mxfp4(x, group_size)
-
-    fn = run_reference if provider == "reference" else run_sglang
-    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
+    ms, min_ms, max_ms = triton.testing.do_bench(
+        lambda: sglang_per_token_group_quant_mxfp4(x, group_size),
+        quantiles=quantiles,
+    )
 
     bw_metrics = calculate_effective_bandwidth(
         batch_size, seq_len, hidden_dim, group_size, src_dtype, ms

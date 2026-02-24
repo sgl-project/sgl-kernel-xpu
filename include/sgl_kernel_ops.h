@@ -1370,6 +1370,10 @@ void causal_conv1d_fwd(
     const std::optional<at::Tensor>& has_initial_state,
     bool silu_activation,
     int64_t pad_slot_id);
+// Xe35 only kernels
+#if SYCL_INTEL_TARGET == 35
+void dsv3_router_gemm_xpu(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
+#endif
 
 void causal_conv1d_update(
     at::Tensor& x,

@@ -834,4 +834,6 @@ void moe_grouped_mm_nt_xe35(
     bool fuse_act = false,
     double gemm1_alpha = 1.702,
     double gemm1_limit = 7.0);
+
+void dsv3_router_gemm_xpu(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
 #endif

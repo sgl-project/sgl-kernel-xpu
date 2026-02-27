@@ -439,3 +439,18 @@ def dsv3_router_gemm(
         router_weights,
     )
     return output
+
+
+def dsv3_fused_a_gemm(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if output is None:
+        output = torch.empty(
+            (mat_a.shape[0], mat_b.shape[1]),
+            device=mat_a.device,
+            dtype=mat_a.dtype,
+        )
+    torch.ops.sgl_kernel.dsv3_fused_a_gemm.default(output, mat_a, mat_b)
+    return output

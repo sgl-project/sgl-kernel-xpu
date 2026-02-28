@@ -115,7 +115,7 @@ class FlashChunkPrefillSoftmaxEpilogue<CausalMask_, LocalMask_, epilogue::IntelX
       CUTLASS_PRAGMA_UNROLL
       for (int z = 0; z < FragsN; z++) {
         auto base_indx = index + (z * Vec * FragsM);
-        if constexpr (LocalMask) {
+        if constexpr (LocalMask || CausalMask) {
           if ((std::isinf(max_scale_bcast) && max_scale_bcast < 0) ||
               (std::isinf(frag_s(base_indx)) && frag_s(base_indx) < 0)) {
             frag_s(base_indx) = 0.f;
@@ -167,7 +167,7 @@ class FlashChunkPrefillSoftmaxEpilogue<CausalMask_, LocalMask_, epilogue::IntelX
       auto sg = compat::get_nd_item<1>().get_sub_group();
       Element max_scale{max * params.scale};
       Element exp_scale;
-      if constexpr (LocalMask) {
+      if constexpr (LocalMask || CausalMask) {
         if ((std::isinf(max_scale) && max_scale < 0) || (std::isinf(max_prev) && max_prev < 0)) {
           exp_scale = 0.f;
         } else {
@@ -185,7 +185,7 @@ class FlashChunkPrefillSoftmaxEpilogue<CausalMask_, LocalMask_, epilogue::IntelX
         CUTLASS_PRAGMA_UNROLL
         for (int z = 0; z < FragsNAcc; z++) {
           auto base_indx = index + (z * Vec * FragsM);
-          if constexpr (LocalMask) {
+          if constexpr (LocalMask || CausalMask) {
             if ((std::isinf(max_scale_bcast) && max_scale_bcast < 0) ||
                 (std::isinf(frag_s(base_indx)) && frag_s(base_indx) < 0)) {
               frag_s(base_indx) = 0.f;

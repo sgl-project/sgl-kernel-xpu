@@ -44,6 +44,7 @@ def flash_attn_with_kvcache(
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k_new: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
     rotary_seqlens: Optional[torch.Tensor] = None,
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
@@ -189,6 +190,7 @@ def flash_attn_with_kvcache(
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_q,
+        max_seqlen_k,
         page_table,
         cache_batch_idx,
         cache_leftpad,
@@ -252,46 +254,36 @@ def flash_attn_varlen_func(
         ) * q.size(1)
         max_seqlen_q = q.size(1)
         q = q.view(-1, q.size(-2), q.size(-1)).contiguous()
-    batch_size = cu_seqlens_q.numel() - 1
-    page_table = (
-        torch.arange(0, batch_size, device=q.device)
-        .to(torch.int32)
-        .reshape([batch_size, 1])
-        .contiguous()
-    )
 
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
         q,
         k,
         v,
-        None,  # k_new
-        None,  # v_new
         qv,  # qv
         cu_seqlens_q,
         cu_seqlens_k,
-        None,  # cu_seqlens_k_new
         max_seqlen_q,
         max_seqlen_k,
-        page_table,  # page_table,
-        page_table,  # num_pages_per_seq
+        None,  # page_table,
         None,  # kv_batch_idx
         None,  # leftpad_k
         None,  # rotary cos
         None,  # rotary sin
-        None,  # seqlens_rotary
+        None,  # rotary_seqlens
         q_descale,
         k_descale,
         v_descale,
         softmax_scale,
+        None, # sinks
         causal,
         window_size[0],
         window_size[1],
         softcap,
-        is_rotary_interleaved=False,
-        scheduler_metadata=None,
-        num_splits=num_splits,
-        pack_gqa=pack_gqa,
-        sm_margin=sm_margin,
+        False, # rotary_interleaved
+        None, # scheduler_metadata
+        num_splits,
+        pack_gqa,
+        sm_margin,
     )
 
     return (out, softmax_lse, *rest) if return_softmax_lse else out

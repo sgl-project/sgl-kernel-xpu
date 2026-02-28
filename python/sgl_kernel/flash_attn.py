@@ -274,13 +274,13 @@ def flash_attn_varlen_func(
         k_descale,
         v_descale,
         softmax_scale,
-        None, # sinks
+        None,  # sinks
         causal,
         window_size[0],
         window_size[1],
         softcap,
-        False, # rotary_interleaved
-        None, # scheduler_metadata
+        False,  # rotary_interleaved
+        None,  # scheduler_metadata
         num_splits,
         pack_gqa,
         sm_margin,

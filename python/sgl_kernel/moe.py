@@ -2,6 +2,8 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from .utils import is_xe2_arch
+
 
 def moe_align_block_size(
     topk_ids,
@@ -376,15 +378,18 @@ def fused_experts(
     )
     torch.ops.sgl_kernel.shuffle_rows.default(hidden_states, a_map, input_A_shuffle)
 
-    intermediate_cache1 = torch.empty(
-        (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
-    )
     intermediate_cache3 = torch.empty(
         (M * TopK, OutK), device=hidden_states.device, dtype=hidden_states.dtype
     )
 
     activation_type = 0 if activation == "silu" else 1
-    torch.ops.sgl_kernel.moe_grouped_mm_nt(
+
+    # for xe20, silu_and_mul is fused into moe_grouped_mm_nt
+    assert is_xe2_arch(), f"Current MoE is only supported on BMG"
+    intermediate_cache1 = torch.empty(
+        (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
+    )
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
         intermediate_cache1,
         input_A_shuffle,
         w1,
@@ -394,11 +399,7 @@ def fused_experts(
         activation_type,
         fuse_act=True,
     )
-
-    # silu_and_mul is fused into moe_grouped_mm_nt
-    # torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
-
-    torch.ops.sgl_kernel.moe_grouped_mm_nt(
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
         intermediate_cache3,
         intermediate_cache1,
         w2,

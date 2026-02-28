@@ -190,7 +190,7 @@ class FMHAPrefillChunk {
     return {
         args.mode,
         args.problem_shape,
-        CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop, workspace),
+        CollectiveMainloop::to_underlying_arguments(args.problem_shape, args.mainloop, args.softmax.scale, workspace),
         CollectiveSoftmaxEpilogue::to_underlying_arguments(args.softmax),
         CollectiveEpilogue::to_underlying_arguments(args.problem_shape, args.epilogue, workspace),
         TileScheduler::to_underlying_arguments(args.problem_shape, args.hw_info, TileShapeOutput{})};
@@ -228,6 +228,10 @@ class FMHAPrefillChunk {
       int seq_len_q =
           get<3>(problem_shape).cumulative_length[batch + 1] - get<3>(problem_shape).cumulative_length[batch];
       int seq_len_k = get<5>(problem_shape).cumulative_length[batch];
+      if constexpr (!PagedKV) {
+        seq_len_k =
+            get<5>(problem_shape).cumulative_length[batch + 1] - get<5>(problem_shape).cumulative_length[batch];
+      }
       return cute::make_tuple<int, int>(seq_len_q, seq_len_k);
     } else {
       return select<3, 5>(problem_shape);
@@ -393,19 +397,10 @@ class FMHAPrefillChunk {
         ] * tiles_per_page;                                          // base block idx of physical page
       }
       // The headsize for both cached and non-cached version is the same
-      if constexpr (PagedKV) {
-        for (int j = 0; j < size<4>(pKgK1_); j++) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = cached_nblock; i < cached_nblock + DispatchPolicy::Stages; i++) {
-            prefetch(prefetch_K, pKgK1_(_, _, _, i, j));
-          }
-        }
-      } else {
-        for (int j = 0; j < size<4>(pKgK1_); j++) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < DispatchPolicy::Stages; i++) {
-            prefetch(prefetch_K, pKgK1_(_, _, _, i, j));
-          }
+      for (int j = 0; j < size<4>(pKgK1_); j++) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = cached_nblock; i < cached_nblock + DispatchPolicy::Stages; i++) {
+          prefetch(prefetch_K, pKgK1_(_, _, _, i, j));
         }
       }
 
@@ -446,8 +441,8 @@ class FMHAPrefillChunk {
 
         //                                                               // = 0, all KV is kv_cache
         // 1) Load KV (performed inside mmaQK)
-        auto gK_ = PagedKV ? gK_cache(_, _, cached_nblock, _) : gK_cache(_, _, split, _);
-        auto gV_ = PagedKV ? gV_cache(_, _, cached_nblock) : gV_cache(_, _, split);
+        auto gK_ = gK_cache(_, _, cached_nblock, _);
+        auto gV_ = gV_cache(_, _, cached_nblock);
         // 2) Create Tensor S
         Tensor tSr = make_tensor<ElementAccumulator>(Shape<Int<Vec>, Int<FragsM>, Int<FragsN>>{});
         clear(tSr);
@@ -520,14 +515,9 @@ class FMHAPrefillChunk {
         }
         auto& tiled_prefetch_v_ = tiled_prefetch_v_cache;
         auto& pVgV_ = pVgV_cache;
-        if constexpr (PagedKV) {
-          for (int i = 0; i < size<1>(pVgV_); i++) {
-            prefetch(tiled_prefetch_v_, pVgV_(_, i, _, cached_nblock));
-          }
-        } else {
-          for (int i = 0; i < size<1>(pVgV_); i++) {
-            prefetch(tiled_prefetch_v_, pVgV_(_, i, _, split));
-          }
+        int v_prefetch_idx = cached_nblock;
+        for (int i = 0; i < size<1>(pVgV_); i++) {
+          prefetch(tiled_prefetch_v_, pVgV_(_, i, _, v_prefetch_idx));
         }
         int next_cached_nblock = split + 1;
         if constexpr (PagedKV) {
@@ -569,16 +559,9 @@ class FMHAPrefillChunk {
         // Prefetch the next K tile
         // there is no need to guard it with if statement as prefetch will
         // ignore out of bound reading
-        if constexpr (PagedKV) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int j = 0; j < size<4>(pKgK_cache); j++) {
-            prefetch(tiled_prefetch_k_cache, pKgK_cache(_, _, _, cached_nblock, j));
-          }
-        } else {
-          CUTLASS_PRAGMA_UNROLL
-          for (int j = 0; j < size<4>(pKgK_cache); j++) {
-            prefetch(tiled_prefetch_k_cache, pKgK_cache(_, _, _, split + DispatchPolicy::Stages, j));
-          }
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < size<4>(pKgK_cache); j++) {
+          prefetch(tiled_prefetch_k_cache, pKgK_cache(_, _, _, cached_nblock, j));
         }
         barrier_wait(barrier_scope);
       }

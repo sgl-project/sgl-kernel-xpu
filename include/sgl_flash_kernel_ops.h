@@ -52,6 +52,7 @@ std::vector<at::Tensor> mha_fwd(
     const at::Tensor& cu_seqlens_q,         // b+1
     const at::Tensor& cu_seqlens_k,         // b+1
     int max_seqlen_q,
+    int max_seqlen_k,
     std::optional<const at::Tensor>& page_table,
     std::optional<const at::Tensor>& kv_batch_idx_,    // b. indices to index into the KV cache
     std::optional<const at::Tensor>& leftpad_k_,       // b

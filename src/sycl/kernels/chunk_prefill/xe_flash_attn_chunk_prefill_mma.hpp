@@ -439,12 +439,9 @@ struct FlashChunkPrefillMma<
         offset_k_cache = kv_head_coord * head_size_qk;
         offset_v_cache = kv_head_coord * head_size_vo;
       } else {
-        auto kv_cumulative_length = 0;
-        for (auto i=0; i<l_coord; i++) {
-          kv_cumulative_length += kv_cached_cumulative_length[i];
-        }
-        offset_k_cache =  num_heads_kv * head_size_qk * kv_cumulative_length + kv_head_coord * head_size_qk;
-        offset_v_cache =  num_heads_kv * head_size_vo * kv_cumulative_length + kv_head_coord * head_size_vo;
+        auto kv_cumulative_length = kv_cached_cumulative_length[l_coord];
+        offset_k_cache = num_heads_kv * head_size_qk * kv_cumulative_length + kv_head_coord * head_size_qk;
+        offset_v_cache = num_heads_kv * head_size_vo * kv_cumulative_length + kv_head_coord * head_size_vo;
       }
     } else {
     }

@@ -480,6 +480,7 @@ std::vector<at::Tensor> mha_fwd(
     const at::Tensor& cu_seqlens_q,         // b+1
     const at::Tensor& cu_seqlens_k,         // b+1
     int max_seqlen_q,
+    int max_seqlen_k,
     std::optional<const at::Tensor>& page_table,       // (b_k, max_num_pages_per_seq)
     std::optional<const at::Tensor>& kv_batch_idx_,    // b. indices to index into the KV cache
     std::optional<const at::Tensor>& leftpad_k_,       // b
@@ -547,9 +548,9 @@ std::vector<at::Tensor> mha_fwd(
   int num_pages = 0;
   int page_size = 0;
   int max_num_pages_per_seq = 0;
-  int batch_size_k = k.size(0);
-  int seqlen_k = k.size(1);
-  int total_k = batch_size_k * seqlen_k;
+  int batch_size_k = cu_seqlens_k.size(0) - 1;
+  int seqlen_k = max_seqlen_k;
+  int total_k = k.size(0);
   if (page_table.has_value()) {
     num_pages = k.size(0);
     page_size = k.size(1);
@@ -560,9 +561,6 @@ std::vector<at::Tensor> mha_fwd(
     CHECK_SHAPE(page_table.value(), batch_size_k, max_num_pages_per_seq);
     CHECK_SHAPE(k, num_pages, page_size, num_heads_k, head_size);
     CHECK_SHAPE(v, num_pages, page_size, num_heads_k, head_size_v);
-  } else {
-    CHECK_SHAPE(k, batch_size_k, seqlen_k, num_heads_k, head_size);
-    CHECK_SHAPE(v, batch_size_k, seqlen_k, num_heads_k, head_size_v);
   }
 
   if (!kv_batch_idx_.has_value()) {
@@ -649,6 +647,7 @@ std::vector<at::Tensor> mha_fwd(
   params.h_k = num_heads_k;
   params.seqlen_q = seqlen_q;
   params.seqlen_k = seqlen_k;
+  params.seqlen_knew = seqlen_k;
   params.seqlen_q_rounded = seqlen_q_rounded;
   params.seqlen_k_rounded = seqlen_k_rounded;
   params.d = head_size;

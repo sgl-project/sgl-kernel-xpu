@@ -229,8 +229,7 @@ class FMHAPrefillChunk {
           get<3>(problem_shape).cumulative_length[batch + 1] - get<3>(problem_shape).cumulative_length[batch];
       int seq_len_k = get<5>(problem_shape).cumulative_length[batch];
       if constexpr (!PagedKV) {
-        seq_len_k =
-            get<5>(problem_shape).cumulative_length[batch + 1] - get<5>(problem_shape).cumulative_length[batch];
+        seq_len_k = get<5>(problem_shape).cumulative_length[batch + 1] - get<5>(problem_shape).cumulative_length[batch];
       }
       return cute::make_tuple<int, int>(seq_len_q, seq_len_k);
     } else {

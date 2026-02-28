@@ -228,6 +228,9 @@ class FMHAPrefillChunk {
       int seq_len_q =
           get<3>(problem_shape).cumulative_length[batch + 1] - get<3>(problem_shape).cumulative_length[batch];
       int seq_len_k = get<5>(problem_shape).cumulative_length[batch];
+      if constexpr (!PagedKV) {
+        seq_len_k = get<5>(problem_shape).cumulative_length[batch + 1] - get<5>(problem_shape).cumulative_length[batch];
+      }
       return cute::make_tuple<int, int>(seq_len_q, seq_len_k);
     } else {
       return select<3, 5>(problem_shape);
@@ -473,38 +476,36 @@ class FMHAPrefillChunk {
             }
           }
         }
-        if constexpr (PagedKV) {
-          int col_start = local_id + kv_start_coord;
-          int col_end = col_start + (FragsN - 1) * get<1>(MmaAtomShape());
-          if (col_end >= seq_len_kv_cache) {
-            int col_idx = col_start;
-            CUTLASS_PRAGMA_UNROLL
-            for (int n = 0; n < FragsN; n++, col_idx += get<1>(MmaAtomShape())) {  // 4
-              if (col_idx >= seq_len_kv_cache) {
+        int col_start = local_id + kv_start_coord;
+        int col_end = col_start + (FragsN - 1) * get<1>(MmaAtomShape());
+        if (col_end >= seq_len_kv_cache) {
+          int col_idx = col_start;
+          CUTLASS_PRAGMA_UNROLL
+          for (int n = 0; n < FragsN; n++, col_idx += get<1>(MmaAtomShape())) {  // 4
+            if (col_idx >= seq_len_kv_cache) {
+              CUTLASS_PRAGMA_UNROLL
+              for (int m = 0; m < FragsM; m++) {  // 2
                 CUTLASS_PRAGMA_UNROLL
-                for (int m = 0; m < FragsM; m++) {  // 2
-                  CUTLASS_PRAGMA_UNROLL
-                  for (int row = 0; row < Vec; row++) {  // 8
-                    tSr(row, m, n) = ElementAccumulator{-INFINITY};
-                  }
+                for (int row = 0; row < Vec; row++) {  // 8
+                  tSr(row, m, n) = ElementAccumulator{-INFINITY};
                 }
               }
             }
           }
-          if constexpr (CausalMask) {
-            int row_start = q_start_coord + sub_group_id * QK_SG_M;
-            if (row_start + seq_diff < col_end) {
-              int col_idx = col_start;
-              CUTLASS_PRAGMA_UNROLL
-              for (int n = 0; n < FragsN; n++, col_idx += get<1>(MmaAtomShape())) {  // 4
-                if (col_idx > row_start + seq_diff) {
+        }
+        if constexpr (CausalMask) {
+          int row_start = q_start_coord + sub_group_id * QK_SG_M;
+          if (row_start + seq_diff < col_end) {
+            int col_idx = col_start;
+            CUTLASS_PRAGMA_UNROLL
+            for (int n = 0; n < FragsN; n++, col_idx += get<1>(MmaAtomShape())) {  // 4
+              if (col_idx > row_start + seq_diff) {
+                CUTLASS_PRAGMA_UNROLL
+                for (int m = 0; m < FragsM; m++) {  // 2
                   CUTLASS_PRAGMA_UNROLL
-                  for (int m = 0; m < FragsM; m++) {  // 2
-                    CUTLASS_PRAGMA_UNROLL
-                    for (int row = 0; row < Vec; row++) {  // 8
-                      int row_idx = row_start + m * Vec + row;
-                      if (row_idx + seq_diff < col_idx) tSr(row, m, n) = ElementAccumulator{-INFINITY};
-                    }
+                  for (int row = 0; row < Vec; row++) {  // 8
+                    int row_idx = row_start + m * Vec + row;
+                    if (row_idx + seq_diff < col_idx) tSr(row, m, n) = ElementAccumulator{-INFINITY};
                   }
                 }
               }

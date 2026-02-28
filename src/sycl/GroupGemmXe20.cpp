@@ -1,3 +1,5 @@
+#define SYCL_INTEL_TARGET 20
+
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
@@ -5,26 +7,20 @@
 #include <cute/tensor.hpp>
 
 #include "Utils.h"
-#include "cutlass/epilogue/collective/collective_builder.hpp"
-#include "cutlass/epilogue/collective/default_epilogue.hpp"
-#include "cutlass/epilogue/fusion/xe_callbacks.hpp"
-#include "cutlass/gemm/collective/collective_mma.hpp"
-#include "cutlass/gemm/device/gemm_universal.h"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
-#include "cutlass/util/device_memory.h"
-#include "kernels/moe/moe_kernel.hpp"
+#include "kernels/moe/xe20/moe_kernel.hpp"
 
 using namespace cute;
-using namespace MoE;
 
 using ElementAccumulator = float;  // <- data type of accumulator
 
 template <typename, typename, typename, typename, typename, typename, int, bool, bool>
-class GemmCuteName;
+class GemmXe20Name;
 
 // ActType: 0=silu, 1=gelu
 template <typename Tile, typename SGLayout, int ActType, bool FuseAct, bool WithBias>
-void MoEGEMMLauncher(
+void Xe20MoEGEMMLauncher(
     sycl::queue q,
     const void* activations,
     const void* weights,
@@ -90,7 +86,7 @@ void MoEGEMMLauncher(
 
   auto event = q.submit([&](sycl::handler& h) {
     sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), h);
-    h.parallel_for<GemmCuteName<Tile, SGLayout, TensorA, TensorB, TensorD, Element, ActType, FuseAct, WithBias>>(
+    h.parallel_for<GemmXe20Name<Tile, SGLayout, TensorA, TensorB, TensorD, Element, ActType, FuseAct, WithBias>>(
         sycl::nd_range<3>(global * local, local), kernel_props, [=](sycl::nd_item<3> item) {
           int32_t* slm_mem =
               static_cast<int32_t*>(local_mem.template get_multi_ptr<sycl::access::decorated::no>().get());
@@ -100,7 +96,7 @@ void MoEGEMMLauncher(
 }
 
 #define LAUNCH_MOE(...)                       \
-  MoEGEMMLauncher<__VA_ARGS__>(               \
+  Xe20MoEGEMMLauncher<__VA_ARGS__>(           \
       queue,                                  \
       activations.data_ptr(),                 \
       weights.data_ptr(),                     \
@@ -111,7 +107,7 @@ void MoEGEMMLauncher(
       gemm_k,                                 \
       total_rows_for_experts.data_ptr<int>(), \
       n_experts,                              \
-      static_cast<int*>(atomic_buffer.data_ptr()))
+      atomic_buffer.data_ptr<int>())
 
 #define DISPATCH_MOE_HELPER_BIAS(ActType, FuseAct, WithBias, ...) \
   do {                                                            \
@@ -148,7 +144,7 @@ void MoEGEMMLauncher(
 #define DISPATCH_MOE(ActType, FuseAct, WithBias, ...) \
   DISPATCH_MOE_HELPER_ACT_TYPE(ActType, FuseAct, WithBias, __VA_ARGS__)
 
-void moe_grouped_mm_nt(
+void moe_grouped_mm_nt_xe20(
     torch::Tensor& output,
     const torch::Tensor& activations,
     const torch::Tensor& weights,
@@ -219,3 +215,5 @@ void moe_grouped_mm_nt(
     }
   }
 }
+
+#undef SYCL_INTEL_TARGET

@@ -10,7 +10,7 @@
 #  SYCL_COMPILER
 #  -- SYCL compiler's executable.
 #
-#  SYCL_FLAGS
+#  SYCL_COMPILE_FLAGS
 #  -- SYCL compiler's compilation command line arguments.
 #
 #  SYCL_HOST_FLAGS
@@ -364,7 +364,7 @@ function(SYCL_COMPUTE_DEVICE_OBJECT_FILE_NAME output_file_var sycl_target)
   set(${output_file_var} "${output_file}" PARENT_SCOPE)
 endfunction()
 
-macro(SYCL_LINK_DEVICE_OBJECTS output_file sycl_target)
+macro(SYCL_LINK_DEVICE_OBJECTS output_file sycl_target sycl_offline_compiler_flags sycl_device_link_flags)
   set(object_files)
   list(APPEND object_files ${ARGN})
 
@@ -383,8 +383,7 @@ macro(SYCL_LINK_DEVICE_OBJECTS output_file sycl_target)
     set(SYCL_device_link_flags
         ${link_type_flag}
         ${important_host_flags}
-        ${SYCL_FLAGS}
-        ${SYCL_DEVICE_LINK_FLAGS})
+        "${sycl_device_link_flags}")
 
     file(RELATIVE_PATH output_file_relative_path "${CMAKE_BINARY_DIR}" "${output_file}")
 
@@ -408,7 +407,7 @@ macro(SYCL_LINK_DEVICE_OBJECTS output_file sycl_target)
       COMMAND ${SYCL_EXECUTABLE}
       ${SYCL_device_link_flags}
       -fsycl-link ${object_files}
-      -Xs ${SYCL_OFFLINE_COMPILER_FLAGS}
+      -Xs ${sycl_offline_compiler_flags}
       -o ${output_file}
       COMMENT "Building SYCL device link file ${output_file_relative_path}"
       )
@@ -418,6 +417,18 @@ endmacro()
 ###############################################################################
 # ADD LIBRARY
 macro(SYCL_ADD_LIBRARY sycl_target)
+
+  set(_SYCL_OFFLINE_COMPILER_FLAGS ${SYCL_OFFLINE_COMPILER_FLAGS})
+  set(_SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS})
+
+  cmake_parse_arguments(PY_SYCL "SHARED" "" "SYCL_SOURCES" ${ARGN})
+  if(PY_SYCL_UNPARSED_ARGUMENTS)
+      list(GET PY_SYCL_UNPARSED_ARGUMENTS 0 _SYCL_OFFLINE_COMPILER_FLAGS)
+
+      set(_TMP_LIST ${PY_SYCL_UNPARSED_ARGUMENTS})
+      list(REMOVE_AT _TMP_LIST 0)
+      set(_SYCL_DEVICE_LINK_FLAGS "${_TMP_LIST}")
+  endif()
 
   if(SYCL_HOST_COMPILATION_CXX)
     set(SYCL_C_OR_CXX CXX)
@@ -451,6 +462,8 @@ macro(SYCL_ADD_LIBRARY sycl_target)
     SYCL_LINK_DEVICE_OBJECTS(
       ${device_object}
       ${sycl_target}
+      "${_SYCL_OFFLINE_COMPILER_FLAGS}"
+      "${_SYCL_DEVICE_LINK_FLAGS}"
       ${${sycl_target}_sycl_objects})
 
     add_library(
@@ -461,65 +474,6 @@ macro(SYCL_ADD_LIBRARY sycl_target)
       ${device_object})
   else()
     add_library(
-      ${sycl_target}
-      ${_cmake_options}
-      ${_cxx_sources})
-  endif()
-
-  target_link_libraries(
-    ${sycl_target}
-    ${SYCL_LINK_LIBRARIES_KEYWORD}
-    ${SYCL_LIBRARY})
-
-  set_target_properties(${sycl_target}
-    PROPERTIES
-    LINKER_LANGUAGE ${SYCL_C_OR_CXX})
-
-endmacro()
-
-###############################################################################
-# ADD EXECUTABLE
-macro(SYCL_ADD_EXECUTABLE sycl_target)
-
-  if(SYCL_HOST_COMPILATION_CXX)
-    set(SYCL_C_OR_CXX CXX)
-  else()
-    set(SYCL_C_OR_CXX C)
-  endif()
-
-  # Separate the sources from the options
-  SYCL_GET_SOURCES_AND_OPTIONS(
-    _sycl_sources
-    _cxx_sources
-    _cmake_options
-    ${ARGN})
-
-  if(_sycl_sources)
-    # Compile sycl sources
-    SYCL_WRAP_SRCS(
-      ${sycl_target}
-      ${sycl_target}_sycl_objects
-      ${ARGN})
-
-    # Compute the file name of the intermedate link file used for separable
-    # compilation.
-    SYCL_COMPUTE_DEVICE_OBJECT_FILE_NAME(device_object ${sycl_target})
-
-    # Add a custom device linkage command to produce a host relocatable object
-    # containing device object module.
-    SYCL_LINK_DEVICE_OBJECTS(
-      ${device_object}
-      ${sycl_target}
-      ${${sycl_target}_sycl_objects})
-
-    add_executable(
-      ${sycl_target}
-      ${_cmake_options}
-      ${_cxx_sources}
-      ${${sycl_target}_sycl_objects}
-      ${device_object})
-  else()
-    add_executable(
       ${sycl_target}
       ${_cmake_options}
       ${_cxx_sources})

@@ -4,6 +4,9 @@ project(sgl_kernel)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_STANDARD 20)
 
+set(ATen_XPU_SYCL_XE20)
+set(ATen_XPU_SYCL_COMMON)
+
 # Torch
 find_package(Python3 COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
@@ -31,7 +34,6 @@ include(FetchContent)
 
 # SYCL support in cutlass
 add_compile_definitions(CUTLASS_ENABLE_SYCL)
-add_compile_definitions(SYCL_INTEL_TARGET)
 set(CUTLASS_ENABLE_SYCL ON CACHE BOOL "Enable SYCL in the cutlass" FORCE)
 set(CUTLASS_ENABLE_BENCHMARKS  OFF CACHE BOOL "Remove benchmark to avoid cmake version issue in google benchmark" FORCE)
 set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable headers only mode in cutlass" FORCE)

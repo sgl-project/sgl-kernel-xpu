@@ -189,8 +189,8 @@ class XeFMHAFwdKernel {
       //         problem_shape.seq_len_qo, problem_shape.seq_len_kv, problem_shape.seq_len_kv_cache},
       //     batch);
 
-      int seq_len_q =
-          problem_shape.seq_len_qo.cumulative_length[batch + 1] - problem_shape.seq_len_qo.cumulative_length[batch];
+      int seq_len_q = problem_shape.seq_len_qo.q_group_size * (problem_shape.seq_len_qo.cumulative_length[batch + 1] -
+                                                               problem_shape.seq_len_qo.cumulative_length[batch]);
       int seq_len_k_new = 0;
       int seq_len_k_cache = problem_shape.seq_len_kv_cache.cumulative_length[batch];
       return cute::make_tuple<int, int, int>(seq_len_q, seq_len_k_new, seq_len_k_cache);

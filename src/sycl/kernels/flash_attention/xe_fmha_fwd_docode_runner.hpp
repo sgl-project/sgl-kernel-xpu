@@ -38,10 +38,9 @@
 
 #include <cute/tensor.hpp>
 #include <random>
-#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
-#include "Utils.h"
-#include "comm/common.h"
+#include "../../Utils.h"
+#include "../../comm/common.h"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/util/GPU_Clock.hpp"
@@ -51,15 +50,15 @@
 #include "cutlass/util/reference/device/gemm_complex.h"
 #include "cutlass/util/reference/device/tensor_compare.h"
 #include "cutlass/util/sycl_event_manager.hpp"
-#include "kernels/flash_attention/fmha_fusion.hpp"
-#include "kernels/flash_attention/xe_fhma_fwd_kernel.hpp"
-#include "kernels/flash_attention/xe_tile_scheduler.hpp"
+#include "fmha_fusion.hpp"
+#include "xe_fhma_fwd_kernel.hpp"
+#include "xe_tile_scheduler.hpp"
 
 // #include "helper.h"
 // #include "sycl_common.hpp"
 
 using namespace cute;
-
+namespace decode {
 struct Arguments {
   using index_t = int64_t;
 
@@ -82,6 +81,7 @@ struct Arguments {
 
   // The number of heads.
   int h, h_k;
+  int q_group_size = 1;
 
   // The O matrix (output).
   void* __restrict__ o_ptr;
@@ -197,8 +197,6 @@ struct Arguments {
   torch::TensorOptions tensor_opts;
 };
 
-template <typename Kernel>
-class KernelCur {};
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // 3 input matrices: Keys, Queries and Values.
 using LayoutQ = cutlass::layout::RowMajor;
@@ -207,7 +205,7 @@ using LayoutV = cutlass::layout::RowMajor;
 using LayoutO = cutlass::layout::RowMajor;
 
 template <class FMHADecodeKernel, bool isVarLen = false>
-struct KernelRunner {
+struct DecodeRunner {
   using StrideQ = typename FMHADecodeKernel::StrideQ;
   using StrideK = typename FMHADecodeKernel::StrideK;
   using StrideV = typename FMHADecodeKernel::StrideV;
@@ -267,15 +265,17 @@ struct KernelRunner {
 
     ProblemShape problem_size_for_init = problem_size;
     get<0>(problem_size_for_init) = 1;  // concentrated batch
-    get<3>(problem_size_for_init) = params.total_q;
+    get<1>(problem_size_for_init) = params.h / params.q_group_size;
+    get<3>(problem_size_for_init) = params.total_q * params.q_group_size;
     get<4>(problem_size_for_init) = params.total_knew;
     get<5>(problem_size_for_init) = params.total_k;
 
     ProblemShapeType problem_size_for_launch;
     problem_size_for_launch.batch = get<0>(problem_size);
-    problem_size_for_launch.num_heads_q = get<1>(problem_size);
+    problem_size_for_launch.num_heads_q = get<1>(problem_size) / params.q_group_size;
     problem_size_for_launch.num_heads_kv = get<2>(problem_size);
-    problem_size_for_launch.seq_len_qo = cutlass::fmha::collective::VariableLength{params.seqlen_q, params.total_q};
+    problem_size_for_launch.seq_len_qo = cutlass::fmha::collective::VariableLength{
+        params.seqlen_q, params.total_q * params.q_group_size, nullptr, params.q_group_size};
     problem_size_for_launch.seq_len_kv =
         cutlass::fmha::collective::VariableLength{params.seqlen_knew, params.total_knew};
     problem_size_for_launch.seq_len_kv_cache =
@@ -324,46 +324,49 @@ struct KernelRunner {
       shape.seq_len_kv.cumulative_length = params.cu_seqlens_knew;
       shape.seq_len_kv_cache.cumulative_length = params.cu_seqlens_k;
     }
+
     return shape;
   }
 
   // Note that the GemmUniversalAdapter currently doesn't support flash attention, which is why this
   // secondary `run` function is required to launch the kernel.
-  static void run(typename FMHADecodeKernel::Params params) {
-    namespace syclex = sycl::ext::oneapi::experimental;
-    namespace intelex = sycl::ext::intel::experimental;
+  // static void run(typename FMHADecodeKernel::Params params) {
+  // launch<FMHADecodeKernel>(params);
+  // namespace syclex = sycl::ext::oneapi::experimental;
+  // namespace intelex = sycl::ext::intel::experimental;
 
-    dim3 const block = FMHADecodeKernel::get_block_shape();
-    dim3 const grid = FMHADecodeKernel::get_grid_shape(params);
+  // dim3 const block = FMHADecodeKernel::get_block_shape();
+  // dim3 const grid = FMHADecodeKernel::get_grid_shape(params);
 
-    // configure smem size and carveout
-    int smem_size = FMHADecodeKernel::SharedStorageSize;
+  // // configure smem size and carveout
+  // int smem_size = FMHADecodeKernel::SharedStorageSize;
 
-    const auto sycl_block = compat::dim3(block.x, block.y, block.z);
-    const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
+  // const auto sycl_block = compat::dim3(block.x, block.y, block.z);
+  // const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
 
-    // Launch parameters depend on whether SYCL compiler supports work-group scratch memory extension
-    compat::experimental::launch_properties launch_props{
-        syclex::work_group_scratch_size(smem_size),
-    };
-    compat::experimental::kernel_properties kernel_props{
-        syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<256>};
-    compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
+  // // Launch parameters depend on whether SYCL compiler supports work-group scratch memory extension
+  // compat::experimental::launch_properties launch_props{
+  //     syclex::work_group_scratch_size(smem_size),
+  // };
+  // compat::experimental::kernel_properties kernel_props{
+  //     syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<256>};
+  // compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
 
-    sycl::ext::oneapi::experimental::launch_config config(policy.get_range(), policy.get_launch_properties());
-    auto cgf = [&](::sycl::handler& cgh) {
-      auto KernelFunctor = compat::experimental::detail::build_kernel_functor<cutlass::device_kernel<FMHADecodeKernel>>(
-          cgh, policy, params);
-      sycl::ext::oneapi::experimental::detail::
-          LaunchConfigAccess<sycl::nd_range<3>, decltype(policy.get_launch_properties())>
-              ConfigAccess(config);
-      cgh.parallel_for<KernelCur<FMHADecodeKernel>>(
-          ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
-    };
-    auto stream = at::xpu::getCurrentXPUStream();
-    auto q = stream.queue();
-    q.submit(cgf);
-  }
+  // sycl::ext::oneapi::experimental::launch_config config(policy.get_range(), policy.get_launch_properties());
+  // auto cgf = [&](::sycl::handler& cgh) {
+  //   auto KernelFunctor =
+  //   compat::experimental::detail::build_kernel_functor<cutlass::device_kernel<FMHADecodeKernel>>(
+  //       cgh, policy, params);
+  //   sycl::ext::oneapi::experimental::detail::
+  //       LaunchConfigAccess<sycl::nd_range<3>, decltype(policy.get_launch_properties())>
+  //           ConfigAccess(config);
+  //   cgh.parallel_for<KernelCur<FMHADecodeKernel>>(
+  //       ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
+  // };
+  // auto stream = at::xpu::getCurrentXPUStream();
+  // auto q = stream.queue();
+  // q.submit(cgf);
+  // }
 
   cutlass::Status run(const Arguments& params, const cutlass::KernelHardwareInfo& hw_info) {
     ProblemShapeType shape = initialize(params);
@@ -406,11 +409,11 @@ struct KernelRunner {
     auto kernel_params = FMHADecodeKernel::to_underlying_arguments(arguments, workspace.get());
 
     // Run
-    run(kernel_params);
+    // run(kernel_params);
+    launch<FMHADecodeKernel>(kernel_params);
     return cutlass::Status::kSuccess;
   }
 };
-
 template <
     bool Causal,
     bool LocalMask,
@@ -515,7 +518,7 @@ struct FMHAConfig {
             XeFMHAFwdDynamicSplitKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>,
         cutlass::fmha::kernel::XeFMHAFwdKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>>;
 
-    KernelRunner<FMHADecodeKernel, isVarLen> kernel;
+    DecodeRunner<FMHADecodeKernel, isVarLen> kernel;
 
     kernel.run(params, hw_info);
     return 0;
@@ -531,8 +534,7 @@ struct FMHAConfig {
     }
   }
 };
-
-std::vector<at::Tensor> flash_decode(
+std::vector<at::Tensor> mha_fwd(
     at::Tensor& q,        // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
                           // h_k, d) if there is page_table.
@@ -608,6 +610,8 @@ std::vector<at::Tensor> flash_decode(
   int const seqlen_k = max_num_pages_per_seq * page_size;
   int const total_k = num_pages * page_size;
   int const num_heads_k = k.size(-2);
+  int q_group_size = num_heads / num_heads_k;
+
   int const batch_size_k = page_table.size(0);
   float softmax_scale = softmax_scale_;
 
@@ -652,7 +656,7 @@ std::vector<at::Tensor> flash_decode(
 
   auto opts = q.options();
   at::Tensor out;
-  out = torch::empty({total_q, num_heads, head_size_v}, opts);
+  out = torch::empty({total_q * q_group_size, num_heads / q_group_size, head_size_v}, opts);
 
   auto round_multiple = [](int x, int m) -> int { return (x + m - 1) / m * m; };
   auto nextPowerOf2 = [](uint32_t a) -> int {
@@ -669,8 +673,8 @@ std::vector<at::Tensor> flash_decode(
   };
   int const head_size_rounded = round_up_headdim(head_size);
   int const head_size_v_rounded = head_size_v == head_size ? head_size_rounded : round_up_headdim(head_size_v);
-  int const seqlen_q_rounded = round_multiple(seqlen_q, 128);
-  int const seqlen_k_rounded = round_multiple(seqlen_k, 128);
+  // int const seqlen_q_rounded = round_multiple(seqlen_q, 128);
+  // int const seqlen_k_rounded = round_multiple(seqlen_k, 128);
 
   // Otherwise the kernel will be launched from cuda:0 device
   // Cast to char to avoid compiler warning about narrowing
@@ -709,10 +713,11 @@ std::vector<at::Tensor> flash_decode(
   params.b = batch_size;
   params.h = num_heads;
   params.h_k = num_heads_k;
-  params.seqlen_q = seqlen_q;
+  params.q_group_size = num_heads / num_heads_k;
+  params.seqlen_q = seqlen_q * q_group_size;
   params.seqlen_k = seqlen_k;
-  params.seqlen_q_rounded = seqlen_q_rounded;
-  params.seqlen_k_rounded = seqlen_k_rounded;
+  // params.seqlen_q_rounded = seqlen_q_rounded;
+  // params.seqlen_k_rounded = seqlen_k_rounded;
   params.d = head_size;
   params.d_rounded = head_size_rounded;
 
@@ -885,5 +890,8 @@ std::vector<at::Tensor> flash_decode(
     default:
       TORCH_CHECK(false, "Unsupported head size for decode attention: ", params.d);
   }
-  return {out, softmax_lse, out_accum, softmax_lse_accum};
+  // out = torch::empty({total_q * q_group_size, num_heads / q_group_size, head_size_v}, opts);
+
+  return {out.view({total_q, num_heads, head_size_v}), softmax_lse, out_accum, softmax_lse_accum};
 }
+}  // namespace decode

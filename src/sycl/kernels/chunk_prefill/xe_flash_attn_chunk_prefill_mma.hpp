@@ -30,12 +30,12 @@
  **************************************************************************************************/
 #pragma once
 
+#include "../flash_attention/fmha_fusion.hpp"
 #include "cute/algorithm/functional.hpp"
 #include "cute/algorithm/gemm.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
-#include "fmha_fusion.hpp"
 
 ////////////////////////////////////////////////////////////
 namespace {}

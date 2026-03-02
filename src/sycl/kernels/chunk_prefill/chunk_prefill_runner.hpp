@@ -5,20 +5,20 @@
 
 #include <cute/tensor.hpp>
 
-#include "Utils.h"
-#include "comm/common.h"
+#include "../../Utils.h"
+#include "../../comm/common.h"
+#include "../flash_attention/fmha_fusion.hpp"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
 #include "cutlass/util/sycl_event_manager.hpp"
-#include "kernels/chunk_prefill/fmha_fusion.hpp"
-#include "kernels/chunk_prefill/tile_scheduler_chunk_prefill.hpp"
-#include "kernels/chunk_prefill/xe_chunk_prefill.hpp"
-#include "kernels/chunk_prefill/xe_flash_attn_chunk_prefill_epilogue.hpp"
-#include "kernels/chunk_prefill/xe_flash_attn_chunk_prefill_softmax_epilogue.hpp"
+#include "tile_scheduler_chunk_prefill.hpp"
+#include "xe_chunk_prefill.hpp"
+#include "xe_flash_attn_chunk_prefill_epilogue.hpp"
+#include "xe_flash_attn_chunk_prefill_softmax_epilogue.hpp"
 
 using namespace cute;
-
+namespace chunkprefill {
 struct Flash_fwd_params {
   using index_t = int64_t;
 
@@ -156,9 +156,6 @@ struct Flash_fwd_params {
   torch::TensorOptions tensor_opts;
 };
 
-template <typename Kernel>
-class KernelCur {};
-
 // Flash Attention takes 3 input matrices: Keys, Queries and Values.
 using LayoutQ = cutlass::layout::RowMajor;
 using LayoutK = cutlass::layout::ColumnMajor;
@@ -166,7 +163,7 @@ using LayoutV = cutlass::layout::RowMajor;
 using LayoutO = cutlass::layout::RowMajor;
 
 template <class FMHAChunkPrefillKernel, bool isVarLen>
-struct KernelRunner {
+struct ChunkPrefillRunner {
   using StrideQ = typename FMHAChunkPrefillKernel::StrideQ;
   using StrideK = typename FMHAChunkPrefillKernel::StrideK;
   using StrideV = typename FMHAChunkPrefillKernel::StrideV;
@@ -273,39 +270,39 @@ struct KernelRunner {
 
   // Note that the GemmUniversalAdapter currently doesn't support flash attention, which is why this
   // secondary `run` function is required to launch the kernel.
-  static void run(typename FMHAChunkPrefillKernel::Params params) {
-    dim3 const block = FMHAChunkPrefillKernel::get_block_shape();
-    dim3 const grid = FMHAChunkPrefillKernel::get_grid_shape(params);
+  // static void run(typename FMHAChunkPrefillKernel::Params params) {
+  // dim3 const block = FMHAChunkPrefillKernel::get_block_shape();
+  // dim3 const grid = FMHAChunkPrefillKernel::get_grid_shape(params);
 
-    // configure smem size and carveout
-    int smem_size = FMHAChunkPrefillKernel::SharedStorageSize;
+  // // configure smem size and carveout
+  // int smem_size = FMHAChunkPrefillKernel::SharedStorageSize;
 
-    const auto sycl_block = compat::dim3(block.x, block.y, block.z);
-    const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
+  // const auto sycl_block = compat::dim3(block.x, block.y, block.z);
+  // const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
 
-    using namespace compat::experimental;
-    compat::experimental::launch_properties launch_props{
-        sycl::ext::oneapi::experimental::work_group_scratch_size(smem_size),
-    };
-    compat::experimental::kernel_properties kernel_props{
-        sycl::ext::oneapi::experimental::sub_group_size<FMHAChunkPrefillKernel::DispatchPolicy::SubgroupSize>};
-    compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
+  // using namespace compat::experimental;
+  // compat::experimental::launch_properties launch_props{
+  //     sycl::ext::oneapi::experimental::work_group_scratch_size(smem_size),
+  // };
+  // compat::experimental::kernel_properties kernel_props{
+  //     sycl::ext::oneapi::experimental::sub_group_size<FMHAChunkPrefillKernel::DispatchPolicy::SubgroupSize>};
+  // compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
 
-    sycl::ext::oneapi::experimental::launch_config config(policy.get_range(), policy.get_launch_properties());
-    auto cgf = [&](::sycl::handler& cgh) {
-      auto KernelFunctor =
-          compat::experimental::detail::build_kernel_functor<cutlass::device_kernel<FMHAChunkPrefillKernel>>(
-              cgh, policy, params);
-      sycl::ext::oneapi::experimental::detail::
-          LaunchConfigAccess<sycl::nd_range<3>, decltype(policy.get_launch_properties())>
-              ConfigAccess(config);
-      cgh.parallel_for<KernelCur<FMHAChunkPrefillKernel>>(
-          ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
-    };
-    auto stream = at::xpu::getCurrentXPUStream();
-    auto q = stream.queue();
-    q.submit(cgf);
-  }
+  // sycl::ext::oneapi::experimental::launch_config config(policy.get_range(), policy.get_launch_properties());
+  // auto cgf = [&](::sycl::handler& cgh) {
+  //   auto KernelFunctor =
+  //       compat::experimental::detail::build_kernel_functor<cutlass::device_kernel<FMHAChunkPrefillKernel>>(
+  //           cgh, policy, params);
+  //   sycl::ext::oneapi::experimental::detail::
+  //       LaunchConfigAccess<sycl::nd_range<3>, decltype(policy.get_launch_properties())>
+  //           ConfigAccess(config);
+  //   cgh.parallel_for<KernelCur<FMHAChunkPrefillKernel>>(
+  //       ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
+  // };
+  // auto stream = at::xpu::getCurrentXPUStream();
+  // auto q = stream.queue();
+  // q.submit(cgf);
+  // }
 
   cutlass::Status run(const Flash_fwd_params& params, const cutlass::KernelHardwareInfo& hw_info) {
     ProblemShapeType problem_size = initialize(params);
@@ -350,11 +347,11 @@ struct KernelRunner {
     auto params_kernel = FMHAChunkPrefillKernel::to_underlying_arguments(arguments, workspace.data_ptr());
 
     // Run the Flash Attention implementation.
-    run(params_kernel);
+    // run(params_kernel);
+    launch<FMHAChunkPrefillKernel>(params_kernel);
     return cutlass::Status::kSuccess;
   }
 };
-
 // the default value used for the case BF16
 template <
     typename TileShapeQK,
@@ -376,7 +373,7 @@ template <
     typename ElementOutput = bfloat16_t,
     typename ElementSink = bfloat16_t,
     typename GmemTiledCopyStore = XE_2D_U16x8x16_ST_N>
-struct FMHAConfig {
+struct ChunkPrefillConfig {
   template <bool isVarLen, bool PagedKV, class Scheduler>
   static int run(const Flash_fwd_params& params) {
     // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
@@ -433,7 +430,7 @@ struct FMHAConfig {
         CollectiveEpilogue,
         Scheduler>;
 
-    KernelRunner<FMHAChunkPrefillKernel, isVarLen> runner;
+    ChunkPrefillRunner<FMHAChunkPrefillKernel, isVarLen> runner;
 
     (runner.run(params, hw_info));
     return 0;
@@ -742,7 +739,7 @@ std::vector<at::Tensor> mha_fwd(
     case 64:
       AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
         if (params.is_causal) {
-          FMHAConfig<
+          ChunkPrefillConfig<
               cute::Shape<_128, _64, _64>,
               cute::Shape<_128, _32, _64>,
               cute::Shape<_128, _64, _64>,
@@ -755,7 +752,7 @@ std::vector<at::Tensor> mha_fwd(
           AT_DISPATCH_BOOL_NO_RETURN(
               params.is_local,
               LocalMask,
-              FMHAConfig<
+              ChunkPrefillConfig<
                   cute::Shape<_128, _64, _64>,
                   cute::Shape<_128, _32, _64>,
                   cute::Shape<_128, _64, _64>,
@@ -770,7 +767,7 @@ std::vector<at::Tensor> mha_fwd(
     case 96:
       AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
         if (params.is_causal) {
-          FMHAConfig<
+          ChunkPrefillConfig<
               cute::Shape<_128, _64, _32>,
               cute::Shape<_128, _32, _64>,
               cute::Shape<_128, _96, _64>,
@@ -784,7 +781,7 @@ std::vector<at::Tensor> mha_fwd(
           AT_DISPATCH_BOOL_NO_RETURN(
               params.is_local,
               LocalMask,
-              FMHAConfig<
+              ChunkPrefillConfig<
                   cute::Shape<_128, _64, _32>,
                   cute::Shape<_128, _32, _64>,
                   cute::Shape<_128, _96, _64>,
@@ -799,7 +796,7 @@ std::vector<at::Tensor> mha_fwd(
     case 128:
       AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
         if (params.is_causal) {
-          FMHAConfig<
+          ChunkPrefillConfig<
               cute::Shape<_128, _64, _64>,
               cute::Shape<_128, _32, _64>,
               cute::Shape<_128, _128, _64>,
@@ -812,7 +809,7 @@ std::vector<at::Tensor> mha_fwd(
           AT_DISPATCH_BOOL_NO_RETURN(
               params.is_local,
               LocalMask,
-              FMHAConfig<
+              ChunkPrefillConfig<
                   cute::Shape<_128, _64, _64>,
                   cute::Shape<_128, _32, _64>,
                   cute::Shape<_128, _128, _64>,
@@ -827,7 +824,7 @@ std::vector<at::Tensor> mha_fwd(
     case 192:
       AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
         if (params.is_causal) {
-          FMHAConfig<
+          ChunkPrefillConfig<
               cute::Shape<_256, _64, _64>,
               cute::Shape<_256, _32, _64>,
               cute::Shape<_256, _192, _64>,
@@ -840,7 +837,7 @@ std::vector<at::Tensor> mha_fwd(
           AT_DISPATCH_BOOL_NO_RETURN(
               params.is_local,
               LocalMask,
-              FMHAConfig<
+              ChunkPrefillConfig<
                   cute::Shape<_256, _64, _64>,
                   cute::Shape<_256, _32, _64>,
                   cute::Shape<_256, _192, _64>,
@@ -857,3 +854,4 @@ std::vector<at::Tensor> mha_fwd(
   }
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
+}  // namespace chunkprefill

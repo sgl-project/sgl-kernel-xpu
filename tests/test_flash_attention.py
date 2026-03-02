@@ -522,7 +522,7 @@ def generate_qkv(
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
-@pytest.mark.parametrize("d", [64])
+@pytest.mark.parametrize("d", [64, 128])
 # @pytest.mark.parametrize("d", [192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -1043,8 +1043,7 @@ def test_flash_attn_kvcache(
     ),
 )
 # @pytest.mark.parametrize("rotary_fraction", [0.0])
-@pytest.mark.parametrize("page_size", [128])
-# @pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize("page_size", [64, 128])
 # @pytest.mark.parametrize("page_size", [None])
 # @pytest.mark.parametrize("has_leftpad", [False, True])
 @pytest.mark.parametrize("has_leftpad", [False])
@@ -1052,24 +1051,23 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize("has_batch_idx", [False])
 # @pytest.mark.parametrize("varlen_q", [False, True])
 @pytest.mark.parametrize("varlen_q", [True])
-@pytest.mark.parametrize("d", [64])
-# @pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("seqlen_q", [1])
 @pytest.mark.parametrize(
     "seqlen_k",
     [
         128,
-        # 256,
-        # 339,
-        # 1024,
-        # 800,
-        # 256,
-        # 799,
-        # 2048,
-        # 20000,
-        # # # (1, 128 * 1024),
-        # # # (16, 128 * 1024),
-        # # 128,
+        256,
+        339,
+        1024,
+        800,
+        256,
+        799,
+        2048,
+        20000,
+        # (1, 128 * 1024),
+        # (16, 128 * 1024),
+        # 128,
         # 512,  # To test appending KV with more than 1 block
         # 3577,  # Enough tile to test persistent scheduler
     ],
@@ -1094,7 +1092,7 @@ def test_flash_attn_decode_kvcache(
     mha_type,
     dtype,
 ):
-    from sgl_kernel.flash_attn import flash_attn_decode_with_kvcache
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
     if page_size is not None and seqlen_k % page_size != 0:
         pytest.skip()
@@ -1106,10 +1104,10 @@ def test_flash_attn_decode_kvcache(
         pytest.skip()
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 1
+    batch_size = 16
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
-    nheads = 2
-    nheads_k = 1  # nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
+    nheads = 16
+    nheads_k = 4  # nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
 
     if seqlen_k <= seqlen_q:
@@ -1418,7 +1416,7 @@ def test_flash_attn_decode_kvcache(
                 else:
                     k_cache_paged.copy_(k_cache_saved)
                     v_cache_paged.copy_(v_cache_saved)
-                out, lse, *rest = flash_attn_decode_with_kvcache(
+                out, lse, *rest = flash_attn_with_kvcache(
                     q if not varlen_q else q_unpad,
                     k_cache if page_size is None else k_cache_paged,
                     v_cache if page_size is None else v_cache_paged,

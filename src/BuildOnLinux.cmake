@@ -17,12 +17,25 @@ macro(setup_common_libraries)
 endmacro()
 
 setup_common_libraries()
-message(STATUS "all sycl srcs: ${ATen_XPU_SYCL_SRCS}")
-foreach(sycl_src ${ATen_XPU_SYCL_SRCS})
+
+if(SYCL_COMPILER_VERSION GREATER_EQUAL 20250806)
+  set(COMMON_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS})
+  set(COMMON_DEVICE_LINK_FLAGS ${COMMON_DEVICE_LINK_FLAGS} -Xspirv-translator)
+  set(COMMON_DEVICE_LINK_FLAGS ${COMMON_DEVICE_LINK_FLAGS} -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+else()
+  message(FATAL_ERROR
+      "SYCL compiler version must be >= 20250806, "
+      "but got ${SYCL_COMPILER_VERSION}")
+endif()
+
+# common kernels
+foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
   get_filename_component(name ${sycl_src} NAME_WLE REALPATH)
   set(sycl_lib sgl-ops-sycl-${name})
   sycl_add_library(
     ${sycl_lib}
+    ${SYCL_OFFLINE_COMPILER_FLAGS}
+    ${COMMON_DEVICE_LINK_FLAGS}
     SHARED
     SYCL_SOURCES ${sycl_src})
   target_link_libraries(common_ops PUBLIC ${sycl_lib})
@@ -35,6 +48,30 @@ foreach(sycl_src ${ATen_XPU_SYCL_SRCS})
     BUILD_WITH_INSTALL_RPATH TRUE
   )
 endforeach()
+
+# xe20 kernels
+set(XE20_OFFLINE_COMPILER_AOT_OPTIONS "-device bmg")
+set(XE20_OFFLINE_COMPILER_FLAGS "${XE20_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
+foreach(sycl_src ${ATen_XPU_SYCL_XE20})
+  get_filename_component(name ${sycl_src} NAME_WLE REALPATH)
+  set(sycl_lib sgl-ops-sycl-${name})
+  sycl_add_library(
+    ${sycl_lib}
+    ${XE20_OFFLINE_COMPILER_FLAGS}
+    ${COMMON_DEVICE_LINK_FLAGS}
+    SHARED
+    SYCL_SOURCES ${sycl_src})
+  target_link_libraries(common_ops PUBLIC ${sycl_lib})
+  list(APPEND SGL_OPS_LIBRARIES ${sycl_lib})
+
+  # Decouple with PyTorch cmake definition.
+  install(TARGETS ${sycl_lib} LIBRARY DESTINATION sgl_kernel)
+  set_target_properties(${sycl_lib} PROPERTIES
+    INSTALL_RPATH "$ORIGIN"
+    BUILD_WITH_INSTALL_RPATH TRUE
+  )
+endforeach()
+
 set(SYCL_LINK_LIBRARIES_KEYWORD)
 
 foreach(lib ${SGL_OPS_LIBRARIES})

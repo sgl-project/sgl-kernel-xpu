@@ -47,7 +47,6 @@
 // #include "cutlass/util/command_line.h"
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
-
 #include "fmha_fusion.hpp"
 #include "xe_fhma_fwd_kernel.hpp"
 #include "xe_tile_scheduler.hpp"

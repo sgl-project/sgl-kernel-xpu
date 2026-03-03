@@ -217,10 +217,6 @@ def flash_attn_with_kvcache(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
-    # if max_seqlen_q <= 16 and (
-    #     (q.dim() == 4 and max_seqlen_q == q.size(1))
-    #     or (q.dim() == 3 and max_seqlen_q * (cu_seqlens_q.size(0) - 1) == q.size(0))
-    # ):
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
     if softmax_scale is None:

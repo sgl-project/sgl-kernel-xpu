@@ -344,21 +344,21 @@ struct FMHAFwdMainloop<
         prefetch(prefetch_q, pQgQ(_, _, _, D));
       }
 
-      // for (int D = 0; D < size<4>(pKgK); D++) {
-      //   CUTLASS_PRAGMA_UNROLL
-      //   for (int K = 0; K < Stages; K++) {
-      //     if (K < kblocks_cache) {
-      //       if constexpr (PagedKV) {
-      //         int physical_K_tile = get_physical_k_tile(K, l_coord, seq_len_kv_cache);
-      //         prefetch(prefetch_k_cache, pKgK_cache(_, _, _, physical_K_tile, D));
-      //       } else {
-      //         prefetch(prefetch_k_cache, pKgK_cache(_, _, _, K, D));
-      //       }
-      //     } else {
-      //       prefetch(prefetch_k, pKgK(_, _, _, K - kblocks_cache, D));
-      //     }
-      //   }
-      // }
+      for (int D = 0; D < size<4>(pKgK); D++) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int K = 0; K < Stages; K++) {
+          if (K < kblocks_cache) {
+            if constexpr (PagedKV) {
+              int physical_K_tile = get_physical_k_tile(K, l_coord, seq_len_kv_cache);
+              prefetch(prefetch_k_cache, pKgK_cache(_, _, _, physical_K_tile, D));
+            } else {
+              prefetch(prefetch_k_cache, pKgK_cache(_, _, _, K, D));
+            }
+          } else {
+            prefetch(prefetch_k, pKgK(_, _, _, K - kblocks_cache, D));
+          }
+        }
+      }
 
       clear(tArA);
       fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
@@ -414,22 +414,22 @@ struct FMHAFwdMainloop<
         }
 
         /* K prefetch */
-        // for (int D = 0; D < size<4>(pKgK); D++) {
-        //   int K_next = K + Stages;
-        //   bool is_cache_next = K_next < kblocks_cache;
-        // int physical_K_next = K_next;
-        // if constexpr (PagedKV) {
-        //   if (is_cache_next) {
-        //     physical_K_next = get_physical_k_tile(K_next, l_coord, seq_len_kv_cache);
-        //   }
-        // }
+        for (int D = 0; D < size<4>(pKgK); D++) {
+          int K_next = K + Stages;
+          bool is_cache_next = K_next < kblocks_cache;
+          int physical_K_next = K_next;
+          if constexpr (PagedKV) {
+            if (is_cache_next) {
+              physical_K_next = get_physical_k_tile(K_next, l_coord, seq_len_kv_cache);
+            }
+          }
 
-        // if (is_cache_next) {
-        //   prefetch(prefetch_k_cache, pKgK_cache(_, _, _, physical_K_next, D));
-        // } else {
-        //   prefetch(prefetch_k, pKgK(_, _, _, K_next - kblocks_cache, D));
-        // }
-        // }
+          if (is_cache_next) {
+            prefetch(prefetch_k_cache, pKgK_cache(_, _, _, physical_K_next, D));
+          } else {
+            prefetch(prefetch_k, pKgK(_, _, _, K_next - kblocks_cache, D));
+          }
+        }
       }
     }
 

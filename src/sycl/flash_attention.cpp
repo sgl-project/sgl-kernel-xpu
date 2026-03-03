@@ -69,9 +69,6 @@ std::vector<at::Tensor> mha_fwd(
     int num_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin) {
-  // TODO: check GPU support
-  // auto dprops = at::cuda::getCurrentDeviceProperties();
-  // TORCH_CHECK(drops->name.find("B580") != std::string::npos, "sgl_kernel_xpu only supports BMG+");
   if (max_seqlen_q == 1) {
     return decode::mha_fwd(
         q,

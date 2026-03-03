@@ -1,6 +1,6 @@
 /***************************************************************************************************
  * Copyright (c) 2024 - 2025 Codeplay Software Ltd. All rights reserved.
- * Copyright (C) 2025 Intel Corporation, All rights reserved.
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -41,21 +41,16 @@
 
 #include "../../Utils.h"
 #include "../../comm/common.h"
-#include "cutlass/epilogue/collective/default_epilogue.hpp"
-#include "cutlass/gemm/device/gemm_universal_adapter.h"
-#include "cutlass/util/GPU_Clock.hpp"
-#include "cutlass/util/command_line.h"
+// #include "cutlass/epilogue/collective/default_epilogue.hpp"
+// #include "cutlass/gemm/device/gemm_universal_adapter.h"
+// #include "cutlass/util/GPU_Clock.hpp"
+// #include "cutlass/util/command_line.h"
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
-#include "cutlass/util/reference/device/gemm_complex.h"
-#include "cutlass/util/reference/device/tensor_compare.h"
-#include "cutlass/util/sycl_event_manager.hpp"
+
 #include "fmha_fusion.hpp"
 #include "xe_fhma_fwd_kernel.hpp"
 #include "xe_tile_scheduler.hpp"
-
-// #include "helper.h"
-// #include "sycl_common.hpp"
 
 using namespace cute;
 namespace decode {
@@ -233,28 +228,6 @@ struct DecodeRunner {
   StrideV stride_V_cache;
   StrideO stride_O;
 
-  // cutlass::DeviceAllocation<ElementQ> block_Q;
-  // cutlass::DeviceAllocation<ElementK> block_K;
-  // cutlass::DeviceAllocation<ElementV> block_V;
-  // cutlass::DeviceAllocation<ElementK> block_K_cache;
-  // cutlass::DeviceAllocation<ElementV> block_V_cache;
-  // cutlass::DeviceAllocation<ElementO> block_O;
-  // cutlass::DeviceAllocation<ElementO> block_ref_O;
-
-  // std::vector<int> cumulative_seqlen_q;
-  // std::vector<int> cumulative_seqlen_kv;
-  // std::vector<int> cumulative_seqlen_kv_cache;
-  // cutlass::DeviceAllocation<int> device_cumulative_seqlen_q;
-  // cutlass::DeviceAllocation<int> device_cumulative_seqlen_kv;
-  // cutlass::DeviceAllocation<int> device_cumulative_seqlen_kv_cache;
-
-  // struct PagedKVParams {
-  //   cutlass::DeviceAllocation<int> page_table;
-  //   int page_size = 0;
-  //   cutlass::DeviceAllocation<int> num_pages_per_seq;
-  // };
-  // PagedKVParams paged_kv_cache;
-
   //
   // Methods
   //
@@ -328,46 +301,6 @@ struct DecodeRunner {
     return shape;
   }
 
-  // Note that the GemmUniversalAdapter currently doesn't support flash attention, which is why this
-  // secondary `run` function is required to launch the kernel.
-  // static void run(typename FMHADecodeKernel::Params params) {
-  // launch<FMHADecodeKernel>(params);
-  // namespace syclex = sycl::ext::oneapi::experimental;
-  // namespace intelex = sycl::ext::intel::experimental;
-
-  // dim3 const block = FMHADecodeKernel::get_block_shape();
-  // dim3 const grid = FMHADecodeKernel::get_grid_shape(params);
-
-  // // configure smem size and carveout
-  // int smem_size = FMHADecodeKernel::SharedStorageSize;
-
-  // const auto sycl_block = compat::dim3(block.x, block.y, block.z);
-  // const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
-
-  // // Launch parameters depend on whether SYCL compiler supports work-group scratch memory extension
-  // compat::experimental::launch_properties launch_props{
-  //     syclex::work_group_scratch_size(smem_size),
-  // };
-  // compat::experimental::kernel_properties kernel_props{
-  //     syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<256>};
-  // compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
-
-  // sycl::ext::oneapi::experimental::launch_config config(policy.get_range(), policy.get_launch_properties());
-  // auto cgf = [&](::sycl::handler& cgh) {
-  //   auto KernelFunctor =
-  //   compat::experimental::detail::build_kernel_functor<cutlass::device_kernel<FMHADecodeKernel>>(
-  //       cgh, policy, params);
-  //   sycl::ext::oneapi::experimental::detail::
-  //       LaunchConfigAccess<sycl::nd_range<3>, decltype(policy.get_launch_properties())>
-  //           ConfigAccess(config);
-  //   cgh.parallel_for<KernelCur<FMHADecodeKernel>>(
-  //       ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
-  // };
-  // auto stream = at::xpu::getCurrentXPUStream();
-  // auto q = stream.queue();
-  // q.submit(cgf);
-  // }
-
   cutlass::Status run(const Arguments& params, const cutlass::KernelHardwareInfo& hw_info) {
     ProblemShapeType shape = initialize(params);
 
@@ -396,9 +329,6 @@ struct DecodeRunner {
     cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
 
     if (!FMHADecodeKernel::can_implement(arguments)) {
-      // std::cout << "Invalid Problem Size: " << params.b << 'x' << params.num_heads_q << 'x' << params.seq_len_qo
-      //           << 'x' << params.seq_len_kv << 'x' << params.head_size_qk << 'x' << params.head_size_vo
-      //           << (params.is_causal ? "xCausal" : "xNonCausal") << std::endl;
       return cutlass::Status::kErrorInvalidProblem;
     }
 

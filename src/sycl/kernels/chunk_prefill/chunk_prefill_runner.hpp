@@ -9,9 +9,7 @@
 #include "../../comm/common.h"
 #include "../flash_attention/fmha_fusion.hpp"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
-#include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
-#include "cutlass/util/sycl_event_manager.hpp"
 #include "tile_scheduler_chunk_prefill.hpp"
 #include "xe_chunk_prefill.hpp"
 #include "xe_flash_attn_chunk_prefill_epilogue.hpp"
@@ -267,42 +265,6 @@ struct ChunkPrefillRunner {
 
     return problem_shape;
   }
-
-  // Note that the GemmUniversalAdapter currently doesn't support flash attention, which is why this
-  // secondary `run` function is required to launch the kernel.
-  // static void run(typename FMHAChunkPrefillKernel::Params params) {
-  // dim3 const block = FMHAChunkPrefillKernel::get_block_shape();
-  // dim3 const grid = FMHAChunkPrefillKernel::get_grid_shape(params);
-
-  // // configure smem size and carveout
-  // int smem_size = FMHAChunkPrefillKernel::SharedStorageSize;
-
-  // const auto sycl_block = compat::dim3(block.x, block.y, block.z);
-  // const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
-
-  // using namespace compat::experimental;
-  // compat::experimental::launch_properties launch_props{
-  //     sycl::ext::oneapi::experimental::work_group_scratch_size(smem_size),
-  // };
-  // compat::experimental::kernel_properties kernel_props{
-  //     sycl::ext::oneapi::experimental::sub_group_size<FMHAChunkPrefillKernel::DispatchPolicy::SubgroupSize>};
-  // compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
-
-  // sycl::ext::oneapi::experimental::launch_config config(policy.get_range(), policy.get_launch_properties());
-  // auto cgf = [&](::sycl::handler& cgh) {
-  //   auto KernelFunctor =
-  //       compat::experimental::detail::build_kernel_functor<cutlass::device_kernel<FMHAChunkPrefillKernel>>(
-  //           cgh, policy, params);
-  //   sycl::ext::oneapi::experimental::detail::
-  //       LaunchConfigAccess<sycl::nd_range<3>, decltype(policy.get_launch_properties())>
-  //           ConfigAccess(config);
-  //   cgh.parallel_for<KernelCur<FMHAChunkPrefillKernel>>(
-  //       ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
-  // };
-  // auto stream = at::xpu::getCurrentXPUStream();
-  // auto q = stream.queue();
-  // q.submit(cgf);
-  // }
 
   cutlass::Status run(const Flash_fwd_params& params, const cutlass::KernelHardwareInfo& hw_info) {
     ProblemShapeType problem_size = initialize(params);

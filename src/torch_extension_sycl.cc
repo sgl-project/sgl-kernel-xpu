@@ -73,9 +73,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("moe_sum", torch::kXPU, &moe_sum);
 
   m.def(
-      "moe_grouped_mm_nt(Tensor output, Tensor activations, Tensor weights, Tensor? bias, Tensor "
+      "moe_grouped_mm_nt_xe20(Tensor output, Tensor activations, Tensor weights, Tensor? bias, Tensor "
       "total_rows_for_experts, int n_experts, int activation_type, bool fuse_act) -> ()");
-  m.impl("moe_grouped_mm_nt", torch::kXPU, &moe_grouped_mm_nt);
+  m.impl("moe_grouped_mm_nt_xe20", torch::kXPU, &moe_grouped_mm_nt_xe20);
 
   m.def(
       "prepare_moe_input(Tensor topk_ids, Tensor expert_offsets, Tensor? blockscale_offsets, Tensor problem_sizes1,"

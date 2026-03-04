@@ -1,7 +1,7 @@
 from typing import List, Optional, Tuple
 
 import torch
-from sgl_kernel.utils import _get_cache_buf, ceil_align, get_xpu_stream
+from sgl_kernel.utils import _get_cache_buf, get_xpu_stream
 
 
 def awq_dequantize(

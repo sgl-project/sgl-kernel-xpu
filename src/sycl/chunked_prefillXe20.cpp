@@ -1,3 +1,5 @@
+#define SYCL_INTEL_TARGET 20
+
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 #include <c10/xpu/XPUStream.h>
@@ -857,3 +859,4 @@ std::vector<at::Tensor> mha_fwd(
   }
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
+#undef SYCL_INTEL_TARGET

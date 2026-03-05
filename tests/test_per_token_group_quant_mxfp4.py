@@ -25,7 +25,9 @@ FLOAT4_E2M1_MAX = 6.0
 E2M1_EBITS = 2
 E2M1_MBITS = 3  # includes sign bit and implicit one
 E2M1_EMAX = 2 ** (E2M1_EBITS - 1)  # = 2
-E2M1_MAX_NORM = 2 ** E2M1_EMAX * float(2 ** (E2M1_MBITS - 1) - 1) / 2 ** (E2M1_MBITS - 2)  # = 6.0
+E2M1_MAX_NORM = (
+    2**E2M1_EMAX * float(2 ** (E2M1_MBITS - 1) - 1) / 2 ** (E2M1_MBITS - 2)
+)  # = 6.0
 
 FP32_EXPONENT_BIAS = 127
 FP32_MIN_NORMAL = 2 ** (-FP32_EXPONENT_BIAS + 1)  # 2^(-126)
@@ -73,9 +75,9 @@ def _quantize_elemwise_core_e2m1(
 
     Ref: https://github.com/microsoft/microxcaling/blob/main/mx/elemwise_ops.py
     """
-    ebits = E2M1_EBITS      # 2
-    mbits = E2M1_MBITS       # 3
-    max_norm = E2M1_MAX_NORM # 6.0
+    ebits = E2M1_EBITS  # 2
+    mbits = E2M1_MBITS  # 3
+    max_norm = E2M1_MAX_NORM  # 6.0
 
     # min representable exponent: -(2^(ebits-1)) + 2 = 0
     min_exp = -(2 ** (ebits - 1)) + 2  # 0
@@ -84,22 +86,20 @@ def _quantize_elemwise_core_e2m1(
 
     # Per-element private exponent: floor(log2(|A|))
     # Add guard for zeros: log2(0) is -inf, we use (A==0) to avoid that
-    private_exp = torch.floor(
-        torch.log2(torch.abs(A) + (A == 0).type(A.dtype))
-    )
+    private_exp = torch.floor(torch.log2(torch.abs(A) + (A == 0).type(A.dtype)))
     private_exp = private_exp.clip(min=min_exp)
 
     # Left-shift: scale up so mantissa bits land in integer portion
     # out = A / 2^private_exp * 2^(mbits-2)
     shift = mbits - 2  # = 1
-    out = out / (2 ** private_exp) * (2 ** shift)
+    out = out / (2**private_exp) * (2**shift)
 
     # Round mantissa with roundTiesToEven
     out = _round_mantissa_even(out)
 
     # Right-shift: undo scaling
     # out = out / 2^(mbits-2) * 2^private_exp
-    out = out / (2 ** shift) * (2 ** private_exp)
+    out = out / (2**shift) * (2**private_exp)
 
     # Saturate to [-max_norm, max_norm]
     if saturate_normals:
@@ -140,7 +140,9 @@ def quantize_to_e2m1(tensor: torch.Tensor) -> torch.Tensor:
 
     Ref: https://github.com/microsoft/microxcaling/blob/main/mx/elemwise_ops.py
     """
-    quantized_float = _quantize_elemwise_core_e2m1(tensor.float(), saturate_normals=True)
+    quantized_float = _quantize_elemwise_core_e2m1(
+        tensor.float(), saturate_normals=True
+    )
     return _float_to_e2m1_code(quantized_float)
 
 
@@ -250,7 +252,7 @@ def quantize_to_mxfp4(
     scales_ue8m0 = (shared_exp.to(torch.int32) + 127).to(torch.uint8).squeeze(-1)
 
     # Scale elements by shared exponent: A = A / 2^shared_exp
-    scaled_tensor = tensor_blocks / (2.0 ** shared_exp)
+    scaled_tensor = tensor_blocks / (2.0**shared_exp)
 
     # Quantize element-wise with microxcaling core (roundTiesToEven, saturate)
     quantized_float = _quantize_elemwise_core_e2m1(scaled_tensor, saturate_normals=True)
@@ -324,15 +326,15 @@ class TestMXFP4ReferenceQuantization:
         # Midpoint values and their expected quantized results
         # (midpoint_value, expected_dequantized_value)
         midpoint_tests = [
-            (0.25, 0.0),    # midpoint of (0.0, 0.5) -> 0.0 (m=0, even)
-            (0.75, 1.0),    # midpoint of (0.5, 1.0) -> 1.0 (m=0, even)
-            (1.25, 1.0),    # midpoint of (1.0, 1.5) -> 1.0 (m=0, even)
-            (1.75, 2.0),    # midpoint of (1.5, 2.0) -> 2.0 (m=0, even)
-            (2.5, 2.0),     # midpoint of (2.0, 3.0) -> 2.0 (m=0, even)
-            (3.5, 4.0),     # midpoint of (3.0, 4.0) -> 4.0 (m=0, even)
-            (5.0, 4.0),     # midpoint of (4.0, 6.0) -> 4.0 (m=0, even)
+            (0.25, 0.0),  # midpoint of (0.0, 0.5) -> 0.0 (m=0, even)
+            (0.75, 1.0),  # midpoint of (0.5, 1.0) -> 1.0 (m=0, even)
+            (1.25, 1.0),  # midpoint of (1.0, 1.5) -> 1.0 (m=0, even)
+            (1.75, 2.0),  # midpoint of (1.5, 2.0) -> 2.0 (m=0, even)
+            (2.5, 2.0),  # midpoint of (2.0, 3.0) -> 2.0 (m=0, even)
+            (3.5, 4.0),  # midpoint of (3.0, 4.0) -> 4.0 (m=0, even)
+            (5.0, 4.0),  # midpoint of (4.0, 6.0) -> 4.0 (m=0, even)
             # Negative midpoints
-            (-0.25, 0.0),   # -> -0.0 = 0.0
+            (-0.25, 0.0),  # -> -0.0 = 0.0
             (-0.75, -1.0),
             (-1.25, -1.0),
             (-1.75, -2.0),
@@ -439,17 +441,15 @@ class TestPerTokenGroupQuantFP4XPU:
         if not q_match:
             q_mismatches = (x_q_xpu_norm != x_q_ref_norm).sum().item()
             total = x_q_ref_norm.numel()
-            assert q_mismatches / total < 0.05, (
-                f"Too many quantized value mismatches: {q_mismatches}/{total}"
-            )
+            assert (
+                q_mismatches / total < 0.05
+            ), f"Too many quantized value mismatches: {q_mismatches}/{total}"
 
         # Compare scale exponents (allow ±1 difference due to rounding)
         scale_exp_ref = scales_ref.to(torch.int32) - 127
         scale_exp_xpu = scales_xpu_cpu.to(torch.int32) - 127
         exp_diff = (scale_exp_ref - scale_exp_xpu).abs()
-        assert (
-            exp_diff.max() == 0
-        ), f"Scale exponent difference: {exp_diff.max()}"
+        assert exp_diff.max() == 0, f"Scale exponent difference: {exp_diff.max()}"
 
         # Compare dequantized outputs
         x_dq_ref = dequantize_mxfp4(x_q_ref, scales_ref, torch.float32, group_size)
@@ -499,8 +499,22 @@ class TestPerTokenGroupQuantFP4XPU:
         # Create a tensor of exactly 32 elements (one group) containing
         # midpoint values. Scale will be 1.0 (exponent=0) since max abs is 5.0
         # which maps to scale = 2^(floor(log2(5.0)) - 2) = 2^(2 - 2) = 2^0 = 1.0
-        midpoints = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0,
-                     -0.25, -0.75, -1.25, -1.75, -2.5, -3.5, -5.0]
+        midpoints = [
+            0.25,
+            0.75,
+            1.25,
+            1.75,
+            2.5,
+            3.5,
+            5.0,
+            -0.25,
+            -0.75,
+            -1.25,
+            -1.75,
+            -2.5,
+            -3.5,
+            -5.0,
+        ]
         # Pad to 32 elements with zeros
         padded = midpoints + [0.0] * (32 - len(midpoints))
         x = torch.tensor([padded], dtype=torch.float32, device=self.device)

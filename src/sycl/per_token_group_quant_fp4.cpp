@@ -251,16 +251,21 @@ void sgl_per_token_group_quant_fp4(
 
   TORCH_CHECK(
       output_q.scalar_type() == at::ScalarType::Byte,
-      "output_q must be uint8 (packed FP4), got ", output_q.scalar_type());
+      "output_q must be uint8 (packed FP4), got ",
+      output_q.scalar_type());
   TORCH_CHECK(
       output_s.scalar_type() == at::ScalarType::Byte,
-      "output_s must be uint8 (UE8M0 scales), got ", output_s.scalar_type());
+      "output_s must be uint8 (UE8M0 scales), got ",
+      output_s.scalar_type());
 
   TORCH_CHECK(input.dim() >= 1, "input must have at least 1 dimension");
   TORCH_CHECK(
       input.size(-1) % group_size == 0,
-      "sgl_per_token_group_quant_fp4: last dimension of input (", input.size(-1),
-      ") must be divisible by group_size (", group_size, ")");
+      "sgl_per_token_group_quant_fp4: last dimension of input (",
+      input.size(-1),
+      ") must be divisible by group_size (",
+      group_size,
+      ")");
 
   const int num_groups = input.numel() / group_size;
 

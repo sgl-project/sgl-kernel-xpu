@@ -20,7 +20,9 @@ FLOAT4_E2M1_MAX = 6.0
 E2M1_EBITS = 2
 E2M1_MBITS = 3  # includes sign bit and implicit one
 E2M1_EMAX = 2 ** (E2M1_EBITS - 1)  # = 2
-E2M1_MAX_NORM = 2 ** E2M1_EMAX * float(2 ** (E2M1_MBITS - 1) - 1) / 2 ** (E2M1_MBITS - 2)  # = 6.0
+E2M1_MAX_NORM = (
+    2**E2M1_EMAX * float(2 ** (E2M1_MBITS - 1) - 1) / 2 ** (E2M1_MBITS - 2)
+)  # = 6.0
 
 FP32_EXPONENT_BIAS = 127
 FP32_MIN_NORMAL = 2 ** (-FP32_EXPONENT_BIAS + 1)  # 2^(-126)
@@ -73,9 +75,9 @@ def _quantize_elemwise_core_e2m1(
 
     Ref: https://github.com/microsoft/microxcaling/blob/main/mx/elemwise_ops.py
     """
-    ebits = E2M1_EBITS      # 2
-    mbits = E2M1_MBITS       # 3
-    max_norm = E2M1_MAX_NORM # 6.0
+    ebits = E2M1_EBITS  # 2
+    mbits = E2M1_MBITS  # 3
+    max_norm = E2M1_MAX_NORM  # 6.0
 
     # min representable exponent: -(2^(ebits-1)) + 2 = 0
     min_exp = -(2 ** (ebits - 1)) + 2  # 0
@@ -84,22 +86,20 @@ def _quantize_elemwise_core_e2m1(
 
     # Per-element private exponent: floor(log2(|A|))
     # Add guard for zeros: log2(0) is -inf, we use (A==0) to avoid that
-    private_exp = torch.floor(
-        torch.log2(torch.abs(A) + (A == 0).type(A.dtype))
-    )
+    private_exp = torch.floor(torch.log2(torch.abs(A) + (A == 0).type(A.dtype)))
     private_exp = private_exp.clip(min=min_exp)
 
     # Left-shift: scale up so mantissa bits land in integer portion
     # out = A / 2^private_exp * 2^(mbits-2)
     shift = mbits - 2  # = 1
-    out = out / (2 ** private_exp) * (2 ** shift)
+    out = out / (2**private_exp) * (2**shift)
 
     # Round mantissa with roundTiesToEven
     out = _round_mantissa_even(out)
 
     # Right-shift: undo scaling
     # out = out / 2^(mbits-2) * 2^private_exp
-    out = out / (2 ** shift) * (2 ** private_exp)
+    out = out / (2**shift) * (2**private_exp)
 
     # Saturate to [-max_norm, max_norm]
     if saturate_normals:
@@ -139,7 +139,9 @@ def quantize_to_e2m1(tensor: torch.Tensor) -> torch.Tensor:
 
     Ref: https://github.com/microsoft/microxcaling/blob/main/mx/elemwise_ops.py
     """
-    quantized_float = _quantize_elemwise_core_e2m1(tensor.float(), saturate_normals=True)
+    quantized_float = _quantize_elemwise_core_e2m1(
+        tensor.float(), saturate_normals=True
+    )
     return _float_to_e2m1_code(quantized_float)
 
 
@@ -249,7 +251,7 @@ def quantize_to_mxfp4_ref(
     scales_ue8m0 = (shared_exp.to(torch.int32) + 127).to(torch.uint8).squeeze(-1)
 
     # Scale elements by shared exponent: A = A / 2^shared_exp
-    scaled_tensor = tensor_blocks / (2.0 ** shared_exp)
+    scaled_tensor = tensor_blocks / (2.0**shared_exp)
 
     # Quantize element-wise with microxcaling core (roundTiesToEven, saturate)
     quantized_float = _quantize_elemwise_core_e2m1(scaled_tensor, saturate_normals=True)
@@ -342,9 +344,7 @@ def calculate_diff(
             f"  \u2705 Quantized values match (batch={batch_size}, seq={seq_len}, hidden={hidden_dim}, group={group_size}, dtype={src_dtype})"
         )
     else:
-        q_mismatches = (
-            (x_q_ref_norm != x_q_sgl_norm).sum().item() if not q_match else 0
-        )
+        q_mismatches = (x_q_ref_norm != x_q_sgl_norm).sum().item() if not q_match else 0
         s_mismatches = (
             (x_s_ref.cpu() != x_s_sgl.cpu()).sum().item() if not s_match else 0
         )

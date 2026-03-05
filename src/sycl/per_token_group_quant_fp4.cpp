@@ -17,6 +17,10 @@
  * Two FP4 values are packed into a single uint8_t:
  *   - Lower nibble (bits 0-3): First value
  *   - Upper nibble (bits 4-7): Second value
+ *
+ * Rounding: Per OCP MX spec (section 5.3.3), FP4 conversion uses
+ * roundTiesToEven — at midpoints between representable values, the
+ * value with even mantissa (mantissa bit = 0) is chosen.
  */
 
 #include <ATen/ATen.h>
@@ -34,7 +38,7 @@ namespace at::native::xpu {
 constexpr float FLOAT4_E2M1_MAX = 6.0f;
 
 template <typename T>
-inline T QuantGroupReduceMaxFP4(T val, sycl::nd_item<1> item, int lane_id_in_quant_group) {
+inline T QuantGroupReduceMaxFP4(T val, sycl::nd_item<1> item) {
   auto sg = item.get_sub_group();
 
   val = sycl::fmax(val, sycl::permute_group_by_xor(sg, val, 8));
@@ -48,22 +52,46 @@ inline T QuantGroupReduceMaxFP4(T val, sycl::nd_item<1> item, int lane_id_in_qua
 // E2M1 format (4-bit float): 1 sign bit, 2 exponent bits, 1 mantissa bit
 // Encoding: exp=00 (subnormal), exp=01/10/11 (normal with bias=1)
 // Result: bits[3]=sign, bits[2:1]=exponent, bits[0]=mantissa
+//
+// Representable values and their codes:
+//   0.0 -> 0b000   (subnormal, m=0, even)
+//   0.5 -> 0b001   (subnormal, m=1, odd)
+//   1.0 -> 0b010   (e=01, m=0, even)
+//   1.5 -> 0b011   (e=01, m=1, odd)
+//   2.0 -> 0b100   (e=10, m=0, even)
+//   3.0 -> 0b101   (e=10, m=1, odd)
+//   4.0 -> 0b110   (e=11, m=0, even)
+//   6.0 -> 0b111   (e=11, m=1, odd)
+//
+// RoundTiesToEven: At exact midpoints between two representable values,
+// we round to the one whose mantissa bit is 0 (even).
+//
+// Midpoints and their rounding targets:
+//   0.25  -> midpoint of (0.0, 0.5)  -> round to 0.0  (m=0, even)
+//   0.75  -> midpoint of (0.5, 1.0)  -> round to 1.0  (m=0, even)
+//   1.25  -> midpoint of (1.0, 1.5)  -> round to 1.0  (m=0, even)
+//   1.75  -> midpoint of (1.5, 2.0)  -> round to 2.0  (m=0, even)
+//   2.5   -> midpoint of (2.0, 3.0)  -> round to 2.0  (m=0, even)
+//   3.5   -> midpoint of (3.0, 4.0)  -> round to 4.0  (m=0, even)
+//   5.0   -> midpoint of (4.0, 6.0)  -> round to 4.0  (m=0, even)
 inline uint8_t quantize_to_e2m1(float val) {
   uint8_t sign = (val < 0.0f) ? 1 : 0;
   float abs_val = sycl::fabs(val);
 
   uint8_t code;
+  // RoundTiesToEven: at midpoints, round to the value with even mantissa (m=0).
+  // Midpoints use strict < for the upper bound so ties go to the even value.
   if (abs_val <= 0.25f) {
     code = 0b000;  // 0.0 (subnormal: exp=00, m=0)
-  } else if (abs_val <= 0.75f) {
+  } else if (abs_val < 0.75f) {
     code = 0b001;  // 0.5 (subnormal: exp=00, m=1)
   } else if (abs_val <= 1.25f) {
     code = 0b010;  // 1.0 (exp=01, m=0)
-  } else if (abs_val <= 1.75f) {
+  } else if (abs_val < 1.75f) {
     code = 0b011;  // 1.5 (exp=01, m=1)
   } else if (abs_val <= 2.5f) {
     code = 0b100;  // 2.0 (exp=10, m=0)
-  } else if (abs_val <= 3.5f) {
+  } else if (abs_val < 3.5f) {
     code = 0b101;  // 3.0 (exp=10, m=1)
   } else if (abs_val <= 5.0f) {
     code = 0b110;  // 4.0 (exp=11, m=0)
@@ -147,16 +175,19 @@ struct PerTokenGroupQuantFP4Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     }
 
     // Reduce across the threads in the quantization group to find the maximum
-    local_absmax = QuantGroupReduceMaxFP4(local_absmax, item, lane_id);
+    local_absmax = QuantGroupReduceMaxFP4(local_absmax, item);
 
-    float log2_scale = sycl::ceil(sycl::log2(sycl::fmax(local_absmax / FLOAT4_E2M1_MAX, 1e-10f)));
+    // Shared exponent per OCP MX spec / Microsoft micro-scaling:
+    //   shared_exp = floor(log2(absmax)) - E2M1_EMAX
+    // where E2M1_EMAX = 2.  eps already lower-limits local_absmax so
+    // log2 is well-defined.
+    float log2_scale = sycl::floor(sycl::log2(local_absmax)) - 2.0f;
     int clamped_exponent = sycl::clamp(static_cast<int>(log2_scale), -127, 127);
     float scale_value = sycl::exp2(static_cast<float>(clamped_exponent));
 
-    // Store scale as UE8M0: exponent + 127 bias
-    uint8_t scale_ue8m0 = static_cast<uint8_t>(clamped_exponent + 127);
-
     if (lane_id == 0) {
+      // Store scale as UE8M0: exponent + 127 bias
+      uint8_t scale_ue8m0 = static_cast<uint8_t>(clamped_exponent + 127);
       *scale_output = scale_ue8m0;
     }
 
@@ -181,7 +212,8 @@ struct PerTokenGroupQuantFP4Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
           uint8_t q1 = quantize_to_e2m1(val1);
 
           // Pack: first value in lower nibble, second in upper nibble
-          packed_output[j / 2] = (q0 & 0x0F) | ((q1 & 0x0F) << 4);
+          // No masking needed — quantize_to_e2m1 returns values in [0, 15]
+          packed_output[j / 2] = q0 | (q1 << 4);
         }
 
         // Store packed output
@@ -209,7 +241,7 @@ void sgl_per_token_group_quant_fp4(
   CHECK_CONTIGUOUS(input);
   CHECK_CONTIGUOUS(output_q);
 
-  TORCH_CHECK(group_size == 32, "sgl_per_token_group_quant_fp4: group_size must be 32 for MXFP4", group_size);
+  TORCH_CHECK(group_size == 32, "sgl_per_token_group_quant_fp4: group_size must be 32 for MXFP4, got ", group_size);
 
   TORCH_CHECK(
       input.scalar_type() == at::ScalarType::Half || input.scalar_type() == at::ScalarType::BFloat16 ||
@@ -217,14 +249,29 @@ void sgl_per_token_group_quant_fp4(
       "sgl_per_token_group_quant_fp4: input dtype must be Float16, BFloat16, or Float32, got ",
       input.scalar_type());
 
-  TORCH_CHECK(output_q.scalar_type() == at::ScalarType::Byte, "output_q must be uint8 (packed FP4)");
-  TORCH_CHECK(output_s.scalar_type() == at::ScalarType::Byte, "output_s must be uint8 (UE8M0 scales)");
+  TORCH_CHECK(
+      output_q.scalar_type() == at::ScalarType::Byte,
+      "output_q must be uint8 (packed FP4), got ", output_q.scalar_type());
+  TORCH_CHECK(
+      output_s.scalar_type() == at::ScalarType::Byte,
+      "output_s must be uint8 (UE8M0 scales), got ", output_s.scalar_type());
+
+  TORCH_CHECK(input.dim() >= 1, "input must have at least 1 dimension");
+  TORCH_CHECK(
+      input.size(-1) % group_size == 0,
+      "sgl_per_token_group_quant_fp4: last dimension of input (", input.size(-1),
+      ") must be divisible by group_size (", group_size, ")");
 
   const int num_groups = input.numel() / group_size;
-  CHECK_EQ(input.numel() % group_size, 0);
 
   // Output should be half the size (2 FP4 values per byte)
   CHECK_EQ(output_q.numel(), input.numel() / 2);
+
+  // Ensure eps is positive to prevent NaN from log2(0)
+  float eps_f = static_cast<float>(eps);
+  if (eps_f <= 0.0f) {
+    eps_f = 1e-10f;
+  }
 
   auto queue = dpcppGetCurrentQueue();
 
@@ -256,7 +303,7 @@ void sgl_per_token_group_quant_fp4(
         static_cast<uint8_t*>(output_s.data_ptr()),               \
         num_groups,                                               \
         groups_per_block,                                         \
-        static_cast<float>(eps));                                 \
+        eps_f);                                                   \
     sycl_kernel_submit(global_range, local_range, queue, kernel); \
   } while (0)
 

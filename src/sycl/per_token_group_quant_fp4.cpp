@@ -314,19 +314,7 @@ void sgl_per_token_group_quant_fp4(
 
 #define LAUNCH_FP4_KERNEL(T)                                        \
   do {                                                              \
-    switch (group_size) {                                           \
-      case 32:                                                      \
-        LAUNCH_FP4_KERNEL_WITH_GROUP_SIZE(T, 32);                   \
-        break;                                                      \
-      case 64:                                                      \
-        LAUNCH_FP4_KERNEL_WITH_GROUP_SIZE(T, 64);                   \
-        break;                                                      \
-      case 128:                                                     \
-        LAUNCH_FP4_KERNEL_WITH_GROUP_SIZE(T, 128);                  \
-        break;                                                      \
-      default:                                                      \
-        TORCH_CHECK(false, "Unsupported group_size: ", group_size); \
-    }                                                               \
+    LAUNCH_FP4_KERNEL_WITH_GROUP_SIZE(T, 32);                       \
   } while (0)
 
   // Dispatch based on input type

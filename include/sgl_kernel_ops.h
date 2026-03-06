@@ -256,13 +256,6 @@ torch::Tensor int8_scaled_mm(
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype,
     const c10::optional<torch::Tensor>& bias);
-torch::Tensor fp8_scaled_mm(
-    const torch::Tensor& mat_a,
-    const torch::Tensor& mat_b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const torch::Dtype& out_dtype,
-    const c10::optional<torch::Tensor>& bias);
 torch::Tensor fp8_blockwise_scaled_mm(
     const torch::Tensor& mat_a,
     const torch::Tensor& mat_b,
@@ -837,4 +830,11 @@ void moe_grouped_mm_nt_xe35(
 
 void dsv3_router_gemm_xpu(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
 void dsv3_fused_a_gemm_xpu(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
+torch::Tensor fp8_scaled_mm_xpu(
+    const torch::Tensor& mat_a,
+    const torch::Tensor& mat_b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const torch::Dtype& out_dtype,
+    const c10::optional<torch::Tensor>& bias);
 #endif

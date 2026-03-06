@@ -134,6 +134,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("dsv3_router_gemm", torch::kXPU, &dsv3_router_gemm_xpu);
   m.def("dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
   m.impl("dsv3_fused_a_gemm", torch::kXPU, &dsv3_fused_a_gemm_xpu);
+  m.def(
+      "fp8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? "
+      "bias) -> Tensor");
+  m.impl("fp8_scaled_mm", torch::kXPU, &fp8_scaled_mm_xpu);
 #endif
 
   m.def(

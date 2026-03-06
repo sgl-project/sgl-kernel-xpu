@@ -43,7 +43,6 @@
 #include "cutlass/util/reference/device/tensor_compare.h"
 #include "cutlass/util/reference/host/tensor_fill.h"
 #include "cutlass/util/sycl_event_manager.hpp"
-#include <cmath>
 
 #pragma clang diagnostic ignored "-Wpass-failed"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -364,8 +363,7 @@ struct MoEMainloop<
         constexpr float kAlpha = 0.044715f;
         float x_cube = x * x * x;
         float tanh_arg = kBeta * (x + kAlpha * x_cube);
-        float e2x = sycl::native::exp(2.0f * tanh_arg);
-        s = e2x / (e2x + 1.0f);
+        s = 0.5f * (1.0f + std::tanh(tanh_arg));
       }
       tCrC0(i) = x * s * y;
     }

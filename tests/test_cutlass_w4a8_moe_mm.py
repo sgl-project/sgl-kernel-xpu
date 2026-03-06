@@ -1,10 +1,11 @@
 import pytest
 import torch
+import utils
 from sgl_kernel import cutlass_w4a8_moe_mm, sgl_per_tensor_quant_fp8
 from utils import is_hopper
-import utils
 
 device = utils.get_device()
+
 
 def pack_int4_values_to_int8(int4_values_interleaved: torch.Tensor) -> torch.Tensor:
     if int4_values_interleaved.shape[-1] % 2 != 0:

@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 import torch
+import utils
 from sgl_kernel import awq_marlin_repack, gptq_marlin_repack
 from sgl_kernel.scalar_type import scalar_types
 
@@ -12,7 +13,6 @@ from sglang.srt.layers.quantization.utils import (
     sort_weights,
 )
 from sglang.test.test_marlin_utils import get_weight_perm, marlin_weights
-import utils
 
 device = utils.get_device()
 GPTQ_MARLIN_TILE = 16
@@ -74,7 +74,7 @@ def test_awq_marlin_repack_correct(num_bits, k_tiles, n_tiles, group_size):
     q_w_marlin = marlin_weights(q_w, size_k, size_n, num_bits, weight_perm)
 
     out_gpu = awq_marlin_repack(q_w_awq, size_k, size_n, num_bits)
-    assert out_gpu.device.type == torch.accelerator.current_accelerator().type 
+    assert out_gpu.device.type == torch.accelerator.current_accelerator().type
     assert out_gpu.dtype == torch.int32
 
     expected_cols = size_n * tile_k // pack_factor

@@ -1,11 +1,11 @@
 import pytest
 import torch
+import utils
 from sgl_kernel import gptq_marlin_gemm
 from sgl_kernel.scalar_type import scalar_types
 
 from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
-import utils
 
 device = utils.get_device()
 MNK_FACTORS = [

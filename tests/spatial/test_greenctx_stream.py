@@ -1,10 +1,11 @@
 import pytest
 import torch
 import torch.nn.functional as F
-from sgl_kernel import create_greenctx_stream_by_value, get_sm_available
 import utils
+from sgl_kernel import create_greenctx_stream_by_value, get_sm_available
 
 device = utils.get_device()
+
 
 def test_green_ctx():
     A = torch.randn(5120, 5120).to(device)

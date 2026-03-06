@@ -5,12 +5,12 @@ from typing import Optional, Tuple
 import pytest
 import torch
 import triton
+import utils
 from sgl_kernel.flash_mla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
     get_mla_metadata,
 )
-import utils
 
 device = utils.get_device()
 # ================ prefill usage ================ #
@@ -370,7 +370,10 @@ def test_flashmla_prefill(
     torch.testing.assert_close(ans_lse, ref_lse, atol=1e-6, rtol=2.01 / 65536)
 
 
-@pytest.mark.skipif(torch.cuda.is_available() and not is_sm90_supported(), reason="SM90 required for FP8 support")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and not is_sm90_supported(),
+    reason="SM90 required for FP8 support",
+)
 @pytest.mark.parametrize("b", B_DECODE)
 @pytest.mark.parametrize("s_q", S_Q_DECODE)
 @pytest.mark.parametrize("s_k", S_K_DECODE)
@@ -521,7 +524,10 @@ def test_flash_mla_decode(
     torch.testing.assert_close(lse_ans, lse_ref, atol=1e-6, rtol=8.01 / 65536)
 
 
-@pytest.mark.skipif(torch.cuda.is_available() and not is_sm90_supported(), reason="SM90 required for FP8 support")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and not is_sm90_supported(),
+    reason="SM90 required for FP8 support",
+)
 @pytest.mark.parametrize("b", [128])
 @pytest.mark.parametrize("s_q", [1, 2])
 @pytest.mark.parametrize("mean_sk", [4096, 8192, 16384])

@@ -3,12 +3,13 @@ import math
 import pytest
 import torch
 import torch.nn.functional as F
+import utils
 from einops import rearrange, repeat
 from scipy.linalg import hadamard
 from sgl_kernel import hadamard_transform
-import utils
 
 device = utils.get_device()
+
 
 def hadamard_transform_ref(x, scale=1.0):
     """

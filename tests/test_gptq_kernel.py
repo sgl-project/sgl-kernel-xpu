@@ -1,11 +1,12 @@
 import pytest
 import torch
+import utils
 from sgl_kernel import gptq_gemm
 
 from sglang.srt.layers.quantization.utils import pack_cols, pack_rows
-import utils
 
 device = utils.get_device()
+
 
 def torch_dequantize(q_weight, q_zeros, scales, g_idx, use_shuffle, bit, K, N):
     assert bit == 4, "Reference dequantization only supports 4-bit"

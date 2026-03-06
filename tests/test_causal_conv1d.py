@@ -2,9 +2,9 @@
 from typing import Optional
 
 import torch
+import utils
 from sgl_kernel import causal_conv1d_fwd
 from sgl_kernel import causal_conv1d_update as causal_conv1d_update_kernel
-import utils
 
 device = utils.get_device()
 

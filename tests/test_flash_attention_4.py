@@ -9,8 +9,8 @@ from functools import partial
 import pytest
 import torch
 import torch.nn.functional as F
-from einops import rearrange, repeat
 import utils
+from einops import rearrange, repeat
 
 device = utils.get_device()
 
@@ -30,7 +30,10 @@ flash_attn_varlen_func = partial(flash_attn_varlen_func, ver=4)
 flash_attn_with_kvcache = partial(flash_attn_with_kvcache, ver=4)
 
 # Skip this test on Hopper machine
-skip_condition = torch.cuda.is_available() and torch.cuda.get_device_capability() < (10, 0)
+skip_condition = torch.cuda.is_available() and torch.cuda.get_device_capability() < (
+    10,
+    0,
+)
 
 
 def unpad_input(hidden_states, attention_mask, unused_mask=None):

@@ -3,10 +3,11 @@ from typing import Tuple
 
 import pytest
 import torch
-from sgl_kernel import es_fp8_blockwise_scaled_grouped_mm
 import utils
+from sgl_kernel import es_fp8_blockwise_scaled_grouped_mm
 
 device = utils.get_device()
+
 
 def cdiv(a: int, b: int) -> int:
     return -(a // -b)

@@ -1,10 +1,11 @@
 import pytest
 import torch
 import torch.nn.functional as F
-from sgl_kernel import reconstruct_indices_from_tree_mask
 import utils
+from sgl_kernel import reconstruct_indices_from_tree_mask
 
 device = utils.get_device()
+
 
 def test_reconstruct_indices_from_tree_mask():
     bs = 1

@@ -1,5 +1,6 @@
 import pytest
 import torch
+import utils
 from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer,
     transfer_kv_all_layer_direct_lf_pf,
@@ -12,9 +13,9 @@ from sgl_kernel.kvcacheio import (
 )
 
 from sglang.srt.utils import is_hip
-import utils
 
 device = utils.get_device()
+
 
 def ref_copy_with_indices(src_pool, dst_pool, src_indices, dst_indices):
     dst_pool[dst_indices] = src_pool[src_indices].to(dst_pool.device)
@@ -83,7 +84,7 @@ def test_transfer_kv(
 
     original_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
-    device=device
+    device = device
     torch.manual_seed(42)
 
     num_layers = 4  # A small number of layers for pool creation
@@ -317,7 +318,7 @@ def test_transfer_kv_pf_direct(
 ):
     original_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
-    device=device
+    device = device
     torch.manual_seed(42)
 
     num_layers = 4
@@ -531,7 +532,7 @@ def test_transfer_kv_page_head(
 ):
     original_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
-    device=device
+    device = device
     torch.manual_seed(42)
 
     num_layers = 4

@@ -1,10 +1,11 @@
 import pytest
 import torch
 import torch.nn.functional as F
-from sgl_kernel import dsv3_fused_a_gemm
 import utils
+from sgl_kernel import dsv3_fused_a_gemm
 
 device = utils.get_device()
+
 
 @pytest.mark.parametrize("num_tokens", [i + 1 for i in range(16)])
 def test_dsv3_fused_a_gemm(num_tokens):

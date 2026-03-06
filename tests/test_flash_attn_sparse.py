@@ -3,6 +3,7 @@ from typing import List, Optional, Tuple
 
 import pytest
 import torch
+import utils
 from einops import rearrange, repeat
 from sgl_kernel.sparse_flash_attn import (
     convert_vertical_slash_indexes,
@@ -10,9 +11,9 @@ from sgl_kernel.sparse_flash_attn import (
     sparse_attn_func,
 )
 from test_flash_attention import construct_local_mask, is_fa3_supported
-import utils
 
 device = utils.get_device()
+
 
 def ref_attn(
     q,

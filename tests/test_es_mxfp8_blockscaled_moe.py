@@ -2,11 +2,11 @@ import random
 
 import pytest
 import torch
+import utils
 from sgl_kernel import (
     es_sm100_mxfp8_blockscaled_grouped_mm,
     es_sm100_mxfp8_blockscaled_grouped_quant,
 )
-import utils
 
 device = utils.get_device()
 

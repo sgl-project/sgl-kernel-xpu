@@ -161,23 +161,6 @@ def test_norm_non_contiguous(batch_size, hidden_size, dtype):
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
-# @pytest.mark.parametrize("batch_size", [1, 19, 99])
-# @pytest.mark.parametrize("hidden_size", [512, 1024, 3072])
-# @pytest.mark.parametrize("dtype", [torch.float16])
-# def test_fused_add_rmsnorm_non_contiguous(batch_size, hidden_size, dtype):
-#     eps = 1e-6
-#     x_nc = _make_non_contiguous(batch_size, hidden_size, dtype)
-#     residual = torch.randn(batch_size, hidden_size, device=device, dtype=dtype)
-#     w = torch.randn(hidden_size, device=device, dtype=dtype)
-
-#     x_ref, res_ref = fused_add_rms_norm(x_nc.clone(), residual.clone(), w, eps)
-
-#     sgl_kernel.fused_add_rmsnorm(x_nc, residual, w, eps)
-
-#     torch.testing.assert_close(x_nc, x_ref, rtol=1e-3, atol=1e-3)
-#     torch.testing.assert_close(residual, res_ref, rtol=1e-3, atol=1e-3)
-
-
 @pytest.mark.parametrize("batch_size", [1, 19, 99])
 @pytest.mark.parametrize("hidden_size", [512, 1024, 3072])
 @pytest.mark.parametrize("dtype", [torch.float16])

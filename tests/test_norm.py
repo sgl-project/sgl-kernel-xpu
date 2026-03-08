@@ -138,6 +138,7 @@ def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype):
 # Non-contiguous input tests (DeepSeek split pattern: stride[0] != hidden_size)
 ###############################################################################
 
+
 def _make_non_contiguous(batch_size, hidden_size, dtype, extra=64):
     """Create a non-contiguous tensor by slicing a larger tensor,
     mimicking latent_cache.split([hidden_size, extra], dim=-1)[0]."""

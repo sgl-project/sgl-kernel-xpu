@@ -384,31 +384,64 @@ def fused_experts(
 
     activation_type = 0 if activation == "silu" else 1
 
-    # for xe20, silu_and_mul is fused into moe_grouped_mm_nt
     assert is_xe2_arch(), f"Current MoE is only supported on BMG"
-    intermediate_cache1 = torch.empty(
-        (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
-    )
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
-        intermediate_cache1,
-        input_A_shuffle,
-        w1,
-        b1,
-        expert_offsets,
-        E,
-        activation_type,
-        fuse_act=True,
-    )
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
-        intermediate_cache3,
-        intermediate_cache1,
-        w2,
-        b2,
-        expert_offsets,
-        E,
-        activation_type,
-        fuse_act=False,
-    )
+
+    # heuristic for choosing fused or unfused act, can be tuned
+    avg_m = (M * TopK) // E
+    big_weight = K * N > 4096 * 4096
+    use_unfused_act = avg_m <= 128 and big_weight
+    if use_unfused_act:
+        intermediate_cache1 = torch.empty(
+            (M * TopK, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype
+        )
+        intermediate_cache2 = torch.empty(
+            (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
+        )
+        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+            intermediate_cache1,
+            input_A_shuffle,
+            w1,
+            b1,
+            expert_offsets,
+            E,
+            activation_type,
+            fuse_act=False,
+        )
+        torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
+        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+            intermediate_cache3,
+            intermediate_cache2,
+            w2,
+            b2,
+            expert_offsets,
+            E,
+            activation_type,
+            fuse_act=False,
+        )
+    else:
+        intermediate_cache1 = torch.empty(
+            (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
+        )
+        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+            intermediate_cache1,
+            input_A_shuffle,
+            w1,
+            b1,
+            expert_offsets,
+            E,
+            activation_type,
+            fuse_act=True,
+        )
+        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+            intermediate_cache3,
+            intermediate_cache1,
+            w2,
+            b2,
+            expert_offsets,
+            E,
+            activation_type,
+            fuse_act=False,
+        )
 
     torch.ops.sgl_kernel.apply_shuffle_mul_sum.default(
         intermediate_cache3, out_hidden_states, c_map, topk_weights

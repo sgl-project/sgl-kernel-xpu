@@ -105,7 +105,7 @@ Please read our [Contributing Guidelines](./CONTRIBUTING.md) before submitting a
 )
 ```
 
-2. Add benchmarks using [triton benchmark](https://triton-lang.org/main/python-api/generated/triton.testing.Benchmark.html) in [benchmark/](https://github.com/sgl-project/sglang/tree/main/sgl-kernel/benchmark)
+2. Add benchmarks using [triton benchmark](https://triton-lang.org/main/python-api/generated/triton.testing.Benchmark.html) in [benchmark/](https://github.com/sgl-project/sgl-kernel-xpu/tree/main/benchmark)
 3. Run test suite
 
 ### Release new version

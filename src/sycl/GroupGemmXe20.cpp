@@ -200,7 +200,7 @@ void moe_grouped_mm_nt_xe20(
   } else if (avg_m <= 128) {
     if (fuse_act) {
       DISPATCH_MOE(
-          activation_type, true, with_bias, Shape<_128, _128, _32>, Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>);
+          activation_type, true, with_bias, Shape<_128, _64, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
     } else {
       DISPATCH_MOE(
           activation_type, false, with_bias, Shape<_128, _128, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
@@ -208,10 +208,10 @@ void moe_grouped_mm_nt_xe20(
   } else {
     if (fuse_act) {
       DISPATCH_MOE(
-          activation_type, true, with_bias, Shape<_256, _128, _32>, Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>);
+          activation_type, true, with_bias, Shape<_256, _64, _32>, Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>);
     } else {
       DISPATCH_MOE(
-          activation_type, false, with_bias, Shape<_256, _128, _32>, Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>);
+          activation_type, false, with_bias, Shape<_256, _256, _32>, Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>);
     }
   }
 }

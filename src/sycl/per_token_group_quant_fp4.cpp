@@ -312,9 +312,9 @@ void sgl_per_token_group_quant_fp4(
     sycl_kernel_submit(global_range, local_range, queue, kernel); \
   } while (0)
 
-#define LAUNCH_FP4_KERNEL(T)                                        \
-  do {                                                              \
-    LAUNCH_FP4_KERNEL_WITH_GROUP_SIZE(T, 32);                       \
+#define LAUNCH_FP4_KERNEL(T)                  \
+  do {                                        \
+    LAUNCH_FP4_KERNEL_WITH_GROUP_SIZE(T, 32); \
   } while (0)
 
   // Dispatch based on input type

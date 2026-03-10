@@ -547,19 +547,14 @@ std::vector<at::Tensor> mha_fwd(
   int const head_size_v = v.size(-1);
   int const num_heads_k = k.size(-2);
   float softmax_scale = softmax_scale_;
-  int num_pages = 0;
-  int page_size = 0;
-  int max_num_pages_per_seq = 0;
-  int batch_size_k = cu_seqlens_k.size(0) - 1;
-  int seqlen_k = max_seqlen_k;
-  int total_k = k.size(0);
-  if (page_table.has_value()) {
-    num_pages = k.size(0);
-    page_size = k.size(1);
-    max_num_pages_per_seq = page_table.value().size(1);
-    batch_size_k = page_table.value().size(0);
-    seqlen_k = max_num_pages_per_seq * page_size;
-    total_k = num_pages * page_size;
+  const bool has_page_table = page_table.has_value();
+  int num_pages = has_page_table ? k.size(0) : 0;
+  int page_size = has_page_table ? k.size(1) : 0;
+  int max_num_pages_per_seq = has_page_table ? page_table.value().size(1) : 0;
+  int batch_size_k = has_page_table ? page_table.value().size(0) : cu_seqlens_k.size(0) - 1;
+  int seqlen_k = has_page_table ? max_num_pages_per_seq * page_size : max_seqlen_k;
+  int total_k = has_page_table ? num_pages * page_size : k.size(0);
+  if (has_page_table) {
     CHECK_SHAPE(page_table.value(), batch_size_k, max_num_pages_per_seq);
     CHECK_SHAPE(k, num_pages, page_size, num_heads_k, head_size);
     CHECK_SHAPE(v, num_pages, page_size, num_heads_k, head_size_v);

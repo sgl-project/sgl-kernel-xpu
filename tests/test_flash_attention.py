@@ -7,6 +7,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
+import utils
+
+device = utils.get_device()
 
 apply_rotary_emb = None
 
@@ -1106,10 +1109,6 @@ def test_flash_attn_varlen_output(
     has_sink,
 ):
     from sgl_kernel.flash_attn import flash_attn_varlen_func
-import utils
-
-
-device = utils.get_device()
     # set seed
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
     # batch_size = 40

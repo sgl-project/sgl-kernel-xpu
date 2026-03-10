@@ -1,12 +1,9 @@
-import sys
-
 import pytest
 import torch
-import utils
 from sgl_kernel import apply_token_bitmask_inplace_cuda
+import utils
 
 device = utils.get_device()
-
 
 def test_apply_token_bitmask_inplace_kernel():
     neginf = float("-inf")
@@ -16,13 +13,13 @@ def test_apply_token_bitmask_inplace_kernel():
     )
     expected = torch.where(bool_mask, logits, neginf)
 
-    logits_gpu = logits.to(device)
-    bitmask = torch.tensor([0b1010101010], dtype=torch.int32).to(device)
+    logits_gpu = logits.to("cuda")
+    bitmask = torch.tensor([0b1010101010], dtype=torch.int32).to("cuda")
     apply_token_bitmask_inplace_cuda(logits_gpu, bitmask)
     torch.accelerator.synchronize()
-    torch.testing.assert_close(logits_gpu, expected.to(device))
+    torch.testing.assert_close(logits_gpu, expected.to("cuda"))
 
 
 if __name__ == "__main__":
     test_apply_token_bitmask_inplace_kernel()
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

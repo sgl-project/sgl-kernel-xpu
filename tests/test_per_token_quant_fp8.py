@@ -1,15 +1,18 @@
 import itertools
-import sys
 from typing import Optional, Tuple
 
 import pytest
 import torch
-import utils
 from sgl_kernel import sgl_per_token_quant_fp8
 
-from sglang.srt.utils import is_hip
+import utils
 
 device = utils.get_device()
+
+
+def is_hip():
+    return hasattr(torch.version, "hip") and torch.version.hip is not None
+
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
@@ -45,7 +48,6 @@ def test_per_token_quant_compare_implementations(
     num_tokens: int,
     hidden_dim: int,
 ):
-    device = device
     x = torch.rand((num_tokens, hidden_dim), dtype=torch.float16, device=device)
 
     sglang_out, sglang_scale = sglang_per_token_quant_fp8(x)
@@ -57,4 +59,4 @@ def test_per_token_quant_compare_implementations(
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

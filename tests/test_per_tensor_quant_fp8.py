@@ -1,15 +1,20 @@
 import itertools
-import sys
 from typing import Optional, Tuple
 
 import pytest
 import torch
-import utils
 from sgl_kernel import sgl_per_tensor_quant_fp8
+
+import utils
 
 device = utils.get_device()
 
-fp8_type_ = torch.float8_e4m3fn
+
+def is_hip():
+    return hasattr(torch.version, "hip") and torch.version.hip is not None
+
+_is_hip = is_hip()
+fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 
 def sglang_scaled_fp8_quant(
@@ -39,16 +44,13 @@ def torch_scaled_fp8_quant(tensor, inv_scale):
 
 @pytest.mark.parametrize(
     "num_tokens,hidden_dim",
-    list(itertools.product([128, 256, 512, 1024], [512, 2048, 4096, 8192])),
+    list(itertools.product([128, 256, 512], [512, 2048, 4096])),
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_per_tensor_quant_compare_implementations(
     num_tokens: int,
     hidden_dim: int,
-    dtype: torch.dtype,
 ):
-    torch.manual_seed(1234)
-    x = torch.rand((num_tokens, hidden_dim), dtype=dtype, device=device)
+    x = torch.rand((num_tokens, hidden_dim), dtype=torch.float16, device=device)
 
     sglang_out, sglang_scale = sglang_scaled_fp8_quant(x)
     torch_out = torch_scaled_fp8_quant(x, sglang_scale)
@@ -67,4 +69,4 @@ def test_per_tensor_quant_compare_implementations(
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

@@ -1,11 +1,10 @@
 import pytest
 import torch
 import torch.nn.functional as F
-import utils
 from sgl_kernel import dsv3_router_gemm
+import utils
 
 device = utils.get_device()
-
 
 @pytest.mark.parametrize("num_tokens", [i + 1 for i in range(16)])
 @pytest.mark.parametrize("num_experts", [256, 384])

@@ -3,11 +3,10 @@ from typing import Tuple
 
 import pytest
 import torch
-import utils
 from sgl_kernel import es_fp8_blockwise_scaled_grouped_mm
+import utils
 
 device = utils.get_device()
-
 
 def cdiv(a: int, b: int) -> int:
     return -(a // -b)
@@ -108,7 +107,6 @@ def is_sm90_supported(device=None) -> bool:
 @pytest.mark.parametrize("num_experts", [8, 16, 32, 64, 128])
 @pytest.mark.parametrize("out_dtype", [torch.half, torch.bfloat16])
 def test_fp8_blockwise_scaled_grouped_mm(num_experts, out_dtype):
-    device = device
     alignment = 128
     n_g = random.randint(1, 64) * alignment
     k_g = random.randint(1, 64) * alignment

@@ -1,11 +1,10 @@
 import pytest
 import torch
-import utils
 from sgl_kernel import cutlass_w4a8_moe_mm, sgl_per_tensor_quant_fp8
 from utils import is_hopper
+import utils
 
 device = utils.get_device()
-
 
 def pack_int4_values_to_int8(int4_values_interleaved: torch.Tensor) -> torch.Tensor:
     if int4_values_interleaved.shape[-1] % 2 != 0:
@@ -61,7 +60,6 @@ def test_int4_fp8_grouped_gemm_single_expert(batch_size):
     n = 1024  # output dimension
     torch.manual_seed(0)
     dtype = torch.bfloat16
-    device = device
     debug = False
 
     print(f"\nTesting with batch_size={batch_size}")
@@ -166,7 +164,6 @@ def _per_tensor_quant_fp8(
 def test_int4_fp8_grouped_gemm_multi_experts(batch_size, k, n, num_experts):
     torch.manual_seed(0)
     dtype = torch.bfloat16
-    device = device
     debug = False
 
     print(

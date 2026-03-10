@@ -2,11 +2,10 @@ import itertools
 
 import pytest
 import torch
-import utils
 from sgl_kernel import topk_sigmoid
+import utils
 
 device = utils.get_device()
-
 
 @pytest.mark.parametrize(
     "num_tokens, num_experts, topk",

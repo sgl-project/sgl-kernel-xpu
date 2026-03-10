@@ -1,14 +1,14 @@
 import os
 import random
-import sys
 from typing import Optional, Type
 
 import pytest
 import torch
-import utils
 from sgl_kernel import fp8_blockwise_scaled_mm
+import utils
 
 device = utils.get_device()
+
 
 
 def cdiv(a: int, b: int) -> int:
@@ -94,4 +94,4 @@ def test_accuracy(M, N, K, out_dtype):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

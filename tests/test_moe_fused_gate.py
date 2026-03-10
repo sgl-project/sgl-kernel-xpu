@@ -1,21 +1,13 @@
-import sys
-from typing import (
-    TYPE_CHECKING,
-    Callable,
-    NamedTuple,
-    Optional,
-    Protocol,
-    TypeGuard,
-    runtime_checkable,
-)
+from typing import Optional
 
 import pytest
 import torch
 from sgl_kernel import moe_fused_gate
+import utils
 
+device = utils.get_device()
 
-@torch.compile
-def biased_grouped_topk_native(
+def biased_grouped_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -25,7 +17,6 @@ def biased_grouped_topk_native(
     topk_group: Optional[int] = None,
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
-    num_token_non_padded: Optional[torch.Tensor] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
@@ -52,37 +43,83 @@ def biased_grouped_topk_native(
     tmp_scores = scores_for_choice.masked_fill(
         ~score_mask.bool(), float("-inf")
     )  # [n, e]
-    # TODO: NPU can't support directly evaluating a comparison for now
-    _, topk_ids = torch.topk(
-        tmp_scores,
-        k=topk,
-        dim=-1,
-        sorted=(True if num_fused_shared_experts > 0 else False),
-    )
-    topk_weights = scores.gather(1, topk_ids)
 
-    if num_fused_shared_experts:
-        topk_ids[:, -1] = torch.randint(
-            low=num_experts,
-            high=num_experts + num_fused_shared_experts,
-            size=(topk_ids.size(0),),
-            dtype=topk_ids.dtype,
-            device=topk_ids.device,
+    topk_excluding_shared = topk - num_fused_shared_experts
+    _, routed_topk_ids = torch.topk(
+        tmp_scores,
+        k=topk_excluding_shared,
+        dim=-1,
+        sorted=False,
+    )
+    routed_topk_weights = scores.gather(1, routed_topk_ids)
+
+    if num_fused_shared_experts > 0:
+        topk_ids = torch.empty(
+            (num_token, topk),
+            dtype=routed_topk_ids.dtype,
+            device=routed_topk_ids.device,
         )
-        topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
+        topk_weights = torch.empty(
+            (num_token, topk),
+            dtype=routed_topk_weights.dtype,
+            device=routed_topk_weights.device,
+        )
+        topk_ids[:, :topk_excluding_shared] = routed_topk_ids
+        topk_weights[:, :topk_excluding_shared] = routed_topk_weights
+
+        scale = 1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+        routed_sum = routed_topk_weights.sum(dim=-1, keepdim=True)
+
+        for i in range(num_fused_shared_experts):
+            topk_ids[:, topk_excluding_shared + i] = num_experts + i
+            topk_weights[:, topk_excluding_shared + i] = routed_sum[:, 0] / scale
+    else:
+        topk_ids = routed_topk_ids
+        topk_weights = routed_topk_weights
 
     if renormalize:
-        topk_weights_sum = (
-            topk_weights.sum(dim=-1, keepdim=True)
-            if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
-        )
+        if num_fused_shared_experts > 0:
+            topk_weights_sum = topk_weights[:, :topk_excluding_shared].sum(
+                dim=-1, keepdim=True
+            )
+        else:
+            topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True)
         topk_weights = topk_weights / topk_weights_sum
         if apply_routed_scaling_factor_on_output:
-            topk_weights *= routed_scaling_factor
+            scale = (
+                1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+            )
+            topk_weights *= scale
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     return topk_weights, topk_ids
+
+
+def biased_grouped_topk(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: Optional[float] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+):
+    return biased_grouped_topk_impl(
+        hidden_states,
+        gating_output,
+        correction_bias,
+        topk,
+        renormalize,
+        num_expert_group,
+        topk_group,
+        num_fused_shared_experts=num_fused_shared_experts,
+        routed_scaling_factor=routed_scaling_factor,
+        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+    )
 
 
 @pytest.mark.parametrize(
@@ -98,8 +135,7 @@ def biased_grouped_topk_native(
         (512, 16, 8, 16),
     ],
 )
-# @pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
-@pytest.mark.parametrize("num_fused_shared_experts", [0])
+@pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
 @pytest.mark.parametrize("apply_routed_scaling_factor_on_output", [False, True])
 def test_moe_fused_gate_combined(
     seq_length, params, num_fused_shared_experts, apply_routed_scaling_factor_on_output
@@ -108,10 +144,11 @@ def test_moe_fused_gate_combined(
     dtype = torch.float32
 
     torch.manual_seed(seq_length)
-    tensor = torch.rand((seq_length, num_experts), dtype=dtype, device="xpu")
+    tensor = torch.rand((seq_length, num_experts), dtype=dtype, device=device)
     scores = tensor.clone()
-    bias = torch.rand(num_experts, dtype=dtype, device="xpu")
+    bias = torch.rand(num_experts, dtype=dtype, device=device)
     topk = topk + num_fused_shared_experts
+
     output, indices = moe_fused_gate(
         tensor,
         bias,
@@ -122,7 +159,7 @@ def test_moe_fused_gate_combined(
         routed_scaling_factor=2.5,
         apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
     )
-    ref_output, ref_indices = biased_grouped_topk_native(
+    ref_output, ref_indices = biased_grouped_topk(
         scores,
         scores,
         bias,
@@ -173,7 +210,6 @@ def test_moe_fused_gate_combined(
         f"Indices mismatch at seq_length {seq_length}, dtype {dtype}, "
         f"params {params}, num_fused_shared_experts {num_fused_shared_experts}"
     )
-
     assert output_check, (
         f"Output mismatch at seq_length {seq_length}, dtype {dtype}, "
         f"params {params}, num_fused_shared_experts {num_fused_shared_experts}"
@@ -181,4 +217,4 @@ def test_moe_fused_gate_combined(
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

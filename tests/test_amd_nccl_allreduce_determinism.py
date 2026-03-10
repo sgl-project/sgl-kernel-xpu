@@ -31,11 +31,11 @@ def get_open_port():
 
 
 def worker(world_size, rank, port):
-    device = torch.device(f"{device}:{rank}")
-    torch.accelerator.set_device_index(device)
-    backend = torch.distributed.get_default_backend_for_device(device)
+    rank_device = torch.device(f"{device.type}:{rank}")
+    torch.accelerator.set_device_index(rank)
+
     dist.init_process_group(
-        backend=backend,
+        backend=torch.distributed.get_default_backend_for_device(rank_device),
         init_method=f"tcp://localhost:{port}",
         rank=rank,
         world_size=world_size,
@@ -53,8 +53,8 @@ def worker(world_size, rank, port):
 
     # Create fixed inputs for all trials
     # Single request: (hidden_dim,)
-    base_input = torch.randn(hidden_dim, dtype=torch.bfloat16, device=device)
-    base_input_rand = torch.randn(hidden_dim, dtype=torch.bfloat16, device=device)
+    base_input = torch.randn(hidden_dim, dtype=torch.bfloat16, device=rank_device)
+    base_input_rand = torch.randn(hidden_dim, dtype=torch.bfloat16, device=rank_device)
 
     dist.barrier()
 
@@ -200,7 +200,7 @@ def main():
 
 @pytest.mark.skipif(
     not torch.accelerator.is_available() or torch.accelerator.device_count() < 2,
-    reason="Requires at least 2 GPUs",
+    reason="Requires at least 2 CUDA GPUs",
 )
 def test_nccl_allreduce_determinism():
     """Test NCCL all-reduce determinism behavior with varying batch sizes."""

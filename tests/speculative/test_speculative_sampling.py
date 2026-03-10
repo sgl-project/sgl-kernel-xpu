@@ -1,8 +1,9 @@
 import pytest
 import torch
 import torch.nn.functional as F
-import utils
 from sgl_kernel import tree_speculative_sampling_target_only
+import utils
+
 
 device = utils.get_device()
 
@@ -38,8 +39,6 @@ def test_tree_speculative_sampling_target_only(
     """
     Tests the tree_speculative_sampling_target_only function using Pytest parameterization.
     """
-    device = device
-
     candidates = torch.tensor(
         [
             [0, 1, 2, 3, 4, 5],

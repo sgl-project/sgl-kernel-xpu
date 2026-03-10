@@ -2,28 +2,26 @@ import ctypes
 import multiprocessing as mp
 import random
 import socket
-import sys
 import unittest
 from typing import Any, List, Optional
 
 import sgl_kernel.allreduce as custom_ops
 import torch
 import torch.distributed as dist
-import utils
 from torch.distributed import ProcessGroup
-
-from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
+import utils
 
 device = utils.get_device()
 
+from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
+
 
 def _run_correctness_worker(world_size, rank, distributed_init_port, test_sizes):
-    device = torch.device(f"{device}:{rank}")
-    torch.accelerator.set_device_index(device)
+    rank_device = torch.device(f"{device.type}:{rank}")
+    torch.accelerator.set_device_index(rank)
     distributed_init_method = f"tcp://localhost:{distributed_init_port}"
-    backend = torch.distributed.get_default_backend_for_device(device)
     dist.init_process_group(
-        backend=backend,
+        backend=torch.distributed.get_default_backend_for_device(rank_device),
         init_method=distributed_init_method,
         rank=rank,
         world_size=world_size,
@@ -31,7 +29,7 @@ def _run_correctness_worker(world_size, rank, distributed_init_port, test_sizes)
     group = dist.group.WORLD
 
     try:
-        device = torch.device(f"{device}:{rank}")
+        rank_device = torch.device(f"{device.type}:{rank}")
         max_size = 8192 * 1024
         meta_ptrs = TestCustomAllReduce.create_shared_buffer(
             custom_ops.meta_size() + max_size, group=group
@@ -130,7 +128,7 @@ class TestCustomAllReduce(unittest.TestCase):
         rank = dist.get_rank(group=group)
 
         handle_bytes = ctypes.string_at(ctypes.addressof(handle), ctypes.sizeof(handle))
-        input_tensor = torch.ByteTensor(list(handle_bytes)).to(f"{device}:{rank}")
+        input_tensor = torch.ByteTensor(list(handle_bytes)).to(f"{device.type}:{rank}")
         gathered_tensors = [torch.empty_like(input_tensor) for _ in range(world_size)]
         dist.all_gather(gathered_tensors, input_tensor, group=group)
 
@@ -187,4 +185,4 @@ class TestCustomAllReduce(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    unittest.main()

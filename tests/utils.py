@@ -11,9 +11,8 @@ def get_device():
     return device
 
 
-def is_sm10x():
-    return torch.cuda.get_device_capability() >= (10, 0)
-
-
-def is_hopper():
-    return torch.cuda.get_device_capability() == (9, 0)
+precision = {
+    torch.bfloat16: 1e-2,
+    torch.float16: 1e-3,
+    torch.float32: 1e-5,
+}

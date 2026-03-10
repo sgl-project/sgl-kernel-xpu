@@ -577,6 +577,7 @@ def test_flash_attn_varlen_output(
         causal or local
     ):  # Right now we only support causal attention with seqlen_k == seqlen_q
         seqlen_k = seqlen_q
+    device = device
     # set seed
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
     batch_size = 49 if seqlen_q <= 1024 else 7
@@ -979,6 +980,7 @@ def test_flash_attn_kvcache(
         pytest.skip()
     if rotary_fraction == 0.0 and has_rotary_seqlens:
         pytest.skip()
+    device = device
     # set seed
     torch.random.manual_seed(0)
     batch_size = 5

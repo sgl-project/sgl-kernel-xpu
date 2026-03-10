@@ -1,12 +1,16 @@
+import sys
+
 import pytest
 import torch
-from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
 import utils
+from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
 
 device = utils.get_device()
 
-
-skip_condition = torch.cuda.get_device_capability() < (10, 0)
+skip_condition = torch.cuda.is_available() and torch.cuda.get_device_capability() < (
+    10,
+    0,
+)
 
 DTYPES = [torch.float16, torch.bfloat16]
 # m, n, k
@@ -144,7 +148,8 @@ def test_nvfp4_gemm(
         m,
         n,
         dtype,
-        block_size, device,
+        block_size,
+        device,
     )
     out = cutlass_scaled_fp4_mm(
         a_fp4, b_fp4, a_scale_interleaved, b_scale_interleaved, alpha, dtype
@@ -154,4 +159,4 @@ def test_nvfp4_gemm(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

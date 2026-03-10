@@ -1,10 +1,11 @@
 import pytest
 import sgl_kernel
 import torch
-from sgl_kernel.elementwise import copy_to_gpu_no_ce
 import utils
+from sgl_kernel.elementwise import copy_to_gpu_no_ce
 
 device = utils.get_device()
+
 
 @pytest.mark.parametrize("size", [64, 72])
 def test_copy_to_gpu_no_ce(size):

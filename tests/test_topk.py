@@ -2,15 +2,14 @@ from typing import Any, Optional
 
 import pytest
 import torch
+import utils
 from sgl_kernel import (
     fast_topk_transform_fused,
     fast_topk_transform_ragged_fused,
     fast_topk_v2,
 )
-import utils
 
 device = utils.get_device()
-
 
 
 def _ref_torch_impl(

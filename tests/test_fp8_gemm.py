@@ -1,10 +1,11 @@
+import sys
+
 import pytest
 import torch
-from sgl_kernel import fp8_scaled_mm
 import utils
+from sgl_kernel import fp8_scaled_mm
 
 device = utils.get_device()
-
 
 
 def torch_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias):
@@ -50,4 +51,4 @@ def test_accuracy(M, N, K, with_bias, out_dtype):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

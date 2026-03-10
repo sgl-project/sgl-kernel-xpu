@@ -2,18 +2,16 @@ import random
 
 import pytest
 import torch
+import utils
 from sgl_kernel import (
     es_sm100_mxfp8_blockscaled_grouped_mm,
     es_sm100_mxfp8_blockscaled_grouped_quant,
 )
-import utils
 
 device = utils.get_device()
 
-
 random.seed(42)
 torch.manual_seed(42)
-torch.cuda.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 
 
@@ -36,12 +34,13 @@ def is_sm100_supported(device=None) -> bool:
 
 
 @pytest.mark.skipif(
-    not is_sm100_supported(),
+    torch.cuda.is_available() and not is_sm100_supported(),
     reason="test_es_sm100_mxfp8_blockscaled_grouped_mm at sgl-kernel is only supported on sm100",
 )
 @pytest.mark.parametrize("num_experts", [8, 16, 32, 64])
 @pytest.mark.parametrize("out_dtype", [torch.half, torch.bfloat16])
 def test_es_sm100_mxfp8_blockscaled_grouped_mm(num_experts, out_dtype):
+    device = device
     alignment = 128
     n_g = random.randint(1, 64) * alignment
     k_g = random.randint(1, 64) * alignment

@@ -33,11 +33,11 @@ def get_open_port():
 
 
 def worker(world_size, rank, port):
-    rank_device = torch.device(f"{device.type}:{rank}")
-    torch.accelerator.set_device_index(rank)
-
+    device = torch.device(f"{device}:{rank}")
+    torch.accelerator.set_device_index(device)
+    backend = torch.distributed.get_default_backend_for_device(device)
     dist.init_process_group(
-        backend="nccl",
+        backend=backend,
         init_method=f"tcp://localhost:{port}",
         rank=rank,
         world_size=world_size,
@@ -272,7 +272,7 @@ def main():
 
 @pytest.mark.skipif(
     not torch.accelerator.is_available() or torch.accelerator.device_count() < 2,
-    reason="Requires at least 2 CUDA GPUs",
+    reason="Requires at least 2 GPUs",
 )
 def test_deterministic_custom_allreduce():
     """Test that deterministic custom all-reduce produces consistent results."""

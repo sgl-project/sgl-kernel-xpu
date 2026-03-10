@@ -19,11 +19,12 @@ class MscclContextSelection(IntEnum):
 
 
 def _run_correctness_worker(world_size, rank, distributed_init_port, test_sizes):
-    rank_device = torch.device(f"{device.type}:{rank % torch.accelerator.device_count()}")
-    torch.accelerator.set_device_index(rank % torch.accelerator.device_count())
+    device = torch.device(f"{device}:{rank % torch.accelerator.device_count()}")
+    torch.accelerator.set_device_index(device)
     distributed_init_method = f"tcp://localhost:{distributed_init_port}"
+    backend = torch.distributed.get_default_backend_for_device(device)
     dist.init_process_group(
-        backend="nccl",
+        backend=backend,
         init_method=distributed_init_method,
         rank=rank,
         world_size=world_size,
@@ -44,10 +45,12 @@ def _run_correctness_worker(world_size, rank, distributed_init_port, test_sizes)
         rank_to_ib[r] = rank % 8
     MAX_BYTES = 2**20
     scratch = torch.empty(
-        MAX_BYTES * 8, dtype=torch.bfloat16, device=rank_device
+        MAX_BYTES * 8,
+        dtype=torch.bfloat16,
+        device=torch.accelerator.current_accelerator(),
     )
     put_buffer = torch.empty(
-        MAX_BYTES, dtype=torch.bfloat16, device=rank_device
+        MAX_BYTES, dtype=torch.bfloat16, device=torch.accelerator.current_accelerator()
     )
     print(f"[{rank}] start mscclpp_context init")
     nranks_per_node = torch.accelerator.device_count()

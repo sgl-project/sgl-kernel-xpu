@@ -332,7 +332,12 @@ def benchmark(
     bench_lambda = lambda: api_func(**api_kwargs)
 
     quantiles = [0.5, 0.2, 0.8]
-    ms, _, _ = triton.testing.do_bench(bench_lambda, quantiles=quantiles)
+    ms, _, _ = triton.testing.do_bench(
+        bench_lambda,
+        warmup=200,
+        rep=300,
+        quantiles=quantiles,
+    )
 
     torch.xpu.empty_cache()
     del x, w1, w2, input_gating

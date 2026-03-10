@@ -82,8 +82,8 @@ def torch_naive_moe(
             [1, 4, 33, 64, 222],  # num_tokens
             [1, 2, 6],  # topk
             [8, 64],  #  num_experts
-            [128, 1024],  # hidden_size
-            [128, 512, 1024],  # intermediate_size
+            [1024, 4096],  # hidden_size
+            [512, 1024, 4096],  # intermediate_size
             [False, True],  # with_bias
             ["silu", "gelu"],  # act_type
         )
@@ -94,7 +94,7 @@ def test_moe_gemm(
 ):
     torch.xpu.manual_seed_all(0)
 
-    rtol, atol = 1e-1, 1e-2
+    rtol, atol = 1e-4, 1e-3
     a = create_random_xpu_tensor((num_tokens, hidden_size), torch.bfloat16)
     w1 = create_random_xpu_tensor(
         (num_experts, 2 * intermediate_size, hidden_size), torch.bfloat16

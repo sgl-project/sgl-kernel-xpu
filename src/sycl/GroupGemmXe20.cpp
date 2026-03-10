@@ -187,31 +187,32 @@ void moe_grouped_mm_nt_xe20(
   at::Tensor atomic_buffer = at::empty({static_cast<long>(1)}, activations.options().dtype(at::kInt));
   bool with_bias = bias.has_value();
   void* bias_ptr = with_bias ? bias->data_ptr() : nullptr;
+  bool small_weight = (int64_t)gemm_k * gemm_n <= (int64_t)4096 * 4096;  // heuristic for small K*N, can be tuned
 
   if (avg_m <= 8) {
     DISPATCH_MOE(
         activation_type, fuse_act, with_bias, Shape<_8, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
-  } else if (avg_m <= 16) {
+  } else if (avg_m <= 16 && small_weight) {
     DISPATCH_MOE(
         activation_type, fuse_act, with_bias, Shape<_16, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
-  } else if (avg_m <= 32) {
+  } else if (avg_m <= 32 && small_weight) {
     DISPATCH_MOE(
         activation_type, fuse_act, with_bias, Shape<_32, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
-  } else if (avg_m <= 128) {
+  } else if (avg_m <= 128 && small_weight) {
     if (fuse_act) {
       DISPATCH_MOE(
-          activation_type, true, with_bias, Shape<_128, _32, _32>, Layout<Shape<_2, _8, _1>, Stride<_8, _1, _0>>);
+          activation_type, true, with_bias, Shape<_128, _64, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
     } else {
       DISPATCH_MOE(
-          activation_type, false, with_bias, Shape<_128, _64, _32>, Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>);
+          activation_type, false, with_bias, Shape<_128, _128, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
     }
   } else {
     if (fuse_act) {
       DISPATCH_MOE(
-          activation_type, true, with_bias, Shape<_256, _32, _32>, Layout<Shape<_4, _8, _1>, Stride<_8, _1, _0>>);
+          activation_type, true, with_bias, Shape<_256, _64, _32>, Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>);
     } else {
       DISPATCH_MOE(
-          activation_type, false, with_bias, Shape<_256, _128, _32>, Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>);
+          activation_type, false, with_bias, Shape<_256, _256, _32>, Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>);
     }
   }
 }

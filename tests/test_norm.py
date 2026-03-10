@@ -8,6 +8,7 @@ import utils
 
 device = utils.get_device()
 
+
 def llama_rms_norm(x, w, eps=1e-6):
     orig_dtype = x.dtype
     x = x.float()
@@ -57,8 +58,8 @@ def fused_add_rms_norm(x, residual, weight, eps):
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("specify_out", [True, False])
 def test_norm(batch_size, hidden_size, dtype, specify_out):
-    x = torch.randn(batch_size, hidden_size).to(0).to(dtype)
-    w = torch.randn(hidden_size).to(0).to(dtype)
+    x = torch.randn(batch_size, hidden_size).to(device).to(dtype)
+    w = torch.randn(hidden_size).to(device).to(dtype)
 
     y_ref = llama_rms_norm(x, w)
     enable_pdl = is_arch_support_pdl()
@@ -101,8 +102,8 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("specify_out", [True, False])
 def test_gemma_norm(batch_size, hidden_size, dtype, specify_out):
-    x = torch.randn(batch_size, hidden_size).to(0).to(dtype)
-    w = torch.randn(hidden_size).to(0).to(dtype)
+    x = torch.randn(batch_size, hidden_size).to(device).to(dtype)
+    w = torch.randn(hidden_size).to(device).to(dtype)
 
     y_ref = gemma_rms_norm(x, w)
     enable_pdl = is_arch_support_pdl()

@@ -5,6 +5,8 @@ import utils
 
 device = utils.get_device()
 
+
+
 def test_apply_token_bitmask_inplace_kernel():
     neginf = float("-inf")
     bool_mask = torch.tensor([0, 1, 0, 1, 0, 1, 0, 1, 0, 1], dtype=torch.bool)
@@ -13,11 +15,11 @@ def test_apply_token_bitmask_inplace_kernel():
     )
     expected = torch.where(bool_mask, logits, neginf)
 
-    logits_gpu = logits.to("cuda")
-    bitmask = torch.tensor([0b1010101010], dtype=torch.int32).to("cuda")
+    logits_gpu = logits.to(device)
+    bitmask = torch.tensor([0b1010101010], dtype=torch.int32).to(device)
     apply_token_bitmask_inplace_cuda(logits_gpu, bitmask)
     torch.accelerator.synchronize()
-    torch.testing.assert_close(logits_gpu, expected.to("cuda"))
+    torch.testing.assert_close(logits_gpu, expected.to(device))
 
 
 if __name__ == "__main__":

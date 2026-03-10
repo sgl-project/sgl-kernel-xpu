@@ -6,6 +6,8 @@ import utils
 
 device = utils.get_device()
 
+
+
 def to_int8(tensor: torch.Tensor) -> torch.Tensor:
     return torch.round(tensor.clamp(min=-128, max=127)).to(dtype=torch.int8)
 
@@ -43,7 +45,7 @@ def _test_accuracy_once(M, N, K, with_bias, out_dtype, device):
 @pytest.mark.parametrize("with_bias", [True, False])
 @pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16])
 def test_accuracy(M, N, K, with_bias, out_dtype):
-    _test_accuracy_once(M, N, K, with_bias, out_dtype, "cuda")
+    _test_accuracy_once(M, N, K, with_bias, out_dtype, device)
 
 
 if __name__ == "__main__":

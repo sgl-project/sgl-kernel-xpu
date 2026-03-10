@@ -407,7 +407,12 @@ def fused_experts(
             activation_type,
             fuse_act=False,
         )
-        torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
+        if activation == "silu":
+            torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
+        elif activation == "gelu":
+            torch.ops.sgl_kernel.gelu_tanh_and_mul(intermediate_cache2, intermediate_cache1)
+        else:
+            raise ValueError(f"Unsupported activation {activation}")
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
             intermediate_cache3,
             intermediate_cache2,

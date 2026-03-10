@@ -187,7 +187,7 @@ void moe_grouped_mm_nt_xe20(
   at::Tensor atomic_buffer = at::empty({static_cast<long>(1)}, activations.options().dtype(at::kInt));
   bool with_bias = bias.has_value();
   void* bias_ptr = with_bias ? bias->data_ptr() : nullptr;
-  bool small_weight = gemm_k * gemm_n <= 4096 * 4096;  // heuristic for small K*N, can be tuned
+  bool small_weight = (int64_t)gemm_k * gemm_n <= (int64_t)4096 * 4096;  // heuristic for small K*N, can be tuned
 
   if (avg_m <= 8) {
     DISPATCH_MOE(

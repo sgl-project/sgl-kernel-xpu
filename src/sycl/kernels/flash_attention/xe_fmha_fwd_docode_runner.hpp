@@ -41,10 +41,6 @@
 
 #include "../../Utils.h"
 #include "../../comm/common.h"
-// #include "cutlass/epilogue/collective/default_epilogue.hpp"
-// #include "cutlass/gemm/device/gemm_universal_adapter.h"
-// #include "cutlass/util/GPU_Clock.hpp"
-// #include "cutlass/util/command_line.h"
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
 #include "fmha_fusion.hpp"

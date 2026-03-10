@@ -81,6 +81,7 @@ inline uint8_t quantize_to_e2m1(float val) {
   uint8_t code;
   // RoundTiesToEven: at midpoints, round to the value with even mantissa (m=0).
   // Midpoints use strict < for the upper bound so ties go to the even value.
+  // TODO(sspintel): Optimize this logic under a LUT to avoid branch divergence
   if (abs_val <= 0.25f) {
     code = 0b000;  // 0.0 (subnormal: exp=00, m=0)
   } else if (abs_val < 0.75f) {

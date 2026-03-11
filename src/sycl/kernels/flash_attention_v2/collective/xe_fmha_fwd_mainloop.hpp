@@ -185,7 +185,6 @@ struct FMHAFwdMainloop<
     ElementS const scale;
     int const* ptr_page_table = nullptr;
     int page_size = 0;
-    // int const* num_pages_per_seq = nullptr;
     int max_num_pages_per_seq = 0;
   };
 

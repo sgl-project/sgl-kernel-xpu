@@ -5,11 +5,11 @@
 
 #include <cute/tensor.hpp>
 
+#include "cutlass/epilogue/collective/default_epilogue.hpp"
+#include "cutlass/util/packed_stride.hpp"
 #include "sycl/Utils.h"
 #include "sycl/comm/common.h"
 #include "sycl/kernels/flash_attention_v2/collective/fmha_fusion.hpp"
-#include "cutlass/epilogue/collective/default_epilogue.hpp"
-#include "cutlass/util/packed_stride.hpp"
 #include "tile_scheduler_chunk_prefill.hpp"
 #include "xe_chunk_prefill.hpp"
 #include "xe_flash_attn_chunk_prefill_epilogue.hpp"
@@ -469,25 +469,23 @@ std::vector<at::Tensor> mha_fwd(
   TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
   TORCH_CHECK(v.scalar_type() == q_type, "query and value must have the same dtype");
 
-  CHECK_DEVICE(q);
-  CHECK_DEVICE(k);
-  CHECK_DEVICE(v);
+  CHECK_INPUT(q);
+  CHECK_INPUT(k);
+  CHECK_INPUT(v);
 
   TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
   TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
   TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
 
-  CHECK_DEVICE(page_table);
+  CHECK_INPUT(page_table);
   TORCH_CHECK(page_table.dtype() == torch::kInt32, "page_table must have dtype torch.int32");
   TORCH_CHECK(page_table.stride(-1) == 1, "page_table must have contiguous last dimension");
 
   TORCH_CHECK(q.dim() == 3, "query must be in ragged format");
-  CHECK_DEVICE(cu_seqlens_q);
-  CHECK_CONTIGUOUS(cu_seqlens_q);
+  CHECK_INPUT(cu_seqlens_q);
   TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype torch.int32");
 
-  CHECK_DEVICE(cu_seqlens_k);
-  CHECK_CONTIGUOUS(cu_seqlens_k);
+  CHECK_INPUT(cu_seqlens_k);
   TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype torch.int32");
 
   auto const sizes = q.sizes();
@@ -536,8 +534,7 @@ std::vector<at::Tensor> mha_fwd(
   if (leftpad_k_.has_value()) {
     auto leftpad_k = leftpad_k_.value();
     TORCH_CHECK(leftpad_k.dtype() == torch::kInt32, "leftpad_k must have dtype int32");
-    CHECK_DEVICE(leftpad_k);
-    CHECK_CONTIGUOUS(leftpad_k);
+    CHECK_INPUT(leftpad_k);
     CHECK_SHAPE(leftpad_k, batch_size);
   }
 
@@ -641,7 +638,7 @@ std::vector<at::Tensor> mha_fwd(
     TORCH_CHECK(false, "q_v is not supported yet");
     at::Tensor q_v = q_v_.value();
     TORCH_CHECK(q_v.dtype() == q_type, "q_v must have the same dtype as query");
-    CHECK_DEVICE(q_v);
+    CHECK_INPUT(q_v);
     TORCH_CHECK(q_v.stride(-1) == 1, "q_v tensor must have contiguous last dimension");
     CHECK_SHAPE(q_v, total_q, num_heads, head_size_v);
     params.qv_ptr = q_v.data_ptr();
@@ -652,8 +649,7 @@ std::vector<at::Tensor> mha_fwd(
 
   if (rotary_cos_.has_value()) {
     auto rotary_cos = rotary_cos_.value();
-    CHECK_DEVICE(rotary_cos);
-    CHECK_CONTIGUOUS(rotary_cos);
+    CHECK_INPUT(rotary_cos);
     params.rotary_dim = rotary_cos.size(1) * 2;
     TORCH_CHECK(params.rotary_dim <= head_size, "rotary_dim must be <= headdim");
     TORCH_CHECK(params.rotary_dim % 16 == 0, "Only rotary dimensions divisible by 16 are currently supported");
@@ -664,8 +660,7 @@ std::vector<at::Tensor> mha_fwd(
 
     TORCH_CHECK(rotary_sin_.has_value(), "If rotary cos is provided, rotary sin must also be provided");
     auto rotary_sin = rotary_sin_.value();
-    CHECK_DEVICE(rotary_sin);
-    CHECK_CONTIGUOUS(rotary_sin);
+    CHECK_INPUT(rotary_sin);
     CHECK_SHAPE(rotary_sin, seqlen_ro, params.rotary_dim / 2);
     TORCH_CHECK(rotary_sin.scalar_type() == q_type, "rotary_cos must have the same dtype as query");
     params.rotary_cos_ptr = rotary_cos.data_ptr();
@@ -673,8 +668,7 @@ std::vector<at::Tensor> mha_fwd(
     params.is_rotary_interleaved = is_rotary_interleaved;
     if (seqlens_rotary_.has_value()) {
       at::Tensor seqlens_rotary = seqlens_rotary_.value();
-      CHECK_DEVICE(seqlens_rotary);
-      CHECK_CONTIGUOUS(seqlens_rotary);
+      CHECK_INPUT(seqlens_rotary);
       TORCH_CHECK(seqlens_rotary.dtype() == torch::kInt32, "seqlens_rotary must have dtype torch.int32");
       CHECK_SHAPE(seqlens_rotary, batch_size);
       params.seqlens_rotary = seqlens_rotary.data_ptr<int>();
@@ -685,8 +679,7 @@ std::vector<at::Tensor> mha_fwd(
 
   if (kv_batch_idx_.has_value()) {
     auto kv_batch_idx = kv_batch_idx_.value();
-    CHECK_DEVICE(kv_batch_idx);
-    CHECK_CONTIGUOUS(kv_batch_idx);
+    CHECK_INPUT(kv_batch_idx);
     TORCH_CHECK(kv_batch_idx.scalar_type() == torch::kInt32, "kv_batch_idx must have dtype int32");
     params.kv_batch_idx = reinterpret_cast<int*>(kv_batch_idx.data_ptr());
   }

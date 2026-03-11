@@ -282,7 +282,6 @@ def flash_attn_with_kvcache(
         pack_gqa,
         sm_margin,
     )
-    # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out
 
 

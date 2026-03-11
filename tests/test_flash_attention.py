@@ -474,33 +474,18 @@ def generate_qkv(
     not is_fa3_supported(),
     reason="flash_attn at sgl-kernel is only supported on sm90 and above",
 )
-# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
     "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
 )
-# @pytest.mark.parametrize("dtype", [torch.bfloat16])
-# @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
-# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("mha_type", ["mha"])
-# @pytest.mark.parametrize("new_kv", [False] + ([True] if not DISABLE_APPENDKV else []))
 @pytest.mark.parametrize("new_kv", [False])
-# @pytest.mark.parametrize(
-#     "causal,local",
-#     [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []),
-# )
 @pytest.mark.parametrize("causal,local", [(False, True), (False, False), (True, False)])
-# @pytest.mark.parametrize("causal,local", [(True, False)])
 @pytest.mark.parametrize("use_sinks", [True, False])
-# @pytest.mark.parametrize(
-#     "seqlen_new_eq_seqlen_q", [True, False] if not DISABLE_APPENDKV else [True]
-# )
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
-# @pytest.mark.parametrize("has_rotary_seqlens", [False, True])
 @pytest.mark.parametrize("has_rotary_seqlens", [False])
 @pytest.mark.parametrize(
     "rotary_interleaved", [False, True] if not DISABLE_APPENDKV else [False]
 )
-# @pytest.mark.parametrize("rotary_interleaved", [True])
 @pytest.mark.parametrize(
     "rotary_fraction",
     (
@@ -509,21 +494,11 @@ def generate_qkv(
         else [0.0]
     ),
 )
-# @pytest.mark.parametrize("rotary_fraction", [0.0])
 @pytest.mark.parametrize("page_size", [64, 128, 256])
-# @pytest.mark.parametrize("page_size", [None])
-# @pytest.mark.parametrize("has_leftpad", [False, True])
 @pytest.mark.parametrize("has_leftpad", [False])
-# @pytest.mark.parametrize("has_batch_idx", [False, True])
 @pytest.mark.parametrize("has_batch_idx", [False])
-# @pytest.mark.parametrize("varlen_q", [False, True])
 @pytest.mark.parametrize("varlen_q", [True])
-# @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
-# @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
-# @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
-# @pytest.mark.parametrize('d', [56, 80])
 @pytest.mark.parametrize("d", [64, 128])
-# @pytest.mark.parametrize("d", [192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -533,14 +508,11 @@ def generate_qkv(
         (3, 799),
         (64, 2048),
         (16, 20000),
-        # (1, 128 * 1024),
-        # (16, 128 * 1024),
         (128, 128),
         (256, 512),  # To test appending KV with more than 1 block
         (2048, 3577),  # Enough tile to test persistent scheduler
     ],
 )
-# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
 def test_flash_attn_kvcache(
     seqlen_q,
     seqlen_k,
@@ -1006,34 +978,19 @@ def test_flash_attn_kvcache(
     not is_fa3_supported(),
     reason="flash_attn at sgl-kernel is only supported on sm90 and above",
 )
-# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
     "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
 )
-# @pytest.mark.parametrize("dtype", [torch.bfloat16])
-# @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
-# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("mha_type", ["mha"])
-# @pytest.mark.parametrize("new_kv", [False] + ([True] if not DISABLE_APPENDKV else []))
 @pytest.mark.parametrize("new_kv", [False])
-# @pytest.mark.parametrize(
-#     "causal,local",
-#     [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []),
-# )
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("local", [False])
-# @pytest.mark.parametrize("local", [(True, False)])
 @pytest.mark.parametrize("use_sinks", [False])
-# @pytest.mark.parametrize(
-#     "seqlen_new_eq_seqlen_q", [True, False] if not DISABLE_APPENDKV else [True]
-# )
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
-# @pytest.mark.parametrize("has_rotary_seqlens", [False, True])
 @pytest.mark.parametrize("has_rotary_seqlens", [False])
 @pytest.mark.parametrize(
     "rotary_interleaved", [False, True] if not DISABLE_APPENDKV else [False]
 )
-# @pytest.mark.parametrize("rotary_interleaved", [True])
 @pytest.mark.parametrize(
     "rotary_fraction",
     (
@@ -1042,14 +999,9 @@ def test_flash_attn_kvcache(
         else [0.0]
     ),
 )
-# @pytest.mark.parametrize("rotary_fraction", [0.0])
 @pytest.mark.parametrize("page_size", [64, 128])
-# @pytest.mark.parametrize("page_size", [None])
-# @pytest.mark.parametrize("has_leftpad", [False, True])
 @pytest.mark.parametrize("has_leftpad", [False])
-# @pytest.mark.parametrize("has_batch_idx", [False, True])
 @pytest.mark.parametrize("has_batch_idx", [False])
-# @pytest.mark.parametrize("varlen_q", [False, True])
 @pytest.mark.parametrize("varlen_q", [True])
 @pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("seqlen_q", [1])
@@ -1065,14 +1017,8 @@ def test_flash_attn_kvcache(
         799,
         2048,
         20000,
-        # (1, 128 * 1024),
-        # (16, 128 * 1024),
-        # 128,
-        # 512,  # To test appending KV with more than 1 block
-        # 3577,  # Enough tile to test persistent scheduler
     ],
 )
-# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
 def test_flash_attn_decode_kvcache(
     seqlen_q,
     seqlen_k,
@@ -1444,16 +1390,6 @@ def test_flash_attn_decode_kvcache(
                 )
                 if varlen_q:
                     out = output_pad_fn(out)
-                # out = flash_attn_decode_with_kvcache(
-                #     q, k_cache, v_cache, cache_seqlens=cache_seqlens, causal=causal, window_size=window_size
-                # )
-                # out = flash_attn_decode_with_kvcache(q, k_cache, v_cache, causal=causal, window_size=window_size)
-                # qk = torch.einsum("bqhd,bkhd->bhqk", q, k_cache_ref)
-                # m = qk.amax(-1, keepdim=True)
-                # s_tmp = torch.exp((qk - m) / math.sqrt(d))
-                # o1 = torch.einsum('bhst,bthd->bshd', s_tmp, v_cache_ref)
-                # lse_ref = torch.logsumexp(qk / math.sqrt(d), -1)
-                # probs = torch.softmax(qk, dim=-1)
                 torch.xpu.synchronize()
                 out = out.flatten()
                 out_ref = out_ref.flatten()

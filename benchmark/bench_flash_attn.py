@@ -2,7 +2,7 @@ from itertools import product
 
 import torch
 import triton
-from sgl_kernel.flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
+from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 
 def flash_attn_with_kvcache_baseline(

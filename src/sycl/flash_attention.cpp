@@ -29,6 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+#define SYCL_INTEL_TARGET 20
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 #include <c10/xpu/XPUStream.h>
@@ -49,7 +50,8 @@ std::vector<at::Tensor> mha_fwd(
     const at::Tensor& cu_seqlens_q,         // b+1
     const at::Tensor& cu_seqlens_k,         // b+1
     int max_seqlen_q,
-    const at::Tensor& page_table,                      // (b_k, max_num_pages_per_seq)
+    int max_seqlen_k,
+    std::optional<const at::Tensor>& page_table,                      // (b_k, max_num_pages_per_seq)
     std::optional<const at::Tensor>& kv_batch_idx_,    // b. indices to index into the KV cache
     std::optional<const at::Tensor>& leftpad_k_,       // b
     std::optional<const at::Tensor>& rotary_cos_,      // seqlen_ro x (rotary_dim / 2)
@@ -69,7 +71,7 @@ std::vector<at::Tensor> mha_fwd(
     int num_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin) {
-  if (max_seqlen_q == 1) {
+  if (max_seqlen_q == 1 && page_table.has_value()) {
     return decode::mha_fwd(
         q,
         k,
@@ -78,6 +80,7 @@ std::vector<at::Tensor> mha_fwd(
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_q,
+        max_seqlen_k,
         page_table,
         kv_batch_idx_,
         leftpad_k_,
@@ -107,6 +110,7 @@ std::vector<at::Tensor> mha_fwd(
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_q,
+        max_seqlen_k,
         page_table,
         kv_batch_idx_,
         leftpad_k_,
@@ -129,3 +133,4 @@ std::vector<at::Tensor> mha_fwd(
         sm_margin);
   }
 }
+#undef SYCL_INTEL_TARGET

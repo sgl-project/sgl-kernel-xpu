@@ -227,6 +227,7 @@ def flash_attn_varlen_func(
     seqused_q=None,
     seqused_k=None,
     softmax_scale=None,
+    sinks=None,
     causal=False,
     qv=None,
     q_descale=None,
@@ -274,7 +275,7 @@ def flash_attn_varlen_func(
         k_descale,
         v_descale,
         softmax_scale,
-        None,  # sinks
+        sinks,
         causal,
         window_size[0],
         window_size[1],

@@ -2,7 +2,7 @@ from itertools import product
 
 import torch
 import triton
-from sgl_kernel.flash_attn import flash_attn_with_kvcache
+from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 
 def flash_attn_baseline(
@@ -16,24 +16,44 @@ def flash_attn_baseline(
     cache_seqlens,
     page_table,
     cu_seqlens_q,
+    cu_seqlens_k,
     max_seqlen_q,
+    max_seqlen_k,
 ):
     """Baseline Flash Attention implementation"""
-    out, lse, *rest = flash_attn_with_kvcache(
-        q,
-        k_cache,
-        v_cache,
-        causal=causal,
-        sinks=sinks,
-        window_size=window_size,
-        softmax_scale=softmax_scale,
-        page_table=page_table,
-        cache_seqlens=cache_seqlens,
-        cu_seqlens_q=cu_seqlens_q,
-        max_seqlen_q=max_seqlen_q,
-        return_softmax_lse=True,
-    )
-    return out, lse
+    if page_table is not None:
+        out, lse, *rest = flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            causal=causal,
+            sinks=sinks,
+            window_size=window_size,
+            softmax_scale=softmax_scale,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            return_softmax_lse=True,
+        )
+        return out, lse
+    else:
+        out, lse, *rest = flash_attn_varlen_func(
+            q,
+            k_cache,
+            v_cache,
+            causal=causal,
+            sinks=sinks,
+            window_size=window_size,
+            softmax_scale=softmax_scale,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            return_softmax_lse=True,
+        )
+        return out, lse
 
 
 # Benchmark configurations
@@ -46,7 +66,7 @@ head_dim = [64, 128]
 num_heads_q = [16]
 num_heads_kv = [2, 4, 8]
 kv_seq_length_range = [4096, 16384]
-page_size_range = [128]
+page_size_range = [0, 128]
 configs = list(
     filter(
         lambda cfg: not (cfg[0] and cfg[1])
@@ -112,20 +132,35 @@ def benchmark(
     q = torch.randn(
         (batch_size * q_seq_length, num_heads_q, head_dim), device=device, dtype=dtype
     )
-    num_pages = (batch_size * kv_seq_length + page_size - 1) // page_size
-    k_cache = torch.randn(
-        (num_pages, page_size, num_heads_kv, head_dim), device=device, dtype=dtype
-    )
-    v_cache = torch.randn(
-        (num_pages, page_size, num_heads_kv, head_dim), device=device, dtype=dtype
-    )
+    if page_size > 0:
+        num_pages = (batch_size * kv_seq_length + page_size - 1) // page_size
+        k_cache = torch.randn(
+            (num_pages, page_size, num_heads_kv, head_dim), device=device, dtype=dtype
+        )
+        v_cache = torch.randn(
+            (num_pages, page_size, num_heads_kv, head_dim), device=device, dtype=dtype
+        )
+        page_table = (
+            torch.randperm(num_pages, device=device, dtype=torch.int32)
+            .reshape(batch_size, -1)
+            .contiguous()
+        )
+    else:
+        k_cache = torch.randn(
+            (batch_size * kv_seq_length, num_heads_kv, head_dim),
+            device=device,
+            dtype=dtype,
+        )
+        v_cache = torch.randn(
+            (batch_size * kv_seq_length, num_heads_kv, head_dim),
+            device=device,
+            dtype=dtype,
+        )
+        num_pages = 0
+        page_table = None
+
     cache_seqlens = (
         torch.ones(batch_size, device=device, dtype=torch.int32) * kv_seq_length
-    )
-    page_table = (
-        torch.randperm(num_pages, device=device, dtype=torch.int32)
-        .reshape(batch_size, -1)
-        .contiguous()
     )
     cu_seqlens_q = torch.arange(
         0,
@@ -134,7 +169,15 @@ def benchmark(
         device=device,
         dtype=torch.int32,
     )
+    cu_seqlens_k = torch.arange(
+        0,
+        (batch_size + 1) * kv_seq_length,
+        step=kv_seq_length,
+        device=device,
+        dtype=torch.int32,
+    )
     max_seqlen_q = q_seq_length
+    max_seqlen_k = kv_seq_length
     window_size = (-1, -1) if not local else torch.randint(0, kv_seq_length, (2,))
 
     sinks = torch.randn(num_heads_q, device=device, dtype=dtype) if use_sinks else None
@@ -156,7 +199,9 @@ def benchmark(
                 cache_seqlens=cache_seqlens,
                 page_table=page_table,
                 cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
             ),
             quantiles=quantiles,
         )

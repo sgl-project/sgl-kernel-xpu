@@ -1116,6 +1116,7 @@ def test_flash_attn_decode_kvcache(
         )
         cu_seqlens_k_new = None
         key_new_padding_mask = None
+        max_seqlen_k = seqlen_k
         if new_kv:
             k = (
                 torch.randn(
@@ -1380,6 +1381,7 @@ def test_flash_attn_decode_kvcache(
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k_new=cu_seqlens_k_new,
                     max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
                     rotary_seqlens=rotary_seqlens,
                     causal=causal,
                     window_size=window_size,

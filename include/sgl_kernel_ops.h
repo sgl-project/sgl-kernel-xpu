@@ -140,6 +140,23 @@ void sgl_per_token_group_quant_8bit(
     double fp8_min,
     double fp8_max,
     bool scale_ue8m0);
+void fused_qk_norm_rope(
+    torch::Tensor& qkv,
+    int64_t num_heads_q,
+    int64_t num_heads_k,
+    int64_t num_heads_v,
+    int64_t head_dim,
+    double eps,
+    torch::Tensor& q_weight,
+    torch::Tensor& k_weight,
+    double base,
+    bool is_neox,
+    torch::Tensor& position_ids,
+    double factor,
+    double low,
+    double high,
+    double attention_factor,
+    int64_t rotary_dim);
 }  // namespace at::native::xpu
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
@@ -253,7 +270,7 @@ void fp8_blockwise_scaled_grouped_mm(
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace);
 
-void moe_grouped_mm_nt(
+void moe_grouped_mm_nt_xe20(
     torch::Tensor& output,
     const torch::Tensor& activations,
     const torch::Tensor& weights,

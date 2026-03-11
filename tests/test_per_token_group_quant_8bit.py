@@ -1,8 +1,9 @@
 import itertools
 import sys
-from typing import Tuple
+from typing import List, Optional, Tuple
 
 import pytest
+import sgl_kernel
 import torch
 import triton
 import triton.language as tl
@@ -11,8 +12,6 @@ try:
     HAS_XPU = torch.xpu.is_available()
 except (ImportError, AttributeError):
     HAS_XPU = False
-
-from sgl_kernel import sgl_per_token_group_quant_8bit
 
 
 def ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
@@ -55,6 +54,156 @@ def per_token_group_quant_int8_ref(
     return x_quantized.view(num_tokens, hidden_dim), scales
 
 
+def sglapi_per_token_group_quant_int8(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-10,
+    dtype: torch.dtype = torch.int8,
+    enable_v2: Optional[bool] = None,
+):
+    assert (
+        x.shape[-1] % group_size == 0
+    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.is_contiguous(), "`x` is not contiguous"
+
+    iinfo = torch.iinfo(dtype)
+    int8_max = iinfo.max
+    int8_min = iinfo.min
+
+    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
+    x_s = torch.empty(
+        x.shape[:-1] + (x.shape[-1] // group_size,),
+        device=x.device,
+        dtype=torch.float32,
+    )
+
+    torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit.default(
+        x, x_q, x_s, group_size, eps, int8_min, int8_max, scale_ue8m0=False
+    )
+    return x_q, x_s
+
+
+def create_fp8_output_scale(
+    x_shape,
+    device,
+    group_size,
+    column_major_scales: bool,
+    scale_tma_aligned: bool,
+    scale_ue8m0: bool,
+):
+    if scale_ue8m0:
+        assert column_major_scales and scale_tma_aligned
+        *x_batch, x_q_mn, x_q_k = x_shape
+        x_s_mn, x_s_k = x_q_mn, x_q_k // 128
+        aligned_mn = ceil_align(x_s_mn, 4)
+        aligned_k = ceil_align(x_s_k, 4)
+        return torch.empty(
+            (*x_batch, aligned_k // 4, aligned_mn),
+            device=device,
+            dtype=torch.int,
+        ).transpose(-1, -2)[..., :x_s_mn, :]
+    elif column_major_scales:
+        if scale_tma_aligned:
+            # TODO extract "align" function
+            # aligned to 4 * sizeof(float)
+            aligned_size = (x_shape[-2] + 3) // 4 * 4
+            return torch.empty(
+                x_shape[:-2] + (x_shape[-1] // group_size, aligned_size),
+                device=device,
+                dtype=torch.float32,
+            ).transpose(-1, -2)[: x_shape[-2], :]
+        else:
+            return torch.empty(
+                (x_shape[-1] // group_size,) + x_shape[:-1],
+                device=device,
+                dtype=torch.float32,
+            ).permute(-1, -2)
+    else:
+        return torch.empty(
+            x_shape[:-1] + (x_shape[-1] // group_size,),
+            device=device,
+            dtype=torch.float32,
+        )
+
+
+def sglapi_per_token_group_quant_fp8(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-10,
+    column_major_scales: bool = False,
+    scale_tma_aligned: bool = False,
+    scale_ue8m0: bool = False,
+    fuse_silu_and_mul: bool = False,
+    masked_m: Optional[torch.Tensor] = None,
+    enable_v2: Optional[bool] = None,
+    dtype: torch.dtype = torch.float8_e4m3fn,
+):
+    assert (
+        x.shape[-1] % group_size == 0
+    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.is_contiguous(), "`x` is not contiguous"
+
+    out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
+
+    x_q = torch.empty(out_shape, device=x.device, dtype=dtype)
+    x_s = create_fp8_output_scale(
+        x_shape=out_shape,
+        device=x.device,
+        group_size=group_size,
+        column_major_scales=column_major_scales,
+        scale_tma_aligned=scale_tma_aligned,
+        scale_ue8m0=scale_ue8m0,
+    )
+
+    fp8_max = torch.finfo(dtype).max
+    fp8_min = -fp8_max
+    if x.shape[0] > 0:
+        torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit.default(
+            x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+        )
+    return x_q, x_s
+
+
+def sglapi_per_token_group_quant_8bit(
+    x: torch.Tensor,
+    group_size: int,
+    dst_dtype: torch.dtype,
+    eps: float = 1e-10,
+    column_major_scales: bool = False,
+    scale_tma_aligned: bool = False,
+    scale_ue8m0: bool = False,
+    fuse_silu_and_mul: bool = False,
+    masked_m: Optional[torch.Tensor] = None,
+    enable_v2: Optional[bool] = None,
+):
+
+    if dst_dtype == torch.int8:
+        assert not column_major_scales
+        assert not scale_tma_aligned
+        assert not fuse_silu_and_mul
+        assert masked_m is None
+        return sglapi_per_token_group_quant_int8(
+            x=x,
+            group_size=group_size,
+            eps=eps,
+            dtype=dst_dtype,
+            enable_v2=enable_v2,
+        )
+
+    return sglapi_per_token_group_quant_fp8(
+        x=x,
+        group_size=group_size,
+        eps=eps,
+        column_major_scales=column_major_scales,
+        scale_tma_aligned=scale_tma_aligned,
+        scale_ue8m0=scale_ue8m0,
+        fuse_silu_and_mul=fuse_silu_and_mul,
+        masked_m=masked_m,
+        enable_v2=enable_v2,
+        dtype=dst_dtype,
+    )
+
+
 @pytest.mark.skipif(not HAS_XPU, reason="XPU not available")
 class TestPerTokenGroupQuantXPU:
     @pytest.fixture(autouse=True)
@@ -90,7 +239,7 @@ class TestPerTokenGroupQuantXPU:
             )
 
         # Run XPU implementation
-        x_q_xpu, scales_xpu = sgl_per_token_group_quant_8bit(
+        x_q_xpu, scales_xpu = sglapi_per_token_group_quant_8bit(
             x=x_xpu,
             masked_m=None,
             group_size=group_size,
@@ -192,7 +341,7 @@ class TestPerTokenGroupQuantXPU:
         torch.manual_seed(42)
         x = torch.randn(64, 512, dtype=torch.bfloat16) * scale_factor
         x_xpu = x.to(self.device)
-        x_q, scales = sgl_per_token_group_quant_8bit(
+        x_q, scales = sglapi_per_token_group_quant_8bit(
             x=x_xpu,
             masked_m=None,
             group_size=64,
@@ -441,7 +590,7 @@ def test_per_token_group_quant_with_column_major_fp8(
         scale_tma_aligned=scale_tma_aligned,
     )
 
-    x_q_xpu, x_s_xpu = sgl_per_token_group_quant_8bit(
+    x_q_xpu, x_s_xpu = sglapi_per_token_group_quant_8bit(
         x,
         group_size,
         eps=1e-10,

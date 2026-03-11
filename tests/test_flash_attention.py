@@ -608,6 +608,7 @@ def test_flash_attn_kvcache(
         )
         cu_seqlens_k_new = None
         key_new_padding_mask = None
+        max_seqlen_k = seqlen_k
         if new_kv:
             k = (
                 torch.randn(
@@ -872,6 +873,7 @@ def test_flash_attn_kvcache(
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k_new=cu_seqlens_k_new,
                     max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
                     rotary_seqlens=rotary_seqlens,
                     causal=causal,
                     window_size=window_size,
@@ -1504,8 +1506,8 @@ def _generate_block_kvcache(
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.skipif(
-    True,
-    reason="flash_attn at sgl-kernel-xpu only supports paged cache",
+    not is_fa3_supported(),
+    reason="flash_attn at sgl-kernel is only supported on sm90 and above",
 )
 @pytest.mark.parametrize(
     "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
@@ -1520,12 +1522,9 @@ def _generate_block_kvcache(
 @pytest.mark.parametrize("deterministic", [False])
 @pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
 # @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("local", [False])
-# @pytest.mark.parametrize("local", [False])
-@pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [False])
-@pytest.mark.parametrize("add_unused_qkv", [False, True])
-# @pytest.mark.parametrize("add_unused_qkv", [True])
+@pytest.mark.parametrize("causal,local", [(False, True), (False, False), (True, False)])
+@pytest.mark.parametrize("use_sinks", [True, False])
+@pytest.mark.parametrize("add_unused_qkv", [False])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192, 256])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
@@ -1566,6 +1565,7 @@ def test_flash_attn_varlen_output(
     add_unused_qkv,
     causal,
     local,
+    use_sinks,
     softcap,
     deterministic,
     has_qv,
@@ -1585,9 +1585,12 @@ def test_flash_attn_varlen_output(
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
+    if use_sinks:
+        sinks = torch.randn(nheads, device=device, dtype=dtype_ref)
     if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
     for dv in dv_vals:
+        softmax_scale = 1.0 / math.sqrt(d if not has_qv else d + dv)
         q_ref = torch.randn(
             batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref
         )
@@ -1692,8 +1695,10 @@ def test_flash_attn_varlen_output(
             q_ref,
             k_ref,
             v_ref,
-            query_padding_mask,
-            key_padding_mask,
+            softmax_scale,
+            sinks if use_sinks else None,
+            query_padding_mask=query_padding_mask,
+            key_padding_mask=key_padding_mask,
             causal=causal,
             qv=qv_ref,
             q_descale=q_descale,
@@ -1706,8 +1711,10 @@ def test_flash_attn_varlen_output(
             q_ref,
             k_ref,
             v_ref,
-            query_padding_mask,
-            key_padding_mask,
+            softmax_scale,
+            sinks if use_sinks else None,
+            query_padding_mask=query_padding_mask,
+            key_padding_mask=key_padding_mask,
             causal=causal,
             qv=qv_ref,
             q_descale=q_descale,
@@ -1741,6 +1748,7 @@ def test_flash_attn_varlen_output(
                 cu_seqlens_k,
                 max_seqlen_q,
                 max_seqlen_k,
+                qv=qv,
                 seqused_q=seqused_q,
                 seqused_k=seqused_k,
                 causal=causal,
@@ -1748,6 +1756,8 @@ def test_flash_attn_varlen_output(
                 k_descale=k_descale,
                 v_descale=v_descale,
                 window_size=window_size,
+                softmax_scale=softmax_scale,
+                sinks=sinks if use_sinks else None,
                 softcap=softcap,
                 return_softmax_lse=True,
             )

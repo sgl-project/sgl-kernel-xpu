@@ -73,9 +73,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("moe_sum", torch::kXPU, &moe_sum);
 
   m.def(
-      "moe_grouped_mm_nt(Tensor output, Tensor activations, Tensor weights, Tensor? bias, Tensor "
+      "moe_grouped_mm_nt_xe20(Tensor output, Tensor activations, Tensor weights, Tensor? bias, Tensor "
       "total_rows_for_experts, int n_experts, int activation_type, bool fuse_act) -> ()");
-  m.impl("moe_grouped_mm_nt", torch::kXPU, &moe_grouped_mm_nt);
+  m.impl("moe_grouped_mm_nt_xe20", torch::kXPU, &moe_grouped_mm_nt_xe20);
 
   m.def(
       "prepare_moe_input(Tensor topk_ids, Tensor expert_offsets, Tensor? blockscale_offsets, Tensor problem_sizes1,"
@@ -100,7 +100,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    Tensor  cu_seqlens_q,"
       "    Tensor  cu_seqlens_k,"
       "    int     max_seqlen_q,"
-      "    Tensor  page_table,"
+      "    int     max_seqlen_k,"
+      "    Tensor?  page_table,"
       "    Tensor?  kv_batch_idx,"
       "    Tensor?  leftpad_k,"
       "    Tensor?  rotary_cos,"
@@ -132,6 +133,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("sgl_per_tensor_quant_fp8(Tensor input, Tensor output_q, Tensor output_s, bool is_static) -> ()");
   m.impl("sgl_per_tensor_quant_fp8", torch::kXPU, &sgl_per_tensor_quant_fp8);
 
+  /*
+   * From fused qk norm rope
+   */
+  m.def(
+      "fused_qk_norm_rope(Tensor! qkv, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, "
+      "float eps, Tensor! q_weight, Tensor! k_weight, float base, bool is_neox, Tensor! position_ids, "
+      "float factor, float low, float high, float attention_factor, int rotary_dim) -> ()");
+  m.impl("fused_qk_norm_rope", torch::kXPU, &at::native::xpu::fused_qk_norm_rope);
   /* utils */
   m.def("query_device(int device_id) -> (int, int)");
   m.impl("query_device", c10::DispatchKey::BackendSelect, &query_device);

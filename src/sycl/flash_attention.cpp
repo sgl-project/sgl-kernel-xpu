@@ -37,7 +37,7 @@
 #include <cute/tensor.hpp>
 
 #include "kernels/chunk_prefill/chunk_prefill_runner.hpp"
-#include "kernels/flash_attention/xe_fmha_fwd_docode_runner.hpp"
+#include "kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
 
 std::vector<at::Tensor> mha_fwd(
     at::Tensor& q,        // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q

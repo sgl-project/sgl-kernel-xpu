@@ -39,13 +39,13 @@
 #include <cute/tensor.hpp>
 #include <random>
 
-#include "../../Utils.h"
-#include "../../comm/common.h"
+#include "sycl/Utils.h"
+#include "sycl/comm/common.h"
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
-#include "fmha_fusion.hpp"
-#include "xe_fhma_fwd_kernel.hpp"
-#include "xe_tile_scheduler.hpp"
+#include "sycl/kernels/flash_attention_v2/collective/fmha_fusion.hpp"
+#include "sycl/kernels/flash_attention_v2/kernel/xe_fhma_fwd_kernel.hpp"
+#include "sycl/kernels/flash_attention_v2/kernel/xe_tile_scheduler.hpp"
 
 using namespace cute;
 namespace decode {

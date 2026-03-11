@@ -5,9 +5,9 @@
 
 #include <cute/tensor.hpp>
 
-#include "../../Utils.h"
-#include "../../comm/common.h"
-#include "../flash_attention/fmha_fusion.hpp"
+#include "sycl/Utils.h"
+#include "sycl/comm/common.h"
+#include "sycl/kernels/flash_attention_v2/collective/fmha_fusion.hpp"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/util/packed_stride.hpp"
 #include "tile_scheduler_chunk_prefill.hpp"

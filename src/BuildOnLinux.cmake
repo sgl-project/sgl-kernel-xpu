@@ -47,6 +47,7 @@ foreach(lib ${SGL_OPS_LIBRARIES})
   target_include_directories(${lib} PUBLIC ${ATen_XPU_INCLUDE_DIRS})
   target_include_directories(${lib} PUBLIC ${SYCL_INCLUDE_DIR})
   target_include_directories(${lib} PRIVATE ${Python3_INCLUDE_DIRS})
+  target_include_directories(${lib} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(${lib} PRIVATE ${Python3_LIBRARIES})
 
   target_include_directories(${lib} PRIVATE ${TORCH_INCLUDE_DIRS})

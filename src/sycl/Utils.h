@@ -263,3 +263,15 @@ template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::
 inline T div_up(T x, T y) {
   return (x + y - 1) / y;
 }
+
+int nextPowerOf2(uint32_t a) {
+  if (a <= 1) return 1;
+  return 1 << (32 - __builtin_clz(a - 1));
+};
+int round_up_headdim(int head_size) {
+  if (head_size <= 64) return 64;
+  if (head_size <= 96) return 96;
+  if (head_size <= 128) return 128;
+  if (head_size <= 192) return 192;
+  return 256;
+};

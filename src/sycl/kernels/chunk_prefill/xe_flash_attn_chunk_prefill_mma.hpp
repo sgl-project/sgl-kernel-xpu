@@ -35,7 +35,7 @@
 #include "cute/atom/mma_atom.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
-#include "fmha_fusion.hpp"
+#include "sycl/kernels/flash_attention_v2/collective/fmha_fusion.hpp"
 
 ////////////////////////////////////////////////////////////
 namespace {}

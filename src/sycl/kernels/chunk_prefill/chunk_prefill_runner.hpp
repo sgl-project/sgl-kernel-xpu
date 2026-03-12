@@ -1,5 +1,3 @@
-#define SYCL_INTEL_TARGET 20
-
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 #include <c10/xpu/XPUStream.h>
@@ -7,20 +5,18 @@
 
 #include <cute/tensor.hpp>
 
-#include "Utils.h"
-#include "comm/common.h"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
-#include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
-#include "cutlass/util/sycl_event_manager.hpp"
-#include "kernels/chunk_prefill/fmha_fusion.hpp"
-#include "kernels/chunk_prefill/tile_scheduler_chunk_prefill.hpp"
-#include "kernels/chunk_prefill/xe_chunk_prefill.hpp"
-#include "kernels/chunk_prefill/xe_flash_attn_chunk_prefill_epilogue.hpp"
-#include "kernels/chunk_prefill/xe_flash_attn_chunk_prefill_softmax_epilogue.hpp"
+#include "sycl/Utils.h"
+#include "sycl/comm/common.h"
+#include "sycl/kernels/flash_attention_v2/collective/fmha_fusion.hpp"
+#include "tile_scheduler_chunk_prefill.hpp"
+#include "xe_chunk_prefill.hpp"
+#include "xe_flash_attn_chunk_prefill_epilogue.hpp"
+#include "xe_flash_attn_chunk_prefill_softmax_epilogue.hpp"
 
 using namespace cute;
-
+namespace chunkprefill {
 struct Flash_fwd_params {
   using index_t = int64_t;
 
@@ -158,9 +154,6 @@ struct Flash_fwd_params {
   torch::TensorOptions tensor_opts;
 };
 
-template <typename Kernel>
-class KernelCur {};
-
 // Flash Attention takes 3 input matrices: Keys, Queries and Values.
 using LayoutQ = cutlass::layout::RowMajor;
 using LayoutK = cutlass::layout::ColumnMajor;
@@ -168,7 +161,7 @@ using LayoutV = cutlass::layout::RowMajor;
 using LayoutO = cutlass::layout::RowMajor;
 
 template <class FMHAChunkPrefillKernel, bool isVarLen>
-struct KernelRunner {
+struct ChunkPrefillRunner {
   using StrideQ = typename FMHAChunkPrefillKernel::StrideQ;
   using StrideK = typename FMHAChunkPrefillKernel::StrideK;
   using StrideV = typename FMHAChunkPrefillKernel::StrideV;
@@ -273,42 +266,6 @@ struct KernelRunner {
     return problem_shape;
   }
 
-  // Note that the GemmUniversalAdapter currently doesn't support flash attention, which is why this
-  // secondary `run` function is required to launch the kernel.
-  static void run(typename FMHAChunkPrefillKernel::Params params) {
-    dim3 const block = FMHAChunkPrefillKernel::get_block_shape();
-    dim3 const grid = FMHAChunkPrefillKernel::get_grid_shape(params);
-
-    // configure smem size and carveout
-    int smem_size = FMHAChunkPrefillKernel::SharedStorageSize;
-
-    const auto sycl_block = compat::dim3(block.x, block.y, block.z);
-    const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
-
-    using namespace compat::experimental;
-    compat::experimental::launch_properties launch_props{
-        sycl::ext::oneapi::experimental::work_group_scratch_size(smem_size),
-    };
-    compat::experimental::kernel_properties kernel_props{
-        sycl::ext::oneapi::experimental::sub_group_size<FMHAChunkPrefillKernel::DispatchPolicy::SubgroupSize>};
-    compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
-
-    sycl::ext::oneapi::experimental::launch_config config(policy.get_range(), policy.get_launch_properties());
-    auto cgf = [&](::sycl::handler& cgh) {
-      auto KernelFunctor =
-          compat::experimental::detail::build_kernel_functor<cutlass::device_kernel<FMHAChunkPrefillKernel>>(
-              cgh, policy, params);
-      sycl::ext::oneapi::experimental::detail::
-          LaunchConfigAccess<sycl::nd_range<3>, decltype(policy.get_launch_properties())>
-              ConfigAccess(config);
-      cgh.parallel_for<KernelCur<FMHAChunkPrefillKernel>>(
-          ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
-    };
-    auto stream = at::xpu::getCurrentXPUStream();
-    auto q = stream.queue();
-    q.submit(cgf);
-  }
-
   cutlass::Status run(const Flash_fwd_params& params, const cutlass::KernelHardwareInfo& hw_info) {
     ProblemShapeType problem_size = initialize(params);
 
@@ -352,7 +309,8 @@ struct KernelRunner {
     auto params_kernel = FMHAChunkPrefillKernel::to_underlying_arguments(arguments, workspace.data_ptr());
 
     // Run the Flash Attention implementation.
-    run(params_kernel);
+    // run(params_kernel);
+    launch<FMHAChunkPrefillKernel>(params_kernel);
     return cutlass::Status::kSuccess;
   }
 };
@@ -378,7 +336,7 @@ template <
     typename ElementOutput = bfloat16_t,
     typename ElementSink = bfloat16_t,
     typename GmemTiledCopyStore = XE_2D_U16x8x16_ST_N>
-struct FMHAConfig {
+struct ChunkPrefillConfig {
   template <bool isVarLen, bool PagedKV, class Scheduler>
   static int run(const Flash_fwd_params& params) {
     // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
@@ -435,7 +393,7 @@ struct FMHAConfig {
         CollectiveEpilogue,
         Scheduler>;
 
-    KernelRunner<FMHAChunkPrefillKernel, isVarLen> runner;
+    ChunkPrefillRunner<FMHAChunkPrefillKernel, isVarLen> runner;
 
     (runner.run(params, hw_info));
     return 0;
@@ -515,27 +473,25 @@ std::vector<at::Tensor> mha_fwd(
   TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
   TORCH_CHECK(v.scalar_type() == q_type, "query and value must have the same dtype");
 
-  CHECK_DEVICE(q);
-  CHECK_DEVICE(k);
-  CHECK_DEVICE(v);
+  CHECK_INPUT(q);
+  CHECK_INPUT(k);
+  CHECK_INPUT(v);
 
   TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
   TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
   TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
 
   if (page_table.has_value()) {
-    CHECK_DEVICE(page_table.value());
+    CHECK_INPUT(page_table.value());
     TORCH_CHECK(page_table.value().dtype() == torch::kInt32, "page_table must have dtype torch.int32");
     TORCH_CHECK(page_table.value().stride(-1) == 1, "page_table must have contiguous last dimension");
   }
 
   TORCH_CHECK(q.dim() == 3, "query must be in ragged format");
-  CHECK_DEVICE(cu_seqlens_q);
-  CHECK_CONTIGUOUS(cu_seqlens_q);
+  CHECK_INPUT(cu_seqlens_q);
   TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype torch.int32");
 
-  CHECK_DEVICE(cu_seqlens_k);
-  CHECK_CONTIGUOUS(cu_seqlens_k);
+  CHECK_INPUT(cu_seqlens_k);
   TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype torch.int32");
 
   auto const sizes = q.sizes();
@@ -586,8 +542,7 @@ std::vector<at::Tensor> mha_fwd(
   if (leftpad_k_.has_value()) {
     auto leftpad_k = leftpad_k_.value();
     TORCH_CHECK(leftpad_k.dtype() == torch::kInt32, "leftpad_k must have dtype int32");
-    CHECK_DEVICE(leftpad_k);
-    CHECK_CONTIGUOUS(leftpad_k);
+    CHECK_INPUT(leftpad_k);
     CHECK_SHAPE(leftpad_k, batch_size);
   }
 
@@ -696,7 +651,7 @@ std::vector<at::Tensor> mha_fwd(
     TORCH_CHECK(false, "q_v is not supported yet");
     at::Tensor q_v = q_v_.value();
     TORCH_CHECK(q_v.dtype() == q_type, "q_v must have the same dtype as query");
-    CHECK_DEVICE(q_v);
+    CHECK_INPUT(q_v);
     TORCH_CHECK(q_v.stride(-1) == 1, "q_v tensor must have contiguous last dimension");
     CHECK_SHAPE(q_v, total_q, num_heads, head_size_v);
     params.qv_ptr = q_v.data_ptr();
@@ -707,8 +662,7 @@ std::vector<at::Tensor> mha_fwd(
 
   if (rotary_cos_.has_value()) {
     auto rotary_cos = rotary_cos_.value();
-    CHECK_DEVICE(rotary_cos);
-    CHECK_CONTIGUOUS(rotary_cos);
+    CHECK_INPUT(rotary_cos);
     params.rotary_dim = rotary_cos.size(1) * 2;
     TORCH_CHECK(params.rotary_dim <= head_size, "rotary_dim must be <= headdim");
     TORCH_CHECK(params.rotary_dim % 16 == 0, "Only rotary dimensions divisible by 16 are currently supported");
@@ -719,8 +673,7 @@ std::vector<at::Tensor> mha_fwd(
 
     TORCH_CHECK(rotary_sin_.has_value(), "If rotary cos is provided, rotary sin must also be provided");
     auto rotary_sin = rotary_sin_.value();
-    CHECK_DEVICE(rotary_sin);
-    CHECK_CONTIGUOUS(rotary_sin);
+    CHECK_INPUT(rotary_sin);
     CHECK_SHAPE(rotary_sin, seqlen_ro, params.rotary_dim / 2);
     TORCH_CHECK(rotary_sin.scalar_type() == q_type, "rotary_cos must have the same dtype as query");
     params.rotary_cos_ptr = rotary_cos.data_ptr();
@@ -728,8 +681,7 @@ std::vector<at::Tensor> mha_fwd(
     params.is_rotary_interleaved = is_rotary_interleaved;
     if (seqlens_rotary_.has_value()) {
       at::Tensor seqlens_rotary = seqlens_rotary_.value();
-      CHECK_DEVICE(seqlens_rotary);
-      CHECK_CONTIGUOUS(seqlens_rotary);
+      CHECK_INPUT(seqlens_rotary);
       TORCH_CHECK(seqlens_rotary.dtype() == torch::kInt32, "seqlens_rotary must have dtype torch.int32");
       CHECK_SHAPE(seqlens_rotary, batch_size);
       params.seqlens_rotary = seqlens_rotary.data_ptr<int>();
@@ -740,8 +692,7 @@ std::vector<at::Tensor> mha_fwd(
 
   if (kv_batch_idx_.has_value()) {
     auto kv_batch_idx = kv_batch_idx_.value();
-    CHECK_DEVICE(kv_batch_idx);
-    CHECK_CONTIGUOUS(kv_batch_idx);
+    CHECK_INPUT(kv_batch_idx);
     TORCH_CHECK(kv_batch_idx.scalar_type() == torch::kInt32, "kv_batch_idx must have dtype int32");
     params.kv_batch_idx = reinterpret_cast<int*>(kv_batch_idx.data_ptr());
   }
@@ -756,7 +707,7 @@ std::vector<at::Tensor> mha_fwd(
     case 64:
       AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
         if (params.is_causal) {
-          FMHAConfig<
+          ChunkPrefillConfig<
               cute::Shape<_128, _64, _64>,
               cute::Shape<_128, _32, _64>,
               cute::Shape<_128, _64, _64>,
@@ -769,7 +720,7 @@ std::vector<at::Tensor> mha_fwd(
           AT_DISPATCH_BOOL_NO_RETURN(
               params.is_local,
               LocalMask,
-              FMHAConfig<
+              ChunkPrefillConfig<
                   cute::Shape<_128, _64, _64>,
                   cute::Shape<_128, _32, _64>,
                   cute::Shape<_128, _64, _64>,
@@ -784,7 +735,7 @@ std::vector<at::Tensor> mha_fwd(
     case 96:
       AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
         if (params.is_causal) {
-          FMHAConfig<
+          ChunkPrefillConfig<
               cute::Shape<_128, _64, _32>,
               cute::Shape<_128, _32, _64>,
               cute::Shape<_128, _96, _64>,
@@ -798,7 +749,7 @@ std::vector<at::Tensor> mha_fwd(
           AT_DISPATCH_BOOL_NO_RETURN(
               params.is_local,
               LocalMask,
-              FMHAConfig<
+              ChunkPrefillConfig<
                   cute::Shape<_128, _64, _32>,
                   cute::Shape<_128, _32, _64>,
                   cute::Shape<_128, _96, _64>,
@@ -813,7 +764,7 @@ std::vector<at::Tensor> mha_fwd(
     case 128:
       AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
         if (params.is_causal) {
-          FMHAConfig<
+          ChunkPrefillConfig<
               cute::Shape<_128, _64, _64>,
               cute::Shape<_128, _32, _64>,
               cute::Shape<_128, _128, _64>,
@@ -826,7 +777,7 @@ std::vector<at::Tensor> mha_fwd(
           AT_DISPATCH_BOOL_NO_RETURN(
               params.is_local,
               LocalMask,
-              FMHAConfig<
+              ChunkPrefillConfig<
                   cute::Shape<_128, _64, _64>,
                   cute::Shape<_128, _32, _64>,
                   cute::Shape<_128, _128, _64>,
@@ -841,7 +792,7 @@ std::vector<at::Tensor> mha_fwd(
     case 192:
       AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
         if (params.is_causal) {
-          FMHAConfig<
+          ChunkPrefillConfig<
               cute::Shape<_256, _64, _64>,
               cute::Shape<_256, _32, _64>,
               cute::Shape<_256, _192, _64>,
@@ -854,7 +805,7 @@ std::vector<at::Tensor> mha_fwd(
           AT_DISPATCH_BOOL_NO_RETURN(
               params.is_local,
               LocalMask,
-              FMHAConfig<
+              ChunkPrefillConfig<
                   cute::Shape<_256, _64, _64>,
                   cute::Shape<_256, _32, _64>,
                   cute::Shape<_256, _192, _64>,
@@ -871,4 +822,4 @@ std::vector<at::Tensor> mha_fwd(
   }
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
-#undef SYCL_INTEL_TARGET
+}  // namespace chunkprefill

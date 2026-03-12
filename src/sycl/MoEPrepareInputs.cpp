@@ -396,13 +396,14 @@ void shuffle_rows_kernel_impl(
   auto input = reinterpret_cast<T*>(input_tensor.data_ptr());
   auto dst2srcmap = reinterpret_cast<const int32_t*>(dst2src_map.data_ptr());
   auto output = reinterpret_cast<T*>(output_tensor.data_ptr());
-  uint32_t threads_per_block = 256;
-  uint32_t num_src_rows = input_tensor.size(0);
   uint32_t num_dest_rows = output_tensor.size(0);
   uint32_t num_cols = input_tensor.size(1);
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
+  auto dev_id = input_tensor.device().index();
+  uint32_t max_wg_size = static_cast<uint32_t>(dpcppMaxWorkGroupSize(dev_id));
+  uint32_t threads_per_block = std::min(max_wg_size, 256u);
 
   using Kernel = ShuffleRowsKernel<T>;
   sycl::range<1> global_range{static_cast<size_t>(num_dest_rows) * threads_per_block};
@@ -417,6 +418,13 @@ void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2sr
   TORCH_CHECK(
       input_tensor.scalar_type() == output_tensor.scalar_type(),
       "Input and output tensors must have the same data type");
+  TORCH_CHECK(dst2src_map.scalar_type() == at::kInt, "dst2src_map must have dtype int32");
+  TORCH_CHECK(
+      input_tensor.is_contiguous() && output_tensor.is_contiguous() && dst2src_map.is_contiguous(),
+      "input, output, and dst2src_map must all be contiguous");
+  TORCH_CHECK(
+      input_tensor.size(1) % (16 / input_tensor.element_size()) == 0,
+      "num_cols must be divisible by 16/sizeof(dtype) for aligned vectorized shuffle");
   SYCL_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::BFloat16, at::ScalarType::Half, input_tensor.scalar_type(), "shuffle_rows_kernel_impl", [&]() {
         shuffle_rows_kernel_impl<scalar_t>(input_tensor, dst2src_map, output_tensor);
@@ -514,19 +522,19 @@ void apply_shuffle_mul_sum_impl(
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
+  auto dev_id = input_tensor.device().index();
+  uint32_t max_wg_size = static_cast<uint32_t>(dpcppMaxWorkGroupSize(dev_id));
 
   constexpr uint32_t VecSize = 16u / sizeof(T);  // 128-bit
-  constexpr uint32_t max_wg_size = 256;
 
   int m = output_tensor.size(0);
   int topk = int(permutation_tensor.size(0) / m);
   int row_stride = output_tensor.size(1);
   const uint32_t vec_count = static_cast<uint32_t>(row_stride) / VecSize;
-  const uint32_t local_size = sycl::min(max_wg_size, vec_count);
+  const uint32_t local_size = std::max(1u, sycl::min(max_wg_size, vec_count));
 
   sycl::range<1> global_range{static_cast<size_t>(m) * local_size};
   sycl::range<1> local_range{local_size};
-  sycl::nd_range<1> nd_range{sycl::range<1>(static_cast<size_t>(m) * local_size), sycl::range<1>(local_size)};
 
   ApplyShuffleMulSum<T, T1, VecSize> task(input, output, permutation, factors, m, topk, row_stride);
 
@@ -541,6 +549,27 @@ void apply_shuffle_mul_sum(
   TORCH_CHECK(input.dim() == 2, "input_tensor must be 2D [m * topk, row_stride]");
   TORCH_CHECK(output.dim() == 2, "output_tensor must be 2D [m, row_stride]");
   TORCH_CHECK(permutation.dim() == 1, "permutation must be 1D [m * topk]");
+
+  // Validate dtypes to match the assumptions in apply_shuffle_mul_sum_impl.
+  TORCH_CHECK(
+      input.scalar_type() == output.scalar_type(), "input and output must have the same dtype");
+  TORCH_CHECK(permutation.scalar_type() == at::kInt, "permutation must have dtype int32");
+
+  // Validate contiguity / dense row-major layout assumptions.
+  TORCH_CHECK(
+      input.stride(1) == 1 && output.stride(1) == 1,
+      "input and output must be contiguous in the last dimension (stride(1) == 1)");
+  TORCH_CHECK(permutation.is_contiguous(), "permutation tensor must be contiguous");
+  if (factors.has_value()) {
+    TORCH_CHECK(factors->is_contiguous(), "factors tensor must be contiguous when provided");
+  }
+
+  // Validate shape relationships: input is [m * topk, row_stride],
+  // output is [m, row_stride], permutation is [m * topk].
+  TORCH_CHECK(input.size(1) == output.size(1), "input and output must have the same row_stride (size(1))");
+  TORCH_CHECK(
+      input.size(0) == permutation.numel(),
+      "input.size(0) must equal permutation.numel() (m * topk)");
 
   SYCL_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::BFloat16, at::ScalarType::Half, input.scalar_type(), "apply_shuffle_mul_sum", [&]() {

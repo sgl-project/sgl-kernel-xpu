@@ -514,12 +514,6 @@ void apply_shuffle_mul_sum_impl(
     torch::Tensor& output_tensor,
     const torch::Tensor& permutation_tensor,
     const std::optional<torch::Tensor>& factors_tensor) {
-  int m = output_tensor.size(0);
-  // Early exit for empty tensors to avoid division by zero and invalid work-group sizes.
-  if (m == 0) {
-    return;
-  }
-
   auto input = reinterpret_cast<T*>(input_tensor.data_ptr());
   auto permutation = reinterpret_cast<const int32_t*>(permutation_tensor.data_ptr());
   auto output = reinterpret_cast<T*>(output_tensor.data_ptr());
@@ -533,6 +527,7 @@ void apply_shuffle_mul_sum_impl(
 
   constexpr uint32_t VecSize = 16u / sizeof(T);  // 128-bit
 
+  int m = output_tensor.size(0);
   int topk = int(permutation_tensor.size(0) / m);
   int row_stride = output_tensor.size(1);
   const uint32_t vec_count = static_cast<uint32_t>(row_stride) / VecSize;

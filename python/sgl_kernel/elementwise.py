@@ -33,7 +33,6 @@ def rmsnorm(
     output: torch.Tensor
         Normalized tensor, shape (batch_size, hidden_size).
     """
-    input = input.contiguous()
     if out is None:
         out = torch.empty_like(input)
     torch.ops.sgl_kernel.rmsnorm(out, input, weight, eps)
@@ -68,8 +67,6 @@ def fused_add_rmsnorm(
     enable_pdl: Optional[bool]
         Not Used on XPU.
     """
-    assert input.is_contiguous(), "input tensor must be contiguous"
-    assert residual.is_contiguous(), "residual tensor must be contiguous"
     torch.ops.sgl_kernel.fused_add_rmsnorm(input, residual, weight, eps)
 
 
@@ -102,7 +99,6 @@ def gemma_rmsnorm(
     output: torch.Tensor
         Gemma Normalized tensor, shape (batch_size, hidden_size).
     """
-    input = input.contiguous()
     if out is None:
         out = torch.empty_like(input)
     torch.ops.sgl_kernel.gemma_rmsnorm(out, input, weight, eps)
@@ -137,8 +133,6 @@ def gemma_fused_add_rmsnorm(
     enable_pdl: Optional[bool]
         Not Used on XPU.
     """
-    assert input.is_contiguous(), "input tensor must be contiguous"
-    assert residual.is_contiguous(), "residual tensor must be contiguous"
     torch.ops.sgl_kernel.gemma_fused_add_rmsnorm(input, residual, weight, eps)
 
 

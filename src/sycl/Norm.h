@@ -13,7 +13,7 @@ constexpr int NUM_REDUCE_STAGES = 16;
 #define DECLARE_SYCL_GLOBAL_FENCE sycl::access::fence_space::global_space
 #define DECLARE_SYCL_GLOBAL_AND_LOCAL_FENCE dpcpp_global_and_local_fence = sycl::access::fence_space::global_and_local
 
-inline std::pair<int64_t, int64_t> _check_layer_norm_inputs(
+inline std::tuple<int64_t, int64_t, int64_t> _check_layer_norm_inputs(
     const torch::Tensor& input,
     IntArrayRef normalized_shape,
     std::optional<torch::Tensor>& weight /* optional */,
@@ -34,8 +34,9 @@ inline std::pair<int64_t, int64_t> _check_layer_norm_inputs(
 
   unsigned int batch_size = input.size(0);
   unsigned int hidden_size = input.size(1);
+  unsigned int batch_stride = input.stride(0);
 
-  return std::make_pair(batch_size, hidden_size);
+  return std::make_tuple(batch_size, hidden_size, batch_stride);
 }
 
 template <typename accscalar_t, typename reduce_op, typename nd_item_id, typename local_shared>
@@ -98,8 +99,8 @@ static inline void norm_group_reduce(
 
 class NormConfig {
  public:
-  NormConfig(int Batch, int Plane, int problem_dim, int element_size_bytes)
-      : Batch(Batch), Plane(Plane), problem_dim(problem_dim), element_size_bytes(element_size_bytes) {
+  NormConfig(int Batch, int Plane, int problem_dim, int element_size_bytes, int input_batch_stride, int output_batch_stride)
+      : Batch(Batch), Plane(Plane), problem_dim(problem_dim), element_size_bytes(element_size_bytes), input_batch_stride(input_batch_stride), output_batch_stride(output_batch_stride) {
     semaphores_ptr = nullptr;
     scratchpad_ptr = nullptr;
     sub_group_num_global = 1;
@@ -126,6 +127,8 @@ class NormConfig {
   int workgroup_size;
   int sub_group_num;
 
+  int input_batch_stride;
+  int output_batch_stride;
   int* semaphores_ptr;
   void* scratchpad_ptr;
   int sub_group_num_global;

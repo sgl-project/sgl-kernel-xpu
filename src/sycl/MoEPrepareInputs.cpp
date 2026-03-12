@@ -567,19 +567,9 @@ void apply_shuffle_mul_sum(
   // Validate shape relationships: input is [m * topk, row_stride],
   // output is [m, row_stride], permutation is [m * topk].
   TORCH_CHECK(input.size(1) == output.size(1), "input and output must have the same row_stride (size(1))");
-  const auto m = output.size(0);
   TORCH_CHECK(
       input.size(0) == permutation.numel(),
       "input.size(0) must equal permutation.numel() (m * topk)");
-  if (m > 0) {
-    TORCH_CHECK(
-        permutation.numel() % m == 0,
-        "permutation.numel() must be divisible by m (output.size(0))");
-  } else {
-    TORCH_CHECK(
-        permutation.numel() == 0 && input.size(0) == 0,
-        "when m == 0, input and permutation must have zero elements");
-  }
 
   SYCL_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::BFloat16, at::ScalarType::Half, input.scalar_type(), "apply_shuffle_mul_sum", [&]() {

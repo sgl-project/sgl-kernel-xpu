@@ -312,7 +312,15 @@ void launch_vectorized_fused_norm_kernel(Norm<scalar_t, weight_t, mean_t>& norm,
 
 template <typename scalar_t, typename weight_t, typename mean_t = float>
 void RMSNormKernelImplInternal(
-    const Tensor& X, const Tensor& gemma, int64_t M, int64_t N, acc_type<scalar_t> eps, Tensor& Y, Tensor& rstd, int64_t input_batch_stride, int64_t output_batch_stride) {
+    const Tensor& X,
+    const Tensor& gemma,
+    int64_t M,
+    int64_t N,
+    acc_type<scalar_t> eps,
+    Tensor& Y,
+    Tensor& rstd,
+    int64_t input_batch_stride,
+    int64_t output_batch_stride) {
   scalar_t* X_data = X.data_ptr<scalar_t>();
   scalar_t* Y_data = Y.data_ptr<scalar_t>();
   mean_t* var_data = rstd.data_ptr<mean_t>();
@@ -351,7 +359,15 @@ void FusedAddRMSNormKernelImplInternal(
 
 template <typename scalar_t, typename weight_t, typename mean_t = float>
 void GemmaRMSNormKernelImplInternal(
-    const Tensor& X, const Tensor& gemma, int64_t M, int64_t N, acc_type<scalar_t> eps, Tensor& Y, Tensor& rstd, int64_t input_batch_stride, int64_t output_batch_stride) {
+    const Tensor& X,
+    const Tensor& gemma,
+    int64_t M,
+    int64_t N,
+    acc_type<scalar_t> eps,
+    Tensor& Y,
+    Tensor& rstd,
+    int64_t input_batch_stride,
+    int64_t output_batch_stride) {
   scalar_t* X_data = X.data_ptr<scalar_t>();
   scalar_t* Y_data = Y.data_ptr<scalar_t>();
   mean_t* var_data = rstd.data_ptr<mean_t>();
@@ -406,7 +422,15 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "RMSNormKernelImpl", [&]() {
         RMSNormKernelImplInternal<scalar_t, scalar_t>(
-            input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), output_, rstd, input_batch_stride, output_batch_stride);
+            input_,
+            weight_,
+            M,
+            N,
+            static_cast<acc_type<scalar_t>>(eps),
+            output_,
+            rstd,
+            input_batch_stride,
+            output_batch_stride);
       });
 }
 
@@ -445,7 +469,15 @@ void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& w
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
         GemmaRMSNormKernelImplInternal<scalar_t, scalar_t>(
-            input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), output_, rstd, input_batch_stride, output_batch_stride);
+            input_,
+            weight_,
+            M,
+            N,
+            static_cast<acc_type<scalar_t>>(eps),
+            output_,
+            rstd,
+            input_batch_stride,
+            output_batch_stride);
       });
 }
 

@@ -99,8 +99,14 @@ static inline void norm_group_reduce(
 
 class NormConfig {
  public:
-  NormConfig(int Batch, int Plane, int problem_dim, int element_size_bytes, int input_batch_stride, int output_batch_stride)
-      : Batch(Batch), Plane(Plane), problem_dim(problem_dim), element_size_bytes(element_size_bytes), input_batch_stride(input_batch_stride), output_batch_stride(output_batch_stride) {
+  NormConfig(
+      int Batch, int Plane, int problem_dim, int element_size_bytes, int input_batch_stride, int output_batch_stride)
+      : Batch(Batch),
+        Plane(Plane),
+        problem_dim(problem_dim),
+        element_size_bytes(element_size_bytes),
+        input_batch_stride(input_batch_stride),
+        output_batch_stride(output_batch_stride) {
     semaphores_ptr = nullptr;
     scratchpad_ptr = nullptr;
     sub_group_num_global = 1;

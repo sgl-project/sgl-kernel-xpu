@@ -87,7 +87,7 @@ class MoEGEMM {
   struct Params {
     const ElementA* Activations;
     const ElementB* Weights;
-    const ElementD* Bias;
+    const float* Bias;
     ElementD* Outputs;
     const int32_t* M_per_group;
     const int32_t N;
@@ -109,22 +109,22 @@ class MoEGEMM {
     }
   }
 
-  auto make_Bias_tensors(ElementD* ptr_Bias, int N) {
+  auto make_Bias_tensors(float* ptr_Bias, int N) {
     if constexpr (WithBias) {
       if constexpr (FuseAct) {
-        auto Bias0 = make_tensor(make_gmem_ptr<ElementD>(ptr_Bias), make_layout(make_shape(N / 2), make_stride(_1{})));
-        ElementD* ptr_Bias1 = ptr_Bias + (N / 2);
-        auto Bias1 = make_tensor(make_gmem_ptr<ElementD>(ptr_Bias1), make_layout(make_shape(N / 2), make_stride(_1{})));
+        auto Bias0 = make_tensor(make_gmem_ptr<float>(ptr_Bias), make_layout(make_shape(N / 2), make_stride(_1{})));
+        float* ptr_Bias1 = ptr_Bias + (N / 2);
+        auto Bias1 = make_tensor(make_gmem_ptr<float>(ptr_Bias1), make_layout(make_shape(N / 2), make_stride(_1{})));
         return cute::make_tuple(Bias0, Bias1);
       } else {
-        auto Bias = make_tensor(make_gmem_ptr<ElementD>(ptr_Bias), make_layout(make_shape(N), make_stride(_1{})));
+        auto Bias = make_tensor(make_gmem_ptr<float>(ptr_Bias), make_layout(make_shape(N), make_stride(_1{})));
         return cute::make_tuple(Bias);
       }
     } else {
       // return a tuple of empty tensors
       return cute::make_tuple(
-          make_tensor(make_gmem_ptr<ElementD>(nullptr), make_layout(make_shape(0), make_stride(_1{}))),
-          make_tensor(make_gmem_ptr<ElementD>(nullptr), make_layout(make_shape(0), make_stride(_1{}))));
+          make_tensor(make_gmem_ptr<float>(nullptr), make_layout(make_shape(0), make_stride(_1{}))),
+          make_tensor(make_gmem_ptr<float>(nullptr), make_layout(make_shape(0), make_stride(_1{}))));
     }
   }
 
@@ -190,9 +190,9 @@ class MoEGEMM {
       int64_t B_offset = static_cast<int64_t>(expert_id) * static_cast<int64_t>(N) * static_cast<int64_t>(K);
       ElementA* ptr_A_curr_batch = const_cast<ElementA*>(params.Activations) + pre_rows * K;
       ElementB* ptr_B_curr_batch = const_cast<ElementB*>(params.Weights) + B_offset;
-      ElementD* ptr_Bias_curr_batch = nullptr;
+      float* ptr_Bias_curr_batch = nullptr;
       if constexpr (WithBias) {
-        ptr_Bias_curr_batch = const_cast<ElementD*>(params.Bias) + expert_id * N;
+        ptr_Bias_curr_batch = const_cast<float*>(params.Bias) + expert_id * N;
       }
 
       auto A_tensor =

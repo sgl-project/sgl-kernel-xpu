@@ -310,9 +310,13 @@ def fused_experts(
     assert w1.dtype == torch.bfloat16, "w1 must be bfloat16"
     assert w2.dtype == torch.bfloat16, "w2 must be bfloat16"
     if b1 is not None:
-        assert b1.dtype == torch.bfloat16, "b1 must be bfloat16"
+        assert (
+            b1.dtype == torch.bfloat16 or b1.dtype == torch.float32
+        ), "b1 must be bfloat16 or float32"
     if b2 is not None:
-        assert b2.dtype == torch.bfloat16, "b2 must be bfloat16"
+        assert (
+            b2.dtype == torch.bfloat16 or b2.dtype == torch.float32
+        ), "b2 must be bfloat16 or float32"
 
     # Shape check
     assert hidden_states.ndim == 2, "hidden_states must be 2D"

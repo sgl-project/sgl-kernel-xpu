@@ -46,7 +46,7 @@ void Xe20MoEGEMMLauncher(
   using TensorA = decltype(make_dummy_tensor(Element{}, StrideA{}));
   using TensorB = decltype(make_dummy_tensor(Element{}, StrideB{}));
   using TensorD = decltype(make_dummy_tensor(Element{}, StrideD{}));
-  using TensorBias = decltype(make_dummy_bias(Element{}));
+  using TensorBias = decltype(make_dummy_bias(float{}));
 
   using ElementA_non_CV = cutlass::platform::remove_cv_t<Element>;
   using MMA =
@@ -74,7 +74,7 @@ void Xe20MoEGEMMLauncher(
   typename Kernel::Params params{
       static_cast<const Element*>(activations),
       static_cast<const Element*>(weights),
-      static_cast<const Element*>(bias),
+      static_cast<const float*>(bias),
       static_cast<Element*>(outputs),
       num_rows_per_expert_device,
       gemm_n,

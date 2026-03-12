@@ -207,7 +207,7 @@ class MoEGEMM {
 
         CollectiveMainloop mainloop;
         if constexpr (FuseAct) {
-          auto tile_coord = make_coord(m_coord, n_coord, 0);
+          auto tile_coord = make_coord(m_coord, n_coord, n_coord);
           mainloop(
               A_tensor,
               get<0>(B_tensor),

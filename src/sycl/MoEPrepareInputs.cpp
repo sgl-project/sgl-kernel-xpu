@@ -337,44 +337,57 @@ void prepare_moe_input(
   return;
 }
 
+template <typename T, uint32_t N>
+struct alignas(16) VecArray {
+  T data[N];
+};
+
+template <typename T, uint32_t N>
+inline void vec_cast_to_float(const VecArray<T, N>& src, float (&dst)[N]) {
+#pragma unroll
+  for (uint32_t i = 0; i < N; ++i)
+    dst[i] = static_cast<float>(src.data[i]);
+}
+
+template <typename T, uint32_t N>
+inline void vec_cast_from_float(const float (&src)[N], VecArray<T, N>& dst) {
+#pragma unroll
+  for (uint32_t i = 0; i < N; ++i)
+    dst.data[i] = static_cast<T>(src[i]);
+}
+
 template <typename T>
-struct ShuffleRows {
-  ShuffleRows(
-      const T* input,
-      const int32_t* dst2src_map,
-      T* output,
-      const uint32_t num_src_rows,
-      const uint32_t num_dest_rows,
-      const uint32_t num_cols,
-      const uint32_t bs_num_cols)
-      : input_(input),
-        dst2src_map_(dst2src_map),
-        output_(output),
-        num_src_rows_(num_src_rows),
-        num_dest_rows_(num_dest_rows),
-        num_cols_(num_cols),
-        bs_num_cols_(bs_num_cols) {}
+struct ShuffleRowsKernel {
+  static constexpr uint32_t ELEM_PER_THREAD = 16u / sizeof(T);  // 128-bit
+  using DataElem = VecArray<T, ELEM_PER_THREAD>;
+
+  const T* input;
+  const int32_t* dst2src_map;
+  T* output;
+  int64_t num_cols;
+  int64_t num_elems_in_col;  // == num_cols / ELEM_PER_THREAD
+
+  ShuffleRowsKernel(const T* input_, const int32_t* dst2src_map_, T* output_, int64_t num_cols_)
+      : input(input_),
+        dst2src_map(dst2src_map_),
+        output(output_),
+        num_cols(num_cols_),
+        num_elems_in_col(num_cols_ / static_cast<int64_t>(ELEM_PER_THREAD)) {}
 
   void operator()(sycl::nd_item<1> item) const {
-    int gid = item.get_global_linear_id();
-    int tid = item.get_local_linear_id();
-    // Leave it to compiler for simd sub-group
-    if (gid < num_dest_rows_ * bs_num_cols_) {
-      uint32_t dest_token_idx = item.get_group(0);
-      uint32_t source_token_idx = dst2src_map_[dest_token_idx];
-      for (int i = tid; i < num_cols_; i += bs_num_cols_) {
-        auto source_val = input_[source_token_idx * num_cols_ + i];
-        output_[dest_token_idx * num_cols_ + i] = source_val;
-      }
+    const int64_t dest_row_idx = static_cast<int64_t>(item.get_group(0));
+    const int64_t source_row_idx = static_cast<int64_t>(dst2src_map[dest_row_idx]);
+
+    const auto* source_row_ptr = reinterpret_cast<const DataElem*>(input + source_row_idx * num_cols);
+    auto* dest_row_ptr = reinterpret_cast<DataElem*>(output + dest_row_idx * num_cols);
+
+    const int64_t start_offset = static_cast<int64_t>(item.get_local_id(0));
+    const int64_t stride = static_cast<int64_t>(item.get_local_range(0));
+
+    for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
+      dest_row_ptr[elem_index] = source_row_ptr[elem_index];
     }
   }
-  const T* input_;
-  const int32_t* dst2src_map_;
-  T* output_;
-  const uint32_t num_src_rows_;
-  const uint32_t num_dest_rows_;
-  const uint32_t num_cols_;
-  const uint32_t bs_num_cols_;
 };
 
 template <typename T>
@@ -383,7 +396,7 @@ void shuffle_rows_kernel_impl(
   auto input = reinterpret_cast<T*>(input_tensor.data_ptr());
   auto dst2srcmap = reinterpret_cast<const int32_t*>(dst2src_map.data_ptr());
   auto output = reinterpret_cast<T*>(output_tensor.data_ptr());
-
+  uint32_t threads_per_block = 256;
   uint32_t num_src_rows = input_tensor.size(0);
   uint32_t num_dest_rows = output_tensor.size(0);
   uint32_t num_cols = input_tensor.size(1);
@@ -391,19 +404,13 @@ void shuffle_rows_kernel_impl(
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
 
-  using Kernel = ShuffleRows<T>;
+  using Kernel = ShuffleRowsKernel<T>;
+  sycl::range<1> global_range{static_cast<size_t>(num_dest_rows) * threads_per_block};
+  sycl::range<1> local_range{threads_per_block};
 
-  auto dev_id = input_tensor.device().index();
-  uint32_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
-  uint32_t max_num_cols = static_cast<uint32_t>(sycl::min(max_wg_size, num_cols));
-
-  sycl::range<1> global_range{num_dest_rows * max_num_cols};
-  sycl::range<1> local_range{max_num_cols};
-
-  Kernel task(input, dst2srcmap, output, num_src_rows, num_dest_rows, num_cols, max_num_cols);
+  Kernel task(input, dst2srcmap, output, num_cols);
 
   sycl_kernel_submit(global_range, local_range, queue, task);
-  return;
 }
 
 void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor) {
@@ -417,74 +424,113 @@ void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2sr
   return;
 }
 
-template <typename T, typename T1>
+template <typename T, typename T1, uint32_t VecSize>
 struct ApplyShuffleMulSum {
+  using LoadVec = VecArray<T, VecSize>;
+
   ApplyShuffleMulSum(
-      const T* input,
-      T* output,
-      const int32_t* dst2src_map,
-      const T1* factors,
-      const int32_t topk,
-      const int32_t hidden_dim,
-      const int32_t bs_hidden_dim)
+      const T* input, T* output, const int32_t* permutation, const T1* factors, int m, int topk, int row_stride)
       : input_(input),
         output_(output),
-        dst2src_map_(dst2src_map),
+        permutation_(permutation),
         factors_(factors),
+        m_(m),
         topk_(topk),
-        hidden_dim_(hidden_dim),
-        bs_hidden_dim_(bs_hidden_dim) {}
+        row_stride_(row_stride) {}
 
   void operator()(sycl::nd_item<1> item) const {
-    int out_tkn_id = item.get_group(0);
-    for (int i = item.get_local_id(0); i < hidden_dim_; i += bs_hidden_dim_) {
-      float sum_val = 0;
-      for (int k = 0; k < topk_; ++k) {
-        int src_perm_offset = out_tkn_id * topk_ + k;
-        int src_index = dst2src_map_[src_perm_offset];
-        float src_val = static_cast<float>(input_[src_index * hidden_dim_ + i]);
-        float weight = 0;
-        if (factors_ != nullptr) {
-          weight = static_cast<float>(factors_[out_tkn_id * topk_ + k]);
-        }
-        sum_val += weight * src_val;
+    const int i = static_cast<int>(item.get_group(0));  // token index
+    const int thread_idx = static_cast<int>(item.get_local_id(0));
+    const int stride = static_cast<int>(item.get_local_range(0));
+
+    if (i >= m_) return;
+
+    const int vec_count = row_stride_ / static_cast<int>(VecSize);
+
+    for (int d_vec_idx = thread_idx; d_vec_idx < vec_count; d_vec_idx += stride) {
+      const int d = d_vec_idx * static_cast<int>(VecSize);
+
+      float sum[VecSize] = {};
+
+      for (int j = 0; j < topk_; ++j) {
+        const int token_major_idx = i * topk_ + j;
+        const int src_row = permutation_[token_major_idx];
+
+        LoadVec raw;
+        raw = *reinterpret_cast<const LoadVec*>(input_ + src_row * row_stride_ + d);
+
+        float val[VecSize];
+        vec_cast_to_float(raw, val);
+
+        const float factor = (factors_ != nullptr) ? static_cast<float>(factors_[token_major_idx]) : 1.0f;
+
+#pragma unroll
+        for (uint32_t k = 0; k < VecSize; ++k)
+          sum[k] += factor * val[k];
       }
-      output_[out_tkn_id * hidden_dim_ + i] = sum_val;
+
+      LoadVec out_vec;
+      vec_cast_from_float(sum, out_vec);
+      *reinterpret_cast<LoadVec*>(output_ + i * row_stride_ + d) = out_vec;
+    }
+
+    // tail processing
+    const int remainder_start = vec_count * static_cast<int>(VecSize);
+    for (int d = remainder_start + thread_idx; d < row_stride_; d += stride) {
+      float sum_val = 0.0f;
+      for (int j = 0; j < topk_; ++j) {
+        const int token_major_idx = i * topk_ + j;
+        const int src_row = permutation_[token_major_idx];
+
+        const float val = static_cast<float>(input_[src_row * row_stride_ + d]);
+        const float factor = (factors_ != nullptr) ? static_cast<float>(factors_[token_major_idx]) : 1.0f;
+
+        sum_val += factor * val;
+      }
+      output_[i * row_stride_ + d] = static_cast<T>(sum_val);
     }
   }
-  const T* input_;
-  const int32_t* dst2src_map_;
-  T* output_;
-  const T1* factors_;
-  const int32_t topk_;
-  const int32_t hidden_dim_;
-  const int32_t bs_hidden_dim_;
+
+  const T* input_;              // [m * topk, row_stride]
+  T* output_;                   // [m, row_stride]
+  const int32_t* permutation_;  // [m * topk]
+  const T1* factors_;           // [m * topk], nullable
+  int m_;
+  int topk_;
+  int row_stride_;
 };
 
 template <typename T, typename T1>
 void apply_shuffle_mul_sum_impl(
-    const T* input,
-    T* output,
-    const int32_t* dst2src_map,
-    const T1* factors,
-    const uint32_t out_tkns,
-    const uint32_t out_hidden_dims,
-    const int topk,
-    uint32_t max_wg_size) {
+    const torch::Tensor& input_tensor,
+    torch::Tensor& output_tensor,
+    const torch::Tensor& permutation_tensor,
+    const std::optional<torch::Tensor>& factors_tensor) {
+  auto input = reinterpret_cast<T*>(input_tensor.data_ptr());
+  auto permutation = reinterpret_cast<const int32_t*>(permutation_tensor.data_ptr());
+  auto output = reinterpret_cast<T*>(output_tensor.data_ptr());
+  T1* factors = nullptr;
+  if (factors_tensor.has_value()) factors = reinterpret_cast<T1*>(factors_tensor->data_ptr());
+
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
 
-  using Kernel = ApplyShuffleMulSum<T, T1>;
+  constexpr uint32_t VecSize = 16u / sizeof(T);  // 128-bit
+  constexpr uint32_t max_wg_size = 256;
 
-  uint32_t max_out_hidden_dims = static_cast<uint32_t>(sycl::min(max_wg_size, out_hidden_dims));
+  int m = output_tensor.size(0);
+  int topk = int(permutation_tensor.size(0) / m);
+  int row_stride = output_tensor.size(1);
+  const uint32_t vec_count = static_cast<uint32_t>(row_stride) / VecSize;
+  const uint32_t local_size = sycl::min(max_wg_size, vec_count);
 
-  sycl::range<1> global_range{out_tkns * max_out_hidden_dims};
-  sycl::range<1> local_range{max_out_hidden_dims};
+  sycl::range<1> global_range{static_cast<size_t>(m) * local_size};
+  sycl::range<1> local_range{local_size};
+  sycl::nd_range<1> nd_range{sycl::range<1>(static_cast<size_t>(m) * local_size), sycl::range<1>(local_size)};
 
-  Kernel task(input, output, dst2src_map, factors, topk, out_hidden_dims, max_out_hidden_dims);
+  ApplyShuffleMulSum<T, T1, VecSize> task(input, output, permutation, factors, m, topk, row_stride);
 
   sycl_kernel_submit(global_range, local_range, queue, task);
-  return;
 }
 
 void apply_shuffle_mul_sum(
@@ -492,39 +538,21 @@ void apply_shuffle_mul_sum(
     torch::Tensor& output,
     const torch::Tensor& permutation,
     const std::optional<torch::Tensor>& factors) {
-  int m = output.size(0);
-  int topk = int(permutation.size(0) / m);
-
-  auto dev_id = input.device().index();
-  uint32_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
+  TORCH_CHECK(input.dim() == 2, "input_tensor must be 2D [m * topk, row_stride]");
+  TORCH_CHECK(output.dim() == 2, "output_tensor must be 2D [m, row_stride]");
+  TORCH_CHECK(permutation.dim() == 1, "permutation must be 1D [m * topk]");
 
   SYCL_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::BFloat16, at::ScalarType::Half, input.scalar_type(), "apply_shuffle_mul_sum", [&]() {
         using input_t = scalar_t;
         if (factors.has_value()) {
           SYCL_DISPATCH_FLOATING_TYPES_AND2(
-              at::ScalarType::BFloat16, at::ScalarType::Half, factors.value().scalar_type(), "factors dispatch", [&]() {
-                using factors_t = scalar_t;
-                apply_shuffle_mul_sum_impl<input_t, factors_t>(
-                    reinterpret_cast<input_t*>(input.data_ptr()),
-                    reinterpret_cast<input_t*>(output.data_ptr()),
-                    reinterpret_cast<int32_t*>(permutation.data_ptr()),
-                    reinterpret_cast<factors_t*>(factors->data_ptr()),
-                    output.size(0),
-                    output.size(1),
-                    topk,
-                    max_wg_size);
+              at::ScalarType::BFloat16, at::ScalarType::Half, factors->scalar_type(), "factors_dtype", [&]() {
+                using factor_t = scalar_t;
+                apply_shuffle_mul_sum_impl<input_t, factor_t>(input, output, permutation, factors);
               });
         } else {
-          apply_shuffle_mul_sum_impl<input_t, input_t>(
-              reinterpret_cast<input_t*>(input.data_ptr()),
-              reinterpret_cast<input_t*>(output.data_ptr()),
-              reinterpret_cast<int32_t*>(permutation.data_ptr()),
-              nullptr,
-              output.size(0),
-              output.size(1),
-              topk,
-              max_wg_size);
+          apply_shuffle_mul_sum_impl<input_t, float>(input, output, permutation, factors);
         }
       });
   return;

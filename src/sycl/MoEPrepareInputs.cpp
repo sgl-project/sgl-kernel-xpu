@@ -551,8 +551,7 @@ void apply_shuffle_mul_sum(
   TORCH_CHECK(permutation.dim() == 1, "permutation must be 1D [m * topk]");
 
   // Validate dtypes to match the assumptions in apply_shuffle_mul_sum_impl.
-  TORCH_CHECK(
-      input.scalar_type() == output.scalar_type(), "input and output must have the same dtype");
+  TORCH_CHECK(input.scalar_type() == output.scalar_type(), "input and output must have the same dtype");
   TORCH_CHECK(permutation.scalar_type() == at::kInt, "permutation must have dtype int32");
 
   // Validate contiguity / dense row-major layout assumptions.
@@ -567,9 +566,7 @@ void apply_shuffle_mul_sum(
   // Validate shape relationships: input is [m * topk, row_stride],
   // output is [m, row_stride], permutation is [m * topk].
   TORCH_CHECK(input.size(1) == output.size(1), "input and output must have the same row_stride (size(1))");
-  TORCH_CHECK(
-      input.size(0) == permutation.numel(),
-      "input.size(0) must equal permutation.numel() (m * topk)");
+  TORCH_CHECK(input.size(0) == permutation.numel(), "input.size(0) must equal permutation.numel() (m * topk)");
 
   SYCL_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::BFloat16, at::ScalarType::Half, input.scalar_type(), "apply_shuffle_mul_sum", [&]() {

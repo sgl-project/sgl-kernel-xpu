@@ -26,6 +26,8 @@ list(APPEND ATen_XPU_CPP_SRCS ${host_cpp})
 list(APPEND ATen_XPU_SYCL_COMMON ${device_cpp_common})
 list(APPEND ATen_XPU_SYCL_XE20 ${device_cpp_xe20})
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmXe20Instantiations.cmake)
+
 set(ATen_XPU_CPP_SRCS ${ATen_XPU_CPP_SRCS} PARENT_SCOPE)
 set(ATen_XPU_SYCL_COMMON ${ATen_XPU_SYCL_COMMON} PARENT_SCOPE)
 set(ATen_XPU_SYCL_XE20 ${ATen_XPU_SYCL_XE20} PARENT_SCOPE)

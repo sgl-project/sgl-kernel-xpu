@@ -34,7 +34,6 @@ def flash_attn_baseline(
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
             return_softmax_lse=True,
         )
         return out, lse

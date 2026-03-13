@@ -1,9 +1,8 @@
-#include <ATen/ATEN.h>
+#include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
 #include <sycl/sycl.hpp>
-#include <cstring>
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
@@ -320,8 +319,89 @@ void prepare_moe_input(
   return;
 }
 
+template <typename T>
+struct ShuffleRows {
+  ShuffleRows(
+      const T* input,
+      const int32_t* dst2src_map,
+      T* output,
+      const uint32_t num_src_rows,
+      const uint32_t num_dest_rows,
+      const uint32_t num_cols,
+      const uint32_t bs_num_cols)
+      : input_(input),
+        dst2src_map_(dst2src_map),
+        output_(output),
+        num_src_rows_(num_src_rows),
+        num_dest_rows_(num_dest_rows),
+        num_cols_(num_cols),
+        bs_num_cols_(bs_num_cols) {}
+
+  void operator()(sycl::nd_item<1> item) const {
+    int gid = item.get_global_linear_id();
+    int tid = item.get_local_linear_id();
+    // Leave it to compiler for simd sub-group
+    if (gid < num_dest_rows_ * bs_num_cols_) {
+      uint32_t dest_token_idx = item.get_group(0);
+      uint32_t source_token_idx = dst2src_map_[dest_token_idx];
+      for (int i = tid; i < num_cols_; i += bs_num_cols_) {
+        auto source_val = input_[source_token_idx * num_cols_ + i];
+        output_[dest_token_idx * num_cols_ + i] = source_val;
+      }
+    }
+  }
+  const T* input_;
+  const int32_t* dst2src_map_;
+  T* output_;
+  const uint32_t num_src_rows_;
+  const uint32_t num_dest_rows_;
+  const uint32_t num_cols_;
+  const uint32_t bs_num_cols_;
+};
+
+template <typename T>
+void shuffle_rows_kernel_impl(
+    const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor) {
+  auto input = reinterpret_cast<T*>(input_tensor.data_ptr());
+  auto dst2srcmap = reinterpret_cast<const int32_t*>(dst2src_map.data_ptr());
+  auto output = reinterpret_cast<T*>(output_tensor.data_ptr());
+
+  uint32_t num_src_rows = input_tensor.size(0);
+  uint32_t num_dest_rows = output_tensor.size(0);
+  uint32_t num_cols = input_tensor.size(1);
+
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
+
+  using Kernel = ShuffleRows<T>;
+
+  auto dev_id = input_tensor.device().index();
+  uint32_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
+  uint32_t max_num_cols = static_cast<uint32_t>(sycl::min(max_wg_size, num_cols));
+
+  sycl::range<1> global_range{num_dest_rows * max_num_cols};
+  sycl::range<1> local_range{max_num_cols};
+
+  Kernel task(input, dst2srcmap, output, num_src_rows, num_dest_rows, num_cols, max_num_cols);
+
+  sycl_kernel_submit(global_range, local_range, queue, task);
+  return;
+}
+
+void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor) {
+  TORCH_CHECK(
+      input_tensor.scalar_type() == output_tensor.scalar_type(),
+      "Input and output tensors must have the same data type");
+  SYCL_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::BFloat16, at::ScalarType::Half, input_tensor.scalar_type(), "shuffle_rows_kernel_impl", [&]() {
+        shuffle_rows_kernel_impl<scalar_t>(input_tensor, dst2src_map, output_tensor);
+      });
+  return;
+}
+
 // Scatter kernel: 1 WG per source token, reads token once, scatters to topk destinations.
 // Equivalent to IPEX MoEScatter but uses precomputed src2dst_map (c_map / output_permutation).
+// This is 8x more efficient than shuffle_rows for topk=8: fewer WGs, coalesced reads, data reuse.
 template <typename T>
 struct ScatterTokensToExperts {
   static constexpr int WGSize = 256;
@@ -331,15 +411,7 @@ struct ScatterTokensToExperts {
 
   ScatterTokensToExperts(
       const T* input, T* output, const int32_t* src2dst_map, const int32_t topk, const int32_t hidden_dim)
-      : input_(input), output_(output), src2dst_map_(src2dst_map), topk_(topk), hidden_dim_(hidden_dim) {
-    TORCH_CHECK(
-        topk_ <= MAX_TOPK,
-        "ScatterTokensToExperts: topk (",
-        topk_,
-        ") exceeds MAX_TOPK (",
-        MAX_TOPK,
-        ")");
-  }
+      : input_(input), output_(output), src2dst_map_(src2dst_map), topk_(topk), hidden_dim_(hidden_dim) {}
 
   [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
     int token_id = item.get_group(0);
@@ -351,31 +423,17 @@ struct ScatterTokensToExperts {
       dst_rows[k] = src2dst_map_[token_id * topk_ + k];
     }
 
+    // Source base pointer (sequential, coalesced reads)
+    const T* src_base = input_ + token_id * hidden_dim_ + local_id * ElemsPerItem;
+
     const int loop_count = (hidden_dim_ + Stride - 1) / Stride;
     for (int loop = 0; loop < loop_count; ++loop) {
-      const int elem_offset = loop * Stride + local_id * ElemsPerItem;
-      if (elem_offset < hidden_dim_) {
-        const int remaining = hidden_dim_ - elem_offset;
-        const T* src = input_ + token_id * hidden_dim_ + elem_offset;
-
-        if (remaining >= ElemsPerItem) {
-          using vec_t = sycl::vec<T, ElemsPerItem>;
-          vec_t data;
-          std::memcpy(&data, src, sizeof(vec_t));
-
-          for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
-            T* dst = output_ + dst_rows[k] * hidden_dim_ + elem_offset;
-            std::memcpy(dst, &data, sizeof(vec_t));
-          }
-        } else {
-          // Tail path: fewer than ElemsPerItem elements remain, copy scalars.
-          for (int e = 0; e < remaining; ++e) {
-            const T value = src[e];
-            for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
-              T* dst_row = output_ + dst_rows[k] * hidden_dim_ + elem_offset;
-              dst_row[e] = value;
-            }
-          }
+      if (loop * Stride + local_id * ElemsPerItem < hidden_dim_) {
+        using vec_t = sycl::vec<T, ElemsPerItem>;
+        vec_t data = *(reinterpret_cast<const vec_t*>(src_base + loop * Stride));
+        for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
+          T* dst = output_ + dst_rows[k] * hidden_dim_ + local_id * ElemsPerItem + loop * Stride;
+          *(reinterpret_cast<vec_t*>(dst)) = data;
         }
       }
     }
@@ -461,27 +519,26 @@ struct ApplyShuffleMulSum {
     const int loop_count = (hidden_dim_ + Stride - 1) / Stride;
 
     for (int loop = 0; loop < loop_count; ++loop) {
-      int base = loop * Stride + local_id * ElemsPerItem;
-      if (base < hidden_dim_) {
-        int remaining = hidden_dim_ - base;
-        int elems_this_iter = remaining >= ElemsPerItem ? ElemsPerItem : remaining;
-
+      if (loop * Stride + local_id * ElemsPerItem < hidden_dim_) {
         // Float accumulator for better precision and perf
         sycl::vec<float, ElemsPerItem> acc;
         for (int j = 0; j < ElemsPerItem; ++j)
           acc[j] = 0.0f;
 
         for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
-          const T* src = input_ + src_indices[k] * hidden_dim_ + base;
-          for (int j = 0; j < elems_this_iter; ++j) {
-            acc[j] += static_cast<float>(src[j]) * weights[k];
+          const T* src = input_ + src_indices[k] * hidden_dim_ + local_id * ElemsPerItem + loop * Stride;
+          using vec_t = sycl::vec<T, ElemsPerItem>;
+          vec_t reg = *(reinterpret_cast<const vec_t*>(src));
+          for (int j = 0; j < ElemsPerItem; ++j) {
+            acc[j] += static_cast<float>(reg[j]) * weights[k];
           }
         }
 
-        T* dst = dst_base + loop * Stride;
-        for (int j = 0; j < elems_this_iter; ++j) {
-          dst[j] = static_cast<T>(acc[j]);
-        }
+        using vec_t = sycl::vec<T, ElemsPerItem>;
+        vec_t store;
+        for (int j = 0; j < ElemsPerItem; ++j)
+          store[j] = static_cast<T>(acc[j]);
+        *(reinterpret_cast<vec_t*>(dst_base + loop * Stride)) = store;
       }
     }
   }

@@ -46,7 +46,6 @@ from sgl_kernel.gemm import (
     sgl_per_token_group_quant_fp8,
     sgl_per_token_group_quant_int8,
     sgl_per_token_quant_fp8,
-    shuffle_rows,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.moe import (
@@ -59,6 +58,7 @@ from sgl_kernel.moe import (
     moe_sum,
     moe_sum_reduce,
     prepare_moe_input,
+    scatter_tokens_to_experts,
     swiglu_with_alpha_and_limit,
     topk_softmax,
 )

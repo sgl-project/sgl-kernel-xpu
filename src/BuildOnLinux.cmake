@@ -77,6 +77,8 @@ set(SYCL_LINK_LIBRARIES_KEYWORD)
 foreach(lib ${SGL_OPS_LIBRARIES})
   # Align with PyTorch compile options PYTORCH_SRC_DIR/cmake/public/utils.cmake
   torch_compile_options(${lib})
+  #target_compile_definitions(${lib} PRIVATE TEMPORARY_DECODE)
+
   target_compile_options_if_supported(${lib} "-Wno-deprecated-copy")
   target_compile_options(${lib} PRIVATE ${TORCH_XPU_OPS_FLAGS})
 

@@ -38,8 +38,9 @@
 #include <cute/tensor.hpp>
 
 #include "kernels/chunk_prefill/chunk_prefill_runner.hpp"
+#ifdef TEMPORARY_DECODE
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
-
+#endif
 std::vector<at::Tensor> mha_fwd(
     at::Tensor& q,        // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
@@ -71,6 +72,7 @@ std::vector<at::Tensor> mha_fwd(
     int num_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin) {
+#ifdef TEMPORARY_DECODE
   if (max_seqlen_q == 1 && page_table.has_value()) {
     return decode::mha_fwd(
         q,
@@ -132,5 +134,36 @@ std::vector<at::Tensor> mha_fwd(
         pack_gqa_,
         sm_margin);
   }
+#else
+  return chunkprefill::mha_fwd(
+      q,
+      k,
+      v,
+      q_v_,
+      cu_seqlens_q,
+      cu_seqlens_k,
+      max_seqlen_q,
+      max_seqlen_k,
+      page_table,
+      kv_batch_idx_,
+      leftpad_k_,
+      rotary_cos_,
+      rotary_sin_,
+      seqlens_rotary_,
+      q_descale_,
+      k_descale_,
+      v_descale_,
+      softmax_scale_,
+      sinks_,
+      is_causal,
+      window_size_left,
+      window_size_right,
+      softcap,
+      is_rotary_interleaved,
+      scheduler_metadata_,
+      num_splits,
+      pack_gqa_,
+      sm_margin);
+#endif
 }
 #undef SYCL_INTEL_TARGET

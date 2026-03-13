@@ -323,6 +323,9 @@ void ep_moe_post_reorder(
 
 void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor);
 
+void scatter_tokens_to_experts(
+    const torch::Tensor& input_tensor, const torch::Tensor& src2dst_map, torch::Tensor& output_tensor);
+
 void apply_shuffle_mul_sum(
     const torch::Tensor& input,
     torch::Tensor& output,

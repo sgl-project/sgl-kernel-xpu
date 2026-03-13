@@ -349,10 +349,10 @@ def fused_experts(
     elif inplace:
         out_hidden_states = hidden_states
     else:
-        out_hidden_states = torch.zeros_like(hidden_states)
+        out_hidden_states = torch.empty_like(hidden_states)
 
     topk_ids = topk_ids.int() if topk_ids.dtype == torch.long else topk_ids
-    expert_offsets = torch.zeros((E), dtype=torch.int32, device=hidden_states.device)
+    expert_offsets = torch.empty((E), dtype=torch.int32, device=hidden_states.device)
     problem_sizes1 = torch.empty((E, 3), dtype=torch.int32, device=hidden_states.device)
     problem_sizes2 = torch.empty((E, 3), dtype=torch.int32, device=hidden_states.device)
     a_map = torch.empty(
@@ -376,7 +376,12 @@ def fused_experts(
     input_A_shuffle = torch.empty(
         (num_tokens * TopK, K), device=hidden_states.device, dtype=hidden_states.dtype
     )
-    torch.ops.sgl_kernel.shuffle_rows.default(hidden_states, a_map, input_A_shuffle)
+    # Use scatter_tokens_to_experts (IPEX MoEScatter style):
+    # 1 WG per source token, reads sequentially, scatters to TopK destinations.
+    # 8x fewer WGs than shuffle_rows, with coalesced reads and data reuse.
+    torch.ops.sgl_kernel.scatter_tokens_to_experts.default(
+        hidden_states, c_map, input_A_shuffle
+    )
 
     intermediate_cache3 = torch.empty(
         (M * TopK, OutK), device=hidden_states.device, dtype=hidden_states.dtype

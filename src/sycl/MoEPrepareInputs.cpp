@@ -1,8 +1,9 @@
-#include <ATen/ATen.h>
+#include <ATen/ATEN.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
 #include <sycl/sycl.hpp>
+#include <cstring>
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
@@ -411,7 +412,15 @@ struct ScatterTokensToExperts {
 
   ScatterTokensToExperts(
       const T* input, T* output, const int32_t* src2dst_map, const int32_t topk, const int32_t hidden_dim)
-      : input_(input), output_(output), src2dst_map_(src2dst_map), topk_(topk), hidden_dim_(hidden_dim) {}
+      : input_(input), output_(output), src2dst_map_(src2dst_map), topk_(topk), hidden_dim_(hidden_dim) {
+    TORCH_CHECK(
+        topk_ <= MAX_TOPK,
+        "ScatterTokensToExperts: topk (",
+        topk_,
+        ") exceeds MAX_TOPK (",
+        MAX_TOPK,
+        ")");
+  }
 
   [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
     int token_id = item.get_group(0);
@@ -423,17 +432,31 @@ struct ScatterTokensToExperts {
       dst_rows[k] = src2dst_map_[token_id * topk_ + k];
     }
 
-    // Source base pointer (sequential, coalesced reads)
-    const T* src_base = input_ + token_id * hidden_dim_ + local_id * ElemsPerItem;
-
     const int loop_count = (hidden_dim_ + Stride - 1) / Stride;
     for (int loop = 0; loop < loop_count; ++loop) {
-      if (loop * Stride + local_id * ElemsPerItem < hidden_dim_) {
-        using vec_t = sycl::vec<T, ElemsPerItem>;
-        vec_t data = *(reinterpret_cast<const vec_t*>(src_base + loop * Stride));
-        for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
-          T* dst = output_ + dst_rows[k] * hidden_dim_ + local_id * ElemsPerItem + loop * Stride;
-          *(reinterpret_cast<vec_t*>(dst)) = data;
+      const int elem_offset = loop * Stride + local_id * ElemsPerItem;
+      if (elem_offset < hidden_dim_) {
+        const int remaining = hidden_dim_ - elem_offset;
+        const T* src = input_ + token_id * hidden_dim_ + elem_offset;
+
+        if (remaining >= ElemsPerItem) {
+          using vec_t = sycl::vec<T, ElemsPerItem>;
+          vec_t data;
+          std::memcpy(&data, src, sizeof(vec_t));
+
+          for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
+            T* dst = output_ + dst_rows[k] * hidden_dim_ + elem_offset;
+            std::memcpy(dst, &data, sizeof(vec_t));
+          }
+        } else {
+          // Tail path: fewer than ElemsPerItem elements remain, copy scalars.
+          for (int e = 0; e < remaining; ++e) {
+            const T value = src[e];
+            for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
+              T* dst_row = output_ + dst_rows[k] * hidden_dim_ + elem_offset;
+              dst_row[e] = value;
+            }
+          }
         }
       }
     }
@@ -519,26 +542,27 @@ struct ApplyShuffleMulSum {
     const int loop_count = (hidden_dim_ + Stride - 1) / Stride;
 
     for (int loop = 0; loop < loop_count; ++loop) {
-      if (loop * Stride + local_id * ElemsPerItem < hidden_dim_) {
+      int base = loop * Stride + local_id * ElemsPerItem;
+      if (base < hidden_dim_) {
+        int remaining = hidden_dim_ - base;
+        int elems_this_iter = remaining >= ElemsPerItem ? ElemsPerItem : remaining;
+
         // Float accumulator for better precision and perf
         sycl::vec<float, ElemsPerItem> acc;
         for (int j = 0; j < ElemsPerItem; ++j)
           acc[j] = 0.0f;
 
         for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
-          const T* src = input_ + src_indices[k] * hidden_dim_ + local_id * ElemsPerItem + loop * Stride;
-          using vec_t = sycl::vec<T, ElemsPerItem>;
-          vec_t reg = *(reinterpret_cast<const vec_t*>(src));
-          for (int j = 0; j < ElemsPerItem; ++j) {
-            acc[j] += static_cast<float>(reg[j]) * weights[k];
+          const T* src = input_ + src_indices[k] * hidden_dim_ + base;
+          for (int j = 0; j < elems_this_iter; ++j) {
+            acc[j] += static_cast<float>(src[j]) * weights[k];
           }
         }
 
-        using vec_t = sycl::vec<T, ElemsPerItem>;
-        vec_t store;
-        for (int j = 0; j < ElemsPerItem; ++j)
-          store[j] = static_cast<T>(acc[j]);
-        *(reinterpret_cast<vec_t*>(dst_base + loop * Stride)) = store;
+        T* dst = dst_base + loop * Stride;
+        for (int j = 0; j < elems_this_iter; ++j) {
+          dst[j] = static_cast<T>(acc[j]);
+        }
       }
     }
   }

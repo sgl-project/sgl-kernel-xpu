@@ -1,9 +1,22 @@
 import itertools
+import os
 
 import pandas as pd
 import torch
 import triton
 from sgl_kernel import fused_qk_norm_rope
+
+# Supported dtypes and their properties
+DTYPE_MAP = {
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+    "fp8_e4m3fn": torch.float8_e4m3fn,
+}
+DTYPE_BYTES = {
+    "fp16": 2,
+    "bf16": 2,
+    "fp8_e4m3fn": 1,
+}
 
 
 def llama_rms_norm(x, w, eps=1e-6):
@@ -175,14 +188,45 @@ head_config_range = [
     (128, 128, 128, 128),  # DeepSeek-V3 style
 ]
 is_neox_range = [True, False]
+dtype_range = ["fp16", "bf16", "fp8_e4m3fn"]
 
 configs = []
-for batch_size, seq_len, (nq, nk, nv, hd), is_neox in itertools.product(
-    batch_size_range, seq_len_range, head_config_range, is_neox_range
+for batch_size, seq_len, (nq, nk, nv, hd), is_neox, dtype in itertools.product(
+    batch_size_range, seq_len_range, head_config_range, is_neox_range, dtype_range
 ):
-    configs.append((batch_size, seq_len, nq, nk, nv, hd, is_neox))
+    configs.append((batch_size, seq_len, nq, nk, nv, hd, is_neox, dtype))
 
 all_results = []
+
+# Support running the benchmark in "chunked" mode by setting environment variables:
+# - NUM_CHUNKS: total number of chunks
+# - CHUNK_IDX: index of this chunk (0-based)
+num_chunks = int(os.environ.get("NUM_CHUNKS", "1"))
+chunk_idx = int(os.environ.get("CHUNK_IDX", "0"))
+# Support selecting a single config via env var SINGLE_CONFIG with CSV:
+# "batch_size,seq_len,nq,nk,nv,head_dim,is_neox,dtype"
+single_cfg = os.environ.get("SINGLE_CONFIG", "")
+if single_cfg:
+    parts = [p.strip() for p in single_cfg.split(",")]
+    if len(parts) != 8:
+        raise RuntimeError("SINGLE_CONFIG must have 8 comma-separated fields")
+    bsz = int(parts[0])
+    sl = int(parts[1])
+    nq = int(parts[2])
+    nk = int(parts[3])
+    nv = int(parts[4])
+    hd = int(parts[5])
+    is_neox_val = parts[6].lower() in ("1", "true", "yes")
+    dtype_val = parts[7]
+    configs = [(bsz, sl, nq, nk, nv, hd, is_neox_val, dtype_val)]
+    num_chunks = 1
+    chunk_idx = 0
+if num_chunks > 1:
+    total = len(configs)
+    chunk_size = (total + num_chunks - 1) // num_chunks
+    start = chunk_idx * chunk_size
+    end = min(start + chunk_size, total)
+    configs = configs[start:end]
 
 
 def calculate_flops(
@@ -220,6 +264,7 @@ def calculate_effective_bandwidth(
     head_dim: int,
     rotary_dim: int,
     time_ms: float,
+    bytes_per_elem: int = 2,
 ) -> dict:
     """
     Calculate effective bandwidth and FLOPs for fused QK norm + RoPE kernel.
@@ -229,11 +274,11 @@ def calculate_effective_bandwidth(
     num_tokens = batch_size * seq_len
     num_heads = num_heads_q + num_heads_k + num_heads_v
 
-    # Input/output QKV tensor (bf16)
-    qkv_bytes = num_tokens * num_heads * head_dim * 2
+    # Input/output QKV tensor
+    qkv_bytes = num_tokens * num_heads * head_dim * bytes_per_elem
 
-    # Weight tensors (bf16)
-    weight_bytes = 2 * head_dim * 2  # q_weight + k_weight
+    # Weight tensors
+    weight_bytes = 2 * head_dim * bytes_per_elem  # q_weight + k_weight
 
     # Total bytes (read QKV + write QKV + read weights)
     total_bytes = 2 * qkv_bytes + weight_bytes
@@ -265,6 +310,7 @@ def calculate_effective_bandwidth(
             "num_heads_v",
             "head_dim",
             "is_neox",
+            "dtype",
         ],
         x_vals=configs,
         line_arg="provider",
@@ -284,17 +330,39 @@ def benchmark(
     num_heads_v,
     head_dim,
     is_neox,
+    dtype,
     provider,
 ):
     device = torch.device("xpu")
     num_tokens = batch_size * seq_len
     num_heads = num_heads_q + num_heads_k + num_heads_v
+    torch_dtype = DTYPE_MAP[dtype]
+    is_fp8 = dtype == "fp8_e4m3fn"
 
-    qkv = torch.randn(
-        num_tokens, num_heads * head_dim, device=device, dtype=torch.bfloat16
-    )
-    q_weight = torch.randn(head_dim, device=device, dtype=torch.bfloat16)
-    k_weight = torch.randn(head_dim, device=device, dtype=torch.bfloat16)
+    if is_fp8:
+        # FP8 tensors: create in float32, clamp to representable range, convert
+        qkv = (
+            torch.randn(num_tokens, num_heads * head_dim, device=device, dtype=torch.float32)
+            .clamp(-448.0, 448.0)
+            .to(torch_dtype)
+        )
+        q_weight = (
+            torch.randn(head_dim, device=device, dtype=torch.float32)
+            .clamp(-448.0, 448.0)
+            .to(torch_dtype)
+        )
+        k_weight = (
+            torch.randn(head_dim, device=device, dtype=torch.float32)
+            .clamp(-448.0, 448.0)
+            .to(torch_dtype)
+        )
+    else:
+        qkv = torch.randn(
+            num_tokens, num_heads * head_dim, device=device, dtype=torch_dtype
+        )
+        q_weight = torch.randn(head_dim, device=device, dtype=torch_dtype)
+        k_weight = torch.randn(head_dim, device=device, dtype=torch_dtype)
+
     position_ids = torch.arange(num_tokens, device=device, dtype=torch.int32)
 
     eps = 1e-6
@@ -304,24 +372,48 @@ def benchmark(
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "torch":
-        fn = lambda: fused_qk_norm_rope_reference(
-            qkv.clone(),
-            num_heads_q,
-            num_heads_k,
-            num_heads_v,
-            head_dim,
-            eps,
-            q_weight,
-            k_weight,
-            base,
-            is_neox,
-            position_ids,
-            factor=1.0,
-            low=1.0,
-            high=1.0,
-            attention_factor=1.0,
-            rotary_dim=rotary_dim,
-        )
+        if is_fp8:
+            # PyTorch has no native FP8 compute; upcast to float32 for reference
+            qkv_ref = qkv.to(torch.float32)
+            q_weight_ref = q_weight.to(torch.float32)
+            k_weight_ref = k_weight.to(torch.float32)
+            fn = lambda: fused_qk_norm_rope_reference(
+                qkv_ref.clone(),
+                num_heads_q,
+                num_heads_k,
+                num_heads_v,
+                head_dim,
+                eps,
+                q_weight_ref,
+                k_weight_ref,
+                base,
+                is_neox,
+                position_ids,
+                factor=1.0,
+                low=1.0,
+                high=1.0,
+                attention_factor=1.0,
+                rotary_dim=rotary_dim,
+            ).to(torch_dtype)
+        else:
+            fn = lambda: fused_qk_norm_rope_reference(
+                qkv.clone(),
+                num_heads_q,
+                num_heads_k,
+                num_heads_v,
+                head_dim,
+                eps,
+                q_weight,
+                k_weight,
+                base,
+                is_neox,
+                position_ids,
+                factor=1.0,
+                low=1.0,
+                high=1.0,
+                attention_factor=1.0,
+                rotary_dim=rotary_dim,
+            )
     elif provider == "sglang":
         fn = lambda: fused_qk_norm_rope(
             qkv.clone(),
@@ -344,7 +436,7 @@ def benchmark(
 
     ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
 
-    # Calculate effective bandwidth
+    # Calculate effective bandwidth using the correct bytes-per-element for this dtype
     bw_metrics = calculate_effective_bandwidth(
         batch_size,
         seq_len,
@@ -354,6 +446,7 @@ def benchmark(
         head_dim,
         rotary_dim,
         ms,
+        bytes_per_elem=DTYPE_BYTES[dtype],
     )
 
     all_results.append(
@@ -366,6 +459,7 @@ def benchmark(
             "num_heads_v": num_heads_v,
             "head_dim": head_dim,
             "is_neox": is_neox,
+            "dtype": dtype,
             "provider": provider,
             "time_us": 1000 * ms,
             "bandwidth_gbs": bw_metrics["bandwidth_gbs"],
@@ -382,12 +476,18 @@ if __name__ == "__main__":
     print("Running benchmarks...")
     benchmark.run(print_data=True)
 
+    # Ensure results dir exists and write per-chunk CSV
+    os.makedirs("benchmark/results", exist_ok=True)
+    df = pd.DataFrame(all_results)
+    chunk_label = f"chunk_{os.environ.get('CHUNK_IDX','0')}_of_{os.environ.get('NUM_CHUNKS','1')}"
+    out_csv = os.path.join("benchmark/results", f"results_{chunk_label}.csv")
+    df.to_csv(out_csv, index=False)
+    print(f"Wrote results CSV: {out_csv}")
+
     # Print bandwidth results
     print("\n" + "=" * 80)
     print("Effective Bandwidth Results")
     print("=" * 80)
-
-    df = pd.DataFrame(all_results)
     df["bandwidth_gbs"] = df["bandwidth_gbs"].round(2)
     df["total_bytes_mb"] = df["total_bytes_mb"].round(2)
     df["time_us"] = df["time_us"].round(2)
@@ -400,7 +500,7 @@ if __name__ == "__main__":
     print("\n" + "=" * 80)
     print("Summary Statistics by Provider")
     print("=" * 80)
-    summary = df.groupby("provider").agg(
+    summary = df.groupby(["dtype", "provider"]).agg(
         {
             "bandwidth_gbs": ["mean", "min", "max"],
             "time_us": ["mean", "min", "max"],
@@ -424,6 +524,7 @@ if __name__ == "__main__":
             "num_heads_v",
             "head_dim",
             "is_neox",
+            "dtype",
         ],
         columns="provider",
         values="time_us",
@@ -431,6 +532,15 @@ if __name__ == "__main__":
 
     if "torch" in pivot.columns and "sglang" in pivot.columns:
         pivot["speedup"] = pivot["torch"] / pivot["sglang"]
-        print(f"\nAverage speedup: {pivot['speedup'].mean():.2f}x")
-        print(f"Max speedup: {pivot['speedup'].max():.2f}x")
-        print(f"Min speedup: {pivot['speedup'].min():.2f}x")
+        print(f"\nOverall average speedup: {pivot['speedup'].mean():.2f}x")
+        print(f"Overall max speedup:     {pivot['speedup'].max():.2f}x")
+        print(f"Overall min speedup:     {pivot['speedup'].min():.2f}x")
+
+        # Per-dtype speedup breakdown
+        print("\nSpeedup by dtype:")
+        for dt in df["dtype"].unique():
+            mask = pivot.index.get_level_values("dtype") == dt
+            sp = pivot.loc[mask, "speedup"]
+            if not sp.empty:
+                print(f"  {dt:>12s}: avg={sp.mean():.2f}x  max={sp.max():.2f}x  min={sp.min():.2f}x")
+    print(f"Wrote results CSV: {out_csv}")

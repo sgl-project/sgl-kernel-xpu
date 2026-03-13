@@ -145,8 +145,11 @@ def fused_qk_norm_rope_reference(
     # Compute RoPE frequencies
     inv_freq = compute_inv_freq_yarn(head_dim, rotary_dim, base, factor, low, high)
 
-    # Compute cos and sin for each position
+    # Compute cos and sin for each position. Ensure both tensors are on the
+    # same device to avoid cross-device ops (tests sometimes pass CPU tensors
+    # as reference while inv_freq is constructed on `device`).
     positions = position_ids.to(torch.float32)
+    inv_freq = inv_freq.to(positions.device)
     freqs = torch.outer(positions, inv_freq)
     cos = freqs.cos()
     sin = freqs.sin()
@@ -440,15 +443,15 @@ def test_fused_qk_norm_rope_fp8_e4m3(
     # Clamp to FP8 representable range to avoid infinities/NaNs on conversion
     qkv_f32 = qkv_f32.clamp(-448.0, 448.0)
     qkv = qkv_f32.to(dtype)
-    
+
     q_weight_f32 = torch.randn(head_dim, dtype=torch.float32, device=device)
     q_weight_f32 = q_weight_f32.clamp(-448.0, 448.0)
     q_weight = q_weight_f32.to(dtype)
-    
+
     k_weight_f32 = torch.randn(head_dim, dtype=torch.float32, device=device)
     k_weight_f32 = k_weight_f32.clamp(-448.0, 448.0)
     k_weight = k_weight_f32.to(dtype)
-    
+
     position_ids = torch.arange(num_tokens, dtype=torch.int32, device=device)
 
     # Create a copy for reference from FP8-dequantized values

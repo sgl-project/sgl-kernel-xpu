@@ -395,14 +395,15 @@ def fused_experts(
         (M * TopK, OutK), device=hidden_states.device, dtype=hidden_states.dtype
     )
 
-    # 0=silu, 1=gelu, 2=swiglu (silu with alpha/limit clamping)
+    # 0=silu, 1=gelu
     if activation == "silu":
         activation_type = 0
+        # check for swiglu activation and update activation string accordingly though the type remains the same
         if gemm1_alpha is not None:
             assert (
                 gemm1_limit is not None
             ), "gemm1_limit must be provided when gemm1_alpha is set for swiglu"
-            activation_type = 2
+            activation = "swiglu"
     elif activation == "gelu":
         activation_type = 1
     else:
@@ -414,7 +415,7 @@ def fused_experts(
     # Note: using unfused activation path for swiglu till support for fused path is enabled
     avg_m = (M * TopK) // E
     big_weight = K * N > 4096 * 4096
-    use_unfused_act = (avg_m <= 128 and big_weight) or activation_type == 2
+    use_unfused_act = (avg_m <= 128 and big_weight) or activation == "swiglu"
     if use_unfused_act:
         intermediate_cache1 = torch.empty(
             (M * TopK, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype
@@ -432,13 +433,13 @@ def fused_experts(
             activation_type,
             fuse_act=False,
         )
-        if activation_type == 0:
+        if activation == "silu":
             torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
-        elif activation_type == 1:
+        elif activation == "gelu":
             torch.ops.sgl_kernel.gelu_tanh_and_mul(
                 intermediate_cache2, intermediate_cache1
             )
-        elif activation_type == 2:
+        elif activation == "swiglu":
             intermediate_cache2 = torch.ops.sgl_kernel.swiglu_with_alpha_and_limit(
                 intermediate_cache1, gemm1_alpha, gemm1_limit
             )

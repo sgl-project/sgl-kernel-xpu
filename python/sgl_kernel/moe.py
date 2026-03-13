@@ -386,14 +386,26 @@ def fused_experts(
         (M * TopK, OutK), device=hidden_states.device, dtype=hidden_states.dtype
     )
 
-    activation_type = 0 if activation == "silu" else 1
+    # 0=silu, 1=gelu, 2=swiglu (silu with alpha/limit clamping)
+    if activation == "silu":
+        activation_type = 0
+        if gemm1_alpha is not None:
+            assert (
+                gemm1_limit is not None
+            ), "gemm1_limit must be provided when gemm1_alpha is set for swiglu"
+            activation_type = 2
+    elif activation == "gelu":
+        activation_type = 1
+    else:
+        raise ValueError(f"Unsupported activation {activation}")
 
     assert is_xe2_arch(), f"Current MoE is only supported on BMG"
 
     # heuristic for choosing fused or unfused act, can be tuned
+    # Note: using unfused activation path for swiglu till support for fused path is enabled
     avg_m = (M * TopK) // E
     big_weight = K * N > 4096 * 4096
-    use_unfused_act = avg_m <= 128 and big_weight
+    use_unfused_act = (avg_m <= 128 and big_weight) or activation_type == 2
     if use_unfused_act:
         intermediate_cache1 = torch.empty(
             (M * TopK, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype
@@ -411,14 +423,16 @@ def fused_experts(
             activation_type,
             fuse_act=False,
         )
-        if activation == "silu":
+        if activation_type == 0:
             torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
-        elif activation == "gelu":
+        elif activation_type == 1:
             torch.ops.sgl_kernel.gelu_tanh_and_mul(
                 intermediate_cache2, intermediate_cache1
             )
-        else:
-            raise ValueError(f"Unsupported activation {activation}")
+        elif activation_type == 2:
+            intermediate_cache2 = torch.ops.sgl_kernel.swiglu_with_alpha_and_limit(
+                intermediate_cache1, gemm1_alpha, gemm1_limit
+            )
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
             intermediate_cache3,
             intermediate_cache2,

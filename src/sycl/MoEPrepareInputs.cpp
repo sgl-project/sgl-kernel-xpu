@@ -1,9 +1,9 @@
-#include <ATen/ATEN.h>
+#include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
-#include <sycl/sycl.hpp>
 #include <cstring>
+#include <sycl/sycl.hpp>
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
@@ -332,13 +332,7 @@ struct ScatterTokensToExperts {
   ScatterTokensToExperts(
       const T* input, T* output, const int32_t* src2dst_map, const int32_t topk, const int32_t hidden_dim)
       : input_(input), output_(output), src2dst_map_(src2dst_map), topk_(topk), hidden_dim_(hidden_dim) {
-    TORCH_CHECK(
-        topk_ <= MAX_TOPK,
-        "ScatterTokensToExperts: topk (",
-        topk_,
-        ") exceeds MAX_TOPK (",
-        MAX_TOPK,
-        ")");
+    TORCH_CHECK(topk_ <= MAX_TOPK, "ScatterTokensToExperts: topk (", topk_, ") exceeds MAX_TOPK (", MAX_TOPK, ")");
   }
 
   [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {

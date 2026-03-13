@@ -93,7 +93,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    * From cutlass attention
    */
   m.def(
-      "fwd(Tensor!  q,"
+      "fwd(Tensor   q,"
       "    Tensor   k,"
       "    Tensor   v,"
       "    Tensor?  q_v,"

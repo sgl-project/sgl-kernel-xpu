@@ -82,8 +82,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       " Tensor problem_sizes2, Tensor input_permutation, Tensor output_permutation, int num_experts, int n, int k) -> "
       "()");
   m.impl("prepare_moe_input", torch::kXPU, &prepare_moe_input);
-  m.def("shuffle_rows(Tensor input, Tensor dst2src_map, Tensor output) -> ()");
-  m.impl("shuffle_rows", torch::kXPU, &shuffle_rows);
   m.def("scatter_tokens_to_experts(Tensor input, Tensor src2dst_map, Tensor output) -> ()");
   m.impl("scatter_tokens_to_experts", torch::kXPU, &scatter_tokens_to_experts);
   m.def("apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, Tensor? factors) -> ()");

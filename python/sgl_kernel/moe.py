@@ -187,6 +187,10 @@ def apply_shuffle_mul_sum(
     )
 
 
+def scatter_tokens_to_experts(input, src2dst_map, output):
+    torch.ops.sgl_kernel.scatter_tokens_to_experts.default(input, src2dst_map, output)
+
+
 def cutlass_fp4_group_mm(
     a_fp4,
     b_fp4,
@@ -377,8 +381,8 @@ def fused_experts(
         (num_tokens * TopK, K), device=hidden_states.device, dtype=hidden_states.dtype
     )
     # Use scatter_tokens_to_experts (IPEX MoEScatter style):
-    # 1 WG per source token, reads sequentially, scatters to TopK destinations.
-    # 8x fewer WGs than shuffle_rows, with coalesced reads and data reuse.
+    # 1 WG per source token, reads sequentially, scatters to TopK destinations,
+    # with coalesced reads and data reuse.
     torch.ops.sgl_kernel.scatter_tokens_to_experts.default(
         hidden_states, c_map, input_A_shuffle
     )

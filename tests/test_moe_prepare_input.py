@@ -2,8 +2,7 @@ import itertools
 
 import pytest
 import torch
-from sgl_kernel import apply_shuffle_mul_sum, prepare_moe_input
-from sgl_kernel.moe import scatter_tokens_to_experts
+from sgl_kernel import apply_shuffle_mul_sum, prepare_moe_input, scatter_tokens_to_experts
 
 
 @pytest.mark.parametrize("num_tokens", [1, 2, 5, 16, 64, 128, 224, 1024])

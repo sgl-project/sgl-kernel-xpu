@@ -58,6 +58,7 @@ from sgl_kernel.moe import (
     moe_sum,
     moe_sum_reduce,
     prepare_moe_input,
+    scatter_tokens_to_experts,
     swiglu_with_alpha_and_limit,
     topk_softmax,
 )

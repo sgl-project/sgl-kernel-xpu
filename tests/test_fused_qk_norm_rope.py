@@ -406,5 +406,101 @@ def test_fused_qk_norm_rope_partial_rotary(num_tokens, head_dim, rotary_dim, dty
     )
 
 
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
+@pytest.mark.parametrize(
+    "num_heads_q,num_heads_k,num_heads_v",
+    [
+        (2, 2, 2),
+        (1, 1, 1),
+        (4, 2, 2),
+        (8, 4, 2),
+    ],
+)
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("is_neox", [True, False])
+def test_fused_qk_norm_rope_fp8_e4m3(
+    num_tokens, num_heads_q, num_heads_k, num_heads_v, head_dim, is_neox
+):
+    """Test fused QK norm + RoPE with FP8 E4M3 dtype."""
+    dtype = torch.float8_e4m3fn
+    eps = 1e-6
+    base = 10000.0
+    factor = 1.0
+    low = 1.0
+    high = 1.0
+    attention_factor = 1.0
+    rotary_dim = head_dim
+
+    total_heads = num_heads_q + num_heads_k + num_heads_v
+
+    # Create input tensors in float32 first, then convert to FP8
+    qkv_f32 = torch.randn(
+        num_tokens, total_heads * head_dim, dtype=torch.float32, device=device
+    )
+    # Clamp to FP8 representable range to avoid infinities/NaNs on conversion
+    qkv_f32 = qkv_f32.clamp(-448.0, 448.0)
+    qkv = qkv_f32.to(dtype)
+    
+    q_weight_f32 = torch.randn(head_dim, dtype=torch.float32, device=device)
+    q_weight_f32 = q_weight_f32.clamp(-448.0, 448.0)
+    q_weight = q_weight_f32.to(dtype)
+    
+    k_weight_f32 = torch.randn(head_dim, dtype=torch.float32, device=device)
+    k_weight_f32 = k_weight_f32.clamp(-448.0, 448.0)
+    k_weight = k_weight_f32.to(dtype)
+    
+    position_ids = torch.arange(num_tokens, dtype=torch.int32, device=device)
+
+    # Create a copy for reference from FP8-dequantized values
+    qkv_ref = qkv.to(torch.float32).clone().cpu()
+    q_weight_ref = q_weight.to(torch.float32).clone().cpu()
+    k_weight_ref = k_weight.to(torch.float32).clone().cpu()
+    position_ids_ref = position_ids.clone().cpu()
+
+    # Compute reference output on CPU
+    output_ref = fused_qk_norm_rope_reference(
+        qkv_ref,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        q_weight_ref,
+        k_weight_ref,
+        base,
+        is_neox,
+        position_ids_ref,
+        factor,
+        low,
+        high,
+        attention_factor,
+        rotary_dim,
+    ).to(device)
+
+    # Run kernel (in-place operation)
+    sgl_kernel.fused_qk_norm_rope(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        q_weight,
+        k_weight,
+        base,
+        is_neox,
+        position_ids,
+        factor,
+        low,
+        high,
+        attention_factor,
+        rotary_dim,
+    )
+
+    # Compare results - use relaxed tolerance for FP8
+    # FP8 has limited precision, so we need higher tolerance
+    torch.testing.assert_close(qkv.to(torch.float32), output_ref, rtol=5e-2, atol=5e-2)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

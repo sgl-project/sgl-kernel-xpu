@@ -2,7 +2,10 @@ import sys
 
 import pytest
 import torch
+import utils
 from sgl_kernel import fp8_scaled_mm
+
+device = utils.get_device()
 
 
 def torch_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias):
@@ -44,7 +47,7 @@ def _test_accuracy_once(M, N, K, with_bias, out_dtype, device):
 @pytest.mark.parametrize("with_bias", [True, False])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 def test_accuracy(M, N, K, with_bias, out_dtype):
-    _test_accuracy_once(M, N, K, with_bias, out_dtype, "cuda")
+    _test_accuracy_once(M, N, K, with_bias, out_dtype, device)
 
 
 if __name__ == "__main__":

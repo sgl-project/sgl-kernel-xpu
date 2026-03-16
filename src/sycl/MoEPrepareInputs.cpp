@@ -33,34 +33,28 @@ struct compute_problem_sizes_sycl_K_T {
 
   void operator()(sycl::nd_item<1> item) const {
     int thread_id = item.get_local_linear_id();
-    if (thread_id < topk_length_) {
-      int expert_id = item.get_group(0);
+    int expert_id = item.get_group(0);
 
-      T occurrences = 0;
-      for (int i = thread_id; i < topk_length_; i += max_tokens_per_expert_) {
-        occurrences += (topk_ids_[i] == expert_id);
-      }
+    // thread_id < topk_length_ is always true for all launched threads because
+    // the WG size is min(max_wg_size, topk_length) (see compute_problem_sizes_sycl_impl).
+    T occurrences = 0;
+    for (int i = thread_id; i < topk_length_; i += max_tokens_per_expert_) {
+      occurrences += (topk_ids_[i] == expert_id);
+    }
 
-      sycl::atomic_ref<
-          T,
-          sycl::memory_order::relaxed,
-          sycl::memory_scope::work_group,
-          sycl::access::address_space::generic_space>
-          atomic_counter(atomic_buffer_[expert_id]);
+    // Use work-group reduction instead of an atomic accumulation so that the
+    // caller does not need to pre-zero the atomic_buffer (expert_offsets) array.
+    T final_occurrences = sycl::reduce_over_group(item.get_group(), occurrences, sycl::plus<T>());
 
-      atomic_counter.fetch_add(occurrences);
-
-      item.barrier(sycl::access::fence_space::local_space);
-
-      if (thread_id == 0) {
-        T final_occurrences = atomic_buffer_[expert_id];
-        problem_sizes1_[expert_id * 3] = final_occurrences;
-        problem_sizes1_[expert_id * 3 + 1] = static_cast<int32_t>(2 * n_);
-        problem_sizes1_[expert_id * 3 + 2] = static_cast<int32_t>(k_);
-        problem_sizes2_[expert_id * 3] = final_occurrences;
-        problem_sizes2_[expert_id * 3 + 1] = static_cast<int32_t>(k_);
-        problem_sizes2_[expert_id * 3 + 2] = static_cast<int32_t>(n_);
-      }
+    if (thread_id == 0) {
+      // Write per-expert token count so compute_expert_offsets can read it.
+      atomic_buffer_[expert_id] = final_occurrences;
+      problem_sizes1_[expert_id * 3] = final_occurrences;
+      problem_sizes1_[expert_id * 3 + 1] = static_cast<int32_t>(2 * n_);
+      problem_sizes1_[expert_id * 3 + 2] = static_cast<int32_t>(k_);
+      problem_sizes2_[expert_id * 3] = final_occurrences;
+      problem_sizes2_[expert_id * 3 + 1] = static_cast<int32_t>(k_);
+      problem_sizes2_[expert_id * 3 + 2] = static_cast<int32_t>(n_);
     }
   }
 
@@ -216,35 +210,33 @@ struct compute_arg_sorts_sycl_K_T {
       T* output_permutation,
       T* atomic_buffer,
       const int32_t topk_length,
-      const int32_t topk,
-      const int32_t num_experts,
-      const int32_t max_tokens_per_expert)
+      const int32_t topk)
       : topk_ids_(topk_ids),
         input_permutation_(input_permutation),
         output_permutation_(output_permutation),
         atomic_buffer_(atomic_buffer),
         topk_length_(topk_length),
-        topk_(topk),
-        num_experts_(num_experts),
-        max_tokens_per_expert_(max_tokens_per_expert) {}
+        topk_(topk) {}
 
+  // One thread per token-expert pair. Device-scope atomic on per-expert counter
+  // (atomic_buffer[e] pre-loaded with expert start offsets by compute_expert_offsets).
+  // O(topk_length) total work vs the previous O(num_experts * topk_length) scan.
   void operator()(sycl::nd_item<1> item) const {
-    int expert_id = item.get_group(0);
+    int i = item.get_global_id(0);
+    if (i >= topk_length_) return;
+
+    T expert = topk_ids_[i];
 
     sycl::atomic_ref<
         T,
         sycl::memory_order::relaxed,
-        sycl::memory_scope::work_group,
-        sycl::access::address_space::generic_space>
-        atomic_counter(atomic_buffer_[expert_id]);
+        sycl::memory_scope::device,
+        sycl::access::address_space::global_space>
+        counter(atomic_buffer_[expert]);
 
-    for (int32_t i = item.get_local_id(0); i < topk_length_; i += max_tokens_per_expert_) {
-      if (topk_ids_[i] == expert_id) {
-        T start = atomic_counter.fetch_add(1);
-        input_permutation_[start] = i / topk_;
-        output_permutation_[i] = start;
-      }
-    }
+    T pos = counter.fetch_add(1);
+    input_permutation_[pos] = i / topk_;
+    output_permutation_[i] = pos;
   }
 
   const T* topk_ids_;
@@ -253,8 +245,6 @@ struct compute_arg_sorts_sycl_K_T {
   T* atomic_buffer_;
   const uint32_t topk_length_;
   const uint32_t topk_;
-  const uint32_t num_experts_;
-  const uint32_t max_tokens_per_expert_;
 };
 
 template <typename T>
@@ -277,21 +267,13 @@ void compute_arg_sorts_sycl_impl(
   const uint32_t topk_length = topk_ids.numel();
   const int32_t topk = topk_ids.size(1);
   auto dev_id = topk_ids.device().index();
-  uint32_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
-  uint32_t max_tokens_per_expert = static_cast<uint32_t>(sycl::min(max_wg_size, topk_length));
+  uint32_t wg_size = static_cast<uint32_t>(std::min((uint32_t)dpcppMaxWorkGroupSize(dev_id), topk_length));
+  uint32_t num_wgs = (topk_length + wg_size - 1) / wg_size;
 
-  sycl::range<1> global_range{num_experts * max_tokens_per_expert};
-  sycl::range<1> local_range{max_tokens_per_expert};
+  sycl::range<1> global_range{num_wgs * wg_size};
+  sycl::range<1> local_range{wg_size};
 
-  Kernel task(
-      topk_ids_ptr,
-      input_permutation_ptr,
-      output_permutation_ptr,
-      atomic_buffer_ptr,
-      topk_length,
-      topk,
-      num_experts,
-      max_tokens_per_expert);
+  Kernel task(topk_ids_ptr, input_permutation_ptr, output_permutation_ptr, atomic_buffer_ptr, topk_length, topk);
 
   sycl_kernel_submit(global_range, local_range, queue, task);
   return;
@@ -320,7 +302,7 @@ void prepare_moe_input(
     using index_t = index_t;
 
     auto options_type = torch::TensorOptions().dtype(topk_ids.dtype()).device(topk_ids.device());
-    torch::Tensor atomic_buffer = torch::zeros(num_experts + 1, options_type);
+    torch::Tensor atomic_buffer = torch::empty(num_experts + 1, options_type);
 
     compute_problem_sizes_sycl_impl<index_t>(
         topk_ids, problem_sizes1, problem_sizes2, expert_offsets, num_experts, n, k);
@@ -337,128 +319,154 @@ void prepare_moe_input(
   return;
 }
 
+// Scatter kernel: 1 WG per source token, reads token once, scatters to topk destinations.
+// Equivalent to IPEX MoEScatter but uses precomputed src2dst_map (c_map / output_permutation).
 template <typename T>
-struct ShuffleRows {
-  ShuffleRows(
-      const T* input,
-      const int32_t* dst2src_map,
-      T* output,
-      const uint32_t num_src_rows,
-      const uint32_t num_dest_rows,
-      const uint32_t num_cols,
-      const uint32_t bs_num_cols)
-      : input_(input),
-        dst2src_map_(dst2src_map),
-        output_(output),
-        num_src_rows_(num_src_rows),
-        num_dest_rows_(num_dest_rows),
-        num_cols_(num_cols),
-        bs_num_cols_(bs_num_cols) {}
+struct ScatterTokensToExperts {
+  static constexpr int WGSize = 256;
+  static constexpr int ElemsPerItem = sizeof(float) * 4 / sizeof(T);  // 4 for bf16/fp16
+  static constexpr int Stride = WGSize * ElemsPerItem;
+  static constexpr int MAX_TOPK = 16;
 
-  void operator()(sycl::nd_item<1> item) const {
-    int gid = item.get_global_linear_id();
-    int tid = item.get_local_linear_id();
-    // Leave it to compiler for simd sub-group
-    if (gid < num_dest_rows_ * bs_num_cols_) {
-      uint32_t dest_token_idx = item.get_group(0);
-      uint32_t source_token_idx = dst2src_map_[dest_token_idx];
-      for (int i = tid; i < num_cols_; i += bs_num_cols_) {
-        auto source_val = input_[source_token_idx * num_cols_ + i];
-        output_[dest_token_idx * num_cols_ + i] = source_val;
+  ScatterTokensToExperts(
+      const T* input, T* output, const int32_t* src2dst_map, const int32_t topk, const int32_t hidden_dim)
+      : input_(input), output_(output), src2dst_map_(src2dst_map), topk_(topk), hidden_dim_(hidden_dim) {}
+
+  [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
+    int token_id = item.get_group(0);
+    int local_id = item.get_local_linear_id();
+
+    // Load topk destination row indices for this token (loop-invariant)
+    int dst_rows[MAX_TOPK];
+    for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
+      dst_rows[k] = src2dst_map_[token_id * topk_ + k];
+    }
+
+    // Source base pointer (sequential, coalesced reads)
+    const T* src_base = input_ + token_id * hidden_dim_ + local_id * ElemsPerItem;
+
+    const int loop_count = (hidden_dim_ + Stride - 1) / Stride;
+    for (int loop = 0; loop < loop_count; ++loop) {
+      if (loop * Stride + local_id * ElemsPerItem < hidden_dim_) {
+        using vec_t = sycl::vec<T, ElemsPerItem>;
+        vec_t data = *(reinterpret_cast<const vec_t*>(src_base + loop * Stride));
+        for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
+          T* dst = output_ + dst_rows[k] * hidden_dim_ + local_id * ElemsPerItem + loop * Stride;
+          *(reinterpret_cast<vec_t*>(dst)) = data;
+        }
       }
     }
   }
+
   const T* input_;
-  const int32_t* dst2src_map_;
   T* output_;
-  const uint32_t num_src_rows_;
-  const uint32_t num_dest_rows_;
-  const uint32_t num_cols_;
-  const uint32_t bs_num_cols_;
+  const int32_t* src2dst_map_;
+  const int32_t topk_;
+  const int32_t hidden_dim_;
 };
 
 template <typename T>
-void shuffle_rows_kernel_impl(
-    const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor) {
+void scatter_tokens_to_experts_impl(
+    const torch::Tensor& input_tensor, const torch::Tensor& src2dst_map, torch::Tensor& output_tensor) {
   auto input = reinterpret_cast<T*>(input_tensor.data_ptr());
-  auto dst2srcmap = reinterpret_cast<const int32_t*>(dst2src_map.data_ptr());
+  auto src2dst = reinterpret_cast<const int32_t*>(src2dst_map.data_ptr());
   auto output = reinterpret_cast<T*>(output_tensor.data_ptr());
 
-  uint32_t num_src_rows = input_tensor.size(0);
+  uint32_t num_tokens = input_tensor.size(0);
   uint32_t num_dest_rows = output_tensor.size(0);
-  uint32_t num_cols = input_tensor.size(1);
+  uint32_t hidden_dim = input_tensor.size(1);
+  int32_t topk = static_cast<int32_t>(num_dest_rows / num_tokens);
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
 
-  using Kernel = ShuffleRows<T>;
+  using Kernel = ScatterTokensToExperts<T>;
+  sycl::range<1> global_range{num_tokens * Kernel::WGSize};
+  sycl::range<1> local_range{Kernel::WGSize};
 
-  auto dev_id = input_tensor.device().index();
-  uint32_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
-  uint32_t max_num_cols = static_cast<uint32_t>(sycl::min(max_wg_size, num_cols));
-
-  sycl::range<1> global_range{num_dest_rows * max_num_cols};
-  sycl::range<1> local_range{max_num_cols};
-
-  Kernel task(input, dst2srcmap, output, num_src_rows, num_dest_rows, num_cols, max_num_cols);
-
+  Kernel task(input, output, src2dst, topk, hidden_dim);
   sycl_kernel_submit(global_range, local_range, queue, task);
-  return;
 }
 
-void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor) {
+void scatter_tokens_to_experts(
+    const torch::Tensor& input_tensor, const torch::Tensor& src2dst_map, torch::Tensor& output_tensor) {
   TORCH_CHECK(
       input_tensor.scalar_type() == output_tensor.scalar_type(),
       "Input and output tensors must have the same data type");
   SYCL_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::BFloat16, at::ScalarType::Half, input_tensor.scalar_type(), "shuffle_rows_kernel_impl", [&]() {
-        shuffle_rows_kernel_impl<scalar_t>(input_tensor, dst2src_map, output_tensor);
-      });
-  return;
+      at::ScalarType::BFloat16,
+      at::ScalarType::Half,
+      input_tensor.scalar_type(),
+      "scatter_tokens_to_experts_impl",
+      [&]() { scatter_tokens_to_experts_impl<scalar_t>(input_tensor, src2dst_map, output_tensor); });
 }
 
 template <typename T, typename T1>
 struct ApplyShuffleMulSum {
+  static constexpr int WGSize = 256;
+  static constexpr int ElemsPerItem = sizeof(float) * 4 / sizeof(T);  // 4 for bf16/fp16
+  static constexpr int Stride = WGSize * ElemsPerItem;
+  static constexpr int MAX_TOPK = 16;
+
   ApplyShuffleMulSum(
       const T* input,
       T* output,
       const int32_t* dst2src_map,
       const T1* factors,
       const int32_t topk,
-      const int32_t hidden_dim,
-      const int32_t bs_hidden_dim)
+      const int32_t hidden_dim)
       : input_(input),
         output_(output),
         dst2src_map_(dst2src_map),
         factors_(factors),
         topk_(topk),
-        hidden_dim_(hidden_dim),
-        bs_hidden_dim_(bs_hidden_dim) {}
+        hidden_dim_(hidden_dim) {}
 
-  void operator()(sycl::nd_item<1> item) const {
+  [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
     int out_tkn_id = item.get_group(0);
-    for (int i = item.get_local_id(0); i < hidden_dim_; i += bs_hidden_dim_) {
-      float sum_val = 0;
-      for (int k = 0; k < topk_; ++k) {
-        int src_perm_offset = out_tkn_id * topk_ + k;
-        int src_index = dst2src_map_[src_perm_offset];
-        float src_val = static_cast<float>(input_[src_index * hidden_dim_ + i]);
-        float weight = 0;
-        if (factors_ != nullptr) {
-          weight = static_cast<float>(factors_[out_tkn_id * topk_ + k]);
+    int local_id = item.get_local_linear_id();
+
+    // Preload src row indices and weights (loop-invariant over hidden dim)
+    int src_indices[MAX_TOPK];
+    float weights[MAX_TOPK];
+    for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
+      src_indices[k] = static_cast<int>(dst2src_map_[out_tkn_id * topk_ + k]);
+      weights[k] = (factors_ != nullptr) ? static_cast<float>(factors_[out_tkn_id * topk_ + k]) : 0.0f;
+    }
+
+    T* dst_base = output_ + out_tkn_id * hidden_dim_ + local_id * ElemsPerItem;
+    const int loop_count = (hidden_dim_ + Stride - 1) / Stride;
+
+    for (int loop = 0; loop < loop_count; ++loop) {
+      if (loop * Stride + local_id * ElemsPerItem < hidden_dim_) {
+        // Float accumulator for better precision and perf
+        sycl::vec<float, ElemsPerItem> acc;
+        for (int j = 0; j < ElemsPerItem; ++j)
+          acc[j] = 0.0f;
+
+        for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
+          const T* src = input_ + src_indices[k] * hidden_dim_ + local_id * ElemsPerItem + loop * Stride;
+          using vec_t = sycl::vec<T, ElemsPerItem>;
+          vec_t reg = *(reinterpret_cast<const vec_t*>(src));
+          for (int j = 0; j < ElemsPerItem; ++j) {
+            acc[j] += static_cast<float>(reg[j]) * weights[k];
+          }
         }
-        sum_val += weight * src_val;
+
+        using vec_t = sycl::vec<T, ElemsPerItem>;
+        vec_t store;
+        for (int j = 0; j < ElemsPerItem; ++j)
+          store[j] = static_cast<T>(acc[j]);
+        *(reinterpret_cast<vec_t*>(dst_base + loop * Stride)) = store;
       }
-      output_[out_tkn_id * hidden_dim_ + i] = sum_val;
     }
   }
   const T* input_;
-  const int32_t* dst2src_map_;
   T* output_;
+  const int32_t* dst2src_map_;
   const T1* factors_;
   const int32_t topk_;
   const int32_t hidden_dim_;
-  const int32_t bs_hidden_dim_;
 };
 
 template <typename T, typename T1>
@@ -469,19 +477,16 @@ void apply_shuffle_mul_sum_impl(
     const T1* factors,
     const uint32_t out_tkns,
     const uint32_t out_hidden_dims,
-    const int topk,
-    uint32_t max_wg_size) {
+    const int topk) {
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
 
   using Kernel = ApplyShuffleMulSum<T, T1>;
 
-  uint32_t max_out_hidden_dims = static_cast<uint32_t>(sycl::min(max_wg_size, out_hidden_dims));
+  sycl::range<1> global_range{out_tkns * Kernel::WGSize};
+  sycl::range<1> local_range{Kernel::WGSize};
 
-  sycl::range<1> global_range{out_tkns * max_out_hidden_dims};
-  sycl::range<1> local_range{max_out_hidden_dims};
-
-  Kernel task(input, output, dst2src_map, factors, topk, out_hidden_dims, max_out_hidden_dims);
+  Kernel task(input, output, dst2src_map, factors, topk, out_hidden_dims);
 
   sycl_kernel_submit(global_range, local_range, queue, task);
   return;
@@ -494,9 +499,6 @@ void apply_shuffle_mul_sum(
     const std::optional<torch::Tensor>& factors) {
   int m = output.size(0);
   int topk = int(permutation.size(0) / m);
-
-  auto dev_id = input.device().index();
-  uint32_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
 
   SYCL_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::BFloat16, at::ScalarType::Half, input.scalar_type(), "apply_shuffle_mul_sum", [&]() {
@@ -512,8 +514,7 @@ void apply_shuffle_mul_sum(
                     reinterpret_cast<factors_t*>(factors->data_ptr()),
                     output.size(0),
                     output.size(1),
-                    topk,
-                    max_wg_size);
+                    topk);
               });
         } else {
           apply_shuffle_mul_sum_impl<input_t, input_t>(
@@ -523,8 +524,7 @@ void apply_shuffle_mul_sum(
               nullptr,
               output.size(0),
               output.size(1),
-              topk,
-              max_wg_size);
+              topk);
         }
       });
   return;

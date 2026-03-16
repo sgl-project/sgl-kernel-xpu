@@ -2,7 +2,11 @@ import itertools
 
 import pytest
 import torch
-from sgl_kernel import apply_shuffle_mul_sum, prepare_moe_input, shuffle_rows
+from sgl_kernel import (
+    apply_shuffle_mul_sum,
+    prepare_moe_input,
+    scatter_tokens_to_experts,
+)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 2, 5, 16, 64, 128, 224, 1024])
@@ -125,8 +129,11 @@ def test_prepare_input_moe(num_tokens, num_experts, top_k, hidden_dims, dtype):
     torch.testing.assert_close(expert_offsets, expert_offsets_xpu.to("cpu"))
     input_tensor = torch.randn(num_tokens, hidden_dims, dtype=dtype)
     input_tensor_xpu = input_tensor.clone().to(device)
-    output_tensor_xpu = shuffle_rows(
-        input_tensor_xpu, input_permutation_xpu, (num_tokens * top_k, hidden_dims)
+    output_tensor_xpu = torch.empty(
+        (num_tokens * top_k, hidden_dims), dtype=dtype, device=device
+    )
+    scatter_tokens_to_experts(
+        input_tensor_xpu, output_permutation_xpu, output_tensor_xpu
     )
     input_merge_xpu = torch.empty((num_tokens, hidden_dims), dtype=dtype, device=device)
     # apply weights

@@ -6,8 +6,6 @@ import utils
 from sgl_kernel import causal_conv1d_fwd
 from sgl_kernel import causal_conv1d_update as causal_conv1d_update_kernel
 
-device = utils.get_device()
-
 PAD_SLOT_ID = -1
 
 
@@ -241,7 +239,7 @@ def causal_conv1d_update_ref(
 def test_causal_conv1d(
     batch, dim, seqlen, width, has_bias, silu_activation, has_initial_state, itype
 ):
-    device = device
+    device = utils.get_device()
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
@@ -289,7 +287,7 @@ def test_causal_conv1d(
 @pytest.mark.parametrize("width", [4])
 @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
 def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, itype):
-    device = device
+    device = utils.get_device()
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
@@ -323,7 +321,7 @@ def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, ity
 def test_causal_conv1d_update_with_batch_gather(
     with_padding, dim, width, seqlen, has_bias, silu_activation, itype
 ):
-    device = device
+    device = utils.get_device()
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
@@ -388,7 +386,7 @@ def test_causal_conv1d_update_with_batch_gather(
 def test_causal_conv1d_varlen(
     with_padding, dim, seqlen, width, has_bias, silu_activation, itype
 ):
-    device = device
+    device = utils.get_device()
     torch.accelerator.empty_cache()
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:

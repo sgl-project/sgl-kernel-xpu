@@ -543,4 +543,61 @@ void qserve_w4a8_per_group_gemm(
     const torch::Tensor& _ascales,
     torch::Tensor& _out_feats);
 
+/*
+ * From mamba
+ */
+void causal_conv1d_fwd(
+    at::Tensor& x,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    const std::optional<at::Tensor>& conv_states,
+    const std::optional<at::Tensor>& query_start_loc,
+    const std::optional<at::Tensor>& cache_indices,
+    const std::optional<at::Tensor>& has_initial_state,
+    bool silu_activation,
+    int64_t pad_slot_id);
+
+void causal_conv1d_update(
+    at::Tensor& x,
+    at::Tensor& conv_state,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    bool silu_activation,
+    const std::optional<at::Tensor>& cache_seqlens,
+    const std::optional<at::Tensor>& conv_state_indices,
+    int64_t pad_slot_id);
+
+std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& g,
+    const at::Tensor& beta,
+    const at::Tensor& initial_state,
+    bool output_final_state,
+    const at::Tensor& cu_seqlens,
+    const at::Tensor& chunk_indices,
+    const at::Tensor& chunk_offsets,
+    bool head_first,
+    bool use_qk_l2norm_in_kernel,
+    double eps = 1e-5);
+
+at::Tensor fused_sigmoid_gating_delta_rule_update(
+    const at::Tensor& A_log,
+    const at::Tensor& dt_bias,
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& a,
+    const at::Tensor& b,
+    at::Tensor& initial_state_source,
+    const at::Tensor& initial_state_indices,
+    const at::Tensor& cu_seqlens,
+    bool use_qk_l2norm_in_kernel,
+    double softplus_beta = 1.0,
+    double softplus_threshold = 20.0);
+
+std::tuple<at::Tensor, at::Tensor>
+fused_gdn_gating(const at::Tensor& A_log, const at::Tensor& a, const at::Tensor& b, const at::Tensor& dt_bias);
+
 std::tuple<int64_t, int64_t> query_device(int64_t device_index = -1);

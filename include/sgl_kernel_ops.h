@@ -537,4 +537,28 @@ void qserve_w4a8_per_group_gemm(
     const torch::Tensor& _ascales,
     torch::Tensor& _out_feats);
 
+/*
+ * From mamba
+ */
+void causal_conv1d_fwd(
+    at::Tensor& x,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    const std::optional<at::Tensor>& conv_states,
+    const std::optional<at::Tensor>& query_start_loc,
+    const std::optional<at::Tensor>& cache_indices,
+    const std::optional<at::Tensor>& has_initial_state,
+    bool silu_activation,
+    int64_t pad_slot_id);
+
+void causal_conv1d_update(
+    at::Tensor& x,
+    at::Tensor& conv_state,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    bool silu_activation,
+    const std::optional<at::Tensor>& cache_seqlens,
+    const std::optional<at::Tensor>& conv_state_indices,
+    int64_t pad_slot_id);
+
 std::tuple<int64_t, int64_t> query_device(int64_t device_index = -1);

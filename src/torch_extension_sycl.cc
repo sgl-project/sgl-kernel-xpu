@@ -51,6 +51,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("swiglu_with_alpha_and_limit(Tensor x, float alpha, float limit) -> Tensor");
   m.impl("swiglu_with_alpha_and_limit", torch::kXPU, &swiglu_with_alpha_and_limit);
   m.def(
+      "causal_conv1d_fwd(Tensor! x, Tensor weight, Tensor? bias, Tensor? conv_states, Tensor? query_start_loc,"
+      " Tensor? cache_indices, Tensor? has_initial_state, bool silu_activation, int pad_slot_id) -> ()");
+  m.impl("causal_conv1d_fwd", torch::kXPU, &causal_conv1d_fwd);
+
+  m.def(
+      "causal_conv1d_update(Tensor! x, Tensor(a!) conv_state, Tensor weight, Tensor? bias, bool silu_activation,"
+      " Tensor? cache_seqlens, Tensor? conv_state_indices, int pad_slot_id) -> ()");
+  m.impl("causal_conv1d_update", torch::kXPU, &causal_conv1d_update);
+  m.def(
       "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int "
       "num_fused_shared_experts, float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
       "(Tensor[])");

@@ -323,14 +323,22 @@ void prepare_moe_input(
 // Equivalent to IPEX MoEScatter but uses precomputed src2dst_map (c_map / output_permutation).
 template <typename T>
 struct ScatterTokensToExperts {
-  static constexpr int WGSize = 256;
   static constexpr int ElemsPerItem = sizeof(float) * 4 / sizeof(T);  // 4 for bf16/fp16
-  static constexpr int Stride = WGSize * ElemsPerItem;
   static constexpr int MAX_TOPK = 16;
 
   ScatterTokensToExperts(
-      const T* input, T* output, const int32_t* src2dst_map, const int32_t topk, const int32_t hidden_dim)
-      : input_(input), output_(output), src2dst_map_(src2dst_map), topk_(topk), hidden_dim_(hidden_dim) {}
+      const T* input,
+      T* output,
+      const int32_t* src2dst_map,
+      const int32_t topk,
+      const int32_t hidden_dim,
+      const int wg_size)
+      : input_(input),
+        output_(output),
+        src2dst_map_(src2dst_map),
+        topk_(topk),
+        hidden_dim_(hidden_dim),
+        stride_(wg_size * ElemsPerItem) {}
 
   [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
     int token_id = item.get_group(0);
@@ -345,13 +353,13 @@ struct ScatterTokensToExperts {
     // Source base pointer (sequential, coalesced reads)
     const T* src_base = input_ + token_id * hidden_dim_ + local_id * ElemsPerItem;
 
-    const int loop_count = (hidden_dim_ + Stride - 1) / Stride;
+    const int loop_count = (hidden_dim_ + stride_ - 1) / stride_;
     for (int loop = 0; loop < loop_count; ++loop) {
-      if (loop * Stride + local_id * ElemsPerItem < hidden_dim_) {
+      if (loop * stride_ + local_id * ElemsPerItem < hidden_dim_) {
         using vec_t = sycl::vec<T, ElemsPerItem>;
-        vec_t data = *(reinterpret_cast<const vec_t*>(src_base + loop * Stride));
+        vec_t data = *(reinterpret_cast<const vec_t*>(src_base + loop * stride_));
         for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
-          T* dst = output_ + dst_rows[k] * hidden_dim_ + local_id * ElemsPerItem + loop * Stride;
+          T* dst = output_ + dst_rows[k] * hidden_dim_ + local_id * ElemsPerItem + loop * stride_;
           *(reinterpret_cast<vec_t*>(dst)) = data;
         }
       }
@@ -363,6 +371,7 @@ struct ScatterTokensToExperts {
   const int32_t* src2dst_map_;
   const int32_t topk_;
   const int32_t hidden_dim_;
+  const int stride_;
 };
 
 template <typename T>
@@ -379,12 +388,14 @@ void scatter_tokens_to_experts_impl(
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
+  auto dev_id = input_tensor.device().index();
+  int wg_size = static_cast<int>(dpcppMaxWorkGroupSize(dev_id));
 
   using Kernel = ScatterTokensToExperts<T>;
-  sycl::range<1> global_range{num_tokens * Kernel::WGSize};
-  sycl::range<1> local_range{Kernel::WGSize};
+  sycl::range<1> global_range{num_tokens * static_cast<uint32_t>(wg_size)};
+  sycl::range<1> local_range{static_cast<uint32_t>(wg_size)};
 
-  Kernel task(input, output, src2dst, topk, hidden_dim);
+  Kernel task(input, output, src2dst, topk, hidden_dim, wg_size);
   sycl_kernel_submit(global_range, local_range, queue, task);
 }
 
@@ -403,9 +414,7 @@ void scatter_tokens_to_experts(
 
 template <typename T, typename T1>
 struct ApplyShuffleMulSum {
-  static constexpr int WGSize = 256;
   static constexpr int ElemsPerItem = sizeof(float) * 4 / sizeof(T);  // 4 for bf16/fp16
-  static constexpr int Stride = WGSize * ElemsPerItem;
   static constexpr int MAX_TOPK = 16;
 
   ApplyShuffleMulSum(
@@ -414,13 +423,15 @@ struct ApplyShuffleMulSum {
       const int32_t* dst2src_map,
       const T1* factors,
       const int32_t topk,
-      const int32_t hidden_dim)
+      const int32_t hidden_dim,
+      const int wg_size)
       : input_(input),
         output_(output),
         dst2src_map_(dst2src_map),
         factors_(factors),
         topk_(topk),
-        hidden_dim_(hidden_dim) {}
+        hidden_dim_(hidden_dim),
+        stride_(wg_size * ElemsPerItem) {}
 
   [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
     int out_tkn_id = item.get_group(0);
@@ -435,17 +446,17 @@ struct ApplyShuffleMulSum {
     }
 
     T* dst_base = output_ + out_tkn_id * hidden_dim_ + local_id * ElemsPerItem;
-    const int loop_count = (hidden_dim_ + Stride - 1) / Stride;
+    const int loop_count = (hidden_dim_ + stride_ - 1) / stride_;
 
     for (int loop = 0; loop < loop_count; ++loop) {
-      if (loop * Stride + local_id * ElemsPerItem < hidden_dim_) {
+      if (loop * stride_ + local_id * ElemsPerItem < hidden_dim_) {
         // Float accumulator for better precision and perf
         sycl::vec<float, ElemsPerItem> acc;
         for (int j = 0; j < ElemsPerItem; ++j)
           acc[j] = 0.0f;
 
         for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
-          const T* src = input_ + src_indices[k] * hidden_dim_ + local_id * ElemsPerItem + loop * Stride;
+          const T* src = input_ + src_indices[k] * hidden_dim_ + local_id * ElemsPerItem + loop * stride_;
           using vec_t = sycl::vec<T, ElemsPerItem>;
           vec_t reg = *(reinterpret_cast<const vec_t*>(src));
           for (int j = 0; j < ElemsPerItem; ++j) {
@@ -457,7 +468,7 @@ struct ApplyShuffleMulSum {
         vec_t store;
         for (int j = 0; j < ElemsPerItem; ++j)
           store[j] = static_cast<T>(acc[j]);
-        *(reinterpret_cast<vec_t*>(dst_base + loop * Stride)) = store;
+        *(reinterpret_cast<vec_t*>(dst_base + loop * stride_)) = store;
       }
     }
   }
@@ -467,6 +478,7 @@ struct ApplyShuffleMulSum {
   const T1* factors_;
   const int32_t topk_;
   const int32_t hidden_dim_;
+  const int stride_;
 };
 
 template <typename T, typename T1>
@@ -480,13 +492,14 @@ void apply_shuffle_mul_sum_impl(
     const int topk) {
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
+  int wg_size = static_cast<int>(dpcppMaxWorkGroupSize());
 
   using Kernel = ApplyShuffleMulSum<T, T1>;
 
-  sycl::range<1> global_range{out_tkns * Kernel::WGSize};
-  sycl::range<1> local_range{Kernel::WGSize};
+  sycl::range<1> global_range{out_tkns * static_cast<uint32_t>(wg_size)};
+  sycl::range<1> local_range{static_cast<uint32_t>(wg_size)};
 
-  Kernel task(input, output, dst2src_map, factors, topk, out_hidden_dims);
+  Kernel task(input, output, dst2src_map, factors, topk, out_hidden_dims, wg_size);
 
   sycl_kernel_submit(global_range, local_range, queue, task);
   return;

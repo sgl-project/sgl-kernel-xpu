@@ -57,7 +57,7 @@ void Xe20MoEGEMMLauncher(
   static constexpr int MaxThreadsPerSM = 512;
 
   TORCH_CHECK(
-      MaxThreadsPerSM % MaxThreadsPerWorkgroup == 0, "MaxThreadsPerSM must be divisible by MaxThreadsPerWorkgroup")
+      MaxThreadsPerSM % MaxThreadsPerWorkgroup == 0, "MaxThreadsPerSM must be divisible by MaxThreadsPerWorkgroup");
 
   sycl::range<3> local(1, 1, MaxThreadsPerWorkgroup);
   sycl::range<3> global(1, sm_count * MaxThreadsPerSM / MaxThreadsPerWorkgroup, 1);

@@ -1190,7 +1190,7 @@ def test_flash_attn_decode_kvcache(
                 dtype_ref,
             )
         cache_seqlens = torch.randint(
-            seqlen_k,
+            seqlen_q,
             # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
             seqlen_k + 1,
             (batch_size,),

@@ -5,8 +5,62 @@
 #   3. Safe fallback defaults
 
 import argparse
+from typing import List
 
+import pandas as pd
 from transformers import AutoConfig
+
+
+def print_summary(results: List[dict], title: str = "Benchmark Results"):
+    """Print summary statistics from benchmark results."""
+    print("\n" + "=" * 100)
+    print(title)
+    print("=" * 100)
+
+    df = pd.DataFrame(results)
+    df_valid = df[df["time_us"].notna()].copy()
+
+    if df_valid.empty:
+        print("No successful benchmark runs!")
+        return
+
+    df_valid["time_us"] = df_valid["time_us"].round(2)
+    df_valid["bandwidth_gbs"] = df_valid["bandwidth_gbs"].round(2)
+    df_valid["total_bytes_mb"] = df_valid["total_bytes_mb"].round(2)
+    df_valid["gflops"] = df_valid["gflops"].round(2)
+    df_valid["tflops"] = df_valid["tflops"].round(4)
+    df_valid["total_flops_g"] = df_valid["total_flops_g"].round(2)
+
+    display_cols = [
+        col
+        for col in [
+            "expected_m",
+            "actual_m",
+            "n",
+            "k",
+            "num_groups",
+            "time_us",
+            "bandwidth_gbs",
+            "gflops",
+            "tflops",
+            "total_bytes_mb",
+        ]
+        if col in df_valid.columns
+    ]
+    print("\nDetailed Results:")
+    print(df_valid[display_cols].to_markdown(index=False))
+
+    summary_cols = {
+        col: ["mean", "min", "max"] + (["std"] if col == "time_us" else [])
+        for col in ["time_us", "bandwidth_gbs", "gflops", "tflops"]
+        if col in df_valid.columns
+    }
+    if summary_cols:
+        print("\n" + "=" * 100)
+        print("Summary Statistics")
+        print("=" * 100)
+        summary = df_valid.agg(summary_cols)
+        print(summary.to_markdown())
 
 
 def get_model_config(args):

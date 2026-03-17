@@ -58,10 +58,10 @@ def is_xe2_arch() -> bool:
 
 @functools.lru_cache(maxsize=1)
 def is_xe3_arch() -> bool:
-    # Xe3 has compute capability 35
+    # Xe3P(CRI) has compute capability 35
     device = torch.xpu.current_device()
-    major, _ = torch.ops.sgl_kernel.query_device.default(device)
-    return major == 3
+    major, minor = torch.ops.sgl_kernel.query_device.default(device)
+    return major == 3 and minor == 5
 
 
 def ceil_div(x: int, y: int) -> int:

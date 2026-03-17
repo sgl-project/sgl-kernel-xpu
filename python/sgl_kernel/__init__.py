@@ -108,6 +108,7 @@ from sgl_kernel.moe import (
     moe_fused_gate,
     moe_sum,
     moe_sum_reduce,
+    mxfp4_blockwise_scaled_grouped_mm,
     prepare_moe_input,
     scatter_tokens_to_experts,
     swiglu_gpt_oss_sigmoid_alpha,
@@ -139,7 +140,7 @@ from sgl_kernel.top_k import (
     fast_topk_transform_ragged_fused,
     fast_topk_v2,
 )
-from sgl_kernel.utils import get_device_capability, is_xe2_arch
+from sgl_kernel.utils import get_device_capability, is_xe2_arch, is_xe3_arch
 from sgl_kernel.version import __version__
 
 build_tree_kernel = (

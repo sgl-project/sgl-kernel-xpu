@@ -19,7 +19,7 @@ std::tuple<int64_t, int64_t> query_device(int64_t device_index = -1) {
       return std::make_tuple(2, 0);
 #if SYCL_INTEL_TARGET == 35
     case syclex::architecture::intel_gpu_cri:
-      return std::make_tuple(3, 0);
+      return std::make_tuple(3, 5);
 #endif
     default:
       throw std::runtime_error("Unsupported XPU architecture.");

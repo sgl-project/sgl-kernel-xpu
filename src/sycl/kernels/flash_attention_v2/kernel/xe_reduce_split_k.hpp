@@ -240,7 +240,6 @@ class ReduceSplitK {
 
       Tensor exp_sums = make_tensor(make_gmem_ptr(ptrExp_sums), make_layout(shape_exp_sums, stride_exp_sums));
       Tensor max_logits = make_tensor(make_gmem_ptr(ptrMax_logits), make_layout(shape_max_logits, stride_max_logits));
-
       int l_coord = is_var_len ? 0 : idx_b;
 
       // Step 1: reduce max logits across different partitions

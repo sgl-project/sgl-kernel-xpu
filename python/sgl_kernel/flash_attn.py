@@ -281,7 +281,7 @@ def flash_attn_with_kvcache(
         softcap,
         rotary_interleaved,
         scheduler_metadata,
-        num_splits,
+        # num_splits,
         pack_gqa,
         sm_margin,
     )
@@ -354,7 +354,7 @@ def flash_attn_varlen_func(
         softcap,
         False,  # rotary_interleaved
         None,  # scheduler_metadata
-        num_splits,
+        # num_splits,
         pack_gqa,
         sm_margin,
     )

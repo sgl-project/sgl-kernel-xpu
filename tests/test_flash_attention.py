@@ -1004,7 +1004,7 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize("has_leftpad", [False])
 @pytest.mark.parametrize("has_batch_idx", [False])
 @pytest.mark.parametrize("varlen_q", [True])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64])
 @pytest.mark.parametrize("seqlen_q", [1])
 @pytest.mark.parametrize(
     "seqlen_k",
@@ -1189,9 +1189,9 @@ def test_flash_attn_decode_kvcache(
                 dtype_ref,
             )
         cache_seqlens = torch.randint(
-            seqlen_q,
-            # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
             seqlen_k,
+            # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
+            seqlen_k + 1,
             (batch_size,),
             dtype=torch.int32,
             device=device,

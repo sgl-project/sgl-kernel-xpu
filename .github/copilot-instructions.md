@@ -20,7 +20,7 @@ If guidance conflicts, prefer repository files over generic defaults.
 source /PATH/TO/ONEAPI/setvars.sh
 ```
 
-- Default build path should follow repository guidance:
+- Default build command should follow repository guidance:
 
 ```bash
 pip install -v .

@@ -45,8 +45,8 @@
 #include "sycl/comm/common.h"
 #include "sycl/kernels/flash_attention_v2/collective/fmha_fusion.hpp"
 #include "sycl/kernels/flash_attention_v2/kernel/xe_fhma_fwd_kernel.hpp"
+#include "sycl/kernels/flash_attention_v2/kernel/xe_reduce_split_k.hpp"
 #include "sycl/kernels/flash_attention_v2/kernel/xe_tile_scheduler.hpp"
-
 using namespace cute;
 namespace decode {
 struct Arguments {
@@ -57,6 +57,12 @@ struct Arguments {
   void* __restrict__ k_ptr;
   void* __restrict__ v_ptr;
 
+  void* __restrict__ k_scale_ptr = nullptr;
+  void* __restrict__ v_scale_ptr = nullptr;
+
+  void* __restrict__ temp_out_ptr = nullptr;
+  void* __restrict__ exp_sums_ptr = nullptr;
+  void* __restrict__ max_logits_ptr = nullptr;
   // The stride between rows of the Q, K and V matrices.
   index_t q_batch_stride;
   index_t k_batch_stride;
@@ -72,6 +78,7 @@ struct Arguments {
   // The number of heads.
   int h, h_k;
   int q_group_size = 1;
+  bool use_split_kv_decode = false;
 
   // The O matrix (output).
   void* __restrict__ o_ptr;
@@ -144,7 +151,7 @@ struct Arguments {
   // The indices to index into the KV cache.
   int* __restrict__ kv_batch_idx;
 
-  // Paged KV cache
+  // PagedKV KV cache
   int* __restrict__ page_table;
   int max_num_pages_per_seq;
   index_t page_table_batch_stride;
@@ -161,11 +168,13 @@ struct Arguments {
   // Scale factor of 1 / (1 - p_dropout).
   float rp_dropout;
 
-  // Local window size
-  int window_size_left, window_size_right;
+  // LocalMask window size
+  int window_size_left = -1;
+  int window_size_right = -1;
 
   // Pointer to the RNG seed (idx 0) and offset (idx 1).
   uint64_t* rng_state;
+  int num_kv_splits;  // For split-KV version
 
   bool is_bf16;
   bool is_fp32;
@@ -222,16 +231,21 @@ struct DecodeRunner {
   auto initialize_varlen(const Arguments& params, const ProblemShape& problem_size) {
     ProblemShape problem_size_for_init = problem_size;
     get<0>(problem_size_for_init) = 1;  // concentrated batch
-    get<1>(problem_size_for_init) = params.h / params.q_group_size;
-    get<3>(problem_size_for_init) = params.total_q * params.q_group_size;
+    get<1>(problem_size_for_init) = params.use_split_kv_decode ? params.h : params.h_k;
+    get<3>(problem_size_for_init) = params.use_split_kv_decode ? params.total_q : params.total_q * params.q_group_size;
     get<4>(problem_size_for_init) = params.total_knew;
     get<5>(problem_size_for_init) = params.total_k;
 
     ProblemShapeType problem_size_for_launch{
         .batch = get<0>(problem_size),
-        .num_heads_q = get<1>(problem_size) / params.q_group_size,
+        .num_heads_q = params.use_split_kv_decode ? get<1>(problem_size) : get<2>(problem_size),
         .num_heads_kv = get<2>(problem_size),
-        .seq_len_qo = {params.seqlen_q, params.total_q * params.q_group_size, nullptr, params.q_group_size},
+        .seq_len_qo =
+            {params.use_split_kv_decode ? params.seqlen_q * params.q_group_size : params.seqlen_q,
+             params.use_split_kv_decode ? params.total_q : params.total_q * params.q_group_size,
+             nullptr,
+             params.use_split_kv_decode ? 1 : params.q_group_size},
+
         .seq_len_kv = {params.seqlen_knew, params.total_knew},
         .seq_len_kv_cache = {params.seqlen_k, params.total_k},
         .head_size_qk = get<6>(problem_size),
@@ -326,6 +340,243 @@ struct DecodeRunner {
     return cutlass::Status::kSuccess;
   }
 };
+
+template <class FMHAKernel, class ReductionSplitKernel, bool isVarLen>
+struct DecodeKernelLauncher {
+  using StrideQ = typename FMHAKernel::StrideQ;
+  using StrideK = typename FMHAKernel::StrideK;
+  using StrideV = typename FMHAKernel::StrideV;
+  using StrideO = typename FMHAKernel::StrideO;
+
+  using ElementQ = typename FMHAKernel::ElementQ;
+  using ElementK = typename FMHAKernel::ElementK;
+  using ElementV = typename FMHAKernel::ElementV;
+  using ElementO = typename FMHAKernel::ElementO;
+  using ElementLSE = typename FMHAKernel::ElementLSE;
+
+  using CollectiveMainloop = typename FMHAKernel::CollectiveMainloop;
+  using ElementS = typename CollectiveMainloop::ElementS;
+
+  using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<isVarLen>;
+  using ProblemShapeTypeInit = cutlass::fmha::kernel::FMHAProblemShape<false>;
+
+  /// Initialization
+  StrideQ stride_Q;
+  StrideK stride_K;
+  StrideV stride_V;
+  StrideO stride_O;
+  StrideO stride_Oaccum;
+  StrideO stride_exp_sums;
+  StrideO stride_max_logits;
+
+  int num_kv_splits;
+
+  ProblemShapeType initialize(const Arguments& params) {
+    ProblemShapeType shape;
+    ProblemShapeTypeInit shape_init;
+    auto batch = shape.batch = shape_init.batch = params.b;
+    auto num_heads_q = shape.num_heads_q = shape_init.num_heads_q = params.h;
+    auto num_heads_kv = shape.num_heads_kv = shape_init.num_heads_kv = params.h_k;
+    auto head_size_qk = shape.head_size_qk = shape_init.head_size_qk = params.d;
+    auto head_size_vo = shape.head_size_vo = shape_init.head_size_vo = params.d;
+
+    if constexpr (isVarLen) {
+      batch = shape_init.batch = 1;
+      shape_init.seq_len_qo = params.total_q;
+      shape_init.seq_len_kv = params.total_k;
+
+      shape.seq_len_qo = cutlass::fmha::collective::VariableLength{params.seqlen_q};
+      shape.seq_len_qo.cumulative_length = reinterpret_cast<int*>(params.cu_seqlens_q);
+      shape.seq_len_kv = cutlass::fmha::collective::VariableLength{params.seqlen_k};
+      shape.seq_len_kv.cumulative_length = reinterpret_cast<int*>(params.cu_seqlens_k);
+    } else {
+      shape.seq_len_qo = shape_init.seq_len_qo = params.seqlen_q;
+      shape.seq_len_kv = shape_init.seq_len_kv = params.seqlen_k;
+    }
+
+    auto seq_len_qo = shape_init.seq_len_qo;
+    auto seq_len_kv = shape_init.seq_len_kv;
+
+    num_kv_splits = params.num_kv_splits;
+
+    stride_Q =
+        cutlass::make_cute_packed_stride(StrideQ{}, cute::make_shape(seq_len_qo, head_size_qk, num_heads_q, batch));
+    stride_K =
+        cutlass::make_cute_packed_stride(StrideK{}, cute::make_shape(seq_len_kv, head_size_qk, num_heads_kv, batch));
+    stride_V =
+        cutlass::make_cute_packed_stride(StrideV{}, cute::make_shape(head_size_vo, seq_len_kv, num_heads_kv, batch));
+    stride_O =
+        cutlass::make_cute_packed_stride(StrideO{}, cute::make_shape(seq_len_qo, head_size_vo, num_heads_q, batch));
+    stride_Oaccum = cutlass::make_cute_packed_stride(
+        StrideO{}, cute::make_shape(seq_len_qo, head_size_vo, num_heads_q * num_kv_splits, batch));
+
+    stride_exp_sums =
+        cutlass::make_cute_packed_stride(StrideO{}, cute::make_shape(seq_len_qo, num_kv_splits, num_heads_q, batch));
+
+    stride_max_logits =
+        cutlass::make_cute_packed_stride(StrideO{}, cute::make_shape(seq_len_qo, num_kv_splits, num_heads_q, batch));
+
+    return shape;
+  }
+
+  cutlass::Status run(const Arguments& params, const cutlass::KernelHardwareInfo& hw_info) {
+    ProblemShapeType shape = initialize(params);
+
+    typename FMHAKernel::Arguments arguments{
+        {
+            shape,
+            reinterpret_cast<ElementQ*>(params.q_ptr),
+            stride_Q,
+            reinterpret_cast<ElementK*>(params.k_ptr),
+            stride_K,
+            reinterpret_cast<ElementV*>(params.v_ptr),
+            stride_V,
+            reinterpret_cast<ElementO*>(params.temp_out_ptr),
+            stride_Oaccum,
+            reinterpret_cast<ElementLSE*>(params.exp_sums_ptr),
+            stride_exp_sums,
+            reinterpret_cast<ElementLSE*>(params.max_logits_ptr),
+            stride_max_logits,
+            reinterpret_cast<ElementQ*>(params.softmax_sink_ptr),
+        },
+        {params.softmax_scale,
+         params.k_scale_ptr,
+         params.v_scale_ptr,
+         static_cast<int*>(params.page_table),
+         params.page_size,
+         params.max_num_pages_per_seq,
+         params.total_k,
+         params.window_size_left,
+         params.window_size_right},
+        {},
+        hw_info,
+        params.num_kv_splits};
+
+    typename ReductionSplitKernel::Arguments reduce_arg{
+        {shape,
+         reinterpret_cast<ElementO*>(params.o_ptr),
+         stride_O,
+         reinterpret_cast<ElementO*>(params.temp_out_ptr),
+         stride_Oaccum,
+         reinterpret_cast<ElementLSE*>(params.exp_sums_ptr),
+         stride_exp_sums,
+         reinterpret_cast<ElementLSE*>(params.max_logits_ptr),
+         stride_max_logits,
+         params.window_size_left},
+        hw_info,
+        params.num_kv_splits};
+
+    // Define device-global scratch memory
+    size_t workspace_size = FMHAKernel::get_workspace_size(arguments);
+    size_t reduce_workspace_size = ReductionSplitKernel::get_workspace_size(reduce_arg);
+    cutlass::device_memory::allocation<uint8_t> workspace(workspace_size + reduce_workspace_size);
+
+    if (!FMHAKernel::can_implement(arguments)) {
+      // std::cout << "Invalid Problem Size: " << params.batch_size << 'x'
+      //           << params.num_heads_q << 'x' << params.max_queries << 'x'
+      //           << params.max_keys << 'x' << params.head_size << 'x'
+      //           << params.head_size << std::endl;
+      return cutlass::Status::kErrorInvalidProblem;
+    }
+
+    // Initialize the workspace
+    FMHAKernel::initialize_workspace(arguments, workspace.get());
+
+    // Convert host-side arguments to device-side arguments to be passed to the
+    // kernel
+    auto kernel_params = FMHAKernel::to_underlying_arguments(arguments, workspace.get());
+    auto reduce_params = ReductionSplitKernel::to_underlying_arguments(reduce_arg, workspace.get() + workspace_size);
+
+    ReductionSplitKernel::initialize_workspace(reduce_arg, workspace.get() + workspace_size);
+    run(kernel_params, reduce_params, params.num_kv_splits > 1);
+
+    return cutlass::Status::kSuccess;
+  }
+
+  static void
+  run(typename FMHAKernel::Params params, typename ReductionSplitKernel::Params reduce_params, bool need_reduce) {
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto q = stream.queue();
+
+    namespace syclex = sycl::ext::oneapi::experimental;
+    namespace intelex = sycl::ext::intel::experimental;
+
+    dim3 const block = FMHAKernel::get_block_shape();
+    dim3 const grid = FMHAKernel::get_grid_shape(params);
+
+    // cute::print("Launching FMHAKernel with grid: "); cute::print("%d x %d x
+    // %d ", grid.x, grid.y, grid.z); cute::print("and block: ");
+    // cute::print("%d x %d x %d\n", block.x, block.y, block.z);
+
+    // configure smem size and carveout
+    int smem_size = FMHAKernel::SharedStorageSize;
+
+    const auto sycl_block = compat::dim3(block.x, block.y, block.z);
+    const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
+
+    // Launch parameters depend on whether SYCL compiler supports work-group
+    // scratch memory extension
+    compat::experimental::launch_properties launch_props{
+        syclex::work_group_scratch_size(smem_size),
+    };
+    compat::experimental::kernel_properties kernel_props{
+        syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<256>};
+    compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
+
+    sycl::ext::oneapi::experimental::launch_config config(policy.get_range(), policy.get_launch_properties());
+    auto cgf = [&](::sycl::handler& cgh) {
+      auto KernelFunctor =
+          compat::experimental::detail::build_kernel_functor<cutlass::device_kernel<FMHAKernel>>(cgh, policy, params);
+      sycl::ext::oneapi::experimental::detail::
+          LaunchConfigAccess<sycl::nd_range<3>, decltype(policy.get_launch_properties())>
+              ConfigAccess(config);
+      cgh.parallel_for<KernelCur<FMHAKernel>>(ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
+    };
+
+    q.submit(cgf);
+    // auto event =
+    //     compat::experimental::launch<cutlass::device_kernel<FMHAKernel>>(
+    //         policy, queue, params);
+    // EventManager::getInstance().addEvent(event);
+
+    // event.wait();
+
+    if (need_reduce) {
+      dim3 const reduce_grid = ReductionSplitKernel::get_grid_shape(reduce_params);
+      int reduce_smem_size = ReductionSplitKernel::SharedStorageSize;
+      const auto reduce_sycl_block = compat::dim3(block.x, block.y, block.z);
+      const auto reduce_sycl_grid = compat::dim3(reduce_grid.x, reduce_grid.y, reduce_grid.z);
+      compat::experimental::launch_properties launch_props_reduce{
+          syclex::work_group_scratch_size(reduce_smem_size),
+      };
+      compat::experimental::launch_policy reduce_policy{
+          reduce_sycl_grid, reduce_sycl_block, launch_props_reduce, kernel_props};
+
+      sycl::ext::oneapi::experimental::launch_config reduce_config(
+          reduce_policy.get_range(), reduce_policy.get_launch_properties());
+      auto cgf = [&](::sycl::handler& cgh) {
+        auto KernelFunctor =
+            compat::experimental::detail::build_kernel_functor<cutlass::device_kernel<ReductionSplitKernel>>(
+                cgh, reduce_policy, reduce_params);
+        sycl::ext::oneapi::experimental::detail::
+            LaunchConfigAccess<sycl::nd_range<3>, decltype(reduce_policy.get_launch_properties())>
+                ConfigAccess(reduce_config);
+        cgh.parallel_for<KernelCur<ReductionSplitKernel>>(
+            ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
+      };
+      q.submit(cgf);
+
+      // auto reduce_event = compat::experimental::launch<
+      //     cutlass::device_kernel<ReductionSplitKernel>>(
+      //     reduce_policy, queue, reduce_params);
+
+      // // reduce_event.wait();
+
+      // EventManager::getInstance().addEvent(reduce_event);
+    }
+  }
+};
+
 template <
     bool Causal,
     bool LocalMask,
@@ -350,7 +601,7 @@ template <
     typename GmemTiledCopyK = void,
     typename GmemTiledCopyV = void,
     typename GmemTiledCopyO = void>
-struct FMHAConfig {
+struct DecodeConfig {
   static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
   using MMAOperation = cute::conditional_t<
       is_void_v<MMAOperation_>,
@@ -441,8 +692,106 @@ struct FMHAConfig {
     }
   }
 };
+
+template <
+    bool Causal,
+    bool LocalMask,
+    bool Sink,
+    typename TileShapeQK,
+    typename TileShapePV,
+    typename TileShapeOutput,
+    typename SubgroupLayoutQK,
+    typename SubgroupLayoutPV_ = void /* void -> default */,
+    int PipelineStages = 1,
+    typename ElementQ = bfloat16_t,
+    typename ElementK = bfloat16_t,
+    typename ElementV = bfloat16_t,
+    typename ElementO = bfloat16_t,
+    typename MMAOperation_ = void, /* void -> default */
+    typename StrideQ = Stride<int, _1, int, int>,
+    typename StrideK = Stride<int, _1, int, int>,
+    typename StrideV = Stride<_1, int, int, int>,
+    typename StrideO = Stride<int, _1, int, int>,
+    typename StrideOaccum = Stride<int, _1, int, int>,
+    typename GmemTiledCopyQ = void, /* void -> default block 2D */
+    typename GmemTiledCopyK = void,
+    typename GmemTiledCopyV = void,
+    typename GmemTiledCopyO = void>
+struct SplitDeodeConfig {
+  static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
+  using MMAOperation =
+      cute::conditional_t<is_void_v<MMAOperation_>, XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, ElementQ>, MMAOperation_>;
+  using SubgroupLayoutPV = cute::conditional_t<
+      is_void_v<SubgroupLayoutPV_>,
+      decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{})),
+      SubgroupLayoutPV_>;
+
+  template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
+  static void run(const Arguments& params) {
+    // constexpr bool isVarLen = true;
+    // constexpr bool PagedKV = true;
+    cutlass::KernelHardwareInfo hw_info;
+    hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+
+    using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<isVarLen>;
+
+    using TiledMMAQK = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<TileShapeQK>, SubgroupLayoutQK>::TiledMMA;
+    using TiledMMAPV = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<TileShapePV>, SubgroupLayoutPV>::TiledMMA;
+
+    static_assert(
+        get<0>(TileShapeOutput{}) == get<0>(TileShapePV{}),
+        "Output tile and P*V tile have different sizes in Q dimension");
+    constexpr int VTiles = get<1>(TileShapeOutput{}) / get<1>(TileShapePV{});
+
+    auto make_dummy_tensor = [&](auto val, auto stride) {
+      return make_tensor(make_gmem_ptr(&val), make_layout(repeat<rank_v<decltype(stride)>>(1), stride));
+    };
+
+    using TensorQ = decltype(make_dummy_tensor(ElementQ{}, StrideQ{}));
+    using TensorK = decltype(make_dummy_tensor(ElementK{}, StrideK{}));
+    using TensorV = decltype(make_dummy_tensor(ElementV{}, StrideV{}));
+    using TensorO = decltype(make_dummy_tensor(ElementO{}, StrideOaccum{}));
+    using TensorLSE = decltype(make_dummy_tensor(float{}, StrideO{}));
+
+    // Mainloop
+    using MainloopDispatchPolicy = cutlass::fmha::XeDefault<PipelineStages>;
+    using CollectiveMainloop = cutlass::fmha::collective::DecodeFwdMainloop<
+        MainloopDispatchPolicy,
+        PagedKV,
+        Causal,
+        TiledMMAQK,
+        TiledMMAPV,
+        VTiles,
+        TensorQ,
+        TensorK,
+        TensorV,
+        GmemTiledCopyQ,
+        GmemTiledCopyK,
+        GmemTiledCopyV,
+        LocalMask>;
+
+    // Epilogue
+    using CollectiveEpilogue = cutlass::fmha::collective::
+        DecodeFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, TensorLSE, void, Sink>;
+
+    using FMHAKernel = cutlass::fmha::kernel::
+        XeFMHAFwdSplitKVKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>;
+
+    using ReduceSplitKernel = cutlass::reduction::kernel::
+        ReduceSplitK<ProblemShapeType, cutlass::fmha::kernel::XeReduceSplitKTileScheduler, FMHAKernel>;
+
+    DecodeKernelLauncher<FMHAKernel, ReduceSplitKernel, isVarLen> launcher;
+
+    launcher.run(params, hw_info);
+  }
+
+  static void kernel_dispatch(const Arguments& params) {
+    return run<true, true, true, cutlass::fmha::kernel::DecodeTileScheduler>(params);
+  }
+};
+
 std::vector<at::Tensor> mha_fwd(
-    const at::Tensor& q,        // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
+    const at::Tensor& q,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
                           // h_k, d) if there is page_table.
     const at::Tensor& v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages,
@@ -469,7 +818,7 @@ std::vector<at::Tensor> mha_fwd(
     float const softcap,
     bool const is_rotary_interleaved,  // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
     std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
-    int num_splits,
+    // int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin) {
   auto q_type = q.scalar_type();
@@ -551,9 +900,51 @@ std::vector<at::Tensor> mha_fwd(
   TORCH_CHECK(head_size_v % alignment == 0, "head_size_v should be a multiple of " + std::to_string(alignment));
 
   auto opts = q.options();
+  auto device_opts = opts.device(q.device());
   at::Tensor out;
+  at::Tensor temp_out;    // [batch, num_kv_splits, num_head_q, seq_q, head_size]
+  at::Tensor exp_sums;    // [batch, num_head_q, seq_q, num_kv_splits]
+  at::Tensor max_logits;  // [batch, num_head_q, seq_q, num_kv_splits]
+  int num_kv_splits = 1;
   out = torch::empty({total_q, num_heads, head_size_v}, opts);
+  Arguments params;
+  params.use_split_kv_decode = true;
+  if (params.use_split_kv_decode) {
+    //
+    auto get_num_splits = [](int batch_size, int num_heads_kv, int max_seqlen_k, int block_size) {
+      auto stream = at::xpu::getCurrentXPUStream();
+      auto queue = stream.queue();
+      auto device = queue.get_device();
+      int num_xe_cores = device.get_info<sycl::ext::intel::info::device::gpu_slices>() *
+                         device.get_info<sycl::ext::intel::info::device::gpu_subslices_per_slice>();
 
+      int parallel_ = num_xe_cores;
+      int parallel_2 = num_xe_cores * 2;
+      int cur_parallel_d = batch_size * num_heads_kv;
+
+      int num_splits = (parallel_ + cur_parallel_d - 1) / cur_parallel_d;
+
+      if (cur_parallel_d * num_splits > parallel_ && num_splits > 1) {
+        num_splits = std::ceil(parallel_2 / static_cast<float>(cur_parallel_d)) - 1;
+      }
+
+      int max_splits = (max_seqlen_k + block_size - 1) / block_size;
+      max_splits = std::min(max_splits, parallel_);
+      return std::min(num_splits, max_splits);
+    };
+    //
+    num_kv_splits = 1;  // get_num_splits(batch_size, num_heads_k, max_seqlen_k, page_size);
+    temp_out = num_kv_splits == 1
+                   ? out
+                   : torch::empty({total_q, num_kv_splits * num_heads, head_size_v}, q.options().device(q.device()));
+    // auto float_options = opts.dtype(at::kFloat).device(q.device());
+
+    exp_sums = torch::empty({total_q, num_heads, num_kv_splits}, q.options().dtype(at::kFloat).device(q.device()));
+    max_logits = torch::empty({total_q, num_heads, num_kv_splits}, q.options().dtype(at::kFloat).device(q.device()));
+    params.temp_out_ptr = temp_out.data_ptr();
+    params.exp_sums_ptr = exp_sums.data_ptr();
+    params.max_logits_ptr = max_logits.data_ptr();
+  }
   int const head_size_rounded = round_up_headdim(head_size);
   int const head_size_v_rounded = head_size_v == head_size ? head_size_rounded : round_up_headdim(head_size_v);
 
@@ -565,7 +956,7 @@ std::vector<at::Tensor> mha_fwd(
   softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
 
   // align with FA3
-  Arguments params;
+
   params.is_bf16 = q.dtype() == torch::kBFloat16;
 
   // Set the pointers and strides.
@@ -586,7 +977,7 @@ std::vector<at::Tensor> mha_fwd(
 
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
-
+  params.num_kv_splits = num_kv_splits;
   // Softmax sum
   params.softmax_lse_ptr = softmax_lse.data_ptr();
 
@@ -595,7 +986,7 @@ std::vector<at::Tensor> mha_fwd(
   params.h = num_heads;
   params.h_k = num_heads_k;
   params.q_group_size = num_heads / num_heads_k;
-  params.seqlen_q = seqlen_q * q_group_size;
+  params.seqlen_q = seqlen_q;
   params.seqlen_k = seqlen_k;
   params.d = head_size;
   params.d_rounded = head_size_rounded;
@@ -611,7 +1002,7 @@ std::vector<at::Tensor> mha_fwd(
   params.p_dropout = 1.f;
 
   // Causal is the special case where window_size_right == 0 and window_size_left < 0.
-  // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
+  // LocalMask is the more general case where window_size_right >= 0 or window_size_left >= 0.
   params.is_causal = window_size_left < 0 && window_size_right == 0;
   params.is_local = (window_size_left >= 0 || window_size_right >= 0) && !params.is_causal;
 
@@ -680,90 +1071,91 @@ std::vector<at::Tensor> mha_fwd(
     params.rotary_dim = 0;
   }
 
-  if (kv_batch_idx_.has_value()) {
-    auto kv_batch_idx = kv_batch_idx_.value();
-    CHECK_INPUT(kv_batch_idx);
-    TORCH_CHECK(kv_batch_idx.scalar_type() == torch::kInt32, "kv_batch_idx must have dtype int32");
-    params.kv_batch_idx = reinterpret_cast<int*>(kv_batch_idx.data_ptr());
-  }
-
   params.tensor_opts = torch::TensorOptions().dtype(torch::kUInt8).device(q.device());
 
   at::Tensor out_accum, softmax_lse_accum;
   auto outaccum_type = at::ScalarType::Float;
 
   constexpr bool Causal = false;  // The decode kernel does not support causal mode. It must be set to false.
+  using ShapeQK = Shape<_8, _64, _64>;
+  using ShapePV = Shape<_8, _32, _64>;
+  using ShapeOut = Shape<_8, _64>;
+  using SubgroupLayoutQK = Layout<Shape<_1, _4, _1>>;
+  // SplitDeodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput,
+  // SubgroupLayoutQK>::run(params);
+  SplitDeodeConfig<false, false, false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK>::kernel_dispatch(params);
 
-  auto launch_kernel = [&](auto _QG_SZ, auto _HEAD_DIM, auto _PAGE_SIZE, auto _NUM_SG) {
-    using TileShapeQK = cute::Shape<decltype(_QG_SZ), decltype(_PAGE_SIZE), _64>;
-    using TileShapePV = cute::Shape<decltype(_QG_SZ), _32, decltype(_PAGE_SIZE)>;
-    using TileShapeOutput = cute::Shape<decltype(_QG_SZ), decltype(_HEAD_DIM)>;
-    using SubgroupLayoutQK = cute::Layout<cute::Shape<_1, decltype(_NUM_SG), _1>>;
+  // auto launch_kernel = [&](auto _QG_SZ, auto _HEAD_DIM, auto _PAGE_SIZE, auto _NUM_SG) {
+  //   using TileShapeQK = cute::Shape<decltype(_QG_SZ), decltype(_PAGE_SIZE), _64>;
+  //   using TileShapePV = cute::Shape<decltype(_QG_SZ), _32, decltype(_PAGE_SIZE)>;
+  //   using TileShapeOutput = cute::Shape<decltype(_QG_SZ), decltype(_HEAD_DIM)>;
+  //   using SubgroupLayoutQK = cute::Layout<cute::Shape<_1, decltype(_NUM_SG), _1>>;
 
-    AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
-      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-        FMHAConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(params);
-      });
-    });
-  };
+  //   AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+  //     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+  //       DecodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput,
+  //       SubgroupLayoutQK>::run(params);
+  //     });
+  //   });
+  // };
 
-  auto dispatch_page_size = [&](auto _QG_SZ, auto _HEAD_DIM) {
-    switch (params.page_size) {
-      case 32:
-        launch_kernel(_QG_SZ, _HEAD_DIM, _32{}, _2{});
-        break;
-      case 64:
-        launch_kernel(_QG_SZ, _HEAD_DIM, _64{}, _4{});
-        break;
-      case 128:
-        launch_kernel(_QG_SZ, _HEAD_DIM, _128{}, _8{});
-        break;
-      default:
-        TORCH_CHECK(false, "Unsupported page size for decode attention: ", params.page_size);
-    }
-  };
+  // auto dispatch_page_size = [&](auto _QG_SZ, auto _HEAD_DIM) {
+  //   switch (params.page_size) {
+  //     case 32:
+  //       launch_kernel(_QG_SZ, _HEAD_DIM, _32{}, _2{});
+  //       break;
+  //     case 64:
+  //       launch_kernel(_QG_SZ, _HEAD_DIM, _64{}, _4{});
+  //       break;
+  //     case 128:
+  //       launch_kernel(_QG_SZ, _HEAD_DIM, _128{}, _8{});
+  //       break;
+  //     default:
+  //       TORCH_CHECK(false, "Unsupported page size for decode attention: ", params.page_size);
+  //   }
+  // };
 
-  auto dispatch_q_group = [&](auto _HEAD_DIM) {
-    switch (nextPowerOf2(max_seqlen_q)) {
-      case 1:
-        dispatch_page_size(_1{}, _HEAD_DIM);
-        break;
-      case 2:
-        dispatch_page_size(_2{}, _HEAD_DIM);
-        break;
-      case 4:
-        dispatch_page_size(_4{}, _HEAD_DIM);
-        break;
-      case 8:
-        dispatch_page_size(_8{}, _HEAD_DIM);
-        break;
-      case 16:
-        dispatch_page_size(_16{}, _HEAD_DIM);
-        break;
-      case 32:
-        dispatch_page_size(_32{}, _HEAD_DIM);
-        break;
-      default:
-        TORCH_CHECK(false, "Unsupported qgroup_size for decode attention: ", max_seqlen_q);
-    }
-  };
+  // auto dispatch_q_group = [&](auto _HEAD_DIM) {
+  //   switch (nextPowerOf2(max_seqlen_q)) {
+  //     case 1:
+  //       dispatch_page_size(_1{}, _HEAD_DIM);
+  //       break;
+  //     case 2:
+  //       dispatch_page_size(_2{}, _HEAD_DIM);
+  //       break;
+  //     case 4:
+  //       dispatch_page_size(_4{}, _HEAD_DIM);
+  //       break;
+  //     case 8:
+  //       dispatch_page_size(_8{}, _HEAD_DIM);
+  //       break;
+  //     case 16:
+  //       dispatch_page_size(_16{}, _HEAD_DIM);
+  //       break;
+  //     case 32:
+  //       dispatch_page_size(_32{}, _HEAD_DIM);
+  //       break;
+  //     default:
+  //       TORCH_CHECK(false, "Unsupported qgroup_size for decode attention: ", max_seqlen_q);
+  //   }
+  // };
 
-  switch (params.d) {
-    case 64:
-      dispatch_q_group(_64{});
-      break;
-    case 96:
-      dispatch_q_group(_96{});
-      break;
-    case 128:
-      dispatch_q_group(_128{});
-      break;
-    case 192:
-      dispatch_q_group(_192{});
-      break;
-    default:
-      TORCH_CHECK(false, "Unsupported head size for decode attention: ", params.d);
-  }
+  // switch (params.d) {
+  //   case 64:
+  //     dispatch_q_group(_64{});
+  //     break;
+  //   case 96:
+  //     dispatch_q_group(_96{});
+  //     break;
+  //   case 128:
+  //     dispatch_q_group(_128{});
+  //     break;
+  //   case 192:
+  //     dispatch_q_group(_192{});
+  //     break;
+  //   default:
+  //     TORCH_CHECK(false, "Unsupported head size for decode attention: ", params.d);
+  // }
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
 }  // namespace decode

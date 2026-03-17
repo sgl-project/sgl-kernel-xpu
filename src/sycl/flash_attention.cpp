@@ -41,7 +41,7 @@
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
 
 std::vector<at::Tensor> mha_fwd(
-    const at::Tensor& q,        // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
+    const at::Tensor& q,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
                           // h_k, d) if there is page_table.
     const at::Tensor& v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages,
@@ -68,7 +68,7 @@ std::vector<at::Tensor> mha_fwd(
     float const softcap,
     bool const is_rotary_interleaved,  // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
     std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
-    int num_splits,
+    // int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin) {
   if (max_seqlen_q == 1 && page_table.has_value()) {
@@ -98,7 +98,7 @@ std::vector<at::Tensor> mha_fwd(
         softcap,
         is_rotary_interleaved,
         scheduler_metadata_,
-        num_splits,
+        // num_kv_splits,
         pack_gqa_,
         sm_margin);
   } else {
@@ -128,7 +128,7 @@ std::vector<at::Tensor> mha_fwd(
         softcap,
         is_rotary_interleaved,
         scheduler_metadata_,
-        num_splits,
+        // num_kv_splits,
         pack_gqa_,
         sm_margin);
   }

@@ -21,7 +21,12 @@ limitations under the License.
 #include <algorithm>
 #include <sycl/sycl.hpp>
 
+#include "SYCLHelpers.h"
+#include "Utils.h"
+
 namespace {
+
+constexpr int kSeqVecElems = 4;
 
 template <typename scalar_t>
 inline float to_float(scalar_t v) {
@@ -34,7 +39,6 @@ struct CausalConv1dFwdKernel {
   const int32_t* query_start_ptr;
   const int32_t* cache_indices_ptr;
   const bool* has_initial_state_ptr;
-  const int64_t dim;
   const int64_t seqlen;
   const int64_t width;
   const scalar_t* x_ptr;
@@ -56,10 +60,9 @@ struct CausalConv1dFwdKernel {
   const bool silu_activation;
   const int64_t pad_slot_id;
 
-  void operator()(sycl::id<1> idx) const {
-    const int64_t linear_idx = static_cast<int64_t>(idx[0]);
-    const int64_t batch_id = linear_idx / dim;
-    const int64_t channel_id = linear_idx % dim;
+  void operator()(sycl::id<2> idx) const {
+    const int64_t batch_id = static_cast<int64_t>(idx[0]);
+    const int64_t channel_id = static_cast<int64_t>(idx[1]);
 
     const int cache_index = cache_indices_ptr == nullptr ? static_cast<int>(batch_id) : cache_indices_ptr[batch_id];
     if (cache_index == pad_slot_id) {
@@ -83,17 +86,67 @@ struct CausalConv1dFwdKernel {
 
     const bool has_init = has_initial_state_ptr == nullptr ? false : has_initial_state_ptr[batch_id];
 
-    scalar_t history[4] = {scalar_t(0), scalar_t(0), scalar_t(0), scalar_t(0)};
-    for (int64_t i = 0; i < width - 1; ++i) {
-      history[i] = (conv_base != nullptr && has_init) ? conv_base[i * conv_states_l_stride] : scalar_t(0);
+    scalar_t tail[4] = {scalar_t(0), scalar_t(0), scalar_t(0), scalar_t(0)};
+    if (conv_base != nullptr && has_init) {
+      for (int64_t i = 0; i < width - 1; ++i) {
+        tail[i] = conv_base[i * conv_states_l_stride];
+      }
     }
 
-    for (int64_t t = 0; t < seq_len; ++t) {
+    using x_vec_t = sycl::vec<scalar_t, kSeqVecElems>;
+    int64_t t = 0;
+    for (; t + (kSeqVecElems - 1) < seq_len; t += kSeqVecElems) {
+      x_vec_t x_vec_s;
+      if (x_l_stride == 1) {
+        x_vec_s.load(0, x_base + t);
+      } else {
+        for (int lane = 0; lane < kSeqVecElems; ++lane) {
+          x_vec_s[lane] = x_base[(t + lane) * x_l_stride];
+        }
+      }
+
+      const float w_last = weight_base[(width - 1) * weight_width_stride];
+      sycl::vec<float, kSeqVecElems> out_vec_f = (x_vec_s * w_last).template convert<float>();
+      out_vec_f += bias_val;
+
+#pragma unroll
+      for (int64_t w = 0; w < width - 1; ++w) {
+        sycl::vec<float, kSeqVecElems> history_vec_f;
+        for (int lane = 0; lane < kSeqVecElems; ++lane) {
+          const int idx = lane + static_cast<int>(w);
+          const scalar_t hist_val = idx < width - 1 ? tail[idx] : x_vec_s[idx - static_cast<int>(width - 1)];
+          history_vec_f[lane] = to_float(hist_val);
+        }
+        out_vec_f += to_float(weight_base[w * weight_width_stride]) * history_vec_f;
+      }
+
+      if (silu_activation) {
+        auto sigmoid = 1.0f / (1.0f + sycl::exp(-out_vec_f));
+        out_vec_f *= sigmoid;
+      }
+      for (int64_t i = 0; i < width - 1; ++i) {
+        tail[i] = x_vec_s[static_cast<int>(kSeqVecElems - (width - 1) + i)];
+      }
+
+      if (out_l_stride == 1) {
+        x_vec_t out_data;
+        out_data = out_vec_f.template convert<scalar_t>();
+        out_data.store(0, out_base + t);
+      } else {
+        for (int lane = 0; lane < kSeqVecElems; ++lane) {
+          out_base[(t + lane) * out_l_stride] = static_cast<scalar_t>(out_vec_f[lane]);
+        }
+      }
+    }
+
+    for (; t < seq_len; ++t) {
       const scalar_t x_t = x_base[t * x_l_stride];
       float acc = bias_val;
+
       for (int64_t w = 0; w < width - 1; ++w) {
-        acc += to_float(weight_base[w * weight_width_stride]) * to_float(history[w]);
+        acc += to_float(weight_base[w * weight_width_stride]) * to_float(tail[w]);
       }
+
       acc += to_float(weight_base[(width - 1) * weight_width_stride]) * to_float(x_t);
 
       if (silu_activation) {
@@ -103,14 +156,14 @@ struct CausalConv1dFwdKernel {
       out_base[t * out_l_stride] = static_cast<scalar_t>(acc);
 
       for (int64_t i = 0; i < width - 2; ++i) {
-        history[i] = history[i + 1];
+        tail[i] = tail[i + 1];
       }
-      history[width - 2] = x_t;
+      tail[width - 2] = x_t;
     }
 
     if (conv_base != nullptr) {
       for (int64_t i = 0; i < width - 1; ++i) {
-        conv_base[i * conv_states_l_stride] = history[i];
+        conv_base[i * conv_states_l_stride] = tail[i];
       }
     }
   }
@@ -118,7 +171,6 @@ struct CausalConv1dFwdKernel {
 
 template <typename scalar_t>
 struct CausalConv1dUpdateKernel {
-  const int64_t dim;
   const int64_t seqlen;
   const int64_t width;
   const int64_t state_len;
@@ -143,10 +195,9 @@ struct CausalConv1dUpdateKernel {
   const bool silu_activation;
   const int64_t pad_slot_id;
 
-  void operator()(sycl::id<1> idx) const {
-    const int64_t linear_idx = static_cast<int64_t>(idx[0]);
-    const int64_t batch_id = linear_idx / dim;
-    const int64_t channel_id = linear_idx % dim;
+  void operator()(sycl::id<2> idx) const {
+    const int64_t batch_id = static_cast<int64_t>(idx[0]);
+    const int64_t channel_id = static_cast<int64_t>(idx[1]);
 
     const int conv_state_batch_coord =
         conv_state_indices_ptr == nullptr ? static_cast<int>(batch_id) : conv_state_indices_ptr[batch_id];
@@ -183,7 +234,71 @@ struct CausalConv1dUpdateKernel {
       }
     }
 
-    for (int64_t t = 0; t < seqlen; ++t) {
+    using x_vec_t = sycl::vec<scalar_t, kSeqVecElems>;
+    int64_t t = 0;
+    for (; t + (kSeqVecElems - 1) < seqlen; t += kSeqVecElems) {
+      x_vec_t x_vec_s;
+      if (x_l_stride == 1) {
+        x_vec_s.load(0, x_base + t);
+      } else {
+        for (int lane = 0; lane < kSeqVecElems; ++lane) {
+          x_vec_s[lane] = x_base[(t + lane) * x_l_stride];
+        }
+      }
+
+      const float w_last = weight_base[(width - 1) * weight_width_stride];
+      sycl::vec<float, kSeqVecElems> out_vec_f = (x_vec_s * w_last).template convert<float>();
+      out_vec_f += bias_val;
+
+#pragma unroll
+      for (int64_t w = 0; w < width - 1; ++w) {
+        sycl::vec<float, kSeqVecElems> history_vec_f;
+        for (int lane = 0; lane < kSeqVecElems; ++lane) {
+          const int hist_idx = lane + static_cast<int>(w);
+          const scalar_t hist_val =
+              hist_idx < width - 1 ? history[hist_idx] : x_vec_s[hist_idx - static_cast<int>(width - 1)];
+          history_vec_f[lane] = to_float(hist_val);
+        }
+        out_vec_f += to_float(weight_base[w * weight_width_stride]) * history_vec_f;
+      }
+
+      if (silu_activation) {
+        auto sigmoid = 1.0f / (1.0f + sycl::exp(-out_vec_f));
+        out_vec_f *= sigmoid;
+      }
+
+      if (out_l_stride == 1) {
+        x_vec_t out_data = out_vec_f.template convert<scalar_t>();
+        out_data.store(0, out_base + t);
+      } else {
+        for (int lane = 0; lane < kSeqVecElems; ++lane) {
+          out_base[(t + lane) * out_l_stride] = static_cast<scalar_t>(out_vec_f[lane]);
+        }
+      }
+
+      for (int lane = 0; lane < kSeqVecElems; ++lane) {
+        const scalar_t x_t = x_vec_s[lane];
+        if (cache_seqlens_ptr != nullptr) {
+          conv_base[static_cast<int64_t>(update_idx) * conv_state_l_stride] = x_t;
+          ++update_idx;
+          if (update_idx >= state_len) {
+            update_idx -= static_cast<int>(state_len);
+          }
+        } else {
+          // Keep conv_state as a sliding window over original input tokens.
+          for (int64_t i = 0; i < state_len - 1; ++i) {
+            conv_base[i * conv_state_l_stride] = conv_base[(i + 1) * conv_state_l_stride];
+          }
+          conv_base[(state_len - 1) * conv_state_l_stride] = x_t;
+        }
+      }
+
+      for (int64_t i = 0; i < width - 1; ++i) {
+        history[i] = x_vec_s[static_cast<int>(kSeqVecElems - (width - 1) + i)];
+      }
+    }
+
+    for (; t < seqlen; ++t) {
       const scalar_t x_t = x_base[t * x_l_stride];
       float acc = bias_val;
       for (int64_t w = 0; w < width - 1; ++w) {
@@ -239,12 +354,12 @@ void causal_conv1d_fwd_impl(
   const int64_t seqlen = varlen ? x.size(1) : x.size(2);
   const int64_t width = weight.size(1);
 
-  const scalar_t* x_ptr = x.data_ptr<scalar_t>();
-  const scalar_t* weight_ptr = weight.data_ptr<scalar_t>();
-  const scalar_t* bias_ptr = bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr;
-  scalar_t* out_ptr = x.data_ptr<scalar_t>();
+  const scalar_t* x_ptr = reinterpret_cast<const scalar_t*>(x.data_ptr());
+  const scalar_t* weight_ptr = reinterpret_cast<const scalar_t*>(weight.data_ptr());
+  const scalar_t* bias_ptr = bias.has_value() ? reinterpret_cast<const scalar_t*>(bias->data_ptr()) : nullptr;
+  scalar_t* out_ptr = reinterpret_cast<scalar_t*>(x.data_ptr());
 
-  scalar_t* conv_states_ptr = conv_states.has_value() ? conv_states->data_ptr<scalar_t>() : nullptr;
+  scalar_t* conv_states_ptr = conv_states.has_value() ? reinterpret_cast<scalar_t*>(conv_states->data_ptr()) : nullptr;
 
   const int64_t x_batch_stride = x.stride(varlen ? 1 : 0);
   const int64_t x_c_stride = x.stride(varlen ? 0 : 1);
@@ -265,7 +380,6 @@ void causal_conv1d_fwd_impl(
       query_start_ptr,
       cache_indices_ptr,
       has_initial_state_ptr,
-      dim,
       seqlen,
       width,
       x_ptr,
@@ -286,7 +400,7 @@ void causal_conv1d_fwd_impl(
       conv_states_l_stride,
       silu_activation,
       pad_slot_id};
-  q.parallel_for<CausalConv1dFwdKernel<scalar_t>>(sycl::range<1>(batch * dim), kernel);
+  q.parallel_for<CausalConv1dFwdKernel<scalar_t>>(sycl::range<2>(batch, dim), kernel);
 }
 
 template <typename scalar_t>
@@ -305,15 +419,16 @@ void causal_conv1d_update_impl(
   const int64_t width = weight.size(1);
   const int64_t state_len = conv_state.size(2);
 
-  const scalar_t* x_ptr = x.data_ptr<scalar_t>();
-  scalar_t* out_ptr = x.data_ptr<scalar_t>();
-  const scalar_t* weight_ptr = weight.data_ptr<scalar_t>();
-  const scalar_t* bias_ptr = bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr;
-  scalar_t* conv_state_ptr = conv_state.data_ptr<scalar_t>();
+  const scalar_t* x_ptr = reinterpret_cast<const scalar_t*>(x.data_ptr());
+  scalar_t* out_ptr = reinterpret_cast<scalar_t*>(x.data_ptr());
+  const scalar_t* weight_ptr = reinterpret_cast<const scalar_t*>(weight.data_ptr());
+  const scalar_t* bias_ptr = bias.has_value() ? reinterpret_cast<const scalar_t*>(bias->data_ptr()) : nullptr;
+  scalar_t* conv_state_ptr = reinterpret_cast<scalar_t*>(conv_state.data_ptr());
 
-  const int32_t* cache_seqlens_ptr = cache_seqlens.has_value() ? cache_seqlens->data_ptr<int32_t>() : nullptr;
+  const int32_t* cache_seqlens_ptr =
+      cache_seqlens.has_value() ? reinterpret_cast<const int32_t*>(cache_seqlens->data_ptr()) : nullptr;
   const int32_t* conv_state_indices_ptr =
-      conv_state_indices.has_value() ? conv_state_indices->data_ptr<int32_t>() : nullptr;
+      conv_state_indices.has_value() ? reinterpret_cast<const int32_t*>(conv_state_indices->data_ptr()) : nullptr;
 
   const int64_t x_batch_stride = x.stride(0);
   const int64_t x_c_stride = x.stride(1);
@@ -331,7 +446,6 @@ void causal_conv1d_update_impl(
 
   auto q = at::xpu::getCurrentXPUStream().queue();
   CausalConv1dUpdateKernel<scalar_t> kernel{
-      dim,
       seqlen,
       width,
       state_len,
@@ -355,7 +469,7 @@ void causal_conv1d_update_impl(
       conv_state_l_stride,
       silu_activation,
       pad_slot_id};
-  q.parallel_for<CausalConv1dUpdateKernel<scalar_t>>(sycl::range<1>(batch * dim), kernel);
+  q.parallel_for<CausalConv1dUpdateKernel<scalar_t>>(sycl::range<2>(batch, dim), kernel);
 }
 
 }  // namespace
@@ -414,10 +528,19 @@ void causal_conv1d_fwd(
     TORCH_CHECK(weight.size(0) == x.size(1), "weight dim must match x dim axis");
   }
 
-  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "causal_conv1d_fwd_xpu", [&] {
-    causal_conv1d_fwd_impl<scalar_t>(
-        x, weight, bias, conv_states, query_start_loc, cache_indices, has_initial_state, silu_activation, pad_slot_id);
-  });
+  SYCL_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::BFloat16, at::ScalarType::Half, x.scalar_type(), "causal_conv1d_fwd_xpu", [&] {
+        causal_conv1d_fwd_impl<scalar_t>(
+            x,
+            weight,
+            bias,
+            conv_states,
+            query_start_loc,
+            cache_indices,
+            has_initial_state,
+            silu_activation,
+            pad_slot_id);
+      });
 }
 
 void causal_conv1d_update(
@@ -469,8 +592,9 @@ void causal_conv1d_update(
     TORCH_CHECK(conv_state.size(0) == batch, "conv_state entries must match batch when indices are absent");
   }
 
-  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "causal_conv1d_update_xpu", [&] {
-    causal_conv1d_update_impl<scalar_t>(
-        x, conv_state, weight, bias, silu_activation, cache_seqlens, conv_state_indices, pad_slot_id);
-  });
+  SYCL_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::BFloat16, at::ScalarType::Half, x.scalar_type(), "causal_conv1d_update_xpu", [&] {
+        causal_conv1d_update_impl<scalar_t>(
+            x, conv_state, weight, bias, silu_activation, cache_seqlens, conv_state_indices, pad_slot_id);
+      });
 }

@@ -1078,7 +1078,7 @@ std::vector<at::Tensor> mha_fwd(
   constexpr bool Causal = false;  // The decode kernel does not support causal mode. It must be set to false.
   using ShapeQK = Shape<_8, _64, _64>;
   using ShapePV = Shape<_8, _32, _64>;
-  using ShapeOut = Shape<_8, _64>;
+  using ShapeOut = Shape<_8, _128>;
   using SubgroupLayoutQK = Layout<Shape<_1, _4, _1>>;
   // SplitDeodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput,
   // SubgroupLayoutQK>::run(params);

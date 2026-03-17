@@ -32,6 +32,12 @@
 
 #define DISPATCH_FLOAT_TYPES(TYPE, NAME, ...) AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_FLOAT_TYPES(__VA_ARGS__))
 
+#define CUTLASS_CHECK(status)                                                       \
+  {                                                                                 \
+    cutlass::Status error = status;                                                 \
+    TORCH_CHECK(error == cutlass::Status::kSuccess, cutlassGetStatusString(error)); \
+  }
+
 using DeviceId = at::DeviceIndex;
 
 static inline DeviceId dpcppGetDeviceIdOfCurrentQueue() {

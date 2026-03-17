@@ -93,7 +93,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    * From cutlass attention
    */
   m.def(
-      "fwd(Tensor!  q,"
+      "fwd(Tensor   q,"
       "    Tensor   k,"
       "    Tensor   v,"
       "    Tensor?  q_v,"
@@ -118,7 +118,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    float    softcap,"
       "    bool     is_rotary_interleaved,"
       "    Tensor?  scheduler_metadata,"
-      "    int      num_splits,"
       "    bool?    pack_gqa,"
       "    int      sm_margin) -> Tensor[]");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));

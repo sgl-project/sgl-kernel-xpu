@@ -1006,6 +1006,7 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize("varlen_q", [True])
 @pytest.mark.parametrize("d", [64])
 @pytest.mark.parametrize("seqlen_q", [1])
+@pytest.mark.parametrize("batch_size", [1, 16, 32])
 @pytest.mark.parametrize(
     "seqlen_k",
     [
@@ -1021,6 +1022,7 @@ def test_flash_attn_kvcache(
     ],
 )
 def test_flash_attn_decode_kvcache(
+    batch_size,
     seqlen_q,
     seqlen_k,
     d,
@@ -1051,7 +1053,6 @@ def test_flash_attn_decode_kvcache(
         pytest.skip()
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 16
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
     nheads = 16
     nheads_k = 4  # nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)

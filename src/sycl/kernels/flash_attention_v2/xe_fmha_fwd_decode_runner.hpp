@@ -910,20 +910,17 @@ std::vector<at::Tensor> mha_fwd(
   Arguments params;
   params.use_split_kv_decode = true;
   if (params.use_split_kv_decode) {
-    //
+    // lambda to calculate num_splits based on batch_size, num_heads_kv, max_seqlen_k and block_size
     auto get_num_splits = [](int batch_size, int num_heads_kv, int max_seqlen_k, int block_size) {
       auto stream = at::xpu::getCurrentXPUStream();
       auto queue = stream.queue();
       auto device = queue.get_device();
       int num_xe_cores = device.get_info<sycl::ext::intel::info::device::gpu_slices>() *
                          device.get_info<sycl::ext::intel::info::device::gpu_subslices_per_slice>();
-
       int parallel_ = num_xe_cores;
       int parallel_2 = num_xe_cores * 2;
       int cur_parallel_d = batch_size * num_heads_kv;
-
       int num_splits = (parallel_ + cur_parallel_d - 1) / cur_parallel_d;
-
       if (cur_parallel_d * num_splits > parallel_ && num_splits > 1) {
         num_splits = std::ceil(parallel_2 / static_cast<float>(cur_parallel_d)) - 1;
       }
@@ -932,8 +929,10 @@ std::vector<at::Tensor> mha_fwd(
       max_splits = std::min(max_splits, parallel_);
       return std::min(num_splits, max_splits);
     };
-    //
-    num_kv_splits = 1;  // get_num_splits(batch_size, num_heads_k, max_seqlen_k, page_size);
+    // lambda end
+    // For split-kv, we split the kv sequence into num_kv_splits splits and run the kernel for each split, then do a
+    // reduction to get the final output.
+    num_kv_splits = get_num_splits(batch_size, num_heads_k, max_seqlen_k, page_size);
     temp_out = num_kv_splits == 1
                    ? out
                    : torch::empty({total_q, num_kv_splits * num_heads, head_size_v}, q.options().device(q.device()));

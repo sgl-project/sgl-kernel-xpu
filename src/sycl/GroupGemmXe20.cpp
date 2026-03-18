@@ -27,7 +27,9 @@ void Xe20MoEGEMMLauncher(
     const int gemm_k,
     const int* num_rows_per_expert_device,
     const int num_experts,
-    int* workspace);
+    int* workspace,
+    float gemm1_alpha,
+    float gemm1_limit);
 
 using Tile_8_64_32 = Shape<_8, _64, _32>;
 using Tile_16_64_32 = Shape<_16, _64, _32>;
@@ -54,7 +56,9 @@ using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
       const int,                                                                        \
       const int*,                                                                       \
       const int,                                                                        \
-      int*);
+      int*,                                                                             \
+      float,                                                                            \
+      float);
 
 #define DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile, SGLayout)    \
   DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 0, true, true)   \
@@ -64,13 +68,19 @@ using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
   DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, true, true)   \
   DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, true, false)  \
   DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, false, true)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, false, false)
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, false, false) \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 2, true, true)   \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 2, true, false)  \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 2, false, true)  \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 2, false, false)
 
 #define DECLARE_XE20_MOE_TILE_FUSE(Tile, SGLayout, FuseAct)  \
   DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 0, FuseAct, true)  \
   DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 0, FuseAct, false) \
   DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, FuseAct, true)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, FuseAct, false)
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, FuseAct, false) \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 2, FuseAct, true)  \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 2, FuseAct, false)
 
 DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile_8_64_32, SG_1_4_1)
 DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile_16_64_32, SG_1_4_1)

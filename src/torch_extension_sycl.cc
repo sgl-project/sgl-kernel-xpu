@@ -74,7 +74,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def(
       "moe_grouped_mm_nt_xe20(Tensor output, Tensor activations, Tensor weights, Tensor? bias, Tensor "
-      "total_rows_for_experts, int n_experts, int activation_type, bool fuse_act) -> ()");
+      "total_rows_for_experts, int n_experts, int activation_type, bool fuse_act, float gemm1_alpha, float "
+      "gemm1_limit) -> ()");
   m.impl("moe_grouped_mm_nt_xe20", torch::kXPU, &moe_grouped_mm_nt_xe20);
 
   m.def(

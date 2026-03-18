@@ -96,7 +96,9 @@ DECLARE_XE20_MOE_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
       gemm_k,                                 \
       total_rows_for_experts.data_ptr<int>(), \
       n_experts,                              \
-      atomic_buffer.data_ptr<int>())
+      atomic_buffer.data_ptr<int>(),          \
+      gemm1_alpha,                            \
+      gemm1_limit)
 
 #define DISPATCH_MOE_HELPER_BIAS(ActType, FuseAct, WithBias, ...) \
   do {                                                            \
@@ -125,6 +127,9 @@ DECLARE_XE20_MOE_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
       case 1:                                                            \
         DISPATCH_MOE_HELPER_FUSE_ACT(1, FuseAct, WithBias, __VA_ARGS__); \
         break;                                                           \
+      case 2:                                                            \
+        DISPATCH_MOE_HELPER_FUSE_ACT(2, FuseAct, WithBias, __VA_ARGS__); \
+        break;                                                           \
       default:                                                           \
         TORCH_CHECK(false, "Unsupported activation type");               \
     }                                                                    \
@@ -140,8 +145,10 @@ void moe_grouped_mm_nt_xe20(
     const std::optional<at::Tensor>& bias,
     const torch::Tensor& total_rows_for_experts,
     const int64_t n_experts,
-    const int64_t activation_type,  // 0=silu, 1=gelu
-    bool fuse_act) {
+    const int64_t activation_type,  // 0=silu, 1=gelu, 2=swiglu
+    bool fuse_act,
+    double gemm1_alpha,
+    double gemm1_limit) {
   int total_m = activations.sizes()[0];
   int gemm_k = activations.sizes()[1];
   auto weights_shape = weights.sizes().vec();

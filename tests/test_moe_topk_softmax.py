@@ -3,7 +3,10 @@ import sys
 
 import pytest
 import torch
+import utils
 from sgl_kernel import topk_softmax
+
+device = utils.get_device()
 
 
 @pytest.mark.parametrize(
@@ -18,13 +21,13 @@ from sgl_kernel import topk_softmax
 )
 def test_topk_softmax(num_tokens, num_experts, topk):
     gating_output = torch.randn(
-        (num_tokens, num_experts), dtype=torch.float32, device="cuda"
+        (num_tokens, num_experts), dtype=torch.float32, device=device
     )
 
-    topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device="cuda")
-    topk_indices = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
+    topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device=device)
+    topk_indices = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
     token_expert_indices = torch.empty(
-        (num_tokens, topk), dtype=torch.int32, device="cuda"
+        (num_tokens, topk), dtype=torch.int32, device=device
     )
 
     topk_softmax(

@@ -385,7 +385,9 @@ class TestMXFP4ReferenceQuantization:
 class TestPerTokenGroupQuantFP4XPU:
     @pytest.fixture(autouse=True)
     def setup(self):
-        self.device = "xpu"
+        import utils
+
+        self.device = utils.get_device()
         self.eps = 1e-10
 
     def _import_kernel(self):

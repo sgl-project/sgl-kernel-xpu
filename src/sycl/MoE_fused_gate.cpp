@@ -3,6 +3,7 @@
 #include <torch/all.h>
 
 #include <sycl/sycl.hpp>
+#include <vector>
 
 #include "MemoryAccess.h"
 #include "SYCLHelpers.h"

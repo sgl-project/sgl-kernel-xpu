@@ -4,6 +4,7 @@
 #include <torch/all.h>
 
 #include <cute/tensor.hpp>
+#include <vector>
 
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/util/packed_stride.hpp"

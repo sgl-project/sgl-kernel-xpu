@@ -38,6 +38,7 @@
 
 #include <cute/tensor.hpp>
 #include <random>
+#include <vector>
 
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"

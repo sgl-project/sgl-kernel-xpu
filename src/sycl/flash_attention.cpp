@@ -36,6 +36,7 @@
 #include <torch/all.h>
 
 #include <cute/tensor.hpp>
+#include <vector>
 
 #include "kernels/chunk_prefill/chunk_prefill_runner.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp"

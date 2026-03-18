@@ -15,10 +15,6 @@ using namespace cute;
 
 using ElementAccumulator = float;  // <- data type of accumulator
 
-template <typename, typename, typename, typename, typename, typename, int, bool, bool>
-class GemmXe20Name;
-
-// ActType: 0=silu, 1=gelu
 template <typename Tile, typename SGLayout, int ActType, bool FuseAct, bool WithBias>
 void Xe20MoEGEMMLauncher(
     sycl::queue q,
@@ -31,69 +27,62 @@ void Xe20MoEGEMMLauncher(
     const int gemm_k,
     const int* num_rows_per_expert_device,
     const int num_experts,
-    int* workspace) {
-  using Element = cutlass::bfloat16_t;
+    int* workspace);
 
-  auto make_dummy_tensor = [&](auto val, auto stride) {
-    return make_tensor(make_gmem_ptr(&val), make_layout(repeat<rank_v<decltype(stride)>>(1), stride));
-  };
-  auto make_dummy_bias = [&](auto val) {
-    return make_tensor(make_gmem_ptr(&val), make_layout(Shape<int>{}, Stride<_1>{}));
-  };
-  using StrideA = Stride<int, _1>;
-  using StrideB = Stride<int, _1>;
-  using StrideD = Stride<int, _1>;
-  using TensorA = decltype(make_dummy_tensor(Element{}, StrideA{}));
-  using TensorB = decltype(make_dummy_tensor(Element{}, StrideB{}));
-  using TensorD = decltype(make_dummy_tensor(Element{}, StrideD{}));
-  using TensorBias = decltype(make_dummy_bias(Element{}));
+using Tile_8_64_32 = Shape<_8, _64, _32>;
+using Tile_16_64_32 = Shape<_16, _64, _32>;
+using Tile_32_64_32 = Shape<_32, _64, _32>;
+using Tile_128_64_32 = Shape<_128, _64, _32>;
+using Tile_128_128_32 = Shape<_128, _128, _32>;
+using Tile_256_64_32 = Shape<_256, _64, _32>;
+using Tile_256_256_32 = Shape<_256, _256, _32>;
 
-  using ElementA_non_CV = cutlass::platform::remove_cv_t<Element>;
-  using MMA =
-      typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, ElementA_non_CV>>, Layout<Tile>, SGLayout>::TiledMMA;
-  auto mma = MMA{};
+using SG_1_4_1 = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
+using SG_4_2_1 = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
+using SG_8_2_1 = Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>;
+using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
 
-  int sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
-  auto MaxThreadsPerWorkgroup = size(mma);
+#define DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActType, FuseAct, WithBias)             \
+  extern template void Xe20MoEGEMMLauncher<Tile, SGLayout, ActType, FuseAct, WithBias>( \
+      sycl::queue,                                                                      \
+      const void*,                                                                      \
+      const void*,                                                                      \
+      const void*,                                                                      \
+      const void*,                                                                      \
+      void*,                                                                            \
+      const int,                                                                        \
+      const int,                                                                        \
+      const int*,                                                                       \
+      const int,                                                                        \
+      int*);
 
-  static constexpr int MaxThreadsPerSM = 512;
+#define DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile, SGLayout)    \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 0, true, true)   \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 0, true, false)  \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 0, false, true)  \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 0, false, false) \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, true, true)   \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, true, false)  \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, false, true)  \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, false, false)
 
-  TORCH_CHECK(
-      MaxThreadsPerSM % MaxThreadsPerWorkgroup == 0, "MaxThreadsPerSM must be divisible by MaxThreadsPerWorkgroup")
+#define DECLARE_XE20_MOE_TILE_FUSE(Tile, SGLayout, FuseAct)  \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 0, FuseAct, true)  \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 0, FuseAct, false) \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, FuseAct, true)  \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, FuseAct, false)
 
-  sycl::range<3> local(1, 1, MaxThreadsPerWorkgroup);
-  sycl::range<3> global(1, sm_count * MaxThreadsPerSM / MaxThreadsPerWorkgroup, 1);
+DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile_8_64_32, SG_1_4_1)
+DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile_16_64_32, SG_1_4_1)
+DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile_32_64_32, SG_1_4_1)
+DECLARE_XE20_MOE_TILE_FUSE(Tile_128_64_32, SG_4_2_1, true)
+DECLARE_XE20_MOE_TILE_FUSE(Tile_128_128_32, SG_4_2_1, false)
+DECLARE_XE20_MOE_TILE_FUSE(Tile_256_64_32, SG_8_2_1, true)
+DECLARE_XE20_MOE_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
 
-  namespace syclex = sycl::ext::oneapi::experimental;
-  namespace intelex = sycl::ext::intel::experimental;
-
-  syclex::properties kernel_props{syclex::sub_group_size<16>, intelex::grf_size<256>};
-
-  using Kernel =
-      MoE::MoEGEMM<Tile, SGLayout, TensorA, TensorB, TensorD, TensorBias, MMA, ActType, FuseAct, WithBias, Element>;
-  typename Kernel::Params params{
-      static_cast<const Element*>(activations),
-      static_cast<const Element*>(weights),
-      static_cast<const Element*>(bias),
-      static_cast<Element*>(outputs),
-      num_rows_per_expert_device,
-      gemm_n,
-      gemm_k,
-      num_experts,
-      workspace,
-      mma,
-  };
-
-  auto event = q.submit([&](sycl::handler& h) {
-    sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), h);
-    h.parallel_for<GemmXe20Name<Tile, SGLayout, TensorA, TensorB, TensorD, Element, ActType, FuseAct, WithBias>>(
-        sycl::nd_range<3>(global * local, local), kernel_props, [=](sycl::nd_item<3> item) {
-          int32_t* slm_mem =
-              static_cast<int32_t*>(local_mem.template get_multi_ptr<sycl::access::decorated::no>().get());
-          Kernel{}(params, item, slm_mem);
-        });
-  });
-}
+#undef DECLARE_XE20_MOE_TILE_FUSE
+#undef DECLARE_XE20_MOE_TILE_ALL_FUSES
+#undef DECLARE_XE20_MOE_EXTERN
 
 #define LAUNCH_MOE(...)                       \
   Xe20MoEGEMMLauncher<__VA_ARGS__>(           \

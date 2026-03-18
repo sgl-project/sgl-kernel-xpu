@@ -1,0 +1,109 @@
+#define SYCL_INTEL_TARGET 20
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/all.h>
+
+#include <cute/tensor.hpp>
+
+#include "sycl/Utils.h"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/group_array_problem_shape.hpp"
+#include "sycl/kernels/moe/xe20/moe_kernel.hpp"
+
+using namespace cute;
+
+template <typename, typename, typename, typename, typename, typename, int, bool, bool>
+class GemmXe20Name;
+
+template <typename Tile, typename SGLayout, int ActType, bool FuseAct, bool WithBias>
+void Xe20MoEGEMMLauncher(
+    sycl::queue q,
+    const void* activations,
+    const void* weights,
+    const void* scales,
+    const void* bias,
+    void* outputs,
+    const int gemm_n,
+    const int gemm_k,
+    const int* num_rows_per_expert_device,
+    const int num_experts,
+    int* workspace) {
+  (void)scales;
+  using Element = cutlass::bfloat16_t;
+
+  auto make_dummy_tensor = [&](auto val, auto stride) {
+    return make_tensor(make_gmem_ptr(&val), make_layout(repeat<rank_v<decltype(stride)>>(1), stride));
+  };
+  auto make_dummy_bias = [&](auto val) {
+    return make_tensor(make_gmem_ptr(&val), make_layout(Shape<int>{}, Stride<_1>{}));
+  };
+  using StrideA = Stride<int, _1>;
+  using StrideB = Stride<int, _1>;
+  using StrideD = Stride<int, _1>;
+  using TensorA = decltype(make_dummy_tensor(Element{}, StrideA{}));
+  using TensorB = decltype(make_dummy_tensor(Element{}, StrideB{}));
+  using TensorD = decltype(make_dummy_tensor(Element{}, StrideD{}));
+  using TensorBias = decltype(make_dummy_bias(Element{}));
+
+  using ElementA_non_CV = cutlass::platform::remove_cv_t<Element>;
+  using MMA =
+      typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, ElementA_non_CV>>, Layout<Tile>, SGLayout>::TiledMMA;
+  auto mma = MMA{};
+
+  int sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+  auto MaxThreadsPerWorkgroup = size(mma);
+
+  static constexpr int MaxThreadsPerSM = 512;
+
+  TORCH_CHECK(
+      MaxThreadsPerSM % MaxThreadsPerWorkgroup == 0, "MaxThreadsPerSM must be divisible by MaxThreadsPerWorkgroup");
+
+  sycl::range<3> local(1, 1, MaxThreadsPerWorkgroup);
+  sycl::range<3> global(1, sm_count * MaxThreadsPerSM / MaxThreadsPerWorkgroup, 1);
+
+  namespace syclex = sycl::ext::oneapi::experimental;
+  namespace intelex = sycl::ext::intel::experimental;
+
+  syclex::properties kernel_props{syclex::sub_group_size<16>, intelex::grf_size<256>};
+
+  using Kernel =
+      MoE::MoEGEMM<Tile, SGLayout, TensorA, TensorB, TensorD, TensorBias, MMA, ActType, FuseAct, WithBias, Element>;
+  typename Kernel::Params params{
+      static_cast<const Element*>(activations),
+      static_cast<const Element*>(weights),
+      static_cast<const Element*>(bias),
+      static_cast<Element*>(outputs),
+      num_rows_per_expert_device,
+      gemm_n,
+      gemm_k,
+      num_experts,
+      workspace,
+      mma,
+  };
+
+  q.submit([&](sycl::handler& h) {
+    sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), h);
+    h.parallel_for<GemmXe20Name<Tile, SGLayout, TensorA, TensorB, TensorD, Element, ActType, FuseAct, WithBias>>(
+        sycl::nd_range<3>(global * local, local), kernel_props, [=](sycl::nd_item<3> item) {
+          int32_t* slm_mem =
+              static_cast<int32_t*>(local_mem.template get_multi_ptr<sycl::access::decorated::no>().get());
+          Kernel{}(params, item, slm_mem);
+        });
+  });
+}
+
+template void Xe20MoEGEMMLauncher<@TILE@, @SGLAYOUT@, @ACT_TYPE@, @FUSE_ACT@, @WITH_BIAS@>(
+    sycl::queue,
+    const void*,
+    const void*,
+    const void*,
+    const void*,
+    void*,
+    const int,
+    const int,
+    const int*,
+    const int,
+    int*);
+
+#undef SYCL_INTEL_TARGET

@@ -31,7 +31,7 @@
 /*! \file
     \brief MLA decode interface for PyTorch
 */
-
+#define SYCL_INTEL_TARGET 20
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
@@ -401,3 +401,5 @@ cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches, int64_t
   //
   return MlaXeType::Fmla::get_workspace_size(arguments);
 }
+
+#undef SYCL_INTEL_TARGET

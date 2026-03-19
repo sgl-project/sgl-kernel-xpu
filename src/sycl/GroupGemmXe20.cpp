@@ -178,6 +178,11 @@ void moe_grouped_mm_nt_xe20(
     TORCH_CHECK(output.sizes()[1] == gemm_n, "output must have the same number of columns as activations");
   }
   TORCH_CHECK(n_experts % 8 == 0, "n_experts must be a multiple of 8 for the current implementation");
+  if (bias.has_value()) {
+    TORCH_CHECK(
+        bias->scalar_type() == at::kFloat,
+        "moe_grouped_mm_nt_xe20: bias must be float32 (at::kFloat) to match kernel expectations");
+  }
   TORCH_CHECK(
       activations.scalar_type() == weights.scalar_type(), "activations and weights must have the same data type");
   TORCH_CHECK(

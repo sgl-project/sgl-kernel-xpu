@@ -122,7 +122,7 @@ def torch_naive_moe(
 
 
 @pytest.mark.parametrize(
-    "num_tokens,topk,num_experts,hidden_size,intermediate_size,with_bias,act_type",
+    "num_tokens,topk,num_experts,hidden_size,intermediate_size,bias_dtype,act_type",
     list(
         itertools.product(
             [1, 4, 33, 64, 222],  # num_tokens
@@ -130,13 +130,13 @@ def torch_naive_moe(
             [8, 64],  #  num_experts
             [1024, 4096],  # hidden_size
             [512, 1024, 4096],  # intermediate_size
-            [False, True],  # with_bias
+            [False, "bfloat16", "float32"],  # bias_dtype
             ["silu", "gelu", "swiglu"],  # act_type
         )
     ),
 )
 def test_moe_gemm(
-    num_tokens, topk, num_experts, hidden_size, intermediate_size, with_bias, act_type
+    num_tokens, topk, num_experts, hidden_size, intermediate_size, bias_dtype, act_type
 ):
     torch.xpu.manual_seed_all(0)
 
@@ -149,13 +149,12 @@ def test_moe_gemm(
         (num_experts, hidden_size, intermediate_size), torch.bfloat16
     )
     b1, b2 = None, None
-    if with_bias:
+    if bias_dtype:
+        dtype = torch.bfloat16 if bias_dtype == "bfloat16" else torch.float32
         b1 = create_random_xpu_tensor(
-            (num_experts, 2 * intermediate_size), torch.float32, std=0.005
+            (num_experts, 2 * intermediate_size), dtype, std=0.005
         )
-        b2 = create_random_xpu_tensor(
-            (num_experts, hidden_size), torch.float32, std=0.005
-        )
+        b2 = create_random_xpu_tensor((num_experts, hidden_size), dtype, std=0.005)
     score = torch.randn([num_tokens, num_experts], dtype=torch.bfloat16).to("xpu")
 
     score = torch.softmax(score, dim=-1, dtype=torch.float32)

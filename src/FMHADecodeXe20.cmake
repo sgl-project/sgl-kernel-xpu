@@ -3,7 +3,7 @@
 # library to parallelize and speed up compilation.
 
 set(FMHA_DECODE_QG_SIZES 1 2 4 8 16 32)
-set(FMHA_DECODE_HEAD_DIMS 64 96 128 192)
+set(FMHA_DECODE_HEAD_DIMS 64 96 128 192 256)
 set(FMHA_DECODE_PAGE_SIZES 32 64 128)
 
 set(FMHA_DECODE_TEMPLATE

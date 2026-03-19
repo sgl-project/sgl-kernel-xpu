@@ -273,5 +273,6 @@ int round_up_headdim(int head_size) {
   if (head_size <= 96) return 96;
   if (head_size <= 128) return 128;
   if (head_size <= 192) return 192;
+  if (head_size <= 256) return 256;
   return 256;
 };

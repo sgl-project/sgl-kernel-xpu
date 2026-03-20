@@ -134,5 +134,46 @@ def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
 
 
+###############################################################################
+# Non-contiguous input tests (DeepSeek split pattern: stride[0] != hidden_size)
+###############################################################################
+
+
+def _make_non_contiguous(batch_size, hidden_size, dtype, extra=64):
+    """Create a non-contiguous tensor by slicing a larger tensor,
+    mimicking latent_cache.split([hidden_size, extra], dim=-1)[0]."""
+    full = torch.randn(batch_size, hidden_size + extra, device=device, dtype=dtype)
+    view = full[:, :hidden_size]  # stride = (hidden_size + extra, 1)
+    # assert not view.is_contiguous()
+    assert view.stride(0) == hidden_size + extra
+    return view
+
+
+@pytest.mark.parametrize("batch_size", [1, 19, 99])
+@pytest.mark.parametrize("hidden_size", [512, 1024, 3072])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_norm_non_contiguous(batch_size, hidden_size, dtype):
+    x_nc = _make_non_contiguous(batch_size, hidden_size, dtype)
+    w = torch.randn(hidden_size, device=device, dtype=dtype)
+
+    y_ref = llama_rms_norm(x_nc.clone(), w)
+    y = sgl_kernel.rmsnorm(x_nc, w)
+
+    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [1, 19, 99])
+@pytest.mark.parametrize("hidden_size", [512, 1024, 3072])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_gemma_norm_non_contiguous(batch_size, hidden_size, dtype):
+    x_nc = _make_non_contiguous(batch_size, hidden_size, dtype)
+    w = torch.randn(hidden_size, device=device, dtype=dtype)
+
+    y_ref = gemma_rms_norm(x_nc.clone(), w)
+    y = sgl_kernel.gemma_rmsnorm(x_nc, w)
+
+    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

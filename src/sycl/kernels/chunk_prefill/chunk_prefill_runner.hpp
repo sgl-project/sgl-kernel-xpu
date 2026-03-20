@@ -846,7 +846,7 @@ std::vector<at::Tensor> mha_fwd(
       })
       break;
     default:
-      TORCH_CHECK(false, "Unsupported head size for causal attention");
+      TORCH_CHECK(false, "Unsupported head size ", params.d, " for chunk-prefill MHA");
   }
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }

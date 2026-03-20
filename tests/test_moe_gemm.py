@@ -35,12 +35,12 @@ SWIGLU_ALPHA = 1.702
 SWIGLU_LIMIT = 7.0
 
 
-def swiglu_with_alpha_and_limit(
+def swiglu_gpt_oss_sigmoid_alpha(
     x: torch.Tensor,
     alpha: float = SWIGLU_ALPHA,
     limit: float = SWIGLU_LIMIT,
 ) -> torch.Tensor:
-    """Matches the kernel's swiglu_with_alpha_and_limit formula:
+    """Matches the kernel's swiglu_gpt_oss_sigmoid_alpha formula:
         gate = clamp(gate, -inf, limit)
         up   = clamp(up,   -limit, limit)
         out  = gate * sigmoid(gate * alpha) * (up + 1)
@@ -49,6 +49,7 @@ def swiglu_with_alpha_and_limit(
         x: Input tensor of shape (..., 2*N).
            x is in [g0, u0, g1, u1, ...] layout
            (model weight format).
+    Note: currently, only GPT-OSS uses this variant.
     """
     gate = x[..., 0::2].float()  # even columns
     up = x[..., 1::2].float()  # odd columns
@@ -88,13 +89,13 @@ def torch_naive_moe(
     assert activations in [
         "silu",
         "gelu",
-        "swiglu",
-    ], "Only silu, gelu, and swiglu activations are supported."
+        "swiglu_gpt_oss_sigmoid_alpha",
+    ], "Only silu, gelu, and swiglu_gpt_oss_sigmoid_alpha activations are supported."
 
-    if activations == "swiglu":
+    if activations == "swiglu_gpt_oss_sigmoid_alpha":
         # w1 is in interleaved layout [g0, u0, g1, u1, ...] (model weight format).
         # The GEMM output is therefore also interleaved along the N dimension.
-        act_fn = lambda x: swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit)
+        act_fn = lambda x: swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit)
         for i in range(w1.shape[0]):
             mask = topk_ids == i
             if mask.sum():
@@ -131,7 +132,7 @@ def torch_naive_moe(
             [1024, 4096],  # hidden_size
             [512, 1024, 4096],  # intermediate_size
             [False, "bfloat16", "float32"],  # bias_dtype
-            ["silu", "gelu", "swiglu"],  # act_type
+            ["silu", "gelu", "swiglu_gpt_oss_sigmoid_alpha"],  # act_type
         )
     ),
 )
@@ -182,7 +183,7 @@ def test_moe_gemm(
         topk_ids,
         b1,
         b2,
-        activation="silu" if act_type == "swiglu" else act_type,
+        activation="silu" if act_type == "swiglu_gpt_oss_sigmoid_alpha" else act_type,
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
     )

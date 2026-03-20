@@ -3,10 +3,10 @@ import sys
 
 import pytest
 import torch
-from sgl_kernel import swiglu_with_alpha_and_limit
+from sgl_kernel import swiglu_gpt_oss_sigmoid_alpha
 
 
-def swiglu_with_alpha_and_limit_ref(x, gemm1_alpha, gemm1_limit):
+def swiglu_gpt_oss_sigmoid_alpha_ref(x, gemm1_alpha, gemm1_limit):
     """Reference implementation using native PyTorch"""
     gate, up = x[..., ::2], x[..., 1::2]
     gate = gate.clamp(min=None, max=gemm1_limit)
@@ -26,7 +26,7 @@ def swiglu_with_alpha_and_limit_ref(x, gemm1_alpha, gemm1_limit):
         )
     ),
 )
-def test_swiglu_with_alpha_and_limit(batch_size, hidden_size, alpha, limit, dtype):
+def test_swiglu_gpt_oss_sigmoid_alpha(batch_size, hidden_size, alpha, limit, dtype):
     # Ensure hidden_size is even for gate/up split
     if hidden_size % 2 != 0:
         pytest.skip("hidden_size must be even")
@@ -34,10 +34,10 @@ def test_swiglu_with_alpha_and_limit(batch_size, hidden_size, alpha, limit, dtyp
     x = torch.randn((batch_size, hidden_size), dtype=dtype, device="xpu")
 
     # Call the kernel
-    output = swiglu_with_alpha_and_limit(x, alpha, limit)
+    output = swiglu_gpt_oss_sigmoid_alpha(x, alpha, limit)
 
     # Reference implementation
-    output_ref = swiglu_with_alpha_and_limit_ref(x, alpha, limit)
+    output_ref = swiglu_gpt_oss_sigmoid_alpha_ref(x, alpha, limit)
 
     # Verify the outputs match
     atol = 1e-1 if dtype in [torch.bfloat16, torch.float16] else 1e-4

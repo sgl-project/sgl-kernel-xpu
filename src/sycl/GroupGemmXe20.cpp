@@ -107,8 +107,8 @@ DECLARE_XE20_MOE_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
       total_rows_for_experts.data_ptr<int>(), \
       n_experts,                              \
       atomic_buffer.data_ptr<int>(),          \
-      gemm1_alpha,                            \
-      gemm1_limit)
+      static_cast<float>(gemm1_alpha),        \
+      static_cast<float>(gemm1_limit))
 
 #define DISPATCH_MOE_HELPER_BIAS(ActType, FuseAct, WithBias, ...) \
   do {                                                            \
@@ -155,7 +155,7 @@ void moe_grouped_mm_nt_xe20(
     const std::optional<at::Tensor>& bias,
     const torch::Tensor& total_rows_for_experts,
     const int64_t n_experts,
-    const int64_t activation_type,  // 0=silu, 1=gelu, 2=swiglu
+    const int64_t activation_type,  // 0=silu, 1=gelu, 2=swiglu_gpt_oss
     bool fuse_act,
     double gemm1_alpha,
     double gemm1_limit) {

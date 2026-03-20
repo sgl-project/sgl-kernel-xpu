@@ -49,7 +49,7 @@
 
 #define SILU 0
 #define GELU 1
-#define SWIGLU 2
+#define SWILGU_GPT_OSS 2
 
 template <typename T>
 struct dump;
@@ -362,7 +362,7 @@ struct MoEMainloop<
       if constexpr (ActType == SILU) {
         s = 1.0f / (1.0f + sycl::native::exp(-x));
         tCrC0(i) = x * s * y;
-      } else if constexpr (ActType == SWIGLU) {
+      } else if constexpr (ActType == SWILGU_GPT_OSS) {
         float gate = sycl::fmin(x, gemm1_limit);
         float up = sycl::fmax(-gemm1_limit, sycl::fmin(y, gemm1_limit));
         float t = gate * gemm1_alpha;

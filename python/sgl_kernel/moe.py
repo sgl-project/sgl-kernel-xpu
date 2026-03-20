@@ -50,13 +50,13 @@ def moe_sum_reduce(
     )
 
 
-def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
+def swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit):
     assert gemm1_limit > 0, f"gemm1_limit must be positive, got {gemm1_limit}"
     assert x.dim() == 2, f"x must be 2D [B, 2H], got {x.dim()}D"
     assert (
         x.size(1) % 2 == 0
     ), f"Last dim must be even for gate/up split, got {x.size(1)}"
-    return torch.ops.sgl_kernel.swiglu_with_alpha_and_limit.default(
+    return torch.ops.sgl_kernel.swiglu_gpt_oss_sigmoid_alpha.default(
         x,
         gemm1_alpha,
         gemm1_limit,
@@ -400,14 +400,15 @@ def fused_experts(
         (M * TopK, OutK), device=hidden_states.device, dtype=hidden_states.dtype
     )
 
-    # 0=silu, 1=gelu, 2=swiglu (silu with alpha/limit clamping)
+    # 0=silu, 1=gelu, 2=swiglu (silu with alpha/limit clamping for gpt-oss)
     if activation == "silu":
         activation_type = 0
         if gemm1_alpha is not None:
             assert (
                 gemm1_limit is not None
-            ), "gemm1_limit must be provided when gemm1_alpha is set for swiglu"
+            ), "gemm1_limit must be provided when gemm1_alpha is set for swiglu for GPT-OSS"
             activation_type = 2
+            activation = "swiglu_gpt_oss_sigmoid_alpha"
     elif activation == "gelu":
         activation_type = 1
     else:
@@ -416,7 +417,6 @@ def fused_experts(
     assert is_xe2_arch(), f"Current MoE is only supported on BMG"
 
     # heuristic for choosing fused or unfused act, can be tuned
-    # Note: using unfused activation path for swiglu till support for fused path is enabled
     avg_m = (M * TopK) // E
     big_weight = K * N > 4096 * 4096
     use_unfused_act = avg_m <= 128 and big_weight
@@ -446,7 +446,7 @@ def fused_experts(
                 intermediate_cache2, intermediate_cache1
             )
         elif activation_type == 2:
-            intermediate_cache2 = torch.ops.sgl_kernel.swiglu_with_alpha_and_limit(
+            intermediate_cache2 = torch.ops.sgl_kernel.swiglu_gpt_oss_sigmoid_alpha(
                 intermediate_cache1, gemm1_alpha, gemm1_limit
             )
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(

@@ -86,8 +86,8 @@ void Xe20MoEGEMMLauncher(
       num_experts,
       workspace,
       mma,
-      gemm1_alpha,
-      gemm1_limit,
+      static_cast<float>(gemm1_alpha),
+      static_cast<float>(gemm1_limit),
   };
 
   q.submit([&](sycl::handler& h) {

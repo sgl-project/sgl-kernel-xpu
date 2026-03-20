@@ -19,12 +19,16 @@ foreach(file ${device_cpp})
 
 endforeach()
 
+include(FMHADecodeXe20.cmake)
+
 message(STATUS "BMG files: ${device_cpp_xe20}")
 message(STATUS "Common files: ${device_cpp_common}")
 
 list(APPEND ATen_XPU_CPP_SRCS ${host_cpp})
 list(APPEND ATen_XPU_SYCL_COMMON ${device_cpp_common})
 list(APPEND ATen_XPU_SYCL_XE20 ${device_cpp_xe20})
+
+include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmXe20.cmake)
 
 set(ATen_XPU_CPP_SRCS ${ATen_XPU_CPP_SRCS} PARENT_SCOPE)
 set(ATen_XPU_SYCL_COMMON ${ATen_XPU_SYCL_COMMON} PARENT_SCOPE)

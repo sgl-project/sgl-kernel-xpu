@@ -338,17 +338,22 @@ std::vector<at::Tensor> mha_fwd(
 
     AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-        SplitDecodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::
-            kernel_dispatch(params);
+        if (params.use_split_kv_decode) {
+          SplitDecodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::
+              kernel_dispatch(params);
+        } else {
+          DecodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(
+              params);
+        }
       });
     });
   };
 
   auto dispatch_page_size = [&](auto _QG_SZ, auto _HEAD_DIM) {
     switch (params.page_size) {
-      case 32:
-        launch_kernel(_QG_SZ, _HEAD_DIM, _32{}, _2{});
-        break;
+      // case 32:
+      //   launch_kernel(_QG_SZ, _HEAD_DIM, _32{}, _2{});
+      //   break;
       case 64:
         launch_kernel(_QG_SZ, _HEAD_DIM, _64{}, _4{});
         break;

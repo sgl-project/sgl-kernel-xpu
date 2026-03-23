@@ -717,7 +717,7 @@ template <
     typename GmemTiledCopyK = void,
     typename GmemTiledCopyV = void,
     typename GmemTiledCopyO = void>
-struct SplitDeodeConfig {
+struct SplitDecodeConfig {
   static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
   using MMAOperation =
       cute::conditional_t<is_void_v<MMAOperation_>, XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, ElementQ>, MMAOperation_>;

@@ -38,107 +38,12 @@
 #include <cute/tensor.hpp>
 
 #include "kernels/chunk_prefill/chunk_prefill_runner.hpp"
-#include "kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
 
 namespace decode {
 
-namespace {
-
-using launch_fn_t = void (*)(bool use_sink, const Arguments& params);
-
-#define LAUNCH_FN_ENTRY(QG, HD, PS) &launch_fmha_decode_##QG##_##HD##_##PS
-
-launch_fn_t get_launch_fn(int qg_sz, int head_dim, int page_size) {
-  // Dispatch table indexed by (qg_sz, head_dim, page_size).
-  // qg_sz  index: {1->0, 2->1, 4->2, 8->3, 16->4, 32->5}
-  // head_dim index: {64->0, 96->1, 128->2, 192->3}
-  // page_size index: {32->0, 64->1, 128->2}
-
-#define PAGE_ENTRIES(QG, HD) \
-  { LAUNCH_FN_ENTRY(QG, HD, 32), LAUNCH_FN_ENTRY(QG, HD, 64), LAUNCH_FN_ENTRY(QG, HD, 128) }
-
-#define HD_ENTRIES(QG) \
-  { PAGE_ENTRIES(QG, 64), PAGE_ENTRIES(QG, 96), PAGE_ENTRIES(QG, 128), PAGE_ENTRIES(QG, 192) }
-
-  static const launch_fn_t table[6][4][3] = {
-      HD_ENTRIES(1),
-      HD_ENTRIES(2),
-      HD_ENTRIES(4),
-      HD_ENTRIES(8),
-      HD_ENTRIES(16),
-      HD_ENTRIES(32),
-  };
-
-#undef HD_ENTRIES
-#undef PAGE_ENTRIES
-
-  int qg_idx = -1;
-  switch (qg_sz) {
-    case 1:
-      qg_idx = 0;
-      break;
-    case 2:
-      qg_idx = 1;
-      break;
-    case 4:
-      qg_idx = 2;
-      break;
-    case 8:
-      qg_idx = 3;
-      break;
-    case 16:
-      qg_idx = 4;
-      break;
-    case 32:
-      qg_idx = 5;
-      break;
-    default:
-      return nullptr;
-  }
-
-  int hd_idx = -1;
-  switch (head_dim) {
-    case 64:
-      hd_idx = 0;
-      break;
-    case 96:
-      hd_idx = 1;
-      break;
-    case 128:
-      hd_idx = 2;
-      break;
-    case 192:
-      hd_idx = 3;
-      break;
-    default:
-      return nullptr;
-  }
-
-  int ps_idx = -1;
-  switch (page_size) {
-    case 32:
-      ps_idx = 0;
-      break;
-    case 64:
-      ps_idx = 1;
-      break;
-    case 128:
-      ps_idx = 2;
-      break;
-    default:
-      return nullptr;
-  }
-
-  return table[qg_idx][hd_idx][ps_idx];
-}
-
-#undef LAUNCH_FN_ENTRY
-
-}  // namespace
-
 std::vector<at::Tensor> mha_fwd(
-    at::Tensor& q,        // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
+    const at::Tensor& q,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
                           // h_k, d) if there is page_table.
     const at::Tensor& v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages,
@@ -165,7 +70,7 @@ std::vector<at::Tensor> mha_fwd(
     float const softcap,
     bool const is_rotary_interleaved,  // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
     std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
-    int num_splits,
+    // int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin) {
   auto q_type = q.scalar_type();
@@ -202,10 +107,9 @@ std::vector<at::Tensor> mha_fwd(
   int const max_num_pages_per_seq = page_table.value().size(1);
   int const num_pages = k.size(0);
   int const page_size = k.size(1);
-  int const seqlen_k = max_num_pages_per_seq * page_size;
+  int const seqlen_k = page_table.has_value() ? max_num_pages_per_seq * page_size : max_seqlen_k;
   int const total_k = num_pages * page_size;
   int const num_heads_k = k.size(-2);
-  int q_group_size = num_heads / num_heads_k;
 
   int const batch_size_k = page_table.value().size(0);
   float softmax_scale = softmax_scale_;
@@ -248,8 +152,43 @@ std::vector<at::Tensor> mha_fwd(
 
   auto opts = q.options();
   at::Tensor out;
+  at::Tensor temp_out;    // [batch, num_kv_splits, num_head_q, seq_q, head_size]
+  at::Tensor exp_sums;    // [batch, num_head_q, seq_q, num_kv_splits]
+  at::Tensor max_logits;  // [batch, num_head_q, seq_q, num_kv_splits]
+  int num_kv_splits = 1;
   out = torch::empty({total_q, num_heads, head_size_v}, opts);
+  Arguments params;
+  params.use_split_kv_decode = true;
+  if (params.use_split_kv_decode) {
+    auto get_num_splits = [](int batch_size, int num_heads_kv, int max_seqlen_k, int block_size) {
+      auto stream = at::xpu::getCurrentXPUStream();
+      auto queue = stream.queue();
+      auto device = queue.get_device();
+      int num_xe_cores = device.get_info<sycl::ext::intel::info::device::gpu_slices>() *
+                         device.get_info<sycl::ext::intel::info::device::gpu_subslices_per_slice>();
+      int parallel_ = num_xe_cores;
+      int parallel_2 = num_xe_cores * 2;
+      int cur_parallel_d = batch_size * num_heads_kv;
+      int num_splits = (parallel_ + cur_parallel_d - 1) / cur_parallel_d;
+      if (cur_parallel_d * num_splits > parallel_ && num_splits > 1) {
+        num_splits = std::ceil(parallel_2 / static_cast<float>(cur_parallel_d)) - 1;
+      }
 
+      int max_splits = (max_seqlen_k + block_size - 1) / block_size;
+      max_splits = std::min(max_splits, parallel_);
+      return std::min(num_splits, max_splits);
+    };
+    num_kv_splits = get_num_splits(batch_size, num_heads_k, seqlen_k, page_size);
+    temp_out = num_kv_splits == 1
+                   ? out
+                   : torch::empty({total_q, num_kv_splits * num_heads, head_size_v}, q.options().device(q.device()));
+
+    exp_sums = torch::empty({total_q, num_heads, num_kv_splits}, q.options().dtype(at::kFloat).device(q.device()));
+    max_logits = torch::empty({total_q, num_heads, num_kv_splits}, q.options().dtype(at::kFloat).device(q.device()));
+    params.temp_out_ptr = temp_out.data_ptr();
+    params.exp_sums_ptr = exp_sums.data_ptr();
+    params.max_logits_ptr = max_logits.data_ptr();
+  }
   int const head_size_rounded = round_up_headdim(head_size);
   int const head_size_v_rounded = head_size_v == head_size ? head_size_rounded : round_up_headdim(head_size_v);
 
@@ -261,7 +200,7 @@ std::vector<at::Tensor> mha_fwd(
   softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
 
   // align with FA3
-  Arguments params;
+
   params.is_bf16 = q.dtype() == torch::kBFloat16;
 
   // Set the pointers and strides.
@@ -282,6 +221,7 @@ std::vector<at::Tensor> mha_fwd(
 
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
+  params.num_kv_splits = num_kv_splits;
 
   // Softmax sum
   params.softmax_lse_ptr = softmax_lse.data_ptr();
@@ -291,7 +231,7 @@ std::vector<at::Tensor> mha_fwd(
   params.h = num_heads;
   params.h_k = num_heads_k;
   params.q_group_size = num_heads / num_heads_k;
-  params.seqlen_q = seqlen_q * q_group_size;
+  params.seqlen_q = seqlen_q;
   params.seqlen_k = seqlen_k;
   params.d = head_size;
   params.d_rounded = head_size_rounded;
@@ -388,21 +328,79 @@ std::vector<at::Tensor> mha_fwd(
   at::Tensor out_accum, softmax_lse_accum;
   auto outaccum_type = at::ScalarType::Float;
 
-  int qg_sz = nextPowerOf2(max_seqlen_q);
-  TORCH_CHECK(qg_sz >= 1 && qg_sz <= 32, "Unsupported qgroup_size for decode attention: ", max_seqlen_q);
-  TORCH_CHECK(
-      params.d == 64 || params.d == 96 || params.d == 128 || params.d == 192,
-      "Unsupported head size for decode attention: ",
-      params.d);
-  TORCH_CHECK(
-      params.page_size == 32 || params.page_size == 64 || params.page_size == 128,
-      "Unsupported page size for decode attention: ",
-      params.page_size);
+  constexpr bool Causal = false;  // The decode kernel does not support causal mode. It must be set to false.
 
-  auto fn = get_launch_fn(qg_sz, params.d, params.page_size);
-  TORCH_CHECK(fn != nullptr, "No FMHA decode kernel for qg=", qg_sz, " hd=", params.d, " ps=", params.page_size);
-  fn(use_sink, params);
+  auto launch_kernel = [&](auto _QG_SZ, auto _HEAD_DIM, auto _PAGE_SIZE, auto _NUM_SG) {
+    using TileShapeQK = cute::Shape<decltype(_QG_SZ), decltype(_PAGE_SIZE), _64>;
+    using TileShapePV = cute::Shape<decltype(_QG_SZ), _32, decltype(_PAGE_SIZE)>;
+    using TileShapeOutput = cute::Shape<decltype(_QG_SZ), decltype(_HEAD_DIM)>;
+    using SubgroupLayoutQK = cute::Layout<cute::Shape<_1, decltype(_NUM_SG), _1>>;
 
+    AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+        SplitDecodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::
+            kernel_dispatch(params);
+      });
+    });
+  };
+
+  auto dispatch_page_size = [&](auto _QG_SZ, auto _HEAD_DIM) {
+    switch (params.page_size) {
+      case 32:
+        launch_kernel(_QG_SZ, _HEAD_DIM, _32{}, _2{});
+        break;
+      case 64:
+        launch_kernel(_QG_SZ, _HEAD_DIM, _64{}, _4{});
+        break;
+      case 128:
+        launch_kernel(_QG_SZ, _HEAD_DIM, _128{}, _8{});
+        break;
+      default:
+        TORCH_CHECK(false, "Unsupported page size for decode attention: ", params.page_size);
+    }
+  };
+
+  auto dispatch_q_group = [&](auto _HEAD_DIM) {
+    switch (nextPowerOf2(params.q_group_size)) {
+      case 1:
+        dispatch_page_size(_1{}, _HEAD_DIM);
+        break;
+      case 2:
+        dispatch_page_size(_2{}, _HEAD_DIM);
+        break;
+      case 4:
+        dispatch_page_size(_4{}, _HEAD_DIM);
+        break;
+      case 8:
+        dispatch_page_size(_8{}, _HEAD_DIM);
+        break;
+      case 16:
+        dispatch_page_size(_16{}, _HEAD_DIM);
+        break;
+      default:
+        TORCH_CHECK(false, "Unsupported q_group_size for decode attention: ", params.q_group_size);
+    }
+  };
+
+  switch (params.d) {
+    case 64:
+      dispatch_q_group(_64{});
+      break;
+    case 96:
+      dispatch_q_group(_96{});
+      break;
+    case 128:
+      dispatch_q_group(_128{});
+      break;
+    case 192:
+      dispatch_q_group(_192{});
+      break;
+    case 256:
+      dispatch_q_group(_256{});
+      break;
+    default:
+      TORCH_CHECK(false, "Unsupported head size for decode attention: ", params.d);
+  }
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
 

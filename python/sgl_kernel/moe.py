@@ -317,14 +317,14 @@ def fused_experts(
         assert (
             b1.dtype == torch.bfloat16 or b1.dtype == torch.float32
         ), "b1 must be bfloat16 or float32"
-        if b1.dtype == torch.bfloat16:
+        if is_xe2_arch() and b1.dtype == torch.bfloat16:
             # cast b1 to float32, since bias is accumulated in float32 in the kernel
             b1 = b1.float()
     if b2 is not None:
         assert (
             b2.dtype == torch.bfloat16 or b2.dtype == torch.float32
         ), "b2 must be bfloat16 or float32"
-        if b2.dtype == torch.bfloat16:
+        if is_xe2_arch() and b2.dtype == torch.bfloat16:
             # cast b2 to float32, since bias is accumulated in float32 in the kernel
             b2 = b2.float()
     # Shape check
@@ -408,7 +408,7 @@ def fused_experts(
                 gemm1_limit is not None
             ), "gemm1_limit must be provided when gemm1_alpha is set for swiglu for GPT-OSS"
             activation_type = 2
-            activation = "swiglu_gpt_oss_sigmoid_alpha"
+            activation = "swiglu_gpt_oss"
     elif activation == "gelu":
         activation_type = 1
     else:

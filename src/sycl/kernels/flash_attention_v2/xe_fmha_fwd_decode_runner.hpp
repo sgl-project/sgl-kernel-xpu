@@ -1102,12 +1102,12 @@ std::vector<at::Tensor> mha_fwd(
 
   auto dispatch_page_size = [&](auto _QG_SZ, auto _HEAD_DIM) {
     switch (params.page_size) {
-      // case 32:
-      //   launch_kernel(_QG_SZ, _HEAD_DIM, _32{}, _2{});
-      //   break;
-      // case 64:
-      //   launch_kernel(_QG_SZ, _HEAD_DIM, _64{}, _4{});
-      //   break;
+      case 32:
+        launch_kernel(_QG_SZ, _HEAD_DIM, _32{}, _2{});
+        break;
+      case 64:
+        launch_kernel(_QG_SZ, _HEAD_DIM, _64{}, _4{});
+        break;
       case 128:
         launch_kernel(_QG_SZ, _HEAD_DIM, _128{}, _8{});
         break;
@@ -1142,21 +1142,21 @@ std::vector<at::Tensor> mha_fwd(
   };
 
   switch (params.d) {
-    // case 64:
-    //   dispatch_q_group(_64{});
-    //   break;
-    // case 96:
-    //   dispatch_q_group(_96{});
-    //   break;
+    case 64:
+      dispatch_q_group(_64{});
+      break;
+    case 96:
+      dispatch_q_group(_96{});
+      break;
     case 128:
       dispatch_q_group(_128{});
       break;
-    // case 192:
-    //   dispatch_q_group(_192{});
-    //   break;
-    // case 256:
-    //   dispatch_q_group(_256{});
-    //   break;
+    case 192:
+      dispatch_q_group(_192{});
+      break;
+    case 256:
+      dispatch_q_group(_256{});
+      break;
     default:
       TORCH_CHECK(false, "Unsupported head size for decode attention: ", params.d);
   }

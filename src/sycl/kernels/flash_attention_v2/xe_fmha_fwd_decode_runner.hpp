@@ -785,7 +785,7 @@ struct SplitDeodeConfig {
     launcher.run(params, hw_info);
   }
 
-  static void kernel_dispatch(const Arguments& params) {
+  static void run(const Arguments& params) {
     return run<true, true, true, cutlass::fmha::kernel::DecodeTileScheduler>(params);
   }
 };
@@ -1082,7 +1082,7 @@ std::vector<at::Tensor> mha_fwd(
   // using SubgroupLayoutQK = Layout<Shape<_1, _4, _1>>;
   // // SplitDeodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput,
   // // SubgroupLayoutQK>::run(params);
-  // SplitDeodeConfig<false, false, false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK>::kernel_dispatch(params);
+  // SplitDeodeConfig<false, false, false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK>::run(params);
 
   auto launch_kernel = [&](auto _QG_SZ, auto _HEAD_DIM, auto _PAGE_SIZE, auto _NUM_SG) {
     using TileShapeQK = cute::Shape<decltype(_QG_SZ), decltype(_PAGE_SIZE), _64>;
@@ -1095,19 +1095,19 @@ std::vector<at::Tensor> mha_fwd(
         // DecodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput,
         // SubgroupLayoutQK>::run(params);
         SplitDeodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::
-            kernel_dispatch(params);
+            run(params);
       });
     });
   };
 
   auto dispatch_page_size = [&](auto _QG_SZ, auto _HEAD_DIM) {
     switch (params.page_size) {
-      // case 32:
-      //   launch_kernel(_QG_SZ, _HEAD_DIM, _32{}, _2{});
-      //   break;
-      // case 64:
-      //   launch_kernel(_QG_SZ, _HEAD_DIM, _64{}, _4{});
-      //   break;
+      case 32:
+        launch_kernel(_QG_SZ, _HEAD_DIM, _32{}, _2{});
+        break;
+      case 64:
+        launch_kernel(_QG_SZ, _HEAD_DIM, _64{}, _4{});
+        break;
       case 128:
         launch_kernel(_QG_SZ, _HEAD_DIM, _128{}, _8{});
         break;
@@ -1142,21 +1142,21 @@ std::vector<at::Tensor> mha_fwd(
   };
 
   switch (params.d) {
-    // case 64:
-    //   dispatch_q_group(_64{});
-    //   break;
-    // case 96:
-    //   dispatch_q_group(_96{});
-    //   break;
+    case 64:
+      dispatch_q_group(_64{});
+      break;
+    case 96:
+      dispatch_q_group(_96{});
+      break;
     case 128:
       dispatch_q_group(_128{});
       break;
-    // case 192:
-    //   dispatch_q_group(_192{});
-    //   break;
-    // case 256:
-    //   dispatch_q_group(_256{});
-    //   break;
+    case 192:
+      dispatch_q_group(_192{});
+      break;
+    case 256:
+      dispatch_q_group(_256{});
+      break;
     default:
       TORCH_CHECK(false, "Unsupported head size for decode attention: ", params.d);
   }

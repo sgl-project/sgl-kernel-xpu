@@ -1092,19 +1092,22 @@ std::vector<at::Tensor> mha_fwd(
 
     AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-        // DecodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput,
-        // SubgroupLayoutQK>::run(params);
-        SplitDeodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::
-            run(params);
+        if (params.use_split_kv_decode) {
+          SplitDeodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(
+              params);
+        } else {
+          DecodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(
+              params);
+        }
       });
     });
   };
 
   auto dispatch_page_size = [&](auto _QG_SZ, auto _HEAD_DIM) {
     switch (params.page_size) {
-      case 32:
-        launch_kernel(_QG_SZ, _HEAD_DIM, _32{}, _2{});
-        break;
+      // case 32:
+      //   launch_kernel(_QG_SZ, _HEAD_DIM, _32{}, _2{});
+      //   break;
       case 64:
         launch_kernel(_QG_SZ, _HEAD_DIM, _64{}, _4{});
         break;
@@ -1133,8 +1136,8 @@ std::vector<at::Tensor> mha_fwd(
       case 16:
         dispatch_page_size(_16{}, _HEAD_DIM);
         break;
-      // case 32:
-      //   dispatch_page_size(_32{}, _HEAD_DIM);
+        // case 32:
+        //   dispatch_page_size(_32{}, _HEAD_DIM);
         break;
       default:
         TORCH_CHECK(false, "Unsupported qgroup_size for decode attention: ", max_seqlen_q);

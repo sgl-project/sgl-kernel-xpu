@@ -855,7 +855,8 @@ std::vector<at::Tensor> mha_fwd(
   int const max_num_pages_per_seq = page_table.value().size(1);
   int const num_pages = k.size(0);
   int const page_size = k.size(1);
-  int const seqlen_k = max_num_pages_per_seq * page_size;
+  const bool has_page_table = page_table.has_value();
+  int const seqlen_k = has_page_table ? max_num_pages_per_seq * page_size : max_seqlen_k;
   int const total_k = num_pages * page_size;
   int const num_heads_k = k.size(-2);
 
@@ -931,7 +932,7 @@ std::vector<at::Tensor> mha_fwd(
     // lambda end
     // For split-kv, we split the kv sequence into num_kv_splits splits and run the kernel for each split, then do a
     // reduction to get the final output.
-    num_kv_splits = get_num_splits(batch_size, num_heads_k, max_seqlen_k, page_size);
+    num_kv_splits = get_num_splits(batch_size, num_heads_k, seqlen_k, page_size);
     temp_out = num_kv_splits == 1
                    ? out
                    : torch::empty({total_q, num_kv_splits * num_heads, head_size_v}, q.options().device(q.device()));

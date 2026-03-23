@@ -339,8 +339,8 @@ std::vector<at::Tensor> mha_fwd(
     AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
         if (params.use_split_kv_decode) {
-          SplitDecodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::
-              kernel_dispatch(params);
+          SplitDecodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(
+              params);
         } else {
           DecodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(
               params);

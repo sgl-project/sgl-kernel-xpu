@@ -785,7 +785,7 @@ struct SplitDecodeConfig {
     launcher.run(params, hw_info);
   }
 
-  static void kernel_dispatch(const Arguments& params) {
+  static void run(const Arguments& params) {
     return run<true, true, true, cutlass::fmha::kernel::DecodeTileScheduler>(params);
   }
 };

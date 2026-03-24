@@ -48,7 +48,8 @@ void launch_fmha_decode_@QG_SZ@_@HEAD_DIM@_@PAGE_SIZE@(bool use_sink, const Argu
 
   AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-      DecodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(params);
+      SplitDecodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(
+              params);
     });
   });
 }

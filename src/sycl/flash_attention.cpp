@@ -41,7 +41,7 @@
 namespace decode {
 
 // Dispatch macros following the GroupGemmXe20.cpp pattern.
-// Directly call struct operator() — no function pointers.
+// Directly call struct operator() - no function pointers.
 
 #define DISPATCH_DECODE_KERNEL(QG, HD, PS)                      \
   do {                                                           \

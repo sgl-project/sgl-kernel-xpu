@@ -35,38 +35,68 @@ namespace decode {
 
 struct Arguments;
 
-// Declarations for generated FMHA decode kernel launch functions.
-// Each function is defined in a separate generated .cpp file from
-// xe_fmha_fwd_decode_kernel.cpp.in, compiled as its own library.
+// Template function declarations for FMHA decode kernel launchers.
+// Each template is explicitly instantiated in a separate generated .cpp file
+// (from xe_fmha_fwd_decode_kernel.cpp.in / xe_fmha_fwd_split_decode_kernel.cpp.in).
 //
-// Naming: launch_fmha_decode_<QG_SZ>_<HEAD_DIM>_<PAGE_SIZE>
-// Parameters:
-//   QG_SZ    in {1, 2, 4, 8, 16}
-//   HEAD_DIM in {64, 96, 128, 192, 256}
-//   PAGE_SIZE in {64, 128}  (with NUM_SG = PAGE_SIZE / 16)
+// QG_SZ    in {1, 2, 4, 8, 16}
+// HEAD_DIM in {64, 96, 128, 192, 256}
+// PAGE_SIZE in {64, 128}
 
-#define DECLARE_LAUNCH_FMHA_DECODE(QG, HD, PS) \
-  void launch_fmha_decode_##QG##_##HD##_##PS(bool use_sink, const Arguments& params);
+template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
+void launch_fmha_decode(bool use_sink, const Arguments& params);
 
-#define DECLARE_LAUNCH_FMHA_DECODE_ALL_PAGE_SIZES(QG, HD) \
-  DECLARE_LAUNCH_FMHA_DECODE(QG, HD, 64)                  \
-  DECLARE_LAUNCH_FMHA_DECODE(QG, HD, 128)
+template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
+void launch_fmha_split_decode(bool use_sink, const Arguments& params);
 
-#define DECLARE_LAUNCH_FMHA_DECODE_ALL_QG(HD)       \
-  DECLARE_LAUNCH_FMHA_DECODE_ALL_PAGE_SIZES(1, HD)  \
-  DECLARE_LAUNCH_FMHA_DECODE_ALL_PAGE_SIZES(2, HD)  \
-  DECLARE_LAUNCH_FMHA_DECODE_ALL_PAGE_SIZES(4, HD)  \
-  DECLARE_LAUNCH_FMHA_DECODE_ALL_PAGE_SIZES(8, HD)  \
-  DECLARE_LAUNCH_FMHA_DECODE_ALL_PAGE_SIZES(16, HD)
+// Explicit instantiation declarations — tell the compiler these are compiled
+// in separate translation units (generated from the .cpp.in templates).
 
-DECLARE_LAUNCH_FMHA_DECODE_ALL_QG(64)
-DECLARE_LAUNCH_FMHA_DECODE_ALL_QG(96)
-DECLARE_LAUNCH_FMHA_DECODE_ALL_QG(128)
-DECLARE_LAUNCH_FMHA_DECODE_ALL_QG(192)
-DECLARE_LAUNCH_FMHA_DECODE_ALL_QG(256)  
+#define EXTERN_LAUNCH_FMHA_DECODE(QG, HD, PS) \
+  extern template void launch_fmha_decode<QG, HD, PS>(bool, const Arguments&);
 
-#undef DECLARE_LAUNCH_FMHA_DECODE
-#undef DECLARE_LAUNCH_FMHA_DECODE_ALL_PAGE_SIZES
-#undef DECLARE_LAUNCH_FMHA_DECODE_ALL_QG
+#define EXTERN_LAUNCH_FMHA_SPLIT_DECODE(QG, HD, PS) \
+  extern template void launch_fmha_split_decode<QG, HD, PS>(bool, const Arguments&);
+
+#define EXTERN_LAUNCH_FMHA_DECODE_ALL_PAGE_SIZES(QG, HD) \
+  EXTERN_LAUNCH_FMHA_DECODE(QG, HD, 64)                  \
+  EXTERN_LAUNCH_FMHA_DECODE(QG, HD, 128)
+
+#define EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_PAGE_SIZES(QG, HD) \
+  EXTERN_LAUNCH_FMHA_SPLIT_DECODE(QG, HD, 64)                  \
+  EXTERN_LAUNCH_FMHA_SPLIT_DECODE(QG, HD, 128)
+
+#define EXTERN_LAUNCH_FMHA_DECODE_ALL_QG(HD)              \
+  EXTERN_LAUNCH_FMHA_DECODE_ALL_PAGE_SIZES(1, HD)         \
+  EXTERN_LAUNCH_FMHA_DECODE_ALL_PAGE_SIZES(2, HD)         \
+  EXTERN_LAUNCH_FMHA_DECODE_ALL_PAGE_SIZES(4, HD)         \
+  EXTERN_LAUNCH_FMHA_DECODE_ALL_PAGE_SIZES(8, HD)         \
+  EXTERN_LAUNCH_FMHA_DECODE_ALL_PAGE_SIZES(16, HD)
+
+#define EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_QG(HD)        \
+  EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_PAGE_SIZES(1, HD)   \
+  EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_PAGE_SIZES(2, HD)   \
+  EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_PAGE_SIZES(4, HD)   \
+  EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_PAGE_SIZES(8, HD)   \
+  EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_PAGE_SIZES(16, HD)
+
+EXTERN_LAUNCH_FMHA_DECODE_ALL_QG(64)
+EXTERN_LAUNCH_FMHA_DECODE_ALL_QG(96)
+EXTERN_LAUNCH_FMHA_DECODE_ALL_QG(128)
+EXTERN_LAUNCH_FMHA_DECODE_ALL_QG(192)
+EXTERN_LAUNCH_FMHA_DECODE_ALL_QG(256)
+
+EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_QG(64)
+EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_QG(96)
+EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_QG(128)
+EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_QG(192)
+EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_QG(256)
+
+#undef EXTERN_LAUNCH_FMHA_DECODE
+#undef EXTERN_LAUNCH_FMHA_SPLIT_DECODE
+#undef EXTERN_LAUNCH_FMHA_DECODE_ALL_PAGE_SIZES
+#undef EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_PAGE_SIZES
+#undef EXTERN_LAUNCH_FMHA_DECODE_ALL_QG
+#undef EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_QG
 
 }  // namespace decode

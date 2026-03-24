@@ -29,7 +29,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
-// Auto-generated from xe_fmha_fwd_decode_kernel.cpp.in
+// Auto-generated from xe_fmha_fwd_split_decode_kernel.cpp.in
 // Template parameters: QG_SZ=@QG_SZ@, HEAD_DIM=@HEAD_DIM@, PAGE_SIZE=@PAGE_SIZE@
 #define SYCL_INTEL_TARGET 20
 
@@ -37,6 +37,6 @@
 
 namespace decode {
 
-template void launch_fmha_decode<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>(bool, const Arguments&);
+template void launch_fmha_split_decode<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>(bool, const Arguments&);
 
 }  // namespace decode

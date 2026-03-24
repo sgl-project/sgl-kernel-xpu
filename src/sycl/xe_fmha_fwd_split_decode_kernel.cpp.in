@@ -30,30 +30,28 @@
  *
  **************************************************************************************************/
 // Auto-generated from xe_fmha_fwd_split_decode_kernel.cpp.in
-// Template parameters: QG_SZ=@QG_SZ@, HEAD_DIM=@HEAD_DIM@, PAGE_SIZE=@PAGE_SIZE@
+// Template parameters: QG_SZ=@QG_SZ@, HEAD_DIM=@HEAD_DIM@, PAGE_SIZE=@PAGE_SIZE@, NUM_SG=@NUM_SG@
 #define SYCL_INTEL_TARGET 20
 
 #include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
 
 namespace decode {
 
-template <>
-void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Arguments& params) const {
+void launch_fmha_split_decode_@QG_SZ@_@HEAD_DIM@_@PAGE_SIZE@(bool use_sink, const Arguments& params) {
+  using namespace cute;
+
+  constexpr bool Causal = false;
   using TileShapeQK = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@PAGE_SIZE@>, cute::_64>;
   using TileShapePV = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@PAGE_SIZE@>>;
   using TileShapeOutput = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@HEAD_DIM@>>;
-  using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<@PAGE_SIZE@ / 16>, cute::_1>>;
+  using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<@NUM_SG@>, cute::_1>>;
 
-  AT_DISPATCH_BOOL_NO_RETURN(params.use_causal_mask, Causal, {
-    AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
-      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-        SplitDecodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(
-            params);
-      });
+  AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      SplitDecodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(
+          params);
     });
   });
 }
-
-template struct FmhaSplitDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>;
 
 }  // namespace decode

@@ -47,6 +47,7 @@
 #include "sycl/kernels/flash_attention_v2/kernel/xe_fhma_fwd_kernel.hpp"
 #include "sycl/kernels/flash_attention_v2/kernel/xe_reduce_split_k.hpp"
 #include "sycl/kernels/flash_attention_v2/kernel/xe_tile_scheduler.hpp"
+
 using namespace cute;
 namespace decode {
 struct Arguments {
@@ -63,6 +64,7 @@ struct Arguments {
   void* __restrict__ temp_out_ptr = nullptr;
   void* __restrict__ exp_sums_ptr = nullptr;
   void* __restrict__ max_logits_ptr = nullptr;
+
   // The stride between rows of the Q, K and V matrices.
   index_t q_batch_stride;
   index_t k_batch_stride;
@@ -151,7 +153,7 @@ struct Arguments {
   // The indices to index into the KV cache.
   int* __restrict__ kv_batch_idx;
 
-  // PagedKV KV cache
+  // Paged KV cache
   int* __restrict__ page_table;
   int max_num_pages_per_seq;
   index_t page_table_batch_stride;
@@ -168,12 +170,13 @@ struct Arguments {
   // Scale factor of 1 / (1 - p_dropout).
   float rp_dropout;
 
-  // LocalMask window size
+  // Local window size
   int window_size_left = -1;
   int window_size_right = -1;
 
   // Pointer to the RNG seed (idx 0) and offset (idx 1).
   uint64_t* rng_state;
+
   int num_kv_splits;  // For split-KV version
 
   bool is_bf16;
@@ -181,7 +184,6 @@ struct Arguments {
   bool is_e4m3;
   bool is_causal;
   bool is_local;
-
   bool use_sink = false;
   bool use_causal_mask = false;
 
@@ -234,21 +236,16 @@ struct DecodeRunner {
   auto initialize_varlen(const Arguments& params, const ProblemShape& problem_size) {
     ProblemShape problem_size_for_init = problem_size;
     get<0>(problem_size_for_init) = 1;  // concentrated batch
-    get<1>(problem_size_for_init) = params.use_split_kv_decode ? params.h : params.h_k;
-    get<3>(problem_size_for_init) = params.use_split_kv_decode ? params.total_q : params.total_q * params.q_group_size;
+    get<1>(problem_size_for_init) = params.h / params.q_group_size;
+    get<3>(problem_size_for_init) = params.total_q * params.q_group_size;
     get<4>(problem_size_for_init) = params.total_knew;
     get<5>(problem_size_for_init) = params.total_k;
 
     ProblemShapeType problem_size_for_launch{
         .batch = get<0>(problem_size),
-        .num_heads_q = params.use_split_kv_decode ? get<1>(problem_size) : get<2>(problem_size),
+        .num_heads_q = get<1>(problem_size) / params.q_group_size,
         .num_heads_kv = get<2>(problem_size),
-        .seq_len_qo =
-            {params.use_split_kv_decode ? params.seqlen_q * params.q_group_size : params.seqlen_q,
-             params.use_split_kv_decode ? params.total_q : params.total_q * params.q_group_size,
-             nullptr,
-             params.use_split_kv_decode ? 1 : params.q_group_size},
-
+        .seq_len_qo = {params.seqlen_q, params.total_q * params.q_group_size, nullptr, params.q_group_size},
         .seq_len_kv = {params.seqlen_knew, params.total_knew},
         .seq_len_kv_cache = {params.seqlen_k, params.total_k},
         .head_size_qk = get<6>(problem_size),
@@ -338,7 +335,6 @@ struct DecodeRunner {
     auto kernel_params = FMHADecodeKernel::to_underlying_arguments(arguments, workspace.get());
 
     // Run
-    // run(kernel_params);
     launch<FMHADecodeKernel>(kernel_params);
     return cutlass::Status::kSuccess;
   }
@@ -475,18 +471,13 @@ struct DecodeKernelLauncher {
     cutlass::device_memory::allocation<uint8_t> workspace(workspace_size + reduce_workspace_size);
 
     if (!FMHAKernel::can_implement(arguments)) {
-      // std::cout << "Invalid Problem Size: " << params.batch_size << 'x'
-      //           << params.num_heads_q << 'x' << params.max_queries << 'x'
-      //           << params.max_keys << 'x' << params.head_size << 'x'
-      //           << params.head_size << std::endl;
       return cutlass::Status::kErrorInvalidProblem;
     }
 
     // Initialize the workspace
     FMHAKernel::initialize_workspace(arguments, workspace.get());
 
-    // Convert host-side arguments to device-side arguments to be passed to the
-    // kernel
+    // Convert host-side arguments to device-side arguments to be passed to the kernel
     auto kernel_params = FMHAKernel::to_underlying_arguments(arguments, workspace.get());
     auto reduce_params = ReductionSplitKernel::to_underlying_arguments(reduce_arg, workspace.get() + workspace_size);
 
@@ -507,18 +498,11 @@ struct DecodeKernelLauncher {
     dim3 const block = FMHAKernel::get_block_shape();
     dim3 const grid = FMHAKernel::get_grid_shape(params);
 
-    // cute::print("Launching FMHAKernel with grid: "); cute::print("%d x %d x
-    // %d ", grid.x, grid.y, grid.z); cute::print("and block: ");
-    // cute::print("%d x %d x %d\n", block.x, block.y, block.z);
-
-    // configure smem size and carveout
     int smem_size = FMHAKernel::SharedStorageSize;
 
     const auto sycl_block = compat::dim3(block.x, block.y, block.z);
     const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
 
-    // Launch parameters depend on whether SYCL compiler supports work-group
-    // scratch memory extension
     compat::experimental::launch_properties launch_props{
         syclex::work_group_scratch_size(smem_size),
     };
@@ -537,12 +521,6 @@ struct DecodeKernelLauncher {
     };
 
     q.submit(cgf);
-    // auto event =
-    //     compat::experimental::launch<cutlass::device_kernel<FMHAKernel>>(
-    //         policy, queue, params);
-    // EventManager::getInstance().addEvent(event);
-
-    // event.wait();
 
     if (need_reduce) {
       dim3 const reduce_grid = ReductionSplitKernel::get_grid_shape(reduce_params);
@@ -568,14 +546,6 @@ struct DecodeKernelLauncher {
             ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
       };
       q.submit(cgf);
-
-      // auto reduce_event = compat::experimental::launch<
-      //     cutlass::device_kernel<ReductionSplitKernel>>(
-      //     reduce_policy, queue, reduce_params);
-
-      // // reduce_event.wait();
-
-      // EventManager::getInstance().addEvent(reduce_event);
     }
   }
 };
@@ -604,7 +574,7 @@ template <
     typename GmemTiledCopyK = void,
     typename GmemTiledCopyV = void,
     typename GmemTiledCopyO = void>
-struct DecodeConfig {
+struct FMHAConfig {
   static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
   using MMAOperation = cute::conditional_t<
       is_void_v<MMAOperation_>,
@@ -620,8 +590,6 @@ struct DecodeConfig {
 
   template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
   static int run(const Arguments& params) {
-    // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
-    // information is used by the underlying kernel.
     cutlass::KernelHardwareInfo hw_info;
     hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
@@ -704,7 +672,7 @@ template <
     typename TileShapePV,
     typename TileShapeOutput,
     typename SubgroupLayoutQK,
-    typename SubgroupLayoutPV_ = void /* void -> default */,
+    typename SubgroupLayoutPV_ = void, /* void -> default */
     int PipelineStages = 1,
     typename ElementQ = bfloat16_t,
     typename ElementK = bfloat16_t,
@@ -731,8 +699,6 @@ struct SplitDecodeConfig {
 
   template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
   static void run(const Arguments& params) {
-    // constexpr bool isVarLen = true;
-    // constexpr bool PagedKV = true;
     cutlass::KernelHardwareInfo hw_info;
     hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
@@ -791,22 +757,6 @@ struct SplitDecodeConfig {
   static void run(const Arguments& params) {
     return run<true, true, true, cutlass::fmha::kernel::DecodeTileScheduler>(params);
   }
-};
-
-// Struct functors for decode kernel dispatch.
-// operator() is declared here; each specialization's body is defined in a
-// generated .cpp file (from xe_fmha_fwd_decode_kernel.cpp.in /
-// xe_fmha_fwd_split_decode_kernel.cpp.in) so the compiler only emits code
-// for the combinations that are actually needed.
-
-template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
-struct FmhaDecodeRunner {
-  void operator()(const Arguments& params) const;
-};
-
-template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
-struct FmhaSplitDecodeRunner {
-  void operator()(const Arguments& params) const;
 };
 
 }  // namespace decode

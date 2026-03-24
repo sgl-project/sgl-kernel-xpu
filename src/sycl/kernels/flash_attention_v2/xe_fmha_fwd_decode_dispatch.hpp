@@ -31,72 +31,67 @@
  **************************************************************************************************/
 #pragma once
 
+#include "xe_fmha_fwd_decode_runner.hpp"
+
 namespace decode {
 
-struct Arguments;
-
-// Template function declarations for FMHA decode kernel launchers.
-// Each template is explicitly instantiated in a separate generated .cpp file
-// (from xe_fmha_fwd_decode_kernel.cpp.in / xe_fmha_fwd_split_decode_kernel.cpp.in).
+// Struct functor declarations for FMHA decode kernel launchers.
+// Each template specialization is explicitly instantiated in a separate
+// generated .cpp file (from xe_fmha_fwd_decode_kernel.cpp.in /
+// xe_fmha_fwd_split_decode_kernel.cpp.in).
 //
 // QG_SZ    in {1, 2, 4, 8, 16}
 // HEAD_DIM in {64, 96, 128, 192, 256}
 // PAGE_SIZE in {64, 128}
 
-template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
-void launch_fmha_decode(bool use_sink, const Arguments& params);
-
-template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
-void launch_fmha_split_decode(bool use_sink, const Arguments& params);
-
 // Explicit instantiation declarations — tell the compiler these are compiled
 // in separate translation units (generated from the .cpp.in templates).
 
-#define EXTERN_LAUNCH_FMHA_DECODE(QG, HD, PS) \
-  extern template void launch_fmha_decode<QG, HD, PS>(bool, const Arguments&);
+#define EXTERN_FMHA_DECODE_RUNNER(QG, HD, PS) \
+  extern template struct FmhaDecodeRunner<QG, HD, PS>;
 
-#define EXTERN_LAUNCH_FMHA_SPLIT_DECODE(QG, HD, PS) \
-  extern template void launch_fmha_split_decode<QG, HD, PS>(bool, const Arguments&);
+#define EXTERN_FMHA_SPLIT_DECODE_RUNNER(QG, HD, PS) \
+  extern template struct FmhaSplitDecodeRunner<QG, HD, PS>;
 
-#define EXTERN_LAUNCH_FMHA_DECODE_ALL_PAGE_SIZES(QG, HD) \
-  EXTERN_LAUNCH_FMHA_DECODE(QG, HD, 64)                  \
-  EXTERN_LAUNCH_FMHA_DECODE(QG, HD, 128)
+#define EXTERN_FMHA_DECODE_RUNNER_ALL_PAGE_SIZES(QG, HD) \
+  EXTERN_FMHA_DECODE_RUNNER(QG, HD, 64)                  \
+  EXTERN_FMHA_DECODE_RUNNER(QG, HD, 128)
 
-#define EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_PAGE_SIZES(QG, HD) \
-  EXTERN_LAUNCH_FMHA_SPLIT_DECODE(QG, HD, 64)                  \
-  EXTERN_LAUNCH_FMHA_SPLIT_DECODE(QG, HD, 128)
+#define EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_PAGE_SIZES(QG, HD) \
+  EXTERN_FMHA_SPLIT_DECODE_RUNNER(QG, HD, 64)                  \
+  EXTERN_FMHA_SPLIT_DECODE_RUNNER(QG, HD, 128)
 
-#define EXTERN_LAUNCH_FMHA_DECODE_ALL_QG(HD)              \
-  EXTERN_LAUNCH_FMHA_DECODE_ALL_PAGE_SIZES(1, HD)         \
-  EXTERN_LAUNCH_FMHA_DECODE_ALL_PAGE_SIZES(2, HD)         \
-  EXTERN_LAUNCH_FMHA_DECODE_ALL_PAGE_SIZES(4, HD)         \
-  EXTERN_LAUNCH_FMHA_DECODE_ALL_PAGE_SIZES(8, HD)         \
-  EXTERN_LAUNCH_FMHA_DECODE_ALL_PAGE_SIZES(16, HD)
+#define EXTERN_FMHA_DECODE_RUNNER_ALL_QG(HD)              \
+  EXTERN_FMHA_DECODE_RUNNER_ALL_PAGE_SIZES(1, HD)         \
+  EXTERN_FMHA_DECODE_RUNNER_ALL_PAGE_SIZES(2, HD)         \
+  EXTERN_FMHA_DECODE_RUNNER_ALL_PAGE_SIZES(4, HD)         \
+  EXTERN_FMHA_DECODE_RUNNER_ALL_PAGE_SIZES(8, HD)         \
+  EXTERN_FMHA_DECODE_RUNNER_ALL_PAGE_SIZES(16, HD)
 
-#define EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_QG(HD)        \
-  EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_PAGE_SIZES(1, HD)   \
-  EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_PAGE_SIZES(2, HD)   \
-  EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_PAGE_SIZES(4, HD)   \
-  EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_PAGE_SIZES(8, HD)   \
-  EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_PAGE_SIZES(16, HD)
+#define EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(HD)        \
+  EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_PAGE_SIZES(1, HD)   \
+  EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_PAGE_SIZES(2, HD)   \
+  EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_PAGE_SIZES(4, HD)   \
+  EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_PAGE_SIZES(8, HD)   \
+  EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_PAGE_SIZES(16, HD)
 
-EXTERN_LAUNCH_FMHA_DECODE_ALL_QG(64)
-EXTERN_LAUNCH_FMHA_DECODE_ALL_QG(96)
-EXTERN_LAUNCH_FMHA_DECODE_ALL_QG(128)
-EXTERN_LAUNCH_FMHA_DECODE_ALL_QG(192)
-EXTERN_LAUNCH_FMHA_DECODE_ALL_QG(256)
+EXTERN_FMHA_DECODE_RUNNER_ALL_QG(64)
+EXTERN_FMHA_DECODE_RUNNER_ALL_QG(96)
+EXTERN_FMHA_DECODE_RUNNER_ALL_QG(128)
+EXTERN_FMHA_DECODE_RUNNER_ALL_QG(192)
+EXTERN_FMHA_DECODE_RUNNER_ALL_QG(256)
 
-EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_QG(64)
-EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_QG(96)
-EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_QG(128)
-EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_QG(192)
-EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_QG(256)
+EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(64)
+EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(96)
+EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(128)
+EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(192)
+EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(256)
 
-#undef EXTERN_LAUNCH_FMHA_DECODE
-#undef EXTERN_LAUNCH_FMHA_SPLIT_DECODE
-#undef EXTERN_LAUNCH_FMHA_DECODE_ALL_PAGE_SIZES
-#undef EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_PAGE_SIZES
-#undef EXTERN_LAUNCH_FMHA_DECODE_ALL_QG
-#undef EXTERN_LAUNCH_FMHA_SPLIT_DECODE_ALL_QG
+#undef EXTERN_FMHA_DECODE_RUNNER
+#undef EXTERN_FMHA_SPLIT_DECODE_RUNNER
+#undef EXTERN_FMHA_DECODE_RUNNER_ALL_PAGE_SIZES
+#undef EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_PAGE_SIZES
+#undef EXTERN_FMHA_DECODE_RUNNER_ALL_QG
+#undef EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG
 
 }  // namespace decode

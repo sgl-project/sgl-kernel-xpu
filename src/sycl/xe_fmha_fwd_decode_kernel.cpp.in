@@ -37,6 +37,21 @@
 
 namespace decode {
 
-template void launch_fmha_decode<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>(bool, const Arguments&);
+template <>
+void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(bool use_sink, const Arguments& params) const {
+  constexpr bool Causal = false;
+  using TileShapeQK = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@PAGE_SIZE@>, cute::_64>;
+  using TileShapePV = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@PAGE_SIZE@>>;
+  using TileShapeOutput = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@HEAD_DIM@>>;
+  using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<@PAGE_SIZE@ / 16>, cute::_1>>;
+
+  AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      DecodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(params);
+    });
+  });
+}
+
+template struct FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>;
 
 }  // namespace decode

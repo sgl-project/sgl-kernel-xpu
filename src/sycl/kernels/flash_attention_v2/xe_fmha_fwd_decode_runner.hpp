@@ -790,39 +790,26 @@ struct SplitDecodeConfig {
   }
 };
 
-// Free-function templates for use with the function-pointer dispatch table.
-// Each template is explicitly instantiated in a generated .cpp file so the
-// compiler only emits code for the combinations that are actually needed.
+// Struct functors for use with the function-pointer dispatch table.
+// operator() is declared here; each specialization's body is defined in a
+// generated .cpp file (from xe_fmha_fwd_decode_kernel.cpp.in /
+// xe_fmha_fwd_split_decode_kernel.cpp.in) so the compiler only emits code
+// for the combinations that are actually needed.
 
 template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
-void launch_fmha_decode(bool use_sink, const Arguments& params) {
-  constexpr bool Causal = false;
-  using TileShapeQK = cute::Shape<cute::Int<QG_SZ>, cute::Int<PAGE_SIZE>, cute::_64>;
-  using TileShapePV = cute::Shape<cute::Int<QG_SZ>, cute::_32, cute::Int<PAGE_SIZE>>;
-  using TileShapeOutput = cute::Shape<cute::Int<QG_SZ>, cute::Int<HEAD_DIM>>;
-  using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<PAGE_SIZE / 16>, cute::_1>>;
-
-  AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
-    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-      DecodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(params);
-    });
-  });
-}
+struct FmhaDecodeRunner {
+  void operator()(bool use_sink, const Arguments& params) const;
+  static void call(bool use_sink, const Arguments& params) {
+    FmhaDecodeRunner{}(use_sink, params);
+  }
+};
 
 template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
-void launch_fmha_split_decode(bool use_sink, const Arguments& params) {
-  constexpr bool Causal = false;
-  using TileShapeQK = cute::Shape<cute::Int<QG_SZ>, cute::Int<PAGE_SIZE>, cute::_64>;
-  using TileShapePV = cute::Shape<cute::Int<QG_SZ>, cute::_32, cute::Int<PAGE_SIZE>>;
-  using TileShapeOutput = cute::Shape<cute::Int<QG_SZ>, cute::Int<HEAD_DIM>>;
-  using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<PAGE_SIZE / 16>, cute::_1>>;
-
-  AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
-    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-      SplitDecodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(
-          params);
-    });
-  });
-}
+struct FmhaSplitDecodeRunner {
+  void operator()(bool use_sink, const Arguments& params) const;
+  static void call(bool use_sink, const Arguments& params) {
+    FmhaSplitDecodeRunner{}(use_sink, params);
+  }
+};
 
 }  // namespace decode

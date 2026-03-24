@@ -37,7 +37,6 @@
 
 #include "kernels/chunk_prefill/chunk_prefill_runner.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp"
-#include "kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
 
 namespace decode {
 
@@ -45,8 +44,8 @@ namespace {
 
 using launch_fn_t = void (*)(bool use_sink, const Arguments& params);
 
-#define LAUNCH_FN_ENTRY(QG, HD, PS) &launch_fmha_decode<QG, HD, PS>
-#define LAUNCH_SPLIT_FN_ENTRY(QG, HD, PS) &launch_fmha_split_decode<QG, HD, PS>
+#define LAUNCH_FN_ENTRY(QG, HD, PS) &FmhaDecodeRunner<QG, HD, PS>::call
+#define LAUNCH_SPLIT_FN_ENTRY(QG, HD, PS) &FmhaSplitDecodeRunner<QG, HD, PS>::call
 
 launch_fn_t get_launch_fn(int qg_sz, int head_dim, int page_size, bool use_split) {
   // Dispatch tables indexed by (qg_sz, head_dim, page_size).

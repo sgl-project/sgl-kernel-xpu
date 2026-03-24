@@ -182,6 +182,9 @@ struct Arguments {
   bool is_causal;
   bool is_local;
 
+  bool use_sink = false;
+  bool use_causal_mask = false;
+
   bool is_rotary_interleaved;
 
   torch::TensorOptions tensor_opts;
@@ -798,12 +801,12 @@ struct SplitDecodeConfig {
 
 template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
 struct FmhaDecodeRunner {
-  void operator()(bool use_sink, const Arguments& params) const;
+  void operator()(const Arguments& params) const;
 };
 
 template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
 struct FmhaSplitDecodeRunner {
-  void operator()(bool use_sink, const Arguments& params) const;
+  void operator()(const Arguments& params) const;
 };
 
 }  // namespace decode

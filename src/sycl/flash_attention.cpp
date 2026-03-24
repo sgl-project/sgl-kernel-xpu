@@ -46,9 +46,9 @@ namespace decode {
 #define DISPATCH_DECODE_KERNEL(QG, HD, PS)                      \
   do {                                                           \
     if (params.use_split_kv_decode) {                           \
-      FmhaSplitDecodeRunner<QG, HD, PS>{}(use_sink, params);    \
+      FmhaSplitDecodeRunner<QG, HD, PS>{}(params);              \
     } else {                                                     \
-      FmhaDecodeRunner<QG, HD, PS>{}(use_sink, params);         \
+      FmhaDecodeRunner<QG, HD, PS>{}(params);                   \
     }                                                            \
   } while (0)
 
@@ -310,6 +310,7 @@ std::vector<at::Tensor> mha_fwd(
   params.softmax_scale = softmax_scale;
   bool use_sink = sinks_.has_value();
   params.softmax_sink_ptr = use_sink ? sinks_.value().data_ptr() : nullptr;
+  params.use_sink = use_sink;
 
   params.softcap = softcap;
 
@@ -319,6 +320,7 @@ std::vector<at::Tensor> mha_fwd(
   // Causal is the special case where window_size_right == 0 and window_size_left < 0.
   // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
   params.is_causal = window_size_left < 0 && window_size_right == 0;
+  params.use_causal_mask = params.is_causal;
   params.is_local = (window_size_left >= 0 || window_size_right >= 0) && !params.is_causal;
 
   // TODO: check this

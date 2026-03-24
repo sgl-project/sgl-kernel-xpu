@@ -67,6 +67,8 @@ jobs:
               python3 bench_merge_states_v2.py 2>&1 | tee merge_states.py.log \
               python3 bench_swiglu_alpha_limit.py 2>&1 | tee swiglu_alpha_limit.py.log \
               python3 bench_fused_qk_norm_rope.py 2>&1 | tee fused_qk_norm_rope.py.log \
+              python3 bench_per_token_group_quant_8bit.py 2>&1 | tee per_token_group_quant_8bit.py.log \
+              python3 bench_per_token_group_quant_mxfp4.py 2>&1 | tee per_token_group_quant_mxfp4.py.log \
             "
 
       - name: Copy logs from container

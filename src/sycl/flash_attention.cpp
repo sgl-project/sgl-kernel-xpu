@@ -43,73 +43,73 @@ namespace decode {
 // Dispatch macros following the GroupGemmXe20.cpp pattern.
 // Directly call struct operator() - no function pointers.
 
-#define DISPATCH_DECODE_KERNEL(QG, HD, PS)                      \
-  do {                                                           \
-    if (params.use_split_kv_decode) {                           \
-      FmhaSplitDecodeRunner<QG, HD, PS>{}(params);              \
-    } else {                                                     \
-      FmhaDecodeRunner<QG, HD, PS>{}(params);                   \
-    }                                                            \
+#define DISPATCH_DECODE_KERNEL(QG, HD, PS)         \
+  do {                                             \
+    if (params.use_split_kv_decode) {              \
+      FmhaSplitDecodeRunner<QG, HD, PS>{}(params); \
+    } else {                                       \
+      FmhaDecodeRunner<QG, HD, PS>{}(params);      \
+    }                                              \
   } while (0)
 
-#define DISPATCH_DECODE_PAGE_SIZE(QG, HD)                                                                            \
-  do {                                                                                                                \
-    switch (params.page_size) {                                                                                       \
-      case 64:                                                                                                        \
-        DISPATCH_DECODE_KERNEL(QG, HD, 64);                                                                          \
-        break;                                                                                                        \
-      case 128:                                                                                                       \
-        DISPATCH_DECODE_KERNEL(QG, HD, 128);                                                                         \
-        break;                                                                                                        \
-      default:                                                                                                        \
-        TORCH_CHECK(false, "Unsupported page_size for decode attention: ", params.page_size);                        \
-    }                                                                                                                 \
+#define DISPATCH_DECODE_PAGE_SIZE(QG, HD)                                                     \
+  do {                                                                                        \
+    switch (params.page_size) {                                                               \
+      case 64:                                                                                \
+        DISPATCH_DECODE_KERNEL(QG, HD, 64);                                                   \
+        break;                                                                                \
+      case 128:                                                                               \
+        DISPATCH_DECODE_KERNEL(QG, HD, 128);                                                  \
+        break;                                                                                \
+      default:                                                                                \
+        TORCH_CHECK(false, "Unsupported page_size for decode attention: ", params.page_size); \
+    }                                                                                         \
   } while (0)
 
-#define DISPATCH_DECODE_HEAD_DIM(QG)                                                                                 \
-  do {                                                                                                                \
-    switch (params.d) {                                                                                               \
-      case 64:                                                                                                        \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 64);                                                                           \
-        break;                                                                                                        \
-      case 96:                                                                                                        \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 96);                                                                           \
-        break;                                                                                                        \
-      case 128:                                                                                                       \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 128);                                                                          \
-        break;                                                                                                        \
-      case 192:                                                                                                       \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 192);                                                                          \
-        break;                                                                                                        \
-      case 256:                                                                                                       \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 256);                                                                          \
-        break;                                                                                                        \
-      default:                                                                                                        \
-        TORCH_CHECK(false, "Unsupported head size for decode attention: ", params.d);                                \
-    }                                                                                                                 \
+#define DISPATCH_DECODE_HEAD_DIM(QG)                                                  \
+  do {                                                                                \
+    switch (params.d) {                                                               \
+      case 64:                                                                        \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 64);                                            \
+        break;                                                                        \
+      case 96:                                                                        \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 96);                                            \
+        break;                                                                        \
+      case 128:                                                                       \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 128);                                           \
+        break;                                                                        \
+      case 192:                                                                       \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 192);                                           \
+        break;                                                                        \
+      case 256:                                                                       \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 256);                                           \
+        break;                                                                        \
+      default:                                                                        \
+        TORCH_CHECK(false, "Unsupported head size for decode attention: ", params.d); \
+    }                                                                                 \
   } while (0)
 
-#define DISPATCH_DECODE(qg_sz)                                                                                       \
-  do {                                                                                                                \
-    switch (qg_sz) {                                                                                                  \
-      case 1:                                                                                                         \
-        DISPATCH_DECODE_HEAD_DIM(1);                                                                                  \
-        break;                                                                                                        \
-      case 2:                                                                                                         \
-        DISPATCH_DECODE_HEAD_DIM(2);                                                                                  \
-        break;                                                                                                        \
-      case 4:                                                                                                         \
-        DISPATCH_DECODE_HEAD_DIM(4);                                                                                  \
-        break;                                                                                                        \
-      case 8:                                                                                                         \
-        DISPATCH_DECODE_HEAD_DIM(8);                                                                                  \
-        break;                                                                                                        \
-      case 16:                                                                                                        \
-        DISPATCH_DECODE_HEAD_DIM(16);                                                                                 \
-        break;                                                                                                        \
-      default:                                                                                                        \
-        TORCH_CHECK(false, "Unsupported q_group_size for decode attention: ", params.q_group_size);                  \
-    }                                                                                                                 \
+#define DISPATCH_DECODE(qg_sz)                                                                      \
+  do {                                                                                              \
+    switch (qg_sz) {                                                                                \
+      case 1:                                                                                       \
+        DISPATCH_DECODE_HEAD_DIM(1);                                                                \
+        break;                                                                                      \
+      case 2:                                                                                       \
+        DISPATCH_DECODE_HEAD_DIM(2);                                                                \
+        break;                                                                                      \
+      case 4:                                                                                       \
+        DISPATCH_DECODE_HEAD_DIM(4);                                                                \
+        break;                                                                                      \
+      case 8:                                                                                       \
+        DISPATCH_DECODE_HEAD_DIM(8);                                                                \
+        break;                                                                                      \
+      case 16:                                                                                      \
+        DISPATCH_DECODE_HEAD_DIM(16);                                                               \
+        break;                                                                                      \
+      default:                                                                                      \
+        TORCH_CHECK(false, "Unsupported q_group_size for decode attention: ", params.q_group_size); \
+    }                                                                                               \
   } while (0)
 
 std::vector<at::Tensor> mha_fwd(

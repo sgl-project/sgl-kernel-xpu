@@ -498,84 +498,10 @@ struct DecodeKernelLauncher {
 
   static void
   run(typename FMHAKernel::Params params, typename ReductionSplitKernel::Params reduce_params, bool need_reduce) {
-    auto stream = at::xpu::getCurrentXPUStream();
-    auto q = stream.queue();
-
-    namespace syclex = sycl::ext::oneapi::experimental;
-    namespace intelex = sycl::ext::intel::experimental;
-
-    dim3 const block = FMHAKernel::get_block_shape();
-    dim3 const grid = FMHAKernel::get_grid_shape(params);
-
-    // cute::print("Launching FMHAKernel with grid: "); cute::print("%d x %d x
-    // %d ", grid.x, grid.y, grid.z); cute::print("and block: ");
-    // cute::print("%d x %d x %d\n", block.x, block.y, block.z);
-
-    // configure smem size and carveout
-    int smem_size = FMHAKernel::SharedStorageSize;
-
-    const auto sycl_block = compat::dim3(block.x, block.y, block.z);
-    const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
-
-    // Launch parameters depend on whether SYCL compiler supports work-group
-    // scratch memory extension
-    compat::experimental::launch_properties launch_props{
-        syclex::work_group_scratch_size(smem_size),
-    };
-    compat::experimental::kernel_properties kernel_props{
-        syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<256>};
-    compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
-
-    sycl::ext::oneapi::experimental::launch_config config(policy.get_range(), policy.get_launch_properties());
-    auto cgf = [&](::sycl::handler& cgh) {
-      auto KernelFunctor =
-          compat::experimental::detail::build_kernel_functor<cutlass::device_kernel<FMHAKernel>>(cgh, policy, params);
-      sycl::ext::oneapi::experimental::detail::
-          LaunchConfigAccess<sycl::nd_range<3>, decltype(policy.get_launch_properties())>
-              ConfigAccess(config);
-      cgh.parallel_for<KernelCur<FMHAKernel>>(ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
-    };
-
-    q.submit(cgf);
-    // auto event =
-    //     compat::experimental::launch<cutlass::device_kernel<FMHAKernel>>(
-    //         policy, queue, params);
-    // EventManager::getInstance().addEvent(event);
-
-    // event.wait();
+    launch<FMHAKernel>(params);
 
     if (need_reduce) {
-      dim3 const reduce_grid = ReductionSplitKernel::get_grid_shape(reduce_params);
-      int reduce_smem_size = ReductionSplitKernel::SharedStorageSize;
-      const auto reduce_sycl_block = compat::dim3(block.x, block.y, block.z);
-      const auto reduce_sycl_grid = compat::dim3(reduce_grid.x, reduce_grid.y, reduce_grid.z);
-      compat::experimental::launch_properties launch_props_reduce{
-          syclex::work_group_scratch_size(reduce_smem_size),
-      };
-      compat::experimental::launch_policy reduce_policy{
-          reduce_sycl_grid, reduce_sycl_block, launch_props_reduce, kernel_props};
-
-      sycl::ext::oneapi::experimental::launch_config reduce_config(
-          reduce_policy.get_range(), reduce_policy.get_launch_properties());
-      auto cgf = [&](::sycl::handler& cgh) {
-        auto KernelFunctor =
-            compat::experimental::detail::build_kernel_functor<cutlass::device_kernel<ReductionSplitKernel>>(
-                cgh, reduce_policy, reduce_params);
-        sycl::ext::oneapi::experimental::detail::
-            LaunchConfigAccess<sycl::nd_range<3>, decltype(reduce_policy.get_launch_properties())>
-                ConfigAccess(reduce_config);
-        cgh.parallel_for<KernelCur<ReductionSplitKernel>>(
-            ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
-      };
-      q.submit(cgf);
-
-      // auto reduce_event = compat::experimental::launch<
-      //     cutlass::device_kernel<ReductionSplitKernel>>(
-      //     reduce_policy, queue, reduce_params);
-
-      // // reduce_event.wait();
-
-      // EventManager::getInstance().addEvent(reduce_event);
+      launch<ReductionSplitKernel>(reduce_params);
     }
   }
 };

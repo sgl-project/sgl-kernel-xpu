@@ -59,18 +59,19 @@ def flash_attn_baseline(
 causal = [True, False]
 local = [True, False]
 use_sinks = [True, False]
-batch_size = [16, 32]
+batch_size = [1, 2, 4, 16, 32]
 q_seq_length_range = [1, 128]
-head_dim = [64, 128]
+head_dim = [64, 128, 256]
 num_heads_q = [16]
 num_heads_kv = [2, 4, 8]
 kv_seq_length_range = [4096, 16384]
-page_size_range = [0, 128]
+page_size_range = [0, 64, 128]
 configs = list(
     filter(
         lambda cfg: not (cfg[0] and cfg[1])
         and (cfg[4] != 1 or (not cfg[0] and not cfg[1] and not cfg[2]))
-        and (cfg[6] % cfg[7] == 0),
+        and (cfg[6] % cfg[7] == 0)
+        and (cfg[8] >= cfg[9]),
         product(
             causal,
             local,

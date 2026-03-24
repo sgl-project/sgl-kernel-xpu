@@ -40,115 +40,77 @@
 
 namespace decode {
 
-namespace {
+// Dispatch macros following the GroupGemmXe20.cpp pattern.
+// Directly call struct operator() — no function pointers.
 
-using launch_fn_t = void (*)(bool use_sink, const Arguments& params);
+#define DISPATCH_DECODE_KERNEL(QG, HD, PS)                      \
+  do {                                                           \
+    if (params.use_split_kv_decode) {                           \
+      FmhaSplitDecodeRunner<QG, HD, PS>{}(use_sink, params);    \
+    } else {                                                     \
+      FmhaDecodeRunner<QG, HD, PS>{}(use_sink, params);         \
+    }                                                            \
+  } while (0)
 
-#define LAUNCH_FN_ENTRY(QG, HD, PS) &FmhaDecodeRunner<QG, HD, PS>::call
-#define LAUNCH_SPLIT_FN_ENTRY(QG, HD, PS) &FmhaSplitDecodeRunner<QG, HD, PS>::call
+#define DISPATCH_DECODE_PAGE_SIZE(QG, HD)                                                                            \
+  do {                                                                                                                \
+    switch (params.page_size) {                                                                                       \
+      case 64:                                                                                                        \
+        DISPATCH_DECODE_KERNEL(QG, HD, 64);                                                                          \
+        break;                                                                                                        \
+      case 128:                                                                                                       \
+        DISPATCH_DECODE_KERNEL(QG, HD, 128);                                                                         \
+        break;                                                                                                        \
+      default:                                                                                                        \
+        TORCH_CHECK(false, "Unsupported page_size for decode attention: ", params.page_size);                        \
+    }                                                                                                                 \
+  } while (0)
 
-launch_fn_t get_launch_fn(int qg_sz, int head_dim, int page_size, bool use_split) {
-  // Dispatch tables indexed by (qg_sz, head_dim, page_size).
-  // qg_sz index:    {1->0, 2->1, 4->2, 8->3, 16->4}
-  // head_dim index: {64->0, 96->1, 128->2, 192->3, 256->4}
-  // page_size index: {64->0, 128->1}
+#define DISPATCH_DECODE_HEAD_DIM(QG)                                                                                 \
+  do {                                                                                                                \
+    switch (params.d) {                                                                                               \
+      case 64:                                                                                                        \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 64);                                                                           \
+        break;                                                                                                        \
+      case 96:                                                                                                        \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 96);                                                                           \
+        break;                                                                                                        \
+      case 128:                                                                                                       \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 128);                                                                          \
+        break;                                                                                                        \
+      case 192:                                                                                                       \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 192);                                                                          \
+        break;                                                                                                        \
+      case 256:                                                                                                       \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 256);                                                                          \
+        break;                                                                                                        \
+      default:                                                                                                        \
+        TORCH_CHECK(false, "Unsupported head size for decode attention: ", params.d);                                \
+    }                                                                                                                 \
+  } while (0)
 
-#define PAGE_ENTRIES(QG, HD) \
-  { LAUNCH_FN_ENTRY(QG, HD, 64), LAUNCH_FN_ENTRY(QG, HD, 128) }
-
-#define HD_ENTRIES(QG) \
-  { PAGE_ENTRIES(QG, 64), PAGE_ENTRIES(QG, 96), PAGE_ENTRIES(QG, 128), PAGE_ENTRIES(QG, 192), PAGE_ENTRIES(QG, 256) }
-
-  static const launch_fn_t decode_table[5][5][2] = {
-      HD_ENTRIES(1),
-      HD_ENTRIES(2),
-      HD_ENTRIES(4),
-      HD_ENTRIES(8),
-      HD_ENTRIES(16),
-  };
-
-#undef HD_ENTRIES
-#undef PAGE_ENTRIES
-
-#define PAGE_ENTRIES(QG, HD) \
-  { LAUNCH_SPLIT_FN_ENTRY(QG, HD, 64), LAUNCH_SPLIT_FN_ENTRY(QG, HD, 128) }
-
-#define HD_ENTRIES(QG) \
-  { PAGE_ENTRIES(QG, 64), PAGE_ENTRIES(QG, 96), PAGE_ENTRIES(QG, 128), PAGE_ENTRIES(QG, 192), PAGE_ENTRIES(QG, 256) }
-
-  static const launch_fn_t split_decode_table[5][5][2] = {
-      HD_ENTRIES(1),
-      HD_ENTRIES(2),
-      HD_ENTRIES(4),
-      HD_ENTRIES(8),
-      HD_ENTRIES(16),
-  };
-
-#undef HD_ENTRIES
-#undef PAGE_ENTRIES
-
-  int qg_idx = -1;
-  switch (qg_sz) {
-    case 1:
-      qg_idx = 0;
-      break;
-    case 2:
-      qg_idx = 1;
-      break;
-    case 4:
-      qg_idx = 2;
-      break;
-    case 8:
-      qg_idx = 3;
-      break;
-    case 16:
-      qg_idx = 4;
-      break;
-    default:
-      return nullptr;
-  }
-
-  int hd_idx = -1;
-  switch (head_dim) {
-    case 64:
-      hd_idx = 0;
-      break;
-    case 96:
-      hd_idx = 1;
-      break;
-    case 128:
-      hd_idx = 2;
-      break;
-    case 192:
-      hd_idx = 3;
-      break;
-    case 256:
-      hd_idx = 4;
-      break;
-    default:
-      return nullptr;
-  }
-
-  int ps_idx = -1;
-  switch (page_size) {
-    case 64:
-      ps_idx = 0;
-      break;
-    case 128:
-      ps_idx = 1;
-      break;
-    default:
-      return nullptr;
-  }
-
-  const auto& table = use_split ? split_decode_table : decode_table;
-  return table[qg_idx][hd_idx][ps_idx];
-}
-
-#undef LAUNCH_FN_ENTRY
-#undef LAUNCH_SPLIT_FN_ENTRY
-
-}  // namespace
+#define DISPATCH_DECODE(qg_sz)                                                                                       \
+  do {                                                                                                                \
+    switch (qg_sz) {                                                                                                  \
+      case 1:                                                                                                         \
+        DISPATCH_DECODE_HEAD_DIM(1);                                                                                  \
+        break;                                                                                                        \
+      case 2:                                                                                                         \
+        DISPATCH_DECODE_HEAD_DIM(2);                                                                                  \
+        break;                                                                                                        \
+      case 4:                                                                                                         \
+        DISPATCH_DECODE_HEAD_DIM(4);                                                                                  \
+        break;                                                                                                        \
+      case 8:                                                                                                         \
+        DISPATCH_DECODE_HEAD_DIM(8);                                                                                  \
+        break;                                                                                                        \
+      case 16:                                                                                                        \
+        DISPATCH_DECODE_HEAD_DIM(16);                                                                                 \
+        break;                                                                                                        \
+      default:                                                                                                        \
+        TORCH_CHECK(false, "Unsupported q_group_size for decode attention: ", params.q_group_size);                  \
+    }                                                                                                                 \
+  } while (0)
 
 std::vector<at::Tensor> mha_fwd(
     const at::Tensor& q,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
@@ -446,12 +408,15 @@ std::vector<at::Tensor> mha_fwd(
       "Unsupported page size for decode attention: ",
       params.page_size);
 
-  auto fn = get_launch_fn(qg_sz, params.d, params.page_size, params.use_split_kv_decode);
-  TORCH_CHECK(fn != nullptr, "No FMHA decode kernel for qg=", qg_sz, " hd=", params.d, " ps=", params.page_size);
-  fn(use_sink, params);
+  DISPATCH_DECODE(qg_sz);
 
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
+
+#undef DISPATCH_DECODE_KERNEL
+#undef DISPATCH_DECODE_PAGE_SIZE
+#undef DISPATCH_DECODE_HEAD_DIM
+#undef DISPATCH_DECODE
 
 }  // namespace decode
 

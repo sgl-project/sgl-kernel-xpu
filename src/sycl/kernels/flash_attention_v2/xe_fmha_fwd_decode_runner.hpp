@@ -790,7 +790,7 @@ struct SplitDecodeConfig {
   }
 };
 
-// Struct functors for use with the function-pointer dispatch table.
+// Struct functors for decode kernel dispatch.
 // operator() is declared here; each specialization's body is defined in a
 // generated .cpp file (from xe_fmha_fwd_decode_kernel.cpp.in /
 // xe_fmha_fwd_split_decode_kernel.cpp.in) so the compiler only emits code
@@ -799,17 +799,11 @@ struct SplitDecodeConfig {
 template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
 struct FmhaDecodeRunner {
   void operator()(bool use_sink, const Arguments& params) const;
-  static void call(bool use_sink, const Arguments& params) {
-    FmhaDecodeRunner{}(use_sink, params);
-  }
 };
 
 template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
 struct FmhaSplitDecodeRunner {
   void operator()(bool use_sink, const Arguments& params) const;
-  static void call(bool use_sink, const Arguments& params) {
-    FmhaSplitDecodeRunner{}(use_sink, params);
-  }
 };
 
 }  // namespace decode

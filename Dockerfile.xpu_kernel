@@ -53,11 +53,6 @@ RUN --mount=type=secret,id=github_token \
     echo "cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} && \
     cd sglang && \
-    # Clone sgl-kernel and build sglang-kernel...
-    echo "cloning ${SG_LANG_KERNEL_REPO} from ${SG_LANG_KERNEL_BRANCH}" && \
-    git clone --branch ${SG_LANG_KERNEL_BRANCH} --single-branch ${SG_LANG_KERNEL_REPO} && \
-    cd sgl-kernel-xpu && \
-    pip install -v . &&\
     # Install required packages for sglang workloads
     pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops matplotlib pandas --root-user-action=ignore aiohttp && \
     conda install libsqlite=3.48.0 -y && \

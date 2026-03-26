@@ -122,7 +122,6 @@ class FlashChunkPrefillSoftmaxEpilogue<CausalMask_, LocalMask_, epilogue::IntelX
         } else {
           frag_s(base_indx) = sycl::native::exp2(frag_s(base_indx) - max_scale_bcast);
         }
-
         sum(index) += frag_s(base_indx);
       }
     }
@@ -162,7 +161,6 @@ class FlashChunkPrefillSoftmaxEpilogue<CausalMask_, LocalMask_, epilogue::IntelX
       auto sg = compat::get_nd_item<1>().get_sub_group();
       Element max_scale{max * params.scale};
       Element exp_scale;
-
       if constexpr (LocalMask || CausalMask) {
         exp_scale = (max_scale == -INFINITY || max_prev == -INFINITY)
                         ? 0.f
@@ -187,6 +185,7 @@ class FlashChunkPrefillSoftmaxEpilogue<CausalMask_, LocalMask_, epilogue::IntelX
             frag_s(base_indx) = sycl::native::exp2(frag_s(base_indx) - max_scale_bcast);
           }
         }
+        sum(index) += frag_s(base_indx);
         CUTLASS_PRAGMA_UNROLL
         for (int z = 0; z < FragsNOut; z++) {
           auto base_indx = index + (z * Vec * FragsM);

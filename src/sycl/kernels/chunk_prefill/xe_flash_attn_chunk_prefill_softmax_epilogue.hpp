@@ -112,14 +112,16 @@ class FlashChunkPrefillSoftmaxEpilogue<CausalMask_, LocalMask_, epilogue::IntelX
     CUTLASS_PRAGMA_UNROLL
     for (int index = 0; index < Vec * FragsM; index++) {
       const auto max_scale_bcast = group_broadcast(g, max_scale, index);
-      bool max_scale_bcast_is_inf = max_scale_bcast == -INFINITY;
       CUTLASS_PRAGMA_UNROLL
       for (int z = 0; z < FragsN; z++) {
         auto base_indx = index + (z * Vec * FragsM);
-
-        frag_s(base_indx) = (LocalMask || CausalMask) && (max_scale_bcast_is_inf || frag_s(base_indx) == -INFINITY)
-                                ? 0.f
-                                : sycl::native::exp2(frag_s(base_indx) - max_scale_bcast);
+        if constexpr (LocalMask || CausalMask) {
+          frag_s(base_indx) = (max_scale_bcast == -INFINITY || frag_s(base_indx) == -INFINITY)
+                                  ? 0.f
+                                  : sycl::native::exp2(frag_s(base_indx) - max_scale_bcast);
+        } else {
+          frag_s(base_indx) = sycl::native::exp2(frag_s(base_indx) - max_scale_bcast);
+        }
 
         sum(index) += frag_s(base_indx);
       }
@@ -161,9 +163,13 @@ class FlashChunkPrefillSoftmaxEpilogue<CausalMask_, LocalMask_, epilogue::IntelX
       Element max_scale{max * params.scale};
       Element exp_scale;
 
-      exp_scale = (LocalMask || CausalMask) && (max_scale == -INFINITY || max_prev == -INFINITY)
-                      ? 0.f
-                      : sycl::native::exp2(max_prev * params.scale - max_scale);
+      if constexpr (LocalMask || CausalMask) {
+        exp_scale = (max_scale == -INFINITY || max_prev == -INFINITY)
+                        ? 0.f
+                        : sycl::native::exp2(max_prev * params.scale - max_scale);
+      } else {
+        exp_scale = sycl::native::exp2(max_prev * params.scale - max_scale);
+      }
 
       CUTLASS_PRAGMA_UNROLL
       for (int index = 0; index < Vec * FragsM; index++) {
@@ -173,12 +179,13 @@ class FlashChunkPrefillSoftmaxEpilogue<CausalMask_, LocalMask_, epilogue::IntelX
         CUTLASS_PRAGMA_UNROLL
         for (int z = 0; z < FragsNAcc; z++) {
           auto base_indx = index + (z * Vec * FragsM);
-
-          frag_s(base_indx) =
-              (LocalMask || CausalMask) && (max_scale_bcast == -INFINITY || frag_s(base_indx) == -INFINITY)
-                  ? 0.f
-                  : sycl::native::exp2(frag_s(base_indx) - max_scale_bcast);
-          sum(index) += frag_s(base_indx);
+          if constexpr (LocalMask || CausalMask) {
+            frag_s(base_indx) = (max_scale_bcast == -INFINITY || frag_s(base_indx) == -INFINITY)
+                                    ? 0.f
+                                    : sycl::native::exp2(frag_s(base_indx) - max_scale_bcast);
+          } else {
+            frag_s(base_indx) = sycl::native::exp2(frag_s(base_indx) - max_scale_bcast);
+          }
         }
         CUTLASS_PRAGMA_UNROLL
         for (int z = 0; z < FragsNOut; z++) {

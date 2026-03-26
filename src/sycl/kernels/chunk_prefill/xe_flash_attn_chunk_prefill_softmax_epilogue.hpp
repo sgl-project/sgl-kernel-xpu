@@ -184,8 +184,8 @@ class FlashChunkPrefillSoftmaxEpilogue<CausalMask_, LocalMask_, epilogue::IntelX
           } else {
             frag_s(base_indx) = sycl::native::exp2(frag_s(base_indx) - max_scale_bcast);
           }
+          sum(index) += frag_s(base_indx);
         }
-        sum(index) += frag_s(base_indx);
         CUTLASS_PRAGMA_UNROLL
         for (int z = 0; z < FragsNOut; z++) {
           auto base_indx = index + (z * Vec * FragsM);

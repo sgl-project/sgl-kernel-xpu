@@ -48,7 +48,7 @@
 #include "sycl/kernels/flash_attention_v2/kernel/xe_tile_scheduler.hpp"
 
 using namespace cute;
-namespace decode {
+namespace prefill {
 struct Arguments {
   using index_t = int64_t;
 
@@ -185,19 +185,19 @@ using LayoutK = cutlass::layout::ColumnMajor;
 using LayoutV = cutlass::layout::RowMajor;
 using LayoutO = cutlass::layout::RowMajor;
 
-template <class FMHADecodeKernel, bool isVarLen = false>
-struct DecodeRunner {
-  using StrideQ = typename FMHADecodeKernel::StrideQ;
-  using StrideK = typename FMHADecodeKernel::StrideK;
-  using StrideV = typename FMHADecodeKernel::StrideV;
-  using StrideO = typename FMHADecodeKernel::StrideO;
+template <class FMHAPrefillKernel, bool isVarLen = false>
+struct PrefillRunner {
+  using StrideQ = typename FMHAPrefillKernel::StrideQ;
+  using StrideK = typename FMHAPrefillKernel::StrideK;
+  using StrideV = typename FMHAPrefillKernel::StrideV;
+  using StrideO = typename FMHAPrefillKernel::StrideO;
 
-  using ElementQ = typename FMHADecodeKernel::ElementQ;
-  using ElementK = typename FMHADecodeKernel::ElementK;
-  using ElementV = typename FMHADecodeKernel::ElementV;
-  using ElementO = typename FMHADecodeKernel::ElementO;
+  using ElementQ = typename FMHAPrefillKernel::ElementQ;
+  using ElementK = typename FMHAPrefillKernel::ElementK;
+  using ElementV = typename FMHAPrefillKernel::ElementV;
+  using ElementO = typename FMHAPrefillKernel::ElementO;
 
-  using CollectiveMainloop = typename FMHADecodeKernel::CollectiveMainloop;
+  using CollectiveMainloop = typename FMHAPrefillKernel::CollectiveMainloop;
   using ElementS = typename CollectiveMainloop::ElementS;
 
   using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<isVarLen>;
@@ -222,16 +222,16 @@ struct DecodeRunner {
   auto initialize_varlen(const Arguments& params, const ProblemShape& problem_size) {
     ProblemShape problem_size_for_init = problem_size;
     get<0>(problem_size_for_init) = 1;  // concentrated batch
-    get<1>(problem_size_for_init) = params.h / params.q_group_size;
-    get<3>(problem_size_for_init) = params.total_q * params.q_group_size;
+    get<1>(problem_size_for_init) = params.h;
+    get<3>(problem_size_for_init) = params.total_q;
     get<4>(problem_size_for_init) = params.total_knew;
     get<5>(problem_size_for_init) = params.total_k;
 
     ProblemShapeType problem_size_for_launch{
         .batch = get<0>(problem_size),
-        .num_heads_q = get<1>(problem_size) / params.q_group_size,
+        .num_heads_q = get<1>(problem_size),
         .num_heads_kv = get<2>(problem_size),
-        .seq_len_qo = {params.seqlen_q, params.total_q * params.q_group_size, nullptr, params.q_group_size},
+        .seq_len_qo = {params.seqlen_q, params.total_q, nullptr, 1},
         .seq_len_kv = {params.seqlen_knew, params.total_knew},
         .seq_len_kv_cache = {params.seqlen_k, params.total_k},
         .head_size_qk = get<6>(problem_size),
@@ -286,7 +286,7 @@ struct DecodeRunner {
   cutlass::Status run(const Arguments& params, const cutlass::KernelHardwareInfo& hw_info) {
     ProblemShapeType shape = initialize(params);
 
-    typename FMHADecodeKernel::Arguments arguments{
+    typename FMHAPrefillKernel::Arguments arguments{
         {
             shape,
             static_cast<const ElementQ*>(params.q_ptr),
@@ -307,22 +307,22 @@ struct DecodeRunner {
         hw_info};
 
     // Define device-global scratch memory
-    size_t workspace_size = FMHADecodeKernel::get_workspace_size(arguments);
+    size_t workspace_size = FMHAPrefillKernel::get_workspace_size(arguments);
     cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
 
-    if (!FMHADecodeKernel::can_implement(arguments)) {
+    if (!FMHAPrefillKernel::can_implement(arguments)) {
       return cutlass::Status::kErrorInvalidProblem;
     }
 
     // Initialize the workspace
-    FMHADecodeKernel::initialize_workspace(arguments, workspace.get());
+    FMHAPrefillKernel::initialize_workspace(arguments, workspace.get());
 
     // Convert host-side arguments to device-side arguments to be passed to the kernel
-    auto kernel_params = FMHADecodeKernel::to_underlying_arguments(arguments, workspace.get());
+    auto kernel_params = FMHAPrefillKernel::to_underlying_arguments(arguments, workspace.get());
 
     // Run
     // run(kernel_params);
-    launch<FMHADecodeKernel>(kernel_params);
+    launch<FMHAPrefillKernel>(kernel_params);
     return cutlass::Status::kSuccess;
   }
 };
@@ -335,7 +335,7 @@ template <
     typename TileShapeOutput,
     typename SubgroupLayoutQK,
     typename SubgroupLayoutPV_ = void, /* void -> default */
-    int PipelineStages = 1,
+    int PipelineStages = 2,
     bool persistent = false,
     typename ElementQ = bfloat16_t,
     typename ElementK = bfloat16_t,
@@ -366,6 +366,13 @@ struct FMHAConfig {
 
   template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
   static int run(const Arguments& params) {
+    // std::cout << "SGTileQ: " << get<0>(TileShapeQK{})  << " " << get<0>(shape(SubgroupLayoutQK{})) << " " << SGTileQ << " " << cute::gcd(SGTileQ, 8) << std::endl;
+    // 128: 128 8 16 8
+    // 16: 16 8 2 2
+    // 8: 8 8 1 1
+    // 4: 4 8 1 1
+    // auto mma = MMAOperation{}; // cute::XE_DPAS_TT<1, float, cutlass::bfloat16_t>
+    // std::cout << "mma: " << std::to_string(mma) << std::endl;
     // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
     // information is used by the underlying kernel.
     cutlass::KernelHardwareInfo hw_info;
@@ -415,18 +422,25 @@ struct FMHAConfig {
         GmemTiledCopyK_cache,
         GmemTiledCopyV_cache>;
 
+    // // Template Features
+    // static constexpr bool PagedKV = CollectiveMainloop::PagedKV;
+    // static constexpr bool CausalMask = CollectiveMainloop::CausalMask;
+    // static constexpr bool LocalMask = CollectiveMainloop::LocalMask;
+    // static constexpr bool Sink = CollectiveEpilogue::Sink;
+    // using ElementSink = typename CollectiveEpilogue::ElementSink;
+
     // Epilogue
     using CollectiveEpilogue =
         cutlass::fmha::collective::FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO>;
 
     static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
-    using FMHADecodeKernel = conditional_t<
+    using FMHAPrefillKernel = conditional_t<
         is_same_v<Scheduler, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>,
         cutlass::fmha::kernel::
           XeFMHAFwdDynamicSplitKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>,
-        cutlass::fmha::kernel::XeFMHAFwdKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler, Step<_1, _0, _2, _3>>>;
+        cutlass::fmha::kernel::XeFMHAFwdKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler, Step<_2, _0, _1, _3>>>;
 
-    DecodeRunner<FMHADecodeKernel, isVarLen> kernel;
+    PrefillRunner<FMHAPrefillKernel, isVarLen> kernel;
 
     kernel.run(params, hw_info);
     return 0;
@@ -441,4 +455,288 @@ struct FMHAConfig {
     }
   }
 };
-}  // namespace decode
+std::vector<at::Tensor> mha_fwd(
+    at::Tensor& q,        // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
+    const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
+                          // h_k, d) if there is page_table.
+    const at::Tensor& v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages,
+                          // page_size, h_k, dv) if there is page_table.
+    std::optional<const at::Tensor>& q_v_,  // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
+    const at::Tensor& cu_seqlens_q,         // b+1
+    const at::Tensor& cu_seqlens_k,         // b+1
+    int max_seqlen_q,
+    int max_seqlen_k,
+    std::optional<const at::Tensor>& page_table,       // (b_k, max_num_pages_per_seq)
+    std::optional<const at::Tensor>& kv_batch_idx_,    // b. indices to index into the KV cache
+    std::optional<const at::Tensor>& leftpad_k_,       // b
+    std::optional<const at::Tensor>& rotary_cos_,      // seqlen_ro x (rotary_dim / 2)
+    std::optional<const at::Tensor>& rotary_sin_,      // seqlen_ro x (rotary_dim / 2)
+    std::optional<const at::Tensor>& seqlens_rotary_,  // b
+    std::optional<at::Tensor>& q_descale_,             // (b, h_k), not (b, h)
+    std::optional<at::Tensor>& k_descale_,             // (b, h_k)
+    std::optional<at::Tensor>& v_descale_,             // (b, h_k)
+    const float softmax_scale_,
+    std::optional<const at::Tensor>& sinks_,
+    bool is_causal,
+    int window_size_left,
+    int window_size_right,
+    float const softcap,
+    bool const is_rotary_interleaved,  // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
+    std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
+    int num_splits,
+    std::optional<bool> pack_gqa_,
+    int const sm_margin) {
+  auto q_type = q.scalar_type();
+  TORCH_CHECK(
+      q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
+      "mha_fwd only supports Half and BFloat16, got",
+      q_type);
+
+  TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
+  TORCH_CHECK(v.scalar_type() == q_type, "query and value must have the same dtype");
+  CHECK_INPUT(q);
+  CHECK_INPUT(k);
+  CHECK_INPUT(v);
+  TORCH_CHECK(
+      q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+
+  TORCH_CHECK(page_table.value().dtype() == torch::kInt32, "page_table must have dtype torch.int32");
+  TORCH_CHECK(page_table.value().stride(-1) == 1, "page_table must have contiguous last dimension");
+
+  TORCH_CHECK(q.dim() == 3, "query must be in ragged format");
+  CHECK_INPUT(cu_seqlens_q);
+  TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype torch.int32");
+
+  CHECK_INPUT(cu_seqlens_k);
+  TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype torch.int32");
+
+  auto const sizes = q.sizes();
+  const int batch_size = cu_seqlens_q.size(0) - 1;
+  int seqlen_q = max_seqlen_q;
+  int total_q = q.size(0);
+  int num_heads = q.size(-2);
+  int const head_size = q.size(-1);
+  int const head_size_v = v.size(-1);
+  int const max_num_pages_per_seq = page_table.value().size(1);
+  int const num_pages = k.size(0);
+  int const page_size = k.size(1);
+  int const seqlen_k = max_num_pages_per_seq * page_size;
+  int const total_k = num_pages * page_size;
+  int const num_heads_k = k.size(-2);
+
+  int const batch_size_k = page_table.value().size(0);
+  float softmax_scale = softmax_scale_;
+
+  if (!kv_batch_idx_.has_value()) {
+    TORCH_CHECK(batch_size == batch_size_k, "batch_size must be equal to batch_size_k");
+  }
+
+  // Currently only support head dims <= 256
+  static constexpr int max_headdim = 256;
+  TORCH_CHECK(head_size <= max_headdim, "FlashAttention forward only supports head dimension at most ", max_headdim);
+  // TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+  TORCH_CHECK(num_heads == num_heads_k, "Only support number of heads in key/value equals to number of heads in query");
+
+  // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
+  // TODO: check this
+
+  if (window_size_left >= seqlen_k - 1) {
+    window_size_left = -1;
+  }
+  window_size_right = min(window_size_right, seqlen_q);
+  // causal=true is the same as causal=false in this case
+  if (is_causal) {
+    window_size_right = 0;
+  }
+
+  CHECK_SHAPE(k, num_pages, page_size, num_heads_k, head_size);
+  CHECK_SHAPE(v, num_pages, page_size, num_heads_k, head_size_v);
+  CHECK_SHAPE(page_table.value(), batch_size_k, max_num_pages_per_seq);
+
+  if (leftpad_k_.has_value()) {
+    auto leftpad_k = leftpad_k_.value();
+    TORCH_CHECK(leftpad_k.dtype() == torch::kInt32, "leftpad_k must have dtype int32");
+    CHECK_INPUT(leftpad_k);
+    CHECK_SHAPE(leftpad_k, batch_size);
+  }
+
+  static constexpr int alignment = 8;
+  TORCH_CHECK(head_size % alignment == 0, "head_size should be a multiple of " + std::to_string(alignment));
+  TORCH_CHECK(head_size_v % alignment == 0, "head_size_v should be a multiple of " + std::to_string(alignment));
+
+  auto opts = q.options();
+  at::Tensor out;
+  out = torch::empty({total_q, num_heads, head_size_v}, opts);
+
+  int const head_size_rounded = round_up_headdim(head_size);
+  int const head_size_v_rounded = head_size_v == head_size ? head_size_rounded : round_up_headdim(head_size_v);
+
+  // Otherwise the kernel will be launched from cuda:0 device
+  // Cast to char to avoid compiler warning about narrowing
+  c10::DeviceGuard device_guard(q.device());
+
+  at::Tensor softmax_lse;
+  softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
+
+  // align with FA3
+  Arguments params;
+  params.is_bf16 = q.dtype() == torch::kBFloat16;
+
+  // Set the pointers and strides.
+  params.q_ptr = q.data_ptr();
+  params.k_ptr = k.data_ptr();
+  params.v_ptr = v.data_ptr();
+  // All stride are in elements, not bytes.
+  params.q_row_stride = q.stride(-3);
+  params.k_row_stride = k.stride(-3);
+  params.v_row_stride = v.stride(-3);
+  params.q_head_stride = q.stride(-2);
+  params.k_head_stride = k.stride(-2);
+  params.v_head_stride = v.stride(-2);
+  params.v_dim_stride = v.stride(-1);
+  params.o_ptr = out.data_ptr();
+  params.o_row_stride = out.stride(-3);
+  params.o_head_stride = out.stride(-2);
+
+  params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
+  params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
+
+  // Softmax sum
+  params.softmax_lse_ptr = softmax_lse.data_ptr();
+
+  // Set the dimensions.
+  params.b = batch_size;
+  params.h = num_heads;
+  params.h_k = num_heads_k;
+  params.q_group_size = 1;
+  params.seqlen_q = seqlen_q;
+  params.seqlen_k = seqlen_k;
+  params.d = head_size;
+  params.d_rounded = head_size_rounded;
+
+  // Set the different scale values.
+  params.softmax_scale = softmax_scale;
+  bool use_sink = sinks_.has_value();
+  params.softmax_sink_ptr = use_sink ? sinks_.value().data_ptr() : nullptr;
+
+  params.softcap = softcap;
+
+  // Set this to probability of keeping an element to simplify things.
+  params.p_dropout = 1.f;
+
+  // Causal is the special case where window_size_right == 0 and window_size_left < 0.
+  // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
+  params.is_causal = window_size_left < 0 && window_size_right == 0;
+  params.is_local = (window_size_left >= 0 || window_size_right >= 0) && !params.is_causal;
+
+  // TODO: check this
+  if (window_size_left < 0) {
+    window_size_left = seqlen_k - 1;
+  }
+  if (window_size_right < 0) {
+    window_size_right = seqlen_q - 1;
+  }
+  params.window_size_left = window_size_left;
+  params.window_size_right = window_size_right;
+  params.total_q = total_q;
+  params.total_k = total_k;
+  params.b_k = batch_size_k;
+  params.dv = head_size_v;
+  params.page_table = page_table.value().data_ptr<int>();
+  params.page_table_batch_stride = page_table.value().stride(0);
+  params.max_num_pages_per_seq = max_num_pages_per_seq;
+  params.page_size = page_size;
+  params.num_pages = num_pages;
+
+  if (q_v_.has_value()) {
+    TORCH_CHECK(head_size <= 64, "q_v is only supported for head_size <= 64");
+    TORCH_CHECK(
+        q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
+        "q_v is only supported for fp16 and bf16 data type");
+    TORCH_CHECK(false, "q_v is not supported yet");
+    at::Tensor q_v = q_v_.value();
+    TORCH_CHECK(q_v.dtype() == q_type, "q_v must have the same dtype as query");
+    TORCH_CHECK(q_v.stride(-1) == 1, "q_v tensor must have contiguous last dimension");
+    CHECK_SHAPE(q_v, total_q, num_heads, head_size_v);
+    params.qv_ptr = q_v.data_ptr();
+    // All stride are in elements, not bytes.
+    params.qv_row_stride = q_v.stride(-3);
+    params.qv_head_stride = q_v.stride(-2);
+  }
+
+  if (rotary_cos_.has_value()) {
+    auto rotary_cos = rotary_cos_.value();
+    CHECK_INPUT(rotary_cos);
+    params.rotary_dim = rotary_cos.size(1) * 2;
+    TORCH_CHECK(params.rotary_dim <= head_size, "rotary_dim must be <= headdim");
+    TORCH_CHECK(params.rotary_dim % 16 == 0, "Only rotary dimensions divisible by 16 are currently supported");
+    const int seqlen_ro = rotary_cos.size(0);
+    TORCH_CHECK(seqlen_ro >= seqlen_k, "cos/sin seqlen must be at least the seqlen of KV cache");
+    CHECK_SHAPE(rotary_cos, seqlen_ro, params.rotary_dim / 2);
+    TORCH_CHECK(rotary_cos.scalar_type() == q_type, "rotary_cos must have the same dtype as query");
+
+    TORCH_CHECK(rotary_sin_.has_value(), "If rotary cos is provided, rotary sin must also be provided");
+    auto rotary_sin = rotary_sin_.value();
+    CHECK_INPUT(rotary_sin);
+    CHECK_SHAPE(rotary_sin, seqlen_ro, params.rotary_dim / 2);
+    TORCH_CHECK(rotary_sin.scalar_type() == q_type, "rotary_cos must have the same dtype as query");
+    params.rotary_cos_ptr = rotary_cos.data_ptr();
+    params.rotary_sin_ptr = rotary_sin.data_ptr();
+    params.is_rotary_interleaved = is_rotary_interleaved;
+    if (seqlens_rotary_.has_value()) {
+      at::Tensor seqlens_rotary = seqlens_rotary_.value();
+      CHECK_INPUT(seqlens_rotary);
+      TORCH_CHECK(seqlens_rotary.dtype() == torch::kInt32, "seqlens_rotary must have dtype torch.int32");
+      CHECK_SHAPE(seqlens_rotary, batch_size);
+      params.seqlens_rotary = seqlens_rotary.data_ptr<int>();
+    }
+  } else {
+    params.rotary_dim = 0;
+  }
+
+  if (kv_batch_idx_.has_value()) {
+    auto kv_batch_idx = kv_batch_idx_.value();
+    CHECK_INPUT(kv_batch_idx);
+    TORCH_CHECK(kv_batch_idx.scalar_type() == torch::kInt32, "kv_batch_idx must have dtype int32");
+    params.kv_batch_idx = reinterpret_cast<int*>(kv_batch_idx.data_ptr());
+  }
+
+  params.tensor_opts = torch::TensorOptions().dtype(torch::kUInt8).device(q.device());
+
+  at::Tensor out_accum, softmax_lse_accum;
+  auto outaccum_type = at::ScalarType::Float;
+
+  auto launch_kernel = [&](auto _TILED_Q, auto _TILED_KV, auto _HEAD_DIM, auto _NUM_SG) {
+    using TileShapeQK = cute::Shape<decltype(_TILED_Q), decltype(_TILED_KV), _32>;
+    using TileShapePV = cute::Shape<decltype(_TILED_Q), _32, decltype(_TILED_KV)>;
+    using TileShapeOutput = cute::Shape<decltype(_TILED_Q), decltype(_HEAD_DIM)>;
+    using SubgroupLayoutQK = cute::Layout<cute::Shape<decltype(_NUM_SG), _1, _1>, cute::Stride<_1, _1, _1>>;
+
+    AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+        AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+          FMHAConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(params);
+        });      
+      });
+    });
+  };
+
+  switch (params.d) {
+    case 64:
+      launch_kernel(_128{}, _64{}, _64{}, _8{});
+      break;
+    case 96:
+      launch_kernel(_128{}, _64{}, _96{}, _8{});
+      break;
+    case 128:
+      launch_kernel(_256{}, _32{}, _128{}, _16{});
+      break;
+    case 192:
+      launch_kernel(_256{}, _64{}, _192{}, _32{});
+      break;
+    default:
+      TORCH_CHECK(false, "Unsupported head size for prefill attention: ", params.d);
+  }
+  return {out, softmax_lse, out_accum, softmax_lse_accum};
+}
+}  // namespace prefill

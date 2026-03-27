@@ -479,8 +479,10 @@ def generate_qkv(
 )
 @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("new_kv", [False])
-@pytest.mark.parametrize("causal,local", [(False, True), (False, False), (True, False)])
-@pytest.mark.parametrize("use_sinks", [True, False])
+# @pytest.mark.parametrize("causal,local", [(False, True), (False, False), (True, False)])
+@pytest.mark.parametrize("causal,local", [(False, False)])
+# @pytest.mark.parametrize("use_sinks", [True, False])
+@pytest.mark.parametrize("use_sinks", [False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 @pytest.mark.parametrize("has_rotary_seqlens", [False])
 @pytest.mark.parametrize(

@@ -48,6 +48,11 @@ class XeDefault {};  // Default FMHA mainloop, P in registers.
 
 namespace cutlass::fmha::collective {
 
+static inline void barrier() {
+  asm volatile("lsc_fence.ugm.none.group\n");
+  asm volatile("barrier\n");
+}
+
 using namespace cute;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -412,6 +417,8 @@ struct FMHAFwdMainloop<
           cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
         }
 
+        barrier();
+
         /* K prefetch */
         for (int D = 0; D < size<4>(pKgK); D++) {
           int K_next = K + Stages;
@@ -491,6 +498,8 @@ struct FMHAFwdMainloop<
         reorder(tVrV, tArV);
         cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
       }
+
+      barrier();
 
       /* K prefetch */
       for (int D = 0; D < size<4>(pKgK); D++) {

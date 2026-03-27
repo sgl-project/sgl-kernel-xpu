@@ -40,6 +40,7 @@
 #include "kernels/chunk_prefill/chunk_prefill_runner.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
+#include "kernels/flash_attention_v2/xe_fmha_fwd_prefill_runner.hpp"
 
 namespace decode {
 
@@ -470,7 +471,10 @@ std::vector<at::Tensor> mha_fwd(
         pack_gqa_,
         sm_margin);
   } else {
-    return chunkprefill::mha_fwd(
+    // TODO: For now, this pass always enters prefill kernel.
+    // We should identify when to go to pure prefill or chunked prefill kernel.
+    // return chunkprefill::mha_fwd(
+    return prefill::mha_fwd(
         q,
         k,
         v,

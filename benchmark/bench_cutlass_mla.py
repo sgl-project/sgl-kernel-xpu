@@ -8,8 +8,8 @@ import torch
 import triton
 from sgl_kernel import cutlass_mla_decode, cutlass_mla_get_workspace_size
 
-bs_range = [1, 8, 16, 32, 64, 128, 256]
-qlen_range = [1, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+bs_range = [1, 4, 16]
+qlen_range = [1024, 2048, 4096, 8192]
 
 configs = list(itertools.product(bs_range, qlen_range))
 

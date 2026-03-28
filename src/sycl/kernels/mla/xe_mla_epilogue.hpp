@@ -35,7 +35,6 @@
 
 #include <sycl/sycl.hpp>
 
-#include "copy_block_slm.hpp"
 #include "cute/algorithm/subgroup_algorithms.hpp"
 #include "cute/algorithm/tensor_algorithms.hpp"
 #include "cutlass/cutlass.h"
@@ -43,6 +42,7 @@
 #include "cutlass/epilogue/collective/collective_epilogue.hpp"
 #include "cutlass/epilogue/collective/detail.hpp"
 #include "cutlass/epilogue/dispatch_policy.hpp"
+#include "sycl/comm/copy_block_slm.hpp"
 
 namespace cutlass::flash_attention::collective {
 /////////////////////////////////////////////////////////////////////////////////////////////////

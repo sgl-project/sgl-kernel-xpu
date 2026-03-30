@@ -129,7 +129,7 @@ def cutlass_mla_decode(
         sm_scale,
         num_kv_splits,
     )
-    return out.contiguous() if device_type == "xpu" else out[:, :H].contiguous()
+    return out if device_type == "xpu" else out[:, :H].contiguous()
 
 
 def cutlass_mla_get_workspace_size(

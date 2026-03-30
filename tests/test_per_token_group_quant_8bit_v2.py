@@ -1,5 +1,6 @@
 import itertools
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -17,7 +18,7 @@ fp8_min = -fp8_max
 enable_sgl_per_token_group_quant_8bit = True
 import sgl_kernel
 
- 
+
 def create_per_token_group_quant_test_data(num_tokens, hidden_dim, num_ranks, flags):
     device = torch.device("xpu")
     dtype = torch.bfloat16
@@ -78,13 +79,16 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, num_ranks, fl
         x[torch.randn(x.shape, device=device, generator=gen_xpu) < 0.001] *= 10
         return x, None
 
+
 # COPIED FROM DeepGEMM
 def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
-    
+
+
 # COPIED FROM DeepGEMM
 def align(x: int, y: int) -> int:
     return ceil_div(x, y) * y
+
 
 def ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
     """Round scale to nearest power of 2 for UE8M0 format."""
@@ -92,7 +96,8 @@ def ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
     y_s_quant = (exp_s.to(torch.int32) + 127).to(torch.int32)
     scale = torch.pow(2.0, torch.ceil(torch.log2(x.abs().clamp(min=1e-10))))
     return y_s_quant, scale
-    #return torch.pow(2.0, torch.ceil(torch.log2(x.abs().clamp(min=1e-10))))
+    # return torch.pow(2.0, torch.ceil(torch.log2(x.abs().clamp(min=1e-10))))
+
 
 def create_per_token_group_quant_fp8_output_scale(
     x_shape,
@@ -137,6 +142,7 @@ def create_per_token_group_quant_fp8_output_scale(
             dtype=torch.float32,
         )
 
+
 def sgl_per_token_group_quant_8bit_kernel(
     input: torch.Tensor,
     output_q: torch.Tensor,
@@ -175,9 +181,11 @@ def sgl_per_token_group_quant_8bit_kernel(
         input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
     )
 
+
 # For legacy usage
 sgl_per_token_group_quant_fp8_kernel = sgl_per_token_group_quant_8bit_kernel
 sgl_per_token_group_quant_int8_kernel = sgl_per_token_group_quant_8bit_kernel
+
 
 def sglang_per_token_group_quant_int8_layer(
     x: torch.Tensor,
@@ -209,9 +217,12 @@ def sglang_per_token_group_quant_int8_layer(
         )
     else:
         assert not enable_v2
-        sgl_per_token_group_quant_int8_kernel(x, x_q, x_s, group_size, eps, int8_min, int8_max)
+        sgl_per_token_group_quant_int8_kernel(
+            x, x_q, x_s, group_size, eps, int8_min, int8_max
+        )
 
     return x_q, x_s
+
 
 def sglang_per_token_group_quant_fp8_layer(
     x: torch.Tensor,
@@ -265,6 +276,7 @@ def sglang_per_token_group_quant_fp8_layer(
 
     return x_q, x_s
 
+
 # TODO maybe unify int8 and fp8 code later
 def sglang_per_token_group_quant_8bit_layer(
     x: torch.Tensor,
@@ -304,10 +316,11 @@ def sglang_per_token_group_quant_8bit_layer(
         enable_v2=enable_v2,
     )
 
+
 configs = list(
     itertools.product(
         [1, 4, 16, 64, 127, 128, 512, 1024, 4096, 8192],  # num_tokens
-        [128,  256, 384, 512, 1024, 1536, 1664, 2048, 4096, 7168, 16384],  # hidden_dim
+        [128, 256, 384, 512, 1024, 1536, 1664, 2048, 4096, 7168, 16384],  # hidden_dim
         [16, 32, 64, 128],  # group_size
         [None],  # num_ranks
         [fp8_type_, torch.int8],  # dtype
@@ -339,7 +352,7 @@ configs = list(
             #     scale_ue8m0=True,
             #     fuse_silu_and_mul=False,
             #     masked_layout_mode=None,
-            # ),                                    
+            # ),
         ],
     )
 ) + list(
@@ -383,6 +396,7 @@ configs = list(
     )
 )
 
+
 # Pure PyTorch reference implementations
 def per_token_group_quant_fp8_ref(
     x: torch.Tensor,
@@ -416,11 +430,12 @@ def per_token_group_quant_fp8_ref(
         quant_scales, scales = ceil_to_ue8m0(scales)
 
     x_quantized = (x_view / scales.unsqueeze(2)).to(torch.float8_e4m3fn)
-    #return x_quantized.view(num_tokens, hidden_dim), quant_scales
+    # return x_quantized.view(num_tokens, hidden_dim), quant_scales
     if fuse_silu_mul:
         return x_quantized.reshape(num_tokens, -1), quant_scales
     else:
-        return x_quantized.view(num_tokens, hidden_dim), quant_scales    
+        return x_quantized.view(num_tokens, hidden_dim), quant_scales
+
 
 def per_token_group_quant_fp8_ref_xxx(
     x: torch.Tensor,
@@ -442,6 +457,7 @@ def per_token_group_quant_fp8_ref_xxx(
     x_quantized = (x_view / scales.unsqueeze(2)).to(torch.float8_e4m3fn)
     return x_quantized.view(num_tokens, hidden_dim), quant_scales
 
+
 def per_token_group_quant_int8_ref(
     x: torch.Tensor, group_size: int = 128, eps: float = 1e-10
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -454,6 +470,7 @@ def per_token_group_quant_int8_ref(
     x_scaled = (x_view / scales.unsqueeze(2)).clamp(-127.0, 127.0)
     x_quantized = x_scaled.to(torch.int8)
     return x_quantized.view(num_tokens, hidden_dim), scales
+
 
 def sglang_per_token_group_quant_fp8_layer_ref(
     x: torch.Tensor,
@@ -488,14 +505,13 @@ def sglang_per_token_group_quant_fp8_layer_ref(
         if enable_sgl_per_token_group_quant_8bit:
             x_q, x_s = per_token_group_quant_fp8_ref(
                 x, group_size, eps, scale_ue8m0, fuse_silu_and_mul
-            )                        
+            )
         else:
-            #assert not enable_v2
-            x_q, x_s = per_token_group_quant_fp8_ref(
-                x, group_size, eps, scale_ue8m0
-            )                        
+            # assert not enable_v2
+            x_q, x_s = per_token_group_quant_fp8_ref(x, group_size, eps, scale_ue8m0)
 
     return x_q, x_s
+
 
 def sglang_per_token_group_quant_int8_layer_ref(
     x: torch.Tensor,
@@ -525,17 +541,14 @@ def sglang_per_token_group_quant_int8_layer_ref(
         # sgl_per_token_group_quant_8bit(
         #     x, x_q, x_s, group_size, eps, int8_min, int8_max, enable_v2=enable_v2
         # )
-        x_q, x_s = per_token_group_quant_int8_ref(
-            x, group_size, eps
-        )        
+        x_q, x_s = per_token_group_quant_int8_ref(x, group_size, eps)
     else:
         assert not enable_v2
-        #sgl_per_token_group_quant_int8(x, x_q, x_s, group_size, eps, int8_min, int8_max)
-        x_q, x_s = per_token_group_quant_int8_ref(
-            x, group_size, eps
-        )        
+        # sgl_per_token_group_quant_int8(x, x_q, x_s, group_size, eps, int8_min, int8_max)
+        x_q, x_s = per_token_group_quant_int8_ref(x, group_size, eps)
 
     return x_q, x_s
+
 
 def per_token_group_quant_8bit_ref(
     x: torch.Tensor,
@@ -575,6 +588,7 @@ def per_token_group_quant_8bit_ref(
         enable_v2=enable_v2,
     )
 
+
 def assert_all_close_or_tiny_diff(a: torch.Tensor, b: torch.Tensor):
     assert (a.shape == b.shape) and (
         a.dtype == b.dtype
@@ -606,6 +620,7 @@ def assert_all_close_or_tiny_diff(a: torch.Tensor, b: torch.Tensor):
         )
     ), f"{count_diff_sign=} {count_tiny_diff=} {count_large_diff=} {numel=} {a=} {b=}"
 
+
 def process_scales(
     x_s: torch.Tensor,
     num_tokens: int,
@@ -623,7 +638,7 @@ def process_scales(
 
         if column_major_scales:
             # column-major unpack
-            x_bytes = x_bytes.permute(1, 2, 0)   # [G/4, 4, T]
+            x_bytes = x_bytes.permute(1, 2, 0)  # [G/4, 4, T]
             x_unpacked = x_bytes.reshape(-1, T)  # [G, T]
             x_unpacked = x_unpacked.transpose(0, 1)
         else:
@@ -640,6 +655,7 @@ def process_scales(
     #     else:
     #         return x_s.to(torch.int32)
 
+
 @pytest.mark.parametrize(
     "num_tokens, hidden_dim, group_size, num_ranks, dst_dtype, flags", configs
 )
@@ -654,7 +670,7 @@ def test_per_token_group_quant_with_column_major(
     print(
         f"{num_tokens=} {hidden_dim=} {group_size=} {num_ranks=} {dst_dtype=} {flags=}"
     )
-     
+
     if (flags["scale_ue8m0"] and (group_size != 128)) or (
         (dst_dtype == torch.int8) and flags["column_major_scales"]
     ):
@@ -693,12 +709,12 @@ def test_per_token_group_quant_with_column_major(
         *sglang_per_token_group_quant_8bit_layer(**execute_kwargs, enable_v2=True)
     )
 
-    # Ref scale as per flags    
+    # Ref scale as per flags
     x_s_sglang = process_scales(
         x_s_sglang,
         num_tokens=x_q_sglang.shape[-2],
-        column_major_scales=flags["column_major_scales"],   # or False (test both)
-        scale_ue8m0=flags["scale_ue8m0"]
+        column_major_scales=flags["column_major_scales"],  # or False (test both)
+        scale_ue8m0=flags["scale_ue8m0"],
     )
 
     try:
@@ -723,5 +739,6 @@ def test_per_token_group_quant_with_column_major(
 
         raise
 
+
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

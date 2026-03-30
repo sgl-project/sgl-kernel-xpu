@@ -232,31 +232,31 @@ inline typename T::Fmla::Arguments args_from_options(
   using ElementK = typename T::ElementK;
   using ElementO = typename T::ElementO;
 
-  StrideQ stride_Q_nope = cute::make_tuple(
+  StrideQ stride_Q_nope = cute::make_stride(
       static_cast<int>(batch * num_heads * v_head_dim),
       cute::_1{},
       static_cast<int>(q_nope.stride(1)),
       static_cast<int>(q_nope.stride(0)));
 
-  StrideQ stride_Q_pe = cute::make_tuple(
+  StrideQ stride_Q_pe = cute::make_stride(
       static_cast<int>(batch * num_heads * q_pe_dim),
       cute::_1{},
       static_cast<int>(q_pe.stride(1)),
       static_cast<int>(q_pe.stride(0)));
 
-  StrideK stride_K = cute::make_tuple(
+  StrideK stride_K = cute::make_stride(
       static_cast<int>(kv_c_and_k_pe_cache.stride(1)),
       cute::_1{},
       static_cast<int>(kv_c_and_k_pe_cache.stride(0)),
       static_cast<int>(1));
 
-  StrideV stride_V = cute::make_tuple(
+  StrideV stride_V = cute::make_stride(
       cute::_1{},
       static_cast<int>(kv_c_and_k_pe_cache.stride(1)),
       static_cast<int>(kv_c_and_k_pe_cache.stride(0)),
       static_cast<int>(1));
 
-  StrideO stride_O = cute::make_tuple(
+  StrideO stride_O = cute::make_stride(
       static_cast<int>(batch * num_heads * v_head_dim),
       cute::_1{},
       static_cast<int>(out.stride(1)),
@@ -299,8 +299,7 @@ inline void runMla(
     at::Tensor const& page_table,
     at::Tensor const& workspace,
     double sm_scale,
-    int64_t num_kv_splits,
-    sycl::queue& queue) {
+    int64_t num_kv_splits) {
   using MlaXeType = MlaXe<Element, PageSizeOpt, IsPersistent<false>>;
   typename MlaXeType::Fmla fmla;
   auto arguments = args_from_options<MlaXeType>(
@@ -308,5 +307,5 @@ inline void runMla(
 
   CUTLASS_CHECK(fmla.can_implement(arguments));
 
-  CUTLASS_CHECK(fmla.run(arguments, workspace.data_ptr(), queue));
+  CUTLASS_CHECK(fmla.run(arguments, workspace.data_ptr()));
 }

@@ -9,9 +9,9 @@ import triton
 from sgl_kernel import cutlass_mla_decode, cutlass_mla_get_workspace_size
 
 bs_range = [1, 4, 16]
-qlen_range = [1024, 2048, 4096, 8192]
+kv_len_range = [1024, 2048, 4096, 8192]
 
-configs = list(itertools.product(bs_range, qlen_range))
+configs = list(itertools.product(bs_range, kv_len_range))
 
 all_results = []
 

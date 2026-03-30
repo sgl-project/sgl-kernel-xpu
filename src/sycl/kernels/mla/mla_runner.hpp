@@ -43,6 +43,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/device_kernel.h"
 #include "cutlass/util/sycl_event_manager.hpp"
+#include "sycl/comm/common.h"
 #include "xe_mla_kernel.hpp"
 
 namespace cutlass::flash_attention::device {
@@ -156,34 +157,7 @@ class MLA {
   }
 
   static cutlass::Status run(Params& params, sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
-    namespace syclex = sycl::ext::oneapi::experimental;
-    namespace intelex = sycl::ext::intel::experimental;
-
-    dim3 const block = Kernel::get_block_shape();
-    dim3 const grid = Kernel::get_grid_shape(params.fmla_params);
-
-    int smem_size = Kernel::SharedStorageSize;
-
-    const auto sycl_block = compat::dim3(block.x, block.y, block.z);
-    const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
-
-    compat::experimental::launch_properties launch_props{
-        syclex::work_group_scratch_size(smem_size),
-    };
-    compat::experimental::kernel_properties kernel_props{
-        syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<128>};
-    compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
-    sycl::ext::oneapi::experimental::launch_config config(policy.get_range(), policy.get_launch_properties());
-    auto cgf = [&](::sycl::handler& cgh) {
-      auto KernelFunctor = compat::experimental::detail::build_kernel_functor<cutlass::device_kernel<Kernel>>(
-          cgh, policy, params.fmla_params);
-      sycl::ext::oneapi::experimental::detail::
-          LaunchConfigAccess<sycl::nd_range<3>, decltype(policy.get_launch_properties())>
-              ConfigAccess(config);
-      cgh.parallel_for<KernelCur<Kernel>>(ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
-    };
-    queue.submit(cgf);
-    queue.wait_and_throw();
+    launch<Kernel, 128>(params.fmla_params);
 
     return cutlass::Status::kSuccess;
   }

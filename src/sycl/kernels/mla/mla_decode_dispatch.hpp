@@ -59,8 +59,7 @@ namespace mla_decode {
       const at::Tensor& page_table,          \
       at::Tensor& workspace,                 \
       double sm_scale,                       \
-      int64_t num_kv_splits,                 \
-      sycl::queue& queue);
+      int64_t num_kv_splits);
 
 #define DECLARE_MLA_DECODE_ALL_PAGE_SIZES(ELEM) \
   DECLARE_MLA_DECODE_LAUNCH(ELEM, 16)           \

@@ -46,70 +46,43 @@
 
 namespace {
 
-using launch_fn_t = void (*)(
-    at::Tensor&,
-    const at::Tensor&,
-    const at::Tensor&,
-    const at::Tensor&,
-    const at::Tensor&,
-    const at::Tensor&,
-    at::Tensor&,
-    double,
-    int64_t,
-    sycl::queue&);
+#define DISPATCH_MLA_PAGE_SIZE(ELEM)                                                                           \
+  do {                                                                                                         \
+    switch (page_size) {                                                                                       \
+      case 16:                                                                                                 \
+        mla_decode::launch_mla_decode_##ELEM##_16(                                                             \
+            out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
+        break;                                                                                                 \
+      case 32:                                                                                                 \
+        mla_decode::launch_mla_decode_##ELEM##_32(                                                             \
+            out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
+        break;                                                                                                 \
+      case 64:                                                                                                 \
+        mla_decode::launch_mla_decode_##ELEM##_64(                                                             \
+            out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
+        break;                                                                                                 \
+      case 128:                                                                                                \
+        mla_decode::launch_mla_decode_##ELEM##_128(                                                            \
+            out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
+        break;                                                                                                 \
+      default:                                                                                                 \
+        TORCH_CHECK(false, "Unsupported page size for MLA decode: ", page_size);                               \
+    }                                                                                                          \
+  } while (0)
 
-#define LAUNCH_FN_ENTRY(ELEM, PS) &mla_decode::launch_mla_decode_##ELEM##_##PS
-
-launch_fn_t get_launch_fn(at::ScalarType dtype, int page_size) {
-  // Dispatch table indexed by (dtype, page_size).
-  // dtype index: {Half->0, BFloat16->1}
-  // page_size index: {16->0, 32->1, 64->2, 128->3}
-
-#define PAGE_ENTRIES(ELEM) \
-  { LAUNCH_FN_ENTRY(ELEM, 16), LAUNCH_FN_ENTRY(ELEM, 32), LAUNCH_FN_ENTRY(ELEM, 64), LAUNCH_FN_ENTRY(ELEM, 128) }
-
-  static const launch_fn_t table[2][4] = {
-      PAGE_ENTRIES(half),
-      PAGE_ENTRIES(bf16),
-  };
-
-#undef PAGE_ENTRIES
-
-  int dtype_idx = -1;
-  switch (dtype) {
-    case at::ScalarType::Half:
-      dtype_idx = 0;
-      break;
-    case at::ScalarType::BFloat16:
-      dtype_idx = 1;
-      break;
-    default:
-      return nullptr;
-  }
-
-  int ps_idx = -1;
-  switch (page_size) {
-    case 16:
-      ps_idx = 0;
-      break;
-    case 32:
-      ps_idx = 1;
-      break;
-    case 64:
-      ps_idx = 2;
-      break;
-    case 128:
-      ps_idx = 3;
-      break;
-    default:
-      return nullptr;
-  }
-
-  return table[dtype_idx][ps_idx];
-}
-
-#undef LAUNCH_FN_ENTRY
-
+#define DISPATCH_MLA_DTYPE()                                              \
+  do {                                                                    \
+    switch (in_dtype) {                                                   \
+      case at::ScalarType::Half:                                          \
+        DISPATCH_MLA_PAGE_SIZE(half);                                     \
+        break;                                                            \
+      case at::ScalarType::BFloat16:                                      \
+        DISPATCH_MLA_PAGE_SIZE(bf16);                                     \
+        break;                                                            \
+      default:                                                            \
+        TORCH_CHECK(false, "Unsupported input data type for MLA decode"); \
+    }                                                                     \
+  } while (0)
 }  // namespace
 
 /// @brief Dispatch kernel implementation for MLA decode.
@@ -134,8 +107,7 @@ void cutlass_mla_decode(
   int page_size = kv_c_and_k_pe_cache.size(1);
 
   c10::DeviceGuard guard(q_nope.device());
-  auto stream = at::xpu::getCurrentXPUStream(q_nope.device().index());
-  sycl::queue& queue = stream.queue();
+
   auto in_dtype = q_nope.scalar_type();
 
   TORCH_CHECK(num_kv_splits <= 1, "Manual KV splits are not supported yet.");
@@ -148,10 +120,11 @@ void cutlass_mla_decode(
       page_size,
       ". Supported: 16, 32, 64, 128");
 
-  auto fn = get_launch_fn(in_dtype, page_size);
-  TORCH_CHECK(fn != nullptr, "No MLA decode kernel for dtype=", in_dtype, " page_size=", page_size);
-  fn(out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits, queue);
+  DISPATCH_MLA_DTYPE();
 }
+
+#undef DISPATCH_MLA_PAGE_SIZE
+#undef DISPATCH_MLA_DTYPE
 
 int64_t
 cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches, int64_t sm_count, int64_t num_kv_splits) {

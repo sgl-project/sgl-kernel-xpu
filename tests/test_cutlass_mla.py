@@ -82,7 +82,7 @@ def test_cutlass_mla_decode(
     h_q = num_heads
     dv = 512
 
-    q_nope_dim = 512
+    q_nope_dim = 128
     q_pe_dim = 64
     scale = (q_nope_dim + q_pe_dim) ** (-0.5)
     if varlen:

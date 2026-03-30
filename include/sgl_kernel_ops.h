@@ -140,6 +140,17 @@ void sgl_per_token_group_quant_8bit(
     double fp8_min,
     double fp8_max,
     bool scale_ue8m0);
+void sgl_per_token_group_quant_8bit_v2(
+    at::Tensor input,
+    at::Tensor output_q,
+    at::Tensor output_s,
+    int64_t group_size,
+    double eps,
+    double min_8bit,
+    double max_8bit,
+    bool scale_ue8m0,
+    bool fuse_silu_and_mul,
+    const std::optional<torch::Tensor>& masked_m);
 void fused_qk_norm_rope(
     torch::Tensor& qkv,
     int64_t num_heads_q,

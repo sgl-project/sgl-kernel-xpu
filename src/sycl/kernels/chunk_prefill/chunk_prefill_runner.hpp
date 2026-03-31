@@ -39,6 +39,8 @@ struct Flash_fwd_params {
 
   // The number of heads.
   int h, h_k;
+  bool use_sink = false;
+  bool use_causal_mask = false;
 
   // The O matrix (output).
   void* __restrict__ o_ptr;
@@ -607,8 +609,8 @@ std::vector<at::Tensor> mha_fwd(
 
   // Set the different scale values.
   params.scale_softmax = softmax_scale;
-  bool use_sink = sinks_.has_value();
-  params.sink_softmax = use_sink ? sinks_.value().data_ptr() : nullptr;
+  params.use_sink = sinks_.has_value();
+  params.sink_softmax = params.use_sink ? sinks_.value().data_ptr() : nullptr;
 
   params.softcap = softcap;
 
@@ -705,7 +707,7 @@ std::vector<at::Tensor> mha_fwd(
   constexpr int PipelineStages = 2;
   switch (params.d) {
     case 64:
-      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
         if (params.is_causal) {
           ChunkPrefillConfig<
               cute::Shape<_128, _64, _64>,
@@ -733,7 +735,7 @@ std::vector<at::Tensor> mha_fwd(
       })
       break;
     case 96:
-      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
         if (params.is_causal) {
           ChunkPrefillConfig<
               cute::Shape<_128, _64, _32>,
@@ -762,7 +764,7 @@ std::vector<at::Tensor> mha_fwd(
       })
       break;
     case 128:
-      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
         if (params.is_causal) {
           ChunkPrefillConfig<
               cute::Shape<_128, _64, _64>,
@@ -790,7 +792,7 @@ std::vector<at::Tensor> mha_fwd(
       })
       break;
     case 192:
-      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
         if (params.is_causal) {
           ChunkPrefillConfig<
               cute::Shape<_256, _64, _64>,
@@ -818,7 +820,7 @@ std::vector<at::Tensor> mha_fwd(
       })
       break;
     case 256:
-      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
         if (params.is_causal) {
           ChunkPrefillConfig<
               cute::Shape<_256, _64, _64>,

@@ -44,12 +44,10 @@ void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Argume
   using TileShapeOutput = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@HEAD_DIM@>>;
   using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<@PAGE_SIZE@ / 16>, cute::_1>>;
 
-  AT_DISPATCH_BOOL_NO_RETURN(params.use_causal_mask, Causal, {
     AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-        DecodeConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(params);
+        DecodeConfig<false, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(params);
       });
-    });
   });
 }
 

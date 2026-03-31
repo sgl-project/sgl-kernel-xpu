@@ -78,7 +78,11 @@ struct Arguments {
   // The number of heads.
   int h, h_k;
   int q_group_size = 1;
-  bool use_split_kv_decode = false;
+  int num_kv_splits = -1;  // For split-KV version
+  bool use_split_kv = false;
+  bool use_sink = false;
+  bool is_causal = false;
+  bool is_local = false;
 
   // The O matrix (output).
   void* __restrict__ o_ptr;
@@ -174,16 +178,10 @@ struct Arguments {
 
   // Pointer to the RNG seed (idx 0) and offset (idx 1).
   uint64_t* rng_state;
-  int num_kv_splits;  // For split-KV version
 
   bool is_bf16;
   bool is_fp32;
   bool is_e4m3;
-  bool is_causal;
-  bool is_local;
-
-  bool use_sink = false;
-  bool use_causal_mask = false;
 
   bool is_rotary_interleaved;
 
@@ -234,20 +232,20 @@ struct DecodeRunner {
   auto initialize_varlen(const Arguments& params, const ProblemShape& problem_size) {
     ProblemShape problem_size_for_init = problem_size;
     get<0>(problem_size_for_init) = 1;  // concentrated batch
-    get<1>(problem_size_for_init) = params.use_split_kv_decode ? params.h : params.h_k;
-    get<3>(problem_size_for_init) = params.use_split_kv_decode ? params.total_q : params.total_q * params.q_group_size;
+    get<1>(problem_size_for_init) = params.use_split_kv ? params.h : params.h_k;
+    get<3>(problem_size_for_init) = params.use_split_kv ? params.total_q : params.total_q * params.q_group_size;
     get<4>(problem_size_for_init) = params.total_knew;
     get<5>(problem_size_for_init) = params.total_k;
 
     ProblemShapeType problem_size_for_launch{
         .batch = get<0>(problem_size),
-        .num_heads_q = params.use_split_kv_decode ? get<1>(problem_size) : get<2>(problem_size),
+        .num_heads_q = params.use_split_kv ? get<1>(problem_size) : get<2>(problem_size),
         .num_heads_kv = get<2>(problem_size),
         .seq_len_qo =
-            {params.use_split_kv_decode ? params.seqlen_q * params.q_group_size : params.seqlen_q,
-             params.use_split_kv_decode ? params.total_q : params.total_q * params.q_group_size,
+            {params.use_split_kv ? params.seqlen_q * params.q_group_size : params.seqlen_q,
+             params.use_split_kv ? params.total_q : params.total_q * params.q_group_size,
              nullptr,
-             params.use_split_kv_decode ? 1 : params.q_group_size},
+             params.use_split_kv ? 1 : params.q_group_size},
 
         .seq_len_kv = {params.seqlen_knew, params.total_knew},
         .seq_len_kv_cache = {params.seqlen_k, params.total_k},
@@ -325,17 +323,18 @@ struct DecodeRunner {
 
     // Define device-global scratch memory
     size_t workspace_size = FMHADecodeKernel::get_workspace_size(arguments);
-    cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+    torch::Tensor workspace = torch::empty({static_cast<int64_t>(workspace_size)}, torch::device(torch::kXPU).dtype(torch::kByte));
+    uint8_t* workspace_ptr = static_cast<uint8_t*>(workspace.data_ptr());
 
     if (!FMHADecodeKernel::can_implement(arguments)) {
       return cutlass::Status::kErrorInvalidProblem;
     }
 
     // Initialize the workspace
-    FMHADecodeKernel::initialize_workspace(arguments, workspace.get());
+    FMHADecodeKernel::initialize_workspace(arguments, workspace_ptr);
 
     // Convert host-side arguments to device-side arguments to be passed to the kernel
-    auto kernel_params = FMHADecodeKernel::to_underlying_arguments(arguments, workspace.get());
+    auto kernel_params = FMHADecodeKernel::to_underlying_arguments(arguments, workspace_ptr);
 
     // Run
     // run(kernel_params);
@@ -472,8 +471,9 @@ struct DecodeKernelLauncher {
     // Define device-global scratch memory
     size_t workspace_size = FMHAKernel::get_workspace_size(arguments);
     size_t reduce_workspace_size = ReductionSplitKernel::get_workspace_size(reduce_arg);
-    cutlass::device_memory::allocation<uint8_t> workspace(workspace_size + reduce_workspace_size);
-
+    torch::Tensor workspace = torch::empty({static_cast<int64_t>(workspace_size + reduce_workspace_size)}, torch::device(torch::kXPU).dtype(torch::kByte));
+    uint8_t* workspace_ptr = static_cast<uint8_t*>(workspace.data_ptr());
+    
     if (!FMHAKernel::can_implement(arguments)) {
       // std::cout << "Invalid Problem Size: " << params.batch_size << 'x'
       //           << params.num_heads_q << 'x' << params.max_queries << 'x'
@@ -483,14 +483,14 @@ struct DecodeKernelLauncher {
     }
 
     // Initialize the workspace
-    FMHAKernel::initialize_workspace(arguments, workspace.get());
+    FMHAKernel::initialize_workspace(arguments, workspace_ptr);
 
     // Convert host-side arguments to device-side arguments to be passed to the
     // kernel
-    auto kernel_params = FMHAKernel::to_underlying_arguments(arguments, workspace.get());
-    auto reduce_params = ReductionSplitKernel::to_underlying_arguments(reduce_arg, workspace.get() + workspace_size);
+    auto kernel_params = FMHAKernel::to_underlying_arguments(arguments, workspace_ptr);
+    auto reduce_params = ReductionSplitKernel::to_underlying_arguments(reduce_arg, workspace_ptr + workspace_size);
 
-    ReductionSplitKernel::initialize_workspace(reduce_arg, workspace.get() + workspace_size);
+    ReductionSplitKernel::initialize_workspace(reduce_arg, workspace_ptr + workspace_size);
     run(kernel_params, reduce_params, params.num_kv_splits > 1);
 
     return cutlass::Status::kSuccess;
@@ -715,7 +715,7 @@ struct SplitDecodeConfig {
   }
 
   static void run(const Arguments& params) {
-    return run<true, true, true, cutlass::fmha::kernel::DecodeTileScheduler>(params);
+    return run<true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
   }
 };
 

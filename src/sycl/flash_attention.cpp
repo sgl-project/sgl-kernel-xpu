@@ -45,7 +45,7 @@ namespace decode {
 
 #define DISPATCH_DECODE_KERNEL(QG, HD, PS)         \
   do {                                             \
-    if (params.use_split_kv_decode) {              \
+    if (params.use_split_kv) {                     \
       FmhaSplitDecodeRunner<QG, HD, PS>{}(params); \
     } else {                                       \
       FmhaDecodeRunner<QG, HD, PS>{}(params);      \
@@ -225,11 +225,11 @@ std::vector<at::Tensor> mha_fwd(
   at::Tensor temp_out;    // [batch, num_kv_splits, num_head_q, seq_q, head_size]
   at::Tensor exp_sums;    // [batch, num_head_q, seq_q, num_kv_splits]
   at::Tensor max_logits;  // [batch, num_head_q, seq_q, num_kv_splits]
-  int num_kv_splits = 1;
+  int num_kv_splits = -1;
   out = torch::empty({total_q, num_heads, head_size_v}, opts);
   Arguments params;
-  params.use_split_kv_decode = true;
-  if (params.use_split_kv_decode) {
+  params.use_split_kv = true;
+  if (params.use_split_kv) {
     auto get_num_splits = [](int batch_size, int num_heads_kv, int max_seqlen_k, int block_size) {
       auto stream = at::xpu::getCurrentXPUStream();
       auto queue = stream.queue();
@@ -308,9 +308,8 @@ std::vector<at::Tensor> mha_fwd(
 
   // Set the different scale values.
   params.softmax_scale = softmax_scale;
-  bool use_sink = sinks_.has_value();
-  params.softmax_sink_ptr = use_sink ? sinks_.value().data_ptr() : nullptr;
-  params.use_sink = use_sink;
+  params.use_sink = sinks_.has_value();
+  params.softmax_sink_ptr = params.use_sink ? sinks_.value().data_ptr() : nullptr;
 
   params.softcap = softcap;
 
@@ -319,8 +318,8 @@ std::vector<at::Tensor> mha_fwd(
 
   // Causal is the special case where window_size_right == 0 and window_size_left < 0.
   // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
-  params.is_causal = window_size_left < 0 && window_size_right == 0;
-  params.use_causal_mask = params.is_causal;
+  params.is_causal = false;  // Decode don't need causal mask since we only compute attention for the current token, but
+                             // this kernel can also be used for local attention in the future
   params.is_local = (window_size_left >= 0 || window_size_right >= 0) && !params.is_causal;
 
   // TODO: check this

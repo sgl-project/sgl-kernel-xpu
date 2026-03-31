@@ -59,13 +59,13 @@ def flash_attn_baseline(
 causal = [True, False]
 local = [True, False]
 use_sinks = [True, False]
-batch_size = [1, 2, 4, 16, 32]
+batch_size = [1, 8, 16]
 q_seq_length_range = [1, 128]
-head_dim = [64, 128, 256]
-num_heads_q = [16]
-num_heads_kv = [2, 4, 8]
-kv_seq_length_range = [4096, 16384]
-page_size_range = [0, 64, 128]
+head_dim = [64, 128]
+num_heads_q = [32]
+num_heads_kv = [4, 8]
+kv_seq_length_range = [1024, 4096]
+page_size_range = [0, 128]
 configs = list(
     filter(
         lambda cfg: not (cfg[0] and cfg[1])

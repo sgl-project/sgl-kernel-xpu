@@ -102,6 +102,8 @@ class XeFMHAFwdKernel {
   using ElementO = typename CollectiveEpilogue::TensorO::element_type;
   using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
 
+  using ElementLSE = void;
+
   // Kernel level shared memory storage
   using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
   using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
@@ -135,6 +137,7 @@ class XeFMHAFwdKernel {
     MainloopArguments mainloop{};
     EpilogueArguments epilogue{};
     KernelHardwareInfo hw_info{};
+    int num_kv_splits = -1;
   };
 
   // Kernel entry point API
@@ -223,7 +226,7 @@ class XeFMHAFwdKernel {
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
-      auto [blk_q, blk_v, head_q, idx_b] = tile_scheduler.get_block_coord();  // (Q,V,h,b)
+      auto [blk_q, blk_v, head_q, idx_b, unused] = tile_scheduler.get_block_coord();  // (Q,V,h,b)
       auto blk_qv = make_coord(blk_q, blk_v);
       int head = head_q / head_group_q;
 
@@ -822,7 +825,6 @@ class XeFMHAFwdSplitKVKernel {
   static constexpr int SharedStorageSize = is_empty_v<SharedStorage> ? size_t(0) : sizeof(SharedStorage);
 
   static constexpr int max_num_kv_splits = SGPerWG::value * intel::sg_size;
-  static constexpr int dpas_max_repeat_count = 8;
   static constexpr bool Sink = CollectiveEpilogue::Sink;
   using ElementSink = typename CollectiveEpilogue::ElementSink;
 

@@ -323,7 +323,8 @@ struct DecodeRunner {
 
     // Define device-global scratch memory
     size_t workspace_size = FMHADecodeKernel::get_workspace_size(arguments);
-    torch::Tensor workspace = torch::empty({static_cast<int64_t>(workspace_size)}, torch::device(torch::kXPU).dtype(torch::kByte));
+    torch::Tensor workspace =
+        torch::empty({static_cast<int64_t>(workspace_size)}, torch::device(torch::kXPU).dtype(torch::kByte));
     uint8_t* workspace_ptr = static_cast<uint8_t*>(workspace.data_ptr());
 
     if (!FMHADecodeKernel::can_implement(arguments)) {
@@ -471,9 +472,10 @@ struct DecodeKernelLauncher {
     // Define device-global scratch memory
     size_t workspace_size = FMHAKernel::get_workspace_size(arguments);
     size_t reduce_workspace_size = ReductionSplitKernel::get_workspace_size(reduce_arg);
-    torch::Tensor workspace = torch::empty({static_cast<int64_t>(workspace_size + reduce_workspace_size)}, torch::device(torch::kXPU).dtype(torch::kByte));
+    torch::Tensor workspace = torch::empty(
+        {static_cast<int64_t>(workspace_size + reduce_workspace_size)}, torch::device(torch::kXPU).dtype(torch::kByte));
     uint8_t* workspace_ptr = static_cast<uint8_t*>(workspace.data_ptr());
-    
+
     if (!FMHAKernel::can_implement(arguments)) {
       // std::cout << "Invalid Problem Size: " << params.batch_size << 'x'
       //           << params.num_heads_q << 'x' << params.max_queries << 'x'

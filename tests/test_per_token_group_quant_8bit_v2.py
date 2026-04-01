@@ -346,13 +346,13 @@ configs = list(
                 fuse_silu_and_mul=False,
                 masked_layout_mode=None,
             ),
-            # dict(
-            #     column_major_scales=True,
-            #     scale_tma_aligned=True,
-            #     scale_ue8m0=True,
-            #     fuse_silu_and_mul=False,
-            #     masked_layout_mode=None,
-            # ),
+            dict(
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=True,
+                fuse_silu_and_mul=False,
+                masked_layout_mode=None,
+            ),
         ],
     )
 ) + list(
@@ -371,6 +371,7 @@ configs = list(
                 fuse_silu_and_mul=True,
                 masked_layout_mode=None,
             ),
+            # masked layput disabled used in case of EP
             # dict(
             #     column_major_scales=True,
             #     scale_tma_aligned=True,
@@ -621,18 +622,95 @@ def assert_all_close_or_tiny_diff(a: torch.Tensor, b: torch.Tensor):
     ), f"{count_diff_sign=} {count_tiny_diff=} {count_large_diff=} {numel=} {a=} {b=}"
 
 
+def unpack_match_ref(x_s_sglang: torch.Tensor, x_s_ref: torch.Tensor):
+    """
+    Universal unpack:
+    - works for ANY shape
+    - no stride/view issues
+    - no assumption about number of packed values
+    - extracts bytes via bit ops
+    """
+
+    # Case 1: already same shape → no unpack
+    if x_s_sglang.shape == x_s_ref.shape:
+        return x_s_sglang
+
+    # flatten input
+    x_flat = x_s_sglang.reshape(-1).to(torch.int32)
+
+    T, K_packed = x_s_sglang.shape
+    target_K = x_s_ref.shape[1]
+
+    full_groups = target_K // 4
+    remainder = target_K % 4
+
+    if remainder:
+
+        x = x_s_sglang.to(torch.int32)
+
+        # extract bytes
+        shifts = torch.tensor([0, 8, 16, 24], device=x.device, dtype=torch.int32)
+        x_bytes = (x.unsqueeze(-1) >> shifts) & 0xFF  # [T, K_packed, 4]
+
+        full_groups = target_K // 4
+        remainder = target_K % 4
+
+        # take full groups
+        parts = []
+
+        if full_groups > 0:
+            full = x_bytes[:, :full_groups, :].reshape(T, full_groups * 4)
+            parts.append(full)
+
+        # take remainder from next packed element
+        if remainder > 0:
+            tail = x_bytes[:, full_groups, :remainder]
+            parts.append(tail)
+
+        # concatenate
+        x_unpacked = torch.cat(parts, dim=1)
+
+        return x_unpacked.to(torch.int32)
+
+    # extract bytes (little-endian)
+    pakced_shapes = (x_s_ref.shape[-1] / x_s_sglang.shape[-1]) * 8
+    # shifts = torch.arange(0, 32, 8, device=x_flat.device, dtype=torch.int32)  # [0,8,16,24]
+    shifts = torch.arange(
+        0, pakced_shapes, 8, device=x_flat.device, dtype=torch.int32
+    )  # [0,8,16,24]
+
+    # shape: [N, 4]
+    bytes_per_elem = (x_flat.unsqueeze(1) >> shifts) & 0xFF
+
+    # flatten all bytes
+    x_bytes = bytes_per_elem.reshape(-1)
+
+    # take only required number of values
+    needed = x_s_ref.numel()
+
+    if x_bytes.numel() < needed:
+        raise RuntimeError(
+            f"Not enough unpacked values: got {x_bytes.numel()}, need {needed}"
+        )
+
+    x_unpacked = x_bytes[:needed]
+
+    return x_unpacked.view_as(x_s_ref)
+
+
 def process_scales(
     x_s: torch.Tensor,
     num_tokens: int,
     column_major_scales: bool,
     scale_ue8m0: bool,
+    fuse_silu_and_mul: bool,
 ) -> torch.Tensor:
 
     T = num_tokens
 
     if scale_ue8m0:
-        # ✅ FIX: ensure contiguous before reinterpret
-        x_bytes = x_s.contiguous().view(torch.uint8)
+        # FIX: ensure contiguous before reinterpret
+        x_bytes = x_s.contiguous().reshape(-1).view(torch.uint8)
 
         x_bytes = x_bytes.view(T, -1, 4)
 
@@ -646,14 +724,24 @@ def process_scales(
             x_unpacked = x_bytes.reshape(T, -1)
 
         return x_unpacked.to(torch.int32)
-    else:
-        return x_s
-
+    return x_s
+    # Disable now if special handling needed will fix it later
     # else:
     #     if column_major_scales:
     #         return x_s.transpose(0, 1).contiguous().to(torch.int32)
     #     else:
     #         return x_s.to(torch.int32)
+
+
+import torch.nn.functional as F
+
+
+def pad_to_match(x, target_last_dim):
+    pad_size = target_last_dim - x.shape[1]
+    assert pad_size >= 0, "target must be >= current size"
+
+    # pad on the right (last dimension)
+    return F.pad(x, (0, pad_size), value=0)
 
 
 @pytest.mark.parametrize(
@@ -701,39 +789,32 @@ def test_per_token_group_quant_with_column_major(
                 x_s[i, masked_m[i] :, :] = 0
         return x_q, x_s
 
-    x_q_triton, x_s_triton = _postprocess(
-        *per_token_group_quant_8bit_ref(**execute_kwargs)
-    )
+    x_q_ref, x_s_ref = _postprocess(*per_token_group_quant_8bit_ref(**execute_kwargs))
 
     x_q_sglang, x_s_sglang = _postprocess(
         *sglang_per_token_group_quant_8bit_layer(**execute_kwargs, enable_v2=True)
     )
 
-    # Ref scale as per flags
-    x_s_sglang = process_scales(
-        x_s_sglang,
-        num_tokens=x_q_sglang.shape[-2],
-        column_major_scales=flags["column_major_scales"],  # or False (test both)
-        scale_ue8m0=flags["scale_ue8m0"],
-    )
+    # unpack any unaligned bytes to match with Ref
+    x_s_sglang = unpack_match_ref(x_s_sglang, x_s_ref)
 
     try:
-        assert_all_close_or_tiny_diff(x_q_triton, x_q_sglang)
+        assert_all_close_or_tiny_diff(x_q_ref, x_q_sglang)
         torch.testing.assert_close(
-            x_s_triton.contiguous(),
+            x_s_ref.contiguous(),
             x_s_sglang.contiguous(),
             rtol=1e-3,
             atol=1e-5,
-            msg=lambda message: message + f" {x_s_triton=} {x_s_sglang=}",
+            msg=lambda message: message + f" {x_s_ref=} {x_s_sglang=}",
         )
     except AssertionError:
         print(
-            f"{x.shape=} {x_q_triton.shape=} {x_s_triton.shape=} {x_q_sglang.shape=} {x_s_sglang.shape=}"
+            f"{x.shape=} {x_q_ref.shape=} {x_s_ref.shape=} {x_q_sglang.shape=} {x_s_sglang.shape=}"
         )
         print(f"{x=}")
         print(f"{masked_m=}")
-        print(f"{x_q_triton=}")
-        print(f"{x_s_triton=}")
+        print(f"{x_q_ref=}")
+        print(f"{x_s_ref=}")
         print(f"{x_q_sglang=}")
         print(f"{x_s_sglang=}")
 

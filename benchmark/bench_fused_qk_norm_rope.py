@@ -342,7 +342,9 @@ def benchmark(
     if is_fp8:
         # FP8 tensors: create in float32, clamp to representable range, convert
         qkv = (
-            torch.randn(num_tokens, num_heads * head_dim, device=device, dtype=torch.float32)
+            torch.randn(
+                num_tokens, num_heads * head_dim, device=device, dtype=torch.float32
+            )
             .clamp(-448.0, 448.0)
             .to(torch_dtype)
         )
@@ -479,7 +481,9 @@ if __name__ == "__main__":
     # Ensure results dir exists and write per-chunk CSV
     os.makedirs("benchmark/results", exist_ok=True)
     df = pd.DataFrame(all_results)
-    chunk_label = f"chunk_{os.environ.get('CHUNK_IDX','0')}_of_{os.environ.get('NUM_CHUNKS','1')}"
+    chunk_label = (
+        f"chunk_{os.environ.get('CHUNK_IDX','0')}_of_{os.environ.get('NUM_CHUNKS','1')}"
+    )
     out_csv = os.path.join("benchmark/results", f"results_{chunk_label}.csv")
     df.to_csv(out_csv, index=False)
     print(f"Wrote results CSV: {out_csv}")
@@ -542,5 +546,7 @@ if __name__ == "__main__":
             mask = pivot.index.get_level_values("dtype") == dt
             sp = pivot.loc[mask, "speedup"]
             if not sp.empty:
-                print(f"  {dt:>12s}: avg={sp.mean():.2f}x  max={sp.max():.2f}x  min={sp.min():.2f}x")
+                print(
+                    f"  {dt:>12s}: avg={sp.mean():.2f}x  max={sp.max():.2f}x  min={sp.min():.2f}x"
+                )
     print(f"Wrote results CSV: {out_csv}")

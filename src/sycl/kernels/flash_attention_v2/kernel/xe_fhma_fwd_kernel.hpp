@@ -57,7 +57,15 @@ struct FMHAProblemShape {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-template <class ProblemShape_, class CollectiveMainloop_, class CollectiveEpilogue_, class TileScheduler_, class VarLenQOLayoutStep_>
+template <
+    class ProblemShape_,
+    class CollectiveMainloop_,
+    class CollectiveEpilogue_,
+    class TileScheduler_,
+    class VarLenQLayoutStep_,
+    class VarLenKLayoutStep_,
+    class VarLenVLayoutStep_,
+    class VarLenOLayoutStep_ = VarLenQLayoutStep_>
 class XeFMHAFwdKernel {
  public:
   //
@@ -269,14 +277,12 @@ class XeFMHAFwdKernel {
       auto dcV_cache = const_cast<ElementV*>(p.V_cache + offset_v_cache);
       auto dcO = const_cast<ElementO*>(p.O + offset_o);
       // NHD layout for GQA
-      auto layout_q = is_var_len ? make_ordered_layout(shape_Q, VarLenQOLayoutStep_{})
-                 : make_layout(shape_Q, p.dQ);
-      auto layout_k = is_var_len ? make_ordered_layout(shape_K, Step<_2, _0, _1, _3>{}) : make_layout(shape_K, p.dK);
-      auto layout_v = is_var_len ? make_ordered_layout(shape_V, Step<_0, _2, _1, _3>{}) : make_layout(shape_V, p.dV);
+      auto layout_q = is_var_len ? make_ordered_layout(shape_Q, VarLenQLayoutStep_{}) : make_layout(shape_Q, p.dQ);
+      auto layout_k = is_var_len ? make_ordered_layout(shape_K, VarLenKLayoutStep_{}) : make_layout(shape_K, p.dK);
+      auto layout_v = is_var_len ? make_ordered_layout(shape_V, VarLenVLayoutStep_{}) : make_layout(shape_V, p.dV);
 
       // NHD layout for GQA
-      auto layout_o = is_var_len ? make_ordered_layout(shape_O, VarLenQOLayoutStep_{})
-                 : make_layout(shape_O, p.dO);
+      auto layout_o = is_var_len ? make_ordered_layout(shape_O, VarLenOLayoutStep_{}) : make_layout(shape_O, p.dO);
 
       Tensor Q = make_tensor(make_gmem_ptr(dcQ), layout_q);
       Tensor K_cache = make_tensor(make_gmem_ptr(dcK_cache), layout_k);

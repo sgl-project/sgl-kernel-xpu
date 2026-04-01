@@ -423,8 +423,16 @@ struct FMHAConfig {
     using FMHADecodeKernel = conditional_t<
         is_same_v<Scheduler, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>,
         cutlass::fmha::kernel::
-          XeFMHAFwdDynamicSplitKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>,
-        cutlass::fmha::kernel::XeFMHAFwdKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler, Step<_1, _0, _2, _3>>>;
+            XeFMHAFwdDynamicSplitKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>,
+        cutlass::fmha::kernel::XeFMHAFwdKernel<
+            ProblemShapeType,
+            CollectiveMainloop,
+            CollectiveEpilogue,
+            Scheduler,
+            Step<_1, _0, _2, _3>,
+            Step<_2, _0, _1, _3>,
+            Step<_0, _2, _1, _3>,
+            Step<_1, _0, _2, _3>>>;
 
     DecodeRunner<FMHADecodeKernel, isVarLen> kernel;
 

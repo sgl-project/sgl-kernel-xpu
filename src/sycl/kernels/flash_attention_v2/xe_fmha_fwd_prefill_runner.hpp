@@ -366,13 +366,6 @@ struct FMHAConfig {
 
   template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
   static int run(const Arguments& params) {
-    // std::cout << "SGTileQ: " << get<0>(TileShapeQK{})  << " " << get<0>(shape(SubgroupLayoutQK{})) << " " << SGTileQ << " " << cute::gcd(SGTileQ, 8) << std::endl;
-    // 128: 128 8 16 8
-    // 16: 16 8 2 2
-    // 8: 8 8 1 1
-    // 4: 4 8 1 1
-    // auto mma = MMAOperation{}; // cute::XE_DPAS_TT<1, float, cutlass::bfloat16_t>
-    // std::cout << "mma: " << std::to_string(mma) << std::endl;
     // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
     // information is used by the underlying kernel.
     cutlass::KernelHardwareInfo hw_info;
@@ -437,8 +430,16 @@ struct FMHAConfig {
     using FMHAPrefillKernel = conditional_t<
         is_same_v<Scheduler, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>,
         cutlass::fmha::kernel::
-          XeFMHAFwdDynamicSplitKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>,
-        cutlass::fmha::kernel::XeFMHAFwdKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler, Step<_2, _0, _1, _3>>>;
+            XeFMHAFwdDynamicSplitKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>,
+        cutlass::fmha::kernel::XeFMHAFwdKernel<
+            ProblemShapeType,
+            CollectiveMainloop,
+            CollectiveEpilogue,
+            Scheduler,
+            Step<_2, _0, _1, _3>,
+            Step<_2, _0, _1, _3>,
+            Step<_0, _2, _1, _3>,
+            Step<_2, _0, _1, _3>>>;
 
     PrefillRunner<FMHAPrefillKernel, isVarLen> kernel;
 
@@ -716,7 +717,7 @@ std::vector<at::Tensor> mha_fwd(
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
         AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
           FMHAConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(params);
-        });      
+        });
       });
     });
   };

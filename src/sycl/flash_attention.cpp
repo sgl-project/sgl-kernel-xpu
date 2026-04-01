@@ -440,6 +440,8 @@ std::vector<at::Tensor> mha_fwd(
     int num_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin) {
+  int const num_heads = q.size(-2);
+  int const num_heads_k = k.size(-2);
   if (max_seqlen_q == 1 && page_table.has_value()) {
     return decode::mha_fwd(
         q,
@@ -470,10 +472,42 @@ std::vector<at::Tensor> mha_fwd(
         num_splits,
         pack_gqa_,
         sm_margin);
+  } else if (
+      !page_table.has_value() || is_causal || window_size_left >= 0 || window_size_right >= 0 || sinks_.has_value() ||
+      num_heads != num_heads_k || max_seqlen_q == 2048 || max_seqlen_q == 4096 || max_seqlen_q == 8192) {
+    // Use chunked prefill for GQA/MQA
+    // Now we detect chunked prefill according to max_seqlen_q
+    return chunkprefill::mha_fwd(
+        q,
+        k,
+        v,
+        q_v_,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        page_table,
+        kv_batch_idx_,
+        leftpad_k_,
+        rotary_cos_,
+        rotary_sin_,
+        seqlens_rotary_,
+        q_descale_,
+        k_descale_,
+        v_descale_,
+        softmax_scale_,
+        sinks_,
+        is_causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        is_rotary_interleaved,
+        scheduler_metadata_,
+        num_splits,
+        pack_gqa_,
+        sm_margin);
   } else {
-    // TODO: For now, this pass always enters prefill kernel.
-    // We should identify when to go to pure prefill or chunked prefill kernel.
-    // return chunkprefill::mha_fwd(
+    // TODO: support the cases for non-kv cache, causal, sliding window and sink.
     return prefill::mha_fwd(
         q,
         k,

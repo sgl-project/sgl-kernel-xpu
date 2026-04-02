@@ -69,6 +69,7 @@ jobs:
               python3 bench_fused_qk_norm_rope.py 2>&1 | tee fused_qk_norm_rope.py.log \
               python3 bench_per_token_group_quant_8bit.py 2>&1 | tee per_token_group_quant_8bit.py.log \
               python3 bench_per_token_group_quant_mxfp4.py 2>&1 | tee per_token_group_quant_mxfp4.py.log \
+              python3 bench_per_token_group_quant_8bit_v2.py 2>&1 | tee bench_per_token_group_quant_8bit_v2.py.log \
             "
 
       - name: Copy logs from container

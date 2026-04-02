@@ -1,20 +1,14 @@
 import itertools
-from typing import Tuple
+from typing import Optional
 
-import itertools
-import sys
-from typing import List, Optional, Tuple
-
-
-import pandas as pd
+import sgl_kernel
 import torch
 import triton
-import triton.language as tl
-import sgl_kernel
 
 fp8_type_ = torch.float8_e4m3fn
 fp8_max = torch.finfo(fp8_type_).max
 fp8_min = -fp8_max
+
 
 def prepare_token_group_quant_test_data(num_tokens, hidden_dim):
     device = torch.device("xpu")
@@ -25,7 +19,7 @@ def prepare_token_group_quant_test_data(num_tokens, hidden_dim):
     gen_xpu.manual_seed(seed)
 
     effective_hidden_dim = hidden_dim * 2
-    
+
     x = torch.randn(
         num_tokens,
         effective_hidden_dim,
@@ -35,13 +29,16 @@ def prepare_token_group_quant_test_data(num_tokens, hidden_dim):
     )
     return x
 
+
 # COPIED FROM DeepGEMM
 def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
+
 # COPIED FROM DeepGEMM
 def ceil_align(x: int, y: int) -> int:
     return ceil_div(x, y) * y
+
 
 def create_fp8_output_scale(
     x_shape,
@@ -85,6 +82,7 @@ def create_fp8_output_scale(
             dtype=torch.float32,
         )
 
+
 def sglang_per_token_group_quant_8bit_layer(
     x: torch.Tensor,
     group_size: int,
@@ -119,26 +117,27 @@ def sglang_per_token_group_quant_8bit_layer(
     )
 
     torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit_v2.default(
-            x,
-            x_q,
-            x_s,
-            group_size,
-            eps,
-            fp8_min,
-            fp8_max,
-            scale_ue8m0,
-            fuse_silu_and_mul,
-            masked_m,
+        x,
+        x_q,
+        x_s,
+        group_size,
+        eps,
+        fp8_min,
+        fp8_max,
+        scale_ue8m0,
+        fuse_silu_and_mul,
+        masked_m,
     )
-    
+
     return x_q, x_s
+
 
 def calculate_diff(batch_size, seq_len, group_size, dst_dtype):
     device = torch.device("xpu")
     hidden_dim = 7168
 
     x = prepare_token_group_quant_test_data(batch_size * seq_len, hidden_dim)
-   
+
     x_q_ref, x_s_ref = sglang_per_token_group_quant_8bit_layer(
         x.clone(), group_size, dst_dtype, 1e-10, True, True, True, False, None, True
     )
@@ -169,6 +168,7 @@ def calculate_diff(batch_size, seq_len, group_size, dst_dtype):
         print("❌ Implementations differ")
         raise
 
+
 batch_size_range = [16, 32, 64]
 seq_len_range = [128, 256, 512, 1024]
 group_size_range = [128]  # For DeepSeek V3/R1
@@ -179,6 +179,7 @@ configs = list(
         batch_size_range, seq_len_range, group_size_range, dst_dtype_range
     )
 )
+
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -202,9 +203,13 @@ def benchmark(batch_size, seq_len, group_size, dst_dtype, provider):
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "sglang_unfused":
-        fn = lambda: sglang_per_token_group_quant_8bit_layer(x, group_size, dst_dtype, 1e-10, True, True, True, False, None, True)
+        fn = lambda: sglang_per_token_group_quant_8bit_layer(
+            x, group_size, dst_dtype, 1e-10, True, True, True, False, None, True
+        )
     elif provider == "sglang_fused":
-        fn = lambda: sglang_per_token_group_quant_8bit_layer(x, group_size, dst_dtype, 1e-10, True, True, True, True, None, True)
+        fn = lambda: sglang_per_token_group_quant_8bit_layer(
+            x, group_size, dst_dtype, 1e-10, True, True, True, True, None, True
+        )
 
     ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
 

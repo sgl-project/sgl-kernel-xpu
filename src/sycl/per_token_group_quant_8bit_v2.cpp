@@ -438,6 +438,117 @@ struct NaiveKernel : MainKernel<
   const int num_tokens_per_expert;
 };
 
+template <
+    typename SCHEDULER,
+    int GROUP_SIZE,
+    int THREADS_PER_SUBWARP,
+    typename T,
+    typename DST_DTYPE,
+    bool IS_COLUMN_MAJOR,
+    bool SCALE_UE8M0,
+    bool FUSE_SILU_AND_MUL,
+    typename scale_packed_t>
+struct MaskedKernel : MainKernel<
+                          GROUP_SIZE,
+                          THREADS_PER_SUBWARP,
+                          T,
+                          DST_DTYPE,
+                          IS_COLUMN_MAJOR,
+                          SCALE_UE8M0,
+                          FUSE_SILU_AND_MUL,
+                          scale_packed_t> {
+  MaskedKernel(
+      const T* input,
+      DST_DTYPE* output_q,
+      scale_packed_t* output_s,
+      const int32_t* masked_m,
+      float eps,
+      float min_8bit,
+      float max_8bit,
+      const int subwarps_per_block,
+      const int hidden_dim_num_groups,
+      const int scale_expert_stride,
+      const int scale_hidden_stride,
+      const int num_tokens_per_expert)
+      : MainKernel<
+            GROUP_SIZE,
+            THREADS_PER_SUBWARP,
+            T,
+            DST_DTYPE,
+            IS_COLUMN_MAJOR,
+            SCALE_UE8M0,
+            FUSE_SILU_AND_MUL,
+            scale_packed_t>(
+            input,
+            output_q,
+            output_s,
+            masked_m,
+            eps,
+            min_8bit,
+            max_8bit,
+            subwarps_per_block,
+            hidden_dim_num_groups,
+            scale_expert_stride,
+            scale_hidden_stride,
+            num_tokens_per_expert),  // base initialization
+        subwarps_per_block(subwarps_per_block),
+        hidden_dim_num_groups(hidden_dim_num_groups),
+        scale_expert_stride(scale_expert_stride),
+        scale_hidden_stride(scale_hidden_stride),
+        num_tokens_per_expert(num_tokens_per_expert),
+        masked_m(masked_m) {}
+
+  inline int compute_input_group_start_offset(
+      int expert_idx,
+      int token_idx,
+      int hidden_dim_group_idx,
+      int hidden_size,
+      int num_tokens_per_expert,
+      int group_size) const {
+    return expert_idx * num_tokens_per_expert * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) +
+           token_idx * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) + hidden_dim_group_idx * group_size;
+  }
+
+  [[sycl::reqd_sub_group_size(32)]]
+  void operator()(sycl::nd_item<3> item) const {
+    int threadIdx_x = item.get_local_linear_id();
+    const int64_t subwarp_id = threadIdx_x / THREADS_PER_SUBWARP;
+    const int lane_id = threadIdx_x % THREADS_PER_SUBWARP;
+
+    auto group = item.get_group();
+
+    const int expert_idx = group.get_group_id(0);
+    const int token_idx_start = group.get_group_id(1);
+    const int chunk_id = group.get_group_id(2);
+
+    const int64_t hidden_dim_group_idx = chunk_id * SCHEDULER::SUBWARPS_PER_BLOCK + subwarp_id;
+
+    // only valid tokens are handled
+    const int curr_expert_token_num = masked_m[expert_idx];
+
+    // skip maksed tokens
+    for (int token_idx = token_idx_start; token_idx < curr_expert_token_num;
+         token_idx += SCHEDULER::TOKEN_DIM_BLOCK_NUM_PER_EXPERT) {
+      const int hidden_size = hidden_dim_num_groups * GROUP_SIZE;
+
+      // chunk offset
+      const int64_t input_group_start_offset = compute_input_group_start_offset(
+          expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, GROUP_SIZE);
+
+      // invoke only unmasked token
+      this->compute(
+          expert_idx, token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset, item.get_sub_group());
+    }
+  }
+
+  const int subwarps_per_block;
+  const int hidden_dim_num_groups;
+  const int scale_expert_stride;
+  const int scale_hidden_stride;
+  const int num_tokens_per_expert;
+  const int32_t* masked_m;
+};
+
 struct NaiveScheduler {
   static void compute_exec_config(
       int threads_per_subwarp,
@@ -547,7 +658,7 @@ void per_token_group_quant_8bit_kernel_impl(
     sycl_kernel_submit(global_range, local_range, queue, task);
 
   } else if constexpr (std::is_same_v<SCHEDULER, MaskedLayoutScheduler>) {
-    using Kernel = NaiveKernel<
+    using Kernel = MaskedKernel<
         SCHEDULER,
         GROUP_SIZE,
         THREADS_PER_SUBWARP,
@@ -557,6 +668,33 @@ void per_token_group_quant_8bit_kernel_impl(
         SCALE_UE8M0,
         FUSE_SILU_AND_MUL,
         scale_packed_t>;
+
+    auto stream = at::xpu::getCurrentXPUStream();
+    auto queue = stream.queue();
+
+    unsigned long num_experts = grid.z;
+    unsigned long token_dims_per_expert = grid.y;
+    unsigned long sub_warp_chunks = grid.x;
+    unsigned long num_block_threads = blocks.x;
+
+    sycl::range<3> global_range{num_experts, token_dims_per_expert, sub_warp_chunks};
+    sycl::range<3> local_range{1, 1, num_block_threads};
+
+    Kernel task(
+        input,
+        output_q,
+        output_s,
+        masked_m,
+        eps,
+        min_8bit,
+        max_8bit,
+        subwarps_per_block,
+        hidden_dim_num_groups,
+        scale_expert_stride,
+        scale_hidden_stride,
+        num_tokens_per_expert);
+
+    sycl_kernel_submit(global_range, local_range, queue, task);
   }
 }
 

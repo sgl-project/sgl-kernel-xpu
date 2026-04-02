@@ -48,11 +48,6 @@ class XeDefault {};  // Default FMHA mainloop, P in registers.
 
 namespace cutlass::fmha::collective {
 
-static inline void barrier() {
-  asm volatile("lsc_fence.ugm.none.group\n");
-  asm volatile("barrier\n");
-}
-
 using namespace cute;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

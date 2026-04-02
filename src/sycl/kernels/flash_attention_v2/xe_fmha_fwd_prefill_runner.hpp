@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2024 - 2025 Codeplay Software Ltd. All rights reserved.
+ * Copyright (c) 2025 - 2026 Codeplay Software Ltd. All rights reserved.
  * Copyright (C) 2026 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -50,24 +50,22 @@
 using namespace cute;
 namespace prefill {
 struct Arguments {
-  using index_t = int64_t;
-
   // The QKV matrices.
   void* __restrict__ q_ptr;
   void* __restrict__ k_ptr;
   void* __restrict__ v_ptr;
 
   // The stride between rows of the Q, K and V matrices.
-  index_t q_batch_stride;
-  index_t k_batch_stride;
-  index_t v_batch_stride;
-  index_t q_row_stride;
-  index_t k_row_stride;
-  index_t v_row_stride;
-  index_t q_head_stride;
-  index_t k_head_stride;
-  index_t v_head_stride;
-  index_t v_dim_stride;
+  int64_t q_batch_stride;
+  int64_t k_batch_stride;
+  int64_t v_batch_stride;
+  int64_t q_row_stride;
+  int64_t k_row_stride;
+  int64_t v_row_stride;
+  int64_t q_head_stride;
+  int64_t k_head_stride;
+  int64_t v_head_stride;
+  int64_t v_dim_stride;
 
   // The number of heads.
   int h, h_k;
@@ -78,9 +76,9 @@ struct Arguments {
   void* __restrict__ oaccum_ptr;
 
   // The stride between rows of O.
-  index_t o_batch_stride;
-  index_t o_row_stride;
-  index_t o_head_stride;
+  int64_t o_batch_stride;
+  int64_t o_row_stride;
+  int64_t o_head_stride;
 
   // The pointer to the softmax sum.
   void* __restrict__ softmax_lse_ptr;
@@ -109,32 +107,32 @@ struct Arguments {
   int* __restrict__ seqused_k;
 
   // The stride between rows of Oaccum.
-  index_t oaccum_split_stride;
-  index_t oaccum_batch_stride;
-  index_t oaccum_row_stride;
-  index_t oaccum_head_stride;
+  int64_t oaccum_split_stride;
+  int64_t oaccum_batch_stride;
+  int64_t oaccum_row_stride;
+  int64_t oaccum_head_stride;
 
   // The stride between rows of LSEaccum.
-  index_t lseaccum_split_stride;
-  index_t lseaccum_batch_stride;
-  index_t lseaccum_head_stride;
+  int64_t lseaccum_split_stride;
+  int64_t lseaccum_batch_stride;
+  int64_t lseaccum_head_stride;
 
   // The K_new and V_new matrices.
   void* __restrict__ knew_ptr;
   void* __restrict__ vnew_ptr;
 
   // The stride between rows of the Q, K and V matrices.
-  index_t knew_batch_stride;
-  index_t vnew_batch_stride;
-  index_t knew_row_stride;
-  index_t vnew_row_stride;
-  index_t knew_head_stride;
-  index_t vnew_head_stride;
+  int64_t knew_batch_stride;
+  int64_t vnew_batch_stride;
+  int64_t knew_row_stride;
+  int64_t vnew_row_stride;
+  int64_t knew_head_stride;
+  int64_t vnew_head_stride;
 
   void* __restrict__ qv_ptr;
-  index_t qv_batch_stride;
-  index_t qv_row_stride;
-  index_t qv_head_stride;
+  int64_t qv_batch_stride;
+  int64_t qv_row_stride;
+  int64_t qv_head_stride;
 
   // The cos and sin matrices for rotary embedding.
   void* __restrict__ rotary_cos_ptr;
@@ -147,15 +145,13 @@ struct Arguments {
   // Paged KV cache
   int* __restrict__ page_table;
   int max_num_pages_per_seq;
-  index_t page_table_batch_stride;
+  int64_t page_table_batch_stride;
   int page_size;
   int num_pages;
   bool pagedkv_tma;
 
   // The dropout probability (probability of keeping an activation).
   float p_dropout;
-  // uint32_t p_dropout_in_uint;
-  // uint16_t p_dropout_in_uint16_t;
   uint8_t p_dropout_in_uint8_t;
 
   // Scale factor of 1 / (1 - p_dropout).
@@ -297,7 +293,7 @@ struct PrefillRunner {
             stride_V,
             static_cast<ElementO*>(params.o_ptr),
             stride_O,
-            static_cast<const ElementV*>(params.k_ptr),
+            static_cast<const ElementK*>(params.k_ptr),
             stride_K_cache,
             static_cast<const ElementV*>(params.v_ptr),
             stride_V_cache,
@@ -308,20 +304,19 @@ struct PrefillRunner {
 
     // Define device-global scratch memory
     size_t workspace_size = FMHAPrefillKernel::get_workspace_size(arguments);
-    cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+    auto workspace = torch::empty(workspace_size, params.tensor_opts);
 
     if (!FMHAPrefillKernel::can_implement(arguments)) {
       return cutlass::Status::kErrorInvalidProblem;
     }
 
     // Initialize the workspace
-    FMHAPrefillKernel::initialize_workspace(arguments, workspace.get());
+    FMHAPrefillKernel::initialize_workspace(arguments, workspace.data_ptr());
 
     // Convert host-side arguments to device-side arguments to be passed to the kernel
-    auto kernel_params = FMHAPrefillKernel::to_underlying_arguments(arguments, workspace.get());
+    auto kernel_params = FMHAPrefillKernel::to_underlying_arguments(arguments, workspace.data_ptr());
 
     // Run
-    // run(kernel_params);
     launch<FMHAPrefillKernel>(kernel_params);
     return cutlass::Status::kSuccess;
   }
@@ -415,13 +410,6 @@ struct FMHAConfig {
         GmemTiledCopyK_cache,
         GmemTiledCopyV_cache>;
 
-    // // Template Features
-    // static constexpr bool PagedKV = CollectiveMainloop::PagedKV;
-    // static constexpr bool CausalMask = CollectiveMainloop::CausalMask;
-    // static constexpr bool LocalMask = CollectiveMainloop::LocalMask;
-    // static constexpr bool Sink = CollectiveEpilogue::Sink;
-    // using ElementSink = typename CollectiveEpilogue::ElementSink;
-
     // Epilogue
     using CollectiveEpilogue =
         cutlass::fmha::collective::FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO>;
@@ -448,12 +436,8 @@ struct FMHAConfig {
   }
 
   static int run(const Arguments& params) {
-    if (params.page_table == nullptr || params.cu_seqlens_k == nullptr) {
-      TORCH_CHECK(false, "Only support varlen with paged KV or varlen with cached KV now");
-    } else {
-      // template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
-      return run<true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
-    }
+    // template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
+    return run<true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
   }
 };
 std::vector<at::Tensor> mha_fwd(
@@ -495,11 +479,9 @@ std::vector<at::Tensor> mha_fwd(
 
   TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
   TORCH_CHECK(v.scalar_type() == q_type, "query and value must have the same dtype");
-  CHECK_INPUT(q);
-  CHECK_INPUT(k);
-  CHECK_INPUT(v);
-  TORCH_CHECK(
-      q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v);
 
   TORCH_CHECK(page_table.value().dtype() == torch::kInt32, "page_table must have dtype torch.int32");
   TORCH_CHECK(page_table.value().stride(-1) == 1, "page_table must have contiguous last dimension");
@@ -535,7 +517,6 @@ std::vector<at::Tensor> mha_fwd(
   // Currently only support head dims <= 256
   static constexpr int max_headdim = 256;
   TORCH_CHECK(head_size <= max_headdim, "FlashAttention forward only supports head dimension at most ", max_headdim);
-  // TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
   TORCH_CHECK(num_heads == num_heads_k, "Only support number of heads in key/value equals to number of heads in query");
 
   // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM

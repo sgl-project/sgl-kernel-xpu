@@ -513,8 +513,8 @@ std::vector<at::Tensor> mha_fwd(
     TORCH_CHECK(batch_size == batch_size_k, "batch_size must be equal to batch_size_k");
   }
 
-  // Currently only support head dims <= 256
-  static constexpr int max_headdim = 256;
+  // Currently only support head dims <= 512
+  static constexpr int max_headdim = 512;
   TORCH_CHECK(head_size <= max_headdim, "FlashAttention forward only supports head dimension at most ", max_headdim);
   TORCH_CHECK(num_heads == num_heads_k, "Only support number of heads in key/value equals to number of heads in query");
 

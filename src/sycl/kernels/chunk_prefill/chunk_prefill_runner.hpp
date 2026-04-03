@@ -845,6 +845,34 @@ std::vector<at::Tensor> mha_fwd(
         }
       })
       break;
+    case 512:
+      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+        if (params.is_causal) {
+          ChunkPrefillConfig<
+              cute::Shape<cute::Int<512>, _64, _64>,
+              cute::Shape<cute::Int<512>, _32, _64>,
+              cute::Shape<cute::Int<512>, cute::Int<512>, _64>,
+              cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true,
+              false,
+              Sink>::run(params);
+        } else {
+          AT_DISPATCH_BOOL_NO_RETURN(
+              params.is_local,
+              LocalMask,
+              ChunkPrefillConfig<
+                  cute::Shape<cute::Int<512>, _64, _64>,
+                  cute::Shape<cute::Int<512>, _32, _64>,
+                  cute::Shape<cute::Int<512>, cute::Int<512>, _64>,
+                  cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+                  PipelineStages,
+                  false,
+                  LocalMask,
+                  Sink>::run(params))
+        }
+      })
+      break;
     default:
       TORCH_CHECK(false, "Unsupported head size ", params.d, " for chunk-prefill MHA");
   }

@@ -41,18 +41,6 @@
 
 namespace at::native::xpu {
 
-#define SYCL_DISPATCH_ONLY_FLOATING16_TYPES(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)  \
-  {                                                                                     \
-    const auto& the_type = TYPE;                                                        \
-    at::ScalarType _st = ::detail::scalar_type(the_type);                               \
-    switch (_st) {                                                                      \
-      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE1, sycl::ext::oneapi::bfloat16, __VA_ARGS__) \
-      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE2, sycl::half, __VA_ARGS__)                  \
-      default:                                                                          \
-        AT_ERROR(#NAME, " not implemented for '", toString(TYPE), "'");                 \
-    }                                                                                   \
-  }
-
 constexpr float LOCAL_ABSMAX_ABS = 1e-10;
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
 
@@ -195,7 +183,6 @@ struct MainKernel {
 #pragma unroll
     for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
       input_primary_int4[j] = primary_base_ptr[j];
-      // input_primary_int4.load(j, primary_base_ptr);
     }
     if constexpr (FUSE_SILU_AND_MUL) {
       const int secondary_offset = hidden_dim_num_groups * GROUP_SIZE;
@@ -204,7 +191,6 @@ struct MainKernel {
 #pragma unroll
       for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
         input_secondary_int4[j] = secondary_base_ptr[j];
-        // input_secondary_int4.load(j, secondary_base_ptr);
       }
     }
 

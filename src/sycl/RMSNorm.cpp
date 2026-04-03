@@ -20,12 +20,13 @@ template <typename ScalarType, int Dims = 1>
 using sycl_local_acc_t = sycl::local_accessor<ScalarType, Dims>;
 
 // Flatten tensor to 2D (M, N) for the kernel.  If the tensor is already 2D it
-// is returned unchanged; 1D and 3D tensors are reshaped.
+// is returned unchanged; 3D tensors are viewed as 2D.  Uses view() so that the
+// returned tensor always shares storage with the original (no copy).
 static inline Tensor flatten_to_2d(const Tensor& t, int64_t M, int64_t N) {
   if (t.dim() == 2) {
     return t;
   }
-  return t.reshape({M, N});
+  return t.view({M, N});
 }
 
 template <typename scalar_t, typename weight_t, typename mean_t = float>
@@ -417,16 +418,15 @@ void GemmaFusedAddRMSNormKernelImplInternal(
 void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
-  auto M_N_S = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
-  auto M = std::get<0>(M_N_S);
-  auto N = std::get<1>(M_N_S);
-  auto input_batch_stride = std::get<2>(M_N_S);
+  auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
 
   // Flatten leading dimensions to 2D for the kernel
   Tensor input_ = flatten_to_2d(input, M, N);
   Tensor output_ = flatten_to_2d(output, M, N);
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
   Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
+  // Derive strides from the flattened views so they are always consistent
+  int64_t input_batch_stride = input_.stride(0);
   int64_t output_batch_stride = output_.stride(0);
 
   SYCL_DISPATCH_FLOATING_TYPES(
@@ -449,9 +449,7 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
   TORCH_CHECK(residual.is_contiguous(), "fused_add_rmsnorm: residual must be contiguous");
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
-  auto M_N_S = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
-  auto M = std::get<0>(M_N_S);
-  auto N = std::get<1>(M_N_S);
+  auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
 
   // Flatten leading dimensions to 2D for the kernel
   Tensor input_ = flatten_to_2d(input, M, N);
@@ -468,16 +466,15 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
-  auto M_N_S = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
-  auto M = std::get<0>(M_N_S);
-  auto N = std::get<1>(M_N_S);
-  auto input_batch_stride = std::get<2>(M_N_S);
+  auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
 
   // Flatten leading dimensions to 2D for the kernel
   Tensor input_ = flatten_to_2d(input, M, N);
   Tensor output_ = flatten_to_2d(output, M, N);
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
   Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
+  // Derive strides from the flattened views so they are always consistent
+  int64_t input_batch_stride = input_.stride(0);
   int64_t output_batch_stride = output_.stride(0);
 
   SYCL_DISPATCH_FLOATING_TYPES(
@@ -500,9 +497,7 @@ void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torc
   TORCH_CHECK(residual.is_contiguous(), "gemma_fused_add_rmsnorm: residual must be contiguous");
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
-  auto M_N_S = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
-  auto M = std::get<0>(M_N_S);
-  auto N = std::get<1>(M_N_S);
+  auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
 
   // Flatten leading dimensions to 2D for the kernel
   Tensor input_ = flatten_to_2d(input, M, N);

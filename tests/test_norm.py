@@ -264,5 +264,52 @@ def test_gemma_fused_add_rmsnorm_3d(batch_size, seq_len, hidden_size, dtype):
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
 
 
+###############################################################################
+# Non-contiguous 3D tensor tests (sliced last-dim, flattenable leading dims)
+###############################################################################
+
+
+def _make_non_contiguous_3d(batch_size, seq_len, hidden_size, dtype, extra=64):
+    """Create a last-dim-contiguous but not fully contiguous 3D tensor by
+    slicing a larger tensor along the last dimension."""
+    full = torch.randn(
+        batch_size, seq_len, hidden_size + extra, device=device, dtype=dtype
+    )
+    view = full[
+        :, :, :hidden_size
+    ]  # stride = (seq_len*(hidden_size+extra), hidden_size+extra, 1)
+    assert view.stride(-1) == 1
+    assert view.stride(-2) == hidden_size + extra
+    return view
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("seq_len", [1, 7])
+@pytest.mark.parametrize("hidden_size", [512, 1024])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_norm_3d_non_contiguous(batch_size, seq_len, hidden_size, dtype):
+    x_nc = _make_non_contiguous_3d(batch_size, seq_len, hidden_size, dtype)
+    w = torch.randn(hidden_size, device=device, dtype=dtype)
+
+    y_ref = llama_rms_norm(x_nc.clone(), w)
+    y = sgl_kernel.rmsnorm(x_nc, w)
+
+    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("seq_len", [1, 7])
+@pytest.mark.parametrize("hidden_size", [512, 1024])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_gemma_norm_3d_non_contiguous(batch_size, seq_len, hidden_size, dtype):
+    x_nc = _make_non_contiguous_3d(batch_size, seq_len, hidden_size, dtype)
+    w = torch.randn(hidden_size, device=device, dtype=dtype)
+
+    y_ref = gemma_rms_norm(x_nc.clone(), w)
+    y = sgl_kernel.gemma_rmsnorm(x_nc, w)
+
+    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

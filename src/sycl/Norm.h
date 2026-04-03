@@ -13,7 +13,7 @@ constexpr int NUM_REDUCE_STAGES = 16;
 #define DECLARE_SYCL_GLOBAL_FENCE sycl::access::fence_space::global_space
 #define DECLARE_SYCL_GLOBAL_AND_LOCAL_FENCE dpcpp_global_and_local_fence = sycl::access::fence_space::global_and_local
 
-inline std::tuple<int64_t, int64_t, int64_t> _check_layer_norm_inputs(
+inline std::tuple<int64_t, int64_t> _check_layer_norm_inputs(
     const torch::Tensor& input,
     IntArrayRef normalized_shape,
     std::optional<torch::Tensor>& weight /* optional */,
@@ -32,21 +32,19 @@ inline std::tuple<int64_t, int64_t, int64_t> _check_layer_norm_inputs(
   TENSOR_CHECK(weight)
   TENSOR_CHECK(bias)
 
-  int64_t hidden_size = input.size(-1);
-  int64_t batch_size = input.numel() / hidden_size;
-  // For 2D tensors stride(0) is the batch stride. For 3D tensors we flatten
-  // the leading dimensions into a logical batch, so that is only valid when
-  // consecutive [*, *, :] rows remain evenly spaced by stride(-2) across the
-  // dim1 -> dim0 boundary.
+  // For 3D inputs, verify that the leading dimensions can be flattened into a
+  // single batch dimension without a copy (i.e. rows are evenly spaced).
   if (input.dim() == 3) {
     TORCH_CHECK(
         input.size(0) == 1 || input.stride(0) == input.size(1) * input.stride(1),
         "3D input must have flattenable leading dimensions when treated as a "
         "batched 2D tensor");
   }
-  int64_t batch_stride = input.stride(-2);
 
-  return std::make_tuple(batch_size, hidden_size, batch_stride);
+  int64_t hidden_size = input.size(-1);
+  int64_t batch_size = input.numel() / hidden_size;
+
+  return std::make_tuple(batch_size, hidden_size);
 }
 
 template <typename accscalar_t, typename reduce_op, typename nd_item_id, typename local_shared>

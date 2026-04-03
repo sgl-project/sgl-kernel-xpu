@@ -58,9 +58,10 @@ def fused_add_rmsnorm(
     Parameters
     ----------
     input: torch.Tensor
-        Input tensor, shape (batch_size, hidden_size).
+        Input tensor, shape ``(batch_size, hidden_size)`` or
+        ``(batch_size, seq_len, hidden_size)``.
     residual: torch.Tensor
-        Residual tensor, shape (batch_size, hidden_size).
+        Residual tensor, same shape as input.
     weight: torch.Tensor
         Weight tensor, shape (hidden_size,).
     eps: float
@@ -85,7 +86,8 @@ def gemma_rmsnorm(
     Parameters
     ----------
     input: torch.Tensor
-        Input tensor, shape (batch_size, hidden_size).
+        Input tensor, shape ``(batch_size, hidden_size)`` or
+        ``(batch_size, seq_len, hidden_size)``.
     weight: torch.Tensor
         Weight tensor, shape (hidden_size,).
     eps: float
@@ -98,7 +100,7 @@ def gemma_rmsnorm(
     Returns
     -------
     output: torch.Tensor
-        Gemma Normalized tensor, shape (batch_size, hidden_size).
+        Gemma Normalized tensor, same shape as input.
     """
     if out is None:
         out = torch.empty_like(input)
@@ -124,9 +126,10 @@ def gemma_fused_add_rmsnorm(
     Parameters
     ----------
     input: torch.Tensor
-        Input tensor, shape (batch_size, hidden_size).
+        Input tensor, shape ``(batch_size, hidden_size)`` or
+        ``(batch_size, seq_len, hidden_size)``.
     residual: torch.Tensor
-        Residual tensor, shape (batch_size, hidden_size).
+        Residual tensor, same shape as input.
     weight: torch.Tensor
         Weight tensor, shape (hidden_size,).
     eps: float

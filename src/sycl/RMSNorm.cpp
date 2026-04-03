@@ -19,6 +19,15 @@ namespace at::native::xpu {
 template <typename ScalarType, int Dims = 1>
 using sycl_local_acc_t = sycl::local_accessor<ScalarType, Dims>;
 
+// Flatten tensor to 2D (M, N) for the kernel.  If the tensor is already 2D it
+// is returned unchanged; 1D and 3D tensors are reshaped.
+static inline Tensor flatten_to_2d(const Tensor& t, int64_t M, int64_t N) {
+  if (t.dim() == 2) {
+    return t;
+  }
+  return t.reshape({M, N});
+}
+
 template <typename scalar_t, typename weight_t, typename mean_t = float>
 class RMSNormForward : public NormForward<scalar_t, weight_t, true> {
  public:
@@ -414,8 +423,8 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
   auto input_batch_stride = std::get<2>(M_N_S);
 
   // Flatten leading dimensions to 2D for the kernel
-  Tensor input_ = input.dim() <= 2 ? ((input.dim() == 1) ? input.reshape({M, N}) : input) : input.reshape({M, N});
-  Tensor output_ = output.dim() <= 2 ? ((output.dim() == 1) ? output.reshape({M, N}) : output) : output.reshape({M, N});
+  Tensor input_ = flatten_to_2d(input, M, N);
+  Tensor output_ = flatten_to_2d(output, M, N);
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
   Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
   int64_t output_batch_stride = output_.stride(0);
@@ -445,8 +454,8 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
   auto N = std::get<1>(M_N_S);
 
   // Flatten leading dimensions to 2D for the kernel
-  Tensor input_ = (input.dim() > 2) ? input.reshape({M, N}) : input;
-  Tensor residual_ = (residual.dim() > 2) ? residual.reshape({M, N}) : residual;
+  Tensor input_ = flatten_to_2d(input, M, N);
+  Tensor residual_ = flatten_to_2d(residual, M, N);
   Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
 
   SYCL_DISPATCH_FLOATING_TYPES(
@@ -465,8 +474,8 @@ void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& w
   auto input_batch_stride = std::get<2>(M_N_S);
 
   // Flatten leading dimensions to 2D for the kernel
-  Tensor input_ = input.dim() <= 2 ? ((input.dim() == 1) ? input.reshape({M, N}) : input) : input.reshape({M, N});
-  Tensor output_ = output.dim() <= 2 ? ((output.dim() == 1) ? output.reshape({M, N}) : output) : output.reshape({M, N});
+  Tensor input_ = flatten_to_2d(input, M, N);
+  Tensor output_ = flatten_to_2d(output, M, N);
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
   Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
   int64_t output_batch_stride = output_.stride(0);
@@ -496,9 +505,8 @@ void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torc
   auto N = std::get<1>(M_N_S);
 
   // Flatten leading dimensions to 2D for the kernel
-  Tensor input_ = input.dim() <= 2 ? ((input.dim() == 1) ? input.reshape({M, N}) : input) : input.reshape({M, N});
-  Tensor residual_ =
-      residual.dim() <= 2 ? ((residual.dim() == 1) ? residual.reshape({M, N}) : residual) : residual.reshape({M, N});
+  Tensor input_ = flatten_to_2d(input, M, N);
+  Tensor residual_ = flatten_to_2d(residual, M, N);
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
   Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
 

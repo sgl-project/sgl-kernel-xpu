@@ -6,6 +6,10 @@ import triton
 from sgl_kernel import fused_experts, topk_softmax
 from torch.nn import functional as F
 
+# GPT-OSS SwiGLU parameters
+SWIGLU_GPT_OSS_ALPHA = 1.702
+SWIGLU_GPT_OSS_LIMIT = 7.0
+
 shape_configs = [
     # # Qwen/Qwen2-57B-A14B-Instruct, tp = 1
     # {
@@ -124,27 +128,61 @@ shape_configs = [
         "dtype": torch.bfloat16,
         "block_shape": None,
     },
+    # lmsys/gpt-oss-20b-bf16, tp = 4
+    {
+        "num_experts": 32,
+        "topk": 4,
+        "hidden_size": 2880,
+        "shard_intermediate_size": 2880,
+        "dtype": torch.bfloat16,
+        "block_shape": None,
+        "gemm1_alpha": SWIGLU_GPT_OSS_ALPHA,
+        "gemm1_limit": SWIGLU_GPT_OSS_LIMIT,
+    },
 ]
 
 shape_configs_gelu = [
     # grok, tp=1
-    {
-        "num_experts": 8,
-        "topk": 2,
-        "hidden_size": 8192,
-        "shard_intermediate_size": 16384,
-        "dtype": torch.bfloat16,
-        "block_shape": None,
-    }
+    # {
+    #     "num_experts": 8,
+    #     "topk": 2,
+    #     "hidden_size": 8192,
+    #     "shard_intermediate_size": 16384,
+    #     "dtype": torch.bfloat16,
+    #     "block_shape": None,
+    # }
 ]
 
-shape_values = [list(d.values()) for d in shape_configs]
+
+def _cfg_vals(d):
+    return [
+        d["num_experts"],
+        d["topk"],
+        d["hidden_size"],
+        d["shard_intermediate_size"],
+        d["dtype"],
+        d["block_shape"],
+        d.get("gemm1_alpha"),
+        d.get("gemm1_limit"),
+    ]
+
+
+shape_values = [_cfg_vals(d) for d in shape_configs]
 bs = [1, 128, 512, 1024, 2048, 4096, 8192]
 with_bias = [False, True]
 configs = [(k, *v, b, "silu") for k, v, b in product(bs, shape_values, with_bias)]
-shape_values_gelu = [list(d.values()) for d in shape_configs_gelu]
+shape_values_gelu = [_cfg_vals(d) for d in shape_configs_gelu]
 configs += [(k, *v, b, "gelu") for k, v, b in product(bs, shape_values_gelu, with_bias)]
 all_results = []
+
+
+@torch.compile
+def swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit):
+    # At present, only GPT-OSS uses this variant.
+    gate, up = x[..., ::2], x[..., 1::2]
+    gate = gate.clamp(min=None, max=gemm1_limit)
+    up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
+    return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
 
 
 def fused_topk_native(
@@ -173,6 +211,11 @@ def fused_moe_torch(
     w2,
     input_gating,
     topk,
+    b1,
+    b2,
+    act_type,
+    gemm1_alpha=None,
+    gemm1_limit=None,
 ) -> torch.Tensor:
 
     topk_weights, topk_ids = fused_topk_native(
@@ -181,13 +224,43 @@ def fused_moe_torch(
         topk=topk,
         renormalize=True,
     )
-    w13_weights = w1[topk_ids]
-    w1_weights, w3_weights = torch.chunk(w13_weights, 2, dim=2)
     w2_weights = w2[topk_ids]
-    x1 = torch.einsum("ti,taoi -> tao", x, w1_weights)
-    x1 = F.silu(x1)
-    x3 = torch.einsum("ti, taoi -> tao", x, w3_weights)
-    expert_outs = torch.einsum("tao, taio -> tai", (x1 * x3), w2_weights)
+    is_swiglu_gpt_oss = (
+        act_type == "silu" and gemm1_alpha is not None and gemm1_limit is not None
+    )
+
+    if is_swiglu_gpt_oss:
+        # GPT-OSS: w1 rows are interleaved [g0, u0, g1, u1, ...].
+        # Run a single GEMM to get the full interleaved output [T, topk, 2N],
+        # add the interleaved bias, then let swiglu_gpt_oss_sigmoid_alpha
+        # split gate/up internally.
+        w1_weights = w1[topk_ids]
+        x1 = torch.einsum("ti,taoi -> tao", x, w1_weights)
+        if b1 is not None:
+            b1_weights = b1[topk_ids]
+            x1 = (x1.float() + b1_weights.float()).to(x.dtype)
+        x1 = swiglu_gpt_oss_sigmoid_alpha(x1, gemm1_alpha, gemm1_limit)
+        expert_outs = torch.einsum("tao, taio -> tai", x1, w2_weights)
+    else:
+        # silu/gelu: w1 is block-split [gate_rows | up_rows].
+        w13_weights = w1[topk_ids]
+        w1_weights, w3_weights = torch.chunk(w13_weights, 2, dim=2)
+        x1 = torch.einsum("ti,taoi -> tao", x, w1_weights)
+        x3 = torch.einsum("ti, taoi -> tao", x, w3_weights)
+        if b1 is not None:
+            b1_weights = b1[topk_ids]
+            b1_gate, b1_up = torch.chunk(b1_weights, 2, dim=2)
+            x1 = (x1.float() + b1_gate.float()).to(x.dtype)
+            x3 = (x3.float() + b1_up.float()).to(x.dtype)
+        if act_type == "silu":
+            x1 = F.silu(x1)
+        elif act_type == "gelu":
+            x1 = F.gelu(x1, approximate="tanh")
+        expert_outs = torch.einsum("tao, taio -> tai", x1 * x3, w2_weights)
+    if b2 is not None:
+        b2_weights = b2[topk_ids]
+        expert_outs = expert_outs.float() + b2_weights.float()
+        expert_outs = expert_outs.to(x.dtype)
     return torch.einsum("tai,ta -> ti", expert_outs, topk_weights.to(expert_outs.dtype))
 
 
@@ -204,6 +277,9 @@ def fused_moe_torch_compile(
     w2_scale=None,
     a1_scale=None,
     a2_scale=None,
+    act_type=None,
+    gemm1_alpha=None,
+    gemm1_limit=None,
 ):
     return fused_moe_torch(
         x,
@@ -211,6 +287,11 @@ def fused_moe_torch_compile(
         w2,
         input_gating,
         topk,
+        b1,
+        b2,
+        act_type=act_type,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
     )
 
 
@@ -223,6 +304,8 @@ def fused_moe_sglang_api(
     b1,
     b2,
     act_type,
+    gemm1_alpha=None,
+    gemm1_limit=None,
 ):
     num_tokens = x.shape[0]
     topk_weights = torch.empty(num_tokens, topk, dtype=torch.float32, device=x.device)
@@ -244,6 +327,8 @@ def fused_moe_sglang_api(
             b1,
             b2,
             activation=act_type,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_limit=gemm1_limit,
         ),
         topk_indices,
     )
@@ -259,6 +344,8 @@ def fused_moe_sglang_api(
             "shard_intermediate_size",
             "dtype",
             "block_shape",
+            "gemm1_alpha",
+            "gemm1_limit",
             "with_bias",
             "act_type",
         ],
@@ -289,6 +376,8 @@ def benchmark(
     with_bias,
     act_type,
     provider,
+    gemm1_alpha,
+    gemm1_limit,
 ):
     print(
         f"benchmark {provider} with {num_tokens=} {hidden_size=} {shard_intermediate_size=} {with_bias=} {act_type=}"
@@ -322,6 +411,8 @@ def benchmark(
         "b1": b1,
         "b2": b2,
         "act_type": act_type,
+        "gemm1_alpha": gemm1_alpha,
+        "gemm1_limit": gemm1_limit,
     }
 
     # Warmup

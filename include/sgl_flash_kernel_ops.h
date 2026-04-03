@@ -70,6 +70,6 @@ std::vector<at::Tensor> mha_fwd(
     float const softcap,
     bool const is_rotary_interleaved,  // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
     std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
-    // int num_kv_splits,
+    int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin);

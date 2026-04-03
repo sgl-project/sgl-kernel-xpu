@@ -37,6 +37,7 @@
 
 #include "kernels/chunk_prefill/chunk_prefill_runner.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp"
+#include "kernels/flash_attention_v2/xe_fmha_fwd_prefill_runner.hpp"
 
 namespace decode {
 
@@ -83,6 +84,9 @@ namespace decode {
         break;                                                                        \
       case 256:                                                                       \
         DISPATCH_DECODE_PAGE_SIZE(QG, 256);                                           \
+        break;                                                                        \
+      case 512:                                                                       \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 512);                                           \
         break;                                                                        \
       default:                                                                        \
         TORCH_CHECK(false, "Unsupported head size for decode attention: ", params.d); \
@@ -140,7 +144,7 @@ std::vector<at::Tensor> mha_fwd(
     float const softcap,
     bool const is_rotary_interleaved,  // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
     std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
-    // int num_kv_splits,
+    int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin) {
   auto q_type = q.scalar_type();
@@ -151,11 +155,9 @@ std::vector<at::Tensor> mha_fwd(
 
   TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
   TORCH_CHECK(v.scalar_type() == q_type, "query and value must have the same dtype");
-  CHECK_INPUT(q);
-  CHECK_INPUT(k);
-  CHECK_INPUT(v);
-  TORCH_CHECK(
-      q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v);
 
   TORCH_CHECK(page_table.value().dtype() == torch::kInt32, "page_table must have dtype torch.int32");
   TORCH_CHECK(page_table.value().stride(-1) == 1, "page_table must have contiguous last dimension");
@@ -188,8 +190,8 @@ std::vector<at::Tensor> mha_fwd(
     TORCH_CHECK(batch_size == batch_size_k, "batch_size must be equal to batch_size_k");
   }
 
-  // Currently only support head dims <= 256
-  static constexpr int max_headdim = 256;
+  // Currently only support head dims <= 512
+  static constexpr int max_headdim = 512;
   TORCH_CHECK(head_size <= max_headdim, "FlashAttention forward only supports head dimension at most ", max_headdim);
   TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
@@ -225,7 +227,7 @@ std::vector<at::Tensor> mha_fwd(
   at::Tensor temp_out;    // [batch, num_kv_splits, num_head_q, seq_q, head_size]
   at::Tensor exp_sums;    // [batch, num_head_q, seq_q, num_kv_splits]
   at::Tensor max_logits;  // [batch, num_head_q, seq_q, num_kv_splits]
-  int num_kv_splits = -1;
+  num_kv_splits = -1;
   out = torch::empty({total_q, num_heads, head_size_v}, opts);
   Arguments params;
   params.use_split_kv = true;
@@ -401,7 +403,7 @@ std::vector<at::Tensor> mha_fwd(
   int qg_sz = nextPowerOf2(params.q_group_size);
   TORCH_CHECK(qg_sz >= 1 && qg_sz <= 16, "Unsupported q_group_size for decode attention: ", params.q_group_size);
   TORCH_CHECK(
-      params.d == 64 || params.d == 96 || params.d == 128 || params.d == 192 || params.d == 256,
+      params.d == 64 || params.d == 96 || params.d == 128 || params.d == 192 || params.d == 256 || params.d == 512,
       "Unsupported head size for decode attention: ",
       params.d);
   TORCH_CHECK(
@@ -449,9 +451,12 @@ std::vector<at::Tensor> mha_fwd(
     float const softcap,
     bool const is_rotary_interleaved,  // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
     std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
-    // int num_kv_splits,
+    int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin) {
+  TORCH_CHECK(cu_seqlens_k.data_ptr<int>() != nullptr, "cu_seqlens_k is not valid.");
+  int const num_heads = q.size(-2);
+  int const num_heads_k = k.size(-2);
   if (max_seqlen_q == 1 && page_table.has_value()) {
     return decode::mha_fwd(
         q,
@@ -479,10 +484,14 @@ std::vector<at::Tensor> mha_fwd(
         softcap,
         is_rotary_interleaved,
         scheduler_metadata_,
-        // num_kv_splits,
+        num_kv_splits,
         pack_gqa_,
         sm_margin);
-  } else {
+  } else if (
+      !page_table.has_value() || is_causal || window_size_left >= 0 || window_size_right >= 0 || sinks_.has_value() ||
+      num_heads != num_heads_k || max_seqlen_q == 2048 || max_seqlen_q == 4096 || max_seqlen_q == 8192) {
+    // Use chunked prefill for GQA/MQA
+    // Now we detect chunked prefill according to max_seqlen_q
     return chunkprefill::mha_fwd(
         q,
         k,
@@ -509,7 +518,38 @@ std::vector<at::Tensor> mha_fwd(
         softcap,
         is_rotary_interleaved,
         scheduler_metadata_,
-        // num_kv_splits,
+        num_kv_splits,
+        pack_gqa_,
+        sm_margin);
+  } else {
+    // TODO: support the cases for non-kv cache, causal, sliding window and sink.
+    return prefill::mha_fwd(
+        q,
+        k,
+        v,
+        q_v_,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        page_table,
+        kv_batch_idx_,
+        leftpad_k_,
+        rotary_cos_,
+        rotary_sin_,
+        seqlens_rotary_,
+        q_descale_,
+        k_descale_,
+        v_descale_,
+        softmax_scale_,
+        sinks_,
+        is_causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        is_rotary_interleaved,
+        scheduler_metadata_,
+        num_kv_splits,
         pack_gqa_,
         sm_margin);
   }

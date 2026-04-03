@@ -60,7 +60,7 @@ from sgl_kernel.moe import (
     moe_sum_reduce,
     prepare_moe_input,
     scatter_tokens_to_experts,
-    swiglu_with_alpha_and_limit,
+    swiglu_gpt_oss_sigmoid_alpha,
     topk_softmax,
 )
 from sgl_kernel.sampling import (

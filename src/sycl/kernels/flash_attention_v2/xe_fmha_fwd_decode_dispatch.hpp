@@ -40,9 +40,11 @@ namespace decode {
 // generated .cpp file (from xe_fmha_fwd_decode_kernel.cpp.in /
 // xe_fmha_fwd_split_decode_kernel.cpp.in).
 //
-// QG_SZ    in {1, 2, 4, 8, 16}
-// HEAD_DIM in {64, 96, 128, 192, 256}
-// PAGE_SIZE in {64, 128}
+// Naming: launch_fmha_decode_<QG_SZ>_<HEAD_DIM>_<PAGE_SIZE>
+// Parameters:
+//   QG_SZ    in {1, 2, 4, 8, 16, 32}
+//   HEAD_DIM in {64, 96, 128, 192, 256, 512}
+//   PAGE_SIZE in {32, 64, 128}  (with NUM_SG = PAGE_SIZE / 16)
 
 // Explicit instantiation declarations — tell the compiler these are compiled
 // in separate translation units (generated from the .cpp.in templates).
@@ -78,12 +80,14 @@ EXTERN_FMHA_DECODE_RUNNER_ALL_QG(96)
 EXTERN_FMHA_DECODE_RUNNER_ALL_QG(128)
 EXTERN_FMHA_DECODE_RUNNER_ALL_QG(192)
 EXTERN_FMHA_DECODE_RUNNER_ALL_QG(256)
+EXTERN_FMHA_DECODE_RUNNER_ALL_QG(512)
 
 EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(64)
 EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(96)
 EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(128)
 EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(192)
 EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(256)
+EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(512)
 
 #undef EXTERN_FMHA_DECODE_RUNNER
 #undef EXTERN_FMHA_SPLIT_DECODE_RUNNER

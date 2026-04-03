@@ -87,7 +87,7 @@ class MoEGEMM {
   struct Params {
     const ElementA* Activations;
     const ElementB* Weights;
-    const ElementD* Bias;
+    const float* Bias;
     ElementD* Outputs;
     const int32_t* M_per_group;
     const int32_t N;
@@ -95,36 +95,66 @@ class MoEGEMM {
     const int32_t num_experts;
     int32_t* workspace;
     TiledMMA mma;
+    float gemm1_alpha = 1.702f;
+    float gemm1_limit = 7.0f;
   };
 
   auto make_B_tensors(ElementB* ptr_B, int N, int K) {
     if constexpr (FuseAct) {
-      auto B0 = make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N / 2, K), make_stride(K, _1{})));
-      ElementB* ptr_B1 = ptr_B + (N / 2) * K;
-      auto B1 = make_tensor(make_gmem_ptr<ElementB>(ptr_B1), make_layout(make_shape(N / 2, K), make_stride(K, _1{})));
-      return cute::make_tuple(B0, B1);
+      if constexpr (ActType == SWILGU_GPT_OSS) {
+        // Weights are interleaved for GPT-OSS: [gate_row0, up_row0, gate_row1, up_row1, ...]
+        // Gate rows are at offsets 0, 2*K, 4*K, ... → row stride = 2*K
+        auto B0 =
+            make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N / 2, K), make_stride(2 * K, _1{})));
+        // Up rows are at offsets K, 3*K, 5*K, ... → start one row in, same stride
+        auto B1 = make_tensor(
+            make_gmem_ptr<ElementB>(ptr_B + K), make_layout(make_shape(N / 2, K), make_stride(2 * K, _1{})));
+        return cute::make_tuple(B0, B1);
+      } else {
+        // SiLU/GELU: block split – first N/2 rows = gate, last N/2 rows = up
+        auto B0 = make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N / 2, K), make_stride(K, _1{})));
+        ElementB* ptr_B1 = ptr_B + (N / 2) * K;
+        auto B1 = make_tensor(make_gmem_ptr<ElementB>(ptr_B1), make_layout(make_shape(N / 2, K), make_stride(K, _1{})));
+        return cute::make_tuple(B0, B1);
+      }
     } else {
       auto B = make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N, K), make_stride(K, _1{})));
       return cute::make_tuple(B);
     }
   }
 
-  auto make_Bias_tensors(ElementD* ptr_Bias, int N) {
+  auto make_Bias_tensors(float* ptr_Bias, int N) {
     if constexpr (WithBias) {
       if constexpr (FuseAct) {
-        auto Bias0 = make_tensor(make_gmem_ptr<ElementD>(ptr_Bias), make_layout(make_shape(N / 2), make_stride(_1{})));
-        ElementD* ptr_Bias1 = ptr_Bias + (N / 2);
-        auto Bias1 = make_tensor(make_gmem_ptr<ElementD>(ptr_Bias1), make_layout(make_shape(N / 2), make_stride(_1{})));
-        return cute::make_tuple(Bias0, Bias1);
+        if constexpr (ActType == SWILGU_GPT_OSS) {
+          // Bias is interleaved for GPT-OSS: [bias_gate0, bias_up0, bias_gate1, bias_up1, ...]
+          // Gate bias at even indices → stride 2; up bias at odd indices → start +1, stride 2
+          auto Bias0 = make_tensor(make_gmem_ptr<float>(ptr_Bias), make_layout(make_shape(N / 2), make_stride(_2{})));
+          auto Bias1 =
+              make_tensor(make_gmem_ptr<float>(ptr_Bias + 1), make_layout(make_shape(N / 2), make_stride(_2{})));
+          return cute::make_tuple(Bias0, Bias1);
+        } else {
+          // SiLU/GELU: block split – first N/2 elements = gate, last N/2 = up
+          auto Bias0 = make_tensor(make_gmem_ptr<float>(ptr_Bias), make_layout(make_shape(N / 2), make_stride(_1{})));
+          float* ptr_Bias1 = ptr_Bias + (N / 2);
+          auto Bias1 = make_tensor(make_gmem_ptr<float>(ptr_Bias1), make_layout(make_shape(N / 2), make_stride(_1{})));
+          return cute::make_tuple(Bias0, Bias1);
+        }
       } else {
-        auto Bias = make_tensor(make_gmem_ptr<ElementD>(ptr_Bias), make_layout(make_shape(N), make_stride(_1{})));
+        auto Bias = make_tensor(make_gmem_ptr<float>(ptr_Bias), make_layout(make_shape(N), make_stride(_1{})));
         return cute::make_tuple(Bias);
       }
     } else {
-      // return a tuple of empty tensors
-      return cute::make_tuple(
-          make_tensor(make_gmem_ptr<ElementD>(nullptr), make_layout(make_shape(0), make_stride(_1{}))),
-          make_tensor(make_gmem_ptr<ElementD>(nullptr), make_layout(make_shape(0), make_stride(_1{}))));
+      // return a tuple of empty tensors with stride matching the active path
+      if constexpr (FuseAct && ActType == SWILGU_GPT_OSS) {
+        return cute::make_tuple(
+            make_tensor(make_gmem_ptr<float>(nullptr), make_layout(make_shape(0), make_stride(_2{}))),
+            make_tensor(make_gmem_ptr<float>(nullptr), make_layout(make_shape(0), make_stride(_2{}))));
+      } else {
+        return cute::make_tuple(
+            make_tensor(make_gmem_ptr<float>(nullptr), make_layout(make_shape(0), make_stride(_1{}))),
+            make_tensor(make_gmem_ptr<float>(nullptr), make_layout(make_shape(0), make_stride(_1{}))));
+      }
     }
   }
 
@@ -190,9 +220,9 @@ class MoEGEMM {
       int64_t B_offset = static_cast<int64_t>(expert_id) * static_cast<int64_t>(N) * static_cast<int64_t>(K);
       ElementA* ptr_A_curr_batch = const_cast<ElementA*>(params.Activations) + pre_rows * K;
       ElementB* ptr_B_curr_batch = const_cast<ElementB*>(params.Weights) + B_offset;
-      ElementD* ptr_Bias_curr_batch = nullptr;
+      float* ptr_Bias_curr_batch = nullptr;
       if constexpr (WithBias) {
-        ptr_Bias_curr_batch = const_cast<ElementD*>(params.Bias) + expert_id * N;
+        ptr_Bias_curr_batch = const_cast<float*>(params.Bias) + expert_id * N;
       }
 
       auto A_tensor =
@@ -207,7 +237,7 @@ class MoEGEMM {
 
         CollectiveMainloop mainloop;
         if constexpr (FuseAct) {
-          auto tile_coord = make_coord(m_coord, n_coord, 0);
+          auto tile_coord = make_coord(m_coord, n_coord, n_coord);
           mainloop(
               A_tensor,
               get<0>(B_tensor),
@@ -217,7 +247,9 @@ class MoEGEMM {
               mma,
               thr_id,
               get<0>(Bias_tensor),
-              get<1>(Bias_tensor));
+              get<1>(Bias_tensor),
+              params.gemm1_alpha,
+              params.gemm1_limit);
         } else {
           auto tile_coord = make_coord(m_coord, n_coord, _, 0);
           mainloop(A_tensor, get<0>(B_tensor), D_tensor, tile_coord, mma, thr_id, get<0>(Bias_tensor));

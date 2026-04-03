@@ -28,7 +28,9 @@ void Xe20MoEGEMMLauncher(
     const int gemm_k,
     const int* num_rows_per_expert_device,
     const int num_experts,
-    int* workspace) {
+    int* workspace,
+    float gemm1_alpha,
+    float gemm1_limit) {
   (void)scales;
   using Element = cutlass::bfloat16_t;
 
@@ -36,7 +38,11 @@ void Xe20MoEGEMMLauncher(
     return make_tensor(make_gmem_ptr(&val), make_layout(repeat<rank_v<decltype(stride)>>(1), stride));
   };
   auto make_dummy_bias = [&](auto val) {
-    return make_tensor(make_gmem_ptr(&val), make_layout(Shape<int>{}, Stride<_1>{}));
+    if constexpr (FuseAct && ActType == 2) {  // SWIGLU interleaved: stride 2
+      return make_tensor(make_gmem_ptr(&val), make_layout(Shape<int>{}, Stride<_2>{}));
+    } else {
+      return make_tensor(make_gmem_ptr(&val), make_layout(Shape<int>{}, Stride<_1>{}));
+    }
   };
   using StrideA = Stride<int, _1>;
   using StrideB = Stride<int, _1>;
@@ -44,7 +50,7 @@ void Xe20MoEGEMMLauncher(
   using TensorA = decltype(make_dummy_tensor(Element{}, StrideA{}));
   using TensorB = decltype(make_dummy_tensor(Element{}, StrideB{}));
   using TensorD = decltype(make_dummy_tensor(Element{}, StrideD{}));
-  using TensorBias = decltype(make_dummy_bias(Element{}));
+  using TensorBias = decltype(make_dummy_bias(float{}));
 
   using ElementA_non_CV = cutlass::platform::remove_cv_t<Element>;
   using MMA =
@@ -72,7 +78,7 @@ void Xe20MoEGEMMLauncher(
   typename Kernel::Params params{
       static_cast<const Element*>(activations),
       static_cast<const Element*>(weights),
-      static_cast<const Element*>(bias),
+      static_cast<const float*>(bias),
       static_cast<Element*>(outputs),
       num_rows_per_expert_device,
       gemm_n,
@@ -80,6 +86,8 @@ void Xe20MoEGEMMLauncher(
       num_experts,
       workspace,
       mma,
+      static_cast<float>(gemm1_alpha),
+      static_cast<float>(gemm1_limit),
   };
 
   q.submit([&](sycl::handler& h) {
@@ -104,6 +112,8 @@ template void Xe20MoEGEMMLauncher<@TILE@, @SGLAYOUT@, @ACT_TYPE@, @FUSE_ACT@, @W
     const int,
     const int*,
     const int,
-    int*);
+    int*,
+    float,
+    float);
 
 #undef SYCL_INTEL_TARGET

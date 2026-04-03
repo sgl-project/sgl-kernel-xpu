@@ -715,6 +715,12 @@ std::vector<at::Tensor> mha_fwd(
     case 192:
       launch_kernel(_256{}, _64{}, _192{}, _32{});
       break;
+    case 256:
+      launch_kernel(_256{}, _64{}, _256{}, _32{});
+      break;
+    case 512:
+      launch_kernel(_256{}, _64{}, _512{}, _32{});
+      break;
     default:
       TORCH_CHECK(false, "Unsupported head size for prefill attention: ", params.d);
   }

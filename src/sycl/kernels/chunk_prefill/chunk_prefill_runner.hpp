@@ -521,7 +521,7 @@ std::vector<at::Tensor> mha_fwd(
   }
 
   // Currently only support head dims <= 256
-  static constexpr int max_headdim = 256;
+  static constexpr int max_headdim = 512;
   TORCH_CHECK(
       head_size <= max_headdim,
       "FlashAttention forward only supports head dimension at most " + std::to_string(max_headdim));

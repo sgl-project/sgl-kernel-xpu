@@ -19,6 +19,16 @@ namespace at::native::xpu {
 template <typename ScalarType, int Dims = 1>
 using sycl_local_acc_t = sycl::local_accessor<ScalarType, Dims>;
 
+// Flatten tensor to 2D (M, N) for the kernel.  If the tensor is already 2D it
+// is returned unchanged; 3D tensors are viewed as 2D.  Uses view() so that the
+// returned tensor always shares storage with the original (no copy).
+static inline Tensor flatten_to_2d(const Tensor& t, int64_t M, int64_t N) {
+  if (t.dim() == 2) {
+    return t;
+  }
+  return t.view({M, N});
+}
+
 template <typename scalar_t, typename weight_t, typename mean_t = float>
 class RMSNormForward : public NormForward<scalar_t, weight_t, true> {
  public:
@@ -408,16 +418,16 @@ void GemmaFusedAddRMSNormKernelImplInternal(
 void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
-  auto M_N_S = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
-  auto M = std::get<0>(M_N_S);
-  auto N = std::get<1>(M_N_S);
-  auto input_batch_stride = std::get<2>(M_N_S);
+  auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
 
-  Tensor input_ = (input.dim() == 1) ? input.reshape({M, N}) : input;
-  Tensor output_ = (output.dim() == 1) ? output.reshape({M, N}) : output;
+  // Flatten leading dimensions to 2D for the kernel
+  Tensor input_ = flatten_to_2d(input, M, N);
+  Tensor output_ = flatten_to_2d(output, M, N);
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
   Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
-  int64_t output_batch_stride = (output.dim() >= 2) ? output.stride(0) : N;
+  // Derive strides from the flattened views so they are always consistent
+  int64_t input_batch_stride = input_.stride(0);
+  int64_t output_batch_stride = output_.stride(0);
 
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "RMSNormKernelImpl", [&]() {
@@ -439,32 +449,33 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
   TORCH_CHECK(residual.is_contiguous(), "fused_add_rmsnorm: residual must be contiguous");
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
-  auto M_N_S = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
-  auto M = std::get<0>(M_N_S);
-  auto N = std::get<1>(M_N_S);
+  auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
 
-  Tensor rstd = at::empty({M}, input.options().dtype(kFloat));
+  // Flatten leading dimensions to 2D for the kernel
+  Tensor input_ = flatten_to_2d(input, M, N);
+  Tensor residual_ = flatten_to_2d(residual, M, N);
+  Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
 
   SYCL_DISPATCH_FLOATING_TYPES(
-      at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
+      at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
         FusedAddRMSNormKernelImplInternal<scalar_t, scalar_t>(
-            input, weight, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual);
+            input_, weight, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual_);
       });
 }
 
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
-  auto M_N_S = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
-  auto M = std::get<0>(M_N_S);
-  auto N = std::get<1>(M_N_S);
-  auto input_batch_stride = std::get<2>(M_N_S);
+  auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
 
-  Tensor input_ = (input.dim() == 1) ? input.reshape({M, N}) : input;
-  Tensor output_ = (output.dim() == 1) ? output.reshape({M, N}) : output;
+  // Flatten leading dimensions to 2D for the kernel
+  Tensor input_ = flatten_to_2d(input, M, N);
+  Tensor output_ = flatten_to_2d(output, M, N);
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
   Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
-  int64_t output_batch_stride = (output.dim() >= 2) ? output.stride(0) : N;
+  // Derive strides from the flattened views so they are always consistent
+  int64_t input_batch_stride = input_.stride(0);
+  int64_t output_batch_stride = output_.stride(0);
 
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
@@ -486,12 +497,11 @@ void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torc
   TORCH_CHECK(residual.is_contiguous(), "gemma_fused_add_rmsnorm: residual must be contiguous");
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
-  auto M_N_S = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
-  auto M = std::get<0>(M_N_S);
-  auto N = std::get<1>(M_N_S);
+  auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
 
-  Tensor input_ = (input.dim() == 1) ? input.reshape({M, N}) : input;
-  Tensor residual_ = (residual.dim() == 1) ? residual.reshape({M, N}) : residual;
+  // Flatten leading dimensions to 2D for the kernel
+  Tensor input_ = flatten_to_2d(input, M, N);
+  Tensor residual_ = flatten_to_2d(residual, M, N);
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
   Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
 

@@ -40,6 +40,7 @@
 #include "kernels/chunk_prefill/chunk_prefill_runner.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
+#include "kernels/flash_attention_v2/xe_fmha_fwd_prefill_runner.hpp"
 
 namespace decode {
 
@@ -176,11 +177,9 @@ std::vector<at::Tensor> mha_fwd(
 
   TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
   TORCH_CHECK(v.scalar_type() == q_type, "query and value must have the same dtype");
-  CHECK_INPUT(q);
-  CHECK_INPUT(k);
-  CHECK_INPUT(v);
-  TORCH_CHECK(
-      q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v);
 
   TORCH_CHECK(page_table.value().dtype() == torch::kInt32, "page_table must have dtype torch.int32");
   TORCH_CHECK(page_table.value().stride(-1) == 1, "page_table must have contiguous last dimension");
@@ -439,6 +438,9 @@ std::vector<at::Tensor> mha_fwd(
     int num_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin) {
+  TORCH_CHECK(cu_seqlens_k.data_ptr<int>() != nullptr, "cu_seqlens_k is not valid.");
+  int const num_heads = q.size(-2);
+  int const num_heads_k = k.size(-2);
   if (max_seqlen_q == 1 && page_table.has_value()) {
     return decode::mha_fwd(
         q,
@@ -469,8 +471,43 @@ std::vector<at::Tensor> mha_fwd(
         num_splits,
         pack_gqa_,
         sm_margin);
-  } else {
+  } else if (
+      !page_table.has_value() || is_causal || window_size_left >= 0 || window_size_right >= 0 || sinks_.has_value() ||
+      num_heads != num_heads_k || max_seqlen_q == 2048 || max_seqlen_q == 4096 || max_seqlen_q == 8192) {
+    // Use chunked prefill for GQA/MQA
+    // Now we detect chunked prefill according to max_seqlen_q
     return chunkprefill::mha_fwd(
+        q,
+        k,
+        v,
+        q_v_,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        page_table,
+        kv_batch_idx_,
+        leftpad_k_,
+        rotary_cos_,
+        rotary_sin_,
+        seqlens_rotary_,
+        q_descale_,
+        k_descale_,
+        v_descale_,
+        softmax_scale_,
+        sinks_,
+        is_causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        is_rotary_interleaved,
+        scheduler_metadata_,
+        num_splits,
+        pack_gqa_,
+        sm_margin);
+  } else {
+    // TODO: support the cases for non-kv cache, causal, sliding window and sink.
+    return prefill::mha_fwd(
         q,
         k,
         v,

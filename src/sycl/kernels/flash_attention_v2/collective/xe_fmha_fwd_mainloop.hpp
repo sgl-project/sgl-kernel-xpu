@@ -412,6 +412,8 @@ struct FMHAFwdMainloop<
           cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
         }
 
+        barrier();
+
         /* K prefetch */
         for (int D = 0; D < size<4>(pKgK); D++) {
           int K_next = K + Stages;
@@ -491,6 +493,8 @@ struct FMHAFwdMainloop<
         reorder(tVrV, tArV);
         cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
       }
+
+      barrier();
 
       /* K prefetch */
       for (int D = 0; D < size<4>(pKgK); D++) {

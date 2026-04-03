@@ -11,9 +11,14 @@
 #define CHECK_SHAPE(x, ...) \
   TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+#define CHECK_LAST_DIM_CONTIGUOUS(x) \
+  TORCH_CHECK(x.strides()[x.strides().size() - 1] == 1, #x "must be contiguous at last dimension")
 #define CHECK_INPUT(x) \
   CHECK_DEVICE(x);     \
   CHECK_CONTIGUOUS(x);
+#define CHECK_LAST_DIM_CONTIGUOUS_INPUT(x) \
+  CHECK_DEVICE(x);                         \
+  CHECK_LAST_DIM_CONTIGUOUS(x)
 
 #define DISPATCH_CASE_INTEGRAL_TYPES(...)              \
   AT_DISPATCH_CASE(at::ScalarType::Byte, __VA_ARGS__)  \
@@ -31,6 +36,12 @@
   AT_DISPATCH_CASE(at::ScalarType::BFloat16, __VA_ARGS__)
 
 #define DISPATCH_FLOAT_TYPES(TYPE, NAME, ...) AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_FLOAT_TYPES(__VA_ARGS__))
+
+static inline void barrier() {
+  // Compiler + hardware memory fence for work-group–level synchronization.
+  asm volatile("lsc_fence.ugm.none.group\n" ::: "memory");
+  asm volatile("barrier\n" ::: "memory");
+}
 
 using DeviceId = at::DeviceIndex;
 

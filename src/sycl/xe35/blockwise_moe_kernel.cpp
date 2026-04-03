@@ -3,7 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  **************************************************************************************************/
 /*! \file
-    \brief Block-scaled Grouped GEMM for MoE (MXFP4/FP8) on Intel XPU (xe35).
+    \brief Block-scaled Grouped GEMM for MoE (MXFP4 and MXFP8) on Intel XPU (xe35).
+
+    MXFP4: E2M1 + UE8M0 scales, block size 32, HW-accelerated via XE_BDPAS.
+    MXFP8: E4M3 + fp32 scales, block size 128, software-scaled path.
+    Both share a common grouped GEMM runner interface.
 */
 
 // clang-format off
@@ -19,6 +23,7 @@
 #include "cutlass/epilogue/collective/xe_epilogue.hpp"
 #include "cutlass/epilogue/fusion/xe_callbacks.hpp"
 #include "cutlass/float_subbyte.h"
+#include "cutlass/float8.h"
 #include "cutlass/gemm/collective/collective_mma.hpp"
 #include "cutlass/gemm/device/gemm_universal.h"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
@@ -30,79 +35,70 @@
 using namespace cute;
 using namespace cutlass::gemm;
 
+// CUTLASS kernel type definitions
 namespace at::native::xpu {
 
-template <typename ElementType_, int BlockSize_, int TileK_>
-struct BlockScaledGemmConfig {
-  using ElementType = ElementType_;
-  using MmaType = typename ElementType::DataType;
-  using ElementInputA = typename ElementType::DataType;
-  using ElementInputB = typename ElementType::DataType;
-  using ElementScale = typename ElementType::ScaleFactorType;
+// Common types
+using GroupedProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
+using UnderlyingProblemShapeType = typename GroupedProblemShape::UnderlyingProblemShape;
 
-  static constexpr int BlockSize = BlockSize_;
-  static constexpr int TileK = TileK_;
+// MXFP4: E2M1 + UE8M0 scales, block=32, A=RowMajor, B=ColumnMajor, symmetric MN-major scale strides
+struct MXFP4Types {
 
-  using ElementAccumulator = float;
-  using ElementComputeEpilogue = float;
-  // TODO: Fuse quantization conversion to output bf16/fp16 to avoid an
-  // extra quantize op.  For now the output remains float32.
-  using ElementOutput = float;
-  using ElementC = float;
+  using ElementType     = cutlass::mx_float4_t<float_e2m1_t>;
+  using ElementInputA   = typename ElementType::DataType;    // float_e2m1_t
+  using ElementInputB   = typename ElementType::DataType;    // float_e2m1_t
+  using ElementScale    = typename ElementType::ScaleFactorType;  // float_ue8m0_t
+
+
+  using ElementAccumulator       = float;
+  using ElementComputeEpilogue   = float;
+  using ElementOutput            = float;
+
 
   using LayoutA = cutlass::layout::RowMajor;
   using LayoutB = cutlass::layout::ColumnMajor;
   using LayoutC = cutlass::layout::RowMajor;
   using LayoutD = cutlass::layout::RowMajor;
-  using StrideScale = cute::Stride<_1, int64_t, int64_t>;
 
-  using GmemTiledCopyA = void;
-  using GmemTiledCopyB = void;
+  // Scale strides (both MN-major)
+  using StrideScaleA = cute::Stride<_1, int64_t, int64_t>;
+  using StrideScaleB = cute::Stride<_1, int64_t, int64_t>;
+
+
+  static constexpr int BlockSize = 32;
+  static constexpr int TileK     = 64;
+
+  // Gmem copy atoms (void = auto-select)
+  using GmemTiledCopyA      = void;
+  using GmemTiledCopyB      = void;
   using GmemTiledCopyScaleA = void;
   using GmemTiledCopyScaleB = void;
-};
-
-template <typename Config>
-class BlockScaledGroupedGemmKernel {
- public:
-  using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
-  using GroupScheduler = cutlass::gemm::GroupScheduler;
-  using ElementInputA = typename Config::ElementInputA;
-  using ElementInputB = typename Config::ElementInputB;
-  using ElementScale = typename Config::ElementScale;
-  using ElementOutput = typename Config::ElementOutput;
-  using ElementAccumulator = typename Config::ElementAccumulator;
-  using ElementComputeEpilogue = typename Config::ElementComputeEpilogue;
-  using LayoutA = typename Config::LayoutA;
-  using LayoutB = typename Config::LayoutB;
-  using LayoutC = typename Config::LayoutC;
-  using LayoutD = typename Config::LayoutD;
-  using StrideScale = typename Config::StrideScale;
-
-  static constexpr int BlockSize = Config::BlockSize;
-  static constexpr int TileK = Config::TileK;
-  static constexpr int PipelineStages = 2;
 
   using TileShape = Shape<_512, _512, Int<TileK>>;
+
+  // Thread layout (8×4 SG tiling, n-major)
+  using ThreadLayout = cute::Layout<Shape<_8, _4, _1>, cute::Stride<_4, _1, _0>>;
+
 
   using TiledMma = typename TiledMMAHelper<
       MMA_Atom<XE_BDPAS_TT<8, float, ElementInputA>>,
       cute::Layout<TileShape>,
-      cute::Layout<Shape<_8, _4, _1>, cute::Stride<_4, _1, _0>>>::TiledMMA;
+      ThreadLayout>::TiledMMA;
 
-  using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16BlockScaledGroup<PipelineStages>;
+  // Mainloop dispatch (integer GroupSize → MXFP specialization)
+  static constexpr int PipelineStages = 2;
+  using GEMMDispatchPolicy    = cutlass::gemm::MainloopIntelXeXMX16BlockScaledGroup<PipelineStages>;
   using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeXMX16Group;
 
+
   using EpilogueOp = cutlass::epilogue::fusion::LinearCombination<
-      ElementOutput,
-      ElementComputeEpilogue,
-      ElementAccumulator,
-      ElementAccumulator,
+      ElementOutput, ElementComputeEpilogue, ElementAccumulator, ElementAccumulator,
       cutlass::FloatRoundStyle::round_to_nearest>;
+  using FusionCallBacks = cutlass::epilogue::fusion::FusionCallbacks<
+      EpilogueDispatchPolicy, EpilogueOp, TileShape, decltype(tile_shape(TiledMma()))>;
 
-  using FusionCallBacks = cutlass::epilogue::fusion::
-      FusionCallbacks<EpilogueDispatchPolicy, EpilogueOp, TileShape, decltype(tile_shape(TiledMma()))>;
-
+  // Collective epilogue (legacy path, explicit copy atoms)
   using CollectiveEpilogue = cutlass::epilogue::collective::CollectiveEpilogue<
       EpilogueDispatchPolicy,
       TileShape,
@@ -118,37 +114,143 @@ class BlockScaledGroupedGemmKernel {
       void,
       void>;
 
+
   using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
       GEMMDispatchPolicy,
       TileShape,
       cute::tuple<ElementInputA, ElementScale>,
-      cute::tuple<cutlass::gemm::TagToStrideA_t<LayoutA*>, StrideScale*>,
+      cute::tuple<cutlass::gemm::TagToStrideA_t<LayoutA*>, StrideScaleA*>,
       cute::tuple<ElementInputB, ElementScale>,
-      cute::tuple<cutlass::gemm::TagToStrideB_t<LayoutB*>, StrideScale*>,
+      cute::tuple<cutlass::gemm::TagToStrideB_t<LayoutB*>, StrideScaleB*>,
       TiledMma,
-      cute::tuple<typename Config::GmemTiledCopyA, typename Config::GmemTiledCopyScaleA>,
-      void,
-      void,
-      cute::identity,
-      cute::tuple<typename Config::GmemTiledCopyB, typename Config::GmemTiledCopyScaleB>,
-      void,
-      void,
-      cute::identity>;
+      cute::tuple<GmemTiledCopyA, GmemTiledCopyScaleA>,
+      void, void, cute::identity,
+      cute::tuple<GmemTiledCopyB, GmemTiledCopyScaleB>,
+      void, void, cute::identity>;
 
-  using GemmKernel =
-      cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue, GroupScheduler>;
 
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      GroupedProblemShape, CollectiveMainloop, CollectiveEpilogue, cutlass::gemm::GroupScheduler>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+
   using StrideA = typename Gemm::GemmKernel::InternalStrideA;
   using StrideB = typename Gemm::GemmKernel::InternalStrideB;
   using StrideC = typename Gemm::GemmKernel::InternalStrideC;
   using StrideD = typename Gemm::GemmKernel::InternalStrideD;
-  using StrideScaleA = StrideScale;
-  using StrideScaleB = StrideScale;
-  using UnderlyingProblemShape = typename ProblemShape::UnderlyingProblemShape;
+};
 
-  static void
-  run(
+// MXFP8: E4M3 + fp32 scales, block=128, A/B=RowMajor, asymmetric scale strides (A=col-major, B=row-major)
+struct MXFP8Types {
+
+  using ElementInputA   = cutlass::float_e4m3_t;
+  using ElementInputB   = cutlass::float_e4m3_t;
+  using ElementScale    = float;  // fp32 scale factors
+
+
+  using ElementAccumulator       = float;
+  using ElementComputeEpilogue   = float;
+  using ElementOutput            = float;
+
+
+  using LayoutA = cutlass::layout::RowMajor;
+  using LayoutB = cutlass::layout::ColumnMajor;  // B is (N, K) with K-contiguous (PyTorch standard)
+  using LayoutC = cutlass::layout::RowMajor;
+  using LayoutD = cutlass::layout::RowMajor;
+
+  // Scale strides (asymmetric: A=col-major, B=row-major)
+  using StrideScaleA = cute::Stride<_1, int64_t, int64_t>;
+  using StrideScaleB = cute::Stride<int64_t, _1, int64_t>;
+
+  static constexpr int BlockSize = 128;
+  static constexpr int TileK     = 32;
+
+
+  using GmemTiledCopyA      = void;
+  using GmemTiledCopyB      = void;
+  using GmemTiledCopyScaleA = void;
+  using GmemTiledCopyScaleB = void;
+
+  using TileShape = Shape<_256, _256, Int<TileK>>;
+
+  using ThreadLayout = cute::Layout<Shape<_8, _4, _1>, cute::Stride<_4, _1, _0>>;
+
+  // TiledMMA (XE_BDPAS_TT + fp32 scales → software scaling path)
+  using TiledMma = typename TiledMMAHelper<
+      MMA_Atom<XE_BDPAS_TT<8, float, ElementInputA>>,
+      cute::Layout<TileShape>,
+      ThreadLayout>::TiledMMA;
+
+  // Mainloop dispatch (tuple GroupSize → FP8 block-scaled mainloop)
+  static constexpr int PipelineStages = 2;
+  using GroupSizeMNK = cute::tuple<cute::_1, cute::Int<BlockSize>, cute::Int<BlockSize>>;
+  using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16BlockScaledGroupImpl<
+      PipelineStages, GroupSizeMNK>;
+  using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeGenericGroup;
+
+
+  using EpilogueOp = cutlass::epilogue::fusion::LinearCombination<
+      ElementOutput, ElementComputeEpilogue, ElementAccumulator, ElementAccumulator,
+      cutlass::FloatRoundStyle::round_to_nearest>;
+  using FusionCallBacks = cutlass::epilogue::fusion::FusionCallbacks<
+      EpilogueDispatchPolicy, EpilogueOp, TileShape, decltype(tile_shape(TiledMma()))>;
+
+  // Collective epilogue (generic group path, no explicit copy atoms)
+  using CollectiveEpilogue = cutlass::epilogue::collective::CollectiveEpilogue<
+      EpilogueDispatchPolicy,
+      TileShape,
+      void,   // EpilogueTile = void (auto)
+      ElementAccumulator,
+      cutlass::gemm::TagToStrideC_t<LayoutC*>,
+      ElementOutput,
+      cutlass::gemm::TagToStrideC_t<LayoutD*>,
+      FusionCallBacks,
+      void, void>;  // no explicit copy atoms
+
+
+  using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+      GEMMDispatchPolicy,
+      TileShape,
+      cute::tuple<ElementInputA, ElementScale>,
+      cute::tuple<cutlass::gemm::TagToStrideA_t<LayoutA*>, StrideScaleA*>,
+      cute::tuple<ElementInputB, ElementScale>,
+      cute::tuple<cutlass::gemm::TagToStrideB_t<LayoutB*>, StrideScaleB*>,
+      TiledMma,
+      cute::tuple<GmemTiledCopyA, GmemTiledCopyScaleA>,
+      void, void, cute::identity,
+      cute::tuple<GmemTiledCopyB, GmemTiledCopyScaleB>,
+      void, void, cute::identity>;
+
+
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      GroupedProblemShape, CollectiveMainloop, CollectiveEpilogue, cutlass::gemm::GroupScheduler>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+
+  using StrideA = typename Gemm::GemmKernel::InternalStrideA;
+  using StrideB = typename Gemm::GemmKernel::InternalStrideB;
+  using StrideC = typename Gemm::GemmKernel::InternalStrideC;
+  using StrideD = typename Gemm::GemmKernel::InternalStrideD;
+};
+
+// Shared grouped GEMM runner (sets up CUTLASS args and launches the kernel)
+template <typename Types>
+class BlockScaledGroupedGemmRunner {
+ public:
+  using Gemm          = typename Types::Gemm;
+  using GemmKernel    = typename Gemm::GemmKernel;
+  using ElementInputA = typename Types::ElementInputA;
+  using ElementInputB = typename Types::ElementInputB;
+  using ElementScale  = typename Types::ElementScale;
+  using ElementOutput = typename Types::ElementOutput;
+  using StrideA       = typename Types::StrideA;
+  using StrideB       = typename Types::StrideB;
+  using StrideC       = typename Types::StrideC;
+  using StrideD       = typename Types::StrideD;
+  using StrideScaleA  = typename Types::StrideScaleA;
+  using StrideScaleB  = typename Types::StrideScaleB;
+
+  static void run(
       torch::Tensor& output,
       torch::Tensor& a_ptrs,
       torch::Tensor& b_ptrs,
@@ -162,182 +264,201 @@ class BlockScaledGroupedGemmKernel {
       const torch::Tensor& problem_sizes,
       const torch::Tensor& expert_offsets,
       const torch::Tensor& workspace) {
-    TORCH_CHECK(problem_sizes.dim() == 2 && problem_sizes.size(1) == 3, "problem_sizes must be (num_experts, 3)");
-    TORCH_CHECK(problem_sizes.size(0) == expert_offsets.size(0), "Expert count mismatch");
-    TORCH_CHECK(
-        problem_sizes.scalar_type() == torch::kInt32 && expert_offsets.scalar_type() == torch::kInt32,
-        "Indices must be int32");
-    TORCH_CHECK(output.scalar_type() == torch::kFloat32, "Output must be float32");
+
+    // Validate inputs
+    TORCH_CHECK(problem_sizes.dim() == 2 && problem_sizes.size(1) == 3,
+                "problem_sizes must be (num_experts, 3)");
+    TORCH_CHECK(problem_sizes.size(0) == expert_offsets.size(0),
+                "Expert count mismatch");
+    TORCH_CHECK(problem_sizes.scalar_type() == torch::kInt32 &&
+                expert_offsets.scalar_type() == torch::kInt32,
+                "Indices must be int32");
+    TORCH_CHECK(output.scalar_type() == torch::kFloat32,
+                "Output must be float32");
 
     int num_groups = static_cast<int>(expert_offsets.size(0));
-    TORCH_CHECK(num_groups > 0, "Number of experts must be positive, got ", num_groups);
+    TORCH_CHECK(num_groups > 0,
+                "Number of experts must be positive, got ", num_groups);
 
-    TORCH_CHECK(
-        a.dim() == 3, "Input tensor A must be 3-dimensional (num_experts, M, K_packed), got ", a.dim(), " dimensions");
-    TORCH_CHECK(
-        b.dim() == 3, "Input tensor B must be 3-dimensional (num_experts, N, K_packed), got ", b.dim(), " dimensions");
-    TORCH_CHECK(
-        scales_a.dim() == 3,
-        "Scales tensor A must be 3-dimensional (num_experts, M, K/BlockSize), got ",
-        scales_a.dim(),
-        " dimensions");
-    TORCH_CHECK(
-        scales_b.dim() == 3,
-        "Scales tensor B must be 3-dimensional (num_experts, N, K/BlockSize), got ",
-        scales_b.dim(),
-        " dimensions");
-    TORCH_CHECK(
-        output.dim() == 3,
-        "Output tensor must be 3-dimensional (num_experts, M, N), got ",
-        output.dim(),
-        " dimensions");
+    TORCH_CHECK(a.dim() == 3,
+                "Input tensor A must be 3-dimensional, got ", a.dim(), " dimensions");
+    TORCH_CHECK(b.dim() == 3,
+                "Input tensor B must be 3-dimensional, got ", b.dim(), " dimensions");
+    TORCH_CHECK(scales_a.dim() == 3,
+                "Scales tensor A must be 3-dimensional, got ", scales_a.dim(), " dimensions");
+    TORCH_CHECK(scales_b.dim() == 3,
+                "Scales tensor B must be 3-dimensional, got ", scales_b.dim(), " dimensions");
+    TORCH_CHECK(output.dim() == 3,
+                "Output tensor must be 3-dimensional, got ", output.dim(), " dimensions");
 
-    TORCH_CHECK(
-        a.size(0) == num_groups,
-        "Tensor A batch size must match num_experts: expected ",
-        num_groups,
-        " got ",
-        a.size(0));
-    TORCH_CHECK(
-        b.size(0) == num_groups,
-        "Tensor B batch size must match num_experts: expected ",
-        num_groups,
-        " got ",
-        b.size(0));
-    TORCH_CHECK(
-        scales_a.size(0) == num_groups,
-        "Scales A batch size must match num_experts: expected ",
-        num_groups,
-        " got ",
-        scales_a.size(0));
-    TORCH_CHECK(
-        scales_b.size(0) == num_groups,
-        "Scales B batch size must match num_experts: expected ",
-        num_groups,
-        " got ",
-        scales_b.size(0));
-    TORCH_CHECK(
-        output.size(0) == num_groups,
-        "Output batch size must match num_experts: expected ",
-        num_groups,
-        " got ",
-        output.size(0));
+    TORCH_CHECK(a.size(0) == num_groups,
+                "Tensor A batch size must match num_experts: expected ", num_groups, " got ", a.size(0));
+    TORCH_CHECK(b.size(0) == num_groups,
+                "Tensor B batch size must match num_experts: expected ", num_groups, " got ", b.size(0));
+    TORCH_CHECK(scales_a.size(0) == num_groups,
+                "Scales A batch size must match num_experts: expected ", num_groups, " got ", scales_a.size(0));
+    TORCH_CHECK(scales_b.size(0) == num_groups,
+                "Scales B batch size must match num_experts: expected ", num_groups, " got ", scales_b.size(0));
+    TORCH_CHECK(output.size(0) == num_groups,
+                "Output batch size must match num_experts: expected ", num_groups, " got ", output.size(0));
 
-    TORCH_CHECK(a.is_contiguous(), "Input tensor A must be contiguous. Use .contiguous() before calling.");
-    TORCH_CHECK(b.is_contiguous(), "Input tensor B must be contiguous. Use .contiguous() before calling.");
-    TORCH_CHECK(scales_a.is_contiguous(), "Scales tensor A must be contiguous. Use .contiguous() before calling.");
-    TORCH_CHECK(scales_b.is_contiguous(), "Scales tensor B must be contiguous. Use .contiguous() before calling.");
+    TORCH_CHECK(a.is_contiguous(), "Input tensor A must be contiguous.");
+    TORCH_CHECK(b.is_contiguous(), "Input tensor B must be contiguous.");
+    TORCH_CHECK(scales_a.is_contiguous(), "Scales tensor A must be contiguous.");
+    TORCH_CHECK(scales_b.is_contiguous(), "Scales tensor B must be contiguous.");
     TORCH_CHECK(output.is_contiguous(), "Output tensor must be contiguous.");
-
     TORCH_CHECK(a_ptrs.is_contiguous(), "Pointer array a_ptrs must be contiguous");
     TORCH_CHECK(b_ptrs.is_contiguous(), "Pointer array b_ptrs must be contiguous");
     TORCH_CHECK(out_ptrs.is_contiguous(), "Pointer array out_ptrs must be contiguous");
     TORCH_CHECK(a_scales_ptrs.is_contiguous(), "Pointer array a_scales_ptrs must be contiguous");
     TORCH_CHECK(b_scales_ptrs.is_contiguous(), "Pointer array b_scales_ptrs must be contiguous");
-
-    cutlass::KernelHardwareInfo hw_info;
-    hw_info.device_id = static_cast<int>(a.device().index());
-    hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
-
     TORCH_CHECK(problem_sizes.is_contiguous(), "problem_sizes must be contiguous");
 
-    // Compute strides on device to avoid host roundtrips.
-    auto device = problem_sizes.device();
+    // Hardware info
+    cutlass::KernelHardwareInfo hw_info;
+    hw_info.device_id = static_cast<int>(a.device().index());
+    hw_info.sm_count  = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+
+    // Get the current PyTorch XPU stream so the CUTLASS kernel is enqueued
+    // on the same queue as the stride-tensor ops (stream ordering guarantees
+    // correctness without a host-side synchronize).
+    auto stream = at::xpu::getCurrentXPUStream(a.device().index());
+    sycl::queue& queue = stream.queue();
+
+    // Build per-group strides on device
+    auto device  = problem_sizes.device();
     auto opts_i64 = torch::TensorOptions().dtype(torch::kInt64).device(device);
 
-    auto M_col = problem_sizes.select(1, 0);  // [num_groups] int32
+    auto M_col = problem_sizes.select(1, 0);
     auto N_col = problem_sizes.select(1, 1);
     auto K_col = problem_sizes.select(1, 2);
 
-    // StrideA/B: single int64 leading dim = K per group.
-    torch::Tensor stride_AB_dev = K_col.to(torch::kInt64).contiguous();
-
-    // StrideC/D: leading dim = N per group.
+    torch::Tensor stride_A_dev = K_col.to(torch::kInt64).contiguous();
+    torch::Tensor stride_B_dev = K_col.to(torch::kInt64).contiguous();
     torch::Tensor stride_CD_dev = N_col.to(torch::kInt64).contiguous();
 
-    // Scale strides: {M or N, 0} per group.
-    auto zeros = torch::zeros({num_groups}, opts_i64);
+    // Scale strides (strategy differs per Types)
+    auto stride_SFA_dev = build_scale_stride_A(M_col, N_col, K_col, num_groups, opts_i64);
+    auto stride_SFB_dev = build_scale_stride_B(M_col, N_col, K_col, num_groups, opts_i64);
 
-    torch::Tensor stride_SFA_dev = torch::stack(
-        {M_col.to(torch::kInt64), zeros}, /*dim=*/1).contiguous();
-    torch::Tensor stride_SFB_dev = torch::stack(
-        {N_col.to(torch::kInt64), zeros}, /*dim=*/1).contiguous();
+    // Reinterpret device pointers for CUTLASS
+    auto* problem_sizes_ptr = reinterpret_cast<UnderlyingProblemShapeType*>(
+        problem_sizes.data_ptr<int32_t>());
+    auto* stride_A_ptr  = reinterpret_cast<StrideA*>(stride_A_dev.data_ptr<int64_t>());
+    auto* stride_B_ptr  = reinterpret_cast<StrideB*>(stride_B_dev.data_ptr<int64_t>());
+    auto* stride_C_ptr  = reinterpret_cast<StrideC*>(stride_CD_dev.data_ptr<int64_t>());
+    auto* stride_D_ptr  = reinterpret_cast<StrideD*>(stride_CD_dev.data_ptr<int64_t>());
+    auto* stride_SFA_ptr = reinterpret_cast<StrideScaleA*>(stride_SFA_dev.data_ptr<int64_t>());
+    auto* stride_SFB_ptr = reinterpret_cast<StrideScaleB*>(stride_SFB_dev.data_ptr<int64_t>());
 
-    // Reinterpret device pointers for CUTLASS.
-    auto* problem_sizes_device_ptr =
-        reinterpret_cast<UnderlyingProblemShape*>(problem_sizes.data_ptr<int32_t>());
-    auto* stride_A_device_ptr =
-        reinterpret_cast<StrideA*>(stride_AB_dev.data_ptr<int64_t>());
-    auto* stride_B_device_ptr =
-        reinterpret_cast<StrideB*>(stride_AB_dev.data_ptr<int64_t>());
-    auto* stride_C_device_ptr =
-        reinterpret_cast<StrideC*>(stride_CD_dev.data_ptr<int64_t>());
-    auto* stride_D_device_ptr =
-        reinterpret_cast<StrideD*>(stride_CD_dev.data_ptr<int64_t>());
-    auto* stride_SFA_device_ptr =
-        reinterpret_cast<StrideScaleA*>(stride_SFA_dev.data_ptr<int64_t>());
-    auto* stride_SFB_device_ptr =
-        reinterpret_cast<StrideScaleB*>(stride_SFB_dev.data_ptr<int64_t>());
-
+    // Build CUTLASS arguments
     typename Gemm::Arguments arguments;
     decltype(arguments.epilogue.thread) fusion_args;
     fusion_args.alpha = 1.0f;
-    fusion_args.beta = 0.0f;
+    fusion_args.beta  = 0.0f;
     fusion_args.alpha_ptr = nullptr;
-    fusion_args.beta_ptr = nullptr;
+    fusion_args.beta_ptr  = nullptr;
     fusion_args.alpha_ptr_array = nullptr;
-    fusion_args.beta_ptr_array = nullptr;
+    fusion_args.beta_ptr_array  = nullptr;
     fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
-    fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
+    fusion_args.dBeta  = {cute::_0{}, cute::_0{}, 0};
 
-    using RasterOrderOptions =
-        typename cutlass::gemm::kernel::detail::PersistentTileSchedulerXeGroup<ProblemShape>::RasterOrderOptions;
+    using RasterOrderOptions = typename cutlass::gemm::kernel::detail::
+        PersistentTileSchedulerXeGroup<GroupedProblemShape>::RasterOrderOptions;
 
-    typename Gemm::GemmKernel::Arguments gemm_args{
+    typename GemmKernel::Arguments gemm_args{
         cutlass::gemm::GemmUniversalMode::kGrouped,
-        typename Gemm::GemmKernel::ProblemShape{num_groups, problem_sizes_device_ptr, nullptr},
-        typename Gemm::GemmKernel::MainloopArguments{
+        typename GemmKernel::ProblemShape{num_groups, problem_sizes_ptr, nullptr},
+        typename GemmKernel::MainloopArguments{
             reinterpret_cast<ElementInputA const**>(a_ptrs.data_ptr()),
-            stride_A_device_ptr,
+            stride_A_ptr,
             reinterpret_cast<ElementInputB const**>(b_ptrs.data_ptr()),
-            stride_B_device_ptr,
+            stride_B_ptr,
             reinterpret_cast<ElementScale const**>(a_scales_ptrs.data_ptr()),
-            stride_SFA_device_ptr,
+            stride_SFA_ptr,
             reinterpret_cast<ElementScale const**>(b_scales_ptrs.data_ptr()),
-            stride_SFB_device_ptr,
-            BlockSize},
-        typename Gemm::GemmKernel::EpilogueArguments{
+            stride_SFB_ptr},
+        typename GemmKernel::EpilogueArguments{
             fusion_args,
             nullptr,
-            stride_C_device_ptr,
+            stride_C_ptr,
             reinterpret_cast<ElementOutput**>(out_ptrs.data_ptr()),
-            stride_D_device_ptr},
+            stride_D_ptr},
         hw_info,
-        typename Gemm::GemmKernel::TileSchedulerArguments{1, RasterOrderOptions::AlongN}};
+        typename GemmKernel::TileSchedulerArguments{1, RasterOrderOptions::AlongN}};
 
+    // Launch
     Gemm gemm_op;
-    TORCH_CHECK(
-        gemm_op.can_implement(gemm_args) == cutlass::Status::kSuccess, "CUTLASS cannot implement this configuration");
+    TORCH_CHECK(gemm_op.can_implement(gemm_args) == cutlass::Status::kSuccess,
+                "CUTLASS cannot implement this configuration");
 
     size_t workspace_size = Gemm::get_workspace_size(gemm_args);
-    TORCH_CHECK(
-        static_cast<size_t>(workspace.numel()) >= workspace_size,
-        "Workspace insufficient: need ",
-        workspace_size,
-        " bytes");
+    TORCH_CHECK(static_cast<size_t>(workspace.numel()) >= workspace_size,
+                "Workspace insufficient: need ", workspace_size, " bytes");
 
-    TORCH_CHECK(
-        gemm_op.initialize(gemm_args, workspace.data_ptr()) == cutlass::Status::kSuccess, "Failed to initialize");
-    TORCH_CHECK(gemm_op.run() == cutlass::Status::kSuccess, "Failed to run");
-    compat::wait();
+    TORCH_CHECK(gemm_op.initialize(gemm_args, workspace.data_ptr()) == cutlass::Status::kSuccess,
+                "Failed to initialize");
+    TORCH_CHECK(gemm_op.run(&queue) == cutlass::Status::kSuccess,
+                "Failed to run");
+  }
+
+ private:
+  // Scale stride builders (dispatched via SFINAE on StrideScaleA/B)
+
+  // A scales: Stride<_1, M, 0> — same layout for both MXFP4 and MXFP8
+  static torch::Tensor build_scale_stride_A(
+      const torch::Tensor& M_col,
+      const torch::Tensor& /*N_col*/,
+      const torch::Tensor& /*K_col*/,
+      int num_groups,
+      const torch::TensorOptions& opts_i64) {
+    auto zeros = torch::zeros({num_groups}, opts_i64);
+    return torch::stack({M_col.to(torch::kInt64), zeros}, /*dim=*/1).contiguous();
+  }
+
+  // B scales: dispatched on StrideScaleB layout (MXFP4=MN-major, MXFP8=row-major)
+  static torch::Tensor build_scale_stride_B(
+      const torch::Tensor& /*M_col*/,
+      const torch::Tensor& N_col,
+      const torch::Tensor& K_col,
+      int num_groups,
+      const torch::TensorOptions& opts_i64) {
+    return build_scale_stride_B_impl(N_col, K_col, num_groups, opts_i64,
+                                     StrideScaleB{});
+  }
+
+  // MXFP4: Stride<_1, N, 0> (MN-major)
+  static torch::Tensor build_scale_stride_B_impl(
+      const torch::Tensor& N_col,
+      const torch::Tensor& /*K_col*/,
+      int num_groups,
+      const torch::TensorOptions& opts_i64,
+      cute::Stride<_1, int64_t, int64_t> /*tag*/) {
+    auto zeros = torch::zeros({num_groups}, opts_i64);
+    return torch::stack({N_col.to(torch::kInt64), zeros}, /*dim=*/1).contiguous();
+  }
+
+  // MXFP8: Stride<K/BS, _1, 0> (row-major)
+  static torch::Tensor build_scale_stride_B_impl(
+      const torch::Tensor& /*N_col*/,
+      const torch::Tensor& K_col,
+      int num_groups,
+      const torch::TensorOptions& opts_i64,
+      cute::Stride<int64_t, _1, int64_t> /*tag*/) {
+    constexpr int BS = Types::BlockSize;
+    auto scale_k = torch::div(K_col.to(torch::kInt64) + (BS - 1), BS, "trunc");
+    auto zeros = torch::zeros({num_groups}, opts_i64);
+    return torch::stack({scale_k, zeros}, /*dim=*/1).contiguous();
   }
 };
 
-// MXFP4 configuration: E2M1 with 32-element blocks and TileK=64
-using MXFP4Config = BlockScaledGemmConfig<cutlass::mx_float4_t<float_e2m1_t>, 32, 64>;
-using MXFP4Kernel = BlockScaledGroupedGemmKernel<MXFP4Config>;
+
+using MXFP4Runner = BlockScaledGroupedGemmRunner<MXFP4Types>;
+using MXFP8Runner = BlockScaledGroupedGemmRunner<MXFP8Types>;
 
 }  // namespace at::native::xpu
+
+// Public entry points
 
 void mxfp4_blockwise_scaled_grouped_mm(
     torch::Tensor& output,
@@ -361,23 +482,57 @@ void mxfp4_blockwise_scaled_grouped_mm(
   TORCH_CHECK(workspace.device().is_xpu(), "Workspace tensor must be on XPU device");
 
   TORCH_CHECK(
-      a.scalar_type() == torch::kUInt8 && b.scalar_type() == torch::kUInt8, "Inputs must be uint8 (packed MXFP4)");
+      a.scalar_type() == torch::kUInt8 && b.scalar_type() == torch::kUInt8,
+      "Inputs must be uint8 (packed MXFP4)");
   TORCH_CHECK(
       scales_a.scalar_type() == torch::kUInt8 && scales_b.scalar_type() == torch::kUInt8,
       "Scales must be uint8 (UE8M0)");
 
-  at::native::xpu::MXFP4Kernel::run(
-      output,
-      a_ptrs,
-      b_ptrs,
-      out_ptrs,
-      a_scales_ptrs,
-      b_scales_ptrs,
-      a,
-      b,
-      scales_a,
-      scales_b,
-      problem_sizes,
-      expert_offsets,
-      workspace);
+  at::native::xpu::MXFP4Runner::run(
+      output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
+      a, b, scales_a, scales_b, problem_sizes, expert_offsets, workspace);
+}
+
+
+void fp8_blockwise_scaled_grouped_mm(
+    torch::Tensor& output,
+    torch::Tensor& a_ptrs,
+    torch::Tensor& b_ptrs,
+    torch::Tensor& out_ptrs,
+    torch::Tensor& a_scales_ptrs,
+    torch::Tensor& b_scales_ptrs,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const torch::Tensor& stride_a,
+    const torch::Tensor& stride_b,
+    const torch::Tensor& stride_c,
+    const torch::Tensor& layout_sfa,
+    const torch::Tensor& layout_sfb,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& workspace) {
+  // stride_a, stride_b, stride_c, layout_sfa, layout_sfb are accepted for
+  // interface compatibility but unused — strides are built internally.
+  (void)stride_a; (void)stride_b; (void)stride_c;
+  (void)layout_sfa; (void)layout_sfb;
+
+  TORCH_CHECK(a.device().is_xpu(), "Input tensor A must be on XPU device");
+  TORCH_CHECK(b.device().is_xpu(), "Input tensor B must be on XPU device");
+  TORCH_CHECK(scales_a.device().is_xpu(), "Scales tensor A must be on XPU device");
+  TORCH_CHECK(scales_b.device().is_xpu(), "Scales tensor B must be on XPU device");
+  TORCH_CHECK(output.device().is_xpu(), "Output tensor must be on XPU device");
+  TORCH_CHECK(workspace.device().is_xpu(), "Workspace tensor must be on XPU device");
+
+  TORCH_CHECK(
+      a.scalar_type() == torch::kFloat8_e4m3fn && b.scalar_type() == torch::kFloat8_e4m3fn,
+      "Inputs must be float8_e4m3fn");
+  TORCH_CHECK(
+      scales_a.scalar_type() == torch::kFloat32 && scales_b.scalar_type() == torch::kFloat32,
+      "Scales must be float32");
+
+  at::native::xpu::MXFP8Runner::run(
+      output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
+      a, b, scales_a, scales_b, problem_sizes, expert_offsets, workspace);
 }

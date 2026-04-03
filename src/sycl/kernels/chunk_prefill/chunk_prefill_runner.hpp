@@ -849,9 +849,9 @@ std::vector<at::Tensor> mha_fwd(
       AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
         if (params.is_causal) {
           ChunkPrefillConfig<
-              cute::Shape<cute::Int<512>, _64, _64>,
-              cute::Shape<cute::Int<512>, _32, _64>,
-              cute::Shape<cute::Int<512>, cute::Int<512>, _64>,
+              cute::Shape<cute::Int<256>, _64, _64>,
+              cute::Shape<cute::Int<256>, _32, _64>,
+              cute::Shape<cute::Int<256>, cute::Int<512>, _64>,
               cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
               PipelineStages,
               true,
@@ -862,9 +862,9 @@ std::vector<at::Tensor> mha_fwd(
               params.is_local,
               LocalMask,
               ChunkPrefillConfig<
-                  cute::Shape<cute::Int<512>, _64, _64>,
-                  cute::Shape<cute::Int<512>, _32, _64>,
-                  cute::Shape<cute::Int<512>, cute::Int<512>, _64>,
+                  cute::Shape<cute::Int<256>, _64, _64>,
+                  cute::Shape<cute::Int<256>, _32, _64>,
+                  cute::Shape<cute::Int<256>, cute::Int<512>, _64>,
                   cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
                   PipelineStages,
                   false,

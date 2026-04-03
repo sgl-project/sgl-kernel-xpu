@@ -521,7 +521,7 @@ std::vector<at::Tensor> mha_fwd(
   }
 
   // Currently only support head dims <= 256
-  static constexpr int max_headdim = 256;
+  static constexpr int max_headdim = 512;
   TORCH_CHECK(
       head_size <= max_headdim,
       "FlashAttention forward only supports head dimension at most " + std::to_string(max_headdim));
@@ -837,6 +837,34 @@ std::vector<at::Tensor> mha_fwd(
                   cute::Shape<_256, _64, _64>,
                   cute::Shape<_256, _32, _64>,
                   cute::Shape<_256, _256, _64>,
+                  cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+                  PipelineStages,
+                  false,
+                  LocalMask,
+                  Sink>::run(params))
+        }
+      })
+      break;
+    case 512:
+      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+        if (params.is_causal) {
+          ChunkPrefillConfig<
+              cute::Shape<cute::Int<256>, _64, _64>,
+              cute::Shape<cute::Int<256>, _32, _64>,
+              cute::Shape<cute::Int<256>, cute::Int<512>, _64>,
+              cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true,
+              false,
+              Sink>::run(params);
+        } else {
+          AT_DISPATCH_BOOL_NO_RETURN(
+              params.is_local,
+              LocalMask,
+              ChunkPrefillConfig<
+                  cute::Shape<cute::Int<256>, _64, _64>,
+                  cute::Shape<cute::Int<256>, _32, _64>,
+                  cute::Shape<cute::Int<256>, cute::Int<512>, _64>,
                   cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
                   PipelineStages,
                   false,

@@ -19,22 +19,25 @@ inline std::tuple<int64_t, int64_t, int64_t> _check_layer_norm_inputs(
     std::optional<torch::Tensor>& weight /* optional */,
     std::optional<torch::Tensor>& bias /* optional */) {
   CHECK_LAST_DIM_CONTIGUOUS(input);
-  CHECK_DIM(2, input);  // input: (batch_size, hidden_size)
-#define TENSOR_CHECK(T)                         \
-  if (T.has_value()) {                          \
-    CHECK_LAST_DIM_CONTIGUOUS(T.value());       \
-    auto device = input.device();               \
-    CHECK_EQ(T.value().device(), device);       \
-    CHECK_DIM(1, T.value());                    \
-    CHECK_EQ(input.size(1), T.value().size(0)); \
+  TORCH_CHECK(input.dim() == 2 || input.dim() == 3, "input must be a 2D or 3D tensor");
+#define TENSOR_CHECK(T)                          \
+  if (T.has_value()) {                           \
+    CHECK_LAST_DIM_CONTIGUOUS(T.value());        \
+    auto device = input.device();                \
+    CHECK_EQ(T.value().device(), device);        \
+    CHECK_DIM(1, T.value());                     \
+    CHECK_EQ(input.size(-1), T.value().size(0)); \
   }
 
   TENSOR_CHECK(weight)
   TENSOR_CHECK(bias)
 
-  unsigned int batch_size = input.size(0);
-  unsigned int hidden_size = input.size(1);
-  unsigned int batch_stride = input.stride(0);
+  int64_t hidden_size = input.size(-1);
+  int64_t batch_size = input.numel() / hidden_size;
+  // For 2D tensors stride(0) is the batch stride; for 3D contiguous tensors
+  // whose leading dims are flattened the stride between consecutive "rows" is
+  // still the second-to-last stride.
+  int64_t batch_stride = input.stride(-2);
 
   return std::make_tuple(batch_size, hidden_size, batch_stride);
 }

@@ -413,11 +413,12 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
   auto N = std::get<1>(M_N_S);
   auto input_batch_stride = std::get<2>(M_N_S);
 
-  Tensor input_ = (input.dim() == 1) ? input.reshape({M, N}) : input;
-  Tensor output_ = (output.dim() == 1) ? output.reshape({M, N}) : output;
+  // Flatten leading dimensions to 2D for the kernel
+  Tensor input_ = input.dim() <= 2 ? ((input.dim() == 1) ? input.reshape({M, N}) : input) : input.reshape({M, N});
+  Tensor output_ = output.dim() <= 2 ? ((output.dim() == 1) ? output.reshape({M, N}) : output) : output.reshape({M, N});
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
   Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
-  int64_t output_batch_stride = (output.dim() >= 2) ? output.stride(0) : N;
+  int64_t output_batch_stride = output_.stride(0);
 
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "RMSNormKernelImpl", [&]() {
@@ -443,12 +444,15 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
   auto M = std::get<0>(M_N_S);
   auto N = std::get<1>(M_N_S);
 
-  Tensor rstd = at::empty({M}, input.options().dtype(kFloat));
+  // Flatten leading dimensions to 2D for the kernel
+  Tensor input_ = (input.dim() > 2) ? input.reshape({M, N}) : input;
+  Tensor residual_ = (residual.dim() > 2) ? residual.reshape({M, N}) : residual;
+  Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
 
   SYCL_DISPATCH_FLOATING_TYPES(
-      at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
+      at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
         FusedAddRMSNormKernelImplInternal<scalar_t, scalar_t>(
-            input, weight, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual);
+            input_, weight, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual_);
       });
 }
 
@@ -460,11 +464,12 @@ void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& w
   auto N = std::get<1>(M_N_S);
   auto input_batch_stride = std::get<2>(M_N_S);
 
-  Tensor input_ = (input.dim() == 1) ? input.reshape({M, N}) : input;
-  Tensor output_ = (output.dim() == 1) ? output.reshape({M, N}) : output;
+  // Flatten leading dimensions to 2D for the kernel
+  Tensor input_ = input.dim() <= 2 ? ((input.dim() == 1) ? input.reshape({M, N}) : input) : input.reshape({M, N});
+  Tensor output_ = output.dim() <= 2 ? ((output.dim() == 1) ? output.reshape({M, N}) : output) : output.reshape({M, N});
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
   Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
-  int64_t output_batch_stride = (output.dim() >= 2) ? output.stride(0) : N;
+  int64_t output_batch_stride = output_.stride(0);
 
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
@@ -490,8 +495,10 @@ void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torc
   auto M = std::get<0>(M_N_S);
   auto N = std::get<1>(M_N_S);
 
-  Tensor input_ = (input.dim() == 1) ? input.reshape({M, N}) : input;
-  Tensor residual_ = (residual.dim() == 1) ? residual.reshape({M, N}) : residual;
+  // Flatten leading dimensions to 2D for the kernel
+  Tensor input_ = input.dim() <= 2 ? ((input.dim() == 1) ? input.reshape({M, N}) : input) : input.reshape({M, N});
+  Tensor residual_ =
+      residual.dim() <= 2 ? ((residual.dim() == 1) ? residual.reshape({M, N}) : residual) : residual.reshape({M, N});
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
   Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
 

@@ -37,6 +37,7 @@
 
 #include "kernels/chunk_prefill/chunk_prefill_runner.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp"
+
 #include "kernels/flash_attention_v2/xe_fmha_fwd_prefill_runner.hpp"
 
 namespace decode {
@@ -550,6 +551,37 @@ std::vector<at::Tensor> mha_fwd(
         is_rotary_interleaved,
         scheduler_metadata_,
         num_kv_splits,
+        pack_gqa_,
+        sm_margin);
+  } else {
+    // TODO: support the cases for non-kv cache, causal, sliding window and sink.
+    return prefill::mha_fwd(
+        q,
+        k,
+        v,
+        q_v_,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        page_table,
+        kv_batch_idx_,
+        leftpad_k_,
+        rotary_cos_,
+        rotary_sin_,
+        seqlens_rotary_,
+        q_descale_,
+        k_descale_,
+        v_descale_,
+        softmax_scale_,
+        sinks_,
+        is_causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        is_rotary_interleaved,
+        scheduler_metadata_,
+        num_splits,
         pack_gqa_,
         sm_margin);
   }

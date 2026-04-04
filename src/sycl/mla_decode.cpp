@@ -41,8 +41,8 @@
 #include <sycl/sycl.hpp>
 
 #include "Utils.h"
-#include "kernels/mla/mla_decode_dispatch.hpp"
-#include "kernels/mla/mla_decode_types.hpp"
+#include "sycl/kernels/mla/device/mla_decode_dispatch.hpp"
+#include "sycl/kernels/mla/device/mla_decode_types.hpp"
 
 namespace {
 
@@ -86,7 +86,7 @@ namespace {
 }  // namespace
 
 /// @brief Dispatch kernel implementation for MLA decode.
-void cutlass_mla_decode(
+void flash_mla_decode(
     at::Tensor& out,                        // (batch, num_heads, latent_dim)
     const at::Tensor& q_nope,               // (batch, num_heads, latent_dim)
     const at::Tensor& q_pe,                 // (batch, num_heads, rope_dim)
@@ -127,7 +127,7 @@ void cutlass_mla_decode(
 #undef DISPATCH_MLA_DTYPE
 
 int64_t
-cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches, int64_t sm_count, int64_t num_kv_splits) {
+flash_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches, int64_t sm_count, int64_t num_kv_splits) {
   // Workspace size depends on ElementAcc and ElementLSE (same as ElementAcc)
   // which are float, so Element type here doesn't matter.
   using MlaXeType = MlaXe<sycl::half>;

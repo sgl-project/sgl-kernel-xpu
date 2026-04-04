@@ -74,7 +74,7 @@ std::vector<at::Tensor> mha_fwd(
     std::optional<bool> pack_gqa_,
     int const sm_margin);
 
-void cutlass_mla_decode(
+void flash_mla_decode(
     torch::Tensor& out,
     const torch::Tensor& q_nope,
     const torch::Tensor& q_pe,
@@ -85,5 +85,5 @@ void cutlass_mla_decode(
     double sm_scale,
     int64_t num_kv_splits = -1);
 
-int64_t cutlass_mla_get_workspace_size(
+int64_t flash_mla_get_workspace_size(
     int64_t max_seq_len, int64_t num_batches, int64_t sm_count = 0, int64_t num_kv_splits = -1);

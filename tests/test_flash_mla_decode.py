@@ -4,7 +4,7 @@ import sys
 import pytest
 import torch
 import torch.nn.functional as F
-from sgl_kernel import cutlass_mla_decode, cutlass_mla_get_workspace_size
+from sgl_kernel import flash_mla_decode, flash_mla_get_workspace_size
 from torch import Tensor
 
 device = torch.device("xpu")
@@ -66,7 +66,7 @@ def ref_mla(
 @pytest.mark.parametrize("num_heads", [16, 32, 64, 128])
 # TODO: enable num_kv_splits >1
 @pytest.mark.parametrize("num_kv_splits", [-1, 1])
-def test_cutlass_mla_decode(
+def test_flash_mla_decode(
     dtype: torch.dtype,
     mean_seq_len: int,
     bs: int,
@@ -120,7 +120,7 @@ def test_cutlass_mla_decode(
     seq_lens_xpu = seq_lens_cpu.to(device=device)
     del q_cpu, kv_cache_cpu, block_table_cpu, seq_lens_cpu
 
-    workspace_size = cutlass_mla_get_workspace_size(
+    workspace_size = flash_mla_get_workspace_size(
         block_num * block_size, bs, num_kv_splits=num_kv_splits
     )
     workspace = torch.empty(workspace_size, device=device, dtype=torch.uint8)
@@ -129,7 +129,7 @@ def test_cutlass_mla_decode(
     q_nope.copy_(q_xpu[:, :, :dv])
     q_pe = q_xpu[:, :, dv:].clone()
     del q_xpu
-    out = cutlass_mla_decode(
+    out = flash_mla_decode(
         q_nope,
         q_pe,
         kv_cache_xpu,

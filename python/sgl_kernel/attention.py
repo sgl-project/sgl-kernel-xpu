@@ -51,7 +51,7 @@ def merge_state_v2(
     return v_merged, s_merged
 
 
-def cutlass_mla_decode(
+def flash_mla_decode(
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
     kv_c_and_k_pe_cache: torch.Tensor,
@@ -118,7 +118,7 @@ def cutlass_mla_decode(
         else q_nope.new_empty((B_q, MAX_HEADS, D_latent))
     )
 
-    torch.ops.sgl_kernel.cutlass_mla_decode.default(
+    torch.ops.sgl_kernel.flash_mla_decode.default(
         out,
         q_nope,
         q_pe,
@@ -132,11 +132,11 @@ def cutlass_mla_decode(
     return out if device_type == "xpu" else out[:, :H].contiguous()
 
 
-def cutlass_mla_get_workspace_size(
+def flash_mla_get_workspace_size(
     max_seq_len: int, num_batches: int, sm_count: int = 0, num_kv_splits: int = -1
 ) -> int:
     assert max_seq_len > 0, f"max_seq_len must be greater than 0, got {max_seq_len}"
     assert num_batches > 0, f"num_batches must be greater than 0, got {num_batches}"
-    return torch.ops.sgl_kernel.cutlass_mla_get_workspace_size.default(
+    return torch.ops.sgl_kernel.flash_mla_get_workspace_size.default(
         max_seq_len, num_batches, sm_count, num_kv_splits
     )

@@ -13,8 +13,8 @@ if os.path.exists(cuda_path):
 from sgl_kernel import common_ops
 from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
-    cutlass_mla_decode,
-    cutlass_mla_get_workspace_size,
+    flash_mla_decode,
+    flash_mla_get_workspace_size,
     lightning_attention_decode,
     merge_state,
     merge_state_v2,

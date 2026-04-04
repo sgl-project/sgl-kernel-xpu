@@ -42,12 +42,12 @@
 #include <cute/tensor.hpp>
 #include <sycl/sycl.hpp>
 
-#include "../../Utils.h"
-#include "mla_runner.hpp"
-#include "mla_tile_scheduler.hpp"
-#include "xe_mla_epilogue.hpp"
-#include "xe_mla_kernel.hpp"
-#include "xe_mla_mainloop.hpp"
+#include "../../../Utils.h"
+#include "sycl/kernels/mla/collective/xe_mla_epilogue.hpp"
+#include "sycl/kernels/mla/collective/xe_mla_mainloop.hpp"
+#include "sycl/kernels/mla/device/mla_runner.hpp"
+#include "sycl/kernels/mla/kernel/mla_tile_scheduler.hpp"
+#include "sycl/kernels/mla/kernel/xe_mla_kernel.hpp"
 
 using namespace cute;
 

@@ -32,7 +32,7 @@
 // Template parameters: ELEM_TAG=@ELEM_TAG@, PAGE_SIZE=@PAGE_SIZE@
 #define SYCL_INTEL_TARGET 20
 
-#include "sycl/kernels/mla/mla_decode_types.hpp"
+#include "sycl/kernels/mla/device/mla_decode_types.hpp"
 
 namespace mla_decode {
 

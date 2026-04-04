@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import torch
 import triton
-from sgl_kernel import cutlass_mla_decode, cutlass_mla_get_workspace_size
+from sgl_kernel import flash_mla_decode, flash_mla_get_workspace_size
 
 bs_range = [1, 4, 16]
 kv_len_range = [1024, 2048, 4096, 8192]
@@ -85,14 +85,14 @@ def benchmark(batch_size, seq_len, provider, block_size, num_kv_splits):
     q_nope.copy_(q[:, :, :dv])
     q_pe = q[:, :, dv:].clone()
 
-    workspace_size = cutlass_mla_get_workspace_size(
+    workspace_size = flash_mla_get_workspace_size(
         block_num * block_size, batch_size, num_kv_splits=num_kv_splits
     )
     workspace = torch.empty(workspace_size, device="xpu", dtype=torch.uint8)
     scale = (512 + 64) ** (-0.5)
     quantiles = [0.5, 0.25, 0.75]
     ms, min_ms, max_ms = triton.testing.do_bench(
-        lambda: cutlass_mla_decode(
+        lambda: flash_mla_decode(
             q_nope,
             q_pe,
             kv_cache,
@@ -283,7 +283,7 @@ def plot_data(df):
 
     # Use appropriate filename based on whether we have comparison data
     if has_previous:
-        plot_path = "bench_bmg_mla_res/cutlass_mla_current_vs_previous.png"
+        plot_path = "bench_bmg_mla_res/flash_mla_current_vs_previous.png"
         plt.savefig(plot_path, dpi=150, bbox_inches="tight")
         plt.close()
         print(f"Comparison plot saved: {plot_path}")
@@ -291,7 +291,7 @@ def plot_data(df):
         print(f"  - Previous: {previous_csv_path}")
         print(f"  - Current:  {current_csv_path}")
     else:
-        plot_path = "bench_bmg_mla_res/cutlass_mla_current_results.png"
+        plot_path = "bench_bmg_mla_res/flash_mla_current_results.png"
         plt.savefig(plot_path, dpi=150, bbox_inches="tight")
         plt.close()
         print(f"Current results plot saved: {plot_path}")

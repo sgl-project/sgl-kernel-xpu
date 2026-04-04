@@ -27,7 +27,9 @@ void Xe20MoEGEMMLauncher(
     const int gemm_k,
     const int* num_rows_per_expert_device,
     const int num_experts,
-    int* workspace);
+    int* workspace,
+    float gemm1_alpha,
+    float gemm1_limit);
 
 using Tile_8_64_32 = Shape<_8, _64, _32>;
 using Tile_16_64_32 = Shape<_16, _64, _32>;
@@ -54,7 +56,9 @@ using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
       const int,                                                                        \
       const int*,                                                                       \
       const int,                                                                        \
-      int*);
+      int*,                                                                             \
+      float,                                                                            \
+      float);
 
 #define DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile, SGLayout)    \
   DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 0, true, true)   \
@@ -64,13 +68,19 @@ using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
   DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, true, true)   \
   DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, true, false)  \
   DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, false, true)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, false, false)
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, false, false) \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 2, true, true)   \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 2, true, false)  \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 2, false, true)  \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 2, false, false)
 
 #define DECLARE_XE20_MOE_TILE_FUSE(Tile, SGLayout, FuseAct)  \
   DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 0, FuseAct, true)  \
   DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 0, FuseAct, false) \
   DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, FuseAct, true)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, FuseAct, false)
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, FuseAct, false) \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 2, FuseAct, true)  \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 2, FuseAct, false)
 
 DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile_8_64_32, SG_1_4_1)
 DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile_16_64_32, SG_1_4_1)
@@ -96,7 +106,9 @@ DECLARE_XE20_MOE_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
       gemm_k,                                 \
       total_rows_for_experts.data_ptr<int>(), \
       n_experts,                              \
-      atomic_buffer.data_ptr<int>())
+      atomic_buffer.data_ptr<int>(),          \
+      static_cast<float>(gemm1_alpha),        \
+      static_cast<float>(gemm1_limit))
 
 #define DISPATCH_MOE_HELPER_BIAS(ActType, FuseAct, WithBias, ...) \
   do {                                                            \
@@ -125,6 +137,9 @@ DECLARE_XE20_MOE_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
       case 1:                                                            \
         DISPATCH_MOE_HELPER_FUSE_ACT(1, FuseAct, WithBias, __VA_ARGS__); \
         break;                                                           \
+      case 2:                                                            \
+        DISPATCH_MOE_HELPER_FUSE_ACT(2, FuseAct, WithBias, __VA_ARGS__); \
+        break;                                                           \
       default:                                                           \
         TORCH_CHECK(false, "Unsupported activation type");               \
     }                                                                    \
@@ -140,8 +155,10 @@ void moe_grouped_mm_nt_xe20(
     const std::optional<at::Tensor>& bias,
     const torch::Tensor& total_rows_for_experts,
     const int64_t n_experts,
-    const int64_t activation_type,  // 0=silu, 1=gelu
-    bool fuse_act) {
+    const int64_t activation_type,  // 0=silu, 1=gelu, 2=swiglu_gpt_oss
+    bool fuse_act,
+    double gemm1_alpha,
+    double gemm1_limit) {
   int total_m = activations.sizes()[0];
   int gemm_k = activations.sizes()[1];
   auto weights_shape = weights.sizes().vec();
@@ -161,6 +178,11 @@ void moe_grouped_mm_nt_xe20(
     TORCH_CHECK(output.sizes()[1] == gemm_n, "output must have the same number of columns as activations");
   }
   TORCH_CHECK(n_experts % 8 == 0, "n_experts must be a multiple of 8 for the current implementation");
+  if (bias.has_value()) {
+    TORCH_CHECK(
+        bias->scalar_type() == at::kFloat,
+        "moe_grouped_mm_nt_xe20: bias must be float32 (at::kFloat) to match kernel expectations");
+  }
   TORCH_CHECK(
       activations.scalar_type() == weights.scalar_type(), "activations and weights must have the same data type");
   TORCH_CHECK(

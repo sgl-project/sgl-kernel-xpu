@@ -14,7 +14,7 @@ function(add_group_gemm_xe20_inst TILE_M TILE_N TILE_K SG_SHAPE SG_STRIDE ACT_TY
     set(GROUP_GEMM_XE20_INST_SRCS ${GROUP_GEMM_XE20_INST_SRCS} PARENT_SCOPE)
 endfunction()
 
-foreach(act_type 0 1)
+foreach(act_type 0 1 2)
     foreach(with_bias true false)
         foreach(fuse_act true false)
             add_group_gemm_xe20_inst("_8" "_64" "_32" "_1, _4, _1" "_4, _1, _0" ${act_type} ${fuse_act} ${with_bias})

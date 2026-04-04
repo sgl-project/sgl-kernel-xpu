@@ -98,7 +98,7 @@ struct SwigluVec4Kernel {
 };
 
 template <typename scalar_t>
-void swiglu_with_alpha_and_limit_sycl(
+void swiglu_gpt_oss_sigmoid_alpha_sycl(
     const scalar_t* x,  // [B, 2*H]
     scalar_t* y,        // [B, H]
     size_t batch,
@@ -145,11 +145,11 @@ void swiglu_with_alpha_and_limit_sycl(
 
 #define CALL_SWIGLU_VEC4_LAUNCHER_SYCL(scalar_t)                                                           \
   {                                                                                                        \
-    swiglu_with_alpha_and_limit_sycl<scalar_t>(                                                            \
+    swiglu_gpt_oss_sigmoid_alpha_sycl<scalar_t>(                                                           \
         reinterpret_cast<const scalar_t*>(x_ptr), reinterpret_cast<scalar_t*>(y_ptr), B, H, alpha, limit); \
   }
 
-torch::Tensor swiglu_with_alpha_and_limit(
+torch::Tensor swiglu_gpt_oss_sigmoid_alpha(
     torch::Tensor x,  // [B, 2H]
     double alpha,
     double limit) {

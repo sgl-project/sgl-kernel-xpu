@@ -10,11 +10,20 @@ Currently we only support building from source. To use on Intel GPUs, you need t
 
 ## Build from source
 
-Development build:
+Development build (incremental — only changed kernels recompile):
 
 ```bash
 source /PATH/TO/ONEAPI/setvars.sh
-pip install -v .
+pip install scikit-build-core ninja wheel  # one-time setup
+pip install -v -e . --no-build-isolation
+```
+
+To enable parallel builds on low memory systems, you may use the following.
+Experiment with lower $num_processes values if you face icpx compiler errors:
+
+```bash
+export num_processes=8
+CMAKE_BUILD_PARALLEL_LEVEL=$(num_processes) pip install -v -e . --no-build-isolation
 ```
 
 

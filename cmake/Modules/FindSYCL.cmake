@@ -290,6 +290,11 @@ macro(SYCL_WRAP_SRCS sycl_target generated_files)
 
       set(SYCL_build_type "Device")
 
+      # Pass compiler launcher (ccache/sccache) to the build script if set.
+      if(NOT DEFINED SYCL_COMPILER_LAUNCHER)
+        set(SYCL_COMPILER_LAUNCHER "")
+      endif()
+
       # Configure the build script
       configure_file("${SYCL_run_sycl}" "${custom_target_script_pregen}" @ONLY)
       file(GENERATE

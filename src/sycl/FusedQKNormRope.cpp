@@ -272,6 +272,10 @@ void fused_qk_norm_rope(
   CHECK_CONTIGUOUS(qkv);
   CHECK_DEVICE(position_ids);
   CHECK_CONTIGUOUS(position_ids);
+  TORCH_CHECK(
+      position_ids.scalar_type() == at::ScalarType::Int,
+      "position_ids must have dtype int32 (at::kInt); got ",
+      position_ids.scalar_type());
   CHECK_DEVICE(q_weight);
   CHECK_CONTIGUOUS(q_weight);
   CHECK_DEVICE(k_weight);

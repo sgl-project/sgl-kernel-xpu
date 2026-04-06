@@ -11,9 +11,14 @@
 #define CHECK_SHAPE(x, ...) \
   TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+#define CHECK_LAST_DIM_CONTIGUOUS(x) \
+  TORCH_CHECK(x.strides()[x.strides().size() - 1] == 1, #x "must be contiguous at last dimension")
 #define CHECK_INPUT(x) \
   CHECK_DEVICE(x);     \
   CHECK_CONTIGUOUS(x);
+#define CHECK_LAST_DIM_CONTIGUOUS_INPUT(x) \
+  CHECK_DEVICE(x);                         \
+  CHECK_LAST_DIM_CONTIGUOUS(x)
 
 #define DISPATCH_CASE_INTEGRAL_TYPES(...)              \
   AT_DISPATCH_CASE(at::ScalarType::Byte, __VA_ARGS__)  \
@@ -31,6 +36,12 @@
   AT_DISPATCH_CASE(at::ScalarType::BFloat16, __VA_ARGS__)
 
 #define DISPATCH_FLOAT_TYPES(TYPE, NAME, ...) AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_FLOAT_TYPES(__VA_ARGS__))
+
+static inline void barrier() {
+  // Compiler + hardware memory fence for work-group–level synchronization.
+  asm volatile("lsc_fence.ugm.none.group\n" ::: "memory");
+  asm volatile("barrier\n" ::: "memory");
+}
 
 using DeviceId = at::DeviceIndex;
 
@@ -259,6 +270,18 @@ inline void check_shape(const at::Tensor& a, const at::Tensor& b, const char* a_
     }                                                                                   \
   }
 
+#define SYCL_DISPATCH_ONLY_FLOATING16_TYPES(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)  \
+  {                                                                                     \
+    const auto& the_type = TYPE;                                                        \
+    at::ScalarType _st = ::detail::scalar_type(the_type);                               \
+    switch (_st) {                                                                      \
+      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE1, sycl::ext::oneapi::bfloat16, __VA_ARGS__) \
+      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE2, sycl::half, __VA_ARGS__)                  \
+      default:                                                                          \
+        AT_ERROR(#NAME, " not implemented for '", toString(TYPE), "'");                 \
+    }                                                                                   \
+  }
+
 template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
 inline T div_up(T x, T y) {
   return (x + y - 1) / y;
@@ -273,5 +296,22 @@ int round_up_headdim(int head_size) {
   if (head_size <= 96) return 96;
   if (head_size <= 128) return 128;
   if (head_size <= 192) return 192;
-  return 256;
+  if (head_size <= 256) return 256;
+  if (head_size <= 512) return 512;
+  return 512;
+};
+
+template <typename T>
+struct DtypeInfo;
+
+template <>
+struct DtypeInfo<int8_t> {
+  static constexpr float MIN = -128;
+  static constexpr float MAX = 127;
+};
+
+template <>
+struct DtypeInfo<c10::Float8_e4m3fn> {
+  static constexpr float MIN = -448;
+  static constexpr float MAX = 448;
 };

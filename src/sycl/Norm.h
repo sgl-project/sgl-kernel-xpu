@@ -13,30 +13,38 @@ constexpr int NUM_REDUCE_STAGES = 16;
 #define DECLARE_SYCL_GLOBAL_FENCE sycl::access::fence_space::global_space
 #define DECLARE_SYCL_GLOBAL_AND_LOCAL_FENCE dpcpp_global_and_local_fence = sycl::access::fence_space::global_and_local
 
-inline std::tuple<int64_t, int64_t, int64_t> _check_layer_norm_inputs(
+inline std::tuple<int64_t, int64_t> _check_layer_norm_inputs(
     const torch::Tensor& input,
     IntArrayRef normalized_shape,
     std::optional<torch::Tensor>& weight /* optional */,
     std::optional<torch::Tensor>& bias /* optional */) {
   CHECK_LAST_DIM_CONTIGUOUS(input);
-  CHECK_DIM(2, input);  // input: (batch_size, hidden_size)
-#define TENSOR_CHECK(T)                         \
-  if (T.has_value()) {                          \
-    CHECK_LAST_DIM_CONTIGUOUS(T.value());       \
-    auto device = input.device();               \
-    CHECK_EQ(T.value().device(), device);       \
-    CHECK_DIM(1, T.value());                    \
-    CHECK_EQ(input.size(1), T.value().size(0)); \
+  TORCH_CHECK(input.dim() == 2 || input.dim() == 3, "input must be a 2D or 3D tensor");
+#define TENSOR_CHECK(T)                          \
+  if (T.has_value()) {                           \
+    CHECK_LAST_DIM_CONTIGUOUS(T.value());        \
+    auto device = input.device();                \
+    CHECK_EQ(T.value().device(), device);        \
+    CHECK_DIM(1, T.value());                     \
+    CHECK_EQ(input.size(-1), T.value().size(0)); \
   }
 
   TENSOR_CHECK(weight)
   TENSOR_CHECK(bias)
 
-  unsigned int batch_size = input.size(0);
-  unsigned int hidden_size = input.size(1);
-  unsigned int batch_stride = input.stride(0);
+  // For 3D inputs, verify that the leading dimensions can be flattened into a
+  // single batch dimension without a copy (i.e. rows are evenly spaced).
+  if (input.dim() == 3) {
+    TORCH_CHECK(
+        input.size(0) == 1 || input.stride(0) == input.size(1) * input.stride(1),
+        "3D input must have flattenable leading dimensions when treated as a "
+        "batched 2D tensor");
+  }
 
-  return std::make_tuple(batch_size, hidden_size, batch_stride);
+  int64_t hidden_size = input.size(-1);
+  int64_t batch_size = input.numel() / hidden_size;
+
+  return std::make_tuple(batch_size, hidden_size);
 }
 
 template <typename accscalar_t, typename reduce_op, typename nd_item_id, typename local_shared>

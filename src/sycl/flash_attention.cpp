@@ -40,6 +40,7 @@
 #include "kernels/chunk_prefill/chunk_prefill_runner.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
+#include "kernels/flash_attention_v2/xe_fmha_fwd_prefill_runner.hpp"
 
 namespace decode {
 
@@ -52,16 +53,19 @@ using launch_fn_t = void (*)(bool use_sink, const Arguments& params);
 launch_fn_t get_launch_fn(int qg_sz, int head_dim, int page_size) {
   // Dispatch table indexed by (qg_sz, head_dim, page_size).
   // qg_sz  index: {1->0, 2->1, 4->2, 8->3, 16->4, 32->5}
-  // head_dim index: {64->0, 96->1, 128->2, 192->3}
+  // head_dim index: {64->0, 96->1, 128->2, 192->3, 256->4, 512->5}
   // page_size index: {32->0, 64->1, 128->2}
 
 #define PAGE_ENTRIES(QG, HD) \
   { LAUNCH_FN_ENTRY(QG, HD, 32), LAUNCH_FN_ENTRY(QG, HD, 64), LAUNCH_FN_ENTRY(QG, HD, 128) }
 
-#define HD_ENTRIES(QG) \
-  { PAGE_ENTRIES(QG, 64), PAGE_ENTRIES(QG, 96), PAGE_ENTRIES(QG, 128), PAGE_ENTRIES(QG, 192) }
+#define HD_ENTRIES(QG)                                                                                               \
+  {                                                                                                                  \
+    PAGE_ENTRIES(QG, 64), PAGE_ENTRIES(QG, 96), PAGE_ENTRIES(QG, 128), PAGE_ENTRIES(QG, 192), PAGE_ENTRIES(QG, 256), \
+        PAGE_ENTRIES(QG, 512)                                                                                        \
+  }
 
-  static const launch_fn_t table[6][4][3] = {
+  static const launch_fn_t table[6][6][3] = {
       HD_ENTRIES(1),
       HD_ENTRIES(2),
       HD_ENTRIES(4),
@@ -110,6 +114,12 @@ launch_fn_t get_launch_fn(int qg_sz, int head_dim, int page_size) {
       break;
     case 192:
       hd_idx = 3;
+      break;
+    case 256:
+      hd_idx = 4;
+      break;
+    case 512:
+      hd_idx = 5;
       break;
     default:
       return nullptr;
@@ -176,11 +186,9 @@ std::vector<at::Tensor> mha_fwd(
 
   TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
   TORCH_CHECK(v.scalar_type() == q_type, "query and value must have the same dtype");
-  CHECK_INPUT(q);
-  CHECK_INPUT(k);
-  CHECK_INPUT(v);
-  TORCH_CHECK(
-      q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v);
 
   TORCH_CHECK(page_table.value().dtype() == torch::kInt32, "page_table must have dtype torch.int32");
   TORCH_CHECK(page_table.value().stride(-1) == 1, "page_table must have contiguous last dimension");
@@ -214,8 +222,8 @@ std::vector<at::Tensor> mha_fwd(
     TORCH_CHECK(batch_size == batch_size_k, "batch_size must be equal to batch_size_k");
   }
 
-  // Currently only support head dims <= 256
-  static constexpr int max_headdim = 256;
+  // Currently only support head dims <= 512
+  static constexpr int max_headdim = 512;
   TORCH_CHECK(head_size <= max_headdim, "FlashAttention forward only supports head dimension at most ", max_headdim);
   TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
@@ -391,7 +399,7 @@ std::vector<at::Tensor> mha_fwd(
   int qg_sz = nextPowerOf2(max_seqlen_q);
   TORCH_CHECK(qg_sz >= 1 && qg_sz <= 32, "Unsupported qgroup_size for decode attention: ", max_seqlen_q);
   TORCH_CHECK(
-      params.d == 64 || params.d == 96 || params.d == 128 || params.d == 192,
+      params.d == 64 || params.d == 96 || params.d == 128 || params.d == 192 || params.d == 256 || params.d == 512,
       "Unsupported head size for decode attention: ",
       params.d);
   TORCH_CHECK(
@@ -439,6 +447,9 @@ std::vector<at::Tensor> mha_fwd(
     int num_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin) {
+  TORCH_CHECK(cu_seqlens_k.data_ptr<int>() != nullptr, "cu_seqlens_k is not valid.");
+  int const num_heads = q.size(-2);
+  int const num_heads_k = k.size(-2);
   if (max_seqlen_q == 1 && page_table.has_value()) {
     return decode::mha_fwd(
         q,
@@ -469,8 +480,43 @@ std::vector<at::Tensor> mha_fwd(
         num_splits,
         pack_gqa_,
         sm_margin);
-  } else {
+  } else if (
+      !page_table.has_value() || is_causal || window_size_left >= 0 || window_size_right >= 0 || sinks_.has_value() ||
+      num_heads != num_heads_k || max_seqlen_q == 2048 || max_seqlen_q == 4096 || max_seqlen_q == 8192) {
+    // Use chunked prefill for GQA/MQA
+    // Now we detect chunked prefill according to max_seqlen_q
     return chunkprefill::mha_fwd(
+        q,
+        k,
+        v,
+        q_v_,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        page_table,
+        kv_batch_idx_,
+        leftpad_k_,
+        rotary_cos_,
+        rotary_sin_,
+        seqlens_rotary_,
+        q_descale_,
+        k_descale_,
+        v_descale_,
+        softmax_scale_,
+        sinks_,
+        is_causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        is_rotary_interleaved,
+        scheduler_metadata_,
+        num_splits,
+        pack_gqa_,
+        sm_margin);
+  } else {
+    // TODO: support the cases for non-kv cache, causal, sliding window and sink.
+    return prefill::mha_fwd(
         q,
         k,
         v,

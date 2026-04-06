@@ -4,25 +4,25 @@ import pandas as pd
 import torch
 import triton
 import triton.testing
-from sgl_kernel import swiglu_with_alpha_and_limit
+from sgl_kernel import swiglu_gpt_oss_sigmoid_alpha
 
 
-def reference_swiglu_with_alpha_and_limit(x, alpha, limit):
+def reference_swiglu_gpt_oss_sigmoid_alpha(x, alpha, limit):
     gate, up = x[..., ::2], x[..., 1::2]
     gate = gate.clamp(min=None, max=limit)
     up = up.clamp(min=-limit, max=limit)
     return gate * torch.sigmoid(gate * alpha) * (up + 1)
 
 
-def sglang_swiglu_with_alpha_and_limit(x, alpha, limit):
-    return swiglu_with_alpha_and_limit(x, alpha, limit)
+def sglang_swiglu_gpt_oss_sigmoid_alpha(x, alpha, limit):
+    return swiglu_gpt_oss_sigmoid_alpha(x, alpha, limit)
 
 
 def calculate_diff(batch_size, hidden_dim, alpha, limit, dtype):
     device = torch.device("xpu")
     x = torch.randn(batch_size, hidden_dim * 2, device=device, dtype=dtype)
-    torch_out = reference_swiglu_with_alpha_and_limit(x, alpha, limit)
-    sglang_out = sglang_swiglu_with_alpha_and_limit(x, alpha, limit)
+    torch_out = reference_swiglu_gpt_oss_sigmoid_alpha(x, alpha, limit)
+    sglang_out = sglang_swiglu_gpt_oss_sigmoid_alpha(x, alpha, limit)
     output_diff = torch.abs(torch_out - sglang_out).mean().item()
     cos_sim = torch.nn.functional.cosine_similarity(
         torch_out.reshape(-1), sglang_out.reshape(-1), dim=0
@@ -92,9 +92,9 @@ def benchmark_swiglu_alpha_limit(batch_size, hidden_dim, alpha, limit, dtype, pr
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "reference":
-        fn = lambda: reference_swiglu_with_alpha_and_limit(x, alpha, limit)
+        fn = lambda: reference_swiglu_gpt_oss_sigmoid_alpha(x, alpha, limit)
     elif provider == "sglang":
-        fn = lambda: sglang_swiglu_with_alpha_and_limit(x, alpha, limit)
+        fn = lambda: sglang_swiglu_gpt_oss_sigmoid_alpha(x, alpha, limit)
 
     ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
 

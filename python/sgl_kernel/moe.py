@@ -50,13 +50,13 @@ def moe_sum_reduce(
     )
 
 
-def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
+def swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit):
     assert gemm1_limit > 0, f"gemm1_limit must be positive, got {gemm1_limit}"
     assert x.dim() == 2, f"x must be 2D [B, 2H], got {x.dim()}D"
     assert (
         x.size(1) % 2 == 0
     ), f"Last dim must be even for gate/up split, got {x.size(1)}"
-    return torch.ops.sgl_kernel.swiglu_with_alpha_and_limit.default(
+    return torch.ops.sgl_kernel.swiglu_gpt_oss_sigmoid_alpha.default(
         x,
         gemm1_alpha,
         gemm1_limit,
@@ -314,10 +314,19 @@ def fused_experts(
     assert w1.dtype == torch.bfloat16, "w1 must be bfloat16"
     assert w2.dtype == torch.bfloat16, "w2 must be bfloat16"
     if b1 is not None:
-        assert b1.dtype == torch.bfloat16, "b1 must be bfloat16"
+        assert (
+            b1.dtype == torch.bfloat16 or b1.dtype == torch.float32
+        ), "b1 must be bfloat16 or float32"
+        if is_xe2_arch() and b1.dtype == torch.bfloat16:
+            # cast b1 to float32, since bias is accumulated in float32 in the kernel
+            b1 = b1.float()
     if b2 is not None:
-        assert b2.dtype == torch.bfloat16, "b2 must be bfloat16"
-
+        assert (
+            b2.dtype == torch.bfloat16 or b2.dtype == torch.float32
+        ), "b2 must be bfloat16 or float32"
+        if is_xe2_arch() and b2.dtype == torch.bfloat16:
+            # cast b2 to float32, since bias is accumulated in float32 in the kernel
+            b2 = b2.float()
     # Shape check
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
     assert (
@@ -391,7 +400,19 @@ def fused_experts(
         (M * TopK, OutK), device=hidden_states.device, dtype=hidden_states.dtype
     )
 
-    activation_type = 0 if activation == "silu" else 1
+    # 0=silu, 1=gelu, 2=swiglu (silu with alpha/limit clamping for gpt-oss)
+    if activation == "silu":
+        activation_type = 0
+        if gemm1_alpha is not None:
+            assert (
+                gemm1_limit is not None
+            ), "gemm1_limit must be provided when gemm1_alpha is set for swiglu for GPT-OSS"
+            activation_type = 2
+            activation = "swiglu_gpt_oss"
+    elif activation == "gelu":
+        activation_type = 1
+    else:
+        raise ValueError(f"Unsupported activation {activation}")
 
     assert is_xe2_arch(), f"Current MoE is only supported on BMG"
 
@@ -415,15 +436,19 @@ def fused_experts(
             E,
             activation_type,
             fuse_act=False,
+            gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+            gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
         )
-        if activation == "silu":
+        if activation_type == 0:
             torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
-        elif activation == "gelu":
+        elif activation_type == 1:
             torch.ops.sgl_kernel.gelu_tanh_and_mul(
                 intermediate_cache2, intermediate_cache1
             )
-        else:
-            raise ValueError(f"Unsupported activation {activation}")
+        elif activation_type == 2:
+            intermediate_cache2 = torch.ops.sgl_kernel.swiglu_gpt_oss_sigmoid_alpha(
+                intermediate_cache1, gemm1_alpha, gemm1_limit
+            )
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
             intermediate_cache3,
             intermediate_cache2,
@@ -433,6 +458,8 @@ def fused_experts(
             E,
             activation_type,
             fuse_act=False,
+            gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+            gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
         )
     else:
         intermediate_cache1 = torch.empty(
@@ -447,6 +474,8 @@ def fused_experts(
             E,
             activation_type,
             fuse_act=True,
+            gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+            gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
         )
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
             intermediate_cache3,
@@ -457,6 +486,8 @@ def fused_experts(
             E,
             activation_type,
             fuse_act=False,
+            gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+            gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
         )
 
     torch.ops.sgl_kernel.apply_shuffle_mul_sum.default(

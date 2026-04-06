@@ -140,6 +140,17 @@ void sgl_per_token_group_quant_8bit(
     double fp8_min,
     double fp8_max,
     bool scale_ue8m0);
+void sgl_per_token_group_quant_8bit_v2(
+    at::Tensor input,
+    at::Tensor output_q,
+    at::Tensor output_s,
+    int64_t group_size,
+    double eps,
+    double min_8bit,
+    double max_8bit,
+    bool scale_ue8m0,
+    bool fuse_silu_and_mul,
+    const std::optional<torch::Tensor>& masked_m);
 void fused_qk_norm_rope(
     torch::Tensor& qkv,
     int64_t num_heads_q,
@@ -240,7 +251,7 @@ void topk_softmax(
     torch::Tensor& topk_indices,
     torch::Tensor& token_expert_indices,
     torch::Tensor& gating_output);
-torch::Tensor swiglu_with_alpha_and_limit(torch::Tensor x, double alpha, double limit);
+torch::Tensor swiglu_gpt_oss_sigmoid_alpha(torch::Tensor x, double alpha, double limit);
 
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
@@ -279,8 +290,10 @@ void moe_grouped_mm_nt_xe20(
     const std::optional<at::Tensor>& bias,
     const torch::Tensor& total_rows_for_experts,
     const int64_t n_experts,
-    const int64_t activation_type = 0,  // 0=silu, 1=gelu
-    bool fuse_act = false);
+    const int64_t activation_type = 0,  // 0=silu, 1=gelu, 2=swiglu
+    bool fuse_act = false,
+    double gemm1_alpha = 1.702,
+    double gemm1_limit = 7.0);
 
 void prepare_moe_input(
     const torch::Tensor& topk_ids,

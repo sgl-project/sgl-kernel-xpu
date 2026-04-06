@@ -175,5 +175,141 @@ def test_gemma_norm_non_contiguous(batch_size, hidden_size, dtype):
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
+###############################################################################
+# 3D tensor input tests (batch_size, seq_len, hidden_size)
+###############################################################################
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 19])
+@pytest.mark.parametrize("seq_len", [1, 7, 32])
+@pytest.mark.parametrize("hidden_size", [111, 1024, 4096])
+@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("specify_out", [True, False])
+def test_norm_3d(batch_size, seq_len, hidden_size, dtype, specify_out):
+    x = torch.randn(batch_size, seq_len, hidden_size, device=device, dtype=dtype)
+    w = torch.randn(hidden_size, device=device, dtype=dtype)
+
+    y_ref = llama_rms_norm(x, w)
+    if specify_out:
+        y = torch.empty_like(x)
+        sgl_kernel.rmsnorm(x, w, out=y)
+    else:
+        y = sgl_kernel.rmsnorm(x, w)
+
+    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 19])
+@pytest.mark.parametrize("seq_len", [1, 7, 32])
+@pytest.mark.parametrize("hidden_size", [111, 1024, 4096])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_fused_add_rmsnorm_3d(batch_size, seq_len, hidden_size, dtype):
+    eps = 1e-6
+
+    x = torch.randn(batch_size, seq_len, hidden_size, dtype=dtype, device=device)
+    residual = torch.randn_like(x)
+    weight = torch.randn(hidden_size, dtype=dtype, device=device)
+
+    x_native, residual_native = fused_add_rms_norm(
+        x.clone(), residual.clone(), weight, eps
+    )
+
+    x_fused = x.clone()
+    residual_fused = residual.clone()
+    sgl_kernel.fused_add_rmsnorm(x_fused, residual_fused, weight, eps)
+
+    torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 19])
+@pytest.mark.parametrize("seq_len", [1, 7, 32])
+@pytest.mark.parametrize("hidden_size", [111, 1024, 4096])
+@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("specify_out", [True, False])
+def test_gemma_norm_3d(batch_size, seq_len, hidden_size, dtype, specify_out):
+    x = torch.randn(batch_size, seq_len, hidden_size, device=device, dtype=dtype)
+    w = torch.randn(hidden_size, device=device, dtype=dtype)
+
+    y_ref = gemma_rms_norm(x, w)
+    if specify_out:
+        y = torch.empty_like(x)
+        sgl_kernel.gemma_rmsnorm(x, w, out=y)
+    else:
+        y = sgl_kernel.gemma_rmsnorm(x, w)
+
+    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 19])
+@pytest.mark.parametrize("seq_len", [1, 7, 32])
+@pytest.mark.parametrize("hidden_size", [111, 1024, 4096])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_gemma_fused_add_rmsnorm_3d(batch_size, seq_len, hidden_size, dtype):
+    eps = 1e-6
+
+    x = torch.randn(batch_size, seq_len, hidden_size, dtype=dtype, device=device)
+    residual = torch.randn_like(x)
+    weight = torch.randn(hidden_size, dtype=dtype, device=device)
+
+    x_native, residual_native = gemma_fused_add_rms_norm(
+        x.clone(), residual.clone(), weight, eps
+    )
+
+    x_fused = x.clone()
+    residual_fused = residual.clone()
+    sgl_kernel.gemma_fused_add_rmsnorm(x_fused, residual_fused, weight, eps)
+
+    torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
+
+
+###############################################################################
+# Non-contiguous 3D tensor tests (sliced last-dim, flattenable leading dims)
+###############################################################################
+
+
+def _make_non_contiguous_3d(batch_size, seq_len, hidden_size, dtype, extra=64):
+    """Create a last-dim-contiguous but not fully contiguous 3D tensor by
+    slicing a larger tensor along the last dimension."""
+    full = torch.randn(
+        batch_size, seq_len, hidden_size + extra, device=device, dtype=dtype
+    )
+    view = full[
+        :, :, :hidden_size
+    ]  # stride = (seq_len*(hidden_size+extra), hidden_size+extra, 1)
+    assert view.stride(-1) == 1
+    assert view.stride(-2) == hidden_size + extra
+    return view
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("seq_len", [1, 7])
+@pytest.mark.parametrize("hidden_size", [512, 1024])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_norm_3d_non_contiguous(batch_size, seq_len, hidden_size, dtype):
+    x_nc = _make_non_contiguous_3d(batch_size, seq_len, hidden_size, dtype)
+    w = torch.randn(hidden_size, device=device, dtype=dtype)
+
+    y_ref = llama_rms_norm(x_nc.clone(), w)
+    y = sgl_kernel.rmsnorm(x_nc, w)
+
+    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("seq_len", [1, 7])
+@pytest.mark.parametrize("hidden_size", [512, 1024])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_gemma_norm_3d_non_contiguous(batch_size, seq_len, hidden_size, dtype):
+    x_nc = _make_non_contiguous_3d(batch_size, seq_len, hidden_size, dtype)
+    w = torch.randn(hidden_size, device=device, dtype=dtype)
+
+    y_ref = gemma_rms_norm(x_nc.clone(), w)
+    y = sgl_kernel.gemma_rmsnorm(x_nc, w)
+
+    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

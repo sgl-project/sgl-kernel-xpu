@@ -175,28 +175,31 @@ def torch_recurrent_gated_delta_rule(
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
         query = l2norm(query, dim=-1, eps=1e-6)
-        key   = l2norm(key,   dim=-1, eps=1e-6)
+        key = l2norm(key, dim=-1, eps=1e-6)
     query, key, value, beta, g = [
         x.transpose(1, 2).contiguous().to(torch.float32)
         for x in (query, key, value, beta, g)
     ]
     B, H, T, K = key.shape
-    V     = value.shape[-1]
+    V = value.shape[-1]
     scale = 1 / (query.shape[-1] ** 0.5)
     query = query * scale
 
-    out   = torch.zeros(B, H, T, V, device=value.device)
-    state = (torch.zeros(B, H, K, V, device=value.device)
-             if initial_state is None else initial_state.float())
+    out = torch.zeros(B, H, T, V, device=value.device)
+    state = (
+        torch.zeros(B, H, K, V, device=value.device)
+        if initial_state is None
+        else initial_state.float()
+    )
 
     for i in range(T):
         q_t, k_t, v_t = query[:, :, i], key[:, :, i], value[:, :, i]
-        g_t    = g   [:, :, i].exp().unsqueeze(-1).unsqueeze(-1)
+        g_t = g[:, :, i].exp().unsqueeze(-1).unsqueeze(-1)
         beta_t = beta[:, :, i].unsqueeze(-1)
-        state  = state * g_t
+        state = state * g_t
         kv_mem = (state * k_t.unsqueeze(-1)).sum(dim=-2)
-        delta  = (v_t - kv_mem) * beta_t
-        state  = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+        delta = (v_t - kv_mem) * beta_t
+        state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
         out[:, :, i] = (state * q_t.unsqueeze(-1)).sum(dim=-2)
 
     out = out.transpose(1, 2).contiguous().to(initial_dtype)
@@ -470,7 +473,10 @@ class TestMambaAttention(unittest.TestCase):
         atol = rtol = precision[core_attn_out.dtype]
         torch.xpu.synchronize()
         torch.testing.assert_close(
-            core_attn_out, core_attn_out_ref.transpose(0, 1).to(core_attn_out.dtype), atol=atol, rtol=rtol
+            core_attn_out,
+            core_attn_out_ref.transpose(0, 1).to(core_attn_out.dtype),
+            atol=atol,
+            rtol=rtol,
         )
         torch.testing.assert_close(
             last_recurrent_state, last_recurrent_state_ref, atol=atol, rtol=rtol

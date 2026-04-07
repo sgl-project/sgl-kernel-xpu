@@ -6,7 +6,6 @@ import pandas as pd
 import sgl_kernel
 import torch
 import triton
-from torch.nn.functional import softplus
 
 
 @dataclass
@@ -72,7 +71,6 @@ def benchmark_fused_gdn(device: torch.device, quick: bool) -> list[BenchResult]:
         b = torch.rand(batch, heads, dtype=torch.bfloat16, device=device)
         dt_bias = torch.rand(heads, dtype=torch.bfloat16, device=device)
 
-
         def fn_kernel():
             sgl_kernel.fused_gdn_gating(A_log, a, b, dt_bias)
 
@@ -130,7 +128,9 @@ def benchmark_fused_sigmoid_update(
         a = torch.rand(batch_size, v_heads, dtype=torch.bfloat16, device=device)
         b = torch.rand(batch_size, v_heads, dtype=torch.bfloat16, device=device)
         dt_bias = torch.rand(v_heads, dtype=torch.bfloat16, device=device)
-        ssm_states = torch.rand(513, v_heads, v_d, q_d, dtype=torch.float32, device=device)
+        ssm_states = torch.rand(
+            513, v_heads, v_d, q_d, dtype=torch.float32, device=device
+        )
         cache_indices = torch.arange(batch_size, device=device, dtype=torch.int32)
 
         cu_seqlens = torch.arange(batch_size + 1, device=device, dtype=torch.int32)
@@ -157,10 +157,12 @@ def benchmark_fused_sigmoid_update(
             ms = do_bench(fn)
             n = batch_size * v_heads * d * d
             flops = n * 4
-            actual_state_bytes = batch_size * v_heads * d * d * ssm_states.element_size()
-            bytes_total = tensor_bytes(
-                q, k, v, A_log, a, b, dt_bias
-            ) + 2 * actual_state_bytes
+            actual_state_bytes = (
+                batch_size * v_heads * d * d * ssm_states.element_size()
+            )
+            bytes_total = (
+                tensor_bytes(q, k, v, A_log, a, b, dt_bias) + 2 * actual_state_bytes
+            )
             tflops = flops / (ms * 1e-3) / 1e12
             bw = bytes_total / (ms * 1e-3) / 1e9
             results.append(

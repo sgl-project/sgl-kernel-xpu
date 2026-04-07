@@ -230,7 +230,7 @@ std::vector<at::Tensor> mha_fwd(
   num_kv_splits = -1;
   out = torch::empty({total_q, num_heads, head_size_v}, opts);
   Arguments params;
-  params.use_split_kv = true;
+  params.use_split_kv = false;
   if (params.use_split_kv) {
     auto get_num_splits = [](int batch_size, int num_heads_kv, int max_seqlen_k, int block_size) {
       auto stream = at::xpu::getCurrentXPUStream();

@@ -1,34 +1,41 @@
 # Generate FMHA prefill kernel instantiation files.
 # Each HEAD_DIM is compiled as a separate translation unit to parallelize
 # and speed up compilation.
-#
-# Tile shape mapping (HEAD_DIM -> TILED_Q, TILED_KV, NUM_SG):
-#   64  -> 128, 64, 8
-#   96  -> 128, 64, 8
-#   128 -> 256, 32, 16
-#   192 -> 256, 64, 32
-#   256 -> 256, 64, 32
-#   512 -> 256, 64, 32
+
+set(FMHA_PREFILL_HEAD_DIMS 64 96 128 192 256 512)
 
 set(FMHA_PREFILL_TEMPLATE
     "${CMAKE_CURRENT_SOURCE_DIR}/sycl/xe_fmha_fwd_prefill_kernel.cpp.in")
 
-# Define the per-HEAD_DIM tile configurations
-# Format: HEAD_DIM;TILED_Q;TILED_KV;NUM_SG
-set(FMHA_PREFILL_CONFIGS
-    "64;128;64;8"
-    "96;128;64;8"
-    "128;256;32;16"
-    "192;256;64;32"
-    "256;256;64;32"
-    "512;256;64;32"
-)
+# Per-HEAD_DIM tile shape parameters (TILED_Q, TILED_KV, NUM_SG)
+set(FMHA_PREFILL_TILED_Q_64 128)
+set(FMHA_PREFILL_TILED_KV_64 64)
+set(FMHA_PREFILL_NUM_SG_64 8)
 
-foreach(CONFIG ${FMHA_PREFILL_CONFIGS})
-    list(GET CONFIG 0 HEAD_DIM)
-    list(GET CONFIG 1 TILED_Q)
-    list(GET CONFIG 2 TILED_KV)
-    list(GET CONFIG 3 NUM_SG)
+set(FMHA_PREFILL_TILED_Q_96 128)
+set(FMHA_PREFILL_TILED_KV_96 64)
+set(FMHA_PREFILL_NUM_SG_96 8)
+
+set(FMHA_PREFILL_TILED_Q_128 256)
+set(FMHA_PREFILL_TILED_KV_128 32)
+set(FMHA_PREFILL_NUM_SG_128 16)
+
+set(FMHA_PREFILL_TILED_Q_192 256)
+set(FMHA_PREFILL_TILED_KV_192 64)
+set(FMHA_PREFILL_NUM_SG_192 32)
+
+set(FMHA_PREFILL_TILED_Q_256 256)
+set(FMHA_PREFILL_TILED_KV_256 64)
+set(FMHA_PREFILL_NUM_SG_256 32)
+
+set(FMHA_PREFILL_TILED_Q_512 256)
+set(FMHA_PREFILL_TILED_KV_512 64)
+set(FMHA_PREFILL_NUM_SG_512 32)
+
+foreach(HEAD_DIM ${FMHA_PREFILL_HEAD_DIMS})
+    set(TILED_Q ${FMHA_PREFILL_TILED_Q_${HEAD_DIM}})
+    set(TILED_KV ${FMHA_PREFILL_TILED_KV_${HEAD_DIM}})
+    set(NUM_SG ${FMHA_PREFILL_NUM_SG_${HEAD_DIM}})
 
     set(GENERATED_FILE
         "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_prefill_kernel_${HEAD_DIM}.cpp")

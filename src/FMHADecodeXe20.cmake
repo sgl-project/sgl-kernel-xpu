@@ -2,9 +2,9 @@
 # Each (QG_SZ, HEAD_DIM, PAGE_SIZE) combination is compiled as a separate
 # library to parallelize and speed up compilation.
 
-set(FMHA_DECODE_QG_SIZES 1 2 4 8 16 32)
+set(FMHA_DECODE_QG_SIZES 1 2 4 8 16)
 set(FMHA_DECODE_HEAD_DIMS 64 96 128 192 256 512)
-set(FMHA_DECODE_PAGE_SIZES 32 64 128)
+set(FMHA_DECODE_PAGE_SIZES 64 128)
 
 set(FMHA_DECODE_TEMPLATE
     "${CMAKE_CURRENT_SOURCE_DIR}/sycl/xe_fmha_fwd_decode_kernel.cpp.in")

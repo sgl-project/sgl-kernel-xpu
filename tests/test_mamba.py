@@ -19,10 +19,15 @@ def prepare_chunk_indices_offsets(cu_seqlens: torch.Tensor, chunk_size: int = 64
     lens = cu_seqlens[1:] - cu_seqlens[:-1]
     chunk_counts = torch.div(lens + chunk_size - 1, chunk_size, rounding_mode="floor")
     chunk_offsets = torch.cat((cu_seqlens.new_zeros(1), chunk_counts)).cumsum(dim=0)
-    seq_ids = torch.arange(chunk_counts.numel(), device=cu_seqlens.device, dtype=torch.int32)
+    seq_ids = torch.arange(
+        chunk_counts.numel(), device=cu_seqlens.device, dtype=torch.int32
+    )
     chunk_seq = torch.repeat_interleave(seq_ids, chunk_counts)
     starts = torch.repeat_interleave(chunk_offsets[:-1], chunk_counts)
-    local = torch.arange(chunk_seq.numel(), device=cu_seqlens.device, dtype=torch.int64) - starts
+    local = (
+        torch.arange(chunk_seq.numel(), device=cu_seqlens.device, dtype=torch.int64)
+        - starts
+    )
     chunk_indices = torch.stack((chunk_seq, local.to(torch.int32)), dim=1)
     return chunk_indices, chunk_offsets.to(torch.int32)
 
@@ -272,19 +277,21 @@ class TestMambaAttention(unittest.TestCase):
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             )
 
-            core_attn_out, last_recurrent_state = torch.ops.sgl_kernel.chunk_gated_delta_rule(
-                query=query_.clone(),
-                key=key_.clone(),
-                value=value_.clone(),
-                g=g_.clone(),
-                beta=beta_.clone(),
-                initial_state=initial_state_.clone(),
-                output_final_state=True,
-                cu_seqlens=cu_seqlens_.clone(),
-                chunk_indices=chunk_indices_.clone(),
-                chunk_offsets=chunk_offsets_.clone(),
-                head_first=False,
-                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            core_attn_out, last_recurrent_state = (
+                torch.ops.sgl_kernel.chunk_gated_delta_rule(
+                    query=query_.clone(),
+                    key=key_.clone(),
+                    value=value_.clone(),
+                    g=g_.clone(),
+                    beta=beta_.clone(),
+                    initial_state=initial_state_.clone(),
+                    output_final_state=True,
+                    cu_seqlens=cu_seqlens_.clone(),
+                    chunk_indices=chunk_indices_.clone(),
+                    chunk_offsets=chunk_offsets_.clone(),
+                    head_first=False,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                )
             )
 
             atol = rtol = precision[core_attn_out.dtype]

@@ -144,7 +144,11 @@ struct ChunkGatedDeltaRuleKernel {
 
     const int64_t progress_idx = seq_idx * v_heads + vh;
     sycl::global_ptr<int32_t> progress_ptr(seq_head_progress + progress_idx);
-    sycl::atomic_ref<int32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device, sycl::access::address_space::global_space>
+    sycl::atomic_ref<
+        int32_t,
+        sycl::memory_order::acq_rel,
+        sycl::memory_scope::device,
+        sycl::access::address_space::global_space>
         progress_atomic(*progress_ptr);
 
     while (progress_atomic.load() != static_cast<int32_t>(local_chunk_idx)) {

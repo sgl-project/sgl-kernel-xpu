@@ -37,6 +37,12 @@
 
 #define DISPATCH_FLOAT_TYPES(TYPE, NAME, ...) AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_FLOAT_TYPES(__VA_ARGS__))
 
+#define CUTLASS_CHECK(status)                                                       \
+  {                                                                                 \
+    cutlass::Status error = status;                                                 \
+    TORCH_CHECK(error == cutlass::Status::kSuccess, cutlassGetStatusString(error)); \
+  }
+
 static inline void barrier() {
   // Compiler + hardware memory fence for work-group–level synchronization.
   asm volatile("lsc_fence.ugm.none.group\n" ::: "memory");

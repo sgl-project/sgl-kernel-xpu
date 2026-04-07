@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (C) 2025 Intel Corporation, All rights reserved.
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -28,7 +28,9 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
-
+/*! \file
+    \brief MLA Epilogue
+*/
 #pragma once
 
 #include <sycl/sycl.hpp>
@@ -42,16 +44,10 @@
 #include "cutlass/epilogue/dispatch_policy.hpp"
 #include "sycl/comm/copy_block_slm.hpp"
 
-namespace cutlass::fmha::collective {
-
-using namespace cute;
-
-template <
-    class CollectiveMainloop,  // Attention mainloop
-    class TileShapeO_,         // Shape of output tile, may be larger than P*V GEMM
-    class TensorO_,            // 2D slice of global output tensor
-    class TiledCopyO_ = void>  // Optional TiledCopy for loading O
-class FMHAFwdEpilogue {
+namespace cutlass::flash_attention::collective {
+/////////////////////////////////////////////////////////////////////////////////////////////////
+template <class CollectiveMainloop, class TileShapeO_, class TensorO_, class TiledCopyO_ = void>
+class XeMlaEpilogue {
  public:
   //
   // Type Aliases
@@ -69,8 +65,6 @@ class FMHAFwdEpilogue {
   using FragARow = typename CollectiveMainloop::FragARow;
   using ElementA = typename FragA::value_type;
 
-  // Split k-reduced tiles between participating subgroups.
-  // Assumption: the A tile is contiguous.
   using ReduceK = decltype(size<3>(typename TiledMMAPV::ThrLayoutVMNK{}));
 
   static auto reduce_sg_v_helper() {
@@ -97,14 +91,13 @@ class FMHAFwdEpilogue {
       return make_block_2d_copy_D_subtiled(TiledMMAPV{}, ReduceFragA{}.tv_layout(), ReduceSGLayout{}, TensorO2D{});
   }
 
+  // Default TiledCopy for writing output
   using DefaultTiledCopyO = decltype(default_tiled_copy_O_helper());
   using TiledCopyO = conditional_t<is_void_v<TiledCopyO_>, DefaultTiledCopyO, TiledCopyO_>;
 
-  // Stateless design -- no arguments or parameters.
-  struct Arguments {};
-  struct Params {};
-
+  //
   // Shared memory storage
+  //
   // Note sum/max tiles are padded to 16 elements, due to limitations in CuTe block load infrastructure.
   using AlignedSGTileA_Q = C<((size<0>(SGTileShapeA{}) + intel::sg_size - 1) / intel::sg_size) * intel::sg_size>;
 
@@ -120,6 +113,23 @@ class FMHAFwdEpilogue {
   SharedStorage& shared;
 
  public:
+  //
+  // Arguments
+  //
+  struct Arguments {};
+
+  //
+  // Params
+  //
+  struct Params {};
+
+  //
+  // methods
+  //
+
+  CUTLASS_HOST_DEVICE
+  XeMlaEpilogue(Params const& params_, SharedStorage& shared_) : shared(shared_) {}
+
   static constexpr Params to_underlying_arguments(Arguments const& args, void* /* workspace */) {
     return {};
   }
@@ -128,18 +138,14 @@ class FMHAFwdEpilogue {
     return true;
   }
 
-  CUTLASS_HOST_DEVICE
-  FMHAFwdEpilogue(Params const&, SharedStorage& shared_) : shared(shared_) {}
-
   template <typename QVCoord>
   CUTLASS_DEVICE void operator()(
       TensorO2D const& O,  // Global O tensor: (q,v)
       FragA& tArA,         // O accumulator:   (q,v)
       FragARow& tA_max,    // Softmax row-wise max accumulator
       FragARow& tA_sum,    // Softmax row-wise sum accumulator
-      QVCoord blk_qv,      // WG tile indices: (q,v)
+      QVCoord blk_qv,      // WG tile indices: (Q,V)
       int thr_id) {        // Work-item ID
-
     using namespace cute;
     using ElementA = typename FragA::element_type;
 
@@ -155,8 +161,10 @@ class FMHAFwdEpilogue {
       rA_sum(i) = ElementA(1) / rA_sum(i);
 
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA.size(); i++)
-      rA(i) *= broadcast<0>(rA_sum, rA, i);
+    for (int i = 0; i < rA.size(); i++) {
+      auto val = broadcast<0>(rA_sum, rA, i);
+      rA(i) *= val;
+    }
 
     /* Tile output */
     Tensor cO = make_identity_tensor(O.shape());       // (q,v)
@@ -174,9 +182,6 @@ class FMHAFwdEpilogue {
     copy(copy_o, tOrO, tOgO);
   }
 
-  // Reduce k-blocks of A and A_sum across WG, if needed.
-  // Note that each k block has its own scale factor based on A_max,
-  //   so A/A_sum contributions need to be rescaled to match.
   template <typename FragA, typename FragARow>
   CUTLASS_DEVICE decltype(auto) reduce_A(
       FragA& tArA,       // O accumulator:   (q,v)
@@ -185,7 +190,6 @@ class FMHAFwdEpilogue {
       int thr_id) {      // Work-item ID
 
     using namespace sycl::ext::oneapi::this_work_item;
-
     if constexpr (ReduceK{} == _1{}) {
       return std::make_tuple(tArA, tA_sum, true);
     } else {
@@ -198,11 +202,13 @@ class FMHAFwdEpilogue {
       auto shape_A = append(append(SGTileShapeA{}, ReduceK{}), SGPerWG{} / ReduceK{});
       auto shape_A_row = make_shape(get<0>(SGTileShapeO{}), shape(ReduceSGLayout{}), ReduceK{}, SGPerWG{} / ReduceK{});
 
+      /* Physical layouts, with sub-tile modes broken out */
       auto sA_layout = group<2, 4>(flat_divide(make_ordered_layout(shape_A, Step<_1, _0, _2, _3>{}), SGTileShapeO{}));
       auto sA_row_stride =
           make_stride(_1{}, make_stride(get<0>(shape_A_row), _0{}), AlignedSGTileA_Q{}, AlignedSGTileA_Q{} * ReduceK{});
       auto sA_row_layout = make_layout(shape_A_row, sA_row_stride);
 
+      /* Coordinate layouts, with sub-tile modes broken out */
       auto basis2 = make_basis_like(SGTileShapeO{});
       auto sA_coords = make_layout(
           append(SGTileShapeO{}, shape(ReduceSGLayout{})), append(basis2, product_each(zip(SGTileShapeO{}, basis2))));
@@ -281,5 +287,6 @@ class FMHAFwdEpilogue {
     }
   }
 };
+/////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace cutlass::fmha::collective
+}  // namespace cutlass::flash_attention::collective

@@ -104,16 +104,7 @@ void merge_state(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
-void cutlass_mla_decode(
-    torch::Tensor const& out,
-    torch::Tensor const& q_nope_and_q_pe,
-    torch::Tensor const& kv_c_and_k_pe_cache,
-    torch::Tensor const& seq_lens,
-    torch::Tensor const& page_table,
-    torch::Tensor const& workspace,
-    int64_t num_kv_splits = -1);
-int64_t cutlass_mla_get_workspace_size(
-    int64_t max_seq_len, int64_t num_batches, int64_t sm_count = 0, int64_t num_kv_splits = -1);
+
 /*
  * From csrc/elementwise
  */
@@ -140,6 +131,17 @@ void sgl_per_token_group_quant_8bit(
     double fp8_min,
     double fp8_max,
     bool scale_ue8m0);
+void sgl_per_token_group_quant_8bit_v2(
+    at::Tensor input,
+    at::Tensor output_q,
+    at::Tensor output_s,
+    int64_t group_size,
+    double eps,
+    double min_8bit,
+    double max_8bit,
+    bool scale_ue8m0,
+    bool fuse_silu_and_mul,
+    const std::optional<torch::Tensor>& masked_m);
 void fused_qk_norm_rope(
     torch::Tensor& qkv,
     int64_t num_heads_q,

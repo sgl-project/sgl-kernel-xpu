@@ -21,6 +21,7 @@ endforeach()
 
 include(FMHADecodeXe20.cmake)
 include(FMHAPrefillXe20.cmake)
+include(MlaDecodeXe20.cmake)
 
 message(STATUS "BMG files: ${device_cpp_xe20}")
 message(STATUS "Common files: ${device_cpp_common}")

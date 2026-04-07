@@ -60,6 +60,7 @@ jobs:
               /miniforge3/envs/py3.10/bin/python3 -m pip install tabulate && \
               cd /root/sglang/sgl-kernel-xpu/benchmark && \
               python3 bench_flash_attn.py 2>&1 | tee flash.log && \
+              python3 bench_flash_mla_decode.py.py 2>&1 | tee mla.log && \
               python3 bench_moe_topk_softmax.py 2>&1 | tee moe.log && \
               python3 bench_fused_moe.py 2>&1 | tee fused_moe.log && \
               python3 bench_moe_sum_reduce.py 2>&1 | tee moe_sum_reduce.log \
@@ -69,6 +70,7 @@ jobs:
               python3 bench_fused_qk_norm_rope.py 2>&1 | tee fused_qk_norm_rope.py.log \
               python3 bench_per_token_group_quant_8bit.py 2>&1 | tee per_token_group_quant_8bit.py.log \
               python3 bench_per_token_group_quant_mxfp4.py 2>&1 | tee per_token_group_quant_mxfp4.py.log \
+              python3 bench_per_token_group_quant_8bit_v2.py 2>&1 | tee bench_per_token_group_quant_8bit_v2.py.log \
             "
 
       - name: Copy logs from container

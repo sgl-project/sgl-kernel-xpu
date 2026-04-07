@@ -17,6 +17,7 @@ suites = {
         TestFile("test_awq_dequant.py"),
         TestFile("test_topk_softmax.py"),
         TestFile("test_flash_attention.py"),
+        TestFile("test_flash_mla_decode.py"),
         TestFile("test_moe_align.py"),
         TestFile("test_moe_gemm.py"),
         TestFile("test_moe_sum_reduce.py"),
@@ -28,6 +29,9 @@ suites = {
         TestFile("test_per_tensor_quant_fp8.py"),
         TestFile("test_fused_qk_norm_rope.py"),
         TestFile("test_merge_state_v2.py"),
+        TestFile("test_norm.py"),
+        TestFile("test_per_token_group_quant_8bit_v2.py"),
+        TestFile("test_activation.py"),
     ],
 }
 

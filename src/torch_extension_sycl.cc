@@ -66,7 +66,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "chunk_gated_delta_rule(Tensor query, Tensor key, Tensor value, Tensor g, Tensor beta, Tensor initial_state, "
       "bool output_final_state, Tensor cu_seqlens, Tensor chunk_indices, Tensor chunk_offsets, bool head_first, bool "
       "use_qk_l2norm_in_kernel, "
-      "float eps=1e-5) -> (Tensor, Tensor)");
+      "float eps=1e-6) -> (Tensor, Tensor)");
   m.impl("chunk_gated_delta_rule", torch::kXPU, &chunk_gated_delta_rule);
 
   m.def(

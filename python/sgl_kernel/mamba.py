@@ -78,6 +78,7 @@ def chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool,
     chunk_size: int = 64,
 ):
+    assert chunk_size == 64, "currently only chunk_size=64 is supported on XPU"
     chunk_indices, chunk_offsets = _prepare_chunk_indices_offsets(
         cu_seqlens, chunk_size
     )

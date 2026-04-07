@@ -163,57 +163,44 @@ def chunk_gated_delta_rule_update(
 
 
 def torch_recurrent_gated_delta_rule(
-    query,
-    key,
-    value,
-    g,
-    beta,
-    initial_state,
+    query,  # [B, HK, K]
+    key,  # [B, HK, K]
+    value,  # [B, HV, V]
+    g,  # [B, HV]
+    beta,  # [B, HV]
+    initial_state,  # [N, HV, K, V]
     output_final_state,
-    use_qk_l2norm_in_kernel=False,
+    use_qk_l2norm_in_kernel,  # True
 ):
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
         query = l2norm(query, dim=-1, eps=1e-6)
-        key = l2norm(key, dim=-1, eps=1e-6)
+        key   = l2norm(key,   dim=-1, eps=1e-6)
     query, key, value, beta, g = [
         x.transpose(1, 2).contiguous().to(torch.float32)
         for x in (query, key, value, beta, g)
     ]
-
-    batch_size, num_heads, sequence_length, k_head_dim = key.shape
-    v_head_dim = value.shape[-1]
+    B, H, T, K = key.shape
+    V     = value.shape[-1]
     scale = 1 / (query.shape[-1] ** 0.5)
     query = query * scale
 
-    core_attn_out = torch.zeros(batch_size, num_heads, sequence_length, v_head_dim).to(
-        value
-    )
-    last_recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
-        if initial_state is None
-        else initial_state.to(value)
-    )
+    out   = torch.zeros(B, H, T, V, device=value.device)
+    state = (torch.zeros(B, H, K, V, device=value.device)
+             if initial_state is None else initial_state.float())
 
-    for i in range(sequence_length):
-        q_t = query[:, :, i]
-        k_t = key[:, :, i]
-        v_t = value[:, :, i]
-        g_t = g[:, :, i].exp().unsqueeze(-1).unsqueeze(-1)
+    for i in range(T):
+        q_t, k_t, v_t = query[:, :, i], key[:, :, i], value[:, :, i]
+        g_t    = g   [:, :, i].exp().unsqueeze(-1).unsqueeze(-1)
         beta_t = beta[:, :, i].unsqueeze(-1)
+        state  = state * g_t
+        kv_mem = (state * k_t.unsqueeze(-1)).sum(dim=-2)
+        delta  = (v_t - kv_mem) * beta_t
+        state  = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+        out[:, :, i] = (state * q_t.unsqueeze(-1)).sum(dim=-2)
 
-        last_recurrent_state = last_recurrent_state * g_t
-        kv_mem = (last_recurrent_state * k_t.unsqueeze(-1)).sum(dim=-2)
-        delta = (v_t - kv_mem) * beta_t
-        last_recurrent_state = last_recurrent_state + k_t.unsqueeze(
-            -1
-        ) * delta.unsqueeze(-2)
-        core_attn_out[:, :, i] = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)
-
-    if not output_final_state:
-        last_recurrent_state = None
-    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
-    return core_attn_out, last_recurrent_state
+    out = out.transpose(1, 2).contiguous().to(initial_dtype)
+    return out, (state if output_final_state else None)
 
 
 def sigmoid_gating_delta_rule_update(
@@ -224,22 +211,59 @@ def sigmoid_gating_delta_rule_update(
     a,
     dt_bias,
     b,
+    cu_seqlens,
+    initial_state_indices,
     initial_state,
     output_final_state,
     use_qk_l2norm_in_kernel=False,
+    softplus_beta=1.0,
+    softplus_threshold=20.0,
 ):
-    beta = b.sigmoid()
-    g = -A_log.float().exp() * softplus(a.float() + dt_bias)
-    return torch_recurrent_gated_delta_rule(
-        query,
-        key,
-        value,
-        g.unsqueeze(0),
-        beta.unsqueeze(0),
-        initial_state,
-        output_final_state,
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    # Match fused decode kernel semantics: iterate sequences in batch order,
+    # consume per-sequence local timesteps using cu_seqlens, and update state
+    # in-place at initial_state_indices.
+    assert query.size(0) == 1, "reference path expects decode mode (seq_len == 1)"
+    batch_size = query.size(1)
+    assert cu_seqlens.numel() == batch_size + 1
+
+    beta = b.float().sigmoid()
+    g = -A_log.float().exp() * softplus(
+        a.float() + dt_bias, beta=softplus_beta, threshold=softplus_threshold
     )
+
+    ratio = value.size(2) // key.size(2)
+    q_expand = query.repeat_interleave(ratio, dim=2)
+    k_expand = key.repeat_interleave(ratio, dim=2)
+
+    out = torch.empty_like(value)
+    final_state = initial_state.clone().float()
+
+    for b_idx in range(batch_size):
+        seq_start = cu_seqlens[b_idx].item()
+        seq_end = cu_seqlens[b_idx + 1].item()
+        seq_len = seq_end - seq_start
+        state_idx = initial_state_indices[b_idx].item()
+
+        q_i = q_expand[:seq_len, b_idx : b_idx + 1]
+        k_i = k_expand[:seq_len, b_idx : b_idx + 1]
+        v_i = value[:seq_len, b_idx : b_idx + 1]
+        g_i = g[b_idx : b_idx + 1, :].unsqueeze(1).expand(1, seq_len, -1)
+        beta_i = beta[b_idx : b_idx + 1, :].unsqueeze(1).expand(1, seq_len, -1)
+
+        out_i, state_i = torch_recurrent_gated_delta_rule(
+            q_i.transpose(0, 1),
+            k_i.transpose(0, 1),
+            v_i.transpose(0, 1),
+            g_i,
+            beta_i,
+            final_state[state_idx : state_idx + 1],
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        out[:seq_len, b_idx : b_idx + 1] = out_i.transpose(0, 1)
+        final_state[state_idx] = state_i[0]
+
+    return out, (final_state[initial_state_indices] if output_final_state else None)
 
 
 def torch_gdn_gating(A_log, a, b, dt_bias):
@@ -378,7 +402,7 @@ class TestMambaAttention(unittest.TestCase):
             torch.testing.assert_close(beta, beta_sgl, atol=atol2, rtol=rtol2)
 
     def test_fused_sigmoid_gating_delta_rule_update(self):
-        batch_size = 1
+        batch_size = 5
         num_value_heads = 32
         head_k_dim = 128
         head_v_dim = 128
@@ -400,9 +424,9 @@ class TestMambaAttention(unittest.TestCase):
             ],
             dim=-1,
         )
-        query = query.view(1, seq_len, num_heads, head_k_dim)
-        key = key.view(1, seq_len, num_heads, head_k_dim)
-        value = value.view(1, seq_len, num_value_heads, head_v_dim)
+        query = query.view(1, batch_size, num_heads, head_k_dim)
+        key = key.view(1, batch_size, num_heads, head_k_dim)
+        value = value.view(1, batch_size, num_value_heads, head_v_dim)
         A_log = torch.rand(num_value_heads, dtype=torch.float32)
         a = torch.rand(batch_size, num_value_heads, dtype=torch.bfloat16)
         b = torch.rand(batch_size, num_value_heads, dtype=torch.bfloat16)
@@ -411,21 +435,18 @@ class TestMambaAttention(unittest.TestCase):
             513, num_value_heads, head_k_dim, head_v_dim, dtype=torch.float32
         )
         cache_indices = torch.arange(batch_size, dtype=torch.int32)
-        query_start_loc = torch.tensor([0, 1], dtype=torch.int32)
+        cu_seqlens = torch.arange(batch_size + 1, dtype=torch.int32)
         use_qk_l2norm_in_kernel = True
-        query_ref = query.clone()
-        key_ref = key.clone()
-        if num_value_heads // num_heads > 1:
-            query_ref = query_ref.repeat_interleave(num_value_heads // num_heads, dim=2)
-            key_ref = key_ref.repeat_interleave(num_value_heads // num_heads, dim=2)
         core_attn_out_ref, last_recurrent_state_ref = sigmoid_gating_delta_rule_update(
-            query_ref,
-            key_ref,
+            query,
+            key,
             value,
             A_log,
             a,
             dt_bias,
             b,
+            cu_seqlens=cu_seqlens,
+            initial_state_indices=cache_indices,
             initial_state=ssm_states[cache_indices],
             output_final_state=True,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
@@ -440,15 +461,16 @@ class TestMambaAttention(unittest.TestCase):
             b=b,
             initial_state_source=ssm_states,
             initial_state_indices=cache_indices,
-            cu_seqlens=query_start_loc,
+            cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             softplus_beta=1.0,
             softplus_threshold=20.0,
         )
         last_recurrent_state = ssm_states[cache_indices]
         atol = rtol = precision[core_attn_out.dtype]
+        torch.xpu.synchronize()
         torch.testing.assert_close(
-            core_attn_out, core_attn_out_ref, atol=atol, rtol=rtol
+            core_attn_out, core_attn_out_ref.transpose(0, 1).to(core_attn_out.dtype), atol=atol, rtol=rtol
         )
         torch.testing.assert_close(
             last_recurrent_state, last_recurrent_state_ref, atol=atol, rtol=rtol

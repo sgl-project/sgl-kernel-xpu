@@ -763,16 +763,16 @@ at::Tensor fused_sigmoid_gating_delta_rule_update(
 
   const float q_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
   const int64_t head_expand = v_heads / q_heads;
-  const int64_t q_stride_b = q.stride(0);
-  const int64_t q_stride_t = q.stride(1);
+  const int64_t q_stride_t = q.stride(0);
+  const int64_t q_stride_b = q.stride(1);
   const int64_t q_stride_h = q.stride(2);
   const int64_t q_stride_d = q.stride(3);
-  const int64_t k_stride_b = k.stride(0);
-  const int64_t k_stride_t = k.stride(1);
+  const int64_t k_stride_t = k.stride(0);
+  const int64_t k_stride_b = k.stride(1);
   const int64_t k_stride_h = k.stride(2);
   const int64_t k_stride_d = k.stride(3);
-  const int64_t v_stride_b = v.stride(0);
-  const int64_t v_stride_t = v.stride(1);
+  const int64_t v_stride_t = v.stride(0);
+  const int64_t v_stride_b = v.stride(1);
   const int64_t v_stride_h = v.stride(2);
   const int64_t v_stride_d = v.stride(3);
 

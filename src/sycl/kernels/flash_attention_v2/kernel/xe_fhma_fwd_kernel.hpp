@@ -1001,9 +1001,27 @@ class XeFMHAFwdSplitKVKernel {
       auto shape_sink = make_shape(s.num_heads_kv, head_group_q);
 
       int num_blocks_per_split = cute::ceil_div(windowed_k_blocks, num_kv_splits);
-      int kv_split_offset = k_block0 + idx_kv_split * num_blocks_per_split;
-      int num_effective_kv_blocks =
-          cute::min(windowed_k_blocks - idx_kv_split * num_blocks_per_split, num_blocks_per_split);
+
+      // Per-sequence split decision: short sequences are treated as
+      // single-split even when num_kv_splits > 1, avoiding precision
+      // loss from the split-reduce roundtrip.
+      constexpr int kMinBlocksForSplit = 128;
+      bool is_single_split = (num_kv_splits > 1) && (windowed_k_blocks < kMinBlocksForSplit);
+
+      int kv_split_offset;
+      int num_effective_kv_blocks;
+      if (is_single_split) {
+        // Split 0 processes all blocks; splits 1+ skip entirely.
+        if (idx_kv_split > 0) {
+          continue;
+        }
+        kv_split_offset = k_block0;
+        num_effective_kv_blocks = windowed_k_blocks;
+      } else {
+        kv_split_offset = k_block0 + idx_kv_split * num_blocks_per_split;
+        num_effective_kv_blocks =
+            cute::min(windowed_k_blocks - idx_kv_split * num_blocks_per_split, num_blocks_per_split);
+      }
 
       if (num_effective_kv_blocks <= 0) {
         // no need computation
@@ -1020,6 +1038,9 @@ class XeFMHAFwdSplitKVKernel {
       auto layout_q = make_ordered_layout(shape_Q, Step<_1, _0, _2, _3>{});
       auto layout_k = make_ordered_layout(shape_K, Step<_2, _0, _1, _3>{});
       auto layout_v = make_ordered_layout(shape_V, Step<_0, _2, _1, _3>{});
+
+      // auto layout_k = make_layout(shape_K, make_stride(get<0>(p.dK), _1{}, get<2>(p.dK), get<3>(p.dK)));
+      // auto layout_v = make_layout(shape_V, make_stride(_1{}, get<1>(p.dV), get<2>(p.dV), get<3>(p.dV)));
 
       auto layout_o = make_ordered_layout(shape_O, Step<_1, _0, _2, _3, _4>{});
       auto layout_exp_sums = make_ordered_layout(shape_exp_sums, Step<_1, _0, _2, _3>{});
@@ -1083,7 +1104,8 @@ class XeFMHAFwdSplitKVKernel {
             idx_kv_split,
             head_group_q,
             sinks_per_kv,
-            num_kv_splits);
+            num_kv_splits,
+            is_single_split);
       } else {
         epilogue(
             O(_, _, head, idx_kv_split, l_coord),
@@ -1097,9 +1119,11 @@ class XeFMHAFwdSplitKVKernel {
             idx_kv_split,
             head_group_q,
             sinks,
-            num_kv_splits);
+            num_kv_splits,
+            is_single_split);
       }
     }
   }
 };
+
 }  // namespace cutlass::fmha::kernel

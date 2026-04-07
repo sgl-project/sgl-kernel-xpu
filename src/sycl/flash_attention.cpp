@@ -230,7 +230,7 @@ std::vector<at::Tensor> mha_fwd(
   num_kv_splits = -1;
   out = torch::empty({total_q, num_heads, head_size_v}, opts);
   Arguments params;
-  params.use_split_kv = false;
+  params.use_split_kv = true;
   if (params.use_split_kv) {
     auto get_num_splits = [](int batch_size, int num_heads_kv, int max_seqlen_k, int block_size) {
       auto stream = at::xpu::getCurrentXPUStream();
@@ -255,8 +255,17 @@ std::vector<at::Tensor> mha_fwd(
                    ? out
                    : torch::empty({total_q, num_kv_splits * num_heads, head_size_v}, q.options().device(q.device()));
 
-    exp_sums = torch::empty({total_q, num_heads, num_kv_splits}, q.options().dtype(at::kFloat).device(q.device()));
-    max_logits = torch::empty({total_q, num_heads, num_kv_splits}, q.options().dtype(at::kFloat).device(q.device()));
+    max_logits = at::full(
+        {total_q, num_heads, num_kv_splits},
+        -std::numeric_limits<float>::infinity(),
+        q.options().dtype(at::kFloat).device(q.device()));
+        
+    exp_sums = at::zeros(
+        {total_q, num_heads, num_kv_splits},
+        q.options().dtype(at::kFloat).device(q.device()));
+
+
+
     params.temp_out_ptr = temp_out.data_ptr();
     params.exp_sums_ptr = exp_sums.data_ptr();
     params.max_logits_ptr = max_logits.data_ptr();
@@ -284,8 +293,17 @@ std::vector<at::Tensor> mha_fwd(
   params.k_row_stride = k.stride(-3);
   params.v_row_stride = v.stride(-3);
   params.q_head_stride = q.stride(-2);
+
   params.k_head_stride = k.stride(-2);
   params.v_head_stride = v.stride(-2);
+
+  params.k_stride_page = k.stride(0);
+  params.k_stride_seq = k.stride(1);
+  params.k_stride_heads = k.stride(2);
+  params.v_stride_page = v.stride(0);
+  params.v_stride_seq = v.stride(1);
+  params.v_stride_heads = v.stride(2);
+
   params.v_dim_stride = v.stride(-1);
   params.o_ptr = out.data_ptr();
   params.o_row_stride = out.stride(-3);

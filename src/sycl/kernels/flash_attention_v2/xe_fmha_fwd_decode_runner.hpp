@@ -72,6 +72,13 @@ struct Arguments {
   int64_t v_head_stride;
   int64_t v_dim_stride;
 
+  int64_t k_stride_page = 0;
+  int64_t k_stride_seq = 0;
+  int64_t k_stride_heads = 0;
+  int64_t v_stride_page = 0;
+  int64_t v_stride_seq = 0;
+  int64_t v_stride_heads = 0;
+
   // The number of heads.
   int h, h_k;
   int q_group_size = 1;
@@ -337,7 +344,7 @@ struct DecodeRunner {
 };
 
 template <class FMHAKernel, class ReductionSplitKernel, bool isVarLen>
-struct DecodeKernelLauncher {
+struct SplitDecodeKernelRunner {
   using StrideQ = typename FMHAKernel::StrideQ;
   using StrideK = typename FMHAKernel::StrideK;
   using StrideV = typename FMHAKernel::StrideV;
@@ -396,10 +403,43 @@ struct DecodeKernelLauncher {
 
     stride_Q =
         cutlass::make_cute_packed_stride(StrideQ{}, cute::make_shape(seq_len_qo, head_size_qk, num_heads_q, batch));
-    stride_K =
-        cutlass::make_cute_packed_stride(StrideK{}, cute::make_shape(seq_len_kv, head_size_qk, num_heads_kv, batch));
-    stride_V =
-        cutlass::make_cute_packed_stride(StrideV{}, cute::make_shape(head_size_vo, seq_len_kv, num_heads_kv, batch));
+    if (params.k_stride_seq > 0) {
+      // Use actual strides from KV cache tensors (supports non-contiguous
+      // layouts such as MLA combined KV cache)
+      constexpr int64_t kIntMax = static_cast<int64_t>(std::numeric_limits<int>::max());
+      TORCH_CHECK(
+          params.k_stride_seq <= kIntMax && params.k_stride_heads <= kIntMax && params.k_stride_page <= kIntMax &&
+              params.v_stride_seq <= kIntMax && params.v_stride_heads <= kIntMax && params.v_stride_page <= kIntMax,
+          "KV cache stride exceeds int32 max (",
+          kIntMax,
+          "): k_stride_seq=",
+          params.k_stride_seq,
+          " k_stride_heads=",
+          params.k_stride_heads,
+          " k_stride_page=",
+          params.k_stride_page,
+          " v_stride_seq=",
+          params.v_stride_seq,
+          " v_stride_heads=",
+          params.v_stride_heads,
+          " v_stride_page=",
+          params.v_stride_page);
+      stride_K = StrideK{
+          static_cast<int>(params.k_stride_seq),
+          _1{},
+          static_cast<int>(params.k_stride_heads),
+          static_cast<int>(params.k_stride_page)};
+      stride_V = StrideV{
+          _1{},
+          static_cast<int>(params.v_stride_seq),
+          static_cast<int>(params.v_stride_heads),
+          static_cast<int>(params.v_stride_page)};
+    } else {
+      stride_K =
+          cutlass::make_cute_packed_stride(StrideK{}, cute::make_shape(seq_len_kv, head_size_qk, num_heads_kv, batch));
+      stride_V =
+          cutlass::make_cute_packed_stride(StrideV{}, cute::make_shape(head_size_vo, seq_len_kv, num_heads_kv, batch));
+    }
     stride_O =
         cutlass::make_cute_packed_stride(StrideO{}, cute::make_shape(seq_len_qo, head_size_vo, num_heads_q, batch));
     stride_Oaccum = cutlass::make_cute_packed_stride(
@@ -707,7 +747,7 @@ struct SplitDecodeConfig {
     using ReduceSplitKernel = cutlass::reduction::kernel::
         ReduceSplitK<ProblemShapeType, cutlass::fmha::kernel::XeReduceSplitKTileScheduler, FMHAKernel>;
 
-    DecodeKernelLauncher<FMHAKernel, ReduceSplitKernel, isVarLen> launcher;
+    SplitDecodeKernelRunner<FMHAKernel, ReduceSplitKernel, isVarLen> launcher;
 
     launcher.run(params, hw_info);
   }

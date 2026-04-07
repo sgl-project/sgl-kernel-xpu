@@ -240,6 +240,7 @@ class ReduceSplitK {
 
       Tensor exp_sums = make_tensor(make_gmem_ptr(ptrExp_sums), make_layout(shape_exp_sums, stride_exp_sums));
       Tensor max_logits = make_tensor(make_gmem_ptr(ptrMax_logits), make_layout(shape_max_logits, stride_max_logits));
+
       int l_coord = is_var_len ? 0 : idx_b;
 
       // Step 1: reduce max logits across different partitions
@@ -276,19 +277,23 @@ class ReduceSplitK {
           ElementLSE local_max_logit = shared_storage.max_logits_slm_array[i];
           ElementLSE local_exp_sum = shared_storage.exp_sums_slm_array[i];
 
+          // Skip splits with no valid data (short sequences treated as
+          // single-split have exp_sums=0 / max_logits=-inf for unused splits).
+          if (local_exp_sum <= ElementLSE(0)) continue;
+
           ElementLSE rescale = sycl::native::exp2(local_max_logit - global_max_logits);
 
-          // in FMHA epilogue, it's divided by local_exp_sum, here we multiply
-          // back
-          ElementLSE adjusted_o_accum =
-              static_cast<ElementLSE>(Oaccum(seq_idx, idx, i * num_heads_q + head_q, l_coord)) * local_exp_sum;
-          acc += adjusted_o_accum * rescale;
+          // Partial outputs are unnormalized (not divided by exp_sum in the
+          // epilogue), so combine them directly with the rescale factor.
+          ElementLSE o_accum_val = static_cast<ElementLSE>(Oaccum(seq_idx, idx, i * num_heads_q + head_q, l_coord));
+          acc += o_accum_val * rescale;
 
           // update global exp sum
           global_exp_sums += local_exp_sum * rescale;
         }
 
         ElementLSE inv_global_exp_sums = 1. / global_exp_sums;
+
         acc *= inv_global_exp_sums;
         O(seq_idx, idx, head_q, l_coord) = static_cast<ElementO>(acc);
       }

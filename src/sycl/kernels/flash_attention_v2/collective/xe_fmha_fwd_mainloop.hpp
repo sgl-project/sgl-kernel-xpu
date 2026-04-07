@@ -929,7 +929,7 @@ struct DecodeFwdMainloop<
         cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
       }
 
-      // barrier();
+      barrier();
 
       // next tile_idx
       next_tile_idx = K + 1;

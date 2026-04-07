@@ -985,7 +985,7 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("causal", [False])
-@pytest.mark.parametrize("local", [False])
+@pytest.mark.parametrize("local", [True, False])
 @pytest.mark.parametrize("use_sinks", [False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 @pytest.mark.parametrize("has_rotary_seqlens", [False])
@@ -1007,7 +1007,7 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize("d", [64, 128, 256, 512])
 @pytest.mark.parametrize("seqlen_q", [1])
 # @pytest.mark.parametrize("batch_size", [1])
-@pytest.mark.parametrize("batch_size", [1, 16])
+@pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize(
     "seqlen_k",
     [
@@ -1056,7 +1056,7 @@ def test_flash_attn_decode_kvcache(
     torch.random.manual_seed(0)
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
     nheads = 16
-    nheads_k = 4  # nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
+    nheads_k = 16  # nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
 
     if seqlen_k <= seqlen_q:

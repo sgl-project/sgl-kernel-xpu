@@ -262,7 +262,7 @@ def flash_attn_with_kvcache(
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_q,
-        max_seqlen_k,
+        1,
         page_table,
         cache_batch_idx,
         cache_leftpad,

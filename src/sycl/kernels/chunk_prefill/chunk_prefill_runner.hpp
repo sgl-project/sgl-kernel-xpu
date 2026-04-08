@@ -37,6 +37,8 @@ struct Flash_fwd_params {
 
   // The number of heads.
   int h, h_k;
+  bool use_sink = false;
+  bool use_causal_mask = false;
 
   // The O matrix (output).
   void* __restrict__ o_ptr;
@@ -140,7 +142,7 @@ struct Flash_fwd_params {
 
   bool is_rotary_interleaved;
 
-  int num_splits;  // For split-KV version
+  int num_kv_splits;  // For split-KV version
   bool pack_gqa;
 
   int* __restrict__ tile_count_semaphore;
@@ -427,7 +429,7 @@ inline int round_up_headdim(int head_size) {
 }
 
 std::vector<at::Tensor> mha_fwd(
-    at::Tensor& q,        // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
+    const at::Tensor& q,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
                           // h_k, d) if there is page_table.
     const at::Tensor& v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages,
@@ -454,7 +456,7 @@ std::vector<at::Tensor> mha_fwd(
     float const softcap,
     bool const is_rotary_interleaved,  // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
     std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
-    int num_splits,
+    int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin) {
   // TODO: check GPU support
@@ -599,8 +601,8 @@ std::vector<at::Tensor> mha_fwd(
 
   // Set the different scale values.
   params.scale_softmax = softmax_scale;
-  bool use_sink = sinks_.has_value();
-  params.sink_softmax = use_sink ? sinks_.value().data_ptr() : nullptr;
+  params.use_sink = sinks_.has_value();
+  params.sink_softmax = params.use_sink ? sinks_.value().data_ptr() : nullptr;
 
   params.softcap = softcap;
 
@@ -697,7 +699,7 @@ std::vector<at::Tensor> mha_fwd(
   constexpr int PipelineStages = 2;
   switch (params.d) {
     case 64:
-      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
         if (params.is_causal) {
           ChunkPrefillConfig<
               cute::Shape<_128, _64, _64>,
@@ -725,7 +727,7 @@ std::vector<at::Tensor> mha_fwd(
       })
       break;
     case 96:
-      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
         if (params.is_causal) {
           ChunkPrefillConfig<
               cute::Shape<_128, _64, _32>,
@@ -754,7 +756,7 @@ std::vector<at::Tensor> mha_fwd(
       })
       break;
     case 128:
-      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
         if (params.is_causal) {
           ChunkPrefillConfig<
               cute::Shape<_128, _64, _64>,
@@ -782,7 +784,7 @@ std::vector<at::Tensor> mha_fwd(
       })
       break;
     case 192:
-      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
         if (params.is_causal) {
           ChunkPrefillConfig<
               cute::Shape<_256, _64, _64>,
@@ -810,7 +812,7 @@ std::vector<at::Tensor> mha_fwd(
       })
       break;
     case 256:
-      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
         if (params.is_causal) {
           ChunkPrefillConfig<
               cute::Shape<_256, _64, _64>,
@@ -838,7 +840,7 @@ std::vector<at::Tensor> mha_fwd(
       })
       break;
     case 512:
-      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
         if (params.is_causal) {
           ChunkPrefillConfig<
               cute::Shape<cute::Int<256>, _64, _64>,

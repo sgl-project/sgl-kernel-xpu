@@ -1,6 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2024 - 2025 Codeplay Software Ltd. All rights reserved.
- * Copyright (C) 2025 Intel Corporation, All rights reserved.
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -29,28 +28,32 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
-// Auto-generated from xe_fmha_fwd_decode_kernel.cpp.in
-// Template parameters: QG_SZ=@QG_SZ@, HEAD_DIM=@HEAD_DIM@, PAGE_SIZE=@PAGE_SIZE@
+// Auto-generated from xe_fmha_fwd_prefill_kernel.cpp.in
+// Template parameters: HEAD_DIM=@HEAD_DIM@, TILED_Q=@TILED_Q@, TILED_KV=@TILED_KV@, NUM_SG=@NUM_SG@
 #define SYCL_INTEL_TARGET 20
 
-#include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
+#include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_runner.hpp"
 
-namespace decode {
+namespace prefill {
 
 template <>
-void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Arguments& params) const {
-  using TileShapeQK = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@PAGE_SIZE@>, cute::_64>;
-  using TileShapePV = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@PAGE_SIZE@>>;
-  using TileShapeOutput = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@HEAD_DIM@>>;
-  using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<@PAGE_SIZE@ / 16>, cute::_1>>;
+void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
+  using TileShapeQK = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_KV@>, cute::_32>;
+  using TileShapePV = cute::Shape<cute::Int<@TILED_Q@>, cute::_32, cute::Int<@TILED_KV@>>;
+  using TileShapeOutput = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@HEAD_DIM@>>;
+  using SubgroupLayoutQK =
+      cute::Layout<cute::Shape<cute::Int<@NUM_SG@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
 
-    AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
-      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-        DecodeConfig<false, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(params);
+  bool use_sink = (params.softmax_sink_ptr != nullptr);
+  AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+        FMHAConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(params);
       });
+    });
   });
 }
 
-template struct FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>;
+template struct FmhaPrefillRunner<@HEAD_DIM@>;
 
-}  // namespace decode
+}  // namespace prefill

@@ -1,6 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2024 - 2025 Codeplay Software Ltd. All rights reserved.
- * Copyright (C) 2025 Intel Corporation, All rights reserved.
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -29,28 +28,27 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
-// Auto-generated from xe_fmha_fwd_decode_kernel.cpp.in
-// Template parameters: QG_SZ=@QG_SZ@, HEAD_DIM=@HEAD_DIM@, PAGE_SIZE=@PAGE_SIZE@
-#define SYCL_INTEL_TARGET 20
+#pragma once
 
-#include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
+#include "xe_fmha_fwd_prefill_runner.hpp"
 
-namespace decode {
+namespace prefill {
 
-template <>
-void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Arguments& params) const {
-  using TileShapeQK = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@PAGE_SIZE@>, cute::_64>;
-  using TileShapePV = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@PAGE_SIZE@>>;
-  using TileShapeOutput = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@HEAD_DIM@>>;
-  using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<@PAGE_SIZE@ / 16>, cute::_1>>;
+// Explicit instantiation declarations — tell the compiler these are compiled
+// in separate translation units (generated from the .cpp.in templates).
+//
+// Parameters:
+//   HEAD_DIM in {64, 96, 128, 192, 256, 512}
 
-    AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
-      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-        DecodeConfig<false, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(params);
-      });
-  });
-}
+#define EXTERN_FMHA_PREFILL_RUNNER(HD) extern template struct FmhaPrefillRunner<HD>;
 
-template struct FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>;
+EXTERN_FMHA_PREFILL_RUNNER(64)
+EXTERN_FMHA_PREFILL_RUNNER(96)
+EXTERN_FMHA_PREFILL_RUNNER(128)
+EXTERN_FMHA_PREFILL_RUNNER(192)
+EXTERN_FMHA_PREFILL_RUNNER(256)
+EXTERN_FMHA_PREFILL_RUNNER(512)
 
-}  // namespace decode
+#undef EXTERN_FMHA_PREFILL_RUNNER
+
+}  // namespace prefill

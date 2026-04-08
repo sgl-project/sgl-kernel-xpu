@@ -259,12 +259,8 @@ std::vector<at::Tensor> mha_fwd(
         {total_q, num_heads, num_kv_splits},
         -std::numeric_limits<float>::infinity(),
         q.options().dtype(at::kFloat).device(q.device()));
-        
-    exp_sums = at::zeros(
-        {total_q, num_heads, num_kv_splits},
-        q.options().dtype(at::kFloat).device(q.device()));
 
-
+    exp_sums = at::zeros({total_q, num_heads, num_kv_splits}, q.options().dtype(at::kFloat).device(q.device()));
 
     params.temp_out_ptr = temp_out.data_ptr();
     params.exp_sums_ptr = exp_sums.data_ptr();

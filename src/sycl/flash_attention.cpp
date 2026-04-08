@@ -255,12 +255,12 @@ std::vector<at::Tensor> mha_fwd(
                    ? out
                    : torch::empty({total_q, num_kv_splits * num_heads, head_size_v}, q.options().device(q.device()));
 
-    max_logits = at::full(
+    max_logits = torch::full(
         {total_q, num_heads, num_kv_splits},
         -std::numeric_limits<float>::infinity(),
         q.options().dtype(at::kFloat).device(q.device()));
 
-    exp_sums = at::zeros({total_q, num_heads, num_kv_splits}, q.options().dtype(at::kFloat).device(q.device()));
+    exp_sums = torch::zeros({total_q, num_heads, num_kv_splits}, q.options().dtype(at::kFloat).device(q.device()));
 
     params.temp_out_ptr = temp_out.data_ptr();
     params.exp_sums_ptr = exp_sums.data_ptr();

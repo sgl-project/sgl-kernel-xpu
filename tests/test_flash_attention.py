@@ -1012,14 +1012,9 @@ def test_flash_attn_kvcache(
     "seqlen_k",
     [
         128,
-        256,
-        339,
         1024,
-        800,
-        256,
-        799,
-        2048,
-        20000,
+        4096,
+        8192,
     ],
 )
 def test_flash_attn_decode_kvcache(

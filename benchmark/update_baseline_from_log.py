@@ -36,7 +36,7 @@ def parse_fused_moe_log(log_text: str) -> dict:
         ms = float(cols[-1])
 
         key = (
-            f"{num_tokens}-{num_experts}-{topk}-{hidden_size}-{shard_intermediate_size}"
+            f"fused_moe:{num_tokens}-{num_experts}-{topk}-{hidden_size}-{shard_intermediate_size}"
         )
         result[key] = ms
 

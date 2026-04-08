@@ -1006,7 +1006,6 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize("varlen_q", [True])
 @pytest.mark.parametrize("d", [64, 128, 256, 512])
 @pytest.mark.parametrize("seqlen_q", [1])
-# @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize(
     "seqlen_k",
@@ -1468,6 +1467,7 @@ def test_flash_attn_decode_kvcache(
                 assert (out - out_ref).abs().mean().item() <= mult_mean * (
                     out_pt - out_ref
                 ).abs().mean().item()
+    torch.xpu.empty_cache()
 
 
 def _generate_block_kvcache(

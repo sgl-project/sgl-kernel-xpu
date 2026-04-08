@@ -241,8 +241,9 @@ def benchmark(
 
 if __name__ == "__main__":
     benchmark.run(print_data=False)
+    print("Benchmark finished!")
+
     import pandas as pd
 
     df = pd.DataFrame(all_results)
     print(df.to_markdown())
-    print("Benchmark finished!")

@@ -18,9 +18,9 @@ import torch
 import triton
 from sgl_kernel import fused_qk_rope
 
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
-#Dtype helpers
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
+# -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
+# Dtype helpers
+# -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
 DTYPE_MAP = {
     "fp16": torch.float16,
     "bf16": torch.bfloat16,
@@ -32,9 +32,10 @@ DTYPE_BYTES = {
     "fp8_e4m3fn": 1,
 }
 
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
-#Reference implementation(CPU float32)
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
+
+# -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
+# Reference implementation(CPU float32)
+# -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
 def apply_rotary_emb_native(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -85,17 +86,13 @@ def compute_inv_freq_yarn(
     )
 
     if factor != 1.0:
-        dim_range = torch.arange(
-            0, rotary_dim, 2, dtype=torch.float32, device=device
-        )
+        dim_range = torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device)
         ramp_func = torch.clamp(
             (dim_range - low_freq_factor) / (high_freq_factor - low_freq_factor),
             0.0,
             1.0,
         )
-        inv_freq = (
-            inv_freq / factor * (1.0 - ramp_func) + inv_freq * ramp_func
-        )
+        inv_freq = inv_freq / factor * (1.0 - ramp_func) + inv_freq * ramp_func
 
     return inv_freq
 
@@ -140,18 +137,18 @@ def fused_qk_rope_reference(
     k = qkv_reshaped[:, num_heads_q : num_heads_q + num_heads_k, :]
     v = qkv_reshaped[:, num_heads_q + num_heads_k :, :]
 
-#Per - dimension weight scaling(no RMSNorm)
+    # Per - dimension weight scaling(no RMSNorm)
     q_scaled = q.float() * q_weight.float()
     k_scaled = k.float() * k_weight.float()
 
-#RoPE frequencies
+    # RoPE frequencies
     inv_freq = compute_inv_freq_yarn(rotary_dim, base, factor, low, high, qkv.device)
     positions = position_ids.float()
     freqs = torch.outer(positions, inv_freq)
     cos = freqs.cos() * attention_factor
     sin = freqs.sin() * attention_factor
 
-#Apply RoPE(rotary_dim portion only)
+    # Apply RoPE(rotary_dim portion only)
     q_rot = apply_rotary_emb_native(q_scaled[..., :rotary_dim], cos, sin, is_neox)
     q_final = torch.cat([q_rot, q_scaled[..., rotary_dim:]], dim=-1)
 
@@ -161,14 +158,15 @@ def fused_qk_rope_reference(
     result = torch.cat([q_final, k_final, v.float()], dim=1)
     return result.view(num_tokens, total_heads * head_dim)
 
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
-#Benchmark configuration
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
+
+# -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
+# Benchmark configuration
+# -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
 batch_size_range = [1, 2, 4, 8]
 seq_len_range = [64, 128, 256, 512, 1024, 2048]
-#(num_heads_q, num_heads_k, num_heads_v, head_dim)
+# (num_heads_q, num_heads_k, num_heads_v, head_dim)
 head_config_range = [
-    (32, 8, 8, 128),    # Standard MQA config
+    (32, 8, 8, 128),  # Standard MQA config
     (32, 32, 32, 128),  # Standard MHA config
     (128, 128, 128, 128),  # DeepSeek-V3 style
 ]
@@ -183,13 +181,13 @@ for batch_size, seq_len, (nq, nk, nv, hd), is_neox, dtype in itertools.product(
 
 all_results = []
 
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
-#Chunked / single - config mode(set env vars for parallel sweeps)
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
-#NUM_CHUNKS / CHUNK_IDX  – split the full config list across processes
-#SINGLE_CONFIG           – run exactly one config given as CSV:
-#"batch_size,seq_len,nq,nk,nv,head_dim,is_neox,dtype"
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+# -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+# Chunked / single - config mode(set env vars for parallel sweeps)
+# -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+# NUM_CHUNKS / CHUNK_IDX  – split the full config list across processes
+# SINGLE_CONFIG           – run exactly one config given as CSV:
+# "batch_size,seq_len,nq,nk,nv,head_dim,is_neox,dtype"
+# -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
 num_chunks = int(os.environ.get("NUM_CHUNKS", "1"))
 chunk_idx = int(os.environ.get("CHUNK_IDX", "0"))
 
@@ -220,9 +218,10 @@ if num_chunks > 1:
     end = min(start + chunk_size, total)
     configs = configs[start:end]
 
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
-#FLOPs / bandwidth helpers
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
+
+# -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
+# FLOPs / bandwidth helpers
+# -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
 def calculate_flops(
     num_tokens: int,
     num_heads_q: int,
@@ -266,7 +265,7 @@ def calculate_effective_bandwidth(
 
     qkv_bytes = num_tokens * num_heads * head_dim * bytes_per_elem
     weight_bytes = 2 * head_dim * bytes_per_elem  # q_weight + k_weight
-    total_bytes = 2 * qkv_bytes + weight_bytes     # read + write QKV
+    total_bytes = 2 * qkv_bytes + weight_bytes  # read + write QKV
 
     time_s = time_ms / 1000.0
     bandwidth_gbs = (total_bytes / 1e9) / time_s
@@ -277,16 +276,17 @@ def calculate_effective_bandwidth(
     gflops = (total_flops / 1e9) / time_s
 
     return {
-  "num_tokens" : num_tokens,
-                 "total_bytes" : total_bytes,
-                                 "bandwidth_gbs" : bandwidth_gbs,
-                                                   "total_flops" : total_flops,
-                                                                   "gflops" : gflops,
+        "num_tokens": num_tokens,
+        "total_bytes": total_bytes,
+        "bandwidth_gbs": bandwidth_gbs,
+        "total_flops": total_flops,
+        "gflops": gflops,
     }
 
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
-#Triton perf_report benchmark
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
+
+# -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
+# Triton perf_report benchmark
+# -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=[
@@ -328,17 +328,15 @@ def benchmark(
     is_fp8 = dtype == "fp8_e4m3fn"
 
     if is_fp8:
-#FP8 tensors : use bounded uniform values to stay within the FP8
-#representable range(| x | <= 448 for float8_e4m3fn).
+        # FP8 tensors : use bounded uniform values to stay within the FP8
+        # representable range(| x | <= 448 for float8_e4m3fn).
         qkv = (
-            (torch.rand(num_tokens, num_heads * head_dim) * 2.0 - 1.0) * 2.0
-        ).to(torch_dtype).to(device)
-        q_weight = (
-            (torch.rand(head_dim) * 2.0 - 1.0) * 0.5
-        ).to(torch_dtype).to(device)
-        k_weight = (
-            (torch.rand(head_dim) * 2.0 - 1.0) * 0.5
-        ).to(torch_dtype).to(device)
+            ((torch.rand(num_tokens, num_heads * head_dim) * 2.0 - 1.0) * 2.0)
+            .to(torch_dtype)
+            .to(device)
+        )
+        q_weight = ((torch.rand(head_dim) * 2.0 - 1.0) * 0.5).to(torch_dtype).to(device)
+        k_weight = ((torch.rand(head_dim) * 2.0 - 1.0) * 0.5).to(torch_dtype).to(device)
     else:
         qkv = torch.randn(
             num_tokens, num_heads * head_dim, device=device, dtype=torch_dtype
@@ -351,9 +349,9 @@ def benchmark(
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "torch":
-#Run the reference on a CPU float32 copy to time CPU throughput.
-#For FP8, dequantize first so the reference sees the same values as
-#the kernel(FP8 has no native compute path in PyTorch).
+        # Run the reference on a CPU float32 copy to time CPU throughput.
+        # For FP8, dequantize first so the reference sees the same values as
+        # the kernel(FP8 has no native compute path in PyTorch).
         qkv_cpu = qkv.to(torch.float32).to("cpu")
         q_weight_cpu = q_weight.to(torch.float32).to("cpu")
         k_weight_cpu = k_weight.to(torch.float32).to("cpu")
@@ -431,28 +429,27 @@ def benchmark(
 
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
-#Entry point
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
+
+# -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
+# Entry point
+# -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
 if __name__ == "__main__":
     print("Running fused_qk_rope benchmarks...")
     benchmark.run(print_data=True)
 
-#Write per - chunk CSV
+    # Write per - chunk CSV
     os.makedirs("benchmark/results", exist_ok=True)
     df = pd.DataFrame(all_results)
-    chunk_label = (
-        f"chunk_{os.environ.get('CHUNK_IDX', '0')}_of_{os.environ.get('NUM_CHUNKS', '1')}"
-    )
+    chunk_label = f"chunk_{os.environ.get('CHUNK_IDX', '0')}_of_{os.environ.get('NUM_CHUNKS', '1')}"
     out_csv = os.path.join(
         "benchmark/results", f"results_fused_qk_rope_{chunk_label}.csv"
     )
     df.to_csv(out_csv, index=False)
     print(f"Wrote results CSV: {out_csv}")
 
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
-#Summary tables
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+    # -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+    # Summary tables
+    # -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
     print("\n" + "=" * 80)
     print("Effective Bandwidth Results")
     print("=" * 80)
@@ -475,9 +472,9 @@ if __name__ == "__main__":
     )
     print(summary.to_markdown())
 
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
-#Speedup analysis
-#-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+    # -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+    # Speedup analysis
+    # -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
     print("\n" + "=" * 80)
     print("Speedup Analysis (torch vs sglang)")
     print("=" * 80)

@@ -101,7 +101,7 @@ class MoEGEMM {
 
   auto make_B_tensors(ElementB* ptr_B, int N, int K) {
     if constexpr (FuseAct) {
-      if constexpr (ActType == SWILGU_GPT_OSS) {
+      if constexpr (ActType == SWIGLU_GPT_OSS) {
         // Weights are interleaved for GPT-OSS: [gate_row0, up_row0, gate_row1, up_row1, ...]
         // Gate rows are at offsets 0, 2*K, 4*K, ... → row stride = 2*K
         auto B0 =
@@ -126,7 +126,7 @@ class MoEGEMM {
   auto make_Bias_tensors(float* ptr_Bias, int N) {
     if constexpr (WithBias) {
       if constexpr (FuseAct) {
-        if constexpr (ActType == SWILGU_GPT_OSS) {
+        if constexpr (ActType == SWIGLU_GPT_OSS) {
           // Bias is interleaved for GPT-OSS: [bias_gate0, bias_up0, bias_gate1, bias_up1, ...]
           // Gate bias at even indices → stride 2; up bias at odd indices → start +1, stride 2
           auto Bias0 = make_tensor(make_gmem_ptr<float>(ptr_Bias), make_layout(make_shape(N / 2), make_stride(_2{})));
@@ -146,7 +146,7 @@ class MoEGEMM {
       }
     } else {
       // return a tuple of empty tensors with stride matching the active path
-      if constexpr (FuseAct && ActType == SWILGU_GPT_OSS) {
+      if constexpr (FuseAct && ActType == SWIGLU_GPT_OSS) {
         return cute::make_tuple(
             make_tensor(make_gmem_ptr<float>(nullptr), make_layout(make_shape(0), make_stride(_2{}))),
             make_tensor(make_gmem_ptr<float>(nullptr), make_layout(make_shape(0), make_stride(_2{}))));

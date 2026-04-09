@@ -143,14 +143,14 @@ shape_configs = [
 
 shape_configs_gelu = [
     # grok, tp=1
-    # {
-    #     "num_experts": 8,
-    #     "topk": 2,
-    #     "hidden_size": 8192,
-    #     "shard_intermediate_size": 16384,
-    #     "dtype": torch.bfloat16,
-    #     "block_shape": None,
-    # }
+    {
+        "num_experts": 8,
+        "topk": 2,
+        "hidden_size": 8192,
+        "shard_intermediate_size": 16384,
+        "dtype": torch.bfloat16,
+        "block_shape": None,
+    }
 ]
 
 

@@ -1,6 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2024 - 2025 Codeplay Software Ltd. All rights reserved.
- * Copyright (C) 2025 Intel Corporation, All rights reserved.
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -29,28 +28,49 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
-// Auto-generated from xe_fmha_fwd_decode_kernel.cpp.in
-// Template parameters: QG_SZ=@QG_SZ@, HEAD_DIM=@HEAD_DIM@, PAGE_SIZE=@PAGE_SIZE@
-#define SYCL_INTEL_TARGET 20
+/*!
+  \file
+  \brief Forward declarations for generated MLA decode kernel launch functions
+*/
 
-#include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
+#pragma once
 
-namespace decode {
+#include <ATen/ATen.h>
 
-template <>
-void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Arguments& params) const {
-  using TileShapeQK = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@PAGE_SIZE@>, cute::_64>;
-  using TileShapePV = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@PAGE_SIZE@>>;
-  using TileShapeOutput = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@HEAD_DIM@>>;
-  using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<@PAGE_SIZE@ / 16>, cute::_1>>;
+#include <sycl/sycl.hpp>
 
-    AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
-      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-        DecodeConfig<false, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(params);
-      });
-  });
-}
+namespace mla_decode {
 
-template struct FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>;
+// Each function is defined in a separate generated .cpp file from
+// mla_decode_kernel.cpp.in, compiled as its own library.
+//
+// Naming: launch_mla_decode_<ELEM_TAG>_<PAGE_SIZE>
+// Parameters:
+//   ELEM_TAG  in {half, bf16}
+//   PAGE_SIZE in {16, 32, 64, 128}
 
-}  // namespace decode
+#define DECLARE_MLA_DECODE_LAUNCH(ELEM, PS)  \
+  void launch_mla_decode_##ELEM##_##PS(      \
+      at::Tensor& out,                       \
+      const at::Tensor& q_nope,              \
+      const at::Tensor& q_pe,                \
+      const at::Tensor& kv_c_and_k_pe_cache, \
+      const at::Tensor& seq_lens,            \
+      const at::Tensor& page_table,          \
+      at::Tensor& workspace,                 \
+      double sm_scale,                       \
+      int64_t num_kv_splits);
+
+#define DECLARE_MLA_DECODE_ALL_PAGE_SIZES(ELEM) \
+  DECLARE_MLA_DECODE_LAUNCH(ELEM, 16)           \
+  DECLARE_MLA_DECODE_LAUNCH(ELEM, 32)           \
+  DECLARE_MLA_DECODE_LAUNCH(ELEM, 64)           \
+  DECLARE_MLA_DECODE_LAUNCH(ELEM, 128)
+
+DECLARE_MLA_DECODE_ALL_PAGE_SIZES(half)
+DECLARE_MLA_DECODE_ALL_PAGE_SIZES(bf16)
+
+#undef DECLARE_MLA_DECODE_LAUNCH
+#undef DECLARE_MLA_DECODE_ALL_PAGE_SIZES
+
+}  // namespace mla_decode

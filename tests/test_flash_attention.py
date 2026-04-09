@@ -498,7 +498,7 @@ def generate_qkv(
 @pytest.mark.parametrize("has_leftpad", [False])
 @pytest.mark.parametrize("has_batch_idx", [False])
 @pytest.mark.parametrize("varlen_q", [True])
-@pytest.mark.parametrize("d", [512])
+@pytest.mark.parametrize("d", [64, 128, 256, 512])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -985,7 +985,7 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("causal", [False])
-@pytest.mark.parametrize("local", [False])
+@pytest.mark.parametrize("local", [True, False])
 @pytest.mark.parametrize("use_sinks", [False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 @pytest.mark.parametrize("has_rotary_seqlens", [False])
@@ -1006,21 +1006,18 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize("varlen_q", [True])
 @pytest.mark.parametrize("d", [64, 128, 256, 512])
 @pytest.mark.parametrize("seqlen_q", [1])
+@pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize(
     "seqlen_k",
     [
         128,
-        256,
-        339,
         1024,
-        800,
-        256,
-        799,
-        2048,
-        20000,
+        4096,
+        8192,
     ],
 )
 def test_flash_attn_decode_kvcache(
+    batch_size,
     seqlen_q,
     seqlen_k,
     d,
@@ -1051,10 +1048,9 @@ def test_flash_attn_decode_kvcache(
         pytest.skip()
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 16
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
     nheads = 16
-    nheads_k = 4  # nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
+    nheads_k = 16  # nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
 
     if seqlen_k <= seqlen_q:
@@ -1191,7 +1187,7 @@ def test_flash_attn_decode_kvcache(
         cache_seqlens = torch.randint(
             seqlen_q,
             # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
-            seqlen_k,
+            seqlen_k + 1,
             (batch_size,),
             dtype=torch.int32,
             device=device,
@@ -1471,6 +1467,7 @@ def test_flash_attn_decode_kvcache(
                 assert (out - out_ref).abs().mean().item() <= mult_mean * (
                     out_pt - out_ref
                 ).abs().mean().item()
+    torch.xpu.empty_cache()
 
 
 def _generate_block_kvcache(

@@ -291,67 +291,55 @@ void fused_qk_norm_rope(
   auto queue = dpcppGetCurrentQueue();
   bool interleave = !is_neox;
 
-#define LAUNCH_KERNEL(head_dim, interleave)                                         \
-  do {                                                                              \
-    auto dtype = qkv.scalar_type();                                                 \
-    if (dtype == at::ScalarType::Half) {                                            \
-      launchFusedQKNormRopeImpl<head_dim, interleave, sycl::half>(                  \
-          qkv.data_ptr(),                                                           \
-          static_cast<int>(num_tokens),                                             \
-          static_cast<int>(num_heads_q),                                            \
-          static_cast<int>(num_heads_k),                                            \
-          static_cast<int>(num_heads_v),                                            \
-          static_cast<float>(eps),                                                  \
-          q_weight.data_ptr(),                                                      \
-          k_weight.data_ptr(),                                                      \
-          static_cast<float>(base),                                                 \
-          position_ids.data_ptr<int>(),                                             \
-          static_cast<float>(factor),                                               \
-          static_cast<float>(low),                                                  \
-          static_cast<float>(high),                                                 \
-          static_cast<float>(attention_factor),                                     \
-          static_cast<int>(rotary_dim),                                             \
-          queue);                                                                   \
-    } else if (dtype == at::ScalarType::BFloat16) {                                 \
-      launchFusedQKNormRopeImpl<head_dim, interleave, sycl::ext::oneapi::bfloat16>( \
-          qkv.data_ptr(),                                                           \
-          static_cast<int>(num_tokens),                                             \
-          static_cast<int>(num_heads_q),                                            \
-          static_cast<int>(num_heads_k),                                            \
-          static_cast<int>(num_heads_v),                                            \
-          static_cast<float>(eps),                                                  \
-          q_weight.data_ptr(),                                                      \
-          k_weight.data_ptr(),                                                      \
-          static_cast<float>(base),                                                 \
-          position_ids.data_ptr<int>(),                                             \
-          static_cast<float>(factor),                                               \
-          static_cast<float>(low),                                                  \
-          static_cast<float>(high),                                                 \
-          static_cast<float>(attention_factor),                                     \
-          static_cast<int>(rotary_dim),                                             \
-          queue);                                                                   \
-    } else if (dtype == at::ScalarType::Float8_e4m3fn) {                            \
-      launchFusedQKNormRopeImpl<head_dim, interleave, float_e4m3_t>(                \
-          qkv.data_ptr(),                                                           \
-          static_cast<int>(num_tokens),                                             \
-          static_cast<int>(num_heads_q),                                            \
-          static_cast<int>(num_heads_k),                                            \
-          static_cast<int>(num_heads_v),                                            \
-          static_cast<float>(eps),                                                  \
-          q_weight.data_ptr(),                                                      \
-          k_weight.data_ptr(),                                                      \
-          static_cast<float>(base),                                                 \
-          position_ids.data_ptr<int>(),                                             \
-          static_cast<float>(factor),                                               \
-          static_cast<float>(low),                                                  \
-          static_cast<float>(high),                                                 \
-          static_cast<float>(attention_factor),                                     \
-          static_cast<int>(rotary_dim),                                             \
-          queue);                                                                   \
-    } else {                                                                        \
-      TORCH_CHECK(false, "Unsupported dtype for fused_qk_norm_rope: ", dtype);      \
+// Maps at::ScalarType to the corresponding SYCL/cutlass C++ type (scalar_t)
+// and immediately invokes the callable passed as the variadic argument.
+// Float8_e4m3fn uses the cutlass type because native SYCL float8 is not yet
+// supported; Half and BFloat16 use their respective SYCL types.
+#define SYCL_DISPATCH_FLOATING_TYPES(SCALAR_TYPE, KERNEL_NAME, ...)                 \
+  [&]() {                                                                           \
+    switch (SCALAR_TYPE) {                                                          \
+      case at::ScalarType::Half: {                                                  \
+        using scalar_t = sycl::half;                                                \
+        __VA_ARGS__();                                                              \
+        break;                                                                      \
+      }                                                                             \
+      case at::ScalarType::BFloat16: {                                              \
+        using scalar_t = sycl::ext::oneapi::bfloat16;                               \
+        __VA_ARGS__();                                                              \
+        break;                                                                      \
+      }                                                                             \
+      case at::ScalarType::Float8_e4m3fn: {                                         \
+        using scalar_t = float_e4m3_t;                                              \
+        __VA_ARGS__();                                                              \
+        break;                                                                      \
+      }                                                                             \
+      default:                                                                      \
+        TORCH_CHECK(false, "Unsupported dtype for " KERNEL_NAME ": ", SCALAR_TYPE); \
     }                                                                               \
-  } while (0)
+  }()
+
+// The lambda is wrapped in an extra () so that commas in the template argument
+// list <HD, IL, scalar_t> are hidden from the preprocessor's argument splitter.
+#define LAUNCH_KERNEL(HD, IL)                                                    \
+  SYCL_DISPATCH_FLOATING_TYPES(qkv.scalar_type(), "fused_qk_norm_rope", ([&]() { \
+                                 launchFusedQKNormRopeImpl<HD, IL, scalar_t>(    \
+                                     qkv.data_ptr(),                             \
+                                     static_cast<int>(num_tokens),               \
+                                     static_cast<int>(num_heads_q),              \
+                                     static_cast<int>(num_heads_k),              \
+                                     static_cast<int>(num_heads_v),              \
+                                     static_cast<float>(eps),                    \
+                                     q_weight.data_ptr(),                        \
+                                     k_weight.data_ptr(),                        \
+                                     static_cast<float>(base),                   \
+                                     position_ids.data_ptr<int>(),               \
+                                     static_cast<float>(factor),                 \
+                                     static_cast<float>(low),                    \
+                                     static_cast<float>(high),                   \
+                                     static_cast<float>(attention_factor),       \
+                                     static_cast<int>(rotary_dim),               \
+                                     queue);                                     \
+                               }))
 
   switch (head_dim) {
     case 64:
@@ -380,6 +368,7 @@ void fused_qk_norm_rope(
   }
 
 #undef LAUNCH_KERNEL
+#undef SYCL_DISPATCH_FLOATING_TYPES
 }
 
 }  // namespace at::native::xpu

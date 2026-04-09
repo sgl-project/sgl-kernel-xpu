@@ -386,7 +386,9 @@ def test_fused_qk_rope_fp8_basic(
     total_heads = num_heads_q + num_heads_k + num_heads_v
 
     # Generate bounded float16 inputs, then cast to FP8
-    qkv_fp32 = (torch.rand(num_tokens, total_heads * head_dim) * 2.0 - 1.0) * input_bound
+    qkv_fp32 = (
+        torch.rand(num_tokens, total_heads * head_dim) * 2.0 - 1.0
+    ) * input_bound
     q_weight_fp32 = (torch.rand(head_dim) * 2.0 - 1.0) * weight_bound
     k_weight_fp32 = (torch.rand(head_dim) * 2.0 - 1.0) * weight_bound
 

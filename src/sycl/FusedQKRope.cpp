@@ -5,12 +5,12 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <sycl/sycl.hpp>
 #include <vector>
-#include <cassert>
 
 #include "MemoryAccess.h"
 #include "Norm.h"
@@ -277,8 +277,7 @@ void fused_qk_rope(
   } else {
     int64_t half_rotary_lanes = rotary_dim / (head_dim / 32) / 2;
     TORCH_CHECK(
-        half_rotary_lanes >= 1 && half_rotary_lanes < 32 &&
-            (half_rotary_lanes & (half_rotary_lanes - 1)) == 0,
+        half_rotary_lanes >= 1 && half_rotary_lanes < 32 && (half_rotary_lanes & (half_rotary_lanes - 1)) == 0,
         "half_rotary_lanes must be a power of 2 and less than 32 for neox style, got ",
         half_rotary_lanes);
   }

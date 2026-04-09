@@ -33,6 +33,7 @@
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 #include <c10/xpu/XPUStream.h>
+#include <c10/xpu/XPUCachingAllocator.h>
 #include <torch/all.h>
 
 #include "kernels/chunk_prefill/chunk_prefill_runner.hpp"
@@ -232,7 +233,7 @@ std::vector<at::Tensor> mha_fwd(
   Arguments params;
   params.use_split_kv = true;
   if (params.use_split_kv) {
-    auto get_num_splits = [](int batch_size, int num_heads_kv, int max_seqlen_k, int block_size) {
+    auto get_num_splits = [&](int batch_size, int num_heads_kv, int max_seqlen_k, int block_size) {
       auto stream = at::xpu::getCurrentXPUStream();
       auto queue = stream.queue();
       auto device = queue.get_device();
@@ -248,19 +249,41 @@ std::vector<at::Tensor> mha_fwd(
 
       int max_splits = (max_seqlen_k + block_size - 1) / block_size;
       max_splits = std::min(max_splits, parallel_);
-      return std::min(num_splits, max_splits);
+      int target_splits = std::min(num_splits, max_splits);
+
+      // Get device memory stats to avoid OOM
+      size_t global_mem = device.get_info<sycl::info::device::global_mem_size>();
+      size_t allocated_mem = c10::xpu::XPUCachingAllocator::getDeviceStats(q.device().index()).allocated_bytes[0].current;
+      
+      // Safety margin (e.g. 500MB) for fragmentation and other overhead
+      constexpr size_t SAFE_MARGIN = 500 * 1024 * 1024;
+      size_t free_mem = (global_mem > allocated_mem + SAFE_MARGIN) ? (global_mem - allocated_mem - SAFE_MARGIN) : 0;
+      std::cout << "global_mem: " << global_mem / (1024.0 * 1024.0 * 1024.0) << " GB, allocated_mem: " 
+                << allocated_mem / (1024.0 * 1024.0 * 1024.0) << " GB, free_mem (with margin): " 
+                << free_mem / (1024.0 * 1024.0 * 1024.0) << " GB" << std::endl;
+      // Bytes needed for one split slice: 
+      // temp_out slice + max_logits slice + exp_sums slice
+      size_t mem_per_split = (total_q * num_heads * head_size_v * q.element_size()) 
+                           + 2 * (total_q * num_heads * sizeof(float));
+
+      // Dial down target_splits if the total needed extra memory exceeds available free memory
+      while (target_splits > 1 && (mem_per_split * target_splits) > free_mem) {
+          target_splits /= 2;
+      }
+
+      return target_splits;
     };
     num_kv_splits = get_num_splits(batch_size, num_heads_k, seqlen_k, page_size);
+    std::cout << "num_kv_splits" << num_kv_splits << std::endl;
     temp_out = num_kv_splits == 1
                    ? out
                    : torch::empty({total_q, num_kv_splits * num_heads, head_size_v}, q.options().device(q.device()));
 
-    max_logits = torch::full(
-        {total_q, num_heads, num_kv_splits},
-        -std::numeric_limits<float>::infinity(),
-        q.options().dtype(at::kFloat).device(q.device()));
-
-    exp_sums = torch::zeros({total_q, num_heads, num_kv_splits}, q.options().dtype(at::kFloat).device(q.device()));
+            max_logits = torch::full(
+            {total_q, num_heads, num_kv_splits},
+            -std::numeric_limits<float>::infinity(),
+            q.options().dtype(at::kFloat).device(q.device()));
+        exp_sums = torch::zeros({total_q, num_heads, num_kv_splits}, q.options().dtype(at::kFloat).device(q.device()));
 
     params.temp_out_ptr = temp_out.data_ptr();
     params.exp_sums_ptr = exp_sums.data_ptr();

@@ -254,7 +254,6 @@ def flash_attn_with_kvcache(
     if cache_seqlens is not None:
         assert cache_seqlens.size(0) + 1 == cu_seqlens_q.size(0)
         cu_seqlens_k = cache_seqlens
-        max_seqlen_k = int(cache_seqlens.max().item())
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
         q,
         k_cache,
@@ -263,7 +262,7 @@ def flash_attn_with_kvcache(
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_q,
-        max_seqlen_k,
+        1,
         page_table,
         cache_batch_idx,
         cache_leftpad,

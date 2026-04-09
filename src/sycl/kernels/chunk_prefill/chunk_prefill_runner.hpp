@@ -18,36 +18,36 @@
 using namespace cute;
 namespace chunkprefill {
 struct Flash_fwd_params {
-  using index_t = int64_t;
-
   // The QKV matrices.
   void* __restrict__ q_ptr;
   void* __restrict__ k_ptr;
   void* __restrict__ v_ptr;
 
   // The stride between rows of the Q, K and V matrices.
-  index_t q_batch_stride;
-  index_t k_batch_stride;
-  index_t v_batch_stride;
-  index_t q_row_stride;
-  index_t k_row_stride;
-  index_t v_row_stride;
-  index_t q_head_stride;
-  index_t k_head_stride;
-  index_t v_head_stride;
-  index_t v_dim_stride;
+  int64_t q_batch_stride;
+  int64_t k_batch_stride;
+  int64_t v_batch_stride;
+  int64_t q_row_stride;
+  int64_t k_row_stride;
+  int64_t v_row_stride;
+  int64_t q_head_stride;
+  int64_t k_head_stride;
+  int64_t v_head_stride;
+  int64_t v_dim_stride;
 
   // The number of heads.
   int h, h_k;
+  bool use_sink = false;
+  bool use_causal_mask = false;
 
   // The O matrix (output).
   void* __restrict__ o_ptr;
   void* __restrict__ oaccum_ptr;
 
   // The stride between rows of O.
-  index_t o_batch_stride;
-  index_t o_row_stride;
-  index_t o_head_stride;
+  int64_t o_batch_stride;
+  int64_t o_row_stride;
+  int64_t o_head_stride;
 
   // The pointer to the softmax sum.
   void* __restrict__ softmax_lse_ptr;
@@ -76,32 +76,32 @@ struct Flash_fwd_params {
   int* __restrict__ seqused_k;
 
   // The stride between rows of Oaccum.
-  index_t oaccum_split_stride;
-  index_t oaccum_batch_stride;
-  index_t oaccum_row_stride;
-  index_t oaccum_head_stride;
+  int64_t oaccum_split_stride;
+  int64_t oaccum_batch_stride;
+  int64_t oaccum_row_stride;
+  int64_t oaccum_head_stride;
 
   // The stride between rows of LSEaccum.
-  index_t lseaccum_split_stride;
-  index_t lseaccum_batch_stride;
-  index_t lseaccum_head_stride;
+  int64_t lseaccum_split_stride;
+  int64_t lseaccum_batch_stride;
+  int64_t lseaccum_head_stride;
 
   // The K_new and V_new matrices.
   void* __restrict__ knew_ptr;
   void* __restrict__ vnew_ptr;
 
   // The stride between rows of the Q, K and V matrices.
-  index_t knew_batch_stride;
-  index_t vnew_batch_stride;
-  index_t knew_row_stride;
-  index_t vnew_row_stride;
-  index_t knew_head_stride;
-  index_t vnew_head_stride;
+  int64_t knew_batch_stride;
+  int64_t vnew_batch_stride;
+  int64_t knew_row_stride;
+  int64_t vnew_row_stride;
+  int64_t knew_head_stride;
+  int64_t vnew_head_stride;
 
   void* __restrict__ qv_ptr;
-  index_t qv_batch_stride;
-  index_t qv_row_stride;
-  index_t qv_head_stride;
+  int64_t qv_batch_stride;
+  int64_t qv_row_stride;
+  int64_t qv_head_stride;
 
   // The cos and sin matrices for rotary embedding.
   void* __restrict__ rotary_cos_ptr;
@@ -114,7 +114,7 @@ struct Flash_fwd_params {
   // Paged KV cache
   int* __restrict__ page_table;
   int max_num_pages_per_seq;
-  index_t page_table_batch_stride;
+  int64_t page_table_batch_stride;
   int page_size;
   int num_pages;
   bool pagedkv_tma;
@@ -142,7 +142,7 @@ struct Flash_fwd_params {
 
   bool is_rotary_interleaved;
 
-  int num_splits;  // For split-KV version
+  int num_kv_splits;  // For split-KV version
   bool pack_gqa;
 
   int* __restrict__ tile_count_semaphore;
@@ -303,7 +303,7 @@ struct ChunkPrefillRunner {
     }
 
     // Initialize the workspace
-    (FMHAChunkPrefillKernel::initialize_workspace(arguments, workspace.data_ptr()));
+    FMHAChunkPrefillKernel::initialize_workspace(arguments, workspace.data_ptr());
 
     // Convert host-side arguments to device-side arguments to be passed to the kernel
     auto params_kernel = FMHAChunkPrefillKernel::to_underlying_arguments(arguments, workspace.data_ptr());
@@ -401,12 +401,10 @@ struct ChunkPrefillConfig {
 
   static int run(const Flash_fwd_params& params) {
     // only support varlen now
-    if (params.page_table != nullptr && params.cu_seqlens_k != nullptr) {
+    if (params.page_table != nullptr) {
       return run<true, true, cutlass::flash_attention::IndividualScheduler>(params);
-    } else if (params.cu_seqlens_k != nullptr) {
-      return run<true, false, cutlass::flash_attention::IndividualScheduler>(params);
     } else {
-      return 0;
+      return run<true, false, cutlass::flash_attention::IndividualScheduler>(params);
     }
   }
 };
@@ -431,7 +429,7 @@ inline int round_up_headdim(int head_size) {
 }
 
 std::vector<at::Tensor> mha_fwd(
-    at::Tensor& q,        // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
+    const at::Tensor& q,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
                           // h_k, d) if there is page_table.
     const at::Tensor& v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages,
@@ -458,7 +456,7 @@ std::vector<at::Tensor> mha_fwd(
     float const softcap,
     bool const is_rotary_interleaved,  // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
     std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
-    int num_splits,
+    int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin) {
   // TODO: check GPU support
@@ -473,13 +471,9 @@ std::vector<at::Tensor> mha_fwd(
   TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
   TORCH_CHECK(v.scalar_type() == q_type, "query and value must have the same dtype");
 
-  CHECK_INPUT(q);
-  CHECK_INPUT(k);
-  CHECK_INPUT(v);
-
-  TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
-  TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
-  TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v);
 
   if (page_table.has_value()) {
     CHECK_INPUT(page_table.value());
@@ -521,7 +515,7 @@ std::vector<at::Tensor> mha_fwd(
   }
 
   // Currently only support head dims <= 256
-  static constexpr int max_headdim = 256;
+  static constexpr int max_headdim = 512;
   TORCH_CHECK(
       head_size <= max_headdim,
       "FlashAttention forward only supports head dimension at most " + std::to_string(max_headdim));
@@ -607,8 +601,8 @@ std::vector<at::Tensor> mha_fwd(
 
   // Set the different scale values.
   params.scale_softmax = softmax_scale;
-  bool use_sink = sinks_.has_value();
-  params.sink_softmax = use_sink ? sinks_.value().data_ptr() : nullptr;
+  params.use_sink = sinks_.has_value();
+  params.sink_softmax = params.use_sink ? sinks_.value().data_ptr() : nullptr;
 
   params.softcap = softcap;
 
@@ -705,7 +699,7 @@ std::vector<at::Tensor> mha_fwd(
   constexpr int PipelineStages = 2;
   switch (params.d) {
     case 64:
-      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
         if (params.is_causal) {
           ChunkPrefillConfig<
               cute::Shape<_128, _64, _64>,
@@ -733,7 +727,7 @@ std::vector<at::Tensor> mha_fwd(
       })
       break;
     case 96:
-      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
         if (params.is_causal) {
           ChunkPrefillConfig<
               cute::Shape<_128, _64, _32>,
@@ -762,7 +756,7 @@ std::vector<at::Tensor> mha_fwd(
       })
       break;
     case 128:
-      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
         if (params.is_causal) {
           ChunkPrefillConfig<
               cute::Shape<_128, _64, _64>,
@@ -790,7 +784,7 @@ std::vector<at::Tensor> mha_fwd(
       })
       break;
     case 192:
-      AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
         if (params.is_causal) {
           ChunkPrefillConfig<
               cute::Shape<_256, _64, _64>,
@@ -817,8 +811,64 @@ std::vector<at::Tensor> mha_fwd(
         }
       })
       break;
+    case 256:
+      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
+        if (params.is_causal) {
+          ChunkPrefillConfig<
+              cute::Shape<_256, _64, _64>,
+              cute::Shape<_256, _32, _64>,
+              cute::Shape<_256, _256, _64>,
+              cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true,
+              false,
+              Sink>::run(params);
+        } else {
+          AT_DISPATCH_BOOL_NO_RETURN(
+              params.is_local,
+              LocalMask,
+              ChunkPrefillConfig<
+                  cute::Shape<_256, _64, _64>,
+                  cute::Shape<_256, _32, _64>,
+                  cute::Shape<_256, _256, _64>,
+                  cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+                  PipelineStages,
+                  false,
+                  LocalMask,
+                  Sink>::run(params))
+        }
+      })
+      break;
+    case 512:
+      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
+        if (params.is_causal) {
+          ChunkPrefillConfig<
+              cute::Shape<cute::Int<256>, _64, _64>,
+              cute::Shape<cute::Int<256>, _32, _64>,
+              cute::Shape<cute::Int<256>, cute::Int<512>, _64>,
+              cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true,
+              false,
+              Sink>::run(params);
+        } else {
+          AT_DISPATCH_BOOL_NO_RETURN(
+              params.is_local,
+              LocalMask,
+              ChunkPrefillConfig<
+                  cute::Shape<cute::Int<256>, _64, _64>,
+                  cute::Shape<cute::Int<256>, _32, _64>,
+                  cute::Shape<cute::Int<256>, cute::Int<512>, _64>,
+                  cute::Layout<cute::Shape<_32, _1, _1>, cute::Stride<_1, _1, _1>>,
+                  PipelineStages,
+                  false,
+                  LocalMask,
+                  Sink>::run(params))
+        }
+      })
+      break;
     default:
-      TORCH_CHECK(false, "Unsupported head size for causal attention");
+      TORCH_CHECK(false, "Unsupported head size ", params.d, " for chunk-prefill MHA");
   }
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }

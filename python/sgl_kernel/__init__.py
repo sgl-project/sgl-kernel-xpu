@@ -13,8 +13,8 @@ if os.path.exists(cuda_path):
 from sgl_kernel import common_ops
 from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
-    cutlass_mla_decode,
-    cutlass_mla_get_workspace_size,
+    flash_mla_decode,
+    flash_mla_get_workspace_size,
     lightning_attention_decode,
     merge_state,
     merge_state_v2,
@@ -44,10 +44,10 @@ from sgl_kernel.gemm import (
     scaled_fp4_quant,
     sgl_per_tensor_quant_fp8,
     sgl_per_token_group_quant_8bit,
+    sgl_per_token_group_quant_fp4,
     sgl_per_token_group_quant_fp8,
     sgl_per_token_group_quant_int8,
     sgl_per_token_quant_fp8,
-    shuffle_rows,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.moe import (
@@ -60,7 +60,8 @@ from sgl_kernel.moe import (
     moe_sum,
     moe_sum_reduce,
     prepare_moe_input,
-    swiglu_with_alpha_and_limit,
+    scatter_tokens_to_experts,
+    swiglu_gpt_oss_sigmoid_alpha,
     topk_softmax,
 )
 from sgl_kernel.sampling import (

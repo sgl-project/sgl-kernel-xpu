@@ -99,7 +99,20 @@ def sgl_per_token_group_quant_8bit(
         from sglang.srt.utils import get_bool_env_var
 
         enable_v2 = get_bool_env_var("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
-        assert not enable_v2, "v2 not yet supported on xpu!"
+
+    if enable_v2:
+        return torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit_v2.default(
+            input,
+            output_q,
+            output_s,
+            group_size,
+            eps,
+            fp8_min,
+            fp8_max,
+            scale_ue8m0,
+            fuse_silu_and_mul,
+            masked_m,
+        )
 
     assert not fuse_silu_and_mul, "only v2 support fuse_silu_and_mul"
     assert masked_m is None, "only v2 support masked_m"
@@ -122,6 +135,67 @@ def sgl_per_tensor_quant_fp8(
     torch.ops.sgl_kernel.sgl_per_tensor_quant_fp8.default(
         input, output_q, output_s, is_static
     )
+
+
+def sgl_per_token_group_quant_fp4(
+    x: torch.Tensor,
+    group_size: int = 32,
+    eps: float = 1e-10,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize input tensor to MXFP4 (E2M1) format with per-token group scaling.
+
+    MXFP4 follows the OpenCompute MX (Microscaling) format specification:
+    - Data type: E2M1 (4-bit float with 2-bit exponent, 1-bit mantissa)
+    - Block size: 32 elements per scale factor (default)
+    - Scale format: UE8M0 (unsigned 8-bit exponent-only, no mantissa)
+
+    Args:
+        x: Input tensor with shape (..., K) where K is divisible by group_size.
+           Must be contiguous and dtype float16, bfloat16, or float32.
+        group_size: Number of elements per quantization group. Must be 32 for MXFP4.
+        eps: Small epsilon to avoid division by zero. Default is 1e-10.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            - output_q: Packed FP4 tensor with shape (..., K // 2) and dtype uint8.
+                        Two E2M1 values are packed into each byte.
+            - output_s: Scale tensor with shape (..., K // group_size) and dtype uint8.
+                        Scales are stored in UE8M0 format (exponent + 127 bias).
+    """
+    assert (
+        x.shape[-1] % group_size == 0
+    ), f"the last dimension of `x` ({x.shape[-1]}) must be divisible by `group_size` ({group_size})"
+    assert x.is_contiguous(), "`x` is not contiguous"
+    assert group_size == 32, f"group_size must be 32 for MXFP4, got {group_size}"
+
+    # Ensure input is 2D for the kernel
+    original_shape = x.shape
+    if x.dim() == 1:
+        x = x.unsqueeze(0)
+    elif x.dim() > 2:
+        x = x.view(-1, x.shape[-1])
+
+    m, k = x.shape
+    num_groups_per_row = k // group_size
+
+    # Output is packed FP4 (2 values per byte)
+    output_q = torch.empty((m, k // 2), device=x.device, dtype=torch.uint8)
+
+    # Scales in row-major layout: (m, num_groups_per_row)
+    # Each row has the scales for that token's groups
+    output_s = torch.empty((m, num_groups_per_row), device=x.device, dtype=torch.uint8)
+
+    if x.shape[0] > 0:
+        torch.ops.sgl_kernel.sgl_per_token_group_quant_fp4.default(
+            x, output_q, output_s, group_size, eps
+        )
+
+    # Reshape output to match input shape
+    output_shape_q = original_shape[:-1] + (original_shape[-1] // 2,)
+    output_shape_s = original_shape[:-1] + (original_shape[-1] // group_size,)
+
+    return output_q.view(output_shape_q), output_s.view(output_shape_s)
 
 
 def sgl_per_token_quant_fp8(
@@ -246,16 +320,6 @@ def qserve_w4a8_per_group_gemm(
     return out_feats
 
 
-def shuffle_rows(input_tensor, dst2src_map, output_tensor_shape):
-    output_tensor = torch.empty(
-        output_tensor_shape,
-        device=input_tensor.device,
-        dtype=input_tensor.dtype,
-    )
-    torch.ops.sgl_kernel.shuffle_rows.default(input_tensor, dst2src_map, output_tensor)
-    return output_tensor
-
-
 def scaled_fp4_experts_quant(
     input_tensor: torch.Tensor,
     input_global_scale: torch.Tensor,
@@ -283,7 +347,7 @@ def scaled_fp4_experts_quant(
     if expert_map is not None:
         (m, k) = input_tensor.shape
         output_tensor_shape = (m * topk, k)
-        input_tensor = shuffle_rows(input_tensor, expert_map, output_tensor_shape)
+        input_tensor = input_tensor[expert_map]
     m_numtopk, k = input_tensor.shape
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE Expert Quantization. This is used to prevent the kernel

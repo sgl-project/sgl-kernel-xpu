@@ -104,16 +104,7 @@ void merge_state(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
-void cutlass_mla_decode(
-    torch::Tensor const& out,
-    torch::Tensor const& q_nope_and_q_pe,
-    torch::Tensor const& kv_c_and_k_pe_cache,
-    torch::Tensor const& seq_lens,
-    torch::Tensor const& page_table,
-    torch::Tensor const& workspace,
-    int64_t num_kv_splits = -1);
-int64_t cutlass_mla_get_workspace_size(
-    int64_t max_seq_len, int64_t num_batches, int64_t sm_count = 0, int64_t num_kv_splits = -1);
+
 /*
  * From csrc/elementwise
  */
@@ -140,6 +131,17 @@ void sgl_per_token_group_quant_8bit(
     double fp8_min,
     double fp8_max,
     bool scale_ue8m0);
+void sgl_per_token_group_quant_8bit_v2(
+    at::Tensor input,
+    at::Tensor output_q,
+    at::Tensor output_s,
+    int64_t group_size,
+    double eps,
+    double min_8bit,
+    double max_8bit,
+    bool scale_ue8m0,
+    bool fuse_silu_and_mul,
+    const std::optional<torch::Tensor>& masked_m);
 void fused_qk_norm_rope(
     torch::Tensor& qkv,
     int64_t num_heads_q,
@@ -157,22 +159,8 @@ void fused_qk_norm_rope(
     double high,
     double attention_factor,
     int64_t rotary_dim);
-void fused_qk_rope(
-    torch::Tensor& qkv,
-    int64_t num_heads_q,
-    int64_t num_heads_k,
-    int64_t num_heads_v,
-    int64_t head_dim,
-    torch::Tensor& q_weight,
-    torch::Tensor& k_weight,
-    double base,
-    bool is_neox,
-    torch::Tensor& position_ids,
-    double factor,
-    double low,
-    double high,
-    double attention_factor,
-    int64_t rotary_dim);
+void sgl_per_token_group_quant_fp4(
+    at::Tensor input, at::Tensor output_q, at::Tensor output_s, int64_t group_size, double eps);
 }  // namespace at::native::xpu
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
@@ -254,7 +242,7 @@ void topk_softmax(
     torch::Tensor& topk_indices,
     torch::Tensor& token_expert_indices,
     torch::Tensor& gating_output);
-torch::Tensor swiglu_with_alpha_and_limit(torch::Tensor x, double alpha, double limit);
+torch::Tensor swiglu_gpt_oss_sigmoid_alpha(torch::Tensor x, double alpha, double limit);
 
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
@@ -293,8 +281,10 @@ void moe_grouped_mm_nt_xe20(
     const std::optional<at::Tensor>& bias,
     const torch::Tensor& total_rows_for_experts,
     const int64_t n_experts,
-    const int64_t activation_type = 0,  // 0=silu, 1=gelu
-    bool fuse_act = false);
+    const int64_t activation_type = 0,  // 0=silu, 1=gelu, 2=swiglu
+    bool fuse_act = false,
+    double gemm1_alpha = 1.702,
+    double gemm1_limit = 7.0);
 
 void prepare_moe_input(
     const torch::Tensor& topk_ids,
@@ -337,7 +327,8 @@ void ep_moe_post_reorder(
     int64_t end_expert_id,
     int64_t topk);
 
-void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor);
+void scatter_tokens_to_experts(
+    const torch::Tensor& input_tensor, const torch::Tensor& src2dst_map, torch::Tensor& output_tensor);
 
 void apply_shuffle_mul_sum(
     const torch::Tensor& input,

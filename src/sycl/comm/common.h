@@ -31,8 +31,10 @@ namespace {
 template <typename Kernel>
 class KernelCur {};
 
-template <typename Kernel>
+template <typename Kernel, int GrfSize = 256>
 static void launch(typename Kernel::Params params) {
+  static_assert(GrfSize == 128 || GrfSize == 256, "GRF size must be 128 or 256");
+
   compat::dim3 const block = Kernel::get_block_shape();
   compat::dim3 const grid = Kernel::get_grid_shape(params);
 
@@ -50,7 +52,7 @@ static void launch(typename Kernel::Params params) {
   namespace syclex = sycl::ext::oneapi::experimental;
   namespace intelex = sycl::ext::intel::experimental;
   compat::experimental::kernel_properties kernel_props{
-      syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<256>};
+      syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<GrfSize>};
 
   compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
 

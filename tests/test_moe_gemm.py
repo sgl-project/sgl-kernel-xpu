@@ -30,6 +30,34 @@ def create_random_xpu_tensor(shape, dtype, mean=0, std=0.01):
     return torch.empty(shape, dtype=dtype, device="xpu").normal_(mean, std)
 
 
+# GPT-OSS SwiGLU parameters (matches kernel defaults)
+SWIGLU_ALPHA = 1.702
+SWIGLU_LIMIT = 7.0
+
+
+def swiglu_gpt_oss_sigmoid_alpha(
+    x: torch.Tensor,
+    alpha: float = SWIGLU_ALPHA,
+    limit: float = SWIGLU_LIMIT,
+) -> torch.Tensor:
+    """Matches the kernel's swiglu_gpt_oss_sigmoid_alpha formula:
+        gate = clamp(gate, -inf, limit)
+        up   = clamp(up,   -limit, limit)
+        out  = gate * sigmoid(gate * alpha) * (up + 1)
+
+    Args:
+        x: Input tensor of shape (..., 2*N).
+           x is in [g0, u0, g1, u1, ...] layout
+           (model weight format).
+    Note: currently, only GPT-OSS uses this variant.
+    """
+    gate = x[..., 0::2].float()  # even columns
+    up = x[..., 1::2].float()  # odd columns
+    gate = gate.clamp(max=limit)
+    up = up.clamp(-limit, limit)
+    return (gate * torch.sigmoid(gate * alpha) * (up + 1.0)).to(x.dtype)
+
+
 def torch_naive_moe(
     a,
     w1,
@@ -40,6 +68,8 @@ def torch_naive_moe(
     b1,
     b2,
     activations="silu",
+    gemm1_alpha: float = None,
+    gemm1_limit: float = None,
 ):
     B, D = a.shape
     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
@@ -60,15 +90,34 @@ def torch_naive_moe(
         "silu",
         "gelu",
     ], "Only silu and gelu activations are supported."
-    act_func = (
-        F.silu if activations == "silu" else lambda x: F.gelu(x, approximate="tanh")
-    )
 
-    for i in range(w1.shape[0]):
-        mask = topk_ids == i
-        if mask.sum():
-            tmp = apply_act_and_mul(a[mask] @ w1[i].transpose(0, 1) + b1[i], act_func)
-            out[mask] = tmp @ w2[i].transpose(0, 1) + b2[i]
+    is_swiglu_gpt_oss = (
+        activations == "silu" and gemm1_alpha is not None and gemm1_limit is not None
+    )
+    if is_swiglu_gpt_oss:
+        # w1 is in interleaved layout [g0, u0, g1, u1, ...] (model weight format).
+        # The GEMM output is therefore also interleaved along the N dimension.
+        act_fn = lambda x: swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit)
+        for i in range(w1.shape[0]):
+            mask = topk_ids == i
+            if mask.sum():
+                # Matches kernel behavior: accumulator is float32, bias is float32,
+                gemm1 = (a[mask] @ w1[i].transpose(0, 1)).float() + b1[i].float()
+                tmp = act_fn(gemm1).to(a.dtype)
+                # Same for GEMM2.
+                gemm2 = (tmp @ w2[i].transpose(0, 1)).float() + b2[i].float()
+                out[mask] = gemm2.to(a.dtype)
+    else:
+        act_func = (
+            F.silu if activations == "silu" else lambda x: F.gelu(x, approximate="tanh")
+        )
+        for i in range(w1.shape[0]):
+            mask = topk_ids == i
+            if mask.sum():
+                gemm1 = (a[mask] @ w1[i].transpose(0, 1)).float() + b1[i].float()
+                tmp = apply_act_and_mul(gemm1.to(a.dtype), act_func)
+                gemm2 = (tmp @ w2[i].transpose(0, 1)).float() + b2[i].float()
+                out[mask] = gemm2.to(a.dtype)
 
     return (
         out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
@@ -76,7 +125,7 @@ def torch_naive_moe(
 
 
 @pytest.mark.parametrize(
-    "num_tokens,topk,num_experts,hidden_size,intermediate_size,with_bias,act_type",
+    "num_tokens,topk,num_experts,hidden_size,intermediate_size,bias_dtype,act",
     list(
         itertools.product(
             [1, 4, 33, 64, 222],  # num_tokens
@@ -84,14 +133,19 @@ def torch_naive_moe(
             [8, 64],  #  num_experts
             [1024, 4096],  # hidden_size
             [512, 1024, 4096],  # intermediate_size
-            [False, True],  # with_bias
-            ["silu", "gelu"],  # act_type
+            [False, "bfloat16", "float32"],  # bias_dtype
+            [
+                ("silu", None, None),
+                ("gelu", None, None),
+                ("silu", SWIGLU_ALPHA, SWIGLU_LIMIT),  # swiglu_gpt_oss
+            ],  # (act_type, gemm1_alpha, gemm1_limit)
         )
     ),
 )
 def test_moe_gemm(
-    num_tokens, topk, num_experts, hidden_size, intermediate_size, with_bias, act_type
+    num_tokens, topk, num_experts, hidden_size, intermediate_size, bias_dtype, act
 ):
+    act_type, gemm1_alpha, gemm1_limit = act
     torch.xpu.manual_seed_all(0)
 
     rtol, atol = 1e-4, 1e-3
@@ -103,13 +157,12 @@ def test_moe_gemm(
         (num_experts, hidden_size, intermediate_size), torch.bfloat16
     )
     b1, b2 = None, None
-    if with_bias:
+    if bias_dtype:
+        dtype = torch.bfloat16 if bias_dtype == "bfloat16" else torch.float32
         b1 = create_random_xpu_tensor(
-            (num_experts, 2 * intermediate_size), torch.bfloat16, std=0.005
+            (num_experts, 2 * intermediate_size), dtype, std=0.005
         )
-        b2 = create_random_xpu_tensor(
-            (num_experts, hidden_size), torch.bfloat16, std=0.005
-        )
+        b2 = create_random_xpu_tensor((num_experts, hidden_size), dtype, std=0.005)
     score = torch.randn([num_tokens, num_experts], dtype=torch.bfloat16).to("xpu")
 
     score = torch.softmax(score, dim=-1, dtype=torch.float32)
@@ -124,6 +177,8 @@ def test_moe_gemm(
         b1,
         b2,
         activations=act_type,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
     )
     sglang_output = fused_experts(
         a,
@@ -134,6 +189,8 @@ def test_moe_gemm(
         b1,
         b2,
         activation=act_type,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
     )
     torch.testing.assert_close(torch_output, sglang_output, rtol=rtol, atol=atol)
 

@@ -1,6 +1,7 @@
 #include <ATen/ATen.h>
 #include <ATen/OpMathType.h>
 #include <ATen/Parallel.h>
+#include <c10/util/Float8_e4m3fn.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
@@ -14,6 +15,10 @@
 #include "Norm.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "cutlass/float8.h"
+
+// TODO: Remove this when sycl float8 is supported
+using cutlass::float_e4m3_t;
 
 namespace at::native::xpu {
 
@@ -76,7 +81,8 @@ struct FusedQKNormRopeKernel {
   int rotary_dim;
 
   void operator()(sycl::nd_item<1> item) const {
-    using accscalar_t = at::opmath_type<scalar_t>;
+    // Always use float for accumulation, regardless of scalar_t
+    using accscalar_t = float;
 
     const int sg_size = item.get_sub_group().get_max_local_range()[0];
     const int warpsPerBlock = item.get_local_range(0) / sg_size;
@@ -115,16 +121,16 @@ struct FusedQKNormRopeKernel {
 
     // Reduce sum across sub-group (warp)
     auto sg = item.get_sub_group();
-    sumOfSquares = sycl::reduce_over_group(sg, sumOfSquares, sycl::plus<accscalar_t>());
+    sumOfSquares = sycl::reduce_over_group(sg, sumOfSquares, sycl::plus<accscalar_t>{});
 
     // Compute RMS normalization factor
-    accscalar_t rms_rcp =
-        sycl::rsqrt(sumOfSquares / static_cast<accscalar_t>(head_dim) + static_cast<accscalar_t>(eps));
+    float rms_rcp = sycl::rsqrt(sumOfSquares / static_cast<float>(head_dim) + eps);
 
     // Normalize elements
+    const scalar_t* weight_ptr = isQ ? q_weight : k_weight;
     for (int i = 0; i < numElemsPerThread; i++) {
       int dim = laneId * numElemsPerThread + i;
-      accscalar_t weight = isQ ? static_cast<accscalar_t>(q_weight[dim]) : static_cast<accscalar_t>(k_weight[dim]);
+      accscalar_t weight = static_cast<accscalar_t>(weight_ptr[dim]);
       elements[i] *= rms_rcp * weight;
     }
 
@@ -262,10 +268,18 @@ void fused_qk_norm_rope(
         half_rotary_lanes);
   }
 
-  CHECK_INPUT(qkv);
-  CHECK_INPUT(position_ids);
-  CHECK_INPUT(q_weight);
-  CHECK_INPUT(k_weight);
+  CHECK_DEVICE(qkv);
+  CHECK_CONTIGUOUS(qkv);
+  CHECK_DEVICE(position_ids);
+  CHECK_CONTIGUOUS(position_ids);
+  TORCH_CHECK(
+      position_ids.scalar_type() == at::ScalarType::Int,
+      "position_ids must have dtype int32 (at::kInt); got ",
+      position_ids.scalar_type());
+  CHECK_DEVICE(q_weight);
+  CHECK_CONTIGUOUS(q_weight);
+  CHECK_DEVICE(k_weight);
+  CHECK_CONTIGUOUS(k_weight);
 
   int64_t num_tokens = qkv.size(0);
   TORCH_CHECK(position_ids.size(0) == num_tokens, "Number of tokens in position_ids must match QKV");
@@ -277,27 +291,55 @@ void fused_qk_norm_rope(
   auto queue = dpcppGetCurrentQueue();
   bool interleave = !is_neox;
 
-#define LAUNCH_KERNEL(head_dim, interleave)                                                          \
-  AT_DISPATCH_FLOATING_TYPES_AND2(                                                                   \
-      at::ScalarType::Half, at::ScalarType::BFloat16, qkv.scalar_type(), "fused_qk_norm_rope", [&] { \
-        launchFusedQKNormRopeImpl<head_dim, interleave, scalar_t>(                                   \
-            qkv.data_ptr(),                                                                          \
-            static_cast<int>(num_tokens),                                                            \
-            static_cast<int>(num_heads_q),                                                           \
-            static_cast<int>(num_heads_k),                                                           \
-            static_cast<int>(num_heads_v),                                                           \
-            static_cast<float>(eps),                                                                 \
-            q_weight.data_ptr(),                                                                     \
-            k_weight.data_ptr(),                                                                     \
-            static_cast<float>(base),                                                                \
-            position_ids.data_ptr<int>(),                                                            \
-            static_cast<float>(factor),                                                              \
-            static_cast<float>(low),                                                                 \
-            static_cast<float>(high),                                                                \
-            static_cast<float>(attention_factor),                                                    \
-            static_cast<int>(rotary_dim),                                                            \
-            queue);                                                                                  \
-      });
+// Maps at::ScalarType to the corresponding SYCL/cutlass C++ type (scalar_t)
+// and immediately invokes the callable passed as the variadic argument.
+// Float8_e4m3fn uses the cutlass type because native SYCL float8 is not yet
+// supported; Half and BFloat16 use their respective SYCL types.
+#define SYCL_DISPATCH_FLOATING_TYPES(SCALAR_TYPE, KERNEL_NAME, ...)                 \
+  [&]() {                                                                           \
+    switch (SCALAR_TYPE) {                                                          \
+      case at::ScalarType::Half: {                                                  \
+        using scalar_t = sycl::half;                                                \
+        __VA_ARGS__();                                                              \
+        break;                                                                      \
+      }                                                                             \
+      case at::ScalarType::BFloat16: {                                              \
+        using scalar_t = sycl::ext::oneapi::bfloat16;                               \
+        __VA_ARGS__();                                                              \
+        break;                                                                      \
+      }                                                                             \
+      case at::ScalarType::Float8_e4m3fn: {                                         \
+        using scalar_t = float_e4m3_t;                                              \
+        __VA_ARGS__();                                                              \
+        break;                                                                      \
+      }                                                                             \
+      default:                                                                      \
+        TORCH_CHECK(false, "Unsupported dtype for " KERNEL_NAME ": ", SCALAR_TYPE); \
+    }                                                                               \
+  }()
+
+// The lambda is wrapped in an extra () so that commas in the template argument
+// list <HD, IL, scalar_t> are hidden from the preprocessor's argument splitter.
+#define LAUNCH_KERNEL(HD, IL)                                                    \
+  SYCL_DISPATCH_FLOATING_TYPES(qkv.scalar_type(), "fused_qk_norm_rope", ([&]() { \
+                                 launchFusedQKNormRopeImpl<HD, IL, scalar_t>(    \
+                                     qkv.data_ptr(),                             \
+                                     static_cast<int>(num_tokens),               \
+                                     static_cast<int>(num_heads_q),              \
+                                     static_cast<int>(num_heads_k),              \
+                                     static_cast<int>(num_heads_v),              \
+                                     static_cast<float>(eps),                    \
+                                     q_weight.data_ptr(),                        \
+                                     k_weight.data_ptr(),                        \
+                                     static_cast<float>(base),                   \
+                                     position_ids.data_ptr<int>(),               \
+                                     static_cast<float>(factor),                 \
+                                     static_cast<float>(low),                    \
+                                     static_cast<float>(high),                   \
+                                     static_cast<float>(attention_factor),       \
+                                     static_cast<int>(rotary_dim),               \
+                                     queue);                                     \
+                               }))
 
   switch (head_dim) {
     case 64:
@@ -326,6 +368,7 @@ void fused_qk_norm_rope(
   }
 
 #undef LAUNCH_KERNEL
+#undef SYCL_DISPATCH_FLOATING_TYPES
 }
 
 }  // namespace at::native::xpu

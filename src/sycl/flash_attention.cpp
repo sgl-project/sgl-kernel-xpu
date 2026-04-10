@@ -254,23 +254,25 @@ std::vector<at::Tensor> mha_fwd(
       // Get device memory stats to avoid OOM
       size_t global_mem = device.get_info<sycl::info::device::global_mem_size>();
       size_t allocated_mem = c10::xpu::XPUCachingAllocator::getDeviceStats(q.device().index()).allocated_bytes[0].current;
+      size_t reserved_mem = c10::xpu::XPUCachingAllocator::getDeviceStats(q.device().index()).reserved_bytes[0].current;
       
       // Safety margin (e.g. 500MB) for fragmentation and other overhead
       constexpr size_t SAFE_MARGIN = 500 * 1024 * 1024;
-      size_t free_mem = (global_mem > allocated_mem + SAFE_MARGIN) ? (global_mem - allocated_mem - SAFE_MARGIN) : 0;
-      std::cout << "global_mem: " << global_mem / (1024.0 * 1024.0 * 1024.0) << " GB, allocated_mem: " 
-                << allocated_mem / (1024.0 * 1024.0 * 1024.0) << " GB, free_mem (with margin): " 
-                << free_mem / (1024.0 * 1024.0 * 1024.0) << " GB" << std::endl;
       // Bytes needed for one split slice: 
       // temp_out slice + max_logits slice + exp_sums slice
       size_t mem_per_split = (total_q * num_heads * head_size_v * q.element_size()) 
-                           + 2 * (total_q * num_heads * sizeof(float));
-
+      + 2 * (total_q * num_heads * sizeof(float));
+      
       // Dial down target_splits if the total needed extra memory exceeds available free memory
       while (target_splits > 1 && (mem_per_split * target_splits) > free_mem) {
-          target_splits /= 2;
+        target_splits /= 2;
       }
-
+      
+      size_t free_mem = (global_mem > allocated_mem + SAFE_MARGIN) ? (global_mem - allocated_mem - SAFE_MARGIN) : 0;
+      std::cout << "global_mem: " << global_mem / (1024.0 * 1024.0 * 1024.0) << " GB, allocated_mem: " 
+                << allocated_mem / (1024.0 * 1024.0 * 1024.0) << " GB, reserved_mem: " 
+                << reserved_mem / (1024.0 * 1024.0 * 1024.0) << " GB, free_mem (with margin): " 
+                << free_mem / (1024.0 * 1024.0 * 1024.0) << " GB, required_mem: " << (target_splits * mem_per_split) / (1024.0 * 1024.0 * 1024.0) << " GB" << std::endl;
       return target_splits;
     };
     num_kv_splits = get_num_splits(batch_size, num_heads_k, seqlen_k, page_size);

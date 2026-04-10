@@ -258,6 +258,8 @@ std::vector<at::Tensor> mha_fwd(
       
       // Safety margin (e.g. 500MB) for fragmentation and other overhead
       constexpr size_t SAFE_MARGIN = 1000 * 1024 * 1024;
+      size_t free_mem = (global_mem > allocated_mem + SAFE_MARGIN) ? (global_mem - allocated_mem - SAFE_MARGIN) : 0;
+      
       // Bytes needed for one split slice: 
       // temp_out slice + max_logits slice + exp_sums slice
       size_t mem_per_split = (total_q * num_heads * head_size_v * q.element_size()) 
@@ -268,7 +270,6 @@ std::vector<at::Tensor> mha_fwd(
         target_splits /= 2;
       }
       
-      size_t free_mem = (global_mem > allocated_mem + SAFE_MARGIN) ? (global_mem - allocated_mem - SAFE_MARGIN) : 0;
       std::cout << "global_mem: " << global_mem / (1024.0 * 1024.0 * 1024.0) << " GB, allocated_mem: " 
                 << allocated_mem / (1024.0 * 1024.0 * 1024.0) << " GB, reserved_mem: " 
                 << reserved_mem / (1024.0 * 1024.0 * 1024.0) << " GB, free_mem (with margin): " 

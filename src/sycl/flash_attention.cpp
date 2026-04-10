@@ -256,10 +256,10 @@ std::vector<at::Tensor> mha_fwd(
       size_t allocated_mem = c10::xpu::XPUCachingAllocator::getDeviceStats(q.device().index()).allocated_bytes[0].current;
       size_t reserved_mem = c10::xpu::XPUCachingAllocator::getDeviceStats(q.device().index()).reserved_bytes[0].current;
       
-      // Safety margin (e.g. 500MB) for fragmentation and other overhead
-      constexpr size_t SAFE_MARGIN = 1000 * 1024 * 1024;
+      // Safety margin (e.g. 1024MB) for fragmentation and other overhead
+      constexpr size_t SAFE_MARGIN = 1024 * 1024 * 1024 + (total_q * num_heads * head_size_v * q.element_size());
       size_t free_mem = (global_mem > allocated_mem + SAFE_MARGIN) ? (global_mem - allocated_mem - SAFE_MARGIN) : 0;
-      
+
       // Bytes needed for one split slice: 
       // temp_out slice + max_logits slice + exp_sums slice
       size_t mem_per_split = (total_q * num_heads * head_size_v * q.element_size()) 

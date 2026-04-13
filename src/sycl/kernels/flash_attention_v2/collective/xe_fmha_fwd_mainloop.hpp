@@ -370,6 +370,8 @@ struct FMHAFwdMainloop<
     /* Main loop, blocked in k. */
     if constexpr (CachedKV) {
       for (int K = blk_k0; K < kblocks_cache; K++) {
+        /* Split barrier to keep threads together */
+        barrier_arrive(ScopeWorkgroup);
         int physical_K_tile = K;
         if constexpr (PagedKV) {
           physical_K_tile = get_physical_k_tile(K, l_coord, seq_len_kv_cache);
@@ -400,19 +402,23 @@ struct FMHAFwdMainloop<
         /* V prefetch for GEMM 2 */
         prefetch(prefetch_v_cache, pVgV_cache(_, _, _, physical_K_tile));
 
-        /* Apply softmax and scaling */
-        softmax(K == blk_k0, tSrS, tA_max, tA_sum, tArA);
+        /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
+        auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum);
         reorder(tSrS, tArP);
 
-        /* GEMM 2: A += P * V, split in v dimension */
+        /* GEMM 2: A += P * V, split in v dimension.
+          tArA rescaling is fused to per-VTile */
         CUTLASS_PRAGMA_UNROLL
         for (int VV = 0; VV < VTiles; VV++) {
           copy(copy_v_cache, tVgV_cache(_, _, _, VV, physical_K_tile), tVrV);
           reorder(tVrV, tArV);
+          if (K != blk_k0) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tArA.size() / VTiles; i++)
+              tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
+          }
           cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
         }
-
-        barrier();
 
         /* K prefetch */
         for (int D = 0; D < size<4>(pKgK); D++) {
@@ -431,10 +437,13 @@ struct FMHAFwdMainloop<
             prefetch(prefetch_k, pKgK(_, _, _, K_next - kblocks_cache, D));
           }
         }
+        barrier_wait(ScopeWorkgroup);
       }
     }
 
     for (int K = (blk_k0 > kblocks_cache ? blk_k0 : kblocks_cache); K < blk_k1; K++) {
+      /* Split barrier to keep threads together */
+      barrier_arrive(ScopeWorkgroup);
       /* GEMM 1: S = K * Q */
       clear(tSrS);
       CUTLASS_PRAGMA_UNROLL
@@ -482,45 +491,51 @@ struct FMHAFwdMainloop<
         }
       }
 
-      /* Apply softmax and scaling */
-      softmax(K == blk_k0, tSrS, tA_max, tA_sum, tArA);
+      /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
+      auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum);
       reorder(tSrS, tArP);
 
-      /* GEMM 2: A += P * V, split in v dimension */
+      /* GEMM 2: A += P * V, split in v dimension.
+        tArA rescaling is fused to per-VTile */
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
         copy(copy_v, tVgV(_, _, _, VV, K - kblocks_cache), tVrV);
         reorder(tVrV, tArV);
+        if (K != blk_k0) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tArA.size() / VTiles; i++)
+            tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
+        }
         cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
       }
-
-      barrier();
 
       /* K prefetch */
       for (int D = 0; D < size<4>(pKgK); D++) {
         int K_next = K + Stages;
         prefetch(prefetch_k, pKgK(_, _, _, K_next - kblocks_cache, D));
       }
+      barrier_wait(ScopeWorkgroup);
     }
   }
 
   // Single step of blocked softmax.
   CUTLASS_DEVICE
-  void softmax(
-      bool first_block,  // First softmax block?
-      FragS& tS,         // Softmax src/dst block
-      FragSRow& tS_max,  // Softmax row-wise max accumulator
-      FragSRow& tS_sum,  // Softmax row-wise sum accumulator
-      FragA& tA) {       // O accumulator (for rescaling)
+  FragSRow softmax(
+      bool first_block,    // First softmax block?
+      FragS& tS,           // Softmax src/dst block
+      FragSRow& tS_max,    // Softmax row-wise max accumulator
+      FragSRow& tS_sum) {  // Softmax row-wise sum accumulator
 
     /* Compute row-wise maxima for this block */
     auto tS_bmax = reduce<1>(tS, sycl::maximum{});
 
-    /* Update (scaled) maxima */
-    auto tS_prev_max = tS_max;
+    /* Update (scaled) maxima and compute rescale factor */
+    FragSRow rescale;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS_max.size(); i++) {
-      tS_max(i) = sycl::max(tS_max(i), params.scale * tS_bmax(i));
+      ElementS new_max = sycl::max(tS_max(i), params.scale * tS_bmax(i));
+      rescale(i) = sycl::native::exp2(tS_max(i) - new_max);
+      tS_max(i) = new_max;
     }
 
     /* Scale S and subtract maxima, then exponentiate */
@@ -528,25 +543,21 @@ struct FMHAFwdMainloop<
     for (int i = 0; i < tS.size(); i++)
       tS(i) = sycl::native::exp2(params.scale * tS(i) - broadcast<0>(tS_max, tS, i));
 
-    /* Rescale existing S sums and O accumulator */
+    /* Rescale existing S sums */
     if (!first_block) {
-      FragSRow rescale;
-
       CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < tS_max.size(); i++) {
-        rescale(i) = sycl::native::exp2(tS_prev_max(i) - tS_max(i));
+      for (int i = 0; i < tS_sum.size(); i++) {
         tS_sum(i) *= rescale(i);
       }
-
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < tA.size(); i++)
-        tA(i) *= broadcast<0>(rescale, tA, i);
     }
 
     /* Update sums */
     auto tS_bsum = reduce<1>(tS, sycl::plus<void>{});
+    CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS_sum.size(); i++)
       tS_sum(i) += tS_bsum(i);
+
+    return rescale;
   }
 };
 

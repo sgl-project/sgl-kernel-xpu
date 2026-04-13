@@ -4,6 +4,21 @@ project(sgl_kernel)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_STANDARD 20)
 
+# Auto-detect ccache/sccache for faster rebuilds.
+find_program(CCACHE_PROGRAM ccache)
+find_program(SCCACHE_PROGRAM sccache)
+if(CCACHE_PROGRAM)
+  set(CMAKE_C_COMPILER_LAUNCHER   "${CCACHE_PROGRAM}")
+  set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+  set(SYCL_COMPILER_LAUNCHER "${CCACHE_PROGRAM}" CACHE STRING "")
+elseif(SCCACHE_PROGRAM)
+  set(CMAKE_C_COMPILER_LAUNCHER   "${SCCACHE_PROGRAM}")
+  set(CMAKE_CXX_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
+  set(SYCL_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}" CACHE STRING "")
+else()
+  set(SYCL_COMPILER_LAUNCHER "" CACHE STRING "")
+endif()
+
 set(ATen_XPU_SYCL_XE20)
 set(ATen_XPU_SYCL_COMMON)
 
@@ -31,6 +46,13 @@ include(${SGL_OPS_XPU_ROOT}/cmake/SYCL.cmake)
 include(${SGL_OPS_XPU_ROOT}/cmake/BuildFlags.cmake)
 
 include(FetchContent)
+
+# Persist FetchContent downloads outside the build tree so that
+# rm -rf build does not re-clone large repositories.
+if(NOT FETCHCONTENT_BASE_DIR)
+  set(FETCHCONTENT_BASE_DIR "${PROJECT_SOURCE_DIR}/.deps"
+      CACHE PATH "FetchContent download directory")
+endif()
 
 # SYCL support in cutlass
 add_compile_definitions(CUTLASS_ENABLE_SYCL)

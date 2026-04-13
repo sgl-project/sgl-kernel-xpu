@@ -30,6 +30,7 @@ set(SYCL_executable "@SYCL_EXECUTABLE@") # path
 set(SYCL_compile_flags @SYCL_COMPILE_FLAGS@) # list
 set(SYCL_include_dirs [==[@SYCL_include_dirs@]==]) # list
 set(SYCL_compile_definitions [==[@SYCL_compile_definitions@]==]) # list
+set(SYCL_compiler_launcher "@SYCL_COMPILER_LAUNCHER@") # path (ccache or empty)
 
 list(REMOVE_DUPLICATES SYCL_INCLUDE_DIRS)
 
@@ -112,21 +113,22 @@ macro(SYCL_execute_process status command)
   execute_process(COMMAND ${ARGN} RESULT_VARIABLE SYCL_result )
 endmacro()
 
-# Delete the target file
-SYCL_execute_process(
-  "Removing ${generated_file}"
-  COMMAND "${CMAKE_COMMAND}" -E remove "${generated_file}"
-  )
-
 # Generate the code
 if(WIN32)
   set(SYCL_dependency_file_args /clang:-MD /clang:-MF /clang:${SYCL_generated_dependency_file})
 else()
   set(SYCL_dependency_file_args -MD -MF "${SYCL_generated_dependency_file}")
 endif()
+# Build the compiler command: optionally prepend ccache/sccache launcher.
+if(SYCL_compiler_launcher)
+  set(_sycl_compiler_cmd "${SYCL_compiler_launcher}" "${SYCL_executable}")
+else()
+  set(_sycl_compiler_cmd "${SYCL_executable}")
+endif()
+
 SYCL_execute_process(
   "Generating ${generated_file}"
-  COMMAND "${SYCL_executable}"
+  COMMAND ${_sycl_compiler_cmd}
   ${SYCL_dependency_file_args}
   -c
   "${source_file}"

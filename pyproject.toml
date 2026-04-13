@@ -31,7 +31,7 @@ exclude = [
 
 [tool.scikit-build]
 cmake.build-type = "Release"
-build-dir = "build"
+build-dir = "build/{wheel_tag}"
 minimum-version = "build-system.requires"
 
 wheel.py-api = "cp39"

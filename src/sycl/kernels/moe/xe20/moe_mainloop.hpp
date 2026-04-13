@@ -282,11 +282,39 @@ struct MoEMainloop<
     auto tBrB0 = thr_copy_b0.partition_sg_fragment_D(gB(_, _, 0));
     auto tBrB1 = thr_copy_b1.partition_sg_fragment_D(gB(_, _, 0));
 
-    auto tSrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
+    auto tSrB_template = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
+    auto tSrB_layout = tSrB_template.tensor().layout();
+    auto tSrB_storage = make_tensor<typename decltype(tSrB_template)::element_type>(make_layout(
+        make_shape(shape<0>(tSrB_layout), _2{}, shape<1>(tSrB_layout), shape<2>(tSrB_layout)),
+        make_stride(stride<0>(tSrB_layout), size(tSrB_layout), stride<1>(tSrB_layout), stride<2>(tSrB_layout))));
+    auto tSrB0 = make_subgroup_tensor(tSrB_storage(_, 0, _, _), tSrB_template.tv_layout());
+    auto tSrB1 = make_subgroup_tensor(tSrB_storage(_, 1, _, _), tSrB_template.tv_layout());
+    auto tSrB_pair = make_tensor(
+        tSrB_storage.data(),
+        make_layout(
+            make_shape(shape<0>(tSrB_layout), make_shape(_2{}, shape<1>(tSrB_layout)), shape<2>(tSrB_layout)),
+            make_stride(
+                stride<0>(tSrB_layout),
+                make_stride(size(tSrB_layout), stride<1>(tSrB_layout)),
+                stride<2>(tSrB_layout))));
 
     /* Partition C */
-    SubgroupTensor tCrC0 = thr_mma.partition_sg_fragment_C(gC0);
-    SubgroupTensor tCrC1 = thr_mma.partition_sg_fragment_C(gC1);
+    auto tCrC_template = thr_mma.partition_sg_fragment_C(gC0);
+    auto tCrC_layout = tCrC_template.tensor().layout();
+    auto tCrC_storage = make_tensor<typename decltype(tCrC_template)::element_type>(make_layout(
+        make_shape(shape<0>(tCrC_layout), shape<1>(tCrC_layout), _2{}, shape<2>(tCrC_layout)),
+        make_stride(stride<0>(tCrC_layout), stride<1>(tCrC_layout), size(tCrC_layout), stride<2>(tCrC_layout))));
+    clear(tCrC_storage);
+    auto tCrC0 = make_subgroup_tensor(tCrC_storage(_, _, 0, _), tCrC_template.tv_layout());
+    auto tCrC1 = make_subgroup_tensor(tCrC_storage(_, _, 1, _), tCrC_template.tv_layout());
+    auto tCrC_pair = make_tensor(
+        tCrC_storage.data(),
+        make_layout(
+            make_shape(shape<0>(tCrC_layout), shape<1>(tCrC_layout), make_shape(_2{}, shape<2>(tCrC_layout))),
+            make_stride(
+                stride<0>(tCrC_layout),
+                stride<1>(tCrC_layout),
+                make_stride(size(tCrC_layout), stride<2>(tCrC_layout)))));
 
     /* Partition D */
     using TD = typename DTensor::element_type;
@@ -331,13 +359,18 @@ struct MoEMainloop<
 
       copy(tiled_copy_a, tAgA(_, _, _, k_tile), tArA);
       copy(tiled_copy_b0, tBgB0(_, _, _, k_tile), tBrB0);
-      reorder(tArA, tSrA);
-      reorder(tBrB0, tSrB);
-      cute::gemm(mma, tSrA, tSrB, tCrC0);
-
       copy(tiled_copy_b1, tBgB1(_, _, _, k_tile), tBrB1);
-      reorder(tBrB1, tSrB);
-      cute::gemm(mma, tSrA, tSrB, tCrC1);
+
+      reorder(tArA, tSrA);
+      reorder(tBrB0, tSrB0);
+      reorder(tBrB1, tSrB1);
+
+      if constexpr (ActType == SWIGLU_GPT_OSS) {
+        cute::gemm(mma, tSrA, tSrB0, tCrC0);
+        cute::gemm(mma, tSrA, tSrB1, tCrC1);
+      } else {
+        cute::gemm(mma, tSrA, tSrB_pair, tCrC_pair);
+      }
 
       if (prefetch_k < k_tile_count) {
         prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));

@@ -128,6 +128,21 @@ shape_configs = [
         "dtype": torch.bfloat16,
         "block_shape": None,
     },
+]
+
+shape_configs_gelu = [
+    # grok, tp=1
+    {
+        "num_experts": 8,
+        "topk": 2,
+        "hidden_size": 8192,
+        "shard_intermediate_size": 16384,
+        "dtype": torch.bfloat16,
+        "block_shape": None,
+    },
+]
+
+shape_configs_swiglu_gpt_oss = [
     # lmsys/gpt-oss-20b-bf16, tp = 4
     {
         "num_experts": 32,
@@ -139,18 +154,6 @@ shape_configs = [
         "gemm1_alpha": SWIGLU_GPT_OSS_ALPHA,
         "gemm1_limit": SWIGLU_GPT_OSS_LIMIT,
     },
-]
-
-shape_configs_gelu = [
-    # grok, tp=1
-    # {
-    #     "num_experts": 8,
-    #     "topk": 2,
-    #     "hidden_size": 8192,
-    #     "shard_intermediate_size": 16384,
-    #     "dtype": torch.bfloat16,
-    #     "block_shape": None,
-    # }
 ]
 
 
@@ -173,6 +176,11 @@ with_bias = [False, True]
 configs = [(k, *v, b, "silu") for k, v, b in product(bs, shape_values, with_bias)]
 shape_values_gelu = [_cfg_vals(d) for d in shape_configs_gelu]
 configs += [(k, *v, b, "gelu") for k, v, b in product(bs, shape_values_gelu, with_bias)]
+shape_values_swiglu_gpt_oss = [_cfg_vals(d) for d in shape_configs_swiglu_gpt_oss]
+configs += [
+    (k, *v, b, "silu")
+    for k, v, b in product(bs, shape_values_swiglu_gpt_oss, with_bias)
+]
 all_results = []
 
 

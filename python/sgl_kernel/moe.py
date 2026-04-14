@@ -490,8 +490,13 @@ def fused_experts(
             gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
         )
 
+    rsf = 1.0
+
+    if routed_scaling_factor is not None:
+        rsf = routed_scaling_factor
+
     torch.ops.sgl_kernel.apply_shuffle_mul_sum.default(
-        intermediate_cache3, out_hidden_states, c_map, topk_weights
+        intermediate_cache3, out_hidden_states, c_map, rsf, topk_weights
     )
 
     return out_hidden_states

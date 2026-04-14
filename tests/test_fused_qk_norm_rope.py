@@ -427,7 +427,7 @@ def test_fused_qk_norm_rope_partial_rotary(num_tokens, head_dim, rotary_dim, dty
 def test_fused_qk_norm_rope_fp8_e4m3(
     num_tokens, num_heads_q, num_heads_k, num_heads_v, head_dim, is_neox
 ):
-    """Test fused QK norm + RoPE with FP8 E4M3 dtype."""
+    """Test fused QK norm + RoPE with FP8_E4M3 dtype."""
     torch.random.manual_seed(42)
     dtype = torch.float8_e4m3fn
     eps = 1e-6

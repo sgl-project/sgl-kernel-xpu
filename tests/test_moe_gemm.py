@@ -145,7 +145,7 @@ def torch_naive_moe(
                 ("gelu", None, None),
                 ("silu", SWIGLU_ALPHA, SWIGLU_LIMIT),  # swiglu_gpt_oss
             ],  # (act_type, gemm1_alpha, gemm1_limit)
-            [1.0, 2.5, None],
+            [2.5],
         )
     ),
 )

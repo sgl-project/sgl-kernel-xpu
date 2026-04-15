@@ -12,7 +12,7 @@ from sgl_kernel import (
 @pytest.mark.parametrize("num_tokens", [1, 2, 5, 16, 64, 128, 224, 1024])
 @pytest.mark.parametrize("num_experts", [1, 4, 8, 32, 40, 64, 128, 256])
 @pytest.mark.parametrize("top_k", [1, 2, 4, 6, 8])
-@pytest.mark.parametrize("hidden_dims", [16, 32, 64, 128, 1024, 1536])
+@pytest.mark.parametrize("hidden_dims", [640, 1024, 1536])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_prepare_input_moe(num_tokens, num_experts, top_k, hidden_dims, dtype):
     if num_experts < top_k:
@@ -161,7 +161,7 @@ def test_apply_shuffle_mul_sum_without_factors_regression():
     device = "xpu"
     dtype = torch.bfloat16
     num_tokens = 16
-    hidden_dims = 256
+    hidden_dims = 640
     top_k = 4
     num_experts = 8
 

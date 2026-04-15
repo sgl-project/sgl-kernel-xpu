@@ -181,9 +181,15 @@ def apply_shuffle_mul_sum(
     output,
     permutation,
     factors,
+    routed_scaling_factor: Optional[float] = None,
 ):
+    rsf = 1.0
+
+    if routed_scaling_factor is not None:
+        rsf = routed_scaling_factor
+
     torch.ops.sgl_kernel.apply_shuffle_mul_sum.default(
-        input, output, permutation, factors
+        input, output, permutation, rsf, factors
     )
 
 

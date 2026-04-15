@@ -451,16 +451,17 @@ struct ApplyShuffleMulSum {
           using vec_t = sycl::vec<T, ElemsPerItem>;
           vec_t reg = *(reinterpret_cast<const vec_t*>(src));
           for (int j = 0; j < ElemsPerItem; ++j) {
-            acc[j] += static_cast<float>(reg[j]) * weights[k];
+            if constexpr (APPLY_ROUTED_SCALING) {
+              acc[j] += static_cast<float>(reg[j]) * weights[k] * routed_scaling_factor_;
+            } else {
+              acc[j] += static_cast<float>(reg[j]) * weights[k];
+            }
           }
         }
 
         using vec_t = sycl::vec<T, ElemsPerItem>;
         vec_t store;
         for (int j = 0; j < ElemsPerItem; ++j) {
-          if constexpr (APPLY_ROUTED_SCALING) {
-            acc[j] *= routed_scaling_factor_;
-          }
           store[j] = static_cast<T>(acc[j]);
         }
         *(reinterpret_cast<vec_t*>(dst_base + loop * Stride)) = store;

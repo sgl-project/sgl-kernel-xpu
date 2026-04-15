@@ -241,17 +241,29 @@ class XeFMHAFwdKernel {
       auto sequence_length_shape = get_sequence_length_shape(s, idx_b);
       auto [seq_len_qo, seq_len_kv, seq_len_kv_cache] = sequence_length_shape;
       if (blk_q * get<0>(TileShapeQK{}) >= seq_len_qo) continue;
-      auto offset = cute::min(seq_len_qo, seq_len_kv);
+      // auto offset = cute::min(seq_len_qo, seq_len_kv);
+      // auto discard_seq_coord = seq_len_qo - offset;
+      // auto full_tile_offset = seq_len_kv - offset;
+      // auto offset = cute::min(seq_len_qo, seq_len_kv_cache);
+      auto offset = seq_len_qo;
       auto discard_seq_coord = seq_len_qo - offset;
-      auto full_tile_offset = seq_len_kv - offset;
+      auto full_tile_offset = seq_len_kv_cache - offset;
       int seq_coord = cute::min(seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
 
-      if (CollectiveMainloop::CausalMask && seq_coord < discard_seq_coord) continue;
-      const int seq_len_new = CollectiveMainloop::CausalMask
-                                  ? full_tile_offset + cute::min(seq_len_kv, seq_coord - discard_seq_coord) + q_sg_tile
-                                  : seq_len_kv;
-      const int seq_len = seq_len_new + seq_len_kv_cache;
+      // if (CollectiveMainloop::CausalMask && seq_coord < discard_seq_coord) continue;
+
+      // const int seq_len_new = CollectiveMainloop::CausalMask
+      //                             ? full_tile_offset + cute::min(seq_len_kv, seq_coord - discard_seq_coord) +
+      //                             q_sg_tile : seq_len_kv;
+      // const int seq_len = seq_len_new + seq_len_kv_cache;
+      // const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
+
+      const int seq_len = CollectiveMainloop::CausalMask
+                              ? cute::min(seq_len_kv_cache, full_tile_offset + seq_coord + q_sg_tile)
+                              : seq_len_kv_cache;
       const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
+      const int k_blocks_causal =
+          CollectiveMainloop::CausalMask ? (seq_coord + full_tile_offset) / get<1>(TileShapeQK{}) : 0;
 
       int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
       int offset_k_cache = 0, offset_v_cache = 0;
@@ -309,6 +321,7 @@ class XeFMHAFwdKernel {
           0,
           k_blocks,
           k_blocks,
+          k_blocks_causal,
           thr_id,
           seq_len,
           seq_len_kv_cache,

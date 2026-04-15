@@ -187,6 +187,7 @@ def test_fused_qk_norm_rope_basic(
     num_tokens, num_heads_q, num_heads_k, num_heads_v, head_dim, is_neox, dtype
 ):
     """Test basic fused QK norm + RoPE without YARN."""
+    torch.random.manual_seed(42)
     eps = 1e-6
     base = 10000.0
     factor = 1.0
@@ -261,6 +262,7 @@ def test_fused_qk_norm_rope_basic(
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_fused_qk_norm_rope_yarn(num_tokens, head_dim, is_neox, dtype):
     """Test fused QK norm + RoPE with YARN scaling."""
+    torch.random.manual_seed(42)
     num_heads_q = 32
     num_heads_k = 8
     num_heads_v = 8
@@ -338,6 +340,7 @@ def test_fused_qk_norm_rope_yarn(num_tokens, head_dim, is_neox, dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_fused_qk_norm_rope_partial_rotary(num_tokens, head_dim, rotary_dim, dtype):
     """Test with partial rotary dimensions (rotary_dim < head_dim)."""
+    torch.random.manual_seed(42)
     num_heads_q = 16
     num_heads_k = 4
     num_heads_v = 4
@@ -424,7 +427,8 @@ def test_fused_qk_norm_rope_partial_rotary(num_tokens, head_dim, rotary_dim, dty
 def test_fused_qk_norm_rope_fp8_e4m3(
     num_tokens, num_heads_q, num_heads_k, num_heads_v, head_dim, is_neox
 ):
-    """Test fused QK norm + RoPE with FP8 E4M3 dtype."""
+    """Test fused QK norm + RoPE with FP8_E4M3 dtype."""
+    torch.random.manual_seed(42)
     dtype = torch.float8_e4m3fn
     eps = 1e-6
     base = 10000.0

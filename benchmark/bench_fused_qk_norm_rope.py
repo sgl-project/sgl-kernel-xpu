@@ -180,7 +180,7 @@ def fused_qk_norm_rope_reference(
 
 # Benchmark configurations
 batch_size_range = [1, 2, 4, 8]
-seq_len_range = [64, 128, 256, 512, 1024, 2048]
+seq_len_range = [64, 128, 256, 512, 1024]
 # DeepSeek-V3 config: 128 Q heads, 128 KV heads (MLA)
 head_config_range = [
     (32, 8, 8, 128),  # Standard MQA config

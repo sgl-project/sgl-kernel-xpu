@@ -168,7 +168,10 @@ def test_apply_shuffle_mul_sum_without_factors_regression():
     torch.manual_seed(0)
 
     topk_ids = torch.stack(
-        [torch.randperm(num_experts, dtype=torch.int32)[:top_k] for _ in range(num_tokens)]
+        [
+            torch.randperm(num_experts, dtype=torch.int32)[:top_k]
+            for _ in range(num_tokens)
+        ]
     )
     routing_size = num_tokens * top_k
 
@@ -198,9 +201,7 @@ def test_apply_shuffle_mul_sum_without_factors_regression():
         (num_tokens, hidden_dims), dtype=dtype, device=device
     )
 
-    scatter_tokens_to_experts(
-        hidden_states, output_permutation, shuffled_hidden_states
-    )
+    scatter_tokens_to_experts(hidden_states, output_permutation, shuffled_hidden_states)
     apply_shuffle_mul_sum(
         shuffled_hidden_states, combined_hidden_states, output_permutation, None
     )

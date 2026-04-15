@@ -328,9 +328,8 @@ struct ScatterTokensToExperts : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr int Stride = WGSize * ElemsPerItem;
   static constexpr int MAX_TOPK = 16;
 
-  ScatterTokensToExperts(
-      const T* input, T* output, const int32_t* src2dst_map)
-      : input_(input), output_(output), src2dst_map_(src2dst_map){}
+  ScatterTokensToExperts(const T* input, T* output, const int32_t* src2dst_map)
+      : input_(input), output_(output), src2dst_map_(src2dst_map) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
     dst_rows_ = sycl::local_accessor<int32_t>(sycl::range<1>(TOPK), cgh);
@@ -348,66 +347,19 @@ struct ScatterTokensToExperts : public __SYCL_KER_CONFIG_CONVENTION__ {
     using vec_t = sycl::vec<T, ElemsPerItem>;
     const int token_offset = token_id * HIDDEN_DIM;
 
-    if constexpr (HIDDEN_DIM > 0) {
-      static_assert(HIDDEN_DIM % ElemsPerItem == 0, "specialized hidden dimensions must align with vector width");
-      constexpr int max_tiles = (HIDDEN_DIM + Stride - 1) / Stride;
+    static_assert(HIDDEN_DIM % ElemsPerItem == 0, "specialized hidden dimensions must align with vector width");
+    constexpr int max_tiles = (HIDDEN_DIM + Stride - 1) / Stride;
 #pragma unroll
-      for (int tile = 0; tile < max_tiles; ++tile) {
-        const int offset = local_id * ElemsPerItem + tile * Stride;
-        if (offset >= HIDDEN_DIM) {
-          continue;
-        }
-        vec_t data = *(reinterpret_cast<const vec_t*>(input_ + token_offset + offset));
-        if constexpr (TOPK > 0) {
-#pragma unroll
-          for (int k = 0; k < TOPK; ++k) {
-            T* dst = output_ + dst_rows_[k] * HIDDEN_DIM + offset;
-            *(reinterpret_cast<vec_t*>(dst)) = data;
-          }
-        } else {
-          for (int k = 0; k < TOPK; ++k) {
-            T* dst = output_ + dst_rows_[k] * HIDDEN_DIM + offset;
-            *(reinterpret_cast<vec_t*>(dst)) = data;
-          }
-        }
+    for (int tile = 0; tile < max_tiles; ++tile) {
+      const int offset = local_id * ElemsPerItem + tile * Stride;
+      if (offset >= HIDDEN_DIM) {
+        continue;
       }
-    } else {
-      for (int offset = local_id * ElemsPerItem; offset < HIDDEN_DIM; offset += Stride) {
-        const int remaining = HIDDEN_DIM - offset;
-        if (remaining >= ElemsPerItem) {
-          vec_t data = *(reinterpret_cast<const vec_t*>(input_ + token_offset + offset));
-          if constexpr (TOPK > 0) {
+      vec_t data = *(reinterpret_cast<const vec_t*>(input_ + token_offset + offset));
 #pragma unroll
-            for (int k = 0; k < TOPK; ++k) {
-              T* dst = output_ + dst_rows_[k] * HIDDEN_DIM + offset;
-              *(reinterpret_cast<vec_t*>(dst)) = data;
-            }
-          } else {
-            for (int k = 0; k < TOPK; ++k) {
-              T* dst = output_ + dst_rows_[k] * HIDDEN_DIM + offset;
-              *(reinterpret_cast<vec_t*>(dst)) = data;
-            }
-          }
-        } else {
-#pragma unroll
-          for (int j = 0; j < ElemsPerItem; ++j) {
-            const int idx = offset + j;
-            if (idx >= HIDDEN_DIM) {
-              break;
-            }
-            const T value = input_[token_offset + idx];
-            if constexpr (TOPK > 0) {
-#pragma unroll
-              for (int k = 0; k < TOPK; ++k) {
-                output_[dst_rows_[k] * HIDDEN_DIM + idx] = value;
-              }
-            } else {
-              for (int k = 0; k < TOPK; ++k) {
-                output_[dst_rows_[k] * HIDDEN_DIM + idx] = value;
-              }
-            }
-          }
-        }
+      for (int k = 0; k < TOPK; ++k) {
+        T* dst = output_ + dst_rows_[k] * HIDDEN_DIM + offset;
+        *(reinterpret_cast<vec_t*>(dst)) = data;
       }
     }
   }
@@ -420,11 +372,7 @@ struct ScatterTokensToExperts : public __SYCL_KER_CONFIG_CONVENTION__ {
 
 template <typename T, int TOPK, int HIDDEN_DIM>
 void launch_scatter_tokens_to_experts_impl(
-    const T* input,
-    T* output,
-    const int32_t* src2dst,
-    const uint32_t num_tokens,
-    sycl::queue& queue) {
+    const T* input, T* output, const int32_t* src2dst, const uint32_t num_tokens, sycl::queue& queue) {
   using Kernel = ScatterTokensToExperts<T, TOPK, HIDDEN_DIM>;
   sycl::range<1> global_range{num_tokens * Kernel::WGSize};
   sycl::range<1> local_range{Kernel::WGSize};
@@ -518,7 +466,11 @@ void scatter_tokens_to_experts_impl(
       dispatch_scatter_tokens_to_experts_topk<T, 16384>(input, output, src2dst, num_tokens, queue, topk);
       break;
     default:
-      TORCH_CHECK(false, "Unsupported hidden_dim value: ", hidden_dim, ". Supported values are 640, 1024, 1280, 1536, 1792, 2880, 3584, 4096, 8192, 16384.");
+      TORCH_CHECK(
+          false,
+          "Unsupported hidden_dim value: ",
+          hidden_dim,
+          ". Supported values are 640, 1024, 1280, 1536, 1792, 2880, 3584, 4096, 8192, 16384.");
       break;
   }
 }
@@ -544,15 +496,8 @@ struct ApplyShuffleMulSum : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr int Stride = WGSize * ElemsPerItem;
   static constexpr int MAX_TOPK = 16;
 
-  ApplyShuffleMulSum(
-      const T* input,
-      T* output,
-      const int32_t* dst2src_map,
-      const T1* factors)
-      : input_(input),
-        output_(output),
-        dst2src_map_(dst2src_map),
-        factors_(factors) {}
+  ApplyShuffleMulSum(const T* input, T* output, const int32_t* dst2src_map, const T1* factors)
+      : input_(input), output_(output), dst2src_map_(dst2src_map), factors_(factors) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
     const size_t topk_storage = TOPK;
@@ -574,130 +519,36 @@ struct ApplyShuffleMulSum : public __SYCL_KER_CONFIG_CONVENTION__ {
     using vec_t = sycl::vec<T, ElemsPerItem>;
     const int out_offset = out_tkn_id * HIDDEN_DIM;
 
-    if constexpr (HIDDEN_DIM > 0) {
-      static_assert(HIDDEN_DIM % ElemsPerItem == 0, "specialized hidden dimensions must align with vector width");
-      constexpr int max_tiles = (HIDDEN_DIM + Stride - 1) / Stride;
+    static_assert(HIDDEN_DIM % ElemsPerItem == 0, "specialized hidden dimensions must align with vector width");
+    constexpr int max_tiles = (HIDDEN_DIM + Stride - 1) / Stride;
 #pragma unroll
-      for (int tile = 0; tile < max_tiles; ++tile) {
-        const int offset = local_id * ElemsPerItem + tile * Stride;
-        if (offset >= HIDDEN_DIM) {
-          continue;
-        }
-        sycl::vec<float, ElemsPerItem> acc;
-#pragma unroll
-        for (int j = 0; j < ElemsPerItem; ++j) {
-          acc[j] = 0.0f;
-        }
-
-        if constexpr (TOPK > 0) {
-#pragma unroll
-          for (int k = 0; k < TOPK; ++k) {
-            const vec_t reg = *(reinterpret_cast<const vec_t*>(input_ + src_indices_[k] * HIDDEN_DIM + offset));
-            const float weight = weights_[k];
-#pragma unroll
-            for (int j = 0; j < ElemsPerItem; ++j) {
-              acc[j] += static_cast<float>(reg[j]) * weight;
-            }
-          }
-        } else {
-          for (int k = 0; k < TOPK; ++k) {
-            const vec_t reg = *(reinterpret_cast<const vec_t*>(input_ + src_indices_[k] * HIDDEN_DIM + offset));
-            const float weight = weights_[k];
-#pragma unroll
-            for (int j = 0; j < ElemsPerItem; ++j) {
-              acc[j] += static_cast<float>(reg[j]) * weight;
-            }
-          }
-        }
-
-        vec_t store;
-#pragma unroll
-        for (int j = 0; j < ElemsPerItem; ++j) {
-          store[j] = static_cast<T>(acc[j]);
-        }
-        *(reinterpret_cast<vec_t*>(output_ + out_offset + offset)) = store;
+    for (int tile = 0; tile < max_tiles; ++tile) {
+      const int offset = local_id * ElemsPerItem + tile * Stride;
+      if (offset >= HIDDEN_DIM) {
+        continue;
       }
-    } else {
-      for (int offset = local_id * ElemsPerItem; offset < HIDDEN_DIM; offset += Stride) {
-        const int remaining = HIDDEN_DIM - offset;
-        if (remaining >= ElemsPerItem) {
-          sycl::vec<float, ElemsPerItem> acc;
+      sycl::vec<float, ElemsPerItem> acc;
 #pragma unroll
-          for (int j = 0; j < ElemsPerItem; ++j) {
-            acc[j] = 0.0f;
-          }
+      for (int j = 0; j < ElemsPerItem; ++j) {
+        acc[j] = 0.0f;
+      }
 
-          if constexpr (TOPK > 0) {
 #pragma unroll
-            for (int k = 0; k < TOPK; ++k) {
-              const vec_t reg = *(reinterpret_cast<const vec_t*>(input_ + src_indices_[k] * HIDDEN_DIM + offset));
-              const float weight = weights_[k];
-#pragma unroll
-              for (int j = 0; j < ElemsPerItem; ++j) {
-                acc[j] += static_cast<float>(reg[j]) * weight;
-              }
-            }
-          } else {
-            for (int k = 0; k < TOPK; ++k) {
-              const vec_t reg = *(reinterpret_cast<const vec_t*>(input_ + src_indices_[k] * HIDDEN_DIM + offset));
-              const float weight = weights_[k];
-#pragma unroll
-              for (int j = 0; j < ElemsPerItem; ++j) {
-                acc[j] += static_cast<float>(reg[j]) * weight;
-              }
-            }
-          }
-
-          vec_t store;
-#pragma unroll
-          for (int j = 0; j < ElemsPerItem; ++j) {
-            store[j] = static_cast<T>(acc[j]);
-          }
-          *(reinterpret_cast<vec_t*>(output_ + out_offset + offset)) = store;
-        } else {
-        float acc[ElemsPerItem];
+      for (int k = 0; k < TOPK; ++k) {
+        const vec_t reg = *(reinterpret_cast<const vec_t*>(input_ + src_indices_[k] * HIDDEN_DIM + offset));
+        const float weight = weights_[k];
 #pragma unroll
         for (int j = 0; j < ElemsPerItem; ++j) {
-          acc[j] = 0.0f;
-        }
-
-        if constexpr (TOPK > 0) {
-#pragma unroll
-          for (int k = 0; k < TOPK; ++k) {
-            const float weight = weights_[k];
-#pragma unroll
-            for (int j = 0; j < ElemsPerItem; ++j) {
-              const int idx = offset + j;
-              if (idx >= HIDDEN_DIM) {
-                break;
-              }
-              acc[j] += static_cast<float>(input_[src_indices_[k] * HIDDEN_DIM + idx]) * weight;
-            }
-          }
-        } else {
-          for (int k = 0; k < TOPK; ++k) {
-            const float weight = weights_[k];
-#pragma unroll
-            for (int j = 0; j < ElemsPerItem; ++j) {
-              const int idx = offset + j;
-              if (idx >= HIDDEN_DIM) {
-                break;
-              }
-              acc[j] += static_cast<float>(input_[src_indices_[k] * HIDDEN_DIM + idx]) * weight;
-            }
-          }
-        }
-
-#pragma unroll
-        for (int j = 0; j < ElemsPerItem; ++j) {
-          const int idx = offset + j;
-          if (idx >= HIDDEN_DIM) {
-            break;
-          }
-          output_[out_offset + idx] = static_cast<T>(acc[j]);
+          acc[j] += static_cast<float>(reg[j]) * weight;
         }
       }
+
+      vec_t store;
+#pragma unroll
+      for (int j = 0; j < ElemsPerItem; ++j) {
+        store[j] = static_cast<T>(acc[j]);
       }
+      *(reinterpret_cast<vec_t*>(output_ + out_offset + offset)) = store;
     }
   }
   const T* input_;
@@ -806,7 +657,11 @@ void apply_shuffle_mul_sum_impl(
       dispatch_apply_shuffle_mul_sum_topk<T, T1, 16384>(input, output, dst2src_map, factors, out_tkns, queue, topk);
       break;
     default:
-      TORCH_CHECK(false, "Unsupported hidden_dim value: ", out_hidden_dims, ". Supported values are 640, 1024, 1280, 1536, 1792, 2880, 3584, 4096, 8192, 16384.");
+      TORCH_CHECK(
+          false,
+          "Unsupported hidden_dim value: ",
+          out_hidden_dims,
+          ". Supported values are 640, 1024, 1280, 1536, 1792, 2880, 3584, 4096, 8192, 16384.");
       break;
   }
   return;

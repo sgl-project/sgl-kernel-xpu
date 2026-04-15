@@ -145,3 +145,67 @@ def test_prepare_input_moe(num_tokens, num_experts, top_k, hidden_dims, dtype):
     )
     # of same order as in input
     torch.testing.assert_allclose(input_merge_xpu.to("cpu"), input_tensor)
+
+    input_merge_no_factors_xpu = torch.empty(
+        (num_tokens, hidden_dims), dtype=dtype, device=device
+    )
+    apply_shuffle_mul_sum(
+        output_tensor_xpu, input_merge_no_factors_xpu, output_permutation_xpu, None
+    )
+    torch.testing.assert_allclose(
+        input_merge_no_factors_xpu.to("cpu"), input_tensor * top_k
+    )
+
+
+def test_apply_shuffle_mul_sum_without_factors_regression():
+    device = "xpu"
+    dtype = torch.bfloat16
+    num_tokens = 16
+    hidden_dims = 256
+    top_k = 4
+    num_experts = 8
+
+    torch.manual_seed(0)
+
+    topk_ids = torch.stack(
+        [torch.randperm(num_experts, dtype=torch.int32)[:top_k] for _ in range(num_tokens)]
+    )
+    routing_size = num_tokens * top_k
+
+    expert_offsets = torch.empty((num_experts,), dtype=torch.int32, device=device)
+    problem_sizes1 = torch.empty((num_experts * 3,), dtype=torch.int32, device=device)
+    problem_sizes2 = torch.empty((num_experts * 3,), dtype=torch.int32, device=device)
+    input_permutation = torch.empty((routing_size,), dtype=torch.int32, device=device)
+    output_permutation = torch.empty((routing_size,), dtype=torch.int32, device=device)
+
+    prepare_moe_input(
+        topk_ids.to(device),
+        expert_offsets,
+        problem_sizes1,
+        problem_sizes2,
+        input_permutation,
+        output_permutation,
+        num_experts,
+        hidden_dims,
+        top_k,
+    )
+
+    hidden_states = torch.randn(num_tokens, hidden_dims, dtype=dtype, device=device)
+    shuffled_hidden_states = torch.empty(
+        (routing_size, hidden_dims), dtype=dtype, device=device
+    )
+    combined_hidden_states = torch.empty(
+        (num_tokens, hidden_dims), dtype=dtype, device=device
+    )
+
+    scatter_tokens_to_experts(
+        hidden_states, output_permutation, shuffled_hidden_states
+    )
+    apply_shuffle_mul_sum(
+        shuffled_hidden_states, combined_hidden_states, output_permutation, None
+    )
+
+    torch.testing.assert_allclose(
+        combined_hidden_states.to("cpu"),
+        (hidden_states * top_k).to("cpu"),
+    )

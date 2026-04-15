@@ -321,8 +321,8 @@ void prepare_moe_input(
 
 // Scatter kernel: 1 WG per source token, reads token once, scatters to topk destinations.
 // Equivalent to IPEX MoEScatter but uses precomputed src2dst_map (c_map / output_permutation).
-template <typename T>
-struct ScatterTokensToExperts {
+template <typename T, int TOPK = 0, int HIDDEN_DIM = 0>
+struct ScatterTokensToExperts : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr int WGSize = 256;
   static constexpr int ElemsPerItem = sizeof(float) * 4 / sizeof(T);  // 4 for bf16/fp16
   static constexpr int Stride = WGSize * ElemsPerItem;
@@ -332,27 +332,83 @@ struct ScatterTokensToExperts {
       const T* input, T* output, const int32_t* src2dst_map, const int32_t topk, const int32_t hidden_dim)
       : input_(input), output_(output), src2dst_map_(src2dst_map), topk_(topk), hidden_dim_(hidden_dim) {}
 
+  void sycl_ker_config_convention(sycl::handler& cgh) {
+    dst_rows_ = sycl::local_accessor<int32_t>(sycl::range<1>(TOPK > 0 ? TOPK : topk_), cgh);
+  }
+
   [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
-    int token_id = item.get_group(0);
-    int local_id = item.get_local_linear_id();
+    const int token_id = item.get_group(0);
+    const int local_id = item.get_local_linear_id();
+    const int active_topk = TOPK > 0 ? TOPK : topk_;
+    const int active_hidden_dim = HIDDEN_DIM > 0 ? HIDDEN_DIM : hidden_dim_;
 
-    // Load topk destination row indices for this token (loop-invariant)
-    int dst_rows[MAX_TOPK];
-    for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
-      dst_rows[k] = src2dst_map_[token_id * topk_ + k];
+    if (local_id < active_topk) {
+      dst_rows_[local_id] = src2dst_map_[token_id * topk_ + local_id];
     }
+    item.barrier(sycl::access::fence_space::local_space);
 
-    // Source base pointer (sequential, coalesced reads)
-    const T* src_base = input_ + token_id * hidden_dim_ + local_id * ElemsPerItem;
+    using vec_t = sycl::vec<T, ElemsPerItem>;
+    const int token_offset = token_id * active_hidden_dim;
 
-    const int loop_count = (hidden_dim_ + Stride - 1) / Stride;
-    for (int loop = 0; loop < loop_count; ++loop) {
-      if (loop * Stride + local_id * ElemsPerItem < hidden_dim_) {
-        using vec_t = sycl::vec<T, ElemsPerItem>;
-        vec_t data = *(reinterpret_cast<const vec_t*>(src_base + loop * Stride));
-        for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
-          T* dst = output_ + dst_rows[k] * hidden_dim_ + local_id * ElemsPerItem + loop * Stride;
-          *(reinterpret_cast<vec_t*>(dst)) = data;
+    if constexpr (HIDDEN_DIM > 0) {
+      static_assert(HIDDEN_DIM % ElemsPerItem == 0, "specialized hidden dimensions must align with vector width");
+      constexpr int max_tiles = (HIDDEN_DIM + Stride - 1) / Stride;
+#pragma unroll
+      for (int tile = 0; tile < max_tiles; ++tile) {
+        const int offset = local_id * ElemsPerItem + tile * Stride;
+        if (offset >= HIDDEN_DIM) {
+          continue;
+        }
+        vec_t data = *(reinterpret_cast<const vec_t*>(input_ + token_offset + offset));
+        if constexpr (TOPK > 0) {
+#pragma unroll
+          for (int k = 0; k < TOPK; ++k) {
+            T* dst = output_ + dst_rows_[k] * HIDDEN_DIM + offset;
+            *(reinterpret_cast<vec_t*>(dst)) = data;
+          }
+        } else {
+          for (int k = 0; k < active_topk; ++k) {
+            T* dst = output_ + dst_rows_[k] * HIDDEN_DIM + offset;
+            *(reinterpret_cast<vec_t*>(dst)) = data;
+          }
+        }
+      }
+    } else {
+      for (int offset = local_id * ElemsPerItem; offset < active_hidden_dim; offset += Stride) {
+        const int remaining = active_hidden_dim - offset;
+        if (remaining >= ElemsPerItem) {
+          vec_t data = *(reinterpret_cast<const vec_t*>(input_ + token_offset + offset));
+          if constexpr (TOPK > 0) {
+#pragma unroll
+            for (int k = 0; k < TOPK; ++k) {
+              T* dst = output_ + dst_rows_[k] * active_hidden_dim + offset;
+              *(reinterpret_cast<vec_t*>(dst)) = data;
+            }
+          } else {
+            for (int k = 0; k < active_topk; ++k) {
+              T* dst = output_ + dst_rows_[k] * active_hidden_dim + offset;
+              *(reinterpret_cast<vec_t*>(dst)) = data;
+            }
+          }
+        } else {
+#pragma unroll
+          for (int j = 0; j < ElemsPerItem; ++j) {
+            const int idx = offset + j;
+            if (idx >= active_hidden_dim) {
+              break;
+            }
+            const T value = input_[token_offset + idx];
+            if constexpr (TOPK > 0) {
+#pragma unroll
+              for (int k = 0; k < TOPK; ++k) {
+                output_[dst_rows_[k] * active_hidden_dim + idx] = value;
+              }
+            } else {
+              for (int k = 0; k < active_topk; ++k) {
+                output_[dst_rows_[k] * active_hidden_dim + idx] = value;
+              }
+            }
+          }
         }
       }
     }
@@ -363,24 +419,19 @@ struct ScatterTokensToExperts {
   const int32_t* src2dst_map_;
   const int32_t topk_;
   const int32_t hidden_dim_;
+  sycl::local_accessor<int32_t> dst_rows_;
 };
 
-template <typename T>
-void scatter_tokens_to_experts_impl(
-    const torch::Tensor& input_tensor, const torch::Tensor& src2dst_map, torch::Tensor& output_tensor) {
-  auto input = reinterpret_cast<T*>(input_tensor.data_ptr());
-  auto src2dst = reinterpret_cast<const int32_t*>(src2dst_map.data_ptr());
-  auto output = reinterpret_cast<T*>(output_tensor.data_ptr());
-
-  uint32_t num_tokens = input_tensor.size(0);
-  uint32_t num_dest_rows = output_tensor.size(0);
-  uint32_t hidden_dim = input_tensor.size(1);
-  int32_t topk = static_cast<int32_t>(num_dest_rows / num_tokens);
-
-  auto stream = at::xpu::getCurrentXPUStream();
-  auto queue = stream.queue();
-
-  using Kernel = ScatterTokensToExperts<T>;
+template <typename T, int TOPK, int HIDDEN_DIM>
+void launch_scatter_tokens_to_experts_impl(
+    const T* input,
+    T* output,
+    const int32_t* src2dst,
+    const uint32_t num_tokens,
+    const int32_t topk,
+    const uint32_t hidden_dim,
+    sycl::queue& queue) {
+  using Kernel = ScatterTokensToExperts<T, TOPK, HIDDEN_DIM>;
   sycl::range<1> global_range{num_tokens * Kernel::WGSize};
   sycl::range<1> local_range{Kernel::WGSize};
 
@@ -388,8 +439,100 @@ void scatter_tokens_to_experts_impl(
   sycl_kernel_submit(global_range, local_range, queue, task);
 }
 
+template <typename T, int HIDDEN_DIM>
+void dispatch_scatter_tokens_to_experts_topk(
+    const T* input,
+    T* output,
+    const int32_t* src2dst,
+    const uint32_t num_tokens,
+    const int32_t topk,
+    const uint32_t hidden_dim,
+    sycl::queue& queue) {
+  switch (topk) {
+    case 1:
+      launch_scatter_tokens_to_experts_impl<T, 1, HIDDEN_DIM>(input, output, src2dst, num_tokens, topk, hidden_dim, queue);
+      break;
+    case 2:
+      launch_scatter_tokens_to_experts_impl<T, 2, HIDDEN_DIM>(input, output, src2dst, num_tokens, topk, hidden_dim, queue);
+      break;
+    case 4:
+      launch_scatter_tokens_to_experts_impl<T, 4, HIDDEN_DIM>(input, output, src2dst, num_tokens, topk, hidden_dim, queue);
+      break;
+    case 6:
+      launch_scatter_tokens_to_experts_impl<T, 6, HIDDEN_DIM>(input, output, src2dst, num_tokens, topk, hidden_dim, queue);
+      break;
+    case 8:
+      launch_scatter_tokens_to_experts_impl<T, 8, HIDDEN_DIM>(input, output, src2dst, num_tokens, topk, hidden_dim, queue);
+      break;
+    default:
+      launch_scatter_tokens_to_experts_impl<T, 0, HIDDEN_DIM>(input, output, src2dst, num_tokens, topk, hidden_dim, queue);
+      break;
+  }
+}
+
+template <typename T>
+void scatter_tokens_to_experts_impl(
+    const torch::Tensor& input_tensor, const torch::Tensor& src2dst_map, torch::Tensor& output_tensor) {
+  const auto* input = reinterpret_cast<const T*>(input_tensor.data_ptr());
+  auto src2dst = reinterpret_cast<const int32_t*>(src2dst_map.data_ptr());
+  auto output = reinterpret_cast<T*>(output_tensor.data_ptr());
+
+  const uint32_t num_tokens = input_tensor.size(0);
+  const uint32_t num_dest_rows = output_tensor.size(0);
+  const uint32_t hidden_dim = input_tensor.size(1);
+
+  TORCH_CHECK(num_tokens > 0, "input_tensor must have at least one token");
+  TORCH_CHECK(num_dest_rows % num_tokens == 0, "output_tensor rows must be a multiple of input_tensor rows");
+
+  const int32_t topk = static_cast<int32_t>(num_dest_rows / num_tokens);
+  TORCH_CHECK(topk > 0 && topk <= ScatterTokensToExperts<T>::MAX_TOPK, "topk must be in [1, 16]");
+
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
+
+  switch (hidden_dim) {
+    case 16:
+      dispatch_scatter_tokens_to_experts_topk<T, 16>(input, output, src2dst, num_tokens, topk, hidden_dim, queue);
+      break;
+    case 32:
+      dispatch_scatter_tokens_to_experts_topk<T, 32>(input, output, src2dst, num_tokens, topk, hidden_dim, queue);
+      break;
+    case 64:
+      dispatch_scatter_tokens_to_experts_topk<T, 64>(input, output, src2dst, num_tokens, topk, hidden_dim, queue);
+      break;
+    case 128:
+      dispatch_scatter_tokens_to_experts_topk<T, 128>(input, output, src2dst, num_tokens, topk, hidden_dim, queue);
+      break;
+    case 1024:
+      dispatch_scatter_tokens_to_experts_topk<T, 1024>(input, output, src2dst, num_tokens, topk, hidden_dim, queue);
+      break;
+    case 1280:
+      dispatch_scatter_tokens_to_experts_topk<T, 1280>(input, output, src2dst, num_tokens, topk, hidden_dim, queue);
+      break;
+    case 1536:
+      dispatch_scatter_tokens_to_experts_topk<T, 1536>(input, output, src2dst, num_tokens, topk, hidden_dim, queue);
+      break;
+    case 2880:
+      dispatch_scatter_tokens_to_experts_topk<T, 2880>(input, output, src2dst, num_tokens, topk, hidden_dim, queue);
+      break;
+    case 3584:
+      dispatch_scatter_tokens_to_experts_topk<T, 3584>(input, output, src2dst, num_tokens, topk, hidden_dim, queue);
+      break;
+    case 4096:
+      dispatch_scatter_tokens_to_experts_topk<T, 4096>(input, output, src2dst, num_tokens, topk, hidden_dim, queue);
+      break;
+    case 8192:
+      dispatch_scatter_tokens_to_experts_topk<T, 8192>(input, output, src2dst, num_tokens, topk, hidden_dim, queue);
+      break;
+    default:
+      dispatch_scatter_tokens_to_experts_topk<T, 0>(input, output, src2dst, num_tokens, topk, hidden_dim, queue);
+      break;
+  }
+}
+
 void scatter_tokens_to_experts(
     const torch::Tensor& input_tensor, const torch::Tensor& src2dst_map, torch::Tensor& output_tensor) {
+  TORCH_CHECK(src2dst_map.scalar_type() == at::ScalarType::Int, "src2dst_map must have dtype int32");
   TORCH_CHECK(
       input_tensor.scalar_type() == output_tensor.scalar_type(),
       "Input and output tensors must have the same data type");
@@ -401,8 +544,8 @@ void scatter_tokens_to_experts(
       [&]() { scatter_tokens_to_experts_impl<scalar_t>(input_tensor, src2dst_map, output_tensor); });
 }
 
-template <typename T, typename T1>
-struct ApplyShuffleMulSum {
+template <typename T, typename T1, int TOPK = 0, int HIDDEN_DIM = 0>
+struct ApplyShuffleMulSum : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr int WGSize = 256;
   static constexpr int ElemsPerItem = sizeof(float) * 4 / sizeof(T);  // 4 for bf16/fp16
   static constexpr int Stride = WGSize * ElemsPerItem;
@@ -422,42 +565,151 @@ struct ApplyShuffleMulSum {
         topk_(topk),
         hidden_dim_(hidden_dim) {}
 
+  void sycl_ker_config_convention(sycl::handler& cgh) {
+    const size_t topk_storage = TOPK > 0 ? TOPK : topk_;
+    src_indices_ = sycl::local_accessor<int32_t>(sycl::range<1>(topk_storage), cgh);
+    weights_ = sycl::local_accessor<float>(sycl::range<1>(topk_storage), cgh);
+  }
+
   [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
-    int out_tkn_id = item.get_group(0);
-    int local_id = item.get_local_linear_id();
+    const int out_tkn_id = item.get_group(0);
+    const int local_id = item.get_local_linear_id();
+    const int active_topk = TOPK > 0 ? TOPK : topk_;
+    const int active_hidden_dim = HIDDEN_DIM > 0 ? HIDDEN_DIM : hidden_dim_;
 
-    // Preload src row indices and weights (loop-invariant over hidden dim)
-    int src_indices[MAX_TOPK];
-    float weights[MAX_TOPK];
-    for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
-      src_indices[k] = static_cast<int>(dst2src_map_[out_tkn_id * topk_ + k]);
-      weights[k] = (factors_ != nullptr) ? static_cast<float>(factors_[out_tkn_id * topk_ + k]) : 0.0f;
+    if (local_id < active_topk) {
+      const int map_index = out_tkn_id * topk_ + local_id;
+      src_indices_[local_id] = dst2src_map_[map_index];
+      weights_[local_id] = factors_ != nullptr ? static_cast<float>(factors_[map_index]) : 1.0f;
     }
+    item.barrier(sycl::access::fence_space::local_space);
 
-    T* dst_base = output_ + out_tkn_id * hidden_dim_ + local_id * ElemsPerItem;
-    const int loop_count = (hidden_dim_ + Stride - 1) / Stride;
+    using vec_t = sycl::vec<T, ElemsPerItem>;
+    const int out_offset = out_tkn_id * active_hidden_dim;
 
-    for (int loop = 0; loop < loop_count; ++loop) {
-      if (loop * Stride + local_id * ElemsPerItem < hidden_dim_) {
-        // Float accumulator for better precision and perf
+    if constexpr (HIDDEN_DIM > 0) {
+      static_assert(HIDDEN_DIM % ElemsPerItem == 0, "specialized hidden dimensions must align with vector width");
+      constexpr int max_tiles = (HIDDEN_DIM + Stride - 1) / Stride;
+#pragma unroll
+      for (int tile = 0; tile < max_tiles; ++tile) {
+        const int offset = local_id * ElemsPerItem + tile * Stride;
+        if (offset >= HIDDEN_DIM) {
+          continue;
+        }
         sycl::vec<float, ElemsPerItem> acc;
-        for (int j = 0; j < ElemsPerItem; ++j)
+#pragma unroll
+        for (int j = 0; j < ElemsPerItem; ++j) {
           acc[j] = 0.0f;
+        }
 
-        for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
-          const T* src = input_ + src_indices[k] * hidden_dim_ + local_id * ElemsPerItem + loop * Stride;
-          using vec_t = sycl::vec<T, ElemsPerItem>;
-          vec_t reg = *(reinterpret_cast<const vec_t*>(src));
-          for (int j = 0; j < ElemsPerItem; ++j) {
-            acc[j] += static_cast<float>(reg[j]) * weights[k];
+        if constexpr (TOPK > 0) {
+#pragma unroll
+          for (int k = 0; k < TOPK; ++k) {
+            const vec_t reg = *(reinterpret_cast<const vec_t*>(input_ + src_indices_[k] * HIDDEN_DIM + offset));
+            const float weight = weights_[k];
+#pragma unroll
+            for (int j = 0; j < ElemsPerItem; ++j) {
+              acc[j] += static_cast<float>(reg[j]) * weight;
+            }
+          }
+        } else {
+          for (int k = 0; k < active_topk; ++k) {
+            const vec_t reg = *(reinterpret_cast<const vec_t*>(input_ + src_indices_[k] * HIDDEN_DIM + offset));
+            const float weight = weights_[k];
+#pragma unroll
+            for (int j = 0; j < ElemsPerItem; ++j) {
+              acc[j] += static_cast<float>(reg[j]) * weight;
+            }
           }
         }
 
-        using vec_t = sycl::vec<T, ElemsPerItem>;
         vec_t store;
-        for (int j = 0; j < ElemsPerItem; ++j)
+#pragma unroll
+        for (int j = 0; j < ElemsPerItem; ++j) {
           store[j] = static_cast<T>(acc[j]);
-        *(reinterpret_cast<vec_t*>(dst_base + loop * Stride)) = store;
+        }
+        *(reinterpret_cast<vec_t*>(output_ + out_offset + offset)) = store;
+      }
+    } else {
+      for (int offset = local_id * ElemsPerItem; offset < active_hidden_dim; offset += Stride) {
+        const int remaining = active_hidden_dim - offset;
+        if (remaining >= ElemsPerItem) {
+          sycl::vec<float, ElemsPerItem> acc;
+#pragma unroll
+          for (int j = 0; j < ElemsPerItem; ++j) {
+            acc[j] = 0.0f;
+          }
+
+          if constexpr (TOPK > 0) {
+#pragma unroll
+            for (int k = 0; k < TOPK; ++k) {
+              const vec_t reg = *(reinterpret_cast<const vec_t*>(input_ + src_indices_[k] * active_hidden_dim + offset));
+              const float weight = weights_[k];
+#pragma unroll
+              for (int j = 0; j < ElemsPerItem; ++j) {
+                acc[j] += static_cast<float>(reg[j]) * weight;
+              }
+            }
+          } else {
+            for (int k = 0; k < active_topk; ++k) {
+              const vec_t reg = *(reinterpret_cast<const vec_t*>(input_ + src_indices_[k] * active_hidden_dim + offset));
+              const float weight = weights_[k];
+#pragma unroll
+              for (int j = 0; j < ElemsPerItem; ++j) {
+                acc[j] += static_cast<float>(reg[j]) * weight;
+              }
+            }
+          }
+
+          vec_t store;
+#pragma unroll
+          for (int j = 0; j < ElemsPerItem; ++j) {
+            store[j] = static_cast<T>(acc[j]);
+          }
+          *(reinterpret_cast<vec_t*>(output_ + out_offset + offset)) = store;
+        } else {
+        float acc[ElemsPerItem];
+#pragma unroll
+        for (int j = 0; j < ElemsPerItem; ++j) {
+          acc[j] = 0.0f;
+        }
+
+        if constexpr (TOPK > 0) {
+#pragma unroll
+          for (int k = 0; k < TOPK; ++k) {
+            const float weight = weights_[k];
+#pragma unroll
+            for (int j = 0; j < ElemsPerItem; ++j) {
+              const int idx = offset + j;
+              if (idx >= active_hidden_dim) {
+                break;
+              }
+              acc[j] += static_cast<float>(input_[src_indices_[k] * active_hidden_dim + idx]) * weight;
+            }
+          }
+        } else {
+          for (int k = 0; k < active_topk; ++k) {
+            const float weight = weights_[k];
+#pragma unroll
+            for (int j = 0; j < ElemsPerItem; ++j) {
+              const int idx = offset + j;
+              if (idx >= active_hidden_dim) {
+                break;
+              }
+              acc[j] += static_cast<float>(input_[src_indices_[k] * active_hidden_dim + idx]) * weight;
+            }
+          }
+        }
+
+#pragma unroll
+        for (int j = 0; j < ElemsPerItem; ++j) {
+          const int idx = offset + j;
+          if (idx >= active_hidden_dim) {
+            break;
+          }
+          output_[out_offset + idx] = static_cast<T>(acc[j]);
+        }
+      }
       }
     }
   }
@@ -467,7 +719,60 @@ struct ApplyShuffleMulSum {
   const T1* factors_;
   const int32_t topk_;
   const int32_t hidden_dim_;
+  sycl::local_accessor<int32_t> src_indices_;
+  sycl::local_accessor<float> weights_;
 };
+
+template <typename T, typename T1, int TOPK, int HIDDEN_DIM>
+void launch_apply_shuffle_mul_sum_impl(
+    const T* input,
+    T* output,
+    const int32_t* dst2src_map,
+    const T1* factors,
+    const uint32_t out_tkns,
+    const uint32_t out_hidden_dims,
+    const int topk,
+    sycl::queue& queue) {
+  using Kernel = ApplyShuffleMulSum<T, T1, TOPK, HIDDEN_DIM>;
+
+  sycl::range<1> global_range{out_tkns * Kernel::WGSize};
+  sycl::range<1> local_range{Kernel::WGSize};
+
+  Kernel task(input, output, dst2src_map, factors, topk, out_hidden_dims);
+  sycl_kernel_submit(global_range, local_range, queue, task);
+}
+
+template <typename T, typename T1, int HIDDEN_DIM>
+void dispatch_apply_shuffle_mul_sum_topk(
+    const T* input,
+    T* output,
+    const int32_t* dst2src_map,
+    const T1* factors,
+    const uint32_t out_tkns,
+    const uint32_t out_hidden_dims,
+    const int topk,
+    sycl::queue& queue) {
+  switch (topk) {
+    case 1:
+      launch_apply_shuffle_mul_sum_impl<T, T1, 1, HIDDEN_DIM>(input, output, dst2src_map, factors, out_tkns, out_hidden_dims, topk, queue);
+      break;
+    case 2:
+      launch_apply_shuffle_mul_sum_impl<T, T1, 2, HIDDEN_DIM>(input, output, dst2src_map, factors, out_tkns, out_hidden_dims, topk, queue);
+      break;
+    case 4:
+      launch_apply_shuffle_mul_sum_impl<T, T1, 4, HIDDEN_DIM>(input, output, dst2src_map, factors, out_tkns, out_hidden_dims, topk, queue);
+      break;
+    case 6:
+      launch_apply_shuffle_mul_sum_impl<T, T1, 6, HIDDEN_DIM>(input, output, dst2src_map, factors, out_tkns, out_hidden_dims, topk, queue);
+      break;
+    case 8:
+      launch_apply_shuffle_mul_sum_impl<T, T1, 8, HIDDEN_DIM>(input, output, dst2src_map, factors, out_tkns, out_hidden_dims, topk, queue);
+      break;
+    default:
+      launch_apply_shuffle_mul_sum_impl<T, T1, 0, HIDDEN_DIM>(input, output, dst2src_map, factors, out_tkns, out_hidden_dims, topk, queue);
+      break;
+  }
+}
 
 template <typename T, typename T1>
 void apply_shuffle_mul_sum_impl(
@@ -481,14 +786,47 @@ void apply_shuffle_mul_sum_impl(
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
 
-  using Kernel = ApplyShuffleMulSum<T, T1>;
+  constexpr int max_topk = ApplyShuffleMulSum<T, T1, 0>::MAX_TOPK;
+  TORCH_CHECK(topk > 0 && topk <= max_topk, "topk must be in [1, 16]");
 
-  sycl::range<1> global_range{out_tkns * Kernel::WGSize};
-  sycl::range<1> local_range{Kernel::WGSize};
-
-  Kernel task(input, output, dst2src_map, factors, topk, out_hidden_dims);
-
-  sycl_kernel_submit(global_range, local_range, queue, task);
+  switch (out_hidden_dims) {
+    case 16:
+      dispatch_apply_shuffle_mul_sum_topk<T, T1, 16>(input, output, dst2src_map, factors, out_tkns, out_hidden_dims, topk, queue);
+      break;
+    case 32:
+      dispatch_apply_shuffle_mul_sum_topk<T, T1, 32>(input, output, dst2src_map, factors, out_tkns, out_hidden_dims, topk, queue);
+      break;
+    case 64:
+      dispatch_apply_shuffle_mul_sum_topk<T, T1, 64>(input, output, dst2src_map, factors, out_tkns, out_hidden_dims, topk, queue);
+      break;
+    case 128:
+      dispatch_apply_shuffle_mul_sum_topk<T, T1, 128>(input, output, dst2src_map, factors, out_tkns, out_hidden_dims, topk, queue);
+      break;
+    case 1024:
+      dispatch_apply_shuffle_mul_sum_topk<T, T1, 1024>(input, output, dst2src_map, factors, out_tkns, out_hidden_dims, topk, queue);
+      break;
+    case 1280:
+      dispatch_apply_shuffle_mul_sum_topk<T, T1, 1280>(input, output, dst2src_map, factors, out_tkns, out_hidden_dims, topk, queue);
+      break;
+    case 1536:
+      dispatch_apply_shuffle_mul_sum_topk<T, T1, 1536>(input, output, dst2src_map, factors, out_tkns, out_hidden_dims, topk, queue);
+      break;
+    case 2880:
+      dispatch_apply_shuffle_mul_sum_topk<T, T1, 2880>(input, output, dst2src_map, factors, out_tkns, out_hidden_dims, topk, queue);
+      break;
+    case 3584:
+      dispatch_apply_shuffle_mul_sum_topk<T, T1, 3584>(input, output, dst2src_map, factors, out_tkns, out_hidden_dims, topk, queue);
+      break;
+    case 4096:
+      dispatch_apply_shuffle_mul_sum_topk<T, T1, 4096>(input, output, dst2src_map, factors, out_tkns, out_hidden_dims, topk, queue);
+      break;
+    case 8192:
+      dispatch_apply_shuffle_mul_sum_topk<T, T1, 8192>(input, output, dst2src_map, factors, out_tkns, out_hidden_dims, topk, queue);
+      break;
+    default:
+      dispatch_apply_shuffle_mul_sum_topk<T, T1, 0>(input, output, dst2src_map, factors, out_tkns, out_hidden_dims, topk, queue);
+      break;
+  }
   return;
 }
 
@@ -497,8 +835,13 @@ void apply_shuffle_mul_sum(
     torch::Tensor& output,
     const torch::Tensor& permutation,
     const std::optional<torch::Tensor>& factors) {
-  int m = output.size(0);
-  int topk = int(permutation.size(0) / m);
+  TORCH_CHECK(permutation.scalar_type() == at::ScalarType::Int, "permutation must have dtype int32");
+
+  const int m = output.size(0);
+  TORCH_CHECK(m > 0, "output must have at least one row");
+  TORCH_CHECK(permutation.size(0) % m == 0, "permutation length must be a multiple of output rows");
+
+  const int topk = int(permutation.size(0) / m);
 
   SYCL_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::BFloat16, at::ScalarType::Half, input.scalar_type(), "apply_shuffle_mul_sum", [&]() {

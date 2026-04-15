@@ -46,6 +46,44 @@
 
 namespace {
 
+/// Compute optimal split-KV count based on page_size and base parallelism.
+///
+/// Derived from exhaustive tests on BMG :
+///   - batch_size: 1, 4, 16
+///   - seq_len: 1024, 2048, 4096, 8192
+///   - num_heads: 16, 32, 64, 128
+///   - page_size: 16, 32, 64, 128
+///   - num_kv_splits: 1, 2, 4, 8, 10, 16, 20, 24, 30, 36, 48, 64
+/// TODO: find a same optimal kv_split formula (ref:src/sycl/flash_attention.cpp[get_num_splits]), when entire mla is
+/// optimized.
+int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int64_t page_size) {
+  int base_parallel = batch * num_heads_q;
+  int total_pages = (seq_len_kv + page_size - 1) / page_size;
+
+  int kv_per_split;
+  if (page_size <= 16) {
+    kv_per_split = (base_parallel <= 64) ? 256 : 128;
+  } else if (page_size <= 32) {
+    kv_per_split = (base_parallel <= 64) ? 192 : 64;
+  } else if (page_size <= 64) {
+    kv_per_split = (base_parallel <= 64) ? 128 : 64;
+  } else {
+    kv_per_split = page_size;
+  }
+
+  int pages_per_split = std::max(1, kv_per_split / static_cast<int>(page_size));
+  int num_splits = std::max(1, total_pages / pages_per_split);
+  num_splits = std::min(num_splits, total_pages);
+
+  if (batch == 1 && num_heads_q > total_pages) {
+    int ratio = static_cast<int>(num_heads_q) / total_pages;
+    int capped_splits = std::max(2, num_splits / ratio);
+    num_splits = std::min(num_splits, capped_splits);
+  }
+
+  return std::max(1, num_splits);
+}
+
 #define DISPATCH_MLA_PAGE_SIZE(ELEM)                                                                           \
   do {                                                                                                         \
     switch (page_size) {                                                                                       \
@@ -110,7 +148,6 @@ void flash_mla_decode(
 
   auto in_dtype = q_nope.scalar_type();
 
-  TORCH_CHECK(num_kv_splits <= 1, "Manual KV splits are not supported yet.");
   TORCH_CHECK(
       in_dtype == at::ScalarType::Half || in_dtype == at::ScalarType::BFloat16,
       "Unsupported input data type for MLA decode");
@@ -120,22 +157,72 @@ void flash_mla_decode(
       page_size,
       ". Supported: 16, 32, 64, 128");
 
+  if (num_kv_splits < 1) {
+    int page_count_per_seq = page_table.size(1);
+    int max_seq_len = page_size * page_count_per_seq;
+    num_kv_splits = set_split_kv(q_nope.size(0), q_nope.size(1), max_seq_len, page_size);
+  }
+
   DISPATCH_MLA_DTYPE();
 }
 
 #undef DISPATCH_MLA_PAGE_SIZE
 #undef DISPATCH_MLA_DTYPE
 
-int64_t
-flash_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches, int64_t sm_count, int64_t num_kv_splits) {
-  // Workspace size depends on ElementAcc and ElementLSE (same as ElementAcc)
-  // which are float, so Element type here doesn't matter.
-  using MlaXeType = MlaXe<sycl::half>;
-  typename MlaXeType::Fmla::Arguments arguments;
-  //
-  // TODO: support manual kv splits
-  //
-  return MlaXeType::Fmla::get_workspace_size(arguments);
+namespace {
+template <typename MlaXeType>
+int64_t mla_workspace_size(int64_t num_batches, int64_t num_heads, int64_t num_kv_splits) {
+  typename MlaXeType::Fmla::Arguments args{};
+  args.kernel.shape.batch = num_batches;
+  args.kernel.shape.num_heads_q = num_heads;
+  args.kernel.shape.head_size_o = 512;
+  args.split_kv = num_kv_splits;
+  return MlaXeType::Fmla::get_workspace_size(args);
+}
+}  // namespace
+
+int64_t flash_mla_get_workspace_size(
+    int64_t max_seq_len, int64_t num_batches, int64_t num_heads, int64_t page_size, int64_t num_kv_splits) {
+  if (num_kv_splits < 1) {
+    num_kv_splits = set_split_kv(num_batches, num_heads, max_seq_len, page_size);
+  }
+  if (num_kv_splits == 1) {
+    switch (page_size) {
+      case 16:
+        return mla_workspace_size<MlaXe<cutlass::half_t, PageSizeOption<16>, EnabledSplitKV<false>>>(
+            num_batches, num_heads, num_kv_splits);
+      case 32:
+        return mla_workspace_size<MlaXe<cutlass::half_t, PageSizeOption<32>, EnabledSplitKV<false>>>(
+            num_batches, num_heads, num_kv_splits);
+      case 64:
+        return mla_workspace_size<MlaXe<cutlass::half_t, PageSizeOption<64>, EnabledSplitKV<false>>>(
+            num_batches, num_heads, num_kv_splits);
+      case 128:
+        return mla_workspace_size<MlaXe<cutlass::half_t, PageSizeOption<128>, EnabledSplitKV<false>>>(
+            num_batches, num_heads, num_kv_splits);
+      default:
+        TORCH_CHECK(false, "Unsupported page size: ", page_size);
+        return 0;
+    }
+  } else {
+    switch (page_size) {
+      case 16:
+        return mla_workspace_size<MlaXe<cutlass::half_t, PageSizeOption<16>, EnabledSplitKV<true>>>(
+            num_batches, num_heads, num_kv_splits);
+      case 32:
+        return mla_workspace_size<MlaXe<cutlass::half_t, PageSizeOption<32>, EnabledSplitKV<true>>>(
+            num_batches, num_heads, num_kv_splits);
+      case 64:
+        return mla_workspace_size<MlaXe<cutlass::half_t, PageSizeOption<64>, EnabledSplitKV<true>>>(
+            num_batches, num_heads, num_kv_splits);
+      case 128:
+        return mla_workspace_size<MlaXe<cutlass::half_t, PageSizeOption<128>, EnabledSplitKV<true>>>(
+            num_batches, num_heads, num_kv_splits);
+      default:
+        TORCH_CHECK(false, "Unsupported page size: ", page_size);
+        return 0;
+    }
+  }
 }
 
 #undef SYCL_INTEL_TARGET

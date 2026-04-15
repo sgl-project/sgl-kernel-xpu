@@ -37,6 +37,7 @@
 
 #include <c10/xpu/XPUStream.h>
 
+#include <cmath>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <sycl/sycl.hpp>
 
@@ -45,12 +46,10 @@
 #include "cutlass/util/sycl_event_manager.hpp"
 #include "sycl/comm/common.h"
 #include "sycl/kernels/mla/kernel/xe_mla_kernel.hpp"
+#include "sycl/kernels/mla/kernel/xe_mla_reduce_split_kv.hpp"
 
 namespace cutlass::flash_attention::device {
 using namespace cute;
-
-template <typename Kernel>
-class KernelCur {};
 
 ////////////////////////////////////////////////////////////////////////////////
 template <class Kernel_>
@@ -63,13 +62,17 @@ class MLA {
   using KernelArguments = typename Kernel::KernelArguments;
   using Arguments = typename Kernel::Arguments;
   using KernelParams = typename Kernel::Params;
-  //
-  // Params
-  //
+
+  using ProblemShape = typename Kernel::ProblemShape;
+  using ReductionScheduler = cutlass::flash_attention::kernel::XeMlaReduceSplitKScheduler;
+  using ReductionKernel =
+      cutlass::flash_attention::kernel::XeMlaReduceSplitKV<ProblemShape, ReductionScheduler, Kernel>;
+  using ReductionArguments = typename ReductionKernel::Arguments;
+  using ReductionParams = typename ReductionKernel::Params;
+
   struct Params {
     KernelParams fmla_params;
-    Params() = default;
-    explicit Params(KernelParams const& kp) : fmla_params(kp) {}
+    ReductionParams reduction_params;
   };
 
  private:
@@ -102,21 +105,25 @@ class MLA {
     return params_;
   }
 
-  static void set_split_kv(KernelArguments& args) {
-    // TODO: set split_kv in args if needed
-    assert(false && "set_split_kv not implemented yet.");
-    return;
-  }
-
   static cutlass::Status can_implement(Arguments const& args) {
-    return Kernel_::can_implement(args) ? cutlass::Status::kSuccess : cutlass::Status::kErrorInvalidProblem;
-    // return cutlass::Status::kSuccess;
+    if (!Kernel_::can_implement(args)) return cutlass::Status::kErrorInvalidProblem;
+    if constexpr (Kernel::is_split_kv) {
+      ReductionArguments reduce_args{};
+      reduce_args.kernel.shape = args.kernel.shape;
+      reduce_args.num_kv_splits = args.split_kv;
+      if (!ReductionKernel::can_implement(reduce_args)) return cutlass::Status::kErrorInvalidProblem;
+    }
+    return cutlass::Status::kSuccess;
   }
 
   static size_t get_workspace_size(Arguments const& args) {
     size_t workspace_bytes = 0;
     workspace_bytes += Kernel::get_workspace_size(args);
-    // TODO: add Reduction workspace size when splitkv > 1
+    if constexpr (Kernel::is_split_kv) {
+      ReductionArguments reduce_args{};
+      reduce_args.num_kv_splits = args.split_kv;
+      workspace_bytes += ReductionKernel::get_workspace_size(reduce_args);
+    }
     return workspace_bytes;
   }
 
@@ -126,11 +133,32 @@ class MLA {
 
   cutlass::Status initialize(
       Arguments const& args, void* workspace = nullptr, sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
-    // Initialize the workspace
-    CUTLASS_CHECK(Kernel::initialize_workspace(args, workspace));
+    int split_kv = args.split_kv;
+    if constexpr (!Kernel::is_split_kv) {
+      // Non-split path
+      CUTLASS_CHECK(Kernel::initialize_workspace(args, workspace));
+      params_.fmla_params = Kernel::to_underlying_arguments(args, workspace);
+    } else {
+      // Split-KV path: compute workspace layout and set up both kernel params
+      auto const& s = args.kernel.shape;
+      // Construct split-KV main kernel arguments
+      params_.fmla_params = Kernel::to_underlying_arguments(args, workspace);
 
-    KernelParams kernel_params = Kernel::to_underlying_arguments(args, workspace);
-    params_ = Params{kernel_params};
+      using StrideO = typename Kernel::StrideO;
+
+      typename ReductionKernel::KernelArguments reduce_kernel_args{};
+      reduce_kernel_args.shape = s;
+      reduce_kernel_args.O = args.kernel.O;
+      reduce_kernel_args.dO = args.kernel.dO;
+      reduce_kernel_args.O_accum = args.kernel.O_accum;
+      reduce_kernel_args.dO_accum = args.kernel.dO_accum;
+      reduce_kernel_args.exp_sums = args.kernel.exp_sums;
+      reduce_kernel_args.max_logits = args.kernel.max_logits;
+      reduce_kernel_args.dLSE = args.kernel.dLSE;
+
+      ReductionArguments reduce_args{reduce_kernel_args, args.hw_info, split_kv};
+      params_.reduction_params = ReductionKernel::to_underlying_arguments(reduce_args, workspace);
+    }
 
     if (is_initialized()) return Status::kSuccess;
 
@@ -149,15 +177,18 @@ class MLA {
     if (workspace_bytes > 0 && nullptr == workspace) {
       return Status::kErrorWorkspaceNull;
     }
-
-    auto fmla_params = Kernel::to_underlying_arguments(args, workspace);
-    params_ = Params{fmla_params};
-
-    return cutlass::Status::kSuccess;
+    return initialize(args, workspace);
   }
 
   static cutlass::Status run(Params& params, sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
-    launch<Kernel, 128>(params.fmla_params);
+    if constexpr (!Kernel::is_split_kv) {
+      // Non-split: launch main kernel only
+      launch<Kernel, 128>(params.fmla_params);
+    } else {
+      // Split-KV: launch split attention kernel + reduction kernel
+      launch<Kernel, 128>(params.fmla_params);
+      launch<ReductionKernel, 128>(params.reduction_params);
+    }
 
     return cutlass::Status::kSuccess;
   }

@@ -161,25 +161,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * Fused QK RoPE (no RMSNorm)
    */
-
-
-  /*
- * Fused QK RoPE (no RMSNorm)
- */
-m.def(
-    "fused_qk_rope(Tensor! qkv, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, "
-    "Tensor! q_weight, Tensor! k_weight, float base, bool is_neox, Tensor! position_ids, "
-    "float factor, float low, float high, float attention_factor, int rotary_dim) -> ()");
-
-#if defined(__has_include)
-  #if __has_include(<ATen/native/xpu/sycl/FusedQKRope.h>)
-    m.impl("fused_qk_rope", torch::kXPU, &at::native::xpu::fused_qk_rope);
-  #else
-    // Symbol not available in this PyTorch XPU build; skip registration.
-  #endif
-#else
-  // Fallback: skip registration if we can't detect header availability.
-#endif
+  m.def(
+      "fused_qk_rope(Tensor! qkv, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, "
+      "Tensor! q_weight, Tensor! k_weight, float base, bool is_neox, Tensor! position_ids, "
+      "float factor, float low, float high, float attention_factor, int rotary_dim) -> ()");
+  m.impl("fused_qk_rope", torch::kXPU, &at::native::xpu::fused_qk_rope);
   /* utils */
   m.def("query_device(int device_id) -> (int, int)");
   m.impl("query_device", c10::DispatchKey::BackendSelect, &query_device);

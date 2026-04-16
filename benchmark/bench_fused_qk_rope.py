@@ -13,6 +13,11 @@ Key differences vs bench_fused_qk_norm_rope.py:
 import itertools
 import os
 
+# Set matplotlib backend to non-interactive to avoid hanging in headless environments
+import matplotlib
+
+matplotlib.use("Agg")
+
 import pandas as pd
 import torch
 import triton

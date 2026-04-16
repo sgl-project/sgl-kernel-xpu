@@ -224,6 +224,7 @@ def fused_moe_torch(
     act_type,
     gemm1_alpha=None,
     gemm1_limit=None,
+    routed_scaling_factor=None,
 ) -> torch.Tensor:
 
     topk_weights, topk_ids = fused_topk_native(
@@ -269,7 +270,12 @@ def fused_moe_torch(
         b2_weights = b2[topk_ids]
         expert_outs = expert_outs.float() + b2_weights.float()
         expert_outs = expert_outs.to(x.dtype)
-    return torch.einsum("tai,ta -> ti", expert_outs, topk_weights.to(expert_outs.dtype))
+    result = torch.einsum(
+        "tai,ta -> ti", expert_outs, topk_weights.to(expert_outs.dtype)
+    )
+    if routed_scaling_factor is not None:
+        result = result * routed_scaling_factor
+    return result
 
 
 def fused_moe_torch_compile(
@@ -288,6 +294,7 @@ def fused_moe_torch_compile(
     act_type=None,
     gemm1_alpha=None,
     gemm1_limit=None,
+    routed_scaling_factor=None,
 ):
     return fused_moe_torch(
         x,
@@ -300,6 +307,7 @@ def fused_moe_torch_compile(
         act_type=act_type,
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
+        routed_scaling_factor=routed_scaling_factor,
     )
 
 
@@ -314,6 +322,7 @@ def fused_moe_sglang_api(
     act_type,
     gemm1_alpha=None,
     gemm1_limit=None,
+    routed_scaling_factor=None,
 ):
     num_tokens = x.shape[0]
     topk_weights = torch.empty(num_tokens, topk, dtype=torch.float32, device=x.device)
@@ -337,6 +346,7 @@ def fused_moe_sglang_api(
             activation=act_type,
             gemm1_alpha=gemm1_alpha,
             gemm1_limit=gemm1_limit,
+            routed_scaling_factor=routed_scaling_factor,
         ),
         topk_indices,
     )
@@ -387,6 +397,8 @@ def benchmark(
     gemm1_alpha,
     gemm1_limit,
 ):
+    routed_scaling_factor = 1.0
+
     print(
         f"benchmark {provider} with {num_tokens=} {hidden_size=} {shard_intermediate_size=} {with_bias=} {act_type=}"
     )
@@ -421,6 +433,7 @@ def benchmark(
         "act_type": act_type,
         "gemm1_alpha": gemm1_alpha,
         "gemm1_limit": gemm1_limit,
+        "routed_scaling_factor": routed_scaling_factor,
     }
 
     # Warmup

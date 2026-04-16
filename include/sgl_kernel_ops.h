@@ -334,6 +334,7 @@ void apply_shuffle_mul_sum(
     const torch::Tensor& input,
     torch::Tensor& output,
     const torch::Tensor& permutation,
+    double routed_scaling_factor,
     const std::optional<torch::Tensor>& factors);
 
 void cutlass_fp4_group_mm(

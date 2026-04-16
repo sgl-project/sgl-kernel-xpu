@@ -401,7 +401,7 @@ void scatter_tokens_to_experts(
       [&]() { scatter_tokens_to_experts_impl<scalar_t>(input_tensor, src2dst_map, output_tensor); });
 }
 
-template <typename T, typename T1>
+template <typename T, typename T1, bool APPLY_ROUTED_SCALING>
 struct ApplyShuffleMulSum {
   static constexpr int WGSize = 256;
   static constexpr int ElemsPerItem = sizeof(float) * 4 / sizeof(T);  // 4 for bf16/fp16
@@ -414,13 +414,15 @@ struct ApplyShuffleMulSum {
       const int32_t* dst2src_map,
       const T1* factors,
       const int32_t topk,
-      const int32_t hidden_dim)
+      const int32_t hidden_dim,
+      float routed_scaling_factor)
       : input_(input),
         output_(output),
         dst2src_map_(dst2src_map),
         factors_(factors),
         topk_(topk),
-        hidden_dim_(hidden_dim) {}
+        hidden_dim_(hidden_dim),
+        routed_scaling_factor_(routed_scaling_factor) {}
 
   [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
     int out_tkn_id = item.get_group(0);
@@ -449,14 +451,19 @@ struct ApplyShuffleMulSum {
           using vec_t = sycl::vec<T, ElemsPerItem>;
           vec_t reg = *(reinterpret_cast<const vec_t*>(src));
           for (int j = 0; j < ElemsPerItem; ++j) {
-            acc[j] += static_cast<float>(reg[j]) * weights[k];
+            if constexpr (APPLY_ROUTED_SCALING) {
+              acc[j] += static_cast<float>(reg[j]) * weights[k] * routed_scaling_factor_;
+            } else {
+              acc[j] += static_cast<float>(reg[j]) * weights[k];
+            }
           }
         }
 
         using vec_t = sycl::vec<T, ElemsPerItem>;
         vec_t store;
-        for (int j = 0; j < ElemsPerItem; ++j)
+        for (int j = 0; j < ElemsPerItem; ++j) {
           store[j] = static_cast<T>(acc[j]);
+        }
         *(reinterpret_cast<vec_t*>(dst_base + loop * Stride)) = store;
       }
     }
@@ -467,9 +474,10 @@ struct ApplyShuffleMulSum {
   const T1* factors_;
   const int32_t topk_;
   const int32_t hidden_dim_;
+  float routed_scaling_factor_;
 };
 
-template <typename T, typename T1>
+template <typename T, typename T1, bool APPLY_ROUTED_SCALING>
 void apply_shuffle_mul_sum_impl(
     const T* input,
     T* output,
@@ -477,16 +485,17 @@ void apply_shuffle_mul_sum_impl(
     const T1* factors,
     const uint32_t out_tkns,
     const uint32_t out_hidden_dims,
-    const int topk) {
+    const int topk,
+    float routed_scaling_factor) {
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
 
-  using Kernel = ApplyShuffleMulSum<T, T1>;
+  using Kernel = ApplyShuffleMulSum<T, T1, APPLY_ROUTED_SCALING>;
 
   sycl::range<1> global_range{out_tkns * Kernel::WGSize};
   sycl::range<1> local_range{Kernel::WGSize};
 
-  Kernel task(input, output, dst2src_map, factors, topk, out_hidden_dims);
+  Kernel task(input, output, dst2src_map, factors, topk, out_hidden_dims, routed_scaling_factor);
 
   sycl_kernel_submit(global_range, local_range, queue, task);
   return;
@@ -496,9 +505,11 @@ void apply_shuffle_mul_sum(
     const torch::Tensor& input,
     torch::Tensor& output,
     const torch::Tensor& permutation,
+    double routed_scaling_factor,
     const std::optional<torch::Tensor>& factors) {
   int m = output.size(0);
   int topk = int(permutation.size(0) / m);
+  bool use_routed_scaling = routed_scaling_factor != 1.0f;
 
   SYCL_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::BFloat16, at::ScalarType::Half, input.scalar_type(), "apply_shuffle_mul_sum", [&]() {
@@ -507,24 +518,50 @@ void apply_shuffle_mul_sum(
           SYCL_DISPATCH_FLOATING_TYPES_AND2(
               at::ScalarType::BFloat16, at::ScalarType::Half, factors.value().scalar_type(), "factors dispatch", [&]() {
                 using factors_t = scalar_t;
-                apply_shuffle_mul_sum_impl<input_t, factors_t>(
-                    reinterpret_cast<input_t*>(input.data_ptr()),
-                    reinterpret_cast<input_t*>(output.data_ptr()),
-                    reinterpret_cast<int32_t*>(permutation.data_ptr()),
-                    reinterpret_cast<factors_t*>(factors->data_ptr()),
-                    output.size(0),
-                    output.size(1),
-                    topk);
+                if (use_routed_scaling) {
+                  apply_shuffle_mul_sum_impl<input_t, factors_t, true>(
+                      reinterpret_cast<input_t*>(input.data_ptr()),
+                      reinterpret_cast<input_t*>(output.data_ptr()),
+                      reinterpret_cast<int32_t*>(permutation.data_ptr()),
+                      reinterpret_cast<factors_t*>(factors->data_ptr()),
+                      output.size(0),
+                      output.size(1),
+                      topk,
+                      routed_scaling_factor);
+                } else {
+                  apply_shuffle_mul_sum_impl<input_t, factors_t, false>(
+                      reinterpret_cast<input_t*>(input.data_ptr()),
+                      reinterpret_cast<input_t*>(output.data_ptr()),
+                      reinterpret_cast<int32_t*>(permutation.data_ptr()),
+                      reinterpret_cast<factors_t*>(factors->data_ptr()),
+                      output.size(0),
+                      output.size(1),
+                      topk,
+                      routed_scaling_factor);
+                }
               });
         } else {
-          apply_shuffle_mul_sum_impl<input_t, input_t>(
-              reinterpret_cast<input_t*>(input.data_ptr()),
-              reinterpret_cast<input_t*>(output.data_ptr()),
-              reinterpret_cast<int32_t*>(permutation.data_ptr()),
-              nullptr,
-              output.size(0),
-              output.size(1),
-              topk);
+          if (use_routed_scaling) {
+            apply_shuffle_mul_sum_impl<input_t, input_t, true>(
+                reinterpret_cast<input_t*>(input.data_ptr()),
+                reinterpret_cast<input_t*>(output.data_ptr()),
+                reinterpret_cast<int32_t*>(permutation.data_ptr()),
+                nullptr,
+                output.size(0),
+                output.size(1),
+                topk,
+                routed_scaling_factor);
+          } else {
+            apply_shuffle_mul_sum_impl<input_t, input_t, false>(
+                reinterpret_cast<input_t*>(input.data_ptr()),
+                reinterpret_cast<input_t*>(output.data_ptr()),
+                reinterpret_cast<int32_t*>(permutation.data_ptr()),
+                nullptr,
+                output.size(0),
+                output.size(1),
+                topk,
+                routed_scaling_factor);
+          }
         }
       });
   return;

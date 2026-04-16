@@ -70,6 +70,7 @@ def torch_naive_moe(
     activations="silu",
     gemm1_alpha: float = None,
     gemm1_limit: float = None,
+    routed_scaling_factor=None,
 ):
     B, D = a.shape
     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
@@ -119,13 +120,18 @@ def torch_naive_moe(
                 gemm2 = (tmp @ w2[i].transpose(0, 1)).float() + b2[i].float()
                 out[mask] = gemm2.to(a.dtype)
 
-    return (
+    result = (
         out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
     ).sum(dim=1)
 
+    if routed_scaling_factor is not None:
+        result = result * routed_scaling_factor
+
+    return result
+
 
 @pytest.mark.parametrize(
-    "num_tokens,topk,num_experts,hidden_size,intermediate_size,bias_dtype,act",
+    "num_tokens,topk,num_experts,hidden_size,intermediate_size,bias_dtype,act,routed_scaling_factor",
     list(
         itertools.product(
             [1, 4, 33, 64, 222],  # num_tokens
@@ -139,11 +145,19 @@ def torch_naive_moe(
                 ("gelu", None, None),
                 ("silu", SWIGLU_ALPHA, SWIGLU_LIMIT),  # swiglu_gpt_oss
             ],  # (act_type, gemm1_alpha, gemm1_limit)
+            [2.5],
         )
     ),
 )
 def test_moe_gemm(
-    num_tokens, topk, num_experts, hidden_size, intermediate_size, bias_dtype, act
+    num_tokens,
+    topk,
+    num_experts,
+    hidden_size,
+    intermediate_size,
+    bias_dtype,
+    act,
+    routed_scaling_factor,
 ):
     act_type, gemm1_alpha, gemm1_limit = act
     torch.xpu.manual_seed_all(0)
@@ -179,6 +193,7 @@ def test_moe_gemm(
         activations=act_type,
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
+        routed_scaling_factor=routed_scaling_factor,
     )
     sglang_output = fused_experts(
         a,
@@ -191,6 +206,7 @@ def test_moe_gemm(
         activation=act_type,
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
+        routed_scaling_factor=routed_scaling_factor,
     )
     torch.testing.assert_close(torch_output, sglang_output, rtol=rtol, atol=atol)
 

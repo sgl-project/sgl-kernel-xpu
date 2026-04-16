@@ -85,7 +85,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("prepare_moe_input", torch::kXPU, &prepare_moe_input);
   m.def("scatter_tokens_to_experts(Tensor input, Tensor src2dst_map, Tensor output) -> ()");
   m.impl("scatter_tokens_to_experts", torch::kXPU, &scatter_tokens_to_experts);
-  m.def("apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, Tensor? factors) -> ()");
+  m.def(
+      "apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, float routed_scaling_factor, Tensor? "
+      "factors) -> ()");
   m.impl("apply_shuffle_mul_sum", torch::kXPU, &apply_shuffle_mul_sum);
 
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");

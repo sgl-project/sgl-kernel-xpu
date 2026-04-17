@@ -521,7 +521,7 @@ std::vector<at::Tensor> mha_fwd(
   // Currently only support head dims <= 512
   static constexpr int max_headdim = 512;
   TORCH_CHECK(head_size <= max_headdim, "FlashAttention forward only supports head dimension at most ", max_headdim);
-  TORCH_CHECK(num_heads == num_heads_k, "Only support number of heads in key/value equals to number of heads in query");
+  TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
   // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
   // TODO: check this
@@ -789,12 +789,9 @@ std::vector<at::Tensor> mha_fwd(
         num_kv_splits,
         pack_gqa_,
         sm_margin);
-  } else if (
-      !page_table.has_value() || is_causal || window_size_left >= 0 || window_size_right >= 0 || sinks_.has_value() ||
-      num_heads != num_heads_k || max_seqlen_q == 2048 || max_seqlen_q == 4096 || max_seqlen_q == 8192) {
-    // Use chunked prefill for GQA/MQA
-    // Now we detect chunked prefill according to max_seqlen_q
-    return chunkprefill::mha_fwd(
+  } else if (!(window_size_left >= 0 || window_size_right >= 0) && !sinks_.has_value() && page_table.has_value()) {
+    // TODO: support the cases for non-kv cache, sliding window and sink.
+    return prefill::mha_fwd(
         q,
         k,
         v,
@@ -824,8 +821,7 @@ std::vector<at::Tensor> mha_fwd(
         pack_gqa_,
         sm_margin);
   } else {
-    // TODO: support the cases for non-kv cache, causal, sliding window and sink.
-    return prefill::mha_fwd(
+    return chunkprefill::mha_fwd(
         q,
         k,
         v,

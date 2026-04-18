@@ -383,7 +383,7 @@ macro(SYCL_LINK_DEVICE_OBJECTS output_file sycl_target sycl_offline_compiler_fla
     set(SYCL_device_link_flags
         ${link_type_flag}
         ${important_host_flags}
-        "${sycl_device_link_flags}")
+        ${sycl_device_link_flags})
 
     file(RELATIVE_PATH output_file_relative_path "${CMAKE_BINARY_DIR}" "${output_file}")
 
@@ -401,16 +401,6 @@ macro(SYCL_LINK_DEVICE_OBJECTS output_file sycl_target sycl_offline_compiler_fla
     endif()
 
     # Build the generated file and dependency file ##########################
-    # Only pass -Xs when there are offline compiler flags (AOT targets).
-    # For JIT (spir64) targets SYCL_OFFLINE_COMPILER_FLAGS is empty and
-    # passing a bare -Xs causes icx to consume the following -o flag as
-    # its argument, producing "no such file or directory" errors.
-    if(SYCL_OFFLINE_COMPILER_FLAGS)
-      set(_sycl_xs_flags -Xs ${SYCL_OFFLINE_COMPILER_FLAGS})
-    else()
-      set(_sycl_xs_flags)
-    endif()
-
     add_custom_command(
       OUTPUT ${output_file}
       DEPENDS ${object_files}

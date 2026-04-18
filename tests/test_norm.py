@@ -311,5 +311,67 @@ def test_gemma_norm_3d_non_contiguous(batch_size, seq_len, hidden_size, dtype):
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
+###############################################################################
+# Non-flattenable 3D tensor tests (Qwen3 QK Norm split+view pattern)
+# Here the 3D tensor comes from tensor.split(dim=-1).view(B, num_heads, head_dim)
+# where stride(0) != size(1) * stride(1) because of the split.
+###############################################################################
+
+
+def _make_split_view_3d(batch_size, num_heads, head_dim, dtype, num_kv_heads=2):
+    """Reproduce the Qwen3 QK Norm split+view pattern that creates a 3D
+    tensor whose leading dims are NOT flattenable (stride(0) > size(1)*stride(1)).
+    """
+    q_size = num_heads * head_dim
+    kv_size = num_kv_heads * head_dim
+    total = q_size + 2 * kv_size
+    qkv = torch.randn(batch_size, total, device=device, dtype=dtype)
+    q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+    q_3d = q.view(batch_size, num_heads, head_dim)
+    k_3d = k.view(batch_size, num_kv_heads, head_dim)
+    # Verify the tensor is indeed non-flattenable
+    assert q_3d.stride(0) != q_3d.size(1) * q_3d.stride(1)
+    assert k_3d.stride(0) != k_3d.size(1) * k_3d.stride(1)
+    return q_3d, k_3d
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 16])
+@pytest.mark.parametrize("num_heads", [8, 16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_norm_3d_split_view_qwen3(batch_size, num_heads, head_dim, dtype):
+    """Test rmsnorm with the non-flattenable 3D tensor pattern from Qwen3 QK Norm."""
+    q_3d, k_3d = _make_split_view_3d(batch_size, num_heads, head_dim, dtype)
+    w_q = torch.randn(head_dim, device=device, dtype=dtype)
+    w_k = torch.randn(head_dim, device=device, dtype=dtype)
+
+    y_q_ref = llama_rms_norm(q_3d.contiguous(), w_q)
+    y_q = sgl_kernel.rmsnorm(q_3d, w_q)
+    torch.testing.assert_close(y_q_ref, y_q, rtol=1e-3, atol=1e-3)
+
+    y_k_ref = llama_rms_norm(k_3d.contiguous(), w_k)
+    y_k = sgl_kernel.rmsnorm(k_3d, w_k)
+    torch.testing.assert_close(y_k_ref, y_k, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 16])
+@pytest.mark.parametrize("num_heads", [8, 16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_gemma_norm_3d_split_view_qwen3(batch_size, num_heads, head_dim, dtype):
+    """Test gemma_rmsnorm with the non-flattenable 3D tensor pattern from Qwen3 QK Norm."""
+    q_3d, k_3d = _make_split_view_3d(batch_size, num_heads, head_dim, dtype)
+    w_q = torch.randn(head_dim, device=device, dtype=dtype)
+    w_k = torch.randn(head_dim, device=device, dtype=dtype)
+
+    y_q_ref = gemma_rms_norm(q_3d.contiguous(), w_q)
+    y_q = sgl_kernel.gemma_rmsnorm(q_3d, w_q)
+    torch.testing.assert_close(y_q_ref, y_q, rtol=1e-3, atol=1e-3)
+
+    y_k_ref = gemma_rms_norm(k_3d.contiguous(), w_k)
+    y_k = sgl_kernel.gemma_rmsnorm(k_3d, w_k)
+    torch.testing.assert_close(y_k_ref, y_k, rtol=1e-3, atol=1e-3)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

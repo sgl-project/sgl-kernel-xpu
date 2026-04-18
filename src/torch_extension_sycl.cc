@@ -108,6 +108,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("moe_sum(Tensor input, Tensor! output) -> ()");
   m.impl("moe_sum", torch::kXPU, &moe_sum);
 
+// Xe20 only kernels
+#if SYCL_INTEL_TARGET == 20
   m.def(
       "moe_grouped_mm_nt_xe20(Tensor! output, Tensor activations, Tensor weights, Tensor? bias, Tensor "
       "total_rows_for_experts, int n_experts, int activation_type, bool fuse_act, float gemm1_alpha=1.702, float "
@@ -119,6 +121,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? bias, Tensor total_rows_for_experts, int n_experts, int activation_type, bool fuse_act, "
       "float gemm1_alpha=1.702, float gemm1_limit=7.0) -> ()");
   m.impl("moe_grouped_mm_nt_xe20_mxfp4_w4a16", torch::kXPU, &moe_grouped_mm_nt_xe20_mxfp4_w4a16);
+#endif
 
   m.def(
       "prepare_moe_input(Tensor topk_ids, Tensor! expert_offsets, Tensor? blockscale_offsets, Tensor! problem_sizes1,"
@@ -303,6 +306,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   /* NSA (Native Sparse Attention) indexer scoring */
   // fp8_mqa_logits (prefill) is implemented in pure Python via sgl_kernel.nsa.
+#if SYCL_INTEL_TARGET == 20
   m.def(
       "fp8_paged_mqa_logits(Tensor q_fp8, Tensor kv_cache, Tensor weights, "
       "Tensor seq_lens, Tensor block_tables, Tensor? schedule_metadata, "
@@ -344,6 +348,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "plan_compress_decode(Tensor req_pool_indices, Tensor req_to_token, Tensor full_to_state, "
       "Tensor seq_lens, int compress_ratio, int swa_page_size, int ring_size) -> Tensor");
   m.impl("plan_compress_decode", torch::kXPU, &at::native::xpu::plan_compress_decode);
+#endif
 }
 
 REGISTER_EXTENSION(common_ops)

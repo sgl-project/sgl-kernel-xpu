@@ -100,11 +100,13 @@ foreach(HEAD_DIM ${FMHA_PREFILL_PAGED_HEAD_DIMS})
         "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_prefill_paged_kernel_${HEAD_DIM}.cpp")
     configure_file(${FMHA_PREFILL_TEMPLATE} ${GENERATED_FILE} @ONLY)
     list(APPEND device_cpp_xe20 ${GENERATED_FILE})
+    list(APPEND device_cpp_xe35 ${GENERATED_FILE})
 
     set(GENERATED_FP8_FILE
         "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_prefill_fp8_kernel_${HEAD_DIM}.cpp")
     configure_file(${FMHA_PREFILL_FP8_TEMPLATE} ${GENERATED_FP8_FILE} @ONLY)
     list(APPEND device_cpp_xe20 ${GENERATED_FP8_FILE})
+    list(APPEND device_cpp_xe35 ${GENERATED_FP8_FILE})
 endforeach()
 
 # --- Non-paged (no_page) prefill: np head dims only, no fp8, bf16 query only. ---
@@ -120,4 +122,5 @@ foreach(HEAD_DIM ${FMHA_PREFILL_NP_HEAD_DIMS})
         "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_prefill_nopage_kernel_${HEAD_DIM}.cpp")
     configure_file(${FMHA_PREFILL_NOPAGE_TEMPLATE} ${GENERATED_NP_FILE} @ONLY)
     list(APPEND device_cpp_xe20 ${GENERATED_NP_FILE})
+    list(APPEND device_cpp_xe35 ${GENERATED_NP_FILE})
 endforeach()

@@ -49,28 +49,55 @@ foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
   )
 endforeach()
 
-# xe20 kernels
-set(XE20_OFFLINE_COMPILER_AOT_OPTIONS "-device bmg")
-set(XE20_OFFLINE_COMPILER_FLAGS "${XE20_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
-foreach(sycl_src ${ATen_XPU_SYCL_XE20})
-  get_filename_component(name ${sycl_src} NAME_WLE REALPATH)
-  set(sycl_lib sgl-ops-sycl-${name})
-  sycl_add_library(
-    ${sycl_lib}
-    ${XE20_OFFLINE_COMPILER_FLAGS}
-    ${COMMON_DEVICE_LINK_FLAGS}
-    SHARED
-    SYCL_SOURCES ${sycl_src})
-  target_link_libraries(common_ops PUBLIC ${sycl_lib})
-  list(APPEND SGL_OPS_LIBRARIES ${sycl_lib})
+# xe20 kernels (BMG only)
+if(DPCPP_SYCL_TARGET MATCHES "bmg")
+  set(XE20_OFFLINE_COMPILER_AOT_OPTIONS "-device bmg")
+  set(XE20_OFFLINE_COMPILER_FLAGS "${XE20_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
+  foreach(sycl_src ${ATen_XPU_SYCL_XE20})
+    get_filename_component(name ${sycl_src} NAME_WLE REALPATH)
+    set(sycl_lib sgl-ops-sycl-${name})
+    sycl_add_library(
+      ${sycl_lib}
+      ${XE20_OFFLINE_COMPILER_FLAGS}
+      ${COMMON_DEVICE_LINK_FLAGS}
+      SHARED
+      SYCL_SOURCES ${sycl_src})
+    target_link_libraries(common_ops PUBLIC ${sycl_lib})
+    list(APPEND SGL_OPS_LIBRARIES ${sycl_lib})
 
-  # Decouple with PyTorch cmake definition.
-  install(TARGETS ${sycl_lib} LIBRARY DESTINATION sgl_kernel)
-  set_target_properties(${sycl_lib} PROPERTIES
-    INSTALL_RPATH "$ORIGIN"
-    BUILD_WITH_INSTALL_RPATH TRUE
-  )
-endforeach()
+    # Decouple with PyTorch cmake definition.
+    install(TARGETS ${sycl_lib} LIBRARY DESTINATION sgl_kernel)
+    set_target_properties(${sycl_lib} PROPERTIES
+      INSTALL_RPATH "$ORIGIN"
+      BUILD_WITH_INSTALL_RPATH TRUE
+    )
+  endforeach()
+endif()
+
+# xe35 kernels (CRI only)
+if(DPCPP_SYCL_TARGET MATCHES "cri")
+  set(XE35_OFFLINE_COMPILER_AOT_OPTIONS "-device cri")
+  set(XE35_OFFLINE_COMPILER_FLAGS "${XE35_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
+  foreach(sycl_src ${ATen_XPU_SYCL_XE35})
+    get_filename_component(name ${sycl_src} NAME_WLE REALPATH)
+    set(sycl_lib sgl-ops-sycl-${name})
+    sycl_add_library(
+      ${sycl_lib}
+      ${XE35_OFFLINE_COMPILER_FLAGS}
+      ${COMMON_DEVICE_LINK_FLAGS}
+      SHARED
+      SYCL_SOURCES ${sycl_src})
+    target_link_libraries(common_ops PUBLIC ${sycl_lib})
+    list(APPEND SGL_OPS_LIBRARIES ${sycl_lib})
+
+    # Decouple with PyTorch cmake definition.
+    install(TARGETS ${sycl_lib} LIBRARY DESTINATION sgl_kernel)
+    set_target_properties(${sycl_lib} PROPERTIES
+      INSTALL_RPATH "$ORIGIN"
+      BUILD_WITH_INSTALL_RPATH TRUE
+    )
+  endforeach()
+endif()
 
 set(SYCL_LINK_LIBRARIES_KEYWORD)
 
@@ -84,7 +111,6 @@ foreach(lib ${SGL_OPS_LIBRARIES})
   target_include_directories(${lib} PUBLIC ${ATen_XPU_INCLUDE_DIRS})
   target_include_directories(${lib} PUBLIC ${SYCL_INCLUDE_DIR})
   target_include_directories(${lib} PRIVATE ${Python3_INCLUDE_DIRS})
-  target_include_directories(${lib} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(${lib} PRIVATE ${Python3_LIBRARIES})
 
   target_include_directories(${lib} PRIVATE ${TORCH_INCLUDE_DIRS})

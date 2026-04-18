@@ -40,7 +40,7 @@ if(USE_MLA)
     add_compile_definitions(USE_MLA)
 endif()
 
-file(GLOB device_cpp "sycl/*.cpp" "sycl/*.sycl")
+file(GLOB_RECURSE device_cpp "sycl/*.cpp" "sycl/*.sycl")
 file(GLOB host_cpp "./*.cpp" "./*.cc")
 
 # Filter out source files belonging to disabled features BEFORE splitting them
@@ -60,14 +60,20 @@ endif()
 
 # BMG only
 set(device_cpp_xe20)
+# CRI only
+set(device_cpp_xe35)
 # common SYCL kernels
 set(device_cpp_common)
 
 foreach(file ${device_cpp})
     get_filename_component(fname ${file} NAME)
 
-    if(fname MATCHES "Xe20\\.(cpp|sycl)$")
+    # Classify by filename suffix (e.g. Kernel.Xe35.cpp) or by parent
+    # directory path containing /Xe20/ or /Xe35/.
+    if(fname MATCHES "Xe20\\.(cpp|sycl)$" OR file MATCHES "/xe20/")
         list(APPEND device_cpp_xe20 ${file})
+    elseif(fname MATCHES "Xe35\\.(cpp|sycl)$" OR file MATCHES "/xe35/")
+        list(APPEND device_cpp_xe35 ${file})
     else()
         list(APPEND device_cpp_common ${file})
     endif()
@@ -91,14 +97,17 @@ if(USE_MOE)
 endif()
 
 message(STATUS "BMG files: ${device_cpp_xe20}")
+message(STATUS "CRI files: ${device_cpp_xe35}")
 message(STATUS "Common files: ${device_cpp_common}")
 
 list(APPEND ATen_XPU_CPP_SRCS ${host_cpp})
 list(APPEND ATen_XPU_SYCL_COMMON ${device_cpp_common})
 list(APPEND ATen_XPU_SYCL_XE20 ${device_cpp_xe20})
+list(APPEND ATen_XPU_SYCL_XE35 ${device_cpp_xe35})
 
 set(ATen_XPU_CPP_SRCS ${ATen_XPU_CPP_SRCS} PARENT_SCOPE)
 set(ATen_XPU_SYCL_COMMON ${ATen_XPU_SYCL_COMMON} PARENT_SCOPE)
 set(ATen_XPU_SYCL_XE20 ${ATen_XPU_SYCL_XE20} PARENT_SCOPE)
+set(ATen_XPU_SYCL_XE35 ${ATen_XPU_SYCL_XE35} PARENT_SCOPE)
 
 include(BuildOnLinux.cmake)

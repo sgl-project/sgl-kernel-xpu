@@ -108,7 +108,10 @@ if(USE_MLA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-mla_sparse_prefill)
 endif()
 
 # xe20 kernels
-set(XE20_OFFLINE_COMPILER_AOT_OPTIONS "-device bmg")
+# The AOT device must match the arch these sources were *compiled* for: CMakeLists.txt
+# applies SYCL_INTEL_TARGET globally, so on a cri build these TUs emit Xe3p vISA and
+# ocloc -device bmg rejects it ("platform requires 2 (l1-l3) caching options").
+set(XE20_OFFLINE_COMPILER_AOT_OPTIONS "${SYCL_OFFLINE_COMPILER_AOT_OPTIONS}")
 set(XE20_OFFLINE_COMPILER_FLAGS "${XE20_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
 
 # Instance families that are bundled into a single shared library each.

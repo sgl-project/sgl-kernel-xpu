@@ -159,7 +159,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "float factor, float low, float high, float attention_factor, int rotary_dim) -> ()");
   m.impl("fused_qk_norm_rope", torch::kXPU, &at::native::xpu::fused_qk_norm_rope);
   /*
-   * Fused QK RoPE (no RMSNorm)
+   * Fused QK RoPE (no RMS_Norm)
    */
   m.def(
       "fused_qk_rope(Tensor! qkv, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, "

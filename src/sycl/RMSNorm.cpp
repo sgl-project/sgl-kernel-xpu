@@ -416,12 +416,20 @@ void GemmaFusedAddRMSNormKernelImplInternal(
 }
 
 void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
+  // When the input is a 3D slice of a larger tensor (e.g. a head-slice of a
+  // packed QKV buffer) its leading dimensions may not be flattenable via
+  // view().  Making it contiguous resolves this; the kernel only reads the
+  // input so a copy is safe.
+  Tensor input_c = (input.dim() == 3 && input.size(0) != 1 && input.stride(0) != input.size(1) * input.stride(1))
+                       ? input.contiguous()
+                       : input;
+
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
-  auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
+  auto [M, N] = _check_layer_norm_inputs(input_c, c10::IntArrayRef({input_c.size(-1)}), opt_weight, opt_bias);
 
   // Flatten leading dimensions to 2D for the kernel
-  Tensor input_ = flatten_to_2d(input, M, N);
+  Tensor input_ = flatten_to_2d(input_c, M, N);
   Tensor output_ = flatten_to_2d(output, M, N);
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
   Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
@@ -464,12 +472,17 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
 }
 
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
+  // Same contiguity guard as rmsnorm – see comment there.
+  Tensor input_c = (input.dim() == 3 && input.size(0) != 1 && input.stride(0) != input.size(1) * input.stride(1))
+                       ? input.contiguous()
+                       : input;
+
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
-  auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
+  auto [M, N] = _check_layer_norm_inputs(input_c, c10::IntArrayRef({input_c.size(-1)}), opt_weight, opt_bias);
 
   // Flatten leading dimensions to 2D for the kernel
-  Tensor input_ = flatten_to_2d(input, M, N);
+  Tensor input_ = flatten_to_2d(input_c, M, N);
   Tensor output_ = flatten_to_2d(output, M, N);
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
   Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));

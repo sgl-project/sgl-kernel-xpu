@@ -340,12 +340,11 @@ void rotary_embedding_2D_kernel_impl(
   int64_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
   int64_t max_group_num = dpcppMaxWorkItemsPerTile(dev_id) / max_wg_size;
   int64_t num_groups = num_tokens;
-  int64_t num_eus = dpcppMaxDSSNum(dev_id);
+  int64_t num_eus = at::xpu::getDeviceProperties(dev_id)->gpu_eu_count;
   int64_t group_size = std::min(max_wg_size, query.size(-1));
 
   if (num_tokens >= num_eus) {
-    int rot_tim = cos_sin_cache.size(1);
-    group_size = std::min<int64_t>(num_heads * rot_dim / 2, 512);
+    group_size = std::min<int64_t>(std::min<int64_t>(num_heads * rot_dim / 2, 512), max_wg_size);
   }
 
   SYCL_DISPATCH_FLOATING_TYPES(

@@ -11,6 +11,29 @@ namespace at::native::xpu {
 enum class EmbeddingAlgorithm { RotateHalf = 0, RotateInterleave = 1 };
 
 template <typename scalar_t, EmbeddingAlgorithm algo = EmbeddingAlgorithm::RotateHalf, bool has_cache_offset = true>
+inline void apply_token_rotary_embedding(
+    scalar_t* data, const scalar_t* cos_cache, const scalar_t* sin_cache, int rot_offset, int embed_dim) {
+  using accscalar = at::opmath_type<scalar_t>;
+  int x_idx, y_idx;
+  accscalar cos_val, sin_val;
+  if constexpr (algo == EmbeddingAlgorithm::RotateHalf) {
+    x_idx = rot_offset;
+    y_idx = rot_offset + embed_dim;
+    cos_val = cos_cache[x_idx];
+    sin_val = sin_cache[x_idx];
+  } else {
+    x_idx = 2 * rot_offset;
+    y_idx = 2 * rot_offset + 1;
+    cos_val = cos_cache[x_idx / 2];
+    sin_val = sin_cache[x_idx / 2];
+  }
+  accscalar x = data[x_idx];
+  accscalar y = data[y_idx];
+  data[x_idx] = x * cos_val - y * sin_val;
+  data[y_idx] = x * sin_val + y * cos_val;
+}
+
+template <typename scalar_t, EmbeddingAlgorithm algo = EmbeddingAlgorithm::RotateHalf, bool has_cache_offset = true>
 struct RotaryEmbeddingBatched {
   void operator()(sycl::nd_item<1> item) const {
     using accscalar = at::opmath_type<scalar_t>;
@@ -18,7 +41,7 @@ struct RotaryEmbeddingBatched {
     int32_t start_idx = item.get_local_id(0);
     int64_t pos = positions_[token_id];
     int64_t cos_sin_offset = 0;
-    if constexpr (has_cache_offset) int64_t cos_sin_offset = cos_sin_cache_offsets_[token_id];
+    if constexpr (has_cache_offset) cos_sin_offset = cos_sin_cache_offsets_[token_id];
     scalar_t* cos_cache = cos_sin_cache_ + (pos + cos_sin_offset) * rot_dim_;
     int32_t embed_dim = rot_dim_ / 2;
     scalar_t* sin_cache = cos_cache + embed_dim;
@@ -31,30 +54,17 @@ struct RotaryEmbeddingBatched {
       int32_t head_id = i / embed_dim;
       int32_t rot_offset = i % embed_dim;
       scalar_t* query_st = query_base + head_id * head_size_;
-      int x_idx, y_idx;
-      accscalar cos_val, sin_val;
-      if constexpr (algo == EmbeddingAlgorithm::RotateHalf) {
-        x_idx = rot_offset;
-        y_idx = rot_offset + embed_dim;
-        cos_val = cos_cache[x_idx];
-        sin_val = sin_cache[x_idx];
-      } else {
-        x_idx = 2 * rot_offset;
-        y_idx = 2 * rot_offset + 1;
-        cos_val = cos_cache[x_idx / 2];
-        sin_val = sin_cache[x_idx / 2];
-      }
-      accscalar x = query_st[x_idx];
-      accscalar y = query_st[y_idx];
-      query_st[x_idx] = x * cos_val - y * sin_val;
-      query_st[y_idx] = x * sin_val + y * cos_val;
-      if (i < k_num) {
-        scalar_t* key_st = key_base + head_id * head_size_;
-        x = key_st[x_idx];
-        y = key_st[y_idx];
-        key_st[x_idx] = x * cos_val - y * sin_val;
-        key_st[y_idx] = x * sin_val + y * cos_val;
-      }
+
+      apply_token_rotary_embedding<scalar_t, algo, has_cache_offset>(
+          query_st, cos_cache, sin_cache, rot_offset, embed_dim);
+    }
+
+    for (int i = start_idx; i < k_num; i += local_range) {
+      int32_t head_id = i / embed_dim;
+      int32_t rot_offset = i % embed_dim;
+      scalar_t* key_st = key_base + head_id * head_size_;
+      apply_token_rotary_embedding<scalar_t, algo, has_cache_offset>(
+          key_st, cos_cache, sin_cache, rot_offset, embed_dim);
     }
   }
 
@@ -330,7 +340,13 @@ void rotary_embedding_2D_kernel_impl(
   int64_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
   int64_t max_group_num = dpcppMaxWorkItemsPerTile(dev_id) / max_wg_size;
   int64_t num_groups = num_tokens;
+  int64_t num_eus = dpcppMaxDSSNum(dev_id);
   int64_t group_size = std::min(max_wg_size, query.size(-1));
+
+  if (num_tokens >= num_eus) {
+    int rot_tim = cos_sin_cache.size(1);
+    group_size = std::min<int64_t>(num_heads * rot_dim / 2, 512);
+  }
 
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, query.scalar_type(), "rotary_embedding_2D_kernel_impl", [=]() {

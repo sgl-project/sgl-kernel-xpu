@@ -36,20 +36,17 @@
 
 #include <cute/tensor.hpp>
 
+#include "../../../Utils.h"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
-#include "moe_kernel.hpp"
-#include "sycl/Utils.h"
+#include "bf16/moe_kernel.hpp"
 
 using namespace cute;
+using namespace MoE;
 
 using ElementAccumulator = float;  // <- data type of accumulator
 
-template <typename, typename, typename, typename, typename, typename, int, bool, bool>
-class GemmXe20Name;
-
-// ActType: 0=silu, 1=gelu
-template <typename Tile, typename SGLayout, int ActType, bool FuseAct, bool WithBias>
+template <typename Tile, typename SGLayout, ActivationType ActType, bool FuseAct, bool WithBias>
 void Xe20MoEGEMMLauncher(
     sycl::queue q,
     const void* activations,
@@ -61,69 +58,74 @@ void Xe20MoEGEMMLauncher(
     const int gemm_k,
     const int* num_rows_per_expert_device,
     const int num_experts,
-    int* workspace) {
-  using Element = cutlass::bfloat16_t;
+    int* workspace,
+    float gemm1_alpha,
+    float gemm1_limit,
+    int ld_b);
 
-  auto make_dummy_tensor = [&](auto val, auto stride) {
-    return make_tensor(make_gmem_ptr(&val), make_layout(repeat<rank_v<decltype(stride)>>(1), stride));
-  };
-  auto make_dummy_bias = [&](auto val) {
-    return make_tensor(make_gmem_ptr(&val), make_layout(Shape<int>{}, Stride<_1>{}));
-  };
-  using StrideA = Stride<int, _1>;
-  using StrideB = Stride<int, _1>;
-  using StrideD = Stride<int, _1>;
-  using TensorA = decltype(make_dummy_tensor(Element{}, StrideA{}));
-  using TensorB = decltype(make_dummy_tensor(Element{}, StrideB{}));
-  using TensorD = decltype(make_dummy_tensor(Element{}, StrideD{}));
-  using TensorBias = decltype(make_dummy_bias(Element{}));
+using Tile_8_64_32 = Shape<_8, _64, _32>;
+using Tile_16_64_32 = Shape<_16, _64, _32>;
+using Tile_32_64_32 = Shape<_32, _64, _32>;
+using Tile_128_64_32 = Shape<_128, _64, _32>;
+using Tile_128_128_32 = Shape<_128, _128, _32>;
+using Tile_256_64_32 = Shape<_256, _64, _32>;
+using Tile_256_256_32 = Shape<_256, _256, _32>;
 
-  using ElementA_non_CV = cutlass::platform::remove_cv_t<Element>;
-  using MMA =
-      typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, ElementA_non_CV>>, Layout<Tile>, SGLayout>::TiledMMA;
-  auto mma = MMA{};
+using SG_1_4_1 = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
+using SG_4_2_1 = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
+using SG_8_2_1 = Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>;
+using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
 
-  int sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
-  auto MaxThreadsPerWorkgroup = size(mma);
+#define DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActType, FuseAct, WithBias)             \
+  extern template void Xe20MoEGEMMLauncher<Tile, SGLayout, ActType, FuseAct, WithBias>( \
+      sycl::queue,                                                                      \
+      const void*,                                                                      \
+      const void*,                                                                      \
+      const void*,                                                                      \
+      const void*,                                                                      \
+      void*,                                                                            \
+      const int,                                                                        \
+      const int,                                                                        \
+      const int*,                                                                       \
+      const int,                                                                        \
+      int*,                                                                             \
+      float,                                                                            \
+      float,                                                                            \
+      int);
 
-  static constexpr int MaxThreadsPerSM = 512;
+#define DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile, SGLayout)                                \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, true, true)            \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, true, false)           \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, false, true)           \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, false, false)          \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, true, true)            \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, true, false)           \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, false, true)           \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, false, false)          \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, true, true)  \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, true, false) \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, false, true) \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, false, false)
 
-  TORCH_CHECK(
-      MaxThreadsPerSM % MaxThreadsPerWorkgroup == 0, "MaxThreadsPerSM must be divisible by MaxThreadsPerWorkgroup")
+#define DECLARE_XE20_MOE_TILE_FUSE(Tile, SGLayout, FuseAct)                              \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, FuseAct, true)           \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, FuseAct, false)          \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, FuseAct, true)           \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, FuseAct, false)          \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, FuseAct, true) \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, FuseAct, false)
 
-  sycl::range<3> local(1, 1, MaxThreadsPerWorkgroup);
-  sycl::range<3> global(1, sm_count * MaxThreadsPerSM / MaxThreadsPerWorkgroup, 1);
+DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile_8_64_32, SG_1_4_1)
+DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile_16_64_32, SG_1_4_1)
+DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile_32_64_32, SG_1_4_1)
+DECLARE_XE20_MOE_TILE_FUSE(Tile_128_64_32, SG_4_2_1, true)
+DECLARE_XE20_MOE_TILE_FUSE(Tile_128_128_32, SG_4_2_1, false)
+DECLARE_XE20_MOE_TILE_FUSE(Tile_256_64_32, SG_8_2_1, true)
+DECLARE_XE20_MOE_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
 
-  namespace syclex = sycl::ext::oneapi::experimental;
-  namespace intelex = sycl::ext::intel::experimental;
-
-  syclex::properties kernel_props{syclex::sub_group_size<16>, intelex::grf_size<256>};
-
-  using Kernel =
-      MoE::MoEGEMM<Tile, SGLayout, TensorA, TensorB, TensorD, TensorBias, MMA, ActType, FuseAct, WithBias, Element>;
-  typename Kernel::Params params{
-      static_cast<const Element*>(activations),
-      static_cast<const Element*>(weights),
-      static_cast<const Element*>(bias),
-      static_cast<Element*>(outputs),
-      num_rows_per_expert_device,
-      gemm_n,
-      gemm_k,
-      num_experts,
-      workspace,
-      mma,
-  };
-
-  auto event = q.submit([&](sycl::handler& h) {
-    sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), h);
-    h.parallel_for<GemmXe20Name<Tile, SGLayout, TensorA, TensorB, TensorD, Element, ActType, FuseAct, WithBias>>(
-        sycl::nd_range<3>(global * local, local), kernel_props, [=](sycl::nd_item<3> item) {
-          int32_t* slm_mem =
-              static_cast<int32_t*>(local_mem.template get_multi_ptr<sycl::access::decorated::no>().get());
-          Kernel{}(params, item, slm_mem);
-        });
-  });
-}
+#undef DECLARE_XE20_MOE_TILE_FUSE
+#undef DECLARE_XE20_MOE_TILE_ALL_FUSES
+#undef DECLARE_XE20_MOE_EXTERN
 
 #define LAUNCH_MOE(...)                       \
   Xe20MoEGEMMLauncher<__VA_ARGS__>(           \
@@ -137,7 +139,10 @@ void Xe20MoEGEMMLauncher(
       gemm_k,                                 \
       total_rows_for_experts.data_ptr<int>(), \
       n_experts,                              \
-      atomic_buffer.data_ptr<int>())
+      atomic_buffer.data_ptr<int>(),          \
+      static_cast<float>(gemm1_alpha),        \
+      static_cast<float>(gemm1_limit),        \
+      ld_b)
 
 #define DISPATCH_MOE_HELPER_BIAS(ActType, FuseAct, WithBias, ...) \
   do {                                                            \
@@ -157,18 +162,24 @@ void Xe20MoEGEMMLauncher(
     }                                                                  \
   } while (0)
 
-#define DISPATCH_MOE_HELPER_ACT_TYPE(ActType, FuseAct, WithBias, ...)    \
-  do {                                                                   \
-    switch (ActType) {                                                   \
-      case 0:                                                            \
-        DISPATCH_MOE_HELPER_FUSE_ACT(0, FuseAct, WithBias, __VA_ARGS__); \
-        break;                                                           \
-      case 1:                                                            \
-        DISPATCH_MOE_HELPER_FUSE_ACT(1, FuseAct, WithBias, __VA_ARGS__); \
-        break;                                                           \
-      default:                                                           \
-        TORCH_CHECK(false, "Unsupported activation type");               \
-    }                                                                    \
+#define DISPATCH_MOE_HELPER_ACT_TYPE(ActType, FuseAct, WithBias, ...)                                 \
+  do {                                                                                                \
+    switch (ActType) {                                                                                \
+      case 0:                                                                                         \
+        DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::SILU, FuseAct, WithBias, __VA_ARGS__);           \
+        break;                                                                                        \
+      case 1:                                                                                         \
+        DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::GELU, FuseAct, WithBias, __VA_ARGS__);           \
+        break;                                                                                        \
+      case 2:                                                                                         \
+        DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::SWIGLU_GPT_OSS, FuseAct, WithBias, __VA_ARGS__); \
+        break;                                                                                        \
+      case 3:                                                                                         \
+        DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::RELU2, FuseAct, false, __VA_ARGS__);             \
+        break;                                                                                        \
+      default:                                                                                        \
+        TORCH_CHECK(false, "Unsupported activation type");                                            \
+    }                                                                                                 \
   } while (0)
 
 #define DISPATCH_MOE(ActType, FuseAct, WithBias, ...) \
@@ -181,8 +192,10 @@ void moe_grouped_mm_nt_xe20(
     const std::optional<at::Tensor>& bias,
     const torch::Tensor& total_rows_for_experts,
     const int64_t n_experts,
-    const int64_t activation_type,  // 0=silu, 1=gelu
-    bool fuse_act) {
+    const int64_t activation_type,  // 0=silu, 1=gelu, 2=swiglu_gpt_oss, 3=relu2
+    bool fuse_act,
+    double gemm1_alpha,
+    double gemm1_limit) {
   int total_m = activations.sizes()[0];
   int gemm_k = activations.sizes()[1];
   auto weights_shape = weights.sizes().vec();
@@ -196,12 +209,25 @@ void moe_grouped_mm_nt_xe20(
       weights_shape[0] == total_rows_for_experts.size(0),
       "rows_for_experts must have the same size as the first dimension of weights");
   TORCH_CHECK(output.sizes()[0] == total_m, "output must have the same number of rows as activations");
-  if (fuse_act) {
+  // For fused activation:
+  // - Gated activations (SILU, GELU, SWIGLU): output has N/2 columns (gate * up fusion)
+  // - Non-gated RELU2: output has N columns (single GEMM with fused activation)
+  bool is_fused_non_gated_relu2 = (fuse_act && activation_type == static_cast<int64_t>(ActivationType::RELU2));
+  if (fuse_act && !is_fused_non_gated_relu2) {
     TORCH_CHECK(output.sizes()[1] == gemm_n / 2, "output must have half the number of columns as activations");
   } else {
     TORCH_CHECK(output.sizes()[1] == gemm_n, "output must have the same number of columns as activations");
   }
   TORCH_CHECK(n_experts % 8 == 0, "n_experts must be a multiple of 8 for the current implementation");
+  if (bias.has_value()) {
+    TORCH_CHECK(
+        bias->scalar_type() == at::kFloat,
+        "moe_grouped_mm_nt_xe20: bias must be float32 (at::kFloat) to match kernel expectations");
+
+    // TODO this is only for binary size consideration, if needed, can remove it
+    TORCH_CHECK(
+        activation_type != static_cast<int>(ActivationType::RELU2), "RELU2 activation only supports no bias as of now");
+  }
   TORCH_CHECK(
       activations.scalar_type() == weights.scalar_type(), "activations and weights must have the same data type");
   TORCH_CHECK(
@@ -211,37 +237,66 @@ void moe_grouped_mm_nt_xe20(
     TORCH_CHECK(bias->dim() == 2, "bias must be 2D [n_experts, N]");
     TORCH_CHECK(bias->size(0) == n_experts && bias->size(1) == gemm_n, "bias shape mismatch with weight");
   }
+  TORCH_CHECK(
+      activation_type >= static_cast<int>(ActivationType::MIN) &&
+          activation_type <= static_cast<int>(ActivationType::MAX),
+      "Unsupported activation_type: ",
+      activation_type,
+      ". Supported values are 0 (silu), 1 (gelu), 2 (swiglu_gpt_oss), 3 (relu2)");
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
   at::Tensor atomic_buffer = at::empty({static_cast<long>(1)}, activations.options().dtype(at::kInt));
   bool with_bias = bias.has_value();
   void* bias_ptr = with_bias ? bias->data_ptr() : nullptr;
+  bool small_weight = (int64_t)gemm_k * gemm_n <= MOE_GROUPED_GEMM_SMALL_WEIGHT_THRESHOLD;
+  int ld_b = static_cast<int>(weights.stride(1));
+
+  bool narrow_k = gemm_k <= 256;
+  bool narrow_n_fused = fuse_act && (gemm_n <= 512);
 
   if (avg_m <= 8) {
     DISPATCH_MOE(
         activation_type, fuse_act, with_bias, Shape<_8, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
-  } else if (avg_m <= 16) {
+  } else if (avg_m <= 16 && small_weight) {
     DISPATCH_MOE(
         activation_type, fuse_act, with_bias, Shape<_16, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
-  } else if (avg_m <= 32) {
+  } else if (avg_m <= 32 && small_weight) {
     DISPATCH_MOE(
         activation_type, fuse_act, with_bias, Shape<_32, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
-  } else if (avg_m <= 128) {
+  } else if (avg_m <= 128 && small_weight) {
     if (fuse_act) {
       DISPATCH_MOE(
-          activation_type, true, with_bias, Shape<_128, _32, _32>, Layout<Shape<_2, _8, _1>, Stride<_8, _1, _0>>);
+          activation_type, true, with_bias, Shape<_128, _64, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
     } else {
       DISPATCH_MOE(
-          activation_type, false, with_bias, Shape<_128, _64, _32>, Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>);
+          activation_type, false, with_bias, Shape<_128, _128, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
     }
+  } else if (narrow_k) {
+    // Narrow-K (e.g. K=176 for MoE down-projection): few K-loop iterations
+    // starve the pipeline. Unfused: Tile_128_128 (Shape<_128, _128, _32>);
+    // fused: Tile_128_64 (Shape<_128, _64, _32>). Both use 8 SGs/WG and
+    // balance occupancy with good N-coverage (22 tiles for N=2816) and
+    // M-tail utilization.
+    if (fuse_act) {
+      DISPATCH_MOE(
+          activation_type, true, with_bias, Shape<_128, _64, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
+    } else {
+      DISPATCH_MOE(
+          activation_type, false, with_bias, Shape<_128, _128, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
+    }
+  } else if (narrow_n_fused) {
+    // Narrow-N fused (e.g. N=352 → effective N/2=176 for MoE up-projection):
+    // Use 128-tile for better M-tail utilization vs 256-tile.
+    DISPATCH_MOE(
+        activation_type, true, with_bias, Shape<_128, _64, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
   } else {
     if (fuse_act) {
       DISPATCH_MOE(
-          activation_type, true, with_bias, Shape<_256, _32, _32>, Layout<Shape<_4, _8, _1>, Stride<_8, _1, _0>>);
+          activation_type, true, with_bias, Shape<_256, _64, _32>, Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>);
     } else {
       DISPATCH_MOE(
-          activation_type, false, with_bias, Shape<_256, _128, _32>, Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>);
+          activation_type, false, with_bias, Shape<_256, _256, _32>, Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>);
     }
   }
 }

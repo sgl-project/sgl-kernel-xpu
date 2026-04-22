@@ -11,8 +11,9 @@ void moe_grouped_mm_nt_xe35(
     const int64_t n_experts,
     const int64_t activation_type,  // 0=silu, 1=gelu
     bool fuse_act) {
-  moe_grouped_mm_nt_xe20(
-      output, activations, weights, bias, total_rows_for_experts, n_experts, activation_type, fuse_act);
+  //moe_grouped_mm_nt_xe20(
+  //    output, activations, weights, bias, total_rows_for_experts, n_experts, activation_type, fuse_act);
+  // To Be Completed for Xe35
 }
 
 #undef SYCL_INTEL_TARGET

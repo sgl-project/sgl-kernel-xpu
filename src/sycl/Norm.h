@@ -32,15 +32,6 @@ inline std::tuple<int64_t, int64_t> _check_layer_norm_inputs(
   TENSOR_CHECK(weight)
   TENSOR_CHECK(bias)
 
-  // For 3D inputs, verify that the leading dimensions can be flattened into a
-  // single batch dimension without a copy (i.e. rows are evenly spaced).
-  if (input.dim() == 3) {
-    TORCH_CHECK(
-        input.size(0) == 1 || input.stride(0) == input.size(1) * input.stride(1),
-        "3D input must have flattenable leading dimensions when treated as a "
-        "batched 2D tensor");
-  }
-
   int64_t hidden_size = input.size(-1);
   int64_t batch_size = input.numel() / hidden_size;
 

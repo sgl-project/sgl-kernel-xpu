@@ -416,12 +416,17 @@ void GemmaFusedAddRMSNormKernelImplInternal(
 }
 
 void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
+  // Make input contiguous so that non-flattenable 3D tensors (e.g. from
+  // tensor.split().view() in Qwen3 QK Norm) get valid strides for the
+  // kernel.  This is a no-op when the tensor is already contiguous.
+  Tensor input_c = input.contiguous();
+
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
-  auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
+  auto [M, N] = _check_layer_norm_inputs(input_c, c10::IntArrayRef({input_c.size(-1)}), opt_weight, opt_bias);
 
   // Flatten leading dimensions to 2D for the kernel
-  Tensor input_ = flatten_to_2d(input, M, N);
+  Tensor input_ = flatten_to_2d(input_c, M, N);
   Tensor output_ = flatten_to_2d(output, M, N);
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
   Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
@@ -464,12 +469,14 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
 }
 
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
+  Tensor input_c = input.contiguous();
+
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
-  auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
+  auto [M, N] = _check_layer_norm_inputs(input_c, c10::IntArrayRef({input_c.size(-1)}), opt_weight, opt_bias);
 
   // Flatten leading dimensions to 2D for the kernel
-  Tensor input_ = flatten_to_2d(input, M, N);
+  Tensor input_ = flatten_to_2d(input_c, M, N);
   Tensor output_ = flatten_to_2d(output, M, N);
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
   Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));

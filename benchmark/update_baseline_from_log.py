@@ -33,9 +33,12 @@ def parse_fused_moe_log(log_text: str) -> dict:
         topk = cols[3]
         hidden_size = cols[4]
         shard_intermediate_size = cols[5]
+        dtype = cols[6]
+        with_bias = cols[7]
+        act_type = cols[8]
         ms = float(cols[-1])
 
-        key = f"fused_moe:{num_tokens}-{num_experts}-{topk}-{hidden_size}-{shard_intermediate_size}"
+        key = f"fused_moe:{num_tokens}-{num_experts}-{topk}-{hidden_size}-{shard_intermediate_size}-{dtype}-{with_bias}-{act_type}"
         result[key] = ms
 
     return result

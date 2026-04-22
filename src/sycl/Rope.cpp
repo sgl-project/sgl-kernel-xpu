@@ -10,7 +10,7 @@ namespace at::native::xpu {
 
 enum class EmbeddingAlgorithm { RotateHalf = 0, RotateInterleave = 1 };
 
-template <typename scalar_t, EmbeddingAlgorithm algo = EmbeddingAlgorithm::RotateHalf, bool has_cache_offset = true>
+template <typename scalar_t, EmbeddingAlgorithm algo = EmbeddingAlgorithm::RotateHalf>
 inline void apply_token_rotary_embedding(
     scalar_t* data, const scalar_t* cos_cache, const scalar_t* sin_cache, int rot_offset, int embed_dim) {
   using accscalar = at::opmath_type<scalar_t>;
@@ -55,7 +55,7 @@ struct RotaryEmbeddingBatched {
       int32_t rot_offset = i % embed_dim;
       scalar_t* query_st = query_base + head_id * head_size_;
 
-      apply_token_rotary_embedding<scalar_t, algo, has_cache_offset>(
+      apply_token_rotary_embedding<scalar_t, algo>(
           query_st, cos_cache, sin_cache, rot_offset, embed_dim);
     }
 
@@ -63,7 +63,7 @@ struct RotaryEmbeddingBatched {
       int32_t head_id = i / embed_dim;
       int32_t rot_offset = i % embed_dim;
       scalar_t* key_st = key_base + head_id * head_size_;
-      apply_token_rotary_embedding<scalar_t, algo, has_cache_offset>(
+      apply_token_rotary_embedding<scalar_t, algo>(
           key_st, cos_cache, sin_cache, rot_offset, embed_dim);
     }
   }

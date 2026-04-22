@@ -12,7 +12,11 @@ enum class EmbeddingAlgorithm { RotateHalf = 0, RotateInterleave = 1 };
 
 template <typename scalar_t, EmbeddingAlgorithm algo = EmbeddingAlgorithm::RotateHalf>
 inline void apply_token_rotary_embedding(
-    scalar_t* data, const scalar_t* cos_cache, const scalar_t* sin_cache, int rot_offset, int embed_dim) {
+    scalar_t* data,
+    const scalar_t* cos_cache,
+    const scalar_t* sin_cache,
+    int rot_offset,
+    [[maybe_unused]] int embed_dim) {
   using accscalar = at::opmath_type<scalar_t>;
   int x_idx, y_idx;
   accscalar cos_val, sin_val;
@@ -338,7 +342,7 @@ void rotary_embedding_2D_kernel_impl(
   int64_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
   int64_t max_group_num = dpcppMaxWorkItemsPerTile(dev_id) / max_wg_size;
   int64_t num_groups = num_tokens;
-  int64_t num_eus = at::xpu::getDeviceProperties(dev_id)->gpu_eu_count;
+  int64_t num_eus = dpcppGpuEuCount(dev_id);
   int64_t group_size = std::min(max_wg_size, query.size(-1));
 
   if (num_tokens >= num_eus) {

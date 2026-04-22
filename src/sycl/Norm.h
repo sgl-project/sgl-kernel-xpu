@@ -32,14 +32,11 @@ inline std::tuple<int64_t, int64_t> _check_layer_norm_inputs(
   TENSOR_CHECK(weight)
   TENSOR_CHECK(bias)
 
-  // For 3D inputs, verify that the leading dimensions can be flattened into a
-  // single batch dimension without a copy (i.e. rows are evenly spaced).
-  if (input.dim() == 3) {
-    TORCH_CHECK(
-        input.size(0) == 1 || input.stride(0) == input.size(1) * input.stride(1),
-        "3D input must have flattenable leading dimensions when treated as a "
-        "batched 2D tensor");
-  }
+  // Note: for 3D inputs, the leading dimensions do not need to be flattenable
+  // into a single batch dimension.  The kernel indexes rows using both an
+  // outer stride and an inner (head-like) stride when necessary, so sliced
+  // views of a packed buffer (e.g. per-head slices of a QKV tensor) are
+  // supported natively without requiring a contiguous copy.
 
   int64_t hidden_size = input.size(-1);
   int64_t batch_size = input.numel() / hidden_size;
@@ -108,13 +105,26 @@ static inline void norm_group_reduce(
 class NormConfig {
  public:
   NormConfig(
-      int Batch, int Plane, int problem_dim, int element_size_bytes, int input_batch_stride, int output_batch_stride)
+      int Batch,
+      int Plane,
+      int problem_dim,
+      int element_size_bytes,
+      int input_batch_stride,
+      int output_batch_stride,
+      int input_inner_size = 1,
+      int input_inner_stride = 0,
+      int output_inner_size = 1,
+      int output_inner_stride = 0)
       : Batch(Batch),
         Plane(Plane),
         problem_dim(problem_dim),
         element_size_bytes(element_size_bytes),
         input_batch_stride(input_batch_stride),
-        output_batch_stride(output_batch_stride) {
+        output_batch_stride(output_batch_stride),
+        input_inner_size(input_inner_size),
+        input_inner_stride(input_inner_stride),
+        output_inner_size(output_inner_size),
+        output_inner_stride(output_inner_stride) {
     semaphores_ptr = nullptr;
     scratchpad_ptr = nullptr;
     sub_group_num_global = 1;
@@ -143,6 +153,15 @@ class NormConfig {
 
   int input_batch_stride;
   int output_batch_stride;
+  // Inner-stride support for non-flattenable 3D tensors.  For a tensor viewed
+  // as (outer, inner, plane), the flattened row index r is split as
+  // (r / inner_size) for the outer index and (r % inner_size) for the inner
+  // index.  For 2D or flattenable 3D tensors, inner_size is 1 so the inner
+  // term collapses to zero.
+  int input_inner_size;
+  int input_inner_stride;
+  int output_inner_size;
+  int output_inner_stride;
   int* semaphores_ptr;
   void* scratchpad_ptr;
   int sub_group_num_global;

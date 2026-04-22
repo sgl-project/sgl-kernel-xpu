@@ -49,6 +49,13 @@ from sgl_kernel.gemm import (
     sgl_per_token_quant_fp8,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
+from sgl_kernel.mamba import (
+    causal_conv1d_fwd,
+    causal_conv1d_update,
+    chunk_gated_delta_rule,
+    fused_gdn_gating,
+    fused_sigmoid_gating_delta_rule_update,
+)
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     cutlass_fp4_group_mm,

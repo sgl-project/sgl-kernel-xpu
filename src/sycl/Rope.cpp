@@ -55,16 +55,14 @@ struct RotaryEmbeddingBatched {
       int32_t rot_offset = i % embed_dim;
       scalar_t* query_st = query_base + head_id * head_size_;
 
-      apply_token_rotary_embedding<scalar_t, algo>(
-          query_st, cos_cache, sin_cache, rot_offset, embed_dim);
+      apply_token_rotary_embedding<scalar_t, algo>(query_st, cos_cache, sin_cache, rot_offset, embed_dim);
     }
 
     for (int i = start_idx; i < k_num; i += local_range) {
       int32_t head_id = i / embed_dim;
       int32_t rot_offset = i % embed_dim;
       scalar_t* key_st = key_base + head_id * head_size_;
-      apply_token_rotary_embedding<scalar_t, algo>(
-          key_st, cos_cache, sin_cache, rot_offset, embed_dim);
+      apply_token_rotary_embedding<scalar_t, algo>(key_st, cos_cache, sin_cache, rot_offset, embed_dim);
     }
   }
 

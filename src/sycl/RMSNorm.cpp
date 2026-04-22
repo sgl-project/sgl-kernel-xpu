@@ -47,6 +47,7 @@ struct RowStrides {
 };
 
 static inline RowStrides get_row_strides(const Tensor& t) {
+  TORCH_CHECK(t.dim() == 2 || t.dim() == 3, "get_row_strides: expected a 2D or 3D tensor, got ", t.dim(), "D");
   if (t.dim() == 2) {
     return {t.stride(0), 1, 0};
   }

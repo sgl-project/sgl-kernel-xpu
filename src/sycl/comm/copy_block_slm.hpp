@@ -167,5 +167,4 @@ CUTE_HOST_DEVICE void copy_block_s2r(
     SubgroupTensor<DstEngine, DstLayout, DstCoordLayout>&& dst) {
   return copy_block_s2r(src, src_c, dst);
 }
-
 } /* namespace cute */

@@ -9,16 +9,16 @@ We encourage you to open Pull Request from the following 4 perspectives:
 * **Bug Fixing**: Enhance test case coverage and code robustness.
 
 ### Guidelines for Pull Requests:
-* Make sure update test cases when enabling a new feature and comprehesively cover all possible combinaitons in the test suite.
+* Make sure update test cases when enabling a new feature and comprehensively cover all possible combinations in the test suite.
 * Make sure update benchmarks cases when enabling a new feature or optimizing for new scenario especially for critical operators.
-* Provide benchmark data to prove affectiveness of performance optimizations.
+* Provide benchmark data to prove effectiveness of performance optimizations.
 * Use main branch for device-agnostic features and optimizations.
 * DO NOT expose hardware or software features for Intel(R) Protect IP on main branch.
 
 ### Review Process for Merging Pull Requests:
 * Mark Pull Requests as `draft` and ask review from maintainers (mingfeima, airMeng, chunyuan-w, sunjiweiswift)
 * At least one approval is needed before landing for simple Pull Requests
-* At least two approvals are needed before landing for complexed Pull Requests.
+* At least two approvals are needed before landing for complex Pull Requests.
 * Mark Pull Requests as `ready for review` once comments are addressed.
 * Pass all CI tests.
 

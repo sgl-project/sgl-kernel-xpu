@@ -134,6 +134,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "page_table, Tensor! workspace, float sm_scale, int num_kv_splits) -> ()");
   m.impl("flash_mla_decode", torch::kXPU, &flash_mla_decode);
 
+  m.def("flash_mla_prefill_get_workspace_size", &flash_mla_prefill_get_workspace_size);
+
+  m.def(
+      "flash_mla_prefill(Tensor! out, Tensor! q_nope, Tensor! q_pe, Tensor! kv_c_and_k_pe_cache, "
+      "Tensor! cu_seqlens_q, Tensor! seq_lens, int max_seqlen_q, "
+      "Tensor! page_table, Tensor! workspace, float sm_scale, bool causal, int num_kv_splits) -> ()");;
+  m.impl("flash_mla_prefill", torch::kXPU, &flash_mla_prefill);
+
   /*
    * From quantization ops
    */

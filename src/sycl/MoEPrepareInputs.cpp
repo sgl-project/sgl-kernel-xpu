@@ -1,4 +1,5 @@
 #include <ATen/ATen.h>
+#include <c10/util/Float8_e4m3fn.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
@@ -324,9 +325,12 @@ void prepare_moe_input(
 template <typename T>
 struct ScatterTokensToExperts {
   static constexpr int WGSize = 256;
-  static constexpr int ElemsPerItem = sizeof(float) * 4 / sizeof(T);  // 4 for bf16/fp16
+  static constexpr int ElemsPerItem = sizeof(float) * 4 / sizeof(T);  // 4 for bf16/fp16, 16 for fp8
   static constexpr int Stride = WGSize * ElemsPerItem;
   static constexpr int MAX_TOPK = 16;
+
+  // Use uint8_t storage for FP8 types since SYCL doesn't natively support FP8 vectors
+  using storage_t = std::conditional_t<std::is_same_v<T, c10::Float8_e4m3fn>, uint8_t, T>;
 
   ScatterTokensToExperts(
       const T* input, T* output, const int32_t* src2dst_map, const int32_t topk, const int32_t hidden_dim)
@@ -348,11 +352,11 @@ struct ScatterTokensToExperts {
     const int loop_count = (hidden_dim_ + Stride - 1) / Stride;
     for (int loop = 0; loop < loop_count; ++loop) {
       if (loop * Stride + local_id * ElemsPerItem < hidden_dim_) {
-        using vec_t = sycl::vec<T, ElemsPerItem>;
-        vec_t data = *(reinterpret_cast<const vec_t*>(src_base + loop * Stride));
+        using vec_t = sycl::vec<storage_t, ElemsPerItem>;
+        vec_t data = *(reinterpret_cast<const vec_t*>(reinterpret_cast<const storage_t*>(src_base + loop * Stride)));
         for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
           T* dst = output_ + dst_rows[k] * hidden_dim_ + local_id * ElemsPerItem + loop * Stride;
-          *(reinterpret_cast<vec_t*>(dst)) = data;
+          *(reinterpret_cast<vec_t*>(reinterpret_cast<storage_t*>(dst))) = data;
         }
       }
     }
@@ -393,6 +397,13 @@ void scatter_tokens_to_experts(
   TORCH_CHECK(
       input_tensor.scalar_type() == output_tensor.scalar_type(),
       "Input and output tensors must have the same data type");
+
+  // Handle FP8 type separately
+  if (input_tensor.scalar_type() == at::ScalarType::Float8_e4m3fn) {
+    scatter_tokens_to_experts_impl<c10::Float8_e4m3fn>(input_tensor, src2dst_map, output_tensor);
+    return;
+  }
+
   SYCL_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::BFloat16,
       at::ScalarType::Half,

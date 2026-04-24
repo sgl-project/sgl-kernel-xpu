@@ -32,6 +32,7 @@ suites = {
         TestFile("test_norm.py"),
         TestFile("test_per_token_group_quant_8bit_v2.py"),
         TestFile("test_activation.py"),
+        TestFile("test_scatter_tokens_to_experts.py"),
     ],
 }
 

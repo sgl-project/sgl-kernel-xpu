@@ -71,6 +71,7 @@ jobs:
               python3 bench_per_token_group_quant_8bit.py 2>&1 | tee per_token_group_quant_8bit.py.log \
               python3 bench_per_token_group_quant_mxfp4.py 2>&1 | tee per_token_group_quant_mxfp4.py.log \
               python3 bench_per_token_group_quant_8bit_v2.py 2>&1 | tee bench_per_token_group_quant_8bit_v2.py.log \
+              python3 bench_scatter_tokens_to_experts.py 2>&1 | tee bench_scatter_tokens_to_experts.py.log \
             "
 
       - name: Copy logs from container

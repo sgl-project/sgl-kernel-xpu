@@ -29,6 +29,39 @@ static inline Tensor flatten_to_2d(const Tensor& t, int64_t M, int64_t N) {
   return t.view({M, N});
 }
 
+// Describes how a flattened row index (0 .. M-1) maps to a byte offset on a
+// 2D or 3D tensor without requiring a contiguous copy.  For 2D and
+// flattenable 3D tensors, (inner_size == 1, inner_stride == 0) reduces the
+// kernel's per-row offset formula
+//
+//   offset(r) = (r / inner_size) * batch_stride + (r % inner_size) * inner_stride
+//
+// to the existing behaviour `offset(r) = r * batch_stride`.  For
+// non-flattenable 3D tensors (e.g. a per-head slice of a packed QKV buffer
+// reshaped to (tokens, heads, head_dim)) we fall back to the general formula
+// by setting inner_size = size(1) and inner_stride = stride(1).
+struct RowStrides {
+  int64_t batch_stride;
+  int64_t inner_size;
+  int64_t inner_stride;
+};
+
+static inline RowStrides get_row_strides(const Tensor& t) {
+  TORCH_CHECK(t.dim() == 2 || t.dim() == 3, "get_row_strides: expected a 2D or 3D tensor, got ", t.dim(), "D");
+  if (t.dim() == 2) {
+    return {t.stride(0), 1, 0};
+  }
+  // 3D
+  int64_t outer_stride = t.stride(0);
+  int64_t inner_size = t.size(1);
+  int64_t inner_stride = t.stride(1);
+  if (t.size(0) == 1 || outer_stride == inner_size * inner_stride) {
+    // Flattenable: a single stride describes all rows.
+    return {inner_stride, 1, 0};
+  }
+  return {outer_stride, inner_size, inner_stride};
+}
+
 template <typename scalar_t, typename weight_t, typename mean_t = float>
 class RMSNormForward : public NormForward<scalar_t, weight_t, true> {
  public:
@@ -46,7 +79,8 @@ class RMSNormForward : public NormForward<scalar_t, weight_t, true> {
     auto group_id = item_id.get_group(0);
     auto group_id_foreach = item_id.get_group(1);
     auto local_id = item_id.get_local_id(2);
-    index_t group_offset = group_id * cfg.input_batch_stride;
+    index_t group_offset = (group_id / cfg.input_inner_size) * cfg.input_batch_stride +
+                           (group_id % cfg.input_inner_size) * cfg.input_inner_stride;
 
     for (index_t j = local_id * vec_size; j < cfg.WGPlane; j += cfg.workgroup_size * vec_size) {
       index_t plane_offset = group_id_foreach * cfg.WGPlane + j;
@@ -73,8 +107,10 @@ class RMSNormForward : public NormForward<scalar_t, weight_t, true> {
     auto group_id_foreach = item_id.get_group(1);
     auto local_id = item_id.get_local_id(2);
 
-    index_t x_group_offset = group_id * cfg.input_batch_stride;
-    index_t y_group_offset = group_id * cfg.output_batch_stride;
+    index_t x_group_offset = (group_id / cfg.input_inner_size) * cfg.input_batch_stride +
+                             (group_id % cfg.input_inner_size) * cfg.input_inner_stride;
+    index_t y_group_offset = (group_id / cfg.output_inner_size) * cfg.output_batch_stride +
+                             (group_id % cfg.output_inner_size) * cfg.output_inner_stride;
     if (cfg.workgroup_num_foreach == 1) {
       if (local_id == 0) {
         reduce_project(item_id, sum_value, sum_tmp, cfg);
@@ -124,7 +160,8 @@ class AddRMSNormForward : public RMSNormForward<scalar_t, weight_t> {
     auto group_id = item_id.get_group(0);
     auto group_id_foreach = item_id.get_group(1);
     auto local_id = item_id.get_local_id(2);
-    index_t group_offset = group_id * cfg.input_batch_stride;
+    index_t group_offset = (group_id / cfg.input_inner_size) * cfg.input_batch_stride +
+                           (group_id % cfg.input_inner_size) * cfg.input_inner_stride;
 
     for (index_t j = local_id * vec_size; j < cfg.WGPlane; j += cfg.workgroup_size * vec_size) {
       index_t plane_offset = group_id_foreach * cfg.WGPlane + j;
@@ -159,8 +196,10 @@ class GemmaRMSNormForward : public RMSNormForward<scalar_t, weight_t> {
     auto group_id_foreach = item_id.get_group(1);
     auto local_id = item_id.get_local_id(2);
 
-    index_t x_group_offset = group_id * cfg.input_batch_stride;
-    index_t y_group_offset = group_id * cfg.output_batch_stride;
+    index_t x_group_offset = (group_id / cfg.input_inner_size) * cfg.input_batch_stride +
+                             (group_id % cfg.input_inner_size) * cfg.input_inner_stride;
+    index_t y_group_offset = (group_id / cfg.output_inner_size) * cfg.output_batch_stride +
+                             (group_id % cfg.output_inner_size) * cfg.output_inner_stride;
     if (cfg.workgroup_num_foreach == 1) {
       if (local_id == 0) {
         RNF::reduce_project(item_id, sum_value, sum_tmp, cfg);
@@ -330,13 +369,27 @@ void RMSNormKernelImplInternal(
     Tensor& Y,
     Tensor& rstd,
     int64_t input_batch_stride,
-    int64_t output_batch_stride) {
+    int64_t output_batch_stride,
+    int64_t input_inner_size,
+    int64_t input_inner_stride,
+    int64_t output_inner_size,
+    int64_t output_inner_stride) {
   scalar_t* X_data = X.data_ptr<scalar_t>();
   scalar_t* Y_data = Y.data_ptr<scalar_t>();
   mean_t* var_data = rstd.data_ptr<mean_t>();
   weight_t* gemma_data = gemma.defined() ? gemma.data_ptr<weight_t>() : nullptr;
 
-  auto config = NormConfig(M, N, 1, sizeof(scalar_t), input_batch_stride, output_batch_stride);
+  auto config = NormConfig(
+      M,
+      N,
+      1,
+      sizeof(scalar_t),
+      input_batch_stride,
+      output_batch_stride,
+      input_inner_size,
+      input_inner_stride,
+      output_inner_size,
+      output_inner_stride);
   RMSNormForward<scalar_t, weight_t> rms_norm_forward(X_data, Y_data, var_data, gemma_data, eps, M, N);
   config.workgroup_num_foreach = 1;
   config.WGPlane = config.Plane;
@@ -377,13 +430,27 @@ void GemmaRMSNormKernelImplInternal(
     Tensor& Y,
     Tensor& rstd,
     int64_t input_batch_stride,
-    int64_t output_batch_stride) {
+    int64_t output_batch_stride,
+    int64_t input_inner_size,
+    int64_t input_inner_stride,
+    int64_t output_inner_size,
+    int64_t output_inner_stride) {
   scalar_t* X_data = X.data_ptr<scalar_t>();
   scalar_t* Y_data = Y.data_ptr<scalar_t>();
   mean_t* var_data = rstd.data_ptr<mean_t>();
   weight_t* gemma_data = gemma.defined() ? gemma.data_ptr<weight_t>() : nullptr;
 
-  auto config = NormConfig(M, N, 1, sizeof(scalar_t), input_batch_stride, output_batch_stride);
+  auto config = NormConfig(
+      M,
+      N,
+      1,
+      sizeof(scalar_t),
+      input_batch_stride,
+      output_batch_stride,
+      input_inner_size,
+      input_inner_stride,
+      output_inner_size,
+      output_inner_stride);
   GemmaRMSNormForward<scalar_t, weight_t> gemma_rms_norm_forward(X_data, Y_data, var_data, gemma_data, eps, M, N);
   config.workgroup_num_foreach = 1;
   config.WGPlane = config.Plane;
@@ -420,27 +487,29 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
   std::optional<torch::Tensor> opt_bias;
   auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
 
-  // Flatten leading dimensions to 2D for the kernel
-  Tensor input_ = flatten_to_2d(input, M, N);
-  Tensor output_ = flatten_to_2d(output, M, N);
+  // Derive row-stride info directly from input/output so the kernel can
+  // handle non-flattenable 3D tensors (e.g. QKV slices) natively.
+  RowStrides in_strides = get_row_strides(input);
+  RowStrides out_strides = get_row_strides(output);
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
-  Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
-  // Derive strides from the flattened views so they are always consistent
-  int64_t input_batch_stride = input_.stride(0);
-  int64_t output_batch_stride = output_.stride(0);
+  Tensor rstd = at::empty({M}, input.options().dtype(kFloat));
 
   SYCL_DISPATCH_FLOATING_TYPES(
-      at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "RMSNormKernelImpl", [&]() {
+      at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "RMSNormKernelImpl", [&]() {
         RMSNormKernelImplInternal<scalar_t, scalar_t>(
-            input_,
+            input,
             weight_,
             M,
             N,
             static_cast<acc_type<scalar_t>>(eps),
-            output_,
+            output,
             rstd,
-            input_batch_stride,
-            output_batch_stride);
+            in_strides.batch_stride,
+            out_strides.batch_stride,
+            in_strides.inner_size,
+            in_strides.inner_stride,
+            out_strides.inner_size,
+            out_strides.inner_stride);
       });
 }
 
@@ -468,27 +537,27 @@ void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& w
   std::optional<torch::Tensor> opt_bias;
   auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
 
-  // Flatten leading dimensions to 2D for the kernel
-  Tensor input_ = flatten_to_2d(input, M, N);
-  Tensor output_ = flatten_to_2d(output, M, N);
+  RowStrides in_strides = get_row_strides(input);
+  RowStrides out_strides = get_row_strides(output);
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
-  Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
-  // Derive strides from the flattened views so they are always consistent
-  int64_t input_batch_stride = input_.stride(0);
-  int64_t output_batch_stride = output_.stride(0);
+  Tensor rstd = at::empty({M}, input.options().dtype(kFloat));
 
   SYCL_DISPATCH_FLOATING_TYPES(
-      at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
+      at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
         GemmaRMSNormKernelImplInternal<scalar_t, scalar_t>(
-            input_,
+            input,
             weight_,
             M,
             N,
             static_cast<acc_type<scalar_t>>(eps),
-            output_,
+            output,
             rstd,
-            input_batch_stride,
-            output_batch_stride);
+            in_strides.batch_stride,
+            out_strides.batch_stride,
+            in_strides.inner_size,
+            in_strides.inner_stride,
+            out_strides.inner_size,
+            out_strides.inner_stride);
       });
 }
 

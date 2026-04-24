@@ -311,5 +311,73 @@ def test_gemma_norm_3d_non_contiguous(batch_size, seq_len, hidden_size, dtype):
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
+###############################################################################
+# Non-flattenable 3D tensor tests (QKV slice pattern: stride(0) != size(1)*stride(1))
+###############################################################################
+
+
+def _make_non_flattenable_3d(num_tokens, num_heads, head_dim, dtype, extra_heads=4):
+    """Create a 3D tensor whose leading dimensions are NOT flattenable.
+
+    This mimics the pattern where q is obtained by slicing a packed QKV
+    buffer along dim-1 and then unflattening to (tokens, heads, head_dim).
+    The resulting tensor has stride(0) = (num_heads + extra_heads) * head_dim,
+    which differs from size(1) * stride(1) = num_heads * head_dim.
+
+    Note: parametrizations should use num_tokens > 1 so the flattenability
+    check (which short-circuits when size(0) == 1) is actually exercised.
+    """
+    assert num_tokens > 1, "use num_tokens > 1 to exercise the non-flattenable path"
+    total_heads = num_heads + extra_heads
+    full = torch.randn(num_tokens, total_heads * head_dim, device=device, dtype=dtype)
+    # Slice the first num_heads*head_dim columns (non-contiguous in dim-0)
+    q_flat = full[:, : num_heads * head_dim]
+    # Unflatten to 3D – strides become (total_heads*head_dim, head_dim, 1)
+    q_3d = q_flat.unflatten(-1, (num_heads, head_dim))
+    assert q_3d.stride(0) == total_heads * head_dim
+    assert q_3d.stride(0) != q_3d.size(1) * q_3d.stride(1)
+    return q_3d
+
+
+@pytest.mark.parametrize("num_tokens", [7, 32])
+@pytest.mark.parametrize("num_heads", [4, 8])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("specify_out", [True, False])
+def test_norm_3d_non_flattenable(num_tokens, num_heads, head_dim, dtype, specify_out):
+    x = _make_non_flattenable_3d(num_tokens, num_heads, head_dim, dtype)
+    w = torch.randn(head_dim, device=device, dtype=dtype)
+
+    y_ref = llama_rms_norm(x.clone(), w)
+    if specify_out:
+        y = torch.empty_like(x)
+        sgl_kernel.rmsnorm(x, w, out=y)
+    else:
+        y = sgl_kernel.rmsnorm(x, w)
+
+    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("num_tokens", [7, 32])
+@pytest.mark.parametrize("num_heads", [4, 8])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("specify_out", [True, False])
+def test_gemma_norm_3d_non_flattenable(
+    num_tokens, num_heads, head_dim, dtype, specify_out
+):
+    x = _make_non_flattenable_3d(num_tokens, num_heads, head_dim, dtype)
+    w = torch.randn(head_dim, device=device, dtype=dtype)
+
+    y_ref = gemma_rms_norm(x.clone(), w)
+    if specify_out:
+        y = torch.empty_like(x)
+        sgl_kernel.gemma_rmsnorm(x, w, out=y)
+    else:
+        y = sgl_kernel.gemma_rmsnorm(x, w)
+
+    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

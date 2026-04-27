@@ -64,7 +64,6 @@ def ref_mla(
 # TODO: enable block_size 1
 @pytest.mark.parametrize("block_size", [16, 32, 64, 128])
 @pytest.mark.parametrize("num_heads", [16, 32, 64, 128])
-# TODO: enable num_kv_splits >1
 @pytest.mark.parametrize("num_kv_splits", [-1, 1])
 def test_flash_mla_decode(
     dtype: torch.dtype,

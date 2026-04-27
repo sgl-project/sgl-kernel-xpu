@@ -159,6 +159,22 @@ void fused_qk_norm_rope(
     double high,
     double attention_factor,
     int64_t rotary_dim);
+void fused_qk_rope(
+    torch::Tensor& qkv,
+    int64_t num_heads_q,
+    int64_t num_heads_k,
+    int64_t num_heads_v,
+    int64_t head_dim,
+    torch::Tensor& q_weight,
+    torch::Tensor& k_weight,
+    double base,
+    bool is_neox,
+    torch::Tensor& position_ids,
+    double factor,
+    double low,
+    double high,
+    double attention_factor,
+    int64_t rotary_dim);
 void sgl_per_token_group_quant_fp4(
     at::Tensor input, at::Tensor output_q, at::Tensor output_s, int64_t group_size, double eps);
 }  // namespace at::native::xpu

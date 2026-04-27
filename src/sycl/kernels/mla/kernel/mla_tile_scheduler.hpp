@@ -109,7 +109,7 @@ struct XeMlaIndividualTileScheduler {
 
     idx_b = idx_kv_split;
     params.divmod_num_heads(idx_b, head, idx_b);
-    return make_coord(BlockIdxY(), BlockIdxX(), head, idx_b, int(1));
+    return make_coord(BlockIdxY(), BlockIdxX(), head, idx_b, int(-1));
   }
 
   CUTLASS_DEVICE

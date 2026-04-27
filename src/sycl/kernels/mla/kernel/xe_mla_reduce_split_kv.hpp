@@ -46,6 +46,21 @@ namespace cutlass::flash_attention::kernel {
 using namespace cute;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
+struct DummyReductionKernel {
+  struct Arguments {};
+  struct Params {};
+  static bool can_implement(Arguments const&) {
+    return true;
+  }
+  static int get_workspace_size(Arguments const&) {
+    return 0;
+  }
+  static Params to_underlying_arguments(Arguments const&, void*) {
+    return {};
+  }
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
 template <class ProblemShape_, class TileScheduler_, class MlaKernel_>
 class XeMlaReduceSplitKV {
  public:

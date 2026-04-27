@@ -51,6 +51,21 @@
 namespace cutlass::flash_attention::device {
 using namespace cute;
 
+namespace detail {
+template <class Kernel, bool IsSplitKV = Kernel::is_split_kv>
+struct ReductionTraits {
+  using type = cutlass::flash_attention::kernel::DummyReductionKernel;
+};
+
+template <class Kernel>
+struct ReductionTraits<Kernel, true> {
+  using type = cutlass::flash_attention::kernel::XeMlaReduceSplitKV<
+      typename Kernel::ProblemShape,
+      cutlass::flash_attention::kernel::XeMlaReduceSplitKScheduler,
+      Kernel>;
+};
+}  // namespace detail
+
 ////////////////////////////////////////////////////////////////////////////////
 template <class Kernel_>
 class MLA {
@@ -64,9 +79,7 @@ class MLA {
   using KernelParams = typename Kernel::Params;
 
   using ProblemShape = typename Kernel::ProblemShape;
-  using ReductionScheduler = cutlass::flash_attention::kernel::XeMlaReduceSplitKScheduler;
-  using ReductionKernel =
-      cutlass::flash_attention::kernel::XeMlaReduceSplitKV<ProblemShape, ReductionScheduler, Kernel>;
+  using ReductionKernel = typename detail::ReductionTraits<Kernel>::type;
   using ReductionArguments = typename ReductionKernel::Arguments;
   using ReductionParams = typename ReductionKernel::Params;
 

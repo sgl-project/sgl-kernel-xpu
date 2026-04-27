@@ -184,26 +184,15 @@ int64_t mla_workspace_size(int64_t num_batches, int64_t num_heads, int64_t num_k
 int64_t flash_mla_get_workspace_size(
     int64_t max_seq_len, int64_t num_batches, int64_t num_heads, int64_t page_size, int64_t num_kv_splits) {
   if (num_kv_splits < 1) {
+    TORCH_CHECK(num_heads > 0, "num_heads must be > 0 when num_kv_splits is auto-selected");
+    TORCH_CHECK(
+        page_size == 16 || page_size == 32 || page_size == 64 || page_size == 128,
+        "Unsupported page size: ",
+        page_size);
     num_kv_splits = set_split_kv(num_batches, num_heads, max_seq_len, page_size);
   }
   if (num_kv_splits == 1) {
-    switch (page_size) {
-      case 16:
-        return mla_workspace_size<MlaXe<cutlass::half_t, PageSizeOption<16>, EnabledSplitKV<false>>>(
-            num_batches, num_heads, num_kv_splits);
-      case 32:
-        return mla_workspace_size<MlaXe<cutlass::half_t, PageSizeOption<32>, EnabledSplitKV<false>>>(
-            num_batches, num_heads, num_kv_splits);
-      case 64:
-        return mla_workspace_size<MlaXe<cutlass::half_t, PageSizeOption<64>, EnabledSplitKV<false>>>(
-            num_batches, num_heads, num_kv_splits);
-      case 128:
-        return mla_workspace_size<MlaXe<cutlass::half_t, PageSizeOption<128>, EnabledSplitKV<false>>>(
-            num_batches, num_heads, num_kv_splits);
-      default:
-        TORCH_CHECK(false, "Unsupported page size: ", page_size);
-        return 0;
-    }
+    return 0;
   } else {
     switch (page_size) {
       case 16:

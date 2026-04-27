@@ -140,3 +140,99 @@ def flash_mla_get_workspace_size(
     return torch.ops.sgl_kernel.flash_mla_get_workspace_size.default(
         max_seq_len, num_batches, sm_count, num_kv_splits
     )
+
+
+def flash_mla_prefill(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_c_and_k_pe_cache: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seq_lens_k: torch.Tensor,
+    max_seqlen_q: int,
+    page_table: torch.Tensor,
+    workspace: torch.Tensor,
+    sm_scale: float,
+    causal: bool = True,
+    num_kv_splits: int = 1,
+) -> torch.Tensor:
+    """MLA prefill with varlen/ragged Q and FA2-style causal masking.
+
+    Supports full prefill (seqlen_q == seqlen_k) and incremental prefill
+    (seqlen_q < seqlen_k). Prefix tokens are unmasked; only new prompt
+    tokens get triangular causal mask.
+
+    Args:
+        q_nope: (total_q, num_heads, latent_dim)  fp16/bf16, ragged
+        q_pe:   (total_q, num_heads, rope_dim)    fp16/bf16, ragged
+        kv_c_and_k_pe_cache: (total_pages, page_size, latent_dim + rope_dim)
+        cu_seqlens_q: (batch + 1,) int32  cumulative Q lengths
+        seq_lens_k:   (batch,) int32  KV sequence length per request
+        max_seqlen_q: int  max Q length across batch
+        page_table:   (batch, max_pages_per_seq)  int32
+        workspace:    uint8 workspace tensor
+        sm_scale:     softmax scale factor
+        causal:       apply FA2-style causal masking (default True)
+        num_kv_splits: KV split count (currently must be <= 1)
+
+    Returns:
+        out: (total_q, num_heads, latent_dim)  ragged, same layout as q_nope
+    """
+    assert q_nope.ndim == 3, f"q_nope must be 3D (total_q, heads, dim), got {q_nope.ndim}"
+    assert q_pe.ndim == 3, f"q_pe must be 3D (total_q, heads, dim), got {q_pe.ndim}"
+    assert kv_c_and_k_pe_cache.ndim == 3, (
+        f"kv_c_and_k_pe_cache must be 3D (pages, page_size, dim), got {kv_c_and_k_pe_cache.ndim}"
+    )
+
+    total_q, H, D_latent = q_nope.shape
+    _, _, D_rope = q_pe.shape
+    _, PAGE_SIZE, D_ckv = kv_c_and_k_pe_cache.shape
+
+    assert D_ckv == D_latent + D_rope, (
+        f"kv dim {D_ckv} must equal D_latent({D_latent}) + D_rope({D_rope})"
+    )
+    assert q_nope.dtype in (torch.float16, torch.bfloat16), (
+        f"q_nope.dtype must be fp16 or bf16, got {q_nope.dtype}"
+    )
+    assert q_nope.dtype == q_pe.dtype == kv_c_and_k_pe_cache.dtype
+    assert cu_seqlens_q.dtype == torch.int32
+    assert seq_lens_k.dtype == torch.int32
+    assert page_table.dtype == torch.int32
+
+    batch_size = cu_seqlens_q.shape[0] - 1
+    assert seq_lens_k.shape[0] == batch_size
+
+    # Require each sequence's Q length is a multiple of Q_TILE_M=16
+    Q_TILE_M = 16
+    seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+    assert (seqlens_q % Q_TILE_M == 0).all(), (
+        f"Each sequence's Q length must be a multiple of {Q_TILE_M}, "
+        f"got seqlens_q={seqlens_q.tolist()}"
+    )
+
+    out = q_nope.new_empty((total_q, H, D_latent))
+
+    torch.ops.sgl_kernel.flash_mla_prefill.default(
+        out,
+        q_nope.contiguous(),
+        q_pe.contiguous(),
+        kv_c_and_k_pe_cache,
+        cu_seqlens_q,
+        seq_lens_k.contiguous(),
+        max_seqlen_q,
+        page_table,
+        workspace,
+        sm_scale,
+        causal,
+        num_kv_splits,
+    )
+    return out
+
+
+def flash_mla_prefill_get_workspace_size(
+    max_seq_len: int, num_batches: int, sm_count: int = 0, num_kv_splits: int = -1
+) -> int:
+    assert max_seq_len > 0, f"max_seq_len must be > 0, got {max_seq_len}"
+    assert num_batches > 0, f"num_batches must be > 0, got {num_batches}"
+    return torch.ops.sgl_kernel.flash_mla_prefill_get_workspace_size.default(
+        max_seq_len, num_batches, sm_count, num_kv_splits
+    )

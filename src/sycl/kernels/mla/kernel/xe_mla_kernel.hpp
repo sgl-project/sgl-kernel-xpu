@@ -129,6 +129,10 @@ class XeMlaFwdKernel {
     // Sequence lengths per batch (for computing total_blk)
     const int* seq_lens = nullptr;
 
+    // Cumulative Q sequence lengths for varlen/ragged Q [batch + 1].
+    // When nullptr, Q is fixed-shape (decode or old-style prefill).
+    const int* cu_seqlens_q = nullptr;
+
     // Default constructor
     KernelArguments() = default;
   };
@@ -220,20 +224,45 @@ class XeMlaFwdKernel {
       auto [blk_q, blk_v, head_coord, batch_coord] = tile_scheduler.get_block_coord();
       auto blk_qv = make_coord(blk_q, blk_v);
 
+      // --- Varlen Q handling ---
+      // When cu_seqlens_q is set, Q/O are ragged 3D (total_q, heads, dim).
+      // Offset pointers per-batch and use per-sequence Q length.
+      int q_start = 0;
+      int seqlen_q_i = s.seq_len_qo;
+      int batch_dim_size = s.batch;
+      int batch_slice_idx = batch_coord;
+
+      if (p.cu_seqlens_q != nullptr) {
+        q_start = p.cu_seqlens_q[batch_coord];
+        seqlen_q_i = p.cu_seqlens_q[batch_coord + 1] - q_start;
+        batch_dim_size = 1;
+        batch_slice_idx = 0;
+      }
+
+      // Skip Q tiles beyond this sequence's actual length
+      if (blk_q * static_cast<int>(QK_BLK_M) >= seqlen_q_i) {
+        continue;
+      }
+
       // Get actual kv sequence length for this batch
       int seq_len_kv = p.seq_lens[batch_coord];
       int total_blk = cute::ceil_div(seq_len_kv, get<1>(TileShapeQK{}));
 
-      auto shape_Q_nope = make_shape(s.seq_len_qo, s.head_size_q_nope, s.num_heads_q, s.batch);
-      auto shape_Q_pe = make_shape(s.seq_len_qo, s.head_size_q_pe, s.num_heads_q, s.batch);
-      auto shape_O = make_shape(s.seq_len_qo, s.head_size_o, s.num_heads_q, s.batch);
+      // Compute varlen Q/O pointer offsets (int64 to avoid overflow on large total_q)
+      auto q_nope_offset = static_cast<int64_t>(q_start) * static_cast<int64_t>(get<0>(p.dQ_nope));
+      auto q_pe_offset = static_cast<int64_t>(q_start) * static_cast<int64_t>(get<0>(p.dQ_pe));
+      auto o_offset = static_cast<int64_t>(q_start) * static_cast<int64_t>(get<0>(p.dO));
 
-      auto dcQ_nope = const_cast<ElementQ*>(p.Q_nope);
-      auto dcQ_pe = const_cast<ElementQ*>(p.Q_pe);
+      auto shape_Q_nope = make_shape(seqlen_q_i, s.head_size_q_nope, s.num_heads_q, batch_dim_size);
+      auto shape_Q_pe = make_shape(seqlen_q_i, s.head_size_q_pe, s.num_heads_q, batch_dim_size);
+      auto shape_O = make_shape(seqlen_q_i, s.head_size_o, s.num_heads_q, batch_dim_size);
+
+      auto dcQ_nope = const_cast<ElementQ*>(p.Q_nope) + q_nope_offset;
+      auto dcQ_pe = const_cast<ElementQ*>(p.Q_pe) + q_pe_offset;
 
       Tensor Q_nope = make_tensor(make_gmem_ptr(dcQ_nope), make_layout(shape_Q_nope, p.dQ_nope));
       Tensor Q_pe = make_tensor(make_gmem_ptr(dcQ_pe), make_layout(shape_Q_pe, p.dQ_pe));
-      Tensor O = make_tensor(make_gmem_ptr(p.O), make_layout(shape_O, p.dO));
+      Tensor O = make_tensor(make_gmem_ptr(p.O + o_offset), make_layout(shape_O, p.dO));
 
       // O accumulator types
       FragA tArA;
@@ -256,10 +285,21 @@ class XeMlaFwdKernel {
       Tensor K_pe = make_tensor(make_gmem_ptr(dcK_pe), make_layout(shape_K_pe, p.dK_pe));  // (k,d,h,page)
       Tensor V = make_tensor(make_gmem_ptr(dcK), make_layout(shape_V, p.dV));
 
+      // For causal prefill: limit K loop with FA2-style offset.
+      // causal_offset = seqlen_k - seqlen_q; mask: k_idx <= causal_offset + q_idx
+      // For decode (CausalMask=false): blk_k1 stays at total_blk.
+      int blk_k1 = total_blk;
+      int causal_offset = 0;
+      if constexpr (CollectiveMainloop::CausalMask) {
+        causal_offset = seq_len_kv - seqlen_q_i;
+        int causal_blk_k1 = cute::ceil_div(causal_offset + (blk_q + 1) * static_cast<int>(QK_BLK_M), page_size);
+        blk_k1 = cute::min(total_blk, causal_blk_k1);
+      }
+
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
       mainloop(
-          Q_nope(_, _, head_coord, batch_coord),
-          Q_pe(_, _, head_coord, batch_coord),
+          Q_nope(_, _, head_coord, batch_slice_idx),
+          Q_pe(_, _, head_coord, batch_slice_idx),
           K(_, _, _, _0{}),
           K_pe(_, _, _, _0{}),
           V(_, _, _, _0{}),
@@ -267,19 +307,20 @@ class XeMlaFwdKernel {
           tA_max,
           tA_sum,
           blk_qv,
-          0,          // blk_k0: start from first K block
-          total_blk,  // blk_k1: end at last K block
-          total_blk,  // total_blk: total number of K blocks
+          0,        // blk_k0: start from first K block
+          blk_k1,   // blk_k1: causal-adjusted upper bound
+          total_blk,
           thr_id,
           seq_len_kv,
-          batch_coord);  // batch index for page table lookup
+          batch_coord,
+          causal_offset);  // FA2-style causal offset for masking
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());
       }
 
       CollectiveEpilogue epilogue(params.epilogue, shared_storage.epilogue);
-      epilogue(O(_, _, head_coord, batch_coord), tArA, tA_max, tA_sum, blk_qv, thr_id);
+      epilogue(O(_, _, head_coord, batch_slice_idx), tArA, tA_max, tA_sum, blk_qv, thr_id);
     }
   }
 };

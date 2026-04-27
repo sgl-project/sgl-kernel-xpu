@@ -15,6 +15,7 @@ std::tuple<int64_t, int64_t> query_device(int64_t device_index = -1) {
   auto device_arch = get_device_architecture(device_index);
   switch (device_arch) {
     case syclex::architecture::intel_gpu_bmg_g21:
+    case syclex::architecture::intel_gpu_bmg_g31:
       return std::make_tuple(2, 0);
     // more arch is coming soon
     default:

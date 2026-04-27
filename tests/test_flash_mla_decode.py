@@ -64,7 +64,6 @@ def ref_mla(
 # TODO: enable block_size 1
 @pytest.mark.parametrize("block_size", [16, 32, 64, 128])
 @pytest.mark.parametrize("num_heads", [16, 32, 64, 128])
-# TODO: enable num_kv_splits >1
 @pytest.mark.parametrize("num_kv_splits", [-1, 1])
 def test_flash_mla_decode(
     dtype: torch.dtype,
@@ -121,7 +120,7 @@ def test_flash_mla_decode(
     del q_cpu, kv_cache_cpu, block_table_cpu, seq_lens_cpu
 
     workspace_size = flash_mla_get_workspace_size(
-        block_num * block_size, bs, num_kv_splits=num_kv_splits
+        block_num * block_size, bs, h_q, block_size, num_kv_splits=num_kv_splits
     )
     workspace = torch.empty(workspace_size, device=device, dtype=torch.uint8)
 

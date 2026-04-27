@@ -39,6 +39,7 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include <cmath>
 #include <cute/tensor.hpp>
 #include <sycl/sycl.hpp>
 
@@ -51,9 +52,9 @@
 
 using namespace cute;
 
-//----------------- set persistent options --------------------//
+//----------------- set splitkv options --------------------//
 template <bool v>
-struct IsPersistent {
+struct EnabledSplitKV {
   static const bool value = v;
 };
 
@@ -98,7 +99,7 @@ struct FMlAProblemShape {
 };
 
 //----------------- define MLA Xe configuration --------------------//
-template <typename T, typename PageSizeOpt = PageSizeOption<64>, typename PersistenceOption = IsPersistent<false>>
+template <typename T, typename PageSizeOpt = PageSizeOption<64>, typename SplitKVOption = EnabledSplitKV<false>>
 struct MlaXe {
   // TODO: add persistence option support in tile scheduler
   using TileScheduler = typename cutlass::flash_attention::kernel::XeMlaIndividualTileScheduler;
@@ -175,8 +176,13 @@ struct MlaXe {
       cutlass::flash_attention::collective::XeMlaEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO>;
 
   // Kernel instantiation
-  using FmlaKernel = cutlass::flash_attention::kernel::
-      XeMlaFwdKernel<ProblemShape, CollectiveMainloop, CollectiveEpilogue, TileScheduler>;
+  static constexpr bool is_split_kv = SplitKVOption::value;
+  using FmlaKernel = typename cute::conditional_t<
+      SplitKVOption::value,
+      cutlass::flash_attention::kernel::
+          XeMlaSplitKVKernel<ProblemShape, CollectiveMainloop, CollectiveEpilogue, TileScheduler>,
+      cutlass::flash_attention::kernel::
+          XeMlaFwdKernel<ProblemShape, CollectiveMainloop, CollectiveEpilogue, TileScheduler>>;
 
   using Fmla = cutlass::flash_attention::device::MLA<FmlaKernel>;
 };
@@ -189,6 +195,7 @@ inline typename T::Fmla::Arguments args_from_options(
     at::Tensor const& kv_c_and_k_pe_cache,
     at::Tensor const& seq_lens,
     at::Tensor const& page_table,
+    at::Tensor const& workspace,
     double sm_scale,
     int64_t num_kv_splits) {
   cutlass::KernelHardwareInfo hw_info;
@@ -277,6 +284,32 @@ inline typename T::Fmla::Arguments args_from_options(
   kernel_args.dO = stride_O;
   kernel_args.seq_lens = static_cast<const int*>(seq_lens.data_ptr());
 
+  if constexpr (T::is_split_kv) {
+    using cutlass::flash_attention::kernel::SplitKVWorkspaceLayout;
+    SplitKVWorkspaceLayout ws(
+        batch, problem_shape.num_heads_q, num_kv_splits, problem_shape.head_size_o, sizeof(ElementO));
+
+    auto* ws_ptr = static_cast<char*>(workspace.data_ptr());
+    auto* o_accum_ptr = reinterpret_cast<ElementO*>(ws_ptr + ws.o_accum_offset);
+    auto* exp_sums_ptr = reinterpret_cast<float*>(ws_ptr + ws.exp_sums_offset);
+    auto* max_logits_ptr = reinterpret_cast<float*>(ws_ptr + ws.max_logits_offset);
+
+    StrideO stride_O_accum = cute::make_stride(
+        static_cast<int>(batch * problem_shape.num_heads_q * num_kv_splits * problem_shape.head_size_o),
+        cute::_1{},
+        static_cast<int>(problem_shape.head_size_o),
+        static_cast<int>(problem_shape.num_heads_q * num_kv_splits * problem_shape.head_size_o));
+    StrideO stride_lse = cute::make_stride(
+        static_cast<int>(problem_shape.batch * problem_shape.num_heads_q * num_kv_splits),
+        cute::_1{},
+        static_cast<int>(num_kv_splits),
+        static_cast<int>(problem_shape.num_heads_q * num_kv_splits));
+    kernel_args.O_accum = o_accum_ptr;
+    kernel_args.dO_accum = stride_O_accum;
+    kernel_args.exp_sums = exp_sums_ptr;
+    kernel_args.max_logits = max_logits_ptr;
+    kernel_args.dLSE = stride_lse;
+  }
   typename T::CollectiveMainloop::Arguments mainloop_args{
       static_cast<float>(sm_scale),
       static_cast<const int*>(page_table.data_ptr()),
@@ -284,9 +317,30 @@ inline typename T::Fmla::Arguments args_from_options(
       total_page,
       page_count_per_seq};
 
-  typename T::Fmla::Arguments arguments{kernel_args, mainloop_args, {}, hw_info};
+  typename T::Fmla::Arguments arguments{kernel_args, mainloop_args, {}, hw_info, static_cast<int>(num_kv_splits)};
 
   return arguments;
+}
+
+template <typename Element, typename PageSizeOpt, typename SplitKVOpt>
+inline void runMlaImpl(
+    at::Tensor const& out,
+    at::Tensor const& q_nope,
+    at::Tensor const& q_pe,
+    at::Tensor const& kv_c_and_k_pe_cache,
+    at::Tensor const& seq_lens,
+    at::Tensor const& page_table,
+    at::Tensor const& workspace,
+    double sm_scale,
+    int64_t num_kv_splits) {
+  using MlaXeType = MlaXe<Element, PageSizeOpt, SplitKVOpt>;
+  typename MlaXeType::Fmla fmla;
+  auto arguments = args_from_options<MlaXeType>(
+      out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+
+  CUTLASS_CHECK(fmla.can_implement(arguments));
+
+  CUTLASS_CHECK(fmla.run(arguments, workspace.data_ptr()));
 }
 
 template <typename Element, typename PageSizeOpt>
@@ -300,12 +354,31 @@ inline void runMla(
     at::Tensor const& workspace,
     double sm_scale,
     int64_t num_kv_splits) {
-  using MlaXeType = MlaXe<Element, PageSizeOpt, IsPersistent<false>>;
-  typename MlaXeType::Fmla fmla;
-  auto arguments = args_from_options<MlaXeType>(
-      out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, sm_scale, num_kv_splits);
+  TORCH_CHECK(num_kv_splits >= 1, "num_kv_splits must be resolved before calling runMla, got ", num_kv_splits);
 
-  CUTLASS_CHECK(fmla.can_implement(arguments));
+  if (num_kv_splits > 1) {
+    using cutlass::flash_attention::kernel::SplitKVWorkspaceLayout;
+    int batch = q_nope.size(0);
+    int num_heads = q_nope.size(1);
+    int head_size_o = q_nope.size(2);
+    SplitKVWorkspaceLayout ws(batch, num_heads, num_kv_splits, head_size_o, sizeof(Element));
+    TORCH_CHECK(
+        static_cast<size_t>(workspace.numel()) >= ws.total_bytes,
+        "MLA workspace too small: need ",
+        ws.total_bytes,
+        " bytes for num_kv_splits=",
+        num_kv_splits,
+        ", but got ",
+        workspace.numel(),
+        " bytes. Reallocate workspace with flash_mla_get_workspace_size() using "
+        "matching (batch, num_heads, max_seq_len, page_size) parameters.");
+  }
 
-  CUTLASS_CHECK(fmla.run(arguments, workspace.data_ptr()));
+  if (num_kv_splits == 1) {
+    runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<false>>(
+        out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+  } else {
+    runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<true>>(
+        out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+  }
 }

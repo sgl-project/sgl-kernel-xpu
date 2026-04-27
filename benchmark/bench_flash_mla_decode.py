@@ -86,7 +86,7 @@ def benchmark(batch_size, seq_len, provider, block_size, num_kv_splits):
     q_pe = q[:, :, dv:].clone()
 
     workspace_size = flash_mla_get_workspace_size(
-        block_num * block_size, batch_size, num_kv_splits=num_kv_splits
+        block_num * block_size, batch_size, h_q, block_size, num_kv_splits=num_kv_splits
     )
     workspace = torch.empty(workspace_size, device="xpu", dtype=torch.uint8)
     scale = (512 + 64) ** (-0.5)

@@ -172,13 +172,14 @@ class XeMlaReduceSplitKV {
     TileScheduler tile_scheduler{params.scheduler};
     int num_kv_splits = params.scheduler.num_kv_splits;
 
+    auto seq_len_qo = s.seq_len_qo;
     auto num_heads_q = s.num_heads_q;
     auto head_size_o = s.head_size_o;
     auto batch = s.batch;
-    auto shape_O = make_shape(1, head_size_o, num_heads_q, batch);
-    auto shape_Oaccum = make_shape(1, head_size_o, num_heads_q * num_kv_splits, batch);
-    auto shape_exp_sums = make_shape(1, num_kv_splits, num_heads_q, batch);
-    auto shape_max_logits = make_shape(1, num_kv_splits, num_heads_q, batch);
+    auto shape_O = make_shape(seq_len_qo, head_size_o, num_heads_q, batch);
+    auto shape_Oaccum = make_shape(seq_len_qo, head_size_o, num_heads_q * num_kv_splits, batch);
+    auto shape_exp_sums = make_shape(seq_len_qo, num_kv_splits, num_heads_q, batch);
+    auto shape_max_logits = make_shape(seq_len_qo, num_kv_splits, num_heads_q, batch);
 
     Tensor O = make_tensor(make_gmem_ptr(p.O), make_layout(shape_O, p.dO));
     Tensor Oaccum = make_tensor(make_gmem_ptr(const_cast<ElementO*>(p.O_accum)), make_layout(shape_Oaccum, p.dO_accum));
@@ -197,11 +198,11 @@ class XeMlaReduceSplitKV {
       ElementLSE global_max{cutlass::platform::numeric_limits<ElementLSE>::lowest()};
 
       for (int s_idx = thr_id; s_idx < num_kv_splits; s_idx += WG_SIZE) {
-        ElementLSE cur_max_logit = max_logits(0, s_idx, head_q, idx_b);
+        ElementLSE cur_max_logit = max_logits(seq_idx, s_idx, head_q, idx_b);
         global_max = sycl::max(global_max, cur_max_logit);
         shared_storage.max_logits_slm[s_idx] = cur_max_logit;
 
-        shared_storage.exp_sums_slm[s_idx] = exp_sums(0, s_idx, head_q, idx_b);
+        shared_storage.exp_sums_slm[s_idx] = exp_sums(seq_idx, s_idx, head_q, idx_b);
       }
 
       // Barrier: ensure SLM writes are visible to all threads
@@ -225,7 +226,7 @@ class XeMlaReduceSplitKV {
           ElementLSE local_max = shared_storage.max_logits_slm[k];
           ElementLSE rescale = sycl::native::exp2(local_max - global_max);
 
-          ElementLSE o_val = static_cast<ElementLSE>(Oaccum(0, j, head_q * num_kv_splits + k, idx_b));
+          ElementLSE o_val = static_cast<ElementLSE>(Oaccum(seq_idx, j, head_q * num_kv_splits + k, idx_b));
 
           // O_accum is unnormalized (not divided by exp_sum in epilogue),
           // so multiply by rescale only
@@ -236,7 +237,7 @@ class XeMlaReduceSplitKV {
         ElementLSE inv_global_exp_sums = ElementLSE(1) / global_exp_sums;
         acc *= inv_global_exp_sums;
 
-        O(0, j, head_q, idx_b) = static_cast<ElementO>(acc);
+        O(seq_idx, j, head_q, idx_b) = static_cast<ElementO>(acc);
       }
     }
   }

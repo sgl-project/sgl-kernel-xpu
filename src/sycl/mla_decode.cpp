@@ -50,15 +50,15 @@ namespace {
 ///
 /// Derived from exhaustive tests on BMG :
 ///   - batch_size: 1, 4, 16
-///   - seq_len: 1024, 2048, 4096, 8192
+///   - seq_len: 1024, 2048, 4096, 8192, 16384, 32768
 ///   - num_heads: 16, 32, 64, 128
 ///   - page_size: 16, 32, 64, 128
-///   - num_kv_splits: 1, 2, 4, 8, 10, 16, 20, 24, 30, 36, 48, 64
+///   - num_kv_splits: 1, 2, 4, 8, 16, 32, 48, 64, 96, 128
 /// TODO: find a same optimal kv_split formula (ref:src/sycl/flash_attention.cpp[get_num_splits]), when entire mla is
 /// optimized.
 int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int64_t page_size) {
-  int base_parallel = batch * num_heads_q;
-  int total_pages = (seq_len_kv + page_size - 1) / page_size;
+  int base_parallel = static_cast<int>(batch * num_heads_q);
+  int total_pages = (static_cast<int>(seq_len_kv) + static_cast<int>(page_size) - 1) / static_cast<int>(page_size);
 
   int kv_per_split;
   if (page_size <= 16) {
@@ -68,20 +68,27 @@ int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int
   } else if (page_size <= 64) {
     kv_per_split = (base_parallel <= 64) ? 128 : 64;
   } else {
-    kv_per_split = page_size;
+    kv_per_split = static_cast<int>(page_size);
   }
 
   int pages_per_split = std::max(1, kv_per_split / static_cast<int>(page_size));
   int num_splits = std::max(1, total_pages / pages_per_split);
   num_splits = std::min(num_splits, total_pages);
 
-  if (batch == 1 && num_heads_q > total_pages) {
-    int ratio = static_cast<int>(num_heads_q) / total_pages;
-    int capped_splits = std::max(2, num_splits / ratio);
-    num_splits = std::min(num_splits, capped_splits);
+  // For long sequences with small page sizes, the base heuristic over-splits
+  // because kv_per_split was tuned for seq_len <= 8K. Each split needs enough
+  // KV work to amortize the split-KV reduction overhead.
+  if (seq_len_kv > 8192) {
+    if (page_size <= 16) {
+      int min_pages = (base_parallel <= 32) ? 64 : 16;
+      num_splits = std::min(num_splits, std::max(1, total_pages / min_pages));
+    }
+    if (page_size <= 32 && base_parallel <= 32) {
+      num_splits = std::min(num_splits, std::max(1, total_pages / 32));
+    }
   }
 
-  return std::max(1, num_splits);
+  return std::clamp(num_splits, 1, 128);
 }
 
 #define DISPATCH_MLA_PAGE_SIZE(ELEM)                                                                           \

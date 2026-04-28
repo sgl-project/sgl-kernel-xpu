@@ -9,7 +9,7 @@ import triton
 from sgl_kernel import flash_mla_decode, flash_mla_get_workspace_size
 
 bs_range = [1, 4, 16]
-kv_len_range = [1024, 2048, 4096, 8192]
+kv_len_range = [1024, 2048, 4096, 8192, 16384, 32768]
 
 configs = list(itertools.product(bs_range, kv_len_range))
 
@@ -329,9 +329,7 @@ if __name__ == "__main__":
 
     for block_size in args.block_sizes:
         for kv_split in args.num_kv_splits:
-            print(f"\n{'='*60}")
             print(f"Running: block_size={block_size}, num_kv_splits={kv_split}")
-            print(f"{'='*60}")
             benchmark.run(
                 print_data=False,
                 show_plots=False,

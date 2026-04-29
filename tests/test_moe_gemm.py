@@ -24,18 +24,11 @@ def apply_act_and_mul(
 
 
 def create_random_xpu_tensor(shape, dtype, mean=0, std=0.01):
-    """Create a random xpu tensor
-
-    Args:
-        shape: Tensor shape
-        dtype: Data type
-        mean: Mean value
-        std: Standard deviation
-
-    Returns:
-        torch.Tensor: Randomly initialized xpu tensor
-    """
     return torch.empty(shape, dtype=dtype, device="xpu").normal_(mean, std)
+
+
+def create_random_cpu_tensor(shape, dtype, mean=0, std=0.01):
+    return torch.empty(shape, dtype=dtype, device="cpu").normal_(mean, std)
 
 
 # GPT-OSS SwiGLU parameters (matches kernel defaults)
@@ -298,7 +291,7 @@ def _dequantize_weights_mxfp4(
 
 
 @pytest.mark.parametrize(
-    "num_tokens,topk,num_experts,hidden_size,intermediate_size,bias_dtype,act",
+    "num_tokens,topk,num_experts,hidden_size,intermediate_size,bias_dtype,activation",
     list(
         itertools.product(
             [1, 33, 222],  # num_tokens
@@ -307,15 +300,12 @@ def _dequantize_weights_mxfp4(
             [128, 1024],  # hidden_size  – must be a multiple of MXFP4_BLOCK_SIZE
             [128, 512],  # intermediate_size – must be a multiple of MXFP4_BLOCK_SIZE
             [False, "bfloat16", "float32"],  # bias_dtype
-            [
-                ("silu", None, None),
-                ("gelu", None, None),
-            ],  # (act_type, gemm1_alpha, gemm1_limit)
+            ["silu", "gelu"],  # activation type
         )
     ),
 )
 def test_moe_gemm_mxfp4_weights(
-    num_tokens, topk, num_experts, hidden_size, intermediate_size, bias_dtype, act
+    num_tokens, topk, num_experts, hidden_size, intermediate_size, bias_dtype, activation
 ):
     """Test fused_experts with MXFP4-packed expert weights (W4A16).
 
@@ -328,7 +318,7 @@ def test_moe_gemm_mxfp4_weights(
     difference is purely from the BF16 grouped GeMM arithmetic, not from
     quantisation, and should be within the same tolerances as the BF16 test.
     """
-    act_type, gemm1_alpha, gemm1_limit = act
+    act_type = activation
     torch.xpu.manual_seed_all(0)
 
     rtol, atol = 1e-1, 1e-2

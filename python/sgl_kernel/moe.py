@@ -4,10 +4,15 @@ import torch
 
 from .utils import is_xe2_arch
 
-# Lookup table for MXFP4 E2M1 dequantization: maps 3-bit magnitude codes to float values.
-# Index i corresponds to code i in {0,0.5,1.0,1.5,2.0,3.0,4.0,6.0}.
-_MXFP4_E2M1_TO_FLOAT = torch.tensor(
-    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
+# E2M1 lookup table: nibble value 0x0–0xF → float.
+# Encodes sign directly: 0b0xxx = positive, 0b1xxx = negative.
+# high nibble = second element; see _upcast_mxfp4_one_xpu in sglang).
+_MXFP4_E2M1_LUT = torch.tensor(
+    [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,        # 0b0xxx (positive)
+        0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,  # 0b1xxx (negative)
+    ],
+    dtype=torch.float32,
 )
 
 
@@ -257,10 +262,8 @@ def dequantize_mxfp4_weights(
     block_size: int = 32,
 ) -> torch.Tensor:
     """Dequantize MXFP4 (E2M1) packed expert weight tensor to BF16 (or other dtype).
-
-    MXFP4 uses the OCP MX format: 4-bit E2M1 data packed two-per-byte (low
-    nibble first), with one UE8M0 (uint8) block scale per ``block_size``
-    elements along the last dimension.
+        byte = (first_elem & 0xF) | (second_elem << 4)
+    i.e. low nibble = first element, high nibble = second element.
 
     Parameters:
     - packed:     [E, rows, packed_cols] uint8 – two FP4 nibbles per byte,
@@ -279,32 +282,25 @@ def dequantize_mxfp4_weights(
     cols = packed_cols * 2
     num_blocks = cols // block_size
 
-    # --- 1. Unpack two FP4 nibbles per byte (low nibble = element 0) ---
-    lo = packed & 0x0F  # [E, rows, packed_cols]
-    hi = (packed >> 4) & 0x0F  # [E, rows, packed_cols]
-    # Interleave lo/hi pairs → [E, rows, cols]
-    unpacked = torch.stack([lo, hi], dim=-1).reshape(E, rows, cols)
+    # --- 1. Unpack and dequantize via 16-entry signed LUT ---
+    # Low nibble = first element (even K position), high nibble = second element
+    lut = _MXFP4_E2M1_LUT.to(device=packed.device, dtype=torch.bfloat16)
+    lo = (packed & 0x0F).long()           # [E, rows, packed_cols]
+    hi = (packed >> 4).long()             # [E, rows, packed_cols]
+    # Interleave: [lo, hi] per packed position → [E, rows, cols]
+    paired = torch.stack([lut[lo], lut[hi]], dim=-1)  # [E, rows, packed_cols, 2]
+    dequantized = paired.reshape(E, rows, cols)
 
-    # --- 2. Dequantize E2M1 codes via lookup table ---
-    # E2M1 layout: bit 3 = sign, bits 2-0 = magnitude index
-    lut = _MXFP4_E2M1_TO_FLOAT.to(device=packed.device)
-    sign = ((unpacked >> 3) & 1).to(torch.bool)
-    magnitude_idx = (unpacked & 0x07).to(torch.long)
-    magnitude = lut[magnitude_idx]  # [E, rows, cols], float32
-    dequantized = torch.where(sign, -magnitude, magnitude)
-
-    # --- 3. Apply per-block UE8M0 scale factors ---
-    # Reshape into blocks: [E, rows, num_blocks, block_size]
-    dequantized_blocks = dequantized.reshape(E, rows, num_blocks, block_size)
-
-    # Decode UE8M0: float_scale = 2^(stored_byte - 127)
+    # --- 2. Apply per-block UE8M0 scale factors ---
+    dequantized = dequantized.reshape(E, rows, num_blocks, block_size)
     scale_exp = scales.to(torch.int32) - 127  # [E, rows, num_blocks]
-    # unsqueeze for broadcast over block_size dim
-    scale_values = torch.pow(2.0, scale_exp.float()).unsqueeze(-1)
+    scale_values = torch.exp2(scale_exp.float()).unsqueeze(-1).to(torch.bfloat16)
+    dequantized = dequantized * scale_values
 
-    scaled = dequantized_blocks * scale_values  # [E, rows, num_blocks, block_size]
-
-    return scaled.reshape(E, rows, cols).to(dtype)
+    result = dequantized.reshape(E, rows, cols)
+    if dtype != torch.bfloat16:
+        result = result.to(dtype)
+    return result
 
 
 def fused_experts(
@@ -403,8 +399,8 @@ def fused_experts(
         assert w1_scale.dtype == torch.uint8, "w1_scale must be uint8 (UE8M0 format)"
         assert w2_scale.dtype == torch.uint8, "w2_scale must be uint8 (UE8M0 format)"
     else:
-        assert w1_scale is None, "current MoE does not support w1_scale"
-        assert w2_scale is None, "current MoE does not support w2_scale"
+        assert w1_scale is None, "w1_scale is only supported when use_mxfp4_w4a16=True"
+        assert w2_scale is None, "w2_scale is only supported when use_mxfp4_w4a16=True"
 
     # type check
     assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"

@@ -5,12 +5,12 @@ from typing import Callable
 import pytest
 import torch
 import torch.nn.functional as F
-from sgl_kernel import fused_experts
 
 # Shared MXFP4 helpers live in a dedicated module next to this file.
 from mxfp4_utils import MXFP4_BLOCK_SIZE
 from mxfp4_utils import dequantize_mxfp4_2d as _dequantize_mxfp4_2d
 from mxfp4_utils import quantize_mxfp4_2d as _quantize_mxfp4_2d
+from sgl_kernel import fused_experts
 
 
 def apply_act_and_mul(
@@ -282,7 +282,13 @@ def _dequantize_weights_mxfp4(
     ),
 )
 def test_moe_gemm_mxfp4_weights(
-    num_tokens, topk, num_experts, hidden_size, intermediate_size, bias_dtype, activation
+    num_tokens,
+    topk,
+    num_experts,
+    hidden_size,
+    intermediate_size,
+    bias_dtype,
+    activation,
 ):
     """Test fused_experts with MXFP4-packed expert weights (W4A16).
 

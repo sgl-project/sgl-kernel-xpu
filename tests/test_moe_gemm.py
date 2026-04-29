@@ -1,5 +1,4 @@
 import itertools
-import os
 import sys
 from typing import Callable
 
@@ -8,12 +7,10 @@ import torch
 import torch.nn.functional as F
 from sgl_kernel import fused_experts
 
-# Reuse the reference MXFP4 quantisation/dequantisation helpers that live in
-# the dedicated unit-test file next to this one.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_per_token_group_quant_mxfp4 import MXFP4_BLOCK_SIZE
-from test_per_token_group_quant_mxfp4 import dequantize_mxfp4 as _dequantize_mxfp4_2d
-from test_per_token_group_quant_mxfp4 import quantize_to_mxfp4 as _quantize_mxfp4_2d
+# Shared MXFP4 helpers live in a dedicated module next to this file.
+from mxfp4_utils import MXFP4_BLOCK_SIZE
+from mxfp4_utils import dequantize_mxfp4_2d as _dequantize_mxfp4_2d
+from mxfp4_utils import quantize_mxfp4_2d as _quantize_mxfp4_2d
 
 
 def apply_act_and_mul(
@@ -299,6 +296,7 @@ def test_moe_gemm_mxfp4_weights(
     quantisation, and should be within the same tolerances as the BF16 test.
     """
     act_type = activation
+    torch.manual_seed(0)
     torch.xpu.manual_seed_all(0)
 
     rtol, atol = 1e-1, 1e-2

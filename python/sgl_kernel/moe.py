@@ -10,8 +10,22 @@ from .utils import is_xe2_arch
 # low nibble = first element, high nibble = second element.
 _MXFP4_E2M1_LUT_CPU = torch.tensor(
     [
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,        # 0b0xxx (positive)
-        0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,  # 0b1xxx (negative)
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,  # 0b0xxx (positive)
+        0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,  # 0b1xxx (negative)
     ],
     dtype=torch.bfloat16,
 )
@@ -311,15 +325,17 @@ def dequantize_mxfp4_weights(
     num_blocks = cols // block_size
 
     # Validate inputs
-    assert cols % block_size == 0, (
-        f"cols ({cols}) must be divisible by block_size ({block_size})"
-    )
-    assert scales.shape == (E, rows, num_blocks), (
-        f"scales shape {scales.shape} must be ({E}, {rows}, {num_blocks})"
-    )
-    assert packed.device == scales.device, (
-        f"packed and scales must be on the same device, got {packed.device} and {scales.device}"
-    )
+    assert (
+        cols % block_size == 0
+    ), f"cols ({cols}) must be divisible by block_size ({block_size})"
+    assert scales.shape == (
+        E,
+        rows,
+        num_blocks,
+    ), f"scales shape {scales.shape} must be ({E}, {rows}, {num_blocks})"
+    assert (
+        packed.device == scales.device
+    ), f"packed and scales must be on the same device, got {packed.device} and {scales.device}"
 
     # --- 1. Unpack and dequantize via 16-entry signed LUT ---
     lut = _get_e2m1_lut(packed.device)

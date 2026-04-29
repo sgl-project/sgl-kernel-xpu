@@ -114,6 +114,12 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
 void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize);
+void topk_sigmoid(
+    at::Tensor& topk_weights,
+    at::Tensor& topk_indices,
+    at::Tensor& gating_output,
+    bool renormalize,
+    const c10::optional<at::Tensor>& correction_bias);
 
 std::tuple<at::Tensor, at::Tensor> rotary_embedding(
     at::Tensor& positions,
@@ -242,6 +248,12 @@ void topk_softmax(
     torch::Tensor& topk_indices,
     torch::Tensor& token_expert_indices,
     torch::Tensor& gating_output);
+void topk_sigmoid(
+    torch::Tensor& topk_weights,
+    torch::Tensor& topk_indices,
+    torch::Tensor& gating_output,
+    bool renormalize,
+    const std::optional<torch::Tensor>& correction_bias);
 torch::Tensor swiglu_gpt_oss_sigmoid_alpha(torch::Tensor x, double alpha, double limit);
 
 std::vector<at::Tensor> moe_fused_gate(

@@ -61,6 +61,7 @@ from sgl_kernel.moe import (
     prepare_moe_input,
     scatter_tokens_to_experts,
     swiglu_gpt_oss_sigmoid_alpha,
+    topk_sigmoid,
     topk_softmax,
 )
 from sgl_kernel.sampling import (

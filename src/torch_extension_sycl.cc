@@ -48,6 +48,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
 
+  m.def(
+      "topk_sigmoid(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, Tensor? "
+      "correction_bias) -> ()");
+  m.impl("topk_sigmoid", torch::kXPU, &at::native::xpu::topk_sigmoid);
+
   m.def("swiglu_gpt_oss_sigmoid_alpha(Tensor x, float alpha, float limit) -> Tensor");
   m.impl("swiglu_gpt_oss_sigmoid_alpha", torch::kXPU, &swiglu_gpt_oss_sigmoid_alpha);
   m.def(

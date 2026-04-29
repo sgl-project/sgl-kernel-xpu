@@ -462,9 +462,6 @@ def fused_experts(
         # w1/w2 last dims are packed (H//2, I//2); recover actual dims
         K = K * 2
         N = N * 2
-    assert (N * 2 == w1.shape[1]) or (
-        N == w1.shape[1]
-    ), "w1 shape[1] must be 1x or 2x of w2 shape[2]"
     if b1 is not None:
         assert b1.shape == w1.shape[:2], "b1 shape must match w1 shape[:2]"
     if b2 is not None:
@@ -545,10 +542,6 @@ def fused_experts(
     avg_m = (M * TopK) // E
     big_weight = K * N > 4096 * 4096
     use_unfused_act = avg_m <= 128 and big_weight
-    # ---- GEMM1: dequantize w1 just before use, free immediately after ----
-    if use_mxfp4_w4a16:
-        w1 = dequantize_mxfp4_weights(w1, w1_scale)
-
     if use_unfused_act:
         intermediate_cache1 = torch.empty(
             (M * TopK, gate_factor * N),
@@ -558,6 +551,9 @@ def fused_experts(
         intermediate_cache2 = torch.empty(
             (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
         )
+        # Dequantize w1 just before GEMM1, free immediately after
+        if use_mxfp4_w4a16:
+            w1 = dequantize_mxfp4_weights(w1, w1_scale)
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
             intermediate_cache1,
             input_A_shuffle,
@@ -602,10 +598,14 @@ def fused_experts(
         )
         if use_mxfp4_w4a16:
             del w2
+            torch.xpu.empty_cache()
     else:
         intermediate_cache1 = torch.empty(
             (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
         )
+        # Dequantize w1 just before GEMM1, free immediately after
+        if use_mxfp4_w4a16:
+            w1 = dequantize_mxfp4_weights(w1, w1_scale)
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
             intermediate_cache1,
             input_A_shuffle,
@@ -638,6 +638,7 @@ def fused_experts(
         )
         if use_mxfp4_w4a16:
             del w2
+            torch.xpu.empty_cache()
 
     rsf = 1.0
 

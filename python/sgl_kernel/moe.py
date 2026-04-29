@@ -4,6 +4,12 @@ import torch
 
 from .utils import is_xe2_arch
 
+# Lookup table for MXFP4 E2M1 dequantization: maps 3-bit magnitude codes to float values.
+# Index i corresponds to code i in {0,0.5,1.0,1.5,2.0,3.0,4.0,6.0}.
+_MXFP4_E2M1_TO_FLOAT = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
+)
+
 
 def moe_align_block_size(
     topk_ids,
@@ -260,6 +266,63 @@ def cutlass_fp4_group_mm(
     return c.to(dtype=out_dtype)
 
 
+def dequantize_mxfp4_weights(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+    block_size: int = 32,
+) -> torch.Tensor:
+    """Dequantize MXFP4 (E2M1) packed expert weight tensor to BF16 (or other dtype).
+
+    MXFP4 uses the OCP MX format: 4-bit E2M1 data packed two-per-byte (low
+    nibble first), with one UE8M0 (uint8) block scale per ``block_size``
+    elements along the last dimension.
+
+    Parameters:
+    - packed:     [E, rows, packed_cols] uint8 – two FP4 nibbles per byte,
+                  where packed_cols = cols // 2.
+    - scales:     [E, rows, num_blocks]  uint8 in UE8M0 format
+                  (stored_byte = biased_exp + 127), where
+                  num_blocks = cols // block_size.
+    - dtype:      Output floating-point dtype (default: torch.bfloat16).
+    - block_size: Number of FP4 elements sharing one scale factor (default: 32).
+
+    Returns:
+    - Tensor of shape [E, rows, cols] in ``dtype`` on the same device as
+      ``packed``.
+    """
+    E, rows, packed_cols = packed.shape
+    cols = packed_cols * 2
+    num_blocks = cols // block_size
+
+    # --- 1. Unpack two FP4 nibbles per byte (low nibble = element 0) ---
+    lo = packed & 0x0F  # [E, rows, packed_cols]
+    hi = (packed >> 4) & 0x0F  # [E, rows, packed_cols]
+    # Interleave lo/hi pairs → [E, rows, cols]
+    unpacked = torch.stack([lo, hi], dim=-1).reshape(E, rows, cols)
+
+    # --- 2. Dequantize E2M1 codes via lookup table ---
+    # E2M1 layout: bit 3 = sign, bits 2-0 = magnitude index
+    lut = _MXFP4_E2M1_TO_FLOAT.to(device=packed.device)
+    sign = ((unpacked >> 3) & 1).to(torch.bool)
+    magnitude_idx = (unpacked & 0x07).to(torch.long)
+    magnitude = lut[magnitude_idx]  # [E, rows, cols], float32
+    dequantized = torch.where(sign, -magnitude, magnitude)
+
+    # --- 3. Apply per-block UE8M0 scale factors ---
+    # Reshape into blocks: [E, rows, num_blocks, block_size]
+    dequantized_blocks = dequantized.reshape(E, rows, num_blocks, block_size)
+
+    # Decode UE8M0: float_scale = 2^(stored_byte - 127)
+    scale_exp = scales.to(torch.int32) - 127  # [E, rows, num_blocks]
+    # unsqueeze for broadcast over block_size dim
+    scale_values = torch.pow(2.0, scale_exp.float()).unsqueeze(-1)
+
+    scaled = dequantized_blocks * scale_values  # [E, rows, num_blocks, block_size]
+
+    return scaled.reshape(E, rows, cols).to(dtype)
+
+
 def fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -271,6 +334,7 @@ def fused_experts(
     inplace: bool = False,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
+    use_mxfp4_w4a16: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_zp: Optional[torch.Tensor] = None,
@@ -299,6 +363,12 @@ def fused_experts(
     - activation (str): The activation function to use ('silu' or 'gelu'). Defaults to 'silu'.
     - use_fp8_w8a8 (bool): If True, use fp8 arithmetic to compute the inner
         products for w1 and w2. Defaults to False.
+    - use_mxfp4_w4a16 (bool): If True, w1 and w2 are in MXFP4 packed format
+        (uint8, two E2M1 nibbles per byte) with corresponding UE8M0 block
+        scales supplied via w1_scale and w2_scale.  The weights are
+        dequantized to BF16 before the grouped GeMM so the rest of the
+        computation is unchanged (W4A16: activations stay in BF16).
+        Defaults to False.
     - w1_scale (Optional[torch.Tensor]): Optional scale to be used for
         w1.
     - w2_scale (Optional[torch.Tensor]): Optional scale to be used for
@@ -321,8 +391,6 @@ def fused_experts(
     """
 
     assert use_fp8_w8a8 is False, "current MoE does not support use_fp8_w8a8"
-    assert w1_scale is None, "current MoE does not support w1_scale"
-    assert w2_scale is None, "current MoE does not support w2_scale"
     assert a1_scale is None, "current MoE does not support a1_scale"
     assert a2_scale is None, "current MoE does not support a2_scale"
     assert block_shape is None, "current MoE does not support block_shape"
@@ -331,10 +399,34 @@ def fused_experts(
         "gelu",
     ), f"Only silu and gelu are supported but got {activation}"
 
+    # For MXFP4 W4A16: validate packed uint8 inputs and scales.
+    # Actual dequantization is deferred to just before each GeMM so that
+    # at most one dequantized weight tensor lives in GPU memory at a time.
+    # Scales must be None on all non-mxfp4 code paths.
+    if use_mxfp4_w4a16:
+        assert (
+            w1.dtype == torch.uint8
+        ), "use_mxfp4_w4a16=True requires w1 to be uint8 (packed MXFP4)"
+        assert (
+            w2.dtype == torch.uint8
+        ), "use_mxfp4_w4a16=True requires w2 to be uint8 (packed MXFP4)"
+        assert (
+            w1_scale is not None
+        ), "w1_scale (UE8M0 uint8) must be provided when use_mxfp4_w4a16=True"
+        assert (
+            w2_scale is not None
+        ), "w2_scale (UE8M0 uint8) must be provided when use_mxfp4_w4a16=True"
+        assert w1_scale.dtype == torch.uint8, "w1_scale must be uint8 (UE8M0 format)"
+        assert w2_scale.dtype == torch.uint8, "w2_scale must be uint8 (UE8M0 format)"
+    else:
+        assert w1_scale is None, "current MoE does not support w1_scale"
+        assert w2_scale is None, "current MoE does not support w2_scale"
+
     # type check
     assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
-    assert w1.dtype == torch.bfloat16, "w1 must be bfloat16"
-    assert w2.dtype == torch.bfloat16, "w2 must be bfloat16"
+    if not use_mxfp4_w4a16:
+        assert w1.dtype == torch.bfloat16, "w1 must be bfloat16"
+        assert w2.dtype == torch.bfloat16, "w2 must be bfloat16"
     if b1 is not None:
         assert (
             b1.dtype == torch.bfloat16 or b1.dtype == torch.float32
@@ -350,13 +442,17 @@ def fused_experts(
             # cast b2 to float32, since bias is accumulated in float32 in the kernel
             b2 = b2.float()
     # Shape check
+    # For packed MXFP4 the last dim of w1/w2 is halved (2 FP4 values per byte),
+    # so compute the actual (unpacked) inner dimensions for validation.
+    _w1_inner = w1.shape[-1] * 2 if use_mxfp4_w4a16 else w1.shape[-1]
+    _w2_inner = w2.shape[-1] * 2 if use_mxfp4_w4a16 else w2.shape[-1]
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
     assert (
-        hidden_states.shape[-1] == w1.shape[-1]
-    ), f"hidden_states shape[-1] {hidden_states.shape} must be equal to w1 shape[-2] {w1.shape}"
+        hidden_states.shape[-1] == _w1_inner
+    ), f"hidden_states shape[-1] {hidden_states.shape} must equal w1 inner dim {_w1_inner} (w1.shape={w1.shape})"
     assert (
-        2 * w2.shape[2] == w1.shape[1]
-    ), f"w2 shape[2] {w2.shape[2]} must be half of w1 shape[1] {w1.shape[1]}"
+        2 * _w2_inner == w1.shape[1]
+    ), f"w2 inner dim {_w2_inner} must be half of w1 shape[1] {w1.shape[1]}"
     assert (topk_ids.shape == topk_weights.shape) and (
         topk_ids.shape[0] == hidden_states.shape[0]
     ), f"topk_ids shape {topk_ids.shape} and topk_weights shape {topk_weights.shape} must be equal and match hidden_states shape[0] {hidden_states.shape[0]}"
@@ -365,6 +461,10 @@ def fused_experts(
 
     E, _, K = w1.shape
     E, OutK, N = w2.shape
+    if use_mxfp4_w4a16:
+        # w1/w2 last dims are packed (H//2, I//2); recover actual dims
+        K = K * 2
+        N = N * 2
     assert N * 2 == w1.shape[1], "w1 shape[1] must be 2x of w2 shape[2]"
     if b1 is not None:
         assert b1.shape == w1.shape[:2], "b1 shape must match w1 shape[:2]"
@@ -442,6 +542,10 @@ def fused_experts(
     avg_m = (M * TopK) // E
     big_weight = K * N > 4096 * 4096
     use_unfused_act = avg_m <= 128 and big_weight
+    # ---- GEMM1: dequantize w1 just before use, free immediately after ----
+    if use_mxfp4_w4a16:
+        w1 = dequantize_mxfp4_weights(w1, w1_scale)
+
     if use_unfused_act:
         intermediate_cache1 = torch.empty(
             (M * TopK, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype
@@ -461,6 +565,12 @@ def fused_experts(
             gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
             gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
         )
+        # Free dequantized w1 before allocating dequantized w2 — ensures at most
+        # one dequantized weight tensor occupies GPU memory at a time.
+        if use_mxfp4_w4a16:
+            del w1
+            torch.xpu.empty_cache()
+            w2 = dequantize_mxfp4_weights(w2, w2_scale)
         if activation_type == 0:
             torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
         elif activation_type == 1:
@@ -483,6 +593,8 @@ def fused_experts(
             gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
             gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
         )
+        if use_mxfp4_w4a16:
+            del w2
     else:
         intermediate_cache1 = torch.empty(
             (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
@@ -499,6 +611,12 @@ def fused_experts(
             gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
             gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
         )
+        # Free dequantized w1 before allocating dequantized w2 — ensures at most
+        # one dequantized weight tensor occupies GPU memory at a time.
+        if use_mxfp4_w4a16:
+            del w1
+            torch.xpu.empty_cache()
+            w2 = dequantize_mxfp4_weights(w2, w2_scale)
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
             intermediate_cache3,
             intermediate_cache1,
@@ -511,6 +629,8 @@ def fused_experts(
             gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
             gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
         )
+        if use_mxfp4_w4a16:
+            del w2
 
     rsf = 1.0
 

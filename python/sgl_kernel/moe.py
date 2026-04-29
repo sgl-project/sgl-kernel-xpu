@@ -6,14 +6,24 @@ from .utils import is_xe2_arch
 
 # E2M1 lookup table: nibble value 0x0–0xF → float.
 # Encodes sign directly: 0b0xxx = positive, 0b1xxx = negative.
-# high nibble = second element; see _upcast_mxfp4_one_xpu in sglang).
-_MXFP4_E2M1_LUT = torch.tensor(
+# Packing convention (matches sglang upstream / DeepSeek / sgl-kernel-xpu):
+# low nibble = first element, high nibble = second element.
+_MXFP4_E2M1_LUT_CPU = torch.tensor(
     [
         0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,        # 0b0xxx (positive)
         0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,  # 0b1xxx (negative)
     ],
-    dtype=torch.float32,
+    dtype=torch.bfloat16,
 )
+# Cache of device-resident LUTs to avoid re-copying on every call.
+_MXFP4_E2M1_LUT_CACHE: Dict[torch.device, torch.Tensor] = {}
+
+
+def _get_e2m1_lut(device: torch.device) -> torch.Tensor:
+    """Return a device-resident BF16 E2M1 lookup table, cached after first use."""
+    if device not in _MXFP4_E2M1_LUT_CACHE:
+        _MXFP4_E2M1_LUT_CACHE[device] = _MXFP4_E2M1_LUT_CPU.to(device=device)
+    return _MXFP4_E2M1_LUT_CACHE[device]
 
 
 def moe_align_block_size(
@@ -262,6 +272,8 @@ def dequantize_mxfp4_weights(
     block_size: int = 32,
 ) -> torch.Tensor:
     """Dequantize MXFP4 (E2M1) packed expert weight tensor to BF16 (or other dtype).
+
+    Packing convention (matches sglang upstream / DeepSeek / sgl-kernel-xpu):
         byte = (first_elem & 0xF) | (second_elem << 4)
     i.e. low nibble = first element, high nibble = second element.
 
@@ -282,19 +294,30 @@ def dequantize_mxfp4_weights(
     cols = packed_cols * 2
     num_blocks = cols // block_size
 
+    # Validate inputs
+    assert cols % block_size == 0, (
+        f"cols ({cols}) must be divisible by block_size ({block_size})"
+    )
+    assert scales.shape == (E, rows, num_blocks), (
+        f"scales shape {scales.shape} must be ({E}, {rows}, {num_blocks})"
+    )
+    assert packed.device == scales.device, (
+        f"packed and scales must be on the same device, got {packed.device} and {scales.device}"
+    )
+
     # --- 1. Unpack and dequantize via 16-entry signed LUT ---
-    # Low nibble = first element (even K position), high nibble = second element
-    lut = _MXFP4_E2M1_LUT.to(device=packed.device, dtype=torch.bfloat16)
-    lo = (packed & 0x0F).long()           # [E, rows, packed_cols]
-    hi = (packed >> 4).long()             # [E, rows, packed_cols]
-    # Interleave: [lo, hi] per packed position → [E, rows, cols]
-    paired = torch.stack([lut[lo], lut[hi]], dim=-1)  # [E, rows, packed_cols, 2]
-    dequantized = paired.reshape(E, rows, cols)
+    lut = _get_e2m1_lut(packed.device)
+
+    # Allocate output directly and fill even/odd positions to avoid
+    # torch.stack + reshape intermediaries.
+    dequantized = torch.empty(E, rows, cols, dtype=torch.bfloat16, device=packed.device)
+    dequantized[:, :, 0::2] = lut[(packed & 0x0F).int()]
+    dequantized[:, :, 1::2] = lut[(packed >> 4).int()]
 
     # --- 2. Apply per-block UE8M0 scale factors ---
-    dequantized = dequantized.reshape(E, rows, num_blocks, block_size)
+    dequantized = dequantized.view(E, rows, num_blocks, block_size)
     scale_exp = scales.to(torch.int32) - 127  # [E, rows, num_blocks]
-    scale_values = torch.exp2(scale_exp.float()).unsqueeze(-1).to(torch.bfloat16)
+    scale_values = torch.exp2(scale_exp).unsqueeze(-1).to(torch.bfloat16)
     dequantized = dequantized * scale_values
 
     result = dequantized.reshape(E, rows, cols)
@@ -548,7 +571,6 @@ def fused_experts(
         # one dequantized weight tensor occupies GPU memory at a time.
         if use_mxfp4_w4a16:
             del w1
-            torch.xpu.empty_cache()
             w2 = dequantize_mxfp4_weights(w2, w2_scale)
         if activation_type == 0:
             torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
@@ -574,7 +596,6 @@ def fused_experts(
         )
         if use_mxfp4_w4a16:
             del w2
-            torch.xpu.empty_cache()
     else:
         intermediate_cache1 = torch.empty(
             (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
@@ -598,7 +619,6 @@ def fused_experts(
         # one dequantized weight tensor occupies GPU memory at a time.
         if use_mxfp4_w4a16:
             del w1
-            torch.xpu.empty_cache()
             w2 = dequantize_mxfp4_weights(w2, w2_scale)
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
             intermediate_cache3,
@@ -614,7 +634,6 @@ def fused_experts(
         )
         if use_mxfp4_w4a16:
             del w2
-            torch.xpu.empty_cache()
 
     rsf = 1.0
 

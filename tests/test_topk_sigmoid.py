@@ -22,10 +22,11 @@ def fused_topk_sigmoid_torch_native(
     ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
     if correction_bias is not None:
         n_routed_experts = gating_output.shape[-1]
-        scores = F.sigmoid(gating_output).view(
+        scores = F.sigmoid(gating_output)
+        scores_for_choice = scores.view(
             -1, n_routed_experts
         ) + correction_bias.unsqueeze(0)
-        topk_ids = torch.topk(scores, k=topk, dim=-1, sorted=False)[1]
+        topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=False)[1]
         topk_weights = scores.gather(1, topk_ids)
     else:
         M, _ = hidden_states.shape
@@ -45,19 +46,25 @@ def fused_topk_sigmoid_torch_native(
 @pytest.mark.parametrize("n_expert", [8, 32])
 @pytest.mark.parametrize("n_topk", [1, 2, 4])
 @pytest.mark.parametrize("renormalize", [False, True])
-def test_topk_sigmoid(dtype, n_token, n_topk, n_expert, renormalize):
+@pytest.mark.parametrize("with_correction_bias", [False, True])
+def test_topk_sigmoid(
+    dtype, n_token, n_topk, n_expert, renormalize, with_correction_bias
+):
     torch.manual_seed(1024)
 
     # expand gating_output by M, otherwise bfloat16 fall into same value aftering truncating
     hidden_states = torch.randn(n_token, 100, device=device, dtype=dtype)
     gating_output = torch.randn(n_token, n_expert, device=device, dtype=dtype)
+    correction_bias = None
+    if with_correction_bias:
+        correction_bias = torch.randn((n_expert), dtype=torch.float32, device=device)
 
     ref_token_weights, ref_topk_indices = fused_topk_sigmoid_torch_native(
         hidden_states.float(),
         gating_output.float(),
         n_topk,
         renormalize,
-        None,
+        correction_bias,
     )
 
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
@@ -76,6 +83,7 @@ def test_topk_sigmoid(dtype, n_token, n_topk, n_expert, renormalize):
         topk_indices,
         gating_output,
         renormalize,
+        correction_bias,
     )
 
     # Compare the results

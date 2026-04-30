@@ -223,7 +223,7 @@ void topk_sigmoid(
   TORCH_CHECK(shape.size() == 2, "gating_output must be 2D");
   int64_t n_tokens = shape[0];
   int64_t n_experts = shape[1];
-  TORCH_CHECK(n_experts <= 128, "n_experts only support up to 128, got ", n_experts);
+  TORCH_CHECK(n_experts <= 256, "n_experts only support up to 256, got ", n_experts);
   TORCH_CHECK(topk_weights.scalar_type() == at::kFloat, "topk_weights should be Float");
   TORCH_CHECK(topk_indices.scalar_type() == at::kInt, "topk_indices should be Int");
 

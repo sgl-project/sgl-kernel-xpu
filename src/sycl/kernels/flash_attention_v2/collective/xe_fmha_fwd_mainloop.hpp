@@ -339,23 +339,16 @@ struct FMHAFwdMainloop<
     /* Initialization steps for first block: Q/K prefetch, O init */
     /* TODO: limit D prefetch for large head size, and reorder K prefetches */
     int kblocks_cache = ceil_div(seq_len_kv_cache, get<1>(TileShapeQK{}));
+    int page_idx = blk_k0;
+    int next_page_idx = blk_k0;
+    if constexpr (PagedKV) {
+      next_page_idx = get_physical_k_tile(blk_k0, l_coord, seq_len_kv_cache);
+    }
     for (int D = 0; D < size<3>(pQgQ); D++) {
       prefetch(prefetch_q, pQgQ(_, _, _, D));
     }
     for (int D = 0; D < size<4>(pKgK); D++) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int K = 0; K < Stages; K++) {
-        if (K < kblocks_cache) {
-          if constexpr (PagedKV) {
-            int physical_K_tile = get_physical_k_tile(K, l_coord, seq_len_kv_cache);
-            prefetch(prefetch_k_cache, pKgK_cache(_, _, _, physical_K_tile, D));
-          } else {
-            prefetch(prefetch_k_cache, pKgK_cache(_, _, _, K, D));
-          }
-        } else {
-          prefetch(prefetch_k, pKgK(_, _, _, K - kblocks_cache, D));
-        }
-      }
+      prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
     }
     if (blk_k0 == 0) {
       clear(tArA);
@@ -366,32 +359,20 @@ struct FMHAFwdMainloop<
     /* Check if */
     bool check_remainder_k = (seq_len % get<1>(TileShapeQK{}) != 0);
 
-    /* Main loop body */
-    auto mainloop_body = [&](auto cached_k,
-                             int K,
-                             auto& copy_k_cur,
-                             auto& copy_v_cur,
-                             auto& prefetch_v_cur,
-                             auto& tKgK_cur,
-                             auto& tVgV_cur,
-                             auto& pVgV_cur) {
+    /* Main loop, blocked in k. */
+    for (int K = blk_k0; K < blk_k1 && K < kblocks_cache; K++) {
       /* Split barrier to keep threads together */
-      // barrier_arrive(ScopeWorkgroup);
+      barrier_arrive(ScopeWorkgroup);
+
       bool need_causal = false;
       if constexpr (CausalMask) {
         need_causal = K >= blk_k1_causal;
       }
 
-      constexpr bool is_cache = decltype(cached_k)::value;
-
-      int k_idx;
-      if constexpr (is_cache) {
-        k_idx = K;
-        if constexpr (PagedKV) {
-          k_idx = get_physical_k_tile(K, l_coord, seq_len_kv_cache);
-        }
-      } else {
-        k_idx = K - kblocks_cache;
+      page_idx = next_page_idx;
+      next_page_idx = K + 1;
+      if constexpr (PagedKV) {
+        next_page_idx = get_physical_k_tile(next_page_idx, l_coord, seq_len_kv_cache);
       }
 
       /* GEMM 1: S = K * Q */
@@ -399,23 +380,20 @@ struct FMHAFwdMainloop<
       CUTLASS_PRAGMA_UNROLL
       for (int D = 0; D < size<4>(tKgK); D++) {
         copy(copy_q, tQgQ(_, _, _, D), tQrQ);
-        copy(copy_k_cur, tKgK_cur(_, _, _, k_idx, D), tKrK);
+        copy(copy_k_cache, tKgK_cache(_, _, _, page_idx, D), tKrK);
         reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);
-
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
       }
 
       /* V prefetch for GEMM 2 */
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
-        prefetch(prefetch_v_cur, pVgV_cur(_, _, _, VV, k_idx));
+        prefetch(prefetch_v_cache, pVgV_cache(_, _, _, VV, page_idx));
       }
 
-      /* Causal masking - only in non-cache mode */
-      // if constexpr (!is_cache && CausalMask) {
-      if constexpr (is_cache && CausalMask) {
-        // if (K == total_blk - 1) {
+      /* Causal masking */
+      if constexpr (CausalMask) {
         if (need_causal) {
           // Need to get global col and row indices to mask the elements
           Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
@@ -432,47 +410,18 @@ struct FMHAFwdMainloop<
         }
       }
 
-      // /* Causal masking - only in non-cache mode */
-      // if constexpr (CausalMask) {
-      //   int lane_id = thr_id % intel::sg_size;
-      //   constexpr int sg_tile_q = get<0>(TileShapeQK{}) / SGPerWG::value;
-      //   int row_base = get<0>(blk_qv) * get<0>(TileShapeQK{}) + (thr_id / intel::sg_size) * sg_tile_q;
-      //   if (need_causal) {
-      //     constexpr int kTileK = get<1>(TileShapeQK{});
-      //     constexpr int n_reps = kTileK / intel::sg_size;
-      //     const int elems_per_n = tSrS.size() / n_reps;
-      //     // constexpr int elems_per_n = decltype(size(tSrS))::value / n_reps;
-      //     // constexpr int elems_per_n = decltype(cute::size(tSrS))::value / n_reps;
-      //     int k_base = K * kTileK;
-      //     CUTLASS_PRAGMA_UNROLL
-      //     for (int n = 0; n < n_reps; n++) {
-      //       int col = k_base + n * intel::sg_size + lane_id;
-      //       int causal_bound = col - full_tile_offset - row_base;
-      //       CUTLASS_PRAGMA_UNROLL
-      //       for (int j = 0; j < elems_per_n; j++) {
-      //         if (j < causal_bound) {
-      //           tSrS(n * elems_per_n + j) = ElementS(-INFINITY);
-      //         }
-      //       }
-      //     }
-      //   }
-      // }
-
       /* k masking for remainder tiles */
-      if constexpr (is_cache) {
-        if (check_remainder_k && K == total_blk - 1) {
-          FragSCol k_rem_mask;
-          // int k_val = get<0>(tKgK_cur(0, 0, 0, k_idx, 0)) + kblocks_cache * get<1>(TileShapeQK{});
-          int k_val = get<0>(tKgK_cur(0, 0, 0, K, 0));
-          int k = k_val + get_sub_group().get_local_id()[0];
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < k_rem_mask.size(); i++, k += intel::sg_size) {
-            k_rem_mask(i) = (k < seq_len) ? ElementS(sycl::nan(0u)) : ElementS(-INFINITY);
-          }
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tSrS.size(); i++) {
-            tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(k_rem_mask, tSrS, i));
-          }
+      if (check_remainder_k && K == total_blk - 1) {
+        FragSCol k_rem_mask;
+        int k_val = get<0>(tKgK_cache(0, 0, 0, K, 0));
+        int k = k_val + get_sub_group().get_local_id()[0];
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < k_rem_mask.size(); i++, k += intel::sg_size) {
+          k_rem_mask(i) = (k < seq_len) ? ElementS(sycl::nan(0u)) : ElementS(-INFINITY);
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tSrS.size(); i++) {
+          tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(k_rem_mask, tSrS, i));
         }
       }
 
@@ -480,64 +429,27 @@ struct FMHAFwdMainloop<
       auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum);
       reorder(tSrS, tArP);
 
-      /* GEMM 2: A += P * V, split in v dimension.
-        tArA rescaling is fused to per-VTile */
+      /* GEMM 2: A += P * V, split in v dimension. */
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
-        copy(copy_v_cur, tVgV_cur(_, _, _, VV, k_idx), tVrV);
+        copy(copy_v_cache, tVgV_cache(_, _, _, VV, page_idx), tVrV);
         reorder(tVrV, tArV);
         if (K != blk_k0) {
           CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tArA.size() / VTiles; i++)
+          for (int i = 0; i < tArA.size() / VTiles; i++) {
             tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
+          }
         }
-
         cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
       }
 
-      barrier();
-
       /* K prefetch */
-      int K_next = K + Stages;
       for (int D = 0; D < size<4>(pKgK); D++) {
-        if constexpr (is_cache) {
-          bool is_cache_next = K_next < kblocks_cache;
-          int physical_K_next = K_next;
-          if constexpr (PagedKV) {
-            if (is_cache_next) {
-              physical_K_next = get_physical_k_tile(K_next, l_coord, seq_len_kv_cache);
-            }
-          }
-          if (is_cache_next) {
-            prefetch(prefetch_k_cache, pKgK_cache(_, _, _, physical_K_next, D));
-          } else {
-            prefetch(prefetch_k, pKgK(_, _, _, K_next - kblocks_cache, D));
-          }
-        } else {
-          prefetch(prefetch_k, pKgK(_, _, _, K_next - kblocks_cache, D));
-        }
+        prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
       }
-      // barrier_wait(ScopeWorkgroup);
-    };
 
-    /* Main loop, blocked in k. */
-    if constexpr (CachedKV) {
-      for (int K = blk_k0; K < kblocks_cache; K++) {
-        mainloop_body(
-            std::bool_constant<true>{},
-            K,
-            copy_k_cache,
-            copy_v_cache,
-            prefetch_v_cache,
-            tKgK_cache,
-            tVgV_cache,
-            pVgV_cache);
-      }
+      barrier_wait(ScopeWorkgroup);
     }
-
-    // for (int K = (blk_k0 > kblocks_cache ? blk_k0 : kblocks_cache); K < blk_k1; K++) {
-    //   mainloop_body(std::bool_constant<false>{}, K, copy_k, copy_v, prefetch_v, tKgK, tVgV, pVgV);
-    // }
   }
 
   // Single step of blocked softmax.

@@ -10,7 +10,7 @@ def _top_k_renorm_probs_internal(
     top_k_val: int,
 ) -> torch.Tensor:
     probs = probs.float()
-    maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
+    maybe_top_k_arr = maybe_top_k_arr.long() if maybe_top_k_arr is not None else None
     renorm_probs = torch.empty_like(probs)
     torch.ops.sgl_kernel.top_k_renorm_probs.default(
         probs, renorm_probs, maybe_top_k_arr, top_k_val

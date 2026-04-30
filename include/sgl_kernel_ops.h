@@ -417,7 +417,7 @@ void min_p_sampling_from_probs(
     std::optional<at::Generator> gen);
 
 void top_k_renorm_probs(
-    at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val);
+    const at::Tensor& probs, at::Tensor& renorm_probs, const std::optional<at::Tensor>& maybe_top_k_arr, int64_t top_k_val);
 
 void top_p_renorm_probs(
     at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_p_arr, double top_p_val);

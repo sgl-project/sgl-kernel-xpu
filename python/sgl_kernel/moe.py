@@ -32,6 +32,10 @@ _MXFP4_E2M1_LUT_CPU = torch.tensor(
 # Cache of device-resident LUTs to avoid re-copying on every call.
 _MXFP4_E2M1_LUT_CACHE: Dict[torch.device, torch.Tensor] = {}
 
+# Number of experts to dequantize per iteration. Bounds the int64 index tensor
+# materialized by advanced indexing during gather — prevents OOM on large E.
+_MXFP4_DEQUANT_EXPERT_CHUNK = 4
+
 
 def _get_e2m1_lut(device: torch.device) -> torch.Tensor:
     """Return a device-resident BF16 E2M1 lookup table, cached after first use."""
@@ -298,7 +302,7 @@ def dequantize_mxfp4_weights(
                   multiplier), matching upstream sglang
                   ``_upcast_mxfp4_one_xpu``'s contract. Callers holding raw
                   UE8M0 bytes must decode to fp32 first via
-                  ``torch.exp2((byte.to(int32) - 127).to(float32))``, where
+                  ``_ue8m0_to_fp32_multiplier``, where
                   num_blocks = cols // block_size.
     - dtype:      Output floating-point dtype (default: torch.bfloat16).
     - block_size: Number of FP4 elements sharing one scale factor (default: 32).
@@ -325,28 +329,42 @@ def dequantize_mxfp4_weights(
     ), f"packed and scales must be on the same device, got {packed.device} and {scales.device}"
     assert scales.dtype == torch.float32, (
         f"scales must be float32 direct multiplier (matches upstream "
-        f"_upcast_mxfp4_one_xpu contract); decode UE8M0 bytes first if needed. "
-        f"got {scales.dtype}"
+        f"_upcast_mxfp4_one_xpu contract); decode UE8M0 bytes first via "
+        f"_ue8m0_to_fp32_multiplier. got {scales.dtype}"
     )
 
-    # --- 1. Unpack and dequantize via 16-entry signed LUT ---
     lut = _get_e2m1_lut(packed.device)
+    out = torch.empty(E, rows, cols, dtype=torch.bfloat16, device=packed.device)
 
-    # Allocate output directly and fill even/odd positions to avoid
-    # torch.stack + reshape intermediaries.
-    dequantized = torch.empty(E, rows, cols, dtype=torch.bfloat16, device=packed.device)
-    dequantized[:, :, 0::2] = lut[(packed & 0x0F).int()]
-    dequantized[:, :, 1::2] = lut[(packed >> 4).int()]
+    # Cast fp32 multiplier to bf16 once up-front; reused per chunk.
+    scale_mul = scales.to(torch.bfloat16)
 
-    # --- 2. Apply per-block direct-multiplier scale factors ---
-    dequantized = dequantized.view(E, rows, num_blocks, block_size)
-    scale_values = scales.unsqueeze(-1).to(torch.bfloat16)
-    dequantized = dequantized * scale_values
+    # Chunk over experts: a flat 1-D gather is faster on Intel L0 than an
+    # N-D advanced-index gather, and chunking bounds the int64 index tensor
+    # materialized by index_select so it doesn't blow peak memory on large E.
+    CHUNK = _MXFP4_DEQUANT_EXPERT_CHUNK
+    for start in range(0, E, CHUNK):
+        end = min(start + CHUNK, E)
+        chunk = packed[start:end]  # [C, rows, packed_cols]
 
-    result = dequantized.reshape(E, rows, cols)
+        lo_idx = (chunk & 0x0F).reshape(-1).to(torch.long)
+        hi_idx = (chunk >> 4).reshape(-1).to(torch.long)
+        lo_vals = lut.index_select(0, lo_idx).view(end - start, rows, packed_cols)
+        hi_vals = lut.index_select(0, hi_idx).view(end - start, rows, packed_cols)
+
+        # Strided writes avoid an extra [C, rows, packed_cols, 2] stack + reshape.
+        out_chunk = out[start:end]
+        out_chunk[:, :, 0::2] = lo_vals
+        out_chunk[:, :, 1::2] = hi_vals
+
+        # Apply per-block scale in-place.
+        out_chunk.view(end - start, rows, num_blocks, block_size).mul_(
+            scale_mul[start:end].unsqueeze(-1)
+        )
+
     if dtype != torch.bfloat16:
-        result = result.to(dtype)
-    return result
+        out = out.to(dtype)
+    return out
 
 
 def _ue8m0_to_fp32_multiplier(ue8m0: torch.Tensor) -> torch.Tensor:

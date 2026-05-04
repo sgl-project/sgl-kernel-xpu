@@ -30,7 +30,11 @@
  **************************************************************************************************/
 /*!
   \file
-  \brief Shared type definitions for MLA decode kernel instantiations
+  \brief Shared type definitions for MLA prefill kernel instantiations.
+
+  Supports varlen/ragged Q with cu_seqlens_q for incremental prefill.
+  Causal masking uses FA2-style offset: k_idx <= (seqlen_k - seqlen_q) + q_idx.
+  Q tile size = 16 (one DPAS-8 pair per subgroup in the M direction).
 */
 
 #pragma once
@@ -45,72 +49,38 @@
 #include "../../../Utils.h"
 #include "sycl/kernels/mla/collective/xe_mla_epilogue.hpp"
 #include "sycl/kernels/mla/collective/xe_mla_mainloop.hpp"
+#include "sycl/kernels/mla/device/mla_decode_types.hpp"  // re-use FMlAProblemShape, helpers
 #include "sycl/kernels/mla/device/mla_runner.hpp"
 #include "sycl/kernels/mla/kernel/mla_tile_scheduler.hpp"
 #include "sycl/kernels/mla/kernel/xe_mla_kernel.hpp"
 
 using namespace cute;
 
-//----------------- set persistent options --------------------//
-template <bool v>
-struct IsPersistent {
-  static const bool value = v;
-};
-
-//----------------- set page size options --------------------//
-template <int PageSize>
-struct PageSizeOption {
-  static constexpr int value = PageSize;
-};
-
-//----------------- set element type options --------------------//
-template <typename T>
-struct ToCutlassElementType {
-  using type = T;
-};
-
-template <>
-struct ToCutlassElementType<sycl::half> {
-  using type = cutlass::half_t;
-};
-
-template <>
-struct ToCutlassElementType<sycl::ext::oneapi::bfloat16> {
-  using type = cutlass::bfloat16_t;
-};
-
-//----------------- define problem shape --------------------//
-struct FMlAProblemShape {
-  int batch = 0;
-  int num_heads_q = 0;
-  int num_heads_kv = 0;
-  int seq_len_qo = 0;
-  int seq_len_kv = 0;
-  int head_size_q_nope = 0;
-  int head_size_q_pe = 0;
-  int head_size_kv = 0;
-  int head_size_k_pe = 0;
-  int head_size_o = 0;
-  int page_size = 0;
-  int total_page = 0;
-
-  FMlAProblemShape() = default;
-};
-
-//----------------- define MLA Xe configuration --------------------//
+//----------------- define MLA Xe Prefill configuration --------------------//
+// Q tile = 16 rows; causal masking enabled; everything else mirrors MlaXe.
 template <typename T, typename PageSizeOpt = PageSizeOption<64>, typename PersistenceOption = IsPersistent<false>>
-struct MlaXe {
+struct MlaXePrefill {
   // TODO: add persistence option support in tile scheduler
   using TileScheduler = typename cutlass::flash_attention::kernel::XeMlaIndividualTileScheduler;
+
+  // Number of Q rows per work-group tile (must be a multiple of DPAS M = 8).
+  static constexpr int Q_TILE_M = 16;
 
   static constexpr int PAGE_SIZE = PageSizeOpt::value;
   using KvTileSizeType = cute::Int<PAGE_SIZE>;
 
-  static constexpr int NumSubgroupsN = PAGE_SIZE / 16;
+  // Always use 1 subgroup for prefill.  With Q_TILE_M=16 the cross-SG
+  // reduction epilogue needs ~(Q_TILE_M * 512 * NumSGs) floats of SLM for
+  // the output accumulator.  For NumSubgroupsN=PAGE_SIZE/16 and PAGE_SIZE>=32
+  // this exceeds the 64 KB per-workgroup SLM budget on BMG, causing a hang.
+  // A single subgroup handles the full KV tile; the K-loop already provides
+  // sufficient work across pages.
+  static constexpr int NumSubgroupsN = 1;
 
-  using TileShapeQK = Shape<_1, KvTileSizeType, _64>;
-  using TileShapePV = Shape<_1, _64, KvTileSizeType>;
-  using TileShapeOutput = Shape<_1, _512>;
+  // Tile shapes: (Q_tile, K_tile, head_dim) for QK; (Q_tile, V_dim, K_tile) for PV
+  using TileShapeQK = Shape<cute::Int<Q_TILE_M>, KvTileSizeType, _64>;
+  using TileShapePV = Shape<cute::Int<Q_TILE_M>, _64, KvTileSizeType>;
+  using TileShapeOutput = Shape<cute::Int<Q_TILE_M>, _512>;
 
   using SubgroupLayoutQK = Layout<Shape<_1, cute::Int<NumSubgroupsN>, _1>>;
   using SubgroupLayoutPV = decltype(cutlass::flash_attention::collective::get_sg_layout_pv(SubgroupLayoutQK{}));
@@ -120,8 +90,8 @@ struct MlaXe {
   using ElementK = ElementType;
   using ElementV = ElementType;
   using ElementO = ElementType;
+
   static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
-  // TODO: handle special float8 types float_e5m2_t, float_e4m3_t for MMA operation
   using MMAOperation = XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, ElementQ>;
 
   using StrideQ = Stride<int, _1, int, int>;
@@ -154,12 +124,12 @@ struct MlaXe {
   using TensorV = decltype(make_dummy_tensor_type(ElementV{}, StrideV{}));
   using TensorO = decltype(make_dummy_tensor_type(ElementO{}, StrideO{}));
 
-  // Collective Mainloop
+  // Collective Mainloop – causal masking enabled for prefill
   static constexpr int PipelineStages = 1;
   using MainloopDispatchPolicy = cutlass::flash_attention::XeDefault<PipelineStages>;
   using CollectiveMainloop = cutlass::flash_attention::collective::XeMlaMainloop<
       MainloopDispatchPolicy,
-      false,  // CausalMask: decode attends to all past KV, no masking needed
+      true,  // CausalMask: prefill uses lower-triangular (causal) masking
       TiledMMAQK,
       TiledMMAPV,
       VTiles,
@@ -181,48 +151,59 @@ struct MlaXe {
   using Fmla = cutlass::flash_attention::device::MLA<FmlaKernel>;
 };
 
+// ---------------------------------------------------------------------------
+// Build kernel Arguments from PyTorch tensors (varlen prefill variant).
+//
+// Expected tensor layouts:
+//   q_nope            : (total_q, num_heads, v_head_dim)   3D ragged
+//   q_pe              : (total_q, num_heads, q_pe_dim)     3D ragged
+//   kv_c_and_k_pe_cache: (total_pages, page_size, v_head_dim + q_pe_dim)
+//   out               : (total_q, num_heads, v_head_dim)   3D ragged
+//   cu_seqlens_q      : (batch + 1,)  cumulative Q lengths (padded to Q_TILE_M)
+//   seq_lens          : (batch,)  actual KV length per batch item
+//   page_table        : (batch, max_pages_per_seq)
+// ---------------------------------------------------------------------------
 template <typename T>
-inline typename T::Fmla::Arguments args_from_options(
+inline typename T::Fmla::Arguments args_from_options_prefill(
     at::Tensor const& out,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
+    at::Tensor const& cu_seqlens_q,
     at::Tensor const& seq_lens,
+    int64_t max_seqlen_q,
     at::Tensor const& page_table,
     double sm_scale,
+    bool causal,
     int64_t num_kv_splits) {
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = q_nope.device().index();
   hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
-  // Extract dimensions from tensors
-  // q_nope: (bs, num_heads, v_head_dim) where v_head_dim = 512 (d_latent)
-  // q_pe:   (bs, num_heads, q_pe_dim)   where q_pe_dim = 64 (d_rope)
-  // kv_cache: (num_blocks, block_size, head_dim) where head_dim = 576 (d_latent + d_rope)
-  // out:    (bs, num_heads, v_head_dim)
-  int batch = q_nope.size(0);
-  int num_heads = q_nope.size(1);
-  int v_head_dim = q_nope.size(2);
-  int q_pe_dim = q_pe.size(2);
-  int head_dim = kv_c_and_k_pe_cache.size(2);
-  int page_size = kv_c_and_k_pe_cache.size(1);
+  // q_nope: (total_q, H, D_latent)  — 3D ragged
+  // q_pe:   (total_q, H, D_rope)    — 3D ragged
+  // kv_cache: (total_pages, page_size, D_latent + D_rope)
+  int batch           = seq_lens.size(0);
+  int num_heads       = q_nope.size(1);
+  int v_head_dim      = q_nope.size(2);
+  int q_pe_dim        = q_pe.size(2);
+  int page_size       = kv_c_and_k_pe_cache.size(1);
+  int total_page      = kv_c_and_k_pe_cache.size(0);
   int page_count_per_seq = page_table.size(1);
-  int max_seq_len = page_size * page_count_per_seq;
-  int total_page = kv_c_and_k_pe_cache.size(0);
 
   FMlAProblemShape problem_shape;
-  problem_shape.batch = batch;
-  problem_shape.num_heads_q = num_heads;
-  problem_shape.num_heads_kv = 1;
-  problem_shape.seq_len_qo = 1;
-  problem_shape.seq_len_kv = max_seq_len;
+  problem_shape.batch          = batch;
+  problem_shape.num_heads_q    = num_heads;
+  problem_shape.num_heads_kv   = 1;
+  problem_shape.seq_len_qo     = static_cast<int>(max_seqlen_q);  // max Q length (for grid)
+  problem_shape.seq_len_kv     = 0;  // unused in prefill — kernel reads per-batch seq_lens directly
   problem_shape.head_size_q_nope = v_head_dim;
-  problem_shape.head_size_q_pe = q_pe_dim;
-  problem_shape.head_size_kv = v_head_dim;
-  problem_shape.head_size_k_pe = q_pe_dim;
-  problem_shape.head_size_o = v_head_dim;
-  problem_shape.page_size = page_size;
-  problem_shape.total_page = total_page;
+  problem_shape.head_size_q_pe   = q_pe_dim;
+  problem_shape.head_size_kv     = v_head_dim;
+  problem_shape.head_size_k_pe   = q_pe_dim;
+  problem_shape.head_size_o      = v_head_dim;
+  problem_shape.page_size        = page_size;
+  problem_shape.total_page       = total_page;
 
   using StrideQ = typename T::StrideQ;
   using StrideK = typename T::StrideK;
@@ -232,18 +213,24 @@ inline typename T::Fmla::Arguments args_from_options(
   using ElementK = typename T::ElementK;
   using ElementO = typename T::ElementO;
 
+  // Ragged 3D Q strides mapped to kernel's 4D layout (seq, dim, head, batch):
+  //   dim0 = seq  -> q_nope.stride(0) = H * D
+  //   dim1 = dim  -> _1 (innermost)
+  //   dim2 = head -> q_nope.stride(1) = D
+  //   dim3 = batch -> 0 (unused, pointer offset via cu_seqlens_q instead)
   StrideQ stride_Q_nope = cute::make_stride(
-      static_cast<int>(batch * num_heads * v_head_dim),
+      static_cast<int>(q_nope.stride(0)),
       cute::_1{},
       static_cast<int>(q_nope.stride(1)),
-      static_cast<int>(q_nope.stride(0)));
+      static_cast<int>(0));
 
   StrideQ stride_Q_pe = cute::make_stride(
-      static_cast<int>(batch * num_heads * q_pe_dim),
+      static_cast<int>(q_pe.stride(0)),
       cute::_1{},
       static_cast<int>(q_pe.stride(1)),
-      static_cast<int>(q_pe.stride(0)));
+      static_cast<int>(0));
 
+  // KV cache strides are the same as decode (paged layout unchanged)
   StrideK stride_K = cute::make_stride(
       static_cast<int>(kv_c_and_k_pe_cache.stride(1)),
       cute::_1{},
@@ -256,26 +243,28 @@ inline typename T::Fmla::Arguments args_from_options(
       static_cast<int>(kv_c_and_k_pe_cache.stride(0)),
       static_cast<int>(1));
 
+  // Ragged 3D O strides (same as Q)
   StrideO stride_O = cute::make_stride(
-      static_cast<int>(batch * num_heads * v_head_dim),
+      static_cast<int>(out.stride(0)),
       cute::_1{},
       static_cast<int>(out.stride(1)),
-      static_cast<int>(out.stride(0)));
+      static_cast<int>(0));
 
   typename T::Fmla::KernelArguments kernel_args{};
-  kernel_args.shape = problem_shape;
-  kernel_args.Q_nope = static_cast<const ElementQ*>(q_nope.data_ptr());
-  kernel_args.dQ_nope = stride_Q_nope;
-  kernel_args.Q_pe = static_cast<const ElementQ*>(q_pe.data_ptr());
-  kernel_args.dQ_pe = stride_Q_pe;
-  kernel_args.K = static_cast<const ElementK*>(kv_c_and_k_pe_cache.data_ptr());
-  kernel_args.dK = stride_K;
-  kernel_args.K_pe = static_cast<const ElementK*>(kv_c_and_k_pe_cache.data_ptr()) + v_head_dim;
-  kernel_args.dK_pe = stride_K;
-  kernel_args.dV = stride_V;
-  kernel_args.O = static_cast<ElementO*>(out.data_ptr());
-  kernel_args.dO = stride_O;
+  kernel_args.shape    = problem_shape;
+  kernel_args.Q_nope   = static_cast<const ElementQ*>(q_nope.data_ptr());
+  kernel_args.dQ_nope  = stride_Q_nope;
+  kernel_args.Q_pe     = static_cast<const ElementQ*>(q_pe.data_ptr());
+  kernel_args.dQ_pe    = stride_Q_pe;
+  kernel_args.K        = static_cast<const ElementK*>(kv_c_and_k_pe_cache.data_ptr());
+  kernel_args.dK       = stride_K;
+  kernel_args.K_pe     = static_cast<const ElementK*>(kv_c_and_k_pe_cache.data_ptr()) + v_head_dim;
+  kernel_args.dK_pe    = stride_K;
+  kernel_args.dV       = stride_V;
+  kernel_args.O        = static_cast<ElementO*>(out.data_ptr());
+  kernel_args.dO       = stride_O;
   kernel_args.seq_lens = static_cast<const int*>(seq_lens.data_ptr());
+  kernel_args.cu_seqlens_q = static_cast<const int*>(cu_seqlens_q.data_ptr());
 
   typename T::CollectiveMainloop::Arguments mainloop_args{
       static_cast<float>(sm_scale),
@@ -285,27 +274,29 @@ inline typename T::Fmla::Arguments args_from_options(
       page_count_per_seq};
 
   typename T::Fmla::Arguments arguments{kernel_args, mainloop_args, {}, hw_info};
-
   return arguments;
 }
 
 template <typename Element, typename PageSizeOpt>
-inline void runMla(
+inline void runMlaPrefill(
     at::Tensor const& out,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
+    at::Tensor const& cu_seqlens_q,
     at::Tensor const& seq_lens,
+    int64_t max_seqlen_q,
     at::Tensor const& page_table,
     at::Tensor const& workspace,
     double sm_scale,
+    bool causal,
     int64_t num_kv_splits) {
-  using MlaXeType = MlaXe<Element, PageSizeOpt, IsPersistent<false>>;
-  typename MlaXeType::Fmla fmla;
-  auto arguments = args_from_options<MlaXeType>(
-      out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, sm_scale, num_kv_splits);
+  using MlaXePrefillType = MlaXePrefill<Element, PageSizeOpt, IsPersistent<false>>;
+  typename MlaXePrefillType::Fmla fmla;
+  auto arguments = args_from_options_prefill<MlaXePrefillType>(
+      out, q_nope, q_pe, kv_c_and_k_pe_cache, cu_seqlens_q, seq_lens,
+      max_seqlen_q, page_table, sm_scale, causal, num_kv_splits);
 
   CUTLASS_CHECK(fmla.can_implement(arguments));
-
   CUTLASS_CHECK(fmla.run(arguments, workspace.data_ptr()));
 }

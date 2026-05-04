@@ -238,7 +238,8 @@ struct XeMlaMainloop<
       int total_blk,              // Total # of K blocks
       int thr_id,
       int seq_len_kv,
-      int batch_coord) {  // Batch index for page table lookup
+      int batch_coord,
+      int causal_offset = 0) {  // FA2-style offset: seqlen_k - seqlen_q
     using namespace sycl::ext::oneapi::this_work_item;
 
     // Short dimension names:
@@ -414,7 +415,7 @@ struct XeMlaMainloop<
         cute::gemm(mma_qk, tSrQpe, tSrKpe, tSrS);
       }
 
-      /* PagedKV masking - mask out invalid positions */
+      /* PagedKV masking - mask out invalid positions beyond seq_len_kv */
       if (check_remainder_k && K == total_blk - 1) {
         FragSRow k_rem_mask;
         int k_intra_page = get<0>(tKgK(0, 0, 0, intra_page_tile_idx, 0, physical_block_idx)) + K * params.page_size;
@@ -427,6 +428,29 @@ struct XeMlaMainloop<
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < tSrS.size(); i++) {
           tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(k_rem_mask, tSrS, i));
+        }
+      }
+
+      /* Causal masking (FA2-style): mask positions where k_pos > causal_offset + q_pos.
+       * Applies to any K tile that intersects the causal boundary, not just the last tile.
+       * For full prefill (offset=0): standard lower-triangular mask.
+       * For incremental prefill (offset>0): prefix is unmasked, only new tokens get triangular mask. */
+      if constexpr (CausalMask) {
+        int k_tile_start = K * params.page_size;
+        int q_tile_start = get<0>(blk_qv) * static_cast<int>(QK_BLK_M);
+        // Check if any element in this tile could be masked
+        if (k_tile_start + static_cast<int>(QK_BLK_N) - 1 > causal_offset + q_tile_start) {
+          Tensor cPgP = make_identity_tensor(make_shape(seq_len_kv, seq_len_kv));
+          Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
+          auto cS_thread = thr_mma_qk.partition_C(gP);
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); ++i) {
+            int q_pos = get<0>(cS_thread(i));
+            int k_pos = get<1>(cS_thread(i));
+            if (k_pos > causal_offset + q_pos) {
+              tSrS(i) = ElementS(-INFINITY);
+            }
+          }
         }
       }
 

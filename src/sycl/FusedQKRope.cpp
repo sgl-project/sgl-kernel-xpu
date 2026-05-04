@@ -1,21 +1,45 @@
+/***************************************************************************************************
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ **************************************************************************************************/
+
 #include <ATen/ATen.h>
-#include <ATen/OpMathType.h>
-#include <ATen/Parallel.h>
-#include <c10/util/Float8_e4m3fn.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
 #include <cassert>
 #include <cmath>
-#include <cstdint>
-#include <iostream>
 #include <sycl/sycl.hpp>
-#include <vector>
 
-#include "MemoryAccess.h"
-#include "Norm.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "comm/Numerics.h"
 #include "cutlass/float8.h"
 
 // TODO: Remove this when sycl float8 is supported
@@ -23,16 +47,19 @@ using cutlass::float_e4m3_t;
 
 namespace at::native::xpu {
 
-template <typename T>
-inline T divUp(T m, T n) {
-  static_assert(std::is_integral<T>::value, "divUp requires an integral type");
-  return (m + n - 1) / n;
-}
-
 // local to avoid ODR issues while keeping the implementation consistent.
-static inline float
-compute_freq_yarn_rope(float base, int rotary_dim, int half_dim, float factor, float low, float high) {
-  float freq = sycl::pow(base, -2.0f * static_cast<float>(half_dim) / static_cast<float>(rotary_dim));
+// Uses exp2(x * log2_base) instead of pow(base, x) because exp2 lowers to a
+// single hardware instruction on Intel GPUs, whereas pow goes through a slow
+// polynomial path.
+static inline float compute_freq_yarn_rope(
+    float log2_base,
+    int rotary_dim,
+    int half_dim,
+    float factor,
+    float low,
+    float high) {
+  const float exponent = -2.0f * static_cast<float>(half_dim) / static_cast<float>(rotary_dim);
+  float freq = sycl::exp2(exponent * log2_base);
 
   if (factor != 1.0f) {
     float inv_freq_extrapolation = freq;
@@ -62,7 +89,7 @@ struct FusedQKRopeKernel {
   int num_heads_v;
   const scalar_t* q_weight;
   const scalar_t* k_weight;
-  float base;
+  float log2_base;
   const int* position_ids;
   int num_tokens;
   float factor;
@@ -106,6 +133,7 @@ struct FusedQKRopeKernel {
 
     // Load elements and apply per-dimension weight scaling (no RMSNorm)
     const scalar_t* weight_ptr = isQ ? q_weight : k_weight;
+#pragma unroll
     for (int i = 0; i < numElemsPerThread; i++) {
       // TODO: For FP8, per-tensor or per-channel dequant scales should be applied
       // here before the weight multiply (e.g. val *= dequant_scale).
@@ -128,15 +156,18 @@ struct FusedQKRopeKernel {
     if (applyRotary) {
       if constexpr (interleave) {
         // Interleave mode
+#pragma unroll
         for (int i = 0; i < numElemsPerThread; i++) {
           elements2[i] = (i % 2 == 0) ? -elements[i + 1] : elements[i - 1];
 
           int dim_idx = laneId * numElemsPerThread + i;
           int half_dim = dim_idx / 2;
-          float freq = compute_freq_yarn_rope(base, rotary_dim, half_dim, factor, low, high);
+          float freq = compute_freq_yarn_rope(log2_base, rotary_dim, half_dim, factor, low, high);
           float theta = pos_id * freq;
-          sin_vals[i] = sycl::sin(theta);
-          cos_vals[i] = sycl::cos(theta);
+          // native::{sin,cos} map to hardware transcendentals on Intel GPUs —
+          // substantially faster than sycl::sin / sycl::cos.
+          sin_vals[i] = sycl::native::sin(theta);
+          cos_vals[i] = sycl::native::cos(theta);
         }
       }
     }
@@ -146,6 +177,7 @@ struct FusedQKRopeKernel {
       sycl::group_barrier(sg);
       const int half_rotary_lanes = rotary_lanes / 2;
 
+#pragma unroll
       for (int i = 0; i < numElemsPerThread; i++) {
         auto permuted = sycl::permute_group_by_xor(sg, elements[i], half_rotary_lanes);
 
@@ -158,10 +190,10 @@ struct FusedQKRopeKernel {
           int dim_idx = laneId * numElemsPerThread + i;
           dim_idx = (dim_idx * 2) % rotary_dim;
           int half_dim = dim_idx / 2;
-          float freq = compute_freq_yarn_rope(base, rotary_dim, half_dim, factor, low, high);
+          float freq = compute_freq_yarn_rope(log2_base, rotary_dim, half_dim, factor, low, high);
           float theta = pos_id * freq;
-          sin_vals[i] = sycl::sin(theta);
-          cos_vals[i] = sycl::cos(theta);
+          sin_vals[i] = sycl::native::sin(theta);
+          cos_vals[i] = sycl::native::cos(theta);
         }
       }
       sycl::group_barrier(sg);
@@ -169,12 +201,14 @@ struct FusedQKRopeKernel {
 
     // Apply rotation with attention_factor
     if (applyRotary) {
+#pragma unroll
       for (int i = 0; i < numElemsPerThread; i++) {
         elements[i] = (elements[i] * cos_vals[i] + elements2[i] * sin_vals[i]) * attention_factor;
       }
     }
 
     // Store results
+#pragma unroll
     for (int i = 0; i < numElemsPerThread; i++) {
       qkv[offsetThread + i] = static_cast<scalar_t>(elements[i]);
     }
@@ -202,7 +236,9 @@ void launchFusedQKRopeImpl(
   const int warpsPerBlock = blockSize / 32;
   const int totalQKHeads = num_heads_q + num_heads_k;
   const int totalWarps = num_tokens * totalQKHeads;
-  const int gridSize = divUp(totalWarps, warpsPerBlock);
+  const int gridSize = CeilDiv(totalWarps, warpsPerBlock);
+
+  const float log2_base = std::log2(base);
 
   FusedQKRopeKernel<head_dim, interleave, scalar_t> kernel{
       static_cast<scalar_t*>(qkv),
@@ -211,7 +247,7 @@ void launchFusedQKRopeImpl(
       num_heads_v,
       static_cast<const scalar_t*>(q_weight),
       static_cast<const scalar_t*>(k_weight),
-      base,
+      log2_base,
       position_ids,
       num_tokens,
       factor,
@@ -262,7 +298,10 @@ void fused_qk_rope(
       position_ids.scalar_type() == at::kInt,
       "Position IDs dtype must be int32 (at::kInt) to match data_ptr<int>() usage; got ",
       position_ids.scalar_type());
-  TORCH_CHECK(head_dim >= 32, "head_dim must be >= 32 to avoid invalid rotary configuration; got ", head_dim);
+  TORCH_CHECK(
+      head_dim == 64 || head_dim == 128 || head_dim == 256,
+      "head_dim must be one of {64, 128, 256}; got ",
+      head_dim);
   TORCH_CHECK(
       rotary_dim > 0 && rotary_dim <= head_dim,
       "rotary_dim must be in the range (0, head_dim], got ",
@@ -272,9 +311,7 @@ void fused_qk_rope(
   TORCH_CHECK(rotary_dim % 2 == 0, "rotary_dim must be even for RoPE, got ", rotary_dim);
   TORCH_CHECK(rotary_dim % (head_dim / 32) == 0, "rotary_dim must be divisible by numElemsPerThread");
 
-  if (!is_neox) {
-    // interleave mode: nothing extra to check
-  } else {
+  if (is_neox) {
     int64_t half_rotary_lanes = rotary_dim / (head_dim / 32) / 2;
     TORCH_CHECK(
         half_rotary_lanes >= 1 && half_rotary_lanes < 32 && (half_rotary_lanes & (half_rotary_lanes - 1)) == 0,
@@ -302,64 +339,23 @@ void fused_qk_rope(
   auto queue = dpcppGetCurrentQueue();
   bool interleave = !is_neox;
 
-#define LAUNCH_QK_ROPE_KERNEL(head_dim, interleave)                             \
-  do {                                                                          \
-    auto dtype = qkv.scalar_type();                                             \
-    if (dtype == at::ScalarType::Half) {                                        \
-      launchFusedQKRopeImpl<head_dim, interleave, sycl::half>(                  \
-          qkv.data_ptr(),                                                       \
-          static_cast<int>(num_tokens),                                         \
-          static_cast<int>(num_heads_q),                                        \
-          static_cast<int>(num_heads_k),                                        \
-          static_cast<int>(num_heads_v),                                        \
-          q_weight.data_ptr(),                                                  \
-          k_weight.data_ptr(),                                                  \
-          static_cast<float>(base),                                             \
-          position_ids.data_ptr<int>(),                                         \
-          static_cast<float>(factor),                                           \
-          static_cast<float>(low),                                              \
-          static_cast<float>(high),                                             \
-          static_cast<float>(attention_factor),                                 \
-          static_cast<int>(rotary_dim),                                         \
-          queue);                                                               \
-    } else if (dtype == at::ScalarType::BFloat16) {                             \
-      launchFusedQKRopeImpl<head_dim, interleave, sycl::ext::oneapi::bfloat16>( \
-          qkv.data_ptr(),                                                       \
-          static_cast<int>(num_tokens),                                         \
-          static_cast<int>(num_heads_q),                                        \
-          static_cast<int>(num_heads_k),                                        \
-          static_cast<int>(num_heads_v),                                        \
-          q_weight.data_ptr(),                                                  \
-          k_weight.data_ptr(),                                                  \
-          static_cast<float>(base),                                             \
-          position_ids.data_ptr<int>(),                                         \
-          static_cast<float>(factor),                                           \
-          static_cast<float>(low),                                              \
-          static_cast<float>(high),                                             \
-          static_cast<float>(attention_factor),                                 \
-          static_cast<int>(rotary_dim),                                         \
-          queue);                                                               \
-    } else if (dtype == at::ScalarType::Float8_e4m3fn) {                        \
-      launchFusedQKRopeImpl<head_dim, interleave, float_e4m3_t>(                \
-          qkv.data_ptr(),                                                       \
-          static_cast<int>(num_tokens),                                         \
-          static_cast<int>(num_heads_q),                                        \
-          static_cast<int>(num_heads_k),                                        \
-          static_cast<int>(num_heads_v),                                        \
-          q_weight.data_ptr(),                                                  \
-          k_weight.data_ptr(),                                                  \
-          static_cast<float>(base),                                             \
-          position_ids.data_ptr<int>(),                                         \
-          static_cast<float>(factor),                                           \
-          static_cast<float>(low),                                              \
-          static_cast<float>(high),                                             \
-          static_cast<float>(attention_factor),                                 \
-          static_cast<int>(rotary_dim),                                         \
-          queue);                                                               \
-    } else {                                                                    \
-      TORCH_CHECK(false, "Unsupported dtype for fused_qk_rope: ", dtype);       \
-    }                                                                           \
-  } while (0)
+#define FUSED_QK_ROPE_LAUNCH_ARGS                                               \
+  qkv.data_ptr(), static_cast<int>(num_tokens), static_cast<int>(num_heads_q),  \
+      static_cast<int>(num_heads_k), static_cast<int>(num_heads_v),             \
+      q_weight.data_ptr(), k_weight.data_ptr(), static_cast<float>(base),       \
+      position_ids.data_ptr<int>(), static_cast<float>(factor),                 \
+      static_cast<float>(low), static_cast<float>(high),                        \
+      static_cast<float>(attention_factor), static_cast<int>(rotary_dim), queue
+
+#define LAUNCH_QK_ROPE_KERNEL(HEAD_DIM, INTERLEAVE)                              \
+  AT_DISPATCH_SWITCH(                                                            \
+      qkv.scalar_type(),                                                         \
+      "fused_qk_rope",                                                           \
+      DISPATCH_CASE_FLOAT_TYPES(([&] {                                           \
+        launchFusedQKRopeImpl<HEAD_DIM, INTERLEAVE, scalar_t>(FUSED_QK_ROPE_LAUNCH_ARGS); \
+      })) AT_DISPATCH_CASE(at::ScalarType::Float8_e4m3fn, ([&] {                 \
+        launchFusedQKRopeImpl<HEAD_DIM, INTERLEAVE, float_e4m3_t>(FUSED_QK_ROPE_LAUNCH_ARGS); \
+      })))
 
   switch (head_dim) {
     case 64:
@@ -388,6 +384,7 @@ void fused_qk_rope(
   }
 
 #undef LAUNCH_QK_ROPE_KERNEL
+#undef FUSED_QK_ROPE_LAUNCH_ARGS
 }
 
 }  // namespace at::native::xpu

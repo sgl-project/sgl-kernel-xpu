@@ -6,10 +6,13 @@ Key differences vs bench_fused_qk_norm_rope.py:
   - No eps parameter
   - Reference applies per-head weight multiply then rotary embeddings
   - FP8 (float8_e4m3fn) is supported; inputs created with bounded uniform
-    values and cast to FP8 (matching kernel precision constraints)
+    values and cast to FP8 (matching kernel precision constraints). The
+    torch baseline dequantizes to float32 on XPU (PyTorch has no native FP8
+    compute path) so the comparison stays device-resident.
   - FLOPs: weight-scale is 1 FLOP/elem instead of 4 (no variance computation)
 """
 
+import gc
 import itertools
 import os
 
@@ -22,6 +25,20 @@ import pandas as pd
 import torch
 import triton
 from sgl_kernel import fused_qk_rope
+
+
+def _free_xpu_memory():
+    """Best-effort release of cached XPU allocations between configs."""
+    gc.collect()
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        try:
+            torch.xpu.synchronize()
+        except Exception:
+            pass
+        try:
+            torch.xpu.empty_cache()
+        except Exception:
+            pass
 
 # -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
 # Dtype helpers
@@ -152,15 +169,20 @@ def fused_qk_rope_reference(
     freqs = torch.outer(positions, inv_freq)
     cos = freqs.cos() * attention_factor
     sin = freqs.sin() * attention_factor
+    del inv_freq, positions, freqs
 
     # Apply RoPE(rotary_dim portion only)
     q_rot = apply_rotary_emb_native(q_scaled[..., :rotary_dim], cos, sin, is_neox)
     q_final = torch.cat([q_rot, q_scaled[..., rotary_dim:]], dim=-1)
+    del q_rot, q_scaled
 
     k_rot = apply_rotary_emb_native(k_scaled[..., :rotary_dim], cos, sin, is_neox)
     k_final = torch.cat([k_rot, k_scaled[..., rotary_dim:]], dim=-1)
+    del k_rot, k_scaled, cos, sin
 
-    result = torch.cat([q_final, k_final, v.float()], dim=1)
+    v_float = v.float()
+    result = torch.cat([q_final, k_final, v_float], dim=1)
+    del q_final, k_final, v_float
     return result.view(num_tokens, total_heads * head_dim)
 
 
@@ -325,6 +347,8 @@ def benchmark(
     dtype,
     provider,
 ):
+    _free_xpu_memory()
+
     device = torch.device("xpu")
     num_tokens = batch_size * seq_len
     num_heads = num_heads_q + num_heads_k + num_heads_v
@@ -354,25 +378,25 @@ def benchmark(
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "torch":
-        # Run the reference on a CPU float32 copy to time CPU throughput.
-        # For FP8, dequantize first so the reference sees the same values as
-        # the kernel(FP8 has no native compute path in PyTorch).
-        qkv_cpu = qkv.to(torch.float32).to("cpu")
-        q_weight_cpu = q_weight.to(torch.float32).to("cpu")
-        k_weight_cpu = k_weight.to(torch.float32).to("cpu")
-        pos_cpu = position_ids.to("cpu")
+        # Run the reference on XPU for an apples-to-apples comparison with the
+        # sglang kernel. FP8 has no native compute path in PyTorch, so
+        # dequantize to float32 on XPU while keeping the data device-resident.
+        ref_dtype = torch.float32 if is_fp8 else torch_dtype
+        qkv_ref = qkv.to(ref_dtype)
+        q_weight_ref = q_weight.to(ref_dtype)
+        k_weight_ref = k_weight.to(ref_dtype)
 
         fn = lambda: fused_qk_rope_reference(
-            qkv_cpu.clone(),
+            qkv_ref.clone(),
             num_heads_q,
             num_heads_k,
             num_heads_v,
             head_dim,
-            q_weight_cpu,
-            k_weight_cpu,
+            q_weight_ref,
+            k_weight_ref,
             base,
             is_neox,
-            pos_cpu,
+            position_ids,
             factor=1.0,
             low=1.0,
             high=1.0,
@@ -398,7 +422,44 @@ def benchmark(
             rotary_dim=rotary_dim,
         )
 
-    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
+    try:
+        ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
+    except RuntimeError as e:
+        # XPU OOM (or similar transient failure) on the largest configs —
+        # record the skip and keep the sweep going.
+        msg = str(e)
+        if "OUT_OF" in msg or "out of memory" in msg.lower():
+            print(
+                f"[skip] OOM for provider={provider} "
+                f"bs={batch_size} seq={seq_len} "
+                f"nq={num_heads_q} nk={num_heads_k} nv={num_heads_v} "
+                f"hd={head_dim} neox={is_neox} dtype={dtype}"
+            )
+            del fn
+            _free_xpu_memory()
+            all_results.append(
+                {
+                    "batch_size": batch_size,
+                    "seq_len": seq_len,
+                    "num_tokens": num_tokens,
+                    "num_heads_q": num_heads_q,
+                    "num_heads_k": num_heads_k,
+                    "num_heads_v": num_heads_v,
+                    "head_dim": head_dim,
+                    "is_neox": is_neox,
+                    "dtype": dtype,
+                    "provider": provider,
+                    "time_us": float("nan"),
+                    "bandwidth_gbs": float("nan"),
+                    "total_bytes_mb": float("nan"),
+                    "total_flops_m": float("nan"),
+                    "gflops": float("nan"),
+                    "status": "oom",
+                }
+            )
+            nan = float("nan")
+            return nan, nan, nan
+        raise
 
     bw_metrics = calculate_effective_bandwidth(
         batch_size,
@@ -429,9 +490,12 @@ def benchmark(
             "total_bytes_mb": bw_metrics["total_bytes"] / 1e6,
             "total_flops_m": bw_metrics["total_flops"] / 1e6,
             "gflops": bw_metrics["gflops"],
+            "status": "ok",
         }
     )
 
+    del fn
+    _free_xpu_memory()
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
 
@@ -451,6 +515,11 @@ if __name__ == "__main__":
     )
     df.to_csv(out_csv, index=False)
     print(f"Wrote results CSV: {out_csv}")
+
+    if "status" in df.columns:
+        n_skipped = int((df["status"] == "oom").sum())
+        if n_skipped:
+            print(f"Skipped {n_skipped} config/provider rows due to OOM.")
 
     # -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
     # Summary tables

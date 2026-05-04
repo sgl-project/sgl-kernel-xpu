@@ -133,10 +133,14 @@ def flash_mla_decode(
 
 
 def flash_mla_get_workspace_size(
-    max_seq_len: int, num_batches: int, sm_count: int = 0, num_kv_splits: int = -1
+    max_seq_len: int,
+    num_batches: int,
+    num_heads: int = 0,
+    page_size: int = 0,
+    num_kv_splits: int = -1,
 ) -> int:
     assert max_seq_len > 0, f"max_seq_len must be greater than 0, got {max_seq_len}"
     assert num_batches > 0, f"num_batches must be greater than 0, got {num_batches}"
     return torch.ops.sgl_kernel.flash_mla_get_workspace_size.default(
-        max_seq_len, num_batches, sm_count, num_kv_splits
+        max_seq_len, num_batches, num_heads, page_size, num_kv_splits
     )

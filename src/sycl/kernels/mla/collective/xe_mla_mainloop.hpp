@@ -40,7 +40,6 @@
 #include "cute/atom/mma_atom.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
-
 namespace cutlass::flash_attention {
 
 template <int Stages>
@@ -177,11 +176,7 @@ struct XeMlaMainloop<
   //
   // Shared memory storage for cross-subgroup softmax reduction
   //
-  struct SharedStorage {
-    // Storage for per-subgroup max values (one per subgroup)
-    // Used for cross-SG max reduction before computing exp2
-    cute::array<ElementS, NumSubgroups> sg_max_data;
-  };
+  struct SharedStorage {};
 
   Params params;
   SharedStorage& shared;

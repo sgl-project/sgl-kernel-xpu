@@ -310,8 +310,11 @@ def dequantize_mxfp4_weights(
     Parameters:
     - packed:     [E, rows, packed_cols] uint8 – two FP4 nibbles per byte,
                   where packed_cols = cols // 2.
-    - scales:     [E, rows, num_blocks]  uint8 in UE8M0 format
-                  (stored_byte = biased_exp + 127), where
+    - scales:     [E, rows, num_blocks]  float32 MX block scale (direct
+                  multiplier), matching upstream sglang
+                  ``_upcast_mxfp4_one_xpu``'s contract. Callers holding raw
+                  UE8M0 bytes must decode to fp32 first via
+                  ``torch.exp2((byte.to(int32) - 127).to(float32))``, where
                   num_blocks = cols // block_size.
     - dtype:      Output floating-point dtype (default: torch.bfloat16).
     - block_size: Number of FP4 elements sharing one scale factor (default: 32).
@@ -336,6 +339,11 @@ def dequantize_mxfp4_weights(
     assert (
         packed.device == scales.device
     ), f"packed and scales must be on the same device, got {packed.device} and {scales.device}"
+    assert scales.dtype == torch.float32, (
+        f"scales must be float32 direct multiplier (matches upstream "
+        f"_upcast_mxfp4_one_xpu contract); decode UE8M0 bytes first if needed. "
+        f"got {scales.dtype}"
+    )
 
     # --- 1. Unpack and dequantize via 16-entry signed LUT ---
     lut = _get_e2m1_lut(packed.device)
@@ -346,16 +354,23 @@ def dequantize_mxfp4_weights(
     dequantized[:, :, 0::2] = lut[(packed & 0x0F).int()]
     dequantized[:, :, 1::2] = lut[(packed >> 4).int()]
 
-    # --- 2. Apply per-block UE8M0 scale factors ---
+    # --- 2. Apply per-block direct-multiplier scale factors ---
     dequantized = dequantized.view(E, rows, num_blocks, block_size)
-    scale_exp = scales.to(torch.int32) - 127  # [E, rows, num_blocks]
-    scale_values = torch.exp2(scale_exp).unsqueeze(-1).to(torch.bfloat16)
+    scale_values = scales.unsqueeze(-1).to(torch.bfloat16)
     dequantized = dequantized * scale_values
 
     result = dequantized.reshape(E, rows, cols)
     if dtype != torch.bfloat16:
         result = result.to(dtype)
     return result
+
+
+def _ue8m0_to_fp32_multiplier(ue8m0: torch.Tensor) -> torch.Tensor:
+    """Decode a UE8M0 biased-exponent byte tensor to its fp32 direct multiplier.
+
+    stored_byte = biased_exp + 127  →  multiplier = 2^(byte - 127)
+    """
+    return torch.exp2((ue8m0.to(torch.int32) - 127).to(torch.float32))
 
 
 def fused_experts(
@@ -592,7 +607,7 @@ def fused_experts(
         )
         # Dequantize w1 just before GEMM1, free immediately after
         if use_mxfp4_w4a16:
-            w1 = dequantize_mxfp4_weights(w1, w1_scale)
+            w1 = dequantize_mxfp4_weights(w1, _ue8m0_to_fp32_multiplier(w1_scale))
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
             intermediate_cache1,
             input_A_shuffle,
@@ -609,7 +624,7 @@ def fused_experts(
         # one dequantized weight tensor occupies GPU memory at a time.
         if use_mxfp4_w4a16:
             del w1
-            w2 = dequantize_mxfp4_weights(w2, w2_scale)
+            w2 = dequantize_mxfp4_weights(w2, _ue8m0_to_fp32_multiplier(w2_scale))
         if activation_type == 0:
             torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
         elif activation_type == 1:
@@ -642,7 +657,7 @@ def fused_experts(
         )
         # Dequantize w1 just before GEMM1, free immediately after
         if use_mxfp4_w4a16:
-            w1 = dequantize_mxfp4_weights(w1, w1_scale)
+            w1 = dequantize_mxfp4_weights(w1, _ue8m0_to_fp32_multiplier(w1_scale))
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
             intermediate_cache1,
             input_A_shuffle,
@@ -659,7 +674,7 @@ def fused_experts(
         # one dequantized weight tensor occupies GPU memory at a time.
         if use_mxfp4_w4a16:
             del w1
-            w2 = dequantize_mxfp4_weights(w2, w2_scale)
+            w2 = dequantize_mxfp4_weights(w2, _ue8m0_to_fp32_multiplier(w2_scale))
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
             intermediate_cache3,
             intermediate_cache1,

@@ -513,5 +513,88 @@ def test_moe_grouped_mm_nt_xe20_mxfp4_op(
     )
 
 
+# ---------------------------------------------------------------------------
+# End-to-end: fused_experts with use_fused_mxfp4_kernel=True
+# ---------------------------------------------------------------------------
+#
+# This is the stage-2 counterpart of test_moe_gemm_mxfp4_weights: same
+# reference pipeline (torch_naive_moe on dequantised weights), but the
+# sglang side now routes through moe_grouped_mm_nt_xe20_mxfp4 via the new
+# use_fused_mxfp4_kernel flag — skipping the intermediate bf16 weight
+# allocation in the Python layer.
+#
+# Stage-1 only compiled the <_128,_128,_32> / silu / no-bias / unfused-act
+# tile, so this test is deliberately narrow. Once the full tile menu is
+# re-enabled, the existing test_moe_gemm_mxfp4_weights test can be
+# parametrised with use_fused_mxfp4_kernel=True to cover the full matrix.
+
+
+@pytest.mark.parametrize(
+    "num_tokens,topk,num_experts,hidden_size,intermediate_size",
+    list(
+        itertools.product(
+            [33, 128],  # avg_m per expert ∈ (8, 128] with num_experts=8
+            [1, 2],
+            [8],
+            [1024],  # small enough to stay in the dispatcher's small-weight branch
+            [512, 1024],
+        )
+    ),
+)
+def test_fused_experts_mxfp4_fused_kernel(
+    num_tokens, topk, num_experts, hidden_size, intermediate_size
+):
+    """End-to-end fused_experts(use_mxfp4_w4a16=True, use_fused_mxfp4_kernel=True).
+
+    Reference is torch_naive_moe on dequantised BF16 weights.  The sglang
+    path runs the tile-fused MXFP4 grouped-GEMM directly (no intermediate
+    bf16 weight materialisation in Python).
+    """
+    torch.manual_seed(0)
+    torch.xpu.manual_seed_all(0)
+    rtol, atol = 1e-1, 1e-2
+
+    a = create_random_cpu_tensor((num_tokens, hidden_size), torch.bfloat16)
+    w1_bf16 = create_random_cpu_tensor(
+        (num_experts, 2 * intermediate_size, hidden_size), torch.bfloat16
+    )
+    w2_bf16 = create_random_cpu_tensor(
+        (num_experts, hidden_size, intermediate_size), torch.bfloat16
+    )
+
+    score = torch.randn([num_tokens, num_experts], dtype=torch.bfloat16)
+    score = torch.softmax(score, dim=-1, dtype=torch.float32)
+    topk_weight, topk_ids = torch.topk(score, topk)
+
+    w1_packed, w1_scale = _quantize_weights_mxfp4(w1_bf16)
+    w2_packed, w2_scale = _quantize_weights_mxfp4(w2_bf16)
+    w1_dq = _dequantize_weights_mxfp4(w1_packed, w1_scale)
+    w2_dq = _dequantize_weights_mxfp4(w2_packed, w2_scale)
+
+    torch_output = torch_naive_moe(
+        a, w1_dq, w2_dq, topk_ids, topk_weight, topk, None, None, activations="silu"
+    )
+
+    device = "xpu"
+    sglang_output = fused_experts(
+        a.to(device),
+        w1_packed.to(device),
+        w2_packed.to(device),
+        topk_weight.to(device),
+        topk_ids.to(device),
+        None,
+        None,
+        activation="silu",
+        use_mxfp4_w4a16=True,
+        use_fused_mxfp4_kernel=True,
+        w1_scale=w1_scale.to(device),
+        w2_scale=w2_scale.to(device),
+    )
+
+    torch.testing.assert_close(
+        torch_output, sglang_output.to("cpu"), rtol=rtol, atol=atol
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

@@ -403,6 +403,7 @@ def fused_experts(
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
     use_mxfp4_w4a16: bool = False,
+    use_fused_mxfp4_kernel: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_zp: Optional[torch.Tensor] = None,
@@ -437,6 +438,13 @@ def fused_experts(
         dequantized to BF16 before the grouped GeMM so the rest of the
         computation is unchanged (W4A16: activations stay in BF16).
         Defaults to False.
+    - use_fused_mxfp4_kernel (bool): Only used when use_mxfp4_w4a16=True.
+        When True, calls moe_grouped_mm_nt_xe20_mxfp4 directly with the
+        packed weights and UE8M0 scales — the GEMM dequantizes B
+        per-tile in registers, skipping the intermediate BF16 weight
+        tensor. When False, pre-dequantizes with
+        dequantize_mxfp4_weights and calls the BF16 grouped GEMM (the
+        original path). Defaults to False.
     - w1_scale (Optional[torch.Tensor]): Optional scale to be used for
         w1.
     - w2_scale (Optional[torch.Tensor]): Optional scale to be used for
@@ -466,6 +474,10 @@ def fused_experts(
         "silu",
         "gelu",
     ), f"Only silu and gelu are supported but got {activation}"
+    if use_fused_mxfp4_kernel:
+        assert use_mxfp4_w4a16, (
+            "use_fused_mxfp4_kernel=True requires use_mxfp4_w4a16=True"
+        )
 
     # For MXFP4 W4A16: validate packed uint8 inputs and scales.
     # Actual dequantization is deferred to just before each GeMM so that
@@ -610,6 +622,12 @@ def fused_experts(
     avg_m = (M * TopK) // E
     big_weight = K * N > 4096 * 4096
     use_unfused_act = avg_m <= 128 and big_weight
+    # Stage-1 MXFP4 build only compiles the unfused-act tile
+    # (<_128,_128,_32>) for small-weight shapes. Force unfused_act when the
+    # fused-MXFP4 kernel is requested and we'd otherwise pick fused_act.
+    # TODO: drop this override once the full tile menu is re-enabled.
+    if use_fused_mxfp4_kernel and not big_weight:
+        use_unfused_act = True
     if use_unfused_act:
         intermediate_cache1 = torch.empty(
             (M * TopK, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype
@@ -617,26 +635,39 @@ def fused_experts(
         intermediate_cache2 = torch.empty(
             (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
         )
-        # Dequantize w1 just before GEMM1, free immediately after
-        if use_mxfp4_w4a16:
-            w1 = dequantize_mxfp4_weights(w1, _ue8m0_to_fp32_multiplier(w1_scale))
-        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
-            intermediate_cache1,
-            input_A_shuffle,
-            w1,
-            b1,
-            expert_offsets,
-            E,
-            activation_type,
-            fuse_act=False,
-            gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
-            gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
-        )
-        # Free dequantized w1 before allocating dequantized w2 — ensures at most
-        # one dequantized weight tensor occupies GPU memory at a time.
-        if use_mxfp4_w4a16:
-            del w1
-            w2 = dequantize_mxfp4_weights(w2, _ue8m0_to_fp32_multiplier(w2_scale))
+        # GEMM1: B = w1 (gate+up). Fused path skips the Python dequant;
+        # unfused path dequantizes, calls bf16 GEMM, frees immediately.
+        if use_mxfp4_w4a16 and use_fused_mxfp4_kernel:
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4(
+                intermediate_cache1,
+                input_A_shuffle,
+                w1,
+                w1_scale,
+                b1,
+                expert_offsets,
+                E,
+                activation_type,
+                False,  # fuse_act
+                float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                float(gemm1_limit) if gemm1_limit is not None else 7.0,
+            )
+        else:
+            if use_mxfp4_w4a16:
+                w1 = dequantize_mxfp4_weights(w1, _ue8m0_to_fp32_multiplier(w1_scale))
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+                intermediate_cache1,
+                input_A_shuffle,
+                w1,
+                b1,
+                expert_offsets,
+                E,
+                activation_type,
+                fuse_act=False,
+                gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
+            )
+            if use_mxfp4_w4a16:
+                del w1
         if activation_type == 0:
             torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
         elif activation_type == 1:
@@ -647,58 +678,106 @@ def fused_experts(
             intermediate_cache2 = torch.ops.sgl_kernel.swiglu_gpt_oss_sigmoid_alpha(
                 intermediate_cache1, gemm1_alpha, gemm1_limit
             )
-        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
-            intermediate_cache3,
-            intermediate_cache2,
-            w2,
-            b2,
-            expert_offsets,
-            E,
-            activation_type,
-            fuse_act=False,
-            gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
-            gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
-        )
-        if use_mxfp4_w4a16:
-            del w2
+        # GEMM2: B = w2 (down).
+        if use_mxfp4_w4a16 and use_fused_mxfp4_kernel:
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4(
+                intermediate_cache3,
+                intermediate_cache2,
+                w2,
+                w2_scale,
+                b2,
+                expert_offsets,
+                E,
+                activation_type,
+                False,  # fuse_act
+                float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                float(gemm1_limit) if gemm1_limit is not None else 7.0,
+            )
+        else:
+            if use_mxfp4_w4a16:
+                w2 = dequantize_mxfp4_weights(w2, _ue8m0_to_fp32_multiplier(w2_scale))
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+                intermediate_cache3,
+                intermediate_cache2,
+                w2,
+                b2,
+                expert_offsets,
+                E,
+                activation_type,
+                fuse_act=False,
+                gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
+            )
+            if use_mxfp4_w4a16:
+                del w2
     else:
         intermediate_cache1 = torch.empty(
             (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
         )
-        # Dequantize w1 just before GEMM1, free immediately after
-        if use_mxfp4_w4a16:
-            w1 = dequantize_mxfp4_weights(w1, _ue8m0_to_fp32_multiplier(w1_scale))
-        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
-            intermediate_cache1,
-            input_A_shuffle,
-            w1,
-            b1,
-            expert_offsets,
-            E,
-            activation_type,
-            fuse_act=True,
-            gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
-            gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
-        )
-        # Free dequantized w1 before allocating dequantized w2 — ensures at most
-        # one dequantized weight tensor occupies GPU memory at a time.
-        if use_mxfp4_w4a16:
-            del w1
-            w2 = dequantize_mxfp4_weights(w2, _ue8m0_to_fp32_multiplier(w2_scale))
-        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
-            intermediate_cache3,
-            intermediate_cache1,
-            w2,
-            b2,
-            expert_offsets,
-            E,
-            activation_type,
-            fuse_act=False,
-            gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
-            gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
-        )
-        if use_mxfp4_w4a16:
-            del w2
+        # GEMM1 (fused act): B = w1 (gate+up).
+        if use_mxfp4_w4a16 and use_fused_mxfp4_kernel:
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4(
+                intermediate_cache1,
+                input_A_shuffle,
+                w1,
+                w1_scale,
+                b1,
+                expert_offsets,
+                E,
+                activation_type,
+                True,  # fuse_act
+                float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                float(gemm1_limit) if gemm1_limit is not None else 7.0,
+            )
+        else:
+            if use_mxfp4_w4a16:
+                w1 = dequantize_mxfp4_weights(w1, _ue8m0_to_fp32_multiplier(w1_scale))
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+                intermediate_cache1,
+                input_A_shuffle,
+                w1,
+                b1,
+                expert_offsets,
+                E,
+                activation_type,
+                fuse_act=True,
+                gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
+            )
+            if use_mxfp4_w4a16:
+                del w1
+        # GEMM2: B = w2 (down). Always fuse_act=False on the second GEMM.
+        if use_mxfp4_w4a16 and use_fused_mxfp4_kernel:
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4(
+                intermediate_cache3,
+                intermediate_cache1,
+                w2,
+                w2_scale,
+                b2,
+                expert_offsets,
+                E,
+                activation_type,
+                False,  # fuse_act
+                float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                float(gemm1_limit) if gemm1_limit is not None else 7.0,
+            )
+        else:
+            if use_mxfp4_w4a16:
+                w2 = dequantize_mxfp4_weights(w2, _ue8m0_to_fp32_multiplier(w2_scale))
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+                intermediate_cache3,
+                intermediate_cache1,
+                w2,
+                b2,
+                expert_offsets,
+                E,
+                activation_type,
+                fuse_act=False,
+                gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
+            )
+            if use_mxfp4_w4a16:
+                del w2
 
     rsf = 1.0
 

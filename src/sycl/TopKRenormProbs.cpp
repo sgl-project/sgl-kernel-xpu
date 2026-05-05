@@ -223,9 +223,10 @@ struct TopKRenormProbsSingleCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
     float thread_sum = 0.0f;
     for (uint32_t i = tid; i < num_vec_elems; i += kWgSize) {
       vec_in v;
-      v.load(0, sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(
-                    probs + row_offset + i * kVecSize));
-      #pragma unroll
+      v.load(
+          0,
+          sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(probs + row_offset + i * kVecSize));
+#pragma unroll
       for (uint32_t j = 0; j < kVecSize; ++j) {
         float val = static_cast<float>(v[j]);
         thread_sum += sycl::select(0.0f, val, val >= pivot);
@@ -252,16 +253,18 @@ struct TopKRenormProbsSingleCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
     using vec_out = vec_t<DType, kVecSize>;
     for (uint32_t i = tid; i < num_vec_elems; i += kWgSize) {
       vec_in v;
-      v.load(0, sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(
-                    probs + row_offset + i * kVecSize));
+      v.load(
+          0,
+          sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(probs + row_offset + i * kVecSize));
       vec_out out;
-      #pragma unroll
+#pragma unroll
       for (uint32_t j = 0; j < kVecSize; ++j) {
         float val = static_cast<float>(v[j]);
         out[j] = static_cast<DType>(sycl::select(0.0f, val * inv_sum, val >= pivot));
       }
-      out.store(0, sycl::multi_ptr<DType, sycl::access::address_space::global_space>(
-                       renorm_probs + row_offset + i * kVecSize));
+      out.store(
+          0,
+          sycl::multi_ptr<DType, sycl::access::address_space::global_space>(renorm_probs + row_offset + i * kVecSize));
     }
     for (uint32_t col = vec_tail_start + tid; col < vocab_u32; col += kWgSize) {
       const float val = static_cast<float>(probs[row_offset + col]);
@@ -294,7 +297,10 @@ void launch_single_cta_kernel(
 }
 
 void top_k_renorm_probs(
-    const at::Tensor& probs, at::Tensor& renorm_probs, const std::optional<at::Tensor>& maybe_top_k_arr, int64_t top_k_val) {
+    const at::Tensor& probs,
+    at::Tensor& renorm_probs,
+    const std::optional<at::Tensor>& maybe_top_k_arr,
+    int64_t top_k_val) {
   CHECK_INPUT(probs);
   CHECK_INPUT(renorm_probs);
   TORCH_CHECK(probs.dim() == 2, "probs must be a 2D tensor [batch_size, vocab_size]");

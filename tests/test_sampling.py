@@ -9,6 +9,7 @@ import utils
 
 device = utils.get_device()
 
+
 @pytest.mark.skip(reason="not implemented")
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
@@ -95,10 +96,10 @@ def torch_top_k_renorm_probs(normalized_prob, k):
         renorm_prob_ground_truth = torch.zeros_like(normalized_prob)
         for i in range(batch_size):
             k_i = k_cpu[i]
-            sorted_prob, _ = torch.sort(normalized_prob[i:i+1], descending=True)
+            sorted_prob, _ = torch.sort(normalized_prob[i : i + 1], descending=True)
             pivot = sorted_prob[:, k_i - 1].unsqueeze(-1)
-            mask = (normalized_prob[i:i+1] >= pivot).int()
-            row_result = normalized_prob[i:i+1].clone()
+            mask = (normalized_prob[i : i + 1] >= pivot).int()
+            row_result = normalized_prob[i : i + 1].clone()
             row_result[mask == 0] = 0
             row_result = row_result / row_result.sum(dim=-1, keepdim=True)
             renorm_prob_ground_truth[i] = row_result[0]
@@ -110,8 +111,9 @@ def torch_top_k_renorm_probs(normalized_prob, k):
         mask = (normalized_prob >= pivot).int()
         renorm_prob_ground_truth = normalized_prob.clone()
         renorm_prob_ground_truth[mask == 0] = 0
-        renorm_prob_ground_truth = renorm_prob_ground_truth / renorm_prob_ground_truth.sum(
-            dim=-1, keepdim=True
+        renorm_prob_ground_truth = (
+            renorm_prob_ground_truth
+            / renorm_prob_ground_truth.sum(dim=-1, keepdim=True)
         )
         return renorm_prob_ground_truth
 
@@ -150,7 +152,9 @@ def test_top_k_renorm_probs_array(batch_size, vocab_size, k_range):
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
 
     # Create per-row top-k array with varied values
-    top_k_arr = torch.randint(k_min, k_max, (batch_size,), dtype=torch.int64, device=f"{device}:0")
+    top_k_arr = torch.randint(
+        k_min, k_max, (batch_size,), dtype=torch.int64, device=f"{device}:0"
+    )
     if torch.any(top_k_arr <= 0):
         pytest.skip("top_k_arr values should be greater than 0")
 

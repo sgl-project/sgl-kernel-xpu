@@ -131,6 +131,7 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k):
     renorm_prob_ground_truth = torch_top_k_renorm_probs(normalized_prob, k)
 
     renorm_prob = sgl_kernel.top_k_renorm_prob(normalized_prob, k)
+
     torch.testing.assert_close(
         renorm_prob_ground_truth,
         renorm_prob,

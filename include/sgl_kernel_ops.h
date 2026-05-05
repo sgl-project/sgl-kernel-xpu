@@ -321,6 +321,22 @@ void moe_grouped_mm_nt_xe20(
     double gemm1_alpha = 1.702,
     double gemm1_limit = 7.0);
 
+// Tile-fused MXFP4-B × BF16-A MoE grouped GEMM. B is uint8 packed MXFP4
+// (two E2M1 per byte, low nibble = smaller-K element). Scales are uint8
+// UE8M0 biased exponents, one per 32-element K-block.
+void moe_grouped_mm_nt_xe20_mxfp4(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& packed_weights,
+    const torch::Tensor& scales,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts,
+    const int64_t activation_type = 0,
+    bool fuse_act = false,
+    double gemm1_alpha = 1.702,
+    double gemm1_limit = 7.0);
+
 void prepare_moe_input(
     const torch::Tensor& topk_ids,
     torch::Tensor& expert_offsets,

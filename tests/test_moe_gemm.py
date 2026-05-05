@@ -398,5 +398,140 @@ def test_moe_gemm_mxfp4_weights(
     )
 
 
+# ---------------------------------------------------------------------------
+# Op-level test: moe_grouped_mm_nt_xe20_mxfp4 vs. moe_grouped_mm_nt_xe20(dequant)
+# ---------------------------------------------------------------------------
+#
+# Exercises the tile-fused MXFP4 grouped GEMM op directly (no fused_experts
+# orchestrator). Compares against running the non-quantized bf16 grouped GEMM
+# on the dequantized weights — both paths see the same MXFP4-rounded weight
+# values, so any difference is bf16 GEMM arithmetic noise, not quantization.
+
+
+def _build_moe_gemm_inputs(
+    num_experts: int,
+    avg_m_per_expert: int,
+    gemm_n: int,
+    gemm_k: int,
+    with_bias: bool,
+    fuse_act: bool,
+    seed: int = 0,
+):
+    """Construct (activations, bf16_weights, mxfp4_packed, mxfp4_scales,
+    total_rows_for_experts, bias_or_none) on XPU for the op-level test."""
+    torch.manual_seed(seed)
+    torch.xpu.manual_seed_all(seed)
+
+    # Equal rows per expert for simplicity.
+    total_m = num_experts * avg_m_per_expert
+    total_rows = torch.full(
+        (num_experts,), avg_m_per_expert, dtype=torch.int32, device="xpu"
+    )
+
+    activations = create_random_xpu_tensor((total_m, gemm_k), torch.bfloat16)
+
+    # Build bf16 weights on CPU, quantize to mxfp4 there, then move to XPU.
+    w_bf16_cpu = create_random_cpu_tensor(
+        (num_experts, gemm_n, gemm_k), torch.bfloat16
+    )
+    w_packed_cpu, w_scale_cpu = _quantize_weights_mxfp4(w_bf16_cpu)
+    w_dq_cpu = _dequantize_weights_mxfp4(w_packed_cpu, w_scale_cpu)
+
+    w_dq_xpu = w_dq_cpu.to("xpu")
+    w_packed_xpu = w_packed_cpu.to("xpu")
+    w_scale_xpu = w_scale_cpu.to("xpu")
+
+    bias = None
+    if with_bias:
+        bias = create_random_xpu_tensor(
+            (num_experts, gemm_n), torch.float32, std=0.005
+        )
+
+    out_cols = gemm_n // 2 if fuse_act else gemm_n
+    output_bf16 = torch.empty((total_m, out_cols), dtype=torch.bfloat16, device="xpu")
+    output_mxfp4 = torch.empty((total_m, out_cols), dtype=torch.bfloat16, device="xpu")
+
+    return {
+        "activations": activations,
+        "w_dq": w_dq_xpu,
+        "w_packed": w_packed_xpu,
+        "w_scale": w_scale_xpu,
+        "total_rows": total_rows,
+        "bias": bias,
+        "output_bf16": output_bf16,
+        "output_mxfp4": output_mxfp4,
+    }
+
+
+@pytest.mark.parametrize("num_tokens_per_expert", [1, 33, 222])
+@pytest.mark.parametrize("num_experts", [8])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize("activation_type", [0, 1, 2])  # silu, gelu, swiglu_gpt_oss
+@pytest.mark.parametrize("fuse_act", [False, True])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_moe_grouped_mm_nt_xe20_mxfp4_op(
+    num_tokens_per_expert,
+    num_experts,
+    hidden_size,
+    intermediate_size,
+    activation_type,
+    fuse_act,
+    with_bias,
+):
+    """Direct op-level comparison: mxfp4 fused op vs. bf16 op on dequant weights.
+
+    gemm_k = hidden_size (activation's inner dim)
+    gemm_n = 2*intermediate_size (w1 style) — we pick one shape for simplicity
+    For fuse_act=True the output has N/2 cols, so gemm_n must be even.
+    """
+    gemm_k = hidden_size
+    gemm_n = 2 * intermediate_size
+    assert gemm_n % 2 == 0
+    assert gemm_k % 32 == 0, "gemm_k must be a multiple of MXFP4 group size"
+
+    inputs = _build_moe_gemm_inputs(
+        num_experts=num_experts,
+        avg_m_per_expert=num_tokens_per_expert,
+        gemm_n=gemm_n,
+        gemm_k=gemm_k,
+        with_bias=with_bias,
+        fuse_act=fuse_act,
+    )
+
+    # Baseline: bf16 op on the dequantised weights.
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+        inputs["output_bf16"],
+        inputs["activations"],
+        inputs["w_dq"],
+        inputs["bias"],
+        inputs["total_rows"],
+        num_experts,
+        activation_type,
+        fuse_act,
+        1.702,
+        7.0,
+    )
+
+    # Fused MXFP4 path.
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4(
+        inputs["output_mxfp4"],
+        inputs["activations"],
+        inputs["w_packed"],
+        inputs["w_scale"],
+        inputs["bias"],
+        inputs["total_rows"],
+        num_experts,
+        activation_type,
+        fuse_act,
+        1.702,
+        7.0,
+    )
+
+    torch.testing.assert_close(
+        inputs["output_bf16"], inputs["output_mxfp4"], rtol=1e-1, atol=1e-2
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

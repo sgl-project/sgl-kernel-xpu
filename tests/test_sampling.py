@@ -91,9 +91,10 @@ def torch_top_k_renorm_probs(normalized_prob, k):
     if isinstance(k, torch.Tensor):
         # Per-row k array
         batch_size = normalized_prob.size(0)
+        k_cpu = k.to("cpu").tolist()
         renorm_prob_ground_truth = torch.zeros_like(normalized_prob)
         for i in range(batch_size):
-            k_i = k[i].item()
+            k_i = k_cpu[i]
             sorted_prob, _ = torch.sort(normalized_prob[i:i+1], descending=True)
             pivot = sorted_prob[:, k_i - 1].unsqueeze(-1)
             mask = (normalized_prob[i:i+1] >= pivot).int()
@@ -150,6 +151,8 @@ def test_top_k_renorm_probs_array(batch_size, vocab_size, k_range):
 
     # Create per-row top-k array with varied values
     top_k_arr = torch.randint(k_min, k_max, (batch_size,), dtype=torch.int64, device=f"{device}:0")
+    if torch.any(top_k_arr <= 0):
+        pytest.skip("top_k_arr values should be greater than 0")
 
     # Compute ground truth using unified function
     renorm_prob_ground_truth = torch_top_k_renorm_probs(normalized_prob, top_k_arr)

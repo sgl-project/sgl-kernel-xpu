@@ -38,7 +38,7 @@ def benchmark(batch_size, vocab_size, top_k, provider):
     )
     dtype = torch.float32
     torch.set_default_device("xpu")
-    torch.xpu.manual_seed_all(0)
+    torch.xpu.manual_seed_all(42)
 
     # Create input probabilities
     probs = torch.rand(

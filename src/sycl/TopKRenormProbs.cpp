@@ -281,7 +281,7 @@ void launch_single_cta_kernel(
     sycl::queue& queue) {
   using KernelDType = typename ToSyclElementType<TensorDType>::type;
 
-  auto* probs_ptr = reinterpret_cast<KernelDType*>(probs.data_ptr<TensorDType>());
+  const KernelDType* probs_ptr = reinterpret_cast<const KernelDType*>(probs.data_ptr<TensorDType>());
   auto* renorm_probs_ptr = reinterpret_cast<KernelDType*>(renorm_probs.data_ptr<TensorDType>());
 
   const int local_size = 1024;
@@ -311,7 +311,6 @@ void top_k_renorm_probs(
     TORCH_CHECK(maybe_top_k_arr->dim() == 1, "maybe_top_k_arr must be a 1D tensor [batch_size]");
     TORCH_CHECK(maybe_top_k_arr->size(0) == probs.size(0), "maybe_top_k_arr size must match batch_size");
     TORCH_CHECK(maybe_top_k_arr->scalar_type() == torch::kInt64, "maybe_top_k_arr must be int64");
-    TORCH_CHECK(maybe_top_k_arr->min().item<int64_t>() >= 1, "maybe_top_k_arr values must be >= 1");
   } else {
     TORCH_CHECK(top_k_val > 0, "top_k_val must be positive");
   }

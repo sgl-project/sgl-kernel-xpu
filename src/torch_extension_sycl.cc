@@ -87,6 +87,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("moe_grouped_mm_nt_xe20", torch::kXPU, &moe_grouped_mm_nt_xe20);
 
   m.def(
+      "moe_grouped_mm_nt_xe20_mxfp4(Tensor output, Tensor activations, Tensor packed_weights, Tensor scales, "
+      "Tensor? bias, Tensor total_rows_for_experts, int n_experts, int activation_type, bool fuse_act, "
+      "float gemm1_alpha=1.702, float gemm1_limit=7.0) -> ()");
+  m.impl("moe_grouped_mm_nt_xe20_mxfp4", torch::kXPU, &moe_grouped_mm_nt_xe20_mxfp4);
+
+  m.def(
       "prepare_moe_input(Tensor topk_ids, Tensor expert_offsets, Tensor? blockscale_offsets, Tensor problem_sizes1,"
       " Tensor problem_sizes2, Tensor input_permutation, Tensor output_permutation, int num_experts, int n, int k) -> "
       "()");
@@ -100,47 +106,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state_v2", torch::kXPU, &merge_state_v2);
-  /*
-   * From cutlass attention
-   */
-  m.def(
-      "fwd(Tensor   q,"
-      "    Tensor   k,"
-      "    Tensor   v,"
-      "    Tensor?  q_v,"
-      "    Tensor  cu_seqlens_q,"
-      "    Tensor  cu_seqlens_k,"
-      "    int     max_seqlen_q,"
-      "    int     max_seqlen_k,"
-      "    Tensor?  page_table,"
-      "    Tensor?  kv_batch_idx,"
-      "    Tensor?  leftpad_k,"
-      "    Tensor?  rotary_cos,"
-      "    Tensor?  rotary_sin,"
-      "    Tensor?  seqlens_rotary,"
-      "    Tensor?  q_descale,"
-      "    Tensor?  k_descale,"
-      "    Tensor?  v_descale,"
-      "    float    softmax_scale,"
-      "    Tensor?  sinks,"
-      "    bool     is_causal,"
-      "    int      window_size_left,"
-      "    int      window_size_right,"
-      "    float    softcap,"
-      "    bool     is_rotary_interleaved,"
-      "    Tensor?  scheduler_metadata,"
-      "    int      num_kv_splits,"
-      "    bool?    pack_gqa,"
-      "    int      sm_margin) -> Tensor[]");
-  m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
-
-  m.def("flash_mla_get_workspace_size", &flash_mla_get_workspace_size);
-
-  m.def(
-      "flash_mla_decode(Tensor! out, Tensor! q_nope, Tensor! q_pe, Tensor! kv_c_and_k_pe_cache, Tensor! seq_lens, "
-      "Tensor! "
-      "page_table, Tensor! workspace, float sm_scale, int num_kv_splits) -> ()");
-  m.impl("flash_mla_decode", torch::kXPU, &flash_mla_decode);
 
   /*
    * From quantization ops

@@ -82,13 +82,16 @@ static constexpr int SUBGROUP_SIZE = 16;
 // ([N, K/GROUP_SIZE] uint8, row-stride = K/GROUP_SIZE).
 // k_scale_idx is the K-group index for this k-tile (= k_tile since we
 // force BLK_K == GROUP_SIZE).
-// Load the full SG_N-range of scale bytes for this subgroup's N-slice into
-// a per-SG register array (every WI in the SG reads the same SG_N bytes).
-// Each WI reads SG_N / SUBGROUP_SIZE contiguous bytes, then broadcasts them
-// to the other lanes via a subgroup shuffle / shared writes. For simplicity
-// (and because SG_N is small) we just have every WI read the whole range —
-// the gmem load cache makes the redundant reads cheap, and this avoids the
-// subgroup-shuffle plumbing.
+// Collaborative scale load. Each WI in the SG reads SG_N / SUBGROUP_SIZE
+// bytes from gmem, then the SG uses sycl::select_from_group to broadcast
+// each WI's local bytes into every other WI's full SG_N-byte array. Total
+// gmem traffic per SG per k-tile: SG_N bytes (coalesced, one cache line)
+// instead of 16*SG_N with the old naive approach.
+//
+// The broadcast is done as SG_N separate select_from_group ops — one per
+// byte-position in the output array. Each call asks the SG for the byte
+// stored in lane `src_lane` at local array slot `local_slot`, which is
+// cheap on Xe (single sub-group exchange instruction).
 template <int SG_N, int ATOM_N, int BLK_N>
 CUTLASS_DEVICE void load_scale_slice(
     const uint8_t* scales_gmem_ptr,
@@ -97,38 +100,35 @@ CUTLASS_DEVICE void load_scale_slice(
     int k_scale_idx,
     int thr_id,
     uint8_t* scale_out /* [SG_N] */) {
+  static constexpr int N_per_wi = SG_N / SUBGROUP_SIZE;
+  static_assert(SG_N % SUBGROUP_SIZE == 0,
+                "SG_N must be a multiple of SUBGROUP_SIZE");
+
   const int sg_n_coord = (thr_id / SUBGROUP_SIZE) % ATOM_N;
+  const int lane = thr_id % SUBGROUP_SIZE;
   const int n_base = wg_n * BLK_N + sg_n_coord * SG_N;
 
+  // Each WI loads its own N_per_wi bytes from gmem (its assigned rows
+  // interleaved by lane: WI `lane` owns rows { lane*N_per_wi + k : k<N_per_wi }).
+  // This matches the add_bias per-WI N mapping convention.
+  uint8_t wi_local[N_per_wi];
   CUTE_UNROLL
-  for (int i = 0; i < SG_N; ++i) {
-    scale_out[i] = scales_gmem_ptr[(n_base + i) * row_stride + k_scale_idx];
+  for (int sn = 0; sn < N_per_wi; ++sn) {
+    const int n = n_base + lane * N_per_wi + sn;
+    wi_local[sn] = scales_gmem_ptr[n * row_stride + k_scale_idx];
   }
-}
 
-// E2M1 decode LUT (16 entries). Bit 3 = sign, bits 2..0 = magnitude index.
-// All values are exactly representable in bf16.
-CUTLASS_DEVICE
-cutlass::bfloat16_t mxfp4_e2m1_lut(uint8_t nibble) {
-  switch (nibble & 0xF) {
-    case 0x0: return cutlass::bfloat16_t(0.0f);
-    case 0x1: return cutlass::bfloat16_t(0.5f);
-    case 0x2: return cutlass::bfloat16_t(1.0f);
-    case 0x3: return cutlass::bfloat16_t(1.5f);
-    case 0x4: return cutlass::bfloat16_t(2.0f);
-    case 0x5: return cutlass::bfloat16_t(3.0f);
-    case 0x6: return cutlass::bfloat16_t(4.0f);
-    case 0x7: return cutlass::bfloat16_t(6.0f);
-    case 0x8: return cutlass::bfloat16_t(0.0f);  // -0.0 arithmetically equal to +0
-    case 0x9: return cutlass::bfloat16_t(-0.5f);
-    case 0xA: return cutlass::bfloat16_t(-1.0f);
-    case 0xB: return cutlass::bfloat16_t(-1.5f);
-    case 0xC: return cutlass::bfloat16_t(-2.0f);
-    case 0xD: return cutlass::bfloat16_t(-3.0f);
-    case 0xE: return cutlass::bfloat16_t(-4.0f);
-    case 0xF: return cutlass::bfloat16_t(-6.0f);
+  // Broadcast each lane's bytes to all SG lanes, materializing the full
+  // SG_N-byte scale array in every WI's registers.
+  auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+  CUTE_UNROLL
+  for (int src_lane = 0; src_lane < SUBGROUP_SIZE; ++src_lane) {
+    CUTE_UNROLL
+    for (int sn = 0; sn < N_per_wi; ++sn) {
+      scale_out[src_lane * N_per_wi + sn] =
+          sycl::select_from_group(sg, wi_local[sn], src_lane);
+    }
   }
-  return cutlass::bfloat16_t(0.0f);
 }
 
 // UE8M0 biased-exponent byte -> bf16 direct multiplier = 2^(byte - 127).
@@ -168,31 +168,37 @@ cutlass::bfloat16_t mxfp4_ue8m0_to_bf16_mul(uint8_t byte) {
 // cutlass/gemm/collective/xe_mma_mixed_input.hpp::transform_quant — but
 // with per-element scale lookup via a coord companion, since the packed
 // fragment's linear index doesn't trivially decompose to (n, k).
-template <class PackedFrag, class CoordFrag, class OutFrag>
-CUTLASS_DEVICE void dequant_B_mxfp4_to_bf16(
-    PackedFrag const& packed,
+// Apply per-block MXFP4 scales to an already-upcasted bf16 MMA-B fragment.
+// Used after cute::reorder does the E2M1→bf16 conversion + layout permute.
+//
+// The N-row for each fragment element comes from the MMA-B coord companion:
+// get<0>(coord_frag(idx)) is the WG-tile-N coord. We subtract n_sg_base to
+// index into scale_bf16, which was pre-decoded per-k-tile.
+template <int SG_N_v, class FragBf16, class CoordFrag>
+CUTLASS_DEVICE void apply_B_scales_mma(
+    FragBf16& frag,
     CoordFrag const& coord_frag,
     const uint8_t* scales_sg,
-    int n_sg_base,
-    OutFrag& out) {
-  using OutLayout = typename OutFrag::layout_type;
-  using PackedLayout = typename PackedFrag::layout_type;
+    int n_sg_base) {
+  using FragLayout = typename FragBf16::layout_type;
+  constexpr int frag_size = cute::size_v<FragLayout>;
 
-  constexpr int out_size = cute::size_v<OutLayout>;
-  constexpr int packed_size = cute::size_v<PackedLayout>;
-  static_assert(out_size == packed_size,
-                "packed fragment and bf16 out fragment must have equal element counts");
+  // Pre-decode SG_N UE8M0 scale bytes → bf16 multipliers once.
+  cutlass::bfloat16_t scale_bf16[SG_N_v];
+  CUTE_UNROLL
+  for (int i = 0; i < SG_N_v; ++i) {
+    scale_bf16[i] = mxfp4_ue8m0_to_bf16_mul(scales_sg[i]);
+  }
 
   CUTE_UNROLL
-  for (int idx = 0; idx < out_size; ++idx) {
+  for (int idx = 0; idx < frag_size; ++idx) {
     auto coord = coord_frag(idx);
     int n_in_sg = get<0>(coord) - n_sg_base;
-    cutlass::bfloat16_t s = mxfp4_ue8m0_to_bf16_mul(scales_sg[n_in_sg]);
-    cutlass::float_e2m1_t elt = packed(idx);
-    uint8_t nibble = static_cast<uint8_t>(elt.raw()) & 0xF;
-    out(idx) = mxfp4_e2m1_lut(nibble) * s;
+    cutlass::bfloat16_t s = scale_bf16[n_in_sg];
+    frag(idx) = frag(idx) * s;
   }
 }
+
 
 template <int Stages>
 class XeDefault {};
@@ -307,27 +313,23 @@ struct MoEMainloopMxfp4<
     auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
     auto tSrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
 
-    // B fragments — two-step layout path (mirrors BF16 mainloop's reorder
-    // pattern plus a dequant step):
-    //   tBrB_packed  : float_e2m1_t, COPY layout — destination of the
-    //                  8-bit 2D-load. SubgroupTensor with tv_layout for
-    //                  reorder bookkeeping.
-    //   tBrB_bf16    : bf16, SAME COPY layout as tBrB_packed — dequant
-    //                  writes here element-wise.
-    //   tSrB         : bf16, MMA-B layout — reorder target; consumed by
-    //                  cute::gemm.
+    // B fragments — fused reorder path that collapses dequant+reorder into
+    // a single cute::reorder call with built-in E2M1→bf16 conversion:
+    //   tBrB_packed   : float_e2m1_t, COPY layout — destination of the
+    //                   8-bit 2D-load.
+    //   tSrB          : bf16, MMA-B layout — reorder produces this;
+    //                   element-wise scale is applied in-place here.
+    // We no longer allocate an intermediate bf16 fragment in the copy
+    // layout; cute::reorder handles both the E2M1→bf16 conversion and
+    // the copy-layout→MMA-layout permutation via its ConvertRelayout
+    // dispatch path.
     auto tBrB_packed = thr_copy_b.partition_sg_fragment_D(gBp(_, _, 0));
-    cutlass::bfloat16_t tBrB_bf16_storage[tBrB_packed.size()];
-    Tensor tBrB_bf16_rmem = make_tensor(make_rmem_ptr(tBrB_bf16_storage), tBrB_packed.layout());
-    auto tBrB_bf16 = make_subgroup_tensor(tBrB_bf16_rmem, tBrB_packed.tv_layout());
     auto tSrB = thr_mma.partition_sg_fragment_B(gBp(_, _, 0));
 
-    // Coord companion in the COPY layout — same partition as tBrB_packed.
-    // Using partition_S on a coord gmem tile gives per-WI N/K coordinates
-    // for every element of the copy-layout fragment, so the dequant loop
-    // can resolve the correct scale byte per packed element.
+    // Coord companion in the MMA-B layout — maps each tSrB element's
+    // linear index to its (n, k) coord for scale indexing.
     auto cBp_coord_tile = make_identity_tensor(make_shape(Int<BLK_N>{}, Int<BLK_K>{}));
-    auto tCrB_coord = thr_copy_b.partition_S(cBp_coord_tile);
+    auto tCrB_coord = thr_mma.partition_B(cBp_coord_tile);
 
     // Per-SG scale register array — one byte per N-row in this SG's slice.
     uint8_t scale_sg[SG_N];
@@ -377,12 +379,17 @@ struct MoEMainloopMxfp4<
       }
 
       reorder(tArA, tSrA);
-      // Dequant in the copy-layout (linear index over tBrB_packed matches
-      // tBrB_bf16 matches tCrB_coord), then reorder bf16 → MMA-B layout.
+      // Fused type-conversion + layout-reorder. This picks the
+      // ConvertRelayout dispatch inside cute::reorder, which handles both
+      // E2M1 → bf16 upcast and copy-layout → MMA-B layout permutation.
+      reorder(tBrB_packed, tSrB);
+
+      // Apply per-block MXFP4 scales to tSrB in-place. Each element's
+      // N-coord is looked up in the MMA-B coord companion; scale_sg holds
+      // the per-SG UE8M0 bytes decoded to bf16 in apply_scales.
       const int sg_n_coord = (thr_id / SUBGROUP_SIZE) % ATOM_N_V;
       const int n_sg_base = sg_n_coord * SG_N;
-      dequant_B_mxfp4_to_bf16(tBrB_packed, tCrB_coord, scale_sg, n_sg_base, tBrB_bf16);
-      reorder(tBrB_bf16, tSrB);
+      apply_B_scales_mma<SG_N>(tSrB, tCrB_coord, scale_sg, n_sg_base);
 
       cute::gemm(mma, tSrA, tSrB, tCrC);
       barrier_wait(barrier_scope);
@@ -463,22 +470,18 @@ struct MoEMainloopMxfp4<
     auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
     auto tSrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
 
-    // Two packed-B fragments in the COPY layout, each with a bf16 shadow
-    // in the same layout for dequant. tSrB is the MMA-B layout target
-    // (shared across gate and up gemms since they run in series).
+    // Two packed-B fragments in the COPY layout; tSrB is the MMA-B layout
+    // target, shared across gate and up gemms (they run in series).
+    // cute::reorder with the ConvertRelayout dispatch does both E2M1→bf16
+    // conversion and layout permute in one call — no copy-layout bf16
+    // intermediate needed.
     auto tBrB_packed0 = thr_copy_b0.partition_sg_fragment_D(gBp(_, _, 0));
     auto tBrB_packed1 = thr_copy_b1.partition_sg_fragment_D(gBp(_, _, 0));
-    cutlass::bfloat16_t tBrB_bf160_storage[tBrB_packed0.size()];
-    cutlass::bfloat16_t tBrB_bf161_storage[tBrB_packed1.size()];
-    Tensor tBrB_bf160_rmem = make_tensor(make_rmem_ptr(tBrB_bf160_storage), tBrB_packed0.layout());
-    Tensor tBrB_bf161_rmem = make_tensor(make_rmem_ptr(tBrB_bf161_storage), tBrB_packed1.layout());
-    auto tBrB_bf160 = make_subgroup_tensor(tBrB_bf160_rmem, tBrB_packed0.tv_layout());
-    auto tBrB_bf161 = make_subgroup_tensor(tBrB_bf161_rmem, tBrB_packed1.tv_layout());
     auto tSrB = thr_mma.partition_sg_fragment_B(gBp(_, _, 0));
 
-    // Coord companion in the COPY layout (same partition as tBrB_packed0).
+    // Coord companion in the MMA-B layout for scale indexing on tSrB.
     auto cBp_coord_tile = make_identity_tensor(make_shape(Int<BLK_N>{}, Int<BLK_K>{}));
-    auto tCrB_coord = thr_copy_b0.partition_S(cBp_coord_tile);
+    auto tCrB_coord = thr_mma.partition_B(cBp_coord_tile);
 
     // Per-SG scale register arrays (gate + up).
     uint8_t scale0_sg[SG_N];
@@ -530,16 +533,16 @@ struct MoEMainloopMxfp4<
       load_scale_slice<SG_N, ATOM_N_V, BLK_N>(
           scales0_gmem, scale_row_stride, wg_n, k_tile, thr_id, scale0_sg);
       reorder(tArA, tSrA);
-      dequant_B_mxfp4_to_bf16(tBrB_packed0, tCrB_coord, scale0_sg, n_sg_base, tBrB_bf160);
-      reorder(tBrB_bf160, tSrB);
+      reorder(tBrB_packed0, tSrB);
+      apply_B_scales_mma<SG_N>(tSrB, tCrB_coord, scale0_sg, n_sg_base);
       cute::gemm(mma, tSrA, tSrB, tCrC0);
 
       // GEMM1 (up)
       copy(tiled_copy_b1, tBgBp1(_, _, _, k_tile), tBrB_packed1);
       load_scale_slice<SG_N, ATOM_N_V, BLK_N>(
           scales1_gmem, scale_row_stride, wg_n1, k_tile, thr_id, scale1_sg);
-      dequant_B_mxfp4_to_bf16(tBrB_packed1, tCrB_coord, scale1_sg, n_sg_base, tBrB_bf161);
-      reorder(tBrB_bf161, tSrB);
+      reorder(tBrB_packed1, tSrB);
+      apply_B_scales_mma<SG_N>(tSrB, tCrB_coord, scale1_sg, n_sg_base);
       cute::gemm(mma, tSrA, tSrB, tCrC1);
 
       if (prefetch_k < k_tile_count) {

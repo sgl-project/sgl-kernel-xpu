@@ -7,8 +7,9 @@
 //
 // Fork of src/sycl/kernels/moe/xe20/moe_kernel.hpp. Identical per-expert
 // tile-scheduler loop; the only changes are:
-//   - B is uint8 packed MXFP4 with row stride K/2 (two E2M1 nibbles per byte).
-//   - A per-expert UE8M0 scale tensor S is threaded through alongside B.
+//   - B is int8 packed MXFP4 with row stride K/2 (two E2M1 nibbles per byte).
+//   - A per-expert float32 scale tensor S is threaded through alongside B
+//     (direct multiplier; producer decodes UE8M0 ahead of the kernel).
 //   - B tensor construction uses halved-K strides; S tensor uses stride K/32.
 //   - The mainloop call takes both B-tile and S-tile tensors.
 
@@ -72,7 +73,7 @@ class MoEGEMMMxfp4 {
     // to make per-expert offsetting obvious (1 byte = 2 E2M1 elements);
     // wrapped into a float_e2m1_t CuTe tensor per-expert below.
     const uint8_t* PackedWeights;
-    const uint8_t* Scales;                        // [num_experts, N, K/GROUP_SIZE] UE8M0
+    const float* Scales;                          // [num_experts, N, K/GROUP_SIZE] fp32 direct multiplier
     const float* Bias;
     ElementD* Outputs;
     const int32_t* M_per_group;
@@ -125,21 +126,21 @@ class MoEGEMMMxfp4 {
 
   // Per-expert scale pointers + row stride. Returns a struct that matches
   // the split-B pattern: gate/up base pointers for the fused-act path, or
-  // a single pointer for the non-fused path. Row stride is the N-row byte
-  // stride (= K/GROUP_SIZE for block-split and non-fused, 2*K/GROUP_SIZE
-  // for GPT-OSS interleaved layout).
+  // a single pointer for the non-fused path. Row stride is the N-row fp32
+  // element stride (= K/GROUP_SIZE for block-split and non-fused,
+  // 2*K/GROUP_SIZE for GPT-OSS interleaved layout).
   struct ScalePtrs {
-    const uint8_t* ptr0;
-    const uint8_t* ptr1;
+    const float* ptr0;
+    const float* ptr1;
     int row_stride;
   };
 
-  ScalePtrs make_scale_ptrs(const uint8_t* ptr_S, int N, int K) {
+  ScalePtrs make_scale_ptrs(const float* ptr_S, int N, int K) {
     const int K_scale = K / MXFP4_GROUP_SIZE;
     if constexpr (FuseAct) {
       if constexpr (ActType == SWIGLU_GPT_OSS) {
-        // Interleaved [g0, u0, g1, u1, ...] scales: gate rows at byte
-        // offset 0, up rows at byte offset K_scale; row stride = 2*K_scale.
+        // Interleaved [g0, u0, g1, u1, ...] scales: gate rows at element
+        // offset 0, up rows at element offset K_scale; row stride = 2*K_scale.
         return ScalePtrs{ptr_S, ptr_S + K_scale, 2 * K_scale};
       } else {
         // Block-split: up rows start after (N/2) gate rows.
@@ -248,7 +249,7 @@ class MoEGEMMMxfp4 {
 
       ElementA* ptr_A_curr_batch = const_cast<ElementA*>(params.Activations) + pre_rows * K;
       uint8_t* ptr_B_curr_batch = const_cast<uint8_t*>(params.PackedWeights) + B_offset;
-      uint8_t* ptr_S_curr_batch = const_cast<uint8_t*>(params.Scales) + S_offset;
+      float* ptr_S_curr_batch = const_cast<float*>(params.Scales) + S_offset;
       float* ptr_Bias_curr_batch = nullptr;
       if constexpr (WithBias) {
         ptr_Bias_curr_batch = const_cast<float*>(params.Bias) + expert_id * N;

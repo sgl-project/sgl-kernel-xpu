@@ -43,7 +43,7 @@ def fused_topk_sigmoid_torch_native(
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("n_token", [2, 32, 4096])
-@pytest.mark.parametrize("n_expert", [8, 32])
+@pytest.mark.parametrize("n_expert", [8, 32, 256])
 @pytest.mark.parametrize("n_topk", [1, 2, 4])
 @pytest.mark.parametrize("renormalize", [False, True])
 @pytest.mark.parametrize("with_correction_bias", [False, True])

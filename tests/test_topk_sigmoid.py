@@ -52,7 +52,7 @@ def test_topk_sigmoid(
 ):
     torch.manual_seed(1024)
 
-    # expand gating_output by M, otherwise bfloat16 fall into same value aftering truncating
+    # expand gating_output by M, otherwise bfloat16 fall into same value after truncating
     hidden_states = torch.randn(n_token, 100, device=device, dtype=dtype)
     gating_output = torch.randn(n_token, n_expert, device=device, dtype=dtype)
     correction_bias = None

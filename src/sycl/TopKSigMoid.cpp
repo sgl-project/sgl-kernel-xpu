@@ -2,6 +2,7 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include <limits>
 #include <sycl/sycl.hpp>
 
 #include "SYCLHelpers.h"
@@ -137,7 +138,6 @@ struct FusedTopkSigmoid {
       for (int i = 0; i < top_k; ++i) {
         int id = topk_ids_local[i];
         topk_weights_local[i] -= correction_bias[id];
-        ;
       }
     }
 
@@ -228,6 +228,9 @@ void topk_sigmoid(
   TORCH_CHECK(topk_indices.scalar_type() == at::kInt, "topk_indices should be Int");
 
   int64_t n_topk = topk_weights.size(1);
+  // The max topk value is 8, which is constrained by 'malloc_per_item'.
+  auto max_topk = n_experts < 8 ? n_experts : 8;
+  TORCH_CHECK(0 < n_topk && n_topk <= max_topk, "topk must be less than or equal to num_experts and 8");
 
   const float* bias_ptr = nullptr;
   if (correction_bias.has_value()) {

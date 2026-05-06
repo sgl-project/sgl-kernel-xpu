@@ -29,12 +29,12 @@ void Xe20MoEGEMMMxfp4Launcher(
     float gemm1_alpha,
     float gemm1_limit);
 
-// Reduced tile menu for Stage 1 (4 shapes):
-//   - Decode-like (avg_m <= 8):                 <_8, _64, _32>, SG_1_4_1
-//   - Prefill fused-act (mid-M):                <_128, _64, _32>, SG_4_2_1
-//   - Prefill unfused-act (mid-M):              <_128, _128, _32>, SG_4_2_1
-//   - Prefill fused-act (big-M):                <_256, _64, _32>, SG_8_2_1
-//   - Prefill unfused-act (big-M):              <_256, _256, _32>, SG_8_4_1
+// Tile menu (see GroupGemmMxfp4Xe20.cmake for the full instantiation matrix):
+//   - avg_m ≤ 8:                  <_8, _64, _32>, SG_1_4_1
+//   - avg_m ≤ 128, fuse_act:      <_128, _64, _32>, SG_4_2_1
+//   - avg_m ≤ 128, no fuse_act:   <_128, _128, _32>, SG_4_2_1
+//   - avg_m >  128, fuse_act:     <_256, _64, _32>, SG_8_2_1
+//   - avg_m >  128, no fuse_act:  <_256, _256, _32>, SG_8_4_1
 using Tile_8_64_32 = Shape<_8, _64, _32>;
 using Tile_128_64_32 = Shape<_128, _64, _32>;
 using Tile_128_128_32 = Shape<_128, _128, _32>;

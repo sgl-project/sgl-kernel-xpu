@@ -622,12 +622,6 @@ def fused_experts(
     avg_m = (M * TopK) // E
     big_weight = K * N > 4096 * 4096
     use_unfused_act = avg_m <= 128 and big_weight
-    # Stage-1 MXFP4 build only compiles the unfused-act tile
-    # (<_128,_128,_32>) for small-weight shapes. Force unfused_act when the
-    # fused-MXFP4 kernel is requested and we'd otherwise pick fused_act.
-    # TODO: drop this override once the full tile menu is re-enabled.
-    if use_fused_mxfp4_kernel and not big_weight:
-        use_unfused_act = True
     if use_unfused_act:
         intermediate_cache1 = torch.empty(
             (M * TopK, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype

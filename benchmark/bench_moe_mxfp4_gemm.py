@@ -1,24 +1,17 @@
 # Op-level benchmark for the tile-fused MXFP4 MoE grouped GEMM.
 #
-# Compares two providers at a stage-1-compatible shape
-# (<_128, _128, _32> / SG_4_2_1 / silu / unfused / no-bias):
+# Compares two providers:
 #
 #   bf16_dequant : dequantize packed MXFP4 → bf16, then run the standard
-#                  moe_grouped_mm_nt_xe20 on the bf16 weights. This
-#                  represents the current path in fused_experts(
-#                  use_mxfp4_w4a16=True).
-#   mxfp4_fused  : run the new moe_grouped_mm_nt_xe20_mxfp4 directly on
-#                  packed weights + UE8M0 scales (tile-level dequant).
+#                  moe_grouped_mm_nt_xe20 on the bf16 weights (the
+#                  pre-fused path in fused_experts(use_mxfp4_w4a16=True)).
+#   mxfp4_fused  : moe_grouped_mm_nt_xe20_mxfp4 directly on packed
+#                  weights + fp32 direct-multiplier scales (tile-level
+#                  dequant).
 #
-# Both providers compute the SAME mathematical result (MXFP4-rounded
-# weights × bf16 activations), so ms is directly comparable. The fused
-# path additionally avoids ever allocating the bf16 weight tensor —
-# reported separately as peak transient GMEM.
-#
-# Stage 1 only has one tile compiled (<_128, _128, _32>), so this
-# benchmark is deliberately narrow. Once the full tile menu is
-# re-enabled, expand the shape list to cover decode / prefill regimes
-# and DSv4-sized weights.
+# Both paths compute the same mathematical result (MXFP4-rounded weights
+# × bf16 activations). The fused path additionally avoids ever allocating
+# the bf16 weight tensor — reported separately as peak transient GMEM.
 #
 # Run:
 #   python benchmark/bench_moe_mxfp4_gemm.py
@@ -30,23 +23,14 @@ import torch
 import triton
 
 import sgl_kernel  # noqa: F401 — registers the torch.ops.sgl_kernel namespace
-from sgl_kernel.moe import (
-    _ue8m0_to_fp32_multiplier,
-    dequantize_mxfp4_weights,
-)
+from sgl_kernel.moe import dequantize_mxfp4_weights
 
 # The CPU MXFP4 quantize/dequantize helpers live next to the tests.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests"))
 from mxfp4_utils import MXFP4_BLOCK_SIZE  # noqa: E402
-from mxfp4_utils import dequantize_mxfp4_2d, quantize_mxfp4_2d  # noqa: E402
+from mxfp4_utils import quantize_mxfp4_2d  # noqa: E402
 
 
-# Stage-1 target tile: <_128, _128, _32> / SG_4_2_1 / silu / unfused / no-bias.
-# Dispatcher rule: avg_m ∈ (8, 128]  AND  K * N ≤ 4096 * 4096  AND  fuse_act=False.
-# N is the grouped-GEMM's output-column extent; for un-fused act it equals
-# the hidden_size of the *output* of GEMM1 (= 2 * intermediate) or the output
-# of GEMM2 (= hidden). We sweep avg_m across decode-like (small) and
-# prefill-like (large) within the 8..128 band.
 NUM_EXPERTS = 8
 BENCH_SHAPES = [
     # (avg_m_per_expert, gemm_n, gemm_k)   # total_m = num_experts * avg_m
@@ -56,7 +40,7 @@ BENCH_SHAPES = [
     (128, 1024, 1024),
     (33, 2048, 1024),
     (33, 1024, 2048),
-    (128, 2048, 2048),  # K*N=4M — right at the small_weight boundary
+    (128, 2048, 2048),
 ]
 
 
@@ -64,27 +48,14 @@ ALL_RESULTS = []
 
 
 def _quantize_bf16_weights_mxfp4(w_bf16_cpu: torch.Tensor):
-    """[E, N, K] bf16 → ([E, N, K/2] uint8 packed, [E, N, K/32] uint8 UE8M0)."""
+    """[E, N, K] bf16 → ([E, N, K/2] int8 packed, [E, N, K/32] fp32 direct mul)."""
     E, N, K = w_bf16_cpu.shape
     flat = w_bf16_cpu.reshape(E * N, K).float().cpu()
-    p, s = quantize_mxfp4_2d(flat, MXFP4_BLOCK_SIZE)
-    return (
-        p.reshape(E, N, K // 2),
-        s.reshape(E, N, K // MXFP4_BLOCK_SIZE),
-    )
-
-
-def _dequantize_mxfp4_to_bf16(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    """Reference CPU dequant, matches fused_experts(use_mxfp4_w4a16=True)."""
-    E, N, packed_K = packed.shape
-    K = packed_K * 2
-    flat = dequantize_mxfp4_2d(
-        packed.reshape(E * N, packed_K),
-        scales.reshape(E * N, K // MXFP4_BLOCK_SIZE),
-        dtype=torch.bfloat16,
-        block_size=MXFP4_BLOCK_SIZE,
-    )
-    return flat.reshape(E, N, K)
+    packed_u8, scales_u8 = quantize_mxfp4_2d(flat, MXFP4_BLOCK_SIZE)
+    packed_i8 = packed_u8.view(torch.int8).reshape(E, N, K // 2)
+    scales_fp32 = torch.exp2((scales_u8.to(torch.int32) - 127).to(torch.float32))
+    scales_fp32 = scales_fp32.reshape(E, N, K // MXFP4_BLOCK_SIZE)
+    return packed_i8, scales_fp32
 
 
 def _prepare_inputs(avg_m: int, gemm_n: int, gemm_k: int):
@@ -132,7 +103,7 @@ def _run_bf16_dequant(inputs):
     # GEMM call, immediately hand to moe_grouped_mm_nt_xe20.
     w_bf16 = dequantize_mxfp4_weights(
         inputs["packed_xpu"],
-        _ue8m0_to_fp32_multiplier(inputs["scales_xpu"]),
+        inputs["scales_xpu"],
     )
     torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
         inputs["output"],
@@ -219,18 +190,19 @@ def benchmark(avg_m, gemm_n, gemm_k, provider):
     # weight tensor that was produced by the XPU dequant step (written
     # by dequantize_mxfp4_weights → read by moe_grouped_mm_nt_xe20, so
     # effectively bf16 bandwidth). For mxfp4_fused the GEMM reads the
-    # packed MXFP4 directly (0.5 B/elem) plus scale bytes.
+    # packed MXFP4 directly (0.5 B/elem) plus fp32 scales (4 B per
+    # MXFP4_BLOCK_SIZE elements).
     if provider == "bf16_dequant":
         b_bytes = NUM_EXPERTS * gemm_n * gemm_k * 2
     else:
-        b_bytes = NUM_EXPERTS * gemm_n * gemm_k * (1 / 2 + 1 / MXFP4_BLOCK_SIZE)
+        b_bytes = NUM_EXPERTS * gemm_n * gemm_k * (1 / 2 + 4 / MXFP4_BLOCK_SIZE)
 
     # Resident weight footprint. Both providers hold the same packed
     # tensor + scales as the "on-disk" truth; bf16_dequant additionally
     # materializes the bf16 tensor transiently per GEMM call (captured
-    # by peak_transient_MB).
+    # by peak_transient_MB). Scales are fp32 (4 B per group).
     packed_bytes = NUM_EXPERTS * gemm_n * (
-        gemm_k // 2 + gemm_k // MXFP4_BLOCK_SIZE
+        gemm_k // 2 + 4 * (gemm_k // MXFP4_BLOCK_SIZE)
     )
     bf16_transient = NUM_EXPERTS * gemm_n * gemm_k * 2
     weights_resident_bytes = packed_bytes

@@ -65,35 +65,21 @@ static constexpr int MXFP4_GROUP_SIZE = 32;
 // Number of work-items per subgroup on Xe (SIMD lane count).
 static constexpr int SUBGROUP_SIZE = 16;
 
-// Hand-rolled scale load.
-//
-// The 2D-block-load machinery doesn't fit a (BLK_N, 1)-shaped scale tile
-// cleanly, so we load scales with plain pointer arithmetic. Scales are tiny
-// (one fp32 element per N-row per k-tile — at most a few elements per WI
-// per k-tile), so we skip prefetch and accept the slow path; the latency
-// is fully hidden under the A/B tile loads which are orders of magnitude
-// bigger.
-//
-// Per-WI N-to-element mapping matches add_bias: WI at (sg_n_coord, lane)
-// owns N-positions { sn*SUBGROUP_SIZE + lane : sn ∈ [0, SG_N/16) }, with
-// SG starting at n_base = wg_n * BLK_N + sg_n_coord * SG_N. This matches
-// the MMA-B fragment's per-WI N layout so dequant can index scales by the
-// same `n` value as its N-loop.
-//
-// scales_gmem_ptr points at the start of this expert's scales
-// ([N, K/GROUP_SIZE] fp32, row-stride = K/GROUP_SIZE).
-// k_scale_idx is the K-group index for this k-tile (= k_tile since we
-// force BLK_K == GROUP_SIZE).
 // Collaborative scale load. Each WI in the SG reads SG_N / SUBGROUP_SIZE
 // fp32 elements from gmem, then the SG uses sycl::select_from_group to
-// broadcast each WI's local elements into every other WI's full SG_N
-// array. Total gmem traffic per SG per k-tile: SG_N * 4 bytes (coalesced)
-// instead of 16*SG_N*4 with the old naive approach.
+// broadcast each WI's local elements so every WI holds the full [SG_N]
+// scale array. Total gmem traffic per SG per k-tile: SG_N * 4 bytes vs.
+// 16*SG_N*4 with a naive "every WI reads all scales" approach.
 //
-// The broadcast is done as SG_N separate select_from_group ops — one per
-// element position in the output array. Each call asks the SG for the
-// value stored in lane `src_lane` at local array slot `local_slot`, which
-// is cheap on Xe (single sub-group exchange instruction).
+// scales_gmem_ptr points at this expert's scale tile
+// ([N, K/GROUP_SIZE] fp32, row-stride = K/GROUP_SIZE). k_scale_idx is the
+// K-group index for this k-tile (= k_tile since BLK_K == GROUP_SIZE).
+// Per-WI N assignment matches the add_bias convention so apply_B_scales_mma
+// can index scales by the same N coord as the MMA-B fragment's N-loop.
+//
+// 2D-block-load doesn't fit a (BLK_N, 1) tile cleanly so we load with
+// plain pointer arithmetic; the latency is hidden under the A/B 2D-block
+// loads which are orders of magnitude bigger.
 template <int SG_N, int ATOM_N, int BLK_N>
 CUTLASS_DEVICE void load_scale_slice(
     const float* scales_gmem_ptr,
@@ -280,16 +266,10 @@ struct MoEMainloopMxfp4<
     auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
     auto tSrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
 
-    // B fragments — fused reorder path that collapses dequant+reorder into
-    // a single cute::reorder call with built-in E2M1→bf16 conversion:
-    //   tBrB_packed   : float_e2m1_t, COPY layout — destination of the
-    //                   8-bit 2D-load.
-    //   tSrB          : bf16, MMA-B layout — reorder produces this;
-    //                   element-wise scale is applied in-place here.
-    // We no longer allocate an intermediate bf16 fragment in the copy
-    // layout; cute::reorder handles both the E2M1→bf16 conversion and
-    // the copy-layout→MMA-layout permutation via its ConvertRelayout
-    // dispatch path.
+    // tBrB_packed: float_e2m1_t COPY-layout fragment (2D-block-load target).
+    // tSrB:        bf16 MMA-B-layout fragment. cute::reorder's
+    //              ConvertRelayout path does E2M1→bf16 + layout permute in
+    //              one call; scales are applied in-place on tSrB after.
     auto tBrB_packed = thr_copy_b.partition_sg_fragment_D(gBp(_, _, 0));
     auto tSrB = thr_mma.partition_sg_fragment_B(gBp(_, _, 0));
 
@@ -437,11 +417,8 @@ struct MoEMainloopMxfp4<
     auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
     auto tSrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
 
-    // Two packed-B fragments in the COPY layout; tSrB is the MMA-B layout
-    // target, shared across gate and up gemms (they run in series).
-    // cute::reorder with the ConvertRelayout dispatch does both E2M1→bf16
-    // conversion and layout permute in one call — no copy-layout bf16
-    // intermediate needed.
+    // Two packed-B fragments (gate, up); tSrB is shared MMA-B-layout target
+    // (the two cute::gemm calls run in series).
     auto tBrB_packed0 = thr_copy_b0.partition_sg_fragment_D(gBp(_, _, 0));
     auto tBrB_packed1 = thr_copy_b1.partition_sg_fragment_D(gBp(_, _, 0));
     auto tSrB = thr_mma.partition_sg_fragment_B(gBp(_, _, 0));

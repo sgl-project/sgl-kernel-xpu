@@ -550,17 +550,9 @@ def test_moe_grouped_mm_nt_xe20_mxfp4_op(
 # ---------------------------------------------------------------------------
 # End-to-end: fused_experts with use_fused_mxfp4_kernel=True
 # ---------------------------------------------------------------------------
-#
-# This is the stage-2 counterpart of test_moe_gemm_mxfp4_weights: same
-# reference pipeline (torch_naive_moe on dequantised weights), but the
-# sglang side now routes through moe_grouped_mm_nt_xe20_mxfp4 via the new
-# use_fused_mxfp4_kernel flag — skipping the intermediate bf16 weight
-# allocation in the Python layer.
-#
-# Stage-1 only compiled the <_128,_128,_32> / silu / no-bias / unfused-act
-# tile, so this test is deliberately narrow. Once the full tile menu is
-# re-enabled, the existing test_moe_gemm_mxfp4_weights test can be
-# parametrised with use_fused_mxfp4_kernel=True to cover the full matrix.
+# Same reference pipeline as test_moe_gemm_mxfp4_weights (torch_naive_moe on
+# dequantised weights); the sglang side routes through
+# moe_grouped_mm_nt_xe20_mxfp4 and skips the intermediate bf16 weight.
 
 
 @pytest.mark.parametrize(

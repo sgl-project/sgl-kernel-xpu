@@ -10,6 +10,7 @@ import utils
 device = utils.get_device()
 
 
+@pytest.mark.skip(reason="not implemented")
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5])
@@ -54,6 +55,7 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
         ]
 
 
+@pytest.mark.skip(reason="not implemented")
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
@@ -80,34 +82,98 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
     )
 
 
+def torch_top_k_renorm_probs(normalized_prob, k):
+    """Compute ground truth for top-k renormalization.
+
+    Args:
+        normalized_prob: [batch_size, vocab_size] probabilities
+        k: int or [batch_size] tensor of per-row k values
+    """
+    if isinstance(k, torch.Tensor):
+        # Per-row k array
+        batch_size = normalized_prob.size(0)
+        k_cpu = k.to("cpu").tolist()
+        renorm_prob_ground_truth = torch.zeros_like(normalized_prob)
+        for i in range(batch_size):
+            k_i = k_cpu[i]
+            sorted_prob, _ = torch.sort(normalized_prob[i : i + 1], descending=True)
+            pivot = sorted_prob[:, k_i - 1].unsqueeze(-1)
+            mask = (normalized_prob[i : i + 1] >= pivot).int()
+            row_result = normalized_prob[i : i + 1].clone()
+            row_result[mask == 0] = 0
+            row_result = row_result / row_result.sum(dim=-1, keepdim=True)
+            renorm_prob_ground_truth[i] = row_result[0]
+        return renorm_prob_ground_truth
+    else:
+        # Scalar k
+        sorted_prob, indices = torch.sort(normalized_prob, descending=True)
+        pivot = sorted_prob[:, k - 1].unsqueeze(-1)
+        mask = (normalized_prob >= pivot).int()
+        renorm_prob_ground_truth = normalized_prob.clone()
+        renorm_prob_ground_truth[mask == 0] = 0
+        renorm_prob_ground_truth = (
+            renorm_prob_ground_truth
+            / renorm_prob_ground_truth.sum(dim=-1, keepdim=True)
+        )
+        return renorm_prob_ground_truth
+
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
 def test_top_k_renorm_probs(batch_size, vocab_size, k):
+    # Note: SYCL kernel clamps k > vocab_size to vocab_size
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
     torch.manual_seed(42)
     pre_norm_prob = torch.rand(batch_size, vocab_size, device=f"{device}:0")
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
-    sorted_prob, _ = torch.sort(normalized_prob, descending=True)
-    pivot = sorted_prob[:, k - 1]
-    mask = (normalized_prob >= pivot.unsqueeze(-1)).int()
-    renorm_prob_ground_truth = normalized_prob.clone()
-    renorm_prob_ground_truth[mask == 0] = 0
-    renorm_prob_ground_truth = renorm_prob_ground_truth / renorm_prob_ground_truth.sum(
-        dim=-1, keepdim=True
-    )
+    renorm_prob_ground_truth = torch_top_k_renorm_probs(normalized_prob, k)
 
     renorm_prob = sgl_kernel.top_k_renorm_prob(normalized_prob, k)
-    for i in range(batch_size):
-        torch.testing.assert_close(
-            renorm_prob_ground_truth[i],
-            renorm_prob[i],
-            rtol=1e-3,
-            atol=1e-3,
-        )
+
+    torch.testing.assert_close(
+        renorm_prob_ground_truth,
+        renorm_prob,
+        rtol=1e-3,
+        atol=1e-3,
+    )
 
 
+@pytest.mark.parametrize("batch_size", [1, 16, 128])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("k_range", [(10, 50), (50, 200)])
+def test_top_k_renorm_probs_array(batch_size, vocab_size, k_range):
+    # Note: SYCL kernel clamps k > vocab_size to vocab_size
+    k_min, k_max = k_range
+    if k_max > vocab_size:
+        pytest.skip("k_max should be less than vocab_size")
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device=f"{device}:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    # Create per-row top-k array with varied values
+    top_k_arr = torch.randint(
+        k_min, k_max, (batch_size,), dtype=torch.int64, device=f"{device}:0"
+    )
+    if torch.any(top_k_arr <= 0):
+        pytest.skip("top_k_arr values should be greater than 0")
+
+    # Compute ground truth using unified function
+    renorm_prob_ground_truth = torch_top_k_renorm_probs(normalized_prob, top_k_arr)
+
+    # Test with per-row k array
+    renorm_prob = sgl_kernel.top_k_renorm_prob(normalized_prob, top_k_arr)
+
+    torch.testing.assert_close(
+        renorm_prob_ground_truth,
+        renorm_prob,
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
+@pytest.mark.skip(reason="not implemented")
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])

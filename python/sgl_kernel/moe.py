@@ -296,14 +296,10 @@ def dequantize_mxfp4_weights(
     i.e. low nibble = first element, high nibble = second element.
 
     Parameters:
-    - packed:     [E, rows, packed_cols] uint8 – two FP4 nibbles per byte,
+    - packed:     [E, rows, packed_cols] int8 – two FP4 nibbles per byte,
                   where packed_cols = cols // 2.
     - scales:     [E, rows, num_blocks]  float32 MX block scale (direct
-                  multiplier), matching upstream sglang
-                  ``_upcast_mxfp4_one_xpu``'s contract. Callers holding raw
-                  UE8M0 bytes must decode to fp32 first via
-                  ``_ue8m0_to_fp32_multiplier``, where
-                  num_blocks = cols // block_size.
+                  multiplier), where num_blocks = cols // block_size.
     - dtype:      Output floating-point dtype (default: torch.bfloat16).
     - block_size: Number of FP4 elements sharing one scale factor (default: 32).
 
@@ -327,11 +323,9 @@ def dequantize_mxfp4_weights(
     assert (
         packed.device == scales.device
     ), f"packed and scales must be on the same device, got {packed.device} and {scales.device}"
-    assert scales.dtype == torch.float32, (
-        f"scales must be float32 direct multiplier (matches upstream "
-        f"_upcast_mxfp4_one_xpu contract); decode UE8M0 bytes first via "
-        f"_ue8m0_to_fp32_multiplier. got {scales.dtype}"
-    )
+    assert (
+        scales.dtype == torch.float32
+    ), f"scales must be float32 direct multiplier, got {scales.dtype}"
 
     lut = _get_e2m1_lut(packed.device)
     out = torch.empty(E, rows, cols, dtype=torch.bfloat16, device=packed.device)
@@ -339,13 +333,17 @@ def dequantize_mxfp4_weights(
     # Cast fp32 multiplier to bf16 once up-front; reused per chunk.
     scale_mul = scales.to(torch.bfloat16)
 
+    # View as uint8 so `>> 4` is a logical shift (arithmetic shift on signed
+    # int8 would sign-extend the high nibble of bytes with MSB set).
+    packed_u8 = packed.view(torch.uint8)
+
     # Chunk over experts: a flat 1-D gather is faster on Intel L0 than an
     # N-D advanced-index gather, and chunking bounds the int64 index tensor
     # materialized by index_select so it doesn't blow peak memory on large E.
     CHUNK = _MXFP4_DEQUANT_EXPERT_CHUNK
     for start in range(0, E, CHUNK):
         end = min(start + CHUNK, E)
-        chunk = packed[start:end]  # [C, rows, packed_cols]
+        chunk = packed_u8[start:end]  # [C, rows, packed_cols]
 
         lo_idx = (chunk & 0x0F).reshape(-1).to(torch.long)
         hi_idx = (chunk >> 4).reshape(-1).to(torch.long)
@@ -365,14 +363,6 @@ def dequantize_mxfp4_weights(
     if dtype != torch.bfloat16:
         out = out.to(dtype)
     return out
-
-
-def _ue8m0_to_fp32_multiplier(ue8m0: torch.Tensor) -> torch.Tensor:
-    """Decode a UE8M0 biased-exponent byte tensor to its fp32 direct multiplier.
-
-    stored_byte = biased_exp + 127  →  multiplier = 2^(byte - 127)
-    """
-    return torch.exp2((ue8m0.to(torch.int32) - 127).to(torch.float32))
 
 
 def fused_experts(
@@ -416,10 +406,10 @@ def fused_experts(
     - use_fp8_w8a8 (bool): If True, use fp8 arithmetic to compute the inner
         products for w1 and w2. Defaults to False.
     - use_mxfp4_w4a16 (bool): If True, w1 and w2 are in MXFP4 packed format
-        (uint8, two E2M1 nibbles per byte) with corresponding UE8M0 block
-        scales supplied via w1_scale and w2_scale.  The weights are
-        dequantized to BF16 before the grouped GeMM so the rest of the
-        computation is unchanged (W4A16: activations stay in BF16).
+        (int8, two E2M1 nibbles per byte) with corresponding float32 block
+        scales (direct multiplier) supplied via w1_scale and w2_scale.
+        The weights are dequantized to BF16 before the grouped GeMM so the
+        rest of the computation is unchanged (W4A16: activations stay in BF16).
         Defaults to False.
     - w1_scale (Optional[torch.Tensor]): Optional scale to be used for
         w1.
@@ -451,25 +441,25 @@ def fused_experts(
         "gelu",
     ), f"Only silu and gelu are supported but got {activation}"
 
-    # For MXFP4 W4A16: validate packed uint8 inputs and scales.
+    # For MXFP4 W4A16: validate packed int8 inputs and float32 scales.
     # Actual dequantization is deferred to just before each GeMM so that
     # at most one dequantized weight tensor lives in GPU memory at a time.
     # Scales must be None on all non-mxfp4 code paths.
     if use_mxfp4_w4a16:
         assert (
-            w1.dtype == torch.uint8
-        ), "use_mxfp4_w4a16=True requires w1 to be uint8 (packed MXFP4)"
+            w1.dtype == torch.int8
+        ), "use_mxfp4_w4a16=True requires w1 to be int8 (packed MXFP4)"
         assert (
-            w2.dtype == torch.uint8
-        ), "use_mxfp4_w4a16=True requires w2 to be uint8 (packed MXFP4)"
+            w2.dtype == torch.int8
+        ), "use_mxfp4_w4a16=True requires w2 to be int8 (packed MXFP4)"
         assert (
             w1_scale is not None
-        ), "w1_scale (UE8M0 uint8) must be provided when use_mxfp4_w4a16=True"
+        ), "w1_scale (float32) must be provided when use_mxfp4_w4a16=True"
         assert (
             w2_scale is not None
-        ), "w2_scale (UE8M0 uint8) must be provided when use_mxfp4_w4a16=True"
-        assert w1_scale.dtype == torch.uint8, "w1_scale must be uint8 (UE8M0 format)"
-        assert w2_scale.dtype == torch.uint8, "w2_scale must be uint8 (UE8M0 format)"
+        ), "w2_scale (float32) must be provided when use_mxfp4_w4a16=True"
+        assert w1_scale.dtype == torch.float32, "w1_scale must be float32"
+        assert w2_scale.dtype == torch.float32, "w2_scale must be float32"
     else:
         assert w1_scale is None, "w1_scale is only supported when use_mxfp4_w4a16=True"
         assert w2_scale is None, "w2_scale is only supported when use_mxfp4_w4a16=True"
@@ -603,7 +593,7 @@ def fused_experts(
         )
         # Dequantize w1 just before GEMM1, free immediately after
         if use_mxfp4_w4a16:
-            w1 = dequantize_mxfp4_weights(w1, _ue8m0_to_fp32_multiplier(w1_scale))
+            w1 = dequantize_mxfp4_weights(w1, w1_scale)
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
             intermediate_cache1,
             input_A_shuffle,
@@ -620,7 +610,7 @@ def fused_experts(
         # one dequantized weight tensor occupies GPU memory at a time.
         if use_mxfp4_w4a16:
             del w1
-            w2 = dequantize_mxfp4_weights(w2, _ue8m0_to_fp32_multiplier(w2_scale))
+            w2 = dequantize_mxfp4_weights(w2, w2_scale)
         if activation_type == 0:
             torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
         elif activation_type == 1:
@@ -651,7 +641,7 @@ def fused_experts(
         )
         # Dequantize w1 just before GEMM1, free immediately after
         if use_mxfp4_w4a16:
-            w1 = dequantize_mxfp4_weights(w1, _ue8m0_to_fp32_multiplier(w1_scale))
+            w1 = dequantize_mxfp4_weights(w1, w1_scale)
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
             intermediate_cache1,
             input_A_shuffle,
@@ -668,7 +658,7 @@ def fused_experts(
         # one dequantized weight tensor occupies GPU memory at a time.
         if use_mxfp4_w4a16:
             del w1
-            w2 = dequantize_mxfp4_weights(w2, _ue8m0_to_fp32_multiplier(w2_scale))
+            w2 = dequantize_mxfp4_weights(w2, w2_scale)
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
             intermediate_cache3,
             intermediate_cache1,

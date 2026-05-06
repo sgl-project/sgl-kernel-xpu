@@ -348,12 +348,19 @@ def test_moe_gemm_mxfp4_weights(
     )
 
     # ---- fused_experts with packed MXFP4 weights on XPU ----
+    # fused_experts expects packed weights as int8 (bitwise identical to the
+    # uint8 reference packing) and scales as a fp32 direct multiplier
+    # (decoded from UE8M0).
     device = "xpu"
     a_xpu = a.clone().to(device)
-    w1_packed_xpu = w1_packed.to(device)
-    w2_packed_xpu = w2_packed.to(device)
-    w1_scale_xpu = w1_scale.to(device)
-    w2_scale_xpu = w2_scale.to(device)
+    w1_packed_xpu = w1_packed.view(torch.int8).to(device)
+    w2_packed_xpu = w2_packed.view(torch.int8).to(device)
+    w1_scale_xpu = torch.exp2((w1_scale.to(torch.int32) - 127).to(torch.float32)).to(
+        device
+    )
+    w2_scale_xpu = torch.exp2((w2_scale.to(torch.int32) - 127).to(torch.float32)).to(
+        device
+    )
     topk_weight_xpu = topk_weight.clone().to(device)
     topk_ids_xpu = topk_ids.clone().to(device)
     b1_xpu = b1.clone().to(device) if b1 is not None else None

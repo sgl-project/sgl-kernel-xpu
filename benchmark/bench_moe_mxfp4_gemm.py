@@ -19,17 +19,15 @@
 import sys
 from pathlib import Path
 
+import sgl_kernel  # noqa: F401 — registers the torch.ops.sgl_kernel namespace
 import torch
 import triton
-
-import sgl_kernel  # noqa: F401 — registers the torch.ops.sgl_kernel namespace
 from sgl_kernel.moe import dequantize_mxfp4_weights
 
 # The CPU MXFP4 quantize/dequantize helpers live next to the tests.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests"))
 from mxfp4_utils import MXFP4_BLOCK_SIZE  # noqa: E402
 from mxfp4_utils import quantize_mxfp4_2d  # noqa: E402
-
 
 NUM_EXPERTS = 8
 BENCH_SHAPES = [
@@ -69,9 +67,7 @@ def _prepare_inputs(avg_m: int, gemm_n: int, gemm_k: int):
     torch.xpu.manual_seed_all(0)
 
     total_m = NUM_EXPERTS * avg_m
-    total_rows = torch.full(
-        (NUM_EXPERTS,), avg_m, dtype=torch.int32, device="xpu"
-    )
+    total_rows = torch.full((NUM_EXPERTS,), avg_m, dtype=torch.int32, device="xpu")
 
     a = torch.empty((total_m, gemm_k), dtype=torch.bfloat16, device="xpu").normal_(
         0, 0.01
@@ -150,7 +146,10 @@ def _peak_transient_bytes(run_fn, inputs) -> int:
         x_vals=BENCH_SHAPES,
         line_arg="provider",
         line_vals=["bf16_dequant", "mxfp4_fused"],
-        line_names=["bf16_dequant (pre-dequantized)", "mxfp4_fused (tile-level dequant)"],
+        line_names=[
+            "bf16_dequant (pre-dequantized)",
+            "mxfp4_fused (tile-level dequant)",
+        ],
         styles=[("blue", "-"), ("green", "-")],
         ylabel="Time (ms)",
         plot_name="moe-mxfp4-gemm-op-level",
@@ -201,8 +200,8 @@ def benchmark(avg_m, gemm_n, gemm_k, provider):
     # tensor + scales as the "on-disk" truth; bf16_dequant additionally
     # materializes the bf16 tensor transiently per GEMM call (captured
     # by peak_transient_MB). Scales are fp32 (4 B per group).
-    packed_bytes = NUM_EXPERTS * gemm_n * (
-        gemm_k // 2 + 4 * (gemm_k // MXFP4_BLOCK_SIZE)
+    packed_bytes = (
+        NUM_EXPERTS * gemm_n * (gemm_k // 2 + 4 * (gemm_k // MXFP4_BLOCK_SIZE))
     )
     bf16_transient = NUM_EXPERTS * gemm_n * gemm_k * 2
     weights_resident_bytes = packed_bytes
@@ -239,8 +238,12 @@ if __name__ == "__main__":
     df = pd.DataFrame(ALL_RESULTS)
     # Pivot on provider so the comparison is one row per shape.
     pivot_cols = [
-        "ms", "tflops", "b_gbps",
-        "peak_transient_MB", "weights_resident_MB", "transient_bf16_MB",
+        "ms",
+        "tflops",
+        "b_gbps",
+        "peak_transient_MB",
+        "weights_resident_MB",
+        "transient_bf16_MB",
     ]
     pv = df.pivot_table(
         index=["avg_m", "total_m", "gemm_n", "gemm_k"],
@@ -248,7 +251,9 @@ if __name__ == "__main__":
         values=pivot_cols,
         aggfunc="first",
     )
-    pv["speedup_fused_vs_bf16"] = (pv[("ms", "bf16_dequant")] / pv[("ms", "mxfp4_fused")]).round(2)
+    pv["speedup_fused_vs_bf16"] = (
+        pv[("ms", "bf16_dequant")] / pv[("ms", "mxfp4_fused")]
+    ).round(2)
     # bf16_dequant transiently materializes the bf16 weight tensor every
     # GEMM call; mxfp4_fused never does. This is the real GMEM saving.
     pv["transient_bf16_saved_MB"] = pv[("transient_bf16_MB", "bf16_dequant")].round(2)

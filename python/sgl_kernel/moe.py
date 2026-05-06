@@ -466,9 +466,9 @@ def fused_experts(
         "relu2",
     ), f"Only silu, gelu and relu2 are supported but got {activation}"
     if use_fused_mxfp4_kernel:
-        assert use_mxfp4_w4a16, (
-            "use_fused_mxfp4_kernel=True requires use_mxfp4_w4a16=True"
-        )
+        assert (
+            use_mxfp4_w4a16
+        ), "use_fused_mxfp4_kernel=True requires use_mxfp4_w4a16=True"
 
     # For MXFP4 W4A16: validate packed int8 inputs and float32 scales.
     # Actual dequantization is deferred to just before each GeMM so that

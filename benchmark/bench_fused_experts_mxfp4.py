@@ -17,12 +17,11 @@
 # Both producers compute the same mathematical result (MXFP4-rounded weights
 # × bf16 activations), so ms and peak transient GMEM are directly comparable.
 #
-# Shape families covered:
-#   - DSv4-like prefill:  num_experts=256, hidden=7168, intermediate∈{512,1024,2048}
-#   - DSv4-like decode :  num_tokens=1 slices of the above
-#   - Mixtral-like     :  num_experts=8, hidden=4096, intermediate=3584
-#   - Qwen-MoE-like    :  num_experts=64, hidden=3584, intermediate=1280
+# Shapes are scaled to fit BMG VRAM so the bf16_dequant path can actually run —
+# the fused path tolerates much larger shapes, but that's exactly the point of
+# the comparison.
 
+import gc
 import sys
 from pathlib import Path
 
@@ -40,37 +39,31 @@ from mxfp4_utils import quantize_mxfp4_2d  # noqa: E402
 ALL_RESULTS = []
 
 
-def _quantize_weights_mxfp4_3d(w_bf16_cpu: torch.Tensor):
-    E, rows, cols = w_bf16_cpu.shape
-    flat = w_bf16_cpu.reshape(E * rows, cols).float().cpu()
-    p, s = quantize_mxfp4_2d(flat, MXFP4_BLOCK_SIZE)
-    return (
-        p.reshape(E, rows, cols // 2),
-        s.reshape(E, rows, cols // MXFP4_BLOCK_SIZE),
-    )
+def _build_and_quantize_weights_per_expert(E: int, rows: int, cols: int):
+    # Quantize one expert at a time. A full (E, rows, cols) bf16 tensor
+    # followed by `.float()` inside quantize_mxfp4_2d can briefly need tens of
+    # GB of host RAM at large shapes and trigger the Linux OOM killer.
+    packed = torch.empty((E, rows, cols // 2), dtype=torch.uint8)
+    scales = torch.empty((E, rows, cols // MXFP4_BLOCK_SIZE), dtype=torch.uint8)
+    for e in range(E):
+        w_e_bf16 = torch.empty((rows, cols), dtype=torch.bfloat16).normal_(0, 0.01)
+        p_e, s_e = quantize_mxfp4_2d(w_e_bf16.float(), MXFP4_BLOCK_SIZE)
+        packed[e].copy_(p_e)
+        scales[e].copy_(s_e)
+        del w_e_bf16, p_e, s_e
+    return packed, scales
 
 
 # (config_name, num_tokens, num_experts, topk, hidden, intermediate).
-# We keep num_tokens moderate so experts get a realistic avg_m distribution.
-# Prefill/decode is expressed via num_tokens choice; topk and experts drive
-# per-expert average M.
+# Shapes chosen so the transient bf16 weight on the bf16_dequant path
+# (E * 3 * I * H * 2B) stays under a few GiB on BMG.
 SHAPES = [
-    # DSv4-like shapes (num_experts=256, topk=8, hidden=7168). intermediate
-    # tracks tp-shard size.
-    ("dsv4_prefill_tp8_i512",  512,  256, 8, 7168, 512),
-    ("dsv4_prefill_tp4_i1024", 512,  256, 8, 7168, 1024),
-    ("dsv4_prefill_tp2_i2048", 512,  256, 8, 7168, 2048),
-    ("dsv4_decode_tp8_i512",   1,    256, 8, 7168, 512),
-    ("dsv4_decode_tp4_i1024",  1,    256, 8, 7168, 1024),
-    ("dsv4_decode_tp2_i2048",  1,    256, 8, 7168, 2048),
-
-    # Mixtral tp=4 (num_experts=8, hidden=4096).
-    ("mixtral_tp4_prefill",    512,  8,   2, 4096, 7168),
-    ("mixtral_tp4_decode",     1,    8,   2, 4096, 7168),
-
-    # Qwen2-MoE tp=4 (num_experts=64, hidden=3584).
-    ("qwen_tp4_prefill",       512,  64,  8, 3584, 1280),
-    ("qwen_tp4_decode",        1,    64,  8, 3584, 1280),
+    ("prefill_i512",  512, 64, 4, 7168, 512),
+    ("prefill_i1024", 512, 64, 4, 7168, 1024),
+    ("prefill_i2048", 512, 64, 4, 7168, 2048),
+    ("decode_i512",   1,   64, 4, 7168, 512),
+    ("decode_i1024",  1,   64, 4, 7168, 1024),
+    ("decode_i2048",  1,   64, 4, 7168, 2048),
 ]
 
 
@@ -82,17 +75,20 @@ def _prepare_inputs(num_tokens, num_experts, topk, hidden, intermediate):
         0, 0.01
     )
 
-    # Build bf16 weights on CPU, quantize to MXFP4 there (avoids the
-    # CPU-only quantize_mxfp4_2d from running on an XPU tensor).
-    w1_bf16 = torch.empty(
-        (num_experts, 2 * intermediate, hidden), dtype=torch.bfloat16
-    ).normal_(0, 0.01)
-    w2_bf16 = torch.empty(
-        (num_experts, hidden, intermediate), dtype=torch.bfloat16
-    ).normal_(0, 0.01)
+    # Build + quantize weights one expert at a time on CPU to avoid materializing
+    # the full (E, rows, cols) bf16 tensor (plus its fp32 copy inside
+    # quantize_mxfp4_2d). quantize_mxfp4_2d is CPU-only.
+    w1_packed_cpu, w1_scale_cpu = _build_and_quantize_weights_per_expert(
+        num_experts, 2 * intermediate, hidden
+    )
+    w2_packed_cpu, w2_scale_cpu = _build_and_quantize_weights_per_expert(
+        num_experts, hidden, intermediate
+    )
 
-    w1_packed_cpu, w1_scale_cpu = _quantize_weights_mxfp4_3d(w1_bf16)
-    w2_packed_cpu, w2_scale_cpu = _quantize_weights_mxfp4_3d(w2_bf16)
+    # fused_experts now expects int8 packed weights (bitwise identical to
+    # uint8 packing) and fp32 direct-multiplier scales (decoded from UE8M0).
+    w1_scale_fp32 = torch.exp2((w1_scale_cpu.to(torch.int32) - 127).to(torch.float32))
+    w2_scale_fp32 = torch.exp2((w2_scale_cpu.to(torch.int32) - 127).to(torch.float32))
 
     score = torch.randn(num_tokens, num_experts, dtype=torch.bfloat16, device="xpu")
     score = torch.softmax(score.float(), dim=-1)
@@ -101,10 +97,10 @@ def _prepare_inputs(num_tokens, num_experts, topk, hidden, intermediate):
 
     return {
         "a": a,
-        "w1_packed": w1_packed_cpu.to("xpu"),
-        "w2_packed": w2_packed_cpu.to("xpu"),
-        "w1_scale": w1_scale_cpu.to("xpu"),
-        "w2_scale": w2_scale_cpu.to("xpu"),
+        "w1_packed": w1_packed_cpu.view(torch.int8).to("xpu"),
+        "w2_packed": w2_packed_cpu.view(torch.int8).to("xpu"),
+        "w1_scale": w1_scale_fp32.to("xpu"),
+        "w2_scale": w2_scale_fp32.to("xpu"),
         "topk_weight": topk_weight,
         "topk_ids": topk_ids,
     }
@@ -166,6 +162,12 @@ def _peak_transient_bytes(run_fn, inputs) -> int:
     )
 )
 def benchmark(name, num_tokens, num_experts, topk, hidden, intermediate, provider):
+    # Free any lingering tensors from the previous (shape, provider) run before
+    # building a new set — otherwise the unfused path's XPU bf16 weight copy
+    # can stack on top of the previous run's allocations and OOM the device.
+    gc.collect()
+    torch.xpu.empty_cache()
+
     inputs = _prepare_inputs(num_tokens, num_experts, topk, hidden, intermediate)
     run_fn = _run_unfused if provider == "bf16_dequant" else _run_fused
 
@@ -211,6 +213,9 @@ def benchmark(name, num_tokens, num_experts, topk, hidden, intermediate, provide
             "weights_packed_MB": round(weights_packed_MB, 2),
         }
     )
+    del inputs
+    gc.collect()
+    torch.xpu.empty_cache()
     return ms
 
 

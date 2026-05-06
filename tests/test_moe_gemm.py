@@ -288,7 +288,7 @@ def _dequantize_weights_mxfp4(
 
 
 @pytest.mark.parametrize(
-    "num_tokens,topk,num_experts,hidden_size,intermediate_size,bias_dtype,activation",
+    "num_tokens,topk,num_experts,hidden_size,intermediate_size,bias_dtype,activation,use_fused_kernel",
     list(
         itertools.product(
             [1, 33, 222],  # num_tokens
@@ -298,6 +298,7 @@ def _dequantize_weights_mxfp4(
             [128, 512],  # intermediate_size – must be a multiple of MXFP4_BLOCK_SIZE
             [False, "bfloat16", "float32"],  # bias_dtype
             ["silu", "gelu"],  # activation type
+            [False, True],  # use_fused_mxfp4_kernel
         )
     ),
 )
@@ -309,6 +310,7 @@ def test_moe_gemm_mxfp4_weights(
     intermediate_size,
     bias_dtype,
     activation,
+    use_fused_kernel,
 ):
     """Test fused_experts with MXFP4-packed expert weights (W4A16).
 
@@ -320,6 +322,10 @@ def test_moe_gemm_mxfp4_weights(
     so that both code paths see identical effective weights; any numerical
     difference is purely from the BF16 grouped GeMM arithmetic, not from
     quantisation, and should be within the same tolerances as the BF16 test.
+
+    Parametrised over use_fused_mxfp4_kernel so both the legacy path
+    (Python dequant + bf16 GEMM) and the tile-fused path
+    (moe_grouped_mm_nt_xe20_mxfp4) are covered at every shape.
     """
     act_type = activation
     torch.manual_seed(0)
@@ -389,6 +395,7 @@ def test_moe_gemm_mxfp4_weights(
         b2_xpu,
         activation=act_type,
         use_mxfp4_w4a16=True,
+        use_fused_mxfp4_kernel=use_fused_kernel,
         w1_scale=w1_scale_xpu,
         w2_scale=w2_scale_xpu,
     )

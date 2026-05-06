@@ -84,16 +84,11 @@ using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
   DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 2, FuseAct, true)  \
   DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 2, FuseAct, false)
 
-// Stage-1 debugging: only one shape/config is being codegen'd in
-// GroupGemmMxfp4Xe20.cmake. Declaring extern template for just that one.
-// Restore the full set below once correctness is verified.
-DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_128_128_32, SG_4_2_1, 0, false, false)
-
-// DECLARE_XE20_MOE_MXFP4_TILE_ALL_FUSES(Tile_8_64_32, SG_1_4_1)
-// DECLARE_XE20_MOE_MXFP4_TILE_FUSE(Tile_128_64_32, SG_4_2_1, true)
-// DECLARE_XE20_MOE_MXFP4_TILE_FUSE(Tile_128_128_32, SG_4_2_1, false)
-// DECLARE_XE20_MOE_MXFP4_TILE_FUSE(Tile_256_64_32, SG_8_2_1, true)
-// DECLARE_XE20_MOE_MXFP4_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
+DECLARE_XE20_MOE_MXFP4_TILE_ALL_FUSES(Tile_8_64_32, SG_1_4_1)
+DECLARE_XE20_MOE_MXFP4_TILE_FUSE(Tile_128_64_32, SG_4_2_1, true)
+DECLARE_XE20_MOE_MXFP4_TILE_FUSE(Tile_128_128_32, SG_4_2_1, false)
+DECLARE_XE20_MOE_MXFP4_TILE_FUSE(Tile_256_64_32, SG_8_2_1, true)
+DECLARE_XE20_MOE_MXFP4_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
 
 #undef DECLARE_XE20_MOE_MXFP4_TILE_FUSE
 #undef DECLARE_XE20_MOE_MXFP4_TILE_ALL_FUSES
@@ -210,40 +205,29 @@ void moe_grouped_mm_nt_xe20_mxfp4(
   bool with_bias = bias.has_value();
   void* bias_ptr = with_bias ? bias->data_ptr() : nullptr;
 
-  // Stage-1 debugging: hardcoded single-shape dispatch for fast rebuild
-  // cycles. Restore the avg_m-based dispatcher below once correctness is
-  // verified and all 5 tile shapes are re-enabled in GroupGemmMxfp4Xe20.cmake.
-  TORCH_CHECK(activation_type == 0,
-              "stage-1 build: only activation_type=0 (silu) is compiled");
-  TORCH_CHECK(!fuse_act, "stage-1 build: only fuse_act=false is compiled");
-  TORCH_CHECK(!bias.has_value(),
-              "stage-1 build: only with_bias=false is compiled");
-  LAUNCH_MOE_MXFP4(Shape<_128, _128, _32>,
-                   Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>,
-                   /*ActType=*/0, /*FuseAct=*/false, /*WithBias=*/false);
+  int avg_m = total_m / n_experts;
+  bool small_weight = (int64_t)gemm_k * gemm_n <= (int64_t)4096 * 4096;
 
-  // int avg_m = total_m / n_experts;
-  // bool small_weight = (int64_t)gemm_k * gemm_n <= (int64_t)4096 * 4096;
-  // if (avg_m <= 8) {
-  //   DISPATCH_MOE_MXFP4(
-  //       activation_type, fuse_act, with_bias, Shape<_8, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
-  // } else if (avg_m <= 128 && small_weight) {
-  //   if (fuse_act) {
-  //     DISPATCH_MOE_MXFP4(
-  //         activation_type, true, with_bias, Shape<_128, _64, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
-  //   } else {
-  //     DISPATCH_MOE_MXFP4(
-  //         activation_type, false, with_bias, Shape<_128, _128, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
-  //   }
-  // } else {
-  //   if (fuse_act) {
-  //     DISPATCH_MOE_MXFP4(
-  //         activation_type, true, with_bias, Shape<_256, _64, _32>, Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>);
-  //   } else {
-  //     DISPATCH_MOE_MXFP4(
-  //         activation_type, false, with_bias, Shape<_256, _256, _32>, Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>);
-  //   }
-  // }
+  if (avg_m <= 8) {
+    DISPATCH_MOE_MXFP4(
+        activation_type, fuse_act, with_bias, Shape<_8, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
+  } else if (avg_m <= 128 && small_weight) {
+    if (fuse_act) {
+      DISPATCH_MOE_MXFP4(
+          activation_type, true, with_bias, Shape<_128, _64, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
+    } else {
+      DISPATCH_MOE_MXFP4(
+          activation_type, false, with_bias, Shape<_128, _128, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
+    }
+  } else {
+    if (fuse_act) {
+      DISPATCH_MOE_MXFP4(
+          activation_type, true, with_bias, Shape<_256, _64, _32>, Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>);
+    } else {
+      DISPATCH_MOE_MXFP4(
+          activation_type, false, with_bias, Shape<_256, _256, _32>, Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>);
+    }
+  }
 }
 
 #undef SYCL_INTEL_TARGET

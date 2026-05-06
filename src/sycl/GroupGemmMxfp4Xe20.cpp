@@ -46,34 +46,34 @@ using SG_4_2_1 = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
 using SG_8_2_1 = Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>;
 using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
 
-#define DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, ActType, FuseAct, WithBias)              \
-  extern template void Xe20MoEGEMMMxfp4Launcher<Tile, SGLayout, ActType, FuseAct, WithBias>(   \
-      sycl::queue,                                                                             \
-      const void*,                                                                             \
-      const void*,                                                                             \
-      const void*,                                                                             \
-      const void*,                                                                             \
-      void*,                                                                                   \
-      const int,                                                                               \
-      const int,                                                                               \
-      const int*,                                                                              \
-      const int,                                                                               \
-      int*,                                                                                    \
-      float,                                                                                   \
+#define DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, ActType, FuseAct, WithBias)            \
+  extern template void Xe20MoEGEMMMxfp4Launcher<Tile, SGLayout, ActType, FuseAct, WithBias>( \
+      sycl::queue,                                                                           \
+      const void*,                                                                           \
+      const void*,                                                                           \
+      const void*,                                                                           \
+      const void*,                                                                           \
+      void*,                                                                                 \
+      const int,                                                                             \
+      const int,                                                                             \
+      const int*,                                                                            \
+      const int,                                                                             \
+      int*,                                                                                  \
+      float,                                                                                 \
       float);
 
-#define DECLARE_XE20_MOE_MXFP4_TILE_ALL_FUSES(Tile, SGLayout)     \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 0, true, true)    \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 0, true, false)   \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 0, false, true)   \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 0, false, false)  \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 1, true, true)    \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 1, true, false)   \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 1, false, true)   \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 1, false, false)  \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 2, true, true)    \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 2, true, false)   \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 2, false, true)   \
+#define DECLARE_XE20_MOE_MXFP4_TILE_ALL_FUSES(Tile, SGLayout)    \
+  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 0, true, true)   \
+  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 0, true, false)  \
+  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 0, false, true)  \
+  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 0, false, false) \
+  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 1, true, true)   \
+  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 1, true, false)  \
+  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 1, false, true)  \
+  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 1, false, false) \
+  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 2, true, true)   \
+  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 2, true, false)  \
+  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 2, false, true)  \
   DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 2, false, false)
 
 #define DECLARE_XE20_MOE_MXFP4_TILE_FUSE(Tile, SGLayout, FuseAct)  \
@@ -94,20 +94,20 @@ DECLARE_XE20_MOE_MXFP4_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
 #undef DECLARE_XE20_MOE_MXFP4_TILE_ALL_FUSES
 #undef DECLARE_XE20_MOE_MXFP4_EXTERN
 
-#define LAUNCH_MOE_MXFP4(...)                     \
-  Xe20MoEGEMMMxfp4Launcher<__VA_ARGS__>(          \
-      queue,                                      \
-      activations.data_ptr(),                     \
-      packed_weights.data_ptr(),                  \
-      scales.data_ptr(),                          \
-      bias_ptr,                                   \
-      output.data_ptr(),                          \
-      gemm_n,                                     \
-      gemm_k,                                     \
-      total_rows_for_experts.data_ptr<int>(),     \
-      n_experts,                                  \
-      atomic_buffer.data_ptr<int>(),              \
-      static_cast<float>(gemm1_alpha),            \
+#define LAUNCH_MOE_MXFP4(...)                 \
+  Xe20MoEGEMMMxfp4Launcher<__VA_ARGS__>(      \
+      queue,                                  \
+      activations.data_ptr(),                 \
+      packed_weights.data_ptr(),              \
+      scales.data_ptr(),                      \
+      bias_ptr,                               \
+      output.data_ptr(),                      \
+      gemm_n,                                 \
+      gemm_k,                                 \
+      total_rows_for_experts.data_ptr<int>(), \
+      n_experts,                              \
+      atomic_buffer.data_ptr<int>(),          \
+      static_cast<float>(gemm1_alpha),        \
       static_cast<float>(gemm1_limit))
 
 #define DISPATCH_MOE_MXFP4_HELPER_BIAS(ActType, FuseAct, WithBias, ...) \

@@ -25,16 +25,14 @@ import gc
 import sys
 from pathlib import Path
 
+import sgl_kernel  # noqa: F401 — registers torch.ops.sgl_kernel
 import torch
 import triton
-
-import sgl_kernel  # noqa: F401 — registers torch.ops.sgl_kernel
 from sgl_kernel import fused_experts
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests"))
 from mxfp4_utils import MXFP4_BLOCK_SIZE  # noqa: E402
 from mxfp4_utils import quantize_mxfp4_2d  # noqa: E402
-
 
 ALL_RESULTS = []
 
@@ -58,12 +56,12 @@ def _build_and_quantize_weights_per_expert(E: int, rows: int, cols: int):
 # Shapes chosen so the transient bf16 weight on the bf16_dequant path
 # (E * 3 * I * H * 2B) stays under a few GiB on BMG.
 SHAPES = [
-    ("prefill_i512",  512, 64, 4, 7168, 512),
+    ("prefill_i512", 512, 64, 4, 7168, 512),
     ("prefill_i1024", 512, 64, 4, 7168, 1024),
     ("prefill_i2048", 512, 64, 4, 7168, 2048),
-    ("decode_i512",   1,   64, 4, 7168, 512),
-    ("decode_i1024",  1,   64, 4, 7168, 1024),
-    ("decode_i2048",  1,   64, 4, 7168, 2048),
+    ("decode_i512", 1, 64, 4, 7168, 512),
+    ("decode_i1024", 1, 64, 4, 7168, 1024),
+    ("decode_i2048", 1, 64, 4, 7168, 2048),
 ]
 
 
@@ -154,7 +152,10 @@ def _peak_transient_bytes(run_fn, inputs) -> int:
         x_vals=SHAPES,
         line_arg="provider",
         line_vals=["bf16_dequant", "mxfp4_fused"],
-        line_names=["bf16_dequant (Python dequant + bf16 GEMM)", "mxfp4_fused (tile-fused MXFP4)"],
+        line_names=[
+            "bf16_dequant (Python dequant + bf16 GEMM)",
+            "mxfp4_fused (tile-fused MXFP4)",
+        ],
         styles=[("blue", "-"), ("green", "-")],
         ylabel="Time (ms)",
         plot_name="fused-experts-mxfp4-e2e",
@@ -193,8 +194,14 @@ def benchmark(name, num_tokens, num_experts, topk, hidden, intermediate, provide
 
     # Static weight footprint (same for both — bf16 never resident).
     weights_packed_MB = (
-        num_experts * (2 * intermediate + intermediate) * (hidden // 2 + hidden // MXFP4_BLOCK_SIZE)
-    ) / 1024 / 1024
+        (
+            num_experts
+            * (2 * intermediate + intermediate)
+            * (hidden // 2 + hidden // MXFP4_BLOCK_SIZE)
+        )
+        / 1024
+        / 1024
+    )
 
     ALL_RESULTS.append(
         {
@@ -233,10 +240,9 @@ if __name__ == "__main__":
         values=pivot_cols,
         aggfunc="first",
     )
-    pv["speedup"] = (
-        pv[("ms", "bf16_dequant")] / pv[("ms", "mxfp4_fused")]
-    ).round(2)
+    pv["speedup"] = (pv[("ms", "bf16_dequant")] / pv[("ms", "mxfp4_fused")]).round(2)
     pv["transient_saved_MB"] = (
-        pv[("peak_transient_MB", "bf16_dequant")] - pv[("peak_transient_MB", "mxfp4_fused")]
+        pv[("peak_transient_MB", "bf16_dequant")]
+        - pv[("peak_transient_MB", "mxfp4_fused")]
     ).round(2)
     print(pv.to_markdown())

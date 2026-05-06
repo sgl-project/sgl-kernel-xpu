@@ -425,21 +425,20 @@ def _build_moe_gemm_inputs(
     activations = create_random_xpu_tensor((total_m, gemm_k), torch.bfloat16)
 
     # Build bf16 weights on CPU, quantize to mxfp4 there, then move to XPU.
-    w_bf16_cpu = create_random_cpu_tensor(
-        (num_experts, gemm_n, gemm_k), torch.bfloat16
-    )
+    w_bf16_cpu = create_random_cpu_tensor((num_experts, gemm_n, gemm_k), torch.bfloat16)
     w_packed_cpu, w_scale_cpu = _quantize_weights_mxfp4(w_bf16_cpu)
     w_dq_cpu = _dequantize_weights_mxfp4(w_packed_cpu, w_scale_cpu)
 
+    # Fused op contract: int8 packed weights, fp32 direct-multiplier scales.
     w_dq_xpu = w_dq_cpu.to("xpu")
-    w_packed_xpu = w_packed_cpu.to("xpu")
-    w_scale_xpu = w_scale_cpu.to("xpu")
+    w_packed_xpu = w_packed_cpu.view(torch.int8).to("xpu")
+    w_scale_xpu = torch.exp2((w_scale_cpu.to(torch.int32) - 127).to(torch.float32)).to(
+        "xpu"
+    )
 
     bias = None
     if with_bias:
-        bias = create_random_xpu_tensor(
-            (num_experts, gemm_n), torch.float32, std=0.005
-        )
+        bias = create_random_xpu_tensor((num_experts, gemm_n), torch.float32, std=0.005)
 
     out_cols = gemm_n // 2 if fuse_act else gemm_n
     output_bf16 = torch.empty((total_m, out_cols), dtype=torch.bfloat16, device="xpu")

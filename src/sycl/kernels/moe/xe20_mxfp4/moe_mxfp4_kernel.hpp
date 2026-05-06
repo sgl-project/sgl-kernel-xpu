@@ -73,7 +73,7 @@ class MoEGEMMMxfp4 {
     // to make per-expert offsetting obvious (1 byte = 2 E2M1 elements);
     // wrapped into a float_e2m1_t CuTe tensor per-expert below.
     const uint8_t* PackedWeights;
-    const float* Scales;                          // [num_experts, N, K/GROUP_SIZE] fp32 direct multiplier
+    const float* Scales;  // [num_experts, N, K/GROUP_SIZE] fp32 direct multiplier
     const float* Bias;
     ElementD* Outputs;
     const int32_t* M_per_group;
@@ -98,9 +98,7 @@ class MoEGEMMMxfp4 {
       if constexpr (ActType == SWIGLU_GPT_OSS) {
         // Interleaved [g0, u0, g1, u1, ...] → gate at byte offset 0,
         // up at byte offset K/2 (one packed row = K/2 bytes).
-        auto B0 = make_tensor(
-            make_gmem_ptr(e2m1_ptr),
-            make_layout(make_shape(N / 2, K), make_stride(2 * K, _1{})));
+        auto B0 = make_tensor(make_gmem_ptr(e2m1_ptr), make_layout(make_shape(N / 2, K), make_stride(2 * K, _1{})));
         auto B1 = make_tensor(
             make_gmem_ptr(reinterpret_cast<cutlass::float_e2m1_t*>(ptr_B + byte_half_K)),
             make_layout(make_shape(N / 2, K), make_stride(2 * K, _1{})));
@@ -108,18 +106,14 @@ class MoEGEMMMxfp4 {
       } else {
         // Block-split: first N/2 rows = gate, last N/2 rows = up.
         // up rows start at byte offset (N/2) * (K/2).
-        auto B0 = make_tensor(
-            make_gmem_ptr(e2m1_ptr),
-            make_layout(make_shape(N / 2, K), make_stride(K, _1{})));
+        auto B0 = make_tensor(make_gmem_ptr(e2m1_ptr), make_layout(make_shape(N / 2, K), make_stride(K, _1{})));
         auto B1 = make_tensor(
             make_gmem_ptr(reinterpret_cast<cutlass::float_e2m1_t*>(ptr_B + (N / 2) * byte_half_K)),
             make_layout(make_shape(N / 2, K), make_stride(K, _1{})));
         return cute::make_tuple(B0, B1);
       }
     } else {
-      auto B = make_tensor(
-          make_gmem_ptr(e2m1_ptr),
-          make_layout(make_shape(N, K), make_stride(K, _1{})));
+      auto B = make_tensor(make_gmem_ptr(e2m1_ptr), make_layout(make_shape(N, K), make_stride(K, _1{})));
       return cute::make_tuple(B);
     }
   }

@@ -89,8 +89,7 @@ CUTLASS_DEVICE void load_scale_slice(
     int thr_id,
     float* scale_out /* [SG_N] */) {
   static constexpr int N_per_wi = SG_N / SUBGROUP_SIZE;
-  static_assert(SG_N % SUBGROUP_SIZE == 0,
-                "SG_N must be a multiple of SUBGROUP_SIZE");
+  static_assert(SG_N % SUBGROUP_SIZE == 0, "SG_N must be a multiple of SUBGROUP_SIZE");
 
   const int sg_n_coord = (thr_id / SUBGROUP_SIZE) % ATOM_N;
   const int lane = thr_id % SUBGROUP_SIZE;
@@ -114,8 +113,7 @@ CUTLASS_DEVICE void load_scale_slice(
   for (int src_lane = 0; src_lane < SUBGROUP_SIZE; ++src_lane) {
     CUTE_UNROLL
     for (int sn = 0; sn < N_per_wi; ++sn) {
-      scale_out[src_lane * N_per_wi + sn] =
-          sycl::select_from_group(sg, wi_local[sn], src_lane);
+      scale_out[src_lane * N_per_wi + sn] = sycl::select_from_group(sg, wi_local[sn], src_lane);
     }
   }
 }
@@ -127,11 +125,8 @@ CUTLASS_DEVICE void load_scale_slice(
 // get<0>(coord_frag(idx)) is the WG-tile-N coord. We subtract n_sg_base to
 // index into scale_bf16, which is the fp32→bf16-cast SG-local scale array.
 template <int SG_N_v, class FragBf16, class CoordFrag>
-CUTLASS_DEVICE void apply_B_scales_mma(
-    FragBf16& frag,
-    CoordFrag const& coord_frag,
-    const float* scales_sg,
-    int n_sg_base) {
+CUTLASS_DEVICE void
+apply_B_scales_mma(FragBf16& frag, CoordFrag const& coord_frag, const float* scales_sg, int n_sg_base) {
   using FragLayout = typename FragBf16::layout_type;
   constexpr int frag_size = cute::size_v<FragLayout>;
 
@@ -151,7 +146,6 @@ CUTLASS_DEVICE void apply_B_scales_mma(
     frag(idx) = frag(idx) * s;
   }
 }
-
 
 template <int Stages>
 class XeDefault {};
@@ -212,11 +206,11 @@ struct MoEMainloopMxfp4<
   // -------------------------------------------------------------------------
   template <typename Coord>
   CUTLASS_DEVICE void operator()(
-      ATensor& A,                      // (M,K)              bf16
-      BPackedTensor& Bp,               // (N, K)             float_e2m1_t (4-bit)
-      const float* scales_gmem,        // fp32 scale buffer (rows span N via scale_row_stride)
-      int scale_row_stride,            // fp32 stride per scale N-row
-      DTensor& D,                      // (M,N)              bf16
+      ATensor& A,                // (M,K)              bf16
+      BPackedTensor& Bp,         // (N, K)             float_e2m1_t (4-bit)
+      const float* scales_gmem,  // fp32 scale buffer (rows span N via scale_row_stride)
+      int scale_row_stride,      // fp32 stride per scale N-row
+      DTensor& D,                // (M,N)              bf16
       Coord blk_coord,
       TiledMMA mma,
       int thr_id,
@@ -233,8 +227,9 @@ struct MoEMainloopMxfp4<
 
     constexpr int BLK_N = get<1>(decltype(wg_tile){});
     constexpr int BLK_K = get<2>(decltype(wg_tile){});
-    static_assert(BLK_K == MXFP4_GROUP_SIZE,
-                  "MXFP4 mainloop assumes BLK_K == GROUP_SIZE == 32 so each k-tile has one scale per N-row");
+    static_assert(
+        BLK_K == MXFP4_GROUP_SIZE,
+        "MXFP4 mainloop assumes BLK_K == GROUP_SIZE == 32 so each k-tile has one scale per N-row");
 
     // Compute subgroup-local N dimensions for scale loading. ATOM_N is the
     // SG replication along N (mode 2 of TiledMMA::ThrLayoutVMNK); SG_N is
@@ -356,12 +351,12 @@ struct MoEMainloopMxfp4<
   // -------------------------------------------------------------------------
   template <typename Coord>
   CUTLASS_DEVICE void operator()(
-      ATensor& A,                       // (M,K)
-      BPackedTensor& Bp0,               // (N/2, K)  float_e2m1_t
-      BPackedTensor& Bp1,               // (N/2, K)  float_e2m1_t
-      const float* scales0_gmem,        // fp32 gate scales
-      const float* scales1_gmem,        // fp32 up scales
-      int scale_row_stride,             // fp32 stride per scale N-row (same for both halves)
+      ATensor& A,                 // (M,K)
+      BPackedTensor& Bp0,         // (N/2, K)  float_e2m1_t
+      BPackedTensor& Bp1,         // (N/2, K)  float_e2m1_t
+      const float* scales0_gmem,  // fp32 gate scales
+      const float* scales1_gmem,  // fp32 up scales
+      int scale_row_stride,       // fp32 stride per scale N-row (same for both halves)
       DTensor& D,
       Coord blk_coord,
       TiledMMA mma,
@@ -386,8 +381,7 @@ struct MoEMainloopMxfp4<
     constexpr int BLK_M = get<0>(decltype(wg_tile){});
     constexpr int BLK_N = get<1>(decltype(wg_tile){});
     constexpr int BLK_K = get<2>(decltype(wg_tile){});
-    static_assert(BLK_K == MXFP4_GROUP_SIZE,
-                  "MXFP4 mainloop assumes BLK_K == GROUP_SIZE == 32");
+    static_assert(BLK_K == MXFP4_GROUP_SIZE, "MXFP4 mainloop assumes BLK_K == GROUP_SIZE == 32");
 
     constexpr int ATOM_N_V = get<2>(typename TiledMMA::ThrLayoutVMNK{}.shape());
     constexpr int SG_N = BLK_N / ATOM_N_V;
@@ -474,8 +468,7 @@ struct MoEMainloopMxfp4<
 
       // GEMM0 (gate)
       copy(tiled_copy_b0, tBgBp0(_, _, _, k_tile), tBrB_packed0);
-      load_scale_slice<SG_N, ATOM_N_V, BLK_N>(
-          scales0_gmem, scale_row_stride, wg_n, k_tile, thr_id, scale0_sg);
+      load_scale_slice<SG_N, ATOM_N_V, BLK_N>(scales0_gmem, scale_row_stride, wg_n, k_tile, thr_id, scale0_sg);
       reorder(tArA, tSrA);
       reorder(tBrB_packed0, tSrB);
       apply_B_scales_mma<SG_N>(tSrB, tCrB_coord, scale0_sg, n_sg_base);
@@ -483,8 +476,7 @@ struct MoEMainloopMxfp4<
 
       // GEMM1 (up)
       copy(tiled_copy_b1, tBgBp1(_, _, _, k_tile), tBrB_packed1);
-      load_scale_slice<SG_N, ATOM_N_V, BLK_N>(
-          scales1_gmem, scale_row_stride, wg_n1, k_tile, thr_id, scale1_sg);
+      load_scale_slice<SG_N, ATOM_N_V, BLK_N>(scales1_gmem, scale_row_stride, wg_n1, k_tile, thr_id, scale1_sg);
       reorder(tBrB_packed1, tSrB);
       apply_B_scales_mma<SG_N>(tSrB, tCrB_coord, scale1_sg, n_sg_base);
       cute::gemm(mma, tSrA, tSrB, tCrC1);

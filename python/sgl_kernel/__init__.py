@@ -15,6 +15,7 @@ from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
     flash_mla_decode,
     flash_mla_get_workspace_size,
+    flash_mla_sparse_decode,
     lightning_attention_decode,
     merge_state,
     merge_state_v2,

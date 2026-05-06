@@ -1,0 +1,32 @@
+/***************************************************************************************************
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ **************************************************************************************************/
+// Auto-generated from sparse_mla_decode_kernel.cpp.in
+// Template parameters: ELEM_TAG=@ELEM_TAG@, PAGE_SIZE=@PAGE_SIZE@
+#define SYCL_INTEL_TARGET 20
+
+#include "sycl/kernels/sparse_mla/device/sparse_mla_decode_types.hpp"
+
+namespace mla_sparse_decode {
+
+void launch_mla_sparse_decode_@ELEM_TAG@_@PAGE_SIZE@(
+    at::Tensor& out,
+    at::Tensor& lse_out,
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& indices,
+    const std::optional<at::Tensor>& topk_length,
+    const std::optional<at::Tensor>& extra_k_cache,
+    const std::optional<at::Tensor>& extra_indices,
+    const std::optional<at::Tensor>& extra_topk_length,
+    const std::optional<at::Tensor>& attn_sink,
+    double sm_scale,
+    int64_t head_dim_v) {
+  runMlaSparse<@ELEM_SYCL_TYPE@, SparseMlaPageSizeOption<@PAGE_SIZE@>>(
+      out, lse_out, q, k_cache, indices, topk_length,
+      extra_k_cache, extra_indices, extra_topk_length,
+      attn_sink, sm_scale, head_dim_v);
+}
+
+}  // namespace mla_sparse_decode

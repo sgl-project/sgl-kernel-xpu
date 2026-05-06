@@ -96,7 +96,7 @@ void Xe20MoEGEMMMxfp4Launcher(
   typename Kernel::Params params{
       static_cast<const ElementA*>(activations),
       static_cast<const uint8_t*>(packed_weights),
-      static_cast<const uint8_t*>(scales),
+      static_cast<const float*>(scales),
       static_cast<const float*>(bias),
       static_cast<ElementA*>(outputs),
       num_rows_per_expert_device,

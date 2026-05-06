@@ -151,8 +151,8 @@ DECLARE_XE20_MOE_MXFP4_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
 void moe_grouped_mm_nt_xe20_mxfp4(
     torch::Tensor& output,
     const torch::Tensor& activations,
-    const torch::Tensor& packed_weights,  // [E, N, K/2] uint8
-    const torch::Tensor& scales,          // [E, N, K/32] uint8 UE8M0
+    const torch::Tensor& packed_weights,  // [E, N, K/2] int8
+    const torch::Tensor& scales,          // [E, N, K/32] float32 (direct multiplier)
     const std::optional<at::Tensor>& bias,
     const torch::Tensor& total_rows_for_experts,
     const int64_t n_experts,
@@ -169,14 +169,14 @@ void moe_grouped_mm_nt_xe20_mxfp4(
   TORCH_CHECK(pw_shape[0] == n_experts, "packed_weights first dim must equal n_experts");
   TORCH_CHECK(pw_shape[1] == gemm_n, "packed_weights second dim must equal N");
   TORCH_CHECK(pw_shape[2] == gemm_k / 2, "packed_weights last dim must equal K/2 (two E2M1 per byte)");
-  TORCH_CHECK(packed_weights.scalar_type() == at::ScalarType::Byte, "packed_weights must be uint8");
+  TORCH_CHECK(packed_weights.scalar_type() == at::ScalarType::Char, "packed_weights must be int8");
 
   auto sc_shape = scales.sizes().vec();
   TORCH_CHECK(sc_shape.size() == 3, "scales must be 3D [E, N, K/32]");
   TORCH_CHECK(sc_shape[0] == n_experts, "scales first dim must equal n_experts");
   TORCH_CHECK(sc_shape[1] == gemm_n, "scales second dim must equal N");
   TORCH_CHECK(sc_shape[2] == gemm_k / MoE_MXFP4::MXFP4_GROUP_SIZE, "scales last dim must equal K/32");
-  TORCH_CHECK(scales.scalar_type() == at::ScalarType::Byte, "scales must be uint8 (UE8M0)");
+  TORCH_CHECK(scales.scalar_type() == at::ScalarType::Float, "scales must be float32 (direct multiplier)");
 
   TORCH_CHECK(
       n_experts == total_rows_for_experts.size(0),

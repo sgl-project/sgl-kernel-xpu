@@ -10,15 +10,17 @@
 // The only delta is a register-level B-dequantization step inserted between
 // the B-tile load and cute::gemm:
 //
-//   - B is stored in GMEM as packed MXFP4 (uint8 bytes, two E2M1 nibbles each,
+//   - B is stored in GMEM as packed MXFP4 (int8 bytes, two E2M1 nibbles each,
 //     low nibble = smaller-K element).
-//   - A separate 2D block load brings in [SG_N x 1] UE8M0 scale bytes per
+//   - A separate collaborative load brings in [SG_N] fp32 scale elements per
 //     k-tile. BLK_K is hardcoded to MXFP4 GroupSize=32 (the only E2M1 group
 //     size the hardware cares about) so each k-tile sees exactly one scale
-//     byte per N-row, which simplifies the dequant loop.
+//     element per N-row, which simplifies the dequant loop. The producer
+//     decodes UE8M0 bytes to fp32 direct multipliers ahead of the kernel.
 //   - In registers, each work-item unpacks nibbles into a 16-entry signed
-//     bf16 LUT and multiplies by the bf16 multiplier (2^(byte - 127)). The
-//     result lands in a bf16 MMA-B fragment consumed by cute::gemm unchanged.
+//     bf16 LUT and multiplies by the bf16 multiplier (fp32 scale cast to
+//     bf16 once per SG per k-tile). The result lands in a bf16 MMA-B
+//     fragment consumed by cute::gemm unchanged.
 //
 // Design pattern mirrors xe_mma_mixed_input's upconvert-in-registers flow:
 // the packed-B fragment is allocated with the *same layout* as the bf16 MMA
@@ -57,7 +59,7 @@ namespace MoE_MXFP4 {
 
 using namespace cute;
 
-// MXFP4 invariant: one UE8M0 scale byte per 32 consecutive K-elements.
+// MXFP4 invariant: one scale value per 32 consecutive K-elements.
 static constexpr int MXFP4_GROUP_SIZE = 32;
 
 // Number of work-items per subgroup on Xe (SIMD lane count).
@@ -67,39 +69,39 @@ static constexpr int SUBGROUP_SIZE = 16;
 //
 // The 2D-block-load machinery doesn't fit a (BLK_N, 1)-shaped scale tile
 // cleanly, so we load scales with plain pointer arithmetic. Scales are tiny
-// (one UE8M0 byte per N-row per k-tile — at most a few bytes per WI per
-// k-tile), so we skip prefetch and accept the slow path; the latency is
-// fully hidden under the A/B tile loads which are orders of magnitude
+// (one fp32 element per N-row per k-tile — at most a few elements per WI
+// per k-tile), so we skip prefetch and accept the slow path; the latency
+// is fully hidden under the A/B tile loads which are orders of magnitude
 // bigger.
 //
-// Per-WI N-to-byte mapping matches add_bias: WI at (sg_n_coord, lane)
+// Per-WI N-to-element mapping matches add_bias: WI at (sg_n_coord, lane)
 // owns N-positions { sn*SUBGROUP_SIZE + lane : sn ∈ [0, SG_N/16) }, with
 // SG starting at n_base = wg_n * BLK_N + sg_n_coord * SG_N. This matches
 // the MMA-B fragment's per-WI N layout so dequant can index scales by the
 // same `n` value as its N-loop.
 //
 // scales_gmem_ptr points at the start of this expert's scales
-// ([N, K/GROUP_SIZE] uint8, row-stride = K/GROUP_SIZE).
+// ([N, K/GROUP_SIZE] fp32, row-stride = K/GROUP_SIZE).
 // k_scale_idx is the K-group index for this k-tile (= k_tile since we
 // force BLK_K == GROUP_SIZE).
 // Collaborative scale load. Each WI in the SG reads SG_N / SUBGROUP_SIZE
-// bytes from gmem, then the SG uses sycl::select_from_group to broadcast
-// each WI's local bytes into every other WI's full SG_N-byte array. Total
-// gmem traffic per SG per k-tile: SG_N bytes (coalesced, one cache line)
-// instead of 16*SG_N with the old naive approach.
+// fp32 elements from gmem, then the SG uses sycl::select_from_group to
+// broadcast each WI's local elements into every other WI's full SG_N
+// array. Total gmem traffic per SG per k-tile: SG_N * 4 bytes (coalesced)
+// instead of 16*SG_N*4 with the old naive approach.
 //
 // The broadcast is done as SG_N separate select_from_group ops — one per
-// byte-position in the output array. Each call asks the SG for the byte
-// stored in lane `src_lane` at local array slot `local_slot`, which is
-// cheap on Xe (single sub-group exchange instruction).
+// element position in the output array. Each call asks the SG for the
+// value stored in lane `src_lane` at local array slot `local_slot`, which
+// is cheap on Xe (single sub-group exchange instruction).
 template <int SG_N, int ATOM_N, int BLK_N>
 CUTLASS_DEVICE void load_scale_slice(
-    const uint8_t* scales_gmem_ptr,
+    const float* scales_gmem_ptr,
     int row_stride,
     int wg_n,
     int k_scale_idx,
     int thr_id,
-    uint8_t* scale_out /* [SG_N] */) {
+    float* scale_out /* [SG_N] */) {
   static constexpr int N_per_wi = SG_N / SUBGROUP_SIZE;
   static_assert(SG_N % SUBGROUP_SIZE == 0,
                 "SG_N must be a multiple of SUBGROUP_SIZE");
@@ -108,18 +110,19 @@ CUTLASS_DEVICE void load_scale_slice(
   const int lane = thr_id % SUBGROUP_SIZE;
   const int n_base = wg_n * BLK_N + sg_n_coord * SG_N;
 
-  // Each WI loads its own N_per_wi bytes from gmem (its assigned rows
-  // interleaved by lane: WI `lane` owns rows { lane*N_per_wi + k : k<N_per_wi }).
-  // This matches the add_bias per-WI N mapping convention.
-  uint8_t wi_local[N_per_wi];
+  // Each WI loads its own N_per_wi fp32 elements from gmem (its assigned
+  // rows interleaved by lane: WI `lane` owns rows
+  // { lane*N_per_wi + k : k<N_per_wi }). Matches the add_bias per-WI N
+  // mapping convention.
+  float wi_local[N_per_wi];
   CUTE_UNROLL
   for (int sn = 0; sn < N_per_wi; ++sn) {
     const int n = n_base + lane * N_per_wi + sn;
     wi_local[sn] = scales_gmem_ptr[n * row_stride + k_scale_idx];
   }
 
-  // Broadcast each lane's bytes to all SG lanes, materializing the full
-  // SG_N-byte scale array in every WI's registers.
+  // Broadcast each lane's elements to all SG lanes, materializing the full
+  // SG_N fp32 scale array in every WI's registers.
   auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
   CUTE_UNROLL
   for (int src_lane = 0; src_lane < SUBGROUP_SIZE; ++src_lane) {
@@ -131,63 +134,27 @@ CUTLASS_DEVICE void load_scale_slice(
   }
 }
 
-// UE8M0 biased-exponent byte -> bf16 direct multiplier = 2^(byte - 127).
-// Computed by directly writing the biased exponent into fp32's bit layout.
-// This side-steps any numerical imprecision or domain-clamping in
-// transcendental math paths, and all MXFP4 scales are exact powers of two
-// so there's no rounding.
-CUTLASS_DEVICE
-cutlass::bfloat16_t mxfp4_ue8m0_to_bf16_mul(uint8_t byte) {
-  // fp32 layout: sign (1) | exponent (8, biased by 127) | mantissa (23).
-  // For 2^(k - 127) with biased_exp = byte, set exponent bits = byte, sign
-  // and mantissa = 0. UE8M0 = 0x00 maps to fp32 denormal region; bit-pattern
-  // (byte << 23) gives 0 for byte=0 (2^-127 underflows to 0 in fp32 anyway
-  // for most realistic cases), which is acceptable for MoE weight scales.
-  uint32_t bits = static_cast<uint32_t>(byte) << 23;
-  float f = *reinterpret_cast<const float*>(&bits);
-  return cutlass::bfloat16_t(f);
-}
-
-// Dequantize a packed-B fragment (float_e2m1_t, 4-bit each) + per-SG scale
-// array to a bf16 MMA-B fragment, using a companion coordinate fragment to
-// resolve each register position's N-row for scale lookup.
-//
-// Inputs:
-//   packed     : SubgroupTensor/Tensor<float_e2m1_t> with MMA-B layout.
-//   coord_frag : per-WI coord tensor from thr_mma.partition_B(identity(N,K)).
-//                coord_frag(idx) returns a (n, k) tuple for each register
-//                position.
-//   scales_sg  : uint8_t[SG_N], one UE8M0 byte per N-row in this SG's
-//                N-slice. scales_sg[0] is the scale for the SG's first
-//                N-row (at n_sg_base_within_wg).
-//   n_sg_base  : this SG's base N-index within the WG tile (we subtract it
-//                from each element's coord to index into scales_sg).
-//   out        : destination bf16 fragment with SAME layout as packed.
-//
-// Mirrors the upconvert-in-registers pattern in
-// cutlass/gemm/collective/xe_mma_mixed_input.hpp::transform_quant — but
-// with per-element scale lookup via a coord companion, since the packed
-// fragment's linear index doesn't trivially decompose to (n, k).
 // Apply per-block MXFP4 scales to an already-upcasted bf16 MMA-B fragment.
 // Used after cute::reorder does the E2M1→bf16 conversion + layout permute.
 //
 // The N-row for each fragment element comes from the MMA-B coord companion:
 // get<0>(coord_frag(idx)) is the WG-tile-N coord. We subtract n_sg_base to
-// index into scale_bf16, which was pre-decoded per-k-tile.
+// index into scale_bf16, which is the fp32→bf16-cast SG-local scale array.
 template <int SG_N_v, class FragBf16, class CoordFrag>
 CUTLASS_DEVICE void apply_B_scales_mma(
     FragBf16& frag,
     CoordFrag const& coord_frag,
-    const uint8_t* scales_sg,
+    const float* scales_sg,
     int n_sg_base) {
   using FragLayout = typename FragBf16::layout_type;
   constexpr int frag_size = cute::size_v<FragLayout>;
 
-  // Pre-decode SG_N UE8M0 scale bytes → bf16 multipliers once.
+  // Cast SG_N fp32 scales → bf16 multipliers once; amortized across every
+  // fragment element referencing the same N-row.
   cutlass::bfloat16_t scale_bf16[SG_N_v];
   CUTE_UNROLL
   for (int i = 0; i < SG_N_v; ++i) {
-    scale_bf16[i] = mxfp4_ue8m0_to_bf16_mul(scales_sg[i]);
+    scale_bf16[i] = cutlass::bfloat16_t(scales_sg[i]);
   }
 
   CUTE_UNROLL
@@ -261,8 +228,8 @@ struct MoEMainloopMxfp4<
   CUTLASS_DEVICE void operator()(
       ATensor& A,                      // (M,K)              bf16
       BPackedTensor& Bp,               // (N, K)             float_e2m1_t (4-bit)
-      const uint8_t* scales_gmem,      // UE8M0 byte buffer (rows span N via scale_row_stride)
-      int scale_row_stride,            // byte stride per scale N-row
+      const float* scales_gmem,        // fp32 scale buffer (rows span N via scale_row_stride)
+      int scale_row_stride,            // fp32 stride per scale N-row
       DTensor& D,                      // (M,N)              bf16
       Coord blk_coord,
       TiledMMA mma,
@@ -331,8 +298,8 @@ struct MoEMainloopMxfp4<
     auto cBp_coord_tile = make_identity_tensor(make_shape(Int<BLK_N>{}, Int<BLK_K>{}));
     auto tCrB_coord = thr_mma.partition_B(cBp_coord_tile);
 
-    // Per-SG scale register array — one byte per N-row in this SG's slice.
-    uint8_t scale_sg[SG_N];
+    // Per-SG scale register array — one fp32 value per N-row in this SG's slice.
+    float scale_sg[SG_N];
 
     // Partition C/D.
     SubgroupTensor tCrC = thr_mma.partition_sg_fragment_C(gD);
@@ -386,7 +353,7 @@ struct MoEMainloopMxfp4<
 
       // Apply per-block MXFP4 scales to tSrB in-place. Each element's
       // N-coord is looked up in the MMA-B coord companion; scale_sg holds
-      // the per-SG UE8M0 bytes decoded to bf16 in apply_scales.
+      // the per-SG fp32 scales are cast to bf16 in apply_B_scales_mma.
       const int sg_n_coord = (thr_id / SUBGROUP_SIZE) % ATOM_N_V;
       const int n_sg_base = sg_n_coord * SG_N;
       apply_B_scales_mma<SG_N>(tSrB, tCrB_coord, scale_sg, n_sg_base);
@@ -412,9 +379,9 @@ struct MoEMainloopMxfp4<
       ATensor& A,                       // (M,K)
       BPackedTensor& Bp0,               // (N/2, K)  float_e2m1_t
       BPackedTensor& Bp1,               // (N/2, K)  float_e2m1_t
-      const uint8_t* scales0_gmem,      // UE8M0 gate scales
-      const uint8_t* scales1_gmem,      // UE8M0 up scales
-      int scale_row_stride,             // byte stride per scale N-row (same for both halves)
+      const float* scales0_gmem,        // fp32 gate scales
+      const float* scales1_gmem,        // fp32 up scales
+      int scale_row_stride,             // fp32 stride per scale N-row (same for both halves)
       DTensor& D,
       Coord blk_coord,
       TiledMMA mma,
@@ -484,8 +451,8 @@ struct MoEMainloopMxfp4<
     auto tCrB_coord = thr_mma.partition_B(cBp_coord_tile);
 
     // Per-SG scale register arrays (gate + up).
-    uint8_t scale0_sg[SG_N];
-    uint8_t scale1_sg[SG_N];
+    float scale0_sg[SG_N];
+    float scale1_sg[SG_N];
 
     SubgroupTensor tCrC0 = thr_mma.partition_sg_fragment_C(gC0);
     SubgroupTensor tCrC1 = thr_mma.partition_sg_fragment_C(gC1);

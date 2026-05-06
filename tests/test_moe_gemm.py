@@ -354,12 +354,19 @@ def test_moe_gemm_mxfp4_weights(
     )
 
     # ---- fused_experts with packed MXFP4 weights on XPU ----
+    # fused_experts expects packed weights as int8 (bitwise identical to the
+    # uint8 reference packing) and scales as a fp32 direct multiplier
+    # (decoded from UE8M0).
     device = "xpu"
     a_xpu = a.clone().to(device)
-    w1_packed_xpu = w1_packed.to(device)
-    w2_packed_xpu = w2_packed.to(device)
-    w1_scale_xpu = w1_scale.to(device)
-    w2_scale_xpu = w2_scale.to(device)
+    w1_packed_xpu = w1_packed.view(torch.int8).to(device)
+    w2_packed_xpu = w2_packed.view(torch.int8).to(device)
+    w1_scale_xpu = torch.exp2((w1_scale.to(torch.int32) - 127).to(torch.float32)).to(
+        device
+    )
+    w2_scale_xpu = torch.exp2((w2_scale.to(torch.int32) - 127).to(torch.float32)).to(
+        device
+    )
     topk_weight_xpu = topk_weight.clone().to(device)
     topk_ids_xpu = topk_ids.clone().to(device)
     b1_xpu = b1.clone().to(device) if b1 is not None else None
@@ -582,11 +589,14 @@ def test_fused_experts_mxfp4_fused_kernel(
         a, w1_dq, w2_dq, topk_ids, topk_weight, topk, None, None, activations="silu"
     )
 
+    # fused_experts expects int8 packed weights and fp32 direct-multiplier scales.
     device = "xpu"
+    w1_scale_fp32 = torch.exp2((w1_scale.to(torch.int32) - 127).to(torch.float32))
+    w2_scale_fp32 = torch.exp2((w2_scale.to(torch.int32) - 127).to(torch.float32))
     sglang_output = fused_experts(
         a.to(device),
-        w1_packed.to(device),
-        w2_packed.to(device),
+        w1_packed.view(torch.int8).to(device),
+        w2_packed.view(torch.int8).to(device),
         topk_weight.to(device),
         topk_ids.to(device),
         None,
@@ -594,8 +604,8 @@ def test_fused_experts_mxfp4_fused_kernel(
         activation="silu",
         use_mxfp4_w4a16=True,
         use_fused_mxfp4_kernel=True,
-        w1_scale=w1_scale.to(device),
-        w2_scale=w2_scale.to(device),
+        w1_scale=w1_scale_fp32.to(device),
+        w2_scale=w2_scale_fp32.to(device),
     )
 
     torch.testing.assert_close(

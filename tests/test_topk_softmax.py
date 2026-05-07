@@ -32,7 +32,7 @@ def fused_topk_torch_native(
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("n_token", [2, 32, 4096])
-@pytest.mark.parametrize("n_expert", [8, 32])
+@pytest.mark.parametrize("n_expert", [8, 32, 256])
 @pytest.mark.parametrize("n_topk", [1, 2, 4])
 @pytest.mark.parametrize("renormalize", [False, True])
 def test_topk_softmax(dtype, n_token, n_topk, n_expert, renormalize):

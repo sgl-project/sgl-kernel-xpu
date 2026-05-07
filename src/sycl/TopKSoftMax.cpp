@@ -243,7 +243,7 @@ void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor
   int64_t n_tokens = shape[0];
   int64_t n_experts = shape[1];
 
-  TORCH_CHECK(n_experts <= 128, "n_experts only support up to 128, but got ", n_experts);
+  TORCH_CHECK(n_experts <= 256, "n_experts only support up to 256, but got ", n_experts);
 
   TORCH_CHECK(topk_weights.scalar_type() == at::kFloat, "topk_weights should be Float");
   TORCH_CHECK(topk_indices.scalar_type() == at::kInt, "topk_indices should be Int");
@@ -252,6 +252,9 @@ void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor
   int64_t n_experts_aligned = div_up(n_experts, alignment) * alignment;  // align to 8
 
   int64_t n_topk = topk_weights.size(1);
+  // The max topk value is 8, which is constrained by 'malloc_per_item'.
+  auto max_topk = n_experts < 8 ? n_experts : 8;
+  TORCH_CHECK(0 < n_topk && n_topk <= max_topk, "topk must be less than or equal to num_experts and 8");
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(gating_output.scalar_type(), "fused_topk_softmax_kernel", [&]() {
     TopKSoftmaxImpl::fused_topk_softmax<scalar_t>(

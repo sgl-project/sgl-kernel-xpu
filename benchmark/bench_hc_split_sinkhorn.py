@@ -42,7 +42,9 @@ def benchmark(batch_size, seq_len, sinkhorn_iters, provider):
     torch.set_default_device("xpu")
     torch.xpu.manual_seed_all(42)
 
-    mixes = torch.randn(batch_size, seq_len, col_size, dtype=torch.float32, device="xpu")
+    mixes = torch.randn(
+        batch_size, seq_len, col_size, dtype=torch.float32, device="xpu"
+    )
     hc_scale = torch.rand(3, dtype=torch.float32, device="xpu") * 0.5 + 0.5
     hc_base = torch.randn(col_size, dtype=torch.float32, device="xpu") * 0.1
 
@@ -50,7 +52,9 @@ def benchmark(batch_size, seq_len, sinkhorn_iters, provider):
         _ = hc_split_sinkhorn(mixes, hc_scale, hc_base, hc, sinkhorn_iters)
     torch.xpu.synchronize()
 
-    bench_lambda = lambda: hc_split_sinkhorn(mixes, hc_scale, hc_base, hc, sinkhorn_iters)
+    bench_lambda = lambda: hc_split_sinkhorn(
+        mixes, hc_scale, hc_base, hc, sinkhorn_iters
+    )
 
     quantiles = [0.5, 0.25, 0.75]
     ms, _, _ = triton.testing.do_bench(

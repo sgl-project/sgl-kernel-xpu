@@ -1,7 +1,7 @@
 import pytest
 import torch
-
 from sgl_kernel import hc_split_sinkhorn
+
 
 def _hc_split_sinkhorn_torch(
     mixes: torch.Tensor,
@@ -20,9 +20,7 @@ def _hc_split_sinkhorn_torch(
     post = 2.0 * torch.sigmoid(
         flat[:, hc : 2 * hc] * hc_scale[1] + hc_base[hc : 2 * hc]
     )
-    comb = (
-        flat[:, 2 * hc :] * hc_scale[2] + hc_base[2 * hc :]
-    ).reshape(b * s, hc, hc)
+    comb = (flat[:, 2 * hc :] * hc_scale[2] + hc_base[2 * hc :]).reshape(b * s, hc, hc)
 
     comb = torch.softmax(comb, dim=-1) + eps
     comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
@@ -36,6 +34,7 @@ def _hc_split_sinkhorn_torch(
         comb.view(b, s, hc, hc),
     )
 
+
 def _make_inputs(b, s, device="cpu", seed=42):
     """Return (mixes, hc_scale, hc_base) for hc=4 on the given device."""
     hc = 4
@@ -45,6 +44,7 @@ def _make_inputs(b, s, device="cpu", seed=42):
     hc_scale = torch.rand(3, dtype=torch.float32, device=device) * 0.5 + 0.5
     hc_base = torch.randn(col_size, dtype=torch.float32, device=device) * 0.1
     return mixes, hc_scale, hc_base
+
 
 @pytest.mark.parametrize("b", [7, 384, 512])
 @pytest.mark.parametrize("s", [1])
@@ -61,13 +61,18 @@ def test_hc_split_sinkhorn(b, s, sinkhorn_iters):
         mixes_cpu.to("xpu"),
         hc_scale_cpu.to("xpu"),
         hc_base_cpu.to("xpu"),
-        hc, sinkhorn_iters, eps,
+        hc,
+        sinkhorn_iters,
+        eps,
     )
 
     atol = 1e-4
-    assert torch.allclose(pre_xpu.cpu(), pre_ref, atol=atol), \
-        f"pre mismatch: max={(pre_xpu.cpu() - pre_ref).abs().max():.2e}"
-    assert torch.allclose(post_xpu.cpu(), post_ref, atol=atol), \
-        f"post mismatch: max={(post_xpu.cpu() - post_ref).abs().max():.2e}"
-    assert torch.allclose(comb_xpu.cpu(), comb_ref, atol=atol), \
-        f"comb mismatch: max={(comb_xpu.cpu() - comb_ref).abs().max():.2e}"
+    assert torch.allclose(
+        pre_xpu.cpu(), pre_ref, atol=atol
+    ), f"pre mismatch: max={(pre_xpu.cpu() - pre_ref).abs().max():.2e}"
+    assert torch.allclose(
+        post_xpu.cpu(), post_ref, atol=atol
+    ), f"post mismatch: max={(post_xpu.cpu() - post_ref).abs().max():.2e}"
+    assert torch.allclose(
+        comb_xpu.cpu(), comb_ref, atol=atol
+    ), f"comb mismatch: max={(comb_xpu.cpu() - comb_ref).abs().max():.2e}"

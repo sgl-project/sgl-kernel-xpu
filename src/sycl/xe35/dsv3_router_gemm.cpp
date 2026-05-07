@@ -166,10 +166,17 @@ struct Dsv3RouterSpecializedConfig {
   using LayoutC = cutlass::layout::RowMajor;
   using LayoutD = cutlass::layout::RowMajor;
 
+  // TileShape M chosen as 64 (matching one MMA M-iteration per subgroup with the
+  // <_8,_4,_1> sub-group layout): SG_M = BLK_M / ATOM_M = 64 / 8 = 8 rows
+  // per subgroup, atom_iters_M = SG_M / MMA_atom_M = 8 / 8 = 1. With a single
+  // M atom iteration per subgroup the epilogue writes every output row in the
+  // subgroup tile; the previous TileM = 128 (which required 2 M atom iterations
+  // per subgroup) only stored the first M atom iteration's first row, leaving
+  // rows 1..M-1 of the output as zeros for any num_tokens > 1.
   using TileShape = cute::conditional_t<
       (NExperts == 256),
-      cute::Shape<cute::_128, cute::_256, cute::_32>,
-      cute::Shape<cute::_128, cute::_384, cute::_32>>;
+      cute::Shape<cute::_64, cute::_256, cute::_32>,
+      cute::Shape<cute::_64, cute::_384, cute::_32>>;
 
   using GmemTiledCopyA = void;
   using GmemTiledCopyB = void;

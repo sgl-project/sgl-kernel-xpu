@@ -64,6 +64,7 @@ class XeMlaEpilogue {
   using FragA = typename CollectiveMainloop::FragA;
   using FragARow = typename CollectiveMainloop::FragARow;
   using ElementA = typename FragA::value_type;
+  using ElementAcc = float;  // Accumulator type for exp_sums/max_logits in split-KV path
 
   using ReduceK = decltype(size<3>(typename TiledMMAPV::ThrLayoutVMNK{}));
 
@@ -150,7 +151,8 @@ class XeMlaEpilogue {
     using ElementA = typename FragA::element_type;
 
     // Reduce k-blocks of A and A_sum across WG, if needed.
-    auto [rA, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
+    auto [rA, rA_sum, rA_max_unused, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
+    (void)rA_max_unused;
 
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
@@ -182,6 +184,72 @@ class XeMlaEpilogue {
     copy(copy_o, tOrO, tOgO);
   }
 
+  /// Split-KV epilogue operator.
+  ///
+  /// Stores unnormalized partial O to O_accum and writes exp_sum / max_logit
+  /// for this (head, batch, kv_split) to global memory.
+  ///
+  template <typename QVCoord>
+  CUTLASS_DEVICE void operator()(
+      TensorO2D const& O_accum,  // 2D slice of partial output buffer: (q, v)
+      FragA& tArA,               // O accumulator fragment from mainloop
+      FragARow& tA_max,          // Softmax row-wise max accumulator
+      FragARow& tA_sum,          // Softmax row-wise sum accumulator
+      QVCoord blk_qv,            // WG tile indices: (Q, V)
+      int thr_id,                // Work-item ID
+      ElementAcc& exp_sum,       // Reference to this split's exp_sum element
+      ElementAcc& max_logit,     // Reference to this split's max_logit element
+      int num_kv_splits) {       // Total number of KV splits
+    using namespace cute;
+
+    // Step 1: Cross-subgroup reduction of accumulators
+    auto [rA, rA_sum, rA_max, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
+
+    // Step 2: Store LSE statistics for this split.
+    // Thread 0 (subgroup 0, lane 0) is always active after reduce_A.
+    if (thr_id == 0) {
+      exp_sum = static_cast<ElementAcc>(rA_sum(0));
+      max_logit = static_cast<ElementAcc>(rA_max(0));
+    }
+
+    // Inactive subgroups (when ReduceK > 1) have no work to do.
+    if (!active) return;
+
+    // Step 3: Write O_accum.
+    // For num_kv_splits > 1, O_accum is stored UNNORMALIZED (raw numerator):
+    //   O_accum_s = sum_i exp2(S_si - max_s) * V_si
+    // The reduction kernel merges via:
+    //   O = [sum_s O_accum_s * exp2(max_s - global_max)]
+    //     / [sum_s exp_sum_s * exp2(max_s - global_max)]
+    //
+    // For num_kv_splits == 1, normalize in-place (no reduction needed).
+    if (num_kv_splits == 1) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA_sum.size(); i++)
+        rA_sum(i) = ElementA(1) / rA_sum(i);
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA.size(); i++) {
+        rA(i) *= broadcast<0>(rA_sum, rA, i);
+      }
+    }
+
+    /* Tile output */
+    Tensor cO = make_identity_tensor(O_accum.shape());  // (q,v)
+    Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);   // (q,v)
+
+    /* Prepare slices */
+    TiledCopyO copy_o{O_accum};
+    auto thr_copy_o = copy_o.get_slice(thr_id);
+
+    auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
+    auto tOgO = thr_copy_o.partition_D(gO);
+
+    /* Reorder tile and write out */
+    reorder(rA, tOrO);
+    copy(copy_o, tOrO, tOgO);
+  }
+
   template <typename FragA, typename FragARow>
   CUTLASS_DEVICE decltype(auto) reduce_A(
       FragA& tArA,       // O accumulator:   (q,v)
@@ -191,7 +259,7 @@ class XeMlaEpilogue {
 
     using namespace sycl::ext::oneapi::this_work_item;
     if constexpr (ReduceK{} == _1{}) {
-      return std::make_tuple(tArA, tA_sum, true);
+      return std::make_tuple(tArA, tA_sum, tA_max, true);
     } else {
       /* Identify A tile ID and k block for this subgroup. */
       auto thr_vak = group<1, 3>(TiledMMAPV{}.get_thr_layout_vmnk()).get_flat_coord(assert_uniform(thr_id));
@@ -283,7 +351,7 @@ class XeMlaEpilogue {
           }
         }
       }
-      return std::make_tuple(rA, rA_sum, active);
+      return std::make_tuple(rA, rA_sum, rA_max, active);
     }
   }
 };

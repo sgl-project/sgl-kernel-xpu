@@ -549,7 +549,7 @@ template <
     typename TileShapeOutput,
     typename SubgroupLayoutQK,
     typename SubgroupLayoutPV_ = void, /* void -> default */
-    int PipelineStages = 1,
+    int PipelineStages = 1,            // TODO: This is hard-coded as 1 in kernel.
     bool persistent = false,
     typename ElementQ = bfloat16_t,
     typename ElementK = bfloat16_t,

@@ -1,4 +1,5 @@
 import gc
+import os
 import sys
 
 import pytest
@@ -7,6 +8,7 @@ import torch.nn.functional as F
 from sgl_kernel import flash_mla_decode, flash_mla_get_workspace_size
 from torch import Tensor
 
+LONG_TESTS = os.getenv("LONG_TESTS") == "1"
 device = torch.device("xpu")
 
 if not torch.xpu.is_available():
@@ -45,26 +47,27 @@ def ref_mla(
     head_dim = query.shape[2]
 
     for i in range(bs):
-        # gather and flatten KV-cache
         kv = kv_cache[block_tables[i]]  # (max_num_blocks, block_size, head_dim)
         kv = kv.view(1, -1, head_dim)[:, : seq_lens[i]]  # (1, seq_len, head_dim)
         v = kv[:, :, :v_head_dim]
 
-        q = query[i].view(num_heads, 1, head_dim)
-        o = F.scaled_dot_product_attention(q, kv, v, scale=scale, enable_gqa=True)
-        out[i] = o.view(num_heads, v_head_dim)
+        for h in range(num_heads):
+            q_h = query[i, h : h + 1, :].unsqueeze(0)  # (1, 1, head_dim)
+            o_h = F.scaled_dot_product_attention(q_h, kv, v, scale=scale)
+            out[i, h] = o_h.view(v_head_dim)
 
     return out
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("mean_seq_len", [128, 1024, 4096])
+@pytest.mark.parametrize(
+    "mean_seq_len", [128, 1024, 4096] + ([8192, 16384, 32768] if LONG_TESTS else [])
+)
 @pytest.mark.parametrize("bs", [1, 2, 4])
 @pytest.mark.parametrize("varlen", [True, False])
 # TODO: enable block_size 1
 @pytest.mark.parametrize("block_size", [16, 32, 64, 128])
 @pytest.mark.parametrize("num_heads", [16, 32, 64, 128])
-# TODO: enable num_kv_splits >1
 @pytest.mark.parametrize("num_kv_splits", [-1, 1])
 def test_flash_mla_decode(
     dtype: torch.dtype,
@@ -111,7 +114,6 @@ def test_flash_mla_decode(
     # --- Reference: run on CPU ---
     out_ref = torch.zeros(bs, h_q, dv, dtype=dtype, device="cpu")
     ref_mla(out_ref, q_cpu, kv_cache_cpu, scale, block_table_cpu, seq_lens_cpu)
-    # out_ref = out_ref.to(device=device)
 
     # --- Kernel under test: run on XPU ---
     q_xpu = q_cpu.to(device=device)
@@ -121,7 +123,7 @@ def test_flash_mla_decode(
     del q_cpu, kv_cache_cpu, block_table_cpu, seq_lens_cpu
 
     workspace_size = flash_mla_get_workspace_size(
-        block_num * block_size, bs, num_kv_splits=num_kv_splits
+        block_num * block_size, bs, h_q, block_size, num_kv_splits=num_kv_splits
     )
     workspace = torch.empty(workspace_size, device=device, dtype=torch.uint8)
 

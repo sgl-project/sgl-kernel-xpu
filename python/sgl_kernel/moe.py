@@ -27,6 +27,34 @@ def moe_align_block_size(
     )
 
 
+def hc_split_sinkhorn(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int = 4,
+    sinkhorn_iters: int = 20,
+    eps: float = 1e-6,
+):
+    orig_shape = mixes.shape
+    col_size = (2 + hc_mult) * hc_mult
+    T = mixes.numel() // col_size
+
+    flat = mixes.contiguous().view(T, col_size)
+    hc_scale_c = hc_scale.to(device=mixes.device).contiguous()
+    hc_base_c = hc_base.to(device=mixes.device).contiguous()
+
+    pre_flat, post_flat, comb_flat = torch.ops.sgl_kernel.hc_split_sinkhorn.default(
+        flat, hc_scale_c, hc_base_c, hc_mult, sinkhorn_iters, float(eps)
+    )
+
+    leading = orig_shape[:-1]
+    return (
+        pre_flat.view(*leading, hc_mult),
+        post_flat.view(*leading, hc_mult),
+        comb_flat.view(*leading, hc_mult, hc_mult),
+    )
+
+
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,

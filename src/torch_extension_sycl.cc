@@ -171,6 +171,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /* utils */
   m.def("query_device(int device_id) -> (int, int)");
   m.impl("query_device", c10::DispatchKey::BackendSelect, &query_device);
+
+  /* HC SPLIT SINKHORN */
+  m.def(
+      "hc_split_sinkhorn(Tensor mixes, Tensor hc_scale, Tensor hc_base, "
+      "int hc_mult, int sinkhorn_iters, float eps) -> (Tensor, Tensor, Tensor)");
+  m.impl("hc_split_sinkhorn", torch::kXPU, &hc_split_sinkhorn);
 }
 
 REGISTER_EXTENSION(common_ops)

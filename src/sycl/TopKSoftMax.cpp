@@ -243,15 +243,47 @@ void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor
   int64_t n_tokens = shape[0];
   int64_t n_experts = shape[1];
 
-  TORCH_CHECK(n_experts <= 128, "n_experts only support up to 128, but got ", n_experts);
+  TORCH_CHECK(n_experts <= 256, "n_experts only support up to 256, but got ", n_experts);
 
   TORCH_CHECK(topk_weights.scalar_type() == at::kFloat, "topk_weights should be Float");
   TORCH_CHECK(topk_indices.scalar_type() == at::kInt, "topk_indices should be Int");
 
-  constexpr int64_t alignment = 8;
-  int64_t n_experts_aligned = div_up(n_experts, alignment) * alignment;  // align to 8
+  // Validate output tensor shapes
+  TORCH_CHECK(topk_weights.dim() == 2, "topk_weights must be 2D tensor, but got ", topk_weights.dim(), "D");
+  TORCH_CHECK(topk_indices.dim() == 2, "topk_indices must be 2D tensor, but got ", topk_indices.dim(), "D");
+  TORCH_CHECK(
+      topk_weights.size(0) == n_tokens,
+      "topk_weights.size(0) must equal n_tokens, but got ",
+      topk_weights.size(0),
+      " vs ",
+      n_tokens);
+  TORCH_CHECK(
+      topk_indices.size(0) == n_tokens,
+      "topk_indices.size(0) must equal n_tokens, but got ",
+      topk_indices.size(0),
+      " vs ",
+      n_tokens);
 
   int64_t n_topk = topk_weights.size(1);
+  TORCH_CHECK(
+      topk_indices.size(1) == n_topk,
+      "topk_indices.size(1) must equal topk_weights.size(1), but got ",
+      topk_indices.size(1),
+      " vs ",
+      n_topk);
+
+  constexpr int64_t alignment = 8;
+  int64_t n_experts_aligned = div_up(n_experts, alignment) * alignment;  // align to 8
+  constexpr int64_t kernel_max_topk = TopKSoftmaxImpl::FusedTopkSoftmax<float>::malloc_per_item;
+  auto max_topk = n_experts < kernel_max_topk ? n_experts : kernel_max_topk;
+  TORCH_CHECK(
+      0 < n_topk && n_topk <= max_topk,
+      "n_topk must satisfy 0 < n_topk <= min(n_experts, ",
+      kernel_max_topk,
+      "), but got n_topk=",
+      n_topk,
+      " and n_experts=",
+      n_experts);
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(gating_output.scalar_type(), "fused_topk_softmax_kernel", [&]() {
     TopKSoftmaxImpl::fused_topk_softmax<scalar_t>(

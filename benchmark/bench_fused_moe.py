@@ -427,7 +427,8 @@ def benchmark(
         bp = dim * 2
         v, n = bp, 0
         while v % 2 == 0:
-            v >>= 1; n += 1
+            v >>= 1
+            n += 1
         return n >= 11 and v >= 3
 
     def _make_weight(E, N, K, dtype):

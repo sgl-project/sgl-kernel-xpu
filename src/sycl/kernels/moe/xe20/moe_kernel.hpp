@@ -109,9 +109,11 @@ class MoEGEMM {
             make_gmem_ptr<ElementB>(ptr_B + ld_b), make_layout(make_shape(N / 2, K), make_stride(2 * ld_b, _1{})));
         return cute::make_tuple(B0, B1);
       } else {
-        auto B0 = make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N / 2, K), make_stride(ld_b, _1{})));
+        auto B0 =
+            make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N / 2, K), make_stride(ld_b, _1{})));
         ElementB* ptr_B1 = ptr_B + static_cast<int64_t>(N / 2) * ld_b;
-        auto B1 = make_tensor(make_gmem_ptr<ElementB>(ptr_B1), make_layout(make_shape(N / 2, K), make_stride(ld_b, _1{})));
+        auto B1 =
+            make_tensor(make_gmem_ptr<ElementB>(ptr_B1), make_layout(make_shape(N / 2, K), make_stride(ld_b, _1{})));
         return cute::make_tuple(B0, B1);
       }
     } else {

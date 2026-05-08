@@ -94,20 +94,29 @@ struct HCSplitSinkhornKernel {
   }
 };
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_split_sinkhorn(
+void hc_split_sinkhorn(
     const at::Tensor& mixes,
     const at::Tensor& hc_scale,
     const at::Tensor& hc_base,
+    at::Tensor& pre,
+    at::Tensor& post,
+    at::Tensor& comb,
     int64_t hc_mult,
     int64_t sinkhorn_iters,
     double eps) {
   CHECK_INPUT(mixes);
   CHECK_INPUT(hc_scale);
   CHECK_INPUT(hc_base);
+  CHECK_INPUT(pre);
+  CHECK_INPUT(post);
+  CHECK_INPUT(comb);
 
   TORCH_CHECK(mixes.scalar_type() == at::kFloat, "mixes must be float32");
   TORCH_CHECK(hc_scale.scalar_type() == at::kFloat, "hc_scale must be float32");
   TORCH_CHECK(hc_base.scalar_type() == at::kFloat, "hc_base must be float32");
+  TORCH_CHECK(pre.scalar_type() == at::kFloat, "pre must be float32");
+  TORCH_CHECK(post.scalar_type() == at::kFloat, "post must be float32");
+  TORCH_CHECK(comb.scalar_type() == at::kFloat, "comb must be float32");
 
   constexpr int col_size = HCSplitSinkhornKernel::COL_SIZE;
 
@@ -123,11 +132,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_split_sinkhorn(
   TORCH_CHECK(hc_base.numel() == col_size, "hc_base must have (2+HC)*HC=", col_size, " elements");
 
   const int64_t T = mixes.numel() / col_size;
+  TORCH_CHECK(T < std::numeric_limits<int>::max(), "T (", T, ") must fit in int32");
 
-  auto opts = mixes.options();
-  auto pre = at::empty({T, HC}, opts);
-  auto post = at::empty({T, HC}, opts);
-  auto comb = at::empty({T, HC, HC}, opts);
+  TORCH_CHECK(pre.numel() == T * HC, "pre must have T*HC=", T * HC, " elements, got ", pre.numel());
+  TORCH_CHECK(post.numel() == T * HC, "post must have T*HC=", T * HC, " elements, got ", post.numel());
+  TORCH_CHECK(comb.numel() == T * HC * HC, "comb must have T*HC*HC=", T * HC * HC, " elements, got ", comb.numel());
 
   auto q = dpcppGetCurrentQueue();
 
@@ -144,6 +153,4 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_split_sinkhorn(
       static_cast<float>(eps),
   };
   sycl_kernel_submit(num_wg * WG_SIZE, static_cast<int64_t>(WG_SIZE), q, ker);
-
-  return {pre, post, comb};
 }

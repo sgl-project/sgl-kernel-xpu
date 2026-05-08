@@ -34,6 +34,9 @@ def hc_split_sinkhorn(
     hc_mult: int = 4,
     sinkhorn_iters: int = 20,
     eps: float = 1e-6,
+    pre: Optional[torch.Tensor] = None,
+    post: Optional[torch.Tensor] = None,
+    comb: Optional[torch.Tensor] = None,
 ):
     orig_shape = mixes.shape
     col_size = (2 + hc_mult) * hc_mult
@@ -43,8 +46,32 @@ def hc_split_sinkhorn(
     hc_scale_c = hc_scale.to(device=mixes.device).contiguous()
     hc_base_c = hc_base.to(device=mixes.device).contiguous()
 
-    pre_flat, post_flat, comb_flat = torch.ops.sgl_kernel.hc_split_sinkhorn.default(
-        flat, hc_scale_c, hc_base_c, hc_mult, sinkhorn_iters, float(eps)
+    pre_flat = (
+        torch.empty((T, hc_mult), device=mixes.device, dtype=mixes.dtype)
+        if pre is None
+        else pre.contiguous().view(T, hc_mult)
+    )
+    post_flat = (
+        torch.empty((T, hc_mult), device=mixes.device, dtype=mixes.dtype)
+        if post is None
+        else post.contiguous().view(T, hc_mult)
+    )
+    comb_flat = (
+        torch.empty((T, hc_mult, hc_mult), device=mixes.device, dtype=mixes.dtype)
+        if comb is None
+        else comb.contiguous().view(T, hc_mult, hc_mult)
+    )
+
+    torch.ops.sgl_kernel.hc_split_sinkhorn.default(
+        flat,
+        hc_scale_c,
+        hc_base_c,
+        pre_flat,
+        post_flat,
+        comb_flat,
+        hc_mult,
+        sinkhorn_iters,
+        float(eps),
     )
 
     leading = orig_shape[:-1]

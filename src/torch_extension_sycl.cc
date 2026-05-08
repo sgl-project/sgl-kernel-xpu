@@ -175,7 +175,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /* HC SPLIT SINKHORN */
   m.def(
       "hc_split_sinkhorn(Tensor mixes, Tensor hc_scale, Tensor hc_base, "
-      "int hc_mult, int sinkhorn_iters, float eps) -> (Tensor, Tensor, Tensor)");
+      "Tensor! pre, Tensor! post, Tensor! comb, "
+      "int hc_mult, int sinkhorn_iters, float eps) -> ()");
   m.impl("hc_split_sinkhorn", torch::kXPU, &hc_split_sinkhorn);
 }
 

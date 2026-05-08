@@ -38,6 +38,22 @@ def topk_softmax(
     )
 
 
+def topk_sigmoid(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gating_output: torch.Tensor,
+    renormalize: bool = False,
+    correction_bias: Optional[torch.Tensor] = None,
+) -> None:
+    torch.ops.sgl_kernel.topk_sigmoid.default(
+        topk_weights,
+        topk_ids,
+        gating_output,
+        renormalize,
+        correction_bias,
+    )
+
+
 def moe_sum_reduce(
     input_tensor,
     output_tensor,

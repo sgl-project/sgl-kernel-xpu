@@ -128,6 +128,24 @@ shape_configs = [
         "dtype": torch.bfloat16,
         "block_shape": None,
     },
+    # K=3072, N=3072 (L3 aliasing shape)
+    {
+        "num_experts": 8,
+        "topk": 2,
+        "hidden_size": 3072,
+        "shard_intermediate_size": 6144,
+        "dtype": torch.bfloat16,
+        "block_shape": None,
+    },
+    # K=7168, N=3072 (DeepSeek V4 style, L3 aliasing)
+    {
+        "num_experts": 8,
+        "topk": 2,
+        "hidden_size": 7168,
+        "shard_intermediate_size": 6144,
+        "dtype": torch.bfloat16,
+        "block_shape": None,
+    },
 ]
 
 shape_configs_gelu = [
@@ -405,11 +423,24 @@ def benchmark(
     torch.set_default_device("xpu")
     torch.xpu.manual_seed_all(0)
 
+    def _needs_ld_padding(dim):
+        bp = dim * 2
+        v, n = bp, 0
+        while v % 2 == 0:
+            v >>= 1; n += 1
+        return n >= 11 and v >= 3
+
+    def _make_weight(E, N, K, dtype):
+        if _needs_ld_padding(K):
+            PAD = 32
+            buf = torch.empty(E, N, K + PAD, dtype=dtype)
+            buf.normal_()
+            return buf[:, :, :K]
+        return torch.randn(E, N, K, dtype=dtype)
+
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
-    w1 = torch.randn(num_experts, shard_intermediate_size, hidden_size, dtype=dtype)
-    w2 = torch.randn(
-        num_experts, hidden_size, shard_intermediate_size // 2, dtype=dtype
-    )
+    w1 = _make_weight(num_experts, shard_intermediate_size, hidden_size, dtype)
+    w2 = _make_weight(num_experts, hidden_size, shard_intermediate_size // 2, dtype)
     b1, b2 = None, None
     if with_bias:
         b1 = torch.randn(w1.shape[:2], dtype=dtype)

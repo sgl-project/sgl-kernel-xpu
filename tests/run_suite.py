@@ -35,6 +35,7 @@ suites = {
         TestFile("test_activation.py"),
         TestFile("test_scatter_tokens_to_experts.py"),
         TestFile("test_sampling.py"),
+        TestFile("test_hc_split_sinkhorn.py"),
     ],
 }
 

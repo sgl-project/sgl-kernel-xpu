@@ -51,13 +51,8 @@ namespace at::native::xpu {
 // Uses exp2(x * log2_base) instead of pow(base, x) because exp2 lowers to a
 // single hardware instruction on Intel GPUs, whereas pow goes through a slow
 // polynomial path.
-static inline float compute_freq_yarn_rope(
-    float log2_base,
-    int rotary_dim,
-    int half_dim,
-    float factor,
-    float low,
-    float high) {
+static inline float
+compute_freq_yarn_rope(float log2_base, int rotary_dim, int half_dim, float factor, float low, float high) {
   const float exponent = -2.0f * static_cast<float>(half_dim) / static_cast<float>(rotary_dim);
   float freq = sycl::exp2(exponent * log2_base);
 
@@ -143,8 +138,20 @@ struct FusedQKRopeKernel {
       elements[i] = val * static_cast<accscalar_t>(weight_ptr[dim]);
     }
 
-    // Apply RoPE to weighted elements
+    // Apply RoPE to weighted elements.
+    //
+    // Interleave mode pairs element (2k, 2k+1); both pair-members share the
+    // same half_dim and therefore the same sin/cos. We exploit this by
+    // computing sin/cos only at `numElemsPerThread/2` unique pair indices
+    // instead of `numElemsPerThread` per-element values, cutting transcendental
+    // work in half (exp2 + native::sin + native::cos + compute_freq branch).
+    //
+    // Neox mode uses a different dim_idx per element so each slot needs its
+    // own sin/cos — no change there.
     accscalar_t elements2[numElemsPerThread];
+    constexpr int numPairs = (numElemsPerThread + 1) / 2;
+    accscalar_t cos_pair[numPairs];
+    accscalar_t sin_pair[numPairs];
     accscalar_t cos_vals[numElemsPerThread];
     accscalar_t sin_vals[numElemsPerThread];
     float pos_id = static_cast<float>(position_ids[tokenIdx]);
@@ -155,25 +162,34 @@ struct FusedQKRopeKernel {
 
     if (applyRotary) {
       if constexpr (interleave) {
-        // Interleave mode
+        // Pair-swap sign pattern: e2[2k] = -e[2k+1], e2[2k+1] = e[2k]
 #pragma unroll
         for (int i = 0; i < numElemsPerThread; i++) {
           elements2[i] = (i % 2 == 0) ? -elements[i + 1] : elements[i - 1];
-
-          int dim_idx = laneId * numElemsPerThread + i;
+        }
+        // One transcendental per pair, shared by both pair members.
+#pragma unroll
+        for (int p = 0; p < numPairs; p++) {
+          int dim_idx = laneId * numElemsPerThread + 2 * p;
           int half_dim = dim_idx / 2;
           float freq = compute_freq_yarn_rope(log2_base, rotary_dim, half_dim, factor, low, high);
           float theta = pos_id * freq;
           // native::{sin,cos} map to hardware transcendentals on Intel GPUs —
           // substantially faster than sycl::sin / sycl::cos.
-          sin_vals[i] = sycl::native::sin(theta);
-          cos_vals[i] = sycl::native::cos(theta);
+          sin_pair[p] = sycl::native::sin(theta);
+          cos_pair[p] = sycl::native::cos(theta);
+        }
+#pragma unroll
+        for (int i = 0; i < numElemsPerThread; i++) {
+          sin_vals[i] = sin_pair[i / 2];
+          cos_vals[i] = cos_pair[i / 2];
         }
       }
     }
 
     if constexpr (!interleave) {
-      // Neox style
+      // Neox style: each element maps to a distinct half_dim, so sin/cos are
+      // computed per element (no pair sharing available here).
       sycl::group_barrier(sg);
       const int half_rotary_lanes = rotary_lanes / 2;
 
@@ -299,9 +315,7 @@ void fused_qk_rope(
       "Position IDs dtype must be int32 (at::kInt) to match data_ptr<int>() usage; got ",
       position_ids.scalar_type());
   TORCH_CHECK(
-      head_dim == 64 || head_dim == 128 || head_dim == 256,
-      "head_dim must be one of {64, 128, 256}; got ",
-      head_dim);
+      head_dim == 64 || head_dim == 128 || head_dim == 256, "head_dim must be one of {64, 128, 256}; got ", head_dim);
   TORCH_CHECK(
       rotary_dim > 0 && rotary_dim <= head_dim,
       "rotary_dim must be in the range (0, head_dim], got ",
@@ -339,23 +353,19 @@ void fused_qk_rope(
   auto queue = dpcppGetCurrentQueue();
   bool interleave = !is_neox;
 
-#define FUSED_QK_ROPE_LAUNCH_ARGS                                               \
-  qkv.data_ptr(), static_cast<int>(num_tokens), static_cast<int>(num_heads_q),  \
-      static_cast<int>(num_heads_k), static_cast<int>(num_heads_v),             \
-      q_weight.data_ptr(), k_weight.data_ptr(), static_cast<float>(base),       \
-      position_ids.data_ptr<int>(), static_cast<float>(factor),                 \
-      static_cast<float>(low), static_cast<float>(high),                        \
+#define FUSED_QK_ROPE_LAUNCH_ARGS                                                                                  \
+  qkv.data_ptr(), static_cast<int>(num_tokens), static_cast<int>(num_heads_q), static_cast<int>(num_heads_k),      \
+      static_cast<int>(num_heads_v), q_weight.data_ptr(), k_weight.data_ptr(), static_cast<float>(base),           \
+      position_ids.data_ptr<int>(), static_cast<float>(factor), static_cast<float>(low), static_cast<float>(high), \
       static_cast<float>(attention_factor), static_cast<int>(rotary_dim), queue
 
-#define LAUNCH_QK_ROPE_KERNEL(HEAD_DIM, INTERLEAVE)                              \
-  AT_DISPATCH_SWITCH(                                                            \
-      qkv.scalar_type(),                                                         \
-      "fused_qk_rope",                                                           \
-      DISPATCH_CASE_FLOAT_TYPES(([&] {                                           \
-        launchFusedQKRopeImpl<HEAD_DIM, INTERLEAVE, scalar_t>(FUSED_QK_ROPE_LAUNCH_ARGS); \
-      })) AT_DISPATCH_CASE(at::ScalarType::Float8_e4m3fn, ([&] {                 \
-        launchFusedQKRopeImpl<HEAD_DIM, INTERLEAVE, float_e4m3_t>(FUSED_QK_ROPE_LAUNCH_ARGS); \
-      })))
+#define LAUNCH_QK_ROPE_KERNEL(HEAD_DIM, INTERLEAVE)                                                                \
+  AT_DISPATCH_SWITCH(                                                                                              \
+      qkv.scalar_type(), "fused_qk_rope", DISPATCH_CASE_FLOAT_TYPES(([&] {                                         \
+        launchFusedQKRopeImpl<HEAD_DIM, INTERLEAVE, scalar_t>(FUSED_QK_ROPE_LAUNCH_ARGS);                          \
+      })) AT_DISPATCH_CASE(at::ScalarType::Float8_e4m3fn, ([&] {                                                   \
+                             launchFusedQKRopeImpl<HEAD_DIM, INTERLEAVE, float_e4m3_t>(FUSED_QK_ROPE_LAUNCH_ARGS); \
+                           })))
 
   switch (head_dim) {
     case 64:

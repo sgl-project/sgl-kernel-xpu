@@ -1,10 +1,8 @@
 #include <ATen/ATen.h>
-#include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
 #include <limits>
 #include <sycl/sycl.hpp>
-#include <tuple>
 
 #include "SYCLHelpers.h"
 #include "Utils.h"

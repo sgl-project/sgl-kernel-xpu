@@ -39,27 +39,66 @@ def hc_split_sinkhorn(
     comb: Optional[torch.Tensor] = None,
 ):
     orig_shape = mixes.shape
+    if mixes.dtype != torch.float32:
+        raise TypeError(
+            "hc_split_sinkhorn requires mixes to be float32, " f"got {mixes.dtype}"
+        )
+    if hc_mult <= 0:
+        raise ValueError(f"hc_mult must be positive, got {hc_mult}")
+    if hc_mult != 4:
+        raise ValueError(
+            "hc_split_sinkhorn currently supports only hc_mult=4 "
+            "(kernel is specialized/unrolled for this value), "
+            f"got hc_mult={hc_mult}"
+        )
+    if sinkhorn_iters != 20:
+        raise ValueError(
+            "hc_split_sinkhorn currently supports only sinkhorn_iters=20 "
+            "(kernel is specialized/unrolled for this value), "
+            f"got sinkhorn_iters={sinkhorn_iters}"
+        )
+    if mixes.ndim < 1:
+        raise ValueError("mixes must have at least 1 dimension")
+
     col_size = (2 + hc_mult) * hc_mult
+    if mixes.shape[-1] != col_size:
+        raise ValueError(
+            "Invalid mixes shape for hc_split_sinkhorn: "
+            f"expected last dimension {col_size} for hc_mult={hc_mult}, "
+            f"got {mixes.shape[-1]} (shape={tuple(mixes.shape)})"
+        )
+    if mixes.numel() % col_size != 0:
+        raise ValueError(
+            "mixes.numel() must be divisible by col_size in hc_split_sinkhorn: "
+            f"numel={mixes.numel()}, col_size={col_size}"
+        )
+
     T = mixes.numel() // col_size
 
     flat = mixes.contiguous().view(T, col_size)
-    hc_scale_c = hc_scale.to(device=mixes.device).contiguous()
-    hc_base_c = hc_base.to(device=mixes.device).contiguous()
+    hc_scale_c = hc_scale.to(device=mixes.device, dtype=torch.float32).contiguous()
+    hc_base_c = hc_base.to(device=mixes.device, dtype=torch.float32).contiguous()
 
     pre_flat = (
-        torch.empty((T, hc_mult), device=mixes.device, dtype=mixes.dtype)
+        torch.empty((T, hc_mult), device=mixes.device, dtype=torch.float32)
         if pre is None
-        else pre.contiguous().view(T, hc_mult)
+        else pre.to(device=mixes.device, dtype=torch.float32)
+        .contiguous()
+        .view(T, hc_mult)
     )
     post_flat = (
-        torch.empty((T, hc_mult), device=mixes.device, dtype=mixes.dtype)
+        torch.empty((T, hc_mult), device=mixes.device, dtype=torch.float32)
         if post is None
-        else post.contiguous().view(T, hc_mult)
+        else post.to(device=mixes.device, dtype=torch.float32)
+        .contiguous()
+        .view(T, hc_mult)
     )
     comb_flat = (
-        torch.empty((T, hc_mult, hc_mult), device=mixes.device, dtype=mixes.dtype)
+        torch.empty((T, hc_mult, hc_mult), device=mixes.device, dtype=torch.float32)
         if comb is None
-        else comb.contiguous().view(T, hc_mult, hc_mult)
+        else comb.to(device=mixes.device, dtype=torch.float32)
+        .contiguous()
+        .view(T, hc_mult, hc_mult)
     )
 
     torch.ops.sgl_kernel.hc_split_sinkhorn.default(

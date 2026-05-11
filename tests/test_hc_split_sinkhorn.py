@@ -1,6 +1,9 @@
 import pytest
 import torch
+import utils
 from sgl_kernel import hc_split_sinkhorn
+
+device = utils.get_device()
 
 
 def _hc_split_sinkhorn_torch(
@@ -35,7 +38,7 @@ def _hc_split_sinkhorn_torch(
     )
 
 
-def _make_inputs(b, s, device="cpu", seed=42):
+def _make_inputs(b, s, device, seed=42):
     """Return (mixes, hc_scale, hc_base) for hc=4 on the given device."""
     hc = 4
     col_size = (2 + hc) * hc  # 24
@@ -47,20 +50,20 @@ def _make_inputs(b, s, device="cpu", seed=42):
 
 
 @pytest.mark.parametrize("b", [7, 384, 512])
-@pytest.mark.parametrize("s", [1])
+@pytest.mark.parametrize("s", [1, 128])
 @pytest.mark.parametrize("sinkhorn_iters", [20])
 def test_hc_split_sinkhorn(b, s, sinkhorn_iters):
     hc = 4
     eps = 1e-6
-    mixes_cpu, hc_scale_cpu, hc_base_cpu = _make_inputs(b, s)
+    mixes, hc_scale, hc_base = _make_inputs(b, s, device=f"{device}:0")
 
     pre_ref, post_ref, comb_ref = _hc_split_sinkhorn_torch(
-        mixes_cpu, hc_scale_cpu, hc_base_cpu, hc, sinkhorn_iters, eps
+        mixes, hc_scale, hc_base, hc, sinkhorn_iters, eps
     )
     pre_xpu, post_xpu, comb_xpu = hc_split_sinkhorn(
-        mixes_cpu.to("xpu"),
-        hc_scale_cpu.to("xpu"),
-        hc_base_cpu.to("xpu"),
+        mixes,
+        hc_scale,
+        hc_base,
         hc,
         sinkhorn_iters,
         eps,
@@ -68,11 +71,11 @@ def test_hc_split_sinkhorn(b, s, sinkhorn_iters):
 
     atol = 1e-4
     assert torch.allclose(
-        pre_xpu.cpu(), pre_ref, atol=atol
-    ), f"pre mismatch: max={(pre_xpu.cpu() - pre_ref).abs().max():.2e}"
+        pre_xpu, pre_ref, atol=atol
+    ), f"pre mismatch: max={(pre_xpu - pre_ref).abs().max():.2e}"
     assert torch.allclose(
-        post_xpu.cpu(), post_ref, atol=atol
-    ), f"post mismatch: max={(post_xpu.cpu() - post_ref).abs().max():.2e}"
+        post_xpu, post_ref, atol=atol
+    ), f"post mismatch: max={(post_xpu - post_ref).abs().max():.2e}"
     assert torch.allclose(
-        comb_xpu.cpu(), comb_ref, atol=atol
-    ), f"comb mismatch: max={(comb_xpu.cpu() - comb_ref).abs().max():.2e}"
+        comb_xpu, comb_ref, atol=atol
+    ), f"comb mismatch: max={(comb_xpu - comb_ref).abs().max():.2e}"

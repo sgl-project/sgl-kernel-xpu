@@ -90,7 +90,8 @@ def torch_naive_moe(
     assert activations in [
         "silu",
         "gelu",
-    ], "Only silu and gelu activations are supported."
+        "relu2",
+    ], "Only silu, gelu and relu2 activations are supported."
 
     is_swiglu_gpt_oss = (
         activations == "silu" and gemm1_alpha is not None and gemm1_limit is not None
@@ -108,15 +109,24 @@ def torch_naive_moe(
                 # Same for GEMM2.
                 gemm2 = (tmp @ w2[i].transpose(0, 1)).float() + b2[i].float()
                 out[mask] = gemm2.to(a.dtype)
+    elif activations == "relu2":
+        act_fn = lambda x: F.relu(x) ** 2
+        for i in range(w1.shape[0]):
+            mask = topk_ids == i
+            if mask.sum():
+                gemm1 = (a[mask] @ w1[i].transpose(0, 1)).float() + b1[i].float()
+                tmp = act_fn(gemm1).to(a.dtype)
+                gemm2 = (tmp @ w2[i].transpose(0, 1)).float() + b2[i].float()
+                out[mask] = gemm2.to(a.dtype)
     else:
-        act_func = (
+        act_fn = (
             F.silu if activations == "silu" else lambda x: F.gelu(x, approximate="tanh")
         )
         for i in range(w1.shape[0]):
             mask = topk_ids == i
             if mask.sum():
                 gemm1 = (a[mask] @ w1[i].transpose(0, 1)).float() + b1[i].float()
-                tmp = apply_act_and_mul(gemm1.to(a.dtype), act_func)
+                tmp = apply_act_and_mul(gemm1.to(a.dtype), act_fn)
                 gemm2 = (tmp @ w2[i].transpose(0, 1)).float() + b2[i].float()
                 out[mask] = gemm2.to(a.dtype)
 
@@ -144,6 +154,7 @@ def torch_naive_moe(
                 ("silu", None, None),
                 ("gelu", None, None),
                 ("silu", SWIGLU_ALPHA, SWIGLU_LIMIT),  # swiglu_gpt_oss
+                ("relu2", None, None),
             ],  # (act_type, gemm1_alpha, gemm1_limit)
             [2.5],
         )
@@ -162,10 +173,13 @@ def test_moe_gemm(
     act_type, gemm1_alpha, gemm1_limit = act
     torch.xpu.manual_seed_all(0)
 
+    # NOTE: Nemotron3 Nano is using a non-gated MoE w/ activation type ReLU2
+    gating_factor = 1 if act_type == "relu2" else 2
+
     rtol, atol = 1e-4, 1e-3
     a = create_random_xpu_tensor((num_tokens, hidden_size), torch.bfloat16)
     w1 = create_random_xpu_tensor(
-        (num_experts, 2 * intermediate_size, hidden_size), torch.bfloat16
+        (num_experts, gating_factor * intermediate_size, hidden_size), torch.bfloat16
     )
     w2 = create_random_xpu_tensor(
         (num_experts, hidden_size, intermediate_size), torch.bfloat16
@@ -174,7 +188,7 @@ def test_moe_gemm(
     if bias_dtype:
         dtype = torch.bfloat16 if bias_dtype == "bfloat16" else torch.float32
         b1 = create_random_xpu_tensor(
-            (num_experts, 2 * intermediate_size), dtype, std=0.005
+            (num_experts, gating_factor * intermediate_size), dtype, std=0.005
         )
         b2 = create_random_xpu_tensor((num_experts, hidden_size), dtype, std=0.005)
     score = torch.randn([num_tokens, num_experts], dtype=torch.bfloat16).to("xpu")

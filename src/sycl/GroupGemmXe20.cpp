@@ -140,6 +140,9 @@ DECLARE_XE20_MOE_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
       case 2:                                                            \
         DISPATCH_MOE_HELPER_FUSE_ACT(2, FuseAct, WithBias, __VA_ARGS__); \
         break;                                                           \
+      case 3:                                                            \
+        DISPATCH_MOE_HELPER_FUSE_ACT(3, FuseAct, WithBias, __VA_ARGS__); \
+        break;                                                           \
       default:                                                           \
         TORCH_CHECK(false, "Unsupported activation type");               \
     }                                                                    \

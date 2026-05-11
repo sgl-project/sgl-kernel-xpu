@@ -50,6 +50,7 @@
 #define SILU 0
 #define GELU 1
 #define SWIGLU_GPT_OSS 2
+#define RELU2 3
 
 template <typename T>
 struct dump;

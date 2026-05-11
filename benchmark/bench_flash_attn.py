@@ -55,6 +55,31 @@ def flash_attn_baseline(
         return out, lse
 
 
+def get_effective_attention_pairs(
+    q_seq_length, kv_seq_length, causal, window_size=(-1, -1)
+):
+    diagonal_offset = kv_seq_length - q_seq_length
+    window_size_left, window_size_right = window_size
+    if causal:
+        window_size_right = 0
+
+    effective_pairs = 0
+    for query_idx in range(q_seq_length):
+        visible_kv_start = 0
+        if window_size_left >= 0:
+            visible_kv_start = max(0, query_idx + diagonal_offset - window_size_left)
+
+        visible_kv_end = kv_seq_length - 1
+        if window_size_right >= 0:
+            visible_kv_end = min(
+                kv_seq_length - 1, query_idx + diagonal_offset + window_size_right
+            )
+
+        visible_kv = max(0, visible_kv_end - visible_kv_start + 1)
+        effective_pairs += max(0, visible_kv)
+    return effective_pairs
+
+
 # Benchmark configurations
 causal = [True, False]
 local = [True, False]
@@ -178,7 +203,12 @@ def benchmark(
     )
     max_seqlen_q = q_seq_length
     max_seqlen_k = kv_seq_length
-    window_size = (-1, -1) if not local else torch.randint(0, kv_seq_length, (2,))
+    if not local:
+        window_size = (-1, -1)
+    else:
+        window_size = tuple(
+            int(value) for value in torch.randint(0, kv_seq_length, (2,)).tolist()
+        )
 
     sinks = torch.randn(num_heads_q, device=device, dtype=dtype) if use_sinks else None
 
@@ -206,15 +236,37 @@ def benchmark(
             quantiles=quantiles,
         )
 
-    flops_qk = batch_size * num_heads_q * q_seq_length * kv_seq_length * head_dim * 2
-    flops_pv = batch_size * num_heads_q * q_seq_length * head_dim * kv_seq_length * 2
+    total_attention_pairs = q_seq_length * kv_seq_length
+    effective_attention_pairs = get_effective_attention_pairs(
+        q_seq_length=q_seq_length,
+        kv_seq_length=kv_seq_length,
+        causal=causal,
+        window_size=window_size,
+    )
+    effective_attention_ratio = (
+        effective_attention_pairs / total_attention_pairs
+        if total_attention_pairs > 0
+        else 0.0
+    )
+
+    flops_qk = batch_size * num_heads_q * effective_attention_pairs * head_dim * 2
+    flops_pv = batch_size * num_heads_q * effective_attention_pairs * head_dim * 2
     tflops = (flops_qk + flops_pv) * 1e-12 / (ms * 1e-3)
     memory_qk = batch_size * (
         q.element_size() * num_heads_q * q_seq_length * head_dim
-        + k_cache.element_size() * num_heads_kv * kv_seq_length * head_dim
+        + k_cache.element_size()
+        * num_heads_kv
+        * kv_seq_length
+        * head_dim
+        * effective_attention_ratio
     )
     memory_pv = (
-        v_cache.element_size() * batch_size * num_heads_kv * kv_seq_length * head_dim
+        v_cache.element_size()
+        * batch_size
+        * num_heads_kv
+        * kv_seq_length
+        * head_dim
+        * effective_attention_ratio
         + q.element_size() * batch_size * num_heads_q * q_seq_length * head_dim
     )
     bandwidth = (memory_qk + memory_pv) * 1e-9 / (ms * 1e-3)
@@ -228,6 +280,9 @@ def benchmark(
             "head_dim": head_dim,
             "causal": causal,
             "local": local,
+            "window_size_left": window_size[0],
+            "window_size_right": window_size[1],
+            "effective_attention_ratio": effective_attention_ratio,
             "use_sinks": use_sinks,
             "page_size": page_size,
             "provider": provider,

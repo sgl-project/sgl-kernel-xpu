@@ -340,8 +340,8 @@ def fused_experts(
         hidden_states.shape[-1] == w1.shape[-1]
     ), f"hidden_states shape[-1] {hidden_states.shape} must be equal to w1 shape[-2] {w1.shape}"
     assert (2 * w2.shape[2] == w1.shape[1]) or (
-        w2.shape[2] == w1.shape[1]
-    ), f"w2 shape[2] {w2.shape[2]} must be half of or equal to w1 shape[1] {w1.shape[1]}"
+        (w2.shape[2] == w1.shape[1]) and (activation == "relu2")
+    ), f"w2 shape[2] {w2.shape[2]} must be half of w1 shape[1] {w1.shape[1]} except non-gate"
     assert (topk_ids.shape == topk_weights.shape) and (
         topk_ids.shape[0] == hidden_states.shape[0]
     ), f"topk_ids shape {topk_ids.shape} and topk_weights shape {topk_weights.shape} must be equal and match hidden_states shape[0] {hidden_states.shape[0]}"

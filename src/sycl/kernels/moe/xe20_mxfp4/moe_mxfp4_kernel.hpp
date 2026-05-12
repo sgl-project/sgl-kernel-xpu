@@ -118,30 +118,31 @@ class MoEGEMMMxfp4 {
     }
   }
 
-  // Per-expert scale pointers + row stride. Returns a struct that matches
-  // the split-B pattern: gate/up base pointers for the fused-act path, or
-  // a single pointer for the non-fused path. Row stride is the N-row fp32
-  // element stride (= K/GROUP_SIZE for block-split and non-fused,
-  // 2*K/GROUP_SIZE for GPT-OSS interleaved layout).
+  // Per-expert scale pointers + strides. Scale gmem layout is
+  // [E, K/GROUP_SIZE, N_full] (K-outer, N-contiguous).
+  //   k_stride: stride between consecutive k-tiles  = N_full (in fp32)
+  //   n_stride: stride between N positions          = 1 (block-split/non-fused)
+  //                                                 or 2 (SWIGLU interleaved)
+  // Fused-act + block-split: up scales start at offset N/2 along N.
+  // Fused-act + SWIGLU: gate/up are interleaved along N — both halves
+  // share the same k-stride and the up half is offset by 1 with n_stride=2.
   struct ScalePtrs {
     const float* ptr0;
     const float* ptr1;
-    int row_stride;
+    int k_stride;
+    int n_stride;
   };
 
   ScalePtrs make_scale_ptrs(const float* ptr_S, int N, int K) {
-    const int K_scale = K / MXFP4_GROUP_SIZE;
+    const int N_full = N;
     if constexpr (FuseAct) {
       if constexpr (ActType == SWIGLU_GPT_OSS) {
-        // Interleaved [g0, u0, g1, u1, ...] scales: gate rows at element
-        // offset 0, up rows at element offset K_scale; row stride = 2*K_scale.
-        return ScalePtrs{ptr_S, ptr_S + K_scale, 2 * K_scale};
+        return ScalePtrs{ptr_S, ptr_S + 1, N_full, 2};
       } else {
-        // Block-split: up rows start after (N/2) gate rows.
-        return ScalePtrs{ptr_S, ptr_S + (N / 2) * K_scale, K_scale};
+        return ScalePtrs{ptr_S, ptr_S + (N / 2), N_full, 1};
       }
     } else {
-      return ScalePtrs{ptr_S, nullptr, K_scale};
+      return ScalePtrs{ptr_S, nullptr, N_full, 1};
     }
   }
 
@@ -269,7 +270,8 @@ class MoEGEMMMxfp4 {
               get<1>(B_tensor),
               scale_ptrs.ptr0,
               scale_ptrs.ptr1,
-              scale_ptrs.row_stride,
+              scale_ptrs.k_stride,
+              scale_ptrs.n_stride,
               D_tensor,
               tile_coord,
               mma,
@@ -284,7 +286,8 @@ class MoEGEMMMxfp4 {
               A_tensor,
               get<0>(B_tensor),
               scale_ptrs.ptr0,
-              scale_ptrs.row_stride,
+              scale_ptrs.k_stride,
+              scale_ptrs.n_stride,
               D_tensor,
               tile_coord,
               mma,

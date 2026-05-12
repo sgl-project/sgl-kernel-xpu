@@ -68,22 +68,25 @@ static constexpr int SUBGROUP_SIZE = 16;
 // Collaborative scale load. Each WI in the SG reads SG_N / SUBGROUP_SIZE
 // fp32 elements from gmem, then the SG uses sycl::select_from_group to
 // broadcast each WI's local elements so every WI holds the full [SG_N]
-// scale array. Total gmem traffic per SG per k-tile: SG_N * 4 bytes vs.
-// 16*SG_N*4 with a naive "every WI reads all scales" approach.
+// scale array.
 //
-// scales_gmem_ptr points at this expert's scale tile
-// ([N, K/GROUP_SIZE] fp32, row-stride = K/GROUP_SIZE). k_scale_idx is the
-// K-group index for this k-tile (= k_tile since BLK_K == GROUP_SIZE).
+// Scale layout in gmem: [E, K/GROUP_SIZE, N_full] (K-outer, N-contiguous).
+// For a given k-tile the SG's N-slice is one contiguous fp32 run, so the
+// per-SG load is one coalesced cache line per k-tile.
+//
+// scales_gmem_ptr: base of this half's expert scales (already offset for
+//   block-split-up or SWIGLU-up).
+// k_stride: stride between consecutive k-tiles in fp32 elements (= N_full
+//   in the producer).
+// n_stride: stride between N positions (1 for non-fused / block-split,
+//   2 for SWIGLU_GPT_OSS interleaved [g0,u0,g1,u1,...]).
 // Per-WI N assignment matches the add_bias convention so apply_B_scales_mma
 // can index scales by the same N coord as the MMA-B fragment's N-loop.
-//
-// 2D-block-load doesn't fit a (BLK_N, 1) tile cleanly so we load with
-// plain pointer arithmetic; the latency is hidden under the A/B 2D-block
-// loads which are orders of magnitude bigger.
 template <int SG_N, int ATOM_N, int BLK_N>
 CUTLASS_DEVICE void load_scale_slice(
     const float* scales_gmem_ptr,
-    int row_stride,
+    int k_stride,
+    int n_stride,
     int wg_n,
     int k_scale_idx,
     int thr_id,
@@ -94,16 +97,13 @@ CUTLASS_DEVICE void load_scale_slice(
   const int sg_n_coord = (thr_id / SUBGROUP_SIZE) % ATOM_N;
   const int lane = thr_id % SUBGROUP_SIZE;
   const int n_base = wg_n * BLK_N + sg_n_coord * SG_N;
+  const int k_off = k_scale_idx * k_stride;
 
-  // Each WI loads its own N_per_wi fp32 elements from gmem (its assigned
-  // rows interleaved by lane: WI `lane` owns rows
-  // { lane*N_per_wi + k : k<N_per_wi }). Matches the add_bias per-WI N
-  // mapping convention.
   float wi_local[N_per_wi];
   CUTE_UNROLL
   for (int sn = 0; sn < N_per_wi; ++sn) {
     const int n = n_base + lane * N_per_wi + sn;
-    wi_local[sn] = scales_gmem_ptr[n * row_stride + k_scale_idx];
+    wi_local[sn] = scales_gmem_ptr[k_off + n * n_stride];
   }
 
   // Broadcast each lane's elements to all SG lanes, materializing the full
@@ -208,8 +208,9 @@ struct MoEMainloopMxfp4<
   CUTLASS_DEVICE void operator()(
       ATensor& A,                // (M,K)              bf16
       BPackedTensor& Bp,         // (N, K)             float_e2m1_t (4-bit)
-      const float* scales_gmem,  // fp32 scale buffer (rows span N via scale_row_stride)
-      int scale_row_stride,      // fp32 stride per scale N-row
+      const float* scales_gmem,  // fp32 scale buffer, layout [K/GROUP_SIZE, N] (K-outer)
+      int scale_k_stride,        // fp32 stride between k-tiles (= N_full in producer)
+      int scale_n_stride,        // fp32 stride between N positions (1 or 2)
       DTensor& D,                // (M,N)              bf16
       Coord blk_coord,
       TiledMMA mma,
@@ -313,7 +314,7 @@ struct MoEMainloopMxfp4<
       // Standard copy — copy-layout fragment as target (no retile_D).
       copy(tiled_copy_b, tBgBp(_, _, _, k_tile), tBrB_packed);
       load_scale_slice<SG_N, ATOM_N_V, BLK_N>(
-          scales_gmem, scale_row_stride, wg_n, /*k_scale_idx=*/k_tile, thr_id, scale_sg);
+          scales_gmem, scale_k_stride, scale_n_stride, wg_n, /*k_scale_idx=*/k_tile, thr_id, scale_sg);
 
       if (prefetch_k < k_tile_count) {
         prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
@@ -356,7 +357,8 @@ struct MoEMainloopMxfp4<
       BPackedTensor& Bp1,         // (N/2, K)  float_e2m1_t
       const float* scales0_gmem,  // fp32 gate scales
       const float* scales1_gmem,  // fp32 up scales
-      int scale_row_stride,       // fp32 stride per scale N-row (same for both halves)
+      int scale_k_stride,         // fp32 stride between k-tiles (= N_full)
+      int scale_n_stride,         // fp32 stride between N positions (1 or 2; same for both halves)
       DTensor& D,
       Coord blk_coord,
       TiledMMA mma,
@@ -468,7 +470,8 @@ struct MoEMainloopMxfp4<
 
       // GEMM0 (gate)
       copy(tiled_copy_b0, tBgBp0(_, _, _, k_tile), tBrB_packed0);
-      load_scale_slice<SG_N, ATOM_N_V, BLK_N>(scales0_gmem, scale_row_stride, wg_n, k_tile, thr_id, scale0_sg);
+      load_scale_slice<SG_N, ATOM_N_V, BLK_N>(
+          scales0_gmem, scale_k_stride, scale_n_stride, wg_n, k_tile, thr_id, scale0_sg);
       reorder(tArA, tSrA);
       reorder(tBrB_packed0, tSrB);
       apply_B_scales_mma<SG_N>(tSrB, tCrB_coord, scale0_sg, n_sg_base);
@@ -476,7 +479,8 @@ struct MoEMainloopMxfp4<
 
       // GEMM1 (up)
       copy(tiled_copy_b1, tBgBp1(_, _, _, k_tile), tBrB_packed1);
-      load_scale_slice<SG_N, ATOM_N_V, BLK_N>(scales1_gmem, scale_row_stride, wg_n1, k_tile, thr_id, scale1_sg);
+      load_scale_slice<SG_N, ATOM_N_V, BLK_N>(
+          scales1_gmem, scale_k_stride, scale_n_stride, wg_n1, k_tile, thr_id, scale1_sg);
       reorder(tBrB_packed1, tSrB);
       apply_B_scales_mma<SG_N>(tSrB, tCrB_coord, scale1_sg, n_sg_base);
       cute::gemm(mma, tSrA, tSrB, tCrC1);

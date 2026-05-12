@@ -46,13 +46,21 @@ ALL_RESULTS = []
 
 
 def _quantize_bf16_weights_mxfp4(w_bf16_cpu: torch.Tensor):
-    """[E, N, K] bf16 → ([E, N, K/2] int8 packed, [E, N, K/32] fp32 direct mul)."""
+    """[E, N, K] bf16 → ([E, N, K/2] int8 packed, [E, K/32, N] fp32 direct mul).
+
+    Scales are K-outer (N-contiguous) so each k-tile's SG read is one
+    coalesced cache line.
+    """
     E, N, K = w_bf16_cpu.shape
     flat = w_bf16_cpu.reshape(E * N, K).float().cpu()
     packed_u8, scales_u8 = quantize_mxfp4_2d(flat, MXFP4_BLOCK_SIZE)
     packed_i8 = packed_u8.view(torch.int8).reshape(E, N, K // 2)
-    scales_fp32 = torch.exp2((scales_u8.to(torch.int32) - 127).to(torch.float32))
-    scales_fp32 = scales_fp32.reshape(E, N, K // MXFP4_BLOCK_SIZE)
+    scales_fp32 = (
+        torch.exp2((scales_u8.to(torch.int32) - 127).to(torch.float32))
+        .reshape(E, N, K // MXFP4_BLOCK_SIZE)
+        .transpose(1, 2)
+        .contiguous()
+    )
     return packed_i8, scales_fp32
 
 

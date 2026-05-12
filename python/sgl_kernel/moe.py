@@ -75,30 +75,24 @@ def hc_split_sinkhorn(
 
     T = mixes.numel() // col_size
 
-    flat = mixes.contiguous().view(T, col_size)
-    hc_scale_c = hc_scale.to(device=mixes.device, dtype=torch.float32).contiguous()
-    hc_base_c = hc_base.to(device=mixes.device, dtype=torch.float32).contiguous()
+    flat = mixes.view(T, col_size)
+    hc_scale_c = hc_scale.to(device=mixes.device, dtype=torch.float32)
+    hc_base_c = hc_base.to(device=mixes.device, dtype=torch.float32)
 
     pre_flat = (
         torch.empty((T, hc_mult), device=mixes.device, dtype=torch.float32)
         if pre is None
-        else pre.to(device=mixes.device, dtype=torch.float32)
-        .contiguous()
-        .view(T, hc_mult)
+        else pre.to(device=mixes.device, dtype=torch.float32).view(T, hc_mult)
     )
     post_flat = (
         torch.empty((T, hc_mult), device=mixes.device, dtype=torch.float32)
         if post is None
-        else post.to(device=mixes.device, dtype=torch.float32)
-        .contiguous()
-        .view(T, hc_mult)
+        else post.to(device=mixes.device, dtype=torch.float32).view(T, hc_mult)
     )
     comb_flat = (
         torch.empty((T, hc_mult, hc_mult), device=mixes.device, dtype=torch.float32)
         if comb is None
-        else comb.to(device=mixes.device, dtype=torch.float32)
-        .contiguous()
-        .view(T, hc_mult, hc_mult)
+        else comb.to(device=mixes.device, dtype=torch.float32).view(T, hc_mult, hc_mult)
     )
 
     torch.ops.sgl_kernel.hc_split_sinkhorn.default(

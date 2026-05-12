@@ -11,6 +11,8 @@ static constexpr int WG_SIZE = 256;  // threads per WG; tokens_per_wg = WG_SIZE 
 static constexpr int HC = 4;
 static constexpr int SINKHORN_ITERS = 20;
 
+static constexpr float LOG2E = 1.442695040888963f;  // log2(e) for exp2 conversion
+
 struct HCSplitSinkhornKernel {
   static constexpr int HC2 = HC * HC;
   static constexpr int COL_SIZE = (2 + HC) * HC;
@@ -45,10 +47,12 @@ struct HCSplitSinkhornKernel {
     if (tid < 2 * HC) {
       if (row_i == 0) {
         const float pre_logit = row[col_j] * scale0 + hc_base[col_j];
-        pre[static_cast<int64_t>(token_id) * HC + col_j] = 1.0f / (1.0f + sycl::exp(-pre_logit)) + eps;
+        pre[static_cast<int64_t>(token_id) * HC + col_j] =
+            sycl::native::recip(1.0f + sycl::native::exp2(-pre_logit * LOG2E)) + eps;
       } else {
         const float post_logit = row[HC + col_j] * scale1 + hc_base[HC + col_j];
-        post[static_cast<int64_t>(token_id) * HC + col_j] = 2.0f / (1.0f + sycl::exp(-post_logit));
+        post[static_cast<int64_t>(token_id) * HC + col_j] =
+            2.0f * sycl::native::recip(1.0f + sycl::native::exp2(-post_logit * LOG2E));
       }
     }
 
@@ -59,19 +63,19 @@ struct HCSplitSinkhornKernel {
     for (int mask = 1; mask < HC; mask <<= 1)
       row_max = sycl::fmax(row_max, sycl::permute_group_by_xor(sg, row_max, mask));
 
-    float comb_val = sycl::exp(comb_logit - row_max);
+    float comb_val = sycl::native::exp2((comb_logit - row_max) * LOG2E);
     float row_sum = comb_val;
 #pragma unroll
     for (int mask = 1; mask < HC; mask <<= 1)
       row_sum += sycl::permute_group_by_xor(sg, row_sum, mask);
 
-    comb_val = comb_val / row_sum + eps;
+    comb_val = comb_val * sycl::native::recip(row_sum) + eps;
 
     float col_sum = comb_val;
 #pragma unroll
     for (int mask = HC; mask < HC2; mask <<= 1)
       col_sum += sycl::permute_group_by_xor(sg, col_sum, mask);
-    comb_val /= col_sum + eps;
+    comb_val = comb_val * sycl::native::recip(col_sum + eps);
 
 #pragma unroll
     for (int iter = 1; iter < SINKHORN_ITERS; ++iter) {
@@ -79,13 +83,13 @@ struct HCSplitSinkhornKernel {
 #pragma unroll
       for (int mask = 1; mask < HC; mask <<= 1)
         row_sum += sycl::permute_group_by_xor(sg, row_sum, mask);
-      comb_val /= row_sum + eps;
+      comb_val = comb_val * sycl::native::recip(row_sum + eps);
 
       col_sum = comb_val;
 #pragma unroll
       for (int mask = HC; mask < HC2; mask <<= 1)
         col_sum += sycl::permute_group_by_xor(sg, col_sum, mask);
-      comb_val /= col_sum + eps;
+      comb_val = comb_val * sycl::native::recip(col_sum + eps);
     }
 
     comb[static_cast<int64_t>(token_id) * HC2 + tid] = comb_val;

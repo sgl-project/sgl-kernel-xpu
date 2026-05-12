@@ -314,8 +314,8 @@ def dequantize_mxfp4_weights(
     Parameters:
     - packed:     [E, rows, packed_cols] int8 – two FP4 nibbles per byte,
                   where packed_cols = cols // 2.
-    - scales:     [E, rows, num_blocks]  float32 MX block scale (direct
-                  multiplier), where num_blocks = cols // block_size.
+    - scales:     [E, num_blocks, rows]  float32 MX block scale (direct
+                  multiplier), K-outer layout. num_blocks = cols // block_size.
     - dtype:      Output floating-point dtype (default: torch.bfloat16).
     - block_size: Number of FP4 elements sharing one scale factor (default: 32).
 
@@ -333,9 +333,9 @@ def dequantize_mxfp4_weights(
     ), f"cols ({cols}) must be divisible by block_size ({block_size})"
     assert scales.shape == (
         E,
-        rows,
         num_blocks,
-    ), f"scales shape {scales.shape} must be ({E}, {rows}, {num_blocks})"
+        rows,
+    ), f"scales shape {scales.shape} must be ({E}, {num_blocks}, {rows}) (K-outer)"
     assert (
         packed.device == scales.device
     ), f"packed and scales must be on the same device, got {packed.device} and {scales.device}"
@@ -346,8 +346,9 @@ def dequantize_mxfp4_weights(
     lut = _get_e2m1_lut(packed.device)
     out = torch.empty(E, rows, cols, dtype=torch.bfloat16, device=packed.device)
 
-    # Cast fp32 multiplier to bf16 once up-front; reused per chunk.
-    scale_mul = scales.to(torch.bfloat16)
+    # Cast fp32 → bf16 once, and transpose back to [E, rows, num_blocks]
+    # (contiguous) for the per-block mul_ broadcast below.
+    scale_mul = scales.to(torch.bfloat16).transpose(1, 2).contiguous()
 
     # View as uint8 so `>> 4` is a logical shift (arithmetic shift on signed
     # int8 would sign-extend the high nibble of bytes with MSB set).
@@ -423,10 +424,11 @@ def fused_experts(
     - use_fp8_w8a8 (bool): If True, use fp8 arithmetic to compute the inner
         products for w1 and w2. Defaults to False.
     - use_mxfp4_w4a16 (bool): If True, w1 and w2 are in MXFP4 packed format
-        (int8, two E2M1 nibbles per byte) with corresponding float32 block
-        scales (direct multiplier) supplied via w1_scale and w2_scale.
-        The weights are dequantized to BF16 before the grouped GeMM so the
-        rest of the computation is unchanged (W4A16: activations stay in BF16).
+        (int8, two E2M1 nibbles per byte, shape [E, N, K/2]) with
+        corresponding float32 block scales (direct multiplier) supplied via
+        w1_scale and w2_scale in [E, K/32, N] layout (K-outer). The weights
+        are dequantized to BF16 before the grouped GeMM so the rest of the
+        computation is unchanged (W4A16: activations stay in BF16).
         Defaults to False.
     - use_fused_mxfp4_kernel (bool): Only used when use_mxfp4_w4a16=True.
         When True, calls moe_grouped_mm_nt_xe20_mxfp4 directly with the

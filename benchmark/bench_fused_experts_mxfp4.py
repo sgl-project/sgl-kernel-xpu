@@ -83,10 +83,18 @@ def _prepare_inputs(num_tokens, num_experts, topk, hidden, intermediate):
         num_experts, hidden, intermediate
     )
 
-    # fused_experts now expects int8 packed weights (bitwise identical to
-    # uint8 packing) and fp32 direct-multiplier scales (decoded from UE8M0).
-    w1_scale_fp32 = torch.exp2((w1_scale_cpu.to(torch.int32) - 127).to(torch.float32))
-    w2_scale_fp32 = torch.exp2((w2_scale_cpu.to(torch.int32) - 127).to(torch.float32))
+    # fused_experts expects int8 packed weights and fp32 K-outer scales
+    # ([E, K/32, N]) for the kernel's coalesced scale load.
+    w1_scale_fp32 = (
+        torch.exp2((w1_scale_cpu.to(torch.int32) - 127).to(torch.float32))
+        .transpose(1, 2)
+        .contiguous()
+    )
+    w2_scale_fp32 = (
+        torch.exp2((w2_scale_cpu.to(torch.int32) - 127).to(torch.float32))
+        .transpose(1, 2)
+        .contiguous()
+    )
 
     score = torch.randn(num_tokens, num_experts, dtype=torch.bfloat16, device="xpu")
     score = torch.softmax(score.float(), dim=-1)

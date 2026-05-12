@@ -292,6 +292,11 @@ def test_moe_gemm_mxfp4_weights(
     activation,
     use_fused_kernel,
 ):
+    # The tile-fused kernel is built with a pruned template matrix
+    # (ActType=0 silu, WithBias=false) to keep Level Zero module pressure
+    # in budget under TP>1. See src/GroupGemmMxfp4Xe20.cmake.
+    if use_fused_kernel and (activation != "silu" or bias_dtype):
+        pytest.skip("fused MXFP4 kernel currently built silu + no-bias only")
     """Test fused_experts with MXFP4-packed expert weights (W4A16).
 
     Weights are quantized to MXFP4 on CPU and passed to fused_experts as packed
@@ -361,11 +366,19 @@ def test_moe_gemm_mxfp4_weights(
     a_xpu = a.clone().to(device)
     w1_packed_xpu = w1_packed.view(torch.int8).to(device)
     w2_packed_xpu = w2_packed.view(torch.int8).to(device)
-    w1_scale_xpu = torch.exp2((w1_scale.to(torch.int32) - 127).to(torch.float32)).to(
-        device
+    # Decode UE8M0 bytes to fp32 direct multipliers and transpose to K-outer
+    # [E, K/32, N] layout for the kernel's coalesced scale load.
+    w1_scale_xpu = (
+        torch.exp2((w1_scale.to(torch.int32) - 127).to(torch.float32))
+        .transpose(1, 2)
+        .contiguous()
+        .to(device)
     )
-    w2_scale_xpu = torch.exp2((w2_scale.to(torch.int32) - 127).to(torch.float32)).to(
-        device
+    w2_scale_xpu = (
+        torch.exp2((w2_scale.to(torch.int32) - 127).to(torch.float32))
+        .transpose(1, 2)
+        .contiguous()
+        .to(device)
     )
     topk_weight_xpu = topk_weight.clone().to(device)
     topk_ids_xpu = topk_ids.clone().to(device)
@@ -429,11 +442,15 @@ def _build_moe_gemm_inputs(
     w_packed_cpu, w_scale_cpu = _quantize_weights_mxfp4(w_bf16_cpu)
     w_dq_cpu = _dequantize_weights_mxfp4(w_packed_cpu, w_scale_cpu)
 
-    # Fused op contract: int8 packed weights, fp32 direct-multiplier scales.
+    # Fused op contract: int8 packed weights, fp32 direct-multiplier scales
+    # in K-outer [E, K/32, N] layout.
     w_dq_xpu = w_dq_cpu.to("xpu")
     w_packed_xpu = w_packed_cpu.view(torch.int8).to("xpu")
-    w_scale_xpu = torch.exp2((w_scale_cpu.to(torch.int32) - 127).to(torch.float32)).to(
-        "xpu"
+    w_scale_xpu = (
+        torch.exp2((w_scale_cpu.to(torch.int32) - 127).to(torch.float32))
+        .transpose(1, 2)
+        .contiguous()
+        .to("xpu")
     )
 
     bias = None
@@ -478,6 +495,10 @@ def test_moe_grouped_mm_nt_xe20_mxfp4_op(
     gemm_n = 2*intermediate_size (w1 style) — we pick one shape for simplicity
     For fuse_act=True the output has N/2 cols, so gemm_n must be even.
     """
+    # See src/GroupGemmMxfp4Xe20.cmake: the fused kernel is pruned to
+    # ActType=0 silu and WithBias=false to keep L0 module pressure sane.
+    if activation_type != 0 or with_bias:
+        pytest.skip("fused MXFP4 kernel currently built silu + no-bias only")
     gemm_k = hidden_size
     gemm_n = 2 * intermediate_size
     assert gemm_n % 2 == 0
@@ -580,10 +601,18 @@ def test_fused_experts_mxfp4_fused_kernel(
         a, w1_dq, w2_dq, topk_ids, topk_weight, topk, None, None, activations="silu"
     )
 
-    # fused_experts expects int8 packed weights and fp32 direct-multiplier scales.
+    # fused_experts expects int8 packed weights and fp32 K-outer scales.
     device = "xpu"
-    w1_scale_fp32 = torch.exp2((w1_scale.to(torch.int32) - 127).to(torch.float32))
-    w2_scale_fp32 = torch.exp2((w2_scale.to(torch.int32) - 127).to(torch.float32))
+    w1_scale_fp32 = (
+        torch.exp2((w1_scale.to(torch.int32) - 127).to(torch.float32))
+        .transpose(1, 2)
+        .contiguous()
+    )
+    w2_scale_fp32 = (
+        torch.exp2((w2_scale.to(torch.int32) - 127).to(torch.float32))
+        .transpose(1, 2)
+        .contiguous()
+    )
     sglang_output = fused_experts(
         a.to(device),
         w1_packed.view(torch.int8).to(device),

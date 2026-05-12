@@ -24,6 +24,8 @@ all_results = []
 
 
 # Triton kernel implementation
+# Reference: https://github.com/rahulvijayaraghavan/sglang/blob/295d77f1610b95336376e0c38ed4b062c2dfc6d6/python/sglang/srt/models/deepseek_v4.py
+# Commit: 295d77f1610b95336376e0c38ed4b062c2dfc6d6
 @triton.jit
 def _hc_split_sinkhorn_triton_kernel(
     mixes_ptr,  # [N, (2 + HC) * HC] float32

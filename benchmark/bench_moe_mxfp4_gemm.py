@@ -65,6 +65,8 @@ def _import_triton_symbols():
         sys.modules["flashinfer"] = fi
         sys.modules["flashinfer.comm"] = fi_comm
 
+    # The Triton MoE config picker reads a global ServerArgs. Install a stub.
+    from sglang.srt import server_args as _sa
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import _upcast_mxfp4_triton
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
         try_get_optimal_moe_config,
@@ -75,9 +77,6 @@ def _import_triton_symbols():
     from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import (
         moe_align_block_size,
     )
-
-    # The Triton MoE config picker reads a global ServerArgs. Install a stub.
-    from sglang.srt import server_args as _sa
 
     class _StubServerArgs:
         enable_deterministic_inference = False
@@ -423,7 +422,7 @@ if __name__ == "__main__":
     # Both dequant-then-GEMM providers materialize the bf16 weight tensor
     # transiently; mxfp4_fused never does. Report the savings once.
     if ("transient_bf16_MB", "bf16_dequant") in pv.columns:
-        pv["transient_bf16_saved_MB"] = pv[
-            ("transient_bf16_MB", "bf16_dequant")
-        ].round(2)
+        pv["transient_bf16_saved_MB"] = pv[("transient_bf16_MB", "bf16_dequant")].round(
+            2
+        )
     print(pv.to_markdown())

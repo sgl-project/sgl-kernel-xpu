@@ -76,13 +76,12 @@ def _import_triton_fused_experts_impl():
         sys.modules["flashinfer"] = fi
         sys.modules["flashinfer.comm"] = fi_comm
 
-    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-        fused_experts_impl as _impl,
-    )
-
     # The Triton MoE config picker consults a global ServerArgs. Install
     # a minimal stub (a real one would trigger HuggingFace model resolution).
     from sglang.srt import server_args as _sa
+    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+        fused_experts_impl as _impl,
+    )
 
     class _StubServerArgs:
         enable_deterministic_inference = False
@@ -434,6 +433,7 @@ if __name__ == "__main__":
                 pv[("ms", ref)] / pv[("ms", "mxfp4_fused")]
             ).round(2)
             pv[f"transient_saved_vs_{ref}_MB"] = (
-                pv[("peak_transient_MB", ref)] - pv[("peak_transient_MB", "mxfp4_fused")]
+                pv[("peak_transient_MB", ref)]
+                - pv[("peak_transient_MB", "mxfp4_fused")]
             ).round(2)
     print(pv.to_markdown())

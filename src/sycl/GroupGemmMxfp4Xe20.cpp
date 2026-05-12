@@ -62,36 +62,17 @@ using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
       float,                                                                                 \
       float);
 
-#define DECLARE_XE20_MOE_MXFP4_TILE_ALL_FUSES(Tile, SGLayout)    \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 0, true, true)   \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 0, true, false)  \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 0, false, true)  \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 0, false, false) \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 1, true, true)   \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 1, true, false)  \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 1, false, true)  \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 1, false, false) \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 2, true, true)   \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 2, true, false)  \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 2, false, true)  \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 2, false, false)
+// TEMPORARY L0-module-pressure workaround: declare only the instantiations
+// that GroupGemmMxfp4Xe20.cmake actually emits (ActType=0 silu, WithBias=false).
+// The dispatcher below enforces the same constraint at runtime. Keep the
+// two sides in sync.
+DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_8_64_32,    SG_1_4_1, 0, true,  false)
+DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_8_64_32,    SG_1_4_1, 0, false, false)
+DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_128_64_32,  SG_4_2_1, 0, true,  false)
+DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_128_128_32, SG_4_2_1, 0, false, false)
+DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_256_64_32,  SG_8_2_1, 0, true,  false)
+DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_256_256_32, SG_8_4_1, 0, false, false)
 
-#define DECLARE_XE20_MOE_MXFP4_TILE_FUSE(Tile, SGLayout, FuseAct)  \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 0, FuseAct, true)  \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 0, FuseAct, false) \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 1, FuseAct, true)  \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 1, FuseAct, false) \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 2, FuseAct, true)  \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, 2, FuseAct, false)
-
-DECLARE_XE20_MOE_MXFP4_TILE_ALL_FUSES(Tile_8_64_32, SG_1_4_1)
-DECLARE_XE20_MOE_MXFP4_TILE_FUSE(Tile_128_64_32, SG_4_2_1, true)
-DECLARE_XE20_MOE_MXFP4_TILE_FUSE(Tile_128_128_32, SG_4_2_1, false)
-DECLARE_XE20_MOE_MXFP4_TILE_FUSE(Tile_256_64_32, SG_8_2_1, true)
-DECLARE_XE20_MOE_MXFP4_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
-
-#undef DECLARE_XE20_MOE_MXFP4_TILE_FUSE
-#undef DECLARE_XE20_MOE_MXFP4_TILE_ALL_FUSES
 #undef DECLARE_XE20_MOE_MXFP4_EXTERN
 
 #define LAUNCH_MOE_MXFP4(...)                 \
@@ -110,43 +91,26 @@ DECLARE_XE20_MOE_MXFP4_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
       static_cast<float>(gemm1_alpha),        \
       static_cast<float>(gemm1_limit))
 
-#define DISPATCH_MOE_MXFP4_HELPER_BIAS(ActType, FuseAct, WithBias, ...) \
-  do {                                                                  \
-    if (WithBias) {                                                     \
-      LAUNCH_MOE_MXFP4(__VA_ARGS__, ActType, FuseAct, true);            \
-    } else {                                                            \
-      LAUNCH_MOE_MXFP4(__VA_ARGS__, ActType, FuseAct, false);           \
-    }                                                                   \
+// TEMPORARY: matching prune for the cmake-side instantiation matrix above.
+// Only ActType=0 (silu) and WithBias=false are instantiated, so the dispatch
+// hard-codes those values rather than template-branching on runtime inputs.
+// Callers that need the other combos will hit the TORCH_CHECK below and must
+// restore the full matrix before rebuilding.
+#define DISPATCH_MOE_MXFP4(ActType, FuseAct, WithBias, ...)                       \
+  do {                                                                            \
+    TORCH_CHECK(                                                                  \
+        (ActType) == 0,                                                           \
+        "mxfp4 fused kernel built with ActType=0 only (silu); got ActType=",      \
+        (ActType));                                                               \
+    TORCH_CHECK(                                                                  \
+        !(WithBias),                                                              \
+        "mxfp4 fused kernel built with WithBias=false only; bias path unsupported in this build"); \
+    if (FuseAct) {                                                                \
+      LAUNCH_MOE_MXFP4(__VA_ARGS__, 0, true, false);                              \
+    } else {                                                                      \
+      LAUNCH_MOE_MXFP4(__VA_ARGS__, 0, false, false);                             \
+    }                                                                             \
   } while (0)
-
-#define DISPATCH_MOE_MXFP4_HELPER_FUSE_ACT(ActType, FuseAct, WithBias, ...)  \
-  do {                                                                       \
-    if (FuseAct) {                                                           \
-      DISPATCH_MOE_MXFP4_HELPER_BIAS(ActType, true, WithBias, __VA_ARGS__);  \
-    } else {                                                                 \
-      DISPATCH_MOE_MXFP4_HELPER_BIAS(ActType, false, WithBias, __VA_ARGS__); \
-    }                                                                        \
-  } while (0)
-
-#define DISPATCH_MOE_MXFP4_HELPER_ACT_TYPE(ActType, FuseAct, WithBias, ...)    \
-  do {                                                                         \
-    switch (ActType) {                                                         \
-      case 0:                                                                  \
-        DISPATCH_MOE_MXFP4_HELPER_FUSE_ACT(0, FuseAct, WithBias, __VA_ARGS__); \
-        break;                                                                 \
-      case 1:                                                                  \
-        DISPATCH_MOE_MXFP4_HELPER_FUSE_ACT(1, FuseAct, WithBias, __VA_ARGS__); \
-        break;                                                                 \
-      case 2:                                                                  \
-        DISPATCH_MOE_MXFP4_HELPER_FUSE_ACT(2, FuseAct, WithBias, __VA_ARGS__); \
-        break;                                                                 \
-      default:                                                                 \
-        TORCH_CHECK(false, "Unsupported activation type");                     \
-    }                                                                          \
-  } while (0)
-
-#define DISPATCH_MOE_MXFP4(ActType, FuseAct, WithBias, ...) \
-  DISPATCH_MOE_MXFP4_HELPER_ACT_TYPE(ActType, FuseAct, WithBias, __VA_ARGS__)
 
 void moe_grouped_mm_nt_xe20_mxfp4(
     torch::Tensor& output,
@@ -172,10 +136,10 @@ void moe_grouped_mm_nt_xe20_mxfp4(
   TORCH_CHECK(packed_weights.scalar_type() == at::ScalarType::Char, "packed_weights must be int8");
 
   auto sc_shape = scales.sizes().vec();
-  TORCH_CHECK(sc_shape.size() == 3, "scales must be 3D [E, N, K/32]");
+  TORCH_CHECK(sc_shape.size() == 3, "scales must be 3D [E, K/32, N]");
   TORCH_CHECK(sc_shape[0] == n_experts, "scales first dim must equal n_experts");
-  TORCH_CHECK(sc_shape[1] == gemm_n, "scales second dim must equal N");
-  TORCH_CHECK(sc_shape[2] == gemm_k / MoE_MXFP4::MXFP4_GROUP_SIZE, "scales last dim must equal K/32");
+  TORCH_CHECK(sc_shape[1] == gemm_k / MoE_MXFP4::MXFP4_GROUP_SIZE, "scales second dim must equal K/32");
+  TORCH_CHECK(sc_shape[2] == gemm_n, "scales last dim must equal N");
   TORCH_CHECK(scales.scalar_type() == at::ScalarType::Float, "scales must be float32 (direct multiplier)");
 
   TORCH_CHECK(

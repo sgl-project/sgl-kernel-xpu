@@ -66,11 +66,11 @@ using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
 // that GroupGemmMxfp4Xe20.cmake actually emits (ActType=0 silu, WithBias=false).
 // The dispatcher below enforces the same constraint at runtime. Keep the
 // two sides in sync.
-DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_8_64_32,    SG_1_4_1, 0, true,  false)
-DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_8_64_32,    SG_1_4_1, 0, false, false)
-DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_128_64_32,  SG_4_2_1, 0, true,  false)
+DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_8_64_32, SG_1_4_1, 0, true, false)
+DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_8_64_32, SG_1_4_1, 0, false, false)
+DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_128_64_32, SG_4_2_1, 0, true, false)
 DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_128_128_32, SG_4_2_1, 0, false, false)
-DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_256_64_32,  SG_8_2_1, 0, true,  false)
+DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_256_64_32, SG_8_2_1, 0, true, false)
 DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_256_256_32, SG_8_4_1, 0, false, false)
 
 #undef DECLARE_XE20_MOE_MXFP4_EXTERN
@@ -96,20 +96,16 @@ DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_256_256_32, SG_8_4_1, 0, false, false)
 // hard-codes those values rather than template-branching on runtime inputs.
 // Callers that need the other combos will hit the TORCH_CHECK below and must
 // restore the full matrix before rebuilding.
-#define DISPATCH_MOE_MXFP4(ActType, FuseAct, WithBias, ...)                       \
-  do {                                                                            \
-    TORCH_CHECK(                                                                  \
-        (ActType) == 0,                                                           \
-        "mxfp4 fused kernel built with ActType=0 only (silu); got ActType=",      \
-        (ActType));                                                               \
-    TORCH_CHECK(                                                                  \
-        !(WithBias),                                                              \
-        "mxfp4 fused kernel built with WithBias=false only; bias path unsupported in this build"); \
-    if (FuseAct) {                                                                \
-      LAUNCH_MOE_MXFP4(__VA_ARGS__, 0, true, false);                              \
-    } else {                                                                      \
-      LAUNCH_MOE_MXFP4(__VA_ARGS__, 0, false, false);                             \
-    }                                                                             \
+#define DISPATCH_MOE_MXFP4(ActType, FuseAct, WithBias, ...)                                                      \
+  do {                                                                                                           \
+    TORCH_CHECK((ActType) == 0, "mxfp4 fused kernel built with ActType=0 only (silu); got ActType=", (ActType)); \
+    TORCH_CHECK(                                                                                                 \
+        !(WithBias), "mxfp4 fused kernel built with WithBias=false only; bias path unsupported in this build");  \
+    if (FuseAct) {                                                                                               \
+      LAUNCH_MOE_MXFP4(__VA_ARGS__, 0, true, false);                                                             \
+    } else {                                                                                                     \
+      LAUNCH_MOE_MXFP4(__VA_ARGS__, 0, false, false);                                                            \
+    }                                                                                                            \
   } while (0)
 
 void moe_grouped_mm_nt_xe20_mxfp4(

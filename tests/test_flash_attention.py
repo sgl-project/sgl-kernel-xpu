@@ -479,7 +479,7 @@ def generate_qkv(
 )
 @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("new_kv", [False])
-@pytest.mark.parametrize("prepopulated_kv_cache", [False, True])
+@pytest.mark.parametrize("prepopulated_kv_cache", [False])
 @pytest.mark.parametrize("causal,local", [(False, True), (False, False), (True, False)])
 @pytest.mark.parametrize("use_sinks", [True, False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
@@ -1071,6 +1071,55 @@ def test_flash_attn_kvcache(
                 assert (out - out_ref).abs().mean().item() <= mult_mean * (
                     out_pt - out_ref
                 ).abs().mean().item()
+
+
+@pytest.mark.skipif(
+    not is_fa3_supported(),
+    reason="flash_attn at sgl-kernel is only supported on sm90 and above",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
+@pytest.mark.parametrize("page_size", [None, 128])
+@pytest.mark.parametrize("varlen_q", [True, False])
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (64, 800),
+        (128, 512),
+    ],
+)
+def test_flash_attn_kvcache_prepopulated(
+    seqlen_q,
+    seqlen_k,
+    d,
+    varlen_q,
+    page_size,
+    causal,
+    local,
+    dtype,
+):
+    """Dedicated smaller test for prepopulated KV cache (cu_seqlens_k_new support)."""
+    test_flash_attn_kvcache(
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        d=d,
+        varlen_q=varlen_q,
+        has_batch_idx=False,
+        has_leftpad=False,
+        page_size=page_size,
+        rotary_fraction=0.0,
+        rotary_interleaved=False,
+        has_rotary_seqlens=False,
+        seqlen_new_eq_seqlen_q=True,
+        causal=causal,
+        local=local,
+        use_sinks=False,
+        new_kv=False,
+        prepopulated_kv_cache=True,
+        mha_type="mha",
+        dtype=dtype,
+    )
 
 
 @pytest.mark.skipif(

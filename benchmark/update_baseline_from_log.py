@@ -74,7 +74,7 @@ def parse_flash_attn_log(log_text: str) -> dict:
             continue
 
         if col_index is None:
-            continue
+            raise ValueError("Header row not found in flash_attn log table")
 
         batch = cols[col_index["batch"]]
         q_seq_length = cols[col_index["q_seq_length"]]

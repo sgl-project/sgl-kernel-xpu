@@ -151,6 +151,9 @@ def sglang_hc_split_sinkhorn(
 def benchmark(batch_size, seq_len, sinkhorn_iters, provider):
     device = torch.device("xpu")
 
+    torch.manual_seed(42)
+    torch.xpu.manual_seed_all(42)
+
     mixes = torch.randn(
         batch_size, seq_len, col_size, dtype=torch.float32, device=device
     )

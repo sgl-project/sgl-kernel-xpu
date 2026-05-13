@@ -386,19 +386,11 @@ def test_moe_gemm_mxfp4_weights(
     a_xpu = a.clone().to(device)
     w1_packed_xpu = w1_packed.view(torch.int8).to(device)
     w2_packed_xpu = w2_packed.view(torch.int8).to(device)
-    # Decode UE8M0 bytes to fp32 direct multipliers and transpose to K-outer
-    # [E, K/32, N] layout for the kernel's coalesced scale load.
-    w1_scale_xpu = (
-        torch.exp2((w1_scale.to(torch.int32) - 127).to(torch.float32))
-        .transpose(1, 2)
-        .contiguous()
-        .to(device)
+    w1_scale_xpu = torch.exp2((w1_scale.to(torch.int32) - 127).to(torch.float32)).to(
+        device
     )
-    w2_scale_xpu = (
-        torch.exp2((w2_scale.to(torch.int32) - 127).to(torch.float32))
-        .transpose(1, 2)
-        .contiguous()
-        .to(device)
+    w2_scale_xpu = torch.exp2((w2_scale.to(torch.int32) - 127).to(torch.float32)).to(
+        device
     )
     topk_weight_xpu = topk_weight.clone().to(device)
     topk_ids_xpu = topk_ids.clone().to(device)
@@ -462,15 +454,11 @@ def _build_moe_gemm_inputs(
     w_packed_cpu, w_scale_cpu = _quantize_weights_mxfp4(w_bf16_cpu)
     w_dq_cpu = _dequantize_weights_mxfp4(w_packed_cpu, w_scale_cpu)
 
-    # Fused op contract: int8 packed weights, fp32 direct-multiplier scales
-    # in K-outer [E, K/32, N] layout.
+    # Fused op contract: int8 packed weights, fp32 direct-multiplier scales.
     w_dq_xpu = w_dq_cpu.to("xpu")
     w_packed_xpu = w_packed_cpu.view(torch.int8).to("xpu")
-    w_scale_xpu = (
-        torch.exp2((w_scale_cpu.to(torch.int32) - 127).to(torch.float32))
-        .transpose(1, 2)
-        .contiguous()
-        .to("xpu")
+    w_scale_xpu = torch.exp2((w_scale_cpu.to(torch.int32) - 127).to(torch.float32)).to(
+        "xpu"
     )
 
     bias = None
@@ -621,18 +609,10 @@ def test_fused_experts_mxfp4_fused_kernel(
         a, w1_dq, w2_dq, topk_ids, topk_weight, topk, None, None, activations="silu"
     )
 
-    # fused_experts expects int8 packed weights and fp32 K-outer scales.
+    # fused_experts expects int8 packed weights and fp32 direct-multiplier scales.
     device = "xpu"
-    w1_scale_fp32 = (
-        torch.exp2((w1_scale.to(torch.int32) - 127).to(torch.float32))
-        .transpose(1, 2)
-        .contiguous()
-    )
-    w2_scale_fp32 = (
-        torch.exp2((w2_scale.to(torch.int32) - 127).to(torch.float32))
-        .transpose(1, 2)
-        .contiguous()
-    )
+    w1_scale_fp32 = torch.exp2((w1_scale.to(torch.int32) - 127).to(torch.float32))
+    w2_scale_fp32 = torch.exp2((w2_scale.to(torch.int32) - 127).to(torch.float32))
     sglang_output = fused_experts(
         a.to(device),
         w1_packed.view(torch.int8).to(device),

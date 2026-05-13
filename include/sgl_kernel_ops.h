@@ -322,10 +322,8 @@ void moe_grouped_mm_nt_xe20(
     double gemm1_limit = 7.0);
 
 // Tile-fused MXFP4-B × BF16-A MoE grouped GEMM. `packed_weights` is int8
-// [E, N, K/2] with two E2M1 nibbles per byte (low nibble = smaller-K
-// element). `scales` is float32 direct-multiplier, laid out
-// [E, K/32, N] (K-outer, N-contiguous) so each k-tile's SG scale read
-// lands in a single cache line.
+// with two E2M1 nibbles per byte (low nibble = smaller-K element).
+// `scales` is float32 direct-multiplier, one per 32-element K-block.
 void moe_grouped_mm_nt_xe20_mxfp4(
     torch::Tensor& output,
     const torch::Tensor& activations,

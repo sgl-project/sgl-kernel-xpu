@@ -124,21 +124,14 @@ ALL_RESULTS = []
 
 
 def _quantize_bf16_weights_mxfp4(w_bf16_cpu: torch.Tensor):
-    """[E, N, K] bf16 → ([E, N, K/2] int8 packed, [E, K/32, N] fp32 direct mul).
-
-    Scales are K-outer (N-contiguous) so each k-tile's SG read is one
-    coalesced cache line.
-    """
+    """[E, N, K] bf16 → ([E, N, K/2] int8 packed, [E, N, K/32] fp32 direct mul)."""
     E, N, K = w_bf16_cpu.shape
     flat = w_bf16_cpu.reshape(E * N, K).float().cpu()
     packed_u8, scales_u8 = quantize_mxfp4_2d(flat, MXFP4_BLOCK_SIZE)
     packed_i8 = packed_u8.view(torch.int8).reshape(E, N, K // 2)
-    scales_fp32 = (
-        torch.exp2((scales_u8.to(torch.int32) - 127).to(torch.float32))
-        .reshape(E, N, K // MXFP4_BLOCK_SIZE)
-        .transpose(1, 2)
-        .contiguous()
-    )
+    scales_fp32 = torch.exp2(
+        (scales_u8.to(torch.int32) - 127).to(torch.float32)
+    ).reshape(E, N, K // MXFP4_BLOCK_SIZE)
     return packed_i8, scales_fp32
 
 
@@ -166,8 +159,6 @@ def _prepare_inputs(avg_m: int, gemm_n: int, gemm_k: int):
 
     packed_xpu = packed_cpu.to("xpu")
     scales_xpu = scales_cpu.to("xpu")
-    # Triton dequant kernel reads scales in N-contiguous [E, N, K/32] layout.
-    scales_xpu_nc = scales_xpu.transpose(1, 2).contiguous()
 
     output = torch.empty((total_m, gemm_n), dtype=torch.bfloat16, device="xpu")
 
@@ -183,7 +174,6 @@ def _prepare_inputs(avg_m: int, gemm_n: int, gemm_k: int):
         "total_rows": total_rows,
         "packed_xpu": packed_xpu,
         "scales_xpu": scales_xpu,
-        "scales_xpu_nc": scales_xpu_nc,
         "output": output,
         "total_m": total_m,
         "topk_ids": topk_ids,
@@ -222,7 +212,7 @@ def _run_triton_full(inputs):
     # which matches moe_grouped_mm_nt_xe20's semantics (topk=1, no combine).
     w_bf16 = _upcast_mxfp4_triton(
         inputs["packed_xpu"].view(torch.uint8),
-        inputs["scales_xpu_nc"],
+        inputs["scales_xpu"],
         torch.bfloat16,
     )
 

@@ -143,18 +143,13 @@ def _prepare_inputs(num_tokens, num_experts, topk, hidden, intermediate):
         num_experts, hidden, intermediate
     )
 
-    # sgl_kernel expects int8 packed weights and fp32 K-outer scales
-    # ([E, K/32, N]) for the kernel's coalesced scale load. The Triton
-    # reference's dequant kernel reads scales in the N-contiguous layout
-    # ([E, N, K/32]), so we materialize that view too.
-    w1_scale_fp32_nc = torch.exp2(
+    # Both sgl_kernel and the Triton reference accept N-outer scales [E, N, K/32].
+    w1_scale_fp32 = torch.exp2(
         (w1_scale_cpu.to(torch.int32) - 127).to(torch.float32)
     ).contiguous()
-    w2_scale_fp32_nc = torch.exp2(
+    w2_scale_fp32 = torch.exp2(
         (w2_scale_cpu.to(torch.int32) - 127).to(torch.float32)
     ).contiguous()
-    w1_scale_fp32_ko = w1_scale_fp32_nc.transpose(1, 2).contiguous()
-    w2_scale_fp32_ko = w2_scale_fp32_nc.transpose(1, 2).contiguous()
 
     score = torch.randn(num_tokens, num_experts, dtype=torch.bfloat16, device="xpu")
     score = torch.softmax(score.float(), dim=-1)
@@ -167,10 +162,8 @@ def _prepare_inputs(num_tokens, num_experts, topk, hidden, intermediate):
         "a": a,
         "w1_packed": w1_packed_cpu.view(torch.int8).to("xpu"),
         "w2_packed": w2_packed_cpu.view(torch.int8).to("xpu"),
-        "w1_scale": w1_scale_fp32_ko.to("xpu"),
-        "w2_scale": w2_scale_fp32_ko.to("xpu"),
-        "w1_scale_nc": w1_scale_fp32_nc.to("xpu"),
-        "w2_scale_nc": w2_scale_fp32_nc.to("xpu"),
+        "w1_scale": w1_scale_fp32.to("xpu"),
+        "w2_scale": w2_scale_fp32.to("xpu"),
         "topk_weight": topk_weight,
         "topk_ids": topk_ids,
         "topk_ids_i32": topk_ids_i32,
@@ -231,8 +224,8 @@ def _run_triton_full(inputs):
         use_int8_w8a16=False,
         use_int4_w4a16=False,
         per_channel_quant=False,
-        w1_scale=inputs["w1_scale_nc"],
-        w2_scale=inputs["w2_scale_nc"],
+        w1_scale=inputs["w1_scale"],
+        w2_scale=inputs["w2_scale"],
     )
 
 

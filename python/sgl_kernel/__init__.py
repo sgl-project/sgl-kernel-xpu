@@ -49,12 +49,12 @@ from sgl_kernel.gemm import (
     sgl_per_token_quant_fp8,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
+from sgl_kernel.mhc import hc_split_sinkhorn
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     cutlass_fp4_group_mm,
     fp8_blockwise_scaled_grouped_mm,
     fused_experts,
-    hc_split_sinkhorn,
     moe_align_block_size,
     moe_fused_gate,
     moe_sum,

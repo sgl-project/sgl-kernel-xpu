@@ -386,6 +386,17 @@ void scaled_fp4_experts_quant(
     torch::Tensor const& input_offset_by_experts,
     torch::Tensor const& output_scale_offset_by_experts);
 
+void hc_split_sinkhorn(
+    const at::Tensor& mixes,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    at::Tensor& pre,
+    at::Tensor& post,
+    at::Tensor& comb,
+    int64_t hc_mult,
+    int64_t sinkhorn_iters,
+    double eps);
+
 /*
  * From csrc/speculative
  */

@@ -503,6 +503,17 @@ struct XeMlaSparseMainloop<
     // Total GEMM1 iterations = NUM_FULL_SLICES + 1 = 4
     static constexpr int GEMM1_ITERS = NUM_FULL_SLICES + 1;
 
+    /* Prefetch Q for all heads upfront — 2D block prefetch into L1 */
+    CUTLASS_PRAGMA_UNROLL
+    for (int h = 0; h < HEADS_PER_WG; h++) {
+      auto prefetch_q_h = make_block_2d_prefetch(TiledCopyQ{Q_2D[h]});
+      auto pQgQ_h = prefetch_q_h.get_slice(thr_id).partition_S(gQnope);
+      CUTLASS_PRAGMA_UNROLL
+      for (int d = 0; d < GEMM1_ITERS; d++) {
+        prefetch(prefetch_q_h, pQgQ_h(_, _, _, d));
+      }
+    }
+
     CUTLASS_PRAGMA_UNROLL
     for (int iter = 0; iter < GEMM1_ITERS; iter++) {
       // Gather 128-wide K slice to SLM
@@ -589,17 +600,12 @@ struct XeMlaSparseMainloop<
       }
       sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_work_group<3>());
 
-      // Load K from SLM to registers — ONCE
+      // Load K from SLM to registers
       copy(s2r_k, tKsK, tKrK_mma);
 
       // DPAS for each head
-      // Q is also 128-wide: for full slices, Q_nope[iter*128:(iter+1)*128]
-      // For combined slice: Q_nope[384:448] || Q_pe[0:64] — needs combined Q tensor
       CUTLASS_PRAGMA_UNROLL
       for (int h = 0; h < HEADS_PER_WG; h++) {
-        // Q is laid out as [seq_len_qo=1, D_q, ...] with D_q = 448 for nope, 64 for pe
-        // With D_SLICE=128, gQnope partitions into ceil(448/128)=4 tiles (last is partial)
-        // The TiledCopyQ handles the 128-wide load from the right offset
         if (iter < NUM_FULL_SLICES) {
           TiledCopyQ copy_q_h{Q_2D[h]};
           auto thr_copy_h = copy_q_h.get_slice(thr_id);
@@ -610,10 +616,6 @@ struct XeMlaSparseMainloop<
           reorder(tQrQ_h, tSrQ_h);
           cute::gemm(mma_qk, tSrQ_h, tSrK, tSrS[h]);
         } else {
-          // Combined: Q_nope[384:448] || Q_pe[0:64] loaded as one 128-wide vector
-          // Use gQnope's last tile (iter=3) which covers [384:512] but Q_nope only has 448 dims
-          // The CuTe tile will read from the combined Q layout automatically
-          // since Q_nope and Q_pe are adjacent in memory (Q_pe = Q + 448)
           TiledCopyQ copy_q_h{Q_2D[h]};
           auto thr_copy_h = copy_q_h.get_slice(thr_id);
           auto tQgQ_h = thr_copy_h.partition_S(gQnope);
@@ -624,8 +626,6 @@ struct XeMlaSparseMainloop<
           cute::gemm(mma_qk, tSrQ_h, tSrK, tSrS[h]);
         }
       }
-
-      sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_work_group<3>());
     }
 
     /* ================================================================
@@ -741,7 +741,7 @@ struct XeMlaSparseMainloop<
       }
       sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_work_group<3>());
 
-      // Load V from SLM to registers — ONCE
+      // Load V from SLM to registers
       copy(s2r_v, tVsV, tVrV_mma);
 
       // DPAS for each head
@@ -749,8 +749,6 @@ struct XeMlaSparseMainloop<
       for (int h = 0; h < HEADS_PER_WG; h++) {
         cute::gemm(mma_pv, tArP[h], tArV, tArA[h](_, _, _, vv));
       }
-
-      sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_work_group<3>());
     }
   }
 

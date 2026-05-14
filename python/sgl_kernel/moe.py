@@ -429,7 +429,7 @@ def fused_experts(
         rest of the computation is unchanged (W4A16: activations stay in BF16).
         Defaults to False.
     - use_fused_mxfp4_kernel (bool): Only used when use_mxfp4_w4a16=True.
-        When True, calls moe_grouped_mm_nt_xe20_mxfp4 directly with the
+        When True, calls moe_grouped_mm_nt_xe20_mxfp4_w4a16 directly with the
         packed weights and fp32 scales — the GEMM dequantizes B
         per-tile in registers, skipping the intermediate BF16 weight
         tensor. When False, pre-dequantizes with
@@ -628,7 +628,7 @@ def fused_experts(
         # GEMM1: B = w1 (gate+up). Fused path skips the Python dequant;
         # unfused path dequantizes, calls bf16 GEMM, frees immediately.
         if use_mxfp4_w4a16 and use_fused_mxfp4_kernel:
-            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4(
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4_w4a16(
                 intermediate_cache1,
                 input_A_shuffle,
                 w1,
@@ -672,7 +672,7 @@ def fused_experts(
             intermediate_cache2 = torch.square(torch.relu(intermediate_cache1))
         # GEMM2: B = w2 (down).
         if use_mxfp4_w4a16 and use_fused_mxfp4_kernel:
-            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4(
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4_w4a16(
                 intermediate_cache3,
                 intermediate_cache2,
                 w2,
@@ -708,7 +708,7 @@ def fused_experts(
         )
         # GEMM1 (fused act): B = w1 (gate+up).
         if use_mxfp4_w4a16 and use_fused_mxfp4_kernel:
-            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4(
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4_w4a16(
                 intermediate_cache1,
                 input_A_shuffle,
                 w1,
@@ -740,7 +740,7 @@ def fused_experts(
                 del w1
         # GEMM2: B = w2 (down). Always fuse_act=False on the second GEMM.
         if use_mxfp4_w4a16 and use_fused_mxfp4_kernel:
-            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4(
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4_w4a16(
                 intermediate_cache3,
                 intermediate_cache1,
                 w2,

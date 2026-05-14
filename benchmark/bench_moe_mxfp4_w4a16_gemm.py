@@ -6,7 +6,7 @@
 #   triton_full     sglang Triton path: _upcast_mxfp4_triton for dequant
 #                   followed by the Triton fused_moe_kernel for the GEMM.
 #                   Same code paths the sglang Triton runtime uses.
-#   mxfp4_fused     moe_grouped_mm_nt_xe20_mxfp4 directly on packed
+#   mxfp4_fused     moe_grouped_mm_nt_xe20_mxfp4_w4a16 directly on packed
 #                   weights + fp32 scales — tile-level dequant, no bf16
 #                   weight ever materialized.
 #
@@ -257,7 +257,7 @@ def _run_triton_full(inputs):
 
 
 def _run_mxfp4_fused(inputs):
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4(
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4_w4a16(
         inputs["output"],
         inputs["activations"],
         inputs["packed_xpu"],

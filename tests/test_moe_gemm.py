@@ -314,7 +314,7 @@ def test_moe_gemm_mxfp4_weights(
 ):
     # The tile-fused kernel is built with a pruned template matrix
     # (ActType=0 silu, WithBias=false) to keep Level Zero module pressure
-    # in budget under TP>1. See src/GroupGemmMxfp4Xe20.cmake.
+    # in budget under TP>1. See src/GroupGemmMxfp4W4A16Xe20.cmake.
     if use_fused_kernel and (activation != "silu" or bias_dtype):
         pytest.skip("fused MXFP4 kernel currently built silu + no-bias only")
     """Test fused_experts with MXFP4-packed expert weights (W4A16).
@@ -330,7 +330,7 @@ def test_moe_gemm_mxfp4_weights(
 
     Parametrised over use_fused_mxfp4_kernel so both the legacy path
     (Python dequant + bf16 GEMM) and the tile-fused path
-    (moe_grouped_mm_nt_xe20_mxfp4) are covered at every shape.
+    (moe_grouped_mm_nt_xe20_mxfp4_w4a16) are covered at every shape.
     """
     act_type = activation
     torch.manual_seed(0)
@@ -418,7 +418,7 @@ def test_moe_gemm_mxfp4_weights(
 
 
 # ---------------------------------------------------------------------------
-# Op-level test: moe_grouped_mm_nt_xe20_mxfp4 vs. moe_grouped_mm_nt_xe20(dequant)
+# Op-level test: moe_grouped_mm_nt_xe20_mxfp4_w4a16 vs. moe_grouped_mm_nt_xe20(dequant)
 # ---------------------------------------------------------------------------
 #
 # Exercises the tile-fused MXFP4 grouped GEMM op directly (no fused_experts
@@ -488,7 +488,7 @@ def _build_moe_gemm_inputs(
 @pytest.mark.parametrize("activation_type", [0, 1, 2])  # silu, gelu, swiglu_gpt_oss
 @pytest.mark.parametrize("fuse_act", [False, True])
 @pytest.mark.parametrize("with_bias", [False, True])
-def test_moe_grouped_mm_nt_xe20_mxfp4_op(
+def test_moe_grouped_mm_nt_xe20_mxfp4_w4a16_op(
     num_tokens_per_expert,
     num_experts,
     hidden_size,
@@ -503,7 +503,7 @@ def test_moe_grouped_mm_nt_xe20_mxfp4_op(
     gemm_n = 2*intermediate_size (w1 style) — we pick one shape for simplicity
     For fuse_act=True the output has N/2 cols, so gemm_n must be even.
     """
-    # See src/GroupGemmMxfp4Xe20.cmake: the fused kernel is pruned to
+    # See src/GroupGemmMxfp4W4A16Xe20.cmake: the fused kernel is pruned to
     # ActType=0 silu and WithBias=false to keep L0 module pressure sane.
     if activation_type != 0 or with_bias:
         pytest.skip("fused MXFP4 kernel currently built silu + no-bias only")
@@ -536,7 +536,7 @@ def test_moe_grouped_mm_nt_xe20_mxfp4_op(
     )
 
     # Fused MXFP4 path.
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4(
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4_w4a16(
         inputs["output_mxfp4"],
         inputs["activations"],
         inputs["w_packed"],
@@ -560,7 +560,7 @@ def test_moe_grouped_mm_nt_xe20_mxfp4_op(
 # ---------------------------------------------------------------------------
 # Same reference pipeline as test_moe_gemm_mxfp4_weights (torch_naive_moe on
 # dequantised weights); the sglang side routes through
-# moe_grouped_mm_nt_xe20_mxfp4 and skips the intermediate bf16 weight.
+# moe_grouped_mm_nt_xe20_mxfp4_w4a16 and skips the intermediate bf16 weight.
 
 
 @pytest.mark.parametrize(

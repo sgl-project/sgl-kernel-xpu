@@ -9,7 +9,7 @@
 #include "sycl/Utils.h"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
-#include "sycl/kernels/moe/xe20_mxfp4/moe_mxfp4_kernel.hpp"
+#include "sycl/kernels/moe/xe20_mxfp4_w4a16/moe_mxfp4_w4a16_kernel.hpp"
 
 using namespace cute;
 
@@ -17,7 +17,7 @@ template <typename, typename, typename, typename, typename, typename, int, bool,
 class GemmXe20Mxfp4Name;
 
 template <typename Tile, typename SGLayout, int ActType, bool FuseAct, bool WithBias>
-void Xe20MoEGEMMMxfp4Launcher(
+void Xe20MoEGEMMMxfp4W4A16W4A16Launcher(
     sycl::queue q,
     const void* activations,
     const void* packed_weights,
@@ -81,7 +81,7 @@ void Xe20MoEGEMMMxfp4Launcher(
 
   syclex::properties kernel_props{syclex::sub_group_size<16>, intelex::grf_size<256>};
 
-  using Kernel = MoE_MXFP4::MoEGEMMMxfp4<
+  using Kernel = MoE_MXFP4_W4A16::MoEGEMMMxfp4W4A16<
       Tile,
       SGLayout,
       TensorA,
@@ -129,7 +129,7 @@ void Xe20MoEGEMMMxfp4Launcher(
   });
 }
 
-template void Xe20MoEGEMMMxfp4Launcher<@TILE@, @SGLAYOUT@, @ACT_TYPE@, @FUSE_ACT@, @WITH_BIAS@>(
+template void Xe20MoEGEMMMxfp4W4A16W4A16Launcher<@TILE@, @SGLAYOUT@, @ACT_TYPE@, @FUSE_ACT@, @WITH_BIAS@>(
     sycl::queue,
     const void*,
     const void*,

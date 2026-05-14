@@ -74,7 +74,7 @@ void Xe20MoEGEMMLauncher(
   syclex::properties kernel_props{syclex::sub_group_size<16>, intelex::grf_size<256>};
 
   using Kernel =
-      MoE::MoEGEMM<Tile, SGLayout, TensorA, TensorB, TensorD, TensorBias, MMA, ActType, FuseAct, WithBias, Element>;
+      MoE::MoEGEMM<Tile, SGLayout, TensorA, TensorB, TensorD, TensorBias, MMA, static_cast<MoE::ActivationType>(ActType), FuseAct, WithBias, Element>;
   typename Kernel::Params params{
       static_cast<const Element*>(activations),
       static_cast<const Element*>(weights),

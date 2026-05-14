@@ -12,6 +12,7 @@
 #include "kernels/moe/xe20/moe_kernel.hpp"
 
 using namespace cute;
+using namespace MoE;
 
 using ElementAccumulator = float;  // <- data type of accumulator
 
@@ -195,6 +196,12 @@ void moe_grouped_mm_nt_xe20(
     TORCH_CHECK(bias->dim() == 2, "bias must be 2D [n_experts, N]");
     TORCH_CHECK(bias->size(0) == n_experts && bias->size(1) == gemm_n, "bias shape mismatch with weight");
   }
+  TORCH_CHECK(
+    activation_type >= static_cast<int>(ActivationType::MIN) && activation_type <= static_cast<int>(ActivationType::MAX),
+    "Unsupported activation_type: ",
+    activation_type,
+    ". Supported values are 0 (silu), 1 (gelu), 2 (swiglu_gpt_oss), 3 (relu2)");
+
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();

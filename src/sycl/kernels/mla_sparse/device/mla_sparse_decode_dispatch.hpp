@@ -42,7 +42,7 @@
 namespace mla_sparse_decode {
 
 // Each function is defined in a separate generated .cpp file from
-// sparse_mla_decode_kernel.cpp.in, compiled as its own library.
+// mla_sparse_decode_kernel.cpp.in, compiled as its own library.
 //
 // Naming: launch_mla_sparse_decode_<ELEM_TAG>_<PAGE_SIZE>
 // Parameters:

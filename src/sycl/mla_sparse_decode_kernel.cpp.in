@@ -2,11 +2,11 @@
  * Copyright (C) 2026 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  **************************************************************************************************/
-// Auto-generated from sparse_mla_decode_kernel.cpp.in
+// Auto-generated from mla_sparse_decode_kernel.cpp.in
 // Template parameters: ELEM_TAG=@ELEM_TAG@, PAGE_SIZE=@PAGE_SIZE@
 #define SYCL_INTEL_TARGET 20
 
-#include "sycl/kernels/sparse_mla/device/sparse_mla_decode_types.hpp"
+#include "sycl/kernels/mla_sparse/device/mla_sparse_decode_types.hpp"
 
 namespace mla_sparse_decode {
 

@@ -7,7 +7,7 @@ set(MLA_SPARSE_DECODE_ELEM_SYCL_TYPES "sycl::half" "sycl::ext::oneapi::bfloat16"
 set(MLA_SPARSE_DECODE_PAGE_SIZES 128 256)
 
 set(MLA_SPARSE_DECODE_TEMPLATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/sparse_mla_decode_kernel.cpp.in")
+    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/mla_sparse_decode_kernel.cpp.in")
 
 list(LENGTH MLA_SPARSE_DECODE_ELEM_TAGS _num_elems)
 math(EXPR _num_elems "${_num_elems} - 1")

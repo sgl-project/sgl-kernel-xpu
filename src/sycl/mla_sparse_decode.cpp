@@ -14,8 +14,8 @@
 #include <sycl/sycl.hpp>
 
 #include "Utils.h"
-#include "sycl/kernels/sparse_mla/device/sparse_mla_decode_dispatch.hpp"
-#include "sycl/kernels/sparse_mla/device/sparse_mla_decode_types.hpp"
+#include "sycl/kernels/mla_sparse/device/mla_sparse_decode_dispatch.hpp"
+#include "sycl/kernels/mla_sparse/device/mla_sparse_decode_types.hpp"
 
 namespace {
 

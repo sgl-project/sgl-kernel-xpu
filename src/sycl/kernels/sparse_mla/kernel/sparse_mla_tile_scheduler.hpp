@@ -69,12 +69,15 @@ struct XeMlaSparseIndividualTileScheduler {
 
     // Ensure num_heads_q is at least 1 to avoid division by zero
     int num_heads = shape.num_heads_q > 0 ? shape.num_heads_q : 1;
+    // Multi-head fusion: grid uses head_groups instead of individual heads
+    int heads_per_wg = shape.heads_per_wg > 0 ? shape.heads_per_wg : 1;
+    int num_head_groups = (num_heads + heads_per_wg - 1) / heads_per_wg;
 
     dim3 grid(
         size(ceil_div(shape.head_size_o, get<1>(tile_shape))),  // V tiles
         size(ceil_div(shape.seq_len_qo, get<0>(tile_shape))),   // Q tiles
-        size(shape.batch * num_heads));                         // (h,b) combined
-    return Params{grid, FastDivmod{num_heads}};
+        size(shape.batch * num_head_groups));                   // (head_group, b) combined
+    return Params{grid, FastDivmod{num_head_groups}};
   }
 
   template <int Num_SGs>

@@ -101,6 +101,7 @@ struct FSparseMlAProblemShape {
   int swa_topk = 0;          // SWA window token count (e.g. 128)
   int extra_topk = 0;        // C4 routing top-k token count (e.g. 512)
   int extra_page_size = 0;   // Page size of extra KV cache (may differ from primary)
+  int heads_per_wg = 4;      // Multi-head fusion: heads processed per workgroup
 
   FSparseMlAProblemShape() = default;
 };
@@ -121,8 +122,8 @@ struct MlaSparseXe {
 
   static constexpr int NumSubgroupsN = TILE_N_SIZE / 16;
 
-  using TileShapeQK = Shape<_1, KvTileSizeType, _64>;
-  using TileShapePV = Shape<_1, _64, KvTileSizeType>;
+  using TileShapeQK = Shape<_1, KvTileSizeType, _128>;
+  using TileShapePV = Shape<_1, _128, KvTileSizeType>;
   using TileShapeOutput = Shape<_1, _512>;
 
   using SubgroupLayoutQK = Layout<Shape<_1, cute::Int<NumSubgroupsN>, _1>>;
@@ -258,6 +259,7 @@ inline typename T::Fmla::Arguments args_from_options_sparse(
   problem_shape.swa_topk = swa_topk;
   problem_shape.extra_topk = extra_topk;
   problem_shape.extra_page_size = extra_page_size;
+  problem_shape.heads_per_wg = T::CollectiveMainloop::HEADS_PER_WG;
 
   using StrideQ = typename T::StrideQ;
   using StrideK = typename T::StrideK;

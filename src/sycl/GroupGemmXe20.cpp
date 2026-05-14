@@ -29,7 +29,8 @@ void Xe20MoEGEMMLauncher(
     const int num_experts,
     int* workspace,
     float gemm1_alpha,
-    float gemm1_limit);
+    float gemm1_limit,
+    int ld_b);
 
 using Tile_8_64_32 = Shape<_8, _64, _32>;
 using Tile_16_64_32 = Shape<_16, _64, _32>;
@@ -58,7 +59,8 @@ using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
       const int,                                                                        \
       int*,                                                                             \
       float,                                                                            \
-      float);
+      float,                                                                            \
+      int);
 
 #define DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile, SGLayout)    \
   DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 0, true, true)   \
@@ -108,7 +110,8 @@ DECLARE_XE20_MOE_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
       n_experts,                              \
       atomic_buffer.data_ptr<int>(),          \
       static_cast<float>(gemm1_alpha),        \
-      static_cast<float>(gemm1_limit))
+      static_cast<float>(gemm1_limit),        \
+      ld_b)
 
 #define DISPATCH_MOE_HELPER_BIAS(ActType, FuseAct, WithBias, ...) \
   do {                                                            \
@@ -199,6 +202,7 @@ void moe_grouped_mm_nt_xe20(
   bool with_bias = bias.has_value();
   void* bias_ptr = with_bias ? bias->data_ptr() : nullptr;
   bool small_weight = (int64_t)gemm_k * gemm_n <= (int64_t)4096 * 4096;  // heuristic for small K*N, can be tuned
+  int ld_b = static_cast<int>(weights.stride(1));
 
   if (avg_m <= 8) {
     DISPATCH_MOE(

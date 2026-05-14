@@ -30,7 +30,8 @@ void Xe20MoEGEMMLauncher(
     const int num_experts,
     int* workspace,
     float gemm1_alpha,
-    float gemm1_limit) {
+    float gemm1_limit,
+    int ld_b_param) {
   (void)scales;
   using Element = cutlass::bfloat16_t;
 
@@ -86,6 +87,7 @@ void Xe20MoEGEMMLauncher(
       num_experts,
       workspace,
       mma,
+      static_cast<int32_t>(ld_b_param),
       static_cast<float>(gemm1_alpha),
       static_cast<float>(gemm1_limit),
   };
@@ -114,6 +116,7 @@ template void Xe20MoEGEMMLauncher<@TILE@, @SGLAYOUT@, @ACT_TYPE@, @FUSE_ACT@, @W
     const int,
     int*,
     float,
-    float);
+    float,
+    int);
 
 #undef SYCL_INTEL_TARGET

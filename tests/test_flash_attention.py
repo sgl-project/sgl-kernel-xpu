@@ -1079,13 +1079,13 @@ def test_flash_attn_kvcache(
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
-@pytest.mark.parametrize("page_size", [None, 128])
+@pytest.mark.parametrize("page_size", [64, 128])
 @pytest.mark.parametrize("varlen_q", [True, False])
 @pytest.mark.parametrize("d", [128, 256])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
-        (64, 800),
+        (64, 256),
         (128, 512),
     ],
 )

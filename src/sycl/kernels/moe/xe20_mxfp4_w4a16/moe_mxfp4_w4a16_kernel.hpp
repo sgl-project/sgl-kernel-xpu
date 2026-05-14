@@ -23,12 +23,12 @@
 #include "cutlass/kernel_hardware_info.hpp"
 #include "cutlass/platform/platform.h"
 #include "cutlass/util/packed_stride.hpp"
-#include "moe_mxfp4_mainloop.hpp"
+#include "moe_mxfp4_w4a16_mainloop.hpp"
 
 #pragma clang diagnostic ignored "-Wpass-failed"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
-namespace MoE_MXFP4 {
+namespace MoE_MXFP4_W4A16 {
 using namespace cute;
 
 template <
@@ -44,7 +44,7 @@ template <
     bool WithBias,
     typename ElementA,
     typename ElementD = ElementA>
-class MoEGEMMMxfp4 {
+class MoEGEMMMxfp4W4A16 {
  public:
   using TiledCopyA = decltype(make_block_2d_copy_A(TiledMMA{}, TensorA{}));
   using TiledCopyBPacked = decltype(make_block_2d_copy_B(TiledMMA{}, TensorBPacked{}));
@@ -52,8 +52,8 @@ class MoEGEMMMxfp4 {
   using SGPerWG = decltype(product(take<1, 4>(shape(typename TiledMMA::ThrLayoutVMNK{}))));
 
   constexpr static int Stages = 3;
-  using MainloopDispatchPolicy = MoE_MXFP4::XeDefault<Stages>;
-  using CollectiveMainloop = MoEMainloopMxfp4<
+  using MainloopDispatchPolicy = MoE_MXFP4_W4A16::XeDefault<Stages>;
+  using CollectiveMainloop = MoEMainloopMxfp4W4A16<
       MainloopDispatchPolicy,
       TiledCopyA,
       TiledCopyBPacked,
@@ -303,4 +303,4 @@ class MoEGEMMMxfp4 {
     }
   };
 };
-}  // namespace MoE_MXFP4
+}  // namespace MoE_MXFP4_W4A16

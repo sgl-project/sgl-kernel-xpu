@@ -55,7 +55,7 @@
 #define GELU 1
 #define SWIGLU_GPT_OSS 2
 
-namespace MoE_MXFP4 {
+namespace MoE_MXFP4_W4A16 {
 
 using namespace cute;
 
@@ -162,7 +162,7 @@ template <
     class TiledMMA_,
     bool WithBias,
     int ActType>
-struct MoEMainloopMxfp4 {
+struct MoEMainloopMxfp4W4A16 {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
 
@@ -178,7 +178,7 @@ template <
     class TiledMMA_,
     bool WithBias,
     int ActType>
-struct MoEMainloopMxfp4<
+struct MoEMainloopMxfp4W4A16<
     XeDefault<Stages>,
     TiledCopyA_,
     TiledCopyBPacked_,
@@ -199,7 +199,7 @@ struct MoEMainloopMxfp4<
   using DTensor = DTensor_;
   using BiasTensor = BiasTensor_;
 
-  MoEMainloopMxfp4() {}
+  MoEMainloopMxfp4W4A16() {}
 
   // -------------------------------------------------------------------------
   // Non-fused-activation path: one B, one scale-B.
@@ -551,4 +551,4 @@ struct MoEMainloopMxfp4<
   }
 };
 
-}  // namespace MoE_MXFP4
+}  // namespace MoE_MXFP4_W4A16

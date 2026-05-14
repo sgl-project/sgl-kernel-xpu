@@ -5,7 +5,7 @@
 #                   dequantize_mxfp4_weights materializes bf16 weights on
 #                   XPU, then moe_grouped_mm_nt_xe20.
 #   mxfp4_fused     sgl_kernel path with use_fused_mxfp4_kernel=True:
-#                   moe_grouped_mm_nt_xe20_mxfp4 dequants per-tile in
+#                   moe_grouped_mm_nt_xe20_mxfp4_w4a16 dequants per-tile in
 #                   registers, no intermediate bf16 weight.
 #   triton_full     sglang Triton fused_experts_impl (MXFP4-xpu branch):
 #                   one Triton kernel per weight upcasts MXFP4 → bf16,

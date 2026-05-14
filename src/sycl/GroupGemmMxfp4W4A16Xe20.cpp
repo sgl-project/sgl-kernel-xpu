@@ -9,12 +9,12 @@
 #include "Utils.h"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
-#include "kernels/moe/xe20_mxfp4/moe_mxfp4_kernel.hpp"
+#include "kernels/moe/xe20_mxfp4_w4a16/moe_mxfp4_w4a16_kernel.hpp"
 
 using namespace cute;
 
 template <typename Tile, typename SGLayout, int ActType, bool FuseAct, bool WithBias>
-void Xe20MoEGEMMMxfp4Launcher(
+void Xe20MoEGEMMMxfp4W4A16W4A16Launcher(
     sycl::queue q,
     const void* activations,
     const void* packed_weights,
@@ -29,7 +29,7 @@ void Xe20MoEGEMMMxfp4Launcher(
     float gemm1_alpha,
     float gemm1_limit);
 
-// Tile menu (see GroupGemmMxfp4Xe20.cmake for the full instantiation matrix):
+// Tile menu (see GroupGemmMxfp4W4A16Xe20.cmake for the full instantiation matrix):
 //   - avg_m ≤ 8:                  <_8, _64, _32>, SG_1_4_1
 //   - avg_m ≤ 128, fuse_act:      <_128, _64, _32>, SG_4_2_1
 //   - avg_m ≤ 128, no fuse_act:   <_128, _128, _32>, SG_4_2_1
@@ -46,24 +46,24 @@ using SG_4_2_1 = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
 using SG_8_2_1 = Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>;
 using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
 
-#define DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, ActType, FuseAct, WithBias)            \
-  extern template void Xe20MoEGEMMMxfp4Launcher<Tile, SGLayout, ActType, FuseAct, WithBias>( \
-      sycl::queue,                                                                           \
-      const void*,                                                                           \
-      const void*,                                                                           \
-      const void*,                                                                           \
-      const void*,                                                                           \
-      void*,                                                                                 \
-      const int,                                                                             \
-      const int,                                                                             \
-      const int*,                                                                            \
-      const int,                                                                             \
-      int*,                                                                                  \
-      float,                                                                                 \
+#define DECLARE_XE20_MOE_MXFP4_EXTERN(Tile, SGLayout, ActType, FuseAct, WithBias)                      \
+  extern template void Xe20MoEGEMMMxfp4W4A16W4A16Launcher<Tile, SGLayout, ActType, FuseAct, WithBias>( \
+      sycl::queue,                                                                                     \
+      const void*,                                                                                     \
+      const void*,                                                                                     \
+      const void*,                                                                                     \
+      const void*,                                                                                     \
+      void*,                                                                                           \
+      const int,                                                                                       \
+      const int,                                                                                       \
+      const int*,                                                                                      \
+      const int,                                                                                       \
+      int*,                                                                                            \
+      float,                                                                                           \
       float);
 
 // TEMPORARY L0-module-pressure workaround: declare only the instantiations
-// that GroupGemmMxfp4Xe20.cmake actually emits (ActType=0 silu, WithBias=false).
+// that GroupGemmMxfp4W4A16Xe20.cmake actually emits (ActType=0 silu, WithBias=false).
 // The dispatcher below enforces the same constraint at runtime. Keep the
 // two sides in sync.
 DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_8_64_32, SG_1_4_1, 0, true, false)
@@ -75,20 +75,20 @@ DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_256_256_32, SG_8_4_1, 0, false, false)
 
 #undef DECLARE_XE20_MOE_MXFP4_EXTERN
 
-#define LAUNCH_MOE_MXFP4(...)                 \
-  Xe20MoEGEMMMxfp4Launcher<__VA_ARGS__>(      \
-      queue,                                  \
-      activations.data_ptr(),                 \
-      packed_weights.data_ptr(),              \
-      scales.data_ptr(),                      \
-      bias_ptr,                               \
-      output.data_ptr(),                      \
-      gemm_n,                                 \
-      gemm_k,                                 \
-      total_rows_for_experts.data_ptr<int>(), \
-      n_experts,                              \
-      atomic_buffer.data_ptr<int>(),          \
-      static_cast<float>(gemm1_alpha),        \
+#define LAUNCH_MOE_MXFP4(...)                      \
+  Xe20MoEGEMMMxfp4W4A16W4A16Launcher<__VA_ARGS__>( \
+      queue,                                       \
+      activations.data_ptr(),                      \
+      packed_weights.data_ptr(),                   \
+      scales.data_ptr(),                           \
+      bias_ptr,                                    \
+      output.data_ptr(),                           \
+      gemm_n,                                      \
+      gemm_k,                                      \
+      total_rows_for_experts.data_ptr<int>(),      \
+      n_experts,                                   \
+      atomic_buffer.data_ptr<int>(),               \
+      static_cast<float>(gemm1_alpha),             \
       static_cast<float>(gemm1_limit))
 
 // TEMPORARY: matching prune for the cmake-side instantiation matrix above.
@@ -108,7 +108,7 @@ DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_256_256_32, SG_8_4_1, 0, false, false)
     }                                                                                                            \
   } while (0)
 
-void moe_grouped_mm_nt_xe20_mxfp4(
+void moe_grouped_mm_nt_xe20_mxfp4_w4a16(
     torch::Tensor& output,
     const torch::Tensor& activations,
     const torch::Tensor& packed_weights,  // [E, N, K/2] int8
@@ -135,7 +135,7 @@ void moe_grouped_mm_nt_xe20_mxfp4(
   TORCH_CHECK(sc_shape.size() == 3, "scales must be 3D [E, N, K/32]");
   TORCH_CHECK(sc_shape[0] == n_experts, "scales first dim must equal n_experts");
   TORCH_CHECK(sc_shape[1] == gemm_n, "scales second dim must equal N");
-  TORCH_CHECK(sc_shape[2] == gemm_k / MoE_MXFP4::MXFP4_GROUP_SIZE, "scales last dim must equal K/32");
+  TORCH_CHECK(sc_shape[2] == gemm_k / MoE_MXFP4_W4A16::MXFP4_GROUP_SIZE, "scales last dim must equal K/32");
   TORCH_CHECK(scales.scalar_type() == at::ScalarType::Float, "scales must be float32 (direct multiplier)");
 
   TORCH_CHECK(
@@ -151,7 +151,7 @@ void moe_grouped_mm_nt_xe20_mxfp4(
   TORCH_CHECK(n_experts % 8 == 0, "n_experts must be a multiple of 8 for the current implementation");
   TORCH_CHECK(activations.scalar_type() == at::ScalarType::BFloat16, "activations must be bfloat16");
   TORCH_CHECK(output.scalar_type() == at::ScalarType::BFloat16, "output must be bfloat16");
-  TORCH_CHECK(gemm_k % MoE_MXFP4::MXFP4_GROUP_SIZE == 0, "K must be a multiple of GROUP_SIZE=32");
+  TORCH_CHECK(gemm_k % MoE_MXFP4_W4A16::MXFP4_GROUP_SIZE == 0, "K must be a multiple of GROUP_SIZE=32");
 
   if (bias.has_value()) {
     TORCH_CHECK(bias->scalar_type() == at::kFloat, "bias must be float32");

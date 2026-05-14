@@ -224,6 +224,8 @@ class XeMlaSparseFwdKernel {
     return dim3(SGPerWG::value * intel::sg_size, 1, 1);
   }
 
+  static constexpr int HEADS_PER_WG = CollectiveMainloop::HEADS_PER_WG;
+
   CUTLASS_DEVICE
   void operator()(Params const& params, char* smem_buf) {
     using namespace sycl::ext::oneapi::this_work_item;
@@ -239,12 +241,16 @@ class XeMlaSparseFwdKernel {
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
-      auto [blk_q, blk_v, head_coord, batch_coord] = tile_scheduler.get_block_coord();
+      auto [blk_q, blk_v, head_group, batch_coord] = tile_scheduler.get_block_coord();
       auto blk_qv = make_coord(blk_q, blk_v);
 
-      // Create Q nope tensor: [seq_len_qo, D_nope, H, B]
-      auto shape_Q = make_shape(s.seq_len_qo, s.head_size_q_nope, s.num_heads_q, s.batch);
-      // Create Q pe tensor: [seq_len_qo, D_rope, H, B]
+      // head_group is the group index; actual heads are [head_group*N .. head_group*N + N-1]
+      int head_base = head_group * HEADS_PER_WG;
+
+      // Q tensor: use full 512-dim (448 nope + 64 pe are contiguous in memory).
+      // The combined D_SLICE=128 last iteration reads Q[384:512] = Q_nope_tail || Q_pe.
+      int q_full_dim = s.head_size_q_nope + s.head_size_q_pe;  // 448 + 64 = 512
+      auto shape_Q = make_shape(s.seq_len_qo, q_full_dim, s.num_heads_q, s.batch);
       auto shape_Q_pe = make_shape(s.seq_len_qo, s.head_size_q_pe, s.num_heads_q, s.batch);
       auto shape_O = make_shape(s.seq_len_qo, s.head_size_o, s.num_heads_q, s.batch);
 
@@ -294,14 +300,23 @@ class XeMlaSparseFwdKernel {
       Tensor V_pe_extra =
           make_tensor(make_gmem_ptr(const_cast<ElementQ*>(p.V_pe_extra)), make_layout(shape_V_pe_extra, p.dV_pe_extra));
 
-      // O accumulator types
-      FragA tArA;
-      FragARow tA_max, tA_sum;
+      // Build per-head Q arrays and accumulators
+      using TensorQ2D = typename CollectiveMainloop::TensorQ2D;
+      TensorQ2D Q_arr[HEADS_PER_WG];
+      TensorQ2D Q_pe_arr[HEADS_PER_WG];
+      CUTLASS_PRAGMA_UNROLL
+      for (int h = 0; h < HEADS_PER_WG; h++) {
+        Q_arr[h] = Q(_, _, head_base + h, batch_coord);
+        Q_pe_arr[h] = Q_pe(_, _, head_base + h, batch_coord);
+      }
+
+      FragA tArA[HEADS_PER_WG];
+      FragARow tA_max[HEADS_PER_WG], tA_sum[HEADS_PER_WG];
 
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
       mainloop(
-          Q(_, _, head_coord, batch_coord),
-          Q_pe(_, _, head_coord, batch_coord),
+          Q_arr,
+          Q_pe_arr,
           K_nope(_, _, _, _0{}),
           K_pe(_, _, _, _0{}),
           KV_scale(_, _, _, _0{}),
@@ -319,12 +334,23 @@ class XeMlaSparseFwdKernel {
           thr_id,
           batch_coord);
 
-      if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
-        sycl::group_barrier(get_work_group<3>());
+      // Epilogue: write output for each head
+      CUTLASS_PRAGMA_UNROLL
+      for (int h = 0; h < HEADS_PER_WG; h++) {
+        if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
+          sycl::group_barrier(get_work_group<3>());
+        }
+        CollectiveEpilogue epilogue(params.epilogue, shared_storage.epilogue);
+        epilogue(
+            O(_, _, head_base + h, batch_coord),
+            tArA[h],
+            tA_max[h],
+            tA_sum[h],
+            blk_qv,
+            thr_id,
+            head_base + h,
+            batch_coord);
       }
-
-      CollectiveEpilogue epilogue(params.epilogue, shared_storage.epilogue);
-      epilogue(O(_, _, head_coord, batch_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, head_coord, batch_coord);
     }
   }
 };

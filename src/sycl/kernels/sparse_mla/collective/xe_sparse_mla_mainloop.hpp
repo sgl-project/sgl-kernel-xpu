@@ -180,6 +180,10 @@ struct XeMlaSparseMainloop<
 
   static constexpr bool CausalMask = CausalMask_;
 
+  // Multi-head fusion: process N query heads per WG, amortizing KV gather cost.
+  // KV cache is shared across heads (MQA/MLA), so gather once → DPAS N times.
+  static constexpr int HEADS_PER_WG = 8;
+
   //
   // Arguments
   //
@@ -215,21 +219,27 @@ struct XeMlaSparseMainloop<
   // Kernel-facing parameters
   using Params = Arguments;
 
-  // D_NOPE = 448 (7 tiles × 64, production V4 value)
+  // D_NOPE = 448 (3 full 128-wide tiles + 64 remainder, combined with D_ROPE)
   static constexpr int D_NOPE = 448;
   static constexpr int D_ROPE = 64;
-  static constexpr int D_SLICE = QK_BLK_K;  // One d-slice width = DPAS K-tile = 64
+  static constexpr int D_SLICE = QK_BLK_K;  // One d-slice width = DPAS K-tile = 128
+
+  // GEMM1/GEMM2 iteration counts:
+  //   Full 128-wide nope slices: 448 / 128 = 3 (covering dims 0..383)
+  //   Combined slice: nope[384:448] (64) + pe[0:64] (64) = 128
+  //   Total GEMM1 iterations: 4  (was 8 with D_SLICE=64)
+  static constexpr int NUM_FULL_SLICES = D_NOPE / D_SLICE;              // 448/128 = 3
+  static constexpr int NOPE_TAIL = D_NOPE - NUM_FULL_SLICES * D_SLICE;  // 448 - 384 = 64
 
   //
   // Shared memory storage:
   //   - sg_max_data: cross-subgroup softmax reduction
-  //   - tile_slice: ONE d-slice [TILE_N, D_SLICE=64] gathered at a time
-  //     Reused for each GEMM1 d-iteration AND each GEMM2 v-iteration.
-  //     Total: TILE_N * 64 * sizeof(ElementQ) = 256 * 64 * 2 = 32 KB
+  //   - tile_slice: ONE d-slice [TILE_N, D_SLICE=128] gathered at a time
+  //     Total: TILE_N * 128 * sizeof(ElementQ) = 128 * 128 * 2 = 32 KB
   //
   struct SharedStorage {
     cute::array<ElementS, NumSubgroups> sg_max_data;
-    ElementQ tile_slice[TILE_N * D_SLICE];  // [TILE_N, 64] — one d-slice at a time
+    ElementQ tile_slice[TILE_N * D_SLICE];  // [TILE_N, 128] — one d-slice at a time
   };
 
   Params params;
@@ -377,35 +387,39 @@ struct XeMlaSparseMainloop<
   }
 
   //
-  // Process a tile of TILE_N tokens using SLICE-BY-SLICE scattered gather.
-  // Only ONE d-slice [TILE_N, D_SLICE=64] is in SLM at a time.
-  // Addresses computed ONCE via get_physical_kv_tile_addr(), passed in here.
+  // Process a tile of TILE_N tokens — MULTI-HEAD FUSED.
+  // Gathers K/V once into SLM, then runs DPAS for HEADS_PER_WG heads.
+  // This amortizes the expensive scattered gather across multiple heads.
   //
   // Flow per tile:
-  //   GEMM1: S = Σ Q_nope[d] @ K_nope[d]^T + Q_pe @ K_pe^T
-  //     7 nope d-slices + 1 pe d-slice = 8 GEMM1 accumulations
-  //   Softmax: P = softmax(S)
-  //   GEMM2: O += P @ V
-  //     7 nope d-slices + 1 pe d-slice = 8 GEMM2 accumulations (one per VTile)
+  //   For each K d-slice:
+  //     gather(K_slice) → SLM                   (ONE gather, shared across all heads)
+  //     for h in 0..HEADS_PER_WG:
+  //       S_h += Q_h_nope[d] @ K_slice^T        (DPAS, cheap)
+  //   gather(K_pe) → SLM
+  //   for h: S_h += Q_h_pe @ K_pe^T
+  //   for h: softmax(S_h) → P_h
+  //   For each V d-slice:
+  //     gather(V_slice) → SLM                   (ONE gather)
+  //     for h: O_h += P_h @ V_slice             (DPAS)
   //
   template <typename QVCoord, typename S2rCopyK, typename SLMTensorK, typename S2rCopyV, typename SLMTensorV>
   CUTLASS_DEVICE void process_token_tile(
-      TensorQ2D const& Q_2D,
-      TensorQ2D const& Q_pe_2D,
+      TensorQ2D const (&Q_2D)[HEADS_PER_WG],
+      TensorQ2D const (&Q_pe_2D)[HEADS_PER_WG],
       TensorK3D const& K_nope,        // (page_size, D_NOPE, num_pages)
       TensorKPe3D const& K_pe,        // (page_size, D_ROPE, num_pages)
       TensorScale3D const& KV_scale,  // (page_size, 7, num_pages)
       TensorV3D const& V_nope,        // (D_NOPE, page_size, num_pages) — transposed
       TensorVPe3D const& V_pe,        // (D_ROPE, page_size, num_pages) — transposed
-      FragA& tArA,
-      FragARow& tA_max,
-      FragARow& tA_sum,
+      FragA (&tArA)[HEADS_PER_WG],
+      FragARow (&tA_max)[HEADS_PER_WG],
+      FragARow (&tA_sum)[HEADS_PER_WG],
       QVCoord blk_qv,
-      TileAddresses const& addrs,  // Pre-computed from get_physical_kv_tile_addr()
+      TileAddresses const& addrs,
       bool is_first_tile,
       int thr_id,
       int cache_page_size,
-      // SLM copy infrastructure (pre-constructed)
       S2rCopyK const& s2r_k,
       SLMTensorK& sK,
       S2rCopyV const& s2r_v,
@@ -417,37 +431,20 @@ struct XeMlaSparseMainloop<
     auto thr_mma_pv = mma_pv.get_slice(thr_id);
 
     /* Create proxy coordinate tensors */
-    Tensor cQnope = make_identity_tensor(Q_2D.shape());                // (q, d_nope)
-    Tensor cQpe = make_identity_tensor(Q_pe_2D.shape());               // (q, d_rope)
-    Tensor cP = make_identity_tensor(take<0, 2>(TileShapeQK{}));       // (q, k)
-    Tensor cB_qk = make_identity_tensor(select<1, 2>(TileShapeQK{}));  // (TILE_N, D_SLICE)
-    Tensor cB_pv = make_identity_tensor(select<1, 2>(TileShapePV{}));  // (D_SLICE, TILE_N)
+    Tensor cQnope = make_identity_tensor(Q_2D[0].shape());
+    Tensor cQpe = make_identity_tensor(Q_pe_2D[0].shape());
+    Tensor cP = make_identity_tensor(take<0, 2>(TileShapeQK{}));
+    Tensor cB_qk = make_identity_tensor(select<1, 2>(TileShapeQK{}));
+    Tensor cB_pv = make_identity_tensor(select<1, 2>(TileShapePV{}));
 
-    /* Partition global tensors into workgroup tiles */
     Tensor gQnope = local_tile(cQnope, TileShapeQK{}, append(blk_qv, _), Step<_1, X, _1>{});
     Tensor gQpe = local_tile(cQpe, TileShapeQK{}, append(blk_qv, _), Step<_1, X, _1>{});
 
-    /* Create global -> register copies for Q */
-    TiledCopyQ copy_qnope{Q_2D};
-    TiledCopyQ copy_qpe{Q_pe_2D};
-    auto thr_copy_qnope = copy_qnope.get_slice(thr_id);
-    auto thr_copy_qpe = copy_qpe.get_slice(thr_id);
+    /* Score/P fragments — one per head */
+    decltype(thr_mma_qk.partition_sg_fragment_C(cP)) tSrS[HEADS_PER_WG];
+    decltype(thr_mma_pv.partition_sg_fragment_A(cP)) tArP[HEADS_PER_WG];
 
-    /* Partition Q for copy */
-    auto tQnopegQ = thr_copy_qnope.partition_S(gQnope);
-    auto tQpegQ = thr_copy_qpe.partition_S(gQpe);
-
-    /* Q register fragments */
-    auto tQnoperQ = thr_copy_qnope.partition_sg_fragment_D(gQnope(_, _, 0));
-    auto tSrQnope = thr_mma_qk.partition_sg_fragment_A(gQnope(_, _, 0));
-    auto tQperQ = thr_copy_qpe.partition_sg_fragment_D(gQpe(_, _, 0));
-    auto tSrQpe = thr_mma_qk.partition_sg_fragment_A(gQpe(_, _, 0));
-
-    /* Score/P fragments */
-    auto tSrS = thr_mma_qk.partition_sg_fragment_C(cP);
-    auto tArP = thr_mma_pv.partition_sg_fragment_A(cP);
-
-    /* K and V register fragments (from SLM via s2r) */
+    /* K and V register fragments (from SLM via s2r) — shared across heads */
     auto thr_s2r_k = s2r_k.get_slice(thr_id);
     auto tKsK = thr_s2r_k.partition_S(sK);
     auto tSrK = thr_mma_qk.partition_sg_fragment_B(cB_qk);
@@ -459,175 +456,284 @@ struct XeMlaSparseMainloop<
     auto tVrV_mma = thr_s2r_v.retile_D(tArV);
 
     /* ================================================================
-     * Pre-compute per-token pointers and scales (reused across all 16 d-slice iterations).
-     * Eliminates repeated CuTe stride arithmetic in gather functions.
-     * Each work-item caches its token's base pointers + 7 scale factors.
+     * Pre-compute per-token pointers and scales (shared across all heads).
+     * Scales: 7 groups of 64 bytes each (indexed 0..6 for D_NOPE=448).
      * ================================================================ */
-    static constexpr int NUM_NOPE_SLICES = D_NOPE / D_SLICE;  // 448/64 = 7
-    float cached_scales[NUM_NOPE_SLICES];
-    const uint8_t* my_k_nope_ptr = nullptr;  // base of K_nope for this token
-    const ElementQ* my_k_pe_ptr = nullptr;   // base of K_pe for this token
-    const uint8_t* my_v_nope_ptr = nullptr;  // base of V_nope for this token
-    const ElementQ* my_v_pe_ptr = nullptr;   // base of V_pe for this token
+    static constexpr int NUM_SCALE_GROUPS = D_NOPE / 64;  // 448/64 = 7
+    float cached_scales[NUM_SCALE_GROUPS];
+    const uint8_t* my_k_nope_ptr = nullptr;
+    const ElementQ* my_k_pe_ptr = nullptr;
+    const uint8_t* my_v_nope_ptr = nullptr;
+    const ElementQ* my_v_pe_ptr = nullptr;
     {
       int token_idx = thr_id;
       if (token_idx < TILE_N && addrs.valid[token_idx]) {
         int page_id = addrs.page_ids[token_idx];
         int tok_off = addrs.token_offsets[token_idx];
-        // Precompute base pointers (d-dim is contiguous from here)
         my_k_nope_ptr = reinterpret_cast<const uint8_t*>(&K_nope(tok_off, 0, page_id));
         my_k_pe_ptr = &K_pe(tok_off, 0, page_id);
         my_v_nope_ptr = reinterpret_cast<const uint8_t*>(&V_nope(0, tok_off, page_id));
         my_v_pe_ptr = &V_pe(0, tok_off, page_id);
         CUTLASS_PRAGMA_UNROLL
-        for (int s = 0; s < NUM_NOPE_SLICES; s++) {
+        for (int s = 0; s < NUM_SCALE_GROUPS; s++) {
           uint8_t scale_byte = KV_scale(tok_off, s, page_id);
           cached_scales[s] = sycl::native::exp2(static_cast<float>(scale_byte) - 127.0f);
         }
       } else {
         CUTLASS_PRAGMA_UNROLL
-        for (int s = 0; s < NUM_NOPE_SLICES; s++) {
+        for (int s = 0; s < NUM_SCALE_GROUPS; s++) {
           cached_scales[s] = 0.0f;
         }
       }
     }
 
     /* ================================================================
-     * GEMM 1: S = Q_nope @ K_nope^T + Q_pe @ K_pe^T
+     * GEMM 1: S_h = Q_h_nope @ K_nope^T + Q_h_pe @ K_pe^T
+     * D_SLICE=128, total 4 iterations:
+     *   Iter 0: K_nope[0:128]   (scales[0], scales[1])
+     *   Iter 1: K_nope[128:256] (scales[2], scales[3])
+     *   Iter 2: K_nope[256:384] (scales[4], scales[5])
+     *   Iter 3: K_nope[384:448] + K_pe[0:64] (scales[6] for first 64, no scale for pe)
      * ================================================================ */
-    clear(tSrS);
-
-    // Part 1: Accumulate Q_nope @ K_nope^T (7 d-slices)
     CUTLASS_PRAGMA_UNROLL
-    for (int d_slice = 0; d_slice < NUM_NOPE_SLICES; d_slice++) {
-      // Inline gather using precomputed pointer
+    for (int h = 0; h < HEADS_PER_WG; h++) {
+      clear(tSrS[h]);
+    }
+
+    // Total GEMM1 iterations = NUM_FULL_SLICES + 1 = 4
+    static constexpr int GEMM1_ITERS = NUM_FULL_SLICES + 1;
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int iter = 0; iter < GEMM1_ITERS; iter++) {
+      // Gather 128-wide K slice to SLM
       {
         int token_idx = thr_id;
         if (token_idx < TILE_N) {
-          if (my_k_nope_ptr) {
-            const uint8_t* slice_ptr = my_k_nope_ptr + d_slice * D_SLICE;
-            float sf = cached_scales[d_slice];
-            CUTLASS_PRAGMA_UNROLL
-            for (int chunk = 0; chunk < D_SLICE; chunk += 8) {
-              uint64_t packed = *reinterpret_cast<const uint64_t*>(slice_ptr + chunk);
+          if (iter < NUM_FULL_SLICES) {
+            // Full 128-wide nope slice: two 64-byte halves with different scales
+            if (my_k_nope_ptr) {
+              const uint8_t* slice_ptr = my_k_nope_ptr + iter * D_SLICE;
+              int scale_idx_lo = iter * 2;      // scale for first 64 bytes
+              int scale_idx_hi = iter * 2 + 1;  // scale for second 64 bytes
+              float sf_lo = cached_scales[scale_idx_lo];
+              float sf_hi = cached_scales[scale_idx_hi];
+              // First half [0:64]
               CUTLASS_PRAGMA_UNROLL
-              for (int b = 0; b < 8; b++) {
-                uint8_t raw = static_cast<uint8_t>(packed >> (b * 8));
-                float f_val = fp8_e4m3fn_to_float(raw) * sf;
-                shared.tile_slice[token_idx + (chunk + b) * TILE_N] = static_cast<ElementQ>(f_val);
-              }
-            }
-          } else {
-            CUTLASS_PRAGMA_UNROLL
-            for (int col = 0; col < D_SLICE; col++) {
-              shared.tile_slice[token_idx + col * TILE_N] = ElementQ(0);
-            }
-          }
-        }
-      }
-      sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_work_group<3>());
-      copy(s2r_k, tKsK, tKrK_mma);
-      copy(copy_qnope, tQnopegQ(_, _, _, d_slice), tQnoperQ);
-      reorder(tQnoperQ, tSrQnope);
-      cute::gemm(mma_qk, tSrQnope, tSrK, tSrS);
-      sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_work_group<3>());
-    }
-
-    // Part 2: Accumulate Q_pe @ K_pe^T (1 d-slice)
-    {
-      int token_idx = thr_id;
-      if (token_idx < TILE_N) {
-        if (my_k_pe_ptr) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int chunk = 0; chunk < D_SLICE; chunk += 4) {
-            uint64_t packed = *reinterpret_cast<const uint64_t*>(my_k_pe_ptr + chunk);
-            const ElementQ* vals = reinterpret_cast<const ElementQ*>(&packed);
-            CUTLASS_PRAGMA_UNROLL
-            for (int b = 0; b < 4; b++) {
-              shared.tile_slice[token_idx + (chunk + b) * TILE_N] = vals[b];
-            }
-          }
-        } else {
-          CUTLASS_PRAGMA_UNROLL
-          for (int col = 0; col < D_SLICE; col++) {
-            shared.tile_slice[token_idx + col * TILE_N] = ElementQ(0);
-          }
-        }
-      }
-      sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_work_group<3>());
-      copy(s2r_k, tKsK, tKrK_mma);
-      copy(copy_qpe, tQpegQ(_, _, _, 0), tQperQ);
-      reorder(tQperQ, tSrQpe);
-      cute::gemm(mma_qk, tSrQpe, tSrK, tSrS);
-      sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_work_group<3>());
-    }
-
-    /* ================================================================
-     * Mask invalid tokens: set scores to -INFINITY
-     * ================================================================ */
-    {
-      constexpr int SG_SIZE = intel::sg_size;
-      int sg_id = thr_id / SG_SIZE;
-      int lane_id = thr_id % SG_SIZE;
-      int token_idx = sg_id * SG_SIZE + lane_id;
-      bool token_valid = (token_idx < TILE_N && addrs.valid[token_idx]);
-      if (!token_valid) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < tSrS.size(); i++) {
-          tSrS(i) = -cutlass::platform::numeric_limits<ElementS>::infinity();
-        }
-      }
-    }
-
-    /* ================================================================
-     * Softmax
-     * ================================================================ */
-    softmax(is_first_tile, tSrS, tA_max, tA_sum, tArA);
-    reorder(tSrS, tArP);
-
-    /* ================================================================
-     * GEMM 2: O += P @ V (reuses cached pointers and scales)
-     * ================================================================ */
-    CUTLASS_PRAGMA_UNROLL
-    for (int vv = 0; vv < VTiles; vv++) {
-      {
-        int token_idx = thr_id;
-        if (token_idx < TILE_N) {
-          if (vv < NUM_NOPE_SLICES) {
-            if (my_v_nope_ptr) {
-              const uint8_t* slice_ptr = my_v_nope_ptr + vv * D_SLICE;
-              float sf = cached_scales[vv];
-              CUTLASS_PRAGMA_UNROLL
-              for (int chunk = 0; chunk < D_SLICE; chunk += 8) {
+              for (int chunk = 0; chunk < 64; chunk += 8) {
                 uint64_t packed = *reinterpret_cast<const uint64_t*>(slice_ptr + chunk);
                 CUTLASS_PRAGMA_UNROLL
                 for (int b = 0; b < 8; b++) {
                   uint8_t raw = static_cast<uint8_t>(packed >> (b * 8));
-                  float f_val = fp8_e4m3fn_to_float(raw) * sf;
+                  float f_val = fp8_e4m3fn_to_float(raw) * sf_lo;
+                  shared.tile_slice[token_idx + (chunk + b) * TILE_N] = static_cast<ElementQ>(f_val);
+                }
+              }
+              // Second half [64:128]
+              CUTLASS_PRAGMA_UNROLL
+              for (int chunk = 0; chunk < 64; chunk += 8) {
+                uint64_t packed = *reinterpret_cast<const uint64_t*>(slice_ptr + 64 + chunk);
+                CUTLASS_PRAGMA_UNROLL
+                for (int b = 0; b < 8; b++) {
+                  uint8_t raw = static_cast<uint8_t>(packed >> (b * 8));
+                  float f_val = fp8_e4m3fn_to_float(raw) * sf_hi;
+                  shared.tile_slice[token_idx + (64 + chunk + b) * TILE_N] = static_cast<ElementQ>(f_val);
+                }
+              }
+            } else {
+              CUTLASS_PRAGMA_UNROLL
+              for (int col = 0; col < D_SLICE; col++) {
+                shared.tile_slice[token_idx + col * TILE_N] = ElementQ(0);
+              }
+            }
+          } else {
+            // Combined slice: K_nope[384:448] (64 FP8) + K_pe[0:64] (64 bf16)
+            // First half: nope tail with scale[6]
+            if (my_k_nope_ptr) {
+              const uint8_t* tail_ptr = my_k_nope_ptr + NUM_FULL_SLICES * D_SLICE;
+              float sf_tail = cached_scales[NUM_FULL_SLICES * 2];  // scale[6]
+              CUTLASS_PRAGMA_UNROLL
+              for (int chunk = 0; chunk < NOPE_TAIL; chunk += 8) {
+                uint64_t packed = *reinterpret_cast<const uint64_t*>(tail_ptr + chunk);
+                CUTLASS_PRAGMA_UNROLL
+                for (int b = 0; b < 8; b++) {
+                  uint8_t raw = static_cast<uint8_t>(packed >> (b * 8));
+                  float f_val = fp8_e4m3fn_to_float(raw) * sf_tail;
+                  shared.tile_slice[token_idx + (chunk + b) * TILE_N] = static_cast<ElementQ>(f_val);
+                }
+              }
+            } else {
+              CUTLASS_PRAGMA_UNROLL
+              for (int col = 0; col < NOPE_TAIL; col++) {
+                shared.tile_slice[token_idx + col * TILE_N] = ElementQ(0);
+              }
+            }
+            // Second half: K_pe (bf16, no dequant needed)
+            if (my_k_pe_ptr) {
+              CUTLASS_PRAGMA_UNROLL
+              for (int chunk = 0; chunk < D_ROPE; chunk += 4) {
+                uint64_t packed = *reinterpret_cast<const uint64_t*>(my_k_pe_ptr + chunk);
+                const ElementQ* vals = reinterpret_cast<const ElementQ*>(&packed);
+                CUTLASS_PRAGMA_UNROLL
+                for (int b = 0; b < 4; b++) {
+                  shared.tile_slice[token_idx + (NOPE_TAIL + chunk + b) * TILE_N] = vals[b];
+                }
+              }
+            } else {
+              CUTLASS_PRAGMA_UNROLL
+              for (int col = 0; col < D_ROPE; col++) {
+                shared.tile_slice[token_idx + (NOPE_TAIL + col) * TILE_N] = ElementQ(0);
+              }
+            }
+          }
+        }
+      }
+      sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_work_group<3>());
+
+      // Load K from SLM to registers — ONCE
+      copy(s2r_k, tKsK, tKrK_mma);
+
+      // DPAS for each head
+      // Q is also 128-wide: for full slices, Q_nope[iter*128:(iter+1)*128]
+      // For combined slice: Q_nope[384:448] || Q_pe[0:64] — needs combined Q tensor
+      CUTLASS_PRAGMA_UNROLL
+      for (int h = 0; h < HEADS_PER_WG; h++) {
+        // Q is laid out as [seq_len_qo=1, D_q, ...] with D_q = 448 for nope, 64 for pe
+        // With D_SLICE=128, gQnope partitions into ceil(448/128)=4 tiles (last is partial)
+        // The TiledCopyQ handles the 128-wide load from the right offset
+        if (iter < NUM_FULL_SLICES) {
+          TiledCopyQ copy_q_h{Q_2D[h]};
+          auto thr_copy_h = copy_q_h.get_slice(thr_id);
+          auto tQgQ_h = thr_copy_h.partition_S(gQnope);
+          auto tQrQ_h = thr_copy_h.partition_sg_fragment_D(gQnope(_, _, 0));
+          auto tSrQ_h = thr_mma_qk.partition_sg_fragment_A(gQnope(_, _, 0));
+          copy(copy_q_h, tQgQ_h(_, _, _, iter), tQrQ_h);
+          reorder(tQrQ_h, tSrQ_h);
+          cute::gemm(mma_qk, tSrQ_h, tSrK, tSrS[h]);
+        } else {
+          // Combined: Q_nope[384:448] || Q_pe[0:64] loaded as one 128-wide vector
+          // Use gQnope's last tile (iter=3) which covers [384:512] but Q_nope only has 448 dims
+          // The CuTe tile will read from the combined Q layout automatically
+          // since Q_nope and Q_pe are adjacent in memory (Q_pe = Q + 448)
+          TiledCopyQ copy_q_h{Q_2D[h]};
+          auto thr_copy_h = copy_q_h.get_slice(thr_id);
+          auto tQgQ_h = thr_copy_h.partition_S(gQnope);
+          auto tQrQ_h = thr_copy_h.partition_sg_fragment_D(gQnope(_, _, 0));
+          auto tSrQ_h = thr_mma_qk.partition_sg_fragment_A(gQnope(_, _, 0));
+          copy(copy_q_h, tQgQ_h(_, _, _, iter), tQrQ_h);
+          reorder(tQrQ_h, tSrQ_h);
+          cute::gemm(mma_qk, tSrQ_h, tSrK, tSrS[h]);
+        }
+      }
+
+      sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    }
+
+    /* ================================================================
+     * Mask + Softmax — per head
+     * ================================================================ */
+    CUTLASS_PRAGMA_UNROLL
+    for (int h = 0; h < HEADS_PER_WG; h++) {
+      {
+        constexpr int SG_SIZE = intel::sg_size;
+        int sg_id = thr_id / SG_SIZE;
+        int lane_id = thr_id % SG_SIZE;
+        int token_idx = sg_id * SG_SIZE + lane_id;
+        bool token_valid = (token_idx < TILE_N && addrs.valid[token_idx]);
+        if (!token_valid) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS[h].size(); i++) {
+            tSrS[h](i) = -cutlass::platform::numeric_limits<ElementS>::infinity();
+          }
+        }
+      }
+      softmax(is_first_tile, tSrS[h], tA_max[h], tA_sum[h], tArA[h]);
+      reorder(tSrS[h], tArP[h]);
+    }
+
+    /* ================================================================
+     * GEMM 2: O_h += P_h @ V — D_SLICE=128, 4 iterations
+     *   Iter 0: V_nope[0:128]   (scales[0], scales[1])
+     *   Iter 1: V_nope[128:256] (scales[2], scales[3])
+     *   Iter 2: V_nope[256:384] (scales[4], scales[5])
+     *   Iter 3: V_nope[384:448] + V_pe[0:64] (scales[6], no scale for pe)
+     * ================================================================ */
+    CUTLASS_PRAGMA_UNROLL
+    for (int vv = 0; vv < VTiles; vv++) {
+      // Gather 128-wide V slice to SLM
+      {
+        int token_idx = thr_id;
+        if (token_idx < TILE_N) {
+          if (vv < NUM_FULL_SLICES) {
+            // Full 128-wide V_nope slice (transposed layout: D is first dim)
+            if (my_v_nope_ptr) {
+              const uint8_t* slice_ptr = my_v_nope_ptr + vv * D_SLICE;
+              int scale_idx_lo = vv * 2;
+              int scale_idx_hi = vv * 2 + 1;
+              float sf_lo = cached_scales[scale_idx_lo];
+              float sf_hi = cached_scales[scale_idx_hi];
+              // First half [0:64]
+              CUTLASS_PRAGMA_UNROLL
+              for (int chunk = 0; chunk < 64; chunk += 8) {
+                uint64_t packed = *reinterpret_cast<const uint64_t*>(slice_ptr + chunk);
+                CUTLASS_PRAGMA_UNROLL
+                for (int b = 0; b < 8; b++) {
+                  uint8_t raw = static_cast<uint8_t>(packed >> (b * 8));
+                  float f_val = fp8_e4m3fn_to_float(raw) * sf_lo;
+                  shared.tile_slice[(chunk + b) + token_idx * D_SLICE] = static_cast<ElementQ>(f_val);
+                }
+              }
+              // Second half [64:128]
+              CUTLASS_PRAGMA_UNROLL
+              for (int chunk = 0; chunk < 64; chunk += 8) {
+                uint64_t packed = *reinterpret_cast<const uint64_t*>(slice_ptr + 64 + chunk);
+                CUTLASS_PRAGMA_UNROLL
+                for (int b = 0; b < 8; b++) {
+                  uint8_t raw = static_cast<uint8_t>(packed >> (b * 8));
+                  float f_val = fp8_e4m3fn_to_float(raw) * sf_hi;
+                  shared.tile_slice[(64 + chunk + b) + token_idx * D_SLICE] = static_cast<ElementQ>(f_val);
+                }
+              }
+            } else {
+              CUTLASS_PRAGMA_UNROLL
+              for (int v = 0; v < D_SLICE; v++) {
+                shared.tile_slice[v + token_idx * D_SLICE] = ElementQ(0);
+              }
+            }
+          } else {
+            // Combined: V_nope[384:448] (64 FP8) + V_pe[0:64] (64 bf16)
+            if (my_v_nope_ptr) {
+              const uint8_t* tail_ptr = my_v_nope_ptr + NUM_FULL_SLICES * D_SLICE;
+              float sf_tail = cached_scales[NUM_FULL_SLICES * 2];
+              CUTLASS_PRAGMA_UNROLL
+              for (int chunk = 0; chunk < NOPE_TAIL; chunk += 8) {
+                uint64_t packed = *reinterpret_cast<const uint64_t*>(tail_ptr + chunk);
+                CUTLASS_PRAGMA_UNROLL
+                for (int b = 0; b < 8; b++) {
+                  uint8_t raw = static_cast<uint8_t>(packed >> (b * 8));
+                  float f_val = fp8_e4m3fn_to_float(raw) * sf_tail;
                   shared.tile_slice[(chunk + b) + token_idx * D_SLICE] = static_cast<ElementQ>(f_val);
                 }
               }
             } else {
               CUTLASS_PRAGMA_UNROLL
-              for (int v = 0; v < D_SLICE; v++) {
-                shared.tile_slice[v + token_idx * D_SLICE] = ElementQ(0);
+              for (int col = 0; col < NOPE_TAIL; col++) {
+                shared.tile_slice[col + token_idx * D_SLICE] = ElementQ(0);
               }
             }
-          } else {
             if (my_v_pe_ptr) {
               CUTLASS_PRAGMA_UNROLL
-              for (int chunk = 0; chunk < D_SLICE; chunk += 4) {
+              for (int chunk = 0; chunk < D_ROPE; chunk += 4) {
                 uint64_t packed = *reinterpret_cast<const uint64_t*>(my_v_pe_ptr + chunk);
                 const ElementQ* vals = reinterpret_cast<const ElementQ*>(&packed);
                 CUTLASS_PRAGMA_UNROLL
                 for (int b = 0; b < 4; b++) {
-                  shared.tile_slice[(chunk + b) + token_idx * D_SLICE] = vals[b];
+                  shared.tile_slice[(NOPE_TAIL + chunk + b) + token_idx * D_SLICE] = vals[b];
                 }
               }
             } else {
               CUTLASS_PRAGMA_UNROLL
-              for (int v = 0; v < D_SLICE; v++) {
-                shared.tile_slice[v + token_idx * D_SLICE] = ElementQ(0);
+              for (int col = 0; col < D_ROPE; col++) {
+                shared.tile_slice[(NOPE_TAIL + col) + token_idx * D_SLICE] = ElementQ(0);
               }
             }
           }
@@ -635,57 +741,56 @@ struct XeMlaSparseMainloop<
       }
       sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_work_group<3>());
 
+      // Load V from SLM to registers — ONCE
       copy(s2r_v, tVsV, tVrV_mma);
 
-      cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, vv));
+      // DPAS for each head
+      CUTLASS_PRAGMA_UNROLL
+      for (int h = 0; h < HEADS_PER_WG; h++) {
+        cute::gemm(mma_pv, tArP[h], tArV, tArA[h](_, _, _, vv));
+      }
 
       sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_work_group<3>());
     }
   }
 
   //
-  // Sparse MLA Mainloop Operator - Two-phase: SWA indices then Extra indices
+  // Sparse MLA Mainloop Operator — Multi-head fused (HEADS_PER_WG heads per WG)
   //
-  // Phase 1: Process tokens from SWA (sliding window) indices using primary K cache
-  // Phase 2: Process tokens from Extra indices using extra K cache
+  // All heads share KV gather work. Each WG processes HEADS_PER_WG heads simultaneously.
   //
   template <typename QVCoord>
   CUTLASS_DEVICE void operator()(
-      TensorQ2D const& Q_2D,                // Q nope (q, d_nope)
-      TensorQ2D const& Q_pe_2D,             // Q rope (q, d_rope)
-      TensorK3D const& K_nope,              // Primary K nope (page_size, D_NOPE, num_pages)
-      TensorKPe3D const& K_pe,              // Primary K rope (page_size, D_ROPE, num_pages)
-      TensorScale3D const& KV_scale,        // Primary scales (page_size, 7, num_pages)
-      TensorV3D const& V_nope,              // Primary V nope (D_NOPE, page_size, num_pages) — transposed
-      TensorVPe3D const& V_pe,              // Primary V rope (D_ROPE, page_size, num_pages) — transposed
-      TensorK3D const& K_nope_extra,        // Extra K nope (extra_page_size, D_NOPE, num_extra_pages)
-      TensorKPe3D const& K_pe_extra,        // Extra K rope (extra_page_size, D_ROPE, num_extra_pages)
-      TensorScale3D const& KV_scale_extra,  // Extra scales (extra_page_size, 7, num_extra_pages)
-      TensorV3D const& V_nope_extra,        // Extra V nope (D_NOPE, extra_page_size, num_extra_pages) — transposed
-      TensorVPe3D const& V_pe_extra,        // Extra V rope (D_ROPE, extra_page_size, num_extra_pages) — transposed
-      FragA& tArA,                          // Output accumulator (q,v)
-      FragARow& tA_max,                     // Softmax row-wise max accumulator
-      FragARow& tA_sum,                     // Softmax row-wise sum accumulator
-      QVCoord blk_qv,                       // WG tile indices: (Q,V)
+      TensorQ2D const (&Q_2D)[HEADS_PER_WG],     // Q nope per head
+      TensorQ2D const (&Q_pe_2D)[HEADS_PER_WG],  // Q rope per head
+      TensorK3D const& K_nope,
+      TensorKPe3D const& K_pe,
+      TensorScale3D const& KV_scale,
+      TensorV3D const& V_nope,
+      TensorVPe3D const& V_pe,
+      TensorK3D const& K_nope_extra,
+      TensorKPe3D const& K_pe_extra,
+      TensorScale3D const& KV_scale_extra,
+      TensorV3D const& V_nope_extra,
+      TensorVPe3D const& V_pe_extra,
+      FragA (&tArA)[HEADS_PER_WG],
+      FragARow (&tA_max)[HEADS_PER_WG],
+      FragARow (&tA_sum)[HEADS_PER_WG],
+      QVCoord blk_qv,
       int thr_id,
       int batch_coord) {
-    /* Initialize accumulators */
-    clear(tArA);
-    fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
-    clear(tA_sum);
+    /* Initialize accumulators for all heads */
+    CUTLASS_PRAGMA_UNROLL
+    for (int h = 0; h < HEADS_PER_WG; h++) {
+      clear(tArA[h]);
+      fill(tA_max[h], cutlass::platform::numeric_limits<ElementA>::lowest());
+      clear(tA_sum[h]);
+    }
 
     /* Create MMAs for SLM copy setup */
     TiledMMAQK mma_qk{};
     TiledMMAPV mma_pv{};
 
-    /* -----------------------------------------------------------
-     * Set up SLM s2r copies for QK and PV B operands
-     * Using make_B_slm_copies with dummy global copies for type deduction.
-     * SLM layout is compact N-major:
-     *   QK: SLM[token + d_col * TILE_N]
-     *   PV: SLM[v_dim + token * D_SLICE]
-     * ----------------------------------------------------------- */
-    // Dummy bf16 tensors for creating block 2D copies (shape matches B operand)
     auto dummy_k = make_tensor(
         make_gmem_ptr(static_cast<ElementQ const*>(nullptr)), make_layout(make_shape(Int<TILE_N>{}, Int<D_SLICE>{})));
     auto dummy_v = make_tensor(
@@ -697,15 +802,13 @@ struct XeMlaSparseMainloop<
     auto [r2s_k, s2r_k] = make_B_slm_copies(mma_qk, global_copy_k);
     auto [r2s_v, s2r_v] = make_B_slm_copies(mma_pv, global_copy_v);
 
-    // SLM tensors: use Tiler_MN from the r2s copy as the shape (matches xe_gemm_slm pattern)
     auto sK = make_tensor(make_smem_ptr(shared.tile_slice), make_layout(typename decltype(r2s_k)::Tiler_MN{}));
     auto sV = make_tensor(make_smem_ptr(shared.tile_slice), make_layout(typename decltype(r2s_v)::Tiler_MN{}));
 
-    // Track whether this is the first tile (for softmax initialization)
     bool is_first_tile = true;
 
     // ========================================================================
-    // Phase 1: SWA (sliding window) indices — primary KV cache
+    // Phase 1: SWA indices — primary KV cache
     // ========================================================================
     int const* swa_indices_batch = params.ptr_swa_indices + batch_coord * params.swa_topk;
     int swa_num_valid = params.ptr_topk[batch_coord];
@@ -713,7 +816,6 @@ struct XeMlaSparseMainloop<
 
     for (int tile_idx = 0; tile_idx < swa_num_tiles; tile_idx++) {
       int tile_start = tile_idx * TILE_N;
-
       TileAddresses addrs = get_physical_kv_tile_addr(swa_indices_batch, tile_start, swa_num_valid, params.page_size);
       if (addrs.num_valid == 0) continue;
 
@@ -737,7 +839,6 @@ struct XeMlaSparseMainloop<
           sK,
           s2r_v,
           sV);
-
       is_first_tile = false;
     }
 
@@ -751,7 +852,6 @@ struct XeMlaSparseMainloop<
 
       for (int tile_idx = 0; tile_idx < extra_num_tiles; tile_idx++) {
         int tile_start = tile_idx * TILE_N;
-
         TileAddresses addrs =
             get_physical_kv_tile_addr(extra_indices_batch, tile_start, extra_num_valid, params.extra_page_size);
         if (addrs.num_valid == 0) continue;
@@ -776,7 +876,6 @@ struct XeMlaSparseMainloop<
             sK,
             s2r_v,
             sV);
-
         is_first_tile = false;
       }
     }

@@ -53,35 +53,18 @@ struct HCPreFuseKernel {
     float* pre_mix_shared = mixes_shared + HC3;                                     // 4 floats
     // Remaining space for residual chunk buffer if needed
 
-    // ===== Phase 1: RMS normalization with n_splits accumulation =====
-    // All threads participate
-
-    float rms = 0.0f;
-
-    // Accumulate sqrsum across n_splits
-    for (int split = 0; split < n_splits; split++) {
-      if (tid == 0) {
-        rms += gemm_out_sqrsum[split * T_total + token_id];
-      }
-    }
-
-    // Broadcast rms to all threads
-    item.barrier(sycl::access::fence_space::local_space);
-    if (tid == 0) {
-      mixes_shared[0] = rms;  // Temporary storage
-    }
-    item.barrier(sycl::access::fence_space::local_space);
-    rms = mixes_shared[0];
-
-    // Compute normalization factor
-    rms = sycl::rsqrt(rms / (HC * hidden_size) + rms_eps);
-
-    // Accumulate and normalize mixes - threads 0-23 handle 24 elements
+    // ===== Phase 1: RMS normalization fused with mix accumulation =====
+    // here rms norm is recomputed by every threads seems to be cheaper to recalculate than to seperately calculate and
+    // store in slm. analyse again for bigger split values, if that case is valid
     if (tid < HC3) {
+      float sqrsum = 0.0f;
       float mix_val = 0.0f;
       for (int split = 0; split < n_splits; split++) {
-        mix_val += gemm_out_mul[(split * T_total + token_id) * HC3 + tid];
+        const int row = split * T_total + token_id;
+        sqrsum += gemm_out_sqrsum[row];
+        mix_val += gemm_out_mul[row * HC3 + tid];
       }
+      const float rms = sycl::rsqrt(sqrsum / (HC * hidden_size) + rms_eps);
       mixes_shared[tid] = mix_val * rms;
     }
 

@@ -56,6 +56,7 @@ def parse_flash_attn_log(log_text: str) -> dict:
         raise ValueError("Benchmark finished! not found in flash_attn log")
 
     result = {}
+    col_index = None
 
     for line in lines[start_idx + 1 :]:
         line = line.strip()
@@ -64,22 +65,28 @@ def parse_flash_attn_log(log_text: str) -> dict:
             continue
         if re.match(r"\|\s*-+", line):
             continue
-        if "batch" in line:
-            continue
 
         cols = [c.strip() for c in line.strip("|").split("|")]
 
-        batch = cols[1]
-        q_seq_length = cols[2]
-        kv_seq_length = cols[3]
-        num_heads_q = cols[4]
-        num_heads_kv = cols[5]
-        head_dim = cols[6]
-        causal = cols[7]
-        local = cols[8]
-        use_sinks = cols[9]
-        page_size = cols[10]
-        ms = float(cols[-1])
+        # Parse header row to build column name -> index mapping
+        if "batch" in cols:
+            col_index = {name: idx for idx, name in enumerate(cols)}
+            continue
+
+        if col_index is None:
+            raise ValueError("Header row not found in flash_attn log table")
+
+        batch = cols[col_index["batch"]]
+        q_seq_length = cols[col_index["q_seq_length"]]
+        kv_seq_length = cols[col_index["kv_seq_length"]]
+        num_heads_q = cols[col_index["num_heads_q"]]
+        num_heads_kv = cols[col_index["num_heads_kv"]]
+        head_dim = cols[col_index["head_dim"]]
+        causal = cols[col_index["causal"]]
+        local = cols[col_index["local"]]
+        use_sinks = cols[col_index["use_sinks"]]
+        page_size = cols[col_index["page_size"]]
+        ms = float(cols[col_index["ms"]])
 
         key = (
             f"flash_attn:{batch}-{q_seq_length}-{kv_seq_length}"

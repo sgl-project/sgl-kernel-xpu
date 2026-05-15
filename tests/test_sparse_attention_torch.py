@@ -155,7 +155,7 @@ def test_sparse_attention_torch_full_coverage(
 
     NUM_ROWS = (seqlen_q + block_size_M - 1) // block_size_M
     if NNZ_S * block_size_N > seqlen_k:
-        return
+        pytest.skip("NNZ_S * block_size_N exceeds seqlen_k")
 
     NNZ_V = seqlen_k - NNZ_S * block_size_N
     block_count = torch.tensor(

@@ -103,10 +103,12 @@ def _convert_vertical_slash_indexes_torch(
                 s_ptr = 0
                 has_slash = NNZ_S > 0
                 s_val = s_list[0] if has_slash else 0
+                # Causal boundaries for this query block row
+                causal_limit = end_m + (kv_len - q_len)
+                causal_col_limit = end_m - 1 + (kv_len - q_len)
 
                 if causal and has_slash:
                     # Skip slashes whose diagonal is beyond the causal boundary
-                    causal_limit = end_m + (kv_len - q_len)
                     while s_val >= causal_limit and s_ptr + 1 < NNZ_S:
                         s_ptr += 1
                         s_val = s_list[s_ptr]
@@ -136,7 +138,7 @@ def _convert_vertical_slash_indexes_torch(
                             v_idx = v_list[v_ptr]
                             if v_idx < range_start:
                                 # Vertical column before the current slash block
-                                if not (causal and v_idx >= end_m + (kv_len - q_len)):
+                                if not (causal and v_idx >= causal_limit):
                                     column_index[b, h, row, tmp_col_cnt] = v_idx
                                     tmp_col_cnt += 1
                             # else: inside block range, implicitly covered
@@ -147,7 +149,7 @@ def _convert_vertical_slash_indexes_torch(
                             while s_ptr < NNZ_S:
                                 next_s = s_list[s_ptr]
                                 s_ptr += 1
-                                if causal and next_s >= end_m + (kv_len - q_len):
+                                if causal and next_s >= causal_limit:
                                     continue
                                 if causal:
                                     next_conv = max(
@@ -193,7 +195,7 @@ def _convert_vertical_slash_indexes_torch(
                                 while v_ptr < NNZ_V:
                                     v_idx = v_list[v_ptr]
                                     v_ptr += 1
-                                    if causal and v_idx >= end_m - 1 + (kv_len - q_len):
+                                    if causal and v_idx >= causal_col_limit:
                                         break
                                     if v_idx >= range_end:
                                         column_index[b, h, row, tmp_col_cnt] = v_idx
@@ -203,7 +205,7 @@ def _convert_vertical_slash_indexes_torch(
                     # No slashes: all verticals become columns
                     for vi in range(NNZ_V):
                         v_idx = v_list[vi]
-                        if causal and v_idx >= end_m - 1 + (kv_len - q_len):
+                        if causal and v_idx >= causal_col_limit:
                             break
                         if 0 <= v_idx < kv_len:
                             column_index[b, h, row, tmp_col_cnt] = v_idx
@@ -242,10 +244,10 @@ def _convert_vertical_slash_indexes_mergehead_torch(
     device = q_seqlens.device
     dtype = q_seqlens.dtype
 
-    block_count = torch.empty(B, H, num_rows, dtype=dtype, device=device)
-    block_offset = torch.empty(B, H, num_rows, NNZ_S, dtype=dtype, device=device)
-    column_count = torch.empty(B, H, num_rows, dtype=dtype, device=device)
-    column_index = torch.empty(B, H, num_rows, NNZ_V, dtype=dtype, device=device)
+    block_count = torch.zeros(B, H, num_rows, dtype=dtype, device=device)
+    block_offset = torch.zeros(B, H, num_rows, NNZ_S, dtype=dtype, device=device)
+    column_count = torch.zeros(B, H, num_rows, dtype=dtype, device=device)
+    column_index = torch.zeros(B, H, num_rows, NNZ_V, dtype=dtype, device=device)
 
     for b in range(B):
         q_len = q_seqlens[b].item()
@@ -264,9 +266,11 @@ def _convert_vertical_slash_indexes_mergehead_torch(
                 s_ptr = 0
                 has_slash = nnz_s_h > 0
                 s_val = s_list[0] if has_slash else 0
+                # Causal boundaries for this query block row
+                causal_limit = end_m + (kv_len - q_len)
+                causal_col_limit = end_m - 1 + (kv_len - q_len)
 
                 if causal and has_slash:
-                    causal_limit = end_m + (kv_len - q_len)
                     while s_val >= causal_limit and s_ptr + 1 < nnz_s_h:
                         s_ptr += 1
                         s_val = s_list[s_ptr]
@@ -294,7 +298,7 @@ def _convert_vertical_slash_indexes_mergehead_torch(
                         if v_ptr < nnz_v_h and v_list[v_ptr] < range_end:
                             v_idx = v_list[v_ptr]
                             if v_idx < range_start:
-                                if not (causal and v_idx >= end_m + (kv_len - q_len)):
+                                if not (causal and v_idx >= causal_limit):
                                     column_index[b, h, row, tmp_col_cnt] = v_idx
                                     tmp_col_cnt += 1
                             v_ptr += 1
@@ -303,7 +307,7 @@ def _convert_vertical_slash_indexes_mergehead_torch(
                             while s_ptr < nnz_s_h:
                                 next_s = s_list[s_ptr]
                                 s_ptr += 1
-                                if causal and next_s >= end_m + (kv_len - q_len):
+                                if causal and next_s >= causal_limit:
                                     continue
                                 if causal:
                                     next_conv = max(
@@ -345,7 +349,7 @@ def _convert_vertical_slash_indexes_mergehead_torch(
                                 while v_ptr < nnz_v_h:
                                     v_idx = v_list[v_ptr]
                                     v_ptr += 1
-                                    if causal and v_idx >= end_m - 1 + (kv_len - q_len):
+                                    if causal and v_idx >= causal_col_limit:
                                         break
                                     if v_idx >= range_end:
                                         column_index[b, h, row, tmp_col_cnt] = v_idx
@@ -354,7 +358,7 @@ def _convert_vertical_slash_indexes_mergehead_torch(
                 else:
                     for vi in range(nnz_v_h):
                         v_idx = v_list[vi]
-                        if causal and v_idx >= end_m - 1 + (kv_len - q_len):
+                        if causal and v_idx >= causal_col_limit:
                             break
                         if 0 <= v_idx < kv_len:
                             column_index[b, h, row, tmp_col_cnt] = v_idx

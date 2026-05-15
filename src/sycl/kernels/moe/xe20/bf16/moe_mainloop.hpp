@@ -35,6 +35,7 @@
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <sycl/sycl.hpp>
 
+#include "../common/activation.hpp"
 #include "cutlass/kernel_hardware_info.h"
 #include "cutlass/platform/platform.h"
 #include "cutlass/tensor_ref.h"
@@ -47,16 +48,19 @@
 #pragma clang diagnostic ignored "-Wpass-failed"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
-#define SILU 0
-#define GELU 1
-#define SWIGLU_GPT_OSS 2
-
 template <typename T>
 struct dump;
 
 namespace MoE {
 
 using namespace cute;
+
+// Shared activation IDs / fused gate-and-mul live in common/activation.hpp.
+// Re-export under this namespace so existing call sites (moe_kernel.hpp,
+// the activation switch below) read the same identifiers as before.
+inline constexpr int SILU = moe_xe20::ACT_SILU;
+inline constexpr int GELU = moe_xe20::ACT_GELU;
+inline constexpr int SWIGLU_GPT_OSS = moe_xe20::ACT_SWIGLU_GPT_OSS;
 
 template <int Stages>
 class XeDefault {};
@@ -356,26 +360,7 @@ struct MoEMainloop<
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tCrC0.size(); ++i) {
-      float x = tCrC0(i);
-      float y = tCrC1(i);
-      float s;
-      if constexpr (ActType == SILU) {
-        s = 1.0f / (1.0f + sycl::native::exp(-x));
-        tCrC0(i) = x * s * y;
-      } else if constexpr (ActType == SWIGLU_GPT_OSS) {
-        float gate = sycl::fmin(x, gemm1_limit);
-        float up = sycl::fmax(-gemm1_limit, sycl::fmin(y, gemm1_limit));
-        float t = gate * gemm1_alpha;
-        s = 1.0f / (1.0f + sycl::native::exp(-t));
-        tCrC0(i) = gate * s * (up + 1.0f);
-      } else {                                        // GELU
-        constexpr float kBeta = 0.7978845608028654f;  // sqrt(2.0f / pi)
-        constexpr float kAlpha = 0.044715f;
-        float x_cube = x * x * x;
-        float tanh_arg = kBeta * (x + kAlpha * x_cube);
-        s = 0.5f * (1.0f + std::tanh(tanh_arg));
-        tCrC0(i) = x * s * y;
-      }
+      tCrC0(i) = moe_xe20::apply_fused_activation<ActType>(tCrC0(i), tCrC1(i), gemm1_alpha, gemm1_limit);
     }
 
     reorder(tCrC0, tCrD_final_sg_tensor0);

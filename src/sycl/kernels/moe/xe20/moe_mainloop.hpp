@@ -388,8 +388,8 @@ struct MoEMainloop<
           tCrC0(i) = x * s * y;
           break;
         }
-	default:
-	  break;
+        default:
+          break;
       }
     }
 

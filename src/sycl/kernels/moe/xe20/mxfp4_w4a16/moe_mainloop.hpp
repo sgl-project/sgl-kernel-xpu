@@ -39,6 +39,7 @@
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <sycl/sycl.hpp>
 
+#include "../common/activation.hpp"
 #include "cutlass/kernel_hardware_info.h"
 #include "cutlass/platform/platform.h"
 #include "cutlass/tensor_ref.h"
@@ -51,13 +52,16 @@
 #pragma clang diagnostic ignored "-Wpass-failed"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
-#define SILU 0
-#define GELU 1
-#define SWIGLU_GPT_OSS 2
-
 namespace MoE_MXFP4_W4A16 {
 
 using namespace cute;
+
+// Shared activation IDs / fused gate-and-mul live in common/activation.hpp.
+// Re-export under this namespace so existing call sites (moe_kernel.hpp,
+// the activation switch below) read the same identifiers as before.
+inline constexpr int SILU = moe_xe20::ACT_SILU;
+inline constexpr int GELU = moe_xe20::ACT_GELU;
+inline constexpr int SWIGLU_GPT_OSS = moe_xe20::ACT_SWIGLU_GPT_OSS;
 
 // MXFP4 invariant: one scale value per 32 consecutive K-elements.
 static constexpr int MXFP4_GROUP_SIZE = 32;
@@ -306,6 +310,11 @@ struct MoEMainloopMxfp4W4A16<
       prefetch(prefetch_b, pBgBp(_, _, _, prefetch_k));
     }
 
+    // Loop-invariant N-base for this SG's slice in the WG tile — used by
+    // apply_B_scales_mma to map each MMA-B fragment element to its N-row.
+    const int sg_n_coord = (thr_id / SUBGROUP_SIZE) % ATOM_N_V;
+    const int n_sg_base = sg_n_coord * SG_N;
+
     for (int k_tile = k_start_idx; k_tile < k_tile_count; ++k_tile, ++prefetch_k) {
       barrier_arrive(barrier_scope);
 
@@ -329,8 +338,6 @@ struct MoEMainloopMxfp4W4A16<
       // Apply per-block MXFP4 scales to tSrB in-place. Each element's
       // N-coord is looked up in the MMA-B coord companion; scale_sg holds
       // the per-SG fp32 scales are cast to bf16 in apply_B_scales_mma.
-      const int sg_n_coord = (thr_id / SUBGROUP_SIZE) % ATOM_N_V;
-      const int n_sg_base = sg_n_coord * SG_N;
       apply_B_scales_mma<SG_N>(tSrB, tCrB_coord, scale_sg, n_sg_base);
 
       cute::gemm(mma, tSrA, tSrB, tCrC);
@@ -459,12 +466,15 @@ struct MoEMainloopMxfp4W4A16<
       prefetch(prefetch_b1, pBgBp1(_, _, _, prefetch_k));
     }
 
+    // Loop-invariant N-base for this SG's slice in the WG tile — used by
+    // apply_B_scales_mma to map each MMA-B fragment element to its N-row.
+    const int sg_n_coord = (thr_id / SUBGROUP_SIZE) % ATOM_N_V;
+    const int n_sg_base = sg_n_coord * SG_N;
+
     for (int k_tile = k_start_idx; k_tile < k_tile_count; ++k_tile, ++prefetch_k) {
       barrier_arrive(barrier_scope);
 
       copy(tiled_copy_a, tAgA(_, _, _, k_tile), tArA);
-      const int sg_n_coord = (thr_id / SUBGROUP_SIZE) % ATOM_N_V;
-      const int n_sg_base = sg_n_coord * SG_N;
 
       // GEMM0 (gate)
       copy(tiled_copy_b0, tBgBp0(_, _, _, k_tile), tBrB_packed0);
@@ -497,26 +507,7 @@ struct MoEMainloopMxfp4W4A16<
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tCrC0.size(); ++i) {
-      float x = tCrC0(i);
-      float y = tCrC1(i);
-      float s;
-      if constexpr (ActType == SILU) {
-        s = 1.0f / (1.0f + sycl::native::exp(-x));
-        tCrC0(i) = x * s * y;
-      } else if constexpr (ActType == SWIGLU_GPT_OSS) {
-        float gate = sycl::fmin(x, gemm1_limit);
-        float up = sycl::fmax(-gemm1_limit, sycl::fmin(y, gemm1_limit));
-        float t = gate * gemm1_alpha;
-        s = 1.0f / (1.0f + sycl::native::exp(-t));
-        tCrC0(i) = gate * s * (up + 1.0f);
-      } else {  // GELU (tanh approx)
-        constexpr float kBeta = 0.7978845608028654f;
-        constexpr float kAlpha = 0.044715f;
-        float x_cube = x * x * x;
-        float tanh_arg = kBeta * (x + kAlpha * x_cube);
-        s = 0.5f * (1.0f + std::tanh(tanh_arg));
-        tCrC0(i) = x * s * y;
-      }
+      tCrC0(i) = moe_xe20::apply_fused_activation<ActType>(tCrC0(i), tCrC1(i), gemm1_alpha, gemm1_limit);
     }
 
     reorder(tCrC0, tCrD_final_sg_tensor0);

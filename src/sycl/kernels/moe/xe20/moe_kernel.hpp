@@ -95,30 +95,29 @@ class MoEGEMM {
     const int32_t num_experts;
     int32_t* workspace;
     TiledMMA mma;
+    int32_t ld_b;
     float gemm1_alpha = 1.702f;
     float gemm1_limit = 7.0f;
   };
 
-  auto make_B_tensors(ElementB* ptr_B, int N, int K) {
+  auto make_B_tensors(ElementB* ptr_B, int N, int K, int ld_b) {
     if constexpr (FuseAct) {
       if constexpr (ActType == ActivationType::SWIGLU_GPT_OSS) {
-        // Weights are interleaved for GPT-OSS: [gate_row0, up_row0, gate_row1, up_row1, ...]
-        // Gate rows are at offsets 0, 2*K, 4*K, ... → row stride = 2*K
         auto B0 =
-            make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N / 2, K), make_stride(2 * K, _1{})));
-        // Up rows are at offsets K, 3*K, 5*K, ... → start one row in, same stride
+            make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N / 2, K), make_stride(2 * ld_b, _1{})));
         auto B1 = make_tensor(
-            make_gmem_ptr<ElementB>(ptr_B + K), make_layout(make_shape(N / 2, K), make_stride(2 * K, _1{})));
+            make_gmem_ptr<ElementB>(ptr_B + ld_b), make_layout(make_shape(N / 2, K), make_stride(2 * ld_b, _1{})));
         return cute::make_tuple(B0, B1);
       } else {
-        // SiLU/GELU: block split – first N/2 rows = gate, last N/2 rows = up
-        auto B0 = make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N / 2, K), make_stride(K, _1{})));
-        ElementB* ptr_B1 = ptr_B + (N / 2) * K;
-        auto B1 = make_tensor(make_gmem_ptr<ElementB>(ptr_B1), make_layout(make_shape(N / 2, K), make_stride(K, _1{})));
+        auto B0 =
+            make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N / 2, K), make_stride(ld_b, _1{})));
+        ElementB* ptr_B1 = ptr_B + static_cast<int64_t>(N / 2) * ld_b;
+        auto B1 =
+            make_tensor(make_gmem_ptr<ElementB>(ptr_B1), make_layout(make_shape(N / 2, K), make_stride(ld_b, _1{})));
         return cute::make_tuple(B0, B1);
       }
     } else {
-      auto B = make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N, K), make_stride(K, _1{})));
+      auto B = make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N, K), make_stride(ld_b, _1{})));
       return cute::make_tuple(B);
     }
   }
@@ -217,7 +216,8 @@ class MoEGEMM {
       }
 
       int expert_id = i;
-      int64_t B_offset = static_cast<int64_t>(expert_id) * static_cast<int64_t>(N) * static_cast<int64_t>(K);
+      int ld_b = params.ld_b;
+      int64_t B_offset = static_cast<int64_t>(expert_id) * static_cast<int64_t>(N) * static_cast<int64_t>(ld_b);
       ElementA* ptr_A_curr_batch = const_cast<ElementA*>(params.Activations) + pre_rows * K;
       ElementB* ptr_B_curr_batch = const_cast<ElementB*>(params.Weights) + B_offset;
       float* ptr_Bias_curr_batch = nullptr;
@@ -227,7 +227,7 @@ class MoEGEMM {
 
       auto A_tensor =
           make_tensor(make_gmem_ptr<ElementA>(ptr_A_curr_batch), make_layout(make_shape(M, K), make_stride(K, _1{})));
-      auto B_tensor = make_B_tensors(ptr_B_curr_batch, N, K);
+      auto B_tensor = make_B_tensors(ptr_B_curr_batch, N, K, ld_b);
       auto D_tensor = make_D_tensors(params.Outputs, pre_rows, M, N);
       auto Bias_tensor = make_Bias_tensors(ptr_Bias_curr_batch, N);
 

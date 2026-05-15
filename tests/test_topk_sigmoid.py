@@ -1,4 +1,5 @@
 import sys
+from typing import Optional
 
 import pytest
 import sgl_kernel
@@ -9,22 +10,32 @@ import utils
 device = utils.get_device()
 
 
-def fused_topk_torch_native(
+def fused_topk_sigmoid_torch_native(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
+    correction_bias: Optional[torch.Tensor],
 ):
     assert (
         hidden_states.shape[0] == gating_output.shape[0]
     ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
-    M, _ = hidden_states.shape
-    topk_weights = torch.empty(
-        M, topk, dtype=torch.float32, device=hidden_states.device
-    )
-    topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
-    topk_weights = F.softmax(gating_output.float(), dim=-1)
-    topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
+    if correction_bias is not None:
+        n_routed_experts = gating_output.shape[-1]
+        scores = F.sigmoid(gating_output)
+        scores_for_choice = scores.view(
+            -1, n_routed_experts
+        ) + correction_bias.unsqueeze(0)
+        topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=False)[1]
+        topk_weights = scores.gather(1, topk_ids)
+    else:
+        M, _ = hidden_states.shape
+        topk_weights = torch.empty(
+            M, topk, dtype=torch.float32, device=hidden_states.device
+        )
+        topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
+        topk_weights = F.sigmoid(gating_output.float())
+        topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     return topk_weights, topk_ids
@@ -35,20 +46,25 @@ def fused_topk_torch_native(
 @pytest.mark.parametrize("n_expert", [8, 32, 256])
 @pytest.mark.parametrize("n_topk", [1, 2, 4])
 @pytest.mark.parametrize("renormalize", [False, True])
-def test_topk_softmax(dtype, n_token, n_topk, n_expert, renormalize):
+@pytest.mark.parametrize("with_correction_bias", [False, True])
+def test_topk_sigmoid(
+    dtype, n_token, n_topk, n_expert, renormalize, with_correction_bias
+):
     torch.manual_seed(1024)
 
-    # expand gating_output by M, otherwise bfloat16 fall into same value aftering truncating
+    # expand gating_output by M, otherwise bfloat16 fall into same value after truncating
     hidden_states = torch.randn(n_token, 100, device=device, dtype=dtype)
-    gating_output = (
-        torch.randn(n_token, n_expert, device=device, dtype=dtype) * 2 * n_token
-    )
+    gating_output = torch.randn(n_token, n_expert, device=device, dtype=dtype)
+    correction_bias = None
+    if with_correction_bias:
+        correction_bias = torch.randn((n_expert), dtype=torch.float32, device=device)
 
-    ref_token_weights, ref_topk_indices = fused_topk_torch_native(
+    ref_token_weights, ref_topk_indices = fused_topk_sigmoid_torch_native(
         hidden_states.float(),
         gating_output.float(),
         n_topk,
         renormalize,
+        correction_bias,
     )
 
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
@@ -62,11 +78,12 @@ def test_topk_softmax(dtype, n_token, n_topk, n_expert, renormalize):
         M, n_topk, dtype=torch.int32, device=hidden_states.device
     )
 
-    sgl_kernel.topk_softmax(
+    sgl_kernel.topk_sigmoid(
         topk_weights,
         topk_indices,
         gating_output,
         renormalize,
+        correction_bias,
     )
 
     # Compare the results

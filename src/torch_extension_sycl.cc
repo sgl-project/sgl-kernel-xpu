@@ -48,6 +48,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
 
+  m.def(
+      "topk_sigmoid(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, Tensor? "
+      "correction_bias) -> ()");
+  m.impl("topk_sigmoid", torch::kXPU, &at::native::xpu::topk_sigmoid);
+
   m.def("top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
   m.impl("top_k_renorm_probs", torch::kXPU, &top_k_renorm_probs);
 
@@ -163,9 +168,24 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "float eps, Tensor! q_weight, Tensor! k_weight, float base, bool is_neox, Tensor! position_ids, "
       "float factor, float low, float high, float attention_factor, int rotary_dim) -> ()");
   m.impl("fused_qk_norm_rope", torch::kXPU, &at::native::xpu::fused_qk_norm_rope);
+  /*
+   * Fused QK RoPE (no RMS_Norm)
+   */
+  m.def(
+      "fused_qk_rope(Tensor! qkv, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, "
+      "Tensor! q_weight, Tensor! k_weight, float base, bool is_neox, Tensor! position_ids, "
+      "float factor, float low, float high, float attention_factor, int rotary_dim) -> ()");
+  m.impl("fused_qk_rope", torch::kXPU, &at::native::xpu::fused_qk_rope);
   /* utils */
   m.def("query_device(int device_id) -> (int, int)");
   m.impl("query_device", c10::DispatchKey::BackendSelect, &query_device);
+
+  /* HC SPLIT SINKHORN */
+  m.def(
+      "hc_split_sinkhorn(Tensor mixes, Tensor hc_scale, Tensor hc_base, "
+      "Tensor! pre, Tensor! post, Tensor! comb, "
+      "int hc_mult, int sinkhorn_iters, float eps) -> ()");
+  m.impl("hc_split_sinkhorn", torch::kXPU, &hc_split_sinkhorn);
 }
 
 REGISTER_EXTENSION(common_ops)

@@ -114,6 +114,12 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
 void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize);
+void topk_sigmoid(
+    at::Tensor& topk_weights,
+    at::Tensor& topk_indices,
+    at::Tensor& gating_output,
+    bool renormalize,
+    const c10::optional<at::Tensor>& correction_bias);
 
 std::tuple<at::Tensor, at::Tensor> rotary_embedding(
     at::Tensor& positions,
@@ -149,6 +155,22 @@ void fused_qk_norm_rope(
     int64_t num_heads_v,
     int64_t head_dim,
     double eps,
+    torch::Tensor& q_weight,
+    torch::Tensor& k_weight,
+    double base,
+    bool is_neox,
+    torch::Tensor& position_ids,
+    double factor,
+    double low,
+    double high,
+    double attention_factor,
+    int64_t rotary_dim);
+void fused_qk_rope(
+    torch::Tensor& qkv,
+    int64_t num_heads_q,
+    int64_t num_heads_k,
+    int64_t num_heads_v,
+    int64_t head_dim,
     torch::Tensor& q_weight,
     torch::Tensor& k_weight,
     double base,
@@ -242,6 +264,12 @@ void topk_softmax(
     torch::Tensor& topk_indices,
     torch::Tensor& token_expert_indices,
     torch::Tensor& gating_output);
+void topk_sigmoid(
+    torch::Tensor& topk_weights,
+    torch::Tensor& topk_indices,
+    torch::Tensor& gating_output,
+    bool renormalize,
+    const std::optional<torch::Tensor>& correction_bias);
 torch::Tensor swiglu_gpt_oss_sigmoid_alpha(torch::Tensor x, double alpha, double limit);
 
 std::vector<at::Tensor> moe_fused_gate(
@@ -357,6 +385,17 @@ void scaled_fp4_experts_quant(
     torch::Tensor const& input_global_scale,
     torch::Tensor const& input_offset_by_experts,
     torch::Tensor const& output_scale_offset_by_experts);
+
+void hc_split_sinkhorn(
+    const at::Tensor& mixes,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    at::Tensor& pre,
+    at::Tensor& post,
+    at::Tensor& comb,
+    int64_t hc_mult,
+    int64_t sinkhorn_iters,
+    double eps);
 
 /*
  * From csrc/speculative

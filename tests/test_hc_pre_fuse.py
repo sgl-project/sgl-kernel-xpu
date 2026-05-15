@@ -33,14 +33,13 @@ def _hc_pre_fuse_torch(
     mixes = gemm_out_mul.sum(dim=0)  # [T, 24]
     mixes = mixes * rms.unsqueeze(-1)  # [T, 24]
 
-    # Phase 2a: post_mix computation
+    # post_mix computation
     post_logits = mixes[:, hc : 2 * hc] * hc_scale[1] + hc_base[hc : 2 * hc]
     post_mix = torch.sigmoid(post_logits) * hc_post_mult_value  # [T, 4]
 
-    # Phase 2a: Sinkhorn on comb matrix
+    # Sinkhorn
     comb = (mixes[:, 2 * hc :] * hc_scale[2] + hc_base[2 * hc :]).reshape(T, hc, hc)
 
-    # Sinkhorn iterations
     comb = torch.softmax(comb, dim=-1) + hc_sinkhorn_eps
     comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
     for _ in range(sinkhorn_iters - 1):
@@ -49,7 +48,7 @@ def _hc_pre_fuse_torch(
 
     comb_mix = comb.reshape(T, hc * hc)  # [T, 16]
 
-    # Phase 2b: pre_mix computation (internal only)
+    # pre_mix
     pre_logits = mixes[:, :hc] * hc_scale[0] + hc_base[:hc]
     pre_mix = torch.sigmoid(pre_logits) + hc_pre_eps  # [T, 4]
 
@@ -62,7 +61,6 @@ def _hc_pre_fuse_torch(
 
 
 def _make_inputs(T, hidden_size, n_splits, device, seed=42):
-    """Generate test inputs for hc_pre_fuse with hc=4."""
     hc = 4
     hc_mult3 = (2 + hc) * hc  # 24
 
@@ -80,10 +78,10 @@ def _make_inputs(T, hidden_size, n_splits, device, seed=42):
     hc_scale = torch.rand(3, dtype=torch.float32, device=device) * 0.5 + 0.5
     hc_base = torch.randn(hc_mult3, dtype=torch.float32, device=device) * 0.1
 
-    # Residual from previous layer
+    # Residual
     residual = torch.randn(T, hc, hidden_size, dtype=torch.bfloat16, device=device)
 
-    # Output tensors (allocated by caller)
+    # Output tensors
     post_mix = torch.empty(T, hc, dtype=torch.float32, device=device)
     comb_mix = torch.empty(T, hc * hc, dtype=torch.float32, device=device)
     layer_input = torch.empty(T, hidden_size, dtype=torch.bfloat16, device=device)
@@ -101,9 +99,7 @@ def _make_inputs(T, hidden_size, n_splits, device, seed=42):
 
 
 @pytest.mark.parametrize("T", [1, 16, 128])
-@pytest.mark.parametrize(
-    "hidden_size", [7168, 512]
-)  # 7168 is model default, 512 for faster testing
+@pytest.mark.parametrize("hidden_size", [7168, 512])
 @pytest.mark.parametrize("n_splits", [1, 4])
 def test_hc_pre_fuse(T, hidden_size, n_splits):
     hc = 4
@@ -124,7 +120,6 @@ def test_hc_pre_fuse(T, hidden_size, n_splits):
         layer_input,
     ) = _make_inputs(T, hidden_size, n_splits, device=f"{device}:0")
 
-    # Reference implementation
     post_mix_ref, comb_mix_ref, layer_input_ref = _hc_pre_fuse_torch(
         gemm_out_mul,
         gemm_out_sqrsum,
@@ -139,7 +134,6 @@ def test_hc_pre_fuse(T, hidden_size, n_splits):
         hc_post_mult_value,
     )
 
-    # XPU kernel
     hc_pre_fuse(
         gemm_out_mul,
         gemm_out_sqrsum,
@@ -175,9 +169,3 @@ def test_hc_pre_fuse(T, hidden_size, n_splits):
     ), f"layer_input mismatch: max={(layer_input.float() - layer_input_ref).abs().max():.2e}"
 
     print(f"✓ T={T}, hidden_size={hidden_size}, n_splits={n_splits} passed")
-
-
-if __name__ == "__main__":
-    # Quick smoke test
-    test_hc_pre_fuse(T=16, hidden_size=512, n_splits=1)
-    print("All tests passed!")

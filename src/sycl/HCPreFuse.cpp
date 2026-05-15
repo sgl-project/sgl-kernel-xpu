@@ -21,22 +21,21 @@ struct HCPreFuseKernel {
   const float* __restrict__ gemm_out_sqrsum;  // [n_splits, T] FP32
   const float* __restrict__ hc_scale;         // [3] FP32
   const float* __restrict__ hc_base;          // [24] FP32
-  const scalar_t* __restrict__ residual;      // [T, 4, D] BF16 or FP16
+  const scalar_t* __restrict__ residual;      // [T, 4, D] BF16
   float* __restrict__ post_mix;               // [T, 4] FP32
   float* __restrict__ comb_mix;               // [T, 16] FP32
-  scalar_t* __restrict__ layer_input;         // [T, D] BF16 or FP16
+  scalar_t* __restrict__ layer_input;         // [T, D] BF16
 
   int T_total;
   int hidden_size;
   int n_splits;
-  int hidden_block;
   float rms_eps;
   float hc_pre_eps;
   float hc_sinkhorn_eps;
   float hc_post_mult_value;
   int sinkhorn_iters;
 
-  sycl::local_accessor<float, 1> slm_;  // Shared local memory
+  sycl::local_accessor<float, 1> slm_;
 
   [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
     sycl::sub_group sg = item.get_sub_group();
@@ -51,11 +50,8 @@ struct HCPreFuseKernel {
     // Access shared memory
     float* mixes_shared = slm_.get_multi_ptr<sycl::access::decorated::no>().get();  // 24 floats
     float* pre_mix_shared = mixes_shared + HC3;                                     // 4 floats
-    // Remaining space for residual chunk buffer if needed
 
-    // ===== Phase 1: RMS normalization fused with mix accumulation =====
-    // here rms norm is recomputed by every threads seems to be cheaper to recalculate than to seperately calculate and
-    // store in slm. analyse again for bigger split values, if that case is valid
+    // RMS normalization fused with mix accumulation
     if (tid < HC3) {
       float sqrsum = 0.0f;
       float mix_val = 0.0f;
@@ -70,29 +66,22 @@ struct HCPreFuseKernel {
 
     item.barrier(sycl::access::fence_space::local_space);
 
-    // ===== Phase 2: Concurrent execution =====
-
     if (sg_id < 2) {
-      // ===== Phase 2a: Threads 0-31 (Subgroups 0-1) =====
-
+      // Threads 0-31 (Subgroups 0-1)
       if (sg_id == 0) {
-        // === Subgroup 0: Sinkhorn + post_mix + comb_mix ===
-
-        // Compute post_mix from mixes[4:8]
+        // post_mix from mixes[4:8]
         if (lane_id < HC) {
           const float post_logit = mixes_shared[HC + lane_id] * hc_scale[1] + hc_base[HC + lane_id];
           post_mix[static_cast<int64_t>(token_id) * HC + lane_id] =
               hc_post_mult_value / (1.0f + sycl::exp(-post_logit));
         }
 
-        // Sinkhorn on mixes[8:24] -> comb matrix [4×4]
-        // Each of 16 threads handles one element of the 4×4 matrix
         const int row_i = lane_id / HC;
         const int col_j = lane_id % HC;
 
+        // sinkhorn from mixes[8:24]
         float comb_logit = mixes_shared[2 * HC + lane_id] * hc_scale[2] + hc_base[2 * HC + lane_id];
 
-        // Initial row-wise softmax
         float row_max = comb_logit;
 #pragma unroll
         for (int mask = 1; mask < HC; mask <<= 1)
@@ -106,24 +95,20 @@ struct HCPreFuseKernel {
 
         comb_val = comb_val / row_sum + hc_sinkhorn_eps;
 
-        // Initial column normalization
         float col_sum = comb_val;
 #pragma unroll
         for (int mask = HC; mask < HC2; mask <<= 1)
           col_sum += sycl::permute_group_by_xor(sg, col_sum, mask);
         comb_val /= col_sum + hc_sinkhorn_eps;
 
-// Sinkhorn iterations
 #pragma unroll
         for (int iter = 1; iter < sinkhorn_iters; ++iter) {
-          // Row normalization
           row_sum = comb_val;
 #pragma unroll
           for (int mask = 1; mask < HC; mask <<= 1)
             row_sum += sycl::permute_group_by_xor(sg, row_sum, mask);
           comb_val /= row_sum + hc_sinkhorn_eps;
 
-          // Column normalization
           col_sum = comb_val;
 #pragma unroll
           for (int mask = HC; mask < HC2; mask <<= 1)
@@ -131,16 +116,13 @@ struct HCPreFuseKernel {
           comb_val /= col_sum + hc_sinkhorn_eps;
         }
 
-        // Write comb_mix output
         comb_mix[static_cast<int64_t>(token_id) * HC2 + lane_id] = comb_val;
       }
 
     } else {
-      // ===== Phase 2b: Threads 32-127 (Subgroups 2-7) =====
-      // Weighted sum for layer_input
+      // Threads 32-127 (Subgroups 2-7)
 
-      // Compute pre_mix (internal only, not output)
-      // Use first 4 threads from subgroup 2 to compute all 4 pre_mix values
+      // pre_mix from mixes[:4]
       if (tid >= 32 && tid < 32 + HC) {
         const int pre_idx = tid - 32;
         const float pre_logit = mixes_shared[pre_idx] * hc_scale[0] + hc_base[pre_idx];
@@ -150,7 +132,6 @@ struct HCPreFuseKernel {
       item.barrier(sycl::access::fence_space::local_space);
 
       // Weighted sum: layer_input[t, h] = sum_k(pre_mix[k] * residual[t, k, h])
-      // All threads 32-127 (96 threads) participate
       const int threads_for_wsum = WG_SIZE - 32;  // 96 threads
       const int thread_local_id = tid - 32;       // 0..95
 
@@ -158,14 +139,12 @@ struct HCPreFuseKernel {
       for (int h = thread_local_id; h < hidden_size; h += threads_for_wsum) {
         float accum = 0.0f;
 
-        // Accumulate: sum_k(pre_mix[k] * residual[t, k, h])
         for (int k = 0; k < HC; k++) {
           const int64_t res_idx = (static_cast<int64_t>(token_id) * HC + k) * hidden_size + h;
           const float res_val = static_cast<float>(residual[res_idx]);
           accum += pre_mix_shared[k] * res_val;
         }
 
-        // Write output
         layer_input[static_cast<int64_t>(token_id) * hidden_size + h] = static_cast<scalar_t>(accum);
       }
     }
@@ -201,20 +180,15 @@ void hc_pre_fuse(
   TORCH_CHECK(gemm_out_sqrsum.scalar_type() == at::kFloat, "gemm_out_sqrsum must be float32");
   TORCH_CHECK(hc_scale.scalar_type() == at::kFloat, "hc_scale must be float32");
   TORCH_CHECK(hc_base.scalar_type() == at::kFloat, "hc_base must be float32");
-  TORCH_CHECK(
-      residual.scalar_type() == at::kBFloat16 || residual.scalar_type() == at::kHalf,
-      "residual must be bfloat16 or float16");
+  TORCH_CHECK(residual.scalar_type() == at::kBFloat16, "residual must be bfloat16");
   TORCH_CHECK(post_mix.scalar_type() == at::kFloat, "post_mix must be float32");
   TORCH_CHECK(comb_mix.scalar_type() == at::kFloat, "comb_mix must be float32");
-  TORCH_CHECK(
-      layer_input.scalar_type() == at::kBFloat16 || layer_input.scalar_type() == at::kHalf,
-      "layer_input must be bfloat16 or float16");
+  TORCH_CHECK(layer_input.scalar_type() == at::kBFloat16, "layer_input must be bfloat16");
 
   TORCH_CHECK(static_cast<int>(hc_mult) == HC, "hc_mult must be ", HC, ", got ", hc_mult);
   TORCH_CHECK(hc_scale.numel() == 3, "hc_scale must have 3 elements");
   TORCH_CHECK(hc_base.numel() == HC3, "hc_base must have ", HC3, " elements");
 
-  // Extract shapes
   const int64_t n_splits_actual = gemm_out_mul.size(0);
   const int64_t T = gemm_out_mul.size(1);
   TORCH_CHECK(gemm_out_mul.size(2) == HC3, "gemm_out_mul last dim must be ", HC3);
@@ -232,85 +206,35 @@ void hc_pre_fuse(
   TORCH_CHECK(T < std::numeric_limits<int>::max(), "T too large");
   TORCH_CHECK(hidden_size < std::numeric_limits<int>::max(), "hidden_size too large");
 
-  // Determine hidden_block (matching TileLang logic)
-  int hidden_block = 256;
-  if (hidden_size == 28672) {
-    hidden_block = 128;
-  } else if (hidden_size == 16384 || hidden_size == 7168) {
-    hidden_block = 256;
-  } else {
-    // Use GCD-based approach
-    for (int candidate : {512, 256, 128, 64}) {
-      if (hidden_size % candidate == 0) {
-        hidden_block = candidate;
-        break;
-      }
-    }
-  }
-
   auto q = dpcppGetCurrentQueue();
 
-  // Calculate SLM size: mixes (24) + pre_mix (4) + extra buffer (256)
   constexpr int slm_size = HC3 + HC + 256;
 
-  // Dispatch based on residual data type
-  if (residual.scalar_type() == at::kBFloat16) {
-    using scalar_t = sycl::ext::oneapi::bfloat16;
+  using scalar_t = sycl::ext::oneapi::bfloat16;
 
-    q.submit([&](sycl::handler& cgh) {
-      sycl::local_accessor<float, 1> slm(sycl::range<1>(slm_size), cgh);
+  q.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> slm(sycl::range<1>(slm_size), cgh);
 
-      auto ker = HCPreFuseKernel<scalar_t>{
-          gemm_out_mul.data_ptr<float>(),
-          gemm_out_sqrsum.data_ptr<float>(),
-          hc_scale.data_ptr<float>(),
-          hc_base.data_ptr<float>(),
-          reinterpret_cast<const scalar_t*>(residual.data_ptr<at::BFloat16>()),
-          post_mix.data_ptr<float>(),
-          comb_mix.data_ptr<float>(),
-          reinterpret_cast<scalar_t*>(layer_input.data_ptr<at::BFloat16>()),
-          static_cast<int>(T),
-          static_cast<int>(hidden_size),
-          static_cast<int>(n_splits),
-          hidden_block,
-          static_cast<float>(rms_eps),
-          static_cast<float>(hc_pre_eps),
-          static_cast<float>(hc_sinkhorn_eps),
-          static_cast<float>(hc_post_mult_value),
-          static_cast<int>(sinkhorn_iters),
-          slm,
-      };
+    auto ker = HCPreFuseKernel<scalar_t>{
+        gemm_out_mul.data_ptr<float>(),
+        gemm_out_sqrsum.data_ptr<float>(),
+        hc_scale.data_ptr<float>(),
+        hc_base.data_ptr<float>(),
+        reinterpret_cast<const scalar_t*>(residual.data_ptr<at::BFloat16>()),
+        post_mix.data_ptr<float>(),
+        comb_mix.data_ptr<float>(),
+        reinterpret_cast<scalar_t*>(layer_input.data_ptr<at::BFloat16>()),
+        static_cast<int>(T),
+        static_cast<int>(hidden_size),
+        static_cast<int>(n_splits),
+        static_cast<float>(rms_eps),
+        static_cast<float>(hc_pre_eps),
+        static_cast<float>(hc_sinkhorn_eps),
+        static_cast<float>(hc_post_mult_value),
+        static_cast<int>(sinkhorn_iters),
+        slm,
+    };
 
-      cgh.parallel_for(sycl::nd_range<1>(T * WG_SIZE, WG_SIZE), ker);
-    });
-  } else {  // at::kHalf
-    using scalar_t = sycl::half;
-
-    q.submit([&](sycl::handler& cgh) {
-      sycl::local_accessor<float, 1> slm(sycl::range<1>(slm_size), cgh);
-
-      auto ker = HCPreFuseKernel<scalar_t>{
-          gemm_out_mul.data_ptr<float>(),
-          gemm_out_sqrsum.data_ptr<float>(),
-          hc_scale.data_ptr<float>(),
-          hc_base.data_ptr<float>(),
-          reinterpret_cast<const scalar_t*>(residual.data_ptr<at::Half>()),
-          post_mix.data_ptr<float>(),
-          comb_mix.data_ptr<float>(),
-          reinterpret_cast<scalar_t*>(layer_input.data_ptr<at::Half>()),
-          static_cast<int>(T),
-          static_cast<int>(hidden_size),
-          static_cast<int>(n_splits),
-          hidden_block,
-          static_cast<float>(rms_eps),
-          static_cast<float>(hc_pre_eps),
-          static_cast<float>(hc_sinkhorn_eps),
-          static_cast<float>(hc_post_mult_value),
-          static_cast<int>(sinkhorn_iters),
-          slm,
-      };
-
-      cgh.parallel_for(sycl::nd_range<1>(T * WG_SIZE, WG_SIZE), ker);
-    });
-  }
+    cgh.parallel_for(sycl::nd_range<1>(T * WG_SIZE, WG_SIZE), ker);
+  });
 }

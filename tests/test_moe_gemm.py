@@ -288,7 +288,7 @@ def _dequantize_weights_mxfp4(
 
 
 @pytest.mark.parametrize(
-    "num_tokens,topk,num_experts,hidden_size,intermediate_size,bias_dtype,activation,use_fused_kernel",
+    "num_tokens,topk,num_experts,hidden_size,intermediate_size",
     list(
         itertools.product(
             [1, 33, 222],  # num_tokens
@@ -296,9 +296,6 @@ def _dequantize_weights_mxfp4(
             [8, 64],  # num_experts
             [128, 1024],  # hidden_size  – must be a multiple of MXFP4_BLOCK_SIZE
             [128, 512],  # intermediate_size – must be a multiple of MXFP4_BLOCK_SIZE
-            [False, "bfloat16", "float32"],  # bias_dtype
-            ["silu", "gelu"],  # activation type
-            [False, True],  # use_fused_mxfp4_kernel
         )
     ),
 )
@@ -308,15 +305,7 @@ def test_moe_gemm_mxfp4_weights(
     num_experts,
     hidden_size,
     intermediate_size,
-    bias_dtype,
-    activation,
-    use_fused_kernel,
 ):
-    # The tile-fused kernel is built with a pruned template matrix
-    # (ActType=0 silu, WithBias=false) to keep Level Zero module pressure
-    # in budget under TP>1. See src/GroupGemmMxfp4W4A16Xe20.cmake.
-    if use_fused_kernel and (activation != "silu" or bias_dtype):
-        pytest.skip("fused MXFP4 kernel currently built silu + no-bias only")
     """Test fused_experts with MXFP4-packed expert weights (W4A16).
 
     Weights are quantized to MXFP4 on CPU and passed to fused_experts as packed
@@ -328,11 +317,10 @@ def test_moe_gemm_mxfp4_weights(
     difference is purely from the BF16 grouped GeMM arithmetic, not from
     quantisation, and should be within the same tolerances as the BF16 test.
 
-    Parametrised over use_fused_mxfp4_kernel so both the legacy path
-    (Python dequant + bf16 GEMM) and the tile-fused path
-    (moe_grouped_mm_nt_xe20_mxfp4_w4a16) are covered at every shape.
+    The tile-fused MXFP4 kernel is currently built silu + no-bias only
+    (see src/GroupGemmMxfp4W4A16Xe20.cmake — pruned to keep L0 module
+    pressure sane under TP>1), so this test pins activation=silu and bias=None.
     """
-    act_type = activation
     torch.manual_seed(0)
     torch.xpu.manual_seed_all(0)
 
@@ -346,13 +334,6 @@ def test_moe_gemm_mxfp4_weights(
     w2_bf16 = create_random_cpu_tensor(
         (num_experts, hidden_size, intermediate_size), torch.bfloat16
     )
-    b1, b2 = None, None
-    if bias_dtype:
-        dtype = torch.bfloat16 if bias_dtype == "bfloat16" else torch.float32
-        b1 = create_random_cpu_tensor(
-            (num_experts, 2 * intermediate_size), dtype, std=0.005
-        )
-        b2 = create_random_cpu_tensor((num_experts, hidden_size), dtype, std=0.005)
 
     score = torch.randn([num_tokens, num_experts], dtype=torch.bfloat16)
     score = torch.softmax(score, dim=-1, dtype=torch.float32)
@@ -373,9 +354,9 @@ def test_moe_gemm_mxfp4_weights(
         topk_ids,
         topk_weight,
         topk,
-        b1,
-        b2,
-        activations=act_type,
+        None,
+        None,
+        activations="silu",
     )
 
     # ---- fused_experts with packed MXFP4 weights on XPU ----
@@ -383,33 +364,22 @@ def test_moe_gemm_mxfp4_weights(
     # uint8 reference packing) and scales as a fp32 direct multiplier
     # (decoded from UE8M0).
     device = "xpu"
-    a_xpu = a.clone().to(device)
-    w1_packed_xpu = w1_packed.view(torch.int8).to(device)
-    w2_packed_xpu = w2_packed.view(torch.int8).to(device)
-    w1_scale_xpu = torch.exp2((w1_scale.to(torch.int32) - 127).to(torch.float32)).to(
-        device
-    )
-    w2_scale_xpu = torch.exp2((w2_scale.to(torch.int32) - 127).to(torch.float32)).to(
-        device
-    )
-    topk_weight_xpu = topk_weight.clone().to(device)
-    topk_ids_xpu = topk_ids.clone().to(device)
-    b1_xpu = b1.clone().to(device) if b1 is not None else None
-    b2_xpu = b2.clone().to(device) if b2 is not None else None
-
     sglang_output = fused_experts(
-        a_xpu,
-        w1_packed_xpu,
-        w2_packed_xpu,
-        topk_weight_xpu,
-        topk_ids_xpu,
-        b1_xpu,
-        b2_xpu,
-        activation=act_type,
+        a.to(device),
+        w1_packed.view(torch.int8).to(device),
+        w2_packed.view(torch.int8).to(device),
+        topk_weight.to(device),
+        topk_ids.to(device),
+        None,
+        None,
+        activation="silu",
         use_mxfp4_w4a16=True,
-        use_fused_mxfp4_kernel=use_fused_kernel,
-        w1_scale=w1_scale_xpu,
-        w2_scale=w2_scale_xpu,
+        w1_scale=torch.exp2((w1_scale.to(torch.int32) - 127).to(torch.float32)).to(
+            device
+        ),
+        w2_scale=torch.exp2((w2_scale.to(torch.int32) - 127).to(torch.float32)).to(
+            device
+        ),
     )
 
     torch.testing.assert_close(
@@ -485,28 +455,26 @@ def _build_moe_gemm_inputs(
 @pytest.mark.parametrize("num_experts", [8])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [512])
-@pytest.mark.parametrize("activation_type", [0, 1, 2])  # silu, gelu, swiglu_gpt_oss
 @pytest.mark.parametrize("fuse_act", [False, True])
-@pytest.mark.parametrize("with_bias", [False, True])
 def test_moe_grouped_mm_nt_xe20_mxfp4_w4a16_op(
     num_tokens_per_expert,
     num_experts,
     hidden_size,
     intermediate_size,
-    activation_type,
     fuse_act,
-    with_bias,
 ):
     """Direct op-level comparison: mxfp4 fused op vs. bf16 op on dequant weights.
 
     gemm_k = hidden_size (activation's inner dim)
     gemm_n = 2*intermediate_size (w1 style) — we pick one shape for simplicity
     For fuse_act=True the output has N/2 cols, so gemm_n must be even.
+
+    The fused MXFP4 kernel is built silu + no-bias only (see
+    src/GroupGemmMxfp4W4A16Xe20.cmake — pruned to keep L0 module pressure
+    sane under TP>1), so this op-level test pins activation=silu and
+    bias=None.
     """
-    # See src/GroupGemmMxfp4W4A16Xe20.cmake: the fused kernel is pruned to
-    # ActType=0 silu and WithBias=false to keep L0 module pressure sane.
-    if activation_type != 0 or with_bias:
-        pytest.skip("fused MXFP4 kernel currently built silu + no-bias only")
+    activation_type = 0  # silu
     gemm_k = hidden_size
     gemm_n = 2 * intermediate_size
     assert gemm_n % 2 == 0
@@ -517,7 +485,7 @@ def test_moe_grouped_mm_nt_xe20_mxfp4_w4a16_op(
         avg_m_per_expert=num_tokens_per_expert,
         gemm_n=gemm_n,
         gemm_k=gemm_k,
-        with_bias=with_bias,
+        with_bias=False,
         fuse_act=fuse_act,
     )
 
@@ -552,84 +520,6 @@ def test_moe_grouped_mm_nt_xe20_mxfp4_w4a16_op(
 
     torch.testing.assert_close(
         inputs["output_bf16"], inputs["output_mxfp4"], rtol=1e-1, atol=1e-2
-    )
-
-
-# ---------------------------------------------------------------------------
-# End-to-end: fused_experts with use_fused_mxfp4_kernel=True
-# ---------------------------------------------------------------------------
-# Same reference pipeline as test_moe_gemm_mxfp4_weights (torch_naive_moe on
-# dequantised weights); the sglang side routes through
-# moe_grouped_mm_nt_xe20_mxfp4_w4a16 and skips the intermediate bf16 weight.
-
-
-@pytest.mark.parametrize(
-    "num_tokens,topk,num_experts,hidden_size,intermediate_size",
-    list(
-        itertools.product(
-            [33, 128],  # avg_m per expert ∈ (8, 128] with num_experts=8
-            [1, 2],
-            [8],
-            [1024],  # small enough to stay in the dispatcher's small-weight branch
-            [512, 1024],
-        )
-    ),
-)
-def test_fused_experts_mxfp4_fused_kernel(
-    num_tokens, topk, num_experts, hidden_size, intermediate_size
-):
-    """End-to-end fused_experts(use_mxfp4_w4a16=True, use_fused_mxfp4_kernel=True).
-
-    Reference is torch_naive_moe on dequantised BF16 weights.  The sglang
-    path runs the tile-fused MXFP4 grouped-GEMM directly (no intermediate
-    bf16 weight materialisation in Python).
-    """
-    torch.manual_seed(0)
-    torch.xpu.manual_seed_all(0)
-    rtol, atol = 1e-1, 1e-2
-
-    a = create_random_cpu_tensor((num_tokens, hidden_size), torch.bfloat16)
-    w1_bf16 = create_random_cpu_tensor(
-        (num_experts, 2 * intermediate_size, hidden_size), torch.bfloat16
-    )
-    w2_bf16 = create_random_cpu_tensor(
-        (num_experts, hidden_size, intermediate_size), torch.bfloat16
-    )
-
-    score = torch.randn([num_tokens, num_experts], dtype=torch.bfloat16)
-    score = torch.softmax(score, dim=-1, dtype=torch.float32)
-    topk_weight, topk_ids = torch.topk(score, topk)
-
-    w1_packed, w1_scale = _quantize_weights_mxfp4(w1_bf16)
-    w2_packed, w2_scale = _quantize_weights_mxfp4(w2_bf16)
-    w1_dq = _dequantize_weights_mxfp4(w1_packed, w1_scale)
-    w2_dq = _dequantize_weights_mxfp4(w2_packed, w2_scale)
-
-    torch_output = torch_naive_moe(
-        a, w1_dq, w2_dq, topk_ids, topk_weight, topk, None, None, activations="silu"
-    )
-
-    # fused_experts expects int8 packed weights and fp32 direct-multiplier scales.
-    device = "xpu"
-    w1_scale_fp32 = torch.exp2((w1_scale.to(torch.int32) - 127).to(torch.float32))
-    w2_scale_fp32 = torch.exp2((w2_scale.to(torch.int32) - 127).to(torch.float32))
-    sglang_output = fused_experts(
-        a.to(device),
-        w1_packed.view(torch.int8).to(device),
-        w2_packed.view(torch.int8).to(device),
-        topk_weight.to(device),
-        topk_ids.to(device),
-        None,
-        None,
-        activation="silu",
-        use_mxfp4_w4a16=True,
-        use_fused_mxfp4_kernel=True,
-        w1_scale=w1_scale_fp32.to(device),
-        w2_scale=w2_scale_fp32.to(device),
-    )
-
-    torch.testing.assert_close(
-        torch_output, sglang_output.to("cpu"), rtol=rtol, atol=atol
     )
 
 

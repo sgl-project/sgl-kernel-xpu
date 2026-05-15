@@ -1,8 +1,5 @@
-# Op-level benchmark for the MXFP4 MoE grouped GEMM. Three providers:
+# Op-level benchmark for the MXFP4 MoE grouped GEMM. Two providers:
 #
-#   bf16_dequant    Python-loop dequant (dequantize_mxfp4_weights) → bf16
-#                   grouped GEMM (moe_grouped_mm_nt_xe20). The legacy
-#                   sgl-kernel path in fused_experts(use_mxfp4_w4a16=True).
 #   triton_full     sglang Triton path: _upcast_mxfp4_triton for dequant
 #                   followed by the Triton fused_moe_kernel for the GEMM.
 #                   Same code paths the sglang Triton runtime uses.
@@ -10,9 +7,9 @@
 #                   weights + fp32 scales — tile-level dequant, no bf16
 #                   weight ever materialized.
 #
-# All three produce the same result modulo MXFP4 rounding. peak_transient
-# captures the bf16 weight materialization the first two providers
-# require and the fused path avoids.
+# Both produce the same result modulo MXFP4 rounding. peak_transient
+# captures the bf16 weight materialization the Triton path requires and
+# the fused path avoids.
 #
 # Run:
 #   python benchmark/bench_moe_mxfp4_gemm.py
@@ -26,7 +23,6 @@ import sgl_kernel  # noqa: F401 — registers the torch.ops.sgl_kernel namespace
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel.moe import dequantize_mxfp4_weights
 
 # The CPU MXFP4 quantize/dequantize helpers live next to the tests.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests"))
@@ -139,8 +135,8 @@ def _prepare_inputs(avg_m: int, gemm_n: int, gemm_k: int):
     """Build the XPU tensors shared across providers.
 
     We deliberately do NOT allocate a bf16-dequantized weight tensor
-    up-front: the `bf16_dequant` provider pays for the XPU dequant
-    inside its timed region (mirroring what fused_experts does today).
+    up-front: the `triton_full` provider pays for its XPU dequant inside
+    its timed region.
     """
     torch.manual_seed(0)
     torch.xpu.manual_seed_all(0)
@@ -182,28 +178,6 @@ def _prepare_inputs(avg_m: int, gemm_n: int, gemm_k: int):
         "gemm_k": gemm_k,
         "avg_m": avg_m,
     }
-
-
-def _run_bf16_dequant(inputs):
-    # On-the-fly XPU dequant to bf16, then standard bf16 GEMM. This is
-    # what fused_experts(use_mxfp4_w4a16=True) does today: dequant once per
-    # GEMM call, immediately hand to moe_grouped_mm_nt_xe20.
-    w_bf16 = dequantize_mxfp4_weights(
-        inputs["packed_xpu"],
-        inputs["scales_xpu"],
-    )
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
-        inputs["output"],
-        inputs["activations"],
-        w_bf16,
-        None,
-        inputs["total_rows"],
-        NUM_EXPERTS,
-        0,  # silu
-        False,  # no fuse_act
-        1.702,
-        7.0,
-    )
 
 
 def _run_triton_full(inputs):
@@ -281,13 +255,13 @@ def _peak_transient_bytes(run_fn, inputs) -> int:
     return torch.xpu.max_memory_allocated()
 
 
-_LINE_VALS = ["bf16_dequant", "mxfp4_fused"]
-_LINE_NAMES = ["bf16_dequant (Python dequant)", "mxfp4_fused (tile-level dequant)"]
-_LINE_STYLES = [("blue", "-"), ("green", "-")]
+_LINE_VALS = ["mxfp4_fused"]
+_LINE_NAMES = ["mxfp4_fused (tile-level dequant)"]
+_LINE_STYLES = [("green", "-")]
 if TRITON_REF_AVAILABLE:
-    _LINE_VALS.insert(1, "triton_full")
-    _LINE_NAMES.insert(1, "triton_full (Triton dequant + Triton fused_moe_kernel)")
-    _LINE_STYLES.insert(1, ("red", "-"))
+    _LINE_VALS.insert(0, "triton_full")
+    _LINE_NAMES.insert(0, "triton_full (Triton dequant + Triton fused_moe_kernel)")
+    _LINE_STYLES.insert(0, ("red", "-"))
 
 
 @triton.testing.perf_report(
@@ -305,9 +279,7 @@ if TRITON_REF_AVAILABLE:
 )
 def benchmark(avg_m, gemm_n, gemm_k, provider):
     inputs = _prepare_inputs(avg_m, gemm_n, gemm_k)
-    if provider == "bf16_dequant":
-        run_fn = _run_bf16_dequant
-    elif provider == "triton_full":
+    if provider == "triton_full":
         run_fn = _run_triton_full
     elif provider == "mxfp4_fused":
         run_fn = _run_mxfp4_fused
@@ -323,7 +295,7 @@ def benchmark(avg_m, gemm_n, gemm_k, provider):
     # not the resident weight tensors (which we allocated up-front in
     # _prepare_inputs). To contrast the real savings, see the
     # `weights_bytes` column: the fused path never needs to allocate
-    # w_dq_xpu, whereas bf16_dequant requires it to exist.
+    # w_dq_xpu, whereas triton_full requires it to exist.
     peak_transient = _peak_transient_bytes(run_fn, inputs)
 
     quantiles = [0.5, 0.2, 0.8]
@@ -338,25 +310,23 @@ def benchmark(avg_m, gemm_n, gemm_k, provider):
     total_m = inputs["total_m"]
     flop = 2 * total_m * gemm_n * gemm_k
 
-    # Effective B-side bandwidth the GEMM reads. bf16_dequant and
-    # triton_dequant both hand a bf16 weight tensor to the GEMM, so the
-    # GEMM's B-side read is 2 B/elem. mxfp4_fused consumes packed MXFP4
-    # (0.5 B/elem) plus fp32 scales (4 B per MXFP4_BLOCK_SIZE elements).
+    # Effective B-side bandwidth the GEMM reads. triton_full hands a bf16
+    # weight tensor to the GEMM, so the GEMM's B-side read is 2 B/elem.
+    # mxfp4_fused consumes packed MXFP4 (0.5 B/elem) plus fp32 scales
+    # (4 B per MXFP4_BLOCK_SIZE elements).
     if provider == "mxfp4_fused":
         b_bytes = NUM_EXPERTS * gemm_n * gemm_k * (1 / 2 + 4 / MXFP4_BLOCK_SIZE)
     else:
         b_bytes = NUM_EXPERTS * gemm_n * gemm_k * 2
 
-    # Both dequant-then-GEMM providers materialize the bf16 weight
-    # transiently; mxfp4_fused never does.
+    # triton_full materializes the bf16 weight transiently; mxfp4_fused
+    # never does.
     packed_bytes = (
         NUM_EXPERTS * gemm_n * (gemm_k // 2 + 4 * (gemm_k // MXFP4_BLOCK_SIZE))
     )
     bf16_transient = NUM_EXPERTS * gemm_n * gemm_k * 2
     weights_resident_bytes = packed_bytes
-    transient_bf16_bytes = (
-        bf16_transient if provider in ("bf16_dequant", "triton_full") else 0
-    )
+    transient_bf16_bytes = bf16_transient if provider == "triton_full" else 0
 
     tflops = flop / (ms / 1e3) / 1e12
     b_gbps = b_bytes / (ms / 1e3) / 1e9
@@ -402,17 +372,15 @@ if __name__ == "__main__":
         values=pivot_cols,
         aggfunc="first",
     )
-    # Compare each reference provider against mxfp4_fused where both ran.
-    if ("ms", "mxfp4_fused") in pv.columns:
-        for ref in ("bf16_dequant", "triton_full"):
-            if ("ms", ref) in pv.columns:
-                pv[f"speedup_fused_vs_{ref}"] = (
-                    pv[("ms", ref)] / pv[("ms", "mxfp4_fused")]
-                ).round(2)
-    # Both dequant-then-GEMM providers materialize the bf16 weight tensor
-    # transiently; mxfp4_fused never does. Report the savings once.
-    if ("transient_bf16_MB", "bf16_dequant") in pv.columns:
-        pv["transient_bf16_saved_MB"] = pv[("transient_bf16_MB", "bf16_dequant")].round(
+    # Compare the Triton reference against mxfp4_fused where both ran.
+    if ("ms", "mxfp4_fused") in pv.columns and ("ms", "triton_full") in pv.columns:
+        pv["speedup_fused_vs_triton_full"] = (
+            pv[("ms", "triton_full")] / pv[("ms", "mxfp4_fused")]
+        ).round(2)
+    # triton_full materializes the bf16 weight tensor transiently; mxfp4_fused
+    # never does. Report the savings once.
+    if ("transient_bf16_MB", "triton_full") in pv.columns:
+        pv["transient_bf16_saved_MB"] = pv[("transient_bf16_MB", "triton_full")].round(
             2
         )
     print(pv.to_markdown())

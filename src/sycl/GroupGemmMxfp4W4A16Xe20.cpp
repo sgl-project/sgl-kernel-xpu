@@ -96,16 +96,24 @@ DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_256_256_32, SG_8_4_1, 0, false, false)
 // hard-codes those values rather than template-branching on runtime inputs.
 // Callers that need the other combos will hit the TORCH_CHECK below and must
 // restore the full matrix before rebuilding.
-#define DISPATCH_MOE_MXFP4(ActType, FuseAct, WithBias, ...)                                                      \
-  do {                                                                                                           \
-    TORCH_CHECK((ActType) == 0, "mxfp4 fused kernel built with ActType=0 only (silu); got ActType=", (ActType)); \
-    TORCH_CHECK(                                                                                                 \
-        !(WithBias), "mxfp4 fused kernel built with WithBias=false only; bias path unsupported in this build");  \
-    if (FuseAct) {                                                                                               \
-      LAUNCH_MOE_MXFP4(__VA_ARGS__, 0, true, false);                                                             \
-    } else {                                                                                                     \
-      LAUNCH_MOE_MXFP4(__VA_ARGS__, 0, false, false);                                                            \
-    }                                                                                                            \
+#define DISPATCH_MOE_MXFP4(ActType, FuseAct, WithBias, ...)                                                     \
+  do {                                                                                                          \
+    TORCH_CHECK(                                                                                                \
+        (ActType) == 0,                                                                                         \
+        "mxfp4 fused kernel built with ActType=0 (silu) only; got ActType=",                                    \
+        (ActType),                                                                                              \
+        ". The AOT instantiation matrix is pruned to keep Level Zero module pressure in budget under TP>1 — " \
+        "see src/GroupGemmMxfp4W4A16Xe20.cmake to re-enable additional ActType/WithBias combos.");              \
+    TORCH_CHECK(                                                                                                \
+        !(WithBias),                                                                                            \
+        "mxfp4 fused kernel built with WithBias=false only; bias path unsupported in this build. "              \
+        "The AOT instantiation matrix is pruned to keep Level Zero module pressure in budget under TP>1 — "   \
+        "see src/GroupGemmMxfp4W4A16Xe20.cmake to re-enable additional ActType/WithBias combos.");              \
+    if (FuseAct) {                                                                                              \
+      LAUNCH_MOE_MXFP4(__VA_ARGS__, 0, true, false);                                                            \
+    } else {                                                                                                    \
+      LAUNCH_MOE_MXFP4(__VA_ARGS__, 0, false, false);                                                           \
+    }                                                                                                           \
   } while (0)
 
 void moe_grouped_mm_nt_xe20_mxfp4_w4a16(
@@ -166,7 +174,7 @@ void moe_grouped_mm_nt_xe20_mxfp4_w4a16(
   void* bias_ptr = with_bias ? bias->data_ptr() : nullptr;
 
   int avg_m = total_m / n_experts;
-  bool small_weight = (int64_t)gemm_k * gemm_n <= (int64_t)4096 * 4096;
+  bool small_weight = (int64_t)gemm_k * gemm_n <= MOE_GROUPED_GEMM_SMALL_WEIGHT_THRESHOLD;
 
   if (avg_m <= 8) {
     DISPATCH_MOE_MXFP4(

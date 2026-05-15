@@ -474,9 +474,13 @@ def fused_experts(
 
     assert is_xe2_arch(), f"Current MoE is only supported on BMG"
 
-    # heuristic for choosing fused or unfused act, can be tuned
+    # Heuristic for choosing fused vs unfused activation. The K*N threshold
+    # mirrors the small-weight cutoff in the C++ grouped-GEMM dispatchers
+    # (MOE_GROUPED_GEMM_SMALL_WEIGHT_THRESHOLD in src/sycl/Utils.h). Keep
+    # the two in sync if either side is re-tuned.
+    _MOE_GROUPED_GEMM_SMALL_WEIGHT_THRESHOLD = 4096 * 4096
     avg_m = (M * TopK) // E
-    big_weight = K * N > 4096 * 4096
+    big_weight = K * N > _MOE_GROUPED_GEMM_SMALL_WEIGHT_THRESHOLD
     use_unfused_act = avg_m <= 128 and big_weight
     if use_unfused_act:
         intermediate_cache1 = torch.empty(

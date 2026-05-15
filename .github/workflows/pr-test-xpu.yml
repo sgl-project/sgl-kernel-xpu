@@ -75,6 +75,8 @@ jobs:
               python3 bench_scatter_tokens_to_experts.py 2>&1 | tee bench_scatter_tokens_to_experts.py.log \
               python3 bench_top_k_renorm_probs.py 2>&1 | tee bench_top_k_renorm_probs.py.log \
               python3 bench_hc_split_sinkhorn.py 2>&1 | tee bench_hc_split_sinkhorn.py.log \
+              python3 bench_moe_mxfp4_w4a16_gemm.py 2>&1 | tee bench_moe_mxfp4_w4a16_gemm.py.log \
+              python3 bench_fused_experts_mxfp4.py 2>&1 | tee bench_fused_experts_mxfp4.py.log \
             "
 
       - name: Copy logs from container

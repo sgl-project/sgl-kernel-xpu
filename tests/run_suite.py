@@ -36,6 +36,7 @@ suites = {
         TestFile("test_scatter_tokens_to_experts.py"),
         TestFile("test_sampling.py"),
         TestFile("test_hc_split_sinkhorn.py"),
+        TestFile("test_fused_experts_mxfp4_dsv4_shapes.py"),
     ],
 }
 

@@ -5,7 +5,7 @@
 
 // MXFP4-B × BF16-A MoE grouped-GEMM kernel for Xe2 (BMG).
 //
-// Fork of src/sycl/kernels/moe/xe20/moe_kernel.hpp. Identical per-expert
+// Fork of src/sycl/kernels/moe/xe20/bf16/moe_kernel.hpp. Identical per-expert
 // tile-scheduler loop; the only changes are:
 //   - B is int8 packed MXFP4 with row stride K/2 (two E2M1 nibbles per byte).
 //   - A per-expert float32 scale tensor S is threaded through alongside B
@@ -23,7 +23,7 @@
 #include "cutlass/kernel_hardware_info.hpp"
 #include "cutlass/platform/platform.h"
 #include "cutlass/util/packed_stride.hpp"
-#include "moe_mxfp4_w4a16_mainloop.hpp"
+#include "moe_mainloop.hpp"
 
 #pragma clang diagnostic ignored "-Wpass-failed"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"

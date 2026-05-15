@@ -5,7 +5,7 @@
 
 // MXFP4-B × BF16-A MoE grouped-GEMM mainloop for Xe2 (BMG).
 //
-// Fork of src/sycl/kernels/moe/xe20/moe_mainloop.hpp. Tile cadence is
+// Fork of src/sycl/kernels/moe/xe20/bf16/moe_mainloop.hpp. Tile cadence is
 // unchanged from the BF16 mainloop (BLK_K == 32, one cute::gemm per k-tile).
 // The only delta is a register-level B-dequantization step inserted between
 // the B-tile load and cute::gemm:

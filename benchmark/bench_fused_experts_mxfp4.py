@@ -1,17 +1,14 @@
-# End-to-end benchmark: fused_experts(use_mxfp4_w4a16=True) — three providers
+# End-to-end benchmark: fused_experts(use_mxfp4_w4a16=True) — two providers
 # at MoE-layer granularity (both GEMMs + scatter + activation + combine):
 #
-#   bf16_dequant    sgl_kernel path with use_fused_mxfp4_kernel=False:
-#                   dequantize_mxfp4_weights materializes bf16 weights on
-#                   XPU, then moe_grouped_mm_nt_xe20.
-#   mxfp4_fused     sgl_kernel path with use_fused_mxfp4_kernel=True:
+#   mxfp4_fused     sgl_kernel fused_experts(use_mxfp4_w4a16=True):
 #                   moe_grouped_mm_nt_xe20_mxfp4_w4a16 dequants per-tile in
 #                   registers, no intermediate bf16 weight.
 #   triton_full     sglang Triton fused_experts_impl (MXFP4-xpu branch):
 #                   one Triton kernel per weight upcasts MXFP4 → bf16,
 #                   then the Triton fused-moe GEMM runs on bf16.
 #
-# All three compute the same result modulo MXFP4 rounding. ms and
+# Both compute the same result modulo MXFP4 rounding. ms and
 # peak_transient_MB are directly comparable.
 #
 # Run:
@@ -117,9 +114,9 @@ def _build_and_quantize_weights_per_expert(E: int, rows: int, cols: int):
 
 
 # (name, num_tokens, num_experts, topk, hidden, intermediate). Default is a
-# real DSV4 MXFP4 fused_experts call (E=256, H=4096, I=256, topk=6). Both
-# the bf16_dequant and triton_full providers also need to fit a bf16
-# weight transient (E*2I*H*2B); the fused path avoids it entirely.
+# real DSV4 MXFP4 fused_experts call (E=256, H=4096, I=256, topk=6). The
+# triton_full provider also needs to fit a bf16 weight transient
+# (E*2I*H*2B); the fused path avoids it entirely.
 SHAPES = [
     ("dsv4_prefill_2k", 2048, 256, 6, 4096, 256),
 ]
@@ -170,23 +167,6 @@ def _prepare_inputs(num_tokens, num_experts, topk, hidden, intermediate):
     }
 
 
-def _run_unfused(inputs):
-    return fused_experts(
-        inputs["a"],
-        inputs["w1_packed"],
-        inputs["w2_packed"],
-        inputs["topk_weight"],
-        inputs["topk_ids"],
-        None,
-        None,
-        activation="silu",
-        use_mxfp4_w4a16=True,
-        use_fused_mxfp4_kernel=False,
-        w1_scale=inputs["w1_scale"],
-        w2_scale=inputs["w2_scale"],
-    )
-
-
 def _run_fused(inputs):
     return fused_experts(
         inputs["a"],
@@ -198,7 +178,6 @@ def _run_fused(inputs):
         None,
         activation="silu",
         use_mxfp4_w4a16=True,
-        use_fused_mxfp4_kernel=True,
         w1_scale=inputs["w1_scale"],
         w2_scale=inputs["w2_scale"],
     )
@@ -237,9 +216,6 @@ def _peak_transient_bytes(run_fn, inputs) -> int:
     return torch.xpu.max_memory_allocated()
 
 
-# bf16_dequant is available but not enabled by default: at the shapes we
-# care about it's orders of magnitude slower than the other two and not
-# the comparison we care about. Re-add "bf16_dequant" here if you want it.
 _LINE_VALS = ["mxfp4_fused"]
 _LINE_NAMES = ["mxfp4_fused (tile-fused MXFP4, CUTLASS)"]
 _LINE_STYLES = [("green", "-")]
@@ -264,8 +240,8 @@ if TRITON_REF_AVAILABLE:
 )
 def benchmark(name, num_tokens, num_experts, topk, hidden, intermediate, provider):
     # Free any lingering tensors from the previous (shape, provider) run before
-    # building a new set — otherwise the unfused path's XPU bf16 weight copy
-    # can stack on top of the previous run's allocations and OOM the device.
+    # building a new set — otherwise triton_full's XPU bf16 weight copy can
+    # stack on top of the previous run's allocations and OOM the device.
     gc.collect()
     torch.xpu.empty_cache()
 
@@ -303,9 +279,7 @@ def benchmark(name, num_tokens, num_experts, topk, hidden, intermediate, provide
         return float("nan")
 
     inputs = _prepare_inputs(num_tokens, num_experts, topk, hidden, intermediate)
-    if provider == "bf16_dequant":
-        run_fn = _run_unfused
-    elif provider == "mxfp4_fused":
+    if provider == "mxfp4_fused":
         run_fn = _run_fused
     elif provider == "triton_full":
         run_fn = _run_triton_full
@@ -419,14 +393,13 @@ if __name__ == "__main__":
         values=["ms", "tflops", "peak_transient_MB"],
         aggfunc="first",
     )
-    # Compare each reference provider against mxfp4_fused where both ran.
-    for ref in ("bf16_dequant", "triton_full"):
-        if ("ms", "mxfp4_fused") in pv.columns and ("ms", ref) in pv.columns:
-            pv[f"speedup_vs_{ref}"] = (
-                pv[("ms", ref)] / pv[("ms", "mxfp4_fused")]
-            ).round(2)
-            pv[f"transient_saved_vs_{ref}_MB"] = (
-                pv[("peak_transient_MB", ref)]
-                - pv[("peak_transient_MB", "mxfp4_fused")]
-            ).round(2)
+    # Compare the Triton reference against mxfp4_fused where both ran.
+    if ("ms", "mxfp4_fused") in pv.columns and ("ms", "triton_full") in pv.columns:
+        pv["speedup_vs_triton_full"] = (
+            pv[("ms", "triton_full")] / pv[("ms", "mxfp4_fused")]
+        ).round(2)
+        pv["transient_saved_vs_triton_full_MB"] = (
+            pv[("peak_transient_MB", "triton_full")]
+            - pv[("peak_transient_MB", "mxfp4_fused")]
+        ).round(2)
     print(pv.to_markdown())

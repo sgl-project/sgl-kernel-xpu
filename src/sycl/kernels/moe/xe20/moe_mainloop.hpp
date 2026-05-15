@@ -369,16 +369,16 @@ struct MoEMainloop<
         case ActivationType::SILU: {
           s = 1.0f / (1.0f + sycl::native::exp(-x));
           tCrC0(i) = x * s * y;
-	  break;
-	}
+          break;
+        }
         case ActivationType::SWIGLU_GPT_OSS: {
           float gate = sycl::fmin(x, gemm1_limit);
           float up = sycl::fmax(-gemm1_limit, sycl::fmin(y, gemm1_limit));
           float t = gate * gemm1_alpha;
           s = 1.0f / (1.0f + sycl::native::exp(-t));
           tCrC0(i) = gate * s * (up + 1.0f);
-	  break;
-	}
+          break;
+        }
         case ActivationType::GELU: {
           constexpr float kBeta = 0.7978845608028654f;  // sqrt(2.0f / pi)
           constexpr float kAlpha = 0.044715f;
@@ -386,8 +386,8 @@ struct MoEMainloop<
           float tanh_arg = kBeta * (x + kAlpha * x_cube);
           s = 0.5f * (1.0f + std::tanh(tanh_arg));
           tCrC0(i) = x * s * y;
-	  break;
-	}
+          break;
+        }
 	default:
 	  break;
       }

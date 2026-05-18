@@ -16,16 +16,31 @@ endfunction()
 
 foreach(act_type 0 1 2 3)
     foreach(with_bias true false)
-        foreach(fuse_act true false)
+        # RELU2 (act_type=3) only supports fuse_act=false (unfused activation)
+        # Skip fuse_act=true instantiations for act_type=3 to reduce binary size
+        if(act_type EQUAL 3)
+            set(fuse_act_list false)
+        else()
+            set(fuse_act_list true false)
+        endif()
+
+        foreach(fuse_act ${fuse_act_list})
             add_group_gemm_xe20_inst("_8" "_64" "_32" "_1, _4, _1" "_4, _1, _0" ${act_type} ${fuse_act} ${with_bias})
             add_group_gemm_xe20_inst("_16" "_64" "_32" "_1, _4, _1" "_4, _1, _0" ${act_type} ${fuse_act} ${with_bias})
             add_group_gemm_xe20_inst("_32" "_64" "_32" "_1, _4, _1" "_4, _1, _0" ${act_type} ${fuse_act} ${with_bias})
         endforeach()
 
-        add_group_gemm_xe20_inst("_128" "_64" "_32" "_4, _2, _1" "_2, _1, _0" ${act_type} true ${with_bias})
+        # For larger tiles, only instantiate the specific fuse_act values that are actually used
+        foreach(fuse_act ${fuse_act_list})
+            if(fuse_act)
+                add_group_gemm_xe20_inst("_128" "_64" "_32" "_4, _2, _1" "_2, _1, _0" ${act_type} ${fuse_act} ${with_bias})
+                add_group_gemm_xe20_inst("_256" "_64" "_32" "_8, _2, _1" "_2, _1, _0" ${act_type} ${fuse_act} ${with_bias})
+            endif()
+        endforeach()
+
+        # These are always false
         add_group_gemm_xe20_inst("_128" "_64" "_32" "_4, _2, _1" "_2, _1, _0" ${act_type} false ${with_bias})
         add_group_gemm_xe20_inst("_128" "_128" "_32" "_4, _2, _1" "_2, _1, _0" ${act_type} false ${with_bias})
-        add_group_gemm_xe20_inst("_256" "_64" "_32" "_8, _2, _1" "_2, _1, _0" ${act_type} true ${with_bias})
         add_group_gemm_xe20_inst("_256" "_64" "_32" "_8, _2, _1" "_2, _1, _0" ${act_type} false ${with_bias})
         add_group_gemm_xe20_inst("_256" "_256" "_32" "_8, _4, _1" "_4, _1, _0" ${act_type} false ${with_bias})
     endforeach()

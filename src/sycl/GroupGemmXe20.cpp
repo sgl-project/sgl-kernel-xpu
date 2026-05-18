@@ -145,7 +145,9 @@ DECLARE_XE20_MOE_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
         DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::SWIGLU_GPT_OSS, FuseAct, WithBias, __VA_ARGS__); \
         break;                                                                                        \
       case 3:                                                                                         \
-        /* TODO lift this froce false after we have fused RELU2 */                                    \
+        /* RELU2 only supports unfused activation path (FuseAct=false).                              \
+         * Fused RELU2 is not yet implemented in the kernel mainloop.                                \
+         * Force FuseAct to false to ensure correct results and avoid unnecessary instantiations. */ \
         DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::RELU2, false, WithBias, __VA_ARGS__);            \
         break;                                                                                        \
       default:                                                                                        \

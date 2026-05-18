@@ -3,19 +3,14 @@ import torch
 import triton
 from sgl_kernel import hc_pre_fuse
 
-# Benchmark configurations
-# Format: (batch_size, seq_len, hidden_size, n_splits)
-# Small: 2 cases, Medium: 2 cases, Large: 2 cases
 configs = [
-    # Small cases (low token count)
-    (1, 128, 7168, 1),  # 128 tokens, no splits
-    (8, 128, 7168, 1),  # 1024 tokens, no splits
-    # Medium cases (moderate token count)
-    (32, 256, 7168, 1),  # 8K tokens, no splits
-    (64, 256, 7168, 16),  # 16K tokens, with splits
-    # Large cases (high token count)
-    (128, 512, 7168, 1),  # 65K tokens, no splits
-    (128, 512, 7168, 16),  # 65K tokens, with splits
+    # (batch_size, seq_len, hidden_size, n_splits)
+    (1, 128, 7168, 1),  # 128 tokens
+    (8, 128, 7168, 1),  # 1024 tokens
+    (32, 256, 7168, 1),  # 8K tokens
+    (64, 256, 7168, 16),  # 16K tokens
+    (128, 512, 7168, 1),  # 65K tokens
+    (128, 512, 7168, 16),  # 65K tokens
 ]
 
 sinkhorn_iters = 20

@@ -586,7 +586,10 @@ void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torc
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "GemmaFusedAddRMSNormKernelImpl", [&]() {
         SYCL_DISPATCH_WEIGHT_TYPES(
-            at::ScalarType::Half, at::ScalarType::BFloat16, weight_.scalar_type(), "GemmaFusedAddRMSNormKernelImpl",
+            at::ScalarType::Half,
+            at::ScalarType::BFloat16,
+            weight_.scalar_type(),
+            "GemmaFusedAddRMSNormKernelImpl",
             [&]() {
               GemmaFusedAddRMSNormKernelImplInternal<scalar_t, weight_t>(
                   input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual_);

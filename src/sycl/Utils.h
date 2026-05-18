@@ -262,6 +262,27 @@ inline void check_shape(const at::Tensor& a, const at::Tensor& b, const char* a_
     break;                                               \
   }
 
+#define PRIVATE_CASE_WEIGHT_TYPE(enum_type, type, ...) \
+  case enum_type: {                                    \
+    using weight_t = type;                             \
+    __VA_ARGS__();                                     \
+    break;                                             \
+  }
+
+#define SYCL_DISPATCH_WEIGHT_TYPES(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)                             \
+  {                                                                                                       \
+    const auto& the_weight_type = TYPE;                                                                   \
+    at::ScalarType _wt = ::detail::scalar_type(the_weight_type);                                          \
+    switch (_wt) {                                                                                        \
+      PRIVATE_CASE_WEIGHT_TYPE(at::ScalarType::Double, double, __VA_ARGS__)                               \
+      PRIVATE_CASE_WEIGHT_TYPE(at::ScalarType::Float, float, __VA_ARGS__)                                 \
+      PRIVATE_CASE_WEIGHT_TYPE(SCALARTYPE1, decltype(c10::impl::ScalarTypeToCPPType<SCALARTYPE1>::t), __VA_ARGS__) \
+      PRIVATE_CASE_WEIGHT_TYPE(SCALARTYPE2, decltype(c10::impl::ScalarTypeToCPPType<SCALARTYPE2>::t), __VA_ARGS__) \
+      default:                                                                                            \
+        AT_ERROR(#NAME, " not implemented for weight type '", toString(TYPE), "'");                       \
+    }                                                                                                     \
+  }
+
 #define SYCL_DISPATCH_FLOATING_TYPES_AND2(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)    \
   {                                                                                     \
     const auto& the_type = TYPE;                                                        \

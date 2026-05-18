@@ -449,5 +449,100 @@ def test_deepseek_v2_rope():
             torch.testing.assert_close(k_pe, k_pe_clone, atol=atol, rtol=rtol)
 
 
+@pytest.mark.parametrize(
+    "num_tokens, num_q_heads, num_kv_heads, head_size, num_position_dims",
+    [
+        (54, 16, 2, 128, 3),
+        (50, 16, 2, 128, 3),
+        (32, 8, 1, 64, 2),
+        (128, 32, 8, 128, 3),
+    ],
+)
+def test_rope_multimodal_noncontiguous(
+    num_tokens: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    num_position_dims: int,
+):
+    """
+    Regression test for buffer overflow when:
+    1. positions is multi-dimensional [num_dims, num_tokens] (multimodal)
+    2. query/key are non-contiguous views (stride != shape) from a shared QKV buffer
+
+    """
+    torch.manual_seed(42)
+    max_position = 256
+    rotary_dim = head_size
+    is_neox_style = True
+
+    # Build cos_sin_cache
+    inv_freq = 1.0 / (
+        10000 ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim)
+    )
+    t = torch.arange(max_position, dtype=torch.float)
+    freqs = torch.einsum("i,j->ij", t, inv_freq)
+    cos_sin_cache = (
+        torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(torch.bfloat16).to(device)
+    )
+
+    # Multi-dimensional positions tensor [num_dims, num_tokens] — the trigger
+    positions = torch.randint(
+        0, max_position, (num_position_dims, num_tokens), device=device
+    )
+    positions_clone = positions.clone()
+
+    # Simulate the real scenario: q and k are non-contiguous slices of a shared QKV buffer
+    # Total dim per token = num_q_heads * head_size + num_kv_heads * head_size
+    q_dim = num_q_heads * head_size
+    k_dim = num_kv_heads * head_size
+    total_dim = q_dim + k_dim  # stride will be total_dim, but q/k shapes are subsets
+
+    qkv = torch.randn(num_tokens, total_dim, dtype=torch.bfloat16, device=device)
+    query = qkv[:, :q_dim]  # shape [N, q_dim], stride (total_dim, 1)
+    key = qkv[:, q_dim : q_dim + k_dim]  # shape [N, k_dim], stride (total_dim, 1)
+
+    assert not query.is_contiguous(), "query must be non-contiguous for this test"
+    assert not key.is_contiguous(), "key must be non-contiguous for this test"
+    assert (
+        query.stride(0) == total_dim
+    ), f"Expected stride {total_dim}, got {query.stride(0)}"
+
+    # Save contiguous copies BEFORE calling the kernel (2D path modifies in-place)
+    query_ref = query.clone().contiguous()
+    key_ref = key.clone().contiguous()
+
+    # Run the kernel — before the fix, this would overflow and corrupt positions
+    query_out, key_out = torch.ops.sgl_kernel.rotary_embedding(
+        positions,
+        query,
+        key,
+        head_size,
+        cos_sin_cache,
+        is_neox_style,
+    )
+
+    # Verify positions tensor was NOT corrupted (the primary regression check)
+    assert torch.equal(positions, positions_clone), (
+        f"BUFFER OVERFLOW DETECTED: positions tensor was corrupted by RoPE kernel!\n"
+        f"Corrupted entries: {(positions != positions_clone).sum().item()} / {positions.numel()}"
+    )
+
+    # Verify correctness: compare against reference implementation using first position dim
+    # (The 2D kernel uses positions[token_id] sequentially — for multi-dim positions the
+    # underlying flat memory starts with the first row.)
+    pos_flat = positions[0]
+    rope = RotaryEmbedding(
+        head_size, rotary_dim, max_position, 10000, is_neox_style, torch.bfloat16
+    ).to(device)
+    rope.cos_sin_cache = cos_sin_cache
+
+    query_ref_out, key_ref_out = rope.forward_native(pos_flat, query_ref, key_ref)
+
+    atol = rtol = precision[torch.bfloat16]
+    torch.testing.assert_close(query_out, query_ref_out, atol=atol, rtol=rtol)
+    torch.testing.assert_close(key_out, key_ref_out, atol=atol, rtol=rtol)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

@@ -63,26 +63,26 @@ using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
       float,                                                                            \
       int);
 
-#define DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile, SGLayout)    \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, true, true)   \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, true, false)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, false, true)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, false, false) \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, true, true)   \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, true, false)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, false, true)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, false, false) \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, true, true)   \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, true, false)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, false, true)  \
+#define DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile, SGLayout)                                \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, true, true)            \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, true, false)           \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, false, true)           \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, false, false)          \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, true, true)            \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, true, false)           \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, false, true)           \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, false, false)          \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, true, true)  \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, true, false) \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, false, true) \
   DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, false, false)
 
-#define DECLARE_XE20_MOE_TILE_FUSE(Tile, SGLayout, FuseAct)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, FuseAct, true)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, FuseAct, false) \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, FuseAct, true)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, FuseAct, false) \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, FuseAct, true)  \
+#define DECLARE_XE20_MOE_TILE_FUSE(Tile, SGLayout, FuseAct)                              \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, FuseAct, true)           \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, FuseAct, false)          \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, FuseAct, true)           \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, FuseAct, false)          \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, FuseAct, true) \
   DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, FuseAct, false)
 
 DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile_8_64_32, SG_1_4_1)
@@ -145,9 +145,9 @@ DECLARE_XE20_MOE_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
         DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::SWIGLU_GPT_OSS, FuseAct, WithBias, __VA_ARGS__); \
         break;                                                                                        \
       case 3:                                                                                         \
-        /* RELU2 only supports unfused activation path (FuseAct=false).                              \
-         * Fused RELU2 is not yet implemented in the kernel mainloop.                                \
-         * Force FuseAct to false to ensure correct results and avoid unnecessary instantiations. */ \
+        /* RELU2 only supports unfused activation path (FuseAct=false).                               \
+         * Fused RELU2 is not yet implemented in the kernel mainloop.                                 \
+         * Force FuseAct to false to ensure correct results and avoid unnecessary instantiations. */  \
         DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::RELU2, false, WithBias, __VA_ARGS__);            \
         break;                                                                                        \
       default:                                                                                        \
@@ -203,11 +203,11 @@ void moe_grouped_mm_nt_xe20(
     TORCH_CHECK(bias->size(0) == n_experts && bias->size(1) == gemm_n, "bias shape mismatch with weight");
   }
   TORCH_CHECK(
-    activation_type >= static_cast<int>(ActivationType::MIN) && activation_type <= static_cast<int>(ActivationType::MAX),
-    "Unsupported activation_type: ",
-    activation_type,
-    ". Supported values are 0 (silu), 1 (gelu), 2 (swiglu_gpt_oss), 3 (relu2)");
-
+      activation_type >= static_cast<int>(ActivationType::MIN) &&
+          activation_type <= static_cast<int>(ActivationType::MAX),
+      "Unsupported activation_type: ",
+      activation_type,
+      ". Supported values are 0 (silu), 1 (gelu), 2 (swiglu_gpt_oss), 3 (relu2)");
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();

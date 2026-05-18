@@ -366,7 +366,9 @@ def fused_experts(
 
     E, _, K = w1.shape
     E, OutK, N = w2.shape
-    assert (N * 2 == w1.shape[1]) or (N == w1.shape[1]), "w1 shape[1] must be 1x or 2x of w2 shape[2]"
+    assert (N * 2 == w1.shape[1]) or (
+        N == w1.shape[1]
+    ), "w1 shape[1] must be 1x or 2x of w2 shape[2]"
     if b1 is not None:
         assert b1.shape == w1.shape[:2], "b1 shape must match w1 shape[:2]"
     if b2 is not None:
@@ -449,7 +451,9 @@ def fused_experts(
     use_unfused_act = (avg_m <= 128 and big_weight) or gate_factor == 1
     if use_unfused_act:
         intermediate_cache1 = torch.empty(
-            (M * TopK, gate_factor * N), device=hidden_states.device, dtype=hidden_states.dtype
+            (M * TopK, gate_factor * N),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
         )
         intermediate_cache2 = torch.empty(
             (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype

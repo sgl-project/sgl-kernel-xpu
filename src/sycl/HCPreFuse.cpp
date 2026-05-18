@@ -15,6 +15,8 @@ static constexpr int HC = 4;               // hc_mult value
 static constexpr int HC2 = HC * HC;        // 16
 static constexpr int HC3 = (2 + HC) * HC;  // 24
 
+static constexpr float LOG2E = 1.442695040888963f;  // log2(e) for exp2 conversion
+
 template <typename scalar_t>
 struct HCPreFuseKernel {
   const float* __restrict__ gemm_out_mul;     // [n_splits, T, 24] FP32
@@ -60,7 +62,7 @@ struct HCPreFuseKernel {
         sqrsum += gemm_out_sqrsum[row];
         mix_val += gemm_out_mul[row * HC3 + tid];
       }
-      const float rms = sycl::rsqrt(sqrsum / (HC * hidden_size) + rms_eps);
+      const float rms = sycl::native::rsqrt(sqrsum * sycl::native::recip(HC * hidden_size) + rms_eps);
       mixes_shared[tid] = mix_val * rms;
     }
 
@@ -73,7 +75,7 @@ struct HCPreFuseKernel {
         if (lane_id < HC) {
           const float post_logit = mixes_shared[HC + lane_id] * hc_scale[1] + hc_base[HC + lane_id];
           post_mix[static_cast<int64_t>(token_id) * HC + lane_id] =
-              hc_post_mult_value / (1.0f + sycl::exp(-post_logit));
+              hc_post_mult_value * sycl::native::recip(1.0f + sycl::native::exp2(-post_logit * LOG2E));
         }
 
         const int row_i = lane_id / HC;
@@ -87,19 +89,19 @@ struct HCPreFuseKernel {
         for (int mask = 1; mask < HC; mask <<= 1)
           row_max = sycl::fmax(row_max, sycl::permute_group_by_xor(sg, row_max, mask));
 
-        float comb_val = sycl::exp(comb_logit - row_max);
+        float comb_val = sycl::native::exp2((comb_logit - row_max) * LOG2E);
         float row_sum = comb_val;
 #pragma unroll
         for (int mask = 1; mask < HC; mask <<= 1)
           row_sum += sycl::permute_group_by_xor(sg, row_sum, mask);
 
-        comb_val = comb_val / row_sum + hc_sinkhorn_eps;
+        comb_val = comb_val * sycl::native::recip(row_sum) + hc_sinkhorn_eps;
 
         float col_sum = comb_val;
 #pragma unroll
         for (int mask = HC; mask < HC2; mask <<= 1)
           col_sum += sycl::permute_group_by_xor(sg, col_sum, mask);
-        comb_val /= col_sum + hc_sinkhorn_eps;
+        comb_val = comb_val * sycl::native::recip(col_sum + hc_sinkhorn_eps);
 
 #pragma unroll
         for (int iter = 1; iter < sinkhorn_iters; ++iter) {
@@ -107,13 +109,13 @@ struct HCPreFuseKernel {
 #pragma unroll
           for (int mask = 1; mask < HC; mask <<= 1)
             row_sum += sycl::permute_group_by_xor(sg, row_sum, mask);
-          comb_val /= row_sum + hc_sinkhorn_eps;
+          comb_val = comb_val * sycl::native::recip(row_sum + hc_sinkhorn_eps);
 
           col_sum = comb_val;
 #pragma unroll
           for (int mask = HC; mask < HC2; mask <<= 1)
             col_sum += sycl::permute_group_by_xor(sg, col_sum, mask);
-          comb_val /= col_sum + hc_sinkhorn_eps;
+          comb_val = comb_val * sycl::native::recip(col_sum + hc_sinkhorn_eps);
         }
 
         comb_mix[static_cast<int64_t>(token_id) * HC2 + lane_id] = comb_val;
@@ -126,7 +128,7 @@ struct HCPreFuseKernel {
       if (tid >= 32 && tid < 32 + HC) {
         const int pre_idx = tid - 32;
         const float pre_logit = mixes_shared[pre_idx] * hc_scale[0] + hc_base[pre_idx];
-        pre_mix_shared[pre_idx] = 1.0f / (1.0f + sycl::exp(-pre_logit)) + hc_pre_eps;
+        pre_mix_shared[pre_idx] = sycl::native::recip(1.0f + sycl::native::exp2(-pre_logit * LOG2E)) + hc_pre_eps;
       }
 
       item.barrier(sycl::access::fence_space::local_space);

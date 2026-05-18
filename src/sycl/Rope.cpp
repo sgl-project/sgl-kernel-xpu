@@ -235,6 +235,7 @@ void launch_rotary_embedding(
     cgh.parallel_for(range, task);
   };
   Q.submit(cgf);
+  Q.wait_and_throw();
 }
 
 template <typename T>
@@ -332,7 +333,7 @@ void rotary_embedding_2D_kernel_impl(
     const at::Tensor& cos_sin_cache,  // [max_position, rot_dim]
     bool is_neox,
     int64_t rot_dim) {
-  int64_t num_tokens = positions.view(-1).size(0);
+  int64_t num_tokens = query.size(0);
   int64_t num_heads = query.size(-1) / head_size;
   int64_t num_kv_heads = key.size(-1) / head_size;
   int64_t query_stride = query.stride(-2);
@@ -387,6 +388,7 @@ void rotary_embedding_2D_kernel_impl(
           }
         };
         dpcppGetCurrentQueue().submit(cgf);
+        dpcppGetCurrentQueue().wait_and_throw();
       });
 }
 

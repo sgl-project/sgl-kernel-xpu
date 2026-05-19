@@ -144,3 +144,66 @@ def flash_mla_get_workspace_size(
     return torch.ops.sgl_kernel.flash_mla_get_workspace_size.default(
         max_seq_len, num_batches, num_heads, page_size, num_kv_splits
     )
+
+
+def flash_mla_sparse_decode(
+    q: torch.Tensor,  # [B, s_q, H, D_qk] bf16
+    k_cache: torch.Tensor,  # [num_pages, page_size, 1, D] FP8/bf16
+    indices: torch.Tensor,  # [B, s_q, topk] int32
+    topk_length: Optional[torch.Tensor] = None,  # [B] int32
+    attn_sink: Optional[torch.Tensor] = None,  # [H] fp32
+    head_dim_v: int = 512,
+    softmax_scale: Optional[float] = None,
+    extra_k_cache: Optional[torch.Tensor] = None,  # [num_ext_pg, page_size, 1, D]
+    extra_indices: Optional[torch.Tensor] = None,  # [B, s_q, extra_topk] int32
+    extra_topk_length: Optional[torch.Tensor] = None,  # [B] int32
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    DeepSeek V4 Sparse MLA Decode Attention.
+
+    Performs sparse attention over token-level indices from two KV cache pools
+    (SWA sliding window + C4 compressed). attn_sink is applied inside the kernel.
+
+    Returns:
+        out: [B, s_q, H, head_dim_v]  bf16 — final output (attn_sink applied)
+        lse: [B, H, s_q]              fp32 — raw log-sum-exp
+    """
+    assert q.ndim == 4, f"q must be 4D [B, s_q, H, D_qk], got {q.ndim}D"
+    assert (
+        k_cache.ndim == 4
+    ), f"k_cache must be 4D [num_pages, P, 1, D], got {k_cache.ndim}D"
+    assert indices.ndim == 3, f"indices must be 3D [B, s_q, topk], got {indices.ndim}D"
+
+    B, s_q, H, D_qk = q.shape
+
+    if softmax_scale is None:
+        softmax_scale = D_qk ** (-0.5)
+
+    assert q.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ), f"q.dtype must be fp16 or bf16, got {q.dtype}"
+    assert (
+        indices.dtype == torch.int32
+    ), f"indices.dtype must be int32, got {indices.dtype}"
+
+    # Allocate outputs
+    out = q.new_empty((B, s_q, H, head_dim_v))
+    lse = torch.empty((B, H, s_q), dtype=torch.float32, device=q.device)
+
+    torch.ops.sgl_kernel.flash_mla_sparse_decode.default(
+        out,
+        lse,
+        q,
+        k_cache,
+        indices,
+        topk_length,
+        extra_k_cache,
+        extra_indices,
+        extra_topk_length,
+        attn_sink,
+        softmax_scale,
+        head_dim_v,
+    )
+
+    return out, lse

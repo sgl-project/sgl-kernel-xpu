@@ -82,6 +82,7 @@ class MoEGEMM {
       TensorBias,
       TiledMMA,
       WithBias,
+      FuseAct,
       ActType>;
 
   struct Params {
@@ -101,7 +102,8 @@ class MoEGEMM {
   };
 
   auto make_B_tensors(ElementB* ptr_B, int N, int K, int ld_b) {
-    if constexpr (FuseAct) {
+    if constexpr (FuseAct && ActType != ActivationType::RELU2) {
+      // Fused gated activations: split into gate and up weights
       if constexpr (ActType == ActivationType::SWIGLU_GPT_OSS) {
         auto B0 =
             make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N / 2, K), make_stride(2 * ld_b, _1{})));
@@ -117,6 +119,7 @@ class MoEGEMM {
         return cute::make_tuple(B0, B1);
       }
     } else {
+      // Unfused or fused non-gated RELU2: single weight tensor
       auto B = make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N, K), make_stride(ld_b, _1{})));
       return cute::make_tuple(B);
     }
@@ -124,7 +127,8 @@ class MoEGEMM {
 
   auto make_Bias_tensors(float* ptr_Bias, int N) {
     if constexpr (WithBias) {
-      if constexpr (FuseAct) {
+      if constexpr (FuseAct && ActType != ActivationType::RELU2) {
+        // Fused gated activations: split into gate and up biases
         if constexpr (ActType == ActivationType::SWIGLU_GPT_OSS) {
           // Bias is interleaved for GPT-OSS: [bias_gate0, bias_up0, bias_gate1, bias_up1, ...]
           // Gate bias at even indices → stride 2; up bias at odd indices → start +1, stride 2
@@ -140,12 +144,13 @@ class MoEGEMM {
           return cute::make_tuple(Bias0, Bias1);
         }
       } else {
+        // Unfused or fused non-gated RELU2: single bias tensor
         auto Bias = make_tensor(make_gmem_ptr<float>(ptr_Bias), make_layout(make_shape(N), make_stride(_1{})));
         return cute::make_tuple(Bias);
       }
     } else {
       // return a tuple of empty tensors with stride matching the active path
-      if constexpr (FuseAct && ActType == ActivationType::SWIGLU_GPT_OSS) {
+      if constexpr (FuseAct && ActType != ActivationType::RELU2 && ActType == ActivationType::SWIGLU_GPT_OSS) {
         return cute::make_tuple(
             make_tensor(make_gmem_ptr<float>(nullptr), make_layout(make_shape(0), make_stride(_2{}))),
             make_tensor(make_gmem_ptr<float>(nullptr), make_layout(make_shape(0), make_stride(_2{}))));
@@ -158,7 +163,12 @@ class MoEGEMM {
   }
 
   auto make_D_tensors(ElementD* ptr_D, int pre_rows, int M, int N) {
-    if constexpr (FuseAct) {
+    // For fused gated activations (SILU, GELU, SWIGLU), output is N/2 because gate*up fusion
+    // For fused non-gated RELU2 or unfused, output is N (single GEMM or unfused)
+    constexpr bool is_fused_gated = FuseAct && (ActType == ActivationType::SILU ||
+                                                  ActType == ActivationType::GELU ||
+                                                  ActType == ActivationType::SWIGLU_GPT_OSS);
+    if constexpr (is_fused_gated) {
       auto D_tensor = make_tensor(
           make_gmem_ptr<ElementD>(ptr_D + pre_rows * N / 2),
           make_layout(make_shape(M, N / 2), make_stride(N / 2, _1{})));
@@ -236,7 +246,9 @@ class MoEGEMM {
         int m_coord = (group_m_id - pre_tiles);
 
         CollectiveMainloop mainloop;
-        if constexpr (FuseAct) {
+        // Fused gated activations use dual-GEMM mainloop
+        // Unfused or fused non-gated RELU2 use single-GEMM mainloop
+        if constexpr (FuseAct && ActType != ActivationType::RELU2) {
           auto tile_coord = make_coord(m_coord, n_coord, n_coord);
           mainloop(
               A_tensor,

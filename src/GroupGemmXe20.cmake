@@ -16,13 +16,8 @@ endfunction()
 
 foreach(act_type 0 1 2 3)
     foreach(with_bias true false)
-        # RELU2 (act_type=3) only supports fuse_act=false (unfused activation)
-        # Skip fuse_act=true instantiations for act_type=3 to reduce binary size
-        if(act_type EQUAL 3)
-            set(fuse_act_list false)
-        else()
-            set(fuse_act_list true false)
-        endif()
+        # All activation types now support both fused and unfused paths
+        set(fuse_act_list true false)
 
         foreach(fuse_act ${fuse_act_list})
             add_group_gemm_xe20_inst("_8" "_64" "_32" "_1, _4, _1" "_4, _1, _0" ${act_type} ${fuse_act} ${with_bias})

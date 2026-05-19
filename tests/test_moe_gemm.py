@@ -222,6 +222,8 @@ def test_moe_gemm(
         gemm1_limit=gemm1_limit,
         routed_scaling_factor=routed_scaling_factor,
     )
+
+    print(f"ref: {torch_output[0,1]}, fused: {sglang_output[0,1]}")
     torch.testing.assert_close(torch_output, sglang_output, rtol=rtol, atol=atol)
 
 

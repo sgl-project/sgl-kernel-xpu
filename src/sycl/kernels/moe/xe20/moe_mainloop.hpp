@@ -78,6 +78,7 @@ template <
     class BiasTensor_,
     class TiledMMA_,
     bool WithBias,
+    bool FuseAct,
     ActivationType ActType>
 struct MoEMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
@@ -94,6 +95,7 @@ template <
     class BiasTensor_,
     class TiledMMA_,
     bool WithBias,
+    bool FuseAct,
     ActivationType ActType>
 struct MoEMainloop<
     XeDefault<Stages>,
@@ -106,6 +108,7 @@ struct MoEMainloop<
     BiasTensor_,
     TiledMMA_,
     WithBias,
+    FuseAct,
     ActType> {
   using TiledMMA = TiledMMA_;
   using TiledCopyA = TiledCopyA_;
@@ -221,6 +224,16 @@ struct MoEMainloop<
       constexpr int BLK_M = get<0>(wg_tile);
       constexpr int BLK_N = get<1>(wg_tile);
       add_bias<decltype(tCrC), BLK_M, BLK_N>(Bias, tCrC, mma, wg_n, thr_id);
+    }
+
+    // Apply fused activation for RELU2 (non-gated) only when FuseAct is true
+    if constexpr (FuseAct && ActType == ActivationType::RELU2) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tCrC.size(); ++i) {
+        float x = tCrC(i);
+        float relu_x = sycl::fmax(0.0f, x);
+        tCrC(i) = relu_x * relu_x;  // relu(x)^2
+      }
     }
 
     reorder(tCrC, tCrD_final_sg_tensor);

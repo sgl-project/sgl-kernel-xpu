@@ -78,9 +78,6 @@ struct HCPreFuseKernel {
               hc_post_mult_value * sycl::native::recip(1.0f + sycl::native::exp2(-post_logit * LOG2E));
         }
 
-        const int row_i = lane_id / HC;
-        const int col_j = lane_id % HC;
-
         // sinkhorn from mixes[8:24]
         float comb_logit = mixes_shared[2 * HC + lane_id] * hc_scale[2] + hc_base[2 * HC + lane_id];
 
@@ -196,6 +193,8 @@ void hc_pre_fuse(
   TORCH_CHECK(gemm_out_mul.size(2) == HC3, "gemm_out_mul last dim must be ", HC3);
   TORCH_CHECK(gemm_out_sqrsum.size(0) == n_splits_actual, "sqrsum n_splits mismatch");
   TORCH_CHECK(gemm_out_sqrsum.size(1) == T, "sqrsum T mismatch");
+  TORCH_CHECK(
+      n_splits == n_splits_actual, "n_splits argument (", n_splits, ") must match tensor size (", n_splits_actual, ")");
 
   TORCH_CHECK(residual.size(0) == T, "residual T mismatch");
   TORCH_CHECK(residual.size(1) == HC, "residual must have ", HC, " channels");
@@ -210,7 +209,7 @@ void hc_pre_fuse(
 
   auto q = dpcppGetCurrentQueue();
 
-  constexpr int slm_size = HC3 + HC + 256;
+  constexpr int slm_size = HC3 + HC;
 
   using scalar_t = sycl::ext::oneapi::bfloat16;
 

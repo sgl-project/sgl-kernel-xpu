@@ -186,6 +186,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor! pre, Tensor! post, Tensor! comb, "
       "int hc_mult, int sinkhorn_iters, float eps) -> ()");
   m.impl("hc_split_sinkhorn", torch::kXPU, &hc_split_sinkhorn);
+
+  /* HC PRE FUSE */
+  m.def(
+      "hc_pre_fuse(Tensor gemm_out_mul, Tensor gemm_out_sqrsum, "
+      "Tensor hc_scale, Tensor hc_base, Tensor residual, "
+      "Tensor! post_mix, Tensor! comb_mix, Tensor! layer_input, "
+      "int hc_mult, int sinkhorn_iters, int n_splits, "
+      "float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value) -> ()");
+  m.impl("hc_pre_fuse", torch::kXPU, &hc_pre_fuse);
 }
 
 REGISTER_EXTENSION(common_ops)

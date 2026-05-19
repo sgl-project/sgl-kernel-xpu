@@ -89,3 +89,48 @@ def hc_split_sinkhorn(
         post_flat.view(*leading, hc_mult),
         comb_flat.view(*leading, hc_mult, hc_mult),
     )
+
+
+def hc_pre_fuse(
+    gemm_out_mul: torch.Tensor,
+    gemm_out_sqrsum: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    layer_input: torch.Tensor,
+    hc_mult: int = 4,
+    sinkhorn_iters: int = 20,
+    n_splits: int = 1,
+    rms_eps: float = 1e-5,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 2.0,
+):
+    if hc_mult != 4:
+        raise ValueError(
+            f"hc_pre_fuse currently supports only hc_mult=4, got {hc_mult}"
+        )
+    if sinkhorn_iters != 20:
+        raise ValueError(
+            f"hc_pre_fuse currently supports only sinkhorn_iters=20, got {sinkhorn_iters}"
+        )
+
+    torch.ops.sgl_kernel.hc_pre_fuse.default(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual,
+        post_mix,
+        comb_mix,
+        layer_input,
+        hc_mult,
+        sinkhorn_iters,
+        n_splits,
+        float(rms_eps),
+        float(hc_pre_eps),
+        float(hc_sinkhorn_eps),
+        float(hc_post_mult_value),
+    )

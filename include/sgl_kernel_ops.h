@@ -397,6 +397,23 @@ void hc_split_sinkhorn(
     int64_t sinkhorn_iters,
     double eps);
 
+void hc_pre_fuse(
+    const at::Tensor& gemm_out_mul,
+    const at::Tensor& gemm_out_sqrsum,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    const at::Tensor& residual,
+    at::Tensor& post_mix,
+    at::Tensor& comb_mix,
+    at::Tensor& layer_input,
+    int64_t hc_mult,
+    int64_t sinkhorn_iters,
+    int64_t n_splits,
+    double rms_eps,
+    double hc_pre_eps,
+    double hc_sinkhorn_eps,
+    double hc_post_mult_value);
+
 /*
  * From csrc/speculative
  */

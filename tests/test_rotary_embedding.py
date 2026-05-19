@@ -494,14 +494,25 @@ def test_rope_multimodal_noncontiguous(
     positions_clone = positions.clone()
 
     # Simulate the real scenario: q and k are non-contiguous slices of a shared QKV buffer
-    # Total dim per token = num_q_heads * head_size + num_kv_heads * head_size
+    # Allocate extra guard rows beyond num_tokens filled with a sentinel value.
+    # If the kernel overflows (writes past valid rows), the guard region gets corrupted.
     q_dim = num_q_heads * head_size
     k_dim = num_kv_heads * head_size
-    total_dim = q_dim + k_dim  # stride will be total_dim, but q/k shapes are subsets
+    total_dim = q_dim + k_dim
+    guard_rows = num_tokens * (
+        num_position_dims - 1
+    )  # exact overflow the bug would cause
+    sentinel = -31.75  # arbitrary value unlikely to appear from RoPE math
 
-    qkv = torch.randn(num_tokens, total_dim, dtype=torch.bfloat16, device=device)
-    query = qkv[:, :q_dim]  # shape [N, q_dim], stride (total_dim, 1)
-    key = qkv[:, q_dim : q_dim + k_dim]  # shape [N, k_dim], stride (total_dim, 1)
+    qkv = torch.randn(
+        num_tokens + guard_rows, total_dim, dtype=torch.bfloat16, device=device
+    )
+    qkv[num_tokens:, :] = sentinel  # fill guard region
+
+    query = qkv[:num_tokens, :q_dim]  # shape [N, q_dim], stride (total_dim, 1)
+    key = qkv[
+        :num_tokens, q_dim : q_dim + k_dim
+    ]  # shape [N, k_dim], stride (total_dim, 1)
 
     assert not query.is_contiguous(), "query must be non-contiguous for this test"
     assert not key.is_contiguous(), "key must be non-contiguous for this test"
@@ -523,10 +534,12 @@ def test_rope_multimodal_noncontiguous(
         is_neox_style,
     )
 
-    # Verify positions tensor was NOT corrupted
-    assert torch.equal(positions, positions_clone), (
-        f"BUFFER OVERFLOW DETECTED: positions tensor was corrupted by RoPE kernel!\n"
-        f"Corrupted entries: {(positions != positions_clone).sum().item()} / {positions.numel()}"
+    # Deterministic overflow check: guard rows in the same storage must be untouched
+    guard_region = qkv[num_tokens:, :]
+    corrupted = (guard_region != sentinel).sum().item()
+    assert corrupted == 0, (
+        f"BUFFER OVERFLOW DETECTED: guard region after valid rows was overwritten!\n"
+        f"Corrupted elements: {corrupted} / {guard_region.numel()}"
     )
 
     # Verify correctness: compare against reference implementation using first position dim

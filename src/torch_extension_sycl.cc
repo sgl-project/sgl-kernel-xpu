@@ -19,7 +19,6 @@ limitations under the License.
 #include "sgl_flash_kernel_ops.h"
 #include "sgl_kernel_ops.h"
 #include "sgl_kernel_torch_shim.h"
-
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
   m.impl("awq_dequantize", torch::kXPU, &awq_dequantize);
@@ -100,6 +99,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state_v2", torch::kXPU, &merge_state_v2);
+#ifdef BUILD_FMHA
   /*
    * From cutlass attention
    */
@@ -133,6 +133,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    bool?    pack_gqa,"
       "    int      sm_margin) -> Tensor[]");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
+#endif
 
   m.def("flash_mla_get_workspace_size", &flash_mla_get_workspace_size);
 
@@ -186,6 +187,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor! pre, Tensor! post, Tensor! comb, "
       "int hc_mult, int sinkhorn_iters, float eps) -> ()");
   m.impl("hc_split_sinkhorn", torch::kXPU, &hc_split_sinkhorn);
+
+  /*
+   * From LoRA
+   */
+  m.def(
+      "embedding_lora_a_fwd(Tensor! output, Tensor input_ids, Tensor weights, int vocab_size, Tensor seg_indptr, "
+      "Tensor weight_indices, "
+      "Tensor lora_ranks, Tensor? extra_embeddings, Tensor? seg_lens) -> ()");
+  m.impl("embedding_lora_a_fwd", torch::kXPU, &embedding_lora_a_fwd);
 }
 
 REGISTER_EXTENSION(common_ops)

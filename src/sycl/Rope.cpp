@@ -465,6 +465,11 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding(
   TORCH_CHECK(
       input_dim == 2 || input_dim == 3,
       " Query/Key must be 2D [num_tokens, num_heads*head_size] or 3D [num_tokens, num_heads, head_size] tensor");
+  TORCH_CHECK(
+      positions.dim() == 1 || positions.dim() == 2,
+      "positions must be 1D [num_tokens] or 2D [num_dims, num_tokens], got ",
+      positions.dim(),
+      "D");
   if (input_dim == 2) {
     rotary_embedding_2D_kernel_impl(positions, query, key, head_size, cos_sin_cache, is_neox, rotary_dim);
     return {query, key};

@@ -235,7 +235,6 @@ void launch_rotary_embedding(
     cgh.parallel_for(range, task);
   };
   Q.submit(cgf);
-  Q.wait_and_throw();
 }
 
 template <typename T>
@@ -388,7 +387,6 @@ void rotary_embedding_2D_kernel_impl(
           }
         };
         dpcppGetCurrentQueue().submit(cgf);
-        dpcppGetCurrentQueue().wait_and_throw();
       });
 }
 

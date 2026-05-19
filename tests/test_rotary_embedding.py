@@ -449,6 +449,7 @@ def test_deepseek_v2_rope():
             torch.testing.assert_close(k_pe, k_pe_clone, atol=atol, rtol=rtol)
 
 
+# Qwen/Qwen2.5-VL-3B-Instruct (Encode-Prefill-Decode(EPD) mode)
 @pytest.mark.parametrize(
     "num_tokens, num_q_heads, num_kv_heads, head_size, num_position_dims",
     [
@@ -512,7 +513,7 @@ def test_rope_multimodal_noncontiguous(
     query_ref = query.clone().contiguous()
     key_ref = key.clone().contiguous()
 
-    # Run the kernel — before the fix, this would overflow and corrupt positions
+    # Run the kernel
     query_out, key_out = torch.ops.sgl_kernel.rotary_embedding(
         positions,
         query,
@@ -522,7 +523,7 @@ def test_rope_multimodal_noncontiguous(
         is_neox_style,
     )
 
-    # Verify positions tensor was NOT corrupted (the primary regression check)
+    # Verify positions tensor was NOT corrupted
     assert torch.equal(positions, positions_clone), (
         f"BUFFER OVERFLOW DETECTED: positions tensor was corrupted by RoPE kernel!\n"
         f"Corrupted entries: {(positions != positions_clone).sum().item()} / {positions.numel()}"

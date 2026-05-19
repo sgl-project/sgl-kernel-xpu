@@ -479,6 +479,7 @@ def generate_qkv(
 )
 @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("new_kv", [False])
+@pytest.mark.parametrize("prepopulated_kv_cache", [False])
 @pytest.mark.parametrize("causal,local", [(False, True), (False, False), (True, False)])
 @pytest.mark.parametrize("use_sinks", [True, False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
@@ -529,6 +530,7 @@ def test_flash_attn_kvcache(
     local,
     use_sinks,
     new_kv,
+    prepopulated_kv_cache,
     mha_type,
     dtype,
 ):
@@ -608,6 +610,9 @@ def test_flash_attn_kvcache(
         )
         cu_seqlens_k_new = None
         key_new_padding_mask = None
+        prepopulated_k_new_seqlens = None
+        k_cache_new = None
+        v_cache_new = None
         max_seqlen_k = seqlen_k
         if new_kv:
             k = (
@@ -636,6 +641,45 @@ def test_flash_attn_kvcache(
                 k_unpad, v_unpad = k, v
         else:
             k, v, k_unpad, v_unpad = None, None, None, None
+            if prepopulated_kv_cache:
+                prepopulated_k_new_seqlens = (
+                    query_padding_mask.sum(dim=-1, dtype=torch.int32)
+                    if varlen_q
+                    else torch.full(
+                        (batch_size,),
+                        seqlen_q,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                )
+                cu_seqlens_k_new = F.pad(
+                    torch.cumsum(prepopulated_k_new_seqlens, dim=0, dtype=torch.int32),
+                    (1, 0),
+                )
+                k_cache_new = (
+                    torch.randn(
+                        batch_size,
+                        seqlen_q,
+                        nheads_k,
+                        d,
+                        device=device,
+                        dtype=dtype_ref,
+                    )
+                    .to(dtype)
+                    .to(dtype_ref)
+                )
+                v_cache_new = (
+                    torch.randn(
+                        batch_size,
+                        seqlen_q,
+                        nheads_k,
+                        dv,
+                        device=device,
+                        dtype=dtype_ref,
+                    )
+                    .to(dtype)
+                    .to(dtype_ref)
+                )
         if page_size is None:
             k_cache = (
                 torch.randn(
@@ -681,14 +725,29 @@ def test_flash_attn_kvcache(
                 dtype,
                 dtype_ref,
             )
-        cache_seqlens = torch.randint(
-            seqlen_q,
-            # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
-            seqlen_k,
-            (batch_size,),
-            dtype=torch.int32,
-            device=device,
-        )
+        if prepopulated_kv_cache:
+            cache_seqlens = torch.tensor(
+                [
+                    torch.randint(
+                        0,
+                        max(1, seqlen_k - prepopulated_k_new_seqlens[i].item() + 1),
+                        (1,),
+                        device=device,
+                    ).item()
+                    for i in range(batch_size)
+                ],
+                dtype=torch.int32,
+                device=device,
+            )
+        else:
+            cache_seqlens = torch.randint(
+                seqlen_q,
+                # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
+                seqlen_k,
+                (batch_size,),
+                dtype=torch.int32,
+                device=device,
+            )
         if has_leftpad:
             cache_leftpad = torch.cat(
                 [
@@ -716,7 +775,12 @@ def test_flash_attn_kvcache(
             cache_batch_idx = None
         arange = rearrange(torch.arange(seqlen_k, device=device), "s -> 1 s")
         cache_seqlens_expanded = rearrange(cache_seqlens, "b -> b 1")
-        if not new_kv:
+        if prepopulated_kv_cache:
+            k_new_seqlens = prepopulated_k_new_seqlens
+            key_padding_mask = arange < cache_seqlens_expanded + rearrange(
+                k_new_seqlens, "b -> b 1"
+            )
+        elif not new_kv:
             key_padding_mask = arange < cache_seqlens_expanded
         else:
             k_new_seqlens = (
@@ -780,7 +844,41 @@ def test_flash_attn_kvcache(
         v_cache_ref = (
             v_cache if not has_batch_idx else v_cache[cache_batch_idx]
         ).clone()
-        if new_kv:
+        if prepopulated_kv_cache:
+            k_to_update = (
+                rearrange(k_cache_new, "b s ... -> (b s) ...")[indices_q]
+                if varlen_q
+                else rearrange(k_cache_new, "b s ... -> (b s) ...")
+            )
+            v_to_update = (
+                rearrange(v_cache_new, "b s ... -> (b s) ...")[indices_q]
+                if varlen_q
+                else rearrange(v_cache_new, "b s ... -> (b s) ...")
+            )
+            update_mask = torch.logical_and(
+                cache_seqlens_expanded <= arange,
+                arange < cache_seqlens_expanded + rearrange(k_new_seqlens, "b -> b 1"),
+            )
+            k_cache_ref[update_mask] = k_to_update
+            v_cache_ref[update_mask] = v_to_update
+            if page_size is None:
+                k_cache[update_mask] = k_to_update.to(k_cache.dtype)
+                v_cache[update_mask] = v_to_update.to(v_cache.dtype)
+            else:
+                for batch_idx in range(batch_size):
+                    start = cache_seqlens[batch_idx].item()
+                    num_new_tokens = k_new_seqlens[batch_idx].item()
+                    for token_idx in range(num_new_tokens):
+                        seq_idx = start + token_idx
+                        block_idx = page_table[batch_idx, seq_idx // page_size].item()
+                        block_offset = seq_idx % page_size
+                        k_cache_paged[block_idx, block_offset] = k_cache_new[
+                            batch_idx, token_idx
+                        ].to(k_cache_paged.dtype)
+                        v_cache_paged[block_idx, block_offset] = v_cache_new[
+                            batch_idx, token_idx
+                        ].to(v_cache_paged.dtype)
+        elif new_kv:
             update_mask = torch.logical_and(
                 cache_seqlens_expanded <= arange,
                 arange < cache_seqlens_expanded + k_new_seqlens,
@@ -973,6 +1071,55 @@ def test_flash_attn_kvcache(
                 assert (out - out_ref).abs().mean().item() <= mult_mean * (
                     out_pt - out_ref
                 ).abs().mean().item()
+
+
+@pytest.mark.skipif(
+    not is_fa3_supported(),
+    reason="flash_attn at sgl-kernel is only supported on sm90 and above",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
+@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize("varlen_q", [True, False])
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (64, 256),
+        (128, 512),
+    ],
+)
+def test_flash_attn_kvcache_prepopulated(
+    seqlen_q,
+    seqlen_k,
+    d,
+    varlen_q,
+    page_size,
+    causal,
+    local,
+    dtype,
+):
+    """Dedicated smaller test for prepopulated KV cache (cu_seqlens_k_new support)."""
+    test_flash_attn_kvcache(
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        d=d,
+        varlen_q=varlen_q,
+        has_batch_idx=False,
+        has_leftpad=False,
+        page_size=page_size,
+        rotary_fraction=0.0,
+        rotary_interleaved=False,
+        has_rotary_seqlens=False,
+        seqlen_new_eq_seqlen_q=True,
+        causal=causal,
+        local=local,
+        use_sinks=False,
+        new_kv=False,
+        prepopulated_kv_cache=True,
+        mha_type="mha",
+        dtype=dtype,
+    )
 
 
 @pytest.mark.skipif(

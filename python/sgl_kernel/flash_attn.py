@@ -251,9 +251,19 @@ def flash_attn_with_kvcache(
         ) * q.size(1)
         max_seqlen_q = q.size(1)
         q = q.view(-1, q.size(-2), q.size(-1)).contiguous()
+    cu_seqlens_k = None
     if cache_seqlens is not None:
         assert cache_seqlens.size(0) + 1 == cu_seqlens_q.size(0)
         cu_seqlens_k = cache_seqlens
+    if cu_seqlens_k_new is not None:
+        if cache_seqlens is not None:
+            k_new_lens = cu_seqlens_k_new[1:] - cu_seqlens_k_new[:-1]
+            cu_seqlens_k = cu_seqlens_k + k_new_lens
+        else:
+            cu_seqlens_k = cu_seqlens_k_new
+    assert (
+        cu_seqlens_k is not None
+    ), "flash_attn_with_kvcache requires cache_seqlens or cu_seqlens_k_new"
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
         q,
         k_cache,

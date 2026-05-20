@@ -448,7 +448,7 @@ def fused_experts(
     # heuristic for choosing fused or unfused act, can be tuned
     avg_m = (M * TopK) // E
     big_weight = K * N > 4096 * 4096
-    use_unfused_act = (avg_m <= 128 and big_weight)
+    use_unfused_act = avg_m <= 128 and big_weight
     if use_unfused_act:
         intermediate_cache1 = torch.empty(
             (M * TopK, gate_factor * N),

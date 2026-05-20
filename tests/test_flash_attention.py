@@ -340,7 +340,7 @@ def generate_qkv(
     Arguments:
         q: (batch_size, seqlen_q, nheads, d)
         k: (batch_size, seqlen_k, nheads_k, d)
-        v: (batch_size, seqlen_k, nheads_k, d)
+        v: (batch_size, seqlen_k, nheads_k, dv), where dv may differ from d
         query_padding_mask: (batch_size, seqlen), bool
         key_padding_mask: (batch_size, seqlen), bool
     """

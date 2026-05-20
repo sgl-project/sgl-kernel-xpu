@@ -1,5 +1,4 @@
 import argparse
-import math
 from typing import Any, Dict, List, Tuple
 
 import pandas as pd
@@ -420,33 +419,7 @@ def _count_token_classes(
     return base, extra, oor
 
 
-def _estimate_bytes_sgl(
-    num_tokens: int,
-    num_segments: int,
-    max_rank: int,
-    elem_size: int,
-    rank_sum: int,
-) -> float:
-    """Memory traffic estimate for the C++ SGL kernel."""
-    binary_iters = math.ceil(math.log2(max(num_segments, 1)))
-    bytes_seg_indptr = num_tokens * 2 * binary_iters * 4
-    bytes_input_ids = num_tokens * 8
-    bytes_weight_indices = num_tokens * 4
-    bytes_lora_ranks = num_tokens * 4
-    bytes_embedding_reads = rank_sum * elem_size
-    bytes_out = num_tokens * max_rank * elem_size
-
-    return (
-        bytes_seg_indptr
-        + bytes_input_ids
-        + bytes_weight_indices
-        + bytes_lora_ranks
-        + bytes_embedding_reads
-        + bytes_out
-    )
-
-
-def _estimate_bytes_triton(
+def _estimate_bytes(
     num_tokens: int,
     num_segments: int,
     max_rank: int,
@@ -717,14 +690,7 @@ def benchmark(case_id, provider):
     num_segments = min(case["num_segments"], case["num_tokens"])
     elem_size = torch.tensor([], dtype=dtype).element_size()
 
-    # total_bytes_sgl = _estimate_bytes_sgl(
-    # 	num_tokens=case["num_tokens"],
-    # 	num_segments=num_segments,
-    # 	max_rank=case["max_rank"],
-    # 	elem_size=elem_size,
-    # 	rank_sum=rank_sum,
-    # )
-    total_bytes = _estimate_bytes_triton(
+    total_bytes = _estimate_bytes(
         num_tokens=case["num_tokens"],
         num_segments=num_segments,
         max_rank=case["max_rank"],

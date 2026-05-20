@@ -27,8 +27,8 @@
 //
 // Notes:
 //   - Negative token ids are skipped (no write).
-//   - This kernel writes only active rank entries; output tail handling
-//     (padding/initialization) is expected to be managed by caller policy.
+//   - Initializes output tensor to zeros to pad inactive rank entries
+//   - Work items write only active rank entries;
 //
 // ============================================================
 
@@ -178,23 +178,14 @@ void launch_embedding_lora_a_fwd(
     const torch::Tensor& weight_indices,
     const torch::Tensor& lora_ranks,
     const std::optional<torch::Tensor>& extra_embeddings,
-    const std::optional<torch::Tensor>& seg_lens,
     torch::Tensor& output,
-    int num_tokens,
-    int max_rank,
-    int num_segments,
-    int num_extra_tokens,
+    const int num_tokens,
+    const int max_rank,
+    const int num_segments,
+    const int num_extra_tokens,
+    const int max_len,
     sycl::queue& queue) {
   using KernelDType = typename ToSyclElementType<TensorDType>::type;
-  // max_len = maximum segment length of all segments
-  int max_len = 0;
-  if (seg_lens.has_value()) {
-    max_len = seg_lens->max().item<int>();
-  } else {
-    auto seg_len_tensor = seg_indptr.slice(0, 1) - seg_indptr.slice(0, 0, seg_indptr.size(0) - 1);
-    max_len = seg_len_tensor.max().item<int>();
-  }
-
   constexpr int BLOCK_TOK = EmbeddingLoRAAFwd<KernelDType>::BLOCK_TOK;
   const int num_tok_blocks = (max_len + BLOCK_TOK - 1) / BLOCK_TOK;
 
@@ -212,7 +203,7 @@ void launch_embedding_lora_a_fwd(
       lora_ranks.data_ptr<int>(),
       extra_embeddings.has_value() ? reinterpret_cast<const KernelDType*>(extra_embeddings->data_ptr<TensorDType>())
                                    : nullptr,
-      seg_lens.has_value() ? seg_lens->data_ptr<int>() : nullptr,
+      nullptr,
       reinterpret_cast<KernelDType*>(output.data_ptr<TensorDType>()),
       vocab_size,
       num_segments,
@@ -265,22 +256,29 @@ void embedding_lora_a_fwd(
   const int64_t num_segments_i64 = seg_indptr.numel() - 1;
   TORCH_CHECK(weight_indices.numel() == num_segments_i64, "weight_indices.numel() must equal seg_indptr.numel() - 1");
   if (num_segments_i64 > 0) {
-    const int64_t min_weight_index = weight_indices.min().item<int64_t>();
-    const int64_t max_weight_index = weight_indices.max().item<int64_t>();
+    auto [min_wi, max_wi] = torch::aminmax(weight_indices);
     TORCH_CHECK(
-        min_weight_index >= 0 && max_weight_index < num_loras_i64,
+        min_wi.item<int64_t>() >= 0 && max_wi.item<int64_t>() < num_loras_i64,
         "weight_indices values must be in [0, weights.size(0))");
   }
-  if (num_tokens_i64 > 0) {
-    TORCH_CHECK(seg_indptr[0].item<int64_t>() == 0, "seg_indptr[0] must be 0");
-    TORCH_CHECK(
-        seg_indptr[seg_indptr.numel() - 1].item<int64_t>() == num_tokens_i64, "seg_indptr[-1] must equal num_tokens");
+  // Validate output tensor size and dtype
+  TORCH_CHECK(
+      output.size(0) == num_tokens_i64 && output.size(1) == max_rank_i64,
+      "Output tensor must have shape (num_tokens, max_rank)");
+  TORCH_CHECK(output.scalar_type() == weights.scalar_type(), "Output tensor dtype must match weights dtype");
+  output.zero_();
+  if (num_tokens_i64 == 0) {
+    return;
   }
-  if (seg_lens.has_value()) {
-    CHECK_INPUT(seg_lens.value());
-    TORCH_CHECK(seg_lens->dim() == 1, "seg_lens must be a 1D tensor");
-    TORCH_CHECK(seg_lens->numel() == num_segments_i64, "seg_lens.numel() must equal num_segments");
-  }
+
+  TORCH_CHECK(seg_indptr[0].item<int64_t>() == 0, "seg_indptr[0] must be 0");
+  TORCH_CHECK(
+      seg_indptr[seg_indptr.numel() - 1].item<int64_t>() == num_tokens_i64, "seg_indptr[-1] must equal num_tokens");
+  auto seg_len_tensor = seg_indptr.slice(0, 1) - seg_indptr.slice(0, 0, seg_indptr.size(0) - 1);
+  auto [seg_len_min, seg_len_max] = torch::aminmax(seg_len_tensor);
+  TORCH_CHECK(seg_len_min.item<int>() >= 0, "seg_indptr must be non-decreasing");
+  const int max_len =
+      static_cast<int>(seg_len_max.item<int64_t>());  // max_len = maximum segment length of all segments
 
   if (extra_embeddings.has_value()) {
     TORCH_CHECK(extra_embeddings->dim() == 3, "extra_embeddings must be a 3D tensor");
@@ -290,28 +288,24 @@ void embedding_lora_a_fwd(
     TORCH_CHECK(
         extra_embeddings->scalar_type() == weights.scalar_type(), "extra_embeddings dtype must match weights dtype");
   }
-
+  auto [min_lr, max_lr] = torch::aminmax(lora_ranks);
   TORCH_CHECK(
-      lora_ranks.min().item<int>() >= 0 && lora_ranks.max().item<int>() <= max_rank_i64,
+      min_lr.item<int64_t>() >= 0 && max_lr.item<int>() <= max_rank_i64,
       "All values in lora_ranks must be within the range [0, max_rank]");
+
+  // Cast to int32 and validate the bounds
+  auto seg_indptr_i32 = seg_indptr.scalar_type() == torch::kInt32 ? seg_indptr : seg_indptr.to(torch::kInt32);
+  auto weight_indices_i32 =
+      weight_indices.scalar_type() == torch::kInt32 ? weight_indices : weight_indices.to(torch::kInt32);
+  auto lora_ranks_i32 = lora_ranks.scalar_type() == torch::kInt32 ? lora_ranks : lora_ranks.to(torch::kInt32);
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
 
-  int num_tokens = num_tokens_i64;
-  int max_rank = max_rank_i64;
-  int num_segments = num_segments_i64;
-  int num_extra_tokens = extra_embeddings.has_value() ? extra_embeddings->size(1) : 0;
-
-  if (num_tokens == 0) {
-    return;
-  }
-
-  // Validate output tensor size and dtype
-  TORCH_CHECK(
-      output.size(0) == num_tokens && output.size(1) == max_rank,
-      "Output tensor must have shape (num_tokens, max_rank)");
-  TORCH_CHECK(output.scalar_type() == weights.scalar_type(), "Output tensor dtype must match weights dtype");
+  const int num_tokens = num_tokens_i64;
+  const int max_rank = max_rank_i64;
+  const int num_segments = num_segments_i64;
+  const int num_extra_tokens = extra_embeddings.has_value() ? extra_embeddings->size(1) : 0;
 
   // Dispatch kernel based on data type
   if (weights.scalar_type() == torch::kFloat32) {
@@ -323,12 +317,12 @@ void embedding_lora_a_fwd(
         weight_indices,
         lora_ranks,
         extra_embeddings,
-        seg_lens,
         output,
         num_tokens,
         max_rank,
         num_segments,
         num_extra_tokens,
+        max_len,
         queue);
   } else if (weights.scalar_type() == torch::kHalf) {
     launch_embedding_lora_a_fwd<at::Half>(
@@ -339,12 +333,12 @@ void embedding_lora_a_fwd(
         weight_indices,
         lora_ranks,
         extra_embeddings,
-        seg_lens,
         output,
         num_tokens,
         max_rank,
         num_segments,
         num_extra_tokens,
+        max_len,
         queue);
   } else if (weights.scalar_type() == torch::kBFloat16) {
     launch_embedding_lora_a_fwd<at::BFloat16>(
@@ -355,12 +349,12 @@ void embedding_lora_a_fwd(
         weight_indices,
         lora_ranks,
         extra_embeddings,
-        seg_lens,
         output,
         num_tokens,
         max_rank,
         num_segments,
         num_extra_tokens,
+        max_len,
         queue);
   } else {
     TORCH_CHECK(false, "Unsupported data type for weights");

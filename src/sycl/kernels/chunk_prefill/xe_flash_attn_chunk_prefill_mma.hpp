@@ -460,9 +460,18 @@ struct FlashChunkPrefillMma<
     auto shape_k_cache = make_shape(
         static_cast<int>(PagedKV ? total_seq_len_kv_cache : seq_len_kv_cache), head_size_qk * num_heads_kv, 1);
     StrideK stride_k_cache = cutlass::make_cute_packed_stride(StrideK{}, shape_k_cache);
+    // Use single-head width for V surface so that when TileShapeOutput_N > head_size_vo
+    // (asymmetric head dim, e.g. d=192, dv=128), OOB reads hit the real surface boundary
+    // and get zero-padded by hardware, instead of reading adjacent head data.
+    // We must NOT use packed stride here because the pitch (stride between seq positions)
+    // is num_heads_kv * head_size_vo (interleaved heads), not head_size_vo.
     auto shape_v_cache = make_shape(
-        head_size_vo * num_heads_kv, static_cast<int>(PagedKV ? total_seq_len_kv_cache : seq_len_kv_cache), 1);
-    StrideV stride_v_cache = cutlass::make_cute_packed_stride(StrideV{}, shape_v_cache);
+        static_cast<int>(head_size_vo), static_cast<int>(PagedKV ? total_seq_len_kv_cache : seq_len_kv_cache), 1);
+    StrideV stride_v_cache = make_stride(
+        cute::Int<1>{},
+        static_cast<int64_t>(num_heads_kv * head_size_vo),
+        static_cast<int64_t>(num_heads_kv * head_size_vo) *
+            static_cast<int64_t>(PagedKV ? total_seq_len_kv_cache : seq_len_kv_cache));
     auto tensorQ = make_tensor(make_gmem_ptr(q_ptr + offset_q), make_layout(shape_q, stride_q));
     auto tensorK_cache =
         make_tensor(make_gmem_ptr(k_cache_ptr + offset_k_cache), make_layout(shape_k_cache, stride_k_cache));

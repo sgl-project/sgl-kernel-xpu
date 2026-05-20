@@ -243,6 +243,27 @@ void bmm_fp8(
     int64_t sycl_stream);
 
 /*
+ * From csrc/nsa (Native Sparse Attention)
+ */
+torch::Tensor fp8_mqa_logits(
+    const torch::Tensor& q_fp8,
+    const torch::Tensor& k_fp8,
+    const torch::Tensor& k_scale,
+    const torch::Tensor& weights,
+    const torch::Tensor& ks,
+    const torch::Tensor& ke);
+
+torch::Tensor fp8_paged_mqa_logits(
+    const torch::Tensor& q_fp8,
+    const torch::Tensor& kv_cache,
+    const torch::Tensor& weights,
+    const torch::Tensor& seq_lens,
+    const torch::Tensor& block_tables,
+    const std::optional<torch::Tensor>& schedule_metadata,
+    int64_t max_seq_len,
+    bool clean_logits);
+
+/*
  * From csrc/moe
  */
 void moe_align_block_size(

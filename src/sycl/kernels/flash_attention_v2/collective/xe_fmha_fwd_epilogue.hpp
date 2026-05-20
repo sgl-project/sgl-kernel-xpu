@@ -46,12 +46,24 @@ namespace cutlass::fmha::collective {
 
 using namespace cute;
 
+template <class TensorLSE>
+struct FMHAFwdEpilogueLSETraits {
+  using TensorLSE2D = decltype(TensorLSE{}(append<rank_v<TensorLSE>>(make_coord(_, _), 0)));
+  using ElementLSE = typename TensorLSE::value_type;
+};
+
+template <>
+struct FMHAFwdEpilogueLSETraits<void> {
+  using TensorLSE2D = void;
+  using ElementLSE = void;
+};
+
 template <
     class CollectiveMainloop,  // Attention mainloop
     class TileShapeO_,         // Shape of output tile, may be larger than P*V GEMM
     class TensorO_,            // 2D slice of global output tensor
-  class TiledCopyO_ = void,  // Optional TiledCopy for loading O
-  class TensorLSE_ = void>   // Optional tensor for intermediate exp sums and max logits
+    class TiledCopyO_ = void,  // Optional TiledCopy for loading O
+    class TensorLSE_ = void>   // Optional tensor for intermediate exp sums and max logits
 class FMHAFwdEpilogue {
  public:
   //
@@ -67,8 +79,8 @@ class FMHAFwdEpilogue {
   using ElementO = typename TensorO_::value_type;
 
   using TensorLSE = TensorLSE_;
-  using TensorLSE2D = conditional_t<is_void_v<TensorLSE_>, void, decltype(TensorLSE_{}(append<rank_v<TensorLSE_>>(make_coord(_,_),0)))>;
-  using ElementLSE = conditional_t<is_void_v<TensorLSE_>, void, typename TensorLSE_::value_type>;
+  using TensorLSE2D = typename FMHAFwdEpilogueLSETraits<TensorLSE_>::TensorLSE2D;
+  using ElementLSE = typename FMHAFwdEpilogueLSETraits<TensorLSE_>::ElementLSE;
 
   using FragA = typename CollectiveMainloop::FragA;
   using FragARow = typename CollectiveMainloop::FragARow;
@@ -178,17 +190,17 @@ class FMHAFwdEpilogue {
     copy(copy_o, tOrO, tOgO);
   }
 
-  template <typename QVCoord>
+  template <typename QVCoord, class TensorLSE2DArg = TensorLSE2D>
   CUTLASS_DEVICE
-  void
+  cute::enable_if_t<!is_void_v<TensorLSE2DArg>, void>
   operator()(TensorO2D const& O,
              FragA          & tArA,
              FragARow       & tA_max,
              FragARow       & tA_sum,
              QVCoord          blk_qv,
              int              thr_id,
-             TensorLSE2D const& exp_sums,
-             TensorLSE2D const& max_logits,
+             TensorLSE2DArg const& exp_sums,
+             TensorLSE2DArg const& max_logits,
              int              blk_k) {
 
     using namespace cute;

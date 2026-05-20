@@ -49,8 +49,8 @@ namespace mla_sparse_decode {
 //   ELEM_TAG  in {half, bf16}
 //   PAGE_SIZE in {128, 256}
 
-#define DECLARE_MLA_SPARSE_DECODE_LAUNCH(ELEM, PS)        \
-  void launch_mla_sparse_decode_##ELEM##_##PS(            \
+#define DECLARE_MLA_SPARSE_DECODE_LAUNCH(ELEM)            \
+  void launch_mla_sparse_decode_##ELEM##_128(             \
       at::Tensor& out,                                    \
       at::Tensor& lse_out,                                \
       const at::Tensor& q,                                \
@@ -64,14 +64,9 @@ namespace mla_sparse_decode {
       double sm_scale,                                    \
       int64_t head_dim_v);
 
-#define DECLARE_MLA_SPARSE_DECODE_ALL_PAGE_SIZES(ELEM) \
-  DECLARE_MLA_SPARSE_DECODE_LAUNCH(ELEM, 128)          \
-  DECLARE_MLA_SPARSE_DECODE_LAUNCH(ELEM, 256)
-
-DECLARE_MLA_SPARSE_DECODE_ALL_PAGE_SIZES(half)
-DECLARE_MLA_SPARSE_DECODE_ALL_PAGE_SIZES(bf16)
+DECLARE_MLA_SPARSE_DECODE_LAUNCH(half)
+DECLARE_MLA_SPARSE_DECODE_LAUNCH(bf16)
 
 #undef DECLARE_MLA_SPARSE_DECODE_LAUNCH
-#undef DECLARE_MLA_SPARSE_DECODE_ALL_PAGE_SIZES
 
 }  // namespace mla_sparse_decode

@@ -19,52 +19,38 @@
 
 namespace {
 
-#define DISPATCH_MLA_SPARSE_PAGE_SIZE(ELEM)                                             \
-  do {                                                                                  \
-    switch (page_size) {                                                                \
-      case 256:                                                                         \
-        mla_sparse_decode::launch_mla_sparse_decode_##ELEM##_256(                       \
-            out,                                                                        \
-            lse_out,                                                                    \
-            q,                                                                          \
-            k_cache,                                                                    \
-            indices,                                                                    \
-            topk_length,                                                                \
-            extra_k_cache,                                                              \
-            extra_indices,                                                              \
-            extra_topk_length,                                                          \
-            attn_sink,                                                                  \
-            sm_scale,                                                                   \
-            head_dim_v);                                                                \
-        break;                                                                          \
-      case 128:                                                                         \
-        mla_sparse_decode::launch_mla_sparse_decode_##ELEM##_128(                       \
-            out,                                                                        \
-            lse_out,                                                                    \
-            q,                                                                          \
-            k_cache,                                                                    \
-            indices,                                                                    \
-            topk_length,                                                                \
-            extra_k_cache,                                                              \
-            extra_indices,                                                              \
-            extra_topk_length,                                                          \
-            attn_sink,                                                                  \
-            sm_scale,                                                                   \
-            head_dim_v);                                                                \
-        break;                                                                          \
-      default:                                                                          \
-        TORCH_CHECK(false, "Unsupported page size for Sparse MLA decode: ", page_size); \
-    }                                                                                   \
-  } while (0)
-
 #define DISPATCH_MLA_SPARSE_DTYPE()                                              \
   do {                                                                           \
     switch (in_dtype) {                                                          \
       case at::ScalarType::Half:                                                 \
-        DISPATCH_MLA_SPARSE_PAGE_SIZE(half);                                     \
+        mla_sparse_decode::launch_mla_sparse_decode_half_128(                    \
+            out,                                                                 \
+            lse_out,                                                             \
+            q,                                                                   \
+            k_cache,                                                             \
+            indices,                                                             \
+            topk_length,                                                         \
+            extra_k_cache,                                                       \
+            extra_indices,                                                       \
+            extra_topk_length,                                                   \
+            attn_sink,                                                           \
+            sm_scale,                                                            \
+            head_dim_v);                                                         \
         break;                                                                   \
       case at::ScalarType::BFloat16:                                             \
-        DISPATCH_MLA_SPARSE_PAGE_SIZE(bf16);                                     \
+        mla_sparse_decode::launch_mla_sparse_decode_bf16_128(                    \
+            out,                                                                 \
+            lse_out,                                                             \
+            q,                                                                   \
+            k_cache,                                                             \
+            indices,                                                             \
+            topk_length,                                                         \
+            extra_k_cache,                                                       \
+            extra_indices,                                                       \
+            extra_topk_length,                                                   \
+            attn_sink,                                                           \
+            sm_scale,                                                            \
+            head_dim_v);                                                         \
         break;                                                                   \
       default:                                                                   \
         TORCH_CHECK(false, "Unsupported input data type for Sparse MLA decode"); \
@@ -103,16 +89,10 @@ void flash_mla_sparse_decode(
   TORCH_CHECK(
       in_dtype == at::ScalarType::Half || in_dtype == at::ScalarType::BFloat16,
       "Unsupported input data type for Sparse MLA decode");
-  TORCH_CHECK(
-      page_size == 256 || page_size == 128,
-      "Unsupported page size for Sparse MLA decode: ",
-      page_size,
-      ". Supported: 256, 128");
   TORCH_CHECK(head_dim_v == 512, "head_dim_v must be 512 for DeepSeek V4 MLA");
 
   DISPATCH_MLA_SPARSE_DTYPE();
 }
 
-#undef DISPATCH_MLA_SPARSE_PAGE_SIZE
 #undef DISPATCH_MLA_SPARSE_DTYPE
 #undef SYCL_INTEL_TARGET

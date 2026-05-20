@@ -389,7 +389,7 @@ def _compute_total_bytes(B, topk, extra_topk, H):
 # ============================================================================
 # Benchmark configuration
 # ============================================================================
-batch_size_range = [8, 48, 128, 256]
+batch_size_range = [1, 8, 42, 128, 256]
 topk_range = [64, 128, 512]
 extra_topk_range = [0, 512]
 

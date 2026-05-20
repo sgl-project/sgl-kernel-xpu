@@ -95,7 +95,7 @@ struct FSparseMlAProblemShape {
   int head_size_k = 0;       // D_NOPE = 448 (FP8 nope elements)
   int head_size_v = 0;       // D_V = 512 (dequanted: 448 nope + 64 rope)
   int head_size_o = 0;       // D_V = 512
-  int page_size = 0;         // PAGE_SIZE = 256 (primary); extra uses 2 or 64
+  int page_size = 0;         // PAGE_SIZE = 128
   int total_page = 0;        // Total pages in primary KV cache
   int total_extra_page = 0;  // Total pages in extra KV cache
   int swa_topk = 0;          // SWA window token count (e.g. 128)
@@ -109,18 +109,16 @@ struct FSparseMlAProblemShape {
 //----------------- define Sparse MLA Xe configuration --------------------//
 template <
     typename T,
-    typename PageSizeOpt = SparseMlaPageSizeOption<256>,
+    typename PageSizeOpt = SparseMlaPageSizeOption<128>,
     typename HasExtraOpt = MlaSparseHasExtra<true>>
 struct MlaSparseXe {
   static constexpr bool HasExtra = HasExtraOpt::value;
   using TileScheduler = typename cutlass::flash_attention::kernel::XeMlaSparseIndividualTileScheduler;
 
   static constexpr int PAGE_SIZE = PageSizeOpt::value;
-  // currently fixed the tile size to 128, earlier it was based on the page_size
-  static constexpr int TILE_N_SIZE = 128;
-  using KvTileSizeType = cute::Int<TILE_N_SIZE>;
+  using KvTileSizeType = cute::Int<PAGE_SIZE>;
 
-  static constexpr int NumSubgroupsN = TILE_N_SIZE / 16;
+  static constexpr int NumSubgroupsN = PAGE_SIZE / 16;
 
   using TileShapeQK = Shape<_1, KvTileSizeType, _128>;
   using TileShapePV = Shape<_1, _128, KvTileSizeType>;
@@ -386,7 +384,10 @@ inline typename T::Fmla::Arguments args_from_options_sparse(
   return arguments;
 }
 
-template <typename Element, typename PageSizeOpt, typename HasExtraOpt>
+template <
+    typename Element,
+    typename PageSizeOpt = SparseMlaPageSizeOption<128>,
+    typename HasExtraOpt = MlaSparseHasExtra<true>>
 inline void runMlaSparseImpl(
     at::Tensor& out,
     at::Tensor& lse_out,
@@ -421,7 +422,7 @@ inline void runMlaSparseImpl(
   CUTLASS_CHECK(fmla.run(arguments, workspace.data_ptr()));
 }
 
-template <typename Element, typename PageSizeOpt>
+template <typename Element, typename PageSizeOpt = SparseMlaPageSizeOption<128>>
 inline void runMlaSparse(
     at::Tensor& out,
     at::Tensor& lse_out,

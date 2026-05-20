@@ -3,14 +3,14 @@
  * SPDX-License-Identifier: BSD-3-Clause
  **************************************************************************************************/
 // Auto-generated from mla_sparse_decode_kernel.cpp.in
-// Template parameters: ELEM_TAG=@ELEM_TAG@, PAGE_SIZE=@PAGE_SIZE@
+// Template parameters: ELEM_TAG=@ELEM_TAG@
 #define SYCL_INTEL_TARGET 20
 
 #include "sycl/kernels/mla_sparse/device/mla_sparse_decode_types.hpp"
 
 namespace mla_sparse_decode {
 
-void launch_mla_sparse_decode_@ELEM_TAG@_@PAGE_SIZE@(
+void launch_mla_sparse_decode_@ELEM_TAG@_128(
     at::Tensor& out,
     at::Tensor& lse_out,
     const at::Tensor& q,
@@ -23,7 +23,7 @@ void launch_mla_sparse_decode_@ELEM_TAG@_@PAGE_SIZE@(
     const std::optional<at::Tensor>& attn_sink,
     double sm_scale,
     int64_t head_dim_v) {
-  runMlaSparse<@ELEM_SYCL_TYPE@, SparseMlaPageSizeOption<@PAGE_SIZE@>>(
+  runMlaSparse<@ELEM_SYCL_TYPE@, SparseMlaPageSizeOption<128>>(
       out, lse_out, q, k_cache, indices, topk_length,
       extra_k_cache, extra_indices, extra_topk_length,
       attn_sink, sm_scale, head_dim_v);

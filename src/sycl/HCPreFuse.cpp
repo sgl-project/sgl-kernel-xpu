@@ -18,7 +18,7 @@ static constexpr int HC3 = (2 + HC) * HC;  // 24
 static constexpr float LOG2E = 1.442695040888963f;  // log2(e) for exp2 conversion
 
 template <typename scalar_t>
-struct HCPreFuseKernel {
+struct HCPreBigFuseKernel {
   const float* __restrict__ gemm_out_mul;     // [n_splits, T, 24] FP32
   const float* __restrict__ gemm_out_sqrsum;  // [n_splits, T] FP32
   const float* __restrict__ hc_scale;         // [3] FP32
@@ -150,12 +150,12 @@ struct HCPreFuseKernel {
   }
 };
 
-void hc_pre_fuse(
+void hc_pre_big_fuse(
     const at::Tensor& gemm_out_mul,
     const at::Tensor& gemm_out_sqrsum,
     const at::Tensor& hc_scale,
     const at::Tensor& hc_base,
-    const at::Tensor& residual,
+    const at::Tensor& residual_flat,
     at::Tensor& post_mix,
     at::Tensor& comb_mix,
     at::Tensor& layer_input,
@@ -170,7 +170,7 @@ void hc_pre_fuse(
   CHECK_INPUT(gemm_out_sqrsum);
   CHECK_INPUT(hc_scale);
   CHECK_INPUT(hc_base);
-  CHECK_INPUT(residual);
+  CHECK_INPUT(residual_flat);
   CHECK_INPUT(post_mix);
   CHECK_INPUT(comb_mix);
   CHECK_INPUT(layer_input);
@@ -179,7 +179,7 @@ void hc_pre_fuse(
   TORCH_CHECK(gemm_out_sqrsum.scalar_type() == at::kFloat, "gemm_out_sqrsum must be float32");
   TORCH_CHECK(hc_scale.scalar_type() == at::kFloat, "hc_scale must be float32");
   TORCH_CHECK(hc_base.scalar_type() == at::kFloat, "hc_base must be float32");
-  TORCH_CHECK(residual.scalar_type() == at::kBFloat16, "residual must be bfloat16");
+  TORCH_CHECK(residual_flat.scalar_type() == at::kBFloat16, "residual_flat must be bfloat16");
   TORCH_CHECK(post_mix.scalar_type() == at::kFloat, "post_mix must be float32");
   TORCH_CHECK(comb_mix.scalar_type() == at::kFloat, "comb_mix must be float32");
   TORCH_CHECK(layer_input.scalar_type() == at::kBFloat16, "layer_input must be bfloat16");
@@ -196,9 +196,9 @@ void hc_pre_fuse(
   TORCH_CHECK(
       n_splits == n_splits_actual, "n_splits argument (", n_splits, ") must match tensor size (", n_splits_actual, ")");
 
-  TORCH_CHECK(residual.size(0) == T, "residual T mismatch");
-  TORCH_CHECK(residual.size(1) == HC, "residual must have ", HC, " channels");
-  const int64_t hidden_size = residual.size(2);
+  TORCH_CHECK(residual_flat.size(0) == T, "residual_flat T mismatch");
+  TORCH_CHECK(residual_flat.size(1) == HC, "residual_flat must have ", HC, " channels");
+  const int64_t hidden_size = residual_flat.size(2);
 
   TORCH_CHECK(post_mix.numel() == T * HC, "post_mix size mismatch");
   TORCH_CHECK(comb_mix.numel() == T * HC2, "comb_mix size mismatch");
@@ -216,12 +216,12 @@ void hc_pre_fuse(
   q.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> slm(sycl::range<1>(slm_size), cgh);
 
-    auto ker = HCPreFuseKernel<scalar_t>{
+    auto ker = HCPreBigFuseKernel<scalar_t>{
         gemm_out_mul.data_ptr<float>(),
         gemm_out_sqrsum.data_ptr<float>(),
         hc_scale.data_ptr<float>(),
         hc_base.data_ptr<float>(),
-        reinterpret_cast<const scalar_t*>(residual.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const scalar_t*>(residual_flat.data_ptr<at::BFloat16>()),
         post_mix.data_ptr<float>(),
         comb_mix.data_ptr<float>(),
         reinterpret_cast<scalar_t*>(layer_input.data_ptr<at::BFloat16>()),

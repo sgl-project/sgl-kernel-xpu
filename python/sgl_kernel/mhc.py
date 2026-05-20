@@ -91,12 +91,12 @@ def hc_split_sinkhorn(
     )
 
 
-def hc_pre_fuse(
+def hc_pre_big_fuse(
     gemm_out_mul: torch.Tensor,
     gemm_out_sqrsum: torch.Tensor,
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
-    residual: torch.Tensor,
+    residual_flat: torch.Tensor,
     post_mix: torch.Tensor,
     comb_mix: torch.Tensor,
     layer_input: torch.Tensor,
@@ -110,19 +110,19 @@ def hc_pre_fuse(
 ):
     if hc_mult != 4:
         raise ValueError(
-            f"hc_pre_fuse currently supports only hc_mult=4, got {hc_mult}"
+            f"hc_pre_big_fuse currently supports only hc_mult=4, got {hc_mult}"
         )
     if sinkhorn_iters != 20:
         raise ValueError(
-            f"hc_pre_fuse currently supports only sinkhorn_iters=20, got {sinkhorn_iters}"
+            f"hc_pre_big_fuse currently supports only sinkhorn_iters=20, got {sinkhorn_iters}"
         )
 
-    torch.ops.sgl_kernel.hc_pre_fuse.default(
+    torch.ops.sgl_kernel.hc_pre_big_fuse.default(
         gemm_out_mul,
         gemm_out_sqrsum,
         hc_scale,
         hc_base,
-        residual,
+        residual_flat,
         post_mix,
         comb_mix,
         layer_input,

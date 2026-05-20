@@ -1,7 +1,7 @@
 import pandas as pd
 import torch
 import triton
-from sgl_kernel import hc_pre_fuse
+from sgl_kernel import hc_pre_big_fuse
 
 configs = [
     # (batch_size, seq_len, hidden_size, n_splits)
@@ -59,7 +59,7 @@ def benchmark(batch_size, seq_len, hidden_size, n_splits, provider):
 
     # Warmup
     for _ in range(10):
-        hc_pre_fuse(
+        hc_pre_big_fuse(
             gemm_out_mul,
             gemm_out_sqrsum,
             hc_scale,
@@ -78,7 +78,7 @@ def benchmark(batch_size, seq_len, hidden_size, n_splits, provider):
         )
     torch.xpu.synchronize()
 
-    bench_lambda = lambda: hc_pre_fuse(
+    bench_lambda = lambda: hc_pre_big_fuse(
         gemm_out_mul,
         gemm_out_sqrsum,
         hc_scale,

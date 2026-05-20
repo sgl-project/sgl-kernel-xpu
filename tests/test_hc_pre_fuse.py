@@ -1,17 +1,17 @@
 import pytest
 import torch
 import utils
-from sgl_kernel import hc_pre_fuse
+from sgl_kernel import hc_pre_big_fuse
 
 device = utils.get_device()
 
 
-def _hc_pre_fuse_torch(
+def _hc_pre_big_fuse_torch(
     gemm_out_mul: torch.Tensor,
     gemm_out_sqrsum: torch.Tensor,
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
-    residual: torch.Tensor,
+    residual_flat: torch.Tensor,
     hc_mult: int,
     sinkhorn_iters: int,
     rms_eps: float,
@@ -20,10 +20,10 @@ def _hc_pre_fuse_torch(
     hc_post_mult_value: float,
 ):
     """
-    Pure-torch reference implementation of hc_pre_fuse based on TileLang code.
+    Pure-torch reference implementation of hc_pre_big_fuse based on TileLang code.
     """
     n_splits, T, hc_mult3 = gemm_out_mul.shape
-    _, hidden_size = residual.shape[0], residual.shape[2]
+    _, hidden_size = residual_flat.shape[0], residual_flat.shape[2]
     hc = hc_mult
 
     # Phase 1: RMS normalization with n_splits accumulation
@@ -52,10 +52,10 @@ def _hc_pre_fuse_torch(
     pre_logits = mixes[:, :hc] * hc_scale[0] + hc_base[:hc]
     pre_mix = torch.sigmoid(pre_logits) + hc_pre_eps  # [T, 4]
 
-    # Weighted sum: layer_input = sum_k(pre_mix[k] * residual[:, k, :])
-    # residual: [T, 4, D], pre_mix: [T, 4]
-    # layer_input[t, h] = sum_k(pre_mix[t, k] * residual[t, k, h])
-    layer_input = torch.einsum("tk,tkh->th", pre_mix, residual.float())  # [T, D]
+    # Weighted sum: layer_input = sum_k(pre_mix[k] * residual_flat[:, k, :])
+    # residual_flat: [T, 4, D], pre_mix: [T, 4]
+    # layer_input[t, h] = sum_k(pre_mix[t, k] * residual_flat[t, k, h])
+    layer_input = torch.einsum("tk,tkh->th", pre_mix, residual_flat.float())  # [T, D]
 
     return post_mix, comb_mix, layer_input
 
@@ -101,7 +101,7 @@ def _make_inputs(T, hidden_size, n_splits, device, seed=42):
 @pytest.mark.parametrize("T", [1, 16, 128])
 @pytest.mark.parametrize("hidden_size", [7168, 512])
 @pytest.mark.parametrize("n_splits", [1, 4])
-def test_hc_pre_fuse(T, hidden_size, n_splits):
+def test_hc_pre_big_fuse(T, hidden_size, n_splits):
     hc = 4
     sinkhorn_iters = 20
     rms_eps = 1e-5
@@ -114,18 +114,18 @@ def test_hc_pre_fuse(T, hidden_size, n_splits):
         gemm_out_sqrsum,
         hc_scale,
         hc_base,
-        residual,
+        residual_flat,
         post_mix,
         comb_mix,
         layer_input,
     ) = _make_inputs(T, hidden_size, n_splits, device=f"{device}:0")
 
-    post_mix_ref, comb_mix_ref, layer_input_ref = _hc_pre_fuse_torch(
+    post_mix_ref, comb_mix_ref, layer_input_ref = _hc_pre_big_fuse_torch(
         gemm_out_mul,
         gemm_out_sqrsum,
         hc_scale,
         hc_base,
-        residual,
+        residual_flat,
         hc,
         sinkhorn_iters,
         rms_eps,
@@ -134,12 +134,12 @@ def test_hc_pre_fuse(T, hidden_size, n_splits):
         hc_post_mult_value,
     )
 
-    hc_pre_fuse(
+    hc_pre_big_fuse(
         gemm_out_mul,
         gemm_out_sqrsum,
         hc_scale,
         hc_base,
-        residual,
+        residual_flat,
         post_mix,
         comb_mix,
         layer_input,

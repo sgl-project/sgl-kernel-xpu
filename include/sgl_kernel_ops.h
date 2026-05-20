@@ -397,12 +397,12 @@ void hc_split_sinkhorn(
     int64_t sinkhorn_iters,
     double eps);
 
-void hc_pre_fuse(
+void hc_pre_big_fuse(
     const at::Tensor& gemm_out_mul,
     const at::Tensor& gemm_out_sqrsum,
     const at::Tensor& hc_scale,
     const at::Tensor& hc_base,
-    const at::Tensor& residual,
+    const at::Tensor& residual_flat,
     at::Tensor& post_mix,
     at::Tensor& comb_mix,
     at::Tensor& layer_input,

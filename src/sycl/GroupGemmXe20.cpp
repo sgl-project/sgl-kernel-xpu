@@ -206,7 +206,7 @@ void moe_grouped_mm_nt_xe20(
   TORCH_CHECK(
       activation_type >= static_cast<int>(ActivationType::MIN) &&
           activation_type <= static_cast<int>(ActivationType::MAX),
-      "Unsupported activation_typ: ",
+      "Unsupported activation_type: ",
       activation_type,
       ". Supported values are 0 (silu), 1 (gelu), 2 (swiglu_gpt_oss), 3 (relu2)");
 

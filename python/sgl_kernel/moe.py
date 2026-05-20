@@ -343,8 +343,6 @@ def fused_experts(
         if is_xe2_arch() and b1.dtype == torch.bfloat16:
             # cast b1 to float32, since bias is accumulated in float32 in the kernel
             b1 = b1.float()
-            # Ensure conversion is complete before proceeding
-            torch.xpu.synchronize()
     if b2 is not None:
         assert (
             b2.dtype == torch.bfloat16 or b2.dtype == torch.float32
@@ -352,8 +350,6 @@ def fused_experts(
         if is_xe2_arch() and b2.dtype == torch.bfloat16:
             # cast b2 to float32, since bias is accumulated in float32 in the kernel
             b2 = b2.float()
-            # Ensure conversion is complete before proceeding
-            torch.xpu.synchronize()
     # Shape check
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
     assert (
@@ -500,7 +496,7 @@ def fused_experts(
         )
     else:
         # Use zeros instead of empty to avoid uninitialized memory issues
-        intermediate_cache1 = torch.zeros(
+        intermediate_cache1 = torch.empty(
             (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
         )
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(

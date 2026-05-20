@@ -495,7 +495,6 @@ def fused_experts(
             gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
         )
     else:
-        # Use zeros instead of empty to avoid uninitialized memory issues
         intermediate_cache1 = torch.empty(
             (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
         )

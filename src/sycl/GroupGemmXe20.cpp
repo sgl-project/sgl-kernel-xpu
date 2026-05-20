@@ -182,7 +182,8 @@ void moe_grouped_mm_nt_xe20(
   // For fused activation:
   // - Gated activations (SILU, GELU, SWIGLU): output has N/2 columns (gate * up fusion)
   // - Non-gated RELU2: output has N columns (single GEMM with fused activation)
-  bool is_fused_non_gated_relu2 = (fuse_act && activation_type == 3);
+  bool is_fused_non_gated_relu2 =
+      (fuse_act && activation_type == static_cast<int64_t>(ActivationType::RELU2));
   if (fuse_act && !is_fused_non_gated_relu2) {
     TORCH_CHECK(output.sizes()[1] == gemm_n / 2, "output must have half the number of columns as activations");
   } else {

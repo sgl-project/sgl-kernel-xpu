@@ -50,7 +50,8 @@ template <
     class CollectiveMainloop,  // Attention mainloop
     class TileShapeO_,         // Shape of output tile, may be larger than P*V GEMM
     class TensorO_,            // 2D slice of global output tensor
-    class TiledCopyO_ = void>  // Optional TiledCopy for loading O
+  class TiledCopyO_ = void,  // Optional TiledCopy for loading O
+  class TensorLSE_ = void>   // Optional tensor for intermediate exp sums and max logits
 class FMHAFwdEpilogue {
  public:
   //
@@ -64,6 +65,10 @@ class FMHAFwdEpilogue {
   using TensorO = TensorO_;
   using TensorO2D = decltype(TensorO_{}(append<rank_v<TensorO_>>(make_coord(_, _), 0)));
   using ElementO = typename TensorO_::value_type;
+
+  using TensorLSE = TensorLSE_;
+  using TensorLSE2D = conditional_t<is_void_v<TensorLSE_>, void, decltype(TensorLSE_{}(append<rank_v<TensorLSE_>>(make_coord(_,_),0)))>;
+  using ElementLSE = conditional_t<is_void_v<TensorLSE_>, void, typename TensorLSE_::value_type>;
 
   using FragA = typename CollectiveMainloop::FragA;
   using FragARow = typename CollectiveMainloop::FragARow;
@@ -143,7 +148,7 @@ class FMHAFwdEpilogue {
     using ElementA = typename FragA::element_type;
 
     // Reduce k-blocks of A and A_sum across WG, if needed.
-    auto [rA, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
+    auto [rA, rA_max_unused, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
 
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
@@ -173,6 +178,56 @@ class FMHAFwdEpilogue {
     copy(copy_o, tOrO, tOgO);
   }
 
+  template <typename QVCoord>
+  CUTLASS_DEVICE
+  void
+  operator()(TensorO2D const& O,
+             FragA          & tArA,
+             FragARow       & tA_max,
+             FragARow       & tA_sum,
+             QVCoord          blk_qv,
+             int              thr_id,
+             TensorLSE2D const& exp_sums,
+             TensorLSE2D const& max_logits,
+             int              blk_k) {
+
+    using namespace cute;
+    using ElementA = typename FragA::element_type;
+
+    auto [rA, rA_max, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
+
+    if (!active) return;
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < rA_sum.size(); i++)
+      rA_sum(i) = ElementA(1) / rA_sum(i);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < rA.size(); i++)
+      rA(i) *= broadcast<0>(rA_sum, rA, i);
+
+    Tensor cO = make_identity_tensor(O.shape());
+    Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);
+
+    TiledCopyO copy_o{O};
+    auto thr_copy_o = copy_o.get_slice(thr_id);
+
+    auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
+    auto tOgO = thr_copy_o.partition_D(gO);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tOrO.size(); i++) {
+      int row = get<0>(tOgO(i));
+      if (row < get<0>(O.shape())) {
+        exp_sums(row, blk_k) = ElementA(1) / broadcast<0>(rA_sum, rA, i);
+        max_logits(row, blk_k) = broadcast<0>(rA_max, rA, i);
+      }
+    }
+
+    reorder(rA, tOrO);
+    copy(copy_o, tOrO, tOgO);
+  }
+
   // Reduce k-blocks of A and A_sum across WG, if needed.
   // Note that each k block has its own scale factor based on A_max,
   //   so A/A_sum contributions need to be rescaled to match.
@@ -186,7 +241,7 @@ class FMHAFwdEpilogue {
     using namespace sycl::ext::oneapi::this_work_item;
 
     if constexpr (ReduceK{} == _1{}) {
-      return std::make_tuple(tArA, tA_sum, true);
+      return std::make_tuple(tArA, tA_max, tA_sum, true);
     } else {
       /* Identify A tile ID and k block for this subgroup. */
       auto thr_vak = group<1, 3>(TiledMMAPV{}.get_thr_layout_vmnk()).get_flat_coord(assert_uniform(thr_id));
@@ -276,7 +331,7 @@ class FMHAFwdEpilogue {
           }
         }
       }
-      return std::make_tuple(rA, rA_sum, active);
+      return std::make_tuple(rA, rA_max, rA_sum, active);
     }
   }
 };

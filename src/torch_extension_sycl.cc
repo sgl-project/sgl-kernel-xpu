@@ -193,7 +193,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor hc_scale, Tensor hc_base, Tensor residual_flat, "
       "Tensor! post_mix, Tensor! comb_mix, Tensor! layer_input, "
       "int hc_mult, int sinkhorn_iters, int n_splits, "
-      "float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value) -> ()");
+      "float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value, "
+      "Tensor? norm_weight=None, float? norm_eps=None) -> ()");
   m.impl("hc_pre_big_fuse", torch::kXPU, &hc_pre_big_fuse);
 }
 

@@ -412,7 +412,9 @@ void hc_pre_big_fuse(
     double rms_eps,
     double hc_pre_eps,
     double hc_sinkhorn_eps,
-    double hc_post_mult_value);
+    double hc_post_mult_value,
+    std::optional<at::Tensor> norm_weight = std::nullopt,
+    std::optional<double> norm_eps = std::nullopt);
 
 /*
  * From csrc/speculative

@@ -18,6 +18,8 @@ def _hc_pre_big_fuse_torch(
     hc_pre_eps: float,
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
+    norm_weight: torch.Tensor = None,
+    norm_eps: float = 1e-6,
 ):
     """
     Pure-torch reference implementation of hc_pre_big_fuse based on TileLang code.
@@ -56,6 +58,12 @@ def _hc_pre_big_fuse_torch(
     # residual_flat: [T, 4, D], pre_mix: [T, 4]
     # layer_input[t, h] = sum_k(pre_mix[t, k] * residual_flat[t, k, h])
     layer_input = torch.einsum("tk,tkh->th", pre_mix, residual_flat.float())  # [T, D]
+
+    # Apply RMSNorm if norm_weight is provided
+    if norm_weight is not None:
+        var = layer_input.pow(2).mean(dim=-1, keepdim=True)
+        rms = torch.rsqrt(var + norm_eps)
+        layer_input = layer_input * rms * norm_weight
 
     return post_mix, comb_mix, layer_input
 
@@ -98,16 +106,18 @@ def _make_inputs(T, hidden_size, n_splits, device, seed=42):
     )
 
 
-@pytest.mark.parametrize("T", [1, 16, 128])
-@pytest.mark.parametrize("hidden_size", [7168, 512])
+@pytest.mark.parametrize("T", [1, 16, 128, 512])
+@pytest.mark.parametrize("hidden_size", [512, 4096, 7168])
 @pytest.mark.parametrize("n_splits", [1, 4])
-def test_hc_pre_big_fuse(T, hidden_size, n_splits):
+@pytest.mark.parametrize("with_norm", [False, True])
+def test_hc_pre_big_fuse(T, hidden_size, n_splits, with_norm):
     hc = 4
     sinkhorn_iters = 20
     rms_eps = 1e-5
     hc_pre_eps = 1e-6
     hc_sinkhorn_eps = 1e-6
     hc_post_mult_value = 2.0
+    norm_eps = 1e-6
 
     (
         gemm_out_mul,
@@ -120,6 +130,14 @@ def test_hc_pre_big_fuse(T, hidden_size, n_splits):
         layer_input,
     ) = _make_inputs(T, hidden_size, n_splits, device=f"{device}:0")
 
+    # Create norm_weight if using norm
+    norm_weight = None
+    if with_norm:
+        norm_weight = torch.randn(
+            hidden_size, dtype=torch.bfloat16, device=f"{device}:0"
+        )
+
+    # Reference implementation
     post_mix_ref, comb_mix_ref, layer_input_ref = _hc_pre_big_fuse_torch(
         gemm_out_mul,
         gemm_out_sqrsum,
@@ -132,8 +150,11 @@ def test_hc_pre_big_fuse(T, hidden_size, n_splits):
         hc_pre_eps,
         hc_sinkhorn_eps,
         hc_post_mult_value,
+        norm_weight=norm_weight.float() if with_norm else None,
+        norm_eps=norm_eps,
     )
 
+    # Kernel call
     hc_pre_big_fuse(
         gemm_out_mul,
         gemm_out_sqrsum,
@@ -150,6 +171,8 @@ def test_hc_pre_big_fuse(T, hidden_size, n_splits):
         hc_pre_eps,
         hc_sinkhorn_eps,
         hc_post_mult_value,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps if with_norm else None,
     )
 
     # Validate outputs
@@ -167,5 +190,3 @@ def test_hc_pre_big_fuse(T, hidden_size, n_splits):
     assert torch.allclose(
         layer_input.float(), layer_input_ref, atol=atol_bf16, rtol=1e-2
     ), f"layer_input mismatch: max={(layer_input.float() - layer_input_ref).abs().max():.2e}"
-
-    print(f"✓ T={T}, hidden_size={hidden_size}, n_splits={n_splits} passed")

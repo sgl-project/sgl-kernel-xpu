@@ -107,6 +107,8 @@ def hc_pre_big_fuse(
     hc_pre_eps: float = 1e-6,
     hc_sinkhorn_eps: float = 1e-6,
     hc_post_mult_value: float = 2.0,
+    norm_weight: Optional[torch.Tensor] = None,
+    norm_eps: float = 1e-6,
 ):
     if hc_mult != 4:
         raise ValueError(
@@ -116,6 +118,9 @@ def hc_pre_big_fuse(
         raise ValueError(
             f"hc_pre_big_fuse currently supports only sinkhorn_iters=20, got {sinkhorn_iters}"
         )
+
+    norm_weight_arg = norm_weight.contiguous() if norm_weight is not None else None
+    norm_eps_arg = float(norm_eps) if norm_weight is not None else None
 
     torch.ops.sgl_kernel.hc_pre_big_fuse.default(
         gemm_out_mul,
@@ -133,4 +138,6 @@ def hc_pre_big_fuse(
         float(hc_pre_eps),
         float(hc_sinkhorn_eps),
         float(hc_post_mult_value),
+        norm_weight_arg,
+        norm_eps_arg,
     )

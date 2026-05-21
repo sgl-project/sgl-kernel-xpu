@@ -171,6 +171,11 @@ def test_moe_gemm(
     routed_scaling_factor,
 ):
     act_type, gemm1_alpha, gemm1_limit = act
+
+    # For relu2 activation, only test bias_dtype=False
+    if act_type == "relu2" and bias_dtype != False:
+        pytest.skip("relu2 only supports bias_dtype=False")
+
     torch.xpu.manual_seed_all(0)
 
     # NOTE: Nemotron3 Nano is using a non-gated MoE w/ activation type ReLU2
@@ -222,6 +227,7 @@ def test_moe_gemm(
         gemm1_limit=gemm1_limit,
         routed_scaling_factor=routed_scaling_factor,
     )
+
     torch.testing.assert_close(torch_output, sglang_output, rtol=rtol, atol=atol)
 
 

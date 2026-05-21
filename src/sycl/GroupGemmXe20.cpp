@@ -145,7 +145,7 @@ DECLARE_XE20_MOE_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
         DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::SWIGLU_GPT_OSS, FuseAct, WithBias, __VA_ARGS__); \
         break;                                                                                        \
       case 3:                                                                                         \
-        DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::RELU2, FuseAct, false, __VA_ARGS__);          \
+        DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::RELU2, FuseAct, false, __VA_ARGS__);             \
         break;                                                                                        \
       default:                                                                                        \
         TORCH_CHECK(false, "Unsupported activation type");                                            \

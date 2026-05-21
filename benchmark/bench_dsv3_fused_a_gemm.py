@@ -26,6 +26,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 import itertools
 
 import pandas as pd
+import sgl_kernel  # noqa: F401 - required to register torch.ops.sgl_kernel.* custom ops
 import torch
 import torch.nn.functional as F
 import triton.testing as tt

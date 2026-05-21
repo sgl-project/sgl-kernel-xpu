@@ -15,7 +15,12 @@ function(add_group_gemm_xe20_inst TILE_M TILE_N TILE_K SG_SHAPE SG_STRIDE ACT_TY
 endfunction()
 
 foreach(act_type 0 1 2 3)
-    foreach(with_bias true false)
+    if(act_type EQUAL 3)
+        set(with_bias_list false)
+    else()
+        set(with_bias_list true false)
+    endif()
+    foreach(with_bias ${with_bias_list})
         # All activation types now support both fused and unfused paths
         set(fuse_act_list true false)
 

@@ -195,8 +195,8 @@ void moe_grouped_mm_nt_xe20(
         "moe_grouped_mm_nt_xe20: bias must be float32 (at::kFloat) to match kernel expectations");
 
     // TODO this is only for binary size consideration, if needed, can remove it
-    TORCH_CHECK(activation_type != static_cast<int>(ActivationType::RELU2),
-        "RELU2 activation only supports no bias as of now")
+    TORCH_CHECK(
+        activation_type != static_cast<int>(ActivationType::RELU2), "RELU2 activation only supports no bias as of now");
   }
   TORCH_CHECK(
       activations.scalar_type() == weights.scalar_type(), "activations and weights must have the same data type");

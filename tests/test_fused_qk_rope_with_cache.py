@@ -74,7 +74,10 @@ def torch_impl_rope(
     head_size = q.shape[-1]
     positions = positions.flatten()
     num_tokens = positions.shape[0]
-    rotary_dim = cos_sin_cache.shape[-1]
+    assert rotary_dim == cos_sin_cache.size(-1), (
+        f"rotary_dim ({rotary_dim}) must match cos/sin cache rotary width "
+        f"({cos_cache.size(-1)})"
+    )
     cos_cache, sin_cache = cos_sin_cache.chunk(2, dim=-1)
     cos = cos_cache[positions]
     sin = sin_cache[positions]

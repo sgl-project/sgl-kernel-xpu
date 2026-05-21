@@ -397,4 +397,154 @@ void fused_qk_rope(
 #undef FUSED_QK_ROPE_LAUNCH_ARGS
 }
 
+template <bool is_neox, typename scalar_t, typename pos_t>
+struct FusedRopeCacheKernel {
+  scalar_t* query;
+  scalar_t* key;
+  const scalar_t* cos_sin_cache;
+  const pos_t* positions;
+  int64_t q_stride;
+  int64_t k_stride;
+  int64_t q_head_stride;
+  int64_t k_head_stride;
+  int64_t num_tokens;
+  int64_t num_q_heads;
+  int64_t num_k_heads;
+  int64_t rope_dim;
+  int64_t cache_stride;
+  int64_t workers_per_work_group;
+  int64_t total_workers;
+
+  [[sycl::reqd_sub_group_size(16)]]
+  void operator()(sycl::nd_item<1> item) const {
+    const int64_t sg_size = item.get_sub_group().get_max_local_range()[0];
+    assert(sg_size == 16);
+    const int64_t local_id = item.get_local_id(0);
+    const int64_t worker_in_work_group = local_id / sg_size;
+    const int64_t lane_id = local_id % sg_size;
+    const int64_t worker_id = item.get_group(0) * workers_per_work_group + worker_in_work_group;
+
+    const int64_t num_qk_heads = num_q_heads + num_k_heads;
+    const int64_t num_works = num_tokens * num_qk_heads;
+    const int64_t half_rope = rope_dim / 2;
+
+    for (int64_t idx = worker_id; idx < num_works; idx += total_workers) {
+      const int64_t token_id = idx / num_qk_heads;
+      const int64_t head_id = idx % num_qk_heads;
+      const bool is_q_head = head_id < num_q_heads;
+
+      const int64_t pos = static_cast<int64_t>(positions[token_id]);
+      scalar_t* base_ptr = nullptr;
+      int64_t head_index = 0;
+
+      if (is_q_head) {
+        head_index = head_id;
+        base_ptr = query + token_id * q_stride + head_index * q_head_stride;
+      } else {
+        head_index = head_id - num_q_heads;
+        base_ptr = key + token_id * k_stride + head_index * k_head_stride;
+      }
+
+      const scalar_t* cos_ptr = cos_sin_cache + pos * cache_stride;
+      const scalar_t* sin_ptr = cos_ptr + half_rope;
+
+      if constexpr (is_neox) {
+        for (int64_t i = lane_id; i < half_rope; i += sg_size) {
+          const scalar_t x = base_ptr[i];
+          const scalar_t y = base_ptr[i + half_rope];
+          const scalar_t c = cos_ptr[i];
+          const scalar_t s = sin_ptr[i];
+          base_ptr[i] = x * c - y * s;
+          base_ptr[i + half_rope] = x * s + y * c;
+        }
+      } else {
+        for (int64_t i = lane_id; i < half_rope; i += sg_size) {
+          const int64_t x_idx = 2 * i;
+          const int64_t y_idx = 2 * i + 1;
+          const scalar_t x = base_ptr[x_idx];
+          const scalar_t y = base_ptr[y_idx];
+          const scalar_t c = cos_ptr[i];
+          const scalar_t s = sin_ptr[i];
+          base_ptr[x_idx] = x * c - y * s;
+          base_ptr[y_idx] = x * s + y * c;
+        }
+      }
+    }
+  }
+};
+
+template <bool is_neox, typename scalar_t, typename pos_t>
+void launch_fused_rope_cache_kernel_scalar(
+    at::Tensor& query,
+    at::Tensor& key,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& positions,
+    int64_t rope_dim) {
+  constexpr int kWorkGroupSize = 128;
+  constexpr int sg_size = 16;
+  static_assert(kWorkGroupSize % sg_size == 0, "kWorkGroupSize must be divisible by subgroup size");
+
+  const int64_t workers_per_work_group = kWorkGroupSize / sg_size;
+  const int64_t num_tokens = query.size(0);
+  const int64_t num_q_heads = query.size(1);
+  const int64_t num_k_heads = key.size(1);
+  const int64_t num_works = num_tokens * (num_q_heads + num_k_heads);
+  const int64_t num_groups = CeilDiv(num_works, workers_per_work_group);
+  const int64_t total_workers = num_groups * workers_per_work_group;
+
+  FusedRopeCacheKernel<is_neox, scalar_t, pos_t> kernel{
+      query.data_ptr<scalar_t>(),
+      key.data_ptr<scalar_t>(),
+      cos_sin_cache.data_ptr<scalar_t>(),
+      positions.data_ptr<pos_t>(),
+      query.stride(0),
+      key.stride(0),
+      query.stride(1),
+      key.stride(1),
+      num_tokens,
+      num_q_heads,
+      num_k_heads,
+      rope_dim,
+      cos_sin_cache.stride(0),
+      workers_per_work_group,
+      total_workers};
+
+  sycl_kernel_submit(
+      sycl::range<1>(num_groups * kWorkGroupSize), sycl::range<1>(kWorkGroupSize), dpcppGetCurrentQueue(), kernel);
+}
+
+void fused_qk_rope_with_cos_sin_cache(
+    at::Tensor& query,
+    at::Tensor& key,
+    at::Tensor& cos_sin_cache,
+    at::Tensor& positions,
+    int64_t rope_dim,
+    bool is_neox) {
+  const auto input_dim = query.dim();
+  // Note that query and key were truncated to rope_dim here if head_dim is larger.
+  TORCH_CHECK(
+      input_dim == 3, "fused_qk_rope_with_cos_sin_cache only supports 3D input [num_tokens, num_heads, rope_dim]");
+
+  SYCL_DISPATCH_FLOATING_TYPES(
+      at::ScalarType::Half, at::ScalarType::BFloat16, query.scalar_type(), "fused_qk_rope_with_cos_sin_cache", [&]() {
+        if (positions.scalar_type() == at::kInt) {
+          if (is_neox) {
+            launch_fused_rope_cache_kernel_scalar<true, scalar_t, int32_t>(
+                query, key, cos_sin_cache, positions, rope_dim);
+          } else {
+            launch_fused_rope_cache_kernel_scalar<false, scalar_t, int32_t>(
+                query, key, cos_sin_cache, positions, rope_dim);
+          }
+        } else {
+          if (is_neox) {
+            launch_fused_rope_cache_kernel_scalar<true, scalar_t, int64_t>(
+                query, key, cos_sin_cache, positions, rope_dim);
+          } else {
+            launch_fused_rope_cache_kernel_scalar<false, scalar_t, int64_t>(
+                query, key, cos_sin_cache, positions, rope_dim);
+          }
+        }
+      });
+}
+
 }  // namespace at::native::xpu

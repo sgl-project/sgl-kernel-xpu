@@ -425,3 +425,25 @@ def fused_qk_rope(
         attention_factor,
         rotary_dim,
     )
+
+
+def fused_qk_rope_with_cos_sin_cache(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    head_dim: int,
+    is_neox: bool,
+) -> None:
+    r"""Apply RoPE to Q/K using precomputed cos/sin cache.
+
+    This op updates ``q`` and ``k`` in-place.
+    """
+    torch.ops.sgl_kernel.fused_qk_rope_with_cos_sin_cache(
+        q,
+        k,
+        cos_sin_cache,
+        positions,
+        head_dim,
+        is_neox,
+    )

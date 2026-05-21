@@ -179,4 +179,124 @@ struct Fp8PagedMqaLogitsKernel {
   }
 };
 
+// Reduction kernel for SYCL-TLA optimized path.
+// Takes GEMM output dots(Nq*H, Nk) and reduces across H heads with ReLU + weights.
+// dots: (Nq, H, Nk) float32 — reshaped GEMM output
+// weights: (Nq, H) float32
+// k_scale: (Nk,) float32
+// ks: (Nq,) int32
+// ke: (Nq,) int32
+// out: (Nq, Nk) float32
+struct Fp8MqaLogitsReduceKernel {
+  const float* dots_ptr;
+  const float* weights_ptr;
+  const float* k_scale_ptr;
+  const int32_t* ks_ptr;
+  const int32_t* ke_ptr;
+  float* out_ptr;
+  int Nq, H, Nk;
+
+  void operator()(sycl::nd_item<2> item) const {
+    int qi = item.get_global_id(0);
+    int kj = item.get_global_id(1);
+    if (qi >= Nq || kj >= Nk) return;
+
+    if (kj < ks_ptr[qi] || kj >= ke_ptr[qi]) {
+      out_ptr[qi * Nk + kj] = 0.0f;
+      return;
+    }
+
+    float score = 0.0f;
+    for (int h = 0; h < H; ++h) {
+      float dot = dots_ptr[(qi * H + h) * Nk + kj];
+      dot = dot > 0.0f ? dot : 0.0f;  // ReLU
+      score += dot * weights_ptr[qi * H + h];
+    }
+    score *= k_scale_ptr[kj];
+    out_ptr[qi * Nk + kj] = score;
+  }
+};
+
+// Gather kernel: extracts FP8 keys and scales from paged KV cache
+// into contiguous buffers for GEMM.
+// kv_cache: (num_pages, page_size, 1, D+4) uint8
+// block_tables: (B, max_num_blocks) int32
+// seq_lens: (B,) int32
+// k_out: (B * max_seq_len, D) uint8 — contiguous FP8 keys
+// k_scale_out: (B, max_seq_len) float32
+struct PagedKGatherKernel {
+  const uint8_t* kv_cache_ptr;
+  const int32_t* block_tables_ptr;
+  const int32_t* seq_lens_ptr;
+  uint8_t* k_out_ptr;
+  float* k_scale_out_ptr;
+  int B, D, page_size, max_num_blocks, max_seq_len;
+  int head_dim_with_sf;
+
+  void operator()(sycl::nd_item<2> item) const {
+    int b = item.get_global_id(0);
+    int kj = item.get_global_id(1);
+    if (b >= B || kj >= max_seq_len) return;
+
+    int out_idx = b * max_seq_len + kj;
+    if (kj >= seq_lens_ptr[b]) {
+      // Zero padding
+      for (int d = 0; d < D; ++d)
+        k_out_ptr[out_idx * D + d] = 0;
+      k_scale_out_ptr[out_idx] = 0.0f;
+      return;
+    }
+
+    int page_block = kj / page_size;
+    int token_in_page = kj % page_size;
+    int page_id = block_tables_ptr[b * max_num_blocks + page_block];
+
+    const uint8_t* src = kv_cache_ptr + page_id * page_size * head_dim_with_sf + token_in_page * head_dim_with_sf;
+
+    for (int d = 0; d < D; ++d)
+      k_out_ptr[out_idx * D + d] = src[d];
+
+    // Extract float32 scale from last 4 bytes
+    const uint8_t* sb = src + D;
+    uint32_t bits = static_cast<uint32_t>(sb[0]) | (static_cast<uint32_t>(sb[1]) << 8) |
+                    (static_cast<uint32_t>(sb[2]) << 16) | (static_cast<uint32_t>(sb[3]) << 24);
+    k_scale_out_ptr[out_idx] = *reinterpret_cast<const float*>(&bits);
+  }
+};
+
+// Reduction kernel for paged path (after batched GEMM).
+// dots: (B, H, max_seq_len) float32
+// weights: (B, H) float32
+// k_scale: (B, max_seq_len) float32
+// seq_lens: (B,) int32
+// out: (B, max_seq_len) float32
+struct Fp8PagedMqaLogitsReduceKernel {
+  const float* dots_ptr;
+  const float* weights_ptr;
+  const float* k_scale_ptr;
+  const int32_t* seq_lens_ptr;
+  float* out_ptr;
+  int B, H, max_seq_len;
+
+  void operator()(sycl::nd_item<2> item) const {
+    int bi = item.get_global_id(0);
+    int kj = item.get_global_id(1);
+    if (bi >= B || kj >= max_seq_len) return;
+
+    if (kj >= seq_lens_ptr[bi]) {
+      out_ptr[bi * max_seq_len + kj] = 0.0f;
+      return;
+    }
+
+    float score = 0.0f;
+    for (int h = 0; h < H; ++h) {
+      float dot = dots_ptr[(bi * H + h) * max_seq_len + kj];
+      dot = dot > 0.0f ? dot : 0.0f;
+      score += dot * weights_ptr[bi * H + h];
+    }
+    score *= k_scale_ptr[bi * max_seq_len + kj];
+    out_ptr[bi * max_seq_len + kj] = score;
+  }
+};
+
 }  // namespace nsa

@@ -127,9 +127,11 @@ struct HCPreBigFuseKernel {
         const float pre_logit = mixes_shared[pre_idx] * hc_scale[0] + hc_base[pre_idx];
         pre_mix_shared[pre_idx] = sycl::native::recip(1.0f + sycl::native::exp2(-pre_logit * LOG2E)) + hc_pre_eps;
       }
+    }
 
-      item.barrier(sycl::access::fence_space::local_space);
+    item.barrier(sycl::access::fence_space::local_space);
 
+    if (sg_id >= 2) {
       // Weighted sum: layer_input[t, h] = sum_k(pre_mix[k] * residual[t, k, h])
       const int threads_for_wsum = WG_SIZE - 32;  // 96 threads
       const int thread_local_id = tid - 32;       // 0..95

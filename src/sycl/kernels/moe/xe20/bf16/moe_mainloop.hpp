@@ -383,8 +383,8 @@ struct MoEMainloop<
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tCrC0.size(); ++i) {
-      tCrC0(i) = moe_xe20::apply_fused_activation<static_cast<int>(ActType)>(
-          tCrC0(i), tCrC1(i), gemm1_alpha, gemm1_limit);
+      tCrC0(i) =
+          moe_xe20::apply_fused_activation<static_cast<int>(ActType)>(tCrC0(i), tCrC1(i), gemm1_alpha, gemm1_limit);
     }
 
     reorder(tCrC0, tCrD_final_sg_tensor0);

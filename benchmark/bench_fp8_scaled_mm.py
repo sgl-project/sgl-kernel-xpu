@@ -178,8 +178,11 @@ if __name__ == "__main__":
     ref = F.linear(a_cpu, b_cpu)
     ref = ref * scale_a_cpu.view(-1, 1) * scale_b_cpu.view(1, -1)
 
+    # Tolerances match tests/test_fp8_scaled_mm_xpu.py::_get_tolerances() for
+    # fp32 output
+    rtol, atol = 2e-2, 50.0
     assert torch.allclose(
-        out.cpu(), ref, rtol=1e-3, atol=1e-3
+        out.cpu(), ref, rtol=rtol, atol=atol
     ), f"Correctness check failed! Max diff: {(out.cpu() - ref).abs().max()}"
     print("Smoke correctness check passed.")
 

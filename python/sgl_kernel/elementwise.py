@@ -427,7 +427,7 @@ def fused_qk_rope(
     )
 
 
-def fused_qk_rope_with_cos_sin_cache(
+def fused_qk_rope_with_cos_sin_cache_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
     cos_sin_cache: torch.Tensor,
@@ -454,7 +454,7 @@ def fused_qk_rope_with_cos_sin_cache(
     is_neox: bool
         Whether to apply NeoX-style rotary layout.
     """
-    torch.ops.sgl_kernel.fused_qk_rope_with_cos_sin_cache(
+    torch.ops.sgl_kernel.fused_qk_rope_with_cos_sin_cache_inplace(
         q,
         k,
         cos_sin_cache,

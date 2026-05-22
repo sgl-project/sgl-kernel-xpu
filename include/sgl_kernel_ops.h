@@ -181,7 +181,7 @@ void fused_qk_rope(
     double high,
     double attention_factor,
     int64_t rotary_dim);
-void fused_qk_rope_with_cos_sin_cache(
+void fused_qk_rope_with_cos_sin_cache_inplace(
     at::Tensor& query,
     at::Tensor& key,
     at::Tensor& cos_sin_cache,

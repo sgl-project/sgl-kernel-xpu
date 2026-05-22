@@ -1,8 +1,9 @@
 import itertools
 
+import pandas as pd
 import torch
 import triton
-from sgl_kernel import fused_qk_rope_with_cos_sin_cache
+from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
 
 DEVICE = "xpu"
 MAX_SEQ_LEN = 131072  # common seq length
@@ -32,66 +33,6 @@ def create_cos_sin_cache(
     return cache
 
 
-def apply_rotary_emb(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    is_neox_style: bool,
-) -> torch.Tensor:
-    """
-    Args:
-        x: [num_tokens, num_heads, head_size]
-        cos: [num_tokens, head_size // 2]
-        sin: [num_tokens, head_size // 2]
-        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
-            positional embeddings.
-    """
-    cos = cos.unsqueeze(-2).to(x.dtype)
-    sin = sin.unsqueeze(-2).to(x.dtype)
-    if is_neox_style:
-        x1, x2 = torch.chunk(x, 2, dim=-1)
-    else:
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-    o1 = x1 * cos - x2 * sin
-    o2 = x2 * cos + x1 * sin
-    if is_neox_style:
-        return torch.cat((o1, o2), dim=-1)
-    else:
-        return torch.stack((o1, o2), dim=-1).flatten(-2)
-
-
-def native_fused_qk_rope_with_cache(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    positions: torch.Tensor,
-    rotary_dim: int,
-    is_neox: bool,
-):
-    head_size = q.shape[-1]
-    positions = positions.flatten()
-    num_tokens = positions.shape[0]
-    cos_cache, sin_cache = cos_sin_cache.chunk(2, dim=-1)
-    cos = cos_cache[positions]
-    sin = sin_cache[positions]
-
-    query_shape = q.shape
-    query = q.view(num_tokens, -1, head_size)
-    query_rot = query[..., :rotary_dim]
-    query_pass = query[..., rotary_dim:]
-    query_rot = apply_rotary_emb(query_rot, cos, sin, is_neox)
-    query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
-
-    key_shape = k.shape
-    key = k.view(num_tokens, -1, head_size)
-    key_rot = key[..., :rotary_dim]
-    key_pass = key[..., rotary_dim:]
-    key_rot = apply_rotary_emb(key_rot, cos, sin, is_neox)
-    key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
-    return query, key
-
-
 def sglang_fused_qk_rope_with_cache(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -100,9 +41,49 @@ def sglang_fused_qk_rope_with_cache(
     rotary_dim: int,
     is_neox: bool,
 ):
-    return fused_qk_rope_with_cos_sin_cache(
+    fused_qk_rope_with_cos_sin_cache_inplace(
         q, k, cos_sin_cache, positions, rotary_dim, is_neox
     )
+
+
+def calculate_bandwidth(
+    num_tokens: int,
+    num_heads: int,
+    num_kv_heads: int,
+    rotary_dim: int,
+    time_ms: float,
+    dtype: torch.dtype,
+):
+    """Estimate effective memory bandwidth (GB/s) for the fused QK RoPE kernel.
+
+    This is an *effective* bandwidth model: it approximates how many bytes are
+    moved for one invocation and divides by measured kernel time.
+
+    Byte model:
+    - Q/K read + write for rotary part:
+        num_tokens * (num_heads + num_kv_heads) * rotary_dim * dtype_size * 2
+        (*2 accounts for one read and one write of Q/K rotary slices).
+    - Cos/sin cache read:
+        num_tokens * rotary_dim * dtype_size
+        (counted as one read per token; cache effects can make measured bandwidth
+        differ from peak/theoretical device bandwidth).
+
+    Effective bandwidth = total_bytes / elapsed_time.
+    """
+    dtype_size = 2 if dtype in [torch.float16, torch.bfloat16] else 4
+    qkv_read_write_bytes = (
+        num_tokens * (num_heads + num_kv_heads) * rotary_dim * dtype_size * 2
+    )
+    # cos_sin_cache is fetched once per token for the current position.
+    cache_read_bytes = num_tokens * rotary_dim * dtype_size
+    total_bytes = qkv_read_write_bytes + cache_read_bytes
+
+    time_s = time_ms / 1000.0
+    # Return effective GB/s (decimal GB).
+    return (total_bytes / 1e9) / time_s
+
+
+all_results = []
 
 
 def get_benchmark(device="xpu"):
@@ -118,8 +99,8 @@ def get_benchmark(device="xpu"):
             ],
             x_vals=configs,
             line_arg="provider",
-            line_vals=["sglang", "native"],
-            line_names=["SGLang", "native"],
+            line_vals=["sglang"],
+            line_names=["SGLang"],
             styles=[("blue", "-"), ("green", "-")],
             ylabel="Latency (us)",
             plot_name="fused-qk-rope-with-cache-performance",
@@ -138,17 +119,29 @@ def get_benchmark(device="xpu"):
         )
         cos_sin_cache = create_cos_sin_cache(rope_dim).to(dtype)
 
-        if provider == "sglang" or provider == "sglang1":
+        if provider == "sglang":
             fn = lambda: sglang_fused_qk_rope_with_cache(
-                q, k, cos_sin_cache, positions, rope_dim, is_neox
-            )
-        elif provider == "native":
-            fn = lambda: native_fused_qk_rope_with_cache(
                 q, k, cos_sin_cache, positions, rope_dim, is_neox
             )
 
         quantiles = [0.5, 0.2, 0.8]
         ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
+        bandwidth = calculate_bandwidth(
+            num_tokens, num_heads, num_kv_heads, rope_dim, ms, dtype
+        )
+        all_results.append(
+            {
+                "num_tokens": num_tokens,
+                "num_heads": num_heads,
+                "num_kv_heads": num_kv_heads,
+                "rope_dim": rope_dim,
+                "is_neox": is_neox,
+                "dtype": dtype,
+                "provider": provider,
+                "bandwidth": bandwidth,
+                "ms": ms,
+            }
+        )
 
         return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
@@ -177,12 +170,6 @@ if __name__ == "__main__":
 
     keys = sweep_params.keys()
     configs = list(itertools.product(*sweep_params.values()))
-    print(f"Testing {len(configs)} configurations...")
-    for config in configs:
-        num_tokens, num_heads, num_kv_heads, rope_dim, is_neox, dtype = config
-        print(
-            f"Config: num_tokens={num_tokens}, num_heads={num_heads}, num_kv_heads={num_kv_heads}, rope_dim: {rope_dim}, is_neox: {is_neox}, dtype={dtype}"
-        )
 
     global benchmark_configs
     benchmark_configs = configs
@@ -190,4 +177,8 @@ if __name__ == "__main__":
     # Run benchmark
     print("Starting performance benchmark...")
     benchmark = get_benchmark()
-    benchmark.run(print_data=True, show_plots=False, save_path=".")
+    benchmark.run(print_data=False)
+    print("Benchmark finished!")
+
+    df = pd.DataFrame(all_results)
+    print(df.to_markdown())

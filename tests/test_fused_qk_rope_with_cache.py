@@ -4,7 +4,7 @@ import pytest
 import torch
 import triton
 import utils
-from sgl_kernel import fused_qk_rope_with_cos_sin_cache
+from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
 
 DEVICE = utils.get_device()
 DTYPE = torch.bfloat16
@@ -106,7 +106,7 @@ def fused_qk_rope_with_cache(
     rotary_dim: int,
     is_neox: bool,
 ):
-    return fused_qk_rope_with_cos_sin_cache(
+    return fused_qk_rope_with_cos_sin_cache_inplace(
         q, k, cos_sin_cache, positions, rotary_dim, is_neox
     )
 
@@ -149,7 +149,7 @@ def test_rope(
 
     q_ker, k_ker = q.clone(), k.clone()
     q_na, k_na = torch_impl_rope(q, k, cos_sin_cache, positions, rope_dim, is_neox)
-    fused_qk_rope_with_cos_sin_cache(
+    fused_qk_rope_with_cos_sin_cache_inplace(
         q_ker, k_ker, cos_sin_cache, positions, rope_dim, is_neox
     )
 
@@ -171,7 +171,7 @@ def test_rope_position_dtypes(dtype: torch.dtype) -> None:
 
     q_ker, k_ker = q.clone(), k.clone()
     q_na, k_na = torch_impl_rope(q, k, cos_sin_cache, positions, rope_dim, is_neox)
-    fused_qk_rope_with_cos_sin_cache(
+    fused_qk_rope_with_cos_sin_cache_inplace(
         q_ker, k_ker, cos_sin_cache, positions, rope_dim, is_neox
     )
     atol = rtol = 1e-2

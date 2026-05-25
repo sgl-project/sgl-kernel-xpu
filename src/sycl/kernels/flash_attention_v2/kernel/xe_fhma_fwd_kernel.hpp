@@ -145,7 +145,7 @@ class XeFMHAFwdKernel {
     MainloopArguments mainloop{};
     EpilogueArguments epilogue{};
     KernelHardwareInfo hw_info{};
-    int num_kv_splits = -1;
+    int num_kv_splits = 1;
   };
 
   // Kernel entry point API
@@ -161,11 +161,15 @@ class XeFMHAFwdKernel {
   //
 
   static Params to_underlying_arguments(Arguments const& args, void* workspace) {
-    return {
-        args.kernel,
-        CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
-        CollectiveEpilogue::to_underlying_arguments(args.epilogue, workspace),
-        TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{})};
+    auto scheduler = TileScheduler::template to_underlying_arguments<SGPerWG::value>(
+        args.kernel.shape, args.hw_info, TileShapeO{});
+    if constexpr (is_same_v<TileScheduler, XeFHMADynamicPresistentTileScheduler>) {
+      scheduler.tile_counter = reinterpret_cast<int *>(workspace);
+    }
+    return {args.kernel,
+            CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
+            CollectiveEpilogue::to_underlying_arguments(args.epilogue, workspace),
+            scheduler};
   }
 
   static bool can_implement(Arguments const& args) {
@@ -173,6 +177,9 @@ class XeFMHAFwdKernel {
   }
 
   static int get_workspace_size(Arguments const& args) {
+    if constexpr (is_same_v<TileScheduler, XeFHMADynamicPresistentTileScheduler>) {
+      return sizeof(int);
+    }
     return 0;
   }
 
@@ -181,6 +188,9 @@ class XeFMHAFwdKernel {
       void* workspace = nullptr,
       cudaStream_t stream = nullptr,
       CudaHostAdapter* cuda_adapter = nullptr) {
+    if constexpr (is_same_v<TileScheduler, XeFHMADynamicPresistentTileScheduler>) {
+      compat::fill(reinterpret_cast<int*>(workspace), 0, 1);
+    }
     return Status::kSuccess;
   }
 
@@ -219,6 +229,7 @@ class XeFMHAFwdKernel {
 
     auto& p = params.kernel;
     ProblemShape const& s = p.shape;
+    using SeqLenQ = remove_cvref_t<decltype(s.seq_len_qo)>;
     int head_group_q = s.num_heads_q / s.num_heads_kv;
 
     int thr_id = int(ThreadIdxX());
@@ -234,7 +245,7 @@ class XeFMHAFwdKernel {
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
-      auto [blk_q, blk_v, head_q, idx_b, unused] = tile_scheduler.get_block_coord();  // (Q,V,h,b)
+  auto [blk_q, blk_v, head_q, idx_b] = tile_scheduler.template get_block_coord<SeqLenQ>();  // (Q,V,h,b)
       auto blk_qv = make_coord(blk_q, blk_v);
       int head = head_q / head_group_q;
 
@@ -428,6 +439,7 @@ class XeFMHAFwdDynamicSplitKernel {
     MainloopArguments mainloop{};
     EpilogueArguments epilogue{};
     KernelHardwareInfo hw_info{};
+    int num_kv_splits = 1;
   };
 
   // Kernel entry point API
@@ -454,7 +466,7 @@ class XeFMHAFwdDynamicSplitKernel {
         args.kernel,
         CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
         CollectiveEpilogue::to_underlying_arguments(args.epilogue, workspace),
-        TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{}),
+        TileScheduler::template to_underlying_arguments<SGPerWG::value>(args.kernel.shape, args.hw_info, TileShapeO{}),
         partial_results_ptr,
         atomic_reduce_cnt_ptr};
   }
@@ -574,6 +586,7 @@ class XeFMHAFwdDynamicSplitKernel {
 
     auto& p = params.kernel;
     ProblemShape const& s = p.shape;
+    using SeqLenQ = remove_cvref_t<decltype(s.seq_len_qo)>;
     int head_group_q = s.num_heads_q / s.num_heads_kv;
 
     int thr_id = int(ThreadIdxX());
@@ -593,7 +606,7 @@ class XeFMHAFwdDynamicSplitKernel {
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
-      auto [blk_q, blk_v, start_batch_head_id] = tile_scheduler.get_block_coord();  // (Q,V, batch_head_idx)
+  auto [blk_q, blk_v, start_batch_head_id] = tile_scheduler.template get_block_coord<SeqLenQ>();  // (Q,V, batch_head_idx)
       auto blk_qv = make_coord(blk_q, blk_v);
 
       auto shape_Q = make_shape(s.seq_len_qo, s.head_size_qk, s.num_heads_q, s.batch);

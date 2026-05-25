@@ -172,7 +172,7 @@ def test_fp8_paged_mqa_logits(page_size):
         block_tables,
         None,
         max_seq_len,
-        False,
+        True,  # clean_logits: ensure out-of-range positions are zeroed
     )
     ref = reference_fp8_paged_mqa_logits(
         q,
@@ -216,7 +216,7 @@ def test_fp8_paged_mqa_logits_xe20():
         block_tables,
         None,
         max_seq_len,
-        False,
+        True,
     )
     ref = reference_fp8_paged_mqa_logits(
         q,
@@ -257,7 +257,7 @@ def test_fp8_paged_mqa_logits_noncontiguous_pages():
         block_tables,
         None,
         max_seq_len,
-        False,
+        True,
     )
     ref = reference_fp8_paged_mqa_logits(
         q,

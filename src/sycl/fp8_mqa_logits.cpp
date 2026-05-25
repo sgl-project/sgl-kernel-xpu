@@ -90,6 +90,8 @@ torch::Tensor fp8_mqa_logits(
   TORCH_CHECK(k_fp8.is_xpu(), "k_fp8 must be on XPU");
   TORCH_CHECK(q_fp8.dim() == 3, "q_fp8 must be 3D (Nq, H, D)");
   TORCH_CHECK(k_fp8.dim() == 2, "k_fp8 must be 2D (Nk, D)");
+  TORCH_CHECK(q_fp8.scalar_type() == at::kByte, "q_fp8 must be uint8 (FP8 e4m3)");
+  TORCH_CHECK(k_fp8.scalar_type() == at::kByte, "k_fp8 must be uint8 (FP8 e4m3)");
 
   int Nq = q_fp8.size(0);
   int H = q_fp8.size(1);
@@ -102,19 +104,27 @@ torch::Tensor fp8_mqa_logits(
   auto stream = c10::xpu::getCurrentXPUStream();
   auto& queue = stream.queue();
 
+  // Ensure contiguity for all inputs passed to kernels via data_ptr
+  auto q_contig = q_fp8.contiguous();
+  auto k_contig = k_fp8.contiguous();
+  auto k_scale_contig = k_scale.contiguous();
+  auto weights_contig = weights.contiguous();
+  auto ks_contig = ks.contiguous();
+  auto ke_contig = ke.contiguous();
+
   int M = Nq * H;
   bool use_gemm = (M >= MIN_M_GEMM && Nk >= MIN_N_GEMM);
 
   if (use_gemm) {
     // Optimized path: SYCL-TLA FP8 GEMM + reduction kernel
-    auto dots = fp8_gemm_xe20(queue, q_fp8.contiguous().view({M, D}), k_fp8.contiguous(), M, Nk, D);
+    auto dots = fp8_gemm_xe20(queue, q_contig.view({M, D}), k_contig, M, Nk, D);
 
     nsa::Fp8MqaLogitsReduceKernel reduce_kernel{
         dots.data_ptr<float>(),
-        weights.data_ptr<float>(),
-        k_scale.data_ptr<float>(),
-        ks.data_ptr<int32_t>(),
-        ke.data_ptr<int32_t>(),
+        weights_contig.data_ptr<float>(),
+        k_scale_contig.data_ptr<float>(),
+        ks_contig.data_ptr<int32_t>(),
+        ke_contig.data_ptr<int32_t>(),
         logits.data_ptr<float>(),
         Nq,
         H,
@@ -124,13 +134,13 @@ torch::Tensor fp8_mqa_logits(
   }
 
   // Naive kernel fallback
-  nsa::Fp8MqaLogitsKernel<32> kernel{
-      q_fp8.data_ptr<uint8_t>(),
-      k_fp8.data_ptr<uint8_t>(),
-      k_scale.data_ptr<float>(),
-      weights.data_ptr<float>(),
-      ks.data_ptr<int32_t>(),
-      ke.data_ptr<int32_t>(),
+  nsa::Fp8MqaLogitsKernel kernel{
+      q_contig.data_ptr<uint8_t>(),
+      k_contig.data_ptr<uint8_t>(),
+      k_scale_contig.data_ptr<float>(),
+      weights_contig.data_ptr<float>(),
+      ks_contig.data_ptr<int32_t>(),
+      ke_contig.data_ptr<int32_t>(),
       logits.data_ptr<float>(),
       Nq,
       Nk,
@@ -154,6 +164,8 @@ torch::Tensor fp8_paged_mqa_logits(
   TORCH_CHECK(kv_cache.is_xpu(), "kv_cache must be on XPU");
   TORCH_CHECK(q_fp8.dim() == 4, "q_fp8 must be 4D (B, 1, H, D)");
   TORCH_CHECK(kv_cache.dim() == 4, "kv_cache must be 4D");
+  TORCH_CHECK(q_fp8.scalar_type() == at::kByte, "q_fp8 must be uint8 (FP8 e4m3)");
+  TORCH_CHECK(kv_cache.scalar_type() == at::kByte, "kv_cache must be uint8");
 
   int B_next = q_fp8.size(0);
   int H = q_fp8.size(2);
@@ -163,10 +175,19 @@ torch::Tensor fp8_paged_mqa_logits(
   int max_num_blocks = block_tables.size(1);
   int msl = static_cast<int>(max_seq_len);
 
-  auto logits = torch::zeros({B_next, msl}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
+  // Use torch::zeros when clean_logits is requested (out-of-range positions = 0),
+  // torch::empty otherwise (out-of-range positions are undefined).
+  auto logits = clean_logits ? torch::zeros({B_next, msl}, torch::dtype(torch::kFloat32).device(q_fp8.device()))
+                             : torch::empty({B_next, msl}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
   if (B_next == 0 || msl == 0) return logits;
 
   auto seq_lens_flat = seq_lens.dim() == 2 ? seq_lens.contiguous().view({-1}) : seq_lens.contiguous();
+
+  // Ensure contiguity
+  auto q_contig = q_fp8.contiguous();
+  auto kv_contig = kv_cache.contiguous();
+  auto weights_contig = weights.contiguous();
+  auto block_tables_contig = block_tables.contiguous();
 
   auto stream = c10::xpu::getCurrentXPUStream();
   auto& queue = stream.queue();
@@ -179,8 +200,8 @@ torch::Tensor fp8_paged_mqa_logits(
     auto k_scale_gathered = torch::zeros({B_next, msl}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
 
     nsa::PagedKGatherKernel gather_kernel{
-        kv_cache.data_ptr<uint8_t>(),
-        block_tables.data_ptr<int32_t>(),
+        kv_contig.data_ptr<uint8_t>(),
+        block_tables_contig.data_ptr<int32_t>(),
         seq_lens_flat.data_ptr<int32_t>(),
         k_gathered.data_ptr<uint8_t>(),
         k_scale_gathered.data_ptr<float>(),
@@ -193,10 +214,11 @@ torch::Tensor fp8_paged_mqa_logits(
     launch_2d_kernel(queue, gather_kernel, B_next, msl);
 
     // Stage 2: Per-batch SYCL-TLA FP8 GEMM
+    // TODO: batch all B_next GEMMs into a single grouped GEMM launch
     auto dots = torch::empty({B_next, H, msl}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
 
     for (int b = 0; b < B_next; ++b) {
-      auto q_b = q_fp8.slice(0, b, b + 1).view({H, D});         // (H, D)
+      auto q_b = q_contig.slice(0, b, b + 1).view({H, D});      // (H, D)
       auto k_b = k_gathered.slice(0, b * msl, (b + 1) * msl);   // (msl, D)
       auto dots_b = fp8_gemm_xe20(queue, q_b, k_b, H, msl, D);  // (H, msl)
       dots.slice(0, b, b + 1).view({H, msl}).copy_(dots_b);
@@ -205,7 +227,7 @@ torch::Tensor fp8_paged_mqa_logits(
     // Stage 3: Reduction
     nsa::Fp8PagedMqaLogitsReduceKernel reduce_kernel{
         dots.data_ptr<float>(),
-        weights.data_ptr<float>(),
+        weights_contig.data_ptr<float>(),
         k_scale_gathered.data_ptr<float>(),
         seq_lens_flat.data_ptr<int32_t>(),
         logits.data_ptr<float>(),
@@ -217,21 +239,19 @@ torch::Tensor fp8_paged_mqa_logits(
   }
 
   // Naive kernel fallback
-  int kv_stride = page_size * 1 * head_dim_with_sf;
   nsa::Fp8PagedMqaLogitsKernel paged_kernel{
-      q_fp8.data_ptr<uint8_t>(),
-      kv_cache.data_ptr<uint8_t>(),
-      weights.data_ptr<float>(),
+      q_contig.data_ptr<uint8_t>(),
+      kv_contig.data_ptr<uint8_t>(),
+      weights_contig.data_ptr<float>(),
       seq_lens_flat.data_ptr<int32_t>(),
-      block_tables.data_ptr<int32_t>(),
+      block_tables_contig.data_ptr<int32_t>(),
       logits.data_ptr<float>(),
       B_next,
       H,
       D,
       page_size,
       max_num_blocks,
-      msl,
-      kv_stride};
+      msl};
   launch_2d_kernel(queue, paged_kernel, B_next, msl);
   return logits;
 }

@@ -154,6 +154,7 @@ int fp8_mqa_gemm_xe20(sycl::queue* queue_ptr, const void* A_fp8, const void* B_f
   gemm_op.run(queue_ptr);
 
   if (workspace_ptr) {
+    // Wait for GEMM to complete before freeing workspace
     queue_ptr->wait();
     sycl::free(workspace_ptr, *queue_ptr);
   }

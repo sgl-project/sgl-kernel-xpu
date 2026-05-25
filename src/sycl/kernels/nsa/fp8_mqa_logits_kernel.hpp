@@ -47,6 +47,13 @@ inline float fp8_e4m3_to_float(uint8_t val) {
   return sign ? -result : result;
 }
 
+// Extract a little-endian float32 from 4 unaligned bytes
+inline float load_le_f32(const uint8_t* p) {
+  uint32_t bits = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+                  (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+  return *reinterpret_cast<const float*>(&bits);
+}
+
 // FP8 MQA logits kernel (prefill/extend path)
 // q: (Nq, H, D) fp8 e4m3
 // k: (Nk, D) fp8 e4m3
@@ -54,11 +61,10 @@ inline float fp8_e4m3_to_float(uint8_t val) {
 // weights: (Nq, H) float32
 // ks: (Nq,) int32 — start index per query
 // ke: (Nq,) int32 — end index per query
-// out: (Nq, Nk) float32
+// out: (Nq, Nk) float32 — must be pre-zeroed for out-of-range positions
 //
 // For each query i, for each kv position j in [ks[i], ke[i]):
 //   score = sum_h( ReLU( dot(q[i,h,:], k[j,:]) ) * weights[i,h] ) * k_scale[j]
-template <int TILE_K = 32>
 struct Fp8MqaLogitsKernel {
   const uint8_t* q_ptr;
   const uint8_t* k_ptr;
@@ -78,10 +84,7 @@ struct Fp8MqaLogitsKernel {
     int start = ks_ptr[qi];
     int end = ke_ptr[qi];
 
-    if (kj < start || kj >= end) {
-      out_ptr[qi * Nk + kj] = 0.0f;
-      return;
-    }
+    if (kj < start || kj >= end) return;  // out-of-range: rely on pre-zeroed output
 
     float score = 0.0f;
 
@@ -109,7 +112,7 @@ struct Fp8MqaLogitsKernel {
 // weights: (B, H) float32
 // seq_lens: (B,) int32  — actual sequence length per batch
 // block_tables: (B, max_num_blocks) int32
-// out: (B, max_seq_len) float32
+// out: (B, max_seq_len) float32 — must be pre-zeroed for out-of-range positions
 //
 // For each batch b, for each kv position j < seq_lens[b]:
 //   page_idx = block_tables[b, j / page_size]
@@ -128,7 +131,6 @@ struct Fp8PagedMqaLogitsKernel {
   int page_size;
   int max_num_blocks;
   int max_seq_len;
-  int kv_stride;  // = page_size * 1 * (D + 4) = stride between pages
 
   void operator()(sycl::nd_item<2> item) const {
     int bi = item.get_global_id(0);  // batch index
@@ -137,27 +139,17 @@ struct Fp8PagedMqaLogitsKernel {
     if (bi >= B || kj >= max_seq_len) return;
 
     int seq_len = seq_lens_ptr[bi];
-    if (kj >= seq_len) {
-      out_ptr[bi * max_seq_len + kj] = 0.0f;
-      return;
-    }
+    if (kj >= seq_len) return;  // out-of-range: rely on pre-zeroed output
 
     int page_block_idx = kj / page_size;
     int token_in_page = kj % page_size;
     int page_id = block_tables_ptr[bi * max_num_blocks + page_block_idx];
 
     int head_dim_with_sf = D + 4;
-    // kv_cache layout: (num_pages, page_size, 1, head_dim_with_sf) stored as uint8
     const uint8_t* kv_token_ptr =
         kv_cache_ptr + page_id * page_size * head_dim_with_sf + token_in_page * head_dim_with_sf;
 
-    // Last 4 bytes are float32 scale
-    float k_scale;
-    const uint8_t* scale_bytes = kv_token_ptr + D;
-    // memcpy to avoid alignment issues
-    uint32_t scale_bits = (static_cast<uint32_t>(scale_bytes[0])) | (static_cast<uint32_t>(scale_bytes[1]) << 8) |
-                          (static_cast<uint32_t>(scale_bytes[2]) << 16) | (static_cast<uint32_t>(scale_bytes[3]) << 24);
-    k_scale = *reinterpret_cast<const float*>(&scale_bits);
+    float k_scale = load_le_f32(kv_token_ptr + D);
 
     // q layout: (B, 1, H, D) — the "1" is next_n
     const uint8_t* q_batch = q_ptr + bi * H * D;
@@ -186,7 +178,7 @@ struct Fp8PagedMqaLogitsKernel {
 // k_scale: (Nk,) float32
 // ks: (Nq,) int32
 // ke: (Nq,) int32
-// out: (Nq, Nk) float32
+// out: (Nq, Nk) float32 — must be pre-zeroed for out-of-range positions
 struct Fp8MqaLogitsReduceKernel {
   const float* dots_ptr;
   const float* weights_ptr;
@@ -201,10 +193,7 @@ struct Fp8MqaLogitsReduceKernel {
     int kj = item.get_global_id(1);
     if (qi >= Nq || kj >= Nk) return;
 
-    if (kj < ks_ptr[qi] || kj >= ke_ptr[qi]) {
-      out_ptr[qi * Nk + kj] = 0.0f;
-      return;
-    }
+    if (kj < ks_ptr[qi] || kj >= ke_ptr[qi]) return;  // rely on pre-zeroed output
 
     float score = 0.0f;
     for (int h = 0; h < H; ++h) {
@@ -240,9 +229,10 @@ struct PagedKGatherKernel {
 
     int out_idx = b * max_seq_len + kj;
     if (kj >= seq_lens_ptr[b]) {
-      // Zero padding
-      for (int d = 0; d < D; ++d)
-        k_out_ptr[out_idx * D + d] = 0;
+      // Zero padding for out-of-range tokens
+      auto* dst = reinterpret_cast<uint32_t*>(k_out_ptr + out_idx * D);
+      for (int i = 0; i < D / 4; ++i)
+        dst[i] = 0;
       k_scale_out_ptr[out_idx] = 0.0f;
       return;
     }
@@ -253,14 +243,13 @@ struct PagedKGatherKernel {
 
     const uint8_t* src = kv_cache_ptr + page_id * page_size * head_dim_with_sf + token_in_page * head_dim_with_sf;
 
-    for (int d = 0; d < D; ++d)
-      k_out_ptr[out_idx * D + d] = src[d];
+    // Vectorized copy: 4 bytes at a time (D is always a multiple of 4)
+    auto* dst = reinterpret_cast<uint32_t*>(k_out_ptr + out_idx * D);
+    auto* src32 = reinterpret_cast<const uint32_t*>(src);
+    for (int i = 0; i < D / 4; ++i)
+      dst[i] = src32[i];
 
-    // Extract float32 scale from last 4 bytes
-    const uint8_t* sb = src + D;
-    uint32_t bits = static_cast<uint32_t>(sb[0]) | (static_cast<uint32_t>(sb[1]) << 8) |
-                    (static_cast<uint32_t>(sb[2]) << 16) | (static_cast<uint32_t>(sb[3]) << 24);
-    k_scale_out_ptr[out_idx] = *reinterpret_cast<const float*>(&bits);
+    k_scale_out_ptr[out_idx] = load_le_f32(src + D);
   }
 };
 
@@ -269,7 +258,7 @@ struct PagedKGatherKernel {
 // weights: (B, H) float32
 // k_scale: (B, max_seq_len) float32
 // seq_lens: (B,) int32
-// out: (B, max_seq_len) float32
+// out: (B, max_seq_len) float32 — must be pre-zeroed for out-of-range positions
 struct Fp8PagedMqaLogitsReduceKernel {
   const float* dots_ptr;
   const float* weights_ptr;
@@ -283,10 +272,7 @@ struct Fp8PagedMqaLogitsReduceKernel {
     int kj = item.get_global_id(1);
     if (bi >= B || kj >= max_seq_len) return;
 
-    if (kj >= seq_lens_ptr[bi]) {
-      out_ptr[bi * max_seq_len + kj] = 0.0f;
-      return;
-    }
+    if (kj >= seq_lens_ptr[bi]) return;  // rely on pre-zeroed output
 
     float score = 0.0f;
     for (int h = 0; h < H; ++h) {

@@ -106,9 +106,9 @@ def _make_inputs(T, hidden_size, n_splits, device, seed=42):
     )
 
 
-@pytest.mark.parametrize("T", [1, 16, 128, 512])
-@pytest.mark.parametrize("hidden_size", [512, 4096, 7168])
-@pytest.mark.parametrize("n_splits", [1, 4])
+@pytest.mark.parametrize("T", [1, 16, 128, 512, 1024, 2048])
+@pytest.mark.parametrize("hidden_size", [4096, 7168])
+@pytest.mark.parametrize("n_splits", [1, 4, 16])
 @pytest.mark.parametrize("with_norm", [False, True])
 def test_hc_pre_big_fuse(T, hidden_size, n_splits, with_norm):
     hc = 4

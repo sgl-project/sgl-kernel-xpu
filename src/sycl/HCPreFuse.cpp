@@ -8,7 +8,7 @@
 #include "Utils.h"
 
 // Kernel configuration
-static constexpr int WG_SIZE = 128;        // 8 subgroups of 16 threads each
+static constexpr int WG_SIZE = 96;         // 6 subgroups of 16 threads each
 static constexpr int HC = 4;               // hc_mult value
 static constexpr int HC2 = HC * HC;        // 16
 static constexpr int HC3 = (2 + HC) * HC;  // 24
@@ -41,8 +41,8 @@ struct HCPreBigFuseKernel {
     sycl::sub_group sg = item.get_sub_group();
 
     const int token_id = static_cast<int>(item.get_group(0));
-    const int tid = static_cast<int>(item.get_local_id(0));      // 0..127
-    const int sg_id = static_cast<int>(sg.get_group_id()[0]);    // 0..7
+    const int tid = static_cast<int>(item.get_local_id(0));      // 0..95
+    const int sg_id = static_cast<int>(sg.get_group_id()[0]);    // 0..5
     const int lane_id = static_cast<int>(sg.get_local_id()[0]);  // 0..15
 
     if (token_id >= T_total) return;
@@ -117,7 +117,7 @@ struct HCPreBigFuseKernel {
       }
 
     } else {
-      // Threads 32-127 (Subgroups 2-7)
+      // Threads 32-95 (Subgroups 2-5)
 
       // pre_mix from mixes[:4]
       if (tid >= 32 && tid < 32 + HC) {
@@ -131,8 +131,8 @@ struct HCPreBigFuseKernel {
 
     if (sg_id >= 2) {
       // Weighted sum: layer_input[t, h] = sum_k(pre_mix[k] * residual[t, k, h])
-      const int threads_for_wsum = WG_SIZE - 32;  // 96 threads
-      const int thread_local_id = tid - 32;       // 0..95
+      const int threads_for_wsum = WG_SIZE - 32;  // 64 threads
+      const int thread_local_id = tid - 32;       // 0..63
 
       // Stride across hidden_size with all threads
       for (int h = thread_local_id; h < hidden_size; h += threads_for_wsum) {
@@ -178,8 +178,8 @@ struct HCPreBigFuseWithNormKernel {
     sycl::sub_group sg = item.get_sub_group();
 
     const int token_id = static_cast<int>(item.get_group(0));
-    const int tid = static_cast<int>(item.get_local_id(0));      // 0..127
-    const int sg_id = static_cast<int>(sg.get_group_id()[0]);    // 0..7
+    const int tid = static_cast<int>(item.get_local_id(0));      // 0..95
+    const int sg_id = static_cast<int>(sg.get_group_id()[0]);    // 0..5
     const int lane_id = static_cast<int>(sg.get_local_id()[0]);  // 0..15
 
     if (token_id >= T_total) return;
@@ -254,7 +254,7 @@ struct HCPreBigFuseWithNormKernel {
       }
 
     } else {
-      // Threads 32-127 (Subgroups 2-7)
+      // Threads 32-95 (Subgroups 2-5)
 
       // pre_mix from mixes[:4]
       if (tid >= 32 && tid < 32 + HC) {
@@ -266,10 +266,10 @@ struct HCPreBigFuseWithNormKernel {
 
     item.barrier(sycl::access::fence_space::local_space);
 
-    // Pass 1: Accumulate sum of squares (threads 32-127)
+    // Pass 1: Accumulate sum of squares (threads 32-95)
     if (tid >= 32) {
       const int thread_local_id = tid - 32;
-      const int stride = 96;
+      const int stride = 64;
 
       float local_sqr_sum = 0.0f;
       for (int h = thread_local_id; h < hidden_size; h += stride) {
@@ -292,8 +292,8 @@ struct HCPreBigFuseWithNormKernel {
 
     // Final reduction
     if (sg_id == 0) {
-      const int idx = sycl::select(0, lane_id, lane_id < 6);
-      const float val_to_reduce = sycl::select(0.0f, slm_[idx], lane_id < 6);
+      const int idx = sycl::select(0, lane_id, lane_id < 4);
+      const float val_to_reduce = sycl::select(0.0f, slm_[idx], lane_id < 4);
       const float total_sqr_sum = sycl::reduce_over_group(sg, val_to_reduce, sycl::plus<float>());
       if (lane_id == 0) {
         const float mean_sqr = total_sqr_sum / static_cast<float>(hidden_size);
@@ -303,10 +303,10 @@ struct HCPreBigFuseWithNormKernel {
 
     item.barrier(sycl::access::fence_space::local_space);
 
-    // Pass 2: Apply RMS*norm_weight and write (threads 32-127)
+    // Pass 2: Apply RMS*norm_weight and write (threads 32-95)
     if (tid >= 32) {
       const int thread_local_id = tid - 32;
-      const int stride = 96;
+      const int stride = 64;
       const float rms = slm_[0];
 
       for (int h = thread_local_id; h < hidden_size; h += stride) {

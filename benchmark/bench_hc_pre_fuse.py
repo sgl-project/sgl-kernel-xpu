@@ -5,12 +5,11 @@ from sgl_kernel import hc_pre_big_fuse
 
 configs = [
     # (batch_size, seq_len, hidden_size, n_splits)
-    (1, 128, 7168, 1),  # 128 tokens
-    (8, 128, 7168, 1),  # 1024 tokens
-    (32, 256, 7168, 1),  # 8K tokens
-    (64, 256, 7168, 16),  # 16K tokens
-    (128, 512, 7168, 1),  # 65K tokens
-    (128, 512, 7168, 16),  # 65K tokens
+    (16, 1, 4096, 1),  # 16 tokens
+    (128, 1, 4096, 1),  # 128 tokens
+    (512, 1, 4096, 1),  # 512 tokens
+    (1024, 1, 4096, 1),  # 1024 tokens
+    (2048, 1, 4096, 1),  # 2048 tokens
 ]
 
 sinkhorn_iters = 20
@@ -25,9 +24,9 @@ all_results = []
         x_names=["batch_size", "seq_len", "hidden_size", "n_splits"],
         x_vals=configs,
         line_arg="provider",
-        line_vals=["sgl_kernel"],
-        line_names=["SGL Kernel"],
-        styles=[("green", "-")],
+        line_vals=["without_norm", "with_norm"],
+        line_names=["Without Norm", "With Norm"],
+        styles=[("green", "-"), ("blue", "--")],
         ylabel="Time (ms)",
         plot_name="hc-pre-fuse-performance",
         args={},
@@ -51,15 +50,60 @@ def benchmark(batch_size, seq_len, hidden_size, n_splits, provider):
     hc_scale = torch.rand(3, dtype=torch.float32, device="xpu") * 0.5 + 0.5
     hc_base = torch.randn(hc_mult3, dtype=torch.float32, device="xpu") * 0.1
     residual = torch.randn(T, hc, hidden_size, dtype=torch.bfloat16, device="xpu")
+    norm_weight = torch.randn(hidden_size, dtype=torch.bfloat16, device="xpu")
 
     # Create output tensors
     post_mix = torch.empty(T, hc, dtype=torch.float32, device="xpu")
     comb_mix = torch.empty(T, hc * hc, dtype=torch.float32, device="xpu")
     layer_input = torch.empty(T, hidden_size, dtype=torch.bfloat16, device="xpu")
 
+    # Determine which variant to benchmark
+    use_norm = provider == "with_norm"
+
     # Warmup
-    for _ in range(10):
-        hc_pre_big_fuse(
+    for _ in range(1000):
+        if use_norm:
+            hc_pre_big_fuse(
+                gemm_out_mul,
+                gemm_out_sqrsum,
+                hc_scale,
+                hc_base,
+                residual,
+                post_mix,
+                comb_mix,
+                layer_input,
+                hc,
+                sinkhorn_iters,
+                n_splits,
+                1e-5,  # rms_eps
+                1e-6,  # hc_pre_eps
+                1e-6,  # hc_sinkhorn_eps
+                2.0,  # hc_post_mult_value
+                norm_weight,  # norm_weight
+                1e-6,  # norm_eps
+            )
+        else:
+            hc_pre_big_fuse(
+                gemm_out_mul,
+                gemm_out_sqrsum,
+                hc_scale,
+                hc_base,
+                residual,
+                post_mix,
+                comb_mix,
+                layer_input,
+                hc,
+                sinkhorn_iters,
+                n_splits,
+                1e-5,  # rms_eps
+                1e-6,  # hc_pre_eps
+                1e-6,  # hc_sinkhorn_eps
+                2.0,  # hc_post_mult_value
+            )
+    torch.xpu.synchronize()
+
+    if use_norm:
+        bench_lambda = lambda: hc_pre_big_fuse(
             gemm_out_mul,
             gemm_out_sqrsum,
             hc_scale,
@@ -71,30 +115,31 @@ def benchmark(batch_size, seq_len, hidden_size, n_splits, provider):
             hc,
             sinkhorn_iters,
             n_splits,
-            1e-5,  # rms_eps
-            1e-6,  # hc_pre_eps
-            1e-6,  # hc_sinkhorn_eps
-            2.0,  # hc_post_mult_value
+            1e-5,
+            1e-6,
+            1e-6,
+            2.0,
+            norm_weight,
+            1e-6,
         )
-    torch.xpu.synchronize()
-
-    bench_lambda = lambda: hc_pre_big_fuse(
-        gemm_out_mul,
-        gemm_out_sqrsum,
-        hc_scale,
-        hc_base,
-        residual,
-        post_mix,
-        comb_mix,
-        layer_input,
-        hc,
-        sinkhorn_iters,
-        n_splits,
-        1e-5,
-        1e-6,
-        1e-6,
-        2.0,
-    )
+    else:
+        bench_lambda = lambda: hc_pre_big_fuse(
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            hc_scale,
+            hc_base,
+            residual,
+            post_mix,
+            comb_mix,
+            layer_input,
+            hc,
+            sinkhorn_iters,
+            n_splits,
+            1e-5,
+            1e-6,
+            1e-6,
+            2.0,
+        )
 
     quantiles = [0.5, 0.25, 0.75]
     ms, _, _ = triton.testing.do_bench(
@@ -104,7 +149,7 @@ def benchmark(batch_size, seq_len, hidden_size, n_splits, provider):
     torch.xpu.empty_cache()
 
     # Calculate memory bandwidth
-    # Inputs: gemm_out_mul, gemm_out_sqrsum, hc_scale, hc_base, residual
+    # Inputs: gemm_out_mul, gemm_out_sqrsum, hc_scale, hc_base, residual, (norm_weight if with_norm)
     # Outputs: post_mix, comb_mix, layer_input
     read_bytes = (
         n_splits * T * hc_mult3 * 4  # gemm_out_mul (fp32)
@@ -113,6 +158,9 @@ def benchmark(batch_size, seq_len, hidden_size, n_splits, provider):
         + hc_mult3 * 4  # hc_base (fp32)
         + T * hc * hidden_size * 2  # residual (bf16)
     )
+    if use_norm:
+        read_bytes += hidden_size * 2  # norm_weight (bf16)
+
     write_bytes = (
         T * hc * 4  # post_mix (fp32)
         + T * hc * hc * 4  # comb_mix (fp32)
@@ -128,6 +176,7 @@ def benchmark(batch_size, seq_len, hidden_size, n_splits, provider):
             "T": T,
             "hidden_size": hidden_size,
             "n_splits": n_splits,
+            "with_norm": use_norm,
             "ms": ms,
             "Mtok_per_sec": T / (ms / 1e3) / 1e6,
             "bandwidth_gb_s": bandwidth_gb_s,
@@ -147,9 +196,13 @@ if __name__ == "__main__":
     print(df.to_markdown(index=False))
     print("\n")
 
-    # Summary statistics
+    # Summary statistics by variant
     print("Summary Statistics:")
-    print(f"  Mean throughput: {df['Mtok_per_sec'].mean():.2f} Mtok/s")
-    print(f"  Mean bandwidth: {df['bandwidth_gb_s'].mean():.2f} GB/s")
-    print(f"  Best throughput: {df['Mtok_per_sec'].max():.2f} Mtok/s")
-    print(f"  Best bandwidth: {df['bandwidth_gb_s'].max():.2f} GB/s")
+    for with_norm_val in [False, True]:
+        df_variant = df[df["with_norm"] == with_norm_val]
+        variant_name = "With Norm" if with_norm_val else "Without Norm"
+        print(f"\n{variant_name}:")
+        print(f"  Mean throughput: {df_variant['Mtok_per_sec'].mean():.2f} Mtok/s")
+        print(f"  Mean bandwidth: {df_variant['bandwidth_gb_s'].mean():.2f} GB/s")
+        print(f"  Best throughput: {df_variant['Mtok_per_sec'].max():.2f} Mtok/s")
+        print(f"  Best bandwidth: {df_variant['bandwidth_gb_s'].max():.2f} GB/s")

@@ -2,7 +2,11 @@ from itertools import product
 
 import torch
 import triton
-from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from sgl_kernel.flash_attn import (
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
+    make_cu_seqlens_block_q,
+)
 
 
 def flash_attn_baseline(
@@ -16,6 +20,7 @@ def flash_attn_baseline(
     cache_seqlens,
     page_table,
     cu_seqlens_q,
+    cu_seqlens_block_q,
     cu_seqlens_k,
     max_seqlen_q,
     max_seqlen_k,
@@ -33,6 +38,7 @@ def flash_attn_baseline(
             page_table=page_table,
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_block_q=cu_seqlens_block_q,
             max_seqlen_q=max_seqlen_q,
             return_softmax_lse=True,
         )
@@ -194,6 +200,7 @@ def benchmark(
         device=device,
         dtype=torch.int32,
     )
+    cu_seqlens_block_q = make_cu_seqlens_block_q(cu_seqlens_q, head_dim)
     cu_seqlens_k = torch.arange(
         0,
         (batch_size + 1) * kv_seq_length,
@@ -229,6 +236,7 @@ def benchmark(
                 cache_seqlens=cache_seqlens,
                 page_table=page_table,
                 cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_block_q=cu_seqlens_block_q,
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlen_k,

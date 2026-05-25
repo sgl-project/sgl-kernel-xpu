@@ -532,7 +532,7 @@ def test_flash_attn_kvcache(
     mha_type,
     dtype,
 ):
-    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache, make_cu_seqlens_block_q
 
     if page_size is not None and seqlen_k % page_size != 0:
         pytest.skip()
@@ -843,6 +843,7 @@ def test_flash_attn_kvcache(
         sin = sin.to(dtype) if sin is not None else None
         k_cache_saved = k_cache.clone() if page_size is None else k_cache_paged.clone()
         v_cache_saved = v_cache.clone() if page_size is None else v_cache_paged.clone()
+        cu_seqlens_block_q = make_cu_seqlens_block_q(cu_seqlens_q, d) if varlen_q else None
         num_splits_vals = [1, 0] if not DISABLE_SPLIT else [1]
         precompute_metadata_vals = [False]
         for num_splits, precompute_metadata in itertools.product(
@@ -871,6 +872,7 @@ def test_flash_attn_kvcache(
                     cache_leftpad=cache_leftpad,
                     page_table=page_table,
                     cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_block_q=cu_seqlens_block_q,
                     cu_seqlens_k_new=cu_seqlens_k_new,
                     max_seqlen_q=max_seqlen_q,
                     rotary_seqlens=rotary_seqlens,
@@ -1036,7 +1038,7 @@ def test_flash_attn_decode_kvcache(
     mha_type,
     dtype,
 ):
-    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache, make_cu_seqlens_block_q
 
     if page_size is not None and seqlen_k % page_size != 0:
         pytest.skip()
@@ -1346,6 +1348,7 @@ def test_flash_attn_decode_kvcache(
         sin = sin.to(dtype) if sin is not None else None
         k_cache_saved = k_cache.clone() if page_size is None else k_cache_paged.clone()
         v_cache_saved = v_cache.clone() if page_size is None else v_cache_paged.clone()
+        cu_seqlens_block_q = make_cu_seqlens_block_q(cu_seqlens_q, d) if varlen_q else None
         num_splits_vals = [1, 0] if not DISABLE_SPLIT else [1]
         precompute_metadata_vals = [False]
         for num_splits, precompute_metadata in itertools.product(
@@ -1374,6 +1377,7 @@ def test_flash_attn_decode_kvcache(
                     cache_leftpad=cache_leftpad,
                     page_table=page_table,
                     cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_block_q=cu_seqlens_block_q,
                     cu_seqlens_k_new=cu_seqlens_k_new,
                     max_seqlen_q=max_seqlen_q,
                     max_seqlen_k=max_seqlen_k,

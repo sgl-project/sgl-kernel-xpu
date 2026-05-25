@@ -109,6 +109,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    Tensor   v,"
       "    Tensor?  q_v,"
       "    Tensor  cu_seqlens_q,"
+    "    Tensor? cu_seqlens_block_q,"
       "    Tensor  cu_seqlens_k,"
       "    int     max_seqlen_q,"
       "    int     max_seqlen_k,"

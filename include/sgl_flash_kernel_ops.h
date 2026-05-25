@@ -50,6 +50,7 @@ std::vector<at::Tensor> mha_fwd(
                           // page_size, h_k, dv) if there is page_table.
     std::optional<const at::Tensor>& q_v_,  // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
     const at::Tensor& cu_seqlens_q,         // b+1
+    std::optional<const at::Tensor>& cu_seqlens_block_q_,
     const at::Tensor& cu_seqlens_k,         // b+1
     int max_seqlen_q,
     int max_seqlen_k,

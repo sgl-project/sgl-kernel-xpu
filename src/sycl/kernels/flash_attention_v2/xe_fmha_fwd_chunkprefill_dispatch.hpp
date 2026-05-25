@@ -41,32 +41,13 @@ inline void dispatch_chunkprefill_kernel(const Arguments& params) {
   }
 }
 
-inline int get_chunkprefill_q_tile_size(int head_size) {
-  return head_size <= 96 ? 128 : 256;
-}
-
-inline at::Tensor
-make_cumulative_q_blocks(const at::Tensor& cu_seqlens_q, int batch_size, int q_tile_size, int& total_q_blocks) {
-  at::Tensor cu_seqlens_q_cpu = cu_seqlens_q.to(torch::kCPU);
-  auto cu_seqlens_q_ptr = cu_seqlens_q_cpu.data_ptr<int>();
-  at::Tensor cumulative_q_blocks_cpu = torch::empty({batch_size + 1}, torch::TensorOptions().dtype(torch::kInt32));
-  auto cumulative_q_blocks_ptr = cumulative_q_blocks_cpu.data_ptr<int>();
-  cumulative_q_blocks_ptr[0] = 0;
-  for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-    int seq_len_q = cu_seqlens_q_ptr[batch_idx + 1] - cu_seqlens_q_ptr[batch_idx];
-    int q_blocks = (seq_len_q + q_tile_size - 1) / q_tile_size;
-    cumulative_q_blocks_ptr[batch_idx + 1] = cumulative_q_blocks_ptr[batch_idx] + q_blocks;
-  }
-  total_q_blocks = cumulative_q_blocks_ptr[batch_size];
-  return cumulative_q_blocks_cpu.to(cu_seqlens_q.device(), /*non_blocking=*/false);
-}
-
 std::vector<at::Tensor> mha_fwd(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
     std::optional<const at::Tensor>& q_v_,
     const at::Tensor& cu_seqlens_q,
+    std::optional<const at::Tensor>& cu_seqlens_block_q_,
     const at::Tensor& cu_seqlens_k,
     int max_seqlen_q,
     int max_seqlen_k,
@@ -102,7 +83,11 @@ std::vector<at::Tensor> mha_fwd(
   TORCH_CHECK(q.dim() == 3, "query must be in ragged format");
   CHECK_INPUT(cu_seqlens_q);
   CHECK_INPUT(cu_seqlens_k);
+  TORCH_CHECK(cu_seqlens_block_q_.has_value(), "cu_seqlens_block_q must be provided for v2 chunk-prefill");
+  auto cu_seqlens_block_q = cu_seqlens_block_q_.value();
+  CHECK_INPUT(cu_seqlens_block_q);
   TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype torch.int32");
+  TORCH_CHECK(cu_seqlens_block_q.dtype() == torch::kInt32, "cu_seqlens_block_q must have dtype torch.int32");
   TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype torch.int32");
   TORCH_CHECK(!q_v_.has_value(), "q_v is not supported yet");
   TORCH_CHECK(!rotary_cos_.has_value() && !rotary_sin_.has_value(), "rotary is not supported by v2 chunk-prefill yet");
@@ -139,6 +124,7 @@ std::vector<at::Tensor> mha_fwd(
     CHECK_SHAPE(v, total_k, num_heads_k, head_size_v);
   }
   TORCH_CHECK(batch_size == batch_size_k, "batch_size must be equal to batch_size_k");
+  CHECK_SHAPE(cu_seqlens_block_q, batch_size + 1);
   TORCH_CHECK(head_size <= 512, "FlashAttention forward only supports head dimension at most 512");
   TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
   TORCH_CHECK(head_size % 8 == 0, "head_size should be a multiple of 8");
@@ -175,9 +161,9 @@ std::vector<at::Tensor> mha_fwd(
   params.cu_seqlens_q = const_cast<int*>(cu_seqlens_q.data_ptr<int>());
   params.cu_seqlens_k = const_cast<int*>(cu_seqlens_k.data_ptr<int>());
   params.cu_seqlens_knew = nullptr;
-  at::Tensor cumulative_q_blocks = make_cumulative_q_blocks(
-      cu_seqlens_q, batch_size, get_chunkprefill_q_tile_size(head_size), params.total_q_blocks);
-  params.cu_q_blocks = cumulative_q_blocks.data_ptr<int>();
+  at::Tensor cu_seqlens_block_q_cpu = cu_seqlens_block_q.to(torch::kCPU);
+  params.total_q_blocks = cu_seqlens_block_q_cpu.data_ptr<int>()[batch_size];
+  params.cu_q_blocks = const_cast<int*>(cu_seqlens_block_q.data_ptr<int>());
   params.b = batch_size;
   params.h = num_heads;
   params.h_k = num_heads_k;

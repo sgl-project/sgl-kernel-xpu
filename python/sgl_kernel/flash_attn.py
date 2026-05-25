@@ -28,6 +28,20 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+def make_cu_seqlens_block_q(cu_seqlens_q, head_dim):
+    q_tile_size = 128 if head_dim <= 96 else 256
+    q_lengths = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+    q_blocks = torch.div(
+        q_lengths + q_tile_size - 1, q_tile_size, rounding_mode="floor"
+    )
+    return torch.cat(
+        (
+            torch.zeros(1, device=cu_seqlens_q.device, dtype=torch.int32),
+            torch.cumsum(q_blocks, dim=0, dtype=torch.int32),
+        )
+    )
+
+
 def flash_attn_extended(
     q,
     k_cache,
@@ -42,6 +56,7 @@ def flash_attn_extended(
     cache_leftpad: Optional[torch.Tensor] = None,
     page_table: Optional[torch.Tensor] = None,
     cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_block_q: Optional[torch.Tensor] = None,
     cu_seqlens_k_new: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     rotary_seqlens: Optional[torch.Tensor] = None,
@@ -78,6 +93,7 @@ def flash_attn_decode(
     cache_leftpad: Optional[torch.Tensor] = None,
     page_table: Optional[torch.Tensor] = None,
     cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_block_q: Optional[torch.Tensor] = None,
     cu_seqlens_k_new: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     rotary_seqlens: Optional[torch.Tensor] = None,
@@ -114,6 +130,7 @@ def flash_attn_with_kvcache(
     cache_leftpad: Optional[torch.Tensor] = None,
     page_table: Optional[torch.Tensor] = None,
     cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_block_q: Optional[torch.Tensor] = None,
     cu_seqlens_k_new: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = 0,
     max_seqlen_k: Optional[int] = 0,
@@ -236,8 +253,8 @@ def flash_attn_with_kvcache(
         if v_cache.stride(-1) != 1 and v_cache.stride(-3) != 1
         else v_cache
     )
-    cu_seqlens_q, cu_seqlens_k_new = [
-        maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k_new)
+    cu_seqlens_q, cu_seqlens_block_q, cu_seqlens_k_new = [
+        maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_block_q, cu_seqlens_k_new)
     ]
     page_table, cache_batch_idx, cache_leftpad = [
         maybe_contiguous(x) for x in (page_table, cache_batch_idx, cache_leftpad)
@@ -251,6 +268,8 @@ def flash_attn_with_kvcache(
         ) * q.size(1)
         max_seqlen_q = q.size(1)
         q = q.view(-1, q.size(-2), q.size(-1)).contiguous()
+    if cu_seqlens_block_q is None:
+        cu_seqlens_block_q = make_cu_seqlens_block_q(cu_seqlens_q, q.size(-1))
     if cache_seqlens is not None:
         assert cache_seqlens.size(0) + 1 == cu_seqlens_q.size(0)
         cu_seqlens_k = cache_seqlens
@@ -260,6 +279,7 @@ def flash_attn_with_kvcache(
         v_cache,
         qv,
         cu_seqlens_q,
+        cu_seqlens_block_q,
         cu_seqlens_k,
         max_seqlen_q,
         1,
@@ -295,6 +315,7 @@ def flash_attn_varlen_func(
     cu_seqlens_k,
     max_seqlen_q,
     max_seqlen_k,
+    cu_seqlens_block_q=None,
     seqused_q=None,
     seqused_k=None,
     softmax_scale=None,
@@ -326,6 +347,9 @@ def flash_attn_varlen_func(
         ) * q.size(1)
         max_seqlen_q = q.size(1)
         q = q.view(-1, q.size(-2), q.size(-1)).contiguous()
+    if cu_seqlens_block_q is None:
+        cu_seqlens_block_q = make_cu_seqlens_block_q(cu_seqlens_q, q.size(-1))
+    cu_seqlens_block_q = maybe_contiguous(cu_seqlens_block_q)
 
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
         q,
@@ -333,6 +357,7 @@ def flash_attn_varlen_func(
         v,
         qv,  # qv
         cu_seqlens_q,
+        cu_seqlens_block_q,
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,

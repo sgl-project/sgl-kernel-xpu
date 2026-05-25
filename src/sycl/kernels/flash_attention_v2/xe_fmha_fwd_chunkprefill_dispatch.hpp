@@ -4,13 +4,6 @@
 
 namespace chunkprefill {
 
-extern template struct FmhaChunkPrefillStaticRunner<64>;
-extern template struct FmhaChunkPrefillStaticRunner<96>;
-extern template struct FmhaChunkPrefillStaticRunner<128>;
-extern template struct FmhaChunkPrefillStaticRunner<192>;
-extern template struct FmhaChunkPrefillStaticRunner<256>;
-extern template struct FmhaChunkPrefillStaticRunner<512>;
-
 extern template struct FmhaChunkPrefillDynamicRunner<64>;
 extern template struct FmhaChunkPrefillDynamicRunner<96>;
 extern template struct FmhaChunkPrefillDynamicRunner<128>;
@@ -18,36 +11,9 @@ extern template struct FmhaChunkPrefillDynamicRunner<192>;
 extern template struct FmhaChunkPrefillDynamicRunner<256>;
 extern template struct FmhaChunkPrefillDynamicRunner<512>;
 
-extern template struct FmhaChunkPrefillSplitKVStaticRunner<64>;
-extern template struct FmhaChunkPrefillSplitKVStaticRunner<96>;
-extern template struct FmhaChunkPrefillSplitKVStaticRunner<128>;
-extern template struct FmhaChunkPrefillSplitKVStaticRunner<192>;
-extern template struct FmhaChunkPrefillSplitKVStaticRunner<256>;
-extern template struct FmhaChunkPrefillSplitKVStaticRunner<512>;
-
-extern template struct FmhaChunkPrefillSplitKVDynamicRunner<64>;
-extern template struct FmhaChunkPrefillSplitKVDynamicRunner<96>;
-extern template struct FmhaChunkPrefillSplitKVDynamicRunner<128>;
-extern template struct FmhaChunkPrefillSplitKVDynamicRunner<192>;
-extern template struct FmhaChunkPrefillSplitKVDynamicRunner<256>;
-extern template struct FmhaChunkPrefillSplitKVDynamicRunner<512>;
-
 template <int HEAD_DIM>
 inline void run_chunkprefill_kernel(const Arguments& params) {
-  switch (get_scheduler_variant()) {
-    case ChunkPrefillSchedulerVariant::StaticPersistent:
-      FmhaChunkPrefillStaticRunner<HEAD_DIM>{}(params);
-      return;
-    case ChunkPrefillSchedulerVariant::DynamicPersistent:
-      FmhaChunkPrefillDynamicRunner<HEAD_DIM>{}(params);
-      return;
-    case ChunkPrefillSchedulerVariant::SplitKVStaticPersistent:
-      FmhaChunkPrefillSplitKVStaticRunner<HEAD_DIM>{}(params);
-      return;
-    case ChunkPrefillSchedulerVariant::SplitKVDynamicPersistent:
-      FmhaChunkPrefillSplitKVDynamicRunner<HEAD_DIM>{}(params);
-      return;
-  }
+  FmhaChunkPrefillDynamicRunner<HEAD_DIM>{}(params);
 }
 
 inline void dispatch_chunkprefill_kernel(const Arguments& params) {

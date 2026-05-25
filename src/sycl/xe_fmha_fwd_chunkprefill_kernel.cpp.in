@@ -11,25 +11,10 @@ using SubgroupLayout =
   cute::Layout<cute::Shape<cute::Int<@NUM_SG@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
 constexpr int PipelineStages = 2;
 
-using StaticPersistentScheduler = cutlass::fmha::kernel::XeFHMAStaticPresistentTileScheduler;
 using DynamicPersistentScheduler = cutlass::fmha::kernel::XeFHMADynamicPresistentTileScheduler;
-using SplitKVStaticPersistentScheduler = cutlass::fmha::kernel::XeFMHASplitKVStaticPersistentTileScheduler;
-using SplitKVDynamicPersistentScheduler = cutlass::fmha::kernel::XeFMHASplitKVDynamicPersistentTileScheduler;
 
 template <bool Causal, bool LocalMask, bool Sink>
 using StandardConfig = prefill::FMHAConfig<
-    Causal,
-    LocalMask,
-    Sink,
-    TileShapeQK,
-    TileShapePV,
-    TileShapeO,
-    SubgroupLayout,
-    void,
-    PipelineStages>;
-
-template <bool Causal, bool LocalMask, bool Sink>
-using SplitKVConfig = ChunkPrefillSplitKVConfig<
     Causal,
     LocalMask,
     Sink,
@@ -55,47 +40,13 @@ void run_standard_config(const Arguments& params) {
     })
   })
 }
-
-template <class Scheduler>
-void run_splitkv_config(const Arguments& params) {
-  AT_DISPATCH_BOOL_NO_RETURN(params.page_table != nullptr, PagedKV, {
-    AT_DISPATCH_BOOL_NO_RETURN(params.softmax_sink_ptr != nullptr, Sink, {
-      if (params.is_causal) {
-        SplitKVConfig<true, false, Sink>::template run<true, true, PagedKV, Scheduler>(params);
-      } else {
-        AT_DISPATCH_BOOL_NO_RETURN(
-            params.is_local,
-            LocalMask,
-            SplitKVConfig<false, LocalMask, Sink>::template run<true, true, PagedKV, Scheduler>(params))
-      }
-    })
-  })
-}
 }  // namespace
-
-template <>
-void FmhaChunkPrefillStaticRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
-  run_standard_config<StaticPersistentScheduler>(params);
-}
 
 template <>
 void FmhaChunkPrefillDynamicRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
   run_standard_config<DynamicPersistentScheduler>(params);
 }
 
-template <>
-void FmhaChunkPrefillSplitKVStaticRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
-  run_splitkv_config<SplitKVStaticPersistentScheduler>(params);
-}
-
-template <>
-void FmhaChunkPrefillSplitKVDynamicRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
-  run_splitkv_config<SplitKVDynamicPersistentScheduler>(params);
-}
-
-template struct FmhaChunkPrefillStaticRunner<@HEAD_DIM@>;
 template struct FmhaChunkPrefillDynamicRunner<@HEAD_DIM@>;
-template struct FmhaChunkPrefillSplitKVStaticRunner<@HEAD_DIM@>;
-template struct FmhaChunkPrefillSplitKVDynamicRunner<@HEAD_DIM@>;
 
 }  // namespace chunkprefill

@@ -99,6 +99,8 @@ struct Arguments {
   int* __restrict__ cu_seqlens_q;
   int* __restrict__ cu_seqlens_k;
   int* __restrict__ cu_seqlens_knew;
+  int const* __restrict__ cu_q_blocks = nullptr;
+  int total_q_blocks = 0;
   int* __restrict__ leftpad_k;
 
   // If provided, the actual length of each q/k sequence.
@@ -271,6 +273,8 @@ struct PrefillRunner {
 
     if constexpr (isVarLen) {
       shape.seq_len_qo.cumulative_length = params.cu_seqlens_q;
+      shape.seq_len_qo.cumulative_blocks = params.cu_q_blocks;
+      shape.seq_len_qo.total_blocks = params.total_q_blocks;
       shape.seq_len_kv.cumulative_length = params.cu_seqlens_knew;
       shape.seq_len_kv_cache.cumulative_length = params.cu_seqlens_k;
     }

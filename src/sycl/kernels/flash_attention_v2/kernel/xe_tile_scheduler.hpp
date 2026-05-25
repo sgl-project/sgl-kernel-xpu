@@ -85,8 +85,7 @@ struct XeFHMAIndividualTileScheduler {
   }
 
   template <class Varlen = cutlass::fmha::collective::VariableLength>
-  CUTLASS_DEVICE
-  auto get_block_coord() {
+  CUTLASS_DEVICE auto get_block_coord() {
     using namespace cute;
     int idx_b = BlockIdxZ();
     int head;
@@ -140,10 +139,8 @@ struct XeFHMAIndividualPersistentTileScheduler {
         num_batch_heads_(num_batch_heads) {}
 
   template <int Num_SGs = 16, class ProblemShape, class TileShape>
-  static Params to_underlying_arguments(
-      ProblemShape const& shape, KernelHardwareInfo hw_info,
-      TileShape const& tile_shape)
-  {
+  static Params
+  to_underlying_arguments(ProblemShape const& shape, KernelHardwareInfo hw_info, TileShape const& tile_shape) {
     using namespace cute;
 
     dim3 grid(
@@ -167,8 +164,7 @@ struct XeFHMAIndividualPersistentTileScheduler {
   }
 
   template <class Varlen = cutlass::fmha::collective::VariableLength>
-  CUTLASS_DEVICE
-  auto get_block_coord() {
+  CUTLASS_DEVICE auto get_block_coord() {
     using namespace cute;
     int wg_id = BlockIdxZ();
 
@@ -191,8 +187,7 @@ struct XeFHMAIndividualPersistentTileScheduler {
 };
 
 template <class Varlen, class Scheduler>
-CUTLASS_DEVICE
-void xe_fmha_persistent_decompose_work_idx(
+CUTLASS_DEVICE void xe_fmha_persistent_decompose_work_idx(
     Scheduler const& scheduler, int work_idx, int& blk_q, int& blk_v, int& head, int& idx_b) {
   auto const& params = scheduler.params;
 
@@ -240,8 +235,7 @@ void xe_fmha_persistent_decompose_work_idx(
 }
 
 template <class Varlen, class Scheduler>
-CUTLASS_DEVICE
-void xe_fmha_split_kv_persistent_decompose_work_idx(
+CUTLASS_DEVICE void xe_fmha_split_kv_persistent_decompose_work_idx(
     Scheduler const& scheduler, int work_idx, int& blk_q, int& blk_v, int& head, int& idx_b, int& blk_k) {
   auto const& params = scheduler.params;
 
@@ -280,7 +274,6 @@ void xe_fmha_split_kv_persistent_decompose_work_idx(
 }
 
 struct XeFHMAStaticPresistentTileScheduler {
-
   struct Params {
     dim3 grid;
     int batch;
@@ -302,17 +295,14 @@ struct XeFHMAStaticPresistentTileScheduler {
 
   CUTLASS_DEVICE
   XeFHMAStaticPresistentTileScheduler(Params const& params) : params(params) {
-    current_work_linear_idx_ = uint64_t(BlockIdxX())
-                             + uint64_t(BlockIdxY()) * uint64_t(GridDimX())
-                             + uint64_t(BlockIdxZ()) * uint64_t(GridDimX()) * uint64_t(GridDimY());
+    current_work_linear_idx_ = uint64_t(BlockIdxX()) + uint64_t(BlockIdxY()) * uint64_t(GridDimX()) +
+                               uint64_t(BlockIdxZ()) * uint64_t(GridDimX()) * uint64_t(GridDimY());
     total_grid_size_ = uint64_t(GridDimX()) * uint64_t(GridDimY()) * uint64_t(GridDimZ());
   }
 
   template <int Num_SGs = 16, class ProblemShape, class TileShape>
-  static Params to_underlying_arguments(
-      ProblemShape const& shape, KernelHardwareInfo hw_info,
-      TileShape const& tile_shape)
-  {
+  static Params
+  to_underlying_arguments(ProblemShape const& shape, KernelHardwareInfo hw_info, TileShape const& tile_shape) {
     using namespace cute;
     using SeqLenQ = remove_cvref_t<decltype(shape.seq_len_qo)>;
 
@@ -341,18 +331,19 @@ struct XeFHMAStaticPresistentTileScheduler {
 
     total_q_blocks = total_q_blocks > 0 ? total_q_blocks : shape.batch * max_q_blocks;
 
-    return Params{grid,
-                  shape.batch,
-                  shape.num_heads_q,
-                  num_v_blocks,
-                  max_q_blocks,
-                  q_tile_size,
-                  cumulative_seqlen_q,
-                  cumulative_q_blocks,
-                  total_q_blocks,
-                  {num_v_blocks},
-                  {max_q_blocks},
-                  {shape.num_heads_q}};
+    return Params{
+        grid,
+        shape.batch,
+        shape.num_heads_q,
+        num_v_blocks,
+        max_q_blocks,
+        q_tile_size,
+        cumulative_seqlen_q,
+        cumulative_q_blocks,
+        total_q_blocks,
+        {num_v_blocks},
+        {max_q_blocks},
+        {shape.num_heads_q}};
   }
 
   template <int Num_SGs>
@@ -361,8 +352,7 @@ struct XeFHMAStaticPresistentTileScheduler {
   }
 
   template <class Varlen = cutlass::fmha::collective::VariableLength>
-  CUTLASS_DEVICE
-  int q_blocks_for_batch(int batch_idx) const {
+  CUTLASS_DEVICE int q_blocks_for_batch(int batch_idx) const {
     if constexpr (cutlass::fmha::collective::is_variable_length_v<Varlen>) {
       int seq_len_q = params.cumulative_seqlen_q[batch_idx + 1] - params.cumulative_seqlen_q[batch_idx];
       return cute::ceil_div(seq_len_q, params.q_tile_size);
@@ -381,8 +371,7 @@ struct XeFHMAStaticPresistentTileScheduler {
   }
 
   template <class Varlen = cutlass::fmha::collective::VariableLength>
-  CUTLASS_DEVICE
-  auto get_block_coord() {
+  CUTLASS_DEVICE auto get_block_coord() {
     using namespace cute;
     int work_idx = static_cast<int>(current_work_linear_idx_);
     int blk_q;
@@ -402,7 +391,6 @@ struct XeFHMAStaticPresistentTileScheduler {
 };
 
 struct XeFHMADynamicPresistentTileScheduler {
-
   struct Params {
     dim3 grid;
     int batch;
@@ -428,10 +416,8 @@ struct XeFHMADynamicPresistentTileScheduler {
   }
 
   template <int Num_SGs = 16, class ProblemShape, class TileShape>
-  static Params to_underlying_arguments(
-      ProblemShape const& shape, KernelHardwareInfo hw_info,
-      TileShape const& tile_shape)
-  {
+  static Params
+  to_underlying_arguments(ProblemShape const& shape, KernelHardwareInfo hw_info, TileShape const& tile_shape) {
     using namespace cute;
     using SeqLenQ = remove_cvref_t<decltype(shape.seq_len_qo)>;
 
@@ -460,19 +446,20 @@ struct XeFHMADynamicPresistentTileScheduler {
 
     total_q_blocks = total_q_blocks > 0 ? total_q_blocks : shape.batch * max_q_blocks;
 
-    return Params{grid,
-                  shape.batch,
-                  shape.num_heads_q,
-                  num_v_blocks,
-                  max_q_blocks,
-                  q_tile_size,
-                  cumulative_seqlen_q,
-                  cumulative_q_blocks,
-                  total_q_blocks,
-                  nullptr,
-                  {num_v_blocks},
-                  {max_q_blocks},
-                  {shape.num_heads_q}};
+    return Params{
+        grid,
+        shape.batch,
+        shape.num_heads_q,
+        num_v_blocks,
+        max_q_blocks,
+        q_tile_size,
+        cumulative_seqlen_q,
+        cumulative_q_blocks,
+        total_q_blocks,
+        nullptr,
+        {num_v_blocks},
+        {max_q_blocks},
+        {shape.num_heads_q}};
   }
 
   template <int Num_SGs>
@@ -481,8 +468,7 @@ struct XeFHMADynamicPresistentTileScheduler {
   }
 
   template <class Varlen = cutlass::fmha::collective::VariableLength>
-  CUTLASS_DEVICE
-  int q_blocks_for_batch(int batch_idx) const {
+  CUTLASS_DEVICE int q_blocks_for_batch(int batch_idx) const {
     if constexpr (cutlass::fmha::collective::is_variable_length_v<Varlen>) {
       int seq_len_q = params.cumulative_seqlen_q[batch_idx + 1] - params.cumulative_seqlen_q[batch_idx];
       return cute::ceil_div(seq_len_q, params.q_tile_size);
@@ -501,8 +487,7 @@ struct XeFHMADynamicPresistentTileScheduler {
   }
 
   template <class Varlen = cutlass::fmha::collective::VariableLength>
-  CUTLASS_DEVICE
-  auto get_block_coord() {
+  CUTLASS_DEVICE auto get_block_coord() {
     using namespace cute;
     int work_idx = static_cast<int>(current_work_linear_idx_);
     int blk_q;
@@ -532,7 +517,6 @@ struct XeFHMADynamicPresistentTileScheduler {
 };
 
 struct XeFMHASplitKVStaticPersistentTileScheduler {
-
   struct Params {
     dim3 grid;
     int batch;
@@ -560,17 +544,14 @@ struct XeFMHASplitKVStaticPersistentTileScheduler {
 
   CUTLASS_DEVICE
   XeFMHASplitKVStaticPersistentTileScheduler(Params const& params) : params(params) {
-    current_work_linear_idx_ = uint64_t(BlockIdxX())
-                             + uint64_t(BlockIdxY()) * uint64_t(GridDimX())
-                             + uint64_t(BlockIdxZ()) * uint64_t(GridDimX()) * uint64_t(GridDimY());
+    current_work_linear_idx_ = uint64_t(BlockIdxX()) + uint64_t(BlockIdxY()) * uint64_t(GridDimX()) +
+                               uint64_t(BlockIdxZ()) * uint64_t(GridDimX()) * uint64_t(GridDimY());
     total_grid_size_ = uint64_t(GridDimX()) * uint64_t(GridDimY()) * uint64_t(GridDimZ());
   }
 
   template <int Num_SGs = 16, class ProblemShape, class TileShape>
   static Params to_underlying_arguments(
-      ProblemShape const& shape, KernelHardwareInfo hw_info,
-      TileShape const& tile_shape, int num_kv_splits = 1)
-  {
+      ProblemShape const& shape, KernelHardwareInfo hw_info, TileShape const& tile_shape, int num_kv_splits = 1) {
     using namespace cute;
     using SeqLenQ = remove_cvref_t<decltype(shape.seq_len_qo)>;
     using SeqLenKV = remove_cvref_t<decltype(shape.seq_len_kv)>;
@@ -614,24 +595,25 @@ struct XeFMHASplitKVStaticPersistentTileScheduler {
 
     total_q_blocks = work_q_blocks;
 
-    return Params{grid,
-                  shape.batch,
-                  shape.num_heads_q,
-                  num_v_blocks,
-                  max_q_blocks,
-                  q_tile_size,
-                  cumulative_seqlen_q,
-                  cumulative_q_blocks,
-                  total_q_blocks,
-                  cumulative_k_blocks,
-                  total_k_blocks,
-                  cumulative_split_kv_blocks,
-                  total_split_kv_blocks,
-                  num_kv_splits,
-                  {num_v_blocks},
-                  {max_q_blocks},
-                  {shape.num_heads_q},
-                  {num_kv_splits}};
+    return Params{
+        grid,
+        shape.batch,
+        shape.num_heads_q,
+        num_v_blocks,
+        max_q_blocks,
+        q_tile_size,
+        cumulative_seqlen_q,
+        cumulative_q_blocks,
+        total_q_blocks,
+        cumulative_k_blocks,
+        total_k_blocks,
+        cumulative_split_kv_blocks,
+        total_split_kv_blocks,
+        num_kv_splits,
+        {num_v_blocks},
+        {max_q_blocks},
+        {shape.num_heads_q},
+        {num_kv_splits}};
   }
 
   template <int Num_SGs>
@@ -640,8 +622,7 @@ struct XeFMHASplitKVStaticPersistentTileScheduler {
   }
 
   template <class Varlen = cutlass::fmha::collective::VariableLength>
-  CUTLASS_DEVICE
-  int q_blocks_for_batch(int batch_idx) const {
+  CUTLASS_DEVICE int q_blocks_for_batch(int batch_idx) const {
     if constexpr (cutlass::fmha::collective::is_variable_length_v<Varlen>) {
       int seq_len_q = params.cumulative_seqlen_q[batch_idx + 1] - params.cumulative_seqlen_q[batch_idx];
       return cute::ceil_div(seq_len_q, params.q_tile_size);
@@ -651,7 +632,8 @@ struct XeFMHASplitKVStaticPersistentTileScheduler {
 
   CUTLASS_DEVICE
   int total_work_tiles() const {
-    int split_kv_blocks = params.total_split_kv_blocks > 0 ? params.total_split_kv_blocks : params.total_q_blocks * params.num_kv_splits_;
+    int split_kv_blocks =
+        params.total_split_kv_blocks > 0 ? params.total_split_kv_blocks : params.total_q_blocks * params.num_kv_splits_;
     return split_kv_blocks * params.num_heads_q * params.num_v_blocks;
   }
 
@@ -661,8 +643,7 @@ struct XeFMHASplitKVStaticPersistentTileScheduler {
   }
 
   template <class Varlen = cutlass::fmha::collective::VariableLength>
-  CUTLASS_DEVICE
-  auto get_block_coord() {
+  CUTLASS_DEVICE auto get_block_coord() {
     using namespace cute;
     int work_idx = static_cast<int>(current_work_linear_idx_);
     int blk_q;
@@ -683,7 +664,6 @@ struct XeFMHASplitKVStaticPersistentTileScheduler {
 };
 
 struct XeFMHASplitKVDynamicPersistentTileScheduler {
-
   struct Params {
     dim3 grid;
     int batch;
@@ -716,9 +696,7 @@ struct XeFMHASplitKVDynamicPersistentTileScheduler {
 
   template <int Num_SGs = 16, class ProblemShape, class TileShape>
   static Params to_underlying_arguments(
-      ProblemShape const& shape, KernelHardwareInfo hw_info,
-      TileShape const& tile_shape, int num_kv_splits = 1)
-  {
+      ProblemShape const& shape, KernelHardwareInfo hw_info, TileShape const& tile_shape, int num_kv_splits = 1) {
     using namespace cute;
     using SeqLenQ = remove_cvref_t<decltype(shape.seq_len_qo)>;
     using SeqLenKV = remove_cvref_t<decltype(shape.seq_len_kv)>;
@@ -762,25 +740,26 @@ struct XeFMHASplitKVDynamicPersistentTileScheduler {
 
     total_q_blocks = work_q_blocks;
 
-    return Params{grid,
-                  shape.batch,
-                  shape.num_heads_q,
-                  num_v_blocks,
-                  max_q_blocks,
-                  q_tile_size,
-                  cumulative_seqlen_q,
-                  cumulative_q_blocks,
-                  total_q_blocks,
-                  cumulative_k_blocks,
-                  total_k_blocks,
-                  cumulative_split_kv_blocks,
-                  total_split_kv_blocks,
-                  num_kv_splits,
-                  nullptr,
-                  {num_v_blocks},
-                  {max_q_blocks},
-                  {shape.num_heads_q},
-                  {num_kv_splits}};
+    return Params{
+        grid,
+        shape.batch,
+        shape.num_heads_q,
+        num_v_blocks,
+        max_q_blocks,
+        q_tile_size,
+        cumulative_seqlen_q,
+        cumulative_q_blocks,
+        total_q_blocks,
+        cumulative_k_blocks,
+        total_k_blocks,
+        cumulative_split_kv_blocks,
+        total_split_kv_blocks,
+        num_kv_splits,
+        nullptr,
+        {num_v_blocks},
+        {max_q_blocks},
+        {shape.num_heads_q},
+        {num_kv_splits}};
   }
 
   template <int Num_SGs>
@@ -789,8 +768,7 @@ struct XeFMHASplitKVDynamicPersistentTileScheduler {
   }
 
   template <class Varlen = cutlass::fmha::collective::VariableLength>
-  CUTLASS_DEVICE
-  int q_blocks_for_batch(int batch_idx) const {
+  CUTLASS_DEVICE int q_blocks_for_batch(int batch_idx) const {
     if constexpr (cutlass::fmha::collective::is_variable_length_v<Varlen>) {
       int seq_len_q = params.cumulative_seqlen_q[batch_idx + 1] - params.cumulative_seqlen_q[batch_idx];
       return cute::ceil_div(seq_len_q, params.q_tile_size);
@@ -800,7 +778,8 @@ struct XeFMHASplitKVDynamicPersistentTileScheduler {
 
   CUTLASS_DEVICE
   int total_work_tiles() const {
-    int split_kv_blocks = params.total_split_kv_blocks > 0 ? params.total_split_kv_blocks : params.total_q_blocks * params.num_kv_splits_;
+    int split_kv_blocks =
+        params.total_split_kv_blocks > 0 ? params.total_split_kv_blocks : params.total_q_blocks * params.num_kv_splits_;
     return split_kv_blocks * params.num_heads_q * params.num_v_blocks;
   }
 
@@ -810,8 +789,7 @@ struct XeFMHASplitKVDynamicPersistentTileScheduler {
   }
 
   template <class Varlen = cutlass::fmha::collective::VariableLength>
-  CUTLASS_DEVICE
-  auto get_block_coord() {
+  CUTLASS_DEVICE auto get_block_coord() {
     using namespace cute;
     int work_idx = static_cast<int>(current_work_linear_idx_);
     int blk_q;
@@ -842,7 +820,6 @@ struct XeFMHASplitKVDynamicPersistentTileScheduler {
 };
 
 struct XeReduceSplitKTileScheduler {
-
   struct Params {
     dim3 grid;
     FastDivmod divmod_num_heads;
@@ -857,9 +834,7 @@ struct XeReduceSplitKTileScheduler {
 
   template <int Num_SGs = 16, class ProblemShape, class TileShape>
   static Params to_underlying_arguments(
-      ProblemShape const& shape, KernelHardwareInfo hw_info,
-      TileShape const& tile_shape, int num_kv_splits = 1)
-  {
+      ProblemShape const& shape, KernelHardwareInfo hw_info, TileShape const& tile_shape, int num_kv_splits = 1) {
     using namespace cute;
     int max_seq_len_q = 0;
     if constexpr (cutlass::fmha::collective::is_variable_length_v<remove_cvref_t<decltype(shape.seq_len_qo)>>) {
@@ -882,8 +857,7 @@ struct XeReduceSplitKTileScheduler {
   }
 
   template <class Varlen = cutlass::fmha::collective::VariableLength>
-  CUTLASS_DEVICE
-  auto get_block_coord() {
+  CUTLASS_DEVICE auto get_block_coord() {
     using namespace cute;
     return make_coord(BlockIdxX(), BlockIdxY(), BlockIdxZ());
   }

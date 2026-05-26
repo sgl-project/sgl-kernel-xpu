@@ -58,17 +58,21 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("swiglu_gpt_oss_sigmoid_alpha(Tensor x, float alpha, float limit) -> Tensor");
   m.impl("swiglu_gpt_oss_sigmoid_alpha", torch::kXPU, &swiglu_gpt_oss_sigmoid_alpha);
+
+#if defined(SGL_KERNEL_ENABLE_MOE)
   m.def(
       "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int "
       "num_fused_shared_experts, float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
       "(Tensor[])");
   m.impl("moe_fused_gate", torch::kXPU, &moe_fused_gate);
+#endif
 
   m.def(
       "rotary_embedding(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
       "bool is_neox) -> (Tensor, Tensor)");
   m.impl("rotary_embedding", torch::kXPU, &at::native::xpu::rotary_embedding);
 
+#if defined(SGL_KERNEL_ENABLE_MOE)
   m.def("moe_sum_reduce(Tensor input, Tensor output, float routed_scaling_factor) -> ()");
   m.impl("moe_sum_reduce", torch::kXPU, &moe_sum_reduce);
   m.def(
@@ -97,6 +101,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, float routed_scaling_factor, Tensor? "
       "factors) -> ()");
   m.impl("apply_shuffle_mul_sum", torch::kXPU, &apply_shuffle_mul_sum);
+#endif
 
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state_v2", torch::kXPU, &merge_state_v2);
@@ -135,6 +140,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    int      sm_margin) -> Tensor[]");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
 
+#if defined(SGL_KERNEL_ENABLE_MLA_DECODE)
   m.def("flash_mla_get_workspace_size", &flash_mla_get_workspace_size);
 
   m.def(
@@ -142,6 +148,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor! "
       "page_table, Tensor! workspace, float sm_scale, int num_kv_splits) -> ()");
   m.impl("flash_mla_decode", torch::kXPU, &flash_mla_decode);
+#endif
 
   /*
    * From quantization ops

@@ -35,10 +35,14 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
-#include "kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_chunkprefill_dispatch.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_prefill_dispatch.hpp"
 
+#if defined(SGL_KERNEL_ENABLE_FMHA_DECODE)
+#include "kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp"
+#endif
+
+#if defined(SGL_KERNEL_ENABLE_FMHA_DECODE)
 namespace decode {
 
 // Dispatch macros following the GroupGemmXe20.cpp pattern.
@@ -436,6 +440,7 @@ std::vector<at::Tensor> mha_fwd(
 #undef DISPATCH_DECODE
 
 }  // namespace decode
+#endif
 
 namespace prefill {
 
@@ -758,9 +763,12 @@ std::vector<at::Tensor> mha_fwd(
     std::optional<bool> pack_gqa_,
     int const sm_margin) {
   TORCH_CHECK(cu_seqlens_k.data_ptr<int>() != nullptr, "cu_seqlens_k is not valid.");
+  // Internal benchmark path: keep non-local semantics while comparing chunkprefill directly.
+  const bool force_chunkprefill = num_kv_splits == -2;
   int const num_heads = q.size(-2);
   int const num_heads_k = k.size(-2);
   if (max_seqlen_q == 1 && page_table.has_value()) {
+#if defined(SGL_KERNEL_ENABLE_FMHA_DECODE)
     return decode::mha_fwd(
         q,
         k,
@@ -790,7 +798,13 @@ std::vector<at::Tensor> mha_fwd(
         num_kv_splits,
         pack_gqa_,
         sm_margin);
-  } else if (!(window_size_left >= 0 || window_size_right >= 0) && !sinks_.has_value() && page_table.has_value()) {
+#else
+    TORCH_CHECK(false, "FMHA decode kernels are disabled in this build");
+    return {};
+#endif
+  } else if (
+      !force_chunkprefill && !(window_size_left >= 0 || window_size_right >= 0) && !sinks_.has_value() &&
+      page_table.has_value()) {
     // TODO: support the cases for non-kv cache, sliding window and sink.
     return prefill::mha_fwd(
         q,

@@ -65,11 +65,12 @@ template <
     class TensorV_,
     class TensorK_cache_,
     class TensorV_cache_,
-    class TiledCopyQ_ = void,  // Optional TiledCopy for loading Q
-    class TiledCopyK_ = void,  // Optional TiledCopy for loading K
-    class TiledCopyV_ = void,  // Optional TiledCopy for loading V
-    class TiledCopyK_cache_ = void,
-    class TiledCopyV_cache_ = void>  // Optional TiledCopy for loading V_cache
+    class TiledCopyQ_ = void,        // Optional TiledCopy for loading Q
+    class TiledCopyK_ = void,        // Optional TiledCopy for loading K
+    class TiledCopyV_ = void,        // Optional TiledCopy for loading V
+    class TiledCopyK_cache_ = void,  // Optional TiledCopy for loading K_cache
+    class TiledCopyV_cache_ = void,  // Optional TiledCopy for loading V_cache
+    bool LocalMask_ = false>
 struct FMHAFwdMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -93,7 +94,8 @@ template <
     class TiledCopyK_,
     class TiledCopyV_,
     class TiledCopyK_cache_,
-    class TiledCopyV_cache_>
+    class TiledCopyV_cache_,
+    bool LocalMask_>
 struct FMHAFwdMainloop<
     XeDefault<Stages>,
     CausalMask_,
@@ -111,7 +113,8 @@ struct FMHAFwdMainloop<
     TiledCopyK_,
     TiledCopyV_,
     TiledCopyK_cache_,
-    TiledCopyV_cache_> {
+    TiledCopyV_cache_,
+    LocalMask_> {
   //
   // Type Aliases
   //
@@ -179,6 +182,7 @@ struct FMHAFwdMainloop<
   static constexpr bool CausalMask = CausalMask_;
   static constexpr bool CachedKV = CachedKV_;
   static constexpr bool PagedKV = PagedKV_;
+  static constexpr bool LocalMask = LocalMask_;
 
   // User-facing arguments
   struct Arguments {
@@ -186,6 +190,8 @@ struct FMHAFwdMainloop<
     int const* ptr_page_table = nullptr;
     int page_size = 0;
     int max_num_pages_per_seq = 0;
+    int window_size_left = -1;
+    int window_size_right = -1;
   };
 
   // Kernel-facing parameters
@@ -205,7 +211,13 @@ struct FMHAFwdMainloop<
   static constexpr Params to_underlying_arguments(Arguments const& args, void* /* workspace */) {
     constexpr double kLog2e = 1.4426950408889634074;  // log_2(e)
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
-    return Params{val, args.ptr_page_table, args.page_size, args.max_num_pages_per_seq};
+    return Params{
+        val,
+        args.ptr_page_table,
+        args.page_size,
+        args.max_num_pages_per_seq,
+        args.window_size_left,
+        args.window_size_right};
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
@@ -406,6 +418,24 @@ struct FMHAFwdMainloop<
             if (row_idx < col_idx - full_tile_offset) {
               tSrS(i) = ElementS(-INFINITY);
             }
+          }
+        }
+      }
+
+      /* Local/sliding window masking */
+      if constexpr (LocalMask) {
+        Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
+        Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
+        auto cS_thread = thr_mma_qk.partition_C(gP);
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tSrS.size(); ++i) {
+          int row_idx = get<0>(cS_thread(i));
+          int col_idx = get<1>(cS_thread(i));
+          int row_kv_idx = row_idx + full_tile_offset;
+          bool left_mask = col_idx < row_kv_idx - params.window_size_left;
+          bool right_mask = col_idx > row_kv_idx + params.window_size_right;
+          if (left_mask || right_mask) {
+            tSrS(i) = ElementS(-INFINITY);
           }
         }
       }

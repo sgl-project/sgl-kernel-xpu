@@ -797,8 +797,8 @@ std::vector<at::Tensor> mha_fwd(
         num_kv_splits,
         pack_gqa_,
         sm_margin);
-  } else if (!(window_size_left >= 0 || window_size_right >= 0) && !sinks_.has_value() && page_table.has_value()) {
-    // TODO: support the cases for non-kv cache, sliding window and sink.
+  } else if (!sinks_.has_value() && page_table.has_value()) {
+    // TODO: support the cases for non-kv cache and sink.
     return prefill::mha_fwd(
         q,
         k,

@@ -297,7 +297,14 @@ struct PrefillRunner {
             static_cast<const ElementV*>(params.v_ptr),
             stride_V_cache,
         },
-        {params.softmax_scale, params.page_table, params.page_size, params.max_num_pages_per_seq},
+        {
+            params.softmax_scale,
+            params.page_table,
+            params.page_size,
+            params.max_num_pages_per_seq,
+            params.window_size_left,
+            params.window_size_right,
+        },
         {},
         hw_info};
 
@@ -407,7 +414,8 @@ struct FMHAConfig {
         GmemTiledCopyK,
         GmemTiledCopyV,
         GmemTiledCopyK_cache,
-        GmemTiledCopyV_cache>;
+        GmemTiledCopyV_cache,
+        LocalMask>;
 
     // Epilogue
     using CollectiveEpilogue =

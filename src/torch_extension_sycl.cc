@@ -176,6 +176,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor! q_weight, Tensor! k_weight, float base, bool is_neox, Tensor! position_ids, "
       "float factor, float low, float high, float attention_factor, int rotary_dim) -> ()");
   m.impl("fused_qk_rope", torch::kXPU, &at::native::xpu::fused_qk_rope);
+
+  m.def(
+      "fused_qk_rope_with_cos_sin_cache_inplace(Tensor! q, Tensor! k, Tensor! cos_sin_cache, Tensor! positions, int "
+      "rope_dim, "
+      "bool is_neox) -> ()");
+  m.impl(
+      "fused_qk_rope_with_cos_sin_cache_inplace",
+      torch::kXPU,
+      &at::native::xpu::fused_qk_rope_with_cos_sin_cache_inplace);
+
   /* utils */
   m.def("query_device(int device_id) -> (int, int)");
   m.impl("query_device", c10::DispatchKey::BackendSelect, &query_device);

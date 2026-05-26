@@ -337,7 +337,7 @@ template <
     bool one_moment = false,
     typename mean_t = float>
 void launch_vectorized_fused_norm_kernel(Norm<scalar_t, weight_t, mean_t>& norm, const NormConfig& config) {
-  int vec_size = norm.get_update_vec_size(config.WGPlane, config.max_vec_size);
+  int vec_size = config.get_stride_aligned_vec_size(norm.get_update_vec_size(config.WGPlane, config.max_vec_size));
 #define VECTORIZED_FUSED_NORM_KERNEL(vec_size)                                       \
   {                                                                                  \
     fused_norm_kernel<scalar_t, weight_t, vec_size, Norm, one_moment>(norm, config); \

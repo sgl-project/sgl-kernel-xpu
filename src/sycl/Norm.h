@@ -116,8 +116,7 @@ class NormConfig {
       int input_inner_size = 1,
       int input_inner_stride = 0,
       int output_inner_size = 1,
-      int output_inner_stride = 0,
-      bool single_wg_per_row = false)
+      int output_inner_stride = 0)
       : Batch(Batch),
         Plane(Plane),
         problem_dim(problem_dim),
@@ -133,20 +132,12 @@ class NormConfig {
     sub_group_num_global = 1;
     update_vec_size = 1;
 
-    if (single_wg_per_row) {
-      // Each WG processes one full row independently. WG sizing is deferred
-      // to get_workgroup_size_single_wg_per_row() after vec_size is determined.
-      workgroup_num = Batch;
-      workgroup_num_foreach = 1;
-      WGPlane = Plane;
+    get_max_vec_size();
+    if (problem_dim == 1) {
+      get_workgroup_size();
+      WGPlane = (Plane + workgroup_num_foreach - 1) / workgroup_num_foreach;
     } else {
-      get_max_vec_size();
-      if (problem_dim == 1) {
-        get_workgroup_size();
-        WGPlane = (Plane + workgroup_num_foreach - 1) / workgroup_num_foreach;
-      } else {
-        get_workgroup_size_row();
-      }
+      get_workgroup_size_row();
     }
   }
 
@@ -175,8 +166,10 @@ class NormConfig {
             input_inner_size,
             input_inner_stride,
             output_inner_size,
-            output_inner_stride,
-            /*single_wg_per_row=*/true) {
+            output_inner_stride) {
+    workgroup_num = Batch;
+    workgroup_num_foreach = 1;
+    WGPlane = Plane;
     get_workgroup_size_single_wg_per_row(get_update_vec_size);
   }
 
@@ -232,6 +225,14 @@ class NormConfig {
     while ((max_vec_size >> 1) * total_resource >= (Batch * Plane) && (max_vec_size >> 1) >= 1) {
       max_vec_size = max_vec_size >> 1;
     }
+  }
+
+  int get_stride_aligned_vec_size(int vec_size) const {
+    while (vec_size > 1 && (input_batch_stride % vec_size != 0 || output_batch_stride % vec_size != 0 ||
+                            input_inner_stride % vec_size != 0 || output_inner_stride % vec_size != 0)) {
+      vec_size = vec_size >> 1;
+    }
+    return vec_size;
   }
 
   // get resource size for Reduce problem [Batch, Plane]
@@ -323,6 +324,7 @@ class NormConfig {
     constexpr int float4_size = sizeof(float) * 4;
     max_vec_size = float4_size / element_size_bytes;
     update_vec_size = get_update_vec_size(WGPlane, max_vec_size);
+    update_vec_size = get_stride_aligned_vec_size(update_vec_size);
     while (update_vec_size > 1 && (Plane / update_vec_size) < NUM_REDUCE_STAGES) {
       update_vec_size = update_vec_size >> 1;
     }

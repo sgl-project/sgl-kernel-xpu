@@ -384,6 +384,22 @@ def test_gemma_norm_3d_non_flattenable_row_strides():
     torch.testing.assert_close(y_ref, y, **norm_tolerances(x.dtype))
 
 
+def test_gemma_norm_3d_non_flattenable_unaligned_row_strides():
+    full = torch.randn(7, 8, 130, device=device, dtype=torch.float16)
+    x = full[:, :4, :128]
+    w = torch.randn(x.size(-1), device=device, dtype=x.dtype)
+
+    assert x.stride(0) != x.size(1) * x.stride(1)
+    assert x.size(-1) % 8 == 0
+    assert x.stride(1) % 8 != 0
+
+    y = torch.empty_strided(x.shape, x.stride(), device=device, dtype=x.dtype)
+    y_ref = gemma_rms_norm(x.clone(), w)
+    sgl_kernel.gemma_rmsnorm(x, w, out=y)
+
+    torch.testing.assert_close(y_ref, y, **norm_tolerances(x.dtype))
+
+
 @pytest.mark.parametrize("num_tokens", [7, 32])
 @pytest.mark.parametrize("num_heads", [4, 8])
 @pytest.mark.parametrize("head_dim", [64, 128])

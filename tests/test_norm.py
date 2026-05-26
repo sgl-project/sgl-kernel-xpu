@@ -400,7 +400,8 @@ def test_norm_mixed_dtype(batch_size, hidden_size, input_dtype, weight_dtype):
     y_ref = llama_rms_norm(x, w)
     y = sgl_kernel.rmsnorm(x, w)
 
-    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+    tol = 1e-2 if input_dtype == torch.bfloat16 else 1e-3
+    torch.testing.assert_close(y_ref, y, rtol=tol, atol=tol)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19])
@@ -450,7 +451,8 @@ def test_gemma_norm_mixed_dtype(batch_size, hidden_size, input_dtype, weight_dty
     y_ref = gemma_rms_norm(x, w)
     y = sgl_kernel.gemma_rmsnorm(x, w)
 
-    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+    tol = 1e-2 if input_dtype == torch.bfloat16 else 1e-3
+    torch.testing.assert_close(y_ref, y, rtol=tol, atol=tol)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19])

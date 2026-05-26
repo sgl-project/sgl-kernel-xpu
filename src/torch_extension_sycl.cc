@@ -80,26 +80,26 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("moe_sum", torch::kXPU, &moe_sum);
 
   m.def(
-      "moe_grouped_mm_nt_xe20(Tensor output, Tensor activations, Tensor weights, Tensor? bias, Tensor "
+      "moe_grouped_mm_nt_xe20(Tensor! output, Tensor activations, Tensor weights, Tensor? bias, Tensor "
       "total_rows_for_experts, int n_experts, int activation_type, bool fuse_act, float gemm1_alpha=1.702, float "
       "gemm1_limit=7.0) -> ()");
   m.impl("moe_grouped_mm_nt_xe20", torch::kXPU, &moe_grouped_mm_nt_xe20);
 
   m.def(
-      "moe_grouped_mm_nt_xe20_mxfp4_w4a16(Tensor output, Tensor activations, Tensor packed_weights, Tensor scales, "
+      "moe_grouped_mm_nt_xe20_mxfp4_w4a16(Tensor! output, Tensor activations, Tensor packed_weights, Tensor scales, "
       "Tensor? bias, Tensor total_rows_for_experts, int n_experts, int activation_type, bool fuse_act, "
       "float gemm1_alpha=1.702, float gemm1_limit=7.0) -> ()");
   m.impl("moe_grouped_mm_nt_xe20_mxfp4_w4a16", torch::kXPU, &moe_grouped_mm_nt_xe20_mxfp4_w4a16);
 
   m.def(
-      "prepare_moe_input(Tensor topk_ids, Tensor expert_offsets, Tensor? blockscale_offsets, Tensor problem_sizes1,"
-      " Tensor problem_sizes2, Tensor input_permutation, Tensor output_permutation, int num_experts, int n, int k) -> "
-      "()");
+      "prepare_moe_input(Tensor topk_ids, Tensor! expert_offsets, Tensor? blockscale_offsets, Tensor! problem_sizes1,"
+      " Tensor! problem_sizes2, Tensor! input_permutation, Tensor! output_permutation, int num_experts, int n, int k)"
+      " -> ()");
   m.impl("prepare_moe_input", torch::kXPU, &prepare_moe_input);
-  m.def("scatter_tokens_to_experts(Tensor input, Tensor src2dst_map, Tensor output) -> ()");
+  m.def("scatter_tokens_to_experts(Tensor input, Tensor src2dst_map, Tensor! output) -> ()");
   m.impl("scatter_tokens_to_experts", torch::kXPU, &scatter_tokens_to_experts);
   m.def(
-      "apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, float routed_scaling_factor, Tensor? "
+      "apply_shuffle_mul_sum(Tensor input, Tensor! output, Tensor permutation, float routed_scaling_factor, Tensor? "
       "factors) -> ()");
   m.impl("apply_shuffle_mul_sum", torch::kXPU, &apply_shuffle_mul_sum);
 

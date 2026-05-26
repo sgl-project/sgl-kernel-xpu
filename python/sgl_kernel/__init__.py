@@ -51,6 +51,7 @@ from sgl_kernel.gemm import (
     sgl_per_token_quant_fp8,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
+from sgl_kernel.lora import embedding_lora_a_fwd
 from sgl_kernel.mhc import hc_split_sinkhorn
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,

@@ -340,15 +340,16 @@ def generate_qkv(
     Arguments:
         q: (batch_size, seqlen_q, nheads, d)
         k: (batch_size, seqlen_k, nheads_k, d)
-        v: (batch_size, seqlen_k, nheads_k, d)
+        v: (batch_size, seqlen_k, nheads_k, dv), where dv may differ from d
         query_padding_mask: (batch_size, seqlen), bool
         key_padding_mask: (batch_size, seqlen), bool
     """
     assert not (kvpacked and qkvpacked)
     batch_size, seqlen_q, nheads, d = q.shape
     _, seqlen_k, nheads_k, _ = k.shape
+    dv = v.shape[-1]
     assert k.shape == (batch_size, seqlen_k, nheads_k, d)
-    assert v.shape == (batch_size, seqlen_k, nheads_k, d)
+    assert v.shape == (batch_size, seqlen_k, nheads_k, dv)
     if query_unused_mask is not None or key_unused_mask is not None:
         assert not kvpacked
         assert not qkvpacked
@@ -1530,7 +1531,7 @@ def _generate_block_kvcache(
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128])
 # @pytest.mark.parametrize("d", COMPILED_HDIMS)
-@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("d", [128, 192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [

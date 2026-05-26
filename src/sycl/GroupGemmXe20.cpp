@@ -145,10 +145,7 @@ DECLARE_XE20_MOE_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
         DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::SWIGLU_GPT_OSS, FuseAct, WithBias, __VA_ARGS__); \
         break;                                                                                        \
       case 3:                                                                                         \
-        /* RELU2 only supports unfused activation path (FuseAct=false).                               \
-         * Fused RELU2 is not yet implemented in the kernel mainloop.                                 \
-         * Force FuseAct to false to ensure correct results and avoid unnecessary instantiations. */  \
-        DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::RELU2, false, WithBias, __VA_ARGS__);            \
+        DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::RELU2, FuseAct, false, __VA_ARGS__);             \
         break;                                                                                        \
       default:                                                                                        \
         TORCH_CHECK(false, "Unsupported activation type");                                            \
@@ -182,7 +179,11 @@ void moe_grouped_mm_nt_xe20(
       weights_shape[0] == total_rows_for_experts.size(0),
       "rows_for_experts must have the same size as the first dimension of weights");
   TORCH_CHECK(output.sizes()[0] == total_m, "output must have the same number of rows as activations");
-  if (fuse_act) {
+  // For fused activation:
+  // - Gated activations (SILU, GELU, SWIGLU): output has N/2 columns (gate * up fusion)
+  // - Non-gated RELU2: output has N columns (single GEMM with fused activation)
+  bool is_fused_non_gated_relu2 = (fuse_act && activation_type == static_cast<int64_t>(ActivationType::RELU2));
+  if (fuse_act && !is_fused_non_gated_relu2) {
     TORCH_CHECK(output.sizes()[1] == gemm_n / 2, "output must have half the number of columns as activations");
   } else {
     TORCH_CHECK(output.sizes()[1] == gemm_n, "output must have the same number of columns as activations");
@@ -192,6 +193,10 @@ void moe_grouped_mm_nt_xe20(
     TORCH_CHECK(
         bias->scalar_type() == at::kFloat,
         "moe_grouped_mm_nt_xe20: bias must be float32 (at::kFloat) to match kernel expectations");
+
+    // TODO this is only for binary size consideration, if needed, can remove it
+    TORCH_CHECK(
+        activation_type != static_cast<int>(ActivationType::RELU2), "RELU2 activation only supports no bias as of now");
   }
   TORCH_CHECK(
       activations.scalar_type() == weights.scalar_type(), "activations and weights must have the same data type");

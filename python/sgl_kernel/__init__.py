@@ -24,6 +24,7 @@ from sgl_kernel.elementwise import (
     fused_add_rmsnorm,
     fused_qk_norm_rope,
     fused_qk_rope,
+    fused_qk_rope_with_cos_sin_cache_inplace,
     gelu_and_mul,
     gelu_tanh_and_mul,
     gemma_fused_add_rmsnorm,
@@ -50,6 +51,7 @@ from sgl_kernel.gemm import (
     sgl_per_token_quant_fp8,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
+from sgl_kernel.lora import embedding_lora_a_fwd
 from sgl_kernel.mhc import hc_split_sinkhorn
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,

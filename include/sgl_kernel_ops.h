@@ -181,6 +181,13 @@ void fused_qk_rope(
     double high,
     double attention_factor,
     int64_t rotary_dim);
+void fused_qk_rope_with_cos_sin_cache_inplace(
+    at::Tensor& query,
+    at::Tensor& key,
+    at::Tensor& cos_sin_cache,
+    at::Tensor& positions,
+    int64_t rope_dim,
+    bool is_neox);
 void sgl_per_token_group_quant_fp4(
     at::Tensor input, at::Tensor output_q, at::Tensor output_s, int64_t group_size, double eps);
 }  // namespace at::native::xpu
@@ -608,3 +615,18 @@ void qserve_w4a8_per_group_gemm(
     torch::Tensor& _out_feats);
 
 std::tuple<int64_t, int64_t> query_device(int64_t device_index = -1);
+
+/*
+ * From LoRA
+ */
+void embedding_lora_a_fwd(
+    torch::Tensor& output,           // [num_tokens, max_rank]
+    const torch::Tensor& input_ids,  // [num_tokens,]
+    const torch::Tensor& weights,    // [num_loras, max_rank, vocab_size]
+    const int64_t vocab_size,
+    const torch::Tensor& seg_indptr,                       // [num_segments + 1,]
+    const torch::Tensor& weight_indices,                   // [num_segments,]
+    const torch::Tensor& lora_ranks,                       // [num_loras,]
+    const std::optional<torch::Tensor>& extra_embeddings,  // [num_loras, num_extra_tokens, max_rank]
+    const std::optional<torch::Tensor>& seg_lens           // [num_segments,]
+);

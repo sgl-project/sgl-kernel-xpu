@@ -297,8 +297,15 @@ class FlashChunkPrefillEpilogue<
     }
     auto store_traits = static_cast<traits_store_O const&>(params.xe_store_o);
     ElementO* base_ptr = (ElementO*)store_traits.base_ptr;
-    auto shape_o = make_shape(static_cast<int>(seq_len_qo), num_heads_q * head_size_vo, 1);
-    StrideO stride_o = cutlass::make_cute_packed_stride(StrideO{}, shape_o);
+    // Use single-head width for O surface so that when TileShapeOutput_N > head_size_vo
+    // (asymmetric head dim), OOB stores are dropped by hardware instead of
+    // overwriting adjacent head output data.
+    // Pitch must remain num_heads_q * head_size_vo (physical stride between seq positions).
+    auto shape_o = make_shape(static_cast<int>(seq_len_qo), static_cast<int>(head_size_vo), 1);
+    StrideO stride_o = make_stride(
+        static_cast<int64_t>(num_heads_q * head_size_vo),
+        cute::Int<1>{},
+        static_cast<int64_t>(num_heads_q * head_size_vo) * static_cast<int64_t>(seq_len_qo));
     auto tensorO = make_tensor(make_gmem_ptr(base_ptr + offset_o), make_layout(shape_o, stride_o));
     XE_Copy_O xe_store_o{XE_Copy_O{}.with(tensorO)};
     return Params{xe_store_o, params.ptr_sink};

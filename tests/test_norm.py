@@ -379,5 +379,110 @@ def test_gemma_norm_3d_non_flattenable(
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
+###############################################################################
+# Mixed input/weight dtype tests
+###############################################################################
+
+
+@pytest.mark.parametrize("batch_size", [1, 19])
+@pytest.mark.parametrize("hidden_size", [512, 1024, 4096])
+@pytest.mark.parametrize(
+    "input_dtype,weight_dtype",
+    [
+        (torch.float16, torch.float32),
+        (torch.bfloat16, torch.float32),
+    ],
+)
+def test_norm_mixed_dtype(batch_size, hidden_size, input_dtype, weight_dtype):
+    x = torch.randn(batch_size, hidden_size, device=device, dtype=input_dtype)
+    w = torch.randn(hidden_size, device=device, dtype=weight_dtype)
+
+    y_ref = llama_rms_norm(x, w)
+    y = sgl_kernel.rmsnorm(x, w)
+
+    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [1, 19])
+@pytest.mark.parametrize("hidden_size", [512, 1024, 4096])
+@pytest.mark.parametrize(
+    "input_dtype,weight_dtype",
+    [
+        (torch.float16, torch.float32),
+        (torch.bfloat16, torch.float32),
+    ],
+)
+def test_fused_add_rmsnorm_mixed_dtype(
+    batch_size, hidden_size, input_dtype, weight_dtype
+):
+    eps = 1e-6
+
+    x = torch.randn(batch_size, hidden_size, dtype=input_dtype, device=device)
+    residual = torch.randn_like(x)
+    weight = torch.randn(hidden_size, dtype=weight_dtype, device=device)
+
+    x_native, residual_native = fused_add_rms_norm(
+        x.clone(), residual.clone(), weight, eps
+    )
+
+    x_fused = x.clone()
+    residual_fused = residual.clone()
+    sgl_kernel.fused_add_rmsnorm(x_fused, residual_fused, weight, eps)
+
+    tol = 1e-2 if input_dtype == torch.bfloat16 else 1e-3
+    torch.testing.assert_close(x_fused, x_native, rtol=tol, atol=tol)
+    torch.testing.assert_close(residual_fused, residual_native, rtol=tol, atol=tol)
+
+
+@pytest.mark.parametrize("batch_size", [1, 19])
+@pytest.mark.parametrize("hidden_size", [512, 1024, 4096])
+@pytest.mark.parametrize(
+    "input_dtype,weight_dtype",
+    [
+        (torch.float16, torch.float32),
+        (torch.bfloat16, torch.float32),
+    ],
+)
+def test_gemma_norm_mixed_dtype(batch_size, hidden_size, input_dtype, weight_dtype):
+    x = torch.randn(batch_size, hidden_size, device=device, dtype=input_dtype)
+    w = torch.randn(hidden_size, device=device, dtype=weight_dtype)
+
+    y_ref = gemma_rms_norm(x, w)
+    y = sgl_kernel.gemma_rmsnorm(x, w)
+
+    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [1, 19])
+@pytest.mark.parametrize("hidden_size", [512, 1024, 4096])
+@pytest.mark.parametrize(
+    "input_dtype,weight_dtype",
+    [
+        (torch.float16, torch.float32),
+        (torch.bfloat16, torch.float32),
+    ],
+)
+def test_gemma_fused_add_rmsnorm_mixed_dtype(
+    batch_size, hidden_size, input_dtype, weight_dtype
+):
+    eps = 1e-6
+
+    x = torch.randn(batch_size, hidden_size, dtype=input_dtype, device=device)
+    residual = torch.randn_like(x)
+    weight = torch.randn(hidden_size, dtype=weight_dtype, device=device)
+
+    x_native, residual_native = gemma_fused_add_rms_norm(
+        x.clone(), residual.clone(), weight, eps
+    )
+
+    x_fused = x.clone()
+    residual_fused = residual.clone()
+    sgl_kernel.gemma_fused_add_rmsnorm(x_fused, residual_fused, weight, eps)
+
+    tol = 1e-2 if input_dtype == torch.bfloat16 else 1e-3
+    torch.testing.assert_close(x_fused, x_native, rtol=tol, atol=tol)
+    torch.testing.assert_close(residual_fused, residual_native, rtol=tol, atol=tol)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

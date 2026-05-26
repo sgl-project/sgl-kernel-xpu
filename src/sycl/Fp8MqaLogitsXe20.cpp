@@ -18,16 +18,23 @@ limitations under the License.
 // + lightweight reduction kernel for ReLU + weighted head sum + scaling.
 // Naive SYCL fallback for small problem sizes.
 
+#define SYCL_INTEL_TARGET 20
+
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include "kernels/nsa/fp8_mqa_gemm_xe20.hpp"
 #include "kernels/nsa/fp8_mqa_logits_kernel.hpp"
 
-// SYCL-TLA FP8 GEMM: D(M,N) = A_fp8(M,K) @ B_fp8(K,N) in f32.
-// B must be in (K,N) row-major layout (N contiguous).
-extern int
-fp8_mqa_gemm_xe20(sycl::queue* queue_ptr, const void* A_fp8, const void* B_fp8, void* D_f32, int M, int N, int K);
+// Thin launcher for the custom FP8 MQA GEMM on Intel BMG (Xe20).
+// The kernel implementation is in kernels/nsa/fp8_mqa_gemm_xe20.hpp.
+// D(M,N) = A_fp8(M,K) @ B_fp8(N,K)^T, all uint8 fp8 inputs, float32 output.
+// B is in (N,K) layout with K contiguous — no host-side transpose needed.
+// Returns 0 on success, non-zero if dimensions are not tile-aligned.
+int fp8_mqa_gemm_xe20(sycl::queue* queue_ptr, const void* A_fp8, const void* B_fp8, void* D_f32, int M, int N, int K) {
+  return nsa::fp8_mqa_gemm_launch(queue_ptr, A_fp8, B_fp8, D_f32, M, N, K);
+}
 
 namespace {
 
@@ -49,7 +56,7 @@ void launch_2d_kernel(sycl::queue& queue, Kernel& kernel, int dim0, int dim1) {
 }
 
 // FP8 GEMM via SYCL-TLA: D(M,N) = A(M,K) @ B(N,K)^T in f32.
-// Handles transposing B from (N,K) to (K,N) for CUTLASS.
+// B is passed directly in (N,K) layout — no host-side transpose needed.
 at::Tensor fp8_gemm_xe20(
     sycl::queue& queue,
     const at::Tensor& a_uint8,  // (M, K) uint8 containing fp8 e4m3
@@ -57,16 +64,13 @@ at::Tensor fp8_gemm_xe20(
     int M,
     int N,
     int K) {
-  // CUTLASS expects B in (K,N) row-major. Input is (N,K) row-major → transpose.
-  auto b_transposed = b_uint8.view({N, K}).t().contiguous();  // (K, N)
-
   auto D = torch::zeros({M, N}, torch::dtype(torch::kFloat32).device(a_uint8.device()));
 
-  int rc = fp8_mqa_gemm_xe20(
-      &queue, a_uint8.data_ptr<uint8_t>(), b_transposed.data_ptr<uint8_t>(), D.data_ptr<float>(), M, N, K);
+  int rc =
+      fp8_mqa_gemm_xe20(&queue, a_uint8.data_ptr<uint8_t>(), b_uint8.data_ptr<uint8_t>(), D.data_ptr<float>(), M, N, K);
 
   if (rc != 0) {
-    // Fallback to torch::mm if SYCL-TLA can_implement fails (e.g. size not aligned)
+    // Fallback to torch::mm if dimensions are not tile-aligned
     auto a_fp8 = a_uint8.view({M, K}).view(at::ScalarType::Float8_e4m3fn);
     auto b_fp8 = b_uint8.view({N, K}).view(at::ScalarType::Float8_e4m3fn);
     auto a_bf16 = a_fp8.to(at::ScalarType::BFloat16);
@@ -255,3 +259,5 @@ torch::Tensor fp8_paged_mqa_logits(
   launch_2d_kernel(queue, paged_kernel, B_next, msl);
   return logits;
 }
+
+#undef SYCL_INTEL_TARGET

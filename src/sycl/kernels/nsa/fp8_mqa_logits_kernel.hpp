@@ -54,9 +54,15 @@ inline float load_le_f32(const uint8_t* p) {
   return *reinterpret_cast<const float*>(&bits);
 }
 
-// FP8 MQA logits kernel (prefill/extend path)
-// q: (Nq, H, D) fp8 e4m3
-// k: (Nk, D) fp8 e4m3
+// FP8 MQA logits kernel (prefill/extend path — naive fallback)
+//
+// Math: For each query i and kv position j in [ks[i], ke[i]):
+//   score[i,j] = k_scale[j] * Σ_h ReLU( Σ_d q[i,h,d] · k[j,d] ) * weights[i,h]
+//
+// where q and k are fp8_e4m3, converted to float for the dot product.
+//
+// q: (Nq, H, D) fp8_e4m3
+// k: (Nk, D) fp8_e4m3
 // k_scale: (Nk,) float32
 // weights: (Nq, H) float32
 // ks: (Nq,) int32 — start index per query
@@ -105,8 +111,9 @@ struct Fp8MqaLogitsKernel {
   }
 };
 
-// Paged FP8 MQA logits kernel (decode path)
-// q: (B, 1, H, D) fp8 e4m3  — flattened as (B*1*H*D) uint8
+// Paged FP8 MQA logits kernel (decode path — naive fallback)
+//
+// q: (B, 1, H, D) fp8_e4m3  — flattened as (B*1*H*D) uint8
 // kv_cache: (num_pages, page_size, 1, head_dim_with_sf) uint8
 //           head_dim_with_sf = D + 4 (128 fp8 bytes + 4 bytes float32 scale)
 // weights: (B, H) float32
@@ -114,7 +121,7 @@ struct Fp8MqaLogitsKernel {
 // block_tables: (B, max_num_blocks) int32
 // out: (B, max_seq_len) float32 — must be pre-zeroed for out-of-range positions
 //
-// For each batch b, for each kv position j < seq_lens[b]:
+// Math: For each batch b, for each kv position j < seq_lens[b]:
 //   page_idx = block_tables[b, j / page_size]
 //   token_in_page = j % page_size
 //   k_fp8 = kv_cache[page_idx, token_in_page, 0, :D]
@@ -171,8 +178,12 @@ struct Fp8PagedMqaLogitsKernel {
   }
 };
 
-// Reduction kernel for SYCL-TLA optimized path.
-// Takes GEMM output dots(Nq*H, Nk) and reduces across H heads with ReLU + weights.
+// Reduction kernel for SYCL-TLA optimized prefill path.
+//
+// Math: Given GEMM output dots[i,h,j] = Σ_d q[i,h,d] · k[j,d] for all heads h,
+// reduces across heads with ReLU gating and per-token scaling:
+//   score[i,j] = k_scale[j] * Σ_h ReLU(dots[i,h,j]) * weights[i,h]
+//
 // dots: (Nq, H, Nk) float32 — reshaped GEMM output
 // weights: (Nq, H) float32
 // k_scale: (Nk,) float32
@@ -207,7 +218,13 @@ struct Fp8MqaLogitsReduceKernel {
 };
 
 // Gather kernel: extracts FP8 keys and scales from paged KV cache
-// into contiguous buffers for GEMM.
+// into contiguous buffers for the SYCL-TLA GEMM path.
+//
+// Each KV cache token is stored as D bytes of FP8 key data followed by
+// 4 bytes of float32 per-token scale (total: D+4 bytes per token).
+// This kernel linearizes the paged layout into contiguous (B*max_seq_len, D) keys
+// and (B, max_seq_len) scales for efficient GEMM.
+//
 // kv_cache: (num_pages, page_size, 1, D+4) uint8
 // block_tables: (B, max_num_blocks) int32
 // seq_lens: (B,) int32
@@ -253,7 +270,12 @@ struct PagedKGatherKernel {
   }
 };
 
-// Reduction kernel for paged path (after batched GEMM).
+// Reduction kernel for paged decode path (after batched GEMM).
+//
+// Math: Same as Fp8MqaLogitsReduceKernel but for the paged decode case:
+//   score[b,j] = k_scale[b,j] * Σ_h ReLU(dots[b,h,j]) * weights[b,h]
+// where j < seq_lens[b].
+//
 // dots: (B, H, max_seq_len) float32
 // weights: (B, H) float32
 // k_scale: (B, max_seq_len) float32

@@ -148,48 +148,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("flash_mla_decode", torch::kXPU, &flash_mla_decode);
 
   /*
-   * From cutlass attention
-   */
-  m.def(
-      "fwd(Tensor   q,"
-      "    Tensor   k,"
-      "    Tensor   v,"
-      "    Tensor?  q_v,"
-      "    Tensor  cu_seqlens_q,"
-      "    Tensor  cu_seqlens_k,"
-      "    int     max_seqlen_q,"
-      "    int     max_seqlen_k,"
-      "    Tensor?  page_table,"
-      "    Tensor?  kv_batch_idx,"
-      "    Tensor?  leftpad_k,"
-      "    Tensor?  rotary_cos,"
-      "    Tensor?  rotary_sin,"
-      "    Tensor?  seqlens_rotary,"
-      "    Tensor?  q_descale,"
-      "    Tensor?  k_descale,"
-      "    Tensor?  v_descale,"
-      "    float    softmax_scale,"
-      "    Tensor?  sinks,"
-      "    bool     is_causal,"
-      "    int      window_size_left,"
-      "    int      window_size_right,"
-      "    float    softcap,"
-      "    bool     is_rotary_interleaved,"
-      "    Tensor?  scheduler_metadata,"
-      "    int      num_kv_splits,"
-      "    bool?    pack_gqa,"
-      "    int      sm_margin) -> Tensor[]");
-  m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
-
-  m.def("flash_mla_get_workspace_size", &flash_mla_get_workspace_size);
-
-  m.def(
-      "flash_mla_decode(Tensor! out, Tensor! q_nope, Tensor! q_pe, Tensor! kv_c_and_k_pe_cache, Tensor! seq_lens, "
-      "Tensor! "
-      "page_table, Tensor! workspace, float sm_scale, int num_kv_splits) -> ()");
-  m.impl("flash_mla_decode", torch::kXPU, &flash_mla_decode);
-
-  /*
    * From quantization ops
    */
   m.def(

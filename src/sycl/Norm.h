@@ -1,6 +1,8 @@
 #include <ATen/ATen.h>
 #include <ATen/core/Array.h>
 
+#include <type_traits>
+
 #include "MemoryAccess.h"
 #include "comm/AccumulateType.h"
 #include "comm/Numerics.h"
@@ -114,7 +116,8 @@ class NormConfig {
       int input_inner_size = 1,
       int input_inner_stride = 0,
       int output_inner_size = 1,
-      int output_inner_stride = 0)
+      int output_inner_stride = 0,
+      bool single_wg_per_row = false)
       : Batch(Batch),
         Plane(Plane),
         problem_dim(problem_dim),
@@ -128,14 +131,53 @@ class NormConfig {
     semaphores_ptr = nullptr;
     scratchpad_ptr = nullptr;
     sub_group_num_global = 1;
+    update_vec_size = 1;
 
-    get_max_vec_size();
-    if (problem_dim == 1) {
-      get_workgroup_size();
-      WGPlane = (Plane + workgroup_num_foreach - 1) / workgroup_num_foreach;
+    if (single_wg_per_row) {
+      // Each WG processes one full row independently. WG sizing is deferred
+      // to get_workgroup_size_single_wg_per_row() after vec_size is determined.
+      workgroup_num = Batch;
+      workgroup_num_foreach = 1;
+      WGPlane = Plane;
     } else {
-      get_workgroup_size_row();
+      get_max_vec_size();
+      if (problem_dim == 1) {
+        get_workgroup_size();
+        WGPlane = (Plane + workgroup_num_foreach - 1) / workgroup_num_foreach;
+      } else {
+        get_workgroup_size_row();
+      }
     }
+  }
+
+  template <
+      typename GetUpdateVecSizeFn,
+      typename = std::enable_if_t<std::is_invocable_r_v<int, GetUpdateVecSizeFn, int, int>>>
+  NormConfig(
+      int Batch,
+      int Plane,
+      int problem_dim,
+      int element_size_bytes,
+      int input_batch_stride,
+      int output_batch_stride,
+      GetUpdateVecSizeFn get_update_vec_size,
+      int input_inner_size = 1,
+      int input_inner_stride = 0,
+      int output_inner_size = 1,
+      int output_inner_stride = 0)
+      : NormConfig(
+            Batch,
+            Plane,
+            problem_dim,
+            element_size_bytes,
+            input_batch_stride,
+            output_batch_stride,
+            input_inner_size,
+            input_inner_stride,
+            output_inner_size,
+            output_inner_stride,
+            /*single_wg_per_row=*/true) {
+    get_workgroup_size_single_wg_per_row(get_update_vec_size);
   }
 
   int Batch;
@@ -150,6 +192,7 @@ class NormConfig {
   int workgroup_num_foreach;
   int workgroup_size;
   int sub_group_num;
+  int update_vec_size;
 
   int input_batch_stride;
   int output_batch_stride;
@@ -263,6 +306,55 @@ class NormConfig {
     block_row = max_workgroup_size / workgroup_size;
 
     workgroup_num = (Plane + workgroup_size * max_vec_size - 1) / (workgroup_size * max_vec_size);
+  }
+
+  // Configure workgroup sizing where each workgroup processes one full row
+  // (workgroup_num = Batch, workgroup_num_foreach = 1).
+  // Strategy:
+  //   - Small Batch: use max WG size for highest per-row parallelism (low iters).
+  //   - Large Batch: reduce WG size to improve WG occupancy, subject
+  //     to keeping iters within max_cached_iters to avoid register spills.
+  //   - If reduce size is too large (iters > max_cached_iters at max WG), the
+  //     caller should fallback to a non-cached (reload) implementation.
+  //   - The vec_size policy is provided by callback to keep per-kernel
+  //     alignment rules close to the corresponding forward functor.
+  template <typename GetUpdateVecSizeFn>
+  void get_workgroup_size_single_wg_per_row(GetUpdateVecSizeFn get_update_vec_size, int max_cached_iters = 8) {
+    constexpr int float4_size = sizeof(float) * 4;
+    max_vec_size = float4_size / element_size_bytes;
+    update_vec_size = get_update_vec_size(WGPlane, max_vec_size);
+    while (update_vec_size > 1 && (Plane / update_vec_size) < NUM_REDUCE_STAGES) {
+      update_vec_size = update_vec_size >> 1;
+    }
+
+    auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
+    int max_wg_size = static_cast<int>(dpcppMaxWorkGroupSize(dev_id));
+    if constexpr (NUM_REDUCE_STAGES == 16) {
+      // See the note of max_workgroup_size in get_workgroup_size
+      max_wg_size = std::min(max_wg_size, 512);
+    }
+    int total_resource = static_cast<int>(dpcppMaxWorkItemsPerTile(dev_id)) /
+                         static_cast<int>(dpcppMaxSubGroupSize(dev_id)) * NUM_REDUCE_STAGES;
+
+    // Start with the smallest WG that covers all vector lanes, capped at max.
+    int plane_vecs = (Plane + update_vec_size - 1) / update_vec_size;
+    workgroup_size = (plane_vecs + NUM_REDUCE_STAGES - 1) / NUM_REDUCE_STAGES * NUM_REDUCE_STAGES;
+    workgroup_size = std::min(workgroup_size, max_wg_size);
+
+    int iters = (WGPlane + workgroup_size * update_vec_size - 1) / (workgroup_size * update_vec_size);
+
+    // Reduce WG size to improve occupancy: only when the device cannot concurrently
+    // hold half the batch at the current WG size. Floor at 4 subgroups (64
+    // work-items) to maintain adequate per-row reduction throughput — below
+    // this each WG has too few SIMD threads to utilize XVEs effectively.
+    while ((iters << 1) <= max_cached_iters && (total_resource / workgroup_size) < (Batch >> 1) &&
+           (workgroup_size >> 1) >= NUM_REDUCE_STAGES * 4) {
+      workgroup_size = workgroup_size >> 1;
+      iters = (WGPlane + workgroup_size * update_vec_size - 1) / (workgroup_size * update_vec_size);
+    }
+
+    workgroup_size = std::max(workgroup_size, NUM_REDUCE_STAGES);
+    sub_group_num = workgroup_size / NUM_REDUCE_STAGES;
   }
 };
 

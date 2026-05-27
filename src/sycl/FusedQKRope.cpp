@@ -397,6 +397,14 @@ void fused_qk_rope(
 #undef FUSED_QK_ROPE_LAUNCH_ARGS
 }
 
+[[maybe_unused]]
+constexpr auto next_pow2(uint32_t target, uint32_t factor = 1) {
+  uint32_t power = 1;
+  while (power * factor < target)
+    power *= 2;
+  return power;
+}
+
 template <bool is_neox, int64_t rope_dim, typename scalar_t, typename pos_t>
 struct FusedRopeCacheKernel {
   scalar_t* query;
@@ -427,6 +435,20 @@ struct FusedRopeCacheKernel {
     const int64_t num_works = num_tokens * num_qk_heads;
     constexpr int64_t half_rope = rope_dim / 2;
 
+    constexpr int requested_vec_size = next_pow2(rope_dim, (2 * sg_size * (1 + is_neox)));
+    // Non-neox uses vec2_t (2 * vec_size lanes), and sycl::vec lane count is
+    // limited to 16 on the currently, so cap vec_size at 8.
+    constexpr int vec_size = is_neox ? requested_vec_size : (requested_vec_size > 8 ? 8 : requested_vec_size);
+    static_assert(is_neox || vec_size <= 8, "non-neox requires vec_size <= 8 because vec2_t uses 2 * vec_size lanes");
+
+    using storage_t = std::conditional_t<
+        std::is_same_v<scalar_t, c10::Half>,
+        sycl::half,
+        sycl::ext::oneapi::bfloat16>;  // fallback is bf16 since only 2 types supported
+
+    using vec_t = sycl::vec<storage_t, vec_size>;
+    using vec2_t = sycl::vec<storage_t, vec_size * 2>;  // for interleave pairs
+
     for (int64_t idx = worker_id; idx < num_works; idx += total_workers) {
       const int64_t token_id = idx / num_qk_heads;
       const int64_t head_id = idx % num_qk_heads;
@@ -447,27 +469,54 @@ struct FusedRopeCacheKernel {
       const scalar_t* cos_ptr = cos_sin_cache + pos * cache_stride;
       const scalar_t* sin_ptr = cos_ptr + half_rope;
 
+      // Reinterpret scalar_t* as storage_t* for vectorized load/store.
+      // Safe: c10::Half and sycl::half share identical IEEE binary16 layout;
+      //       same holds for c10::BFloat16 and sycl::ext::oneapi::bfloat16.
+      auto* base_sptr = reinterpret_cast<storage_t*>(base_ptr);
+      auto* cos_sptr = reinterpret_cast<const storage_t*>(cos_ptr);
+      auto* sin_sptr = reinterpret_cast<const storage_t*>(sin_ptr);
+
       if constexpr (is_neox) {
+        auto* x_sptr = base_sptr;
+        auto* y_sptr = base_sptr + half_rope;
+
 #pragma unroll
-        for (int64_t i = lane_id; i < half_rope; i += sg_size) {
-          const scalar_t x = base_ptr[i];
-          const scalar_t y = base_ptr[i + half_rope];
-          const scalar_t c = cos_ptr[i];
-          const scalar_t s = sin_ptr[i];
-          base_ptr[i] = x * c - y * s;
-          base_ptr[i + half_rope] = x * s + y * c;
+        for (int64_t i = lane_id * vec_size; i < half_rope; i += sg_size * vec_size) {
+          vec_t x_vec = *reinterpret_cast<const vec_t*>(x_sptr + i);
+          vec_t y_vec = *reinterpret_cast<const vec_t*>(y_sptr + i);
+          vec_t c_vec = *reinterpret_cast<const vec_t*>(cos_sptr + i);
+          vec_t s_vec = *reinterpret_cast<const vec_t*>(sin_sptr + i);
+          vec_t out_x, out_y;
+
+#pragma unroll
+          for (int j = 0; j < vec_size; j++) {
+            const storage_t x = x_vec[j];
+            const storage_t y = y_vec[j];
+            const storage_t c = c_vec[j];
+            const storage_t s = s_vec[j];
+            out_x[j] = x * c - y * s;
+            out_y[j] = x * s + y * c;
+          }
+          *reinterpret_cast<vec_t*>(x_sptr + i) = out_x;
+          *reinterpret_cast<vec_t*>(y_sptr + i) = out_y;
         }
       } else {
 #pragma unroll
-        for (int64_t i = lane_id; i < half_rope; i += sg_size) {
-          const int64_t x_idx = 2 * i;
-          const int64_t y_idx = 2 * i + 1;
-          const scalar_t x = base_ptr[x_idx];
-          const scalar_t y = base_ptr[y_idx];
-          const scalar_t c = cos_ptr[i];
-          const scalar_t s = sin_ptr[i];
-          base_ptr[x_idx] = x * c - y * s;
-          base_ptr[y_idx] = x * s + y * c;
+        for (int64_t i = lane_id * vec_size; i < half_rope; i += sg_size * vec_size) {
+          vec2_t v = *reinterpret_cast<const vec2_t*>(base_sptr + 2 * i);
+          vec_t c_vec = *reinterpret_cast<const vec_t*>(cos_sptr + i);
+          vec_t s_vec = *reinterpret_cast<const vec_t*>(sin_sptr + i);
+
+#pragma unroll
+          for (int j = 0; j < vec_size; j++) {
+            const storage_t x = v[2 * j];
+            const storage_t y = v[2 * j + 1];
+            const storage_t c = c_vec[j];
+            const storage_t s = s_vec[j];
+            v[2 * j] = x * c - y * s;
+            v[2 * j + 1] = x * s + y * c;
+          }
+          *reinterpret_cast<vec2_t*>(base_sptr + 2 * i) = v;
         }
       }
     }

@@ -2,7 +2,7 @@
 # Each HEAD_DIM is compiled as a separate translation unit to parallelize
 # and speed up compilation.
 
-set(FMHA_PREFILL_HEAD_DIMS 64 96 128 192 256 512)
+set(FMHA_PREFILL_HEAD_DIMS 64 72 96 128 192 256 512)
 
 set(FMHA_PREFILL_TEMPLATE
     "${CMAKE_CURRENT_SOURCE_DIR}/sycl/xe_fmha_fwd_prefill_kernel.cpp.in")
@@ -11,6 +11,10 @@ set(FMHA_PREFILL_TEMPLATE
 set(FMHA_PREFILL_TILED_Q_64 128)
 set(FMHA_PREFILL_TILED_KV_64 64)
 set(FMHA_PREFILL_NUM_SG_64 8)
+
+set(FMHA_PREFILL_TILED_Q_72 128)
+set(FMHA_PREFILL_TILED_KV_72 64)
+set(FMHA_PREFILL_NUM_SG_72 8)
 
 set(FMHA_PREFILL_TILED_Q_96 128)
 set(FMHA_PREFILL_TILED_KV_96 64)

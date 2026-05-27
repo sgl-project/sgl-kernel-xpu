@@ -695,13 +695,17 @@ std::vector<at::Tensor> mha_fwd(
   at::Tensor out_accum, softmax_lse_accum;
 
   TORCH_CHECK(
-      params.d == 64 || params.d == 96 || params.d == 128 || params.d == 192 || params.d == 256 || params.d == 512,
+      params.d == 64 || params.d == 72 || params.d == 96 || params.d == 128 || params.d == 192 || params.d == 256 ||
+          params.d == 512,
       "Unsupported head size for prefill attention: ",
       params.d);
 
   switch (params.d) {
     case 64:
       DISPATCH_PREFILL_KERNEL(64);
+      break;
+    case 72:
+      DISPATCH_PREFILL_KERNEL(72);
       break;
     case 96:
       DISPATCH_PREFILL_KERNEL(96);

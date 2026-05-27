@@ -732,7 +732,7 @@ std::vector<at::Tensor> mha_fwd(
           ChunkPrefillConfig<
               cute::Shape<_128, _64, _32>,
               cute::Shape<_128, _32, _64>,
-              cute::Shape<_128, _92, _64>,
+              cute::Shape<_128, _72, _64>,
               cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
               PipelineStages,
               true,
@@ -746,7 +746,7 @@ std::vector<at::Tensor> mha_fwd(
               ChunkPrefillConfig<
                   cute::Shape<_128, _64, _32>,
                   cute::Shape<_128, _32, _64>,
-                  cute::Shape<_128, _92, _64>,
+                  cute::Shape<_128, _72, _64>,
                   cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
                   PipelineStages,
                   false,

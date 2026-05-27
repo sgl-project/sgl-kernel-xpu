@@ -147,3 +147,13 @@ def hc_pre_big_fuse(
         norm_weight_arg,
         norm_eps_arg,
     )
+
+
+def hc_pre_gemm(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor):
+    """
+    HC Pre GEMM: C = A @ B
+    A: [T, K] bfloat16, row-major
+    B: [K, N] float32, column-major
+    C: [T, N] float32, row-major (output)
+    """
+    torch.ops.sgl_kernel.hc_pre_gemm.default(A, B, C)

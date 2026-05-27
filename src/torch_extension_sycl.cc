@@ -230,6 +230,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor weight_indices, "
       "Tensor lora_ranks, Tensor? extra_embeddings, Tensor? seg_lens) -> ()");
   m.impl("embedding_lora_a_fwd", torch::kXPU, &embedding_lora_a_fwd);
+
+  /* HC PRE GEMM */
+  m.def("hc_pre_gemm(Tensor A, Tensor B, Tensor! C) -> ()");
+  m.impl("hc_pre_gemm", torch::kXPU, &hc_pre_gemm);
 }
 
 REGISTER_EXTENSION(common_ops)

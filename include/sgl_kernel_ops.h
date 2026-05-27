@@ -657,3 +657,8 @@ void embedding_lora_a_fwd(
     const std::optional<torch::Tensor>& extra_embeddings,  // [num_loras, num_extra_tokens, max_rank]
     const std::optional<torch::Tensor>& seg_lens           // [num_segments,]
 );
+ 
+/*
+ * From csrc/mhc_gemm
+ */
+void hc_pre_gemm(const at::Tensor& A, const at::Tensor& B, at::Tensor& C);

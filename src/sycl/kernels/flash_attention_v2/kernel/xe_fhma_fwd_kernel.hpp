@@ -112,6 +112,10 @@ class XeFMHAFwdKernel {
 
   using ElementLSE = void;
 
+  // Sink support from epilogue
+  static constexpr bool Sink = CollectiveEpilogue::Sink;
+  using ElementSink = typename CollectiveEpilogue::ElementSink;
+
   // Kernel level shared memory storage
   using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
   using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
@@ -137,6 +141,7 @@ class XeFMHAFwdKernel {
     StrideK dK_cache{};
     const ElementV* V_cache;
     StrideV dV_cache{};
+    const ElementSink* sm_sink = nullptr;  // Per-head sink logits (nheads,), null if no sink
   };
   using KernelParams = KernelArguments;
 
@@ -337,7 +342,11 @@ class XeFMHAFwdKernel {
 
       // Epilogue
       CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
-      epilogue(O(_, _, head_q, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id);
+      if constexpr (Sink) {
+        epilogue(O(_, _, head_q, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, p.sm_sink[head_q]);
+      } else {
+        epilogue(O(_, _, head_q, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id);
+      }
     }
   }
 };

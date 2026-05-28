@@ -397,14 +397,6 @@ void fused_qk_rope(
 #undef FUSED_QK_ROPE_LAUNCH_ARGS
 }
 
-[[maybe_unused]]
-constexpr auto next_pow2(uint32_t target, uint32_t factor = 1) {
-  uint32_t power = 1;
-  while (power * factor < target)
-    power *= 2;
-  return power;
-}
-
 template <bool is_neox, int64_t rope_dim, typename scalar_t, typename pos_t>
 struct FusedRopeCacheKernel {
   scalar_t* query;

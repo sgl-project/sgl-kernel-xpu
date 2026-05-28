@@ -362,11 +362,12 @@ struct FMHAFwdMainloop<
     for (int D = 0; D < size<4>(pKgK); D++) {
       prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
     }
-    if (blk_k0 == 0) {
-      clear(tArA);
-      fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
-      clear(tA_sum);
-    }
+    // Always initialize the per-WG accumulators: the caller (kernel) may pass
+    // blk_k0 > 0 when sliding-window pruning skips leading K blocks, so we can
+    // no longer key initialization off of (blk_k0 == 0).
+    clear(tArA);
+    fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
+    clear(tA_sum);
 
     /* Check if */
     bool check_remainder_k = (seq_len % get<1>(TileShapeQK{}) != 0);

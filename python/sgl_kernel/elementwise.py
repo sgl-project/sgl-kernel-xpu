@@ -195,6 +195,35 @@ def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
     return out
 
 
+def store_cache_xpu(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,
+) -> None:
+    r"""Fused KV-cache store for XPU.
+
+    Writes K and V into the flat KV-cache at the given slot indices in a
+    single SYCL kernel launch (replacing 2x aten::_index_put_impl_).
+
+    Parameters
+    ----------
+    k : torch.Tensor
+        Key tensor, shape: ``(num_tokens, row_dim)``.
+    v : torch.Tensor
+        Value tensor, shape: ``(num_tokens, row_dim)``.
+    k_cache : torch.Tensor
+        Key cache buffer, shape: ``(cache_size, row_dim)``.
+    v_cache : torch.Tensor
+        Value cache buffer, shape: ``(cache_size, row_dim)``.
+    indices : torch.Tensor
+        Flat cache slot indices, shape: ``(num_tokens,)``, dtype int64.
+        Use -1 to skip a token.
+    """
+    torch.ops.sgl_kernel.store_cache_xpu(k, v, k_cache, v_cache, indices.long())
+
+
 def apply_rope_with_cos_sin_cache_inplace(
     positions: torch.Tensor,
     query: torch.Tensor,

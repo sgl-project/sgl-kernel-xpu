@@ -473,4 +473,203 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding(
   }
 }
 
+// ============================================================================
+// Fused RoPE + KV-cache write kernel
+// Mirrors CUDA `apply_rope_inplace_with_kvcache` from jit_kernel/rope.py:140-175.
+// Single kernel: rotates Q/K in-place (fp32 arithmetic) and writes rotated K + V
+// into the flat KV-cache at out_loc.
+// ============================================================================
+
+template <typename scalar_t, EmbeddingAlgorithm algo>
+struct FusedRopeKVCacheKernel {
+  using accscalar = at::opmath_type<scalar_t>;
+
+  void operator()(sycl::nd_item<1> item) const {
+    int32_t token_id = item.get_group(0);
+    int32_t local_id = item.get_local_id(0);
+    int32_t local_range = item.get_local_range(0);
+
+    int64_t out_idx = out_loc_[token_id];
+    if (out_idx < 0) return;  // speculative decoding skip
+
+    int64_t pos = positions_[token_id];
+    int32_t embed_dim = rot_dim_ / 2;
+
+    // cos_sin_cache is float32; index by position
+    const float* cos_cache = cos_sin_cache_ + pos * rot_dim_;
+    const float* sin_cache = cos_cache + embed_dim;
+
+    // RoPE Q in-place
+    scalar_t* q_base = query_ + token_id * num_q_heads_ * head_dim_;
+    int32_t q_work = num_q_heads_ * embed_dim;
+    for (int i = local_id; i < q_work; i += local_range) {
+      int32_t head_id = i / embed_dim;
+      int32_t rot_offset = i % embed_dim;
+      scalar_t* q_head = q_base + head_id * head_dim_;
+
+      int x_idx, y_idx;
+      float cos_val, sin_val;
+      if constexpr (algo == EmbeddingAlgorithm::RotateHalf) {
+        x_idx = rot_offset;
+        y_idx = rot_offset + embed_dim;
+        cos_val = cos_cache[rot_offset];
+        sin_val = sin_cache[rot_offset];
+      } else {
+        x_idx = 2 * rot_offset;
+        y_idx = 2 * rot_offset + 1;
+        cos_val = cos_cache[rot_offset];
+        sin_val = sin_cache[rot_offset];
+      }
+      accscalar x = static_cast<accscalar>(q_head[x_idx]);
+      accscalar y = static_cast<accscalar>(q_head[y_idx]);
+      q_head[x_idx] = static_cast<scalar_t>(x * cos_val - y * sin_val);
+      q_head[y_idx] = static_cast<scalar_t>(x * sin_val + y * cos_val);
+    }
+
+    // RoPE K in-place + write to k_cache
+    scalar_t* k_base = key_ + token_id * num_kv_heads_ * head_dim_;
+    scalar_t* k_cache_row = k_cache_ + out_idx * num_kv_heads_ * head_dim_;
+    int32_t k_work = num_kv_heads_ * embed_dim;
+    for (int i = local_id; i < k_work; i += local_range) {
+      int32_t head_id = i / embed_dim;
+      int32_t rot_offset = i % embed_dim;
+      scalar_t* k_head = k_base + head_id * head_dim_;
+
+      int x_idx, y_idx;
+      float cos_val, sin_val;
+      if constexpr (algo == EmbeddingAlgorithm::RotateHalf) {
+        x_idx = rot_offset;
+        y_idx = rot_offset + embed_dim;
+        cos_val = cos_cache[rot_offset];
+        sin_val = sin_cache[rot_offset];
+      } else {
+        x_idx = 2 * rot_offset;
+        y_idx = 2 * rot_offset + 1;
+        cos_val = cos_cache[rot_offset];
+        sin_val = sin_cache[rot_offset];
+      }
+      accscalar x = static_cast<accscalar>(k_head[x_idx]);
+      accscalar y = static_cast<accscalar>(k_head[y_idx]);
+      scalar_t x_rot = static_cast<scalar_t>(x * cos_val - y * sin_val);
+      scalar_t y_rot = static_cast<scalar_t>(x * sin_val + y * cos_val);
+      k_head[x_idx] = x_rot;
+      k_head[y_idx] = y_rot;
+      // Write rotated K to cache
+      k_cache_row[head_id * head_dim_ + x_idx] = x_rot;
+      k_cache_row[head_id * head_dim_ + y_idx] = y_rot;
+    }
+
+    // Copy non-rotated dims of K to cache (if head_dim > rot_dim)
+    // and write full V to v_cache
+    scalar_t* v_base = value_ + token_id * num_kv_heads_ * head_dim_;
+    scalar_t* v_cache_row = v_cache_ + out_idx * num_kv_heads_ * head_dim_;
+    int32_t full_work = num_kv_heads_ * head_dim_;
+    for (int i = local_id; i < full_work; i += local_range) {
+      v_cache_row[i] = v_base[i];
+    }
+
+    // For head_dim > rot_dim: copy the non-rotated tail of K to cache
+    if (head_dim_ > rot_dim_) {
+      for (int i = local_id; i < num_kv_heads_ * (head_dim_ - rot_dim_); i += local_range) {
+        int32_t head_id = i / (head_dim_ - rot_dim_);
+        int32_t dim_offset = i % (head_dim_ - rot_dim_) + rot_dim_;
+        k_cache_row[head_id * head_dim_ + dim_offset] = k_base[head_id * head_dim_ + dim_offset];
+      }
+    }
+  }
+
+  int64_t* positions_;
+  float* cos_sin_cache_;  // always fp32
+  scalar_t* query_;
+  scalar_t* key_;
+  scalar_t* value_;
+  scalar_t* k_cache_;
+  scalar_t* v_cache_;
+  int64_t* out_loc_;
+  int64_t num_q_heads_;
+  int64_t num_kv_heads_;
+  int64_t head_dim_;
+  int64_t rot_dim_;
+};
+
+void apply_rope_inplace_with_kvcache_xpu(
+    at::Tensor& query,          // [num_tokens, n_q_heads, head_dim]
+    at::Tensor& key,            // [num_tokens, n_kv_heads, head_dim]
+    at::Tensor& value,          // [num_tokens, n_kv_heads, head_dim]
+    at::Tensor& k_cache,        // [cache_size, n_kv_heads * head_dim]
+    at::Tensor& v_cache,        // [cache_size, n_kv_heads * head_dim]
+    at::Tensor& cos_sin_cache,  // [max_pos, rot_dim] — MUST be float32
+    at::Tensor& positions,      // [num_tokens] int64
+    at::Tensor& out_loc,        // [num_tokens] int64
+    bool is_neox) {
+  TORCH_CHECK(
+      cos_sin_cache.scalar_type() == at::ScalarType::Float,
+      "cos_sin_cache must be float32, got ",
+      cos_sin_cache.scalar_type());
+  TORCH_CHECK(query.dim() == 3, "query must be 3D [num_tokens, n_heads, head_dim]");
+  TORCH_CHECK(key.dim() == 3, "key must be 3D [num_tokens, n_kv_heads, head_dim]");
+  TORCH_CHECK(value.dim() == 3, "value must be 3D [num_tokens, n_kv_heads, head_dim]");
+
+  int64_t num_tokens = query.size(0);
+  int64_t num_q_heads = query.size(1);
+  int64_t num_kv_heads = key.size(1);
+  int64_t head_dim = query.size(2);
+  int64_t rot_dim = cos_sin_cache.size(1);
+
+  TORCH_CHECK(key.size(2) == head_dim, "key head_dim must match query head_dim");
+  TORCH_CHECK(value.size(1) == num_kv_heads, "value num_heads must match key");
+  TORCH_CHECK(value.size(2) == head_dim, "value head_dim must match key head_dim");
+
+  auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
+  int64_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
+  int64_t max_work = std::max(num_q_heads * rot_dim / 2, num_kv_heads * head_dim);
+  int64_t group_size = std::min<int64_t>(std::min<int64_t>(max_work, 512), max_wg_size);
+
+  SYCL_DISPATCH_FLOATING_TYPES(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      query.scalar_type(),
+      "apply_rope_inplace_with_kvcache_xpu",
+      [&]() {
+        auto cgf = DPCPP_Q_CGF(cgh) {
+          if (is_neox) {
+            FusedRopeKVCacheKernel<scalar_t, EmbeddingAlgorithm::RotateHalf> kernel = {
+                .positions_ = positions.data_ptr<int64_t>(),
+                .cos_sin_cache_ = cos_sin_cache.data_ptr<float>(),
+                .query_ = query.data_ptr<scalar_t>(),
+                .key_ = key.data_ptr<scalar_t>(),
+                .value_ = value.data_ptr<scalar_t>(),
+                .k_cache_ = k_cache.data_ptr<scalar_t>(),
+                .v_cache_ = v_cache.data_ptr<scalar_t>(),
+                .out_loc_ = out_loc.data_ptr<int64_t>(),
+                .num_q_heads_ = num_q_heads,
+                .num_kv_heads_ = num_kv_heads,
+                .head_dim_ = head_dim,
+                .rot_dim_ = rot_dim,
+            };
+            cgh.parallel_for<decltype(kernel)>(
+                sycl::nd_range<1>(sycl::range<1>(num_tokens * group_size), sycl::range<1>(group_size)), kernel);
+          } else {
+            FusedRopeKVCacheKernel<scalar_t, EmbeddingAlgorithm::RotateInterleave> kernel = {
+                .positions_ = positions.data_ptr<int64_t>(),
+                .cos_sin_cache_ = cos_sin_cache.data_ptr<float>(),
+                .query_ = query.data_ptr<scalar_t>(),
+                .key_ = key.data_ptr<scalar_t>(),
+                .value_ = value.data_ptr<scalar_t>(),
+                .k_cache_ = k_cache.data_ptr<scalar_t>(),
+                .v_cache_ = v_cache.data_ptr<scalar_t>(),
+                .out_loc_ = out_loc.data_ptr<int64_t>(),
+                .num_q_heads_ = num_q_heads,
+                .num_kv_heads_ = num_kv_heads,
+                .head_dim_ = head_dim,
+                .rot_dim_ = rot_dim,
+            };
+            cgh.parallel_for<decltype(kernel)>(
+                sycl::nd_range<1>(sycl::range<1>(num_tokens * group_size), sycl::range<1>(group_size)), kernel);
+          }
+        };
+        dpcppGetCurrentQueue().submit(cgf);
+      });
+}
+
 }  // namespace at::native::xpu

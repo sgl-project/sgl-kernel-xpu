@@ -68,6 +68,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "bool is_neox) -> (Tensor, Tensor)");
   m.impl("rotary_embedding", torch::kXPU, &at::native::xpu::rotary_embedding);
 
+  m.def(
+      "apply_rope_inplace_with_kvcache_xpu(Tensor(a!) query, Tensor(b!) key, Tensor value, "
+      "Tensor(c!) k_cache, Tensor(d!) v_cache, Tensor cos_sin_cache, "
+      "Tensor positions, Tensor out_loc, bool is_neox) -> ()");
+  m.impl("apply_rope_inplace_with_kvcache_xpu", torch::kXPU, &at::native::xpu::apply_rope_inplace_with_kvcache_xpu);
+
   m.def("moe_sum_reduce(Tensor input, Tensor output, float routed_scaling_factor) -> ()");
   m.impl("moe_sum_reduce", torch::kXPU, &moe_sum_reduce);
   m.def(

@@ -35,9 +35,33 @@ struct StoreCacheKernel {
 };
 
 void store_cache_xpu(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices) {
+  CHECK_DEVICE(k);
+  CHECK_DEVICE(v);
+  CHECK_DEVICE(k_cache);
+  CHECK_DEVICE(v_cache);
+  CHECK_DEVICE(indices);
+
+  CHECK_CONTIGUOUS(k);
+  CHECK_CONTIGUOUS(v);
+  CHECK_CONTIGUOUS(k_cache);
+  CHECK_CONTIGUOUS(v_cache);
+  CHECK_CONTIGUOUS(indices);
+
   TORCH_CHECK(k.dim() == 2, "k must be 2D [num_tokens, row_dim]");
   TORCH_CHECK(v.dim() == 2, "v must be 2D [num_tokens, row_dim]");
   TORCH_CHECK(k_cache.dim() == 2, "k_cache must be 2D [cache_size, row_dim]");
+  TORCH_CHECK(v_cache.dim() == 2, "v_cache must be 2D [cache_size, row_dim]");
+  TORCH_CHECK(indices.dim() == 1, "indices must be 1D [num_tokens]");
+
+  TORCH_CHECK(v.sizes() == k.sizes(), "v shape must match k shape");
+  TORCH_CHECK(v_cache.sizes() == k_cache.sizes(), "v_cache shape must match k_cache shape");
+  TORCH_CHECK(k.size(1) == k_cache.size(1), "k row_dim must match k_cache row_dim");
+  TORCH_CHECK(indices.size(0) == k.size(0), "indices length must match num_tokens");
+
+  TORCH_CHECK(indices.scalar_type() == at::kLong, "indices must be int64");
+  TORCH_CHECK(k.dtype() == v.dtype(), "k and v must have the same dtype");
+  TORCH_CHECK(k.dtype() == k_cache.dtype(), "k and k_cache must have the same dtype");
+  TORCH_CHECK(k.dtype() == v_cache.dtype(), "k and v_cache must have the same dtype");
 
   int64_t num_tokens = k.size(0);
   int64_t row_dim = k.size(1);

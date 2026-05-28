@@ -435,16 +435,21 @@ struct FusedRopeCacheKernel {
     const int64_t num_works = num_tokens * num_qk_heads;
     constexpr int64_t half_rope = rope_dim / 2;
 
-    constexpr int requested_vec_size = next_pow2(rope_dim, (2 * sg_size * (1 + is_neox)));
-    // Non-neox uses vec2_t (2 * vec_size lanes), and sycl::vec lane count is
-    // limited to 16 on the currently, so cap vec_size at 8.
-    constexpr int vec_size = is_neox ? requested_vec_size : (requested_vec_size > 8 ? 8 : requested_vec_size);
-    static_assert(is_neox || vec_size <= 8, "non-neox requires vec_size <= 8 because vec2_t uses 2 * vec_size lanes");
-
     using storage_t = std::conditional_t<
         std::is_same_v<scalar_t, c10::Half>,
         sycl::half,
         sycl::ext::oneapi::bfloat16>;  // fallback is bf16 since only 2 types supported
+
+    constexpr int64_t max_vec_bytes = 16;  // 128 bits
+    constexpr int64_t max_vec_elems = max_vec_bytes / (int64_t)sizeof(storage_t);
+
+    // We use different heuristic vec_size choosing from cuda.
+    // The following config would get the best performance:
+    // head_dim: 64 128 256 512
+    // vec_size: 2    2   8   8
+
+    constexpr int64_t vec_size =
+        is_neox ? (rope_dim < 256 ? 2 : max_vec_elems) : (rope_dim < 256 ? 1 : max_vec_elems / 2);
 
     using vec_t = sycl::vec<storage_t, vec_size>;
     using vec2_t = sycl::vec<storage_t, vec_size * 2>;  // for interleave pairs

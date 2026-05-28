@@ -295,7 +295,7 @@ void fused_qk_norm_rope(
 // and immediately invokes the callable passed as the variadic argument.
 // Float8_e4m3fn uses the cutlass type because native SYCL float8 is not yet
 // supported; Half and BFloat16 use their respective SYCL types.
-#define FUSED_QK_NORM_ROPE_DISPATCH_FLOATING_TYPES(SCALAR_TYPE, KERNEL_NAME, ...)                 \
+#define SYCL_DISPATCH_FLOATING_TYPES(SCALAR_TYPE, KERNEL_NAME, ...)                 \
   [&]() {                                                                           \
     switch (SCALAR_TYPE) {                                                          \
       case at::ScalarType::Half: {                                                  \
@@ -321,7 +321,7 @@ void fused_qk_norm_rope(
 // The lambda is wrapped in an extra () so that commas in the template argument
 // list <HD, IL, scalar_t> are hidden from the preprocessor's argument splitter.
 #define LAUNCH_KERNEL(HD, IL)                                                    \
-  FUSED_QK_NORM_ROPE_DISPATCH_FLOATING_TYPES(qkv.scalar_type(), "fused_qk_norm_rope", ([&]() { \
+  SYCL_DISPATCH_FLOATING_TYPES(qkv.scalar_type(), "fused_qk_norm_rope", ([&]() { \
                                  launchFusedQKNormRopeImpl<HD, IL, scalar_t>(    \
                                      qkv.data_ptr(),                             \
                                      static_cast<int>(num_tokens),               \
@@ -368,7 +368,7 @@ void fused_qk_norm_rope(
   }
 
 #undef LAUNCH_KERNEL
-#undef FUSED_QK_NORM_ROPE_DISPATCH_FLOATING_TYPES
+#undef SYCL_DISPATCH_FLOATING_TYPES
 }
 
 }  // namespace at::native::xpu

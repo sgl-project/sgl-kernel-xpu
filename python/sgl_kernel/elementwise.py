@@ -221,7 +221,7 @@ def store_cache_xpu(
         Flat cache slot indices, shape: ``(num_tokens,)``, dtype int64.
         Use -1 to skip a token.
     """
-    torch.ops.sgl_kernel.store_cache_xpu(k, v, k_cache, v_cache, indices.long())
+    torch.ops.sgl_kernel.store_cache(k, v, k_cache, v_cache, indices.long())
 
 
 def apply_rope_with_cos_sin_cache_inplace(

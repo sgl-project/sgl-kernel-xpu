@@ -31,6 +31,7 @@ from sgl_kernel.elementwise import (
     gemma_rmsnorm,
     rmsnorm,
     silu_and_mul,
+    store_cache_xpu,
 )
 from sgl_kernel.gemm import (
     awq_dequantize,

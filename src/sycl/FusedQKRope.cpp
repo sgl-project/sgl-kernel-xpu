@@ -433,10 +433,7 @@ struct FusedRopeCacheKernel {
     using storage_t = std::conditional_t<
         std::is_same_v<scalar_t, c10::Half>,
         sycl::half,
-        std::conditional_t<
-            std::is_same_v<scalar_t, c10::BFloat16>,
-            sycl::ext::oneapi::bfloat16,
-            void>>;
+        std::conditional_t<std::is_same_v<scalar_t, c10::BFloat16>, sycl::ext::oneapi::bfloat16, void>>;
 
     constexpr int64_t max_vec_bytes = 16;  // 128 bits
     constexpr int64_t max_vec_elems = max_vec_bytes / (int64_t)sizeof(storage_t);

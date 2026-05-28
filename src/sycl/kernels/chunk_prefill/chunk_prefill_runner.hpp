@@ -726,6 +726,35 @@ std::vector<at::Tensor> mha_fwd(
         }
       })
       break;
+    case 72:
+      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
+        if (params.is_causal) {
+          ChunkPrefillConfig<
+              cute::Shape<_128, _64, _32>,
+              cute::Shape<_128, _32, _64>,
+              cute::Shape<_128, _96, _64>,
+              cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+              PipelineStages,
+              true,
+              false,
+              Sink>::run(params);
+
+        } else {
+          AT_DISPATCH_BOOL_NO_RETURN(
+              params.is_local,
+              LocalMask,
+              ChunkPrefillConfig<
+                  cute::Shape<_128, _64, _32>,
+                  cute::Shape<_128, _32, _64>,
+                  cute::Shape<_128, _96, _64>,
+                  cute::Layout<cute::Shape<_8, _1, _1>, cute::Stride<_1, _1, _1>>,
+                  PipelineStages,
+                  false,
+                  LocalMask,
+                  Sink>::run(params))
+        }
+      })
+      break;
     case 96:
       AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
         if (params.is_causal) {

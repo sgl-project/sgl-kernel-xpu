@@ -427,10 +427,16 @@ struct FusedRopeCacheKernel {
     const int64_t num_works = num_tokens * num_qk_heads;
     constexpr int64_t half_rope = rope_dim / 2;
 
+    static_assert(
+        std::is_same_v<scalar_t, c10::Half> || std::is_same_v<scalar_t, c10::BFloat16>,
+        "FusedQKRope only supports c10::Half and c10::BFloat16 for storage reinterpretation.");
     using storage_t = std::conditional_t<
         std::is_same_v<scalar_t, c10::Half>,
         sycl::half,
-        sycl::ext::oneapi::bfloat16>;  // fallback is bf16 since only 2 types supported
+        std::conditional_t<
+            std::is_same_v<scalar_t, c10::BFloat16>,
+            sycl::ext::oneapi::bfloat16,
+            void>>;
 
     constexpr int64_t max_vec_bytes = 16;  // 128 bits
     constexpr int64_t max_vec_elems = max_vec_bytes / (int64_t)sizeof(storage_t);

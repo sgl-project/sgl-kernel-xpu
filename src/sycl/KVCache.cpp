@@ -20,22 +20,19 @@ struct StoreCacheKernel {
     scalar_t* k_dst = k_cache_ + cache_idx * row_dim_;
     scalar_t* v_dst = v_cache_ + cache_idx * row_dim_;
 
-    // Vectorized copy: 4 elements at a time (8 bytes for bf16/fp16)
-    constexpr int64_t vec_width = sizeof(uint64_t) / sizeof(scalar_t);
-    int64_t row_dim_vec = (row_dim_ / vec_width) * vec_width;
-
-    auto* k_src_vec = reinterpret_cast<const uint64_t*>(k_src);
-    auto* v_src_vec = reinterpret_cast<const uint64_t*>(v_src);
-    auto* k_dst_vec = reinterpret_cast<uint64_t*>(k_dst);
-    auto* v_dst_vec = reinterpret_cast<uint64_t*>(v_dst);
-    int64_t vec_count = row_dim_vec / vec_width;
+    using pack_t = sycl::vec<uint32_t, 4>;
+    constexpr int64_t vec_width = sizeof(pack_t) / sizeof(scalar_t);
+    const int64_t vec_count = row_dim_ / vec_width;
 
     for (int64_t i = local_id; i < vec_count; i += local_range) {
-      k_dst_vec[i] = k_src_vec[i];
-      v_dst_vec[i] = v_src_vec[i];
+      pack_t kp, vp;
+      const int64_t off = i * vec_width;
+      memcpy(&kp, k_src + off, sizeof(pack_t));
+      memcpy(&vp, v_src + off, sizeof(pack_t));
+      memcpy(k_dst + off, &kp, sizeof(pack_t));
+      memcpy(v_dst + off, &vp, sizeof(pack_t));
     }
-    // Handle remaining elements
-    for (int64_t i = row_dim_vec + local_id; i < row_dim_; i += local_range) {
+    for (int64_t i = vec_count * vec_width + local_id; i < row_dim_; i += local_range) {
       k_dst[i] = k_src[i];
       v_dst[i] = v_src[i];
     }

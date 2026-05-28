@@ -792,7 +792,9 @@ void GemmaFusedAddRMSNormKernelImplInternal(
 void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
-  auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
+  auto MN_ = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
+  const int64_t M = std::get<0>(MN_);
+  const int64_t N = std::get<1>(MN_);
 
   // Derive row-stride info directly from input/output so the kernel can
   // handle non-flattenable 3D tensors (e.g. QKV slices) natively.
@@ -828,7 +830,9 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
   TORCH_CHECK(residual.is_contiguous(), "fused_add_rmsnorm: residual must be contiguous");
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
-  auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
+  auto MN_ = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
+  const int64_t M = std::get<0>(MN_);
+  const int64_t N = std::get<1>(MN_);
 
   // Flatten leading dimensions to 2D for the kernel
   Tensor input_ = flatten_to_2d(input, M, N);
@@ -848,7 +852,9 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
-  auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
+  auto MN_ = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
+  const int64_t M = std::get<0>(MN_);
+  const int64_t N = std::get<1>(MN_);
 
   RowStrides in_strides = get_row_strides(input);
   RowStrides out_strides = get_row_strides(output);
@@ -880,7 +886,9 @@ void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torc
   TORCH_CHECK(residual.is_contiguous(), "gemma_fused_add_rmsnorm: residual must be contiguous");
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
-  auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
+  auto MN_ = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
+  const int64_t M = std::get<0>(MN_);
+  const int64_t N = std::get<1>(MN_);
 
   // Flatten leading dimensions to 2D for the kernel
   Tensor input_ = flatten_to_2d(input, M, N);

@@ -317,8 +317,7 @@ std::vector<at::Tensor> mha_fwd(
   // Per-batch skip mask for the chunkprefill two-launch path
   // (vllm-xpu-kernels#218). When provided, decode skips batches where
   // mask[idx_b] == true (i.e. the prefill rows).
-  params.skip_batch_mask_ptr =
-      skip_batch_mask_opt.has_value() ? skip_batch_mask_opt->data_ptr() : nullptr;
+  params.skip_batch_mask_ptr = skip_batch_mask_opt.has_value() ? skip_batch_mask_opt->data_ptr() : nullptr;
 
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
@@ -608,8 +607,7 @@ std::vector<at::Tensor> mha_fwd(
   params.o_head_stride = out.stride(-2);
 
   // Per-batch skip mask for the chunkprefill two-launch dispatcher.
-  params.skip_batch_mask_ptr =
-      skip_batch_mask_opt.has_value() ? skip_batch_mask_opt->data_ptr() : nullptr;
+  params.skip_batch_mask_ptr = skip_batch_mask_opt.has_value() ? skip_batch_mask_opt->data_ptr() : nullptr;
 
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
@@ -795,12 +793,9 @@ std::vector<at::Tensor> mha_fwd(
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin) {
+  TORCH_CHECK(page_table.has_value(), "chunkprefill two-launch path requires paged KV cache (page_table != None).");
   TORCH_CHECK(
-      page_table.has_value(),
-      "chunkprefill two-launch path requires paged KV cache (page_table != None).");
-  TORCH_CHECK(
-      window_size_left < 0 && window_size_right < 0,
-      "chunkprefill two-launch path does not support sliding window.");
+      window_size_left < 0 && window_size_right < 0, "chunkprefill two-launch path does not support sliding window.");
   TORCH_CHECK(!sinks_.has_value(), "chunkprefill two-launch path does not support attention sinks.");
   TORCH_CHECK(
       !q_v_.has_value() && !rotary_cos_.has_value() && !rotary_sin_.has_value() && !seqlens_rotary_.has_value() &&
@@ -812,8 +807,7 @@ std::vector<at::Tensor> mha_fwd(
   int64_t batch_size = cu_seqlens_q.size(0) - 1;
   TORCH_CHECK(batch_size >= 0, "cu_seqlens_q must have at least 1 element.");
 
-  auto seqlens_q =
-      cu_seqlens_q.slice(0, 1, batch_size + 1).sub(cu_seqlens_q.slice(0, 0, batch_size));
+  auto seqlens_q = cu_seqlens_q.slice(0, 1, batch_size + 1).sub(cu_seqlens_q.slice(0, 0, batch_size));
   auto is_prefill_mask = seqlens_q.gt(1).to(at::kBool).contiguous();
   auto is_decode_mask = seqlens_q.le(1).to(at::kBool).contiguous();
 

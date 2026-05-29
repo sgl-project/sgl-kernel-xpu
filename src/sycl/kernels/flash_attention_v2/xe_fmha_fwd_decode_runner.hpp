@@ -187,6 +187,11 @@ struct Arguments {
 
   bool is_rotary_interleaved;
 
+  // Per-batch skip mask for two-kernel mix-batch dispatch
+  // (see https://github.com/vllm-project/vllm-xpu-kernels/pull/218).
+  // If non-null, the kernel skips batches where mask[idx_b] is true.
+  void* skip_batch_mask_ptr = nullptr;
+
   torch::TensorOptions tensor_opts;
 };
 
@@ -318,6 +323,7 @@ struct DecodeRunner {
             stride_K_cache,
             static_cast<const ElementV*>(params.v_ptr),
             stride_V_cache,
+            static_cast<const bool*>(params.skip_batch_mask_ptr),
         },
         {params.softmax_scale, params.page_table, params.page_size, params.max_num_pages_per_seq},
         {},
@@ -473,6 +479,7 @@ struct SplitDecodeKernelRunner {
             reinterpret_cast<ElementLSE*>(params.max_logits_ptr),
             stride_max_logits,
             reinterpret_cast<ElementQ*>(params.softmax_sink_ptr),
+            static_cast<const bool*>(params.skip_batch_mask_ptr),
         },
         {params.softmax_scale,
          params.k_scale_ptr,
@@ -497,7 +504,8 @@ struct SplitDecodeKernelRunner {
          stride_exp_sums,
          reinterpret_cast<ElementLSE*>(params.max_logits_ptr),
          stride_max_logits,
-         params.window_size_left},
+         params.window_size_left,
+         static_cast<const bool*>(params.skip_batch_mask_ptr)},
         hw_info,
         params.num_kv_splits};
 

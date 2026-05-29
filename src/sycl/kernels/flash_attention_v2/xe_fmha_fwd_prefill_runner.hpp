@@ -170,6 +170,11 @@ struct Arguments {
 
   bool is_rotary_interleaved;
 
+  // Per-batch skip mask for two-kernel mix-batch dispatch
+  // (see https://github.com/vllm-project/vllm-xpu-kernels/pull/218).
+  // If non-null, the kernel skips batches where mask[idx_b] is true.
+  void* skip_batch_mask_ptr = nullptr;
+
   torch::TensorOptions tensor_opts;
 };
 
@@ -305,6 +310,7 @@ struct PrefillRunner {
             params.max_num_pages_per_seq,
             params.window_size_left,
             params.window_size_right,
+            static_cast<const bool*>(params.skip_batch_mask_ptr),
         },
         {},
         hw_info};

@@ -35,7 +35,6 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
-#include "kernels/chunk_prefill/chunk_prefill_runner.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_prefill_dispatch.hpp"
 
@@ -149,7 +148,14 @@ std::vector<at::Tensor> mha_fwd(
     std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
-    int const sm_margin) {
+    int const sm_margin,
+    // Optional pre-allocated output tensor. When set, decode writes into it
+    // instead of allocating a fresh one (used by the chunkprefill two-launch
+    // dispatcher so decode + prefill share the same O buffer).
+    std::optional<at::Tensor> out_opt = std::nullopt,
+    // Optional device-side per-batch skip mask (bool, length = batch). When
+    // set, batches where mask[idx_b] is true are skipped by the kernel.
+    std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
       q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
@@ -231,7 +237,7 @@ std::vector<at::Tensor> mha_fwd(
   at::Tensor exp_sums;    // [batch, num_head_q, seq_q, num_kv_splits]
   at::Tensor max_logits;  // [batch, num_head_q, seq_q, num_kv_splits]
   num_kv_splits = -1;
-  out = torch::empty({total_q, num_heads, head_size_v}, opts);
+  out = out_opt.has_value() ? *out_opt : torch::empty({total_q, num_heads, head_size_v}, opts);
   Arguments params;
   params.use_split_kv = true;
   if (params.use_split_kv) {
@@ -307,6 +313,12 @@ std::vector<at::Tensor> mha_fwd(
   params.o_ptr = out.data_ptr();
   params.o_row_stride = out.stride(-3);
   params.o_head_stride = out.stride(-2);
+
+  // Per-batch skip mask for the chunkprefill two-launch path
+  // (vllm-xpu-kernels#218). When provided, decode skips batches where
+  // mask[idx_b] == true (i.e. the prefill rows).
+  params.skip_batch_mask_ptr =
+      skip_batch_mask_opt.has_value() ? skip_batch_mask_opt->data_ptr() : nullptr;
 
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
@@ -478,7 +490,14 @@ std::vector<at::Tensor> mha_fwd(
     std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
     int num_splits,
     std::optional<bool> pack_gqa_,
-    int const sm_margin) {
+    int const sm_margin,
+    // Optional pre-allocated output tensor. When set, prefill writes into it
+    // instead of allocating a fresh one (used by the chunkprefill two-launch
+    // dispatcher so decode + prefill share the same O buffer).
+    std::optional<at::Tensor> out_opt = std::nullopt,
+    // Optional device-side per-batch skip mask (bool, length = batch). When
+    // set, batches where mask[idx_b] is true are skipped by the kernel.
+    std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
       q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
@@ -556,7 +575,7 @@ std::vector<at::Tensor> mha_fwd(
 
   auto opts = q.options();
   at::Tensor out;
-  out = torch::empty({total_q, num_heads, head_size_v}, opts);
+  out = out_opt.has_value() ? *out_opt : torch::empty({total_q, num_heads, head_size_v}, opts);
 
   int const head_size_rounded = round_up_headdim(head_size);
   int const head_size_v_rounded = head_size_v == head_size ? head_size_rounded : round_up_headdim(head_size_v);
@@ -587,6 +606,10 @@ std::vector<at::Tensor> mha_fwd(
   params.o_ptr = out.data_ptr();
   params.o_row_stride = out.stride(-3);
   params.o_head_stride = out.stride(-2);
+
+  // Per-batch skip mask for the chunkprefill two-launch dispatcher.
+  params.skip_batch_mask_ptr =
+      skip_batch_mask_opt.has_value() ? skip_batch_mask_opt->data_ptr() : nullptr;
 
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
@@ -732,6 +755,147 @@ std::vector<at::Tensor> mha_fwd(
 #undef DISPATCH_PREFILL_KERNEL
 
 }  // namespace prefill
+
+namespace chunkprefill {
+
+// Two-launch mix-batch dispatcher (vllm-xpu-kernels#218).
+//
+// Build a per-batch ``is_prefill`` bool mask on device, then launch the
+// decode kernel skipping prefill batches and the prefill kernel skipping
+// decode batches. Both launches write into the same output tensor.
+//
+// Limitations: paged KV cache required; sliding window / sinks / rotary /
+// descale / scheduler metadata are not supported on this path.
+std::vector<at::Tensor> mha_fwd(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    std::optional<const at::Tensor>& q_v_,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& cu_seqlens_k,  // per-batch cache_seqlens (size = batch) in paged mode
+    int max_seqlen_q,
+    int max_seqlen_k,
+    std::optional<const at::Tensor>& page_table,
+    std::optional<const at::Tensor>& kv_batch_idx_,
+    std::optional<const at::Tensor>& leftpad_k_,
+    std::optional<const at::Tensor>& rotary_cos_,
+    std::optional<const at::Tensor>& rotary_sin_,
+    std::optional<const at::Tensor>& seqlens_rotary_,
+    std::optional<at::Tensor>& q_descale_,
+    std::optional<at::Tensor>& k_descale_,
+    std::optional<at::Tensor>& v_descale_,
+    const float softmax_scale_,
+    std::optional<const at::Tensor>& sinks_,
+    bool is_causal,
+    int window_size_left,
+    int window_size_right,
+    float const softcap,
+    bool const is_rotary_interleaved,
+    std::optional<at::Tensor>& scheduler_metadata_,
+    int num_kv_splits,
+    std::optional<bool> pack_gqa_,
+    int const sm_margin) {
+  TORCH_CHECK(
+      page_table.has_value(),
+      "chunkprefill two-launch path requires paged KV cache (page_table != None).");
+  TORCH_CHECK(
+      window_size_left < 0 && window_size_right < 0,
+      "chunkprefill two-launch path does not support sliding window.");
+  TORCH_CHECK(!sinks_.has_value(), "chunkprefill two-launch path does not support attention sinks.");
+  TORCH_CHECK(
+      !q_v_.has_value() && !rotary_cos_.has_value() && !rotary_sin_.has_value() && !seqlens_rotary_.has_value() &&
+          !q_descale_.has_value() && !k_descale_.has_value() && !v_descale_.has_value() &&
+          !scheduler_metadata_.has_value(),
+      "chunkprefill two-launch path does not yet support q_v / rotary / descale / scheduler_metadata.");
+  TORCH_CHECK(cu_seqlens_q.scalar_type() == at::kInt, "cu_seqlens_q must be int32.");
+
+  int64_t batch_size = cu_seqlens_q.size(0) - 1;
+  TORCH_CHECK(batch_size >= 0, "cu_seqlens_q must have at least 1 element.");
+
+  auto seqlens_q =
+      cu_seqlens_q.slice(0, 1, batch_size + 1).sub(cu_seqlens_q.slice(0, 0, batch_size));
+  auto is_prefill_mask = seqlens_q.gt(1).to(at::kBool).contiguous();
+  auto is_decode_mask = seqlens_q.le(1).to(at::kBool).contiguous();
+
+  int64_t head_dim_v = v.size(-1);
+  auto out = at::empty({q.size(0), q.size(1), head_dim_v}, q.options());
+  std::optional<at::Tensor> out_opt = out;
+  std::optional<at::Tensor> decode_mask = is_prefill_mask;
+  std::optional<at::Tensor> prefill_mask = is_decode_mask;
+
+  // Launch 1: decode kernel on full batch, skip prefill batches.
+  (void)decode::mha_fwd(
+      q,
+      k,
+      v,
+      q_v_,
+      cu_seqlens_q,
+      cu_seqlens_k,
+      max_seqlen_q,
+      max_seqlen_k,
+      page_table,
+      kv_batch_idx_,
+      leftpad_k_,
+      rotary_cos_,
+      rotary_sin_,
+      seqlens_rotary_,
+      q_descale_,
+      k_descale_,
+      v_descale_,
+      softmax_scale_,
+      sinks_,
+      is_causal,
+      window_size_left,
+      window_size_right,
+      softcap,
+      is_rotary_interleaved,
+      scheduler_metadata_,
+      num_kv_splits,
+      pack_gqa_,
+      sm_margin,
+      out_opt,
+      decode_mask);
+
+  // Launch 2: prefill kernel on full batch, skip decode batches.
+  (void)prefill::mha_fwd(
+      q,
+      k,
+      v,
+      q_v_,
+      cu_seqlens_q,
+      cu_seqlens_k,
+      max_seqlen_q,
+      max_seqlen_k,
+      page_table,
+      kv_batch_idx_,
+      leftpad_k_,
+      rotary_cos_,
+      rotary_sin_,
+      seqlens_rotary_,
+      q_descale_,
+      k_descale_,
+      v_descale_,
+      softmax_scale_,
+      sinks_,
+      is_causal,
+      window_size_left,
+      window_size_right,
+      softcap,
+      is_rotary_interleaved,
+      scheduler_metadata_,
+      num_kv_splits,
+      pack_gqa_,
+      sm_margin,
+      out_opt,
+      prefill_mask);
+
+  // softmax_lse / accum tensors are not stitched here; return empty
+  // placeholders to keep the Python ABI stable.
+  auto empty_f = at::empty({0}, q.options().dtype(at::kFloat));
+  return {out, empty_f, empty_f, empty_f};
+}
+
+}  // namespace chunkprefill
 
 std::vector<at::Tensor> mha_fwd(
     const at::Tensor& q,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q

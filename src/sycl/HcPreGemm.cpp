@@ -23,7 +23,6 @@ limitations under the License.
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
-
 #include "cutlass/epilogue/collective/collective_epilogue.hpp"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/epilogue/collective/xe_epilogue.hpp"
@@ -52,7 +51,7 @@ void hc_pre_gemm(
     at::Tensor& C) {      // [T, N] float32
 
   CHECK_INPUT(A);
-  CHECK_INPUT(B);
+  CHECK_DEVICE(B);  // B can be non-contiguous (column-major)
   CHECK_INPUT(C);
 
   TORCH_CHECK(A.scalar_type() == at::kBFloat16, "A must be bfloat16");
@@ -65,8 +64,17 @@ void hc_pre_gemm(
   const int64_t N = B.size(1);
 
   TORCH_CHECK(K_A == K_B, "K dimension mismatch: A has ", K_A, ", B has ", K_B);
-  TORCH_CHECK(C.size(0) == T && C.size(1) == N, "C dimension mismatch: expected [",
-              T, ", ", N, "], got [", C.size(0), ", ", C.size(1), "]");
+  TORCH_CHECK(
+      C.size(0) == T && C.size(1) == N,
+      "C dimension mismatch: expected [",
+      T,
+      ", ",
+      N,
+      "], got [",
+      C.size(0),
+      ", ",
+      C.size(1),
+      "]");
 
   // CUTLASS GEMM configuration
   using ElementAccumulator = float;
@@ -76,7 +84,7 @@ void hc_pre_gemm(
   using ElementOutput = float;
 
   using LayoutA = cutlass::layout::RowMajor;     // A: row-major
-  using LayoutB = cutlass::layout::ColumnMajor;  // B: column-major
+  using LayoutB = cutlass::layout::ColumnMajor;  // B: column-major (transposed view)
   using LayoutC = cutlass::layout::RowMajor;
   using LayoutD = cutlass::layout::RowMajor;
 
@@ -105,11 +113,8 @@ void hc_pre_gemm(
       ElementAccumulator,
       cutlass::FloatRoundStyle::round_to_nearest>;
 
-  using FusionCallbacks = cutlass::epilogue::fusion::FusionCallbacks<
-      EpilogueDispatchPolicy,
-      EpilogueOp,
-      TileShape,
-      decltype(tile_shape(TiledMma()))>;
+  using FusionCallbacks = cutlass::epilogue::fusion::
+      FusionCallbacks<EpilogueDispatchPolicy, EpilogueOp, TileShape, decltype(tile_shape(TiledMma()))>;
 
   using CollectiveEpilogue = cutlass::epilogue::collective::CollectiveEpilogue<
       EpilogueDispatchPolicy,
@@ -132,8 +137,14 @@ void hc_pre_gemm(
       ElementInputB,
       cutlass::gemm::TagToStrideB_t<LayoutB>,
       TiledMma,
-      GmemTiledCopyA, void, void, cute::identity,  // A copy ops
-      GmemTiledCopyB, void, void, cute::identity   // B copy ops
+      GmemTiledCopyA,
+      void,
+      void,
+      cute::identity,  // A copy ops
+      GmemTiledCopyB,
+      void,
+      void,
+      cute::identity  // B copy ops
       >;
 
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
@@ -167,15 +178,15 @@ void hc_pre_gemm(
        stride_A,
        reinterpret_cast<ElementInputB*>(const_cast<float*>(B.data_ptr<float>())),
        stride_B},
-      {{1.0f, 0.0f},                                               // alpha=1, beta=0
-       nullptr,                                                    // C ptr (nullptr since beta=0)
+      {{1.0f, 0.0f},  // alpha=1, beta=0
+       nullptr,       // C ptr (nullptr since beta=0)
        stride_C,
-       reinterpret_cast<ElementOutput*>(C.data_ptr<float>()),     // D ptr
+       reinterpret_cast<ElementOutput*>(C.data_ptr<float>()),  // D ptr
        stride_D},
       cutlass::KernelHardwareInfo{
-          0,  // device_id
+          0,                                                                  // device_id
           cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0),  // sm_count
-          0   // smem_capacity (auto)
+          0                                                                   // smem_capacity (auto)
       }};
 
   Gemm gemm_op;
@@ -185,14 +196,20 @@ void hc_pre_gemm(
 
   at::Tensor workspace;
   if (workspace_size > 0) {
-    workspace = at::empty({static_cast<int64_t>(workspace_size)},
-                          at::TensorOptions().dtype(at::kByte).device(A.device()));
+    workspace =
+        at::empty({static_cast<int64_t>(workspace_size)}, at::TensorOptions().dtype(at::kByte).device(A.device()));
   }
 
   // Check if kernel can implement the problem
   cutlass::Status status = gemm_op.can_implement(arguments);
-  TORCH_CHECK(status == cutlass::Status::kSuccess,
-              "CUTLASS GEMM cannot implement the problem: M=", M, ", N=", N_val, ", K=", K);
+  TORCH_CHECK(
+      status == cutlass::Status::kSuccess,
+      "CUTLASS GEMM cannot implement the problem: M=",
+      M,
+      ", N=",
+      N_val,
+      ", K=",
+      K);
 
   // Initialize
   status = gemm_op.initialize(arguments, workspace_size > 0 ? workspace.data_ptr() : nullptr);

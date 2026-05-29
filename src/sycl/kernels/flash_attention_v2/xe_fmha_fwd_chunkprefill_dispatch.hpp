@@ -161,8 +161,13 @@ std::vector<at::Tensor> mha_fwd(
   params.cu_seqlens_q = const_cast<int*>(cu_seqlens_q.data_ptr<int>());
   params.cu_seqlens_k = const_cast<int*>(cu_seqlens_k.data_ptr<int>());
   params.cu_seqlens_knew = nullptr;
-  at::Tensor cu_seqlens_block_q_cpu = cu_seqlens_block_q.to(torch::kCPU);
-  params.total_q_blocks = cu_seqlens_block_q_cpu.data_ptr<int>()[batch_size];
+  // total_q_blocks is derived on-device from cu_q_blocks[batch_size] inside the
+  // dynamic persistent tile scheduler, so we avoid a per-call blocking
+  // device-to-host copy here. A value of 0 makes the scheduler fall back to an
+  // upper-bound (batch * max_q_blocks) only for host-side grid sizing, which is
+  // safe because the launched grid is capped at sm_count * 8 and surplus work
+  // groups exit immediately via is_valid().
+  params.total_q_blocks = 0;
   params.cu_q_blocks = const_cast<int*>(cu_seqlens_block_q.data_ptr<int>());
   params.b = batch_size;
   params.h = num_heads;

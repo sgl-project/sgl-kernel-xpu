@@ -409,9 +409,16 @@ struct XeFHMADynamicPresistentTileScheduler {
 
   Params params;
   uint64_t current_work_linear_idx_ = 0;
+  int total_work_tiles_ = 0;
 
   CUTLASS_DEVICE
   XeFHMADynamicPresistentTileScheduler(Params const& params) : params(params) {
+    // Derive the exact total number of q blocks on device from the cumulative
+    // prefix-sum buffer (cumulative_q_blocks[batch]). This avoids a per-call
+    // blocking device-to-host copy on the host side just to read this scalar.
+    int total_q_blocks =
+        params.cumulative_q_blocks != nullptr ? params.cumulative_q_blocks[params.batch] : params.total_q_blocks;
+    total_work_tiles_ = total_q_blocks * params.num_heads_q * params.num_v_blocks;
     current_work_linear_idx_ = fetch_next_work_tile();
   }
 
@@ -478,7 +485,7 @@ struct XeFHMADynamicPresistentTileScheduler {
 
   CUTLASS_DEVICE
   int total_work_tiles() const {
-    return params.total_q_blocks * params.num_heads_q * params.num_v_blocks;
+    return total_work_tiles_;
   }
 
   CUTLASS_DEVICE

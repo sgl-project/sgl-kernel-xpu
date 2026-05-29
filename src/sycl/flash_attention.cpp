@@ -817,14 +817,12 @@ std::vector<at::Tensor> mha_fwd(
   auto is_prefill_mask = seqlens_q.gt(1).to(at::kBool).contiguous();
   auto is_decode_mask = seqlens_q.le(1).to(at::kBool).contiguous();
 
-  int64_t head_dim_v = v.size(-1);
-  auto out = at::empty({q.size(0), q.size(1), head_dim_v}, q.options());
-  std::optional<at::Tensor> out_opt = out;
   std::optional<at::Tensor> decode_mask = is_prefill_mask;
   std::optional<at::Tensor> prefill_mask = is_decode_mask;
 
-  // Launch 1: decode kernel on full batch, skip prefill batches.
-  (void)decode::mha_fwd(
+  // [BENCH-A] Let decode allocate out, then hand it to prefill via out_opt.
+  std::optional<at::Tensor> out_opt = std::nullopt;
+  auto decode_ret = decode::mha_fwd(
       q,
       k,
       v,
@@ -855,6 +853,10 @@ std::vector<at::Tensor> mha_fwd(
       sm_margin,
       out_opt,
       decode_mask);
+  (void)decode_ret;
+
+  auto out = decode_ret[0];
+  out_opt = out;
 
   // Launch 2: prefill kernel on full batch, skip decode batches.
   (void)prefill::mha_fwd(

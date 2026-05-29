@@ -436,7 +436,7 @@ struct FusedRopeCacheKernel {
     constexpr int64_t max_vec_elems = max_vec_bytes / (int64_t)sizeof(storage_t);
 
     // We use different heuristic vec_size choosing from cuda.
-    // The following config would get the best performance:
+    // The following config would get the best performance(bf16/half):
     // head_dim: 64 128 256 512
     // vec_size: 2    2   8   8
 
@@ -483,17 +483,11 @@ struct FusedRopeCacheKernel {
           vec_t y_vec = *reinterpret_cast<const vec_t*>(y_sptr + i);
           vec_t c_vec = *reinterpret_cast<const vec_t*>(cos_sptr + i);
           vec_t s_vec = *reinterpret_cast<const vec_t*>(sin_sptr + i);
-          vec_t out_x, out_y;
 
-#pragma unroll
-          for (int j = 0; j < vec_size; j++) {
-            const storage_t x = x_vec[j];
-            const storage_t y = y_vec[j];
-            const storage_t c = c_vec[j];
-            const storage_t s = s_vec[j];
-            out_x[j] = x * c - y * s;
-            out_y[j] = x * s + y * c;
-          }
+          // Calculate syl::vec directly without iterating over vec_size.
+          vec_t out_x = x_vec * c_vec - y_vec * s_vec;
+          vec_t out_y = x_vec * s_vec + y_vec * c_vec;
+
           *reinterpret_cast<vec_t*>(x_sptr + i) = out_x;
           *reinterpret_cast<vec_t*>(y_sptr + i) = out_y;
         }

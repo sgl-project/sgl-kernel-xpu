@@ -142,6 +142,9 @@ class XeFMHAFwdKernel {
     const ElementV* V_cache;
     StrideV dV_cache{};
     const ElementSink* sm_sink = nullptr;  // Per-head sink logits (nheads,), null if no sink
+    // Per-batch skip mask for two-kernel mix-batch dispatch
+    // If non-null, the tile loop skips batches where mask[idx_b] is true.
+    const bool* skip_batch_mask = nullptr;
   };
   using KernelParams = KernelArguments;
 
@@ -240,6 +243,8 @@ class XeFMHAFwdKernel {
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
       auto [blk_q, blk_v, head_q, idx_b, unused] = tile_scheduler.get_block_coord();  // (Q,V,h,b)
+      // Mix-batch dispatch: skip batches not owned by this kernel launch.
+      if (p.skip_batch_mask != nullptr && p.skip_batch_mask[idx_b]) continue;
       auto blk_qv = make_coord(blk_q, blk_v);
       int head = head_q / head_group_q;
 
@@ -448,6 +453,11 @@ class XeFMHAFwdDynamicSplitKernel {
     StrideK dK_cache{};
     const ElementV* V_cache = nullptr;
     StrideV dV_cache{};
+    // Per-batch skip mask, see XeFMHAFwdKernel above. Not honored by this
+    // kernel (DynamicSplit scheduler is not used by the chunkprefill
+    // mix-batch path) but kept for uniform aggregate initialization in the
+    // shared runner template.
+    const bool* skip_batch_mask = nullptr;
   };
   using KernelParams = KernelArguments;
 
@@ -890,6 +900,9 @@ class XeFMHAFwdSplitKVKernel {
     StrideO dMax_logits;
 
     const ElementSink* sm_sink;
+    // Per-batch skip mask for two-kernel mix-batch dispatch
+    // (see https://github.com/vllm-project/vllm-xpu-kernels/pull/218).
+    const bool* skip_batch_mask = nullptr;
   };
   using KernelParams = KernelArguments;
 
@@ -990,6 +1003,8 @@ class XeFMHAFwdSplitKVKernel {
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
       auto [blk_q, blk_v, head, idx_b, idx_kv_split] = tile_scheduler.get_block_coord();  // (Q,V,h,b,id_split)
+      // Mix-batch dispatch: skip batches not owned by this kernel launch.
+      if (p.skip_batch_mask != nullptr && p.skip_batch_mask[idx_b]) continue;
       auto blk_qv = make_coord(blk_q, blk_v);
       int head_q_start = head * head_group_q;
 

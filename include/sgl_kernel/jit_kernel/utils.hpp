@@ -121,35 +121,8 @@ inline T warp_reduce_min(const ::sycl::nd_item<3>& item, T value) {
 
 template <typename T>
 inline T block_reduce_sum(const ::sycl::nd_item<3>& item, T value, T* shared_mem) {
-    auto sg = item.get_sub_group();
-    size_t sg_size = sg.get_local_linear_range();
-
-    // First, reduce within warp
-    value = warp_reduce_sum(item, value);
-    
-    // Write warp results to shared memory
-    size_t lid = threadIdx<0>(item);
-    size_t warp_id = lid / sg_size;
-    size_t lane_id = lid % sg_size;
-    
-    if (lane_id == 0) {
-        shared_mem[warp_id] = value;
-    }
-    
-    syncthreads(item);
-    
-    // Final reduction across warps
-    size_t num_warps = (blockDim<0>(item) + sg_size - 1) / sg_size;
-    
-    if (lid < num_warps) {
-        value = shared_mem[lid];
-    } else {
-        value = T(0);
-    }
-    
-    value = warp_reduce_sum(item, value);
-    
-    return value;
+    (void)shared_mem;
+    return ::sycl::reduce_over_group(item.get_group(), value, ::sycl::plus<T>());
 }
 
 // ============================================================================

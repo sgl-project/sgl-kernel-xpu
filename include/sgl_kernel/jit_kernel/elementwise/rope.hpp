@@ -96,24 +96,15 @@ class FusedRopeKernel {
 public:
     using DType2 = aligned_vector<DType, 2>;
     
-    // Calculate vector size for efficient memory access
-    static constexpr int64_t kVecSize = []() {
-        uint32_t power = 1;
-        uint32_t factor = 2 * kWorkThreads * (1 + kIsNeox);
-        while (power * factor < kRopeDim) power *= 2;
-        return power;
-    }();
-    
+    static constexpr int64_t kLanesPerVecGroup = kWorkThreads * (1 + kIsNeox);
+    static constexpr int64_t kTotalVecs = kRopeDim / 2;
+    static constexpr int64_t kVecSize = (kTotalVecs + kLanesPerVecGroup - 1) / kLanesPerVecGroup;
     static constexpr int64_t kDimPerThread = kVecSize * 2 * (1 + kIsNeox);
-    static constexpr uint32_t kLaneCount = kRopeDim / kDimPerThread;
     
     FusedRopeKernel(const FusedRopeParams<DType, IdType>& params) : params_(params) {}
     
     void operator()(::sycl::nd_item<1> item) const {
         const uint32_t lane_id = item.get_local_id(0) % kWorkThreads;
-        if constexpr (kLaneCount < kWorkThreads) {
-            if (lane_id >= kLaneCount) return;
-        }
         
         constexpr uint32_t kBlockSize = 128;
         constexpr uint32_t kWorkersPerBlock = kBlockSize / kWorkThreads;
@@ -152,6 +143,7 @@ public:
                 #pragma unroll 4
                 for (int64_t i = 0; i < kVecSize; ++i) {
                     const int64_t vec_idx = static_cast<int64_t>(lane_id) * kVecSize + i;
+                    if (vec_idx >= kRopeDim / 4) break;
                     DType2 input_vec_x = input_vec_x_ptr[vec_idx];
                     DType2 input_vec_y = input_vec_y_ptr[vec_idx];
                     aligned_vector<float, 2> cos_pair = cos_ptr_vec[vec_idx];
@@ -183,6 +175,7 @@ public:
                 #pragma unroll 4
                 for (int64_t i = 0; i < kVecSize; ++i) {
                     const int64_t vec_idx = static_cast<int64_t>(lane_id) * kVecSize + i;
+                    if (vec_idx >= kRopeDim / 2) break;
                     DType2 input_vec = input_vec_ptr[vec_idx];
                     float cos_val = cos_vec_ptr[vec_idx];
                     float sin_val = sin_vec_ptr[vec_idx];

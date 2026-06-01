@@ -16,6 +16,9 @@ namespace {
 
 static constexpr int sg_size = 32;
 
+// Adapted from triton implementation in sglang "_triton_mrope_forward_fused":
+// https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/rotary_embedding/triton_kernels.py
+
 template <typename scalar_t, bool is_neox, bool is_interleaved>
 struct MRoPEKernel {
   // Grid  : nd_range<2>( {num_tokens, global_rotary_dim}, {1, local_rotary_dim} )

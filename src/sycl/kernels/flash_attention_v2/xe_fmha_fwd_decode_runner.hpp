@@ -323,6 +323,7 @@ struct DecodeRunner {
             stride_K_cache,
             static_cast<const ElementV*>(params.v_ptr),
             stride_V_cache,
+            static_cast<const typename FMHADecodeKernel::ElementSink*>(params.softmax_sink_ptr),
             static_cast<const bool*>(params.skip_batch_mask_ptr),
         },
         {params.softmax_scale, params.page_table, params.page_size, params.max_num_pages_per_seq},

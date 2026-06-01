@@ -74,8 +74,8 @@ configs = list(
         x_names=["batch_size", "num_heads", "head_dim"],
         x_vals=configs,
         line_arg="provider",
-        line_vals=["torch", "jit_xpu"],
-        line_names=["PyTorch Eager", "JIT XPU"],
+        line_vals=["torch_ref", "jit"],
+        line_names=["PyTorch Reference", "JIT (sglang)"],
         styles=[("blue", "-"), ("green", "-")],
         ylabel="us",
         plot_name="jit-qknorm-performance",
@@ -94,13 +94,13 @@ def benchmark(batch_size, num_heads, head_dim, provider):
     
     quantiles = [0.5, 0.2, 0.8]
     
-    if provider == "torch":
+    if provider == "torch_ref":
         def fn():
             q_clone = q.clone()
             k_clone = k.clone()
             pytorch_qknorm(q_clone, k_clone, q_weight, k_weight, eps)
             return q_clone, k_clone
-    elif provider == "jit_xpu":
+    elif provider == "jit":
         # Import here to allow optional dependency
         try:
             from sglang.jit_kernel.norm import fused_inplace_qknorm as jit_qknorm
@@ -136,7 +136,11 @@ def benchmark(batch_size, num_heads, head_dim, provider):
 
 
 if __name__ == "__main__":
-    print("Running JIT QKNorm benchmarks...")
+    print("Running QKNorm benchmarks...")
+    print("Reference: PyTorch eager implementation")
+    print("JIT: sglang.jit_kernel.norm.fused_inplace_qknorm (runtime JIT compilation)")
+    print("Note: No standalone AOT QKNorm available; comparing against PyTorch reference")
+    print("\n" + "=" * 80 + "\n")
     benchmark.run(print_data=True)
     
     # Print bandwidth results
@@ -177,8 +181,8 @@ if __name__ == "__main__":
         values="time_us",
     )
     
-    if "torch" in pivot.columns and "jit_xpu" in pivot.columns:
-        pivot["speedup"] = pivot["torch"] / pivot["jit_xpu"]
+    if "torch_ref" in pivot.columns and "jit" in pivot.columns:
+        pivot["speedup"] = pivot["torch_ref"] / pivot["jit"]
         print(f"\nAverage speedup: {pivot['speedup'].mean():.2f}x")
         print(f"Max speedup: {pivot['speedup'].max():.2f}x")
         print(f"Min speedup: {pivot['speedup'].min():.2f}x")

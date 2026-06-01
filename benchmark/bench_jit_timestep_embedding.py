@@ -80,8 +80,8 @@ configs = list(
         x_names=["batch_size", "dim"],
         x_vals=configs,
         line_arg="provider",
-        line_vals=["torch", "jit_xpu"],
-        line_names=["PyTorch Eager", "JIT XPU"],
+        line_vals=["torch_ref", "jit"],
+        line_names=["PyTorch Reference", "JIT (sglang)"],
         styles=[("blue", "-"), ("green", "-")],
         ylabel="us",
         plot_name="jit-timestep-embedding-performance",
@@ -96,12 +96,12 @@ def benchmark(batch_size, dim, provider):
     
     quantiles = [0.5, 0.2, 0.8]
     
-    if provider == "torch":
+    if provider == "torch_ref":
         fn = lambda: pytorch_timestep_embedding(
             timesteps.clone(), dim, flip_sin_to_cos=False, downscale_freq_shift=0.0,
             scale=1.0, max_period=10000
         )
-    elif provider == "jit_xpu":
+    elif provider == "jit":
         # Import here to allow optional dependency
         try:
             from sglang.jit_kernel.timestep_embedding import timestep_embedding as jit_timestep_embedding
@@ -135,7 +135,11 @@ def benchmark(batch_size, dim, provider):
 
 
 if __name__ == "__main__":
-    print("Running JIT Timestep Embedding benchmarks...")
+    print("Running Timestep Embedding benchmarks...")
+    print("Reference: PyTorch eager implementation")
+    print("JIT: sglang.jit_kernel.timestep_embedding (runtime JIT compilation)")
+    print("Note: No AOT Timestep Embedding available; comparing against PyTorch reference")
+    print("\n" + "=" * 80 + "\n")
     benchmark.run(print_data=True)
     
     # Print bandwidth results
@@ -176,10 +180,10 @@ if __name__ == "__main__":
         values="time_us",
     )
     
-    if "torch" in pivot.columns and "jit_xpu" in pivot.columns:
-        pivot["speedup"] = pivot["torch"] / pivot["jit_xpu"]
+    if "torch_ref" in pivot.columns and "jit" in pivot.columns:
+        pivot["speedup"] = pivot["torch_ref"] / pivot["jit"]
         print(f"\nAverage speedup: {pivot['speedup'].mean():.2f}x")
         print(f"Max speedup: {pivot['speedup'].max():.2f}x")
         print(f"Min speedup: {pivot['speedup'].min():.2f}x")
         print("\nPer-configuration speedup:")
-        print(pivot[["torch", "jit_xpu", "speedup"]].to_markdown())
+        print(pivot[["torch_ref", "jit", "speedup"]].to_markdown())

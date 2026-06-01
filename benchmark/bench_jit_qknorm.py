@@ -149,42 +149,4 @@ if __name__ == "__main__":
     print("=" * 80)
     
     df = pd.DataFrame(all_results)
-    df["bandwidth_gbs"] = df["bandwidth_gbs"].round(2)
-    df["total_bytes_mb"] = df["total_bytes_mb"].round(2)
-    df["time_us"] = df["time_us"].round(2)
-    df["total_flops_m"] = df["total_flops_m"].round(2)
-    df["gflops"] = df["gflops"].round(2)
-    
     print(df.to_markdown(index=False))
-    
-    # Print summary statistics per provider
-    print("\n" + "=" * 80)
-    print("Summary Statistics by Provider")
-    print("=" * 80)
-    summary = df.groupby("provider").agg(
-        {
-            "bandwidth_gbs": ["mean", "min", "max"],
-            "time_us": ["mean", "min", "max"],
-            "gflops": ["mean", "min", "max"],
-        }
-    )
-    print(summary.to_markdown())
-    
-    # Print speedup analysis
-    print("\n" + "=" * 80)
-    print("Speedup Analysis")
-    print("=" * 80)
-    
-    pivot = df.pivot_table(
-        index=["batch_size", "num_heads", "head_dim"],
-        columns="provider",
-        values="time_us",
-    )
-    
-    if "torch_ref" in pivot.columns and "jit" in pivot.columns:
-        pivot["speedup"] = pivot["torch_ref"] / pivot["jit"]
-        print(f"\nAverage speedup: {pivot['speedup'].mean():.2f}x")
-        print(f"Max speedup: {pivot['speedup'].max():.2f}x")
-        print(f"Min speedup: {pivot['speedup'].min():.2f}x")
-        print("\nTop 10 speedups:")
-        print(pivot[["torch", "jit_xpu", "speedup"]].nlargest(10, "speedup").to_markdown())

@@ -1,21 +1,19 @@
-"""Benchmark JIT RMSNorm kernel vs PyTorch eager implementation."""
+"""Benchmark JIT RMSNorm kernel vs AOT implementation."""
 import itertools
 
 import pandas as pd
 import torch
 import triton
 
+try:
+    import sgl_kernel
+    HAS_AOT = True
+except ImportError:
+    HAS_AOT = False
+    print("Warning: sgl_kernel not available, AOT comparison will be skipped")
+
 # Storage for bandwidth/performance results
 all_results = []
-
-
-def pytorch_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6):
-    """PyTorch reference implementation of RMS normalization."""
-    orig_dtype = input.dtype
-    input_float = input.float()
-    variance = input_float.pow(2).mean(dim=-1, keepdim=True)
-    output = input_float * torch.rsqrt(variance + eps) * weight.float()
-    return output.to(orig_dtype)
 
 
 def calculate_effective_bandwidth(batch_size, hidden_size, time_ms):
@@ -41,10 +39,11 @@ def calculate_effective_bandwidth(batch_size, hidden_size, time_ms):
 
 
 # Test configurations
+# JIT RMSNorm supported hidden_sizes: [64, 128, 256, 512, 1024, 1536, 2048, 2304, 2560, 3072, 4096, 5120, 6144, 7168, 8192, 12288, 16384]
 configs = list(
     itertools.product(
         [1, 128, 256, 512, 1024, 4096],  # batch_size
-        [2048, 4096, 8192, 11008],  # hidden_size
+        [2048, 4096, 8192, 12288],  # hidden_size (using supported sizes only)
     )
 )
 
@@ -54,11 +53,11 @@ configs = list(
         x_names=["batch_size", "hidden_size"],
         x_vals=configs,
         line_arg="provider",
-        line_vals=["torch", "jit_xpu"],
-        line_names=["PyTorch Eager", "JIT XPU"],
+        line_vals=["aot", "jit"],
+        line_names=["AOT (sgl_kernel)", "JIT (sglang)"],
         styles=[("blue", "-"), ("green", "-")],
         ylabel="us",
-        plot_name="jit-rmsnorm-performance",
+        plot_name="aot-vs-jit-rmsnorm-performance",
         args={},
     )
 )
@@ -72,9 +71,12 @@ def benchmark(batch_size, hidden_size, provider):
     
     quantiles = [0.5, 0.2, 0.8]
     
-    if provider == "torch":
-        fn = lambda: pytorch_rmsnorm(input_tensor.clone(), weight, eps)
-    elif provider == "jit_xpu":
+    if provider == "aot":
+        if not HAS_AOT:
+            print("Warning: sgl_kernel AOT not available, skipping")
+            return 0, 0, 0
+        fn = lambda: sgl_kernel.rmsnorm(input_tensor.clone(), weight, eps)
+    elif provider == "jit":
         # Import here to allow optional dependency
         try:
             from sglang.jit_kernel.norm import rmsnorm as jit_rmsnorm
@@ -106,7 +108,15 @@ def benchmark(batch_size, hidden_size, provider):
 
 
 if __name__ == "__main__":
-    print("Running JIT RMSNorm benchmarks...")
+    if not HAS_AOT:
+        print("ERROR: sgl_kernel (AOT) not available. Please install sgl-kernel-xpu.")
+        exit(1)
+    
+    print("Running AOT vs JIT RMSNorm benchmarks...")
+    print("AOT: sgl_kernel.rmsnorm (compiled SYCL kernels)")
+    print("JIT: sglang.jit_kernel.norm.rmsnorm (runtime JIT compilation)")
+    print("\n" + "=" * 80 + "\n")
+    
     benchmark.run(print_data=True)
     
     # Print bandwidth results
@@ -147,10 +157,11 @@ if __name__ == "__main__":
         values="time_us",
     )
     
-    if "torch" in pivot.columns and "jit_xpu" in pivot.columns:
-        pivot["speedup"] = pivot["torch"] / pivot["jit_xpu"]
-        print(f"\nAverage speedup: {pivot['speedup'].mean():.2f}x")
+    if "aot" in pivot.columns and "jit" in pivot.columns:
+        pivot["speedup"] = pivot["aot"] / pivot["jit"]
+        print(f"\nJIT Speedup vs AOT (>1.0 means JIT is faster):")
+        print(f"Average speedup: {pivot['speedup'].mean():.2f}x")
         print(f"Max speedup: {pivot['speedup'].max():.2f}x")
         print(f"Min speedup: {pivot['speedup'].min():.2f}x")
-        print("\nPer-configuration speedup:")
-        print(pivot[["torch", "jit_xpu", "speedup"]].to_markdown())
+        print("\nPer-configuration comparison:")
+        print(pivot[["aot", "jit", "speedup"]].to_markdown())

@@ -186,6 +186,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       torch::kXPU,
       &at::native::xpu::fused_qk_rope_with_cos_sin_cache_inplace);
 
+  m.def(
+      "multomodal_rotary_embedding(Tensor! query, Tensor! key, Tensor! cos_sin_cache, Tensor! positions, "
+      "int[] mrope_section, int head_size, int rotary_dim, bool mrope_interleaved, bool mrope_interleaved_glm, "
+      "bool is_neox_style, Tensor? axis_map) -> ()");
+  m.impl("multomodal_rotary_embedding", torch::kXPU, &at::native::xpu::multomodal_rotary_embedding);
+
   /* utils */
   m.def("query_device(int device_id) -> (int, int)");
   m.impl("query_device", c10::DispatchKey::BackendSelect, &query_device);

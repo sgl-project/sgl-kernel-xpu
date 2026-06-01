@@ -609,6 +609,21 @@ void apply_rope_inplace_with_kvcache_xpu(
   TORCH_CHECK(query.dim() == 3, "query must be 3D [num_tokens, n_heads, head_dim]");
   TORCH_CHECK(key.dim() == 3, "key must be 3D [num_tokens, n_kv_heads, head_dim]");
   TORCH_CHECK(value.dim() == 3, "value must be 3D [num_tokens, n_kv_heads, head_dim]");
+  TORCH_CHECK(
+      query.is_contiguous(),
+      "query must be contiguous because the XPU RoPE kernel uses packed indexing");
+  TORCH_CHECK(
+      key.is_contiguous(),
+      "key must be contiguous because the XPU RoPE kernel uses packed indexing");
+  TORCH_CHECK(
+      value.is_contiguous(),
+      "value must be contiguous because the XPU RoPE kernel uses packed indexing");
+  TORCH_CHECK(
+      k_cache.is_contiguous(),
+      "k_cache must be contiguous because the XPU RoPE kernel uses packed indexing");
+  TORCH_CHECK(
+      v_cache.is_contiguous(),
+      "v_cache must be contiguous because the XPU RoPE kernel uses packed indexing");
 
   int64_t num_tokens = query.size(0);
   int64_t num_q_heads = query.size(1);

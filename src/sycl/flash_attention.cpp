@@ -149,12 +149,9 @@ std::vector<at::Tensor> mha_fwd(
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin,
-    // Optional pre-allocated output tensor. When set, decode writes into it
-    // instead of allocating a fresh one (used by the chunkprefill two-launch
-    // dispatcher so decode + prefill share the same O buffer).
+    // chunkprefill two-launch path: pre-allocated shared output, and a per-batch
+    // bool mask (length = batch) whose true entries are skipped by the kernel.
     std::optional<at::Tensor> out_opt = std::nullopt,
-    // Optional device-side per-batch skip mask (bool, length = batch). When
-    // set, batches where mask[idx_b] is true are skipped by the kernel.
     std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
@@ -490,12 +487,9 @@ std::vector<at::Tensor> mha_fwd(
     int num_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin,
-    // Optional pre-allocated output tensor. When set, prefill writes into it
-    // instead of allocating a fresh one (used by the chunkprefill two-launch
-    // dispatcher so decode + prefill share the same O buffer).
+    // chunkprefill two-launch path: pre-allocated shared output, and a per-batch
+    // bool mask (length = batch) whose true entries are skipped by the kernel.
     std::optional<at::Tensor> out_opt = std::nullopt,
-    // Optional device-side per-batch skip mask (bool, length = batch). When
-    // set, batches where mask[idx_b] is true are skipped by the kernel.
     std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
@@ -808,82 +802,22 @@ std::vector<at::Tensor> mha_fwd(
   TORCH_CHECK(batch_size >= 0, "cu_seqlens_q must have at least 1 element.");
 
   auto seqlens_q = cu_seqlens_q.slice(0, 1, batch_size + 1).sub(cu_seqlens_q.slice(0, 0, batch_size));
-  auto is_prefill_mask = seqlens_q.gt(1).to(at::kBool).contiguous();
-  auto is_decode_mask = seqlens_q.le(1).to(at::kBool).contiguous();
+  auto is_prefill = seqlens_q.gt(1).contiguous();  // true for prefill batches
 
-  std::optional<at::Tensor> decode_mask = is_prefill_mask;
-  std::optional<at::Tensor> prefill_mask = is_decode_mask;
+  // Forward every shared argument to a sub-kernel, overriding only the output
+  // tensor (out_opt) and the per-batch skip mask.
+  auto launch = [&](auto&& fn, std::optional<at::Tensor> out_opt, std::optional<at::Tensor> skip_mask) {
+    return fn(
+        q, k, v, q_v_, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx_, leftpad_k_,
+        rotary_cos_, rotary_sin_, seqlens_rotary_, q_descale_, k_descale_, v_descale_, softmax_scale_, sinks_, is_causal,
+        window_size_left, window_size_right, softcap, is_rotary_interleaved, scheduler_metadata_, num_kv_splits,
+        pack_gqa_, sm_margin, std::move(out_opt), std::move(skip_mask));
+  };
 
-  // [BENCH-A] Let decode allocate out, then hand it to prefill via out_opt.
-  std::optional<at::Tensor> out_opt = std::nullopt;
-  auto decode_ret = decode::mha_fwd(
-      q,
-      k,
-      v,
-      q_v_,
-      cu_seqlens_q,
-      cu_seqlens_k,
-      max_seqlen_q,
-      max_seqlen_k,
-      page_table,
-      kv_batch_idx_,
-      leftpad_k_,
-      rotary_cos_,
-      rotary_sin_,
-      seqlens_rotary_,
-      q_descale_,
-      k_descale_,
-      v_descale_,
-      softmax_scale_,
-      sinks_,
-      is_causal,
-      window_size_left,
-      window_size_right,
-      softcap,
-      is_rotary_interleaved,
-      scheduler_metadata_,
-      num_kv_splits,
-      pack_gqa_,
-      sm_margin,
-      out_opt,
-      decode_mask);
-  (void)decode_ret;
-
-  auto out = decode_ret[0];
-  out_opt = out;
-
-  // Launch 2: prefill kernel on full batch, skip decode batches.
-  (void)prefill::mha_fwd(
-      q,
-      k,
-      v,
-      q_v_,
-      cu_seqlens_q,
-      cu_seqlens_k,
-      max_seqlen_q,
-      max_seqlen_k,
-      page_table,
-      kv_batch_idx_,
-      leftpad_k_,
-      rotary_cos_,
-      rotary_sin_,
-      seqlens_rotary_,
-      q_descale_,
-      k_descale_,
-      v_descale_,
-      softmax_scale_,
-      sinks_,
-      is_causal,
-      window_size_left,
-      window_size_right,
-      softcap,
-      is_rotary_interleaved,
-      scheduler_metadata_,
-      num_kv_splits,
-      pack_gqa_,
-      sm_margin,
-      out_opt,
-      prefill_mask);
+  // Launch 1: decode allocates the shared output and skips prefill batches.
+  auto out = launch(decode::mha_fwd, std::nullopt, is_prefill)[0];
+  // Launch 2: prefill writes into the same output and skips decode batches.
+  launch(prefill::mha_fwd, out, is_prefill.logical_not());
 
   // softmax_lse / accum tensors are not stitched here; return empty
   // placeholders to keep the Python ABI stable.

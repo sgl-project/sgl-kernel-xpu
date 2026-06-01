@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <sycl/sycl.hpp>
 
 namespace sgl {
@@ -143,7 +144,8 @@ void timestep_embedding_launcher(
     // Similar thread configuration to CUDA version
     constexpr int kMaxThreadsPerBlock = 1024;
     
-    const int num_threads_per_row = std::min(kMaxThreadsPerBlock, half_dim / 4);
+    const int num_threads_per_row =
+        std::max(1, std::min(kMaxThreadsPerBlock, half_dim));
     
     const size_t threads_per_group = num_threads_per_row;
     const size_t num_groups = batch_size;

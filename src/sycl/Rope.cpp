@@ -609,21 +609,11 @@ void apply_rope_inplace_with_kvcache(
   TORCH_CHECK(query.dim() == 3, "query must be 3D [num_tokens, n_heads, head_dim]");
   TORCH_CHECK(key.dim() == 3, "key must be 3D [num_tokens, n_kv_heads, head_dim]");
   TORCH_CHECK(value.dim() == 3, "value must be 3D [num_tokens, n_kv_heads, head_dim]");
-  TORCH_CHECK(
-      query.is_contiguous(),
-      "query must be contiguous because the XPU RoPE kernel uses packed indexing");
-  TORCH_CHECK(
-      key.is_contiguous(),
-      "key must be contiguous because the XPU RoPE kernel uses packed indexing");
-  TORCH_CHECK(
-      value.is_contiguous(),
-      "value must be contiguous because the XPU RoPE kernel uses packed indexing");
-  TORCH_CHECK(
-      k_cache.is_contiguous(),
-      "k_cache must be contiguous because the XPU RoPE kernel uses packed indexing");
-  TORCH_CHECK(
-      v_cache.is_contiguous(),
-      "v_cache must be contiguous because the XPU RoPE kernel uses packed indexing");
+  TORCH_CHECK(query.is_contiguous(), "query must be contiguous because the XPU RoPE kernel uses packed indexing");
+  TORCH_CHECK(key.is_contiguous(), "key must be contiguous because the XPU RoPE kernel uses packed indexing");
+  TORCH_CHECK(value.is_contiguous(), "value must be contiguous because the XPU RoPE kernel uses packed indexing");
+  TORCH_CHECK(k_cache.is_contiguous(), "k_cache must be contiguous because the XPU RoPE kernel uses packed indexing");
+  TORCH_CHECK(v_cache.is_contiguous(), "v_cache must be contiguous because the XPU RoPE kernel uses packed indexing");
 
   int64_t num_tokens = query.size(0);
   int64_t num_q_heads = query.size(1);
@@ -634,11 +624,18 @@ void apply_rope_inplace_with_kvcache(
   TORCH_CHECK(key.size(2) == head_dim, "key head_dim must match query head_dim");
   TORCH_CHECK(value.size(1) == num_kv_heads, "value num_heads must match key");
   TORCH_CHECK(value.size(2) == head_dim, "value head_dim must match key head_dim");
-  TORCH_CHECK(rot_dim <= head_dim,
-              "rot_dim (", rot_dim, ") must be <= head_dim (", head_dim,
-              "); cos_sin_cache.size(1) cannot exceed query head_dim");
-  TORCH_CHECK(rot_dim % 2 == 0,
-              "rot_dim (", rot_dim, ") must be even; the kernel pairs rotary components as (i, i+rot_dim/2) or (2i, 2i+1)");
+  TORCH_CHECK(
+      rot_dim <= head_dim,
+      "rot_dim (",
+      rot_dim,
+      ") must be <= head_dim (",
+      head_dim,
+      "); cos_sin_cache.size(1) cannot exceed query head_dim");
+  TORCH_CHECK(
+      rot_dim % 2 == 0,
+      "rot_dim (",
+      rot_dim,
+      ") must be even; the kernel pairs rotary components as (i, i+rot_dim/2) or (2i, 2i+1)");
 
   auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
   int64_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
@@ -646,11 +643,7 @@ void apply_rope_inplace_with_kvcache(
   int64_t group_size = std::min<int64_t>(std::min<int64_t>(max_work, 512), max_wg_size);
 
   SYCL_DISPATCH_FLOATING_TYPES(
-      at::ScalarType::Half,
-      at::ScalarType::BFloat16,
-      query.scalar_type(),
-      "apply_rope_inplace_with_kvcache",
-      [&]() {
+      at::ScalarType::Half, at::ScalarType::BFloat16, query.scalar_type(), "apply_rope_inplace_with_kvcache", [&]() {
         auto cgf = DPCPP_Q_CGF(cgh) {
           if (is_neox) {
             FusedRopeKVCacheKernel<scalar_t, EmbeddingAlgorithm::RotateHalf> kernel = {

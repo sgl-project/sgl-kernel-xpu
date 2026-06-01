@@ -488,6 +488,98 @@ def test_rot_dim_exceeds_head_dim_rejected() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Validation: positions / out_loc shape & dtype.
+# The kernel reads positions_[token_id] and out_loc_[token_id] indexed by
+# work-group id (1 group per token). A short or wrong-dtype tensor would lead
+# to OOB device reads — these checks must trip on host before launch.
+# ---------------------------------------------------------------------------
+
+
+def _make_valid_inputs(batch_size: int = 4, head_dim: int = 64):
+    num_q_heads, num_kv_heads = 4, 2
+    cache_size = 64
+    dtype = torch.bfloat16
+    q = torch.randn(batch_size, num_q_heads, head_dim, device=DEVICE, dtype=dtype)
+    k = torch.randn(batch_size, num_kv_heads, head_dim, device=DEVICE, dtype=dtype)
+    v = torch.randn(batch_size, num_kv_heads, head_dim, device=DEVICE, dtype=dtype)
+    k_cache = torch.zeros(
+        cache_size, num_kv_heads * head_dim, device=DEVICE, dtype=dtype
+    )
+    v_cache = torch.zeros(
+        cache_size, num_kv_heads * head_dim, device=DEVICE, dtype=dtype
+    )
+    cos_sin_cache = create_cos_sin_cache(head_dim).float()
+    positions = torch.zeros(batch_size, device=DEVICE, dtype=torch.int64)
+    out_loc = torch.arange(batch_size, device=DEVICE, dtype=torch.int64)
+    return q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc
+
+
+@pytest.mark.parametrize("which", ["positions", "out_loc"])
+def test_short_index_tensor_rejected(which: str) -> None:
+    """positions / out_loc shorter than num_tokens must be rejected on the host."""
+    q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc = _make_valid_inputs()
+    if which == "positions":
+        positions = positions[:-1]
+    else:
+        out_loc = out_loc[:-1]
+
+    with pytest.raises(RuntimeError, match=f"{which}.size\\(0\\)"):
+        apply_rope_inplace_with_kvcache(
+            q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc, True
+        )
+
+
+@pytest.mark.parametrize("which", ["positions", "out_loc"])
+def test_long_index_tensor_rejected(which: str) -> None:
+    """positions / out_loc longer than num_tokens must also be rejected."""
+    q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc = _make_valid_inputs()
+    extra = torch.zeros(1, device=DEVICE, dtype=torch.int64)
+    if which == "positions":
+        positions = torch.cat([positions, extra])
+    else:
+        out_loc = torch.cat([out_loc, extra])
+
+    with pytest.raises(RuntimeError, match=f"{which}.size\\(0\\)"):
+        apply_rope_inplace_with_kvcache(
+            q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc, True
+        )
+
+
+@pytest.mark.parametrize("which", ["positions", "out_loc"])
+def test_index_tensor_must_be_1d(which: str) -> None:
+    """A 2-D positions/out_loc with the right total element count must still be rejected."""
+    q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc = _make_valid_inputs()
+    if which == "positions":
+        positions = positions.view(2, -1)
+    else:
+        out_loc = out_loc.view(2, -1)
+
+    with pytest.raises(RuntimeError, match="1-D"):
+        apply_rope_inplace_with_kvcache(
+            q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc, True
+        )
+
+
+@pytest.mark.parametrize("which", ["positions", "out_loc"])
+def test_index_tensor_must_be_int64(which: str) -> None:
+    """The kernel reads int64 strides; the raw op must reject int32 inputs.
+
+    The Python wrapper coerces to int64 via .long(), so this exercises the C++
+    TORCH_CHECK directly through torch.ops to cover the defense-in-depth path.
+    """
+    q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc = _make_valid_inputs()
+    if which == "positions":
+        positions = positions.to(torch.int32)
+    else:
+        out_loc = out_loc.to(torch.int32)
+
+    with pytest.raises(RuntimeError, match="int64"):
+        torch.ops.sgl_kernel.apply_rope_inplace_with_kvcache(
+            q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc, True
+        )
+
+
 def test_mqa_configuration() -> None:
     """Test Multi-Query Attention (MQA) with num_kv_heads=1."""
     batch_size, num_q_heads, num_kv_heads, head_dim = 32, 32, 1, 128

@@ -637,6 +637,30 @@ void apply_rope_inplace_with_kvcache(
       rot_dim,
       ") must be even; the kernel pairs rotary components as (i, i+rot_dim/2) or (2i, 2i+1)");
 
+  // The kernel reads positions_[token_id] and out_loc_[token_id] indexed by the
+  // SYCL work-group id (1 group per token); a shorter tensor would alias OOB.
+  TORCH_CHECK(positions.dim() == 1, "positions must be 1-D, got dim=", positions.dim());
+  TORCH_CHECK(out_loc.dim() == 1, "out_loc must be 1-D, got dim=", out_loc.dim());
+  TORCH_CHECK(
+      positions.scalar_type() == at::ScalarType::Long, "positions must be int64, got ", positions.scalar_type());
+  TORCH_CHECK(out_loc.scalar_type() == at::ScalarType::Long, "out_loc must be int64, got ", out_loc.scalar_type());
+  TORCH_CHECK(
+      positions.size(0) == num_tokens,
+      "positions.size(0) (",
+      positions.size(0),
+      ") must equal num_tokens (",
+      num_tokens,
+      ")");
+  TORCH_CHECK(
+      out_loc.size(0) == num_tokens,
+      "out_loc.size(0) (",
+      out_loc.size(0),
+      ") must equal num_tokens (",
+      num_tokens,
+      ")");
+  TORCH_CHECK(positions.is_contiguous(), "positions must be contiguous");
+  TORCH_CHECK(out_loc.is_contiguous(), "out_loc must be contiguous");
+
   auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
   int64_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
   int64_t max_work = std::max(num_q_heads * rot_dim / 2, num_kv_heads * head_dim);

@@ -195,7 +195,7 @@ def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
     return out
 
 
-def apply_rope_inplace_with_kvcache_xpu(
+def apply_rope_inplace_with_kvcache(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -238,7 +238,7 @@ def apply_rope_inplace_with_kvcache_xpu(
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache must be float32")
 
-    torch.ops.sgl_kernel.apply_rope_inplace_with_kvcache_xpu(
+    torch.ops.sgl_kernel.apply_rope_inplace_with_kvcache(
         query,
         key,
         value,

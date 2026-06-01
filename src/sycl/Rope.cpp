@@ -592,7 +592,7 @@ struct FusedRopeKVCacheKernel {
   int64_t rot_dim_;
 };
 
-void apply_rope_inplace_with_kvcache_xpu(
+void apply_rope_inplace_with_kvcache(
     at::Tensor& query,          // [num_tokens, n_q_heads, head_dim]
     at::Tensor& key,            // [num_tokens, n_kv_heads, head_dim]
     at::Tensor& value,          // [num_tokens, n_kv_heads, head_dim]
@@ -634,6 +634,11 @@ void apply_rope_inplace_with_kvcache_xpu(
   TORCH_CHECK(key.size(2) == head_dim, "key head_dim must match query head_dim");
   TORCH_CHECK(value.size(1) == num_kv_heads, "value num_heads must match key");
   TORCH_CHECK(value.size(2) == head_dim, "value head_dim must match key head_dim");
+  TORCH_CHECK(rot_dim <= head_dim,
+              "rot_dim (", rot_dim, ") must be <= head_dim (", head_dim,
+              "); cos_sin_cache.size(1) cannot exceed query head_dim");
+  TORCH_CHECK(rot_dim % 2 == 0,
+              "rot_dim (", rot_dim, ") must be even; the kernel pairs rotary components as (i, i+rot_dim/2) or (2i, 2i+1)");
 
   auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
   int64_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
@@ -644,7 +649,7 @@ void apply_rope_inplace_with_kvcache_xpu(
       at::ScalarType::Half,
       at::ScalarType::BFloat16,
       query.scalar_type(),
-      "apply_rope_inplace_with_kvcache_xpu",
+      "apply_rope_inplace_with_kvcache",
       [&]() {
         auto cgf = DPCPP_Q_CGF(cgh) {
           if (is_neox) {

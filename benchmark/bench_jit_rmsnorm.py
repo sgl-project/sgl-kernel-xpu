@@ -119,49 +119,9 @@ if __name__ == "__main__":
     
     benchmark.run(print_data=True)
     
-    # Print bandwidth results
-    print("\n" + "=" * 80)
-    print("Effective Bandwidth Results")
-    print("=" * 80)
+    print("Benchmark finished!")
+    
+    import pandas as pd
     
     df = pd.DataFrame(all_results)
-    df["bandwidth_gbs"] = df["bandwidth_gbs"].round(2)
-    df["total_bytes_mb"] = df["total_bytes_mb"].round(2)
-    df["time_us"] = df["time_us"].round(2)
-    df["total_flops_m"] = df["total_flops_m"].round(2)
-    df["gflops"] = df["gflops"].round(2)
-    
     print(df.to_markdown(index=False))
-    
-    # Print summary statistics per provider
-    print("\n" + "=" * 80)
-    print("Summary Statistics by Provider")
-    print("=" * 80)
-    summary = df.groupby("provider").agg(
-        {
-            "bandwidth_gbs": ["mean", "min", "max"],
-            "time_us": ["mean", "min", "max"],
-            "gflops": ["mean", "min", "max"],
-        }
-    )
-    print(summary.to_markdown())
-    
-    # Print speedup analysis
-    print("\n" + "=" * 80)
-    print("Speedup Analysis")
-    print("=" * 80)
-    
-    pivot = df.pivot_table(
-        index=["batch_size", "hidden_size"],
-        columns="provider",
-        values="time_us",
-    )
-    
-    if "aot" in pivot.columns and "jit" in pivot.columns:
-        pivot["speedup"] = pivot["aot"] / pivot["jit"]
-        print(f"\nJIT Speedup vs AOT (>1.0 means JIT is faster):")
-        print(f"Average speedup: {pivot['speedup'].mean():.2f}x")
-        print(f"Max speedup: {pivot['speedup'].max():.2f}x")
-        print(f"Min speedup: {pivot['speedup'].min():.2f}x")
-        print("\nPer-configuration comparison:")
-        print(pivot[["aot", "jit", "speedup"]].to_markdown())

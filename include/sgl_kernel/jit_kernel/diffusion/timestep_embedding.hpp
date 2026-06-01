@@ -76,8 +76,10 @@ public:
         const size_t tid = item.get_local_id(0);
         const size_t num_threads = item.get_local_range(0);
 
+        const int vec_half_dim = (half_dim / 4) * 4;
+
         // Process in chunks of 4 (vectorized)
-        for (size_t thread_offset = tid; thread_offset * 4 < static_cast<size_t>(half_dim); thread_offset += num_threads) {
+        for (size_t thread_offset = tid; thread_offset * 4 < static_cast<size_t>(vec_half_dim); thread_offset += num_threads) {
             float4* top_half;
             float4* bottom_half;
             
@@ -111,6 +113,21 @@ public:
             sin_vals[2] = ::sycl::sin(vals[2]);
             sin_vals[3] = ::sycl::sin(vals[3]);
             *bottom_half = sin_vals;
+        }
+
+        // Handle remaining elements (scalar tail loop)
+        for (int i = vec_half_dim + tid; i < half_dim; i += num_threads) {
+            const float freq = scale_ * t_val * ::sycl::exp(neg_log_max_period_ * static_cast<float>(i));
+            const float cos_val = ::sycl::cos(freq);
+            const float sin_val = ::sycl::sin(freq);
+            
+            if constexpr (!kFlipSinToCos) {
+                output_batch_base_ptr[i] = cos_val;
+                output_batch_base_ptr[half_dim + i] = sin_val;
+            } else {
+                output_batch_base_ptr[i] = sin_val;
+                output_batch_base_ptr[half_dim + i] = cos_val;
+            }
         }
     }
 

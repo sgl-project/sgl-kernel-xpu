@@ -139,6 +139,10 @@ void timestep_embedding_launcher(
     int max_period,
     int batch_size
 ) {
+    if (batch_size <= 0 || dim <= 0) {
+        return;
+    }
+
     const int half_dim = dim / 2;
     
     // Similar thread configuration to CUDA version

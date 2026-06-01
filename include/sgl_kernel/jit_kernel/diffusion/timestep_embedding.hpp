@@ -122,11 +122,11 @@ public:
             const float sin_val = ::sycl::sin(freq);
             
             if constexpr (!kFlipSinToCos) {
-                output_batch_base_ptr[i] = cos_val;
-                output_batch_base_ptr[half_dim + i] = sin_val;
-            } else {
                 output_batch_base_ptr[i] = sin_val;
                 output_batch_base_ptr[half_dim + i] = cos_val;
+            } else {
+                output_batch_base_ptr[i] = cos_val;
+                output_batch_base_ptr[half_dim + i] = sin_val;
             }
         }
     }

@@ -1,4 +1,4 @@
-from typing import Optional, List
+from typing import List, Optional
 
 import torch
 from sgl_kernel.utils import get_xpu_stream
@@ -475,7 +475,7 @@ def multimodal_rotary_embedding(
     mrope_interleaved: bool,
     mrope_interleaved_glm: bool,
     is_neox: bool,
-    axis_map: Optional[torch.Tensor]
+    axis_map: Optional[torch.Tensor],
 ) -> None:
     r"""Apply multimodal RoPE to Q/K using precomputed cos/sin cache.
 
@@ -517,4 +517,3 @@ def multimodal_rotary_embedding(
         is_neox,
         axis_map,
     )
-

@@ -560,12 +560,44 @@ struct FusedRopeKVCacheKernel {
     }
 
     // Copy non-rotated dims of K to cache (if head_dim > rot_dim)
-    // and write full V to v_cache
+    // and write full V to v_cache.
+    // V is a pure copy — for 2-byte scalar_t (bf16 / half) we vectorize as
+    // 16-byte block loads/stores using the `pack_128b_t = sycl::vec<uint32_t, 4>`
+    // idiom (mirrors src/sycl/merge_states.cpp:106). This avoids the
+    // c10::BFloat16 / c10::Half element-type-trait mismatch that
+    // sycl::vec<scalar_t, 8> would hit, while still emitting a single 16-byte
+    // block load/store per work-item — i.e. 8 bf16 / half elements. Row stride
+    // (num_kv_heads * head_dim * sizeof(scalar_t)) is a multiple of 16 B for
+    // every supported config (checked at the host boundary via TORCH_CHECK on
+    // (num_kv_heads * head_dim) % 8 == 0). For 4-byte scalar_t (float) the
+    // SYCL_DISPATCH_FLOATING_TYPES surface still instantiates this kernel, but
+    // the host TORCH_CHECK rejects float at runtime — keep a scalar fallback
+    // here so the float instantiation still compiles.
     scalar_t* v_base = value_ + token_id * num_kv_heads_ * head_dim_;
     scalar_t* v_cache_row = v_cache_ + out_idx * num_kv_heads_ * head_dim_;
     int32_t full_work = num_kv_heads_ * head_dim_;
-    for (int i = local_id; i < full_work; i += local_range) {
-      v_cache_row[i] = v_base[i];
+    if constexpr (sizeof(scalar_t) == 2) {
+      using pack_128b_t = sycl::vec<uint32_t, 4>;
+      constexpr int kVecLen = 8;  // bf16/half elements per 16-byte pack
+      int32_t vec_count = full_work / kVecLen;
+      auto* v_base_p = reinterpret_cast<uint32_t*>(v_base);
+      auto* v_cache_p = reinterpret_cast<uint32_t*>(v_cache_row);
+      for (int v = local_id; v < vec_count; v += local_range) {
+        pack_128b_t tmp;
+        tmp.load(v, v_base_p);
+        tmp.store(v, v_cache_p);
+      }
+      // Tail (only fires if full_work is not a multiple of kVecLen, which the
+      // host TORCH_CHECK forbids — kept for safety).
+      for (int i = vec_count * kVecLen + local_id; i < full_work; i += local_range) {
+        v_cache_row[i] = v_base[i];
+      }
+    } else {
+      // float fallback — never hit at runtime (host check rejects), but kept
+      // for compilation under SYCL_DISPATCH_FLOATING_TYPES.
+      for (int i = local_id; i < full_work; i += local_range) {
+        v_cache_row[i] = v_base[i];
+      }
     }
 
     // For head_dim > rot_dim: copy the non-rotated tail of K to cache
@@ -636,6 +668,11 @@ void apply_rope_inplace_with_kvcache(
       "rot_dim (",
       rot_dim,
       ") must be even; the kernel pairs rotary components as (i, i+rot_dim/2) or (2i, 2i+1)");
+  TORCH_CHECK(
+      (num_kv_heads * head_dim) % 8 == 0,
+      "num_kv_heads * head_dim (",
+      num_kv_heads * head_dim,
+      ") must be a multiple of 8 so the vectorized V-cache stores stay 16-byte-aligned");
 
   // The kernel reads positions_[token_id] and out_loc_[token_id] indexed by the
   // SYCL work-group id (1 group per token); a shorter tensor would alias OOB.

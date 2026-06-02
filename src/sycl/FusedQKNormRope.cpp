@@ -1,44 +1,24 @@
 #include <ATen/ATen.h>
 #include <ATen/OpMathType.h>
-#include <ATen/Parallel.h>
 #include <c10/util/Float8_e4m3fn.h>
-#include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
 #include <cmath>
 #include <cstdint>
-#include <iostream>
 #include <sycl/sycl.hpp>
-#include <vector>
 
-#include "MemoryAccess.h"
-#include "Norm.h"
-#include "SYCLHelpers.h"
+#include "QKNormCommon.h"
 #include "Utils.h"
 #include "cutlass/float8.h"
 
-// TODO: Remove this when sycl float8 is supported
 using cutlass::float_e4m3_t;
 
 namespace at::native::xpu {
 
-template <typename T>
-inline T divUp(T m, T n) {
-  return (m + n - 1) / n;
-}
-
-// Sub-group reduction for sum
-template <typename T>
-inline T subGroupReduceSum(T val, const sycl::sub_group& sg) {
-  for (int offset = sg.get_max_local_range()[0] / 2; offset > 0; offset /= 2) {
-    val += sycl::shift_group_left(sg, val, offset);
-  }
-  return val;
-}
-
-inline float compute_freq_yarn(float base, int rotary_dim, int half_dim, float factor, float low, float high) {
-  // freq_idx is the value from arange(0, rotary_dim, 2): i.e., 0, 2, 4, 6, ...
-  float freq = sycl::pow(base, -2.0f * static_cast<float>(half_dim) / static_cast<float>(rotary_dim));
+static inline float
+compute_freq_yarn_rope(float log2_base, int rotary_dim, int half_dim, float factor, float low, float high) {
+  const float exponent = -2.0f * static_cast<float>(half_dim) / static_cast<float>(rotary_dim);
+  float freq = sycl::exp2(exponent * log2_base);
 
   if (factor != 1.0f) {
     float inv_freq_extrapolation = freq;
@@ -49,189 +29,366 @@ inline float compute_freq_yarn(float base, int rotary_dim, int half_dim, float f
       high_adj += 0.001f;
     }
 
-    // Match Python: dim_range is [0, 2, 4, 6, ...], so use 2*half_dim
     float dim_value = 2.0f * static_cast<float>(half_dim);
     float linear_func = (dim_value - low) / (high_adj - low);
     float ramp_func = sycl::fmin(sycl::fmax(linear_func, 0.0f), 1.0f);
-
-    // Match Python formula exactly
     freq = inv_freq_interpolation * (1.0f - ramp_func) + inv_freq_extrapolation * ramp_func;
   }
 
   return freq;
 }
 
-// SYCL Kernel for Fused QK Norm and RoPE
-template <int head_dim, bool interleave, typename scalar_t>
-struct FusedQKNormRopeKernel {
-  scalar_t* qkv;
-  int num_heads_q;
-  int num_heads_k;
-  int num_heads_v;
-  float eps;
-  const scalar_t* q_weight;
-  const scalar_t* k_weight;
-  float base;
+template <bool interleave>
+struct QKNormRopePostOp {
   const int* position_ids;
-  int num_tokens;
+  float log2_base;
   float factor;
   float low;
   float high;
   float attention_factor;
   int rotary_dim;
 
-  void operator()(sycl::nd_item<1> item) const {
-    // Always use float for accumulation, regardless of scalar_t
-    using accscalar_t = float;
+  template <typename accscalar_t, int num_tiles, int vec_size, int head_dim>
+  static accscalar_t load_dim(accscalar_t (&elements)[num_tiles][vec_size], sycl::sub_group sg, int lane_id, int dim) {
+    constexpr int tile_width = NUM_REDUCE_STAGES * vec_size;
+    const int tile = dim / tile_width;
+    const int tile_offset = dim - tile * tile_width;
+    const int target_lane = tile_offset / vec_size;
+    const int value_index = tile_offset - target_lane * vec_size;
 
-    const int sg_size = item.get_sub_group().get_max_local_range()[0];
-    const int warpsPerBlock = item.get_local_range(0) / sg_size;
-    const int warpId = item.get_local_id(0) / sg_size;
-    const int laneId = item.get_local_id(0) % sg_size;
-
-    const int globalWarpIdx = item.get_group(0) * warpsPerBlock + warpId;
-    const int total_qk_heads = num_heads_q + num_heads_k;
-
-    const int tokenIdx = globalWarpIdx / total_qk_heads;
-    const int localHeadIdx = globalWarpIdx % total_qk_heads;
-
-    if (tokenIdx >= num_tokens) return;
-
-    const bool isQ = localHeadIdx < num_heads_q;
-    const int headIdx = isQ ? localHeadIdx : localHeadIdx - num_heads_q;
-    const int num_heads = num_heads_q + num_heads_k + num_heads_v;
-
-    constexpr int numElemsPerThread = head_dim / 32;
-    accscalar_t elements[numElemsPerThread];
-
-    int offsetWarp;
-    if (isQ) {
-      offsetWarp = tokenIdx * num_heads * head_dim + headIdx * head_dim;
-    } else {
-      offsetWarp = tokenIdx * num_heads * head_dim + num_heads_q * head_dim + headIdx * head_dim;
+    accscalar_t value = elements[tile][value_index];
+    if (target_lane != lane_id) {
+      value = sycl::permute_group_by_xor(sg, value, lane_id ^ target_lane);
     }
-    int offsetThread = offsetWarp + laneId * numElemsPerThread;
+    return value;
+  }
 
-    // Load data and compute sum of squares for RMSNorm
-    accscalar_t sumOfSquares = 0.0f;
-    for (int i = 0; i < numElemsPerThread; i++) {
-      elements[i] = static_cast<accscalar_t>(qkv[offsetThread + i]);
-      sumOfSquares += elements[i] * elements[i];
+  template <typename accscalar_t, int num_tiles, int vec_size, int head_dim>
+  void apply_full_interleave(
+      accscalar_t (&elements)[num_tiles][vec_size],
+      accscalar_t (&original)[num_tiles][vec_size],
+      int lane_id,
+      float pos_id) const {
+    const accscalar_t scale = static_cast<accscalar_t>(attention_factor);
+#pragma unroll
+    for (int tile = 0; tile < num_tiles; ++tile) {
+#pragma unroll
+      for (int v = 0; v < vec_size; v += 2) {
+        const int dim = (tile * NUM_REDUCE_STAGES + lane_id) * vec_size + v;
+        const float freq = compute_freq_yarn_rope(log2_base, head_dim, dim / 2, factor, low, high);
+        const float theta = pos_id * freq;
+        const accscalar_t sin_val = static_cast<accscalar_t>(sycl::native::sin(theta));
+        const accscalar_t cos_val = static_cast<accscalar_t>(sycl::native::cos(theta));
+        const accscalar_t x0 = original[tile][v];
+        const accscalar_t x1 = original[tile][v + 1];
+        elements[tile][v] = (x0 * cos_val - x1 * sin_val) * scale;
+        elements[tile][v + 1] = (x1 * cos_val + x0 * sin_val) * scale;
+      }
     }
+  }
 
-    // Reduce sum across sub-group (warp)
-    auto sg = item.get_sub_group();
-    sumOfSquares = sycl::reduce_over_group(sg, sumOfSquares, sycl::plus<accscalar_t>{});
+  template <typename accscalar_t, int num_tiles, int vec_size, int head_dim>
+  void apply_full_neox(
+      accscalar_t (&elements)[num_tiles][vec_size],
+      accscalar_t (&original)[num_tiles][vec_size],
+      sycl::sub_group sg,
+      int lane_id,
+      float pos_id) const {
+    constexpr int half_rotary_dim = head_dim / 2;
+    constexpr int tile_width = NUM_REDUCE_STAGES * vec_size;
+    constexpr int lane_xor = (half_rotary_dim / vec_size) % NUM_REDUCE_STAGES;
+    constexpr int tile_delta = half_rotary_dim / tile_width;
+    const accscalar_t scale = static_cast<accscalar_t>(attention_factor);
 
-    // Compute RMS normalization factor
-    float rms_rcp = sycl::rsqrt(sumOfSquares / static_cast<float>(head_dim) + eps);
-
-    // Normalize elements
-    const scalar_t* weight_ptr = isQ ? q_weight : k_weight;
-    for (int i = 0; i < numElemsPerThread; i++) {
-      int dim = laneId * numElemsPerThread + i;
-      accscalar_t weight = static_cast<accscalar_t>(weight_ptr[dim]);
-      elements[i] *= rms_rcp * weight;
-    }
-
-    // Apply RoPE to normalized elements
-    accscalar_t elements2[numElemsPerThread];
-    accscalar_t cos_vals[numElemsPerThread];
-    accscalar_t sin_vals[numElemsPerThread];
-    float pos_id = static_cast<float>(position_ids[tokenIdx]);
-    const int rotary_lanes = rotary_dim / numElemsPerThread;
-    const bool applyRotary = (laneId < rotary_lanes);
-
-    if (applyRotary) {
-      if constexpr (interleave) {
-        // Interleave mode
-        for (int i = 0; i < numElemsPerThread; i++) {
-          elements2[i] = (i % 2 == 0) ? -elements[i + 1] : elements[i - 1];
-
-          int dim_idx = laneId * numElemsPerThread + i;
-          int half_dim = dim_idx / 2;
-          float freq = compute_freq_yarn(base, rotary_dim, half_dim, factor, low, high);
-          float theta = pos_id * freq;
-          sin_vals[i] = sycl::sin(theta);
-          cos_vals[i] = sycl::cos(theta);
+#pragma unroll
+    for (int tile = 0; tile < num_tiles; ++tile) {
+#pragma unroll
+      for (int v = 0; v < vec_size; ++v) {
+        const int dim = (tile * NUM_REDUCE_STAGES + lane_id) * vec_size + v;
+        const bool first_half = dim < half_rotary_dim;
+        accscalar_t rotated;
+        if constexpr (half_rotary_dim % tile_width == 0) {
+          rotated = original[first_half ? tile + tile_delta : tile - tile_delta][v];
+        } else {
+          rotated = sycl::permute_group_by_xor(sg, original[tile][v], lane_xor);
         }
-      } else {
-        // Neox style - use XOR shuffle like CUDA
-        sycl::group_barrier(sg);
-        const int half_rotary_lanes = rotary_lanes / 2;
+        if (first_half) {
+          rotated = -rotated;
+        }
 
-        for (int i = 0; i < numElemsPerThread; i++) {
-          // XOR shuffle to exchange between first and second half
-          elements2[i] = sycl::permute_group_by_xor(sg, elements[i], half_rotary_lanes);
-          if (laneId < half_rotary_lanes) {
-            elements2[i] = -elements2[i];
+        const int freq_dim = (dim * 2) % head_dim;
+        const float freq = compute_freq_yarn_rope(log2_base, head_dim, freq_dim / 2, factor, low, high);
+        const float theta = pos_id * freq;
+        const accscalar_t sin_val = static_cast<accscalar_t>(sycl::native::sin(theta));
+        const accscalar_t cos_val = static_cast<accscalar_t>(sycl::native::cos(theta));
+        const accscalar_t x = original[tile][v];
+        elements[tile][v] = (x * cos_val + rotated * sin_val) * scale;
+      }
+    }
+  }
+
+  template <typename accscalar_t, int num_tiles, int vec_size, int head_dim>
+  void apply_generic(
+      accscalar_t (&elements)[num_tiles][vec_size],
+      accscalar_t (&original)[num_tiles][vec_size],
+      sycl::sub_group sg,
+      int lane_id,
+      float pos_id) const {
+    const accscalar_t scale = static_cast<accscalar_t>(attention_factor);
+#pragma unroll
+    for (int tile = 0; tile < num_tiles; ++tile) {
+#pragma unroll
+      for (int v = 0; v < vec_size; ++v) {
+        const int dim = (tile * NUM_REDUCE_STAGES + lane_id) * vec_size + v;
+        if (dim < rotary_dim) {
+          const accscalar_t x = original[tile][v];
+          accscalar_t rotated;
+          int half_dim;
+
+          if constexpr (interleave) {
+            const int paired_dim = dim ^ 1;
+            rotated = load_dim<accscalar_t, num_tiles, vec_size, head_dim>(original, sg, lane_id, paired_dim);
+            if ((dim & 1) == 0) {
+              rotated = -rotated;
+            }
+            half_dim = dim / 2;
+          } else {
+            const int half_rotary_dim = rotary_dim / 2;
+            const bool first_half = dim < half_rotary_dim;
+            const int paired_dim = first_half ? dim + half_rotary_dim : dim - half_rotary_dim;
+            rotated = load_dim<accscalar_t, num_tiles, vec_size, head_dim>(original, sg, lane_id, paired_dim);
+            if (first_half) {
+              rotated = -rotated;
+            }
+
+            const int freq_dim = (dim * 2) % rotary_dim;
+            half_dim = freq_dim / 2;
           }
 
-          int dim_idx = laneId * numElemsPerThread + i;
-          dim_idx = (dim_idx * 2) % rotary_dim;
-          int half_dim = dim_idx / 2;
-          float freq = compute_freq_yarn(base, rotary_dim, half_dim, factor, low, high);
-          float theta = pos_id * freq;
-          sin_vals[i] = sycl::sin(theta);
-          cos_vals[i] = sycl::cos(theta);
+          const float freq = compute_freq_yarn_rope(log2_base, rotary_dim, half_dim, factor, low, high);
+          const float theta = pos_id * freq;
+          const accscalar_t sin_val = static_cast<accscalar_t>(sycl::native::sin(theta));
+          const accscalar_t cos_val = static_cast<accscalar_t>(sycl::native::cos(theta));
+          elements[tile][v] = (x * cos_val + rotated * sin_val) * scale;
         }
-        sycl::group_barrier(sg);
       }
+    }
+  }
 
-      // Apply rotation with attention_factor
-      for (int i = 0; i < numElemsPerThread; i++) {
-        elements[i] = (elements[i] * cos_vals[i] + elements2[i] * sin_vals[i]) * attention_factor;
+  template <typename accscalar_t, int num_tiles, int vec_size, int head_dim>
+  void apply(
+      accscalar_t (&elements)[num_tiles][vec_size],
+      sycl::nd_item<1> item,
+      int64_t token_id,
+      int64_t,
+      bool,
+      int64_t lane_id_value,
+      int64_t) const {
+    auto sg = item.get_sub_group();
+    const int lane_id = static_cast<int>(lane_id_value);
+    const float pos_id = static_cast<float>(position_ids[token_id]);
+
+    accscalar_t original[num_tiles][vec_size];
+#pragma unroll
+    for (int tile = 0; tile < num_tiles; ++tile) {
+#pragma unroll
+      for (int v = 0; v < vec_size; ++v) {
+        original[tile][v] = elements[tile][v];
       }
     }
 
-    // Store results
-    for (int i = 0; i < numElemsPerThread; i++) {
-      qkv[offsetThread + i] = static_cast<scalar_t>(elements[i]);
+    if (rotary_dim == head_dim) {
+      if constexpr (interleave && vec_size % 2 == 0) {
+        apply_full_interleave<accscalar_t, num_tiles, vec_size, head_dim>(elements, original, lane_id, pos_id);
+      } else if constexpr (!interleave) {
+        apply_full_neox<accscalar_t, num_tiles, vec_size, head_dim>(elements, original, sg, lane_id, pos_id);
+      } else {
+        apply_generic<accscalar_t, num_tiles, vec_size, head_dim>(elements, original, sg, lane_id, pos_id);
+      }
+    } else {
+      apply_generic<accscalar_t, num_tiles, vec_size, head_dim>(elements, original, sg, lane_id, pos_id);
     }
   }
 };
-template <int head_dim, bool interleave, typename scalar_t>
-void launchFusedQKNormRopeImpl(
-    void* qkv,
-    int num_tokens,
-    int num_heads_q,
-    int num_heads_k,
-    int num_heads_v,
-    float eps,
-    const void* q_weight,
-    const void* k_weight,
-    float base,
-    const int* position_ids,
-    float factor,
-    float low,
-    float high,
-    float attention_factor,
-    int rotary_dim,
-    sycl::queue& q) {
-  constexpr int blockSize = 256;
-  const int warpsPerBlock = blockSize / 32;
-  const int totalQKHeads = num_heads_q + num_heads_k;
-  const int totalWarps = num_tokens * totalQKHeads;
-  const int gridSize = divUp(totalWarps, warpsPerBlock);
 
-  FusedQKNormRopeKernel<head_dim, interleave, scalar_t> kernel{
-      static_cast<scalar_t*>(qkv),
+static void validate_rotary_for_vec_size(int64_t head_dim, int64_t rotary_dim, bool is_neox, int vec_size) {
+  TORCH_CHECK(
+      rotary_dim > 0 && rotary_dim <= head_dim, "rotary_dim must be in the range (0, head_dim], got ", rotary_dim);
+  TORCH_CHECK(rotary_dim % 2 == 0, "rotary_dim must be even for RoPE, got ", rotary_dim);
+
+  if (is_neox) {
+    const int64_t half_rotary_dim = rotary_dim / 2;
+    if (half_rotary_dim > vec_size) {
+      TORCH_CHECK(
+          half_rotary_dim % vec_size == 0,
+          "half rotary dimension must be divisible by selected vec_size for neox style, got half_rotary_dim=",
+          half_rotary_dim,
+          ", vec_size=",
+          vec_size);
+    }
+
+    if (half_rotary_dim >= vec_size) {
+      const int64_t half_rotary_vecs = half_rotary_dim / vec_size;
+      const int64_t lane_xor = half_rotary_vecs % NUM_REDUCE_STAGES;
+      TORCH_CHECK(
+          lane_xor == 0 || ((lane_xor & (lane_xor - 1)) == 0 && lane_xor < NUM_REDUCE_STAGES),
+          "neox style requires a power-of-two subgroup lane xor, got ",
+          lane_xor);
+    }
+  }
+}
+
+template <bool interleave, typename scalar_t, typename weight_t>
+void launch_fused_qk_norm_rope_core(
+    torch::Tensor& qkv,
+    int64_t num_heads_q,
+    int64_t num_heads_k,
+    int64_t num_heads_v,
+    int64_t head_dim,
+    double eps,
+    torch::Tensor& q_weight,
+    torch::Tensor& k_weight,
+    double base,
+    torch::Tensor& position_ids,
+    double factor,
+    double low,
+    double high,
+    double attention_factor,
+    int64_t rotary_dim,
+    const char* op_name) {
+  const auto layout = qknorm::make_packed_qkv_layout_from_ptr<scalar_t, weight_t>(
+      static_cast<scalar_t*>(qkv.data_ptr()),
+      static_cast<const weight_t*>(q_weight.data_ptr()),
+      static_cast<const weight_t*>(k_weight.data_ptr()),
+      qkv.size(0),
       num_heads_q,
       num_heads_k,
       num_heads_v,
-      eps,
-      static_cast<const scalar_t*>(q_weight),
-      static_cast<const scalar_t*>(k_weight),
-      base,
-      position_ids,
-      num_tokens,
-      factor,
-      low,
-      high,
-      attention_factor,
-      rotary_dim};
+      head_dim);
 
-  sycl_kernel_submit(sycl::range<1>(gridSize * blockSize), sycl::range<1>(blockSize), q, kernel);
+  const int vec_size =
+      qknorm::vec_size<scalar_t, weight_t>(layout, qknorm::max_vec_size<scalar_t>(), NUM_REDUCE_STAGES);
+  validate_rotary_for_vec_size(head_dim, rotary_dim, !interleave, vec_size);
+
+  const QKNormRopePostOp<interleave> post_op{
+      position_ids.data_ptr<int>(),
+      static_cast<float>(std::log2(base)),
+      static_cast<float>(factor),
+      static_cast<float>(low),
+      static_cast<float>(high),
+      static_cast<float>(attention_factor),
+      static_cast<int>(rotary_dim)};
+
+  qknorm::dispatch_head_dim<scalar_t, weight_t>(
+      layout, static_cast<qknorm::acc_type_t<scalar_t>>(eps), post_op, op_name, false);
+}
+
+template <bool interleave, typename scalar_t>
+void dispatch_fused_qk_norm_rope_weight_type(
+    torch::Tensor& qkv,
+    int64_t num_heads_q,
+    int64_t num_heads_k,
+    int64_t num_heads_v,
+    int64_t head_dim,
+    double eps,
+    torch::Tensor& q_weight,
+    torch::Tensor& k_weight,
+    double base,
+    torch::Tensor& position_ids,
+    double factor,
+    double low,
+    double high,
+    double attention_factor,
+    int64_t rotary_dim,
+    const char* op_name) {
+#define QKNORM_ROPE_WEIGHT_CASE(enum_type, cpp_type)                \
+  case enum_type: {                                                 \
+    using weight_t = cpp_type;                                      \
+    launch_fused_qk_norm_rope_core<interleave, scalar_t, weight_t>( \
+        qkv,                                                        \
+        num_heads_q,                                                \
+        num_heads_k,                                                \
+        num_heads_v,                                                \
+        head_dim,                                                   \
+        eps,                                                        \
+        q_weight,                                                   \
+        k_weight,                                                   \
+        base,                                                       \
+        position_ids,                                               \
+        factor,                                                     \
+        low,                                                        \
+        high,                                                       \
+        attention_factor,                                           \
+        rotary_dim,                                                 \
+        op_name);                                                   \
+    break;                                                          \
+  }
+
+  switch (q_weight.scalar_type()) {
+    QKNORM_ROPE_WEIGHT_CASE(at::ScalarType::Double, double)
+    QKNORM_ROPE_WEIGHT_CASE(at::ScalarType::Float, float)
+    QKNORM_ROPE_WEIGHT_CASE(at::ScalarType::Half, decltype(c10::impl::ScalarTypeToCPPType<at::ScalarType::Half>::t))
+    QKNORM_ROPE_WEIGHT_CASE(
+        at::ScalarType::BFloat16, decltype(c10::impl::ScalarTypeToCPPType<at::ScalarType::BFloat16>::t))
+    QKNORM_ROPE_WEIGHT_CASE(at::ScalarType::Float8_e4m3fn, float_e4m3_t)
+    default:
+      TORCH_CHECK(false, op_name, " not implemented for weight type '", toString(q_weight.scalar_type()), "'");
+  }
+
+#undef QKNORM_ROPE_WEIGHT_CASE
+}
+
+template <bool interleave>
+void dispatch_fused_qk_norm_rope_qkv_type(
+    torch::Tensor& qkv,
+    int64_t num_heads_q,
+    int64_t num_heads_k,
+    int64_t num_heads_v,
+    int64_t head_dim,
+    double eps,
+    torch::Tensor& q_weight,
+    torch::Tensor& k_weight,
+    double base,
+    torch::Tensor& position_ids,
+    double factor,
+    double low,
+    double high,
+    double attention_factor,
+    int64_t rotary_dim,
+    const char* op_name) {
+#define QKNORM_ROPE_QKV_CASE(enum_type, cpp_type)                  \
+  case enum_type: {                                                \
+    using scalar_t = cpp_type;                                     \
+    dispatch_fused_qk_norm_rope_weight_type<interleave, scalar_t>( \
+        qkv,                                                       \
+        num_heads_q,                                               \
+        num_heads_k,                                               \
+        num_heads_v,                                               \
+        head_dim,                                                  \
+        eps,                                                       \
+        q_weight,                                                  \
+        k_weight,                                                  \
+        base,                                                      \
+        position_ids,                                              \
+        factor,                                                    \
+        low,                                                       \
+        high,                                                      \
+        attention_factor,                                          \
+        rotary_dim,                                                \
+        op_name);                                                  \
+    break;                                                         \
+  }
+
+  switch (qkv.scalar_type()) {
+    QKNORM_ROPE_QKV_CASE(at::ScalarType::Half, decltype(c10::impl::ScalarTypeToCPPType<at::ScalarType::Half>::t))
+    QKNORM_ROPE_QKV_CASE(
+        at::ScalarType::BFloat16, decltype(c10::impl::ScalarTypeToCPPType<at::ScalarType::BFloat16>::t))
+    QKNORM_ROPE_QKV_CASE(at::ScalarType::Float8_e4m3fn, float_e4m3_t)
+    default:
+      TORCH_CHECK(false, op_name, " not implemented for qkv type '", toString(qkv.scalar_type()), "'");
+  }
+
+#undef QKNORM_ROPE_QKV_CASE
 }
 
 void fused_qk_norm_rope(
@@ -251,124 +408,109 @@ void fused_qk_norm_rope(
     double high,
     double attention_factor,
     int64_t rotary_dim) {
-  // Input validation
-  TORCH_CHECK(qkv.dim() == 2, "QKV tensor must be 2D: [num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim]");
-  TORCH_CHECK(position_ids.dim() == 1, "Position IDs must be 1D: [num_tokens]");
-  TORCH_CHECK(q_weight.dim() == 1, "Query weights must be 1D: [head_dim]");
-  TORCH_CHECK(k_weight.dim() == 1, "Key weights must be 1D: [head_dim]");
-  TORCH_CHECK(q_weight.size(0) == head_dim, "Query weights size must match head dimension");
-  TORCH_CHECK(k_weight.size(0) == head_dim, "Key weights size must match head dimension");
-  TORCH_CHECK(rotary_dim % (head_dim / 32) == 0, "rotary_dim must be divisible by numElemsPerThread");
+  constexpr const char* op_name = "fused_qk_norm_rope";
 
-  if (is_neox) {
-    int64_t half_rotary_lanes = rotary_dim / (head_dim / 32) / 2;
-    TORCH_CHECK(
-        half_rotary_lanes >= 1 && (half_rotary_lanes & (half_rotary_lanes - 1)) == 0,
-        "half_rotary_lanes must be a power of 2 for neox style, got ",
-        half_rotary_lanes);
-  }
+  TORCH_CHECK(qkv.dim() == 2, op_name, ": qkv must be 2D [num_tokens, total_qkv_heads * head_dim]");
+  TORCH_CHECK(position_ids.dim() == 1, op_name, ": position_ids must be 1D [num_tokens]");
+  TORCH_CHECK(q_weight.dim() == 1, op_name, ": q_weight must be 1D [head_dim]");
+  TORCH_CHECK(k_weight.dim() == 1, op_name, ": k_weight must be 1D [head_dim]");
+  TORCH_CHECK(q_weight.size(0) == head_dim, op_name, ": q_weight size must match head_dim");
+  TORCH_CHECK(k_weight.size(0) == head_dim, op_name, ": k_weight size must match head_dim");
+  TORCH_CHECK(q_weight.scalar_type() == k_weight.scalar_type(), op_name, ": q_weight and k_weight dtype must match");
+  TORCH_CHECK(
+      head_dim == 64 || head_dim == 128 || head_dim == 256, op_name, ": head_dim must be one of {64, 128, 256}");
 
   CHECK_DEVICE(qkv);
   CHECK_CONTIGUOUS(qkv);
   CHECK_DEVICE(position_ids);
   CHECK_CONTIGUOUS(position_ids);
-  TORCH_CHECK(
-      position_ids.scalar_type() == at::ScalarType::Int,
-      "position_ids must have dtype int32 (at::kInt); got ",
-      position_ids.scalar_type());
   CHECK_DEVICE(q_weight);
   CHECK_CONTIGUOUS(q_weight);
   CHECK_DEVICE(k_weight);
   CHECK_CONTIGUOUS(k_weight);
 
-  int64_t num_tokens = qkv.size(0);
-  TORCH_CHECK(position_ids.size(0) == num_tokens, "Number of tokens in position_ids must match QKV");
-
-  int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
   TORCH_CHECK(
-      qkv.size(1) == total_heads * head_dim, "QKV tensor size must match total number of heads and head dimension");
+      position_ids.scalar_type() == at::ScalarType::Int,
+      op_name,
+      ": position_ids must have dtype int32 (at::kInt); got ",
+      position_ids.scalar_type());
 
-  auto queue = dpcppGetCurrentQueue();
-  bool interleave = !is_neox;
+  const int64_t num_tokens = qkv.size(0);
+  TORCH_CHECK(position_ids.size(0) == num_tokens, op_name, ": position_ids length must match qkv num_tokens");
 
-// Maps at::ScalarType to the corresponding SYCL/cutlass C++ type (scalar_t)
-// and immediately invokes the callable passed as the variadic argument.
-// Float8_e4m3fn uses the cutlass type because native SYCL float8 is not yet
-// supported; Half and BFloat16 use their respective SYCL types.
-#define SYCL_DISPATCH_FLOATING_TYPES(SCALAR_TYPE, KERNEL_NAME, ...)                 \
-  [&]() {                                                                           \
-    switch (SCALAR_TYPE) {                                                          \
-      case at::ScalarType::Half: {                                                  \
-        using scalar_t = sycl::half;                                                \
-        __VA_ARGS__();                                                              \
-        break;                                                                      \
-      }                                                                             \
-      case at::ScalarType::BFloat16: {                                              \
-        using scalar_t = sycl::ext::oneapi::bfloat16;                               \
-        __VA_ARGS__();                                                              \
-        break;                                                                      \
-      }                                                                             \
-      case at::ScalarType::Float8_e4m3fn: {                                         \
-        using scalar_t = float_e4m3_t;                                              \
-        __VA_ARGS__();                                                              \
-        break;                                                                      \
-      }                                                                             \
-      default:                                                                      \
-        TORCH_CHECK(false, "Unsupported dtype for " KERNEL_NAME ": ", SCALAR_TYPE); \
-    }                                                                               \
-  }()
+  const int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
+  TORCH_CHECK(qkv.size(1) == total_heads * head_dim, op_name, ": qkv size must match total heads and head_dim");
 
-// The lambda is wrapped in an extra () so that commas in the template argument
-// list <HD, IL, scalar_t> are hidden from the preprocessor's argument splitter.
-#define LAUNCH_KERNEL(HD, IL)                                                    \
-  SYCL_DISPATCH_FLOATING_TYPES(qkv.scalar_type(), "fused_qk_norm_rope", ([&]() { \
-                                 launchFusedQKNormRopeImpl<HD, IL, scalar_t>(    \
-                                     qkv.data_ptr(),                             \
-                                     static_cast<int>(num_tokens),               \
-                                     static_cast<int>(num_heads_q),              \
-                                     static_cast<int>(num_heads_k),              \
-                                     static_cast<int>(num_heads_v),              \
-                                     static_cast<float>(eps),                    \
-                                     q_weight.data_ptr(),                        \
-                                     k_weight.data_ptr(),                        \
-                                     static_cast<float>(base),                   \
-                                     position_ids.data_ptr<int>(),               \
-                                     static_cast<float>(factor),                 \
-                                     static_cast<float>(low),                    \
-                                     static_cast<float>(high),                   \
-                                     static_cast<float>(attention_factor),       \
-                                     static_cast<int>(rotary_dim),               \
-                                     queue);                                     \
-                               }))
-
-  switch (head_dim) {
-    case 64:
-      if (interleave) {
-        LAUNCH_KERNEL(64, true);
-      } else {
-        LAUNCH_KERNEL(64, false);
-      }
-      break;
-    case 128:
-      if (interleave) {
-        LAUNCH_KERNEL(128, true);
-      } else {
-        LAUNCH_KERNEL(128, false);
-      }
-      break;
-    case 256:
-      if (interleave) {
-        LAUNCH_KERNEL(256, true);
-      } else {
-        LAUNCH_KERNEL(256, false);
-      }
-      break;
-    default:
-      TORCH_CHECK(false, "Unsupported head dimension for fusedQKNormRope: ", head_dim);
+  if (is_neox) {
+    dispatch_fused_qk_norm_rope_qkv_type<false>(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        q_weight,
+        k_weight,
+        base,
+        position_ids,
+        factor,
+        low,
+        high,
+        attention_factor,
+        rotary_dim,
+        op_name);
+  } else {
+    dispatch_fused_qk_norm_rope_qkv_type<true>(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        q_weight,
+        k_weight,
+        base,
+        position_ids,
+        factor,
+        low,
+        high,
+        attention_factor,
+        rotary_dim,
+        op_name);
   }
+}
 
-#undef LAUNCH_KERNEL
-#undef SYCL_DISPATCH_FLOATING_TYPES
+void fused_inplace_qknorm(
+    torch::Tensor& q, torch::Tensor& k, torch::Tensor& q_weight, torch::Tensor& k_weight, double eps) {
+  TORCH_CHECK(q.dim() == 3, "fused_inplace_qknorm: q must be 3D [num_tokens, num_q_heads, head_dim]");
+  TORCH_CHECK(k.dim() == 3, "fused_inplace_qknorm: k must be 3D [num_tokens, num_k_heads, head_dim]");
+  TORCH_CHECK(q.size(0) == k.size(0), "fused_inplace_qknorm: q and k must have same num_tokens");
+  TORCH_CHECK(q.size(2) == k.size(2), "fused_inplace_qknorm: q and k must have same head_dim");
+  TORCH_CHECK(q_weight.dim() == 1 && k_weight.dim() == 1, "fused_inplace_qknorm: weights must be 1D");
+  TORCH_CHECK(q_weight.size(0) == q.size(2), "fused_inplace_qknorm: q_weight size must match head_dim");
+  TORCH_CHECK(k_weight.size(0) == k.size(2), "fused_inplace_qknorm: k_weight size must match head_dim");
+  TORCH_CHECK(q.stride(2) == 1 && k.stride(2) == 1, "fused_inplace_qknorm: q/k last dimension must be contiguous");
+  CHECK_DEVICE(q);
+  CHECK_DEVICE(k);
+  CHECK_DEVICE(q_weight);
+  CHECK_DEVICE(k_weight);
+  TORCH_CHECK(q.scalar_type() == k.scalar_type(), "fused_inplace_qknorm: q and k dtype must match");
+  TORCH_CHECK(
+      q_weight.scalar_type() == k_weight.scalar_type(), "fused_inplace_qknorm: q_weight and k_weight dtype must match");
+
+  SYCL_DISPATCH_FLOATING_TYPES(
+      at::ScalarType::Half, at::ScalarType::BFloat16, q.scalar_type(), "fused_inplace_qknorm", [&]() {
+        SYCL_DISPATCH_WEIGHT_TYPES(
+            at::ScalarType::Half, at::ScalarType::BFloat16, q_weight.scalar_type(), "fused_inplace_qknorm", [&]() {
+              const auto layout = qknorm::make_separated_layout<scalar_t, weight_t>(q, k, q_weight, k_weight);
+              qknorm::dispatch_head_dim<scalar_t, weight_t>(
+                  layout,
+                  static_cast<qknorm::acc_type_t<scalar_t>>(eps),
+                  qknorm::NoPostOp{},
+                  "fused_inplace_qknorm",
+                  true);
+            });
+      });
 }
 
 }  // namespace at::native::xpu

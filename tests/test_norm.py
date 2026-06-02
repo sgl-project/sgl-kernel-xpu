@@ -62,6 +62,64 @@ def fused_add_rms_norm(x, residual, weight, eps):
     return x, residual
 
 
+def qk_rms_norm(x, w, eps=1e-6):
+    orig_dtype = x.dtype
+    x = x.float()
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    x = x * torch.rsqrt(variance + eps)
+    x = x * w.float()
+    return x.to(orig_dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("weight_dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+def test_fused_inplace_qknorm(dtype, weight_dtype, head_dim):
+    eps = 1e-6
+    num_tokens, num_q_heads, num_k_heads = 17, 8, 2
+    q = torch.randn(num_tokens, num_q_heads, head_dim, dtype=dtype, device=device)
+    k = torch.randn(num_tokens, num_k_heads, head_dim, dtype=dtype, device=device)
+    q_weight = torch.randn(head_dim, dtype=weight_dtype, device=device)
+    k_weight = torch.randn(head_dim, dtype=weight_dtype, device=device)
+
+    q_ref = qk_rms_norm(q, q_weight, eps)
+    k_ref = qk_rms_norm(k, k_weight, eps)
+
+    sgl_kernel.fused_inplace_qknorm(q, k, q_weight, k_weight, eps)
+
+    torch.testing.assert_close(q, q_ref, **norm_tolerances(dtype))
+    torch.testing.assert_close(k, k_ref, **norm_tolerances(dtype))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fused_inplace_qknorm_qwen3_split_view(dtype):
+    eps = 1e-6
+    num_tokens, num_q_heads, num_k_heads, head_dim = 32, 40, 8, 128
+    q_size = num_q_heads * head_dim
+    kv_size = num_k_heads * head_dim
+    qkv = torch.randn(
+        num_tokens, q_size + kv_size + kv_size, dtype=dtype, device=device
+    )
+    q, k, _ = qkv.split([q_size, kv_size, kv_size], dim=-1)
+    q = q.view(num_tokens, num_q_heads, head_dim)
+    k = k.view(num_tokens, num_k_heads, head_dim)
+
+    assert q.stride(-1) == 1
+    assert k.stride(-1) == 1
+    assert q.stride(0) == q_size + kv_size + kv_size
+    assert k.stride(0) == q_size + kv_size + kv_size
+
+    q_weight = torch.randn(head_dim, dtype=dtype, device=device)
+    k_weight = torch.randn(head_dim, dtype=dtype, device=device)
+    q_ref = qk_rms_norm(q.clone(), q_weight, eps)
+    k_ref = qk_rms_norm(k.clone(), k_weight, eps)
+
+    sgl_kernel.fused_inplace_qknorm(q, k, q_weight, k_weight, eps)
+
+    torch.testing.assert_close(q, q_ref, **norm_tolerances(dtype))
+    torch.testing.assert_close(k, k_ref, **norm_tolerances(dtype))
+
+
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
 @pytest.mark.parametrize("dtype", [torch.float16])

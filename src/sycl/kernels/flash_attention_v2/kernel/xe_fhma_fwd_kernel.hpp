@@ -112,6 +112,10 @@ class XeFMHAFwdKernel {
 
   using ElementLSE = void;
 
+  // Sink support from epilogue
+  static constexpr bool Sink = CollectiveEpilogue::Sink;
+  using ElementSink = typename CollectiveEpilogue::ElementSink;
+
   // Kernel level shared memory storage
   using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
   using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
@@ -137,6 +141,7 @@ class XeFMHAFwdKernel {
     StrideK dK_cache{};
     const ElementV* V_cache;
     StrideV dV_cache{};
+    const ElementSink* sm_sink = nullptr;  // Per-head sink logits (nheads,), null if no sink
   };
   using KernelParams = KernelArguments;
 
@@ -265,6 +270,25 @@ class XeFMHAFwdKernel {
       const int k_blocks_causal =
           CollectiveMainloop::CausalMask ? (seq_coord + full_tile_offset) / get<1>(TileShapeQK{}) : 0;
 
+      // Sliding-window pruning: skip K blocks that are entirely outside the
+      // [row - window_size_left, row + window_size_right] band for all rows in
+      // this Q-tile. Mirrors the LocalMask optimization on the decode path.
+      // Use Q-tile granularity so all subgroups in the WG agree on the loop
+      // count (avoids per-SG barrier mismatch).
+      int blk_k0 = 0;
+      int blk_k1 = k_blocks;
+      if constexpr (CollectiveMainloop::LocalMask) {
+        const int tile_q = get<0>(TileShapeQK{});
+        const int tile_k = get<1>(TileShapeQK{});
+        const int q_tile_min_row_kv = blk_q * tile_q + full_tile_offset;
+        const int q_tile_max_row_kv = q_tile_min_row_kv + tile_q - 1;
+        const int lo_kv = cute::max(0, q_tile_min_row_kv - params.mainloop.window_size_left);
+        const int hi_kv_plus_one = q_tile_max_row_kv + params.mainloop.window_size_right + 1;
+        blk_k0 = lo_kv / tile_k;
+        blk_k1 = cute::min(k_blocks, cute::ceil_div(hi_kv_plus_one, tile_k));
+        if (blk_k0 >= blk_k1) continue;
+      }
+
       int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
       int offset_k_cache = 0, offset_v_cache = 0;
       if constexpr (is_var_len) {
@@ -318,8 +342,8 @@ class XeFMHAFwdKernel {
           tA_max,
           tA_sum,
           blk_qv,
-          0,
-          k_blocks,
+          blk_k0,
+          blk_k1,
           k_blocks,
           k_blocks_causal,
           thr_id,
@@ -337,7 +361,11 @@ class XeFMHAFwdKernel {
 
       // Epilogue
       CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
-      epilogue(O(_, _, head_q, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id);
+      if constexpr (Sink) {
+        epilogue(O(_, _, head_q, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, p.sm_sink[head_q]);
+      } else {
+        epilogue(O(_, _, head_q, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id);
+      }
     }
   }
 };

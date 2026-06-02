@@ -12,10 +12,11 @@
 #include "kernels/moe/xe20/moe_kernel.hpp"
 
 using namespace cute;
+using namespace MoE;
 
 using ElementAccumulator = float;  // <- data type of accumulator
 
-template <typename Tile, typename SGLayout, int ActType, bool FuseAct, bool WithBias>
+template <typename Tile, typename SGLayout, ActivationType ActType, bool FuseAct, bool WithBias>
 void Xe20MoEGEMMLauncher(
     sycl::queue q,
     const void* activations,
@@ -29,7 +30,8 @@ void Xe20MoEGEMMLauncher(
     const int num_experts,
     int* workspace,
     float gemm1_alpha,
-    float gemm1_limit);
+    float gemm1_limit,
+    int ld_b);
 
 using Tile_8_64_32 = Shape<_8, _64, _32>;
 using Tile_16_64_32 = Shape<_16, _64, _32>;
@@ -58,29 +60,30 @@ using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
       const int,                                                                        \
       int*,                                                                             \
       float,                                                                            \
-      float);
+      float,                                                                            \
+      int);
 
-#define DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile, SGLayout)    \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 0, true, true)   \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 0, true, false)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 0, false, true)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 0, false, false) \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, true, true)   \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, true, false)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, false, true)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, false, false) \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 2, true, true)   \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 2, true, false)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 2, false, true)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 2, false, false)
+#define DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile, SGLayout)                                \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, true, true)            \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, true, false)           \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, false, true)           \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, false, false)          \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, true, true)            \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, true, false)           \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, false, true)           \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, false, false)          \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, true, true)  \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, true, false) \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, false, true) \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, false, false)
 
-#define DECLARE_XE20_MOE_TILE_FUSE(Tile, SGLayout, FuseAct)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 0, FuseAct, true)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 0, FuseAct, false) \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, FuseAct, true)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 1, FuseAct, false) \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 2, FuseAct, true)  \
-  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, 2, FuseAct, false)
+#define DECLARE_XE20_MOE_TILE_FUSE(Tile, SGLayout, FuseAct)                              \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, FuseAct, true)           \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, FuseAct, false)          \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, FuseAct, true)           \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::GELU, FuseAct, false)          \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, FuseAct, true) \
+  DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SWIGLU_GPT_OSS, FuseAct, false)
 
 DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile_8_64_32, SG_1_4_1)
 DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile_16_64_32, SG_1_4_1)
@@ -108,7 +111,8 @@ DECLARE_XE20_MOE_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
       n_experts,                              \
       atomic_buffer.data_ptr<int>(),          \
       static_cast<float>(gemm1_alpha),        \
-      static_cast<float>(gemm1_limit))
+      static_cast<float>(gemm1_limit),        \
+      ld_b)
 
 #define DISPATCH_MOE_HELPER_BIAS(ActType, FuseAct, WithBias, ...) \
   do {                                                            \
@@ -128,21 +132,24 @@ DECLARE_XE20_MOE_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
     }                                                                  \
   } while (0)
 
-#define DISPATCH_MOE_HELPER_ACT_TYPE(ActType, FuseAct, WithBias, ...)    \
-  do {                                                                   \
-    switch (ActType) {                                                   \
-      case 0:                                                            \
-        DISPATCH_MOE_HELPER_FUSE_ACT(0, FuseAct, WithBias, __VA_ARGS__); \
-        break;                                                           \
-      case 1:                                                            \
-        DISPATCH_MOE_HELPER_FUSE_ACT(1, FuseAct, WithBias, __VA_ARGS__); \
-        break;                                                           \
-      case 2:                                                            \
-        DISPATCH_MOE_HELPER_FUSE_ACT(2, FuseAct, WithBias, __VA_ARGS__); \
-        break;                                                           \
-      default:                                                           \
-        TORCH_CHECK(false, "Unsupported activation type");               \
-    }                                                                    \
+#define DISPATCH_MOE_HELPER_ACT_TYPE(ActType, FuseAct, WithBias, ...)                                 \
+  do {                                                                                                \
+    switch (ActType) {                                                                                \
+      case 0:                                                                                         \
+        DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::SILU, FuseAct, WithBias, __VA_ARGS__);           \
+        break;                                                                                        \
+      case 1:                                                                                         \
+        DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::GELU, FuseAct, WithBias, __VA_ARGS__);           \
+        break;                                                                                        \
+      case 2:                                                                                         \
+        DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::SWIGLU_GPT_OSS, FuseAct, WithBias, __VA_ARGS__); \
+        break;                                                                                        \
+      case 3:                                                                                         \
+        DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::RELU2, FuseAct, false, __VA_ARGS__);             \
+        break;                                                                                        \
+      default:                                                                                        \
+        TORCH_CHECK(false, "Unsupported activation type");                                            \
+    }                                                                                                 \
   } while (0)
 
 #define DISPATCH_MOE(ActType, FuseAct, WithBias, ...) \
@@ -155,7 +162,7 @@ void moe_grouped_mm_nt_xe20(
     const std::optional<at::Tensor>& bias,
     const torch::Tensor& total_rows_for_experts,
     const int64_t n_experts,
-    const int64_t activation_type,  // 0=silu, 1=gelu, 2=swiglu_gpt_oss
+    const int64_t activation_type,  // 0=silu, 1=gelu, 2=swiglu_gpt_oss, 3=relu2
     bool fuse_act,
     double gemm1_alpha,
     double gemm1_limit) {
@@ -172,7 +179,11 @@ void moe_grouped_mm_nt_xe20(
       weights_shape[0] == total_rows_for_experts.size(0),
       "rows_for_experts must have the same size as the first dimension of weights");
   TORCH_CHECK(output.sizes()[0] == total_m, "output must have the same number of rows as activations");
-  if (fuse_act) {
+  // For fused activation:
+  // - Gated activations (SILU, GELU, SWIGLU): output has N/2 columns (gate * up fusion)
+  // - Non-gated RELU2: output has N columns (single GEMM with fused activation)
+  bool is_fused_non_gated_relu2 = (fuse_act && activation_type == static_cast<int64_t>(ActivationType::RELU2));
+  if (fuse_act && !is_fused_non_gated_relu2) {
     TORCH_CHECK(output.sizes()[1] == gemm_n / 2, "output must have half the number of columns as activations");
   } else {
     TORCH_CHECK(output.sizes()[1] == gemm_n, "output must have the same number of columns as activations");
@@ -182,6 +193,10 @@ void moe_grouped_mm_nt_xe20(
     TORCH_CHECK(
         bias->scalar_type() == at::kFloat,
         "moe_grouped_mm_nt_xe20: bias must be float32 (at::kFloat) to match kernel expectations");
+
+    // TODO this is only for binary size consideration, if needed, can remove it
+    TORCH_CHECK(
+        activation_type != static_cast<int>(ActivationType::RELU2), "RELU2 activation only supports no bias as of now");
   }
   TORCH_CHECK(
       activations.scalar_type() == weights.scalar_type(), "activations and weights must have the same data type");
@@ -192,6 +207,12 @@ void moe_grouped_mm_nt_xe20(
     TORCH_CHECK(bias->dim() == 2, "bias must be 2D [n_experts, N]");
     TORCH_CHECK(bias->size(0) == n_experts && bias->size(1) == gemm_n, "bias shape mismatch with weight");
   }
+  TORCH_CHECK(
+      activation_type >= static_cast<int>(ActivationType::MIN) &&
+          activation_type <= static_cast<int>(ActivationType::MAX),
+      "Unsupported activation_type: ",
+      activation_type,
+      ". Supported values are 0 (silu), 1 (gelu), 2 (swiglu_gpt_oss), 3 (relu2)");
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
@@ -199,6 +220,7 @@ void moe_grouped_mm_nt_xe20(
   bool with_bias = bias.has_value();
   void* bias_ptr = with_bias ? bias->data_ptr() : nullptr;
   bool small_weight = (int64_t)gemm_k * gemm_n <= (int64_t)4096 * 4096;  // heuristic for small K*N, can be tuned
+  int ld_b = static_cast<int>(weights.stride(1));
 
   if (avg_m <= 8) {
     DISPATCH_MOE(

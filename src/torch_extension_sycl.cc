@@ -19,7 +19,6 @@ limitations under the License.
 #include "sgl_flash_kernel_ops.h"
 #include "sgl_kernel_ops.h"
 #include "sgl_kernel_torch_shim.h"
-
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
   m.impl("awq_dequantize", torch::kXPU, &awq_dequantize);
@@ -100,6 +99,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state_v2", torch::kXPU, &merge_state_v2);
+
   /*
    * From cutlass attention
    */
@@ -176,6 +176,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor! q_weight, Tensor! k_weight, float base, bool is_neox, Tensor! position_ids, "
       "float factor, float low, float high, float attention_factor, int rotary_dim) -> ()");
   m.impl("fused_qk_rope", torch::kXPU, &at::native::xpu::fused_qk_rope);
+
+  m.def(
+      "fused_qk_rope_with_cos_sin_cache_inplace(Tensor! q, Tensor! k, Tensor! cos_sin_cache, Tensor! positions, int "
+      "rope_dim, "
+      "bool is_neox) -> ()");
+  m.impl(
+      "fused_qk_rope_with_cos_sin_cache_inplace",
+      torch::kXPU,
+      &at::native::xpu::fused_qk_rope_with_cos_sin_cache_inplace);
+
   /* utils */
   m.def("query_device(int device_id) -> (int, int)");
   m.impl("query_device", c10::DispatchKey::BackendSelect, &query_device);
@@ -196,6 +206,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value, "
       "Tensor? norm_weight=None, float? norm_eps=None) -> ()");
   m.impl("hc_pre_big_fuse", torch::kXPU, &hc_pre_big_fuse);
+  /*
+   * From LoRA
+   */
+  m.def(
+      "embedding_lora_a_fwd(Tensor! output, Tensor input_ids, Tensor weights, int vocab_size, Tensor seg_indptr, "
+      "Tensor weight_indices, "
+      "Tensor lora_ranks, Tensor? extra_embeddings, Tensor? seg_lens) -> ()");
+  m.impl("embedding_lora_a_fwd", torch::kXPU, &embedding_lora_a_fwd);
 }
 
 REGISTER_EXTENSION(common_ops)

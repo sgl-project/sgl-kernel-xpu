@@ -14,17 +14,34 @@ function(add_group_gemm_xe20_inst TILE_M TILE_N TILE_K SG_SHAPE SG_STRIDE ACT_TY
     set(GROUP_GEMM_XE20_INST_SRCS ${GROUP_GEMM_XE20_INST_SRCS} PARENT_SCOPE)
 endfunction()
 
-foreach(act_type 0 1 2)
-    foreach(with_bias true false)
-        foreach(fuse_act true false)
+foreach(act_type 0 1 2 3)
+    if(act_type EQUAL 3)
+        set(with_bias_list false)
+    else()
+        set(with_bias_list true false)
+    endif()
+    foreach(with_bias ${with_bias_list})
+        # All activation types now support both fused and unfused paths
+        set(fuse_act_list true false)
+
+        foreach(fuse_act ${fuse_act_list})
             add_group_gemm_xe20_inst("_8" "_64" "_32" "_1, _4, _1" "_4, _1, _0" ${act_type} ${fuse_act} ${with_bias})
             add_group_gemm_xe20_inst("_16" "_64" "_32" "_1, _4, _1" "_4, _1, _0" ${act_type} ${fuse_act} ${with_bias})
             add_group_gemm_xe20_inst("_32" "_64" "_32" "_1, _4, _1" "_4, _1, _0" ${act_type} ${fuse_act} ${with_bias})
         endforeach()
 
-        add_group_gemm_xe20_inst("_128" "_64" "_32" "_4, _2, _1" "_2, _1, _0" ${act_type} true ${with_bias})
+        # For larger tiles, only instantiate the specific fuse_act values that are actually used
+        foreach(fuse_act ${fuse_act_list})
+            if(fuse_act)
+                add_group_gemm_xe20_inst("_128" "_64" "_32" "_4, _2, _1" "_2, _1, _0" ${act_type} ${fuse_act} ${with_bias})
+                add_group_gemm_xe20_inst("_256" "_64" "_32" "_8, _2, _1" "_2, _1, _0" ${act_type} ${fuse_act} ${with_bias})
+            endif()
+        endforeach()
+
+        # These are always false
+        add_group_gemm_xe20_inst("_128" "_64" "_32" "_4, _2, _1" "_2, _1, _0" ${act_type} false ${with_bias})
         add_group_gemm_xe20_inst("_128" "_128" "_32" "_4, _2, _1" "_2, _1, _0" ${act_type} false ${with_bias})
-        add_group_gemm_xe20_inst("_256" "_64" "_32" "_8, _2, _1" "_2, _1, _0" ${act_type} true ${with_bias})
+        add_group_gemm_xe20_inst("_256" "_64" "_32" "_8, _2, _1" "_2, _1, _0" ${act_type} false ${with_bias})
         add_group_gemm_xe20_inst("_256" "_256" "_32" "_8, _4, _1" "_4, _1, _0" ${act_type} false ${with_bias})
     endforeach()
 endforeach()

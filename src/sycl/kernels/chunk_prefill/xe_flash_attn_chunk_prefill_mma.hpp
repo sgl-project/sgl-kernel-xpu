@@ -454,15 +454,37 @@ struct FlashChunkPrefillMma<
     const ElementV* v_cache_ptr = (const ElementV*)v_traits_cache.base_ptr;
     // NHD format{batch, seq_len, head, dim_head}
     // stride {seq_len*head*dim_head, head*dim_head, dim_head, 1}
-    auto shape_q = make_shape(static_cast<int>(seq_len_qo), head_size_qk * num_heads_q, 1);
-    StrideQ stride_q = cutlass::make_cute_packed_stride(StrideQ{}, shape_q);
+    // Use single-head width for Q surface so that when the K-tile range (ceil_div(head_size_qk,
+    // QK_BLK_K) * QK_BLK_K) exceeds head_size_qk (e.g. head_size_qk=72 with QK_BLK_K=32 iterating
+    // to 96), OOB reads on the head-dim axis hit the surface boundary and get zero-padded by
+    // hardware, instead of reading adjacent head data. The pitch must remain
+    // num_heads_q * head_size_qk (physical stride between seq positions, interleaved heads).
+    auto shape_q = make_shape(static_cast<int>(seq_len_qo), static_cast<int>(head_size_qk), 1);
+    StrideQ stride_q = make_stride(
+        static_cast<int64_t>(num_heads_q * head_size_qk),
+        cute::Int<1>{},
+        static_cast<int64_t>(num_heads_q * head_size_qk) * static_cast<int64_t>(seq_len_qo));
 
+    // Use single-head width for K_cache surface for the same reason as Q above.
     auto shape_k_cache = make_shape(
-        static_cast<int>(PagedKV ? total_seq_len_kv_cache : seq_len_kv_cache), head_size_qk * num_heads_kv, 1);
-    StrideK stride_k_cache = cutlass::make_cute_packed_stride(StrideK{}, shape_k_cache);
+        static_cast<int>(PagedKV ? total_seq_len_kv_cache : seq_len_kv_cache), static_cast<int>(head_size_qk), 1);
+    StrideK stride_k_cache = make_stride(
+        static_cast<int64_t>(num_heads_kv * head_size_qk),
+        cute::Int<1>{},
+        static_cast<int64_t>(num_heads_kv * head_size_qk) *
+            static_cast<int64_t>(PagedKV ? total_seq_len_kv_cache : seq_len_kv_cache));
+    // Use single-head width for V surface so that when TileShapeOutput_N > head_size_vo
+    // (asymmetric head dim, e.g. d=192, dv=128), OOB reads hit the real surface boundary
+    // and get zero-padded by hardware, instead of reading adjacent head data.
+    // We must NOT use packed stride here because the pitch (stride between seq positions)
+    // is num_heads_kv * head_size_vo (interleaved heads), not head_size_vo.
     auto shape_v_cache = make_shape(
-        head_size_vo * num_heads_kv, static_cast<int>(PagedKV ? total_seq_len_kv_cache : seq_len_kv_cache), 1);
-    StrideV stride_v_cache = cutlass::make_cute_packed_stride(StrideV{}, shape_v_cache);
+        static_cast<int>(head_size_vo), static_cast<int>(PagedKV ? total_seq_len_kv_cache : seq_len_kv_cache), 1);
+    StrideV stride_v_cache = make_stride(
+        cute::Int<1>{},
+        static_cast<int64_t>(num_heads_kv * head_size_vo),
+        static_cast<int64_t>(num_heads_kv * head_size_vo) *
+            static_cast<int64_t>(PagedKV ? total_seq_len_kv_cache : seq_len_kv_cache));
     auto tensorQ = make_tensor(make_gmem_ptr(q_ptr + offset_q), make_layout(shape_q, stride_q));
     auto tensorK_cache =
         make_tensor(make_gmem_ptr(k_cache_ptr + offset_k_cache), make_layout(shape_k_cache, stride_k_cache));

@@ -397,4 +397,211 @@ void fused_qk_rope(
 #undef FUSED_QK_ROPE_LAUNCH_ARGS
 }
 
+template <bool is_neox, int64_t rope_dim, typename scalar_t, typename pos_t>
+struct FusedRopeCacheKernel {
+  scalar_t* query;
+  scalar_t* key;
+  const scalar_t* cos_sin_cache;
+  const pos_t* positions;
+  int64_t q_stride;
+  int64_t k_stride;
+  int64_t q_head_stride;
+  int64_t k_head_stride;
+  int64_t num_tokens;
+  int64_t num_q_heads;
+  int64_t num_k_heads;
+  int64_t cache_stride;
+  int64_t workers_per_work_group;
+  int64_t total_workers;
+
+  [[sycl::reqd_sub_group_size(16)]]
+  void operator()(sycl::nd_item<1> item) const {
+    constexpr int64_t sg_size = 16;
+    assert(sg_size == 16);
+    const int64_t local_id = item.get_local_id(0);
+    const int64_t worker_in_work_group = local_id / sg_size;
+    const int64_t lane_id = local_id % sg_size;
+    const int64_t worker_id = item.get_group(0) * workers_per_work_group + worker_in_work_group;
+
+    const int64_t num_qk_heads = num_q_heads + num_k_heads;
+    const int64_t num_works = num_tokens * num_qk_heads;
+    constexpr int64_t half_rope = rope_dim / 2;
+
+    using storage_t = std::conditional_t<
+        std::is_same_v<scalar_t, c10::Half>,
+        sycl::half,
+        std::conditional_t<std::is_same_v<scalar_t, c10::BFloat16>, sycl::ext::oneapi::bfloat16, float>>;
+
+    constexpr int64_t max_vec_bytes = 16;  // 128 bits
+    constexpr int64_t max_vec_elems = max_vec_bytes / (int64_t)sizeof(storage_t);
+
+    // We use different heuristic vec_size choosing from cuda.
+    // The following config would get the best performance(bf16/half):
+    // head_dim: 64 128 256 512
+    // vec_size: 2    2   8   8
+
+    constexpr int64_t vec_size =
+        is_neox ? (rope_dim < 256 ? 2 : max_vec_elems) : (rope_dim < 256 ? 1 : max_vec_elems / 2);
+
+    using vec_t = sycl::vec<storage_t, vec_size>;
+    using vec2_t = sycl::vec<storage_t, vec_size * 2>;  // for interleave pairs
+
+    for (int64_t idx = worker_id; idx < num_works; idx += total_workers) {
+      const int64_t token_id = idx / num_qk_heads;
+      const int64_t head_id = idx % num_qk_heads;
+      const bool is_q_head = head_id < num_q_heads;
+
+      const int64_t pos = static_cast<int64_t>(positions[token_id]);
+      scalar_t* base_ptr = nullptr;
+      int64_t head_index = 0;
+
+      if (is_q_head) {
+        head_index = head_id;
+        base_ptr = query + token_id * q_stride + head_index * q_head_stride;
+      } else {
+        head_index = head_id - num_q_heads;
+        base_ptr = key + token_id * k_stride + head_index * k_head_stride;
+      }
+
+      const scalar_t* cos_ptr = cos_sin_cache + pos * cache_stride;
+      const scalar_t* sin_ptr = cos_ptr + half_rope;
+
+      // Reinterpret scalar_t* as storage_t* for vectorized load/store.
+      // Safe: c10::Half and sycl::half share identical IEEE binary16 layout;
+      //       same holds for c10::BFloat16 and sycl::ext::oneapi::bfloat16.
+      auto* base_sptr = reinterpret_cast<storage_t*>(base_ptr);
+      auto* cos_sptr = reinterpret_cast<const storage_t*>(cos_ptr);
+      auto* sin_sptr = reinterpret_cast<const storage_t*>(sin_ptr);
+
+      if constexpr (is_neox) {
+        auto* x_sptr = base_sptr;
+        auto* y_sptr = base_sptr + half_rope;
+
+#pragma unroll
+        for (int64_t i = lane_id * vec_size; i < half_rope; i += sg_size * vec_size) {
+          vec_t x_vec = *reinterpret_cast<const vec_t*>(x_sptr + i);
+          vec_t y_vec = *reinterpret_cast<const vec_t*>(y_sptr + i);
+          vec_t c_vec = *reinterpret_cast<const vec_t*>(cos_sptr + i);
+          vec_t s_vec = *reinterpret_cast<const vec_t*>(sin_sptr + i);
+
+          // Calculate syl::vec directly without iterating over vec_size.
+          vec_t out_x = x_vec * c_vec - y_vec * s_vec;
+          vec_t out_y = x_vec * s_vec + y_vec * c_vec;
+
+          *reinterpret_cast<vec_t*>(x_sptr + i) = out_x;
+          *reinterpret_cast<vec_t*>(y_sptr + i) = out_y;
+        }
+      } else {
+#pragma unroll
+        for (int64_t i = lane_id * vec_size; i < half_rope; i += sg_size * vec_size) {
+          vec2_t v = *reinterpret_cast<const vec2_t*>(base_sptr + 2 * i);
+          vec_t c_vec = *reinterpret_cast<const vec_t*>(cos_sptr + i);
+          vec_t s_vec = *reinterpret_cast<const vec_t*>(sin_sptr + i);
+
+#pragma unroll
+          for (int j = 0; j < vec_size; j++) {
+            const storage_t x = v[2 * j];
+            const storage_t y = v[2 * j + 1];
+            const storage_t c = c_vec[j];
+            const storage_t s = s_vec[j];
+            v[2 * j] = x * c - y * s;
+            v[2 * j + 1] = x * s + y * c;
+          }
+          *reinterpret_cast<vec2_t*>(base_sptr + 2 * i) = v;
+        }
+      }
+    }
+  }
+};
+
+template <bool is_neox, int64_t rope_dim, typename scalar_t, typename pos_t>
+void launch_fused_rope_cache_kernel_scalar(
+    at::Tensor& query, at::Tensor& key, const at::Tensor& cos_sin_cache, const at::Tensor& positions) {
+  constexpr int kWorkGroupSize = 128;
+  constexpr int sg_size = 16;
+  static_assert(kWorkGroupSize % sg_size == 0, "kWorkGroupSize must be divisible by subgroup size");
+
+  const int64_t workers_per_work_group = kWorkGroupSize / sg_size;
+  const int64_t num_tokens = query.size(0);
+  const int64_t num_q_heads = query.size(1);
+  const int64_t num_k_heads = key.size(1);
+  const int64_t num_works = num_tokens * (num_q_heads + num_k_heads);
+  const int64_t num_groups = CeilDiv(num_works, workers_per_work_group);
+  const int64_t total_workers = num_groups * workers_per_work_group;
+
+  FusedRopeCacheKernel<is_neox, rope_dim, scalar_t, pos_t> kernel{
+      query.data_ptr<scalar_t>(),
+      key.data_ptr<scalar_t>(),
+      cos_sin_cache.data_ptr<scalar_t>(),
+      positions.data_ptr<pos_t>(),
+      query.stride(0),
+      key.stride(0),
+      query.stride(1),
+      key.stride(1),
+      num_tokens,
+      num_q_heads,
+      num_k_heads,
+      cos_sin_cache.stride(0),
+      workers_per_work_group,
+      total_workers};
+
+  sycl_kernel_submit(
+      sycl::range<1>(num_groups * kWorkGroupSize), sycl::range<1>(kWorkGroupSize), dpcppGetCurrentQueue(), kernel);
+}
+
+void fused_qk_rope_with_cos_sin_cache_inplace(
+    at::Tensor& query,
+    at::Tensor& key,
+    at::Tensor& cos_sin_cache,
+    at::Tensor& positions,
+    int64_t rope_dim,
+    bool is_neox) {
+  const auto input_dim = query.dim();
+  // Note that query and key were truncated to rope_dim here if head_dim is larger.
+  TORCH_CHECK(
+      input_dim == 3,
+      "fused_qk_rope_with_cos_sin_cache_inplace only supports 3D input [num_tokens, num_heads, rope_dim]");
+
+#define LAUNCH_ROPE_CACHE_KERNEL(IS_NEOX, POS_T)                                                                  \
+  switch (rope_dim) {                                                                                             \
+    case 64:                                                                                                      \
+      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 64, scalar_t, POS_T>(query, key, cos_sin_cache, positions);  \
+      break;                                                                                                      \
+    case 128:                                                                                                     \
+      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 128, scalar_t, POS_T>(query, key, cos_sin_cache, positions); \
+      break;                                                                                                      \
+    case 256:                                                                                                     \
+      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 256, scalar_t, POS_T>(query, key, cos_sin_cache, positions); \
+      break;                                                                                                      \
+    case 512:                                                                                                     \
+      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 512, scalar_t, POS_T>(query, key, cos_sin_cache, positions); \
+      break;                                                                                                      \
+    default:                                                                                                      \
+      TORCH_CHECK(false, "Unsupported rope_dim: ", rope_dim);                                                     \
+  }
+
+#define DISPATCH_ROPE_CACHE_KERNEL_BY_LAYOUT(POS_T) \
+  if (is_neox) {                                    \
+    LAUNCH_ROPE_CACHE_KERNEL(true, POS_T);          \
+  } else {                                          \
+    LAUNCH_ROPE_CACHE_KERNEL(false, POS_T);         \
+  }
+
+  SYCL_DISPATCH_FLOATING_TYPES(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      query.scalar_type(),
+      "fused_qk_rope_with_cos_sin_cache_inplace",
+      [&]() {
+        if (positions.scalar_type() == at::kInt) {
+          DISPATCH_ROPE_CACHE_KERNEL_BY_LAYOUT(int32_t);
+        } else {
+          DISPATCH_ROPE_CACHE_KERNEL_BY_LAYOUT(int64_t);
+        }
+      });
+
+#undef DISPATCH_ROPE_CACHE_KERNEL_BY_LAYOUT
+#undef LAUNCH_ROPE_CACHE_KERNEL
+}
+
 }  // namespace at::native::xpu

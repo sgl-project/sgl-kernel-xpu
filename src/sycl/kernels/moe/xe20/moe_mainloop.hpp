@@ -47,14 +47,20 @@
 #pragma clang diagnostic ignored "-Wpass-failed"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
-#define SILU 0
-#define GELU 1
-#define SWIGLU_GPT_OSS 2
-
 template <typename T>
 struct dump;
 
 namespace MoE {
+
+enum class ActivationType {
+  SILU = 0,
+  GELU = 1,
+  SWIGLU_GPT_OSS = 2,
+  RELU2 = 3,
+
+  MIN = SILU,
+  MAX = RELU2
+};
 
 using namespace cute;
 
@@ -72,7 +78,8 @@ template <
     class BiasTensor_,
     class TiledMMA_,
     bool WithBias,
-    int ActType>
+    bool FuseAct,
+    ActivationType ActType>
 struct MoEMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -88,7 +95,8 @@ template <
     class BiasTensor_,
     class TiledMMA_,
     bool WithBias,
-    int ActType>
+    bool FuseAct,
+    ActivationType ActType>
 struct MoEMainloop<
     XeDefault<Stages>,
     TiledCopyA_,
@@ -100,6 +108,7 @@ struct MoEMainloop<
     BiasTensor_,
     TiledMMA_,
     WithBias,
+    FuseAct,
     ActType> {
   using TiledMMA = TiledMMA_;
   using TiledCopyA = TiledCopyA_;
@@ -215,6 +224,16 @@ struct MoEMainloop<
       constexpr int BLK_M = get<0>(wg_tile);
       constexpr int BLK_N = get<1>(wg_tile);
       add_bias<decltype(tCrC), BLK_M, BLK_N>(Bias, tCrC, mma, wg_n, thr_id);
+    }
+
+    // Apply fused activation for RELU2 (non-gated) only when FuseAct is true
+    if constexpr (FuseAct && ActType == ActivationType::RELU2) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tCrC.size(); ++i) {
+        float x = tCrC(i);
+        float relu_x = sycl::fmax(0.0f, x);
+        tCrC(i) = relu_x * relu_x;  // relu(x)^2
+      }
     }
 
     reorder(tCrC, tCrD_final_sg_tensor);
@@ -359,22 +378,31 @@ struct MoEMainloop<
       float x = tCrC0(i);
       float y = tCrC1(i);
       float s;
-      if constexpr (ActType == SILU) {
-        s = 1.0f / (1.0f + sycl::native::exp(-x));
-        tCrC0(i) = x * s * y;
-      } else if constexpr (ActType == SWIGLU_GPT_OSS) {
-        float gate = sycl::fmin(x, gemm1_limit);
-        float up = sycl::fmax(-gemm1_limit, sycl::fmin(y, gemm1_limit));
-        float t = gate * gemm1_alpha;
-        s = 1.0f / (1.0f + sycl::native::exp(-t));
-        tCrC0(i) = gate * s * (up + 1.0f);
-      } else {                                        // GELU
-        constexpr float kBeta = 0.7978845608028654f;  // sqrt(2.0f / pi)
-        constexpr float kAlpha = 0.044715f;
-        float x_cube = x * x * x;
-        float tanh_arg = kBeta * (x + kAlpha * x_cube);
-        s = 0.5f * (1.0f + std::tanh(tanh_arg));
-        tCrC0(i) = x * s * y;
+      switch (ActType) {
+        case ActivationType::SILU: {
+          s = 1.0f / (1.0f + sycl::native::exp(-x));
+          tCrC0(i) = x * s * y;
+          break;
+        }
+        case ActivationType::SWIGLU_GPT_OSS: {
+          float gate = sycl::fmin(x, gemm1_limit);
+          float up = sycl::fmax(-gemm1_limit, sycl::fmin(y, gemm1_limit));
+          float t = gate * gemm1_alpha;
+          s = 1.0f / (1.0f + sycl::native::exp(-t));
+          tCrC0(i) = gate * s * (up + 1.0f);
+          break;
+        }
+        case ActivationType::GELU: {
+          constexpr float kBeta = 0.7978845608028654f;  // sqrt(2.0f / pi)
+          constexpr float kAlpha = 0.044715f;
+          float x_cube = x * x * x;
+          float tanh_arg = kBeta * (x + kAlpha * x_cube);
+          s = 0.5f * (1.0f + std::tanh(tanh_arg));
+          tCrC0(i) = x * s * y;
+          break;
+        }
+        default:
+          break;
       }
     }
 

@@ -425,3 +425,40 @@ def fused_qk_rope(
         attention_factor,
         rotary_dim,
     )
+
+
+def fused_qk_rope_with_cos_sin_cache_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+    is_neox: bool,
+) -> None:
+    r"""Apply RoPE to Q/K using precomputed cos/sin cache.
+
+    Parameters
+    ----------
+    q: torch.Tensor
+        Query tensor updated in-place.
+    k: torch.Tensor
+        Key tensor updated in-place.
+    cos_sin_cache: torch.Tensor
+        Precomputed RoPE cos/sin cache.
+    positions: torch.Tensor
+        Position indices used to index the cache.
+    rope_dim: int
+        Rotary/RoPE dimension represented by ``cos_sin_cache`` (that is,
+        the size of the cached cos/sin concatenation), not the full attention
+        head dimension.
+    is_neox: bool
+        Whether to apply NeoX-style rotary layout.
+    """
+    torch.ops.sgl_kernel.fused_qk_rope_with_cos_sin_cache_inplace(
+        q,
+        k,
+        cos_sin_cache,
+        positions,
+        rope_dim,
+        is_neox,
+    )

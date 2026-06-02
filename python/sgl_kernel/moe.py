@@ -329,7 +329,8 @@ def fused_experts(
     assert activation in (
         "silu",
         "gelu",
-    ), f"Only silu and gelu are supported but got {activation}"
+        "relu2",
+    ), f"Only silu, gelu and relu2 are supported but got {activation}"
 
     # type check
     assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
@@ -354,9 +355,9 @@ def fused_experts(
     assert (
         hidden_states.shape[-1] == w1.shape[-1]
     ), f"hidden_states shape[-1] {hidden_states.shape} must be equal to w1 shape[-2] {w1.shape}"
-    assert (
-        2 * w2.shape[2] == w1.shape[1]
-    ), f"w2 shape[2] {w2.shape[2]} must be half of w1 shape[1] {w1.shape[1]}"
+    assert (2 * w2.shape[2] == w1.shape[1]) or (
+        (w2.shape[2] == w1.shape[1]) and (activation == "relu2")
+    ), f"w2 shape[2] {w2.shape[2]} must be half of w1 shape[1] {w1.shape[1]} except non-gate"
     assert (topk_ids.shape == topk_weights.shape) and (
         topk_ids.shape[0] == hidden_states.shape[0]
     ), f"topk_ids shape {topk_ids.shape} and topk_weights shape {topk_weights.shape} must be equal and match hidden_states shape[0] {hidden_states.shape[0]}"
@@ -365,7 +366,9 @@ def fused_experts(
 
     E, _, K = w1.shape
     E, OutK, N = w2.shape
-    assert N * 2 == w1.shape[1], "w1 shape[1] must be 2x of w2 shape[2]"
+    assert (N * 2 == w1.shape[1]) or (
+        N == w1.shape[1]
+    ), "w1 shape[1] must be 1x or 2x of w2 shape[2]"
     if b1 is not None:
         assert b1.shape == w1.shape[:2], "b1 shape must match w1 shape[:2]"
     if b2 is not None:
@@ -422,7 +425,7 @@ def fused_experts(
         (M * TopK, OutK), device=hidden_states.device, dtype=hidden_states.dtype
     )
 
-    # 0=silu, 1=gelu, 2=swiglu (silu with alpha/limit clamping for gpt-oss)
+    # 0=silu, 1=gelu, 2=swiglu (silu with alpha/limit clamping for gpt-oss), 3=relu2
     if activation == "silu":
         activation_type = 0
         if gemm1_alpha is not None:
@@ -433,10 +436,14 @@ def fused_experts(
             activation = "swiglu_gpt_oss"
     elif activation == "gelu":
         activation_type = 1
+    elif activation == "relu2":
+        activation_type = 3
     else:
         raise ValueError(f"Unsupported activation {activation}")
 
     assert is_xe2_arch(), f"Current MoE is only supported on BMG"
+
+    gate_factor = 2 if (2 * w2.shape[2] == w1.shape[1]) else 1
 
     # heuristic for choosing fused or unfused act, can be tuned
     avg_m = (M * TopK) // E
@@ -444,7 +451,9 @@ def fused_experts(
     use_unfused_act = avg_m <= 128 and big_weight
     if use_unfused_act:
         intermediate_cache1 = torch.empty(
-            (M * TopK, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype
+            (M * TopK, gate_factor * N),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
         )
         intermediate_cache2 = torch.empty(
             (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
@@ -471,6 +480,8 @@ def fused_experts(
             intermediate_cache2 = torch.ops.sgl_kernel.swiglu_gpt_oss_sigmoid_alpha(
                 intermediate_cache1, gemm1_alpha, gemm1_limit
             )
+        elif activation_type == 3:
+            intermediate_cache2 = torch.square(torch.relu(intermediate_cache1))
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
             intermediate_cache3,
             intermediate_cache2,

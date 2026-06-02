@@ -12,11 +12,12 @@
 #include "sycl/kernels/moe/xe20/moe_kernel.hpp"
 
 using namespace cute;
+using namespace MoE;
 
-template <typename, typename, typename, typename, typename, typename, int, bool, bool>
+template <typename, typename, typename, typename, typename, typename, ActivationType, bool, bool>
 class GemmXe20Name;
 
-template <typename Tile, typename SGLayout, int ActType, bool FuseAct, bool WithBias>
+template <typename Tile, typename SGLayout, ActivationType ActType, bool FuseAct, bool WithBias>
 void Xe20MoEGEMMLauncher(
     sycl::queue q,
     const void* activations,
@@ -30,7 +31,8 @@ void Xe20MoEGEMMLauncher(
     const int num_experts,
     int* workspace,
     float gemm1_alpha,
-    float gemm1_limit) {
+    float gemm1_limit,
+    int ld_b_param) {
   (void)scales;
   using Element = cutlass::bfloat16_t;
 
@@ -38,7 +40,7 @@ void Xe20MoEGEMMLauncher(
     return make_tensor(make_gmem_ptr(&val), make_layout(repeat<rank_v<decltype(stride)>>(1), stride));
   };
   auto make_dummy_bias = [&](auto val) {
-    if constexpr (FuseAct && ActType == 2) {  // SWIGLU interleaved: stride 2
+    if constexpr (FuseAct && ActType == ActivationType::SWIGLU_GPT_OSS) {  // SWIGLU interleaved: stride 2
       return make_tensor(make_gmem_ptr(&val), make_layout(Shape<int>{}, Stride<_2>{}));
     } else {
       return make_tensor(make_gmem_ptr(&val), make_layout(Shape<int>{}, Stride<_1>{}));
@@ -86,6 +88,7 @@ void Xe20MoEGEMMLauncher(
       num_experts,
       workspace,
       mma,
+      static_cast<int32_t>(ld_b_param),
       static_cast<float>(gemm1_alpha),
       static_cast<float>(gemm1_limit),
   };
@@ -101,7 +104,7 @@ void Xe20MoEGEMMLauncher(
   });
 }
 
-template void Xe20MoEGEMMLauncher<@TILE@, @SGLAYOUT@, @ACT_TYPE@, @FUSE_ACT@, @WITH_BIAS@>(
+template void Xe20MoEGEMMLauncher<@TILE@, @SGLAYOUT@, static_cast<ActivationType>(@ACT_TYPE@), @FUSE_ACT@, @WITH_BIAS@>(
     sycl::queue,
     const void*,
     const void*,
@@ -114,6 +117,7 @@ template void Xe20MoEGEMMLauncher<@TILE@, @SGLAYOUT@, @ACT_TYPE@, @FUSE_ACT@, @W
     const int,
     int*,
     float,
-    float);
+    float,
+    int);
 
 #undef SYCL_INTEL_TARGET

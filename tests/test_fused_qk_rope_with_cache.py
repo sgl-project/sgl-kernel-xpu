@@ -3,10 +3,9 @@ import sys
 import pytest
 import torch
 import triton
-
 from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
-
 from test_rope_utils import *
+
 
 def torch_impl_rope(
     q: torch.Tensor,

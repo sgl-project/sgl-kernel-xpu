@@ -10,6 +10,24 @@ namespace at::native::xpu {
 
 enum class EmbeddingAlgorithm { RotateHalf = 0, RotateInterleave = 1 };
 
+// Map a PyTorch c10 scalar type to the SYCL-native element type that sycl::vec
+// accepts. c10::Half / c10::BFloat16 are PyTorch wrapper structs that do not
+// satisfy SYCL's vector element-type concept; the native sycl::half /
+// sycl::ext::oneapi::bfloat16 do, and are bit-identical 2-byte layouts. (Same
+// pattern as src/sycl/EmbeddingLoraAFwd.cpp:38.)
+template <typename T>
+struct ToSyclElementType {
+  using type = T;
+};
+template <>
+struct ToSyclElementType<at::Half> {
+  using type = sycl::half;
+};
+template <>
+struct ToSyclElementType<at::BFloat16> {
+  using type = sycl::ext::oneapi::bfloat16;
+};
+
 template <typename scalar_t, EmbeddingAlgorithm algo = EmbeddingAlgorithm::RotateHalf>
 inline void apply_token_rotary_embedding(
     scalar_t* data,
@@ -480,9 +498,134 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding(
 // into the flat KV-cache at out_loc.
 // ============================================================================
 
-template <typename scalar_t, EmbeddingAlgorithm algo>
+// ROT_DIM is a compile-time specialization knob (B3): when non-zero the kernel knows
+// rot_dim at compile time, so embed_dim = ROT_DIM/2 is constexpr and the compiler folds
+// the hot `i / embed_dim` / `i % embed_dim` divmods into multiply-shift, unrolls the
+// now statically-bounded Q/K loops, and sizes the register tile at compile time. A
+// ROT_DIM of 0 selects the original runtime-rot_dim path (the dispatch fallback for any
+// rot_dim outside the specialized set). This mirrors DSRotaryEmbedding's templating on
+// rotary_dim (Rope.cpp:87) and the CUDA Triton path's JIT autotune on BLOCK_DH.
+template <typename scalar_t, EmbeddingAlgorithm algo, int ROT_DIM = 0>
 struct FusedRopeKVCacheKernel {
   using accscalar = at::opmath_type<scalar_t>;
+  static constexpr int kVec = 8;  // 8 x 2-byte = one 16-byte LSC OWord message
+
+  // Rotate `n_heads` heads in place starting at `base`, and (if `cache != nullptr`)
+  // mirror the rotated rot_dim region to `cache` using the same per-head layout.
+  //
+  // EMBED_DIM_T is the compile-time embed_dim (rot_dim/2) when known, else 0; the body
+  // resolves `embed_dim` from it so a non-zero EMBED_DIM_T turns every `/ embed_dim` and
+  // `% embed_dim` into a constant-divisor strength reduction.
+  //
+  // B2: for 2-byte scalar_t (bf16/half) and 16-byte-aligned shapes we vectorize the
+  // rotated load/store as `pack_128b_t = sycl::vec<uint32_t, 4>` block messages (the
+  // same idiom B1 used for the V write and src/sycl/merge_states.cpp:106 uses for the
+  // merge). The fp32 rotation math runs lane-by-lane using the *identical*
+  // static_cast<accscalar>/static_cast<scalar_t> round-trip as the scalar path below,
+  // so the result is bit-exact — only the access pattern changes (N scalar stores ->
+  // N/kVec OWord stores). Alignment invariant: a head base is base + head_id * head_dim_,
+  // which is 16-byte-aligned when head_dim_ % kVec == 0; each kVec-block stays inside one
+  // head and on a 16-byte boundary when embed_dim % kVec == 0. Both are re-checked at
+  // runtime; anything else (and the float instantiation forced by
+  // SYCL_DISPATCH_FLOATING_TYPES) takes the scalar path.
+  template <int EMBED_DIM_T>
+  inline void rope_heads(
+      scalar_t* base,
+      scalar_t* cache,
+      int64_t n_heads,
+      const float* cos_cache,
+      const float* sin_cache,
+      int32_t embed_dim_dyn,
+      int32_t local_id,
+      int32_t local_range) const {
+    // EMBED_DIM_T != 0 is a compile-time constant, so the optimizer replaces the ternary
+    // with the constant and strength-reduces the divmods below; EMBED_DIM_T == 0 keeps
+    // the runtime value.
+    const int32_t embed_dim = (EMBED_DIM_T != 0) ? EMBED_DIM_T : embed_dim_dyn;
+    int32_t work = static_cast<int32_t>(n_heads) * embed_dim;
+
+    // B2 vectorization is enabled for the Neox (RotateHalf) layout only. There the
+    // x-lanes [rot_off, rot_off+kVec) and y-lanes [rot_off+embed_dim, +kVec) are each
+    // contiguous, so kVec rotations map onto two wide loads + two wide stores per
+    // target (in-place, and the K-cache mirror). The load/store goes through
+    // sycl::vec<uint32_t, 4> — the 16-byte OWord block message the Intel Xe LSC issues
+    // in one shot (same idiom as the B1 V-write and src/sycl/merge_states.cpp:106).
+    // A native sycl::vec<bfloat16, 8> load/store does NOT coalesce to one OWord here
+    // and benchmarked ~9% slower, so we keep the uint32x4 message and reinterpret it
+    // to 8 bf16/half lanes with the native vec::as<>() (no memcpy) for the fp32 math.
+    // The Interleave layout pairs (2i, 2i+1) adjacently, forcing a stride-2 access in
+    // the tile; that regressed ~6.5% on the 48-shape sweep, so Interleave stays on the
+    // scalar fallback below. Gemma 4 — the model this kernel exists for — is Neox. The
+    // rotation runs lane-by-lane in fp32 with the same static_cast round-trip as the
+    // scalar path, so the result is bit-exact.
+    if constexpr (sizeof(scalar_t) == 2 && algo == EmbeddingAlgorithm::RotateHalf) {
+      if ((embed_dim % kVec == 0) && (head_dim_ % kVec == 0)) {
+        using elem_t = typename ToSyclElementType<scalar_t>::type;
+        using pack_t = sycl::vec<uint32_t, 4>;   // one 16-byte OWord = 8 x 2-byte lanes
+        using lane_t = sycl::vec<elem_t, kVec>;  // the same 16 bytes viewed as 8 lanes
+        int32_t vec_work = work / kVec;
+        for (int vi = local_id; vi < vec_work; vi += local_range) {
+          int32_t i_base = vi * kVec;
+          int32_t head_id = i_base / embed_dim;
+          int32_t rot_off = i_base % embed_dim;  // multiple of kVec
+          scalar_t* h = base + head_id * head_dim_;
+          scalar_t* hc = cache ? cache + head_id * head_dim_ : nullptr;
+
+          pack_t px, py;
+          px.load(0, reinterpret_cast<const uint32_t*>(h + rot_off));
+          py.load(0, reinterpret_cast<const uint32_t*>(h + rot_off + embed_dim));
+          lane_t vx = px.template as<lane_t>();
+          lane_t vy = py.template as<lane_t>();
+#pragma unroll
+          for (int j = 0; j < kVec; ++j) {
+            float cos_val = cos_cache[rot_off + j];
+            float sin_val = sin_cache[rot_off + j];
+            accscalar x = static_cast<accscalar>(vx[j]);
+            accscalar y = static_cast<accscalar>(vy[j]);
+            vx[j] = static_cast<elem_t>(static_cast<scalar_t>(x * cos_val - y * sin_val));
+            vy[j] = static_cast<elem_t>(static_cast<scalar_t>(x * sin_val + y * cos_val));
+          }
+          px = vx.template as<pack_t>();
+          py = vy.template as<pack_t>();
+          px.store(0, reinterpret_cast<uint32_t*>(h + rot_off));
+          py.store(0, reinterpret_cast<uint32_t*>(h + rot_off + embed_dim));
+          if (hc) {
+            px.store(0, reinterpret_cast<uint32_t*>(hc + rot_off));
+            py.store(0, reinterpret_cast<uint32_t*>(hc + rot_off + embed_dim));
+          }
+        }
+        return;
+      }
+    }
+
+    // Scalar fallback: float instantiation, or shapes not 16-byte-aligned.
+    for (int i = local_id; i < work; i += local_range) {
+      int32_t head_id = i / embed_dim;
+      int32_t rot_offset = i % embed_dim;
+      scalar_t* h = base + head_id * head_dim_;
+
+      int x_idx, y_idx;
+      if constexpr (algo == EmbeddingAlgorithm::RotateHalf) {
+        x_idx = rot_offset;
+        y_idx = rot_offset + embed_dim;
+      } else {
+        x_idx = 2 * rot_offset;
+        y_idx = 2 * rot_offset + 1;
+      }
+      float cos_val = cos_cache[rot_offset];
+      float sin_val = sin_cache[rot_offset];
+      accscalar x = static_cast<accscalar>(h[x_idx]);
+      accscalar y = static_cast<accscalar>(h[y_idx]);
+      scalar_t x_rot = static_cast<scalar_t>(x * cos_val - y * sin_val);
+      scalar_t y_rot = static_cast<scalar_t>(x * sin_val + y * cos_val);
+      h[x_idx] = x_rot;
+      h[y_idx] = y_rot;
+      if (cache) {
+        cache[head_id * head_dim_ + x_idx] = x_rot;
+        cache[head_id * head_dim_ + y_idx] = y_rot;
+      }
+    }
+  }
 
   void operator()(sycl::nd_item<1> item) const {
     int32_t token_id = item.get_group(0);
@@ -493,71 +636,24 @@ struct FusedRopeKVCacheKernel {
     if (out_idx < 0) return;  // speculative decoding skip
 
     int64_t pos = positions_[token_id];
-    int32_t embed_dim = rot_dim_ / 2;
+    // When ROT_DIM is specialized, rot_dim_ == ROT_DIM and embed_dim is a compile-time
+    // constant; the EMBED_DIM_T template arg threads that constant into rope_heads so the
+    // divmods fold. ROT_DIM == 0 leaves both as runtime values.
+    constexpr int kEmbedDimT = (ROT_DIM != 0) ? (ROT_DIM / 2) : 0;
+    int32_t embed_dim = (ROT_DIM != 0) ? (ROT_DIM / 2) : static_cast<int32_t>(rot_dim_ / 2);
 
     // cos_sin_cache is float32; index by position
     const float* cos_cache = cos_sin_cache_ + pos * rot_dim_;
     const float* sin_cache = cos_cache + embed_dim;
 
-    // RoPE Q in-place
+    // RoPE Q in-place (no cache write)
     scalar_t* q_base = query_ + token_id * num_q_heads_ * head_dim_;
-    int32_t q_work = num_q_heads_ * embed_dim;
-    for (int i = local_id; i < q_work; i += local_range) {
-      int32_t head_id = i / embed_dim;
-      int32_t rot_offset = i % embed_dim;
-      scalar_t* q_head = q_base + head_id * head_dim_;
+    rope_heads<kEmbedDimT>(q_base, nullptr, num_q_heads_, cos_cache, sin_cache, embed_dim, local_id, local_range);
 
-      int x_idx, y_idx;
-      float cos_val, sin_val;
-      if constexpr (algo == EmbeddingAlgorithm::RotateHalf) {
-        x_idx = rot_offset;
-        y_idx = rot_offset + embed_dim;
-        cos_val = cos_cache[rot_offset];
-        sin_val = sin_cache[rot_offset];
-      } else {
-        x_idx = 2 * rot_offset;
-        y_idx = 2 * rot_offset + 1;
-        cos_val = cos_cache[rot_offset];
-        sin_val = sin_cache[rot_offset];
-      }
-      accscalar x = static_cast<accscalar>(q_head[x_idx]);
-      accscalar y = static_cast<accscalar>(q_head[y_idx]);
-      q_head[x_idx] = static_cast<scalar_t>(x * cos_val - y * sin_val);
-      q_head[y_idx] = static_cast<scalar_t>(x * sin_val + y * cos_val);
-    }
-
-    // RoPE K in-place + write to k_cache
+    // RoPE K in-place + write rotated K to k_cache
     scalar_t* k_base = key_ + token_id * num_kv_heads_ * head_dim_;
     scalar_t* k_cache_row = k_cache_ + out_idx * num_kv_heads_ * head_dim_;
-    int32_t k_work = num_kv_heads_ * embed_dim;
-    for (int i = local_id; i < k_work; i += local_range) {
-      int32_t head_id = i / embed_dim;
-      int32_t rot_offset = i % embed_dim;
-      scalar_t* k_head = k_base + head_id * head_dim_;
-
-      int x_idx, y_idx;
-      float cos_val, sin_val;
-      if constexpr (algo == EmbeddingAlgorithm::RotateHalf) {
-        x_idx = rot_offset;
-        y_idx = rot_offset + embed_dim;
-        cos_val = cos_cache[rot_offset];
-        sin_val = sin_cache[rot_offset];
-      } else {
-        x_idx = 2 * rot_offset;
-        y_idx = 2 * rot_offset + 1;
-        cos_val = cos_cache[rot_offset];
-        sin_val = sin_cache[rot_offset];
-      }
-      accscalar x = static_cast<accscalar>(k_head[x_idx]);
-      accscalar y = static_cast<accscalar>(k_head[y_idx]);
-      scalar_t x_rot = static_cast<scalar_t>(x * cos_val - y * sin_val);
-      scalar_t y_rot = static_cast<scalar_t>(x * sin_val + y * cos_val);
-      k_head[x_idx] = x_rot;
-      k_head[y_idx] = y_rot;
-      // Write rotated K to cache
-      k_cache_row[head_id * head_dim_ + x_idx] = x_rot;
-      k_cache_row[head_id * head_dim_ + y_idx] = y_rot;
-    }
+    rope_heads<kEmbedDimT>(k_base, k_cache_row, num_kv_heads_, cos_cache, sin_cache, embed_dim, local_id, local_range);
 
     // Copy non-rotated dims of K to cache (if head_dim > rot_dim)
     // and write full V to v_cache.
@@ -705,9 +801,14 @@ void apply_rope_inplace_with_kvcache(
 
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, query.scalar_type(), "apply_rope_inplace_with_kvcache", [&]() {
-        auto cgf = DPCPP_Q_CGF(cgh) {
-          if (is_neox) {
-            FusedRopeKVCacheKernel<scalar_t, EmbeddingAlgorithm::RotateHalf> kernel = {
+        // Build + submit the kernel specialized for a given EmbeddingAlgorithm and a
+        // compile-time ROT_DIM (0 = runtime-rot_dim fallback). Generic lambda so the same
+        // body covers all five specialized dims plus the fallback without duplication.
+        auto launch = [&](auto algo_tag, auto rot_dim_tag) {
+          constexpr EmbeddingAlgorithm kAlgo = decltype(algo_tag)::value;
+          constexpr int kRotDim = decltype(rot_dim_tag)::value;
+          auto cgf = DPCPP_Q_CGF(cgh) {
+            FusedRopeKVCacheKernel<scalar_t, kAlgo, kRotDim> kernel = {
                 .positions_ = positions.data_ptr<int64_t>(),
                 .cos_sin_cache_ = cos_sin_cache.data_ptr<float>(),
                 .query_ = query.data_ptr<scalar_t>(),
@@ -723,26 +824,42 @@ void apply_rope_inplace_with_kvcache(
             };
             cgh.parallel_for<decltype(kernel)>(
                 sycl::nd_range<1>(sycl::range<1>(num_tokens * group_size), sycl::range<1>(group_size)), kernel);
-          } else {
-            FusedRopeKVCacheKernel<scalar_t, EmbeddingAlgorithm::RotateInterleave> kernel = {
-                .positions_ = positions.data_ptr<int64_t>(),
-                .cos_sin_cache_ = cos_sin_cache.data_ptr<float>(),
-                .query_ = query.data_ptr<scalar_t>(),
-                .key_ = key.data_ptr<scalar_t>(),
-                .value_ = value.data_ptr<scalar_t>(),
-                .k_cache_ = k_cache.data_ptr<scalar_t>(),
-                .v_cache_ = v_cache.data_ptr<scalar_t>(),
-                .out_loc_ = out_loc.data_ptr<int64_t>(),
-                .num_q_heads_ = num_q_heads,
-                .num_kv_heads_ = num_kv_heads,
-                .head_dim_ = head_dim,
-                .rot_dim_ = rot_dim,
-            };
-            cgh.parallel_for<decltype(kernel)>(
-                sycl::nd_range<1>(sycl::range<1>(num_tokens * group_size), sycl::range<1>(group_size)), kernel);
+          };
+          dpcppGetCurrentQueue().submit(cgf);
+        };
+
+        // Dispatch on the runtime rot_dim to a compile-time specialization when it is one
+        // of the common values, else fall back to the runtime-rot_dim kernel (ROT_DIM=0).
+        // 5 dims x 2 algos = 10 specializations per dtype, matching the DSRotaryEmbedding
+        // precedent's instantiation count.
+        auto dispatch_algo = [&](auto algo_tag) {
+          switch (rot_dim) {
+            case 32:
+              launch(algo_tag, std::integral_constant<int, 32>{});
+              break;
+            case 64:
+              launch(algo_tag, std::integral_constant<int, 64>{});
+              break;
+            case 96:
+              launch(algo_tag, std::integral_constant<int, 96>{});
+              break;
+            case 128:
+              launch(algo_tag, std::integral_constant<int, 128>{});
+              break;
+            case 256:
+              launch(algo_tag, std::integral_constant<int, 256>{});
+              break;
+            default:
+              launch(algo_tag, std::integral_constant<int, 0>{});  // runtime-rot_dim fallback
+              break;
           }
         };
-        dpcppGetCurrentQueue().submit(cgf);
+
+        if (is_neox) {
+          dispatch_algo(std::integral_constant<EmbeddingAlgorithm, EmbeddingAlgorithm::RotateHalf>{});
+        } else {
+          dispatch_algo(std::integral_constant<EmbeddingAlgorithm, EmbeddingAlgorithm::RotateInterleave>{});
+        }
       });
 }
 

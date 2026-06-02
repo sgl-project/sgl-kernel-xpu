@@ -20,17 +20,27 @@ struct StoreCacheKernel {
     scalar_t* k_dst = k_cache_ + cache_idx * row_dim_;
     scalar_t* v_dst = v_cache_ + cache_idx * row_dim_;
 
+    // K/V are a pure copy. For 2-byte scalar_t (bf16/half) we move 16 bytes at a
+    // time as one Intel Xe LSC OWord message via sycl::vec<uint32_t, 4>, using the
+    // native sycl::vec::load/store(offset, ptr) API (no memcpy) — offset is in units
+    // of the 16-byte pack, ptr is the reinterpreted uint32_t row base. This mirrors
+    // the B1 V-write idiom in Rope.cpp and src/sycl/merge_states.cpp:106. A native
+    // sycl::vec<scalar_t, 8> would hit the c10::BFloat16/Half element-type-trait
+    // mismatch and (measured on the rope kernel) does not coalesce to one OWord.
     using pack_t = sycl::vec<uint32_t, 4>;
     constexpr int64_t vec_width = sizeof(pack_t) / sizeof(scalar_t);
     const int64_t vec_count = row_dim_ / vec_width;
 
+    auto* k_src_p = reinterpret_cast<uint32_t*>(k_src);
+    auto* v_src_p = reinterpret_cast<uint32_t*>(v_src);
+    auto* k_dst_p = reinterpret_cast<uint32_t*>(k_dst);
+    auto* v_dst_p = reinterpret_cast<uint32_t*>(v_dst);
     for (int64_t i = local_id; i < vec_count; i += local_range) {
       pack_t kp, vp;
-      const int64_t off = i * vec_width;
-      memcpy(&kp, k_src + off, sizeof(pack_t));
-      memcpy(&vp, v_src + off, sizeof(pack_t));
-      memcpy(k_dst + off, &kp, sizeof(pack_t));
-      memcpy(v_dst + off, &vp, sizeof(pack_t));
+      kp.load(i, k_src_p);
+      vp.load(i, v_src_p);
+      kp.store(i, k_dst_p);
+      vp.store(i, v_dst_p);
     }
     for (int64_t i = vec_count * vec_width + local_id; i < row_dim_; i += local_range) {
       k_dst[i] = k_src[i];
@@ -46,7 +56,7 @@ struct StoreCacheKernel {
   int64_t row_dim_;
 };
 
-void store_cache_xpu(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices) {
+void store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices) {
   CHECK_DEVICE(k);
   CHECK_DEVICE(v);
   CHECK_DEVICE(k_cache);
@@ -84,22 +94,21 @@ void store_cache_xpu(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tens
   int64_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
   int64_t group_size = std::min<int64_t>(std::min<int64_t>(row_dim, 512), max_wg_size);
 
-  SYCL_DISPATCH_FLOATING_TYPES(
-      at::ScalarType::Half, at::ScalarType::BFloat16, k.scalar_type(), "store_cache_xpu", [&]() {
-        auto cgf = DPCPP_Q_CGF(cgh) {
-          StoreCacheKernel<scalar_t> kernel = {
-              .k_ = k.data_ptr<scalar_t>(),
-              .v_ = v.data_ptr<scalar_t>(),
-              .k_cache_ = k_cache.data_ptr<scalar_t>(),
-              .v_cache_ = v_cache.data_ptr<scalar_t>(),
-              .indices_ = indices.data_ptr<int64_t>(),
-              .row_dim_ = row_dim,
-          };
-          cgh.parallel_for<decltype(kernel)>(
-              sycl::nd_range<1>(sycl::range<1>(num_tokens * group_size), sycl::range<1>(group_size)), kernel);
-        };
-        dpcppGetCurrentQueue().submit(cgf);
-      });
+  SYCL_DISPATCH_FLOATING_TYPES(at::ScalarType::Half, at::ScalarType::BFloat16, k.scalar_type(), "store_cache", [&]() {
+    auto cgf = DPCPP_Q_CGF(cgh) {
+      StoreCacheKernel<scalar_t> kernel = {
+          .k_ = k.data_ptr<scalar_t>(),
+          .v_ = v.data_ptr<scalar_t>(),
+          .k_cache_ = k_cache.data_ptr<scalar_t>(),
+          .v_cache_ = v_cache.data_ptr<scalar_t>(),
+          .indices_ = indices.data_ptr<int64_t>(),
+          .row_dim_ = row_dim,
+      };
+      cgh.parallel_for<decltype(kernel)>(
+          sycl::nd_range<1>(sycl::range<1>(num_tokens * group_size), sycl::range<1>(group_size)), kernel);
+    };
+    dpcppGetCurrentQueue().submit(cgf);
+  });
 }
 
 }  // namespace at::native::xpu

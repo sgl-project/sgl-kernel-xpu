@@ -71,7 +71,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "store_cache(Tensor k, Tensor v, Tensor(a!) k_cache, Tensor(b!) v_cache, "
       "Tensor indices) -> ()");
-  m.impl("store_cache", torch::kXPU, &at::native::xpu::store_cache_xpu);
+  m.impl("store_cache", torch::kXPU, &at::native::xpu::store_cache);
 
   m.def("moe_sum_reduce(Tensor input, Tensor output, float routed_scaling_factor) -> ()");
   m.impl("moe_sum_reduce", torch::kXPU, &moe_sum_reduce);

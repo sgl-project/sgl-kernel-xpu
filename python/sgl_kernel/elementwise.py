@@ -195,6 +195,62 @@ def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
     return out
 
 
+def apply_rope_inplace_with_kvcache(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    out_loc: torch.Tensor,
+    is_neox: bool = True,
+) -> None:
+    r"""Fused in-place RoPE + KV-cache store for XPU.
+
+    Applies rotary position embedding to Q and K in-place, then writes
+    rotated K and unmodified V into the flat KV-cache at the given slot
+    indices. All in a single SYCL kernel launch.
+
+    Parameters
+    ----------
+    query : torch.Tensor
+        Query tensor, shape: ``(num_tokens, num_q_heads, head_dim)``.
+    key : torch.Tensor
+        Key tensor, shape: ``(num_tokens, num_kv_heads, head_dim)``.
+    value : torch.Tensor
+        Value tensor, shape: ``(num_tokens, num_kv_heads, head_dim)``.
+    k_cache : torch.Tensor
+        Key cache buffer, shape: ``(cache_size, num_kv_heads * head_dim)``.
+    v_cache : torch.Tensor
+        Value cache buffer, shape: ``(cache_size, num_kv_heads * head_dim)``.
+    cos_sin_cache : torch.Tensor
+        Precomputed cos/sin cache, shape: ``(max_position, rotary_dim)``.
+        Must be float32.
+    positions : torch.Tensor
+        Position indices, shape: ``(num_tokens,)``, dtype int64.
+    out_loc : torch.Tensor
+        Flat cache slot indices, shape: ``(num_tokens,)``, dtype int64.
+        Use -1 to skip a token (speculative decoding).
+    is_neox : bool
+        Whether to use GPT-NeoX style (True) or interleaved (False).
+    """
+    if cos_sin_cache.dtype != torch.float32:
+        raise ValueError("cos_sin_cache must be float32")
+
+    torch.ops.sgl_kernel.apply_rope_inplace_with_kvcache(
+        query,
+        key,
+        value,
+        k_cache,
+        v_cache,
+        cos_sin_cache,
+        positions.long(),
+        out_loc.long(),
+        is_neox,
+    )
+
+
 def apply_rope_with_cos_sin_cache_inplace(
     positions: torch.Tensor,
     query: torch.Tensor,

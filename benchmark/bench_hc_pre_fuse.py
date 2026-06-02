@@ -4,11 +4,17 @@ import triton
 from sgl_kernel import hc_pre_big_fuse
 
 configs = [
-    # (batch_size, seq_len, hidden_size, n_splits)
+    # (b_s, seq_len, hidden_size, n_splits)
     (16, 1, 4096, 1),  # 16 tokens
+    (48, 1, 4096, 1),  # 48 tokens
     (128, 1, 4096, 1),  # 128 tokens
     (512, 1, 4096, 1),  # 512 tokens
+    (896, 1, 4096, 1),  # 896 tokens
+    (1021, 1, 4096, 1),  # 1021 tokens
     (1024, 1, 4096, 1),  # 1024 tokens
+    (1034, 1, 4096, 1),  # 1034 tokens
+    (1038, 1, 4096, 1),  # 1038 tokens
+    (1518, 1, 4096, 1),  # 1518 tokens
     (2048, 1, 4096, 1),  # 2048 tokens
 ]
 
@@ -21,7 +27,7 @@ all_results = []
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["batch_size", "seq_len", "hidden_size", "n_splits"],
+        x_names=["b_s", "seq_len", "hidden_size", "n_splits"],
         x_vals=configs,
         line_arg="provider",
         line_vals=["without_norm", "with_norm"],
@@ -32,15 +38,15 @@ all_results = []
         args={},
     )
 )
-def benchmark(batch_size, seq_len, hidden_size, n_splits, provider):
+def benchmark(b_s, seq_len, hidden_size, n_splits, provider):
     print(
-        f"benchmark {provider} with batch_size={batch_size} seq_len={seq_len} "
+        f"benchmark {provider} with b_s={b_s} seq_len={seq_len} "
         f"hidden_size={hidden_size} n_splits={n_splits}"
     )
     torch.set_default_device("xpu")
     torch.xpu.manual_seed_all(42)
 
-    T = batch_size * seq_len
+    T = b_s * seq_len
 
     # Create inputs
     gemm_out_mul = torch.randn(n_splits, T, hc_mult3, dtype=torch.float32, device="xpu")
@@ -171,7 +177,7 @@ def benchmark(batch_size, seq_len, hidden_size, n_splits, provider):
 
     all_results.append(
         {
-            "batch_size": batch_size,
+            "b_s": b_s,
             "seq_len": seq_len,
             "T": T,
             "hidden_size": hidden_size,

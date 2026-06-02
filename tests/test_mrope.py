@@ -3,9 +3,8 @@ from typing import List
 
 import pytest
 import triton
-from test_rope_utils import *
-
 from sgl_kernel import multomodal_rotary_embedding
+from test_rope_utils import *
 
 
 def apply_interleaved_rope(x: torch.Tensor, mrope_section: list) -> torch.Tensor:

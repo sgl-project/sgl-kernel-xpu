@@ -40,84 +40,6 @@
 
 namespace decode {
 
-// Dispatch macros following the GroupGemmXe20.cpp pattern.
-// Directly call struct operator() - no function pointers.
-
-#define DISPATCH_DECODE_KERNEL(QG, HD, PS)         \
-  do {                                             \
-    if (params.use_split_kv) {                     \
-      FmhaSplitDecodeRunner<QG, HD, PS>{}(params); \
-    } else {                                       \
-      FmhaDecodeRunner<QG, HD, PS>{}(params);      \
-    }                                              \
-  } while (0)
-
-#define DISPATCH_DECODE_PAGE_SIZE(QG, HD)                                                     \
-  do {                                                                                        \
-    switch (params.page_size) {                                                               \
-      case 64:                                                                                \
-        DISPATCH_DECODE_KERNEL(QG, HD, 64);                                                   \
-        break;                                                                                \
-      case 128:                                                                               \
-        DISPATCH_DECODE_KERNEL(QG, HD, 128);                                                  \
-        break;                                                                                \
-      default:                                                                                \
-        TORCH_CHECK(false, "Unsupported page_size for decode attention: ", params.page_size); \
-    }                                                                                         \
-  } while (0)
-
-#define DISPATCH_DECODE_HEAD_DIM(QG)                                                  \
-  do {                                                                                \
-    switch (params.d) {                                                               \
-      case 64:                                                                        \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 64);                                            \
-        break;                                                                        \
-      case 72:                                                                        \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 72);                                            \
-        break;                                                                        \
-      case 96:                                                                        \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 96);                                            \
-        break;                                                                        \
-      case 128:                                                                       \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 128);                                           \
-        break;                                                                        \
-      case 192:                                                                       \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 192);                                           \
-        break;                                                                        \
-      case 256:                                                                       \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 256);                                           \
-        break;                                                                        \
-      case 512:                                                                       \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 512);                                           \
-        break;                                                                        \
-      default:                                                                        \
-        TORCH_CHECK(false, "Unsupported head size for decode attention: ", params.d); \
-    }                                                                                 \
-  } while (0)
-
-#define DISPATCH_DECODE(qg_sz)                                                                      \
-  do {                                                                                              \
-    switch (qg_sz) {                                                                                \
-      case 1:                                                                                       \
-        DISPATCH_DECODE_HEAD_DIM(1);                                                                \
-        break;                                                                                      \
-      case 2:                                                                                       \
-        DISPATCH_DECODE_HEAD_DIM(2);                                                                \
-        break;                                                                                      \
-      case 4:                                                                                       \
-        DISPATCH_DECODE_HEAD_DIM(4);                                                                \
-        break;                                                                                      \
-      case 8:                                                                                       \
-        DISPATCH_DECODE_HEAD_DIM(8);                                                                \
-        break;                                                                                      \
-      case 16:                                                                                      \
-        DISPATCH_DECODE_HEAD_DIM(16);                                                               \
-        break;                                                                                      \
-      default:                                                                                      \
-        TORCH_CHECK(false, "Unsupported q_group_size for decode attention: ", params.q_group_size); \
-    }                                                                                               \
-  } while (0)
-
 std::vector<at::Tensor> mha_fwd(
     const at::Tensor& q,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
@@ -233,11 +155,13 @@ std::vector<at::Tensor> mha_fwd(
   at::Tensor temp_out;    // [batch, num_kv_splits, num_head_q, seq_q, head_size]
   at::Tensor exp_sums;    // [batch, num_head_q, seq_q, num_kv_splits]
   at::Tensor max_logits;  // [batch, num_head_q, seq_q, num_kv_splits]
-  num_kv_splits = -1;
   out = out_opt.has_value() ? *out_opt : torch::empty({total_q, num_heads, head_size_v}, opts);
   Arguments params;
-  params.use_split_kv = true;
-  if (params.use_split_kv) {
+  // num_kv_splits semantics (host-side scalar, no D2H sync):
+  //   -1 or 1 -> split-KV disabled, use the non-split FmhaDecodeRunner
+  //         0 -> auto: pick a split count from the device-occupancy heuristic
+  //        >1 -> use the caller-provided split count with FmhaSplitDecodeRunner
+  if (num_kv_splits == 0) {
     auto get_num_splits = [](int batch_size, int num_heads_kv, int max_seqlen_k, int block_size) {
       auto stream = at::xpu::getCurrentXPUStream();
       auto queue = stream.queue();
@@ -252,14 +176,26 @@ std::vector<at::Tensor> mha_fwd(
         num_splits = std::ceil(parallel_2 / static_cast<float>(cur_parallel_d)) - 1;
       }
 
-      int max_splits = (max_seqlen_k + block_size - 1) / block_size;
-      max_splits = std::min(max_splits, parallel_);
+      int total_blocks = (max_seqlen_k + block_size - 1) / block_size;
+      // Split-KV adds a separate reduction launch whose cost is roughly fixed.
+      // Benchmarks (benchmark/bench_flash_attn_split_decode.py) show that on the
+      // decode path splitting only pays off once the KV cache spans more than
+      // ~64 pages; below that the occupancy-only heuristic over-splits short
+      // sequences and the non-split runner is 20-40% faster. Gate on total work.
+      constexpr int kMinBlocksToSplit = 64;
+      if (total_blocks <= kMinBlocksToSplit) {
+        return 1;
+      }
+
+      int max_splits = std::min(total_blocks, parallel_);
       return std::min(num_splits, max_splits);
     };
     num_kv_splits = get_num_splits(batch_size, num_heads_k, seqlen_k, page_size);
-    temp_out = num_kv_splits == 1
-                   ? out
-                   : torch::empty({total_q, num_kv_splits * num_heads, head_size_v}, q.options().device(q.device()));
+  }
+  // Only split when the resolved count is > 1; -1 / 1 fall back to non-split.
+  params.use_split_kv = num_kv_splits > 1;
+  if (params.use_split_kv) {
+    temp_out = torch::empty({total_q, num_kv_splits * num_heads, head_size_v}, q.options().device(q.device()));
 
     max_logits = torch::full(
         {total_q, num_heads, num_kv_splits},
@@ -442,19 +378,9 @@ std::vector<at::Tensor> mha_fwd(
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
 
-#undef DISPATCH_DECODE_KERNEL
-#undef DISPATCH_DECODE_PAGE_SIZE
-#undef DISPATCH_DECODE_HEAD_DIM
-#undef DISPATCH_DECODE
-
 }  // namespace decode
 
 namespace prefill {
-
-// Dispatch macro following the same pattern as decode.
-// Directly call struct operator() - no function pointers.
-
-#define DISPATCH_PREFILL_KERNEL(HD) FmhaPrefillRunner<HD>{}(params)
 
 std::vector<at::Tensor> mha_fwd(
     const at::Tensor& q,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
@@ -744,8 +670,6 @@ std::vector<at::Tensor> mha_fwd(
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
 
-#undef DISPATCH_PREFILL_KERNEL
-
 }  // namespace prefill
 
 namespace chunkprefill {
@@ -756,8 +680,9 @@ namespace chunkprefill {
 // decode kernel skipping prefill batches and the prefill kernel skipping
 // decode batches. Both launches write into the same output tensor.
 //
-// Limitations: paged KV cache required; sliding window / sinks / rotary /
-// descale / scheduler metadata are not supported on this path.
+// Limitations: paged KV cache required; rotary / q_v / descale / scheduler
+// metadata are not supported on this path. Sliding window and attention sinks
+// are forwarded to both sub-kernels, which support them.
 std::vector<at::Tensor> mha_fwd(
     const at::Tensor& q,
     const at::Tensor& k,
@@ -788,13 +713,12 @@ std::vector<at::Tensor> mha_fwd(
     std::optional<bool> pack_gqa_,
     int const sm_margin) {
   TORCH_CHECK(page_table.has_value(), "chunkprefill two-launch path requires paged KV cache (page_table != None).");
+  // ``seqlens_rotary_`` is intentionally not checked here: callers pass it
+  // alongside ``cache_seqlens`` even when rotary is disabled, and the
+  // sub-kernels only consume it inside the ``rotary_cos_.has_value()`` branch.
   TORCH_CHECK(
-      window_size_left < 0 && window_size_right < 0, "chunkprefill two-launch path does not support sliding window.");
-  TORCH_CHECK(!sinks_.has_value(), "chunkprefill two-launch path does not support attention sinks.");
-  TORCH_CHECK(
-      !q_v_.has_value() && !rotary_cos_.has_value() && !rotary_sin_.has_value() && !seqlens_rotary_.has_value() &&
-          !q_descale_.has_value() && !k_descale_.has_value() && !v_descale_.has_value() &&
-          !scheduler_metadata_.has_value(),
+      !q_v_.has_value() && !rotary_cos_.has_value() && !rotary_sin_.has_value() && !q_descale_.has_value() &&
+          !k_descale_.has_value() && !v_descale_.has_value() && !scheduler_metadata_.has_value(),
       "chunkprefill two-launch path does not yet support q_v / rotary / descale / scheduler_metadata.");
   TORCH_CHECK(cu_seqlens_q.scalar_type() == at::kInt, "cu_seqlens_q must be int32.");
 
@@ -808,10 +732,36 @@ std::vector<at::Tensor> mha_fwd(
   // tensor (out_opt) and the per-batch skip mask.
   auto launch = [&](auto&& fn, std::optional<at::Tensor> out_opt, std::optional<at::Tensor> skip_mask) {
     return fn(
-        q, k, v, q_v_, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx_, leftpad_k_,
-        rotary_cos_, rotary_sin_, seqlens_rotary_, q_descale_, k_descale_, v_descale_, softmax_scale_, sinks_, is_causal,
-        window_size_left, window_size_right, softcap, is_rotary_interleaved, scheduler_metadata_, num_kv_splits,
-        pack_gqa_, sm_margin, std::move(out_opt), std::move(skip_mask));
+        q,
+        k,
+        v,
+        q_v_,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        page_table,
+        kv_batch_idx_,
+        leftpad_k_,
+        rotary_cos_,
+        rotary_sin_,
+        seqlens_rotary_,
+        q_descale_,
+        k_descale_,
+        v_descale_,
+        softmax_scale_,
+        sinks_,
+        is_causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        is_rotary_interleaved,
+        scheduler_metadata_,
+        num_kv_splits,
+        pack_gqa_,
+        sm_margin,
+        std::move(out_opt),
+        std::move(skip_mask));
   };
 
   // Launch 1: decode allocates the shared output and skips prefill batches.
@@ -893,7 +843,7 @@ std::vector<at::Tensor> mha_fwd(
         sm_margin);
   } else if (page_table.has_value()) {
     // TODO: support for non-kv cache.
-    return prefill::mha_fwd(
+    return chunkprefill::mha_fwd(
         q,
         k,
         v,
@@ -923,7 +873,7 @@ std::vector<at::Tensor> mha_fwd(
         pack_gqa_,
         sm_margin);
   } else {
-    return chunkprefill::mha_fwd(
+    return prefill::mha_fwd(
         q,
         k,
         v,

@@ -171,7 +171,7 @@ void launch_mrope(
 
 }  // namespace
 
-void multomodal_rotary_embedding(
+void multimodal_rotary_embedding(
     at::Tensor& query,
     at::Tensor& key,
     at::Tensor& cos_sin_cache,
@@ -205,7 +205,7 @@ void multomodal_rotary_embedding(
   const int64_t num_k_heads = key.size(1) / head_size;
 
 #define LAUNCH_MROPE_KERNEL(IS_NEOX, IS_INTERLEAVED)                                                                 \
-  SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, query.scalar_type(), "multomodal_rotary_embedding", [&]() { \
+  SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, query.scalar_type(), "multimodal_rotary_embedding", [&]() { \
     launch_mrope<scalar_t, IS_NEOX, IS_INTERLEAVED>(                                                                 \
         query,                                                                                                       \
         key,                                                                                                         \

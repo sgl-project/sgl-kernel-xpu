@@ -188,7 +188,7 @@ void fused_qk_rope_with_cos_sin_cache_inplace(
     at::Tensor& positions,
     int64_t rope_dim,
     bool is_neox);
-void multomodal_rotary_embedding(
+void multimodal_rotary_embedding(
     at::Tensor& query,
     at::Tensor& key,
     at::Tensor& cos_sin_cache,

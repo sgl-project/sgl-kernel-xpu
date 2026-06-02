@@ -3,7 +3,7 @@ from typing import List
 
 import pytest
 import triton
-from sgl_kernel import multomodal_rotary_embedding
+from sgl_kernel import multimodal_rotary_embedding
 from test_rope_utils import *
 
 
@@ -86,7 +86,7 @@ DTYPE_LIST = [torch.bfloat16, torch.float16]
 @pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
 @pytest.mark.parametrize("mrope_section", MROPE_SECTION_LIST)
 @pytest.mark.parametrize("dtype", DTYPE_LIST)
-def test_multomodal_rotary_embedding(
+def test_multimodal_rotary_embedding(
     batch_size: int,
     gqa_ratio: int,
     num_kv_heads: int,
@@ -123,7 +123,7 @@ def test_multomodal_rotary_embedding(
         is_neox,
     )
 
-    multomodal_rotary_embedding(
+    multimodal_rotary_embedding(
         q_ker,
         k_ker,
         cos_sin_cache,

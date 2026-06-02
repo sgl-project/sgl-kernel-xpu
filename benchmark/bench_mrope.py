@@ -6,7 +6,7 @@ from typing import List, Optional
 import pandas as pd
 import torch
 import triton
-from sgl_kernel import multomodal_rotary_embedding
+from sgl_kernel import multimodal_rotary_embedding
 
 
 def apply_interleaved_rope(x: torch.Tensor, mrope_section: list) -> torch.Tensor:
@@ -58,7 +58,7 @@ def mrope_sglang(
     is_neox_style: bool,
     axis_map: Optional[torch.Tensor],
 ):
-    multomodal_rotary_embedding(
+    multimodal_rotary_embedding(
         q,
         k,
         cos_sin_cache,

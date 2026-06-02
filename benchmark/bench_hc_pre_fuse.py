@@ -67,7 +67,7 @@ def benchmark(b_s, seq_len, hidden_size, n_splits, provider):
     use_norm = provider == "with_norm"
 
     # Warmup
-    for _ in range(1000):
+    for _ in range(10000):
         if use_norm:
             hc_pre_big_fuse(
                 gemm_out_mul,

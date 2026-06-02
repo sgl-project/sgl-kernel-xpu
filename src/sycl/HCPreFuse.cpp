@@ -13,9 +13,9 @@ static constexpr int HC = 4;               // hc_mult value
 static constexpr int HC2 = HC * HC;        // 16
 static constexpr int HC3 = (2 + HC) * HC;  // 24
 
-static constexpr float LOG2E = 1.442695040888963f;  // log2(e) for exp2 conversion
+static constexpr float LOG2E = 1.442695040888963f;
 
-template <typename scalar_t>
+template <typename scalar_t, int VEC_SIZE>
 struct HCPreBigFuseKernel {
   const float* __restrict__ gemm_out_mul;     // [n_splits, T, 24] FP32
   const float* __restrict__ gemm_out_sqrsum;  // [n_splits, T] FP32
@@ -134,23 +134,53 @@ struct HCPreBigFuseKernel {
       const int threads_for_wsum = WG_SIZE - 32;  // 64 threads
       const int thread_local_id = tid - 32;       // 0..63
 
-      // Stride across hidden_size with all threads
-      for (int h = thread_local_id; h < hidden_size; h += threads_for_wsum) {
-        float accum = 0.0f;
+      constexpr int kVecSize = VEC_SIZE;
+      using vec_in = vec_t<scalar_t, kVecSize>;
+      using vec_out = vec_t<scalar_t, kVecSize>;
+
+      const int num_vec_elems = hidden_size / kVecSize;
+      const int vec_tail_start = num_vec_elems * kVecSize;
+
+      for (int i = thread_local_id; i < num_vec_elems; i += threads_for_wsum) {
+        const int h = i * kVecSize;
+
+        float accum[kVecSize] = {};
 
         for (int k = 0; k < HC; k++) {
-          const int64_t res_idx = (static_cast<int64_t>(token_id) * HC + k) * hidden_size + h;
-          const float res_val = static_cast<float>(residual[res_idx]);
-          accum += pre_mix_shared[k] * res_val;
+          const int64_t res_base = (static_cast<int64_t>(token_id) * HC + k) * hidden_size + h;
+          vec_in v;
+          v.load(0, sycl::multi_ptr<const scalar_t, sycl::access::address_space::global_space>(&residual[res_base]));
+
+#pragma unroll
+          for (int j = 0; j < kVecSize; ++j) {
+            accum[j] += pre_mix_shared[k] * static_cast<float>(v[j]);
+          }
         }
 
+        vec_out out;
+#pragma unroll
+        for (int j = 0; j < kVecSize; ++j) {
+          out[j] = static_cast<scalar_t>(accum[j]);
+        }
+        out.store(
+            0,
+            sycl::multi_ptr<scalar_t, sycl::access::address_space::global_space>(
+                &layer_input[static_cast<int64_t>(token_id) * hidden_size + h]));
+      }
+
+      for (int h = vec_tail_start + thread_local_id; h < hidden_size; h += threads_for_wsum) {
+        float accum = 0.0f;
+        for (int k = 0; k < HC; k++) {
+          const int64_t res_idx = (static_cast<int64_t>(token_id) * HC + k) * hidden_size + h;
+          accum += pre_mix_shared[k] * static_cast<float>(residual[res_idx]);
+        }
         layer_input[static_cast<int64_t>(token_id) * hidden_size + h] = static_cast<scalar_t>(accum);
       }
     }
   }
 };
 
-template <typename scalar_t>
+template <typename scalar_t, int VEC_SIZE>
 struct HCPreBigFuseWithNormKernel {
   const float* __restrict__ gemm_out_mul;     // [n_splits, T, 24] FP32
   const float* __restrict__ gemm_out_sqrsum;  // [n_splits, T] FP32
@@ -184,11 +214,9 @@ struct HCPreBigFuseWithNormKernel {
 
     if (token_id >= T_total) return;
 
-    // Access shared memory
     float* mixes_shared = slm_.get_multi_ptr<sycl::access::decorated::no>().get();  // 24 floats
     float* pre_mix_shared = mixes_shared + HC3;                                     // 4 floats
 
-    // RMS normalization fused with mix accumulation
     if (tid < HC3) {
       float sqrsum = 0.0f;
       float mix_val = 0.0f;
@@ -266,13 +294,39 @@ struct HCPreBigFuseWithNormKernel {
 
     item.barrier(sycl::access::fence_space::local_space);
 
-    // Pass 1: Accumulate sum of squares (threads 32-95)
     if (tid >= 32) {
       const int thread_local_id = tid - 32;
       const int stride = 64;
 
+      constexpr int kVecSize = VEC_SIZE;
+      using vec_in = vec_t<scalar_t, kVecSize>;
+
+      const int num_vec_elems = hidden_size / kVecSize;
+      const int vec_tail_start = num_vec_elems * kVecSize;
+
       float local_sqr_sum = 0.0f;
-      for (int h = thread_local_id; h < hidden_size; h += stride) {
+      for (int i = thread_local_id; i < num_vec_elems; i += stride) {
+        const int h = i * kVecSize;
+        float accum[kVecSize] = {};
+
+        for (int k = 0; k < HC; k++) {
+          const int64_t res_base = (static_cast<int64_t>(token_id) * HC + k) * hidden_size + h;
+          vec_in v;
+          v.load(0, sycl::multi_ptr<const scalar_t, sycl::access::address_space::global_space>(&residual[res_base]));
+
+#pragma unroll
+          for (int j = 0; j < kVecSize; ++j) {
+            accum[j] += pre_mix_shared[k] * static_cast<float>(v[j]);
+          }
+        }
+
+#pragma unroll
+        for (int j = 0; j < kVecSize; ++j) {
+          local_sqr_sum += accum[j] * accum[j];
+        }
+      }
+
+      for (int h = vec_tail_start + thread_local_id; h < hidden_size; h += stride) {
         float accum = 0.0f;
         for (int k = 0; k < HC; k++) {
           const int64_t res_idx = (static_cast<int64_t>(token_id) * HC + k) * hidden_size + h;
@@ -281,7 +335,6 @@ struct HCPreBigFuseWithNormKernel {
         local_sqr_sum += accum * accum;
       }
 
-      // Subgroup reduction
       local_sqr_sum = sycl::reduce_over_group(sg, local_sqr_sum, sycl::plus<float>());
       if (lane_id == 0) {
         slm_[sg_id - 2] = local_sqr_sum;
@@ -290,7 +343,6 @@ struct HCPreBigFuseWithNormKernel {
 
     item.barrier(sycl::access::fence_space::local_space);
 
-    // Final reduction
     if (sg_id == 0) {
       const int idx = sycl::select(0, lane_id, lane_id < 4);
       const float val_to_reduce = sycl::select(0.0f, slm_[idx], lane_id < 4);
@@ -303,27 +355,137 @@ struct HCPreBigFuseWithNormKernel {
 
     item.barrier(sycl::access::fence_space::local_space);
 
-    // Pass 2: Apply RMS*norm_weight and write (threads 32-95)
     if (tid >= 32) {
       const int thread_local_id = tid - 32;
       const int stride = 64;
       const float rms = slm_[0];
 
-      for (int h = thread_local_id; h < hidden_size; h += stride) {
+      constexpr int kVecSize = VEC_SIZE;
+      using vec_in = vec_t<scalar_t, kVecSize>;
+      using vec_out = vec_t<scalar_t, kVecSize>;
+
+      const int num_vec_elems = hidden_size / kVecSize;
+      const int vec_tail_start = num_vec_elems * kVecSize;
+
+      for (int i = thread_local_id; i < num_vec_elems; i += stride) {
+        const int h = i * kVecSize;
+        float accum[kVecSize] = {};
+
+        for (int k = 0; k < HC; k++) {
+          const int64_t res_base = (static_cast<int64_t>(token_id) * HC + k) * hidden_size + h;
+          vec_in v;
+          v.load(0, sycl::multi_ptr<const scalar_t, sycl::access::address_space::global_space>(&residual[res_base]));
+
+#pragma unroll
+          for (int j = 0; j < kVecSize; ++j) {
+            accum[j] += pre_mix_shared[k] * static_cast<float>(v[j]);
+          }
+        }
+
+        vec_in weight_vec;
+        weight_vec.load(0, sycl::multi_ptr<const scalar_t, sycl::access::address_space::global_space>(&norm_weight[h]));
+
+        vec_out out;
+#pragma unroll
+        for (int j = 0; j < kVecSize; ++j) {
+          out[j] = static_cast<scalar_t>(accum[j] * rms * static_cast<float>(weight_vec[j]));
+        }
+        out.store(
+            0,
+            sycl::multi_ptr<scalar_t, sycl::access::address_space::global_space>(
+                &layer_input[static_cast<int64_t>(token_id) * hidden_size + h]));
+      }
+
+      for (int h = vec_tail_start + thread_local_id; h < hidden_size; h += stride) {
         float accum = 0.0f;
         for (int k = 0; k < HC; k++) {
           const int64_t res_idx = (static_cast<int64_t>(token_id) * HC + k) * hidden_size + h;
           accum += pre_mix_shared[k] * static_cast<float>(residual[res_idx]);
         }
-
         const float weight = static_cast<float>(norm_weight[h]);
-        accum = accum * rms * weight;
-
-        layer_input[static_cast<int64_t>(token_id) * hidden_size + h] = static_cast<scalar_t>(accum);
+        layer_input[static_cast<int64_t>(token_id) * hidden_size + h] = static_cast<scalar_t>(accum * rms * weight);
       }
     }
   }
 };
+
+template <int VEC_SIZE>
+static void launch_hc_pre_fuse_kernel(
+    sycl::queue& q,
+    const at::Tensor& gemm_out_mul,
+    const at::Tensor& gemm_out_sqrsum,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    const at::Tensor& residual_flat,
+    at::Tensor& post_mix,
+    at::Tensor& comb_mix,
+    at::Tensor& layer_input,
+    int64_t T,
+    int64_t hidden_size,
+    int64_t n_splits,
+    double rms_eps,
+    double hc_pre_eps,
+    double hc_sinkhorn_eps,
+    double hc_post_mult_value,
+    int64_t sinkhorn_iters,
+    std::optional<at::Tensor> norm_weight,
+    std::optional<double> norm_eps) {
+  using scalar_t = sycl::ext::oneapi::bfloat16;
+  constexpr int slm_size = HC3 + HC;
+
+  if (norm_weight.has_value()) {
+    const float norm_eps_val = static_cast<float>(norm_eps.value_or(1e-6));
+    q.submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<float, 1> slm(sycl::range<1>(slm_size), cgh);
+      auto ker = HCPreBigFuseWithNormKernel<scalar_t, VEC_SIZE>{
+          gemm_out_mul.data_ptr<float>(),
+          gemm_out_sqrsum.data_ptr<float>(),
+          hc_scale.data_ptr<float>(),
+          hc_base.data_ptr<float>(),
+          reinterpret_cast<const scalar_t*>(residual_flat.data_ptr<at::BFloat16>()),
+          post_mix.data_ptr<float>(),
+          comb_mix.data_ptr<float>(),
+          reinterpret_cast<scalar_t*>(layer_input.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const scalar_t*>(norm_weight.value().data_ptr<at::BFloat16>()),
+          static_cast<int>(T),
+          static_cast<int>(hidden_size),
+          static_cast<int>(n_splits),
+          static_cast<float>(rms_eps),
+          static_cast<float>(hc_pre_eps),
+          static_cast<float>(hc_sinkhorn_eps),
+          static_cast<float>(hc_post_mult_value),
+          static_cast<int>(sinkhorn_iters),
+          norm_eps_val,
+          slm,
+      };
+      cgh.parallel_for(sycl::nd_range<1>(T * WG_SIZE, WG_SIZE), ker);
+    });
+  } else {
+    q.submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<float, 1> slm(sycl::range<1>(slm_size), cgh);
+      auto ker = HCPreBigFuseKernel<scalar_t, VEC_SIZE>{
+          gemm_out_mul.data_ptr<float>(),
+          gemm_out_sqrsum.data_ptr<float>(),
+          hc_scale.data_ptr<float>(),
+          hc_base.data_ptr<float>(),
+          reinterpret_cast<const scalar_t*>(residual_flat.data_ptr<at::BFloat16>()),
+          post_mix.data_ptr<float>(),
+          comb_mix.data_ptr<float>(),
+          reinterpret_cast<scalar_t*>(layer_input.data_ptr<at::BFloat16>()),
+          static_cast<int>(T),
+          static_cast<int>(hidden_size),
+          static_cast<int>(n_splits),
+          static_cast<float>(rms_eps),
+          static_cast<float>(hc_pre_eps),
+          static_cast<float>(hc_sinkhorn_eps),
+          static_cast<float>(hc_post_mult_value),
+          static_cast<int>(sinkhorn_iters),
+          slm,
+      };
+      cgh.parallel_for(sycl::nd_range<1>(T * WG_SIZE, WG_SIZE), ker);
+    });
+  }
+}
 
 void hc_pre_big_fuse(
     const at::Tensor& gemm_out_mul,
@@ -395,64 +557,72 @@ void hc_pre_big_fuse(
 
   auto q = dpcppGetCurrentQueue();
 
-  constexpr int slm_size = HC3 + HC;
+  // Dynamic VEC_SIZE selection based on batch size
+  int vec_size = (T <= 16) ? 8 : (T <= 48) ? 4 : 2;
 
-  using scalar_t = sycl::ext::oneapi::bfloat16;
-
-  if (norm_weight.has_value()) {
-    const float norm_eps_val = static_cast<float>(norm_eps.value_or(1e-6));
-    q.submit([&](sycl::handler& cgh) {
-      sycl::local_accessor<float, 1> slm(sycl::range<1>(slm_size), cgh);
-
-      auto ker = HCPreBigFuseWithNormKernel<scalar_t>{
-          gemm_out_mul.data_ptr<float>(),
-          gemm_out_sqrsum.data_ptr<float>(),
-          hc_scale.data_ptr<float>(),
-          hc_base.data_ptr<float>(),
-          reinterpret_cast<const scalar_t*>(residual_flat.data_ptr<at::BFloat16>()),
-          post_mix.data_ptr<float>(),
-          comb_mix.data_ptr<float>(),
-          reinterpret_cast<scalar_t*>(layer_input.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const scalar_t*>(norm_weight.value().data_ptr<at::BFloat16>()),
-          static_cast<int>(T),
-          static_cast<int>(hidden_size),
-          static_cast<int>(n_splits),
-          static_cast<float>(rms_eps),
-          static_cast<float>(hc_pre_eps),
-          static_cast<float>(hc_sinkhorn_eps),
-          static_cast<float>(hc_post_mult_value),
-          static_cast<int>(sinkhorn_iters),
-          norm_eps_val,
-          slm,
-      };
-
-      cgh.parallel_for(sycl::nd_range<1>(T * WG_SIZE, WG_SIZE), ker);
-    });
+  // Runtime dispatch to template function
+  if (vec_size == 8) {
+    launch_hc_pre_fuse_kernel<8>(
+        q,
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual_flat,
+        post_mix,
+        comb_mix,
+        layer_input,
+        T,
+        hidden_size,
+        n_splits,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_iters,
+        norm_weight,
+        norm_eps);
+  } else if (vec_size == 4) {
+    launch_hc_pre_fuse_kernel<4>(
+        q,
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual_flat,
+        post_mix,
+        comb_mix,
+        layer_input,
+        T,
+        hidden_size,
+        n_splits,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_iters,
+        norm_weight,
+        norm_eps);
   } else {
-    q.submit([&](sycl::handler& cgh) {
-      sycl::local_accessor<float, 1> slm(sycl::range<1>(slm_size), cgh);
-
-      auto ker = HCPreBigFuseKernel<scalar_t>{
-          gemm_out_mul.data_ptr<float>(),
-          gemm_out_sqrsum.data_ptr<float>(),
-          hc_scale.data_ptr<float>(),
-          hc_base.data_ptr<float>(),
-          reinterpret_cast<const scalar_t*>(residual_flat.data_ptr<at::BFloat16>()),
-          post_mix.data_ptr<float>(),
-          comb_mix.data_ptr<float>(),
-          reinterpret_cast<scalar_t*>(layer_input.data_ptr<at::BFloat16>()),
-          static_cast<int>(T),
-          static_cast<int>(hidden_size),
-          static_cast<int>(n_splits),
-          static_cast<float>(rms_eps),
-          static_cast<float>(hc_pre_eps),
-          static_cast<float>(hc_sinkhorn_eps),
-          static_cast<float>(hc_post_mult_value),
-          static_cast<int>(sinkhorn_iters),
-          slm,
-      };
-
-      cgh.parallel_for(sycl::nd_range<1>(T * WG_SIZE, WG_SIZE), ker);
-    });
+    launch_hc_pre_fuse_kernel<2>(
+        q,
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual_flat,
+        post_mix,
+        comb_mix,
+        layer_input,
+        T,
+        hidden_size,
+        n_splits,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_iters,
+        norm_weight,
+        norm_eps);
   }
 }

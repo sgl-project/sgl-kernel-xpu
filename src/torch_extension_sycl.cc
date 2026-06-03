@@ -187,7 +187,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       &at::native::xpu::fused_qk_rope_with_cos_sin_cache_inplace);
 
   m.def(
-      "multimodal_rotary_embedding(Tensor! query, Tensor! key, Tensor! cos_sin_cache, Tensor! positions, "
+      "multimodal_rotary_embedding(Tensor! query, Tensor! key, Tensor cos_sin_cache, Tensor positions, "
       "int[] mrope_section, int head_size, int rotary_dim, bool mrope_interleaved, bool mrope_interleaved_glm, "
       "bool is_neox_style, Tensor? axis_map) -> ()");
   m.impl("multimodal_rotary_embedding", torch::kXPU, &at::native::xpu::multimodal_rotary_embedding);

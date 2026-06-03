@@ -1,12 +1,6 @@
 import torch
 import utils
 
-DEVICE = utils.get_device()
-DTYPE = torch.bfloat16
-MAX_SEQ_LEN = 131072  # common seq length
-ROPE_BASE = 10000.0
-CACHE_SIZE = 1024 * 128
-
 """Common utilities for calculating rope reference"""
 DEVICE = utils.get_device()
 DTYPE = torch.bfloat16

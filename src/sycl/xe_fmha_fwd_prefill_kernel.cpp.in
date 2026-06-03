@@ -38,6 +38,27 @@ namespace prefill {
 
 template <>
 void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
+  bool use_sink = (params.softmax_sink_ptr != nullptr);
+
+  if (params.page_table == nullptr) {
+    // Non-paged (contiguous ragged) KV cache. Uses an independent tile-shape
+    // configuration so it can be tuned separately from the paged path.
+    using TileShapeQK = cute::Shape<cute::Int<@TILED_Q_NP@>, cute::Int<@TILED_KV_NP@>, cute::_32>;
+    using TileShapePV = cute::Shape<cute::Int<@TILED_Q_NP@>, cute::_32, cute::Int<@TILED_KV_NP@>>;
+    using TileShapeOutput = cute::Shape<cute::Int<@TILED_Q_NP@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;
+    using SubgroupLayoutQK = cute::
+        Layout<cute::Shape<cute::Int<@NUM_SG_NP@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+    AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+        AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+          FMHAConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_nopaged(
+              params);
+        });
+      });
+    });
+    return;
+  }
+
   using TileShapeQK = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_KV@>, cute::_32>;
   using TileShapePV = cute::Shape<cute::Int<@TILED_Q@>, cute::_32, cute::Int<@TILED_KV@>>;
   // Round the head-dim of the output tile up to a multiple of get<1>(TileShapePV) (32) so that
@@ -48,11 +69,11 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
   using SubgroupLayoutQK =
       cute::Layout<cute::Shape<cute::Int<@NUM_SG@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
 
-  bool use_sink = (params.softmax_sink_ptr != nullptr);
   AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
-        FMHAConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(params);
+        FMHAConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
+            params);
       });
     });
   });

@@ -47,7 +47,6 @@ struct HCPreBigFuseKernel {
 
     if (token_id >= T_total) return;
 
-    // Access shared memory
     float* mixes_shared = slm_.get_multi_ptr<sycl::access::decorated::no>().get();  // 24 floats
     float* pre_mix_shared = mixes_shared + HC3;                                     // 4 floats
 
@@ -66,116 +65,107 @@ struct HCPreBigFuseKernel {
 
     item.barrier(sycl::access::fence_space::local_space);
 
-    if (sg_id < 2) {
-      // Threads 0-31 (Subgroups 0-1)
-      if (sg_id == 0) {
+    // mix operations
+    if (sg_id == 0) {
+      // pre_mix, post_mix computed by lanes 0-3
+      if (lane_id < HC) {
+        // pre_mix from mixes[0:4]
+        const float pre_logit = mixes_shared[lane_id] * hc_scale[0] + hc_base[lane_id];
+        pre_mix_shared[lane_id] = sycl::native::recip(1.0f + sycl::native::exp2(-pre_logit * LOG2E)) + hc_pre_eps;
+
         // post_mix from mixes[4:8]
-        if (lane_id < HC) {
-          const float post_logit = mixes_shared[HC + lane_id] * hc_scale[1] + hc_base[HC + lane_id];
-          post_mix[static_cast<int64_t>(token_id) * HC + lane_id] =
-              hc_post_mult_value * sycl::native::recip(1.0f + sycl::native::exp2(-post_logit * LOG2E));
-        }
+        const float post_logit = mixes_shared[HC + lane_id] * hc_scale[1] + hc_base[HC + lane_id];
+        post_mix[static_cast<int64_t>(token_id) * HC + lane_id] =
+            hc_post_mult_value * sycl::native::recip(1.0f + sycl::native::exp2(-post_logit * LOG2E));
+      }
 
-        // sinkhorn from mixes[8:24]
-        float comb_logit = mixes_shared[2 * HC + lane_id] * hc_scale[2] + hc_base[2 * HC + lane_id];
+      // comb_mix (Sinkhorn) computed by all 16 lanes from mixes[8:24]
+      float comb_logit = mixes_shared[2 * HC + lane_id] * hc_scale[2] + hc_base[2 * HC + lane_id];
 
-        float row_max = comb_logit;
+      float row_max = comb_logit;
 #pragma unroll
-        for (int mask = 1; mask < HC; mask <<= 1)
-          row_max = sycl::fmax(row_max, sycl::permute_group_by_xor(sg, row_max, mask));
+      for (int mask = 1; mask < HC; mask <<= 1)
+        row_max = sycl::fmax(row_max, sycl::permute_group_by_xor(sg, row_max, mask));
 
-        float comb_val = sycl::native::exp2((comb_logit - row_max) * LOG2E);
-        float row_sum = comb_val;
+      float comb_val = sycl::native::exp2((comb_logit - row_max) * LOG2E);
+      float row_sum = comb_val;
+#pragma unroll
+      for (int mask = 1; mask < HC; mask <<= 1)
+        row_sum += sycl::permute_group_by_xor(sg, row_sum, mask);
+
+      comb_val = comb_val * sycl::native::recip(row_sum) + hc_sinkhorn_eps;
+
+      float col_sum = comb_val;
+#pragma unroll
+      for (int mask = HC; mask < HC2; mask <<= 1)
+        col_sum += sycl::permute_group_by_xor(sg, col_sum, mask);
+      comb_val = comb_val * sycl::native::recip(col_sum + hc_sinkhorn_eps);
+
+#pragma unroll
+      for (int iter = 1; iter < sinkhorn_iters; ++iter) {
+        row_sum = comb_val;
 #pragma unroll
         for (int mask = 1; mask < HC; mask <<= 1)
           row_sum += sycl::permute_group_by_xor(sg, row_sum, mask);
+        comb_val = comb_val * sycl::native::recip(row_sum + hc_sinkhorn_eps);
 
-        comb_val = comb_val * sycl::native::recip(row_sum) + hc_sinkhorn_eps;
-
-        float col_sum = comb_val;
+        col_sum = comb_val;
 #pragma unroll
         for (int mask = HC; mask < HC2; mask <<= 1)
           col_sum += sycl::permute_group_by_xor(sg, col_sum, mask);
         comb_val = comb_val * sycl::native::recip(col_sum + hc_sinkhorn_eps);
-
-#pragma unroll
-        for (int iter = 1; iter < sinkhorn_iters; ++iter) {
-          row_sum = comb_val;
-#pragma unroll
-          for (int mask = 1; mask < HC; mask <<= 1)
-            row_sum += sycl::permute_group_by_xor(sg, row_sum, mask);
-          comb_val = comb_val * sycl::native::recip(row_sum + hc_sinkhorn_eps);
-
-          col_sum = comb_val;
-#pragma unroll
-          for (int mask = HC; mask < HC2; mask <<= 1)
-            col_sum += sycl::permute_group_by_xor(sg, col_sum, mask);
-          comb_val = comb_val * sycl::native::recip(col_sum + hc_sinkhorn_eps);
-        }
-
-        comb_mix[static_cast<int64_t>(token_id) * HC2 + lane_id] = comb_val;
       }
 
-    } else {
-      // Threads 32-95 (Subgroups 2-5)
-
-      // pre_mix from mixes[:4]
-      if (tid >= 32 && tid < 32 + HC) {
-        const int pre_idx = tid - 32;
-        const float pre_logit = mixes_shared[pre_idx] * hc_scale[0] + hc_base[pre_idx];
-        pre_mix_shared[pre_idx] = sycl::native::recip(1.0f + sycl::native::exp2(-pre_logit * LOG2E)) + hc_pre_eps;
-      }
+      comb_mix[static_cast<int64_t>(token_id) * HC2 + lane_id] = comb_val;
     }
 
     item.barrier(sycl::access::fence_space::local_space);
 
-    if (sg_id >= 2) {
-      // Weighted sum: layer_input[t, h] = sum_k(pre_mix[k] * residual[t, k, h])
-      const int threads_for_wsum = WG_SIZE - 32;  // 64 threads
-      const int thread_local_id = tid - 32;       // 0..63
+    // Weighted sum
+    const int threads_for_wsum = WG_SIZE;  // 96 threads
+    const int thread_local_id = tid;       // 0..95
 
-      constexpr int kVecSize = VEC_SIZE;
-      using vec_in = vec_t<scalar_t, kVecSize>;
-      using vec_out = vec_t<scalar_t, kVecSize>;
+    constexpr int kVecSize = VEC_SIZE;
+    using vec_in = vec_t<scalar_t, kVecSize>;
+    using vec_out = vec_t<scalar_t, kVecSize>;
 
-      const int num_vec_elems = hidden_size / kVecSize;
-      const int vec_tail_start = num_vec_elems * kVecSize;
+    const int num_vec_elems = hidden_size / kVecSize;
+    const int vec_tail_start = num_vec_elems * kVecSize;
 
-      for (int i = thread_local_id; i < num_vec_elems; i += threads_for_wsum) {
-        const int h = i * kVecSize;
+    for (int i = thread_local_id; i < num_vec_elems; i += threads_for_wsum) {
+      const int h = i * kVecSize;
 
-        float accum[kVecSize] = {};
+      float accum[kVecSize] = {};
 
-        for (int k = 0; k < HC; k++) {
-          const int64_t res_base = (static_cast<int64_t>(token_id) * HC + k) * hidden_size + h;
-          vec_in v;
-          v.load(0, sycl::multi_ptr<const scalar_t, sycl::access::address_space::global_space>(&residual[res_base]));
+      for (int k = 0; k < HC; k++) {
+        const int64_t res_base = (static_cast<int64_t>(token_id) * HC + k) * hidden_size + h;
+        vec_in v;
+        v.load(0, sycl::multi_ptr<const scalar_t, sycl::access::address_space::global_space>(&residual[res_base]));
 
-#pragma unroll
-          for (int j = 0; j < kVecSize; ++j) {
-            accum[j] += pre_mix_shared[k] * static_cast<float>(v[j]);
-          }
-        }
-
-        vec_out out;
 #pragma unroll
         for (int j = 0; j < kVecSize; ++j) {
-          out[j] = static_cast<scalar_t>(accum[j]);
+          accum[j] += pre_mix_shared[k] * static_cast<float>(v[j]);
         }
-        out.store(
-            0,
-            sycl::multi_ptr<scalar_t, sycl::access::address_space::global_space>(
-                &layer_input[static_cast<int64_t>(token_id) * hidden_size + h]));
       }
 
-      for (int h = vec_tail_start + thread_local_id; h < hidden_size; h += threads_for_wsum) {
-        float accum = 0.0f;
-        for (int k = 0; k < HC; k++) {
-          const int64_t res_idx = (static_cast<int64_t>(token_id) * HC + k) * hidden_size + h;
-          accum += pre_mix_shared[k] * static_cast<float>(residual[res_idx]);
-        }
-        layer_input[static_cast<int64_t>(token_id) * hidden_size + h] = static_cast<scalar_t>(accum);
+      vec_out out;
+#pragma unroll
+      for (int j = 0; j < kVecSize; ++j) {
+        out[j] = static_cast<scalar_t>(accum[j]);
       }
+      out.store(
+          0,
+          sycl::multi_ptr<scalar_t, sycl::access::address_space::global_space>(
+              &layer_input[static_cast<int64_t>(token_id) * hidden_size + h]));
+    }
+
+    for (int h = vec_tail_start + thread_local_id; h < hidden_size; h += threads_for_wsum) {
+      float accum = 0.0f;
+      for (int k = 0; k < HC; k++) {
+        const int64_t res_idx = (static_cast<int64_t>(token_id) * HC + k) * hidden_size + h;
+        accum += pre_mix_shared[k] * static_cast<float>(residual[res_idx]);
+      }
+      layer_input[static_cast<int64_t>(token_id) * hidden_size + h] = static_cast<scalar_t>(accum);
     }
   }
 };
@@ -231,72 +221,66 @@ struct HCPreBigFuseWithNormKernel {
 
     item.barrier(sycl::access::fence_space::local_space);
 
-    if (sg_id < 2) {
-      // Threads 0-31 (Subgroups 0-1)
-      if (sg_id == 0) {
+    // mix operations
+    if (sg_id == 0) {
+      // pre_mix, post_mix computed by lanes 0-3
+      if (lane_id < HC) {
+        // pre_mix from mixes[0:4]
+        const float pre_logit = mixes_shared[lane_id] * hc_scale[0] + hc_base[lane_id];
+        pre_mix_shared[lane_id] = sycl::native::recip(1.0f + sycl::native::exp2(-pre_logit * LOG2E)) + hc_pre_eps;
+
         // post_mix from mixes[4:8]
-        if (lane_id < HC) {
-          const float post_logit = mixes_shared[HC + lane_id] * hc_scale[1] + hc_base[HC + lane_id];
-          post_mix[static_cast<int64_t>(token_id) * HC + lane_id] =
-              hc_post_mult_value * sycl::native::recip(1.0f + sycl::native::exp2(-post_logit * LOG2E));
-        }
+        const float post_logit = mixes_shared[HC + lane_id] * hc_scale[1] + hc_base[HC + lane_id];
+        post_mix[static_cast<int64_t>(token_id) * HC + lane_id] =
+            hc_post_mult_value * sycl::native::recip(1.0f + sycl::native::exp2(-post_logit * LOG2E));
+      }
 
-        // sinkhorn from mixes[8:24]
-        float comb_logit = mixes_shared[2 * HC + lane_id] * hc_scale[2] + hc_base[2 * HC + lane_id];
+      // comb_mix (Sinkhorn) computed by all 16 lanes from mixes[8:24]
+      float comb_logit = mixes_shared[2 * HC + lane_id] * hc_scale[2] + hc_base[2 * HC + lane_id];
 
-        float row_max = comb_logit;
+      float row_max = comb_logit;
 #pragma unroll
-        for (int mask = 1; mask < HC; mask <<= 1)
-          row_max = sycl::fmax(row_max, sycl::permute_group_by_xor(sg, row_max, mask));
+      for (int mask = 1; mask < HC; mask <<= 1)
+        row_max = sycl::fmax(row_max, sycl::permute_group_by_xor(sg, row_max, mask));
 
-        float comb_val = sycl::native::exp2((comb_logit - row_max) * LOG2E);
-        float row_sum = comb_val;
+      float comb_val = sycl::native::exp2((comb_logit - row_max) * LOG2E);
+      float row_sum = comb_val;
+#pragma unroll
+      for (int mask = 1; mask < HC; mask <<= 1)
+        row_sum += sycl::permute_group_by_xor(sg, row_sum, mask);
+
+      comb_val = comb_val * sycl::native::recip(row_sum) + hc_sinkhorn_eps;
+
+      float col_sum = comb_val;
+#pragma unroll
+      for (int mask = HC; mask < HC2; mask <<= 1)
+        col_sum += sycl::permute_group_by_xor(sg, col_sum, mask);
+      comb_val = comb_val * sycl::native::recip(col_sum + hc_sinkhorn_eps);
+
+#pragma unroll
+      for (int iter = 1; iter < sinkhorn_iters; ++iter) {
+        row_sum = comb_val;
 #pragma unroll
         for (int mask = 1; mask < HC; mask <<= 1)
           row_sum += sycl::permute_group_by_xor(sg, row_sum, mask);
+        comb_val = comb_val * sycl::native::recip(row_sum + hc_sinkhorn_eps);
 
-        comb_val = comb_val * sycl::native::recip(row_sum) + hc_sinkhorn_eps;
-
-        float col_sum = comb_val;
+        col_sum = comb_val;
 #pragma unroll
         for (int mask = HC; mask < HC2; mask <<= 1)
           col_sum += sycl::permute_group_by_xor(sg, col_sum, mask);
         comb_val = comb_val * sycl::native::recip(col_sum + hc_sinkhorn_eps);
-
-#pragma unroll
-        for (int iter = 1; iter < sinkhorn_iters; ++iter) {
-          row_sum = comb_val;
-#pragma unroll
-          for (int mask = 1; mask < HC; mask <<= 1)
-            row_sum += sycl::permute_group_by_xor(sg, row_sum, mask);
-          comb_val = comb_val * sycl::native::recip(row_sum + hc_sinkhorn_eps);
-
-          col_sum = comb_val;
-#pragma unroll
-          for (int mask = HC; mask < HC2; mask <<= 1)
-            col_sum += sycl::permute_group_by_xor(sg, col_sum, mask);
-          comb_val = comb_val * sycl::native::recip(col_sum + hc_sinkhorn_eps);
-        }
-
-        comb_mix[static_cast<int64_t>(token_id) * HC2 + lane_id] = comb_val;
       }
 
-    } else {
-      // Threads 32-95 (Subgroups 2-5)
-
-      // pre_mix from mixes[:4]
-      if (tid >= 32 && tid < 32 + HC) {
-        const int pre_idx = tid - 32;
-        const float pre_logit = mixes_shared[pre_idx] * hc_scale[0] + hc_base[pre_idx];
-        pre_mix_shared[pre_idx] = sycl::native::recip(1.0f + sycl::native::exp2(-pre_logit * LOG2E)) + hc_pre_eps;
-      }
+      comb_mix[static_cast<int64_t>(token_id) * HC2 + lane_id] = comb_val;
     }
 
     item.barrier(sycl::access::fence_space::local_space);
 
-    if (tid >= 32) {
-      const int thread_local_id = tid - 32;
-      const int stride = 64;
+    // Weighted sum with local square-sum calculation
+    if (tid >= 16) {
+      const int thread_local_id = tid - 16;
+      const int stride = 80;
 
       constexpr int kVecSize = VEC_SIZE;
       using vec_in = vec_t<scalar_t, kVecSize>;
@@ -337,15 +321,15 @@ struct HCPreBigFuseWithNormKernel {
 
       local_sqr_sum = sycl::reduce_over_group(sg, local_sqr_sum, sycl::plus<float>());
       if (lane_id == 0) {
-        slm_[sg_id - 2] = local_sqr_sum;
+        slm_[sg_id - 1] = local_sqr_sum;  // SG1-5 → indices 0-4
       }
     }
 
     item.barrier(sycl::access::fence_space::local_space);
 
     if (sg_id == 0) {
-      const int idx = sycl::select(0, lane_id, lane_id < 4);
-      const float val_to_reduce = sycl::select(0.0f, slm_[idx], lane_id < 4);
+      const int idx = sycl::select(0, lane_id, lane_id < 5);  // Now 5 subgroups
+      const float val_to_reduce = sycl::select(0.0f, slm_[idx], lane_id < 5);
       const float total_sqr_sum = sycl::reduce_over_group(sg, val_to_reduce, sycl::plus<float>());
       if (lane_id == 0) {
         const float mean_sqr = total_sqr_sum / static_cast<float>(hidden_size);
@@ -355,9 +339,10 @@ struct HCPreBigFuseWithNormKernel {
 
     item.barrier(sycl::access::fence_space::local_space);
 
-    if (tid >= 32) {
-      const int thread_local_id = tid - 32;
-      const int stride = 64;
+    // recompute with RMS normalization
+    if (tid >= 16) {
+      const int thread_local_id = tid - 16;
+      const int stride = 80;
       const float rms = slm_[0];
 
       constexpr int kVecSize = VEC_SIZE;

@@ -1,4 +1,3 @@
-#include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
@@ -65,15 +64,15 @@ struct MRoPEKernel {
         if constexpr (is_neox) {
           const scalar_t x = q_head[rot];
           const scalar_t y = q_head[rot + half_rotary_dim_];
-          q_head[rot] = static_cast<scalar_t>(x * cos_v - y * sin_v);
-          q_head[rot + half_rotary_dim_] = static_cast<scalar_t>(y * cos_v + x * sin_v);
+          q_head[rot] = x * cos_v - y * sin_v;
+          q_head[rot + half_rotary_dim_] = y * cos_v + x * sin_v;
         } else {
           const int64_t x_idx = 2 * rot;
           const int64_t y_idx = x_idx + 1;
           const scalar_t x = q_head[x_idx];
           const scalar_t y = q_head[y_idx];
-          q_head[x_idx] = static_cast<scalar_t>(x * cos_v - y * sin_v);
-          q_head[y_idx] = static_cast<scalar_t>(y * cos_v + x * sin_v);
+          q_head[x_idx] = x * cos_v - y * sin_v;
+          q_head[y_idx] = y * cos_v + x * sin_v;
         }
       }
       if (head_id < num_k_heads_) {
@@ -82,15 +81,15 @@ struct MRoPEKernel {
         if constexpr (is_neox) {
           const scalar_t x = k_head[rot];
           const scalar_t y = k_head[rot + half_rotary_dim_];
-          k_head[rot] = static_cast<scalar_t>(x * cos_v - y * sin_v);
-          k_head[rot + half_rotary_dim_] = static_cast<scalar_t>(y * cos_v + x * sin_v);
+          k_head[rot] = x * cos_v - y * sin_v;
+          k_head[rot + half_rotary_dim_] = y * cos_v + x * sin_v;
         } else {
           const int64_t x_idx = 2 * rot;
           const int64_t y_idx = x_idx + 1;
           const scalar_t x = k_head[x_idx];
           const scalar_t y = k_head[y_idx];
-          k_head[x_idx] = static_cast<scalar_t>(x * cos_v - y * sin_v);
-          k_head[y_idx] = static_cast<scalar_t>(y * cos_v + x * sin_v);
+          k_head[x_idx] = x * cos_v - y * sin_v;
+          k_head[y_idx] = y * cos_v + x * sin_v;
         }
       }
     }
@@ -134,14 +133,12 @@ void launch_mrope(
     int64_t section_t,
     int64_t section_h,
     int64_t section_w) {
-  // local_rotary_dim(wg_size): sub-group-friendly tile size for the rotary dimension.
-  // 64 fills two Intel sub-groups (2×32) and gives good occupancy on
-  // Intel Arc / Xe / PVC.
-  constexpr int64_t local_rotary_dim = 2 * sg_size;
-
   const int64_t num_tokens = query.size(0);
   const int64_t half_rotary_dim = rotary_dim / 2;
-  const int64_t global_rotary_dim = CeilDiv(half_rotary_dim, local_rotary_dim) * local_rotary_dim;
+
+  // local_rotary_dim(wg_size): sub-group-friendly tile size for the rotary dimension.
+  const int64_t local_rotary_dim = RoundUp(half_rotary_dim, static_cast<int64_t>(sg_size));
+  const int64_t global_rotary_dim = RoundUp(half_rotary_dim, local_rotary_dim);
 
   MRoPEKernel<scalar_t, is_neox, is_interleaved> kernel{
       query.data_ptr<scalar_t>(),
@@ -163,8 +160,8 @@ void launch_mrope(
   };
 
   sycl_kernel_submit(
-      sycl::range<2>(static_cast<size_t>(num_tokens), static_cast<size_t>(global_rotary_dim)),
-      sycl::range<2>(1, static_cast<size_t>(local_rotary_dim)),
+      sycl::range<2>(num_tokens, global_rotary_dim),
+      sycl::range<2>(1, local_rotary_dim),
       dpcppGetCurrentQueue(),
       kernel);
 }

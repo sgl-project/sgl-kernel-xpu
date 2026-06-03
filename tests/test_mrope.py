@@ -137,9 +137,6 @@ def test_multimodal_rotary_embedding(
         None,
     )
 
-    # mrope_triton(q_ker, k_ker,
-    #    cos_sin_cache, positions, mrope_section,  head_size, rotary_dim, mrope_is_interleaved, False, is_neox, None)
-
     atol = rtol = 1e-2
     triton.testing.assert_close(q_na, q_ker, atol=atol, rtol=rtol)
     triton.testing.assert_close(k_na, k_ker, atol=atol, rtol=rtol)

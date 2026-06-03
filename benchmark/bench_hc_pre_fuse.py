@@ -5,17 +5,17 @@ from sgl_kernel import hc_pre_big_fuse
 
 configs = [
     # (b_s, seq_len, hidden_size, n_splits)
-    (16, 1, 4096, 1),  # 16 tokens
-    (48, 1, 4096, 1),  # 48 tokens
-    (128, 1, 4096, 1),  # 128 tokens
-    (512, 1, 4096, 1),  # 512 tokens
-    (896, 1, 4096, 1),  # 896 tokens
-    (1021, 1, 4096, 1),  # 1021 tokens
-    (1024, 1, 4096, 1),  # 1024 tokens
-    (1034, 1, 4096, 1),  # 1034 tokens
-    (1038, 1, 4096, 1),  # 1038 tokens
-    (1518, 1, 4096, 1),  # 1518 tokens
-    (2048, 1, 4096, 1),  # 2048 tokens
+    (16, 1, 4096, 1),
+    (48, 1, 4096, 1),
+    (128, 1, 4096, 1),
+    (512, 1, 4096, 1),
+    (896, 1, 4096, 1),
+    (1021, 1, 4096, 1),
+    (1024, 1, 4096, 1),
+    (1034, 1, 4096, 1),
+    (1038, 1, 4096, 1),
+    (1518, 1, 4096, 1),
+    (2048, 1, 4096, 1),
 ]
 
 sinkhorn_iters = 20
@@ -63,11 +63,16 @@ def benchmark(b_s, seq_len, hidden_size, n_splits, provider):
     comb_mix = torch.empty(T, hc * hc, dtype=torch.float32, device="xpu")
     layer_input = torch.empty(T, hidden_size, dtype=torch.bfloat16, device="xpu")
 
-    # Determine which variant to benchmark
     use_norm = provider == "with_norm"
 
+    rms_eps = 1e-5
+    hc_pre_eps = 1e-6
+    hc_sinkhorn_eps = 1e-6
+    hc_post_mult_value = 2.0
+    norm_eps = 1e-6
+
     # Warmup
-    for _ in range(10000):
+    for _ in range(10):
         if use_norm:
             hc_pre_big_fuse(
                 gemm_out_mul,
@@ -81,12 +86,12 @@ def benchmark(b_s, seq_len, hidden_size, n_splits, provider):
                 hc,
                 sinkhorn_iters,
                 n_splits,
-                1e-5,  # rms_eps
-                1e-6,  # hc_pre_eps
-                1e-6,  # hc_sinkhorn_eps
-                2.0,  # hc_post_mult_value
-                norm_weight,  # norm_weight
-                1e-6,  # norm_eps
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                norm_weight,
+                norm_eps,
             )
         else:
             hc_pre_big_fuse(
@@ -101,10 +106,10 @@ def benchmark(b_s, seq_len, hidden_size, n_splits, provider):
                 hc,
                 sinkhorn_iters,
                 n_splits,
-                1e-5,  # rms_eps
-                1e-6,  # hc_pre_eps
-                1e-6,  # hc_sinkhorn_eps
-                2.0,  # hc_post_mult_value
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
             )
     torch.xpu.synchronize()
 

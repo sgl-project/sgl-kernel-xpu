@@ -119,14 +119,20 @@ def hc_pre_big_fuse(
             f"hc_pre_big_fuse currently supports only sinkhorn_iters=20, got {sinkhorn_iters}"
         )
 
-    norm_weight_arg = norm_weight.contiguous() if norm_weight is not None else None
+    hc_scale_c = hc_scale.to(device=gemm_out_mul.device, dtype=torch.float32)
+    hc_base_c = hc_base.to(device=gemm_out_mul.device, dtype=torch.float32)
+    norm_weight_arg = (
+        norm_weight.to(device=gemm_out_mul.device, dtype=torch.bfloat16)
+        if norm_weight is not None
+        else None
+    )
     norm_eps_arg = float(norm_eps) if norm_weight is not None else None
 
     torch.ops.sgl_kernel.hc_pre_big_fuse.default(
         gemm_out_mul,
         gemm_out_sqrsum,
-        hc_scale,
-        hc_base,
+        hc_scale_c,
+        hc_base_c,
         residual_flat,
         post_mix,
         comb_mix,

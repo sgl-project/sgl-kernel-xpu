@@ -1,14 +1,14 @@
 /**
  * SYCL Utility Headers for SGLang JIT Kernels
- * 
+ *
  * This file provides SYCL equivalents for common CUDA primitives used in SGLang kernels.
  * It bridges the gap between CUDA-style kernel code and SYCL programming model.
  */
 
 #pragma once
 
-#include <sycl/sycl.hpp>
 #include <cstdint>
+#include <sycl/sycl.hpp>
 #include <type_traits>
 
 namespace sgl {
@@ -30,31 +30,43 @@ using int64_t = std::int64_t;
 
 template <int Dim = 0>
 inline size_t threadIdx(const ::sycl::nd_item<3>& item) {
-    static_assert(Dim >= 0 && Dim < 3, "threadIdx Dim must be 0, 1, or 2");
-    if constexpr (Dim == 0) return item.get_local_id(2);  // x
-    else if constexpr (Dim == 1) return item.get_local_id(1);  // y
-    else if constexpr (Dim == 2) return item.get_local_id(0);  // z
+  static_assert(Dim >= 0 && Dim < 3, "threadIdx Dim must be 0, 1, or 2");
+  if constexpr (Dim == 0)
+    return item.get_local_id(2);  // x
+  else if constexpr (Dim == 1)
+    return item.get_local_id(1);  // y
+  else if constexpr (Dim == 2)
+    return item.get_local_id(0);  // z
 }
 
 template <int Dim = 0>
 inline size_t blockIdx(const ::sycl::nd_item<3>& item) {
-    if constexpr (Dim == 0) return item.get_group(2);  // x
-    else if constexpr (Dim == 1) return item.get_group(1);  // y
-    else if constexpr (Dim == 2) return item.get_group(0);  // z
+  if constexpr (Dim == 0)
+    return item.get_group(2);  // x
+  else if constexpr (Dim == 1)
+    return item.get_group(1);  // y
+  else if constexpr (Dim == 2)
+    return item.get_group(0);  // z
 }
 
 template <int Dim = 0>
 inline size_t blockDim(const ::sycl::nd_item<3>& item) {
-    if constexpr (Dim == 0) return item.get_local_range(2);  // x
-    else if constexpr (Dim == 1) return item.get_local_range(1);  // y
-    else if constexpr (Dim == 2) return item.get_local_range(0);  // z
+  if constexpr (Dim == 0)
+    return item.get_local_range(2);  // x
+  else if constexpr (Dim == 1)
+    return item.get_local_range(1);  // y
+  else if constexpr (Dim == 2)
+    return item.get_local_range(0);  // z
 }
 
 template <int Dim = 0>
 inline size_t gridDim(const ::sycl::nd_item<3>& item) {
-    if constexpr (Dim == 0) return item.get_group_range(2);  // x
-    else if constexpr (Dim == 1) return item.get_group_range(1);  // y
-    else if constexpr (Dim == 2) return item.get_group_range(0);  // z
+  if constexpr (Dim == 0)
+    return item.get_group_range(2);  // x
+  else if constexpr (Dim == 1)
+    return item.get_group_range(1);  // y
+  else if constexpr (Dim == 2)
+    return item.get_group_range(0);  // z
 }
 
 // ============================================================================
@@ -62,13 +74,13 @@ inline size_t gridDim(const ::sycl::nd_item<3>& item) {
 // ============================================================================
 
 inline void syncthreads(const ::sycl::nd_item<3>& item) {
-    item.barrier(::sycl::access::fence_space::local_space);
+  item.barrier(::sycl::access::fence_space::local_space);
 }
 
 inline void syncwarp(const ::sycl::nd_item<3>& item) {
-    // SYCL sub-group barrier
-    auto sg = item.get_sub_group();
-    ::sycl::group_barrier(sg);
+  // SYCL sub-group barrier
+  auto sg = item.get_sub_group();
+  ::sycl::group_barrier(sg);
 }
 
 // ============================================================================
@@ -77,20 +89,20 @@ inline void syncwarp(const ::sycl::nd_item<3>& item) {
 
 template <typename T>
 inline T shfl_xor(const ::sycl::nd_item<3>& item, T value, int mask) {
-    auto sg = item.get_sub_group();
-    return ::sycl::permute_group_by_xor(sg, value, mask);
+  auto sg = item.get_sub_group();
+  return ::sycl::permute_group_by_xor(sg, value, mask);
 }
 
 template <typename T>
 inline T shfl_down(const ::sycl::nd_item<3>& item, T value, int delta) {
-    auto sg = item.get_sub_group();
-    return ::sycl::shift_group_left(sg, value, delta);
+  auto sg = item.get_sub_group();
+  return ::sycl::shift_group_left(sg, value, delta);
 }
 
 template <typename T>
 inline T shfl_up(const ::sycl::nd_item<3>& item, T value, int delta) {
-    auto sg = item.get_sub_group();
-    return ::sycl::shift_group_right(sg, value, delta);
+  auto sg = item.get_sub_group();
+  return ::sycl::shift_group_right(sg, value, delta);
 }
 
 // ============================================================================
@@ -99,20 +111,20 @@ inline T shfl_up(const ::sycl::nd_item<3>& item, T value, int delta) {
 
 template <typename T>
 inline T warp_reduce_sum(const ::sycl::nd_item<3>& item, T value) {
-    auto sg = item.get_sub_group();
-    return ::sycl::reduce_over_group(sg, value, ::sycl::plus<T>());
+  auto sg = item.get_sub_group();
+  return ::sycl::reduce_over_group(sg, value, ::sycl::plus<T>());
 }
 
 template <typename T>
 inline T warp_reduce_max(const ::sycl::nd_item<3>& item, T value) {
-    auto sg = item.get_sub_group();
-    return ::sycl::reduce_over_group(sg, value, ::sycl::maximum<T>());
+  auto sg = item.get_sub_group();
+  return ::sycl::reduce_over_group(sg, value, ::sycl::maximum<T>());
 }
 
 template <typename T>
 inline T warp_reduce_min(const ::sycl::nd_item<3>& item, T value) {
-    auto sg = item.get_sub_group();
-    return ::sycl::reduce_over_group(sg, value, ::sycl::minimum<T>());
+  auto sg = item.get_sub_group();
+  return ::sycl::reduce_over_group(sg, value, ::sycl::minimum<T>());
 }
 
 // ============================================================================
@@ -121,8 +133,8 @@ inline T warp_reduce_min(const ::sycl::nd_item<3>& item, T value) {
 
 template <typename T>
 inline T block_reduce_sum(const ::sycl::nd_item<3>& item, T value, T* shared_mem) {
-    (void)shared_mem;
-    return ::sycl::reduce_over_group(item.get_group(), value, ::sycl::plus<T>());
+  (void)shared_mem;
+  return ::sycl::reduce_over_group(item.get_group(), value, ::sycl::plus<T>());
 }
 
 // ============================================================================
@@ -131,27 +143,27 @@ inline T block_reduce_sum(const ::sycl::nd_item<3>& item, T value, T* shared_mem
 
 template <typename T>
 inline T rsqrt(T x) {
-    return ::sycl::rsqrt(x);
+  return ::sycl::rsqrt(x);
 }
 
 template <typename T>
 inline T exp(T x) {
-    return ::sycl::exp(x);
+  return ::sycl::exp(x);
 }
 
 template <typename T>
 inline T log(T x) {
-    return ::sycl::log(x);
+  return ::sycl::log(x);
 }
 
 template <typename T>
 inline T sqrt(T x) {
-    return ::sycl::sqrt(x);
+  return ::sycl::sqrt(x);
 }
 
 template <typename T>
 inline T tanh(T x) {
-    return ::sycl::tanh(x);
+  return ::sycl::tanh(x);
 }
 
 // ============================================================================
@@ -160,8 +172,8 @@ inline T tanh(T x) {
 
 template <typename T>
 inline T ldg(const T* ptr) {
-    // Load from global memory (similar to __ldg in CUDA)
-    return *ptr;
+  // Load from global memory (similar to __ldg in CUDA)
+  return *ptr;
 }
 
 // ============================================================================
@@ -170,5 +182,5 @@ inline T ldg(const T* ptr) {
 
 constexpr int kWarpSize = 32;  // Standard sub-group size
 
-} // namespace sycl
-} // namespace sgl
+}  // namespace sycl
+}  // namespace sgl

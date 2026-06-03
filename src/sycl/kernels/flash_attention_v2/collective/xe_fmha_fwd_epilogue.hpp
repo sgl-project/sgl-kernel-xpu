@@ -165,10 +165,12 @@ class FMHAFwdEpilogue {
       }
     }
 
-    /* Complete softmax, dividing out sums. */
+    /* Complete softmax, dividing out sums. Rows whose denominator is exactly
+       zero attend to no (unmasked) keys -- e.g. a batch with zero KV length --
+       so emit 0 instead of NaN to match the reference implementation. */
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < rA_sum.size(); i++)
-      rA_sum(i) = ElementA(1) / rA_sum(i);
+      rA_sum(i) = rA_sum(i) == ElementA(0) ? ElementA(0) : ElementA(1) / rA_sum(i);
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < rA.size(); i++)
@@ -416,10 +418,12 @@ class DecodeFwdEpilogue {
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
 
-    /* Complete softmax, dividing out sums. */
+    /* Complete softmax, dividing out sums. Rows whose denominator is exactly
+       zero attend to no (unmasked) keys -- e.g. a batch with zero KV length --
+       so emit 0 instead of NaN to match the reference implementation. */
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < rA_sum.size(); i++)
-      rA_sum(i) = ElementA(1) / rA_sum(i);
+      rA_sum(i) = rA_sum(i) == ElementA(0) ? ElementA(0) : ElementA(1) / rA_sum(i);
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < rA.size(); i++)

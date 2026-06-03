@@ -211,7 +211,16 @@ class XeFMHAFwdKernel {
       int seq_len_q = problem_shape.seq_len_qo.q_group_size * (problem_shape.seq_len_qo.cumulative_length[batch + 1] -
                                                                problem_shape.seq_len_qo.cumulative_length[batch]);
       int seq_len_k_new = 0;
-      int seq_len_k_cache = problem_shape.seq_len_kv_cache.cumulative_length[batch];
+      // Paged KV passes per-batch cache lengths in cu_seqlens_k (cumulative_length[b]
+      // already holds this batch's KV length). Non-paged KV passes a cumulative
+      // prefix-sum array (b+1 entries), so the per-batch length is the difference.
+      int seq_len_k_cache;
+      if constexpr (CollectiveMainloop::PagedKV) {
+        seq_len_k_cache = problem_shape.seq_len_kv_cache.cumulative_length[batch];
+      } else {
+        seq_len_k_cache = problem_shape.seq_len_kv_cache.cumulative_length[batch + 1] -
+                          problem_shape.seq_len_kv_cache.cumulative_length[batch];
+      }
       return cute::make_tuple<int, int, int>(seq_len_q, seq_len_k_new, seq_len_k_cache);
 
     } else {
@@ -305,15 +314,25 @@ class XeFMHAFwdKernel {
         offset_o = s.num_heads_q * s.head_size_vo * qo_cumulative[idx_b] * s.seq_len_qo.q_group_size;
         if (s.seq_len_kv_cache.cumulative_length) {
           auto kv_cumulative_cache = s.seq_len_kv_cache.cumulative_length;
-          // offset_k_cache = s.num_heads_kv * s.head_size_qk * kv_cumulative_cache[idx_b];
-          // offset_v_cache = s.num_heads_kv * s.head_size_vo * kv_cumulative_cache[idx_b];
+          // Non-paged KV stores all batches in one contiguous ragged buffer, so each
+          // batch starts at its cumulative KV offset. Paged KV uses the page table for
+          // absolute addressing, so no base offset is applied here.
+          if constexpr (!CollectiveMainloop::PagedKV) {
+            offset_k_cache = s.num_heads_kv * s.head_size_qk * kv_cumulative_cache[idx_b];
+            offset_v_cache = s.num_heads_kv * s.head_size_vo * kv_cumulative_cache[idx_b];
+          }
         }
       }
 
       auto batch_dim = is_var_len ? 1 : s.batch;
+      // Paged KV addresses the whole cache buffer (page table remaps tiles), so the
+      // sequence extent is the global total. Non-paged KV points at a single batch's
+      // contiguous region, so the extent must be this batch's KV length to keep the
+      // 2D block loads in-bounds.
+      int kv_seq_extent = CollectiveMainloop::PagedKV ? int(s.seq_len_kv_cache.total_length) : int(seq_len_kv_cache);
       auto shape_Q = make_shape(seq_len_qo, s.head_size_qk, s.num_heads_q, batch_dim);
-      auto shape_K = make_shape(s.seq_len_kv_cache.total_length, s.head_size_qk, s.num_heads_kv, batch_dim);
-      auto shape_V = make_shape(s.head_size_vo, s.seq_len_kv_cache.total_length, s.num_heads_kv, batch_dim);
+      auto shape_K = make_shape(kv_seq_extent, s.head_size_qk, s.num_heads_kv, batch_dim);
+      auto shape_V = make_shape(s.head_size_vo, kv_seq_extent, s.num_heads_kv, batch_dim);
       auto shape_O = make_shape(seq_len_qo, s.head_size_vo, s.num_heads_q, batch_dim);
 
       auto dcQ = const_cast<ElementQ*>(p.Q + offset_q);

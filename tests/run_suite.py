@@ -38,6 +38,7 @@ suites = {
         TestFile("test_sampling.py"),
         TestFile("test_hc_split_sinkhorn.py"),
         TestFile("test_hc_pre_fuse.py"),
+        TestFile("test_store_cache_xpu.py"),
     ],
 }
 

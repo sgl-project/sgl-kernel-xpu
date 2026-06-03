@@ -39,6 +39,33 @@ namespace decode {
 
 template <>
 void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Arguments& params) const {
+#if @PAGE_SIZE@ == 64
+  if (params.page_table == nullptr) {
+    // Non-paged (contiguous ragged) KV cache. The paged decode kernel ties its
+    // KV tile to PAGE_SIZE; the non-paged path has no page size, so it uses an
+    // independent KV-tile constant (@TILED_KV_NP@) that can be tuned separately.
+    // Only emitted in the PAGE_SIZE==64 TU; the host routes non-paged decode
+    // launches here (decode::mha_fwd_nopage sets page_size = 64).
+    using TileShapeQK_NP = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@TILED_KV_NP@>, cute::_64>;
+    using TileShapePV_NP = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@TILED_KV_NP@>>;
+    using TileShapeOutput_NP = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;
+    using SubgroupLayoutQK_NP = cute::Layout<cute::Shape<cute::_1, cute::Int<@TILED_KV_NP@ / 16>, cute::_1>>;
+    AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+        DecodeConfig<
+            false,
+            LocalMask,
+            Sink,
+            TileShapeQK_NP,
+            TileShapePV_NP,
+            TileShapeOutput_NP,
+            SubgroupLayoutQK_NP>::run_nopaged(params);
+      });
+    });
+    return;
+  }
+#endif
+
   using TileShapeQK = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@PAGE_SIZE@>, cute::_64>;
   using TileShapePV = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@PAGE_SIZE@>>;
   // Round the head-dim of the output tile up to a multiple of get<1>(TileShapePV) (32) so that
@@ -50,7 +77,8 @@ void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Argume
 
     AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-        DecodeConfig<false, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(params);
+        DecodeConfig<false, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
+            params);
       });
   });
 }

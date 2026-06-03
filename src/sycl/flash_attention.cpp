@@ -40,11 +40,12 @@
 
 namespace decode {
 
-// Non-paged (contiguous ragged KV) decode entry. Kept separate from
-// prefill::mha_fwd_nopage so the decode no-page path can adopt its own
-// parameter configuration in the future. The dedicated decode kernel is
-// paged-only, so for now this reuses the non-paged prefill kernel, which is
-// mathematically identical for the seqlen_q <= 1 batches selected here.
+// Non-paged (contiguous ragged KV) decode entry. Dedicated decode path: it
+// drives the decode kernel (FmhaDecodeRunner with PagedKV = false) rather than
+// reusing the prefill kernel, so the single-query decode batches selected by the
+// chunkprefill dispatcher run on the decode-optimized kernel. The non-paged
+// decode kernel carries its own tile configuration (FMHA_DECODE_TILED_KV_NP_*)
+// so it can be tuned independently of both the paged decode and prefill paths.
 std::vector<at::Tensor> mha_fwd_nopage(
     const at::Tensor& q,             // (total_q, h, d)
     const at::Tensor& k,             // (total_k, h_k, d)
@@ -125,9 +126,11 @@ std::vector<at::Tensor> mha_fwd_nopage(
 
   at::Tensor softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
 
-  prefill::Arguments params;
+  Arguments params;
   params.is_bf16 = q.dtype() == torch::kBFloat16;
 
+  // Q / O are in ragged (total, h, d) format; KV is a contiguous ragged
+  // (total_k, h_k, d) cache addressed via cu_seqlens_k offsets.
   params.q_ptr = q.data_ptr();
   params.k_ptr = k.data_ptr();
   params.v_ptr = v.data_ptr();
@@ -147,24 +150,35 @@ std::vector<at::Tensor> mha_fwd_nopage(
 
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
+  // No "new" KV: the whole sequence lives in the contiguous cache buffer, so the
+  // decode kernel reads everything from the K/V cache pointers (knew = 0).
+  params.cu_seqlens_knew = nullptr;
+  params.seqlen_knew = 0;
+  params.total_knew = 0;
 
   params.softmax_lse_ptr = softmax_lse.data_ptr();
 
   params.b = batch_size;
   params.h = num_heads;
   params.h_k = num_heads_k;
-  params.q_group_size = 1;
+  // GQA packing: the decode kernel folds q_group_size query heads into the Q
+  // tile, matching the paged decode path.
+  params.q_group_size = num_heads / num_heads_k;
   params.seqlen_q = seqlen_q;
   params.seqlen_k = seqlen_k;
   params.d = head_size;
   params.d_rounded = head_size_rounded;
 
   params.softmax_scale = softmax_scale;
-  params.softmax_sink_ptr = sinks_.has_value() ? sinks_.value().data_ptr() : nullptr;
+  params.use_sink = sinks_.has_value();
+  params.softmax_sink_ptr = params.use_sink ? sinks_.value().data_ptr() : nullptr;
   params.softcap = softcap;
   params.p_dropout = 1.f;
 
-  params.is_causal = window_size_left < 0 && window_size_right == 0;
+  // Decode never needs a causal mask (each selected batch has seqlen_q <= 1, so
+  // a single query attends to the full cache); sliding-window/local masking is
+  // still honored. Mirrors decode::mha_fwd.
+  params.is_causal = false;
   params.is_local = (window_size_left >= 0 || window_size_right >= 0) && !params.is_causal;
   if (window_size_left < 0) {
     window_size_left = seqlen_k - 1;
@@ -179,12 +193,21 @@ std::vector<at::Tensor> mha_fwd_nopage(
   params.b_k = batch_size;
   params.dv = head_size_v;
 
-  // Non-paged KV: no page table. The kernel branches on page_table == nullptr.
+  // Non-paged KV: no page table. The decode kernel branches on
+  // page_table == nullptr to take its non-paged path. page_size is set to 64
+  // purely to route the dispatch to the PAGE_SIZE==64 translation unit, which
+  // is where the non-paged decode kernel is emitted (the non-paged KV tile is
+  // FMHA_DECODE_TILED_KV_NP_*, independent of this routing value).
   params.page_table = nullptr;
   params.page_table_batch_stride = 0;
   params.max_num_pages_per_seq = 0;
-  params.page_size = 0;
+  params.page_size = 64;
   params.num_pages = 0;
+
+  // Split-KV is a paged-cache optimization; the non-paged path uses the
+  // single-launch decode kernel.
+  params.use_split_kv = false;
+  params.num_kv_splits = -1;
 
   params.rotary_dim = 0;
 
@@ -192,37 +215,15 @@ std::vector<at::Tensor> mha_fwd_nopage(
 
   at::Tensor out_accum, softmax_lse_accum;
 
+  int qg_sz = nextPowerOf2(params.q_group_size);
+  TORCH_CHECK(qg_sz >= 1 && qg_sz <= 16, "Unsupported q_group_size for decode attention: ", params.q_group_size);
   TORCH_CHECK(
       params.d == 64 || params.d == 72 || params.d == 96 || params.d == 128 || params.d == 192 || params.d == 256 ||
           params.d == 512,
       "Unsupported head size for decode attention: ",
       params.d);
 
-  switch (params.d) {
-    case 64:
-      prefill::FmhaPrefillRunner<64>{}(params);
-      break;
-    case 72:
-      prefill::FmhaPrefillRunner<72>{}(params);
-      break;
-    case 96:
-      prefill::FmhaPrefillRunner<96>{}(params);
-      break;
-    case 128:
-      prefill::FmhaPrefillRunner<128>{}(params);
-      break;
-    case 192:
-      prefill::FmhaPrefillRunner<192>{}(params);
-      break;
-    case 256:
-      prefill::FmhaPrefillRunner<256>{}(params);
-      break;
-    case 512:
-      prefill::FmhaPrefillRunner<512>{}(params);
-      break;
-    default:
-      TORCH_CHECK(false, "Unsupported head size for decode attention: ", params.d);
-  }
+  DISPATCH_DECODE(qg_sz);
 
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }

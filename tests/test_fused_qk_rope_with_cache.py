@@ -118,7 +118,7 @@ def fused_qk_rope_with_cache(
 BS_LIST = [1, 128, 2048]
 NUM_KV_HEADS_LIST = [1, 4]
 GQA_RATIO = [1, 8]
-ROPE_DIM_LIST = [64, 256]
+ROPE_DIM_LIST = [64, 128, 256, 512]
 IS_NEOX_LIST = [False, True]
 DTYPE_LIST = [torch.bfloat16, torch.float16]
 PARTIAL_ROPE_DIM_LIST = [64, 96]

@@ -81,16 +81,16 @@ def get_effective_attention_pairs(
 
 
 # Benchmark configurations
-causal = [True, False]
-local = [True, False]
-use_sinks = [True, False]
-batch_size = [1, 8, 16]
-q_seq_length_range = [1, 128]
-head_dim = [72, 128, 256, 512]
+causal = [False]
+local = [False]
+use_sinks = [False]
+batch_size = [1]
+q_seq_length_range = [20480, 40960]
+head_dim = [72]
 num_heads_q = [16]
-num_heads_kv = [4, 8]
-kv_seq_length_range = [4096]
-page_size_range = [0, 128]
+num_heads_kv = [16]
+kv_seq_length_range = [20480, 40960]
+page_size_range = [0]
 configs = list(
     filter(
         lambda cfg: not (cfg[0] and cfg[1])

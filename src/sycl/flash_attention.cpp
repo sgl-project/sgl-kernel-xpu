@@ -194,14 +194,14 @@ std::vector<at::Tensor> mha_fwd_nopage(
   params.dv = head_size_v;
 
   // Non-paged KV: no page table. The decode kernel branches on
-  // page_table == nullptr to take its non-paged path. page_size is set to 64
-  // purely to route the dispatch to the PAGE_SIZE==64 translation unit, which
+  // page_table == nullptr to take its non-paged path. page_size is set to 128
+  // purely to route the dispatch to the PAGE_SIZE==128 translation unit, which
   // is where the non-paged decode kernel is emitted (the non-paged KV tile is
   // FMHA_DECODE_TILED_KV_NP_*, independent of this routing value).
   params.page_table = nullptr;
   params.page_table_batch_stride = 0;
   params.max_num_pages_per_seq = 0;
-  params.page_size = 64;
+  params.page_size = 128;
   params.num_pages = 0;
 
   // Split-KV is a paged-cache optimization; the non-paged path uses the

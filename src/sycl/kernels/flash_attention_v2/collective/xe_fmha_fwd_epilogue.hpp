@@ -465,7 +465,20 @@ class DecodeFwdEpilogue {
     if constexpr (Sink) {
       constexpr double kLog2e = 1.4426950408889634074;
       if (idx_kv_split == 0 && sg_id == 0 && thr_id < head_group_q) {
-        tA_sum(0) += sycl::native::exp2(static_cast<ElementA>(tSink(thr_id) * kLog2e) - tA_max(0));
+        // tA_max(0) here is this subgroup's (k_blk0's) partial row max. When
+        // k_blk0 is fully masked out by the sliding window, that partial max is
+        // the sentinel lowest() (e.g. -138 while the true row max is ~19.5), so
+        // exp2(sink - tA_max(0)) overflows to +inf. reduce_A later rescales this
+        // subgroup by exp2(tA_max(0) - global_max) ~ 0, turning the sum into
+        // inf * 0 = NaN that poisons the whole row. The mathematically correct
+        // sink contribution to the row is exp2(sink - global_max), which is
+        // negligible here (the row is dominated by real keys), so on overflow we
+        // simply drop this subgroup's sink term. The common, non-masked path
+        // (finite term) is left byte-identical to the original.
+        ElementA sink_term = sycl::native::exp2(static_cast<ElementA>(tSink(thr_id) * kLog2e) - tA_max(0));
+        if (sycl::isfinite(sink_term)) {
+          tA_sum(0) += sink_term;
+        }
       }
     }
 

@@ -22,20 +22,23 @@ endfunction()
 #   <_256, _256, _32> / SG_8_4_1   — avg_m > 128,  fuse_act=false
 
 # TEMPORARY L0-module-pressure workaround: generate only the variants DSV4
-# actually dispatches (activation_type=0 i.e. silu, with_bias=false), skipping
-# the full act × bias cartesian product. This shrinks the number of
-# AOT-compiled MXFP4 .so libraries from 36 → 6, which is necessary to keep
-# the Level Zero driver below its per-context module cap under TP>1.
-# Matching dispatch-side prune lives in src/sycl/GroupGemmMxfp4W4A16Xe20.cpp.
-set(act_type 0)
+# actually dispatches (activation_type=0 silu and activation_type=4
+# swiglu_deepseek_v4, with_bias=false), skipping the full act × bias cartesian
+# product. This keeps the AOT-compiled MXFP4 .so count small, which is
+# necessary to keep the Level Zero driver below its per-context module cap
+# under TP>1. Matching dispatch-side prune lives in
+# src/sycl/GroupGemmMxfp4W4A16Xe20.cpp.
+#   act_type 0 = silu, 4 = swiglu_deepseek_v4 (clamp gate/up then silu*up)
 set(with_bias false)
-foreach(fuse_act true false)
-    add_group_gemm_mxfp4_w4a16_xe20_inst("_8" "_64" "_32" "_1, _4, _1" "_4, _1, _0" ${act_type} ${fuse_act} ${with_bias})
-endforeach()
+foreach(act_type 0 4)
+    foreach(fuse_act true false)
+        add_group_gemm_mxfp4_w4a16_xe20_inst("_8" "_64" "_32" "_1, _4, _1" "_4, _1, _0" ${act_type} ${fuse_act} ${with_bias})
+    endforeach()
 
-add_group_gemm_mxfp4_w4a16_xe20_inst("_128" "_64" "_32" "_4, _2, _1" "_2, _1, _0" ${act_type} true ${with_bias})
-add_group_gemm_mxfp4_w4a16_xe20_inst("_128" "_128" "_32" "_4, _2, _1" "_2, _1, _0" ${act_type} false ${with_bias})
-add_group_gemm_mxfp4_w4a16_xe20_inst("_256" "_64" "_32" "_8, _2, _1" "_2, _1, _0" ${act_type} true ${with_bias})
-add_group_gemm_mxfp4_w4a16_xe20_inst("_256" "_256" "_32" "_8, _4, _1" "_4, _1, _0" ${act_type} false ${with_bias})
+    add_group_gemm_mxfp4_w4a16_xe20_inst("_128" "_64" "_32" "_4, _2, _1" "_2, _1, _0" ${act_type} true ${with_bias})
+    add_group_gemm_mxfp4_w4a16_xe20_inst("_128" "_128" "_32" "_4, _2, _1" "_2, _1, _0" ${act_type} false ${with_bias})
+    add_group_gemm_mxfp4_w4a16_xe20_inst("_256" "_64" "_32" "_8, _2, _1" "_2, _1, _0" ${act_type} true ${with_bias})
+    add_group_gemm_mxfp4_w4a16_xe20_inst("_256" "_256" "_32" "_8, _4, _1" "_4, _1, _0" ${act_type} false ${with_bias})
+endforeach()
 
 list(APPEND ATen_XPU_SYCL_XE20 ${GROUP_GEMM_MXFP4_W4A16_XE20_INST_SRCS})

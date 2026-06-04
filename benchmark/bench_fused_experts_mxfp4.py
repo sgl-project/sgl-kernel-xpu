@@ -4,9 +4,15 @@
 #   mxfp4_fused     sgl_kernel fused_experts(use_mxfp4_w4a16=True):
 #                   moe_grouped_mm_nt_xe20_mxfp4_w4a16 dequants per-tile in
 #                   registers, no intermediate bf16 weight.
-#   triton_full     sglang Triton fused_experts_impl (MXFP4-xpu branch):
-#                   one Triton kernel per weight upcasts MXFP4 → bf16,
-#                   then the Triton fused-moe GEMM runs on bf16.
+#   triton_fused    sglang Triton fused_experts_impl from the DeepSeek-V4 XPU
+#                   support branch. Detects MXFP4-packed routed-expert weights
+#                   (_is_mxfp4_xpu_packed), upcasts them to bf16 with a Triton
+#                   dequant kernel (_upcast_mxfp4_triton), then runs the
+#                   standard fused_moe_kernel. The bf16 weight is materialized
+#                   as a transient, so its peak_transient_MB is higher than the
+#                   tile-fused sgl_kernel path. Requires sglang to be installed
+#                   in the environment (see project README for the XPU install
+#                   recipe).
 #
 # Both compute the same result modulo MXFP4 rounding. ms and
 # peak_transient_MB are directly comparable.
@@ -23,9 +29,7 @@
 # mid-sweep. Fresh processes reset the pool.
 
 import gc
-import importlib.machinery
 import sys
-import types
 from pathlib import Path
 
 import sgl_kernel  # noqa: F401 — registers torch.ops.sgl_kernel
@@ -38,52 +42,32 @@ from mxfp4_utils import MXFP4_BLOCK_SIZE  # noqa: E402
 from mxfp4_utils import quantize_mxfp4_2d  # noqa: E402
 
 
-# Importing sglang on an XPU-only host trips over flashinfer.comm (CUDA)
-# and a DSV4 env default that asserts swiglu_limit. Stub both before the
-# sglang import chain runs.
 def _import_triton_fused_experts_impl():
-    import os
-
-    os.environ.setdefault("SGLANG_DSV4_2604_SUBMODE", "2604A")
-
-    if "flashinfer.comm" not in sys.modules:
-        fi = sys.modules.get("flashinfer") or types.ModuleType("flashinfer")
-        fi.__spec__ = importlib.machinery.ModuleSpec(
-            "flashinfer", loader=None, is_package=True
-        )
-        if not hasattr(fi, "__path__"):
-            fi.__path__ = []
-        fi_comm = types.ModuleType("flashinfer.comm")
-        fi_comm.__spec__ = importlib.machinery.ModuleSpec(
-            "flashinfer.comm", loader=None, is_package=False
-        )
-
-        class _Stub:
-            def __init__(self, *a, **k):
-                pass
-
-            def __getattr__(self, n):
-                return _Stub()
-
-            def __call__(self, *a, **k):
-                return _Stub()
-
-        fi_comm.MoeAlltoAll = _Stub
-        fi_comm.moe_a2a_get_workspace_size_per_rank = _Stub
-        sys.modules["flashinfer"] = fi
-        sys.modules["flashinfer.comm"] = fi_comm
-
-    # The Triton MoE config picker consults a global ServerArgs. Install
-    # a minimal stub (a real one would trigger HuggingFace model resolution).
+    # The triton_fused provider needs sglang's moe_runner/triton_utils path
+    # with the DeepSeek-V4 XPU MXFP4 support: fused_experts_impl plus the
+    # _is_mxfp4_xpu_packed detector that routes int8/uint8-packed weights
+    # through the Triton MXFP4 upcast. Without it the packed weights would be
+    # misread as real FP8 and the bench would compare against the wrong path,
+    # so require this marker and refuse to fall back.
     from sglang.srt import server_args as _sa
-    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+    from sglang.srt.layers.moe.moe_runner.triton_utils import fused_moe as _fm
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
         fused_experts_impl as _impl,
     )
 
+    assert hasattr(
+        _fm, "_is_mxfp4_xpu_packed"
+    ), "Resolved sglang lacks MXFP4-XPU support (_is_mxfp4_xpu_packed) — wrong checkout"
+
+    # fused_experts_impl + the Triton config picker read get_global_server_args()
+    # at call time. Install a minimal stub holding only the flags this path reads
+    # (a real ServerArgs would trigger HuggingFace model resolution).
     class _StubServerArgs:
         enable_deterministic_inference = False
+        enable_fused_moe_sum_all_reduce = False
 
     _sa._global_server_args = _StubServerArgs()
+    print(f"[triton_fused] using {_impl.__module__} from {_impl.__code__.co_filename}")
     return _impl
 
 
@@ -93,7 +77,7 @@ try:
 except Exception as exc:
     triton_fused_experts_impl = None
     TRITON_REF_AVAILABLE = False
-    print(f"[triton_full provider disabled: {type(exc).__name__}: {exc}]")
+    print(f"[triton_fused provider disabled: {type(exc).__name__}: {exc}]")
 
 ALL_RESULTS = []
 
@@ -113,12 +97,19 @@ def _build_and_quantize_weights_per_expert(E: int, rows: int, cols: int):
     return packed, scales
 
 
-# (name, num_tokens, num_experts, topk, hidden, intermediate). Default is a
-# real DSV4 MXFP4 fused_experts call (E=256, H=4096, I=256, topk=6). The
-# triton_full provider also needs to fit a bf16 weight transient
-# (E*2I*H*2B); the fused path avoids it entirely.
+# (name, num_tokens, num_experts, topk, hidden, intermediate). Only the
+# sgl_kernel provider is tile-fused; the Triton reference upcasts to a bf16
+# weight transient first (see provider notes at the top of the file).
+#
+# fused_experts picks a fused vs unfused GEMM1 activation by
+#   use_unfused_act = avg_m <= 128 and (hidden*intermediate > 4096**2)
+# where avg_m = (num_tokens*topk)//num_experts. Cover BOTH branches:
+#   - dsv4_prefill_2k: real DSV4 prefill (E=256, H=4096, I=256) -> fused path
+#   - dsv4_unfused:    small E + large H*I (E=8, H=4096, I=8192) -> unfused path
+#     (M=128: avg_m = 128*6//8 = 96 <= 128, and H*I = 33.5M > 16.8M)
 SHAPES = [
     ("dsv4_prefill_2k", 2048, 256, 6, 4096, 256),
+    ("dsv4_unfused", 128, 8, 6, 4096, 8192),
 ]
 
 
@@ -167,6 +158,10 @@ def _prepare_inputs(num_tokens, num_experts, topk, hidden, intermediate):
     }
 
 
+# DSV4 swiglu clamp limit. Clamps the gate/up halves before silu_and_mul.
+SWIGLU_LIMIT = 10
+
+
 def _run_fused(inputs):
     return fused_experts(
         inputs["a"],
@@ -180,12 +175,15 @@ def _run_fused(inputs):
         use_mxfp4_w4a16=True,
         w1_scale=inputs["w1_scale"],
         w2_scale=inputs["w2_scale"],
+        swiglu_limit=SWIGLU_LIMIT,
     )
 
 
-def _run_triton_full(inputs):
-    # use_fp8_w8a8=True is how _is_mxfp4_xpu_packed detects MXFP4-packed
-    # routed experts on this branch (see sglang fused_moe.py).
+def _run_triton_fused(inputs):
+    # sglang auto-detects MXFP4 inside fused_experts_impl from (w.dtype in
+    # {uint8,int8}, w_scale present, not use_int4_w4a16) via _is_mxfp4_xpu_packed.
+    # All quantization flags stay False — the packed E2M1 + E8M0 weights are
+    # upcast to bf16 by a Triton dequant kernel before the standard fused_moe.
     return triton_fused_experts_impl(
         inputs["a"],
         inputs["w1_packed"].view(torch.uint8),
@@ -198,13 +196,14 @@ def _run_triton_full(inputs):
         activation="silu",
         is_gated=True,
         apply_router_weight_on_input=False,
-        use_fp8_w8a8=True,
+        use_fp8_w8a8=False,
         use_int8_w8a8=False,
         use_int8_w8a16=False,
         use_int4_w4a16=False,
         per_channel_quant=False,
         w1_scale=inputs["w1_scale"],
         w2_scale=inputs["w2_scale"],
+        swiglu_limit=SWIGLU_LIMIT,
     )
 
 
@@ -220,8 +219,10 @@ _LINE_VALS = ["mxfp4_fused"]
 _LINE_NAMES = ["mxfp4_fused (tile-fused MXFP4, CUTLASS)"]
 _LINE_STYLES = [("green", "-")]
 if TRITON_REF_AVAILABLE:
-    _LINE_VALS.append("triton_full")
-    _LINE_NAMES.append("triton_full (Triton dequant + Triton fused_moe)")
+    _LINE_VALS.append("triton_fused")
+    _LINE_NAMES.append(
+        "triton_fused (Triton MXFP4 upcast + fused_moe, sglang DSV4-XPU)"
+    )
     _LINE_STYLES.append(("red", "-"))
 
 
@@ -281,8 +282,8 @@ def benchmark(name, num_tokens, num_experts, topk, hidden, intermediate, provide
     inputs = _prepare_inputs(num_tokens, num_experts, topk, hidden, intermediate)
     if provider == "mxfp4_fused":
         run_fn = _run_fused
-    elif provider == "triton_full":
-        run_fn = _run_triton_full
+    elif provider == "triton_fused":
+        run_fn = _run_triton_fused
     else:
         raise ValueError(f"unknown provider: {provider}")
 
@@ -362,8 +363,8 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    if args.cutlass_only and "triton_full" in _LINE_VALS:
-        i = _LINE_VALS.index("triton_full")
+    if args.cutlass_only and "triton_fused" in _LINE_VALS:
+        i = _LINE_VALS.index("triton_fused")
         _LINE_VALS.pop(i)
         _LINE_NAMES.pop(i)
         _LINE_STYLES.pop(i)
@@ -394,12 +395,12 @@ if __name__ == "__main__":
         aggfunc="first",
     )
     # Compare the Triton reference against mxfp4_fused where both ran.
-    if ("ms", "mxfp4_fused") in pv.columns and ("ms", "triton_full") in pv.columns:
-        pv["speedup_vs_triton_full"] = (
-            pv[("ms", "triton_full")] / pv[("ms", "mxfp4_fused")]
+    if ("ms", "mxfp4_fused") in pv.columns and ("ms", "triton_fused") in pv.columns:
+        pv["speedup_vs_triton_fused"] = (
+            pv[("ms", "triton_fused")] / pv[("ms", "mxfp4_fused")]
         ).round(2)
-        pv["transient_saved_vs_triton_full_MB"] = (
-            pv[("peak_transient_MB", "triton_full")]
+        pv["transient_saved_vs_triton_fused_MB"] = (
+            pv[("peak_transient_MB", "triton_fused")]
             - pv[("peak_transient_MB", "mxfp4_fused")]
         ).round(2)
     print(pv.to_markdown())

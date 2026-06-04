@@ -283,6 +283,7 @@ def fused_experts(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
+    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -322,6 +323,8 @@ def fused_experts(
     - gemm1_alpha (Optional[float]): Optional gemm1_alpha for the activation
         function.
     - gemm1_limit (Optional[float]): Optional gemm1_limit for the swiglu activation
+        function.
+    - swiglu_limit (Optional[float]): Optional swiglu_limit for the swiglu activation
         function.
 
     Returns:
@@ -458,7 +461,8 @@ def fused_experts(
         (M * TopK, OutK), device=hidden_states.device, dtype=hidden_states.dtype
     )
 
-    # 0=silu, 1=gelu, 2=swiglu (silu with alpha/limit clamping for gpt-oss), 3=relu2
+    # 0=silu, 1=gelu, 2=swiglu (silu with alpha/limit clamping for gpt-oss),
+    # 3=relu2, 4=swiglu_deepseek_v4 (clamp gate/up then plain silu * up).
     if activation == "silu":
         activation_type = 0
         if gemm1_alpha is not None:
@@ -467,6 +471,22 @@ def fused_experts(
             ), "gemm1_limit must be provided when gemm1_alpha is set for swiglu for GPT-OSS"
             activation_type = 2
             activation = "swiglu_gpt_oss"
+        elif swiglu_limit is not None:
+            assert swiglu_limit == 10
+            # The fused swiglu_deepseek_v4 epilogue (activation_type=4) is only
+            # AOT-instantiated for the MXFP4 W4A16 grouped GEMM. The bf16
+            # grouped GEMM caps activation_type at RELU2 (3); routing 4 there
+            # would trip its dispatcher range check.
+            assert (
+                use_mxfp4_w4a16
+            ), "swiglu_limit (swiglu_deepseek_v4) is only supported with use_mxfp4_w4a16=True"
+            activation_type = 4
+            activation = "swiglu_deepseek_v4"
+            # The kernel ABI carries the clamp threshold in gemm1_limit (the
+            # only limit slot). The fused epilogue
+            # apply_fused_activation<SWIGLU_DEEPSEEK_V4> reads it from there;
+            # gemm1_alpha is unused for this activation.
+            gemm1_limit = float(swiglu_limit)
     elif activation == "gelu":
         activation_type = 1
     elif activation == "relu2":
@@ -476,7 +496,11 @@ def fused_experts(
 
     assert is_xe2_arch(), f"Current MoE is only supported on BMG"
 
-    gate_factor = 2 if (2 * w2.shape[2] == w1.shape[1]) else 1
+    # Gated activations (silu/gelu/swiglu) split w1's output into gate+up, so
+    # w1.shape[1] == 2*N; non-gated relu2 has w1.shape[1] == N. Compare against
+    # the recovered (unpacked) N — w2.shape[2] is the packed I/2 under MXFP4,
+    # which would mis-detect the gated case as non-gated (gate_factor=1).
+    gate_factor = 2 if (2 * N == w1.shape[1]) else 1
 
     # Heuristic for choosing fused vs unfused activation. The K*N threshold
     # mirrors the small-weight cutoff in the C++ grouped-GEMM dispatchers
@@ -523,7 +547,17 @@ def fused_experts(
                 gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
                 gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
             )
-        if activation_type == 0:
+        if activation_type in (0, 4):
+            if activation_type == 4:
+                # DeepSeek-V4 swiglu clamp, applied here on the raw gate+up
+                # projection because the unfused GEMM1 wrote it out without
+                # activation. The fused path does the same clamp in-kernel
+                # (apply_fused_activation<SWIGLU_DEEPSEEK_V4>).
+                half = w1.shape[1] // 2
+                intermediate_cache1[:, :half].clamp_(max=swiglu_limit)
+                intermediate_cache1[:, half:].clamp_(
+                    min=-swiglu_limit, max=swiglu_limit
+                )
             torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
         elif activation_type == 1:
             torch.ops.sgl_kernel.gelu_tanh_and_mul(

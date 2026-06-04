@@ -4,9 +4,10 @@ Exercises fused_experts at the exact shape a real DSV4 decode step
 produced (47 tokens, E=256, topk=6, H=4096, I=256), with N-outer
 [E, N, K/32] scales matching the sglang checkpoint convention.
 
-Golden reference is sglang's Triton fused_experts_impl on the MXFP4-xpu
-branch — the upstream path the model is already known to run correctly
-with.
+Golden reference is sglang's Triton fused_experts_impl on the DeepSeek-V4
+XPU support branch — the upstream path the model is already known to run
+correctly with. Requires sglang to be installed in the environment (see the
+project README for the XPU install recipe).
 
 Not part of the `per-commit` CI suite: the shapes are large enough
 (~800 MB resident weights) that they would slow the gate meaningfully.
@@ -17,10 +18,8 @@ Run manually:
 Or force-include via SGL_RUN_DSV4_SHAPE_TEST=1 when running the suite.
 """
 
-import importlib.machinery
 import os
 import sys
-import types
 from pathlib import Path
 
 import pytest
@@ -41,46 +40,25 @@ pytestmark = pytest.mark.skipif(
 
 
 def _import_triton_fused_experts_impl():
-    # sglang's package chain pulls flashinfer.comm (CUDA) and a DSV4 env
-    # default that asserts swiglu_limit. Stub both before importing so
-    # the reference loads on an XPU-only host. Same preamble as in
-    # benchmark/bench_fused_experts_mxfp4.py.
-    os.environ.setdefault("SGLANG_DSV4_2604_SUBMODE", "2604A")
+    """Import sglang's Triton fused_experts_impl as the golden reference.
 
-    if "flashinfer.comm" not in sys.modules:
-        fi = sys.modules.get("flashinfer") or types.ModuleType("flashinfer")
-        fi.__spec__ = importlib.machinery.ModuleSpec(
-            "flashinfer", loader=None, is_package=True
-        )
-        if not hasattr(fi, "__path__"):
-            fi.__path__ = []
-        fi_comm = types.ModuleType("flashinfer.comm")
-        fi_comm.__spec__ = importlib.machinery.ModuleSpec(
-            "flashinfer.comm", loader=None, is_package=False
-        )
+    Requires sglang (upstream main) to be installed in the environment — see
+    the project README for the XPU install recipe. The DeepSeek-V4 swiglu_limit
+    clamp lives in moe_runner/triton_utils/fused_moe.py; the older
+    fused_moe_triton tree lacks it, so this import path is required.
 
-        class _Stub:
-            def __init__(self, *a, **k):
-                pass
-
-            def __getattr__(self, n):
-                return _Stub()
-
-            def __call__(self, *a, **k):
-                return _Stub()
-
-        fi_comm.MoeAlltoAll = _Stub
-        fi_comm.moe_a2a_get_workspace_size_per_rank = _Stub
-        sys.modules["flashinfer"] = fi
-        sys.modules["flashinfer.comm"] = fi_comm
-
+    fused_experts_impl reads get_global_server_args() at call time but the
+    reference never runs under a real server, so install a minimal stub holding
+    only the flags this code path reads.
+    """
     from sglang.srt import server_args as _sa
-    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
         fused_experts_impl as _impl,
     )
 
     class _StubServerArgs:
         enable_deterministic_inference = False
+        enable_fused_moe_sum_all_reduce = False
 
     _sa._global_server_args = _StubServerArgs()
     return _impl
@@ -100,13 +78,48 @@ def _build_packed_weights(E, N, K):
     return packed, scales
 
 
-def test_fused_experts_dsv4_shape():
-    """fused_experts at the DSV4 decode shape, compared against the
-    sglang Triton reference.
+# fused_experts chooses a fused-activation vs unfused-activation GEMM1 by
+#   use_unfused_act = avg_m <= 128 and (hidden*intermediate > 4096**2)
+# where avg_m = (num_tokens*topk)//num_experts. The swiglu_deepseek_v4 clamp
+# is applied in two different places on the two paths (in-kernel epilogue vs
+# explicit clamp_ in Python), so exercise BOTH:
+#   - "fused":   real DSV4 decode shape (E=256, H=4096, I=256) -> fused path
+#   - "unfused": small E + large H*I (E=8, H=4096, I=8192)     -> unfused path
+# Both keep packed resident weights ~400 MB.
+_DSV4_SHAPES = [
+    # (name, num_tokens, num_experts, topk, hidden, intermediate)
+    ("fused", 47, 256, 6, 4096, 256),
+    ("unfused", 47, 8, 6, 4096, 8192),
+]
 
-    Reproduces the exact call sglang's fp8 apply path was making when
-    the scale-layout mismatch first surfaced. Inputs replicate the
-    observed shapes and dtypes:
+
+# swiglu_limit selects whether the DeepSeek-V4 clamp runs at all:
+#   - 10:   activation_type=4 (swiglu_deepseek_v4) — clamp gate/up then silu*up
+#   - None: activation_type=0 (plain silu_and_mul, no clamp)
+# Both values must match the Triton reference, so cross both with the two
+# activation paths (4 cases total).
+_SWIGLU_LIMITS = [10, None]
+
+
+@pytest.mark.parametrize(
+    "swiglu_limit",
+    _SWIGLU_LIMITS,
+    ids=[f"limit{lim}" for lim in _SWIGLU_LIMITS],
+)
+@pytest.mark.parametrize(
+    "name,num_tokens,num_experts,topk,hidden,intermediate",
+    _DSV4_SHAPES,
+    ids=[s[0] for s in _DSV4_SHAPES],
+)
+def test_fused_experts_dsv4_shape(
+    name, num_tokens, num_experts, topk, hidden, intermediate, swiglu_limit
+):
+    """fused_experts with/without the DeepSeek-V4 swiglu clamp, compared
+    against the sglang Triton reference.
+
+    Runs at two shapes that take the two distinct activation paths in
+    fused_experts. The "fused" shape reproduces the exact call sglang's fp8
+    apply path was making when the scale-layout mismatch first surfaced:
 
       x.shape                 = [47, 4096]       bfloat16
       w13_weight.shape        = [256, 512, 2048] int8   (E, 2*I, H/2)
@@ -115,10 +128,14 @@ def test_fused_experts_dsv4_shape():
       w2_weight_scale_inv     = [256, 4096, 8]   float32
       topk_weights.shape      = [47, 6]          float32
       topk_ids.shape          = [47, 6]          int64
-      activation='silu', routed_scaling_factor=1.5,
-      gemm1_alpha=None, gemm1_clamp_limit=None
+      activation='silu', routed_scaling_factor=1.5, swiglu_limit=10
+
+    The "unfused" shape (E=8, H=4096, I=8192) trips the unfused-activation
+    branch so the explicit Python clamp_ path is covered too.
+
+    swiglu_limit is crossed over {10, None}: 10 exercises the DSV4 clamp
+    (activation_type=4), None falls back to plain silu (activation_type=0).
     """
-    num_tokens, num_experts, topk, hidden, intermediate = 47, 256, 6, 4096, 256
     torch.manual_seed(0)
     torch.xpu.manual_seed_all(0)
 
@@ -162,16 +179,19 @@ def test_fused_experts_dsv4_shape():
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         routed_scaling_factor=routed_scaling_factor,
+        swiglu_limit=swiglu_limit,
     )
 
     assert out_sgl.shape == (num_tokens, hidden)
     assert out_sgl.dtype == torch.bfloat16
     assert torch.isfinite(out_sgl).all(), "sgl_kernel output has non-finite values"
 
-    # Golden reference: sglang Triton fused_experts_impl on the MXFP4-xpu
-    # branch. use_fp8_w8a8=True triggers _is_mxfp4_xpu_packed which routes
-    # the int8-packed weights through the MXFP4 dequant-then-fused-moe path.
-    # Triton fused_moe kernel expects int32 topk_ids.
+    # Golden reference: sglang Triton fused_experts_impl on the DeepSeek-V4
+    # XPU support branch. use_fp8_w8a8=True is what the DSv4 fp8 loader passes
+    # for MXFP4 routed experts; _is_mxfp4_xpu_packed then detects the packed
+    # weights (uint8/int8 + scales, last dim == hidden/2) and routes them
+    # through the Triton MXFP4 upcast-then-fused-moe path. Triton's fused_moe
+    # kernel expects int32 topk_ids.
     triton_fused_experts_impl = _import_triton_fused_experts_impl()
     out_triton = triton_fused_experts_impl(
         a,
@@ -193,6 +213,7 @@ def test_fused_experts_dsv4_shape():
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         routed_scaling_factor=routed_scaling_factor,
+        swiglu_limit=swiglu_limit,
     )
 
     assert out_triton.shape == out_sgl.shape

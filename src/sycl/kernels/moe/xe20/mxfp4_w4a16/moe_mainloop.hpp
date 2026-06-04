@@ -62,6 +62,10 @@ using namespace cute;
 inline constexpr int SILU = moe_xe20::ACT_SILU;
 inline constexpr int GELU = moe_xe20::ACT_GELU;
 inline constexpr int SWIGLU_GPT_OSS = moe_xe20::ACT_SWIGLU_GPT_OSS;
+// DeepSeek-V4 swiglu uses the default block-split gate/up weight layout
+// (first N/2 rows = gate, last N/2 = up), same as SILU — only the fused
+// epilogue formula differs (see common/activation.hpp).
+inline constexpr int SWIGLU_DEEPSEEK_V4 = moe_xe20::ACT_SWIGLU_DEEPSEEK_V4;
 
 // MXFP4 invariant: one scale value per 32 consecutive K-elements.
 static constexpr int MXFP4_GROUP_SIZE = 32;

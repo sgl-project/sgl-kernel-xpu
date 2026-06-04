@@ -63,16 +63,21 @@ using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
       float);
 
 // TEMPORARY L0-module-pressure workaround: declare only the instantiations
-// that GroupGemmMxfp4W4A16Xe20.cmake actually emits (ActType=0 silu, WithBias=false).
-// The dispatcher below enforces the same constraint at runtime. Keep the
-// two sides in sync.
-DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_8_64_32, SG_1_4_1, 0, true, false)
-DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_8_64_32, SG_1_4_1, 0, false, false)
-DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_128_64_32, SG_4_2_1, 0, true, false)
-DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_128_128_32, SG_4_2_1, 0, false, false)
-DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_256_64_32, SG_8_2_1, 0, true, false)
-DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_256_256_32, SG_8_4_1, 0, false, false)
+// that GroupGemmMxfp4W4A16Xe20.cmake actually emits (ActType=0 silu and
+// ActType=4 swiglu_deepseek_v4, WithBias=false). The dispatcher below enforces
+// the same constraint at runtime. Keep the two sides in sync.
+#define DECLARE_XE20_MOE_MXFP4_TILES(ActType)                              \
+  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_8_64_32, SG_1_4_1, ActType, true, false)   \
+  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_8_64_32, SG_1_4_1, ActType, false, false)  \
+  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_128_64_32, SG_4_2_1, ActType, true, false) \
+  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_128_128_32, SG_4_2_1, ActType, false, false) \
+  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_256_64_32, SG_8_2_1, ActType, true, false) \
+  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_256_256_32, SG_8_4_1, ActType, false, false)
 
+DECLARE_XE20_MOE_MXFP4_TILES(0)
+DECLARE_XE20_MOE_MXFP4_TILES(4)
+
+#undef DECLARE_XE20_MOE_MXFP4_TILES
 #undef DECLARE_XE20_MOE_MXFP4_EXTERN
 
 #define LAUNCH_MOE_MXFP4(...)                      \
@@ -92,15 +97,24 @@ DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_256_256_32, SG_8_4_1, 0, false, false)
       static_cast<float>(gemm1_limit))
 
 // TEMPORARY: matching prune for the cmake-side instantiation matrix above.
-// Only ActType=0 (silu) and WithBias=false are instantiated, so the dispatch
-// hard-codes those values rather than template-branching on runtime inputs.
-// Callers that need the other combos will hit the TORCH_CHECK below and must
-// restore the full matrix before rebuilding.
+// Only ActType ∈ {0 silu, 4 swiglu_deepseek_v4} and WithBias=false are
+// instantiated, so the dispatch branches over just those values rather than
+// the full activation set. Callers that need the other combos will hit the
+// TORCH_CHECK below and must restore the full matrix before rebuilding.
+#define LAUNCH_MOE_MXFP4_ACT(ActTypeLit, FuseAct, ...) \
+  do {                                                 \
+    if (FuseAct) {                                     \
+      LAUNCH_MOE_MXFP4(__VA_ARGS__, ActTypeLit, true, false);  \
+    } else {                                           \
+      LAUNCH_MOE_MXFP4(__VA_ARGS__, ActTypeLit, false, false); \
+    }                                                  \
+  } while (0)
+
 #define DISPATCH_MOE_MXFP4(ActType, FuseAct, WithBias, ...)                                                     \
   do {                                                                                                          \
     TORCH_CHECK(                                                                                                \
-        (ActType) == 0,                                                                                         \
-        "mxfp4 fused kernel built with ActType=0 (silu) only; got ActType=",                                    \
+        (ActType) == 0 || (ActType) == 4,                                                                       \
+        "mxfp4 fused kernel built with ActType=0 (silu) and ActType=4 (swiglu_deepseek_v4) only; got ActType=", \
         (ActType),                                                                                              \
         ". The AOT instantiation matrix is pruned to keep Level Zero module pressure in budget under TP>1 — " \
         "see src/GroupGemmMxfp4W4A16Xe20.cmake to re-enable additional ActType/WithBias combos.");              \
@@ -109,10 +123,10 @@ DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_256_256_32, SG_8_4_1, 0, false, false)
         "mxfp4 fused kernel built with WithBias=false only; bias path unsupported in this build. "              \
         "The AOT instantiation matrix is pruned to keep Level Zero module pressure in budget under TP>1 — "   \
         "see src/GroupGemmMxfp4W4A16Xe20.cmake to re-enable additional ActType/WithBias combos.");              \
-    if (FuseAct) {                                                                                              \
-      LAUNCH_MOE_MXFP4(__VA_ARGS__, 0, true, false);                                                            \
+    if ((ActType) == 4) {                                                                                       \
+      LAUNCH_MOE_MXFP4_ACT(4, FuseAct, __VA_ARGS__);                                                            \
     } else {                                                                                                    \
-      LAUNCH_MOE_MXFP4(__VA_ARGS__, 0, false, false);                                                           \
+      LAUNCH_MOE_MXFP4_ACT(0, FuseAct, __VA_ARGS__);                                                            \
     }                                                                                                           \
   } while (0)
 

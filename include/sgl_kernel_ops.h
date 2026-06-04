@@ -191,8 +191,8 @@ void fused_qk_rope_with_cos_sin_cache_inplace(
 void multimodal_rotary_embedding(
     at::Tensor& query,
     at::Tensor& key,
-    at::Tensor& cos_sin_cache,
-    at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& positions,
     const std::vector<int64_t>& mrope_section,
     int64_t head_size,
     int64_t rotary_dim,

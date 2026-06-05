@@ -66,12 +66,12 @@ using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
 // that GroupGemmMxfp4W4A16Xe20.cmake actually emits (ActType=0 silu and
 // ActType=4 swiglu_deepseek_v4, WithBias=false). The dispatcher below enforces
 // the same constraint at runtime. Keep the two sides in sync.
-#define DECLARE_XE20_MOE_MXFP4_TILES(ActType)                              \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_8_64_32, SG_1_4_1, ActType, true, false)   \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_8_64_32, SG_1_4_1, ActType, false, false)  \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_128_64_32, SG_4_2_1, ActType, true, false) \
+#define DECLARE_XE20_MOE_MXFP4_TILES(ActType)                                     \
+  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_8_64_32, SG_1_4_1, ActType, true, false)     \
+  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_8_64_32, SG_1_4_1, ActType, false, false)    \
+  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_128_64_32, SG_4_2_1, ActType, true, false)   \
   DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_128_128_32, SG_4_2_1, ActType, false, false) \
-  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_256_64_32, SG_8_2_1, ActType, true, false) \
+  DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_256_64_32, SG_8_2_1, ActType, true, false)   \
   DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_256_256_32, SG_8_4_1, ActType, false, false)
 
 DECLARE_XE20_MOE_MXFP4_TILES(0)
@@ -101,13 +101,13 @@ DECLARE_XE20_MOE_MXFP4_TILES(4)
 // instantiated, so the dispatch branches over just those values rather than
 // the full activation set. Callers that need the other combos will hit the
 // TORCH_CHECK below and must restore the full matrix before rebuilding.
-#define LAUNCH_MOE_MXFP4_ACT(ActTypeLit, FuseAct, ...) \
-  do {                                                 \
-    if (FuseAct) {                                     \
+#define LAUNCH_MOE_MXFP4_ACT(ActTypeLit, FuseAct, ...)         \
+  do {                                                         \
+    if (FuseAct) {                                             \
       LAUNCH_MOE_MXFP4(__VA_ARGS__, ActTypeLit, true, false);  \
-    } else {                                           \
+    } else {                                                   \
       LAUNCH_MOE_MXFP4(__VA_ARGS__, ActTypeLit, false, false); \
-    }                                                  \
+    }                                                          \
   } while (0)
 
 #define DISPATCH_MOE_MXFP4(ActType, FuseAct, WithBias, ...)                                                     \

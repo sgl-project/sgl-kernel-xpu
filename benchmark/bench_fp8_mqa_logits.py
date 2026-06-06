@@ -19,7 +19,7 @@ def make_fp8_tensor(shape, device="xpu"):
 
 
 def make_kv_cache(num_pages, page_size, D, device="xpu"):
-    """Build a KV cache with random FP8 keys and float32 scales.
+    """Build a KV cache with random FP8 keys and per-token float32 scales.
     KV cache is uint8 because each token packs 128 bytes of FP8 key data + 4 bytes of float32 scale (132 bytes total).
     Since it mixes two dtypes, uint8 is the only representation — this matches the real NSA KV cache format.
     """
@@ -31,10 +31,11 @@ def make_kv_cache(num_pages, page_size, D, device="xpu"):
         k_fp8 = torch.randn(page_size, D, dtype=torch.float32) * 0.5
         k_fp8 = k_fp8.to(torch.float8_e4m3fn).view(torch.uint8)
         kv[p, :, 0, :D] = k_fp8
-        scale = 0.5 + torch.rand(1).item()
-        scale_bytes = struct.pack("<f", scale)
-        for i, b in enumerate(scale_bytes):
-            kv[p, :, 0, D + i] = b
+        for t in range(page_size):
+            scale = 0.5 + torch.rand(1).item()
+            scale_bytes = struct.pack("<f", scale)
+            for i, b in enumerate(scale_bytes):
+                kv[p, t, 0, D + i] = b
     return kv.to(device)
 
 

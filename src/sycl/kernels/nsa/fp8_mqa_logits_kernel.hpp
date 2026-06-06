@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <sycl/sycl.hpp>
 
 namespace nsa {
@@ -51,7 +52,9 @@ inline float fp8_e4m3_to_float(uint8_t val) {
 inline float load_le_f32(const uint8_t* p) {
   uint32_t bits = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
                   (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
-  return *reinterpret_cast<const float*>(&bits);
+  float result;
+  std::memcpy(&result, &bits, sizeof(float));
+  return result;
 }
 
 // FP8 MQA logits kernel (prefill/extend path — naive fallback)

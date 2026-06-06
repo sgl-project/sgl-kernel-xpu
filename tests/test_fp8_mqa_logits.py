@@ -274,7 +274,7 @@ def test_fp8_paged_mqa_logits_noncontiguous_pages():
 
 
 def test_python_wrapper():
-    """Test the Python wrapper (nsa.py) interface."""
+    """Test the Python wrapper (nsa.py) interface with numerical correctness."""
     from sgl_kernel.nsa import fp8_mqa_logits, fp8_paged_mqa_logits  # noqa: F811
 
     device = "xpu"
@@ -292,6 +292,33 @@ def test_python_wrapper():
     )
     assert logits.shape == (Nq, Nk)
     assert logits.dtype == torch.float32
+
+    # Verify numerical correctness against reference
+    ref = reference_fp8_mqa_logits(q, k, k_scale, weights, ks, ke)
+    torch.testing.assert_close(logits.cpu(), ref.cpu(), rtol=2e-3, atol=0.1)
+
+    # Also test paged wrapper shape/dtype (full correctness tested in paged tests)
+    page_size = 1
+    num_pages = Nk
+    B = 1
+    kv_cache = make_kv_cache(num_pages, page_size, D, device)
+    seq_lens = torch.tensor([Nk], dtype=torch.int32, device=device)
+    block_tables = torch.arange(num_pages, dtype=torch.int32, device=device).unsqueeze(
+        0
+    )
+    q_paged = make_fp8_tensor((B, 1, H, D), device)
+    w_paged = torch.ones(B, H, dtype=torch.float32, device=device)
+    paged_logits = fp8_paged_mqa_logits(
+        q_paged.view(torch.uint8),
+        kv_cache,
+        w_paged,
+        seq_lens,
+        block_tables,
+        None,
+        Nk,
+    )
+    assert paged_logits.shape == (B, Nk)
+    assert paged_logits.dtype == torch.float32
 
 
 if __name__ == "__main__":

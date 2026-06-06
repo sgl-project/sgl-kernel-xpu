@@ -170,6 +170,11 @@ torch::Tensor fp8_paged_mqa_logits(
   TORCH_CHECK(kv_cache.dim() == 4, "kv_cache must be 4D");
   TORCH_CHECK(q_fp8.scalar_type() == at::kByte, "q_fp8 must be uint8 (FP8 e4m3)");
   TORCH_CHECK(kv_cache.scalar_type() == at::kByte, "kv_cache must be uint8");
+  // schedule_metadata is accepted for API compatibility with DeepGEMM but not
+  // used on XPU — scheduling is handled internally by the SYCL runtime.
+  if (schedule_metadata.has_value()) {
+    TORCH_WARN_ONCE("fp8_paged_mqa_logits: schedule_metadata is ignored on XPU");
+  }
 
   int B_next = q_fp8.size(0);
   int H = q_fp8.size(2);
@@ -179,10 +184,9 @@ torch::Tensor fp8_paged_mqa_logits(
   int max_num_blocks = block_tables.size(1);
   int msl = static_cast<int>(max_seq_len);
 
-  // Use torch::zeros when clean_logits is requested (out-of-range positions = 0),
-  // torch::empty otherwise (out-of-range positions are undefined).
-  auto logits = clean_logits ? torch::zeros({B_next, msl}, torch::dtype(torch::kFloat32).device(q_fp8.device()))
-                             : torch::empty({B_next, msl}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
+  // Always zero-initialize: the cost is negligible relative to GEMM, and
+  // uninitialized out-of-range positions are a footgun for callers.
+  auto logits = torch::zeros({B_next, msl}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
   if (B_next == 0 || msl == 0) return logits;
 
   auto seq_lens_flat = seq_lens.dim() == 2 ? seq_lens.contiguous().view({-1}) : seq_lens.contiguous();

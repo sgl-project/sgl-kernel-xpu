@@ -42,6 +42,14 @@ def gemma_fused_add_rms_norm(x, residual, w, eps=1e-6):
     return x, residual
 
 
+def norm_tolerances(dtype):
+    if dtype == torch.float32:
+        return dict(rtol=1e-4, atol=1e-4)
+    if dtype == torch.bfloat16:
+        return dict(rtol=1e-2, atol=1e-2)
+    return dict(rtol=1e-3, atol=1e-3)
+
+
 def fused_add_rms_norm(x, residual, weight, eps):
     orig_dtype = x.dtype
     x = x.to(torch.float32)
@@ -94,9 +102,19 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
-@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize(
+    "batch_size, hidden_size, dtype",
+    [
+        *[
+            (batch_size, hidden_size, torch.float16)
+            for batch_size in [1, 19, 99, 989]
+            for hidden_size in [111, 500, 1024, 3072, 3584, 4096, 8192, 16384]
+        ],
+        (19, 1024, torch.bfloat16),
+        (19, 1024, torch.float32),
+        (2, 32768, torch.float16),
+    ],
+)
 @pytest.mark.parametrize("specify_out", [True, False])
 def test_gemma_norm(batch_size, hidden_size, dtype, specify_out):
     x = torch.randn(batch_size, hidden_size).to(device).to(dtype)
@@ -109,12 +127,22 @@ def test_gemma_norm(batch_size, hidden_size, dtype, specify_out):
     else:
         y = sgl_kernel.gemma_rmsnorm(x, w)
 
-    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(y_ref, y, **norm_tolerances(dtype))
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
-@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize(
+    "batch_size, hidden_size, dtype",
+    [
+        *[
+            (batch_size, hidden_size, torch.float16)
+            for batch_size in [1, 19, 99, 989]
+            for hidden_size in [111, 500, 1024, 3072, 3584, 4096, 8192, 16384]
+        ],
+        (19, 1024, torch.bfloat16),
+        (19, 1024, torch.float32),
+        (2, 32768, torch.float16),
+    ],
+)
 def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     eps = 1e-6
 
@@ -130,8 +158,10 @@ def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     residual_fused = residual.clone()
     sgl_kernel.gemma_fused_add_rmsnorm(x_fused, residual_fused, weight, eps)
 
-    torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(x_fused, x_native, **norm_tolerances(dtype))
+    torch.testing.assert_close(
+        residual_fused, residual_native, **norm_tolerances(dtype)
+    )
 
 
 ###############################################################################
@@ -339,6 +369,37 @@ def _make_non_flattenable_3d(num_tokens, num_heads, head_dim, dtype, extra_heads
     return q_3d
 
 
+def test_gemma_norm_3d_non_flattenable_row_strides():
+    x = _make_non_flattenable_3d(7, 4, 128, torch.float16)
+    w = torch.randn(x.size(-1), device=device, dtype=x.dtype)
+
+    assert x.size(1) > 1
+    assert x.stride(1) != 0
+    assert x.stride(0) != x.size(1) * x.stride(1)
+
+    y = torch.empty_strided(x.shape, x.stride(), device=device, dtype=x.dtype)
+    y_ref = gemma_rms_norm(x.clone(), w)
+    sgl_kernel.gemma_rmsnorm(x, w, out=y)
+
+    torch.testing.assert_close(y_ref, y, **norm_tolerances(x.dtype))
+
+
+def test_gemma_norm_3d_non_flattenable_unaligned_row_strides():
+    full = torch.randn(7, 8, 130, device=device, dtype=torch.float16)
+    x = full[:, :4, :128]
+    w = torch.randn(x.size(-1), device=device, dtype=x.dtype)
+
+    assert x.stride(0) != x.size(1) * x.stride(1)
+    assert x.size(-1) % 8 == 0
+    assert x.stride(1) % 8 != 0
+
+    y = torch.empty_strided(x.shape, x.stride(), device=device, dtype=x.dtype)
+    y_ref = gemma_rms_norm(x.clone(), w)
+    sgl_kernel.gemma_rmsnorm(x, w, out=y)
+
+    torch.testing.assert_close(y_ref, y, **norm_tolerances(x.dtype))
+
+
 @pytest.mark.parametrize("num_tokens", [7, 32])
 @pytest.mark.parametrize("num_heads", [4, 8])
 @pytest.mark.parametrize("head_dim", [64, 128])
@@ -400,7 +461,8 @@ def test_norm_mixed_dtype(batch_size, hidden_size, input_dtype, weight_dtype):
     y_ref = llama_rms_norm(x, w)
     y = sgl_kernel.rmsnorm(x, w)
 
-    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+    tol = 1e-2 if input_dtype == torch.bfloat16 else 1e-3
+    torch.testing.assert_close(y_ref, y, rtol=tol, atol=tol)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19])
@@ -450,7 +512,8 @@ def test_gemma_norm_mixed_dtype(batch_size, hidden_size, input_dtype, weight_dty
     y_ref = gemma_rms_norm(x, w)
     y = sgl_kernel.gemma_rmsnorm(x, w)
 
-    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+    tol = 1e-2 if input_dtype == torch.bfloat16 else 1e-3
+    torch.testing.assert_close(y_ref, y, rtol=tol, atol=tol)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19])

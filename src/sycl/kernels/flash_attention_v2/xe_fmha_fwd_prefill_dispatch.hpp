@@ -38,11 +38,12 @@ namespace prefill {
 // in separate translation units (generated from the .cpp.in templates).
 //
 // Parameters:
-//   HEAD_DIM in {64, 96, 128, 192, 256, 512}
+//   HEAD_DIM in {64, 72, 96, 128, 192, 256, 512}
 
 #define EXTERN_FMHA_PREFILL_RUNNER(HD) extern template struct FmhaPrefillRunner<HD>;
 
 EXTERN_FMHA_PREFILL_RUNNER(64)
+EXTERN_FMHA_PREFILL_RUNNER(72)
 EXTERN_FMHA_PREFILL_RUNNER(96)
 EXTERN_FMHA_PREFILL_RUNNER(128)
 EXTERN_FMHA_PREFILL_RUNNER(192)

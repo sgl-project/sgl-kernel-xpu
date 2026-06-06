@@ -296,8 +296,16 @@ struct PrefillRunner {
             stride_K_cache,
             static_cast<const ElementV*>(params.v_ptr),
             stride_V_cache,
+            static_cast<const typename FMHAPrefillKernel::ElementSink*>(params.softmax_sink_ptr),
         },
-        {params.softmax_scale, params.page_table, params.page_size, params.max_num_pages_per_seq},
+        {
+            params.softmax_scale,
+            params.page_table,
+            params.page_size,
+            params.max_num_pages_per_seq,
+            params.window_size_left,
+            params.window_size_right,
+        },
         {},
         hw_info};
 
@@ -407,11 +415,12 @@ struct FMHAConfig {
         GmemTiledCopyK,
         GmemTiledCopyV,
         GmemTiledCopyK_cache,
-        GmemTiledCopyV_cache>;
+        GmemTiledCopyV_cache,
+        LocalMask>;
 
     // Epilogue
     using CollectiveEpilogue =
-        cutlass::fmha::collective::FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO>;
+        cutlass::fmha::collective::FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, Sink>;
 
     static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
     using FMHAPrefillKernel = conditional_t<

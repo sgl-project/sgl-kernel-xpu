@@ -40,6 +40,7 @@ compute_freq_yarn_rope(float log2_base, int rotary_dim, int half_dim, float fact
 
 template <bool interleave>
 struct QKNormRopePostOp {
+  static constexpr bool needs_staging = true;
   const int* position_ids;
   float log2_base;
   float factor;
@@ -56,19 +57,14 @@ struct QKNormRopePostOp {
     const int target_lane = tile_offset / vec_size;
     const int value_index = tile_offset - target_lane * vec_size;
 
-    accscalar_t value = elements[tile][value_index];
-    if (target_lane != lane_id) {
-      value = sycl::permute_group_by_xor(sg, value, lane_id ^ target_lane);
-    }
-    return value;
+    const accscalar_t value = elements[tile][value_index];
+    // Always call permute_group_by_xor for SYCL spec compliance (all lanes must participate).
+    // When target_lane == lane_id the XOR mask is 0, so each lane receives its own value.
+    return sycl::permute_group_by_xor(sg, value, lane_id ^ target_lane);
   }
 
   template <typename accscalar_t, int num_tiles, int vec_size, int head_dim>
-  void apply_full_interleave(
-      accscalar_t (&elements)[num_tiles][vec_size],
-      accscalar_t (&original)[num_tiles][vec_size],
-      int lane_id,
-      float pos_id) const {
+  void apply_full_interleave(accscalar_t (&elements)[num_tiles][vec_size], int lane_id, float pos_id) const {
     const accscalar_t scale = static_cast<accscalar_t>(attention_factor);
 #pragma unroll
     for (int tile = 0; tile < num_tiles; ++tile) {
@@ -79,8 +75,9 @@ struct QKNormRopePostOp {
         const float theta = pos_id * freq;
         const accscalar_t sin_val = static_cast<accscalar_t>(sycl::native::sin(theta));
         const accscalar_t cos_val = static_cast<accscalar_t>(sycl::native::cos(theta));
-        const accscalar_t x0 = original[tile][v];
-        const accscalar_t x1 = original[tile][v + 1];
+        // Read both elements before writing either; v and v+1 are a pair processed atomically.
+        const accscalar_t x0 = elements[tile][v];
+        const accscalar_t x1 = elements[tile][v + 1];
         elements[tile][v] = (x0 * cos_val - x1 * sin_val) * scale;
         elements[tile][v + 1] = (x1 * cos_val + x0 * sin_val) * scale;
       }
@@ -88,83 +85,114 @@ struct QKNormRopePostOp {
   }
 
   template <typename accscalar_t, int num_tiles, int vec_size, int head_dim>
-  void apply_full_neox(
-      accscalar_t (&elements)[num_tiles][vec_size],
-      accscalar_t (&original)[num_tiles][vec_size],
-      sycl::sub_group sg,
-      int lane_id,
-      float pos_id) const {
+  void
+  apply_full_neox(accscalar_t (&elements)[num_tiles][vec_size], sycl::sub_group sg, int lane_id, float pos_id) const {
     constexpr int half_rotary_dim = head_dim / 2;
     constexpr int tile_width = NUM_REDUCE_STAGES * vec_size;
     constexpr int lane_xor = (half_rotary_dim / vec_size) % NUM_REDUCE_STAGES;
     constexpr int tile_delta = half_rotary_dim / tile_width;
     const accscalar_t scale = static_cast<accscalar_t>(attention_factor);
 
+    if constexpr (half_rotary_dim % tile_width == 0) {
+      // Tile-delta path: each pair (dim, dim+half_rotary_dim) lives in two different tiles
+      // of the SAME lane.  Process both tiles together so no copy of elements is needed
+      // and the shared sin/cos is computed only once per pair.
+      // tile_delta == num_tiles / 2 when half_rotary_dim % tile_width == 0.
 #pragma unroll
-    for (int tile = 0; tile < num_tiles; ++tile) {
+      for (int tile = 0; tile < tile_delta; ++tile) {
+        const int paired_tile = tile + tile_delta;
 #pragma unroll
-      for (int v = 0; v < vec_size; ++v) {
-        const int dim = (tile * NUM_REDUCE_STAGES + lane_id) * vec_size + v;
-        const bool first_half = dim < half_rotary_dim;
-        accscalar_t rotated;
-        if constexpr (half_rotary_dim % tile_width == 0) {
-          rotated = original[first_half ? tile + tile_delta : tile - tile_delta][v];
-        } else {
-          rotated = sycl::permute_group_by_xor(sg, original[tile][v], lane_xor);
+        for (int v = 0; v < vec_size; ++v) {
+          const int dim = (tile * NUM_REDUCE_STAGES + lane_id) * vec_size + v;
+          // dim is in the first half; dim + half_rotary_dim is in the second half.
+          const accscalar_t xa = elements[tile][v];
+          const accscalar_t xb = elements[paired_tile][v];
+          const int freq_dim = (dim * 2) % head_dim;  // same for dim and dim+half_rotary_dim
+          const float freq = compute_freq_yarn_rope(log2_base, head_dim, freq_dim / 2, factor, low, high);
+          const float theta = pos_id * freq;
+          const accscalar_t sin_val = static_cast<accscalar_t>(sycl::native::sin(theta));
+          const accscalar_t cos_val = static_cast<accscalar_t>(sycl::native::cos(theta));
+          // first half:  x*cos + (-xb)*sin
+          // second half: x*cos + xa*sin
+          elements[tile][v] = (xa * cos_val - xb * sin_val) * scale;
+          elements[paired_tile][v] = (xb * cos_val + xa * sin_val) * scale;
         }
-        if (first_half) {
-          rotated = -rotated;
+      }
+    } else {
+      // XOR-shuffle path: paired elements are in different lanes of the SAME tile.
+      // The shuffle reads all lanes' values simultaneously before any write, so
+      // elements can be used directly without a copy.
+#pragma unroll
+      for (int tile = 0; tile < num_tiles; ++tile) {
+#pragma unroll
+        for (int v = 0; v < vec_size; ++v) {
+          const int dim = (tile * NUM_REDUCE_STAGES + lane_id) * vec_size + v;
+          const bool first_half = dim < half_rotary_dim;
+          // Shuffle reads all lanes' values before this lane writes.
+          const accscalar_t xb = sycl::permute_group_by_xor(sg, elements[tile][v], lane_xor);
+          const accscalar_t rotated = first_half ? -xb : xb;
+          const int freq_dim = (dim * 2) % head_dim;
+          const float freq = compute_freq_yarn_rope(log2_base, head_dim, freq_dim / 2, factor, low, high);
+          const float theta = pos_id * freq;
+          const accscalar_t sin_val = static_cast<accscalar_t>(sycl::native::sin(theta));
+          const accscalar_t cos_val = static_cast<accscalar_t>(sycl::native::cos(theta));
+          const accscalar_t x = elements[tile][v];
+          elements[tile][v] = (x * cos_val + rotated * sin_val) * scale;
         }
-
-        const int freq_dim = (dim * 2) % head_dim;
-        const float freq = compute_freq_yarn_rope(log2_base, head_dim, freq_dim / 2, factor, low, high);
-        const float theta = pos_id * freq;
-        const accscalar_t sin_val = static_cast<accscalar_t>(sycl::native::sin(theta));
-        const accscalar_t cos_val = static_cast<accscalar_t>(sycl::native::cos(theta));
-        const accscalar_t x = original[tile][v];
-        elements[tile][v] = (x * cos_val + rotated * sin_val) * scale;
       }
     }
   }
 
   template <typename accscalar_t, int num_tiles, int vec_size, int head_dim>
-  void apply_generic(
-      accscalar_t (&elements)[num_tiles][vec_size],
-      accscalar_t (&original)[num_tiles][vec_size],
-      sycl::sub_group sg,
-      int lane_id,
-      float pos_id) const {
+  void
+  apply_generic(accscalar_t (&elements)[num_tiles][vec_size], sycl::sub_group sg, int lane_id, float pos_id) const {
     const accscalar_t scale = static_cast<accscalar_t>(attention_factor);
+    // A copy is required: for neox partial-rotary the second-half elements read their
+    // paired dim from the first half, which may have been written in an earlier tile
+    // iteration.  (Interleave and xor-neox fast paths avoid this cost.)
+    accscalar_t original[num_tiles][vec_size];
+#pragma unroll
+    for (int tile = 0; tile < num_tiles; ++tile) {
+#pragma unroll
+      for (int v = 0; v < vec_size; ++v) {
+        original[tile][v] = elements[tile][v];
+      }
+    }
+
 #pragma unroll
     for (int tile = 0; tile < num_tiles; ++tile) {
 #pragma unroll
       for (int v = 0; v < vec_size; ++v) {
         const int dim = (tile * NUM_REDUCE_STAGES + lane_id) * vec_size + v;
-        if (dim < rotary_dim) {
-          const accscalar_t x = original[tile][v];
-          accscalar_t rotated;
-          int half_dim;
+        const bool in_rotary = (dim < rotary_dim);
+        int paired_dim;
+        int half_dim;
+        bool negate;
 
-          if constexpr (interleave) {
-            const int paired_dim = dim ^ 1;
-            rotated = load_dim<accscalar_t, num_tiles, vec_size, head_dim>(original, sg, lane_id, paired_dim);
-            if ((dim & 1) == 0) {
-              rotated = -rotated;
-            }
-            half_dim = dim / 2;
-          } else {
-            const int half_rotary_dim = rotary_dim / 2;
-            const bool first_half = dim < half_rotary_dim;
-            const int paired_dim = first_half ? dim + half_rotary_dim : dim - half_rotary_dim;
-            rotated = load_dim<accscalar_t, num_tiles, vec_size, head_dim>(original, sg, lane_id, paired_dim);
-            if (first_half) {
-              rotated = -rotated;
-            }
+        if constexpr (interleave) {
+          // Use dim itself as a dummy paired_dim for out-of-rotary lanes so that
+          // load_dim's group shuffle is called unconditionally by all lanes
+          // (SYCL spec requires all work-items to participate in group operations).
+          paired_dim = in_rotary ? (dim ^ 1) : dim;
+          negate = in_rotary && ((dim & 1) == 0);
+          half_dim = dim / 2;
+        } else {
+          const int half_rotary_dim = rotary_dim / 2;
+          const bool first_half = dim < half_rotary_dim;
+          paired_dim = in_rotary ? (first_half ? dim + half_rotary_dim : dim - half_rotary_dim) : dim;
+          negate = in_rotary && first_half;
+          const int freq_dim = (dim * 2) % rotary_dim;
+          half_dim = freq_dim / 2;
+        }
 
-            const int freq_dim = (dim * 2) % rotary_dim;
-            half_dim = freq_dim / 2;
+        // Always call load_dim so all lanes participate in the group shuffle.
+        accscalar_t rotated = load_dim<accscalar_t, num_tiles, vec_size, head_dim>(original, sg, lane_id, paired_dim);
+
+        if (in_rotary) {
+          if (negate) {
+            rotated = -rotated;
           }
-
+          const accscalar_t x = original[tile][v];
           const float freq = compute_freq_yarn_rope(log2_base, rotary_dim, half_dim, factor, low, high);
           const float theta = pos_id * freq;
           const accscalar_t sin_val = static_cast<accscalar_t>(sycl::native::sin(theta));
@@ -188,26 +216,52 @@ struct QKNormRopePostOp {
     const int lane_id = static_cast<int>(lane_id_value);
     const float pos_id = static_cast<float>(position_ids[token_id]);
 
-    accscalar_t original[num_tiles][vec_size];
-#pragma unroll
-    for (int tile = 0; tile < num_tiles; ++tile) {
-#pragma unroll
-      for (int v = 0; v < vec_size; ++v) {
-        original[tile][v] = elements[tile][v];
-      }
-    }
-
     if (rotary_dim == head_dim) {
       if constexpr (interleave && vec_size % 2 == 0) {
-        apply_full_interleave<accscalar_t, num_tiles, vec_size, head_dim>(elements, original, lane_id, pos_id);
+        apply_full_interleave<accscalar_t, num_tiles, vec_size, head_dim>(elements, lane_id, pos_id);
       } else if constexpr (!interleave) {
-        apply_full_neox<accscalar_t, num_tiles, vec_size, head_dim>(elements, original, sg, lane_id, pos_id);
+        apply_full_neox<accscalar_t, num_tiles, vec_size, head_dim>(elements, sg, lane_id, pos_id);
       } else {
-        apply_generic<accscalar_t, num_tiles, vec_size, head_dim>(elements, original, sg, lane_id, pos_id);
+        apply_generic<accscalar_t, num_tiles, vec_size, head_dim>(elements, sg, lane_id, pos_id);
       }
     } else {
-      apply_generic<accscalar_t, num_tiles, vec_size, head_dim>(elements, original, sg, lane_id, pos_id);
+      apply_generic<accscalar_t, num_tiles, vec_size, head_dim>(elements, sg, lane_id, pos_id);
     }
+  }
+
+  // CTA path: the full normalized head lives in `head` (shared local memory), so paired
+  // RoPE dimensions are read directly instead of via sub-group shuffles. Works for any head size.
+  template <typename accscalar_t, typename HeadT>
+  accscalar_t apply_cta(const HeadT& head, int dim, int64_t token_id) const {
+    const accscalar_t x = head[dim];
+    if (dim >= rotary_dim) {
+      return x;
+    }
+    const float pos_id = static_cast<float>(position_ids[token_id]);
+    int paired_dim;
+    int half_dim;
+    bool negate;
+    if constexpr (interleave) {
+      paired_dim = dim ^ 1;
+      negate = ((dim & 1) == 0);
+      half_dim = dim / 2;
+    } else {
+      const int half_rotary_dim = rotary_dim / 2;
+      const bool first_half = dim < half_rotary_dim;
+      paired_dim = first_half ? dim + half_rotary_dim : dim - half_rotary_dim;
+      negate = first_half;
+      const int freq_dim = (dim * 2) % rotary_dim;
+      half_dim = freq_dim / 2;
+    }
+    accscalar_t rotated = head[paired_dim];
+    if (negate) {
+      rotated = -rotated;
+    }
+    const float freq = compute_freq_yarn_rope(log2_base, rotary_dim, half_dim, factor, low, high);
+    const float theta = pos_id * freq;
+    const accscalar_t sin_val = static_cast<accscalar_t>(sycl::native::sin(theta));
+    const accscalar_t cos_val = static_cast<accscalar_t>(sycl::native::cos(theta));
+    return (x * cos_val + rotated * sin_val) * static_cast<accscalar_t>(attention_factor);
   }
 };
 
@@ -268,7 +322,14 @@ void launch_fused_qk_norm_rope_core(
 
   const int vec_size =
       qknorm::vec_size<scalar_t, weight_t>(layout, qknorm::max_vec_size<scalar_t>(), NUM_REDUCE_STAGES);
-  validate_rotary_for_vec_size(head_dim, rotary_dim, !interleave, vec_size);
+  const bool is_warp = (head_dim == 64 || head_dim == 128 || head_dim == 256);
+  if (is_warp) {
+    validate_rotary_for_vec_size(head_dim, rotary_dim, !interleave, vec_size);
+  } else {
+    TORCH_CHECK(
+        rotary_dim > 0 && rotary_dim <= head_dim, op_name, ": rotary_dim must be in (0, head_dim], got ", rotary_dim);
+    TORCH_CHECK(rotary_dim % 2 == 0, op_name, ": rotary_dim must be even for RoPE, got ", rotary_dim);
+  }
 
   const QKNormRopePostOp<interleave> post_op{
       position_ids.data_ptr<int>(),
@@ -280,7 +341,7 @@ void launch_fused_qk_norm_rope_core(
       static_cast<int>(rotary_dim)};
 
   qknorm::dispatch_head_dim<scalar_t, weight_t>(
-      layout, static_cast<qknorm::acc_type_t<scalar_t>>(eps), post_op, op_name, false);
+      layout, static_cast<qknorm::acc_type_t<scalar_t>>(eps), post_op, op_name, true);
 }
 
 template <bool interleave, typename scalar_t>
@@ -417,8 +478,7 @@ void fused_qk_norm_rope(
   TORCH_CHECK(q_weight.size(0) == head_dim, op_name, ": q_weight size must match head_dim");
   TORCH_CHECK(k_weight.size(0) == head_dim, op_name, ": k_weight size must match head_dim");
   TORCH_CHECK(q_weight.scalar_type() == k_weight.scalar_type(), op_name, ": q_weight and k_weight dtype must match");
-  TORCH_CHECK(
-      head_dim == 64 || head_dim == 128 || head_dim == 256, op_name, ": head_dim must be one of {64, 128, 256}");
+  TORCH_CHECK(head_dim > 0, op_name, ": head_dim must be positive, got ", head_dim);
 
   CHECK_DEVICE(qkv);
   CHECK_CONTIGUOUS(qkv);

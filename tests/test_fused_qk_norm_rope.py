@@ -256,8 +256,84 @@ def test_fused_qk_norm_rope_basic(
     )
 
 
-@pytest.mark.parametrize("num_tokens", [32, 128])
-@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("num_tokens", [1, 32])
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
+@pytest.mark.parametrize("is_neox", [True, False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_qk_norm_rope_mixed_dtype(num_tokens, head_dim, is_neox, dtype):
+    """Test fused QK norm + RoPE with fp32 weights and representative head sizes."""
+    torch.random.manual_seed(42)
+    num_heads_q = 32
+    num_heads_k = 8
+    num_heads_v = 8
+    eps = 1e-6
+    base = 10000.0
+    factor = 1.0
+    low = 1.0
+    high = 1.0
+    attention_factor = 1.0
+    rotary_dim = head_dim
+
+    total_heads = num_heads_q + num_heads_k + num_heads_v
+
+    qkv = torch.randn(num_tokens, total_heads * head_dim, dtype=dtype, device=device)
+    q_weight = torch.randn(head_dim, dtype=torch.float32, device=device)
+    k_weight = torch.randn(head_dim, dtype=torch.float32, device=device)
+    position_ids = torch.arange(num_tokens, dtype=torch.int32, device=device)
+
+    qkv_ref = qkv.clone().float().to("cpu")
+    q_weight_ref = q_weight.clone().to("cpu")
+    k_weight_ref = k_weight.clone().to("cpu")
+    position_ids_ref = position_ids.clone().to("cpu")
+
+    output_ref = fused_qk_norm_rope_reference(
+        qkv_ref,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        q_weight_ref,
+        k_weight_ref,
+        base,
+        is_neox,
+        position_ids_ref,
+        factor,
+        low,
+        high,
+        attention_factor,
+        rotary_dim,
+    )
+
+    sgl_kernel.fused_qk_norm_rope(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        q_weight,
+        k_weight,
+        base,
+        is_neox,
+        position_ids,
+        factor,
+        low,
+        high,
+        attention_factor,
+        rotary_dim,
+    )
+
+    torch.testing.assert_close(
+        qkv.to(torch.float32).to("cpu"),
+        output_ref,
+        rtol=precision[dtype],
+        atol=precision[dtype],
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [32])
+@pytest.mark.parametrize("head_dim", [128, 256, 512])
 @pytest.mark.parametrize("is_neox", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_fused_qk_norm_rope_yarn(num_tokens, head_dim, is_neox, dtype):

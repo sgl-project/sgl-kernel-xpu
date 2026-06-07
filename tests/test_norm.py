@@ -73,7 +73,7 @@ def qk_rms_norm(x, w, eps=1e-6):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("weight_dtype", [torch.float16, torch.float32])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
 def test_fused_inplace_qknorm(dtype, weight_dtype, head_dim):
     eps = 1e-6
     num_tokens, num_q_heads, num_k_heads = 17, 8, 2
@@ -92,9 +92,11 @@ def test_fused_inplace_qknorm(dtype, weight_dtype, head_dim):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_fused_inplace_qknorm_qwen3_split_view(dtype):
+@pytest.mark.parametrize("num_tokens", [1, 32])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+def test_fused_inplace_qknorm_qwen3_split_view(dtype, num_tokens, head_dim):
     eps = 1e-6
-    num_tokens, num_q_heads, num_k_heads, head_dim = 32, 40, 8, 128
+    num_q_heads, num_k_heads = 40, 8
     q_size = num_q_heads * head_dim
     kv_size = num_k_heads * head_dim
     qkv = torch.randn(

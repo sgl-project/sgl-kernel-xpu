@@ -39,6 +39,7 @@ suites = {
         TestFile("test_sampling.py"),
         TestFile("test_hc_split_sinkhorn.py"),
         TestFile("test_store_cache_xpu.py"),
+        TestFile("test_per_token_group_quant_mxfp4_fused.py"),
     ],
 }
 

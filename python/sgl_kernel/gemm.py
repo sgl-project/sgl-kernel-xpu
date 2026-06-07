@@ -141,6 +141,8 @@ def sgl_per_token_group_quant_fp4(
     x: torch.Tensor,
     group_size: int = 32,
     eps: float = 1e-10,
+    x_secondary: Optional[torch.Tensor] = None,
+    column_major_scales: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize input tensor to MXFP4 (E2M1) format with per-token group scaling.
@@ -153,8 +155,14 @@ def sgl_per_token_group_quant_fp4(
     Args:
         x: Input tensor with shape (..., K) where K is divisible by group_size.
            Must be contiguous and dtype float16, bfloat16, or float32.
+           When x_secondary is provided, this is interpreted as the gate projection.
         group_size: Number of elements per quantization group. Must be 32 for MXFP4.
         eps: Small epsilon to avoid division by zero. Default is 1e-10.
+        x_secondary: Optional secondary input tensor for SiLU+Mul fusion.
+                     When provided, computes quantize(SiLU(x) * x_secondary).
+                     Must have same shape, dtype, and device as x.
+        column_major_scales: If True, store scales in column-major interleaved layout
+                             for better cache locality in MoE workloads. Default is False.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -162,6 +170,7 @@ def sgl_per_token_group_quant_fp4(
                         Two E2M1 values are packed into each byte.
             - output_s: Scale tensor with shape (..., K // group_size) and dtype uint8.
                         Scales are stored in UE8M0 format (exponent + 127 bias).
+                        If column_major_scales=True, scales are interleaved in memory.
     """
     assert (
         x.shape[-1] % group_size == 0
@@ -169,12 +178,29 @@ def sgl_per_token_group_quant_fp4(
     assert x.is_contiguous(), "`x` is not contiguous"
     assert group_size == 32, f"group_size must be 32 for MXFP4, got {group_size}"
 
+    # Validate x_secondary if provided
+    if x_secondary is not None:
+        assert (
+            x_secondary.shape == x.shape
+        ), f"x_secondary shape {x_secondary.shape} must match x shape {x.shape}"
+        assert (
+            x_secondary.dtype == x.dtype
+        ), f"x_secondary dtype {x_secondary.dtype} must match x dtype {x.dtype}"
+        assert (
+            x_secondary.device == x.device
+        ), f"x_secondary device {x_secondary.device} must match x device {x.device}"
+        assert x_secondary.is_contiguous(), "`x_secondary` is not contiguous"
+
     # Ensure input is 2D for the kernel
     original_shape = x.shape
     if x.dim() == 1:
         x = x.unsqueeze(0)
+        if x_secondary is not None:
+            x_secondary = x_secondary.unsqueeze(0)
     elif x.dim() > 2:
         x = x.view(-1, x.shape[-1])
+        if x_secondary is not None:
+            x_secondary = x_secondary.view(-1, x_secondary.shape[-1])
 
     m, k = x.shape
     num_groups_per_row = k // group_size
@@ -182,13 +208,22 @@ def sgl_per_token_group_quant_fp4(
     # Output is packed FP4 (2 values per byte)
     output_q = torch.empty((m, k // 2), device=x.device, dtype=torch.uint8)
 
-    # Scales in row-major layout: (m, num_groups_per_row)
-    # Each row has the scales for that token's groups
-    output_s = torch.empty((m, num_groups_per_row), device=x.device, dtype=torch.uint8)
+    # Scales: create with transposed strides if column-major requested
+    if column_major_scales:
+        # Create as (groups, tokens) then permute to (tokens, groups)
+        # This gives stride(0) < stride(1), triggering column-major in kernel
+        output_s = torch.empty(
+            (num_groups_per_row, m), device=x.device, dtype=torch.uint8
+        ).permute(1, 0)
+    else:
+        # Row-major layout: (m, num_groups_per_row)
+        output_s = torch.empty(
+            (m, num_groups_per_row), device=x.device, dtype=torch.uint8
+        )
 
     if x.shape[0] > 0:
         torch.ops.sgl_kernel.sgl_per_token_group_quant_fp4.default(
-            x, output_q, output_s, group_size, eps
+            x, output_q, output_s, group_size, eps, x_secondary
         )
 
     # Reshape output to match input shape

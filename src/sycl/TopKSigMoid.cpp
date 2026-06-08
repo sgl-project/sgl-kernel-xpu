@@ -83,7 +83,7 @@ struct FusedTopkSigmoid {
       float logit = static_cast<float>(gating_output[tid * experts + expert_id]);
 
       // sigmoid activation
-      float sig = 1.0f / (1.0f + sycl::exp(-logit));
+      float sig = 1.0f / (1.0f + sycl::native::exp(-logit));
 
       local_idx[e] = expert_id;
 
@@ -289,7 +289,7 @@ struct TopkGatingSigmoid {
     // Note(Byron): upcast logits to float32
     for (int ii = 0; ii < VPT; ++ii) {
       float val = static_cast<float>(row_chunk_temp[ii]);
-      val = 1.0f / (1.0f + sycl::exp(-val));
+      val = 1.0f / (1.0f + sycl::native::exp(-val));
       if (correction_bias != nullptr) {
         /*
         LDG is interleaved

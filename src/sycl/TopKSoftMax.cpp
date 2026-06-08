@@ -50,7 +50,7 @@ struct FusedTopkSoftmax {
 
   static inline T Sigmoid(T x) {
     float sycl_x = static_cast<float>(x);
-    float result = 1.0f / (1.0f + sycl::exp(-sycl_x));
+    float result = 1.0f / (1.0f + sycl::native::exp(-sycl_x));
     return static_cast<T>(result);
   }
 
@@ -137,12 +137,12 @@ struct FusedTopkSoftmax {
 
     for (int i = 0; i < top_k; ++i) {
       float score = topk_weights_local[i];
-      sum_exp += sycl::exp(score - max_score);
+      sum_exp += sycl::native::exp(score - max_score);
     }
 
     for (int e = 0; e < calc_per_item; ++e) {
       float score = local_elems[e];
-      float my_val = sycl::exp(score - max_score);
+      float my_val = sycl::native::exp(score - max_score);
       for (int offset = sub_group_size / 2; offset > 0; offset /= 2) {
         float other_val = sycl::permute_group_by_xor(sg, my_val, offset);
         my_val += other_val;
@@ -152,7 +152,7 @@ struct FusedTopkSoftmax {
 
     for (int i = 0; i < top_k; ++i) {
       float score = topk_weights_local[i];
-      topk_weights_local[i] = sycl::exp(score - max_score) / sum_exp;
+      topk_weights_local[i] = sycl::native::exp(score - max_score) / sum_exp;
     }
 
     if (renormalize) {
@@ -357,7 +357,7 @@ struct TopkGatingSoftMax {
     float row_sum = 0;
 #pragma unroll
     for (int ii = 0; ii < VPT; ++ii) {
-      row_chunk[ii] = sycl::exp(row_chunk[ii] - thread_max);
+      row_chunk[ii] = sycl::native::exp(row_chunk[ii] - thread_max);
       row_sum += row_chunk[ii];
     }
 

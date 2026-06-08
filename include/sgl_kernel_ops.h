@@ -188,6 +188,18 @@ void fused_qk_rope_with_cos_sin_cache_inplace(
     at::Tensor& positions,
     int64_t rope_dim,
     bool is_neox);
+void multimodal_rotary_embedding(
+    at::Tensor& query,
+    at::Tensor& key,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& positions,
+    const std::vector<int64_t>& mrope_section,
+    int64_t head_size,
+    int64_t rotary_dim,
+    bool mrope_interleaved,
+    bool mrope_interleaved_glm,
+    bool is_neox_style,
+    const std::optional<at::Tensor>& axis_map);
 void sgl_per_token_group_quant_fp4(
     at::Tensor input, at::Tensor output_q, at::Tensor output_s, int64_t group_size, double eps);
 void store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices);

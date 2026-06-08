@@ -36,6 +36,25 @@ int fp8_mqa_gemm_xe20(sycl::queue* queue_ptr, const void* A_fp8, const void* B_f
   return nsa::fp8_mqa_gemm_launch(queue_ptr, A_fp8, B_fp8, D_f32, M, N, K);
 }
 
+// Batched variant: computes `batch` independent GEMMs D_b = A_b @ B_b^T in a
+// single fused launch. Per-batch base pointers advance by the given strides
+// (in elements). All batches share the same (M,N,K) tile shape.
+int fp8_mqa_gemm_xe20_batched(
+    sycl::queue* queue_ptr,
+    const void* A_fp8,
+    const void* B_fp8,
+    void* D_f32,
+    int batch,
+    int M,
+    int N,
+    int K,
+    int64_t A_batch_stride,
+    int64_t B_batch_stride,
+    int64_t D_batch_stride) {
+  return nsa::fp8_mqa_gemm_batched_launch(
+      queue_ptr, A_fp8, B_fp8, D_f32, batch, M, N, K, A_batch_stride, B_batch_stride, D_batch_stride);
+}
+
 namespace {
 
 constexpr int WG_SIZE = 256;
@@ -57,27 +76,68 @@ void launch_2d_kernel(sycl::queue& queue, Kernel& kernel, int dim0, int dim1) {
 
 // FP8 GEMM via SYCL-TLA: D(M,N) = A(M,K) @ B(N,K)^T in f32.
 // B is passed directly in (N,K) layout — no host-side transpose needed.
-at::Tensor fp8_gemm_xe20(
+// Writes result directly to the output pointer D_out (M*N floats, must be pre-allocated).
+// Returns 0 on success, non-zero if fallback was used.
+int fp8_gemm_xe20_inplace(
     sycl::queue& queue,
-    const at::Tensor& a_uint8,  // (M, K) uint8 containing fp8 e4m3
-    const at::Tensor& b_uint8,  // (N, K) uint8 containing fp8 e4m3
+    const uint8_t* a_ptr,  // (M, K) fp8
+    const uint8_t* b_ptr,  // (N, K) fp8
+    float* d_ptr,          // (M, N) output
     int M,
     int N,
-    int K) {
-  auto D = torch::zeros({M, N}, torch::dtype(torch::kFloat32).device(a_uint8.device()));
-
-  int rc =
-      fp8_mqa_gemm_xe20(&queue, a_uint8.data_ptr<uint8_t>(), b_uint8.data_ptr<uint8_t>(), D.data_ptr<float>(), M, N, K);
+    int K,
+    at::Device device) {
+  int rc = fp8_mqa_gemm_xe20(&queue, a_ptr, b_ptr, d_ptr, M, N, K);
 
   if (rc != 0) {
     // Fallback to torch::mm if dimensions are not tile-aligned
-    auto a_fp8 = a_uint8.view({M, K}).view(at::ScalarType::Float8_e4m3fn);
-    auto b_fp8 = b_uint8.view({N, K}).view(at::ScalarType::Float8_e4m3fn);
+    auto a_fp8 = torch::from_blob(const_cast<uint8_t*>(a_ptr), {M, K}, torch::dtype(torch::kByte).device(device))
+                     .view(at::ScalarType::Float8_e4m3fn);
+    auto b_fp8 = torch::from_blob(const_cast<uint8_t*>(b_ptr), {N, K}, torch::dtype(torch::kByte).device(device))
+                     .view(at::ScalarType::Float8_e4m3fn);
     auto a_bf16 = a_fp8.to(at::ScalarType::BFloat16);
     auto b_bf16 = b_fp8.to(at::ScalarType::BFloat16);
-    return at::mm(a_bf16, b_bf16.t()).to(at::ScalarType::Float);
+    auto result = at::mm(a_bf16, b_bf16.t()).to(at::ScalarType::Float);
+    // Copy fallback result into the output buffer
+    auto d_view = torch::from_blob(d_ptr, {M, N}, torch::dtype(torch::kFloat32).device(device));
+    d_view.copy_(result);
   }
-  return D;
+  return rc;
+}
+
+// Batched FP8 GEMM via SYCL-TLA: for each b, D_b(M,N) = A_b(M,K) @ B_b(N,K)^T.
+// Base pointers advance by the per-batch element strides. Writes directly into
+// the pre-allocated output buffer. Falls back to torch::bmm if not tile-aligned.
+int fp8_gemm_xe20_batched_inplace(
+    sycl::queue& queue,
+    const uint8_t* a_ptr,  // (batch, M, K) fp8
+    const uint8_t* b_ptr,  // (batch, N, K) fp8
+    float* d_ptr,          // (batch, M, N) output
+    int batch,
+    int M,
+    int N,
+    int K,
+    int64_t a_batch_stride,
+    int64_t b_batch_stride,
+    int64_t d_batch_stride,
+    at::Device device) {
+  int rc = fp8_mqa_gemm_xe20_batched(
+      &queue, a_ptr, b_ptr, d_ptr, batch, M, N, K, a_batch_stride, b_batch_stride, d_batch_stride);
+
+  if (rc != 0) {
+    // Fallback to torch::bmm if dimensions are not tile-aligned.
+    // Strides are the natural contiguous strides (M*K, N*K, M*N).
+    auto a_fp8 = torch::from_blob(const_cast<uint8_t*>(a_ptr), {batch, M, K}, torch::dtype(torch::kByte).device(device))
+                     .view(at::ScalarType::Float8_e4m3fn);
+    auto b_fp8 = torch::from_blob(const_cast<uint8_t*>(b_ptr), {batch, N, K}, torch::dtype(torch::kByte).device(device))
+                     .view(at::ScalarType::Float8_e4m3fn);
+    auto a_bf16 = a_fp8.to(at::ScalarType::BFloat16);
+    auto b_bf16 = b_fp8.to(at::ScalarType::BFloat16);
+    auto result = at::bmm(a_bf16, b_bf16.transpose(1, 2)).to(at::ScalarType::Float);
+    auto d_view = torch::from_blob(d_ptr, {batch, M, N}, torch::dtype(torch::kFloat32).device(device));
+    d_view.copy_(result);
+  }
+  return rc;
 }
 
 }  // namespace
@@ -130,7 +190,16 @@ torch::Tensor fp8_mqa_logits(
 
   if (use_gemm) {
     // Optimized path: SYCL-TLA FP8 GEMM + reduction kernel
-    auto dots = fp8_gemm_xe20(queue, q_contig.view({M, D}), k_contig, M, Nk, D);
+    auto dots = torch::empty({M, Nk}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
+    fp8_gemm_xe20_inplace(
+        queue,
+        q_contig.data_ptr<uint8_t>(),
+        k_contig.data_ptr<uint8_t>(),
+        dots.data_ptr<float>(),
+        M,
+        Nk,
+        D,
+        q_fp8.device());
 
     nsa::Fp8MqaLogitsReduceKernel reduce_kernel{
         dots.data_ptr<float>(),
@@ -258,16 +327,22 @@ torch::Tensor fp8_paged_mqa_logits(
         head_dim_with_sf};
     launch_2d_kernel(queue, gather_kernel, B_next, msl);
 
-    // Stage 2: Per-batch SYCL-TLA FP8 GEMM
-    // TODO: batch all B_next GEMMs into a single grouped GEMM launch
+    // Stage 2: Batched SYCL-TLA FP8 GEMM — all B_next GEMMs in one launch.
     auto dots = torch::empty({B_next, H, msl}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
 
-    for (int b = 0; b < B_next; ++b) {
-      auto q_b = q_contig.slice(0, b, b + 1).view({H, D});      // (H, D)
-      auto k_b = k_gathered.slice(0, b * msl, (b + 1) * msl);   // (msl, D)
-      auto dots_b = fp8_gemm_xe20(queue, q_b, k_b, H, msl, D);  // (H, msl)
-      dots.slice(0, b, b + 1).view({H, msl}).copy_(dots_b);
-    }
+    fp8_gemm_xe20_batched_inplace(
+        queue,
+        q_contig.data_ptr<uint8_t>(),    // (B,1,H,D), A batch stride = H*D
+        k_gathered.data_ptr<uint8_t>(),  // (B*msl,D), B batch stride = msl*D
+        dots.data_ptr<float>(),          // (B,H,msl), D batch stride = H*msl
+        B_next,
+        H,
+        msl,
+        D,
+        static_cast<int64_t>(H) * D,
+        static_cast<int64_t>(msl) * D,
+        static_cast<int64_t>(H) * msl,
+        q_fp8.device());
 
     // Stage 3: Reduction
     nsa::Fp8PagedMqaLogitsReduceKernel reduce_kernel{

@@ -201,23 +201,44 @@ using GemmStrideD = Stride<int, _1>;
 
 // Kernel parameters — POD struct captured by the SYCL lambda.
 // Tensors are constructed inside the kernel from these raw pointers/dims.
+// Batch strides (in elements) advance the per-batch A/B/D base pointers;
+// they are 0 for the single-GEMM case.
 struct Fp8MqaGemmParams {
   uint8_t* A_ptr;
   uint8_t* B_ptr;
   float* D_ptr;
   int M, N, K;
   int grid_n;
+  int64_t A_batch_stride;
+  int64_t B_batch_stride;
+  int64_t D_batch_stride;
 };
 
 // Kernel name
 class Fp8MqaGemmKernelName;
 
-// Launch the custom FP8 MQA GEMM.
+// Launch the custom FP8 MQA GEMM, optionally batched.
+// Computes, for each batch b in [0, batch):
+//   D_b(M,N) = A_b(M,K) @ B_b(N,K)^T
+// where A_b = A_fp8 + b*A_batch_stride, similarly for B and D.
+// All batches share the same (M,N,K) tile shape, so a single grid launch
+// covers them by adding a batch dimension (grid dim 0). This replaces the
+// per-batch serial launch loop with one fused launch.
 // A: (M,K) uint8 fp8, K contiguous
 // B: (N,K) uint8 fp8, K contiguous
 // D: (M,N) float32, N contiguous
-inline int
-fp8_mqa_gemm_launch(sycl::queue* queue_ptr, const void* A_fp8, const void* B_fp8, void* D_f32, int M, int N, int K) {
+inline int fp8_mqa_gemm_batched_launch(
+    sycl::queue* queue_ptr,
+    const void* A_fp8,
+    const void* B_fp8,
+    void* D_f32,
+    int batch,
+    int M,
+    int N,
+    int K,
+    int64_t A_batch_stride,
+    int64_t B_batch_stride,
+    int64_t D_batch_stride) {
   // Create dummy tensors for type deduction (only stride types matter)
   auto make_dummy = [](auto* ptr, auto stride) {
     return make_tensor(make_gmem_ptr(ptr), make_layout(repeat<rank_v<decltype(stride)>>(1), stride));
@@ -261,7 +282,7 @@ fp8_mqa_gemm_launch(sycl::queue* queue_ptr, const void* A_fp8, const void* B_fp8
 
   auto max_threads = size(mma);
 
-  sycl::range<3> global_range(1, total_tiles, max_threads);
+  sycl::range<3> global_range(batch, total_tiles, max_threads);
   sycl::range<3> local_range(1, 1, max_threads);
 
   Fp8MqaGemmParams params{
@@ -272,6 +293,9 @@ fp8_mqa_gemm_launch(sycl::queue* queue_ptr, const void* A_fp8, const void* B_fp8
       N,
       K,
       grid_n,
+      A_batch_stride,
+      B_batch_stride,
+      D_batch_stride,
   };
 
   namespace syclex = sycl::ext::oneapi::experimental;
@@ -281,6 +305,7 @@ fp8_mqa_gemm_launch(sycl::queue* queue_ptr, const void* A_fp8, const void* B_fp8
   queue_ptr->submit([&](sycl::handler& h) {
     h.parallel_for<Fp8MqaGemmKernelName>(
         sycl::nd_range<3>(global_range, local_range), kernel_props, [=](sycl::nd_item<3> item) {
+          int batch_id = item.get_group(0);
           int group_id = item.get_group(1);
           int wg_m_idx = group_id / params.grid_n;
           int wg_n_idx = group_id % params.grid_n;
@@ -288,13 +313,18 @@ fp8_mqa_gemm_launch(sycl::queue* queue_ptr, const void* A_fp8, const void* B_fp8
 
           auto coord = make_coord(wg_m_idx, wg_n_idx, 0);
 
+          // Per-batch base pointers
+          uint8_t* A_base = params.A_ptr + batch_id * params.A_batch_stride;
+          uint8_t* B_base = params.B_ptr + batch_id * params.B_batch_stride;
+          float* D_base = params.D_ptr + batch_id * params.D_batch_stride;
+
           // Construct tensors from raw pointers inside the kernel
           auto A = make_tensor(
-              make_gmem_ptr(params.A_ptr), make_layout(make_shape(params.M, params.K), GemmStrideAB{params.K, _1{}}));
+              make_gmem_ptr(A_base), make_layout(make_shape(params.M, params.K), GemmStrideAB{params.K, _1{}}));
           auto B = make_tensor(
-              make_gmem_ptr(params.B_ptr), make_layout(make_shape(params.N, params.K), GemmStrideAB{params.K, _1{}}));
+              make_gmem_ptr(B_base), make_layout(make_shape(params.N, params.K), GemmStrideAB{params.K, _1{}}));
           auto D = make_tensor(
-              make_gmem_ptr(params.D_ptr), make_layout(make_shape(params.M, params.N), GemmStrideD{params.N, _1{}}));
+              make_gmem_ptr(D_base), make_layout(make_shape(params.M, params.N), GemmStrideD{params.N, _1{}}));
 
           GemmTiledMMA mma_local;
           Mainloop{}(A, B, D, coord, mma_local, thr_id);
@@ -302,6 +332,12 @@ fp8_mqa_gemm_launch(sycl::queue* queue_ptr, const void* A_fp8, const void* B_fp8
   });
 
   return 0;
+}
+
+// Single-GEMM convenience wrapper (batch=1, zero batch strides).
+inline int
+fp8_mqa_gemm_launch(sycl::queue* queue_ptr, const void* A_fp8, const void* B_fp8, void* D_f32, int M, int N, int K) {
+  return fp8_mqa_gemm_batched_launch(queue_ptr, A_fp8, B_fp8, D_f32, 1, M, N, K, 0, 0, 0);
 }
 
 }  // namespace nsa

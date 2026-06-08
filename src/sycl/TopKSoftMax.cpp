@@ -561,6 +561,7 @@ void fused_topk_softmax(
       break;
     case 256:
       LAUNCH_GATING_SOFTMAX(T, 256, WARPS_PER_TB);
+      break;
     default:
       launch_fused_topk_softmax(
           queue, gating_output, topk_weights, topk_indices, renormalize, topk, num_tokens, num_experts);

@@ -516,6 +516,7 @@ void fused_topk_sigmoid(
       break;
     case 256:
       LAUNCH_GATING_SIGMOID(T, 256, WARPS_PER_TB);
+      break;
     default:
       launch_fused_topk_sigmoid(
           queue,

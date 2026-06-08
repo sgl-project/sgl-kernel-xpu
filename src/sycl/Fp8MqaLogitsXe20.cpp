@@ -96,6 +96,15 @@ torch::Tensor fp8_mqa_logits(
   TORCH_CHECK(k_fp8.dim() == 2, "k_fp8 must be 2D (Nk, D)");
   TORCH_CHECK(q_fp8.scalar_type() == at::kByte, "q_fp8 must be uint8 (FP8 e4m3)");
   TORCH_CHECK(k_fp8.scalar_type() == at::kByte, "k_fp8 must be uint8 (FP8 e4m3)");
+  TORCH_CHECK(k_fp8.size(1) == q_fp8.size(2), "k_fp8 D must match q_fp8 D");
+  TORCH_CHECK(k_scale.scalar_type() == at::kFloat, "k_scale must be float32");
+  TORCH_CHECK(k_scale.dim() == 1 && k_scale.size(0) == k_fp8.size(0), "k_scale must be 1D with Nk elements");
+  TORCH_CHECK(weights.scalar_type() == at::kFloat, "weights must be float32");
+  TORCH_CHECK(
+      weights.dim() == 2 && weights.size(0) == q_fp8.size(0) && weights.size(1) == q_fp8.size(1),
+      "weights must be (Nq, H)");
+  TORCH_CHECK(ks.scalar_type() == at::kInt, "ks must be int32");
+  TORCH_CHECK(ke.scalar_type() == at::kInt, "ke must be int32");
 
   int Nq = q_fp8.size(0);
   int H = q_fp8.size(1);
@@ -170,6 +179,11 @@ torch::Tensor fp8_paged_mqa_logits(
   TORCH_CHECK(kv_cache.dim() == 4, "kv_cache must be 4D");
   TORCH_CHECK(q_fp8.scalar_type() == at::kByte, "q_fp8 must be uint8 (FP8 e4m3)");
   TORCH_CHECK(kv_cache.scalar_type() == at::kByte, "kv_cache must be uint8");
+  TORCH_CHECK(weights.scalar_type() == at::kFloat, "weights must be float32");
+  TORCH_CHECK(seq_lens.scalar_type() == at::kInt, "seq_lens must be int32");
+  TORCH_CHECK(block_tables.scalar_type() == at::kInt, "block_tables must be int32");
+  TORCH_CHECK(block_tables.dim() == 2, "block_tables must be 2D (B, max_num_blocks)");
+  TORCH_CHECK(block_tables.size(0) == q_fp8.size(0), "block_tables batch size must match q_fp8 batch size");
   // schedule_metadata is accepted for API compatibility with DeepGEMM but not
   // used on XPU — scheduling is handled internally by the SYCL runtime.
   if (schedule_metadata.has_value()) {
@@ -184,12 +198,35 @@ torch::Tensor fp8_paged_mqa_logits(
   int max_num_blocks = block_tables.size(1);
   int msl = static_cast<int>(max_seq_len);
 
-  // Always zero-initialize: the cost is negligible relative to GEMM, and
-  // uninitialized out-of-range positions are a footgun for callers.
+  TORCH_CHECK(
+      head_dim_with_sf == D + 4,
+      "kv_cache last dim must be D+4 (FP8 key data + float32 scale), got ",
+      head_dim_with_sf,
+      " vs D+4=",
+      D + 4);
+  TORCH_CHECK(D % 4 == 0, "D must be a multiple of 4 for vectorized gather, got ", D);
+  TORCH_CHECK(
+      static_cast<int64_t>(max_num_blocks) * page_size >= msl,
+      "block_tables capacity (",
+      max_num_blocks * page_size,
+      ") must cover max_seq_len (",
+      msl,
+      ")");
+  TORCH_CHECK(weights.dim() == 2 && weights.size(0) == B_next && weights.size(1) == H, "weights must be (B, H)");
+
+  // clean_logits is accepted for API compatibility but output is always
+  // zero-initialized — the cost is negligible relative to GEMM.
+  (void)clean_logits;
   auto logits = torch::zeros({B_next, msl}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
   if (B_next == 0 || msl == 0) return logits;
 
   auto seq_lens_flat = seq_lens.dim() == 2 ? seq_lens.contiguous().view({-1}) : seq_lens.contiguous();
+  TORCH_CHECK(
+      seq_lens_flat.size(0) == B_next,
+      "seq_lens must have B elements after flattening, got ",
+      seq_lens_flat.size(0),
+      " vs B=",
+      B_next);
 
   // Ensure contiguity
   auto q_contig = q_fp8.contiguous();

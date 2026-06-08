@@ -4,8 +4,14 @@ import struct
 import sys
 
 import pytest
-import sgl_kernel  # noqa: F401 — triggers op registration
 import torch
+
+pytestmark = pytest.mark.skipif(
+    not (hasattr(torch, "xpu") and torch.xpu.is_available()),
+    reason="XPU not available",
+)
+
+import sgl_kernel  # noqa: F401, E402 — triggers op registration
 
 
 def make_fp8_tensor(shape, device="xpu"):

@@ -2,6 +2,13 @@ from typing import Optional, Tuple
 
 import torch
 
+_VALID_FP8_DTYPES = (torch.uint8, torch.float8_e4m3fn)
+
+
+def _check_fp8_dtype(t: torch.Tensor, name: str) -> None:
+    if t.dtype not in _VALID_FP8_DTYPES:
+        raise TypeError(f"{name} must be uint8 or float8_e4m3fn, got {t.dtype}")
+
 
 def fp8_mqa_logits(
     q_fp8: torch.Tensor,
@@ -31,6 +38,8 @@ def fp8_mqa_logits(
         logits: (Nq, Nk) float32
     """
     k_fp8, k_scale = kv_fp8
+    _check_fp8_dtype(q_fp8, "q_fp8")
+    _check_fp8_dtype(k_fp8, "k_fp8")
     q_input = q_fp8.view(torch.uint8) if q_fp8.dtype != torch.uint8 else q_fp8
     k_input = k_fp8.view(torch.uint8) if k_fp8.dtype != torch.uint8 else k_fp8
     return torch.ops.sgl_kernel.fp8_mqa_logits.default(
@@ -63,6 +72,7 @@ def fp8_paged_mqa_logits(
     Returns:
         logits: (B, max_seq_len) float32
     """
+    _check_fp8_dtype(q_fp8, "q_fp8")
     q_input = q_fp8.view(torch.uint8) if q_fp8.dtype != torch.uint8 else q_fp8
     return torch.ops.sgl_kernel.fp8_paged_mqa_logits.default(
         q_input,

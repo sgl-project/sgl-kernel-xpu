@@ -269,7 +269,6 @@ def test_sparse_attention(
 )
 @pytest.mark.parametrize("causal", [True, False])
 def test_convert_vertical_slash_indexes(causal):
-    # Prepare small, hand-checkable inputs
     q_seqlens = torch.tensor([4], dtype=torch.int32, device=device)  # [BATCH]
     kv_seqlens = torch.tensor([4], dtype=torch.int32, device=device)
     vertical_indexes = torch.tensor(
@@ -282,7 +281,6 @@ def test_convert_vertical_slash_indexes(causal):
     block_size_M = 2
     block_size_N = 2
 
-    # Call your CUDA kernel wrapper
     block_count, block_offset, column_count, column_index = (
         convert_vertical_slash_indexes(
             q_seqlens,
@@ -296,27 +294,36 @@ def test_convert_vertical_slash_indexes(causal):
         )
     )
 
-    # Manually create expected outputs for this input
-    # There are 2 rows (blocks): row0 (tokens 0-1), row1 (tokens 2-3)
-    # Fill these expected tensors based on your CUDA kernel's logic
-    # For demonstration, we assume:
-    # - block_count: how many slash indices fall into each block
-    # - block_offset: the value of those indices
-    # - column_count: number of valid vertical indices per block
-    # - column_index: the actual vertical indices
-
-    expected_column_index = torch.tensor(
-        [[[[0, 0], [0, 0]]]], dtype=torch.int32, device=device
-    )
-
-    # If causal=False, update these tensors according to expected behavior
     if not causal:
-        # Update these values if your kernel produces different output in non-causal mode
+        expected_block_count = torch.tensor(
+            [[[1, 0]]], dtype=torch.int32, device=device
+        )
+        expected_block_offset = torch.tensor(
+            [[[[2], [0]]]], dtype=torch.int32, device=device
+        )
+        expected_column_count = torch.tensor(
+            [[[1, 2]]], dtype=torch.int32, device=device
+        )
         expected_column_index = torch.tensor(
             [[[[1, 0], [1, 3]]]], dtype=torch.int32, device=device
         )
+    else:
+        expected_block_count = torch.tensor(
+            [[[0, 1]]], dtype=torch.int32, device=device
+        )
+        expected_block_offset = torch.tensor(
+            [[[[0], [0]]]], dtype=torch.int32, device=device
+        )
+        expected_column_count = torch.tensor(
+            [[[0, 0]]], dtype=torch.int32, device=device
+        )
+        expected_column_index = torch.tensor(
+            [[[[0, 0], [0, 0]]]], dtype=torch.int32, device=device
+        )
 
-    # Assert that outputs match expectations
+    assert torch.equal(block_count, expected_block_count)
+    assert torch.equal(block_offset, expected_block_offset)
+    assert torch.equal(column_count, expected_column_count)
     assert torch.equal(column_index, expected_column_index)
 
 
@@ -327,7 +334,6 @@ def test_convert_vertical_slash_indexes(causal):
 )
 @pytest.mark.parametrize("causal", [True, False])
 def test_convert_vertical_slash_indexes_mergehead(causal):
-    # Prepare small, hand-checkable inputs for mergehead version
     q_seqlens = torch.tensor([4], dtype=torch.int32, device=device)
     kv_seqlens = torch.tensor([4], dtype=torch.int32, device=device)
     vertical_indexes = torch.tensor(
@@ -356,7 +362,6 @@ def test_convert_vertical_slash_indexes_mergehead(causal):
     block_size_M = 2
     block_size_N = 2
 
-    # Call your CUDA kernel wrapper
     block_count, block_offset, column_count, column_index = (
         convert_vertical_slash_indexes_mergehead(
             q_seqlens,
@@ -372,26 +377,38 @@ def test_convert_vertical_slash_indexes_mergehead(causal):
         )
     )
 
-    # Manually create expected outputs for this input
-    # For demonstration, assume:
-    # - batch=1, head=2, num_rows=2, nnz_v=2, nnz_s=2
-    # Fill these expected tensors according to your kernel's behavior
-
-    expected_column_index = torch.tensor(
-        [[[[1, 0], [1, 3]], [[-1079459945, -1077788999], [-1080050043, -1104625879]]]],
-        dtype=torch.int32,
-        device=device,
-    )
-
     if not causal:
-        # If non-causal mode output is different, update these values
+        expected_block_count = torch.tensor(
+            [[[1, 0], [1, 0]]], dtype=torch.int32, device=device
+        )
+        expected_block_offset = torch.tensor(
+            [[[[2, 0], [0, 0]], [[3, 0], [0, 0]]]], dtype=torch.int32, device=device
+        )
+        expected_column_count = torch.tensor(
+            [[[1, 2], [1, 1]]], dtype=torch.int32, device=device
+        )
         expected_column_index = torch.tensor(
-            [[[[1, 0], [1, 3]], [[2, -1077788999], [2, -1104625879]]]],
+            [[[[1, 0], [1, 3]], [[2, 0], [2, 0]]]],
             dtype=torch.int32,
             device=device,
         )
+    else:
+        expected_block_count = torch.tensor(
+            [[[0, 1], [1, 1]]], dtype=torch.int32, device=device
+        )
+        expected_block_offset = torch.tensor(
+            [[[[0, 0], [0, 0]], [[0, 0], [1, 0]]]], dtype=torch.int32, device=device
+        )
+        expected_column_count = torch.tensor(
+            [[[0, 0], [0, 0]]], dtype=torch.int32, device=device
+        )
+        expected_column_index = torch.tensor(
+            [[[[0, 0], [0, 0]], [[0, 0], [0, 0]]]], dtype=torch.int32, device=device
+        )
 
-    # Assert that outputs match expectations
+    assert torch.equal(block_count, expected_block_count)
+    assert torch.equal(block_offset, expected_block_offset)
+    assert torch.equal(column_count, expected_column_count)
     assert torch.equal(column_index, expected_column_index)
 
 

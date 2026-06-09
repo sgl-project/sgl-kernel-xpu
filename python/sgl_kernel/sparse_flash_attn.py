@@ -695,14 +695,14 @@ def convert_vertical_slash_indexes_mergehead(
         nnz_vertical = vertical_indexes.size(2)
         num_rows = (context_size + block_size_M - 1) // block_size_M
 
-        block_count = torch.empty(
+        block_count = torch.zeros(
             batch_size,
             num_heads,
             num_rows,
             dtype=q_seqlens.dtype,
             device=q_seqlens.device,
         )
-        block_offset = torch.empty(
+        block_offset = torch.zeros(
             batch_size,
             num_heads,
             num_rows,
@@ -710,14 +710,14 @@ def convert_vertical_slash_indexes_mergehead(
             dtype=q_seqlens.dtype,
             device=q_seqlens.device,
         )
-        column_count = torch.empty(
+        column_count = torch.zeros(
             batch_size,
             num_heads,
             num_rows,
             dtype=q_seqlens.dtype,
             device=q_seqlens.device,
         )
-        column_index = torch.empty(
+        column_index = torch.zeros(
             batch_size,
             num_heads,
             num_rows,

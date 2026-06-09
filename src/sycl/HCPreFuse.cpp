@@ -12,6 +12,7 @@ static constexpr int WG_SIZE = 96;         // 6 subgroups of 16 threads each
 static constexpr int HC = 4;               // hc_mult value
 static constexpr int HC2 = HC * HC;        // 16
 static constexpr int HC3 = (2 + HC) * HC;  // 24
+static constexpr int SINKHORN_ITERS = 20;
 
 static constexpr float LOG2E = 1.442695040888963f;
 
@@ -33,7 +34,6 @@ struct HCPreBigFuseKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   float hc_pre_eps;
   float hc_sinkhorn_eps;
   float hc_post_mult_value;
-  int sinkhorn_iters;
 
   sycl::local_accessor<float, 1> slm_;
 
@@ -52,8 +52,7 @@ struct HCPreBigFuseKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       float rms_eps_,
       float hc_pre_eps_,
       float hc_sinkhorn_eps_,
-      float hc_post_mult_value_,
-      int sinkhorn_iters_)
+      float hc_post_mult_value_)
       : gemm_out_mul(gemm_out_mul_),
         gemm_out_sqrsum(gemm_out_sqrsum_),
         hc_scale(hc_scale_),
@@ -68,8 +67,7 @@ struct HCPreBigFuseKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         rms_eps(rms_eps_),
         hc_pre_eps(hc_pre_eps_),
         hc_sinkhorn_eps(hc_sinkhorn_eps_),
-        hc_post_mult_value(hc_post_mult_value_),
-        sinkhorn_iters(sinkhorn_iters_) {}
+        hc_post_mult_value(hc_post_mult_value_) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
     constexpr int slm_size = HC3 + HC;
@@ -141,7 +139,7 @@ struct HCPreBigFuseKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       comb_val = comb_val * sycl::native::recip(col_sum + hc_sinkhorn_eps);
 
 #pragma unroll
-      for (int iter = 1; iter < sinkhorn_iters; ++iter) {
+      for (int iter = 1; iter < SINKHORN_ITERS; ++iter) {
         row_sum = comb_val;
 #pragma unroll
         for (int mask = 1; mask < HC; mask <<= 1)
@@ -228,7 +226,6 @@ struct HCPreBigFuseWithNormKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   float hc_pre_eps;
   float hc_sinkhorn_eps;
   float hc_post_mult_value;
-  int sinkhorn_iters;
   float norm_eps;
 
   sycl::local_accessor<float, 1> slm_;
@@ -250,7 +247,6 @@ struct HCPreBigFuseWithNormKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       float hc_pre_eps_,
       float hc_sinkhorn_eps_,
       float hc_post_mult_value_,
-      int sinkhorn_iters_,
       float norm_eps_)
       : gemm_out_mul(gemm_out_mul_),
         gemm_out_sqrsum(gemm_out_sqrsum_),
@@ -268,7 +264,6 @@ struct HCPreBigFuseWithNormKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         hc_pre_eps(hc_pre_eps_),
         hc_sinkhorn_eps(hc_sinkhorn_eps_),
         hc_post_mult_value(hc_post_mult_value_),
-        sinkhorn_iters(sinkhorn_iters_),
         norm_eps(norm_eps_) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
@@ -340,7 +335,7 @@ struct HCPreBigFuseWithNormKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       comb_val = comb_val * sycl::native::recip(col_sum + hc_sinkhorn_eps);
 
 #pragma unroll
-      for (int iter = 1; iter < sinkhorn_iters; ++iter) {
+      for (int iter = 1; iter < SINKHORN_ITERS; ++iter) {
         row_sum = comb_val;
 #pragma unroll
         for (int mask = 1; mask < HC; mask <<= 1)
@@ -494,7 +489,6 @@ static void launch_hc_pre_fuse_kernel(
     double hc_pre_eps,
     double hc_sinkhorn_eps,
     double hc_post_mult_value,
-    int64_t sinkhorn_iters,
     std::optional<at::Tensor> norm_weight,
     std::optional<double> norm_eps) {
   using scalar_t = sycl::ext::oneapi::bfloat16;
@@ -518,7 +512,6 @@ static void launch_hc_pre_fuse_kernel(
         static_cast<float>(hc_pre_eps),
         static_cast<float>(hc_sinkhorn_eps),
         static_cast<float>(hc_post_mult_value),
-        static_cast<int>(sinkhorn_iters),
         norm_eps_val);
     sycl_kernel_submit(sycl::range<1>(T * WG_SIZE), sycl::range<1>(WG_SIZE), q, ker);
   } else {
@@ -537,8 +530,7 @@ static void launch_hc_pre_fuse_kernel(
         static_cast<float>(rms_eps),
         static_cast<float>(hc_pre_eps),
         static_cast<float>(hc_sinkhorn_eps),
-        static_cast<float>(hc_post_mult_value),
-        static_cast<int>(sinkhorn_iters));
+        static_cast<float>(hc_post_mult_value));
     sycl_kernel_submit(sycl::range<1>(T * WG_SIZE), sycl::range<1>(WG_SIZE), q, ker);
   }
 }
@@ -585,6 +577,12 @@ void hc_pre_big_fuse(
   TORCH_CHECK(layer_input.scalar_type() == at::kBFloat16, "layer_input must be bfloat16");
 
   TORCH_CHECK(static_cast<int>(hc_mult) == HC, "hc_mult must be ", HC, ", got ", hc_mult);
+  TORCH_CHECK(
+      static_cast<int>(sinkhorn_iters) == SINKHORN_ITERS,
+      "sinkhorn_iters must be ",
+      SINKHORN_ITERS,
+      ", got ",
+      sinkhorn_iters);
   TORCH_CHECK(hc_scale.numel() == 3, "hc_scale must have 3 elements");
   TORCH_CHECK(hc_base.numel() == HC3, "hc_base must have ", HC3, " elements");
 
@@ -635,7 +633,6 @@ void hc_pre_big_fuse(
         hc_pre_eps,
         hc_sinkhorn_eps,
         hc_post_mult_value,
-        sinkhorn_iters,
         norm_weight,
         norm_eps);
   } else if (vec_size == 4) {
@@ -656,7 +653,6 @@ void hc_pre_big_fuse(
         hc_pre_eps,
         hc_sinkhorn_eps,
         hc_post_mult_value,
-        sinkhorn_iters,
         norm_weight,
         norm_eps);
   } else {
@@ -677,7 +673,6 @@ void hc_pre_big_fuse(
         hc_pre_eps,
         hc_sinkhorn_eps,
         hc_post_mult_value,
-        sinkhorn_iters,
         norm_weight,
         norm_eps);
   }

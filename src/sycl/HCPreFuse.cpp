@@ -16,7 +16,7 @@ static constexpr int HC3 = (2 + HC) * HC;  // 24
 static constexpr float LOG2E = 1.442695040888963f;
 
 template <typename scalar_t, int VEC_SIZE>
-struct HCPreBigFuseKernel {
+struct HCPreBigFuseKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   const float* __restrict__ gemm_out_mul;     // [n_splits, T, 24] FP32
   const float* __restrict__ gemm_out_sqrsum;  // [n_splits, T] FP32
   const float* __restrict__ hc_scale;         // [3] FP32
@@ -36,6 +36,45 @@ struct HCPreBigFuseKernel {
   int sinkhorn_iters;
 
   sycl::local_accessor<float, 1> slm_;
+
+  HCPreBigFuseKernel(
+      const float* gemm_out_mul_,
+      const float* gemm_out_sqrsum_,
+      const float* hc_scale_,
+      const float* hc_base_,
+      const scalar_t* residual_,
+      float* post_mix_,
+      float* comb_mix_,
+      scalar_t* layer_input_,
+      int T_total_,
+      int hidden_size_,
+      int n_splits_,
+      float rms_eps_,
+      float hc_pre_eps_,
+      float hc_sinkhorn_eps_,
+      float hc_post_mult_value_,
+      int sinkhorn_iters_)
+      : gemm_out_mul(gemm_out_mul_),
+        gemm_out_sqrsum(gemm_out_sqrsum_),
+        hc_scale(hc_scale_),
+        hc_base(hc_base_),
+        residual(residual_),
+        post_mix(post_mix_),
+        comb_mix(comb_mix_),
+        layer_input(layer_input_),
+        T_total(T_total_),
+        hidden_size(hidden_size_),
+        n_splits(n_splits_),
+        rms_eps(rms_eps_),
+        hc_pre_eps(hc_pre_eps_),
+        hc_sinkhorn_eps(hc_sinkhorn_eps_),
+        hc_post_mult_value(hc_post_mult_value_),
+        sinkhorn_iters(sinkhorn_iters_) {}
+
+  void sycl_ker_config_convention(sycl::handler& cgh) {
+    constexpr int slm_size = HC3 + HC;
+    slm_ = sycl::local_accessor<float, 1>(slm_size, cgh);
+  }
 
   [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
     sycl::sub_group sg = item.get_sub_group();
@@ -171,7 +210,7 @@ struct HCPreBigFuseKernel {
 };
 
 template <typename scalar_t, int VEC_SIZE>
-struct HCPreBigFuseWithNormKernel {
+struct HCPreBigFuseWithNormKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   const float* __restrict__ gemm_out_mul;     // [n_splits, T, 24] FP32
   const float* __restrict__ gemm_out_sqrsum;  // [n_splits, T] FP32
   const float* __restrict__ hc_scale;         // [3] FP32
@@ -193,6 +232,49 @@ struct HCPreBigFuseWithNormKernel {
   float norm_eps;
 
   sycl::local_accessor<float, 1> slm_;
+
+  HCPreBigFuseWithNormKernel(
+      const float* gemm_out_mul_,
+      const float* gemm_out_sqrsum_,
+      const float* hc_scale_,
+      const float* hc_base_,
+      const scalar_t* residual_,
+      float* post_mix_,
+      float* comb_mix_,
+      scalar_t* layer_input_,
+      const scalar_t* norm_weight_,
+      int T_total_,
+      int hidden_size_,
+      int n_splits_,
+      float rms_eps_,
+      float hc_pre_eps_,
+      float hc_sinkhorn_eps_,
+      float hc_post_mult_value_,
+      int sinkhorn_iters_,
+      float norm_eps_)
+      : gemm_out_mul(gemm_out_mul_),
+        gemm_out_sqrsum(gemm_out_sqrsum_),
+        hc_scale(hc_scale_),
+        hc_base(hc_base_),
+        residual(residual_),
+        post_mix(post_mix_),
+        comb_mix(comb_mix_),
+        layer_input(layer_input_),
+        norm_weight(norm_weight_),
+        T_total(T_total_),
+        hidden_size(hidden_size_),
+        n_splits(n_splits_),
+        rms_eps(rms_eps_),
+        hc_pre_eps(hc_pre_eps_),
+        hc_sinkhorn_eps(hc_sinkhorn_eps_),
+        hc_post_mult_value(hc_post_mult_value_),
+        sinkhorn_iters(sinkhorn_iters_),
+        norm_eps(norm_eps_) {}
+
+  void sycl_ker_config_convention(sycl::handler& cgh) {
+    constexpr int slm_size = HC3 + HC;
+    slm_ = sycl::local_accessor<float, 1>(slm_size, cgh);
+  }
 
   [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
     sycl::sub_group sg = item.get_sub_group();
@@ -416,59 +498,48 @@ static void launch_hc_pre_fuse_kernel(
     std::optional<at::Tensor> norm_weight,
     std::optional<double> norm_eps) {
   using scalar_t = sycl::ext::oneapi::bfloat16;
-  constexpr int slm_size = HC3 + HC;
 
   if (norm_weight.has_value()) {
     const float norm_eps_val = static_cast<float>(norm_eps.value_or(1e-6));
-    q.submit([&](sycl::handler& cgh) {
-      sycl::local_accessor<float, 1> slm(sycl::range<1>(slm_size), cgh);
-      auto ker = HCPreBigFuseWithNormKernel<scalar_t, VEC_SIZE>{
-          gemm_out_mul.data_ptr<float>(),
-          gemm_out_sqrsum.data_ptr<float>(),
-          hc_scale.data_ptr<float>(),
-          hc_base.data_ptr<float>(),
-          reinterpret_cast<const scalar_t*>(residual_flat.data_ptr<at::BFloat16>()),
-          post_mix.data_ptr<float>(),
-          comb_mix.data_ptr<float>(),
-          reinterpret_cast<scalar_t*>(layer_input.data_ptr<at::BFloat16>()),
-          reinterpret_cast<const scalar_t*>(norm_weight.value().data_ptr<at::BFloat16>()),
-          static_cast<int>(T),
-          static_cast<int>(hidden_size),
-          static_cast<int>(n_splits),
-          static_cast<float>(rms_eps),
-          static_cast<float>(hc_pre_eps),
-          static_cast<float>(hc_sinkhorn_eps),
-          static_cast<float>(hc_post_mult_value),
-          static_cast<int>(sinkhorn_iters),
-          norm_eps_val,
-          slm,
-      };
-      cgh.parallel_for(sycl::nd_range<1>(T * WG_SIZE, WG_SIZE), ker);
-    });
+    auto ker = HCPreBigFuseWithNormKernel<scalar_t, VEC_SIZE>(
+        gemm_out_mul.data_ptr<float>(),
+        gemm_out_sqrsum.data_ptr<float>(),
+        hc_scale.data_ptr<float>(),
+        hc_base.data_ptr<float>(),
+        reinterpret_cast<const scalar_t*>(residual_flat.data_ptr<at::BFloat16>()),
+        post_mix.data_ptr<float>(),
+        comb_mix.data_ptr<float>(),
+        reinterpret_cast<scalar_t*>(layer_input.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const scalar_t*>(norm_weight.value().data_ptr<at::BFloat16>()),
+        static_cast<int>(T),
+        static_cast<int>(hidden_size),
+        static_cast<int>(n_splits),
+        static_cast<float>(rms_eps),
+        static_cast<float>(hc_pre_eps),
+        static_cast<float>(hc_sinkhorn_eps),
+        static_cast<float>(hc_post_mult_value),
+        static_cast<int>(sinkhorn_iters),
+        norm_eps_val);
+    sycl_kernel_submit(sycl::range<1>(T * WG_SIZE), sycl::range<1>(WG_SIZE), q, ker);
   } else {
-    q.submit([&](sycl::handler& cgh) {
-      sycl::local_accessor<float, 1> slm(sycl::range<1>(slm_size), cgh);
-      auto ker = HCPreBigFuseKernel<scalar_t, VEC_SIZE>{
-          gemm_out_mul.data_ptr<float>(),
-          gemm_out_sqrsum.data_ptr<float>(),
-          hc_scale.data_ptr<float>(),
-          hc_base.data_ptr<float>(),
-          reinterpret_cast<const scalar_t*>(residual_flat.data_ptr<at::BFloat16>()),
-          post_mix.data_ptr<float>(),
-          comb_mix.data_ptr<float>(),
-          reinterpret_cast<scalar_t*>(layer_input.data_ptr<at::BFloat16>()),
-          static_cast<int>(T),
-          static_cast<int>(hidden_size),
-          static_cast<int>(n_splits),
-          static_cast<float>(rms_eps),
-          static_cast<float>(hc_pre_eps),
-          static_cast<float>(hc_sinkhorn_eps),
-          static_cast<float>(hc_post_mult_value),
-          static_cast<int>(sinkhorn_iters),
-          slm,
-      };
-      cgh.parallel_for(sycl::nd_range<1>(T * WG_SIZE, WG_SIZE), ker);
-    });
+    auto ker = HCPreBigFuseKernel<scalar_t, VEC_SIZE>(
+        gemm_out_mul.data_ptr<float>(),
+        gemm_out_sqrsum.data_ptr<float>(),
+        hc_scale.data_ptr<float>(),
+        hc_base.data_ptr<float>(),
+        reinterpret_cast<const scalar_t*>(residual_flat.data_ptr<at::BFloat16>()),
+        post_mix.data_ptr<float>(),
+        comb_mix.data_ptr<float>(),
+        reinterpret_cast<scalar_t*>(layer_input.data_ptr<at::BFloat16>()),
+        static_cast<int>(T),
+        static_cast<int>(hidden_size),
+        static_cast<int>(n_splits),
+        static_cast<float>(rms_eps),
+        static_cast<float>(hc_pre_eps),
+        static_cast<float>(hc_sinkhorn_eps),
+        static_cast<float>(hc_post_mult_value),
+        static_cast<int>(sinkhorn_iters));
+    sycl_kernel_submit(sycl::range<1>(T * WG_SIZE), sycl::range<1>(WG_SIZE), q, ker);
   }
 }
 

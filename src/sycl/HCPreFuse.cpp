@@ -7,17 +7,14 @@
 #include "SYCLHelpers.h"
 #include "Utils.h"
 
-// Kernel configuration
-static constexpr int WG_SIZE = 96;         // 6 subgroups of 16 threads each
-static constexpr int HC = 4;               // hc_mult value
-static constexpr int HC2 = HC * HC;        // 16
-static constexpr int HC3 = (2 + HC) * HC;  // 24
-static constexpr int SINKHORN_ITERS = 20;
-
+static constexpr int WG_SIZE = 96;  // 6 subgroups of 16 threads each
 static constexpr float LOG2E = 1.442695040888963f;
 
-template <typename scalar_t, int VEC_SIZE>
+template <typename scalar_t, int VEC_SIZE, int HC = 4>
 struct HCPreBigFuseKernelBase : public __SYCL_KER_CONFIG_CONVENTION__ {
+  static constexpr int HC2 = HC * HC;
+  static constexpr int HC3 = (2 + HC) * HC;
+  static constexpr int SINKHORN_ITERS = 20;
   const float* __restrict__ gemm_out_mul;     // [n_splits, T, 24] FP32
   const float* __restrict__ gemm_out_sqrsum;  // [n_splits, T] FP32
   const float* __restrict__ hc_scale;         // [3] FP32
@@ -155,9 +152,9 @@ struct HCPreBigFuseKernelBase : public __SYCL_KER_CONFIG_CONVENTION__ {
   }
 };
 
-template <typename scalar_t, int VEC_SIZE>
-struct HCPreBigFuseKernel : public HCPreBigFuseKernelBase<scalar_t, VEC_SIZE> {
-  using Base = HCPreBigFuseKernelBase<scalar_t, VEC_SIZE>;
+template <typename scalar_t, int VEC_SIZE, int HC = 4>
+struct HCPreBigFuseKernel : public HCPreBigFuseKernelBase<scalar_t, VEC_SIZE, HC> {
+  using Base = HCPreBigFuseKernelBase<scalar_t, VEC_SIZE, HC>;
 
   HCPreBigFuseKernel(
       const float* gemm_out_mul_,
@@ -254,9 +251,9 @@ struct HCPreBigFuseKernel : public HCPreBigFuseKernelBase<scalar_t, VEC_SIZE> {
   }
 };
 
-template <typename scalar_t, int VEC_SIZE>
-struct HCPreBigFuseWithNormKernel : public HCPreBigFuseKernelBase<scalar_t, VEC_SIZE> {
-  using Base = HCPreBigFuseKernelBase<scalar_t, VEC_SIZE>;
+template <typename scalar_t, int VEC_SIZE, int HC = 4>
+struct HCPreBigFuseWithNormKernel : public HCPreBigFuseKernelBase<scalar_t, VEC_SIZE, HC> {
+  using Base = HCPreBigFuseKernelBase<scalar_t, VEC_SIZE, HC>;
 
   const scalar_t* __restrict__ norm_weight;
   float norm_eps;
@@ -535,6 +532,11 @@ void hc_pre_big_fuse(
   TORCH_CHECK(comb_mix.scalar_type() == at::kFloat, "comb_mix must be float32");
   TORCH_CHECK(layer_input.scalar_type() == at::kBFloat16, "layer_input must be bfloat16");
 
+  constexpr int HC = 4;
+  constexpr int HC3 = (2 + HC) * HC;
+  constexpr int HC2 = HC * HC;
+  constexpr int SINKHORN_ITERS = 20;
+
   TORCH_CHECK(static_cast<int>(hc_mult) == HC, "hc_mult must be ", HC, ", got ", hc_mult);
   TORCH_CHECK(
       static_cast<int>(sinkhorn_iters) == SINKHORN_ITERS,
@@ -565,73 +567,42 @@ void hc_pre_big_fuse(
     TORCH_CHECK(norm_weight.value().numel() == hidden_size, "norm_weight size must match hidden_size");
   }
 
-  TORCH_CHECK(T < std::numeric_limits<int>::max(), "T too large");
-  TORCH_CHECK(hidden_size < std::numeric_limits<int>::max(), "hidden_size too large");
-
   auto q = dpcppGetCurrentQueue();
 
   // Dynamic VEC_SIZE selection based on batch size
   int vec_size = (T <= 16) ? 8 : (T <= 48) ? 4 : 2;
 
-  if (vec_size == 8) {
-    launch_hc_pre_fuse_kernel<8>(
-        q,
-        gemm_out_mul,
-        gemm_out_sqrsum,
-        hc_scale,
-        hc_base,
-        residual_flat,
-        post_mix,
-        comb_mix,
-        layer_input,
-        T,
-        hidden_size,
-        n_splits,
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_mult_value,
-        norm_weight,
-        norm_eps);
-  } else if (vec_size == 4) {
-    launch_hc_pre_fuse_kernel<4>(
-        q,
-        gemm_out_mul,
-        gemm_out_sqrsum,
-        hc_scale,
-        hc_base,
-        residual_flat,
-        post_mix,
-        comb_mix,
-        layer_input,
-        T,
-        hidden_size,
-        n_splits,
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_mult_value,
-        norm_weight,
-        norm_eps);
-  } else {
-    launch_hc_pre_fuse_kernel<2>(
-        q,
-        gemm_out_mul,
-        gemm_out_sqrsum,
-        hc_scale,
-        hc_base,
-        residual_flat,
-        post_mix,
-        comb_mix,
-        layer_input,
-        T,
-        hidden_size,
-        n_splits,
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_mult_value,
-        norm_weight,
-        norm_eps);
+#define LAUNCH_HC_PRE_FUSE(VEC_SIZE)     \
+  case VEC_SIZE: {                       \
+    launch_hc_pre_fuse_kernel<VEC_SIZE>( \
+        q,                               \
+        gemm_out_mul,                    \
+        gemm_out_sqrsum,                 \
+        hc_scale,                        \
+        hc_base,                         \
+        residual_flat,                   \
+        post_mix,                        \
+        comb_mix,                        \
+        layer_input,                     \
+        T,                               \
+        hidden_size,                     \
+        n_splits,                        \
+        rms_eps,                         \
+        hc_pre_eps,                      \
+        hc_sinkhorn_eps,                 \
+        hc_post_mult_value,              \
+        norm_weight,                     \
+        norm_eps);                       \
+    break;                               \
   }
+
+  switch (vec_size) {
+    LAUNCH_HC_PRE_FUSE(8);
+    LAUNCH_HC_PRE_FUSE(4);
+    LAUNCH_HC_PRE_FUSE(2);
+    default:
+      TORCH_CHECK(false, "Unsupported vec_size: ", vec_size);
+  }
+
+#undef LAUNCH_HC_PRE_FUSE
 }

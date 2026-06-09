@@ -17,7 +17,7 @@ static constexpr int SINKHORN_ITERS = 20;
 static constexpr float LOG2E = 1.442695040888963f;
 
 template <typename scalar_t, int VEC_SIZE>
-struct HCPreBigFuseKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
+struct HCPreBigFuseKernelBase : public __SYCL_KER_CONFIG_CONVENTION__ {
   const float* __restrict__ gemm_out_mul;     // [n_splits, T, 24] FP32
   const float* __restrict__ gemm_out_sqrsum;  // [n_splits, T] FP32
   const float* __restrict__ hc_scale;         // [3] FP32
@@ -37,7 +37,7 @@ struct HCPreBigFuseKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
   sycl::local_accessor<float, 1> slm_;
 
-  HCPreBigFuseKernel(
+  HCPreBigFuseKernelBase(
       const float* gemm_out_mul_,
       const float* gemm_out_sqrsum_,
       const float* hc_scale_,
@@ -74,18 +74,11 @@ struct HCPreBigFuseKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     slm_ = sycl::local_accessor<float, 1>(slm_size, cgh);
   }
 
-  [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
-    sycl::sub_group sg = item.get_sub_group();
-
-    const int token_id = static_cast<int>(item.get_group(0));
-    const int tid = static_cast<int>(item.get_local_id(0));      // 0..95
-    const int sg_id = static_cast<int>(sg.get_group_id()[0]);    // 0..5
-    const int lane_id = static_cast<int>(sg.get_local_id()[0]);  // 0..15
-
-    if (token_id >= T_total) return;
-
-    float* mixes_shared = slm_.get_multi_ptr<sycl::access::decorated::no>().get();  // 24 floats
-    float* pre_mix_shared = mixes_shared + HC3;                                     // 4 floats
+  // RMS normalization and Sinkhorn computation
+  inline float* compute_rms_and_sinkhorn(
+      sycl::nd_item<1> item, sycl::sub_group sg, int token_id, int tid, int sg_id, int lane_id) const {
+    float* mixes_shared = slm_.get_multi_ptr<sycl::access::decorated::no>().get();
+    float* pre_mix_shared = mixes_shared + HC3;
 
     // RMS normalization fused with mix accumulation
     if (tid < HC3) {
@@ -158,15 +151,68 @@ struct HCPreBigFuseKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
     item.barrier(sycl::access::fence_space::local_space);
 
+    return pre_mix_shared;
+  }
+};
+
+template <typename scalar_t, int VEC_SIZE>
+struct HCPreBigFuseKernel : public HCPreBigFuseKernelBase<scalar_t, VEC_SIZE> {
+  using Base = HCPreBigFuseKernelBase<scalar_t, VEC_SIZE>;
+
+  HCPreBigFuseKernel(
+      const float* gemm_out_mul_,
+      const float* gemm_out_sqrsum_,
+      const float* hc_scale_,
+      const float* hc_base_,
+      const scalar_t* residual_,
+      float* post_mix_,
+      float* comb_mix_,
+      scalar_t* layer_input_,
+      int T_total_,
+      int hidden_size_,
+      int n_splits_,
+      float rms_eps_,
+      float hc_pre_eps_,
+      float hc_sinkhorn_eps_,
+      float hc_post_mult_value_)
+      : Base(
+            gemm_out_mul_,
+            gemm_out_sqrsum_,
+            hc_scale_,
+            hc_base_,
+            residual_,
+            post_mix_,
+            comb_mix_,
+            layer_input_,
+            T_total_,
+            hidden_size_,
+            n_splits_,
+            rms_eps_,
+            hc_pre_eps_,
+            hc_sinkhorn_eps_,
+            hc_post_mult_value_) {}
+
+  [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
+    sycl::sub_group sg = item.get_sub_group();
+
+    const int token_id = static_cast<int>(item.get_group(0));
+    const int tid = static_cast<int>(item.get_local_id(0));
+    const int sg_id = static_cast<int>(sg.get_group_id()[0]);
+    const int lane_id = static_cast<int>(sg.get_local_id()[0]);
+
+    if (token_id >= this->T_total) return;
+
+    float* pre_mix_shared = this->compute_rms_and_sinkhorn(item, sg, token_id, tid, sg_id, lane_id);
+
     // Weighted sum
-    const int threads_for_wsum = WG_SIZE;  // 96 threads
-    const int thread_local_id = tid;       // 0..95
+    const int threads_for_wsum = WG_SIZE;
+    const int thread_local_id = tid;
 
     constexpr int kVecSize = VEC_SIZE;
     using vec_in = vec_t<scalar_t, kVecSize>;
     using vec_out = vec_t<scalar_t, kVecSize>;
 
-    const int num_vec_elems = hidden_size / kVecSize;
+    const int num_vec_elems = this->hidden_size / kVecSize;
     const int vec_tail_start = num_vec_elems * kVecSize;
 
     for (int i = thread_local_id; i < num_vec_elems; i += threads_for_wsum) {
@@ -175,9 +221,10 @@ struct HCPreBigFuseKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       float accum[kVecSize] = {};
 
       for (int k = 0; k < HC; k++) {
-        const int64_t res_base = (static_cast<int64_t>(token_id) * HC + k) * hidden_size + h;
+        const int64_t res_base = (static_cast<int64_t>(token_id) * HC + k) * this->hidden_size + h;
         vec_in v;
-        v.load(0, sycl::multi_ptr<const scalar_t, sycl::access::address_space::global_space>(&residual[res_base]));
+        v.load(
+            0, sycl::multi_ptr<const scalar_t, sycl::access::address_space::global_space>(&this->residual[res_base]));
 
 #pragma unroll
         for (int j = 0; j < kVecSize; ++j) {
@@ -193,42 +240,26 @@ struct HCPreBigFuseKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       out.store(
           0,
           sycl::multi_ptr<scalar_t, sycl::access::address_space::global_space>(
-              &layer_input[static_cast<int64_t>(token_id) * hidden_size + h]));
+              &this->layer_input[static_cast<int64_t>(token_id) * this->hidden_size + h]));
     }
 
-    for (int h = vec_tail_start + thread_local_id; h < hidden_size; h += threads_for_wsum) {
+    for (int h = vec_tail_start + thread_local_id; h < this->hidden_size; h += threads_for_wsum) {
       float accum = 0.0f;
       for (int k = 0; k < HC; k++) {
-        const int64_t res_idx = (static_cast<int64_t>(token_id) * HC + k) * hidden_size + h;
-        accum += pre_mix_shared[k] * static_cast<float>(residual[res_idx]);
+        const int64_t res_idx = (static_cast<int64_t>(token_id) * HC + k) * this->hidden_size + h;
+        accum += pre_mix_shared[k] * static_cast<float>(this->residual[res_idx]);
       }
-      layer_input[static_cast<int64_t>(token_id) * hidden_size + h] = static_cast<scalar_t>(accum);
+      this->layer_input[static_cast<int64_t>(token_id) * this->hidden_size + h] = static_cast<scalar_t>(accum);
     }
   }
 };
 
 template <typename scalar_t, int VEC_SIZE>
-struct HCPreBigFuseWithNormKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
-  const float* __restrict__ gemm_out_mul;     // [n_splits, T, 24] FP32
-  const float* __restrict__ gemm_out_sqrsum;  // [n_splits, T] FP32
-  const float* __restrict__ hc_scale;         // [3] FP32
-  const float* __restrict__ hc_base;          // [24] FP32
-  const scalar_t* __restrict__ residual;      // [T, 4, D] BF16
-  float* __restrict__ post_mix;               // [T, 4] FP32
-  float* __restrict__ comb_mix;               // [T, 16] FP32
-  scalar_t* __restrict__ layer_input;         // [T, D] BF16
-  const scalar_t* __restrict__ norm_weight;   // [D] BF16
+struct HCPreBigFuseWithNormKernel : public HCPreBigFuseKernelBase<scalar_t, VEC_SIZE> {
+  using Base = HCPreBigFuseKernelBase<scalar_t, VEC_SIZE>;
 
-  int T_total;
-  int hidden_size;
-  int n_splits;
-  float rms_eps;
-  float hc_pre_eps;
-  float hc_sinkhorn_eps;
-  float hc_post_mult_value;
+  const scalar_t* __restrict__ norm_weight;
   float norm_eps;
-
-  sycl::local_accessor<float, 1> slm_;
 
   HCPreBigFuseWithNormKernel(
       const float* gemm_out_mul_,
@@ -248,111 +279,36 @@ struct HCPreBigFuseWithNormKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       float hc_sinkhorn_eps_,
       float hc_post_mult_value_,
       float norm_eps_)
-      : gemm_out_mul(gemm_out_mul_),
-        gemm_out_sqrsum(gemm_out_sqrsum_),
-        hc_scale(hc_scale_),
-        hc_base(hc_base_),
-        residual(residual_),
-        post_mix(post_mix_),
-        comb_mix(comb_mix_),
-        layer_input(layer_input_),
+      : Base(
+            gemm_out_mul_,
+            gemm_out_sqrsum_,
+            hc_scale_,
+            hc_base_,
+            residual_,
+            post_mix_,
+            comb_mix_,
+            layer_input_,
+            T_total_,
+            hidden_size_,
+            n_splits_,
+            rms_eps_,
+            hc_pre_eps_,
+            hc_sinkhorn_eps_,
+            hc_post_mult_value_),
         norm_weight(norm_weight_),
-        T_total(T_total_),
-        hidden_size(hidden_size_),
-        n_splits(n_splits_),
-        rms_eps(rms_eps_),
-        hc_pre_eps(hc_pre_eps_),
-        hc_sinkhorn_eps(hc_sinkhorn_eps_),
-        hc_post_mult_value(hc_post_mult_value_),
         norm_eps(norm_eps_) {}
-
-  void sycl_ker_config_convention(sycl::handler& cgh) {
-    constexpr int slm_size = HC3 + HC;
-    slm_ = sycl::local_accessor<float, 1>(slm_size, cgh);
-  }
 
   [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
     sycl::sub_group sg = item.get_sub_group();
 
     const int token_id = static_cast<int>(item.get_group(0));
-    const int tid = static_cast<int>(item.get_local_id(0));      // 0..95
-    const int sg_id = static_cast<int>(sg.get_group_id()[0]);    // 0..5
-    const int lane_id = static_cast<int>(sg.get_local_id()[0]);  // 0..15
+    const int tid = static_cast<int>(item.get_local_id(0));
+    const int sg_id = static_cast<int>(sg.get_group_id()[0]);
+    const int lane_id = static_cast<int>(sg.get_local_id()[0]);
 
-    if (token_id >= T_total) return;
+    if (token_id >= this->T_total) return;
 
-    float* mixes_shared = slm_.get_multi_ptr<sycl::access::decorated::no>().get();  // 24 floats
-    float* pre_mix_shared = mixes_shared + HC3;                                     // 4 floats
-
-    if (tid < HC3) {
-      float sqrsum = 0.0f;
-      float mix_val = 0.0f;
-      for (int split = 0; split < n_splits; split++) {
-        const int row = split * T_total + token_id;
-        sqrsum += gemm_out_sqrsum[row];
-        mix_val += gemm_out_mul[row * HC3 + tid];
-      }
-      const float rms = sycl::native::rsqrt(sqrsum * sycl::native::recip(HC * hidden_size) + rms_eps);
-      mixes_shared[tid] = mix_val * rms;
-    }
-
-    item.barrier(sycl::access::fence_space::local_space);
-
-    // mix operations
-    if (sg_id == 0) {
-      // pre_mix, post_mix computed by lanes 0-3
-      if (lane_id < HC) {
-        // pre_mix from mixes[0:4]
-        const float pre_logit = mixes_shared[lane_id] * hc_scale[0] + hc_base[lane_id];
-        pre_mix_shared[lane_id] = sycl::native::recip(1.0f + sycl::native::exp2(-pre_logit * LOG2E)) + hc_pre_eps;
-
-        // post_mix from mixes[4:8]
-        const float post_logit = mixes_shared[HC + lane_id] * hc_scale[1] + hc_base[HC + lane_id];
-        post_mix[static_cast<int64_t>(token_id) * HC + lane_id] =
-            hc_post_mult_value * sycl::native::recip(1.0f + sycl::native::exp2(-post_logit * LOG2E));
-      }
-
-      // comb_mix (Sinkhorn) computed by all 16 lanes from mixes[8:24]
-      float comb_logit = mixes_shared[2 * HC + lane_id] * hc_scale[2] + hc_base[2 * HC + lane_id];
-
-      float row_max = comb_logit;
-#pragma unroll
-      for (int mask = 1; mask < HC; mask <<= 1)
-        row_max = sycl::fmax(row_max, sycl::permute_group_by_xor(sg, row_max, mask));
-
-      float comb_val = sycl::native::exp2((comb_logit - row_max) * LOG2E);
-      float row_sum = comb_val;
-#pragma unroll
-      for (int mask = 1; mask < HC; mask <<= 1)
-        row_sum += sycl::permute_group_by_xor(sg, row_sum, mask);
-
-      comb_val = comb_val * sycl::native::recip(row_sum) + hc_sinkhorn_eps;
-
-      float col_sum = comb_val;
-#pragma unroll
-      for (int mask = HC; mask < HC2; mask <<= 1)
-        col_sum += sycl::permute_group_by_xor(sg, col_sum, mask);
-      comb_val = comb_val * sycl::native::recip(col_sum + hc_sinkhorn_eps);
-
-#pragma unroll
-      for (int iter = 1; iter < SINKHORN_ITERS; ++iter) {
-        row_sum = comb_val;
-#pragma unroll
-        for (int mask = 1; mask < HC; mask <<= 1)
-          row_sum += sycl::permute_group_by_xor(sg, row_sum, mask);
-        comb_val = comb_val * sycl::native::recip(row_sum + hc_sinkhorn_eps);
-
-        col_sum = comb_val;
-#pragma unroll
-        for (int mask = HC; mask < HC2; mask <<= 1)
-          col_sum += sycl::permute_group_by_xor(sg, col_sum, mask);
-        comb_val = comb_val * sycl::native::recip(col_sum + hc_sinkhorn_eps);
-      }
-
-      comb_mix[static_cast<int64_t>(token_id) * HC2 + lane_id] = comb_val;
-    }
-
-    item.barrier(sycl::access::fence_space::local_space);
+    float* pre_mix_shared = this->compute_rms_and_sinkhorn(item, sg, token_id, tid, sg_id, lane_id);
 
     // Weighted sum with local square-sum calculation
     if (tid >= 16) {
@@ -362,7 +318,7 @@ struct HCPreBigFuseWithNormKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       constexpr int kVecSize = VEC_SIZE;
       using vec_in = vec_t<scalar_t, kVecSize>;
 
-      const int num_vec_elems = hidden_size / kVecSize;
+      const int num_vec_elems = this->hidden_size / kVecSize;
       const int vec_tail_start = num_vec_elems * kVecSize;
 
       float local_sqr_sum = 0.0f;
@@ -371,9 +327,10 @@ struct HCPreBigFuseWithNormKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         float accum[kVecSize] = {};
 
         for (int k = 0; k < HC; k++) {
-          const int64_t res_base = (static_cast<int64_t>(token_id) * HC + k) * hidden_size + h;
+          const int64_t res_base = (static_cast<int64_t>(token_id) * HC + k) * this->hidden_size + h;
           vec_in v;
-          v.load(0, sycl::multi_ptr<const scalar_t, sycl::access::address_space::global_space>(&residual[res_base]));
+          v.load(
+              0, sycl::multi_ptr<const scalar_t, sycl::access::address_space::global_space>(&this->residual[res_base]));
 
 #pragma unroll
           for (int j = 0; j < kVecSize; ++j) {
@@ -387,30 +344,30 @@ struct HCPreBigFuseWithNormKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         }
       }
 
-      for (int h = vec_tail_start + thread_local_id; h < hidden_size; h += stride) {
+      for (int h = vec_tail_start + thread_local_id; h < this->hidden_size; h += stride) {
         float accum = 0.0f;
         for (int k = 0; k < HC; k++) {
-          const int64_t res_idx = (static_cast<int64_t>(token_id) * HC + k) * hidden_size + h;
-          accum += pre_mix_shared[k] * static_cast<float>(residual[res_idx]);
+          const int64_t res_idx = (static_cast<int64_t>(token_id) * HC + k) * this->hidden_size + h;
+          accum += pre_mix_shared[k] * static_cast<float>(this->residual[res_idx]);
         }
         local_sqr_sum += accum * accum;
       }
 
       local_sqr_sum = sycl::reduce_over_group(sg, local_sqr_sum, sycl::plus<float>());
       if (lane_id == 0) {
-        slm_[sg_id - 1] = local_sqr_sum;  // SG1-5 → indices 0-4
+        this->slm_[sg_id - 1] = local_sqr_sum;
       }
     }
 
     item.barrier(sycl::access::fence_space::local_space);
 
     if (sg_id == 0) {
-      const int idx = sycl::select(0, lane_id, lane_id < 5);  // Now 5 subgroups
-      const float val_to_reduce = sycl::select(0.0f, slm_[idx], lane_id < 5);
+      const int idx = sycl::select(0, lane_id, lane_id < 5);
+      const float val_to_reduce = sycl::select(0.0f, this->slm_[idx], lane_id < 5);
       const float total_sqr_sum = sycl::reduce_over_group(sg, val_to_reduce, sycl::plus<float>());
       if (lane_id == 0) {
-        const float mean_sqr = total_sqr_sum / static_cast<float>(hidden_size);
-        slm_[0] = sycl::rsqrt(mean_sqr + norm_eps);
+        const float mean_sqr = total_sqr_sum / static_cast<float>(this->hidden_size);
+        this->slm_[0] = sycl::rsqrt(mean_sqr + norm_eps);
       }
     }
 
@@ -420,13 +377,13 @@ struct HCPreBigFuseWithNormKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     if (tid >= 16) {
       const int thread_local_id = tid - 16;
       const int stride = 80;
-      const float rms = slm_[0];
+      const float rms = this->slm_[0];
 
       constexpr int kVecSize = VEC_SIZE;
       using vec_in = vec_t<scalar_t, kVecSize>;
       using vec_out = vec_t<scalar_t, kVecSize>;
 
-      const int num_vec_elems = hidden_size / kVecSize;
+      const int num_vec_elems = this->hidden_size / kVecSize;
       const int vec_tail_start = num_vec_elems * kVecSize;
 
       for (int i = thread_local_id; i < num_vec_elems; i += stride) {
@@ -434,9 +391,10 @@ struct HCPreBigFuseWithNormKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         float accum[kVecSize] = {};
 
         for (int k = 0; k < HC; k++) {
-          const int64_t res_base = (static_cast<int64_t>(token_id) * HC + k) * hidden_size + h;
+          const int64_t res_base = (static_cast<int64_t>(token_id) * HC + k) * this->hidden_size + h;
           vec_in v;
-          v.load(0, sycl::multi_ptr<const scalar_t, sycl::access::address_space::global_space>(&residual[res_base]));
+          v.load(
+              0, sycl::multi_ptr<const scalar_t, sycl::access::address_space::global_space>(&this->residual[res_base]));
 
 #pragma unroll
           for (int j = 0; j < kVecSize; ++j) {
@@ -455,17 +413,18 @@ struct HCPreBigFuseWithNormKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         out.store(
             0,
             sycl::multi_ptr<scalar_t, sycl::access::address_space::global_space>(
-                &layer_input[static_cast<int64_t>(token_id) * hidden_size + h]));
+                &this->layer_input[static_cast<int64_t>(token_id) * this->hidden_size + h]));
       }
 
-      for (int h = vec_tail_start + thread_local_id; h < hidden_size; h += stride) {
+      for (int h = vec_tail_start + thread_local_id; h < this->hidden_size; h += stride) {
         float accum = 0.0f;
         for (int k = 0; k < HC; k++) {
-          const int64_t res_idx = (static_cast<int64_t>(token_id) * HC + k) * hidden_size + h;
-          accum += pre_mix_shared[k] * static_cast<float>(residual[res_idx]);
+          const int64_t res_idx = (static_cast<int64_t>(token_id) * HC + k) * this->hidden_size + h;
+          accum += pre_mix_shared[k] * static_cast<float>(this->residual[res_idx]);
         }
         const float weight = static_cast<float>(norm_weight[h]);
-        layer_input[static_cast<int64_t>(token_id) * hidden_size + h] = static_cast<scalar_t>(accum * rms * weight);
+        this->layer_input[static_cast<int64_t>(token_id) * this->hidden_size + h] =
+            static_cast<scalar_t>(accum * rms * weight);
       }
     }
   }
@@ -614,7 +573,6 @@ void hc_pre_big_fuse(
   // Dynamic VEC_SIZE selection based on batch size
   int vec_size = (T <= 16) ? 8 : (T <= 48) ? 4 : 2;
 
-  // Runtime dispatch to template function
   if (vec_size == 8) {
     launch_hc_pre_fuse_kernel<8>(
         q,

@@ -73,7 +73,7 @@ def qk_rms_norm(x, w, eps=1e-6):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("weight_dtype", [torch.float16, torch.float32])
-@pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 701])
 def test_fused_inplace_qknorm(dtype, weight_dtype, head_dim):
     eps = 1e-6
     num_tokens, num_q_heads, num_k_heads = 17, 8, 2
@@ -108,8 +108,12 @@ def test_fused_inplace_qknorm_qwen3_split_view(dtype, num_tokens, head_dim):
 
     assert q.stride(-1) == 1
     assert k.stride(-1) == 1
-    assert q.stride(0) == q_size + kv_size + kv_size
-    assert k.stride(0) == q_size + kv_size + kv_size
+    # When num_tokens == 1, PyTorch's view normalises stride(0) to q_size / kv_size
+    # because the single-row tensor is trivially re-viewable; the non-contiguous
+    # token stride only matters (and is preserved) for num_tokens > 1.
+    if num_tokens > 1:
+        assert q.stride(0) == q_size + kv_size + kv_size
+        assert k.stride(0) == q_size + kv_size + kv_size
 
     q_weight = torch.randn(head_dim, dtype=dtype, device=device)
     k_weight = torch.randn(head_dim, dtype=dtype, device=device)

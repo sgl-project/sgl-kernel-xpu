@@ -40,7 +40,6 @@ compute_freq_yarn_rope(float log2_base, int rotary_dim, int half_dim, float fact
 
 template <bool interleave>
 struct QKNormRopePostOp {
-  static constexpr bool needs_staging = true;
   const int* position_ids;
   float log2_base;
   float factor;
@@ -49,8 +48,13 @@ struct QKNormRopePostOp {
   float attention_factor;
   int rotary_dim;
 
+  int cta_staging_elems(int head_dim, int vec_size) const {
+    return std::min(head_dim, div_up(rotary_dim, vec_size) * vec_size);
+  }
+
   template <typename accscalar_t, int num_tiles, int vec_size, int head_dim>
-  static accscalar_t load_dim(accscalar_t (&elements)[num_tiles][vec_size], sycl::sub_group sg, int lane_id, int dim) {
+  static accscalar_t
+  load_warp_dim(accscalar_t (&elements)[num_tiles][vec_size], sycl::sub_group sg, int lane_id, int dim) {
     constexpr int tile_width = NUM_REDUCE_STAGES * vec_size;
     const int tile = dim / tile_width;
     const int tile_offset = dim - tile * tile_width;
@@ -64,7 +68,7 @@ struct QKNormRopePostOp {
   }
 
   template <typename accscalar_t, int num_tiles, int vec_size, int head_dim>
-  void apply_full_interleave(accscalar_t (&elements)[num_tiles][vec_size], int lane_id, float pos_id) const {
+  void apply_warp_full_interleave(accscalar_t (&elements)[num_tiles][vec_size], int lane_id, float pos_id) const {
     const accscalar_t scale = static_cast<accscalar_t>(attention_factor);
 #pragma unroll
     for (int tile = 0; tile < num_tiles; ++tile) {
@@ -85,8 +89,8 @@ struct QKNormRopePostOp {
   }
 
   template <typename accscalar_t, int num_tiles, int vec_size, int head_dim>
-  void
-  apply_full_neox(accscalar_t (&elements)[num_tiles][vec_size], sycl::sub_group sg, int lane_id, float pos_id) const {
+  void apply_warp_full_neox(
+      accscalar_t (&elements)[num_tiles][vec_size], sycl::sub_group sg, int lane_id, float pos_id) const {
     constexpr int half_rotary_dim = head_dim / 2;
     constexpr int tile_width = NUM_REDUCE_STAGES * vec_size;
     constexpr int lane_xor = (half_rotary_dim / vec_size) % NUM_REDUCE_STAGES;
@@ -144,8 +148,8 @@ struct QKNormRopePostOp {
   }
 
   template <typename accscalar_t, int num_tiles, int vec_size, int head_dim>
-  void
-  apply_generic(accscalar_t (&elements)[num_tiles][vec_size], sycl::sub_group sg, int lane_id, float pos_id) const {
+  void apply_warp_generic(
+      accscalar_t (&elements)[num_tiles][vec_size], sycl::sub_group sg, int lane_id, float pos_id) const {
     const accscalar_t scale = static_cast<accscalar_t>(attention_factor);
     // A copy is required: for neox partial-rotary the second-half elements read their
     // paired dim from the first half, which may have been written in an earlier tile
@@ -186,7 +190,8 @@ struct QKNormRopePostOp {
         }
 
         // Always call load_dim so all lanes participate in the group shuffle.
-        accscalar_t rotated = load_dim<accscalar_t, num_tiles, vec_size, head_dim>(original, sg, lane_id, paired_dim);
+        accscalar_t rotated =
+            load_warp_dim<accscalar_t, num_tiles, vec_size, head_dim>(original, sg, lane_id, paired_dim);
 
         if (in_rotary) {
           if (negate) {
@@ -204,7 +209,7 @@ struct QKNormRopePostOp {
   }
 
   template <typename accscalar_t, int num_tiles, int vec_size, int head_dim>
-  void apply(
+  void apply_warp_path(
       accscalar_t (&elements)[num_tiles][vec_size],
       sycl::nd_item<1> item,
       int64_t token_id,
@@ -218,21 +223,21 @@ struct QKNormRopePostOp {
 
     if (rotary_dim == head_dim) {
       if constexpr (interleave && vec_size % 2 == 0) {
-        apply_full_interleave<accscalar_t, num_tiles, vec_size, head_dim>(elements, lane_id, pos_id);
+        apply_warp_full_interleave<accscalar_t, num_tiles, vec_size, head_dim>(elements, lane_id, pos_id);
       } else if constexpr (!interleave) {
-        apply_full_neox<accscalar_t, num_tiles, vec_size, head_dim>(elements, sg, lane_id, pos_id);
+        apply_warp_full_neox<accscalar_t, num_tiles, vec_size, head_dim>(elements, sg, lane_id, pos_id);
       } else {
-        apply_generic<accscalar_t, num_tiles, vec_size, head_dim>(elements, sg, lane_id, pos_id);
+        apply_warp_generic<accscalar_t, num_tiles, vec_size, head_dim>(elements, sg, lane_id, pos_id);
       }
     } else {
-      apply_generic<accscalar_t, num_tiles, vec_size, head_dim>(elements, sg, lane_id, pos_id);
+      apply_warp_generic<accscalar_t, num_tiles, vec_size, head_dim>(elements, sg, lane_id, pos_id);
     }
   }
 
-  // CTA path: the full normalized head lives in `head` (shared local memory), so paired
-  // RoPE dimensions are read directly instead of via sub-group shuffles. Works for any head size.
+  // CTA path: the normalized head lives in shared local memory, so paired RoPE
+  // dimensions are read directly from `head` and work for any head size.
   template <typename accscalar_t, typename HeadT>
-  accscalar_t apply_cta(const HeadT& head, int dim, int64_t token_id) const {
+  accscalar_t apply_cta_path(const HeadT& head, int dim, int64_t token_id) const {
     const accscalar_t x = head[dim];
     if (dim >= rotary_dim) {
       return x;

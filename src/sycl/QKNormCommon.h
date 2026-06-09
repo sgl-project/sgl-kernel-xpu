@@ -53,12 +53,16 @@ struct Layout {
 };
 
 struct NoPostOp {
-  static constexpr bool needs_staging = false;
+  static constexpr int cta_staging_elems(int, int) {
+    return 0;
+  }
+
   template <typename accscalar_t, int num_tiles, int vec_size, int head_dim>
-  void apply(accscalar_t (&)[num_tiles][vec_size], sycl::nd_item<1>, int64_t, int64_t, bool, int64_t, int64_t) const {}
+  void apply_warp_path(
+      accscalar_t (&)[num_tiles][vec_size], sycl::nd_item<1>, int64_t, int64_t, bool, int64_t, int64_t) const {}
 
   template <typename accscalar_t, typename HeadT>
-  accscalar_t apply_cta(const HeadT& head, int dim, int64_t) const {
+  accscalar_t apply_cta_path(const HeadT& head, int dim, int64_t) const {
     return head[dim];
   }
 };
@@ -80,6 +84,58 @@ make_separated_layout(torch::Tensor& q, torch::Tensor& k, torch::Tensor& q_weigh
       k.size(1),
       q.size(2)};
 }
+
+template <typename scalar_t, typename weight_t, int vec_size_value>
+struct CTAKernelVecOps {
+  using accscalar_t = acc_type_t<scalar_t>;
+  using vec_t = aligned_vector_loop<scalar_t, vec_size_value>;
+  using weight_vec_t = aligned_vector_loop<weight_t, vec_size_value>;
+
+  static inline void
+  write_scaled_direct(scalar_t* input, int64_t dim, const vec_t& values, const weight_vec_t& gamma, accscalar_t rstd) {
+    vec_t output;
+#pragma unroll
+    for (int v = 0; v < vec_size_value; ++v) {
+      output[v] =
+          static_cast<scalar_t>(static_cast<accscalar_t>(values[v]) * rstd * static_cast<accscalar_t>(gamma[v]));
+    }
+    *(reinterpret_cast<vec_t*>(input + dim)) = output;
+  }
+
+  static inline void write_scaled_or_stage(
+      scalar_t* input,
+      int64_t dim,
+      const vec_t& values,
+      const weight_vec_t& gamma,
+      accscalar_t rstd,
+      int staging_prefix_elems,
+      const sycl::local_accessor<accscalar_t, 1>& staging) {
+    if (dim < staging_prefix_elems) {
+#pragma unroll
+      for (int v = 0; v < vec_size_value; ++v) {
+        staging[dim + v] = static_cast<accscalar_t>(values[v]) * rstd * static_cast<accscalar_t>(gamma[v]);
+      }
+    } else {
+      write_scaled_direct(input, dim, values, gamma, rstd);
+    }
+  }
+
+  template <typename PostOp>
+  static inline void write_postop_from_staging(
+      scalar_t* input,
+      int64_t dim,
+      int64_t token_id,
+      const PostOp& post_op,
+      const sycl::local_accessor<accscalar_t, 1>& staging) {
+    vec_t output;
+#pragma unroll
+    for (int v = 0; v < vec_size_value; ++v) {
+      output[v] = static_cast<scalar_t>(
+          post_op.template apply_cta_path<accscalar_t>(staging, static_cast<int>(dim + v), token_id));
+    }
+    *(reinterpret_cast<vec_t*>(input + dim)) = output;
+  }
+};
 
 template <typename scalar_t, typename weight_t>
 Layout<scalar_t, weight_t> make_packed_qkv_layout_from_ptr(
@@ -216,17 +272,21 @@ struct WarpKernel {
     const int64_t subgroups_per_wg = item.get_local_range(0) / NUM_REDUCE_STAGES;
     const int64_t worker_id = item.get_group(0) * subgroups_per_wg + subgroup_id;
     const int64_t num_workers = item.get_group_range(0) * subgroups_per_wg;
-    const int64_t total_qk_heads = layout.num_q_heads + layout.num_k_heads;
-    const int64_t num_works = layout.num_tokens * total_qk_heads;
+    // Use 32-bit integers for work assignment to avoid 64-bit division emulation
+    // bugs on Intel XPU when total_qk_heads is a non-power-of-2 runtime value.
+    const int total_qk_heads = static_cast<int>(layout.num_q_heads + layout.num_k_heads);
+    const int num_works = static_cast<int>(layout.num_tokens) * total_qk_heads;
 
-    for (int64_t work_id = worker_id; work_id < num_works; work_id += num_workers) {
-      const int64_t token_id = work_id / total_qk_heads;
-      const int64_t head_id = work_id % total_qk_heads;
-      const bool is_q = head_id < layout.num_q_heads;
-      const int64_t local_head_id = is_q ? head_id : head_id - layout.num_q_heads;
+    for (int work_id = static_cast<int>(worker_id); work_id < num_works; work_id += static_cast<int>(num_workers)) {
+      const int token_id = work_id / total_qk_heads;
+      const int head_id = work_id % total_qk_heads;
+      const bool is_q = head_id < static_cast<int>(layout.num_q_heads);
+      const int local_head_id = is_q ? head_id : head_id - static_cast<int>(layout.num_q_heads);
 
-      scalar_t* input = is_q ? layout.q + token_id * layout.q_token_stride + local_head_id * layout.q_head_stride
-                             : layout.k + token_id * layout.k_token_stride + local_head_id * layout.k_head_stride;
+      scalar_t* input = is_q ? layout.q + static_cast<int64_t>(token_id) * layout.q_token_stride +
+                                   static_cast<int64_t>(local_head_id) * layout.q_head_stride
+                             : layout.k + static_cast<int64_t>(token_id) * layout.k_token_stride +
+                                   static_cast<int64_t>(local_head_id) * layout.k_head_stride;
       const weight_t* weight = is_q ? layout.q_weight : layout.k_weight;
 
       accscalar_t sum = 0;
@@ -258,8 +318,14 @@ struct WarpKernel {
         }
       }
 
-      post_op.template apply<accscalar_t, num_tiles, vec_size_value, head_dim>(
-          output_tiles, item, token_id, local_head_id, is_q, lane_id, work_id);
+      post_op.template apply_warp_path<accscalar_t, num_tiles, vec_size_value, head_dim>(
+          output_tiles,
+          item,
+          static_cast<int64_t>(token_id),
+          static_cast<int64_t>(local_head_id),
+          is_q,
+          lane_id,
+          static_cast<int64_t>(work_id));
 
 #pragma unroll
       for (int tile = 0; tile < num_tiles; ++tile) {
@@ -275,16 +341,24 @@ struct WarpKernel {
   }
 };
 
-template <typename scalar_t, typename weight_t, int ITERS, int vec_size_value, typename PostOp>
-struct CTARegisterKernel {
+template <
+    typename scalar_t,
+    typename weight_t,
+    int ITERS,
+    int vec_size_value,
+    typename PostOp,
+    bool UseCtaStaging,
+    bool UseRegisterPath>
+struct CTAKernel {
   using accscalar_t = acc_type_t<scalar_t>;
   using vec_t = aligned_vector_loop<scalar_t, vec_size_value>;
   using weight_vec_t = aligned_vector_loop<weight_t, vec_size_value>;
-  static_assert(ITERS > 0);
+  static_assert(!UseRegisterPath || ITERS > 0);
 
   Layout<scalar_t, weight_t> layout;
   accscalar_t eps;
   PostOp post_op;
+  int staging_prefix_elems;
   sycl::local_accessor<accscalar_t, 1> staging;
 
   [[sycl::reqd_sub_group_size(NUM_REDUCE_STAGES)]] void operator()(sycl::nd_item<1> item) const {
@@ -292,27 +366,56 @@ struct CTARegisterKernel {
     const int64_t num_workgroups = item.get_group_range(0);
     const int64_t local_id = item.get_local_id(0);
     const int64_t workgroup_size = item.get_local_range(0);
-    const int64_t total_qk_heads = layout.num_q_heads + layout.num_k_heads;
-    const int64_t num_works = layout.num_tokens * total_qk_heads;
+    // Use 32-bit integers for work assignment to avoid 64-bit division emulation
+    // bugs on Intel XPU when total_qk_heads is a non-power-of-2 runtime value.
+    const int total_qk_heads = static_cast<int>(layout.num_q_heads + layout.num_k_heads);
+    const int num_works = static_cast<int>(layout.num_tokens) * total_qk_heads;
 
-    for (int64_t work_id = workgroup_id; work_id < num_works; work_id += num_workgroups) {
-      const int64_t token_id = work_id / total_qk_heads;
-      const int64_t head_id = work_id % total_qk_heads;
-      const bool is_q = head_id < layout.num_q_heads;
-      const int64_t local_head_id = is_q ? head_id : head_id - layout.num_q_heads;
+    for (int work_id = static_cast<int>(workgroup_id); work_id < num_works;
+         work_id += static_cast<int>(num_workgroups)) {
+      const int token_id = work_id / total_qk_heads;
+      const int head_id = work_id % total_qk_heads;
+      const bool is_q = head_id < static_cast<int>(layout.num_q_heads);
+      const int local_head_id = is_q ? head_id : head_id - static_cast<int>(layout.num_q_heads);
 
-      scalar_t* input = is_q ? layout.q + token_id * layout.q_token_stride + local_head_id * layout.q_head_stride
-                             : layout.k + token_id * layout.k_token_stride + local_head_id * layout.k_head_stride;
+      scalar_t* input = is_q ? layout.q + static_cast<int64_t>(token_id) * layout.q_token_stride +
+                                   static_cast<int64_t>(local_head_id) * layout.q_head_stride
+                             : layout.k + static_cast<int64_t>(token_id) * layout.k_token_stride +
+                                   static_cast<int64_t>(local_head_id) * layout.k_head_stride;
       const weight_t* weight = is_q ? layout.q_weight : layout.k_weight;
 
+      using VecOps = CTAKernelVecOps<scalar_t, weight_t, vec_size_value>;
+      const auto write_scaled = [&](int64_t dim, const vec_t& values, accscalar_t rstd) {
+        const weight_vec_t gamma = *(reinterpret_cast<const weight_vec_t*>(weight + dim));
+        if constexpr (UseCtaStaging) {
+          VecOps::write_scaled_or_stage(input, dim, values, gamma, rstd, staging_prefix_elems, staging);
+        } else {
+          VecOps::write_scaled_direct(input, dim, values, gamma, rstd);
+        }
+      };
+      const auto flush_staging = [&](int64_t dim) {
+        VecOps::write_postop_from_staging(input, dim, token_id, post_op, staging);
+      };
+
       accscalar_t sum = 0;
-      vec_t input_tiles[ITERS];
+      vec_t input_tiles[UseRegisterPath ? ITERS : 1];
+      if constexpr (UseRegisterPath) {
 #pragma unroll
-      for (int tile = 0; tile < ITERS; ++tile) {
-        const int64_t dim = (static_cast<int64_t>(tile) * workgroup_size + local_id) * vec_size_value;
-        if (dim < layout.head_dim) {
+        for (int tile = 0; tile < ITERS; ++tile) {
+          const int64_t dim = (static_cast<int64_t>(tile) * workgroup_size + local_id) * vec_size_value;
+          if (dim < layout.head_dim) {
+            const vec_t values = *(reinterpret_cast<const vec_t*>(input + dim));
+            input_tiles[tile] = values;
+#pragma unroll
+            for (int v = 0; v < vec_size_value; ++v) {
+              const accscalar_t value = static_cast<accscalar_t>(values[v]);
+              sum += value * value;
+            }
+          }
+        }
+      } else {
+        for (int64_t dim = local_id * vec_size_value; dim < layout.head_dim; dim += workgroup_size * vec_size_value) {
           const vec_t values = *(reinterpret_cast<const vec_t*>(input + dim));
-          input_tiles[tile] = values;
 #pragma unroll
           for (int v = 0; v < vec_size_value; ++v) {
             const accscalar_t value = static_cast<accscalar_t>(values[v]);
@@ -324,124 +427,37 @@ struct CTARegisterKernel {
       sum = sycl::reduce_over_group(item.get_group(), sum, sycl::plus<accscalar_t>());
       const accscalar_t rstd = Numerics<accscalar_t>::rsqrt(sum / static_cast<accscalar_t>(layout.head_dim) + eps);
 
-#pragma unroll
-      for (int tile = 0; tile < ITERS; ++tile) {
-        const int64_t dim = (static_cast<int64_t>(tile) * workgroup_size + local_id) * vec_size_value;
-        if (dim < layout.head_dim) {
-          const vec_t values = input_tiles[tile];
-          const weight_vec_t gamma = *(reinterpret_cast<const weight_vec_t*>(weight + dim));
-          if constexpr (PostOp::needs_staging) {
-#pragma unroll
-            for (int v = 0; v < vec_size_value; ++v) {
-              staging[dim + v] = static_cast<accscalar_t>(values[v]) * rstd * static_cast<accscalar_t>(gamma[v]);
-            }
-          } else {
-            vec_t output;
-#pragma unroll
-            for (int v = 0; v < vec_size_value; ++v) {
-              output[v] = static_cast<scalar_t>(
-                  static_cast<accscalar_t>(values[v]) * rstd * static_cast<accscalar_t>(gamma[v]));
-            }
-            *(reinterpret_cast<vec_t*>(input + dim)) = output;
-          }
-        }
-      }
-
-      if constexpr (PostOp::needs_staging) {
-        item.barrier(sycl::access::fence_space::local_space);
+      if constexpr (UseRegisterPath) {
 #pragma unroll
         for (int tile = 0; tile < ITERS; ++tile) {
           const int64_t dim = (static_cast<int64_t>(tile) * workgroup_size + local_id) * vec_size_value;
           if (dim < layout.head_dim) {
-            vec_t output;
-#pragma unroll
-            for (int v = 0; v < vec_size_value; ++v) {
-              output[v] = static_cast<scalar_t>(
-                  post_op.template apply_cta<accscalar_t>(staging, static_cast<int>(dim + v), token_id));
-            }
-            *(reinterpret_cast<vec_t*>(input + dim)) = output;
+            write_scaled(dim, input_tiles[tile], rstd);
           }
         }
-        item.barrier(sycl::access::fence_space::local_space);
-      }
-    }
-  }
-};
-
-template <typename scalar_t, typename weight_t, int vec_size_value, typename PostOp>
-struct CTATwoPassKernel {
-  using accscalar_t = acc_type_t<scalar_t>;
-  using vec_t = aligned_vector_loop<scalar_t, vec_size_value>;
-  using weight_vec_t = aligned_vector_loop<weight_t, vec_size_value>;
-
-  Layout<scalar_t, weight_t> layout;
-  accscalar_t eps;
-  PostOp post_op;
-  sycl::local_accessor<accscalar_t, 1> staging;
-
-  [[sycl::reqd_sub_group_size(NUM_REDUCE_STAGES)]] void operator()(sycl::nd_item<1> item) const {
-    const int64_t workgroup_id = item.get_group(0);
-    const int64_t num_workgroups = item.get_group_range(0);
-    const int64_t local_id = item.get_local_id(0);
-    const int64_t workgroup_size = item.get_local_range(0);
-    const int64_t total_qk_heads = layout.num_q_heads + layout.num_k_heads;
-    const int64_t num_works = layout.num_tokens * total_qk_heads;
-
-    for (int64_t work_id = workgroup_id; work_id < num_works; work_id += num_workgroups) {
-      const int64_t token_id = work_id / total_qk_heads;
-      const int64_t head_id = work_id % total_qk_heads;
-      const bool is_q = head_id < layout.num_q_heads;
-      const int64_t local_head_id = is_q ? head_id : head_id - layout.num_q_heads;
-
-      scalar_t* input = is_q ? layout.q + token_id * layout.q_token_stride + local_head_id * layout.q_head_stride
-                             : layout.k + token_id * layout.k_token_stride + local_head_id * layout.k_head_stride;
-      const weight_t* weight = is_q ? layout.q_weight : layout.k_weight;
-
-      accscalar_t sum = 0;
-      for (int64_t dim = local_id * vec_size_value; dim < layout.head_dim; dim += workgroup_size * vec_size_value) {
-        const vec_t values = *(reinterpret_cast<const vec_t*>(input + dim));
-#pragma unroll
-        for (int v = 0; v < vec_size_value; ++v) {
-          const accscalar_t value = static_cast<accscalar_t>(values[v]);
-          sum += value * value;
-        }
-      }
-
-      sum = sycl::reduce_over_group(item.get_group(), sum, sycl::plus<accscalar_t>());
-      const accscalar_t rstd = Numerics<accscalar_t>::rsqrt(sum / static_cast<accscalar_t>(layout.head_dim) + eps);
-
-      if constexpr (PostOp::needs_staging) {
-        for (int64_t dim = local_id * vec_size_value; dim < layout.head_dim; dim += workgroup_size * vec_size_value) {
-          const vec_t values = *(reinterpret_cast<const vec_t*>(input + dim));
-          const weight_vec_t gamma = *(reinterpret_cast<const weight_vec_t*>(weight + dim));
-#pragma unroll
-          for (int v = 0; v < vec_size_value; ++v) {
-            staging[dim + v] = static_cast<accscalar_t>(values[v]) * rstd * static_cast<accscalar_t>(gamma[v]);
-          }
-        }
-        item.barrier(sycl::access::fence_space::local_space);
-        for (int64_t dim = local_id * vec_size_value; dim < layout.head_dim; dim += workgroup_size * vec_size_value) {
-          vec_t output;
-#pragma unroll
-          for (int v = 0; v < vec_size_value; ++v) {
-            output[v] = static_cast<scalar_t>(
-                post_op.template apply_cta<accscalar_t>(staging, static_cast<int>(dim + v), token_id));
-          }
-          *(reinterpret_cast<vec_t*>(input + dim)) = output;
-        }
-        item.barrier(sycl::access::fence_space::local_space);
       } else {
         for (int64_t dim = local_id * vec_size_value; dim < layout.head_dim; dim += workgroup_size * vec_size_value) {
-          const vec_t values = *(reinterpret_cast<const vec_t*>(input + dim));
-          const weight_vec_t gamma = *(reinterpret_cast<const weight_vec_t*>(weight + dim));
-          vec_t output;
-#pragma unroll
-          for (int v = 0; v < vec_size_value; ++v) {
-            output[v] =
-                static_cast<scalar_t>(static_cast<accscalar_t>(values[v]) * rstd * static_cast<accscalar_t>(gamma[v]));
-          }
-          *(reinterpret_cast<vec_t*>(input + dim)) = output;
+          write_scaled(dim, *(reinterpret_cast<const vec_t*>(input + dim)), rstd);
         }
+      }
+
+      if constexpr (UseCtaStaging) {
+        item.barrier(sycl::access::fence_space::local_space);
+        if constexpr (UseRegisterPath) {
+#pragma unroll
+          for (int tile = 0; tile < ITERS; ++tile) {
+            const int64_t dim = (static_cast<int64_t>(tile) * workgroup_size + local_id) * vec_size_value;
+            if (dim < staging_prefix_elems) {
+              flush_staging(dim);
+            }
+          }
+        } else {
+          for (int64_t dim = local_id * vec_size_value; dim < staging_prefix_elems;
+               dim += workgroup_size * vec_size_value) {
+            flush_staging(dim);
+          }
+        }
+        item.barrier(sycl::access::fence_space::local_space);
       }
     }
   }
@@ -474,25 +490,22 @@ void launch_warp_kernel(const Layout<scalar_t, weight_t>& layout, acc_type_t<sca
       kernel);
 }
 
-template <typename scalar_t, typename weight_t, int head_dim, int vec_size_value, typename PostOp>
-void launch_warp_kernel_if_supported(
-    const Layout<scalar_t, weight_t>& layout, acc_type_t<scalar_t> eps, const PostOp& post_op, const char* op_name) {
-  if constexpr (head_dim % (NUM_REDUCE_STAGES * vec_size_value) == 0) {
-    launch_warp_kernel<scalar_t, weight_t, head_dim, vec_size_value, PostOp>(layout, eps, post_op);
-  } else {
-    TORCH_CHECK(false, op_name, ": unsupported warp vec_size for head_dim");
-  }
-}
-
 template <typename scalar_t, typename weight_t, int head_dim, typename PostOp>
 void dispatch_warp_vec_size(
-    const Layout<scalar_t, weight_t>& layout, acc_type_t<scalar_t> eps, const PostOp& post_op, const char* op_name) {
-  const int max_vec_size_value = max_vec_size<scalar_t>();
-  constexpr int64_t subgroup_tile_lanes = NUM_REDUCE_STAGES;
-  const int vec_size_value = vec_size<scalar_t, weight_t>(layout, max_vec_size_value, subgroup_tile_lanes);
+    const Layout<scalar_t, weight_t>& layout,
+    acc_type_t<scalar_t> eps,
+    const PostOp& post_op,
+    const char*,
+    int vec_size_value) {
+  // vec_size_value is pre-computed and validated by dispatch_head_dim; no recomputation needed.
+  // The if constexpr guard in the macro is still required at compile time: the switch
+  // instantiates all VEC_SIZE cases, and WarpKernel has a static_assert that would fire
+  // for combinations where head_dim % (NUM_REDUCE_STAGES * VEC_SIZE) != 0.
 
-#define QKNORM_WARP_VEC_CASE(VEC_SIZE) \
-  launch_warp_kernel_if_supported<scalar_t, weight_t, head_dim, VEC_SIZE, PostOp>(layout, eps, post_op, op_name)
+#define QKNORM_WARP_VEC_CASE(VEC_SIZE)                                                          \
+  if constexpr (head_dim % (NUM_REDUCE_STAGES * (VEC_SIZE)) == 0) {                             \
+    launch_warp_kernel<scalar_t, weight_t, head_dim, (VEC_SIZE), PostOp>(layout, eps, post_op); \
+  }
 
   switch (vec_size_value) {
     case 16:
@@ -515,12 +528,13 @@ void dispatch_warp_vec_size(
 #undef QKNORM_WARP_VEC_CASE
 }
 
-template <typename scalar_t, typename weight_t, int ITERS, int vec_size_value, typename PostOp>
-void launch_cta_register_kernel(
+template <typename scalar_t, typename weight_t, int ITERS, int vec_size_value, typename PostOp, bool UseRegisterPath>
+void launch_cta_kernel(
     const Layout<scalar_t, weight_t>& layout,
     acc_type_t<scalar_t> eps,
     const PostOp& post_op,
-    const CTAConfig& config) {
+    const CTAConfig& config,
+    int staging_prefix_elems) {
   const int64_t num_works = layout.num_tokens * (layout.num_q_heads + layout.num_k_heads);
   const int workgroup_size = config.workgroup_size;
 
@@ -531,43 +545,27 @@ void launch_cta_register_kernel(
   const int num_wgs = std::max(1, std::min(static_cast<int>(num_works), max_resident_wgs));
 
   using accscalar_t = acc_type_t<scalar_t>;
-  const size_t staging_size = PostOp::needs_staging ? static_cast<size_t>(layout.head_dim) : 0;
+  const bool use_cta_staging = staging_prefix_elems > 0;
+  const size_t staging_size = use_cta_staging ? static_cast<size_t>(staging_prefix_elems) : 0;
   queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<accscalar_t, 1> staging(sycl::range<1>(staging_size), cgh);
-    CTARegisterKernel<scalar_t, weight_t, ITERS, vec_size_value, PostOp> kernel{layout, eps, post_op, staging};
-    cgh.parallel_for(
-        sycl::nd_range<1>(
-            sycl::range<1>(static_cast<size_t>(num_wgs) * static_cast<size_t>(workgroup_size)),
-            sycl::range<1>(static_cast<size_t>(workgroup_size))),
-        kernel);
-  });
-}
-
-template <typename scalar_t, typename weight_t, int vec_size_value, typename PostOp>
-void launch_cta_two_pass_kernel(
-    const Layout<scalar_t, weight_t>& layout,
-    acc_type_t<scalar_t> eps,
-    const PostOp& post_op,
-    const CTAConfig& config) {
-  const int64_t num_works = layout.num_tokens * (layout.num_q_heads + layout.num_k_heads);
-  const int workgroup_size = config.workgroup_size;
-
-  auto stream = at::xpu::getCurrentXPUStream();
-  auto queue = stream.queue();
-  const int dev_id = dpcppGetDeviceIdOfCurrentQueue();
-  const int max_resident_wgs = std::max(1, static_cast<int>(dpcppMaxWorkItemsPerTile(dev_id)) / workgroup_size);
-  const int num_wgs = std::max(1, std::min(static_cast<int>(num_works), max_resident_wgs));
-
-  using accscalar_t = acc_type_t<scalar_t>;
-  const size_t staging_size = PostOp::needs_staging ? static_cast<size_t>(layout.head_dim) : 0;
-  queue.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<accscalar_t, 1> staging(sycl::range<1>(staging_size), cgh);
-    CTATwoPassKernel<scalar_t, weight_t, vec_size_value, PostOp> kernel{layout, eps, post_op, staging};
-    cgh.parallel_for(
-        sycl::nd_range<1>(
-            sycl::range<1>(static_cast<size_t>(num_wgs) * static_cast<size_t>(workgroup_size)),
-            sycl::range<1>(static_cast<size_t>(workgroup_size))),
-        kernel);
+    if (use_cta_staging) {
+      CTAKernel<scalar_t, weight_t, ITERS, vec_size_value, PostOp, true, UseRegisterPath> kernel{
+          layout, eps, post_op, staging_prefix_elems, staging};
+      cgh.parallel_for(
+          sycl::nd_range<1>(
+              sycl::range<1>(static_cast<size_t>(num_wgs) * static_cast<size_t>(workgroup_size)),
+              sycl::range<1>(static_cast<size_t>(workgroup_size))),
+          kernel);
+    } else {
+      CTAKernel<scalar_t, weight_t, ITERS, vec_size_value, PostOp, false, UseRegisterPath> kernel{
+          layout, eps, post_op, staging_prefix_elems, staging};
+      cgh.parallel_for(
+          sycl::nd_range<1>(
+              sycl::range<1>(static_cast<size_t>(num_wgs) * static_cast<size_t>(workgroup_size)),
+              sycl::range<1>(static_cast<size_t>(workgroup_size))),
+          kernel);
+    }
   });
 }
 
@@ -577,8 +575,11 @@ void dispatch_cta_iters(
     const Layout<scalar_t, weight_t>& layout,
     acc_type_t<scalar_t> eps,
     const PostOp& post_op) {
-#define QKNORM_CTA_REGISTER_CASE(ITERS) \
-  launch_cta_register_kernel<scalar_t, weight_t, ITERS, vec_size_value, PostOp>(layout, eps, post_op, config)
+#define QKNORM_CTA_REGISTER_CASE(ITERS)                                       \
+  launch_cta_kernel<scalar_t, weight_t, ITERS, vec_size_value, PostOp, true>( \
+      layout, eps, post_op, config, staging_prefix_elems)
+
+  const int staging_prefix_elems = post_op.cta_staging_elems(static_cast<int>(layout.head_dim), config.vec_size);
 
   switch (config.iters) {
     case 1:
@@ -606,7 +607,8 @@ void dispatch_cta_iters(
       QKNORM_CTA_REGISTER_CASE(8);
       break;
     default:
-      launch_cta_two_pass_kernel<scalar_t, weight_t, vec_size_value, PostOp>(layout, eps, post_op, config);
+      launch_cta_kernel<scalar_t, weight_t, 0, vec_size_value, PostOp, false>(
+          layout, eps, post_op, config, staging_prefix_elems);
       break;
   }
 
@@ -651,24 +653,34 @@ void dispatch_head_dim(
     const char* op_name,
     bool allow_cta) {
   TORCH_CHECK(layout.head_dim > 0, op_name, ": head_dim must be positive");
-  switch (layout.head_dim) {
-    case 64:
-      dispatch_warp_vec_size<scalar_t, weight_t, 64, PostOp>(layout, eps, post_op, op_name);
-      break;
-    case 128:
-      dispatch_warp_vec_size<scalar_t, weight_t, 128, PostOp>(layout, eps, post_op, op_name);
-      break;
-    case 256:
-      dispatch_warp_vec_size<scalar_t, weight_t, 256, PostOp>(layout, eps, post_op, op_name);
-      break;
-    default: {
-      TORCH_CHECK(allow_cta, op_name, ": unsupported head dimension: ", layout.head_dim);
-      const int64_t num_works = layout.num_tokens * (layout.num_q_heads + layout.num_k_heads);
-      const CTAConfig config = cta_config<scalar_t, weight_t>(layout, num_works, layout.head_dim, op_name);
-      dispatch_cta_vec_size<scalar_t, weight_t>(config, layout, eps, post_op);
-      break;
+
+  // For warp-path head_dims (64/128/256), verify at runtime that the selected vec_size
+  // satisfies the warp kernel divisibility requirement before committing to that path.
+  // If not (e.g. due to alignment constraints reducing vec_size), fall back to CTA.
+  const bool is_warp_head_dim = (layout.head_dim == 64 || layout.head_dim == 128 || layout.head_dim == 256);
+  if (is_warp_head_dim) {
+    const int warp_vs =
+        vec_size<scalar_t, weight_t>(layout, max_vec_size<scalar_t>(), static_cast<int64_t>(NUM_REDUCE_STAGES));
+    if (layout.head_dim % (NUM_REDUCE_STAGES * warp_vs) == 0) {
+      switch (layout.head_dim) {
+        case 64:
+          dispatch_warp_vec_size<scalar_t, weight_t, 64, PostOp>(layout, eps, post_op, op_name, warp_vs);
+          return;
+        case 128:
+          dispatch_warp_vec_size<scalar_t, weight_t, 128, PostOp>(layout, eps, post_op, op_name, warp_vs);
+          return;
+        case 256:
+          dispatch_warp_vec_size<scalar_t, weight_t, 256, PostOp>(layout, eps, post_op, op_name, warp_vs);
+          return;
+      }
     }
+    // Warp path not feasible for this layout — fall through to CTA.
   }
+
+  TORCH_CHECK(allow_cta, op_name, ": unsupported head dimension: ", layout.head_dim);
+  const int64_t num_works = layout.num_tokens * (layout.num_q_heads + layout.num_k_heads);
+  const CTAConfig config = cta_config<scalar_t, weight_t>(layout, num_works, layout.head_dim, op_name);
+  dispatch_cta_vec_size<scalar_t, weight_t>(config, layout, eps, post_op);
 }
 
 }  // namespace at::native::xpu::qknorm

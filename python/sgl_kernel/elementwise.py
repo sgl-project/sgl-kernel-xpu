@@ -210,9 +210,12 @@ def store_cache_xpu(
     Parameters
     ----------
     k : torch.Tensor
-        Key tensor, shape: ``(num_tokens, row_dim)``.
+        Key tensor, shape: ``(num_tokens, row_dim)``. Rows may be strided
+        (e.g. a per-head slice of a wider tensor); only the inner row must be
+        contiguous (``k.stride(1) == 1``).
     v : torch.Tensor
-        Value tensor, shape: ``(num_tokens, row_dim)``.
+        Value tensor, shape: ``(num_tokens, row_dim)``. Same row-contiguity
+        rule as ``k``.
     k_cache : torch.Tensor
         Key cache buffer, shape: ``(cache_size, row_dim)``.
     v_cache : torch.Tensor

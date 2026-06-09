@@ -240,7 +240,11 @@ void topk_sigmoid(
     bias_ptr = bias.data_ptr<float>();
   }
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(gating_output.scalar_type(), "fused_topk_sigmoid_kernel", [&]() {
+  // Cover Float in addition to the reduced float types (Half, BFloat16): some
+  // models (e.g. Nemotron-3-Nano MoE) emit fp32 router gating logits. The kernel
+  // already upcasts each element to float internally, so the fp32 path is a
+  // no-op cast and adds no numerical change.
+  DISPATCH_FLOAT_TYPES(gating_output.scalar_type(), "fused_topk_sigmoid_kernel", [&] {
     TopKSigmoidImpl::fused_topk_sigmoid<scalar_t>(
         gating_output.data_ptr<scalar_t>(),
         topk_weights.data_ptr<float>(),

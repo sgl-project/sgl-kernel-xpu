@@ -239,20 +239,16 @@ struct DecodeRunner {
   auto initialize_varlen(const Arguments& params, const ProblemShape& problem_size) {
     ProblemShape problem_size_for_init = problem_size;
     get<0>(problem_size_for_init) = 1;  // concentrated batch
-    get<1>(problem_size_for_init) = params.use_split_kv ? params.h : params.h_k;
-    get<3>(problem_size_for_init) = params.use_split_kv ? params.total_q : params.total_q * params.q_group_size;
+    get<1>(problem_size_for_init) = params.h;
+    get<3>(problem_size_for_init) = params.total_q;
     get<4>(problem_size_for_init) = params.total_knew;
     get<5>(problem_size_for_init) = params.total_k;
 
     ProblemShapeType problem_size_for_launch{
         .batch = get<0>(problem_size),
-        .num_heads_q = params.use_split_kv ? get<1>(problem_size) : get<2>(problem_size),
+      .num_heads_q = get<1>(problem_size),
         .num_heads_kv = get<2>(problem_size),
-        .seq_len_qo =
-            {params.use_split_kv ? params.seqlen_q * params.q_group_size : params.seqlen_q,
-             params.use_split_kv ? params.total_q : params.total_q * params.q_group_size,
-             nullptr,
-             params.use_split_kv ? 1 : params.q_group_size},
+      .seq_len_qo = {params.seqlen_q, params.total_q, nullptr, params.q_group_size},
 
         .seq_len_kv = {params.seqlen_knew, params.total_knew},
         .seq_len_kv_cache = {params.seqlen_k, params.total_k},

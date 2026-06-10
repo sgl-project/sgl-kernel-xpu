@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import List, Optional
 
 import torch
 from sgl_kernel.utils import get_xpu_stream
@@ -210,9 +210,12 @@ def store_cache_xpu(
     Parameters
     ----------
     k : torch.Tensor
-        Key tensor, shape: ``(num_tokens, row_dim)``.
+        Key tensor, shape: ``(num_tokens, row_dim)``. Rows may be strided
+        (e.g. a per-head slice of a wider tensor); only the inner row must be
+        contiguous (``k.stride(1) == 1``).
     v : torch.Tensor
-        Value tensor, shape: ``(num_tokens, row_dim)``.
+        Value tensor, shape: ``(num_tokens, row_dim)``. Same row-contiguity
+        rule as ``k``.
     k_cache : torch.Tensor
         Key cache buffer, shape: ``(cache_size, row_dim)``.
     v_cache : torch.Tensor
@@ -490,4 +493,59 @@ def fused_qk_rope_with_cos_sin_cache_inplace(
         positions,
         rope_dim,
         is_neox,
+    )
+
+
+def multimodal_rotary_embedding(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    mrope_section: List[int],
+    head_size: int,
+    rotary_dim: int,
+    mrope_interleaved: bool,
+    mrope_interleaved_glm: bool,
+    is_neox: bool,
+    axis_map: Optional[torch.Tensor],
+) -> None:
+    r"""Apply multimodal RoPE to Q/K using precomputed cos/sin cache.
+
+    Parameters
+    ----------
+    query: torch.Tensor
+        Query tensor updated in-place.
+    key: torch.Tensor
+        Key tensor updated in-place.
+    cos_sin_cache: torch.Tensor
+        Precomputed RoPE cos/sin cache.
+    positions: torch.Tensor
+        Position indices used to index the cache.
+    mrope_section: List[int]
+        Per-axis section sizes for multimodal RoPE.
+    head_size: int
+        Full attention head size for Q/K.
+    rotary_dim: int
+        Rotary/RoPE dimension represented by ``cos_sin_cache``.
+    mrope_interleaved: bool
+        Whether multimodal rotary dimensions are interleaved.
+    mrope_interleaved_glm: bool
+        Whether to use GLM-style interleaving behavior.
+    is_neox: bool
+        Whether to apply NeoX-style rotary layout.
+    axis_map: Optional[torch.Tensor]
+        Optional axis remapping tensor for multimodal position handling.
+    """
+    torch.ops.sgl_kernel.multimodal_rotary_embedding(
+        query,
+        key,
+        cos_sin_cache,
+        positions,
+        mrope_section,
+        head_size,
+        rotary_dim,
+        mrope_interleaved,
+        mrope_interleaved_glm,
+        is_neox,
+        axis_map,
     )

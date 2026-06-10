@@ -188,6 +188,18 @@ void fused_qk_rope_with_cos_sin_cache_inplace(
     at::Tensor& positions,
     int64_t rope_dim,
     bool is_neox);
+void multimodal_rotary_embedding(
+    at::Tensor& query,
+    at::Tensor& key,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& positions,
+    const std::vector<int64_t>& mrope_section,
+    int64_t head_size,
+    int64_t rotary_dim,
+    bool mrope_interleaved,
+    bool mrope_interleaved_glm,
+    bool is_neox_style,
+    const std::optional<at::Tensor>& axis_map);
 void sgl_per_token_group_quant_fp4(
     at::Tensor input, at::Tensor output_q, at::Tensor output_s, int64_t group_size, double eps);
 void store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices);
@@ -333,6 +345,22 @@ void moe_grouped_mm_nt_xe20(
     const torch::Tensor& total_rows_for_experts,
     const int64_t n_experts,
     const int64_t activation_type = 0,  // 0=silu, 1=gelu, 2=swiglu
+    bool fuse_act = false,
+    double gemm1_alpha = 1.702,
+    double gemm1_limit = 7.0);
+
+// Tile-fused MXFP4-B × BF16-A MoE grouped GEMM. `packed_weights` is int8
+// with two E2M1 nibbles per byte (low nibble = smaller-K element).
+// `scales` is float32 direct-multiplier, one per 32-element K-block.
+void moe_grouped_mm_nt_xe20_mxfp4_w4a16(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& packed_weights,
+    const torch::Tensor& scales,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts,
+    const int64_t activation_type = 0,
     bool fuse_act = false,
     double gemm1_alpha = 1.702,
     double gemm1_limit = 7.0);

@@ -100,3 +100,39 @@ class TestStoreCacheXPU:
 
         torch.testing.assert_close(k_cache[42], k[0])
         torch.testing.assert_close(v_cache[42], v[0])
+
+    @pytest.mark.parametrize("num_heads", [2, 10])
+    @pytest.mark.parametrize("head", [0, 1])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    def test_strided_head_slice(self, num_heads, head, dtype):
+        """Non-contiguous K/V: a per-head slice of a [tokens, heads, dim]
+        tensor has row stride heads*dim (not dim). The kernel must address
+        source rows by their real stride, matching index_put.
+
+        This is the layout that sliding-window-attention (SWA) layers pass on
+        Gemma-style models, e.g. k.stride == (2560, 1) for heads=10, dim=256.
+        """
+        from sgl_kernel import store_cache_xpu
+
+        torch.manual_seed(123)
+        num_tokens, row_dim, cache_size = 271, 256, 2048
+
+        kw = torch.randn(num_tokens, num_heads, row_dim, dtype=dtype, device="xpu")
+        vw = torch.randn(num_tokens, num_heads, row_dim, dtype=dtype, device="xpu")
+        k = kw[:, head, :]  # shape (num_tokens, row_dim), stride (num_heads*row_dim, 1)
+        v = vw[:, head, :]
+        assert not k.is_contiguous()
+        assert k.stride() == (num_heads * row_dim, 1)
+
+        indices = torch.randperm(cache_size, device="xpu")[:num_tokens].to(torch.int64)
+
+        k_cache_ref = torch.zeros(cache_size, row_dim, dtype=dtype, device="xpu")
+        v_cache_ref = torch.zeros_like(k_cache_ref)
+        k_cache_test = torch.zeros_like(k_cache_ref)
+        v_cache_test = torch.zeros_like(k_cache_ref)
+
+        reference_store_cache(k, v, k_cache_ref, v_cache_ref, indices)
+        store_cache_xpu(k, v, k_cache_test, v_cache_test, indices)
+
+        torch.testing.assert_close(k_cache_test, k_cache_ref)
+        torch.testing.assert_close(v_cache_test, v_cache_ref)

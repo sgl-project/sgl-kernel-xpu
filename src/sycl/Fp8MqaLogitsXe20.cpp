@@ -29,16 +29,11 @@ limitations under the License.
 
 // Thin launcher for the custom FP8 MQA GEMM on Intel BMG (Xe20).
 // The kernel implementation is in kernels/nsa/fp8_mqa_gemm_xe20.hpp.
-// D(M,N) = A_fp8(M,K) @ B_fp8(N,K)^T, all uint8 fp8 inputs, float32 output.
-// B is in (N,K) layout with K contiguous — no host-side transpose needed.
+// Batched variant: computes `batch` independent GEMMs D_b = A_b(M,K) @ B_b(N,K)^T
+// in a single fused launch. Per-batch base pointers advance by the given strides
+// (in elements). All batches share the same (M,N,K) tile shape. B is in (N,K)
+// layout with K contiguous — no host-side transpose needed.
 // Returns 0 on success, non-zero if dimensions are not tile-aligned.
-int fp8_mqa_gemm_xe20(sycl::queue* queue_ptr, const void* A_fp8, const void* B_fp8, void* D_f32, int M, int N, int K) {
-  return nsa::fp8_mqa_gemm_launch(queue_ptr, A_fp8, B_fp8, D_f32, M, N, K);
-}
-
-// Batched variant: computes `batch` independent GEMMs D_b = A_b @ B_b^T in a
-// single fused launch. Per-batch base pointers advance by the given strides
-// (in elements). All batches share the same (M,N,K) tile shape.
 int fp8_mqa_gemm_xe20_batched(
     sycl::queue* queue_ptr,
     const void* A_fp8,
@@ -72,37 +67,6 @@ void launch_2d_kernel(sycl::queue& queue, Kernel& kernel, int dim0, int dim1) {
   int global_1 = cdiv(dim1, (int)local_range[1]) * local_range[1];
   sycl::range<2> adjusted_global(dim0, global_1);
   queue.submit([&](sycl::handler& cgh) { cgh.parallel_for(sycl::nd_range<2>(adjusted_global, local_range), kernel); });
-}
-
-// FP8 GEMM via SYCL-TLA: D(M,N) = A(M,K) @ B(N,K)^T in f32.
-// B is passed directly in (N,K) layout — no host-side transpose needed.
-// Writes result directly to the output pointer D_out (M*N floats, must be pre-allocated).
-// Returns 0 on success, non-zero if fallback was used.
-int fp8_gemm_xe20_inplace(
-    sycl::queue& queue,
-    const uint8_t* a_ptr,  // (M, K) fp8
-    const uint8_t* b_ptr,  // (N, K) fp8
-    float* d_ptr,          // (M, N) output
-    int M,
-    int N,
-    int K,
-    at::Device device) {
-  int rc = fp8_mqa_gemm_xe20(&queue, a_ptr, b_ptr, d_ptr, M, N, K);
-
-  if (rc != 0) {
-    // Fallback to torch::mm if dimensions are not tile-aligned
-    auto a_fp8 = torch::from_blob(const_cast<uint8_t*>(a_ptr), {M, K}, torch::dtype(torch::kByte).device(device))
-                     .view(at::ScalarType::Float8_e4m3fn);
-    auto b_fp8 = torch::from_blob(const_cast<uint8_t*>(b_ptr), {N, K}, torch::dtype(torch::kByte).device(device))
-                     .view(at::ScalarType::Float8_e4m3fn);
-    auto a_bf16 = a_fp8.to(at::ScalarType::BFloat16);
-    auto b_bf16 = b_fp8.to(at::ScalarType::BFloat16);
-    auto result = at::mm(a_bf16, b_bf16.t()).to(at::ScalarType::Float);
-    // Copy fallback result into the output buffer
-    auto d_view = torch::from_blob(d_ptr, {M, N}, torch::dtype(torch::kFloat32).device(device));
-    d_view.copy_(result);
-  }
-  return rc;
 }
 
 // Batched FP8 GEMM via SYCL-TLA: for each b, D_b(M,N) = A_b(M,K) @ B_b(N,K)^T.
@@ -186,20 +150,22 @@ torch::Tensor fp8_mqa_logits(
   auto ke_contig = ke.contiguous();
 
   int M = Nq * H;
-  bool use_gemm = (M >= MIN_M_GEMM && Nk >= MIN_N_GEMM);
+  // Use the fast GEMM path when torch._scaled_mm constraints are met:
+  // mat2 (D, Nk) requires both dims divisible by 16.
+  bool use_gemm = (M >= MIN_M_GEMM && Nk >= MIN_N_GEMM && Nk % 16 == 0 && D % 16 == 0);
 
   if (use_gemm) {
-    // Optimized path: SYCL-TLA FP8 GEMM + reduction kernel
-    auto dots = torch::empty({M, Nk}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
-    fp8_gemm_xe20_inplace(
-        queue,
-        q_contig.data_ptr<uint8_t>(),
-        k_contig.data_ptr<uint8_t>(),
-        dots.data_ptr<float>(),
-        M,
-        Nk,
-        D,
-        q_fp8.device());
+    // Optimized path: torch._scaled_mm FP8 GEMM + reduction kernel.
+    // dots[m, j] = Σ_d q[m, d] · k[j, d], with m = qi*H + h (heads folded into rows).
+    // scale_a = scale_b = 1 → raw FP8 dot products; the per-token k_scale and
+    // per-head ReLU/weighting are applied by the reduction kernel below.
+    // _scaled_mm is well-tuned on XPU and outperforms the custom SYCL-TLA GEMM
+    // for this (single-batch) prefill shape.
+    auto q_fp8_2d = q_contig.view(at::ScalarType::Float8_e4m3fn).reshape({M, D});  // (M, D)
+    auto k_fp8_2d = k_contig.view(at::ScalarType::Float8_e4m3fn);                  // (Nk, D)
+    auto scale = torch::ones({}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
+    auto dots = at::_scaled_mm(
+        q_fp8_2d, k_fp8_2d.t(), scale, scale, /*bias=*/{}, /*scale_result=*/{}, at::kFloat, /*use_fast_accum=*/false);
 
     nsa::Fp8MqaLogitsReduceKernel reduce_kernel{
         dots.data_ptr<float>(),
@@ -328,6 +294,11 @@ torch::Tensor fp8_paged_mqa_logits(
     launch_2d_kernel(queue, gather_kernel, B_next, msl);
 
     // Stage 2: Batched SYCL-TLA FP8 GEMM — all B_next GEMMs in one launch.
+    // TODO: switch to torch._scaled_grouped_mm once it is implemented on XPU
+    // (currently aten::_scaled_grouped_mm_v2 is unimplemented and 3D batched
+    // _scaled_mm is unsupported, so the only torch option is a per-batch
+    // _scaled_mm loop that does not scale with B). The custom batched SYCL-TLA
+    // kernel is 4-15x faster than that loop for B>=4, so we keep it for decode.
     auto dots = torch::empty({B_next, H, msl}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
 
     fp8_gemm_xe20_batched_inplace(

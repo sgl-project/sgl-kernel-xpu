@@ -334,10 +334,4 @@ inline int fp8_mqa_gemm_batched_launch(
   return 0;
 }
 
-// Single-GEMM convenience wrapper (batch=1, zero batch strides).
-inline int
-fp8_mqa_gemm_launch(sycl::queue* queue_ptr, const void* A_fp8, const void* B_fp8, void* D_f32, int M, int N, int K) {
-  return fp8_mqa_gemm_batched_launch(queue_ptr, A_fp8, B_fp8, D_f32, 1, M, N, K, 0, 0, 0);
-}
-
 }  // namespace nsa

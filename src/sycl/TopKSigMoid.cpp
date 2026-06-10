@@ -83,7 +83,7 @@ struct FusedTopkSigmoid {
       float logit = static_cast<float>(gating_output[tid * experts + expert_id]);
 
       // sigmoid activation
-      float sig = 1.0f / (1.0f + sycl::exp(-logit));
+      float sig = 1.0f / (1.0f + sycl::native::exp(-logit));
 
       local_idx[e] = expert_id;
 
@@ -171,6 +171,280 @@ struct FusedTopkSigmoid {
   const int top_k;
 };
 
+/// Aligned array type
+template <
+    typename T,
+    /// Number of elements in the array
+    int N,
+    /// Alignment requirement in bytes
+    int Alignment = sizeof(T) * N>
+class alignas(Alignment) AlignedArray {
+  T data[N];
+};
+
+static constexpr int sub_group_size = 32;
+static constexpr int WARP_SIZE = sub_group_size;
+static constexpr float NEG_INIFINITY = -std::numeric_limits<float>::infinity();
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+
+/*
+  This gating kernel is adapted from
+  https://github.com/sgl-project/sglang/blob/v0.5.12/sgl-kernel/csrc/moe/moe_topk_sigmoid_kernels.cu
+
+  A Top-K gating sigmoid written to exploit when the number of experts in the MoE layers
+  are a small power of 2. This allows us to cleanly share the rows among the threads in
+  a single warp and eliminate communication between warps (so no need to use shared mem).
+
+  It fuses the sigmoid, max and argmax into a single kernel.
+
+  Limitations:
+  1) This implementation is intended for when the number of experts is a small power of 2.
+  2) This implementation assumes k is small, but will work for any k.
+*/
+
+template <typename T, int VPT, int NUM_EXPERTS, int WARPS_PER_CTA, int BYTES_PER_LDG>
+struct TopkGatingSigmoid {
+  [[sycl::reqd_sub_group_size(sub_group_size)]] void operator()(sycl::nd_item<2> item) const {
+    // We begin by enforcing compile time assertions and setting up compile time constants.
+    static_assert(VPT == (VPT & -VPT), "VPT must be power of 2");
+    static_assert(NUM_EXPERTS == (NUM_EXPERTS & -NUM_EXPERTS), "NUM_EXPERTS must be power of 2");
+    static_assert(BYTES_PER_LDG == (BYTES_PER_LDG & -BYTES_PER_LDG), "BYTES_PER_LDG must be power of 2");
+    static_assert(BYTES_PER_LDG <= 16, "BYTES_PER_LDG must be leq 16");
+
+    // Number of bytes each thread pulls in per load
+    static constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T);
+    static constexpr int ELTS_PER_ROW = NUM_EXPERTS;
+    static constexpr int THREADS_PER_ROW = ELTS_PER_ROW / VPT;
+    static constexpr int LDG_PER_THREAD = VPT / ELTS_PER_LDG;
+
+    // Restrictions based on previous section.
+    static_assert(VPT % ELTS_PER_LDG == 0, "The elements per thread must be a multiple of the elements per ldg");
+    static_assert(WARP_SIZE % THREADS_PER_ROW == 0, "The threads per row must cleanly divide the threads per warp");
+    static_assert(THREADS_PER_ROW == (THREADS_PER_ROW & -THREADS_PER_ROW), "THREADS_PER_ROW must be power of 2");
+    static_assert(THREADS_PER_ROW <= WARP_SIZE, "THREADS_PER_ROW can be at most warp size");
+
+    // We have NUM_EXPERTS elements per row. We specialize for small #experts
+    static constexpr int ELTS_PER_WARP = WARP_SIZE * VPT;
+    static constexpr int ROWS_PER_WARP = ELTS_PER_WARP / ELTS_PER_ROW;
+    static constexpr int ROWS_PER_CTA = WARPS_PER_CTA * ROWS_PER_WARP;
+
+    // Restrictions for previous section.
+    static_assert(ELTS_PER_WARP % ELTS_PER_ROW == 0, "The elts per row must cleanly divide the total elt per warp");
+
+    // ===================== From this point, we finally start computing run-time variables. ========================
+
+    // Compute CTA and warp rows. We pack multiple rows into a single warp, and a block contains WARPS_PER_CTA warps.
+    // This, each block processes a chunk of rows. We start by computing the start row for each block.
+    auto sg = item.get_sub_group();
+    auto local_id_x = item.get_local_id(1);
+    auto local_id_y = item.get_local_id(0);
+    auto group_id_x = item.get_group(1);
+
+    const int cta_base_row = group_id_x * ROWS_PER_CTA;
+
+    // Now, using the base row per thread block, we compute the base row per warp.
+    const int warp_base_row = cta_base_row + local_id_y * ROWS_PER_WARP;
+
+    // The threads in a warp are split into sub-groups that will work on a row.
+    // We compute row offset for each thread sub-group
+    const int thread_row_in_warp = local_id_x / THREADS_PER_ROW;
+    const int thread_row = warp_base_row + thread_row_in_warp;
+
+    // Threads with indices out of bounds should early exit here.
+    if (thread_row >= num_rows) {
+      return;
+    }
+
+    const bool row_is_active = finished ? !finished[thread_row] : true;
+
+    // We finally start setting up the read pointers for each thread. First, each thread jumps to the start of the
+    // row it will read.
+    const T* thread_row_ptr = input + thread_row * ELTS_PER_ROW;
+
+    // Now, we compute the group each thread belong to in order to determine the first column to start loads.
+    const int thread_group_idx = local_id_x % THREADS_PER_ROW;
+    const int first_elt_read_by_thread = thread_group_idx * ELTS_PER_LDG;
+    const T* thread_read_ptr = thread_row_ptr + first_elt_read_by_thread;
+
+    // Determine the pointer type to use to read in the data depending on the BYTES_PER_LDG template param. In theory,
+    // this can support all powers of 2 up to 16.
+    // NOTE(woosuk): The original implementation uses CUTLASS aligned array here.
+    // We defined our own aligned array and use it here to avoid the dependency on CUTLASS.
+    using AccessType = AlignedArray<T, ELTS_PER_LDG>;
+
+    // Finally, we pull in the data from global mem
+    T row_chunk_temp[VPT];
+    AccessType* row_chunk_vec_ptr = reinterpret_cast<AccessType*>(&row_chunk_temp);
+    const AccessType* vec_thread_read_ptr = reinterpret_cast<const AccessType*>(thread_read_ptr);
+#pragma unroll
+    // Note(Byron): interleaved loads to achieve better memory coalescing
+    // | thread[0] | thread[1] | thread[2] | thread[3] | thread[0] | thread[1] | thread[2] | thread[3] | ...
+    for (int ii = 0; ii < LDG_PER_THREAD; ++ii) {
+      row_chunk_vec_ptr[ii] = vec_thread_read_ptr[ii * THREADS_PER_ROW];
+    }
+
+    float row_chunk[VPT];
+#pragma unroll
+    // Note(Byron): upcast logits to float32
+    for (int ii = 0; ii < VPT; ++ii) {
+      float val = static_cast<float>(row_chunk_temp[ii]);
+      val = 1.0f / (1.0f + sycl::native::exp(-val));
+      if (correction_bias != nullptr) {
+        /*
+        LDG is interleaved
+        |thread0 LDG| |thread1 LDG| |thread0 LDG| |thread1 LDG|
+        |--------- group0 --------| |----------group1 --------|
+                                      ^ local2
+        */
+        const int group_id = ii / ELTS_PER_LDG;
+        const int local_id = ii % ELTS_PER_LDG;
+        const int expert_idx = first_elt_read_by_thread + group_id * THREADS_PER_ROW * ELTS_PER_LDG + local_id;
+        val = val + correction_bias[expert_idx];
+      }
+      row_chunk[ii] = val;
+    }
+
+    // Now, row_chunk contains the sigmoid of the row chunk. Now, I want to find the topk elements in each row, along
+    // with the max index.
+    int start_col = first_elt_read_by_thread;
+    static constexpr int COLS_PER_GROUP_LDG = ELTS_PER_LDG * THREADS_PER_ROW;
+
+    float row_sum_for_renormalize = 0;
+
+    for (int k_idx = 0; k_idx < k; ++k_idx) {
+      // First, each thread does the local argmax
+      float max_val = row_chunk[0];
+      int expert = start_col;
+#pragma unroll
+      for (int ldg = 0, col = start_col; ldg < LDG_PER_THREAD; ++ldg, col += COLS_PER_GROUP_LDG) {
+#pragma unroll
+        for (int ii = 0; ii < ELTS_PER_LDG; ++ii) {
+          float val = row_chunk[ldg * ELTS_PER_LDG + ii];
+
+          // No check on the experts here since columns with the smallest index are processed first and only
+          // updated if > (not >=)
+          if (val > max_val) {
+            max_val = val;
+            expert = col + ii;
+          }
+        }
+      }
+
+// Now, we perform the argmax reduce. We use the butterfly pattern so threads reach consensus about the max.
+// This will be useful for K > 1 so that the threads can agree on "who" had the max value. That thread can
+// then blank out their max with -inf and the warp can run more iterations...
+#pragma unroll
+      for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+        float other_max = sycl::permute_group_by_xor(sg, max_val, mask);
+        int other_expert = sycl::permute_group_by_xor(sg, expert, mask);
+
+        // We want lower indices to "win" in every thread so we break ties this way
+        if (other_max > max_val || (other_max == max_val && other_expert < expert)) {
+          max_val = other_max;
+          expert = other_expert;
+        }
+      }
+
+      // Write the max for this k iteration to global memory.
+      if (thread_group_idx == 0) {
+        // Add a guard to ignore experts not included by this node
+        const bool node_uses_expert = expert >= start_expert && expert < end_expert;
+        const bool should_process_row = row_is_active && node_uses_expert;
+
+        // The lead thread from each sub-group will write out the final results to global memory. (This will be a
+        // single) thread per row of the input/output matrices.
+        const int idx = k * thread_row + k_idx;
+        if (correction_bias != nullptr) {
+          max_val -= correction_bias[expert];
+        }
+        output[idx] = max_val;
+        indices[idx] = should_process_row ? (expert - start_expert) : NUM_EXPERTS;
+        row_sum_for_renormalize += max_val;
+      }
+
+      // Finally, we clear the value in the thread with the current max if there is another iteration to run.
+      if (k_idx + 1 < k) {
+        const int ldg_group_for_expert = expert / COLS_PER_GROUP_LDG;
+        const int thread_to_clear_in_group = (expert / ELTS_PER_LDG) % THREADS_PER_ROW;
+
+        // Only the thread in the group which produced the max will reset the "winning" value to -inf.
+        if (thread_group_idx == thread_to_clear_in_group) {
+          const int offset_for_expert = expert % ELTS_PER_LDG;
+          // Safe to set to any negative value since row_chunk values must be between 0 and 1.
+          row_chunk[ldg_group_for_expert * ELTS_PER_LDG + offset_for_expert] = -10000.f;
+        }
+      }
+    }
+
+    // Fuse renormalization of topk_weights into this kernel
+    if (renormalize && thread_group_idx == 0) {
+      float row_sum_for_renormalize_inv = 1.f / row_sum_for_renormalize;
+#pragma unroll
+      for (int k_idx = 0; k_idx < k; ++k_idx) {
+        const int idx = k * thread_row + k_idx;
+        output[idx] = output[idx] * row_sum_for_renormalize_inv;
+      }
+    }
+  }
+
+  const T* input;
+  const bool* finished;
+  float* output;
+  const int num_rows;
+  int* indices;
+  const float* correction_bias;
+  const int k;
+  const int start_expert;
+  const int end_expert;
+  const bool renormalize;
+};
+
+namespace detail {
+// Constructs some constants needed to partition the work across threads at compile time.
+template <typename T, int EXPERTS, int BYTES_PER_LDG>
+struct TopkConstants {
+  static constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T);
+  static_assert(EXPERTS / (ELTS_PER_LDG * WARP_SIZE) == 0 || EXPERTS % (ELTS_PER_LDG * WARP_SIZE) == 0, "");
+  static constexpr int VECs_PER_THREAD = MAX(1, EXPERTS / (ELTS_PER_LDG * WARP_SIZE));
+  static constexpr int VPT = VECs_PER_THREAD * ELTS_PER_LDG;
+  static constexpr int THREADS_PER_ROW = EXPERTS / VPT;
+  static constexpr int ROWS_PER_WARP = WARP_SIZE / THREADS_PER_ROW;
+};
+}  // namespace detail
+
+template <typename T, int NUM_EXPERTS, int WARPS_PER_TB>
+void launch_topk_gating_sigmoid(
+    const T* input,
+    const bool* finished,
+    float* output,
+    int* indices,
+    const float* correction_bias,
+    const int num_rows,
+    const int k,
+    const int start_expert,
+    const int end_expert,
+    const bool renormalize,
+    sycl::queue& queue) {
+  static constexpr std::size_t MAX_BYTES_PER_LDG = 16;
+
+  static constexpr int BYTES_PER_LDG = MIN(MAX_BYTES_PER_LDG, sizeof(T) * NUM_EXPERTS);
+  using Constants = detail::TopkConstants<T, NUM_EXPERTS, BYTES_PER_LDG>;
+  static constexpr int VPT = Constants::VPT;
+  static constexpr int ROWS_PER_WARP = Constants::ROWS_PER_WARP;
+  const int num_warps = (num_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
+  const int num_blocks = (num_warps + WARPS_PER_TB - 1) / WARPS_PER_TB;
+
+  sycl::range<2> grid(1, num_blocks);
+  sycl::range<2> block(WARPS_PER_TB, WARP_SIZE);
+
+  using Kernel = TopkGatingSigmoid<T, VPT, NUM_EXPERTS, WARPS_PER_TB, BYTES_PER_LDG>;
+
+  Kernel task{input, finished, output, num_rows, indices, correction_bias, k, start_expert, end_expert, renormalize};
+
+  sycl_kernel_submit(grid * block, block, queue, task);
+}
+
 template <typename T>
 void launch_fused_topk_sigmoid(
     sycl::queue& queue,
@@ -199,8 +473,63 @@ void fused_topk_sigmoid(
     const int num_experts,
     const int topk) {
   auto queue = at::xpu::getCurrentXPUStream().queue();
-  launch_fused_topk_sigmoid(
-      queue, gating_output, topk_weights, topk_indices, correction_bias, renormalize, topk, num_tokens, num_experts);
+  constexpr int WARPS_PER_TB = 4;
+
+#define LAUNCH_GATING_SIGMOID(TYPE, NUM_EXPERTS, WARPS_PER_TB) \
+  launch_topk_gating_sigmoid<TYPE, NUM_EXPERTS, WARPS_PER_TB>( \
+      gating_output,                                           \
+      nullptr,                                                 \
+      topk_weights,                                            \
+      topk_indices,                                            \
+      correction_bias,                                         \
+      num_tokens,                                              \
+      topk,                                                    \
+      0,                                                       \
+      num_experts,                                             \
+      renormalize,                                             \
+      queue);
+
+  switch (num_experts) {
+    case 1:
+      LAUNCH_GATING_SIGMOID(T, 1, WARPS_PER_TB);
+      break;
+    case 2:
+      LAUNCH_GATING_SIGMOID(T, 2, WARPS_PER_TB);
+      break;
+    case 4:
+      LAUNCH_GATING_SIGMOID(T, 4, WARPS_PER_TB);
+      break;
+    case 8:
+      LAUNCH_GATING_SIGMOID(T, 8, WARPS_PER_TB);
+      break;
+    case 16:
+      LAUNCH_GATING_SIGMOID(T, 16, WARPS_PER_TB);
+      break;
+    case 32:
+      LAUNCH_GATING_SIGMOID(T, 32, WARPS_PER_TB);
+      break;
+    case 64:
+      LAUNCH_GATING_SIGMOID(T, 64, WARPS_PER_TB);
+      break;
+    case 128:
+      LAUNCH_GATING_SIGMOID(T, 128, WARPS_PER_TB);
+      break;
+    case 256:
+      LAUNCH_GATING_SIGMOID(T, 256, WARPS_PER_TB);
+      break;
+    default:
+      launch_fused_topk_sigmoid(
+          queue,
+          gating_output,
+          topk_weights,
+          topk_indices,
+          correction_bias,
+          renormalize,
+          topk,
+          num_tokens,
+          num_experts);
+  }
+#undef LAUNCH_GATING_SIGMOID
 }
 };  // namespace TopKSigmoidImpl
 

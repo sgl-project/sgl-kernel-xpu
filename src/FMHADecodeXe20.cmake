@@ -12,13 +12,15 @@ set(FMHA_DECODE_PAGE_SIZES 64 128)
 # independently. The non-paged kernel is only emitted in the PAGE_SIZE==128
 # translation unit (see xe_fmha_fwd_decode_kernel.cpp.in) and the host routes
 # the non-paged decode launch to that TU. Must be a multiple of 16.
+# Note: Larger head dimensions require smaller KV tiles to avoid running out of
+# registers/local memory on Level Zero backend (UR_RESULT_ERROR_OUT_OF_RESOURCES).
 set(FMHA_DECODE_TILED_KV_NP_64 512)
 set(FMHA_DECODE_TILED_KV_NP_72 512)
 set(FMHA_DECODE_TILED_KV_NP_96 512)
 set(FMHA_DECODE_TILED_KV_NP_128 512)
-set(FMHA_DECODE_TILED_KV_NP_192 512)
-set(FMHA_DECODE_TILED_KV_NP_256 512)
-set(FMHA_DECODE_TILED_KV_NP_512 512)
+set(FMHA_DECODE_TILED_KV_NP_192 256)
+set(FMHA_DECODE_TILED_KV_NP_256 256)
+set(FMHA_DECODE_TILED_KV_NP_512 128)
 
 set(FMHA_DECODE_TEMPLATE
     "${CMAKE_CURRENT_SOURCE_DIR}/sycl/xe_fmha_fwd_decode_kernel.cpp.in")

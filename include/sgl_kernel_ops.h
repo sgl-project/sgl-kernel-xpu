@@ -253,13 +253,7 @@ void bmm_fp8(
 /*
  * From csrc/nsa (Native Sparse Attention)
  */
-torch::Tensor fp8_mqa_logits(
-    const torch::Tensor& q_fp8,
-    const torch::Tensor& k_fp8,
-    const torch::Tensor& k_scale,
-    const torch::Tensor& weights,
-    const torch::Tensor& ks,
-    const torch::Tensor& ke);
+// fp8_mqa_logits (prefill) is implemented in pure Python via sgl_kernel.nsa.
 
 torch::Tensor fp8_paged_mqa_logits(
     const torch::Tensor& q_fp8,

@@ -13,10 +13,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-// FP8 MQA Logits kernels for NSA (Native Sparse Attention) indexer scoring.
+// FP8 paged MQA Logits kernel for NSA (Native Sparse Attention) indexer scoring (decode path).
 // Optimized path: SYCL-TLA FP8 GEMM (fused FP8→bf16 conversion + XMX GEMM)
 // + lightweight reduction kernel for ReLU + weighted head sum + scaling.
 // Naive SYCL fallback for small problem sizes.
+// Note: fp8_mqa_logits (prefill path) is implemented in pure Python via sgl_kernel.nsa.
 
 #define SYCL_INTEL_TARGET 20
 
@@ -105,98 +106,6 @@ int fp8_gemm_xe20_batched_inplace(
 }
 
 }  // namespace
-
-// fp8_mqa_logits: prefill/extend path
-torch::Tensor fp8_mqa_logits(
-    const torch::Tensor& q_fp8,
-    const torch::Tensor& k_fp8,
-    const torch::Tensor& k_scale,
-    const torch::Tensor& weights,
-    const torch::Tensor& ks,
-    const torch::Tensor& ke) {
-  TORCH_CHECK(q_fp8.is_xpu(), "q_fp8 must be on XPU");
-  TORCH_CHECK(k_fp8.is_xpu(), "k_fp8 must be on XPU");
-  TORCH_CHECK(q_fp8.dim() == 3, "q_fp8 must be 3D (Nq, H, D)");
-  TORCH_CHECK(k_fp8.dim() == 2, "k_fp8 must be 2D (Nk, D)");
-  TORCH_CHECK(q_fp8.scalar_type() == at::kByte, "q_fp8 must be uint8 (FP8 e4m3)");
-  TORCH_CHECK(k_fp8.scalar_type() == at::kByte, "k_fp8 must be uint8 (FP8 e4m3)");
-  TORCH_CHECK(k_fp8.size(1) == q_fp8.size(2), "k_fp8 D must match q_fp8 D");
-  TORCH_CHECK(k_scale.scalar_type() == at::kFloat, "k_scale must be float32");
-  TORCH_CHECK(k_scale.dim() == 1 && k_scale.size(0) == k_fp8.size(0), "k_scale must be 1D with Nk elements");
-  TORCH_CHECK(weights.scalar_type() == at::kFloat, "weights must be float32");
-  TORCH_CHECK(
-      weights.dim() == 2 && weights.size(0) == q_fp8.size(0) && weights.size(1) == q_fp8.size(1),
-      "weights must be (Nq, H)");
-  TORCH_CHECK(ks.scalar_type() == at::kInt, "ks must be int32");
-  TORCH_CHECK(ke.scalar_type() == at::kInt, "ke must be int32");
-
-  int Nq = q_fp8.size(0);
-  int H = q_fp8.size(1);
-  int D = q_fp8.size(2);
-  int Nk = k_fp8.size(0);
-
-  auto logits = torch::zeros({Nq, Nk}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
-  if (Nq == 0 || Nk == 0) return logits;
-
-  auto stream = c10::xpu::getCurrentXPUStream();
-  auto& queue = stream.queue();
-
-  // Ensure contiguity for all inputs passed to kernels via data_ptr
-  auto q_contig = q_fp8.contiguous();
-  auto k_contig = k_fp8.contiguous();
-  auto k_scale_contig = k_scale.contiguous();
-  auto weights_contig = weights.contiguous();
-  auto ks_contig = ks.contiguous();
-  auto ke_contig = ke.contiguous();
-
-  int M = Nq * H;
-  // Use the fast GEMM path when torch._scaled_mm constraints are met:
-  // mat2 (D, Nk) requires both dims divisible by 16.
-  bool use_gemm = (M >= MIN_M_GEMM && Nk >= MIN_N_GEMM && Nk % 16 == 0 && D % 16 == 0);
-
-  if (use_gemm) {
-    // Optimized path: torch._scaled_mm FP8 GEMM + reduction kernel.
-    // dots[m, j] = Σ_d q[m, d] · k[j, d], with m = qi*H + h (heads folded into rows).
-    // scale_a = scale_b = 1 → raw FP8 dot products; the per-token k_scale and
-    // per-head ReLU/weighting are applied by the reduction kernel below.
-    // _scaled_mm is well-tuned on XPU and outperforms the custom SYCL-TLA GEMM
-    // for this (single-batch) prefill shape.
-    auto q_fp8_2d = q_contig.view(at::ScalarType::Float8_e4m3fn).reshape({M, D});  // (M, D)
-    auto k_fp8_2d = k_contig.view(at::ScalarType::Float8_e4m3fn);                  // (Nk, D)
-    auto scale = torch::ones({}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
-    auto dots = at::_scaled_mm(
-        q_fp8_2d, k_fp8_2d.t(), scale, scale, /*bias=*/{}, /*scale_result=*/{}, at::kFloat, /*use_fast_accum=*/false);
-
-    nsa::Fp8MqaLogitsReduceKernel reduce_kernel{
-        dots.data_ptr<float>(),
-        weights_contig.data_ptr<float>(),
-        k_scale_contig.data_ptr<float>(),
-        ks_contig.data_ptr<int32_t>(),
-        ke_contig.data_ptr<int32_t>(),
-        logits.data_ptr<float>(),
-        Nq,
-        H,
-        Nk};
-    launch_2d_kernel(queue, reduce_kernel, Nq, Nk);
-    return logits;
-  }
-
-  // Naive kernel fallback
-  nsa::Fp8MqaLogitsKernel kernel{
-      q_contig.data_ptr<uint8_t>(),
-      k_contig.data_ptr<uint8_t>(),
-      k_scale_contig.data_ptr<float>(),
-      weights_contig.data_ptr<float>(),
-      ks_contig.data_ptr<int32_t>(),
-      ke_contig.data_ptr<int32_t>(),
-      logits.data_ptr<float>(),
-      Nq,
-      Nk,
-      H,
-      D};
-  launch_2d_kernel(queue, kernel, Nq, Nk);
-  return logits;
-}
 
 // fp8_paged_mqa_logits: decode path
 torch::Tensor fp8_paged_mqa_logits(

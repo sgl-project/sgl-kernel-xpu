@@ -12,6 +12,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 import sgl_kernel  # noqa: F401, E402 — triggers op registration
+from sgl_kernel.nsa import _fp8_mqa_logits_impl
 
 
 def make_fp8_tensor(shape, device="xpu"):
@@ -122,7 +123,7 @@ def test_fp8_mqa_logits(Nq, H, D, Nk):
     ks = torch.zeros(Nq, dtype=torch.int32, device=device)
     ke = torch.full((Nq,), Nk, dtype=torch.int32, device=device)
 
-    logits = torch.ops.sgl_kernel.fp8_mqa_logits.default(
+    logits = _fp8_mqa_logits_impl(
         q.view(torch.uint8), k.view(torch.uint8), k_scale, weights, ks, ke
     )
     ref = reference_fp8_mqa_logits(q, k, k_scale, weights, ks, ke)
@@ -141,7 +142,7 @@ def test_fp8_mqa_logits_masking():
     ks = torch.tensor([2, 4], dtype=torch.int32, device=device)
     ke = torch.tensor([5, 7], dtype=torch.int32, device=device)
 
-    logits = torch.ops.sgl_kernel.fp8_mqa_logits.default(
+    logits = _fp8_mqa_logits_impl(
         q.view(torch.uint8), k.view(torch.uint8), k_scale, weights, ks, ke
     )
     ref = reference_fp8_mqa_logits(q, k, k_scale, weights, ks, ke)

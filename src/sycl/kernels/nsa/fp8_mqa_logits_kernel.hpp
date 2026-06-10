@@ -57,63 +57,6 @@ inline float load_le_f32(const uint8_t* p) {
   return result;
 }
 
-// FP8 MQA logits kernel (prefill/extend path — naive fallback)
-//
-// Math: For each query i and kv position j in [ks[i], ke[i]):
-//   score[i,j] = k_scale[j] * Σ_h ReLU( Σ_d q[i,h,d] · k[j,d] ) * weights[i,h]
-//
-// where q and k are fp8_e4m3, converted to float for the dot product.
-//
-// q: (Nq, H, D) fp8_e4m3
-// k: (Nk, D) fp8_e4m3
-// k_scale: (Nk,) float32
-// weights: (Nq, H) float32
-// ks: (Nq,) int32 — start index per query
-// ke: (Nq,) int32 — end index per query
-// out: (Nq, Nk) float32 — must be pre-zeroed for out-of-range positions
-//
-// For each query i, for each kv position j in [ks[i], ke[i]):
-//   score = sum_h( ReLU( dot(q[i,h,:], k[j,:]) ) * weights[i,h] ) * k_scale[j]
-struct Fp8MqaLogitsKernel {
-  const uint8_t* q_ptr;
-  const uint8_t* k_ptr;
-  const float* k_scale_ptr;
-  const float* weights_ptr;
-  const int32_t* ks_ptr;
-  const int32_t* ke_ptr;
-  float* out_ptr;
-  int Nq, Nk, H, D;
-
-  void operator()(sycl::nd_item<2> item) const {
-    int qi = item.get_global_id(0);  // query index
-    int kj = item.get_global_id(1);  // kv position index
-
-    if (qi >= Nq || kj >= Nk) return;
-
-    int start = ks_ptr[qi];
-    int end = ke_ptr[qi];
-
-    if (kj < start || kj >= end) return;  // out-of-range: rely on pre-zeroed output
-
-    float score = 0.0f;
-
-    for (int h = 0; h < H; ++h) {
-      float dot = 0.0f;
-      for (int d = 0; d < D; ++d) {
-        float qv = fp8_e4m3_to_float(q_ptr[(qi * H + h) * D + d]);
-        float kv = fp8_e4m3_to_float(k_ptr[kj * D + d]);
-        dot += qv * kv;
-      }
-      // ReLU
-      dot = dot > 0.0f ? dot : 0.0f;
-      score += dot * weights_ptr[qi * H + h];
-    }
-
-    score *= k_scale_ptr[kj];
-    out_ptr[qi * Nk + kj] = score;
-  }
-};
-
 // Paged FP8 MQA logits kernel (decode path — naive fallback)
 //
 // q: (B, 1, H, D) fp8_e4m3  — flattened as (B*1*H*D) uint8
@@ -180,46 +123,6 @@ struct Fp8PagedMqaLogitsKernel {
     out_ptr[bi * max_seq_len + kj] = score;
   }
 };
-
-// Reduction kernel for SYCL-TLA optimized prefill path.
-//
-// Math: Given GEMM output dots[i,h,j] = Σ_d q[i,h,d] · k[j,d] for all heads h,
-// reduces across heads with ReLU gating and per-token scaling:
-//   score[i,j] = k_scale[j] * Σ_h ReLU(dots[i,h,j]) * weights[i,h]
-//
-// dots: (Nq, H, Nk) float32 — reshaped GEMM output
-// weights: (Nq, H) float32
-// k_scale: (Nk,) float32
-// ks: (Nq,) int32
-// ke: (Nq,) int32
-// out: (Nq, Nk) float32 — must be pre-zeroed for out-of-range positions
-struct Fp8MqaLogitsReduceKernel {
-  const float* dots_ptr;
-  const float* weights_ptr;
-  const float* k_scale_ptr;
-  const int32_t* ks_ptr;
-  const int32_t* ke_ptr;
-  float* out_ptr;
-  int Nq, H, Nk;
-
-  void operator()(sycl::nd_item<2> item) const {
-    int qi = item.get_global_id(0);
-    int kj = item.get_global_id(1);
-    if (qi >= Nq || kj >= Nk) return;
-
-    if (kj < ks_ptr[qi] || kj >= ke_ptr[qi]) return;  // rely on pre-zeroed output
-
-    float score = 0.0f;
-    for (int h = 0; h < H; ++h) {
-      float dot = dots_ptr[(qi * H + h) * Nk + kj];
-      dot = dot > 0.0f ? dot : 0.0f;  // ReLU
-      score += dot * weights_ptr[qi * H + h];
-    }
-    score *= k_scale_ptr[kj];
-    out_ptr[qi * Nk + kj] = score;
-  }
-};
-
 // Gather kernel: extracts FP8 keys and scales from paged KV cache
 // into contiguous buffers for the SYCL-TLA GEMM path.
 //

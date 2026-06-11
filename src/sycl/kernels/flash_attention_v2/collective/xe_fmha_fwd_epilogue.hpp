@@ -40,6 +40,7 @@
 #include "cutlass/epilogue/collective/collective_epilogue.hpp"
 #include "cutlass/epilogue/collective/detail.hpp"
 #include "cutlass/epilogue/dispatch_policy.hpp"
+#include "sycl/Utils.h"
 #include "sycl/comm/copy_block_slm.hpp"
 
 namespace cutlass::fmha::collective {
@@ -169,8 +170,9 @@ class FMHAFwdEpilogue {
        zero attend to no (unmasked) keys -- e.g. a batch with zero KV length --
        so emit 0 instead of NaN to match the reference implementation. */
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA_sum.size(); i++)
-      rA_sum(i) = rA_sum(i) == ElementA(0) ? ElementA(0) : ElementA(1) / rA_sum(i);
+    for (int i = 0; i < rA_sum.size(); i++) {
+      rA_sum(i) = safe_recip(rA_sum(i));
+    }
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < rA.size(); i++)
@@ -422,8 +424,9 @@ class DecodeFwdEpilogue {
        zero attend to no (unmasked) keys -- e.g. a batch with zero KV length --
        so emit 0 instead of NaN to match the reference implementation. */
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA_sum.size(); i++)
-      rA_sum(i) = rA_sum(i) == ElementA(0) ? ElementA(0) : ElementA(1) / rA_sum(i);
+    for (int i = 0; i < rA_sum.size(); i++) {
+      rA_sum(i) = safe_recip(rA_sum(i));
+    }
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < rA.size(); i++)

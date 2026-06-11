@@ -70,6 +70,7 @@ from sgl_kernel.moe import (
     topk_sigmoid,
     topk_softmax,
 )
+from sgl_kernel.reduction import row_wise_square_sum
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,
     top_k_renorm_prob,

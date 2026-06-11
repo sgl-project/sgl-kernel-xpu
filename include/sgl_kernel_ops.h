@@ -662,3 +662,8 @@ void embedding_lora_a_fwd(
  * From csrc/mhc_gemm
  */
 void hc_pre_gemm(const at::Tensor& A, const at::Tensor& B, at::Tensor& C);
+
+/*
+ * Row-wise sum with CUTLASS mainloop/epilogue pattern
+ */
+void row_wise_sum_cutlass(const at::Tensor& A, at::Tensor& D);

@@ -110,6 +110,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state_v2", torch::kXPU, &merge_state_v2);
+#ifdef BUILD_FMHA
   /*
    * From cutlass attention
    */
@@ -143,7 +144,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    bool?    pack_gqa,"
       "    int      sm_margin) -> Tensor[]");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
-
+#endif
   m.def("flash_mla_get_workspace_size", &flash_mla_get_workspace_size);
 
   m.def(
@@ -234,6 +235,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /* HC PRE GEMM */
   m.def("hc_pre_gemm(Tensor A, Tensor B, Tensor! C) -> ()");
   m.impl("hc_pre_gemm", torch::kXPU, &hc_pre_gemm);
+
+  /* ROW WISE SUM CUTLASS */
+  m.def("row_wise_sum_cutlass(Tensor A, Tensor! D) -> ()");
+  m.impl("row_wise_sum_cutlass", torch::kXPU, &row_wise_sum_cutlass);
 }
 
 REGISTER_EXTENSION(common_ops)

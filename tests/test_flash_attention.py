@@ -1639,7 +1639,7 @@ def test_flash_attn_varlen_output(
             seqlen_q, batch_size, device, mode="random", zero_lengths=False
         )
         key_padding_mask = generate_random_padding_mask(
-            seqlen_k, batch_size, device, mode="random", zero_lengths=True
+            seqlen_k, batch_size, device, mode="random", zero_lengths=False
         )
 
         def _gen_unused_masks(padding_mask, add_unused, max_seq_len, bs, device):

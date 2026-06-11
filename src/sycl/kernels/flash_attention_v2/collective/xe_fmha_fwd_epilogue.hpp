@@ -171,7 +171,11 @@ class FMHAFwdEpilogue {
        so emit 0 instead of NaN to match the reference implementation. */
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < rA_sum.size(); i++) {
-      rA_sum(i) = safe_recip(rA_sum(i));
+      if constexpr (CollectiveMainloop::LocalMask || CollectiveMainloop::CausalMask) {
+        rA_sum(i) = safe_recip(rA_sum(i));
+      } else {
+        rA_sum(i) = ElementA(1) / rA_sum(i);
+      }
     }
 
     CUTLASS_PRAGMA_UNROLL
@@ -425,7 +429,11 @@ class DecodeFwdEpilogue {
        so emit 0 instead of NaN to match the reference implementation. */
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < rA_sum.size(); i++) {
-      rA_sum(i) = safe_recip(rA_sum(i));
+      if constexpr (CollectiveMainloop::LocalMask || CollectiveMainloop::CausalMask) {
+        rA_sum(i) = safe_recip(rA_sum(i));
+      } else {
+        rA_sum(i) = ElementA(1) / rA_sum(i);
+      }
     }
 
     CUTLASS_PRAGMA_UNROLL

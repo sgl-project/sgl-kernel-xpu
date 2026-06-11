@@ -101,4 +101,5 @@ void flash_mla_sparse_decode(
     const std::optional<torch::Tensor>& extra_topk_length,
     const std::optional<torch::Tensor>& attn_sink,
     double sm_scale,
-    int64_t head_dim_v);
+    int64_t head_dim_v,
+    bool is_fp8_kvcache = false);

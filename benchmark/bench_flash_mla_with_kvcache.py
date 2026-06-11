@@ -14,7 +14,7 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel import flash_mla_sparse_decode
+from sgl_kernel import flash_mla_with_kvcache
 
 # ── DeepSeek V4 constants ──
 NOPE_DIM_VAL = 448
@@ -426,7 +426,24 @@ if __name__ == "__main__":
         bw_triton = total_bytes / (ms_triton / 1e3) / 1e9
 
         # SGL Kernel
-        fn_sgl = lambda: flash_mla_sparse_decode(**inputs)
+        fn_sgl = lambda: flash_mla_with_kvcache(
+            q=inputs["q"],
+            k_cache=inputs["k_cache"],
+            block_table=None,
+            cache_seqlens=None,
+            head_dim_v=inputs["head_dim_v"],
+            tile_scheduler_metadata=None,
+            num_splits=None,
+            softmax_scale=inputs["softmax_scale"],
+            causal=False,
+            is_fp8_kvcache=True,
+            indices=inputs["indices"],
+            attn_sink=inputs["attn_sink"],
+            extra_k_cache=inputs.get("extra_k_cache"),
+            extra_indices_in_kvcache=inputs.get("extra_indices"),
+            topk_length=inputs["topk_length"],
+            extra_topk_length=inputs.get("extra_topk_length"),
+        )
         ms_sgl, _, _ = triton.testing.do_bench(fn_sgl, quantiles=[0.5, 0.2, 0.8])
         bw_sgl = total_bytes / (ms_sgl / 1e3) / 1e9
 

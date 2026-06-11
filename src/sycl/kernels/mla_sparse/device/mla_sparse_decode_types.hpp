@@ -218,7 +218,8 @@ inline typename T::Fmla::Arguments args_from_options_sparse(
     at::Tensor const& topk_length,                // [H]
     at::Tensor const& extra_topk_length,          // [H]
     double sm_scale,
-    int64_t head_dim_v) {
+    int64_t head_dim_v,
+    bool is_fp8_kvcache = false) {
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = q.device().index();
   hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
@@ -359,9 +360,6 @@ inline typename T::Fmla::Arguments args_from_options_sparse(
   kernel_args.dO = stride_O;
   kernel_args.lse_out = static_cast<float*>(lse_out.data_ptr());
 
-  // Mainloop arguments: scattered gather indices + raw KV cache pointers
-  bool is_fp8 = (kv_c_and_k_pe_cache.dtype() == at::ScalarType::Float8_e4m3fn);
-
   typename T::CollectiveMainloop::Arguments mainloop_args{
       static_cast<float>(sm_scale),
       page_size,
@@ -373,7 +371,7 @@ inline typename T::Fmla::Arguments args_from_options_sparse(
       extra_topk,
       static_cast<const int*>(topk_length.data_ptr()),
       static_cast<const int*>(extra_topk_length.data_ptr()),
-      is_fp8};
+      is_fp8_kvcache};
 
   // Epilogue arguments: attn_sink and LSE output
   typename T::CollectiveEpilogue::Arguments epilogue_args{
@@ -400,7 +398,8 @@ inline void runMlaSparseImpl(
     const at::Tensor& topk_length,
     const at::Tensor& extra_topk_length,
     double sm_scale,
-    int64_t head_dim_v) {
+    int64_t head_dim_v,
+    bool is_fp8_kvcache = false) {
   using MlaSparseXeType = MlaSparseXe<Element, PageSizeOpt, HasExtraOpt>;
   typename MlaSparseXeType::Fmla fmla;
   auto arguments = args_from_options_sparse<MlaSparseXeType>(
@@ -415,7 +414,8 @@ inline void runMlaSparseImpl(
       topk_length,
       extra_topk_length,
       sm_scale,
-      head_dim_v);
+      head_dim_v,
+      is_fp8_kvcache);
 
   auto workspace = at::empty({0}, at::TensorOptions().dtype(at::kByte).device(q.device()));
   CUTLASS_CHECK(fmla.can_implement(arguments));
@@ -435,7 +435,8 @@ inline void runMlaSparse(
     const std::optional<at::Tensor>& extra_topk_length,
     const std::optional<at::Tensor>& attn_sink,
     double sm_scale,
-    int64_t head_dim_v) {
+    int64_t head_dim_v,
+    bool is_fp8_kvcache) {
   int B = q.size(0);
   int H = q.size(2);
 
@@ -474,7 +475,8 @@ inline void runMlaSparse(
         topk_length_resolved,
         extra_topk_length_resolved,
         sm_scale,
-        head_dim_v);
+        head_dim_v,
+        is_fp8_kvcache);
   } else {
     int page_size = k_cache.size(1);
     int D = k_cache.size(3);
@@ -493,6 +495,7 @@ inline void runMlaSparse(
         topk_length_resolved,
         extra_topk_length_resolved,
         sm_scale,
-        head_dim_v);
+        head_dim_v,
+        is_fp8_kvcache);
   }
 }

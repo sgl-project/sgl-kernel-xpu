@@ -62,7 +62,8 @@ namespace mla_sparse_decode {
       const std::optional<at::Tensor>& extra_topk_length, \
       const std::optional<at::Tensor>& attn_sink,         \
       double sm_scale,                                    \
-      int64_t head_dim_v);
+      int64_t head_dim_v,                                 \
+      bool is_fp8_kvcache);
 
 DECLARE_MLA_SPARSE_DECODE_LAUNCH(half)
 DECLARE_MLA_SPARSE_DECODE_LAUNCH(bf16)

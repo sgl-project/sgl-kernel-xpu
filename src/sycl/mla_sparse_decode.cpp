@@ -35,7 +35,8 @@ namespace {
             extra_topk_length,                                                   \
             attn_sink,                                                           \
             sm_scale,                                                            \
-            head_dim_v);                                                         \
+            head_dim_v,                                                          \
+            is_fp8_kvcache);                                                     \
         break;                                                                   \
       case at::ScalarType::BFloat16:                                             \
         mla_sparse_decode::launch_mla_sparse_decode_bf16_128(                    \
@@ -50,7 +51,8 @@ namespace {
             extra_topk_length,                                                   \
             attn_sink,                                                           \
             sm_scale,                                                            \
-            head_dim_v);                                                         \
+            head_dim_v,                                                          \
+            is_fp8_kvcache);                                                     \
         break;                                                                   \
       default:                                                                   \
         TORCH_CHECK(false, "Unsupported input data type for Sparse MLA decode"); \
@@ -72,7 +74,8 @@ void flash_mla_sparse_decode(
     const std::optional<at::Tensor>& extra_topk_length,  // [B] or nullopt
     const std::optional<at::Tensor>& attn_sink,          // [H] or nullopt
     double sm_scale,
-    int64_t head_dim_v) {
+    int64_t head_dim_v,
+    bool is_fp8_kvcache = false) {
   CHECK_INPUT(out);
   CHECK_INPUT(lse_out);
   CHECK_INPUT(q);

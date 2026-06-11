@@ -40,7 +40,7 @@ from typing import Optional
 
 import pytest
 import torch
-from sgl_kernel import flash_mla_sparse_decode
+from sgl_kernel import flash_mla_with_kvcache
 from torch import Tensor
 
 device = torch.device("xpu")
@@ -364,16 +364,22 @@ def call_kernel(
     extra_topk_length=None,
 ):
     """Calls flash_mla_sparse_decode with FP8 packed KV cache (page-end scales)."""
-    return flash_mla_sparse_decode(
+    return flash_mla_with_kvcache(
         q=q,
         k_cache=k_cache,
-        indices=indices,
-        topk_length=topk_length,
-        attn_sink=attn_sink,
+        block_table=None,
+        cache_seqlens=None,
         head_dim_v=D_V,
+        tile_scheduler_metadata=None,
+        num_splits=None,
         softmax_scale=SM_SCALE,
+        causal=False,
+        is_fp8_kvcache=True,
+        indices=indices,
+        attn_sink=attn_sink,
         extra_k_cache=extra_k_cache,
-        extra_indices=extra_indices,
+        extra_indices_in_kvcache=extra_indices,
+        topk_length=topk_length,
         extra_topk_length=extra_topk_length,
     )
 
@@ -530,58 +536,6 @@ def test_dsv4_sparse_decode_correctness(
                 dtype=torch.int32,
                 device=device,
             )
-    print(f"\nq shape : {q.shape}, stride : {q.stride()}")
-    print(f"k_cache shape : {k_cache.shape}, stride: {k_cache.stride()}")
-    print(f"indices shape : {indices.shape}")
-    if extra_k_cache is not None:
-        print(
-            f"extra_k_cache shape : {extra_k_cache.shape}, stride : {extra_k_cache.stride()}"
-        )
-        print(f"extra_indices shape : {extra_indices.shape}")
-    if attn_sink is not None:
-        print(f"attn_sink shape : {attn_sink.shape}")
-    print(f"topk_length : {topk_length}")
-    print(f"extra_topk_length : {extra_topk_length}")
-    # print(f"q_nope : {q[0, 0, 1, :448]}")
-    # print(f"q_pe : {q[0, 0, 1, 448:]}")
-    # For the FP8 packed cache (584 bytes/token layout):
-    # k_bytes = k_cache.view(torch.uint8)
-    # # Primary K_nope: FP8 nope (first 448 bytes of token 0, page 0)
-    # print(f"k_nope: {k_bytes[0, 0, 0, :448].view(torch.float8_e4m3fn)}")
-    # # Primary K_pe: bf16 rope (bytes 448..576 of token 0, page 0)
-    # k_rope = k_cache.view(torch.uint8)[0, 0, 0, 448 : 448 + 128].view(torch.bfloat16)
-    # print(f"k_rope : {k_rope}")
-    # # Primary KV_scale
-    # raw_flat = k_cache.as_strided(
-    #     (k_cache.shape[0], k_cache.stride(0)), (k_cache.stride(0), 1)
-    # ).view(torch.uint8)
-    # scale_start = page_size * 576
-    # print("Scales page0 token0:", raw_flat[0, scale_start : scale_start + 8])
-    # # Primary V_nope = K_nope (shared latent in MLA)
-    # print(f"v_nope: {k_bytes[0, 0, 0, :448].view(torch.float8_e4m3fn)}")
-    # # Primary V_pe = K_pe (shared latent in MLA)
-    # print(f"v_rope : {k_rope}")
-    # # Extra K_nope
-    # extra_bytes = extra_k_cache.view(torch.uint8)
-    # print(f"k_nope_extra: {extra_bytes[0, 0, 0, :448].view(torch.float8_e4m3fn)}")
-    # # Extra K_pe
-    # extra_rope = extra_k_cache.view(torch.uint8)[0, 0, 0, 448 : 448 + 128].view(
-    #     torch.bfloat16
-    # )
-    # print(f"k_rope_extra : {extra_rope}")
-    # # Extra KV_scale
-    # extra_raw_flat = extra_k_cache.as_strided(
-    #     (extra_k_cache.shape[0], extra_k_cache.stride(0)), (extra_k_cache.stride(0), 1)
-    # ).view(torch.uint8)
-    # extra_scale_start = extra_page_size * 576
-    # print(
-    #     "Scales_extra page0 token0:",
-    #     extra_raw_flat[0, extra_scale_start : extra_scale_start + 8],
-    # )
-    # # Extra V_nope = Extra K_nope (shared latent)
-    # print(f"v_nope_extra: {extra_bytes[0, 0, 0, :448].view(torch.float8_e4m3fn)}")
-    # # Extra V_pe = Extra K_pe (shared latent)
-    # print(f"v_rope_extra : {extra_rope}")
     out, lse = call_kernel(
         q,
         k_cache,

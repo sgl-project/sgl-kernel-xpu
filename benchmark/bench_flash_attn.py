@@ -86,7 +86,8 @@ local = [True, False]
 use_sinks = [True, False]
 batch_size = [1, 8, 16]
 q_seq_length_range = [1, 128]
-head_dim = [72, 128, 256, 512]
+head_dim_no_page = [72, 128]
+head_dim_paged = [128, 256, 512]
 num_heads_q = [16]
 num_heads_kv = [4, 8]
 kv_seq_length_range = [4096]
@@ -97,18 +98,22 @@ configs = list(
         and (cfg[4] != 1 or (not cfg[0] and not cfg[1] and not cfg[2]))
         and (cfg[6] % cfg[7] == 0)
         and (cfg[8] >= cfg[9]),
-        product(
-            causal,
-            local,
-            use_sinks,
-            batch_size,
-            q_seq_length_range,
-            head_dim,
-            num_heads_q,
-            num_heads_kv,
-            kv_seq_length_range,
-            page_size_range,
-        ),
+        [
+            cfg
+            for page_size in page_size_range
+            for cfg in product(
+                causal,
+                local,
+                use_sinks,
+                batch_size,
+                q_seq_length_range,
+                head_dim_no_page if page_size == 0 else head_dim_paged,
+                num_heads_q,
+                num_heads_kv,
+                kv_seq_length_range,
+                [page_size],
+            )
+        ],
     )
 )
 all_results = []

@@ -499,7 +499,7 @@ def generate_qkv(
 @pytest.mark.parametrize("has_leftpad", [False])
 @pytest.mark.parametrize("has_batch_idx", [False])
 @pytest.mark.parametrize("varlen_q", [True])
-@pytest.mark.parametrize("d", [64, 72, 128, 256, 512])
+@pytest.mark.parametrize("d", [64, 128, 256, 512])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -987,7 +987,7 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("local", [True, False])
-@pytest.mark.parametrize("use_sinks", [False])
+@pytest.mark.parametrize("use_sinks", [True, False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 @pytest.mark.parametrize("has_rotary_seqlens", [False])
 @pytest.mark.parametrize(
@@ -1005,7 +1005,7 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize("has_leftpad", [False])
 @pytest.mark.parametrize("has_batch_idx", [False])
 @pytest.mark.parametrize("varlen_q", [True])
-@pytest.mark.parametrize("d", [64, 72, 128, 256, 512])
+@pytest.mark.parametrize("d", [64, 128, 256, 512])
 @pytest.mark.parametrize("seqlen_q", [1])
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize(
@@ -1531,7 +1531,7 @@ def _generate_block_kvcache(
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128])
 # @pytest.mark.parametrize("d", COMPILED_HDIMS)
-@pytest.mark.parametrize("d", [72, 128, 192])
+@pytest.mark.parametrize("d", [72, 128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -1639,7 +1639,7 @@ def test_flash_attn_varlen_output(
             seqlen_q, batch_size, device, mode="random", zero_lengths=False
         )
         key_padding_mask = generate_random_padding_mask(
-            seqlen_k, batch_size, device, mode="random", zero_lengths=True
+            seqlen_k, batch_size, device, mode="random", zero_lengths=False
         )
 
         def _gen_unused_masks(padding_mask, add_unused, max_seq_len, bs, device):

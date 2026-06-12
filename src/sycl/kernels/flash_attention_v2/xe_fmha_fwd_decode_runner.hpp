@@ -187,6 +187,11 @@ struct Arguments {
 
   bool is_rotary_interleaved;
 
+  // Per-batch skip mask for two-kernel mix-batch dispatch
+  // (see https://github.com/vllm-project/vllm-xpu-kernels/pull/218).
+  // If non-null, the kernel skips batches where mask[idx_b] is true.
+  void* skip_batch_mask_ptr = nullptr;
+
   torch::TensorOptions tensor_opts;
 };
 
@@ -234,20 +239,16 @@ struct DecodeRunner {
   auto initialize_varlen(const Arguments& params, const ProblemShape& problem_size) {
     ProblemShape problem_size_for_init = problem_size;
     get<0>(problem_size_for_init) = 1;  // concentrated batch
-    get<1>(problem_size_for_init) = params.use_split_kv ? params.h : params.h_k;
-    get<3>(problem_size_for_init) = params.use_split_kv ? params.total_q : params.total_q * params.q_group_size;
+    get<1>(problem_size_for_init) = params.h;
+    get<3>(problem_size_for_init) = params.total_q;
     get<4>(problem_size_for_init) = params.total_knew;
     get<5>(problem_size_for_init) = params.total_k;
 
     ProblemShapeType problem_size_for_launch{
         .batch = get<0>(problem_size),
-        .num_heads_q = params.use_split_kv ? get<1>(problem_size) : get<2>(problem_size),
+        .num_heads_q = get<1>(problem_size),
         .num_heads_kv = get<2>(problem_size),
-        .seq_len_qo =
-            {params.use_split_kv ? params.seqlen_q * params.q_group_size : params.seqlen_q,
-             params.use_split_kv ? params.total_q : params.total_q * params.q_group_size,
-             nullptr,
-             params.use_split_kv ? 1 : params.q_group_size},
+        .seq_len_qo = {params.seqlen_q, params.total_q, nullptr, params.q_group_size},
 
         .seq_len_kv = {params.seqlen_knew, params.total_knew},
         .seq_len_kv_cache = {params.seqlen_k, params.total_k},
@@ -318,8 +319,15 @@ struct DecodeRunner {
             stride_K_cache,
             static_cast<const ElementV*>(params.v_ptr),
             stride_V_cache,
+            static_cast<const typename FMHADecodeKernel::ElementSink*>(params.softmax_sink_ptr),
+            static_cast<const bool*>(params.skip_batch_mask_ptr),
         },
-        {params.softmax_scale, params.page_table, params.page_size, params.max_num_pages_per_seq},
+        {params.softmax_scale,
+         params.page_table,
+         params.page_size,
+         params.max_num_pages_per_seq,
+         params.window_size_left,
+         params.window_size_right},
         {},
         hw_info};
 
@@ -473,6 +481,7 @@ struct SplitDecodeKernelRunner {
             reinterpret_cast<ElementLSE*>(params.max_logits_ptr),
             stride_max_logits,
             reinterpret_cast<ElementQ*>(params.softmax_sink_ptr),
+            static_cast<const bool*>(params.skip_batch_mask_ptr),
         },
         {params.softmax_scale,
          params.k_scale_ptr,
@@ -497,7 +506,8 @@ struct SplitDecodeKernelRunner {
          stride_exp_sums,
          reinterpret_cast<ElementLSE*>(params.max_logits_ptr),
          stride_max_logits,
-         params.window_size_left},
+         params.window_size_left,
+         static_cast<const bool*>(params.skip_batch_mask_ptr)},
         hw_info,
         params.num_kv_splits};
 
@@ -627,11 +637,12 @@ struct DecodeConfig {
         GmemTiledCopyK,
         GmemTiledCopyV,
         GmemTiledCopyK_cache,
-        GmemTiledCopyV_cache>;
+        GmemTiledCopyV_cache,
+        LocalMask>;
 
     // Epilogue
     using CollectiveEpilogue =
-        cutlass::fmha::collective::FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO>;
+        cutlass::fmha::collective::FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, Sink>;
 
     static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
     using FMHADecodeKernel = conditional_t<
@@ -654,9 +665,20 @@ struct DecodeConfig {
     return 0;
   }
 
-  static int run(const Arguments& params) {
+  // Paged KV cache: the page table encodes absolute KV positions.
+  static int run_paged(const Arguments& params) {
     // template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
     return run<true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+  }
+
+  // Non-paged (contiguous ragged) KV cache: addressed via cu_seqlens_k offsets.
+  static int run_nopaged(const Arguments& params) {
+    // template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
+    return run<true, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+  }
+
+  static int run(const Arguments& params) {
+    return run_paged(params);
   }
 };
 

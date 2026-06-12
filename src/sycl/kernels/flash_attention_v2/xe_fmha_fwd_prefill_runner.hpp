@@ -170,6 +170,11 @@ struct Arguments {
 
   bool is_rotary_interleaved;
 
+  // Per-batch skip mask for two-kernel mix-batch dispatch
+  // (see https://github.com/vllm-project/vllm-xpu-kernels/pull/218).
+  // If non-null, the kernel skips batches where mask[idx_b] is true.
+  void* skip_batch_mask_ptr = nullptr;
+
   torch::TensorOptions tensor_opts;
 };
 
@@ -297,6 +302,7 @@ struct PrefillRunner {
             static_cast<const ElementV*>(params.v_ptr),
             stride_V_cache,
             static_cast<const typename FMHAPrefillKernel::ElementSink*>(params.softmax_sink_ptr),
+            static_cast<const bool*>(params.skip_batch_mask_ptr),
         },
         {
             params.softmax_scale,
@@ -443,9 +449,20 @@ struct FMHAConfig {
     return 0;
   }
 
-  static int run(const Arguments& params) {
+  // Paged KV cache: the page table encodes absolute KV positions.
+  static int run_paged(const Arguments& params) {
     // template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
     return run<true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+  }
+
+  // Non-paged (contiguous ragged) KV cache: addressed via cu_seqlens_k offsets.
+  static int run_nopaged(const Arguments& params) {
+    // template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
+    return run<true, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+  }
+
+  static int run(const Arguments& params) {
+    return run_paged(params);
   }
 };
 

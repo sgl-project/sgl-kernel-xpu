@@ -165,6 +165,8 @@ void fused_qk_norm_rope(
     double high,
     double attention_factor,
     int64_t rotary_dim);
+void fused_inplace_qknorm(
+    torch::Tensor& q, torch::Tensor& k, torch::Tensor& q_weight, torch::Tensor& k_weight, double eps);
 void fused_qk_rope(
     torch::Tensor& qkv,
     int64_t num_heads_q,

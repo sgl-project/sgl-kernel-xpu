@@ -39,7 +39,7 @@ namespace decode {
 
 template <>
 void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Arguments& params) const {
-#if @PAGE_SIZE@ == 128
+#if @PAGE_SIZE@ == 128 && @EMIT_NP@
   if (params.page_table == nullptr) {
     // Non-paged (contiguous ragged) KV cache. The paged decode kernel ties its
     // KV tile to PAGE_SIZE; the non-paged path has no page size, so it uses an
@@ -66,6 +66,7 @@ void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Argume
   }
 #endif
 
+#if @EMIT_PAGED@
   using TileShapeQK = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@PAGE_SIZE@>, cute::_64>;
   using TileShapePV = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@PAGE_SIZE@>>;
   // Round the head-dim of the output tile up to a multiple of get<1>(TileShapePV) (32) so that
@@ -81,6 +82,9 @@ void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Argume
             params);
       });
   });
+#else
+  TORCH_CHECK(false, "head dim @HEAD_DIM@ is not compiled for the paged decode path");
+#endif
 }
 
 template struct FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>;

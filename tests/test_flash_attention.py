@@ -499,7 +499,7 @@ def generate_qkv(
 @pytest.mark.parametrize("has_leftpad", [False])
 @pytest.mark.parametrize("has_batch_idx", [False])
 @pytest.mark.parametrize("varlen_q", [True])
-@pytest.mark.parametrize("d", [64, 72, 128, 256, 512])
+@pytest.mark.parametrize("d", [64, 128, 256, 512])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -1005,7 +1005,7 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize("has_leftpad", [False])
 @pytest.mark.parametrize("has_batch_idx", [False])
 @pytest.mark.parametrize("varlen_q", [True])
-@pytest.mark.parametrize("d", [64, 72, 128, 256, 512])
+@pytest.mark.parametrize("d", [64, 128, 256, 512])
 @pytest.mark.parametrize("seqlen_q", [1])
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize(
@@ -1531,7 +1531,7 @@ def _generate_block_kvcache(
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128])
 # @pytest.mark.parametrize("d", COMPILED_HDIMS)
-@pytest.mark.parametrize("d", [72, 128, 192])
+@pytest.mark.parametrize("d", [72, 128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [

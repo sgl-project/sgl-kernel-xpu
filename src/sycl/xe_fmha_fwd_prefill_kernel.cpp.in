@@ -40,6 +40,7 @@ template <>
 void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
   bool use_sink = (params.softmax_sink_ptr != nullptr);
 
+#if @EMIT_NP@
   if (params.page_table == nullptr) {
     // Non-paged (contiguous ragged) KV cache. Uses an independent tile-shape
     // configuration so it can be tuned separately from the paged path.
@@ -58,7 +59,9 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
     });
     return;
   }
+#endif
 
+#if @EMIT_PAGED@
   using TileShapeQK = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_KV@>, cute::_32>;
   using TileShapePV = cute::Shape<cute::Int<@TILED_Q@>, cute::_32, cute::Int<@TILED_KV@>>;
   // Round the head-dim of the output tile up to a multiple of get<1>(TileShapePV) (32) so that
@@ -77,6 +80,9 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
       });
     });
   });
+#else
+  TORCH_CHECK(false, "head dim @HEAD_DIM@ is not compiled for the paged prefill path");
+#endif
 }
 
 template struct FmhaPrefillRunner<@HEAD_DIM@>;

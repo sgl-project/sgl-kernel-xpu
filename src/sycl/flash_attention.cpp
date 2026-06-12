@@ -217,10 +217,11 @@ std::vector<at::Tensor> mha_fwd_nopage(
 
   int qg_sz = nextPowerOf2(params.q_group_size);
   TORCH_CHECK(qg_sz >= 1 && qg_sz <= 16, "Unsupported q_group_size for decode attention: ", params.q_group_size);
+  // Non-paged decode supports its own (independent) set of head dims; see
+  // FMHA_DECODE_NP_HEAD_DIMS in FMHADecodeXe20.cmake.
   TORCH_CHECK(
-      params.d == 64 || params.d == 72 || params.d == 96 || params.d == 128 || params.d == 192 || params.d == 256 ||
-          params.d == 512,
-      "Unsupported head size for decode attention: ",
+      params.d == 64 || params.d == 72 || params.d == 96 || params.d == 128,
+      "Unsupported head size for non-paged decode attention: ",
       params.d);
 
   DISPATCH_DECODE(qg_sz);
@@ -573,10 +574,11 @@ std::vector<at::Tensor> mha_fwd(
 
   int qg_sz = nextPowerOf2(params.q_group_size);
   TORCH_CHECK(qg_sz >= 1 && qg_sz <= 16, "Unsupported q_group_size for decode attention: ", params.q_group_size);
+  // Paged decode supports its own (independent) set of head dims; see
+  // FMHA_DECODE_PAGED_HEAD_DIMS in FMHADecodeXe20.cmake.
   TORCH_CHECK(
-      params.d == 64 || params.d == 72 || params.d == 96 || params.d == 128 || params.d == 192 || params.d == 256 ||
-          params.d == 512,
-      "Unsupported head size for decode attention: ",
+      params.d == 64 || params.d == 96 || params.d == 128 || params.d == 192 || params.d == 256 || params.d == 512,
+      "Unsupported head size for paged decode attention: ",
       params.d);
   TORCH_CHECK(
       params.page_size == 64 || params.page_size == 128,
@@ -743,10 +745,11 @@ std::vector<at::Tensor> mha_fwd_nopage(
 
   at::Tensor out_accum, softmax_lse_accum;
 
+  // Non-paged prefill supports its own (independent) set of head dims; see
+  // FMHA_PREFILL_NP_HEAD_DIMS in FMHAPrefillXe20.cmake.
   TORCH_CHECK(
-      params.d == 64 || params.d == 72 || params.d == 96 || params.d == 128 || params.d == 192 || params.d == 256 ||
-          params.d == 512,
-      "Unsupported head size for prefill attention: ",
+      params.d == 64 || params.d == 72 || params.d == 96 || params.d == 128,
+      "Unsupported head size for non-paged prefill attention: ",
       params.d);
 
   switch (params.d) {
@@ -762,17 +765,8 @@ std::vector<at::Tensor> mha_fwd_nopage(
     case 128:
       DISPATCH_PREFILL_KERNEL(128);
       break;
-    case 192:
-      DISPATCH_PREFILL_KERNEL(192);
-      break;
-    case 256:
-      DISPATCH_PREFILL_KERNEL(256);
-      break;
-    case 512:
-      DISPATCH_PREFILL_KERNEL(512);
-      break;
     default:
-      TORCH_CHECK(false, "Unsupported head size for prefill attention: ", params.d);
+      TORCH_CHECK(false, "Unsupported head size for non-paged prefill attention: ", params.d);
   }
 
   return {out, softmax_lse, out_accum, softmax_lse_accum};
@@ -1051,18 +1045,16 @@ std::vector<at::Tensor> mha_fwd(
 
   at::Tensor out_accum, softmax_lse_accum;
 
+  // Paged prefill supports its own (independent) set of head dims; see
+  // FMHA_PREFILL_PAGED_HEAD_DIMS in FMHAPrefillXe20.cmake.
   TORCH_CHECK(
-      params.d == 64 || params.d == 72 || params.d == 96 || params.d == 128 || params.d == 192 || params.d == 256 ||
-          params.d == 512,
-      "Unsupported head size for prefill attention: ",
+      params.d == 64 || params.d == 96 || params.d == 128 || params.d == 192 || params.d == 256 || params.d == 512,
+      "Unsupported head size for paged prefill attention: ",
       params.d);
 
   switch (params.d) {
     case 64:
       DISPATCH_PREFILL_KERNEL(64);
-      break;
-    case 72:
-      DISPATCH_PREFILL_KERNEL(72);
       break;
     case 96:
       DISPATCH_PREFILL_KERNEL(96);
@@ -1080,7 +1072,7 @@ std::vector<at::Tensor> mha_fwd(
       DISPATCH_PREFILL_KERNEL(512);
       break;
     default:
-      TORCH_CHECK(false, "Unsupported head size for prefill attention: ", params.d);
+      TORCH_CHECK(false, "Unsupported head size for paged prefill attention: ", params.d);
   }
 
   return {out, softmax_lse, out_accum, softmax_lse_accum};

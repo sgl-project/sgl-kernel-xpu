@@ -1,0 +1,45 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index ec9dd8c..1c5843d 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -19,8 +19,17 @@ foreach(file ${device_cpp})
+
+ endforeach()
+
+-include(FMHADecodeXe20.cmake)
+-include(FMHAPrefillXe20.cmake)
++option(BUILD_FMHA "Build FMHA decode/prefill kernels" ON)
++if(BUILD_FMHA)
++    add_compile_definitions(BUILD_FMHA)
++    include(FMHADecodeXe20.cmake)
++    include(FMHAPrefillXe20.cmake)
++else()
++    message(STATUS "Skipping FMHA decode/prefill kernels (BUILD_FMHA=OFF)")
++    # flash_attention.cpp depends on FmhaDecodeRunner symbols instantiated by
++    # FMHADecodeXe20.cmake — exclude it to avoid undefined symbol errors.
++    list(FILTER device_cpp_common EXCLUDE REGEX "flash_attention\\.cpp$")
++endif()
+ include(MlaDecodeXe20.cmake)
+
+ message(STATUS "BMG files: ${device_cpp_xe20}")
+diff --git a/src/torch_extension_sycl.cc b/src/torch_extension_sycl.cc
+index 8234e0e..51523a5 100644
+--- a/src/torch_extension_sycl.cc
++++ b/src/torch_extension_sycl.cc
+@@ -110,6 +110,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+
+   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
+   m.impl("merge_state_v2", torch::kXPU, &merge_state_v2);
++#ifdef BUILD_FMHA
+   /*
+    * From cutlass attention
+    */
+@@ -143,7 +144,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+       "    bool?    pack_gqa,"
+       "    int      sm_margin) -> Tensor[]");
+   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
+-
++#endif
+   m.def("flash_mla_get_workspace_size", &flash_mla_get_workspace_size);
+
+   m.def(

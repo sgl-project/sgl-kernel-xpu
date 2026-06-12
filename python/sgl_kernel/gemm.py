@@ -320,6 +320,24 @@ def qserve_w4a8_per_group_gemm(
     return out_feats
 
 
+def gemm_sqrsum(
+    C: torch.Tensor,
+    sqrsum: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+) -> None:
+    """
+    Compute C = A @ B and sqrsum[i] = sum(A[i, :]^2) row-wise.
+
+    Args:
+        C: Output tensor [M, N], will be filled with A @ B
+        sqrsum: Output tensor [M], will be filled with row-wise squared sums of A
+        A: Input tensor [M, K]
+        B: Input tensor [K, N]
+    """
+    torch.ops.sgl_kernel.gemm_sqrsum.default(C, sqrsum, A, B)
+
+
 def scaled_fp4_experts_quant(
     input_tensor: torch.Tensor,
     input_global_scale: torch.Tensor,

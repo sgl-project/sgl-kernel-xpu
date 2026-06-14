@@ -38,9 +38,9 @@ all_results = []
         x_names=["M", "K", "N"],
         x_vals=configs,
         line_arg="provider",
-        line_vals=["sgl_kernel", "torch"],
-        line_names=["sgl_kernel (tf32)", "torch (fp32)"],
-        styles=[("green", "-"), ("blue", "--")],
+        line_vals=["sgl_kernel"],
+        line_names=["sgl_kernel (tf32)"],
+        styles=[("green", "-")],
         ylabel="Time (ms)",
         plot_name="gemm-sqrsum-performance",
         args={},
@@ -59,12 +59,7 @@ def benchmark(M, K, N, provider):
     C = torch.empty(M, N, dtype=torch.float32, device="xpu")
     sqrsum = torch.empty(M, dtype=torch.float32, device="xpu")
 
-    if provider == "sgl_kernel":
-        run = lambda: gemm_sqrsum(C, sqrsum, A, B)
-    else:
-        # torch baseline: fp32 GEMM (A @ B^T) + row-wise square sum.
-        Af = A.float()
-        run = lambda: (torch.matmul(Af, B.t()), (Af * Af).sum(dim=1))
+    run = lambda: gemm_sqrsum(C, sqrsum, A, B)
 
     # Warmup
     for _ in range(10):
@@ -114,14 +109,9 @@ if __name__ == "__main__":
     print(df.to_markdown(index=False))
     print("\n")
 
-    # Summary statistics by provider
+    # Summary statistics
     print("Summary Statistics:")
-    for prov in ["sgl_kernel", "torch"]:
-        df_variant = df[df["provider"] == prov]
-        if df_variant.empty:
-            continue
-        print(f"\n{prov}:")
-        print(f"  Mean throughput: {df_variant['Mtok_per_sec'].mean():.2f} Mtok/s")
-        print(f"  Mean compute:    {df_variant['TFLOP_per_sec'].mean():.3f} TFLOP/s")
-        print(f"  Mean bandwidth:  {df_variant['bandwidth_gb_s'].mean():.2f} GB/s")
-        print(f"  Best throughput: {df_variant['Mtok_per_sec'].max():.2f} Mtok/s")
+    print(f"  Mean throughput: {df['Mtok_per_sec'].mean():.2f} Mtok/s")
+    print(f"  Mean compute:    {df['TFLOP_per_sec'].mean():.3f} TFLOP/s")
+    print(f"  Mean bandwidth:  {df['bandwidth_gb_s'].mean():.2f} GB/s")
+    print(f"  Best throughput: {df['Mtok_per_sec'].max():.2f} Mtok/s")

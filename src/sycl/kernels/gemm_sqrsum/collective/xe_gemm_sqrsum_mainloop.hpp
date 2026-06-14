@@ -123,9 +123,11 @@ struct XeGemmSqrSumMainloop<
   using ElementAccum = typename TiledMMA::ValTypeD;     // Accumulator type (float)
   using ElementC = ElementA;                             // Output type (same as input)
 
-  // Square sum accumulator: one accumulator per row in the BLK_M tile.
-  // BLK_M is a CuTe Int<> instance, so its compile-time extent is decltype(BLK_M)::value.
-  using FragSqrSum = cute::array<float, decltype(BLK_M)::value>;
+  // Square sum is computed as a SECOND GEMM: (A elementwise-squared) @ ones[K,N].
+  // Every column of that (M,N) product equals sqrsum[row], so the accumulator is
+  // a full C-fragment (identical type/layout to FragGemm) and the epilogue reuses
+  // the proven C-write coordinate mapping to extract one column per row.
+  using FragSqrSum = decltype(partition_fragment_C(TiledMMA{}, select<0, 1>(TileShape{})));
   using ElementSqrSum = float;  // Square sum output type (always float for atomic support)
 
   //
@@ -176,136 +178,109 @@ struct XeGemmSqrSumMainloop<
       int thr_id) {
     using namespace sycl::ext::oneapi::this_work_item;
 
-    /* Create proxy coordinate tensors */
-    Tensor cA = make_identity_tensor(A_2D.shape());  // (m,k)
-    Tensor cB = make_identity_tensor(B_2D.shape());  // (n,k)  [B is the (N,K) view]
-
-    /* Partition global tensors into workgroup tiles.
-     * Step<_1,X,_1> selects (M,K) of TileShape -> A tile (BLK_M,BLK_K,k).
-     * Step<X,_1,_1> selects (N,K) of TileShape -> B tile (BLK_N,BLK_K,k),
-     * matching cB's (n,k) layout and the canonical Xe GEMM convention. */
-    Tensor gA = local_tile(cA, TileShape{}, append(blk_mn, _), Step<_1, X, _1>{});  // (BLK_M,BLK_K,k)
-    Tensor gB = local_tile(cB, TileShape{}, append(blk_mn, _), Step<X, _1, _1>{});  // (BLK_N,BLK_K,k)
-
-    /* Create global -> register copies */
-    TiledCopyA copy_a{A_2D};
-    TiledCopyB copy_b{B_2D};
-
-    /* Create MMA */
     TiledMMA mma{};
+    auto wg_tile = mma.tile_mnk();
+    int wg_m = int(get<0>(blk_mn));
+    int wg_n = int(get<1>(blk_mn));
 
-    /* Slice TiledCopy/TiledMMA operations down to work-item level */
+    /* Proxy coordinate tensors. A is (M,K); B is the (N,K) view. */
+    Tensor cA = make_identity_tensor(A_2D.shape());  // (M,K)
+    Tensor cB = make_identity_tensor(B_2D.shape());  // (N,K)
+
+    /* Workgroup tiles — transcribed from the canonical Xe GEMM tutorial:
+     *   gA: (BLK_M,BLK_K,k) via select<0,2>(wg_tile) at (wg_m,_)
+     *   gB: (BLK_N,BLK_K,k) via select<1,2>(wg_tile) at (wg_n,_)
+     * Using the 2-mode tilers (not the full 3-mode Step form) is what lets the
+     * MMA fragments span the full WG tile across all subgroups. */
+    Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(wg_m, _));  // (BLK_M,BLK_K,k)
+    Tensor gB = local_tile(cB, select<1, 2>(wg_tile), make_coord(wg_n, _));  // (BLK_N,BLK_K,k)
+
+    /* Block-2D copies */
+    auto copy_a = make_block_2d_copy_A(mma, A_2D);
+    auto copy_b = make_block_2d_copy_B(mma, B_2D);
+
+    /* Slice to work-item level */
+    auto thr_mma = mma.get_slice(thr_id);
     auto thr_copy_a = copy_a.get_slice(thr_id);
     auto thr_copy_b = copy_b.get_slice(thr_id);
-    auto thr_mma = mma.get_slice(thr_id);
 
-    /* Recover this work-item's N-subgroup coordinate (ThrN).
-     * The A block-2D copy replicates A across the N subgroup dimension
-     * (drop_n uses stride 0 on ThrN in make_block_2d_copy_A), so every value of
-     * ThrN loads the SAME A data. To compute the square sum exactly once we let
-     * only the ThrN == 0 column of subgroups accumulate; together they cover the
-     * entire (BLK_M, BLK_K) A tile with no duplication. */
-    auto thr_vmnk = mma.get_thr_layout_vmnk().get_flat_coord(thr_id);  // (ThrV,ThrM,ThrN,ThrK)
-    int thr_n = int(get<2>(thr_vmnk));
-
-    /* Partition coordinate tensors for copy */
-    auto tAgA = thr_copy_a.partition_S(gA);  // (atom_val,m',k',K)
-    auto tBgB = thr_copy_b.partition_S(gB);  // (atom_val,k',n',K)
-
-    /* Create register fragments for MMA and copies */
-    auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
+    /* MMA register fragments */
     auto tCrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
-
-    auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_, _, 0));
     auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
 
-    /* Create TiledCopy objects for prefetches */
+    /* Copy register fragments */
+    auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
+    auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_, _, 0));
+
+    /* Partition global proxies for copies */
+    Tensor tAgA = thr_copy_a.partition_S(gA);
+    Tensor tBgB = thr_copy_b.partition_S(gB);
+
+    /* Square-sum-as-GEMM operands (same MMA layouts as tCrA/tCrB) */
+    auto tCrAsq = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
+    auto tCrBones = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
+
+    /* Prefetch instances */
     auto prefetch_a = make_block_2d_prefetch(copy_a);
     auto prefetch_b = make_block_2d_prefetch(copy_b);
-
-    /* Partition global tensors for prefetch */
     auto pAgA = prefetch_a.get_slice(thr_id).partition_S(gA);
     auto pBgB = prefetch_b.get_slice(thr_id).partition_S(gB);
 
-    // Initialize accumulators
+    const int prefetch_dist = 3;
+    constexpr int barrier_scope = 2;
+    int k_tile_count = size<2>(gA);
+    int k_tile_prefetch = 0;
+
+    /* Clear accumulators */
     clear(tC);
     clear(tSqrSum);
 
-    /* Prefetch first tile */
-    prefetch(prefetch_a, pAgA(_, _, _, 0));
-    prefetch(prefetch_b, pBgB(_, _, _, 0));
+    /* Warm up prefetch to L1 */
+    CUTE_UNROLL
+    for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
+      prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
+      prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+    }
 
-    /* Main loop over K dimension */
-    int num_k_tiles = size<2>(gA);
-    for (int K = 0; K < num_k_tiles; K++) {
-      /* Prefetch next K tile */
-      if (K + 1 < num_k_tiles) {
-        prefetch(prefetch_a, pAgA(_, _, _, K + 1));
-        prefetch(prefetch_b, pBgB(_, _, _, K + 1));
-      }
+    /* Main loop */
+    for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
+      barrier_arrive(barrier_scope);
 
-      /* Load A and B tiles */
-      copy(copy_a, tAgA(_, _, _, K), tArA);
-      copy(copy_b, tBgB(_, _, _, K), tBrB);
+      /* Load A/B to registers */
+      copy(copy_a, tAgA(_, _, _, k_tile), tArA);
+      copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
 
-      /* Reorder for MMA */
+      /* Prefetch ahead */
+      prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
+      prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+
+      /* Shuffle copy fragments into MMA fragments */
       reorder(tArA, tCrA);
       reorder(tBrB, tCrB);
 
-      /* Compute C += A @ B; tC is the plain MMA accumulator (== tutorial's tCrC) */
+      /* C += A * B */
       cute::gemm(mma, tCrA, tCrB, tC);
 
-      /* Accumulate square sum using the SAME A values */
-      // Reuse tArA (the A fragment already loaded for the GEMM) so A is read once.
-      // tArA(i) and tAgA(_,_,_,K)(i) are co-indexed by linear index i: the copy()
-      // above moves tAgA -> tArA element-for-element, so the i-th register value
-      // corresponds to the i-th coordinate in the partitioned proxy tensor.
-      //
-      // cA is an identity tensor over the *global* A shape, so the coordinate's
-      // M component is the GLOBAL row. Subtract the tile base (blk_m * BLK_M) to
-      // index the per-tile accumulator array.
-      // Only the ThrN == 0 subgroup column accumulates; other columns hold
-      // duplicate copies of A and would over-count.
-      {
-        // tArA is a SubgroupTensor; .tensor() exposes this work-item's plain
-        // register fragment so size()/element access resolve normally.
-        auto a_frag = tArA.tensor();
-        auto a_coord = tAgA(_, _, _, K);  // co-indexed coordinate proxy for this K-tile
-        int m_base = int(get<0>(blk_mn)) * int(decltype(BLK_M)::value);
-#ifdef GEMM_SQRSUM_DEBUG
-        // One-shot instrumentation: dump real shapes + sample coords for a few
-        // work-items in the first workgroup, first K-tile.
-        if (K == 0 && get<0>(blk_mn) == 0 && get<1>(blk_mn) == 0 &&
-            (thr_id == 0 || thr_id == 1 || thr_id == 16 || thr_id == 128)) {
-          sycl::ext::oneapi::experimental::printf(
-              "[DBG] thr=%d thr_n=%d a_frag_size=%d coords: i0=(%d,%d) i1=(%d,%d) iL=(%d,%d)\n",
-              thr_id, thr_n, int(size(a_frag)),
-              int(get<0>(a_coord(0))), int(get<1>(a_coord(0))),
-              int(get<0>(a_coord(1))), int(get<1>(a_coord(1))),
-              int(get<0>(a_coord(int(size(a_frag)) - 1))),
-              int(get<1>(a_coord(int(size(a_frag)) - 1))));
-        }
-#endif
-        // Only the ThrN == 0 subgroup column accumulates; other columns hold
-        // duplicate copies of A and would over-count.
-        if (thr_n == 0) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < size(a_frag); i++) {
-            ElementA a_val = a_frag(i);
-            ElementSqrSum sq_val = static_cast<ElementSqrSum>(a_val) * static_cast<ElementSqrSum>(a_val);
-
-            // Global row of this element, then convert to local [0, BLK_M).
-            int m_global = int(get<0>(a_coord(i)));
-            int m_local = m_global - m_base;
-
-            if (m_local >= 0 && m_local < int(decltype(BLK_M)::value)) {
-              tSqrSum[m_local] += sq_val;
-            }
-          }
-        }
+      /* Square sum as a second GEMM: tSqrSum += (A^2) @ ones.
+       * Reuses the already-loaded A values (tCrA); every column of tSqrSum then
+       * holds sum_k A[m,k]^2 for row m. Write through the SubgroupTensors'
+       * operator() (their .tensor() view is const). */
+      int n_a = int(size(tCrAsq.tensor()));
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < n_a; i++) {
+        ElementA a_in = tCrA(i);
+        tCrAsq(i) = static_cast<ElementA>(a_in * a_in);
       }
+      int n_b = int(size(tCrBones.tensor()));
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < n_b; i++) {
+        tCrBones(i) = static_cast<ElementB>(1);
+      }
+      cute::gemm(mma, tCrAsq, tCrBones, tSqrSum);
+
+      barrier_wait(barrier_scope);
     }
-    // tC already holds the final accumulator; the kernel epilogue stores it.
+    // tC and tSqrSum hold the final accumulators; the kernel epilogue stores them.
   }
 };
 

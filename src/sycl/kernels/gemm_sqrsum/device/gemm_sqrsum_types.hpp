@@ -166,6 +166,15 @@ inline void runGemmSqrSumImpl(
   // Output sqrsum: [M] - 1D vector (always float32)
   args.ptr_sqrsum = sqrsum.data_ptr<float>();
 
+  // (M,N) float scratch for the square-sum-as-GEMM accumulator. The kernel
+  // stores the full A^2 @ ones product here via the proven block-2D copy (whose
+  // coordinate handling is correct, unlike a manual per-element store). Every
+  // column equals sum_k A[row,k]^2, so we slice column 0 into sqrsum afterward.
+  auto sqsc = torch::empty({M, N}, sqrsum.options().dtype(torch::kFloat32));
+  args.ptr_sqrsum_scratch = sqsc.data_ptr<float>();
+  args.stride_sqsc_m = N;  // row-major
+  args.stride_sqsc_n = 1;
+
   // Mainloop arguments (empty for now)
   args.mainloop = typename KernelConfig::CollectiveMainloop::Arguments{};
 
@@ -175,6 +184,9 @@ inline void runGemmSqrSumImpl(
 
   TORCH_CHECK(status == cutlass::Status::kSuccess,
               "CUTLASS GEMM+SqrSum kernel failed with status: ", int(status));
+
+  // sqrsum[m] = scratch[m, 0]  (all columns are equal).
+  sqrsum.copy_(sqsc.select(/*dim=*/1, /*index=*/0));
 }
 
 template <typename Element, typename TileSizeOpt>

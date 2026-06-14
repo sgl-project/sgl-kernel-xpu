@@ -61,6 +61,13 @@ public:
     int64_t stride_C_n;
 
     ElementSqrSum* ptr_sqrsum;  // Output: [M] row-wise square sums
+
+    // (M,N) float scratch: the square-sum-as-GEMM accumulator is stored here via
+    // the proven block-2D copy engine. Every column equals sqrsum[row]; the host
+    // dispatch slices column 0 into the [M] sqrsum output.
+    ElementSqrSum* ptr_sqrsum_scratch;
+    int64_t stride_sqsc_m;
+    int64_t stride_sqsc_n;
   };
 
   struct Arguments {
@@ -85,6 +92,10 @@ public:
     int64_t stride_C_n;
 
     ElementSqrSum* ptr_sqrsum;
+
+    ElementSqrSum* ptr_sqrsum_scratch;
+    int64_t stride_sqsc_m;
+    int64_t stride_sqsc_n;
   };
 
   struct SharedStorage {
@@ -108,7 +119,10 @@ public:
         args.ptr_C,
         args.stride_C_m,
         args.stride_C_n,
-        args.ptr_sqrsum};
+        args.ptr_sqrsum,
+        args.ptr_sqrsum_scratch,
+        args.stride_sqsc_m,
+        args.stride_sqsc_n};
   }
 
   static bool can_implement(Arguments const& args) {
@@ -143,9 +157,16 @@ public:
     // Cast shared memory buffer to SharedStorage
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
-    int thr_id = this_work_item::get_nd_item<3>().get_local_id(0);
-    int blk_m = this_work_item::get_nd_item<3>().get_group(2);
-    int blk_n = this_work_item::get_nd_item<3>().get_group(1);
+    // Work-item / workgroup IDs. compat::dim3(x,y,z) -> sycl::range<3> maps
+    // x->dim2, y->dim1, z->dim0. get_block_shape() = dim3(512,1,1) puts the 512
+    // work-items on nd-range dim 2 (== ThreadIdxX == get_local_id(2)).
+    // get_grid_shape() = dim3(1, grid_n, grid_m) puts grid_m on dim 0, grid_n on
+    // dim 1. (The previous code read local_id(0)/group(2), which are the size-1
+    // dims, so every work-item saw thr_id 0 and only one subgroup tile computed.)
+    auto nd = this_work_item::get_nd_item<3>();
+    int thr_id = int(nd.get_local_id(2));
+    int blk_m = int(nd.get_group(0));
+    int blk_n = int(nd.get_group(1));
 
     // Create global tensor layouts.
     // A: (M,K) row-major (contiguous K).
@@ -207,35 +228,22 @@ public:
     }
     copy(copy_c, tCrC, tCgC);
 
-    int row_offset = blk_m * BLK_M;
-
-    // 2. Write sqrsum - one value per row of A
-    // tSqrSum is an array[BLK_M] holding this work-item's per-row partial sums.
-    // Each work-item only touched a subset of the tile's rows; atomics reduce the
-    // partial sums across all work-items that touched each row.
-    //
-    // sqrsum depends only on A (not B or N), so every workgroup along the N grid
-    // dimension computes the SAME square sums for its M-tile. Only the blk_n == 0
-    // column writes them out; otherwise the result would be (grid_n) times too large.
-    if (blk_n == 0) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int m_local = 0; m_local < BLK_M; ++m_local) {
-        int global_row = row_offset + m_local;
-
-        if (global_row < params.M) {
-          ElementSqrSum local_sum = tSqrSum[m_local];
-
-          if (local_sum != ElementSqrSum(0)) {  // Skip work-items that missed this row
-            sycl::atomic_ref<ElementSqrSum,
-                             sycl::memory_order::relaxed,
-                             sycl::memory_scope::device,
-                             sycl::access::address_space::global_space>
-                atomic_sqrsum(params.ptr_sqrsum[global_row]);
-            atomic_sqrsum.fetch_add(local_sum);
-          }
-        }
-      }
-    }
+    // 2. Write the square-sum accumulator to the (M,N) float scratch using the
+    //    SAME proven block-2D store engine as C. tSqrSum is float and the scratch
+    //    is float, so no conversion is needed and the store atom matches. Manual
+    //    get<0>/get<1> on the MMA C-partition mis-decodes rows (the Xe coordinate
+    //    is linearized), so we must let the copy engine handle the layout — just
+    //    as it does for C. The host then slices column 0 of the scratch into the
+    //    [M] sqrsum output (every column of tSqrSum equals sum_k A[row,k]^2).
+    auto layout_Ssc = make_layout(make_shape(params.M, params.N),
+                                  make_stride(params.stride_sqsc_m, Int<1>{}));
+    Tensor Ssc = make_tensor(make_gmem_ptr(params.ptr_sqrsum_scratch), layout_Ssc);
+    auto cSsc = make_identity_tensor(Ssc.shape());
+    auto gSsc = local_tile(cSsc, mma.tile_mnk(), make_coord(blk_m, blk_n, 0),
+                           Step<_1, _1, X>{});
+    auto copy_sq = make_block_2d_copy_D(mma, Ssc);
+    auto tSgSsc = thr_mma.partition_C(gSsc);
+    copy(copy_sq, tSqrSum, tSgSsc);
   }
 };
 

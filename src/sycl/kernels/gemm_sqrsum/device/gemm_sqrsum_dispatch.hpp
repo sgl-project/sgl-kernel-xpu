@@ -4,7 +4,7 @@
  **************************************************************************************************/
 /*!
   \file
-  \brief Forward declarations for generated GEMM+SqrSum kernel launch functions
+  \brief Forward declaration for the GEMM+SqrSum kernel launch function.
 */
 
 #pragma once
@@ -14,29 +14,14 @@
 
 namespace gemm_sqrsum {
 
-// Each function is defined in a separate generated .cpp file from
-// gemm_sqrsum_kernel.cpp.in, compiled as its own library.
-//
-// Naming: launch_gemm_sqrsum_<ELEM_TAG>_<TILE_M>x<TILE_N>x<TILE_K>
-// Parameters:
-//   ELEM_TAG  in {half, bf16, float}
-//   TILE_M, TILE_N, TILE_K: tile dimensions
-
-#define DECLARE_GEMM_SQRSUM_LAUNCH(ELEM, TM, TN, TK) \
-  void launch_gemm_sqrsum_##ELEM##_##TM##x##TN##x##TK( \
-      at::Tensor& C,                                   \
-      at::Tensor& sqrsum,                              \
-      const at::Tensor& A,                             \
-      const at::Tensor& B);
-
-#define DECLARE_GEMM_SQRSUM_ALL_TILES(ELEM) \
-  DECLARE_GEMM_SQRSUM_LAUNCH(ELEM, 256, 256, 16)
-
-// Only half and bf16 supported (DPAS limitation - no float x float)
-DECLARE_GEMM_SQRSUM_ALL_TILES(half)
-DECLARE_GEMM_SQRSUM_ALL_TILES(bf16)
-
-#undef DECLARE_GEMM_SQRSUM_LAUNCH
-#undef DECLARE_GEMM_SQRSUM_ALL_TILES
+// The kernel is instantiated in src/sycl/gemm_sqrsum_kernel_tf32.cpp as its own
+// translation unit. It runs the mhc_pre production path: bf16(A) x fp32(B) ->
+// fp32 via a tf32 x tf32 -> fp32 DPAS atom (A widened to fp32, B taken as-is,
+// both reinterpreted to tf32 at load). C and sqrsum are fp32.
+void launch_gemm_sqrsum_tf32_256x256x16(
+    at::Tensor& C,
+    at::Tensor& sqrsum,
+    const at::Tensor& A,
+    const at::Tensor& B);
 
 }  // namespace gemm_sqrsum

@@ -13,76 +13,93 @@
 #include <sycl/sycl.hpp>
 
 #include "Utils.h"
+// Only the launch declarations are needed here; the heavy CUTLASS/CuTe kernel
+// types live in the per-dtype generated TUs, not in this host dispatcher.
 #include "sycl/kernels/gemm_sqrsum/device/gemm_sqrsum_dispatch.hpp"
-#include "sycl/kernels/gemm_sqrsum/device/gemm_sqrsum_types.hpp"
 
 namespace {
 
-#define DISPATCH_GEMM_SQRSUM_TILE(ELEM)                                          \
-  do {                                                                           \
-    gemm_sqrsum::launch_gemm_sqrsum_##ELEM##_256x256x16(C, sqrsum, A, B);      \
-  } while (0)
-
-#define DISPATCH_GEMM_SQRSUM_DTYPE()                                            \
-  do {                                                                          \
-    switch (dtype) {                                                            \
-      case at::ScalarType::Half:                                                \
-        DISPATCH_GEMM_SQRSUM_TILE(half);                                       \
-        break;                                                                  \
-      case at::ScalarType::BFloat16:                                            \
-        DISPATCH_GEMM_SQRSUM_TILE(bf16);                                       \
-        break;                                                                  \
-      default:                                                                  \
-        TORCH_CHECK(false, "Unsupported data type for GEMM+SqrSum. Supported: Half, BFloat16");           \
-    }                                                                           \
-  } while (0)
+// Drop leading size-1 dims until the tensor has `rank` dims. This squeezes the
+// n_splits=1 axis the mhc_pre pipeline carries on its 3D buffers
+// (gemm_out_mul [1,T,N], gemm_out_sqrsum [1,T]) without touching the trailing
+// dims, so a legitimate small leading dim (M, N) is never collapsed.
+at::Tensor squeeze_leading_to(const at::Tensor& t, int64_t rank) {
+  at::Tensor x = t;
+  while (x.dim() > rank && x.size(0) == 1) {
+    x = x.squeeze(0);
+  }
+  return x;
+}
 
 }  // namespace
 
 /// @brief Compute C = A @ B and sqrsum[i] = sum(A[i,:]^2)
 ///
-/// @param C Output tensor [M, N]
-/// @param sqrsum Output row-wise square sum [M]
+/// Contract (mhc_pre GEMM+sqrsum stage):
+///   A      [M, K]   bf16/fp16/fp32   (residual.view(M, hc_hidden))
+///   B      [N, K]   fp32             (fn = [24, 16384] = [N, K])
+///   C      [M, N]   fp32             (gemm_out_mul)
+///   sqrsum [M]      fp32             (gemm_out_sqrsum), sqrsum[m] = sum_k A[m,k]^2
+///
+/// Leading singleton (n_splits=1) axes on any argument are squeezed away.
+///
+/// Precision: when B is fp32 the kernel runs a tf32 x tf32 -> fp32 DPAS path
+/// (A widened to fp32, B taken as-is, both reinterpreted to tf32 at load). When
+/// A and B share a 16-bit dtype (half/bf16) the matching native DPAS path runs.
+/// C is always fp32.
+///
+/// @param C Output tensor [M, N] fp32
+/// @param sqrsum Output row-wise square sum [M] fp32
 /// @param A Input tensor [M, K]
-/// @param B Input tensor [K, N]
+/// @param B Input tensor [N, K]
 void gemm_with_sqrsum(
     at::Tensor& C,
     at::Tensor& sqrsum,
-    const at::Tensor& A,
-    const at::Tensor& B) {
+    const at::Tensor& A_in,
+    const at::Tensor& B_in) {
 
-  CHECK_INPUT(C);
-  CHECK_INPUT(sqrsum);
-  CHECK_INPUT(A);
-  CHECK_INPUT(B);
+  c10::DeviceGuard guard(A_in.device());
 
-  c10::DeviceGuard guard(A.device());
+  // Squeeze the n_splits=1 leading axis off the 3D pipeline buffers. The squeezed
+  // views share storage with the originals, so kernel writes to Cv/sqv land in
+  // the caller's C/sqrsum buffers.
+  at::Tensor A = squeeze_leading_to(A_in, 2);
+  at::Tensor B = squeeze_leading_to(B_in, 2);
+  at::Tensor Cv = squeeze_leading_to(C, 2);
+  at::Tensor sqv = squeeze_leading_to(sqrsum, 1);
 
-  auto dtype = A.scalar_type();
+  CHECK_DEVICE(A);
+  CHECK_DEVICE(B);
+  CHECK_INPUT(Cv);
+  CHECK_INPUT(sqv);
 
-  // Verify tensor dtypes
-  TORCH_CHECK(B.scalar_type() == dtype && C.scalar_type() == dtype,
-              "A, B, and C must have the same data type");
-  TORCH_CHECK(sqrsum.scalar_type() == at::ScalarType::Float,
+  auto a_dtype = A.scalar_type();
+  auto b_dtype = B.scalar_type();
+
+  TORCH_CHECK(Cv.scalar_type() == at::ScalarType::Float, "C must be float32");
+  TORCH_CHECK(sqv.scalar_type() == at::ScalarType::Float,
               "sqrsum must be float32 for atomic operations");
 
-  TORCH_CHECK(
-      dtype == at::ScalarType::Half || dtype == at::ScalarType::BFloat16,
-      "Unsupported data type for GEMM+SqrSum. Supported: Half, BFloat16 (DPAS limitation)");
+  auto is_supported = [](at::ScalarType t) {
+    return t == at::ScalarType::Half || t == at::ScalarType::BFloat16 || t == at::ScalarType::Float;
+  };
+  TORCH_CHECK(is_supported(a_dtype), "A must be Half, BFloat16, or Float, got ", a_dtype);
+  TORCH_CHECK(is_supported(b_dtype), "B must be Half, BFloat16, or Float, got ", b_dtype);
 
-  // Verify shapes
+  // Verify shapes. A is [M, K], B is [N, K] (both K-contiguous), C is [M, N].
   int M = A.size(0);
   int K = A.size(1);
-  int N = B.size(1);
+  int N = B.size(0);
 
-  TORCH_CHECK(B.size(0) == K, "Matrix dimensions don't match for GEMM: A.K=", K, " but B.K=", B.size(0));
-  TORCH_CHECK(C.size(0) == M && C.size(1) == N, "Output C shape mismatch");
-  TORCH_CHECK(sqrsum.size(0) == M, "Output sqrsum size mismatch");
-  TORCH_CHECK(sqrsum.dim() == 1, "sqrsum must be 1D");
+  TORCH_CHECK(B.size(1) == K, "K mismatch for GEMM: A.K=", K, " but B.K=", B.size(1));
+  TORCH_CHECK(Cv.size(0) == M && Cv.size(1) == N, "Output C shape mismatch: expected [", M, ",", N, "]");
+  TORCH_CHECK(sqv.size(0) == M, "Output sqrsum size mismatch");
+  TORCH_CHECK(sqv.dim() == 1, "sqrsum must be 1D");
 
-  DISPATCH_GEMM_SQRSUM_DTYPE();
+  // Single tf32 x tf32 -> fp32 DPAS path. The launcher widens A and B to fp32
+  // and reinterprets to tf32 at load, so it covers the production bf16(A) x
+  // fp32(B) case and any half/bf16/float input combination uniformly.
+  gemm_sqrsum::launch_gemm_sqrsum_tf32_256x256x16(Cv, sqv, A, B);
 }
 
-#undef DISPATCH_GEMM_SQRSUM_TILE
-#undef DISPATCH_GEMM_SQRSUM_DTYPE
 #undef SYCL_INTEL_TARGET

@@ -121,7 +121,11 @@ struct XeGemmSqrSumMainloop<
   // would NOT be a valid copy source).
   using FragGemm = decltype(partition_fragment_C(TiledMMA{}, select<0, 1>(TileShape{})));
   using ElementAccum = typename TiledMMA::ValTypeD;     // Accumulator type (float)
-  using ElementC = ElementA;                             // Output type (same as input)
+  // C output is fp32 == the accumulator type. The mhc_pre pipeline consumes
+  // gemm_out_mul as FP32, and keeping C == accumulator lets the epilogue store
+  // the MMA accumulator straight through the block-2D copy with no convert
+  // (the convert was only needed when C was a narrower 16-bit type).
+  using ElementC = ElementAccum;                         // Output type (fp32)
 
   // Square sum is computed as a SECOND GEMM: (A elementwise-squared) @ ones[K,N].
   // Every column of that (M,N) product equals sqrsum[row], so the accumulator is

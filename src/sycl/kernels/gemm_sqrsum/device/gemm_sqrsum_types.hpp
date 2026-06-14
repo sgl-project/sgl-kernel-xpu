@@ -18,6 +18,7 @@
 #include <sycl/sycl.hpp>
 
 #include "../../../Utils.h"
+#include "cutlass/numeric_types.h"
 #include "cutlass/gemm/collective/collective_mma.hpp"
 #include "sycl/kernels/gemm_sqrsum/collective/xe_gemm_sqrsum_mainloop.hpp"
 #include "sycl/kernels/gemm_sqrsum/kernel/xe_gemm_sqrsum_kernel.hpp"
@@ -44,6 +45,11 @@ struct ToCutlassElementType<sycl::ext::oneapi::bfloat16> {
 template <>
 struct ToCutlassElementType<float> {
   using type = float;
+};
+
+template <>
+struct ToCutlassElementType<cutlass::tfloat32_t> {
+  using type = cutlass::tfloat32_t;
 };
 
 //----------------- Tile size options --------------------//
@@ -86,15 +92,18 @@ struct GemmSqrSumXe {
   // Placeholder tensor types used only to deduce TiledCopyA / TiledCopyB. Their
   // SHAPE ORIENTATION and contiguous-stride position must match the runtime
   // tensors the kernel builds, or the deduced copies tile the wrong axes.
-  //   A: (M,K) row-major  -> shape (m,k), stride (k,1)
-  //   B: (N,K) col-major  -> shape (n,k), stride (1,n)  [the Bᵀ view of PyTorch's
-  //      [K,N] row-major buffer; this is what copy_B / the mainloop tiling expect]
+  //   A: (M,K) row-major  -> shape (m,k), stride (k,1)  [K-contiguous]
+  //   B: (N,K) row-major  -> shape (n,k), stride (k,1)  [K-contiguous] — this is
+  //      fn = [N,K] = [24,16384] passed DIRECTLY (no col-major-of-[K,N] trick).
+  //      K-contiguous B is the canonical "Bᵀ" case in xe_gemm.cpp's
+  //      choose_tiled_mma (b_n == false), which the block-2D copy_B and the
+  //      select<1,2> mainloop tiling expect.
   using TensorA = decltype(make_tensor(
       make_gmem_ptr<Element const>(nullptr),
       make_layout(make_shape(Int<256>{}, Int<128>{}), make_stride(Int<128>{}, Int<1>{}))));
   using TensorB = decltype(make_tensor(
       make_gmem_ptr<Element const>(nullptr),
-      make_layout(make_shape(Int<256>{}, Int<128>{}), make_stride(Int<1>{}, Int<256>{}))));
+      make_layout(make_shape(Int<256>{}, Int<128>{}), make_stride(Int<128>{}, Int<1>{}))));
 
   // Assemble collective mainloop
   using CollectiveMainloop = cutlass::gemm_sqrsum::collective::XeGemmSqrSumMainloop<
@@ -108,20 +117,36 @@ struct GemmSqrSumXe {
 };
 
 //----------------- Launch function --------------------//
+// Contract (mhc_pre GEMM+sqrsum stage):
+//   A      : [M, K]  (residual.view(M, hc_hidden)); bf16/fp16/fp32 accepted
+//   B      : [N, K]  (fn = [24, 16384]); fp32 — passed as genuine [N,K] row-major
+//   C      : [M, N]  fp32  (== gemm_out_mul)
+//   sqrsum : [M]     fp32  (== gemm_out_sqrsum), sqrsum[m] = sum_k A[m,k]^2
+//
+// Element is the MMA compute type. For the production path Element ==
+// cutlass::tfloat32_t: A is widened to fp32 and B (already fp32) is taken as-is,
+// then both are bit-reinterpreted to tf32 (tfloat32_t stores raw fp32 bits; the
+// DPAS unit truncates the mantissa at load — ~10 bits kept vs bf16's 7). This is
+// the "proper" mixed-precision path; the bf16-downcast path (HcPreGemm-style)
+// lost too much precision on B.
 template <typename Element, typename TileSizeOpt>
 inline void runGemmSqrSumImpl(
-    at::Tensor& C,           // Output: [M, N]
-    at::Tensor& sqrsum,      // Output: [M] row-wise square sums
+    at::Tensor& C,           // Output: [M, N] fp32
+    at::Tensor& sqrsum,      // Output: [M] fp32
     const at::Tensor& A,     // Input: [M, K]
-    const at::Tensor& B) {   // Input: [K, N]
+    const at::Tensor& B) {   // Input: [N, K]
 
-  // Get dimensions
+  // Get CUTLASS element type
+  using CutlassElement = typename ToCutlassElementType<Element>::type;
+  constexpr bool kIsTf32 = std::is_same_v<CutlassElement, cutlass::tfloat32_t>;
+
+  // Get dimensions. B is [N, K] (NOT [K, N]).
   int M = A.size(0);
   int K = A.size(1);
-  int N = B.size(1);
+  int N = B.size(0);
 
   // Verify shapes
-  TORCH_CHECK(A.size(1) == B.size(0), "A.K must match B.K for GEMM");
+  TORCH_CHECK(B.size(1) == K, "A.K (", K, ") must match B.K (", B.size(1), ") for GEMM");
   TORCH_CHECK(C.size(0) == M && C.size(1) == N, "C shape mismatch");
   TORCH_CHECK(sqrsum.size(0) == M, "sqrsum size mismatch");
 
@@ -129,8 +154,17 @@ inline void runGemmSqrSumImpl(
   C.zero_();
   sqrsum.zero_();
 
-  // Get CUTLASS element type
-  using CutlassElement = typename ToCutlassElementType<Element>::type;
+  // Prepare A/B in the kernel's storage type. tfloat32_t is bit-compatible with
+  // float (alignas(4){uint32_t}), so an fp32 buffer reinterprets to tf32 with no
+  // copy. A is widened from bf16/fp16; B (fp32) is taken contiguous as-is.
+  at::Tensor A_buf, B_buf;
+  if constexpr (kIsTf32) {
+    A_buf = A.scalar_type() == at::kFloat ? A.contiguous() : A.to(at::kFloat);
+    B_buf = B.scalar_type() == at::kFloat ? B.contiguous() : B.to(at::kFloat);
+  } else {
+    A_buf = A.contiguous();
+    B_buf = B.contiguous();
+  }
 
   // Get kernel configuration
   using KernelConfig = GemmSqrSumXe<Element, TileSizeOpt>;
@@ -145,21 +179,22 @@ inline void runGemmSqrSumImpl(
 
   // Fetch raw pointers via the untyped data_ptr() (returns void*) and reinterpret.
   // Using data_ptr<Element>() would require a PyTorch data_ptr specialization for
-  // the kernel element type; sycl::ext::oneapi::bfloat16 has none, so the typed
-  // form leaves an undefined symbol at link time. The untyped form sidesteps that.
+  // the kernel element type; tfloat32_t/bfloat16 have none, so the typed form
+  // leaves an undefined symbol at link time. The untyped form sidesteps that.
 
-  // Input A: [M, K] - row-major
-  args.ptr_A = reinterpret_cast<CutlassElement const*>(A.data_ptr());
-  args.stride_A_m = K;  // Row stride
-  args.stride_A_k = 1;  // Column stride
+  // Input A: [M, K] - row-major (K contiguous)
+  args.ptr_A = reinterpret_cast<CutlassElement const*>(A_buf.data_ptr());
+  args.stride_A_m = K;  // M-row stride
+  args.stride_A_k = 1;  // K stride (contiguous)
 
-  // Input B: [K, N] - row-major
-  args.ptr_B = reinterpret_cast<CutlassElement const*>(B.data_ptr());
-  args.stride_B_k = N;  // Row stride
-  args.stride_B_n = 1;  // Column stride
+  // Input B: [N, K] - row-major (K contiguous). stride_B_k carries the N-row
+  // stride (== K); layout_B is make_stride(stride_B_k, 1) over shape (N,K).
+  args.ptr_B = reinterpret_cast<CutlassElement const*>(B_buf.data_ptr());
+  args.stride_B_k = K;  // N-row stride
+  args.stride_B_n = 1;  // K stride (contiguous)
 
-  // Output C: [M, N] - row-major
-  args.ptr_C = reinterpret_cast<CutlassElement*>(C.data_ptr());
+  // Output C: [M, N] fp32 row-major. ElementC == float (the accumulator type).
+  args.ptr_C = reinterpret_cast<typename Kernel::ElementC*>(C.data_ptr());
   args.stride_C_m = N;  // Row stride
   args.stride_C_n = 1;  // Column stride
 

@@ -1,0 +1,127 @@
+import pandas as pd
+import torch
+import triton
+from sgl_kernel import gemm_sqrsum
+
+# Production mhc_pre GEMM+sqrsum stage shapes:
+#   A      [M, K]  bf16   (residual.view(M, hc_hidden));  hc_hidden = hc_mult * hidden_size
+#   B      [N, K]  fp32   (fn = [24, 16384] = [N, K])
+#   C      [M, N]  fp32   (gemm_out_mul),  C = A @ B^T
+#   sqrsum [M]     fp32   (gemm_out_sqrsum), sqrsum[m] = sum_k A[m,k]^2
+# N (=hc_mult3) and K (=hc_mult*hidden_size) are fixed; only the token count M varies.
+hc = 4
+hc_mult3 = (2 + hc) * hc  # 24 -> N
+hidden_size = 4096
+K = hc * hidden_size  # 16384 -> K
+N = hc_mult3  # 24
+
+configs = [
+    # (M, K, N)  -- same token sweep as bench_hc_pre_fuse.py (incl. ragged M)
+    (16, K, N),
+    (48, K, N),
+    (128, K, N),
+    (512, K, N),
+    (896, K, N),
+    (1021, K, N),
+    (1024, K, N),
+    (1034, K, N),
+    (1038, K, N),
+    (1518, K, N),
+    (2048, K, N),
+]
+
+all_results = []
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["M", "K", "N"],
+        x_vals=configs,
+        line_arg="provider",
+        line_vals=["sgl_kernel", "torch"],
+        line_names=["sgl_kernel (tf32)", "torch (fp32)"],
+        styles=[("green", "-"), ("blue", "--")],
+        ylabel="Time (ms)",
+        plot_name="gemm-sqrsum-performance",
+        args={},
+    )
+)
+def benchmark(M, K, N, provider):
+    print(f"benchmark {provider} with M={M} K={K} N={N}")
+    torch.set_default_device("xpu")
+    torch.xpu.manual_seed_all(42)
+
+    # Inputs: A bf16 [M,K], B fp32 [N,K]  (B = fn, the [N,K] weight matrix)
+    A = torch.randn(M, K, dtype=torch.bfloat16, device="xpu")
+    B = torch.randn(N, K, dtype=torch.float32, device="xpu")
+
+    # Outputs: C fp32 [M,N], sqrsum fp32 [M]
+    C = torch.empty(M, N, dtype=torch.float32, device="xpu")
+    sqrsum = torch.empty(M, dtype=torch.float32, device="xpu")
+
+    if provider == "sgl_kernel":
+        run = lambda: gemm_sqrsum(C, sqrsum, A, B)
+    else:
+        # torch baseline: fp32 GEMM (A @ B^T) + row-wise square sum.
+        Af = A.float()
+        run = lambda: (torch.matmul(Af, B.t()), (Af * Af).sum(dim=1))
+
+    # Warmup
+    for _ in range(10):
+        run()
+    torch.xpu.synchronize()
+
+    quantiles = [0.5, 0.25, 0.75]
+    ms, _, _ = triton.testing.do_bench(run, quantiles=quantiles, return_mode="median")
+
+    torch.xpu.empty_cache()
+
+    # Useful work: GEMM (2*M*N*K) + row square-sum (2*M*K: square + accumulate).
+    flops = 2.0 * M * N * K + 2.0 * M * K
+    tflops = flops / (ms / 1e3) / 1e12
+
+    # Logical I/O (the kernel also widens A->fp32 and uses an M*N fp32 scratch
+    # internally; those are not counted here, matching the convention of
+    # reporting the problem's intrinsic traffic).
+    read_bytes = M * K * 2 + N * K * 4  # A (bf16) + B (fp32)
+    write_bytes = M * N * 4 + M * 4  # C (fp32) + sqrsum (fp32)
+    total_bytes = read_bytes + write_bytes
+    bandwidth_gb_s = total_bytes / (ms / 1e3) / 1e9
+
+    all_results.append(
+        {
+            "M": M,
+            "K": K,
+            "N": N,
+            "provider": provider,
+            "ms": ms,
+            "Mtok_per_sec": M / (ms / 1e3) / 1e6,
+            "TFLOP_per_sec": tflops,
+            "bandwidth_gb_s": bandwidth_gb_s,
+        }
+    )
+    return ms
+
+
+if __name__ == "__main__":
+    benchmark.run(print_data=False)
+    print("Benchmark finished!")
+
+    df = pd.DataFrame(all_results)
+    print("\n" + "=" * 80)
+    print("GEMM_SQRSUM BENCHMARK RESULTS")
+    print("=" * 80)
+    print(df.to_markdown(index=False))
+    print("\n")
+
+    # Summary statistics by provider
+    print("Summary Statistics:")
+    for prov in ["sgl_kernel", "torch"]:
+        df_variant = df[df["provider"] == prov]
+        if df_variant.empty:
+            continue
+        print(f"\n{prov}:")
+        print(f"  Mean throughput: {df_variant['Mtok_per_sec'].mean():.2f} Mtok/s")
+        print(f"  Mean compute:    {df_variant['TFLOP_per_sec'].mean():.3f} TFLOP/s")
+        print(f"  Mean bandwidth:  {df_variant['bandwidth_gb_s'].mean():.2f} GB/s")
+        print(f"  Best throughput: {df_variant['Mtok_per_sec'].max():.2f} Mtok/s")

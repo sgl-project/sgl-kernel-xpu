@@ -31,7 +31,8 @@ else()
     list(FILTER device_cpp_common EXCLUDE REGEX "flash_attention\\.cpp$")
 endif()
 include(MlaDecodeXe20.cmake)
-include(GemmSqrSumXe20.cmake)
+# gemm_sqrsum kernels are plain committed TUs (src/sycl/gemm_sqrsum_kernel_*.cpp),
+# picked up by the file(GLOB "sycl/*.cpp") above — no code-gen step needed.
 
 message(STATUS "BMG files: ${device_cpp_xe20}")
 message(STATUS "Common files: ${device_cpp_common}")

@@ -171,11 +171,12 @@ public:
     // Create global tensor layouts.
     // A: (M,K) row-major (contiguous K).
     auto layout_A = make_layout(make_shape(params.M, params.K), make_stride(params.stride_A_m, Int<1>{}));
-    // B: PyTorch passes [K,N] row-major (ptr[k*N+n]). The canonical Xe GEMM (and
-    // the block-2D copy_B / Step<X,_1,_1> tiling in the mainloop) expect B as
-    // (N,K). The SAME memory is exactly (N,K) with stride (1, N): element (n,k)
-    // lives at n*1 + k*N == k*N+n. stride_B_n==1 (contiguous), stride_B_k==N.
-    auto layout_B = make_layout(make_shape(params.N, params.K), make_stride(Int<1>{}, params.stride_B_k));
+    // B: passed as genuine [N,K] row-major (fn = [24,16384] = [N,K]). Element
+    // (n,k) lives at n*stride_B_k + k, i.e. stride (stride_B_k==K, 1) with K
+    // contiguous. This is the canonical "Bᵀ" orientation the block-2D copy_B
+    // and the select<1,2> mainloop tiling expect (xe_gemm.cpp). No more
+    // col-major-view-of-[K,N] trick.
+    auto layout_B = make_layout(make_shape(params.N, params.K), make_stride(params.stride_B_k, Int<1>{}));
     auto layout_C = make_layout(make_shape(params.M, params.N), make_stride(params.stride_C_m, Int<1>{}));
     auto layout_sqrsum = make_layout(make_shape(params.M), make_stride(Int<1>{}));
 
@@ -206,11 +207,11 @@ public:
     //      gC     = local_tile of C's coords, Step<_1,_1,X>  -> (BLK_M,BLK_N)
     //      copy_c = make_block_2d_copy_D(mma, C)
     //      tCgC   = thr_mma.partition_C(gC)
-    //      copy(copy_c, <frag>, tCgC)
-    //    The example's C is float (== accumulator), so it stores tC directly.
-    //    Our C is fp16, so the block-2D store atom (16-bit) would mismatch the
-    //    float (32-bit) accumulator. We first convert tC -> a SAME-LAYOUT fp16
-    //    fragment (element-wise, no coordinate logic), then run the proven copy.
+    //      copy(copy_c, tC, tCgC)
+    //    C is now fp32 == the MMA accumulator type, exactly like the canonical
+    //    example, so the float accumulator stores straight through the block-2D
+    //    copy with no element-wise convert (the old fp16 C needed a convert
+    //    because the 16-bit store atom mismatched the 32-bit accumulator).
     typename CollectiveMainloop::TiledMMA mma{};
     auto thr_mma = mma.get_slice(thr_id);
 
@@ -220,13 +221,7 @@ public:
     auto copy_c = make_block_2d_copy_D(mma, C);
     auto tCgC = thr_mma.partition_C(gC);
 
-    // Convert the float accumulator to an fp16 fragment with identical layout.
-    auto tCrC = make_fragment_like<ElementC>(tC);
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(tC); ++i) {
-      tCrC(i) = static_cast<ElementC>(tC(i));
-    }
-    copy(copy_c, tCrC, tCgC);
+    copy(copy_c, tC, tCgC);
 
     // 2. Write the square-sum accumulator to the (M,N) float scratch using the
     //    SAME proven block-2D store engine as C. tSqrSum is float and the scratch

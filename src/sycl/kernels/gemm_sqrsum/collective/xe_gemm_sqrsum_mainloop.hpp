@@ -172,6 +172,11 @@ struct XeGemmSqrSumMainloop<
   //   C = A @ B
   //   sqrsum[i] = sum(A[i,:]^2) for each row i
   //
+  // The K loop runs over the tile range [k_tile_begin, k_tile_end) so the kernel
+  // can partition K across workgroups (split-K). k_tile_begin == 0 and
+  // k_tile_end == ceil(K/BLK_K) is the full single-pass loop (split_k == 1).
+  // An empty range (begin == end) clears the accumulators and returns a zero
+  // partial, which the host sums in harmlessly.
   template <typename TensorA2D_runtime, typename TensorB2D_runtime, typename MNCoord>
   CUTLASS_DEVICE void operator()(
       TensorA2D_runtime const& A_2D,      // A (m, k) - runtime shaped
@@ -179,7 +184,9 @@ struct XeGemmSqrSumMainloop<
       FragGemm& tC,               // GEMM accumulator output (m,n)
       FragSqrSum& tSqrSum,        // Square sum accumulator output (m)
       MNCoord blk_mn,             // WG tile indices: (M,N)
-      int thr_id) {
+      int thr_id,
+      int k_tile_begin,           // first K-tile this split computes
+      int k_tile_end) {           // one past last K-tile this split computes
     using namespace sycl::ext::oneapi::this_work_item;
 
     TiledMMA mma{};
@@ -232,22 +239,27 @@ struct XeGemmSqrSumMainloop<
 
     const int prefetch_dist = 3;
     constexpr int barrier_scope = 2;
-    int k_tile_count = size<2>(gA);
-    int k_tile_prefetch = 0;
+    // This split owns global K-tiles [k_tile_begin, k_tile_end). Prefetch and
+    // load index pAgA/tAgA with the GLOBAL tile index (they span all
+    // k_tiles_total tiles), so a split simply offsets its window into them.
+    int k_tile_prefetch = k_tile_begin;
 
     /* Clear accumulators */
     clear(tC);
     clear(tSqrSum);
 
-    /* Warm up prefetch to L1 */
+    /* Warm up prefetch to L1: prefetch this split's first `prefetch_dist`
+     * tiles. Hints that run off the end of this split's window fall into the
+     * next split's (still-valid) tiles, or are clamped OOB by the block-2D
+     * prefetch past k_tiles_total — both harmless. */
     CUTE_UNROLL
-    for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
+    for (int p = 0; p < prefetch_dist; p++, k_tile_prefetch++) {
       prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
       prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
     }
 
-    /* Main loop */
-    for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
+    /* Main loop over this split's K-tile sub-range */
+    for (int k_tile = k_tile_begin; k_tile < k_tile_end; k_tile++, k_tile_prefetch++) {
       barrier_arrive(barrier_scope);
 
       /* Load A/B to registers */

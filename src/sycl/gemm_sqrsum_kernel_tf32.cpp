@@ -22,7 +22,7 @@ void launch_gemm_sqrsum_tf32_256x256x16(
     at::Tensor& sqrsum,
     const at::Tensor& A,
     const at::Tensor& B) {
-  runGemmSqrSum<cutlass::tfloat32_t, TileSizeOption<256, 256, 16>>(C, sqrsum, A, B);
+  runGemmSqrSum<cutlass::tfloat32_t, TileSizeOption<256, 32, 16>>(C, sqrsum, A, B);
 }
 
 }  // namespace gemm_sqrsum

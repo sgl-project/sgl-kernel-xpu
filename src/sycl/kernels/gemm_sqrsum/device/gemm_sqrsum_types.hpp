@@ -78,11 +78,16 @@ struct GemmSqrSumXe {
   using MMAOperation = XE_DPAS_TT<8, float, Element>;
   using MmaAtom = MMA_Atom<MMAOperation>;
 
-  // Subgroup layout: how subgroups tile the work, matching the canonical Xe
-  // GEMM tutorial (examples/cute/tutorial/xe_gemm.cpp). An 8x4 (M x N) layout
-  // gives 32 subgroups => 32 * sg_size(16) = 512 work-items per workgroup,
-  // which is what get_block_shape() must launch. N-major stride <4,1,0>.
-  using SubgroupLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
+  // Subgroup layout (M x N x 1). MUST satisfy TileN == 16 * SG_N * iters and
+  // TileM == 8 * SG_M * iters (the DPAS atom is Shape_MNK = <8, 16, K>, so N is
+  // hardwired to 16 per atom). For the production N=24 case we use a TileN=32
+  // tile (mask to 24), which needs SG_N = 2 (16*2 = 32, one N-iteration). An
+  // 8x2 layout = 16 subgroups => 16 * sg_size(16) = 256 work-items/WG, which is
+  // what get_block_shape() launches. N-major stride <SG_N,1,0> = <2,1,0>.
+  // KEEP IN SYNC with the TileSizeOption passed from the launcher: 8x2 pairs
+  // with TileN=32. (The old 8x4 + TileN=256 wasted ~90% of the GEMM on N=24 and
+  // spilled registers from the oversized 256x256 fp32 accumulator.)
+  using SubgroupLayout = Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>;
 
   // TiledMMA: tiles MMA atoms across subgroups
   using TiledMma = typename TiledMMAHelper<MmaAtom, Layout<TileShape>, SubgroupLayout>::TiledMMA;

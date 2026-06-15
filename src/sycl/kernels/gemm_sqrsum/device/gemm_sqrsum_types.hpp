@@ -33,12 +33,22 @@ using namespace cute;
 //----------------- Kernel configuration --------------------//
 // Concrete instantiation of the GEMM+SqrSum kernel: tf32 compute, tile 64x32x16.
 struct GemmSqrSumXe {
-  // MMA compute type. The production path is bf16(A) x fp32(B) -> fp32: A is
-  // widened to fp32 and B taken as-is, then both reinterpreted to tf32 (raw fp32
-  // bits; the DPAS unit truncates the mantissa at load — ~10 bits kept vs bf16's
-  // 7). This is the "proper" mixed-precision path; the bf16-downcast path
-  // (HcPreGemm-style) lost too much precision on B.
+  // MMA compute type. The production path is bf16(A) x fp32(B) -> fp32. The DPAS
+  // atom is tf32 x tf32 -> fp32, so both operands reach the engine as tf32.
+  //   B (fp32) is reinterpreted to tf32 (raw fp32 bits; DPAS truncates to ~10
+  //     mantissa bits at load) — the genuine fp32->tf32 step, where the real
+  //     precision lives. The bf16-downcast path lost too much precision on B.
+  //   A (bf16) is loaded from gmem AS bf16 (ElementALoad) and converted bf16->tf32
+  //     in-register at the reorder() before the MMA. A was bf16 to begin with, so
+  //     tf32's 10-bit slot holds its 7 bits losslessly — converting in-register is
+  //     bit-identical to the old host fp32-widen, but avoids hauling a 2x-wider
+  //     fp32 copy of A through memory (the dominant traffic at large M).
   using Element = cutlass::tfloat32_t;
+
+  // Global load type for A: bf16. The block-2D copy loads bf16 from gmem into a
+  // bf16 fragment; reorder() converts it to the tf32 MMA fragment. (B has no
+  // separate load type — its gmem tensor is fp32 bits reinterpreted as tf32.)
+  using ElementALoad = cutlass::bfloat16_t;
 
   // Tile shape (M, N, K) = (64, 32, 16).
   //   TileM=64 = 8(atom M) * 8(SG_M) * 1 iter. Small M-tile => more workgroups
@@ -75,8 +85,10 @@ struct GemmSqrSumXe {
   //      K-contiguous B is the canonical "Bᵀ" case in xe_gemm.cpp's
   //      choose_tiled_mma (b_n == false), which the block-2D copy_B and the
   //      select<1,2> mainloop tiling expect.
+  //   A's value_type is ElementALoad (bf16) so the deduced TiledCopyA loads bf16;
+  //   B's stays Element (tf32) — its fp32 gmem buffer is reinterpreted to tf32.
   using TensorA = decltype(make_tensor(
-      make_gmem_ptr<Element const>(nullptr),
+      make_gmem_ptr<ElementALoad const>(nullptr),
       make_layout(make_shape(Int<256>{}, Int<128>{}), make_stride(Int<128>{}, Int<1>{}))));
   using TensorB = decltype(make_tensor(
       make_gmem_ptr<Element const>(nullptr),
@@ -138,11 +150,16 @@ inline void runGemmSqrSum(
   C.zero_();
   sqrsum.zero_();
 
-  // Prepare A/B as fp32, then reinterpret to tf32 at load. tfloat32_t is
-  // bit-compatible with float (alignas(4){uint32_t}), so an fp32 buffer
-  // reinterprets to tf32 with no copy. A is widened from bf16/fp16; B (fp32) is
-  // taken contiguous as-is.
-  at::Tensor A_buf = A.scalar_type() == at::kFloat ? A.contiguous() : A.to(at::kFloat);
+  // Prepare A as bf16 and B as fp32 (reinterpreted to tf32 at load).
+  //   A: loaded narrow (bf16) and converted bf16->tf32 in-register in the
+  //      mainloop, so NO host fp32 widen — that widen was a full extra pass over
+  //      A plus a 2x-wider re-read, the dominant memory traffic at large M. A
+  //      that arrives as fp32/fp16 is cast down to bf16 (the production input is
+  //      already bf16, so this is normally a no-op contiguous view).
+  //   B: tfloat32_t is bit-compatible with float (alignas(4){uint32_t}), so an
+  //      fp32 buffer reinterprets to tf32 with no copy. This is the genuine
+  //      fp32->tf32 precision step; keep B fp32 in, reinterpret at load.
+  at::Tensor A_buf = A.scalar_type() == at::kBFloat16 ? A.contiguous() : A.to(at::kBFloat16);
   at::Tensor B_buf = B.scalar_type() == at::kFloat ? B.contiguous() : B.to(at::kFloat);
 
   // Setup kernel arguments
@@ -157,8 +174,9 @@ inline void runGemmSqrSum(
   // for tfloat32_t (there is none), leaving an undefined symbol at link time.
   // The untyped form sidesteps that.
 
-  // Input A: [M, K] - row-major (K contiguous)
-  args.ptr_A = reinterpret_cast<GemmSqrSumXe::Element const*>(A_buf.data_ptr());
+  // Input A: [M, K] - row-major (K contiguous). Loaded as bf16 (ElementALoad);
+  // the block-2D copy reads bf16 and reorder() converts to tf32 for the MMA.
+  args.ptr_A = reinterpret_cast<GemmSqrSumXe::ElementALoad const*>(A_buf.data_ptr());
   args.stride_A_m = K;  // M-row stride
   args.stride_A_k = 1;  // K stride (contiguous)
 

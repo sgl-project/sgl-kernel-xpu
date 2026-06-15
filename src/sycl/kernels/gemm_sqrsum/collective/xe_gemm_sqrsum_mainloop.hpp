@@ -101,8 +101,17 @@ struct XeGemmSqrSumMainloop<
   using TensorA = TensorA_;
   using TensorB = TensorB_;
 
+  // Global LOAD types (the gmem tensor value_types). ElementA is bf16 (A is
+  // loaded narrow and converted in-register); ElementB is tf32 (fp32 bits
+  // reinterpreted). These drive the block-2D copies, NOT the MMA math.
   using ElementA = typename TensorA_::value_type;
   using ElementB = typename TensorB_::value_type;
+
+  // MMA input type (tf32). The square-sum reuses the MMA fragments (tCrA etc.),
+  // which hold this type after reorder() converts the bf16 A load. The square
+  // cast below MUST target this, not ElementA (bf16) — otherwise A^2 would be
+  // re-truncated to bf16 and lose the tf32 precision the MMA path provides.
+  using ElementMMA = typename TiledMMA::ValTypeA;
 
   using TensorA2D = decltype(TensorA_{}(append<rank_v<TensorA_>>(make_coord(_, _), 0)));
   using TensorB2D = decltype(TensorB_{}(append<rank_v<TensorB_>>(make_coord(_, _), 0)));
@@ -281,16 +290,19 @@ struct XeGemmSqrSumMainloop<
        * Reuses the already-loaded A values (tCrA); every column of tSqrSum then
        * holds sum_k A[m,k]^2 for row m. Write through the SubgroupTensors'
        * operator() (their .tensor() view is const). */
+      // Square in the MMA type (tf32), reusing the already-loaded+converted A
+      // fragment tCrA. tCrAsq/tCrBones are MMA fragments (ElementMMA == tf32),
+      // so cast to ElementMMA — casting to ElementA (bf16) would re-truncate.
       int n_a = int(size(tCrAsq.tensor()));
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < n_a; i++) {
-        ElementA a_in = tCrA(i);
-        tCrAsq(i) = static_cast<ElementA>(a_in * a_in);
+        ElementMMA a_in = tCrA(i);
+        tCrAsq(i) = static_cast<ElementMMA>(a_in * a_in);
       }
       int n_b = int(size(tCrBones.tensor()));
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < n_b; i++) {
-        tCrBones(i) = static_cast<ElementB>(1);
+        tCrBones(i) = static_cast<ElementMMA>(1);
       }
       cute::gemm(mma, tCrAsq, tCrBones, tSqrSum);
 

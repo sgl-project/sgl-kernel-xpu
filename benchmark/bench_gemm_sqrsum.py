@@ -3,17 +3,22 @@ import torch
 import triton
 from sgl_kernel import gemm_sqrsum
 
-# Production mhc_pre GEMM+sqrsum stage shapes:
-#   A      [M, K]  bf16   (residual.view(M, hc_hidden));  hc_hidden = hc_mult * hidden_size
-#   B      [N, K]  fp32   (fn = [24, 16384] = [N, K])
-#   C      [M, N]  fp32   (gemm_out_mul),  C = A @ B^T
-#   sqrsum [M]     fp32   (gemm_out_sqrsum), sqrsum[m] = sum_k A[m,k]^2
-# N (=hc_mult3) and K (=hc_mult*hidden_size) are fixed; only the token count M varies.
+# Production mhc_pre GEMM+sqrsum stage shapes (Design B: K-split partials):
+#   A      [M, K]            bf16   (residual.view(M, hc_hidden)); hc_hidden = hc_mult * hidden
+#   B      [N, K]            fp32   (fn = [24, 16384] = [N, K])
+#   C      [n_splits, M, N]  fp32   (gemm_out_mul partials), C = A @ B^T per K-slice
+#   sqrsum [n_splits, M]     fp32   (gemm_out_sqrsum partials), sqrsum[s,m] = partial sum A^2
+# N (=hc_mult3) and K (=hc_mult*hidden) are fixed; only the token count M varies.
+# n_splits follows the mhc_pre split-k rule (32 for M<=2048).
 hc = 4
 hc_mult3 = (2 + hc) * hc  # 24 -> N
 hidden_size = 4096
 K = hc * hidden_size  # 16384 -> K
 N = hc_mult3  # 24
+
+
+def _n_splits_pre(M):
+    return 32 if M <= 2048 else 1
 
 configs = [
     # (M, K, N)  -- same token sweep as bench_hc_pre_fuse.py (incl. ragged M)
@@ -51,13 +56,15 @@ def benchmark(M, K, N, provider):
     torch.set_default_device("xpu")
     torch.xpu.manual_seed_all(42)
 
+    n_splits = _n_splits_pre(M)
+
     # Inputs: A bf16 [M,K], B fp32 [N,K]  (B = fn, the [N,K] weight matrix)
     A = torch.randn(M, K, dtype=torch.bfloat16, device="xpu")
     B = torch.randn(N, K, dtype=torch.float32, device="xpu")
 
-    # Outputs: C fp32 [M,N], sqrsum fp32 [M]
-    C = torch.empty(M, N, dtype=torch.float32, device="xpu")
-    sqrsum = torch.empty(M, dtype=torch.float32, device="xpu")
+    # Outputs: K-split partials. C fp32 [n_splits,M,N], sqrsum fp32 [n_splits,M].
+    C = torch.empty(n_splits, M, N, dtype=torch.float32, device="xpu")
+    sqrsum = torch.empty(n_splits, M, dtype=torch.float32, device="xpu")
 
     run = lambda: gemm_sqrsum(C, sqrsum, A, B)
 
@@ -75,11 +82,12 @@ def benchmark(M, K, N, provider):
     flops = 2.0 * M * N * K + 2.0 * M * K
     tflops = flops / (ms / 1e3) / 1e12
 
-    # Logical I/O (the kernel also widens A->fp32 and uses an M*N fp32 scratch
-    # internally; those are not counted here, matching the convention of
-    # reporting the problem's intrinsic traffic).
+    # Logical I/O (the kernel also widens A->fp32 and uses an [n_splits,M,N] fp32
+    # scratch for the square-sum internally; those are not counted here, matching
+    # the convention of reporting the problem's intrinsic traffic). The partial
+    # writes are n_splits deep (each K-slice writes its own [M,N] / [M] slab).
     read_bytes = M * K * 2 + N * K * 4  # A (bf16) + B (fp32)
-    write_bytes = M * N * 4 + M * 4  # C (fp32) + sqrsum (fp32)
+    write_bytes = n_splits * M * N * 4 + n_splits * M * 4  # C + sqrsum partials (fp32)
     total_bytes = read_bytes + write_bytes
     bandwidth_gb_s = total_bytes / (ms / 1e3) / 1e9
 
@@ -88,6 +96,7 @@ def benchmark(M, K, N, provider):
             "M": M,
             "K": K,
             "N": N,
+            "n_splits": n_splits,
             "provider": provider,
             "ms": ms,
             "Mtok_per_sec": M / (ms / 1e3) / 1e6,

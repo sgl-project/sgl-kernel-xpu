@@ -236,14 +236,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor lora_ranks, Tensor? extra_embeddings, Tensor? seg_lens) -> ()");
   m.impl("embedding_lora_a_fwd", torch::kXPU, &embedding_lora_a_fwd);
 
-  /* HC PRE GEMM */
-  m.def("hc_pre_gemm(Tensor A, Tensor B, Tensor! C) -> ()");
-  m.impl("hc_pre_gemm", torch::kXPU, &hc_pre_gemm);
-
-  /* ROW WISE SUM CUTLASS */
-  m.def("row_wise_sum_cutlass(Tensor A, Tensor! D) -> ()");
-  m.impl("row_wise_sum_cutlass", torch::kXPU, &row_wise_sum_cutlass);
-
   /* GEMM + SQUARE SUM */
   m.def("gemm_sqrsum(Tensor! C, Tensor! sqrsum, Tensor A, Tensor B) -> ()");
   m.impl("gemm_sqrsum", torch::kXPU, &gemm_with_sqrsum);

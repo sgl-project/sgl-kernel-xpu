@@ -40,7 +40,6 @@ from sgl_kernel.gemm import (
     cutlass_scaled_fp4_mm,
     fp8_blockwise_scaled_mm,
     fp8_scaled_mm,
-    gemm_sqrsum,
     int8_scaled_mm,
     qserve_w4a8_per_chn_gemm,
     qserve_w4a8_per_group_gemm,
@@ -55,7 +54,7 @@ from sgl_kernel.gemm import (
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.lora import embedding_lora_a_fwd
-from sgl_kernel.mhc import hc_pre_big_fuse, hc_pre_gemm, hc_split_sinkhorn
+from sgl_kernel.mhc import gemm_sqrsum, hc_pre_big_fuse, hc_split_sinkhorn
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     cutlass_fp4_group_mm,
@@ -71,7 +70,6 @@ from sgl_kernel.moe import (
     topk_sigmoid,
     topk_softmax,
 )
-from sgl_kernel.reduction import row_wise_square_sum
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,
     top_k_renorm_prob,

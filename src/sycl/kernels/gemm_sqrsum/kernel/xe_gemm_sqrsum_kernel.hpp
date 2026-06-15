@@ -16,7 +16,6 @@
 #include "cutlass/gemm/kernel/tile_scheduler.hpp"
 #include "cutlass/kernel_hardware_info.hpp"
 #include "../collective/xe_gemm_sqrsum_mainloop.hpp"
-#include "../collective/xe_gemm_sqrsum_epilogue.hpp"
 
 namespace cutlass::gemm_sqrsum::kernel {
 using namespace cute;

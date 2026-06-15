@@ -319,34 +319,6 @@ def qserve_w4a8_per_group_gemm(
     )
     return out_feats
 
-
-def gemm_sqrsum(
-    C: torch.Tensor,
-    sqrsum: torch.Tensor,
-    A: torch.Tensor,
-    B: torch.Tensor,
-) -> None:
-    """
-    Compute C[m,n] = sum_k A[m,k]*B[n,k] and sqrsum[m] = sum_k A[m,k]^2.
-
-    This is the mhc_pre GEMM+sqrsum stage: B is the weight matrix fn given as
-    [N, K] (e.g. [24, 16384]), so C = A @ B^T. Leading singleton (n_splits=1)
-    axes on any argument are squeezed away.
-
-    Precision: when B is fp32 the kernel runs a tf32 x tf32 -> fp32 DPAS path
-    (A widened to fp32, B taken as-is, both reinterpreted to tf32 at load). When
-    A and B share a 16-bit dtype (half/bf16) the native DPAS path runs. C and
-    sqrsum are always fp32.
-
-    Args:
-        C: Output tensor [M, N] fp32, filled with A @ B^T
-        sqrsum: Output tensor [M] fp32, filled with row-wise squared sums of A
-        A: Input tensor [M, K]   (bf16/fp16/fp32)
-        B: Input tensor [N, K]   (fp32 for the production tf32 path)
-    """
-    torch.ops.sgl_kernel.gemm_sqrsum.default(C, sqrsum, A, B)
-
-
 def scaled_fp4_experts_quant(
     input_tensor: torch.Tensor,
     input_global_scale: torch.Tensor,

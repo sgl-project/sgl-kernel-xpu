@@ -46,21 +46,23 @@ void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Argume
     // independent KV-tile constant (@TILED_KV_NP@) that can be tuned separately.
     // Only emitted in the PAGE_SIZE==128 TU; the host routes non-paged decode
     // launches here (decode::mha_fwd_nopage sets page_size = 128).
+    TORCH_CHECK(
+        params.softmax_sink_ptr == nullptr,
+        "No-page attention does not support sink logits (softmax_sink_ptr must be null)");
     using TileShapeQK_NP = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@TILED_KV_NP@>, cute::_64>;
     using TileShapePV_NP = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@TILED_KV_NP@>>;
     using TileShapeOutput_NP = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;
     using SubgroupLayoutQK_NP = cute::Layout<cute::Shape<cute::_1, cute::Int<@TILED_KV_NP@ / 16>, cute::_1>>;
-    AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
-      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-        DecodeConfig<
-            false,
-            LocalMask,
-            Sink,
-            TileShapeQK_NP,
-            TileShapePV_NP,
-            TileShapeOutput_NP,
-            SubgroupLayoutQK_NP>::run_nopaged(params);
-      });
+    // No sink support for no_page path; always use Sink=false
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      DecodeConfig<
+          false,
+          LocalMask,
+          false,
+          TileShapeQK_NP,
+          TileShapePV_NP,
+          TileShapeOutput_NP,
+          SubgroupLayoutQK_NP>::run_nopaged(params);
     });
     return;
   }

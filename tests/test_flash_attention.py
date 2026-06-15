@@ -543,6 +543,9 @@ def test_flash_attn_kvcache(
         pytest.skip()
     if rotary_fraction == 0.0 and has_rotary_seqlens:
         pytest.skip()
+    # sink is only supported for head_size == 64
+    if use_sinks and d != 64:
+        pytest.skip()
     # set seed
     torch.random.manual_seed(0)
     batch_size = 5
@@ -1027,6 +1030,9 @@ def test_flash_attn_decode_kvcache(
     if not new_kv and rotary_fraction > 0.0:
         pytest.skip()
     if rotary_fraction == 0.0 and has_rotary_seqlens:
+        pytest.skip()
+    # sink is only supported for head_size == 64
+    if use_sinks and d != 64:
         pytest.skip()
     # set seed
     torch.random.manual_seed(0)

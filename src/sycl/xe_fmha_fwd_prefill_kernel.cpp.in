@@ -74,6 +74,7 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
   using SubgroupLayoutQK =
       cute::Layout<cute::Shape<cute::Int<@NUM_SG@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
 
+#if @HEAD_DIM@ == 64
   AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
@@ -82,6 +83,17 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
       });
     });
   });
+#else
+  TORCH_CHECK(
+      !use_sink,
+      "sink is only supported for head_size == 64, got @HEAD_DIM@");
+  AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+      FMHAConfig<Causal, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
+          params);
+    });
+  });
+#endif
 #else
   TORCH_CHECK(false, "head dim @HEAD_DIM@ is not compiled for the paged prefill path");
 #endif

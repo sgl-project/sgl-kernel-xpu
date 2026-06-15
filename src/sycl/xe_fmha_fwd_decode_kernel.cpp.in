@@ -78,12 +78,22 @@ void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Argume
   using TileShapeOutput = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;
   using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<@PAGE_SIZE@ / 16>, cute::_1>>;
 
+#if @HEAD_DIM@ == 64
     AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
         DecodeConfig<false, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
             params);
       });
   });
+#else
+    TORCH_CHECK(
+        !params.use_sink,
+        "sink is only supported for head_size == 64, got @HEAD_DIM@");
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      DecodeConfig<false, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
+          params);
+    });
+#endif
 #else
   TORCH_CHECK(false, "head dim @HEAD_DIM@ is not compiled for the paged decode path");
 #endif

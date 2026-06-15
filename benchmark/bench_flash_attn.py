@@ -87,7 +87,7 @@ use_sinks = [True, False]
 batch_size = [1, 8, 16]
 q_seq_length_range = [1, 128]
 head_dim_no_page = [72, 128]
-head_dim_paged = [128, 256, 512]
+head_dim_paged = [64, 128, 256, 512]
 num_heads_q = [16]
 num_heads_kv = [4, 8]
 kv_seq_length_range = [4096]
@@ -105,6 +105,8 @@ configs = list(
             and (cfg[8] >= cfg[9])
             # Condition 5: no_page mode (page_size=0) does not support sink logits
             and (cfg[9] != 0 or not cfg[2])
+            # Condition 6: sink is only supported for head_size == 64
+            and (not cfg[2] or cfg[5] == 64)
         ),
         [
             cfg

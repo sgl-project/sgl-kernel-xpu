@@ -17,15 +17,12 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
-#include <algorithm>  // std::max / std::min for the split-K factor
-
 #include <cute/tensor.hpp>
 #include <cute/atom/mma_atom.hpp>
 #include <sycl/sycl.hpp>
 
 #include "../../../Utils.h"
 #include "cutlass/numeric_types.h"
-#include "cutlass/kernel_hardware_info.h"  // query_device_multiprocessor_count
 #include "cutlass/gemm/collective/collective_mma.hpp"
 #include "sycl/kernels/gemm_sqrsum/collective/xe_gemm_sqrsum_mainloop.hpp"
 #include "sycl/kernels/gemm_sqrsum/kernel/xe_gemm_sqrsum_kernel.hpp"
@@ -97,14 +94,21 @@ struct GemmSqrSumXe {
 };
 
 //----------------- Launch function --------------------//
-// Contract (mhc_pre GEMM+sqrsum stage):
-//   A      : [M, K]  (residual.view(M, hc_hidden)); bf16/fp16/fp32 accepted
-//   B      : [N, K]  (fn = [24, 16384]); fp32 — passed as genuine [N,K] row-major
-//   C      : [M, N]  fp32  (== gemm_out_mul)
-//   sqrsum : [M]     fp32  (== gemm_out_sqrsum), sqrsum[m] = sum_k A[m,k]^2
+// Contract (mhc_pre GEMM+sqrsum stage — Design B: the kernel writes the K-split
+// partials and the downstream hc_pre_big_fuse reduces them, so NOTHING is summed
+// here):
+//   A      : [M, K]            (residual.view(M, hc_hidden)); bf16/fp16/fp32
+//   B      : [N, K]            (fn = [24, 16384]); fp32 — genuine [N,K] row-major
+//   C      : [n_splits, M, N]  fp32  (== gemm_out_mul partials)
+//   sqrsum : [n_splits, M]     fp32  (== gemm_out_sqrsum partials)
+//             sqrsum[s,m] = sum_{k in split s} A[m,k]^2
+// The K reduction is partitioned into `split_k = C.size(0)` slices; the caller
+// (mhc_pre) picks that count (32 for the split-k path, 1 for the simple path)
+// and pre-allocates the partial buffers. The fuse's `for split` loop collapses
+// the leading axis, so the K-reduction is folded into work the fuse already does.
 inline void runGemmSqrSum(
-    at::Tensor& C,           // Output: [M, N] fp32
-    at::Tensor& sqrsum,      // Output: [M] fp32
+    at::Tensor& C,           // Output: [n_splits, M, N] fp32
+    at::Tensor& sqrsum,      // Output: [n_splits, M] fp32
     const at::Tensor& A,     // Input: [M, K]
     const at::Tensor& B) {   // Input: [N, K]
 
@@ -116,15 +120,21 @@ inline void runGemmSqrSum(
   int K = A.size(1);
   int N = B.size(0);
 
+  // Split-K count = the leading axis of the partial buffers. Each K-slice writes
+  // one [M,N] slab; the fuse reduces over this axis. No host-side reduction.
+  int split_k = C.size(0);
+
   // Verify shapes
   TORCH_CHECK(B.size(1) == K, "A.K (", K, ") must match B.K (", B.size(1), ") for GEMM");
-  TORCH_CHECK(C.size(0) == M && C.size(1) == N, "C shape mismatch");
-  TORCH_CHECK(sqrsum.size(0) == M, "sqrsum size mismatch");
+  TORCH_CHECK(C.dim() == 3 && C.size(1) == M && C.size(2) == N,
+              "C must be [n_splits, M, N]");
+  TORCH_CHECK(sqrsum.dim() == 2 && sqrsum.size(0) == split_k && sqrsum.size(1) == M,
+              "sqrsum must be [n_splits, M] matching C's leading dim");
 
   // Zero the outputs. The epilogue does a full block-2D store (overwrite, not
-  // atomic add) over every (blk_m,blk_n) tile, and the split-K path overwrites C
-  // via copy_ from the reduced partials, so this is belt-and-suspenders for the
-  // OOB-masked boundary tiles (ragged M, N=24<BLK_N).
+  // atomic add) over every (blk_m,blk_n) tile, so this is belt-and-suspenders for
+  // the OOB-masked boundary tiles (ragged M, N=24<BLK_N) and any tail K-slice
+  // that runs zero loop iterations.
   C.zero_();
   sqrsum.zero_();
 
@@ -134,19 +144,6 @@ inline void runGemmSqrSum(
   // taken contiguous as-is.
   at::Tensor A_buf = A.scalar_type() == at::kFloat ? A.contiguous() : A.to(at::kFloat);
   at::Tensor B_buf = B.scalar_type() == at::kFloat ? B.contiguous() : B.to(at::kFloat);
-
-  // ---- Split-K factor (mhc_pre reference: _compute_num_split_for_mhc_pre) ----
-  // Partition the K reduction into `split_k` workgroup slices when the M/N grid
-  // is too small to fill the machine (the starved small-M regime). Replicated
-  // verbatim in the reference's 64-element block units so the slice count
-  // matches mhc exactly; our kernel then divides its finer BLK_K tiles into
-  // `split_k` contiguous chunks. block_m=64 == our TileM, so grid_m agrees.
-  constexpr int kRefBlockM = 64;
-  constexpr int kRefBlockK = 64;
-  int grid_m_ref = (M + kRefBlockM - 1) / kRefBlockM;
-  int num_block_k = (K + kRefBlockK - 1) / kRefBlockK;
-  int n_sms = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
-  int split_k = std::max(1, std::min(n_sms / std::max(grid_m_ref, 1), num_block_k / 4));
 
   // Setup kernel arguments
   typename Kernel::Arguments args;
@@ -171,31 +168,23 @@ inline void runGemmSqrSum(
   args.stride_B_k = K;  // N-row stride
   args.stride_B_n = 1;  // K stride (contiguous)
 
-  // Output C: [M, N] fp32 row-major. ElementC == float (the accumulator type).
-  // For split_k > 1 the kernel writes `split_k` partial [M,N] slabs that we sum
-  // afterward, so we point ptr_C at a [split_k, M, N] scratch buffer instead of
-  // the caller's C. For split_k == 1 we write C in place (no extra buffer, the
-  // already-validated fast path). stride_C_m/n describe one [M,N] slab; the
-  // kernel offsets the base pointer per split.
-  at::Tensor c_partial;
-  if (split_k > 1) {
-    c_partial = torch::empty({split_k, M, N}, C.options().dtype(torch::kFloat32));
-    args.ptr_C = reinterpret_cast<typename Kernel::ElementC*>(c_partial.data_ptr());
-  } else {
-    args.ptr_C = reinterpret_cast<typename Kernel::ElementC*>(C.data_ptr());
-  }
+  // Output C: [split_k, M, N] fp32 row-major == the caller's gemm_out_mul
+  // partials. ElementC == float (the accumulator type). The kernel writes slab
+  // `split_idx` directly into this buffer (base offset split_idx*M*N); no host
+  // scratch, no host reduction — the fuse reduces the leading axis downstream.
+  // stride_C_m/n describe one [M,N] slab.
+  args.ptr_C = reinterpret_cast<typename Kernel::ElementC*>(C.data_ptr());
   args.stride_C_m = N;  // Row stride within a slab
   args.stride_C_n = 1;  // Column stride
 
-  // Output sqrsum: [M] - 1D vector (always float32)
-  args.ptr_sqrsum = sqrsum.data_ptr<float>();
-
-  // [split_k, M, N] float scratch for the square-sum-as-GEMM accumulator (one
-  // [M,N] slab per split). The kernel stores the A^2 @ ones product via the
-  // proven block-2D copy (whose coordinate handling is correct, unlike a manual
-  // per-element store). Every column of a row equals that row's partial
-  // sum_k A[row,k]^2; we sum the slabs over split_k then slice column 0.
+  // Output sqrsum partials: [split_k, M]. The square-sum-as-GEMM produces an
+  // [M,N] slab per split where every column of a row equals that row's partial
+  // sum_k A[row,k]^2, so the kernel needs an [M,N]-shaped scratch slab to store
+  // through the block-2D copy engine; we then take column 0 into sqrsum[s, :].
+  // (A standalone [split_k, M, N] scratch — only the square-sum needs the extra
+  // N columns; the final sqrsum the fuse reads is [split_k, M].)
   auto sqsc = torch::empty({split_k, M, N}, sqrsum.options().dtype(torch::kFloat32));
+  args.ptr_sqrsum = sqsc.data_ptr<float>();  // base of the [split_k,M,N] scratch
   args.ptr_sqrsum_scratch = sqsc.data_ptr<float>();
   args.stride_sqsc_m = N;  // row-major within a slab
   args.stride_sqsc_n = 1;
@@ -210,17 +199,12 @@ inline void runGemmSqrSum(
   TORCH_CHECK(status == cutlass::Status::kSuccess,
               "CUTLASS GEMM+SqrSum kernel failed with status: ", int(status));
 
-  // Split-K reduction. Each split wrote an [M,N] partial slab; sum over the
-  // split_k axis to get the full result. This is a tiny reduction (split_k *
-  // M * N fp32, e.g. 64*2048*32*4 ~ 16 MB worst case) so torch handles it in
-  // microseconds — no need for a second device kernel like the CUTLASS
-  // SplitKParallel reference (which targets the CUDA path).
-  //   C      = sum_s c_partial[s]                       -> [M, N]
-  //   sqrsum = (sum_s sqsc[s])[:, 0]  (all cols equal)  -> [M]
-  if (split_k > 1) {
-    C.copy_(c_partial.sum(/*dim=*/0));
-  }
-  // sqsc is [split_k, M, N]; reduce splits then slice column 0. For split_k==1
-  // this is a no-op squeeze of the leading dim.
-  sqrsum.copy_(sqsc.sum(/*dim=*/0).select(/*dim=*/1, /*index=*/0));
+  // Design B: NO split-K reduction here. C already holds the [split_k, M, N]
+  // partials in place (the kernel wrote each slab directly). The only host work
+  // is extracting the square-sum partials from the [split_k, M, N] scratch into
+  // the caller's [split_k, M] buffer: every column of a slab's row is equal, so
+  // column 0 is that split's partial sum_k A[m,k]^2. No sum over split_k — the
+  // fuse's `for split` loop reduces both C and sqrsum downstream.
+  //   sqrsum[s, m] = sqsc[s, m, 0]
+  sqrsum.copy_(sqsc.select(/*dim=*/2, /*index=*/0));
 }

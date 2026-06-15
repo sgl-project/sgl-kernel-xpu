@@ -469,8 +469,8 @@ def _sparse_attn_func_torch(
             valid_kv_v = (ci >= 0) & (ci < Sk)
             valid_v = valid_j_v & valid_kv_v
 
-            ci_clamped = ci.clamp(0, Sk - 1)
-            mask.scatter_(-1, ci_clamped, valid_v)
+            vb, vh, _ = valid_v.nonzero(as_tuple=True)
+            mask[vb, vh, ci[valid_v]] = True
 
         # ----- Compute attention scores -----
         scores = (

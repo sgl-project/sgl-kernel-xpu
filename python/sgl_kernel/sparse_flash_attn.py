@@ -10,8 +10,7 @@ The sparsity pattern consists of:
   diagonal stripes in the attention matrix.
 """
 
-import math
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 
@@ -557,16 +556,11 @@ def _sparse_attn_varlen_func_torch(
         q_end = cu_seqlens_q[b + 1].item()
         k_start = cu_seqlens_k[b].item()
         k_end = cu_seqlens_k[b + 1].item()
-        sq = q_end - q_start
-        sk = k_end - k_start
-
         # Extract and reshape to (1, seqlen, nheads, headdim)
         q_b = q[q_start:q_end].unsqueeze(0)  # (1, sq, H, D)
         k_b = k[k_start:k_end].unsqueeze(0)  # (1, sk, Hk, D)
         v_b = v[k_start:k_end].unsqueeze(0)  # (1, sk, Hk, D)
-
         # Per-batch sparse indices (already indexed by batch dim)
-        num_rows_b = block_count.shape[2]
         bc_b = block_count[b : b + 1]  # (1, H, num_rows)
         bo_b = block_offset[b : b + 1]
         cc_b = column_count[b : b + 1]

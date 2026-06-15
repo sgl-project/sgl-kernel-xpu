@@ -22,6 +22,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstring>
 #include <sycl/sycl.hpp>
 
 namespace sgl {
@@ -77,42 +78,40 @@ class TimestepEmbeddingKernel {
 
     const int vec_half_dim = (half_dim / 4) * 4;
 
-    // Process in chunks of 4 (vectorized)
+    // Process in chunks of 4 (vectorized register computation, scalar stores to avoid
+    // alignment/aliasing UB from float4* pointer casts when dim % 4 != 0 per row).
     for (size_t thread_offset = tid; thread_offset * 4 < static_cast<size_t>(vec_half_dim);
          thread_offset += num_threads) {
-      float4* top_half;
-      float4* bottom_half;
+      const size_t base = thread_offset * 4;
 
-      if constexpr (!kFlipSinToCos) {
-        bottom_half = reinterpret_cast<float4*>(output_batch_base_ptr + thread_offset * 4);
-        top_half = reinterpret_cast<float4*>(output_batch_base_ptr + half_dim + thread_offset * 4);
-      } else {
-        top_half = reinterpret_cast<float4*>(output_batch_base_ptr + thread_offset * 4);
-        bottom_half = reinterpret_cast<float4*>(output_batch_base_ptr + half_dim + thread_offset * 4);
-      }
-
-      // Compute frequencies
       float4 vals;
-      vals[0] = scale_ * t_val * ::sycl::exp(neg_log_max_period_ * static_cast<float>(thread_offset * 4 + 0));
-      vals[1] = scale_ * t_val * ::sycl::exp(neg_log_max_period_ * static_cast<float>(thread_offset * 4 + 1));
-      vals[2] = scale_ * t_val * ::sycl::exp(neg_log_max_period_ * static_cast<float>(thread_offset * 4 + 2));
-      vals[3] = scale_ * t_val * ::sycl::exp(neg_log_max_period_ * static_cast<float>(thread_offset * 4 + 3));
+      vals[0] = scale_ * t_val * ::sycl::exp(neg_log_max_period_ * static_cast<float>(base + 0));
+      vals[1] = scale_ * t_val * ::sycl::exp(neg_log_max_period_ * static_cast<float>(base + 1));
+      vals[2] = scale_ * t_val * ::sycl::exp(neg_log_max_period_ * static_cast<float>(base + 2));
+      vals[3] = scale_ * t_val * ::sycl::exp(neg_log_max_period_ * static_cast<float>(base + 3));
 
-      // Compute cos values
       float4 cos_vals;
       cos_vals[0] = ::sycl::cos(vals[0]);
       cos_vals[1] = ::sycl::cos(vals[1]);
       cos_vals[2] = ::sycl::cos(vals[2]);
       cos_vals[3] = ::sycl::cos(vals[3]);
-      *top_half = cos_vals;
 
-      // Compute sin values
       float4 sin_vals;
       sin_vals[0] = ::sycl::sin(vals[0]);
       sin_vals[1] = ::sycl::sin(vals[1]);
       sin_vals[2] = ::sycl::sin(vals[2]);
       sin_vals[3] = ::sycl::sin(vals[3]);
-      *bottom_half = sin_vals;
+
+      // Write results element-wise to avoid float4* alignment/aliasing assumptions.
+      for (int k = 0; k < 4; ++k) {
+        if constexpr (!kFlipSinToCos) {
+          output_batch_base_ptr[base + k] = sin_vals[k];
+          output_batch_base_ptr[half_dim + base + k] = cos_vals[k];
+        } else {
+          output_batch_base_ptr[base + k] = cos_vals[k];
+          output_batch_base_ptr[half_dim + base + k] = sin_vals[k];
+        }
+      }
     }
 
     // Handle remaining elements (scalar tail loop)

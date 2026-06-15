@@ -22,9 +22,17 @@ namespace sycl {
 /**
  * SharedMemory: SYCL equivalent of CUDA __shared__ memory
  *
- * Usage in kernel:
- *   auto shared = SharedMemory<float, 256>(item);
- *   shared[threadIdx<0>(item)] = value;
+ * The caller must allocate a local_accessor of exactly Size elements in the
+ * command group handler and pass it alongside the nd_item:
+ *
+ *   cgh.parallel_for(range, [=](::sycl::nd_item<3> item) {
+ *     ::sycl::local_accessor<float, 1> acc(Size, cgh);  // allocated in CGH
+ *     auto shared = SharedMemory<float, Size>(item, acc);
+ *     shared[threadIdx<0>(item)] = value;
+ *   });
+ *
+ * Note: Size is not validated against the accessor's allocated length; the
+ * caller is responsible for ensuring they match.
  */
 template <typename T, size_t Size>
 class SharedMemory {

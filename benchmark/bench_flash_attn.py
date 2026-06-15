@@ -94,10 +94,18 @@ kv_seq_length_range = [4096]
 page_size_range = [0, 128]
 configs = list(
     filter(
-        lambda cfg: not (cfg[0] and cfg[1])
-        and (cfg[4] != 1 or (not cfg[0] and not cfg[1] and not cfg[2]))
-        and (cfg[6] % cfg[7] == 0)
-        and (cfg[8] >= cfg[9]),
+        lambda cfg: (
+            # Condition 1: causal and local cannot both be True
+            not (cfg[0] and cfg[1])
+            # Condition 2: when q_seq_length=1, causal must be False
+            and (cfg[4] != 1 or not cfg[0])
+            # Condition 3: num_heads_q must be a multiple of num_heads_kv (GQA requirement)
+            and (cfg[6] % cfg[7] == 0)
+            # Condition 4: kv_seq_length >= page_size
+            and (cfg[8] >= cfg[9])
+            # Condition 5: no_page mode (page_size=0) does not support sink logits
+            and (cfg[9] != 0 or not cfg[2])
+        ),
         [
             cfg
             for page_size in page_size_range

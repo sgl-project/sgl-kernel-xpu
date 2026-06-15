@@ -1522,7 +1522,7 @@ def _generate_block_kvcache(
 @pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
 # @pytest.mark.parametrize("softcap", [0.0])
 @pytest.mark.parametrize("causal,local", [(False, True), (False, False), (True, False)])
-@pytest.mark.parametrize("use_sinks", [True, False])
+@pytest.mark.parametrize("use_sinks", [False]) # Sinks are not supported in flash_attn_varlen_func
 @pytest.mark.parametrize("add_unused_qkv", [False])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192, 256])

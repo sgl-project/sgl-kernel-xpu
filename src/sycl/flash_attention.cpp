@@ -171,10 +171,7 @@ std::vector<at::Tensor> mha_fwd_nopage(
 
   params.softmax_scale = softmax_scale;
   if (sinks_.has_value()) {
-    TORCH_CHECK(
-        head_size == 64,
-        "sink is only supported for head_size == 64, got ",
-        head_size);
+    TORCH_CHECK(head_size == 64, "sink is only supported for head_size == 64, got ", head_size);
     params.use_sink = true;
     params.softmax_sink_ptr = sinks_.value().data_ptr();
   } else {
@@ -492,10 +489,7 @@ std::vector<at::Tensor> mha_fwd(
   // Set the different scale values.
   params.softmax_scale = softmax_scale;
   if (sinks_.has_value()) {
-    TORCH_CHECK(
-        head_size == 64,
-        "sink is only supported for head_size == 64, got ",
-        head_size);
+    TORCH_CHECK(head_size == 64, "sink is only supported for head_size == 64, got ", head_size);
     params.use_sink = true;
     params.softmax_sink_ptr = sinks_.value().data_ptr();
   } else {
@@ -732,10 +726,7 @@ std::vector<at::Tensor> mha_fwd_nopage(
 
   params.softmax_scale = softmax_scale;
   if (sinks_.has_value()) {
-    TORCH_CHECK(
-        head_size == 64,
-        "sink is only supported for head_size == 64, got ",
-        head_size);
+    TORCH_CHECK(head_size == 64, "sink is only supported for head_size == 64, got ", head_size);
     params.softmax_sink_ptr = sinks_.value().data_ptr();
   } else {
     params.softmax_sink_ptr = nullptr;
@@ -984,10 +975,7 @@ std::vector<at::Tensor> mha_fwd(
   // Set the different scale values.
   params.softmax_scale = softmax_scale;
   if (sinks_.has_value()) {
-    TORCH_CHECK(
-        head_size == 64,
-        "sink is only supported for head_size == 64, got ",
-        head_size);
+    TORCH_CHECK(head_size == 64, "sink is only supported for head_size == 64, got ", head_size);
     params.softmax_sink_ptr = sinks_.value().data_ptr();
   } else {
     params.softmax_sink_ptr = nullptr;

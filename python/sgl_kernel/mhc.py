@@ -155,20 +155,6 @@ def gemm_sqrsum(
     A: torch.Tensor,
     B: torch.Tensor,
 ) -> None:
-    """GEMM + row-wise square-sum, written as K-split partials (Design B).
-
-    Computes, partitioned into ``n_splits = C.size(0)`` K-slices:
-        C[s, m, n]      = sum_{k in split s} A[m, k] * B[n, k]   (partial A @ Bᵀ)
-        sqrsum[s, m]    = sum_{k in split s} A[m, k]^2
-    NOTHING is reduced here — the downstream ``hc_pre_big_fuse`` sums the leading
-    (split) axis. The caller picks ``n_splits`` and pre-allocates the buffers.
-
-    Args:
-        C:      [n_splits, M, N] fp32 output partials (== gemm_out_mul).
-        sqrsum: [n_splits, M]    fp32 output partials (== gemm_out_sqrsum).
-        A:      [M, K] bf16/fp16/fp32 (residual.view(M, hc_hidden)).
-        B:      [N, K] fp32 (fn = [hc_mult3, hc_hidden]).
-    """
     torch.ops.sgl_kernel.gemm_sqrsum.default(C, sqrsum, A, B)
 
 

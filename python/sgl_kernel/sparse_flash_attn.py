@@ -608,7 +608,7 @@ def convert_vertical_slash_indexes(
     block_size_N: int,
     causal: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if _has_native_convert_ops():
+    if _has_native_convert_ops() and q_seqlens.device.type != "cpu":
         batch_size = slash_indexes.size(0)
         num_heads = slash_indexes.size(1)
         nnz_slash = slash_indexes.size(2)
@@ -687,7 +687,7 @@ def convert_vertical_slash_indexes_mergehead(
     block_size_N: int,
     causal: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if _has_native_convert_ops():
+    if _has_native_convert_ops() and q_seqlens.device.type != "cpu":
         batch_size = slash_indexes.size(0)
         num_heads = slash_indexes.size(1)
         nnz_slash = slash_indexes.size(2)
@@ -816,7 +816,7 @@ def sparse_attn_func(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
-    if _has_native_sparse_ops():
+    if _has_native_sparse_ops() and q.device.type != "cpu":
         q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
         out, softmax_lse = torch.ops.sgl_kernel.fwd_sparse.default(
             q,
@@ -912,7 +912,7 @@ def sparse_attn_varlen_func(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
-    if _has_native_sparse_ops():
+    if _has_native_sparse_ops() and q.device.type != "cpu":
         q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
         out, softmax_lse = torch.ops.sgl_kernel.varlen_fwd_sparse.default(
             q,

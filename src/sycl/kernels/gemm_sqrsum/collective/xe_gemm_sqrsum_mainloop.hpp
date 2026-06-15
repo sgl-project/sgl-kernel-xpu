@@ -246,7 +246,11 @@ struct XeGemmSqrSumMainloop<
     auto pAgA = prefetch_a.get_slice(thr_id).partition_S(gA);
     auto pBgB = prefetch_b.get_slice(thr_id).partition_S(gB);
 
-    const int prefetch_dist = 3;
+    // Prefetch depth = the dispatch policy's pipeline Stages (repo convention,
+    // matches the bf16 MoE mainloop's `prefetch_dist = Stages`). K-tiles kept in
+    // flight ahead of compute: trades L1 pressure vs. latency hiding. Set at the
+    // config site via XeDefault<Stages> (see gemm_sqrsum_types.hpp).
+    constexpr int prefetch_dist = Stages;
     constexpr int barrier_scope = 2;
     // This split owns global K-tiles [k_tile_begin, k_tile_end). Prefetch and
     // load index pAgA/tAgA with the GLOBAL tile index (they span all
@@ -293,13 +297,17 @@ struct XeGemmSqrSumMainloop<
       // Square in the MMA type (tf32), reusing the already-loaded+converted A
       // fragment tCrA. tCrAsq/tCrBones are MMA fragments (ElementMMA == tf32),
       // so cast to ElementMMA — casting to ElementA (bf16) would re-truncate.
-      int n_a = int(size(tCrAsq.tensor()));
+      // Static trip counts: size() of a register fragment with a static layout
+      // is a compile-time Int<N>. Pull the value from the TYPE (no tensor
+      // construction, no runtime int cast) so the unroll fully eliminates the
+      // loop (these are tiny, ~8-16 elems/thread).
+      constexpr int n_a = decltype(size(tCrAsq.tensor()))::value;
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < n_a; i++) {
         ElementMMA a_in = tCrA(i);
         tCrAsq(i) = static_cast<ElementMMA>(a_in * a_in);
       }
-      int n_b = int(size(tCrBones.tensor()));
+      constexpr int n_b = decltype(size(tCrBones.tensor()))::value;
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < n_b; i++) {
         tCrBones(i) = static_cast<ElementMMA>(1);

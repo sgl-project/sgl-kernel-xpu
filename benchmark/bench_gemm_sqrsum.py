@@ -22,8 +22,6 @@ def _n_splits_pre(M):
 
 configs = [
     # (M, K, N)  -- same token sweep as bench_hc_pre_fuse.py (incl. ragged M)
-    (16, K, N),
-    (48, K, N),
     (128, K, N),
     (512, K, N),
     (896, K, N),
@@ -33,6 +31,8 @@ configs = [
     (1038, K, N),
     (1518, K, N),
     (2048, K, N),
+    (16, K, N),
+    (48, K, N),
 ]
 
 all_results = []
@@ -69,7 +69,7 @@ def benchmark(M, K, N, provider):
     run = lambda: gemm_sqrsum(C, sqrsum, A, B)
 
     # Warmup
-    for _ in range(10):
+    for _ in range(100):
         run()
     torch.xpu.synchronize()
 

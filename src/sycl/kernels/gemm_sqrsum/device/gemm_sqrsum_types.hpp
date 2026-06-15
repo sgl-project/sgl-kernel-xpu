@@ -74,7 +74,12 @@ struct GemmSqrSumXe {
   // TiledMMA: tiles MMA atoms across subgroups
   using TiledMma = typename TiledMMAHelper<MmaAtom, Layout<TileShape>, SubgroupLayout>::TiledMMA;
 
-  using DispatchPolicy = cutlass::gemm_sqrsum::XeDefault<1>;
+  // Pipeline Stages == prefetch depth (K-tiles kept in flight ahead of compute;
+  // see the mainloop). 3 is the swept optimum on BMG: best in the small-M
+  // (latency-bound) regime, flat at large M (bandwidth-bound; inter-workgroup
+  // parallelism hides latency there regardless). Matches the bf16 MoE kernel's
+  // Stages=3. Deeper (4+) thrashes L1 at small M; shallower under-hides latency.
+  using DispatchPolicy = cutlass::gemm_sqrsum::XeDefault<3>;
 
   // Placeholder tensor types used only to deduce TiledCopyA / TiledCopyB. Their
   // SHAPE ORIENTATION and contiguous-stride position must match the runtime

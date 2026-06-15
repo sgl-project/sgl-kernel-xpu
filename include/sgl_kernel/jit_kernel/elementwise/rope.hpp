@@ -135,7 +135,10 @@ class FusedRopeKernel {
       const float* sin_ptr = sin_cache_ptr + pos * kRopeDim;
 
       if constexpr (kIsNeox) {
-        // GPT-NeoX style: first half and second half
+        // GPT-NeoX style: first half and second half.
+        // JIT ABI requirement: q/k/cos_sin_cache tensors must be allocated with
+        // at least alignof(DType2) = 2*sizeof(DType) bytes alignment (e.g. 4 B for fp16).
+        // PyTorch allocates tensors with >=64-byte alignment, satisfying this.
         DType* input_x = input;
         DType* input_y = input + (kRopeDim / 2);
         DType2* input_vec_x_ptr = reinterpret_cast<DType2*>(input_x);
@@ -170,7 +173,8 @@ class FusedRopeKernel {
           input_vec_y_ptr[vec_idx] = input_vec_y;
         }
       } else {
-        // Interleaved style (GPT-J): pairs (x, y) adjacent
+        // Interleaved style (GPT-J): pairs (x, y) adjacent.
+        // Same alignment requirement as the kIsNeox path above.
         DType2* input_vec_ptr = reinterpret_cast<DType2*>(input);
         const float* cos_vec_ptr = cos_ptr;
         const float* sin_vec_ptr = sin_ptr;
@@ -247,6 +251,8 @@ class FusedRopeStoreKernel {
       const float* sin_ptr = sin_cache_ptr + pos * kRopeDim;
 
       if constexpr (kIsNeox) {
+        // JIT ABI requirement: tensors must satisfy alignof(DType2) = 2*sizeof(DType).
+        // PyTorch's >=64-byte allocation alignment guarantees this.
         DType* input_x = input;
         DType* input_y = input + (kRopeDim / 2);
         DType2* input_vec_x_ptr = reinterpret_cast<DType2*>(input_x);

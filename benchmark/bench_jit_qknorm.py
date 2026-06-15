@@ -137,7 +137,7 @@ def benchmark(batch_size, num_heads, head_dim, provider):
         }
     )
 
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    return 1000 * ms, 1000 * min_ms, 1000 * max_ms
 
 
 if __name__ == "__main__":

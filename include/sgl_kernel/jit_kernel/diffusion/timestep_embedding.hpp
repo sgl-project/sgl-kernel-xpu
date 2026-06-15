@@ -158,6 +158,10 @@ void timestep_embedding_launcher(
   if (batch_size <= 0 || dim <= 0) {
     return;
   }
+  // dim must be even: the kernel writes two halves of size dim/2 covering all dim outputs.
+  if (dim % 2 != 0) {
+    return;
+  }
 
   const int half_dim = dim / 2;
 

@@ -361,14 +361,16 @@ void fused_rope_launcher(
     uint32_t num_tokens) {
   constexpr uint32_t kBlockSize = 128;
 
-  // Calculate work threads based on rope_dim
+  // Calculate work threads based on rope_dim, clamped to kBlockSize.
   constexpr uint32_t kDimPerThread = 16 / sizeof(DType);
   constexpr uint32_t kWorkThreads = []() {
     uint32_t power = 1;
     while (power * kDimPerThread < kRopeDim)
       power *= 2;
-    return power;
+    return power < kBlockSize ? power : kBlockSize;
   }();
+  static_assert(kWorkThreads <= kBlockSize, "kWorkThreads exceeds kBlockSize");
+  static_assert(kBlockSize % kWorkThreads == 0, "kBlockSize must be divisible by kWorkThreads");
 
   constexpr uint32_t kWorkersPerBlock = kBlockSize / kWorkThreads;
   const uint32_t num_q_and_k_heads = num_qo_heads + num_kv_heads;
@@ -416,14 +418,16 @@ void fused_rope_store_launcher(
     uint32_t num_tokens) {
   constexpr uint32_t kBlockSize = 128;
 
-  // Calculate work threads
+  // Calculate work threads, clamped to kBlockSize.
   constexpr uint32_t kDimPerThread = 16 / sizeof(DType);
   constexpr uint32_t kWorkThreads = []() {
     uint32_t power = 1;
     while (power * kDimPerThread < kRopeDim)
       power *= 2;
-    return power;
+    return power < kBlockSize ? power : kBlockSize;
   }();
+  static_assert(kWorkThreads <= kBlockSize, "kWorkThreads exceeds kBlockSize");
+  static_assert(kBlockSize % kWorkThreads == 0, "kBlockSize must be divisible by kWorkThreads");
 
   constexpr uint32_t kWorkersPerBlock = kBlockSize / kWorkThreads;
   const uint32_t num_q_and_k_heads = num_qo_heads + num_kv_heads;

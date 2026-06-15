@@ -227,13 +227,16 @@ struct MergeState {
     float s_a_val = s_a[token_idx * num_heads + head_idx];
     float s_b_val = s_b[token_idx * num_heads + head_idx];
 
-    const float s_max = sycl::fmax(s_a_val, s_b_val);
-    s_a_val = sycl::exp2(s_a_val - s_max);
-    s_b_val = sycl::exp2(s_b_val - s_max);
+    s_a_val = sycl::isfinite(s_a_val) ? s_a_val : -std::numeric_limits<float>::infinity();
+    s_b_val = sycl::isfinite(s_b_val) ? s_b_val : -std::numeric_limits<float>::infinity();
 
-    const float d = s_a_val + s_b_val;
-    const float a_scale = s_a_val / d;
-    const float b_scale = s_b_val / d;
+    const float s_max = sycl::fmax(s_a_val, s_b_val);
+    const float a_se = sycl::exp2(s_a_val - s_max);
+    const float b_se = sycl::exp2(s_b_val - s_max);
+
+    const float d = sycl::fmax(a_se + b_se, std::numeric_limits<float>::min());
+    const float a_scale = a_se / d;
+    const float b_scale = b_se / d;
 
     using vec_t = sycl::vec<scalar_t, sizeof(pack_128b_t) / sizeof(scalar_t)>;
 
@@ -395,11 +398,21 @@ void merge_state(
   CHECK_DIM(2, s_a);
   CHECK_DIM(3, v_b);
   CHECK_DIM(2, s_b);
+  CHECK_DIM(3, v_merged);
+  CHECK_DIM(2, s_merged);
 
   CHECK_SAME_SHAPE(v_a, v_b);
+  CHECK_SAME_SHAPE(v_a, v_merged);
   CHECK_SAME_SHAPE(s_a, s_b);
+  CHECK_SAME_SHAPE(s_a, s_merged);
   CHECK_EQ(v_a.size(0), s_a.size(0));
-  CHECK_EQ(v_a.size(1), s_b.size(1));
+  CHECK_EQ(v_a.size(1), s_a.size(1));
+
+  TORCH_CHECK(v_a.scalar_type() == v_b.scalar_type(), "v_b dtype must match v_a dtype");
+  TORCH_CHECK(v_a.scalar_type() == v_merged.scalar_type(), "v_merged dtype must match v_a dtype");
+  TORCH_CHECK(s_a.scalar_type() == at::ScalarType::Float, "s_a must be float32");
+  TORCH_CHECK(s_b.scalar_type() == at::ScalarType::Float, "s_b must be float32");
+  TORCH_CHECK(s_merged.scalar_type() == at::ScalarType::Float, "s_merged must be float32");
 
   SYCL_DISPATCH_BY_SCALAR_DTYPE(v_merged.dtype(), CALL_MERGE_STATE_LAUNCHER_SYCL);
 }

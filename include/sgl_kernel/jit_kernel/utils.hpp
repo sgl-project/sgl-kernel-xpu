@@ -180,7 +180,11 @@ inline T ldg(const T* ptr) {
 // Constants
 // ============================================================================
 
-constexpr int kWarpSize = 32;  // Standard sub-group size
+// Sub-group size varies by device and kernel attribute (e.g. 16 or 32).
+// Do not use this constant for lane arithmetic; query at runtime instead:
+//   item.get_sub_group().get_local_range().size()
+// This fallback is provided only for contexts that cannot query a live item.
+constexpr int kWarpSize = 16;  // Conservative default; matches reqd_sub_group_size used by kernels in this repo
 
 }  // namespace sycl
 }  // namespace sgl

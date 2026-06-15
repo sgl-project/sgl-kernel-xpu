@@ -113,9 +113,10 @@ def benchmark(batch_size, head_dim, num_heads, provider):
     # Calculate bandwidth metrics
     # Memory: read q, k, cos_sin_cache and write q, k
     bytes_per_element = q.element_size()
+    cache = cos_sin_cache_jit if provider == "jit" else cos_sin_cache_aot
     total_bytes = (
         batch_size * num_heads * head_dim * bytes_per_element * 4  # read/write q, k
-        + batch_size * head_dim * bytes_per_element  # read cos_sin_cache
+        + batch_size * head_dim * cache.element_size()  # read cos_sin_cache
     )
     bandwidth_gbs = (total_bytes / (ms * 1e-3)) / 1e9
 

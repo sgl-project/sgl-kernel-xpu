@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <cstring>
 #include <sycl/sycl.hpp>
 
 #include "utils.hpp"
@@ -41,11 +42,11 @@ class SharedMemory {
   }
 
   T* data() {
-    return acc_.get_pointer();
+    return acc_.template get_multi_ptr<::sycl::access::decorated::no>().get();
   }
 
   const T* data() const {
-    return acc_.get_pointer();
+    return acc_.template get_multi_ptr<::sycl::access::decorated::no>().get();
   }
 
   constexpr size_t size() const {
@@ -69,7 +70,9 @@ struct VectorizedLoad {
   using vec_t = ::sycl::vec<T, VecSize>;
 
   static vec_t load(const T* ptr) {
-    return *reinterpret_cast<const vec_t*>(ptr);
+    vec_t result;
+    __builtin_memcpy(&result, ptr, sizeof(vec_t));
+    return result;
   }
 };
 
@@ -81,7 +84,7 @@ struct VectorizedStore {
   using vec_t = ::sycl::vec<T, VecSize>;
 
   static void store(T* ptr, const vec_t& value) {
-    *reinterpret_cast<vec_t*>(ptr) = value;
+    __builtin_memcpy(ptr, &value, sizeof(vec_t));
   }
 };
 

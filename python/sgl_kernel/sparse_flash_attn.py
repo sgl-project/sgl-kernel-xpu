@@ -456,9 +456,8 @@ def _sparse_attn_func_torch(
             valid_kv = (bo_exp >= 0) & (bo_exp < Sk)
             valid = valid_j.unsqueeze(-1) & valid_kv  # (B, H, NNZ_S, BN)
 
-            bo_flat = bo_exp.reshape(B, Hq, -1).clamp(0, Sk - 1)
-            valid_flat = valid.reshape(B, Hq, -1)
-            mask.scatter_(-1, bo_flat, valid_flat)
+            vb, vh, _, _ = valid.nonzero(as_tuple=True)
+            mask[vb, vh, bo_exp[valid]] = True
 
         # Vertical columns (vectorized)
         if NNZ_V > 0:

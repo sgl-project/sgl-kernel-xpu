@@ -19,20 +19,9 @@ foreach(file ${device_cpp})
 
 endforeach()
 
-option(BUILD_FMHA "Build FMHA decode/prefill kernels" ON)
-if(BUILD_FMHA)
-    add_compile_definitions(BUILD_FMHA)
-    include(FMHADecodeXe20.cmake)
-    include(FMHAPrefillXe20.cmake)
-else()
-    message(STATUS "Skipping FMHA decode/prefill kernels (BUILD_FMHA=OFF)")
-    # flash_attention.cpp depends on FmhaDecodeRunner symbols instantiated by
-    # FMHADecodeXe20.cmake — exclude it to avoid undefined symbol errors.
-    list(FILTER device_cpp_common EXCLUDE REGEX "flash_attention\\.cpp$")
-endif()
+include(FMHADecodeXe20.cmake)
+include(FMHAPrefillXe20.cmake)
 include(MlaDecodeXe20.cmake)
-# gemm_sqrsum kernels are plain committed TUs (src/sycl/gemm_sqrsum_kernel_*.cpp),
-# picked up by the file(GLOB "sycl/*.cpp") above — no code-gen step needed.
 
 message(STATUS "BMG files: ${device_cpp_xe20}")
 message(STATUS "Common files: ${device_cpp_common}")

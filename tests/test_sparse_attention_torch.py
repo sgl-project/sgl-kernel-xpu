@@ -38,7 +38,7 @@ def _ref_attn(q, k, v, causal=False):
     """
     B, Sq, Hq, D = q.shape
     _, Sk, Hk, _ = k.shape
-    scale = math.sqrt(D)
+    softmax_scale = 1.0 / math.sqrt(D)
     # GQA expansion
     k = repeat(k, "b s h d -> b s (h g) d", g=Hq // Hk)
     v = repeat(v, "b s h d -> b s (h g) d", g=Hq // Hk)
@@ -47,7 +47,7 @@ def _ref_attn(q, k, v, causal=False):
     k_f = k.float().transpose(1, 2)  # (B, H, Sk, D)
     v_f = v.float().transpose(1, 2)
 
-    scores = torch.matmul(q_f, k_f.transpose(-2, -1)) / scale  # (B, H, Sq, Sk)
+    scores = torch.matmul(q_f, k_f.transpose(-2, -1)) * softmax_scale  # (B, H, Sq, Sk)
 
     if causal:
         q_pos = torch.arange(Sq, device=q.device).unsqueeze(1)
@@ -118,13 +118,9 @@ def test_convert_vertical_slash_indexes_torch_zero_init(causal):
         blk_cnt = bc[0, 0, row].item()
         col_cnt = cc[0, 0, row].item()
         if blk_cnt < bo.shape[3]:
-            assert bo[0, 0, row, int(blk_cnt) :].eq(0).all(), (
-                f"Non-zero padding in block_offset at row {row}"
-            )
+            assert bo[0, 0, row, int(blk_cnt) :].eq(0).all(), f"Non-zero padding in block_offset at row {row}"
         if col_cnt < ci.shape[3]:
-            assert ci[0, 0, row, int(col_cnt) :].eq(0).all(), (
-                f"Non-zero padding in column_index at row {row}"
-            )
+            assert ci[0, 0, row, int(col_cnt) :].eq(0).all(), f"Non-zero padding in column_index at row {row}"
 
 
 # ---------------------------------------------------------------------------

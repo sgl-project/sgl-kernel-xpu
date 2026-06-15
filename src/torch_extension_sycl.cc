@@ -20,9 +20,6 @@ limitations under the License.
 #include "sgl_kernel_ops.h"
 #include "sgl_kernel_torch_shim.h"
 
-// Forward declaration for gemm_with_sqrsum
-void gemm_with_sqrsum(at::Tensor& C, at::Tensor& sqrsum, const at::Tensor& A, const at::Tensor& B);
-
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
   m.impl("awq_dequantize", torch::kXPU, &awq_dequantize);

@@ -453,6 +453,11 @@ void hc_pre_big_fuse(
     std::optional<double> norm_eps = std::nullopt);
 
 /*
+ * mhc_pre GEMM + row-wise square sum stage (feeds hc_pre_big_fuse)
+ */
+void gemm_with_sqrsum(at::Tensor& C, at::Tensor& sqrsum, const at::Tensor& A, const at::Tensor& B);
+
+/*
  * From csrc/speculative
  */
 void tree_speculative_sampling_target_only(

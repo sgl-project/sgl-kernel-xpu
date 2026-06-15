@@ -99,7 +99,7 @@ void gemm_with_sqrsum(
   // Single tf32 x tf32 -> fp32 DPAS path. The launcher widens A and B to fp32
   // and reinterprets to tf32 at load, so it covers the production bf16(A) x
   // fp32(B) case and any half/bf16/float input combination uniformly.
-  gemm_sqrsum::launch_gemm_sqrsum_tf32_256x256x16(Cv, sqv, A, B);
+  gemm_sqrsum::launch_gemm_sqrsum(Cv, sqv, A, B);
 }
 
 #undef SYCL_INTEL_TARGET

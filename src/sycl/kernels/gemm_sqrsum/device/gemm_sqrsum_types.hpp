@@ -4,7 +4,11 @@
  **************************************************************************************************/
 /*!
   \file
-  \brief Type definitions and runner for GEMM + Square Sum kernel
+  \brief Type definitions and runner for the GEMM + Square Sum kernel.
+
+  Single concrete configuration: tf32 x tf32 -> fp32 DPAS, tile 64 x 32 x 16.
+  (The kernel was generalized over dtype/tile during bring-up; production is
+  tf32-only, so it is specialized here to the one instantiation that ships.)
 */
 
 #pragma once
@@ -29,67 +33,35 @@
 
 using namespace cute;
 
-//----------------- Element type conversion --------------------//
-template <typename T>
-struct ToCutlassElementType {
-  using type = T;
-};
-
-template <>
-struct ToCutlassElementType<sycl::half> {
-  using type = cutlass::half_t;
-};
-
-template <>
-struct ToCutlassElementType<sycl::ext::oneapi::bfloat16> {
-  using type = cutlass::bfloat16_t;
-};
-
-template <>
-struct ToCutlassElementType<float> {
-  using type = float;
-};
-
-template <>
-struct ToCutlassElementType<cutlass::tfloat32_t> {
-  using type = cutlass::tfloat32_t;
-};
-
-//----------------- Tile size options --------------------//
-template <int TileM_, int TileN_, int TileK_>
-struct TileSizeOption {
-  static constexpr int TileM = TileM_;
-  static constexpr int TileN = TileN_;
-  static constexpr int TileK = TileK_;
-};
-
 //----------------- Kernel configuration --------------------//
-// This creates a specific instantiation of the GEMM+SqrSum kernel
-template <typename Element_, typename TileSizeOpt_>
+// Concrete instantiation of the GEMM+SqrSum kernel: tf32 compute, tile 64x32x16.
 struct GemmSqrSumXe {
-  using Element = typename ToCutlassElementType<Element_>::type;
-  using TileSizeOpt = TileSizeOpt_;
+  // MMA compute type. The production path is bf16(A) x fp32(B) -> fp32: A is
+  // widened to fp32 and B taken as-is, then both reinterpreted to tf32 (raw fp32
+  // bits; the DPAS unit truncates the mantissa at load — ~10 bits kept vs bf16's
+  // 7). This is the "proper" mixed-precision path; the bf16-downcast path
+  // (HcPreGemm-style) lost too much precision on B.
+  using Element = cutlass::tfloat32_t;
 
-  // Define tile shape
-  using TileShape = Shape<Int<TileSizeOpt::TileM>, Int<TileSizeOpt::TileN>, Int<TileSizeOpt::TileK>>;
+  // Tile shape (M, N, K) = (64, 32, 16).
+  //   TileM=64 = 8(atom M) * 8(SG_M) * 1 iter. Small M-tile => more workgroups
+  //     (grid_m = ceil(M/64)) to fill the GPU, since N=24 gives grid_n=1 and all
+  //     parallelism must come from grid_m. Also keeps the fp32 accumulator small
+  //     (no register spill).
+  //   TileN=32 = 16(atom N) * 2(SG_N) * 1 iter, masked to the production N=24.
+  //   TileK=16 = the DPAS K depth for tf32 (256 / sizeof_bits).
+  using TileShape = Shape<Int<64>, Int<32>, Int<16>>;
 
-  // MMA Atom: XE DPAS operation
-  // XE_DPAS_TT<M, AccumType, InputType>
-  //   M = 8 (DPAS atom size in M dimension)
-  //   AccumType = float (accumulator precision)
-  //   InputType = Element (input type: half/bfloat16/float)
+  // MMA Atom: XE DPAS, XE_DPAS_TT<atom_M=8, AccumType=float, InputType=tf32>.
   using MMAOperation = XE_DPAS_TT<8, float, Element>;
   using MmaAtom = MMA_Atom<MMAOperation>;
 
   // Subgroup layout (M x N x 1). MUST satisfy TileN == 16 * SG_N * iters and
   // TileM == 8 * SG_M * iters (the DPAS atom is Shape_MNK = <8, 16, K>, so N is
-  // hardwired to 16 per atom). For the production N=24 case we use a TileN=32
-  // tile (mask to 24), which needs SG_N = 2 (16*2 = 32, one N-iteration). An
-  // 8x2 layout = 16 subgroups => 16 * sg_size(16) = 256 work-items/WG, which is
-  // what get_block_shape() launches. N-major stride <SG_N,1,0> = <2,1,0>.
-  // KEEP IN SYNC with the TileSizeOption passed from the launcher: 8x2 pairs
-  // with TileN=32. (The old 8x4 + TileN=256 wasted ~90% of the GEMM on N=24 and
-  // spilled registers from the oversized 256x256 fp32 accumulator.)
+  // hardwired to 16 per atom). For TileN=32 we need SG_N = 2 (16*2 = 32, one
+  // N-iteration). An 8x2 layout = 16 subgroups => 16 * sg_size(16) = 256
+  // work-items/WG, which is what get_block_shape() launches. N-major stride
+  // <SG_N,1,0> = <2,1,0>. KEEP IN SYNC with TileShape: 8x2 pairs with TileN=32.
   using SubgroupLayout = Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>;
 
   // TiledMMA: tiles MMA atoms across subgroups
@@ -130,23 +102,14 @@ struct GemmSqrSumXe {
 //   B      : [N, K]  (fn = [24, 16384]); fp32 — passed as genuine [N,K] row-major
 //   C      : [M, N]  fp32  (== gemm_out_mul)
 //   sqrsum : [M]     fp32  (== gemm_out_sqrsum), sqrsum[m] = sum_k A[m,k]^2
-//
-// Element is the MMA compute type. For the production path Element ==
-// cutlass::tfloat32_t: A is widened to fp32 and B (already fp32) is taken as-is,
-// then both are bit-reinterpreted to tf32 (tfloat32_t stores raw fp32 bits; the
-// DPAS unit truncates the mantissa at load — ~10 bits kept vs bf16's 7). This is
-// the "proper" mixed-precision path; the bf16-downcast path (HcPreGemm-style)
-// lost too much precision on B.
-template <typename Element, typename TileSizeOpt>
-inline void runGemmSqrSumImpl(
+inline void runGemmSqrSum(
     at::Tensor& C,           // Output: [M, N] fp32
     at::Tensor& sqrsum,      // Output: [M] fp32
     const at::Tensor& A,     // Input: [M, K]
     const at::Tensor& B) {   // Input: [N, K]
 
-  // Get CUTLASS element type
-  using CutlassElement = typename ToCutlassElementType<Element>::type;
-  constexpr bool kIsTf32 = std::is_same_v<CutlassElement, cutlass::tfloat32_t>;
+  using Kernel = typename GemmSqrSumXe::Kernel;
+  using Runner = cutlass::gemm_sqrsum::device::GemmSqrSum<Kernel>;
 
   // Get dimensions. B is [N, K] (NOT [K, N]).
   int M = A.size(0);
@@ -165,22 +128,12 @@ inline void runGemmSqrSumImpl(
   C.zero_();
   sqrsum.zero_();
 
-  // Prepare A/B in the kernel's storage type. tfloat32_t is bit-compatible with
-  // float (alignas(4){uint32_t}), so an fp32 buffer reinterprets to tf32 with no
-  // copy. A is widened from bf16/fp16; B (fp32) is taken contiguous as-is.
-  at::Tensor A_buf, B_buf;
-  if constexpr (kIsTf32) {
-    A_buf = A.scalar_type() == at::kFloat ? A.contiguous() : A.to(at::kFloat);
-    B_buf = B.scalar_type() == at::kFloat ? B.contiguous() : B.to(at::kFloat);
-  } else {
-    A_buf = A.contiguous();
-    B_buf = B.contiguous();
-  }
-
-  // Get kernel configuration
-  using KernelConfig = GemmSqrSumXe<Element, TileSizeOpt>;
-  using Kernel = typename KernelConfig::Kernel;
-  using Runner = cutlass::gemm_sqrsum::device::GemmSqrSum<Kernel>;
+  // Prepare A/B as fp32, then reinterpret to tf32 at load. tfloat32_t is
+  // bit-compatible with float (alignas(4){uint32_t}), so an fp32 buffer
+  // reinterprets to tf32 with no copy. A is widened from bf16/fp16; B (fp32) is
+  // taken contiguous as-is.
+  at::Tensor A_buf = A.scalar_type() == at::kFloat ? A.contiguous() : A.to(at::kFloat);
+  at::Tensor B_buf = B.scalar_type() == at::kFloat ? B.contiguous() : B.to(at::kFloat);
 
   // ---- Split-K factor (mhc_pre reference: _compute_num_split_for_mhc_pre) ----
   // Partition the K reduction into `split_k` workgroup slices when the M/N grid
@@ -203,18 +156,18 @@ inline void runGemmSqrSumImpl(
   args.split_k = split_k;
 
   // Fetch raw pointers via the untyped data_ptr() (returns void*) and reinterpret.
-  // Using data_ptr<Element>() would require a PyTorch data_ptr specialization for
-  // the kernel element type; tfloat32_t/bfloat16 have none, so the typed form
-  // leaves an undefined symbol at link time. The untyped form sidesteps that.
+  // Using data_ptr<tfloat32_t>() would require a PyTorch data_ptr specialization
+  // for tfloat32_t (there is none), leaving an undefined symbol at link time.
+  // The untyped form sidesteps that.
 
   // Input A: [M, K] - row-major (K contiguous)
-  args.ptr_A = reinterpret_cast<CutlassElement const*>(A_buf.data_ptr());
+  args.ptr_A = reinterpret_cast<GemmSqrSumXe::Element const*>(A_buf.data_ptr());
   args.stride_A_m = K;  // M-row stride
   args.stride_A_k = 1;  // K stride (contiguous)
 
   // Input B: [N, K] - row-major (K contiguous). stride_B_k carries the N-row
   // stride (== K); layout_B is make_stride(stride_B_k, 1) over shape (N,K).
-  args.ptr_B = reinterpret_cast<CutlassElement const*>(B_buf.data_ptr());
+  args.ptr_B = reinterpret_cast<GemmSqrSumXe::Element const*>(B_buf.data_ptr());
   args.stride_B_k = K;  // N-row stride
   args.stride_B_n = 1;  // K stride (contiguous)
 
@@ -248,7 +201,7 @@ inline void runGemmSqrSumImpl(
   args.stride_sqsc_n = 1;
 
   // Mainloop arguments (empty for now)
-  args.mainloop = typename KernelConfig::CollectiveMainloop::Arguments{};
+  args.mainloop = typename GemmSqrSumXe::CollectiveMainloop::Arguments{};
 
   // Launch kernel
   Runner runner;
@@ -270,14 +223,4 @@ inline void runGemmSqrSumImpl(
   // sqsc is [split_k, M, N]; reduce splits then slice column 0. For split_k==1
   // this is a no-op squeeze of the leading dim.
   sqrsum.copy_(sqsc.sum(/*dim=*/0).select(/*dim=*/1, /*index=*/0));
-}
-
-template <typename Element, typename TileSizeOpt>
-inline void runGemmSqrSum(
-    at::Tensor& C,
-    at::Tensor& sqrsum,
-    const at::Tensor& A,
-    const at::Tensor& B) {
-
-  runGemmSqrSumImpl<Element, TileSizeOpt>(C, sqrsum, A, B);
 }

@@ -55,7 +55,9 @@ def _mhc_pre_torch(residual, fn, hc_scale, hc_base, norm_weight):
     )
 
 
-@pytest.mark.parametrize("T", [16, 48, 128, 512, 896, 1021, 1024, 1034, 1038, 1518, 2048])
+@pytest.mark.parametrize(
+    "T", [16, 48, 128, 512, 896, 1021, 1024, 1034, 1038, 1518, 2048]
+)
 @pytest.mark.parametrize("with_norm", [True, False])
 def test_mhc_pre(T, with_norm):
     """Full mhc_pre pipeline vs pure-torch reference, production shapes."""

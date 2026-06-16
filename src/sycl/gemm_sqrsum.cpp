@@ -7,7 +7,7 @@
 #include <sycl/sycl.hpp>
 
 #include "Utils.h"
-#include "sycl/kernels/gemm_sqrsum/device/gemm_sqrsum_dispatch.hpp"
+#include "sycl/kernels/gemm_sqrsum/device/gemm_sqrsum_types.hpp"
 
 void gemm_with_sqrsum(at::Tensor& C, at::Tensor& sqrsum, const at::Tensor& A, const at::Tensor& B) {
   c10::DeviceGuard guard(A.device());
@@ -43,7 +43,7 @@ void gemm_with_sqrsum(at::Tensor& C, at::Tensor& sqrsum, const at::Tensor& A, co
       M,
       "] matching C's leading dim");
 
-  gemm_sqrsum::launch_gemm_sqrsum(C, sqrsum, A, B);
+  runGemmSqrSum(C, sqrsum, A, B);
 }
 
 #undef SYCL_INTEL_TARGET

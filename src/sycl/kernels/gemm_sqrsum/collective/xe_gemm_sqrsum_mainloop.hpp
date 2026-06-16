@@ -169,13 +169,7 @@ struct XeGemmSqrSumMainloop<XeDefault<Stages>, TiledMMA_, TensorA_, TensorB_, Ti
       constexpr int n_b_split = decltype(size(tCrB.tensor()))::value;
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < n_b_split; i++) {
-        // tCrB(i) is a tfloat32_t whose 32-bit storage still holds the ORIGINAL
-        // fp32 bit pattern (B was loaded as fp32 and reinterpreted). Read the raw
-        // bits as fp32 -- NOT via operator float(), which masks the low 13 bits and
-        // would make b_lo identically zero (a no-op second pass).
-        uint32_t raw = tCrB(i).raw();
-        float b;
-        memcpy(&b, &raw, sizeof(b));
+        float b = cutlass::platform::bit_cast<float>(tCrB(i).raw());
         float b_hi = static_cast<float>(static_cast<ElementMMA>(b));
         tCrB(i) = static_cast<ElementMMA>(b_hi);
         tCrBlo(i) = static_cast<ElementMMA>(b - b_hi);

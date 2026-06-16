@@ -5,6 +5,7 @@ from sgl_kernel import gemm_sqrsum
 
 device = utils.get_device()
 
+
 def _gemm_sqrsum_torch(A: torch.Tensor, B: torch.Tensor):
     C = A @ B.t()
     sqrsum_ref = (A * A).sum(dim=1)
@@ -20,8 +21,11 @@ def _make_inputs(M, K, N, n_splits, a_dtype, b_dtype, device, seed=42):
     return A, B, C, sqrsum
 
 
-@pytest.mark.parametrize("M", [16, 48, 128, 512, 896, 1021, 1024, 1034, 1038, 1518, 2048])
+@pytest.mark.parametrize(
+    "M", [16, 48, 128, 512, 896, 1021, 1024, 1034, 1038, 1518, 2048]
+)
 def test_gemm_sqrsum_production(M):
+    torch.manual_seed(42)
     N = 24
     K = 16384
     n_splits = 32 if M <= 2048 else 1

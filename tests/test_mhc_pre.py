@@ -43,9 +43,9 @@ def _make_inputs(T, D, device, seed=42):
     # RMSNorm weights in practice cluster near 1 (they scale a normalized signal),
     # not centered at 0 with unit variance. A randn*0.5+1 weight is both realistic
     # and avoids adversarially amplifying the tf32 GEMM error in layer_input.
-    norm_weight = (
-        torch.randn(D, dtype=torch.float32, device=device) * 0.5 + 1.0
-    ).to(torch.bfloat16)
+    norm_weight = (torch.randn(D, dtype=torch.float32, device=device) * 0.5 + 1.0).to(
+        torch.bfloat16
+    )
     return residual, fn, hc_scale, hc_base, norm_weight
 
 

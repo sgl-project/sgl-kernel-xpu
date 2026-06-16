@@ -218,9 +218,9 @@ def mhc_pre(
     hc_hidden = hc_mult * hidden_size
     hc_mult3 = (2 + hc_mult) * hc_mult
 
-    assert fn.size(0) == hc_mult3 and fn.size(1) == hc_hidden, (
-        f"fn must be [{hc_mult3}, {hc_hidden}], got {tuple(fn.shape)}"
-    )
+    assert (
+        fn.size(0) == hc_mult3 and fn.size(1) == hc_hidden
+    ), f"fn must be [{hc_mult3}, {hc_hidden}], got {tuple(fn.shape)}"
 
     # The two non-prenorm paths carry no outer split (the reference asserts
     # n_splits == 1); the real K-split is n_splits_pre.

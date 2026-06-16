@@ -20,6 +20,7 @@ N = hc_mult3  # 24
 def _n_splits_pre(M):
     return 32 if M <= 2048 else 1
 
+
 configs = [
     # (M, K, N)  -- same token sweep as bench_hc_pre_fuse.py (incl. ragged M)
     (128, K, N),
@@ -53,16 +54,14 @@ all_results = []
 )
 def benchmark(M, K, N, provider):
     print(f"benchmark {provider} with M={M} K={K} N={N}")
+    torch.manual_seed(42)
     torch.set_default_device("xpu")
-    torch.xpu.manual_seed_all(42)
 
     n_splits = _n_splits_pre(M)
 
-    # Inputs: A bf16 [M,K], B fp32 [N,K]  (B = fn, the [N,K] weight matrix)
     A = torch.randn(M, K, dtype=torch.bfloat16, device="xpu")
     B = torch.randn(N, K, dtype=torch.float32, device="xpu")
 
-    # Outputs: K-split partials. C fp32 [n_splits,M,N], sqrsum fp32 [n_splits,M].
     C = torch.empty(n_splits, M, N, dtype=torch.float32, device="xpu")
     sqrsum = torch.empty(n_splits, M, dtype=torch.float32, device="xpu")
 
@@ -78,14 +77,10 @@ def benchmark(M, K, N, provider):
 
     torch.xpu.empty_cache()
 
-    # Useful work: GEMM (2*M*N*K) + row square-sum (2*M*K: square + accumulate).
+    # GEMM (2*M*N*K) + row square-sum (2*M*K: square + accumulate).
     flops = 2.0 * M * N * K + 2.0 * M * K
     tflops = flops / (ms / 1e3) / 1e12
 
-    # Logical I/O (the kernel also widens A->fp32 and uses an [n_splits,M,N] fp32
-    # scratch for the square-sum internally; those are not counted here, matching
-    # the convention of reporting the problem's intrinsic traffic). The partial
-    # writes are n_splits deep (each K-slice writes its own [M,N] / [M] slab).
     read_bytes = M * K * 2 + N * K * 4  # A (bf16) + B (fp32)
     write_bytes = n_splits * M * N * 4 + n_splits * M * 4  # C + sqrsum partials (fp32)
     total_bytes = read_bytes + write_bytes
@@ -118,7 +113,6 @@ if __name__ == "__main__":
     print(df.to_markdown(index=False))
     print("\n")
 
-    # Summary statistics
     print("Summary Statistics:")
     print(f"  Mean throughput: {df['Mtok_per_sec'].mean():.2f} Mtok/s")
     print(f"  Mean compute:    {df['TFLOP_per_sec'].mean():.3f} TFLOP/s")

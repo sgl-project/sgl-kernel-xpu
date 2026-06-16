@@ -1,15 +1,7 @@
-/***************************************************************************************************
- * Copyright (C) 2026 Intel Corporation, All rights reserved.
- * SPDX-License-Identifier: BSD-3-Clause
- **************************************************************************************************/
-/*!
-  \file
-  \brief Device runner for GEMM + Square Sum kernel
-*/
-
 #pragma once
 
 #include <c10/xpu/XPUStream.h>
+
 #include <sycl/sycl.hpp>
 
 #include "cutlass/cutlass.h"
@@ -45,10 +37,7 @@ class GemmSqrSum {
   }
 
   cutlass::Status initialize(
-      Arguments const& args,
-      void* workspace = nullptr,
-      sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
-
+      Arguments const& args, void* workspace = nullptr, sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
     params_ = Kernel::to_underlying_arguments(args, workspace);
     initialized_ = true;
     return cutlass::Status::kSuccess;
@@ -58,17 +47,13 @@ class GemmSqrSum {
     return initialize(args, workspace);
   }
 
-  static cutlass::Status run(
-      Params& params,
-      sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
+  static cutlass::Status run(Params& params, sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
     launch<Kernel, 256>(params);
     return cutlass::Status::kSuccess;
   }
 
-  cutlass::Status run(
-      Arguments const& args,
-      void* workspace = nullptr,
-      sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
+  cutlass::Status
+  run(Arguments const& args, void* workspace = nullptr, sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
     cutlass::Status status = initialize(args, workspace, queue);
     if (cutlass::Status::kSuccess == status) {
       status = run(params_, queue);
@@ -77,9 +62,7 @@ class GemmSqrSum {
   }
 
   cutlass::Status operator()(
-      Arguments const& args,
-      void* workspace = nullptr,
-      sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
+      Arguments const& args, void* workspace = nullptr, sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
     return run(args, workspace, queue);
   }
 

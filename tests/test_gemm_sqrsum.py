@@ -43,13 +43,11 @@ def test_gemm_sqrsum_production(M):
     C_xpu_fused = C_xpu.cpu().sum(dim=0)  # [n_splits, M, N] -> [M, N]
     sqrsum_xpu_fused = sqrsum_xpu.cpu().sum(dim=0)  # [n_splits, M] -> [M]
 
-    # tf32 keeps ~10 mantissa bits; over a K-deep accumulation the absolute error grows ~ 2^-10 * sqrt(K)
-    atol = 2e-2 * max(1, K) ** 0.5
-    assert torch.allclose(C_xpu_fused, C_ref, atol=atol, rtol=2e-2), (
+    assert torch.allclose(C_xpu_fused, C_ref, atol=2e-4, rtol=2e-4), (
         f"C mismatch: max={(C_xpu_fused - C_ref).abs().max():.3e} "
         f"(M={M} K={K} N={N} n_splits={n_splits})"
     )
-    assert torch.allclose(sqrsum_xpu_fused, sqrsum_ref, atol=atol, rtol=2e-2), (
+    assert torch.allclose(sqrsum_xpu_fused, sqrsum_ref, atol=2e-4, rtol=2e-4), (
         f"sqrsum mismatch: max={(sqrsum_xpu_fused - sqrsum_ref).abs().max():.3e} "
         f"(M={M} K={K} N={N} n_splits={n_splits})"
     )

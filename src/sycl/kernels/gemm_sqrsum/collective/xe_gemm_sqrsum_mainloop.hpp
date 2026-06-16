@@ -124,6 +124,12 @@ struct XeGemmSqrSumMainloop<XeDefault<Stages>, TiledMMA_, TensorA_, TensorB_, Ti
     auto tCrAsq = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
     auto tCrBones = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
 
+    // Low-order part of B for the 2-pass tf32 split. B is loaded as full fp32 and
+    // reinterpreted as tf32, so tCrB(i) carries all 23 mantissa bits in storage but
+    // the MMA only consumes the top 10 (b_hi). tCrBlo captures the discarded
+    // remainder (b - b_hi), itself rounded to tf32, recovering ~10 more bits.
+    auto tCrBlo = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
+
     auto prefetch_a = make_block_2d_prefetch(copy_a);
     auto prefetch_b = make_block_2d_prefetch(copy_b);
     auto pAgA = prefetch_a.get_slice(thr_id).partition_S(gA);
@@ -154,7 +160,29 @@ struct XeGemmSqrSumMainloop<XeDefault<Stages>, TiledMMA_, TensorA_, TensorB_, Ti
       reorder(tArA, tCrA);
       reorder(tBrB, tCrB);
 
+      // 2-pass tf32 split of B: tCrB holds full fp32 bits, but a single tf32 MMA
+      // truncates to ~10 mantissa bits. Split each element into b_hi (top tf32) and
+      // b_lo (remainder as tf32), then accumulate A*b_hi + A*b_lo into the same fp32
+      // accumulator -> ~20 effective mantissa bits, near-exact vs the fp32 reference.
+      // A is bf16 (<=7 mantissa bits), so it fits losslessly in a single tf32 and
+      // needs no split.
+      constexpr int n_b_split = decltype(size(tCrB.tensor()))::value;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < n_b_split; i++) {
+        // tCrB(i) is a tfloat32_t whose 32-bit storage still holds the ORIGINAL
+        // fp32 bit pattern (B was loaded as fp32 and reinterpreted). Read the raw
+        // bits as fp32 -- NOT via operator float(), which masks the low 13 bits and
+        // would make b_lo identically zero (a no-op second pass).
+        uint32_t raw = tCrB(i).raw();
+        float b;
+        memcpy(&b, &raw, sizeof(b));
+        float b_hi = static_cast<float>(static_cast<ElementMMA>(b));
+        tCrB(i) = static_cast<ElementMMA>(b_hi);
+        tCrBlo(i) = static_cast<ElementMMA>(b - b_hi);
+      }
+
       cute::gemm(mma, tCrA, tCrB, tC);
+      cute::gemm(mma, tCrA, tCrBlo, tC);
 
       constexpr int n_a = decltype(size(tCrAsq.tensor()))::value;
       CUTLASS_PRAGMA_UNROLL

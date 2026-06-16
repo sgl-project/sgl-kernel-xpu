@@ -41,7 +41,13 @@ def fused_topk_sigmoid_torch_native(
     return topk_weights, topk_ids
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+# float32 covers the fp32 gating-logits path: some models (e.g.
+# Nemotron-3-Nano MoE) emit float32 router logits. Before the kernel dispatch
+# was widened from AT_DISPATCH_REDUCED_FLOATING_TYPES to also cover Float, this
+# call raised "not implemented for 'Float'". The kernel upcasts to float
+# internally, so fp32 in must match the float reference within the same
+# tolerance as the reduced-float path.
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("n_token", [2, 32, 4096])
 @pytest.mark.parametrize("n_expert", [8, 32, 256])
 @pytest.mark.parametrize("n_topk", [1, 2, 4])

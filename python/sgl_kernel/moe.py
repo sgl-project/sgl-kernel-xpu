@@ -271,6 +271,7 @@ def fused_experts(
     inplace: bool = False,
     activation: str = "silu",
     use_fp8_w8a8: bool = False,
+    use_mxfp4_w4a16: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     w1_zp: Optional[torch.Tensor] = None,
@@ -282,6 +283,7 @@ def fused_experts(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
+    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -299,6 +301,13 @@ def fused_experts(
     - activation (str): The activation function to use ('silu' or 'gelu'). Defaults to 'silu'.
     - use_fp8_w8a8 (bool): If True, use fp8 arithmetic to compute the inner
         products for w1 and w2. Defaults to False.
+    - use_mxfp4_w4a16 (bool): If True, w1 and w2 are in MXFP4 packed format
+        (int8, two E2M1 nibbles per byte) with corresponding float32 block
+        scales (direct multiplier) supplied via w1_scale and w2_scale.
+        Routes through moe_grouped_mm_nt_xe20_mxfp4_w4a16, which
+        dequantizes B per-tile in registers and feeds BF16 × BF16 DPAS —
+        no BF16 weight tensor is ever materialized on device. Activations
+        stay in BF16 (W4A16). Defaults to False.
     - w1_scale (Optional[torch.Tensor]): Optional scale to be used for
         w1.
     - w2_scale (Optional[torch.Tensor]): Optional scale to be used for
@@ -315,14 +324,14 @@ def fused_experts(
         function.
     - gemm1_limit (Optional[float]): Optional gemm1_limit for the swiglu activation
         function.
+    - swiglu_limit (Optional[float]): Optional swiglu_limit for the swiglu activation
+        function.
 
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
 
     assert use_fp8_w8a8 is False, "current MoE does not support use_fp8_w8a8"
-    assert w1_scale is None, "current MoE does not support w1_scale"
-    assert w2_scale is None, "current MoE does not support w2_scale"
     assert a1_scale is None, "current MoE does not support a1_scale"
     assert a2_scale is None, "current MoE does not support a2_scale"
     assert block_shape is None, "current MoE does not support block_shape"
@@ -332,10 +341,32 @@ def fused_experts(
         "relu2",
     ), f"Only silu, gelu and relu2 are supported but got {activation}"
 
+    # For MXFP4 W4A16: validate packed int8 inputs and float32 scales.
+    # Scales must be None on all non-mxfp4 code paths.
+    if use_mxfp4_w4a16:
+        assert (
+            w1.dtype == torch.int8
+        ), "use_mxfp4_w4a16=True requires w1 to be int8 (packed MXFP4)"
+        assert (
+            w2.dtype == torch.int8
+        ), "use_mxfp4_w4a16=True requires w2 to be int8 (packed MXFP4)"
+        assert (
+            w1_scale is not None
+        ), "w1_scale (float32) must be provided when use_mxfp4_w4a16=True"
+        assert (
+            w2_scale is not None
+        ), "w2_scale (float32) must be provided when use_mxfp4_w4a16=True"
+        assert w1_scale.dtype == torch.float32, "w1_scale must be float32"
+        assert w2_scale.dtype == torch.float32, "w2_scale must be float32"
+    else:
+        assert w1_scale is None, "w1_scale is only supported when use_mxfp4_w4a16=True"
+        assert w2_scale is None, "w2_scale is only supported when use_mxfp4_w4a16=True"
+
     # type check
     assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
-    assert w1.dtype == torch.bfloat16, "w1 must be bfloat16"
-    assert w2.dtype == torch.bfloat16, "w2 must be bfloat16"
+    if not use_mxfp4_w4a16:
+        assert w1.dtype == torch.bfloat16, "w1 must be bfloat16"
+        assert w2.dtype == torch.bfloat16, "w2 must be bfloat16"
     if b1 is not None:
         assert (
             b1.dtype == torch.bfloat16 or b1.dtype == torch.float32
@@ -351,13 +382,17 @@ def fused_experts(
             # cast b2 to float32, since bias is accumulated in float32 in the kernel
             b2 = b2.float()
     # Shape check
+    # For packed MXFP4 the last dim of w1/w2 is halved (2 FP4 values per byte),
+    # so compute the actual (unpacked) inner dimensions for validation.
+    _w1_inner = w1.shape[-1] * 2 if use_mxfp4_w4a16 else w1.shape[-1]
+    _w2_inner = w2.shape[-1] * 2 if use_mxfp4_w4a16 else w2.shape[-1]
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
     assert (
-        hidden_states.shape[-1] == w1.shape[-1]
-    ), f"hidden_states shape[-1] {hidden_states.shape} must be equal to w1 shape[-2] {w1.shape}"
-    assert (2 * w2.shape[2] == w1.shape[1]) or (
-        (w2.shape[2] == w1.shape[1]) and (activation == "relu2")
-    ), f"w2 shape[2] {w2.shape[2]} must be half of w1 shape[1] {w1.shape[1]} except non-gate"
+        hidden_states.shape[-1] == _w1_inner
+    ), f"hidden_states shape[-1] {hidden_states.shape} must equal w1 inner dim {_w1_inner} (w1.shape={w1.shape})"
+    assert (2 * _w2_inner == w1.shape[1]) or (
+        (_w2_inner == w1.shape[1]) and (activation == "relu2")
+    ), f"w2 inner dim {_w2_inner} must be half of w1 shape[1] {w1.shape[1]} except non-gate"
     assert (topk_ids.shape == topk_weights.shape) and (
         topk_ids.shape[0] == hidden_states.shape[0]
     ), f"topk_ids shape {topk_ids.shape} and topk_weights shape {topk_weights.shape} must be equal and match hidden_states shape[0] {hidden_states.shape[0]}"
@@ -366,9 +401,10 @@ def fused_experts(
 
     E, _, K = w1.shape
     E, OutK, N = w2.shape
-    assert (N * 2 == w1.shape[1]) or (
-        N == w1.shape[1]
-    ), "w1 shape[1] must be 1x or 2x of w2 shape[2]"
+    if use_mxfp4_w4a16:
+        # w1/w2 last dims are packed (H//2, I//2); recover actual dims
+        K = K * 2
+        N = N * 2
     if b1 is not None:
         assert b1.shape == w1.shape[:2], "b1 shape must match w1 shape[:2]"
     if b2 is not None:
@@ -425,7 +461,8 @@ def fused_experts(
         (M * TopK, OutK), device=hidden_states.device, dtype=hidden_states.dtype
     )
 
-    # 0=silu, 1=gelu, 2=swiglu (silu with alpha/limit clamping for gpt-oss), 3=relu2
+    # 0=silu, 1=gelu, 2=swiglu (silu with alpha/limit clamping for gpt-oss),
+    # 3=relu2, 4=swiglu_deepseek_v4 (clamp gate/up then plain silu * up).
     if activation == "silu":
         activation_type = 0
         if gemm1_alpha is not None:
@@ -434,6 +471,22 @@ def fused_experts(
             ), "gemm1_limit must be provided when gemm1_alpha is set for swiglu for GPT-OSS"
             activation_type = 2
             activation = "swiglu_gpt_oss"
+        elif swiglu_limit is not None:
+            assert swiglu_limit == 10
+            # The fused swiglu_deepseek_v4 epilogue (activation_type=4) is only
+            # AOT-instantiated for the MXFP4 W4A16 grouped GEMM. The bf16
+            # grouped GEMM caps activation_type at RELU2 (3); routing 4 there
+            # would trip its dispatcher range check.
+            assert (
+                use_mxfp4_w4a16
+            ), "swiglu_limit (swiglu_deepseek_v4) is only supported with use_mxfp4_w4a16=True"
+            activation_type = 4
+            activation = "swiglu_deepseek_v4"
+            # The kernel ABI carries the clamp threshold in gemm1_limit (the
+            # only limit slot). The fused epilogue
+            # apply_fused_activation<SWIGLU_DEEPSEEK_V4> reads it from there;
+            # gemm1_alpha is unused for this activation.
+            gemm1_limit = float(swiglu_limit)
     elif activation == "gelu":
         activation_type = 1
     elif activation == "relu2":
@@ -443,11 +496,19 @@ def fused_experts(
 
     assert is_xe2_arch(), f"Current MoE is only supported on BMG"
 
-    gate_factor = 2 if (2 * w2.shape[2] == w1.shape[1]) else 1
+    # Gated activations (silu/gelu/swiglu) split w1's output into gate+up, so
+    # w1.shape[1] == 2*N; non-gated relu2 has w1.shape[1] == N. Compare against
+    # the recovered (unpacked) N — w2.shape[2] is the packed I/2 under MXFP4,
+    # which would mis-detect the gated case as non-gated (gate_factor=1).
+    gate_factor = 2 if (2 * N == w1.shape[1]) else 1
 
-    # heuristic for choosing fused or unfused act, can be tuned
+    # Heuristic for choosing fused vs unfused activation. The K*N threshold
+    # mirrors the small-weight cutoff in the C++ grouped-GEMM dispatchers
+    # (MOE_GROUPED_GEMM_SMALL_WEIGHT_THRESHOLD in src/sycl/Utils.h). Keep
+    # the two in sync if either side is re-tuned.
+    _MOE_GROUPED_GEMM_SMALL_WEIGHT_THRESHOLD = 4096 * 4096
     avg_m = (M * TopK) // E
-    big_weight = K * N > 4096 * 4096
+    big_weight = K * N > _MOE_GROUPED_GEMM_SMALL_WEIGHT_THRESHOLD
     use_unfused_act = avg_m <= 128 and big_weight
     if use_unfused_act:
         intermediate_cache1 = torch.empty(
@@ -458,19 +519,45 @@ def fused_experts(
         intermediate_cache2 = torch.empty(
             (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
         )
-        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
-            intermediate_cache1,
-            input_A_shuffle,
-            w1,
-            b1,
-            expert_offsets,
-            E,
-            activation_type,
-            fuse_act=False,
-            gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
-            gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
-        )
-        if activation_type == 0:
+        # GEMM1: B = w1 (gate+up).
+        if use_mxfp4_w4a16:
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4_w4a16(
+                intermediate_cache1,
+                input_A_shuffle,
+                w1,
+                w1_scale,
+                b1,
+                expert_offsets,
+                E,
+                activation_type,
+                False,  # fuse_act
+                float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                float(gemm1_limit) if gemm1_limit is not None else 7.0,
+            )
+        else:
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+                intermediate_cache1,
+                input_A_shuffle,
+                w1,
+                b1,
+                expert_offsets,
+                E,
+                activation_type,
+                fuse_act=False,
+                gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
+            )
+        if activation_type in (0, 4):
+            if activation_type == 4:
+                # DeepSeek-V4 swiglu clamp, applied here on the raw gate+up
+                # projection because the unfused GEMM1 wrote it out without
+                # activation. The fused path does the same clamp in-kernel
+                # (apply_fused_activation<SWIGLU_DEEPSEEK_V4>).
+                half = w1.shape[1] // 2
+                intermediate_cache1[:, :half].clamp_(max=swiglu_limit)
+                intermediate_cache1[:, half:].clamp_(
+                    min=-swiglu_limit, max=swiglu_limit
+                )
             torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
         elif activation_type == 1:
             torch.ops.sgl_kernel.gelu_tanh_and_mul(
@@ -482,46 +569,94 @@ def fused_experts(
             )
         elif activation_type == 3:
             intermediate_cache2 = torch.square(torch.relu(intermediate_cache1))
-        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
-            intermediate_cache3,
-            intermediate_cache2,
-            w2,
-            b2,
-            expert_offsets,
-            E,
-            activation_type,
-            fuse_act=False,
-            gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
-            gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
-        )
+        # GEMM2: B = w2 (down).
+        if use_mxfp4_w4a16:
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4_w4a16(
+                intermediate_cache3,
+                intermediate_cache2,
+                w2,
+                w2_scale,
+                b2,
+                expert_offsets,
+                E,
+                activation_type,
+                False,  # fuse_act
+                float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                float(gemm1_limit) if gemm1_limit is not None else 7.0,
+            )
+        else:
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+                intermediate_cache3,
+                intermediate_cache2,
+                w2,
+                b2,
+                expert_offsets,
+                E,
+                activation_type,
+                fuse_act=False,
+                gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
+            )
     else:
         intermediate_cache1 = torch.empty(
             (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
         )
-        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
-            intermediate_cache1,
-            input_A_shuffle,
-            w1,
-            b1,
-            expert_offsets,
-            E,
-            activation_type,
-            fuse_act=True,
-            gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
-            gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
-        )
-        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
-            intermediate_cache3,
-            intermediate_cache1,
-            w2,
-            b2,
-            expert_offsets,
-            E,
-            activation_type,
-            fuse_act=False,
-            gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
-            gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
-        )
+        # GEMM1 (fused act): B = w1 (gate+up).
+        if use_mxfp4_w4a16:
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4_w4a16(
+                intermediate_cache1,
+                input_A_shuffle,
+                w1,
+                w1_scale,
+                b1,
+                expert_offsets,
+                E,
+                activation_type,
+                True,  # fuse_act
+                float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                float(gemm1_limit) if gemm1_limit is not None else 7.0,
+            )
+        else:
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+                intermediate_cache1,
+                input_A_shuffle,
+                w1,
+                b1,
+                expert_offsets,
+                E,
+                activation_type,
+                fuse_act=True,
+                gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
+            )
+        # GEMM2: B = w2 (down). Always fuse_act=False on the second GEMM.
+        if use_mxfp4_w4a16:
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp4_w4a16(
+                intermediate_cache3,
+                intermediate_cache1,
+                w2,
+                w2_scale,
+                b2,
+                expert_offsets,
+                E,
+                activation_type,
+                False,  # fuse_act
+                float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                float(gemm1_limit) if gemm1_limit is not None else 7.0,
+            )
+        else:
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+                intermediate_cache3,
+                intermediate_cache1,
+                w2,
+                b2,
+                expert_offsets,
+                E,
+                activation_type,
+                fuse_act=False,
+                gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
+            )
 
     rsf = 1.0
 

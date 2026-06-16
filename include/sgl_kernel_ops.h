@@ -339,6 +339,22 @@ void moe_grouped_mm_nt_xe20(
     double gemm1_alpha = 1.702,
     double gemm1_limit = 7.0);
 
+// Tile-fused MXFP4-B × BF16-A MoE grouped GEMM. `packed_weights` is int8
+// with two E2M1 nibbles per byte (low nibble = smaller-K element).
+// `scales` is float32 direct-multiplier, one per 32-element K-block.
+void moe_grouped_mm_nt_xe20_mxfp4_w4a16(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& packed_weights,
+    const torch::Tensor& scales,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts,
+    const int64_t activation_type = 0,
+    bool fuse_act = false,
+    double gemm1_alpha = 1.702,
+    double gemm1_limit = 7.0);
+
 void prepare_moe_input(
     const torch::Tensor& topk_ids,
     torch::Tensor& expert_offsets,
@@ -421,6 +437,25 @@ void hc_split_sinkhorn(
     int64_t hc_mult,
     int64_t sinkhorn_iters,
     double eps);
+
+void hc_pre_big_fuse(
+    const at::Tensor& gemm_out_mul,
+    const at::Tensor& gemm_out_sqrsum,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    const at::Tensor& residual_flat,
+    at::Tensor& post_mix,
+    at::Tensor& comb_mix,
+    at::Tensor& layer_input,
+    int64_t hc_mult,
+    int64_t sinkhorn_iters,
+    int64_t n_splits,
+    double rms_eps,
+    double hc_pre_eps,
+    double hc_sinkhorn_eps,
+    double hc_post_mult_value,
+    std::optional<at::Tensor> norm_weight = std::nullopt,
+    std::optional<double> norm_eps = std::nullopt);
 
 /*
  * From csrc/speculative

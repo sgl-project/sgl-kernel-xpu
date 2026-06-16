@@ -11,6 +11,7 @@ import struct
 import sgl_kernel  # noqa: F401
 import torch
 import triton
+from sgl_kernel.nsa import _fp8_mqa_logits_impl
 
 
 def make_fp8_tensor(shape, device="xpu"):
@@ -69,9 +70,7 @@ def bench_fp8_mqa_logits(Nk, provider, Nq, H, D):
     k_u8 = k.view(torch.uint8)
 
     ms, min_ms, max_ms = triton.testing.do_bench(
-        lambda: torch.ops.sgl_kernel.fp8_mqa_logits.default(
-            q_u8, k_u8, k_scale, weights, ks, ke
-        ),
+        lambda: _fp8_mqa_logits_impl(q_u8, k_u8, k_scale, weights, ks, ke),
         quantiles=[0.5, 0.2, 0.8],
     )
     return ms * 1000, max_ms * 1000, min_ms * 1000

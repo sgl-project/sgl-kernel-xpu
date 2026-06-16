@@ -110,6 +110,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state_v2", torch::kXPU, &merge_state_v2);
+  m.def("merge_state(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
+  m.impl("merge_state", torch::kXPU, &merge_state);
   /*
    * From cutlass attention
    */
@@ -213,14 +215,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int hc_mult, int sinkhorn_iters, float eps) -> ()");
   m.impl("hc_split_sinkhorn", torch::kXPU, &hc_split_sinkhorn);
 
-  /* NSA (Native Sparse Attention) indexer scoring */
-  // fp8_mqa_logits (prefill) is implemented in pure Python via sgl_kernel.nsa.
+  /* HC PRE BIG FUSE */
   m.def(
-      "fp8_paged_mqa_logits(Tensor q_fp8, Tensor kv_cache, Tensor weights, "
-      "Tensor seq_lens, Tensor block_tables, Tensor? schedule_metadata, "
-      "int max_seq_len, bool clean_logits) -> Tensor");
-  m.impl("fp8_paged_mqa_logits", torch::kXPU, &fp8_paged_mqa_logits);
-
+      "hc_pre_big_fuse(Tensor gemm_out_mul, Tensor gemm_out_sqrsum, "
+      "Tensor hc_scale, Tensor hc_base, Tensor residual_flat, "
+      "Tensor! post_mix, Tensor! comb_mix, Tensor! layer_input, "
+      "int hc_mult, int sinkhorn_iters, int n_splits, "
+      "float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value, "
+      "Tensor? norm_weight=None, float? norm_eps=None) -> ()");
+  m.impl("hc_pre_big_fuse", torch::kXPU, &hc_pre_big_fuse);
   /*
    * From LoRA
    */
@@ -229,6 +232,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor weight_indices, "
       "Tensor lora_ranks, Tensor? extra_embeddings, Tensor? seg_lens) -> ()");
   m.impl("embedding_lora_a_fwd", torch::kXPU, &embedding_lora_a_fwd);
+
+  /* NSA (Native Sparse Attention) indexer scoring */
+  // fp8_mqa_logits (prefill) is implemented in pure Python via sgl_kernel.nsa.
+  m.def(
+      "fp8_paged_mqa_logits(Tensor q_fp8, Tensor kv_cache, Tensor weights, "
+      "Tensor seq_lens, Tensor block_tables, Tensor? schedule_metadata, "
+      "int max_seq_len, bool clean_logits) -> Tensor");
+  m.impl("fp8_paged_mqa_logits", torch::kXPU, &fp8_paged_mqa_logits);
 }
 
 REGISTER_EXTENSION(common_ops)

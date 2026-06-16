@@ -171,6 +171,127 @@ void merge_attn_states_sycl(
   });
 }
 
+// Base-2 (exp2/log2) state merge used by the flashinfer-style `merge_state` op.
+// Mathematically distinct from `merge_state_v2`, which uses base-e softmax weights.
+template <typename scalar_t, typename pack_128b_t>
+struct MergeState {
+  const uint64_t total_threads;
+  const uint32_t threads_per_head;
+  const uint32_t num_heads;
+  const uint32_t head_size;
+  const uint32_t pack_size;
+  const scalar_t* v_a;
+  const scalar_t* v_b;
+  scalar_t* v_merged;
+  const float* s_a;
+  const float* s_b;
+  float* s_merged;
+
+  MergeState(
+      uint64_t total_threads,
+      uint32_t threads_per_head,
+      uint32_t num_heads,
+      uint32_t head_size,
+      uint32_t pack_size,
+      const scalar_t* v_a,
+      const scalar_t* v_b,
+      scalar_t* v_merged,
+      const float* s_a,
+      const float* s_b,
+      float* s_merged)
+      : total_threads(total_threads),
+        threads_per_head(threads_per_head),
+        num_heads(num_heads),
+        head_size(head_size),
+        pack_size(pack_size),
+        v_a(v_a),
+        v_b(v_b),
+        v_merged(v_merged),
+        s_a(s_a),
+        s_b(s_b),
+        s_merged(s_merged) {}
+
+  void operator()(sycl::nd_item<1> it) const {
+    const uint64_t global_idx = it.get_global_linear_id();
+    if (global_idx >= total_threads) return;
+
+    const uint32_t token_head_idx = global_idx / threads_per_head;
+    const uint32_t pack_idx = global_idx % threads_per_head;
+
+    const uint32_t token_idx = token_head_idx / num_heads;
+    const uint32_t head_idx = token_head_idx % num_heads;
+
+    const uint32_t pack_offset = pack_idx * pack_size;
+    const uint32_t head_offset = token_idx * num_heads * head_size + head_idx * head_size;
+
+    float s_a_val = s_a[token_idx * num_heads + head_idx];
+    float s_b_val = s_b[token_idx * num_heads + head_idx];
+
+    s_a_val = sycl::isfinite(s_a_val) ? s_a_val : -std::numeric_limits<float>::infinity();
+    s_b_val = sycl::isfinite(s_b_val) ? s_b_val : -std::numeric_limits<float>::infinity();
+
+    const float s_max = sycl::fmax(s_a_val, s_b_val);
+    const float a_se = sycl::exp2(s_a_val - s_max);
+    const float b_se = sycl::exp2(s_b_val - s_max);
+
+    const float d = sycl::fmax(a_se + b_se, std::numeric_limits<float>::min());
+    const float a_scale = a_se / d;
+    const float b_scale = b_se / d;
+
+    using vec_t = sycl::vec<scalar_t, sizeof(pack_128b_t) / sizeof(scalar_t)>;
+
+    if (pack_offset < head_size) {
+      vec_t a_vec;
+      vec_t b_vec;
+
+      memcpy(&a_vec, v_a + head_offset + pack_offset, sizeof(vec_t));
+      memcpy(&b_vec, v_b + head_offset + pack_offset, sizeof(vec_t));
+
+      vec_t o_vec;
+
+#pragma unroll
+      for (uint32_t i = 0; i < pack_size; ++i) {
+        float of = to_float(a_vec[i]) * a_scale + to_float(b_vec[i]) * b_scale;
+        from_float(o_vec[i], of);
+      }
+
+      memcpy(v_merged + head_offset + pack_offset, &o_vec, sizeof(vec_t));
+    }
+
+    if (s_merged != nullptr && pack_idx == 0) {
+      s_merged[token_idx * num_heads + head_idx] = sycl::log2(d) + s_max;
+    }
+  }
+};
+
+template <typename scalar_t>
+void merge_state_sycl(
+    scalar_t* v_merged,
+    float* s_merged,
+    const scalar_t* v_a,
+    const float* s_a,
+    const scalar_t* v_b,
+    const float* s_b,
+    uint32_t num_tokens,
+    uint32_t num_heads,
+    uint32_t head_size) {
+  using pack_128b_t = sycl::vec<uint32_t, 4>;
+
+  const uint32_t pack_size = 16 / sizeof(scalar_t);
+  const uint32_t threads_per_head = head_size / pack_size;
+  const uint64_t total_threads = uint64_t(num_tokens) * num_heads * threads_per_head;
+
+  const uint32_t local_size = 128;
+  const uint64_t global_size = ((total_threads + local_size - 1) / local_size) * local_size;
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto q = stream.queue();
+  q.submit([&](sycl::handler& h) {
+    MergeState<scalar_t, pack_128b_t> kernel_functor(
+        total_threads, threads_per_head, num_heads, head_size, pack_size, v_a, v_b, v_merged, s_a, s_b, s_merged);
+    h.parallel_for(sycl::nd_range<1>(global_size, local_size), kernel_functor);
+  });
+}
+
 #define SYCL_DISPATCH_BY_SCALAR_DTYPE(scalar_dtype, fn)                                     \
   {                                                                                         \
     if (scalar_dtype == at::ScalarType::Float) {                                            \
@@ -233,4 +354,65 @@ void merge_state_v2(
   CHECK_EQ(v_a.size(1), s_b.size(1));
 
   SYCL_DISPATCH_BY_SCALAR_DTYPE(v_merged.dtype(), CALL_MERGE_ATTN_STATES_LAUNCHER_SYCL);
+}
+
+template <typename scalar_t>
+void merge_state_launcher_sycl(
+    const at::Tensor& v_a,
+    const at::Tensor& s_a,
+    const at::Tensor& v_b,
+    const at::Tensor& s_b,
+    at::Tensor& v_merged,
+    at::Tensor& s_merged) {
+  const uint32_t num_tokens = v_merged.size(0);
+  const uint32_t num_heads = v_merged.size(1);
+  const uint32_t head_size = v_merged.size(2);
+
+  const uint32_t pack_size = 16 / sizeof(scalar_t);
+  TORCH_CHECK(head_size % pack_size == 0, "head_size must be multiple of pack_size:", pack_size);
+  merge_state_sycl<scalar_t>(
+      reinterpret_cast<scalar_t*>(v_merged.data_ptr()),
+      reinterpret_cast<float*>(s_merged.data_ptr()),
+      reinterpret_cast<const scalar_t*>(v_a.data_ptr()),
+      reinterpret_cast<const float*>(s_a.data_ptr()),
+      reinterpret_cast<const scalar_t*>(v_b.data_ptr()),
+      reinterpret_cast<const float*>(s_b.data_ptr()),
+      num_tokens,
+      num_heads,
+      head_size);
+}
+
+#define CALL_MERGE_STATE_LAUNCHER_SYCL(scalar_t) \
+  { merge_state_launcher_sycl<scalar_t>(v_a, s_a, v_b, s_b, v_merged, s_merged); }
+
+void merge_state(
+    at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged) {
+  CHECK_INPUT(v_a);
+  CHECK_INPUT(s_a);
+  CHECK_INPUT(v_b);
+  CHECK_INPUT(s_b);
+  CHECK_INPUT(v_merged);
+  CHECK_INPUT(s_merged);
+
+  CHECK_DIM(3, v_a);
+  CHECK_DIM(2, s_a);
+  CHECK_DIM(3, v_b);
+  CHECK_DIM(2, s_b);
+  CHECK_DIM(3, v_merged);
+  CHECK_DIM(2, s_merged);
+
+  CHECK_SAME_SHAPE(v_a, v_b);
+  CHECK_SAME_SHAPE(v_a, v_merged);
+  CHECK_SAME_SHAPE(s_a, s_b);
+  CHECK_SAME_SHAPE(s_a, s_merged);
+  CHECK_EQ(v_a.size(0), s_a.size(0));
+  CHECK_EQ(v_a.size(1), s_a.size(1));
+
+  TORCH_CHECK(v_a.scalar_type() == v_b.scalar_type(), "v_b dtype must match v_a dtype");
+  TORCH_CHECK(v_a.scalar_type() == v_merged.scalar_type(), "v_merged dtype must match v_a dtype");
+  TORCH_CHECK(s_a.scalar_type() == at::ScalarType::Float, "s_a must be float32");
+  TORCH_CHECK(s_b.scalar_type() == at::ScalarType::Float, "s_b must be float32");
+  TORCH_CHECK(s_merged.scalar_type() == at::ScalarType::Float, "s_merged must be float32");
+
+  SYCL_DISPATCH_BY_SCALAR_DTYPE(v_merged.dtype(), CALL_MERGE_STATE_LAUNCHER_SYCL);
 }

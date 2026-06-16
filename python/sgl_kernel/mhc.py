@@ -89,3 +89,61 @@ def hc_split_sinkhorn(
         post_flat.view(*leading, hc_mult),
         comb_flat.view(*leading, hc_mult, hc_mult),
     )
+
+
+def hc_pre_big_fuse(
+    gemm_out_mul: torch.Tensor,
+    gemm_out_sqrsum: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    residual_flat: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    layer_input: torch.Tensor,
+    hc_mult: int = 4,
+    sinkhorn_iters: int = 20,
+    n_splits: int = 1,
+    rms_eps: float = 1e-5,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 2.0,
+    norm_weight: Optional[torch.Tensor] = None,
+    norm_eps: float = 1e-6,
+):
+    if hc_mult != 4:
+        raise ValueError(
+            f"hc_pre_big_fuse currently supports only hc_mult=4, got {hc_mult}"
+        )
+    if sinkhorn_iters != 20:
+        raise ValueError(
+            f"hc_pre_big_fuse currently supports only sinkhorn_iters=20, got {sinkhorn_iters}"
+        )
+
+    hc_scale_c = hc_scale.to(device=gemm_out_mul.device, dtype=torch.float32)
+    hc_base_c = hc_base.to(device=gemm_out_mul.device, dtype=torch.float32)
+    norm_weight_arg = (
+        norm_weight.to(device=gemm_out_mul.device, dtype=torch.bfloat16)
+        if norm_weight is not None
+        else None
+    )
+    norm_eps_arg = float(norm_eps) if norm_weight is not None else None
+
+    torch.ops.sgl_kernel.hc_pre_big_fuse.default(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale_c,
+        hc_base_c,
+        residual_flat,
+        post_mix,
+        comb_mix,
+        layer_input,
+        hc_mult,
+        sinkhorn_iters,
+        n_splits,
+        float(rms_eps),
+        float(hc_pre_eps),
+        float(hc_sinkhorn_eps),
+        float(hc_post_mult_value),
+        norm_weight_arg,
+        norm_eps_arg,
+    )

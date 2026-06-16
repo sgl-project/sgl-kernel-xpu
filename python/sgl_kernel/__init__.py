@@ -54,7 +54,7 @@ from sgl_kernel.gemm import (
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.lora import embedding_lora_a_fwd
-from sgl_kernel.mhc import hc_split_sinkhorn
+from sgl_kernel.mhc import hc_pre_big_fuse, hc_split_sinkhorn
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     cutlass_fp4_group_mm,
@@ -77,6 +77,12 @@ from sgl_kernel.sampling import (
     top_k_top_p_sampling_from_probs,
     top_p_renorm_prob,
     top_p_sampling_from_probs,
+)
+from sgl_kernel.sparse_flash_attn import (
+    convert_vertical_slash_indexes,
+    convert_vertical_slash_indexes_mergehead,
+    sparse_attn_func,
+    sparse_attn_varlen_func,
 )
 from sgl_kernel.speculative import (
     build_tree_kernel_efficient,

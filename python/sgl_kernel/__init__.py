@@ -34,6 +34,7 @@ from sgl_kernel.elementwise import (
     silu_and_mul,
     store_cache_xpu,
 )
+from sgl_kernel.gdn_attn import gdn_attention
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,

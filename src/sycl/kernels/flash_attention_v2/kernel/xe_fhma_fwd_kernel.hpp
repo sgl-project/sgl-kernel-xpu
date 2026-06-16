@@ -208,8 +208,8 @@ class XeFMHAFwdKernel {
       //         problem_shape.seq_len_qo, problem_shape.seq_len_kv, problem_shape.seq_len_kv_cache},
       //     batch);
 
-      int seq_len_q = problem_shape.seq_len_qo.q_group_size * (problem_shape.seq_len_qo.cumulative_length[batch + 1] -
-                                                               problem_shape.seq_len_qo.cumulative_length[batch]);
+      int seq_len_q =
+          problem_shape.seq_len_qo.cumulative_length[batch + 1] - problem_shape.seq_len_qo.cumulative_length[batch];
       int seq_len_k_new = 0;
       // Paged KV passes per-batch cache lengths in cu_seqlens_k (cumulative_length[b]
       // already holds this batch's KV length). Non-paged KV passes a cumulative
@@ -308,10 +308,10 @@ class XeFMHAFwdKernel {
       if constexpr (is_var_len) {
         auto qo_cumulative = s.seq_len_qo.cumulative_length;
         auto kv_cumulative = s.seq_len_kv.cumulative_length;
-        offset_q = s.num_heads_q * s.head_size_qk * qo_cumulative[idx_b] * s.seq_len_qo.q_group_size;
+        offset_q = s.num_heads_q * s.head_size_qk * qo_cumulative[idx_b];
         // offset_k = s.num_heads_kv * s.head_size_qk * kv_cumulative[idx_b];
         // offset_v = s.num_heads_kv * s.head_size_vo * kv_cumulative[idx_b];
-        offset_o = s.num_heads_q * s.head_size_vo * qo_cumulative[idx_b] * s.seq_len_qo.q_group_size;
+        offset_o = s.num_heads_q * s.head_size_vo * qo_cumulative[idx_b];
         if (s.seq_len_kv_cache.cumulative_length) {
           auto kv_cumulative_cache = s.seq_len_kv_cache.cumulative_length;
           // Non-paged KV stores all batches in one contiguous ragged buffer, so each

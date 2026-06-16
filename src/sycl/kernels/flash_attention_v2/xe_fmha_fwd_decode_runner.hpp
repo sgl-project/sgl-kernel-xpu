@@ -248,7 +248,7 @@ struct DecodeRunner {
         .batch = get<0>(problem_size),
         .num_heads_q = get<1>(problem_size),
         .num_heads_kv = get<2>(problem_size),
-        .seq_len_qo = {params.seqlen_q, params.total_q, nullptr, params.q_group_size},
+        .seq_len_qo = {params.seqlen_q, params.total_q, nullptr},
 
         .seq_len_kv = {params.seqlen_knew, params.total_knew},
         .seq_len_kv_cache = {params.seqlen_k, params.total_k},

@@ -65,7 +65,13 @@ template <
     class VarLenQLayoutStep_,
     class VarLenKLayoutStep_,
     class VarLenVLayoutStep_,
-    class VarLenOLayoutStep_ = VarLenQLayoutStep_>
+    class VarLenOLayoutStep_ = VarLenQLayoutStep_,
+    // PackGQA: fold the head_group_q query heads that share a KV head into the
+    // M (q) tile, so a single work-group computes the whole GQA group for one
+    // decode step. Only enabled by the decode runner for the plain attention
+    // case (no causal/local mask, no sink); prefill keeps the default (false)
+    // and is therefore unaffected.
+    bool PackGQA_ = false>
 class XeFMHAFwdKernel {
  public:
   //
@@ -169,11 +175,14 @@ class XeFMHAFwdKernel {
   //
 
   static Params to_underlying_arguments(Arguments const& args, void* workspace) {
+    // When packing GQA into M, grid over KV heads instead of Q heads by reusing
+    // the scheduler's num_heads_kv path (num_kv_splits == 1, no actual split).
+    const int sched_num_kv_splits = PackGQA_ ? 1 : -1;
     return {
         args.kernel,
         CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
         CollectiveEpilogue::to_underlying_arguments(args.epilogue, workspace),
-        TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{})};
+        TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{}, sched_num_kv_splits)};
   }
 
   static bool can_implement(Arguments const& args) {
@@ -255,11 +264,17 @@ class XeFMHAFwdKernel {
       // Mix-batch dispatch: skip batches not owned by this kernel launch.
       if (p.skip_batch_mask != nullptr && p.skip_batch_mask[idx_b]) continue;
       auto blk_qv = make_coord(blk_q, blk_v);
-      int head = head_q / head_group_q;
+      // PackGQA: the scheduler grids over KV heads, so head_q already is the KV
+      // head index and the head_group_q query heads are folded into the M tile.
+      int head = PackGQA_ ? head_q : head_q / head_group_q;
 
       auto sequence_length_shape = get_sequence_length_shape(s, idx_b);
       auto [seq_len_qo, seq_len_kv, seq_len_kv_cache] = sequence_length_shape;
-      if (blk_q * get<0>(TileShapeQK{}) >= seq_len_qo) continue;
+      // M extent of the Q/O tile: the packed GQA group for decode, otherwise the
+      // query sequence length. Masking below still uses the real seq_len_qo so
+      // the decode KV position (seq_len_kv_cache - seq_len_qo) stays correct.
+      const int m_extent = PackGQA_ ? head_group_q : seq_len_qo;
+      if (blk_q * get<0>(TileShapeQK{}) >= m_extent) continue;
       // auto offset = cute::min(seq_len_qo, seq_len_kv);
       // auto discard_seq_coord = seq_len_qo - offset;
       // auto full_tile_offset = seq_len_kv - offset;
@@ -330,10 +345,13 @@ class XeFMHAFwdKernel {
       // contiguous region, so the extent must be this batch's KV length to keep the
       // 2D block loads in-bounds.
       int kv_seq_extent = CollectiveMainloop::PagedKV ? int(s.seq_len_kv_cache.total_length) : int(seq_len_kv_cache);
-      auto shape_Q = make_shape(seq_len_qo, s.head_size_qk, s.num_heads_q, batch_dim);
+      // PackGQA folds the head_group_q query heads into M and grids over KV
+      // heads, so the Q/O head extent collapses to num_heads_kv.
+      auto q_head_count = PackGQA_ ? s.num_heads_kv : s.num_heads_q;
+      auto shape_Q = make_shape(m_extent, s.head_size_qk, q_head_count, batch_dim);
       auto shape_K = make_shape(kv_seq_extent, s.head_size_qk, s.num_heads_kv, batch_dim);
       auto shape_V = make_shape(s.head_size_vo, kv_seq_extent, s.num_heads_kv, batch_dim);
-      auto shape_O = make_shape(seq_len_qo, s.head_size_vo, s.num_heads_q, batch_dim);
+      auto shape_O = make_shape(m_extent, s.head_size_vo, q_head_count, batch_dim);
 
       auto dcQ = const_cast<ElementQ*>(p.Q + offset_q);
       auto dcK_cache = const_cast<ElementK*>(p.K_cache + offset_k_cache);
@@ -357,9 +375,12 @@ class XeFMHAFwdKernel {
 
       // Main loop
       int l_coord = is_var_len ? 0 : idx_b;
+      // With PackGQA the Q/O head dimension is indexed by the KV head; otherwise
+      // by the (un-grouped) query head.
+      int q_head_idx = PackGQA_ ? head : head_q;
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
       mainloop(
-          Q(_, _, head_q, l_coord),
+          Q(_, _, q_head_idx, l_coord),
           K_cache(_, _, head, l_coord),
           V_cache(_, _, head, l_coord),
           tArA,
@@ -386,9 +407,9 @@ class XeFMHAFwdKernel {
       // Epilogue
       CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
       if constexpr (Sink) {
-        epilogue(O(_, _, head_q, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, p.sm_sink[head_q]);
+        epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, p.sm_sink[q_head_idx]);
       } else {
-        epilogue(O(_, _, head_q, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id);
+        epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id);
       }
     }
   }

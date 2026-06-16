@@ -645,6 +645,12 @@ struct DecodeConfig {
         cutlass::fmha::collective::FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, Sink>;
 
     static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
+    // Pack the GQA query group into the M dimension only for plain decode: with
+    // a causal/local mask the shared mainloop applies per-row KV positions
+    // (invalid when M rows are GQA heads at the same decode position), and with
+    // a sink the shared epilogue applies a single per-row sink logit. Those
+    // paths keep the per-head launch (PackGQA = false).
+    constexpr bool PackGQA = !Causal && !LocalMask && !Sink;
     using FMHADecodeKernel = conditional_t<
         is_same_v<Scheduler, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>,
         cutlass::fmha::kernel::
@@ -657,7 +663,8 @@ struct DecodeConfig {
             Step<_1, _0, _2, _3>,
             Step<_2, _0, _1, _3>,
             Step<_0, _2, _1, _3>,
-            Step<_1, _0, _2, _3>>>;
+            Step<_1, _0, _2, _3>,
+            PackGQA>>;
 
     DecodeRunner<FMHADecodeKernel, isVarLen> kernel;
 

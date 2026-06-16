@@ -132,6 +132,81 @@ def test_gdn_attention_smoke(mode, batch_size, seqlen, dtype):
     assert torch.isfinite(i["ssm_state"].float()).all()
 
 
+def _run_op(i, conv_state, ssm_state, state_idx, reorder_input):
+    torch.ops.sgl_kernel.gdn_attention(
+        i["core_attn_out"],
+        i["z"],
+        i["qkvz"],
+        i["ba"],
+        NUM_K_HEADS,
+        NUM_V_HEADS,
+        HEAD_K_DIM,
+        HEAD_V_DIM,
+        conv_state,
+        ssm_state,
+        i["conv_w"],
+        i["conv_b"],
+        "silu",
+        i["A_log"],
+        i["dt_bias"],
+        i["num_prefills"],
+        i["num_decodes"],
+        0,
+        i["has_init"],
+        i["qsl"],
+        None,
+        state_idx,
+        None,
+        None,
+        None,
+        None,
+        i["num_actual"],
+        TP_SIZE,
+        reorder_input,
+    )
+    torch.xpu.synchronize()
+
+
+@pytest.mark.parametrize(
+    "mode,batch_size,seqlen",
+    [("decode", 1, 1), ("decode", 4, 1), ("prefill", 1, 256), ("prefill", 2, 128)],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gdn_attention_dim_major_conv_layout(mode, batch_size, seqlen, dtype):
+    """The kernels index conv_state via explicit strides, so SGLang's native
+    ``[cache, dim, width-1]`` pool (passed as a transposed view) must produce the
+    same result as the vLLM-contiguous ``[cache, width-1, dim]`` layout, including
+    the in-place updated conv state."""
+    device = torch.device("xpu")
+
+    # Reference: contiguous [cache, width-1, dim] (vLLM layout).
+    ref = _make_inputs(mode, batch_size, seqlen, dtype, device)
+    conv_orig = ref["conv_state"].clone()  # pristine initial conv state
+    ssm_orig = ref["ssm_state"].clone()
+    conv_ref = conv_orig.clone()
+    ssm_ref = ssm_orig.clone()
+    _run_op(ref, conv_ref, ssm_ref, ref["state_idx"], reorder_input=False)
+    out_ref = ref["core_attn_out"].clone()
+    z_ref = ref["z"].clone()
+
+    # Candidate: SGLang pool [cache, dim, width-1]; pass a transposed view so the
+    # op sees logical [cache, width-1, dim] while indexing via strides. Start from
+    # the same pristine initial conv/ssm state as the reference.
+    cand = _make_inputs(mode, batch_size, seqlen, dtype, device)
+    conv_dim_major = conv_orig.transpose(1, 2).contiguous()  # [cache, dim, width-1]
+    conv_view = conv_dim_major.transpose(1, 2)  # logical [cache, width-1, dim] view
+    ssm_cand = ssm_orig.clone()
+    _run_op(cand, conv_view, ssm_cand, cand["state_idx"], reorder_input=False)
+
+    torch.testing.assert_close(cand["core_attn_out"], out_ref, rtol=0, atol=0)
+    torch.testing.assert_close(cand["z"], z_ref, rtol=0, atol=0)
+    torch.testing.assert_close(ssm_cand, ssm_ref, rtol=0, atol=0)
+    # Updated conv state must match after converting the dim-major pool back.
+    torch.testing.assert_close(
+        conv_dim_major.transpose(1, 2).contiguous(), conv_ref, rtol=0, atol=0
+    )
+
+
 if __name__ == "__main__":
     import sys
 

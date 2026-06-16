@@ -29,6 +29,8 @@ struct causal_conv1d_kernel {
       const T* conv_bias,
       T* conv_states,
       const int conv_states_stride_0,
+      const int conv_w_stride,
+      const int conv_d_stride,
       T* conv_states_tmp,
       int* query_start_loc,
       int* token_indx,
@@ -58,6 +60,8 @@ struct causal_conv1d_kernel {
         conv_bias(conv_bias),
         conv_states(conv_states),
         conv_states_stride_0(conv_states_stride_0),
+        conv_w_stride(conv_w_stride),
+        conv_d_stride(conv_d_stride),
         conv_states_tmp(conv_states_tmp),
         query_start_loc(query_start_loc),
         token_indx(token_indx),
@@ -243,8 +247,8 @@ struct causal_conv1d_kernel {
       for (int i = 0; i < states_load_len; ++i) {
 #pragma unroll
         for (int e = 0; e < elems_per_item; ++e) {
-          local_input[Width * e + i] =
-              conv_states_ptr[(Width - 1 - states_load_len + i) * conv_elems + reordered_elems_id + e];
+          local_input[Width * e + i] = conv_states_ptr
+              [(Width - 1 - states_load_len + i) * conv_w_stride + (reordered_elems_id + e) * conv_d_stride];
         }
       }
     }
@@ -299,7 +303,8 @@ struct causal_conv1d_kernel {
       for (int i = 0; i < Width - 1; ++i) {
 #pragma unroll
         for (int e = 0; e < elems_per_item; ++e) {
-          conv_states_ptr[i * conv_elems + reordered_elems_id + e] = local_input[Width * e + i + 1];
+          conv_states_ptr[i * conv_w_stride + (reordered_elems_id + e) * conv_d_stride] =
+              local_input[Width * e + i + 1];
         }
       }
     }
@@ -348,6 +353,8 @@ struct causal_conv1d_kernel {
   const T* conv_bias;
   T* conv_states;
   const int conv_states_stride_0;
+  const int conv_w_stride;
+  const int conv_d_stride;
   T* conv_states_tmp;
   const int32_t* query_start_loc;
   const int* token_indx;
@@ -378,6 +385,8 @@ struct update_states_kernel {
   update_states_kernel(
       T* conv_states,
       const int conv_states_stride_0,
+      const int conv_w_stride,
+      const int conv_d_stride,
       const T* conv_states_tmp,
       const int* cache_indices,
       const int width,
@@ -387,6 +396,8 @@ struct update_states_kernel {
       const int batch_size)
       : conv_states(conv_states),
         conv_states_stride_0(conv_states_stride_0),
+        conv_w_stride(conv_w_stride),
+        conv_d_stride(conv_d_stride),
         conv_states_tmp(conv_states_tmp),
         cache_indices(cache_indices),
         width(width),
@@ -420,13 +431,15 @@ struct update_states_kernel {
     T* conv_states_ptr = conv_states + states_id * conv_states_stride_0;
     const T* conv_states_tmp_ptr = conv_states_tmp + batch_id * (width - 1) * conv_elems;
     for (int i = elems_start_offset_group + local_id; i < (local_group_id + 1) * elems_per_group; i += group_size) {
-      conv_states_ptr[width_id * conv_elems + i] = conv_states_tmp_ptr[width_id * conv_elems + i];
+      conv_states_ptr[width_id * conv_w_stride + i * conv_d_stride] = conv_states_tmp_ptr[width_id * conv_elems + i];
     }
   }
 
  private:
   T* conv_states;
   const int conv_states_stride_0;
+  const int conv_w_stride;
+  const int conv_d_stride;
   const T* conv_states_tmp;
   const int* cache_indices;
   const int width;
@@ -480,6 +493,8 @@ struct causal_conv1d_spec_kernel {
       const T* conv_bias,
       T* conv_states,
       const int conv_states_stride_0,
+      const int conv_w_stride,
+      const int conv_d_stride,
       const int* token_indx,
       const int* cache_indices,
       const int cache_indices_stride_0,
@@ -506,6 +521,8 @@ struct causal_conv1d_spec_kernel {
         conv_bias(conv_bias),
         conv_states(conv_states),
         conv_states_stride_0(conv_states_stride_0),
+        conv_w_stride(conv_w_stride),
+        conv_d_stride(conv_d_stride),
         token_indx(token_indx),
         cache_indices(cache_indices),
         cache_indices_stride_0(cache_indices_stride_0),
@@ -665,7 +682,7 @@ struct causal_conv1d_spec_kernel {
       for (int i = 0; i < Width - 1; ++i) {
 #pragma unroll
         for (int e = 0; e < elems_per_item; ++e) {
-          local_input[Width * e + i] = init_state_ptr[i * conv_elems + reordered_elems_id + e];
+          local_input[Width * e + i] = init_state_ptr[i * conv_w_stride + (reordered_elems_id + e) * conv_d_stride];
         }
       }
     }
@@ -751,7 +768,8 @@ struct causal_conv1d_spec_kernel {
           for (int i = 0; i < Width - 1; ++i) {
 #pragma unroll
             for (int e = 0; e < elems_per_item; ++e) {
-              save_state_ptr[i * conv_elems + reordered_elems_id + e] = local_input[Width * e + i + 1];
+              save_state_ptr[i * conv_w_stride + (reordered_elems_id + e) * conv_d_stride] =
+                  local_input[Width * e + i + 1];
             }
           }
         }
@@ -772,6 +790,8 @@ struct causal_conv1d_spec_kernel {
   const T* conv_bias;
   T* conv_states;
   const int conv_states_stride_0;
+  const int conv_w_stride;
+  const int conv_d_stride;
   const int* token_indx;
   const int* cache_indices;
   const int cache_indices_stride_0;
@@ -803,6 +823,8 @@ void kernel_launcher(
     const T* conv_bias,
     T* conv_states,
     const int conv_states_stride_0,
+    const int conv_w_stride,
+    const int conv_d_stride,
     T* conv_states_tmp,
     int* query_start_loc,
     int* token_indx,
@@ -846,6 +868,8 @@ void kernel_launcher(
           conv_bias,
           conv_states,
           conv_states_stride_0,
+          conv_w_stride,
+          conv_d_stride,
           token_indx,
           cache_indices,
           cache_indices_stride_0,
@@ -883,6 +907,8 @@ void kernel_launcher(
         conv_bias,
         conv_states,
         conv_states_stride_0,
+        conv_w_stride,
+        conv_d_stride,
         conv_states_tmp,
         query_start_loc,
         token_indx,
@@ -909,6 +935,8 @@ void kernel_launcher(
       KERNEL_UPDATE task(
           conv_states,
           conv_states_stride_0,
+          conv_w_stride,
+          conv_d_stride,
           conv_states_tmp,
           cache_indices,
           Width,
@@ -964,6 +992,8 @@ void causal_conv1d(
   const int conv_elems = conv_weights.size(0);
   const int width = conv_weights.size(1);
   const int conv_states_stride_0 = conv_states.stride(0);
+  const int conv_w_stride = conv_states.stride(1);
+  const int conv_d_stride = conv_states.stride(2);
 
   int num_spec_tokens = 0;
   int cache_indices_stride_0 = 0;
@@ -995,6 +1025,8 @@ void causal_conv1d(
       conv_bias.has_value() ? reinterpret_cast<scalar_t*>(conv_bias->data_ptr()) : nullptr,                \
       reinterpret_cast<scalar_t*>(conv_states.data_ptr()),                                                 \
       conv_states_stride_0,                                                                                \
+      conv_w_stride,                                                                                       \
+      conv_d_stride,                                                                                       \
       reinterpret_cast<scalar_t*>(conv_states_tmp.data_ptr()),                                             \
       reinterpret_cast<int*>(query_start_loc->data_ptr()),                                                 \
       token_indx.has_value() ? reinterpret_cast<int*>(token_indx->data_ptr()) : nullptr,                   \

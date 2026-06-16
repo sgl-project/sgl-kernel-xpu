@@ -55,7 +55,8 @@ void gdn_attention(
   TORCH_CHECK(z.is_contiguous(), "z must be contiguous");
   TORCH_CHECK(projected_states_qkvz.is_contiguous(), "projected_states_qkvz must be contiguous");
   TORCH_CHECK(projected_states_ba.is_contiguous(), "projected_states_ba must be contiguous");
-  TORCH_CHECK(conv_state[0].is_contiguous(), "conv_state of each batch must be contiguous");
+  // conv_state may be a transposed (dim-major) view of SGLang's pool; the kernels
+  // index it via explicit width/dim strides, so per-row contiguity is not required.
   TORCH_CHECK(ssm_state[0].is_contiguous(), "ssm_state of each batch must be contiguous");
   TORCH_CHECK(conv_weights.is_contiguous(), "conv_weights must be contiguous");
   TORCH_CHECK(A_log.is_contiguous(), "A_log must be contiguous");

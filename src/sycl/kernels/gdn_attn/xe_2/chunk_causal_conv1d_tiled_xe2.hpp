@@ -5,6 +5,7 @@
 #include <sycl/sycl.hpp>
 
 #include "../gdn_attn_utils.h"
+#include "chunk_causal_conv1d_xe2.hpp"  // for chunk_update_states_kernel (prefill writeback)
 
 namespace gdn {
 
@@ -45,6 +46,8 @@ struct chunk_causal_conv1d_tiled_kernel {
       const T* conv_bias,
       T* conv_states,
       const int conv_states_stride_0,
+      const int conv_w_stride,
+      const int conv_d_stride,
       T* conv_states_tmp,
       int* query_start_loc,
       int* cache_indices,
@@ -74,6 +77,8 @@ struct chunk_causal_conv1d_tiled_kernel {
         conv_bias(conv_bias),
         conv_states(conv_states),
         conv_states_stride_0(conv_states_stride_0),
+        conv_w_stride(conv_w_stride),
+        conv_d_stride(conv_d_stride),
         conv_states_tmp(conv_states_tmp),
         query_start_loc(query_start_loc),
         cache_indices(cache_indices),
@@ -288,7 +293,7 @@ struct chunk_causal_conv1d_tiled_kernel {
           if (has_init_conv_states && state_row >= 0 && state_row < Width - 1) {
 #pragma unroll
             for (int e = 0; e < elems_per_item; ++e) {
-              vals[e] = conv_states_ptr[state_row * conv_elems + reordered_feat + e];
+              vals[e] = conv_states_ptr[state_row * conv_w_stride + (reordered_feat + e) * conv_d_stride];
             }
           } else {
 #pragma unroll
@@ -541,7 +546,8 @@ struct chunk_causal_conv1d_tiled_kernel {
         int slot = i + 1;
 #pragma unroll
         for (int e = 0; e < elems_per_item; ++e) {
-          st[i * conv_elems + reordered_feat + e] = slm_input[slot * feats_per_wg + local_feat + e];
+          st[i * conv_w_stride + (reordered_feat + e) * conv_d_stride] =
+              slm_input[slot * feats_per_wg + local_feat + e];
         }
       }
     }
@@ -560,6 +566,8 @@ struct chunk_causal_conv1d_tiled_kernel {
   const T* conv_bias;
   T* conv_states;
   const int conv_states_stride_0;
+  const int conv_w_stride;
+  const int conv_d_stride;
   T* conv_states_tmp;
   const int32_t* query_start_loc;
   const int* cache_indices;
@@ -594,6 +602,8 @@ void tiled_kernel_launcher(
     const T* conv_bias,
     T* conv_states,
     const int conv_states_stride_0,
+    const int conv_w_stride,
+    const int conv_d_stride,
     T* conv_states_tmp,
     int* query_start_loc,
     int* cache_indices,
@@ -640,6 +650,8 @@ void tiled_kernel_launcher(
           conv_bias,
           conv_states,
           conv_states_stride_0,
+          conv_w_stride,
+          conv_d_stride,
           conv_states_tmp,
           query_start_loc,
           cache_indices,
@@ -669,6 +681,8 @@ void tiled_kernel_launcher(
       KERNEL_UPDATE task(
           conv_states,
           conv_states_stride_0,
+          conv_w_stride,
+          conv_d_stride,
           conv_states_tmp,
           cache_indices,
           Width,
@@ -720,6 +734,10 @@ void chunk_causal_conv1d_tiled_xe2(
   const int conv_elems = conv_weights.size(0);
   const int width = conv_weights.size(1);
   const int conv_states_stride_0 = conv_states.stride(0);
+  // conv_states is logically [cache, width-1, dim]; use actual strides so both the
+  // vLLM-contiguous and SGLang [cache, dim, width-1] (transposed view) layouts work.
+  const int conv_w_stride = conv_states.stride(1);
+  const int conv_d_stride = conv_states.stride(2);
 
   // Upper bound on tile count: each token can start a new tile at worst,
   // plus each batch boundary can add one partial tile. The kernel handles
@@ -750,6 +768,8 @@ void chunk_causal_conv1d_tiled_xe2(
       conv_bias.has_value() ? reinterpret_cast<scalar_t*>(conv_bias->data_ptr()) : nullptr,             \
       reinterpret_cast<scalar_t*>(conv_states.data_ptr()),                                              \
       conv_states_stride_0,                                                                             \
+      conv_w_stride,                                                                                    \
+      conv_d_stride,                                                                                    \
       reinterpret_cast<scalar_t*>(conv_states_tmp.data_ptr()),                                          \
       reinterpret_cast<int*>(query_start_loc.data_ptr()),                                               \
       reinterpret_cast<int*>(cache_indices.data_ptr()),                                                 \

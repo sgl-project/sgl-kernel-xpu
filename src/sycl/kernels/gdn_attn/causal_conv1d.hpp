@@ -8,12 +8,12 @@
 
 namespace gdn {
 
-template <typename T, int Width, bool ReorderInput>
+template <typename T, int Width, bool ReorderInput, int ElemsPerItem = 4>
 struct causal_conv1d_kernel {
  public:
   static constexpr int sub_group_size = 32;
   static constexpr int group_size = 256;
-  static constexpr int elems_per_item = 4;
+  static constexpr int elems_per_item = ElemsPerItem;
   static constexpr int elems_per_group = group_size * elems_per_item;
 
   causal_conv1d_kernel(
@@ -889,45 +889,67 @@ void kernel_launcher(
     return;
   }
 
-  using KERNEL_MAIN = causal_conv1d_kernel<T, Width, ReorderInput>;
-  auto range_main = KERNEL_MAIN::get_nd_range(num_virtual_tokens, qkvz_elems);
-  assert(head_k_dim % KERNEL_MAIN::elems_per_item == 0);
-  assert(num_v_heads % KERNEL_MAIN::elems_per_item == 0);
-  queue.submit([&](sycl::handler& cgh) {
-    KERNEL_MAIN task(
-        q_out,
-        k_out,
-        v_out,
-        z_out,
-        b_out,
-        a_out,
-        mixed_qkvz,
-        mixed_ba,
-        conv_weights,
-        conv_bias,
-        conv_states,
-        conv_states_stride_0,
-        conv_w_stride,
-        conv_d_stride,
-        conv_states_tmp,
-        query_start_loc,
-        token_indx,
-        cache_indices,
-        has_initial_state,
-        num_accepted_tokens,
-        act_mode,
-        pad_slot_id,
-        batch_size,
-        num_virtual_tokens,
-        num_actual_tokens,
-        num_k_heads,
-        head_k_dim,
-        num_v_heads,
-        head_v_dim,
-        qkvz_elems,
-        conv_elems);
-    cgh.parallel_for(range_main, task);
-  });
+  // Adaptive feature-parallelism for the main kernel. Each work-item processes
+  // ElemsPerItem feature channels; a smaller value spawns more work-items and
+  // improves GPU occupancy when token-parallelism is low (decode, tiny batch),
+  // but adds redundant per-item overhead (e.g. the batch scan) that hurts when
+  // token-parallelism is already high (large batch / prefill). We pick the fine
+  // split only when the default (ElemsPerItem=4) grid would underfill the
+  // device. This is purely a scheduling choice: results are bit-identical.
+#define LAUNCH_MAIN(EPI)                                                         \
+  do {                                                                           \
+    using KERNEL_MAIN = causal_conv1d_kernel<T, Width, ReorderInput, EPI>;       \
+    auto range_main = KERNEL_MAIN::get_nd_range(num_virtual_tokens, qkvz_elems); \
+    assert(head_k_dim % KERNEL_MAIN::elems_per_item == 0);                       \
+    assert(num_v_heads % KERNEL_MAIN::elems_per_item == 0);                      \
+    queue.submit([&](sycl::handler& cgh) {                                       \
+      KERNEL_MAIN task(                                                          \
+          q_out,                                                                 \
+          k_out,                                                                 \
+          v_out,                                                                 \
+          z_out,                                                                 \
+          b_out,                                                                 \
+          a_out,                                                                 \
+          mixed_qkvz,                                                            \
+          mixed_ba,                                                              \
+          conv_weights,                                                          \
+          conv_bias,                                                             \
+          conv_states,                                                           \
+          conv_states_stride_0,                                                  \
+          conv_w_stride,                                                         \
+          conv_d_stride,                                                         \
+          conv_states_tmp,                                                       \
+          query_start_loc,                                                       \
+          token_indx,                                                            \
+          cache_indices,                                                         \
+          has_initial_state,                                                     \
+          num_accepted_tokens,                                                   \
+          act_mode,                                                              \
+          pad_slot_id,                                                           \
+          batch_size,                                                            \
+          num_virtual_tokens,                                                    \
+          num_actual_tokens,                                                     \
+          num_k_heads,                                                           \
+          head_k_dim,                                                            \
+          num_v_heads,                                                           \
+          head_v_dim,                                                            \
+          qkvz_elems,                                                            \
+          conv_elems);                                                           \
+      cgh.parallel_for(range_main, task);                                        \
+    });                                                                          \
+  } while (0)
+
+  constexpr int elems_per_group_epi4 = causal_conv1d_kernel<T, Width, ReorderInput, 4>::group_size * 4;
+  const int groups_per_token = (qkvz_elems + elems_per_group_epi4 - 1) / elems_per_group_epi4;
+  const int default_work_groups = num_virtual_tokens * groups_per_token;
+  // Threshold tuned on Intel B60 (20 Xe-cores): epi=1 wins up to ~48 work-groups
+  // (decode batch<=4), epi=4 wins from ~96 (batch>=8). 64 sits in the gap.
+  if (default_work_groups < 64) {
+    LAUNCH_MAIN(1);
+  } else {
+    LAUNCH_MAIN(4);
+  }
+#undef LAUNCH_MAIN
   if (num_prefills > 0) {
     using KERNEL_UPDATE = update_states_kernel<T>;
     auto range_update = KERNEL_UPDATE::get_nd_range(batch_size, Width, conv_elems);

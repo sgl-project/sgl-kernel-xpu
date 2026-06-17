@@ -478,7 +478,7 @@ def generate_qkv(
 @pytest.mark.parametrize(
     "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
 )
-@pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("nheads_q,nheads_kv", [(16, 16), (16, 4)])
 @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("causal,local", [(False, True), (False, False), (True, False)])
 @pytest.mark.parametrize("use_sinks", [True, False])
@@ -530,38 +530,39 @@ def test_flash_attn_kvcache(
     local,
     use_sinks,
     new_kv,
-    mha_type,
+    nheads_q,
+    nheads_kv,
     dtype,
 ):
     from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
     if page_size is not None and seqlen_k % page_size != 0:
-        pytest.skip()
+        pytest.skip("page_size must divide seqlen_k")
     if seqlen_q > seqlen_k and new_kv:
-        pytest.skip()
+        pytest.skip("new_kv requires seqlen_q <= seqlen_k")
     if not new_kv and rotary_fraction > 0.0:
-        pytest.skip()
+        pytest.skip("rotary_fraction > 0 requires new_kv")
     if rotary_fraction == 0.0 and has_rotary_seqlens:
-        pytest.skip()
+        pytest.skip("has_rotary_seqlens requires rotary_fraction > 0")
+    if nheads_kv > nheads_q:
+        pytest.skip("Require nheads_kv <= nheads_q")
     # sink is only supported for head_size == 64
     if use_sinks and d != 64:
-        pytest.skip()
+        pytest.skip("use_sinks is only supported when d == 64")
     # set seed
     torch.random.manual_seed(0)
     batch_size = 5
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
-    nheads = 16
+    assert nheads_q % nheads_kv == 0
 
     if seqlen_k <= seqlen_q:
         seqlen_k += seqlen_q
     # rotary_dim must be a multiple of 16, and must be <= d
     rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
-    assert nheads % nheads_k == 0
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     if use_sinks:
-        sinks = torch.randn(nheads, device=device, dtype=dtype_ref)
+        sinks = torch.randn(nheads_q, device=device, dtype=dtype_ref)
     if dtype == torch.float8_e4m3fn or not is_hopper():
         # for fp8 and ampere arch, we not support v head dim != qk head dim
         dv_vals = [d]
@@ -569,14 +570,14 @@ def test_flash_attn_kvcache(
         has_qv = d == 64 and dv >= 256
         softmax_scale = 1.0 / math.sqrt(d if has_qv is None else d + dv)
         q = (
-            torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
+            torch.randn(batch_size, seqlen_q, nheads_q, d, device=device, dtype=dtype_ref)
             .to(dtype)
             .to(dtype_ref)
         )
         if has_qv:
             qv = (
                 torch.randn(
-                    batch_size, seqlen_q, nheads, dv, device=device, dtype=dtype_ref
+                    batch_size, seqlen_q, nheads_q, dv, device=device, dtype=dtype_ref
                 )
                 .to(dtype)
                 .to(dtype_ref)
@@ -615,14 +616,14 @@ def test_flash_attn_kvcache(
         if new_kv:
             k = (
                 torch.randn(
-                    batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype_ref
+                    batch_size, seqlen_new, nheads_kv, d, device=device, dtype=dtype_ref
                 )
                 .to(dtype)
                 .to(dtype_ref)
             )
             v = (
                 torch.randn(
-                    batch_size, seqlen_new, nheads_k, dv, device=device, dtype=dtype_ref
+                    batch_size, seqlen_new, nheads_kv, dv, device=device, dtype=dtype_ref
                 )
                 .to(dtype)
                 .to(dtype_ref)
@@ -644,7 +645,7 @@ def test_flash_attn_kvcache(
                 torch.randn(
                     batch_size_cache,
                     seqlen_k,
-                    nheads_k,
+                    nheads_kv,
                     d,
                     device=device,
                     dtype=dtype_ref,
@@ -656,7 +657,7 @@ def test_flash_attn_kvcache(
                 torch.randn(
                     batch_size_cache,
                     seqlen_k,
-                    nheads_k,
+                    nheads_kv,
                     dv,
                     device=device,
                     dtype=dtype_ref,
@@ -677,7 +678,7 @@ def test_flash_attn_kvcache(
                 seqlen_k,
                 page_size,
                 batch_size_cache,
-                nheads_k,
+                nheads_kv,
                 d,
                 dv,
                 device,
@@ -793,10 +794,10 @@ def test_flash_attn_kvcache(
             k_cache_ref[update_mask] = k_to_update
             v_cache_ref[update_mask] = v_to_update
         k_cache_rep = repeat(
-            k_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k
+            k_cache_ref, "b s h d -> b s (h g) d", g=nheads_q // nheads_kv
         )
         v_cache_rep = repeat(
-            v_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k
+            v_cache_ref, "b s h d -> b s (h g) d", g=nheads_q // nheads_kv
         )
         out_ref, _ = attention_ref(
             q_ro,
@@ -967,7 +968,7 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize(
     "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
 )
-@pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("nheads_q,nheads_kv", [(16, 16), (16, 4)])
 @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("local", [True, False])
@@ -1018,28 +1019,29 @@ def test_flash_attn_decode_kvcache(
     local,
     use_sinks,
     new_kv,
-    mha_type,
+    nheads_q,
+    nheads_kv,
     dtype,
 ):
     from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
     if page_size is not None and seqlen_k % page_size != 0:
-        pytest.skip()
+        pytest.skip("page_size must divide seqlen_k")
     if seqlen_q > seqlen_k and new_kv:
-        pytest.skip()
+        pytest.skip("new_kv requires seqlen_q <= seqlen_k")
     if not new_kv and rotary_fraction > 0.0:
-        pytest.skip()
+        pytest.skip("rotary_fraction > 0 requires new_kv")
     if rotary_fraction == 0.0 and has_rotary_seqlens:
-        pytest.skip()
+        pytest.skip("has_rotary_seqlens requires rotary_fraction > 0")
+    if nheads_kv > nheads_q:
+        pytest.skip("Require nheads_kv <= nheads_q")
     # sink is only supported for head_size == 64
     if use_sinks and d != 64:
-        pytest.skip()
+        pytest.skip("use_sinks is only supported when d == 64")
     # set seed
     torch.random.manual_seed(0)
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
-    nheads = 16
-    nheads_k = 16  # nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
-    assert nheads % nheads_k == 0
+    assert nheads_q % nheads_kv == 0
 
     if seqlen_k <= seqlen_q:
         seqlen_k += seqlen_q
@@ -1048,7 +1050,7 @@ def test_flash_attn_decode_kvcache(
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     if use_sinks:
-        sinks = torch.randn(nheads, device=device, dtype=dtype_ref)
+        sinks = torch.randn(nheads_q, device=device, dtype=dtype_ref)
     if dtype == torch.float8_e4m3fn or not is_hopper():
         # for fp8 and ampere arch, we not support v head dim != qk head dim
         dv_vals = [d]
@@ -1056,14 +1058,14 @@ def test_flash_attn_decode_kvcache(
         has_qv = d == 64 and dv >= 256
         softmax_scale = 1.0 / math.sqrt(d if has_qv is None else d + dv)
         q = (
-            torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
+            torch.randn(batch_size, seqlen_q, nheads_q, d, device=device, dtype=dtype_ref)
             .to(dtype)
             .to(dtype_ref)
         )
         if has_qv:
             qv = (
                 torch.randn(
-                    batch_size, seqlen_q, nheads, dv, device=device, dtype=dtype_ref
+                    batch_size, seqlen_q, nheads_q, dv, device=device, dtype=dtype_ref
                 )
                 .to(dtype)
                 .to(dtype_ref)
@@ -1102,14 +1104,14 @@ def test_flash_attn_decode_kvcache(
         if new_kv:
             k = (
                 torch.randn(
-                    batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype_ref
+                    batch_size, seqlen_new, nheads_kv, d, device=device, dtype=dtype_ref
                 )
                 .to(dtype)
                 .to(dtype_ref)
             )
             v = (
                 torch.randn(
-                    batch_size, seqlen_new, nheads_k, dv, device=device, dtype=dtype_ref
+                    batch_size, seqlen_new, nheads_kv, dv, device=device, dtype=dtype_ref
                 )
                 .to(dtype)
                 .to(dtype_ref)
@@ -1131,7 +1133,7 @@ def test_flash_attn_decode_kvcache(
                 torch.randn(
                     batch_size_cache,
                     seqlen_k,
-                    nheads_k,
+                    nheads_kv,
                     d,
                     device=device,
                     dtype=dtype_ref,
@@ -1143,7 +1145,7 @@ def test_flash_attn_decode_kvcache(
                 torch.randn(
                     batch_size_cache,
                     seqlen_k,
-                    nheads_k,
+                    nheads_kv,
                     dv,
                     device=device,
                     dtype=dtype_ref,
@@ -1164,7 +1166,7 @@ def test_flash_attn_decode_kvcache(
                 seqlen_k,
                 page_size,
                 batch_size_cache,
-                nheads_k,
+                nheads_kv,
                 d,
                 dv,
                 device,
@@ -1280,10 +1282,10 @@ def test_flash_attn_decode_kvcache(
             k_cache_ref[update_mask] = k_to_update
             v_cache_ref[update_mask] = v_to_update
         k_cache_rep = repeat(
-            k_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k
+            k_cache_ref, "b s h d -> b s (h g) d", g=nheads_q // nheads_kv
         )
         v_cache_rep = repeat(
-            v_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k
+            v_cache_ref, "b s h d -> b s (h g) d", g=nheads_q // nheads_kv
         )
         out_ref, _ = attention_ref(
             q_ro,
@@ -1488,7 +1490,7 @@ def _generate_block_kvcache(
 @pytest.mark.parametrize(
     "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
 )
-@pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("nheads_q,nheads_kv", [(16, 16), (16, 4)])
 @pytest.mark.parametrize("has_qv", [False])
 @pytest.mark.parametrize("deterministic", [False])
 @pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
@@ -1530,7 +1532,8 @@ def test_flash_attn_varlen_output(
     softcap,
     deterministic,
     has_qv,
-    mha_type,
+    nheads_q,
+    nheads_kv,
     dtype,
 ):
     from sgl_kernel.flash_attn import flash_attn_varlen_func
@@ -1538,8 +1541,10 @@ def test_flash_attn_varlen_output(
     # set seed
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
     batch_size = 9 if seqlen_q <= 2048 else 2
-    nheads = 6
-    nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
+    if nheads_kv > nheads_q:
+        pytest.skip("Require nheads_kv <= nheads_q")
+    assert nheads_q % nheads_kv == 0
+
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     sinks = None
@@ -1548,7 +1553,7 @@ def test_flash_attn_varlen_output(
     for dv in dv_vals:
         softmax_scale = 1.0 / math.sqrt(d if not has_qv else d + dv)
         q_ref = torch.randn(
-            batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref
+            batch_size, seqlen_q, nheads_q, d, device=device, dtype=dtype_ref
         )
         if softcap > 0.0:
             # Ensure the values of qk are at least within softcap range.
@@ -1573,7 +1578,7 @@ def test_flash_attn_varlen_output(
         if has_qv:
             qv_ref = (
                 torch.randn(
-                    batch_size, seqlen_q, nheads, dv, device=device, dtype=dtype_ref
+                    batch_size, seqlen_q, nheads_q, dv, device=device, dtype=dtype_ref
                 )
                 .to(dtype)
                 .to(dtype_ref)

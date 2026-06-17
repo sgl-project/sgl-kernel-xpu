@@ -124,7 +124,7 @@ def fp8_paged_mqa_logits(
         block_tables: (B, max_num_blocks) int32 page table
         schedule_metadata: optional scheduling metadata (ignored on XPU)
         max_seq_len: maximum sequence length
-        clean_logits: if True, zero out invalid positions
+        clean_logits: unused on XPU (output is always zero-initialized), kept for API compatibility
 
     Returns:
         logits: (B, max_seq_len) float32

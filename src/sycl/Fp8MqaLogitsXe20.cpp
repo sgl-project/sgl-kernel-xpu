@@ -117,6 +117,9 @@ torch::Tensor fp8_paged_mqa_logits(
     const std::optional<torch::Tensor>& schedule_metadata,
     int64_t max_seq_len,
     bool clean_logits) {
+  TORCH_CHECK(
+      !schedule_metadata.has_value(),
+      "fp8_paged_mqa_logits does not support schedule_metadata on XPU");
   TORCH_CHECK(q_fp8.is_xpu(), "q_fp8 must be on XPU");
   TORCH_CHECK(kv_cache.is_xpu(), "kv_cache must be on XPU");
   TORCH_CHECK(q_fp8.dim() == 4, "q_fp8 must be 4D (B, 1, H, D)");

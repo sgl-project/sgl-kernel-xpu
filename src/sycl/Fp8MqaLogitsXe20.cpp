@@ -124,6 +124,7 @@ torch::Tensor fp8_paged_mqa_logits(
   TORCH_CHECK(kv_cache.is_xpu(), "kv_cache must be on XPU");
   TORCH_CHECK(q_fp8.dim() == 4, "q_fp8 must be 4D (B, 1, H, D)");
   TORCH_CHECK(kv_cache.dim() == 4, "kv_cache must be 4D");
+  TORCH_CHECK(q_fp8.size(1) == 1, "q_fp8 must have shape (B, 1, H, D) with size(1)=1");
   TORCH_CHECK(q_fp8.scalar_type() == at::kByte, "q_fp8 must be uint8 (FP8 e4m3)");
   TORCH_CHECK(kv_cache.scalar_type() == at::kByte, "kv_cache must be uint8");
   TORCH_CHECK(weights.scalar_type() == at::kFloat, "weights must be float32");

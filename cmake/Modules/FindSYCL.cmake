@@ -71,6 +71,22 @@ else()
     )
 endif()
 
+# SYCL_COMPILER_LAUNCHER
+# Optional launcher (e.g. ccache/sccache) prefixed before the SYCL compiler. The
+# SYCL device compile runs through run_sycl.cmake's execute_process, which CMake's
+# built-in CMAKE_<LANG>_COMPILER_LAUNCHER does NOT reach — so we plumb a launcher
+# explicitly here for anyone who wants one.
+#
+# Defaults to EMPTY (off) on purpose: ccache cannot cache `icx -fsycl` device
+# compiles. SYCL appends an integration footer to a temp copy of the source
+# (/tmp/icx-XXXX/<tu>.cpp), which ccache's preprocessor mode can't track, so every
+# call returns `bad_input_file` and falls back to the real compiler — adding a
+# wasted `icx -E` preprocess pass with zero cache hits, i.e. strictly slower.
+# Opt in explicitly (e.g. -DSYCL_COMPILER_LAUNCHER=ccache) only if you have a
+# SYCL-aware cache or a newer ccache that handles -fsycl.
+set(SYCL_COMPILER_LAUNCHER ""
+  CACHE STRING "Launcher (e.g. ccache) prefixed before the SYCL compiler; empty = off")
+
 # Parse HOST_COMPILATION mode.
 option(SYCL_HOST_COMPILATION_CXX "Generated file extension" ON)
 

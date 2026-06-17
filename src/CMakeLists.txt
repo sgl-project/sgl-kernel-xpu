@@ -1,7 +1,11 @@
 # ATen XPU sources
 
-file(GLOB device_cpp "sycl/*.cpp" "sycl/*.sycl")
-file(GLOB host_cpp "./*.cpp" "./*.cc")
+# CONFIGURE_DEPENDS makes Ninja re-run these globs on every build and
+# auto-reconfigure when a source file is added/removed, so newly-created
+# kernels are picked up by an incremental `cmake --build` instead of being
+# silently skipped until the next from-scratch configure.
+file(GLOB device_cpp CONFIGURE_DEPENDS "sycl/*.cpp" "sycl/*.sycl")
+file(GLOB host_cpp CONFIGURE_DEPENDS "./*.cpp" "./*.cc")
 
 # BMG only
 set(device_cpp_xe20)

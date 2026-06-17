@@ -37,3 +37,12 @@ minimum-version = "build-system.requires"
 wheel.py-api = "cp39"
 wheel.license-files = []
 wheel.packages = ["python/sgl_kernel"]
+
+# Auto-rebuild on import: after a one-time `pip install -e .`, every
+# `import sgl_kernel` runs `cmake --build` + `cmake --install` against the
+# persistent build dir. Combined with CONFIGURE_DEPENDS on the source globs,
+# the build system handles everything automatically — edits recompile only the
+# touched TUs, and newly-added source files trigger a reconfigure — with no
+# manual build command. Requires build-dir to be set (it is, above).
+editable.rebuild = true
+editable.verbose = false

@@ -244,8 +244,10 @@ void moe_grouped_mm_nt_xe20(
     }
   } else if (narrow_k) {
     // Narrow-K (e.g. K=176 for MoE down-projection): few K-loop iterations
-    // starve the pipeline. Tile_128_128 with 8 SGs/WG balances occupancy
-    // with good N-coverage (22 tiles for N=2816) and M-tail utilization.
+    // starve the pipeline. Unfused: Tile_128_128 (Shape<_128, _128, _32>);
+    // fused: Tile_128_64 (Shape<_128, _64, _32>). Both use 8 SGs/WG and
+    // balance occupancy with good N-coverage (22 tiles for N=2816) and
+    // M-tail utilization.
     if (fuse_act) {
       DISPATCH_MOE(
           activation_type, true, with_bias, Shape<_128, _64, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);

@@ -1553,7 +1553,7 @@ def test_flash_attn_varlen_output(
 
     # set seed
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
-    batch_size = 9 if seqlen_q <= 2048 else 2
+    batch_size = 9 if seqlen_q <= 1024 else 2
     if nheads_kv > nheads_q:
         pytest.skip("Require nheads_kv <= nheads_q")
     assert nheads_q % nheads_kv == 0

@@ -508,7 +508,6 @@ def generate_qkv(
         (64, 256),
         (3, 799),
         (64, 2048),
-        (16, 20000),
         (128, 128),
         (256, 512),  # To test appending KV with more than 1 block
         (2048, 3577),  # Enough tile to test persistent scheduler

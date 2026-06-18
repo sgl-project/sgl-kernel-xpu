@@ -1,3 +1,37 @@
+/***************************************************************************************************
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ **************************************************************************************************/
+/*! \file
+    \brief XPU Gemm Square Sum Kernel
+*/
+
 #pragma once
 
 #include "../collective/xe_gemm_sqrsum_mainloop.hpp"
@@ -6,8 +40,8 @@
 #include "cute/util/compat/dims.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
-#include "cutlass/gemm/kernel/tile_scheduler.hpp"
 #include "cutlass/kernel_hardware_info.hpp"
+#include "gemm_sqrsum_tile_scheduler.hpp"
 
 namespace cutlass::gemm_sqrsum::kernel {
 using namespace cute;
@@ -21,6 +55,8 @@ class GemmSqrSumKernel {
   using ElementB = typename CollectiveMainloop::ElementB;
   using ElementC = typename CollectiveMainloop::ElementC;
   using ElementSqrSum = typename CollectiveMainloop::ElementSqrSum;
+  using TileScheduler = XeGemmSqrSumTileScheduler;
+  using TileSchedulerParams = typename TileScheduler::Params;
 
   static constexpr auto BLK_M = get<0>(TileShape{});
   static constexpr auto BLK_N = get<1>(TileShape{});
@@ -29,6 +65,8 @@ class GemmSqrSumKernel {
   struct Params {
     typename CollectiveMainloop::Params mainloop;
     cutlass::KernelHardwareInfo hw_info;
+
+    TileSchedulerParams scheduler;
 
     int M;
     int K;
@@ -91,6 +129,7 @@ class GemmSqrSumKernel {
     return Params{
         CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
         cutlass::KernelHardwareInfo{},
+        TileScheduler::to_underlying_arguments(args, cutlass::KernelHardwareInfo{}, TileShape{}, args.split_k),
         args.M,
         args.K,
         args.N,
@@ -119,10 +158,9 @@ class GemmSqrSumKernel {
   }
 
   static compat::dim3 get_grid_shape(Params const& params) {
-    int grid_m = (params.M + BLK_M - 1) / BLK_M;
-    int grid_n = (params.N + BLK_N - 1) / BLK_N;
-    return compat::dim3(params.split_k, grid_n, grid_m);
+    return TileScheduler::template get_grid_shape<1>(params.scheduler);
   }
+
 
   static compat::dim3 get_block_shape() {
     constexpr int num_threads = cute::size(typename CollectiveMainloop::TiledMMA{});
@@ -136,11 +174,11 @@ class GemmSqrSumKernel {
 
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
-    auto item = this_work_item::get_nd_item<3>();
-    int thr_id = int(item.get_local_id(2));
-    int blk_m = int(item.get_group(0));
-    int blk_n = int(item.get_group(1));
-    int split_idx = int(item.get_group(2));
+    int thr_id = int(this_work_item::get_nd_item<3>().get_local_id(2));
+
+    TileScheduler scheduler{params.scheduler};
+    auto [blk_m, blk_n, split_idx] = scheduler.get_block_coord();
+
 
     int k_tiles_total = (params.K + BLK_K - 1) / BLK_K;
     int split_k = params.split_k;

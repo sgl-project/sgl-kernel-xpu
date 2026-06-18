@@ -40,6 +40,7 @@
 #include "cutlass/epilogue/collective/collective_epilogue.hpp"
 #include "cutlass/epilogue/collective/detail.hpp"
 #include "cutlass/epilogue/dispatch_policy.hpp"
+#include "sycl/Utils.h"
 #include "sycl/comm/copy_block_slm.hpp"
 
 namespace cutlass::fmha::collective {
@@ -51,7 +52,12 @@ template <
     class TileShapeO_,         // Shape of output tile, may be larger than P*V GEMM
     class TensorO_,            // 2D slice of global output tensor
     class TiledCopyO_ = void,  // Optional TiledCopy for loading O
-    bool Sink_ = false>        // Whether to add a sink token to the softmax denominator
+    bool Sink_ = false,        // Whether to add a sink token to the softmax denominator
+    // PackGQA: the M tile holds the head_group_q query heads of one GQA group
+    // (decode only). Each packed row is a distinct query head with its own sink
+    // logit, so the sink is applied per row. Default false keeps prefill and
+    // non-packed decode on the scalar (per-head) path.
+    bool PackGQA_ = false>
 class FMHAFwdEpilogue {
  public:
   //
@@ -138,15 +144,51 @@ class FMHAFwdEpilogue {
 
   template <typename QVCoord>
   CUTLASS_DEVICE void operator()(
-      TensorO2D const& O,                      // Global O tensor: (q,v)
-      FragA& tArA,                             // O accumulator:   (q,v)
-      FragARow& tA_max,                        // Softmax row-wise max accumulator
-      FragARow& tA_sum,                        // Softmax row-wise sum accumulator
-      QVCoord blk_qv,                          // WG tile indices: (q,v)
-      int thr_id,                              // Work-item ID
-      ElementSink sink_val = ElementSink{}) {  // Per-head sink logit (used when Sink==true)
+      TensorO2D const& O,                     // Global O tensor: (q,v)
+      FragA& tArA,                            // O accumulator:   (q,v)
+      FragARow& tA_max,                       // Softmax row-wise max accumulator
+      FragARow& tA_sum,                       // Softmax row-wise sum accumulator
+      QVCoord blk_qv,                         // WG tile indices: (q,v)
+      int thr_id,                             // Work-item ID
+      ElementSink sink_val = ElementSink{},   // Per-head sink logit (non-packed, used when Sink==true)
+      const ElementSink* sink_ptr = nullptr,  // Per-row sink logits base (PackGQA, used when Sink==true)
+      int head_group_q = 0) {                 // # packed query heads in the M tile (PackGQA)
     using namespace cute;
     using ElementA = typename FragA::element_type;
+
+    /* PackGQA decode: each packed M row is a distinct query head sharing the
+       same decode position, so the sink logit is per-row. Add it to the
+       per-subgroup running sum BEFORE the cross-subgroup reduction (mirrors the
+       split-decode epilogue): lane `l` of subgroup 0 owns packed row `l`, and
+       reduce_A rescales this contribution by exp2(sg0_max - global_max). The
+       running max/sum are kept in log2 units (exp2 space), so the sink logit is
+       likewise scaled by log2e. */
+    if constexpr (Sink && PackGQA_) {
+      constexpr double kLog2e = 1.4426950408889634074;
+      int sg_id = thr_id / intel::sg_size;
+      int lane = thr_id % intel::sg_size;
+      if (sg_id == 0 && lane < head_group_q) {
+        const ElementA s = static_cast<ElementA>(sink_ptr[lane] * kLog2e);
+        if (tA_sum(0) != ElementA(0)) {
+          // Subgroup 0 holds in-window tokens for this row: add the sink
+          // relative to its partial max. reduce_A later rescales this whole
+          // contribution by exp2(sg0_max - global_max), giving exp2(sink -
+          // global_max) regardless of which subgroup owns the global max.
+          tA_sum(0) += sycl::native::exp2(s - tA_max(0));
+        } else {
+          // Subgroup 0 has no in-window tokens for this row (partial max is
+          // -inf), but other subgroups (k-blocks) may. The old guard dropped
+          // the sink here, shrinking the denominator; removing it instead
+          // overflowed exp2(s - (-inf)) to +inf -> inf*0 = NaN after rescale.
+          // Seed sg0's max with the sink logit and its sum with exp2(s - s) = 1
+          // so the cross-subgroup reduction rescales the sink to the true
+          // global max. Fully-masked rows (no tokens anywhere) end up with
+          // denominator 1 and zero P*V, i.e. output 0, matching the reference.
+          tA_max(0) = s;
+          tA_sum(0) = ElementA(1);
+        }
+      }
+    }
 
     // Reduce k-blocks of A and A_sum across WG, if needed.
     auto [rA, rA_max_local, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
@@ -157,18 +199,29 @@ class FMHAFwdEpilogue {
     /* Add sink token contribution to softmax denominator.
        sink_val is the raw logit for the sink token (same for every query row).
        We add exp2(sink_val * log2e - row_max) to each row's running sum. */
-    if constexpr (Sink) {
+    if constexpr (Sink && !PackGQA_) {
       constexpr double kLog2e = 1.4426950408889634074;
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < rA_sum.size(); i++) {
-        rA_sum(i) += sycl::native::exp2(static_cast<ElementA>(sink_val * kLog2e) - rA_max_local(i));
+        // Only add sink if this row has at least some unmasked KV tokens (sum != 0).
+        // Fully-masked rows have sum==0 and max==lowest(), so skipping prevents overflow.
+        if (rA_sum(i) != ElementA(0)) {
+          rA_sum(i) += sycl::native::exp2(static_cast<ElementA>(sink_val * kLog2e) - rA_max_local(i));
+        }
       }
     }
 
-    /* Complete softmax, dividing out sums. */
+    /* Complete softmax, dividing out sums. Rows whose denominator is exactly
+       zero attend to no (unmasked) keys -- e.g. a batch with zero KV length --
+       so emit 0 instead of NaN to match the reference implementation. */
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA_sum.size(); i++)
-      rA_sum(i) = ElementA(1) / rA_sum(i);
+    for (int i = 0; i < rA_sum.size(); i++) {
+      if constexpr (CollectiveMainloop::LocalMask || CollectiveMainloop::CausalMask) {
+        rA_sum(i) = safe_recip(rA_sum(i));
+      } else {
+        rA_sum(i) = ElementA(1) / rA_sum(i);
+      }
+    }
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < rA.size(); i++)
@@ -416,10 +469,17 @@ class DecodeFwdEpilogue {
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
 
-    /* Complete softmax, dividing out sums. */
+    /* Complete softmax, dividing out sums. Rows whose denominator is exactly
+       zero attend to no (unmasked) keys -- e.g. a batch with zero KV length --
+       so emit 0 instead of NaN to match the reference implementation. */
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA_sum.size(); i++)
-      rA_sum(i) = ElementA(1) / rA_sum(i);
+    for (int i = 0; i < rA_sum.size(); i++) {
+      if constexpr (CollectiveMainloop::LocalMask || CollectiveMainloop::CausalMask) {
+        rA_sum(i) = safe_recip(rA_sum(i));
+      } else {
+        rA_sum(i) = ElementA(1) / rA_sum(i);
+      }
+    }
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < rA.size(); i++)
@@ -465,7 +525,20 @@ class DecodeFwdEpilogue {
     if constexpr (Sink) {
       constexpr double kLog2e = 1.4426950408889634074;
       if (idx_kv_split == 0 && sg_id == 0 && thr_id < head_group_q) {
-        tA_sum(0) += sycl::native::exp2(static_cast<ElementA>(tSink(thr_id) * kLog2e) - tA_max(0));
+        const ElementA s = static_cast<ElementA>(tSink(thr_id) * kLog2e);
+        if (tA_sum(0) != ElementA(0)) {
+          // This split holds in-window tokens for the row: add the sink
+          // relative to the partial max; reduce_A rescales it to the global max.
+          tA_sum(0) += sycl::native::exp2(s - tA_max(0));
+        } else {
+          // No in-window tokens in this split's k-blocks for the row. Seed the
+          // max with the sink logit and the sum with exp2(s - s) = 1 so the
+          // sink survives the reduction at the true global max instead of being
+          // dropped (shrunk denominator) or overflowing to NaN. Sink is still
+          // only injected once, in idx_kv_split == 0.
+          tA_max(0) = s;
+          tA_sum(0) = ElementA(1);
+        }
       }
     }
 

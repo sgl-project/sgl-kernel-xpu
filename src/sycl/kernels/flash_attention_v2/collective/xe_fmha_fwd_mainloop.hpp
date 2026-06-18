@@ -70,7 +70,12 @@ template <
     class TiledCopyV_ = void,        // Optional TiledCopy for loading V
     class TiledCopyK_cache_ = void,  // Optional TiledCopy for loading K_cache
     class TiledCopyV_cache_ = void,  // Optional TiledCopy for loading V_cache
-    bool LocalMask_ = false>
+    bool LocalMask_ = false,
+    // PackGQA: the M tile holds the head_group_q query heads of one GQA group
+    // (decode only, seq_len_qo == 1). All packed rows share the single decode
+    // KV position, so per-row masking must use a fixed decode row. Default
+    // false keeps prefill (and non-packed decode) unaffected.
+    bool PackGQA_ = false>
 struct FMHAFwdMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -95,7 +100,8 @@ template <
     class TiledCopyV_,
     class TiledCopyK_cache_,
     class TiledCopyV_cache_,
-    bool LocalMask_>
+    bool LocalMask_,
+    bool PackGQA_>
 struct FMHAFwdMainloop<
     XeDefault<Stages>,
     CausalMask_,
@@ -114,7 +120,8 @@ struct FMHAFwdMainloop<
     TiledCopyV_,
     TiledCopyK_cache_,
     TiledCopyV_cache_,
-    LocalMask_> {
+    LocalMask_,
+    PackGQA_> {
   //
   // Type Aliases
   //
@@ -183,6 +190,7 @@ struct FMHAFwdMainloop<
   static constexpr bool CachedKV = CachedKV_;
   static constexpr bool PagedKV = PagedKV_;
   static constexpr bool LocalMask = LocalMask_;
+  static constexpr bool PackGQA = PackGQA_;
 
   // User-facing arguments
   struct Arguments {
@@ -432,7 +440,10 @@ struct FMHAFwdMainloop<
         for (int i = 0; i < tSrS.size(); ++i) {
           int row_idx = get<0>(cS_thread(i));
           int col_idx = get<1>(cS_thread(i));
-          int row_kv_idx = row_idx + full_tile_offset;
+          // PackGQA decode: every packed M row is the same decode token, so the
+          // KV position is full_tile_offset regardless of the per-row (head)
+          // index. Non-packed keeps the per-row sequence position.
+          int row_kv_idx = (PackGQA_ ? 0 : row_idx) + full_tile_offset;
           bool left_mask = col_idx < row_kv_idx - params.window_size_left;
           bool right_mask = col_idx > row_kv_idx + params.window_size_right;
           if (left_mask || right_mask) {

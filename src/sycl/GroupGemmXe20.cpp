@@ -222,6 +222,9 @@ void moe_grouped_mm_nt_xe20(
   bool small_weight = (int64_t)gemm_k * gemm_n <= MOE_GROUPED_GEMM_SMALL_WEIGHT_THRESHOLD;
   int ld_b = static_cast<int>(weights.stride(1));
 
+  bool narrow_k = gemm_k <= 256;
+  bool narrow_n_fused = fuse_act && (gemm_n <= 512);
+
   if (avg_m <= 8) {
     DISPATCH_MOE(
         activation_type, fuse_act, with_bias, Shape<_8, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
@@ -239,6 +242,22 @@ void moe_grouped_mm_nt_xe20(
       DISPATCH_MOE(
           activation_type, false, with_bias, Shape<_128, _128, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
     }
+  } else if (narrow_k) {
+    // Narrow-K (e.g. K=176 for MoE down-projection): few K-loop iterations
+    // starve the pipeline. Tile_128_128 with 8 SGs/WG balances occupancy
+    // with good N-coverage (22 tiles for N=2816) and M-tail utilization.
+    if (fuse_act) {
+      DISPATCH_MOE(
+          activation_type, true, with_bias, Shape<_128, _64, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
+    } else {
+      DISPATCH_MOE(
+          activation_type, false, with_bias, Shape<_128, _128, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
+    }
+  } else if (narrow_n_fused) {
+    // Narrow-N fused (e.g. N=352 → effective N/2=176 for MoE up-projection):
+    // Use 128-tile for better M-tail utilization vs 256-tile.
+    DISPATCH_MOE(
+        activation_type, true, with_bias, Shape<_128, _64, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
   } else {
     if (fuse_act) {
       DISPATCH_MOE(

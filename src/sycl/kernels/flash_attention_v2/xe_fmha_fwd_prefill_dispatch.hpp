@@ -103,4 +103,10 @@ EXTERN_FMHA_PREFILL_NP_RUNNER(512)
     }                                                                                                           \
   } while (0)
 
+// Dispatch macro following the same pattern as decode.
+// Directly call struct operator() - no function pointers.
+// Expands inside prefill::mha_fwd where a local `params` is in scope.
+
+#define DISPATCH_PREFILL_KERNEL(HD) FmhaPrefillRunner<HD>{}(params)
+
 }  // namespace prefill

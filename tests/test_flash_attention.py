@@ -570,7 +570,9 @@ def test_flash_attn_kvcache(
         has_qv = d == 64 and dv >= 256
         softmax_scale = 1.0 / math.sqrt(d if has_qv is None else d + dv)
         q = (
-            torch.randn(batch_size, seqlen_q, nheads_q, d, device=device, dtype=dtype_ref)
+            torch.randn(
+                batch_size, seqlen_q, nheads_q, d, device=device, dtype=dtype_ref
+            )
             .to(dtype)
             .to(dtype_ref)
         )
@@ -623,7 +625,12 @@ def test_flash_attn_kvcache(
             )
             v = (
                 torch.randn(
-                    batch_size, seqlen_new, nheads_kv, dv, device=device, dtype=dtype_ref
+                    batch_size,
+                    seqlen_new,
+                    nheads_kv,
+                    dv,
+                    device=device,
+                    dtype=dtype_ref,
                 )
                 .to(dtype)
                 .to(dtype_ref)
@@ -1058,7 +1065,9 @@ def test_flash_attn_decode_kvcache(
         has_qv = d == 64 and dv >= 256
         softmax_scale = 1.0 / math.sqrt(d if has_qv is None else d + dv)
         q = (
-            torch.randn(batch_size, seqlen_q, nheads_q, d, device=device, dtype=dtype_ref)
+            torch.randn(
+                batch_size, seqlen_q, nheads_q, d, device=device, dtype=dtype_ref
+            )
             .to(dtype)
             .to(dtype_ref)
         )
@@ -1111,7 +1120,12 @@ def test_flash_attn_decode_kvcache(
             )
             v = (
                 torch.randn(
-                    batch_size, seqlen_new, nheads_kv, dv, device=device, dtype=dtype_ref
+                    batch_size,
+                    seqlen_new,
+                    nheads_kv,
+                    dv,
+                    device=device,
+                    dtype=dtype_ref,
                 )
                 .to(dtype)
                 .to(dtype_ref)

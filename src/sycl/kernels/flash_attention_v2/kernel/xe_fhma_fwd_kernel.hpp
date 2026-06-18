@@ -309,8 +309,11 @@ class XeFMHAFwdKernel {
       if constexpr (CollectiveMainloop::LocalMask) {
         const int tile_q = get<0>(TileShapeQK{});
         const int tile_k = get<1>(TileShapeQK{});
-        const int q_tile_min_row_kv = blk_q * tile_q + full_tile_offset;
-        const int q_tile_max_row_kv = q_tile_min_row_kv + tile_q - 1;
+        // PackGQA decode folds query heads (not sequence positions) into the M
+        // tile, so every row is the single decode token at KV position
+        // full_tile_offset; the sliding-window band is independent of blk_q.
+        const int q_tile_min_row_kv = PackGQA_ ? full_tile_offset : (blk_q * tile_q + full_tile_offset);
+        const int q_tile_max_row_kv = PackGQA_ ? full_tile_offset : (q_tile_min_row_kv + tile_q - 1);
         const int lo_kv = cute::max(0, q_tile_min_row_kv - params.mainloop.window_size_left);
         const int hi_kv_plus_one = q_tile_max_row_kv + params.mainloop.window_size_right + 1;
         blk_k0 = lo_kv / tile_k;
@@ -407,7 +410,23 @@ class XeFMHAFwdKernel {
       // Epilogue
       CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
       if constexpr (Sink) {
-        epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, p.sm_sink[q_head_idx]);
+        if constexpr (PackGQA_) {
+          // Packed decode: pass the per-row sink base for this KV head's group
+          // (heads head*head_group_q .. +head_group_q-1), applied per row in the
+          // epilogue.
+          epilogue(
+              O(_, _, q_head_idx, l_coord),
+              tArA,
+              tA_max,
+              tA_sum,
+              blk_qv,
+              thr_id,
+              ElementSink{},
+              p.sm_sink + head * head_group_q,
+              head_group_q);
+        } else {
+          epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, p.sm_sink[q_head_idx]);
+        }
       } else {
         epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id);
       }

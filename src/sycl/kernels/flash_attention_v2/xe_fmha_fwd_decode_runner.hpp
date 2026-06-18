@@ -618,6 +618,21 @@ struct DecodeConfig {
     using GmemTiledCopyK_cache = GmemTiledCopyK;
     using GmemTiledCopyV_cache = GmemTiledCopyV;
 
+    // Pack the GQA query group into the M dimension for decode. Decode always
+    // has seq_len_qo == 1, so the M tile is free to hold the head_group_q query
+    // heads that share a KV head; the mainloop/epilogue handle the packed
+    // local-mask (fixed decode row) and per-row sink. Decode is always
+    // non-causal (a single query token cannot be masked by a causal rule), so
+    // packing is always enabled here. Prefill keeps the default false on all
+    // three components and is unaffected.
+    // SGL_DISABLE_PACKGQA: benchmark/debug escape hatch to force the unpacked
+    // (per-head launch) decode path for A/B perf comparison.
+#ifdef SGL_DISABLE_PACKGQA
+    constexpr bool PackGQA = false;
+#else
+    constexpr bool PackGQA = true;
+#endif
+
     // Mainloop
     using MainloopDispatchPolicy = cutlass::fmha::XeDefault<PipelineStages>;
     using CollectiveMainloop = cutlass::fmha::collective::FMHAFwdMainloop<
@@ -638,19 +653,14 @@ struct DecodeConfig {
         GmemTiledCopyV,
         GmemTiledCopyK_cache,
         GmemTiledCopyV_cache,
-        LocalMask>;
+        LocalMask,
+        PackGQA>;
 
     // Epilogue
-    using CollectiveEpilogue =
-        cutlass::fmha::collective::FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, Sink>;
+    using CollectiveEpilogue = cutlass::fmha::collective::
+        FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, Sink, PackGQA>;
 
     static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
-    // Pack the GQA query group into the M dimension only for plain decode: with
-    // a causal/local mask the shared mainloop applies per-row KV positions
-    // (invalid when M rows are GQA heads at the same decode position), and with
-    // a sink the shared epilogue applies a single per-row sink logit. Those
-    // paths keep the per-head launch (PackGQA = false).
-    constexpr bool PackGQA = !Causal && !LocalMask && !Sink;
     using FMHADecodeKernel = conditional_t<
         is_same_v<Scheduler, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>,
         cutlass::fmha::kernel::

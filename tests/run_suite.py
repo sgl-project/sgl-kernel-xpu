@@ -32,6 +32,7 @@ suites = {
         TestFile("test_per_tensor_quant_fp8.py"),
         TestFile("test_fused_qk_norm_rope.py"),
         TestFile("test_fused_qk_rope_with_cache.py"),
+        TestFile("test_merge_state.py"),
         TestFile("test_merge_state_v2.py"),
         TestFile("test_norm.py"),
         TestFile("test_per_token_group_quant_8bit_v2.py"),
@@ -42,7 +43,6 @@ suites = {
         TestFile("test_hc_pre_fuse.py"),
         TestFile("test_fused_experts_mxfp4_dsv4_shapes.py"),
         TestFile("test_store_cache_xpu.py"),
-        TestFile("test_merge_state.py"),
     ],
 }
 

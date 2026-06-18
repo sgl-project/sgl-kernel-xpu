@@ -42,14 +42,16 @@
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/kernel_hardware_info.hpp"
 #include "gemm_sqrsum_tile_scheduler.hpp"
+#include "../collective/xe_gemm_sqrsum_epilogue.hpp"
 
 namespace cutlass::gemm_sqrsum::kernel {
 using namespace cute;
 
-template <class CollectiveMainloop_>
+template <class CollectiveMainloop_, class CollectiveEpilogue_>
 class GemmSqrSumKernel {
  public:
   using CollectiveMainloop = CollectiveMainloop_;
+  using CollectiveEpilogue = CollectiveEpilogue_;
   using TileShape = typename CollectiveMainloop::TileShape;
   using ElementA = typename CollectiveMainloop::ElementA;
   using ElementB = typename CollectiveMainloop::ElementB;
@@ -61,6 +63,11 @@ class GemmSqrSumKernel {
   static constexpr auto BLK_M = get<0>(TileShape{});
   static constexpr auto BLK_N = get<1>(TileShape{});
   static constexpr auto BLK_K = get<2>(TileShape{});
+
+  struct SharedStorage {
+    typename CollectiveMainloop::SharedStorage mainloop;
+    typename CollectiveEpilogue::SharedStorage epilogue;
+  };
 
   struct Params {
     typename CollectiveMainloop::Params mainloop;
@@ -119,10 +126,6 @@ class GemmSqrSumKernel {
     ElementSqrSum* ptr_sqrsum_scratch;
     int64_t stride_sqsc_m;
     int64_t stride_sqsc_n;
-  };
-
-  struct SharedStorage {
-    typename CollectiveMainloop::SharedStorage mainloop;
   };
 
   static Params to_underlying_arguments(Arguments const& args, void* workspace) {
@@ -194,12 +197,12 @@ class GemmSqrSumKernel {
     auto layout_A = make_layout(make_shape(params.M, params.K), make_stride(params.stride_A_m, Int<1>{}));
     auto layout_B = make_layout(make_shape(params.N, params.K), make_stride(params.stride_B_k, Int<1>{}));
     auto layout_C = make_layout(make_shape(params.M, params.N), make_stride(params.stride_C_m, Int<1>{}));
-    auto layout_sqrsum = make_layout(make_shape(params.M), make_stride(Int<1>{}));
+    auto layout_Ssc = make_layout(make_shape(params.M, params.N), make_stride(params.stride_sqsc_m, Int<1>{}));
 
     Tensor A = make_tensor(make_gmem_ptr(params.ptr_A), layout_A);
     Tensor B = make_tensor(make_gmem_ptr(params.ptr_B), layout_B);
     Tensor C = make_tensor(make_gmem_ptr(ptr_C_split), layout_C);
-    Tensor SqrSum = make_tensor(make_gmem_ptr(params.ptr_sqrsum), layout_sqrsum);
+    Tensor Ssc = make_tensor(make_gmem_ptr(ptr_sqsc_split), layout_Ssc);
 
     auto A_2D = A(append<rank_v<decltype(A)>>(make_coord(_, _), 0));
     auto B_2D = B(append<rank_v<decltype(B)>>(make_coord(_, _), 0));
@@ -211,23 +214,8 @@ class GemmSqrSumKernel {
 
     mainloop(A_2D, B_2D, tC, tSqrSum, make_coord(blk_m, blk_n), thr_id, k_tile_begin, k_tile_end);
 
-    typename CollectiveMainloop::TiledMMA mma{};
-    auto thr_mma = mma.get_slice(thr_id);
-
-    auto cC = make_identity_tensor(C.shape());
-    auto gC = local_tile(cC, mma.tile_mnk(), make_coord(blk_m, blk_n, 0), Step<_1, _1, X>{});
-    auto copy_c = make_block_2d_copy_D(mma, C);
-    auto tCgC = thr_mma.partition_C(gC);
-
-    copy(copy_c, tC, tCgC);
-
-    auto layout_Ssc = make_layout(make_shape(params.M, params.N), make_stride(params.stride_sqsc_m, Int<1>{}));
-    Tensor Ssc = make_tensor(make_gmem_ptr(ptr_sqsc_split), layout_Ssc);
-    auto cSsc = make_identity_tensor(Ssc.shape());
-    auto gSsc = local_tile(cSsc, mma.tile_mnk(), make_coord(blk_m, blk_n, 0), Step<_1, _1, X>{});
-    auto copy_sq = make_block_2d_copy_D(mma, Ssc);
-    auto tSgSsc = thr_mma.partition_C(gSsc);
-    copy(copy_sq, tSqrSum, tSgSsc);
+    CollectiveEpilogue epilogue({}, shared_storage.epilogue);
+    epilogue(C, Ssc, tC, tSqrSum, make_coord(blk_m, blk_n), thr_id);
   }
 };
 

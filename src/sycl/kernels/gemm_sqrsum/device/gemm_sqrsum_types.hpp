@@ -14,6 +14,7 @@
 #include "cutlass/numeric_types.h"
 #include "sycl/comm/common.h"
 #include "sycl/kernels/gemm_sqrsum/collective/xe_gemm_sqrsum_mainloop.hpp"
+#include "sycl/kernels/gemm_sqrsum/collective/xe_gemm_sqrsum_epilogue.hpp"
 #include "sycl/kernels/gemm_sqrsum/kernel/xe_gemm_sqrsum_kernel.hpp"
 
 using namespace cute;
@@ -113,7 +114,9 @@ struct GemmSqrSumXe {
   using CollectiveMainloop =
       cutlass::gemm_sqrsum::collective::XeGemmSqrSumMainloop<DispatchPolicy, TiledMma, TensorA, TensorB>;
 
-  using Kernel = cutlass::gemm_sqrsum::kernel::GemmSqrSumKernel<CollectiveMainloop>;
+  using CollectiveEpilogue = cutlass::gemm_sqrsum::collective::XeGemmSqrSumEpilogue<CollectiveMainloop>;
+
+  using Kernel = cutlass::gemm_sqrsum::kernel::GemmSqrSumKernel<CollectiveMainloop, CollectiveEpilogue>;
 };
 
 inline void runGemmSqrSum(at::Tensor& C, at::Tensor& sqrsum, const at::Tensor& A, const at::Tensor& B) {

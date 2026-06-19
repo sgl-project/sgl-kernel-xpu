@@ -156,7 +156,15 @@ def torch_naive_moe(
             ],  # (act_type, gemm1_alpha, gemm1_limit)
             [2.5],
         )
-    ),
+    )
+    # Gemma4-26B-A4B TP=4 shapes: hidden=2816, intermediate=176 (shard=352=2×176).
+    # GEMM1: K=2816, N=352, fuse_act=True  → narrow_n_fused branch (N≤512, avg_m>128)
+    # GEMM2: K=176,  N=2816, fuse_act=False → narrow_k branch (K≤256, avg_m>128)
+    # num_tokens=[1,64,256] covers avg_m≤8/16/128 branches; 1024 hits the new branches.
+    + [
+        (num_tokens, 8, 128, 2816, 176, False, ("silu", None, None), 2.5)
+        for num_tokens in [1, 64, 256, 1024]
+    ],
 )
 def test_moe_gemm(
     num_tokens,
@@ -521,72 +529,6 @@ def test_moe_grouped_mm_nt_xe20_mxfp4_w4a16_op(
     torch.testing.assert_close(
         inputs["output_bf16"], inputs["output_mxfp4"], rtol=1e-1, atol=1e-2
     )
-
-
-# ---------------------------------------------------------------------------
-# Gemma4-26B-A4B TP=4 MoE simulation
-# ---------------------------------------------------------------------------
-#
-# Representative shapes for Gemma4-26B-A4B with tensor parallelism degree 4:
-#   hidden_size = 2816
-#   shard_intermediate_size = 352  (= 2 × 176, where 176 is the per-rank
-#                                    intermediate dimension for the down-projection)
-#
-# Per-GEMM dispatch routing (C++ GroupGemmXe20.cpp):
-#   GEMM1 (up-proj, fused-act):
-#     K=2816, N=352, fuse_act=True → narrow_n_fused branch (N ≤ 512) when avg_m > 128
-#   GEMM2 (down-proj):
-#     K=176, N=2816, fuse_act=False → narrow_k branch (K ≤ 256) when avg_m > 128
-#
-# avg_m = (num_tokens × topk) // num_experts (with num_experts=4, topk=1):
-#   num_tokens=1   → avg_m=0  → avg_m ≤ 8 branch (8×64×32 tile)
-#   num_tokens=64  → avg_m=16 → avg_m ≤ 16 && small_weight branch
-#   num_tokens=256 → avg_m=64 → avg_m ≤ 128 && small_weight branch
-#   num_tokens=1024 → avg_m=256 → narrow_n_fused (GEMM1) and narrow_k (GEMM2) ✓
-
-_GEMMA4_26B_TP4_HIDDEN = 2816
-_GEMMA4_26B_TP4_SHARD_INT = 352  # = 2 * (intermediate_size // TP4)
-
-
-@pytest.mark.parametrize("num_tokens", [1, 64, 256, 1024])
-def test_moe_gemm_gemma4_26b_a4b_tp4(num_tokens):
-    """Simulate one TP4 rank of Gemma4-26B-A4B MoE with silu activation.
-
-    Uses 4 local experts and topk=1. The num_tokens=1024 case (avg_m=256)
-    exercises the new narrow_n_fused and narrow_k dispatch branches added in
-    GroupGemmXe20.cpp for the up-projection and down-projection GEMMs.
-    """
-    hidden_size = _GEMMA4_26B_TP4_HIDDEN
-    shard_intermediate_size = _GEMMA4_26B_TP4_SHARD_INT
-    intermediate_size = shard_intermediate_size // 2  # 176 per TP4 rank
-    num_experts = 4
-    topk = 1
-
-    torch.xpu.manual_seed_all(0)
-
-    rtol, atol = 1e-4, 1e-3
-    a = create_random_xpu_tensor((num_tokens, hidden_size), torch.bfloat16)
-    # w1: gate+up projection [E, 2*intermediate, hidden]
-    w1 = create_random_xpu_tensor(
-        (num_experts, shard_intermediate_size, hidden_size), torch.bfloat16
-    )
-    # w2: down projection [E, hidden, intermediate]
-    w2 = create_random_xpu_tensor(
-        (num_experts, hidden_size, intermediate_size), torch.bfloat16
-    )
-
-    score = torch.randn([num_tokens, num_experts], dtype=torch.bfloat16).to("xpu")
-    score = torch.softmax(score, dim=-1, dtype=torch.float32)
-    topk_weight, topk_ids = torch.topk(score, topk)
-
-    torch_output = torch_naive_moe(
-        a, w1, w2, topk_ids, topk_weight, topk, None, None, activations="silu"
-    )
-    sglang_output = fused_experts(
-        a, w1, w2, topk_weight, topk_ids, None, None, activation="silu"
-    )
-
-    torch.testing.assert_close(torch_output, sglang_output, rtol=rtol, atol=atol)
 
 
 if __name__ == "__main__":

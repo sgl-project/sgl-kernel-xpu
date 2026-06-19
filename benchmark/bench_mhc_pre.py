@@ -1,23 +1,10 @@
-"""Benchmark for the full mhc_pre pipeline: hc_pre_gemm_sqr_sum -> hc_pre_big_fuse.
-
-mhc_pre replaces the two non-prenorm TileLang paths. It runs two kernels
-back-to-back: the CUTLASS hc_pre_gemm_sqr_sum (residual @ fnᵀ + row sqr-sum, written
-as K-split partials) and hc_pre_big_fuse (reduce + RMS/Sinkhorn/mix, optional
-RMSNorm). This times the whole thing end-to-end at the production shapes.
-"""
-
 import pandas as pd
 import torch
 import triton
 from sgl_kernel import mhc_pre
 
-# Production shapes (from the real mhc_pre call log): D=4096, hc_mult=4,
-# hc_hidden = hc_mult * D = 16384, fn = [24, 16384]. Token counts span the
-# ragged set; all <= 2048 so all take the split-k path (n_splits_pre=32).
 configs = [
     # (b_s, seq_len, hidden_size)
-    (16, 1, 4096),
-    (48, 1, 4096),
     (128, 1, 4096),
     (512, 1, 4096),
     (896, 1, 4096),
@@ -27,6 +14,8 @@ configs = [
     (1038, 1, 4096),
     (1518, 1, 4096),
     (2048, 1, 4096),
+    (16, 1, 4096),
+    (48, 1, 4096),
 ]
 
 sinkhorn_repeat = 20
@@ -71,12 +60,10 @@ def benchmark(b_s, seq_len, hidden_size, provider):
     hc_hidden = hc * hidden_size
     use_norm = provider == "with_norm"
 
-    # Inputs (match the production mhc_pre call: bf16 residual, fp32 fn).
     residual = torch.randn(T, hc, hidden_size, dtype=torch.bfloat16, device="xpu")
     fn = torch.randn(hc_mult3, hc_hidden, dtype=torch.float32, device="xpu")
     hc_scale = torch.rand(3, dtype=torch.float32, device="xpu") * 0.5 + 0.5
     hc_base = torch.randn(hc_mult3, dtype=torch.float32, device="xpu") * 0.1
-    # RMSNorm weights cluster near 1 in practice.
     norm_weight = (
         torch.randn(hidden_size, dtype=torch.float32, device="xpu") * 0.5 + 1.0
     ).to(torch.bfloat16)
@@ -110,11 +97,6 @@ def benchmark(b_s, seq_len, hidden_size, provider):
 
     n_splits_pre = _n_splits_pre(T)
 
-    # Memory traffic (the dominant terms; small params elided).
-    #   GEMM reads:  residual A (bf16) once widened, fn (fp32)
-    #   GEMM writes: gemm_out_mul [n_splits,T,24] fp32, sqr_sum [n_splits,T] fp32
-    #   Fuse reads:  those partials + residual (bf16) again (+ norm_weight)
-    #   Fuse writes: post_mix, comb_mix (fp32), layer_input (bf16)
     gemm_read = T * hc_hidden * 2 + hc_mult3 * hc_hidden * 4  # residual bf16 + fn fp32
     gemm_write = n_splits_pre * T * hc_mult3 * 4 + n_splits_pre * T * 4
     fuse_read = (
@@ -128,8 +110,6 @@ def benchmark(b_s, seq_len, hidden_size, provider):
     total_bytes = gemm_read + gemm_write + fuse_read + fuse_write
     bandwidth_gb_s = total_bytes / (ms / 1e3) / 1e9
 
-    # GEMM compute: C = A @ Bᵀ is M*N*K MACs; the sqr-sum is a second M*N*K
-    # GEMM. 2 flops/MAC, x2 for the two GEMMs.
     gemm_flops = 2 * 2 * T * hc_mult3 * hc_hidden
     tflops = gemm_flops / (ms / 1e3) / 1e12
 

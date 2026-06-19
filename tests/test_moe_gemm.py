@@ -529,7 +529,8 @@ def test_moe_grouped_mm_nt_xe20_mxfp4_w4a16_op(
 #
 # Representative shapes for Gemma4-26B-A4B with tensor parallelism degree 4:
 #   hidden_size = 2816
-#   shard_intermediate_size = 352  (= 2 × intermediate_size_per_rank = 2 × 176)
+#   shard_intermediate_size = 352  (= 2 × 176, where 176 is the per-rank
+#                                    intermediate dimension for the down-projection)
 #
 # Per-GEMM dispatch routing (C++ GroupGemmXe20.cpp):
 #   GEMM1 (up-proj, fused-act):
@@ -537,10 +538,10 @@ def test_moe_grouped_mm_nt_xe20_mxfp4_w4a16_op(
 #   GEMM2 (down-proj):
 #     K=176, N=2816, fuse_act=False → narrow_k branch (K ≤ 256) when avg_m > 128
 #
-# avg_m = (num_tokens × topk) // num_experts:
-#   num_tokens=1   → avg_m=0   → avg_m ≤ 8 branch
-#   num_tokens=64  → avg_m=16  → avg_m ≤ 16 && small_weight branch
-#   num_tokens=256 → avg_m=64  → avg_m ≤ 128 && small_weight branch
+# avg_m = (num_tokens × topk) // num_experts (with num_experts=4, topk=1):
+#   num_tokens=1   → avg_m=0  → avg_m ≤ 8 branch (8×64×32 tile)
+#   num_tokens=64  → avg_m=16 → avg_m ≤ 16 && small_weight branch
+#   num_tokens=256 → avg_m=64 → avg_m ≤ 128 && small_weight branch
 #   num_tokens=1024 → avg_m=256 → narrow_n_fused (GEMM1) and narrow_k (GEMM2) ✓
 
 _GEMMA4_26B_TP4_HIDDEN = 2816

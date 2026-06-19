@@ -21,26 +21,17 @@
 #include <cstdint>
 #include <sycl/sycl.hpp>
 
+#include "../memory.hpp"
+
 namespace sgl {
 namespace sycl_kernel {
 
+// Import aligned_vector from memory utilities
+using sgl::sycl::aligned_vector;
+
 // ============================================================================
-// Vector Type Helpers
+// Helper Types for RoPE
 // ============================================================================
-
-template <typename T, int N>
-struct alignas(N * sizeof(T)) aligned_vector {
-  T data[N];
-
-  aligned_vector() = default;
-
-  T& operator[](int i) {
-    return data[i];
-  }
-  const T& operator[](int i) const {
-    return data[i];
-  }
-};
 
 // Packed type for half-precision pairs (bf16/fp16)
 struct packed2_t {

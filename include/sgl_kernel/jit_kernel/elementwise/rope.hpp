@@ -360,7 +360,7 @@ void fused_rope_launcher(
 
   // Calculate work threads based on rope_dim, clamped to kBlockSize.
   constexpr uint32_t kDimPerThread = 16 / sizeof(DType);
-  constexpr uint32_t kWorkThreads = []() {
+  constexpr uint32_t kWorkThreads = [kBlockSize]() {
     uint32_t power = 1;
     while (power * kDimPerThread < kRopeDim)
       power *= 2;
@@ -417,7 +417,7 @@ void fused_rope_store_launcher(
 
   // Calculate work threads, clamped to kBlockSize.
   constexpr uint32_t kDimPerThread = 16 / sizeof(DType);
-  constexpr uint32_t kWorkThreads = []() {
+  constexpr uint32_t kWorkThreads = [kBlockSize]() {
     uint32_t power = 1;
     while (power * kDimPerThread < kRopeDim)
       power *= 2;

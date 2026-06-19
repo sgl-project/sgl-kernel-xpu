@@ -130,8 +130,8 @@ struct HcPreGemmSqrSumXe {
 
   using CollectiveEpilogue = cutlass::hc_pre_gemm_sqr_sum::collective::XeHcPreGemmSqrSumEpilogue<CollectiveMainloop>;
 
-  using Kernel =
-      cutlass::hc_pre_gemm_sqr_sum::kernel::XeHcPreGemmSqrSumKernel<HcPreGemmSqrSumProblemShape, CollectiveMainloop, CollectiveEpilogue>;
+  using Kernel = cutlass::hc_pre_gemm_sqr_sum::kernel::
+      XeHcPreGemmSqrSumKernel<HcPreGemmSqrSumProblemShape, CollectiveMainloop, CollectiveEpilogue>;
 };
 
 inline typename HcPreGemmSqrSumXe::Kernel::Arguments

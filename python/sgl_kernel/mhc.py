@@ -149,17 +149,17 @@ def hc_pre_big_fuse(
     )
 
 
-def gemm_sqrsum(
+def hc_pre_gemm_sqr_sum(
     C: torch.Tensor,
-    sqrsum: torch.Tensor,
+    sqr_sum: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,
 ) -> None:
-    torch.ops.sgl_kernel.gemm_sqrsum.default(C, sqrsum, A, B)
+    torch.ops.sgl_kernel.hc_pre_gemm_sqr_sum.default(C, sqr_sum, A, B)
 
 
 def _mhc_pre_n_splits_pre(num_tokens: int) -> int:
-    """K-split count for the TileLang-replacement GEMM+sqrsum paths.
+    """K-split count for the TileLang-replacement GEMM+sqr_sum paths.
 
     Mirrors the reference's two non-prenorm branches:
       * num_tokens <= 2048 -> split-k path, n_splits_pre = 32
@@ -186,11 +186,11 @@ def mhc_pre(
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: float = 1e-6,
 ):
-    """mhc_pre: fused GEMM+sqrsum -> RMS/Sinkhorn/mix, replacing the two TileLang
-    (non-prenorm) paths with the CUTLASS gemm_sqrsum kernel + hc_pre_big_fuse.
+    """mhc_pre: fused GEMM+sqr_sum -> RMS/Sinkhorn/mix, replacing the two TileLang
+    (non-prenorm) paths with the CUTLASS hc_pre_gemm_sqr_sum kernel + hc_pre_big_fuse.
 
     Pipeline (two kernel launches, control returns to Python in between):
-      1. gemm_sqrsum: residual @ fnᵀ and row square-sum, as [n_splits_pre, T, *]
+      1. hc_pre_gemm_sqr_sum: residual @ fnᵀ and row sqr-sum, as [n_splits_pre, T, *]
          K-split partials.
       2. hc_pre_big_fuse: reduces the split axis, then RMS + Sinkhorn mix (and
          optional RMSNorm of layer_input when norm_weight is given).
@@ -233,7 +233,7 @@ def mhc_pre(
 
     device = residual.device
 
-    # GEMM+sqrsum operands. A = residual flattened to [T, hc_hidden]; B = fn [N, K].
+    # GEMM+sqr_sum operands. A = residual flattened to [T, hc_hidden]; B = fn [N, K].
     A = residual.reshape(num_tokens, hc_hidden)
 
     # Fuse-shaped partial buffers (leading split axis reduced by the fuse).
@@ -243,7 +243,7 @@ def mhc_pre(
     gemm_out_sqrsum = torch.empty(
         n_splits_pre, num_tokens, dtype=torch.float32, device=device
     )
-    gemm_sqrsum(gemm_out_mul, gemm_out_sqrsum, A, fn)
+    hc_pre_gemm_sqr_sum(gemm_out_mul, gemm_out_sqrsum, A, fn)
 
     # Fuse outputs.
     post_mix = torch.empty(num_tokens, hc_mult, dtype=torch.float32, device=device)

@@ -7,14 +7,14 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 
-namespace cutlass::gemm_sqrsum {
+namespace cutlass::hc_pre_gemm_sqr_sum {
 
 template <int Stages>
 class XeDefault {};
 
-}  // namespace cutlass::gemm_sqrsum
+}  // namespace cutlass::hc_pre_gemm_sqr_sum
 
-namespace cutlass::gemm_sqrsum::collective {
+namespace cutlass::hc_pre_gemm_sqr_sum::collective {
 using namespace cute;
 
 template <
@@ -24,12 +24,12 @@ template <
     class TensorB_,
     class TiledCopyA_ = void,
     class TiledCopyB_ = void>
-struct XeGemmSqrSumMainloop {
+struct XeHcPreGemmSqrSumMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
 
 template <int Stages, class TiledMMA_, class TensorA_, class TensorB_, class TiledCopyA_, class TiledCopyB_>
-struct XeGemmSqrSumMainloop<XeDefault<Stages>, TiledMMA_, TensorA_, TensorB_, TiledCopyA_, TiledCopyB_> {
+struct XeHcPreGemmSqrSumMainloop<XeDefault<Stages>, TiledMMA_, TensorA_, TensorB_, TiledCopyA_, TiledCopyB_> {
   using TiledMMA = TiledMMA_;
   using TileShape = decltype(TiledMMA{}.tile_mnk());
 
@@ -72,7 +72,7 @@ struct XeGemmSqrSumMainloop<XeDefault<Stages>, TiledMMA_, TensorA_, TensorB_, Ti
   Params params;
   SharedStorage& shared;
 
-  XeGemmSqrSumMainloop(Params const& params_, SharedStorage& shared_) : params(params_), shared(shared_) {}
+  XeHcPreGemmSqrSumMainloop(Params const& params_, SharedStorage& shared_) : params(params_), shared(shared_) {}
 
   static constexpr Params to_underlying_arguments(Arguments const& args, void* /* workspace */) {
     return Params{};
@@ -196,4 +196,4 @@ struct XeGemmSqrSumMainloop<XeDefault<Stages>, TiledMMA_, TensorA_, TensorB_, Ti
   }
 };
 
-}  // namespace cutlass::gemm_sqrsum::collective
+}  // namespace cutlass::hc_pre_gemm_sqr_sum::collective

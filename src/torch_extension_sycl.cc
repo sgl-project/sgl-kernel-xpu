@@ -233,8 +233,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("embedding_lora_a_fwd", torch::kXPU, &embedding_lora_a_fwd);
 
   /* GEMM + SQUARE SUM */
-  m.def("gemm_sqrsum(Tensor! C, Tensor! sqrsum, Tensor A, Tensor B) -> ()");
-  m.impl("gemm_sqrsum", torch::kXPU, &gemm_with_sqrsum);
+  m.def("hc_pre_gemm_sqr_sum(Tensor! C, Tensor! sqr_sum, Tensor A, Tensor B) -> ()");
+  m.impl("hc_pre_gemm_sqr_sum", torch::kXPU, &hc_pre_gemm_with_sqr_sum);
 }
 
 REGISTER_EXTENSION(common_ops)

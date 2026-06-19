@@ -1,13 +1,13 @@
 import pandas as pd
 import torch
 import triton
-from sgl_kernel import gemm_sqrsum
+from sgl_kernel import hc_pre_gemm_sqr_sum
 
-# Production mhc_pre GEMM+sqrsum stage shapes (Design B: K-split partials):
+# Production mhc_pre GEMM+sqr_sum stage shapes (Design B: K-split partials):
 #   A      [M, K]            bf16   (residual.view(M, hc_hidden)); hc_hidden = hc_mult * hidden
 #   B      [N, K]            fp32   (fn = [24, 16384] = [N, K])
 #   C      [n_splits, M, N]  fp32   (gemm_out_mul partials), C = A @ B^T per K-slice
-#   sqrsum [n_splits, M]     fp32   (gemm_out_sqrsum partials), sqrsum[s,m] = partial sum A^2
+#   sqr_sum [n_splits, M]     fp32   (gemm_out_sqr_sum partials), sqr_sum[s,m] = partial sum A^2
 # N (=hc_mult3) and K (=hc_mult*hidden) are fixed; only the token count M varies.
 # n_splits follows the mhc_pre split-k rule (32 for M<=2048).
 hc = 4
@@ -48,7 +48,7 @@ all_results = []
         line_names=["sgl_kernel (tf32)"],
         styles=[("green", "-")],
         ylabel="Time (ms)",
-        plot_name="gemm-sqrsum-performance",
+        plot_name="gemm-sqr_sum-performance",
         args={},
     )
 )
@@ -63,9 +63,9 @@ def benchmark(M, K, N, provider):
     B = torch.randn(N, K, dtype=torch.float32, device="xpu")
 
     C = torch.empty(n_splits, M, N, dtype=torch.float32, device="xpu")
-    sqrsum = torch.empty(n_splits, M, dtype=torch.float32, device="xpu")
+    sqr_sum = torch.empty(n_splits, M, dtype=torch.float32, device="xpu")
 
-    run = lambda: gemm_sqrsum(C, sqrsum, A, B)
+    run = lambda: hc_pre_gemm_sqr_sum(C, sqr_sum, A, B)
 
     # Warmup
     for _ in range(100):
@@ -77,12 +77,12 @@ def benchmark(M, K, N, provider):
 
     torch.xpu.empty_cache()
 
-    # GEMM (2*M*N*K) + row square-sum (2*M*K: square + accumulate).
+    # GEMM (2*M*N*K) + row sqr-sum (2*M*K: square + accumulate).
     flops = 2.0 * M * N * K + 2.0 * M * K
     tflops = flops / (ms / 1e3) / 1e12
 
     read_bytes = M * K * 2 + N * K * 4  # A (bf16) + B (fp32)
-    write_bytes = n_splits * M * N * 4 + n_splits * M * 4  # C + sqrsum partials (fp32)
+    write_bytes = n_splits * M * N * 4 + n_splits * M * 4  # C + sqr_sum partials (fp32)
     total_bytes = read_bytes + write_bytes
     bandwidth_gb_s = total_bytes / (ms / 1e3) / 1e9
 
@@ -108,7 +108,7 @@ if __name__ == "__main__":
 
     df = pd.DataFrame(all_results)
     print("\n" + "=" * 80)
-    print("GEMM_SQRSUM BENCHMARK RESULTS")
+    print("HC_PRE_GEMM_SQUARE_SUM BENCHMARK RESULTS")
     print("=" * 80)
     print(df.to_markdown(index=False))
     print("\n")

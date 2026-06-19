@@ -1,7 +1,7 @@
-"""Benchmark for the full mhc_pre pipeline: gemm_sqrsum -> hc_pre_big_fuse.
+"""Benchmark for the full mhc_pre pipeline: hc_pre_gemm_sqr_sum -> hc_pre_big_fuse.
 
 mhc_pre replaces the two non-prenorm TileLang paths. It runs two kernels
-back-to-back: the CUTLASS gemm_sqrsum (residual @ fnᵀ + row square-sum, written
+back-to-back: the CUTLASS hc_pre_gemm_sqr_sum (residual @ fnᵀ + row sqr-sum, written
 as K-split partials) and hc_pre_big_fuse (reduce + RMS/Sinkhorn/mix, optional
 RMSNorm). This times the whole thing end-to-end at the production shapes.
 """
@@ -112,7 +112,7 @@ def benchmark(b_s, seq_len, hidden_size, provider):
 
     # Memory traffic (the dominant terms; small params elided).
     #   GEMM reads:  residual A (bf16) once widened, fn (fp32)
-    #   GEMM writes: gemm_out_mul [n_splits,T,24] fp32, sqrsum [n_splits,T] fp32
+    #   GEMM writes: gemm_out_mul [n_splits,T,24] fp32, sqr_sum [n_splits,T] fp32
     #   Fuse reads:  those partials + residual (bf16) again (+ norm_weight)
     #   Fuse writes: post_mix, comb_mix (fp32), layer_input (bf16)
     gemm_read = T * hc_hidden * 2 + hc_mult3 * hc_hidden * 4  # residual bf16 + fn fp32
@@ -128,7 +128,7 @@ def benchmark(b_s, seq_len, hidden_size, provider):
     total_bytes = gemm_read + gemm_write + fuse_read + fuse_write
     bandwidth_gb_s = total_bytes / (ms / 1e3) / 1e9
 
-    # GEMM compute: C = A @ Bᵀ is M*N*K MACs; the square-sum is a second M*N*K
+    # GEMM compute: C = A @ Bᵀ is M*N*K MACs; the sqr-sum is a second M*N*K
     # GEMM. 2 flops/MAC, x2 for the two GEMMs.
     gemm_flops = 2 * 2 * T * hc_mult3 * hc_hidden
     tflops = gemm_flops / (ms / 1e3) / 1e12

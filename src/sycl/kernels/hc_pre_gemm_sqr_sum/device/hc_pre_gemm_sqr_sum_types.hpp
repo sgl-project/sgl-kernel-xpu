@@ -13,9 +13,9 @@
 #include "cutlass/gemm/collective/collective_mma.hpp"
 #include "cutlass/numeric_types.h"
 #include "sycl/comm/common.h"
-#include "sycl/kernels/gemm_sqrsum/collective/xe_gemm_sqrsum_epilogue.hpp"
-#include "sycl/kernels/gemm_sqrsum/collective/xe_gemm_sqrsum_mainloop.hpp"
-#include "sycl/kernels/gemm_sqrsum/kernel/xe_gemm_sqrsum_kernel.hpp"
+#include "sycl/kernels/hc_pre_gemm_sqr_sum/collective/xe_hc_pre_gemm_sqr_sum_epilogue.hpp"
+#include "sycl/kernels/hc_pre_gemm_sqr_sum/collective/xe_hc_pre_gemm_sqr_sum_mainloop.hpp"
+#include "sycl/kernels/hc_pre_gemm_sqr_sum/kernel/xe_hc_pre_gemm_sqr_sum_kernel.hpp"
 
 using namespace cute;
 
@@ -24,18 +24,18 @@ auto make_dummy_tensor_type(Element val, Stride stride) {
   return make_tensor(make_gmem_ptr(&val), make_layout(repeat<rank_v<Stride>>(1), stride));
 }
 
-struct GemmSqrSumProblemShape {
+struct HcPreGemmSqrSumProblemShape {
   int M = 0;
   int N = 0;
   int K = 0;
 
-  GemmSqrSumProblemShape() = default;
+  HcPreGemmSqrSumProblemShape() = default;
 };
 
-namespace cutlass::gemm_sqrsum::device {
+namespace cutlass::hc_pre_gemm_sqr_sum::device {
 
 template <class Kernel_>
-class GemmSqrSum {
+class HcPreGemmSqrSum {
  public:
   using Kernel = Kernel_;
   using Arguments = typename Kernel::Arguments;
@@ -46,7 +46,7 @@ class GemmSqrSum {
   bool initialized_ = false;
 
  public:
-  GemmSqrSum() = default;
+  HcPreGemmSqrSum() = default;
 
   Params const& params() const {
     return params_;
@@ -99,16 +99,16 @@ class GemmSqrSum {
   }
 };
 
-}  // namespace cutlass::gemm_sqrsum::device
+}  // namespace cutlass::hc_pre_gemm_sqr_sum::device
 
-struct GemmSqrSumXe {
+struct HcPreGemmSqrSumXe {
   using Element = cutlass::tfloat32_t;
   using ElementALoad = cutlass::bfloat16_t;
 
   using StrideA = Stride<int, _1>;
   using StrideB = Stride<int, _1>;
   using StrideC = Stride<int, _1>;
-  using StrideSqsc = Stride<int, _1>;
+  using StrideSqsum = Stride<int, _1>;
 
   using TileShape = Shape<Int<64>, Int<32>, Int<16>>;
 
@@ -120,32 +120,32 @@ struct GemmSqrSumXe {
   using TiledMma = typename TiledMMAHelper<MmaAtom, Layout<TileShape>, SubgroupLayout>::TiledMMA;
 
   // Pipeline Stages
-  using DispatchPolicy = cutlass::gemm_sqrsum::XeDefault<3>;
+  using DispatchPolicy = cutlass::hc_pre_gemm_sqr_sum::XeDefault<3>;
 
   using TensorA = decltype(make_dummy_tensor_type(ElementALoad{}, StrideA{}));
   using TensorB = decltype(make_dummy_tensor_type(Element{}, StrideB{}));
 
   using CollectiveMainloop =
-      cutlass::gemm_sqrsum::collective::XeGemmSqrSumMainloop<DispatchPolicy, TiledMma, TensorA, TensorB>;
+      cutlass::hc_pre_gemm_sqr_sum::collective::XeHcPreGemmSqrSumMainloop<DispatchPolicy, TiledMma, TensorA, TensorB>;
 
-  using CollectiveEpilogue = cutlass::gemm_sqrsum::collective::XeGemmSqrSumEpilogue<CollectiveMainloop>;
+  using CollectiveEpilogue = cutlass::hc_pre_gemm_sqr_sum::collective::XeHcPreGemmSqrSumEpilogue<CollectiveMainloop>;
 
   using Kernel =
-      cutlass::gemm_sqrsum::kernel::XeGemmSqrSumKernel<GemmSqrSumProblemShape, CollectiveMainloop, CollectiveEpilogue>;
+      cutlass::hc_pre_gemm_sqr_sum::kernel::XeHcPreGemmSqrSumKernel<HcPreGemmSqrSumProblemShape, CollectiveMainloop, CollectiveEpilogue>;
 };
 
-inline typename GemmSqrSumXe::Kernel::Arguments
-args_from_options(at::Tensor& C, at::Tensor& sqrsum, const at::Tensor& A, const at::Tensor& B) {
-  using Kernel = typename GemmSqrSumXe::Kernel;
-  using ElementALoad = typename GemmSqrSumXe::ElementALoad;
-  using Element = typename GemmSqrSumXe::Element;
+inline typename HcPreGemmSqrSumXe::Kernel::Arguments
+args_from_options(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, const at::Tensor& B) {
+  using Kernel = typename HcPreGemmSqrSumXe::Kernel;
+  using ElementALoad = typename HcPreGemmSqrSumXe::ElementALoad;
+  using Element = typename HcPreGemmSqrSumXe::Element;
 
   int M = A.size(0);
   int K = A.size(1);
   int N = B.size(0);
   int split_k = C.size(0);
 
-  GemmSqrSumProblemShape shape;
+  HcPreGemmSqrSumProblemShape shape;
   shape.M = M;
   shape.N = N;
   shape.K = K;
@@ -162,19 +162,19 @@ args_from_options(at::Tensor& C, at::Tensor& sqrsum, const at::Tensor& A, const 
   kernel_args.ptr_C = reinterpret_cast<typename Kernel::ElementC*>(C.data_ptr());
   kernel_args.dC = cute::make_stride(N, cute::_1{});
 
-  kernel_args.ptr_sqrsum = sqrsum.data_ptr<float>();
-  kernel_args.ptr_sqrsum_scratch = sqrsum.data_ptr<float>();
-  kernel_args.dSqsc = cute::make_stride(1, cute::_1{});
+  kernel_args.ptr_sqr_sum = sqr_sum.data_ptr<float>();
+  kernel_args.ptr_sqr_sum_scratch = sqr_sum.data_ptr<float>();
+  kernel_args.dSqsum = cute::make_stride(1, cute::_1{});
 
   typename Kernel::Arguments args{};
   args.kernel = kernel_args;
-  args.mainloop = typename GemmSqrSumXe::CollectiveMainloop::Arguments{};
+  args.mainloop = typename HcPreGemmSqrSumXe::CollectiveMainloop::Arguments{};
   args.split_k = split_k;
   return args;
 }
 
-inline void runGemmSqrSum(at::Tensor& C, at::Tensor& sqrsum, const at::Tensor& A, const at::Tensor& B) {
-  using Runner = cutlass::gemm_sqrsum::device::GemmSqrSum<typename GemmSqrSumXe::Kernel>;
+inline void runHcPreGemmSqrSum(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, const at::Tensor& B) {
+  using Runner = cutlass::hc_pre_gemm_sqr_sum::device::HcPreGemmSqrSum<typename HcPreGemmSqrSumXe::Kernel>;
 
   int M = A.size(0);
   int K = A.size(1);
@@ -184,10 +184,10 @@ inline void runGemmSqrSum(at::Tensor& C, at::Tensor& sqrsum, const at::Tensor& A
   TORCH_CHECK(B.size(1) == K, "A.K (", K, ") must match B.K (", B.size(1), ") for GEMM");
   TORCH_CHECK(C.dim() == 3 && C.size(1) == M && C.size(2) == N, "C must be [n_splits, M, N]");
   TORCH_CHECK(
-      sqrsum.dim() == 2 && sqrsum.size(0) == split_k && sqrsum.size(1) == M,
-      "sqrsum must be [n_splits, M] matching C's leading dim");
+      sqr_sum.dim() == 2 && sqr_sum.size(0) == split_k && sqr_sum.size(1) == M,
+      "sqr_sum must be [n_splits, M] matching C's leading dim");
 
-  auto args = args_from_options(C, sqrsum, A, B);
+  auto args = args_from_options(C, sqr_sum, A, B);
 
   Runner runner;
   auto status = runner.run(args, nullptr, c10::xpu::getCurrentXPUStream().queue());

@@ -455,7 +455,7 @@ void hc_pre_big_fuse(
 /*
  * mhc_pre GEMM + row-wise square sum stage
  */
-void gemm_with_sqrsum(at::Tensor& C, at::Tensor& sqrsum, const at::Tensor& A, const at::Tensor& B);
+void hc_pre_gemm_with_sqr_sum(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, const at::Tensor& B);
 
 /*
  * From csrc/speculative

@@ -29,54 +29,59 @@
  *
  **************************************************************************************************/
 /*! \file
-    \brief Tile scheduler for Gemm Squaresum
+    \brief Gemm Square Sum Epilogue
 */
 
 #pragma once
 
+#include "cute/algorithm/copy.hpp"
+#include "cute/atom/mma_atom.hpp"
+#include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
-#include "cutlass/kernel_hardware_info.h"
 
-namespace cutlass::gemm_sqrsum::kernel {
+namespace cutlass::hc_pre_gemm_sqr_sum::collective {
+using namespace cute;
 
-struct XeGemmSqrSumTileScheduler {
-  struct Params {
-    dim3 grid;
-  };
-
+template <class CollectiveMainloop_>
+class XeHcPreGemmSqrSumEpilogue {
+ public:
+  using CollectiveMainloop = CollectiveMainloop_;
+  using TiledMMA = typename CollectiveMainloop::TiledMMA;
+  using FragGemm = typename CollectiveMainloop::FragGemm;
+  using FragSqrSum = typename CollectiveMainloop::FragSqrSum;
+  struct Arguments {};
+  using Params = Arguments;
+  struct SharedStorage {};
   Params params;
-
-  CUTLASS_DEVICE
-  XeGemmSqrSumTileScheduler(Params const& params) : params(params) {}
-
-  template <class ProblemShape, class TileShape>
-  static Params to_underlying_arguments(
-      ProblemShape const& shape, KernelHardwareInfo hw_info, TileShape const& tile_shape, int n_splits = 1) {
-    using namespace cute;
-
-    dim3 grid(
-        size(n_splits),
-        size(ceil_div(shape.M, get<0>(tile_shape))),  // BLK_M
-        size(ceil_div(shape.N, get<1>(tile_shape)))   // BLK_N
-    );
-
-    return Params{grid};
+  SharedStorage& shared;
+  CUTLASS_HOST_DEVICE
+  XeHcPreGemmSqrSumEpilogue(Params const& params_, SharedStorage& shared_) : params(params_), shared(shared_) {}
+  static constexpr Params to_underlying_arguments(Arguments const& args, void* /* workspace */) {
+    return {};
   }
-
-  template <int Num_SGs>
-  static dim3 get_grid_shape(Params const& params) {
-    return params.grid;
+  CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
+    return true;
   }
-
-  CUTLASS_DEVICE
-  auto get_block_coord() {
-    using namespace cute;
-
-    int split_idx = int(BlockIdxX());
-    int blk_m = int(BlockIdxY());
-    int blk_n = int(BlockIdxZ());
-
-    return make_coord(blk_m, blk_n, split_idx);
+  template <typename TensorC, typename TensorSqrSum, typename MNCoord>
+  CUTLASS_DEVICE void
+  operator()(TensorC const& C, TensorSqrSum const& Ssq, FragGemm& tC, FragSqrSum& tSqrSum, MNCoord blk_mn, int thr_id) {
+    TiledMMA mma{};
+    auto thr_mma = mma.get_slice(thr_id);
+    auto blk_coord = make_coord(get<0>(blk_mn), get<1>(blk_mn), 0);
+    auto cC = make_identity_tensor(C.shape());
+    auto gC = local_tile(cC, mma.tile_mnk(), blk_coord, Step<_1, _1, X>{});
+    auto copy_c = make_block_2d_copy_D(mma, C);
+    copy(copy_c, tC, thr_mma.partition_C(gC));
+    Tensor tCcC = thr_mma.partition_C(gC);
+    int const M = get<0>(C.shape());
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(tSqrSum); i++) {
+      int m = get<0>(tCcC(i));
+      int n = get<1>(tCcC(i));
+      if (n == 0 && m < M) {
+        Ssq(m, 0) = tSqrSum(i);
+      }
+    }
   }
 };
-}  // namespace cutlass::gemm_sqrsum::kernel
+}  // namespace cutlass::hc_pre_gemm_sqr_sum::collective

@@ -34,21 +34,21 @@
 
 #pragma once
 
-#include "../collective/xe_gemm_sqrsum_epilogue.hpp"
-#include "../collective/xe_gemm_sqrsum_mainloop.hpp"
+#include "../collective/xe_hc_pre_gemm_sqr_sum_epilogue.hpp"
+#include "../collective/xe_hc_pre_gemm_sqr_sum_mainloop.hpp"
 #include "cute/algorithm/copy.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/util/compat/dims.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/kernel_hardware_info.hpp"
-#include "gemm_sqrsum_tile_scheduler.hpp"
+#include "hc_pre_gemm_sqr_sum_tile_scheduler.hpp"
 
-namespace cutlass::gemm_sqrsum::kernel {
+namespace cutlass::hc_pre_gemm_sqr_sum::kernel {
 using namespace cute;
 
 template <class ProblemShape_, class CollectiveMainloop_, class CollectiveEpilogue_>
-class XeGemmSqrSumKernel {
+class XeHcPreGemmSqrSumKernel {
  public:
   using ProblemShape = ProblemShape_;
   using CollectiveMainloop = CollectiveMainloop_;
@@ -61,8 +61,8 @@ class XeGemmSqrSumKernel {
   using StrideA = decltype(stride(typename CollectiveMainloop::TensorA{}));
   using StrideB = decltype(stride(typename CollectiveMainloop::TensorB{}));
   using StrideC = cute::Stride<int, cute::_1>;
-  using StrideSqsc = cute::Stride<int, cute::_1>;
-  using TileScheduler = XeGemmSqrSumTileScheduler;
+  using StrideSqsum = cute::Stride<int, cute::_1>;
+  using TileScheduler = XeHcPreGemmSqrSumTileScheduler;
   using TileSchedulerParams = typename TileScheduler::Params;
 
   static constexpr auto BLK_M = get<0>(TileShape{});
@@ -86,9 +86,9 @@ class XeGemmSqrSumKernel {
     ElementC* ptr_C = nullptr;
     StrideC dC{};
 
-    ElementSqrSum* ptr_sqrsum = nullptr;
-    ElementSqrSum* ptr_sqrsum_scratch = nullptr;
-    StrideSqsc dSqsc{};
+    ElementSqrSum* ptr_sqr_sum = nullptr;
+    ElementSqrSum* ptr_sqr_sum_scratch = nullptr;
+    StrideSqsum dSqsum{};
 
     KernelArguments() = default;
   };
@@ -158,17 +158,17 @@ class XeGemmSqrSumKernel {
 
     int64_t c_slab_elems = int64_t(s.M) * int64_t(s.N);
     ElementC* ptr_C_split = p.ptr_C + split_idx * c_slab_elems;
-    ElementSqrSum* ptr_sqsc_split = p.ptr_sqrsum_scratch + int64_t(split_idx) * int64_t(s.M);
+    ElementSqrSum* ptr_sqsum_split = p.ptr_sqr_sum_scratch + int64_t(split_idx) * int64_t(s.M);
 
     auto layout_A = make_layout(make_shape(s.M, s.K), p.dA);
     auto layout_B = make_layout(make_shape(s.N, s.K), p.dB);
     auto layout_C = make_layout(make_shape(s.M, s.N), p.dC);
-    auto layout_Ssc = make_layout(make_shape(s.M, 1), p.dSqsc);
+    auto layout_Ssq = make_layout(make_shape(s.M, 1), p.dSqsum);
 
     Tensor A = make_tensor(make_gmem_ptr(p.ptr_A), layout_A);
     Tensor B = make_tensor(make_gmem_ptr(p.ptr_B), layout_B);
     Tensor C = make_tensor(make_gmem_ptr(ptr_C_split), layout_C);
-    Tensor Ssc = make_tensor(make_gmem_ptr(ptr_sqsc_split), layout_Ssc);
+    Tensor Ssq = make_tensor(make_gmem_ptr(ptr_sqsum_split), layout_Ssq);
 
     auto A_2D = A(append<rank_v<decltype(A)>>(make_coord(_, _), 0));
     auto B_2D = B(append<rank_v<decltype(B)>>(make_coord(_, _), 0));
@@ -181,8 +181,8 @@ class XeGemmSqrSumKernel {
     mainloop(A_2D, B_2D, tC, tSqrSum, make_coord(blk_m, blk_n), thr_id, k_tile_begin, k_tile_end);
 
     CollectiveEpilogue epilogue({}, shared_storage.epilogue);
-    epilogue(C, Ssc, tC, tSqrSum, make_coord(blk_m, blk_n), thr_id);
+    epilogue(C, Ssq, tC, tSqrSum, make_coord(blk_m, blk_n), thr_id);
   }
 };
 
-}  // namespace cutlass::gemm_sqrsum::kernel
+}  // namespace cutlass::hc_pre_gemm_sqr_sum::kernel

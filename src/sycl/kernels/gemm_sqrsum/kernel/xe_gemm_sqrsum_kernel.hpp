@@ -156,14 +156,14 @@ class XeGemmSqrSumKernel {
     int k_tile_end = k_tile_begin + tiles_per_split;
     if (k_tile_end > k_tiles_total) k_tile_end = k_tiles_total;
 
-    int64_t slab_elems = int64_t(s.M) * int64_t(s.N);
-    ElementC* ptr_C_split = p.ptr_C + split_idx * slab_elems;
-    ElementSqrSum* ptr_sqsc_split = p.ptr_sqrsum_scratch + split_idx * slab_elems;
+    int64_t c_slab_elems = int64_t(s.M) * int64_t(s.N);
+    ElementC* ptr_C_split = p.ptr_C + split_idx * c_slab_elems;
+    ElementSqrSum* ptr_sqsc_split = p.ptr_sqrsum_scratch + int64_t(split_idx) * int64_t(s.M);
 
     auto layout_A = make_layout(make_shape(s.M, s.K), p.dA);
     auto layout_B = make_layout(make_shape(s.N, s.K), p.dB);
     auto layout_C = make_layout(make_shape(s.M, s.N), p.dC);
-    auto layout_Ssc = make_layout(make_shape(s.M, s.N), p.dSqsc);
+    auto layout_Ssc = make_layout(make_shape(s.M, 1), p.dSqsc);
 
     Tensor A = make_tensor(make_gmem_ptr(p.ptr_A), layout_A);
     Tensor B = make_tensor(make_gmem_ptr(p.ptr_B), layout_B);

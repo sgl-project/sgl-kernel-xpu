@@ -135,7 +135,7 @@ struct GemmSqrSumXe {
 };
 
 inline typename GemmSqrSumXe::Kernel::Arguments
-args_from_options(at::Tensor& C, at::Tensor& sqsc, const at::Tensor& A, const at::Tensor& B) {
+args_from_options(at::Tensor& C, at::Tensor& sqrsum, const at::Tensor& A, const at::Tensor& B) {
   using Kernel = typename GemmSqrSumXe::Kernel;
   using ElementALoad = typename GemmSqrSumXe::ElementALoad;
   using Element = typename GemmSqrSumXe::Element;
@@ -162,9 +162,9 @@ args_from_options(at::Tensor& C, at::Tensor& sqsc, const at::Tensor& A, const at
   kernel_args.ptr_C = reinterpret_cast<typename Kernel::ElementC*>(C.data_ptr());
   kernel_args.dC = cute::make_stride(N, cute::_1{});
 
-  kernel_args.ptr_sqrsum = sqsc.data_ptr<float>();
-  kernel_args.ptr_sqrsum_scratch = sqsc.data_ptr<float>();
-  kernel_args.dSqsc = cute::make_stride(N, cute::_1{});
+  kernel_args.ptr_sqrsum = sqrsum.data_ptr<float>();
+  kernel_args.ptr_sqrsum_scratch = sqrsum.data_ptr<float>();
+  kernel_args.dSqsc = cute::make_stride(1, cute::_1{});
 
   typename Kernel::Arguments args{};
   args.kernel = kernel_args;
@@ -187,14 +187,10 @@ inline void runGemmSqrSum(at::Tensor& C, at::Tensor& sqrsum, const at::Tensor& A
       sqrsum.dim() == 2 && sqrsum.size(0) == split_k && sqrsum.size(1) == M,
       "sqrsum must be [n_splits, M] matching C's leading dim");
 
-  auto sqsc = torch::empty({split_k, M, N}, sqrsum.options().dtype(torch::kFloat32));
-
-  auto args = args_from_options(C, sqsc, A, B);
+  auto args = args_from_options(C, sqrsum, A, B);
 
   Runner runner;
   auto status = runner.run(args, nullptr, c10::xpu::getCurrentXPUStream().queue());
 
   TORCH_CHECK(status == cutlass::Status::kSuccess, "CUTLASS GEMM+SqrSum kernel failed with status: ", int(status));
-
-  sqrsum.copy_(sqsc.select(2, 0));
 }

@@ -72,10 +72,16 @@ class XeGemmSqrSumEpilogue {
     auto gC = local_tile(cC, mma.tile_mnk(), blk_coord, Step<_1, _1, X>{});
     auto copy_c = make_block_2d_copy_D(mma, C);
     copy(copy_c, tC, thr_mma.partition_C(gC));
-    auto cS = make_identity_tensor(Ssc.shape());
-    auto gS = local_tile(cS, mma.tile_mnk(), blk_coord, Step<_1, _1, X>{});
-    auto copy_s = make_block_2d_copy_D(mma, Ssc);
-    copy(copy_s, tSqrSum, thr_mma.partition_C(gS));
+    Tensor tCcC = thr_mma.partition_C(gC);
+    int const M = get<0>(C.shape());
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(tSqrSum); i++) {
+      int m = get<0>(tCcC(i));
+      int n = get<1>(tCcC(i));
+      if (n == 0 && m < M) {
+        Ssc(m, 0) = tSqrSum(i);
+      }
+    }
   }
 };
 }  // namespace cutlass::gemm_sqrsum::collective

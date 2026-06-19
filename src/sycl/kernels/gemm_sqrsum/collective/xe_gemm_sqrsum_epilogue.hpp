@@ -42,47 +42,40 @@
 namespace cutlass::gemm_sqrsum::collective {
 using namespace cute;
 
-  template <class CollectiveMainloop_>
-  class XeGemmSqrSumEpilogue {
-
-      public:
-  
-        using CollectiveMainloop = CollectiveMainloop_;
-        using TiledMMA = typename CollectiveMainloop::TiledMMA;
-        using FragGemm = typename CollectiveMainloop::FragGemm;
-        using FragSqrSum = typename CollectiveMainloop::FragSqrSum;
-        struct Arguments {};
-        using Params = Arguments;
-        struct SharedStorage {};
-        Params params;
-        SharedStorage& shared;
-        CUTLASS_HOST_DEVICE
-        XeGemmSqrSumEpilogue(Params const& params_, SharedStorage& shared_) : params(params_), shared(shared_) {}
-        static constexpr Params to_underlying_arguments(Arguments const& args, void* /* workspace */) {
-            return {};
-        }
-        CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
-            return true;
-        }
-        template <typename TensorC, typename TensorSqrSum, typename MNCoord>
-        CUTLASS_DEVICE void operator()(
-            TensorC const& C,
-            TensorSqrSum const& Ssc,
-            FragGemm& tC,
-            FragSqrSum& tSqrSum,
-            MNCoord blk_mn,
-            int thr_id) {
-            TiledMMA mma{};
-            auto thr_mma = mma.get_slice(thr_id);
-            auto blk_coord = make_coord(get<0>(blk_mn), get<1>(blk_mn), 0);
-            auto cC = make_identity_tensor(C.shape());
-            auto gC = local_tile(cC, mma.tile_mnk(), blk_coord, Step<_1, _1, X>{});
-            auto copy_c = make_block_2d_copy_D(mma, C);
-            copy(copy_c, tC, thr_mma.partition_C(gC));
-            auto cS = make_identity_tensor(Ssc.shape());
-            auto gS = local_tile(cS, mma.tile_mnk(), blk_coord, Step<_1, _1, X>{});
-            auto copy_s = make_block_2d_copy_D(mma, Ssc);
-            copy(copy_s, tSqrSum, thr_mma.partition_C(gS));
-        }
-    };
-}
+template <class CollectiveMainloop_>
+class XeGemmSqrSumEpilogue {
+ public:
+  using CollectiveMainloop = CollectiveMainloop_;
+  using TiledMMA = typename CollectiveMainloop::TiledMMA;
+  using FragGemm = typename CollectiveMainloop::FragGemm;
+  using FragSqrSum = typename CollectiveMainloop::FragSqrSum;
+  struct Arguments {};
+  using Params = Arguments;
+  struct SharedStorage {};
+  Params params;
+  SharedStorage& shared;
+  CUTLASS_HOST_DEVICE
+  XeGemmSqrSumEpilogue(Params const& params_, SharedStorage& shared_) : params(params_), shared(shared_) {}
+  static constexpr Params to_underlying_arguments(Arguments const& args, void* /* workspace */) {
+    return {};
+  }
+  CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
+    return true;
+  }
+  template <typename TensorC, typename TensorSqrSum, typename MNCoord>
+  CUTLASS_DEVICE void
+  operator()(TensorC const& C, TensorSqrSum const& Ssc, FragGemm& tC, FragSqrSum& tSqrSum, MNCoord blk_mn, int thr_id) {
+    TiledMMA mma{};
+    auto thr_mma = mma.get_slice(thr_id);
+    auto blk_coord = make_coord(get<0>(blk_mn), get<1>(blk_mn), 0);
+    auto cC = make_identity_tensor(C.shape());
+    auto gC = local_tile(cC, mma.tile_mnk(), blk_coord, Step<_1, _1, X>{});
+    auto copy_c = make_block_2d_copy_D(mma, C);
+    copy(copy_c, tC, thr_mma.partition_C(gC));
+    auto cS = make_identity_tensor(Ssc.shape());
+    auto gS = local_tile(cS, mma.tile_mnk(), blk_coord, Step<_1, _1, X>{});
+    auto copy_s = make_block_2d_copy_D(mma, Ssc);
+    copy(copy_s, tSqrSum, thr_mma.partition_C(gS));
+  }
+};
+}  // namespace cutlass::gemm_sqrsum::collective

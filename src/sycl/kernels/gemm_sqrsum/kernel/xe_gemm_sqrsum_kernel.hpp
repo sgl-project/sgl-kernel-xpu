@@ -34,6 +34,7 @@
 
 #pragma once
 
+#include "../collective/xe_gemm_sqrsum_epilogue.hpp"
 #include "../collective/xe_gemm_sqrsum_mainloop.hpp"
 #include "cute/algorithm/copy.hpp"
 #include "cute/atom/mma_atom.hpp"
@@ -42,14 +43,14 @@
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/kernel_hardware_info.hpp"
 #include "gemm_sqrsum_tile_scheduler.hpp"
-#include "../collective/xe_gemm_sqrsum_epilogue.hpp"
 
 namespace cutlass::gemm_sqrsum::kernel {
 using namespace cute;
 
-template <class CollectiveMainloop_, class CollectiveEpilogue_>
-class GemmSqrSumKernel {
+template <class ProblemShape_, class CollectiveMainloop_, class CollectiveEpilogue_>
+class XeGemmSqrSumKernel {
  public:
+  using ProblemShape = ProblemShape_;
   using CollectiveMainloop = CollectiveMainloop_;
   using CollectiveEpilogue = CollectiveEpilogue_;
   using TileShape = typename CollectiveMainloop::TileShape;
@@ -57,6 +58,10 @@ class GemmSqrSumKernel {
   using ElementB = typename CollectiveMainloop::ElementB;
   using ElementC = typename CollectiveMainloop::ElementC;
   using ElementSqrSum = typename CollectiveMainloop::ElementSqrSum;
+  using StrideA = decltype(stride(typename CollectiveMainloop::TensorA{}));
+  using StrideB = decltype(stride(typename CollectiveMainloop::TensorB{}));
+  using StrideC = cute::Stride<int, cute::_1>;
+  using StrideSqsc = cute::Stride<int, cute::_1>;
   using TileScheduler = XeGemmSqrSumTileScheduler;
   using TileSchedulerParams = typename TileScheduler::Params;
 
@@ -69,87 +74,47 @@ class GemmSqrSumKernel {
     typename CollectiveEpilogue::SharedStorage epilogue;
   };
 
+  struct KernelArguments {
+    ProblemShape shape{};
+
+    ElementA const* ptr_A = nullptr;
+    StrideA dA{};
+
+    ElementB const* ptr_B = nullptr;
+    StrideB dB{};
+
+    ElementC* ptr_C = nullptr;
+    StrideC dC{};
+
+    ElementSqrSum* ptr_sqrsum = nullptr;
+    ElementSqrSum* ptr_sqrsum_scratch = nullptr;
+    StrideSqsc dSqsc{};
+
+    KernelArguments() = default;
+  };
+
+  using KernelParams = KernelArguments;
+
   struct Params {
-    typename CollectiveMainloop::Params mainloop;
-    cutlass::KernelHardwareInfo hw_info;
-
-    TileSchedulerParams scheduler;
-
-    int M;
-    int K;
-    int N;
-
-    int split_k;
-
-    ElementA const* ptr_A;
-    int64_t stride_A_m;
-    int64_t stride_A_k;
-
-    ElementB const* ptr_B;
-    int64_t stride_B_k;
-    int64_t stride_B_n;
-
-    ElementC* ptr_C;
-    int64_t stride_C_m;
-    int64_t stride_C_n;
-
-    ElementSqrSum* ptr_sqrsum;
-
-    ElementSqrSum* ptr_sqrsum_scratch;
-    int64_t stride_sqsc_m;
-    int64_t stride_sqsc_n;
+    KernelArguments kernel{};
+    typename CollectiveMainloop::Params mainloop{};
+    TileSchedulerParams scheduler{};
+    int split_k = 1;
   };
 
   struct Arguments {
-    typename CollectiveMainloop::Arguments mainloop;
-
-    int M;
-    int K;
-    int N;
-
-    int split_k;
-
-    ElementA const* ptr_A;
-    int64_t stride_A_m;
-    int64_t stride_A_k;
-
-    ElementB const* ptr_B;
-    int64_t stride_B_k;
-    int64_t stride_B_n;
-
-    ElementC* ptr_C;
-    int64_t stride_C_m;
-    int64_t stride_C_n;
-
-    ElementSqrSum* ptr_sqrsum;
-
-    ElementSqrSum* ptr_sqrsum_scratch;
-    int64_t stride_sqsc_m;
-    int64_t stride_sqsc_n;
+    KernelArguments kernel{};
+    typename CollectiveMainloop::Arguments mainloop{};
+    cutlass::KernelHardwareInfo hw_info{};
+    int split_k = 1;
   };
 
   static Params to_underlying_arguments(Arguments const& args, void* workspace) {
     return Params{
+        args.kernel,
         CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
-        cutlass::KernelHardwareInfo{},
-        TileScheduler::to_underlying_arguments(args, cutlass::KernelHardwareInfo{}, TileShape{}, args.split_k),
-        args.M,
-        args.K,
-        args.N,
-        args.split_k,
-        args.ptr_A,
-        args.stride_A_m,
-        args.stride_A_k,
-        args.ptr_B,
-        args.stride_B_k,
-        args.stride_B_n,
-        args.ptr_C,
-        args.stride_C_m,
-        args.stride_C_n,
-        args.ptr_sqrsum,
-        args.ptr_sqrsum_scratch,
-        args.stride_sqsc_m,
-        args.stride_sqsc_n};
+        TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShape{}, args.split_k),
+        args.split_k};
   }
 
   static bool can_implement(Arguments const& args) {
@@ -164,7 +129,6 @@ class GemmSqrSumKernel {
     return TileScheduler::template get_grid_shape<1>(params.scheduler);
   }
 
-
   static compat::dim3 get_block_shape() {
     constexpr int num_threads = cute::size(typename CollectiveMainloop::TiledMMA{});
     return compat::dim3(num_threads, 1, 1);
@@ -177,30 +141,32 @@ class GemmSqrSumKernel {
 
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
+    auto& p = params.kernel;
+    ProblemShape const& s = p.shape;
+
     int thr_id = int(this_work_item::get_nd_item<3>().get_local_id(2));
 
     TileScheduler scheduler{params.scheduler};
     auto [blk_m, blk_n, split_idx] = scheduler.get_block_coord();
 
-
-    int k_tiles_total = (params.K + BLK_K - 1) / BLK_K;
+    int k_tiles_total = (s.K + BLK_K - 1) / BLK_K;
     int split_k = params.split_k;
     int tiles_per_split = (k_tiles_total + split_k - 1) / split_k;
     int k_tile_begin = split_idx * tiles_per_split;
     int k_tile_end = k_tile_begin + tiles_per_split;
     if (k_tile_end > k_tiles_total) k_tile_end = k_tiles_total;
 
-    int64_t slab_elems = int64_t(params.M) * int64_t(params.N);
-    ElementC* ptr_C_split = params.ptr_C + split_idx * slab_elems;
-    ElementSqrSum* ptr_sqsc_split = params.ptr_sqrsum_scratch + split_idx * slab_elems;
+    int64_t slab_elems = int64_t(s.M) * int64_t(s.N);
+    ElementC* ptr_C_split = p.ptr_C + split_idx * slab_elems;
+    ElementSqrSum* ptr_sqsc_split = p.ptr_sqrsum_scratch + split_idx * slab_elems;
 
-    auto layout_A = make_layout(make_shape(params.M, params.K), make_stride(params.stride_A_m, Int<1>{}));
-    auto layout_B = make_layout(make_shape(params.N, params.K), make_stride(params.stride_B_k, Int<1>{}));
-    auto layout_C = make_layout(make_shape(params.M, params.N), make_stride(params.stride_C_m, Int<1>{}));
-    auto layout_Ssc = make_layout(make_shape(params.M, params.N), make_stride(params.stride_sqsc_m, Int<1>{}));
+    auto layout_A = make_layout(make_shape(s.M, s.K), p.dA);
+    auto layout_B = make_layout(make_shape(s.N, s.K), p.dB);
+    auto layout_C = make_layout(make_shape(s.M, s.N), p.dC);
+    auto layout_Ssc = make_layout(make_shape(s.M, s.N), p.dSqsc);
 
-    Tensor A = make_tensor(make_gmem_ptr(params.ptr_A), layout_A);
-    Tensor B = make_tensor(make_gmem_ptr(params.ptr_B), layout_B);
+    Tensor A = make_tensor(make_gmem_ptr(p.ptr_A), layout_A);
+    Tensor B = make_tensor(make_gmem_ptr(p.ptr_B), layout_B);
     Tensor C = make_tensor(make_gmem_ptr(ptr_C_split), layout_C);
     Tensor Ssc = make_tensor(make_gmem_ptr(ptr_sqsc_split), layout_Ssc);
 

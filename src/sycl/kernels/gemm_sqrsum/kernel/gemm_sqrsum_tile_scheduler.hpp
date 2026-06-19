@@ -37,48 +37,46 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/kernel_hardware_info.h"
 
-
 namespace cutlass::gemm_sqrsum::kernel {
 
-  struct XeGemmSqrSumTileScheduler {
-
-   struct Params{
+struct XeGemmSqrSumTileScheduler {
+  struct Params {
     dim3 grid;
-   };
-
-   Params params;
-
-   CUTLASS_DEVICE
-   XeGemmSqrSumTileScheduler(Params const& params) : params(params) {}
-
-   template <class ProblemShape, class TileShape>
-   static Params to_underlying_arguments(ProblemShape const& shape, KernelHardwareInfo hw_info, TileShape const& tile_shape, int n_splits = 1){
-
-   using namespace cute;
-
-   dim3 grid(
-     size(n_splits),
-     size(ceil_div(shape.M, get<0>(tile_shape))), // BLK_M
-     size(ceil_div(shape.N, get<1>(tile_shape)))  // BLK_N
-   );
-
-   return Params{grid};
-   }
-
-   template <int Num_SGs>
-   static dim3 get_grid_shape(Params const& params) {
-     return params.grid;
-   }
-
-   CUTLASS_DEVICE
-   auto get_block_coord() {
-     using namespace cute;
-
-     int split_idx = int(BlockIdxX());
-     int blk_m     = int(BlockIdxY());
-     int blk_n     = int(BlockIdxZ());
-    
-     return make_coord(blk_m, blk_n, split_idx);
-   }
   };
-}
+
+  Params params;
+
+  CUTLASS_DEVICE
+  XeGemmSqrSumTileScheduler(Params const& params) : params(params) {}
+
+  template <class ProblemShape, class TileShape>
+  static Params to_underlying_arguments(
+      ProblemShape const& shape, KernelHardwareInfo hw_info, TileShape const& tile_shape, int n_splits = 1) {
+    using namespace cute;
+
+    dim3 grid(
+        size(n_splits),
+        size(ceil_div(shape.M, get<0>(tile_shape))),  // BLK_M
+        size(ceil_div(shape.N, get<1>(tile_shape)))   // BLK_N
+    );
+
+    return Params{grid};
+  }
+
+  template <int Num_SGs>
+  static dim3 get_grid_shape(Params const& params) {
+    return params.grid;
+  }
+
+  CUTLASS_DEVICE
+  auto get_block_coord() {
+    using namespace cute;
+
+    int split_idx = int(BlockIdxX());
+    int blk_m = int(BlockIdxY());
+    int blk_n = int(BlockIdxZ());
+
+    return make_coord(blk_m, blk_n, split_idx);
+  }
+};
+}  // namespace cutlass::gemm_sqrsum::kernel

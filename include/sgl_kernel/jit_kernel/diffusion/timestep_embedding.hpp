@@ -25,28 +25,19 @@
 #include <cstring>
 #include <sycl/sycl.hpp>
 
+#include "../memory.hpp"
+
 namespace sgl {
 namespace sycl_kernel {
 
+// Import aligned_vector from memory utilities
+using sgl::sycl::aligned_vector;
+
 // ============================================================================
-// Vector Type Helpers
+// Vector Type Aliases
 // ============================================================================
 
-template <typename T, int N>
-struct alignas(N * sizeof(T)) timestep_aligned_vector {
-  T data[N];
-
-  timestep_aligned_vector() = default;
-
-  T& operator[](int i) {
-    return data[i];
-  }
-  const T& operator[](int i) const {
-    return data[i];
-  }
-};
-
-using float4 = timestep_aligned_vector<float, 4>;
+using float4 = aligned_vector<float, 4>;
 
 // ============================================================================
 // Timestep Embedding Kernel

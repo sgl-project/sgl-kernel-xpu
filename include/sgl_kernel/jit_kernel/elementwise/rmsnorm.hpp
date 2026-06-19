@@ -18,29 +18,20 @@
 #include <cstdint>
 #include <sycl/sycl.hpp>
 
+#include "../memory.hpp"
+
 namespace sgl {
 namespace sycl_kernel {
+
+// Import aligned_vector from memory utilities
+using sgl::sycl::aligned_vector;
 
 // Sub-group size matching sgl-kernel-xpu's NUM_REDUCE_STAGES
 static constexpr int kSubGroupSize = 16;
 
 // ============================================================================
-// Vector Type Helpers (for vectorized memory access)
+// Vector Size Helper
 // ============================================================================
-
-template <typename T, int N>
-struct alignas(N * sizeof(T)) aligned_vector {
-  T data[N];
-
-  aligned_vector() = default;
-
-  T& operator[](int i) {
-    return data[i];
-  }
-  const T& operator[](int i) const {
-    return data[i];
-  }
-};
 
 // Determine optimal vector size based on hidden size and type
 template <typename T, int64_t kHiddenSize>

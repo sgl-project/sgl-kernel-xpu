@@ -55,8 +55,24 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
     // No sink support for no_page path; always use Sink=false
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
-        FMHAConfig<Causal, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_nopaged(
-            params);
+        AT_DISPATCH_BOOL_NO_RETURN(params.is_bf16, IsBf16, {
+          using Element = cute::conditional_t<IsBf16, bfloat16_t, half_t>;
+          FMHAConfig<
+              Causal,
+              LocalMask,
+              false,
+              TileShapeQK,
+              TileShapePV,
+              TileShapeOutput,
+              SubgroupLayoutQK,
+              void,
+              2,
+              false,
+              Element,
+              Element,
+              Element,
+              Element>::run_nopaged(params);
+        });
       });
     });
     return;
@@ -78,8 +94,24 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
   AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
-        FMHAConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
-            params);
+        AT_DISPATCH_BOOL_NO_RETURN(params.is_bf16, IsBf16, {
+          using Element = cute::conditional_t<IsBf16, bfloat16_t, half_t>;
+          FMHAConfig<
+              Causal,
+              LocalMask,
+              Sink,
+              TileShapeQK,
+              TileShapePV,
+              TileShapeOutput,
+              SubgroupLayoutQK,
+              void,
+              2,
+              false,
+              Element,
+              Element,
+              Element,
+              Element>::run_paged(params);
+        });
       });
     });
   });
@@ -89,8 +121,24 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
       "sink is only supported for head_size == 64, got @HEAD_DIM@");
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
-      FMHAConfig<Causal, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
-          params);
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_bf16, IsBf16, {
+        using Element = cute::conditional_t<IsBf16, bfloat16_t, half_t>;
+        FMHAConfig<
+            Causal,
+            LocalMask,
+            false,
+            TileShapeQK,
+            TileShapePV,
+            TileShapeOutput,
+            SubgroupLayoutQK,
+            void,
+            2,
+            false,
+            Element,
+            Element,
+            Element,
+            Element>::run_paged(params);
+      });
     });
   });
 #endif

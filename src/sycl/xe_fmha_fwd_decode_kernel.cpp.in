@@ -55,14 +55,24 @@ void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Argume
     using SubgroupLayoutQK_NP = cute::Layout<cute::Shape<cute::_1, cute::Int<@TILED_KV_NP@ / 16>, cute::_1>>;
     // No sink support for no_page path; always use Sink=false
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-      DecodeConfig<
-          false,
-          LocalMask,
-          false,
-          TileShapeQK_NP,
-          TileShapePV_NP,
-          TileShapeOutput_NP,
-          SubgroupLayoutQK_NP>::run_nopaged(params);
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_bf16, IsBf16, {
+        using Element = cute::conditional_t<IsBf16, bfloat16_t, half_t>;
+        DecodeConfig<
+            false,
+            LocalMask,
+            false,
+            TileShapeQK_NP,
+            TileShapePV_NP,
+            TileShapeOutput_NP,
+            SubgroupLayoutQK_NP,
+            void,
+            1,
+            false,
+            Element,
+            Element,
+            Element,
+            Element>::run_nopaged(params);
+      });
     });
     return;
   }
@@ -81,17 +91,49 @@ void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Argume
 #if @HEAD_DIM@ == 64
     AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-        DecodeConfig<false, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
-            params);
+        AT_DISPATCH_BOOL_NO_RETURN(params.is_bf16, IsBf16, {
+          using Element = cute::conditional_t<IsBf16, bfloat16_t, half_t>;
+          DecodeConfig<
+              false,
+              LocalMask,
+              Sink,
+              TileShapeQK,
+              TileShapePV,
+              TileShapeOutput,
+              SubgroupLayoutQK,
+              void,
+              1,
+              false,
+              Element,
+              Element,
+              Element,
+              Element>::run_paged(params);
+        });
       });
-  });
+    });
 #else
     TORCH_CHECK(
         !params.use_sink,
         "sink is only supported for head_size == 64, got @HEAD_DIM@");
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-      DecodeConfig<false, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
-          params);
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_bf16, IsBf16, {
+        using Element = cute::conditional_t<IsBf16, bfloat16_t, half_t>;
+        DecodeConfig<
+            false,
+            LocalMask,
+            false,
+            TileShapeQK,
+            TileShapePV,
+            TileShapeOutput,
+            SubgroupLayoutQK,
+            void,
+            1,
+            false,
+            Element,
+            Element,
+            Element,
+            Element>::run_paged(params);
+      });
     });
 #endif
 #else

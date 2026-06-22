@@ -63,7 +63,7 @@ DISABLE_APPENDKV = True
 DISABLE_LOCAL = True
 DISABLE_SOFTCAP = True
 DISABLE_PACKGQA = True
-DISABLE_FP16 = True
+DISABLE_FP16 = False
 DISABLE_FP8 = True
 
 
@@ -476,7 +476,10 @@ def generate_qkv(
     reason="flash_attn at sgl-kernel is only supported on sm90 and above",
 )
 @pytest.mark.parametrize(
-    "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
+    "dtype",
+    [torch.bfloat16]
+    + ([torch.float16] if not DISABLE_FP16 else [])
+    + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []),
 )
 @pytest.mark.parametrize("nheads_q,nheads_kv", [(16, 16), (16, 4)])
 @pytest.mark.parametrize("new_kv", [False])
@@ -972,7 +975,10 @@ def test_flash_attn_kvcache(
     reason="flash_attn at sgl-kernel is only supported on sm90 and above",
 )
 @pytest.mark.parametrize(
-    "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
+    "dtype",
+    [torch.bfloat16]
+    + ([torch.float16] if not DISABLE_FP16 else [])
+    + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []),
 )
 @pytest.mark.parametrize("nheads_q,nheads_kv", [(16, 16), (16, 4)])
 @pytest.mark.parametrize("new_kv", [False])
@@ -1501,7 +1507,10 @@ def _generate_block_kvcache(
     reason="flash_attn at sgl-kernel is only supported on sm90 and above",
 )
 @pytest.mark.parametrize(
-    "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
+    "dtype",
+    [torch.bfloat16]
+    + ([torch.float16] if not DISABLE_FP16 else [])
+    + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []),
 )
 @pytest.mark.parametrize("nheads_q,nheads_kv", [(16, 16), (16, 4)])
 @pytest.mark.parametrize("has_qv", [False])

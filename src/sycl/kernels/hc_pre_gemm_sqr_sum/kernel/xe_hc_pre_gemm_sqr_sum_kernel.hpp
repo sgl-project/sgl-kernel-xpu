@@ -29,7 +29,7 @@
  *
  **************************************************************************************************/
 /*! \file
-    \brief XPU Gemm Square Sum Kernel
+    \brief XPU HC Pre Gemm Square Sum Kernel
 */
 
 #pragma once

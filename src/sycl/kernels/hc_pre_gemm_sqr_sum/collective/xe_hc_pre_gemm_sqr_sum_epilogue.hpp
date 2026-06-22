@@ -29,7 +29,7 @@
  *
  **************************************************************************************************/
 /*! \file
-    \brief Gemm Square Sum Epilogue
+    \brief HC PreGemm Square Sum Epilogue
 */
 
 #pragma once

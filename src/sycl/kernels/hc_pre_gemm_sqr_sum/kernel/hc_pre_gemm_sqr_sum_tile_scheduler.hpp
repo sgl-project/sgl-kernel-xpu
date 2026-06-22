@@ -29,7 +29,7 @@
  *
  **************************************************************************************************/
 /*! \file
-    \brief Tile scheduler for Gemm Sqrsum
+    \brief Tile scheduler for HC Pre Gemm Square Sum
 */
 
 #pragma once

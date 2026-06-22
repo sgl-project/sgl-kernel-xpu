@@ -80,7 +80,7 @@ def _ref_attn_gqa(q_bshd, k_bshd, v_bshd, cache_seqlens):
 # Core test helper
 # ---------------------------------------------------------------------------
 
-def _run(batch, nq_heads, nkv_heads, head_dim, page_size, seqlen, dtype=torch.float16):
+def _run(batch, nq_heads, nkv_heads, head_dim, page_size, seqlen, dtype=torch.bfloat16):
     """
     Allocate a paged KV cache and run one decode step (seqlen_q=1 per batch item).
     Asserts:
@@ -112,6 +112,9 @@ def _run(batch, nq_heads, nkv_heads, head_dim, page_size, seqlen, dtype=torch.fl
 
     # Decode query: one token per batch item → (batch, 1, nq_heads, head_dim)
     q = torch.randn(batch, 1, nq_heads, head_dim, dtype=dtype, device=device)
+    q_unpad = q.flatten(0, 1).contiguous()
+    cu_seqlens_q = torch.arange(batch + 1, dtype=torch.int32, device=device)
+    output_pad_fn = lambda output_unpad: output_unpad.view_as(q)
 
     # Linear page assignment: seq i → pages [i*P .. (i+1)*P)
     page_table = torch.arange(num_pages, dtype=torch.int32, device=device).view(
@@ -121,16 +124,18 @@ def _run(batch, nq_heads, nkv_heads, head_dim, page_size, seqlen, dtype=torch.fl
 
     # --- kernel under test ---
     out = flash_attn_with_kvcache(
-        q=q,
+        q=q_unpad,
         k_cache=k_cache,
         v_cache=v_cache,
         page_table=page_table,
         cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=q.size(1),
+        max_seqlen_k=seqlen,
         softmax_scale=head_dim ** -0.5,
         causal=True,
     )
-    # out shape: (batch, 1, nq_heads, head_dim)
-
+    out = output_pad_fn(out)
     nan_count = out.isnan().sum().item()
     assert nan_count == 0, (
         f"flash_attn_with_kvcache produced {nan_count}/{out.numel()} NaN values "
@@ -154,7 +159,7 @@ def _run(batch, nq_heads, nkv_heads, head_dim, page_size, seqlen, dtype=torch.fl
                         cache_seqlens.cpu())  # (batch, 1, nq, d)
 
     out_cpu = out.float().cpu()
-    atol = 1e-2 if dtype == torch.float16 else 5e-3
+    atol = 1e-2 if dtype == torch.bfloat16 else 5e-3
     max_diff = (out_cpu - ref).abs().max().item()
     assert max_diff < atol, (
         f"Max abs diff {max_diff:.4f} exceeds {atol} "
@@ -210,19 +215,23 @@ def test_minimal_repro_sglangt_1286():
     torch.manual_seed(0)
 
     # 2 pages × page_size=128 × 8 KV heads × head_dim=128  (~0.5 MB per K/V)
-    k = torch.randn(2, 128, 8, 128, dtype=torch.float16, device=dev)
-    v = torch.randn(2, 128, 8, 128, dtype=torch.float16, device=dev)
-    q = torch.randn(2, 1, 32, 128, dtype=torch.float16, device=dev)
+    k = torch.randn(2, 128, 8, 128, dtype=torch.bfloat16, device=dev)
+    v = torch.randn(2, 128, 8, 128, dtype=torch.bfloat16, device=dev)
+    q = torch.randn(2, 1, 32, 128, dtype=torch.bfloat16, device=dev)
 
     out = flash_attn_with_kvcache(
-        q=q,
+        q=q.flatten(0, 1).contiguous(),
         k_cache=k,
         v_cache=v,
         page_table=torch.tensor([[0], [1]], dtype=torch.int32, device=dev),
         cache_seqlens=torch.tensor([128, 128], dtype=torch.int32, device=dev),
+        cu_seqlens_q=torch.arange(q.size(0) + 1, dtype=torch.int32, device=dev),
+        max_seqlen_q=q.size(1),
+        max_seqlen_k=k.size(1),
         softmax_scale=128 ** -0.5,
         causal=True,
     )
+    out = out.view_as(q)
 
     # Symptom 1: no NaN in output
     nan_count = out.isnan().sum().item()

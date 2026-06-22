@@ -24,7 +24,7 @@ def _make_inputs(M, K, N, n_splits, a_dtype, b_dtype, device, seed=42):
 @pytest.mark.parametrize(
     "M", [16, 48, 128, 512, 896, 1021, 1024, 1034, 1038, 1518, 2048]
 )
-def test_hc_pre_gemm_sqr_sum_production(M):
+def test_hc_pre_gemm_sqr_sum(M):
     torch.manual_seed(42)
     N = 24
     K = 16384

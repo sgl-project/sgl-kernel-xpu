@@ -19,7 +19,6 @@ limitations under the License.
 #include "sgl_flash_kernel_ops.h"
 #include "sgl_kernel_ops.h"
 #include "sgl_kernel_torch_shim.h"
-
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
   m.impl("awq_dequantize", torch::kXPU, &awq_dequantize);

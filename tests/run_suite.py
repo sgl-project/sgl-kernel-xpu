@@ -41,6 +41,8 @@ suites = {
         TestFile("test_hc_pre_fuse.py"),
         TestFile("test_fused_experts_mxfp4_dsv4_shapes.py"),
         TestFile("test_store_cache_xpu.py"),
+        TestFile("test_hc_pre_gemm_sqr_sum.py"),
+        TestFile("test_mhc_pre.py"),
     ],
 }
 

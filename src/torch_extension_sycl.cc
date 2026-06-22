@@ -55,6 +55,23 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
   m.impl("top_k_renorm_probs", torch::kXPU, &top_k_renorm_probs);
 
+  /*
+   * Fast radix top-k (DeepSeek V3.2 indexer)
+   */
+  m.def(
+      "fast_topk(Tensor score, Tensor! indices, Tensor lengths, Tensor? row_starts) -> ()");
+  m.impl("fast_topk", torch::kXPU, &fast_topk_interface);
+
+  m.def(
+      "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor! dst_page_table, Tensor src_page_table, "
+      "Tensor cu_seqlens_q, Tensor? row_starts) -> ()");
+  m.impl("fast_topk_transform_fused", torch::kXPU, &fast_topk_transform_interface);
+
+  m.def(
+      "fast_topk_transform_ragged_fused(Tensor score, Tensor lengths, Tensor! topk_indices_ragged, "
+      "Tensor topk_indices_offset, Tensor? row_starts) -> ()");
+  m.impl("fast_topk_transform_ragged_fused", torch::kXPU, &fast_topk_transform_ragged_interface);
+
   m.def("swiglu_gpt_oss_sigmoid_alpha(Tensor x, float alpha, float limit) -> Tensor");
   m.impl("swiglu_gpt_oss_sigmoid_alpha", torch::kXPU, &swiglu_gpt_oss_sigmoid_alpha);
   m.def(

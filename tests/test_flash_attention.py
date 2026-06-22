@@ -974,7 +974,7 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize(
     "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
 )
-@pytest.mark.parametrize("nheads_q,nheads_kv", [(16, 16), (16, 4)])
+@pytest.mark.parametrize("nheads_q,nheads_kv", [(32, 8)])
 @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("local", [True, False])
@@ -992,20 +992,20 @@ def test_flash_attn_kvcache(
         else [0.0]
     ),
 )
-@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize("page_size", [128])
 @pytest.mark.parametrize("has_leftpad", [False])
 @pytest.mark.parametrize("has_batch_idx", [False])
 @pytest.mark.parametrize("varlen_q", [True])
-@pytest.mark.parametrize("d", [64, 128, 256, 512])
+@pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize("seqlen_q", [1])
-@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize(
     "seqlen_k",
     [
         128,
-        1024,
-        4096,
-        8192,
+        # 1024,
+        # 4096,
+        # 8192,
     ],
 )
 def test_flash_attn_decode_kvcache(

@@ -3,13 +3,12 @@ import torch
 import triton
 from sgl_kernel import hc_pre_gemm_sqr_sum
 
-# Production mhc_pre GEMM+sqr_sum stage shapes (Design B: K-split partials):
-#   A      [M, K]            bf16   (residual.view(M, hc_hidden)); hc_hidden = hc_mult * hidden
-#   B      [N, K]            fp32   (fn = [24, 16384] = [N, K])
-#   C      [n_splits, M, N]  fp32   (gemm_out_mul partials), C = A @ B^T per K-slice
-#   sqr_sum [n_splits, M]     fp32   (gemm_out_sqr_sum partials), sqr_sum[s,m] = partial sum A^2
-# N (=hc_mult3) and K (=hc_mult*hidden) are fixed; only the token count M varies.
-# n_splits follows the mhc_pre split-k rule (32 for M<=2048).
+#   A       [M, K]            bf16
+#   B       [N, K]            fp32
+#   C       [n_splits, M, N]  fp32
+#   sqr_sum [n_splits, M]     fp32
+#   N       (=hc_mult3)
+#   K       (=hc_mult*hidden)
 hc = 4
 hc_mult3 = (2 + hc) * hc  # 24 -> N
 hidden_size = 4096
@@ -22,7 +21,7 @@ def _n_splits_pre(M):
 
 
 configs = [
-    # (M, K, N)  -- same token sweep as bench_hc_pre_fuse.py (incl. ragged M)
+    # (M, K, N)
     (128, K, N),
     (512, K, N),
     (896, K, N),

@@ -159,15 +159,6 @@ def hc_pre_gemm_sqr_sum(
 
 
 def _mhc_pre_n_splits_pre(num_tokens: int) -> int:
-    """K-split count for the TileLang-replacement GEMM+sqr_sum paths.
-
-    Mirrors the reference's two non-prenorm branches:
-      * num_tokens <= 2048 -> split-k path, n_splits_pre = 32
-      * num_tokens >  2048 -> simple path,  n_splits_pre = 1
-    (The prenorm path's hardware-occupancy formula `_compute_num_split_for_mhc_pre`
-    is intentionally NOT used here; a custom occupancy rule is deferred to the
-    optimization step.)
-    """
     return 32 if num_tokens <= 2048 else 1
 
 
@@ -186,29 +177,6 @@ def mhc_pre(
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: float = 1e-6,
 ):
-    """mhc_pre: fused GEMM+sqr_sum -> RMS/Sinkhorn/mix, replacing the two TileLang
-    (non-prenorm) paths with the CUTLASS hc_pre_gemm_sqr_sum kernel + hc_pre_big_fuse.
-
-    Pipeline (two kernel launches, control returns to Python in between):
-      1. hc_pre_gemm_sqr_sum: residual @ fnᵀ and row sqr-sum, as [n_splits_pre, T, *]
-         K-split partials.
-      2. hc_pre_big_fuse: reduces the split axis, then RMS + Sinkhorn mix (and
-         optional RMSNorm of layer_input when norm_weight is given).
-
-    Args:
-        residual:     [T, hc_mult, D] bf16 (hc_hidden = hc_mult * D == fn's K).
-        fn:           [hc_mult3, hc_hidden] fp32, hc_mult3 = (2 + hc_mult) * hc_mult.
-        hc_scale:     [3] fp32.
-        hc_base:      [hc_mult3] fp32.
-        n_splits:     outer split (reference prenorm axis); must be 1/None here.
-        n_splits_pre: K-split count; defaults to 32 (T<=2048) or 1 by the rule above.
-        norm_weight:  optional [D] bf16; if given, layer_input is RMS-normalized.
-
-    Returns:
-        post_mix    [T, hc_mult] fp32
-        comb_mix    [T, hc_mult, hc_mult] fp32
-        layer_input [T, D] bf16
-    """
     assert residual.dim() == 3, "residual must be [T, hc_mult, D]"
     num_tokens = residual.size(0)
     hc_mult = residual.size(1)
@@ -222,21 +190,15 @@ def mhc_pre(
         fn.size(0) == hc_mult3 and fn.size(1) == hc_hidden
     ), f"fn must be [{hc_mult3}, {hc_hidden}], got {tuple(fn.shape)}"
 
-    # The two non-prenorm paths carry no outer split (the reference asserts
-    # n_splits == 1); the real K-split is n_splits_pre.
     if n_splits is not None and n_splits != 1:
-        raise ValueError(
-            f"mhc_pre (TileLang-replacement paths) requires n_splits==1, got {n_splits}"
-        )
+        raise ValueError(f"mhc_pre requires n_splits==1, got {n_splits}")
     if n_splits_pre is None:
         n_splits_pre = _mhc_pre_n_splits_pre(num_tokens)
 
     device = residual.device
 
-    # GEMM+sqr_sum operands. A = residual flattened to [T, hc_hidden]; B = fn [N, K].
     A = residual.reshape(num_tokens, hc_hidden)
 
-    # Fuse-shaped partial buffers (leading split axis reduced by the fuse).
     gemm_out_mul = torch.empty(
         n_splits_pre, num_tokens, hc_mult3, dtype=torch.float32, device=device
     )
@@ -245,7 +207,6 @@ def mhc_pre(
     )
     hc_pre_gemm_sqr_sum(gemm_out_mul, gemm_out_sqrsum, A, fn)
 
-    # Fuse outputs.
     post_mix = torch.empty(num_tokens, hc_mult, dtype=torch.float32, device=device)
     comb_mix = torch.empty(
         num_tokens, hc_mult, hc_mult, dtype=torch.float32, device=device

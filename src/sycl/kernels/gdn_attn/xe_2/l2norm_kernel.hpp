@@ -167,6 +167,8 @@ void l2norm_impl(sycl::queue& queue, const torch::Tensor& q, const torch::Tensor
     l2norm_launch<sycl::ext::oneapi::bfloat16>(queue, q, k, total_virtual_seqlen, num_k_heads, head_k_dim);
   } else if (q.scalar_type() == at::kHalf) {
     l2norm_launch<sycl::half>(queue, q, k, total_virtual_seqlen, num_k_heads, head_k_dim);
+  } else {
+    TORCH_CHECK(false, "l2norm only supports float16/bfloat16 tensors, but got ", q.scalar_type());
   }
 }
 

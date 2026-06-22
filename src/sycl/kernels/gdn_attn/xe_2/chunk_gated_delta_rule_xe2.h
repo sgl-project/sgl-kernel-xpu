@@ -1,3 +1,7 @@
+#pragma once
+
+#include <optional>
+#include <sycl/sycl.hpp>
 #include <torch/all.h>
 
 void chunk_gated_delta_rule_xe2(

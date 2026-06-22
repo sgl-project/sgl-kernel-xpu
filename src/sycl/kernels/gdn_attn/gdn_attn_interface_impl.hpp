@@ -73,6 +73,9 @@ void gdn_attention(
           "has_initial_state must have size [num_prefills + num_decodes]");
     }
 
+    TORCH_CHECK(
+        non_spec_query_start_loc.has_value(),
+        "non_spec_query_start_loc must be provided when num_prefills + num_decodes > 0");
     TORCH_CHECK(non_spec_query_start_loc->is_contiguous(), "non_spec_query_start_loc must be contiguous");
     TORCH_CHECK(non_spec_query_start_loc->dtype() == torch::kInt32, "non_spec_query_start_loc must be of int32 dtype");
     TORCH_CHECK(
@@ -93,6 +96,9 @@ void gdn_attention(
       non_spec_token = num_actual_tokens;
     }
 
+    TORCH_CHECK(
+        non_spec_state_indices_tensor.has_value(),
+        "non_spec_state_indices_tensor must be provided when num_prefills + num_decodes > 0");
     TORCH_CHECK(non_spec_state_indices_tensor->is_contiguous(), "non_spec_state_indices_tensor must be contiguous");
     TORCH_CHECK(
         non_spec_state_indices_tensor->dtype() == torch::kInt32,
@@ -110,6 +116,10 @@ void gdn_attention(
   int spec_token = 0;
   int num_speculative_tokens = 0;
   if (num_spec_decodes > 0) {
+    TORCH_CHECK(
+        spec_query_start_loc.has_value() && spec_token_indx.has_value() && spec_state_indices_tensor.has_value() &&
+            num_accepted_tokens.has_value(),
+        "spec_query_start_loc/spec_token_indx/spec_state_indices_tensor/num_accepted_tokens must be provided when num_spec_decodes > 0");
     TORCH_CHECK(spec_query_start_loc->is_contiguous(), "spec_query_start_loc must be contiguous");
     TORCH_CHECK(spec_query_start_loc->dtype() == torch::kInt32, "spec_query_start_loc must be of int32 dtype");
     TORCH_CHECK(spec_query_start_loc->dim() == 1, "spec_query_start_loc must be 1D of shape [num_spec_decodes + 1]");
@@ -203,7 +213,7 @@ void gdn_attention(
   } else if (activation == "swish") {
     act_mode = gdn::ActMode::swish;
   } else {
-    TORCH_CHECK(false);
+    TORCH_CHECK(false, "Unsupported activation=", activation, ". Expected 'silu' or 'swish'.");
   }
   const int pad_slot_id = -1;
 

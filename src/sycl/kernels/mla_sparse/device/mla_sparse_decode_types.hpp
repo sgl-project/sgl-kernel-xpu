@@ -215,8 +215,8 @@ inline typename T::Fmla::Arguments args_from_options_sparse(
     at::Tensor const& swa_indices,                // [B, 1, swa_topk]
     at::Tensor const& extra_indices,              // [B, 1, extra_topk]
     at::Tensor const& attn_sink,                  // [H]
-    at::Tensor const& topk_length,                // [H]
-    at::Tensor const& extra_topk_length,          // [H]
+    at::Tensor const& topk_length,                // [B]
+    at::Tensor const& extra_topk_length,          // [B]
     double sm_scale,
     int64_t head_dim_v,
     bool is_fp8_kvcache = false) {
@@ -233,7 +233,7 @@ inline typename T::Fmla::Arguments args_from_options_sparse(
   int D_qk = q.size(3);
   int v_head_dim_int = static_cast<int>(head_dim_v);  // 512
   int q_nope_dim = 448;                               // fixed for DSV4
-  int q_pe_dim = 64;                                  // dixed for DSV4
+  int q_pe_dim = 64;                                  // fixed for DSV4
 
   int page_size = kv_c_and_k_pe_cache.size(1);
   int extra_page_size = extra_kv_c_and_k_pe_cache.size(1);

@@ -200,13 +200,38 @@ def flash_mla_with_kvcache(
 
     if block_table is None:
         assert indices is not None, "indices must be provided for sparse decode path"
-        assert (
-            indices.ndim == 3
-        ), f"indices must be 3D [B, s_q, topk], got {indices.ndim}D"
-        assert (
-            indices.dtype == torch.int32
-        ), f"indices.dtype must be int32, got {indices.dtype}"
-
+        if topk_length is not None:
+            assert (
+                topk_length.device == q.device
+                and topk_length.dtype == torch.int32
+                and topk_length.shape == (B,)
+            ), "topk_length must be int32 on the same device with shape [B]"
+        if attn_sink is not None:
+            assert (
+                attn_sink.device == q.device
+                and attn_sink.dtype == torch.float32
+                and attn_sink.shape == (H,)
+            ), "attn_sink must be float32 on the same device with shape [H]"
+        if (extra_k_cache is None) ^ (extra_indices_in_kvcache is None):
+            raise AssertionError(
+                "extra_k_cache and extra_indices_in_kvcache must be provided together"
+            )
+        if extra_indices_in_kvcache is not None:
+            assert (
+                extra_indices_in_kvcache.dtype == torch.int32
+            ), "extra_indices_in_kvcache.dtype must be int32"
+            assert extra_indices_in_kvcache.device == q.device and extra_indices_in_kvcache.shape[
+                :2
+            ] == (
+                B,
+                s_q,
+            ), "extra_indices_in_kvcache must be on the same device with shape [B, s_q, extra_topk]"
+        if extra_topk_length is not None:
+            assert (
+                extra_topk_length.device == q.device
+                and extra_topk_length.dtype == torch.int32
+                and extra_topk_length.shape == (B,)
+            ), "extra_topk_length must be int32 on the same device with shape [B]"
         torch.ops.sgl_kernel.flash_mla_sparse_decode.default(
             out,
             lse,

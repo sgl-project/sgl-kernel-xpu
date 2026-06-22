@@ -88,7 +88,19 @@ void flash_mla_sparse_decode(
   c10::DeviceGuard guard(q.device());
 
   auto in_dtype = q.scalar_type();
-
+  TORCH_CHECK(q.dim() == 4 && q.size(1) == 1, "q must have shape [B, 1, H, D_qk] (decode-only)");
+  TORCH_CHECK(
+      indices.dim() == 3 && indices.size(0) == q.size(0) && indices.size(1) == 1,
+      "indices must have shape [B, 1, topk]");
+  TORCH_CHECK(k_cache.dim() == 4 && k_cache.size(2) == 1, "k_cache must have shape [num_pages, page_size, 1, D]");
+  TORCH_CHECK(
+      k_cache.scalar_type() == at::ScalarType::Float8_e4m3fn && k_cache.size(3) == 584,
+      "k_cache must use the DeepSeek V4 FP8 packed layout: dtype=float8_e4m3fn, last_dim=584");
+  TORCH_CHECK((q.size(2) % 8) == 0, "num_heads must be a multiple of 8 (kernel fuses 8 heads per workgroup)");
+  TORCH_CHECK(
+      (!extra_k_cache.has_value() && !extra_indices.has_value()) ||
+          (extra_k_cache.has_value() && extra_indices.has_value()),
+      "extra_k_cache and extra_indices must be provided together");
   TORCH_CHECK(
       in_dtype == at::ScalarType::Half || in_dtype == at::ScalarType::BFloat16,
       "Unsupported input data type for Sparse MLA decode");

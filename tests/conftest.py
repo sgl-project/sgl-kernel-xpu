@@ -12,3 +12,14 @@ def reset_torch_defaults():
     yield
     torch.set_default_dtype(orig_default_dtype)
     torch.set_default_device(orig_default_device)
+
+
+# This fixture ensures XPU memory is released after every test, even when the
+# test raises an exception before its own torch.xpu.empty_cache() call.
+# Without this, an OOM in one test leaves the cache full and causes all
+# subsequent tests to fail with UR_RESULT_ERROR_OUT_OF_RESOURCES.
+@pytest.fixture(autouse=True)
+def clear_xpu_cache():
+    yield
+    if torch.xpu.is_available():
+        torch.xpu.empty_cache()

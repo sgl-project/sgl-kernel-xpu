@@ -55,17 +55,9 @@ static void launch(typename Kernel::Params params) {
       syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<GrfSize>};
 
   compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
-
-  auto cgf = [&](::sycl::handler& cgh) {
-    auto KernelFunctor =
-        compat::experimental::detail::build_kernel_functor<cutlass::device_kernel<Kernel>>(cgh, policy, params);
-    // Use handler::parallel_for with nd_range directly
-    // The KernelFunctor provides kernel properties via get(sycl::ext::oneapi::experimental::properties_tag)
-    cgh.parallel_for<KernelCur<Kernel>>(policy.get_range(), KernelFunctor);
-  };
   auto stream = at::xpu::getCurrentXPUStream();
   auto q = stream.queue();
-  q.submit(cgf);
+  compat::experimental::launch<cutlass::device_kernel<Kernel>, KernelCur<Kernel>>(policy, q, params);
 }
 
 }  // namespace

@@ -103,6 +103,15 @@ inline uint8_t quantize_to_e2m1(float val) {
   return (sign << 3) | code;
 }
 
+// SiLU activation: x * sigmoid(x) = x / (1 + exp(-x))
+// Uses direct exp formulation for better performance
+inline float silu(const float& val) {
+  // For very negative values, exp(-val) will be large, making sigmoid ~0
+  // For very positive values, exp(-val) will be ~0, making sigmoid ~1
+  // This formulation is numerically stable and faster than tanh on XPU
+  return val / (1.0f + sycl::exp(-val));
+}
+
 // Use SYCL native vector type for efficient loading
 template <typename T, uint32_t N>
 using vec_t = sycl::vec<T, N>;
@@ -114,7 +123,7 @@ struct FP4GroupSizeTraits {
   static constexpr int SUB_GROUP_SIZE = 32;
 };
 
-template <typename T, int GROUP_SIZE = 32>
+template <typename T, int GROUP_SIZE = 32, bool FUSE_SILU_AND_MUL = false, bool IS_COLUMN_MAJOR = false>
 struct PerTokenGroupQuantFP4Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr uint32_t VEC_SIZE = 16 / sizeof(T);
   static constexpr int32_t NUM_VEC_ELEMS = GROUP_SIZE / VEC_SIZE;
@@ -122,13 +131,24 @@ struct PerTokenGroupQuantFP4Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr int32_t VECS_PER_THREAD = (NUM_VEC_ELEMS + THREADS_PER_GROUP - 1) / THREADS_PER_GROUP;
 
   PerTokenGroupQuantFP4Kernel(
-      const T* input, uint8_t* output_q, uint8_t* output_s, int num_groups, int groups_per_block, float eps)
+      const T* input,
+      uint8_t* output_q,
+      uint8_t* output_s,
+      const T* input_secondary,
+      int num_groups,
+      int groups_per_block,
+      float eps,
+      int num_tokens_per_expert,
+      int hidden_dim_num_groups)
       : input(input),
         output_q(output_q),
         output_s(output_s),
+        input_secondary(input_secondary),
         num_groups(num_groups),
         groups_per_block(groups_per_block),
-        eps(eps) {}
+        eps(eps),
+        num_tokens_per_expert(num_tokens_per_expert),
+        hidden_dim_num_groups(hidden_dim_num_groups) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {}
 
@@ -149,9 +169,29 @@ struct PerTokenGroupQuantFP4Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     // Output is packed FP4 (2 values per byte), so offset is halved
     uint8_t* group_output = output_q + (block_group_offset / 2);
 
-    // Calculate scale output position (row-major layout)
-    // Each row has num_groups_per_row scales, stored contiguously
-    uint8_t* scale_output = output_s + global_group_id;
+    // Calculate scale output position
+    uint8_t* scale_output;
+    if constexpr (IS_COLUMN_MAJOR) {
+      // Column-major interleaved layout: transpose → flatten → reshape
+      // For a 2D scale tensor with shape (num_tokens, num_groups),
+      // compute which (token, group) this global_group_id corresponds to.
+      // Assuming row-major input ordering: global_group_id = token * num_groups + group
+      const int token_idx = global_group_id / hidden_dim_num_groups;
+      const int group_idx = global_group_id % hidden_dim_num_groups;
+
+      // Compute interleaved index: flat_idx = token_idx + group_idx * num_tokens
+      const int flat_idx = token_idx + group_idx * num_tokens_per_expert;
+
+      // Remap to output position: (output_row, output_col)
+      const int output_token_idx = flat_idx / hidden_dim_num_groups;
+      const int output_group_idx = flat_idx % hidden_dim_num_groups;
+
+      // Scale output: use stride=1 for tokens (column-major storage)
+      scale_output = output_s + (output_token_idx + output_group_idx * num_tokens_per_expert);
+    } else {
+      // Row-major layout: scales stored contiguously per row
+      scale_output = output_s + global_group_id;
+    }
 
     using vec_type = vec_t<T, VEC_SIZE>;
     using float_vec_type = vec_t<float, VEC_SIZE>;
@@ -163,14 +203,36 @@ struct PerTokenGroupQuantFP4Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     for (int32_t v = 0; v < VECS_PER_THREAD; ++v) {
       const int32_t i = lane_id + v * THREADS_PER_GROUP;
       if (i < NUM_VEC_ELEMS) {
+        // Load primary vector (gate projection for SiLU)
         input_vecs[v].load(
             0, sycl::multi_ptr<const T, sycl::access::address_space::global_space>(group_input + i * VEC_SIZE));
 
+        if constexpr (FUSE_SILU_AND_MUL) {
+          // Load secondary vector (up projection for multiply)
+          vec_type secondary_vec;
+          const T* secondary_group_input = input_secondary + block_group_offset;
+          secondary_vec.load(
+              0,
+              sycl::multi_ptr<const T, sycl::access::address_space::global_space>(
+                  secondary_group_input + i * VEC_SIZE));
+
+          // Fuse: SiLU(primary) * secondary
 #pragma unroll
-        for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-          float val = static_cast<float>(input_vecs[v][j]);
-          input_vals[v][j] = val;
-          local_absmax = sycl::fmax(local_absmax, sycl::fabs(val));
+          for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+            float gate = static_cast<float>(input_vecs[v][j]);
+            float up = static_cast<float>(secondary_vec[j]);
+            float fused_val = silu(gate) * up;  // SiLU+Mul fusion
+            input_vals[v][j] = fused_val;
+            local_absmax = sycl::fmax(local_absmax, sycl::fabs(fused_val));
+          }
+        } else {
+          // Original unfused path
+#pragma unroll
+          for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+            float val = static_cast<float>(input_vecs[v][j]);
+            input_vals[v][j] = val;
+            local_absmax = sycl::fmax(local_absmax, sycl::fabs(val));
+          }
         }
       }
     }
@@ -232,13 +294,21 @@ struct PerTokenGroupQuantFP4Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   const T* input;
   uint8_t* output_q;
   uint8_t* output_s;
+  const T* input_secondary;  // For fused SiLU+Mul (nullptr if not fused)
   int num_groups;
   int groups_per_block;
   float eps;
+  int num_tokens_per_expert;  // For column-major interleaving
+  int hidden_dim_num_groups;  // For column-major interleaving
 };
 
 void sgl_per_token_group_quant_fp4(
-    torch::Tensor input, torch::Tensor output_q, torch::Tensor output_s, int64_t group_size, double eps) {
+    torch::Tensor input,
+    torch::Tensor output_q,
+    torch::Tensor output_s,
+    int64_t group_size,
+    double eps,
+    std::optional<torch::Tensor> input_secondary) {
   CHECK_CONTIGUOUS(input);
   CHECK_CONTIGUOUS(output_q);
 
@@ -268,7 +338,30 @@ void sgl_per_token_group_quant_fp4(
       group_size,
       ")");
 
+  // Fusion validation
+  bool enable_fusion = input_secondary.has_value();
+  if (enable_fusion) {
+    const auto& input_sec = input_secondary.value();
+    CHECK_CONTIGUOUS(input_sec);
+    TORCH_CHECK(input_sec.dim() == input.dim(), "input_secondary must have same dimensions as input");
+    TORCH_CHECK(input_sec.sizes() == input.sizes(), "input_secondary must have same shape as input");
+    TORCH_CHECK(input_sec.scalar_type() == input.scalar_type(), "input_secondary must have same dtype as input");
+    TORCH_CHECK(input_sec.device() == input.device(), "input_secondary must be on same device as input");
+  }
+
+  // Detect column-major stride for scales
+  // Column-major: stride(tokens) < stride(groups), e.g., stride(0) < stride(1)
+  const bool is_column_major = (output_s.dim() >= 2) && (output_s.stride(-2) < output_s.stride(-1));
+
   const int num_groups = input.numel() / group_size;
+
+  // For column-major interleaving, compute dimensions
+  int num_tokens_per_expert = 1;
+  int hidden_dim_num_groups = num_groups;
+  if (is_column_major && output_s.dim() >= 2) {
+    num_tokens_per_expert = output_s.size(-2);  // tokens dimension
+    hidden_dim_num_groups = output_s.size(-1);  // groups dimension
+  }
 
   // Output should be half the size (2 FP4 values per byte)
   CHECK_EQ(output_q.numel(), input.numel() / 2);
@@ -301,21 +394,33 @@ void sgl_per_token_group_quant_fp4(
   sycl::range<1> global_range(num_blocks * num_threads);
   sycl::range<1> local_range(num_threads);
 
-#define LAUNCH_FP4_KERNEL_WITH_GROUP_SIZE(T, GS)                  \
-  do {                                                            \
-    auto kernel = PerTokenGroupQuantFP4Kernel<T, GS>(             \
-        static_cast<const T*>(input.data_ptr()),                  \
-        static_cast<uint8_t*>(output_q.data_ptr()),               \
-        static_cast<uint8_t*>(output_s.data_ptr()),               \
-        num_groups,                                               \
-        groups_per_block,                                         \
-        eps_f);                                                   \
-    sycl_kernel_submit(global_range, local_range, queue, kernel); \
+#define LAUNCH_FP4_KERNEL_WITH_GROUP_SIZE(T, GS, FUSE, COL_MAJOR)                                        \
+  do {                                                                                                   \
+    const T* input_sec_ptr = FUSE ? static_cast<const T*>(input_secondary.value().data_ptr()) : nullptr; \
+    auto kernel = PerTokenGroupQuantFP4Kernel<T, GS, FUSE, COL_MAJOR>(                                   \
+        static_cast<const T*>(input.data_ptr()),                                                         \
+        static_cast<uint8_t*>(output_q.data_ptr()),                                                      \
+        static_cast<uint8_t*>(output_s.data_ptr()),                                                      \
+        input_sec_ptr,                                                                                   \
+        num_groups,                                                                                      \
+        groups_per_block,                                                                                \
+        eps_f,                                                                                           \
+        num_tokens_per_expert,                                                                           \
+        hidden_dim_num_groups);                                                                          \
+    sycl_kernel_submit(global_range, local_range, queue, kernel);                                        \
   } while (0)
 
-#define LAUNCH_FP4_KERNEL(T)                  \
-  do {                                        \
-    LAUNCH_FP4_KERNEL_WITH_GROUP_SIZE(T, 32); \
+#define LAUNCH_FP4_KERNEL(T)                                  \
+  do {                                                        \
+    if (enable_fusion && is_column_major) {                   \
+      LAUNCH_FP4_KERNEL_WITH_GROUP_SIZE(T, 32, true, true);   \
+    } else if (enable_fusion && !is_column_major) {           \
+      LAUNCH_FP4_KERNEL_WITH_GROUP_SIZE(T, 32, true, false);  \
+    } else if (!enable_fusion && is_column_major) {           \
+      LAUNCH_FP4_KERNEL_WITH_GROUP_SIZE(T, 32, false, true);  \
+    } else {                                                  \
+      LAUNCH_FP4_KERNEL_WITH_GROUP_SIZE(T, 32, false, false); \
+    }                                                         \
   } while (0)
 
   // Dispatch based on input type

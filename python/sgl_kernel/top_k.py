@@ -9,9 +9,24 @@ def fast_topk_v2(
     topk: int,
     row_starts: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Top-k indices of `score`. See sglang fast_topk_v2 docstring."""
-    assert topk == 2048, "fast_topk_v2 only supports topk=2048 (DeepSeek V3.2 indexer)"
-    assert score.dim() == 2
+    """
+    Get the topk indices of the score tensor.
+    Args:
+        score: The score tensor of shape (B, L). The score tensor is the logits
+            between the query and the key whose layout is either ragged or paged.
+            row_starts is only required when the key is ragged.
+        lengths: The lengths tensor of shape (B)
+        topk: The number of topk indices to get
+        row_starts: The start index of each row in the score tensor of shape (B).
+            For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i]]
+            of the score tensor.
+    Returns:
+        The topk indices tensor of shape (B, topk)
+    """
+    if topk != 2048:
+        raise ValueError("fast_topk_v2 only supports topk=2048")
+    if score.dim() != 2:
+        raise ValueError("score must be a 2D tensor")
     topk_indices = score.new_empty((score.size(0), topk), dtype=torch.int32)
     torch.ops.sgl_kernel.fast_topk.default(score, topk_indices, lengths, row_starts)
     return topk_indices
@@ -20,14 +35,33 @@ def fast_topk_v2(
 def fast_topk_transform_fused(
     score: torch.Tensor,
     lengths: torch.Tensor,
-    page_table_size_1: torch.Tensor,
+    page_table_size_1: torch.Tensor,  # NOTE: page size should be 1
     cu_seqlens_q: torch.Tensor,
     topk: int,
     row_starts: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Top-k + paged gather. See sglang fast_topk_transform_fused docstring."""
-    assert topk == 2048, "fast_topk_transform_fused only supports topk=2048"
-    assert score.dim() == 2
+    """
+    Get the topk indices of the score tensor and then transform the topk indices
+    to indices to the page table (page_size = 1)
+    Args:
+        score: The score tensor of shape (B, L). The score tensor is the logits
+            between the query and the key whose layout is either ragged or paged.
+            row_starts is only required when the key is ragged.
+        lengths: The lengths tensor of shape (B)
+        page_table_size_1: The page table tensor of shape (Batch, topk)
+        cu_seqlens_q: The cumulative sequence lengths tensor of shape (Batch + 1)
+        topk: The number of topk indices to get
+        row_starts: The start index of each row in the score tensor of shape (B).
+            For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i]]
+            of the score tensor. It's only used for cases where the key is
+            ragged, i.e. during extend and draft extend.
+    Returns:
+        The topk indices tensor of shape (B, topk)
+    """
+    if topk != 2048:
+        raise ValueError("fast_topk_transform_fused only supports topk=2048")
+    if score.dim() != 2:
+        raise ValueError("score must be a 2D tensor")
     dst_page_table = score.new_empty((score.shape[0], topk), dtype=torch.int32)
     torch.ops.sgl_kernel.fast_topk_transform_fused.default(
         score, lengths, dst_page_table, page_table_size_1, cu_seqlens_q, row_starts
@@ -38,13 +72,33 @@ def fast_topk_transform_fused(
 def fast_topk_transform_ragged_fused(
     score: torch.Tensor,
     lengths: torch.Tensor,
-    topk_indices_offset: torch.Tensor,
+    topk_indices_offset: torch.Tensor,  # ragged kv
     topk: int,
     row_starts: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Top-k + ragged offset. See sglang fast_topk_transform_ragged_fused docstring."""
-    assert topk == 2048, "fast_topk_transform_ragged_fused only supports topk=2048"
-    assert score.dim() == 2
+    """
+    Get the topk indices of the score tensor and then transform the topk indices to
+    indices to ragged kv (non-paged). This function is only used for extend,
+    not including draft extend.
+    Args:
+        score: The score tensor of shape (B, L). The score tensor is the logits
+            between the query and the key which can be ragged or paged.
+            row_starts is only required when the key is ragged.
+        lengths: The lengths tensor of shape (B)
+        topk_indices_offset: The offset of topk indices in ragged kv of shape (B)
+        topk: The number of topk indices to get
+        row_starts: The start index of each row in the score tensor of shape (B).
+            For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i]]
+            of the score tensor. It can be None if only the fast path is triggered,
+            in the case of all values in lengths <= topk (not checked in the kernel,
+            guaranteed by the caller).
+    Returns:
+        The topk indices tensor of shape (B, topk)
+    """
+    if topk != 2048:
+        raise ValueError("fast_topk_transform_ragged_fused only supports topk=2048")
+    if score.dim() != 2:
+        raise ValueError("score must be a 2D tensor")
     topk_indices_ragged = score.new_empty((score.shape[0], topk), dtype=torch.int32)
     torch.ops.sgl_kernel.fast_topk_transform_ragged_fused.default(
         score, lengths, topk_indices_ragged, topk_indices_offset, row_starts

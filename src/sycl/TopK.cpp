@@ -41,8 +41,8 @@ inline uint32_t convert_to_uint32(float x) {
 
 using LocalAtomic = sycl::atomic_ref<
     int32_t,
-    sycl::memory_order::seq_cst,
-    sycl::memory_scope::device,
+    sycl::memory_order::relaxed,
+    sycl::memory_scope::work_group,
     sycl::access::address_space::local_space>;
 
 inline int32_t lm_atomic_add(int32_t& v, int32_t delta) {
@@ -322,7 +322,7 @@ FastTopKParams get_params(
   TORCH_CHECK(score.scalar_type() == at::kFloat, "score must be float32");
   if (row_starts_opt.has_value()) {
     const auto& row_starts = row_starts_opt.value();
-    TORCH_CHECK(row_starts.dim() == 1 && row_starts.size(0) == B);
+    TORCH_CHECK(row_starts.dim() == 1 && row_starts.is_contiguous() && row_starts.size(0) == B);
     TORCH_CHECK(row_starts.scalar_type() == at::kInt, "row_starts must be int32");
   }
   TORCH_CHECK(lengths.dim() == 1 && lengths.is_contiguous() && lengths.size(0) == B);
@@ -681,7 +681,7 @@ void fast_topk_transform_ragged_interface(
   const auto params = get_params(score, lengths, row_starts_opt);
   const int64_t B = score.size(0);
   TORCH_CHECK(topk_indices_ragged.dim() == 2 && topk_indices_ragged.is_contiguous());
-  TORCH_CHECK(topk_indices_offset.dim() == 1);
+  TORCH_CHECK(topk_indices_offset.dim() == 1 && topk_indices_offset.is_contiguous());
   TORCH_CHECK(topk_indices_ragged.size(0) == B);
   TORCH_CHECK(topk_indices_ragged.size(1) == kTopK);
   TORCH_CHECK(topk_indices_offset.size(0) == B);

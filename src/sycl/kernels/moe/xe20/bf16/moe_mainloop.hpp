@@ -193,7 +193,7 @@ struct MoEMainloop<
     auto pAgA = prefetch_a.get_slice(thr_id).partition_S(gA);
     auto pBgB = prefetch_b.get_slice(thr_id).partition_S(gB);
 
-    constexpr int barrier_scope = 2;
+    constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
     int k_start_idx = 0;
     int prefetch_k = k_start_idx;
     const int prefetch_dist = Stages;
@@ -336,7 +336,7 @@ struct MoEMainloop<
     auto pBgB0 = prefetch_b0.get_slice(thr_id).partition_S(gB);
     auto pBgB1 = prefetch_b1.get_slice(thr_id).partition_S(gB);
 
-    constexpr int barrier_scope = 2;
+    constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
     int k_start_idx = 0;
     int prefetch_k = k_start_idx;
     const int prefetch_dist = Stages;

@@ -60,10 +60,7 @@ static void launch(typename Kernel::Params params) {
   auto cgf = [&](::sycl::handler& cgh) {
     auto KernelFunctor =
         compat::experimental::detail::build_kernel_functor<cutlass::device_kernel<Kernel>>(cgh, policy, params);
-    sycl::ext::oneapi::experimental::detail::
-        LaunchConfigAccess<sycl::nd_range<3>, decltype(policy.get_launch_properties())>
-            ConfigAccess(config);
-    cgh.parallel_for<KernelCur<Kernel>>(ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
+    sycl::ext::oneapi::experimental::nd_launch<KernelCur<Kernel>>(cgh, config, KernelFunctor);
   };
   auto stream = at::xpu::getCurrentXPUStream();
   auto q = stream.queue();

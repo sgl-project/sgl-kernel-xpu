@@ -158,10 +158,6 @@ struct XeHcPreGemmSqrSumMainloop<XeDefault<Stages>, TiledMMA_, TensorA_, TensorB
     auto tCrAsq = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
     auto tCrBones = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
 
-    // Low-order part of B for the 2-pass tf32 split. B is loaded as full fp32 and
-    // reinterpreted as tf32, so tCrB(i) carries all 23 mantissa bits in storage but
-    // the MMA only consumes the top 10 (b_hi). tCrBlo captures the discarded
-    // remainder (b - b_hi), itself rounded to tf32, recovering ~10 more bits.
     auto tCrBlo = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
 
     auto prefetch_a = make_block_2d_prefetch(copy_a);
@@ -178,8 +174,10 @@ struct XeHcPreGemmSqrSumMainloop<XeDefault<Stages>, TiledMMA_, TensorA_, TensorB
 
     CUTE_UNROLL
     for (int p = 0; p < prefetch_dist; p++, k_tile_prefetch++) {
-      prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
-      prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+      if (k_tile_prefetch < k_tile_end) {
+        prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
+        prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+      }
     }
 
     for (int k_tile = k_tile_begin; k_tile < k_tile_end; k_tile++, k_tile_prefetch++) {
@@ -188,18 +186,14 @@ struct XeHcPreGemmSqrSumMainloop<XeDefault<Stages>, TiledMMA_, TensorA_, TensorB
       copy(copy_a, tAgA(_, _, _, k_tile), tArA);
       copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
 
-      prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
-      prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+      if (k_tile_prefetch < k_tile_end) {
+        prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
+        prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+      }
 
       reorder(tArA, tCrA);
       reorder(tBrB, tCrB);
 
-      // 2-pass tf32 split of B: tCrB holds full fp32 bits, but a single tf32 MMA
-      // truncates to ~10 mantissa bits. Split each element into b_hi (top tf32) and
-      // b_lo (remainder as tf32), then accumulate A*b_hi + A*b_lo into the same fp32
-      // accumulator -> ~20 effective mantissa bits, near-exact vs the fp32 reference.
-      // A is bf16 (<=7 mantissa bits), so it fits losslessly in a single tf32 and
-      // needs no split.
       constexpr int n_b_split = decltype(size(tCrB.tensor()))::value;
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < n_b_split; i++) {

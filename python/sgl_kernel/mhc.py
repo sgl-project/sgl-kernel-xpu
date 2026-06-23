@@ -177,7 +177,11 @@ def mhc_pre(
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: float = 1e-6,
 ):
-    assert residual.dim() == 3, "residual must be [T, hc_mult, D]"
+    if residual.dim() != 3:
+        raise ValueError(
+            f"residual must be [T, hc_mult, D] (3 dimensions), got {residual.dim()} "
+            f"(shape={tuple(residual.shape)})"
+        )
     num_tokens = residual.size(0)
     hc_mult = residual.size(1)
     hidden_size = residual.size(2)
@@ -186,9 +190,8 @@ def mhc_pre(
     hc_hidden = hc_mult * hidden_size
     hc_mult3 = (2 + hc_mult) * hc_mult
 
-    assert (
-        fn.size(0) == hc_mult3 and fn.size(1) == hc_hidden
-    ), f"fn must be [{hc_mult3}, {hc_hidden}], got {tuple(fn.shape)}"
+    if fn.size(0) != hc_mult3 or fn.size(1) != hc_hidden:
+        raise ValueError(f"fn must be [{hc_mult3}, {hc_hidden}], got {tuple(fn.shape)}")
 
     if n_splits is not None and n_splits != 1:
         raise ValueError(f"mhc_pre requires n_splits==1, got {n_splits}")

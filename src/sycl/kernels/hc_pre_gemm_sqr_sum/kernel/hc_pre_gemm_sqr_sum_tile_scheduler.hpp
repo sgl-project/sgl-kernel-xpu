@@ -44,6 +44,7 @@ struct XeHcPreGemmSqrSumTileScheduler {
     dim3 grid;
   };
 
+  bool valid_ = true;
   Params params;
 
   CUTLASS_DEVICE
@@ -69,6 +70,11 @@ struct XeHcPreGemmSqrSumTileScheduler {
   }
 
   CUTLASS_DEVICE
+  bool is_valid() {
+    return valid_;
+  }
+
+  CUTLASS_DEVICE
   auto get_block_coord() {
     using namespace cute;
 
@@ -77,6 +83,12 @@ struct XeHcPreGemmSqrSumTileScheduler {
     int blk_n = int(BlockIdxZ());
 
     return make_coord(blk_m, blk_n, split_idx);
+  }
+
+  CUTLASS_DEVICE
+  XeHcPreGemmSqrSumTileScheduler& operator++() {
+    valid_ = false;
+    return *this;
   }
 };
 }  // namespace cutlass::hc_pre_gemm_sqr_sum::kernel

@@ -147,41 +147,44 @@ class XeHcPreGemmSqrSumKernel {
     int thr_id = int(this_work_item::get_nd_item<3>().get_local_id(2));
 
     TileScheduler scheduler{params.scheduler};
-    auto [blk_m, blk_n, split_idx] = scheduler.get_block_coord();
 
-    int k_tiles_total = (s.K + BLK_K - 1) / BLK_K;
-    int split_k = params.split_k;
-    int tiles_per_split = (k_tiles_total + split_k - 1) / split_k;
-    int k_tile_begin = split_idx * tiles_per_split;
-    int k_tile_end = k_tile_begin + tiles_per_split;
-    if (k_tile_end > k_tiles_total) k_tile_end = k_tiles_total;
+    for (; scheduler.is_valid(); ++scheduler) {
+      auto [blk_m, blk_n, split_idx] = scheduler.get_block_coord();
 
-    int64_t c_slab_elems = int64_t(s.M) * int64_t(s.N);
-    ElementC* ptr_C_split = p.ptr_C + split_idx * c_slab_elems;
-    ElementSqrSum* ptr_sqsum_split = p.ptr_sqr_sum_scratch + int64_t(split_idx) * int64_t(s.M);
+      int k_tiles_total = (s.K + BLK_K - 1) / BLK_K;
+      int split_k = params.split_k;
+      int tiles_per_split = (k_tiles_total + split_k - 1) / split_k;
+      int k_tile_begin = split_idx * tiles_per_split;
+      int k_tile_end = k_tile_begin + tiles_per_split;
+      if (k_tile_end > k_tiles_total) k_tile_end = k_tiles_total;
 
-    auto layout_A = make_layout(make_shape(s.M, s.K), p.dA);
-    auto layout_B = make_layout(make_shape(s.N, s.K), p.dB);
-    auto layout_C = make_layout(make_shape(s.M, s.N), p.dC);
-    auto layout_Ssq = make_layout(make_shape(s.M, 1), p.dSqsum);
+      int64_t c_slab_elems = int64_t(s.M) * int64_t(s.N);
+      ElementC* ptr_C_split = p.ptr_C + split_idx * c_slab_elems;
+      ElementSqrSum* ptr_sqsum_split = p.ptr_sqr_sum_scratch + int64_t(split_idx) * int64_t(s.M);
 
-    Tensor A = make_tensor(make_gmem_ptr(p.ptr_A), layout_A);
-    Tensor B = make_tensor(make_gmem_ptr(p.ptr_B), layout_B);
-    Tensor C = make_tensor(make_gmem_ptr(ptr_C_split), layout_C);
-    Tensor Ssq = make_tensor(make_gmem_ptr(ptr_sqsum_split), layout_Ssq);
+      auto layout_A = make_layout(make_shape(s.M, s.K), p.dA);
+      auto layout_B = make_layout(make_shape(s.N, s.K), p.dB);
+      auto layout_C = make_layout(make_shape(s.M, s.N), p.dC);
+      auto layout_Ssq = make_layout(make_shape(s.M, 1), p.dSqsum);
 
-    auto A_2D = A(append<rank_v<decltype(A)>>(make_coord(_, _), 0));
-    auto B_2D = B(append<rank_v<decltype(B)>>(make_coord(_, _), 0));
+      Tensor A = make_tensor(make_gmem_ptr(p.ptr_A), layout_A);
+      Tensor B = make_tensor(make_gmem_ptr(p.ptr_B), layout_B);
+      Tensor C = make_tensor(make_gmem_ptr(ptr_C_split), layout_C);
+      Tensor Ssq = make_tensor(make_gmem_ptr(ptr_sqsum_split), layout_Ssq);
 
-    CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
+      auto A_2D = A(append<rank_v<decltype(A)>>(make_coord(_, _), 0));
+      auto B_2D = B(append<rank_v<decltype(B)>>(make_coord(_, _), 0));
 
-    typename CollectiveMainloop::FragGemm tC;
-    typename CollectiveMainloop::FragSqrSum tSqrSum;
+      CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
 
-    mainloop(A_2D, B_2D, tC, tSqrSum, make_coord(blk_m, blk_n), thr_id, k_tile_begin, k_tile_end);
+      typename CollectiveMainloop::FragGemm tC;
+      typename CollectiveMainloop::FragSqrSum tSqrSum;
 
-    CollectiveEpilogue epilogue({}, shared_storage.epilogue);
-    epilogue(C, Ssq, tC, tSqrSum, make_coord(blk_m, blk_n), thr_id);
+      mainloop(A_2D, B_2D, tC, tSqrSum, make_coord(blk_m, blk_n), thr_id, k_tile_begin, k_tile_end);
+
+      CollectiveEpilogue epilogue({}, shared_storage.epilogue);
+      epilogue(C, Ssq, tC, tSqrSum, make_coord(blk_m, blk_n), thr_id);
+    }
   }
 };
 

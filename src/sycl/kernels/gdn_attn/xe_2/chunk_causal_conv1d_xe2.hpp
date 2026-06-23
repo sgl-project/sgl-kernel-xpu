@@ -828,25 +828,26 @@ void chunk_causal_conv1d_xe2(
       num_decodes,                                                                                      \
       fuse_l2norm);
 
-#define WIDTH_DISPATCH(scalar_t, width, reorder_input) \
-  switch (width) {                                     \
-    case 1:                                            \
-      KERNEL_LAUNCHER(scalar_t, 1, reorder_input)      \
-      break;                                           \
-    case 2:                                            \
-      KERNEL_LAUNCHER(scalar_t, 2, reorder_input)      \
-      break;                                           \
-    case 3:                                            \
-      KERNEL_LAUNCHER(scalar_t, 3, reorder_input)      \
-      break;                                           \
-    case 4:                                            \
-      KERNEL_LAUNCHER(scalar_t, 4, reorder_input)      \
-      break;                                           \
-    case 5:                                            \
-      KERNEL_LAUNCHER(scalar_t, 5, reorder_input)      \
-      break;                                           \
-    default:                                           \
-      break;                                           \
+#define WIDTH_DISPATCH(scalar_t, width, reorder_input)                          \
+  switch (width) {                                                              \
+    case 1:                                                                     \
+      KERNEL_LAUNCHER(scalar_t, 1, reorder_input)                               \
+      break;                                                                    \
+    case 2:                                                                     \
+      KERNEL_LAUNCHER(scalar_t, 2, reorder_input)                               \
+      break;                                                                    \
+    case 3:                                                                     \
+      KERNEL_LAUNCHER(scalar_t, 3, reorder_input)                               \
+      break;                                                                    \
+    case 4:                                                                     \
+      KERNEL_LAUNCHER(scalar_t, 4, reorder_input)                               \
+      break;                                                                    \
+    case 5:                                                                     \
+      KERNEL_LAUNCHER(scalar_t, 5, reorder_input)                               \
+      break;                                                                    \
+    default:                                                                    \
+      TORCH_CHECK(false, "Unsupported conv width=", width, " (expected 1..5)"); \
+      break;                                                                    \
   }
 
 #define SPLIT_DISPATCH(scalar_t, width, reorder_input) \

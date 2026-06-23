@@ -39,7 +39,7 @@ void gdn_attention(
     const int64_t num_prefills,
     const int64_t num_decodes,
     const int64_t num_spec_decodes,
-    const std::optional<torch::Tensor>& has_initial_state,              // [num_prefills] or None
+    const std::optional<torch::Tensor>& has_initial_state,              // [num_prefills + num_decodes] or None
     const std::optional<torch::Tensor>& non_spec_query_start_loc,       // [num_prefills + num_decodes + 1]
     const std::optional<torch::Tensor>& non_spec_token_indx,            // [non_spec_token]
     const std::optional<torch::Tensor>& non_spec_state_indices_tensor,  // [num_prefills + num_decodes]

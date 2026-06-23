@@ -172,6 +172,8 @@ struct XeHcPreGemmSqrSumMainloop<XeDefault<Stages>, TiledMMA_, TensorA_, TensorB
     clear(tC);
     clear(tSqrSum);
 
+    fill(tCrBones, static_cast<ElementMMA>(1));
+
     CUTE_UNROLL
     for (int p = 0; p < prefetch_dist; p++, k_tile_prefetch++) {
       if (k_tile_prefetch < k_tile_end) {
@@ -211,11 +213,6 @@ struct XeHcPreGemmSqrSumMainloop<XeDefault<Stages>, TiledMMA_, TensorA_, TensorB
       for (int i = 0; i < n_a; i++) {
         ElementMMA a_in = tCrA(i);
         tCrAsq(i) = static_cast<ElementMMA>(a_in * a_in);
-      }
-      constexpr int n_b = decltype(size(tCrBones.tensor()))::value;
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < n_b; i++) {
-        tCrBones(i) = static_cast<ElementMMA>(1);
       }
       cute::gemm(mma, tCrAsq, tCrBones, tSqrSum);
 

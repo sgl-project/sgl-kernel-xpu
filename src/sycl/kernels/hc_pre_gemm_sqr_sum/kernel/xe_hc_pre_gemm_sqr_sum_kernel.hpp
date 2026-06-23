@@ -98,6 +98,7 @@ class XeHcPreGemmSqrSumKernel {
   struct Params {
     KernelArguments kernel{};
     typename CollectiveMainloop::Params mainloop{};
+    typename CollectiveEpilogue::Params epilogue{};
     TileSchedulerParams scheduler{};
     int split_k = 1;
   };
@@ -105,6 +106,7 @@ class XeHcPreGemmSqrSumKernel {
   struct Arguments {
     KernelArguments kernel{};
     typename CollectiveMainloop::Arguments mainloop{};
+    typename CollectiveEpilogue::Arguments epilogue{};
     cutlass::KernelHardwareInfo hw_info{};
     int split_k = 1;
   };
@@ -113,12 +115,13 @@ class XeHcPreGemmSqrSumKernel {
     return Params{
         args.kernel,
         CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
+        CollectiveEpilogue::to_underlying_arguments(args.epilogue, workspace),
         TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShape{}, args.split_k),
         args.split_k};
   }
 
   static bool can_implement(Arguments const& args) {
-    return CollectiveMainloop::can_implement(args.mainloop);
+    return CollectiveMainloop::can_implement(args.mainloop) && CollectiveEpilogue::can_implement(args.epilogue);
   }
 
   static int get_workspace_size(Arguments const& args) {

@@ -132,6 +132,7 @@ def flash_attn_with_kvcache(
     pack_gqa=None,  # Can be tuned for speed
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
+    out=None,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -245,7 +246,7 @@ def flash_attn_with_kvcache(
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
     rotary_seqlens = maybe_contiguous(rotary_seqlens)
 
-    if cu_seqlens_q == None:  # !is_varlen_q
+    if cu_seqlens_q is None:  # !is_varlen_q
         cu_seqlens_q = torch.arange(
             0, q.size(0) + 1, dtype=torch.int, device=q.device
         ) * q.size(1)
@@ -283,6 +284,7 @@ def flash_attn_with_kvcache(
         num_splits,
         pack_gqa,
         sm_margin,
+        out,
     )
     return (out, softmax_lse, *rest) if return_softmax_lse else out
 
@@ -320,7 +322,7 @@ def flash_attn_varlen_func(
         softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
             -0.5
         )
-    if cu_seqlens_q == None:  # !is_varlen_q
+    if cu_seqlens_q is None:  # !is_varlen_q
         cu_seqlens_q = torch.arange(
             0, q.size(0) + 1, dtype=torch.int, device=q.device
         ) * q.size(1)

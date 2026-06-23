@@ -71,6 +71,10 @@ def test_mhc_pre(T, with_norm):
         residual, fn, hc_scale, hc_base, nw
     )
 
+    norm_kwargs = {}
+    norm_kwargs["norm_weight"] = nw
+    norm_kwargs["norm_eps"] = NORM_EPS
+
     post_mix, comb_mix, layer_input = mhc_pre(
         residual,
         fn,
@@ -81,8 +85,7 @@ def test_mhc_pre(T, with_norm):
         hc_sinkhorn_eps=HC_SINKHORN_EPS,
         hc_post_mult_value=HC_POST_MULT_VALUE,
         sinkhorn_repeat=SINKHORN_REPEAT,
-        norm_weight=nw,
-        norm_eps=NORM_EPS,
+        **norm_kwargs,
     )
 
     assert torch.allclose(

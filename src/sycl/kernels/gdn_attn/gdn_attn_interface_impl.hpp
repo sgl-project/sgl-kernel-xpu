@@ -119,7 +119,8 @@ void gdn_attention(
     TORCH_CHECK(
         spec_query_start_loc.has_value() && spec_token_indx.has_value() && spec_state_indices_tensor.has_value() &&
             num_accepted_tokens.has_value(),
-        "spec_query_start_loc/spec_token_indx/spec_state_indices_tensor/num_accepted_tokens must be provided when num_spec_decodes > 0");
+        "spec_query_start_loc/spec_token_indx/spec_state_indices_tensor/num_accepted_tokens must be provided when "
+        "num_spec_decodes > 0");
     TORCH_CHECK(spec_query_start_loc->is_contiguous(), "spec_query_start_loc must be contiguous");
     TORCH_CHECK(spec_query_start_loc->dtype() == torch::kInt32, "spec_query_start_loc must be of int32 dtype");
     TORCH_CHECK(spec_query_start_loc->dim() == 1, "spec_query_start_loc must be 1D of shape [num_spec_decodes + 1]");

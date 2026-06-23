@@ -1,8 +1,9 @@
 #pragma once
 
+#include <torch/all.h>
+
 #include <optional>
 #include <sycl/sycl.hpp>
-#include <torch/all.h>
 
 void chunk_gated_delta_rule_xe2(
     sycl::queue& queue,

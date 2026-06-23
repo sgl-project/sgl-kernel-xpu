@@ -15,6 +15,7 @@ from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
     flash_mla_decode,
     flash_mla_get_workspace_size,
+    flash_mla_with_kvcache,
     lightning_attention_decode,
     merge_state,
     merge_state_v2,
@@ -81,6 +82,12 @@ from sgl_kernel.sampling import (
     top_k_top_p_sampling_from_probs,
     top_p_renorm_prob,
     top_p_sampling_from_probs,
+)
+from sgl_kernel.sparse_flash_attn import (
+    convert_vertical_slash_indexes,
+    convert_vertical_slash_indexes_mergehead,
+    sparse_attn_func,
+    sparse_attn_varlen_func,
 )
 from sgl_kernel.speculative import (
     build_tree_kernel_efficient,

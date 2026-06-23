@@ -18,7 +18,9 @@ suites = {
         TestFile("test_topk_sigmoid.py"),
         TestFile("test_topk_softmax.py"),
         TestFile("test_flash_attention.py"),
+        TestFile("test_flash_attn_sparse.py"),
         TestFile("test_flash_mla_decode.py"),
+        TestFile("test_flash_mla_with_kvcache.py"),
         TestFile("test_moe_align.py"),
         TestFile("test_moe_gemm.py"),
         TestFile("test_moe_sum_reduce.py"),
@@ -31,6 +33,7 @@ suites = {
         TestFile("test_per_tensor_quant_fp8.py"),
         TestFile("test_fused_qk_norm_rope.py"),
         TestFile("test_fused_qk_rope_with_cache.py"),
+        TestFile("test_merge_state.py"),
         TestFile("test_merge_state_v2.py"),
         TestFile("test_norm.py"),
         TestFile("test_per_token_group_quant_8bit_v2.py"),
@@ -43,6 +46,7 @@ suites = {
         TestFile("test_store_cache_xpu.py"),
         TestFile("test_hc_pre_gemm_sqr_sum.py"),
         TestFile("test_mhc_pre.py"),
+        TestFile("test_per_token_group_quant_mxfp4_fused.py"),
     ],
 }
 

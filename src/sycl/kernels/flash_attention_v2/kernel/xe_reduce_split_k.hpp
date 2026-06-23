@@ -94,6 +94,9 @@ class ReduceSplitK {
     const ElementLSE* max_logits;
     StrideO dMax_logits;
     int window_size_left = -1;
+    // Per-batch skip mask for two-kernel mix-batch dispatch
+    // (see https://github.com/vllm-project/vllm-xpu-kernels/pull/218).
+    const bool* skip_batch_mask = nullptr;
   };
   using KernelParams = KernelArguments;
 
@@ -190,6 +193,8 @@ class ReduceSplitK {
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
       auto [seq_idx, head_q, idx_b] = tile_scheduler.get_block_coord();
+      // Mix-batch dispatch: skip batches not owned by this kernel launch.
+      if (p.skip_batch_mask != nullptr && p.skip_batch_mask[idx_b]) continue;
 
       auto sequence_length_shape = get_sequence_length_shape(s, idx_b);
       auto [seq_len_qo, seq_len_kv] = sequence_length_shape;

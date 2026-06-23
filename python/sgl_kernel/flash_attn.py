@@ -306,7 +306,7 @@ def flash_attn_varlen_func(
     v_descale=None,
     window_size=(-1, -1),
     softcap=0.0,
-    num_splits=1,
+    num_splits=0,
     pack_gqa=None,
     sm_margin=0,
     return_softmax_lse=False,

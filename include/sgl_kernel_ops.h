@@ -201,7 +201,12 @@ void multimodal_rotary_embedding(
     bool is_neox_style,
     const std::optional<at::Tensor>& axis_map);
 void sgl_per_token_group_quant_fp4(
-    at::Tensor input, at::Tensor output_q, at::Tensor output_s, int64_t group_size, double eps);
+    at::Tensor input,
+    at::Tensor output_q,
+    at::Tensor output_s,
+    int64_t group_size,
+    double eps,
+    std::optional<at::Tensor> input_secondary = std::nullopt);
 void store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices);
 }  // namespace at::native::xpu
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);

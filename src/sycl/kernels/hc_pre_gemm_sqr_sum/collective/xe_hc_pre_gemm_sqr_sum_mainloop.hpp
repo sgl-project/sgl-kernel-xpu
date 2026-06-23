@@ -166,7 +166,7 @@ struct XeHcPreGemmSqrSumMainloop<XeDefault<Stages>, TiledMMA_, TensorA_, TensorB
     auto pBgB = prefetch_b.get_slice(thr_id).partition_S(gB);
 
     constexpr int prefetch_dist = Stages;
-    constexpr int barrier_scope = 2;
+    constexpr auto barrier_scope = ScopeWorkgroup;
     int k_tile_prefetch = k_tile_begin;
 
     clear(tC);

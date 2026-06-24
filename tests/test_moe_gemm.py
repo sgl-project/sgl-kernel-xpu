@@ -239,8 +239,8 @@ def test_moe_gemm(
     w2_xpu = w2.clone().to(device)
     topk_weight_xpu = topk_weight.clone().to(device)
     topk_ids_xpu = topk_ids.clone().to(device)
-    b1_xpu = b1.clone().to(device) if with_bias else None
-    b2_xpu = b2.clone().to(device) if with_bias else None
+    b1_xpu = b1.clone().to(device) if bias_dtype else None
+    b2_xpu = b2.clone().to(device) if bias_dtype else None
 
     sglang_output = fused_experts(
         a_xpu,

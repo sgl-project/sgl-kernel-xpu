@@ -92,7 +92,7 @@ if(USE_MLA)
     include(MlaSparseDecodeXe20.cmake)
 endif()
 if(USE_MOE)
-    include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmXe20.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmSIMD.cmake)
     include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmMxfp4W4A16Xe20.cmake)
 endif()
 

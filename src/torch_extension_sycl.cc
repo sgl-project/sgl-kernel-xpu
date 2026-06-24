@@ -127,7 +127,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 #if SYCL_INTEL_TARGET == 35
   m.def(
       "moe_grouped_mm_nt_xe35(Tensor output, Tensor activations, Tensor weights, Tensor? bias, Tensor "
-      "total_rows_for_experts, int n_experts, int activation_type, bool fuse_act) -> ()");
+      "total_rows_for_experts, int n_experts, int activation_type, bool fuse_act, "
+      "float gemm1_alpha=1.702, float gemm1_limit=7.0) -> ()");
   m.impl("moe_grouped_mm_nt_xe35", torch::kXPU, &moe_grouped_mm_nt_xe35);
 #endif
 

@@ -390,14 +390,14 @@ def fused_experts(
         assert (
             b1.dtype == torch.bfloat16 or b1.dtype == torch.float32
         ), "b1 must be bfloat16 or float32"
-        if is_xe2_arch() and b1.dtype == torch.bfloat16:
+        if (is_xe2_arch() or is_xe3_arch()) and b1.dtype == torch.bfloat16:
             # cast b1 to float32, since bias is accumulated in float32 in the kernel
             b1 = b1.float()
     if b2 is not None:
         assert (
             b2.dtype == torch.bfloat16 or b2.dtype == torch.float32
         ), "b2 must be bfloat16 or float32"
-        if is_xe2_arch() and b2.dtype == torch.bfloat16:
+        if (is_xe2_arch() or is_xe3_arch()) and b2.dtype == torch.bfloat16:
             # cast b2 to float32, since bias is accumulated in float32 in the kernel
             b2 = b2.float()
     # Shape check
@@ -548,7 +548,7 @@ def fused_experts(
             )
             # GEMM1: B = w1 (gate+up).
             if use_mxfp4_w4a16:
-                torch.ops.sgl_kernel.moe_grouped_mm_nt(
+                moe_grouped_mm_nt(
                     intermediate_cache1,
                     input_A_shuffle,
                     w1,
@@ -562,7 +562,7 @@ def fused_experts(
                     float(gemm1_limit) if gemm1_limit is not None else 7.0,
                 )
             else:
-                torch.ops.sgl_kernel.moe_grouped_mm_nt(
+                moe_grouped_mm_nt(
                     intermediate_cache1,
                     input_A_shuffle,
                     w1,
@@ -598,7 +598,7 @@ def fused_experts(
                 intermediate_cache2 = torch.square(torch.relu(intermediate_cache1))
             # GEMM2: B = w2 (down).
             if use_mxfp4_w4a16:
-                torch.ops.sgl_kernel.moe_grouped_mm_nt(
+                moe_grouped_mm_nt(
                     intermediate_cache3,
                     intermediate_cache2,
                     w2,
@@ -612,7 +612,7 @@ def fused_experts(
                     float(gemm1_limit) if gemm1_limit is not None else 7.0,
                 )
             else:
-                torch.ops.sgl_kernel.moe_grouped_mm_nt(
+                moe_grouped_mm_nt(
                     intermediate_cache3,
                     intermediate_cache2,
                     w2,
@@ -630,7 +630,7 @@ def fused_experts(
             )
             # GEMM1 (fused act): B = w1 (gate+up).
             if use_mxfp4_w4a16:
-                torch.ops.sgl_kernel.moe_grouped_mm_nt(
+                moe_grouped_mm_nt(
                     intermediate_cache1,
                     input_A_shuffle,
                     w1,
@@ -644,7 +644,7 @@ def fused_experts(
                     float(gemm1_limit) if gemm1_limit is not None else 7.0,
                 )
             else:
-                torch.ops.sgl_kernel.moe_grouped_mm_nt(
+                moe_grouped_mm_nt(
                     intermediate_cache1,
                     input_A_shuffle,
                     w1,
@@ -658,7 +658,7 @@ def fused_experts(
                 )
             # GEMM2: B = w2 (down). Always fuse_act=False on the second GEMM.
             if use_mxfp4_w4a16:
-                torch.ops.sgl_kernel.moe_grouped_mm_nt(
+                moe_grouped_mm_nt(
                     intermediate_cache3,
                     intermediate_cache1,
                     w2,
@@ -672,7 +672,7 @@ def fused_experts(
                     float(gemm1_limit) if gemm1_limit is not None else 7.0,
                 )
             else:
-                torch.ops.sgl_kernel.moe_grouped_mm_nt(
+                moe_grouped_mm_nt(
                     intermediate_cache3,
                     intermediate_cache1,
                     w2,

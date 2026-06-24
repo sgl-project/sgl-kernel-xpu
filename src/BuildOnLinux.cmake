@@ -13,6 +13,10 @@ macro(setup_common_libraries)
     INSTALL_RPATH "$ORIGIN"
     BUILD_WITH_INSTALL_RPATH TRUE
   )
+  # Keep DT_NEEDED for every sibling sgl-ops-sycl-*.so, including template
+  # instantiation libs whose symbols common_ops does not reference directly
+  # but that other sibling libs (e.g. GroupGemmXe35) depend on at load time.
+  target_link_options(common_ops PRIVATE "LINKER:--no-as-needed")
   list(APPEND SGL_OPS_LIBRARIES common_ops)
 endmacro()
 

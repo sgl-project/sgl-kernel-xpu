@@ -1,4 +1,7 @@
-#define SYCL_INTEL_TARGET 20
+#ifdef SYCL_INTEL_TARGET
+#undef SYCL_INTEL_TARGET
+#endif
+#define SYCL_INTEL_TARGET @SYCL_INTEL_TARGET@
 
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
@@ -119,5 +122,3 @@ template void Xe20MoEGEMMLauncher<@TILE@, @SGLAYOUT@, static_cast<ActivationType
     float,
     float,
     int);
-
-#undef SYCL_INTEL_TARGET

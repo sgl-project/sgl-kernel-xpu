@@ -38,6 +38,7 @@
 #include "cute/algorithm/gemm.hpp"
 #include "cute/algorithm/subgroup_algorithms.hpp"
 #include "cute/atom/mma_atom.hpp"
+#include "cute/util/xe_split_barrier.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 namespace cutlass::flash_attention {
@@ -62,7 +63,12 @@ template <
     class TensorV_,            // Global V tensor
     class TiledCopyQ_ = void,  // Optional TiledCopy for loading Q
     class TiledCopyK_ = void,  // Optional TiledCopy for loading KV
-    class TiledCopyV_ = void>  // Optional TiledCopy for loading V
+    class TiledCopyV_ = void,  // Optional TiledCopy for loading V
+    bool IsPrefill_ = true>    // Prefill: 256-GRF launch (large per-thread
+                               // register footprint avoids spill on Q_TILE_M
+                               // up to 256). Decode: 128-GRF launch (small
+                               // per-thread footprint, doubles thread/EU
+                               // occupancy for memory-bound decode).
 struct XeMlaMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -79,7 +85,8 @@ template <
     class TensorV_,
     class TiledCopyQ_,
     class TiledCopyK_,
-    class TiledCopyV_>
+    class TiledCopyV_,
+    bool IsPrefill_>
 struct XeMlaMainloop<
     XeDefault<Stages>,
     CausalMask_,
@@ -91,7 +98,8 @@ struct XeMlaMainloop<
     TensorV_,
     TiledCopyQ_,
     TiledCopyK_,
-    TiledCopyV_> {
+    TiledCopyV_,
+    IsPrefill_> {
   //
   // Type Aliases
   //
@@ -154,6 +162,7 @@ struct XeMlaMainloop<
   using ElementA = typename TiledMMAPV::ValTypeD;
 
   static constexpr bool CausalMask = CausalMask_;
+  static constexpr bool IsPrefill = IsPrefill_;
 
   //
   // Arguments
@@ -233,7 +242,9 @@ struct XeMlaMainloop<
       int total_blk,              // Total # of K blocks
       int thr_id,
       int seq_len_kv,
-      int batch_coord) {  // Batch index for page table lookup
+      int batch_coord,
+      int causal_offset = 0,                            // causal offset: seqlen_k - seqlen_q
+      int q_valid_rows = static_cast<int>(QK_BLK_M)) {  // # valid Q rows in this tile
     using namespace sycl::ext::oneapi::this_work_item;
 
     // Short dimension names:
@@ -338,7 +349,7 @@ struct XeMlaMainloop<
 
     auto [physical_block_idx, intra_page_tile_idx] = get_physical_k_tile(blk_k0, seq_len_kv, batch_coord);
 
-    /* Initialization steps for first block: Q prefetch, O init */
+    /* Initialization steps for first block: Q + K/Kpe + V prefetch, O init. */
     if (blk_k0 == 0) {
       for (int D = 0; D < size<3>(pQnopegQ); D++) {
         prefetch(prefetch_qnope, pQnopegQ(_, _, _, D));
@@ -358,6 +369,14 @@ struct XeMlaMainloop<
 
     /* Main loop, blocked in k. */
     for (int K = blk_k0; K < blk_k1; K++) {
+      /* Split barrier to keep WG together: pairs with barrier_wait at end of
+       * iteration. Prefill only — decode's tiny per-WG footprint can't
+       * amortize the barrier, and at long seq the per-iter overhead
+       * accumulates (e.g. 256 iters at seq=32768/ps=128). */
+      if constexpr (IsPrefill) {
+        barrier_arrive(ScopeWorkgroup);
+      }
+
       /* Prefetch next K tile and save its physical block info for next iteration */
       int next_physical_block_idx = 0, next_intra_page_tile_idx = 0;
       int K_prefetch = K + 1;
@@ -372,13 +391,10 @@ struct XeMlaMainloop<
         prefetch(prefetch_v, pVgV(_, _, 0, pf_tile_idx, pf_block_idx));
       }
 
-      // TODO: need to remove copy_kv1, copy_kpe1, copy_v1, as this is unoptimized approach
-      // as for every block K we are creating new TiledCopy objects which is expensive.
-      // Instead we should create these TiledCopy objects once outside the loop and reuse them by
-      // just changing the block index they point to. but currently TiledCopy objects are immutable
-      // and we cannot change the underlying pointer after creation. We should optimize this by
-      // making TiledCopy objects mutable or by creating a new type of copy object that allows
-      // changing the underlying pointer without creating a new object.
+      // TODO: per-K-iter TiledCopy rebuild — cute's TiledCopy partition contract
+      // is rank-sensitive, so binding to the full 3D paged tensor and rebinding
+      // base per copy() is not possible without a cutlass-sycl change.
+      // Pays one createBlock2DAddressPayload builtin per K iter per copy.
       TiledCopyK copy_kv1{K_3D(_, _, physical_block_idx)};
       TiledCopyK copy_kpe1{Kpe_3D(_, _, physical_block_idx)};
       TiledCopyV copy_v1{V_3D(_, _, physical_block_idx)};
@@ -409,7 +425,7 @@ struct XeMlaMainloop<
         cute::gemm(mma_qk, tSrQpe, tSrKpe, tSrS);
       }
 
-      /* PagedKV masking - mask out invalid positions */
+      /* PagedKV masking - mask out invalid positions beyond seq_len_kv */
       if (check_remainder_k && K == total_blk - 1) {
         FragSRow k_rem_mask;
         int k_intra_page = get<0>(tKgK(0, 0, 0, intra_page_tile_idx, 0, physical_block_idx)) + K * params.page_size;
@@ -425,24 +441,88 @@ struct XeMlaMainloop<
         }
       }
 
+      /* Causal masking: mask positions where k_pos > causal_offset + q_pos.
+       * Applies to any K tile that intersects the causal boundary, not just the last tile.
+       * For full prefill (offset=0): standard lower-triangular mask.
+       * For incremental prefill (offset>0): prefix is unmasked, only new tokens get triangular mask. */
+      if constexpr (CausalMask) {
+        int k_tile_start = K * params.page_size;
+        int q_tile_start = get<0>(blk_qv) * static_cast<int>(QK_BLK_M);
+        // Check if any element in this tile could be masked
+        if (k_tile_start + static_cast<int>(QK_BLK_N) - 1 > causal_offset + q_tile_start) {
+          Tensor cPgP = make_identity_tensor(make_shape(seq_len_kv, seq_len_kv));
+          Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
+          auto cS_thread = thr_mma_qk.partition_C(gP);
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); ++i) {
+            int q_pos = get<0>(cS_thread(i));
+            int k_pos = get<1>(cS_thread(i));
+            if (k_pos > causal_offset + q_pos) {
+              tSrS(i) = ElementS(-INFINITY);
+            }
+          }
+        }
+      }
+
+      // Mask out phantom Q rows in partial last tile so softmax stats stay finite.
+      // Compiled out for decode (QK_BLK_M=1); skipped for full tiles at runtime.
+      if constexpr (QK_BLK_M > 1) {
+        if (q_valid_rows < static_cast<int>(QK_BLK_M)) {
+          Tensor cPgPq = make_identity_tensor(take<0, 2>(TileShapeQK{}));
+          auto cSq_thread = thr_mma_qk.partition_C(cPgPq);
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); ++i) {
+            int q_pos = get<0>(cSq_thread(i));
+            if (q_pos >= q_valid_rows) {
+              tSrS(i) = ElementS(-INFINITY);
+            }
+          }
+        }
+      }
+
       /* =================================================================
-       * Apply softmax and scaling (online softmax algorithm)
+       * Apply softmax and scaling.
+       * Prefill: tArA rescale fused into the per-VTile GEMM2 loop — breaks
+       *          the long rescale RAW chain so GEMM2 issue is not stalled.
+       * Decode:  bulk rescale of full tArA inside softmax helper — fewer
+       *          per-iter inner branches, lower per-iter overhead at
+       *          long seq / many K-iters (e.g. seq=32768/ps=128).
        * ================================================================= */
-      softmax(K == blk_k0, tSrS, tA_max, tA_sum, tArA);
-      reorder(tSrS, tArP);
-      /* =================================================================
-       * GEMM 2: O += P @ V
-       * ================================================================= */
-      CUTLASS_PRAGMA_UNROLL
-      for (int VV = 0; VV < VTiles; VV++) {
-        copy(copy_v1, tVgV(_, _, _, VV, intra_page_tile_idx, physical_block_idx), tVrV);
-        reorder(tVrV, tArV);
-        cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
+      if constexpr (IsPrefill) {
+        auto rescale = softmax_with_rescale(K == blk_k0, tSrS, tA_max, tA_sum);
+        reorder(tSrS, tArP);
+        /* GEMM 2: O += P @ V — per-VTile rescale fused with PV gemm. */
+        CUTLASS_PRAGMA_UNROLL
+        for (int VV = 0; VV < VTiles; VV++) {
+          copy(copy_v1, tVgV(_, _, _, VV, intra_page_tile_idx, physical_block_idx), tVrV);
+          reorder(tVrV, tArV);
+          if (K != blk_k0) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tArA.size() / VTiles; i++) {
+              tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
+            }
+          }
+          cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
+        }
+      } else {
+        softmax(K == blk_k0, tSrS, tA_max, tA_sum, tArA);
+        reorder(tSrS, tArP);
+        /* GEMM 2: O += P @ V (decode path — no per-VTile rescale). */
+        CUTLASS_PRAGMA_UNROLL
+        for (int VV = 0; VV < VTiles; VV++) {
+          copy(copy_v1, tVgV(_, _, _, VV, intra_page_tile_idx, physical_block_idx), tVrV);
+          reorder(tVrV, tArV);
+          cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
+        }
       }
 
       /* use prefetched block info for next iteration's computation */
       physical_block_idx = next_physical_block_idx;
       intra_page_tile_idx = next_intra_page_tile_idx;
+
+      if constexpr (IsPrefill) {
+        barrier_wait(ScopeWorkgroup);
+      }
     }
   }
 
@@ -458,6 +538,52 @@ struct XeMlaMainloop<
   //   8. Update output accumulator: O_new = O_prev * correction
   //   9. Update state: m_prev <- m_new, l_prev <- l_new
   //   10. Final output after all tiles:  O_final = O_new / l_new [epilogue step, not shown here]
+  // Prefill variant: returns the rescale factor so the caller can fuse the
+  // O-accumulator rescale into the per-VTile GEMM2 loop. Breaks the long
+  // RAW chain so GEMM2 issue is not stalled.
+  CUTLASS_DEVICE
+  FragSRow softmax_with_rescale(
+      bool first_block,    // First softmax block?
+      FragS& tS,           // Softmax src/dst block
+      FragSRow& tS_max,    // Softmax row-wise max accumulator
+      FragSRow& tS_sum) {  // Softmax row-wise sum accumulator
+    /* Compute row-wise maxima for this block */
+    auto tS_bmax = reduce<1>(tS, sycl::maximum{});
+
+    /* Update (scaled) maxima and compute rescale factor for prior O accumulator */
+    FragSRow rescale;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tS_max.size(); i++) {
+      ElementA new_max = sycl::max(tS_max(i), params.scale * tS_bmax(i));
+      rescale(i) = sycl::native::exp2(tS_max(i) - new_max);
+      tS_max(i) = new_max;
+    }
+
+    /* Scale S and subtract maxima, then exponentiate */
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tS.size(); i++)
+      tS(i) = sycl::native::exp2(params.scale * tS(i) - broadcast<0>(tS_max, tS, i));
+
+    /* Rescale existing S sums (O accumulator rescaling is fused per-VTile at the call site) */
+    if (!first_block) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tS_sum.size(); i++) {
+        tS_sum(i) *= rescale(i);
+      }
+    }
+
+    /* Update sums */
+    auto tS_bsum = reduce<1>(tS, sycl::plus<void>{});
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tS_sum.size(); i++)
+      tS_sum(i) += tS_bsum(i);
+
+    return rescale;
+  }
+
+  // Decode variant: bulk-rescale the full tArA accumulator inside this
+  // helper. Fewer per-iter inner branches than the prefill fusion path —
+  // wins at long seq / many K-iters where per-iter overhead dominates.
   CUTLASS_DEVICE
   void softmax(
       bool first_block,  // First softmax block?
@@ -465,7 +591,6 @@ struct XeMlaMainloop<
       FragSRow& tS_max,  // Softmax row-wise max accumulator
       FragSRow& tS_sum,  // Softmax row-wise sum accumulator
       FragA& tA) {       // O accumulator (for rescaling)
-
     /* Compute row-wise maxima for this block */
     auto tS_bmax = reduce<1>(tS, sycl::maximum{});
 

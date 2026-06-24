@@ -112,6 +112,9 @@ inline void fast_topk_radix(
     s_histogram_buf[tx] = 0;
     s_histogram_buf[kHistStride + tx] = 0;
   }
+  if (tx < kNumScalars) {
+    s_scalars[tx] = 0;
+  }
   item.barrier(sycl::access::fence_space::local_space);
 
   for (int idx = tx; idx < length; idx += kThreadsPerBlock) {

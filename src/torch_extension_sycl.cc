@@ -231,6 +231,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value, "
       "Tensor? norm_weight=None, float? norm_eps=None) -> ()");
   m.impl("hc_pre_big_fuse", torch::kXPU, &hc_pre_big_fuse);
+
+  /* HC PRE GEMM + SQUARE SUM */
+  m.def("hc_pre_gemm_sqr_sum(Tensor! C, Tensor! sqr_sum, Tensor A, Tensor B) -> ()");
+  m.impl("hc_pre_gemm_sqr_sum", torch::kXPU, &hc_pre_gemm_sqr_sum);
+
   /*
    * From LoRA
    */
@@ -239,10 +244,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor weight_indices, "
       "Tensor lora_ranks, Tensor? extra_embeddings, Tensor? seg_lens) -> ()");
   m.impl("embedding_lora_a_fwd", torch::kXPU, &embedding_lora_a_fwd);
-
-  /* GEMM + SQUARE SUM */
-  m.def("hc_pre_gemm_sqr_sum(Tensor! C, Tensor! sqr_sum, Tensor A, Tensor B) -> ()");
-  m.impl("hc_pre_gemm_sqr_sum", torch::kXPU, &hc_pre_gemm_with_sqr_sum);
 }
 
 REGISTER_EXTENSION(common_ops)

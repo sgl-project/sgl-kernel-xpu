@@ -458,9 +458,9 @@ void hc_pre_big_fuse(
     std::optional<double> norm_eps = std::nullopt);
 
 /*
- * mhc_pre GEMM + row-wise square sum stage
+ * hc_pre GEMM + row-wise square sum
  */
-void hc_pre_gemm_with_sqr_sum(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, const at::Tensor& B);
+void hc_pre_gemm_sqr_sum(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, const at::Tensor& B);
 
 /*
  * From csrc/speculative

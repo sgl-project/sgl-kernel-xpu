@@ -42,7 +42,7 @@
 #include "Utils.h"
 #include "sycl/kernels/hc_pre_gemm_sqr_sum/device/hc_pre_gemm_sqr_sum_types.hpp"
 
-void hc_pre_gemm_with_sqr_sum(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, const at::Tensor& B) {
+void hc_pre_gemm_sqr_sum(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, const at::Tensor& B) {
   c10::DeviceGuard guard(A.device());
 
   CHECK_INPUT(A);

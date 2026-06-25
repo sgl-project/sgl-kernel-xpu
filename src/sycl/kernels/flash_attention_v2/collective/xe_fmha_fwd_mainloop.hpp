@@ -389,6 +389,15 @@ struct FMHAFwdMainloop<
     /* Check if */
     bool check_remainder_k = (seq_len % get<1>(TileShapeQK{}) != 0);
 
+    // FP8 K dequant: S = Q*K is linear in K, so the per-tensor scale_k is folded
+    // into the softmax Q*K scale (qk_scale = params.scale * scale_k) instead of
+    // rescaling every K register element in GEMM1. The V dequant scale (scale_v)
+    // is likewise folded into the epilogue normalization.
+    ElementS qk_scale = params.scale;
+    if constexpr (Fp8KV) {
+      qk_scale = params.scale * static_cast<ElementS>(scale_k);
+    }
+
     /* Main loop, blocked in k. */
     for (int K = blk_k0; K < blk_k1 && K < kblocks_cache; K++) {
       /* Split barrier to keep threads together */
@@ -413,14 +422,6 @@ struct FMHAFwdMainloop<
         copy(copy_k_cache, tKgK_cache(_, _, _, page_idx, D), tKrK);
         reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);
-        if constexpr (Fp8KV) {
-          // Dequantize fp8 K: reorder() already cast fp8 -> ElementQ; apply the
-          // per-tensor scale before the Q*K MMA.
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tSrK.size(); ++i) {
-            tSrK(i) = static_cast<ElementQ>(scale_k * static_cast<float>(tSrK(i)));
-          }
-        }
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
       }
 
@@ -485,7 +486,7 @@ struct FMHAFwdMainloop<
       }
 
       /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
-      auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum);
+      auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, qk_scale);
       reorder(tSrS, tArP);
 
       /* GEMM 2: A += P * V, split in v dimension. */
@@ -514,10 +515,11 @@ struct FMHAFwdMainloop<
   // Single step of blocked softmax.
   CUTLASS_DEVICE
   FragSRow softmax(
-      bool first_block,    // First softmax block?
-      FragS& tS,           // Softmax src/dst block
-      FragSRow& tS_max,    // Softmax row-wise max accumulator
-      FragSRow& tS_sum) {  // Softmax row-wise sum accumulator
+      bool first_block,     // First softmax block?
+      FragS& tS,            // Softmax src/dst block
+      FragSRow& tS_max,     // Softmax row-wise max accumulator
+      FragSRow& tS_sum,     // Softmax row-wise sum accumulator
+      ElementS qk_scale) {  // Q*K scale (folds in fp8 K per-tensor scale_k)
 
     /* Compute row-wise maxima for this block */
     auto tS_bmax = reduce<1>(tS, sycl::maximum{});
@@ -526,7 +528,7 @@ struct FMHAFwdMainloop<
     FragSRow rescale;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS_max.size(); i++) {
-      ElementS new_max = sycl::max(tS_max(i), params.scale * tS_bmax(i));
+      ElementS new_max = sycl::max(tS_max(i), qk_scale * tS_bmax(i));
       rescale(i) = sycl::native::exp2(tS_max(i) - new_max);
       tS_max(i) = new_max;
     }
@@ -534,7 +536,7 @@ struct FMHAFwdMainloop<
     /* Scale S and subtract maxima, then exponentiate */
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS.size(); i++)
-      tS(i) = sycl::native::exp2(params.scale * tS(i) - broadcast<0>(tS_max, tS, i));
+      tS(i) = sycl::native::exp2(qk_scale * tS(i) - broadcast<0>(tS_max, tS, i));
 
     /* Rescale existing S sums */
     if (!first_block) {
@@ -825,9 +827,14 @@ struct DecodeFwdMainloop<
     /* Check if */
     bool check_remainder_k = (seq_len % get<1>(TileShapeQK{}) != 0);
 
-    // FP8 K per-tensor scale is supplied by the caller (kernel) as the scale_k
-    // function argument and applied to K in GEMM1. The V dequant scale (scale_v)
+    // FP8 K dequant: S = Q*K is linear in K, so the per-tensor scale_k is folded
+    // into the softmax Q*K scale (qk_scale = params.scale * scale_k) instead of
+    // rescaling every K register element in GEMM1. The V dequant scale (scale_v)
     // is folded into the softmax normalization in the epilogue, not here.
+    ElementS qk_scale = params.scale;
+    if constexpr (Fp8KV) {
+      qk_scale = params.scale * static_cast<ElementS>(scale_k);
+    }
 
     /* Main loop, blocked in k. */
     int next_tile_idx;
@@ -846,11 +853,6 @@ struct DecodeFwdMainloop<
 
         reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);
-        if constexpr (Fp8KV) {
-          for (int i = 0; i < tSrK.size(); ++i) {
-            tSrK(i) = static_cast<ElementQ>(scale_k * static_cast<float>(tSrK(i)));
-          }
-        }
 
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
       }
@@ -910,7 +912,7 @@ struct DecodeFwdMainloop<
       }
 
       /* Apply softmax and scaling */
-      softmax(K == 0, tSrS, tA_max, tA_sum, tArA);
+      softmax(K == 0, tSrS, tA_max, tA_sum, tArA, qk_scale);
       reorder(tSrS, tArP);
 
       /* GEMM 2: A += P * V, split in v dimension */
@@ -950,11 +952,12 @@ struct DecodeFwdMainloop<
   // Single step of blocked softmax.
   CUTLASS_DEVICE
   void softmax(
-      bool first_block,  // First softmax block?
-      FragS& tS,         // Softmax src/dst block
-      FragSRow& tS_max,  // Softmax row-wise max accumulator
-      FragSRow& tS_sum,  // Softmax row-wise sum accumulator
-      FragA& tA) {       // O accumulator (for rescaling)
+      bool first_block,     // First softmax block?
+      FragS& tS,            // Softmax src/dst block
+      FragSRow& tS_max,     // Softmax row-wise max accumulator
+      FragSRow& tS_sum,     // Softmax row-wise sum accumulator
+      FragA& tA,            // O accumulator (for rescaling)
+      ElementS qk_scale) {  // Q*K scale (folds in fp8 K per-tensor scale_k)
 
     /* Compute row-wise maxima for this block */
     auto tS_bmax = reduce<1>(tS, sycl::maximum{});
@@ -963,13 +966,13 @@ struct DecodeFwdMainloop<
     auto tS_prev_max = tS_max;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS_max.size(); i++) {
-      tS_max(i) = sycl::max(tS_max(i), params.scale * tS_bmax(i));
+      tS_max(i) = sycl::max(tS_max(i), qk_scale * tS_bmax(i));
     }
 
     /* Scale S and subtract maxima, then exponentiate */
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS.size(); i++)
-      tS(i) = sycl::native::exp2(params.scale * tS(i) - broadcast<0>(tS_max, tS, i));
+      tS(i) = sycl::native::exp2(qk_scale * tS(i) - broadcast<0>(tS_max, tS, i));
 
     /* Rescale existing S sums and O accumulator */
     if (!first_block) {

@@ -207,6 +207,9 @@ from sgl_kernel.top_k import (
 from sgl_kernel.utils import get_device_capability, is_xe2_arch
 from sgl_kernel.version import __version__
 
+# ---- Vendored: GDN attention (from vllm-xpu-kernels via origin/dev) ----
+from sgl_kernel.gdn import gdn_attention
+
 build_tree_kernel = (
     None  # TODO(ying): remove this after updating the sglang python code.
 )

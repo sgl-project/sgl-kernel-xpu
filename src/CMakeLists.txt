@@ -196,3 +196,10 @@ set(ATen_XPU_SYCL_COMMON ${ATen_XPU_SYCL_COMMON} PARENT_SCOPE)
 set(ATen_XPU_SYCL_XE20 ${ATen_XPU_SYCL_XE20} PARENT_SCOPE)
 
 include(BuildOnLinux.cmake)
+
+# Vendored: GDN attention (from vllm-xpu-kernels via origin/dev). Requires
+# common_ops target to exist, so must come after BuildOnLinux.cmake. Cherry-
+# picked file-only; kept current dev-bmg cutlass pin (27bb6550) since the
+# cutlass APIs gdn_attn uses (get_sub_group_id, barrier_arrive,
+# get_block_2d_copy_A) already exist there.
+include(${CMAKE_CURRENT_SOURCE_DIR}/GdnAttn.cmake)

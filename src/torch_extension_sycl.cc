@@ -20,7 +20,7 @@ limitations under the License.
 #include "sgl_kernel_ops.h"
 #include "sgl_kernel_torch_shim.h"
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
-  m.def("weak_ref_tensor(Tensor tensor) -> Tensor");
+  m.def("weak_ref_tensor(Tensor(a) tensor) -> Tensor(a)");
   m.impl("weak_ref_tensor", torch::kXPU, &weak_ref_tensor);
 
   m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");

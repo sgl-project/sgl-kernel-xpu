@@ -1252,6 +1252,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
         out_val.dim() == 3 && out_val.size(0) == q.size(0) && out_val.size(1) == q.size(-2) &&
             out_val.size(2) == v.size(-1),
         "out shape must be [total_q, num_heads, head_size_v]");
+    TORCH_CHECK(out_val.device() == q.device(), "out must be on the same device as q");
+    TORCH_CHECK(out_val.stride(-1) == 1, "out must have a contiguous last dimension");
   }
   auto to_tuple = [](std::vector<at::Tensor> v) { return std::make_tuple(v[0], v[1], v[2], v[3]); };
   int const num_heads = q.size(-2);

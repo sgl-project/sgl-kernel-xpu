@@ -21,6 +21,7 @@ limitations under the License.
 #include <torch/library.h>
 #include <torch/torch.h>
 
+#include <tuple>
 #include <vector>
 
 #include "sgl_kernel_torch_shim.h"

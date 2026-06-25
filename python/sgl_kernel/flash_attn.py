@@ -212,10 +212,17 @@ def flash_attn_with_kvcache(
            to automatically determine the number of splits.
            Don't change this unless you know what you are doing.
         return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
+        out [optional]: preallocated output buffer of shape (total_q, nheads, headdim_v),
+            dtype matching q, on the same XPU device as q, with a contiguous last dimension
+            (stride(-1) == 1). When provided, the kernel writes results directly into this
+            buffer and the returned tensor aliases it. Useful for XPU graph / torch.compile
+            capture to avoid allocating a new output tensor each step.
 
     Return:
-        out: (batch_size, seqlen, nheads, headdim).
-        softmax_lse [optional, if return_softmax_lse=True]: (batch_size, nheads, seqlen). The
+        out: (total_q, nheads, headdim_v), where total_q = batch_size * seqlen (non-varlen)
+            or the sum of actual sequence lengths (varlen). The tensor aliases the provided
+            ``out`` buffer when one is supplied.
+        softmax_lse [optional, if return_softmax_lse=True]: (total_q, nheads). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """

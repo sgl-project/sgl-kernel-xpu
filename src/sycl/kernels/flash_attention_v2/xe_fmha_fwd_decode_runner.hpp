@@ -183,7 +183,7 @@ struct Arguments {
 
   bool is_bf16;
   bool is_fp32;
-  bool is_e4m3;
+  bool is_e4m3 = false;
 
   bool is_rotary_interleaved;
 
@@ -323,6 +323,8 @@ struct DecodeRunner {
             static_cast<const bool*>(params.skip_batch_mask_ptr),
         },
         {params.softmax_scale,
+         params.k_scale_ptr,
+         params.v_scale_ptr,
          params.page_table,
          params.page_size,
          params.max_num_pages_per_seq,

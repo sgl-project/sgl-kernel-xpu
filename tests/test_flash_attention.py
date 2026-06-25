@@ -1464,6 +1464,118 @@ def test_flash_attn_decode_kvcache(
     torch.xpu.empty_cache()
 
 
+@pytest.mark.skipif(
+    not torch.xpu.is_available(),
+    reason="fp8 KV cache attention is an XPU (sgl-kernel-xpu) feature",
+)
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("nheads_q,nheads_kv", [(8, 8), (8, 2)])
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize("seqlen_q", [1, 32, 64])
+@pytest.mark.parametrize("seqlen_k", [256, 512])
+def test_flash_attn_fp8_kvcache(
+    seqlen_k,
+    seqlen_q,
+    page_size,
+    d,
+    nheads_q,
+    nheads_kv,
+    causal,
+):
+    """Attention with an fp8 (e4m3) paged KV cache.
+
+    Q stays bf16 while the K/V cache is stored in float8_e4m3fn and dequantized
+    inside the kernel using per-tensor k_descale / v_descale. The result is
+    compared against a dequantized fp32 reference. seqlen_q == 1 exercises the
+    decode kernel; seqlen_q > 1 exercises the (chunk)prefill kernel.
+    """
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    if seqlen_k % page_size != 0:
+        pytest.skip("page_size must divide seqlen_k")
+    assert nheads_q % nheads_kv == 0
+
+    torch.manual_seed(0)
+    batch_size = 3
+    softmax_scale = d**-0.5
+    e4m3_max = 448.0
+
+    # Reference (fp32) K/V, then per-tensor quantize to fp8 e4m3.
+    k_ref_f = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device)
+    v_ref_f = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device)
+    k_descale_val = k_ref_f.abs().max().item() / e4m3_max
+    v_descale_val = v_ref_f.abs().max().item() / e4m3_max
+
+    k_cache = (k_ref_f / k_descale_val).to(torch.float8_e4m3fn)
+    v_cache = (v_ref_f / v_descale_val).to(torch.float8_e4m3fn)
+
+    # Per-tensor descale tensors. The kernel reads a single float (element 0);
+    # attention_ref consumes the full (b, h_kv) layout.
+    k_descale = torch.full(
+        (batch_size, nheads_kv), k_descale_val, dtype=torch.float32, device=device
+    )
+    v_descale = torch.full(
+        (batch_size, nheads_kv), v_descale_val, dtype=torch.float32, device=device
+    )
+
+    # Build a paged KV cache: one contiguous run of blocks per sequence.
+    num_blocks_per_seq = seqlen_k // page_size
+    k_cache_paged = k_cache.reshape(
+        batch_size * num_blocks_per_seq, page_size, nheads_kv, d
+    )
+    v_cache_paged = v_cache.reshape(
+        batch_size * num_blocks_per_seq, page_size, nheads_kv, d
+    )
+    page_table = torch.arange(
+        batch_size * num_blocks_per_seq, dtype=torch.int32, device=device
+    ).reshape(batch_size, num_blocks_per_seq)
+
+    cache_seqlens = torch.full(
+        (batch_size,), seqlen_k, dtype=torch.int32, device=device
+    )
+
+    q = torch.randn(
+        batch_size, seqlen_q, nheads_q, d, device=device, dtype=torch.bfloat16
+    )
+
+    out = flash_attn_with_kvcache(
+        q,
+        k_cache_paged,
+        v_cache_paged,
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        softmax_scale=softmax_scale,
+        causal=causal,
+    )
+    out = out.reshape(batch_size, seqlen_q, nheads_q, d)
+    torch.xpu.synchronize()
+
+    # Dequantized fp32 reference. attention_ref applies k_descale/v_descale to the
+    # fp8 cache internally (k.float() * descale), matching the kernel math.
+    out_ref, _ = attention_ref(
+        q,
+        k_cache,
+        v_cache,
+        softmax_scale,
+        causal=causal,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        upcast=True,
+    )
+
+    out = out.float()
+    out_ref = out_ref.float()
+    max_diff = (out - out_ref).abs().max().item()
+    mean_diff = (out - out_ref).abs().mean().item()
+    print(f"fp8 kvcache (seqlen_q={seqlen_q}) max diff: {max_diff}")
+    print(f"fp8 kvcache (seqlen_q={seqlen_q}) mean diff: {mean_diff}")
+    assert max_diff <= 1e-1
+    assert mean_diff <= 2e-2
+
+
 def _generate_block_kvcache(
     seqlen_k, page_size, batch_size, nheads_k, d, dv, device, dtype, dtype_ref
 ):

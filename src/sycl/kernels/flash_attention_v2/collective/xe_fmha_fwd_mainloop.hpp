@@ -137,6 +137,9 @@ struct FMHAFwdMainloop<
   using TensorK = TensorK_;
   using TensorV = TensorV_;
 
+  using ElementQ = typename TensorQ::engine_type::value_type;
+  using ElementK = typename TensorK::engine_type::value_type;
+
   using TensorQ2D = decltype(TensorQ_{}(append<rank_v<TensorQ_>>(make_coord(_, _), 0)));
   using TensorK2D = decltype(TensorK_{}(append<rank_v<TensorK_>>(make_coord(_, _), 0)));
   using TensorV2D = decltype(TensorV_{}(append<rank_v<TensorV_>>(make_coord(_, _), 0)));
@@ -192,9 +195,18 @@ struct FMHAFwdMainloop<
   static constexpr bool LocalMask = LocalMask_;
   static constexpr bool PackGQA = PackGQA_;
 
+  // FP8 KV cache: enabled when the K element type is an 8-bit float. The fp8
+  // K/V are dequantized (cast to ElementQ and multiplied by the per-tensor
+  // scale) inside the mainloop after the block-2D load.
+  static constexpr bool Fp8KV = is_any_of_v<ElementK, float_e5m2_t, float_e4m3_t>;
+
   // User-facing arguments
   struct Arguments {
     ElementS const scale;
+    // FP8 KV per-tensor scales (host pointers to a single float each). Unused
+    // when Fp8KV is false.
+    void* scale_k = nullptr;
+    void* scale_v = nullptr;
     int const* ptr_page_table = nullptr;
     int page_size = 0;
     int max_num_pages_per_seq = 0;
@@ -221,6 +233,8 @@ struct FMHAFwdMainloop<
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
     return Params{
         val,
+        args.scale_k,
+        args.scale_v,
         args.ptr_page_table,
         args.page_size,
         args.max_num_pages_per_seq,
@@ -380,6 +394,14 @@ struct FMHAFwdMainloop<
     /* Check if */
     bool check_remainder_k = (seq_len % get<1>(TileShapeQK{}) != 0);
 
+    // FP8 KV Scale: currently only per-tensor scale for K/V is supported. The
+    // fp8 K/V are dequantized after the block-2D load (see below).
+    float scale_k = 1.f, scale_v = 1.f;
+    if constexpr (Fp8KV) {
+      scale_k = *static_cast<const float*>(params.scale_k);
+      scale_v = *static_cast<const float*>(params.scale_v);
+    }
+
     /* Main loop, blocked in k. */
     for (int K = blk_k0; K < blk_k1 && K < kblocks_cache; K++) {
       /* Split barrier to keep threads together */
@@ -404,6 +426,14 @@ struct FMHAFwdMainloop<
         copy(copy_k_cache, tKgK_cache(_, _, _, page_idx, D), tKrK);
         reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);
+        if constexpr (Fp8KV) {
+          // Dequantize fp8 K: reorder() already cast fp8 -> ElementQ; apply the
+          // per-tensor scale before the Q*K MMA.
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrK.size(); ++i) {
+            tSrK(i) = static_cast<ElementQ>(scale_k * static_cast<float>(tSrK(i)));
+          }
+        }
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
       }
 
@@ -476,6 +506,14 @@ struct FMHAFwdMainloop<
       for (int VV = 0; VV < VTiles; VV++) {
         copy(copy_v_cache, tVgV_cache(_, _, _, VV, page_idx), tVrV);
         reorder(tVrV, tArV);
+        if constexpr (Fp8KV) {
+          // Dequantize fp8 V: reorder() already cast fp8 -> ElementQ; apply the
+          // per-tensor scale before the P*V MMA.
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tArV.size(); ++i) {
+            tArV(i) = static_cast<ElementQ>(scale_v * static_cast<float>(tArV(i)));
+          }
+        }
         if (K != blk_k0) {
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < tArA.size() / VTiles; i++) {

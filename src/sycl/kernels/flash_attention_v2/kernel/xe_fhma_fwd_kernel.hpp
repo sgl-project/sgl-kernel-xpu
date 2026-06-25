@@ -409,6 +409,13 @@ class XeFMHAFwdKernel {
 
       // Epilogue
       CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
+      // FP8 KV: the per-tensor V dequant scale is applied once in the epilogue
+      // (folded into the softmax normalization) instead of per V element in the
+      // mainloop GEMM2.
+      float v_scale = 1.0f;
+      if constexpr (CollectiveMainloop::Fp8KV) {
+        v_scale = *static_cast<const float*>(params.mainloop.scale_v);
+      }
       if constexpr (Sink) {
         if constexpr (PackGQA_) {
           // Packed decode: pass the per-row sink base for this KV head's group
@@ -421,14 +428,15 @@ class XeFMHAFwdKernel {
               tA_sum,
               blk_qv,
               thr_id,
+              v_scale,
               ElementSink{},
               p.sm_sink + head * head_group_q,
               head_group_q);
         } else {
-          epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, p.sm_sink[q_head_idx]);
+          epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, v_scale, p.sm_sink[q_head_idx]);
         }
       } else {
-        epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id);
+        epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, v_scale);
       }
     }
   }
@@ -877,7 +885,12 @@ class XeFMHAFwdDynamicSplitKernel {
 
         // Epilogue
         CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
-        epilogue(O(_, _, head_q, idx_b), tArA, tA_max, tA_sum, blk_qv, thr_id);
+        // FP8 KV: apply the per-tensor V dequant scale once in the epilogue.
+        float v_scale = 1.0f;
+        if constexpr (CollectiveMainloop::Fp8KV) {
+          v_scale = *static_cast<const float*>(params.mainloop.scale_v);
+        }
+        epilogue(O(_, _, head_q, idx_b), tArA, tA_max, tA_sum, blk_qv, thr_id, v_scale);
       }
     }
   }

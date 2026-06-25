@@ -394,12 +394,11 @@ struct FMHAFwdMainloop<
     /* Check if */
     bool check_remainder_k = (seq_len % get<1>(TileShapeQK{}) != 0);
 
-    // FP8 KV Scale: currently only per-tensor scale for K/V is supported. The
-    // fp8 K/V are dequantized after the block-2D load (see below).
-    float scale_k = 1.f, scale_v = 1.f;
+    // FP8 K dequant scale (per-tensor), applied to K before the Q*K MMA so it
+    // enters the softmax correctly.
+    float scale_k = 1.f;
     if constexpr (Fp8KV) {
       scale_k = *static_cast<const float*>(params.scale_k);
-      scale_v = *static_cast<const float*>(params.scale_v);
     }
 
     /* Main loop, blocked in k. */
@@ -506,14 +505,6 @@ struct FMHAFwdMainloop<
       for (int VV = 0; VV < VTiles; VV++) {
         copy(copy_v_cache, tVgV_cache(_, _, _, VV, page_idx), tVrV);
         reorder(tVrV, tArV);
-        if constexpr (Fp8KV) {
-          // Dequantize fp8 V: reorder() already cast fp8 -> ElementQ; apply the
-          // per-tensor scale before the P*V MMA.
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tArV.size(); ++i) {
-            tArV(i) = static_cast<ElementQ>(scale_v * static_cast<float>(tArV(i)));
-          }
-        }
         if (K != blk_k0) {
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < tArA.size() / VTiles; i++) {

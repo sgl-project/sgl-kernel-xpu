@@ -151,6 +151,10 @@ class XeFMHAFwdKernel {
     // Per-batch skip mask for two-kernel mix-batch dispatch
     // If non-null, the tile loop skips batches where mask[idx_b] is true.
     const bool* skip_batch_mask = nullptr;
+    // FP8 KV per-tensor dequant scales (device pointers to a single float
+    // each). Null when the KV cache is not fp8. Dereferenced on-device.
+    void* scale_k = nullptr;
+    void* scale_v = nullptr;
   };
   using KernelParams = KernelArguments;
 
@@ -381,6 +385,13 @@ class XeFMHAFwdKernel {
       // With PackGQA the Q/O head dimension is indexed by the KV head; otherwise
       // by the (un-grouped) query head.
       int q_head_idx = PackGQA_ ? head : head_q;
+      // FP8 KV: the per-tensor dequant scales are read from the device descale
+      // pointers (stored in KernelArguments) and passed as float function
+      // arguments. scale_k to the mainloop GEMM1.
+      float scale_k = 1.0f;
+      if constexpr (CollectiveMainloop::Fp8KV) {
+        scale_k = *static_cast<const float*>(p.scale_k);
+      }
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
       mainloop(
           Q(_, _, q_head_idx, l_coord),
@@ -401,7 +412,8 @@ class XeFMHAFwdKernel {
           full_tile_offset,
           discard_seq_coord,
           K_cache(_, _, head, l_coord),
-          V_cache(_, _, head, l_coord));
+          V_cache(_, _, head, l_coord),
+          scale_k);
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());
@@ -412,9 +424,9 @@ class XeFMHAFwdKernel {
       // FP8 KV: the per-tensor V dequant scale is applied once in the epilogue
       // (folded into the softmax normalization) instead of per V element in the
       // mainloop GEMM2.
-      float v_scale = 1.0f;
+      float scale_v = 1.0f;
       if constexpr (CollectiveMainloop::Fp8KV) {
-        v_scale = *static_cast<const float*>(params.mainloop.scale_v);
+        scale_v = *static_cast<const float*>(p.scale_v);
       }
       if constexpr (Sink) {
         if constexpr (PackGQA_) {
@@ -428,15 +440,15 @@ class XeFMHAFwdKernel {
               tA_sum,
               blk_qv,
               thr_id,
-              v_scale,
+              scale_v,
               ElementSink{},
               p.sm_sink + head * head_group_q,
               head_group_q);
         } else {
-          epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, v_scale, p.sm_sink[q_head_idx]);
+          epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, scale_v, p.sm_sink[q_head_idx]);
         }
       } else {
-        epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, v_scale);
+        epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, scale_v);
       }
     }
   }
@@ -525,6 +537,10 @@ class XeFMHAFwdDynamicSplitKernel {
     // mix-batch path) but kept for uniform aggregate initialization in the
     // shared runner template.
     const bool* skip_batch_mask = nullptr;
+    // FP8 KV per-tensor dequant scales (device pointers to a single float
+    // each). Null when the KV cache is not fp8. Dereferenced on-device.
+    void* scale_k = nullptr;
+    void* scale_v = nullptr;
   };
   using KernelParams = KernelArguments;
 
@@ -886,11 +902,11 @@ class XeFMHAFwdDynamicSplitKernel {
         // Epilogue
         CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
         // FP8 KV: apply the per-tensor V dequant scale once in the epilogue.
-        float v_scale = 1.0f;
+        float scale_v = 1.0f;
         if constexpr (CollectiveMainloop::Fp8KV) {
-          v_scale = *static_cast<const float*>(params.mainloop.scale_v);
+          scale_v = *static_cast<const float*>(p.scale_v);
         }
-        epilogue(O(_, _, head_q, idx_b), tArA, tA_max, tA_sum, blk_qv, thr_id, v_scale);
+        epilogue(O(_, _, head_q, idx_b), tArA, tA_max, tA_sum, blk_qv, thr_id, scale_v);
       }
     }
   }
@@ -975,6 +991,10 @@ class XeFMHAFwdSplitKVKernel {
     // Per-batch skip mask for two-kernel mix-batch dispatch
     // (see https://github.com/vllm-project/vllm-xpu-kernels/pull/218).
     const bool* skip_batch_mask = nullptr;
+    // FP8 KV per-tensor dequant scales (device pointers to a single float
+    // each). Null when the KV cache is not fp8. Dereferenced on-device.
+    void* scale_k = nullptr;
+    void* scale_v = nullptr;
   };
   using KernelParams = KernelArguments;
 
@@ -1193,6 +1213,15 @@ class XeFMHAFwdSplitKVKernel {
       int start_blk = kv_split_offset;
       int end_blk = kv_split_offset + num_effective_kv_blocks;
 
+      // FP8 KV: read the per-tensor dequant scales from the device descale
+      // pointers (stored in KernelArguments). scale_k is applied to K in the
+      // mainloop GEMM1; scale_v is folded into the softmax normalization in the
+      // epilogue (not the mainloop GEMM2).
+      float scale_k = 1.0f, scale_v = 1.0f;
+      if constexpr (CollectiveMainloop::Fp8KV) {
+        scale_k = *static_cast<const float*>(p.scale_k);
+        scale_v = *static_cast<const float*>(p.scale_v);
+      }
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
 
       mainloop(
@@ -1210,7 +1239,8 @@ class XeFMHAFwdSplitKVKernel {
           thr_id,
           seq_len,
           full_tile_offset,
-          discard_seq_coord);
+          discard_seq_coord,
+          scale_k);
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());
@@ -1227,6 +1257,7 @@ class XeFMHAFwdSplitKVKernel {
             tA_sum,
             blk_qv,
             thr_id,
+            scale_v,
             exp_sums(_, _, head, l_coord),
             max_logits(_, _, head, l_coord),
             idx_kv_split,
@@ -1242,6 +1273,7 @@ class XeFMHAFwdSplitKVKernel {
             tA_sum,
             blk_qv,
             thr_id,
+            scale_v,
             exp_sums(_, _, head, l_coord),
             max_logits(_, _, head, l_coord),
             idx_kv_split,

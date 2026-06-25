@@ -150,7 +150,7 @@ class FMHAFwdEpilogue {
       FragARow& tA_sum,                       // Softmax row-wise sum accumulator
       QVCoord blk_qv,                         // WG tile indices: (q,v)
       int thr_id,                             // Work-item ID
-      float v_scale = 1.0f,                   // Per-tensor V dequant scale (fp8 path)
+      float scale_v = 1.0f,                   // Per-tensor V dequant scale (fp8 path)
       ElementSink sink_val = ElementSink{},   // Per-head sink logit (non-packed, used when Sink==true)
       const ElementSink* sink_ptr = nullptr,  // Per-row sink logits base (PackGQA, used when Sink==true)
       int head_group_q = 0) {                 // # packed query heads in the M tile (PackGQA)
@@ -179,10 +179,7 @@ class FMHAFwdEpilogue {
     }
 
     /* Tile output coordinates. cO/gO are identity tensors, so tOgO exposes the
-       (q,v) coordinate of each output fragment element.
-       For an fp8 KV cache the per-tensor V dequant scale is folded in here
-       (O = scale_v * (P @ V_fp8) / sum), avoiding a per-element V scale in the
-       mainloop GEMM2. */
+       (q,v) coordinate of each output fragment element. */
     Tensor cO = make_identity_tensor(O.shape());       // (q,v)
     Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);  // (q,v)
 
@@ -238,6 +235,9 @@ class FMHAFwdEpilogue {
         }
         // Rows that attend to no (unmasked) keys have denom==0 -> emit 0, not NaN.
         ElementA outv = (denom != ElementA(0)) ? (tO_num(j) / denom) : ElementA(0);
+        //  For an fp8 KV cache the per-tensor V dequant scale is folded in here
+        //  (O = scale_v * (P @ V_fp8) / sum), avoiding a per-element V scale in the
+        //  mainloop GEMM2.
         if constexpr (CollectiveMainloop::Fp8KV) {
           outv *= ElementA(v_scale);
         }
@@ -247,7 +247,10 @@ class FMHAFwdEpilogue {
     } else {
       /* Complete softmax, dividing out sums. Rows whose denominator is exactly
          zero attend to no (unmasked) keys -- e.g. a batch with zero KV length --
-         so emit 0 instead of NaN to match the reference implementation. */
+         so emit 0 instead of NaN to match the reference implementation.
+         For an fp8 KV cache the per-tensor V dequant scale is folded in here
+         (O = scale_v * (P @ V_fp8) / sum), avoiding a per-element V scale in the
+         mainloop GEMM2. */
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < rA_sum.size(); i++) {
         if constexpr (CollectiveMainloop::LocalMask || CollectiveMainloop::CausalMask) {
@@ -537,6 +540,7 @@ class DecodeFwdEpilogue {
       FragARow& tA_sum,               // Softmax row-wise sum accumulator
       QVCoord blk_qv,                 // WG tile indices: (q,v)
       int thr_id,                     // Work-item ID
+      float scale_v,                  // Per-tensor V dequant scale (fp8 path)
       const TensorLSE2D& exp_sums,    // Global exp sum tensor
       const TensorLSE2D& max_logits,  // Global max logits tensor
       int idx_kv_split,
@@ -590,11 +594,17 @@ class DecodeFwdEpilogue {
     /* Complete softmax: normalize output for single-split sequences
        (so ReduceSplitK pass-through gives correct result).
        For multi-split, store unnormalized to avoid divide-multiply
-       precision loss in the reduce roundtrip. */
+       precision loss in the reduce roundtrip.
+       FP8 KV cache: the per-tensor V dequant scale (O = scale_v * (P @ V_fp8) /
+       sum) is folded into the 1/rA_sum reciprocal, so the output is scaled in
+       the same multiply that normalizes it instead of a separate pass. */
     if (is_single_split || num_kv_splits <= 1) {
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < rA_sum.size(); i++) {
-        rA_sum(i) = ElementA(1) / rA_sum(i);
+        if constexpr (CollectiveMainloop::Fp8KV)
+          rA_sum(i) = ElementA(scale_v) / rA_sum(i);
+        else
+          rA_sum(i) = ElementA(1) / rA_sum(i);
       }
 
       CUTLASS_PRAGMA_UNROLL

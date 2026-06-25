@@ -307,11 +307,11 @@ struct PrefillRunner {
             stride_V_cache,
             static_cast<const typename FMHAPrefillKernel::ElementSink*>(params.softmax_sink_ptr),
             static_cast<const bool*>(params.skip_batch_mask_ptr),
+            params.k_scale_ptr,
+            params.v_scale_ptr,
         },
         {
             params.softmax_scale,
-            params.k_scale_ptr,
-            params.v_scale_ptr,
             params.page_table,
             params.page_size,
             params.max_num_pages_per_seq,

@@ -203,10 +203,6 @@ struct FMHAFwdMainloop<
   // User-facing arguments
   struct Arguments {
     ElementS const scale;
-    // FP8 KV per-tensor scales (host pointers to a single float each). Unused
-    // when Fp8KV is false.
-    void* scale_k = nullptr;
-    void* scale_v = nullptr;
     int const* ptr_page_table = nullptr;
     int page_size = 0;
     int max_num_pages_per_seq = 0;
@@ -233,8 +229,6 @@ struct FMHAFwdMainloop<
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
     return Params{
         val,
-        args.scale_k,
-        args.scale_v,
         args.ptr_page_table,
         args.page_size,
         args.max_num_pages_per_seq,
@@ -280,7 +274,8 @@ struct FMHAFwdMainloop<
       int full_tile_offset,
       int discard_seq_coord,
       TensorK_cache2D const& K_cache_2D = TensorK_cache2D{},
-      TensorV_cache2D const& V_cache_2D = TensorV_cache2D{}) {
+      TensorV_cache2D const& V_cache_2D = TensorV_cache2D{},
+      float scale_k = 1.0f) {  // FP8 K per-tensor dequant scale
     using namespace sycl::ext::oneapi::this_work_item;
 
     // Short dimension names:
@@ -393,13 +388,6 @@ struct FMHAFwdMainloop<
 
     /* Check if */
     bool check_remainder_k = (seq_len % get<1>(TileShapeQK{}) != 0);
-
-    // FP8 K dequant scale (per-tensor), applied to K before the Q*K MMA so it
-    // enters the softmax correctly.
-    float scale_k = 1.f;
-    if constexpr (Fp8KV) {
-      scale_k = *static_cast<const float*>(params.scale_k);
-    }
 
     /* Main loop, blocked in k. */
     for (int K = blk_k0; K < blk_k1 && K < kblocks_cache; K++) {
@@ -677,8 +665,6 @@ struct DecodeFwdMainloop<
   // User-facing arguments
   struct Arguments {
     ElementS const scale;
-    void* const scale_k;
-    void* const scale_v;
     // Paged KV Cache
     int const* ptr_page_table;
     int page_size;
@@ -708,8 +694,6 @@ struct DecodeFwdMainloop<
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
     return Params{
         val,
-        args.scale_k,
-        args.scale_v,
         args.ptr_page_table,
         args.page_size,
         args.max_pages_per_seq,
@@ -738,7 +722,8 @@ struct DecodeFwdMainloop<
       int thr_id,
       int seq_len,
       int full_tile_offset,
-      int discard_seq_coord) {
+      int discard_seq_coord,
+      float scale_k = 1.0f) {  // FP8 K per-tensor dequant scale (applied in GEMM1)
     using namespace sycl::ext::oneapi::this_work_item;
 
     // Short dimension names:
@@ -840,12 +825,9 @@ struct DecodeFwdMainloop<
     /* Check if */
     bool check_remainder_k = (seq_len % get<1>(TileShapeQK{}) != 0);
 
-    // FP8 KV Scale: Currently we only support per-tensor scale for KV
-    float scale_k = 1.f, scale_v = 1.f;
-    if constexpr (Fp8KV) {
-      scale_k = *static_cast<const float*>(params.scale_k);
-      scale_v = *static_cast<const float*>(params.scale_v);
-    }
+    // FP8 K per-tensor scale is supplied by the caller (kernel) as the scale_k
+    // function argument and applied to K in GEMM1. The V dequant scale (scale_v)
+    // is folded into the softmax normalization in the epilogue, not here.
 
     /* Main loop, blocked in k. */
     int next_tile_idx;
@@ -936,12 +918,7 @@ struct DecodeFwdMainloop<
       for (int VV = 0; VV < VTiles; VV++) {
         copy(copy_v, tVgV_cache(_, _, _, VV), tVrV);
         reorder(tVrV, tArV);
-        if constexpr (Fp8KV) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tArV.size(); ++i) {
-            tArV(i) = static_cast<ElementQ>(scale_v * static_cast<float>(tArV(i)));
-          }
-        }
+        // FP8 V dequant (scale_v) is deferred to the epilogue.
         cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
       }
 

@@ -187,6 +187,11 @@ struct Arguments {
 
   bool is_rotary_interleaved;
 
+  // Per-batch skip mask for two-kernel mix-batch dispatch
+  // (see https://github.com/vllm-project/vllm-xpu-kernels/pull/218).
+  // If non-null, the kernel skips batches where mask[idx_b] is true.
+  void* skip_batch_mask_ptr = nullptr;
+
   torch::TensorOptions tensor_opts;
 };
 
@@ -234,20 +239,16 @@ struct DecodeRunner {
   auto initialize_varlen(const Arguments& params, const ProblemShape& problem_size) {
     ProblemShape problem_size_for_init = problem_size;
     get<0>(problem_size_for_init) = 1;  // concentrated batch
-    get<1>(problem_size_for_init) = params.use_split_kv ? params.h : params.h_k;
-    get<3>(problem_size_for_init) = params.use_split_kv ? params.total_q : params.total_q * params.q_group_size;
+    get<1>(problem_size_for_init) = params.h;
+    get<3>(problem_size_for_init) = params.total_q;
     get<4>(problem_size_for_init) = params.total_knew;
     get<5>(problem_size_for_init) = params.total_k;
 
     ProblemShapeType problem_size_for_launch{
         .batch = get<0>(problem_size),
-        .num_heads_q = params.use_split_kv ? get<1>(problem_size) : get<2>(problem_size),
+        .num_heads_q = get<1>(problem_size),
         .num_heads_kv = get<2>(problem_size),
-        .seq_len_qo =
-            {params.use_split_kv ? params.seqlen_q * params.q_group_size : params.seqlen_q,
-             params.use_split_kv ? params.total_q : params.total_q * params.q_group_size,
-             nullptr,
-             params.use_split_kv ? 1 : params.q_group_size},
+        .seq_len_qo = {params.seqlen_q, params.total_q, nullptr},
 
         .seq_len_kv = {params.seqlen_knew, params.total_knew},
         .seq_len_kv_cache = {params.seqlen_k, params.total_k},
@@ -318,8 +319,15 @@ struct DecodeRunner {
             stride_K_cache,
             static_cast<const ElementV*>(params.v_ptr),
             stride_V_cache,
+            static_cast<const typename FMHADecodeKernel::ElementSink*>(params.softmax_sink_ptr),
+            static_cast<const bool*>(params.skip_batch_mask_ptr),
         },
-        {params.softmax_scale, params.page_table, params.page_size, params.max_num_pages_per_seq},
+        {params.softmax_scale,
+         params.page_table,
+         params.page_size,
+         params.max_num_pages_per_seq,
+         params.window_size_left,
+         params.window_size_right},
         {},
         hw_info};
 
@@ -473,6 +481,7 @@ struct SplitDecodeKernelRunner {
             reinterpret_cast<ElementLSE*>(params.max_logits_ptr),
             stride_max_logits,
             reinterpret_cast<ElementQ*>(params.softmax_sink_ptr),
+            static_cast<const bool*>(params.skip_batch_mask_ptr),
         },
         {params.softmax_scale,
          params.k_scale_ptr,
@@ -497,7 +506,8 @@ struct SplitDecodeKernelRunner {
          stride_exp_sums,
          reinterpret_cast<ElementLSE*>(params.max_logits_ptr),
          stride_max_logits,
-         params.window_size_left},
+         params.window_size_left,
+         static_cast<const bool*>(params.skip_batch_mask_ptr)},
         hw_info,
         params.num_kv_splits};
 
@@ -608,6 +618,21 @@ struct DecodeConfig {
     using GmemTiledCopyK_cache = GmemTiledCopyK;
     using GmemTiledCopyV_cache = GmemTiledCopyV;
 
+    // Pack the GQA query group into the M dimension for decode. Decode always
+    // has seq_len_qo == 1, so the M tile is free to hold the head_group_q query
+    // heads that share a KV head; the mainloop/epilogue handle the packed
+    // local-mask (fixed decode row) and per-row sink. Decode is always
+    // non-causal (a single query token cannot be masked by a causal rule), so
+    // packing is always enabled here. Prefill keeps the default false on all
+    // three components and is unaffected.
+    // SGL_DISABLE_PACKGQA: benchmark/debug escape hatch to force the unpacked
+    // (per-head launch) decode path for A/B perf comparison.
+#ifdef SGL_DISABLE_PACKGQA
+    constexpr bool PackGQA = false;
+#else
+    constexpr bool PackGQA = true;
+#endif
+
     // Mainloop
     using MainloopDispatchPolicy = cutlass::fmha::XeDefault<PipelineStages>;
     using CollectiveMainloop = cutlass::fmha::collective::FMHAFwdMainloop<
@@ -627,11 +652,13 @@ struct DecodeConfig {
         GmemTiledCopyK,
         GmemTiledCopyV,
         GmemTiledCopyK_cache,
-        GmemTiledCopyV_cache>;
+        GmemTiledCopyV_cache,
+        LocalMask,
+        PackGQA>;
 
     // Epilogue
-    using CollectiveEpilogue =
-        cutlass::fmha::collective::FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO>;
+    using CollectiveEpilogue = cutlass::fmha::collective::
+        FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, Sink, PackGQA>;
 
     static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
     using FMHADecodeKernel = conditional_t<
@@ -646,7 +673,8 @@ struct DecodeConfig {
             Step<_1, _0, _2, _3>,
             Step<_2, _0, _1, _3>,
             Step<_0, _2, _1, _3>,
-            Step<_1, _0, _2, _3>>>;
+            Step<_1, _0, _2, _3>,
+            PackGQA>>;
 
     DecodeRunner<FMHADecodeKernel, isVarLen> kernel;
 
@@ -654,9 +682,20 @@ struct DecodeConfig {
     return 0;
   }
 
-  static int run(const Arguments& params) {
+  // Paged KV cache: the page table encodes absolute KV positions.
+  static int run_paged(const Arguments& params) {
     // template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
     return run<true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+  }
+
+  // Non-paged (contiguous ragged) KV cache: addressed via cu_seqlens_k offsets.
+  static int run_nopaged(const Arguments& params) {
+    // template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
+    return run<true, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+  }
+
+  static int run(const Arguments& params) {
+    return run_paged(params);
   }
 };
 

@@ -28,34 +28,46 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+/*!
+  \file
+  \brief Forward declarations for generated Sparse MLA decode kernel launch functions
+*/
+
 #pragma once
 
-#include "xe_fmha_fwd_prefill_runner.hpp"
+#include <ATen/ATen.h>
 
-namespace prefill {
+#include <sycl/sycl.hpp>
 
-// Explicit instantiation declarations — tell the compiler these are compiled
-// in separate translation units (generated from the .cpp.in templates).
+namespace mla_sparse_decode {
+
+// Each function is defined in a separate generated .cpp file from
+// mla_sparse_decode_kernel.cpp.in, compiled as its own library.
 //
+// Naming: launch_mla_sparse_decode_<ELEM_TAG>_<PAGE_SIZE>
 // Parameters:
-//   HEAD_DIM in {64, 72, 96, 128, 192, 256, 512}
+//   ELEM_TAG  in {half, bf16}
+//   PAGE_SIZE in {128, 256}
 
-#define EXTERN_FMHA_PREFILL_RUNNER(HD) extern template struct FmhaPrefillRunner<HD>;
+#define DECLARE_MLA_SPARSE_DECODE_LAUNCH(ELEM)            \
+  void launch_mla_sparse_decode_##ELEM##_128(             \
+      at::Tensor& out,                                    \
+      at::Tensor& lse_out,                                \
+      const at::Tensor& q,                                \
+      const at::Tensor& k_cache,                          \
+      const at::Tensor& indices,                          \
+      const std::optional<at::Tensor>& topk_length,       \
+      const std::optional<at::Tensor>& extra_k_cache,     \
+      const std::optional<at::Tensor>& extra_indices,     \
+      const std::optional<at::Tensor>& extra_topk_length, \
+      const std::optional<at::Tensor>& attn_sink,         \
+      double sm_scale,                                    \
+      int64_t head_dim_v,                                 \
+      bool is_fp8_kvcache);
 
-EXTERN_FMHA_PREFILL_RUNNER(64)
-EXTERN_FMHA_PREFILL_RUNNER(72)
-EXTERN_FMHA_PREFILL_RUNNER(96)
-EXTERN_FMHA_PREFILL_RUNNER(128)
-EXTERN_FMHA_PREFILL_RUNNER(192)
-EXTERN_FMHA_PREFILL_RUNNER(256)
-EXTERN_FMHA_PREFILL_RUNNER(512)
+DECLARE_MLA_SPARSE_DECODE_LAUNCH(half)
+DECLARE_MLA_SPARSE_DECODE_LAUNCH(bf16)
 
-#undef EXTERN_FMHA_PREFILL_RUNNER
+#undef DECLARE_MLA_SPARSE_DECODE_LAUNCH
 
-// Dispatch macro following the same pattern as decode.
-// Directly call struct operator() - no function pointers.
-// Expands inside prefill::mha_fwd where a local `params` is in scope.
-
-#define DISPATCH_PREFILL_KERNEL(HD) FmhaPrefillRunner<HD>{}(params)
-
-}  // namespace prefill
+}  // namespace mla_sparse_decode

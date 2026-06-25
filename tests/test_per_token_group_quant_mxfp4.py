@@ -539,6 +539,82 @@ class TestPerTokenGroupQuantFP4XPU:
 
         torch.testing.assert_close(x_dq_xpu, x_dq_ref, atol=0.0, rtol=0.0)
 
+    @pytest.mark.parametrize(
+        "num_tokens,hidden_dim,src_dtype",
+        [
+            (2, 96, torch.bfloat16),
+            (4, 128, torch.float16),
+            (8, 256, torch.bfloat16),
+            (16, 512, torch.bfloat16),
+            (32, 1024, torch.float32),
+            (64, 2048, torch.bfloat16),
+        ],
+    )
+    def test_column_major_interleaved(self, num_tokens, hidden_dim, src_dtype):
+        """Test column-major interleaved scale storage pattern."""
+        sgl_per_token_group_quant_fp4 = self._import_kernel()
+        group_size = MXFP4_BLOCK_SIZE
+        num_groups = hidden_dim // group_size
+
+        torch.manual_seed(42)
+
+        # Create input
+        x_cpu = torch.randn(num_tokens, hidden_dim, dtype=src_dtype, device="cpu")
+
+        # Row-major quantization (baseline)
+        x_xpu = x_cpu.to(self.device)
+        output_q_row, output_s_row = sgl_per_token_group_quant_fp4(
+            x=x_xpu, group_size=group_size, eps=self.eps, column_major_scales=False
+        )
+
+        # Column-major quantization with transposed strides
+        output_q_col, output_s_col = sgl_per_token_group_quant_fp4(
+            x=x_xpu, group_size=group_size, eps=self.eps, column_major_scales=True
+        )
+
+        assert output_s_col.stride(0) < output_s_col.stride(
+            1
+        ), f"Column-major stride check failed: stride={output_s_col.stride()}"
+
+        # Verify interleaved pattern
+        # Column-major should produce: [[t0_g0, t1_g0, t0_g1], [t1_g1, t0_g2, t1_g2]]
+        # De-interleave to compare with row-major
+
+        output_s_row_cpu = output_s_row.cpu()
+        output_s_col_cpu = output_s_col.cpu()
+
+        # De-interleave: flatten → reshape(groups, tokens) → transpose
+        flat = output_s_col_cpu.contiguous().flatten()
+        deinterleaved = flat.reshape(num_groups, num_tokens).T.contiguous()
+
+        # Compare scales (allow ±1 difference in exponent due to rounding)
+        scale_exp_row = output_s_row_cpu.to(torch.int32) - 127
+        scale_exp_col = deinterleaved.to(torch.int32) - 127
+        exp_diff = (scale_exp_row - scale_exp_col).abs()
+
+        assert (
+            exp_diff.max() <= 1
+        ), f"Scale mismatch after de-interleaving: max diff = {exp_diff.max()}"
+
+        # Verify the interleaved pattern explicitly for small cases
+        if num_tokens <= 4 and num_groups <= 4:
+            # Check a few positions to verify interleaving
+            for flat_idx in range(min(6, num_tokens * num_groups)):
+                source_token = flat_idx % num_tokens
+                source_group = flat_idx // num_tokens
+
+                output_row_idx = flat_idx // num_groups
+                output_col_idx = flat_idx % num_groups
+
+                expected_val = output_s_row_cpu[source_token, source_group].item()
+                actual_val = output_s_col_cpu[output_row_idx, output_col_idx].item()
+
+                # Allow ±1 difference (exponent rounding)
+                assert abs(expected_val - actual_val) <= 1, (
+                    f"Interleaving error at flat_idx={flat_idx}: "
+                    f"expected ~{expected_val}, got {actual_val}"
+                )
+
 
 if __name__ == "__main__":
     import sys

@@ -323,6 +323,15 @@ inline T div_up(T x, T y) {
   return (x + y - 1) / y;
 }
 
+// Reciprocal with zero check. If x is zero, return zero; else return 1/x.
+template <typename T>
+inline T safe_recip(T x) {
+  const auto nz = (x != T(0));
+  const T safe_d = sycl::select(T(1), x, nz);
+  const T inv = sycl::native::recip(safe_d);
+  return sycl::select(T(0), inv, nz);
+}
+
 int nextPowerOf2(uint32_t a) {
   if (a <= 1) return 1;
   return 1 << (32 - __builtin_clz(a - 1));

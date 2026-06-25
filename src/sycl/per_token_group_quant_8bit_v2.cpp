@@ -197,26 +197,50 @@ struct MainKernel {
     constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
     scale_element_t* scale_output;
     if constexpr (IS_COLUMN_MAJOR) {
-      constexpr int scale_token_stride = 1;
+      // Column-major interleaved pattern:
+      // Logical input: [token_idx, group_idx]
+      // Column-major flattening: flat_idx = token_idx + group_idx * num_tokens_per_expert
+      // Reshape to output: output_row = flat_idx / num_groups, output_col = flat_idx % num_groups
+      //
+      // This produces the interleaved pattern:
+      // Memory: [t0_g0, t1_g0, t0_g1, t1_g1, ...]
+      // Reshaped as (num_tokens, num_groups):
+      //   [[t0_g0, t1_g0, t0_g1],
+      //    [t1_g1, t0_g2, t1_g2]]
 
-      const int hidden_idx_packed = hidden_dim_group_idx / num_elems_per_pack;
-      const int pack_idx = hidden_dim_group_idx % num_elems_per_pack;
+      const int flat_idx = token_idx + hidden_dim_group_idx * num_tokens_per_expert;
+      const int output_token_idx = flat_idx / hidden_dim_num_groups;
+      const int output_group_idx = flat_idx % hidden_dim_num_groups;
+
+      const int hidden_idx_packed = output_group_idx / num_elems_per_pack;
+      const int pack_idx = output_group_idx % num_elems_per_pack;
+
+      constexpr int scale_token_stride = 1;
       scale_output = reinterpret_cast<scale_element_t*>(output_s) +
                      (expert_idx * scale_expert_stride * num_elems_per_pack +
                       hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
-                      token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
+                      output_token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
     } else {
       static_assert(!SCALE_UE8M0);
       scale_output = output_s + offset_num_groups;
     }
 
-    // can speed up if too slow
+    // TMA alignment padding for column-major mode
+    // When scales are packed (scale_tma_aligned=True), we need to zero-initialize
+    // the unused bytes in the pack to avoid reading garbage values.
+    // Only the lane writing to the last pack position needs to zero the remaining bytes.
     if constexpr (IS_COLUMN_MAJOR and SCALE_UE8M0) {
+      const int flat_idx = token_idx + hidden_dim_group_idx * num_tokens_per_expert;
+      const int output_group_idx = flat_idx % hidden_dim_num_groups;
+      const int pack_idx = output_group_idx % num_elems_per_pack;
+
+      // If this is the last group and lane_id==0, zero out the bytes after our write
       const int remainder_num_groups = hidden_dim_num_groups % num_elems_per_pack;
-      if ((remainder_num_groups != 0) and (hidden_dim_group_idx == hidden_dim_num_groups - 1) and
-          (lane_id < num_elems_per_pack - remainder_num_groups)) {
-        const int shift = 1 + lane_id;
-        *(scale_output + shift) = 0;
+      if (lane_id == 0 && remainder_num_groups != 0 && output_group_idx == hidden_dim_num_groups - 1) {
+        // Zero the bytes after the one we'll write (pack_idx)
+        for (int i = pack_idx + 1; i < num_elems_per_pack; i++) {
+          *(scale_output + (i - pack_idx)) = 0;
+        }
       }
     }
 

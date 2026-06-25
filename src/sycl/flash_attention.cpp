@@ -1155,6 +1155,12 @@ std::vector<at::Tensor> mha_fwd(
           !k_descale_.has_value() && !v_descale_.has_value() && !scheduler_metadata_.has_value(),
       "chunkprefill two-launch path does not yet support q_v / rotary / descale / scheduler_metadata.");
   TORCH_CHECK(cu_seqlens_q.scalar_type() == at::kInt, "cu_seqlens_q must be int32.");
+  // Pre-allocated out requires paged KV: on the non-paged path zero-KV-length
+  // rows are never written by the kernel, so a caller buffer would retain stale
+  // values on graph replay. SGLang always provides page_table (paged KV cache),
+  // so this check should never fire in practice.
+  TORCH_CHECK(
+      !out_.has_value() || page_table.has_value(), "chunkprefill: out buffer requires page_table (paged KV cache).");
 
   int64_t batch_size = cu_seqlens_q.size(0) - 1;
   TORCH_CHECK(batch_size >= 0, "cu_seqlens_q must have at least 1 element.");

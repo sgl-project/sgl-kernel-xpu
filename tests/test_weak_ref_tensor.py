@@ -5,7 +5,7 @@ import utils
 device = utils.get_device()
 
 
-@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU not available")
+@pytest.mark.skipif(device.type != "xpu", reason="XPU not available")
 def test_weak_ref_tensor_aliasing():
     """Test that weak_ref_tensor output shares storage with the input."""
     from sgl_kernel.memory import weak_ref_tensor

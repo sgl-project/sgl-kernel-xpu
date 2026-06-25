@@ -216,13 +216,15 @@ def flash_attn_with_kvcache(
             dtype matching q, on the same XPU device as q, with a contiguous last dimension
             (stride(-1) == 1). When provided, the kernel writes results directly into this
             buffer and the returned tensor aliases it. Useful for XPU graph / torch.compile
-            capture to avoid allocating a new output tensor each step.
+            capture to avoid allocating a new output tensor each step. Requires
+            ``page_table`` to be provided (paged KV cache); passing ``out`` without a
+            page table raises a ``RuntimeError``.
 
     Return:
         out: (total_q, nheads, headdim_v), where total_q = batch_size * seqlen (non-varlen)
             or the sum of actual sequence lengths (varlen). The tensor aliases the provided
             ``out`` buffer when one is supplied.
-        softmax_lse [optional, if return_softmax_lse=True]: (total_q, nheads). The
+        softmax_lse [optional, if return_softmax_lse=True]: (nheads, total_q). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """

@@ -150,6 +150,7 @@ class FMHAFwdEpilogue {
       FragARow& tA_sum,                       // Softmax row-wise sum accumulator
       QVCoord blk_qv,                         // WG tile indices: (q,v)
       int thr_id,                             // Work-item ID
+      float v_scale = 1.0f,                   // Per-tensor V dequant scale (fp8 path)
       ElementSink sink_val = ElementSink{},   // Per-head sink logit (non-packed, used when Sink==true)
       const ElementSink* sink_ptr = nullptr,  // Per-row sink logits base (PackGQA, used when Sink==true)
       int head_group_q = 0) {                 // # packed query heads in the M tile (PackGQA)
@@ -178,7 +179,10 @@ class FMHAFwdEpilogue {
     }
 
     /* Tile output coordinates. cO/gO are identity tensors, so tOgO exposes the
-       (q,v) coordinate of each output fragment element. */
+       (q,v) coordinate of each output fragment element.
+       For an fp8 KV cache the per-tensor V dequant scale is folded in here
+       (O = scale_v * (P @ V_fp8) / sum), avoiding a per-element V scale in the
+       mainloop GEMM2. */
     Tensor cO = make_identity_tensor(O.shape());       // (q,v)
     Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);  // (q,v)
 
@@ -234,6 +238,9 @@ class FMHAFwdEpilogue {
         }
         // Rows that attend to no (unmasked) keys have denom==0 -> emit 0, not NaN.
         ElementA outv = (denom != ElementA(0)) ? (tO_num(j) / denom) : ElementA(0);
+        if constexpr (CollectiveMainloop::Fp8KV) {
+          outv *= ElementA(v_scale);
+        }
         tOrO(j) = static_cast<ElementO>(outv);
       }
       copy(copy_o, tOrO, tOgO);
@@ -247,6 +254,9 @@ class FMHAFwdEpilogue {
           rA_sum(i) = safe_recip(rA_sum(i));
         } else {
           rA_sum(i) = ElementA(1) / rA_sum(i);
+        }
+        if constexpr (CollectiveMainloop::Fp8KV) {
+          rA_sum(i) *= ElementA(v_scale);
         }
       }
 

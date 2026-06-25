@@ -20,6 +20,7 @@ from sgl_kernel.attention import (
     merge_state,
     merge_state_v2,
 )
+from sgl_kernel.dsv4 import *
 from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
     fused_add_rmsnorm,

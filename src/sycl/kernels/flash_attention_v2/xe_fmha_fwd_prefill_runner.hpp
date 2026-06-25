@@ -95,6 +95,10 @@ struct Arguments {
   void* softmax_sink_ptr;
   float softcap;
 
+  // FP8 KV cache per-tensor descale pointers (host float each).
+  void* __restrict__ k_scale_ptr = nullptr;
+  void* __restrict__ v_scale_ptr = nullptr;
+
   // array of length b+1 holding starting offset of each sequence.
   int* __restrict__ cu_seqlens_q;
   int* __restrict__ cu_seqlens_k;
@@ -164,7 +168,7 @@ struct Arguments {
 
   bool is_bf16;
   bool is_fp32;
-  bool is_e4m3;
+  bool is_e4m3 = false;
   bool is_causal;
   bool is_local;
 
@@ -306,6 +310,8 @@ struct PrefillRunner {
         },
         {
             params.softmax_scale,
+            params.k_scale_ptr,
+            params.v_scale_ptr,
             params.page_table,
             params.page_size,
             params.max_num_pages_per_seq,

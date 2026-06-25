@@ -664,8 +664,12 @@ void mha_fwd(
 
   // Causal is the special case where window_size_right == 0 and window_size_left < 0.
   // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
-  params.is_causal = false;  // Decode don't need causal mask since we only compute attention for the current token, but
-                             // this kernel can also be used for local attention in the future
+  // Bug: previously is_causal was hardcoded false, but window_size_right was
+  // set to 0 above when the caller passed causal=true; the kernel then saw
+  // (right==0, left==-1, is_causal=false) and classified the mask as local
+  // SWA, which hangs on small-batch decode for (h_k=2, d=256, b=1). Use the
+  // same causal-vs-local detection as the prefill path.
+  params.is_causal = window_size_left < 0 && window_size_right == 0;
   params.is_local = (window_size_left >= 0 || window_size_right >= 0) && !params.is_causal;
 
   // TODO: check this

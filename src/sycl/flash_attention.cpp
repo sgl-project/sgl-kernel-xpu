@@ -1255,8 +1255,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     const at::Tensor& out_val = out_.value();
     TORCH_CHECK(out_val.scalar_type() == q.scalar_type(), "out dtype must match q dtype");
     TORCH_CHECK(
-        out_val.dim() == 3 && out_val.size(0) == q.size(0) && out_val.size(1) == q.size(1) &&
-            out_val.size(2) == v.size(2),
+        out_val.dim() == 3 && out_val.size(0) == q.size(0) && out_val.size(1) == q.size(-2) &&
+            out_val.size(2) == v.size(-1),
         "out shape must be [total_q, num_heads, head_size_v]");
     TORCH_CHECK(out_val.device() == q.device(), "out must be on the same device as q");
     TORCH_CHECK(out_val.stride(-1) == 1, "out must have a contiguous last dimension");

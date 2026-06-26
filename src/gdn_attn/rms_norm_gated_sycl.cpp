@@ -11,7 +11,7 @@
  * norm-before-gate, no bias, swish activation — the Qwen3.5 RMSNormGated config.
  *
  * Grid: one sub-group (sub_group_size lanes) per row; each lane strides over V.
- * Math in fp32 (matches triton/ref numerics), I/O fp16.
+ * Math in fp32 (matches triton/ref numerics), I/O fp16 or bf16.
  */
 #include <sycl/sycl.hpp>
 #include <torch/all.h>
@@ -45,7 +45,7 @@ struct rms_norm_gated_kernel {
     float sum_sq = sycl::reduce_over_group(sg, local_sq, sycl::plus<>());
     float inv_rms = sycl::rsqrt(sum_sq / static_cast<float>(V) + eps);
 
-    // normed * weight * silu(z), stored fp16.
+    // normed * weight * silu(z), stored back in T.
     for (int i = lane; i < V; i += SG) {
       float xv = static_cast<float>(x[base + i]);
       float wv = static_cast<float>(weight[i]);
@@ -56,34 +56,71 @@ struct rms_norm_gated_kernel {
   }
 };
 
-// output[rows,V] = rmsnorm(x) * weight * silu(z). x/z/weight/output all fp16,
-// contiguous, V == hidden (head_v_dim, e.g. 128). Returns output.
-at::Tensor rms_norm_gated(
-    at::Tensor& output,  // [rows, V]
-    const at::Tensor& x,       // [rows, V]
-    const at::Tensor& z,       // [rows, V]
-    const at::Tensor& weight,  // [V]
-    double eps) {
-  TORCH_CHECK(x.is_contiguous() && z.is_contiguous() && weight.is_contiguous() &&
-                  output.is_contiguous(),
-              "rms_norm_gated: x/z/weight/output must be contiguous");
-  TORCH_CHECK(x.scalar_type() == at::kHalf, "rms_norm_gated is fp16-only");
-  const int rows = static_cast<int>(x.size(0));
-  const int V = static_cast<int>(x.size(1));
+template <typename T>
+static void launch_rms_norm_gated(
+    sycl::queue& q,
+    const T* x_ptr,
+    const T* z_ptr,
+    const T* w_ptr,
+    T* out_ptr,
+    int rows,
+    int V,
+    float eps) {
   constexpr int SG = 32;
-
-  auto& q = vllm::xpu::vllmGetQueue();
-  using T = sycl::half;
-  rms_norm_gated_kernel<T, SG> task{
-      reinterpret_cast<const T*>(x.data_ptr()),
-      reinterpret_cast<const T*>(z.data_ptr()),
-      reinterpret_cast<const T*>(weight.data_ptr()),
-      reinterpret_cast<T*>(output.data_ptr()), V, static_cast<float>(eps)};
-  // one sub-group (SG lanes) per row.
+  rms_norm_gated_kernel<T, SG> task{x_ptr, z_ptr, w_ptr, out_ptr, V, eps};
   q.submit([&](sycl::handler& cgh) {
     cgh.parallel_for(
         sycl::nd_range<1>({static_cast<size_t>(rows) * SG}, {SG}), task);
   });
+}
+
+// output[rows,V] = rmsnorm(x) * weight * silu(z). x/z/weight/output all share
+// dtype (fp16 or bf16), contiguous, V == hidden (head_v_dim, e.g. 128).
+// Returns output.
+at::Tensor rms_norm_gated(
+    at::Tensor& output,         // [rows, V]
+    const at::Tensor& x,        // [rows, V]
+    const at::Tensor& z,        // [rows, V]
+    const at::Tensor& weight,   // [V]
+    double eps) {
+  TORCH_CHECK(x.is_contiguous() && z.is_contiguous() && weight.is_contiguous() &&
+                  output.is_contiguous(),
+              "rms_norm_gated: x/z/weight/output must be contiguous");
+  TORCH_CHECK(
+      x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16,
+      "rms_norm_gated: x must be fp16 or bf16");
+  TORCH_CHECK(
+      z.scalar_type() == x.scalar_type() &&
+          weight.scalar_type() == x.scalar_type() &&
+          output.scalar_type() == x.scalar_type(),
+      "rms_norm_gated: x/z/weight/output must share dtype");
+  const int rows = static_cast<int>(x.size(0));
+  const int V = static_cast<int>(x.size(1));
+
+  auto& q = vllm::xpu::vllmGetQueue();
+  if (x.scalar_type() == at::kHalf) {
+    using T = sycl::half;
+    launch_rms_norm_gated<T>(
+        q,
+        reinterpret_cast<const T*>(x.data_ptr()),
+        reinterpret_cast<const T*>(z.data_ptr()),
+        reinterpret_cast<const T*>(weight.data_ptr()),
+        reinterpret_cast<T*>(output.data_ptr()),
+        rows,
+        V,
+        static_cast<float>(eps));
+  } else {
+    using T = sycl::ext::oneapi::bfloat16;
+    launch_rms_norm_gated<T>(
+        q,
+        reinterpret_cast<const T*>(x.data_ptr()),
+        reinterpret_cast<const T*>(z.data_ptr()),
+        reinterpret_cast<const T*>(weight.data_ptr()),
+        reinterpret_cast<T*>(output.data_ptr()),
+        rows,
+        V,
+        static_cast<float>(eps));
+  }
   return output;
 }
 

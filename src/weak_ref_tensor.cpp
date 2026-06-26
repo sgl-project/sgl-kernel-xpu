@@ -18,10 +18,13 @@ limitations under the License.
 
 #include <vector>
 
+// [NOTE] weak_ref_tensor returns a no-ownership alias over the XPU tensor via `at::from_blob`.
+// Use weak references for XPU Graph outputs to decouple object lifetime from XPU graph.
+// This allows the memory to be efficiently reused.
 at::Tensor weak_ref_tensor(const at::Tensor& tensor) {
   TORCH_CHECK(tensor.is_xpu(), "weak_ref_tensor expects an XPU tensor");
   TORCH_CHECK(!tensor.requires_grad(), "weak_ref_tensor does not support autograd tensors");
-  // NOTE: The returned tensor does not own the underlying storage; ensure the backing allocation outlives it.
+  // The returned tensor does not own the underlying storage; ensure the backing allocation outlives it.
   void* data_ptr = tensor.data_ptr();
   std::vector<int64_t> sizes = tensor.sizes().vec();
   std::vector<int64_t> strides = tensor.strides().vec();

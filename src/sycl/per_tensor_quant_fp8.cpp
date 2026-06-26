@@ -184,7 +184,9 @@ sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor outpu
       auto kernel = PerTensorAbsMaxKernel<T, VEC_SIZE>(                                 \
           static_cast<T*>(input.data_ptr()), output_s.data_ptr<float>(), num_elements); \
       sycl_kernel_submit(global_range, local_range, Q, kernel);                         \
-      Q.wait_and_throw();                                                               \
+      /* No explicit wait: the XPU stream queue is in-order so the next kernel \
+         submission sees the absmax write. wait_and_throw() here also breaks \
+         XPU Graph capture (queue is recording). */                                     \
     }                                                                                   \
     auto kernel = PerTensorQuantFP8Kernel<T, DST_DTYPE, VEC_SIZE>(                      \
         static_cast<T*>(input.data_ptr()),                                              \

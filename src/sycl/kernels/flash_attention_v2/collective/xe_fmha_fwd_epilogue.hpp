@@ -227,8 +227,7 @@ class FMHAFwdEpilogue {
         int head_off = int(get<0>(tOgO(j)));
         // Guard against padded rows (qg_sz rounded up beyond head_group_q).
         if (head_off < head_group_q) {
-          ElementA sink_term =
-              sycl::native::exp2(static_cast<ElementA>(sink_ptr[head_off] * kLog2e) - tO_max(j));
+          ElementA sink_term = sycl::native::exp2(static_cast<ElementA>(sink_ptr[head_off] * kLog2e) - tO_max(j));
           if (sycl::isfinite(sink_term)) {
             denom += sink_term;
           }

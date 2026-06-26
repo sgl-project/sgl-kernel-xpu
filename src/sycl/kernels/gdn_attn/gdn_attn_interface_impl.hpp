@@ -4,13 +4,11 @@
 
 #include "causal_conv1d.hpp"
 #include "gated_delta_rule.hpp"
-#include "gdn_vllm_compat.h"
-#ifdef VLLM_XPU_ENABLE_XE2
+#include "gdn_sgl_compat.h"
 #include "xe_2/chunk_causal_conv1d_tiled_xe2.hpp"
 #include "xe_2/chunk_causal_conv1d_xe2.hpp"
 #include "xe_2/chunk_gated_delta_rule_xe2.h"
 #include "xe_2/l2norm.h"
-#endif
 
 void gdn_attention(
     torch::Tensor& core_attn_out,                // [num_actual_tokens, num_v_heads / tp_size,
@@ -204,7 +202,7 @@ void gdn_attention(
   auto projected_states_qkvz_active = projected_states_qkvz.narrow(0, 0, num_actual_tokens);
   auto projected_states_ba_active = projected_states_ba.narrow(0, 0, num_actual_tokens);
 
-  auto& queue = vllm::xpu::vllmGetQueue();
+  auto& queue = sgl::xpu::sglGetQueue();
   auto dtype = projected_states_qkvz.dtype();
   auto device = projected_states_qkvz.device();
   gdn::ActMode act_mode;
@@ -335,7 +333,6 @@ void gdn_attention(
         num_spec_decodes);                                                                                             \
   } while (0)
 
-#ifdef VLLM_XPU_ENABLE_XE2
     // XE2 chunk path handles all non-spec tokens whenever there are prefills,
     // even when spec_decodes are also present. The XE2 kernels accept an
     // optional token_indx so they can read mixed_qkvz/mixed_ba and write z /
@@ -449,9 +446,6 @@ void gdn_attention(
     } else {
       NATIVE_LAUNCHER;
     }
-#else
-    NATIVE_LAUNCHER;
-#endif
 #undef NATIVE_LAUNCHER
   }
 }

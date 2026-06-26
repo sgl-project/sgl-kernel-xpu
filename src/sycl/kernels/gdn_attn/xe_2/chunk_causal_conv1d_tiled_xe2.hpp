@@ -735,7 +735,7 @@ void chunk_causal_conv1d_tiled_xe2(
   const int width = conv_weights.size(1);
   const int conv_states_stride_0 = conv_states.stride(0);
   // conv_states is logically [cache, width-1, dim]; use actual strides so both the
-  // vLLM-contiguous and SGLang [cache, dim, width-1] (transposed view) layouts work.
+  // [cache, width-1, dim]-contiguous and [cache, dim, width-1] (transposed view) layouts work.
   const int conv_w_stride = conv_states.stride(1);
   const int conv_d_stride = conv_states.stride(2);
 

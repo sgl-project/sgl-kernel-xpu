@@ -5,7 +5,7 @@
 #include <sycl/sycl.hpp>
 
 #include "../gdn_attn_utils.h"
-#include "../gdn_vllm_compat.h"
+#include "../gdn_sgl_compat.h"
 
 namespace gdn {
 
@@ -62,7 +62,7 @@ SYCL_EXTERNAL void l2norm_vectorized_kernel(
     const T* q, const T* k, const int total_virtual_seqlen, const int num_k_heads, const int head_k_dim) {
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 
-  using vec_t = vllm::xpu::aligned_vec<T, VEC_SIZE>;
+  using vec_t = sgl::xpu::aligned_vec<T, VEC_SIZE>;
 
   int group_id = item.get_group(1);
   auto sg = item.get_sub_group();

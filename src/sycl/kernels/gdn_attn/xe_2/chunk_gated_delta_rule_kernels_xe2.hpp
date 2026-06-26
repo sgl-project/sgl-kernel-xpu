@@ -6,7 +6,7 @@
 #include <sycl/sycl.hpp>
 
 #include "../gdn_attn_utils.h"
-#include "../gdn_vllm_compat.h"
+#include "../gdn_sgl_compat.h"
 #include "gemm.hpp"
 
 namespace gdn {
@@ -1193,7 +1193,7 @@ void kernel_launcher(
         });
   });
 
-  if (vllm::xpu::is_bmg()) {
+  if (sgl::xpu::is_bmg()) {
     using WGTileInverse = chunk_gemm_policy_inverse::WGTile;
     using SGLayoutInverse = chunk_gemm_policy_inverse::SGLayout;
     using MMAInverse =

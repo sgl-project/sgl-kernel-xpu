@@ -2,9 +2,7 @@
 
 Exercises ``torch.ops.sgl_kernel.gdn_attention`` on synthetic Qwen3-Next/3.5
 shaped inputs for both the decode and prefill paths, asserting the in-place
-outputs have the expected shapes and are finite. This is a self-contained
-smoke test (no vLLM dependency); bit-exact validation vs the vLLM reference op
-lives in the analysis benchmark scripts.
+outputs have the expected shapes and are finite.
 """
 
 import pytest
@@ -175,11 +173,11 @@ def _run_op(i, conv_state, ssm_state, state_idx, reorder_input):
 def test_gdn_attention_dim_major_conv_layout(mode, batch_size, seqlen, dtype):
     """The kernels index conv_state via explicit strides, so SGLang's native
     ``[cache, dim, width-1]`` pool (passed as a transposed view) must produce the
-    same result as the vLLM-contiguous ``[cache, width-1, dim]`` layout, including
+    same result as the contiguous ``[cache, width-1, dim]`` layout, including
     the in-place updated conv state."""
     device = torch.device("xpu")
 
-    # Reference: contiguous [cache, width-1, dim] (vLLM layout).
+    # Reference: contiguous [cache, width-1, dim] layout.
     ref = _make_inputs(mode, batch_size, seqlen, dtype, device)
     conv_orig = ref["conv_state"].clone()  # pristine initial conv state
     ssm_orig = ref["ssm_state"].clone()

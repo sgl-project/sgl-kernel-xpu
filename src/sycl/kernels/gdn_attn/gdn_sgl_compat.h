@@ -29,10 +29,10 @@
         "aligned.");                                                                                                 \
   } while (0)
 
-namespace vllm {
+namespace sgl {
 namespace xpu {
 
-static inline sycl::queue& vllmGetQueue(at::DeviceIndex device_index = -1) {
+static inline sycl::queue& sglGetQueue(at::DeviceIndex device_index = -1) {
   auto current_stream = c10::xpu::getCurrentXPUStream(device_index);
   auto& queue = current_stream.queue();
   return queue;
@@ -149,4 +149,4 @@ inline float to_float(sycl::ext::oneapi::bfloat16 u) {
 
 }  // namespace xpu
 
-}  // namespace vllm
+}  // namespace sgl

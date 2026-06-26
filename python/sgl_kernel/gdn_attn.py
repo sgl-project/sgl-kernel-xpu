@@ -37,8 +37,7 @@ def gdn_attention(
     """Fused Gated-DeltaNet (GDN) attention for Intel Xe2 (BMG).
 
     Writes results in place into ``core_attn_out`` (and ``z``), and updates
-    ``conv_state`` / ``ssm_state`` in place. Mirrors the vLLM-XPU
-    ``gdn_attention`` op semantics. See ``sgl_kernel`` C++ binding for the
+    ``conv_state`` / ``ssm_state`` in place. See ``sgl_kernel`` C++ binding for the
     argument layout / shapes.
     """
     torch.ops.sgl_kernel.gdn_attention.default(

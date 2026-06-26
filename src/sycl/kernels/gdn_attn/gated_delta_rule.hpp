@@ -9,8 +9,11 @@ static constexpr int sub_group_size = 32;
 template <typename T, typename StateT, int k_bucket_size>
 struct gated_delta_rule_kernel {
  public:
-  static constexpr int group_size = 256;
-  static constexpr int sg_per_group = group_size / sub_group_size;
+  // Each WG is exactly one sub-group (32 threads). The 8 v-dim slices that a
+  // 256-thread WG used to handle are now independent WGs, giving the GPU
+  // hardware more scheduling freedom and higher occupancy at small batch sizes.
+  static constexpr int group_size = 32;
+  static constexpr int sg_per_group = group_size / sub_group_size;  // == 1
   static constexpr int v_dim_per_sg = 4;
   static constexpr int v_dim_per_group = v_dim_per_sg * sg_per_group;
   static constexpr float eps = 0.000001;
@@ -280,8 +283,10 @@ struct gated_delta_rule_kernel {
 template <typename T, typename StateT, int k_bucket_size>
 struct gated_delta_rule_spec_kernel {
  public:
-  static constexpr int group_size = 256;
-  static constexpr int sg_per_group = group_size / sub_group_size;
+  // Each WG is exactly one sub-group (32 threads). See gated_delta_rule_kernel
+  // for the rationale (no inter-SG communication, higher occupancy).
+  static constexpr int group_size = 32;
+  static constexpr int sg_per_group = group_size / sub_group_size;  // == 1
   static constexpr int v_dim_per_sg = 4;
   static constexpr int v_dim_per_group = v_dim_per_sg * sg_per_group;
   static constexpr float eps = 0.000001;

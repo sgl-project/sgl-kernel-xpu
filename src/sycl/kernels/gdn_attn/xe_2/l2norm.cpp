@@ -1,5 +1,4 @@
 #define SYCL_INTEL_TARGET 20
-#define VLLM_XPU_ENABLE_XE2
 #include "l2norm.h"
 
 #include <torch/all.h>

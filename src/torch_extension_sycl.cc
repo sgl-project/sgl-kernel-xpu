@@ -231,6 +231,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value, "
       "Tensor? norm_weight=None, float? norm_eps=None) -> ()");
   m.impl("hc_pre_big_fuse", torch::kXPU, &hc_pre_big_fuse);
+
+  /* HC PRE GEMM + SQUARE SUM */
+  m.def("hc_pre_gemm_sqr_sum(Tensor! C, Tensor! sqr_sum, Tensor A, Tensor B) -> ()");
+  m.impl("hc_pre_gemm_sqr_sum", torch::kXPU, &hc_pre_gemm_sqr_sum);
+
   /*
    * From LoRA
    */

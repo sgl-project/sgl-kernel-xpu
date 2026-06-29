@@ -105,6 +105,8 @@ void merge_state(
 void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 
+at::Tensor weak_ref_tensor(const at::Tensor& tensor);
+
 /*
  * From csrc/elementwise
  */

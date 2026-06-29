@@ -58,8 +58,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * Fast radix top-k (DeepSeek V3.2 indexer)
    */
-  m.def(
-      "fast_topk(Tensor score, Tensor! indices, Tensor lengths, Tensor? row_starts) -> ()");
+  m.def("fast_topk(Tensor score, Tensor! indices, Tensor lengths, Tensor? row_starts) -> ()");
   m.impl("fast_topk", torch::kXPU, &fast_topk_interface);
 
   m.def(

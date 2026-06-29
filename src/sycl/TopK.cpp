@@ -29,8 +29,7 @@ constexpr int kNumScalars = 5;
 inline uint8_t convert_to_uint8(float x) {
   sycl::half h = static_cast<sycl::half>(x);
   uint16_t bits = sycl::bit_cast<uint16_t>(h);
-  uint16_t key = (bits & 0x8000u) ? static_cast<uint16_t>(~bits)
-                                  : static_cast<uint16_t>(bits | 0x8000u);
+  uint16_t key = (bits & 0x8000u) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000u);
   return static_cast<uint8_t>(key >> 8);
 }
 
@@ -73,8 +72,7 @@ inline int wg_reserve_dec(sycl::nd_item<1>& item, int32_t& counter, int want) {
   return wg_base - my_off;
 }
 
-inline void run_cumsum(
-    sycl::nd_item<1>& item, int32_t* s_histogram_buf /* [2][kHistStride] */) {
+inline void run_cumsum(sycl::nd_item<1>& item, int32_t* s_histogram_buf /* [2][kHistStride] */) {
   const int tx = static_cast<int>(item.get_local_id(0));
 #pragma unroll 8
   for (int i = 0; i < 8; ++i) {
@@ -103,8 +101,7 @@ inline void fast_topk_radix(
     int length,
     int32_t* s_histogram_buf,
     int32_t* s_scalars,
-    int32_t* s_input_idx
-) {
+    int32_t* s_input_idx) {
   int topk = kTopK;
   const int tx = static_cast<int>(item.get_local_id(0));
 
@@ -125,8 +122,7 @@ inline void fast_topk_radix(
 
   run_cumsum(item, s_histogram_buf);
 
-  if (tx < kRadix && s_histogram_buf[tx] > topk &&
-      s_histogram_buf[tx + 1] <= topk) {
+  if (tx < kRadix && s_histogram_buf[tx] > topk && s_histogram_buf[tx + 1] <= topk) {
     s_scalars[1] = tx;
     s_scalars[2] = 0;
     s_scalars[0] = 0;
@@ -197,8 +193,7 @@ inline void fast_topk_radix(
 
     run_cumsum(item, s_histogram_buf);
 
-    if (tx < kRadix && s_histogram_buf[tx] > topk &&
-        s_histogram_buf[tx + 1] <= topk) {
+    if (tx < kRadix && s_histogram_buf[tx] > topk && s_histogram_buf[tx + 1] <= topk) {
       s_scalars[1] = tx;
       s_scalars[2 + (r_idx ^ 1)] = 0;
       s_scalars[4] = topk - s_histogram_buf[tx + 1];
@@ -209,8 +204,7 @@ inline void fast_topk_radix(
     topk -= s_histogram_buf[threshold_bin + 1];
     const int offset = 24 - round * 8;
 
-    const int n_iters_stash =
-        (num_input + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    const int n_iters_stash = (num_input + kThreadsPerBlock - 1) / kThreadsPerBlock;
 
     if (topk == 0) {
       for (int it = 0; it < n_iters_stash; ++it) {
@@ -220,8 +214,7 @@ inline void fast_topk_radix(
         int bin = -1;
         if (valid) {
           idx = s_input_idx[r_idx * kSmemInputSize + i];
-          bin = static_cast<int>(
-              (convert_to_uint32(input[idx + row_start]) >> offset) & 0xFFu);
+          bin = static_cast<int>((convert_to_uint32(input[idx + row_start]) >> offset) & 0xFFu);
         }
         const int want = (valid && bin > threshold_bin) ? 1 : 0;
         const int pos = wg_reserve(item, s_scalars[0], want);
@@ -263,19 +256,18 @@ inline void fast_topk_radix(
         }
       } else {
         const int want_stash = (valid && bin == threshold_bin) ? 1 : 0;
-        const int stash_pos =
-            wg_reserve(item, s_scalars[2 + (r_idx ^ 1)], want_stash);
+        const int stash_pos = wg_reserve(item, s_scalars[2 + (r_idx ^ 1)], want_stash);
         if (want_stash && stash_pos < kSmemInputSize) {
           s_input_idx[(r_idx ^ 1) * kSmemInputSize + stash_pos] = idx;
           const uint32_t b32 = convert_to_uint32(raw);
-          const int sub_bin =
-              static_cast<int>((b32 >> (offset - 8)) & 0xFFu);
+          const int sub_bin = static_cast<int>((b32 >> (offset - 8)) & 0xFFu);
           LocalAtomic(s_histogram_buf[sub_bin]).fetch_add(1);
         }
       }
     }
     item.barrier(sycl::access::fence_space::local_space);
   }
+  item.barrier(sycl::access::fence_space::local_space);
 }
 
 inline void naive_topk(sycl::nd_item<1>& item, int32_t* indices, int length) {
@@ -285,22 +277,16 @@ inline void naive_topk(sycl::nd_item<1>& item, int32_t* indices, int length) {
   }
 }
 
-inline void naive_topk_transform(
-    sycl::nd_item<1>& item,
-    int length,
-    int32_t* dst_page_entry,
-    const int32_t* src_page_entry) {
+inline void
+naive_topk_transform(sycl::nd_item<1>& item, int length, int32_t* dst_page_entry, const int32_t* src_page_entry) {
   const int tx = static_cast<int>(item.get_local_id(0));
   for (int i = tx; i < kTopK; i += kThreadsPerBlock) {
     dst_page_entry[i] = (i < length) ? src_page_entry[i] : -1;
   }
 }
 
-inline void naive_topk_transform_ragged(
-    sycl::nd_item<1>& item,
-    int length,
-    int32_t* dst_indices_entry,
-    int32_t offset) {
+inline void
+naive_topk_transform_ragged(sycl::nd_item<1>& item, int length, int32_t* dst_indices_entry, int32_t offset) {
   const int tx = static_cast<int>(item.get_local_id(0));
   for (int i = tx; i < kTopK; i += kThreadsPerBlock) {
     dst_indices_entry[i] = (i < length) ? (i + offset) : -1;
@@ -392,20 +378,14 @@ struct FastTopKTransformFusedDecodeKernel : public __SYCL_KER_CONFIG_CONVENTION_
   sycl::local_accessor<int32_t, 1> s_histogram_;
   sycl::local_accessor<int32_t, 1> s_scalars_;
   sycl::local_accessor<int32_t, 1> s_input_idx_;
-  sycl::local_accessor<int32_t, 1> s_indices_;
 
-  FastTopKTransformFusedDecodeKernel(
-      const FastTopKParams& p,
-      int32_t* dst,
-      const int32_t* src,
-      int64_t stride)
+  FastTopKTransformFusedDecodeKernel(const FastTopKParams& p, int32_t* dst, const int32_t* src, int64_t stride)
       : params(p), dst_page_table(dst), src_page_table(src), src_stride(stride) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
     s_histogram_ = sycl::local_accessor<int32_t, 1>(2 * kHistStride, cgh);
     s_scalars_ = sycl::local_accessor<int32_t, 1>(kNumScalars, cgh);
     s_input_idx_ = sycl::local_accessor<int32_t, 1>(2 * kSmemInputSize, cgh);
-    s_indices_ = sycl::local_accessor<int32_t, 1>(kTopK, cgh);
   }
 
   [[sycl::reqd_sub_group_size(32)]] void operator()(sycl::nd_item<1> item) const {
@@ -424,17 +404,21 @@ struct FastTopKTransformFusedDecodeKernel : public __SYCL_KER_CONFIG_CONVENTION_
     int32_t* hist = s_histogram_.get_multi_ptr<sycl::access::decorated::no>().get();
     int32_t* scalars = s_scalars_.get_multi_ptr<sycl::access::decorated::no>().get();
     int32_t* in_idx = s_input_idx_.get_multi_ptr<sycl::access::decorated::no>().get();
-    int32_t* s_idx = s_indices_.get_multi_ptr<sycl::access::decorated::no>().get();
 
-    fast_topk_radix(item, score, s_idx, /*row_start=*/0, length, hist, scalars, in_idx);
+    // EXPERIMENT: use global dst_entry as temp index buffer
+    fast_topk_radix(item, score, dst_entry, /*row_start=*/0, length, hist, scalars, in_idx);
 
     static_assert(kTopK == 2 * kThreadsPerBlock, "kTopK must be 2 * kThreadsPerBlock");
     const int i0 = tid;
     const int i1 = tid + kThreadsPerBlock;
-    const int p0 = s_idx[i0];
-    const int p1 = s_idx[i1];
-    dst_entry[i0] = src_entry[p0];
-    dst_entry[i1] = src_entry[p1];
+    item.barrier();
+    const int p0 = dst_entry[i0];
+    const int p1 = dst_entry[i1];
+    const int32_t v0 = src_entry[p0];
+    const int32_t v1 = src_entry[p1];
+    item.barrier();
+    dst_entry[i0] = v0;
+    dst_entry[i1] = v1;
   }
 };
 
@@ -453,18 +437,8 @@ struct FastTopKTransformFusedPrefillKernel : public __SYCL_KER_CONFIG_CONVENTION
   sycl::local_accessor<int32_t, 1> s_src_row_;  // [1] selected src row id
 
   FastTopKTransformFusedPrefillKernel(
-      const FastTopKParams& p,
-      int32_t* dst,
-      const int32_t* src,
-      int64_t stride,
-      const int32_t* cu_q,
-      int64_t pbs)
-      : params(p),
-        dst_page_table(dst),
-        src_page_table(src),
-        src_stride(stride),
-        cu_seqlens_q(cu_q),
-        prefill_bs(pbs) {}
+      const FastTopKParams& p, int32_t* dst, const int32_t* src, int64_t stride, const int32_t* cu_q, int64_t pbs)
+      : params(p), dst_page_table(dst), src_page_table(src), src_stride(stride), cu_seqlens_q(cu_q), prefill_bs(pbs) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
     s_histogram_ = sycl::local_accessor<int32_t, 1>(2 * kHistStride, cgh);
@@ -538,8 +512,7 @@ struct FastTopKTransformRaggedFusedKernel : public __SYCL_KER_CONFIG_CONVENTION_
   sycl::local_accessor<int32_t, 1> s_input_idx_;
   sycl::local_accessor<int32_t, 1> s_indices_;
 
-  FastTopKTransformRaggedFusedKernel(
-      const FastTopKParams& p, int32_t* out, const int32_t* off)
+  FastTopKTransformRaggedFusedKernel(const FastTopKParams& p, int32_t* out, const int32_t* off)
       : params(p), topk_indices_ragged(out), topk_indices_offset(off) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
@@ -581,10 +554,7 @@ struct FastTopKTransformRaggedFusedKernel : public __SYCL_KER_CONFIG_CONVENTION_
 }  // namespace
 
 void fast_topk_interface(
-    const at::Tensor& score,
-    at::Tensor& indices,
-    const at::Tensor& lengths,
-    std::optional<at::Tensor> row_starts_opt) {
+    const at::Tensor& score, at::Tensor& indices, const at::Tensor& lengths, std::optional<at::Tensor> row_starts_opt) {
   CHECK_INPUT(score);
   CHECK_DEVICE(indices);
   CHECK_DEVICE(lengths);
@@ -600,10 +570,7 @@ void fast_topk_interface(
 
   FastTopKKernel kernel(params);
   sycl_kernel_submit(
-      sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock),
-      sycl::range<1>(kThreadsPerBlock),
-      queue,
-      kernel);
+      sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock), queue, kernel);
 }
 
 void fast_topk_transform_interface(
@@ -647,10 +614,7 @@ void fast_topk_transform_interface(
     FastTopKTransformFusedDecodeKernel kernel(
         params, dst_page_table.data_ptr<int32_t>(), src_page_table.data_ptr<int32_t>(), src_stride);
     sycl_kernel_submit(
-        sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock),
-        sycl::range<1>(kThreadsPerBlock),
-        queue,
-        kernel);
+        sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock), queue, kernel);
   } else {
     FastTopKTransformFusedPrefillKernel kernel(
         params,
@@ -660,10 +624,7 @@ void fast_topk_transform_interface(
         cu_seqlens_q.data_ptr<int32_t>(),
         prefill_bs);
     sycl_kernel_submit(
-        sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock),
-        sycl::range<1>(kThreadsPerBlock),
-        queue,
-        kernel);
+        sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock), queue, kernel);
   }
 }
 
@@ -697,8 +658,5 @@ void fast_topk_transform_ragged_interface(
   FastTopKTransformRaggedFusedKernel kernel(
       params, topk_indices_ragged.data_ptr<int32_t>(), topk_indices_offset.data_ptr<int32_t>());
   sycl_kernel_submit(
-      sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock),
-      sycl::range<1>(kThreadsPerBlock),
-      queue,
-      kernel);
+      sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock), queue, kernel);
 }

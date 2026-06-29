@@ -540,10 +540,7 @@ void top_p_sampling_from_probs(
     std::optional<at::Generator> gen);
 
 void fast_topk_interface(
-    const at::Tensor& score,
-    at::Tensor& indices,
-    const at::Tensor& lengths,
-    std::optional<at::Tensor> row_starts_opt);
+    const at::Tensor& score, at::Tensor& indices, const at::Tensor& lengths, std::optional<at::Tensor> row_starts_opt);
 
 void fast_topk_transform_interface(
     const at::Tensor& score,

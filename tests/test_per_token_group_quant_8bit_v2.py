@@ -130,6 +130,12 @@ def create_per_token_group_quant_fp8_output_scale(
                 dtype=torch.float32,
             ).transpose(-1, -2)[: x_shape[-2], :]
         else:
+            # Column-major interleaved pattern:
+            # Create tensor with transposed strides to trigger column-major mode
+            # Shape (num_tokens, num_groups) but stride(tokens) < stride(groups)
+            # This allows the kernel to fill in interleaved order:
+            #   Logical view: [[t0_g0, t1_g0, t0_g1], [t1_g1, t0_g2, t1_g2]]
+            # The kernel detects column-major via: stride(-2) < stride(-1)
             return torch.empty(
                 (x_shape[-1] // group_size,) + x_shape[:-1],
                 device=device,
@@ -791,12 +797,24 @@ def test_per_token_group_quant_with_column_major(
 
     x_q_ref, x_s_ref = _postprocess(*per_token_group_quant_8bit_ref(**execute_kwargs))
 
-    x_q_sglang, x_s_sglang = _postprocess(
+    x_q_sglang, x_s_sglang_orig = _postprocess(
         *sglang_per_token_group_quant_8bit_layer(**execute_kwargs, enable_v2=True)
     )
 
     # unpack any unaligned bytes to match with Ref
-    x_s_sglang = unpack_match_ref(x_s_sglang, x_s_ref)
+    x_s_sglang = unpack_match_ref(x_s_sglang_orig, x_s_ref)
+
+    # De-interleave column-major scales for comparison with reference
+    # The kernel produces interleaved output: [[t0_g0, t1_g0, t0_g1], [t1_g1, t0_g2, t1_g2]]
+    # But reference produces row-major: [[t0_g0, t0_g1, t0_g2], [t1_g0, t1_g1, t1_g2]]
+    # Transform SGLang output to row-major for comparison
+    if flags.get("column_major_scales", False) and masked_m is None:
+        # Only de-interleave for non-masked layouts
+        num_tokens_val, num_groups_val = x_s_sglang.shape
+        # Flatten the interleaved output
+        flat = x_s_sglang.contiguous().flatten()
+        # Reshape to (num_groups, num_tokens) then transpose to (num_tokens, num_groups)
+        x_s_sglang = flat.reshape(num_groups_val, num_tokens_val).T.contiguous()
 
     try:
         assert_all_close_or_tiny_diff(x_q_ref, x_q_sglang)

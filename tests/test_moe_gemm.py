@@ -156,7 +156,15 @@ def torch_naive_moe(
             ],  # (act_type, gemm1_alpha, gemm1_limit)
             [2.5],
         )
-    ),
+    )
+    # Gemma4-26B-A4B TP=4 shapes: hidden=2816, intermediate=176 (shard=352=2×176).
+    # GEMM1: K=2816, N=352, fuse_act=True  → narrow_n_fused branch (N≤512, avg_m>128)
+    # GEMM2: K=176,  N=2816, fuse_act=False → narrow_k branch (K≤256, avg_m>128)
+    # num_tokens=[1,64,256] covers avg_m≤8/16/128 branches; 1024 hits the new branches.
+    + [
+        (num_tokens, 8, 128, 2816, 176, False, ("silu", None, None), 2.5)
+        for num_tokens in [1, 64, 256, 1024]
+    ],
 )
 def test_moe_gemm(
     num_tokens,

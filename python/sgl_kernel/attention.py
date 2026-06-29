@@ -144,3 +144,112 @@ def flash_mla_get_workspace_size(
     return torch.ops.sgl_kernel.flash_mla_get_workspace_size.default(
         max_seq_len, num_batches, num_heads, page_size, num_kv_splits
     )
+
+
+def flash_mla_with_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    block_table: Optional[torch.Tensor] = None,
+    cache_seqlens: Optional[torch.Tensor] = None,
+    head_dim_v: int = 512,
+    tile_scheduler_metadata: Optional[torch.Tensor] = None,
+    num_splits: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    is_fp8_kvcache: bool = False,
+    indices: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices_in_kvcache: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    DeepSeek V4 MLA Decode Attention with KVCache.
+
+    When block_table is None: Performs sparse attention via indices.
+    When block_table is provided: Performs dense attention via block_table.
+
+    Returns:
+        out: [B, s_q, H, head_dim_v]  bf16 — final output
+        lse: [B, H, s_q]              fp32 — log-sum-exp
+    """
+    assert (
+        tile_scheduler_metadata is None
+    ), "tile_scheduler_metadata is not supported for xpu"
+    assert num_splits is None, "num_splits is not supported for xpu"
+    assert not causal, "causal attention is not supported for xpu"
+    assert q.ndim == 4, f"q must be 4D [B, s_q, H, D_qk], got {q.ndim}D"
+    assert (
+        k_cache.ndim == 4
+    ), f"k_cache must be 4D [num_pages, P, 1, D], got {k_cache.ndim}D"
+
+    B, s_q, H, D_qk = q.shape
+
+    if softmax_scale is None:
+        softmax_scale = D_qk ** (-0.5)
+
+    assert q.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ), f"q.dtype must be fp16 or bf16, got {q.dtype}"
+
+    # Allocate outputs
+    out = q.new_empty((B, s_q, H, head_dim_v))
+    lse = torch.empty((B, H, s_q), dtype=torch.float32, device=q.device)
+
+    if block_table is None:
+        assert indices is not None, "indices must be provided for sparse decode path"
+        if topk_length is not None:
+            assert (
+                topk_length.device == q.device
+                and topk_length.dtype == torch.int32
+                and topk_length.shape == (B,)
+            ), "topk_length must be int32 on the same device with shape [B]"
+        if attn_sink is not None:
+            assert (
+                attn_sink.device == q.device
+                and attn_sink.dtype == torch.float32
+                and attn_sink.shape == (H,)
+            ), "attn_sink must be float32 on the same device with shape [H]"
+        if (extra_k_cache is None) ^ (extra_indices_in_kvcache is None):
+            raise AssertionError(
+                "extra_k_cache and extra_indices_in_kvcache must be provided together"
+            )
+        if extra_indices_in_kvcache is not None:
+            assert (
+                extra_indices_in_kvcache.dtype == torch.int32
+            ), "extra_indices_in_kvcache.dtype must be int32"
+            assert extra_indices_in_kvcache.device == q.device and extra_indices_in_kvcache.shape[
+                :2
+            ] == (
+                B,
+                s_q,
+            ), "extra_indices_in_kvcache must be on the same device with shape [B, s_q, extra_topk]"
+        if extra_topk_length is not None:
+            assert (
+                extra_topk_length.device == q.device
+                and extra_topk_length.dtype == torch.int32
+                and extra_topk_length.shape == (B,)
+            ), "extra_topk_length must be int32 on the same device with shape [B]"
+        torch.ops.sgl_kernel.flash_mla_sparse_decode.default(
+            out,
+            lse,
+            q,
+            k_cache,
+            indices,
+            topk_length,
+            extra_k_cache,
+            extra_indices_in_kvcache,
+            extra_topk_length,
+            attn_sink,
+            softmax_scale,
+            head_dim_v,
+            is_fp8_kvcache,
+        )
+    else:
+        assert (
+            block_table is not None and cache_seqlens is not None
+        ), "block_table path is not enabled yet for xpu"
+
+    return out, lse

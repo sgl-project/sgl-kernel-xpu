@@ -1219,12 +1219,10 @@ std::vector<at::Tensor> mha_fwd(
 }  // namespace chunkprefill
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
-    const at::Tensor& q,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
-    const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
-                          // h_k, d) if there is page_table.
-    const at::Tensor& v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages,
-                          // page_size, h_k, dv) if there is page_table.
-    std::optional<const at::Tensor>& q_v_,  // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
+    const at::Tensor& q,  // (total_q, h, d) — ragged 3D
+    const at::Tensor& k,  // (total_k, h_k, d) if non-paged, or (num_pages, page_size, h_k, d) if paged
+    const at::Tensor& v,  // (total_k, h_k, dv) if non-paged, or (num_pages, page_size, h_k, dv) if paged
+    std::optional<const at::Tensor>& q_v_,  // (total_q, h, dv) — not yet supported
     const at::Tensor& cu_seqlens_q,         // b+1
     const at::Tensor& cu_seqlens_k,         // b+1
     int max_seqlen_q,
@@ -1250,12 +1248,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     std::optional<bool> pack_gqa_,
     int const sm_margin,
     std::optional<at::Tensor>& out_) {
-  TORCH_CHECK(cu_seqlens_k.data_ptr<int>() != nullptr, "cu_seqlens_k is not valid.");
+  TORCH_CHECK(q.dim() == 3, "query must be in ragged format (total_q, h, d)");
+  // k and v may be 3D (total_k, h_k, d) for non-paged or 4D (num_pages, page_size, h_k, d)
+  // for paged KV cache; sub-functions validate their own shapes.
   if (out_.has_value()) {
     const at::Tensor& out_val = out_.value();
     TORCH_CHECK(out_val.scalar_type() == q.scalar_type(), "out dtype must match q dtype");
     TORCH_CHECK(
-        out_val.dim() == 3 && out_val.size(0) == q.size(0) && out_val.size(1) == q.size(-2) &&
+        out_val.dim() == 3 && out_val.size(0) == q.size(0) && out_val.size(1) == q.size(1) &&
             out_val.size(2) == v.size(-1),
         "out shape must be [total_q, num_heads, head_size_v]");
     TORCH_CHECK(out_val.device() == q.device(), "out must be on the same device as q");

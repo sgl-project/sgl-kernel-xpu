@@ -1469,6 +1469,7 @@ def test_flash_attn_decode_kvcache(
     reason="fp8 KV cache attention is an XPU (sgl-kernel-xpu) feature",
 )
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("q_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("nheads_q,nheads_kv", [(8, 8), (8, 2)])
 @pytest.mark.parametrize("d", [128, 256])
 @pytest.mark.parametrize("page_size", [64, 128])
@@ -1481,14 +1482,16 @@ def test_flash_attn_fp8_kvcache(
     d,
     nheads_q,
     nheads_kv,
+    q_dtype,
     causal,
 ):
     """Attention with an fp8 (e4m3) paged KV cache.
 
-    Q stays bf16 while the K/V cache is stored in float8_e4m3fn and dequantized
-    inside the kernel using per-tensor k_descale / v_descale. The result is
-    compared against a dequantized fp32 reference. seqlen_q == 1 exercises the
-    decode kernel; seqlen_q > 1 exercises the (chunk)prefill kernel.
+    Q is bf16 or fp16 while the K/V cache is stored in float8_e4m3fn and
+    dequantized inside the kernel using a single per-tensor k_descale /
+    v_descale scalar. The result is compared against a dequantized fp32
+    reference. seqlen_q == 1 exercises the decode kernel; seqlen_q > 1
+    exercises the (chunk)prefill kernel.
     """
     from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
@@ -1510,14 +1513,14 @@ def test_flash_attn_fp8_kvcache(
     k_cache = (k_ref_f / k_descale_val).to(torch.float8_e4m3fn)
     v_cache = (v_ref_f / v_descale_val).to(torch.float8_e4m3fn)
 
-    # Per-tensor descale tensors. The kernel reads a single float (element 0);
-    # attention_ref consumes the full (b, h_kv) layout.
-    k_descale = torch.full(
-        (batch_size, nheads_kv), k_descale_val, dtype=torch.float32, device=device
-    )
-    v_descale = torch.full(
-        (batch_size, nheads_kv), v_descale_val, dtype=torch.float32, device=device
-    )
+    # Single per-tensor descale scalar. The kernel consumes one float for the
+    # whole K/V cache (host reads element 0), so pass a 1-element tensor.
+    k_descale = torch.tensor([k_descale_val], dtype=torch.float32, device=device)
+    v_descale = torch.tensor([v_descale_val], dtype=torch.float32, device=device)
+
+    # attention_ref applies the descale per (b, h_kv); broadcast the scalar.
+    k_descale_ref = k_descale.expand(batch_size, nheads_kv).contiguous()
+    v_descale_ref = v_descale.expand(batch_size, nheads_kv).contiguous()
 
     # Build a paged KV cache: one contiguous run of blocks per sequence.
     num_blocks_per_seq = seqlen_k // page_size
@@ -1535,9 +1538,7 @@ def test_flash_attn_fp8_kvcache(
         (batch_size,), seqlen_k, dtype=torch.int32, device=device
     )
 
-    q = torch.randn(
-        batch_size, seqlen_q, nheads_q, d, device=device, dtype=torch.bfloat16
-    )
+    q = torch.randn(batch_size, seqlen_q, nheads_q, d, device=device, dtype=q_dtype)
 
     out = flash_attn_with_kvcache(
         q,
@@ -1561,8 +1562,8 @@ def test_flash_attn_fp8_kvcache(
         v_cache,
         softmax_scale,
         causal=causal,
-        k_descale=k_descale,
-        v_descale=v_descale,
+        k_descale=k_descale_ref,
+        v_descale=v_descale_ref,
         upcast=True,
     )
 

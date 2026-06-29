@@ -151,10 +151,11 @@ class XeFMHAFwdKernel {
     // Per-batch skip mask for two-kernel mix-batch dispatch
     // If non-null, the tile loop skips batches where mask[idx_b] is true.
     const bool* skip_batch_mask = nullptr;
-    // FP8 KV per-tensor dequant scales (device pointers to a single float
-    // each). Null when the KV cache is not fp8. Dereferenced on-device.
-    void* scale_k = nullptr;
-    void* scale_v = nullptr;
+    // FP8 KV per-tensor dequant scales. Device pointers to the single descale
+    // scalar; the kernel dereferences them on-device, so the caller never does
+    // a host-side D2H sync (tensor.item()). Null => non-fp8 KV (scale = 1.0f).
+    const float* scale_k_ptr = nullptr;
+    const float* scale_v_ptr = nullptr;
   };
   using KernelParams = KernelArguments;
 
@@ -385,13 +386,12 @@ class XeFMHAFwdKernel {
       // With PackGQA the Q/O head dimension is indexed by the KV head; otherwise
       // by the (un-grouped) query head.
       int q_head_idx = PackGQA_ ? head : head_q;
-      // FP8 KV: the per-tensor dequant scales are read from the device descale
-      // pointers (stored in KernelArguments) and passed as float function
-      // arguments. scale_k to the mainloop GEMM1.
-      float scale_k = 1.0f;
-      if constexpr (CollectiveMainloop::Fp8KV) {
-        scale_k = *static_cast<const float*>(p.scale_k);
-      }
+      // FP8 KV: the per-tensor dequant scale baked into KernelArguments is
+      // passed as a float function argument (scale_k) to the mainloop GEMM1.
+      // It defaults to 1.0f for non-fp8 KV, so no Fp8KV guard is needed. The
+      // scalar is read on-device from scale_k_ptr when the caller supplied a
+      // device pointer (avoids a host-side .item() D2H sync).
+      float scale_k = p.scale_k_ptr ? *p.scale_k_ptr : 1.0f;
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
       mainloop(
           Q(_, _, q_head_idx, l_coord),
@@ -423,11 +423,9 @@ class XeFMHAFwdKernel {
       CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
       // FP8 KV: the per-tensor V dequant scale is applied once in the epilogue
       // (folded into the softmax normalization) instead of per V element in the
-      // mainloop GEMM2.
-      float scale_v = 1.0f;
-      if constexpr (CollectiveMainloop::Fp8KV) {
-        scale_v = *static_cast<const float*>(p.scale_v);
-      }
+      // mainloop GEMM2. It defaults to 1.0f for non-fp8 KV. Read on-device from
+      // scale_v_ptr when the caller supplied a device pointer.
+      float scale_v = p.scale_v_ptr ? *p.scale_v_ptr : 1.0f;
       if constexpr (Sink) {
         if constexpr (PackGQA_) {
           // Packed decode: pass the per-row sink base for this KV head's group
@@ -537,10 +535,11 @@ class XeFMHAFwdDynamicSplitKernel {
     // mix-batch path) but kept for uniform aggregate initialization in the
     // shared runner template.
     const bool* skip_batch_mask = nullptr;
-    // FP8 KV per-tensor dequant scales (device pointers to a single float
-    // each). Null when the KV cache is not fp8. Dereferenced on-device.
-    void* scale_k = nullptr;
-    void* scale_v = nullptr;
+    // FP8 KV per-tensor dequant scales. Device pointers to the single descale
+    // scalar (DynamicSplit does not support fp8, so these stay null and the
+    // scale resolves to 1.0f); present for uniform aggregate initialization.
+    const float* scale_k_ptr = nullptr;
+    const float* scale_v_ptr = nullptr;
   };
   using KernelParams = KernelArguments;
 
@@ -902,10 +901,8 @@ class XeFMHAFwdDynamicSplitKernel {
         // Epilogue
         CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
         // FP8 KV: apply the per-tensor V dequant scale once in the epilogue.
-        float scale_v = 1.0f;
-        if constexpr (CollectiveMainloop::Fp8KV) {
-          scale_v = *static_cast<const float*>(p.scale_v);
-        }
+        // It defaults to 1.0f for non-fp8 KV.
+        float scale_v = p.scale_v_ptr ? *p.scale_v_ptr : 1.0f;
         epilogue(O(_, _, head_q, idx_b), tArA, tA_max, tA_sum, blk_qv, thr_id, scale_v);
       }
     }
@@ -991,10 +988,11 @@ class XeFMHAFwdSplitKVKernel {
     // Per-batch skip mask for two-kernel mix-batch dispatch
     // (see https://github.com/vllm-project/vllm-xpu-kernels/pull/218).
     const bool* skip_batch_mask = nullptr;
-    // FP8 KV per-tensor dequant scales (device pointers to a single float
-    // each). Null when the KV cache is not fp8. Dereferenced on-device.
-    void* scale_k = nullptr;
-    void* scale_v = nullptr;
+    // FP8 KV per-tensor dequant scales. Device pointers to the single descale
+    // scalar; the kernel dereferences them on-device, so the caller never does
+    // a host-side D2H sync (tensor.item()). Null => non-fp8 KV (scale = 1.0f).
+    const float* scale_k_ptr = nullptr;
+    const float* scale_v_ptr = nullptr;
   };
   using KernelParams = KernelArguments;
 
@@ -1213,15 +1211,13 @@ class XeFMHAFwdSplitKVKernel {
       int start_blk = kv_split_offset;
       int end_blk = kv_split_offset + num_effective_kv_blocks;
 
-      // FP8 KV: read the per-tensor dequant scales from the device descale
-      // pointers (stored in KernelArguments). scale_k is applied to K in the
-      // mainloop GEMM1; scale_v is folded into the softmax normalization in the
-      // epilogue (not the mainloop GEMM2).
-      float scale_k = 1.0f, scale_v = 1.0f;
-      if constexpr (CollectiveMainloop::Fp8KV) {
-        scale_k = *static_cast<const float*>(p.scale_k);
-        scale_v = *static_cast<const float*>(p.scale_v);
-      }
+      // FP8 KV: the per-tensor dequant scales baked into KernelArguments.
+      // scale_k is applied to K in the mainloop GEMM1; scale_v is folded into
+      // the softmax normalization in the epilogue (not the mainloop GEMM2).
+      // Both default to 1.0f for non-fp8 KV. Read on-device from the descale
+      // device pointers when supplied (avoids a host-side .item() D2H sync).
+      float scale_k = p.scale_k_ptr ? *p.scale_k_ptr : 1.0f;
+      float scale_v = p.scale_v_ptr ? *p.scale_v_ptr : 1.0f;
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
 
       mainloop(

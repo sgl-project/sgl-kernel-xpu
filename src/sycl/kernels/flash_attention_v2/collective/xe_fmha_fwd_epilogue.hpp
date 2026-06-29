@@ -611,6 +611,11 @@ class DecodeFwdEpilogue {
       for (int i = 0; i < rA.size(); i++) {
         rA(i) *= broadcast<0>(rA_sum, rA, i);
       }
+    } else if constexpr (CollectiveMainloop::Fp8KV) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA.size(); i++) {
+        rA(i) *= ElementA(scale_v);
+      }
     }
 
     /* Tile output */

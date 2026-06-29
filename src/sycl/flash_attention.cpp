@@ -511,7 +511,7 @@ std::vector<at::Tensor> mha_fwd(
   params.softcap = softcap;
 
   // FP8 KV cache descale wiring. K/V are stored as e4m3 and dequantized in the
-  // decode mainloop by a per-tensor scale (k_descale/v_descale, float32).
+  // decode mainloop by a single per-tensor scale (k_descale/v_descale, float32).
   params.is_e4m3 = is_fp8_kv;
   if (is_fp8_kv) {
     TORCH_CHECK(
@@ -520,11 +520,17 @@ std::vector<at::Tensor> mha_fwd(
         k_descale_.value().scalar_type() == at::ScalarType::Float &&
             v_descale_.value().scalar_type() == at::ScalarType::Float,
         "k_descale/v_descale must be float32");
-    params.k_scale_ptr = k_descale_.value().data_ptr();
-    params.v_scale_ptr = v_descale_.value().data_ptr();
-  } else {
-    params.k_scale_ptr = nullptr;
-    params.v_scale_ptr = nullptr;
+    TORCH_CHECK(
+        k_descale_.value().numel() == 1 && v_descale_.value().numel() == 1,
+        "fp8 KV cache decode uses a per-tensor descale: k_descale/v_descale must each hold exactly one element");
+    TORCH_CHECK(
+        k_descale_.value().device() == q.device() && v_descale_.value().device() == q.device(),
+        "fp8 KV cache decode reads k_descale/v_descale on-device: they must be on the same device as q");
+    // Per-tensor dequant: hand the kernel a device pointer to the single descale
+    // element instead of reading it on the host. The scalar is dereferenced
+    // on-device, avoiding a blocking D2H sync (.item()) on every decode step.
+    params.k_scale_ptr = k_descale_.value().data_ptr<float>();
+    params.v_scale_ptr = v_descale_.value().data_ptr<float>();
   }
 
   // Set this to probability of keeping an element to simplify things.
@@ -1022,19 +1028,27 @@ std::vector<at::Tensor> mha_fwd(
 
   params.softcap = softcap;
 
-  // FP8 KV cache: forward the per-tensor descale pointers and flag the kernel
-  // dispatch so the fp8 mainloop is selected.
+  // FP8 KV cache: read the single per-tensor descale on the host and flag the
+  // kernel dispatch so the fp8 mainloop is selected.
   params.is_e4m3 = is_fp8_kv;
   if (is_fp8_kv) {
+    TORCH_CHECK(
+        k_descale_.has_value() && v_descale_.has_value(), "fp8 KV cache prefill requires k_descale and v_descale");
     TORCH_CHECK(
         k_descale_.value().scalar_type() == at::ScalarType::Float &&
             v_descale_.value().scalar_type() == at::ScalarType::Float,
         "k_descale/v_descale must be float32");
-    params.k_scale_ptr = k_descale_.value().data_ptr();
-    params.v_scale_ptr = v_descale_.value().data_ptr();
-  } else {
-    params.k_scale_ptr = nullptr;
-    params.v_scale_ptr = nullptr;
+    TORCH_CHECK(
+        k_descale_.value().numel() == 1 && v_descale_.value().numel() == 1,
+        "fp8 KV cache prefill uses a per-tensor descale: k_descale/v_descale must each hold exactly one element");
+    TORCH_CHECK(
+        k_descale_.value().device() == q.device() && v_descale_.value().device() == q.device(),
+        "fp8 KV cache prefill reads k_descale/v_descale on-device: they must be on the same device as q");
+    // Per-tensor dequant: hand the kernel a device pointer to the single descale
+    // element instead of reading it on the host. The scalar is dereferenced
+    // on-device, avoiding a blocking D2H sync (.item()).
+    params.k_scale_ptr = k_descale_.value().data_ptr<float>();
+    params.v_scale_ptr = v_descale_.value().data_ptr<float>();
   }
 
   // Set this to probability of keeping an element to simplify things.

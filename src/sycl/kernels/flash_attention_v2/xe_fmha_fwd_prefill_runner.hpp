@@ -95,9 +95,11 @@ struct Arguments {
   void* softmax_sink_ptr;
   float softcap;
 
-  // FP8 KV cache per-tensor descale pointers (host float each).
-  void* __restrict__ k_scale_ptr = nullptr;
-  void* __restrict__ v_scale_ptr = nullptr;
+  // FP8 KV cache per-tensor descale. The single scalar lives on-device; the
+  // kernel dereferences these pointers so no host-side D2H sync (.item()) is
+  // needed. Null => no fp8 dequant (scale = 1.0f).
+  const float* k_scale_ptr = nullptr;
+  const float* v_scale_ptr = nullptr;
 
   // array of length b+1 holding starting offset of each sequence.
   int* __restrict__ cu_seqlens_q;

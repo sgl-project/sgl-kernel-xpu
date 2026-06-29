@@ -1141,7 +1141,8 @@ std::vector<at::Tensor> mha_fwd(
     std::optional<at::Tensor>& scheduler_metadata_,
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
-    int const sm_margin) {
+    int const sm_margin,
+    std::optional<at::Tensor> out_ = std::nullopt) {
   // Supports both paged (page_table != None) and non-paged (contiguous ragged
   // KV, page_table == None) layouts. In the non-paged case both sub-launches run
   // the non-paged prefill kernel (decode is paged-only), which is mathematically
@@ -1154,6 +1155,12 @@ std::vector<at::Tensor> mha_fwd(
           !k_descale_.has_value() && !v_descale_.has_value() && !scheduler_metadata_.has_value(),
       "chunkprefill two-launch path does not yet support q_v / rotary / descale / scheduler_metadata.");
   TORCH_CHECK(cu_seqlens_q.scalar_type() == at::kInt, "cu_seqlens_q must be int32.");
+  // Pre-allocated out requires paged KV: on the non-paged path zero-KV-length
+  // rows are never written by the kernel, so a caller buffer would retain stale
+  // values on graph replay. SGLang always provides page_table (paged KV cache),
+  // so this check should never fire in practice.
+  TORCH_CHECK(
+      !out_.has_value() || page_table.has_value(), "chunkprefill: out buffer requires page_table (paged KV cache).");
 
   int64_t batch_size = cu_seqlens_q.size(0) - 1;
   TORCH_CHECK(batch_size >= 0, "cu_seqlens_q must have at least 1 element.");
@@ -1197,8 +1204,9 @@ std::vector<at::Tensor> mha_fwd(
         std::move(skip_mask));
   };
 
-  // Launch 1: decode allocates the shared output and skips prefill batches.
-  auto out = launch(decode::mha_fwd, std::nullopt, is_prefill)[0];
+  // Launch 1: decode allocates the shared output (or reuses the caller-provided
+  // out_ buffer) and skips prefill batches.
+  auto out = launch(decode::mha_fwd, std::move(out_), is_prefill)[0];
   // Launch 2: prefill writes into the same output and skips decode batches.
   launch(prefill::mha_fwd, out, is_prefill.logical_not());
 
@@ -1210,13 +1218,11 @@ std::vector<at::Tensor> mha_fwd(
 
 }  // namespace chunkprefill
 
-std::vector<at::Tensor> mha_fwd(
-    const at::Tensor& q,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
-    const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
-                          // h_k, d) if there is page_table.
-    const at::Tensor& v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages,
-                          // page_size, h_k, dv) if there is page_table.
-    std::optional<const at::Tensor>& q_v_,  // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
+    const at::Tensor& q,  // (total_q, h, d) — ragged 3D
+    const at::Tensor& k,  // (total_k, h_k, d) if non-paged, or (num_pages, page_size, h_k, d) if paged
+    const at::Tensor& v,  // (total_k, h_k, dv) if non-paged, or (num_pages, page_size, h_k, dv) if paged
+    std::optional<const at::Tensor>& q_v_,  // (total_q, h, dv) — not yet supported
     const at::Tensor& cu_seqlens_q,         // b+1
     const at::Tensor& cu_seqlens_k,         // b+1
     int max_seqlen_q,
@@ -1240,12 +1246,26 @@ std::vector<at::Tensor> mha_fwd(
     std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
-    int const sm_margin) {
-  TORCH_CHECK(cu_seqlens_k.data_ptr<int>() != nullptr, "cu_seqlens_k is not valid.");
+    int const sm_margin,
+    std::optional<at::Tensor>& out_) {
+  TORCH_CHECK(q.dim() == 3, "query must be in ragged format (total_q, h, d)");
+  // k and v may be 3D (total_k, h_k, d) for non-paged or 4D (num_pages, page_size, h_k, d)
+  // for paged KV cache; sub-functions validate their own shapes.
+  if (out_.has_value()) {
+    const at::Tensor& out_val = out_.value();
+    TORCH_CHECK(out_val.scalar_type() == q.scalar_type(), "out dtype must match q dtype");
+    TORCH_CHECK(
+        out_val.dim() == 3 && out_val.size(0) == q.size(0) && out_val.size(1) == q.size(1) &&
+            out_val.size(2) == v.size(-1),
+        "out shape must be [total_q, num_heads, head_size_v]");
+    TORCH_CHECK(out_val.device() == q.device(), "out must be on the same device as q");
+    TORCH_CHECK(out_val.stride(-1) == 1, "out must have a contiguous last dimension");
+  }
+  auto to_tuple = [](std::vector<at::Tensor> v) { return std::make_tuple(v[0], v[1], v[2], v[3]); };
   int const num_heads = q.size(-2);
   int const num_heads_k = k.size(-2);
   if (max_seqlen_q == 1 && page_table.has_value()) {
-    return decode::mha_fwd(
+    return to_tuple(decode::mha_fwd(
         q,
         k,
         v,
@@ -1273,9 +1293,10 @@ std::vector<at::Tensor> mha_fwd(
         scheduler_metadata_,
         num_kv_splits,
         pack_gqa_,
-        sm_margin);
+        sm_margin,
+        out_));
   } else {
-    return chunkprefill::mha_fwd(
+    return to_tuple(chunkprefill::mha_fwd(
         q,
         k,
         v,
@@ -1303,7 +1324,8 @@ std::vector<at::Tensor> mha_fwd(
         scheduler_metadata_,
         num_kv_splits,
         pack_gqa_,
-        sm_margin);
+        sm_margin,
+        out_));
   }
 }
 #undef SYCL_INTEL_TARGET

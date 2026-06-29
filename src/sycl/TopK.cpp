@@ -267,7 +267,6 @@ inline void fast_topk_radix(
     }
     item.barrier(sycl::access::fence_space::local_space);
   }
-  item.barrier(sycl::access::fence_space::local_space);
 }
 
 inline void naive_topk(sycl::nd_item<1>& item, int32_t* indices, int length) {
@@ -378,6 +377,7 @@ struct FastTopKTransformFusedDecodeKernel : public __SYCL_KER_CONFIG_CONVENTION_
   sycl::local_accessor<int32_t, 1> s_histogram_;
   sycl::local_accessor<int32_t, 1> s_scalars_;
   sycl::local_accessor<int32_t, 1> s_input_idx_;
+  sycl::local_accessor<int32_t, 1> s_indices_;
 
   FastTopKTransformFusedDecodeKernel(const FastTopKParams& p, int32_t* dst, const int32_t* src, int64_t stride)
       : params(p), dst_page_table(dst), src_page_table(src), src_stride(stride) {}
@@ -386,6 +386,7 @@ struct FastTopKTransformFusedDecodeKernel : public __SYCL_KER_CONFIG_CONVENTION_
     s_histogram_ = sycl::local_accessor<int32_t, 1>(2 * kHistStride, cgh);
     s_scalars_ = sycl::local_accessor<int32_t, 1>(kNumScalars, cgh);
     s_input_idx_ = sycl::local_accessor<int32_t, 1>(2 * kSmemInputSize, cgh);
+    s_indices_ = sycl::local_accessor<int32_t, 1>(kTopK, cgh);
   }
 
   [[sycl::reqd_sub_group_size(32)]] void operator()(sycl::nd_item<1> item) const {
@@ -404,21 +405,17 @@ struct FastTopKTransformFusedDecodeKernel : public __SYCL_KER_CONFIG_CONVENTION_
     int32_t* hist = s_histogram_.get_multi_ptr<sycl::access::decorated::no>().get();
     int32_t* scalars = s_scalars_.get_multi_ptr<sycl::access::decorated::no>().get();
     int32_t* in_idx = s_input_idx_.get_multi_ptr<sycl::access::decorated::no>().get();
+    int32_t* s_idx = s_indices_.get_multi_ptr<sycl::access::decorated::no>().get();
 
-    // EXPERIMENT: use global dst_entry as temp index buffer
-    fast_topk_radix(item, score, dst_entry, /*row_start=*/0, length, hist, scalars, in_idx);
+    fast_topk_radix(item, score, s_idx, /*row_start=*/0, length, hist, scalars, in_idx);
 
     static_assert(kTopK == 2 * kThreadsPerBlock, "kTopK must be 2 * kThreadsPerBlock");
     const int i0 = tid;
     const int i1 = tid + kThreadsPerBlock;
-    item.barrier();
-    const int p0 = dst_entry[i0];
-    const int p1 = dst_entry[i1];
-    const int32_t v0 = src_entry[p0];
-    const int32_t v1 = src_entry[p1];
-    item.barrier();
-    dst_entry[i0] = v0;
-    dst_entry[i1] = v1;
+    const int p0 = s_idx[i0];
+    const int p1 = s_idx[i1];
+    dst_entry[i0] = src_entry[p0];
+    dst_entry[i1] = src_entry[p1];
   }
 };
 

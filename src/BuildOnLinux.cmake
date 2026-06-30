@@ -28,28 +28,13 @@ else()
       "but got ${SYCL_COMPILER_VERSION}")
 endif()
 
-# Variant of the offline-compiler flags that forces 256 GRF per thread for
-# register-heavy kernels (e.g. FMHA prefill). The default auto-large-GRF mode
-# lets IGC pick 128 GRF for these kernels, which causes register spills and a
-# measurable performance loss versus the 256-GRF build.
-string(REPLACE
-  "-cl-intel-enable-auto-large-GRF-mode"
-  "-cl-intel-256-GRF-per-thread"
-  SYCL_OFFLINE_COMPILER_FLAGS_256GRF
-  "${SYCL_OFFLINE_COMPILER_FLAGS}")
-
 # common kernels
 foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
   get_filename_component(name ${sycl_src} NAME_WLE REALPATH)
   set(sycl_lib sgl-ops-sycl-${name})
-  if(name MATCHES "xe_fmha_fwd_prefill_kernel")
-    set(sycl_offline_flags ${SYCL_OFFLINE_COMPILER_FLAGS_256GRF})
-  else()
-    set(sycl_offline_flags ${SYCL_OFFLINE_COMPILER_FLAGS})
-  endif()
   sycl_add_library(
     ${sycl_lib}
-    ${sycl_offline_flags}
+    ${SYCL_OFFLINE_COMPILER_FLAGS}
     ${COMMON_DEVICE_LINK_FLAGS}
     SHARED
     SYCL_SOURCES ${sycl_src})

@@ -203,47 +203,128 @@ void compute_expert_offsets_sycl_impl(
   return;
 }
 
+// Kernel 1: Per-WG SLM histogram → device atomic flush → per-element global offset
+// SLM is dynamically sized at runtime based on num_experts (no compile-time limit)
 template <typename T>
-struct compute_arg_sorts_sycl_K_T {
-  compute_arg_sorts_sycl_K_T(
+struct compute_arg_sorts_count_sycl_K_T : public __SYCL_KER_CONFIG_CONVENTION__ {
+  compute_arg_sorts_count_sycl_K_T(
       const T* topk_ids,
-      T* input_permutation,
-      T* output_permutation,
-      T* atomic_buffer,
-      const int32_t topk_length,
-      const int32_t topk)
+      T* local_offsets,
+      T* global_counts,
+      const uint32_t topk_length,
+      const uint32_t num_experts,
+      const uint32_t wg_size)
       : topk_ids_(topk_ids),
-        input_permutation_(input_permutation),
-        output_permutation_(output_permutation),
-        atomic_buffer_(atomic_buffer),
+        local_offsets_(local_offsets),
+        global_counts_(global_counts),
         topk_length_(topk_length),
-        topk_(topk) {}
+        num_experts_(num_experts),
+        wg_size_(wg_size) {}
 
-  // One thread per token-expert pair. Device-scope atomic on per-expert counter
-  // (atomic_buffer[e] pre-loaded with expert start offsets by compute_expert_offsets).
-  // O(topk_length) total work vs the previous O(num_experts * topk_length) scan.
-  void operator()(sycl::nd_item<1> item) const {
-    int i = item.get_global_id(0);
-    if (i >= topk_length_) return;
+  void sycl_ker_config_convention(sycl::handler& cgh) {
+    // Dynamic SLM allocation based on actual num_experts at runtime
+    slm_ = sycl::local_accessor<T, 1>(num_experts_, cgh);
+  }
 
-    T expert = topk_ids_[i];
+  [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
+    int gid = item.get_global_id(0);
+    int lid = item.get_local_id(0);
+    int wg_id = item.get_group(0);
 
-    sycl::atomic_ref<
-        T,
-        sycl::memory_order::relaxed,
-        sycl::memory_scope::device,
-        sycl::access::address_space::global_space>
-        counter(atomic_buffer_[expert]);
+    // ===== Phase 1: Zero SLM histogram =====
+    for (int e = lid; e < (int)num_experts_; e += wg_size_)
+      slm_[e] = static_cast<T>(0);
+    sycl::group_barrier(item.get_group());
 
-    T pos = counter.fetch_add(1);
-    input_permutation_[pos] = i / topk_;
-    output_permutation_[i] = pos;
+    // ===== Phase 2: Accumulate into SLM histogram, store per-element local offset =====
+    if (gid < (int)topk_length_) {
+      T expert = topk_ids_[gid];
+      sycl::atomic_ref<
+          T,
+          sycl::memory_order::relaxed,
+          sycl::memory_scope::work_group,
+          sycl::access::address_space::local_space>
+          local_cnt(slm_[expert]);
+      T local_old = local_cnt.fetch_add(static_cast<T>(1));
+      // Store this element's offset within its WG's expert bucket
+      local_offsets_[gid] = local_old;
+    }
+    sycl::group_barrier(item.get_group());
+
+    // ===== Phase 3: Flush SLM histogram to global counts =====
+    // Store this WG's base offset back into SLM for Phase 4
+    for (int e = lid; e < (int)num_experts_; e += wg_size_) {
+      T count = slm_[e];
+      if (count > static_cast<T>(0)) {
+        sycl::atomic_ref<
+            T,
+            sycl::memory_order::relaxed,
+            sycl::memory_scope::device,
+            sycl::access::address_space::global_space>
+            g_cnt(global_counts_[e]);
+        T wg_start = g_cnt.fetch_add(count);
+        slm_[e] = wg_start;
+      } else {
+        slm_[e] = static_cast<T>(0);
+      }
+    }
+    sycl::group_barrier(item.get_group());
+
+    // ===== Phase 4: Fix per-element offset to be global =====
+    // local_offsets[gid] += this WG's base for that expert
+    if (gid < (int)topk_length_) {
+      T expert = topk_ids_[gid];
+      local_offsets_[gid] += slm_[expert];
+    }
   }
 
   const T* topk_ids_;
+  T* local_offsets_;
+  T* global_counts_;
+  const uint32_t topk_length_;
+  const uint32_t num_experts_;
+  const uint32_t wg_size_;
+  mutable sycl::local_accessor<T, 1> slm_;
+};
+
+// Kernel 2: Simple scatter using precomputed per-element offsets
+// No SLM, no atomics — pure gather/scatter
+template <typename T>
+struct compute_arg_sorts_scatter_sycl_K_T {
+  compute_arg_sorts_scatter_sycl_K_T(
+      const T* topk_ids,
+      const T* local_offsets,
+      const T* expert_base_offsets,
+      T* input_permutation,
+      T* output_permutation,
+      const uint32_t topk_length,
+      const uint32_t topk)
+      : topk_ids_(topk_ids),
+        local_offsets_(local_offsets),
+        expert_base_offsets_(expert_base_offsets),
+        input_permutation_(input_permutation),
+        output_permutation_(output_permutation),
+        topk_length_(topk_length),
+        topk_(topk) {}
+
+  [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
+    int gid = item.get_global_id(0);
+
+    if (gid < (int)topk_length_) {
+      T expert = topk_ids_[gid];
+      // Final position = expert's base (from prefix-sum) + this element's global offset
+      T pos = expert_base_offsets_[expert] + local_offsets_[gid];
+
+      input_permutation_[pos] = static_cast<T>(gid / topk_);
+      output_permutation_[gid] = pos;
+    }
+  }
+
+  const T* topk_ids_;
+  const T* local_offsets_;
+  const T* expert_base_offsets_;
   T* input_permutation_;
   T* output_permutation_;
-  T* atomic_buffer_;
   const uint32_t topk_length_;
   const uint32_t topk_;
 };
@@ -253,31 +334,65 @@ void compute_arg_sorts_sycl_impl(
     const torch::Tensor& topk_ids,
     torch::Tensor& input_permutation,
     torch::Tensor& output_permutation,
-    torch::Tensor& atomic_buffer,
+    torch::Tensor& atomic_buffer,  // holds expert prefix-sum offsets from compute_expert_offsets
     const uint32_t num_experts) {
+  // B60 (Xe2) has 64 KB SLM per WG. Each expert uses sizeof(T) bytes in the histogram.
+  // 64 KB / 4 bytes = 16384 experts max — effectively unlimited for any MoE model.
+  // The real limit is quite large here, it's enough if we set it to 1024.
+  constexpr uint32_t MAX_EXPERTS_SLM = 1024;
+  TORCH_CHECK(
+      num_experts <= MAX_EXPERTS_SLM,
+      "compute_arg_sorts: num_experts (",
+      num_experts,
+      ") exceeds SLM capacity (",
+      MAX_EXPERTS_SLM,
+      ")");
+
   const T* topk_ids_ptr = static_cast<const T*>(topk_ids.data_ptr());
   T* input_permutation_ptr = static_cast<T*>(input_permutation.data_ptr());
   T* output_permutation_ptr = static_cast<T*>(output_permutation.data_ptr());
-  T* atomic_buffer_ptr = static_cast<T*>(atomic_buffer.data_ptr());
-
-  auto stream = at::xpu::getCurrentXPUStream();
-  auto queue = stream.queue();
-
-  using Kernel = compute_arg_sorts_sycl_K_T<T>;
+  T* expert_base_offsets_ptr = static_cast<T*>(atomic_buffer.data_ptr());
 
   const uint32_t topk_length = topk_ids.numel();
-  const int32_t topk = topk_ids.size(1);
+  const uint32_t topk = static_cast<uint32_t>(topk_ids.size(1));
   auto dev_id = topk_ids.device().index();
+
   uint32_t wg_size = static_cast<uint32_t>(std::min((uint32_t)dpcppMaxWorkGroupSize(dev_id), topk_length));
   uint32_t num_wgs = (topk_length + wg_size - 1) / wg_size;
 
-  sycl::range<1> global_range{num_wgs * wg_size};
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
+  auto options = torch::TensorOptions().dtype(topk_ids.dtype()).device(topk_ids.device());
+
+  // Per-element global offset buffer
+  torch::Tensor local_offsets = torch::empty({(int64_t)topk_length}, options);
+  // Device-wide running count per expert (must start at 0)
+  torch::Tensor global_counts = torch::zeros({(int64_t)num_experts}, options);
+
+  T* local_offsets_ptr = static_cast<T*>(local_offsets.data_ptr());
+  T* global_counts_ptr = static_cast<T*>(global_counts.data_ptr());
+
+  sycl::range<1> global_range{(size_t)num_wgs * wg_size};
   sycl::range<1> local_range{wg_size};
 
-  Kernel task(topk_ids_ptr, input_permutation_ptr, output_permutation_ptr, atomic_buffer_ptr, topk_length, topk);
+  // Kernel 1: SLM histogram per WG → device atomic flush → per-element global offset
+  // sycl_ker_config_convention allocates SLM dynamically based on num_experts
+  using K1 = compute_arg_sorts_count_sycl_K_T<T>;
+  K1 k1(topk_ids_ptr, local_offsets_ptr, global_counts_ptr, topk_length, num_experts, wg_size);
+  sycl_kernel_submit(global_range, local_range, queue, k1);
 
-  sycl_kernel_submit(global_range, local_range, queue, task);
-  return;
+  // Kernel 2: Simple scatter — no atomics, no SLM
+  // Implicit in-order queue ordering guarantees kernel 1 is complete
+  using K2 = compute_arg_sorts_scatter_sycl_K_T<T>;
+  K2 k2(
+      topk_ids_ptr,
+      local_offsets_ptr,
+      expert_base_offsets_ptr,
+      input_permutation_ptr,
+      output_permutation_ptr,
+      topk_length,
+      topk);
+  sycl_kernel_submit(global_range, local_range, queue, k2);
 }
 
 void prepare_moe_input(

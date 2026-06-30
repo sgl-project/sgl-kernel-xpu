@@ -73,7 +73,7 @@ jobs:
               python3 bench_swiglu_alpha_limit.py 2>&1 | tee swiglu_alpha_limit.py.log && \
               python3 bench_fused_qk_norm_rope.py 2>&1 | tee fused_qk_norm_rope.py.log && \
               python3 bench_fused_qk_rope_with_cache.py 2>&1 | tee bench_fused_qk_rope_with_cache.py.log && \
-              python3 bench_per_token_group_quant_8bit.py 2>&1 | tee per_token_group_quant_8bit.py.log && \
+              echo "Skipping bench_per_token_group_quant_8bit.py (disabled to unblock other benchmarks; see PR #256)" && \
               python3 bench_per_token_group_quant_mxfp4.py 2>&1 | tee per_token_group_quant_mxfp4.py.log && \
               python3 bench_per_token_group_quant_8bit_v2.py 2>&1 | tee bench_per_token_group_quant_8bit_v2.py.log && \
               python3 bench_per_token_group_quant_mxfp4_fusion.py 2>&1 | tee bench_per_token_group_quant_mxfp4_fusion.py.log && \

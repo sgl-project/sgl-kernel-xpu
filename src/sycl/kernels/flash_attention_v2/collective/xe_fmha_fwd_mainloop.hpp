@@ -417,6 +417,7 @@ struct FMHAFwdMainloop<
       if constexpr (CausalMask) {
         if (need_causal) {
           /* Masking scalars */
+          // TODO: use a more general code path for causal masking.
           int lane_id = thr_id % intel::sg_size;
           constexpr int sg_tile_q = get<0>(TileShapeQK{}) / SGPerWG::value;
           int row_base = get<0>(blk_qv) * get<0>(TileShapeQK{}) + (thr_id / intel::sg_size) * sg_tile_q;

@@ -1799,5 +1799,60 @@ def test_flash_attn_varlen_output(
         ).abs().max().item() + dv_atol
 
 
+@pytest.mark.skipif(device.type != "xpu", reason="XPU not available")
+def test_flash_attn_with_kvcache_out_buffer():
+    """Test that a preallocated out buffer is reused and the result is correct."""
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    torch.random.manual_seed(42)
+    batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, d = 2, 1, 64, 8, 2, 64
+    dtype = torch.bfloat16
+    page_size = 64
+    num_blocks_per_seq = (seqlen_k + page_size - 1) // page_size
+    num_blocks = num_blocks_per_seq * batch_size
+
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k_cache = torch.randn(
+        num_blocks, page_size, nheads_kv, d, device=device, dtype=dtype
+    )
+    v_cache = torch.randn(
+        num_blocks, page_size, nheads_kv, d, device=device, dtype=dtype
+    )
+    page_table = torch.arange(num_blocks, dtype=torch.int32, device=device).view(
+        batch_size, num_blocks_per_seq
+    )
+    cache_seqlens = torch.full(
+        (batch_size,), seqlen_k, dtype=torch.int32, device=device
+    )
+
+    # Run without out buffer to get reference output
+    ref_out = flash_attn_with_kvcache(
+        q, k_cache, v_cache, cache_seqlens=cache_seqlens, page_table=page_table
+    )
+
+    # Preallocate out buffer: shape [total_q, nheads, d] = [batch*seqlen_q, nheads, d]
+    total_q = batch_size * seqlen_q
+    out_buf = torch.empty(total_q, nheads, d, device=device, dtype=dtype)
+    result = flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        out=out_buf,
+    )
+
+    # The returned tensor must alias the provided buffer (same storage)
+    assert (
+        result.data_ptr() == out_buf.data_ptr()
+    ), "result should alias the provided out buffer"
+
+    # Numerical correctness: values must match the reference
+    torch.xpu.synchronize()
+    assert torch.allclose(
+        result.reshape(ref_out.shape), ref_out, atol=1e-2
+    ), "out-buffer result differs from reference"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

@@ -20,6 +20,9 @@ limitations under the License.
 #include "sgl_kernel_ops.h"
 #include "sgl_kernel_torch_shim.h"
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+  m.def("weak_ref_tensor(Tensor(a) tensor) -> Tensor(a)");
+  m.impl("weak_ref_tensor", torch::kXPU, &weak_ref_tensor);
+
   m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
   m.impl("awq_dequantize", torch::kXPU, &awq_dequantize);
 
@@ -143,7 +146,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    Tensor?  scheduler_metadata,"
       "    int      num_kv_splits,"
       "    bool?    pack_gqa,"
-      "    int      sm_margin) -> Tensor[]");
+      "    int      sm_margin,"
+      "    Tensor(a!)?  out=None) -> (Tensor(a!), Tensor, Tensor, Tensor)");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
 
   m.def("flash_mla_get_workspace_size", &flash_mla_get_workspace_size);
@@ -231,6 +235,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value, "
       "Tensor? norm_weight=None, float? norm_eps=None) -> ()");
   m.impl("hc_pre_big_fuse", torch::kXPU, &hc_pre_big_fuse);
+
+  /* HC PRE GEMM + SQUARE SUM */
+  m.def("hc_pre_gemm_sqr_sum(Tensor! C, Tensor! sqr_sum, Tensor A, Tensor B) -> ()");
+  m.impl("hc_pre_gemm_sqr_sum", torch::kXPU, &hc_pre_gemm_sqr_sum);
+
   /*
    * From LoRA
    */

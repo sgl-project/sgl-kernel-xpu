@@ -105,6 +105,8 @@ void merge_state(
 void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 
+at::Tensor weak_ref_tensor(const at::Tensor& tensor);
+
 /*
  * From csrc/elementwise
  */
@@ -456,6 +458,11 @@ void hc_pre_big_fuse(
     double hc_post_mult_value,
     std::optional<at::Tensor> norm_weight = std::nullopt,
     std::optional<double> norm_eps = std::nullopt);
+
+/*
+ * hc_pre GEMM + row-wise square sum
+ */
+void hc_pre_gemm_sqr_sum(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, const at::Tensor& B);
 
 /*
  * From csrc/speculative

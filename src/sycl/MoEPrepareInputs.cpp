@@ -229,7 +229,6 @@ struct compute_arg_sorts_count_sycl_K_T : public __SYCL_KER_CONFIG_CONVENTION__ 
   [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
     int gid = item.get_global_id(0);
     int lid = item.get_local_id(0);
-    int wg_id = item.get_group(0);
 
     // ===== Phase 1: Zero SLM histogram =====
     for (int e = lid; e < (int)num_experts_; e += wg_size_)
@@ -336,16 +335,19 @@ void compute_arg_sorts_sycl_impl(
     torch::Tensor& output_permutation,
     torch::Tensor& atomic_buffer,  // holds expert prefix-sum offsets from compute_expert_offsets
     const uint32_t num_experts) {
-  // B60 (Xe2) has 64 KB SLM per WG. Each expert uses sizeof(T) bytes in the histogram.
-  // 64 KB / 4 bytes = 16384 experts max — effectively unlimited for any MoE model.
-  // The real limit is quite large here, it's enough if we set it to 1024.
+  // Guard dynamic SLM allocation based on the histogram element size.
+  // Each expert uses sizeof(T) bytes in the SLM histogram.
   constexpr uint32_t MAX_EXPERTS_SLM = 1024;
+  constexpr uint32_t SLM_BYTES_PER_WG = 64 * 1024;  // Xe2 (B60) SLM per work-group
+  const uint32_t max_experts_slm = SLM_BYTES_PER_WG / static_cast<uint32_t>(sizeof(T));
   TORCH_CHECK(
-      num_experts <= MAX_EXPERTS_SLM,
+      num_experts <= max_experts_slm,
       "compute_arg_sorts: num_experts (",
       num_experts,
       ") exceeds SLM capacity (",
-      MAX_EXPERTS_SLM,
+      max_experts_slm,
+      " experts for sizeof(T)=",
+      sizeof(T),
       ")");
 
   const T* topk_ids_ptr = static_cast<const T*>(topk_ids.data_ptr());

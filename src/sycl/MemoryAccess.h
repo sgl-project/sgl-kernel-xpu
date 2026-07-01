@@ -84,7 +84,7 @@ struct alignas(sizeof(scalar_t) * vec_size) aligned_vector_loop {
 };
 
 template <typename scalar_t>
-inline int can_vectorize_up_to(at::DeviceIndex dev_id, char* pointer) {
+inline int can_vectorize_up_to(at::DeviceIndex dev_id, const char* pointer) {
   int elem_size = sizeof(scalar_t);
   int preferred_width = preferred_vector_width(dev_id, elem_size);
   uint64_t address = reinterpret_cast<uint64_t>(pointer);
@@ -108,8 +108,8 @@ template <typename... Args>
 int get_min_vec_size(int vec_size, Args*... args) {
   auto limit_func = [](int vec_size, auto* data) {
     if (!data) return vec_size;
-    return can_vectorize_up_to<std::remove_pointer_t<decltype(data)>>(
-        dpcppGetDeviceIdOfCurrentQueue(), reinterpret_cast<char*>(data));
+    using data_t = std::remove_cv_t<std::remove_pointer_t<decltype(data)>>;
+    return can_vectorize_up_to<data_t>(dpcppGetDeviceIdOfCurrentQueue(), reinterpret_cast<const char*>(data));
   };
   return get_min(limit_func, vec_size, args...);
 }

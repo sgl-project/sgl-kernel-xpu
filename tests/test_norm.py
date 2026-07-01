@@ -30,6 +30,17 @@ def gemma_rms_norm(x, w, eps=1e-6):
     return x
 
 
+def gemma4_rms_norm(x, w, eps=1e-6, scale_shift=0.0, with_scale=True):
+    orig_dtype = x.dtype
+    x = x.float()
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    x = x * torch.rsqrt(variance + eps)
+    if with_scale:
+        x = x * (w.float() + scale_shift)
+    x = x.to(orig_dtype)
+    return x
+
+
 def gemma_fused_add_rms_norm(x, residual, w, eps=1e-6):
     orig_dtype = x.dtype
     x = x + residual
@@ -436,6 +447,32 @@ def test_gemma_norm_3d_non_flattenable(
         sgl_kernel.gemma_rmsnorm(x, w, out=y)
     else:
         y = sgl_kernel.gemma_rmsnorm(x, w)
+
+    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("num_tokens", [7, 32])
+@pytest.mark.parametrize("num_heads", [4, 8])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize(
+    "scale_shift, with_scale, kernel_fn",
+    [
+        (0.0, True, lambda x, w: sgl_kernel.rmsnorm(x, w)),
+        (1.0, True, lambda x, w: sgl_kernel.gemma_rmsnorm(x, w)),
+        (0.0, False, lambda x, w: sgl_kernel.rmsnorm(x, torch.ones_like(w))),
+    ],
+)
+def test_gemma4_rmsnorm_model_semantics_3d_non_flattenable(
+    num_tokens, num_heads, head_dim, dtype, scale_shift, with_scale, kernel_fn
+):
+    x = _make_non_flattenable_3d(num_tokens, num_heads, head_dim, dtype)
+    w = torch.randn(head_dim, device=device, dtype=dtype)
+
+    y_ref = gemma4_rms_norm(
+        x.clone(), w, scale_shift=scale_shift, with_scale=with_scale
+    )
+    y = kernel_fn(x, w)
 
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 

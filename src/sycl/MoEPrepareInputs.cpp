@@ -412,8 +412,9 @@ void compute_arg_sorts_sycl_impl(
   sycl::range<1> global_range{(size_t)num_wgs * wg_size};
   sycl::range<1> local_range{wg_size};
 
-  // Note: this value is tuned for B60. For decode step with less tokens, the old kernel is better.
-  constexpr uint32_t THRESHOLD = 768;
+// Note: this value is tuned for BMG. For decode step with less tokens, the old kernel is better. We need to tune
+// this value for other hardwares in the future.
+#define THRESHOLD 768
   if (topk_length < THRESHOLD) {
     T* atomic_buffer_ptr = static_cast<T*>(atomic_buffer.data_ptr());
     using Kernel = compute_arg_sorts_sycl_K_T<T>;
@@ -451,6 +452,7 @@ void compute_arg_sorts_sycl_impl(
         topk);
     sycl_kernel_submit(global_range, local_range, queue, k2);
   }
+#undef THRESHOLD
 }
 
 void prepare_moe_input(

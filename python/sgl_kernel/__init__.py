@@ -99,6 +99,11 @@ from sgl_kernel.speculative import (
     tree_speculative_sampling_target_only,
     verify_tree_greedy,
 )
+from sgl_kernel.top_k import (
+    fast_topk_transform_fused,
+    fast_topk_transform_ragged_fused,
+    fast_topk_v2,
+)
 from sgl_kernel.utils import get_device_capability, is_xe2_arch
 from sgl_kernel.version import __version__
 

@@ -76,26 +76,6 @@ struct ToCutlassElementType<at::BFloat16> {
 };
 
 
-template <typename E>
-struct XeMmaAtomFor;  // primary template — leaving undefined gives a clean
-                      // diagnostic if instantiated with an unsupported type.
-
-template <>
-struct XeMmaAtomFor<cutlass::bfloat16_t> {
-  using type = cute::XE_8x16x16_F32BF16BF16F32_TT;
-};
-
-template <>
-struct XeMmaAtomFor<cutlass::half_t> {
-  using type = cute::XE_8x16x16_F32F16F16F32_TT;
-};
-
-
-template <>
-struct XeMmaAtomFor<float> {
-  using type = cute::XE_8x16x8_F32TF32TF32F32_TT;
-};
-
 //----------------- Group problem shape (shared across all instantiations) ----//
 using GroupedProblemShape =
     cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>;
@@ -105,13 +85,8 @@ using UnderlyingProblemShapeType =
 
 template <
     typename TensorDType,
-    typename MmaAtom_,
     typename TileShape_,
     typename ThreadLayout_,
-    typename GmemTiledCopyA_,
-    typename GmemTiledCopyB_,
-    typename GmemTiledCopyC_,
-    typename GmemTiledCopyD_,
     typename LayoutB_,
     int PipelineStages_>
 void launch_group_gemm_lora_fwd(
@@ -130,14 +105,17 @@ void launch_group_gemm_lora_fwd(
     int num_segments,
     float alpha,                         // epilogue scalar: D = alpha * (A @ B) + beta * C
     float beta) {                        //   A-fwd uses (1.0, 0.0); B-fwd / QKV-B-fwd use (1.0, 1.0) for in-place residual.
-  using MmaAtom              = MmaAtom_;
   using ElementA             = typename ToCutlassElementType<TensorDType>::type;
   using ElementB             = ElementA;     // same storage dtype as A (LoRA weights match input dtype)
   using ElementOutput        = ElementA;     // output matches input dtype (bf16/fp16/fp32)
-  using ElementMma           = typename cute::MMA_Traits<MmaAtom>::ValTypeA;
-  using ElementMmaB          = typename cute::MMA_Traits<MmaAtom>::ValTypeB;
   using ElementAccumulator   = float;        // XMX accumulates in fp32 -- required by every atom we support
   using ElementComputeEpilogue = float;      // alpha/beta arithmetic in fp32
+
+  // MMA element type fed to the XMX DPAS. For fp32 storage we run the multiply
+  // in TF32 (the DPAS has no true-fp32 path); bf16/fp16 map to themselves.
+  using ElementMma           = std::conditional_t<
+      std::is_same_v<ElementA, float>, cutlass::tfloat32_t, ElementA>;
+  using ElementMmaB          = ElementMma;
 
  
   using LayoutA = cutlass::layout::RowMajor;
@@ -150,21 +128,26 @@ void launch_group_gemm_lora_fwd(
   using ThreadLayout = ThreadLayout_;
 
   //--------- TiledMma (which XMX MMA atom + how many subgroups tile it) ---//
+  using MmaAtom = cute::XE_DPAS_TT<8, ElementAccumulator, ElementMma>;
   using TiledMma = typename cute::TiledMMAHelper<
       cute::MMA_Atom<MmaAtom>,
       cute::Layout<TileShape>,
       ThreadLayout>::TiledMMA;
 
   //--------- Dispatch policies ---------//
+  // MainloopXeL1StagedGroup builds
+  // prefetch through make_block_2d_prefetch()/XE_PREFETCH_2D
   constexpr int PipelineStages = PipelineStages_;
-  using GEMMDispatchPolicy     = cutlass::gemm::MainloopIntelXeXMX16Group<PipelineStages>;
-  using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeXMX16Group;
+  using GEMMDispatchPolicy     = cutlass::gemm::MainloopXeL1StagedGroup<PipelineStages>;
+  using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeGenericGroup;
 
-  //--------- Gmem copy atoms (host-supplied) ---------//
-  using GmemTiledCopyA = GmemTiledCopyA_;
-  using GmemTiledCopyB = GmemTiledCopyB_;
-  using GmemTiledCopyC = GmemTiledCopyC_;
-  using GmemTiledCopyD = GmemTiledCopyD_;
+  //--------- Gmem copy atoms ---------//
+  // void => CUTLASS auto-selects the correct 2D load/store/prefetch ops per
+  // dtype and layout (see get_block_2d_copy_A/B and make_block_2d_prefetch).
+  using GmemTiledCopyA = void;
+  using GmemTiledCopyB = void;
+  using GmemTiledCopyC = void;
+  using GmemTiledCopyD = void;
 
   //--------- Epilogue: D = alpha * acc + beta * C ---------//
   using EpilogueOp = cutlass::epilogue::fusion::LinearCombination<
@@ -183,13 +166,14 @@ void launch_group_gemm_lora_fwd(
   using CollectiveEpilogue = cutlass::epilogue::collective::CollectiveEpilogue<
       EpilogueDispatchPolicy,
       TileShape,
+      void,                                         // EpilogueTile (void = automatic)
       ElementAccumulator,
       cutlass::gemm::TagToStrideC_t<LayoutC*>,
       ElementOutput,                                // bf16/fp16 narrow here; fp32 stores as-is
       cutlass::gemm::TagToStrideC_t<LayoutD*>,
       FusionCallbacks,
-      GmemTiledCopyC, void, void,
-      GmemTiledCopyD, void, void>;
+      GmemTiledCopyC,                               // load C (void = automatic)
+      GmemTiledCopyD>;                              // store D (void = automatic)
 
   //--------- Mainloop ---------//
   using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
@@ -267,7 +251,7 @@ void launch_group_gemm_lora_fwd(
   cutlass::Status status = gemm_op.can_implement(gemm_args);
   TORCH_CHECK(
       status == cutlass::Status::kSuccess,
-      "sgemm_lora_a_grouped_gemm: can_implement failed: status=",
+      "launch_group_gemm_lora_fwd: can_implement failed: status=",
       cutlassGetStatusString(status));
 
   size_t workspace_size = Gemm::get_workspace_size(gemm_args);
@@ -277,13 +261,13 @@ void launch_group_gemm_lora_fwd(
   status = gemm_op.initialize(gemm_args, workspace.data_ptr());
   TORCH_CHECK(
       status == cutlass::Status::kSuccess,
-      "sgemm_lora_a_grouped_gemm: initialize failed: status=",
+      "launch_group_gemm_lora_fwd: initialize failed: status=",
       cutlassGetStatusString(status));
 
   status = gemm_op.run(&queue);
   TORCH_CHECK(
       status == cutlass::Status::kSuccess,
-      "sgemm_lora_a_grouped_gemm: run failed: status=",
+      "launch_group_gemm_lora_fwd: run failed: status=",
       cutlassGetStatusString(status));
 }
 

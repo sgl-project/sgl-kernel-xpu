@@ -97,39 +97,18 @@ void launch_sgemm_lora_a_fwd(
   //----------------- Compile-time perf knobs (LoRA-A forward) -----------------//
   // All perf-critical types are pinned here at the call site rather than inside
   // the shared launcher, so each LoRA entry point (A-fwd, B-fwd, QKV-B-fwd, ...)
-  // can pick its own tile / subgroup / MMA-atom / copy-atom mix without forking
-  // the launcher.
+  // can pick its own tile / subgroup / layout mix without forking the launcher.
   //
-  // Knobs that are currently uniform across input dtypes (tunable here):
-  //   TileShape    = 256 x 256 x 32   -- canonical bf16 tile from upstream
-  //                                      04_bmg_grouped_gemm; K=32 is also valid
-  //                                      for fp32-via-TF32 (MMA K=8 divides 32).
+  // The launcher uses the modern (non-legacy) grouped path
+  // (MainloopXeL1StagedGroup), which auto-selects the XMX DPAS MMA atom and all
+  // gmem load/store/prefetch copy atoms per dtype. 
+  //
+  // Knobs that remain tunable here:
+  //   TileShape    = 256 x 256 x 32   -- canonical tile from upstream
+  //                                      04_bmg_grouped_gemm.
   //   ThreadLayout = 8 x 4 x 1        -- 32 subgroups per workgroup.
-  //   LayoutB      = ColumnMajor      -- free-transpose B; the B atom does the real transpose.
+  //   LayoutB      = ColumnMajor      -- free-transpose B (auto copy atom transposes).
   //   PipelineStages = 2              -- matches the upstream BMG reference.
-  //
-  // Per-dtype knobs (selected below via `std::conditional_t`):
-  //   MmaAtom: which XMX MMA instruction the mainloop calls. Pulled from
-  //            `XeMmaAtomFor<>` for the canonical pick; can be swapped for a
-  //            smaller-M variant in the same family (XE_{4,2,1}x16x{8,16}_*)
-  //            if the TileShape M is small or sub-grouping needs to change.
-  //   Copy atoms: see comment block below.
-  //
-  // Per-dtype copy atoms (selected via `std::conditional_t` below):
-  //   bf16/fp16 (16-bit storage):
-  //     A: XE_2D_U16x32x32_LD_N           (row-major load)
-  //     B: XE_2D_U16x16x16_LD_T           (transpose-at-load, K=16)
-  //     C: XE_2D_U32x8x16_LD_N            (fp32 acc; inert when beta=0)
-  //     D: XE_2D_U16x8x16_ST_N            (16-bit narrow store)
-  //   fp32-via-TF32 (32-bit storage; final result kept as full fp32):
-  //     A: XE_2D_TF32x32x16_LD_N          (TF32 sub-blocks matching MMA A-side ALayout)
-  //     B: XE_2D_U32x16x8_LD_T            (transpose-at-load, K=8)
-  //     C: XE_2D_U32x8x16_LD_N            (same as bf16/fp16 -- C is fp32 either way)
-  //     D: XE_2D_U32x8x16_ST_N            (32-bit store -- no narrowing back to TF32)
-  //
-  // Alternative pairings to try here later (not currently used):
-  //   bf16/fp16 with LayoutB = RowMajor + B atom = XE_2D_U16x32x32_LD_V (VNNI),
-  //   smaller-M MMA variants (XE_{4,2,1}x16x{8,16}_*), different TileShape per dtype, etc.
   using TileShape    = cute::Shape<cute::_256, cute::_256, cute::_32>;
   using ThreadLayout = cute::Layout<
       cute::Shape <cute::_8, cute::_4, cute::_1>,
@@ -137,35 +116,11 @@ void launch_sgemm_lora_a_fwd(
   using LayoutB      = cutlass::layout::ColumnMajor;
   constexpr int PipelineStages = 2;
 
-  // Per-dtype MMA atom. Canonical pick via XeMmaAtomFor<>
-  using ElementCutlass = typename at::native::xpu::ToCutlassElementType<TensorDType>::type;
-  using MmaAtom        = typename at::native::xpu::XeMmaAtomFor<ElementCutlass>::type;
-
-  // Per-dtype gmem copy-atom selection
-  using GmemTiledCopyA = std::conditional_t<
-      std::is_same_v<TensorDType, float>,
-      cute::XE_2D_U32x32x16_LD_N,
-      cute::XE_2D_U16x32x32_LD_N>;
-  using GmemTiledCopyB = std::conditional_t<
-      std::is_same_v<TensorDType, float>,
-      cute::XE_2D_U32x16x8_LD_T,
-      cute::XE_2D_U16x16x16_LD_T>;
-  using GmemTiledCopyC = cute::XE_2D_U32x8x16_LD_N;
-  using GmemTiledCopyD = std::conditional_t<
-      std::is_same_v<TensorDType, float>,
-      cute::XE_2D_U32x8x16_ST_N,
-      cute::XE_2D_U16x8x16_ST_N>;
-
   // Dispatch to the CUTLASS pointer-array grouped GEMM launcher.
   at::native::xpu::launch_group_gemm_lora_fwd<
       TensorDType,
-      MmaAtom,
       TileShape,
       ThreadLayout,
-      GmemTiledCopyA,
-      GmemTiledCopyB,
-      GmemTiledCopyC,
-      GmemTiledCopyD,
       LayoutB,
       PipelineStages>(
       queue,
@@ -264,7 +219,10 @@ void sgemm_lora_a_fwd(
 
   // Dispatch kernel based on data type
   if (weights.scalar_type() == torch::kFloat32) {
-    TORCH_CHECK(false, "Float32 is not supported. Use bfloat16 or float16.");
+    // TORCH_CHECK(false, "Float32 is not supported. Use bfloat16 or float16.");
+    launch_sgemm_lora_a_fwd<float>(
+        input_x, weights, seg_indptr_i32, weight_indices_i32, output,
+        stack_num_, max_rank, num_segments, queue);
   } else if (weights.scalar_type() == torch::kHalf) {
     launch_sgemm_lora_a_fwd<at::Half>(
         input_x, weights, seg_indptr_i32, weight_indices_i32, output,

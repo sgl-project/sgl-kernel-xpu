@@ -143,49 +143,6 @@ def _setup_fast_topk_v2(bs: int, seq_len: int, has_row_starts: bool):
     return score, lengths, row_starts
 
 
-@pytest.mark.parametrize("bs", [1, 132, 256, 4096])
-@pytest.mark.parametrize("k", [2048])  # we only support 2048 now
-@pytest.mark.parametrize("seq_len", [2048, 4096, 16384, 65536])
-@pytest.mark.parametrize("has_row_starts", [True, False])
-@torch.inference_mode()
-def test_fast_topk_v2(bs: int, k: int, seq_len: int, has_row_starts: bool) -> None:
-    score, lengths, row_starts = _setup_fast_topk_v2(bs, seq_len, has_row_starts)
-
-    indices_ref = _ref_torch_impl(score, seq_len, k, row_starts=row_starts)
-    indices_our = fast_topk_v2(score, lengths, k, row_starts=row_starts)
-
-    # sort and compare
-    indices_ref = torch.sort(indices_ref, dim=-1).values
-    indices_our = torch.sort(indices_our, dim=-1).values
-
-    # Tests can pass with max_permit_error=3, set to 5 for safety
-    assert_equal(
-        score,
-        indices_ref,
-        indices_our,
-        bs,
-        k,
-        seq_len,
-        row_starts=row_starts,
-        max_permit_error=5,
-    )
-
-
-@pytest.mark.parametrize("bs", [1, 132, 256, 4096])
-@pytest.mark.parametrize("k", [2048])  # we only support 2048 now
-@pytest.mark.parametrize("seq_len", [2048, 4096, 16384, 65536])
-@pytest.mark.parametrize("has_row_starts", [True, False])
-@torch.inference_mode()
-def test_fast_topk_v2_perf(bs: int, k: int, seq_len: int, has_row_starts: bool) -> None:
-    score, lengths, row_starts = _setup_fast_topk_v2(bs, seq_len, has_row_starts)
-
-    t_ref = _bench(lambda: _ref_torch_impl(score, seq_len, k, row_starts=row_starts))
-    t_our = _bench(lambda: fast_topk_v2(score, lengths, k, row_starts=row_starts))
-    assert (
-        t_our < t_ref
-    ), f"sycl ({t_our:.3f} ms) not faster than torch ({t_ref:.3f} ms)"
-
-
 def _setup_fast_topk_transform_fused(bs: int, seq_len: int, mode: str):
     torch.manual_seed(42)
 
@@ -220,6 +177,58 @@ def _setup_fast_topk_transform_fused(bs: int, seq_len: int, mode: str):
     src_page_table = src_page_table.unsqueeze(0).expand(bs, -1)
 
     return bs, score, lengths, row_starts, cu_seqlens_q, src_page_table
+
+
+def _setup_fast_topk_transform_ragged(bs: int, seq_len: int, has_row_starts: bool):
+    # Used in prefill only
+    torch.manual_seed(42)
+
+    stream = torch.xpu.Stream()
+    torch.xpu.set_stream(stream)
+    # bs: # of q tokens
+    score = torch.randn(
+        bs,
+        seq_len + (2048 if has_row_starts else 0),
+        dtype=torch.float32,
+        device="xpu",
+    )
+    # kv_len
+    if has_row_starts:
+        row_starts = torch.randint(0, 2048, (bs,), dtype=torch.int32, device="xpu")
+    else:
+        row_starts = None
+    lengths = torch.full((bs,), seq_len, dtype=torch.int32, device="xpu")
+    topk_indices_offset = torch.randint(0, 1024, (bs,), dtype=torch.int32, device="xpu")
+
+    return score, lengths, row_starts, topk_indices_offset
+
+
+@pytest.mark.parametrize("bs", [1, 132, 256, 4096])
+@pytest.mark.parametrize("k", [2048])  # we only support 2048 now
+@pytest.mark.parametrize("seq_len", [2048, 4096, 16384, 65536])
+@pytest.mark.parametrize("has_row_starts", [True, False])
+@torch.inference_mode()
+def test_fast_topk_v2(bs: int, k: int, seq_len: int, has_row_starts: bool) -> None:
+    score, lengths, row_starts = _setup_fast_topk_v2(bs, seq_len, has_row_starts)
+
+    indices_ref = _ref_torch_impl(score, seq_len, k, row_starts=row_starts)
+    indices_our = fast_topk_v2(score, lengths, k, row_starts=row_starts)
+
+    # sort and compare
+    indices_ref = torch.sort(indices_ref, dim=-1).values
+    indices_our = torch.sort(indices_our, dim=-1).values
+
+    # Tests can pass with max_permit_error=3, set to 5 for safety
+    assert_equal(
+        score,
+        indices_ref,
+        indices_our,
+        bs,
+        k,
+        seq_len,
+        row_starts=row_starts,
+        max_permit_error=5,
+    )
 
 
 @pytest.mark.parametrize("bs", [1, 132, 256, 4096])
@@ -267,66 +276,6 @@ def test_fast_topk_transform_fused(bs: int, k: int, seq_len: int, mode: str) -> 
 @pytest.mark.parametrize("bs", [1, 132, 256, 4096])
 @pytest.mark.parametrize("k", [2048])  # we only support 2048 now
 @pytest.mark.parametrize("seq_len", [2048, 4096, 16384, 65536])
-@pytest.mark.parametrize("mode", ["extend", "decode", "target_verify"])
-@torch.inference_mode()
-def test_fast_topk_transform_fused_perf(
-    bs: int, k: int, seq_len: int, mode: str
-) -> None:
-    bs, score, lengths, row_starts, cu_seqlens_q, src_page_table = (
-        _setup_fast_topk_transform_fused(bs, seq_len, mode)
-    )
-
-    t_ref = _bench(
-        lambda: _ref_torch_transform_decode_impl(
-            score=score,
-            seq_len=seq_len,
-            src_page_table=src_page_table,
-            topk=k,
-            row_starts=row_starts,
-        )
-    )
-    t_our = _bench(
-        lambda: fast_topk_transform_fused(
-            score=score,
-            lengths=lengths,
-            page_table_size_1=src_page_table,
-            cu_seqlens_q=cu_seqlens_q,
-            topk=k,
-            row_starts=row_starts,
-        )
-    )
-    assert (
-        t_our < t_ref
-    ), f"sycl ({t_our:.3f} ms) not faster than torch ({t_ref:.3f} ms)"
-
-
-def _setup_fast_topk_transform_ragged(bs: int, seq_len: int, has_row_starts: bool):
-    # Used in prefill only
-    torch.manual_seed(42)
-
-    stream = torch.xpu.Stream()
-    torch.xpu.set_stream(stream)
-    # bs: # of q tokens
-    score = torch.randn(
-        bs,
-        seq_len + (2048 if has_row_starts else 0),
-        dtype=torch.float32,
-        device="xpu",
-    )
-    # kv_len
-    if has_row_starts:
-        row_starts = torch.randint(0, 2048, (bs,), dtype=torch.int32, device="xpu")
-    else:
-        row_starts = None
-    lengths = torch.full((bs,), seq_len, dtype=torch.int32, device="xpu")
-    topk_indices_offset = torch.randint(0, 1024, (bs,), dtype=torch.int32, device="xpu")
-
-    return score, lengths, row_starts, topk_indices_offset
-
-
-@pytest.mark.parametrize("bs", [1, 132, 256, 4096])
-@pytest.mark.parametrize("k", [2048])  # we only support 2048 now
-@pytest.mark.parametrize("seq_len", [2048, 4096, 16384, 65536])
 @pytest.mark.parametrize("has_row_starts", [True, False])
 @torch.inference_mode()
 def test_fast_topk_transform_ragged(
@@ -368,7 +317,58 @@ def test_fast_topk_transform_ragged(
     )
 
 
-@pytest.mark.parametrize("bs", [1, 132, 256, 4096])
+@pytest.mark.parametrize("bs", [132, 256, 4096])
+@pytest.mark.parametrize("k", [2048])  # we only support 2048 now
+@pytest.mark.parametrize("seq_len", [2048, 4096, 16384, 65536])
+@pytest.mark.parametrize("has_row_starts", [True, False])
+@torch.inference_mode()
+def test_fast_topk_v2_perf(bs: int, k: int, seq_len: int, has_row_starts: bool) -> None:
+    score, lengths, row_starts = _setup_fast_topk_v2(bs, seq_len, has_row_starts)
+
+    t_ref = _bench(lambda: _ref_torch_impl(score, seq_len, k, row_starts=row_starts))
+    t_our = _bench(lambda: fast_topk_v2(score, lengths, k, row_starts=row_starts))
+    assert (
+        t_our < t_ref
+    ), f"sycl ({t_our:.3f} ms) not faster than torch ({t_ref:.3f} ms)"
+
+
+@pytest.mark.parametrize("bs", [132, 256, 4096])
+@pytest.mark.parametrize("k", [2048])  # we only support 2048 now
+@pytest.mark.parametrize("seq_len", [2048, 4096, 16384, 65536])
+@pytest.mark.parametrize("mode", ["extend", "decode", "target_verify"])
+@torch.inference_mode()
+def test_fast_topk_transform_fused_perf(
+    bs: int, k: int, seq_len: int, mode: str
+) -> None:
+    bs, score, lengths, row_starts, cu_seqlens_q, src_page_table = (
+        _setup_fast_topk_transform_fused(bs, seq_len, mode)
+    )
+
+    t_ref = _bench(
+        lambda: _ref_torch_transform_decode_impl(
+            score=score,
+            seq_len=seq_len,
+            src_page_table=src_page_table,
+            topk=k,
+            row_starts=row_starts,
+        )
+    )
+    t_our = _bench(
+        lambda: fast_topk_transform_fused(
+            score=score,
+            lengths=lengths,
+            page_table_size_1=src_page_table,
+            cu_seqlens_q=cu_seqlens_q,
+            topk=k,
+            row_starts=row_starts,
+        )
+    )
+    assert (
+        t_our < t_ref
+    ), f"sycl ({t_our:.3f} ms) not faster than torch ({t_ref:.3f} ms)"
+
+
+@pytest.mark.parametrize("bs", [132, 256, 4096])
 @pytest.mark.parametrize("k", [2048])  # we only support 2048 now
 @pytest.mark.parametrize("seq_len", [2048, 4096, 16384, 65536])
 @pytest.mark.parametrize("has_row_starts", [True, False])

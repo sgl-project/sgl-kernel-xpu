@@ -18,14 +18,6 @@ constexpr int kHistStride = kRadix + kHistPad;
 constexpr int kSmemInputBytes = 32 * 1024;  // 32 KB for ping-pong index buffer
 constexpr int kSmemInputSize = kSmemInputBytes / (2 * sizeof(int32_t));
 
-// Scalars layout in local memory
-//   [0] s_counter           -> running number of outputs already emitted
-//   [1] s_threshold_bin_id  -> threshold bin selected for the current round
-//   [2] s_num_input[0]      -> stash count for bank 0
-//   [3] s_num_input[1]      -> stash count for bank 1
-//   [4] s_last_remain       -> remaining slots in the final round
-constexpr int kNumScalars = 5;
-
 inline uint8_t convert_to_uint8(float x) {
   sycl::half h = static_cast<sycl::half>(x);
   uint16_t bits = sycl::bit_cast<uint16_t>(h);
@@ -78,15 +70,11 @@ inline void run_cumsum(sycl::nd_item<1>& item, int32_t* s_histogram_buf /* [2][k
   for (int i = 0; i < 8; ++i) {
     const int j = 1 << i;
     const int k = i & 1;
-    int32_t value = 0;
     if (tx < kRadix) {
-      value = s_histogram_buf[k * kHistStride + tx];
+      int32_t value = s_histogram_buf[k * kHistStride + tx];
       if (tx < kRadix - j) {
         value += s_histogram_buf[k * kHistStride + tx + j];
       }
-    }
-    item.barrier(sycl::access::fence_space::local_space);
-    if (tx < kRadix) {
       s_histogram_buf[(k ^ 1) * kHistStride + tx] = value;
     }
     item.barrier(sycl::access::fence_space::local_space);
@@ -98,19 +86,27 @@ inline void fast_topk_radix(
     const float* input,
     int32_t* index,
     int row_start,
-    int length,
-    int32_t* s_histogram_buf,
-    int32_t* s_scalars,
-    int32_t* s_input_idx) {
-  int topk = kTopK;
+    int length) {
+  auto g = item.get_group();
+
+  int32_t* s_histogram_buf =
+      *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[2 * kHistStride]>(g);
+  int32_t& s_counter = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t>(g);
+  int32_t& s_threshold_bin_id = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t>(g);
+  int32_t* s_num_input = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[2]>(g);
+  int32_t& s_last_remain = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t>(g);
+  int32_t& s_topk = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t>(g);
+  int32_t* s_input_idx =
+      *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[2 * kSmemInputSize]>(g);
+
   const int tx = static_cast<int>(item.get_local_id(0));
 
   if (tx < kRadix + 1) {
     s_histogram_buf[tx] = 0;
     s_histogram_buf[kHistStride + tx] = 0;
   }
-  if (tx < kNumScalars) {
-    s_scalars[tx] = 0;
+  if (tx == 0) {
+    s_topk = kTopK;
   }
   item.barrier(sycl::access::fence_space::local_space);
 
@@ -122,19 +118,23 @@ inline void fast_topk_radix(
 
   run_cumsum(item, s_histogram_buf);
 
-  if (tx < kRadix && s_histogram_buf[tx] > topk && s_histogram_buf[tx + 1] <= topk) {
-    s_scalars[1] = tx;
-    s_scalars[2] = 0;
-    s_scalars[0] = 0;
+  const int topk_cur_stage1 = s_topk;
+  if (tx < kRadix && s_histogram_buf[tx] > topk_cur_stage1 && s_histogram_buf[tx + 1] <= topk_cur_stage1) {
+    s_threshold_bin_id = tx;
+    s_num_input[0] = 0;
+    s_counter = 0;
   }
   item.barrier(sycl::access::fence_space::local_space);
 
-  int threshold_bin = s_scalars[1];
-  topk -= s_histogram_buf[threshold_bin + 1];
+  int threshold_bin = s_threshold_bin_id;
+  if (tx == 0) {
+    s_topk = s_topk - s_histogram_buf[threshold_bin + 1];
+  }
+  item.barrier(sycl::access::fence_space::local_space);
 
   const int n_iters_full = (length + kThreadsPerBlock - 1) / kThreadsPerBlock;
 
-  if (topk == 0) {
+  if (s_topk == 0) {
     for (int it = 0; it < n_iters_full; ++it) {
       const int idx = it * kThreadsPerBlock + tx;
       const bool valid = (idx < length);
@@ -143,7 +143,7 @@ inline void fast_topk_radix(
         bin = static_cast<int>(convert_to_uint8(input[idx + row_start]));
       }
       const int want = (valid && bin > threshold_bin) ? 1 : 0;
-      const int pos = wg_reserve(item, s_scalars[0], want);
+      const int pos = wg_reserve(item, s_counter, want);
       if (want) {
         index[pos] = idx;
       }
@@ -169,12 +169,12 @@ inline void fast_topk_radix(
     const int want_out = (valid && bin > threshold_bin) ? 1 : 0;
     const int want_stash = (valid && bin == threshold_bin) ? 1 : 0;
 
-    const int out_pos = wg_reserve(item, s_scalars[0], want_out);
+    const int out_pos = wg_reserve(item, s_counter, want_out);
     if (want_out) {
       index[out_pos] = idx;
     }
 
-    const int stash_pos = wg_reserve(item, s_scalars[2], want_stash);
+    const int stash_pos = wg_reserve(item, s_num_input[0], want_stash);
     if (want_stash && stash_pos < kSmemInputSize) {
       s_input_idx[0 * kSmemInputSize + stash_pos] = idx;
       const uint32_t b32 = convert_to_uint32(raw);
@@ -188,26 +188,31 @@ inline void fast_topk_radix(
   for (int round = 0; round < 4; ++round) {
     const int r_idx = round & 1;
 
-    const int raw_num = s_scalars[2 + r_idx];
+    const int raw_num = s_num_input[r_idx];
     const int num_input = (raw_num < kSmemInputSize) ? raw_num : kSmemInputSize;
 
     run_cumsum(item, s_histogram_buf);
 
-    if (tx < kRadix && s_histogram_buf[tx] > topk && s_histogram_buf[tx + 1] <= topk) {
-      s_scalars[1] = tx;
-      s_scalars[2 + (r_idx ^ 1)] = 0;
-      s_scalars[4] = topk - s_histogram_buf[tx + 1];
+    const int topk_cur = s_topk;
+    if (tx < kRadix && s_histogram_buf[tx] > topk_cur && s_histogram_buf[tx + 1] <= topk_cur) {
+      s_threshold_bin_id = tx;
+      s_num_input[r_idx ^ 1] = 0;
+      s_last_remain = topk_cur - s_histogram_buf[tx + 1];
     }
     item.barrier(sycl::access::fence_space::local_space);
 
-    threshold_bin = s_scalars[1];
-    topk -= s_histogram_buf[threshold_bin + 1];
+    threshold_bin = s_threshold_bin_id;
+    // Update s_topk (single-thread write + barrier).
+    if (tx == 0) {
+      s_topk = s_topk - s_histogram_buf[threshold_bin + 1];
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+
     const int offset = 24 - round * 8;
+    const int iter_count = (num_input + kThreadsPerBlock - 1) / kThreadsPerBlock;
 
-    const int n_iters_stash = (num_input + kThreadsPerBlock - 1) / kThreadsPerBlock;
-
-    if (topk == 0) {
-      for (int it = 0; it < n_iters_stash; ++it) {
+    if (s_topk == 0) {
+      for (int it = 0; it < iter_count; ++it) {
         const int i = it * kThreadsPerBlock + tx;
         const bool valid = (i < num_input);
         int idx = 0;
@@ -217,7 +222,7 @@ inline void fast_topk_radix(
           bin = static_cast<int>((convert_to_uint32(input[idx + row_start]) >> offset) & 0xFFu);
         }
         const int want = (valid && bin > threshold_bin) ? 1 : 0;
-        const int pos = wg_reserve(item, s_scalars[0], want);
+        const int pos = wg_reserve(item, s_counter, want);
         if (want) {
           index[pos] = idx;
         }
@@ -231,7 +236,7 @@ inline void fast_topk_radix(
     }
     item.barrier(sycl::access::fence_space::local_space);
 
-    for (int it = 0; it < n_iters_stash; ++it) {
+    for (int it = 0; it < iter_count; ++it) {
       const int i = it * kThreadsPerBlock + tx;
       const bool valid = (i < num_input);
       int idx = 0;
@@ -243,20 +248,20 @@ inline void fast_topk_radix(
         bin = static_cast<int>((convert_to_uint32(raw) >> offset) & 0xFFu);
       }
       const int want_out = (valid && bin > threshold_bin) ? 1 : 0;
-      const int out_pos = wg_reserve(item, s_scalars[0], want_out);
+      const int out_pos = wg_reserve(item, s_counter, want_out);
       if (want_out) {
         index[out_pos] = idx;
       }
 
       if (round == 3) {
         const int want_last = (valid && bin == threshold_bin) ? 1 : 0;
-        const int last_pos = wg_reserve_dec(item, s_scalars[4], want_last);
+        const int last_pos = wg_reserve_dec(item, s_last_remain, want_last);
         if (want_last && last_pos > 0) {
           index[kTopK - last_pos] = idx;
         }
       } else {
         const int want_stash = (valid && bin == threshold_bin) ? 1 : 0;
-        const int stash_pos = wg_reserve(item, s_scalars[2 + (r_idx ^ 1)], want_stash);
+        const int stash_pos = wg_reserve(item, s_num_input[r_idx ^ 1], want_stash);
         if (want_stash && stash_pos < kSmemInputSize) {
           s_input_idx[(r_idx ^ 1) * kSmemInputSize + stash_pos] = idx;
           const uint32_t b32 = convert_to_uint32(raw);
@@ -337,17 +342,9 @@ FastTopKParams get_params(
 struct FastTopKKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   FastTopKParams params;
 
-  sycl::local_accessor<int32_t, 1> s_histogram_;
-  sycl::local_accessor<int32_t, 1> s_scalars_;
-  sycl::local_accessor<int32_t, 1> s_input_idx_;
-
   explicit FastTopKKernel(const FastTopKParams& p) : params(p) {}
 
-  void sycl_ker_config_convention(sycl::handler& cgh) {
-    s_histogram_ = sycl::local_accessor<int32_t, 1>(2 * kHistStride, cgh);
-    s_scalars_ = sycl::local_accessor<int32_t, 1>(kNumScalars, cgh);
-    s_input_idx_ = sycl::local_accessor<int32_t, 1>(2 * kSmemInputSize, cgh);
-  }
+  void sycl_ker_config_convention(sycl::handler& cgh) {}
 
   [[sycl::reqd_sub_group_size(32)]] void operator()(sycl::nd_item<1> item) const {
     const int64_t bid = static_cast<int64_t>(item.get_group(0));
@@ -356,14 +353,10 @@ struct FastTopKKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     int32_t* indice = params.indices + bid * kTopK;
     const float* score = params.input + bid * params.input_stride;
 
-    int32_t* hist = s_histogram_.get_multi_ptr<sycl::access::decorated::no>().get();
-    int32_t* scalars = s_scalars_.get_multi_ptr<sycl::access::decorated::no>().get();
-    int32_t* in_idx = s_input_idx_.get_multi_ptr<sycl::access::decorated::no>().get();
-
     if (length <= kTopK) {
       naive_topk(item, indice, length);
     } else {
-      fast_topk_radix(item, score, indice, row_start, length, hist, scalars, in_idx);
+      fast_topk_radix(item, score, indice, row_start, length);
     }
   }
 };
@@ -374,18 +367,12 @@ struct FastTopKTransformFusedDecodeKernel : public __SYCL_KER_CONFIG_CONVENTION_
   const int32_t* src_page_table;
   int64_t src_stride;
 
-  sycl::local_accessor<int32_t, 1> s_histogram_;
-  sycl::local_accessor<int32_t, 1> s_scalars_;
-  sycl::local_accessor<int32_t, 1> s_input_idx_;
   sycl::local_accessor<int32_t, 1> s_indices_;
 
   FastTopKTransformFusedDecodeKernel(const FastTopKParams& p, int32_t* dst, const int32_t* src, int64_t stride)
       : params(p), dst_page_table(dst), src_page_table(src), src_stride(stride) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
-    s_histogram_ = sycl::local_accessor<int32_t, 1>(2 * kHistStride, cgh);
-    s_scalars_ = sycl::local_accessor<int32_t, 1>(kNumScalars, cgh);
-    s_input_idx_ = sycl::local_accessor<int32_t, 1>(2 * kSmemInputSize, cgh);
     s_indices_ = sycl::local_accessor<int32_t, 1>(kTopK, cgh);
   }
 
@@ -402,12 +389,9 @@ struct FastTopKTransformFusedDecodeKernel : public __SYCL_KER_CONFIG_CONVENTION_
       return;
     }
 
-    int32_t* hist = s_histogram_.get_multi_ptr<sycl::access::decorated::no>().get();
-    int32_t* scalars = s_scalars_.get_multi_ptr<sycl::access::decorated::no>().get();
-    int32_t* in_idx = s_input_idx_.get_multi_ptr<sycl::access::decorated::no>().get();
     int32_t* s_idx = s_indices_.get_multi_ptr<sycl::access::decorated::no>().get();
 
-    fast_topk_radix(item, score, s_idx, /*row_start=*/0, length, hist, scalars, in_idx);
+    fast_topk_radix(item, score, s_idx, /*row_start=*/0, length);
 
     static_assert(kTopK == 2 * kThreadsPerBlock, "kTopK must be 2 * kThreadsPerBlock");
     const int i0 = tid;
@@ -427,9 +411,6 @@ struct FastTopKTransformFusedPrefillKernel : public __SYCL_KER_CONFIG_CONVENTION
   const int32_t* cu_seqlens_q;
   int64_t prefill_bs;
 
-  sycl::local_accessor<int32_t, 1> s_histogram_;
-  sycl::local_accessor<int32_t, 1> s_scalars_;
-  sycl::local_accessor<int32_t, 1> s_input_idx_;
   sycl::local_accessor<int32_t, 1> s_indices_;
   sycl::local_accessor<int32_t, 1> s_src_row_;  // [1] selected src row id
 
@@ -438,9 +419,6 @@ struct FastTopKTransformFusedPrefillKernel : public __SYCL_KER_CONFIG_CONVENTION
       : params(p), dst_page_table(dst), src_page_table(src), src_stride(stride), cu_seqlens_q(cu_q), prefill_bs(pbs) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
-    s_histogram_ = sycl::local_accessor<int32_t, 1>(2 * kHistStride, cgh);
-    s_scalars_ = sycl::local_accessor<int32_t, 1>(kNumScalars, cgh);
-    s_input_idx_ = sycl::local_accessor<int32_t, 1>(2 * kSmemInputSize, cgh);
     s_indices_ = sycl::local_accessor<int32_t, 1>(kTopK, cgh);
     s_src_row_ = sycl::local_accessor<int32_t, 1>(1, cgh);
   }
@@ -482,12 +460,9 @@ struct FastTopKTransformFusedPrefillKernel : public __SYCL_KER_CONFIG_CONVENTION
       return;
     }
 
-    int32_t* hist = s_histogram_.get_multi_ptr<sycl::access::decorated::no>().get();
-    int32_t* scalars = s_scalars_.get_multi_ptr<sycl::access::decorated::no>().get();
-    int32_t* in_idx = s_input_idx_.get_multi_ptr<sycl::access::decorated::no>().get();
     int32_t* s_idx = s_indices_.get_multi_ptr<sycl::access::decorated::no>().get();
 
-    fast_topk_radix(item, score, s_idx, row_start, length, hist, scalars, in_idx);
+    fast_topk_radix(item, score, s_idx, row_start, length);
 
     static_assert(kTopK == 2 * kThreadsPerBlock, "kTopK must be 2 * kThreadsPerBlock");
     const int i0 = tid;
@@ -504,18 +479,12 @@ struct FastTopKTransformRaggedFusedKernel : public __SYCL_KER_CONFIG_CONVENTION_
   int32_t* topk_indices_ragged;
   const int32_t* topk_indices_offset;
 
-  sycl::local_accessor<int32_t, 1> s_histogram_;
-  sycl::local_accessor<int32_t, 1> s_scalars_;
-  sycl::local_accessor<int32_t, 1> s_input_idx_;
   sycl::local_accessor<int32_t, 1> s_indices_;
 
   FastTopKTransformRaggedFusedKernel(const FastTopKParams& p, int32_t* out, const int32_t* off)
       : params(p), topk_indices_ragged(out), topk_indices_offset(off) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
-    s_histogram_ = sycl::local_accessor<int32_t, 1>(2 * kHistStride, cgh);
-    s_scalars_ = sycl::local_accessor<int32_t, 1>(kNumScalars, cgh);
-    s_input_idx_ = sycl::local_accessor<int32_t, 1>(2 * kSmemInputSize, cgh);
     s_indices_ = sycl::local_accessor<int32_t, 1>(kTopK, cgh);
   }
 
@@ -533,12 +502,9 @@ struct FastTopKTransformRaggedFusedKernel : public __SYCL_KER_CONFIG_CONVENTION_
       return;
     }
 
-    int32_t* hist = s_histogram_.get_multi_ptr<sycl::access::decorated::no>().get();
-    int32_t* scalars = s_scalars_.get_multi_ptr<sycl::access::decorated::no>().get();
-    int32_t* in_idx = s_input_idx_.get_multi_ptr<sycl::access::decorated::no>().get();
     int32_t* s_idx = s_indices_.get_multi_ptr<sycl::access::decorated::no>().get();
 
-    fast_topk_radix(item, score, s_idx, row_start, length, hist, scalars, in_idx);
+    fast_topk_radix(item, score, s_idx, row_start, length);
 
     static_assert(kTopK == 2 * kThreadsPerBlock, "kTopK must be 2 * kThreadsPerBlock");
     const int i0 = tid;

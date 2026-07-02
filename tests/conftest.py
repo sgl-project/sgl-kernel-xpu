@@ -20,6 +20,10 @@ def reset_torch_defaults():
 # subsequent tests to fail with UR_RESULT_ERROR_OUT_OF_RESOURCES.
 @pytest.fixture(autouse=True)
 def clear_xpu_cache():
+    if torch.xpu.is_available():
+        torch.xpu.synchronize()
+        torch.xpu.empty_cache()
     yield
     if torch.xpu.is_available():
+        torch.xpu.synchronize()
         torch.xpu.empty_cache()

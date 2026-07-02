@@ -74,6 +74,51 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
   using SubgroupLayoutQK =
       cute::Layout<cute::Shape<cute::Int<@NUM_SG@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
 
+  if (params.is_e4m3) {
+    // FP8 KV cache: Q is bf16 or fp16, K/V cache are fp8 (e4m3). The mainloop
+    // dequantizes K/V with the per-tensor k_scale/v_scale (Fp8KV path).
+    TORCH_CHECK(
+        !use_sink, "fp8 KV cache prefill does not support sink logits");
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+        if (params.is_bf16) {
+          FMHAConfig<
+              Causal,
+              LocalMask,
+              false,
+              TileShapeQK,
+              TileShapePV,
+              TileShapeOutput,
+              SubgroupLayoutQK,
+              void,
+              2,
+              false,
+              cutlass::bfloat16_t,
+              cutlass::float_e4m3_t,
+              cutlass::float_e4m3_t,
+              cutlass::bfloat16_t>::run_paged(params);
+        } else {
+          FMHAConfig<
+              Causal,
+              LocalMask,
+              false,
+              TileShapeQK,
+              TileShapePV,
+              TileShapeOutput,
+              SubgroupLayoutQK,
+              void,
+              2,
+              false,
+              cutlass::half_t,
+              cutlass::float_e4m3_t,
+              cutlass::float_e4m3_t,
+              cutlass::half_t>::run_paged(params);
+        }
+      });
+    });
+    return;
+  }
+
 #if @HEAD_DIM@ == 64
   AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {

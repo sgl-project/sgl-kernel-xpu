@@ -38,6 +38,35 @@
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_prefill_dispatch.hpp"
 
+namespace {
+
+const float*
+get_per_tensor_descale_ptr(const at::Tensor& descale, const at::Tensor& q, const char* name, const char* context) {
+  TORCH_CHECK(descale.scalar_type() == at::ScalarType::Float, name, " must be float32");
+  TORCH_CHECK(
+      descale.device() == q.device(), context, " reads ", name, " on-device: it must be on the same device as q");
+  TORCH_CHECK(descale.numel() > 0, name, " must not be empty");
+  bool is_scalar_or_expanded_scalar = descale.numel() == 1;
+  if (!is_scalar_or_expanded_scalar) {
+    is_scalar_or_expanded_scalar = true;
+    for (int64_t dim = 0; dim < descale.dim(); ++dim) {
+      if (descale.size(dim) > 1 && descale.stride(dim) != 0) {
+        is_scalar_or_expanded_scalar = false;
+        break;
+      }
+    }
+  }
+  TORCH_CHECK(
+      is_scalar_or_expanded_scalar,
+      context,
+      " uses a per-tensor descale: ",
+      name,
+      " must be a scalar or a view expanded from a single scalar element");
+  return descale.data_ptr<float>();
+}
+
+}  // namespace
+
 namespace decode {
 
 // Non-paged (contiguous ragged KV) decode entry. Dedicated decode path: it
@@ -276,8 +305,19 @@ std::vector<at::Tensor> mha_fwd(
       "mha_fwd only supports Half and BFloat16, got",
       q_type);
 
-  TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
-  TORCH_CHECK(v.scalar_type() == q_type, "query and value must have the same dtype");
+  // FP8 KV cache: Q stays bf16/fp16 while K/V cache may be fp8 (e4m3). The
+  // decode mainloop dequantizes K/V with per-tensor k_descale/v_descale. When
+  // launched as the decode sub-kernel of a pure-prefill chunkprefill batch the
+  // descale pointers are still forwarded; the kernel simply skips every batch.
+  bool const is_fp8_kv = k.scalar_type() == at::ScalarType::Float8_e4m3fn;
+  if (is_fp8_kv) {
+    TORCH_CHECK(
+        v.scalar_type() == at::ScalarType::Float8_e4m3fn,
+        "fp8 KV cache requires key and value to both be float8_e4m3fn");
+  } else {
+    TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
+    TORCH_CHECK(v.scalar_type() == q_type, "query and value must have the same dtype");
+  }
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(v);
@@ -498,6 +538,18 @@ std::vector<at::Tensor> mha_fwd(
   }
 
   params.softcap = softcap;
+
+  // FP8 KV cache descale wiring. K/V are stored as e4m3 and dequantized in the
+  // decode mainloop by a single per-tensor scale (k_descale/v_descale, float32).
+  params.is_e4m3 = is_fp8_kv;
+  if (is_fp8_kv) {
+    TORCH_CHECK(
+        k_descale_.has_value() && v_descale_.has_value(), "fp8 KV cache decode requires k_descale and v_descale");
+    // Per-tensor dequant: the kernel only dereferences one float, so accept a
+    // true scalar or a tensor whose elements are all the same repeated value.
+    params.k_scale_ptr = get_per_tensor_descale_ptr(k_descale_.value(), q, "k_descale", "fp8 KV cache decode");
+    params.v_scale_ptr = get_per_tensor_descale_ptr(v_descale_.value(), q, "v_descale", "fp8 KV cache decode");
+  }
 
   // Set this to probability of keeping an element to simplify things.
   params.p_dropout = 1.f;
@@ -830,8 +882,19 @@ std::vector<at::Tensor> mha_fwd(
       "mha_fwd only supports Half and BFloat16, got",
       q_type);
 
-  TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
-  TORCH_CHECK(v.scalar_type() == q_type, "query and value must have the same dtype");
+  // FP8 KV cache: Q stays bf16/fp16 while K/V cache may be fp8 (e4m3). In that
+  // case per-tensor k_descale/v_descale must be supplied. Otherwise K/V must
+  // match the Q dtype.
+  bool const is_fp8_kv = k.scalar_type() == at::ScalarType::Float8_e4m3fn;
+  if (is_fp8_kv) {
+    TORCH_CHECK(
+        v.scalar_type() == at::ScalarType::Float8_e4m3fn,
+        "fp8 KV cache requires key and value to both be float8_e4m3fn");
+    TORCH_CHECK(k_descale_.has_value() && v_descale_.has_value(), "fp8 KV cache requires k_descale and v_descale");
+  } else {
+    TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
+    TORCH_CHECK(v.scalar_type() == q_type, "query and value must have the same dtype");
+  }
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(v);
@@ -982,6 +1045,17 @@ std::vector<at::Tensor> mha_fwd(
   }
 
   params.softcap = softcap;
+
+  // FP8 KV cache: flag the kernel dispatch so the fp8 mainloop is selected.
+  params.is_e4m3 = is_fp8_kv;
+  if (is_fp8_kv) {
+    TORCH_CHECK(
+        k_descale_.has_value() && v_descale_.has_value(), "fp8 KV cache prefill requires k_descale and v_descale");
+    // Per-tensor dequant: the kernel only dereferences one float, so accept a
+    // true scalar or a tensor whose elements are all the same repeated value.
+    params.k_scale_ptr = get_per_tensor_descale_ptr(k_descale_.value(), q, "k_descale", "fp8 KV cache prefill");
+    params.v_scale_ptr = get_per_tensor_descale_ptr(v_descale_.value(), q, "v_descale", "fp8 KV cache prefill");
+  }
 
   // Set this to probability of keeping an element to simplify things.
   params.p_dropout = 1.f;
@@ -1152,8 +1226,8 @@ std::vector<at::Tensor> mha_fwd(
   // sub-kernels only consume it inside the ``rotary_cos_.has_value()`` branch.
   TORCH_CHECK(
       !q_v_.has_value() && !rotary_cos_.has_value() && !rotary_sin_.has_value() && !q_descale_.has_value() &&
-          !k_descale_.has_value() && !v_descale_.has_value() && !scheduler_metadata_.has_value(),
-      "chunkprefill two-launch path does not yet support q_v / rotary / descale / scheduler_metadata.");
+          !scheduler_metadata_.has_value(),
+      "chunkprefill two-launch path does not yet support q_v / rotary / q_descale / scheduler_metadata.");
   TORCH_CHECK(cu_seqlens_q.scalar_type() == at::kInt, "cu_seqlens_q must be int32.");
   // Pre-allocated out requires paged KV: on the non-paged path zero-KV-length
   // rows are never written by the kernel, so a caller buffer would retain stale

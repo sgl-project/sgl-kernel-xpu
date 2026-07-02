@@ -1475,6 +1475,7 @@ def test_flash_attn_decode_kvcache(
 @pytest.mark.parametrize("page_size", [64, 128])
 @pytest.mark.parametrize("seqlen_q", [1, 32, 64])
 @pytest.mark.parametrize("seqlen_k", [256, 512])
+@pytest.mark.parametrize("descale_layout", ["scalar", "expanded"])
 def test_flash_attn_fp8_kvcache(
     seqlen_k,
     seqlen_q,
@@ -1484,6 +1485,7 @@ def test_flash_attn_fp8_kvcache(
     nheads_kv,
     q_dtype,
     causal,
+    descale_layout,
 ):
     """Attention with an fp8 (e4m3) paged KV cache.
 
@@ -1513,14 +1515,20 @@ def test_flash_attn_fp8_kvcache(
     k_cache = (k_ref_f / k_descale_val).to(torch.float8_e4m3fn)
     v_cache = (v_ref_f / v_descale_val).to(torch.float8_e4m3fn)
 
-    # Single per-tensor descale scalar. The kernel consumes one float for the
-    # whole K/V cache (host reads element 0), so pass a 1-element tensor.
-    k_descale = torch.tensor([k_descale_val], dtype=torch.float32, device=device)
-    v_descale = torch.tensor([v_descale_val], dtype=torch.float32, device=device)
+    # The kernel consumes one float for the whole K/V cache. Cover both a true
+    # scalar tensor and a single-element view expanded to (batch, h_kv).
+    k_descale_scalar = torch.tensor([k_descale_val], dtype=torch.float32, device=device)
+    v_descale_scalar = torch.tensor([v_descale_val], dtype=torch.float32, device=device)
+    if descale_layout == "scalar":
+        k_descale = k_descale_scalar
+        v_descale = v_descale_scalar
+    else:
+        k_descale = k_descale_scalar.expand(batch_size, nheads_kv)
+        v_descale = v_descale_scalar.expand(batch_size, nheads_kv)
 
     # attention_ref applies the descale per (b, h_kv); broadcast the scalar.
-    k_descale_ref = k_descale.expand(batch_size, nheads_kv).contiguous()
-    v_descale_ref = v_descale.expand(batch_size, nheads_kv).contiguous()
+    k_descale_ref = k_descale_scalar.expand(batch_size, nheads_kv).contiguous()
+    v_descale_ref = v_descale_scalar.expand(batch_size, nheads_kv).contiguous()
 
     # Build a paged KV cache: one contiguous run of blocks per sequence.
     num_blocks_per_seq = seqlen_k // page_size
@@ -1571,8 +1579,12 @@ def test_flash_attn_fp8_kvcache(
     out_ref = out_ref.float()
     max_diff = (out - out_ref).abs().max().item()
     mean_diff = (out - out_ref).abs().mean().item()
-    print(f"fp8 kvcache (seqlen_q={seqlen_q}) max diff: {max_diff}")
-    print(f"fp8 kvcache (seqlen_q={seqlen_q}) mean diff: {mean_diff}")
+    print(
+        f"fp8 kvcache (seqlen_q={seqlen_q}, descale_layout={descale_layout}) max diff: {max_diff}"
+    )
+    print(
+        f"fp8 kvcache (seqlen_q={seqlen_q}, descale_layout={descale_layout}) mean diff: {mean_diff}"
+    )
     assert max_diff <= 1e-1
     assert mean_diff <= 2e-2
 

@@ -84,7 +84,7 @@ def test_transfer_kv(
 
     original_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
-    device = device
+
     torch.manual_seed(42)
 
     num_layers = 4  # A small number of layers for pool creation
@@ -318,7 +318,7 @@ def test_transfer_kv_pf_direct(
 ):
     original_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
-    device = device
+
     torch.manual_seed(42)
 
     num_layers = 4
@@ -532,7 +532,7 @@ def test_transfer_kv_page_head(
 ):
     original_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
-    device = device
+
     torch.manual_seed(42)
 
     num_layers = 4

@@ -57,6 +57,17 @@ from sgl_kernel.gemm import (
     sgl_per_token_quant_fp8,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
+from sgl_kernel.kvcacheio import (
+    transfer_kv_all_layer,
+    transfer_kv_all_layer_direct_lf_pf,
+    transfer_kv_all_layer_lf_ph,
+    transfer_kv_all_layer_mla,
+    transfer_kv_direct,
+    transfer_kv_per_layer,
+    transfer_kv_per_layer_direct_pf_lf,
+    transfer_kv_per_layer_mla,
+    transfer_kv_per_layer_ph_lf,
+)
 from sgl_kernel.lora import embedding_lora_a_fwd
 from sgl_kernel.memory import weak_ref_tensor
 from sgl_kernel.mhc import (

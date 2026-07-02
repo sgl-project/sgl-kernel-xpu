@@ -218,7 +218,7 @@ def _make_inputs(
     }
 
 
-def _run_sgl_once(args: Dict[str, Any]):
+def _run_cutlass_once(args: Dict[str, Any]):
     return sgemm_lora_a_fwd(
         input_x=args["input_x"],
         weights=args["weights"],
@@ -280,6 +280,22 @@ def _run_triton_once(args: Dict[str, Any]):
     return output
 
 
+# fp32 tensors are 2x the bytes of fp16/bf16, and the CUTLASS kernel runs fp32 via a
+# 3xTF32 decomposition that needs extra scratch. The largest cases exceed device
+# memory in fp32, so cap num_tokens for that dtype only (fp16/bf16 run full size).
+FP32_MAX_TOKENS = 16384
+
+
+def _scale_case_for_dtype(case: Dict[str, int], dtype: torch.dtype) -> Dict[str, int]:
+    if dtype != torch.float32 or case["num_tokens"] <= FP32_MAX_TOKENS:
+        return case
+    scaled = dict(case)
+    scaled["num_tokens"] = FP32_MAX_TOKENS
+    # Keep segments no larger than the token count.
+    scaled["num_segments"] = min(case["num_segments"], FP32_MAX_TOKENS)
+    return scaled
+
+
 def _dtype_from_provider(provider: str) -> torch.dtype:
     if provider == "fp16":
         return torch.float16
@@ -305,25 +321,31 @@ CASES = DEFAULT_CASES
         x_log=False,
         line_arg="provider",
         line_vals=[
-            "sgl_fp16",
+            "cutlass_fp16",
             "triton_fp16",
-            "sgl_bf16",
+            "cutlass_bf16",
             "triton_bf16",
+            "cutlass_fp32",
+            "triton_fp32",
         ],
         line_names=[
-            "SGL fp16",
+            "CUTLASS fp16",
             "Triton fp16",
-            "SGL bf16",
+            "CUTLASS bf16",
             "Triton bf16",
+            "CUTLASS fp32",
+            "Triton fp32",
         ],
         styles=[
             ("green", "-"),
             ("green", "--"),
             ("blue", "-"),
             ("blue", "--"),
+            ("orange", "-"),
+            ("orange", "--"),
         ],
         ylabel="TFLOP/s",
-        plot_name="sgemm-lora-a-fwd-sgl-vs-triton",
+        plot_name="sgemm-lora-a-fwd-cutlass-vs-triton",
         args={},
     )
 )
@@ -332,7 +354,7 @@ def benchmark(case_id, provider):
     backend, dtype_name = provider.split("_", 1)
     dtype = _dtype_from_provider(dtype_name)
 
-    case = CASES[case_id]
+    case = _scale_case_for_dtype(CASES[case_id], dtype)
     inputs = _make_inputs(case, dtype, device)
 
     K = case["input_dim"]
@@ -350,8 +372,8 @@ def benchmark(case_id, provider):
     quantiles = [0.5, 0.2, 0.8]
     bench_res = triton.testing.do_bench(
         (
-            (lambda: _run_sgl_once(inputs))
-            if backend == "sgl"
+            (lambda: _run_cutlass_once(inputs))
+            if backend == "cutlass"
             else (lambda: _run_triton_once(inputs))
         ),
         quantiles=quantiles,
@@ -369,9 +391,9 @@ def benchmark(case_id, provider):
             "provider": provider,
             "backend": backend,
             "dtype": str(dtype),
-            "time_us": 1e3 * ms,
-            "time_min_us": 1e3 * min_ms,
-            "time_max_us": 1e3 * max_ms,
+            "time_ms": ms,
+            "time_min_ms": min_ms,
+            "time_max_ms": max_ms,
             "tflops": metrics["tflops"],
             "bandwidth_gbs": metrics["bandwidth_gbs"],
             "total_bytes_mb": metrics["total_bytes_mb"],
@@ -393,14 +415,14 @@ def _sanity_check() -> None:
     device = torch.device("xpu")
     case = DEFAULT_CASES[0]
     args = _make_inputs(case, torch.float16, device)
-    out = _run_sgl_once(args)
+    out = _run_cutlass_once(args)
     out_triton = _run_triton_once(args)
 
     total_n = case["stack_num"] * case["max_rank"]
     expected = (case["num_tokens"], total_n)
     if tuple(out.shape) != expected:
         raise RuntimeError(
-            f"Unexpected SGL output shape: got {tuple(out.shape)}, expected {expected}"
+            f"Unexpected CUTLASS output shape: got {tuple(out.shape)}, expected {expected}"
         )
     if tuple(out_triton.shape) != expected:
         raise RuntimeError(
@@ -410,7 +432,7 @@ def _sanity_check() -> None:
     diff = (out.float() - out_triton.float()).abs()
     max_abs = diff.max().item()
     print(
-        f"Sanity check passed: shapes OK, max |SGL - Triton| = {max_abs:.4e} "
+        f"Sanity check passed: shapes OK, max |CUTLASS - Triton| = {max_abs:.4e} "
         f"(fp16, K={case['input_dim']})."
     )
 
@@ -426,7 +448,7 @@ def print_summary(title: str = "SGEMM LoRA-A Forward Benchmark Results"):
 
     df = pd.DataFrame(all_results)
 
-    for col in ["time_us", "tflops", "bandwidth_gbs", "total_bytes_mb"]:
+    for col in ["time_ms", "tflops", "bandwidth_gbs", "total_bytes_mb"]:
         if col in df.columns:
             df[col] = df[col].round(2)
 
@@ -436,7 +458,7 @@ def print_summary(title: str = "SGEMM LoRA-A Forward Benchmark Results"):
             "case_id",
             "case_label",
             "provider",
-            "time_us",
+            "time_ms",
             "tflops",
             "bandwidth_gbs",
         ]
@@ -450,7 +472,7 @@ def print_summary(title: str = "SGEMM LoRA-A Forward Benchmark Results"):
         print("\n" + "=" * 120)
         print("Summary Statistics by Provider")
         print("=" * 120)
-        summary = df.groupby("provider")[["tflops", "bandwidth_gbs", "time_us"]].agg(
+        summary = df.groupby("provider")[["tflops", "bandwidth_gbs", "time_ms"]].agg(
             ["mean", "min", "max", "std"]
         )
         print(summary.to_string())

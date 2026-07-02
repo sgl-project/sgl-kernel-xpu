@@ -13,15 +13,13 @@ def _tolerances(dtype: torch.dtype, k: int = 0):
     if dtype == torch.bfloat16:
         return 2e-2, 2e-2
     if dtype == torch.float32:
-        # fp32 flows through the XMX DPAS, which has no true-fp32 path: each
-        # operand is truncated to TF32 (10-bit mantissa) before the multiply.
-        # Unlike the fp16/bf16 tests -- where the reference starts from the same
-        # low-precision operands -- the fp32 reference multiplies full-precision
-        # values, so the kernel's TF32 input-truncation error (~2^-11 per term)
-        # is entirely uncanceled and accumulates as ~sqrt(K) over the reduction.
-        # Scale the tolerance with sqrt(K) to track that growth.
-        scale = math.sqrt(max(1.0, k / 512.0))
-        return 4e-2 * scale, 4e-2 * scale
+        # fp32 runs through the 3xTF32 emulation path (three chained TF32 GEMMs
+        # accumulating the high/low cross-terms), which recovers ~22-bit
+        # effective mantissa -- essentially fp32. A small K-scaled term absorbs
+        # the residual dropped a_lo*b_lo contribution, which grows slowly with
+        # the reduction length.
+        atol = 1e-3 + 1e-4 * math.sqrt(max(1.0, k / 512.0))
+        return 1e-3, atol
     return 1e-5, 1e-5
 
 

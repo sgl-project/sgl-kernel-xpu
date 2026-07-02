@@ -66,11 +66,10 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
 #if @EMIT_PAGED@
   using TileShapeQK = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_KV@>, cute::_32>;
   using TileShapePV = cute::Shape<cute::Int<@TILED_Q@>, cute::_32, cute::Int<@TILED_KV@>>;
-  // Round the head-dim of the output tile up to a multiple of get<1>(TileShapePV) (32) so that
-  // VTiles = get<1>(TileShapeOutput) / get<1>(TileShapePV) covers the full head dimension when
-  // HEAD_DIM is not a multiple of 32 (e.g. HEAD_DIM=72 -> 96, VTiles=3). The actual O surface is
-  // bounded by head_size_vo, so HW clips the OOB tail writes in the epilogue.
-  using TileShapeOutput = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;
+  // Use the configured output tile head extent. CMake sets @TILED_OUT@ to a
+  // default rounded head size, and may override specific head dims (e.g. 512)
+  // to improve occupancy by splitting the output tile across V.
+  using TileShapeOutput = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_OUT@>>;
   using SubgroupLayoutQK =
       cute::Layout<cute::Shape<cute::Int<@NUM_SG@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
 

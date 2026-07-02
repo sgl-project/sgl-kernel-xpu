@@ -239,7 +239,7 @@ class FMHAFwdEpilogue {
         //  (O = scale_v * (P @ V_fp8) / sum), avoiding a per-element V scale in the
         //  mainloop GEMM2.
         if constexpr (CollectiveMainloop::Fp8KV) {
-          outv *= ElementA(v_scale);
+          outv *= ElementA(scale_v);
         }
         tOrO(j) = static_cast<ElementO>(outv);
       }
@@ -259,7 +259,7 @@ class FMHAFwdEpilogue {
           rA_sum(i) = ElementA(1) / rA_sum(i);
         }
         if constexpr (CollectiveMainloop::Fp8KV) {
-          rA_sum(i) *= ElementA(v_scale);
+          rA_sum(i) *= ElementA(scale_v);
         }
       }
 
@@ -483,12 +483,13 @@ class DecodeFwdEpilogue {
 
   template <typename QVCoord>
   CUTLASS_DEVICE void operator()(
-      TensorO2D const& O,  // Global O tensor: (q,v)
-      FragA& tArA,         // O accumulator:   (q,v)
-      FragARow& tA_max,    // Softmax row-wise max accumulator
-      FragARow& tA_sum,    // Softmax row-wise sum accumulator
-      QVCoord blk_qv,      // WG tile indices: (q,v)
-      int thr_id) {        // Work-item ID
+      TensorO2D const& O,      // Global O tensor: (q,v)
+      FragA& tArA,             // O accumulator:   (q,v)
+      FragARow& tA_max,        // Softmax row-wise max accumulator
+      FragARow& tA_sum,        // Softmax row-wise sum accumulator
+      QVCoord blk_qv,          // WG tile indices: (q,v)
+      int thr_id,              // Work-item ID
+      float scale_v = 1.0f) {  // Per-tensor V dequant scale (fp8 path)
 
     using namespace cute;
     using ElementA = typename FragA::element_type;
@@ -501,13 +502,19 @@ class DecodeFwdEpilogue {
 
     /* Complete softmax, dividing out sums. Rows whose denominator is exactly
        zero attend to no (unmasked) keys -- e.g. a batch with zero KV length --
-       so emit 0 instead of NaN to match the reference implementation. */
+       so emit 0 instead of NaN to match the reference implementation..
+       FP8 KV cache: the per-tensor V dequant scale (O = scale_v * (P @ V_fp8) /
+       sum) is folded into the 1/rA_sum reciprocal, so the output is scaled in
+       the same multiply that normalizes it instead of a separate pass. */
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < rA_sum.size(); i++) {
       if constexpr (CollectiveMainloop::LocalMask || CollectiveMainloop::CausalMask) {
         rA_sum(i) = safe_recip(rA_sum(i));
       } else {
         rA_sum(i) = ElementA(1) / rA_sum(i);
+      }
+      if constexpr (CollectiveMainloop::Fp8KV) {
+        rA_sum(i) *= ElementA(scale_v);
       }
     }
 

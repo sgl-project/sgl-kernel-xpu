@@ -204,18 +204,12 @@ def benchmark(
             v_descale_val = v_cache.abs().max().item() / e4m3_max
             k_cache = (k_cache / k_descale_val).to(torch.float8_e4m3fn)
             v_cache = (v_cache / v_descale_val).to(torch.float8_e4m3fn)
-            k_descale = torch.full(
-                (batch_size, num_heads_kv),
-                k_descale_val,
-                dtype=torch.float32,
-                device=device,
-            )
-            v_descale = torch.full(
-                (batch_size, num_heads_kv),
-                v_descale_val,
-                dtype=torch.float32,
-                device=device,
-            )
+            k_descale = torch.tensor(
+                k_descale_val, dtype=torch.float32, device=device
+            ).expand(batch_size, num_heads_kv)
+            v_descale = torch.tensor(
+                v_descale_val, dtype=torch.float32, device=device
+            ).expand(batch_size, num_heads_kv)
         page_table = (
             torch.randperm(num_pages, device=device, dtype=torch.int32)
             .reshape(batch_size, -1)

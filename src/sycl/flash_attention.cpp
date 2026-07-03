@@ -41,10 +41,14 @@
 namespace {
 
 const float*
-get_per_tensor_descale_ptr(const at::Tensor& descale, const at::Tensor& q, const char* name, const char* context) {
+get_per_tensor_descale_ptr(const at::Tensor& descale, const at::Tensor& ref, const char* name, const char* context) {
   TORCH_CHECK(descale.scalar_type() == at::ScalarType::Float, name, " must be float32");
   TORCH_CHECK(
-      descale.device() == q.device(), context, " reads ", name, " on-device: it must be on the same device as q");
+      descale.device() == ref.device(),
+      context,
+      " reads ",
+      name,
+      " on-device: it must be on the same device as the tensor it descales");
   TORCH_CHECK(descale.numel() > 0, name, " must not be empty");
   bool is_scalar_or_expanded_scalar = descale.numel() == 1;
   if (!is_scalar_or_expanded_scalar) {
@@ -305,15 +309,18 @@ std::vector<at::Tensor> mha_fwd(
       "mha_fwd only supports Half and BFloat16, got",
       q_type);
 
-  // FP8 KV cache: Q stays bf16/fp16 while K/V cache may be fp8 (e4m3). The
-  // decode mainloop dequantizes K/V with per-tensor k_descale/v_descale. When
-  // launched as the decode sub-kernel of a pure-prefill chunkprefill batch the
-  // descale pointers are still forwarded; the kernel simply skips every batch.
-  bool const is_fp8_kv = k.scalar_type() == at::ScalarType::Float8_e4m3fn;
+  // FP8 KV cache: Q stays bf16/fp16 while K/V cache may be fp8 (e4m3 or e5m2).
+  // The decode mainloop dequantizes K/V with per-tensor k_descale/v_descale.
+  // When launched as the decode sub-kernel of a pure-prefill chunkprefill batch
+  // the descale pointers are still forwarded; the kernel simply skips every
+  // batch.
+  bool const is_e4m3_kv = k.scalar_type() == at::ScalarType::Float8_e4m3fn;
+  bool const is_e5m2_kv = k.scalar_type() == at::ScalarType::Float8_e5m2;
+  bool const is_fp8_kv = is_e4m3_kv || is_e5m2_kv;
   if (is_fp8_kv) {
     TORCH_CHECK(
-        v.scalar_type() == at::ScalarType::Float8_e4m3fn,
-        "fp8 KV cache requires key and value to both be float8_e4m3fn");
+        v.scalar_type() == k.scalar_type(),
+        "fp8 KV cache requires key and value to have the same fp8 dtype (both float8_e4m3fn or both float8_e5m2)");
   } else {
     TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
     TORCH_CHECK(v.scalar_type() == q_type, "query and value must have the same dtype");
@@ -539,16 +546,18 @@ std::vector<at::Tensor> mha_fwd(
 
   params.softcap = softcap;
 
-  // FP8 KV cache descale wiring. K/V are stored as e4m3 and dequantized in the
-  // decode mainloop by a single per-tensor scale (k_descale/v_descale, float32).
-  params.is_e4m3 = is_fp8_kv;
+  // FP8 KV cache descale wiring. K/V are stored as fp8 (e4m3 or e5m2) and
+  // dequantized in the decode mainloop by a single per-tensor scale
+  // (k_descale/v_descale, float32).
+  params.is_e4m3 = is_e4m3_kv;
+  params.is_e5m2 = is_e5m2_kv;
   if (is_fp8_kv) {
     TORCH_CHECK(
         k_descale_.has_value() && v_descale_.has_value(), "fp8 KV cache decode requires k_descale and v_descale");
     // Per-tensor dequant: the kernel only dereferences one float, so accept a
     // true scalar or a tensor whose elements are all the same repeated value.
-    params.k_scale_ptr = get_per_tensor_descale_ptr(k_descale_.value(), q, "k_descale", "fp8 KV cache decode");
-    params.v_scale_ptr = get_per_tensor_descale_ptr(v_descale_.value(), q, "v_descale", "fp8 KV cache decode");
+    params.k_scale_ptr = get_per_tensor_descale_ptr(k_descale_.value(), k, "k_descale", "fp8 KV cache decode");
+    params.v_scale_ptr = get_per_tensor_descale_ptr(v_descale_.value(), v, "v_descale", "fp8 KV cache decode");
   }
 
   // Set this to probability of keeping an element to simplify things.
@@ -882,14 +891,16 @@ std::vector<at::Tensor> mha_fwd(
       "mha_fwd only supports Half and BFloat16, got",
       q_type);
 
-  // FP8 KV cache: Q stays bf16/fp16 while K/V cache may be fp8 (e4m3). In that
-  // case per-tensor k_descale/v_descale must be supplied. Otherwise K/V must
-  // match the Q dtype.
-  bool const is_fp8_kv = k.scalar_type() == at::ScalarType::Float8_e4m3fn;
+  // FP8 KV cache: Q stays bf16/fp16 while K/V cache may be fp8 (e4m3 or e5m2).
+  // In that case per-tensor k_descale/v_descale must be supplied. Otherwise K/V
+  // must match the Q dtype.
+  bool const is_e4m3_kv = k.scalar_type() == at::ScalarType::Float8_e4m3fn;
+  bool const is_e5m2_kv = k.scalar_type() == at::ScalarType::Float8_e5m2;
+  bool const is_fp8_kv = is_e4m3_kv || is_e5m2_kv;
   if (is_fp8_kv) {
     TORCH_CHECK(
-        v.scalar_type() == at::ScalarType::Float8_e4m3fn,
-        "fp8 KV cache requires key and value to both be float8_e4m3fn");
+        v.scalar_type() == k.scalar_type(),
+        "fp8 KV cache requires key and value to have the same fp8 dtype (both float8_e4m3fn or both float8_e5m2)");
     TORCH_CHECK(k_descale_.has_value() && v_descale_.has_value(), "fp8 KV cache requires k_descale and v_descale");
   } else {
     TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
@@ -1047,14 +1058,15 @@ std::vector<at::Tensor> mha_fwd(
   params.softcap = softcap;
 
   // FP8 KV cache: flag the kernel dispatch so the fp8 mainloop is selected.
-  params.is_e4m3 = is_fp8_kv;
+  params.is_e4m3 = is_e4m3_kv;
+  params.is_e5m2 = is_e5m2_kv;
   if (is_fp8_kv) {
     TORCH_CHECK(
         k_descale_.has_value() && v_descale_.has_value(), "fp8 KV cache prefill requires k_descale and v_descale");
     // Per-tensor dequant: the kernel only dereferences one float, so accept a
     // true scalar or a tensor whose elements are all the same repeated value.
-    params.k_scale_ptr = get_per_tensor_descale_ptr(k_descale_.value(), q, "k_descale", "fp8 KV cache prefill");
-    params.v_scale_ptr = get_per_tensor_descale_ptr(v_descale_.value(), q, "v_descale", "fp8 KV cache prefill");
+    params.k_scale_ptr = get_per_tensor_descale_ptr(k_descale_.value(), k, "k_descale", "fp8 KV cache prefill");
+    params.v_scale_ptr = get_per_tensor_descale_ptr(v_descale_.value(), v, "v_descale", "fp8 KV cache prefill");
   }
 
   // Set this to probability of keeping an element to simplify things.

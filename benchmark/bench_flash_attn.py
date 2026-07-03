@@ -96,9 +96,11 @@ num_heads_q = [16]
 num_heads_kv = [4, 8]
 kv_seq_length_range = [4096]
 page_size_range = [0, 128]
-# KV cache element type: "bf16" (default) or "fp8" (e4m3, dequantized in-kernel
-# via per-tensor k_descale / v_descale). fp8 only runs on the paged path.
-kv_dtype_range = ["bf16", "fp8"]
+# KV cache element type: "bf16" (default) or fp8. FP8 has two formats,
+# e5m2 and e4m3; both are exercised ("fp8_e4m3" / "fp8_e5m2"), dequantized
+# in-kernel via per-tensor k_descale / v_descale. fp8 only runs on the paged
+# path.
+kv_dtype_range = ["bf16", "fp8_e4m3", "fp8_e5m2"]
 configs = list(
     filter(
         lambda cfg: (
@@ -116,7 +118,7 @@ configs = list(
             and (not cfg[2] or cfg[5] == 64)
             # Condition 7: fp8 KV cache requires the paged path and is exercised
             # without sinks / local masking (matches the supported fp8 path)
-            and (cfg[10] != "fp8" or (cfg[9] != 0 and not cfg[2] and not cfg[1]))
+            and (cfg[10] == "bf16" or (cfg[9] != 0 and not cfg[2] and not cfg[1]))
         ),
         [
             cfg
@@ -181,10 +183,12 @@ def benchmark(
 ):
     dtype = torch.bfloat16
     device = torch.device("xpu")
-    # fp8 KV cache: store K/V as e4m3 and dequantize in-kernel via per-tensor
-    # k_descale / v_descale. Q/O stay bf16. Only valid on the paged path.
-    is_fp8 = kv_dtype == "fp8"
-    e4m3_max = 448.0
+    # fp8 KV cache: store K/V as e4m3 or e5m2 and dequantize in-kernel via
+    # per-tensor k_descale / v_descale. Q/O stay bf16. Only valid on the paged
+    # path.
+    is_fp8 = kv_dtype.startswith("fp8")
+    fp8_dtype = torch.float8_e5m2 if kv_dtype == "fp8_e5m2" else torch.float8_e4m3fn
+    fp8_max = 57344.0 if kv_dtype == "fp8_e5m2" else 448.0
     k_descale = None
     v_descale = None
     # Create input tensors
@@ -200,10 +204,10 @@ def benchmark(
             (num_pages, page_size, num_heads_kv, head_dim), device=device, dtype=dtype
         )
         if is_fp8:
-            k_descale_val = k_cache.abs().max().item() / e4m3_max
-            v_descale_val = v_cache.abs().max().item() / e4m3_max
-            k_cache = (k_cache / k_descale_val).to(torch.float8_e4m3fn)
-            v_cache = (v_cache / v_descale_val).to(torch.float8_e4m3fn)
+            k_descale_val = k_cache.abs().max().item() / fp8_max
+            v_descale_val = v_cache.abs().max().item() / fp8_max
+            k_cache = (k_cache / k_descale_val).to(fp8_dtype)
+            v_cache = (v_cache / v_descale_val).to(fp8_dtype)
             k_descale = torch.tensor(
                 k_descale_val, dtype=torch.float32, device=device
             ).expand(batch_size, num_heads_kv)

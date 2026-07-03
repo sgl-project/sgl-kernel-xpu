@@ -187,6 +187,7 @@ struct Arguments {
   bool is_bf16;
   bool is_fp32;
   bool is_e4m3 = false;
+  bool is_e5m2 = false;
 
   bool is_rotary_interleaved;
 

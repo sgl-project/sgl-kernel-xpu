@@ -25,14 +25,13 @@ from typing import List
 import torch
 
 # Tuned for B580 (Xe2, 20 Xe-cores).
-# sgs_per_wg=32: work-group size of 512 threads (32 sub-groups × 16 lanes),
-#   keeps the hardware scheduler busy without over-fragmenting work.
-# block_quota=0: auto mode — the C++ launcher computes
-#   effective_bq = ceil(num_items / (sgs_per_wg * 16)) so num_wgs ≈ 16,
-#   which fills all Xe-cores at any token count without the fixed bq=16
-#   over-decomposing small (N<512) workloads.
+# sgs_per_wg=32: work-group size of 512 threads (32 sub-groups × 16 lanes).
+# block_quota=16: fixed pool of 16*32=512 sub-groups.  num_wgs scales with the
+#   token count up to that pool, filling all Xe-cores across the whole range
+#   (measured 5-8x faster than an N-derived quota at N<=1024, which starves the
+#   GPU to 1-2 work-groups).
 _DEFAULT_SGS_PER_WG = 32
-_DEFAULT_BLOCK_QUOTA = 0  # 0 = auto-scale in C++ launcher
+_DEFAULT_BLOCK_QUOTA = 16
 
 
 # ---------------------------------------------------------------------------
@@ -53,9 +52,15 @@ def transfer_kv_per_layer(
 ) -> None:
     """Single-layer lf→lf transfer for K and V."""
     torch.ops.sgl_kernel.transfer_kv_per_layer.default(
-        src_k, dst_k, src_v, dst_v,
-        src_indices, dst_indices,
-        item_size, block_quota, sgs_per_wg,
+        src_k,
+        dst_k,
+        src_v,
+        dst_v,
+        src_indices,
+        dst_indices,
+        item_size,
+        block_quota,
+        sgs_per_wg,
     )
 
 
@@ -70,9 +75,13 @@ def transfer_kv_per_layer_mla(
 ) -> None:
     """Single-layer lf→lf transfer, MLA (K only)."""
     torch.ops.sgl_kernel.transfer_kv_per_layer_mla.default(
-        src, dst,
-        src_indices, dst_indices,
-        item_size, block_quota, sgs_per_wg,
+        src,
+        dst,
+        src_indices,
+        dst_indices,
+        item_size,
+        block_quota,
+        sgs_per_wg,
     )
 
 
@@ -94,9 +103,16 @@ def transfer_kv_all_layer(
     one per layer.
     """
     torch.ops.sgl_kernel.transfer_kv_all_layer.default(
-        src_k_layers, dst_k_layers, src_v_layers, dst_v_layers,
-        src_indices, dst_indices,
-        item_size, num_layers, block_quota, sgs_per_wg,
+        src_k_layers,
+        dst_k_layers,
+        src_v_layers,
+        dst_v_layers,
+        src_indices,
+        dst_indices,
+        item_size,
+        num_layers,
+        block_quota,
+        sgs_per_wg,
     )
 
 
@@ -112,9 +128,14 @@ def transfer_kv_all_layer_mla(
 ) -> None:
     """All-layer lf_tbl→lf_tbl transfer, MLA (K only)."""
     torch.ops.sgl_kernel.transfer_kv_all_layer_mla.default(
-        src_layers, dst_layers,
-        src_indices, dst_indices,
-        item_size, num_layers, block_quota, sgs_per_wg,
+        src_layers,
+        dst_layers,
+        src_indices,
+        dst_indices,
+        item_size,
+        num_layers,
+        block_quota,
+        sgs_per_wg,
     )
 
 
@@ -135,10 +156,19 @@ def transfer_kv_all_layer_lf_ph(
 ) -> None:
     """All-layer lf_tbl → page-head transfer for K and V."""
     torch.ops.sgl_kernel.transfer_kv_all_layer_lf_ph.default(
-        src_k_layers, dst_k, src_v_layers, dst_v,
-        src_indices, dst_indices,
-        item_size, dst_layout_dim, num_layers, page_size, head_num,
-        block_quota, sgs_per_wg,
+        src_k_layers,
+        dst_k,
+        src_v_layers,
+        dst_v,
+        src_indices,
+        dst_indices,
+        item_size,
+        dst_layout_dim,
+        num_layers,
+        page_size,
+        head_num,
+        block_quota,
+        sgs_per_wg,
     )
 
 
@@ -159,10 +189,19 @@ def transfer_kv_per_layer_ph_lf(
 ) -> None:
     """Single-layer page-head → lf transfer for K and V."""
     torch.ops.sgl_kernel.transfer_kv_per_layer_ph_lf.default(
-        src_k, dst_k, src_v, dst_v,
-        src_indices, dst_indices,
-        layer_id, item_size, src_layout_dim, page_size, head_num,
-        block_quota, sgs_per_wg,
+        src_k,
+        dst_k,
+        src_v,
+        dst_v,
+        src_indices,
+        dst_indices,
+        layer_id,
+        item_size,
+        src_layout_dim,
+        page_size,
+        head_num,
+        block_quota,
+        sgs_per_wg,
     )
 
 
@@ -179,8 +218,8 @@ def _transfer_page_direct(
     dst_start: int,
     count: int,
 ) -> None:
-    dst_buf[dst_start:dst_start + count].copy_(
-        src_buf[src_start:src_start + count], non_blocking=True
+    dst_buf[dst_start : dst_start + count].copy_(
+        src_buf[src_start : src_start + count], non_blocking=True
     )
 
 
@@ -216,7 +255,9 @@ def transfer_kv_direct(
             end = n
         count = end - start
         for j in range(num_layers):
-            _transfer_page_direct(src_layers[j], dst_layers[j], src_ptr[start], dst_ptr[start], count)
+            _transfer_page_direct(
+                src_layers[j], dst_layers[j], src_ptr[start], dst_ptr[start], count
+            )
         start = end
 
 
@@ -252,16 +293,22 @@ def transfer_kv_per_layer_direct_pf_lf(
             # src is pf: [num_pages, num_layers, page_size, item_size]
             # copy page_size rows from src_ptrs[0 or 1][s_page][layer_id+j]
             # to dst_ptrs[j] starting at d_start
-            src_kv = src_ptrs[0 if is_mla else j]  # per-layer tensor already sliced by caller
+            src_kv = src_ptrs[
+                0 if is_mla else j
+            ]  # per-layer tensor already sliced by caller
             # src_ptrs holds per-layer slices: shape [total_tokens, item_size]
             # The pf tensor layout means the caller passes the pf pool and we index it.
             # Here we mirror the CUDA fallback: src_ptrs[0].select(0, s_page).select(0, layer_id+j)
             # gives a [page_size, item_size] slice.
-            src_slice = src_ptrs[0 if is_mla else j].select(0, s_page).select(0, layer_id + j)
+            src_slice = (
+                src_ptrs[0 if is_mla else j].select(0, s_page).select(0, layer_id + j)
+            )
             _transfer_page_direct(src_slice, dst_ptrs[j], 0, d_start, page_size)
             if not is_mla:
                 src_slice_v = src_ptrs[1].select(0, s_page).select(0, layer_id + j)
-                _transfer_page_direct(src_slice_v, dst_ptrs[j + num_layers], 0, d_start, page_size)
+                _transfer_page_direct(
+                    src_slice_v, dst_ptrs[j + num_layers], 0, d_start, page_size
+                )
 
 
 def transfer_kv_all_layer_direct_lf_pf(
@@ -298,4 +345,6 @@ def transfer_kv_all_layer_direct_lf_pf(
             _transfer_page_direct(src_ptrs[j], dst_slice, s_start, 0, page_size)
             if not is_mla:
                 dst_slice_v = dst_ptrs[1].select(0, d_page).select(0, j)
-                _transfer_page_direct(src_ptrs[j + num_layers], dst_slice_v, s_start, 0, page_size)
+                _transfer_page_direct(
+                    src_ptrs[j + num_layers], dst_slice_v, s_start, 0, page_size
+                )

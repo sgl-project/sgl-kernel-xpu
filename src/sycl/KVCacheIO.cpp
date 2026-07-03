@@ -27,6 +27,7 @@ limitations under the License.
 // KV-cache placement policy.
 
 #include <ATen/ATen.h>
+
 #include <cstdint>
 #include <vector>
 
@@ -78,8 +79,7 @@ static inline char* get_offset_per_head_lf_mut(
     int64_t head_id,
     int64_t head_num,
     int64_t /*page_size*/) {
-  return base + layer_id * layer_dim + page_id * item_size_bytes +
-         item_size_bytes / head_num * head_id;
+  return base + layer_id * layer_dim + page_id * item_size_bytes + item_size_bytes / head_num * head_id;
 }
 
 // Page-head layout: [num_pages, head_num, page_size, num_layers, head_dim]
@@ -95,11 +95,10 @@ static inline char* get_offset_ph_mut(
     int64_t head_num,
     int64_t page_size) {
   const int64_t head_dim_bytes = item_size_bytes / head_num;
-  return base +
-         (page_id / page_size) * page_size * page_dim +       // page bucket
-         (page_dim / head_num) * head_id * page_size +         // head dim
-         (page_id % page_size) * page_dim / head_num +         // slot within page
-         layer_id * head_dim_bytes;                            // layer slot
+  return base + (page_id / page_size) * page_size * page_dim +  // page bucket
+         (page_dim / head_num) * head_id * page_size +          // head dim
+         (page_id % page_size) * page_dim / head_num +          // slot within page
+         layer_id * head_dim_bytes;                             // layer slot
 }
 
 // Page-head layout, const variant (for ph→lf source path).
@@ -114,11 +113,8 @@ static inline const char* get_offset_ph(
     int64_t head_num,
     int64_t page_size) {
   const int64_t head_dim_bytes = item_size_bytes / head_num;
-  return base +
-         (page_id / page_size) * page_size * page_dim +
-         (page_dim / head_num) * head_id * page_size +
-         (page_id % page_size) * page_dim / head_num +
-         layer_id * head_dim_bytes;
+  return base + (page_id / page_size) * page_size * page_dim + (page_dim / head_num) * head_id * page_size +
+         (page_id % page_size) * page_dim / head_num + layer_id * head_dim_bytes;
 }
 
 // ---------------------------------------------------------------------------
@@ -132,9 +128,9 @@ template <bool IsMLA>
 struct TransferKVKernel {
   void operator()(sycl::nd_item<1> item) const {
     const int64_t lane = static_cast<int64_t>(item.get_local_id(0)) % XPU_SG_SIZE;
-    const int64_t sg_id = static_cast<int64_t>(item.get_local_id(0)) / XPU_SG_SIZE +
-                          static_cast<int64_t>(item.get_group(0)) *
-                              (static_cast<int64_t>(item.get_local_range(0)) / XPU_SG_SIZE);
+    const int64_t sg_id =
+        static_cast<int64_t>(item.get_local_id(0)) / XPU_SG_SIZE +
+        static_cast<int64_t>(item.get_group(0)) * (static_cast<int64_t>(item.get_local_range(0)) / XPU_SG_SIZE);
 
     for (int64_t i = 0; i < items_per_sg_; ++i) {
       const int64_t item_id = sg_id * items_per_sg_ + i;
@@ -145,11 +141,10 @@ struct TransferKVKernel {
 
       for (int64_t layer = start_layer_; layer < start_layer_ + num_layers_; ++layer) {
         const char* src_k_ptr = src_k_base_ == nullptr
-            ? reinterpret_cast<const char*>(src_k_tbl_[layer]) + src_page * item_size_
-            : src_k_base_ + src_page * item_size_;
-        char* dst_k_ptr = dst_k_base_ == nullptr
-            ? reinterpret_cast<char*>(dst_k_tbl_[layer]) + dst_page * item_size_
-            : dst_k_base_ + dst_page * item_size_;
+                                    ? reinterpret_cast<const char*>(src_k_tbl_[layer]) + src_page * item_size_
+                                    : src_k_base_ + src_page * item_size_;
+        char* dst_k_ptr = dst_k_base_ == nullptr ? reinterpret_cast<char*>(dst_k_tbl_[layer]) + dst_page * item_size_
+                                                 : dst_k_base_ + dst_page * item_size_;
 
         const int64_t chunks = item_size_ / static_cast<int64_t>(sizeof(uint64_t));
         const auto* src64 = reinterpret_cast<const uint64_t*>(src_k_ptr);
@@ -160,19 +155,18 @@ struct TransferKVKernel {
           // simultaneously, hiding load latency across the two independent
           // address streams.
           const char* src_v_ptr = src_v_base_ == nullptr
-              ? reinterpret_cast<const char*>(src_v_tbl_[layer]) + src_page * item_size_
-              : src_v_base_ + src_page * item_size_;
-          char* dst_v_ptr = dst_v_base_ == nullptr
-              ? reinterpret_cast<char*>(dst_v_tbl_[layer]) + dst_page * item_size_
-              : dst_v_base_ + dst_page * item_size_;
+                                      ? reinterpret_cast<const char*>(src_v_tbl_[layer]) + src_page * item_size_
+                                      : src_v_base_ + src_page * item_size_;
+          char* dst_v_ptr = dst_v_base_ == nullptr ? reinterpret_cast<char*>(dst_v_tbl_[layer]) + dst_page * item_size_
+                                                   : dst_v_base_ + dst_page * item_size_;
 
           const auto* sv64 = reinterpret_cast<const uint64_t*>(src_v_ptr);
           auto* dv64 = reinterpret_cast<uint64_t*>(dst_v_ptr);
           for (int64_t j = lane; j < chunks; j += XPU_SG_SIZE) {
             const uint64_t k_val = src64[j];
             const uint64_t v_val = sv64[j];
-            dst64[j]  = k_val;
-            dv64[j]   = v_val;
+            dst64[j] = k_val;
+            dv64[j] = v_val;
           }
         } else {
           for (int64_t j = lane; j < chunks; j += XPU_SG_SIZE) {
@@ -208,9 +202,9 @@ template <bool IsLfToPh>
 struct TransferKVPageHeadKernel {
   void operator()(sycl::nd_item<1> item) const {
     const int64_t lane = static_cast<int64_t>(item.get_local_id(0)) % XPU_SG_SIZE;
-    const int64_t sg_id = static_cast<int64_t>(item.get_local_id(0)) / XPU_SG_SIZE +
-                          static_cast<int64_t>(item.get_group(0)) *
-                              (static_cast<int64_t>(item.get_local_range(0)) / XPU_SG_SIZE);
+    const int64_t sg_id =
+        static_cast<int64_t>(item.get_local_id(0)) / XPU_SG_SIZE +
+        static_cast<int64_t>(item.get_group(0)) * (static_cast<int64_t>(item.get_local_range(0)) / XPU_SG_SIZE);
 
     const int64_t head_dim_bytes = item_size_ / head_num_;
 
@@ -317,13 +311,15 @@ static void launch_transfer_kv(
   TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "index count mismatch");
 
   const int64_t num_items = src_indices.numel();
-  // Auto-scale block_quota so num_wgs lands in [16, 32]: enough to fill all
-  // 20 Xe-cores on B580 without over-decomposing small workloads.
-  // Caller-supplied block_quota=0 means "auto"; any non-zero value is used
-  // directly for explicit override.
-  const int64_t effective_bq = (block_quota > 0)
-      ? block_quota
-      : std::max(int64_t(1), div_up(num_items, sgs_per_wg * 16));
+  if (num_items == 0) return;  // nothing to transfer; avoids div-by-zero below
+
+  // block_quota fixes the total sub-group pool (block_quota * sgs_per_wg
+  // sub-groups); num_wgs then scales with the token count up to that pool.
+  // A fixed pool of 16*32=512 sub-groups fills all 20 Xe-cores on B580 across
+  // the whole token-count range (measured: 5-8x faster than an N-derived quota
+  // at N<=1024, which starves the GPU to 1-2 work-groups).  block_quota<=0
+  // falls back to this default.
+  const int64_t effective_bq = block_quota > 0 ? block_quota : 16;
   const int64_t total_sgs = effective_bq * sgs_per_wg;
   const int64_t items_per_sg = div_up(num_items, total_sgs);
   const int64_t num_wgs = div_up(num_items, items_per_sg * sgs_per_wg);
@@ -350,8 +346,7 @@ static void launch_transfer_kv(
   auto cgf = DPCPP_Q_CGF(cgh) {
     cgh.parallel_for<decltype(kernel)>(
         sycl::nd_range<1>(
-            sycl::range<1>(static_cast<size_t>(num_wgs * wg_size)),
-            sycl::range<1>(static_cast<size_t>(wg_size))),
+            sycl::range<1>(static_cast<size_t>(num_wgs * wg_size)), sycl::range<1>(static_cast<size_t>(wg_size))),
         kernel);
   };
   dpcppGetCurrentQueue().submit(cgf);
@@ -383,9 +378,9 @@ static void launch_transfer_kv_page_head(
   TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "index count mismatch");
 
   const int64_t num_items = src_indices.numel();
-  const int64_t effective_bq = (block_quota > 0)
-      ? block_quota
-      : std::max(int64_t(1), div_up(num_items, sgs_per_wg * 16));
+  if (num_items == 0) return;  // nothing to transfer; avoids div-by-zero below
+
+  const int64_t effective_bq = block_quota > 0 ? block_quota : 16;
   const int64_t total_sgs = effective_bq * sgs_per_wg;
   const int64_t items_per_sg = div_up(num_items, total_sgs);
   const int64_t num_wgs = div_up(num_items, items_per_sg * sgs_per_wg);
@@ -416,8 +411,7 @@ static void launch_transfer_kv_page_head(
   auto cgf = DPCPP_Q_CGF(cgh) {
     cgh.parallel_for<decltype(kernel)>(
         sycl::nd_range<1>(
-            sycl::range<1>(static_cast<size_t>(num_wgs * wg_size)),
-            sycl::range<1>(static_cast<size_t>(wg_size))),
+            sycl::range<1>(static_cast<size_t>(num_wgs * wg_size)), sycl::range<1>(static_cast<size_t>(wg_size))),
         kernel);
   };
   dpcppGetCurrentQueue().submit(cgf);
@@ -439,11 +433,21 @@ void transfer_kv_per_layer(
     int64_t block_quota,
     int64_t sgs_per_wg) {
   launch_transfer_kv<false>(
-      src_k.data_ptr(), dst_k.data_ptr(),
-      src_v.data_ptr(), dst_v.data_ptr(),
-      nullptr, nullptr, nullptr, nullptr,
-      src_indices, dst_indices,
-      0, 1, item_size, block_quota, sgs_per_wg);
+      src_k.data_ptr(),
+      dst_k.data_ptr(),
+      src_v.data_ptr(),
+      dst_v.data_ptr(),
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      src_indices,
+      dst_indices,
+      0,
+      1,
+      item_size,
+      block_quota,
+      sgs_per_wg);
 }
 
 // Single-layer, lf→lf, K only (MLA).
@@ -456,11 +460,21 @@ void transfer_kv_per_layer_mla(
     int64_t block_quota,
     int64_t sgs_per_wg) {
   launch_transfer_kv<true>(
-      src.data_ptr(), dst.data_ptr(),
-      nullptr, nullptr,
-      nullptr, nullptr, nullptr, nullptr,
-      src_indices, dst_indices,
-      0, 1, item_size, block_quota, sgs_per_wg);
+      src.data_ptr(),
+      dst.data_ptr(),
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      src_indices,
+      dst_indices,
+      0,
+      1,
+      item_size,
+      block_quota,
+      sgs_per_wg);
 }
 
 // All-layers, lf_tbl→lf_tbl, K+V.
@@ -477,13 +491,21 @@ void transfer_kv_all_layer(
     int64_t sgs_per_wg) {
   TORCH_CHECK(num_layers == src_k_layers.size(0), "num_layers mismatch");
   launch_transfer_kv<false>(
-      nullptr, nullptr, nullptr, nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
       src_k_layers.data_ptr<uintptr_t>(),
       dst_k_layers.data_ptr<uintptr_t>(),
       src_v_layers.data_ptr<uintptr_t>(),
       dst_v_layers.data_ptr<uintptr_t>(),
-      src_indices, dst_indices,
-      0, num_layers, item_size, block_quota, sgs_per_wg);
+      src_indices,
+      dst_indices,
+      0,
+      num_layers,
+      item_size,
+      block_quota,
+      sgs_per_wg);
 }
 
 // All-layers, lf_tbl→lf_tbl, K only (MLA).
@@ -498,12 +520,21 @@ void transfer_kv_all_layer_mla(
     int64_t sgs_per_wg) {
   TORCH_CHECK(num_layers == src_layers.size(0), "num_layers mismatch");
   launch_transfer_kv<true>(
-      nullptr, nullptr, nullptr, nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
       src_layers.data_ptr<uintptr_t>(),
       dst_layers.data_ptr<uintptr_t>(),
-      nullptr, nullptr,
-      src_indices, dst_indices,
-      0, num_layers, item_size, block_quota, sgs_per_wg);
+      nullptr,
+      nullptr,
+      src_indices,
+      dst_indices,
+      0,
+      num_layers,
+      item_size,
+      block_quota,
+      sgs_per_wg);
 }
 
 // All-layers, lf_tbl→ph (page-head destination).
@@ -523,15 +554,24 @@ void transfer_kv_all_layer_lf_ph(
     int64_t sgs_per_wg) {
   TORCH_CHECK(num_layers == src_k_layers.size(0), "num_layers mismatch");
   launch_transfer_kv_page_head<true>(
-      nullptr, dst_k.data_ptr(),
-      nullptr, dst_v.data_ptr(),
-      src_k_layers.data_ptr<uintptr_t>(), nullptr,
-      src_v_layers.data_ptr<uintptr_t>(), nullptr,
-      src_indices, dst_indices,
-      num_layers, item_size,
-      0, dst_layout_dim,
-      page_size, head_num,
-      block_quota, sgs_per_wg);
+      nullptr,
+      dst_k.data_ptr(),
+      nullptr,
+      dst_v.data_ptr(),
+      src_k_layers.data_ptr<uintptr_t>(),
+      nullptr,
+      src_v_layers.data_ptr<uintptr_t>(),
+      nullptr,
+      src_indices,
+      dst_indices,
+      num_layers,
+      item_size,
+      0,
+      dst_layout_dim,
+      page_size,
+      head_num,
+      block_quota,
+      sgs_per_wg);
 }
 
 // Single-layer, ph→lf.
@@ -554,13 +594,23 @@ void transfer_kv_per_layer_ph_lf(
   // We launch with start_layer=layer_id, num_layers=1 so the ph offset
   // function reads the correct layer slot from the source.
   launch_transfer_kv_page_head<false>(
-      src_k.data_ptr(), dst_k.data_ptr(),
-      src_v.data_ptr(), dst_v.data_ptr(),
-      nullptr, nullptr, nullptr, nullptr,
-      src_indices, dst_indices,
-      1, item_size,
-      src_layout_dim, 0,
-      page_size, head_num,
-      block_quota, sgs_per_wg,
+      src_k.data_ptr(),
+      dst_k.data_ptr(),
+      src_v.data_ptr(),
+      dst_v.data_ptr(),
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      src_indices,
+      dst_indices,
+      1,
+      item_size,
+      src_layout_dim,
+      0,
+      page_size,
+      head_num,
+      block_quota,
+      sgs_per_wg,
       layer_id);
 }

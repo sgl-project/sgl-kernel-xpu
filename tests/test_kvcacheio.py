@@ -693,5 +693,34 @@ def test_transfer_kv_page_head(
     torch.set_default_dtype(original_dtype)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_transfer_kv_empty_indices(dtype: torch.dtype):
+    """Empty index tensors must be a no-op, not a div-by-zero crash.
+
+    Regression test: num_items==0 previously produced num_wgs = div_up(0, 0)
+    in the SYCL launcher and crashed the process with SIGFPE.
+    """
+    original_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+
+    item_size = 256
+    src_k = torch.randn(16, item_size).to(device)
+    src_v = torch.randn(16, item_size).to(device)
+    dst_k = torch.zeros_like(src_k)
+    dst_v = torch.zeros_like(src_v)
+    empty = torch.empty(0, dtype=torch.int64, device=device)
+
+    transfer_kv_per_layer(
+        src_k, dst_k, src_v, dst_v, empty, empty, item_size * dtype.itemsize
+    )
+    transfer_kv_per_layer_mla(src_k, dst_k, empty, empty, item_size * dtype.itemsize)
+    torch.accelerator.synchronize()
+
+    # Destinations stay zero: nothing was transferred.
+    torch.testing.assert_close(dst_k, torch.zeros_like(dst_k))
+    torch.testing.assert_close(dst_v, torch.zeros_like(dst_v))
+    torch.set_default_dtype(original_dtype)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

@@ -16,10 +16,8 @@ Usage:
 
 import argparse
 
-import torch
-from triton.testing import do_bench
-
 import sgl_kernel  # noqa: F401 – registers XPU ops
+import torch
 from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer,
     transfer_kv_all_layer_direct_lf_pf,
@@ -75,6 +73,7 @@ def _row(N, item_size, nbytes, ms):
 # Suite 1: per_layer  (device→device)
 # ---------------------------------------------------------------------------
 
+
 def bench_per_layer(token_counts, item_sizes):
     _header("transfer_kv_per_layer  [lf→lf, K+V, device→device]")
     for N in token_counts:
@@ -114,6 +113,7 @@ def bench_per_layer_mla(token_counts, item_sizes):
 # ---------------------------------------------------------------------------
 # Suite 2: all_layer  (fused across layers, device→device)
 # ---------------------------------------------------------------------------
+
 
 def bench_all_layer(token_counts, item_sizes, num_layers=32):
     _header(
@@ -196,6 +196,7 @@ def bench_all_layer_mla(token_counts, item_sizes, num_layers=32):
 # Suite 3: host↔device  (pinned memory, PCIe path)
 # ---------------------------------------------------------------------------
 
+
 def bench_host_device(token_counts, item_sizes):
     _header("transfer_kv_direct  [pinned host→device, copy_ fallback]")
     for N in token_counts:
@@ -244,7 +245,10 @@ def bench_host_device(token_counts, item_sizes):
             perm = torch.randperm(total_pages)
             num_pages = N // page_size
             si = torch.cat(
-                [torch.arange(p * page_size, (p + 1) * page_size) for p in perm[:num_pages]]
+                [
+                    torch.arange(p * page_size, (p + 1) * page_size)
+                    for p in perm[:num_pages]
+                ]
             )
             di = torch.cat(
                 [
@@ -263,10 +267,55 @@ def bench_host_device(token_counts, item_sizes):
             )
             _row(N, item_size, nbytes, ms)
 
+    _header("transfer_kv_per_layer_direct_pf_lf  [pinned host pf→device lf, 1 layer]")
+    for N in token_counts:
+        for item_size in item_sizes:
+            page_size = 16
+            if N % page_size != 0:
+                continue
+            total = max(N * 4, 16384)
+            total_pages = total // page_size
+            num_layers = 4
+            layer_id = 0
+            src_k = torch.randn(
+                total_pages, num_layers, page_size, item_size, dtype=DTYPE
+            ).pin_memory()
+            src_v = torch.randn(
+                total_pages, num_layers, page_size, item_size, dtype=DTYPE
+            ).pin_memory()
+            dst_k = torch.zeros(total, item_size, dtype=DTYPE, device=DEVICE)
+            dst_v = torch.zeros_like(dst_k)
+            perm = torch.randperm(total_pages)
+            num_pages = N // page_size
+            si = torch.cat(
+                [
+                    torch.arange(p * page_size, (p + 1) * page_size)
+                    for p in perm[:num_pages]
+                ]
+            )
+            di = torch.cat(
+                [
+                    torch.arange(p * page_size, (p + 1) * page_size)
+                    for p in perm[num_pages : 2 * num_pages]
+                ]
+            )
+            # Single layer transferred (K+V): read from host counts once.
+            nbytes = N * item_size * ELEM * 2
+
+            ms = _bench(
+                lambda: transfer_kv_per_layer_direct_pf_lf(
+                    [src_k, src_v], [dst_k, dst_v], si, di, layer_id, page_size
+                ),
+                warmup=5,
+                rep=20,
+            )
+            _row(N, item_size, nbytes, ms)
+
 
 # ---------------------------------------------------------------------------
 # Suite 4: page-head layout
 # ---------------------------------------------------------------------------
+
 
 def bench_page_head(token_counts, item_sizes, head_num=16, num_layers=4):
     page_size = 16
@@ -289,7 +338,11 @@ def bench_page_head(token_counts, item_sizes, head_num=16, num_layers=4):
                 for _ in range(num_layers)
             ]
             dst_k = torch.zeros(
-                total_pages, head_num, page_size, num_layers, item_size // head_num,
+                total_pages,
+                head_num,
+                page_size,
+                num_layers,
+                item_size // head_num,
                 dtype=DTYPE,
             ).pin_memory()
             dst_v = torch.zeros_like(dst_k).pin_memory()
@@ -308,18 +361,24 @@ def bench_page_head(token_counts, item_sizes, head_num=16, num_layers=4):
 
             ms = _bench(
                 lambda: transfer_kv_all_layer_lf_ph(
-                    sk_t, dst_k, sv_t, dst_v,
-                    si, di,
-                    ib, dst_layout_dim, num_layers, page_size, head_num,
+                    sk_t,
+                    dst_k,
+                    sv_t,
+                    dst_v,
+                    si,
+                    di,
+                    ib,
+                    dst_layout_dim,
+                    num_layers,
+                    page_size,
+                    head_num,
                 ),
                 warmup=5,
                 rep=20,
             )
             _row(N, item_size, nbytes, ms)
 
-    _header(
-        f"transfer_kv_per_layer_ph_lf  [ph→lf, layer 0, head_num={head_num}]"
-    )
+    _header(f"transfer_kv_per_layer_ph_lf  [ph→lf, layer 0, head_num={head_num}]")
     for N in token_counts:
         for item_size in item_sizes:
             if item_size % head_num != 0:
@@ -327,7 +386,11 @@ def bench_page_head(token_counts, item_sizes, head_num=16, num_layers=4):
             total = max(N * 4, 16384)
             total_pages = total // page_size
             src_k = torch.randn(
-                total_pages, head_num, page_size, num_layers, item_size // head_num,
+                total_pages,
+                head_num,
+                page_size,
+                num_layers,
+                item_size // head_num,
                 dtype=DTYPE,
             ).pin_memory()
             src_v = torch.zeros_like(src_k).pin_memory()
@@ -341,9 +404,17 @@ def bench_page_head(token_counts, item_sizes, head_num=16, num_layers=4):
 
             ms = _bench(
                 lambda: transfer_kv_per_layer_ph_lf(
-                    src_k, dst_k, src_v, dst_v,
-                    si, di,
-                    0, ib, src_layout_dim, page_size, head_num,
+                    src_k,
+                    dst_k,
+                    src_v,
+                    dst_v,
+                    si,
+                    di,
+                    0,
+                    ib,
+                    src_layout_dim,
+                    page_size,
+                    head_num,
                 ),
                 warmup=5,
                 rep=20,
@@ -356,10 +427,10 @@ def bench_page_head(token_counts, item_sizes, head_num=16, num_layers=4):
 # ---------------------------------------------------------------------------
 
 SUITES = {
-    "per_layer":   [bench_per_layer, bench_per_layer_mla],
-    "all_layer":   [bench_all_layer, bench_all_layer_mla],
+    "per_layer": [bench_per_layer, bench_per_layer_mla],
+    "all_layer": [bench_all_layer, bench_all_layer_mla],
     "host_device": [bench_host_device],
-    "page_head":   [bench_page_head],
+    "page_head": [bench_page_head],
 }
 
 
@@ -412,6 +483,7 @@ def main():
 
     for fn in fns_to_run:
         import inspect
+
         sig = inspect.signature(fn)
         params = list(sig.parameters.keys())
         kwargs = {"token_counts": args.num_tokens, "item_sizes": args.item_sizes}

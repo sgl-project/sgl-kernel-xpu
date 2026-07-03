@@ -6,7 +6,8 @@ import pytest
 import torch
 from sgl_kernel import sgemm_lora_a_fwd
 
-
+if not torch.xpu.is_available():
+    pytest.skip(reason="sgemm_lora_a_fwd requires XPU device.", allow_module_level=True)
 def _tolerances(dtype: torch.dtype, k: int = 0):
     if dtype == torch.float16:
         return 1e-2, 1e-2

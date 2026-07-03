@@ -113,6 +113,12 @@ GroupedGemmMeta build_grouped_gemm_meta(
     const int32_t lora_id = weight_indices_h[s];
 
     problem_sizes_h[3 * s + 0] = M_s;
+    // N is always the full stack_num * max_rank; per-adapter lora_ranks are NOT
+    // folded into the GEMM problem size. Every segment computes all N output
+    // columns, so the API contract is that weight rows beyond an adapter's rank
+    // R_l (i.e. rows j >= R_l within each stacked block) are pre-zeroed by the
+    // caller. Those rows still take part in the GEMM but contribute zeros,
+    // yielding the correct zero-padded output for ranks smaller than max_rank.
     problem_sizes_h[3 * s + 1] = N;
     problem_sizes_h[3 * s + 2] = K;
 
@@ -332,6 +338,9 @@ void sgemm_lora_a_fwd(
   TORCH_CHECK(lora_ranks.dim() == 1, "lora_ranks must be a 1D tensor");
   TORCH_CHECK(output.dim() == 2, "output must be a 2D tensor");
 
+  TORCH_CHECK(stack_num > 0, "stack_num must be > 0");
+  TORCH_CHECK(weights.size(1) % stack_num == 0, "weights.size(1) must be divisible by stack_num");
+
   const int64_t num_loras_i64 = weights.size(0);
   const int64_t max_rank_i64 = weights.size(1) / stack_num;
   const int64_t num_tokens_i64 = input_x.size(0);
@@ -366,6 +375,10 @@ void sgemm_lora_a_fwd(
   TORCH_CHECK(seg_len_min.item<int>() >= 0, "seg_indptr must be non-decreasing");
   (void)seg_len_max;  // not needed: grouped GEMM handles variable M per group
 
+  // lora_ranks is only range-validated here; it does NOT shrink the per-segment
+  // GEMM (every segment computes the full N = stack_num * max_rank columns). The
+  // caller must pre-zero weight rows beyond each adapter's rank R_l so that the
+  // extra columns come out zero-padded. See build_grouped_gemm_meta().
   auto [min_lr, max_lr] = torch::aminmax(lora_ranks);
   TORCH_CHECK(
       min_lr.item<int64_t>() >= 0 && max_lr.item<int>() <= max_rank_i64,

@@ -22,7 +22,17 @@ from sgl_kernel.attention import (
     merge_state,
     merge_state_v2,
 )
-from sgl_kernel.dsv4 import *
+from sgl_kernel.dsv4 import (
+    flash_compress4_decode,
+    flash_compress4_prefill,
+    flash_compress128_decode,
+    flash_compress128_prefill,
+    fp8_paged_mqa_logits,
+    plan_compress_decode,
+    plan_compress_decode_legacy,
+    plan_compress_prefill,
+    plan_compress_prefill_legacy,
+)
 from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
     fused_add_rmsnorm,

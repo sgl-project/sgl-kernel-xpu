@@ -66,6 +66,19 @@ set(FMHA_PREFILL_HEAD_DIMS ${FMHA_PREFILL_PAGED_HEAD_DIMS} ${FMHA_PREFILL_NP_HEA
 list(REMOVE_DUPLICATES FMHA_PREFILL_HEAD_DIMS)
 list(SORT FMHA_PREFILL_HEAD_DIMS COMPARE NATURAL)
 
+# FP8 KV cache prefill kernels are instantiated for both bf16 and fp16 queries,
+# which roughly doubles the number of fp8 translation units to compile. Shares
+# the SGL_FMHA_FP8_KV_ENABLE_FP16 option with the decode kernels (defined in
+# FMHADecodeXe20.cmake); OFF by default so an fp16 query against an fp8 KV cache
+# raises a runtime TORCH_CHECK unless explicitly enabled. Emitted into the
+# template as @EMIT_FP8_FP16@.
+option(SGL_FMHA_FP8_KV_ENABLE_FP16 "Compile fp16-query fp8 KV cache kernels" OFF)
+if(SGL_FMHA_FP8_KV_ENABLE_FP16)
+    set(EMIT_FP8_FP16 1)
+else()
+    set(EMIT_FP8_FP16 0)
+endif()
+
 foreach(HEAD_DIM ${FMHA_PREFILL_HEAD_DIMS})
     if(HEAD_DIM IN_LIST FMHA_PREFILL_PAGED_HEAD_DIMS)
         set(EMIT_PAGED 1)

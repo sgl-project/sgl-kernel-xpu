@@ -460,6 +460,16 @@ void hc_pre_big_fuse(
     std::optional<double> norm_eps = std::nullopt);
 
 /*
+ * hc_post
+ */
+void hc_post(
+    const at::Tensor& x,
+    const at::Tensor& residual,
+    const at::Tensor& post,
+    const at::Tensor& comb,
+    at::Tensor& out);
+
+/*
  * hc_pre GEMM + row-wise square sum
  */
 void hc_pre_gemm_sqr_sum(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, const at::Tensor& B);

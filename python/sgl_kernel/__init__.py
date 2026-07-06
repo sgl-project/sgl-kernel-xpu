@@ -60,6 +60,7 @@ from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.lora import embedding_lora_a_fwd
 from sgl_kernel.memory import weak_ref_tensor
 from sgl_kernel.mhc import (
+    hc_post,
     hc_pre_big_fuse,
     hc_pre_gemm_sqr_sum,
     hc_split_sinkhorn,

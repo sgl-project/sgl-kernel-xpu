@@ -1,5 +1,6 @@
 import pytest
 import torch
+from sgl_kernel import hc_post
 import utils
 
 device = utils.get_device()
@@ -22,12 +23,16 @@ def _make_inputs(T, D, device, seed=42):
     comb = comb / comb.sum(dim=-1, keepdim=True)
     return x, residual, post, comb
 
-
 @pytest.mark.parametrize("T", [16, 48, 128, 768, 885, 1021, 1024, 1280, 2047])
 @pytest.mark.parametrize("D", [4096])
-def test_hc_post_torch_only(T, D):
+def test_hc_post_kernel(T, D):
     x, residual, post, comb = _make_inputs(T, D, device=f"{device}:0")
-    output = hc_post_torch_impl(x, residual, post, comb)
-    assert output.shape == (T, HC_MULT, D)
-    assert output.dtype == torch.bfloat16
-    assert torch.isfinite(output).all()
+
+    expected = hc_post_torch_impl(x, residual, post, comb)
+
+    comb_flat = comb.reshape(T, -1)
+
+    out = torch.empty(T, HC_MULT, D, dtype=torch.bfloat16, device=f"{device}:0")
+    hc_post(x, residual, post, comb_flat, out)
+
+    torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)

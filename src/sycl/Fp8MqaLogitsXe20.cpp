@@ -28,29 +28,6 @@ limitations under the License.
 #include "kernels/nsa/fp8_mqa_gemm_xe20.hpp"
 #include "kernels/nsa/fp8_mqa_logits_kernel.hpp"
 
-// Thin launcher for the custom FP8 MQA GEMM on Intel BMG (Xe20).
-// The kernel implementation is in kernels/nsa/fp8_mqa_gemm_xe20.hpp.
-// Batched variant: computes `batch` independent GEMMs D_b = A_b(M,K) @ B_b(N,K)^T
-// in a single fused launch. Per-batch base pointers advance by the given strides
-// (in elements). All batches share the same (M,N,K) tile shape. B is in (N,K)
-// layout with K contiguous — no host-side transpose needed.
-// Returns 0 on success, non-zero if dimensions are not tile-aligned.
-int fp8_mqa_gemm_xe20_batched(
-    sycl::queue* queue_ptr,
-    const void* A_fp8,
-    const void* B_fp8,
-    void* D_f32,
-    int batch,
-    int M,
-    int N,
-    int K,
-    int64_t A_batch_stride,
-    int64_t B_batch_stride,
-    int64_t D_batch_stride) {
-  return nsa::fp8_mqa_gemm_batched_launch(
-      queue_ptr, A_fp8, B_fp8, D_f32, batch, M, N, K, A_batch_stride, B_batch_stride, D_batch_stride);
-}
-
 namespace {
 
 constexpr int WG_SIZE = 256;
@@ -73,11 +50,11 @@ void launch_2d_kernel(sycl::queue& queue, Kernel& kernel, int dim0, int dim1) {
 // Batched FP8 GEMM via SYCL-TLA: for each b, D_b(M,N) = A_b(M,K) @ B_b(N,K)^T.
 // Base pointers advance by the per-batch element strides. Writes directly into
 // the pre-allocated output buffer. Falls back to torch::bmm if not tile-aligned.
-int fp8_gemm_xe20_batched_inplace(
+void fp8_gemm_xe20_batched_inplace(
     sycl::queue& queue,
-    const uint8_t* a_ptr,  // (batch, M, K) fp8
-    const uint8_t* b_ptr,  // (batch, N, K) fp8
-    float* d_ptr,          // (batch, M, N) output
+    const torch::Tensor& a_fp8,  // (batch, M, K) fp8
+    const torch::Tensor& b_fp8,  // (batch, N, K)
+    torch::Tensor& d_f32,        // (batch, M, N) output
     int batch,
     int M,
     int N,
@@ -86,23 +63,25 @@ int fp8_gemm_xe20_batched_inplace(
     int64_t b_batch_stride,
     int64_t d_batch_stride,
     at::Device device) {
-  int rc = fp8_mqa_gemm_xe20_batched(
-      &queue, a_ptr, b_ptr, d_ptr, batch, M, N, K, a_batch_stride, b_batch_stride, d_batch_stride);
+  using namespace cute;
+  using GemmTileShape = Shape<_32, _128, _32>;
 
-  if (rc != 0) {
-    // Fallback to torch::bmm if dimensions are not tile-aligned.
-    // Strides are the natural contiguous strides (M*K, N*K, M*N).
-    auto a_fp8 = torch::from_blob(const_cast<uint8_t*>(a_ptr), {batch, M, K}, torch::dtype(torch::kByte).device(device))
-                     .view(at::ScalarType::Float8_e4m3fn);
-    auto b_fp8 = torch::from_blob(const_cast<uint8_t*>(b_ptr), {batch, N, K}, torch::dtype(torch::kByte).device(device))
-                     .view(at::ScalarType::Float8_e4m3fn);
-    auto a_bf16 = a_fp8.to(at::ScalarType::BFloat16);
-    auto b_bf16 = b_fp8.to(at::ScalarType::BFloat16);
-    auto result = at::bmm(a_bf16, b_bf16.transpose(1, 2)).to(at::ScalarType::Float);
-    auto d_view = torch::from_blob(d_ptr, {batch, M, N}, torch::dtype(torch::kFloat32).device(device));
-    d_view.copy_(result);
+  auto a_ptr = a_fp8.data_ptr<uint8_t>();
+  auto b_ptr = b_fp8.data_ptr<uint8_t>();
+  auto d_ptr = d_f32.data_ptr<float>();
+
+  if (M % get<0>(GemmTileShape{}) == 0 && N % get<1>(GemmTileShape{}) == 0 && K % get<2>(GemmTileShape{}) == 0) {
+    nsa::fp8_mqa_gemm_batched_launch<GemmTileShape>(
+        &queue, a_ptr, b_ptr, d_ptr, batch, M, N, K, a_batch_stride, b_batch_stride, d_batch_stride);
+    return;
   }
-  return rc;
+
+  // Fallback to torch::bmm if dimensions are not tile-aligned.
+  // Strides are the natural contiguous strides (M*K, N*K, M*N).
+  auto a_bf16 = a_fp8.to(at::ScalarType::BFloat16);
+  auto b_bf16 = b_fp8.to(at::ScalarType::BFloat16);
+  auto result = at::bmm(a_bf16, b_bf16.transpose(1, 2)).to(at::ScalarType::Float);
+  d_f32.copy_(result);
 }
 
 }  // namespace
@@ -214,9 +193,9 @@ torch::Tensor fp8_paged_mqa_logits(
 
     fp8_gemm_xe20_batched_inplace(
         queue,
-        q_contig.data_ptr<uint8_t>(),    // (B,1,H,D), A batch stride = H*D
-        k_gathered.data_ptr<uint8_t>(),  // (B*msl,D), B batch stride = msl*D
-        dots.data_ptr<float>(),          // (B,H,msl), D batch stride = H*msl
+        q_contig,    // (B,1,H,D), A batch stride = H*D
+        k_gathered,  // (B*msl,D), B batch stride = msl*D
+        dots,        // (B,H,msl), D batch stride = H*msl
         B_next,
         H,
         msl,

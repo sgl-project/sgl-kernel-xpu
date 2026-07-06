@@ -51,7 +51,11 @@ def _fp8_mqa_logits_impl(
     k_2d = k_fp8.contiguous()
 
     # torch._scaled_mm requires alignment: both dims of mat2 (Nk, D) and M divisible by 16.
-    use_scaled_mm = Nk % _SCALED_MM_ALIGN == 0 and D % _SCALED_MM_ALIGN == 0
+    use_scaled_mm = (
+        hasattr(torch, "_scaled_mm")
+        and Nk % _SCALED_MM_ALIGN == 0
+        and D % _SCALED_MM_ALIGN == 0
+    )
     if use_scaled_mm:
         one = torch.ones(1, dtype=torch.float32, device=q_fp8.device)
         # dots: (M, Nk) = (Nq*H, Nk)

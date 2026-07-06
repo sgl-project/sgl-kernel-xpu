@@ -144,7 +144,7 @@ struct Fp8MqaGemmMainloop {
     auto pAgA = prefetch_a.get_slice(thr_id).partition_S(gA);
     auto pBgB = prefetch_b.get_slice(thr_id).partition_S(gB);
 
-    constexpr int barrier_scope = 2;
+    constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
     int prefetch_k = 0;
     int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
 
@@ -187,11 +187,9 @@ struct Fp8MqaGemmMainloop {
   }
 };
 
-// Tile configuration
-using GemmTileShape = Shape<_32, _128, _32>;
+// Layout & atom configuration
 using GemmSGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
 using GemmMmaAtom = MMA_Atom<XE_8x16x16_F32F16F16F32_TT>;
-using GemmTiledMMA = typename TiledMMAHelper<GemmMmaAtom, Layout<GemmTileShape>, GemmSGLayout>::TiledMMA;
 
 constexpr int GemmPipelineStages = 2;
 
@@ -227,7 +225,8 @@ class Fp8MqaGemmKernelName;
 // A: (M,K) uint8 fp8, K contiguous
 // B: (N,K) uint8 fp8, K contiguous
 // D: (M,N) float32, N contiguous
-inline int fp8_mqa_gemm_batched_launch(
+template <typename GemmTileShape>
+inline void fp8_mqa_gemm_batched_launch(
     sycl::queue* queue_ptr,
     const void* A_fp8,
     const void* B_fp8,
@@ -239,6 +238,8 @@ inline int fp8_mqa_gemm_batched_launch(
     int64_t A_batch_stride,
     int64_t B_batch_stride,
     int64_t D_batch_stride) {
+  using GemmTiledMMA = typename TiledMMAHelper<GemmMmaAtom, Layout<GemmTileShape>, GemmSGLayout>::TiledMMA;
+
   // Create dummy tensors for type deduction (only stride types matter)
   auto make_dummy = [](auto* ptr, auto stride) {
     return make_tensor(make_gmem_ptr(ptr), make_layout(repeat<rank_v<decltype(stride)>>(1), stride));
@@ -272,9 +273,9 @@ inline int fp8_mqa_gemm_batched_launch(
   int wg_tile_n = get<1>(wg_tile);
 
   // Check alignment: M and N must be multiples of tile dimensions
-  if (M % wg_tile_m != 0 || N % wg_tile_n != 0 || K % get<2>(wg_tile) != 0) {
-    return 1;  // Caller should use fallback
-  }
+  TORCH_CHECK(
+      M % wg_tile_m == 0 && N % wg_tile_n == 0 && K % get<2>(wg_tile) == 0,
+      "GEMM dimensions must be tile-aligned for SYCL-TLA kernel.");
 
   int grid_m = M / wg_tile_m;
   int grid_n = N / wg_tile_n;
@@ -330,8 +331,6 @@ inline int fp8_mqa_gemm_batched_launch(
           Mainloop{}(A, B, D, coord, mma_local, thr_id);
         });
   });
-
-  return 0;
 }
 
 }  // namespace nsa

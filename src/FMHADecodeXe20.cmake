@@ -44,6 +44,19 @@ set(FMHA_DECODE_HEAD_DIMS ${FMHA_DECODE_PAGED_HEAD_DIMS} ${FMHA_DECODE_NP_HEAD_D
 list(REMOVE_DUPLICATES FMHA_DECODE_HEAD_DIMS)
 list(SORT FMHA_DECODE_HEAD_DIMS COMPARE NATURAL)
 
+# FP8 KV cache decode/split-decode kernels are instantiated for both bf16 and
+# fp16 queries, which roughly doubles the number of fp8 translation units to
+# compile. This option lets a build drop the fp16-query instantiation to cut
+# compile time; it is OFF by default so an fp16 query against an fp8 KV cache
+# raises a runtime TORCH_CHECK unless explicitly enabled. Emitted into the
+# templates as @EMIT_FP8_FP16@.
+option(SGL_FMHA_FP8_KV_ENABLE_FP16 "Compile fp16-query fp8 KV cache kernels" OFF)
+if(SGL_FMHA_FP8_KV_ENABLE_FP16)
+    set(EMIT_FP8_FP16 1)
+else()
+    set(EMIT_FP8_FP16 0)
+endif()
+
 foreach(QG_SZ ${FMHA_DECODE_QG_SIZES})
     foreach(HEAD_DIM ${FMHA_DECODE_HEAD_DIMS})
         if(HEAD_DIM IN_LIST FMHA_DECODE_PAGED_HEAD_DIMS)

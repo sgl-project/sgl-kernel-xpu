@@ -416,16 +416,25 @@ struct FMHAFwdMainloop<
       /* Causal masking */
       if constexpr (CausalMask) {
         if (need_causal) {
-          // Need to get global col and row indices to mask the elements
-          Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
-          Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
-          auto cS_thread = thr_mma_qk.partition_C(gP);
+          /* Masking scalars */
+          // TODO: use a more general code path for causal masking.
+          int lane_id = thr_id % intel::sg_size;
+          constexpr int sg_tile_q = get<0>(TileShapeQK{}) / SGPerWG::value;
+          int row_base = get<0>(blk_qv) * get<0>(TileShapeQK{}) + (thr_id / intel::sg_size) * sg_tile_q;
+
+          constexpr int kTileK = get<1>(TileShapeQK{});
+          constexpr int n_reps = kTileK / intel::sg_size;
+          constexpr int elems_per_n = tSrS.size() / n_reps;
+          int k_base = K * kTileK;
           CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tSrS.size(); ++i) {
-            int row_idx = get<0>(cS_thread(i));
-            int col_idx = get<1>(cS_thread(i));
-            if (row_idx < col_idx - full_tile_offset) {
-              tSrS(i) = ElementS(-INFINITY);
+          for (int n = 0; n < n_reps; n++) {
+            int col = k_base + n * intel::sg_size + lane_id;
+            int causal_bound = col - full_tile_offset - row_base;
+            CUTLASS_PRAGMA_UNROLL
+            for (int j = 0; j < elems_per_n; j++) {
+              if (j < causal_bound) {
+                tSrS(n * elems_per_n + j) = ElementS(-INFINITY);
+              }
             }
           }
         }

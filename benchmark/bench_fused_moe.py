@@ -422,6 +422,10 @@ def benchmark(
     )
     torch.set_default_device("xpu")
     torch.xpu.manual_seed_all(0)
+    # Release cached blocks from the previous config so this one starts on
+    # an unfragmented allocator. Without this, large sweep tails OOM on
+    # shared CI runners that did not fully reset between jobs.
+    torch.xpu.empty_cache()
 
     def _needs_ld_padding(dim):
         bp = dim * 2

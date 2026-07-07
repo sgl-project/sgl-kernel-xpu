@@ -193,13 +193,19 @@ class MLA {
     return initialize(args, workspace);
   }
 
+  // GRF size selected from the mainloop's IsPrefill flag.
+  // Prefill: 256 GRF — required to fit Q_TILE_M up to 256 without spill.
+  // Decode: 128 GRF — Q_TILE_M=1 fits comfortably; halving GRF doubles
+  //                   threads/EU and helps hide HBM latency.
+  static constexpr int kGrfSize = Kernel::CollectiveMainloop::IsPrefill ? 256 : 128;
+
   static cutlass::Status run(Params& params, sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
     if constexpr (!Kernel::is_split_kv) {
       // Non-split: launch main kernel only
-      launch<Kernel, 128>(params.fmla_params);
+      launch<Kernel, kGrfSize>(params.fmla_params);
     } else {
       // Split-KV: launch split attention kernel + reduction kernel
-      launch<Kernel, 128>(params.fmla_params);
+      launch<Kernel, kGrfSize>(params.fmla_params);
       launch<ReductionKernel, 128>(params.reduction_params);
     }
 

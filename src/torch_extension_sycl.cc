@@ -20,6 +20,9 @@ limitations under the License.
 #include "sgl_kernel_ops.h"
 #include "sgl_kernel_torch_shim.h"
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+  m.def("weak_ref_tensor(Tensor(a) tensor) -> Tensor(a)");
+  m.impl("weak_ref_tensor", torch::kXPU, &weak_ref_tensor);
+
   m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
   m.impl("awq_dequantize", torch::kXPU, &awq_dequantize);
 
@@ -159,7 +162,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    Tensor?  scheduler_metadata,"
       "    int      num_kv_splits,"
       "    bool?    pack_gqa,"
-      "    int      sm_margin) -> Tensor[]");
+      "    int      sm_margin,"
+      "    Tensor(a!)?  out=None) -> (Tensor(a!), Tensor, Tensor, Tensor)");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
 
   m.def("flash_mla_get_workspace_size", &flash_mla_get_workspace_size);
@@ -169,6 +173,22 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor! "
       "page_table, Tensor! workspace, float sm_scale, int num_kv_splits) -> ()");
   m.impl("flash_mla_decode", torch::kXPU, &flash_mla_decode);
+
+  m.def(
+      "flash_mla_sparse_decode(Tensor! out, Tensor! lse_out, Tensor! q, Tensor! k_cache, "
+      "Tensor! indices, Tensor? topk_length, "
+      "Tensor? extra_k_cache, Tensor? extra_indices, Tensor? extra_topk_length, "
+      "Tensor? attn_sink, float sm_scale, int head_dim_v, bool is_fp8_kvcache) -> ()");
+  m.impl("flash_mla_sparse_decode", torch::kXPU, &flash_mla_sparse_decode);
+
+  m.def("flash_mla_prefill_get_workspace_size", &flash_mla_prefill_get_workspace_size);
+
+  m.def(
+      "flash_mla_prefill(Tensor! out, Tensor! q_nope, Tensor! q_pe, Tensor! kv_c_and_k_pe_cache, "
+      "Tensor! cu_seqlens_q, Tensor! seq_lens, int max_seqlen_q, "
+      "Tensor! page_table, Tensor! workspace, float sm_scale, bool causal, int num_kv_splits) -> ()");
+  ;
+  m.impl("flash_mla_prefill", torch::kXPU, &flash_mla_prefill);
 
   /*
    * From quantization ops
@@ -183,7 +203,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("sgl_per_token_group_quant_8bit_v2", torch::kXPU, &at::native::xpu::sgl_per_token_group_quant_8bit_v2);
   m.def(
       "sgl_per_token_group_quant_fp4(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
-      " float eps) -> ()");
+      " float eps, Tensor? input_secondary=None) -> ()");
   m.impl("sgl_per_token_group_quant_fp4", torch::kXPU, &at::native::xpu::sgl_per_token_group_quant_fp4);
   m.def("sgl_per_tensor_quant_fp8(Tensor input, Tensor output_q, Tensor output_s, bool is_static) -> ()");
   m.impl("sgl_per_tensor_quant_fp8", torch::kXPU, &sgl_per_tensor_quant_fp8);
@@ -240,6 +260,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value, "
       "Tensor? norm_weight=None, float? norm_eps=None) -> ()");
   m.impl("hc_pre_big_fuse", torch::kXPU, &hc_pre_big_fuse);
+
+  /* HC PRE GEMM + SQUARE SUM */
+  m.def("hc_pre_gemm_sqr_sum(Tensor! C, Tensor! sqr_sum, Tensor A, Tensor B) -> ()");
+  m.impl("hc_pre_gemm_sqr_sum", torch::kXPU, &hc_pre_gemm_sqr_sum);
+
   /*
    * From LoRA
    */
@@ -248,6 +273,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor weight_indices, "
       "Tensor lora_ranks, Tensor? extra_embeddings, Tensor? seg_lens) -> ()");
   m.impl("embedding_lora_a_fwd", torch::kXPU, &embedding_lora_a_fwd);
+
+  /* NSA (Native Sparse Attention) indexer scoring */
+  // fp8_mqa_logits (prefill) is implemented in pure Python via sgl_kernel.nsa.
+  m.def(
+      "fp8_paged_mqa_logits(Tensor q_fp8, Tensor kv_cache, Tensor weights, "
+      "Tensor seq_lens, Tensor block_tables, Tensor? schedule_metadata, "
+      "int max_seq_len, bool clean_logits) -> Tensor");
+  m.impl("fp8_paged_mqa_logits", torch::kXPU, &fp8_paged_mqa_logits);
 }
 
 REGISTER_EXTENSION(common_ops)

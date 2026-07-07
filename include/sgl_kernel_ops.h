@@ -463,11 +463,7 @@ void hc_pre_big_fuse(
  * hc_post
  */
 void hc_post(
-    const at::Tensor& x,
-    const at::Tensor& residual,
-    const at::Tensor& post,
-    const at::Tensor& comb,
-    at::Tensor& out);
+    const at::Tensor& x, const at::Tensor& residual, const at::Tensor& post, const at::Tensor& comb, at::Tensor& out);
 
 /*
  * hc_pre GEMM + row-wise square sum

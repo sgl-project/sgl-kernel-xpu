@@ -1,7 +1,7 @@
 import pytest
 import torch
-from sgl_kernel import hc_post
 import utils
+from sgl_kernel import hc_post
 
 device = utils.get_device()
 HC_MULT = 4
@@ -22,6 +22,7 @@ def _make_inputs(T, D, device, seed=42):
     comb = torch.rand(T, HC_MULT, HC_MULT, dtype=torch.float32, device=device)
     comb = comb / comb.sum(dim=-1, keepdim=True)
     return x, residual, post, comb
+
 
 @pytest.mark.parametrize("T", [16, 48, 128, 768, 885, 1021, 1024, 1280, 2047])
 @pytest.mark.parametrize("D", [4096])

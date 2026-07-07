@@ -81,23 +81,16 @@ inline void run_cumsum(sycl::nd_item<1>& item, int32_t* s_histogram_buf /* [2][k
   }
 }
 
-inline void fast_topk_radix(
-    sycl::nd_item<1>& item,
-    const float* input,
-    int32_t* index,
-    int row_start,
-    int length) {
+inline void fast_topk_radix(sycl::nd_item<1>& item, const float* input, int32_t* index, int row_start, int length) {
   auto g = item.get_group();
 
-  int32_t* s_histogram_buf =
-      *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[2 * kHistStride]>(g);
+  int32_t* s_histogram_buf = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[2 * kHistStride]>(g);
   int32_t& s_counter = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t>(g);
   int32_t& s_threshold_bin_id = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t>(g);
   int32_t* s_num_input = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[2]>(g);
   int32_t& s_last_remain = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t>(g);
   int32_t& s_topk = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t>(g);
-  int32_t* s_input_idx =
-      *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[2 * kSmemInputSize]>(g);
+  int32_t* s_input_idx = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[2 * kSmemInputSize]>(g);
 
   const int tx = static_cast<int>(item.get_local_id(0));
 

@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional
+from typing import Optional
 
 import torch
 
@@ -147,3 +147,95 @@ def hc_pre_big_fuse(
         norm_weight_arg,
         norm_eps_arg,
     )
+
+
+def hc_pre_gemm_sqr_sum(
+    C: torch.Tensor,
+    sqr_sum: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+) -> None:
+    torch.ops.sgl_kernel.hc_pre_gemm_sqr_sum.default(C, sqr_sum, A, B)
+
+
+def _mhc_pre_n_splits_pre(num_tokens: int) -> int:
+    return 32 if num_tokens <= 2048 else 1
+
+
+def mhc_pre(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 2.0,
+    sinkhorn_repeat: int = 20,
+    n_splits: Optional[int] = None,
+    n_splits_pre: Optional[int] = None,
+    norm_weight: Optional[torch.Tensor] = None,
+    norm_eps: float = 1e-6,
+):
+    if residual.dim() != 3:
+        raise ValueError(
+            f"residual must be [T, hc_mult, D] (3 dimensions), got {residual.dim()} "
+            f"(shape={tuple(residual.shape)})"
+        )
+    num_tokens = residual.size(0)
+    hc_mult = residual.size(1)
+    hidden_size = residual.size(2)
+    if hc_mult != 4:
+        raise ValueError(f"mhc_pre currently supports only hc_mult=4, got {hc_mult}")
+    hc_hidden = hc_mult * hidden_size
+    hc_mult3 = (2 + hc_mult) * hc_mult
+
+    if fn.size(0) != hc_mult3 or fn.size(1) != hc_hidden:
+        raise ValueError(f"fn must be [{hc_mult3}, {hc_hidden}], got {tuple(fn.shape)}")
+
+    if n_splits is not None and n_splits != 1:
+        raise ValueError(f"mhc_pre requires n_splits==1, got {n_splits}")
+    if n_splits_pre is None:
+        n_splits_pre = _mhc_pre_n_splits_pre(num_tokens)
+
+    device = residual.device
+
+    A = residual.reshape(num_tokens, hc_hidden)
+
+    gemm_out_mul = torch.empty(
+        n_splits_pre, num_tokens, hc_mult3, dtype=torch.float32, device=device
+    )
+    gemm_out_sqrsum = torch.empty(
+        n_splits_pre, num_tokens, dtype=torch.float32, device=device
+    )
+    hc_pre_gemm_sqr_sum(gemm_out_mul, gemm_out_sqrsum, A, fn)
+
+    post_mix = torch.empty(num_tokens, hc_mult, dtype=torch.float32, device=device)
+    comb_mix = torch.empty(
+        num_tokens, hc_mult, hc_mult, dtype=torch.float32, device=device
+    )
+    layer_input = torch.empty(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device=device
+    )
+
+    hc_pre_big_fuse(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual,
+        post_mix,
+        comb_mix,
+        layer_input,
+        hc_mult=hc_mult,
+        sinkhorn_iters=sinkhorn_repeat,
+        n_splits=n_splits_pre,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+    )
+
+    return post_mix, comb_mix, layer_input

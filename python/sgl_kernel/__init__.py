@@ -15,11 +15,14 @@ from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
     flash_mla_decode,
     flash_mla_get_workspace_size,
+    flash_mla_prefill,
+    flash_mla_prefill_get_workspace_size,
     flash_mla_with_kvcache,
     lightning_attention_decode,
     merge_state,
     merge_state_v2,
 )
+from sgl_kernel.dsv4 import *
 from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
     fused_add_rmsnorm,
@@ -56,7 +59,13 @@ from sgl_kernel.gemm import (
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.lora import embedding_lora_a_fwd
-from sgl_kernel.mhc import hc_pre_big_fuse, hc_split_sinkhorn
+from sgl_kernel.memory import weak_ref_tensor
+from sgl_kernel.mhc import (
+    hc_pre_big_fuse,
+    hc_pre_gemm_sqr_sum,
+    hc_split_sinkhorn,
+    mhc_pre,
+)
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     cutlass_fp4_group_mm,
@@ -72,6 +81,7 @@ from sgl_kernel.moe import (
     topk_sigmoid,
     topk_softmax,
 )
+from sgl_kernel.nsa import fp8_mqa_logits, fp8_paged_mqa_logits
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,
     top_k_renorm_prob,

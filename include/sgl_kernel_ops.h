@@ -105,6 +105,8 @@ void merge_state(
 void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 
+at::Tensor weak_ref_tensor(const at::Tensor& tensor);
+
 /*
  * From csrc/elementwise
  */
@@ -266,6 +268,21 @@ void bmm_fp8(
     at::Tensor workspace_buffer,
     int64_t cublas_handle,
     int64_t sycl_stream);
+
+/*
+ * From csrc/nsa (Native Sparse Attention)
+ */
+// fp8_mqa_logits (prefill) is implemented in pure Python via sgl_kernel.nsa.
+
+torch::Tensor fp8_paged_mqa_logits(
+    const torch::Tensor& q_fp8,
+    const torch::Tensor& kv_cache,
+    const torch::Tensor& weights,
+    const torch::Tensor& seq_lens,
+    const torch::Tensor& block_tables,
+    const std::optional<torch::Tensor>& schedule_metadata,
+    int64_t max_seq_len,
+    bool clean_logits);
 
 /*
  * From csrc/moe
@@ -456,6 +473,11 @@ void hc_pre_big_fuse(
     double hc_post_mult_value,
     std::optional<at::Tensor> norm_weight = std::nullopt,
     std::optional<double> norm_eps = std::nullopt);
+
+/*
+ * hc_pre GEMM + row-wise square sum
+ */
+void hc_pre_gemm_sqr_sum(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, const at::Tensor& B);
 
 /*
  * From csrc/speculative

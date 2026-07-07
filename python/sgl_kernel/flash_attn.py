@@ -132,6 +132,7 @@ def flash_attn_with_kvcache(
     pack_gqa=None,  # Can be tuned for speed
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
+    out=None,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -211,10 +212,19 @@ def flash_attn_with_kvcache(
            to automatically determine the number of splits.
            Don't change this unless you know what you are doing.
         return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
+        out [optional]: preallocated output buffer of shape (total_q, nheads, headdim_v),
+            dtype matching q, on the same XPU device as q, with a contiguous last dimension
+            (stride(-1) == 1). When provided, the kernel writes results directly into this
+            buffer and the returned tensor aliases it. Useful for XPU graph / torch.compile
+            capture to avoid allocating a new output tensor each step. Requires
+            ``page_table`` to be provided (paged KV cache); passing ``out`` without a
+            page table raises a ``RuntimeError``.
 
     Return:
-        out: (batch_size, seqlen, nheads, headdim).
-        softmax_lse [optional, if return_softmax_lse=True]: (batch_size, nheads, seqlen). The
+        out: (total_q, nheads, headdim_v), where total_q = batch_size * seqlen (non-varlen)
+            or the sum of actual sequence lengths (varlen). The tensor aliases the provided
+            ``out`` buffer when one is supplied.
+        softmax_lse [optional, if return_softmax_lse=True]: (nheads, total_q). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
@@ -245,7 +255,7 @@ def flash_attn_with_kvcache(
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
     rotary_seqlens = maybe_contiguous(rotary_seqlens)
 
-    if cu_seqlens_q == None:  # !is_varlen_q
+    if cu_seqlens_q is None:  # !is_varlen_q
         cu_seqlens_q = torch.arange(
             0, q.size(0) + 1, dtype=torch.int, device=q.device
         ) * q.size(1)
@@ -283,6 +293,7 @@ def flash_attn_with_kvcache(
         num_splits,
         pack_gqa,
         sm_margin,
+        out,
     )
     return (out, softmax_lse, *rest) if return_softmax_lse else out
 
@@ -320,7 +331,7 @@ def flash_attn_varlen_func(
         softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
             -0.5
         )
-    if cu_seqlens_q == None:  # !is_varlen_q
+    if cu_seqlens_q is None:  # !is_varlen_q
         cu_seqlens_q = torch.arange(
             0, q.size(0) + 1, dtype=torch.int, device=q.device
         ) * q.size(1)

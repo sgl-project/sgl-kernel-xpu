@@ -40,7 +40,7 @@ def torch_scaled_fp8_quant(tensor, inv_scale):
 
 @pytest.mark.parametrize(
     "num_tokens,hidden_dim",
-    list(itertools.product([128, 256, 512, 1024], [512, 2048, 4096, 8192])),
+    list(itertools.product([1, 128, 256, 512, 1024], [512, 2048, 4096, 5120, 8192])),
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_per_tensor_quant_compare_implementations(

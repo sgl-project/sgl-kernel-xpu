@@ -36,6 +36,15 @@ def is_xe3_device() -> bool:
     return is_xe3_arch()
 
 
+def cri_only(values):
+    """Extra parametrize values that are only exercised on CRI (Xe3) devices.
+
+    Returns ``values`` on CRI and an empty list everywhere else, so the CRI
+    topology shapes do not change coverage or runtime on other devices.
+    """
+    return list(values) if is_xe3_device() else []
+
+
 def get_reference_device():
     """Reference device for eager PyTorch baselines."""
     return get_device() if is_xe2_device() else torch.device("cpu")

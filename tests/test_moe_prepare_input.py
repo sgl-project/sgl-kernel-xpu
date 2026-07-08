@@ -3,6 +3,7 @@ import sys
 
 import pytest
 import torch
+import utils
 from sgl_kernel import (
     apply_shuffle_mul_sum,
     prepare_moe_input,
@@ -111,7 +112,9 @@ def test_prepare_moe_input_small_rejects_capacity_overflow(num_tokens, top_k, er
 @pytest.mark.parametrize("num_tokens", [1, 2, 5, 16, 64, 128, 224, 1024])
 @pytest.mark.parametrize("num_experts", [1, 4, 8, 32, 40, 64, 128, 256])
 @pytest.mark.parametrize("top_k", [1, 2, 4, 6, 8])
-@pytest.mark.parametrize("hidden_dims", [16, 32, 64, 128, 1024, 1536])
+@pytest.mark.parametrize(
+    "hidden_dims", [16, 32, 64, 128, 1024, 1536] + utils.cri_only([2048])
+)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("use_factors", [True, False])
 def test_prepare_input_moe(

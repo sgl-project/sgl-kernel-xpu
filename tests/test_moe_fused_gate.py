@@ -104,7 +104,7 @@ def biased_grouped_topk_native(
         (512, 16, 8, 16),
     ],
 )
-#@pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
+# @pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
 @pytest.mark.parametrize("num_fused_shared_experts", [0])
 @pytest.mark.parametrize("apply_routed_scaling_factor_on_output", [False, True])
 @pytest.mark.parametrize("scoring_func", ["sigmoid", "softmax"])

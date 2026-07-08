@@ -88,7 +88,7 @@ struct moe_fused_gate_impl {
           row_chunk[i] = static_cast<T>(1.0f / (1.0f + sycl::exp(x)));
         }
       } else {
-////////////////////// Softmax //////////////////////
+        ////////////////////// Softmax //////////////////////
         uint32_t lane = sg.get_local_id()[0];
         uint32_t logical_lane = lane & (params_.NUM_EXPERT_GROUPS - 1);
         uint32_t group_base = lane & ~(params_.NUM_EXPERT_GROUPS - 1);

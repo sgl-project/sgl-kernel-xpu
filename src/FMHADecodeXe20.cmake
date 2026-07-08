@@ -77,6 +77,19 @@ foreach(QG_SZ ${FMHA_DECODE_QG_SIZES})
         endif()
 
         foreach(PAGE_SIZE ${FMHA_DECODE_PAGE_SIZES})
+            # KV loop tile for the PAGED decode path, decoupled from PAGE_SIZE.
+            # The mainloop remaps a KV tile smaller than the page via
+            # tiles_per_page = page_size / TileK, so the compile-time KV tile can
+            # be capped independently of the runtime page size. Cap at 64 to
+            # mirror vLLM's fixed kv_tile=_64 (keeps SGPerWG=TileK/16 at 4 so the
+            # epilogue SLM reduction buffer fits for MLA head_size_vo=512). Must
+            # be a multiple of 16.
+            if(PAGE_SIZE LESS 64)
+                set(TILED_KV_PAGED ${PAGE_SIZE})
+            else()
+                set(TILED_KV_PAGED 64)
+            endif()
+
             set(GENERATED_FILE
                 "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_kernel_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}.cpp")
             configure_file(${FMHA_DECODE_TEMPLATE} ${GENERATED_FILE} @ONLY)

@@ -1987,5 +1987,91 @@ def test_flash_attn_with_kvcache_out_buffer():
     ), "out-buffer result differs from reference"
 
 
+@pytest.mark.skipif(device.type != "xpu", reason="XPU not available")
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("nheads_q", [8, 4, 1])
+@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize("seqlen_k", [128, 500])
+@pytest.mark.parametrize("batch_size", [1, 3])
+def test_flash_attn_mla_decode_kvcache(
+    batch_size, seqlen_k, page_size, nheads_q, dtype
+):
+    """MLA (DeepSeek) absorbed decode via packed-576 ``flash_attn_with_kvcache``.
+
+    The query is packed as ``[q_nope(512), q_pe(64)] = 576``, the paged KV cache
+    row is the full latent+rope vector (576), and the value is the leading
+    ``kv_lora_rank``-wide slice (c_kv) of that same cache. The score uses the full
+    576-wide QK dim while the output value dim is 512, exercising the asymmetric
+    ``head_size_qk != head_size_vo`` decode path (dispatched by ``params.dv``).
+
+    On Intel Xe the 576-wide QK tile only fits in shared local memory for up to 8
+    query heads per KV head, so this test keeps ``nheads_q <= 8``; larger group
+    sizes (e.g. nheads_q=16) are rejected fast with a RuntimeError.
+    """
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    torch.random.manual_seed(0)
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    head_dim = kv_lora_rank + qk_rope_head_dim  # 576 (packed QK dim)
+    v_head_dim = kv_lora_rank  # 512 (value / output dim)
+    nheads_kv = 1  # MLA latent cache has a single KV head
+    seqlen_q = 1  # decode step
+
+    num_blocks_per_seq = (seqlen_k + page_size - 1) // page_size
+    num_blocks = num_blocks_per_seq * batch_size
+    seqlen_k_padded = num_blocks_per_seq * page_size
+
+    q = torch.randn(
+        batch_size, seqlen_q, nheads_q, head_dim, device=device, dtype=dtype
+    )
+    kv_cache = torch.randn(
+        num_blocks, page_size, nheads_kv, head_dim, device=device, dtype=dtype
+    )
+    # Value is the leading kv_lora_rank slice of the same cache (narrow view with
+    # a contiguous last dim, i.e. stride(-1) == 1).
+    v_cache = kv_cache[..., :v_head_dim]
+
+    page_table = torch.arange(num_blocks, dtype=torch.int32, device=device).view(
+        batch_size, num_blocks_per_seq
+    )
+    cache_seqlens = torch.randint(
+        1, seqlen_k + 1, (batch_size,), dtype=torch.int32, device=device
+    )
+    cache_seqlens[-1] = seqlen_k  # ensure at least one full-length sequence
+
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    out = flash_attn_with_kvcache(
+        q=q,
+        k_cache=kv_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        softmax_scale=softmax_scale,
+        causal=False,
+    )
+
+    # Reference: gather the (sequentially paged) cache into a dense per-batch
+    # layout, mask padded positions with cache_seqlens, and compute attention with
+    # the full 576-wide QK dim and the narrow 512-wide value.
+    k_ref = kv_cache.view(batch_size, seqlen_k_padded, nheads_kv, head_dim)
+    v_ref = k_ref[..., :v_head_dim]
+    arange = rearrange(torch.arange(seqlen_k_padded, device=device), "s -> 1 s")
+    key_padding_mask = arange < rearrange(cache_seqlens, "b -> b 1")
+    out_ref, _ = attention_ref(
+        q,
+        k_ref,
+        v_ref,
+        softmax_scale,
+        key_padding_mask=key_padding_mask,
+        causal=False,
+    )
+
+    torch.xpu.synchronize()
+    out = out.reshape(batch_size, seqlen_q, nheads_q, v_head_dim)
+    assert (out - out_ref).abs().max().item() <= 2e-2
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

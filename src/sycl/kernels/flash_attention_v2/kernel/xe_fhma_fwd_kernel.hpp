@@ -365,10 +365,27 @@ class XeFMHAFwdKernel {
       auto dcK_cache = const_cast<ElementK*>(p.K_cache + offset_k_cache);
       auto dcV_cache = const_cast<ElementV*>(p.V_cache + offset_v_cache);
       auto dcO = const_cast<ElementO*>(p.O + offset_o);
-      // NHD layout for GQA
+      // NHD layout for GQA. K_cache/V_cache read the paged KV cache, so their
+      // layouts must use the cache strides (dK_cache/dV_cache), not the
+      // "new KV" strides (dK/dV). These coincide for symmetric attention, but
+      // for MLA the value head dim (head_size_vo) is narrower than the packed
+      // cache row (head_size_qk), so dV's seq stride (num_heads_kv*head_size_vo)
+      // undercounts the real cache row pitch; dV_cache carries the true stride.
       auto layout_q = is_var_len ? make_ordered_layout(shape_Q, VarLenQLayoutStep_{}) : make_layout(shape_Q, p.dQ);
-      auto layout_k = is_var_len ? make_ordered_layout(shape_K, VarLenKLayoutStep_{}) : make_layout(shape_K, p.dK);
-      auto layout_v = is_var_len ? make_ordered_layout(shape_V, VarLenVLayoutStep_{}) : make_layout(shape_V, p.dV);
+      auto layout_k =
+          is_var_len ? make_ordered_layout(shape_K, VarLenKLayoutStep_{}) : make_layout(shape_K, p.dK_cache);
+      // V_cache reads the paged/ragged KV cache, so its layout MUST use the real
+      // per-row cache stride (dV_cache), not a compact head_size_vo-wide layout.
+      // For symmetric attention head_size_vo == head_size_qk, so the compact
+      // ordered layout (VarLenVLayoutStep_) coincides with dV_cache. But for MLA
+      // the value head dim (head_size_vo=512) is narrower than the shared cache
+      // row (head_size_qk=576): the compact ordered layout would stride V by
+      // num_heads_kv*head_size_vo (512), reading the wrong row pitch and mixing
+      // in the k_pe/rope tail of the previous token. dV_cache carries the true
+      // stride (num_heads_kv*head_size_qk), so honor it in both the varlen and
+      // fixed-length cases. K is unaffected because its head dim already equals
+      // the cache row width, so its ordered layout is correct.
+      auto layout_v = make_layout(shape_V, p.dV_cache);
 
       // NHD layout for GQA
       auto layout_o = is_var_len ? make_ordered_layout(shape_O, VarLenOLayoutStep_{}) : make_layout(shape_O, p.dO);

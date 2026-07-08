@@ -125,33 +125,37 @@ EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(512)
     }                                                                                         \
   } while (0)
 
-#define DISPATCH_DECODE_HEAD_DIM(QG)                                                  \
-  do {                                                                                \
-    switch (params.d) {                                                               \
-      case 64:                                                                        \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 64);                                            \
-        break;                                                                        \
-      case 72:                                                                        \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 72);                                            \
-        break;                                                                        \
-      case 96:                                                                        \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 96);                                            \
-        break;                                                                        \
-      case 128:                                                                       \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 128);                                           \
-        break;                                                                        \
-      case 192:                                                                       \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 192);                                           \
-        break;                                                                        \
-      case 256:                                                                       \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 256);                                           \
-        break;                                                                        \
-      case 512:                                                                       \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 512);                                           \
-        break;                                                                        \
-      default:                                                                        \
-        TORCH_CHECK(false, "Unsupported head size for decode attention: ", params.d); \
-    }                                                                                 \
+// Dispatch on params.dv (head_size_vo): the decode kernel is templated on the
+// output/value head dim, while the QK head dim is handled at runtime. For MLA
+// (head_size_qk=576, head_size_vo=512) this selects the dv=512 kernel; for
+// symmetric attention params.d == params.dv so it is unchanged.
+#define DISPATCH_DECODE_HEAD_DIM(QG)                                                   \
+  do {                                                                                 \
+    switch (params.dv) {                                                               \
+      case 64:                                                                         \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 64);                                             \
+        break;                                                                         \
+      case 72:                                                                         \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 72);                                             \
+        break;                                                                         \
+      case 96:                                                                         \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 96);                                             \
+        break;                                                                         \
+      case 128:                                                                        \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 128);                                            \
+        break;                                                                         \
+      case 192:                                                                        \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 192);                                            \
+        break;                                                                         \
+      case 256:                                                                        \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 256);                                            \
+        break;                                                                         \
+      case 512:                                                                        \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 512);                                            \
+        break;                                                                         \
+      default:                                                                         \
+        TORCH_CHECK(false, "Unsupported head size for decode attention: ", params.dv); \
+    }                                                                                  \
   } while (0)
 
 #define DISPATCH_DECODE(qg_sz)                                                                      \

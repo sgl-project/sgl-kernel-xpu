@@ -69,14 +69,25 @@ void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Argume
 #endif
 
 #if @EMIT_PAGED@
-  using TileShapeQK = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@PAGE_SIZE@>, cute::_64>;
-  using TileShapePV = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@PAGE_SIZE@>>;
+  // KV loop tile (@TILED_KV_PAGED@) is DECOUPLED from the runtime page_size
+  // (@PAGE_SIZE@ selects this TU; params.page_size carries the real page size).
+  // The mainloop's get_physical_k_tile() already remaps a KV tile that is
+  // smaller than the page via tiles_per_page = page_size / TileK, so the KV
+  // tile can be capped independently of page_size. We cap it at 64 (mirroring
+  // vLLM's fixed kv_tile=_64 paged decode): the epilogue cross-SG reduction
+  // buffer is q_packed * head_size_vo * SGPerWG * sizeof(float) with
+  // SGPerWG = TileK/16. For MLA (head_size_vo=512) and q_packed=8, TileK=128
+  // needs 128 KiB (exceeds the per-WG SLM cap and hangs at submit) while
+  // TileK=64 needs 64 KiB (fits). Capping at 64 makes page_size=128 behave
+  // like the working page_size=64 path. page_size<64 (e.g. 32) keeps TileK=page_size.
+  using TileShapeQK = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@TILED_KV_PAGED@>, cute::_64>;
+  using TileShapePV = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@TILED_KV_PAGED@>>;
   // Round the head-dim of the output tile up to a multiple of get<1>(TileShapePV) (32) so that
   // VTiles = get<1>(TileShapeOutput) / get<1>(TileShapePV) covers the full head dimension when
   // HEAD_DIM is not a multiple of 32 (e.g. HEAD_DIM=72 -> 96, VTiles=3). The actual O surface is
   // bounded by head_size_vo, so HW clips the OOB tail writes in the epilogue.
   using TileShapeOutput = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;
-  using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<@PAGE_SIZE@ / 16>, cute::_1>>;
+  using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<@TILED_KV_PAGED@ / 16>, cute::_1>>;
 
   // FP8 KV cache: Q is bf16 or fp16 while K/V cache are fp8 (e4m3 or e5m2); the
   // mainloop dequantizes K/V with the per-tensor k/v descale. Sink logits are

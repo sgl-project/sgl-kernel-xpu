@@ -296,6 +296,32 @@ struct DecodeRunner {
     stride_O = cutlass::make_stride(
         num_heads_q * head_size_vo, Int<1>{}, head_size_vo, head_size_vo * num_heads_q * seq_len_qo);
 
+    // Honor the actual KV-cache tensor strides when the host supplies them
+    // (params.*_stride_*), mirroring the split-decode runner and the vLLM
+    // paged-decode kernel. This supports non-contiguous / combined layouts such
+    // as the MLA latent+rope KV cache, where V is a narrow (head_size_vo-wide)
+    // view of a head_size_qk-wide cache row: its physical seq/head/page strides
+    // follow the underlying buffer, NOT head_size_vo. The head-dim stride is
+    // contiguous (_1), enforced at the API boundary. When strides are not
+    // supplied the packed recompute above (symmetric layout) is kept.
+    if (params.k_stride_seq > 0) {
+      constexpr int64_t kIntMax = static_cast<int64_t>(std::numeric_limits<int>::max());
+      TORCH_CHECK(
+          params.k_stride_seq <= kIntMax && params.k_stride_heads <= kIntMax && params.k_stride_page <= kIntMax &&
+              params.v_stride_seq <= kIntMax && params.v_stride_heads <= kIntMax && params.v_stride_page <= kIntMax,
+          "KV cache stride exceeds int32 max");
+      stride_K_cache = cutlass::make_stride(
+          static_cast<int>(params.k_stride_seq),
+          Int<1>{},
+          static_cast<int>(params.k_stride_heads),
+          static_cast<int>(params.k_stride_page));
+      stride_V_cache = cutlass::make_stride(
+          Int<1>{},
+          static_cast<int>(params.v_stride_seq),
+          static_cast<int>(params.v_stride_heads),
+          static_cast<int>(params.v_stride_page));
+    }
+
     if constexpr (isVarLen) {
       shape.seq_len_qo.cumulative_length = params.cu_seqlens_q;
       shape.seq_len_kv.cumulative_length = params.cu_seqlens_knew;

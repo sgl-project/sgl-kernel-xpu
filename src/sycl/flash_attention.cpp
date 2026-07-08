@@ -382,8 +382,9 @@ std::vector<at::Tensor> mha_fwd(
     TORCH_CHECK(batch_size == batch_size_k, "batch_size must be equal to batch_size_k");
   }
 
-  // Currently only support head dims <= 512
-  static constexpr int max_headdim = 512;
+  // Currently only support head dims <= 512, except MLA which packs the query as
+  // [q_nope, q_pe] with a 576-wide QK head dim and a 512-wide value head dim.
+  static constexpr int max_headdim = 576;
   TORCH_CHECK(head_size <= max_headdim, "FlashAttention forward only supports head dimension at most ", max_headdim);
   TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
@@ -457,7 +458,10 @@ std::vector<at::Tensor> mha_fwd(
     num_kv_splits = get_num_splits(batch_size, num_heads_k, seqlen_k, page_size);
   }
   // Only split when the resolved count is > 1; -1 / 1 fall back to non-split.
-  params.use_split_kv = num_kv_splits > 1;
+  // MLA packs the query as [q_nope, q_pe] so head_size_qk (576) differs from
+  // head_size_vo (512); the split-KV runner assumes head_size_vo == head_size_qk,
+  // so force the non-split decode runner for the asymmetric (MLA) case.
+  params.use_split_kv = num_kv_splits > 1 && head_size == head_size_v;
   if (params.use_split_kv) {
     temp_out = torch::empty({total_q, num_kv_splits * num_heads, head_size_v}, q.options().device(q.device()));
 
@@ -648,11 +652,30 @@ std::vector<at::Tensor> mha_fwd(
   int qg_sz = nextPowerOf2(params.q_group_size);
   TORCH_CHECK(qg_sz >= 1 && qg_sz <= 16, "Unsupported q_group_size for decode attention: ", params.q_group_size);
   // Paged decode supports its own (independent) set of head dims; see
-  // FMHA_DECODE_PAGED_HEAD_DIMS in FMHADecodeXe20.cmake.
+  // FMHA_DECODE_PAGED_HEAD_DIMS in FMHADecodeXe20.cmake. The kernel is selected
+  // by the value head dim (params.dv); the QK head dim (params.d) is consumed at
+  // runtime by the mainloop, so MLA's asymmetric 576/512 shape maps onto the
+  // dv==512 kernel.
   TORCH_CHECK(
-      params.d == 64 || params.d == 96 || params.d == 128 || params.d == 192 || params.d == 256 || params.d == 512,
-      "Unsupported head size for paged decode attention: ",
-      params.d);
+      params.dv == 64 || params.dv == 96 || params.dv == 128 || params.dv == 192 || params.dv == 256 ||
+          params.dv == 512,
+      "Unsupported value head size for paged decode attention: ",
+      params.dv);
+  TORCH_CHECK(
+      params.d == params.dv || (params.d == 576 && params.dv == 512),
+      "Paged decode attention only supports head_size_qk == head_size_vo, or the MLA shape "
+      "(head_size_qk=576, head_size_vo=512); got head_size_qk=",
+      params.d,
+      " head_size_vo=",
+      params.dv);
+  // MLA (head_size_qk=576) packs a wider Q/K tile into shared local memory; on
+  // Intel Xe the SLM budget only fits up to 8 query heads per KV head. Reject
+  // larger group sizes up front so the launch fails fast instead of hanging.
+  TORCH_CHECK(
+      !(params.d > 512 && qg_sz > 8),
+      "MLA decode (head_size_qk=576) supports at most 8 query heads per KV head due to Intel Xe "
+      "shared-local-memory limits; got q_group_size=",
+      params.q_group_size);
   TORCH_CHECK(
       params.page_size == 64 || params.page_size == 128,
       "Unsupported page size for decode attention: ",

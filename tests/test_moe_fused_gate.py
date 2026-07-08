@@ -14,7 +14,6 @@ import torch
 from sgl_kernel import moe_fused_gate
 
 
-@torch.compile
 def biased_grouped_topk_native(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -27,10 +26,17 @@ def biased_grouped_topk_native(
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    scoring_func: str = "sigmoid",
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
-    scores = gating_output.sigmoid()
+    if scoring_func == "sigmoid":
+        scores = gating_output.sigmoid()
+    elif scoring_func == "softmax":
+        scores = torch.softmax(gating_output, dim=-1)
+    else:
+        raise ValueError(f"Unknown scoring_func: {scoring_func}")
+
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
     scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
@@ -98,11 +104,16 @@ def biased_grouped_topk_native(
         (512, 16, 8, 16),
     ],
 )
-# @pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
+#@pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
 @pytest.mark.parametrize("num_fused_shared_experts", [0])
 @pytest.mark.parametrize("apply_routed_scaling_factor_on_output", [False, True])
+@pytest.mark.parametrize("scoring_func", ["sigmoid", "softmax"])
 def test_moe_fused_gate_combined(
-    seq_length, params, num_fused_shared_experts, apply_routed_scaling_factor_on_output
+    seq_length,
+    params,
+    num_fused_shared_experts,
+    apply_routed_scaling_factor_on_output,
+    scoring_func,
 ):
     num_experts, num_expert_group, topk_group, topk = params
     dtype = torch.float32
@@ -110,7 +121,11 @@ def test_moe_fused_gate_combined(
     torch.manual_seed(seq_length)
     tensor = torch.rand((seq_length, num_experts), dtype=dtype, device="xpu")
     scores = tensor.clone()
-    bias = torch.rand(num_experts, dtype=dtype, device="xpu")
+    if scoring_func == "1":
+        # grouped_topk with softmax activation doesn't have bias
+        bias = torch.zeros(num_experts, dtype=dtype, device="xpu")
+    else:
+        bias = torch.rand(num_experts, dtype=dtype, device="xpu")
     topk = topk + num_fused_shared_experts
     output, indices = moe_fused_gate(
         tensor,
@@ -121,6 +136,7 @@ def test_moe_fused_gate_combined(
         num_fused_shared_experts=num_fused_shared_experts,
         routed_scaling_factor=2.5,
         apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        scoring_func=scoring_func,
     )
     ref_output, ref_indices = biased_grouped_topk_native(
         scores,
@@ -133,6 +149,7 @@ def test_moe_fused_gate_combined(
         num_fused_shared_experts=num_fused_shared_experts,
         routed_scaling_factor=2.5,
         apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        scoring_func=scoring_func,
     )
 
     # When num_fused_shared_experts > 0, ignore the comparison of the last topk dimension

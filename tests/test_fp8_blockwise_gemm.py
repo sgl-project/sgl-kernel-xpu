@@ -3,6 +3,7 @@ Copyright (C) 2026 Intel Corporation, All rights reserved.
 SPDX-License-Identifier: BSD-3-Clause
 """
 
+import os
 import sys
 from typing import Optional, Type
 
@@ -12,6 +13,10 @@ import utils
 from sgl_kernel import fp8_blockwise_scaled_mm
 
 device = utils.get_device()
+
+# Gate the production-sized shapes behind LONG_TESTS=1 -- they are infeasible
+# on the CRI simulator, where each GEMM launch is ~seconds.
+LONG_TESTS = os.getenv("LONG_TESTS") == "1"
 
 
 def cdiv(a: int, b: int) -> int:
@@ -92,12 +97,27 @@ def _test_accuracy_once(M, N, K, out_dtype, device):
     torch.testing.assert_close(out, ref, rtol=rtol, atol=atol)
 
 
+@pytest.mark.skipif(
+    not utils.is_xe3_device(),
+    reason="fp8_blockwise_scaled_mm is only registered on Xe3 (CRI) builds",
+)
 # K and N must be multiples of 128 for the blockwise (1,128)+(128,128) kernel.
-# Shape set kept small so the CI simulator can finish it in a reasonable time;
-# each GEMM launch is ~seconds on the CRI simulator.
-@pytest.mark.parametrize("M", [1, 128, 512])
-@pytest.mark.parametrize("N", [128, 256, 512])
-@pytest.mark.parametrize("K", [128, 256, 512])
+# The default shape set is kept small so the CI simulator can finish it in a
+# reasonable time; the production-sized sweep is gated on LONG_TESTS=1.
+# The small non-multiple-of-128 M values are cheap and cover the ragged-M path.
+@pytest.mark.parametrize(
+    "M", [1, 3, 5, 127, 128, 512] + ([1024, 4096] if LONG_TESTS else [])
+)
+@pytest.mark.parametrize(
+    "N",
+    [128, 256, 512]
+    + ([768, 1024, 2048, 4096, 5120, 8192, 14080, 25600, 28672] if LONG_TESTS else []),
+)
+@pytest.mark.parametrize(
+    "K",
+    [128, 256, 512]
+    + ([1024, 2048, 4096, 5120, 8192, 14080, 16384] if LONG_TESTS else []),
+)
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 def test_accuracy(M, N, K, out_dtype):
     _test_accuracy_once(M, N, K, out_dtype, device)

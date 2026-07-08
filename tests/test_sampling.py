@@ -64,7 +64,7 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
 
 
 @pytest.mark.parametrize("batch_size", [1, 16, 128])
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256] + utils.cri_only([151936]))
 @pytest.mark.parametrize("k_range", [(10, 50), (50, 200)])
 @pytest.mark.parametrize("p_range", [(0.1, 0.3), (0.3, 0.7)])
 def test_top_k_top_p_joint_sampling_from_probs_array(
@@ -146,7 +146,7 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
 
 
 @pytest.mark.parametrize("batch_size", [1, 16, 128])
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256] + utils.cri_only([151936]))
 @pytest.mark.parametrize("p_range", [(0.1, 0.5), (0.5, 0.9)])
 def test_top_p_renorm_probs_array(batch_size, vocab_size, p_range):
     p_min, p_max = p_range
@@ -204,7 +204,7 @@ def torch_top_k_renorm_probs(normalized_prob, k):
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256] + utils.cri_only([151936]))
 @pytest.mark.parametrize("k", [10, 100, 500])
 def test_top_k_renorm_probs(batch_size, vocab_size, k):
     # Note: SYCL kernel clamps k > vocab_size to vocab_size
@@ -226,7 +226,7 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k):
 
 
 @pytest.mark.parametrize("batch_size", [1, 16, 128])
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256] + utils.cri_only([151936]))
 @pytest.mark.parametrize("k_range", [(10, 50), (50, 200)])
 def test_top_k_renorm_probs_array(batch_size, vocab_size, k_range):
     # Note: SYCL kernel clamps k > vocab_size to vocab_size
@@ -272,7 +272,7 @@ def torch_min_p_sampling(batch_size, vocab_size, p, normalized_prob):
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256] + utils.cri_only([151936]))
 @pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
 @pytest.mark.parametrize("dtype", [torch.float32])
 def test_min_p_sampling(batch_size, vocab_size, p, dtype):
@@ -296,7 +296,7 @@ def test_min_p_sampling(batch_size, vocab_size, p, dtype):
 
 
 @pytest.mark.parametrize("batch_size", [1, 16, 128])
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256] + utils.cri_only([151936]))
 @pytest.mark.parametrize("p_range", [(0.05, 0.2), (0.2, 0.7)])
 @pytest.mark.parametrize("dtype", [torch.float32])
 def test_min_p_sampling_array(batch_size, vocab_size, p_range, dtype):

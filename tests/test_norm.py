@@ -75,8 +75,9 @@ def fused_add_rms_norm(x, residual, weight, eps):
     [
         *[
             (batch_size, hidden_size, dtype)
-            for batch_size in [1, 19, 99, 989]
+            for batch_size in [1, 19, 99, 989] + utils.cri_only([128])
             for hidden_size in [111, 500, 1024, 2880, 3072, 3584, 4096, 8192, 16384]
+            + utils.cri_only([2048, 5120])
             for dtype in [torch.float16, torch.bfloat16]
         ],
         # gpt-oss: bf16 input + bf16 weight, H = 2880, prefill batch.
@@ -107,8 +108,9 @@ def test_norm(batch_size, hidden_size, dtype, specify_out):
     [
         *[
             (batch_size, hidden_size, dtype)
-            for batch_size in [1, 19, 99, 989]
+            for batch_size in [1, 19, 99, 989] + utils.cri_only([128])
             for hidden_size in [111, 500, 1024, 2880, 3072, 3584, 4096, 8192, 16384]
+            + utils.cri_only([2048, 5120])
             for dtype in [torch.float16, torch.bfloat16, torch.float32]
         ],
         # gpt-oss: bf16 input + bf16 weight, H = 2880, prefill batch.

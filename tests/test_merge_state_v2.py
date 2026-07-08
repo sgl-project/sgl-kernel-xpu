@@ -137,8 +137,8 @@ def merge_state_torch(
     return output, output_lse
 
 
-NUM_BATCH_TOKENS = [256, 512, 613, 1024, 1536]
-NUM_QUERY_HEADS = [8, 16, 32]
+NUM_BATCH_TOKENS = [256, 512, 613, 1024, 1536] + utils.cri_only([1])
+NUM_QUERY_HEADS = [8, 16, 32] + utils.cri_only([64])
 HEAD_SIZES = [32, 48, 64, 128, 256]
 DTYPES = [torch.half, torch.bfloat16]
 

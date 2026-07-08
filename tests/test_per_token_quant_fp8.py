@@ -37,16 +37,21 @@ def sglang_per_token_quant_fp8(
     return output, scale
 
 
+# num_tokens sweep spans both kernels: small batches (<=512) take the
+# work-group-per-token path; large batches (8192) take the sub-group-per-token
+# warp path. hidden_dims include non-16-divisible sizes to exercise the
+# vec-width fallback.
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     "num_tokens,hidden_dim",
-    list(itertools.product([128, 256, 512], [512, 1076, 1368, 2048, 4096])),
+    list(itertools.product([128, 256, 512, 8192], [512, 1076, 1368, 2048, 4096])),
 )
 def test_per_token_quant_compare_implementations(
+    dtype: torch.dtype,
     num_tokens: int,
     hidden_dim: int,
 ):
-    device = device
-    x = torch.rand((num_tokens, hidden_dim), dtype=torch.float16, device=device)
+    x = torch.rand((num_tokens, hidden_dim), dtype=dtype, device=device)
 
     sglang_out, sglang_scale = sglang_per_token_quant_fp8(x)
     torch_out = torch_per_token_quant_fp8(x, sglang_scale)

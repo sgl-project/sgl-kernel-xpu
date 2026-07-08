@@ -121,7 +121,7 @@ def test_moe_fused_gate_combined(
     torch.manual_seed(seq_length)
     tensor = torch.rand((seq_length, num_experts), dtype=dtype, device="xpu")
     scores = tensor.clone()
-    if scoring_func == "1":
+    if scoring_func == "softmax":
         # grouped_topk with softmax activation doesn't have bias
         bias = torch.zeros(num_experts, dtype=dtype, device="xpu")
     else:

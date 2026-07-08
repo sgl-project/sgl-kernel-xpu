@@ -119,9 +119,8 @@ def moe_fused_gate(
     # apply_routed_scaling_factor_on_output: if true, output will be
     #   scaled by the routed_scaling_factor
     scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
-    assert (
-        scoring_func_int is not None
-    ), f"Unknown scoring_func '{scoring_func}', must be one of {list(_SCORING_FUNC_MAP.keys())}"
+    if scoring_func_int is None:
+        assert (f"Unknown scoring_func '{scoring_func}', must be one of {list(_SCORING_FUNC_MAP.keys())}"
     return torch.ops.sgl_kernel.moe_fused_gate.default(
         input_tensor,
         bias,

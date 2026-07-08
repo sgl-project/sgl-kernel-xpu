@@ -9,3 +9,4 @@ from .flash_compress_128_torch import (
     flash_compress128_decode,
     flash_compress128_prefill,
 )
+from .hadamard import hadamard_transform

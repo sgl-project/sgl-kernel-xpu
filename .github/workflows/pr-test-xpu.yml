@@ -79,6 +79,7 @@ jobs:
               python3 bench_per_token_group_quant_mxfp4_fusion.py 2>&1 | tee bench_per_token_group_quant_mxfp4_fusion.py.log && \
               python3 bench_scatter_tokens_to_experts.py 2>&1 | tee bench_scatter_tokens_to_experts.py.log && \
               python3 bench_top_k_renorm_probs.py 2>&1 | tee bench_top_k_renorm_probs.py.log && \
+              python3 bench_top_p_renorm_probs.py 2>&1 | tee bench_top_p_renorm_probs.py.log && \
               python3 bench_hc_split_sinkhorn.py 2>&1 | tee bench_hc_split_sinkhorn.py.log && \
               python3 bench_hc_pre_fuse.py 2>&1 | tee bench_hc_pre_fuse.py.log && \
               python3 bench_embedding_lora_a_fwd.py 2>&1 | tee bench_embedding_lora_a_fwd.py.log && \

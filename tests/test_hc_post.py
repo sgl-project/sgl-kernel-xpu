@@ -27,13 +27,10 @@ def _make_inputs(T, D, device, seed=42):
 @pytest.mark.parametrize("T", [16, 48, 128, 768, 885, 1021, 1024, 1280, 2047])
 @pytest.mark.parametrize("D", [4096])
 def test_hc_post_kernel(T, D):
-    x, residual, post, comb = _make_inputs(T, D, device=f"{device}:0")
+    x, residual, post_layer_mix, comb_res_mix = _make_inputs(T, D, device=f"{device}:0")
 
-    expected = hc_post_torch_impl(x, residual, post, comb)
+    expected = hc_post_torch_impl(x, residual, post_layer_mix, comb_res_mix)
 
-    comb_flat = comb.reshape(T, -1)
-
-    out = torch.empty(T, HC_MULT, D, dtype=torch.bfloat16, device=f"{device}:0")
-    hc_post(x, residual, post, comb_flat, out)
+    out = hc_post(x, residual, post_layer_mix, comb_res_mix)
 
     torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)

@@ -50,18 +50,15 @@ def benchmark(b_s, seq_len, hidden_size, provider):
     # Create inputs
     x = torch.randn(T, D, dtype=torch.bfloat16, device="xpu")
     residual = torch.randn(T, hc, D, dtype=torch.bfloat16, device="xpu")
-    post = torch.randn(T, hc, dtype=torch.float32, device="xpu")
-    comb = torch.randn(T, hc * hc, dtype=torch.float32, device="xpu")
-
-    # Create output tensor
-    out = torch.empty(T, hc, D, dtype=torch.bfloat16, device="xpu")
+    post_layer_mix = torch.randn(T, hc, dtype=torch.float32, device="xpu")
+    comb_res_mix = torch.randn(T, hc, hc, dtype=torch.float32, device="xpu")
 
     # Warmup
-    for _ in range(10):
-        hc_post(x, residual, post, comb, out)
+    for _ in range(100):
+        hc_post(x, residual, post_layer_mix, comb_res_mix)
     torch.xpu.synchronize()
 
-    bench_lambda = lambda: hc_post(x, residual, post, comb, out)
+    bench_lambda = lambda: hc_post(x, residual, post_layer_mix, comb_res_mix)
 
     quantiles = [0.5, 0.25, 0.75]
     ms, _, _ = triton.testing.do_bench(
@@ -71,13 +68,13 @@ def benchmark(b_s, seq_len, hidden_size, provider):
     torch.xpu.empty_cache()
 
     # Calculate memory bandwidth
-    # Inputs: x, residual, post, comb
+    # Inputs: x, residual, post_layer_mix, comb_res_mix
     # Outputs: out
     read_bytes = (
         T * D * 2  # x (bf16)
         + T * hc * D * 2  # residual (bf16)
-        + T * hc * 4  # post (fp32)
-        + T * hc * hc * 4  # comb (fp32)
+        + T * hc * 4  # post_layer_mix (fp32)
+        + T * hc * hc * 4  # comb_res_mix (fp32)
     )
     write_bytes = T * hc * D * 2  # out (bf16)
     total_bytes = read_bytes + write_bytes

@@ -152,11 +152,12 @@ def hc_pre_big_fuse(
 def hc_post(
     x: torch.Tensor,
     residual: torch.Tensor,
-    post: torch.Tensor,
-    comb: torch.Tensor,
-    out: torch.Tensor,
-) -> None:
-    torch.ops.sgl_kernel.hc_post.default(x, residual, post, comb, out)
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    out = torch.empty_like(residual)
+    torch.ops.sgl_kernel.hc_post.default(x, residual, post_layer_mix, comb_res_mix, out)
+    return out
 
 
 def hc_pre_gemm_sqr_sum(

@@ -16,7 +16,7 @@ struct HCPostKernel {
   const scalar_t* __restrict__ x;         // [T, D]     bf16
   const scalar_t* __restrict__ residual;  // [T, HC, D] bf16
   const float* __restrict__ post;         // [T, HC]    fp32
-  const float* __restrict__ comb;         // [T, HC*HC] fp32
+  const float* __restrict__ comb;         // [T, HC, HC] fp32
 
   scalar_t* __restrict__ out;  // [T, HC, D] bf16
 
@@ -138,17 +138,21 @@ static void launch_hc_post_kernel(
 }
 
 void hc_post(
-    const at::Tensor& x, const at::Tensor& residual, const at::Tensor& post, const at::Tensor& comb, at::Tensor& out) {
+    const at::Tensor& x,
+    const at::Tensor& residual,
+    const at::Tensor& post_layer_mix,
+    const at::Tensor& comb_res_mix,
+    at::Tensor& out) {
   CHECK_INPUT(x);
   CHECK_INPUT(residual);
-  CHECK_INPUT(post);
-  CHECK_INPUT(comb);
+  CHECK_INPUT(post_layer_mix);
+  CHECK_INPUT(comb_res_mix);
   CHECK_INPUT(out);
 
   TORCH_CHECK(x.scalar_type() == at::kBFloat16, "x must be bfloat16");
   TORCH_CHECK(residual.scalar_type() == at::kBFloat16, "residual must be bfloat16");
-  TORCH_CHECK(post.scalar_type() == at::kFloat, "post must be float32");
-  TORCH_CHECK(comb.scalar_type() == at::kFloat, "comb must be float32");
+  TORCH_CHECK(post_layer_mix.scalar_type() == at::kFloat, "post_layer_mix must be float32");
+  TORCH_CHECK(comb_res_mix.scalar_type() == at::kFloat, "comb_res_mix must be float32");
   TORCH_CHECK(out.scalar_type() == at::kBFloat16, "out must be bfloat16");
 
   int64_t T = x.size(0);
@@ -159,13 +163,14 @@ void hc_post(
   TORCH_CHECK(residual.size(1) == 4, "residual must have 4 channels (HC=4)");
   TORCH_CHECK(residual.size(2) == D, "residual D mismatch");
 
-  TORCH_CHECK(post.dim() == 2, "post must be 2D [T, HC]");
-  TORCH_CHECK(post.size(0) == T, "post T mismatch");
-  TORCH_CHECK(post.size(1) == 4, "post must have 4 elements (HC=4)");
+  TORCH_CHECK(post_layer_mix.dim() == 2, "post_layer_mix must be 2D [T, HC]");
+  TORCH_CHECK(post_layer_mix.size(0) == T, "post_layer_mix T mismatch");
+  TORCH_CHECK(post_layer_mix.size(1) == 4, "post_layer_mix must have 4 elements (HC=4)");
 
-  TORCH_CHECK(comb.dim() == 2, "comb must be 2D [T, HC*HC]");
-  TORCH_CHECK(comb.size(0) == T, "comb T mismatch");
-  TORCH_CHECK(comb.size(1) == 16, "comb must have 16 elements (HC*HC=16)");
+  TORCH_CHECK(comb_res_mix.dim() == 3, "comb_res_mix must be 3D [T, HC, HC]");
+  TORCH_CHECK(comb_res_mix.size(0) == T, "comb_res_mix T mismatch");
+  TORCH_CHECK(comb_res_mix.size(1) == 4, "comb_res_mix must have 4 rows (HC=4)");
+  TORCH_CHECK(comb_res_mix.size(2) == 4, "comb_res_mix must have 4 cols (HC=4)");
 
   TORCH_CHECK(out.dim() == 3, "out must be 3D [T, HC, D]");
   TORCH_CHECK(out.size(0) == T, "out T mismatch");
@@ -175,5 +180,5 @@ void hc_post(
   auto q = dpcppGetCurrentQueue();
 
   constexpr int VEC_SIZE = 4;
-  launch_hc_post_kernel<VEC_SIZE>(q, x, residual, post, comb, out, T, D);
+  launch_hc_post_kernel<VEC_SIZE>(q, x, residual, post_layer_mix, comb_res_mix, out, T, D);
 }

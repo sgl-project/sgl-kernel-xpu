@@ -94,7 +94,7 @@ def benchmark(batch_size, head_dim, num_heads, provider):
             k.copy_(k_out.view(k.shape))
 
     else:  # jit
-        from sglang.jit_kernel.rope import apply_rope_inplace
+        from sgl_kernel.jit import apply_rope_inplace
 
         def fn():
             apply_rope_inplace(

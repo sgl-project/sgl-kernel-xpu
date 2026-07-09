@@ -103,7 +103,7 @@ class QKNormKernel {
 
     // Step 1: Compute sum of squares (vectorized)
     float thread_sum_sq = 0.0f;
-#pragma unroll 4
+#pragma unroll
     for (int64_t i = tid; i < kVectorizedSize; i += num_threads) {
       Vec v = input_vec[i];
 #pragma unroll
@@ -118,7 +118,7 @@ class QKNormKernel {
     float rms_scale = ::sycl::rsqrt(total_sum_sq / static_cast<float>(kHeadDim) + eps_);
 
 // Step 4: Apply normalization with weight (vectorized, in-place)
-#pragma unroll 4
+#pragma unroll
     for (int64_t i = tid; i < kVectorizedSize; i += num_threads) {
       Vec in_v = input_vec[i];
       Vec w_v = weight_vec[i];

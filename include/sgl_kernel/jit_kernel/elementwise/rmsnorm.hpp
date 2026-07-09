@@ -85,7 +85,7 @@ class RMSNormKernel {
     float thread_sum_sq = 0.0f;
 
 // Process vectorized elements
-#pragma unroll 4
+#pragma unroll
     for (int64_t i = tid; i < kVectorizedSize; i += num_threads) {
       Vec in_vec = input_vec_ptr[i];
 #pragma unroll
@@ -102,7 +102,7 @@ class RMSNormKernel {
     float rms_scale = ::sycl::rsqrt(total_sum_sq / static_cast<float>(kHiddenSize) + eps_);
 
 // Step 4: Vectorized normalization and weight application
-#pragma unroll 4
+#pragma unroll
     for (int64_t i = tid; i < kVectorizedSize; i += num_threads) {
       Vec in_vec = input_vec_ptr[i];
       Vec weight_vec = weight_vec_ptr[i];

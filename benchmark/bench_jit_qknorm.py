@@ -106,7 +106,7 @@ def benchmark(batch_size, num_heads, head_dim, provider):
     elif provider == "jit":
         # Import here to allow optional dependency
         try:
-            from sglang.jit_kernel.norm import fused_inplace_qknorm as jit_qknorm
+            from sgl_kernel.jit import fused_inplace_qknorm as jit_qknorm
 
             def fn():
                 q_clone = q.clone()
@@ -115,7 +115,7 @@ def benchmark(batch_size, num_heads, head_dim, provider):
                 return q_clone, k_clone
 
         except ImportError:
-            print("Warning: sglang JIT kernel not available, skipping")
+            print("Warning: sgl_kernel JIT module not available, skipping")
             return 0, 0, 0
 
     ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
@@ -143,7 +143,7 @@ def benchmark(batch_size, num_heads, head_dim, provider):
 if __name__ == "__main__":
     print("Running QKNorm benchmarks...")
     print("Reference: PyTorch eager implementation")
-    print("JIT: sglang.jit_kernel.norm.fused_inplace_qknorm (runtime JIT compilation)")
+    print("JIT: sgl_kernel.jit.fused_inplace_qknorm (runtime JIT compilation)")
     print(
         "Note: No standalone AOT QKNorm available; comparing against PyTorch reference"
     )

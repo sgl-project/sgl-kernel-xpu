@@ -64,9 +64,6 @@ def _ref_torch_transform_ragged_impl(
     return torch.where(mask, indices + topk_indices_offset, indices)
 
 
-MAX_SEQ_LEN = 131072
-
-
 def assert_equal(
     score: torch.Tensor,
     indices_ref: torch.Tensor,

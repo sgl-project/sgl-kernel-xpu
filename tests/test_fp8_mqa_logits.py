@@ -328,5 +328,88 @@ def test_python_wrapper():
     assert paged_logits.dtype == torch.float32
 
 
+@pytest.mark.parametrize(
+    "Nq,H,D,Nk,aligned",
+    [
+        # aligned → head-loop uses _scaled_mm (Nq, Nk, D all divisible by 16)
+        (16, 4, 128, 16, True),
+        # unaligned → head-loop uses bf16 fallback
+        (3, 4, 128, 15, False),
+    ],
+    ids=["head_loop_scaled_mm", "head_loop_bf16"],
+)
+def test_fp8_mqa_logits_head_loop(Nq, H, D, Nk, aligned):
+    """Head-loop OOM-avoidance path is numerically correct.
+
+    The threshold is patched to 0 so that even small tensors take the head-loop
+    branch, exercising both the _scaled_mm sub-path (aligned sizes) and the bf16
+    sub-path (unaligned sizes).
+    """
+    import sgl_kernel.nsa as nsa_mod
+
+    device = "xpu"
+    q = make_fp8_tensor((Nq, H, D), device)
+    k = make_fp8_tensor((Nk, D), device)
+    k_scale = torch.rand(Nk, dtype=torch.float32, device=device) + 0.5
+    weights = torch.rand(Nq, H, dtype=torch.float32, device=device)
+    ks = torch.zeros(Nq, dtype=torch.int32, device=device)
+    ke = torch.full((Nq,), Nk, dtype=torch.int32, device=device)
+
+    ref = reference_fp8_mqa_logits(q, k, k_scale, weights, ks, ke)
+
+    # Patch threshold to 0 so every call takes the head-loop branch.
+    original = nsa_mod._HEAD_LOOP_THRESHOLD
+    nsa_mod._HEAD_LOOP_THRESHOLD = 0
+    try:
+        logits = nsa_mod._fp8_mqa_logits_impl(
+            q.view(torch.uint8), k.view(torch.uint8), k_scale, weights, ks, ke
+        )
+    finally:
+        nsa_mod._HEAD_LOOP_THRESHOLD = original
+
+    assert logits.shape == (Nq, Nk)
+    torch.testing.assert_close(logits.cpu(), ref.cpu(), rtol=2e-3, atol=0.1)
+
+
+def test_fp8_paged_mqa_logits_3d_input():
+    """fp8_paged_mqa_logits accepts a 3D (B, H, D) query and matches the 4D result.
+
+    The DSA indexer passes q_fp8 as (B, H, D) in decode mode; the wrapper must
+    unsqueeze dim 1 before calling the SYCL kernel.
+    """
+    from sgl_kernel.nsa import fp8_paged_mqa_logits
+
+    device = "xpu"
+    B, H, D = 2, 4, 128
+    page_size = 4
+    seq_len = 16
+    num_pages = seq_len // page_size
+
+    kv_cache = make_kv_cache(num_pages, page_size, D, device)
+    seq_lens = torch.full((B,), seq_len, dtype=torch.int32, device=device)
+    block_tables = torch.stack(
+        [torch.arange(num_pages, dtype=torch.int32, device=device)] * B
+    )
+    weights = torch.rand(B, H, dtype=torch.float32, device=device)
+
+    q_4d = make_fp8_tensor((B, 1, H, D), device)
+    q_3d = q_4d.squeeze(1)  # (B, H, D)
+
+    common_kwargs = dict(
+        kv_cache=kv_cache,
+        weights=weights,
+        seq_lens=seq_lens,
+        block_tables=block_tables,
+        schedule_metadata=None,
+        max_seq_len=seq_len,
+    )
+
+    out_4d = fp8_paged_mqa_logits(q_4d.view(torch.uint8), **common_kwargs)
+    out_3d = fp8_paged_mqa_logits(q_3d.view(torch.uint8), **common_kwargs)
+
+    assert out_3d.shape == (B, seq_len)
+    torch.testing.assert_close(out_3d, out_4d)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

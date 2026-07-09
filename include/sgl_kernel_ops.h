@@ -322,6 +322,7 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t topk,
     int64_t num_fused_shared_experts,
     int64_t scoring_func,
+    bool renormalize,
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output);
 

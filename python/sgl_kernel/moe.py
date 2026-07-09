@@ -100,10 +100,11 @@ def moe_fused_gate(
     num_expert_group,
     topk_group,
     topk,
+    renormalize=True,
+    scoring_func="sigmoid",
     num_fused_shared_experts=0,
     routed_scaling_factor=0,
     apply_routed_scaling_factor_on_output=False,
-    scoring_func="sigmoid",
 ):
     # This fused kernel function is used to select topk expert in a hierarchical 2-layer fashion
     # it split group of expert into num_expert_group, and use top2 expert weight sum in each group
@@ -118,6 +119,7 @@ def moe_fused_gate(
     # routed_scaling_factor: if > 0, the experts will be scaled by this factor
     # apply_routed_scaling_factor_on_output: if true, output will be
     #   scaled by the routed_scaling_factor
+    # renormalize: if true, normalize selected topk weights by their sum
     scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
     if scoring_func_int is None:
         raise ValueError(
@@ -131,6 +133,7 @@ def moe_fused_gate(
         topk,
         num_fused_shared_experts,
         scoring_func_int,
+        renormalize,
         routed_scaling_factor,
         apply_routed_scaling_factor_on_output,
     )

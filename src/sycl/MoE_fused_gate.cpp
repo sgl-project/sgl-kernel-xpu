@@ -34,6 +34,7 @@ struct moe_fused_gate_impl {
       int32_t topk,
       int32_t num_fused_shared_experts,
       int32_t scoring_func,
+      bool renormalize,
       double routed_scaling_factor,
       bool apply_routed_scaling_factor_on_output,
       Params params)
@@ -46,6 +47,7 @@ struct moe_fused_gate_impl {
         topk_(topk),
         num_fused_shared_experts_(num_fused_shared_experts),
         scoring_func_(scoring_func),
+        renormalize_(renormalize),
         routed_scaling_factor_(routed_scaling_factor),
         apply_routed_scaling_factor_on_output_(apply_routed_scaling_factor_on_output),
         params_(params) {}
@@ -159,7 +161,10 @@ struct moe_fused_gate_impl {
 
       // QQ NOTE: currently fixed to pick top2 activated weight values in each expert group and sum them as the
       // group weight to select expert groups
-      T max_sum = max_val + max_val_second;
+      float max_sum = max_val + max_val_second;
+      if (scoring_func_ == static_cast<int32_t>(ScoringFunc::kSoftmax)) {
+        max_sum = max_val;
+      }
 
       uint32_t lane = sg.get_local_id()[0];  // 0..15
 
@@ -300,12 +305,15 @@ struct moe_fused_gate_impl {
       if (thread_group_idx == 0) {
         // IMP Skip Logical groups
         int thread_row = item.get_global_linear_id() / MAX_VPT;
+        if (renormalize_) {
+          float output_sum_inv = (output_sum > 0.0f) ? (1.0f / output_sum) : 0.0f;
 #pragma unroll
-        for (int i = 0; i < topk_; ++i) {
-          int64_t const idx = topk_ * thread_row + i;
-          output_[idx] = output_[idx] / output_sum;
-          if (apply_routed_scaling_factor_on_output_) {
-            output_[idx] *= routed_scaling_factor_;
+          for (int i = 0; i < topk_; ++i) {
+            int64_t const idx = topk_ * thread_row + i;
+            output_[idx] = output_[idx] * output_sum_inv;
+            if (apply_routed_scaling_factor_on_output_) {
+              output_[idx] *= routed_scaling_factor_;
+            }
           }
         }
       }
@@ -321,6 +329,7 @@ struct moe_fused_gate_impl {
   int32_t topk_;
   int32_t num_fused_shared_experts_;
   int32_t scoring_func_;
+  bool renormalize_;
   float routed_scaling_factor_;
   bool apply_routed_scaling_factor_on_output_;
   Params params_;
@@ -347,6 +356,7 @@ void moe_fused_gate_kernel(
     int64_t topk,
     int64_t num_fused_shared_experts,
     int64_t scoring_func,
+    bool renormalize,
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output) {
   auto input_ptr = reinterpret_cast<T*>(input.data_ptr());
@@ -374,6 +384,7 @@ void moe_fused_gate_kernel(
       topk,
       num_fused_shared_experts,
       scoring_func,
+      renormalize,
       routed_scaling_factor,
       apply_routed_scaling_factor_on_output,
       params);
@@ -396,6 +407,7 @@ void moe_fused_gate_kernel(
         topk,                                                 \
         num_fused_shared_experts,                             \
         scoring_func,                                         \
+        renormalize,                                          \
         routed_scaling_factor,                                \
         apply_routed_scaling_factor_on_output);               \
     dispatched = true;                                        \
@@ -417,10 +429,12 @@ void moe_fused_gate_kernel_dynamic(
     torch::Tensor& output,
     torch::Tensor& indices,
     int64_t num_rows,
+    int64_t num_expert_group,
     int64_t topk_group,
     int64_t topk,
     int64_t num_fused_shared_experts,
     int64_t scoring_func,
+    bool renormalize,
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output) {
   auto input_ptr = reinterpret_cast<T*>(input.data_ptr());
@@ -453,6 +467,7 @@ void moe_fused_gate_kernel_dynamic(
       topk,
       num_fused_shared_experts,
       scoring_func,
+      renormalize,
       routed_scaling_factor,
       apply_routed_scaling_factor_on_output,
       params);
@@ -471,6 +486,7 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t topk,
     int64_t num_fused_shared_experts,
     int64_t scoring_func,
+    bool renormalize,
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output) {
   TORCH_CHECK(input.dtype() == bias.dtype(), "input and bias should have the same dtype");
@@ -510,7 +526,6 @@ std::vector<at::Tensor> moe_fused_gate(
       MAX_VPT,
       ")");
 
-  int64_t num_blocks = (num_rows + ROWS_PER_WG - 1) / ROWS_PER_WG;
   bool dispatched = false;
 
   SYCL_DISPATCH_FLOATING_TYPES_AND2(
@@ -547,10 +562,12 @@ std::vector<at::Tensor> moe_fused_gate(
               output,
               indices,
               num_rows,
+              num_expert_group,
               topk_group,
               topk,
               num_fused_shared_experts,
               scoring_func,
+              renormalize,
               routed_scaling_factor,
               apply_routed_scaling_factor_on_output);
         }

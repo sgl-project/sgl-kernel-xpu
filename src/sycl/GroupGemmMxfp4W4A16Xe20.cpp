@@ -75,7 +75,7 @@ using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
   DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_256_64_32, SG_8_2_1, ActType, true, WithBias)   \
   DECLARE_XE20_MOE_MXFP4_EXTERN(Tile_256_256_32, SG_8_4_1, ActType, false, WithBias)
 
-#define DECLARE_XE20_MOE_MXFP4_TILES(ActType) \
+#define DECLARE_XE20_MOE_MXFP4_TILES(ActType)    \
   DECLARE_XE20_MOE_MXFP4_TILES_B(ActType, false) \
   DECLARE_XE20_MOE_MXFP4_TILES_B(ActType, true)
 
@@ -108,38 +108,38 @@ DECLARE_XE20_MOE_MXFP4_TILES(4)
 // concrete template specialization for the runtime (ActType, FuseAct,
 // WithBias) triple. Combos outside this set hit the TORCH_CHECK below; restore
 // them in both this file and the cmake matrix before rebuilding.
-#define LAUNCH_MOE_MXFP4_ACT(ActTypeLit, FuseAct, WithBias, ...)  \
-  do {                                                            \
-    if (FuseAct) {                                                \
-      if (WithBias) {                                             \
-        LAUNCH_MOE_MXFP4(__VA_ARGS__, ActTypeLit, true, true);    \
-      } else {                                                    \
-        LAUNCH_MOE_MXFP4(__VA_ARGS__, ActTypeLit, true, false);   \
-      }                                                           \
-    } else {                                                      \
-      if (WithBias) {                                             \
-        LAUNCH_MOE_MXFP4(__VA_ARGS__, ActTypeLit, false, true);   \
-      } else {                                                    \
-        LAUNCH_MOE_MXFP4(__VA_ARGS__, ActTypeLit, false, false);  \
-      }                                                           \
-    }                                                             \
+#define LAUNCH_MOE_MXFP4_ACT(ActTypeLit, FuseAct, WithBias, ...) \
+  do {                                                           \
+    if (FuseAct) {                                               \
+      if (WithBias) {                                            \
+        LAUNCH_MOE_MXFP4(__VA_ARGS__, ActTypeLit, true, true);   \
+      } else {                                                   \
+        LAUNCH_MOE_MXFP4(__VA_ARGS__, ActTypeLit, true, false);  \
+      }                                                          \
+    } else {                                                     \
+      if (WithBias) {                                            \
+        LAUNCH_MOE_MXFP4(__VA_ARGS__, ActTypeLit, false, true);  \
+      } else {                                                   \
+        LAUNCH_MOE_MXFP4(__VA_ARGS__, ActTypeLit, false, false); \
+      }                                                          \
+    }                                                            \
   } while (0)
 
-#define DISPATCH_MOE_MXFP4(ActType, FuseAct, WithBias, ...)                                                       \
-  do {                                                                                                            \
-    TORCH_CHECK(                                                                                                  \
-        (ActType) == 0 || (ActType) == 2 || (ActType) == 4,                                                       \
-        "mxfp4 fused kernel built with ActType=0 (silu), 2 (swiglu_gpt_oss) and 4 (swiglu_deepseek_v4) only; "   \
-        "got ActType=",                                                                                           \
-        (ActType),                                                                                                \
-        ". See src/GroupGemmMxfp4W4A16Xe20.cmake to re-enable additional ActType/WithBias combos.");              \
-    if ((ActType) == 4) {                                                                                         \
-      LAUNCH_MOE_MXFP4_ACT(4, FuseAct, WithBias, __VA_ARGS__);                                                    \
-    } else if ((ActType) == 2) {                                                                                  \
-      LAUNCH_MOE_MXFP4_ACT(2, FuseAct, WithBias, __VA_ARGS__);                                                    \
-    } else {                                                                                                      \
-      LAUNCH_MOE_MXFP4_ACT(0, FuseAct, WithBias, __VA_ARGS__);                                                    \
-    }                                                                                                             \
+#define DISPATCH_MOE_MXFP4(ActType, FuseAct, WithBias, ...)                                                    \
+  do {                                                                                                         \
+    TORCH_CHECK(                                                                                               \
+        (ActType) == 0 || (ActType) == 2 || (ActType) == 4,                                                    \
+        "mxfp4 fused kernel built with ActType=0 (silu), 2 (swiglu_gpt_oss) and 4 (swiglu_deepseek_v4) only; " \
+        "got ActType=",                                                                                        \
+        (ActType),                                                                                             \
+        ". See src/GroupGemmMxfp4W4A16Xe20.cmake to re-enable additional ActType/WithBias combos.");           \
+    if ((ActType) == 4) {                                                                                      \
+      LAUNCH_MOE_MXFP4_ACT(4, FuseAct, WithBias, __VA_ARGS__);                                                 \
+    } else if ((ActType) == 2) {                                                                               \
+      LAUNCH_MOE_MXFP4_ACT(2, FuseAct, WithBias, __VA_ARGS__);                                                 \
+    } else {                                                                                                   \
+      LAUNCH_MOE_MXFP4_ACT(0, FuseAct, WithBias, __VA_ARGS__);                                                 \
+    }                                                                                                          \
   } while (0)
 
 void moe_grouped_mm_nt_xe20_mxfp4_w4a16(

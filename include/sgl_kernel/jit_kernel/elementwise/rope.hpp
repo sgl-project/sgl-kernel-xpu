@@ -137,7 +137,7 @@ class FusedRopeKernel {
         const aligned_vector<float, 2>* cos_ptr_vec = reinterpret_cast<const aligned_vector<float, 2>*>(cos_ptr);
         const aligned_vector<float, 2>* sin_ptr_vec = reinterpret_cast<const aligned_vector<float, 2>*>(sin_ptr);
 
-#pragma unroll 4
+#pragma unroll
         for (int64_t i = 0; i < kVecSize; ++i) {
           const int64_t vec_idx = static_cast<int64_t>(lane_id) * kVecSize + i;
           if (vec_idx >= kRopeDim / 4) break;
@@ -170,7 +170,7 @@ class FusedRopeKernel {
         const float* cos_vec_ptr = cos_ptr;
         const float* sin_vec_ptr = sin_ptr;
 
-#pragma unroll 4
+#pragma unroll
         for (int64_t i = 0; i < kVecSize; ++i) {
           const int64_t vec_idx = static_cast<int64_t>(lane_id) * kVecSize + i;
           if (vec_idx >= kRopeDim / 2) break;
@@ -251,7 +251,7 @@ class FusedRopeStoreKernel {
         const aligned_vector<float, 2>* cos_ptr_vec = reinterpret_cast<const aligned_vector<float, 2>*>(cos_ptr);
         const aligned_vector<float, 2>* sin_ptr_vec = reinterpret_cast<const aligned_vector<float, 2>*>(sin_ptr);
 
-#pragma unroll 4
+#pragma unroll
         for (int64_t i = 0; i < kVecSize; ++i) {
           const int64_t vec_idx = static_cast<int64_t>(lane_id) * kVecSize + i;
           // Guard for ceil-div over-allocation (e.g. rope_dim=80, 96).
@@ -291,7 +291,7 @@ class FusedRopeStoreKernel {
         const float* cos_vec_ptr = cos_ptr;
         const float* sin_vec_ptr = sin_ptr;
 
-#pragma unroll 4
+#pragma unroll
         for (int64_t i = 0; i < kVecSize; ++i) {
           const int64_t vec_idx = static_cast<int64_t>(lane_id) * kVecSize + i;
           // Guard for ceil-div over-allocation (e.g. rope_dim=80, 96).

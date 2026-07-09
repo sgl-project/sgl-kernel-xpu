@@ -109,9 +109,7 @@ def benchmark(batch_size, dim, provider):
     elif provider == "jit":
         # Import here to allow optional dependency
         try:
-            from sglang.jit_kernel.timestep_embedding import (
-                timestep_embedding as jit_timestep_embedding,
-            )
+            from sgl_kernel.jit import timestep_embedding as jit_timestep_embedding
 
             fn = lambda: jit_timestep_embedding(
                 timesteps.clone(),

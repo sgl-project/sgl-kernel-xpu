@@ -83,12 +83,12 @@ def benchmark(batch_size, hidden_size, provider):
     elif provider == "jit":
         # Import here to allow optional dependency
         try:
-            from sglang.jit_kernel.norm import rmsnorm as jit_rmsnorm
+            from sgl_kernel.jit import rmsnorm as jit_rmsnorm
 
             output = torch.empty_like(input_tensor)
             fn = lambda: jit_rmsnorm(input_tensor.clone(), weight, output, eps)
         except ImportError:
-            print("Warning: sglang JIT kernel not available, skipping")
+            print("Warning: sgl_kernel JIT module not available, skipping")
             return 0, 0, 0
 
     ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)

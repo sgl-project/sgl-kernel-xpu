@@ -53,6 +53,9 @@ from sgl_kernel.flash_compress_128_torch import (
     flash_compress128_prefill,
 )
 from sgl_kernel.fp8_paged_mqa_logits import fp8_paged_mqa_logits_triton
+from sgl_kernel.fused_q_indexer_rope_hadamard_quant_torch import (
+    fused_q_indexer_rope_hadamard_quant,
+)
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,

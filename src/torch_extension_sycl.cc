@@ -261,6 +261,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor weight_indices, "
       "Tensor lora_ranks, Tensor? extra_embeddings, Tensor? seg_lens) -> ()");
   m.impl("embedding_lora_a_fwd", torch::kXPU, &embedding_lora_a_fwd);
+
+  /* NSA (Native Sparse Attention) indexer scoring */
+  // fp8_mqa_logits (prefill) is implemented in pure Python via sgl_kernel.nsa.
+  m.def(
+      "fp8_paged_mqa_logits(Tensor q_fp8, Tensor kv_cache, Tensor weights, "
+      "Tensor seq_lens, Tensor block_tables, Tensor? schedule_metadata, "
+      "int max_seq_len, bool clean_logits) -> Tensor");
+  m.impl("fp8_paged_mqa_logits", torch::kXPU, &fp8_paged_mqa_logits);
 }
 
 REGISTER_EXTENSION(common_ops)

@@ -213,7 +213,10 @@ void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor o
   TORCH_CHECK(output_q.sizes() == input.sizes(), "output_q must have same shape as input, got ", output_q.sizes());
   TORCH_CHECK(
       output_s.numel() == num_tokens,
-      "output_s must have numel == num_tokens (", num_tokens, "), got ", output_s.numel());
+      "output_s must have numel == num_tokens (",
+      num_tokens,
+      "), got ",
+      output_s.numel());
   TORCH_CHECK(hidden_dim % 4 == 0, "hidden_dim must be divisible by 4, got ", hidden_dim);
   if (num_tokens == 0) return;
 

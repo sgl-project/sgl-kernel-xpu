@@ -13,9 +13,9 @@ static constexpr int HC = 4;
 
 template <typename scalar_t, int VEC_SIZE, int HC_MULT = 4>
 struct HCPostKernel {
-  const scalar_t* __restrict__ x;         // [T, D] bf16
+  const scalar_t* __restrict__ x;         // [T, D]     bf16
   const scalar_t* __restrict__ residual;  // [T, HC, D] bf16
-  const float* __restrict__ post;         // [T, HC] fp32
+  const float* __restrict__ post;         // [T, HC]    fp32
   const float* __restrict__ comb;         // [T, HC*HC] fp32
 
   scalar_t* __restrict__ out;  // [T, HC, D] bf16
@@ -34,9 +34,9 @@ struct HCPostKernel {
       : x(x_), residual(residual_), post(post_), comb(comb_), out(out_), T(T_), D(D_) {}
 
   void operator()(sycl::nd_item<2> item) const {
-    int token_id = static_cast<int>(item.get_group(0));
-    int d_block_id = static_cast<int>(item.get_group(1));
-    int local_id = static_cast<int>(item.get_local_id(0));
+    uint32_t token_id = item.get_group(0);
+    uint32_t d_block_id = item.get_group(1);
+    uint32_t local_id = item.get_local_id(0);
 
     if (token_id >= T) return;
 
@@ -46,13 +46,13 @@ struct HCPostKernel {
     float post_local[HC_MULT];
 #pragma unroll
     for (int i = 0; i < HC_MULT; i++) {
-      post_local[i] = post[static_cast<int64_t>(token_id) * HC_MULT + i];
+      post_local[i] = post[token_id * HC_MULT + i];
     }
 
     float comb_local[HC_MULT * HC_MULT];
 #pragma unroll
     for (int i = 0; i < HC_MULT * HC_MULT; i++) {
-      comb_local[i] = comb[static_cast<int64_t>(token_id) * HC_MULT * HC_MULT + i];
+      comb_local[i] = comb[token_id * HC_MULT * HC_MULT + i];
     }
 
     constexpr int kVecSize = VEC_SIZE;
@@ -61,32 +61,25 @@ struct HCPostKernel {
 
     for (int d = d_start + local_id * kVecSize; d < d_end; d += WG_SIZE * kVecSize) {
       vec_in x_vec;
-      x_vec.load(
-          0,
-          sycl::multi_ptr<const scalar_t, sycl::access::address_space::global_space>(
-              &x[static_cast<int64_t>(token_id) * D + d]));
+      x_vec.load(0, sycl::multi_ptr<const scalar_t, sycl::access::address_space::global_space>(&x[token_id * D + d]));
 
       float x_fp32[kVecSize];
 #pragma unroll
       for (int i = 0; i < kVecSize; i++) {
-        x_fp32[i] = static_cast<float>(x_vec[i]);
-      }
-
-      vec_in residual_vec[HC_MULT];
-#pragma unroll
-      for (int k = 0; k < HC_MULT; k++) {
-        residual_vec[k].load(
-            0,
-            sycl::multi_ptr<const scalar_t, sycl::access::address_space::global_space>(
-                &residual[(static_cast<int64_t>(token_id) * HC_MULT + k) * D + d]));
+        x_fp32[i] = x_vec[i];
       }
 
       float residual_fp32[HC_MULT][kVecSize];
 #pragma unroll
       for (int k = 0; k < HC_MULT; k++) {
+        vec_in residual_vec;
+        residual_vec.load(
+            0,
+            sycl::multi_ptr<const scalar_t, sycl::access::address_space::global_space>(
+                &residual[(token_id * HC_MULT + k) * D + d]));
 #pragma unroll
         for (int i = 0; i < kVecSize; i++) {
-          residual_fp32[k][i] = static_cast<float>(residual_vec[k][i]);
+          residual_fp32[k][i] = residual_vec[i];
         }
       }
 
@@ -104,19 +97,18 @@ struct HCPostKernel {
             accum += comb_local[k * HC_MULT + j] * residual_fp32[k][i];
           }
 
-          out_vec[i] = static_cast<scalar_t>(accum);
+          out_vec[i] = accum;
         }
 
         out_vec.store(
             0,
             sycl::multi_ptr<scalar_t, sycl::access::address_space::global_space>(
-                &out[(static_cast<int64_t>(token_id) * HC_MULT + j) * D + d]));
+                &out[(token_id * HC_MULT + j) * D + d]));
       }
     }
   }
 };
 
-// Kernel launcher
 template <int VEC_SIZE>
 static void launch_hc_post_kernel(
     sycl::queue& q,

@@ -14,70 +14,6 @@ import torch
 from sgl_kernel import moe_fused_gate
 
 
-def grouped_topk_native(
-    hidden_states: torch.Tensor,
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    num_expert_group: Optional[int] = None,
-    topk_group: Optional[int] = None,
-    num_fused_shared_experts: int = 0,
-    routed_scaling_factor: Optional[float] = None,
-    apply_routed_scaling_factor_on_output: Optional[bool] = False,
-):
-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
-
-    scores = torch.softmax(gating_output, dim=-1)
-    num_token = scores.shape[0]
-    num_experts = scores.shape[1]
-    group_scores = (
-        scores.view(num_token, num_expert_group, -1).max(dim=-1).values
-    )  # [n, n_group]
-    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
-        1
-    ]  # [n, top_k_group]
-    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
-    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
-    score_mask = (
-        group_mask.unsqueeze(-1)
-        .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
-        .reshape(num_token, -1)
-    )  # [n, e]
-    tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
-    topk_weights, topk_ids = torch.topk(
-        tmp_scores,
-        k=topk,
-        dim=-1,
-        sorted=(True if num_fused_shared_experts > 0 else False),
-    )
-    if num_fused_shared_experts:
-        topk_ids[:, -1] = torch.randint(
-            low=num_experts,
-            high=num_experts + num_fused_shared_experts,
-            size=(topk_ids.size(0),),
-            dtype=topk_ids.dtype,
-            device=topk_ids.device,
-        )
-        if routed_scaling_factor is not None:
-            topk_weights[:, -1] = (
-                topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
-            )
-
-    if renormalize:
-        topk_weights_sum = (
-            topk_weights.sum(dim=-1, keepdim=True)
-            if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
-        )
-        topk_weights = topk_weights / topk_weights_sum
-        if apply_routed_scaling_factor_on_output:
-            topk_weights *= routed_scaling_factor
-
-    topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
-
-    return topk_weights, topk_ids
-
-
 def biased_grouped_topk_native(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -104,9 +40,10 @@ def biased_grouped_topk_native(
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
     scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
+    group_sum_count = 1 if scoring_func == "softmax" else 2
     group_scores = (
         scores_for_choice.view(num_token, num_expert_group, -1)
-        .topk(2, dim=-1)[0]
+        .topk(group_sum_count, dim=-1)[0]
         .sum(dim=-1)
     )  # [n, n_group]
     group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
@@ -155,7 +92,6 @@ def biased_grouped_topk_native(
     return topk_weights, topk_ids
 
 
-"""
 @pytest.mark.parametrize(
     "seq_length",
     list(range(1, 10))
@@ -174,26 +110,6 @@ def biased_grouped_topk_native(
 @pytest.mark.parametrize("apply_routed_scaling_factor_on_output", [False, True])
 @pytest.mark.parametrize("scoring_func", ["sigmoid", "softmax"])
 @pytest.mark.parametrize("renormalize", [False, True])
-"""
-
-
-@pytest.mark.parametrize(
-    "seq_length",
-    [1024],
-)
-@pytest.mark.parametrize(
-    "params",
-    [
-        # (128, 4, 2, 4),
-        (256, 8, 4, 8),  # deepseek v3
-        # (512, 16, 8, 16),
-    ],
-)
-# @pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
-@pytest.mark.parametrize("num_fused_shared_experts", [0])
-@pytest.mark.parametrize("apply_routed_scaling_factor_on_output", [False])
-@pytest.mark.parametrize("scoring_func", ["softmax"])
-@pytest.mark.parametrize("renormalize", [False])
 def test_moe_fused_gate_combined(
     seq_length,
     params,
@@ -203,8 +119,7 @@ def test_moe_fused_gate_combined(
     renormalize,
 ):
     num_experts, num_expert_group, topk_group, topk = params
-    dtype = torch.bfloat16
-    #dtype = torch.float32
+    dtype = torch.float32
 
     torch.manual_seed(seq_length)
     tensor = torch.rand((seq_length, num_experts), dtype=dtype, device="xpu")
@@ -227,32 +142,20 @@ def test_moe_fused_gate_combined(
         routed_scaling_factor=2.5,
         apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
     )
-    if scoring_func == "softmax":
-        ref_output, ref_indices = grouped_topk_native(
-            scores,
-            scores,
-            topk=topk,
-            renormalize=renormalize,
-            num_expert_group=num_expert_group,
-            topk_group=topk_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            routed_scaling_factor=2.5,
-            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-        )
-    else:
-        ref_output, ref_indices = biased_grouped_topk_native(
-            scores,
-            scores,
-            bias,
-            topk=topk,
-            renormalize=renormalize,
-            num_expert_group=num_expert_group,
-            topk_group=topk_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            routed_scaling_factor=2.5,
-            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-            scoring_func=scoring_func,
-        )
+
+    ref_output, ref_indices = biased_grouped_topk_native(
+        scores,
+        scores,
+        bias,
+        topk=topk,
+        renormalize=renormalize,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        num_fused_shared_experts=num_fused_shared_experts,
+        routed_scaling_factor=2.5,
+        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        scoring_func=scoring_func,
+    )
 
     # When num_fused_shared_experts > 0, ignore the comparison of the last topk dimension
     if num_fused_shared_experts > 0:

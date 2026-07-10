@@ -8,6 +8,7 @@ import pytest
 import sgl_kernel
 import torch
 import utils
+from test_rope_utils import create_cos_sin_cache
 
 precision = {
     torch.bfloat16: 1e-2,
@@ -174,6 +175,48 @@ def fused_qk_norm_rope_reference(
     result = result.view(num_tokens, total_heads * head_dim)
 
     return result
+
+
+def fused_qk_norm_rope_with_cache_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    is_neox: bool,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference implementation for the cache-based fused QK norm + RoPE path."""
+    head_dim = q.shape[-1]
+    rope_dim = cos_sin_cache.shape[-1]
+    positions = positions.flatten()
+    flat_tokens = positions.numel()
+
+    assert rope_dim % 2 == 0
+    assert rope_dim <= head_dim
+
+    cos_cache, sin_cache = cos_sin_cache.chunk(2, dim=-1)
+    cos = cos_cache[positions].to(q.dtype)
+    sin = sin_cache[positions].to(q.dtype)
+
+    q_view = q.reshape(flat_tokens, -1, head_dim)
+    k_view = k.reshape(flat_tokens, -1, head_dim)
+
+    q_norm = llama_rms_norm(q_view, q_weight, eps)
+    k_norm = llama_rms_norm(k_view, k_weight, eps)
+
+    q_rot = q_norm[..., :rope_dim]
+    q_pass = q_norm[..., rope_dim:]
+    q_rot = apply_rotary_emb_native(q_rot, cos, sin, is_neox)
+    q_out = torch.cat((q_rot, q_pass), dim=-1).reshape(q.shape)
+
+    k_rot = k_norm[..., :rope_dim]
+    k_pass = k_norm[..., rope_dim:]
+    k_rot = apply_rotary_emb_native(k_rot, cos, sin, is_neox)
+    k_out = torch.cat((k_rot, k_pass), dim=-1).reshape(k.shape)
+
+    return q_out, k_out
 
 
 @pytest.mark.parametrize("num_tokens", [1, 7, 32, 128])
@@ -507,6 +550,81 @@ def test_fused_qk_norm_rope_fp8_e4m3(
     # Compare results - use relaxed tolerance for FP8
     # FP8 has limited precision, so we need higher tolerance
     torch.testing.assert_close(qkv.to(torch.float32), output_ref, rtol=5e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize(
+    "use_4d,batch_size,seq_len,num_qo_heads,num_kv_heads,head_dim,rope_dim,is_neox,dtype,position_dtype",
+    [
+        (False, 3, None, 4, 2, 64, 32, False, torch.bfloat16, torch.int32),
+        (False, 5, None, 8, 4, 128, 64, True, torch.float16, torch.int64),
+        (True, 2, 4, 16, 4, 128, 128, False, torch.bfloat16, torch.int32),
+        (True, 1, 8, 32, 8, 256, 128, True, torch.float16, torch.int64),
+    ],
+)
+def test_fused_qk_norm_rope_with_cache(
+    use_4d,
+    batch_size,
+    seq_len,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    rope_dim,
+    is_neox,
+    dtype,
+    position_dtype,
+):
+    """Test fused QK norm + RoPE with a precomputed cos/sin cache."""
+    torch.random.manual_seed(42)
+
+    assert rope_dim <= head_dim
+
+    if use_4d:
+        assert seq_len is not None
+        q = torch.randn(
+            batch_size, seq_len, num_qo_heads, head_dim, dtype=dtype, device=device
+        )
+        k = torch.randn(
+            batch_size, seq_len, num_kv_heads, head_dim, dtype=dtype, device=device
+        )
+        num_tokens = batch_size * seq_len
+    else:
+        q = torch.randn(batch_size, num_qo_heads, head_dim, dtype=dtype, device=device)
+        k = torch.randn(batch_size, num_kv_heads, head_dim, dtype=dtype, device=device)
+        num_tokens = batch_size
+
+    q_weight = torch.randn(head_dim, dtype=dtype, device=device)
+    k_weight = torch.randn(head_dim, dtype=dtype, device=device)
+    positions = torch.arange(num_tokens, dtype=position_dtype, device=device)
+    cos_sin_cache = create_cos_sin_cache(rope_dim, max_position=num_tokens + 1)
+
+    q_ref, k_ref = fused_qk_norm_rope_with_cache_reference(
+        q.clone().float(),
+        k.clone().float(),
+        q_weight.clone().float(),
+        k_weight.clone().float(),
+        cos_sin_cache,
+        positions,
+        is_neox,
+    )
+
+    q_test = q.clone()
+    k_test = k.clone()
+    sgl_kernel.fused_qk_norm_rope_with_cos_sin_cache_inplace(
+        q_test,
+        k_test,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        is_neox,
+    )
+
+    torch.testing.assert_close(
+        q_test, q_ref.to(dtype), rtol=precision[dtype], atol=precision[dtype]
+    )
+    torch.testing.assert_close(
+        k_test, k_ref.to(dtype), rtol=precision[dtype], atol=precision[dtype]
+    )
 
 
 if __name__ == "__main__":

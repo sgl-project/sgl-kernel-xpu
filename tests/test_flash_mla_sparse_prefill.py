@@ -5,7 +5,6 @@ Run: pytest tests/test_flash_mla_sparse_prefill.py
 
 import pytest
 import torch
-
 from sgl_kernel import flash_mla_sparse_prefill
 
 default_params = {

@@ -17,6 +17,7 @@ from sgl_kernel.attention import (
     flash_mla_get_workspace_size,
     flash_mla_prefill,
     flash_mla_prefill_get_workspace_size,
+    flash_mla_sparse_decode,
     flash_mla_sparse_prefill,
     flash_mla_with_kvcache,
     lightning_attention_decode,

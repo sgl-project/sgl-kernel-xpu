@@ -6,4 +6,4 @@ namespace FLASH_NAMESPACE {
 template void launch_sparse_mla_prefill_fwd_kernel<512, true, false>(const XPUSparseAttnFwdParams& params);
 template void launch_sparse_mla_prefill_fwd_kernel<512, true, true>(const XPUSparseAttnFwdParams& params);
 
-} // namespace FLASH_NAMESPACE
+}  // namespace FLASH_NAMESPACE

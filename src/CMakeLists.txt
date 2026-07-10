@@ -31,6 +31,7 @@ include(MlaPrefillXe20.cmake)
 # Disabled: sgl's own sparse MLA decode (kernels/mla_sparse). Superseded by mla_sparse_xattn.
 # include(MlaSparseDecodeXe20.cmake)
 include(MlaSparsePrefillXe20.cmake)
+include(MlaSparseDecodeXattnXe20.cmake)
 
 message(STATUS "BMG files: ${device_cpp_xe20}")
 message(STATUS "Common files: ${device_cpp_common}")

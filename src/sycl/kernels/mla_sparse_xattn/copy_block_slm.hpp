@@ -34,16 +34,11 @@
 namespace cute {
 
 /* Flat copies */
-template <class SrcEngine, class SrcLayout,
-          class DstEngine, class DstLayout>
-CUTE_HOST_DEVICE
-void
-copy_block_r2s(Tensor<SrcEngine, SrcLayout> const& src,
-               Tensor<DstEngine, DstLayout>      & dst)
-{
+template <class SrcEngine, class SrcLayout, class DstEngine, class DstLayout>
+CUTE_HOST_DEVICE void copy_block_r2s(Tensor<SrcEngine, SrcLayout> const& src, Tensor<DstEngine, DstLayout>& dst) {
   static_assert(is_rmem_v<SrcEngine> && is_smem_v<DstEngine>, "Expected rmem->smem copy");
 
-  auto atom_r2s = Copy_Atom<XE_1D_STSM<float>, float>{};    // TODO: larger block messages
+  auto atom_r2s = Copy_Atom<XE_1D_STSM<float>, float>{};  // TODO: larger block messages
   using _SG = intel::_SGSize;
   int lane_id = int(ThreadIdxX()) % _SG{};
 
@@ -55,13 +50,8 @@ copy_block_r2s(Tensor<SrcEngine, SrcLayout> const& src,
   copy(atom_r2s, src_v, dst_v);
 }
 
-template <class SrcEngine, class SrcLayout,
-          class DstEngine, class DstLayout>
-CUTE_HOST_DEVICE
-void
-copy_block_s2r(Tensor<SrcEngine, SrcLayout> const& src,
-               Tensor<DstEngine, DstLayout>      & dst)
-{
+template <class SrcEngine, class SrcLayout, class DstEngine, class DstLayout>
+CUTE_HOST_DEVICE void copy_block_s2r(Tensor<SrcEngine, SrcLayout> const& src, Tensor<DstEngine, DstLayout>& dst) {
   static_assert(is_smem_v<SrcEngine> && is_rmem_v<DstEngine>, "Expected smem->rmem copy");
 
   auto atom_s2r = Copy_Atom<XE_1D_LDSM<float>, float>{};
@@ -77,20 +67,23 @@ copy_block_s2r(Tensor<SrcEngine, SrcLayout> const& src,
 }
 
 /* Coordinate-aware copies */
-template <class SrcEngine, class SrcLayout, class SrcCoordLayout,
-          class DstEngine, class DstLayout, class DstCoordLayout>
-CUTE_HOST_DEVICE
-void
-copy_block_r2s(SubgroupTensor<SrcEngine, SrcLayout, SrcCoordLayout> const& src,
-               Tensor<DstEngine, DstLayout>                              & dst,
-               DstCoordLayout                                       const& dst_c)
-{
+template <
+    class SrcEngine,
+    class SrcLayout,
+    class SrcCoordLayout,
+    class DstEngine,
+    class DstLayout,
+    class DstCoordLayout>
+CUTE_HOST_DEVICE void copy_block_r2s(
+    SubgroupTensor<SrcEngine, SrcLayout, SrcCoordLayout> const& src,
+    Tensor<DstEngine, DstLayout>& dst,
+    DstCoordLayout const& dst_c) {
   using _SG = intel::_SGSize;
 
   static_assert(is_rmem_v<SrcEngine> && is_smem_v<DstEngine>, "Expected rmem->smem copy");
   static_assert(sizeof_bits_v<typename SrcEngine::value_type> == 32, "Only 32-bit data supported");
 
-  auto atom_r2s = Copy_Atom<XE_1D_STSM<float>, float>{};    // TODO: larger block messages
+  auto atom_r2s = Copy_Atom<XE_1D_STSM<float>, float>{};  // TODO: larger block messages
   int lane_id = int(ThreadIdxX()) % _SG{};
 
   auto atom_shape = make_shape(_1{}, size(SrcLayout{}));
@@ -105,14 +98,17 @@ copy_block_r2s(SubgroupTensor<SrcEngine, SrcLayout, SrcCoordLayout> const& src,
   copy(atom_r2s, src_v, dst_v);
 }
 
-template <class SrcEngine, class SrcLayout, class SrcCoordLayout,
-          class DstEngine, class DstLayout, class DstCoordLayout>
-CUTE_HOST_DEVICE
-void
-copy_block_s2r(Tensor<SrcEngine, SrcLayout>                         const& src,
-               SrcCoordLayout                                       const& src_c,
-               SubgroupTensor<DstEngine, DstLayout, DstCoordLayout>      & dst)
-{
+template <
+    class SrcEngine,
+    class SrcLayout,
+    class SrcCoordLayout,
+    class DstEngine,
+    class DstLayout,
+    class DstCoordLayout>
+CUTE_HOST_DEVICE void copy_block_s2r(
+    Tensor<SrcEngine, SrcLayout> const& src,
+    SrcCoordLayout const& src_c,
+    SubgroupTensor<DstEngine, DstLayout, DstCoordLayout>& dst) {
   using _SG = intel::_SGSize;
 
   static_assert(is_smem_v<SrcEngine> && is_rmem_v<DstEngine>, "Expected smem->rmem copy");
@@ -134,45 +130,41 @@ copy_block_s2r(Tensor<SrcEngine, SrcLayout>                         const& src,
 }
 
 /* Variants accepting rvalue dst */
-template <class SrcEngine, class SrcLayout,
-          class DstEngine, class DstLayout>
-CUTE_HOST_DEVICE
-void
-copy_block_r2s(Tensor<SrcEngine, SrcLayout> const& src,
-               Tensor<DstEngine, DstLayout>     && dst)
-{
+template <class SrcEngine, class SrcLayout, class DstEngine, class DstLayout>
+CUTE_HOST_DEVICE void copy_block_r2s(Tensor<SrcEngine, SrcLayout> const& src, Tensor<DstEngine, DstLayout>&& dst) {
   return copy_block_r2s(src, dst);
 }
 
-template <class SrcEngine, class SrcLayout,
-          class DstEngine, class DstLayout>
-CUTE_HOST_DEVICE
-void
-copy_block_s2r(Tensor<SrcEngine, SrcLayout> const& src,
-               Tensor<DstEngine, DstLayout>     && dst)
-{
+template <class SrcEngine, class SrcLayout, class DstEngine, class DstLayout>
+CUTE_HOST_DEVICE void copy_block_s2r(Tensor<SrcEngine, SrcLayout> const& src, Tensor<DstEngine, DstLayout>&& dst) {
   return copy_block_s2r(src, dst);
 }
 
-template <class SrcEngine, class SrcLayout, class SrcCoordLayout,
-          class DstEngine, class DstLayout, class DstCoordLayout>
-CUTE_HOST_DEVICE
-void
-copy_block_r2s(SubgroupTensor<SrcEngine, SrcLayout, SrcCoordLayout> const& src,
-               Tensor<DstEngine, DstLayout>                             && dst,
-               DstCoordLayout                                       const& dst_c)
-{
+template <
+    class SrcEngine,
+    class SrcLayout,
+    class SrcCoordLayout,
+    class DstEngine,
+    class DstLayout,
+    class DstCoordLayout>
+CUTE_HOST_DEVICE void copy_block_r2s(
+    SubgroupTensor<SrcEngine, SrcLayout, SrcCoordLayout> const& src,
+    Tensor<DstEngine, DstLayout>&& dst,
+    DstCoordLayout const& dst_c) {
   return copy_block_r2s(src, dst, dst_c);
 }
 
-template <class SrcEngine, class SrcLayout, class SrcCoordLayout,
-          class DstEngine, class DstLayout, class DstCoordLayout>
-CUTE_HOST_DEVICE
-void
-copy_block_s2r(Tensor<SrcEngine, SrcLayout>                         const& src,
-               SrcCoordLayout                                       const& src_c,
-               SubgroupTensor<DstEngine, DstLayout, DstCoordLayout>     && dst)
-{
+template <
+    class SrcEngine,
+    class SrcLayout,
+    class SrcCoordLayout,
+    class DstEngine,
+    class DstLayout,
+    class DstCoordLayout>
+CUTE_HOST_DEVICE void copy_block_s2r(
+    Tensor<SrcEngine, SrcLayout> const& src,
+    SrcCoordLayout const& src_c,
+    SubgroupTensor<DstEngine, DstLayout, DstCoordLayout>&& dst) {
   return copy_block_s2r(src, src_c, dst);
 }
 

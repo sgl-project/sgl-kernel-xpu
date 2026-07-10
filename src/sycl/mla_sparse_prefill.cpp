@@ -7,13 +7,12 @@
 #include <ATen/xpu/XPUContext.h>
 #include <torch/all.h>
 
+#include "cutlass/bfloat16.h"
+#include "cutlass/kernel_hardware_info.h"
+#include "kernels/mla_sparse_xattn/flash.h"
 #include "kernels/mla_sparse_xattn/flash_common_xpu.hpp"
 #include "kernels/mla_sparse_xattn/namespace_config.h"
-#include "kernels/mla_sparse_xattn/flash.h"
 #include "kernels/mla_sparse_xattn/utils.h"
-
-#include "cutlass/kernel_hardware_info.h"
-#include "cutlass/bfloat16.h"
 
 namespace FLASH_NAMESPACE {
 

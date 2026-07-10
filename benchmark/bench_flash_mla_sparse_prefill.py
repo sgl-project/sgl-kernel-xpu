@@ -9,10 +9,7 @@ Usage:
   python benchmark/bench_flash_mla_sparse_prefill.py
 """
 
-import math
-
 import torch
-
 from sgl_kernel import flash_mla_sparse_prefill
 
 # ── DeepSeek V4 constants ──
@@ -121,6 +118,7 @@ def main():
         xatt_gbs = float("nan")
         speedup = float("nan")
         if have_xatt:
+
             def run_xatt():
                 return flash_mla_sparse_fwd(
                     q, kv, indices, sm_scale, d_v=D_V, return_softmax_lse=False

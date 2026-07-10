@@ -85,7 +85,8 @@ jobs:
               python3 bench_moe_mxfp4_w4a16_gemm.py 2>&1 | tee bench_moe_mxfp4_w4a16_gemm.py.log && \
               python3 bench_fused_experts_mxfp4.py 2>&1 | tee bench_fused_experts_mxfp4.py.log && \
               python3 bench_hc_pre_gemm_sqr_sum.py 2>&1 | tee bench_hc_pre_gemm_sqr_sum.py.log && \
-              python3 bench_mhc_pre.py 2>&1 | tee bench_mhc_pre.py.log
+              python3 bench_mhc_pre.py 2>&1 | tee bench_mhc_pre.py.log && \
+              python3 bench_silu_and_mul_clamp.py 2>&1 | tee bench_silu_and_mul_clamp.log
             "
 
       - name: Copy logs from container

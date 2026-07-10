@@ -46,6 +46,7 @@ from sgl_kernel.elementwise import (
     multimodal_rotary_embedding,
     rmsnorm,
     silu_and_mul,
+    silu_and_mul_clamp,
     store_cache_xpu,
 )
 from sgl_kernel.gemm import (

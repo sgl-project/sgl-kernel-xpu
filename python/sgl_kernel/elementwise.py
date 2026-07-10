@@ -165,6 +165,34 @@ def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
     return out
 
 
+def silu_and_mul_clamp(
+    input: torch.Tensor,
+    out: torch.Tensor,
+    swiglu_limit: float,
+) -> None:
+    """Fused SiLU-and-Mul with BF16 clamping (DeepSeek-V4 / DeepGEMM style).
+
+    Writes result into *output* in-place; returns nothing.
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Shape ``(M, 2*H)``, dtype bf16 or fp16.  Gate and up halves are
+        concatenated on the last dimension (split layout, not interleaved).
+    output : torch.Tensor
+        Shape ``(M, H)``, same dtype as *input*, pre-allocated output buffer.
+    swiglu_limit : float
+        Positive clamping bound.  Applied in BF16 precision to match the
+        DeepGEMM ``__hmin2`` / ``__hmax2`` semantics:
+          - gate is upper-clamped:  gate  = min(gate, limit)
+          - up is two-sided-clamped: up   = clamp(up, -limit, limit)
+    """
+    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
+        raise ValueError("The pointers must be multiple of 16 bytes.")
+    _check_shape(input, out)
+    torch.ops.sgl_kernel.silu_and_mul_clamp(out, input, swiglu_limit)
+
+
 def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")

@@ -29,6 +29,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("silu_and_mul", torch::kXPU, &silu_and_mul);
 
+  m.def("silu_and_mul_clamp(Tensor! out, Tensor input, float swiglu_limit) -> ()");
+  m.impl("silu_and_mul_clamp", torch::kXPU, &silu_and_mul_clamp);
+
   m.def("gelu_tanh_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("gelu_tanh_and_mul", torch::kXPU, &gelu_tanh_and_mul);
 

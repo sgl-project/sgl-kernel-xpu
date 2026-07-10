@@ -11,9 +11,7 @@ import torch
 
 # Import utilities first
 from .utils import (
-    CPPArgList,
     cache_once,
-    make_cpp_args,
 )
 
 # Check if we're on XPU
@@ -42,9 +40,7 @@ if is_xpu():
 
     __all__ = [
         # Utilities
-        "CPPArgList",
         "cache_once",
-        "make_cpp_args",
         # Compiler
         "SYCLModule",
         "clear_module_cache",
@@ -61,7 +57,5 @@ if is_xpu():
 else:
     # Non-XPU environment - provide stubs
     __all__ = [
-        "CPPArgList",
         "cache_once",
-        "make_cpp_args",
     ]

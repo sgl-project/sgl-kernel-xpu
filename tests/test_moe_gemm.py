@@ -158,35 +158,13 @@ def torch_naive_moe(
     return result
 
 
-@pytest.mark.parametrize(
-    "num_tokens,topk,num_experts,hidden_size,intermediate_size,bias_dtype,act,routed_scaling_factor",
-    list(
-        itertools.product(
-            [1, 4, 33, 64, 222],  # num_tokens
-            [1, 2, 6],  # topk
-            [8, 64],  #  num_experts
-            [1024, 4096],  # hidden_size
-            [512, 1024, 4096],  # intermediate_size
-            [False, "bfloat16", "float32"],  # bias_dtype
-            [
-                ("silu", None, None),
-                ("gelu", None, None),
-                ("silu", SWIGLU_ALPHA, SWIGLU_LIMIT),  # swiglu_gpt_oss
-                ("relu2", None, None),
-            ],  # (act_type, gemm1_alpha, gemm1_limit)
-            [2.5],
-        )
-    )
-    # Gemma4-26B-A4B TP=4 shapes: hidden=2816, intermediate=176 (shard=352=2×176).
-    # GEMM1: K=2816, N=352, fuse_act=True  → narrow_n_fused branch (N≤512, avg_m>128)
-    # GEMM2: K=176,  N=2816, fuse_act=False → narrow_k branch (K≤256, avg_m>128)
-    # num_tokens=[1,64,256] covers avg_m≤8/16/128 branches; 1024 hits the new branches.
-    + [
-        (num_tokens, 8, 128, 2816, 176, False, ("silu", None, None), 2.5)
-        for num_tokens in [1, 64, 256, 1024]
-    ],
-)
-def test_moe_gemm(
+# Expert weights are E*(2*I*H + H*I) elements, i.e. 6*E*H*I bytes at bf16.
+# Unioning HEAD's 4096 shapes with #184's num_experts=128 produces cells that
+# neither sweep ever ran (E=128,H=4096,I=4096 is ~12 GiB); skip those.
+_MOE_WEIGHT_BUDGET_BYTES = 8 * 1024**3
+
+
+def _check_moe_gemm(
     num_tokens,
     topk,
     num_experts,
@@ -197,6 +175,9 @@ def test_moe_gemm(
     routed_scaling_factor,
 ):
     act_type, gemm1_alpha, gemm1_limit = act
+
+    if 6 * num_experts * hidden_size * intermediate_size > _MOE_WEIGHT_BUDGET_BYTES:
+        pytest.skip("expert weights exceed the memory budget for this combination")
 
     # For relu2 activation, only test bias_dtype=False
     if act_type == "relu2" and bias_dtype != False:
@@ -259,6 +240,66 @@ def test_moe_gemm(
 
     torch.testing.assert_close(
         torch_output.cpu(), kernel_output.cpu(), rtol=rtol, atol=atol
+    )
+
+
+# Each parameter gets its own decorator so pytest numbers the ids per-parameter
+# (act0..act3) instead of indexing every case of a single combined product.
+@pytest.mark.parametrize("routed_scaling_factor", [2.5])
+@pytest.mark.parametrize(
+    "act",
+    [
+        ("silu", None, None),
+        ("gelu", None, None),
+        ("silu", SWIGLU_ALPHA, SWIGLU_LIMIT),  # swiglu_gpt_oss
+        ("relu2", None, None),
+    ],  # (act_type, gemm1_alpha, gemm1_limit)
+)
+@pytest.mark.parametrize("bias_dtype", [False, "bfloat16", "float32"])
+@pytest.mark.parametrize("intermediate_size", [128, 512, 768, 1024, 4096])
+@pytest.mark.parametrize("hidden_size", [128, 1024, 2048, 4096])
+@pytest.mark.parametrize("num_experts", [8, 64, 128])
+@pytest.mark.parametrize("topk", [1, 2, 6, 8])
+@pytest.mark.parametrize("num_tokens", [1, 4, 33, 64, 128, 222])
+def test_moe_gemm(
+    num_tokens,
+    topk,
+    num_experts,
+    hidden_size,
+    intermediate_size,
+    bias_dtype,
+    act,
+    routed_scaling_factor,
+):
+    _check_moe_gemm(
+        num_tokens,
+        topk,
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        bias_dtype,
+        act,
+        routed_scaling_factor,
+    )
+
+
+# Gemma4-26B-A4B TP=4 shapes: hidden=2816, intermediate=176 (shard=352=2×176).
+# GEMM1: K=2816, N=352, fuse_act=True  → narrow_n_fused branch (N≤512, avg_m>128)
+# GEMM2: K=176,  N=2816, fuse_act=False → narrow_k branch (K≤256, avg_m>128)
+# num_tokens=[1,64,256] covers avg_m≤8/16/128 branches; 1024 hits the new branches.
+# Kept separate because the sweep above is a cartesian product and cannot
+# express this single (hidden_size, intermediate_size) pairing.
+@pytest.mark.parametrize("num_tokens", [1, 64, 256, 1024])
+def test_moe_gemm_gemma4_tp4_shapes(num_tokens):
+    _check_moe_gemm(
+        num_tokens=num_tokens,
+        topk=8,
+        num_experts=128,
+        hidden_size=2816,
+        intermediate_size=176,
+        bias_dtype=False,
+        act=("silu", None, None),
+        routed_scaling_factor=2.5,
     )
 
 

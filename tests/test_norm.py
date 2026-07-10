@@ -130,19 +130,40 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     )
 
 
-@pytest.mark.parametrize(
-    "batch_size, hidden_size, dtype",
-    [
-        *[
-            (batch_size, hidden_size, torch.float16)
-            for batch_size in [1, 19, 99, 989]
-            for hidden_size in [111, 500, 1024, 3072, 3584, 4096, 8192, 16384]
-        ],
+# The gemma sweeps are CRI (Xe3) topology expansions: on Xe3 the full
+# batch x hidden x dtype product is exercised, while every other device keeps
+# the original fp16 sweep plus the three sparse dtype / large-hidden cases.
+_GEMMA_BATCH_SIZES = [1, 19, 99, 989] + utils.cri_only([2, 128])
+_GEMMA_HIDDEN_SIZES = [111, 500, 1024, 3072, 3584, 4096, 8192, 16384] + utils.cri_only(
+    [2048, 5120, 32768]
+)
+_GEMMA_DTYPES = [torch.float16] + utils.cri_only([torch.bfloat16, torch.float32])
+
+_GEMMA_CASES = [
+    (batch_size, hidden_size, dtype)
+    for batch_size in _GEMMA_BATCH_SIZES
+    for hidden_size in _GEMMA_HIDDEN_SIZES
+    for dtype in _GEMMA_DTYPES
+] + (
+    []
+    if utils.is_xe3_device()
+    else [
         (19, 1024, torch.bfloat16),
         (19, 1024, torch.float32),
         (2, 32768, torch.float16),
-    ],
+    ]
 )
+
+# Spell the dtype out in the test id. pytest has no clean repr for a torch
+# dtype, so it would otherwise number the whole case as `dtype0`, `dtype1`, ...
+# by its position in the list.
+_GEMMA_IDS = [
+    f"{batch_size}-{hidden_size}-{str(dtype).rsplit('.', 1)[-1]}"
+    for batch_size, hidden_size, dtype in _GEMMA_CASES
+]
+
+
+@pytest.mark.parametrize("batch_size, hidden_size, dtype", _GEMMA_CASES, ids=_GEMMA_IDS)
 @pytest.mark.parametrize("specify_out", [True, False])
 def test_gemma_norm(batch_size, hidden_size, dtype, specify_out):
     x = torch.randn(batch_size, hidden_size).to(device).to(dtype)
@@ -158,19 +179,7 @@ def test_gemma_norm(batch_size, hidden_size, dtype, specify_out):
     torch.testing.assert_close(y_ref, y, **norm_tolerances(dtype))
 
 
-@pytest.mark.parametrize(
-    "batch_size, hidden_size, dtype",
-    [
-        *[
-            (batch_size, hidden_size, torch.float16)
-            for batch_size in [1, 19, 99, 989]
-            for hidden_size in [111, 500, 1024, 3072, 3584, 4096, 8192, 16384]
-        ],
-        (19, 1024, torch.bfloat16),
-        (19, 1024, torch.float32),
-        (2, 32768, torch.float16),
-    ],
-)
+@pytest.mark.parametrize("batch_size, hidden_size, dtype", _GEMMA_CASES, ids=_GEMMA_IDS)
 def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     eps = 1e-6
 

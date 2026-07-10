@@ -58,8 +58,7 @@ struct CausalConv1dFwdKernel {
 	int out_c_stride;
 	int out_l_stride;
 
-	int conv_state_len;
-
+	[[sycl::reqd_sub_group_size(32)]]
 	void operator()(sycl::nd_item<2> item) const {
 		const int batch_id = item.get_group(0);
 		const int channel_id = item.get_group(1) * item.get_local_range(1) + item.get_local_id(1);
@@ -79,17 +78,19 @@ struct CausalConv1dFwdKernel {
 		}
 		const bool has_init = (has_initial_state_ptr != nullptr) ? has_initial_state_ptr[batch_id] : false;
 
+		const int w_base_offset = channel_id * w_c_stride;
 		float wt[kWidth];
 #pragma unroll
 		for (int w = 0; w < kWidth; ++w) {
-			wt[w] = static_cast<float>(w_ptr[channel_id * w_c_stride + w * w_w_stride]);
+			wt[w] = static_cast<float>(w_ptr[w_base_offset + w * w_w_stride]);
 		}
 		const float bias_val = (bias_ptr != nullptr) ? static_cast<float>(bias_ptr[channel_id]) : 0.f;
+		const bool has_conv_states = (conv_states_ptr != nullptr);
 
 		float x_vals[kWidth];
 #pragma unroll
 		for (int w = 0; w < kWidth - 1; ++w) {
-			if (conv_states_ptr != nullptr && has_init) {
+			if (has_conv_states && has_init) {
 				x_vals[w] = static_cast<float>(
 						conv_states_ptr[cache_idx * cs_batch_stride + channel_id * cs_c_stride + w * cs_l_stride]);
 			} else {
@@ -98,11 +99,27 @@ struct CausalConv1dFwdKernel {
 		}
 		x_vals[kWidth - 1] = 0.f;
 
+		// Precompute offset base and step to avoid per-token conditional logic.
+		// varlen layout: x is [dim, seqlen] where seqlen is contiguous (x_batch_stride=1),
+		// so inner loop accesses are sequential — optimal for cache lines.
+		int x_base_offset, out_base_offset, x_step, out_step;
+		if (varlen) {
+			x_base_offset = seq_start * x_batch_stride + channel_id * x_c_stride;
+			out_base_offset = seq_start * out_batch_stride + channel_id * out_c_stride;
+			x_step = x_batch_stride;
+			out_step = out_batch_stride;
+		} else {
+			x_base_offset = batch_id * x_batch_stride + channel_id * x_c_stride;
+			out_base_offset = batch_id * out_batch_stride + channel_id * out_c_stride;
+			x_step = x_l_stride;
+			out_step = out_l_stride;
+		}
+
+		float x_t = static_cast<float>(x_ptr[x_base_offset]);
 		for (int t = 0; t < cur_seqlen; ++t) {
-			const int x_offset = varlen
-															 ? ((seq_start + t) * x_batch_stride + channel_id * x_c_stride)
-															 : (batch_id * x_batch_stride + channel_id * x_c_stride + t * x_l_stride);
-			const float x_t = static_cast<float>(x_ptr[x_offset]);
+			const float x_next = (t + 1 < cur_seqlen)
+					? static_cast<float>(x_ptr[x_base_offset + (t + 1) * x_step])
+					: 0.f;
 			x_vals[kWidth - 1] = x_t;
 
 			float out_val = bias_val;
@@ -112,29 +129,25 @@ struct CausalConv1dFwdKernel {
 			}
 
 			if (silu_activation) {
-				out_val = out_val / (1.f + sycl::exp(-out_val));
+				// Use native exp here to keep SiLU on the XPU fast-math path.
+				out_val = out_val / (1.f + sycl::native::exp(-out_val));
 			}
 
-			const int out_offset = varlen
-																 ? ((seq_start + t) * out_batch_stride + channel_id * out_c_stride)
-																 : (batch_id * out_batch_stride + channel_id * out_c_stride + t * out_l_stride);
-			out_ptr[out_offset] = static_cast<scalar_t>(out_val);
+			out_ptr[out_base_offset + t * out_step] = static_cast<scalar_t>(out_val);
 
 #pragma unroll
 			for (int w = 0; w < kWidth - 1; ++w) {
 				x_vals[w] = x_vals[w + 1];
 			}
+			x_t = x_next;
 		}
 
-		if (conv_states_ptr != nullptr) {
+		// Save final state window (only kWidth-1 elements used by subsequent accesses).
+		if (has_conv_states) {
 #pragma unroll
 			for (int w = 0; w < kWidth - 1; ++w) {
 				conv_states_ptr[cache_idx * cs_batch_stride + channel_id * cs_c_stride + w * cs_l_stride] =
 						static_cast<scalar_t>(x_vals[w]);
-			}
-			for (int w = kWidth - 1; w < conv_state_len; ++w) {
-				conv_states_ptr[cache_idx * cs_batch_stride + channel_id * cs_c_stride + w * cs_l_stride] =
-						static_cast<scalar_t>(0.f);
 			}
 		}
 	}
@@ -169,6 +182,7 @@ struct CausalConv1dUpdateKernel {
 	int out_c_stride;
 	int out_l_stride;
 
+	[[sycl::reqd_sub_group_size(32)]]
 	void operator()(sycl::nd_item<2> item) const {
 		const int batch_id = item.get_group(0);
 		const int channel_id = item.get_group(1) * item.get_local_range(1) + item.get_local_id(1);
@@ -182,10 +196,11 @@ struct CausalConv1dUpdateKernel {
 		}
 		const bool circular = (cache_seqlens_ptr != nullptr);
 
+		const int w_base_offset = channel_id * w_c_stride;
 		float wt[kWidth];
 #pragma unroll
 		for (int w = 0; w < kWidth; ++w) {
-			wt[w] = static_cast<float>(w_ptr[channel_id * w_c_stride + w * w_w_stride]);
+			wt[w] = static_cast<float>(w_ptr[w_base_offset + w * w_w_stride]);
 		}
 		const float bias_val = (bias_ptr != nullptr) ? static_cast<float>(bias_ptr[channel_id]) : 0.f;
 
@@ -223,9 +238,13 @@ struct CausalConv1dUpdateKernel {
 			}
 		}
 
+		const int x_base_offset = batch_id * x_batch_stride + channel_id * x_c_stride;
+		const int out_base_offset = batch_id * out_batch_stride + channel_id * out_c_stride;
+		float x_t = static_cast<float>(x_ptr[x_base_offset]);
 		for (int t = 0; t < seqlen; ++t) {
-			const float x_t = static_cast<float>(
-					x_ptr[batch_id * x_batch_stride + channel_id * x_c_stride + t * x_l_stride]);
+			const float x_next = (t + 1 < seqlen)
+					? static_cast<float>(x_ptr[x_base_offset + (t + 1) * x_l_stride])
+					: 0.f;
 
 			if (!circular) {
 				const int write_idx = state_len - advance_len + t;
@@ -246,16 +265,18 @@ struct CausalConv1dUpdateKernel {
 				out_val += wt[w] * x_vals[w];
 			}
 			if (silu_activation) {
-				out_val = out_val / (1.f + sycl::exp(-out_val));
+				// Use native exp here to keep SiLU on the XPU fast-math path.
+				out_val = out_val / (1.f + sycl::native::exp(-out_val));
 			}
 
-			out_ptr[batch_id * out_batch_stride + channel_id * out_c_stride + t * out_l_stride] =
+			out_ptr[out_base_offset + t * out_l_stride] =
 					static_cast<scalar_t>(out_val);
 
 #pragma unroll
 			for (int w = 0; w < kWidth - 1; ++w) {
 				x_vals[w] = x_vals[w + 1];
 			}
+			x_t = x_next;
 		}
 	}
 };
@@ -286,8 +307,7 @@ static void launch_causal_conv1d_fwd(
 				x_batch_stride, x_c_stride, x_l_stride,                                               \
 				w_c_stride, w_w_stride,                                                               \
 				cs_batch_stride, cs_c_stride, cs_l_stride,                                            \
-				out_batch_stride, out_c_stride, out_l_stride,                                         \
-				width - 1};                                                                           \
+				out_batch_stride, out_c_stride, out_l_stride};                                        \
 		q.submit([&](sycl::handler& h) { h.parallel_for(range, kern); });                        \
 		return;                                                                                   \
 	}
@@ -529,4 +549,3 @@ void causal_conv1d_update(
 	DISPATCH_DTYPE(at::ScalarType::Float, float)
 #undef DISPATCH_DTYPE
 }
-

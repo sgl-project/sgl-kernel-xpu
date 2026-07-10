@@ -106,6 +106,17 @@ void flash_mla_sparse_decode(
     int64_t head_dim_v,
     bool is_fp8_kvcache = false);
 
+// DeepSeek V4 Sparse MLA prefill (dense gather + fused attention)
+std::vector<at::Tensor> flash_mla_sparse_prefill(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    double sm_scale,
+    int64_t d_v,
+    const std::optional<at::Tensor>& attn_sink,
+    const std::optional<at::Tensor>& topk_length,
+    bool return_softmax_lse);
+
 void flash_mla_prefill(
     torch::Tensor& out,
     const torch::Tensor& q_nope,

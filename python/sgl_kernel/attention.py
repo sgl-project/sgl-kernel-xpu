@@ -354,3 +354,55 @@ def flash_mla_with_kvcache(
         ), "block_table path is not enabled yet for xpu"
 
     return out, lse
+
+
+def flash_mla_sparse_prefill(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: Optional[float] = None,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    return_softmax_lse: bool = False,
+):
+    """DeepSeek V4 sparse MLA prefill (dense gather + fused attention).
+
+    Args:
+        q: [s_q, h_q, d_qk] bfloat16 query.
+        kv: [s_kv, h_kv, d_qk] bfloat16 key/value (h_kv must be 1).
+        indices: [s_q, h_kv, topk] int32 gathered token indices.
+        sm_scale: softmax scale. Defaults to d_qk ** -0.5.
+        d_v: value head dim (must be 512).
+        attn_sink: optional [h_q] float32 attention sink logits.
+        topk_length: optional [s_q] int32 valid topk length per query.
+        return_softmax_lse: if True, also return (max_logits, lse).
+
+    Returns:
+        out [s_q, h_q, d_v] if return_softmax_lse is False, else
+        (out, max_logits, lse) with max_logits/lse shaped [s_q, h_q].
+    """
+    assert q.ndim == 3, f"q must be 3D [s_q, h_q, d_qk], got {q.ndim}D"
+    assert kv.ndim == 3, f"kv must be 3D [s_kv, h_kv, d_qk], got {kv.ndim}D"
+    assert (
+        indices.ndim == 3
+    ), f"indices must be 3D [s_q, h_kv, topk], got {indices.ndim}D"
+
+    d_qk = q.shape[2]
+    if sm_scale is None:
+        sm_scale = d_qk ** (-0.5)
+
+    outs = torch.ops.sgl_kernel.flash_mla_sparse_prefill.default(
+        q,
+        kv,
+        indices,
+        sm_scale,
+        d_v,
+        attn_sink,
+        topk_length,
+        return_softmax_lse,
+    )
+    if return_softmax_lse:
+        out, max_logits, lse = outs
+        return out, max_logits, lse
+    return outs[0]

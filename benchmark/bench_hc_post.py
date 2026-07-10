@@ -54,7 +54,7 @@ def benchmark(b_s, seq_len, hidden_size, provider):
     comb_res_mix = torch.randn(T, hc, hc, dtype=torch.float32, device="xpu")
 
     # Warmup
-    for _ in range(100):
+    for _ in range(10):
         hc_post(x, residual, post_layer_mix, comb_res_mix)
     torch.xpu.synchronize()
 

@@ -48,6 +48,11 @@ suites = {
         TestFile("test_hc_pre_gemm_sqr_sum.py"),
         TestFile("test_mhc_pre.py"),
         TestFile("test_per_token_group_quant_mxfp4_fused.py"),
+        TestFile("test_silu_and_mul_clamp.py"),
+        TestFile("test_hadamard.py"),
+        TestFile("test_fp8_paged_mqa_logits.py"),
+        TestFile("test_c128_v2.py"),
+        TestFile("test_c4_v2.py"),
     ],
 }
 

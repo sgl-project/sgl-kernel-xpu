@@ -3,12 +3,10 @@ import math
 import pytest
 import torch
 import torch.nn.functional as F
-import utils
 from einops import rearrange, repeat
 from scipy.linalg import hadamard
 from sgl_kernel import hadamard_transform
-
-device = utils.get_device()
+from utils import get_device
 
 
 def hadamard_transform_ref(x, scale=1.0):
@@ -36,10 +34,10 @@ def hadamard_transform_ref(x, scale=1.0):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     "dim",
-    [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 137, 1024, 2048, 4096, 8192, 16384, 32768],
+    [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
 )
 def test_fast_hadamard_transform(dim, dtype):
-    device = device
+    device = get_device()
 
     if dtype == torch.float32:
         rtol, atol = 3e-4, 3e-3

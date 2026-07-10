@@ -22,12 +22,7 @@ from sgl_kernel.attention import (
     merge_state,
     merge_state_v2,
 )
-from sgl_kernel.dsv4 import (
-    flash_compress4_decode,
-    flash_compress4_prefill,
-    flash_compress128_decode,
-    flash_compress128_prefill,
-    fp8_paged_mqa_logits,
+from sgl_kernel.compress_plan_torch import (
     plan_compress_decode,
     plan_compress_decode_legacy,
     plan_compress_prefill,
@@ -46,8 +41,18 @@ from sgl_kernel.elementwise import (
     multimodal_rotary_embedding,
     rmsnorm,
     silu_and_mul,
+    silu_and_mul_clamp,
     store_cache_xpu,
 )
+from sgl_kernel.flash_compress_4_torch import (
+    flash_compress4_decode,
+    flash_compress4_prefill,
+)
+from sgl_kernel.flash_compress_128_torch import (
+    flash_compress128_decode,
+    flash_compress128_prefill,
+)
+from sgl_kernel.fp8_paged_mqa_logits import fp8_paged_mqa_logits_triton
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
@@ -67,6 +72,7 @@ from sgl_kernel.gemm import (
     sgl_per_token_quant_fp8,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
+from sgl_kernel.hadamard import hadamard_transform
 from sgl_kernel.lora import embedding_lora_a_fwd
 from sgl_kernel.memory import weak_ref_tensor
 from sgl_kernel.mhc import (
@@ -109,6 +115,11 @@ from sgl_kernel.speculative import (
     segment_packbits,
     tree_speculative_sampling_target_only,
     verify_tree_greedy,
+)
+from sgl_kernel.top_k import (
+    fast_topk_transform_fused,
+    fast_topk_transform_ragged_fused,
+    fast_topk_v2,
 )
 from sgl_kernel.utils import get_device_capability, is_xe2_arch
 from sgl_kernel.version import __version__

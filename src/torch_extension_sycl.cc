@@ -69,7 +69,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "maybe_top_k_arr, float top_k_val, Tensor? maybe_top_p_arr, float top_p_val, bool deterministic, Generator? "
       "gen) -> ()");
   m.impl("top_k_top_p_sampling_from_probs", torch::kXPU, &top_k_top_p_sampling_from_probs);
-  
+
   /*
    * Fast radix top-k (DeepSeek V3.2 indexer)
    */

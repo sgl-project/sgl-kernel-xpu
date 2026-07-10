@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import logging
 import os
 import pathlib
 import re
@@ -19,6 +20,8 @@ from typing import Any, List, Tuple
 import torch
 
 from .utils import cache_once
+
+logger = logging.getLogger(__name__)
 
 # Default SYCL compilation flags matching sgl-kernel-xpu build
 DEFAULT_SYCL_CFLAGS = [
@@ -42,24 +45,35 @@ DEFAULT_SYCL_CFLAGS = [
 def _get_sycl_aot_flags() -> List[str]:
     """Detect GPU device and return AOT compilation flags.
 
-    Falls back to generic spir64 if device can't be detected.
+    The AOT targets can be overridden via the ``SGLANG_SYCL_AOT_TARGETS``
+    environment variable (comparable to CUDA's ``TVM_FFI_CUDA_ARCH_LIST``).
+
+    Otherwise uses the numeric device capability reported by the sgl_kernel
+    runtime (equivalent to CUDA's (major, minor)).
+
+    Falls back to generic spir64 if the device can't be detected.
     """
+    override = os.environ.get("SGLANG_SYCL_AOT_TARGETS")
+    if override:
+        return [f"-fsycl-targets={override}"]
+
     try:
         if hasattr(torch, "xpu") and torch.xpu.is_available():
-            dev_name = torch.xpu.get_device_name(0).lower()
-            # BMG (Arc B-series, Battlemage) — IP version 20
-            if (
-                "b580" in dev_name
-                or "b570" in dev_name
-                or "bmg" in dev_name
-                or "battlemage" in dev_name
-            ):
+            device = torch.xpu.current_device()
+            major, _ = torch.ops.sgl_kernel.query_device.default(device)
+            # Xe2 (BMG-G21, Arc B-series/Battlemage) has compute capability 20
+            if major == 2:
                 return [
                     "-fsycl-targets=intel_gpu_bmg_g21",
                 ]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Failed to detect XPU device capability for AOT flags: %s", e)
     # Fallback: generic SPIR-V (runtime JIT to native ISA)
+    logger.warning(
+        "Falling back to generic SPIR-V AOT target (-fsycl-targets=spir64); "
+        "AOT-optimized kernels are unavailable, which may cause a performance "
+        "regression. Set SGLANG_SYCL_AOT_TARGETS to override the target explicitly."
+    )
     return ["-fsycl-targets=spir64"]
 
 
@@ -99,17 +113,25 @@ DEFAULT_SYCL_INCLUDE = [str(_KERNEL_INCLUDE_PATH)]
 def _get_pytorch_sycl_lib_path() -> str:
     """Get the directory containing PyTorch's libsycl.so.
 
-    Assumes a properly configured environment where PyTorch is installed
-    with SYCL support in the standard location.
+    Matches any ``libsycl.so*`` soname (e.g. ``libsycl.so.8``, ``libsycl.so.9``)
+    so detection stays version-agnostic across PyTorch builds compiled against
+    different oneAPI releases.
+
+    Returns an empty string if PyTorch's SYCL runtime cannot be located.
     """
     try:
         torch_lib_path = pathlib.Path(torch.__file__).parent / "lib"
-        if (torch_lib_path / "libsycl.so").exists() or (
-            torch_lib_path / "libsycl.so.8"
-        ).exists():
+        # Match libsycl.so, libsycl.so.8, libsycl.so.9, ... regardless of version
+        if any(torch_lib_path.glob("libsycl.so*")):
             return str(torch_lib_path)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Failed to locate PyTorch SYCL runtime: %s", e)
+
+    logger.warning(
+        "Could not find PyTorch's libsycl.so under torch/lib; linking against the "
+        "SYCL runtime will be left to the system loader, which may cause an ABI "
+        "mismatch. Ensure PyTorch is installed with SYCL/XPU support."
+    )
     return ""
 
 
@@ -190,7 +212,12 @@ class SYCLModule:
 
         self.so_path = so_path
         self.module_name = module_name
-        self._lib = ctypes.CDLL(str(so_path))
+        try:
+            self._lib = ctypes.CDLL(str(so_path))
+        except OSError as e:
+            raise RuntimeError(
+                f"Failed to load SYCL module '{module_name}' from {so_path}: {e}"
+            ) from e
         self._functions = {}
         self._configured_funcs = {}  # Cache for functions with configured argtypes/restype
 
@@ -393,14 +420,13 @@ def load_jit_sycl(
         os.environ.get("LD_LIBRARY_PATH", ""),
     ]
 
-    # Resolve sycl_files to absolute paths for unambiguous cache keying
-    resolved_sycl_files = [str((_SYCL_KERNEL_PATH / f).resolve()) for f in sycl_files]
-
-    # Compute cache key from compilation-affecting inputs
+    # Compute cache key from compilation-affecting inputs. Use the relative
+    # source filenames (not absolute paths) plus the source contents so the
+    # cache key stays portable across machines and install locations.
     cache_key = _compute_cache_key(
         [
             args,
-            resolved_sycl_files,
+            sycl_files,
             sycl_sources,
             DEFAULT_SYCL_CFLAGS,
             aot_flags,
@@ -467,23 +493,17 @@ def load_jit_sycl(
                 cmd += DEFAULT_LDFLAGS + extra_ldflags
 
                 # Compile
-                try:
-                    result = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        timeout=120,  # 2 minute timeout
-                    )
-                    if result.returncode != 0:
-                        error_msg = f"ICPX compilation failed:\n"
-                        error_msg += f"Command: {' '.join(cmd)}\n"
-                        error_msg += f"STDOUT: {result.stdout}\n"
-                        error_msg += f"STDERR: {result.stderr}\n"
-                        raise RuntimeError(error_msg)
-                except subprocess.TimeoutExpired:
-                    raise RuntimeError(
-                        f"ICPX compilation timed out after 120 seconds for {module_name}"
-                    )
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode != 0:
+                    error_msg = f"ICPX compilation failed:\n"
+                    error_msg += f"Command: {' '.join(cmd)}\n"
+                    error_msg += f"STDOUT: {result.stdout}\n"
+                    error_msg += f"STDERR: {result.stderr}\n"
+                    raise RuntimeError(error_msg)
 
                 # Publish compiled library atomically
                 os.replace(tmp_so_path, so_path)

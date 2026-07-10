@@ -79,7 +79,7 @@ def _score_relu_weight_scale_kernel(
     tl.store(out_base + s_offs, tl.where(valid, acc, 0.0), mask=write_mask)
 
 
-def fp8_paged_mqa_logits(
+def fp8_paged_mqa_logits_triton(
     q_fp8: torch.Tensor,
     kvcache_fp8: torch.Tensor,
     weight: torch.Tensor,

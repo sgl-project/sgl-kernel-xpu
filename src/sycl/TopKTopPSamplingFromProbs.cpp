@@ -89,8 +89,8 @@ struct TopKTopPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
     for (int round = 0; round < kMaxRounds; ++round) {
       if (tx == 0) {
-        shared_ids_[0] = d_int;   // sampled_id sentinel
-        shared_ids_[1] = -1;      // last_valid_id
+        shared_ids_[0] = d_int;  // sampled_id sentinel
+        shared_ids_[1] = -1;     // last_valid_id
       }
       item.barrier(sycl::access::fence_space::local_space);
 
@@ -268,8 +268,7 @@ void top_k_top_p_sampling_from_probs(
   }
 
   // Resolve the Philox seed/offset from the (default) XPU generator.
-  auto generator =
-      at::get_generator_or_default<at::XPUGeneratorImpl>(gen, at::xpu::detail::getDefaultXPUGenerator());
+  auto generator = at::get_generator_or_default<at::XPUGeneratorImpl>(gen, at::xpu::detail::getDefaultXPUGenerator());
   uint64_t philox_seed, philox_offset;
   {
     std::lock_guard<std::mutex> lock(generator->mutex_);

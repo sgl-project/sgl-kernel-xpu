@@ -81,8 +81,7 @@ struct TopPRenormProbsSingleCTA {
         vec_io v;
         v.load(
             0,
-            sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(
-                probs + row_offset + i * kVecSize));
+            sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(probs + row_offset + i * kVecSize));
 #pragma unroll
         for (uint32_t j = 0; j < kVecSize; ++j) {
           thread_sum += static_cast<float>(v[j]);
@@ -100,8 +99,7 @@ struct TopPRenormProbsSingleCTA {
         vec_io v;
         v.load(
             0,
-            sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(
-                probs + row_offset + i * kVecSize));
+            sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(probs + row_offset + i * kVecSize));
         vec_io out;
 #pragma unroll
         for (uint32_t j = 0; j < kVecSize; ++j) {
@@ -113,8 +111,7 @@ struct TopPRenormProbsSingleCTA {
                 renorm_probs + row_offset + i * kVecSize));
       }
       for (uint32_t col = vec_tail_start + tid; col < vocab_u32; col += kWgSize) {
-        renorm_probs[row_offset + col] =
-            static_cast<DType>(static_cast<float>(probs[row_offset + col]) * normalizer);
+        renorm_probs[row_offset + col] = static_cast<DType>(static_cast<float>(probs[row_offset + col]) * normalizer);
       }
       return;
     }
@@ -125,8 +122,7 @@ struct TopPRenormProbsSingleCTA {
       vec_io v;
       v.load(
           0,
-          sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(
-              probs + row_offset + i * kVecSize));
+          sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(probs + row_offset + i * kVecSize));
 #pragma unroll
       for (uint32_t j = 0; j < kVecSize; ++j) {
         const float val = static_cast<float>(v[j]);
@@ -158,8 +154,7 @@ struct TopPRenormProbsSingleCTA {
         vec_io v;
         v.load(
             0,
-            sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(
-                probs + row_offset + i * kVecSize));
+            sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(probs + row_offset + i * kVecSize));
 #pragma unroll
         for (uint32_t j = 0; j < kVecSize; ++j) {
           const float val = static_cast<float>(v[j]);
@@ -202,8 +197,7 @@ struct TopPRenormProbsSingleCTA {
       vec_io v;
       v.load(
           0,
-          sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(
-              probs + row_offset + i * kVecSize));
+          sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(probs + row_offset + i * kVecSize));
       vec_io out;
 #pragma unroll
       for (uint32_t j = 0; j < kVecSize; ++j) {
@@ -212,8 +206,7 @@ struct TopPRenormProbsSingleCTA {
       }
       out.store(
           0,
-          sycl::multi_ptr<DType, sycl::access::address_space::global_space>(
-              renorm_probs + row_offset + i * kVecSize));
+          sycl::multi_ptr<DType, sycl::access::address_space::global_space>(renorm_probs + row_offset + i * kVecSize));
     }
     for (uint32_t col = vec_tail_start + tid; col < vocab_u32; col += kWgSize) {
       const float val = static_cast<float>(probs[row_offset + col]);

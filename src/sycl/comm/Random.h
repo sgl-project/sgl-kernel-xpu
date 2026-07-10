@@ -13,7 +13,8 @@ namespace sgl::random {
 // the (seed, offset) pair produced by the torch generator's philox engine.
 // Distinct (subsequence, round) counters give independent draws, matching the
 // flashinfer approach of one Philox stream per request.
-// source: https://www.intel.com/content/www/us/en/docs/onedpl/developer-guide/2022-13-0/random-number-generators.html#PREDEFINED-RANDOM-NUMBER-ENGINES
+// source:
+// https://www.intel.com/content/www/us/en/docs/onedpl/developer-guide/2022-13-0/random-number-generators.html#PREDEFINED-RANDOM-NUMBER-ENGINES
 inline float philox_uniform(uint64_t seed, uint64_t offset, uint32_t subsequence, uint32_t round) {
   using philox4x32_engine = oneapi::dpl::experimental::
       philox_engine<std::uint_fast32_t, 32, 4, 10, 0xCD9E8D57, 0x9E3779B9, 0xD2511F53, 0xBB67AE85>;

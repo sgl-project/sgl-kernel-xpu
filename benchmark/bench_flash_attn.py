@@ -346,6 +346,130 @@ def benchmark(
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
 
+# ==================== MLA decode benchmark ====================
+# DeepSeek MLA absorbed decode via the packed-576 ``flash_attn_with_kvcache``
+# path: the query packs ``[q_nope(512), q_pe(64)] = 576``, the paged KV cache row
+# is the full 576-wide latent+rope vector, and the value is its leading 512-wide
+# slice (kv_lora_rank). The score uses the full 576-wide QK dim while the output
+# value dim is 512, exercising the asymmetric head_size_qk != head_size_vo decode
+# path. The MLA latent cache has a single KV head; on Intel Xe the 576-wide QK
+# tile only fits in shared local memory for up to 8 query heads per KV head.
+MLA_KV_LORA_RANK = 512
+MLA_QK_ROPE_HEAD_DIM = 64
+MLA_HEAD_DIM = MLA_KV_LORA_RANK + MLA_QK_ROPE_HEAD_DIM  # 576 (packed QK dim)
+MLA_V_HEAD_DIM = MLA_KV_LORA_RANK  # 512 (value / output dim)
+
+mla_batch_size = [1, 8, 16]
+mla_num_heads_q = [1, 4, 8]  # query heads per KV head; >8 exceeds the Xe SLM budget
+mla_kv_seq_length = [1024, 4096]
+mla_page_size = [64, 128]
+mla_configs = list(
+    product(mla_batch_size, mla_num_heads_q, mla_kv_seq_length, mla_page_size)
+)
+all_results_mla = []
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=[
+            "batch_size",
+            "num_heads_q",
+            "kv_seq_length",
+            "page_size",
+        ],
+        x_vals=[list(c) for c in mla_configs],
+        line_arg="provider",
+        line_vals=["flash_attn_mla"],
+        line_names=["MLA Decode"],
+        styles=[("green", "-")],
+        ylabel="us",
+        plot_name="flash-attention-mla-decode-performance",
+        args={},
+    )
+)
+def benchmark_mla(
+    batch_size,
+    num_heads_q,
+    kv_seq_length,
+    page_size,
+    provider,
+):
+    dtype = torch.bfloat16
+    device = torch.device("xpu")
+    torch.manual_seed(0)
+
+    seqlen_q = 1  # decode step
+    nheads_kv = 1  # MLA latent cache has a single KV head
+    head_dim = MLA_HEAD_DIM  # 576 packed QK dim
+    v_head_dim = MLA_V_HEAD_DIM  # 512 value / output dim
+
+    num_blocks_per_seq = (kv_seq_length + page_size - 1) // page_size
+    num_blocks = num_blocks_per_seq * batch_size
+
+    q = torch.randn(
+        batch_size, seqlen_q, num_heads_q, head_dim, device=device, dtype=dtype
+    )
+    kv_cache = torch.randn(
+        num_blocks, page_size, nheads_kv, head_dim, device=device, dtype=dtype
+    )
+    # Value is the leading kv_lora_rank slice of the same cache (contiguous last
+    # dim, i.e. stride(-1) == 1).
+    v_cache = kv_cache[..., :v_head_dim]
+    page_table = torch.arange(num_blocks, dtype=torch.int32, device=device).view(
+        batch_size, num_blocks_per_seq
+    )
+    cache_seqlens = (
+        torch.ones(batch_size, device=device, dtype=torch.int32) * kv_seq_length
+    )
+    softmax_scale = 1.0 / (head_dim**0.5)
+
+    quantiles = [0.5, 0.2, 0.8]
+
+    if provider == "flash_attn_mla":
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: flash_attn_with_kvcache(
+                q=q,
+                k_cache=kv_cache,
+                v_cache=v_cache,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                softmax_scale=softmax_scale,
+                causal=False,
+            ),
+            quantiles=quantiles,
+        )
+
+    # decode: seqlen_q == 1, full (non-causal) attention over kv_seq_length.
+    effective_attention_pairs = kv_seq_length
+    flops_qk = batch_size * num_heads_q * effective_attention_pairs * head_dim * 2
+    flops_pv = batch_size * num_heads_q * effective_attention_pairs * v_head_dim * 2
+    tflops = (flops_qk + flops_pv) * 1e-12 / (ms * 1e-3)
+    # Q read + full KV-cache read (single KV head, 576-wide) + O write (512-wide).
+    memory = (
+        q.element_size() * batch_size * num_heads_q * seqlen_q * head_dim
+        + kv_cache.element_size() * batch_size * nheads_kv * kv_seq_length * head_dim
+        + q.element_size() * batch_size * num_heads_q * seqlen_q * v_head_dim
+    )
+    bandwidth = memory * 1e-9 / (ms * 1e-3)
+    all_results_mla.append(
+        {
+            "batch": batch_size,
+            "q_seq_length": seqlen_q,
+            "kv_seq_length": kv_seq_length,
+            "num_heads_q": num_heads_q,
+            "num_heads_kv": nheads_kv,
+            "head_dim": head_dim,
+            "v_head_dim": v_head_dim,
+            "page_size": page_size,
+            "provider": provider,
+            "tflops": tflops,
+            "bandwidth": bandwidth,
+            "ms": ms,
+        }
+    )
+    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+
+
 if __name__ == "__main__":
     benchmark.run(print_data=False)
     print("Benchmark finished!")
@@ -354,3 +478,10 @@ if __name__ == "__main__":
 
     df = pd.DataFrame(all_results)
     print(df.to_markdown())
+
+    print("\nRunning MLA decode benchmark...")
+    benchmark_mla.run(print_data=False)
+    print("MLA benchmark finished!")
+
+    df_mla = pd.DataFrame(all_results_mla)
+    print(df_mla.to_markdown())

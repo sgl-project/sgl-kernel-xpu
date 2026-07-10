@@ -49,6 +49,7 @@ suites = {
         TestFile("test_mhc_pre.py"),
         TestFile("test_per_token_group_quant_mxfp4_fused.py"),
         TestFile("test_hc_post.py"),
+        TestFile("test_silu_and_mul_clamp.py"),
     ],
 }
 

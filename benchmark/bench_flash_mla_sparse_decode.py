@@ -9,7 +9,6 @@ Usage:
 """
 
 import torch
-
 from sgl_kernel import flash_mla_sparse_decode
 
 # ── DeepSeek V4 sparse fp8 KV layout constants ──
@@ -78,16 +77,16 @@ def build_inputs(batch, h_q, topk, device="xpu", seed=0):
         torch.bfloat16
     )
     logical_kv = (
-        torch.randn((NUM_BLOCKS, BLOCK_SIZE, 1, D_QK), device=device, dtype=torch.bfloat16)
+        torch.randn(
+            (NUM_BLOCKS, BLOCK_SIZE, 1, D_QK), device=device, dtype=torch.bfloat16
+        )
         * 0.5
     )
     packed_kv, dequant_kv = _pack_sparse_fp8_kv_deepseek_v4(logical_kv)
     s_kv = NUM_BLOCKS * BLOCK_SIZE
     indices = torch.stack(
         [
-            torch.stack(
-                [torch.randperm(s_kv, device=device)[:topk].to(torch.int32)]
-            )
+            torch.stack([torch.randperm(s_kv, device=device)[:topk].to(torch.int32)])
             for _ in range(b)
         ]
     )  # [b, 1, topk]
@@ -151,7 +150,12 @@ def main():
 
         def run_sgl():
             return flash_mla_sparse_decode(
-                q, packed_kv, indices, sm_scale=sm_scale, d_v=D_V, return_softmax_lse=False
+                q,
+                packed_kv,
+                indices,
+                sm_scale=sm_scale,
+                d_v=D_V,
+                return_softmax_lse=False,
             )
 
         out_sgl = run_sgl()

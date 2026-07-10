@@ -5,7 +5,6 @@ Run: pytest tests/test_flash_mla_sparse_decode.py
 
 import pytest
 import torch
-
 from sgl_kernel import flash_mla_sparse_decode
 
 NOPE_DIM = 448
@@ -140,9 +139,7 @@ def _reference_sparse_decode(
     lse_for_out = lse
     if attn_sink is not None:
         lse_for_out = torch.logsumexp(
-            torch.stack(
-                [lse, attn_sink.view(1, 1, h_q).expand_as(lse)], dim=0
-            ),
+            torch.stack([lse, attn_sink.view(1, 1, h_q).expand_as(lse)], dim=0),
             dim=0,
         )
     lse_for_out = lse_for_out.masked_fill(lse_for_out == float("-inf"), float("inf"))
@@ -171,7 +168,7 @@ def test_flash_mla_sparse_decode_fp8_kvcache(
     d_qk = D_QK
     num_blocks, block_size = 128, 64
     extra_num_blocks, extra_block_size = 256, 64
-    sm_scale = d_qk ** -0.5
+    sm_scale = d_qk**-0.5
 
     q_ref = torch.randn((b, s_q, h_q, d_qk), device=device, dtype=torch.float32) * 0.5
     q_scale = None
@@ -184,7 +181,9 @@ def test_flash_mla_sparse_decode_fp8_kvcache(
         q_for_ref = q.float()
 
     logical_kv = (
-        torch.randn((num_blocks, block_size, 1, d_qk), device=device, dtype=torch.bfloat16)
+        torch.randn(
+            (num_blocks, block_size, 1, d_qk), device=device, dtype=torch.bfloat16
+        )
         * 0.5
     )
     packed_kv, dequant_kv = _pack_sparse_fp8_kv_deepseek_v4(logical_kv)

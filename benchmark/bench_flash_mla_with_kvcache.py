@@ -406,6 +406,16 @@ configs = [
 # Main
 # ============================================================================
 if __name__ == "__main__":
+    # Disabled: legacy sgl sparse MLA decode is build-excluded and superseded by the
+    # xattention-based port. Use benchmark/bench_flash_mla_sparse_decode.py instead.
+    import sys
+
+    print(
+        "[disabled] Legacy sgl sparse MLA decode benchmark is superseded by the "
+        "xattention port. Run benchmark/bench_flash_mla_sparse_decode.py instead."
+    )
+    sys.exit(0)
+
     device = torch.device("xpu")
     H = H_PER_RANK
     num_pages = 512

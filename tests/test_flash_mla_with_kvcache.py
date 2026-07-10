@@ -45,6 +45,15 @@ from torch import Tensor
 
 device = torch.device("xpu")
 
+# Disabled: legacy sgl sparse MLA decode implementation (kernels/mla_sparse) is
+# build-excluded and superseded by the xattention-based port. Correctness is now
+# covered by test_flash_mla_sparse_decode.py / test_flash_mla_sparse_prefill.py.
+pytest.skip(
+    reason="Legacy sgl sparse MLA decode is disabled; superseded by the xattention "
+    "port (test_flash_mla_sparse_decode.py / test_flash_mla_sparse_prefill.py).",
+    allow_module_level=True,
+)
+
 if not torch.xpu.is_available():
     pytest.skip(
         reason="V4 Sparse MLA Decode requires XPU device.",

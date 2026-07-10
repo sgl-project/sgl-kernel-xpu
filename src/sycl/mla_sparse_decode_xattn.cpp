@@ -7,13 +7,12 @@
 #include <ATen/xpu/XPUContext.h>
 #include <torch/all.h>
 
+#include "cutlass/bfloat16.h"
+#include "cutlass/kernel_hardware_info.h"
+#include "kernels/mla_sparse_xattn/flash.h"
 #include "kernels/mla_sparse_xattn/flash_common_xpu.hpp"
 #include "kernels/mla_sparse_xattn/namespace_config.h"
-#include "kernels/mla_sparse_xattn/flash.h"
 #include "kernels/mla_sparse_xattn/utils.h"
-
-#include "cutlass/kernel_hardware_info.h"
-#include "cutlass/bfloat16.h"
 
 namespace FLASH_NAMESPACE {
 
@@ -58,8 +57,8 @@ std::vector<at::Tensor> flash_mla_sparse_decode_impl(
     TORCH_CHECK(q_scale.has_value(), "q_scale must be provided when is_fp8_query is true");
     TORCH_CHECK(q_scale.value().dtype() == torch::kFloat32, "q_scale must be float32");
     TORCH_CHECK(q_scale.value().dim() == 0 || q_scale.value().dim() == 1, "q_scale must be scalar or 1D [h_q]");
-    TORCH_CHECK(q_scale.value().numel() == 1 || q_scale.value().numel() == h_q,
-                "q_scale must have 1 element or h_q elements");
+    TORCH_CHECK(
+        q_scale.value().numel() == 1 || q_scale.value().numel() == h_q, "q_scale must have 1 element or h_q elements");
     CHECK_DEVICE(q_scale.value());
   } else {
     TORCH_CHECK(q.dtype() == torch::kBFloat16, "non-fp8 query path requires q dtype bfloat16");
@@ -86,14 +85,16 @@ std::vector<at::Tensor> flash_mla_sparse_decode_impl(
   if (extra_kv.has_value()) {
     TORCH_CHECK(extra_indices.has_value(), "extra_indices must be provided when extra_kv is provided");
     TORCH_CHECK(extra_kv.value().dim() == 4, "extra_kv must be 4D [num_blocks, page_block_size, h_kv, head_bytes]");
-    TORCH_CHECK(extra_kv.value().size(2) == 1 && extra_kv.value().size(3) == SPARSE_MLA_FP8_HEAD_BYTES,
-                "extra_kv must have h_kv=1 and head_bytes=584");
-    TORCH_CHECK(extra_kv.value().dtype() == at::ScalarType::Float8_e4m3fn,
-                "extra_kv must be float8_e4m3fn packed storage");
+    TORCH_CHECK(
+        extra_kv.value().size(2) == 1 && extra_kv.value().size(3) == SPARSE_MLA_FP8_HEAD_BYTES,
+        "extra_kv must have h_kv=1 and head_bytes=584");
+    TORCH_CHECK(
+        extra_kv.value().dtype() == at::ScalarType::Float8_e4m3fn, "extra_kv must be float8_e4m3fn packed storage");
     CHECK_DEVICE(extra_kv.value());
     TORCH_CHECK(extra_indices.value().dim() == 3, "extra_indices must be 3D [b, s_q, extra_topk]");
-    TORCH_CHECK(extra_indices.value().size(0) == b && extra_indices.value().size(1) == s_q,
-                "extra_indices batch/query dims must match q");
+    TORCH_CHECK(
+        extra_indices.value().size(0) == b && extra_indices.value().size(1) == s_q,
+        "extra_indices batch/query dims must match q");
     TORCH_CHECK(extra_indices.value().dtype() == torch::kInt32, "extra_indices must be int32");
     CHECK_DEVICE(extra_indices.value());
     extra_num_blocks = extra_kv.value().size(0);
@@ -177,7 +178,8 @@ std::vector<at::Tensor> flash_mla_sparse_decode_impl(
   params.stride_extra_kv_row = extra_kv.has_value() ? int64_stride_to_int(extra_kv.value().stride(1)) : 0;
   params.stride_extra_kv_head = extra_kv.has_value() ? int64_stride_to_int(extra_kv.value().stride(2)) : 0;
   params.stride_extra_indices_b = extra_indices.has_value() ? int64_stride_to_int(extra_indices.value().stride(0)) : 0;
-  params.stride_extra_indices_s_q = extra_indices.has_value() ? int64_stride_to_int(extra_indices.value().stride(1)) : 0;
+  params.stride_extra_indices_s_q =
+      extra_indices.has_value() ? int64_stride_to_int(extra_indices.value().stride(1)) : 0;
   params.stride_extra_topk_length_b =
       extra_topk_length.has_value() ? int64_stride_to_int(extra_topk_length.value().stride(0)) : 0;
   params.stride_extra_topk_length_s_q = 0;
@@ -218,6 +220,17 @@ std::vector<at::Tensor> flash_mla_sparse_decode(
     bool is_fp8_query,
     bool return_softmax_lse) {
   return FLASH_NAMESPACE::flash_mla_sparse_decode_impl(
-      q, kv, indices, sm_scale, d_v, topk_length, attn_sink, extra_kv, extra_indices, extra_topk_length, q_scale,
-      is_fp8_query, return_softmax_lse);
+      q,
+      kv,
+      indices,
+      sm_scale,
+      d_v,
+      topk_length,
+      attn_sink,
+      extra_kv,
+      extra_indices,
+      extra_topk_length,
+      q_scale,
+      is_fp8_query,
+      return_softmax_lse);
 }

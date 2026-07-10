@@ -10,9 +10,8 @@ import utils
 device = utils.get_device()
 
 
-@pytest.mark.skip(reason="not implemented")
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256, 151936])
 @pytest.mark.parametrize("p", [0.1, 0.5])
 def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
     torch.manual_seed(42)

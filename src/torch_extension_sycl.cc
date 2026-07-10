@@ -61,6 +61,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("top_p_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_p_arr, float top_p_val) -> ()");
   m.impl("top_p_renorm_probs", torch::kXPU, &top_p_renorm_probs);
 
+  m.def(
+      "top_k_top_p_sampling_from_probs(Tensor probs, Tensor! output, Tensor? maybe_indices, Tensor? "
+      "maybe_top_k_arr, float top_k_val, Tensor? maybe_top_p_arr, float top_p_val, bool deterministic, Generator? "
+      "gen) -> ()");
+  m.impl("top_k_top_p_sampling_from_probs", torch::kXPU, &top_k_top_p_sampling_from_probs);
+
   m.def("swiglu_gpt_oss_sigmoid_alpha(Tensor x, float alpha, float limit) -> Tensor");
   m.impl("swiglu_gpt_oss_sigmoid_alpha", torch::kXPU, &swiglu_gpt_oss_sigmoid_alpha);
   m.def(

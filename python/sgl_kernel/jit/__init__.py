@@ -10,13 +10,13 @@ from __future__ import annotations
 import torch
 
 # Import utilities first
-from .utils import (
-    cache_once,
-)
+from .utils import cache_once
+
 
 # Check if we're on XPU
 def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
+
 
 if is_xpu():
     from .compiler import (
@@ -25,18 +25,9 @@ if is_xpu():
         is_icpx_available,
         load_jit_sycl,
     )
-    from .norm import (
-        can_use_fused_inplace_qknorm,
-        fused_inplace_qknorm,
-        rmsnorm,
-    )
-    from .rope import (
-        apply_rope_inplace,
-        apply_rope_inplace_with_kvcache,
-    )
-    from .timestep_embedding import (
-        timestep_embedding,
-    )
+    from .norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm, rmsnorm
+    from .rope import apply_rope_inplace, apply_rope_inplace_with_kvcache
+    from .timestep_embedding import timestep_embedding
 
     __all__ = [
         # Utilities

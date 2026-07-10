@@ -94,7 +94,10 @@ def _resolve_kernel_include_path() -> pathlib.Path:
 
     # Check for development environment (one level up from python/)
     dev_include_path = sgl_kernel_package.parent.parent / "include"
-    if dev_include_path.exists() and (dev_include_path / "sgl_kernel" / "jit_kernel").exists():
+    if (
+        dev_include_path.exists()
+        and (dev_include_path / "sgl_kernel" / "jit_kernel").exists()
+    ):
         return dev_include_path
 
     raise RuntimeError(
@@ -219,7 +222,9 @@ class SYCLModule:
                 f"Failed to load SYCL module '{module_name}' from {so_path}: {e}"
             ) from e
         self._functions = {}
-        self._configured_funcs = {}  # Cache for functions with configured argtypes/restype
+        self._configured_funcs = (
+            {}
+        )  # Cache for functions with configured argtypes/restype
 
     def __getattr__(self, name: str):
         """Dynamically load function from shared library."""

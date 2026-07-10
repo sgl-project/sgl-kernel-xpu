@@ -16,12 +16,10 @@ except ImportError:
     HAS_SGL_KERNEL = False
 
 try:
-    from sgl_kernel.jit import (
-        fused_inplace_qknorm as jit_qknorm,
-        rmsnorm as jit_rmsnorm,
-        apply_rope_inplace as jit_rope,
-        timestep_embedding as jit_timestep_embedding,
-    )
+    from sgl_kernel.jit import apply_rope_inplace as jit_rope
+    from sgl_kernel.jit import fused_inplace_qknorm as jit_qknorm
+    from sgl_kernel.jit import rmsnorm as jit_rmsnorm
+    from sgl_kernel.jit import timestep_embedding as jit_timestep_embedding
 
     HAS_SGLANG_JIT = True
 except ImportError:

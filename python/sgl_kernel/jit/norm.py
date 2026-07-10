@@ -135,8 +135,7 @@ def _jit_qknorm_module_xpu(head_dim: int, dtype: torch.dtype):
 
     if dtype not in dtype_map:
         raise ValueError(
-            f"Unsupported dtype for XPU QKNorm: {dtype}. "
-            "Only fp16/bf16 supported."
+            f"Unsupported dtype for XPU QKNorm: {dtype}. " "Only fp16/bf16 supported."
         )
 
     dtype_str = dtype_map[dtype]
@@ -184,9 +183,13 @@ class _XPUQKNormWrapper:
 
     def qknorm(self, q, k, q_weight, k_weight, eps):
         if not q.is_contiguous():
-            raise ValueError(f"XPU QKNorm requires contiguous q, got stride={q.stride()}")
+            raise ValueError(
+                f"XPU QKNorm requires contiguous q, got stride={q.stride()}"
+            )
         if not k.is_contiguous():
-            raise ValueError(f"XPU QKNorm requires contiguous k, got stride={k.stride()}")
+            raise ValueError(
+                f"XPU QKNorm requires contiguous k, got stride={k.stride()}"
+            )
         if not q_weight.is_contiguous():
             raise ValueError("XPU QKNorm requires contiguous q_weight")
         if not k_weight.is_contiguous():

@@ -11,6 +11,10 @@ import triton
 HAS_AOT = importlib.util.find_spec("sgl_kernel") is not None
 if not HAS_AOT:
     print("Warning: sgl_kernel (AOT) not available")
+else:
+    # Importing sgl_kernel loads the compiled extension and registers the
+    # torch.ops.sgl_kernel.* operators (e.g. rotary_embedding).
+    import sgl_kernel  # noqa: F401
 
 # Storage for results
 all_results = []
@@ -68,9 +72,9 @@ def benchmark(batch_size, head_dim, num_heads, provider):
         batch_size, dtype=torch.int64, device=device
     )  # AOT kernel needs int64
 
-    # Different kernels have different requirements for cos_sin_cache dtype
-    # AOT kernel: must match q/k dtype (bfloat16)
-    # JIT kernel: must be float32
+    # Different kernels have different requirements for cos_sin_cache dtype:
+    #   AOT kernel (rotary_embedding): must match q/k dtype (bfloat16)
+    #   JIT kernel: must be float32
     cos_sin_cache_aot = create_cos_sin_cache(head_dim).to(device=device, dtype=dtype)
     cos_sin_cache_jit = create_cos_sin_cache(head_dim).to(
         device=device, dtype=torch.float32
@@ -80,7 +84,7 @@ def benchmark(batch_size, head_dim, num_heads, provider):
     if provider == "aot":
 
         def fn():
-            # AOT kernel returns new tensors, not in-place
+            # AOT kernel: 2D input is modified in-place and returned.
             q_out, k_out = torch.ops.sgl_kernel.rotary_embedding(
                 positions,
                 q.view(batch_size, -1),
@@ -89,7 +93,6 @@ def benchmark(batch_size, head_dim, num_heads, provider):
                 cos_sin_cache_aot,
                 is_neox,
             )
-            # Copy back to simulate in-place behavior for fair comparison
             q.copy_(q_out.view(q.shape))
             k.copy_(k_out.view(k.shape))
 

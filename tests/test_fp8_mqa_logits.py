@@ -156,12 +156,18 @@ def test_fp8_mqa_logits_masking():
     torch.testing.assert_close(logits_cpu, ref.cpu(), rtol=2e-3, atol=0.1)
 
 
-@pytest.mark.parametrize("page_size", [4, 8])
-def test_fp8_paged_mqa_logits(page_size):
+@pytest.mark.parametrize(
+    "B,H,D,page_size",
+    [
+        (1, 4, 128, 4),  # small H, page_size=4
+        (1, 4, 128, 8),  # small H, page_size=8
+        (1, 64, 128, 64),  # large H / SYCL-TLA (xe20) path
+    ],
+)
+def test_fp8_paged_mqa_logits(B, H, D, page_size):
     device = "xpu"
-    B, H, D = 1, 4, 128
     num_pages = 8
-    seq_len = page_size * 3  # 3 pages
+    seq_len = page_size * 3  # 3 pages used, 1 page padding
     max_num_blocks = 4
     max_seq_len = max_num_blocks * page_size
 
@@ -194,50 +200,7 @@ def test_fp8_paged_mqa_logits(page_size):
 
     logits_cpu = logits.cpu()
     torch.testing.assert_close(logits_cpu, ref, rtol=2e-3, atol=0.1)
-
-    if seq_len < max_seq_len:
-        assert logits_cpu[0, seq_len:].abs().max().item() == 0.0
-
-
-def test_fp8_paged_mqa_logits_xe20():
-    """Test paged path with sizes large enough for SYCL-TLA (H=64, seq_len=256)."""
-    device = "xpu"
-    B, H, D = 1, 64, 128
-    page_size = 64
-    num_pages = 8
-    seq_len = page_size * 4  # 256 tokens = 4 pages
-    max_num_blocks = 4
-    max_seq_len = max_num_blocks * page_size
-
-    kv_cache = make_kv_cache(num_pages, page_size, D, device)
-    q = make_fp8_tensor((B, 1, H, D), device)
-    weights = torch.rand(B, H, dtype=torch.float32, device=device)
-    seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
-    block_tables = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32, device=device)
-
-    logits = torch.ops.sgl_kernel.fp8_paged_mqa_logits.default(
-        q.view(torch.uint8),
-        kv_cache,
-        weights,
-        seq_lens,
-        block_tables,
-        None,
-        max_seq_len,
-        True,
-    )
-    ref = reference_fp8_paged_mqa_logits(
-        q,
-        kv_cache,
-        weights,
-        seq_lens,
-        block_tables,
-        max_seq_len,
-        page_size,
-        D,
-    )
-
-    logits_cpu = logits.cpu()
-    torch.testing.assert_close(logits_cpu, ref, rtol=2e-3, atol=0.1)
+    assert logits_cpu[0, seq_len:].abs().max().item() == 0.0
 
 
 def test_fp8_paged_mqa_logits_noncontiguous_pages():

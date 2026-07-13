@@ -366,28 +366,10 @@ def _run_triton_once(args: Dict[str, Any]):
     return output
 
 
-# fp32 tensors are 2x the bytes of fp16/bf16, and the CUTLASS kernel runs fp32 via a
-# 3xTF32 decomposition that needs extra scratch. The largest cases exceed device
-# memory in fp32, so cap num_tokens for that dtype only (fp16/bf16 run full size).
-FP32_MAX_TOKENS = 16384
-
-
-def _scale_case_for_dtype(case: Dict[str, int], dtype: torch.dtype) -> Dict[str, int]:
-    if dtype != torch.float32 or case["num_tokens"] <= FP32_MAX_TOKENS:
-        return case
-    scaled = dict(case)
-    scaled["num_tokens"] = FP32_MAX_TOKENS
-    # Keep segments no larger than the token count.
-    scaled["num_segments"] = min(case["num_segments"], FP32_MAX_TOKENS)
-    return scaled
-
-
 def _dtype_from_provider(provider: str) -> torch.dtype:
     if provider == "fp16":
         return torch.float16
-    if provider == "bf16":
-        return torch.bfloat16
-    return torch.float32
+    return torch.bfloat16
 
 
 def _case_label(case: Dict[str, int]) -> str:
@@ -411,24 +393,18 @@ CASES = DEFAULT_CASES
             "triton_fp16",
             "cutlass_bf16",
             "triton_bf16",
-            "cutlass_fp32",
-            "triton_fp32",
         ],
         line_names=[
             "CUTLASS fp16",
             "Triton fp16",
             "CUTLASS bf16",
             "Triton bf16",
-            "CUTLASS fp32",
-            "Triton fp32",
         ],
         styles=[
             ("green", "-"),
             ("green", "--"),
             ("blue", "-"),
             ("blue", "--"),
-            ("orange", "-"),
-            ("orange", "--"),
         ],
         ylabel="TFLOP/s",
         plot_name="sgemm-lora-a-fwd-cutlass-vs-triton",
@@ -440,7 +416,7 @@ def benchmark(case_id, provider):
     backend, dtype_name = provider.split("_", 1)
     dtype = _dtype_from_provider(dtype_name)
 
-    case = _scale_case_for_dtype(CASES[case_id], dtype)
+    case = CASES[case_id]
     inputs = _make_inputs(case, dtype, device)
 
     K = case["input_dim"]

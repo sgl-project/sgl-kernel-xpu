@@ -54,7 +54,6 @@
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/half.h"
-#include "cutlass/tfloat32.h"
 
 namespace at::native::xpu {
 
@@ -102,9 +101,7 @@ void launch_group_gemm_lora_fwd(
   using ElementAccumulator = float;      // XMX accumulates in fp32 -- required by every atom we support
   using ElementComputeEpilogue = float;  // alpha/beta arithmetic in fp32
 
-  // MMA element type fed to the XMX DPAS. For fp32 storage we run the multiply
-  // in TF32 (the DPAS has no true-fp32 path); bf16/fp16 map to themselves.
-  using ElementMma = std::conditional_t<std::is_same_v<ElementA, float>, cutlass::tfloat32_t, ElementA>;
+  using ElementMma = ElementA;
   using ElementMmaB = ElementMma;
 
   using LayoutA = cutlass::layout::RowMajor;

@@ -1,4 +1,3 @@
-import math
 import sys
 from typing import Optional
 
@@ -10,19 +9,11 @@ if not torch.xpu.is_available():
     pytest.skip(reason="sgemm_lora_a_fwd requires XPU device.", allow_module_level=True)
 
 
-def _tolerances(dtype: torch.dtype, k: int = 0):
+def _tolerances(dtype: torch.dtype):
     if dtype == torch.float16:
         return 1e-2, 1e-2
     if dtype == torch.bfloat16:
         return 2e-2, 2e-2
-    if dtype == torch.float32:
-        # fp32 runs through the 3xTF32 emulation path (three chained TF32 GEMMs
-        # accumulating the high/low cross-terms), which recovers ~22-bit
-        # effective mantissa -- essentially fp32. A small K-scaled term absorbs
-        # the residual dropped a_lo*b_lo contribution, which grows slowly with
-        # the reduction length.
-        atol = 1e-3 + 1e-4 * math.sqrt(max(1.0, k / 512.0))
-        return 1e-3, atol
     return 1e-5, 1e-5
 
 
@@ -114,7 +105,7 @@ def _run_and_compare(
 
     assert out_cpu.shape == (num_tokens, total_n)
     assert out_cpu.dtype == dtype
-    rtol, atol = _tolerances(dtype, k=input_dim)
+    rtol, atol = _tolerances(dtype)
     torch.testing.assert_close(out_cpu, ref, rtol=rtol, atol=atol)
 
 
@@ -123,7 +114,7 @@ def _run_and_compare(
 # ----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("input_dim", [64, 4096])
 @pytest.mark.parametrize("max_rank", [8, 64])
 def test_sgemm_lora_a_fwd_basic_shapes(dtype, input_dim, max_rank):
@@ -152,7 +143,7 @@ def test_sgemm_lora_a_fwd_basic_shapes(dtype, input_dim, max_rank):
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("stack_num", [1, 2, 3])
 def test_sgemm_lora_a_fwd_stack_num(dtype, stack_num):
     num_tokens = 32
@@ -179,7 +170,7 @@ def test_sgemm_lora_a_fwd_stack_num(dtype, stack_num):
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_sgemm_lora_a_fwd_single_segment_single_lora(dtype):
     num_tokens = 128
     input_dim = 512
@@ -204,7 +195,7 @@ def test_sgemm_lora_a_fwd_single_segment_single_lora(dtype):
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_sgemm_lora_a_fwd_single_token_segments(dtype):
     """One-token-per-segment stress: maximum segment count for the token count."""
     num_tokens = 64
@@ -234,7 +225,7 @@ def test_sgemm_lora_a_fwd_single_token_segments(dtype):
 
 
 # Stress test for many segments + large token counts. 1024 is a near-duplicate
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("num_tokens", [4096])
 def test_sgemm_lora_a_fwd_large_num_tokens_many_segments(dtype, num_tokens):
     input_dim = 512
@@ -280,7 +271,7 @@ def test_sgemm_lora_a_fwd_large_num_tokens_many_segments(dtype, num_tokens):
 # ----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_sgemm_lora_a_fwd_rank_padding_zero_tail(dtype):
     """Output lanes beyond per-lora rank must be zero (relies on weight pre-zeroing)."""
     torch.manual_seed(11)
@@ -315,7 +306,7 @@ def test_sgemm_lora_a_fwd_rank_padding_zero_tail(dtype):
     assert torch.count_nonzero(out[16:, 5:]).item() == 0
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_sgemm_lora_a_fwd_zero_rank_all_zero_output(dtype):
     torch.manual_seed(14)
     num_tokens = 16
@@ -346,7 +337,7 @@ def test_sgemm_lora_a_fwd_zero_rank_all_zero_output(dtype):
     assert torch.count_nonzero(out).item() == 0
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_sgemm_lora_a_fwd_segment_boundaries_precise_routing(dtype):
     """Variable segment sizes + non-identity weight_indices verifies routing."""
     torch.manual_seed(15)
@@ -373,7 +364,7 @@ def test_sgemm_lora_a_fwd_segment_boundaries_precise_routing(dtype):
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_sgemm_lora_a_fwd_empty_segments_mixed_in(dtype):
     """Empty segments (start == end) must be skipped without affecting neighbours."""
     torch.manual_seed(8)
@@ -405,7 +396,7 @@ def test_sgemm_lora_a_fwd_empty_segments_mixed_in(dtype):
 # ----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_sgemm_lora_a_fwd_empty_input(dtype):
     """num_tokens == 0 must short-circuit cleanly and return a 0-row tensor."""
     input_dim = 64

@@ -155,18 +155,6 @@ make_device_ptrs(const torch::Tensor& base, const std::vector<int64_t>& off_byte
   return torch::from_blob(ptrs_h.data(), {num_segments}, cpu_i64).clone().to(device);
 }
 
-// Split a contiguous fp32 tensor into TF32 hi/lo parts, both stored as fp32.
-//   hi = bits & 0xFFFFE000   (clear the low 13 mantissa bits -> TF32-representable)
-//   lo = x - hi              (residual; TF32-representable up to its own rounding)
-std::pair<torch::Tensor, torch::Tensor> split_tf32_hi_lo(const torch::Tensor& x) {
-  // Reinterpret the fp32 bit pattern as int32 (both 4 bytes) and mask off the
-  // low 13 mantissa bits to obtain the TF32 "high" operand.
-  auto x_i32 = x.contiguous().view(torch::kInt32);
-  auto hi = torch::bitwise_and(x_i32, static_cast<int32_t>(0xFFFFE000)).view(torch::kFloat32);
-  auto lo = x - hi;
-  return {hi.contiguous(), lo.contiguous()};
-}
-
 //----------------- fp16 / bf16 launch (single grouped GEMM) ------------------//
 template <typename TensorDType>
 void launch_sgemm_lora_a_fwd(
@@ -212,101 +200,6 @@ void launch_sgemm_lora_a_fwd(
       num_segments,
       /*alpha    =*/1.0f,
       /*beta     =*/0.0f);
-}
-
-//----------------- fp32 launch (3xTF32 emulation) ----------------------------//
-//
-// The Intel XMX DPAS has no true-fp32 multiply path: a single TF32 GEMM
-// truncates each operand to a 10-bit mantissa, and the per-term error (~2^-11)
-// accumulates as ~sqrt(K) across the reduction, visible as growing error for
-// large input_dim. The standard "3xTF32" split recovers near-fp32 accuracy.
-// Each fp32 operand is decomposed into a high and low TF32-representable part:
-//
-//     a = a_hi + a_lo,   a_hi = tf32(a),   a_lo = tf32(a - a_hi)
-//
-// so the product expands to
-//
-//     a*b = a_hi*b_hi + a_hi*b_lo + a_lo*b_hi + a_lo*b_lo
-//           \_______/   \___________________/   \_______/
-//            leading        two corrections      dropped (~2^-22)
-//
-// Keeping the three largest terms lifts the effective mantissa from ~11 bits to
-// ~22 bits (relative error ~2e-7), which is effectively fp32 and removes the
-// sqrt(K) growth. Because a_hi and a_lo are each *exactly* TF32-representable
-// (their low 13 mantissa bits are zero), the existing TF32 grouped-GEMM
-// launcher -- which truncates fp32->tf32 at load -- reads them losslessly.
-//
-//     D  = A_hi @ B_hi^T           (beta = 0)
-//     D += A_hi @ B_lo^T           (beta = 1, in-place)
-//     D += A_lo @ B_hi^T           (beta = 1, in-place)
-void launch_sgemm_lora_a_fwd_3xtf32(
-    const torch::Tensor& input_x,             // [num_tokens, K]           fp32
-    const torch::Tensor& weights,             // [num_loras, N, K]         fp32
-    const torch::Tensor& seg_indptr_i32,      // [num_segments + 1]        int32
-    const torch::Tensor& weight_indices_i32,  // [num_segments]            int32
-    torch::Tensor& output,                    // [num_tokens, N]           fp32
-    const int stack_num,
-    const int max_rank,
-    const int num_segments,
-    sycl::queue& queue) {
-  const int K = static_cast<int>(input_x.size(1));  // input_dim
-  const int N = stack_num * max_rank;               // output columns
-  const int64_t elem_bytes = static_cast<int64_t>(sizeof(float));
-  const auto device = input_x.device();
-
-  auto meta = build_grouped_gemm_meta(seg_indptr_i32, weight_indices_i32, N, K, num_segments, elem_bytes, device);
-
-  // ---- TF32 hi/lo split of both operands (kept alive for the kernel lifetime) ----
-  auto [x_hi, x_lo] = split_tf32_hi_lo(input_x);
-  auto [w_hi, w_lo] = split_tf32_hi_lo(weights);
-
-  auto a_hi_ptrs = make_device_ptrs(x_hi, meta.a_off, device);
-  auto a_lo_ptrs = make_device_ptrs(x_lo, meta.a_off, device);
-  auto b_hi_ptrs = make_device_ptrs(w_hi, meta.b_off, device);
-  auto b_lo_ptrs = make_device_ptrs(w_lo, meta.b_off, device);
-
-  // The three cross-terms accumulate in place into `output` via the epilogue's
-  // D = alpha*acc + beta*C fusion: the first GEMM writes with beta=0, the two
-  // corrections read-modify-write with beta=1 and C == D == output. This keeps
-  // a single fp32 output buffer (no extra scratch, no host-side sum), matching
-  // the single accumulator of a fused 3xTF32 mainloop.
-  auto d_ptrs = make_device_ptrs(output, meta.d_off, device);
-
-  // One grouped TF32 GEMM: output = alpha*(A@B^T) + beta*output.
-  auto run_gemm = [&](const torch::Tensor& a_ptrs, const torch::Tensor& b_ptrs, float beta) {
-    at::native::xpu::launch_group_gemm_lora_fwd<
-        float,
-        LoraAFwdTileShape,
-        LoraAFwdThreadLayout,
-        LoraAFwdLayoutB,
-        kLoraAFwdPipelineStages>(
-        queue,
-        meta.problem_sizes,
-        a_ptrs,
-        b_ptrs,
-        /*c_ptrs   =*/d_ptrs,  // residual source (inert when beta = 0)
-        d_ptrs,
-        meta.stride_A,
-        meta.stride_B,
-        /*stride_C =*/meta.stride_D,
-        meta.stride_D,
-        num_segments,
-        /*alpha    =*/1.0f,
-        beta);
-  };
-
-  // Ordering is load-bearing: each beta=1 GEMM read-modify-writes `output`, so
-  // it must observe the previous GEMM's completed store. This is guaranteed only
-  // because all three submit to the SAME in-order queue (PyTorch XPU streams are
-  // in-order by construction -- c10 asserts "External SYCL queue must be
-  // in-order"), which serializes them and honors the RAW/WAW dependency on D.
-  // Do NOT dispatch these on separate queues to overlap them: the two
-  // corrections both RMW `output` and would race with the leading term and with
-  // each other. Overlapping requires the separate-buffer + sum approach (or a
-  // fused single-mainloop that accumulates all three products in registers).
-  run_gemm(a_hi_ptrs, b_hi_ptrs, /*beta=*/0.0f);  // D  = A_hi @ B_hi^T  (leading term)
-  run_gemm(a_hi_ptrs, b_lo_ptrs, /*beta=*/1.0f);  // D += A_hi @ B_lo^T  (correction)
-  run_gemm(a_lo_ptrs, b_hi_ptrs, /*beta=*/1.0f);  // D += A_lo @ B_hi^T  (correction)
 }
 
 }  // namespace
@@ -397,12 +290,7 @@ void sgemm_lora_a_fwd(
   const int stack_num_ = static_cast<int>(stack_num);
 
   // Dispatch kernel based on data type
-  if (weights.scalar_type() == torch::kFloat32) {
-    // fp32 has no native XMX path; use the 3xTF32 emulation (three chained TF32
-    // grouped GEMMs) to recover near-fp32 accuracy.
-    launch_sgemm_lora_a_fwd_3xtf32(
-        input_x, weights, seg_indptr_i32, weight_indices_i32, output, stack_num_, max_rank, num_segments, queue);
-  } else if (weights.scalar_type() == torch::kHalf) {
+  if (weights.scalar_type() == torch::kHalf) {
     launch_sgemm_lora_a_fwd<at::Half>(
         input_x, weights, seg_indptr_i32, weight_indices_i32, output, stack_num_, max_rank, num_segments, queue);
   } else if (weights.scalar_type() == torch::kBFloat16) {

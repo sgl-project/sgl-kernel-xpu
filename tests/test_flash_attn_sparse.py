@@ -192,7 +192,8 @@ def ref_paged_attn(
         (129, 129),
     ],
 )
-@pytest.mark.parametrize("num_heads", [1, 2, 4])
+# num_heads expanded to include 32 and 64 to cover PO flash_attn_sparse CFGs.
+@pytest.mark.parametrize("num_heads", [1, 2, 4, 32, 64])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("NNZ_S", [0, 1, 2, 3, 7, 15, 32])

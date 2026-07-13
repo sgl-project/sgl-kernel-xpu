@@ -145,8 +145,9 @@ def fused_qk_rope_reference(
     return result
 
 
+# num_heads_q expanded to include 64 to cover PO fused_qk_rope CFGs.
 @pytest.mark.parametrize("num_tokens", [1, 7, 32, 128])
-@pytest.mark.parametrize("num_heads_q", [8, 32])
+@pytest.mark.parametrize("num_heads_q", [8, 32, 64])
 @pytest.mark.parametrize("num_heads_k", [8])
 @pytest.mark.parametrize("num_heads_v", [8])
 @pytest.mark.parametrize("head_dim", [64, 128])

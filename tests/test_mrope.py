@@ -72,9 +72,11 @@ def split_3(n: int) -> List[int]:
 # Test parameters
 # ---------------------------------------------------------------------------
 BS_LIST = [1, 128, 2048]
-NUM_KV_HEADS_LIST = [1, 4]
+# NUM_KV_HEADS_LIST expanded to include 8 to cover PO mrope CFGs.
+NUM_KV_HEADS_LIST = [1, 4, 8]
 GQA_RATIO = [4]
-HEAD_DIM_LIST = [256]
+# HEAD_DIM_LIST expanded to include 128 to cover PO mrope CFGs.
+HEAD_DIM_LIST = [128, 256]
 PARTIAL_ROTARY_FACTOR = [0.25]
 IS_NEOX_LIST = [False, True]
 MROPE_IS_INTERLEAVED = [False, True]

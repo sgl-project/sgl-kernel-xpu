@@ -37,6 +37,7 @@ set(FMHA_PREFILL_NUM_SG_256 32)
 set(FMHA_PREFILL_TILED_Q_512 256)
 set(FMHA_PREFILL_TILED_KV_512 64)
 set(FMHA_PREFILL_NUM_SG_512 32)
+set(FMHA_PREFILL_TILED_OUT_512 256)
 
 # Per-HEAD_DIM tile shape parameters for the NON-PAGED (contiguous ragged) KV
 # path (TILED_Q_NP, TILED_KV_NP, NUM_SG_NP). These are kept as a separate set so
@@ -93,6 +94,13 @@ foreach(HEAD_DIM ${FMHA_PREFILL_HEAD_DIMS})
         set(TILED_Q 128)
         set(TILED_KV 64)
         set(NUM_SG 8)
+    endif()
+
+    # Output-tile head extent. Defaults to HEAD_DIM rounded up to a multiple of
+    # 32; a head dim may override it (e.g. 512 uses 256 to chunk the head).
+    math(EXPR TILED_OUT "((${HEAD_DIM} + 31) / 32) * 32")
+    if(DEFINED FMHA_PREFILL_TILED_OUT_${HEAD_DIM})
+        set(TILED_OUT ${FMHA_PREFILL_TILED_OUT_${HEAD_DIM}})
     endif()
 
     if(HEAD_DIM IN_LIST FMHA_PREFILL_NP_HEAD_DIMS)

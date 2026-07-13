@@ -396,6 +396,122 @@ def test_moe_gemm_mxfp4_weights(
 
 
 # ---------------------------------------------------------------------------
+# MXFP4 expert-weight test — gpt-oss swiglu (ActType=2) + per-expert bias
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "num_tokens,topk,num_experts,hidden_size,intermediate_size,with_bias",
+    list(
+        itertools.product(
+            [1, 33, 222],  # num_tokens
+            [1, 2, 6],  # topk
+            [8, 64],  # num_experts
+            [128, 1024],  # hidden_size       – multiple of MXFP4_BLOCK_SIZE
+            [128, 512],  # intermediate_size  – multiple of MXFP4_BLOCK_SIZE
+            [False, True],  # with_bias
+        )
+    ),
+)
+def test_moe_gemm_mxfp4_weights_gpt_oss(
+    num_tokens,
+    topk,
+    num_experts,
+    hidden_size,
+    intermediate_size,
+    with_bias,
+):
+    """MXFP4-packed expert weights (W4A16) with the gpt-oss gated activation
+    (swiglu_gpt_oss, ActType=2) and optional per-channel mlp1/mlp2 biases.
+
+    This is the combination gpt-oss-20b (GptOssForCausalLM) needs: the tile-
+    fused MXFP4 grouped-GEMM must dispatch activation_type=2 + with_bias=true.
+    The instantiation matrix in src/GroupGemmMxfp4W4A16Xe20.cmake was originally
+    pruned to {silu, deepseek_v4} x {no-bias}; this test guards the re-enabled
+    ActType=2 / WithBias path so a future re-prune that drops it fails loudly
+    here instead of aborting at the first gpt-oss MoE forward with:
+        RuntimeError: mxfp4 fused kernel built with ActType=0 (silu) and
+        ActType=4 (swiglu_deepseek_v4) only; got ActType=2.
+
+    Weights are quantised to MXFP4 then dequantised for the reference, so both
+    paths see identical MXFP4-rounded weights and any diff is bf16 GEMM noise.
+    """
+    torch.manual_seed(0)
+    torch.xpu.manual_seed_all(0)
+
+    rtol, atol = 1e-1, 1e-2
+
+    a = create_random_cpu_tensor((num_tokens, hidden_size), torch.bfloat16)
+    # w1: gate+up projection [E, 2*I, H] (interleaved g0,u0,g1,u1,... for gpt-oss);
+    # w2: down projection [E, H, I].
+    w1_bf16 = create_random_cpu_tensor(
+        (num_experts, 2 * intermediate_size, hidden_size), torch.bfloat16
+    )
+    w2_bf16 = create_random_cpu_tensor(
+        (num_experts, hidden_size, intermediate_size), torch.bfloat16
+    )
+
+    # Per-channel biases (float32, matching the kernel's fp32 bias accumulate).
+    b1, b2 = None, None
+    if with_bias:
+        b1 = create_random_cpu_tensor(
+            (num_experts, 2 * intermediate_size), torch.float32, std=0.005
+        )
+        b2 = create_random_cpu_tensor(
+            (num_experts, hidden_size), torch.float32, std=0.005
+        )
+
+    score = torch.randn([num_tokens, num_experts], dtype=torch.bfloat16)
+    score = torch.softmax(score, dim=-1, dtype=torch.float32)
+    topk_weight, topk_ids = torch.topk(score, topk)
+
+    # ---- quantise → dequantise so kernel + reference see the same weights ----
+    w1_packed, w1_scale = _quantize_weights_mxfp4(w1_bf16)
+    w2_packed, w2_scale = _quantize_weights_mxfp4(w2_bf16)
+    w1_dq = _dequantize_weights_mxfp4(w1_packed, w1_scale)
+    w2_dq = _dequantize_weights_mxfp4(w2_packed, w2_scale)
+
+    torch_output = torch_naive_moe(
+        a,
+        w1_dq,
+        w2_dq,
+        topk_ids,
+        topk_weight,
+        topk,
+        b1,
+        b2,
+        activations="silu",
+        gemm1_alpha=SWIGLU_ALPHA,
+        gemm1_limit=SWIGLU_LIMIT,
+    )
+
+    device = "xpu"
+    sglang_output = fused_experts(
+        a.to(device),
+        w1_packed.view(torch.int8).to(device),
+        w2_packed.view(torch.int8).to(device),
+        topk_weight.to(device),
+        topk_ids.to(device),
+        b1.to(device) if b1 is not None else None,
+        b2.to(device) if b2 is not None else None,
+        activation="silu",
+        use_mxfp4_w4a16=True,
+        w1_scale=torch.exp2((w1_scale.to(torch.int32) - 127).to(torch.float32)).to(
+            device
+        ),
+        w2_scale=torch.exp2((w2_scale.to(torch.int32) - 127).to(torch.float32)).to(
+            device
+        ),
+        gemm1_alpha=SWIGLU_ALPHA,
+        gemm1_limit=SWIGLU_LIMIT,
+    )
+
+    torch.testing.assert_close(
+        torch_output, sglang_output.to("cpu"), rtol=rtol, atol=atol
+    )
+
+
+# ---------------------------------------------------------------------------
 # Op-level test: moe_grouped_mm_nt_xe20_mxfp4_w4a16 vs. moe_grouped_mm_nt_xe20(dequant)
 # ---------------------------------------------------------------------------
 #

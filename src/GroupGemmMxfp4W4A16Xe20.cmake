@@ -21,24 +21,28 @@ endfunction()
 #   <_256, _64,  _32> / SG_8_2_1   — avg_m > 128,  fuse_act=true
 #   <_256, _256, _32> / SG_8_4_1   — avg_m > 128,  fuse_act=false
 
-# TEMPORARY L0-module-pressure workaround: generate only the variants DSV4
-# actually dispatches (activation_type=0 silu and activation_type=4
-# swiglu_deepseek_v4, with_bias=false), skipping the full act × bias cartesian
-# product. This keeps the AOT-compiled MXFP4 .so count small, which is
-# necessary to keep the Level Zero driver below its per-context module cap
-# under TP>1. Matching dispatch-side prune lives in
-# src/sycl/GroupGemmMxfp4W4A16Xe20.cpp.
-#   act_type 0 = silu, 4 = swiglu_deepseek_v4 (clamp gate/up then silu*up)
-set(with_bias false)
-foreach(act_type 0 4)
-    foreach(fuse_act true false)
-        add_group_gemm_mxfp4_w4a16_xe20_inst("_8" "_64" "_32" "_1, _4, _1" "_4, _1, _0" ${act_type} ${fuse_act} ${with_bias})
-    endforeach()
+# Instantiation matrix: act_type ∈ {0 silu, 2 swiglu_gpt_oss, 4 swiglu_deepseek_v4}
+# × with_bias ∈ {false, true} × the fuse_act tile menu above.
+#
+# act_type 2 (swiglu_gpt_oss) and with_bias=true were re-enabled here to serve
+# gpt-oss-20b (GptOssForCausalLM), whose MoE uses the gpt-oss gated activation
+# and per-channel mlp1/mlp2 biases. The original prune kept only DSV4's
+# {0,4}+no-bias variants to bound Level Zero per-context module count under
+# TP>1; at TP=1 the larger matrix fits. The dispatch-side TORCH_CHECKs in
+# src/sycl/GroupGemmMxfp4W4A16Xe20.cpp are relaxed to match. If you reintroduce
+# TP>1 and hit L0 module-pool exhaustion, narrow this matrix back down.
+#   act_type 0 = silu, 2 = swiglu_gpt_oss (clamp + (up+1) gate), 4 = swiglu_deepseek_v4
+foreach(act_type 0 2 4)
+    foreach(with_bias false true)
+        foreach(fuse_act true false)
+            add_group_gemm_mxfp4_w4a16_xe20_inst("_8" "_64" "_32" "_1, _4, _1" "_4, _1, _0" ${act_type} ${fuse_act} ${with_bias})
+        endforeach()
 
-    add_group_gemm_mxfp4_w4a16_xe20_inst("_128" "_64" "_32" "_4, _2, _1" "_2, _1, _0" ${act_type} true ${with_bias})
-    add_group_gemm_mxfp4_w4a16_xe20_inst("_128" "_128" "_32" "_4, _2, _1" "_2, _1, _0" ${act_type} false ${with_bias})
-    add_group_gemm_mxfp4_w4a16_xe20_inst("_256" "_64" "_32" "_8, _2, _1" "_2, _1, _0" ${act_type} true ${with_bias})
-    add_group_gemm_mxfp4_w4a16_xe20_inst("_256" "_256" "_32" "_8, _4, _1" "_4, _1, _0" ${act_type} false ${with_bias})
+        add_group_gemm_mxfp4_w4a16_xe20_inst("_128" "_64" "_32" "_4, _2, _1" "_2, _1, _0" ${act_type} true ${with_bias})
+        add_group_gemm_mxfp4_w4a16_xe20_inst("_128" "_128" "_32" "_4, _2, _1" "_2, _1, _0" ${act_type} false ${with_bias})
+        add_group_gemm_mxfp4_w4a16_xe20_inst("_256" "_64" "_32" "_8, _2, _1" "_2, _1, _0" ${act_type} true ${with_bias})
+        add_group_gemm_mxfp4_w4a16_xe20_inst("_256" "_256" "_32" "_8, _4, _1" "_4, _1, _0" ${act_type} false ${with_bias})
+    endforeach()
 endforeach()
 
 list(APPEND ATen_XPU_SYCL_XE20 ${GROUP_GEMM_MXFP4_W4A16_XE20_INST_SRCS})

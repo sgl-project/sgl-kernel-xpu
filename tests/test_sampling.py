@@ -173,14 +173,7 @@ def test_top_k_renorm_probs_array(batch_size, vocab_size, k_range):
     )
 
 
-@pytest.mark.skip(reason="not implemented")
-@pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
-@pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
-def test_min_p_sampling(batch_size, vocab_size, p):
-    torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device=f"{device}:0")
-    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+def torch_min_p_sampling(batch_size, vocab_size, p, normalized_prob):
     sorted_prob, indices = torch.sort(normalized_prob, descending=False)
     # scale min-p
     top_probs = sorted_prob[:, -1].unsqueeze(-1)
@@ -188,6 +181,17 @@ def test_min_p_sampling(batch_size, vocab_size, p):
     # min-p mask
     mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32, device=f"{device}:0")
     mask.scatter_add_(1, indices, (sorted_prob >= scaled_p).int())
+    return mask
+    
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
+def test_min_p_sampling(batch_size, vocab_size, p):
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device=f"{device}:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    mask = torch_min_p_sampling(batch_size, vocab_size, p, normalized_prob)
+    pytest.skip("xpu version to be implemented")
     min_p_tensor = torch.full((batch_size,), p, device=f"{device}:0")
 
     num_trails = 1000

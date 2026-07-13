@@ -1,0 +1,29 @@
+/***************************************************************************************************
+ * Copyright (C) 2025 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * AOT instantiation unit for the unified int4/mxfp4 W4A16 MoE grouped GEMM.
+ * One translation unit is generated per (policy, ElementS, ElementA) combo by
+ * src/GroupGemmW4A16Xe20.cmake. @POLICY@ / @ELEMENT_S@ / @ELEMENT_A@ are
+ * substituted there.
+ **************************************************************************************************/
+#define SYCL_INTEL_TARGET 20
+
+#include "sycl/kernels/moe/xe20/w4a16/w4a16_launcher.hpp"
+
+template void moe_w4a16::w4a16_launch<moe_w4a16::@POLICY@, @ELEMENT_S@, @ELEMENT_A@>(
+    sycl::queue,
+    const void*,
+    const void*,
+    const void*,
+    const void*,
+    const void*,
+    void*,
+    const int,
+    const int,
+    const int*,
+    const int,
+    const int,
+    int32_t*);
+
+#undef SYCL_INTEL_TARGET

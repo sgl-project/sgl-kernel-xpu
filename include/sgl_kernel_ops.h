@@ -372,21 +372,28 @@ void moe_grouped_mm_nt_xe20(
     double gemm1_alpha = 1.702,
     double gemm1_limit = 7.0);
 
-// Tile-fused MXFP4-B × BF16-A MoE grouped GEMM. `packed_weights` is int8
-// with two E2M1 nibbles per byte (low nibble = smaller-K element).
-// `scales` is float32 direct-multiplier, one per 32-element K-block.
-void moe_grouped_mm_nt_xe20_mxfp4_w4a16(
+// Unified int4/mxfp4 W4A16 MoE grouped GEMM (ported from vllm-xpu-kernels).
+// `packed_weights` is int8 [E, N, K/2] with two 4-bit values per byte.
+// `scales` is [E, N, K/group_size], N-outer: bfloat16 direct multiplier for
+// int4, or uint8 E8M0 exponent for mxfp4 (decoded in registers). `zeros` is
+// an optional [E, N, K/group_size] bfloat16 tensor (int4-only) holding the
+// raw per-group zero-point in code units; when supplied, weights dequant as
+// `(code - zp) * scale` instead of requiring the zero-point to be pre-folded
+// into a signed 4-bit code (which overflows for non-symmetric zero-points).
+// `rows_per_expert` holds the per-expert row counts. No activation is
+// fused; the caller runs the activation between GEMM1 and GEMM2. group_size
+// must be 32/64/128/256.
+void moe_grouped_mm_nt_xe20_w4a16(
     torch::Tensor& output,
     const torch::Tensor& activations,
     const torch::Tensor& packed_weights,
     const torch::Tensor& scales,
+    const std::optional<at::Tensor>& zeros,
     const std::optional<at::Tensor>& bias,
-    const torch::Tensor& total_rows_for_experts,
+    const torch::Tensor& rows_per_expert,
     const int64_t n_experts,
-    const int64_t activation_type = 0,
-    bool fuse_act = false,
-    double gemm1_alpha = 1.702,
-    double gemm1_limit = 7.0);
+    bool is_int4,
+    const int64_t group_size);
 
 void prepare_moe_input(
     const torch::Tensor& topk_ids,

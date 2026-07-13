@@ -135,6 +135,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("merge_state_v2", torch::kXPU, &merge_state_v2);
   m.def("merge_state(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state", torch::kXPU, &merge_state);
+  #ifdef BUILD_FMHA
   /*
    * From cutlass attention
    */
@@ -169,6 +170,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    int      sm_margin,"
       "    Tensor(a!)?  out=None) -> (Tensor(a!), Tensor, Tensor, Tensor)");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
+  #endif
 
   m.def("flash_mla_get_workspace_size", &flash_mla_get_workspace_size);
 
@@ -288,6 +290,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor weight_indices, "
       "Tensor lora_ranks, Tensor? extra_embeddings, Tensor? seg_lens) -> ()");
   m.impl("embedding_lora_a_fwd", torch::kXPU, &embedding_lora_a_fwd);
+  m.def(
+      "sgemm_lora_a_fwd(Tensor! output, Tensor input_x, Tensor weights, int stack_num, Tensor seg_indptr, "
+      "Tensor weight_indices, "
+      "Tensor lora_ranks, Tensor? seg_lens) -> ()");
+  m.impl("sgemm_lora_a_fwd", torch::kXPU, &sgemm_lora_a_fwd);
 
   /* NSA (Native Sparse Attention) indexer scoring */
   // fp8_mqa_logits (prefill) is implemented in pure Python via sgl_kernel.nsa.

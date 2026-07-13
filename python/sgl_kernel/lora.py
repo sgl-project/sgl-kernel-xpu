@@ -76,3 +76,30 @@ def embedding_lora_a_fwd(
     )
 
     return output
+
+def sgemm_lora_a_fwd(
+    input_x: torch.Tensor,
+    weights: torch.Tensor,
+    stack_num: int,
+    seg_indptr: torch.Tensor,
+    weight_indices: torch.Tensor,
+    lora_ranks: torch.Tensor,
+    seg_lens: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    # Create empty output tensor
+    output = torch.empty(
+        (input_x.size(0), weights.size(1)), dtype=weights.dtype, device=weights.device
+    )
+    # Call the kernel
+    torch.ops.sgl_kernel.sgemm_lora_a_fwd(
+        output,
+        input_x,
+        weights,
+        stack_num,
+        seg_indptr,
+        weight_indices,
+        lora_ranks,
+        seg_lens
+    )
+
+    return output

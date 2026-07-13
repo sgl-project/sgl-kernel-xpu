@@ -19,8 +19,17 @@ foreach(file ${device_cpp})
 
 endforeach()
 
-include(FMHADecodeXe20.cmake)
-include(FMHAPrefillXe20.cmake)
+option(BUILD_FMHA "Build FMHA decode/prefill kernels" ON)
+if(BUILD_FMHA)
+    include(FMHADecodeXe20.cmake)
+    include(FMHAPrefillXe20.cmake)
+    add_compile_definitions(BUILD_FMHA)
+else()
+    message(STATUS "Skipping FMHA decode/prefill kernels (BUILD_FMHA=OFF)")
+    # flash_attention.cpp depends on FmhaDecodeRunner symbols instantiated by
+    # FMHADecodeXe20.cmake — exclude it to avoid undefined symbol errors.
+    list(FILTER device_cpp_common EXCLUDE REGEX "flash_attention\\.cpp$")
+endif()
 include(MlaDecodeXe20.cmake)
 include(MlaPrefillXe20.cmake)
 include(MlaSparseDecodeXe20.cmake)

@@ -78,7 +78,10 @@ from sgl_kernel.gemm import (
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.hadamard import hadamard_transform
-from sgl_kernel.lora import embedding_lora_a_fwd
+from sgl_kernel.lora import (
+    embedding_lora_a_fwd,
+    sgemm_lora_a_fwd
+)
 from sgl_kernel.memory import weak_ref_tensor
 from sgl_kernel.mhc import (
     hc_post,

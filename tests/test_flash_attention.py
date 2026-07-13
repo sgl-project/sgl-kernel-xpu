@@ -1464,6 +1464,139 @@ def test_flash_attn_decode_kvcache(
     torch.xpu.empty_cache()
 
 
+@pytest.mark.skipif(
+    not torch.xpu.is_available(),
+    reason="fp8 KV cache attention is an XPU (sgl-kernel-xpu) feature",
+)
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("q_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("nheads_q,nheads_kv", [(8, 8), (8, 2)])
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize("seqlen_q", [1, 32, 64])
+@pytest.mark.parametrize("seqlen_k", [256, 512])
+@pytest.mark.parametrize("descale_layout", ["scalar", "expanded"])
+def test_flash_attn_fp8_kvcache(
+    seqlen_k,
+    seqlen_q,
+    page_size,
+    d,
+    nheads_q,
+    nheads_kv,
+    fp8_dtype,
+    q_dtype,
+    causal,
+    descale_layout,
+):
+    """Attention with an fp8 (e4m3 or e5m2) paged KV cache.
+
+    Q is bf16 while the K/V cache is stored in fp8 (float8_e4m3fn or
+    float8_e5m2) and dequantized inside the kernel using a single per-tensor
+    k_descale / v_descale scalar. The result is compared against a dequantized
+    fp32 reference. seqlen_q == 1 exercises the decode kernel; seqlen_q > 1
+    exercises the (chunk)prefill kernel.
+    """
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    if seqlen_k % page_size != 0:
+        pytest.skip("page_size must divide seqlen_k")
+    assert nheads_q % nheads_kv == 0
+
+    torch.manual_seed(0)
+    batch_size = 3
+    softmax_scale = d**-0.5
+    # Largest finite magnitude representable by each fp8 format.
+    fp8_max = 448.0 if fp8_dtype == torch.float8_e4m3fn else 57344.0
+
+    # Reference (fp32) K/V, then per-tensor quantize to fp8.
+    k_ref_f = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device)
+    v_ref_f = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device)
+    k_descale_val = k_ref_f.abs().max().item() / fp8_max
+    v_descale_val = v_ref_f.abs().max().item() / fp8_max
+
+    k_cache = (k_ref_f / k_descale_val).to(fp8_dtype)
+    v_cache = (v_ref_f / v_descale_val).to(fp8_dtype)
+
+    # The kernel consumes one float for the whole K/V cache. Cover both a true
+    # scalar tensor and a single-element view expanded to (batch, h_kv).
+    k_descale_scalar = torch.tensor([k_descale_val], dtype=torch.float32, device=device)
+    v_descale_scalar = torch.tensor([v_descale_val], dtype=torch.float32, device=device)
+    if descale_layout == "scalar":
+        k_descale = k_descale_scalar
+        v_descale = v_descale_scalar
+    else:
+        k_descale = k_descale_scalar.expand(batch_size, nheads_kv)
+        v_descale = v_descale_scalar.expand(batch_size, nheads_kv)
+
+    # attention_ref applies the descale per (b, h_kv); broadcast the scalar.
+    k_descale_ref = k_descale_scalar.expand(batch_size, nheads_kv).contiguous()
+    v_descale_ref = v_descale_scalar.expand(batch_size, nheads_kv).contiguous()
+
+    # Build a paged KV cache: one contiguous run of blocks per sequence.
+    num_blocks_per_seq = seqlen_k // page_size
+    k_cache_paged = k_cache.reshape(
+        batch_size * num_blocks_per_seq, page_size, nheads_kv, d
+    )
+    v_cache_paged = v_cache.reshape(
+        batch_size * num_blocks_per_seq, page_size, nheads_kv, d
+    )
+    page_table = torch.arange(
+        batch_size * num_blocks_per_seq, dtype=torch.int32, device=device
+    ).reshape(batch_size, num_blocks_per_seq)
+
+    cache_seqlens = torch.full(
+        (batch_size,), seqlen_k, dtype=torch.int32, device=device
+    )
+
+    q = torch.randn(batch_size, seqlen_q, nheads_q, d, device=device, dtype=q_dtype)
+
+    out = flash_attn_with_kvcache(
+        q,
+        k_cache_paged,
+        v_cache_paged,
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        softmax_scale=softmax_scale,
+        causal=causal,
+    )
+    out = out.reshape(batch_size, seqlen_q, nheads_q, d)
+    torch.xpu.synchronize()
+
+    # Dequantized fp32 reference. attention_ref applies k_descale/v_descale to the
+    # fp8 cache internally (k.float() * descale), matching the kernel math.
+    out_ref, _ = attention_ref(
+        q,
+        k_cache,
+        v_cache,
+        softmax_scale,
+        causal=causal,
+        k_descale=k_descale_ref,
+        v_descale=v_descale_ref,
+        upcast=True,
+    )
+
+    out = out.float()
+    out_ref = out_ref.float()
+    max_diff = (out - out_ref).abs().max().item()
+    mean_diff = (out - out_ref).abs().mean().item()
+    print(
+        f"fp8 kvcache (dtype={fp8_dtype}, seqlen_q={seqlen_q}, descale_layout={descale_layout}) max diff: {max_diff}"
+    )
+    print(
+        f"fp8 kvcache (dtype={fp8_dtype}, seqlen_q={seqlen_q}, descale_layout={descale_layout}) mean diff: {mean_diff}"
+    )
+    # e5m2 has fewer mantissa bits (2 vs 3) than e4m3, so allow larger error.
+    if fp8_dtype == torch.float8_e5m2:
+        assert max_diff <= 4e-1
+        assert mean_diff <= 8e-2
+    else:
+        assert max_diff <= 1e-1
+        assert mean_diff <= 2e-2
+
+
 def _generate_block_kvcache(
     seqlen_k, page_size, batch_size, nheads_k, d, dv, device, dtype, dtype_ref
 ):
@@ -1509,7 +1642,7 @@ def _generate_block_kvcache(
 @pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
 @pytest.mark.parametrize("causal,local", [(False, True), (False, False), (True, False)])
 @pytest.mark.parametrize("add_unused_qkv", [False])
-@pytest.mark.parametrize("d", [72, 128])
+@pytest.mark.parametrize("d", [72, 128, 192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [

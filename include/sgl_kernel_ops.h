@@ -212,6 +212,7 @@ void sgl_per_token_group_quant_fp4(
 void store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices);
 }  // namespace at::native::xpu
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
+void silu_and_mul_clamp(torch::Tensor& out, torch::Tensor& input, double swiglu_limit);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
 void gelu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void apply_rope_pos_ids_cos_sin_cache(
@@ -268,6 +269,21 @@ void bmm_fp8(
     at::Tensor workspace_buffer,
     int64_t cublas_handle,
     int64_t sycl_stream);
+
+/*
+ * From csrc/nsa (Native Sparse Attention)
+ */
+// fp8_mqa_logits (prefill) is implemented in pure Python via sgl_kernel.nsa.
+
+torch::Tensor fp8_paged_mqa_logits(
+    const torch::Tensor& q_fp8,
+    const torch::Tensor& kv_cache,
+    const torch::Tensor& weights,
+    const torch::Tensor& seq_lens,
+    const torch::Tensor& block_tables,
+    const std::optional<torch::Tensor>& schedule_metadata,
+    int64_t max_seq_len,
+    bool clean_logits);
 
 /*
  * From csrc/moe
@@ -550,6 +566,24 @@ void top_p_sampling_from_probs(
     double top_p_val,
     bool deterministic,
     std::optional<at::Generator> gen);
+
+void fast_topk_interface(
+    const at::Tensor& score, at::Tensor& indices, const at::Tensor& lengths, std::optional<at::Tensor> row_starts_opt);
+
+void fast_topk_transform_interface(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& dst_page_table,
+    const at::Tensor& src_page_table,
+    const at::Tensor& cu_seqlens_q,
+    std::optional<at::Tensor> row_starts_opt);
+
+void fast_topk_transform_ragged_interface(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& topk_indices_ragged,
+    const at::Tensor& topk_indices_offset,
+    std::optional<at::Tensor> row_starts_opt);
 
 namespace flash {
 /*

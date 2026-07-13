@@ -19,6 +19,8 @@ def flash_attn_baseline(
     cu_seqlens_k,
     max_seqlen_q,
     max_seqlen_k,
+    k_descale=None,
+    v_descale=None,
 ):
     """Baseline Flash Attention implementation"""
     if page_table is not None:
@@ -34,6 +36,8 @@ def flash_attn_baseline(
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
+            k_descale=k_descale,
+            v_descale=v_descale,
             return_softmax_lse=True,
         )
         return out, lse
@@ -86,12 +90,17 @@ local = [True, False]
 use_sinks = [True, False]
 batch_size = [1, 8, 16]
 q_seq_length_range = [1, 128]
-head_dim_no_page = [72, 128]
+head_dim_no_page = [72, 128, 192]
 head_dim_paged = [64, 128, 256, 512]
 num_heads_q = [16]
 num_heads_kv = [4, 8]
 kv_seq_length_range = [4096]
 page_size_range = [0, 128]
+# KV cache element type: "bf16" (default) or fp8. FP8 has two formats,
+# e5m2 and e4m3; both are exercised ("fp8_e4m3" / "fp8_e5m2"), dequantized
+# in-kernel via per-tensor k_descale / v_descale. fp8 only runs on the paged
+# path.
+kv_dtype_range = ["bf16", "fp8_e4m3", "fp8_e5m2"]
 configs = list(
     filter(
         lambda cfg: (
@@ -107,6 +116,9 @@ configs = list(
             and (cfg[9] != 0 or not cfg[2])
             # Condition 6: sink is only supported for head_size == 64
             and (not cfg[2] or cfg[5] == 64)
+            # Condition 7: fp8 KV cache requires the paged path and is exercised
+            # without sinks / local masking (matches the supported fp8 path)
+            and (cfg[10] == "bf16" or (cfg[9] != 0 and not cfg[2] and not cfg[1]))
         ),
         [
             cfg
@@ -122,6 +134,7 @@ configs = list(
                 num_heads_kv,
                 kv_seq_length_range,
                 [page_size],
+                kv_dtype_range,
             )
         ],
     )
@@ -142,6 +155,7 @@ all_results = []
             "num_heads_kv",
             "kv_seq_length",
             "page_size",
+            "kv_dtype",
         ],
         x_vals=[list(c) for c in configs],
         line_arg="provider",
@@ -164,10 +178,19 @@ def benchmark(
     q_seq_length,
     kv_seq_length,
     page_size,
+    kv_dtype,
     provider,
 ):
     dtype = torch.bfloat16
     device = torch.device("xpu")
+    # fp8 KV cache: store K/V as e4m3 or e5m2 and dequantize in-kernel via
+    # per-tensor k_descale / v_descale. Q/O stay bf16. Only valid on the paged
+    # path.
+    is_fp8 = kv_dtype.startswith("fp8")
+    fp8_dtype = torch.float8_e5m2 if kv_dtype == "fp8_e5m2" else torch.float8_e4m3fn
+    fp8_max = 57344.0 if kv_dtype == "fp8_e5m2" else 448.0
+    k_descale = None
+    v_descale = None
     # Create input tensors
     q = torch.randn(
         (batch_size * q_seq_length, num_heads_q, head_dim), device=device, dtype=dtype
@@ -180,6 +203,17 @@ def benchmark(
         v_cache = torch.randn(
             (num_pages, page_size, num_heads_kv, head_dim), device=device, dtype=dtype
         )
+        if is_fp8:
+            k_descale_val = k_cache.abs().max().item() / fp8_max
+            v_descale_val = v_cache.abs().max().item() / fp8_max
+            k_cache = (k_cache / k_descale_val).to(fp8_dtype)
+            v_cache = (v_cache / v_descale_val).to(fp8_dtype)
+            k_descale = torch.tensor(
+                k_descale_val, dtype=torch.float32, device=device
+            ).expand(batch_size, num_heads_kv)
+            v_descale = torch.tensor(
+                v_descale_val, dtype=torch.float32, device=device
+            ).expand(batch_size, num_heads_kv)
         page_table = (
             torch.randperm(num_pages, device=device, dtype=torch.int32)
             .reshape(batch_size, -1)
@@ -247,6 +281,8 @@ def benchmark(
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlen_k,
+                k_descale=k_descale,
+                v_descale=v_descale,
             ),
             quantiles=quantiles,
         )
@@ -300,6 +336,7 @@ def benchmark(
             "effective_attention_ratio": effective_attention_ratio,
             "use_sinks": use_sinks,
             "page_size": page_size,
+            "kv_dtype": kv_dtype,
             "provider": provider,
             "tflops": tflops,
             "bandwidth": bandwidth,

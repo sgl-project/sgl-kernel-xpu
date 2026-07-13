@@ -34,29 +34,27 @@
 
 #pragma once
 
-#include <type_traits>
-
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
-#include <sycl/sycl.hpp>
-
 #include <cute/tensor.hpp>
+#include <sycl/sycl.hpp>
+#include <type_traits>
 
-#include "cutlass/cutlass.h"
 #include "cutlass/bfloat16.h"
-#include "cutlass/half.h"
-#include "cutlass/tfloat32.h"
-#include "cutlass/gemm/dispatch_policy.hpp"
-#include "cutlass/epilogue/dispatch_policy.hpp"
+#include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/xe_array_epilogue.hpp"
+#include "cutlass/epilogue/dispatch_policy.hpp"
 #include "cutlass/epilogue/fusion/xe_callbacks.hpp"
 #include "cutlass/gemm/collective/collective_mma.hpp"
 #include "cutlass/gemm/device/gemm_universal.h"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/half.h"
+#include "cutlass/tfloat32.h"
 
 namespace at::native::xpu {
 
@@ -75,70 +73,59 @@ struct ToCutlassElementType<at::BFloat16> {
   using type = cutlass::bfloat16_t;
 };
 
-
 //----------------- Group problem shape (shared across all instantiations) ----//
-using GroupedProblemShape =
-    cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>;
-using UnderlyingProblemShapeType =
-    typename GroupedProblemShape::UnderlyingProblemShape;
+using GroupedProblemShape = cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>;
+using UnderlyingProblemShapeType = typename GroupedProblemShape::UnderlyingProblemShape;
 
-
-template <
-    typename TensorDType,
-    typename TileShape_,
-    typename ThreadLayout_,
-    typename LayoutB_,
-    int PipelineStages_>
+template <typename TensorDType, typename TileShape_, typename ThreadLayout_, typename LayoutB_, int PipelineStages_>
 void launch_group_gemm_lora_fwd(
     sycl::queue& queue,
     const torch::Tensor& problem_sizes,  // int32  [num_segments, 3]  (M_s, N, K)
     const torch::Tensor& a_ptrs,         // int64  [num_segments]     pointers into input_x
     const torch::Tensor& b_ptrs,         // int64  [num_segments]     pointers into weights[weight_indices[s]]
     const torch::Tensor& c_ptrs,         // int64  [num_segments]     pointers into C (source for residual add).
-                                         //                          For A-fwd (beta=0) the caller passes d_ptrs here -- the loads are inert.
-                                         //                          For B-fwd (beta!=0) the caller passes the real residual source (typically = d_ptrs for in-place).
-    const torch::Tensor& d_ptrs,         // int64  [num_segments]     pointers into output
-    const torch::Tensor& stride_A,       // int64  [num_segments]     leading dim of A = K
-    const torch::Tensor& stride_B,       // int64  [num_segments]     leading dim of B = K
-    const torch::Tensor& stride_C,       // int64  [num_segments]     leading dim of C (must equal stride_D when LayoutC == LayoutD)
-    const torch::Tensor& stride_D,       // int64  [num_segments]     leading dim of D = N
+                                  //                          For A-fwd (beta=0) the caller passes d_ptrs here -- the
+                                  //                          loads are inert. For B-fwd (beta!=0) the caller passes the
+                                  //                          real residual source (typically = d_ptrs for in-place).
+    const torch::Tensor& d_ptrs,    // int64  [num_segments]     pointers into output
+    const torch::Tensor& stride_A,  // int64  [num_segments]     leading dim of A = K
+    const torch::Tensor& stride_B,  // int64  [num_segments]     leading dim of B = K
+    const torch::Tensor&
+        stride_C,  // int64  [num_segments]     leading dim of C (must equal stride_D when LayoutC == LayoutD)
+    const torch::Tensor& stride_D,  // int64  [num_segments]     leading dim of D = N
     int num_segments,
-    float alpha,                         // epilogue scalar: D = alpha * (A @ B) + beta * C
-    float beta) {                        //   A-fwd uses (1.0, 0.0); B-fwd / QKV-B-fwd use (1.0, 1.0) for in-place residual.
-  using ElementA             = typename ToCutlassElementType<TensorDType>::type;
-  using ElementB             = ElementA;     // same storage dtype as A (LoRA weights match input dtype)
-  using ElementOutput        = ElementA;     // output matches input dtype (bf16/fp16/fp32)
-  using ElementAccumulator   = float;        // XMX accumulates in fp32 -- required by every atom we support
-  using ElementComputeEpilogue = float;      // alpha/beta arithmetic in fp32
+    float alpha,   // epilogue scalar: D = alpha * (A @ B) + beta * C
+    float beta) {  //   A-fwd uses (1.0, 0.0); B-fwd / QKV-B-fwd use (1.0, 1.0) for in-place residual.
+  using ElementA = typename ToCutlassElementType<TensorDType>::type;
+  using ElementB = ElementA;             // same storage dtype as A (LoRA weights match input dtype)
+  using ElementOutput = ElementA;        // output matches input dtype (bf16/fp16/fp32)
+  using ElementAccumulator = float;      // XMX accumulates in fp32 -- required by every atom we support
+  using ElementComputeEpilogue = float;  // alpha/beta arithmetic in fp32
 
   // MMA element type fed to the XMX DPAS. For fp32 storage we run the multiply
   // in TF32 (the DPAS has no true-fp32 path); bf16/fp16 map to themselves.
-  using ElementMma           = std::conditional_t<
-      std::is_same_v<ElementA, float>, cutlass::tfloat32_t, ElementA>;
-  using ElementMmaB          = ElementMma;
+  using ElementMma = std::conditional_t<std::is_same_v<ElementA, float>, cutlass::tfloat32_t, ElementA>;
+  using ElementMmaB = ElementMma;
 
- 
   using LayoutA = cutlass::layout::RowMajor;
   using LayoutB = LayoutB_;
   using LayoutC = cutlass::layout::RowMajor;
   using LayoutD = cutlass::layout::RowMajor;
 
   //--------- Tile / thread layout (host-supplied perf knobs) ---------//
-  using TileShape    = TileShape_;
+  using TileShape = TileShape_;
   using ThreadLayout = ThreadLayout_;
 
   //--------- TiledMma (which XMX MMA atom + how many subgroups tile it) ---//
   using MmaAtom = cute::XE_DPAS_TT<8, ElementAccumulator, ElementMma>;
-  using TiledMma = typename cute::TiledMMAHelper<
-      cute::MMA_Atom<MmaAtom>,
-      cute::Layout<TileShape>,
-      ThreadLayout>::TiledMMA;
+  using TiledMma =
+      typename cute::TiledMMAHelper<cute::MMA_Atom<MmaAtom>, cute::Layout<TileShape>, ThreadLayout>::TiledMMA;
 
   //--------- Dispatch policies ---------//
   // MainloopXeL1StagedGroup builds
   // prefetch through make_block_2d_prefetch()/XE_PREFETCH_2D
   constexpr int PipelineStages = PipelineStages_;
-  using GEMMDispatchPolicy     = cutlass::gemm::MainloopXeL1StagedGroup<PipelineStages>;
+  using GEMMDispatchPolicy = cutlass::gemm::MainloopXeL1StagedGroup<PipelineStages>;
   using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeGenericGroup;
 
   //--------- Gmem copy atoms ---------//
@@ -151,47 +138,49 @@ void launch_group_gemm_lora_fwd(
 
   //--------- Epilogue: D = alpha * acc + beta * C ---------//
   using EpilogueOp = cutlass::epilogue::fusion::LinearCombination<
-      ElementAccumulator,         // <- must be ElementAccumulator for Grouped GEMM
+      ElementAccumulator,  // <- must be ElementAccumulator for Grouped GEMM
       ElementComputeEpilogue,
       ElementAccumulator,
       ElementAccumulator,
       cutlass::FloatRoundStyle::round_to_nearest>;
 
-  using FusionCallbacks = cutlass::epilogue::fusion::FusionCallbacks<
-      EpilogueDispatchPolicy,
-      EpilogueOp,
-      TileShape,
-      decltype(cute::tile_shape(TiledMma()))>;
+  using FusionCallbacks = cutlass::epilogue::fusion::
+      FusionCallbacks<EpilogueDispatchPolicy, EpilogueOp, TileShape, decltype(cute::tile_shape(TiledMma()))>;
 
   using CollectiveEpilogue = cutlass::epilogue::collective::CollectiveEpilogue<
       EpilogueDispatchPolicy,
       TileShape,
-      void,                                         // EpilogueTile (void = automatic)
+      void,  // EpilogueTile (void = automatic)
       ElementAccumulator,
       cutlass::gemm::TagToStrideC_t<LayoutC*>,
-      ElementOutput,                                // bf16/fp16 narrow here; fp32 stores as-is
+      ElementOutput,  // bf16/fp16 narrow here; fp32 stores as-is
       cutlass::gemm::TagToStrideC_t<LayoutD*>,
       FusionCallbacks,
-      GmemTiledCopyC,                               // load C (void = automatic)
-      GmemTiledCopyD>;                              // store D (void = automatic)
+      GmemTiledCopyC,   // load C (void = automatic)
+      GmemTiledCopyD>;  // store D (void = automatic)
 
   //--------- Mainloop ---------//
   using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
       GEMMDispatchPolicy,
       TileShape,
-      ElementMma,  cutlass::gemm::TagToStrideA_t<LayoutA*>,
-      ElementMmaB, cutlass::gemm::TagToStrideB_t<LayoutB*>,
+      ElementMma,
+      cutlass::gemm::TagToStrideA_t<LayoutA*>,
+      ElementMmaB,
+      cutlass::gemm::TagToStrideB_t<LayoutB*>,
       TiledMma,
-      GmemTiledCopyA, void, void, cute::identity,
-      GmemTiledCopyB, void, void, cute::identity>;
+      GmemTiledCopyA,
+      void,
+      void,
+      cute::identity,
+      GmemTiledCopyB,
+      void,
+      void,
+      cute::identity>;
 
   //--------- GemmKernel + adapter ---------//
 
-  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-      GroupedProblemShape,
-      CollectiveMainloop,
-      CollectiveEpilogue,
-      cutlass::gemm::GroupScheduler>;
+  using GemmKernel = cutlass::gemm::kernel::
+      GemmUniversal<GroupedProblemShape, CollectiveMainloop, CollectiveEpilogue, cutlass::gemm::GroupScheduler>;
 
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
@@ -203,11 +192,9 @@ void launch_group_gemm_lora_fwd(
   //--------- Step 3: build Arguments + workspace, then run ----------------//
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = static_cast<int>(d_ptrs.device().index());
-  hw_info.sm_count =
-      cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+  hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
-  auto* problem_sizes_ptr = reinterpret_cast<UnderlyingProblemShapeType*>(
-      problem_sizes.data_ptr<int32_t>());
+  auto* problem_sizes_ptr = reinterpret_cast<UnderlyingProblemShapeType*>(problem_sizes.data_ptr<int32_t>());
   auto* a_ptrs_dev = reinterpret_cast<ElementMma const**>(a_ptrs.data_ptr());
   auto* b_ptrs_dev = reinterpret_cast<ElementMmaB const**>(b_ptrs.data_ptr());
   auto* d_ptrs_dev = reinterpret_cast<ElementOutput**>(d_ptrs.data_ptr());
@@ -228,8 +215,8 @@ void launch_group_gemm_lora_fwd(
   fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
   fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
 
-  using RasterOrderOptions = typename cutlass::gemm::kernel::detail::
-      PersistentTileSchedulerXeGroup<GroupedProblemShape>::RasterOrderOptions;
+  using RasterOrderOptions =
+      typename cutlass::gemm::kernel::detail::PersistentTileSchedulerXeGroup<GroupedProblemShape>::RasterOrderOptions;
 
   using PtrCType = decltype(std::declval<typename GemmKernel::EpilogueArguments>().ptr_C);
   auto c_ptrs_dev = reinterpret_cast<PtrCType>(c_ptrs.data_ptr());
@@ -239,9 +226,9 @@ void launch_group_gemm_lora_fwd(
       typename GemmKernel::MainloopArguments{a_ptrs_dev, stride_A_ptr, b_ptrs_dev, stride_B_ptr},
       typename GemmKernel::EpilogueArguments{
           fusion_args,
-          c_ptrs_dev,    // ptr_C (caller-supplied; aliased to d_ptrs for beta=0 paths)
+          c_ptrs_dev,  // ptr_C (caller-supplied; aliased to d_ptrs for beta=0 paths)
           stride_C_ptr,
-          d_ptrs_dev,    // ptr_D
+          d_ptrs_dev,  // ptr_D
           stride_D_ptr},
       hw_info,
       typename GemmKernel::TileSchedulerArguments{1, RasterOrderOptions::AlongN}};
@@ -271,4 +258,4 @@ void launch_group_gemm_lora_fwd(
       cutlassGetStatusString(status));
 }
 
-} 
+}  // namespace at::native::xpu

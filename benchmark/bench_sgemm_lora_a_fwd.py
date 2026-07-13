@@ -15,18 +15,102 @@ all_results = []
 #   output:  (num_tokens, stack_num * max_rank)
 # input_dim (K) is the model hidden size; max_rank (the LoRA rank) is small.
 DEFAULT_CASES: List[Dict[str, int]] = [
-    {"num_tokens": 4096, "num_segments": 4, "num_loras": 2, "max_rank": 16, "input_dim": 2048, "stack_num": 1},
-    {"num_tokens": 6144, "num_segments": 8, "num_loras": 4, "max_rank": 32, "input_dim": 4096, "stack_num": 1},
-    {"num_tokens": 8192, "num_segments": 8, "num_loras": 4, "max_rank": 64, "input_dim": 4096, "stack_num": 1},
-    {"num_tokens": 12288, "num_segments": 16, "num_loras": 2, "max_rank": 16, "input_dim": 4096, "stack_num": 3},
-    {"num_tokens": 16384, "num_segments": 16, "num_loras": 4, "max_rank": 32, "input_dim": 5120, "stack_num": 1},
-    {"num_tokens": 24576, "num_segments": 32, "num_loras": 8, "max_rank": 64, "input_dim": 4096, "stack_num": 2},
-    {"num_tokens": 32768, "num_segments": 32, "num_loras": 4, "max_rank": 16, "input_dim": 8192, "stack_num": 1},
-    {"num_tokens": 49152, "num_segments": 64, "num_loras": 8, "max_rank": 32, "input_dim": 4096, "stack_num": 3},
-    {"num_tokens": 65536, "num_segments": 64, "num_loras": 4, "max_rank": 64, "input_dim": 5120, "stack_num": 1},
-    {"num_tokens": 81920, "num_segments": 128, "num_loras": 8, "max_rank": 16, "input_dim": 8192, "stack_num": 2},
-    {"num_tokens": 98304, "num_segments": 128, "num_loras": 4, "max_rank": 32, "input_dim": 4096, "stack_num": 1},
-    {"num_tokens": 122880, "num_segments": 256, "num_loras": 8, "max_rank": 64, "input_dim": 8192, "stack_num": 3},
+    {
+        "num_tokens": 4096,
+        "num_segments": 4,
+        "num_loras": 2,
+        "max_rank": 16,
+        "input_dim": 2048,
+        "stack_num": 1,
+    },
+    {
+        "num_tokens": 6144,
+        "num_segments": 8,
+        "num_loras": 4,
+        "max_rank": 32,
+        "input_dim": 4096,
+        "stack_num": 1,
+    },
+    {
+        "num_tokens": 8192,
+        "num_segments": 8,
+        "num_loras": 4,
+        "max_rank": 64,
+        "input_dim": 4096,
+        "stack_num": 1,
+    },
+    {
+        "num_tokens": 12288,
+        "num_segments": 16,
+        "num_loras": 2,
+        "max_rank": 16,
+        "input_dim": 4096,
+        "stack_num": 3,
+    },
+    {
+        "num_tokens": 16384,
+        "num_segments": 16,
+        "num_loras": 4,
+        "max_rank": 32,
+        "input_dim": 5120,
+        "stack_num": 1,
+    },
+    {
+        "num_tokens": 24576,
+        "num_segments": 32,
+        "num_loras": 8,
+        "max_rank": 64,
+        "input_dim": 4096,
+        "stack_num": 2,
+    },
+    {
+        "num_tokens": 32768,
+        "num_segments": 32,
+        "num_loras": 4,
+        "max_rank": 16,
+        "input_dim": 8192,
+        "stack_num": 1,
+    },
+    {
+        "num_tokens": 49152,
+        "num_segments": 64,
+        "num_loras": 8,
+        "max_rank": 32,
+        "input_dim": 4096,
+        "stack_num": 3,
+    },
+    {
+        "num_tokens": 65536,
+        "num_segments": 64,
+        "num_loras": 4,
+        "max_rank": 64,
+        "input_dim": 5120,
+        "stack_num": 1,
+    },
+    {
+        "num_tokens": 81920,
+        "num_segments": 128,
+        "num_loras": 8,
+        "max_rank": 16,
+        "input_dim": 8192,
+        "stack_num": 2,
+    },
+    {
+        "num_tokens": 98304,
+        "num_segments": 128,
+        "num_loras": 4,
+        "max_rank": 32,
+        "input_dim": 4096,
+        "stack_num": 1,
+    },
+    {
+        "num_tokens": 122880,
+        "num_segments": 256,
+        "num_loras": 8,
+        "max_rank": 64,
+        "input_dim": 8192,
+        "stack_num": 3,
+    },
 ]
 
 
@@ -174,7 +258,9 @@ def _estimate_bytes(
     return total
 
 
-def calc_metrics(total_flops: float, total_bytes: float, time_ms: float) -> Dict[str, float]:
+def calc_metrics(
+    total_flops: float, total_bytes: float, time_ms: float
+) -> Dict[str, float]:
     time_s = time_ms / 1e3
     if time_s <= 0:
         raise RuntimeError("Measured time must be > 0")
@@ -365,8 +451,12 @@ def benchmark(case_id, provider):
         inputs["seg_lens"], inputs["weight_indices"], inputs["lora_ranks"], stack_num, K
     )
     total_bytes = _estimate_bytes(
-        inputs["seg_lens"], inputs["weight_indices"], inputs["lora_ranks"],
-        stack_num, K, elem_size,
+        inputs["seg_lens"],
+        inputs["weight_indices"],
+        inputs["lora_ranks"],
+        stack_num,
+        K,
+        elem_size,
     )
 
     quantiles = [0.5, 0.2, 0.8]

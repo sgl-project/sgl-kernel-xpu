@@ -1,5 +1,5 @@
-import sys
 import math
+import sys
 from typing import Optional
 
 import pytest
@@ -159,7 +159,9 @@ def test_sgemm_lora_a_fwd_stack_num(dtype, stack_num):
 
     seg_indptr = torch.tensor([0, 16, 32], dtype=torch.int32, device="xpu")
     weight_indices = torch.tensor([0, 1], dtype=torch.int32, device="xpu")
-    lora_ranks = torch.tensor([max_rank, max_rank // 2], dtype=torch.int32, device="xpu")
+    lora_ranks = torch.tensor(
+        [max_rank, max_rank // 2], dtype=torch.int32, device="xpu"
+    )
 
     _run_and_compare(
         dtype=dtype,
@@ -209,7 +211,9 @@ def test_sgemm_lora_a_fwd_single_token_segments(dtype):
     stack_num = 1
 
     seg_indptr = torch.arange(0, num_tokens + 1, dtype=torch.int32, device="xpu")
-    weight_indices = torch.arange(num_tokens, dtype=torch.int32, device="xpu") % num_loras
+    weight_indices = (
+        torch.arange(num_tokens, dtype=torch.int32, device="xpu") % num_loras
+    )
     weight_indices = weight_indices.to(torch.int32)
     lora_ranks = torch.tensor([1, 3, 5, 8], dtype=torch.int32, device="xpu")
 
@@ -442,7 +446,9 @@ def test_sgemm_lora_a_fwd_int64_index_tensors_accepted():
 
     seg_indptr = torch.tensor([0, 16, 32], dtype=torch.int64, device="xpu")
     weight_indices = torch.tensor([1, 0], dtype=torch.int64, device="xpu")
-    lora_ranks = torch.tensor([max_rank, max_rank // 2], dtype=torch.int32, device="xpu")
+    lora_ranks = torch.tensor(
+        [max_rank, max_rank // 2], dtype=torch.int32, device="xpu"
+    )
 
     _run_and_compare(
         dtype=dtype,
@@ -530,25 +536,15 @@ def test_sgemm_lora_a_fwd_input_validation(bad_case, expected_msg):
     elif bad_case == "lora_ranks_dim":
         kwargs["lora_ranks"] = kwargs["lora_ranks"].view(1, 1)
     elif bad_case == "lora_ranks_size":
-        kwargs["lora_ranks"] = torch.tensor(
-            [4, 4], dtype=torch.int32, device="xpu"
-        )
+        kwargs["lora_ranks"] = torch.tensor([4, 4], dtype=torch.int32, device="xpu")
     elif bad_case == "weight_indices_size":
-        kwargs["weight_indices"] = torch.tensor(
-            [0, 0], dtype=torch.int32, device="xpu"
-        )
+        kwargs["weight_indices"] = torch.tensor([0, 0], dtype=torch.int32, device="xpu")
     elif bad_case == "weight_indices_out_of_range":
-        kwargs["weight_indices"] = torch.tensor(
-            [5], dtype=torch.int32, device="xpu"
-        )
+        kwargs["weight_indices"] = torch.tensor([5], dtype=torch.int32, device="xpu")
     elif bad_case == "seg_indptr_start_nonzero":
-        kwargs["seg_indptr"] = torch.tensor(
-            [1, 4], dtype=torch.int32, device="xpu"
-        )
+        kwargs["seg_indptr"] = torch.tensor([1, 4], dtype=torch.int32, device="xpu")
     elif bad_case == "seg_indptr_end_mismatch":
-        kwargs["seg_indptr"] = torch.tensor(
-            [0, 3], dtype=torch.int32, device="xpu"
-        )
+        kwargs["seg_indptr"] = torch.tensor([0, 3], dtype=torch.int32, device="xpu")
     elif bad_case == "seg_indptr_decreasing":
         # 2-segment indptr, decreasing in the middle (4 -> 2).
         kwargs["seg_indptr"] = torch.tensor(

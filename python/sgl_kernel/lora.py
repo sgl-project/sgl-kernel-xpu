@@ -77,6 +77,7 @@ def embedding_lora_a_fwd(
 
     return output
 
+
 def sgemm_lora_a_fwd(
     input_x: torch.Tensor,
     weights: torch.Tensor,
@@ -99,7 +100,7 @@ def sgemm_lora_a_fwd(
         seg_indptr,
         weight_indices,
         lora_ranks,
-        seg_lens
+        seg_lens,
     )
 
     return output

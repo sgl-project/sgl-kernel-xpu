@@ -105,6 +105,8 @@ void merge_state(
 void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 
+at::Tensor weak_ref_tensor(const at::Tensor& tensor);
+
 /*
  * From csrc/elementwise
  */
@@ -188,10 +190,29 @@ void fused_qk_rope_with_cos_sin_cache_inplace(
     at::Tensor& positions,
     int64_t rope_dim,
     bool is_neox);
+void multimodal_rotary_embedding(
+    at::Tensor& query,
+    at::Tensor& key,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& positions,
+    const std::vector<int64_t>& mrope_section,
+    int64_t head_size,
+    int64_t rotary_dim,
+    bool mrope_interleaved,
+    bool mrope_interleaved_glm,
+    bool is_neox_style,
+    const std::optional<at::Tensor>& axis_map);
 void sgl_per_token_group_quant_fp4(
-    at::Tensor input, at::Tensor output_q, at::Tensor output_s, int64_t group_size, double eps);
+    at::Tensor input,
+    at::Tensor output_q,
+    at::Tensor output_s,
+    int64_t group_size,
+    double eps,
+    std::optional<at::Tensor> input_secondary = std::nullopt);
+void store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices);
 }  // namespace at::native::xpu
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
+void silu_and_mul_clamp(torch::Tensor& out, torch::Tensor& input, double swiglu_limit);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
 void gelu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void apply_rope_pos_ids_cos_sin_cache(
@@ -248,6 +269,21 @@ void bmm_fp8(
     at::Tensor workspace_buffer,
     int64_t cublas_handle,
     int64_t sycl_stream);
+
+/*
+ * From csrc/nsa (Native Sparse Attention)
+ */
+// fp8_mqa_logits (prefill) is implemented in pure Python via sgl_kernel.nsa.
+
+torch::Tensor fp8_paged_mqa_logits(
+    const torch::Tensor& q_fp8,
+    const torch::Tensor& kv_cache,
+    const torch::Tensor& weights,
+    const torch::Tensor& seq_lens,
+    const torch::Tensor& block_tables,
+    const std::optional<torch::Tensor>& schedule_metadata,
+    int64_t max_seq_len,
+    bool clean_logits);
 
 /*
  * From csrc/moe
@@ -317,6 +353,22 @@ void moe_grouped_mm_nt_xe20(
     const torch::Tensor& total_rows_for_experts,
     const int64_t n_experts,
     const int64_t activation_type = 0,  // 0=silu, 1=gelu, 2=swiglu
+    bool fuse_act = false,
+    double gemm1_alpha = 1.702,
+    double gemm1_limit = 7.0);
+
+// Tile-fused MXFP4-B × BF16-A MoE grouped GEMM. `packed_weights` is int8
+// with two E2M1 nibbles per byte (low nibble = smaller-K element).
+// `scales` is float32 direct-multiplier, one per 32-element K-block.
+void moe_grouped_mm_nt_xe20_mxfp4_w4a16(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& packed_weights,
+    const torch::Tensor& scales,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts,
+    const int64_t activation_type = 0,
     bool fuse_act = false,
     double gemm1_alpha = 1.702,
     double gemm1_limit = 7.0);
@@ -404,6 +456,30 @@ void hc_split_sinkhorn(
     int64_t sinkhorn_iters,
     double eps);
 
+void hc_pre_big_fuse(
+    const at::Tensor& gemm_out_mul,
+    const at::Tensor& gemm_out_sqrsum,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    const at::Tensor& residual_flat,
+    at::Tensor& post_mix,
+    at::Tensor& comb_mix,
+    at::Tensor& layer_input,
+    int64_t hc_mult,
+    int64_t sinkhorn_iters,
+    int64_t n_splits,
+    double rms_eps,
+    double hc_pre_eps,
+    double hc_sinkhorn_eps,
+    double hc_post_mult_value,
+    std::optional<at::Tensor> norm_weight = std::nullopt,
+    std::optional<double> norm_eps = std::nullopt);
+
+/*
+ * hc_pre GEMM + row-wise square sum
+ */
+void hc_pre_gemm_sqr_sum(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, const at::Tensor& B);
+
 /*
  * From csrc/speculative
  */
@@ -490,6 +566,24 @@ void top_p_sampling_from_probs(
     double top_p_val,
     bool deterministic,
     std::optional<at::Generator> gen);
+
+void fast_topk_interface(
+    const at::Tensor& score, at::Tensor& indices, const at::Tensor& lengths, std::optional<at::Tensor> row_starts_opt);
+
+void fast_topk_transform_interface(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& dst_page_table,
+    const at::Tensor& src_page_table,
+    const at::Tensor& cu_seqlens_q,
+    std::optional<at::Tensor> row_starts_opt);
+
+void fast_topk_transform_ragged_interface(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& topk_indices_ragged,
+    const at::Tensor& topk_indices_offset,
+    std::optional<at::Tensor> row_starts_opt);
 
 namespace flash {
 /*

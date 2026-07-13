@@ -95,6 +95,12 @@ struct Arguments {
   void* softmax_sink_ptr;
   float softcap;
 
+  // FP8 KV cache per-tensor descale. The single scalar lives on-device; the
+  // kernel dereferences these pointers so no host-side D2H sync (.item()) is
+  // needed. Null => no fp8 dequant (scale = 1.0f).
+  const float* k_scale_ptr = nullptr;
+  const float* v_scale_ptr = nullptr;
+
   // array of length b+1 holding starting offset of each sequence.
   int* __restrict__ cu_seqlens_q;
   int* __restrict__ cu_seqlens_k;
@@ -164,11 +170,17 @@ struct Arguments {
 
   bool is_bf16;
   bool is_fp32;
-  bool is_e4m3;
+  bool is_e4m3 = false;
+  bool is_e5m2 = false;
   bool is_causal;
   bool is_local;
 
   bool is_rotary_interleaved;
+
+  // Per-batch skip mask for two-kernel mix-batch dispatch
+  // (see https://github.com/vllm-project/vllm-xpu-kernels/pull/218).
+  // If non-null, the kernel skips batches where mask[idx_b] is true.
+  void* skip_batch_mask_ptr = nullptr;
 
   torch::TensorOptions tensor_opts;
 };
@@ -226,7 +238,7 @@ struct PrefillRunner {
         .batch = get<0>(problem_size),
         .num_heads_q = get<1>(problem_size),
         .num_heads_kv = get<2>(problem_size),
-        .seq_len_qo = {params.seqlen_q, params.total_q, nullptr, 1},
+        .seq_len_qo = {params.seqlen_q, params.total_q, nullptr},
         .seq_len_kv = {params.seqlen_knew, params.total_knew},
         .seq_len_kv_cache = {params.seqlen_k, params.total_k},
         .head_size_qk = get<6>(problem_size),
@@ -297,6 +309,9 @@ struct PrefillRunner {
             static_cast<const ElementV*>(params.v_ptr),
             stride_V_cache,
             static_cast<const typename FMHAPrefillKernel::ElementSink*>(params.softmax_sink_ptr),
+            static_cast<const bool*>(params.skip_batch_mask_ptr),
+            params.k_scale_ptr,
+            params.v_scale_ptr,
         },
         {
             params.softmax_scale,
@@ -443,9 +458,20 @@ struct FMHAConfig {
     return 0;
   }
 
-  static int run(const Arguments& params) {
+  // Paged KV cache: the page table encodes absolute KV positions.
+  static int run_paged(const Arguments& params) {
     // template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
     return run<true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+  }
+
+  // Non-paged (contiguous ragged) KV cache: addressed via cu_seqlens_k offsets.
+  static int run_nopaged(const Arguments& params) {
+    // template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
+    return run<true, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+  }
+
+  static int run(const Arguments& params) {
+    return run_paged(params);
   }
 };
 

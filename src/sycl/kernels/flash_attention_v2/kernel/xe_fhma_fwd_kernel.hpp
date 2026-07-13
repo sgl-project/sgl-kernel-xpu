@@ -65,7 +65,13 @@ template <
     class VarLenQLayoutStep_,
     class VarLenKLayoutStep_,
     class VarLenVLayoutStep_,
-    class VarLenOLayoutStep_ = VarLenQLayoutStep_>
+    class VarLenOLayoutStep_ = VarLenQLayoutStep_,
+    // PackGQA: fold the head_group_q query heads that share a KV head into the
+    // M (q) tile, so a single work-group computes the whole GQA group for one
+    // decode step. Only enabled by the decode runner for the plain attention
+    // case (no causal/local mask, no sink); prefill keeps the default (false)
+    // and is therefore unaffected.
+    bool PackGQA_ = false>
 class XeFMHAFwdKernel {
  public:
   //
@@ -142,6 +148,14 @@ class XeFMHAFwdKernel {
     const ElementV* V_cache;
     StrideV dV_cache{};
     const ElementSink* sm_sink = nullptr;  // Per-head sink logits (nheads,), null if no sink
+    // Per-batch skip mask for two-kernel mix-batch dispatch
+    // If non-null, the tile loop skips batches where mask[idx_b] is true.
+    const bool* skip_batch_mask = nullptr;
+    // FP8 KV per-tensor dequant scales. Device pointers to the single descale
+    // scalar; the kernel dereferences them on-device, so the caller never does
+    // a host-side D2H sync (tensor.item()). Null => non-fp8 KV (scale = 1.0f).
+    const float* scale_k_ptr = nullptr;
+    const float* scale_v_ptr = nullptr;
   };
   using KernelParams = KernelArguments;
 
@@ -166,11 +180,14 @@ class XeFMHAFwdKernel {
   //
 
   static Params to_underlying_arguments(Arguments const& args, void* workspace) {
+    // When packing GQA into M, grid over KV heads instead of Q heads by reusing
+    // the scheduler's num_heads_kv path (num_kv_splits == 1, no actual split).
+    const int sched_num_kv_splits = PackGQA_ ? 1 : -1;
     return {
         args.kernel,
         CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
         CollectiveEpilogue::to_underlying_arguments(args.epilogue, workspace),
-        TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{})};
+        TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{}, sched_num_kv_splits)};
   }
 
   static bool can_implement(Arguments const& args) {
@@ -205,10 +222,19 @@ class XeFMHAFwdKernel {
       //         problem_shape.seq_len_qo, problem_shape.seq_len_kv, problem_shape.seq_len_kv_cache},
       //     batch);
 
-      int seq_len_q = problem_shape.seq_len_qo.q_group_size * (problem_shape.seq_len_qo.cumulative_length[batch + 1] -
-                                                               problem_shape.seq_len_qo.cumulative_length[batch]);
+      int seq_len_q =
+          problem_shape.seq_len_qo.cumulative_length[batch + 1] - problem_shape.seq_len_qo.cumulative_length[batch];
       int seq_len_k_new = 0;
-      int seq_len_k_cache = problem_shape.seq_len_kv_cache.cumulative_length[batch];
+      // Paged KV passes per-batch cache lengths in cu_seqlens_k (cumulative_length[b]
+      // already holds this batch's KV length). Non-paged KV passes a cumulative
+      // prefix-sum array (b+1 entries), so the per-batch length is the difference.
+      int seq_len_k_cache;
+      if constexpr (CollectiveMainloop::PagedKV) {
+        seq_len_k_cache = problem_shape.seq_len_kv_cache.cumulative_length[batch];
+      } else {
+        seq_len_k_cache = problem_shape.seq_len_kv_cache.cumulative_length[batch + 1] -
+                          problem_shape.seq_len_kv_cache.cumulative_length[batch];
+      }
       return cute::make_tuple<int, int, int>(seq_len_q, seq_len_k_new, seq_len_k_cache);
 
     } else {
@@ -240,12 +266,20 @@ class XeFMHAFwdKernel {
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
       auto [blk_q, blk_v, head_q, idx_b, unused] = tile_scheduler.get_block_coord();  // (Q,V,h,b)
+      // Mix-batch dispatch: skip batches not owned by this kernel launch.
+      if (p.skip_batch_mask != nullptr && p.skip_batch_mask[idx_b]) continue;
       auto blk_qv = make_coord(blk_q, blk_v);
-      int head = head_q / head_group_q;
+      // PackGQA: the scheduler grids over KV heads, so head_q already is the KV
+      // head index and the head_group_q query heads are folded into the M tile.
+      int head = PackGQA_ ? head_q : head_q / head_group_q;
 
       auto sequence_length_shape = get_sequence_length_shape(s, idx_b);
       auto [seq_len_qo, seq_len_kv, seq_len_kv_cache] = sequence_length_shape;
-      if (blk_q * get<0>(TileShapeQK{}) >= seq_len_qo) continue;
+      // M extent of the Q/O tile: the packed GQA group for decode, otherwise the
+      // query sequence length. Masking below still uses the real seq_len_qo so
+      // the decode KV position (seq_len_kv_cache - seq_len_qo) stays correct.
+      const int m_extent = PackGQA_ ? head_group_q : seq_len_qo;
+      if (blk_q * get<0>(TileShapeQK{}) >= m_extent) continue;
       // auto offset = cute::min(seq_len_qo, seq_len_kv);
       // auto discard_seq_coord = seq_len_qo - offset;
       // auto full_tile_offset = seq_len_kv - offset;
@@ -280,8 +314,11 @@ class XeFMHAFwdKernel {
       if constexpr (CollectiveMainloop::LocalMask) {
         const int tile_q = get<0>(TileShapeQK{});
         const int tile_k = get<1>(TileShapeQK{});
-        const int q_tile_min_row_kv = blk_q * tile_q + full_tile_offset;
-        const int q_tile_max_row_kv = q_tile_min_row_kv + tile_q - 1;
+        // PackGQA decode folds query heads (not sequence positions) into the M
+        // tile, so every row is the single decode token at KV position
+        // full_tile_offset; the sliding-window band is independent of blk_q.
+        const int q_tile_min_row_kv = PackGQA_ ? full_tile_offset : (blk_q * tile_q + full_tile_offset);
+        const int q_tile_max_row_kv = PackGQA_ ? full_tile_offset : (q_tile_min_row_kv + tile_q - 1);
         const int lo_kv = cute::max(0, q_tile_min_row_kv - params.mainloop.window_size_left);
         const int hi_kv_plus_one = q_tile_max_row_kv + params.mainloop.window_size_right + 1;
         blk_k0 = lo_kv / tile_k;
@@ -294,22 +331,35 @@ class XeFMHAFwdKernel {
       if constexpr (is_var_len) {
         auto qo_cumulative = s.seq_len_qo.cumulative_length;
         auto kv_cumulative = s.seq_len_kv.cumulative_length;
-        offset_q = s.num_heads_q * s.head_size_qk * qo_cumulative[idx_b] * s.seq_len_qo.q_group_size;
+        offset_q = s.num_heads_q * s.head_size_qk * qo_cumulative[idx_b];
         // offset_k = s.num_heads_kv * s.head_size_qk * kv_cumulative[idx_b];
         // offset_v = s.num_heads_kv * s.head_size_vo * kv_cumulative[idx_b];
-        offset_o = s.num_heads_q * s.head_size_vo * qo_cumulative[idx_b] * s.seq_len_qo.q_group_size;
+        offset_o = s.num_heads_q * s.head_size_vo * qo_cumulative[idx_b];
         if (s.seq_len_kv_cache.cumulative_length) {
           auto kv_cumulative_cache = s.seq_len_kv_cache.cumulative_length;
-          // offset_k_cache = s.num_heads_kv * s.head_size_qk * kv_cumulative_cache[idx_b];
-          // offset_v_cache = s.num_heads_kv * s.head_size_vo * kv_cumulative_cache[idx_b];
+          // Non-paged KV stores all batches in one contiguous ragged buffer, so each
+          // batch starts at its cumulative KV offset. Paged KV uses the page table for
+          // absolute addressing, so no base offset is applied here.
+          if constexpr (!CollectiveMainloop::PagedKV) {
+            offset_k_cache = s.num_heads_kv * s.head_size_qk * kv_cumulative_cache[idx_b];
+            offset_v_cache = s.num_heads_kv * s.head_size_vo * kv_cumulative_cache[idx_b];
+          }
         }
       }
 
       auto batch_dim = is_var_len ? 1 : s.batch;
-      auto shape_Q = make_shape(seq_len_qo, s.head_size_qk, s.num_heads_q, batch_dim);
-      auto shape_K = make_shape(s.seq_len_kv_cache.total_length, s.head_size_qk, s.num_heads_kv, batch_dim);
-      auto shape_V = make_shape(s.head_size_vo, s.seq_len_kv_cache.total_length, s.num_heads_kv, batch_dim);
-      auto shape_O = make_shape(seq_len_qo, s.head_size_vo, s.num_heads_q, batch_dim);
+      // Paged KV addresses the whole cache buffer (page table remaps tiles), so the
+      // sequence extent is the global total. Non-paged KV points at a single batch's
+      // contiguous region, so the extent must be this batch's KV length to keep the
+      // 2D block loads in-bounds.
+      int kv_seq_extent = CollectiveMainloop::PagedKV ? int(s.seq_len_kv_cache.total_length) : int(seq_len_kv_cache);
+      // PackGQA folds the head_group_q query heads into M and grids over KV
+      // heads, so the Q/O head extent collapses to num_heads_kv.
+      auto q_head_count = PackGQA_ ? s.num_heads_kv : s.num_heads_q;
+      auto shape_Q = make_shape(m_extent, s.head_size_qk, q_head_count, batch_dim);
+      auto shape_K = make_shape(kv_seq_extent, s.head_size_qk, s.num_heads_kv, batch_dim);
+      auto shape_V = make_shape(s.head_size_vo, kv_seq_extent, s.num_heads_kv, batch_dim);
+      auto shape_O = make_shape(m_extent, s.head_size_vo, q_head_count, batch_dim);
 
       auto dcQ = const_cast<ElementQ*>(p.Q + offset_q);
       auto dcK_cache = const_cast<ElementK*>(p.K_cache + offset_k_cache);
@@ -333,9 +383,21 @@ class XeFMHAFwdKernel {
 
       // Main loop
       int l_coord = is_var_len ? 0 : idx_b;
+      // With PackGQA the Q/O head dimension is indexed by the KV head; otherwise
+      // by the (un-grouped) query head.
+      int q_head_idx = PackGQA_ ? head : head_q;
+      // FP8 KV: the per-tensor dequant scale baked into KernelArguments is
+      // passed as a float function argument (scale_k) to the mainloop GEMM1.
+      // It defaults to 1.0f for non-fp8 KV; the fp8 dequant scalar is read
+      // on-device from scale_k_ptr (avoids a host-side .item() D2H sync) only
+      // in the fp8 instantiation, so non-fp8 kernels compile the read out.
+      float scale_k = 1.0f;
+      if constexpr (CollectiveMainloop::Fp8KV) {
+        scale_k = *p.scale_k_ptr;
+      }
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
       mainloop(
-          Q(_, _, head_q, l_coord),
+          Q(_, _, q_head_idx, l_coord),
           K_cache(_, _, head, l_coord),
           V_cache(_, _, head, l_coord),
           tArA,
@@ -353,7 +415,8 @@ class XeFMHAFwdKernel {
           full_tile_offset,
           discard_seq_coord,
           K_cache(_, _, head, l_coord),
-          V_cache(_, _, head, l_coord));
+          V_cache(_, _, head, l_coord),
+          scale_k);
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());
@@ -361,10 +424,35 @@ class XeFMHAFwdKernel {
 
       // Epilogue
       CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
+      // FP8 KV: the per-tensor V dequant scale is applied once in the epilogue
+      // (folded into the softmax normalization) instead of per V element in the
+      // mainloop GEMM2. It defaults to 1.0f for non-fp8 KV; the fp8 dequant
+      // scalar is read on-device from scale_v_ptr only in the fp8 instantiation.
+      float scale_v = 1.0f;
+      if constexpr (CollectiveMainloop::Fp8KV) {
+        scale_v = *p.scale_v_ptr;
+      }
       if constexpr (Sink) {
-        epilogue(O(_, _, head_q, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, p.sm_sink[head_q]);
+        if constexpr (PackGQA_) {
+          // Packed decode: pass the per-row sink base for this KV head's group
+          // (heads head*head_group_q .. +head_group_q-1), applied per row in the
+          // epilogue.
+          epilogue(
+              O(_, _, q_head_idx, l_coord),
+              tArA,
+              tA_max,
+              tA_sum,
+              blk_qv,
+              thr_id,
+              scale_v,
+              ElementSink{},
+              p.sm_sink + head * head_group_q,
+              head_group_q);
+        } else {
+          epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, scale_v, p.sm_sink[q_head_idx]);
+        }
       } else {
-        epilogue(O(_, _, head_q, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id);
+        epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, scale_v);
       }
     }
   }
@@ -448,6 +536,16 @@ class XeFMHAFwdDynamicSplitKernel {
     StrideK dK_cache{};
     const ElementV* V_cache = nullptr;
     StrideV dV_cache{};
+    // Per-batch skip mask, see XeFMHAFwdKernel above. Not honored by this
+    // kernel (DynamicSplit scheduler is not used by the chunkprefill
+    // mix-batch path) but kept for uniform aggregate initialization in the
+    // shared runner template.
+    const bool* skip_batch_mask = nullptr;
+    // FP8 KV per-tensor dequant scales. Device pointers to the single descale
+    // scalar (DynamicSplit does not support fp8, so these stay null and the
+    // scale resolves to 1.0f); present for uniform aggregate initialization.
+    const float* scale_k_ptr = nullptr;
+    const float* scale_v_ptr = nullptr;
   };
   using KernelParams = KernelArguments;
 
@@ -808,7 +906,14 @@ class XeFMHAFwdDynamicSplitKernel {
 
         // Epilogue
         CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
-        epilogue(O(_, _, head_q, idx_b), tArA, tA_max, tA_sum, blk_qv, thr_id);
+        // FP8 KV: apply the per-tensor V dequant scale once in the epilogue.
+        // It defaults to 1.0f for non-fp8 KV; read on-device only in the fp8
+        // instantiation.
+        float scale_v = 1.0f;
+        if constexpr (CollectiveMainloop::Fp8KV) {
+          scale_v = *p.scale_v_ptr;
+        }
+        epilogue(O(_, _, head_q, idx_b), tArA, tA_max, tA_sum, blk_qv, thr_id, scale_v);
       }
     }
   }
@@ -890,6 +995,14 @@ class XeFMHAFwdSplitKVKernel {
     StrideO dMax_logits;
 
     const ElementSink* sm_sink;
+    // Per-batch skip mask for two-kernel mix-batch dispatch
+    // (see https://github.com/vllm-project/vllm-xpu-kernels/pull/218).
+    const bool* skip_batch_mask = nullptr;
+    // FP8 KV per-tensor dequant scales. Device pointers to the single descale
+    // scalar; the kernel dereferences them on-device, so the caller never does
+    // a host-side D2H sync (tensor.item()). Null => non-fp8 KV (scale = 1.0f).
+    const float* scale_k_ptr = nullptr;
+    const float* scale_v_ptr = nullptr;
   };
   using KernelParams = KernelArguments;
 
@@ -990,6 +1103,8 @@ class XeFMHAFwdSplitKVKernel {
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
       auto [blk_q, blk_v, head, idx_b, idx_kv_split] = tile_scheduler.get_block_coord();  // (Q,V,h,b,id_split)
+      // Mix-batch dispatch: skip batches not owned by this kernel launch.
+      if (p.skip_batch_mask != nullptr && p.skip_batch_mask[idx_b]) continue;
       auto blk_qv = make_coord(blk_q, blk_v);
       int head_q_start = head * head_group_q;
 
@@ -1106,6 +1221,18 @@ class XeFMHAFwdSplitKVKernel {
       int start_blk = kv_split_offset;
       int end_blk = kv_split_offset + num_effective_kv_blocks;
 
+      // FP8 KV: the per-tensor dequant scales baked into KernelArguments.
+      // scale_k is applied to K in the mainloop GEMM1; scale_v is folded into
+      // the softmax normalization in the epilogue (not the mainloop GEMM2).
+      // Both default to 1.0f for non-fp8 KV; the fp8 dequant scalars are read
+      // on-device from the descale pointers only in the fp8 instantiation
+      // (avoids a host-side .item() D2H sync).
+      float scale_k = 1.0f;
+      float scale_v = 1.0f;
+      if constexpr (CollectiveMainloop::Fp8KV) {
+        scale_k = *p.scale_k_ptr;
+        scale_v = *p.scale_v_ptr;
+      }
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
 
       mainloop(
@@ -1123,7 +1250,8 @@ class XeFMHAFwdSplitKVKernel {
           thr_id,
           seq_len,
           full_tile_offset,
-          discard_seq_coord);
+          discard_seq_coord,
+          scale_k);
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());
@@ -1140,6 +1268,7 @@ class XeFMHAFwdSplitKVKernel {
             tA_sum,
             blk_qv,
             thr_id,
+            scale_v,
             exp_sums(_, _, head, l_coord),
             max_logits(_, _, head, l_coord),
             idx_kv_split,
@@ -1155,6 +1284,7 @@ class XeFMHAFwdSplitKVKernel {
             tA_sum,
             blk_qv,
             thr_id,
+            scale_v,
             exp_sums(_, _, head, l_coord),
             max_logits(_, _, head, l_coord),
             idx_kv_split,

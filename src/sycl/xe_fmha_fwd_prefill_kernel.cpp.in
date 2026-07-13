@@ -38,24 +38,152 @@ namespace prefill {
 
 template <>
 void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
+  bool use_sink = (params.softmax_sink_ptr != nullptr);
+
+#if @EMIT_NP@
+  if (params.page_table == nullptr) {
+    // Non-paged (contiguous ragged) KV cache. Uses an independent tile-shape
+    // configuration so it can be tuned separately from the paged path.
+    TORCH_CHECK(
+        params.softmax_sink_ptr == nullptr,
+        "No-page attention does not support sink logits (softmax_sink_ptr must be null)");
+    using TileShapeQK = cute::Shape<cute::Int<@TILED_Q_NP@>, cute::Int<@TILED_KV_NP@>, cute::_32>;
+    using TileShapePV = cute::Shape<cute::Int<@TILED_Q_NP@>, cute::_32, cute::Int<@TILED_KV_NP@>>;
+    using TileShapeOutput = cute::Shape<cute::Int<@TILED_Q_NP@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;
+    using SubgroupLayoutQK = cute::
+        Layout<cute::Shape<cute::Int<@NUM_SG_NP@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+    // No sink support for no_page path; always use Sink=false
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+        FMHAConfig<Causal, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_nopaged(
+            params);
+      });
+    });
+    return;
+  }
+#endif
+
+#if @EMIT_PAGED@
   using TileShapeQK = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_KV@>, cute::_32>;
   using TileShapePV = cute::Shape<cute::Int<@TILED_Q@>, cute::_32, cute::Int<@TILED_KV@>>;
-  // Round the head-dim of the output tile up to a multiple of get<1>(TileShapePV) (32) so that
-  // VTiles = get<1>(TileShapeOutput) / get<1>(TileShapePV) covers the full head dimension when
-  // HEAD_DIM is not a multiple of 32 (e.g. HEAD_DIM=72 -> 96, VTiles=3). The actual O surface is
-  // bounded by head_size_vo, so HW clips the OOB tail writes in the epilogue.
-  using TileShapeOutput = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;
+  // Use the configured output tile head extent. CMake sets @TILED_OUT@ to a
+  // default rounded head size, and may override specific head dims (e.g. 512)
+  // to improve occupancy by splitting the output tile across V.
+  using TileShapeOutput = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_OUT@>>;
   using SubgroupLayoutQK =
       cute::Layout<cute::Shape<cute::Int<@NUM_SG@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
 
-  bool use_sink = (params.softmax_sink_ptr != nullptr);
+  if (params.is_e4m3 || params.is_e5m2) {
+    // FP8 KV cache: Q is bf16 or fp16, K/V cache are fp8 (e4m3 or e5m2). The
+    // mainloop dequantizes K/V with the per-tensor k_scale/v_scale (Fp8KV path).
+    TORCH_CHECK(
+        !use_sink, "fp8 KV cache prefill does not support sink logits");
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+        if (params.is_bf16) {
+          if (params.is_e4m3) {
+            FMHAConfig<
+                Causal,
+                LocalMask,
+                false,
+                TileShapeQK,
+                TileShapePV,
+                TileShapeOutput,
+                SubgroupLayoutQK,
+                void,
+                2,
+                false,
+                cutlass::bfloat16_t,
+                cutlass::float_e4m3_t,
+                cutlass::float_e4m3_t,
+                cutlass::bfloat16_t>::run_paged(params);
+          } else {
+            FMHAConfig<
+                Causal,
+                LocalMask,
+                false,
+                TileShapeQK,
+                TileShapePV,
+                TileShapeOutput,
+                SubgroupLayoutQK,
+                void,
+                2,
+                false,
+                cutlass::bfloat16_t,
+                cutlass::float_e5m2_t,
+                cutlass::float_e5m2_t,
+                cutlass::bfloat16_t>::run_paged(params);
+          }
+        } else {
+#if @EMIT_FP8_FP16@
+          if (params.is_e4m3) {
+            FMHAConfig<
+                Causal,
+                LocalMask,
+                false,
+                TileShapeQK,
+                TileShapePV,
+                TileShapeOutput,
+                SubgroupLayoutQK,
+                void,
+                2,
+                false,
+                cutlass::half_t,
+                cutlass::float_e4m3_t,
+                cutlass::float_e4m3_t,
+                cutlass::half_t>::run_paged(params);
+          } else {
+            FMHAConfig<
+                Causal,
+                LocalMask,
+                false,
+                TileShapeQK,
+                TileShapePV,
+                TileShapeOutput,
+                SubgroupLayoutQK,
+                void,
+                2,
+                false,
+                cutlass::half_t,
+                cutlass::float_e5m2_t,
+                cutlass::float_e5m2_t,
+                cutlass::half_t>::run_paged(params);
+          }
+#else
+          TORCH_CHECK(
+              false,
+              "fp8 KV cache with fp16 query is disabled at compile time; "
+              "rebuild with -DSGL_FMHA_FP8_KV_ENABLE_FP16=ON to enable it");
+#endif
+        }
+      });
+    });
+    return;
+  }
+
+#if @HEAD_DIM@ == 64
   AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
-        FMHAConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(params);
+        FMHAConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
+            params);
       });
     });
   });
+#else
+  TORCH_CHECK(
+      !use_sink,
+      "sink is only supported for head_size == 64, got @HEAD_DIM@");
+  AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+      FMHAConfig<Causal, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
+          params);
+    });
+  });
+#endif
+#else
+  TORCH_CHECK(false, "head dim @HEAD_DIM@ is not compiled for the paged prefill path");
+#endif
 }
 
 template struct FmhaPrefillRunner<@HEAD_DIM@>;

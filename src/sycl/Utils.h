@@ -43,6 +43,15 @@
     TORCH_CHECK(error == cutlass::Status::kSuccess, cutlassGetStatusString(error)); \
   }
 
+// Shared dispatch heuristic for the MoE grouped-GEMM kernels (bf16 and
+// MXFP4 W4A16). Weights with K*N at or below this threshold are
+// classified as "small" and dispatched to a tile shape tuned for that
+// regime; larger weights take the "big" branch. Used by both
+// GroupGemmXe20.cpp and GroupGemmMxfp4W4A16Xe20.cpp — keep them in sync.
+// Note: python/sgl_kernel/moe.py also references this number to decide
+// fused vs unfused activation; if you retune this, update Python too.
+constexpr int64_t MOE_GROUPED_GEMM_SMALL_WEIGHT_THRESHOLD = int64_t(4096) * 4096;
+
 static inline void barrier() {
   // Compiler + hardware memory fence for work-group–level synchronization.
   asm volatile("lsc_fence.ugm.none.group\n" ::: "memory");
@@ -312,6 +321,15 @@ inline void check_shape(const at::Tensor& a, const at::Tensor& b, const char* a_
 template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
 inline T div_up(T x, T y) {
   return (x + y - 1) / y;
+}
+
+// Reciprocal with zero check. If x is zero, return zero; else return 1/x.
+template <typename T>
+inline T safe_recip(T x) {
+  const auto nz = (x != T(0));
+  const T safe_d = sycl::select(T(1), x, nz);
+  const T inv = sycl::native::recip(safe_d);
+  return sycl::select(T(0), inv, nz);
 }
 
 int nextPowerOf2(uint32_t a) {

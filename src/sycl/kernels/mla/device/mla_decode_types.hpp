@@ -160,7 +160,7 @@ struct MlaXe {
   using MainloopDispatchPolicy = cutlass::flash_attention::XeDefault<PipelineStages>;
   using CollectiveMainloop = cutlass::flash_attention::collective::XeMlaMainloop<
       MainloopDispatchPolicy,
-      true,
+      false,  // CausalMask: decode attends to all past KV, no masking needed
       TiledMMAQK,
       TiledMMAPV,
       VTiles,
@@ -169,7 +169,10 @@ struct MlaXe {
       TensorV,
       GmemTiledCopyQ,
       GmemTiledCopyK,
-      GmemTiledCopyV>;
+      GmemTiledCopyV,
+      false>;  // IsPrefill: decode launches at 128 GRF (Q_TILE_M=1 footprint
+               // fits comfortably; doubles thread/EU occupancy for memory-bound
+               // decode). Prefill defaults to true → 256 GRF.
 
   // Collective Epilogue
   using CollectiveEpilogue =

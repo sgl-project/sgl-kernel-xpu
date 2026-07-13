@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import List, Optional
 
 import torch
 from sgl_kernel.utils import get_xpu_stream
@@ -165,6 +165,34 @@ def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
     return out
 
 
+def silu_and_mul_clamp(
+    input: torch.Tensor,
+    out: torch.Tensor,
+    swiglu_limit: float,
+) -> None:
+    """Fused SiLU-and-Mul with BF16 clamping (DeepSeek-V4 / DeepGEMM style).
+
+    Writes result into *output* in-place; returns nothing.
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Shape ``(M, 2*H)``, dtype bf16 or fp16.  Gate and up halves are
+        concatenated on the last dimension (split layout, not interleaved).
+    output : torch.Tensor
+        Shape ``(M, H)``, same dtype as *input*, pre-allocated output buffer.
+    swiglu_limit : float
+        Positive clamping bound.  Applied in BF16 precision to match the
+        DeepGEMM ``__hmin2`` / ``__hmax2`` semantics:
+          - gate is upper-clamped:  gate  = min(gate, limit)
+          - up is two-sided-clamped: up   = clamp(up, -limit, limit)
+    """
+    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
+        raise ValueError("The pointers must be multiple of 16 bytes.")
+    _check_shape(input, out)
+    torch.ops.sgl_kernel.silu_and_mul_clamp(out, input, swiglu_limit)
+
+
 def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
@@ -193,6 +221,38 @@ def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
         )
     torch.ops.sgl_kernel.gelu_and_mul(out, input)
     return out
+
+
+def store_cache_xpu(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,
+) -> None:
+    r"""Fused KV-cache store for XPU.
+
+    Writes K and V into the flat KV-cache at the given slot indices in a
+    single SYCL kernel launch (replacing 2x aten::_index_put_impl_).
+
+    Parameters
+    ----------
+    k : torch.Tensor
+        Key tensor, shape: ``(num_tokens, row_dim)``. Rows may be strided
+        (e.g. a per-head slice of a wider tensor); only the inner row must be
+        contiguous (``k.stride(1) == 1``).
+    v : torch.Tensor
+        Value tensor, shape: ``(num_tokens, row_dim)``. Same row-contiguity
+        rule as ``k``.
+    k_cache : torch.Tensor
+        Key cache buffer, shape: ``(cache_size, row_dim)``.
+    v_cache : torch.Tensor
+        Value cache buffer, shape: ``(cache_size, row_dim)``.
+    indices : torch.Tensor
+        Flat cache slot indices, shape: ``(num_tokens,)``, dtype int64.
+        Use -1 to skip a token.
+    """
+    torch.ops.sgl_kernel.store_cache(k, v, k_cache, v_cache, indices.long())
 
 
 def apply_rope_with_cos_sin_cache_inplace(
@@ -461,4 +521,59 @@ def fused_qk_rope_with_cos_sin_cache_inplace(
         positions,
         rope_dim,
         is_neox,
+    )
+
+
+def multimodal_rotary_embedding(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    mrope_section: List[int],
+    head_size: int,
+    rotary_dim: int,
+    mrope_interleaved: bool,
+    mrope_interleaved_glm: bool,
+    is_neox: bool,
+    axis_map: Optional[torch.Tensor],
+) -> None:
+    r"""Apply multimodal RoPE to Q/K using precomputed cos/sin cache.
+
+    Parameters
+    ----------
+    query: torch.Tensor
+        Query tensor updated in-place.
+    key: torch.Tensor
+        Key tensor updated in-place.
+    cos_sin_cache: torch.Tensor
+        Precomputed RoPE cos/sin cache.
+    positions: torch.Tensor
+        Position indices used to index the cache.
+    mrope_section: List[int]
+        Per-axis section sizes for multimodal RoPE.
+    head_size: int
+        Full attention head size for Q/K.
+    rotary_dim: int
+        Rotary/RoPE dimension represented by ``cos_sin_cache``.
+    mrope_interleaved: bool
+        Whether multimodal rotary dimensions are interleaved.
+    mrope_interleaved_glm: bool
+        Whether to use GLM-style interleaving behavior.
+    is_neox: bool
+        Whether to apply NeoX-style rotary layout.
+    axis_map: Optional[torch.Tensor]
+        Optional axis remapping tensor for multimodal position handling.
+    """
+    torch.ops.sgl_kernel.multimodal_rotary_embedding(
+        query,
+        key,
+        cos_sin_cache,
+        positions,
+        mrope_section,
+        head_size,
+        rotary_dim,
+        mrope_interleaved,
+        mrope_interleaved_glm,
+        is_neox,
+        axis_map,
     )

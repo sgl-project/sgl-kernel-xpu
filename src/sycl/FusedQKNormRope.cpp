@@ -863,6 +863,8 @@ void fused_qk_norm_rope_with_cos_sin_cache_inplace(
   const int64_t num_kv_heads = k_view.size(1);
   const int64_t head_dim = q_view.size(2);
 
+  TORCH_CHECK(q_weight.dim() == 1, "q_weight must be 1D [head_dim]");
+  TORCH_CHECK(k_weight.dim() == 1, "k_weight must be 1D [head_dim]");
   TORCH_CHECK(q_weight.size(0) == head_dim, "q_weight size must match head_dim");
   TORCH_CHECK(k_weight.size(0) == head_dim, "k_weight size must match head_dim");
   TORCH_CHECK(cos_sin_cache.dim() == 2, "cos_sin_cache must be 2D [max_position, rope_dim]");

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import List, Literal, NamedTuple, Optional, Tuple
 
 import torch
+from utils import get_device
 
 _is_xpu = True
 
@@ -197,10 +198,6 @@ def compress_forward(
 
     fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
     return out
-
-
-def get_device():
-    return "xpu"
 
 
 @dataclass

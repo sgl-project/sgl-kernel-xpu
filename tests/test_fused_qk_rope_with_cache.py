@@ -3,6 +3,7 @@ import sys
 import pytest
 import torch
 import triton
+import utils
 from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
 from test_rope_utils import *
 
@@ -62,7 +63,9 @@ def fused_qk_rope_with_cache(
 # ---------------------------------------------------------------------------
 
 BS_LIST = [1, 128, 2048]
-NUM_KV_HEADS_LIST = [1, 4]
+# NUM_KV_HEADS_LIST expanded to include the CRI-only 8 to cover PO
+# fused_qk_rope_with_cache CFGs.
+NUM_KV_HEADS_LIST = [1, 4] + utils.cri_only([8])
 GQA_RATIO = [1, 8]
 ROPE_DIM_LIST = [64, 128, 256, 512]
 IS_NEOX_LIST = [False, True]

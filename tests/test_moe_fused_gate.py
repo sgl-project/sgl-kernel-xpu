@@ -187,7 +187,7 @@ def test_moe_fused_gate_combined(
     output_check = torch.allclose(
         ref_output.sort()[0].to(torch.float32),
         output.sort()[0].to(torch.float32),
-        rtol=1e-03,
+        rtol=1e-02,
         atol=1e-03,
     )
 

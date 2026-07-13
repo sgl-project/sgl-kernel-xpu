@@ -32,9 +32,10 @@ def biased_grouped_topk_native(
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
     scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
+    group_sum_count = 1 if scoring_func == "softmax" else 2
     group_scores = (
         scores_for_choice.view(num_token, num_expert_group, -1)
-        .topk(2, dim=-1)[0]
+        .topk(group_sum_count, dim=-1)[0]
         .sum(dim=-1)
     )  # [n, n_group]
     group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
@@ -105,15 +106,16 @@ def biased_grouped_topk_org_kernel(
     scores, bias, num_expert_group, topk_group, topk, scoring_func
 ):
     return moe_fused_gate(
-        scores,
-        bias,
-        num_expert_group,
-        topk_group,
-        topk,
-        0,
-        2.5,
-        False,
-        scoring_func,
+        input_tensor=scores,
+        bias=bias,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        topk=topk,
+        renormalize=True,
+        scoring_func=scoring_func,
+        num_fused_shared_experts=0,
+        routed_scaling_factor=2.5,
+        apply_routed_scaling_factor_on_output=False,
     )
 
 
@@ -138,7 +140,12 @@ configs = [(sq,) for sq in seq_length_range]
             "Original (softmax)",
             "SGL Kernel (softmax)",
         ],
-        styles=[("blue", "-"), ("red", "-"), ("green", "--"), ("orange", "--")],
+        styles=[
+            ("blue", "-"),
+            ("red", "-"),
+            ("green", "--"),
+            ("orange", "--"),
+        ],
         ylabel="us",
         plot_name="moe-fused-gate-performance",
         args={},

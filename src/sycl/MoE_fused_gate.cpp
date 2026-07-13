@@ -52,6 +52,57 @@ struct moe_fused_gate_impl {
         apply_routed_scaling_factor_on_output_(apply_routed_scaling_factor_on_output),
         params_(params) {}
 
+  inline void apply_sigmoid_scoring(T row_chunk[MAX_VPT]) const {
+#pragma unroll
+    for (int i = 0; i < params_.VPT; ++i) {
+      float x = static_cast<float>(row_chunk[i]);
+      row_chunk[i] = static_cast<T>(1.0f / (1.0f + sycl::exp(-x)));
+    }
+  }
+
+  inline void apply_softmax_scoring(T row_chunk[MAX_VPT], sycl::sub_group sg) const {
+    uint32_t lane = sg.get_local_id()[0];
+    uint32_t logical_lane = lane & (params_.NUM_EXPERT_GROUPS - 1);
+    uint32_t group_base = lane & ~(params_.NUM_EXPERT_GROUPS - 1);
+
+    float local_max = -max_value<float>();
+#pragma unroll
+    for (int i = 0; i < params_.VPT; ++i) {
+      local_max = sycl::fmax(local_max, static_cast<float>(row_chunk[i]));
+    }
+
+    for (int mask = params_.NUM_EXPERT_GROUPS / 2; mask > 0; mask >>= 1) {
+      uint32_t target_logical = logical_lane ^ mask;
+      uint32_t target_lane = group_base + target_logical;
+      uint32_t xor_mask = lane ^ target_lane;
+      float other_max = sycl::permute_group_by_xor(sg, local_max, xor_mask);
+      local_max = sycl::fmax(local_max, other_max);
+    }
+
+    float exp_chunk[MAX_VPT];
+    float local_sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < params_.VPT; ++i) {
+      float exp_val = sycl::exp(static_cast<float>(row_chunk[i]) - local_max);
+      exp_chunk[i] = exp_val;
+      local_sum += exp_val;
+    }
+
+    for (int mask = params_.NUM_EXPERT_GROUPS / 2; mask > 0; mask >>= 1) {
+      uint32_t target_logical = logical_lane ^ mask;
+      uint32_t target_lane = group_base + target_logical;
+      uint32_t xor_mask = lane ^ target_lane;
+      float other_sum = sycl::permute_group_by_xor(sg, local_sum, xor_mask);
+      local_sum += other_sum;
+    }
+
+    float inv_sum = (local_sum > 0.0f) ? (1.0f / local_sum) : 0.0f;
+#pragma unroll
+    for (int i = 0; i < params_.VPT; ++i) {
+      row_chunk[i] = static_cast<T>(exp_chunk[i] * inv_sum);
+    }
+  }
+
   [[sycl::reqd_sub_group_size(MAX_VPT)]]
   void operator()(sycl::nd_item<3> item) const {
     if (item.get_global_linear_id() / MAX_VPT >= num_rows_) return;
@@ -83,54 +134,9 @@ struct moe_fused_gate_impl {
       }
 
       if (scoring_func_ == static_cast<int32_t>(ScoringFunc::kSigmoid)) {
-////////////////////// Sigmoid //////////////////////
-#pragma unroll
-        for (int i = 0; i < params_.VPT; ++i) {
-          float x = static_cast<float>(-row_chunk[i]);
-          row_chunk[i] = static_cast<T>(1.0f / (1.0f + sycl::exp(x)));
-        }
+        apply_sigmoid_scoring(row_chunk);
       } else {
-        ////////////////////// Softmax //////////////////////
-        uint32_t lane = sg.get_local_id()[0];
-        uint32_t logical_lane = lane & (params_.NUM_EXPERT_GROUPS - 1);
-        uint32_t group_base = lane & ~(params_.NUM_EXPERT_GROUPS - 1);
-
-        float local_max = -max_value<float>();
-#pragma unroll
-        for (int i = 0; i < params_.VPT; ++i) {
-          local_max = sycl::fmax(local_max, static_cast<float>(row_chunk[i]));
-        }
-
-        for (int mask = params_.NUM_EXPERT_GROUPS / 2; mask > 0; mask >>= 1) {
-          uint32_t target_logical = logical_lane ^ mask;
-          uint32_t target_lane = group_base + target_logical;
-          uint32_t xor_mask = lane ^ target_lane;
-          float other_max = sycl::permute_group_by_xor(sg, local_max, xor_mask);
-          local_max = sycl::fmax(local_max, other_max);
-        }
-
-        float exp_chunk[MAX_VPT];
-        float local_sum = 0.0f;
-#pragma unroll
-        for (int i = 0; i < params_.VPT; ++i) {
-          float exp_val = sycl::exp(static_cast<float>(row_chunk[i]) - local_max);
-          exp_chunk[i] = exp_val;
-          local_sum += exp_val;
-        }
-
-        for (int mask = params_.NUM_EXPERT_GROUPS / 2; mask > 0; mask >>= 1) {
-          uint32_t target_logical = logical_lane ^ mask;
-          uint32_t target_lane = group_base + target_logical;
-          uint32_t xor_mask = lane ^ target_lane;
-          float other_sum = sycl::permute_group_by_xor(sg, local_sum, xor_mask);
-          local_sum += other_sum;
-        }
-
-        float inv_sum = (local_sum > 0.0f) ? (1.0f / local_sum) : 0.0f;
-#pragma unroll
-        for (int i = 0; i < params_.VPT; ++i) {
-          row_chunk[i] = static_cast<T>(exp_chunk[i] * inv_sum);
-        }
+        apply_softmax_scoring(row_chunk, sg);
       }
 
 ////////////////////// Add Bias //////////////////////

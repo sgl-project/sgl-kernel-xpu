@@ -292,16 +292,16 @@ def test_python_wrapper():
 
 
 @pytest.mark.parametrize(
-    "Nq,H,D,Nk,aligned",
+    "Nq,H,D,Nk",
     [
         # aligned → head-loop uses _scaled_mm (Nq, Nk, D all divisible by 16)
-        (16, 4, 128, 16, True),
+        (16, 4, 128, 16),
         # unaligned → head-loop uses bf16 fallback
-        (3, 4, 128, 15, False),
+        (3, 4, 128, 15),
     ],
     ids=["head_loop_scaled_mm", "head_loop_bf16"],
 )
-def test_fp8_mqa_logits_head_loop(Nq, H, D, Nk, aligned):
+def test_fp8_mqa_logits_head_loop(Nq, H, D, Nk):
     """Head-loop OOM-avoidance path is numerically correct.
 
     The threshold is patched to 0 so that even small tensors take the head-loop

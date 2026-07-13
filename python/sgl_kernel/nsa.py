@@ -86,7 +86,7 @@ def _fp8_mqa_logits_impl(
                 score += dots_h.relu_() * weights[:, h : h + 1]
         score *= k_scale
     else:
-        if use_scaled_mm:
+        if use_scaled_mm and M % _SCALED_MM_ALIGN == 0:
             one = torch.ones(1, dtype=torch.float32, device=q_fp8.device)
             # dots: (M, Nk) = (Nq*H, Nk)
             dots = torch._scaled_mm(
@@ -155,7 +155,7 @@ def fp8_paged_mqa_logits(
     """FP8 MQA logits for paged (decode) path.
 
     Args:
-        q_fp8: (B, 1, H, D) fp8 e4m3 queries (stored as uint8)
+        q_fp8: (B, 1, H, D) or (B, H, D) fp8 e4m3 queries (stored as uint8)
         kv_cache: (num_pages, page_size, 1, D+4) uint8 paged KV cache
         weights: (B, H) float32 combined gate weights
         seq_lens: (B,) or (B,1) int32 actual sequence lengths

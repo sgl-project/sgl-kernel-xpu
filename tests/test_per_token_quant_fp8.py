@@ -51,6 +51,7 @@ def test_per_token_quant_compare_implementations(
     num_tokens: int,
     hidden_dim: int,
 ):
+    torch.manual_seed(42)
     x = torch.rand((num_tokens, hidden_dim), dtype=dtype, device=device)
 
     sglang_out, sglang_scale = sglang_per_token_quant_fp8(x)

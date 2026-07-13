@@ -76,6 +76,7 @@ jobs:
               echo 'Skipping bench_per_token_group_quant_8bit.py (disabled to unblock other benchmarks; see PR #256)' && \
               python3 bench_per_token_group_quant_mxfp4.py 2>&1 | tee per_token_group_quant_mxfp4.py.log && \
               python3 bench_per_token_group_quant_8bit_v2.py 2>&1 | tee bench_per_token_group_quant_8bit_v2.py.log && \
+              python3 bench_per_token_quant_fp8.py 2>&1 | tee bench_per_token_quant_fp8.py.log && \
               python3 bench_per_token_group_quant_mxfp4_fusion.py 2>&1 | tee bench_per_token_group_quant_mxfp4_fusion.py.log && \
               python3 bench_scatter_tokens_to_experts.py 2>&1 | tee bench_scatter_tokens_to_experts.py.log && \
               python3 bench_top_k_renorm_probs.py 2>&1 | tee bench_top_k_renorm_probs.py.log && \

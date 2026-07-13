@@ -259,7 +259,7 @@ std::vector<at::Tensor> mha_fwd_nopage(
   // Non-paged decode supports its own (independent) set of head dims; see
   // FMHA_DECODE_NP_HEAD_DIMS in FMHADecodeXe20.cmake.
   TORCH_CHECK(
-      params.d == 64 || params.d == 72 || params.d == 96 || params.d == 128,
+      params.d == 64 || params.d == 72 || params.d == 96 || params.d == 128 || params.d == 192,
       "Unsupported head size for non-paged decode attention: ",
       params.d);
 
@@ -826,7 +826,7 @@ std::vector<at::Tensor> mha_fwd_nopage(
   // Non-paged prefill supports its own (independent) set of head dims; see
   // FMHA_PREFILL_NP_HEAD_DIMS in FMHAPrefillXe20.cmake.
   TORCH_CHECK(
-      params.d == 64 || params.d == 72 || params.d == 96 || params.d == 128,
+      params.d == 64 || params.d == 72 || params.d == 96 || params.d == 128 || params.d == 192,
       "Unsupported head size for non-paged prefill attention: ",
       params.d);
 
@@ -842,6 +842,9 @@ std::vector<at::Tensor> mha_fwd_nopage(
       break;
     case 128:
       DISPATCH_PREFILL_KERNEL(128);
+      break;
+    case 192:
+      DISPATCH_PREFILL_KERNEL(192);
       break;
     default:
       TORCH_CHECK(false, "Unsupported head size for non-paged prefill attention: ", params.d);

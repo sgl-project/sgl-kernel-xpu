@@ -41,6 +41,8 @@
 #include <cute/tensor.hpp>
 #include <sycl/sycl.hpp>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 #include "cutlass/bfloat16.h"
 #include "cutlass/cutlass.h"
@@ -54,8 +56,173 @@
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/half.h"
+#include "cutlass/layout/matrix.h"
+#include "sycl/SYCLHelpers.h"
 
 namespace at::native::xpu {
+
+//----------------- Compile-time perf knobs (LoRA-A forward) -----------------//
+// Pinned once here for every LoRA-A entry point (fp16/bf16 single GEMM) so the
+// tile / subgroup / layout mix lives in a single place.
+//   TileShape    = 256 x 256 x 32   -- canonical tile from upstream 04_bmg_grouped_gemm.
+//   ThreadLayout = 8 x 4 x 1        -- 32 subgroups per workgroup.
+//   LayoutB      = ColumnMajor      -- free-transpose B (auto copy atom transposes).
+//   PipelineStages = 2              -- matches the upstream BMG reference.
+using LoraAFwdTileShape = cute::Shape<cute::_256, cute::_256, cute::_32>;
+using LoraAFwdThreadLayout =
+    cute::Layout<cute::Shape<cute::_8, cute::_4, cute::_1>, cute::Stride<cute::_4, cute::_1, cute::_0>>;
+using LoraAFwdLayoutB = cutlass::layout::ColumnMajor;
+constexpr int kLoraAFwdPipelineStages = 2;
+
+//----------------- Shared device-side grouped-GEMM metadata ------------------//
+//
+// Per-segment problem sizes, element byte-offsets, and strides that the CUTLASS
+// pointer-array grouped GEMM consumes. Built on device by a single SYCL kernel
+// (one thread per segment) so the index tensors never leave the GPU -- matching
+// the on-device convention used elsewhere in this repo (see MoEPrepareInputs.cpp
+// and the Xe20 MoE grouped GEMM), rather than the D2H .cpu() path used before.
+//
+// For each segment s in [0, num_segments):
+//   M_s = seg_indptr[s+1] - seg_indptr[s]
+//   N   = stack_num * max_rank                (uniform across segments)
+//   K   = input_x.size(1) = input_dim         (uniform across segments)
+//
+//   a_off[s] = seg_indptr[s]        * K * elem_bytes    (into input_x)
+//   b_off[s] = weight_indices[s] * N * K * elem_bytes   (into weights)
+//   d_off[s] = seg_indptr[s]        * N * elem_bytes    (into output)
+
+struct GroupedGemmMeta {
+  torch::Tensor problem_sizes;  // int32 [num_segments, 3]  (M_s, N, K), on device
+  torch::Tensor stride_A;       // int64 [num_segments]     leading dim of A = K
+  torch::Tensor stride_B;       // int64 [num_segments]     leading dim of B = K
+  torch::Tensor stride_D;       // int64 [num_segments]     leading dim of D = N
+  torch::Tensor a_off;          // int64 [num_segments]     byte offset into A per segment (device)
+  torch::Tensor b_off;          // int64 [num_segments]     byte offset into B per segment (device)
+  torch::Tensor d_off;          // int64 [num_segments]     byte offset into D per segment (device)
+};
+
+// One thread per segment: derive M_s / lora_id from the index tensors and write
+// problem sizes, constant strides, and byte offsets straight into device memory.
+struct BuildGroupedGemmMetaKernel {
+  const int32_t* seg_indptr;      // [num_segments + 1]
+  const int32_t* weight_indices;  // [num_segments]
+  int32_t* problem_sizes;         // [num_segments * 3]
+  int64_t* stride_A;              // [num_segments]
+  int64_t* stride_B;              // [num_segments]
+  int64_t* stride_D;              // [num_segments]
+  int64_t* a_off;                 // [num_segments]
+  int64_t* b_off;                 // [num_segments]
+  int64_t* d_off;                 // [num_segments]
+  int N;
+  int K;
+  int64_t elem_bytes;
+  int num_segments;
+
+  void operator()(sycl::nd_item<1> item) const {
+    const int s = static_cast<int>(item.get_global_linear_id());
+    if (s >= num_segments) {
+      return;
+    }
+    const int32_t row_start = seg_indptr[s];
+    const int32_t M_s = seg_indptr[s + 1] - row_start;
+    const int32_t lora_id = weight_indices[s];
+
+    problem_sizes[3 * s + 0] = M_s;
+    // N is always the full stack_num * max_rank; per-adapter lora_ranks are NOT
+    // folded into the GEMM problem size. Every segment computes all N output
+    // columns, so the API contract is that weight rows beyond an adapter's rank
+    // R_l (i.e. rows j >= R_l within each stacked block) are pre-zeroed by the
+    // caller. Those rows still take part in the GEMM but contribute zeros,
+    // yielding the correct zero-padded output for ranks smaller than max_rank.
+    problem_sizes[3 * s + 1] = N;
+    problem_sizes[3 * s + 2] = K;
+
+    // Strides in elements (leading dim of A/B = K, D = N).
+    stride_A[s] = static_cast<int64_t>(K);
+    stride_B[s] = static_cast<int64_t>(K);
+    stride_D[s] = static_cast<int64_t>(N);
+
+    a_off[s] = static_cast<int64_t>(row_start) * K * elem_bytes;
+    b_off[s] = static_cast<int64_t>(lora_id) * static_cast<int64_t>(N) * K * elem_bytes;
+    d_off[s] = static_cast<int64_t>(row_start) * N * elem_bytes;
+  }
+};
+
+// One thread per segment: turn a base address + per-segment byte offset into an
+// absolute device pointer for the pointer-array grouped GEMM.
+struct MakeDevicePtrsKernel {
+  int64_t base_addr;
+  const int64_t* off_bytes;  // [num_segments]
+  int64_t* ptrs;             // [num_segments]
+  int num_segments;
+
+  void operator()(sycl::nd_item<1> item) const {
+    const int s = static_cast<int>(item.get_global_linear_id());
+    if (s >= num_segments) {
+      return;
+    }
+    ptrs[s] = base_addr + off_bytes[s];
+  }
+};
+
+// Round num_segments up to a whole number of work-groups of `wg` threads.
+template <typename Kernel>
+inline void submit_per_segment(sycl::queue& queue, int num_segments, Kernel kernel) {
+  constexpr int wg = 256;
+  const int64_t global = (static_cast<int64_t>(num_segments) + wg - 1) / wg * wg;
+  sycl_kernel_submit(sycl::range<1>(global), sycl::range<1>(wg), queue, kernel);
+}
+
+inline GroupedGemmMeta build_grouped_gemm_meta(
+    const torch::Tensor& seg_indptr_i32,      // int32 [num_segments + 1]
+    const torch::Tensor& weight_indices_i32,  // int32 [num_segments]
+    const int N,
+    const int K,
+    const int num_segments,
+    const int64_t elem_bytes,
+    const at::Device device,
+    sycl::queue& queue) {
+  auto opt_i32 = torch::TensorOptions().dtype(torch::kInt32).device(device);
+  auto opt_i64 = torch::TensorOptions().dtype(torch::kInt64).device(device);
+
+  GroupedGemmMeta meta;
+  meta.problem_sizes = torch::empty({num_segments, 3}, opt_i32);
+  meta.stride_A = torch::empty({num_segments}, opt_i64);
+  meta.stride_B = torch::empty({num_segments}, opt_i64);
+  meta.stride_D = torch::empty({num_segments}, opt_i64);
+  meta.a_off = torch::empty({num_segments}, opt_i64);
+  meta.b_off = torch::empty({num_segments}, opt_i64);
+  meta.d_off = torch::empty({num_segments}, opt_i64);
+
+  BuildGroupedGemmMetaKernel kernel{
+      seg_indptr_i32.data_ptr<int32_t>(),
+      weight_indices_i32.data_ptr<int32_t>(),
+      meta.problem_sizes.data_ptr<int32_t>(),
+      meta.stride_A.data_ptr<int64_t>(),
+      meta.stride_B.data_ptr<int64_t>(),
+      meta.stride_D.data_ptr<int64_t>(),
+      meta.a_off.data_ptr<int64_t>(),
+      meta.b_off.data_ptr<int64_t>(),
+      meta.d_off.data_ptr<int64_t>(),
+      N,
+      K,
+      elem_bytes,
+      num_segments};
+  submit_per_segment(queue, num_segments, kernel);
+  return meta;
+}
+
+// Turn a base tensor + device byte-offsets into a device int64 pointer array
+// (one absolute device address per segment) for the pointer-array grouped GEMM.
+inline torch::Tensor make_device_ptrs(const torch::Tensor& base, const torch::Tensor& off_bytes, sycl::queue& queue) {
+  const int64_t base_addr = reinterpret_cast<int64_t>(base.data_ptr());
+  const int num_segments = static_cast<int>(off_bytes.numel());
+  auto ptrs = torch::empty({num_segments}, off_bytes.options());
+
+  MakeDevicePtrsKernel kernel{base_addr, off_bytes.data_ptr<int64_t>(), ptrs.data_ptr<int64_t>(), num_segments};
+  submit_per_segment(queue, num_segments, kernel);
+  return ptrs;
+}
 
 template <typename T>
 struct ToCutlassElementType {
@@ -253,6 +420,54 @@ void launch_group_gemm_lora_fwd(
       status == cutlass::Status::kSuccess,
       "launch_group_gemm_lora_fwd: run failed: status=",
       cutlassGetStatusString(status));
+}
+
+//----------------- fp16 / bf16 launch (single grouped GEMM) ------------------//
+template <typename TensorDType>
+void launch_sgemm_lora_a_fwd(
+    const torch::Tensor& input_x,
+    const torch::Tensor& weights,
+    const torch::Tensor& seg_indptr_i32,
+    const torch::Tensor& weight_indices_i32,
+    torch::Tensor& output,
+    const int stack_num,
+    const int max_rank,
+    const int num_segments,
+    sycl::queue& queue) {
+  const int K = static_cast<int>(input_x.size(1));  // input_dim
+  const int N = stack_num * max_rank;               // output columns
+  const int64_t elem_bytes = static_cast<int64_t>(sizeof(TensorDType));
+  const auto device = input_x.device();
+
+  auto meta =
+      build_grouped_gemm_meta(seg_indptr_i32, weight_indices_i32, N, K, num_segments, elem_bytes, device, queue);
+
+  auto a_ptrs = make_device_ptrs(input_x, meta.a_off, queue);
+  auto b_ptrs = make_device_ptrs(weights, meta.b_off, queue);
+  auto d_ptrs = make_device_ptrs(output, meta.d_off, queue);
+
+  // The launcher uses the modern (non-legacy) grouped path
+  // (MainloopXeL1StagedGroup), which auto-selects the XMX DPAS MMA atom and all
+  // gmem load/store/prefetch copy atoms per dtype.
+  launch_group_gemm_lora_fwd<
+      TensorDType,
+      LoraAFwdTileShape,
+      LoraAFwdThreadLayout,
+      LoraAFwdLayoutB,
+      kLoraAFwdPipelineStages>(
+      queue,
+      meta.problem_sizes,
+      a_ptrs,
+      b_ptrs,
+      /*c_ptrs   =*/d_ptrs,
+      d_ptrs,
+      meta.stride_A,
+      meta.stride_B,
+      /*stride_C =*/meta.stride_D,
+      meta.stride_D,
+      num_segments,
+      /*alpha    =*/1.0f,
+      /*beta     =*/0.0f);
 }
 
 }  // namespace at::native::xpu

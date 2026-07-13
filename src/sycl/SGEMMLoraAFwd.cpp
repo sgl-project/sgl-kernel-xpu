@@ -35,174 +35,11 @@
 #define SYCL_INTEL_TARGET 20
 
 #include <ATen/ATen.h>
-#include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
-
-#include <sycl/sycl.hpp>
-#include <type_traits>
-#include <utility>
-#include <vector>
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
-#include "kernels/lora/group_gemm_lora_launcher.hpp"
-
-namespace {
-
-//----------------- Compile-time perf knobs (LoRA-A forward) -----------------//
-// Pinned once here for every LoRA-A entry point (fp16/bf16 single GEMM and the
-// fp32 3xTF32 path) so the tile / subgroup / layout mix lives in a single place.
-//   TileShape    = 256 x 256 x 32   -- canonical tile from upstream 04_bmg_grouped_gemm.
-//   ThreadLayout = 8 x 4 x 1        -- 32 subgroups per workgroup.
-//   LayoutB      = ColumnMajor      -- free-transpose B (auto copy atom transposes).
-//   PipelineStages = 2              -- matches the upstream BMG reference.
-using LoraAFwdTileShape = cute::Shape<cute::_256, cute::_256, cute::_32>;
-using LoraAFwdThreadLayout =
-    cute::Layout<cute::Shape<cute::_8, cute::_4, cute::_1>, cute::Stride<cute::_4, cute::_1, cute::_0>>;
-using LoraAFwdLayoutB = cutlass::layout::ColumnMajor;
-constexpr int kLoraAFwdPipelineStages = 2;
-
-//----------------- Shared host-side grouped-GEMM metadata --------------------//
-//
-// Per-segment problem sizes, element byte-offsets, and strides that the CUTLASS
-// pointer-array grouped GEMM consumes. Built once on the host and reused by
-// every GEMM in a launch (the fp32 3xTF32 path issues three GEMMs off one set).
-//
-// For each segment s in [0, num_segments):
-//   M_s = seg_indptr[s+1] - seg_indptr[s]
-//   N   = stack_num * max_rank                (uniform across segments)
-//   K   = input_x.size(1) = input_dim         (uniform across segments)
-//
-//   a_off[s] = seg_indptr[s]        * K * elem_bytes    (into input_x)
-//   b_off[s] = weight_indices[s] * N * K * elem_bytes   (into weights)
-//   d_off[s] = seg_indptr[s]        * N * elem_bytes    (into output)
-
-struct GroupedGemmMeta {
-  torch::Tensor problem_sizes;  // int32 [num_segments, 3]  (M_s, N, K), on device
-  torch::Tensor stride_A;       // int64 [num_segments]     leading dim of A = K
-  torch::Tensor stride_B;       // int64 [num_segments]     leading dim of B = K
-  torch::Tensor stride_D;       // int64 [num_segments]     leading dim of D = N
-  std::vector<int64_t> a_off;   // byte offset into A per segment (host)
-  std::vector<int64_t> b_off;   // byte offset into B per segment (host)
-  std::vector<int64_t> d_off;   // byte offset into D per segment (host)
-};
-
-GroupedGemmMeta build_grouped_gemm_meta(
-    const torch::Tensor& seg_indptr_i32,      // int32 [num_segments + 1]
-    const torch::Tensor& weight_indices_i32,  // int32 [num_segments]
-    const int N,
-    const int K,
-    const int num_segments,
-    const int64_t elem_bytes,
-    const at::Device device) {
-  auto seg_indptr_cpu = seg_indptr_i32.cpu().contiguous();
-  auto weight_indices_cpu = weight_indices_i32.cpu().contiguous();
-  const int32_t* seg_indptr_h = seg_indptr_cpu.data_ptr<int32_t>();
-  const int32_t* weight_indices_h = weight_indices_cpu.data_ptr<int32_t>();
-
-  std::vector<int32_t> problem_sizes_h(static_cast<size_t>(num_segments) * 3);
-  GroupedGemmMeta meta;
-  meta.a_off.resize(num_segments);
-  meta.b_off.resize(num_segments);
-  meta.d_off.resize(num_segments);
-
-  const int64_t b_per_lora_bytes = static_cast<int64_t>(N) * K * elem_bytes;
-  for (int s = 0; s < num_segments; ++s) {
-    const int32_t row_start = seg_indptr_h[s];
-    const int32_t M_s = seg_indptr_h[s + 1] - row_start;
-    const int32_t lora_id = weight_indices_h[s];
-
-    problem_sizes_h[3 * s + 0] = M_s;
-    // N is always the full stack_num * max_rank; per-adapter lora_ranks are NOT
-    // folded into the GEMM problem size. Every segment computes all N output
-    // columns, so the API contract is that weight rows beyond an adapter's rank
-    // R_l (i.e. rows j >= R_l within each stacked block) are pre-zeroed by the
-    // caller. Those rows still take part in the GEMM but contribute zeros,
-    // yielding the correct zero-padded output for ranks smaller than max_rank.
-    problem_sizes_h[3 * s + 1] = N;
-    problem_sizes_h[3 * s + 2] = K;
-
-    meta.a_off[s] = static_cast<int64_t>(row_start) * K * elem_bytes;
-    meta.b_off[s] = static_cast<int64_t>(lora_id) * b_per_lora_bytes;
-    meta.d_off[s] = static_cast<int64_t>(row_start) * N * elem_bytes;
-  }
-
-  // Strides in elements (leading dim of A/B = K, D = N).
-  std::vector<int64_t> stride_A_h(num_segments, static_cast<int64_t>(K));
-  std::vector<int64_t> stride_B_h(num_segments, static_cast<int64_t>(K));
-  std::vector<int64_t> stride_D_h(num_segments, static_cast<int64_t>(N));
-
-  auto cpu_i32 = torch::TensorOptions().dtype(torch::kInt32);
-  auto cpu_i64 = torch::TensorOptions().dtype(torch::kInt64);
-  meta.problem_sizes = torch::from_blob(problem_sizes_h.data(), {num_segments, 3}, cpu_i32).clone().to(device);
-  meta.stride_A = torch::from_blob(stride_A_h.data(), {num_segments}, cpu_i64).clone().to(device);
-  meta.stride_B = torch::from_blob(stride_B_h.data(), {num_segments}, cpu_i64).clone().to(device);
-  meta.stride_D = torch::from_blob(stride_D_h.data(), {num_segments}, cpu_i64).clone().to(device);
-  return meta;
-}
-
-// Turn a base tensor + host byte-offsets into a device int64 pointer array
-// (one absolute device address per segment) for the pointer-array grouped GEMM.
-torch::Tensor
-make_device_ptrs(const torch::Tensor& base, const std::vector<int64_t>& off_bytes, const at::Device device) {
-  const int64_t base_addr = reinterpret_cast<int64_t>(base.data_ptr());
-  const int num_segments = static_cast<int>(off_bytes.size());
-  std::vector<int64_t> ptrs_h(num_segments);
-  for (int s = 0; s < num_segments; ++s) {
-    ptrs_h[s] = base_addr + off_bytes[s];
-  }
-  auto cpu_i64 = torch::TensorOptions().dtype(torch::kInt64);
-  return torch::from_blob(ptrs_h.data(), {num_segments}, cpu_i64).clone().to(device);
-}
-
-//----------------- fp16 / bf16 launch (single grouped GEMM) ------------------//
-template <typename TensorDType>
-void launch_sgemm_lora_a_fwd(
-    const torch::Tensor& input_x,
-    const torch::Tensor& weights,
-    const torch::Tensor& seg_indptr_i32,
-    const torch::Tensor& weight_indices_i32,
-    torch::Tensor& output,
-    const int stack_num,
-    const int max_rank,
-    const int num_segments,
-    sycl::queue& queue) {
-  const int K = static_cast<int>(input_x.size(1));  // input_dim
-  const int N = stack_num * max_rank;               // output columns
-  const int64_t elem_bytes = static_cast<int64_t>(sizeof(TensorDType));
-  const auto device = input_x.device();
-
-  auto meta = build_grouped_gemm_meta(seg_indptr_i32, weight_indices_i32, N, K, num_segments, elem_bytes, device);
-
-  auto a_ptrs = make_device_ptrs(input_x, meta.a_off, device);
-  auto b_ptrs = make_device_ptrs(weights, meta.b_off, device);
-  auto d_ptrs = make_device_ptrs(output, meta.d_off, device);
-
-  // The launcher uses the modern (non-legacy) grouped path
-  // (MainloopXeL1StagedGroup), which auto-selects the XMX DPAS MMA atom and all
-  // gmem load/store/prefetch copy atoms per dtype.
-  at::native::xpu::launch_group_gemm_lora_fwd<
-      TensorDType,
-      LoraAFwdTileShape,
-      LoraAFwdThreadLayout,
-      LoraAFwdLayoutB,
-      kLoraAFwdPipelineStages>(
-      queue,
-      meta.problem_sizes,
-      a_ptrs,
-      b_ptrs,
-      /*c_ptrs   =*/d_ptrs,
-      d_ptrs,
-      meta.stride_A,
-      meta.stride_B,
-      /*stride_C =*/meta.stride_D,
-      meta.stride_D,
-      num_segments,
-      /*alpha    =*/1.0f,
-      /*beta     =*/0.0f);
-}
-
-}  // namespace
+#include "kernels/lora/device/sgemm_lora_a_fwd_dispatch.hpp"
 
 //----------------- Main API function --------------------//
 
@@ -282,22 +119,23 @@ void sgemm_lora_a_fwd(
   auto weight_indices_i32 =
       weight_indices.scalar_type() == torch::kInt32 ? weight_indices : weight_indices.to(torch::kInt32);
 
-  auto stream = at::xpu::getCurrentXPUStream();
-  auto queue = stream.queue();
-
   const int max_rank = static_cast<int>(max_rank_i64);
   const int num_segments = static_cast<int>(num_segments_i64);
   const int stack_num_ = static_cast<int>(stack_num);
 
-  // Dispatch kernel based on data type
-  if (weights.scalar_type() == torch::kHalf) {
-    launch_sgemm_lora_a_fwd<at::Half>(
-        input_x, weights, seg_indptr_i32, weight_indices_i32, output, stack_num_, max_rank, num_segments, queue);
-  } else if (weights.scalar_type() == torch::kBFloat16) {
-    launch_sgemm_lora_a_fwd<at::BFloat16>(
-        input_x, weights, seg_indptr_i32, weight_indices_i32, output, stack_num_, max_rank, num_segments, queue);
-  } else {
-    TORCH_CHECK(false, "Unsupported data type for weights");
+  // Dispatch kernel based on data type. Each launch symbol is defined in a
+  // separate generated translation unit (see SGEMMLoraAFwdXe20.cmake).
+  switch (weights.scalar_type()) {
+    case torch::kHalf:
+      lora::launch_sgemm_lora_a_fwd_half(
+          input_x, weights, seg_indptr_i32, weight_indices_i32, output, stack_num_, max_rank, num_segments);
+      break;
+    case torch::kBFloat16:
+      lora::launch_sgemm_lora_a_fwd_bf16(
+          input_x, weights, seg_indptr_i32, weight_indices_i32, output, stack_num_, max_rank, num_segments);
+      break;
+    default:
+      TORCH_CHECK(false, "Unsupported data type for weights");
   }
 }
 

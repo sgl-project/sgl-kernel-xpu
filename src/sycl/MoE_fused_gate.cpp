@@ -168,6 +168,7 @@ struct moe_fused_gate_impl {
       // QQ NOTE: currently fixed to pick top2 activated weight values in each expert group and sum them as the
       // group weight to select expert groups
       float max_sum = max_val + max_val_second;
+      // grouped_topk with softmax only uses the max value of each group rather than sum of top-2
       if (scoring_func_ == static_cast<int32_t>(ScoringFunc::kSoftmax)) {
         max_sum = max_val;
       }

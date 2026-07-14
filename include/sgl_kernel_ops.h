@@ -121,7 +121,9 @@ void topk_sigmoid(
     at::Tensor& topk_indices,
     at::Tensor& gating_output,
     bool renormalize,
-    const c10::optional<at::Tensor>& correction_bias);
+    const c10::optional<at::Tensor>& correction_bias,
+    double routed_scaling_factor,
+    int64_t num_fused_shared_experts);
 
 std::tuple<at::Tensor, at::Tensor> rotary_embedding(
     at::Tensor& positions,
@@ -312,7 +314,9 @@ void topk_sigmoid(
     torch::Tensor& topk_indices,
     torch::Tensor& gating_output,
     bool renormalize,
-    const std::optional<torch::Tensor>& correction_bias);
+    const std::optional<torch::Tensor>& correction_bias,
+    double routed_scaling_factor,
+    int64_t num_fused_shared_experts);
 torch::Tensor swiglu_gpt_oss_sigmoid_alpha(torch::Tensor x, double alpha, double limit);
 
 std::vector<at::Tensor> moe_fused_gate(

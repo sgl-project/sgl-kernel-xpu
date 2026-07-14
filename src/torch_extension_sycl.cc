@@ -55,7 +55,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def(
       "topk_sigmoid(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, Tensor? "
-      "correction_bias) -> ()");
+      "correction_bias, float routed_scaling_factor=1.0, int num_fused_shared_experts=0) -> ()");
   m.impl("topk_sigmoid", torch::kXPU, &at::native::xpu::topk_sigmoid);
 
   m.def("top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val) -> ()");

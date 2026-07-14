@@ -174,10 +174,17 @@ inline void dispatchFusedQKNormRopeVecSize(int64_t vec_size, Fn&& fn) {
 }
 
 // Picks the largest power-of-two width (<= max_vec_size) for which every
-// pointer in `ptrs` is aligned to `elem_size * vec_size` bytes, shrinking to
-// 1 (always safe) if needed. Only the physical load/store chunk width
-// shrinks; the per-lane algorithmic element count is unaffected.
-inline int64_t pick_aligned_vec_size(int64_t max_vec_size, int64_t elem_size, std::initializer_list<const void*> ptrs) {
+// pointer in `ptrs` is aligned to `elem_size * vec_size` bytes and every
+// stride in `elem_strides` (elements; row strides for non-contiguous q/k)
+// is a multiple of vec_size, shrinking to 1 (always safe) if needed.
+// `elem_strides` defaults to empty for fully contiguous callers. Only the
+// physical load/store chunk width shrinks; the per-lane algorithmic
+// element count is unaffected.
+inline int64_t pick_aligned_vec_size(
+    int64_t max_vec_size,
+    int64_t elem_size,
+    std::initializer_list<const void*> ptrs,
+    std::initializer_list<int64_t> elem_strides = {}) {
   int64_t vec_size = max_vec_size;
   while (vec_size > 1) {
     const int64_t align_bytes = elem_size * vec_size;
@@ -186,6 +193,14 @@ inline int64_t pick_aligned_vec_size(int64_t max_vec_size, int64_t elem_size, st
       if (reinterpret_cast<uintptr_t>(p) % align_bytes != 0) {
         all_aligned = false;
         break;
+      }
+    }
+    if (all_aligned) {
+      for (int64_t stride : elem_strides) {
+        if (stride % vec_size != 0) {
+          all_aligned = false;
+          break;
+        }
       }
     }
     if (all_aligned) break;
@@ -585,8 +600,12 @@ void fused_qk_norm_rope(
 }
 
 // SYCL Kernel for Fused QK Norm + RoPE using a precomputed cos/sin cache
-// (mirrors CUDA's qknorm_rope.cuh). q/k must be 3D contiguous tensors:
-// [num_tokens, num_heads, head_dim].
+// (mirrors CUDA's qknorm_rope.cuh). q/k must be 3D tensors (after flattening
+// any leading batch/seq dims): [num_tokens, num_heads, head_dim]. Only the
+// last dimension (head_dim) is required to be contiguous; the token and head
+// strides may be arbitrary (e.g. q/k sliced out of a larger packed buffer),
+// so they are passed in explicitly rather than assumed to equal
+// num_heads * head_dim / head_dim.
 template <int64_t kHeadDim, bool kIsNeox, typename scalar_t, typename IdType, int64_t kVecSize>
 struct FusedQKNormRopeCacheKernel {
   static_assert(kHeadDim <= 256, "Only head_dim <= 256 is supported");
@@ -606,8 +625,10 @@ struct FusedQKNormRopeCacheKernel {
   int64_t rope_dim;
   int64_t rotary_lanes;
   int64_t half_rotary_lanes;
-  int64_t q_token_stride;  // elements between consecutive tokens in q (== num_qo_heads * kHeadDim)
-  int64_t k_token_stride;  // elements between consecutive tokens in k (== num_kv_heads * kHeadDim)
+  int64_t q_token_stride;  // elements between consecutive tokens in q
+  int64_t k_token_stride;  // elements between consecutive tokens in k
+  int64_t q_head_stride;   // elements between consecutive heads in q (may differ from kHeadDim)
+  int64_t k_head_stride;   // elements between consecutive heads in k (may differ from kHeadDim)
   uint32_t num_qo_heads;
   uint32_t num_kv_heads;
   uint32_t num_tokens;
@@ -632,11 +653,13 @@ struct FusedQKNormRopeCacheKernel {
       scalar_t* row_ptr;
       const scalar_t* weight_ptr;
       if (load_q) {
-        row_ptr = q_ptr + static_cast<int64_t>(token_id) * q_token_stride + static_cast<int64_t>(head_id) * kHeadDim;
+        row_ptr =
+            q_ptr + static_cast<int64_t>(token_id) * q_token_stride + static_cast<int64_t>(head_id) * q_head_stride;
         weight_ptr = q_weight_ptr;
       } else {
         const uint32_t k_head_id = head_id - num_qo_heads;
-        row_ptr = k_ptr + static_cast<int64_t>(token_id) * k_token_stride + static_cast<int64_t>(k_head_id) * kHeadDim;
+        row_ptr =
+            k_ptr + static_cast<int64_t>(token_id) * k_token_stride + static_cast<int64_t>(k_head_id) * k_head_stride;
         weight_ptr = k_weight_ptr;
       }
 
@@ -734,6 +757,8 @@ void launchFusedQKNormRopeCacheVecImpl(
     const IdType* positions_ptr,
     int64_t q_token_stride,
     int64_t k_token_stride,
+    int64_t q_head_stride,
+    int64_t k_head_stride,
     int64_t num_tokens,
     int64_t num_qo_heads,
     int64_t num_kv_heads,
@@ -757,6 +782,8 @@ void launchFusedQKNormRopeCacheVecImpl(
       half_rotary_lanes,
       q_token_stride,
       k_token_stride,
+      q_head_stride,
+      k_head_stride,
       static_cast<uint32_t>(num_qo_heads),
       static_cast<uint32_t>(num_kv_heads),
       static_cast<uint32_t>(num_tokens),
@@ -775,6 +802,8 @@ void launchFusedQKNormRopeCacheImpl(
     const IdType* positions_ptr,
     int64_t q_token_stride,
     int64_t k_token_stride,
+    int64_t q_head_stride,
+    int64_t k_head_stride,
     int64_t num_tokens,
     int64_t num_qo_heads,
     int64_t num_kv_heads,
@@ -796,8 +825,14 @@ void launchFusedQKNormRopeCacheImpl(
         rotary_lanes);
   }
   const int64_t maxVecSize = std::min<int64_t>(kElemsPerThread, maxHwVecSize(sizeof(scalar_t)));
-  const int64_t vec_size =
-      pick_aligned_vec_size(maxVecSize, sizeof(scalar_t), {q_ptr, k_ptr, q_weight_ptr, k_weight_ptr});
+  // q/k rows may be non-contiguous beyond the last dimension (e.g. sliced
+  // out of a larger packed buffer), so the chosen vector width must also
+  // divide the token/head strides, not just satisfy base-pointer alignment.
+  const int64_t vec_size = pick_aligned_vec_size(
+      maxVecSize,
+      sizeof(scalar_t),
+      {q_ptr, k_ptr, q_weight_ptr, k_weight_ptr},
+      {q_token_stride, k_token_stride, q_head_stride, k_head_stride});
 
   dispatchFusedQKNormRopeVecSize<kElemsPerThread>(vec_size, [&](auto vec_size_tag) {
     constexpr int64_t kVecSize = decltype(vec_size_tag)::value;
@@ -810,6 +845,8 @@ void launchFusedQKNormRopeCacheImpl(
         positions_ptr,
         q_token_stride,
         k_token_stride,
+        q_head_stride,
+        k_head_stride,
         num_tokens,
         num_qo_heads,
         num_kv_heads,
@@ -840,9 +877,13 @@ void fused_qk_norm_rope_with_cos_sin_cache_inplace(
   TORCH_CHECK(cos_sin_cache.scalar_type() == at::ScalarType::Float, "cos_sin_cache must be float32");
 
   CHECK_DEVICE(q);
-  CHECK_CONTIGUOUS(q);
+  // Only the last dimension (head_dim) needs to be contiguous; q/k may be
+  // views sliced out of a larger packed buffer (e.g. per-head strides that
+  // don't equal head_dim), so full tensor contiguity is not required. Token
+  // and head strides are read directly below instead of being assumed.
+  TORCH_CHECK(q.stride(-1) == 1, "q must be contiguous in its last dimension (head_dim)");
   CHECK_DEVICE(k);
-  CHECK_CONTIGUOUS(k);
+  TORCH_CHECK(k.stride(-1) == 1, "k must be contiguous in its last dimension (head_dim)");
   CHECK_DEVICE(q_weight);
   CHECK_CONTIGUOUS(q_weight);
   CHECK_DEVICE(k_weight);
@@ -851,6 +892,17 @@ void fused_qk_norm_rope_with_cos_sin_cache_inplace(
   CHECK_CONTIGUOUS(cos_sin_cache);
   CHECK_DEVICE(positions);
   CHECK_CONTIGUOUS(positions);
+
+  if (q.dim() == 4) {
+    TORCH_CHECK(
+        q.stride(0) == q.size(1) * q.stride(1),
+        "q batch and sequence dimensions must be mergeable (i.e. contiguous with each other) for 4D input");
+  }
+  if (k.dim() == 4) {
+    TORCH_CHECK(
+        k.stride(0) == k.size(1) * k.stride(1),
+        "k batch and sequence dimensions must be mergeable (i.e. contiguous with each other) for 4D input");
+  }
 
   auto q_view = q.dim() == 4 ? q.view({-1, q.size(2), q.size(3)}) : q;
   auto k_view = k.dim() == 4 ? k.view({-1, k.size(2), k.size(3)}) : k;
@@ -862,6 +914,8 @@ void fused_qk_norm_rope_with_cos_sin_cache_inplace(
   const int64_t num_qo_heads = q_view.size(1);
   const int64_t num_kv_heads = k_view.size(1);
   const int64_t head_dim = q_view.size(2);
+  const int64_t q_head_stride = q_view.stride(1);
+  const int64_t k_head_stride = k_view.stride(1);
 
   TORCH_CHECK(q_weight.dim() == 1, "q_weight must be 1D [head_dim]");
   TORCH_CHECK(k_weight.dim() == 1, "k_weight must be 1D [head_dim]");
@@ -897,6 +951,8 @@ void fused_qk_norm_rope_with_cos_sin_cache_inplace(
                           static_cast<const IdType*>(positions.data_ptr()),
                           q_view.stride(0),
                           k_view.stride(0),
+                          q_head_stride,
+                          k_head_stride,
                           num_tokens,
                           num_qo_heads,
                           num_kv_heads,
@@ -913,6 +969,8 @@ void fused_qk_norm_rope_with_cos_sin_cache_inplace(
                           static_cast<const IdType*>(positions.data_ptr()),
                           q_view.stride(0),
                           k_view.stride(0),
+                          q_head_stride,
+                          k_head_stride,
                           num_tokens,
                           num_qo_heads,
                           num_kv_heads,

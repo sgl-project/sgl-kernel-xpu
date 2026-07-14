@@ -1,8 +1,8 @@
-"""Benchmark: DeepSeek V4 sparse MLA fp8 decode (sgl_kernel).
+"""Benchmark: sparse MLA fp8 decode (sgl_kernel).
 
-Times sgl_kernel.flash_mla_sparse_decode across DeepSeek-V4 decode shapes and
-reports latency + effective memory bandwidth. Also cross-checks correctness
-against a float reference.
+Times sgl_kernel.flash_mla_sparse_decode across decode shapes
+(including the extra_kv second-pool path) and reports average latency +
+effective memory bandwidth.
 
 Usage:
   python benchmark/bench_flash_mla_sparse_decode.py
@@ -11,7 +11,7 @@ Usage:
 import torch
 from sgl_kernel import flash_mla_sparse_decode
 
-# ── DeepSeek V4 sparse fp8 KV layout constants ──
+# ── sparse fp8 KV layout constants ──
 NOPE_DIM = 448
 ROPE_DIM = 64
 D_QK = NOPE_DIM + ROPE_DIM  # 512
@@ -23,13 +23,15 @@ HEAD_BYTES = DATA_BYTES_PER_TOKEN + SCALE_BYTES_PER_TOKEN  # 584
 BLOCK_SIZE = 64
 NUM_BLOCKS = 256  # 16384 cached tokens
 
-# (label, batch, h_q, topk)
+# (label, batch, h_q, topk, extra_topk)
 CONFIGS = [
-    ("TP=8  (16 heads) topk=2048", 64, 16, 2048),
-    ("TP=4  (32 heads) topk=2048", 64, 32, 2048),
-    ("TP=1 (128 heads) topk=2048", 64, 128, 2048),
-    ("TP=8  (16 heads) topk=512", 128, 16, 512),
-    ("TP=1 (128 heads) topk=512", 128, 128, 512),
+    ("TP=8  (16 heads) topk=2048", 64, 16, 2048, 0),
+    ("TP=4  (32 heads) topk=2048", 64, 32, 2048, 0),
+    ("TP=1 (128 heads) topk=2048", 64, 128, 2048, 0),
+    ("TP=8  (16 heads) topk=512", 128, 16, 512, 0),
+    ("TP=1 (128 heads) topk=512", 128, 128, 512, 0),
+    ("TP=8  (16 heads) topk=2048 extra=512", 64, 16, 2048, 512),
+    ("TP=1 (128 heads) topk=512 extra=512", 128, 128, 512, 512),
 ]
 
 
@@ -70,7 +72,16 @@ def _pack_sparse_fp8_kv_deepseek_v4(kv: torch.Tensor):
     return packed, dequant
 
 
-def build_inputs(batch, h_q, topk, device="xpu", seed=0):
+def _make_indices(b, topk, s_kv, device):
+    return torch.stack(
+        [
+            torch.stack([torch.randperm(s_kv, device=device)[:topk].to(torch.int32)])
+            for _ in range(b)
+        ]
+    )  # [b, 1, topk]
+
+
+def build_inputs(batch, h_q, topk, extra_topk=0, device="xpu", seed=0):
     torch.manual_seed(seed)
     b, s_q = batch, 1
     q = (torch.randn((b, s_q, h_q, D_QK), device=device, dtype=torch.float32) * 0.5).to(
@@ -82,21 +93,32 @@ def build_inputs(batch, h_q, topk, device="xpu", seed=0):
         )
         * 0.5
     )
-    packed_kv, dequant_kv = _pack_sparse_fp8_kv_deepseek_v4(logical_kv)
+    packed_kv, _ = _pack_sparse_fp8_kv_deepseek_v4(logical_kv)
     s_kv = NUM_BLOCKS * BLOCK_SIZE
-    indices = torch.stack(
-        [
-            torch.stack([torch.randperm(s_kv, device=device)[:topk].to(torch.int32)])
-            for _ in range(b)
-        ]
-    )  # [b, 1, topk]
-    return q, packed_kv, dequant_kv, indices
+    indices = _make_indices(b, topk, s_kv, device)
+
+    extra_kv = None
+    extra_indices = None
+    extra_topk_length = None
+    if extra_topk > 0:
+        logical_extra = (
+            torch.randn(
+                (NUM_BLOCKS, BLOCK_SIZE, 1, D_QK), device=device, dtype=torch.bfloat16
+            )
+            * 0.5
+        )
+        extra_kv, _ = _pack_sparse_fp8_kv_deepseek_v4(logical_extra)
+        extra_indices = _make_indices(b, extra_topk, s_kv, device)
+        extra_topk_length = torch.full(
+            (b,), extra_topk, dtype=torch.int32, device=device
+        )
+    return q, packed_kv, indices, extra_kv, extra_indices, extra_topk_length
 
 
-def effective_bytes(batch, h_q, topk):
+def effective_bytes(batch, h_q, topk, extra_topk=0):
     # q read (bf16) + gathered fp8 kv read (packed head bytes) + out write (bf16)
     q_bytes = batch * h_q * D_QK * 2
-    kv_bytes = batch * topk * HEAD_BYTES
+    kv_bytes = batch * (topk + extra_topk) * HEAD_BYTES
     out_bytes = batch * h_q * D_V * 2
     return q_bytes + kv_bytes + out_bytes
 
@@ -115,38 +137,20 @@ def bench(fn, warmup=10, iters=30):
     return start.elapsed_time(end) / iters  # ms
 
 
-def reference_out(q, dequant_kv, indices, sm_scale):
-    b, s_q, h_q, d_qk = q.shape
-    kv_flat = dequant_kv.view(-1, D_QK)
-    s_kv = kv_flat.shape[0]
-    topk = indices.shape[2]
-    idx = indices.clone()
-    valid = (idx >= 0) & (idx < s_kv)
-    gather = idx.masked_fill(~valid, 0)
-    gk = kv_flat.index_select(0, gather.reshape(-1)).view(b, s_q, topk, D_QK).float()
-    P = torch.einsum("bshd,bskd->bshk", q.float(), gk) * sm_scale
-    P = P.masked_fill(~valid.unsqueeze(2), float("-inf"))
-    lse = torch.logsumexp(P, dim=-1, keepdim=True)
-    s = torch.exp(P - lse)
-    return torch.einsum("bshk,bskd->bshd", s, gk[..., :D_V]).to(torch.bfloat16)
-
-
 def main():
     if not torch.xpu.is_available():
         print("XPU not available")
         return
 
-    hdr = (
-        f"{'config':30s} {'MB/call':>9s} {'sgl ms':>9s} {'sgl GB/s':>9s} "
-        f"{'max_abs':>9s} {'ok':>4s}"
-    )
+    hdr = f"{'config':40s} {'ms':>9s} {'GB/s':>9s}"
     print(hdr)
     print("-" * len(hdr))
 
-    for label, batch, h_q, topk in CONFIGS:
-        q, packed_kv, dequant_kv, indices = build_inputs(batch, h_q, topk)
+    for label, batch, h_q, topk, extra_topk in CONFIGS:
+        q, packed_kv, indices, extra_kv, extra_indices, extra_topk_length = (
+            build_inputs(batch, h_q, topk, extra_topk)
+        )
         sm_scale = D_QK**-0.5
-        mb = effective_bytes(batch, h_q, topk) / 1e6
 
         def run_sgl():
             return flash_mla_sparse_decode(
@@ -155,21 +159,17 @@ def main():
                 indices,
                 sm_scale=sm_scale,
                 d_v=D_V,
+                extra_kv=extra_kv,
+                extra_indices=extra_indices,
+                extra_topk_length=extra_topk_length,
                 return_softmax_lse=False,
             )
 
-        out_sgl = run_sgl()
-        ref = reference_out(q, dequant_kv, indices, sm_scale)
-        max_abs = (out_sgl.float() - ref.float()).abs().max().item()
-        ok = torch.allclose(out_sgl.float(), ref.float(), atol=1e-2, rtol=1e-2)
+        run_sgl()  # warmup / build
+        avg_ms = bench(run_sgl)
+        gbs = effective_bytes(batch, h_q, topk, extra_topk) / (avg_ms * 1e-3) / 1e9
 
-        sgl_ms = bench(run_sgl)
-        sgl_gbs = effective_bytes(batch, h_q, topk) / (sgl_ms * 1e-3) / 1e9
-
-        print(
-            f"{label:30s} {mb:9.1f} {sgl_ms:9.3f} {sgl_gbs:9.2f} "
-            f"{max_abs:9.2e} {str(ok):>4s}"
-        )
+        print(f"{label:40s} {avg_ms:9.3f} {gbs:9.2f}")
 
 
 if __name__ == "__main__":

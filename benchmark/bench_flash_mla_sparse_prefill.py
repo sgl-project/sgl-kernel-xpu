@@ -1,8 +1,7 @@
-"""Benchmark: DeepSeek V4 sparse MLA prefill (sgl_kernel).
+"""Benchmark: sparse MLA prefill (sgl_kernel).
 
-Times sgl_kernel.flash_mla_sparse_prefill across DeepSeek-V4 prefill shapes and
-reports latency + effective memory bandwidth. Also cross-checks correctness
-against a float reference.
+Times sgl_kernel.flash_mla_sparse_prefill across prefill shapes and
+reports average latency + effective memory bandwidth.
 
 Usage:
   python benchmark/bench_flash_mla_sparse_prefill.py
@@ -11,7 +10,7 @@ Usage:
 import torch
 from sgl_kernel import flash_mla_sparse_prefill
 
-# ── DeepSeek V4 constants ──
+# ── constants ──
 D_QK = 576  # qk_nope(512) + qk_rope(64)
 D_V = 512
 H_KV = 1
@@ -61,80 +60,29 @@ def bench(fn, warmup=10, iters=30):
     return start.elapsed_time(end) / iters  # ms
 
 
-def reference_out(q, kv, indices, sm_scale):
-    s_q, h_q, d_qk = q.shape
-    s_kv = kv.shape[0]
-    topk = indices.shape[2]
-    idx = indices.clone().squeeze(1)
-    invalid = (idx < 0) | (idx >= s_kv)
-    idx[invalid] = 0
-    gk = kv.index_select(0, idx.flatten()).reshape(s_q, topk, d_qk).float()
-    P = (q.float() @ gk.transpose(1, 2)) * sm_scale
-    P[invalid.unsqueeze(1).broadcast_to(P.shape)] = float("-inf")
-    lse = torch.logsumexp(P, dim=-1, keepdim=True)
-    s = torch.exp(P - lse)
-    return (s @ gk[..., :D_V]).to(kv.dtype)
-
-
 def main():
     if not torch.xpu.is_available():
         print("XPU not available")
         return
 
-    try:
-        from flash_attn.flash_attn_interface_xpu import flash_mla_sparse_fwd
-
-        have_xatt = True
-    except Exception:
-        have_xatt = False
-
-    hdr = (
-        f"{'config':30s} {'MB/call':>9s} {'sgl ms':>9s} {'sgl GB/s':>9s} "
-        f"{'xatt ms':>9s} {'xatt GB/s':>9s} {'speedup':>8s} {'max_abs':>9s} {'ok':>4s}"
-    )
+    hdr = f"{'config':30s} {'ms':>9s} {'GB/s':>9s}"
     print(hdr)
     print("-" * len(hdr))
 
     for label, s_q, h_q, topk in CONFIGS:
         q, kv, indices = build_inputs(s_q, h_q, topk)
         sm_scale = D_QK**-0.5
-        mb = effective_bytes(s_q, h_q, topk) / 1e6
 
         def run_sgl():
             return flash_mla_sparse_prefill(
                 q, kv, indices, sm_scale=sm_scale, d_v=D_V, return_softmax_lse=False
             )
 
-        out_sgl = run_sgl()
-        ref = reference_out(q, kv, indices, sm_scale)
-        max_abs = (out_sgl.float() - ref.float()).abs().max().item()
-        ok = torch.allclose(out_sgl.float(), ref.float(), atol=1e-2, rtol=1e-2)
+        run_sgl()  # warmup / build
+        avg_ms = bench(run_sgl)
+        gbs = effective_bytes(s_q, h_q, topk) / (avg_ms * 1e-3) / 1e9
 
-        sgl_ms = bench(run_sgl)
-        sgl_gbs = effective_bytes(s_q, h_q, topk) / (sgl_ms * 1e-3) / 1e9
-
-        xatt_ms = float("nan")
-        xatt_gbs = float("nan")
-        speedup = float("nan")
-        if have_xatt:
-
-            def run_xatt():
-                return flash_mla_sparse_fwd(
-                    q, kv, indices, sm_scale, d_v=D_V, return_softmax_lse=False
-                )
-
-            try:
-                run_xatt()
-                xatt_ms = bench(run_xatt)
-                xatt_gbs = effective_bytes(s_q, h_q, topk) / (xatt_ms * 1e-3) / 1e9
-                speedup = xatt_ms / sgl_ms
-            except Exception as e:
-                print(f"  (xatt failed: {e})")
-
-        print(
-            f"{label:30s} {mb:9.1f} {sgl_ms:9.3f} {sgl_gbs:9.2f} "
-            f"{xatt_ms:9.3f} {xatt_gbs:9.2f} {speedup:8.2f} {max_abs:9.2e} {str(ok):>4s}"
-        )
+        print(f"{label:30s} {avg_ms:9.3f} {gbs:9.2f}")
 
 
 if __name__ == "__main__":

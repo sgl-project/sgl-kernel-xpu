@@ -29,7 +29,7 @@
  *
  **************************************************************************************************/
 /*! \file
-    \brief CUTLASS pointer-array grouped GEMM launcher for LoRA-A/B forward.
+    \brief Shared CUTLASS pointer-array grouped GEMM launcher core for LoRA forward. 
 */
 
 #pragma once
@@ -61,31 +61,14 @@
 
 namespace at::native::xpu {
 
-//----------------- Compile-time perf knobs (LoRA-A forward) -----------------//
-// Pinned once here for every LoRA-A entry point (fp16/bf16 single GEMM) so the
-// tile / subgroup / layout mix lives in a single place.
-//   TileShape    = 256 x 256 x 32   -- canonical tile from upstream 04_bmg_grouped_gemm.
-//   ThreadLayout = 8 x 4 x 1        -- 32 subgroups per workgroup.
-//   LayoutB      = ColumnMajor      -- free-transpose B (auto copy atom transposes).
-//   PipelineStages = 2              -- matches the upstream BMG reference.
-using LoraAFwdTileShape = cute::Shape<cute::_256, cute::_256, cute::_32>;
-using LoraAFwdThreadLayout =
-    cute::Layout<cute::Shape<cute::_8, cute::_4, cute::_1>, cute::Stride<cute::_4, cute::_1, cute::_0>>;
-using LoraAFwdLayoutB = cutlass::layout::ColumnMajor;
-constexpr int kLoraAFwdPipelineStages = 2;
-
 //----------------- Shared device-side grouped-GEMM metadata ------------------//
 //
 // Per-segment problem sizes, element byte-offsets, and strides that the CUTLASS
 // pointer-array grouped GEMM consumes. Built on device by a single SYCL kernel
-// (one thread per segment) so the index tensors never leave the GPU -- matching
-// the on-device convention used elsewhere in this repo (see MoEPrepareInputs.cpp
-// and the Xe20 MoE grouped GEMM), rather than the D2H .cpu() path used before.
+// (one thread per segment) 
 //
 // For each segment s in [0, num_segments):
 //   M_s = seg_indptr[s+1] - seg_indptr[s]
-//   N   = stack_num * max_rank                (uniform across segments)
-//   K   = input_x.size(1) = input_dim         (uniform across segments)
 //
 //   a_off[s] = seg_indptr[s]        * K * elem_bytes    (into input_x)
 //   b_off[s] = weight_indices[s] * N * K * elem_bytes   (into weights)
@@ -128,12 +111,6 @@ struct BuildGroupedGemmMetaKernel {
     const int32_t lora_id = weight_indices[s];
 
     problem_sizes[3 * s + 0] = M_s;
-    // N is always the full stack_num * max_rank; per-adapter lora_ranks are NOT
-    // folded into the GEMM problem size. Every segment computes all N output
-    // columns, so the API contract is that weight rows beyond an adapter's rank
-    // R_l (i.e. rows j >= R_l within each stacked block) are pre-zeroed by the
-    // caller. Those rows still take part in the GEMM but contribute zeros,
-    // yielding the correct zero-padded output for ranks smaller than max_rank.
     problem_sizes[3 * s + 1] = N;
     problem_sizes[3 * s + 2] = K;
 
@@ -420,54 +397,6 @@ void launch_group_gemm_lora_fwd(
       status == cutlass::Status::kSuccess,
       "launch_group_gemm_lora_fwd: run failed: status=",
       cutlassGetStatusString(status));
-}
-
-//----------------- fp16 / bf16 launch (single grouped GEMM) ------------------//
-template <typename TensorDType>
-void launch_sgemm_lora_a_fwd(
-    const torch::Tensor& input_x,
-    const torch::Tensor& weights,
-    const torch::Tensor& seg_indptr_i32,
-    const torch::Tensor& weight_indices_i32,
-    torch::Tensor& output,
-    const int stack_num,
-    const int max_rank,
-    const int num_segments,
-    sycl::queue& queue) {
-  const int K = static_cast<int>(input_x.size(1));  // input_dim
-  const int N = stack_num * max_rank;               // output columns
-  const int64_t elem_bytes = static_cast<int64_t>(sizeof(TensorDType));
-  const auto device = input_x.device();
-
-  auto meta =
-      build_grouped_gemm_meta(seg_indptr_i32, weight_indices_i32, N, K, num_segments, elem_bytes, device, queue);
-
-  auto a_ptrs = make_device_ptrs(input_x, meta.a_off, queue);
-  auto b_ptrs = make_device_ptrs(weights, meta.b_off, queue);
-  auto d_ptrs = make_device_ptrs(output, meta.d_off, queue);
-
-  // The launcher uses the modern (non-legacy) grouped path
-  // (MainloopXeL1StagedGroup), which auto-selects the XMX DPAS MMA atom and all
-  // gmem load/store/prefetch copy atoms per dtype.
-  launch_group_gemm_lora_fwd<
-      TensorDType,
-      LoraAFwdTileShape,
-      LoraAFwdThreadLayout,
-      LoraAFwdLayoutB,
-      kLoraAFwdPipelineStages>(
-      queue,
-      meta.problem_sizes,
-      a_ptrs,
-      b_ptrs,
-      /*c_ptrs   =*/d_ptrs,
-      d_ptrs,
-      meta.stride_A,
-      meta.stride_B,
-      /*stride_C =*/meta.stride_D,
-      meta.stride_D,
-      num_segments,
-      /*alpha    =*/1.0f,
-      /*beta     =*/0.0f);
 }
 
 }  // namespace at::native::xpu

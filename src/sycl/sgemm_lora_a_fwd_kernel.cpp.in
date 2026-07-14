@@ -36,8 +36,8 @@
 
 #include <sycl/sycl.hpp>
 
-#include "sycl/kernels/lora/device/group_gemm_lora_launcher.hpp"
 #include "sycl/kernels/lora/device/sgemm_lora_a_fwd_dispatch.hpp"
+#include "sycl/kernels/lora/device/sgemm_lora_a_fwd_launcher.hpp"
 
 namespace lora {
 

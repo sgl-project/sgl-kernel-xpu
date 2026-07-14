@@ -1,5 +1,4 @@
 // DeepSeek V4 Sparse MLA prefill (dense gather + fused attention).
-// Ported from xattention (csrc/flash_attn_xpu/sparse_mla_fwd.cpp) into sgl-kernel-xpu.
 #ifndef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET 20
 #endif
@@ -7,12 +6,14 @@
 #include <ATen/xpu/XPUContext.h>
 #include <torch/all.h>
 
+// Include torch/python.h (via flash_common_xpu.hpp) before any cute header, which
+// defines a `printf` macro that otherwise breaks torch's pythoncapi_compat.h.
 #include "cutlass/bfloat16.h"
 #include "cutlass/kernel_hardware_info.h"
-#include "kernels/mla_sparse_xattn/flash.h"
-#include "kernels/mla_sparse_xattn/flash_common_xpu.hpp"
-#include "kernels/mla_sparse_xattn/namespace_config.h"
-#include "kernels/mla_sparse_xattn/utils.h"
+#include "kernels/mla_sparse/flash.h"
+#include "kernels/mla_sparse/flash_common_xpu.hpp"
+#include "kernels/mla_sparse/namespace_config.h"
+#include "kernels/mla_sparse/utils.h"
 
 namespace FLASH_NAMESPACE {
 

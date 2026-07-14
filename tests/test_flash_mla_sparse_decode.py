@@ -1,4 +1,4 @@
-"""Correctness tests for DeepSeek V4 sparse MLA fp8 decode (ported from xattention).
+"""Correctness tests for DeepSeek V4 sparse MLA fp8 decode.
 
 Run: pytest tests/test_flash_mla_sparse_decode.py
 """

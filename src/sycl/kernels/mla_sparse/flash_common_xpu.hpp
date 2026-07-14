@@ -5,9 +5,18 @@
 #pragma once
 #include <limits>
 
+// cute/util/print.hpp defines `printf` as a function-like macro
+// (sycl::ext::oneapi::experimental::printf). If it is active when the torch /
+// Python headers are parsed, it corrupts declarations such as
+// `Py_GCC_ATTRIBUTE((format(printf, 2, 3)))`. Shield the torch includes.
+#pragma push_macro("printf")
+#undef printf
+
 // Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
 #include <torch/nn/functional.h>
 #include <torch/python.h>
+
+#pragma pop_macro("printf")
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_xpu(), #x " must be on XPU")
 #define CHECK_SHAPE(x, ...) \

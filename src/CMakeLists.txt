@@ -3,10 +3,6 @@
 file(GLOB device_cpp "sycl/*.cpp" "sycl/*.sycl")
 file(GLOB host_cpp "./*.cpp" "./*.cc")
 
-# Disabled: sgl's own sparse MLA decode implementation (kernels/mla_sparse).
-# Superseded by the xattention-based port (kernels/mla_sparse_xattn).
-list(FILTER device_cpp EXCLUDE REGEX "/mla_sparse_decode\\.cpp$")
-
 # BMG only
 set(device_cpp_xe20)
 # common SYCL kernels
@@ -28,10 +24,8 @@ include(FMHAPrefillXe20.cmake)
 include(GdnAttnXe20.cmake)
 include(MlaDecodeXe20.cmake)
 include(MlaPrefillXe20.cmake)
-# Disabled: sgl's own sparse MLA decode (kernels/mla_sparse). Superseded by mla_sparse_xattn.
-# include(MlaSparseDecodeXe20.cmake)
 include(MlaSparsePrefillXe20.cmake)
-include(MlaSparseDecodeXattnXe20.cmake)
+include(MlaSparseDecodeXe20.cmake)
 
 message(STATUS "BMG files: ${device_cpp_xe20}")
 message(STATUS "Common files: ${device_cpp_common}")

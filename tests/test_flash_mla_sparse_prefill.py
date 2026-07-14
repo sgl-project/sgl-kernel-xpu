@@ -1,4 +1,4 @@
-"""Correctness tests for DeepSeek V4 sparse MLA prefill (ported from xattention).
+"""Correctness tests for DeepSeek V4 sparse MLA prefill.
 
 Run: pytest tests/test_flash_mla_sparse_prefill.py
 """

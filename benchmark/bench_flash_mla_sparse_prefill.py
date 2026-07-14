@@ -2,8 +2,7 @@
 
 Times sgl_kernel.flash_mla_sparse_prefill across DeepSeek-V4 prefill shapes and
 reports latency + effective memory bandwidth. Also cross-checks correctness
-against a float reference and, if available, against xattention's
-flash_mla_sparse_fwd.
+against a float reference.
 
 Usage:
   python benchmark/bench_flash_mla_sparse_prefill.py

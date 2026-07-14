@@ -1,4 +1,4 @@
-"""Correctness tests for DeepSeek V4 sparse MLA fp8 decode.
+"""Correctness tests for sparse MLA fp8 decode.
 
 Run: pytest tests/test_flash_mla_sparse_decode.py
 """
@@ -27,7 +27,7 @@ default_params = {
 
 
 def _pack_sparse_fp8_kv_deepseek_v4(kv: torch.Tensor):
-    """Pack logical bf16 KV into DeepSeek V4 sparse fp8 cache layout.
+    """Pack logical bf16 KV into sparse fp8 cache layout.
 
     Physical block layout is:
       [block_size * 576B token data][block_size * 8B token scales]

@@ -25,6 +25,7 @@ if is_xpu():
         is_icpx_available,
         load_jit_sycl,
     )
+    from .moe_fused_gate import can_use_moe_fused_gate, moe_fused_gate
     from .norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm, rmsnorm
     from .rope import apply_rope_inplace, apply_rope_inplace_with_kvcache
     from .timestep_embedding import timestep_embedding
@@ -40,6 +41,8 @@ if is_xpu():
         # Kernels
         "can_use_fused_inplace_qknorm",
         "fused_inplace_qknorm",
+        "moe_fused_gate",
+        "can_use_moe_fused_gate",
         "rmsnorm",
         "apply_rope_inplace",
         "apply_rope_inplace_with_kvcache",

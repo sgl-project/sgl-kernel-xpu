@@ -1233,9 +1233,7 @@ std::vector<at::Tensor> mha_fwd(
     int const sm_margin,
     std::optional<at::Tensor> out_ = std::nullopt) {
   // Supports both paged (page_table != None) and non-paged (contiguous ragged
-  // KV, page_table == None) layouts. In the non-paged case both sub-launches run
-  // the non-paged prefill kernel (decode is paged-only), which is mathematically
-  // identical for the seqlen_q <= 1 decode batches.
+  // KV, page_table == None) layouts.
   // ``seqlens_rotary_`` is intentionally not checked here: callers pass it
   // alongside ``cache_seqlens`` even when rotary is disabled, and the
   // sub-kernels only consume it inside the ``rotary_cos_.has_value()`` branch.
@@ -1292,6 +1290,33 @@ std::vector<at::Tensor> mha_fwd(
         std::move(out_opt),
         std::move(skip_mask));
   };
+
+  // Pure-decode fast path: max_seqlen_q is the MAX seqlen_q over all batches, so
+  // max_seqlen_q <= 1 guarantees EVERY batch is decode (no seqlen_q > 1 prefill
+  // rows) for any batch_size. The prefill sub-launch below would then launch a
+  // full kernel grid only to `continue` past every tile — pure overhead. Run
+  // just the decode kernel. Gate uses only the host scalar max_seqlen_q, so it
+  // adds no device synchronization.
+  if (max_seqlen_q <= 1) {
+    auto out = launch(decode::mha_fwd, std::move(out_), std::nullopt)[0];
+    auto empty_f = at::empty({0}, q.options().dtype(at::kFloat));
+    return {out, empty_f, empty_f, empty_f};
+  }
+
+  // Pure-prefill fast path: symmetrically, when there are no decode rows the
+  // decode sub-launch is pure overhead. Unlike the decode case this cannot be proven from max_seqlen_q
+  // alone: max_seqlen_q > 1 only means AT LEAST ONE batch is prefill, not all of
+  // them (others may be seqlen_q <= 1 decode). Proving "all prefill" for
+  // batch_size > 1 would require is_prefill.all() — a device reduction + D2H
+  // sync that costs more than it saves. But batch_size == 1 makes it provable
+  // from host scalars: a single sequence with max_seqlen_q > 1 IS that prefill
+  // sequence and has no decode rows. The general mixed-batch (batch_size > 1)
+  // path below keeps both launches so decode rows are still handled correctly.
+  if (batch_size == 1 && max_seqlen_q > 1) {
+    auto out = launch(prefill::mha_fwd, std::move(out_), std::nullopt)[0];
+    auto empty_f = at::empty({0}, q.options().dtype(at::kFloat));
+    return {out, empty_f, empty_f, empty_f};
+  }
 
   // Launch 1: decode allocates the shared output (or reuses the caller-provided
   // out_ buffer) and skips prefill batches.

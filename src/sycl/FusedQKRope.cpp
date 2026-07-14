@@ -545,42 +545,42 @@ void fused_qk_rope_with_cos_sin_cache_inplace(
       input_dim == 3,
       "fused_qk_rope_with_cos_sin_cache_inplace only supports 3D input [num_tokens, num_heads, rope_dim]");
 
-#define LAUNCH_ROPE_CACHE_KERNEL(IS_NEOX, CACHE_T, POS_T)                                                            \
-  switch (rope_dim) {                                                                                                 \
-    case 64:                                                                                                          \
-      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 64, scalar_t, CACHE_T, POS_T>(                                   \
-          query, key, cos_sin_cache, positions);                                                                     \
-      break;                                                                                                          \
-    case 128:                                                                                                         \
-      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 128, scalar_t, CACHE_T, POS_T>(                                  \
-          query, key, cos_sin_cache, positions);                                                                     \
-      break;                                                                                                          \
-    case 256:                                                                                                         \
-      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 256, scalar_t, CACHE_T, POS_T>(                                  \
-          query, key, cos_sin_cache, positions);                                                                     \
-      break;                                                                                                          \
-    case 512:                                                                                                         \
-      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 512, scalar_t, CACHE_T, POS_T>(                                  \
-          query, key, cos_sin_cache, positions);                                                                     \
-      break;                                                                                                          \
-    default:                                                                                                          \
-      TORCH_CHECK(false, "Unsupported rope_dim: ", rope_dim);                                                         \
+#define LAUNCH_ROPE_CACHE_KERNEL(IS_NEOX, CACHE_T, POS_T)                            \
+  switch (rope_dim) {                                                                \
+    case 64:                                                                         \
+      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 64, scalar_t, CACHE_T, POS_T>(  \
+          query, key, cos_sin_cache, positions);                                     \
+      break;                                                                         \
+    case 128:                                                                        \
+      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 128, scalar_t, CACHE_T, POS_T>( \
+          query, key, cos_sin_cache, positions);                                     \
+      break;                                                                         \
+    case 256:                                                                        \
+      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 256, scalar_t, CACHE_T, POS_T>( \
+          query, key, cos_sin_cache, positions);                                     \
+      break;                                                                         \
+    case 512:                                                                        \
+      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 512, scalar_t, CACHE_T, POS_T>( \
+          query, key, cos_sin_cache, positions);                                     \
+      break;                                                                         \
+    default:                                                                         \
+      TORCH_CHECK(false, "Unsupported rope_dim: ", rope_dim);                        \
   }
 
 // Select cos/sin cache dtype: sglang keeps the cache in fp32 on XPU for RoPE
 // numerical parity with CUDA. A cache matching the query dtype (bf16/half) is
 // also accepted for backward compatibility. The rotation math is fp32 either way.
-#define DISPATCH_ROPE_CACHE_BY_CACHE_DTYPE(IS_NEOX, POS_T)      \
-  if (cos_sin_cache.scalar_type() == at::kFloat) {              \
-    LAUNCH_ROPE_CACHE_KERNEL(IS_NEOX, float, POS_T);            \
-  } else {                                                      \
-    LAUNCH_ROPE_CACHE_KERNEL(IS_NEOX, scalar_t, POS_T);         \
+#define DISPATCH_ROPE_CACHE_BY_CACHE_DTYPE(IS_NEOX, POS_T) \
+  if (cos_sin_cache.scalar_type() == at::kFloat) {         \
+    LAUNCH_ROPE_CACHE_KERNEL(IS_NEOX, float, POS_T);       \
+  } else {                                                 \
+    LAUNCH_ROPE_CACHE_KERNEL(IS_NEOX, scalar_t, POS_T);    \
   }
 
-#define DISPATCH_ROPE_CACHE_KERNEL_BY_LAYOUT(POS_T)  \
-  if (is_neox) {                                     \
-    DISPATCH_ROPE_CACHE_BY_CACHE_DTYPE(true, POS_T); \
-  } else {                                           \
+#define DISPATCH_ROPE_CACHE_KERNEL_BY_LAYOUT(POS_T)   \
+  if (is_neox) {                                      \
+    DISPATCH_ROPE_CACHE_BY_CACHE_DTYPE(true, POS_T);  \
+  } else {                                            \
     DISPATCH_ROPE_CACHE_BY_CACHE_DTYPE(false, POS_T); \
   }
 

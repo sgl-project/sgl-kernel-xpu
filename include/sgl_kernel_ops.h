@@ -210,6 +210,17 @@ void sgl_per_token_group_quant_fp4(
     double eps,
     std::optional<at::Tensor> input_secondary = std::nullopt);
 void store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices);
+void biased_topk(
+    const at::Tensor& input,
+    const at::Tensor& bias,
+    at::Tensor& output,
+    at::Tensor& indices,
+    int64_t topk,
+    int64_t scoring_func,
+    int64_t num_fused_shared_experts,
+    bool renormalize,
+    double routed_scaling_factor,
+    bool apply_routed_scaling_factor_on_output);
 }  // namespace at::native::xpu
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void silu_and_mul_clamp(torch::Tensor& out, torch::Tensor& input, double swiglu_limit);

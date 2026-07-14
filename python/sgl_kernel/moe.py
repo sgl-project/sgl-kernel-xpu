@@ -4,6 +4,12 @@ import torch
 
 from .utils import is_xe2_arch
 
+_SCORING_FUNC_MAP = {
+    "sigmoid": 0,
+    "sqrtsoftplus": 1,
+    "softmax": 2,
+}
+
 
 def moe_align_block_size(
     topk_ids,
@@ -119,6 +125,37 @@ def moe_fused_gate(
         topk_group,
         topk,
         num_fused_shared_experts,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output,
+    )
+
+
+def biased_topk(
+    input_tensor,
+    bias,
+    output,
+    indices,
+    topk,
+    scoring_func,
+    num_fused_shared_experts=0,
+    renormalize=False,
+    routed_scaling_factor=1.0,
+    apply_routed_scaling_factor_on_output=False,
+):
+    scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
+    assert (
+        scoring_func_int is not None
+    ), f"Unknown scoring_func '{scoring_func}', must be one of {list(_SCORING_FUNC_MAP.keys())}"
+
+    torch.ops.sgl_kernel.biased_topk.default(
+        input_tensor,
+        bias,
+        output,
+        indices,
+        topk,
+        scoring_func_int,
+        num_fused_shared_experts,
+        renormalize,
         routed_scaling_factor,
         apply_routed_scaling_factor_on_output,
     )

@@ -397,11 +397,11 @@ void fused_qk_rope(
 #undef FUSED_QK_ROPE_LAUNCH_ARGS
 }
 
-template <bool is_neox, int64_t rope_dim, typename scalar_t, typename pos_t>
+template <bool is_neox, int64_t rope_dim, typename scalar_t, typename cache_t, typename pos_t>
 struct FusedRopeCacheKernel {
   scalar_t* query;
   scalar_t* key;
-  const scalar_t* cos_sin_cache;
+  const cache_t* cos_sin_cache;
   const pos_t* positions;
   int64_t q_stride;
   int64_t k_stride;
@@ -432,19 +432,14 @@ struct FusedRopeCacheKernel {
         sycl::half,
         std::conditional_t<std::is_same_v<scalar_t, c10::BFloat16>, sycl::ext::oneapi::bfloat16, float>>;
 
-    constexpr int64_t max_vec_bytes = 16;  // 128 bits
-    constexpr int64_t max_vec_elems = max_vec_bytes / (int64_t)sizeof(storage_t);
-
-    // We use different heuristic vec_size choosing from cuda.
-    // The following config would get the best performance(bf16/half):
-    // head_dim: 64 128 256 512
-    // vec_size: 2    2   8   8
-
-    constexpr int64_t vec_size =
-        is_neox ? (rope_dim < 256 ? 2 : max_vec_elems) : (rope_dim < 256 ? 1 : max_vec_elems / 2);
-
-    using vec_t = sycl::vec<storage_t, vec_size>;
-    using vec2_t = sycl::vec<storage_t, vec_size * 2>;  // for interleave pairs
+    // Storage type for the cos/sin cache. sglang keeps this cache in fp32 on XPU
+    // to match CUDA RoPE precision; supporting a bf16/half cache as well keeps
+    // the kernel backward compatible. The rotation math is always performed in
+    // fp32 regardless of cache dtype so cos/sin quantization error is minimized.
+    using cache_storage_t = std::conditional_t<
+        std::is_same_v<cache_t, c10::Half>,
+        sycl::half,
+        std::conditional_t<std::is_same_v<cache_t, c10::BFloat16>, sycl::ext::oneapi::bfloat16, float>>;
 
     for (int64_t idx = worker_id; idx < num_works; idx += total_workers) {
       const int64_t token_id = idx / num_qk_heads;
@@ -463,58 +458,46 @@ struct FusedRopeCacheKernel {
         base_ptr = key + token_id * k_stride + head_index * k_head_stride;
       }
 
-      const scalar_t* cos_ptr = cos_sin_cache + pos * cache_stride;
-      const scalar_t* sin_ptr = cos_ptr + half_rope;
+      const cache_t* cos_ptr = cos_sin_cache + pos * cache_stride;
+      const cache_t* sin_ptr = cos_ptr + half_rope;
 
-      // Reinterpret scalar_t* as storage_t* for vectorized load/store.
-      // Safe: c10::Half and sycl::half share identical IEEE binary16 layout;
-      //       same holds for c10::BFloat16 and sycl::ext::oneapi::bfloat16.
+      // Reinterpret to matching SYCL storage types for load/store.
+      // Safe: c10::Half and sycl::half (and c10::BFloat16 / sycl bfloat16) share
+      // identical binary layouts; fp32 caches map to float directly.
       auto* base_sptr = reinterpret_cast<storage_t*>(base_ptr);
-      auto* cos_sptr = reinterpret_cast<const storage_t*>(cos_ptr);
-      auto* sin_sptr = reinterpret_cast<const storage_t*>(sin_ptr);
+      auto* cos_sptr = reinterpret_cast<const cache_storage_t*>(cos_ptr);
+      auto* sin_sptr = reinterpret_cast<const cache_storage_t*>(sin_ptr);
 
       if constexpr (is_neox) {
         auto* x_sptr = base_sptr;
         auto* y_sptr = base_sptr + half_rope;
 
 #pragma unroll
-        for (int64_t i = lane_id * vec_size; i < half_rope; i += sg_size * vec_size) {
-          vec_t x_vec = *reinterpret_cast<const vec_t*>(x_sptr + i);
-          vec_t y_vec = *reinterpret_cast<const vec_t*>(y_sptr + i);
-          vec_t c_vec = *reinterpret_cast<const vec_t*>(cos_sptr + i);
-          vec_t s_vec = *reinterpret_cast<const vec_t*>(sin_sptr + i);
-
-          // Calculate syl::vec directly without iterating over vec_size.
-          vec_t out_x = x_vec * c_vec - y_vec * s_vec;
-          vec_t out_y = x_vec * s_vec + y_vec * c_vec;
-
-          *reinterpret_cast<vec_t*>(x_sptr + i) = out_x;
-          *reinterpret_cast<vec_t*>(y_sptr + i) = out_y;
+        for (int64_t i = lane_id; i < half_rope; i += sg_size) {
+          // Upcast everything to fp32, rotate, then round back to storage_t.
+          const float c = static_cast<float>(cos_sptr[i]);
+          const float s = static_cast<float>(sin_sptr[i]);
+          const float x = static_cast<float>(x_sptr[i]);
+          const float y = static_cast<float>(y_sptr[i]);
+          x_sptr[i] = static_cast<storage_t>(x * c - y * s);
+          y_sptr[i] = static_cast<storage_t>(x * s + y * c);
         }
       } else {
 #pragma unroll
-        for (int64_t i = lane_id * vec_size; i < half_rope; i += sg_size * vec_size) {
-          vec2_t v = *reinterpret_cast<const vec2_t*>(base_sptr + 2 * i);
-          vec_t c_vec = *reinterpret_cast<const vec_t*>(cos_sptr + i);
-          vec_t s_vec = *reinterpret_cast<const vec_t*>(sin_sptr + i);
-
-#pragma unroll
-          for (int j = 0; j < vec_size; j++) {
-            const storage_t x = v[2 * j];
-            const storage_t y = v[2 * j + 1];
-            const storage_t c = c_vec[j];
-            const storage_t s = s_vec[j];
-            v[2 * j] = x * c - y * s;
-            v[2 * j + 1] = x * s + y * c;
-          }
-          *reinterpret_cast<vec2_t*>(base_sptr + 2 * i) = v;
+        for (int64_t i = lane_id; i < half_rope; i += sg_size) {
+          const float c = static_cast<float>(cos_sptr[i]);
+          const float s = static_cast<float>(sin_sptr[i]);
+          const float x = static_cast<float>(base_sptr[2 * i]);
+          const float y = static_cast<float>(base_sptr[2 * i + 1]);
+          base_sptr[2 * i] = static_cast<storage_t>(x * c - y * s);
+          base_sptr[2 * i + 1] = static_cast<storage_t>(x * s + y * c);
         }
       }
     }
   }
 };
 
-template <bool is_neox, int64_t rope_dim, typename scalar_t, typename pos_t>
+template <bool is_neox, int64_t rope_dim, typename scalar_t, typename cache_t, typename pos_t>
 void launch_fused_rope_cache_kernel_scalar(
     at::Tensor& query, at::Tensor& key, const at::Tensor& cos_sin_cache, const at::Tensor& positions) {
   constexpr int kWorkGroupSize = 128;
@@ -529,10 +512,10 @@ void launch_fused_rope_cache_kernel_scalar(
   const int64_t num_groups = CeilDiv(num_works, workers_per_work_group);
   const int64_t total_workers = num_groups * workers_per_work_group;
 
-  FusedRopeCacheKernel<is_neox, rope_dim, scalar_t, pos_t> kernel{
+  FusedRopeCacheKernel<is_neox, rope_dim, scalar_t, cache_t, pos_t> kernel{
       query.data_ptr<scalar_t>(),
       key.data_ptr<scalar_t>(),
-      cos_sin_cache.data_ptr<scalar_t>(),
+      cos_sin_cache.data_ptr<cache_t>(),
       positions.data_ptr<pos_t>(),
       query.stride(0),
       key.stride(0),
@@ -562,29 +545,43 @@ void fused_qk_rope_with_cos_sin_cache_inplace(
       input_dim == 3,
       "fused_qk_rope_with_cos_sin_cache_inplace only supports 3D input [num_tokens, num_heads, rope_dim]");
 
-#define LAUNCH_ROPE_CACHE_KERNEL(IS_NEOX, POS_T)                                                                  \
-  switch (rope_dim) {                                                                                             \
-    case 64:                                                                                                      \
-      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 64, scalar_t, POS_T>(query, key, cos_sin_cache, positions);  \
-      break;                                                                                                      \
-    case 128:                                                                                                     \
-      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 128, scalar_t, POS_T>(query, key, cos_sin_cache, positions); \
-      break;                                                                                                      \
-    case 256:                                                                                                     \
-      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 256, scalar_t, POS_T>(query, key, cos_sin_cache, positions); \
-      break;                                                                                                      \
-    case 512:                                                                                                     \
-      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 512, scalar_t, POS_T>(query, key, cos_sin_cache, positions); \
-      break;                                                                                                      \
-    default:                                                                                                      \
-      TORCH_CHECK(false, "Unsupported rope_dim: ", rope_dim);                                                     \
+#define LAUNCH_ROPE_CACHE_KERNEL(IS_NEOX, CACHE_T, POS_T)                                                            \
+  switch (rope_dim) {                                                                                                 \
+    case 64:                                                                                                          \
+      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 64, scalar_t, CACHE_T, POS_T>(                                   \
+          query, key, cos_sin_cache, positions);                                                                     \
+      break;                                                                                                          \
+    case 128:                                                                                                         \
+      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 128, scalar_t, CACHE_T, POS_T>(                                  \
+          query, key, cos_sin_cache, positions);                                                                     \
+      break;                                                                                                          \
+    case 256:                                                                                                         \
+      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 256, scalar_t, CACHE_T, POS_T>(                                  \
+          query, key, cos_sin_cache, positions);                                                                     \
+      break;                                                                                                          \
+    case 512:                                                                                                         \
+      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 512, scalar_t, CACHE_T, POS_T>(                                  \
+          query, key, cos_sin_cache, positions);                                                                     \
+      break;                                                                                                          \
+    default:                                                                                                          \
+      TORCH_CHECK(false, "Unsupported rope_dim: ", rope_dim);                                                         \
   }
 
-#define DISPATCH_ROPE_CACHE_KERNEL_BY_LAYOUT(POS_T) \
-  if (is_neox) {                                    \
-    LAUNCH_ROPE_CACHE_KERNEL(true, POS_T);          \
-  } else {                                          \
-    LAUNCH_ROPE_CACHE_KERNEL(false, POS_T);         \
+// Select cos/sin cache dtype: sglang keeps the cache in fp32 on XPU for RoPE
+// numerical parity with CUDA. A cache matching the query dtype (bf16/half) is
+// also accepted for backward compatibility. The rotation math is fp32 either way.
+#define DISPATCH_ROPE_CACHE_BY_CACHE_DTYPE(IS_NEOX, POS_T)      \
+  if (cos_sin_cache.scalar_type() == at::kFloat) {              \
+    LAUNCH_ROPE_CACHE_KERNEL(IS_NEOX, float, POS_T);            \
+  } else {                                                      \
+    LAUNCH_ROPE_CACHE_KERNEL(IS_NEOX, scalar_t, POS_T);         \
+  }
+
+#define DISPATCH_ROPE_CACHE_KERNEL_BY_LAYOUT(POS_T)  \
+  if (is_neox) {                                     \
+    DISPATCH_ROPE_CACHE_BY_CACHE_DTYPE(true, POS_T); \
+  } else {                                           \
+    DISPATCH_ROPE_CACHE_BY_CACHE_DTYPE(false, POS_T); \
   }
 
   SYCL_DISPATCH_FLOATING_TYPES(
@@ -601,6 +598,7 @@ void fused_qk_rope_with_cos_sin_cache_inplace(
       });
 
 #undef DISPATCH_ROPE_CACHE_KERNEL_BY_LAYOUT
+#undef DISPATCH_ROPE_CACHE_BY_CACHE_DTYPE
 #undef LAUNCH_ROPE_CACHE_KERNEL
 }
 

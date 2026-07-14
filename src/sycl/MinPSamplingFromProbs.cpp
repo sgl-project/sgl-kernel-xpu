@@ -33,7 +33,7 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   uint64_t philox_seed;
   uint64_t philox_offset;
 
-  sycl::local_accessor<int32_t, 1> shared_ids_;  // [0]=sampled_id, [1]=last_valid_id
+  sycl::local_accessor<int32_t, 1> shared_ids_;    // [0]=sampled_id, [1]=last_valid_id
   sycl::local_accessor<float, 1> shared_scalars_;  // [0]=pivot, [1]=q (normalizing mass)
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
@@ -172,15 +172,7 @@ void launch_min_p_sampling(
   const int global_size = batch_size * local_size;
 
   auto kernel = MinPSamplingKernel(
-      probs,
-      output,
-      maybe_indices,
-      maybe_min_p_arr,
-      min_p_val,
-      batch_size,
-      vocab_size,
-      philox_seed,
-      philox_offset);
+      probs, output, maybe_indices, maybe_min_p_arr, min_p_val, batch_size, vocab_size, philox_seed, philox_offset);
 
   sycl_kernel_submit(global_size, local_size, queue, kernel);
 }

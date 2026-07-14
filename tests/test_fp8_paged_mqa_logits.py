@@ -1,0 +1,411 @@
+"""fp8_paged_mqa_logits tests.
+
+Validates that the triton implementation matches the loopy
+reference (`fp8_paged_mqa_logits_torch`)
+
+Coverage:
+- Numeric equivalence vs reference at small shapes
+- Both KV-cache dtype views (uint8 raw / float8_e4m3fn) — guards against the
+  historic garbled-output bug where Triton kernels treated uint8 bytes as raw
+  integers instead of FP8
+- Variable per-batch seq_lens with 0.0 masking semantics
+- Shape-assertion guards
+
+Triton implementation on any GPU with Triton support.
+"""
+
+from __future__ import annotations
+
+import itertools
+import os
+import random
+import time
+import traceback
+import unittest
+from typing import Any, Callable
+from unittest import SkipTest
+from unittest.case import _ShouldStop
+
+import torch
+import torch.nn.functional as F
+from sgl_kernel import fp8_paged_mqa_logits_triton
+from sgl_kernel.fp8_paged_mqa_logits import FP8_DTYPE
+from utils import get_device
+
+# DSv4 indexer cache layout (fixed by deepseek_v4_memory_pool.DeepSeekV4IndexerPool):
+#   page_size = 64 tokens
+#   head_dim = 128 (FP8 values per token)
+#   quant_block_size = 128 -> num_scales_per_token = 1 (fp32 scale)
+#   per-page memory: [page_size*head_dim FP8 bytes][page_size*4 scale bytes]
+#                  = [8192][256] = 8448 bytes
+# The (block_size, 1, head_dim+4) shape is a fiction for downstream consumers.
+PAGE_SIZE = 64
+HEAD_DIM = 128
+SCALE_BYTES_PER_TOKEN = 4
+HEAD_DIM_WITH_SF = HEAD_DIM + SCALE_BYTES_PER_TOKEN  # 132
+PAGE_BYTES = PAGE_SIZE * HEAD_DIM + PAGE_SIZE * SCALE_BYTES_PER_TOKEN  # 8448
+_arange_cache = {}
+
+
+def fp8_paged_mqa_logits_torch(
+    q_fp8: torch.Tensor,
+    kvcache_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata: Any,
+    max_seq_len: int,
+    clean_logits: bool = True,
+) -> torch.Tensor:
+    """Vectorized implementation compatible with CUDA graph capture."""
+    _ = deep_gemm_metadata
+    batch_size, _, num_heads, head_dim = q_fp8.shape
+    block_size = kvcache_fp8.shape[1]
+
+    assert head_dim == 128
+    assert block_size == 64
+    assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
+    assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
+    assert weight.shape == (batch_size, num_heads)
+    assert seq_lens.shape == (batch_size,)
+    assert page_table.shape[0] == batch_size
+    assert clean_logits == False
+
+    max_num_pages = page_table.shape[1]
+    SCALE_OFFSET = block_size * head_dim
+    total_dim = block_size * (head_dim + 4)
+
+    kvcache_flat = kvcache_fp8.view(-1, total_dim)
+
+    pages_clamped = page_table.clamp(min=0)
+    kvcache_gathered = kvcache_flat[pages_clamped]
+
+    kv_values_raw = kvcache_gathered[..., :SCALE_OFFSET].contiguous()
+    kv_values_fp8 = kv_values_raw.view(dtype=FP8_DTYPE)
+    kv_values = kv_values_fp8.to(torch.float32)
+    kv_values = kv_values.reshape(batch_size, max_num_pages * block_size, head_dim)
+
+    kv_scales_raw = kvcache_gathered[..., SCALE_OFFSET:].contiguous()
+    kv_scales = kv_scales_raw.view(dtype=torch.float32)
+    kv_scales = kv_scales.reshape(batch_size, max_num_pages * block_size)
+
+    q_float = q_fp8[:, 0].to(torch.float32)
+    scores = torch.bmm(kv_values, q_float.transpose(1, 2))
+    scores = F.relu(scores)
+    scores = scores * weight.unsqueeze(1)
+    scores = scores.sum(dim=2)
+    scores = scores * kv_scales
+
+    padded_seq_len = max_num_pages * block_size
+    cache = _arange_cache
+    arange_key = f"arange_{padded_seq_len}_{scores.device}"
+    if arange_key not in cache:
+        cache[arange_key] = torch.arange(padded_seq_len, device=scores.device)
+    positions = cache[arange_key].unsqueeze(0)
+    valid_mask = positions < seq_lens.unsqueeze(1)
+    scores = scores.masked_fill(~valid_mask, 0.0)
+
+    if padded_seq_len < max_seq_len:
+        scores = F.pad(scores, (0, max_seq_len - padded_seq_len), value=0.0)
+    else:
+        scores = scores[:, :max_seq_len]
+
+    return scores
+
+
+def retry(
+    fn,
+    max_retry: int,
+    initial_delay: float = 2.0,
+    max_delay: float = 60.0,
+    should_retry: Callable[[Any], bool] = lambda e: True,
+):
+    for try_index in itertools.count():
+        try:
+            return fn()
+        except SkipTest:
+            # Do NOT retry skipped tests - used in CI and unittest
+            raise
+        except _ShouldStop:
+            # `unittest.case._ShouldStop` is raised by `subTest.__exit__`
+            # when a subtest fails/skips and `result.failfast` is True
+            # (CI invokes `python3 file.py -f`). It signals the outer
+            # `testPartExecutor` to stop the test method cleanly; do
+            # NOT retry, just propagate so unittest handles it.
+            raise
+        except Exception as e:
+            traceback.print_exc()
+
+            if try_index >= max_retry:
+                raise Exception(f"retry() exceed maximum number of retries.")
+
+            if not should_retry(e):
+                raise Exception(f"retry() observe errors that should not be retried.")
+
+            delay = min(initial_delay * (2**try_index), max_delay) * (
+                0.75 + 0.25 * random.random()
+            )
+
+            print(
+                f"retry() failed once ({try_index}th try, maximum {max_retry} retries). Will delay {delay:.2f}s and retry. Error: {e}"
+            )
+
+            time.sleep(delay)
+
+
+class CustomTestCase(unittest.TestCase):
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
+        # Wrap the effective setUpClass so that tearDownClass is called
+        # even when setUpClass fails. Python's unittest skips tearDownClass
+        # if setUpClass raises, which can leak resources (ports, processes).
+        setup = cls.setUpClass
+        if getattr(setup, "_safe_setup_wrapped", False):
+            return
+
+        orig_func = setup.__func__
+
+        def safe_setUpClass(klass):
+            try:
+                orig_func(klass)
+            except Exception:
+                # Best-effort cleanup; suppress teardown errors so the
+                # original setUpClass exception propagates clearly.
+                try:
+                    klass.tearDownClass()
+                except Exception:
+                    pass
+                raise
+
+        # Set sentinel on the raw function so that bound method attribute
+        # lookup (which delegates to __func__) can detect it in subclasses.
+        safe_setUpClass._safe_setup_wrapped = True
+        cls.setUpClass = classmethod(safe_setUpClass)
+
+    def _callTestMethod(self, method):
+        max_retry = int(os.getenv("SGLANG_TEST_MAX_RETRY", "0"))
+        retry(
+            lambda: super(CustomTestCase, self)._callTestMethod(method),
+            max_retry=max_retry,
+        )
+
+    def setUp(self):
+        print(
+            f"[CI Test Method] {self.__class__.__name__}.{self._testMethodName}",
+            flush=True,
+        )
+
+
+def _build_kvcache(
+    num_pages: int,
+    *,
+    dtype_view: torch.dtype,
+    device: torch.device,
+    seed: int = 0,
+) -> torch.Tensor:
+    """Construct a paged KV cache matching the production layout.
+
+    Returns a tensor shaped (num_pages, PAGE_SIZE, 1, HEAD_DIM_WITH_SF) whose
+    underlying memory is the same regardless of `dtype_view`:
+      - [0 : PAGE_SIZE*HEAD_DIM)        : random FP8 bit patterns (values)
+      - [PAGE_SIZE*HEAD_DIM : PAGE_BYTES) : random positive fp32 scales (bytes)
+    """
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    raw = torch.empty(num_pages, PAGE_BYTES, dtype=torch.uint8, device=device)
+
+    # Random FP8 byte pattern for the value section. Bias away from extreme
+    # bit patterns that map to NaN/Inf in float8_e4m3fn (sign|exp4|mantissa3;
+    # exp=0xF mantissa!=0 -> NaN). Restricting to [0, 0x6F] keeps |x| < 256.
+    val_bytes = torch.randint(
+        0, 0x70, (num_pages, PAGE_SIZE * HEAD_DIM), generator=g, dtype=torch.uint8
+    ).to(device)
+    raw[:, : PAGE_SIZE * HEAD_DIM] = val_bytes
+
+    # Positive fp32 scales in [0.05, 0.55]. Byte-view into the trailing region.
+    scales = (
+        torch.rand((num_pages, PAGE_SIZE), generator=g, dtype=torch.float32).to(device)
+        * 0.5
+        + 0.05
+    )
+    raw[:, PAGE_SIZE * HEAD_DIM :] = scales.contiguous().view(torch.uint8)
+
+    kv = raw.view(num_pages, PAGE_SIZE, 1, HEAD_DIM_WITH_SF)
+    return kv if dtype_view == torch.uint8 else kv.view(dtype=dtype_view)
+
+
+def _build_inputs(
+    batch_size: int,
+    seq_lens: list[int],
+    *,
+    kv_dtype_view: torch.dtype,
+    num_heads: int = 32,
+    device: torch.device = torch.device(get_device()),
+    seed: int = 0,
+):
+    assert len(seq_lens) == batch_size
+    max_seq_len = max(seq_lens)
+    max_pages = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
+    # One global page pool, batch picks its own page ids.
+    num_pages_total = batch_size * max_pages + 1
+
+    kvcache = _build_kvcache(
+        num_pages_total, dtype_view=kv_dtype_view, device=device, seed=seed
+    )
+
+    g = torch.Generator(device="cpu").manual_seed(seed + 1)
+    # Construct query as random bf16->fp8 to keep values inside fp8 range.
+    q_bf16 = torch.randn(
+        (batch_size, 1, num_heads, HEAD_DIM), generator=g, dtype=torch.float32
+    ).to(device)
+    q_bf16 = q_bf16.clamp_(-2.0, 2.0)
+    q_fp8 = q_bf16.to(FP8_DTYPE)
+    if kv_dtype_view == torch.uint8:
+        # Query dtype isn't toggled — only kvcache. q always fp8.
+        pass
+
+    weight = (
+        torch.rand((batch_size, num_heads), generator=g, dtype=torch.float32).to(device)
+        * 0.5
+    )
+
+    seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+
+    # Each batch occupies its own slice of pages, randomized for realism.
+    page_table = torch.zeros((batch_size, max_pages), dtype=torch.int32, device=device)
+    for i in range(batch_size):
+        page_table[i] = torch.arange(
+            1 + i * max_pages, 1 + (i + 1) * max_pages, dtype=torch.int32, device=device
+        )
+
+    return q_fp8, kvcache, weight, seq_lens_t, page_table, max_seq_len
+
+
+def _compare(
+    ref: torch.Tensor,
+    tri: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    atol: float = 1e-3,
+    rtol: float = 1e-3,
+):
+    # Valid positions must match
+    batch_size, max_seq_len = ref.shape
+    for i in range(batch_size):
+        sl = int(seq_lens[i].item())
+        torch.testing.assert_close(
+            ref[i, :sl], tri[i, :sl], atol=atol, rtol=rtol, equal_nan=False
+        )
+
+
+class TestTritonPagedMqaLogitsTorch(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not (torch.cuda.is_available() or torch.xpu.is_available()):
+            raise unittest.SkipTest("CUDA or XPU required")
+        cls.device = torch.device(get_device())
+
+    def _run_one(
+        self,
+        batch_size: int,
+        seq_lens: list[int],
+        kv_dtype_view: torch.dtype,
+        num_heads: int = 32,
+    ):
+        q, kv, w, sl, pt, msl = _build_inputs(
+            batch_size,
+            seq_lens,
+            kv_dtype_view=kv_dtype_view,
+            num_heads=num_heads,
+            device=self.device,
+        )
+        # Reference (loopy)
+        ref = fp8_paged_mqa_logits_torch(
+            q,
+            kv,
+            w,
+            sl,
+            pt,
+            deep_gemm_metadata=None,
+            max_seq_len=msl,
+            clean_logits=False,
+        )
+        # Triton
+        tri = fp8_paged_mqa_logits_triton(
+            q,
+            kv,
+            w,
+            sl,
+            pt,
+            deep_gemm_metadata=None,
+            max_seq_len=msl,
+            clean_logits=False,
+        )
+        _compare(ref, tri, sl)
+
+    def test_equiv_fp8_view_bs1(self):
+        self._run_one(1, [128], FP8_DTYPE)
+
+    def test_equiv_fp8_view_bs4_uniform(self):
+        self._run_one(4, [128, 128, 128, 128], FP8_DTYPE)
+
+    def test_equiv_fp8_view_bs4_variable(self):
+        self._run_one(4, [40, 96, 200, 256], FP8_DTYPE)
+
+    def test_equiv_uint8_view_bs1(self):
+        """Regression guard: KV cache viewed as raw uint8 (no FP8 dtype hint).
+
+        Historic bug (progress doc §4): some kernels treated uint8 bytes as raw
+        integers, producing garbled attention output. The vectorized impl must
+        produce the same numbers as the loopy reference regardless of the
+        caller's KV view dtype.
+        """
+        self._run_one(1, [128], torch.uint8)
+
+    def test_equiv_uint8_view_bs4_variable(self):
+        self._run_one(4, [40, 96, 200, 256], torch.uint8)
+
+    def test_seq_lens_zero_remainder(self):
+        """seq_len not aligned to page_size — last partial page must mask correctly."""
+        self._run_one(2, [65, 129], FP8_DTYPE)  # 65 = 1 full page + 1 token
+
+    def test_seq_lens_full_pages(self):
+        self._run_one(2, [64, 192], FP8_DTYPE)
+
+    def test_seq_lens_2d_input_accepted(self):
+        """Triton impl squeezes seq_lens if dim>1 (matches indexer.py call site)."""
+        q, kv, w, sl, pt, msl = _build_inputs(
+            2, [64, 128], kv_dtype_view=FP8_DTYPE, device=self.device
+        )
+        sl_2d = sl.unsqueeze(-1)  # (B, 1)
+        ref = fp8_paged_mqa_logits_torch(
+            q, kv, w, sl, pt, None, max_seq_len=msl, clean_logits=False
+        )
+        tri = fp8_paged_mqa_logits_triton(
+            q, kv, w, sl_2d, pt, None, max_seq_len=msl, clean_logits=False
+        )
+        _compare(ref, tri, sl)
+
+    def test_shape_assertions(self):
+        """Wrong head_dim or block_size must raise."""
+        q, kv, w, sl, pt, msl = _build_inputs(
+            1, [64], kv_dtype_view=FP8_DTYPE, device=self.device
+        )
+        # head_dim != 128
+        bad_q = q[..., :64]
+        with self.assertRaises(AssertionError):
+            fp8_paged_mqa_logits_triton(
+                bad_q, kv, w, sl, pt, None, max_seq_len=msl, clean_logits=False
+            )
+        # clean_logits=True not supported
+        with self.assertRaises(AssertionError):
+            fp8_paged_mqa_logits_triton(
+                q, kv, w, sl, pt, None, max_seq_len=msl, clean_logits=True
+            )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(unittest.main())

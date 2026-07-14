@@ -77,11 +77,12 @@ void fp8_gemm_xe20_batched_inplace(
   }
 
   // Fallback to torch::bmm if dimensions are not tile-aligned.
-  // Strides are the natural contiguous strides (M*K, N*K, M*N).
-  auto a_bf16 = a_fp8.to(at::ScalarType::BFloat16);
-  auto b_bf16 = b_fp8.to(at::ScalarType::BFloat16);
+  // a_fp8 and b_fp8 may have arbitrary leading dims from the call site;
+  // reshape to 3D (batch, M/N, K) for bmm compatibility.
+  auto a_bf16 = a_fp8.reshape({batch, M, K}).to(at::ScalarType::BFloat16);
+  auto b_bf16 = b_fp8.reshape({batch, N, K}).to(at::ScalarType::BFloat16);
   auto result = at::bmm(a_bf16, b_bf16.transpose(1, 2)).to(at::ScalarType::Float);
-  d_f32.copy_(result);
+  d_f32.copy_(result.reshape(d_f32.sizes()));
 }
 
 }  // namespace

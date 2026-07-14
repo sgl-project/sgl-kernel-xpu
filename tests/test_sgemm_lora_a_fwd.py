@@ -436,12 +436,12 @@ def test_sgemm_lora_a_fwd_zero_input_dim(dtype):
     total_n = stack_num * max_rank
 
     input_x = torch.empty((num_tokens, input_dim), dtype=dtype, device="xpu")
-    weights = torch.empty(
-        (num_loras, total_n, input_dim), dtype=dtype, device="xpu"
-    )
+    weights = torch.empty((num_loras, total_n, input_dim), dtype=dtype, device="xpu")
     seg_indptr = torch.tensor([0, 16, 32], dtype=torch.int32, device="xpu")
     weight_indices = torch.tensor([0, 1], dtype=torch.int32, device="xpu")
-    lora_ranks = torch.tensor([max_rank, max_rank // 2], dtype=torch.int32, device="xpu")
+    lora_ranks = torch.tensor(
+        [max_rank, max_rank // 2], dtype=torch.int32, device="xpu"
+    )
 
     out = sgemm_lora_a_fwd(
         input_x=input_x,

@@ -29,7 +29,7 @@
  *
  **************************************************************************************************/
 /*! \file
-    \brief Shared CUTLASS pointer-array grouped GEMM launcher core for LoRA forward. 
+    \brief Shared CUTLASS pointer-array grouped GEMM launcher core for LoRA forward.
 */
 
 #pragma once
@@ -65,7 +65,7 @@ namespace at::native::xpu {
 //
 // Per-segment problem sizes, element byte-offsets, and strides that the CUTLASS
 // pointer-array grouped GEMM consumes. Built on device by a single SYCL kernel
-// (one thread per segment) 
+// (one thread per segment)
 //
 // For each segment s in [0, num_segments):
 //   M_s = seg_indptr[s+1] - seg_indptr[s]

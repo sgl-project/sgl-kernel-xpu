@@ -96,6 +96,12 @@ void sgemm_lora_a_fwd(
   if (num_tokens_i64 == 0) {
     return;
   }
+  // K == 0 (input_dim == 0) is a degenerate GEMM: every output element is an
+  // empty sum, so the result is the (num_tokens, N) zero matrix. 
+  if (input_x.size(1) == 0) {
+    output.zero_();
+    return;
+  }
 
   TORCH_CHECK(seg_indptr[0].item<int64_t>() == 0, "seg_indptr[0] must be 0");
   TORCH_CHECK(

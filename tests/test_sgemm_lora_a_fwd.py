@@ -425,6 +425,39 @@ def test_sgemm_lora_a_fwd_empty_input(dtype):
     assert out.numel() == 0
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_sgemm_lora_a_fwd_zero_input_dim(dtype):
+    """input_dim == 0 (K == 0) is an empty reduction -> full (num_tokens, N) zero matrix."""
+    num_tokens = 32
+    input_dim = 0
+    max_rank = 8
+    num_loras = 2
+    stack_num = 1
+    total_n = stack_num * max_rank
+
+    input_x = torch.empty((num_tokens, input_dim), dtype=dtype, device="xpu")
+    weights = torch.empty(
+        (num_loras, total_n, input_dim), dtype=dtype, device="xpu"
+    )
+    seg_indptr = torch.tensor([0, 16, 32], dtype=torch.int32, device="xpu")
+    weight_indices = torch.tensor([0, 1], dtype=torch.int32, device="xpu")
+    lora_ranks = torch.tensor([max_rank, max_rank // 2], dtype=torch.int32, device="xpu")
+
+    out = sgemm_lora_a_fwd(
+        input_x=input_x,
+        weights=weights,
+        stack_num=stack_num,
+        seg_indptr=seg_indptr,
+        weight_indices=weight_indices,
+        lora_ranks=lora_ranks,
+        seg_lens=None,
+    )
+
+    assert out.shape == (num_tokens, total_n)
+    assert out.dtype == dtype
+    assert torch.count_nonzero(out).item() == 0
+
+
 def test_sgemm_lora_a_fwd_int64_index_tensors_accepted():
     """seg_indptr / weight_indices in int64 should be cast internally and work.
 

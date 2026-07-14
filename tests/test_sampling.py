@@ -177,12 +177,15 @@ def torch_min_p_sampling(batch_size, vocab_size, p, normalized_prob):
     sorted_prob, indices = torch.sort(normalized_prob, descending=False)
     # scale min-p
     top_probs = sorted_prob[:, -1].unsqueeze(-1)
+    if isinstance(p, torch.Tensor):
+        p = p.unsqueeze(-1)
     scaled_p = p * top_probs
     # min-p mask
     mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32, device=f"{device}:0")
     mask.scatter_add_(1, indices, (sorted_prob >= scaled_p).int())
     return mask
-    
+
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
@@ -191,19 +194,38 @@ def test_min_p_sampling(batch_size, vocab_size, p):
     pre_norm_prob = torch.rand(batch_size, vocab_size, device=f"{device}:0")
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     mask = torch_min_p_sampling(batch_size, vocab_size, p, normalized_prob)
-    pytest.skip("xpu version to be implemented")
-    min_p_tensor = torch.full((batch_size,), p, device=f"{device}:0")
 
     num_trails = 1000
     for _ in range(num_trails):
         samples = sgl_kernel.min_p_sampling_from_probs(
             normalized_prob,
-            min_p_tensor,
+            p,
         )
 
         assert torch.all(mask[torch.arange(batch_size), samples] == 1), samples[
             torch.nonzero(mask[torch.arange(batch_size), samples] == 0)
         ]
+
+
+@pytest.mark.parametrize("batch_size", [1, 16, 128])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("p_range", [(0.05, 0.2), (0.2, 0.7)])
+def test_min_p_sampling_array(batch_size, vocab_size, p_range):
+    p_min, p_max = p_range
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device=f"{device}:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    # Per-row min-p array with varied values
+    min_p_arr = torch.empty(batch_size, device=f"{device}:0").uniform_(p_min, p_max)
+    mask = torch_min_p_sampling(batch_size, vocab_size, min_p_arr, normalized_prob)
+
+    num_trails = 1000
+    for _ in range(num_trails):
+        samples = sgl_kernel.min_p_sampling_from_probs(
+            normalized_prob,
+            min_p_arr,
+        )
 
         assert torch.all(mask[torch.arange(batch_size), samples] == 1), samples[
             torch.nonzero(mask[torch.arange(batch_size), samples] == 0)

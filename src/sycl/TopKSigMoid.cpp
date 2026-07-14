@@ -376,7 +376,7 @@ struct TopkGatingSigmoid {
 
         // The lead thread from each sub-group will write out the final results to global memory. (This will be a
         // single) thread per row of the input/output matrices.
-        const int idx = k * thread_row + k_idx;
+        const int idx = topk * thread_row + k_idx;
         if (correction_bias != nullptr) {
           max_val -= correction_bias[expert];
         }
@@ -545,12 +545,12 @@ void fused_topk_sigmoid(
       topk_indices,                                            \
       correction_bias,                                         \
       num_tokens,                                              \
-        topk - num_fused_shared_experts,                         \
+      topk - num_fused_shared_experts,                         \
       0,                                                       \
       num_experts,                                             \
       renormalize,                                             \
-        routed_scaling_factor,                                   \
-        num_fused_shared_experts,                                \
+      routed_scaling_factor,                                   \
+      num_fused_shared_experts,                                \
       queue);
 
   switch (num_experts) {
@@ -613,9 +613,9 @@ void topk_sigmoid(
     at::Tensor& topk_indices,
     at::Tensor& gating_output,
     bool renormalize,
-  const c10::optional<at::Tensor>& correction_bias,
-  double routed_scaling_factor,
-  int64_t num_fused_shared_experts) {
+    const c10::optional<at::Tensor>& correction_bias,
+    double routed_scaling_factor,
+    int64_t num_fused_shared_experts) {
   auto shape = gating_output.sizes().vec();
   TORCH_CHECK(shape.size() == 2, "gating_output must be 2D");
   int64_t n_tokens = shape[0];
@@ -628,7 +628,17 @@ void topk_sigmoid(
   // The max topk value is 8, which is constrained by 'malloc_per_item'.
   auto max_topk = n_experts < 8 ? n_experts : 8;
   TORCH_CHECK(0 < n_topk && n_topk <= max_topk, "topk must be less than or equal to num_experts and 8");
-  TORCH_CHECK(num_fused_shared_experts <= 1, "num_fused_shared_experts must be <= 1");
+  TORCH_CHECK(
+      num_fused_shared_experts >= 0 && num_fused_shared_experts <= 1, "num_fused_shared_experts must be in [0, 1]");
+  TORCH_CHECK(
+      n_topk > num_fused_shared_experts,
+      "topk must be greater than num_fused_shared_experts, got topk=",
+      n_topk,
+      ", num_fused_shared_experts=",
+      num_fused_shared_experts);
+  TORCH_CHECK(
+      !(num_fused_shared_experts > 0 && !renormalize && routed_scaling_factor == 0.0),
+      "routed_scaling_factor must be non-zero when num_fused_shared_experts > 0 and renormalize is false");
 
   const float* bias_ptr = nullptr;
   if (correction_bias.has_value()) {

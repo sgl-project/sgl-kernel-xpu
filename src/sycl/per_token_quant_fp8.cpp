@@ -285,10 +285,11 @@ void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor o
 
 #define LAUNCH_FOR_VEC(T, DST_DTYPE)             \
   do {                                           \
-    if (use_warp_kernel)                         \
+    if (use_warp_kernel) {                       \
       LAUNCH_SWITCH(LAUNCH_WARP, T, DST_DTYPE);  \
-    else                                         \
+    } else {                                     \
       LAUNCH_SWITCH(LAUNCH_BLOCK, T, DST_DTYPE); \
+    }                                            \
   } while (0)
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "sgl_per_token_quant_fp8", [&] {

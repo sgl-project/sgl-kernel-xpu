@@ -163,11 +163,7 @@ struct FusedTopkSigmoid {
       if (num_fused_shared_experts > 0) {
         const int shared_idx = offset + routed_topk;
         topk_ids[shared_idx] = experts;
-        if (renormalize) {
-          topk_weights[shared_idx] = 1.0f;
-        } else {
-          topk_weights[shared_idx] = row_sum_for_renormalize / routed_scaling_factor;
-        }
+        topk_weights[shared_idx] = renormalize ? 1.0f : row_sum_for_renormalize / routed_scaling_factor;
       }
 
       if (renormalize) {

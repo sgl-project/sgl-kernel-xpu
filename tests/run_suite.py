@@ -57,6 +57,8 @@ suites = {
         TestFile("test_fused_norm_rope_v2.py"),
         TestFile("test_hc_post.py"),
         TestFile("test_jit_kernels.py"),
+        TestFile("test_embedding_lora_a_fwd.py"),
+        TestFile("test_sgemm_lora_a_fwd.py"),
     ],
 }
 

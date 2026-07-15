@@ -61,30 +61,6 @@ inline float compute_freq_yarn(float base, int rotary_dim, int half_dim, float f
   return freq;
 }
 
-// ---------------------------------------------------------------------------
-// Sub-group width portability and occupancy-aware (persistent) launch sizing.
-//
-// Unlike CUDA's fixed 32-wide warp, Intel GPUs support a device-dependent set
-// of sub-group widths (commonly a subset of {8, 16, 32}). The kernels below
-// pin the width to NUM_REDUCE_STAGES via [[sycl::reqd_sub_group_size(...)]]
-// so compile-time lane arithmetic matches the runtime sub-group size, and
-// validate at launch time that the device actually supports that width.
-inline void check_subgroup_size_supported(int64_t required_size) {
-  auto* dev_prop = at::xpu::getDeviceProperties(dpcppGetDeviceIdOfCurrentQueue());
-  bool supported = false;
-  for (auto sz : dev_prop->sub_group_sizes) {
-    if (static_cast<int64_t>(sz) == required_size) {
-      supported = true;
-      break;
-    }
-  }
-  TORCH_CHECK(
-      supported,
-      "fused_qk_norm_rope kernels require sub-group size ",
-      required_size,
-      ", which is not supported by this device");
-}
-
 struct PersistentLaunchConfig {
   int64_t blockSize;
   int64_t gridSize;
@@ -146,18 +122,18 @@ inline void dispatchFusedQKNormRopeHeadDim(int64_t head_dim, const char* kernel_
   }
 }
 
-// Dispatches over vectorized VecSize instantiations (16/8/4/2), gated by
-// `kCandidate <= kElemsPerThread` so only widths that evenly divide the
-// per-lane element count are tried, then unconditionally falls back to
-// scalar (VecSize=1) -- always valid regardless of alignment -- if none
-// matched, guaranteeing the kernel is always launched. Shared by both the
-// packed-QKV and cos/sin-cache launch paths.
+// Dispatches over vectorized VecSize instantiations (16/8/4/2), accepting
+// only widths that both fit within the per-lane element count and divide it
+// evenly, then unconditionally falling back to scalar (VecSize=1) -- always
+// valid regardless of alignment -- if none matched, guaranteeing the kernel
+// is always launched. Shared by both the packed-QKV and cos/sin-cache launch
+// paths.
 template <int64_t kElemsPerThread, typename Fn>
 inline void dispatchFusedQKNormRopeVecSize(int64_t vec_size, Fn&& fn) {
   bool dispatched = false;
   auto try_vec_size = [&](auto vec_size_tag) {
     constexpr int64_t kCandidate = decltype(vec_size_tag)::value;
-    if constexpr (kCandidate <= kElemsPerThread) {
+    if constexpr (kCandidate <= kElemsPerThread && kElemsPerThread % kCandidate == 0) {
       if (!dispatched && vec_size == kCandidate) {
         fn(vec_size_tag);
         dispatched = true;
@@ -173,48 +149,45 @@ inline void dispatchFusedQKNormRopeVecSize(int64_t vec_size, Fn&& fn) {
   }
 }
 
-// Picks the largest power-of-two width (<= max_vec_size) for which every
-// pointer in `ptrs` is aligned to `elem_size * vec_size` bytes and every
-// stride in `elem_strides` (elements; row strides for non-contiguous q/k)
-// is a multiple of vec_size, shrinking to 1 (always safe) if needed.
+// Picks the largest power-of-two width (<= max_vec_size) for which:
+//   1. `elems_per_thread` (the per-lane algorithmic element count) is evenly
+//      divisible by vec_size -- required so the kernel's static_assert
+//      (kElemsPerThread % VecSize == 0) always holds;
+//   2. every pointer in `ptrs` is aligned to `elem_size * vec_size` bytes;
+//   3. every stride in `elem_strides` (elements; row strides for
+//      non-contiguous q/k) is itself a multiple of vec_size.
+// Falls back to 1 (always valid) if no larger width satisfies all three.
 // `elem_strides` defaults to empty for fully contiguous callers. Only the
-// physical load/store chunk width shrinks; the per-lane algorithmic
-// element count is unaffected.
+// physical load/store chunk width shrinks; `elems_per_thread` itself is
+// unaffected.
 inline int64_t pick_aligned_vec_size(
     int64_t max_vec_size,
     int64_t elem_size,
     std::initializer_list<const void*> ptrs,
+    int64_t elems_per_thread,
     std::initializer_list<int64_t> elem_strides = {}) {
-  int64_t vec_size = max_vec_size;
-  while (vec_size > 1) {
+  for (int64_t vec_size = max_vec_size; vec_size > 1; vec_size >>= 1) {
+    if (elems_per_thread % vec_size != 0) continue;
+
     const int64_t align_bytes = elem_size * vec_size;
-    bool all_aligned = true;
+    bool ok = true;
     for (const void* p : ptrs) {
       if (reinterpret_cast<uintptr_t>(p) % align_bytes != 0) {
-        all_aligned = false;
+        ok = false;
         break;
       }
     }
-    if (all_aligned) {
+    if (ok) {
       for (int64_t stride : elem_strides) {
         if (stride % vec_size != 0) {
-          all_aligned = false;
+          ok = false;
           break;
         }
       }
     }
-    if (all_aligned) break;
-    vec_size >>= 1;
+    if (ok) return vec_size;
   }
-  return vec_size;
-}
-
-// Caps the vector load/store chunk at 16 bytes (128-bit), matching
-// RMSNorm.cpp's convention, to avoid oversized vector instructions and
-// register pressure/spills for wide per-lane element counts.
-inline int64_t maxHwVecSize(int64_t elem_size) {
-  constexpr int64_t kMaxVecBytes = sizeof(float) * 4;
-  return std::max<int64_t>(1, kMaxVecBytes / elem_size);
+  return 1;
 }
 
 // Caps work-group size for warp-per-(token,head) kernels: work-groups wider
@@ -468,8 +441,10 @@ void launchFusedQKNormRopeImpl(
   const auto launch_cfg = computePersistentLaunchConfig(totalWarps, NUM_REDUCE_STAGES);
 
   constexpr int64_t numElemsPerThread = head_dim / NUM_REDUCE_STAGES;
-  const int64_t maxVecSize = std::min<int64_t>(numElemsPerThread, maxHwVecSize(sizeof(scalar_t)));
-  const int64_t vec_size = pick_aligned_vec_size(maxVecSize, sizeof(scalar_t), {qkv, q_weight, k_weight});
+  const int64_t preferredVecSize = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), sizeof(scalar_t));
+  const int64_t maxVecSize = std::min<int64_t>(numElemsPerThread, preferredVecSize);
+  const int64_t vec_size =
+      pick_aligned_vec_size(maxVecSize, sizeof(scalar_t), {qkv, q_weight, k_weight}, numElemsPerThread);
 
   dispatchFusedQKNormRopeVecSize<numElemsPerThread>(vec_size, [&](auto vec_size_tag) {
     constexpr int kVecSize = static_cast<int>(decltype(vec_size_tag)::value);
@@ -528,8 +503,6 @@ void fused_qk_norm_rope(
         "half_rotary_lanes must be a power of 2 for neox style, got ",
         half_rotary_lanes);
   }
-
-  check_subgroup_size_supported(NUM_REDUCE_STAGES);
 
   CHECK_DEVICE(qkv);
   CHECK_CONTIGUOUS(qkv);
@@ -824,7 +797,8 @@ void launchFusedQKNormRopeCacheImpl(
         "NeoX fused qknorm+rope requires rotary lane count to be a power of 2, got ",
         rotary_lanes);
   }
-  const int64_t maxVecSize = std::min<int64_t>(kElemsPerThread, maxHwVecSize(sizeof(scalar_t)));
+  const int64_t preferredVecSize = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), sizeof(scalar_t));
+  const int64_t maxVecSize = std::min<int64_t>(kElemsPerThread, preferredVecSize);
   // q/k rows may be non-contiguous beyond the last dimension (e.g. sliced
   // out of a larger packed buffer), so the chosen vector width must also
   // divide the token/head strides, not just satisfy base-pointer alignment.
@@ -832,6 +806,7 @@ void launchFusedQKNormRopeCacheImpl(
       maxVecSize,
       sizeof(scalar_t),
       {q_ptr, k_ptr, q_weight_ptr, k_weight_ptr},
+      kElemsPerThread,
       {q_token_stride, k_token_stride, q_head_stride, k_head_stride});
 
   dispatchFusedQKNormRopeVecSize<kElemsPerThread>(vec_size, [&](auto vec_size_tag) {
@@ -927,8 +902,6 @@ void fused_qk_norm_rope_with_cos_sin_cache_inplace(
   TORCH_CHECK(rope_dim <= head_dim, "rope_dim must be <= head_dim");
   TORCH_CHECK(positions.dim() == 1, "positions must be 1D [num_tokens]");
   TORCH_CHECK(positions.size(0) == num_tokens, "positions size must match flattened q/k tokens");
-
-  check_subgroup_size_supported(NUM_REDUCE_STAGES);
 
   auto queue = dpcppGetCurrentQueue();
 

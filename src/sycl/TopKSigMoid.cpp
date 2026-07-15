@@ -630,7 +630,7 @@ void topk_sigmoid(
       n_topk > num_fused_shared_experts,
       "topk must be greater than num_fused_shared_experts, got topk=",
       n_topk,
-      ", num_fused_shared_experts=",
+      ", num_fused_shared_experts = ",
       num_fused_shared_experts);
   TORCH_CHECK(
       !(num_fused_shared_experts > 0 && !renormalize && routed_scaling_factor == 0.0),

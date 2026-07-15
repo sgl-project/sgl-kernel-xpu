@@ -627,5 +627,106 @@ def test_fused_qk_norm_rope_with_cache(
     )
 
 
+@pytest.mark.parametrize(
+    "use_4d,batch_size,seq_len,num_qo_heads,num_kv_heads,head_dim,rope_dim,is_neox,dtype,position_dtype,last_dim_padding",
+    [
+        (False, 3, None, 4, 2, 64, 32, False, torch.bfloat16, torch.int32, 16),
+        (True, 2, 4, 16, 4, 128, 128, True, torch.float16, torch.int64, 32),
+    ],
+)
+def test_fused_qk_norm_rope_with_cache_last_dim_strided(
+    use_4d,
+    batch_size,
+    seq_len,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    rope_dim,
+    is_neox,
+    dtype,
+    position_dtype,
+    last_dim_padding,
+):
+    """Test fused QK norm + RoPE with non-contiguous Q/K views."""
+    torch.random.manual_seed(42)
+
+    assert rope_dim <= head_dim
+
+    if use_4d:
+        assert seq_len is not None
+        q_storage = torch.randn(
+            batch_size,
+            seq_len,
+            num_qo_heads,
+            head_dim + last_dim_padding,
+            dtype=dtype,
+            device=device,
+        )
+        k_storage = torch.randn(
+            batch_size,
+            seq_len,
+            num_kv_heads,
+            head_dim + last_dim_padding,
+            dtype=dtype,
+            device=device,
+        )
+        num_tokens = batch_size * seq_len
+    else:
+        q_storage = torch.randn(
+            batch_size,
+            num_qo_heads,
+            head_dim + last_dim_padding,
+            dtype=dtype,
+            device=device,
+        )
+        k_storage = torch.randn(
+            batch_size,
+            num_kv_heads,
+            head_dim + last_dim_padding,
+            dtype=dtype,
+            device=device,
+        )
+        num_tokens = batch_size
+
+    q = q_storage[..., :head_dim]
+    k = k_storage[..., :head_dim]
+    assert q.stride(-1) == 1
+    assert k.stride(-1) == 1
+    assert not q.is_contiguous()
+    assert not k.is_contiguous()
+
+    q_weight = torch.randn(head_dim, dtype=dtype, device=device)
+    k_weight = torch.randn(head_dim, dtype=dtype, device=device)
+    positions = torch.arange(num_tokens, dtype=position_dtype, device=device)
+    cos_sin_cache = create_cos_sin_cache(rope_dim, max_position=num_tokens + 1)
+
+    q_ref, k_ref = fused_qk_norm_rope_with_cache_reference(
+        q.clone().float(),
+        k.clone().float(),
+        q_weight.clone().float(),
+        k_weight.clone().float(),
+        cos_sin_cache,
+        positions,
+        is_neox,
+    )
+
+    sgl_kernel.fused_qk_norm_rope_with_cos_sin_cache_inplace(
+        q,
+        k,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        is_neox,
+    )
+
+    torch.testing.assert_close(
+        q, q_ref.to(dtype), rtol=precision[dtype], atol=precision[dtype]
+    )
+    torch.testing.assert_close(
+        k, k_ref.to(dtype), rtol=precision[dtype], atol=precision[dtype]
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

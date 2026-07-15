@@ -628,7 +628,7 @@ void topk_sigmoid(
       num_fused_shared_experts >= 0 && num_fused_shared_experts <= 1, "num_fused_shared_experts must be in [0, 1]");
   TORCH_CHECK(
       n_topk > num_fused_shared_experts,
-      "topk must be greater than num_fused_shared_experts, got topk=",
+      "topk must be greater than num_fused_shared_experts, got topk = ",
       n_topk,
       ", num_fused_shared_experts = ",
       num_fused_shared_experts);

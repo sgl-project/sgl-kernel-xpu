@@ -167,6 +167,8 @@ struct FusedTopkSigmoid {
       }
 
       if (renormalize) {
+        // Keep this tiny denominator guard aligned with CUDA
+        // Ref: https://github.com/sgl-project/sglang/blob/main/python/sglang/jit_kernel/csrc/moe/moe_topk_sigmoid.cuh
         const float scale = routed_scaling_factor / (row_sum_for_renormalize + 1e-20f);
         for (int i = 0; i < routed_topk; ++i) {
           topk_weights[offset + i] *= scale;
@@ -397,11 +399,7 @@ struct TopkGatingSigmoid {
 
     if (num_fused_shared_experts > 0 && thread_group_idx == 0) {
       const int last_idx = topk * thread_row + k;
-      if (renormalize) {
-        output[last_idx] = 1.0f;
-      } else {
-        output[last_idx] = row_sum_for_renormalize / routed_scaling_factor;
-      }
+      output[last_idx] = renormalize ? 1.0f : row_sum_for_renormalize / routed_scaling_factor;
       indices[last_idx] = NUM_EXPERTS;
     }
 

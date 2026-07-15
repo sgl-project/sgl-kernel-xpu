@@ -117,7 +117,7 @@ def get_benchmark(device="xpu"):
         positions = torch.randint(
             0, MAX_SEQ_LEN, (num_tokens,), device=device, dtype=torch.int64
         )
-        cos_sin_cache = create_cos_sin_cache(rope_dim).to(dtype)
+        cos_sin_cache = create_cos_sin_cache(rope_dim)
 
         if provider == "sglang":
             fn = lambda: sglang_fused_qk_rope_with_cache(

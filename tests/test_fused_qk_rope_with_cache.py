@@ -89,7 +89,7 @@ def test_rope(
     positions = torch.randint(
         0, MAX_SEQ_LEN, (batch_size,), device=DEVICE, dtype=torch.int64
     )
-    cos_sin_cache = create_cos_sin_cache(rope_dim).to(dtype)
+    cos_sin_cache = create_cos_sin_cache(rope_dim)
 
     q_ker, k_ker = q.clone(), k.clone()
     q_na, k_na = torch_impl_rope(q, k, cos_sin_cache, positions, rope_dim, is_neox)
@@ -111,7 +111,7 @@ def test_rope_position_dtypes(dtype: torch.dtype) -> None:
     q = torch.randn(batch_size, num_qo_heads, rope_dim, device=DEVICE, dtype=DTYPE)
     k = torch.randn(batch_size, num_kv_heads, rope_dim, device=DEVICE, dtype=DTYPE)
     positions = torch.randint(0, MAX_SEQ_LEN, (batch_size,), device=DEVICE, dtype=dtype)
-    cos_sin_cache = create_cos_sin_cache(rope_dim).to(DTYPE)
+    cos_sin_cache = create_cos_sin_cache(rope_dim)
 
     q_ker, k_ker = q.clone(), k.clone()
     q_na, k_na = torch_impl_rope(q, k, cos_sin_cache, positions, rope_dim, is_neox)

@@ -30,6 +30,7 @@
  **************************************************************************************************/
 
 #include <ATen/ATen.h>
+#include <ATen/OpMathType.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
@@ -401,7 +402,7 @@ template <bool is_neox, int64_t rope_dim, typename scalar_t, typename pos_t>
 struct FusedRopeCacheKernel {
   scalar_t* query;
   scalar_t* key;
-  const scalar_t* cos_sin_cache;
+  const float* cos_sin_cache;
   const pos_t* positions;
   int64_t q_stride;
   int64_t k_stride;
@@ -416,6 +417,8 @@ struct FusedRopeCacheKernel {
 
   [[sycl::reqd_sub_group_size(16)]]
   void operator()(sycl::nd_item<1> item) const {
+    using accscalar_t = at::opmath_type<scalar_t>;
+
     constexpr int64_t sg_size = 16;
     assert(sg_size == 16);
     const int64_t local_id = item.get_local_id(0);
@@ -427,13 +430,13 @@ struct FusedRopeCacheKernel {
     const int64_t num_works = num_tokens * num_qk_heads;
     constexpr int64_t half_rope = rope_dim / 2;
 
-    using storage_t = std::conditional_t<
+    using input_storage_t = std::conditional_t<
         std::is_same_v<scalar_t, c10::Half>,
         sycl::half,
         std::conditional_t<std::is_same_v<scalar_t, c10::BFloat16>, sycl::ext::oneapi::bfloat16, float>>;
 
     constexpr int64_t max_vec_bytes = 16;  // 128 bits
-    constexpr int64_t max_vec_elems = max_vec_bytes / (int64_t)sizeof(storage_t);
+    constexpr int64_t max_vec_elems = max_vec_bytes / (int64_t)sizeof(input_storage_t);
 
     // We use different heuristic vec_size choosing from cuda.
     // The following config would get the best performance(bf16/half):
@@ -443,8 +446,9 @@ struct FusedRopeCacheKernel {
     constexpr int64_t vec_size =
         is_neox ? (rope_dim < 256 ? 2 : max_vec_elems) : (rope_dim < 256 ? 1 : max_vec_elems / 2);
 
-    using vec_t = sycl::vec<storage_t, vec_size>;
-    using vec2_t = sycl::vec<storage_t, vec_size * 2>;  // for interleave pairs
+    using input_vec_t = sycl::vec<input_storage_t, vec_size>;
+    using input_vec2_t = sycl::vec<input_storage_t, vec_size * 2>;  // for interleave pairs
+    using cache_vec_t = sycl::vec<float, vec_size>;
 
     for (int64_t idx = worker_id; idx < num_works; idx += total_workers) {
       const int64_t token_id = idx / num_qk_heads;
@@ -463,15 +467,15 @@ struct FusedRopeCacheKernel {
         base_ptr = key + token_id * k_stride + head_index * k_head_stride;
       }
 
-      const scalar_t* cos_ptr = cos_sin_cache + pos * cache_stride;
-      const scalar_t* sin_ptr = cos_ptr + half_rope;
+      const float* cos_ptr = cos_sin_cache + pos * cache_stride;
+      const float* sin_ptr = cos_ptr + half_rope;
 
-      // Reinterpret scalar_t* as storage_t* for vectorized load/store.
+      // Reinterpret scalar_t* as input_storage_t* for vectorized load/store.
       // Safe: c10::Half and sycl::half share identical IEEE binary16 layout;
       //       same holds for c10::BFloat16 and sycl::ext::oneapi::bfloat16.
-      auto* base_sptr = reinterpret_cast<storage_t*>(base_ptr);
-      auto* cos_sptr = reinterpret_cast<const storage_t*>(cos_ptr);
-      auto* sin_sptr = reinterpret_cast<const storage_t*>(sin_ptr);
+      auto* base_sptr = reinterpret_cast<input_storage_t*>(base_ptr);
+      auto* cos_sptr = cos_ptr;
+      auto* sin_sptr = sin_ptr;
 
       if constexpr (is_neox) {
         auto* x_sptr = base_sptr;
@@ -479,35 +483,45 @@ struct FusedRopeCacheKernel {
 
 #pragma unroll
         for (int64_t i = lane_id * vec_size; i < half_rope; i += sg_size * vec_size) {
-          vec_t x_vec = *reinterpret_cast<const vec_t*>(x_sptr + i);
-          vec_t y_vec = *reinterpret_cast<const vec_t*>(y_sptr + i);
-          vec_t c_vec = *reinterpret_cast<const vec_t*>(cos_sptr + i);
-          vec_t s_vec = *reinterpret_cast<const vec_t*>(sin_sptr + i);
+          input_vec_t x_vec = *reinterpret_cast<const input_vec_t*>(x_sptr + i);
+          input_vec_t y_vec = *reinterpret_cast<const input_vec_t*>(y_sptr + i);
+          cache_vec_t c_vec = *reinterpret_cast<const cache_vec_t*>(cos_sptr + i);
+          cache_vec_t s_vec = *reinterpret_cast<const cache_vec_t*>(sin_sptr + i);
 
-          // Calculate syl::vec directly without iterating over vec_size.
-          vec_t out_x = x_vec * c_vec - y_vec * s_vec;
-          vec_t out_y = x_vec * s_vec + y_vec * c_vec;
+#pragma unroll
+          for (int j = 0; j < vec_size; j++) {
+            const accscalar_t x = static_cast<accscalar_t>(x_vec[j]);
+            const accscalar_t y = static_cast<accscalar_t>(y_vec[j]);
+            const accscalar_t c = static_cast<accscalar_t>(c_vec[j]);
+            const accscalar_t s = static_cast<accscalar_t>(s_vec[j]);
+            const accscalar_t out_x = x * c - y * s;
+            const accscalar_t out_y = x * s + y * c;
+            x_vec[j] = static_cast<input_storage_t>(out_x);
+            y_vec[j] = static_cast<input_storage_t>(out_y);
+          }
 
-          *reinterpret_cast<vec_t*>(x_sptr + i) = out_x;
-          *reinterpret_cast<vec_t*>(y_sptr + i) = out_y;
+          *reinterpret_cast<input_vec_t*>(x_sptr + i) = x_vec;
+          *reinterpret_cast<input_vec_t*>(y_sptr + i) = y_vec;
         }
       } else {
 #pragma unroll
         for (int64_t i = lane_id * vec_size; i < half_rope; i += sg_size * vec_size) {
-          vec2_t v = *reinterpret_cast<const vec2_t*>(base_sptr + 2 * i);
-          vec_t c_vec = *reinterpret_cast<const vec_t*>(cos_sptr + i);
-          vec_t s_vec = *reinterpret_cast<const vec_t*>(sin_sptr + i);
+          input_vec2_t v = *reinterpret_cast<const input_vec2_t*>(base_sptr + 2 * i);
+          cache_vec_t c_vec = *reinterpret_cast<const cache_vec_t*>(cos_sptr + i);
+          cache_vec_t s_vec = *reinterpret_cast<const cache_vec_t*>(sin_sptr + i);
 
 #pragma unroll
           for (int j = 0; j < vec_size; j++) {
-            const storage_t x = v[2 * j];
-            const storage_t y = v[2 * j + 1];
-            const storage_t c = c_vec[j];
-            const storage_t s = s_vec[j];
-            v[2 * j] = x * c - y * s;
-            v[2 * j + 1] = x * s + y * c;
+            const accscalar_t x = static_cast<accscalar_t>(v[2 * j]);
+            const accscalar_t y = static_cast<accscalar_t>(v[2 * j + 1]);
+            const accscalar_t c = static_cast<accscalar_t>(c_vec[j]);
+            const accscalar_t s = static_cast<accscalar_t>(s_vec[j]);
+            const accscalar_t out_x = x * c - y * s;
+            const accscalar_t out_y = x * s + y * c;
+            v[2 * j] = static_cast<input_storage_t>(out_x);
+            v[2 * j + 1] = static_cast<input_storage_t>(out_y);
           }
-          *reinterpret_cast<vec2_t*>(base_sptr + 2 * i) = v;
+          *reinterpret_cast<input_vec2_t*>(base_sptr + 2 * i) = v;
         }
       }
     }
@@ -532,7 +546,7 @@ void launch_fused_rope_cache_kernel_scalar(
   FusedRopeCacheKernel<is_neox, rope_dim, scalar_t, pos_t> kernel{
       query.data_ptr<scalar_t>(),
       key.data_ptr<scalar_t>(),
-      cos_sin_cache.data_ptr<scalar_t>(),
+      cos_sin_cache.data_ptr<float>(),
       positions.data_ptr<pos_t>(),
       query.stride(0),
       key.stride(0),
@@ -562,22 +576,25 @@ void fused_qk_rope_with_cos_sin_cache_inplace(
       input_dim == 3,
       "fused_qk_rope_with_cos_sin_cache_inplace only supports 3D input [num_tokens, num_heads, rope_dim]");
 
-#define LAUNCH_ROPE_CACHE_KERNEL(IS_NEOX, POS_T)                                                                  \
-  switch (rope_dim) {                                                                                             \
-    case 64:                                                                                                      \
-      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 64, scalar_t, POS_T>(query, key, cos_sin_cache, positions);  \
-      break;                                                                                                      \
-    case 128:                                                                                                     \
-      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 128, scalar_t, POS_T>(query, key, cos_sin_cache, positions); \
-      break;                                                                                                      \
-    case 256:                                                                                                     \
-      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 256, scalar_t, POS_T>(query, key, cos_sin_cache, positions); \
-      break;                                                                                                      \
-    case 512:                                                                                                     \
-      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 512, scalar_t, POS_T>(query, key, cos_sin_cache, positions); \
-      break;                                                                                                      \
-    default:                                                                                                      \
-      TORCH_CHECK(false, "Unsupported rope_dim: ", rope_dim);                                                     \
+  at::Tensor cos_sin_cache_fp32 =
+      (cos_sin_cache.scalar_type() == at::kFloat) ? cos_sin_cache : cos_sin_cache.to(at::kFloat);
+
+#define LAUNCH_ROPE_CACHE_KERNEL(IS_NEOX, POS_T)                                                                       \
+  switch (rope_dim) {                                                                                                  \
+    case 64:                                                                                                           \
+      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 64, scalar_t, POS_T>(query, key, cos_sin_cache_fp32, positions);  \
+      break;                                                                                                           \
+    case 128:                                                                                                          \
+      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 128, scalar_t, POS_T>(query, key, cos_sin_cache_fp32, positions); \
+      break;                                                                                                           \
+    case 256:                                                                                                          \
+      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 256, scalar_t, POS_T>(query, key, cos_sin_cache_fp32, positions); \
+      break;                                                                                                           \
+    case 512:                                                                                                          \
+      launch_fused_rope_cache_kernel_scalar<IS_NEOX, 512, scalar_t, POS_T>(query, key, cos_sin_cache_fp32, positions); \
+      break;                                                                                                           \
+    default:                                                                                                           \
+      TORCH_CHECK(false, "Unsupported rope_dim: ", rope_dim);                                                          \
   }
 
 #define DISPATCH_ROPE_CACHE_KERNEL_BY_LAYOUT(POS_T) \

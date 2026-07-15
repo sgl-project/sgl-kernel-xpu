@@ -44,16 +44,19 @@ def apply_rotary_emb(
         is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
             positional embeddings.
     """
-    cos = cos.unsqueeze(-2).to(x.dtype)
-    sin = sin.unsqueeze(-2).to(x.dtype)
+    # Match kernel behavior: use fp32 cos/sin and fp32 arithmetic,
+    # then cast back to the input dtype on store.
+    cos = cos.unsqueeze(-2)
+    sin = sin.unsqueeze(-2)
+    x_fp32 = x.float()
     if is_neox_style:
-        x1, x2 = torch.chunk(x, 2, dim=-1)
+        x1, x2 = torch.chunk(x_fp32, 2, dim=-1)
     else:
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
+        x1 = x_fp32[..., ::2]
+        x2 = x_fp32[..., 1::2]
     o1 = x1 * cos - x2 * sin
     o2 = x2 * cos + x1 * sin
     if is_neox_style:
-        return torch.cat((o1, o2), dim=-1)
+        return torch.cat((o1, o2), dim=-1).to(x.dtype)
     else:
-        return torch.stack((o1, o2), dim=-1).flatten(-2)
+        return torch.stack((o1, o2), dim=-1).flatten(-2).to(x.dtype)

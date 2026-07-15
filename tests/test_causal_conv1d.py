@@ -3,8 +3,7 @@ from typing import Optional
 
 import torch
 import utils
-from sgl_kernel import causal_conv1d_fwd
-from sgl_kernel import causal_conv1d_update as causal_conv1d_update_kernel
+from sgl_kernel import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
 
 device = utils.get_device()
 
@@ -55,7 +54,7 @@ def causal_conv1d_fn(
         x = x.contiguous()
     bias = bias.contiguous() if bias is not None else None
 
-    causal_conv1d_fwd(
+    causal_conv1d_fn_xpu(
         x,
         weight,
         bias,
@@ -109,7 +108,7 @@ def causal_conv1d_update(
     unsqueeze = x.dim() == 2
     if unsqueeze:
         x = x.unsqueeze(-1)
-    causal_conv1d_update_kernel(
+    causal_conv1d_update_xpu(
         x,
         conv_state,
         weight,
@@ -241,7 +240,6 @@ def causal_conv1d_update_ref(
 def test_causal_conv1d(
     batch, dim, seqlen, width, has_bias, silu_activation, has_initial_state, itype
 ):
-    device = device
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
@@ -289,7 +287,6 @@ def test_causal_conv1d(
 @pytest.mark.parametrize("width", [4])
 @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
 def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, itype):
-    device = device
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
@@ -323,7 +320,6 @@ def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, ity
 def test_causal_conv1d_update_with_batch_gather(
     with_padding, dim, width, seqlen, has_bias, silu_activation, itype
 ):
-    device = device
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
@@ -388,7 +384,6 @@ def test_causal_conv1d_update_with_batch_gather(
 def test_causal_conv1d_varlen(
     with_padding, dim, seqlen, width, has_bias, silu_activation, itype
 ):
-    device = device
     torch.accelerator.empty_cache()
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:

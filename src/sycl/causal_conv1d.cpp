@@ -407,7 +407,6 @@ void causal_conv1d_fwd(
 		const std::optional<at::Tensor>& has_initial_state,
 		bool silu_activation,
 		int64_t pad_slot_id) {
-	printf(" in causal_conv1d_fwd \n");
 	auto input_type = x.scalar_type();
 	auto weight_type = weight.scalar_type();
 	TORCH_CHECK(input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == at::ScalarType::BFloat16);
@@ -510,7 +509,6 @@ void causal_conv1d_update(
 		const std::optional<at::Tensor>& cache_seqlens_,
 		const std::optional<at::Tensor>& conv_state_indices_,
 		int64_t pad_slot_id) {
-	printf(" in causal_conv1d_update \n");
 	auto input_type = x.scalar_type();
     auto weight_type = weight.scalar_type();
     TORCH_CHECK(input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == at::ScalarType::BFloat16);

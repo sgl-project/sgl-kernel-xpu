@@ -209,7 +209,12 @@ def flash_mla_prefill(
     batch_size = cu_seqlens_q.shape[0] - 1
     assert seq_lens_k.shape[0] == batch_size
 
-    out = q_nope.new_empty((total_q, H, D_latent))
+    # The kernel epilogue writes Q_TILE_M rows per tile without bounds-checking.
+    # Pad the output to the next multiple of Q_TILE_M (max 256 for the Large
+    # bucket) so partial last tiles don't cause OOB writes and device-lost.
+    _Q_TILE_MAX = 256
+    total_q_padded = (total_q + _Q_TILE_MAX - 1) // _Q_TILE_MAX * _Q_TILE_MAX
+    out = q_nope.new_empty((total_q_padded, H, D_latent))
 
     torch.ops.sgl_kernel.flash_mla_prefill.default(
         out,
@@ -225,7 +230,7 @@ def flash_mla_prefill(
         causal,
         num_kv_splits,
     )
-    return out
+    return out[:total_q]
 
 
 def flash_mla_prefill_get_workspace_size(

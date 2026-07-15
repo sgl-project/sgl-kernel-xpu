@@ -56,6 +56,7 @@ suites = {
         TestFile("test_fused_q_indexer_rope_hadamard_quant.py"),
         TestFile("test_fused_norm_rope_v2.py"),
         TestFile("test_hc_post.py"),
+        TestFile("test_jit_kernels.py"),
     ],
 }
 

@@ -158,6 +158,17 @@ def hc_pre_gemm_sqr_sum(
     torch.ops.sgl_kernel.hc_pre_gemm_sqr_sum.default(C, sqr_sum, A, B)
 
 
+def hc_post(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    out = torch.empty_like(residual)
+    torch.ops.sgl_kernel.hc_post.default(x, residual, post_layer_mix, comb_res_mix, out)
+    return out
+
+
 def _mhc_pre_n_splits_pre(num_tokens: int) -> int:
     return 32 if num_tokens <= 2048 else 1
 

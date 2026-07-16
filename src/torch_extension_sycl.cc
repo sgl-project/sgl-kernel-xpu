@@ -170,6 +170,40 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    int      sm_margin,"
       "    Tensor(a!)?  out=None) -> (Tensor(a!), Tensor, Tensor, Tensor)");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
+  m.def(
+      "fwd_appendkv(Tensor q,"
+      "    Tensor   k,"
+      "    Tensor   v,"
+      "    Tensor?  q_v,"
+      "    Tensor   cu_seqlens_q,"
+      "    Tensor   cu_seqlens_k,"
+      "    int      max_seqlen_q,"
+      "    int      max_seqlen_k,"
+      "    Tensor?  page_table,"
+      "    Tensor?  kv_batch_idx,"
+      "    Tensor?  leftpad_k,"
+      "    Tensor?  rotary_cos,"
+      "    Tensor?  rotary_sin,"
+      "    Tensor?  seqlens_rotary,"
+      "    Tensor?  q_descale,"
+      "    Tensor?  k_descale,"
+      "    Tensor?  v_descale,"
+      "    float    softmax_scale,"
+      "    Tensor?  sinks,"
+      "    bool     is_causal,"
+      "    int      window_size_left,"
+      "    int      window_size_right,"
+      "    float    softcap,"
+      "    bool     is_rotary_interleaved,"
+      "    Tensor?  scheduler_metadata,"
+      "    int      num_kv_splits,"
+      "    bool?    pack_gqa,"
+      "    int      sm_margin,"
+      "    Tensor(a!)?  out=None,"
+      "    Tensor?  k_new=None,"
+      "    Tensor?  v_new=None,"
+      "    Tensor?  cu_seqlens_k_new=None) -> (Tensor(a!), Tensor, Tensor, Tensor)");
+  m.impl("fwd_appendkv", torch::kXPU, make_pytorch_shim(&mha_fwd_appendkv));
 
   m.def("flash_mla_get_workspace_size", &flash_mla_get_workspace_size);
 

@@ -15,6 +15,8 @@ def torch_impl_rope(
     rotary_dim: int,
     is_neox: bool,
 ):
+    q_dtype = q.dtype
+    k_dtype = k.dtype
     head_size = q.shape[-1]
     positions = positions.flatten()
     num_tokens = positions.shape[0]
@@ -27,18 +29,18 @@ def torch_impl_rope(
     sin = sin_cache[positions]
 
     query_shape = q.shape
-    query = q.view(num_tokens, -1, head_size)
+    query = q.float().view(num_tokens, -1, head_size)
     query_rot = query[..., :rotary_dim]
     query_pass = query[..., rotary_dim:]
     query_rot = apply_rotary_emb(query_rot, cos, sin, is_neox)
-    query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+    query = torch.cat((query_rot, query_pass), dim=-1).to(q_dtype).reshape(query_shape)
 
     key_shape = k.shape
-    key = k.view(num_tokens, -1, head_size)
+    key = k.float().view(num_tokens, -1, head_size)
     key_rot = key[..., :rotary_dim]
     key_pass = key[..., rotary_dim:]
     key_rot = apply_rotary_emb(key_rot, cos, sin, is_neox)
-    key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+    key = torch.cat((key_rot, key_pass), dim=-1).to(k_dtype).reshape(key_shape)
     return query, key
 
 
@@ -89,7 +91,7 @@ def test_rope(
     positions = torch.randint(
         0, MAX_SEQ_LEN, (batch_size,), device=DEVICE, dtype=torch.int64
     )
-    cos_sin_cache = create_cos_sin_cache(rope_dim).to(dtype)
+    cos_sin_cache = create_cos_sin_cache(rope_dim)
 
     q_ker, k_ker = q.clone(), k.clone()
     q_na, k_na = torch_impl_rope(q, k, cos_sin_cache, positions, rope_dim, is_neox)
@@ -111,7 +113,7 @@ def test_rope_position_dtypes(dtype: torch.dtype) -> None:
     q = torch.randn(batch_size, num_qo_heads, rope_dim, device=DEVICE, dtype=DTYPE)
     k = torch.randn(batch_size, num_kv_heads, rope_dim, device=DEVICE, dtype=DTYPE)
     positions = torch.randint(0, MAX_SEQ_LEN, (batch_size,), device=DEVICE, dtype=dtype)
-    cos_sin_cache = create_cos_sin_cache(rope_dim).to(DTYPE)
+    cos_sin_cache = create_cos_sin_cache(rope_dim)
 
     q_ker, k_ker = q.clone(), k.clone()
     q_na, k_na = torch_impl_rope(q, k, cos_sin_cache, positions, rope_dim, is_neox)

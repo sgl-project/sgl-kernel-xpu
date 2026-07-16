@@ -51,23 +51,23 @@ namespace {
 // DISPATCH_SGEMM_LORA_A_FWD_TILE (and to SGEMMLoraAFwdXe20.cmake +
 // sgemm_lora_a_fwd_dispatch.hpp + sgemm_lora_a_fwd_types.hpp) with a runtime
 // heuristic (e.g. average M per segment) picking the tag.
-#define DISPATCH_SGEMM_LORA_A_FWD_TILE(ELEM, ...)                              \
-  do {                                                                         \
+#define DISPATCH_SGEMM_LORA_A_FWD_TILE(ELEM, ...)                               \
+  do {                                                                          \
     sgemm_lora_a_fwd_impl::launch_sgemm_lora_a_fwd_##ELEM##_large(__VA_ARGS__); \
   } while (0)
 
-#define DISPATCH_SGEMM_LORA_A_FWD_DTYPE(...)                                                       \
-  do {                                                                                             \
-    switch (weights.scalar_type()) {                                                               \
-      case torch::kHalf:                                                                           \
-        DISPATCH_SGEMM_LORA_A_FWD_TILE(half, __VA_ARGS__);                                         \
-        break;                                                                                     \
-      case torch::kBFloat16:                                                                       \
-        DISPATCH_SGEMM_LORA_A_FWD_TILE(bf16, __VA_ARGS__);                                         \
-        break;                                                                                     \
-      default:                                                                                     \
+#define DISPATCH_SGEMM_LORA_A_FWD_DTYPE(...)                                                               \
+  do {                                                                                                     \
+    switch (weights.scalar_type()) {                                                                       \
+      case torch::kHalf:                                                                                   \
+        DISPATCH_SGEMM_LORA_A_FWD_TILE(half, __VA_ARGS__);                                                 \
+        break;                                                                                             \
+      case torch::kBFloat16:                                                                               \
+        DISPATCH_SGEMM_LORA_A_FWD_TILE(bf16, __VA_ARGS__);                                                 \
+        break;                                                                                             \
+      default:                                                                                             \
         TORCH_CHECK(false, "Unsupported data type for sgemm_lora_a_fwd weights: ", weights.scalar_type()); \
-    }                                                                                              \
+    }                                                                                                      \
   } while (0)
 
 }  // namespace

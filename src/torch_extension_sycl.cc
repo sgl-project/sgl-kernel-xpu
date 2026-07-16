@@ -167,7 +167,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    int      num_kv_splits,"
       "    bool?    pack_gqa,"
       "    int      sm_margin,"
-      "    Tensor(a!)?  out=None) -> (Tensor(a!), Tensor, Tensor, Tensor)");
+      "    Tensor(a!)?  out=None,"
+      "    Tensor?  k_new=None,"
+      "    Tensor?  v_new=None,"
+      "    Tensor?  cu_seqlens_k_new=None) -> (Tensor(a!), Tensor, Tensor, Tensor)");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
 
   m.def("flash_mla_get_workspace_size", &flash_mla_get_workspace_size);

@@ -56,6 +56,6 @@ EXTERN_FMHA_PREFILL_RUNNER(512)
 // Directly call struct operator() - no function pointers.
 // Expands inside prefill::mha_fwd where a local `params` is in scope.
 
-#define DISPATCH_PREFILL_KERNEL(HD) FmhaPrefillRunner<HD>{}(params)
+#define DISPATCH_PREFILL_KERNEL(HD) ::prefill::FmhaPrefillRunner<HD>{}(params)
 
 }  // namespace prefill

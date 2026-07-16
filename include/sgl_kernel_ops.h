@@ -321,7 +321,7 @@ torch::Tensor swiglu_gpt_oss_sigmoid_alpha(torch::Tensor x, double alpha, double
 
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
-    at::Tensor& bias,
+    const std::optional<at::Tensor>& bias,
     int64_t num_expert_group,
     int64_t topk_group,
     int64_t topk,

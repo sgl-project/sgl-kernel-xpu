@@ -100,7 +100,7 @@ def moe_sum(
 
 def moe_fused_gate(
     input_tensor,
-    bias,
+    bias: Optional[torch.Tensor],
     num_expert_group,
     topk_group,
     topk,

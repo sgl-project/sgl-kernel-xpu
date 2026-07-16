@@ -17,7 +17,7 @@ from sgl_kernel import moe_fused_gate
 def biased_grouped_topk_native(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
+    correction_bias: Optional[torch.Tensor],
     topk: int,
     renormalize: bool,
     num_expert_group: Optional[int] = None,
@@ -39,7 +39,9 @@ def biased_grouped_topk_native(
 
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
-    scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
+    scores_for_choice = scores.view(num_token, -1)
+    if correction_bias is not None:
+        scores_for_choice = scores_for_choice + correction_bias.unsqueeze(0)
     group_sum_count = 1 if scoring_func == "softmax" else 2
     group_scores = (
         scores_for_choice.view(num_token, num_expert_group, -1)
@@ -125,8 +127,8 @@ def test_moe_fused_gate_combined(
     tensor = torch.rand((seq_length, num_experts), dtype=dtype, device="xpu")
     scores = tensor.clone()
     if scoring_func == "softmax":
-        # grouped_topk with softmax activation doesn't have bias
-        bias = torch.zeros(num_experts, dtype=dtype, device="xpu")
+        # grouped_topk with softmax activation does not use correction bias.
+        bias = None
     else:
         bias = torch.rand(num_experts, dtype=dtype, device="xpu")
     topk = topk + num_fused_shared_experts

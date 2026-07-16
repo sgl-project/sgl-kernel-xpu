@@ -10,7 +10,7 @@ all_results = []
 def biased_grouped_topk_native(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
+    correction_bias: Optional[torch.Tensor],
     topk: int,
     renormalize: bool,
     num_expert_group: Optional[int] = None,
@@ -31,7 +31,9 @@ def biased_grouped_topk_native(
         raise ValueError(f"Unknown scoring_func: {scoring_func}")
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
-    scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
+    scores_for_choice = scores.view(num_token, -1)
+    if correction_bias is not None:
+        scores_for_choice = scores_for_choice + correction_bias.unsqueeze(0)
     group_sum_count = 1 if scoring_func == "softmax" else 2
     group_scores = (
         scores_for_choice.view(num_token, num_expert_group, -1)
@@ -85,7 +87,12 @@ def biased_grouped_topk_native(
 
 
 def biased_grouped_topk_org(
-    scores, bias, num_expert_group, topk_group, topk, scoring_func
+    scores,
+    bias: Optional[torch.Tensor],
+    num_expert_group,
+    topk_group,
+    topk,
+    scoring_func,
 ):
     return biased_grouped_topk_native(
         scores,
@@ -103,7 +110,12 @@ def biased_grouped_topk_org(
 
 
 def biased_grouped_topk_org_kernel(
-    scores, bias, num_expert_group, topk_group, topk, scoring_func
+    scores,
+    bias: Optional[torch.Tensor],
+    num_expert_group,
+    topk_group,
+    topk,
+    scoring_func,
 ):
     return moe_fused_gate(
         input_tensor=scores,
@@ -160,7 +172,8 @@ def benchmark(seq_length, provider):
 
     scores = torch.randn((seq_length, num_experts), device=device, dtype=dtype)
     if scoring_func == "softmax":
-        bias = torch.zeros(num_experts, device=device, dtype=dtype)
+        # grouped topk with softmax does not use correction bias
+        bias = None
     else:
         bias = torch.rand(num_experts, device=device, dtype=dtype)
 
@@ -170,7 +183,7 @@ def benchmark(seq_length, provider):
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: biased_grouped_topk_org(
                 scores.clone(),
-                bias.clone(),
+                None if bias is None else bias.clone(),
                 num_expert_group,
                 topk_group,
                 topk,
@@ -182,7 +195,7 @@ def benchmark(seq_length, provider):
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: biased_grouped_topk_org_kernel(
                 scores.clone(),
-                bias.clone(),
+                None if bias is None else bias.clone(),
                 num_expert_group,
                 topk_group,
                 topk,

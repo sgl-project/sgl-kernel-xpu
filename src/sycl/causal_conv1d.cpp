@@ -387,7 +387,7 @@ static void launch_causal_conv1d_update(const ConvParamsBase& params) {
 }
 
 void causal_conv1d_fwd(
-    const at::Tensor& x,
+    at::Tensor& x,
     const at::Tensor& weight,
     const std::optional<at::Tensor>& bias_,
     const std::optional<at::Tensor>& conv_states,
@@ -495,8 +495,8 @@ void causal_conv1d_fwd(
 }
 
 void causal_conv1d_update(
-    const at::Tensor& x,
-    const at::Tensor& conv_state,
+    at::Tensor& x,
+    at::Tensor& conv_state,
     const at::Tensor& weight,
     const std::optional<at::Tensor>& bias_,
     bool silu_activation,

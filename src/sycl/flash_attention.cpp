@@ -1252,6 +1252,9 @@ std::vector<at::Tensor> mha_fwd(
   int64_t batch_size = cu_seqlens_q.size(0) - 1;
   TORCH_CHECK(batch_size >= 0, "cu_seqlens_q must have at least 1 element.");
 
+  auto seqlens_q = cu_seqlens_q.slice(0, 1, batch_size + 1).sub(cu_seqlens_q.slice(0, 0, batch_size));
+  auto is_prefill = seqlens_q.gt(1).contiguous();  // true for prefill batches
+
   // Forward every shared argument to a sub-kernel, overriding only the output
   // tensor (out_opt) and the per-batch skip mask.
   auto launch = [&](auto&& fn, std::optional<at::Tensor> out_opt, std::optional<at::Tensor> skip_mask) {
@@ -1287,37 +1290,6 @@ std::vector<at::Tensor> mha_fwd(
         std::move(out_opt),
         std::move(skip_mask));
   };
-
-  // Pure-decode fast path: max_seqlen_q is the MAX seqlen_q over all batches, so
-  // max_seqlen_q <= 1 guarantees EVERY batch is decode (no seqlen_q > 1 prefill
-  // rows) for any batch_size. The prefill sub-launch below would then launch a
-  // full kernel grid only to `continue` past every tile — pure overhead. Run
-  // just the decode kernel. Gate uses only the host scalar max_seqlen_q, so it
-  // adds no device synchronization.
-  if (max_seqlen_q <= 1) {
-    auto out = launch(decode::mha_fwd, std::move(out_), std::nullopt)[0];
-    auto empty_f = at::empty({0}, q.options().dtype(at::kFloat));
-    return {out, empty_f, empty_f, empty_f};
-  }
-
-  // Pure-prefill fast path: symmetrically, when there are no decode rows the
-  // decode sub-launch is pure overhead. Unlike the decode case this cannot be proven from max_seqlen_q
-  // alone: max_seqlen_q > 1 only means AT LEAST ONE batch is prefill, not all of
-  // them (others may be seqlen_q <= 1 decode). Proving "all prefill" for
-  // batch_size > 1 would require is_prefill.all() — a device reduction + D2H
-  // sync that costs more than it saves. But batch_size == 1 makes it provable
-  // from host scalars: a single sequence with max_seqlen_q > 1 IS that prefill
-  // sequence and has no decode rows. The general mixed-batch (batch_size > 1)
-  // path below keeps both launches so decode rows are still handled correctly.
-  if (batch_size == 1 && max_seqlen_q > 1) {
-    auto out = launch(prefill::mha_fwd, std::move(out_), std::nullopt)[0];
-    auto empty_f = at::empty({0}, q.options().dtype(at::kFloat));
-    return {out, empty_f, empty_f, empty_f};
-  }
-
-  // Mixed-batch path: launch two sub-kernels of prefill and decode.
-  auto seqlens_q = cu_seqlens_q.slice(0, 1, batch_size + 1).sub(cu_seqlens_q.slice(0, 0, batch_size));
-  auto is_prefill = seqlens_q.gt(1).contiguous();  // true for prefill batches
 
   // Launch 1: decode allocates the shared output (or reuses the caller-provided
   // out_ buffer) and skips prefill batches.
@@ -1379,68 +1351,62 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
   auto to_tuple = [](std::vector<at::Tensor> v) { return std::make_tuple(v[0], v[1], v[2], v[3]); };
   int const num_heads = q.size(-2);
   int const num_heads_k = k.size(-2);
-  if (max_seqlen_q == 1 && page_table.has_value()) {
-    return to_tuple(decode::mha_fwd(
-        q,
-        k,
-        v,
-        q_v_,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        page_table,
-        kv_batch_idx_,
-        leftpad_k_,
-        rotary_cos_,
-        rotary_sin_,
-        seqlens_rotary_,
-        q_descale_,
-        k_descale_,
-        v_descale_,
-        softmax_scale_,
-        sinks_,
-        is_causal,
-        window_size_left,
-        window_size_right,
-        softcap,
-        is_rotary_interleaved,
-        scheduler_metadata_,
-        num_kv_splits,
-        pack_gqa_,
-        sm_margin,
-        out_));
+  int64_t batch_size = cu_seqlens_q.size(0) - 1;
+
+  // decode / prefill / chunkprefill all take the same leading argument list;
+  // only the trailing parameters differ. Bind the shared arguments once here so
+  // each branch reduces to a single call. ``tail`` carries the callee-specific
+  // suffix: decode and prefill additionally accept a per-batch skip mask (unused
+  // at this top level, so left as std::nullopt); chunkprefill has no such slot.
+  auto dispatch = [&](auto&& fn, auto&&... tail) {
+    return to_tuple(
+        fn(q,
+           k,
+           v,
+           q_v_,
+           cu_seqlens_q,
+           cu_seqlens_k,
+           max_seqlen_q,
+           max_seqlen_k,
+           page_table,
+           kv_batch_idx_,
+           leftpad_k_,
+           rotary_cos_,
+           rotary_sin_,
+           seqlens_rotary_,
+           q_descale_,
+           k_descale_,
+           v_descale_,
+           softmax_scale_,
+           sinks_,
+           is_causal,
+           window_size_left,
+           window_size_right,
+           softcap,
+           is_rotary_interleaved,
+           scheduler_metadata_,
+           num_kv_splits,
+           pack_gqa_,
+           sm_margin,
+           out_,
+           std::forward<decltype(tail)>(tail)...));
+  };
+
+  if (max_seqlen_q == 1) {
+    // Pure decode path
+    return dispatch(decode::mha_fwd, std::nullopt);
+  } else if (!page_table.has_value() || batch_size == 1) {
+    // Pure prefill path
+    // Non-paged attn: assumption of all seqlen_q > 1;
+    // Paged attn: Proving "all prefill" for batch_size > 1 would require
+    // is_prefill.all() — a device reduction + D2H sync that costs more than it saves.
+    // But batch_size == 1 makes it provable from host scalars:
+    // a single sequence with max_seqlen_q > 1 is prefill
+    return dispatch(prefill::mha_fwd, std::nullopt);
   } else {
-    return to_tuple(chunkprefill::mha_fwd(
-        q,
-        k,
-        v,
-        q_v_,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        page_table,
-        kv_batch_idx_,
-        leftpad_k_,
-        rotary_cos_,
-        rotary_sin_,
-        seqlens_rotary_,
-        q_descale_,
-        k_descale_,
-        v_descale_,
-        softmax_scale_,
-        sinks_,
-        is_causal,
-        window_size_left,
-        window_size_right,
-        softcap,
-        is_rotary_interleaved,
-        scheduler_metadata_,
-        num_kv_splits,
-        pack_gqa_,
-        sm_margin,
-        out_));
+    // Chunk prefill path
+    // Paged attn with max_seqlen_q > 1 and batch_size > 1
+    return dispatch(chunkprefill::mha_fwd);
   }
 }
 #undef SYCL_INTEL_TARGET

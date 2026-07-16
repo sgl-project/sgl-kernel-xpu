@@ -151,11 +151,6 @@ class XeFMHAFwdKernel {
     // Per-batch skip mask for two-kernel mix-batch dispatch
     // If non-null, the tile loop skips batches where mask[idx_b] is true.
     const bool* skip_batch_mask = nullptr;
-    // FP8 KV per-tensor dequant scales. Device pointers to the single descale
-    // scalar; the kernel dereferences them on-device, so the caller never does
-    // a host-side D2H sync (tensor.item()). Null => non-fp8 KV (scale = 1.0f).
-    const float* scale_k_ptr = nullptr;
-    const float* scale_v_ptr = nullptr;
   };
   using KernelParams = KernelArguments;
 
@@ -243,6 +238,25 @@ class XeFMHAFwdKernel {
   }
 
   CUTLASS_DEVICE
+  int get_k_new_len(MainloopParams const& mainloop, int batch) {
+    if constexpr (CollectiveMainloop::AppendKV) {
+      if (mainloop.append.ptr_K_new == nullptr || mainloop.append.ptr_V_new == nullptr ||
+          mainloop.append.ptr_cache_seqlens == nullptr || mainloop.append.total_k_new <= 0 ||
+          (mainloop.append.ptr_cu_seqlens_k_new == nullptr && mainloop.append.seq_len_kv_new <= 0)) {
+        return 0;
+      }
+      if (mainloop.append.ptr_cu_seqlens_k_new != nullptr) {
+        return mainloop.append.ptr_cu_seqlens_k_new[batch + 1] - mainloop.append.ptr_cu_seqlens_k_new[batch];
+      }
+      return mainloop.append.seq_len_kv_new;
+    } else {
+      (void)mainloop;
+      (void)batch;
+      return 0;
+    }
+  }
+
+  CUTLASS_DEVICE
   void operator()(Params const& params, char* smem_buf) {
     using namespace sycl::ext::oneapi::this_work_item;
 
@@ -275,6 +289,13 @@ class XeFMHAFwdKernel {
 
       auto sequence_length_shape = get_sequence_length_shape(s, idx_b);
       auto [seq_len_qo, seq_len_kv, seq_len_kv_cache] = sequence_length_shape;
+      int seq_k_eff = seq_len_kv_cache;
+      if constexpr (CollectiveMainloop::AppendKV) {
+        int const seq_k_new = get_k_new_len(params.mainloop, idx_b);
+        if (seq_k_new > 0) {
+          seq_k_eff = params.mainloop.append.ptr_cache_seqlens[idx_b] + seq_k_new;
+        }
+      }
       // M extent of the Q/O tile: the packed GQA group for decode, otherwise the
       // query sequence length. Masking below still uses the real seq_len_qo so
       // the decode KV position (seq_len_kv_cache - seq_len_qo) stays correct.
@@ -286,7 +307,7 @@ class XeFMHAFwdKernel {
       // auto offset = cute::min(seq_len_qo, seq_len_kv_cache);
       auto offset = seq_len_qo;
       auto discard_seq_coord = seq_len_qo - offset;
-      auto full_tile_offset = seq_len_kv_cache - offset;
+      auto full_tile_offset = seq_k_eff - offset;
       int seq_coord = cute::min(seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
 
       // if (CollectiveMainloop::CausalMask && seq_coord < discard_seq_coord) continue;
@@ -297,12 +318,28 @@ class XeFMHAFwdKernel {
       // const int seq_len = seq_len_new + seq_len_kv_cache;
       // const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
 
-      const int seq_len = CollectiveMainloop::CausalMask
-                              ? cute::min(seq_len_kv_cache, full_tile_offset + seq_coord + q_sg_tile)
-                              : seq_len_kv_cache;
+      const int seq_len =
+          CollectiveMainloop::CausalMask ? cute::min(seq_k_eff, full_tile_offset + seq_coord + q_sg_tile) : seq_k_eff;
       const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
       const int k_blocks_causal =
           CollectiveMainloop::CausalMask ? (seq_coord + full_tile_offset) / get<1>(TileShapeQK{}) : 0;
+      int append_store_len = -1;
+      if constexpr (CollectiveMainloop::AppendKV) {
+        int const seq_k_new = get_k_new_len(params.mainloop, idx_b);
+        if (seq_k_new > 0) {
+          append_store_len = seq_k_new;
+          if constexpr (CollectiveMainloop::CausalMask && !PackGQA_) {
+            // Without a grid-wide barrier, each WG must write every appended
+            // token it may read; causal tiles only need the visible prefix.
+            int const cache_len_old = params.mainloop.append.ptr_cache_seqlens[idx_b];
+            int const tile_q = get<0>(TileShapeQK{});
+            int const q_tile_end = cute::min(seq_len_qo, (blk_q + 1) * tile_q);
+            int const visible_k_end = cute::min(seq_k_eff, full_tile_offset + q_tile_end);
+            append_store_len = cute::max(0, visible_k_end - cache_len_old);
+            append_store_len = cute::min(append_store_len, seq_k_new);
+          }
+        }
+      }
 
       // Sliding-window pruning: skip K blocks that are entirely outside the
       // [row - window_size_left, row + window_size_right] band for all rows in
@@ -386,15 +423,6 @@ class XeFMHAFwdKernel {
       // With PackGQA the Q/O head dimension is indexed by the KV head; otherwise
       // by the (un-grouped) query head.
       int q_head_idx = PackGQA_ ? head : head_q;
-      // FP8 KV: the per-tensor dequant scale baked into KernelArguments is
-      // passed as a float function argument (scale_k) to the mainloop GEMM1.
-      // It defaults to 1.0f for non-fp8 KV; the fp8 dequant scalar is read
-      // on-device from scale_k_ptr (avoids a host-side .item() D2H sync) only
-      // in the fp8 instantiation, so non-fp8 kernels compile the read out.
-      float scale_k = 1.0f;
-      if constexpr (CollectiveMainloop::Fp8KV) {
-        scale_k = *p.scale_k_ptr;
-      }
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
       mainloop(
           Q(_, _, q_head_idx, l_coord),
@@ -410,13 +438,15 @@ class XeFMHAFwdKernel {
           k_blocks_causal,
           thr_id,
           seq_len,
-          seq_len_kv_cache,
+          seq_k_eff,
           idx_b,
+          head,
+          s.num_heads_kv,
           full_tile_offset,
           discard_seq_coord,
+          append_store_len,
           K_cache(_, _, head, l_coord),
-          V_cache(_, _, head, l_coord),
-          scale_k);
+          V_cache(_, _, head, l_coord));
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());
@@ -424,14 +454,6 @@ class XeFMHAFwdKernel {
 
       // Epilogue
       CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
-      // FP8 KV: the per-tensor V dequant scale is applied once in the epilogue
-      // (folded into the softmax normalization) instead of per V element in the
-      // mainloop GEMM2. It defaults to 1.0f for non-fp8 KV; the fp8 dequant
-      // scalar is read on-device from scale_v_ptr only in the fp8 instantiation.
-      float scale_v = 1.0f;
-      if constexpr (CollectiveMainloop::Fp8KV) {
-        scale_v = *p.scale_v_ptr;
-      }
       if constexpr (Sink) {
         if constexpr (PackGQA_) {
           // Packed decode: pass the per-row sink base for this KV head's group
@@ -444,15 +466,14 @@ class XeFMHAFwdKernel {
               tA_sum,
               blk_qv,
               thr_id,
-              scale_v,
               ElementSink{},
               p.sm_sink + head * head_group_q,
               head_group_q);
         } else {
-          epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, scale_v, p.sm_sink[q_head_idx]);
+          epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, p.sm_sink[q_head_idx]);
         }
       } else {
-        epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, scale_v);
+        epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id);
       }
     }
   }
@@ -541,11 +562,6 @@ class XeFMHAFwdDynamicSplitKernel {
     // mix-batch path) but kept for uniform aggregate initialization in the
     // shared runner template.
     const bool* skip_batch_mask = nullptr;
-    // FP8 KV per-tensor dequant scales. Device pointers to the single descale
-    // scalar (DynamicSplit does not support fp8, so these stay null and the
-    // scale resolves to 1.0f); present for uniform aggregate initialization.
-    const float* scale_k_ptr = nullptr;
-    const float* scale_v_ptr = nullptr;
   };
   using KernelParams = KernelArguments;
 
@@ -906,14 +922,7 @@ class XeFMHAFwdDynamicSplitKernel {
 
         // Epilogue
         CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
-        // FP8 KV: apply the per-tensor V dequant scale once in the epilogue.
-        // It defaults to 1.0f for non-fp8 KV; read on-device only in the fp8
-        // instantiation.
-        float scale_v = 1.0f;
-        if constexpr (CollectiveMainloop::Fp8KV) {
-          scale_v = *p.scale_v_ptr;
-        }
-        epilogue(O(_, _, head_q, idx_b), tArA, tA_max, tA_sum, blk_qv, thr_id, scale_v);
+        epilogue(O(_, _, head_q, idx_b), tArA, tA_max, tA_sum, blk_qv, thr_id);
       }
     }
   }
@@ -998,11 +1007,6 @@ class XeFMHAFwdSplitKVKernel {
     // Per-batch skip mask for two-kernel mix-batch dispatch
     // (see https://github.com/vllm-project/vllm-xpu-kernels/pull/218).
     const bool* skip_batch_mask = nullptr;
-    // FP8 KV per-tensor dequant scales. Device pointers to the single descale
-    // scalar; the kernel dereferences them on-device, so the caller never does
-    // a host-side D2H sync (tensor.item()). Null => non-fp8 KV (scale = 1.0f).
-    const float* scale_k_ptr = nullptr;
-    const float* scale_v_ptr = nullptr;
   };
   using KernelParams = KernelArguments;
 
@@ -1221,18 +1225,6 @@ class XeFMHAFwdSplitKVKernel {
       int start_blk = kv_split_offset;
       int end_blk = kv_split_offset + num_effective_kv_blocks;
 
-      // FP8 KV: the per-tensor dequant scales baked into KernelArguments.
-      // scale_k is applied to K in the mainloop GEMM1; scale_v is folded into
-      // the softmax normalization in the epilogue (not the mainloop GEMM2).
-      // Both default to 1.0f for non-fp8 KV; the fp8 dequant scalars are read
-      // on-device from the descale pointers only in the fp8 instantiation
-      // (avoids a host-side .item() D2H sync).
-      float scale_k = 1.0f;
-      float scale_v = 1.0f;
-      if constexpr (CollectiveMainloop::Fp8KV) {
-        scale_k = *p.scale_k_ptr;
-        scale_v = *p.scale_v_ptr;
-      }
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
 
       mainloop(
@@ -1250,8 +1242,7 @@ class XeFMHAFwdSplitKVKernel {
           thr_id,
           seq_len,
           full_tile_offset,
-          discard_seq_coord,
-          scale_k);
+          discard_seq_coord);
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());
@@ -1268,7 +1259,6 @@ class XeFMHAFwdSplitKVKernel {
             tA_sum,
             blk_qv,
             thr_id,
-            scale_v,
             exp_sums(_, _, head, l_coord),
             max_logits(_, _, head, l_coord),
             idx_kv_split,
@@ -1284,7 +1274,6 @@ class XeFMHAFwdSplitKVKernel {
             tA_sum,
             blk_qv,
             thr_id,
-            scale_v,
             exp_sums(_, _, head, l_coord),
             max_logits(_, _, head, l_coord),
             idx_kv_split,

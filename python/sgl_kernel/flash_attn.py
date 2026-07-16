@@ -264,6 +264,12 @@ def flash_attn_with_kvcache(
     if cache_seqlens is not None:
         assert cache_seqlens.size(0) + 1 == cu_seqlens_q.size(0)
         cu_seqlens_k = cache_seqlens
+    native_max_seqlen_k = max_seqlen_k
+    if native_max_seqlen_k is None or native_max_seqlen_k == 0:
+        if k is not None:
+            native_max_seqlen_k = k.shape[1] if k.dim() == 4 else (max_seqlen_q or 1)
+        else:
+            native_max_seqlen_k = 1
     out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
         q,
         k_cache,
@@ -272,7 +278,7 @@ def flash_attn_with_kvcache(
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_q,
-        1,
+        native_max_seqlen_k,
         page_table,
         cache_batch_idx,
         cache_leftpad,
@@ -294,6 +300,9 @@ def flash_attn_with_kvcache(
         pack_gqa,
         sm_margin,
         out,
+        k,
+        v,
+        cu_seqlens_k_new,
     )
     return (out, softmax_lse, *rest) if return_softmax_lse else out
 

@@ -59,7 +59,7 @@ DISABLE_BACKWARD = True
 
 DISABLE_SPLIT = True
 DISABLE_PAGEDKV = False
-DISABLE_APPENDKV = True
+DISABLE_APPENDKV = False
 DISABLE_LOCAL = True
 DISABLE_SOFTCAP = True
 DISABLE_PACKGQA = True
@@ -479,7 +479,7 @@ def generate_qkv(
     "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
 )
 @pytest.mark.parametrize("nheads_q,nheads_kv", [(16, 16), (16, 4)])
-@pytest.mark.parametrize("new_kv", [False])
+@pytest.mark.parametrize("new_kv", [False, True])
 @pytest.mark.parametrize("causal,local", [(False, True), (False, False), (True, False)])
 @pytest.mark.parametrize("use_sinks", [True, False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
@@ -691,10 +691,13 @@ def test_flash_attn_kvcache(
                 dtype,
                 dtype_ref,
             )
+        cache_seqlens_high = seqlen_k - seqlen_new + 1 if new_kv else seqlen_k
+        if cache_seqlens_high <= seqlen_q:
+            pytest.skip("new_kv requires room for appended KV")
         cache_seqlens = torch.randint(
             seqlen_q,
             # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
-            seqlen_k,
+            cache_seqlens_high,
             (batch_size,),
             dtype=torch.int32,
             device=device,
@@ -880,6 +883,7 @@ def test_flash_attn_kvcache(
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k_new=cu_seqlens_k_new,
                     max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=seqlen_new if new_kv else max_seqlen_k,
                     rotary_seqlens=rotary_seqlens,
                     causal=causal,
                     window_size=window_size,

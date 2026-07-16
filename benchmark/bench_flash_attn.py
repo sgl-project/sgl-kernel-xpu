@@ -96,11 +96,9 @@ num_heads_q = [16]
 num_heads_kv = [4, 8]
 kv_seq_length_range = [4096]
 page_size_range = [0, 128]
-# KV cache element type: "bf16" (default) or fp8. FP8 has two formats,
-# e5m2 and e4m3; both are exercised ("fp8_e4m3" / "fp8_e5m2"), dequantized
-# in-kernel via per-tensor k_descale / v_descale. fp8 only runs on the paged
-# path.
-kv_dtype_range = ["bf16", "fp8_e4m3", "fp8_e5m2"]
+# KV cache element type: "bf16" (default) or fp8. FP8 is exercised only on
+# the supported paged decode path; prefill uses bf16 KV cache.
+kv_dtype_range = ["bf16", "fp8_e4m3"]
 configs = list(
     filter(
         lambda cfg: (
@@ -116,9 +114,12 @@ configs = list(
             and (cfg[9] != 0 or not cfg[2])
             # Condition 6: sink is only supported for head_size == 64
             and (not cfg[2] or cfg[5] == 64)
-            # Condition 7: fp8 KV cache requires the paged path and is exercised
-            # without sinks / local masking (matches the supported fp8 path)
-            and (cfg[10] == "bf16" or (cfg[9] != 0 and not cfg[2] and not cfg[1]))
+            # Condition 7: fp8 KV cache requires the paged decode path and is
+            # exercised without sinks / local masking.
+            and (
+                cfg[10] == "bf16"
+                or (cfg[4] == 1 and cfg[9] != 0 and not cfg[2] and not cfg[1])
+            )
         ),
         [
             cfg
@@ -255,9 +256,7 @@ def benchmark(
     if not local:
         window_size = (-1, -1)
     else:
-        window_size = tuple(
-            int(value) for value in torch.randint(0, kv_seq_length, (2,)).tolist()
-        )
+        window_size = (kv_seq_length // 2, kv_seq_length // 2)
 
     sinks = torch.randn(num_heads_q, device=device, dtype=dtype) if use_sinks else None
 

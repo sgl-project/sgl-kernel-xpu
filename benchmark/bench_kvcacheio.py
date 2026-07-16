@@ -5,13 +5,15 @@ Covers:
   - transfer_kv_per_layer_mla  (lf→lf, K only, device↔device)
   - transfer_kv_all_layer      (lf_tbl→lf_tbl, K+V, all layers fused)
   - transfer_kv_all_layer_lf_ph / transfer_kv_per_layer_ph_lf
+  - transfer_kv_all_layer_lf_pf / transfer_kv_per_layer_pf_lf (device kernels)
+  - transfer_kv_all_layer_mla_lf_pf / transfer_kv_per_layer_mla_pf_lf
   - transfer_kv_direct         (Python copy_ fallback, host↔device)
   - transfer_kv_all_layer_direct_lf_pf / transfer_kv_per_layer_direct_pf_lf
 
 Usage:
     python benchmark/bench_kvcacheio.py
     python benchmark/bench_kvcacheio.py --num-tokens 128 512 1024 4096 8192
-    python benchmark/bench_kvcacheio.py --suite per_layer all_layer host_device page_head
+    python benchmark/bench_kvcacheio.py --suite per_layer all_layer host_device page_head page_first
 """
 
 import argparse
@@ -21,12 +23,16 @@ import torch
 from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer,
     transfer_kv_all_layer_direct_lf_pf,
+    transfer_kv_all_layer_lf_pf,
     transfer_kv_all_layer_lf_ph,
     transfer_kv_all_layer_mla,
+    transfer_kv_all_layer_mla_lf_pf,
     transfer_kv_direct,
     transfer_kv_per_layer,
     transfer_kv_per_layer_direct_pf_lf,
     transfer_kv_per_layer_mla,
+    transfer_kv_per_layer_mla_pf_lf,
+    transfer_kv_per_layer_pf_lf,
     transfer_kv_per_layer_ph_lf,
 )
 
@@ -423,6 +429,134 @@ def bench_page_head(token_counts, item_sizes, head_num=16, num_layers=4):
 
 
 # ---------------------------------------------------------------------------
+# Suite 5: page-first layout (device kernels, lf↔pf)
+# ---------------------------------------------------------------------------
+# pf pool layout is [num_tokens, num_layers, item_size], per-token addressing:
+#   base + token * (num_layers * item_size) + layer * item_size
+# pf pools live in pinned host memory (CPU-side eviction/disaggregation
+# buffers), matching the page_head / direct benchmarks.
+
+
+def bench_page_first(token_counts, item_sizes):
+    num_layers = 4
+    _header(
+        f"transfer_kv_all_layer_lf_pf  [device lf_tbl→pinned host pf, {num_layers} layers, K+V]"
+    )
+    for N in token_counts:
+        for item_size in item_sizes:
+            total = max(N * 4, 16384)
+            src_k = [
+                torch.randn(total, item_size, dtype=DTYPE, device=DEVICE)
+                for _ in range(num_layers)
+            ]
+            src_v = [
+                torch.randn(total, item_size, dtype=DTYPE, device=DEVICE)
+                for _ in range(num_layers)
+            ]
+            dst_k = torch.zeros(total, num_layers, item_size, dtype=DTYPE).pin_memory()
+            dst_v = torch.zeros_like(dst_k).pin_memory()
+
+            def _ptrs(lst):
+                return torch.tensor(
+                    [x.data_ptr() for x in lst], dtype=torch.uint64, device=DEVICE
+                )
+
+            sk_t, sv_t = _ptrs(src_k), _ptrs(src_v)
+            perm = torch.randperm(total, device=DEVICE)
+            si, di = perm[:N], perm[N : 2 * N]
+            ib = item_size * ELEM
+            layout_dim = item_size * num_layers * ELEM
+            nbytes = N * ib * 4 * num_layers  # read+write K+V over all layers
+
+            ms = _bench(
+                lambda: transfer_kv_all_layer_lf_pf(
+                    sk_t, dst_k, sv_t, dst_v, si, di, ib, layout_dim, num_layers
+                ),
+                warmup=5,
+                rep=20,
+            )
+            _row(N, item_size, nbytes, ms)
+
+    _header(
+        f"transfer_kv_per_layer_pf_lf  [pinned host pf→device lf, layer 0, {num_layers} layers, K+V]"
+    )
+    for N in token_counts:
+        for item_size in item_sizes:
+            total = max(N * 4, 16384)
+            src_k = torch.randn(total, num_layers, item_size, dtype=DTYPE).pin_memory()
+            src_v = torch.randn(total, num_layers, item_size, dtype=DTYPE).pin_memory()
+            dst_k = torch.zeros(total, item_size, dtype=DTYPE, device=DEVICE)
+            dst_v = torch.zeros_like(dst_k)
+            perm = torch.randperm(total, device=DEVICE)
+            si, di = perm[:N], perm[N : 2 * N]
+            ib = item_size * ELEM
+            layout_dim = item_size * num_layers * ELEM
+            nbytes = N * ib * 4  # read+write K+V, single layer
+
+            ms = _bench(
+                lambda: transfer_kv_per_layer_pf_lf(
+                    src_k, dst_k, src_v, dst_v, si, di, 0, ib, layout_dim
+                ),
+                warmup=5,
+                rep=20,
+            )
+            _row(N, item_size, nbytes, ms)
+
+    _header(
+        f"transfer_kv_all_layer_mla_lf_pf  [device lf_tbl→pinned host pf, {num_layers} layers, K only]"
+    )
+    for N in token_counts:
+        for item_size in item_sizes:
+            total = max(N * 4, 16384)
+            src = [
+                torch.randn(total, item_size, dtype=DTYPE, device=DEVICE)
+                for _ in range(num_layers)
+            ]
+            dst = torch.zeros(total, num_layers, item_size, dtype=DTYPE).pin_memory()
+
+            s_t = torch.tensor(
+                [x.data_ptr() for x in src], dtype=torch.uint64, device=DEVICE
+            )
+            perm = torch.randperm(total, device=DEVICE)
+            si, di = perm[:N], perm[N : 2 * N]
+            ib = item_size * ELEM
+            layout_dim = item_size * num_layers * ELEM
+            nbytes = N * ib * 2 * num_layers  # read+write K over all layers
+
+            ms = _bench(
+                lambda: transfer_kv_all_layer_mla_lf_pf(
+                    s_t, dst, si, di, ib, layout_dim, num_layers
+                ),
+                warmup=5,
+                rep=20,
+            )
+            _row(N, item_size, nbytes, ms)
+
+    _header(
+        f"transfer_kv_per_layer_mla_pf_lf  [pinned host pf→device lf, layer 0, {num_layers} layers, K only]"
+    )
+    for N in token_counts:
+        for item_size in item_sizes:
+            total = max(N * 4, 16384)
+            src = torch.randn(total, num_layers, item_size, dtype=DTYPE).pin_memory()
+            dst = torch.zeros(total, item_size, dtype=DTYPE, device=DEVICE)
+            perm = torch.randperm(total, device=DEVICE)
+            si, di = perm[:N], perm[N : 2 * N]
+            ib = item_size * ELEM
+            layout_dim = item_size * num_layers * ELEM
+            nbytes = N * ib * 2  # read+write K, single layer
+
+            ms = _bench(
+                lambda: transfer_kv_per_layer_mla_pf_lf(
+                    src, dst, si, di, 0, ib, layout_dim
+                ),
+                warmup=5,
+                rep=20,
+            )
+            _row(N, item_size, nbytes, ms)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -431,6 +565,7 @@ SUITES = {
     "all_layer": [bench_all_layer, bench_all_layer_mla],
     "host_device": [bench_host_device],
     "page_head": [bench_page_head],
+    "page_first": [bench_page_first],
 }
 
 

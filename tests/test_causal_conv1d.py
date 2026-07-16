@@ -3,8 +3,7 @@ from typing import Optional
 
 import torch
 import utils
-from sgl_kernel import causal_conv1d_fwd as causal_conv1d_fwd_kernel
-from sgl_kernel import causal_conv1d_update as causal_conv1d_update_kernel
+from sgl_kernel import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
 
 device = utils.get_device()
 
@@ -55,7 +54,7 @@ def causal_conv1d_fn(
         x = x.contiguous()
     bias = bias.contiguous() if bias is not None else None
 
-    causal_conv1d_fwd_kernel(
+    causal_conv1d_fn_xpu(
         x,
         weight,
         bias,
@@ -63,7 +62,7 @@ def causal_conv1d_fn(
         query_start_loc,
         cache_indices,
         has_initial_state,
-        activation in ["silu", "swish"],
+        activation,
         pad_slot_id,
     )
     return x
@@ -105,16 +104,15 @@ def causal_conv1d_update(
         raise NotImplementedError(
             f"activation must be None, silu, or swish, actual: {activation}"
         )
-    activation_val = activation in ["silu", "swish"]
     unsqueeze = x.dim() == 2
     if unsqueeze:
         x = x.unsqueeze(-1)
-    causal_conv1d_update_kernel(
+    causal_conv1d_update_xpu(
         x,
         conv_state,
         weight,
         bias,
-        activation_val,
+        activation,
         cache_seqlens,
         conv_state_indices,
         pad_slot_id,

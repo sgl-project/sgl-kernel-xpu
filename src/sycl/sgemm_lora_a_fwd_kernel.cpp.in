@@ -29,7 +29,7 @@
  *
  **************************************************************************************************/
 // Auto-generated from sgemm_lora_a_fwd_kernel.cpp.in
-// Template parameters: ELEM_TAG=@ELEM_TAG@
+// Template parameters: ELEM_TAG=@ELEM_TAG@, TILE_TAG=@TILE_TAG@
 #define SYCL_INTEL_TARGET 20
 
 #include <c10/xpu/XPUStream.h>
@@ -37,25 +37,24 @@
 #include <sycl/sycl.hpp>
 
 #include "sycl/kernels/lora/device/sgemm_lora_a_fwd_dispatch.hpp"
-#include "sycl/kernels/lora/device/sgemm_lora_a_fwd_launcher.hpp"
+#include "sycl/kernels/lora/device/sgemm_lora_a_fwd_types.hpp"
 
-namespace lora {
+namespace sgemm_lora_a_fwd_impl {
 
-void launch_sgemm_lora_a_fwd_@ELEM_TAG@(
-    const at::Tensor& input_x,
-    const at::Tensor& weights,
-    const at::Tensor& seg_indptr_i32,
-    const at::Tensor& weight_indices_i32,
-    at::Tensor& output,
-    int stack_num,
-    int max_rank,
-    int num_segments) {
-  auto stream = at::xpu::getCurrentXPUStream();
-  auto queue = stream.queue();
-  at::native::xpu::launch_sgemm_lora_a_fwd<@ELEM_CUTLASS_TYPE@>(
+void launch_sgemm_lora_a_fwd_@ELEM_TAG@_@TILE_TAG@(
+    const torch::Tensor& input_x,
+    const torch::Tensor& weights,
+    const torch::Tensor& seg_indptr_i32,
+    const torch::Tensor& weight_indices_i32,
+    torch::Tensor& output,
+    const int stack_num,
+    const int max_rank,
+    const int num_segments,
+    sycl::queue& queue) {
+  runSgemmLoraAFwd<@ELEM_TORCH_TYPE@, @TILE_TYPE@>(
       input_x, weights, seg_indptr_i32, weight_indices_i32, output, stack_num, max_rank, num_segments, queue);
 }
 
-}  // namespace lora
+}  // namespace sgemm_lora_a_fwd_impl
 
 #undef SYCL_INTEL_TARGET

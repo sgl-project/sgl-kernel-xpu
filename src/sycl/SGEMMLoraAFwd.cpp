@@ -35,11 +35,42 @@
 #define SYCL_INTEL_TARGET 20
 
 #include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
+
+#include <sycl/sycl.hpp>
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "kernels/lora/device/sgemm_lora_a_fwd_dispatch.hpp"
+
+namespace {
+
+//----------------- Per-(dtype, tile) dispatch macros --------------------//
+// Tile selection currently has a single option (large). Add tiles to
+// DISPATCH_SGEMM_LORA_A_FWD_TILE (and to SGEMMLoraAFwdXe20.cmake +
+// sgemm_lora_a_fwd_dispatch.hpp + sgemm_lora_a_fwd_types.hpp) with a runtime
+// heuristic (e.g. average M per segment) picking the tag.
+#define DISPATCH_SGEMM_LORA_A_FWD_TILE(ELEM, ...)                              \
+  do {                                                                         \
+    sgemm_lora_a_fwd_impl::launch_sgemm_lora_a_fwd_##ELEM##_large(__VA_ARGS__); \
+  } while (0)
+
+#define DISPATCH_SGEMM_LORA_A_FWD_DTYPE(...)                                                       \
+  do {                                                                                             \
+    switch (weights.scalar_type()) {                                                               \
+      case torch::kHalf:                                                                           \
+        DISPATCH_SGEMM_LORA_A_FWD_TILE(half, __VA_ARGS__);                                         \
+        break;                                                                                     \
+      case torch::kBFloat16:                                                                       \
+        DISPATCH_SGEMM_LORA_A_FWD_TILE(bf16, __VA_ARGS__);                                         \
+        break;                                                                                     \
+      default:                                                                                     \
+        TORCH_CHECK(false, "Unsupported data type for sgemm_lora_a_fwd weights: ", weights.scalar_type()); \
+    }                                                                                              \
+  } while (0)
+
+}  // namespace
 
 //----------------- Main API function --------------------//
 
@@ -125,24 +156,19 @@ void sgemm_lora_a_fwd(
   auto weight_indices_i32 =
       weight_indices.scalar_type() == torch::kInt32 ? weight_indices : weight_indices.to(torch::kInt32);
 
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
+
   const int max_rank = static_cast<int>(max_rank_i64);
   const int num_segments = static_cast<int>(num_segments_i64);
   const int stack_num_ = static_cast<int>(stack_num);
 
-  // Dispatch kernel based on data type. Each launch symbol is defined in a
-  // separate generated translation unit (see SGEMMLoraAFwdXe20.cmake).
-  switch (weights.scalar_type()) {
-    case torch::kHalf:
-      lora::launch_sgemm_lora_a_fwd_half(
-          input_x, weights, seg_indptr_i32, weight_indices_i32, output, stack_num_, max_rank, num_segments);
-      break;
-    case torch::kBFloat16:
-      lora::launch_sgemm_lora_a_fwd_bf16(
-          input_x, weights, seg_indptr_i32, weight_indices_i32, output, stack_num_, max_rank, num_segments);
-      break;
-    default:
-      TORCH_CHECK(false, "Unsupported data type for weights");
-  }
+  // Dispatch on (dtype, tile). Each launch symbol is defined in a separate
+  // generated translation unit (see SGEMMLoraAFwdXe20.cmake).
+  DISPATCH_SGEMM_LORA_A_FWD_DTYPE(
+      input_x, weights, seg_indptr_i32, weight_indices_i32, output, stack_num_, max_rank, num_segments, queue);
 }
 
+#undef DISPATCH_SGEMM_LORA_A_FWD_TILE
+#undef DISPATCH_SGEMM_LORA_A_FWD_DTYPE
 #undef SYCL_INTEL_TARGET

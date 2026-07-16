@@ -30,36 +30,50 @@
  **************************************************************************************************/
 /*!
   \file
-  \brief Forward declarations for generated SGEMM LoRA-A forward kernel launch functions
+  \brief Forward declarations of the generated per-(dtype, tile) launch
+         functions for sgemm_lora_a_fwd. The definitions are produced by
+         sgemm_lora_a_fwd_kernel.cpp.in via SGEMMLoraAFwdXe20.cmake, each in
+         its own translation unit for parallel compilation of the heavy CUTLASS
+         template instantiation.
+
+         Naming: launch_sgemm_lora_a_fwd_<ELEM_TAG>_<TILE_TAG>
+         Parameters:
+           ELEM_TAG in {half, bf16}       -- fp16/bf16.
+           TILE_TAG in {large}            -- extend via SGEMMLoraAFwdXe20.cmake
+                                             + a new option tag/type in
+                                             sgemm_lora_a_fwd_types.hpp.
 */
 
 #pragma once
 
 #include <ATen/ATen.h>
+#include <torch/all.h>
 
-namespace lora {
+#include <sycl/sycl.hpp>
+
+namespace sgemm_lora_a_fwd_impl {
 
 // Each function is defined in a separate generated .cpp file from
 // sgemm_lora_a_fwd_kernel.cpp.in, compiled as its own library.
-//
-// Naming: launch_sgemm_lora_a_fwd_<ELEM_TAG>
-// Parameters:
-//   ELEM_TAG in {half, bf16}
+#define DECLARE_SGEMM_LORA_A_FWD_LAUNCH(ELEM, TILE) \
+  void launch_sgemm_lora_a_fwd_##ELEM##_##TILE(     \
+      const torch::Tensor& input_x,                 \
+      const torch::Tensor& weights,                 \
+      const torch::Tensor& seg_indptr_i32,          \
+      const torch::Tensor& weight_indices_i32,      \
+      torch::Tensor& output,                        \
+      const int stack_num,                          \
+      const int max_rank,                           \
+      const int num_segments,                       \
+      sycl::queue& queue);
 
-#define DECLARE_SGEMM_LORA_A_FWD_LAUNCH(ELEM) \
-  void launch_sgemm_lora_a_fwd_##ELEM(        \
-      const at::Tensor& input_x,              \
-      const at::Tensor& weights,              \
-      const at::Tensor& seg_indptr_i32,       \
-      const at::Tensor& weight_indices_i32,   \
-      at::Tensor& output,                     \
-      int stack_num,                          \
-      int max_rank,                           \
-      int num_segments);
+// One declaration per registered tile. Extend as tiles are added.
+#define DECLARE_SGEMM_LORA_A_FWD_ALL_TILES(ELEM) DECLARE_SGEMM_LORA_A_FWD_LAUNCH(ELEM, large)
 
-DECLARE_SGEMM_LORA_A_FWD_LAUNCH(half)
-DECLARE_SGEMM_LORA_A_FWD_LAUNCH(bf16)
+DECLARE_SGEMM_LORA_A_FWD_ALL_TILES(half)
+DECLARE_SGEMM_LORA_A_FWD_ALL_TILES(bf16)
 
 #undef DECLARE_SGEMM_LORA_A_FWD_LAUNCH
+#undef DECLARE_SGEMM_LORA_A_FWD_ALL_TILES
 
-}  // namespace lora
+}  // namespace sgemm_lora_a_fwd_impl

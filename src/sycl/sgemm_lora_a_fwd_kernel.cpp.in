@@ -37,7 +37,7 @@
 #include <sycl/sycl.hpp>
 
 #include "sycl/kernels/lora/device/sgemm_lora_a_fwd_dispatch.hpp"
-#include "sycl/kernels/lora/device/sgemm_lora_a_fwd_types.hpp"
+#include "sycl/kernels/lora/device/sgemm_lora_a_fwd_runner.hpp"
 
 namespace sgemm_lora_a_fwd_impl {
 

@@ -180,6 +180,6 @@ void hc_post(
   auto q = dpcppGetCurrentQueue();
 
   constexpr int VEC_SIZE = 4;
-  TORCH_CHECK(D % VEC_SIZE == 0, "D must be a multiple of VEC_SIZE (", VEC_SIZE, "), got D=", D);
+  TORCH_CHECK(D % VEC_SIZE == 0, "D must be a multiple of 4 for vectorized operations, got D=", D);
   launch_hc_post_kernel<VEC_SIZE>(q, x, residual, post_layer_mix, comb_res_mix, out, T, D);
 }

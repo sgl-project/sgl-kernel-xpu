@@ -205,6 +205,114 @@ def transfer_kv_per_layer_ph_lf(
     )
 
 
+def transfer_kv_per_layer_pf_lf(
+    src_k: torch.Tensor,
+    dst_k: torch.Tensor,
+    src_v: torch.Tensor,
+    dst_v: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    layer_id: int,
+    item_size: int,
+    src_layout_dim: int,
+    block_quota: int = _DEFAULT_BLOCK_QUOTA,
+    sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
+) -> None:
+    """Single-layer page-first → lf transfer for K and V."""
+    torch.ops.sgl_kernel.transfer_kv_per_layer_pf_lf.default(
+        src_k,
+        dst_k,
+        src_v,
+        dst_v,
+        src_indices,
+        dst_indices,
+        layer_id,
+        item_size,
+        src_layout_dim,
+        block_quota,
+        sgs_per_wg,
+    )
+
+
+def transfer_kv_all_layer_lf_pf(
+    src_k_layers: torch.Tensor,
+    dst_k: torch.Tensor,
+    src_v_layers: torch.Tensor,
+    dst_v: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    dst_layout_dim: int,
+    num_layers: int,
+    block_quota: int = _DEFAULT_BLOCK_QUOTA,
+    sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
+) -> None:
+    """All-layers lf → page-first transfer for K and V."""
+    torch.ops.sgl_kernel.transfer_kv_all_layer_lf_pf.default(
+        src_k_layers,
+        dst_k,
+        src_v_layers,
+        dst_v,
+        src_indices,
+        dst_indices,
+        item_size,
+        dst_layout_dim,
+        num_layers,
+        block_quota,
+        sgs_per_wg,
+    )
+
+
+def transfer_kv_per_layer_mla_pf_lf(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    layer_id: int,
+    item_size: int,
+    src_layout_dim: int,
+    block_quota: int = _DEFAULT_BLOCK_QUOTA,
+    sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
+) -> None:
+    """Single-layer page-first → lf transfer for K only (MLA)."""
+    torch.ops.sgl_kernel.transfer_kv_per_layer_mla_pf_lf.default(
+        src,
+        dst,
+        src_indices,
+        dst_indices,
+        layer_id,
+        item_size,
+        src_layout_dim,
+        block_quota,
+        sgs_per_wg,
+    )
+
+
+def transfer_kv_all_layer_mla_lf_pf(
+    src_layers: torch.Tensor,
+    dst: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    dst_layout_dim: int,
+    num_layers: int,
+    block_quota: int = _DEFAULT_BLOCK_QUOTA,
+    sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
+) -> None:
+    """All-layers lf → page-first transfer for K only (MLA)."""
+    torch.ops.sgl_kernel.transfer_kv_all_layer_mla_lf_pf.default(
+        src_layers,
+        dst,
+        src_indices,
+        dst_indices,
+        item_size,
+        dst_layout_dim,
+        num_layers,
+        block_quota,
+        sgs_per_wg,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Group B: Python/PyTorch fallbacks (host↔device; no equivalent of
 # cudaMemcpyBatchAsync on XPU — use PyTorch copy_ page-by-page).

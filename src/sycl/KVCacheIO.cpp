@@ -17,14 +17,18 @@ limitations under the License.
 // csrc/kvcacheio/transfer.cu).
 //
 // Layout conventions:
-//   lf  = layer-first  [num_layers, num_tokens, item_size]         on-device
-//   pf  = page-first   [num_pages, num_layers, page_size, item_size] pinned host
-//   ph  = page-head    [num_pages, head_num, page_size, num_layers, head_dim] pinned host
+//   lf  = layer-first  [num_layers, num_tokens, item_size]
+//   pf  = page-first   [num_tokens, num_layers, item_size]
+//         (per-token addressing: base + token * layout_dim + layer * item_size,
+//          where layout_dim = num_layers * item_size)
+//   ph  = page-head    [num_pages, head_num, page_size, num_layers, head_dim]
 //
-// pf and ph pools are always in pinned host memory — this is by design (they
-// are CPU-side eviction/disaggregation buffers).  No on-device pf kernels are
-// provided because there is no on-device pf use case in the current sglang
-// KV-cache placement policy.
+// pf/ph pools live in pinned host memory (CPU-side eviction/disaggregation
+// buffers); the device kernels address them directly over the fabric.  Both
+// lf↔pf and lf↔ph layout conversions have on-device kernels here, matching the
+// CUDA sgl-kernel API.  The pf_lf/lf_pf variants mirror CUDA transfer_kernel_impl
+// with get_global_offset_pf; a Python copy_ fallback (transfer_kv_*_direct_*)
+// remains available for the page_first_direct layout.
 
 #include <ATen/ATen.h>
 
@@ -195,6 +199,104 @@ struct TransferKVKernel {
   int64_t item_size_;
 };
 
+// Page-first transfer kernel (pf↔lf).
+// pf layout:  [num_pages, num_layers, page_size, item_size], addressed as
+//   base + page_id * layout_dim + layer_id * item_size
+// lf side is the flat/tabled layer-first addressing (base + page_id * item_size,
+// or a per-layer pointer table).  Direction is fixed at compile time:
+//   IsPfToLf=true : src is pf, dst is lf   (transfer_kv_*_pf_lf)
+//   IsPfToLf=false: src is lf, dst is pf   (transfer_kv_*_lf_pf)
+// IsMLA=true: only K is transferred (no separate V tensor).
+// Mirrors CUDA transfer_kernel_impl with get_global_offset_pf on the pf side.
+template <bool IsMLA, bool IsPfToLf>
+struct TransferKVPageFirstKernel {
+  // pf side: base + page * layout_dim + layer * item_size.
+  static inline const char*
+  pf_offset(const char* base, int64_t layer, int64_t page, int64_t item_size, int64_t layout_dim) {
+    return base + page * layout_dim + layer * item_size;
+  }
+  // lf side: flat base (base + page * item_size) or per-layer table.
+  static inline const char*
+  lf_offset(const char* base, const uintptr_t* tbl, int64_t layer, int64_t page, int64_t item_size) {
+    return base == nullptr ? reinterpret_cast<const char*>(tbl[layer]) + page * item_size : base + page * item_size;
+  }
+
+  void operator()(sycl::nd_item<1> item) const {
+    const int64_t lane = static_cast<int64_t>(item.get_local_id(0)) % XPU_SG_SIZE;
+    const int64_t sg_id =
+        static_cast<int64_t>(item.get_local_id(0)) / XPU_SG_SIZE +
+        static_cast<int64_t>(item.get_group(0)) * (static_cast<int64_t>(item.get_local_range(0)) / XPU_SG_SIZE);
+
+    const int64_t chunks = item_size_ / static_cast<int64_t>(sizeof(uint64_t));
+
+    for (int64_t i = 0; i < items_per_sg_; ++i) {
+      const int64_t item_id = sg_id * items_per_sg_ + i;
+      if (item_id >= num_items_) break;
+
+      const int64_t src_page = src_indices_[item_id];
+      const int64_t dst_page = dst_indices_[item_id];
+
+      for (int64_t layer = start_layer_; layer < start_layer_ + num_layers_; ++layer) {
+        const char* src_k_ptr;
+        char* dst_k_ptr;
+        if constexpr (IsPfToLf) {
+          src_k_ptr = pf_offset(src_k_base_, layer, src_page, item_size_, src_layout_dim_);
+          dst_k_ptr = const_cast<char*>(lf_offset(dst_k_base_, dst_k_tbl_, layer, dst_page, item_size_));
+        } else {
+          src_k_ptr = lf_offset(src_k_base_, src_k_tbl_, layer, src_page, item_size_);
+          dst_k_ptr = const_cast<char*>(pf_offset(dst_k_base_, layer, dst_page, item_size_, dst_layout_dim_));
+        }
+
+        const auto* src64 = reinterpret_cast<const uint64_t*>(src_k_ptr);
+        auto* dst64 = reinterpret_cast<uint64_t*>(dst_k_ptr);
+
+        if constexpr (!IsMLA) {
+          const char* src_v_ptr;
+          char* dst_v_ptr;
+          if constexpr (IsPfToLf) {
+            src_v_ptr = pf_offset(src_v_base_, layer, src_page, item_size_, src_layout_dim_);
+            dst_v_ptr = const_cast<char*>(lf_offset(dst_v_base_, dst_v_tbl_, layer, dst_page, item_size_));
+          } else {
+            src_v_ptr = lf_offset(src_v_base_, src_v_tbl_, layer, src_page, item_size_);
+            dst_v_ptr = const_cast<char*>(pf_offset(dst_v_base_, layer, dst_page, item_size_, dst_layout_dim_));
+          }
+          const auto* sv64 = reinterpret_cast<const uint64_t*>(src_v_ptr);
+          auto* dv64 = reinterpret_cast<uint64_t*>(dst_v_ptr);
+          for (int64_t j = lane; j < chunks; j += XPU_SG_SIZE) {
+            const uint64_t k_val = src64[j];
+            const uint64_t v_val = sv64[j];
+            dst64[j] = k_val;
+            dv64[j] = v_val;
+          }
+        } else {
+          for (int64_t j = lane; j < chunks; j += XPU_SG_SIZE) {
+            dst64[j] = src64[j];
+          }
+        }
+      }
+    }
+  }
+
+  // pf side uses a flat base pointer; lf side may use a base or a layer table.
+  const char* src_k_base_;
+  char* dst_k_base_;
+  const char* src_v_base_;
+  char* dst_v_base_;
+  const uintptr_t* src_k_tbl_;
+  const uintptr_t* dst_k_tbl_;
+  const uintptr_t* src_v_tbl_;
+  const uintptr_t* dst_v_tbl_;
+  const int64_t* src_indices_;
+  const int64_t* dst_indices_;
+  int64_t start_layer_;
+  int64_t num_layers_;
+  int64_t num_items_;
+  int64_t items_per_sg_;
+  int64_t item_size_;
+  int64_t src_layout_dim_;
+  int64_t dst_layout_dim_;
+};
+
 // Page-head transfer kernel: loops over heads because each head's data is
 // non-contiguous in the page-head layout.
 // Direction is fixed to lf→ph (IsLfToPh=true) or ph→lf (false).
@@ -341,6 +443,70 @@ static void launch_transfer_kv(
       .num_items_ = num_items,
       .items_per_sg_ = items_per_sg,
       .item_size_ = item_size,
+  };
+
+  auto cgf = DPCPP_Q_CGF(cgh) {
+    cgh.parallel_for<decltype(kernel)>(
+        sycl::nd_range<1>(
+            sycl::range<1>(static_cast<size_t>(num_wgs * wg_size)), sycl::range<1>(static_cast<size_t>(wg_size))),
+        kernel);
+  };
+  dpcppGetCurrentQueue().submit(cgf);
+}
+
+// Launch the page-first transfer kernel.  Uses TransferKVPageFirstKernel.
+// The pf side is always a flat base pointer; the lf side may be a flat base
+// (single layer) or a per-layer pointer table (all layers).
+template <bool IsMLA, bool IsPfToLf>
+static void launch_transfer_kv_page_first(
+    const void* src_k,
+    void* dst_k,
+    const void* src_v,
+    void* dst_v,
+    const uintptr_t* src_k_tbl,
+    const uintptr_t* dst_k_tbl,
+    const uintptr_t* src_v_tbl,
+    const uintptr_t* dst_v_tbl,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t start_layer,
+    int64_t num_layers,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t dst_layout_dim,
+    int64_t block_quota,
+    int64_t sgs_per_wg) {
+  TORCH_CHECK(item_size % 8 == 0, "item_size must be divisible by 8");
+  TORCH_CHECK(src_indices.scalar_type() == at::kLong, "indices must be int64");
+  TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "index count mismatch");
+
+  const int64_t num_items = src_indices.numel();
+  if (num_items == 0) return;  // nothing to transfer; avoids div-by-zero below
+
+  const int64_t effective_bq = block_quota > 0 ? block_quota : 16;
+  const int64_t total_sgs = effective_bq * sgs_per_wg;
+  const int64_t items_per_sg = div_up(num_items, total_sgs);
+  const int64_t num_wgs = div_up(num_items, items_per_sg * sgs_per_wg);
+  const int64_t wg_size = sgs_per_wg * XPU_SG_SIZE;
+
+  TransferKVPageFirstKernel<IsMLA, IsPfToLf> kernel{
+      .src_k_base_ = static_cast<const char*>(src_k),
+      .dst_k_base_ = static_cast<char*>(dst_k),
+      .src_v_base_ = static_cast<const char*>(src_v),
+      .dst_v_base_ = static_cast<char*>(dst_v),
+      .src_k_tbl_ = src_k_tbl,
+      .dst_k_tbl_ = dst_k_tbl,
+      .src_v_tbl_ = src_v_tbl,
+      .dst_v_tbl_ = dst_v_tbl,
+      .src_indices_ = src_indices.data_ptr<int64_t>(),
+      .dst_indices_ = dst_indices.data_ptr<int64_t>(),
+      .start_layer_ = start_layer,
+      .num_layers_ = num_layers,
+      .num_items_ = num_items,
+      .items_per_sg_ = items_per_sg,
+      .item_size_ = item_size,
+      .src_layout_dim_ = src_layout_dim,
+      .dst_layout_dim_ = dst_layout_dim,
   };
 
   auto cgf = DPCPP_Q_CGF(cgh) {
@@ -613,4 +779,136 @@ void transfer_kv_per_layer_ph_lf(
       block_quota,
       sgs_per_wg,
       layer_id);
+}
+
+// Single-layer, pf→lf, K+V.
+// src_k/src_v are the page-first pool base pointers; layer_id selects the layer
+// slot within each page.  dst_k/dst_v are the contiguous per-layer buffers.
+void transfer_kv_per_layer_pf_lf(
+    const at::Tensor& src_k,
+    at::Tensor& dst_k,
+    const at::Tensor& src_v,
+    at::Tensor& dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t block_quota,
+    int64_t sgs_per_wg) {
+  launch_transfer_kv_page_first<false, true>(
+      src_k.data_ptr(),
+      dst_k.data_ptr(),
+      src_v.data_ptr(),
+      dst_v.data_ptr(),
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      src_indices,
+      dst_indices,
+      layer_id,
+      1,
+      item_size,
+      src_layout_dim,
+      0,
+      block_quota,
+      sgs_per_wg);
+}
+
+// All-layers, lf_tbl→pf, K+V.
+void transfer_kv_all_layer_lf_pf(
+    const at::Tensor& src_k_layers,
+    at::Tensor& dst_k,
+    const at::Tensor& src_v_layers,
+    at::Tensor& dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t sgs_per_wg) {
+  TORCH_CHECK(num_layers == src_k_layers.size(0), "num_layers mismatch");
+  launch_transfer_kv_page_first<false, false>(
+      nullptr,
+      dst_k.data_ptr(),
+      nullptr,
+      dst_v.data_ptr(),
+      src_k_layers.data_ptr<uintptr_t>(),
+      nullptr,
+      src_v_layers.data_ptr<uintptr_t>(),
+      nullptr,
+      src_indices,
+      dst_indices,
+      0,
+      num_layers,
+      item_size,
+      0,
+      dst_layout_dim,
+      block_quota,
+      sgs_per_wg);
+}
+
+// Single-layer, pf→lf, K only (MLA).
+void transfer_kv_per_layer_mla_pf_lf(
+    const at::Tensor& src,
+    at::Tensor& dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t block_quota,
+    int64_t sgs_per_wg) {
+  launch_transfer_kv_page_first<true, true>(
+      src.data_ptr(),
+      dst.data_ptr(),
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      src_indices,
+      dst_indices,
+      layer_id,
+      1,
+      item_size,
+      src_layout_dim,
+      0,
+      block_quota,
+      sgs_per_wg);
+}
+
+// All-layers, lf_tbl→pf, K only (MLA).
+void transfer_kv_all_layer_mla_lf_pf(
+    const at::Tensor& src_layers,
+    at::Tensor& dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t sgs_per_wg) {
+  TORCH_CHECK(num_layers == src_layers.size(0), "num_layers mismatch");
+  launch_transfer_kv_page_first<true, false>(
+      nullptr,
+      dst.data_ptr(),
+      nullptr,
+      nullptr,
+      src_layers.data_ptr<uintptr_t>(),
+      nullptr,
+      nullptr,
+      nullptr,
+      src_indices,
+      dst_indices,
+      0,
+      num_layers,
+      item_size,
+      0,
+      dst_layout_dim,
+      block_quota,
+      sgs_per_wg);
 }

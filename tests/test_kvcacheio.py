@@ -4,12 +4,16 @@ import utils
 from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer,
     transfer_kv_all_layer_direct_lf_pf,
+    transfer_kv_all_layer_lf_pf,
     transfer_kv_all_layer_lf_ph,
     transfer_kv_all_layer_mla,
+    transfer_kv_all_layer_mla_lf_pf,
     transfer_kv_direct,
     transfer_kv_per_layer,
     transfer_kv_per_layer_direct_pf_lf,
     transfer_kv_per_layer_mla,
+    transfer_kv_per_layer_mla_pf_lf,
+    transfer_kv_per_layer_pf_lf,
 )
 
 from sglang.srt.utils import is_hip
@@ -34,6 +38,27 @@ def ref_copy_with_indices_pf_direct(
             dst_pool[layer_id][dst_indices[i : i + page_size]] = src_pool[
                 src_indices[i] // page_size
             ][layer_id].to(dst_pool.device)
+
+
+def ref_copy_with_indices_pf(
+    src_pool, dst_pool, src_indices, dst_indices, layer_id, pf_to_lf=True
+):
+    """Reference for the page-first kernel layout.
+
+    pf pool is [num_tokens, num_layers, item_size] (per-token addressing:
+    base + token * (num_layers * item_size) + layer * item_size).
+    lf pool is [num_layers, num_tokens, item_size].
+    """
+    if pf_to_lf:
+        # src is pf [tokens, layers, item], dst is lf [layers, tokens, item]
+        dst_pool[layer_id][dst_indices] = src_pool[src_indices, layer_id].to(
+            dst_pool.device
+        )
+    else:
+        # src is lf [layers, tokens, item], dst is pf [tokens, layers, item]
+        dst_pool[dst_indices, layer_id] = src_pool[layer_id][src_indices].to(
+            dst_pool.device
+        )
 
 
 def ref_copy_with_indices_page_head(
@@ -690,6 +715,162 @@ def test_transfer_kv_page_head(
         torch.accelerator.synchronize()
         torch.testing.assert_close(dst_k_pool_kernel, dst_k_pool_ref)
         torch.testing.assert_close(dst_v_pool_kernel, dst_v_pool_ref)
+    torch.set_default_dtype(original_dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_items_to_transfer", [256, 1024])
+@pytest.mark.parametrize("page_size", [16, 64])
+@pytest.mark.parametrize("item_size", [256])
+@pytest.mark.parametrize("total_items_in_pool", [10240])
+@pytest.mark.parametrize("is_mla", [False, True])
+@pytest.mark.parametrize("lf_to_pf", [False, True])
+def test_transfer_kv_pf_kernel(
+    dtype: torch.dtype,
+    num_items_to_transfer: int,
+    page_size: int,
+    item_size: int,
+    total_items_in_pool: int,
+    is_mla: bool,
+    lf_to_pf: bool,
+):
+    """Device-kernel page-first transfers (transfer_kv_*_pf_lf / *_lf_pf).
+
+    pf pool layout is [num_tokens, num_layers, item_size]; lf pool is
+    [num_layers, num_tokens, item_size].  Validated against a pure-torch
+    reference (ref_copy_with_indices_pf).
+    """
+    original_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+
+    torch.manual_seed(42)
+
+    num_layers = 4
+    layer_idx_to_test = 0
+    item_bytes = item_size * dtype.itemsize
+    layout_dim_bytes = item_size * num_layers * dtype.itemsize
+
+    total_pages_in_pool = total_items_in_pool // page_size
+    num_pages_to_transfer = num_items_to_transfer // page_size
+    if num_pages_to_transfer == 0:
+        torch.set_default_dtype(original_dtype)
+        return
+
+    page_indices = torch.randperm(total_pages_in_pool, dtype=torch.int64)
+    src_indices = torch.cat(
+        [
+            torch.arange(p * page_size, (p + 1) * page_size)
+            for p in page_indices[:num_pages_to_transfer]
+        ]
+    ).to(device)
+    dst_indices = torch.cat(
+        [
+            torch.arange(p * page_size, (p + 1) * page_size)
+            for p in page_indices[num_pages_to_transfer : 2 * num_pages_to_transfer]
+        ]
+    ).to(device)
+
+    def make_lf_tbl(pool):
+        return torch.tensor(
+            [pool[i].data_ptr() for i in range(num_layers)],
+            dtype=torch.uint64,
+            device=device,
+        )
+
+    if lf_to_pf:
+        # src lf [layers, tokens, item] -> dst pf [tokens, layers, item], all layers.
+        src_k = torch.randn(num_layers, total_items_in_pool, item_size).to(device)
+        dst_k_ref = torch.zeros(total_items_in_pool, num_layers, item_size).to(device)
+        dst_k_kernel = torch.zeros_like(dst_k_ref)
+        if is_mla:
+            torch.accelerator.synchronize()
+            transfer_kv_all_layer_mla_lf_pf(
+                make_lf_tbl(src_k),
+                dst_k_kernel,
+                src_indices,
+                dst_indices,
+                item_bytes,
+                layout_dim_bytes,
+                num_layers,
+            )
+            for i in range(num_layers):
+                ref_copy_with_indices_pf(
+                    src_k, dst_k_ref, src_indices, dst_indices, i, pf_to_lf=False
+                )
+            torch.accelerator.synchronize()
+            torch.testing.assert_close(dst_k_kernel, dst_k_ref)
+        else:
+            src_v = torch.randn(num_layers, total_items_in_pool, item_size).to(device)
+            dst_v_ref = torch.zeros_like(dst_k_ref)
+            dst_v_kernel = torch.zeros_like(dst_v_ref)
+            torch.accelerator.synchronize()
+            transfer_kv_all_layer_lf_pf(
+                make_lf_tbl(src_k),
+                dst_k_kernel,
+                make_lf_tbl(src_v),
+                dst_v_kernel,
+                src_indices,
+                dst_indices,
+                item_bytes,
+                layout_dim_bytes,
+                num_layers,
+            )
+            for i in range(num_layers):
+                ref_copy_with_indices_pf(
+                    src_k, dst_k_ref, src_indices, dst_indices, i, pf_to_lf=False
+                )
+                ref_copy_with_indices_pf(
+                    src_v, dst_v_ref, src_indices, dst_indices, i, pf_to_lf=False
+                )
+            torch.accelerator.synchronize()
+            torch.testing.assert_close(dst_k_kernel, dst_k_ref)
+            torch.testing.assert_close(dst_v_kernel, dst_v_ref)
+    else:
+        # src pf [tokens, layers, item] -> dst lf [layers, tokens, item], one layer.
+        src_k = torch.randn(total_items_in_pool, num_layers, item_size).to(device)
+        dst_k_ref = torch.zeros(num_layers, total_items_in_pool, item_size).to(device)
+        dst_k_kernel = torch.zeros_like(dst_k_ref)
+        if is_mla:
+            torch.accelerator.synchronize()
+            transfer_kv_per_layer_mla_pf_lf(
+                src_k,
+                dst_k_kernel[layer_idx_to_test],
+                src_indices,
+                dst_indices,
+                layer_idx_to_test,
+                item_bytes,
+                layout_dim_bytes,
+            )
+            ref_copy_with_indices_pf(
+                src_k, dst_k_ref, src_indices, dst_indices, layer_idx_to_test
+            )
+            torch.accelerator.synchronize()
+            torch.testing.assert_close(dst_k_kernel, dst_k_ref)
+        else:
+            src_v = torch.randn(total_items_in_pool, num_layers, item_size).to(device)
+            dst_v_ref = torch.zeros_like(dst_k_ref)
+            dst_v_kernel = torch.zeros_like(dst_v_ref)
+            torch.accelerator.synchronize()
+            transfer_kv_per_layer_pf_lf(
+                src_k,
+                dst_k_kernel[layer_idx_to_test],
+                src_v,
+                dst_v_kernel[layer_idx_to_test],
+                src_indices,
+                dst_indices,
+                layer_idx_to_test,
+                item_bytes,
+                layout_dim_bytes,
+            )
+            ref_copy_with_indices_pf(
+                src_k, dst_k_ref, src_indices, dst_indices, layer_idx_to_test
+            )
+            ref_copy_with_indices_pf(
+                src_v, dst_v_ref, src_indices, dst_indices, layer_idx_to_test
+            )
+            torch.accelerator.synchronize()
+            torch.testing.assert_close(dst_k_kernel, dst_k_ref)
+            torch.testing.assert_close(dst_v_kernel, dst_v_ref)
     torch.set_default_dtype(original_dtype)
 
 

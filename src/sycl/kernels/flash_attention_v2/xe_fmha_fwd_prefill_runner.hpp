@@ -110,6 +110,7 @@ struct Arguments {
   // If provided, the actual length of each q/k sequence.
   int* __restrict__ seqused_q;
   int* __restrict__ seqused_k;
+  int* __restrict__ cache_seqlens_old;
 
   // The stride between rows of Oaccum.
   int64_t oaccum_split_stride;
@@ -293,6 +294,22 @@ struct PrefillRunner {
   cutlass::Status run(const Arguments& params, const cutlass::KernelHardwareInfo& hw_info) {
     ProblemShapeType shape = initialize(params);
 
+    typename FMHAPrefillKernel::MainloopArguments mainloop_args{
+        params.softmax_scale,
+        params.page_table,
+        params.page_size,
+        params.max_num_pages_per_seq,
+        params.window_size_left,
+        params.window_size_right};
+    if constexpr (CollectiveMainloop::AppendKV) {
+      mainloop_args.append.ptr_K_new = static_cast<const ElementK*>(params.knew_ptr);
+      mainloop_args.append.ptr_V_new = static_cast<const ElementV*>(params.vnew_ptr);
+      mainloop_args.append.ptr_cu_seqlens_k_new = params.cu_seqlens_knew;
+      mainloop_args.append.ptr_cache_seqlens = params.cache_seqlens_old;
+      mainloop_args.append.seq_len_kv_new = params.seqlen_knew;
+      mainloop_args.append.total_k_new = params.total_knew;
+    }
+
     typename FMHAPrefillKernel::Arguments arguments{
         {
             shape,
@@ -313,14 +330,7 @@ struct PrefillRunner {
             params.k_scale_ptr,
             params.v_scale_ptr,
         },
-        {
-            params.softmax_scale,
-            params.page_table,
-            params.page_size,
-            params.max_num_pages_per_seq,
-            params.window_size_left,
-            params.window_size_right,
-        },
+        mainloop_args,
         {},
         hw_info};
 
@@ -381,7 +391,7 @@ struct FMHAConfig {
       decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{})),
       SubgroupLayoutPV_>;
 
-  template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
+  template <bool isVarLen, bool CachedKV, bool PagedKV, bool AppendKV, class Scheduler>
   static int run(const Arguments& params) {
     // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
     // information is used by the underlying kernel.
@@ -431,7 +441,9 @@ struct FMHAConfig {
         GmemTiledCopyV,
         GmemTiledCopyK_cache,
         GmemTiledCopyV_cache,
-        LocalMask>;
+        LocalMask,
+        false,
+        AppendKV>;
 
     // Epilogue
     using CollectiveEpilogue =
@@ -460,14 +472,36 @@ struct FMHAConfig {
 
   // Paged KV cache: the page table encodes absolute KV positions.
   static int run_paged(const Arguments& params) {
-    // template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
-    return run<true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+    TORCH_CHECK(params.cu_seqlens_q != nullptr, "paged prefill requires cu_seqlens_q");
+    TORCH_CHECK(params.cu_seqlens_k != nullptr, "paged prefill requires per-batch cache lengths in cu_seqlens_k");
+    TORCH_CHECK(params.page_table != nullptr, "paged prefill requires page_table");
+    TORCH_CHECK(params.page_size > 0, "paged prefill requires a positive page_size");
+    TORCH_CHECK(params.max_num_pages_per_seq > 0, "paged prefill requires max_num_pages_per_seq");
+    TORCH_CHECK(params.seqlen_q > 0 && params.seqlen_k > 0, "paged prefill requires positive max sequence lengths");
+    TORCH_CHECK(params.total_q > 0 && params.total_k > 0, "paged prefill requires positive total sequence lengths");
+    bool const has_append = params.total_knew > 0 && params.knew_ptr != nullptr && params.vnew_ptr != nullptr &&
+                            params.cache_seqlens_old != nullptr;
+    // template <bool isVarLen, bool CachedKV, bool PagedKV, bool AppendKV, class Scheduler>
+    if (has_append) {
+      return run<true, true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+    }
+    return run<true, true, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
   }
 
   // Non-paged (contiguous ragged) KV cache: addressed via cu_seqlens_k offsets.
   static int run_nopaged(const Arguments& params) {
-    // template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
-    return run<true, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+    TORCH_CHECK(params.cu_seqlens_q != nullptr, "non-paged prefill requires cu_seqlens_q");
+    TORCH_CHECK(params.cu_seqlens_k != nullptr, "non-paged prefill requires cumulative cu_seqlens_k");
+    TORCH_CHECK(params.page_table == nullptr, "non-paged prefill expects page_table to be null");
+    TORCH_CHECK(params.seqlen_q > 0 && params.seqlen_k > 0, "non-paged prefill requires positive max sequence lengths");
+    TORCH_CHECK(params.total_q > 0 && params.total_k > 0, "non-paged prefill requires positive total sequence lengths");
+    bool const has_append = params.total_knew > 0 && params.knew_ptr != nullptr && params.vnew_ptr != nullptr &&
+                            params.cache_seqlens_old != nullptr;
+    // template <bool isVarLen, bool CachedKV, bool PagedKV, bool AppendKV, class Scheduler>
+    if (has_append) {
+      return run<true, true, false, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+    }
+    return run<true, true, false, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
   }
 
   static int run(const Arguments& params) {

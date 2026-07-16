@@ -1,66 +1,50 @@
-from typing import Optional, Union
+from typing import Optional
 
 import torch
 
 
-def causal_conv1d_fn_xpu(
+def causal_conv1d_fwd(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    conv_states: Optional[torch.Tensor] = None,
-    query_start_loc: Optional[torch.Tensor] = None,
-    cache_indices: Optional[torch.Tensor] = None,
-    has_initial_state: Optional[torch.Tensor] = None,
-    activation: Optional[str] = "silu",
-    pad_slot_id: int = -1,
-    **kwargs,
+    bias_: Optional[torch.Tensor],
+    conv_states: Optional[torch.Tensor],
+    query_start_loc: Optional[torch.Tensor],
+    cache_indices: Optional[torch.Tensor],
+    has_initial_state: Optional[torch.Tensor],
+    silu_activation: bool,
+    pad_slot_id: int,
 ):
-    _ = kwargs
-    silu = activation in ["silu", "swish"]
+    # mamba
     torch.ops.sgl_kernel.causal_conv1d_fwd(
         x,
         weight,
-        bias,
+        bias_,
         conv_states,
         query_start_loc,
         cache_indices,
         has_initial_state,
-        silu,
+        silu_activation,
         pad_slot_id,
     )
-    return x
 
 
-def causal_conv1d_update_xpu(
+def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    activation: Union[bool, str, None] = None,
-    cache_seqlens: Optional[torch.Tensor] = None,
-    conv_state_indices: Optional[torch.Tensor] = None,
-    pad_slot_id: int = -1,
+    bias_: Optional[torch.Tensor],
+    silu_activation: bool,
+    cache_seqlens: Optional[torch.Tensor],
+    conv_state_indices: Optional[torch.Tensor],
+    pad_slot_id: int,
 ):
-    if isinstance(activation, bool):
-        silu = activation
-    else:
-        silu = activation in ["silu", "swish"]
-
-    unsqueeze = x.dim() == 2
-    if unsqueeze:
-        x = x.unsqueeze(-1)
-
     torch.ops.sgl_kernel.causal_conv1d_update(
         x,
         conv_state,
         weight,
-        bias,
-        silu,
+        bias_,
+        silu_activation,
         cache_seqlens,
         conv_state_indices,
         pad_slot_id,
     )
-    if unsqueeze:
-        x = x.squeeze(-1)
-    return x
-

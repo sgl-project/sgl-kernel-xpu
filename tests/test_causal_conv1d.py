@@ -3,7 +3,8 @@ from typing import Optional
 
 import torch
 import utils
-from sgl_kernel import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
+from sgl_kernel import causal_conv1d_fwd as causal_conv1d_fwd_kernel
+from sgl_kernel import causal_conv1d_update as causal_conv1d_update_kernel
 
 device = utils.get_device()
 
@@ -54,7 +55,7 @@ def causal_conv1d_fn(
         x = x.contiguous()
     bias = bias.contiguous() if bias is not None else None
 
-    causal_conv1d_fn_xpu(
+    causal_conv1d_fwd_kernel(
         x,
         weight,
         bias,
@@ -108,7 +109,7 @@ def causal_conv1d_update(
     unsqueeze = x.dim() == 2
     if unsqueeze:
         x = x.unsqueeze(-1)
-    causal_conv1d_update_xpu(
+    causal_conv1d_update_kernel(
         x,
         conv_state,
         weight,

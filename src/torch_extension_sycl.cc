@@ -269,6 +269,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("hc_pre_gemm_sqr_sum(Tensor! C, Tensor! sqr_sum, Tensor A, Tensor B) -> ()");
   m.impl("hc_pre_gemm_sqr_sum", torch::kXPU, &hc_pre_gemm_sqr_sum);
 
+  /* HC POST */
+  m.def("hc_post(Tensor x, Tensor residual, Tensor post_layer_mix, Tensor comb_res_mix, Tensor! out) -> ()");
+  m.impl("hc_post", torch::kXPU, &hc_post);
+
   /*
    * From LoRA
    */

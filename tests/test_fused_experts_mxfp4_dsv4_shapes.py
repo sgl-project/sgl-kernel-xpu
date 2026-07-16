@@ -78,18 +78,13 @@ def _build_packed_weights(E, N, K):
     return packed, scales
 
 
-# fused_experts chooses a fused-activation vs unfused-activation GEMM1 by
-#   use_unfused_act = avg_m <= 128 and (hidden*intermediate > 4096**2)
-# where avg_m = (num_tokens*topk)//num_experts. The swiglu_deepseek_v4 clamp
-# is applied in two different places on the two paths (in-kernel epilogue vs
-# explicit clamp_ in Python), so exercise BOTH:
-#   - "fused":   real DSV4 decode shape (E=256, H=4096, I=256) -> fused path
-#   - "unfused": small E + large H*I (E=8, H=4096, I=8192)     -> unfused path
-# Both keep packed resident weights ~400 MB.
+# Cover both the real DSV4 decode shape and a larger-intermediate shape. Both
+# use the W4A16 two-GEMM path and the standalone fused activation kernel.
+# Each case keeps packed resident weights around 400 MB.
 _DSV4_SHAPES = [
     # (name, num_tokens, num_experts, topk, hidden, intermediate)
-    ("fused", 47, 256, 6, 4096, 256),
-    ("unfused", 47, 8, 6, 4096, 8192),
+    ("decode", 47, 256, 6, 4096, 256),
+    ("large-intermediate", 47, 8, 6, 4096, 8192),
 ]
 
 
@@ -130,8 +125,8 @@ def test_fused_experts_dsv4_shape(
       topk_ids.shape          = [47, 6]          int64
       activation='silu', routed_scaling_factor=1.5, swiglu_limit=10
 
-    The "unfused" shape (E=8, H=4096, I=8192) trips the unfused-activation
-    branch so the explicit Python clamp_ path is covered too.
+    The "large-intermediate" shape (E=8, H=4096, I=8192) exercises the same
+    activation path with a substantially larger intermediate projection.
 
     swiglu_limit is crossed over {10, None}: 10 exercises the DSV4 clamp
     (activation_type=4), None falls back to plain silu (activation_type=0).

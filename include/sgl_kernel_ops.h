@@ -380,9 +380,8 @@ void moe_grouped_mm_nt_xe20(
 // raw per-group zero-point in code units; when supplied, weights dequant as
 // `(code - zp) * scale` instead of requiring the zero-point to be pre-folded
 // into a signed 4-bit code (which overflows for non-symmetric zero-points).
-// `rows_per_expert` holds the per-expert row counts. No activation is
-// fused; the caller runs the activation between GEMM1 and GEMM2. group_size
-// must be 32/64/128/256.
+// `rows_per_expert` holds the per-expert row counts. group_size must be
+// 32/64/128/256. The caller runs the activation between GEMM1 and GEMM2.
 void moe_grouped_mm_nt_xe20_w4a16(
     torch::Tensor& output,
     const torch::Tensor& activations,

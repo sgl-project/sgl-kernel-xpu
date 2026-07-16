@@ -3,12 +3,10 @@
  * SPDX-License-Identifier: BSD-3-Clause
  **************************************************************************************************/
 
-// Shared fused-activation helpers for the Xe2 MoE grouped-GEMM mainloops.
-// Both the bf16 and MXFP4 W4A16 mainloops produce a pair of fp32
-// accumulator fragments (tCrC0 = gate, tCrC1 = up) and need the same
-// gate-and-mul formulas to fuse activation with the GEMM. Centralizing
-// the activation IDs and per-element compute here means new activations
-// (e.g. PR #194's ReLU²) drop into one file, not two.
+// Fused-activation helpers for the BF16 Xe2 MoE grouped-GEMM mainloop.
+// W4A16 runs GEMM and activation as separate kernels. Centralizing the
+// activation IDs and per-element compute here keeps new BF16 fused
+// activations (e.g. PR #194's ReLU²) in one file.
 
 #pragma once
 
@@ -17,10 +15,9 @@
 
 namespace moe_xe20 {
 
-// Activation identifiers. Match the ABI exposed by
-// torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20{,_mxfp4_w4a16}; the Python
-// wrapper translates string activation names to these ints. Plain ints
-// (not enum class) so they can be used as int template parameters.
+// Activation identifiers match the BF16 grouped-GEMM ABI. The Python wrapper
+// translates string activation names to these ints. Plain ints (not enum
+// class) so they can be used as int template parameters.
 inline constexpr int ACT_SILU = 0;
 inline constexpr int ACT_GELU = 1;
 inline constexpr int ACT_SWIGLU_GPT_OSS = 2;

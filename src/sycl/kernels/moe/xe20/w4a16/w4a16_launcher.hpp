@@ -80,7 +80,7 @@ void MoEGEMMLauncher(
     sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), cgh);
     cgh.parallel_for<GemmCuteName<ElementA, ElementB, ElementS, ElementD, HasZero, layoutA, layoutB, policy>>(
         sycl::nd_range<3>{global * local, local}, kernel_props, [=](auto) {
-        moe_w4a16::MoEGEMM<GmemTiledCopyA, GmemTiledCopyB, GmemTiledCopyD, layoutA, layoutB, 'R', HasZero>(
+      moe_w4a16::MoEGEMM<GmemTiledCopyA, GmemTiledCopyB, GmemTiledCopyD, layoutA, layoutB, 'R', HasZero>(
               activations,
               weights,
               scales,

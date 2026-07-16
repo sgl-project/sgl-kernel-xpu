@@ -179,7 +179,7 @@ CUTE_DEVICE void MoEGEMM(
       }
     }();
     auto D_tensor = make_moe_tensor<ElementD, LayoutKindD>(
-        ptr_D_curr_batch, gemm_m, gemm_n);
+      ptr_D_curr_batch, gemm_m, gemm_n);
 
     while (group_m_id < cumsum_tiles_for_experts) {
       int n_coord = (group_id * wg_tile_n) % gemm_n_pad / wg_tile_n;

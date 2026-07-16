@@ -627,8 +627,9 @@ def fused_experts(
     _MOE_GROUPED_GEMM_SMALL_WEIGHT_THRESHOLD = 4096 * 4096
     avg_m = (M * TopK) // E
     big_weight = K * N > _MOE_GROUPED_GEMM_SMALL_WEIGHT_THRESHOLD
-    # The 4-bit W4A16 grouped GEMM does not fuse activation, so it always takes
-    # the unfused path (GEMM1 -> activation -> GEMM2).
+    # The 4-bit W4A16 grouped GEMM uses a two-GEMM path. Keep GEMM1 independent
+    # and apply the gated activation with its dedicated elementwise kernel.
+    # This preserves GEMM N-dimension parallelism and matches the CUDA layout.
     use_unfused_act = use_4bit_w4a16 or (avg_m <= 128 and big_weight)
     if use_unfused_act:
         intermediate_cache1 = torch.empty(
@@ -666,18 +667,12 @@ def fused_experts(
                 gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
                 gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
             )
-        if activation_type in (0, 4):
-            if activation_type == 4:
-                # DeepSeek-V4 swiglu clamp, applied here on the raw gate+up
-                # projection because the unfused GEMM1 wrote it out without
-                # activation. The fused path does the same clamp in-kernel
-                # (apply_fused_activation<SWIGLU_DEEPSEEK_V4>).
-                half = w1.shape[1] // 2
-                intermediate_cache1[:, :half].clamp_(max=swiglu_limit)
-                intermediate_cache1[:, half:].clamp_(
-                    min=-swiglu_limit, max=swiglu_limit
-                )
+        if activation_type == 0:
             torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
+        elif activation_type == 4:
+            torch.ops.sgl_kernel.silu_and_mul_clamp(
+                intermediate_cache2, intermediate_cache1, swiglu_limit
+            )
         elif activation_type == 1:
             torch.ops.sgl_kernel.gelu_tanh_and_mul(
                 intermediate_cache2, intermediate_cache1

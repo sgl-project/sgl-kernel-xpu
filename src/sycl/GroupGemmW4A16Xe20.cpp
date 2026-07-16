@@ -59,8 +59,8 @@ void w4a16_launch(
     int32_t* atomic_buffer);
 }  // namespace moe_w4a16
 
-#define DECLARE_W4A16_EXTERN(Policy, ElementS, ElementA)                              \
-  extern template void moe_w4a16::w4a16_launch<moe_w4a16::Policy, ElementS, ElementA>( \
+#define DECLARE_W4A16_EXTERN(Policy, ElementS, ElementA)                                       \
+  extern template void moe_w4a16::w4a16_launch<moe_w4a16::Policy, ElementS, ElementA>(          \
       sycl::queue,                                                                    \
       const void*,                                                                   \
       const void*,                                                                   \
@@ -75,7 +75,7 @@ void w4a16_launch(
       const int,                                                                     \
       int32_t*);
 
-#define DECLARE_W4A16_POLICY(Policy)                                  \
+#define DECLARE_W4A16_POLICY(Policy)                                       \
   DECLARE_W4A16_EXTERN(Policy, cutlass::bfloat16_t, cutlass::bfloat16_t) \
   DECLARE_W4A16_EXTERN(Policy, cutlass::half_t, cutlass::half_t)         \
   DECLARE_W4A16_EXTERN(Policy, uint8_t, cutlass::bfloat16_t)             \
@@ -90,7 +90,7 @@ DECLARE_W4A16_POLICY(w4a16_policy)
 #undef DECLARE_W4A16_EXTERN
 
 void moe_grouped_mm_nt_xe20_w4a16(
-    torch::Tensor& output,                  // [total_m, N] bf16 or fp16 (matches activations)
+    torch::Tensor& output,                  // [total_m, N] bf16/fp16
     const torch::Tensor& activations,       // [total_m, K] bf16 or fp16
     const torch::Tensor& packed_weights,    // [E, N, K/2] int8 (two 4-bit values per byte)
     const torch::Tensor& scales,            // [E, N, K/group_size]: int4=activation dtype, mxfp4=uint8
@@ -165,86 +165,55 @@ void moe_grouped_mm_nt_xe20_w4a16(
 
   const int avg_m = total_m / static_cast<int>(n_experts);
   const bool is_fp16_act = activations.scalar_type() == at::ScalarType::Half;
-
-#define LAUNCH_W4A16(Policy)                                                            \
-  do {                                                                                  \
-    if (is_int4) {                                                                      \
-      if (is_fp16_act) {                                                                \
-        moe_w4a16::w4a16_launch<moe_w4a16::Policy, cutlass::half_t, cutlass::half_t>(     \
-            queue,                                                                      \
-            activations.data_ptr(),                                                     \
-            packed_weights.data_ptr(),                                                  \
-            scales.data_ptr(),                                                          \
-            zeros_ptr,                                                                  \
-            bias_ptr,                                                                   \
-            output.data_ptr(),                                                          \
-            gemm_n,                                                                     \
-            gemm_k,                                                                     \
-            rows_per_expert.data_ptr<int>(),                                             \
-            static_cast<int>(n_experts),                                                \
-            static_cast<int>(group_size),                                               \
-            atomic_buffer.data_ptr<int>());                                             \
-      } else {                                                                          \
-        moe_w4a16::w4a16_launch<moe_w4a16::Policy, cutlass::bfloat16_t, cutlass::bfloat16_t>( \
-            queue,                                                                      \
-            activations.data_ptr(),                                                     \
-            packed_weights.data_ptr(),                                                  \
-            scales.data_ptr(),                                                          \
-            zeros_ptr,                                                                  \
-            bias_ptr,                                                                   \
-            output.data_ptr(),                                                          \
-            gemm_n,                                                                     \
-            gemm_k,                                                                     \
-            rows_per_expert.data_ptr<int>(),                                             \
-            static_cast<int>(n_experts),                                                \
-            static_cast<int>(group_size),                                               \
-            atomic_buffer.data_ptr<int>());                                             \
-      }                                                                                  \
-    } else {                                                                            \
-      if (is_fp16_act) {                                                                \
-        moe_w4a16::w4a16_launch<moe_w4a16::Policy, uint8_t, cutlass::half_t>(            \
-            queue,                                                                      \
-            activations.data_ptr(),                                                     \
-            packed_weights.data_ptr(),                                                  \
-            scales.data_ptr(),                                                          \
-            zeros_ptr,                                                                  \
-            bias_ptr,                                                                   \
-            output.data_ptr(),                                                          \
-            gemm_n,                                                                     \
-            gemm_k,                                                                     \
-            rows_per_expert.data_ptr<int>(),                                             \
-            static_cast<int>(n_experts),                                                \
-            static_cast<int>(group_size),                                               \
-            atomic_buffer.data_ptr<int>());                                             \
-      } else {                                                                          \
-        moe_w4a16::w4a16_launch<moe_w4a16::Policy, uint8_t, cutlass::bfloat16_t>(        \
-            queue,                                                                      \
-            activations.data_ptr(),                                                     \
-            packed_weights.data_ptr(),                                                  \
-            scales.data_ptr(),                                                          \
-            zeros_ptr,                                                                  \
-            bias_ptr,                                                                   \
-            output.data_ptr(),                                                          \
-            gemm_n,                                                                     \
-            gemm_k,                                                                     \
-            rows_per_expert.data_ptr<int>(),                                             \
-            static_cast<int>(n_experts),                                                \
-            static_cast<int>(group_size),                                               \
-            atomic_buffer.data_ptr<int>());                                             \
-      }                                                                                  \
-    }                                                                                    \
+#define LAUNCH_W4A16(Policy)                                                                     \
+  do {                                                                                           \
+    if (is_int4) {                                                                               \
+      if (is_fp16_act) {                                                                         \
+        moe_w4a16::w4a16_launch<moe_w4a16::Policy, cutlass::half_t, cutlass::half_t>(            \
+            queue, activations.data_ptr(), packed_weights.data_ptr(), scales.data_ptr(),         \
+            zeros_ptr, bias_ptr, output.data_ptr(), gemm_n, gemm_k,                              \
+            rows_per_expert.data_ptr<int>(), static_cast<int>(n_experts),                        \
+            static_cast<int>(group_size), atomic_buffer.data_ptr<int>());                        \
+      } else {                                                                                   \
+        moe_w4a16::w4a16_launch<moe_w4a16::Policy, cutlass::bfloat16_t, cutlass::bfloat16_t>(    \
+            queue, activations.data_ptr(), packed_weights.data_ptr(), scales.data_ptr(),         \
+            zeros_ptr, bias_ptr, output.data_ptr(), gemm_n, gemm_k,                              \
+            rows_per_expert.data_ptr<int>(), static_cast<int>(n_experts),                        \
+            static_cast<int>(group_size), atomic_buffer.data_ptr<int>());                        \
+      }                                                                                          \
+    } else {                                                                                     \
+      if (is_fp16_act) {                                                                         \
+        moe_w4a16::w4a16_launch<moe_w4a16::Policy, uint8_t, cutlass::half_t>(                    \
+            queue, activations.data_ptr(), packed_weights.data_ptr(), scales.data_ptr(),         \
+            zeros_ptr, bias_ptr, output.data_ptr(), gemm_n, gemm_k,                              \
+            rows_per_expert.data_ptr<int>(), static_cast<int>(n_experts),                        \
+            static_cast<int>(group_size), atomic_buffer.data_ptr<int>());                        \
+      } else {                                                                                   \
+        moe_w4a16::w4a16_launch<moe_w4a16::Policy, uint8_t, cutlass::bfloat16_t>(                \
+            queue, activations.data_ptr(), packed_weights.data_ptr(), scales.data_ptr(),         \
+            zeros_ptr, bias_ptr, output.data_ptr(), gemm_n, gemm_k,                              \
+            rows_per_expert.data_ptr<int>(), static_cast<int>(n_experts),                        \
+            static_cast<int>(group_size), atomic_buffer.data_ptr<int>());                        \
+      }                                                                                          \
+    }                                                                                            \
   } while (0)
 
-  if (avg_m <= 4) {
-    LAUNCH_W4A16(w4a16_policy_m_8);
-  } else if (avg_m <= 8) {
-    LAUNCH_W4A16(w4a16_policy_m_16);
-  } else if (avg_m <= 128) {
-    LAUNCH_W4A16(w4a16_policy_m_32);
-  } else {
-    LAUNCH_W4A16(w4a16_policy);
-  }
+#define DISPATCH_W4A16_POLICY()                  \
+  do {                                          \
+    if (avg_m <= 4) {                           \
+      LAUNCH_W4A16(w4a16_policy_m_8);           \
+    } else if (avg_m <= 8) {                    \
+      LAUNCH_W4A16(w4a16_policy_m_16);          \
+    } else if (avg_m <= 128) {                  \
+      LAUNCH_W4A16(w4a16_policy_m_32);          \
+    } else {                                    \
+      LAUNCH_W4A16(w4a16_policy);               \
+    }                                           \
+  } while (0)
 
+  DISPATCH_W4A16_POLICY();
+
+#undef DISPATCH_W4A16_POLICY
 #undef LAUNCH_W4A16
 }
 

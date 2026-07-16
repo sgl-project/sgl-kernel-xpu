@@ -20,8 +20,8 @@ endfunction()
 #   w4a16_policy_m_32  <_32, _64,  _32>  — avg_m <= 128
 #   w4a16_policy       <_128,_256, _32>  — avg_m > 128
 # group_size (32/64/128/256) is compiled into every unit as a runtime branch,
-# so it does not multiply the instance count. Total: 4 policies x 2 (int4/
-# mxfp4) x 2 (bf16/fp16 activation) = 16 units.
+# so it does not multiply the instance count. Total: 4 policies x 2 (int4/mxfp4)
+# x 2 (bf16/fp16 activation) = 16 units.
 foreach(policy w4a16_policy_m_8 w4a16_policy_m_16 w4a16_policy_m_32 w4a16_policy)
     foreach(act_tag bf16 fp16)
         if(act_tag STREQUAL "bf16")
@@ -31,7 +31,7 @@ foreach(policy w4a16_policy_m_8 w4a16_policy_m_16 w4a16_policy_m_32 w4a16_policy
         endif()
         # int4: scale and activation use the same dtype.
         add_group_gemm_w4a16_xe20_inst(${policy} "${element_a}" "${element_a}" "int4_${act_tag}")
-        # mxfp4: scale is a uint8 E8M0 exponent
+        # mxfp4: scale is a uint8 E8M0 exponent.
         add_group_gemm_w4a16_xe20_inst(${policy} "uint8_t" "${element_a}" "mxfp4_${act_tag}")
     endforeach()
 endforeach()

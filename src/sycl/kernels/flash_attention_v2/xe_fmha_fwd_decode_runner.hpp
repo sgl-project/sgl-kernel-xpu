@@ -54,8 +54,11 @@ struct Arguments {
   void* __restrict__ k_ptr;
   void* __restrict__ v_ptr;
 
-  void* __restrict__ k_scale_ptr = nullptr;
-  void* __restrict__ v_scale_ptr = nullptr;
+  // FP8 KV cache per-tensor descale. The single scalar lives on-device; the
+  // kernel dereferences these pointers so no host-side D2H sync (.item()) is
+  // needed. Null => no fp8 dequant (scale = 1.0f).
+  const float* k_scale_ptr = nullptr;
+  const float* v_scale_ptr = nullptr;
 
   void* __restrict__ temp_out_ptr = nullptr;
   void* __restrict__ exp_sums_ptr = nullptr;
@@ -183,7 +186,8 @@ struct Arguments {
 
   bool is_bf16;
   bool is_fp32;
-  bool is_e4m3;
+  bool is_e4m3 = false;
+  bool is_e5m2 = false;
 
   bool is_rotary_interleaved;
 
@@ -321,6 +325,8 @@ struct DecodeRunner {
             stride_V_cache,
             static_cast<const typename FMHADecodeKernel::ElementSink*>(params.softmax_sink_ptr),
             static_cast<const bool*>(params.skip_batch_mask_ptr),
+            params.k_scale_ptr,
+            params.v_scale_ptr,
         },
         {params.softmax_scale,
          params.page_table,
@@ -482,10 +488,10 @@ struct SplitDecodeKernelRunner {
             stride_max_logits,
             reinterpret_cast<ElementQ*>(params.softmax_sink_ptr),
             static_cast<const bool*>(params.skip_batch_mask_ptr),
+            params.k_scale_ptr,
+            params.v_scale_ptr,
         },
         {params.softmax_scale,
-         params.k_scale_ptr,
-         params.v_scale_ptr,
          static_cast<int*>(params.page_table),
          params.page_size,
          params.max_num_pages_per_seq,

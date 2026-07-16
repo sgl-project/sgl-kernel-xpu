@@ -121,7 +121,9 @@ void topk_sigmoid(
     at::Tensor& topk_indices,
     at::Tensor& gating_output,
     bool renormalize,
-    const c10::optional<at::Tensor>& correction_bias);
+    const c10::optional<at::Tensor>& correction_bias,
+    double routed_scaling_factor = 1.0,
+    int64_t num_fused_shared_experts = 0);
 
 std::tuple<at::Tensor, at::Tensor> rotary_embedding(
     at::Tensor& positions,
@@ -326,6 +328,7 @@ void transfer_kv_all_layer_mla_lf_pf(
     int64_t block_quota,
     int64_t sgs_per_wg);
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
+void silu_and_mul_clamp(torch::Tensor& out, torch::Tensor& input, double swiglu_limit);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
 void gelu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void apply_rope_pos_ids_cos_sin_cache(
@@ -384,6 +387,21 @@ void bmm_fp8(
     int64_t sycl_stream);
 
 /*
+ * From csrc/nsa (Native Sparse Attention)
+ */
+// fp8_mqa_logits (prefill) is implemented in pure Python via sgl_kernel.nsa.
+
+torch::Tensor fp8_paged_mqa_logits(
+    const torch::Tensor& q_fp8,
+    const torch::Tensor& kv_cache,
+    const torch::Tensor& weights,
+    const torch::Tensor& seq_lens,
+    const torch::Tensor& block_tables,
+    const std::optional<torch::Tensor>& schedule_metadata,
+    int64_t max_seq_len,
+    bool clean_logits);
+
+/*
  * From csrc/moe
  */
 void moe_align_block_size(
@@ -410,7 +428,9 @@ void topk_sigmoid(
     torch::Tensor& topk_indices,
     torch::Tensor& gating_output,
     bool renormalize,
-    const std::optional<torch::Tensor>& correction_bias);
+    const std::optional<torch::Tensor>& correction_bias,
+    double routed_scaling_factor = 1.0,
+    int64_t num_fused_shared_experts = 0);
 torch::Tensor swiglu_gpt_oss_sigmoid_alpha(torch::Tensor x, double alpha, double limit);
 
 std::vector<at::Tensor> moe_fused_gate(
@@ -420,6 +440,8 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t topk_group,
     int64_t topk,
     int64_t num_fused_shared_experts,
+    int64_t scoring_func,
+    bool renormalize,
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output);
 
@@ -574,6 +596,16 @@ void hc_pre_big_fuse(
     std::optional<double> norm_eps = std::nullopt);
 
 /*
+ * hc_post
+ */
+void hc_post(
+    const at::Tensor& x,
+    const at::Tensor& residual,
+    const at::Tensor& post_layer_mix,
+    const at::Tensor& comb_res_mix,
+    at::Tensor& out);
+
+/*
  * hc_pre GEMM + row-wise square sum
  */
 void hc_pre_gemm_sqr_sum(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, const at::Tensor& B);
@@ -664,6 +696,24 @@ void top_p_sampling_from_probs(
     double top_p_val,
     bool deterministic,
     std::optional<at::Generator> gen);
+
+void fast_topk_interface(
+    const at::Tensor& score, at::Tensor& indices, const at::Tensor& lengths, std::optional<at::Tensor> row_starts_opt);
+
+void fast_topk_transform_interface(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& dst_page_table,
+    const at::Tensor& src_page_table,
+    const at::Tensor& cu_seqlens_q,
+    std::optional<at::Tensor> row_starts_opt);
+
+void fast_topk_transform_ragged_interface(
+    const at::Tensor& score,
+    const at::Tensor& lengths,
+    at::Tensor& topk_indices_ragged,
+    const at::Tensor& topk_indices_offset,
+    std::optional<at::Tensor> row_starts_opt);
 
 namespace flash {
 /*

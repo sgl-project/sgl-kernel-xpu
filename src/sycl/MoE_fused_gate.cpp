@@ -11,6 +11,11 @@
 static constexpr int ROWS_PER_WG = 8;  // maximum CTA per work group
 static constexpr int MAX_VPT = 32;     // maximum VPT we support, > params.VPT = num_expert / num_expert_group
 
+enum class ScoringFunc : int32_t {
+  kSigmoid = 0,
+  kSoftmax = 1,
+};
+
 template <typename T>
 constexpr T max_value() {
   return std::numeric_limits<T>::max();
@@ -28,6 +33,8 @@ struct moe_fused_gate_impl {
       int32_t topk_group,
       int32_t topk,
       int32_t num_fused_shared_experts,
+      int32_t scoring_func,
+      bool renormalize,
       double routed_scaling_factor,
       bool apply_routed_scaling_factor_on_output,
       Params params)
@@ -39,9 +46,62 @@ struct moe_fused_gate_impl {
         topk_group_(topk_group),
         topk_(topk),
         num_fused_shared_experts_(num_fused_shared_experts),
+        scoring_func_(scoring_func),
+        renormalize_(renormalize),
         routed_scaling_factor_(routed_scaling_factor),
         apply_routed_scaling_factor_on_output_(apply_routed_scaling_factor_on_output),
         params_(params) {}
+
+  inline void apply_sigmoid_scoring(T row_chunk[MAX_VPT]) const {
+#pragma unroll
+    for (int i = 0; i < params_.VPT; ++i) {
+      float x = static_cast<float>(row_chunk[i]);
+      row_chunk[i] = static_cast<T>(1.0f / (1.0f + sycl::exp(-x)));
+    }
+  }
+
+  inline void apply_softmax_scoring(T row_chunk[MAX_VPT], sycl::sub_group sg) const {
+    uint32_t lane = sg.get_local_id()[0];
+    uint32_t logical_lane = lane & (params_.NUM_EXPERT_GROUPS - 1);
+    uint32_t group_base = lane & ~(params_.NUM_EXPERT_GROUPS - 1);
+
+    float local_max = -max_value<float>();
+#pragma unroll
+    for (int i = 0; i < params_.VPT; ++i) {
+      local_max = sycl::fmax(local_max, static_cast<float>(row_chunk[i]));
+    }
+
+    for (int mask = params_.NUM_EXPERT_GROUPS / 2; mask > 0; mask >>= 1) {
+      uint32_t target_logical = logical_lane ^ mask;
+      uint32_t target_lane = group_base + target_logical;
+      uint32_t xor_mask = lane ^ target_lane;
+      float other_max = sycl::permute_group_by_xor(sg, local_max, xor_mask);
+      local_max = sycl::fmax(local_max, other_max);
+    }
+
+    float exp_chunk[MAX_VPT];
+    float local_sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < params_.VPT; ++i) {
+      float exp_val = sycl::exp(static_cast<float>(row_chunk[i]) - local_max);
+      exp_chunk[i] = exp_val;
+      local_sum += exp_val;
+    }
+
+    for (int mask = params_.NUM_EXPERT_GROUPS / 2; mask > 0; mask >>= 1) {
+      uint32_t target_logical = logical_lane ^ mask;
+      uint32_t target_lane = group_base + target_logical;
+      uint32_t xor_mask = lane ^ target_lane;
+      float other_sum = sycl::permute_group_by_xor(sg, local_sum, xor_mask);
+      local_sum += other_sum;
+    }
+
+    float inv_sum = (local_sum > 0.0f) ? (1.0f / local_sum) : 0.0f;
+#pragma unroll
+    for (int i = 0; i < params_.VPT; ++i) {
+      row_chunk[i] = static_cast<T>(exp_chunk[i] * inv_sum);
+    }
+  }
 
   [[sycl::reqd_sub_group_size(MAX_VPT)]]
   void operator()(sycl::nd_item<3> item) const {
@@ -73,11 +133,10 @@ struct moe_fused_gate_impl {
         bias_chunk[i] = bias_ptr[i];
       }
 
-////////////////////// Sigmoid //////////////////////
-#pragma unroll
-      for (int i = 0; i < params_.VPT; ++i) {
-        float x = static_cast<float>(-row_chunk[i]);
-        row_chunk[i] = static_cast<T>(1.0f / (1.0f + sycl::exp(x)));
+      if (scoring_func_ == static_cast<int32_t>(ScoringFunc::kSigmoid)) {
+        apply_sigmoid_scoring(row_chunk);
+      } else {
+        apply_softmax_scoring(row_chunk, sg);
       }
 
 ////////////////////// Add Bias //////////////////////
@@ -106,9 +165,13 @@ struct moe_fused_gate_impl {
         }
       }
 
-      // QQ NOTE: currently fixed to pick top2 sigmoid weight value in each expert group and sum them as the group
-      // weight to select expert groups
-      T max_sum = max_val + max_val_second;
+      // QQ NOTE: currently fixed to pick top2 activated weight values in each expert group and sum them as the
+      // group weight to select expert groups
+      float max_sum = max_val + max_val_second;
+      // grouped_topk with softmax only uses the max value of each group rather than sum of top-2
+      if (scoring_func_ == static_cast<int32_t>(ScoringFunc::kSoftmax)) {
+        max_sum = max_val;
+      }
 
       uint32_t lane = sg.get_local_id()[0];  // 0..15
 
@@ -249,12 +312,15 @@ struct moe_fused_gate_impl {
       if (thread_group_idx == 0) {
         // IMP Skip Logical groups
         int thread_row = item.get_global_linear_id() / MAX_VPT;
+        if (renormalize_) {
+          float output_sum_inv = (output_sum > 0.0f) ? (1.0f / output_sum) : 0.0f;
 #pragma unroll
-        for (int i = 0; i < topk_; ++i) {
-          int64_t const idx = topk_ * thread_row + i;
-          output_[idx] = output_[idx] / output_sum;
-          if (apply_routed_scaling_factor_on_output_) {
-            output_[idx] *= routed_scaling_factor_;
+          for (int i = 0; i < topk_; ++i) {
+            int64_t const idx = topk_ * thread_row + i;
+            output_[idx] = output_[idx] * output_sum_inv;
+            if (apply_routed_scaling_factor_on_output_) {
+              output_[idx] *= routed_scaling_factor_;
+            }
           }
         }
       }
@@ -269,6 +335,8 @@ struct moe_fused_gate_impl {
   int32_t topk_group_;
   int32_t topk_;
   int32_t num_fused_shared_experts_;
+  int32_t scoring_func_;
+  bool renormalize_;
   float routed_scaling_factor_;
   bool apply_routed_scaling_factor_on_output_;
   Params params_;
@@ -294,6 +362,8 @@ void moe_fused_gate_kernel(
     int64_t topk_group,
     int64_t topk,
     int64_t num_fused_shared_experts,
+    int64_t scoring_func,
+    bool renormalize,
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output) {
   auto input_ptr = reinterpret_cast<T*>(input.data_ptr());
@@ -320,6 +390,8 @@ void moe_fused_gate_kernel(
       topk_group,
       topk,
       num_fused_shared_experts,
+      scoring_func,
+      renormalize,
       routed_scaling_factor,
       apply_routed_scaling_factor_on_output,
       params);
@@ -341,6 +413,8 @@ void moe_fused_gate_kernel(
         topk_group,                                           \
         topk,                                                 \
         num_fused_shared_experts,                             \
+        scoring_func,                                         \
+        renormalize,                                          \
         routed_scaling_factor,                                \
         apply_routed_scaling_factor_on_output);               \
     dispatched = true;                                        \
@@ -362,9 +436,12 @@ void moe_fused_gate_kernel_dynamic(
     torch::Tensor& output,
     torch::Tensor& indices,
     int64_t num_rows,
+    int64_t num_expert_group,
     int64_t topk_group,
     int64_t topk,
     int64_t num_fused_shared_experts,
+    int64_t scoring_func,
+    bool renormalize,
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output) {
   auto input_ptr = reinterpret_cast<T*>(input.data_ptr());
@@ -396,6 +473,8 @@ void moe_fused_gate_kernel_dynamic(
       topk_group,
       topk,
       num_fused_shared_experts,
+      scoring_func,
+      renormalize,
       routed_scaling_factor,
       apply_routed_scaling_factor_on_output,
       params);
@@ -413,9 +492,16 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t topk_group,
     int64_t topk,
     int64_t num_fused_shared_experts,
+    int64_t scoring_func,
+    bool renormalize,
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output) {
   TORCH_CHECK(input.dtype() == bias.dtype(), "input and bias should have the same dtype");
+  TORCH_CHECK(
+      scoring_func == static_cast<int64_t>(ScoringFunc::kSigmoid) ||
+          scoring_func == static_cast<int64_t>(ScoringFunc::kSoftmax),
+      "scoring_func must be 0 (sigmoid) or 1 (softmax), but got ",
+      scoring_func);
 
   int64_t num_rows = input.size(0);
   int32_t num_experts = input.size(1);
@@ -447,7 +533,6 @@ std::vector<at::Tensor> moe_fused_gate(
       MAX_VPT,
       ")");
 
-  int64_t num_blocks = (num_rows + ROWS_PER_WG - 1) / ROWS_PER_WG;
   bool dispatched = false;
 
   SYCL_DISPATCH_FLOATING_TYPES_AND2(
@@ -484,9 +569,12 @@ std::vector<at::Tensor> moe_fused_gate(
               output,
               indices,
               num_rows,
+              num_expert_group,
               topk_group,
               topk,
               num_fused_shared_experts,
+              scoring_func,
+              renormalize,
               routed_scaling_factor,
               apply_routed_scaling_factor_on_output);
         }

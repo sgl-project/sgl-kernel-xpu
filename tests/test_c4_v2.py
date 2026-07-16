@@ -6,16 +6,16 @@ from typing import Tuple, Union
 import pytest
 import torch
 import triton
-from common import (
+from dsv4_common import (
     LegacyContext,
     PagedContext,
     compress_forward,
-    get_device,
     make_legacy_context,
     make_paged_context,
     make_state_pool,
     to_seq_extend,
 )
+from utils import get_device
 
 Context = Union[LegacyContext, PagedContext]
 

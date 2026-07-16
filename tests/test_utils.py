@@ -1,6 +1,7 @@
 """Common utilities for testing and benchmarking"""
 
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -10,6 +11,26 @@ from typing import Callable, List, Optional
 class TestFile:
     name: str
     estimated_time: float = 60
+
+
+def _terminate_process_tree(process: Optional[subprocess.Popen]) -> None:
+    # On XPU the child holds a Level Zero context; leaving it alive after a
+    # timeout wedges the device for later CI jobs on the same runner. The
+    # subprocess is launched with start_new_session=True so its PID is a
+    # process-group leader — SIGKILL to that PGID reaps the whole tree.
+    if process is None or process.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def run_with_timeout(
@@ -54,8 +75,17 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
             )
             tic = time.perf_counter()
 
+            # Run via `pytest -x --tb=short` so the first failing parametrization
+            # stops the file. Without -x, one bad case that wedges the XPU/L0
+            # context cascades into thousands of downstream failures and can
+            # eventually SIGSEGV pytest inside saferepr on a corrupt tensor —
+            # burying the real first failure and bloating CI time.
             process = subprocess.Popen(
-                ["python3", filename], stdout=None, stderr=None, env=os.environ
+                ["python3", "-m", "pytest", "-x", "--tb=short", filename],
+                stdout=None,
+                stderr=None,
+                env=os.environ,
+                start_new_session=True,
             )
             process.wait()
             elapsed = time.perf_counter() - tic
@@ -74,7 +104,7 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
                 ret_code == 0
             ), f"expected return code 0, but {filename} returned {ret_code}"
         except TimeoutError:
-            kill_process_tree(process.pid)
+            _terminate_process_tree(process)
             time.sleep(5)
             print(
                 f"\nTimeout after {timeout_per_file} seconds when running {filename}\n",

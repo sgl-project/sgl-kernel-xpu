@@ -29,6 +29,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("silu_and_mul", torch::kXPU, &silu_and_mul);
 
+  m.def("silu_and_mul_clamp(Tensor! out, Tensor input, float swiglu_limit) -> ()");
+  m.impl("silu_and_mul_clamp", torch::kXPU, &silu_and_mul_clamp);
+
   m.def("gelu_tanh_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("gelu_tanh_and_mul", torch::kXPU, &gelu_tanh_and_mul);
 
@@ -52,17 +55,34 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def(
       "topk_sigmoid(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, Tensor? "
-      "correction_bias) -> ()");
+      "correction_bias, float routed_scaling_factor=1.0, int num_fused_shared_experts=0) -> ()");
   m.impl("topk_sigmoid", torch::kXPU, &at::native::xpu::topk_sigmoid);
 
   m.def("top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
   m.impl("top_k_renorm_probs", torch::kXPU, &top_k_renorm_probs);
 
+  /*
+   * Fast radix top-k (DeepSeek V3.2 indexer)
+   */
+  m.def("fast_topk(Tensor score, Tensor! indices, Tensor lengths, Tensor? row_starts) -> ()");
+  m.impl("fast_topk", torch::kXPU, &fast_topk_interface);
+
+  m.def(
+      "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor! dst_page_table, Tensor src_page_table, "
+      "Tensor cu_seqlens_q, Tensor? row_starts) -> ()");
+  m.impl("fast_topk_transform_fused", torch::kXPU, &fast_topk_transform_interface);
+
+  m.def(
+      "fast_topk_transform_ragged_fused(Tensor score, Tensor lengths, Tensor! topk_indices_ragged, "
+      "Tensor topk_indices_offset, Tensor? row_starts) -> ()");
+  m.impl("fast_topk_transform_ragged_fused", torch::kXPU, &fast_topk_transform_ragged_interface);
+
   m.def("swiglu_gpt_oss_sigmoid_alpha(Tensor x, float alpha, float limit) -> Tensor");
   m.impl("swiglu_gpt_oss_sigmoid_alpha", torch::kXPU, &swiglu_gpt_oss_sigmoid_alpha);
   m.def(
       "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int "
-      "num_fused_shared_experts, float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
+      "num_fused_shared_experts, int scoring_func, bool renormalize, float routed_scaling_factor, bool "
+      "apply_routed_scaling_factor_on_output) -> "
       "(Tensor[])");
   m.impl("moe_fused_gate", torch::kXPU, &moe_fused_gate);
 
@@ -312,6 +332,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("hc_pre_gemm_sqr_sum(Tensor! C, Tensor! sqr_sum, Tensor A, Tensor B) -> ()");
   m.impl("hc_pre_gemm_sqr_sum", torch::kXPU, &hc_pre_gemm_sqr_sum);
 
+  /* HC POST */
+  m.def("hc_post(Tensor x, Tensor residual, Tensor post_layer_mix, Tensor comb_res_mix, Tensor! out) -> ()");
+  m.impl("hc_post", torch::kXPU, &hc_post);
+
   /*
    * From LoRA
    */
@@ -320,6 +344,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor weight_indices, "
       "Tensor lora_ranks, Tensor? extra_embeddings, Tensor? seg_lens) -> ()");
   m.impl("embedding_lora_a_fwd", torch::kXPU, &embedding_lora_a_fwd);
+
+  /* NSA (Native Sparse Attention) indexer scoring */
+  // fp8_mqa_logits (prefill) is implemented in pure Python via sgl_kernel.nsa.
+  m.def(
+      "fp8_paged_mqa_logits(Tensor q_fp8, Tensor kv_cache, Tensor weights, "
+      "Tensor seq_lens, Tensor block_tables, Tensor? schedule_metadata, "
+      "int max_seq_len, bool clean_logits) -> Tensor");
+  m.impl("fp8_paged_mqa_logits", torch::kXPU, &fp8_paged_mqa_logits);
 }
 
 REGISTER_EXTENSION(common_ops)

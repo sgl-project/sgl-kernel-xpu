@@ -25,6 +25,7 @@ if is_xpu():
         is_icpx_available,
         load_jit_sycl,
     )
+    from .moe_topk_sigmoid import topk_sigmoid
     from .norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm, rmsnorm
     from .rope import apply_rope_inplace, apply_rope_inplace_with_kvcache
     from .timestep_embedding import timestep_embedding
@@ -40,6 +41,7 @@ if is_xpu():
         # Kernels
         "can_use_fused_inplace_qknorm",
         "fused_inplace_qknorm",
+        "topk_sigmoid",
         "rmsnorm",
         "apply_rope_inplace",
         "apply_rope_inplace_with_kvcache",

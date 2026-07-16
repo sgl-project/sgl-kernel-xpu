@@ -83,6 +83,7 @@ from sgl_kernel.mhc import (
     hc_pre_big_fuse,
     hc_pre_gemm_sqr_sum,
     hc_split_sinkhorn,
+    mhc_post,
     mhc_pre,
 )
 from sgl_kernel.moe import (

@@ -239,3 +239,39 @@ def mhc_pre(
     )
 
     return post_mix, comb_mix, layer_input
+
+
+def mhc_post(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    if x.dtype != torch.bfloat16:
+        raise TypeError(f"x must be bfloat16, got {x.dtype}")
+    if residual.dtype != torch.bfloat16:
+        raise TypeError(f"residual must be bfloat16, got {residual.dtype}")
+    if post_layer_mix.dtype != torch.float32:
+        raise TypeError(f"post_layer_mix must be float32, got {post_layer_mix.dtype}")
+    if comb_res_mix.dtype != torch.float32:
+        raise TypeError(f"comb_res_mix must be float32, got {comb_res_mix.dtype}")
+
+    if post_layer_mix.dim() == 3:
+        post_layer_mix = post_layer_mix.squeeze(-1)
+    if comb_res_mix.dim() == 2:
+        pass
+    else:
+        T, HC_val = comb_res_mix.shape[0], comb_res_mix.shape[1]
+        comb_res_mix = comb_res_mix.reshape(T, HC_val * HC_val)
+
+    output = torch.empty_like(residual)
+
+    torch.ops.sgl_kernel.mhc_post.default(
+        comb_res_mix,
+        residual,
+        post_layer_mix,
+        x,
+        output,
+    )
+
+    return output

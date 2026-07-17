@@ -66,7 +66,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def(
       "top_k_top_p_sampling_from_probs(Tensor probs, Tensor! output, Tensor? maybe_indices, Tensor? "
-      "maybe_top_k_arr, float top_k_val, Tensor? maybe_top_p_arr, float top_p_val, bool deterministic, Generator? "
+      "maybe_top_k_arr, int top_k_val, Tensor? maybe_top_p_arr, float top_p_val, bool deterministic, Generator? "
       "gen) -> ()");
   m.impl("top_k_top_p_sampling_from_probs", torch::kXPU, &top_k_top_p_sampling_from_probs);
 

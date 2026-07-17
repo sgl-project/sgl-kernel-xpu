@@ -496,13 +496,6 @@ void hc_post(
  */
 void hc_pre_gemm_sqr_sum(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, const at::Tensor& B);
 
-void mhc_post(
-    const at::Tensor& comb_mix,
-    const at::Tensor& residual,
-    const at::Tensor& post_mix,
-    const at::Tensor& x,
-    at::Tensor& output);
-
 /*
  * From csrc/speculative
  */

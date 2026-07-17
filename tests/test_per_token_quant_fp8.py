@@ -7,11 +7,11 @@ import torch
 import utils
 from sgl_kernel import sgl_per_token_quant_fp8
 
-from sglang.srt.utils import is_hip
-
 device = utils.get_device()
-_is_hip = is_hip()
-fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
+# XPU is never HIP/ROCm, so the fp8 dtype is always e4m3fn (matches the sibling
+# test_per_tensor_quant_fp8.py, and avoids importing sglang which isn't
+# installed in the kernel CI image).
+fp8_type_ = torch.float8_e4m3fn
 
 
 def torch_per_token_quant_fp8(tensor, inv_scale):

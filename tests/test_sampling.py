@@ -78,6 +78,7 @@ def torch_top_p_renorm_probs(normalized_prob, p):
     )
     return renorm_prob_ground_truth
 
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256, 151936])
 @pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
@@ -96,7 +97,6 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
     )
 
 
-
 @pytest.mark.parametrize("batch_size", [1, 16, 128])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p_range", [(0.1, 0.5), (0.5, 0.9)])
@@ -107,9 +107,7 @@ def test_top_p_renorm_probs_tensor(batch_size, vocab_size, p_range):
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
 
     # Create per-row top-p array with varied values
-    top_p_arr = (
-        torch.rand(batch_size, device=f"{device}:0") * (p_max - p_min) + p_min
-    )
+    top_p_arr = torch.rand(batch_size, device=f"{device}:0") * (p_max - p_min) + p_min
 
     # Compute ground truth using unified function
     renorm_prob_ground_truth = torch_top_p_renorm_probs(normalized_prob, top_p_arr)

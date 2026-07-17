@@ -47,14 +47,14 @@ struct TopPRenormProbsSingleCTA {
   int vocab_size;
 
   TopPRenormProbsSingleCTA(
-      const DType* probs,
       DType* renorm_probs,
+      const DType* probs,
       const float* maybe_top_p_arr,
       float top_p_val,
       int batch_size,
       int vocab_size)
-      : probs(probs),
-        renorm_probs(renorm_probs),
+      : renorm_probs(renorm_probs),
+        probs(probs),
         maybe_top_p_arr(maybe_top_p_arr),
         top_p_val(top_p_val),
         batch_size(batch_size),
@@ -217,8 +217,8 @@ struct TopPRenormProbsSingleCTA {
 
 template <typename TensorDType>
 void launch_top_p_renorm_kernel(
-    at::Tensor probs,
-    at::Tensor renorm_probs,
+    at::Tensor& renorm_probs,
+    const at::Tensor& probs,
     const float* maybe_top_p_ptr,
     float top_p_val,
     int batch_size,
@@ -233,7 +233,7 @@ void launch_top_p_renorm_kernel(
   const int global_size = batch_size * local_size;
 
   auto kernel = TopPRenormProbsSingleCTA<KernelDType>(
-      probs_ptr, renorm_probs_ptr, maybe_top_p_ptr, top_p_val, batch_size, vocab_size);
+      renorm_probs_ptr, probs_ptr, maybe_top_p_ptr, top_p_val, batch_size, vocab_size);
 
   sycl_kernel_submit(global_size, local_size, queue, kernel);
 }
@@ -241,7 +241,10 @@ void launch_top_p_renorm_kernel(
 }  // namespace
 
 void top_p_renorm_probs(
-    at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_p_arr, double top_p_val) {
+    at::Tensor& renorm_probs,
+    const at::Tensor& probs,
+    const std::optional<at::Tensor>& maybe_top_p_arr,
+    double top_p_val) {
   CHECK_INPUT(probs);
   CHECK_INPUT(renorm_probs);
   TORCH_CHECK(probs.dim() == 2, "probs must be a 2D tensor [batch_size, vocab_size]");
@@ -273,12 +276,12 @@ void top_p_renorm_probs(
 
   if (dtype == torch::kFloat32) {
     launch_top_p_renorm_kernel<float>(
-        probs, renorm_probs, maybe_top_p_ptr, static_cast<float>(top_p_val), batch_size, vocab_size, queue);
+        renorm_probs, probs, maybe_top_p_ptr, static_cast<float>(top_p_val), batch_size, vocab_size, queue);
   } else if (dtype == torch::kHalf) {
     launch_top_p_renorm_kernel<at::Half>(
-        probs, renorm_probs, maybe_top_p_ptr, static_cast<float>(top_p_val), batch_size, vocab_size, queue);
+        renorm_probs, probs, maybe_top_p_ptr, static_cast<float>(top_p_val), batch_size, vocab_size, queue);
   } else if (dtype == torch::kBFloat16) {
     launch_top_p_renorm_kernel<at::BFloat16>(
-        probs, renorm_probs, maybe_top_p_ptr, static_cast<float>(top_p_val), batch_size, vocab_size, queue);
+        renorm_probs, probs, maybe_top_p_ptr, static_cast<float>(top_p_val), batch_size, vocab_size, queue);
   }
 }

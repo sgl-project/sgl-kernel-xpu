@@ -140,6 +140,22 @@ def gemma_fused_add_rmsnorm(
     torch.ops.sgl_kernel.gemma_fused_add_rmsnorm(input, residual, weight, eps)
 
 
+def fused_inplace_qknorm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> None:
+    r"""Fused in-place Q/K RMS normalization.
+
+    ``q`` and ``k`` are expected to be 3D tensors with shape
+    ``(num_tokens, num_heads, head_dim)`` and contiguous last dimension. Only
+    the Q and K tensors are modified in-place.
+    """
+    torch.ops.sgl_kernel.fused_inplace_qknorm(q, k, q_weight, k_weight, eps)
+
+
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
     assert input.ndim == output.ndim, f"{input.ndim} != {output.ndim}"
     assert (

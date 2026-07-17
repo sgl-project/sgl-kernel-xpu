@@ -1,5 +1,8 @@
 # Setup building flags for SYCL device and host codes.
 
+# Import device IP version detection utility.
+include(${CMAKE_CURRENT_LIST_DIR}/DeviceDetection.cmake)
+
 function(CHECK_SYCL_FLAG FLAG VARIABLE_NAME)
   set(TEMP_DIR "${CMAKE_BINARY_DIR}/temp")
   file(MAKE_DIRECTORY ${TEMP_DIR})
@@ -119,31 +122,41 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(SYCL_OFFLINE_COMPILER_CG_OPTIONS "${SYCL_OFFLINE_COMPILER_CG_OPTIONS} -options -cl-fp32-correctly-rounded-divide-sqrt")
   set(SYCL_OFFLINE_COMPILER_CG_OPTIONS "${SYCL_OFFLINE_COMPILER_CG_OPTIONS} -options -cl-intel-greater-than-4GB-buffer-required")
 
+  set(AOT_TARGETS)
 
-  string(REPLACE "," ";" DPCPP_SYCL_TARGET_LIST "${DPCPP_SYCL_TARGET}")
-  message(STATUS "Compile Intel GPU AOT Targets for ${DPCPP_SYCL_TARGET_LIST}")
-
-  foreach(TGT IN LISTS DPCPP_SYCL_TARGET_LIST)
-    if(TGT STREQUAL "intel_gpu_bmg" OR TGT STREQUAL "bmg")
-      list(APPEND AOT_TARGETS "bmg")
-    elseif(TGT STREQUAL "intel_gpu_pvc" OR TGT STREQUAL "pvc")
-      list(APPEND AOT_TARGETS "pvc")
+  # Resolve DPCPP_SYCL_TARGET: user-provided takes priority, otherwise auto-detect
+  if(DPCPP_SYCL_TARGET)
+    message(STATUS "Using user-provided DPCPP_SYCL_TARGET: ${DPCPP_SYCL_TARGET}")
+  else()
+    get_device_ip_version(DEVICE_IP_VERSION)
+    message(STATUS "Detected device IP version: ${DEVICE_IP_VERSION}")
+    if(DEVICE_IP_VERSION EQUAL 20)
+      set(DPCPP_SYCL_TARGET "bmg")
+    elseif(DEVICE_IP_VERSION EQUAL 35)
+      set(DPCPP_SYCL_TARGET "intel_gpu_cri")
+    else()
+      message(WARNING "Unknown device IP version: ${DEVICE_IP_VERSION}. Cannot auto-detect target.")
     endif()
-  endforeach()
+  endif()
+
+  message(STATUS "DPCPP_SYCL_TARGET set to: ${DPCPP_SYCL_TARGET}")
+
+  # Map DPCPP_SYCL_TARGET to AOT_TARGETS and compile definitions
+  if(DPCPP_SYCL_TARGET MATCHES "bmg")
+    list(APPEND AOT_TARGETS "bmg_g21")
+  elseif(DPCPP_SYCL_TARGET MATCHES "cri")
+    list(APPEND AOT_TARGETS "cri")
+    add_compile_definitions(SGL_PRE_SILICON)
+  else()
+    message(WARNING "Unknown DPCPP_SYCL_TARGET: ${DPCPP_SYCL_TARGET}. No AOT target set.")
+  endif()
 
   list(REMOVE_DUPLICATES AOT_TARGETS)
   string(JOIN "," AOT_TARGETS_STR ${AOT_TARGETS})
-  set(SYCL_TARGETS_OPTION -fsycl-targets=spir64_gen)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} ${SYCL_TARGETS_OPTION})
   set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} ${SYCL_TARGETS_OPTION})
-  set(SYCL_OFFLINE_COMPILER_AOT_OPTIONS "-device ${AOT_TARGETS}")
+  set(SYCL_OFFLINE_COMPILER_AOT_OPTIONS "-device ${AOT_TARGETS_STR}")
   message(STATUS "Compile Intel GPU AOT Targets for ${AOT_TARGETS}")
-  # SYCL compiler in basekit after 2025.2 needs more spirv arguments.
-  if(SYCL_COMPILER_VERSION GREATER_EQUAL 20250806)
-    set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} -Xspirv-translator;-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-  else()
-    set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} -Xspirv-translator;-spirv-ext=+SPV_INTEL_split_barrier)
-  endif()
 
   set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} ${SYCL_KERNEL_OPTIONS})
 

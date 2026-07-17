@@ -53,7 +53,13 @@ from sgl_kernel.flash_compress_128_torch import (
     flash_compress128_decode,
     flash_compress128_prefill,
 )
-from sgl_kernel.fp8_paged_mqa_logits import fp8_paged_mqa_logits_triton
+
+try:
+    from sgl_kernel.fp8_paged_mqa_logits import fp8_paged_mqa_logits_triton
+except ImportError:
+    # Triton (or its Intel backend) not importable in this environment.
+    # fp8_paged_mqa_logits_triton will simply be unavailable.
+    fp8_paged_mqa_logits_triton = None
 from sgl_kernel.fused_norm_rope_v2_torch import compress_norm_rope_store
 from sgl_kernel.fused_q_indexer_rope_hadamard_quant_torch import (
     fused_q_indexer_rope_hadamard_quant,

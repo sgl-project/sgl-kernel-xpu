@@ -126,8 +126,7 @@ inline void dispatchFusedQKNormRopeHeadDim(int64_t head_dim, const char* kernel_
 // only widths that both fit within the per-lane element count and divide it
 // evenly, then unconditionally falling back to scalar (VecSize=1) -- always
 // valid regardless of alignment -- if none matched, guaranteeing the kernel
-// is always launched. Shared by both the packed-QKV and cos/sin-cache launch
-// paths.
+// is always launched.
 template <int64_t kElemsPerThread, typename Fn>
 inline void dispatchFusedQKNormRopeVecSize(int64_t vec_size, Fn&& fn) {
   bool dispatched = false;

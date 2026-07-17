@@ -252,7 +252,7 @@ inline typename Types::Gemm::Arguments args_from_options(
       typename GemmKernel::ProblemShape{num_segments, problem_sizes_ptr, nullptr},
       typename GemmKernel::MainloopArguments{a_ptrs_dev, stride_A_ptr, b_ptrs_dev, stride_B_ptr},
       typename GemmKernel::EpilogueArguments{
-          {},  // fusion_args placeholder; alpha/beta filled in below
+          {},          // fusion_args placeholder; alpha/beta filled in below
           c_ptrs_dev,  // ptr_C (caller-supplied; aliased to d_ptrs for beta=0 paths)
           stride_C_ptr,
           d_ptrs_dev,  // ptr_D

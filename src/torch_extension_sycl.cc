@@ -80,7 +80,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("swiglu_gpt_oss_sigmoid_alpha(Tensor x, float alpha, float limit) -> Tensor");
   m.impl("swiglu_gpt_oss_sigmoid_alpha", torch::kXPU, &swiglu_gpt_oss_sigmoid_alpha);
   m.def(
-      "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int "
+      "moe_fused_gate(Tensor input, Tensor? bias, int num_expert_group, int topk_group, int topk, int "
       "num_fused_shared_experts, int scoring_func, bool renormalize, float routed_scaling_factor, bool "
       "apply_routed_scaling_factor_on_output) -> "
       "(Tensor[])");
@@ -220,6 +220,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "float eps, Tensor! q_weight, Tensor! k_weight, float base, bool is_neox, Tensor! position_ids, "
       "float factor, float low, float high, float attention_factor, int rotary_dim) -> ()");
   m.impl("fused_qk_norm_rope", torch::kXPU, &at::native::xpu::fused_qk_norm_rope);
+  m.def(
+      "fused_qk_norm_rope_with_cos_sin_cache_inplace(Tensor! q, Tensor! k, Tensor q_weight, Tensor k_weight, "
+      "Tensor cos_sin_cache, Tensor positions, bool is_neox, float eps) -> ()");
+  m.impl(
+      "fused_qk_norm_rope_with_cos_sin_cache_inplace",
+      torch::kXPU,
+      &at::native::xpu::fused_qk_norm_rope_with_cos_sin_cache_inplace);
   /*
    * Fused QK RoPE (no RMS_Norm)
    */
@@ -268,6 +275,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /* HC PRE GEMM + SQUARE SUM */
   m.def("hc_pre_gemm_sqr_sum(Tensor! C, Tensor! sqr_sum, Tensor A, Tensor B) -> ()");
   m.impl("hc_pre_gemm_sqr_sum", torch::kXPU, &hc_pre_gemm_sqr_sum);
+
+  /* HC POST */
+  m.def("hc_post(Tensor x, Tensor residual, Tensor post_layer_mix, Tensor comb_res_mix, Tensor! out) -> ()");
+  m.impl("hc_post", torch::kXPU, &hc_post);
 
   /*
    * From LoRA

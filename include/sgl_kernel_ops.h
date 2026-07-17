@@ -115,6 +115,15 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
+void fused_qk_norm_rope_with_cos_sin_cache_inplace(
+    torch::Tensor& q,
+    torch::Tensor& k,
+    torch::Tensor& q_weight,
+    torch::Tensor& k_weight,
+    torch::Tensor& cos_sin_cache,
+    torch::Tensor& positions,
+    bool is_neox,
+    double eps);
 void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize);
 void topk_sigmoid(
     at::Tensor& topk_weights,
@@ -321,7 +330,7 @@ torch::Tensor swiglu_gpt_oss_sigmoid_alpha(torch::Tensor x, double alpha, double
 
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
-    at::Tensor& bias,
+    const std::optional<at::Tensor>& bias,
     int64_t num_expert_group,
     int64_t topk_group,
     int64_t topk,
@@ -480,6 +489,16 @@ void hc_pre_big_fuse(
     double hc_post_mult_value,
     std::optional<at::Tensor> norm_weight = std::nullopt,
     std::optional<double> norm_eps = std::nullopt);
+
+/*
+ * hc_post
+ */
+void hc_post(
+    const at::Tensor& x,
+    const at::Tensor& residual,
+    const at::Tensor& post_layer_mix,
+    const at::Tensor& comb_res_mix,
+    at::Tensor& out);
 
 /*
  * hc_pre GEMM + row-wise square sum

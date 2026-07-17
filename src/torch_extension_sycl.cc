@@ -96,6 +96,69 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor indices) -> ()");
   m.impl("store_cache", torch::kXPU, &at::native::xpu::store_cache);
 
+  // KV cache transfer ops
+  m.def(
+      "transfer_kv_per_layer(Tensor src_k, Tensor(a!) dst_k, Tensor src_v, Tensor(b!) dst_v, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_per_layer", torch::kXPU, &transfer_kv_per_layer);
+
+  m.def(
+      "transfer_kv_per_layer_mla(Tensor src, Tensor(a!) dst, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_per_layer_mla", torch::kXPU, &transfer_kv_per_layer_mla);
+
+  m.def(
+      "transfer_kv_all_layer(Tensor src_k_layers, Tensor(a!) dst_k_layers, "
+      "Tensor src_v_layers, Tensor(b!) dst_v_layers, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int num_layers, "
+      "int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_all_layer", torch::kXPU, &transfer_kv_all_layer);
+
+  m.def(
+      "transfer_kv_all_layer_mla(Tensor src_layers, Tensor(a!) dst_layers, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int num_layers, "
+      "int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_all_layer_mla", torch::kXPU, &transfer_kv_all_layer_mla);
+
+  m.def(
+      "transfer_kv_all_layer_lf_ph(Tensor src_k_layers, Tensor(a!) dst_k, "
+      "Tensor src_v_layers, Tensor(b!) dst_v, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, "
+      "int num_layers, int page_size, int head_num, int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_all_layer_lf_ph", torch::kXPU, &transfer_kv_all_layer_lf_ph);
+
+  m.def(
+      "transfer_kv_per_layer_ph_lf(Tensor src_k, Tensor(a!) dst_k, "
+      "Tensor src_v, Tensor(b!) dst_v, "
+      "Tensor src_indices, Tensor dst_indices, int layer_id, int item_size, int src_layout_dim, "
+      "int page_size, int head_num, int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_per_layer_ph_lf", torch::kXPU, &transfer_kv_per_layer_ph_lf);
+
+  m.def(
+      "transfer_kv_per_layer_pf_lf(Tensor src_k, Tensor(a!) dst_k, Tensor src_v, Tensor(b!) dst_v, "
+      "Tensor src_indices, Tensor dst_indices, int layer_id, int item_size, int src_layout_dim, "
+      "int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_per_layer_pf_lf", torch::kXPU, &transfer_kv_per_layer_pf_lf);
+
+  m.def(
+      "transfer_kv_all_layer_lf_pf(Tensor src_k_layers, Tensor(a!) dst_k, "
+      "Tensor src_v_layers, Tensor(b!) dst_v, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, "
+      "int num_layers, int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_all_layer_lf_pf", torch::kXPU, &transfer_kv_all_layer_lf_pf);
+
+  m.def(
+      "transfer_kv_per_layer_mla_pf_lf(Tensor src, Tensor(a!) dst, "
+      "Tensor src_indices, Tensor dst_indices, int layer_id, int item_size, int src_layout_dim, "
+      "int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_per_layer_mla_pf_lf", torch::kXPU, &transfer_kv_per_layer_mla_pf_lf);
+
+  m.def(
+      "transfer_kv_all_layer_mla_lf_pf(Tensor src_layers, Tensor(a!) dst, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, "
+      "int num_layers, int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_all_layer_mla_lf_pf", torch::kXPU, &transfer_kv_all_layer_mla_lf_pf);
+
   m.def("moe_sum_reduce(Tensor input, Tensor output, float routed_scaling_factor) -> ()");
   m.impl("moe_sum_reduce", torch::kXPU, &moe_sum_reduce);
   m.def(

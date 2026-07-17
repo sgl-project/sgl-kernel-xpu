@@ -140,6 +140,53 @@ def gemma_fused_add_rmsnorm(
     torch.ops.sgl_kernel.gemma_fused_add_rmsnorm(input, residual, weight, eps)
 
 
+def fused_qk_norm_rope_with_cos_sin_cache_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    is_neox: bool,
+    eps: float = 1e-6,
+) -> None:
+    r"""Apply fused RMSNorm + RoPE to Q/K using a precomputed cos/sin cache.
+
+    Step 1:
+    ``q = RMSNorm(q, q_weight)`` and ``k = RMSNorm(k, k_weight)``
+
+    Step 2:
+    ``q`` and ``k`` are rotated in-place using the cached cosine/sine values
+    indexed by ``positions``.
+
+    Parameters
+    ----------
+    q: torch.Tensor
+        Query tensor updated in-place.
+    k: torch.Tensor
+        Key tensor updated in-place.
+    q_weight: torch.Tensor
+        RMSNorm weights for query, shape ``(head_dim,)``.
+    k_weight: torch.Tensor
+        RMSNorm weights for key, shape ``(head_dim,)``.
+    cos_sin_cache: torch.Tensor
+        Precomputed RoPE cosine/sine cache, shape ``(max_pos, rope_dim)``.
+    positions: torch.Tensor
+        Position indices used to select rows from ``cos_sin_cache``.
+    is_neox: bool
+        Whether to apply NeoX-style rotary layout.
+    eps: float
+        Epsilon for RMS normalization.
+
+    Note
+    ----
+    This is an in-place operation that modifies ``q`` and ``k`` directly.
+    """
+    torch.ops.sgl_kernel.fused_qk_norm_rope_with_cos_sin_cache_inplace(
+        q, k, q_weight, k_weight, cos_sin_cache, positions, is_neox, eps
+    )
+
+
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
     assert input.ndim == output.ndim, f"{input.ndim} != {output.ndim}"
     assert (

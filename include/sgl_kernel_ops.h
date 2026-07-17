@@ -115,6 +115,15 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
+void fused_qk_norm_rope_with_cos_sin_cache_inplace(
+    torch::Tensor& q,
+    torch::Tensor& k,
+    torch::Tensor& q_weight,
+    torch::Tensor& k_weight,
+    torch::Tensor& cos_sin_cache,
+    torch::Tensor& positions,
+    bool is_neox,
+    double eps);
 void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize);
 void topk_sigmoid(
     at::Tensor& topk_weights,

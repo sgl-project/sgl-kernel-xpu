@@ -4,12 +4,14 @@ import json
 import os
 import time
 
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--db", required=True)
     p.add_argument("--limit-gib", type=float, default=4.0)
     p.add_argument("--start-epoch-file", default="")
     return p.parse_args()
+
 
 def format_duration(seconds: float) -> str:
     seconds = int(max(seconds, 0))
@@ -22,6 +24,7 @@ def format_duration(seconds: float) -> str:
         return f"{m}m {s}s"
     return f"{s}s"
 
+
 def read_start_epoch(path: str):
     if not path or not os.path.exists(path):
         return None
@@ -31,14 +34,20 @@ def read_start_epoch(path: str):
     except Exception:
         return None
 
+
 def print_peak_total_memory_line(peak_system_used_kb: int, mem_total_kb: int):
     if peak_system_used_kb <= 0:
         return
     if mem_total_kb > 0:
         used_pct = peak_system_used_kb * 100.0 / mem_total_kb
-        print(f"[sgl-mem] Peak total system memory usage: {peak_system_used_kb / 1024.0 / 1024.0:.2f} GiB ({used_pct:.1f}%)")
+        print(
+            f"[sgl-mem] Peak total system memory usage: {peak_system_used_kb / 1024.0 / 1024.0:.2f} GiB ({used_pct:.1f}%)"
+        )
     else:
-        print(f"[sgl-mem] Peak total system memory usage: {peak_system_used_kb / 1024.0 / 1024.0:.2f} GiB")
+        print(
+            f"[sgl-mem] Peak total system memory usage: {peak_system_used_kb / 1024.0 / 1024.0:.2f} GiB"
+        )
+
 
 def main():
     args = parse_args()
@@ -54,7 +63,9 @@ def main():
     if not os.path.exists(args.db):
         print("[sgl-mem] No compile memory records found.")
         if start_epoch is not None:
-            print(f"[sgl-mem] Total build time: {format_duration(time.time() - start_epoch)}")
+            print(
+                f"[sgl-mem] Total build time: {format_duration(time.time() - start_epoch)}"
+            )
         print(sep)
         return 0
 
@@ -87,7 +98,9 @@ def main():
     if not offenders:
         print("[sgl-mem] No files exceeded the threshold.")
         if start_epoch is not None:
-            print(f"[sgl-mem] Total build time: {format_duration(time.time() - start_epoch)}")
+            print(
+                f"[sgl-mem] Total build time: {format_duration(time.time() - start_epoch)}"
+            )
         print_peak_total_memory_line(peak_system_used_kb, mem_total_kb)
         print(sep)
         return 0
@@ -97,10 +110,13 @@ def main():
         print(f"[sgl-mem]   {src}: {kb / 1024.0 / 1024.0:.2f} GiB")
 
     if start_epoch is not None:
-        print(f"[sgl-mem] Total build time: {format_duration(time.time() - start_epoch)}")
+        print(
+            f"[sgl-mem] Total build time: {format_duration(time.time() - start_epoch)}"
+        )
     print_peak_total_memory_line(peak_system_used_kb, mem_total_kb)
     print(sep)
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

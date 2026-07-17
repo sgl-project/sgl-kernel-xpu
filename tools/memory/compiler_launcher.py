@@ -12,9 +12,13 @@ from collections import defaultdict
 SRC_EXTS = (".cpp", ".cc", ".cxx", ".c", ".sycl", ".S", ".s")
 HEADER = "Memory"
 
+
 def parse_args():
     p = argparse.ArgumentParser(add_help=True)
-    p.add_argument("--db", default=os.path.join(os.getcwd(), "build", "mem_monitor", "compile_mem.jsonl"))
+    p.add_argument(
+        "--db",
+        default=os.path.join(os.getcwd(), "build", "mem_monitor", "compile_mem.jsonl"),
+    )
     p.add_argument("--file-limit-gib", type=float, default=4.0)
     p.add_argument("--guard-avail-gib", type=float, default=0.5)
     p.add_argument("--guard-used-pct", type=float, default=99.0)
@@ -24,6 +28,7 @@ def parse_args():
     args.compiler_cmd = rest
     return args
 
+
 def read_meminfo():
     out = {}
     with open("/proc/meminfo", encoding="utf-8") as f:
@@ -32,15 +37,17 @@ def read_meminfo():
             out[k] = int(v.strip().split()[0])
     return out
 
+
 def ppid_of(pid):
     try:
         with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
             s = f.read()
         r = s.rfind(")")
-        rest = s[r + 2:].split()
+        rest = s[r + 2 :].split()
         return int(rest[1])
     except Exception:
         return None
+
 
 def descendants(root_pid):
     children = defaultdict(list)
@@ -61,6 +68,7 @@ def descendants(root_pid):
                 stack.append(c)
     return out
 
+
 def vmrss_kb(pid):
     try:
         with open(f"/proc/{pid}/status", encoding="utf-8") as f:
@@ -71,11 +79,13 @@ def vmrss_kb(pid):
         return 0
     return 0
 
+
 def tree_rss_kb(root_pid):
     total = 0
     for pid in descendants(root_pid):
         total += vmrss_kb(pid)
     return total
+
 
 def detect_source(args):
     best = None
@@ -91,6 +101,7 @@ def detect_source(args):
             return os.path.basename(args[i + 1])
     return os.path.basename(args[0]) if args else "<unknown>"
 
+
 def append_record(db_path, record):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     lock_path = db_path + ".lock"
@@ -99,6 +110,7 @@ def append_record(db_path, record):
         with open(db_path, "a", encoding="utf-8") as out:
             out.write(json.dumps(record, sort_keys=True) + "\\n")
         fcntl.flock(lock_f, fcntl.LOCK_UN)
+
 
 def print_current_offenders(db_path, file_limit_kb):
     peaks = {}
@@ -124,6 +136,7 @@ def print_current_offenders(db_path, file_limit_kb):
     print(f"[{HEADER}] Current files above limit:", file=sys.stderr)
     for src, peak in offenders[:10]:
         print(f"[{HEADER}]   {src}: {peak / 1024.0:.1f} MiB", file=sys.stderr)
+
 
 def main():
     args = parse_args()
@@ -153,8 +166,13 @@ def main():
 
         if avail_kb <= guard_avail_kb or used_pct >= args.guard_used_pct:
             killed_by_guard = True
-            guard_reason = f"avail={avail_kb / 1024.0 / 1024.0:.2f}GiB used={used_pct:.1f}%"
-            print(f"[{HEADER}] OOM guard hit while building {source} ({guard_reason}), stopping build.", file=sys.stderr)
+            guard_reason = (
+                f"avail={avail_kb / 1024.0 / 1024.0:.2f}GiB used={used_pct:.1f}%"
+            )
+            print(
+                f"[{HEADER}] OOM guard hit while building {source} ({guard_reason}), stopping build.",
+                file=sys.stderr,
+            )
             try:
                 proc.send_signal(signal.SIGTERM)
                 time.sleep(1.0)
@@ -181,6 +199,7 @@ def main():
     if killed_by_guard:
         print_current_offenders(args.db, file_limit_kb)
     return ret
+
 
 if __name__ == "__main__":
     sys.exit(main())

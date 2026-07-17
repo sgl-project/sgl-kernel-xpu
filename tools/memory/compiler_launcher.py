@@ -31,10 +31,13 @@ def parse_args():
 
 def read_meminfo():
     out = {}
-    with open("/proc/meminfo", encoding="utf-8") as f:
-        for line in f:
-            k, v = line.split(":", 1)
-            out[k] = int(v.strip().split()[0])
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                out[k] = int(v.strip().split()[0])
+    except Exception:
+        return out
     return out
 
 
@@ -51,7 +54,11 @@ def ppid_of(pid):
 
 def descendants(root_pid):
     children = defaultdict(list)
-    for name in os.listdir("/proc"):
+    try:
+        proc_entries = os.listdir("/proc")
+    except Exception:
+        return set()
+    for name in proc_entries:
         if not name.isdigit():
             continue
         pid = int(name)

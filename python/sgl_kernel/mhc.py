@@ -250,3 +250,43 @@ def mhc_pre(
     )
 
     return post_mix, comb_mix, layer_input
+
+
+def mhc_fused_post_pre(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 2.0,
+    sinkhorn_repeat: int = 20,
+    n_splits: int = 0,
+    tile_n: int = 1,
+    *,
+    norm_weight: Optional[torch.Tensor] = None,
+    norm_eps: Optional[float] = None,
+):
+    del tile_n  # SYCL path currently ignores tile_n (TileLang-specific tuning knob).
+
+    return torch.ops.sgl_kernel.mhc_fused_post_pre.default(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        float(rms_eps),
+        float(hc_pre_eps),
+        float(hc_sinkhorn_eps),
+        float(hc_post_mult_value),
+        int(sinkhorn_repeat),
+        int(n_splits),
+        norm_weight,
+        (float(norm_eps) if norm_eps is not None else None),
+    )

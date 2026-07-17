@@ -75,8 +75,13 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
             )
             tic = time.perf_counter()
 
+            # Run via `pytest -x --tb=short` so the first failing parametrization
+            # stops the file. Without -x, one bad case that wedges the XPU/L0
+            # context cascades into thousands of downstream failures and can
+            # eventually SIGSEGV pytest inside saferepr on a corrupt tensor —
+            # burying the real first failure and bloating CI time.
             process = subprocess.Popen(
-                ["python3", filename],
+                ["python3", "-m", "pytest", "-x", "--tb=short", filename],
                 stdout=None,
                 stderr=None,
                 env=os.environ,

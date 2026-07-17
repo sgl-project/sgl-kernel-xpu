@@ -49,6 +49,8 @@ def topk_sigmoid(
     gating_output: torch.Tensor,
     renormalize: bool = False,
     correction_bias: Optional[torch.Tensor] = None,
+    routed_scaling_factor: float = 1.0,
+    num_fused_shared_experts: int = 0,
 ) -> None:
     torch.ops.sgl_kernel.topk_sigmoid.default(
         topk_weights,
@@ -56,6 +58,8 @@ def topk_sigmoid(
         gating_output,
         renormalize,
         correction_bias,
+        routed_scaling_factor,
+        num_fused_shared_experts,
     )
 
 
@@ -96,7 +100,7 @@ def moe_sum(
 
 def moe_fused_gate(
     input_tensor,
-    bias,
+    bias: Optional[torch.Tensor],
     num_expert_group,
     topk_group,
     topk,

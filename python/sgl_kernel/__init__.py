@@ -32,6 +32,7 @@ from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
     fused_add_rmsnorm,
     fused_qk_norm_rope,
+    fused_qk_norm_rope_with_cos_sin_cache_inplace,
     fused_qk_rope,
     fused_qk_rope_with_cos_sin_cache_inplace,
     gelu_and_mul,
@@ -80,6 +81,7 @@ from sgl_kernel.hadamard import hadamard_transform
 from sgl_kernel.lora import embedding_lora_a_fwd
 from sgl_kernel.memory import weak_ref_tensor
 from sgl_kernel.mhc import (
+    hc_post,
     hc_pre_big_fuse,
     hc_pre_gemm_sqr_sum,
     hc_split_sinkhorn,

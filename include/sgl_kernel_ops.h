@@ -728,3 +728,13 @@ void embedding_lora_a_fwd(
     const std::optional<torch::Tensor>& extra_embeddings,  // [num_loras, num_extra_tokens, max_rank]
     const std::optional<torch::Tensor>& seg_lens           // [num_segments,]
 );
+void sgemm_lora_a_fwd(
+    torch::Tensor& output,         // [num_tokens, stacknum*max_rank]
+    const torch::Tensor& input_x,  // [num_tokens, input_dim]
+    const torch::Tensor& weights,  // [num_loras, stack_num*max_rank, input_dim]
+    const int64_t stack_num,
+    const torch::Tensor& seg_indptr,              // [num_segments + 1,]
+    const torch::Tensor& weight_indices,          // [num_segments,]
+    const torch::Tensor& lora_ranks,              // [num_loras,]
+    const std::optional<torch::Tensor>& seg_lens  // [num_segments,]
+);

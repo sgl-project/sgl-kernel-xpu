@@ -8,7 +8,7 @@ import torch
 import triton
 
 try:
-    import sgl_kernel
+    import sgl_kernel  # noqa: F401
     from sgl_kernel import sgl_per_token_group_quant_fp8, sgl_per_token_group_quant_int8
 
     HAS_AOT = True

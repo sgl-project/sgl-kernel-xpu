@@ -26,6 +26,7 @@ if is_xpu():
         load_jit_sycl,
     )
     from .norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm, rmsnorm
+    from .per_token_group_quant_8bit_v2 import per_token_group_quant_8bit_v2
     from .rope import apply_rope_inplace, apply_rope_inplace_with_kvcache
     from .timestep_embedding import timestep_embedding
 
@@ -40,6 +41,7 @@ if is_xpu():
         # Kernels
         "can_use_fused_inplace_qknorm",
         "fused_inplace_qknorm",
+        "per_token_group_quant_8bit_v2",
         "rmsnorm",
         "apply_rope_inplace",
         "apply_rope_inplace_with_kvcache",

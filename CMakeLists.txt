@@ -56,3 +56,8 @@ include_directories(
 )
 
 add_subdirectory(${SGL_OPS_XPU_ROOT}/src)
+
+# Install JIT kernel headers for sglang JIT compilation
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/sgl_kernel/jit_kernel
+        DESTINATION sgl_kernel/include/sgl_kernel
+        FILES_MATCHING PATTERN "*.hpp")

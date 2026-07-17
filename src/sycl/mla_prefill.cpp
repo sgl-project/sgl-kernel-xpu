@@ -234,7 +234,11 @@ void flash_mla_prefill(
   Bucket bucket;
   if (max_seqlen_q < kQTileSmallThreshold) {
     bucket = Bucket::Small;
-  } else if (max_seqlen_q >= kQTileLargeThreshold && max_kv_len_estimate >= kKThresholdForLarge) {
+  } else if (
+      max_seqlen_q >= kQTileLargeThreshold && max_kv_len_estimate >= kKThresholdForLarge && max_seqlen_q % 256 == 0) {
+    // Large bucket (Q_TILE_M=256) only when Q is a multiple of 256: the kernel
+    // does not yet handle partial last tiles and will crash (UR_RESULT_ERROR_DEVICE_LOST)
+    // if Q % Q_TILE_M != 0.  Fall through to Medium for non-aligned Q.
     bucket = Bucket::Large;
   } else {
     bucket = Bucket::Medium;

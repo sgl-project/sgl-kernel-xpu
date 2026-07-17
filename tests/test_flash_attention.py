@@ -1642,7 +1642,7 @@ def _generate_block_kvcache(
 @pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
 @pytest.mark.parametrize("causal,local", [(False, True), (False, False), (True, False)])
 @pytest.mark.parametrize("add_unused_qkv", [False])
-@pytest.mark.parametrize("d", [72, 128])
+@pytest.mark.parametrize("d", [72, 128, 192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [

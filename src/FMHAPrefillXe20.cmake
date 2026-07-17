@@ -8,7 +8,7 @@
 # dim only emits the branch(es) it actually supports. The cmake below iterates
 # the union of both lists and emits per-head-dim EMIT flags into the template.
 set(FMHA_PREFILL_PAGED_HEAD_DIMS 64 96 128 192 256 512)
-set(FMHA_PREFILL_NP_HEAD_DIMS 64 72 96 128)
+set(FMHA_PREFILL_NP_HEAD_DIMS 64 72 96 128 192)
 
 set(FMHA_PREFILL_TEMPLATE
     "${CMAKE_CURRENT_SOURCE_DIR}/sycl/xe_fmha_fwd_prefill_kernel.cpp.in")
@@ -58,6 +58,10 @@ set(FMHA_PREFILL_NUM_SG_NP_96 16)
 set(FMHA_PREFILL_TILED_Q_NP_128 256)
 set(FMHA_PREFILL_TILED_KV_NP_128 32)
 set(FMHA_PREFILL_NUM_SG_NP_128 16)
+
+set(FMHA_PREFILL_TILED_Q_NP_192 256)
+set(FMHA_PREFILL_TILED_KV_NP_192 32)
+set(FMHA_PREFILL_NUM_SG_NP_192 16)
 
 # Compile the union of the paged and non-paged head-dim sets. Each generated TU
 # is told via EMIT_PAGED / EMIT_NP which branch(es) to compile; the disabled

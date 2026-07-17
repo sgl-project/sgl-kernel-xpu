@@ -18,6 +18,7 @@ except ImportError:
 try:
     from sgl_kernel.jit import apply_rope_inplace as jit_rope
     from sgl_kernel.jit import fused_inplace_qknorm as jit_qknorm
+    from sgl_kernel.jit import per_tensor_quant_fp8 as jit_per_tensor_quant_fp8
     from sgl_kernel.jit import rmsnorm as jit_rmsnorm
     from sgl_kernel.jit import timestep_embedding as jit_timestep_embedding
 
@@ -247,6 +248,56 @@ def test_timestep_embedding_jit_vs_reference():
 
     # Compare accuracy
     torch.testing.assert_close(y_jit, y_ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [(128, 1024), (1, 4096), (5120, 7168), (3, 17)],  # last one exercises scalar tail
+)
+@pytest.mark.parametrize("is_static", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.skipif(not HAS_SGL_KERNEL, reason="Requires AOT sgl_kernel")
+@pytest.mark.skipif(not HAS_SGLANG_JIT, reason="Requires SGLang for JIT compilation")
+@pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
+def test_per_tensor_quant_fp8_jit_vs_aot(shape, is_static, dtype):
+    """Test JIT per-tensor FP8 quant vs the AOT op (dynamic and static paths).
+
+    The compute is a plain scale-clip-cast, so JIT matches AOT bit-exactly:
+    scales agree and the fp8 quant codes are byte-identical.
+    """
+    device = "xpu"
+    torch.manual_seed(0)
+    x = torch.randn(*shape, dtype=dtype, device=device)
+
+    def _run(use_aot, scale=None):
+        xq = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+        xs = torch.empty(1, dtype=torch.float32, device=device)
+        if is_static:
+            xs.copy_(scale)
+        else:
+            xs.zero_()
+        if use_aot:
+            torch.ops.sgl_kernel.sgl_per_tensor_quant_fp8.default(x, xq, xs, is_static)
+        else:
+            jit_per_tensor_quant_fp8(x, xq, xs, is_static)
+        return xq, xs
+
+    if is_static:
+        # Precompute a scale with the AOT dynamic path, then feed it to both.
+        scale = torch.zeros(1, dtype=torch.float32, device=device)
+        tmp_q = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+        torch.ops.sgl_kernel.sgl_per_tensor_quant_fp8.default(x, tmp_q, scale, False)
+        q_aot, _ = _run(True, scale)
+        q_jit, _ = _run(False, scale)
+    else:
+        q_aot, s_aot = _run(True)
+        q_jit, s_jit = _run(False)
+        torch.testing.assert_close(s_jit, s_aot, rtol=1e-4, atol=1e-6)
+
+    # fp8 quant codes must be byte-identical.
+    assert torch.equal(
+        q_jit.view(torch.uint8), q_aot.view(torch.uint8)
+    ), "JIT and AOT produced different fp8 codes"
 
 
 if __name__ == "__main__":

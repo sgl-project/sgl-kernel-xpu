@@ -42,6 +42,57 @@ def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
     )
 
 
+def mxfp8_w8a16_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Dense MXFP8 W8A16 GEMM: out[M, N] = input[M, K] @ weight[N, K]^T.
+
+    - input: bf16 activations, shape [M, K] (or [*, K]; flattened here).
+    - weight: float8_e4m3fn MXFP8 weights, shape [N, K] (one byte per element).
+    - weight_scale: fp32 per-32-K-block "direct multiplier" scales, shape
+      [N, K/32] (UE8M0 already decoded to 2**(e-127) by the caller).
+    - bias: optional fp32 bias, shape [N].
+
+    Wraps the grouped kernel with a single logical expert (dense case).
+    """
+    assert input.dim() >= 2, "input must be at least 2D [.., K]"
+    assert weight.dim() == 2, "weight must be 2D [N, K]"
+    assert weight.dtype == torch.float8_e4m3fn, "weight must be float8_e4m3fn"
+    assert weight_scale.dtype == torch.float32, "weight_scale must be float32 (direct multiplier)"
+
+    out_shape = (*input.shape[:-1], weight.shape[0])
+    input_2d = input.reshape(-1, input.shape[-1])
+    input_2d = input_2d.contiguous() if not input_2d.is_contiguous() else input_2d
+    m = input_2d.shape[0]
+    n, k = weight.shape
+
+    # Grouped kernel expects [E, N, K] weights, [E, N, K/32] scales and a
+    # per-expert row count; the dense case is a single expert covering all M rows.
+    packed_weights = weight.unsqueeze(0)
+    scales = weight_scale.unsqueeze(0)
+    total_rows_for_experts = torch.tensor([m], dtype=torch.int32, device=input.device)
+
+    bias_arg = None
+    if bias is not None:
+        # Kernel expects fp32 bias shaped [E, N].
+        bias_arg = bias.to(torch.float32).reshape(1, n).contiguous()
+
+    output = torch.empty((m, n), dtype=torch.bfloat16, device=input.device)
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_mxfp8_w8a16.default(
+        output,
+        input_2d,
+        packed_weights,
+        scales,
+        bias_arg,
+        total_rows_for_experts,
+        1,
+    )
+    return output.reshape(out_shape)
+
+
 def _bmm_fp8_internal(
     workspace_buffer: torch.Tensor,
     A: torch.Tensor,

@@ -161,6 +161,81 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
     return;
   }
 
+#if @HEAD_DIM@ == 64
+  if (params.seqlen_q <= 256 &&
+      static_cast<int64_t>(params.total_q) * 100 <= static_cast<int64_t>(params.b) * params.seqlen_q * 15 &&
+      params.d == 64 && params.dv == 64) {
+    using SparseTileShapeQK = cute::Shape<cute::Int<32>, cute::Int<64>, cute::_32>;
+    using SparseTileShapePV = cute::Shape<cute::Int<32>, cute::_32, cute::Int<64>>;
+    using SparseTileShapeOutput = cute::Shape<cute::Int<32>, cute::Int<64>>;
+    using SparseSubgroupLayoutQK = cute::
+        Layout<cute::Shape<cute::Int<4>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+    AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+        AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+          FMHAConfig<Causal, LocalMask, Sink, SparseTileShapeQK, SparseTileShapePV, SparseTileShapeOutput,
+                     SparseSubgroupLayoutQK>::run_paged(params);
+        });
+      });
+    });
+    return;
+  }
+
+  if (params.seqlen_q <= 256 &&
+      static_cast<int64_t>(params.total_q) * 4 <= static_cast<int64_t>(params.b) * params.seqlen_q &&
+      params.d == 64 && params.dv == 64) {
+    using MixedTileShapeQK = cute::Shape<cute::Int<64>, cute::Int<64>, cute::_32>;
+    using MixedTileShapePV = cute::Shape<cute::Int<64>, cute::_32, cute::Int<64>>;
+    using MixedTileShapeOutput = cute::Shape<cute::Int<64>, cute::Int<64>>;
+    using MixedSubgroupLayoutQK = cute::
+        Layout<cute::Shape<cute::Int<8>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+    AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+        AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+          FMHAConfig<Causal, LocalMask, Sink, MixedTileShapeQK, MixedTileShapePV, MixedTileShapeOutput,
+                     MixedSubgroupLayoutQK>::run_paged(params);
+        });
+      });
+    });
+    return;
+  }
+
+  if (params.seqlen_q <= 32 && params.d == 64 && params.dv == 64) {
+    using SmallTileShapeQK = cute::Shape<cute::Int<32>, cute::Int<64>, cute::_32>;
+    using SmallTileShapePV = cute::Shape<cute::Int<32>, cute::_32, cute::Int<64>>;
+    using SmallTileShapeOutput = cute::Shape<cute::Int<32>, cute::Int<64>>;
+    using SmallSubgroupLayoutQK = cute::
+        Layout<cute::Shape<cute::Int<4>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+    AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+        AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+          FMHAConfig<Causal, LocalMask, Sink, SmallTileShapeQK, SmallTileShapePV, SmallTileShapeOutput,
+                     SmallSubgroupLayoutQK>::run_paged(params);
+        });
+      });
+    });
+    return;
+  }
+
+  if (params.seqlen_q <= 64 && params.d == 64 && params.dv == 64) {
+    using SmallTileShapeQK = cute::Shape<cute::Int<64>, cute::Int<64>, cute::_32>;
+    using SmallTileShapePV = cute::Shape<cute::Int<64>, cute::_32, cute::Int<64>>;
+    using SmallTileShapeOutput = cute::Shape<cute::Int<64>, cute::Int<64>>;
+    using SmallSubgroupLayoutQK = cute::
+        Layout<cute::Shape<cute::Int<8>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+    AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+        AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+          FMHAConfig<Causal, LocalMask, Sink, SmallTileShapeQK, SmallTileShapePV, SmallTileShapeOutput,
+                     SmallSubgroupLayoutQK>::run_paged(params);
+        });
+      });
+    });
+    return;
+  }
+
+#endif
+
 #if @HEAD_DIM@ == 128
   if (params.seqlen_q <= 256 &&
       static_cast<int64_t>(params.total_q) * 2 <= static_cast<int64_t>(params.b) * params.seqlen_q &&

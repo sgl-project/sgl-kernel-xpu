@@ -169,7 +169,7 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
     using SparseTileShapePV = cute::Shape<cute::Int<32>, cute::_32, cute::Int<32>>;
     using SparseTileShapeOutput = cute::Shape<cute::Int<32>, cute::Int<64>>;
     using SparseSubgroupLayoutQK = cute::
-        Layout<cute::Shape<cute::Int<4>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+        Layout<cute::Shape<cute::Int<2>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
     AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
         AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {

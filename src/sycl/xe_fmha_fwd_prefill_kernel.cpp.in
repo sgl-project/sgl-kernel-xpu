@@ -165,8 +165,8 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
   if (params.seqlen_q <= 256 &&
       static_cast<int64_t>(params.total_q) * 100 <= static_cast<int64_t>(params.b) * params.seqlen_q * 15 &&
       params.d == 64 && params.dv == 64) {
-    using SparseTileShapeQK = cute::Shape<cute::Int<32>, cute::Int<64>, cute::_32>;
-    using SparseTileShapePV = cute::Shape<cute::Int<32>, cute::_32, cute::Int<64>>;
+    using SparseTileShapeQK = cute::Shape<cute::Int<32>, cute::Int<32>, cute::_32>;
+    using SparseTileShapePV = cute::Shape<cute::Int<32>, cute::_32, cute::Int<32>>;
     using SparseTileShapeOutput = cute::Shape<cute::Int<32>, cute::Int<64>>;
     using SparseSubgroupLayoutQK = cute::
         Layout<cute::Shape<cute::Int<4>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;

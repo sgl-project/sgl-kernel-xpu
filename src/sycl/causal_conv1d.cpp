@@ -14,8 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 // Causal conv1d forward/update kernels for XPU (SYCL).
-// Implementation aims to mirror CUDA-side behavior in
-// sgl-kernel/csrc/mamba/causal_conv1d.cu.
+// Implementation aims to mirror CUDA-side behavior.
 
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
@@ -142,22 +141,26 @@ struct CausalConv1dFwdKernel {
 
     const int batch_id = item.get_group(0);
     const int channel_id = item.get_group(1) * item.get_local_range(1) + item.get_local_id(1);
+    // Guard out-of-range lanes.
     if (batch_id >= params.batch || channel_id >= params.dim) {
       return;
     }
 
     const int seq_start = varlen ? params.query_start_loc_ptr[batch_id] : 0;
     const int cur_seqlen = varlen ? (params.query_start_loc_ptr[batch_id + 1] - seq_start) : params.seqlen;
+    // Skip empty sequences.
     if (cur_seqlen <= 0) {
       return;
     }
 
     const int cache_idx = (params.cache_indices_ptr != nullptr) ? params.cache_indices_ptr[batch_id] : batch_id;
+    // Skip padded slots.
     if (cache_idx == static_cast<int>(params.pad_slot_id)) {
       return;
     }
     const bool has_init = (params.has_initial_state_ptr != nullptr) ? params.has_initial_state_ptr[batch_id] : false;
 
+    // Load per-channel weights and optional bias.
     const int w_base_offset = channel_id * params.weight_c_stride;
     float wt[kWidth];
 #pragma unroll
@@ -167,6 +170,7 @@ struct CausalConv1dFwdKernel {
     const float bias_val = (bias_ptr != nullptr) ? static_cast<float>(bias_ptr[channel_id]) : 0.f;
     const bool has_conv_states = (conv_states_ptr != nullptr);
 
+    // Initialize the sliding window history.
     float x_vals[kWidth];
 #pragma unroll
     for (int w = 0; w < kWidth - 1; ++w) {
@@ -182,8 +186,6 @@ struct CausalConv1dFwdKernel {
     x_vals[kWidth - 1] = 0.f;
 
     // Precompute offset base and step to avoid per-token conditional logic.
-    // varlen layout: x is [dim, seqlen] where seqlen is contiguous (x_batch_stride=1),
-    // so inner loop accesses are sequential — optimal for cache lines.
     int x_base_offset, out_base_offset, x_step, out_step;
     if (varlen) {
       x_base_offset = seq_start * params.x_batch_stride + channel_id * params.x_c_stride;
@@ -197,6 +199,7 @@ struct CausalConv1dFwdKernel {
       out_step = params.out_l_stride;
     }
 
+    // Main causal conv loop.
     float x_t = static_cast<float>(x_ptr[x_base_offset]);
     for (int t = 0; t < cur_seqlen; ++t) {
       const float x_next = (t + 1 < cur_seqlen) ? static_cast<float>(x_ptr[x_base_offset + (t + 1) * x_step]) : 0.f;
@@ -222,7 +225,7 @@ struct CausalConv1dFwdKernel {
       x_t = x_next;
     }
 
-    // Save final state window (only kWidth-1 elements used by subsequent accesses).
+    // Save trailing window as next-chunk initial state.
     if (has_conv_states) {
 #pragma unroll
       for (int w = 0; w < kWidth - 1; ++w) {
@@ -248,17 +251,20 @@ struct CausalConv1dUpdateKernel {
 
     const int batch_id = item.get_group(0);
     const int channel_id = item.get_group(1) * item.get_local_range(1) + item.get_local_id(1);
+    // Guard out-of-range lanes.
     if (batch_id >= params.batch || channel_id >= params.dim) {
       return;
     }
 
     const int cache_idx =
         (params.conv_state_indices_ptr != nullptr) ? params.conv_state_indices_ptr[batch_id] : batch_id;
+    // Skip padded slots.
     if (cache_idx == static_cast<int>(params.pad_slot_id)) {
       return;
     }
     const bool circular = (params.cache_seqlens != nullptr);
 
+    // Load per-channel weights and optional bias.
     const int w_base_offset = channel_id * params.weight_c_stride;
     float wt[kWidth];
 #pragma unroll
@@ -276,6 +282,7 @@ struct CausalConv1dUpdateKernel {
     int update_idx = cache_seqlen - (kWidth - 1);
     update_idx = (update_idx < 0) ? (update_idx + state_len) : update_idx;
 
+    // Sliding window: first (kWidth - 1) are history, last element is current token.
     float x_vals[kWidth] = {0.f};
     if (!circular) {
       const int shift_count = state_len - advance_len - (kWidth - 1);
@@ -301,6 +308,7 @@ struct CausalConv1dUpdateKernel {
       }
     }
 
+    // Main causal conv loop: write state, run causal conv, write output.
     const int x_base_offset = batch_id * params.x_batch_stride + channel_id * params.x_c_stride;
     const int out_base_offset = batch_id * params.out_batch_stride + channel_id * params.out_c_stride;
     float x_t = static_cast<float>(x_ptr[x_base_offset]);
@@ -334,6 +342,7 @@ struct CausalConv1dUpdateKernel {
       out_ptr[out_base_offset + t * params.out_l_stride] = static_cast<scalar_t>(out_val);
 
 #pragma unroll
+      // Slide the history window by one position.
       for (int w = 0; w < kWidth - 1; ++w) {
         x_vals[w] = x_vals[w + 1];
       }

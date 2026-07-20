@@ -1,90 +1,83 @@
+"""Benchmark for per-token dynamic FP8 E4M3 quantization (XPU).
+
+Reports achieved memory bandwidth (read bf16/fp16 input + write fp8 output +
+fp32 scale) against a pure-torch reference across token/hidden-dim shapes.
+
+Usage:
+    python benchmark/bench_per_token_quant_fp8.py
+"""
+
 import itertools
-from typing import Tuple
 
+import sgl_kernel  # noqa: F401 – registers XPU ops
 import torch
-import triton
-import triton.testing
 from sgl_kernel import sgl_per_token_quant_fp8
-from vllm import _custom_ops as ops
 
-from sglang.srt.utils import is_hip
-
-_is_hip = is_hip()
-fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
+DEVICE = "xpu"
+fp8_type_ = torch.float8_e4m3fn
 
 
-def vllm_per_token_quant_fp8(
-    input: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    return ops.scaled_fp8_quant(input, use_per_token_if_dynamic=True)
-
-
-def sglang_per_token_quant_fp8(
-    input: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+def sglang_per_token_quant_fp8(input: torch.Tensor):
     scale = torch.zeros(input.size(0), device=input.device, dtype=torch.float32)
     output = torch.empty_like(input, device=input.device, dtype=fp8_type_)
     sgl_per_token_quant_fp8(input, output, scale)
-
     return output, scale
 
 
-def calculate_diff(batch_size: int, seq_len: int):
-    """Calculate difference between VLLM and SGLang implementations."""
-    device = torch.device("cuda")
-    x = torch.rand((batch_size, seq_len), dtype=torch.float16, device=device)
-
-    vllm_out, vllm_scale = vllm_per_token_quant_fp8(x)
-    sglang_out, sglang_scale = sglang_per_token_quant_fp8(x)
-
-    scale_diff = torch.abs(vllm_scale - sglang_scale).mean().item()
-    output_diff = torch.abs(vllm_out.float() - sglang_out.float()).mean().item()
-
-    if torch.allclose(
-        vllm_out.to(torch.float32), sglang_out.to(torch.float32), rtol=1e-3, atol=1e-5
-    ) and torch.allclose(vllm_scale, sglang_scale, rtol=1e-3, atol=1e-5):
-        print("✅ All implementations match")
-    else:
-        print("❌ Implementations differ")
+def torch_per_token_quant_fp8(input: torch.Tensor):
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    absmax = input.abs().to(torch.float32).amax(dim=-1, keepdim=True)
+    scale = absmax / finfo.max
+    scale_inv = torch.where(scale > 0, scale.reciprocal(), torch.zeros_like(scale))
+    q = (input.to(torch.float32) * scale_inv).clamp(finfo.min, finfo.max)
+    return q.to(torch.float8_e4m3fn), scale.squeeze(-1)
 
 
-batch_size_range = [16, 32, 64, 128]
-seq_len_range = [64, 128, 256, 512, 1024, 2048, 4096]
+def _bench(fn, warmup=10, rep=100):
+    for _ in range(warmup):
+        fn()
+    torch.xpu.synchronize()
+    start = torch.xpu.Event(enable_timing=True)
+    end = torch.xpu.Event(enable_timing=True)
+    start.record()
+    for _ in range(rep):
+        fn()
+    end.record()
+    torch.xpu.synchronize()
+    return start.elapsed_time(end) / rep  # ms
 
-configs = list(itertools.product(batch_size_range, seq_len_range))
+
+def verify(num_tokens=512, hidden_dim=4096):
+    x = torch.rand((num_tokens, hidden_dim), dtype=torch.float16, device=DEVICE)
+    sgl_out, sgl_scale = sglang_per_token_quant_fp8(x)
+    ref_out, ref_scale = torch_per_token_quant_fp8(x)
+    ok = torch.allclose(
+        sgl_out.float(), ref_out.float(), rtol=1e-3, atol=1e-3
+    ) and torch.allclose(sgl_scale, ref_scale, rtol=1e-3, atol=1e-3)
+    print(f"correctness ({num_tokens}x{hidden_dim}): {'PASS' if ok else 'FAIL'}")
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["batch_size", "seq_len"],
-        x_vals=configs,
-        line_arg="provider",
-        line_vals=["vllm", "sglang"],
-        line_names=["VLLM", "SGL Kernel"],
-        styles=[("blue", "-"), ("green", "-")],
-        ylabel="us",
-        plot_name="per-token-dynamic-quant-fp8-performance",
-        args={},
-    )
-)
-def benchmark_quantization(batch_size, seq_len, provider):
-    dtype = torch.float16
-    device = torch.device("cuda")
+def main():
+    print(f"Device : {torch.xpu.get_device_name(0)}")
+    print(f"dtype  : torch.float16")
+    verify()
 
-    x = torch.randn(batch_size * seq_len, 4096, device=device, dtype=dtype)
+    token_range = [512, 2048, 8192, 16384, 32768]
+    hidden_range = [2048, 4096, 8192]
 
-    quantiles = [0.5, 0.2, 0.8]
+    print(f"\n  {'tokens':>8} {'hidden':>7}  {'us':>9}  {'GB/s':>8}")
+    print(f"  {'-'*40}")
+    for num_tokens, hidden_dim in itertools.product(token_range, hidden_range):
+        x = torch.randn(num_tokens, hidden_dim, dtype=torch.float16, device=DEVICE)
+        out = torch.empty_like(x, dtype=fp8_type_)
+        scale = torch.zeros(num_tokens, dtype=torch.float32, device=DEVICE)
 
-    if provider == "vllm":
-        fn = lambda: vllm_per_token_quant_fp8(x.clone())
-    elif provider == "sglang":
-        fn = lambda: sglang_per_token_quant_fp8(x.clone())
-
-    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
-
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+        ms = _bench(lambda: sgl_per_token_quant_fp8(x, out, scale))
+        # bytes: read 2B input + write 1B output + write 4B scale/row
+        nbytes = num_tokens * hidden_dim * (2 + 1) + num_tokens * 4
+        gbps = nbytes / (ms * 1e-3) / 1e9
+        print(f"  {num_tokens:>8} {hidden_dim:>7}  {ms*1000:>9.1f}  {gbps:>8.1f}")
 
 
 if __name__ == "__main__":
-    calculate_diff(batch_size=4, seq_len=4096)
-    benchmark_quantization.run(print_data=True)
+    main()

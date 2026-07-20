@@ -1,17 +1,10 @@
 import sys
-from typing import Optional, Tuple
+from typing import Optional
 
 import pytest
-import sgl_kernel
 import torch
-import torch.nn.functional as F
 import utils
 from sgl_kernel import biased_topk
-
-from sglang.jit_kernel.moe_fused_gate import moe_fused_gate, moe_fused_gate_jit
-from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.srt.layers.moe.topk import biased_grouped_topk_impl
-from sglang.test.ci.ci_register import register_cuda_ci
 
 device = utils.get_device()
 
@@ -90,26 +83,6 @@ def _scatter_by_expert(
     return dense
 
 
-"""
-@pytest.mark.parametrize("M", [1, 64, 1024])
-@pytest.mark.parametrize("num_experts", [128, 384, 512])
-@pytest.mark.parametrize("topk", [4, 6, 8])
-@pytest.mark.parametrize("scoring_func", ["sigmoid", "sqrtsoftplus"])
-@pytest.mark.parametrize("num_shared", [0, 1])
-@pytest.mark.parametrize("renormalize", [True, False])
-@pytest.mark.parametrize("apply_scale", [True, False])
-"""
-"""
-@pytest.mark.parametrize("M", [1024])
-@pytest.mark.parametrize("num_experts", [128])
-@pytest.mark.parametrize("topk", [6])
-@pytest.mark.parametrize("scoring_func", ["sigmoid"])
-@pytest.mark.parametrize("num_shared", [0])
-@pytest.mark.parametrize("renormalize", [True])
-@pytest.mark.parametrize("apply_scale", [True])
-"""
-
-
 @pytest.mark.parametrize("M", [1, 64, 1024])
 @pytest.mark.parametrize("num_experts", [128, 384, 512])
 @pytest.mark.parametrize("topk", [4, 6, 8])
@@ -133,6 +106,65 @@ def test_biased_topk(
     ref_weights, ref_indices = biased_topk_torch_native(
         hidden_states,
         scores,
+        bias,
+        topk,
+        renormalize,
+        scoring_func,
+        num_shared,
+        scale,
+        apply_scale,
+    )
+
+    topk_weights = torch.empty(M, topk, dtype=torch.float32, device=device)
+    topk_indices = torch.empty(M, topk, dtype=torch.int32, device=device)
+
+    biased_topk(
+        scores,
+        bias,
+        topk_weights,
+        topk_indices,
+        topk,
+        scoring_func,
+        num_shared,
+        renormalize,
+        scale,
+        apply_scale,
+    )
+
+    num_columns = num_experts + num_shared
+    torch.testing.assert_close(
+        _scatter_by_expert(topk_weights, topk_indices, num_columns),
+        _scatter_by_expert(ref_weights, ref_indices, num_columns),
+        rtol=1e-4,
+        atol=1e-5,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("M", [1, 64, 1024])
+@pytest.mark.parametrize("num_experts", [128, 384])
+@pytest.mark.parametrize("scoring_func", ["sigmoid", "sqrtsoftplus"])
+def test_biased_topk_reduced_precision_input(
+    dtype: torch.dtype,
+    M: int,
+    num_experts: int,
+    scoring_func: str,
+) -> None:
+
+    # configs from deepseek-v4
+    topk = 6
+    num_shared = 1
+    renormalize = True
+    apply_scale = True
+    scale = 2.5
+
+    hidden_states = torch.randn(M, 100, device=device, dtype=dtype)
+    scores_fp32, bias = _make_inputs(M, num_experts, seed=num_experts * 100 + topk)
+    scores = scores_fp32.to(dtype)
+
+    ref_weights, ref_indices = biased_topk_torch_native(
+        hidden_states,
+        scores.float(),
         bias,
         topk,
         renormalize,

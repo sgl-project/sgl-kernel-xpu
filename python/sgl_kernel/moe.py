@@ -156,10 +156,10 @@ def biased_topk(
     routed_scaling_factor=1.0,
     apply_routed_scaling_factor_on_output=False,
 ):
-    scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
+    scoring_func_int = _MOE_SCORING_FUNC_MAP.get(scoring_func.lower())
     assert (
         scoring_func_int is not None
-    ), f"Unknown scoring_func '{scoring_func}', must be one of {list(_SCORING_FUNC_MAP.keys())}"
+    ), f"Unknown scoring_func '{scoring_func}', must be one of {list(_MOE_SCORING_FUNC_MAP.keys())}"
 
     torch.ops.sgl_kernel.biased_topk.default(
         input_tensor,

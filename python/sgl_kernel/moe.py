@@ -4,10 +4,10 @@ import torch
 
 from .utils import is_xe2_arch
 
-_SCORING_FUNC_MAP = {
+_MOE_SCORING_FUNC_MAP = {
     "sigmoid": 0,
-    "sqrtsoftplus": 1,
-    "softmax": 2,
+    "softmax": 1,
+    "sqrtsoftplus": 2,
 }
 
 
@@ -50,6 +50,8 @@ def topk_sigmoid(
     gating_output: torch.Tensor,
     renormalize: bool = False,
     correction_bias: Optional[torch.Tensor] = None,
+    routed_scaling_factor: float = 1.0,
+    num_fused_shared_experts: int = 0,
 ) -> None:
     torch.ops.sgl_kernel.topk_sigmoid.default(
         topk_weights,
@@ -57,6 +59,8 @@ def topk_sigmoid(
         gating_output,
         renormalize,
         correction_bias,
+        routed_scaling_factor,
+        num_fused_shared_experts,
     )
 
 
@@ -97,10 +101,12 @@ def moe_sum(
 
 def moe_fused_gate(
     input_tensor,
-    bias,
+    bias: Optional[torch.Tensor],
     num_expert_group,
     topk_group,
     topk,
+    renormalize=True,
+    scoring_func="sigmoid",
     num_fused_shared_experts=0,
     routed_scaling_factor=0,
     apply_routed_scaling_factor_on_output=False,
@@ -118,6 +124,12 @@ def moe_fused_gate(
     # routed_scaling_factor: if > 0, the experts will be scaled by this factor
     # apply_routed_scaling_factor_on_output: if true, output will be
     #   scaled by the routed_scaling_factor
+    # renormalize: if true, normalize selected topk weights by their sum
+    scoring_func_int = _MOE_SCORING_FUNC_MAP.get(scoring_func.lower())
+    if scoring_func_int is None:
+        raise ValueError(
+            f"Unknown scoring_func '{scoring_func}', must be one of {list(_MOE_SCORING_FUNC_MAP.keys())}"
+        )
     return torch.ops.sgl_kernel.moe_fused_gate.default(
         input_tensor,
         bias,
@@ -125,6 +137,8 @@ def moe_fused_gate(
         topk_group,
         topk,
         num_fused_shared_experts,
+        scoring_func_int,
+        renormalize,
         routed_scaling_factor,
         apply_routed_scaling_factor_on_output,
     )

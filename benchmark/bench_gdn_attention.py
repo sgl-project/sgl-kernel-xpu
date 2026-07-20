@@ -9,6 +9,11 @@ Default shapes match Qwen3.5-9B single-layer at TP=1:
   linear_key_head_dim=128, linear_value_head_dim=128,
   linear_conv_kernel_dim=4.
 
+Workload sweep matches the Qwen3.5-9B serving spec BS=(1,4),
+input_len=(1024,4096), output_len=1024 (see the ``workloads`` list in
+``main()`` for the exact prefill/decode shape cross-product and why decode
+only needs one shape per batch size).
+
 Optionally compares against SGLang Triton kernels (requires `sglang` in path);
 prints a warning and skips comparison if not available.
 
@@ -413,17 +418,23 @@ def main():
     print()
 
     # ── Workloads ─────────────────────────────────────────────────────────────
-    # Prefill: S=4096 B=1 is the primary Qwen3.5-9B target; also S=1024/2048.
-    # Decode:  B=1 is the primary target; B=8/32 to show scaling.
+    # Matches the Qwen3.5-9B serving spec: BS=(1,4), input_len(ISL)=(1024,4096),
+    # output_len(OSL)=1024.
+    #   Prefill: one call per (batch, ISL) — the full input_len is processed as
+    #   a single chunked-prefill call.
+    #   Decode: GDN's recurrent state (conv_state/ssm_state) has O(1) size that
+    #   does not grow with context length, so a single decode step's cost is
+    #   independent of how far into the OSL=1024 generation we are — one
+    #   decode-step benchmark per batch size already represents any of the
+    #   1024 output positions.
     workloads = [
         # (mode,    batch, seqlen)
         ("prefill", 1, 1024),
-        ("prefill", 1, 4096),  # ← primary Qwen3.5-9B prefill shape
-        ("prefill", 1, 8192),
+        ("prefill", 1, 4096),
         ("prefill", 4, 1024),
-        ("decode", 1, 1),  # ← primary Qwen3.5-9B decode shape
-        ("decode", 8, 1),
-        ("decode", 32, 1),
+        ("prefill", 4, 4096),
+        ("decode", 1, 1),
+        ("decode", 4, 1),
     ]
 
     # ── Column widths ──────────────────────────────────────────────────────────

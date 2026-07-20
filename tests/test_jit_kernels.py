@@ -18,6 +18,9 @@ except ImportError:
 try:
     from sgl_kernel.jit import apply_rope_inplace as jit_rope
     from sgl_kernel.jit import fused_inplace_qknorm as jit_qknorm
+    from sgl_kernel.jit import (
+        per_token_group_quant_8bit as jit_per_token_group_quant_8bit,
+    )
     from sgl_kernel.jit import rmsnorm as jit_rmsnorm
     from sgl_kernel.jit import timestep_embedding as jit_timestep_embedding
 
@@ -247,6 +250,72 @@ def test_timestep_embedding_jit_vs_reference():
 
     # Compare accuracy
     torch.testing.assert_close(y_jit, y_ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "num_tokens,hidden_dim,group_size",
+    [
+        (128, 1024, 128),
+        (64, 512, 64),
+        (256, 4096, 256),
+        (5120, 7168, 128),  # prefill-ish shape
+    ],
+)
+@pytest.mark.parametrize("dst_dtype", [torch.float8_e4m3fn, torch.int8])
+@pytest.mark.parametrize("src_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.skipif(not HAS_SGL_KERNEL, reason="Requires AOT sgl_kernel")
+@pytest.mark.skipif(not HAS_SGLANG_JIT, reason="Requires SGLang for JIT compilation")
+@pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
+def test_per_token_group_quant_8bit_jit_vs_aot(
+    num_tokens, hidden_dim, group_size, dst_dtype, src_dtype
+):
+    """JIT vs AOT per-token-group 8-bit quantization (row-major scales).
+
+    Scales match closely; quant codes agree with AOT to within one ULP (int8)
+    or one e4m3 step (fp8) -- both kernels do a reciprocal-multiply-then-clamp,
+    so results only differ at quantization boundaries, exactly as the AOT kernel
+    differs from a pure-division reference.
+    """
+    device = "xpu"
+    eps = 1e-10
+    fp8_max = float(torch.finfo(dst_dtype).max) if dst_dtype != torch.int8 else 127.0
+    fp8_min = -fp8_max
+
+    torch.manual_seed(0)
+    x = torch.randn(num_tokens, hidden_dim, dtype=src_dtype, device=device)
+    num_groups = hidden_dim // group_size
+
+    def _empty_outputs():
+        q = torch.empty(num_tokens, hidden_dim, dtype=dst_dtype, device=device)
+        s = torch.empty(num_tokens, num_groups, dtype=torch.float32, device=device)
+        return q, s
+
+    q_aot, s_aot = _empty_outputs()
+    torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit.default(
+        x, q_aot, s_aot, group_size, eps, fp8_min, fp8_max, False
+    )
+
+    q_jit, s_jit = _empty_outputs()
+    jit_per_token_group_quant_8bit(
+        x, q_jit, s_jit, group_size, eps, fp8_min, fp8_max, scale_ue8m0=False
+    )
+
+    # Scales match tightly.
+    torch.testing.assert_close(s_jit, s_aot, rtol=1e-3, atol=1e-5)
+
+    # Quant codes: bounded difference (boundary rounding only).
+    if dst_dtype == torch.int8:
+        max_ulp = (q_jit.to(torch.int32) - q_aot.to(torch.int32)).abs().max().item()
+        assert max_ulp <= 1, f"int8 quant differs from AOT by {max_ulp} > 1 ULP"
+    else:
+        # Compare dequantized magnitudes (fp8 codes aren't ordered as raw bytes).
+        dq = lambda q, s: (
+            q.view(num_tokens, num_groups, group_size).to(torch.float32)
+            * s.unsqueeze(2)
+        )
+        torch.testing.assert_close(
+            dq(q_jit, s_jit), dq(q_aot, s_aot), rtol=1e-1, atol=1e-1
+        )
 
 
 if __name__ == "__main__":

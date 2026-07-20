@@ -10,7 +10,7 @@ all_results = []
 def biased_grouped_topk_native(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
+    correction_bias: Optional[torch.Tensor],
     topk: int,
     renormalize: bool,
     num_expert_group: Optional[int] = None,
@@ -19,16 +19,25 @@ def biased_grouped_topk_native(
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    scoring_func: str = "sigmoid",
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
-    scores = gating_output.sigmoid()
+    if scoring_func == "sigmoid":
+        scores = gating_output.sigmoid()
+    elif scoring_func == "softmax":
+        scores = torch.softmax(gating_output, dim=-1)
+    else:
+        raise ValueError(f"Unknown scoring_func: {scoring_func}")
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
-    scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
+    scores_for_choice = scores.view(num_token, -1)
+    if correction_bias is not None:
+        scores_for_choice = scores_for_choice + correction_bias.unsqueeze(0)
+    group_sum_count = 1 if scoring_func == "softmax" else 2
     group_scores = (
         scores_for_choice.view(num_token, num_expert_group, -1)
-        .topk(2, dim=-1)[0]
+        .topk(group_sum_count, dim=-1)[0]
         .sum(dim=-1)
     )  # [n, n_group]
     group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
@@ -77,7 +86,14 @@ def biased_grouped_topk_native(
     return topk_weights, topk_ids
 
 
-def biased_grouped_topk_org(scores, bias, num_expert_group, topk_group, topk):
+def biased_grouped_topk_org(
+    scores,
+    bias: Optional[torch.Tensor],
+    num_expert_group,
+    topk_group,
+    topk,
+    scoring_func,
+):
     return biased_grouped_topk_native(
         scores,
         scores,
@@ -89,12 +105,29 @@ def biased_grouped_topk_org(scores, bias, num_expert_group, topk_group, topk):
         num_fused_shared_experts=0,
         routed_scaling_factor=2.5,
         apply_routed_scaling_factor_on_output=False,
+        scoring_func=scoring_func,
     )
 
 
-def biased_grouped_topk_org_kernel(scores, bias, num_expert_group, topk_group, topk):
+def biased_grouped_topk_org_kernel(
+    scores,
+    bias: Optional[torch.Tensor],
+    num_expert_group,
+    topk_group,
+    topk,
+    scoring_func,
+):
     return moe_fused_gate(
-        scores, bias, num_expert_group, topk_group, topk, 0, 2.5, False
+        input_tensor=scores,
+        bias=bias,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        topk=topk,
+        renormalize=True,
+        scoring_func=scoring_func,
+        num_fused_shared_experts=0,
+        routed_scaling_factor=2.5,
+        apply_routed_scaling_factor_on_output=False,
     )
 
 
@@ -107,9 +140,24 @@ configs = [(sq,) for sq in seq_length_range]
         x_names=["seq_length"],
         x_vals=[list(_) for _ in configs],
         line_arg="provider",
-        line_vals=["original", "kernel"],
-        line_names=["Original", "SGL Kernel"],
-        styles=[("blue", "-"), ("red", "-")],
+        line_vals=[
+            "original_sigmoid",
+            "kernel_sigmoid",
+            "original_softmax",
+            "kernel_softmax",
+        ],
+        line_names=[
+            "Original (sigmoid)",
+            "SGL Kernel (sigmoid)",
+            "Original (softmax)",
+            "SGL Kernel (softmax)",
+        ],
+        styles=[
+            ("blue", "-"),
+            ("red", "-"),
+            ("green", "--"),
+            ("orange", "--"),
+        ],
         ylabel="us",
         plot_name="moe-fused-gate-performance",
         args={},
@@ -120,22 +168,38 @@ def benchmark(seq_length, provider):
     device = torch.device("xpu")
     num_experts, num_expert_group, topk_group, topk = 512, 16, 8, 16
 
+    impl, scoring_func = provider.split("_", 1)
+
     scores = torch.randn((seq_length, num_experts), device=device, dtype=dtype)
-    bias = torch.rand(num_experts, device=device, dtype=dtype)
+    if scoring_func == "softmax":
+        # grouped topk with softmax does not use correction bias
+        bias = None
+    else:
+        bias = torch.rand(num_experts, device=device, dtype=dtype)
 
     quantiles = [0.5, 0.2, 0.8]
 
-    if provider == "original":
+    if impl == "original":
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: biased_grouped_topk_org(
-                scores.clone(), bias.clone(), num_expert_group, topk_group, topk
+                scores.clone(),
+                None if bias is None else bias.clone(),
+                num_expert_group,
+                topk_group,
+                topk,
+                scoring_func,
             ),
             quantiles=quantiles,
         )
-    elif provider == "kernel":
+    elif impl == "kernel":
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: biased_grouped_topk_org_kernel(
-                scores.clone(), bias.clone(), num_expert_group, topk_group, topk
+                scores.clone(),
+                None if bias is None else bias.clone(),
+                num_expert_group,
+                topk_group,
+                topk,
+                scoring_func,
             ),
             quantiles=quantiles,
         )
@@ -151,6 +215,8 @@ def benchmark(seq_length, provider):
             "gflops": gflops,
             "bandwidth": bandwidth,
             "ms": ms,
+            "implementation": impl,
+            "scoring_func": scoring_func,
         }
     )
 

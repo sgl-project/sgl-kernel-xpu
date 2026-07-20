@@ -20,6 +20,7 @@ try:
     from sgl_kernel.jit import fused_inplace_qknorm as jit_qknorm
     from sgl_kernel.jit import rmsnorm as jit_rmsnorm
     from sgl_kernel.jit import timestep_embedding as jit_timestep_embedding
+    from sgl_kernel.jit import topk_sigmoid as jit_topk_sigmoid
 
     HAS_SGLANG_JIT = True
 except ImportError:
@@ -247,6 +248,81 @@ def test_timestep_embedding_jit_vs_reference():
 
     # Compare accuracy
     torch.testing.assert_close(y_jit, y_ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "num_experts",
+    [8, 32, 128, 256, 5, 100],  # power-of-2 fast path + general fallback (5, 100)
+)
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("num_fused_shared_experts", [0, 1])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.skipif(not HAS_SGL_KERNEL, reason="Requires AOT sgl_kernel")
+@pytest.mark.skipif(not HAS_SGLANG_JIT, reason="Requires SGLang for JIT compilation")
+@pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
+def test_topk_sigmoid_jit_vs_aot(
+    num_experts, with_bias, num_fused_shared_experts, dtype
+):
+    """Test JIT fused sigmoid top-k gate vs the AOT sgl_kernel.topk_sigmoid op.
+
+    Covers both AOT code paths: the power-of-2 optimized kernel (8/32/128/256)
+    and the general fallback (5/100), plus bias-aware ranking, renormalization,
+    and the fused shared expert.
+    """
+    device = "xpu"
+    num_tokens = 64
+    routed_scaling_factor = 2.5
+    renormalize = True
+    topk = min(num_experts, 6)
+    if topk <= num_fused_shared_experts:
+        pytest.skip("topk must be > num_fused_shared_experts")
+
+    torch.manual_seed(0)
+    gating = torch.randn(num_tokens, num_experts, dtype=dtype, device=device)
+    bias = (
+        torch.randn(num_experts, dtype=torch.float32, device=device)
+        if with_bias
+        else None
+    )
+
+    def _run(use_aot):
+        w = torch.empty(num_tokens, topk, dtype=torch.float32, device=device)
+        idx = torch.empty(num_tokens, topk, dtype=torch.int32, device=device)
+        if use_aot:
+            torch.ops.sgl_kernel.topk_sigmoid.default(
+                w,
+                idx,
+                gating,
+                renormalize,
+                bias,
+                routed_scaling_factor,
+                num_fused_shared_experts,
+            )
+        else:
+            jit_topk_sigmoid(
+                w,
+                idx,
+                gating,
+                renormalize,
+                bias,
+                routed_scaling_factor,
+                num_fused_shared_experts,
+            )
+        return w, idx
+
+    w_aot, idx_aot = _run(True)
+    w_jit, idx_jit = _run(False)
+
+    # Selected experts (as a per-row set) and their weights must match AOT.
+    assert torch.equal(
+        idx_jit.sort(dim=-1).values, idx_aot.sort(dim=-1).values
+    ), "JIT and AOT selected different experts"
+    torch.testing.assert_close(
+        w_jit.sort(dim=-1).values,
+        w_aot.sort(dim=-1).values,
+        rtol=1e-2,
+        atol=1e-2,
+    )
 
 
 if __name__ == "__main__":

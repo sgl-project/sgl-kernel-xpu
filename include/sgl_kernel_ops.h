@@ -773,3 +773,27 @@ void gdn_attention(
     const int64_t num_actual_tokens,
     const int64_t tp_size,
     const bool reorder_input);
+
+/*
+ * Mamba causal conv1d (XPU)
+ */
+void causal_conv1d_fwd(
+    at::Tensor& x,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias_,
+    const std::optional<at::Tensor>& conv_states,
+    const std::optional<at::Tensor>& query_start_loc,
+    const std::optional<at::Tensor>& cache_indices,
+    const std::optional<at::Tensor>& has_initial_state,
+    bool silu_activation,
+    int64_t pad_slot_id);
+
+void causal_conv1d_update(
+    at::Tensor& x,
+    at::Tensor& conv_state,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias_,
+    bool silu_activation,
+    const std::optional<at::Tensor>& cache_seqlens_,
+    const std::optional<at::Tensor>& conv_state_indices_,
+    int64_t pad_slot_id);

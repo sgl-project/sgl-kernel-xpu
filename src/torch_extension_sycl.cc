@@ -318,6 +318,21 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? spec_query_start_loc, Tensor? spec_token_indx, Tensor? spec_state_indices_tensor, "
       "Tensor? num_accepted_tokens, int num_actual_tokens, int tp_size, bool reorder_input) -> ()");
   m.impl("gdn_attention", torch::kXPU, &gdn_attention);
+
+  /*
+   * Mamba causal conv1d (XPU)
+   */
+  m.def(
+      "causal_conv1d_fwd(Tensor! x, Tensor weight, Tensor? bias_, Tensor(a!)? conv_states, "
+      "Tensor? query_start_loc, Tensor? cache_indices, Tensor? has_initial_state, "
+      "bool silu_activation, int pad_slot_id) -> ()");
+  m.impl("causal_conv1d_fwd", torch::kXPU, &causal_conv1d_fwd);
+
+  m.def(
+      "causal_conv1d_update(Tensor! x, Tensor! conv_state, Tensor weight, Tensor? bias_, "
+      "bool silu_activation, Tensor? cache_seqlens_, Tensor? conv_state_indices_, "
+      "int pad_slot_id) -> ()");
+  m.impl("causal_conv1d_update", torch::kXPU, &causal_conv1d_update);
 }
 
 REGISTER_EXTENSION(common_ops)

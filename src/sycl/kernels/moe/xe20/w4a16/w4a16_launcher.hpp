@@ -2,11 +2,31 @@
  * Copyright (C) 2025 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * Host-side launcher for the unified int4/mxfp4 W4A16 MoE grouped GEMM.
- * Ported from vllm-xpu-kernels
- * (csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp MoEGEMMLauncher),
- * adapted to sgl-kernel-xpu's AOT instantiation scheme. The device kernel is
- * moe_w4a16::MoEGEMM in grouped_gemm_xe2.hpp.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
  **************************************************************************************************/
 #pragma once
 
@@ -99,17 +119,12 @@ void MoEGEMMLauncher(
   });
 }
 
-// Type-erased entry point AOT-instantiated per (policy, ElementS, ElementA).
-// ElementS selects the quantization flavour: bfloat16_t => int4 (scale is a
-// direct multiplier), uint8_t => mxfp4 (scale is an E8M0 exponent decoded
-// in-kernel). ElementA selects the activation/output dtype: bfloat16_t or
-// half_t (fp16), mirroring vllm-xpu-kernels' A_dtype runtime dispatch.
-// Packed weights are uint8 (two 4-bit values per byte, unsigned/raw codes
-// for int4 -- no folded zero-point), bias is optional float32 (nullptr when
-// absent). `zeros` is only meaningful for int4 (same [E, N, K/group_size]
-// layout/dtype as `scales`, holding the raw per-group zero-point in code
-// units); pass nullptr for mxfp4 or for int4 checkpoints with no separate
-// zero-point (e.g. symmetric quantization).
+// Type-erased entry point AOT-instantiated per policy, scale type, and
+// activation type. ElementS is uint8_t for MXFP4 E8M0 scales; otherwise it
+// matches ElementA for INT4 direct scales. ElementA is BF16 or FP16.
+// Packed weights hold two 4-bit values per byte. For INT4, `zeros` selects
+// unsigned codes with raw per-group zero-points; without it, codes are signed
+// (for example, zero-point-folded). MXFP4 ignores `zeros`; bias is optional FP32.
 template <typename Policy, typename ElementS, typename ElementA>
 void w4a16_launch(
     sycl::queue stream,

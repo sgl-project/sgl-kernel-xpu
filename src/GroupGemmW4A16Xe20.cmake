@@ -5,7 +5,6 @@ file(MAKE_DIRECTORY ${GROUP_GEMM_W4A16_XE20_GEN_DIR})
 
 # Generate one translation unit per (policy, ElementS, ElementA) combo.
 # For int4, ELEMENT_S matches ELEMENT_A; for mxfp4 it is uint8_t (E8M0).
-# SANITIZED is a filesystem-safe tag for the generated filename.
 function(add_group_gemm_w4a16_xe20_inst POLICY ELEMENT_S ELEMENT_A SANITIZED)
     set(GEN_SRC
         "${GROUP_GEMM_W4A16_XE20_GEN_DIR}/GroupGemmW4A16Xe20_inst_${POLICY}_${SANITIZED}.cpp")

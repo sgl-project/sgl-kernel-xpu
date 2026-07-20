@@ -629,7 +629,7 @@ def fused_experts(
     big_weight = K * N > _MOE_GROUPED_GEMM_SMALL_WEIGHT_THRESHOLD
     # The 4-bit W4A16 grouped GEMM uses a two-GEMM path. Keep GEMM1 independent
     # and apply the gated activation with its dedicated elementwise kernel.
-    # This preserves GEMM N-dimension parallelism and matches the CUDA layout.
+    # This preserves GEMM N-dimension parallelism.
     use_unfused_act = use_4bit_w4a16 or (avg_m <= 128 and big_weight)
     if use_unfused_act:
         intermediate_cache1 = torch.empty(
@@ -720,8 +720,9 @@ def fused_experts(
         intermediate_cache1 = torch.empty(
             (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
         )
-        # GEMM1 (fused act): B = w1 (gate+up). 4-bit always takes the unfused
-        # path above, so this fused path is bf16-only.
+        # GEMM1 (fused act): B = w1 (gate+up). The 4-bit W4A16 paths always use the
+        # separate GEMM1 -> activation -> GEMM2 sequence above, so this branch is
+        # only for the non-4-bit grouped-GEMM path.
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
             intermediate_cache1,
             input_A_shuffle,

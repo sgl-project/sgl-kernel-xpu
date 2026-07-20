@@ -2,29 +2,31 @@
  * Copyright (C) 2025 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * Torch op dispatcher for the unified int4/mxfp4 W4A16 MoE grouped GEMM.
- * Ported from vllm-xpu-kernels
- * (csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp), adapted to
- * sgl-kernel-xpu's AOT instantiation scheme.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
  *
- * A single kernel template (moe_w4a16::MoEGEMM) serves both int4 and mxfp4:
- *   - ElementS = ElementA           => int4 (scale is a direct multiplier;
- *     an optional explicit per-group zero-point tensor -- same layout/dtype
- *     as scales -- may be supplied via `zeros`, dequanting as
- *     `(code - zp) * scale` instead of requiring the zero-point to be
- *     pre-folded into a signed 4-bit code, which overflows for real,
- *     non-symmetric AWQ checkpoints)
- *   - ElementS = uint8_t             => mxfp4 (scale is an E8M0 exponent,
- *     decoded to fp32 in registers via `<< 23`; no zero-point, `zeros` must
- *     be absent)
- * Activations/output dtype (ElementA) is either cutlass::bfloat16_t or
- * cutlass::half_t (fp16), dispatched at runtime off activations.scalar_type(),
- * mirroring vllm-xpu-kernels' A_dtype branch in grouped_gemm_xe2_interface.hpp.
- * group_size (32/64/128/256) is a runtime argument; all four are compiled into
- * every instance, so it does not multiply the AOT instance count.
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
  *
- * The AOT instantiation matrix (4 policies x {int4, mxfp4} x {bf16, fp16} =
- * 16 units) lives in src/GroupGemmW4A16Xe20.cmake.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
  **************************************************************************************************/
 #define SYCL_INTEL_TARGET 20
 
@@ -36,11 +38,6 @@
 
 #include "sycl/kernels/moe/xe20/w4a16/gemm_xe2_policy.hpp"
 
-// Primary template declaration for the AOT-instantiated entry points. The
-// definition lives in w4a16_launcher.hpp and is compiled into the generated
-// translation units (GroupGemmW4A16Xe20LauncherInstance.cpp.in); here we only
-// need the declaration plus extern template to avoid pulling the heavy kernel
-// into this dispatcher TU.
 namespace moe_w4a16 {
 template <typename Policy, typename ElementS, typename ElementA>
 void w4a16_launch(

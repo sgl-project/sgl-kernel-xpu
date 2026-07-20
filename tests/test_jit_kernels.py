@@ -21,7 +21,10 @@ try:
     from sgl_kernel.jit import (
         per_token_group_quant_8bit_v2 as jit_per_token_group_quant_8bit_v2,
     )
+    from sgl_kernel.jit import gelu_and_mul as jit_gelu_and_mul
+    from sgl_kernel.jit import gelu_tanh_and_mul as jit_gelu_tanh_and_mul
     from sgl_kernel.jit import rmsnorm as jit_rmsnorm
+    from sgl_kernel.jit import silu_and_mul as jit_silu_and_mul
     from sgl_kernel.jit import timestep_embedding as jit_timestep_embedding
 
     HAS_SGLANG_JIT = True
@@ -350,6 +353,55 @@ def test_per_token_group_quant_8bit_v2_jit_vs_aot(
         torch.testing.assert_close(
             dq(q_jit, s_jit), dq(q_aot, s_aot), rtol=1e-1, atol=1e-1
         )
+
+def _reference_act_and_mul(op_name: str, x: torch.Tensor) -> torch.Tensor:
+    """PyTorch reference for the fused gated activations (fp32 compute)."""
+    import torch.nn.functional as F
+
+    d = x.shape[-1] // 2
+    gate, up = x[..., :d].float(), x[..., d:].float()
+    if op_name == "silu":
+        act = F.silu(gate)
+    elif op_name == "gelu":
+        act = F.gelu(gate)  # erf / exact
+    elif op_name == "gelu_tanh":
+        act = F.gelu(gate, approximate="tanh")
+    else:
+        raise ValueError(op_name)
+    return (act * up).to(x.dtype)
+
+
+@pytest.mark.parametrize(
+    "op_name",
+    ["silu", "gelu", "gelu_tanh"],
+)
+@pytest.mark.parametrize(
+    "num_tokens,dim",
+    [(128, 1024), (37, 512), (256, 4096), (5, 14336)],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.skipif(not HAS_SGLANG_JIT, reason="Requires SGLang for JIT compilation")
+@pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
+def test_activation_and_mul_jit_vs_reference(op_name, num_tokens, dim, dtype):
+    """Test JIT silu/gelu/gelu_tanh + mul against the PyTorch reference.
+
+    Input is [num_tokens, 2*dim] (gate|up split); output is [num_tokens, dim].
+    """
+    device = "xpu"
+    jit_fn = {
+        "silu": jit_silu_and_mul,
+        "gelu": jit_gelu_and_mul,
+        "gelu_tanh": jit_gelu_tanh_and_mul,
+    }[op_name]
+
+    torch.manual_seed(0)
+    x = torch.randn(num_tokens, 2 * dim, dtype=dtype, device=device)
+
+    y_ref = _reference_act_and_mul(op_name, x)
+    y_jit = jit_fn(x.clone())
+
+    assert y_jit.shape == (num_tokens, dim)
+    torch.testing.assert_close(y_jit, y_ref, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":

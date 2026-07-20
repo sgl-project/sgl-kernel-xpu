@@ -841,6 +841,47 @@ def _build_moe_gemm_inputs(
     }
 
 
+def _launch_mxfp4_xe20(inputs, num_experts):
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w4a16(
+        inputs["output_mxfp4"],
+        inputs["activations"],
+        inputs["w_packed"],
+        inputs["w_scale"],
+        None,  # zeros
+        None,  # bias
+        inputs["total_rows"],
+        num_experts,
+        False,  # is_int4
+        32,  # group_size
+    )
+
+
+def _launch_mxfp4_xe35(inputs, num_experts):
+    # The Xe3 op has no int4 zeros/group_size operands; it takes the activation
+    # descriptor instead. fuse_act=False keeps this a plain grouped GEMM so the
+    # dequantised-weight reference below stays comparable with the Xe2 path.
+    #
+    # It also wants fp32 direct multipliers rather than raw E8M0 bytes -- only
+    # the Xe2 kernel decodes E8M0 on-device. exp2 (not a byte<<23 bit-cast) so
+    # byte=0 decodes to the 2^-127 subnormal instead of a hard zero, matching
+    # both _mxfp4_e8m0_to_fp32 and the dequantised-weight reference.
+    scale_bytes = inputs["w_scale"]
+    if scale_bytes.dtype == torch.float8_e8m0fnu:
+        scale_bytes = scale_bytes.view(torch.uint8)
+    scales_fp32 = torch.exp2(scale_bytes.to(torch.float32) - 127.0)
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe35_mxfp4_w4a16(
+        inputs["output_mxfp4"],
+        inputs["activations"],
+        inputs["w_packed"],
+        scales_fp32,
+        None,  # bias
+        inputs["total_rows"],
+        num_experts,
+        0,  # activation_type
+        False,  # fuse_act
+    )
+
+
 def _check_mxfp4_grouped_mm(
     num_tokens_per_expert,
     num_experts,
@@ -849,6 +890,7 @@ def _check_mxfp4_grouped_mm(
     dtype,
     weight_dtype=torch.int8,
     scale_dtype=torch.uint8,
+    launch=_launch_mxfp4_xe20,
 ):
     gemm_k = hidden_size
     gemm_n = 2 * intermediate_size
@@ -877,18 +919,7 @@ def _check_mxfp4_grouped_mm(
     ).to(dtype)
     inputs["output_reference"].copy_(reference)
 
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w4a16(
-        inputs["output_mxfp4"],
-        inputs["activations"],
-        inputs["w_packed"],
-        inputs["w_scale"],
-        None,
-        None,
-        inputs["total_rows"],
-        num_experts,
-        False,
-        32,
-    )
+    launch(inputs, num_experts)
 
     torch.testing.assert_close(
         inputs["output_reference"], inputs["output_mxfp4"], rtol=1e-1, atol=1e-2
@@ -918,6 +949,36 @@ def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_op(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         dtype=dtype,
+    )
+
+
+@pytest.mark.skipif(
+    not utils.is_xe3_device(),
+    reason="moe_grouped_mm_nt_xe35_mxfp4_w4a16 is only registered on Xe3 (CRI) builds",
+)
+@pytest.mark.parametrize("num_tokens_per_expert", [2, 6, 33, 129])
+@pytest.mark.parametrize("num_experts", [8])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [512])
+def test_moe_grouped_mm_nt_xe35_w4a16_mxfp4_op(
+    num_tokens_per_expert,
+    num_experts,
+    hidden_size,
+    intermediate_size,
+):
+    """Xe3 (CRI) counterpart of test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_op.
+
+    Per include/sgl_kernel_ops.h the Xe35 op reuses the Xe20 launcher instances
+    and differs only in its tile-selection heuristic, so both paths see the same
+    MXFP4-rounded weights and any difference is bf16 GEMM arithmetic noise.
+    """
+    _check_mxfp4_grouped_mm(
+        num_tokens_per_expert=num_tokens_per_expert,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        dtype=torch.bfloat16,
+        launch=_launch_mxfp4_xe35,
     )
 
 

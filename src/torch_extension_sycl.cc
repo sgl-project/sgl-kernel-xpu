@@ -135,6 +135,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("merge_state_v2", torch::kXPU, &merge_state_v2);
   m.def("merge_state(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state", torch::kXPU, &merge_state);
+
   /*
    * From cutlass attention
    */
@@ -212,6 +213,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("sgl_per_tensor_quant_fp8(Tensor input, Tensor output_q, Tensor output_s, bool is_static) -> ()");
   m.impl("sgl_per_tensor_quant_fp8", torch::kXPU, &sgl_per_tensor_quant_fp8);
 
+  m.def("sgl_per_token_quant_fp8(Tensor input, Tensor(a!) output_q, Tensor(b!) output_s) -> ()");
+  m.impl("sgl_per_token_quant_fp8", torch::kXPU, &sgl_per_token_quant_fp8);
+
   /*
    * From fused qk norm rope
    */
@@ -288,6 +292,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor weight_indices, "
       "Tensor lora_ranks, Tensor? extra_embeddings, Tensor? seg_lens) -> ()");
   m.impl("embedding_lora_a_fwd", torch::kXPU, &embedding_lora_a_fwd);
+  m.def(
+      "sgemm_lora_a_fwd(Tensor! output, Tensor input_x, Tensor weights, int stack_num, Tensor seg_indptr, "
+      "Tensor weight_indices, "
+      "Tensor lora_ranks, Tensor? seg_lens) -> ()");
+  m.impl("sgemm_lora_a_fwd", torch::kXPU, &sgemm_lora_a_fwd);
 
   /* NSA (Native Sparse Attention) indexer scoring */
   // fp8_mqa_logits (prefill) is implemented in pure Python via sgl_kernel.nsa.
@@ -296,6 +305,21 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor seq_lens, Tensor block_tables, Tensor? schedule_metadata, "
       "int max_seq_len, bool clean_logits) -> Tensor");
   m.impl("fp8_paged_mqa_logits", torch::kXPU, &fp8_paged_mqa_logits);
+
+  /*
+   * Mamba causal conv1d (XPU)
+   */
+  m.def(
+      "causal_conv1d_fwd(Tensor! x, Tensor weight, Tensor? bias_, Tensor(a!)? conv_states, "
+      "Tensor? query_start_loc, Tensor? cache_indices, Tensor? has_initial_state, "
+      "bool silu_activation, int pad_slot_id) -> ()");
+  m.impl("causal_conv1d_fwd", torch::kXPU, &causal_conv1d_fwd);
+
+  m.def(
+      "causal_conv1d_update(Tensor! x, Tensor! conv_state, Tensor weight, Tensor? bias_, "
+      "bool silu_activation, Tensor? cache_seqlens_, Tensor? conv_state_indices_, "
+      "int pad_slot_id) -> ()");
+  m.impl("causal_conv1d_update", torch::kXPU, &causal_conv1d_update);
 }
 
 REGISTER_EXTENSION(common_ops)

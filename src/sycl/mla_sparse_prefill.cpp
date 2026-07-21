@@ -72,6 +72,7 @@ std::vector<at::Tensor> flash_mla_sparse_prefill_impl(
 
   // Chunk gathered_k along s_q to bound peak device memory.
   // gathered_k is [chunk, topk, d_qk] in bf16; cap the workspace at ~256 MB.
+  TORCH_CHECK(topk > 0, "topk must be > 0");
   constexpr int64_t PREFILL_GATHERED_K_MAX_BYTES = 256LL * 1024 * 1024;
   const int64_t per_seq_gathered_bytes = static_cast<int64_t>(topk) * d_qk * 2;  // bf16 = 2 bytes
   int chunk_size = std::max(1, static_cast<int>(PREFILL_GATHERED_K_MAX_BYTES / per_seq_gathered_bytes));
@@ -81,6 +82,7 @@ std::vector<at::Tensor> flash_mla_sparse_prefill_impl(
   at::Tensor gathered_valid_mask = torch::empty({chunk_size, topk}, opts.dtype(torch::kInt));
 
   cutlass::KernelHardwareInfo hw_info;
+  hw_info.device_id = q.device().index();
   hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
   TORCH_CHECK(hw_info.sm_count > 0, "Failed to query device multiprocessor count");
 

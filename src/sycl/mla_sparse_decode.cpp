@@ -121,6 +121,7 @@ std::vector<at::Tensor> flash_mla_sparse_decode_impl(
   at::Tensor gathered_valid_mask = torch::empty({b, s_q, gathered_topk}, q.options().dtype(torch::kInt32));
 
   cutlass::KernelHardwareInfo hw_info;
+  hw_info.device_id = q.device().index();
   hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
   TORCH_CHECK(hw_info.sm_count > 0, "Failed to query device multiprocessor count");
 

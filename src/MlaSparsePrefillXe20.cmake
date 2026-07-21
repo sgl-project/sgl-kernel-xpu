@@ -25,7 +25,7 @@ foreach(D_QK ${MLA_SPARSE_PREFILL_D_QKS})
             set(GENERATED_FILE
                 "${CMAKE_CURRENT_BINARY_DIR}/sycl/sparse_mla_prefill_fwd_${_topk_tag}k${D_QK}_${_sink_tag}.cpp")
             configure_file(${MLA_SPARSE_PREFILL_TEMPLATE} ${GENERATED_FILE} @ONLY)
-            list(APPEND device_cpp_common ${GENERATED_FILE})
+            list(APPEND device_cpp_xe20 ${GENERATED_FILE})
         endforeach()
     endforeach()
 endforeach()

@@ -290,10 +290,7 @@ def flash_mla_with_kvcache(
     if softmax_scale is None:
         softmax_scale = D_qk ** (-0.5)
 
-    assert q.dtype in (
-        torch.float16,
-        torch.bfloat16,
-    ), f"q.dtype must be fp16 or bf16, got {q.dtype}"
+    assert q.dtype == torch.bfloat16, f"q.dtype must be bf16, got {q.dtype}"
 
     # Allocate outputs
     out = q.new_empty((B, s_q, H, head_dim_v))
@@ -301,6 +298,12 @@ def flash_mla_with_kvcache(
 
     if block_table is None:
         assert indices is not None, "indices must be provided for sparse decode path"
+        assert (
+            is_fp8_kvcache
+        ), "sparse decode path requires is_fp8_kvcache=True (fp8-packed k_cache)"
+        assert (
+            k_cache.dtype == torch.uint8
+        ), f"sparse decode k_cache must be uint8 fp8-packed cache, got {k_cache.dtype}"
         if topk_length is not None:
             assert (
                 topk_length.device == q.device
@@ -382,7 +385,7 @@ def flash_mla_sparse_prefill(
         return_softmax_lse: if True, also return (max_logits, lse).
 
     Returns:
-        out [s_q, h_q, d_v] if return_softmax_lse is False, else
+        (out [s_q, h_q, d_v], None, None) if return_softmax_lse is False, else
         (out, max_logits, lse) with max_logits/lse shaped [s_q, h_q].
     """
     assert q.ndim == 3, f"q must be 3D [s_q, h_q, d_qk], got {q.ndim}D"
@@ -408,7 +411,7 @@ def flash_mla_sparse_prefill(
     if return_softmax_lse:
         out, max_logits, lse = outs
         return out, max_logits, lse
-    return outs[0]
+    return outs[0], None, None
 
 
 def flash_mla_sparse_decode(

@@ -13,6 +13,12 @@ set(FMHA_PREFILL_NP_HEAD_DIMS 64 72 96 128 192)
 set(FMHA_PREFILL_TEMPLATE
     "${CMAKE_CURRENT_SOURCE_DIR}/sycl/xe_fmha_fwd_prefill_kernel.cpp.in")
 
+# FP8 KV-cache prefill path is split into a dedicated runner TU
+# (FmhaPrefillFp8Runner) so its heavy e4m3/e5m2 kernel instantiations do not
+# inflate the bf16/fp16 prefill TU's peak compiler memory.
+set(FMHA_PREFILL_FP8_TEMPLATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/xe_fmha_fwd_prefill_fp8_kernel.cpp.in")
+
 # Per-HEAD_DIM tile shape parameters (TILED_Q, TILED_KV, NUM_SG)
 set(FMHA_PREFILL_TILED_Q_64 128)
 set(FMHA_PREFILL_TILED_KV_64 64)
@@ -126,4 +132,13 @@ foreach(HEAD_DIM ${FMHA_PREFILL_HEAD_DIMS})
         "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_prefill_kernel_${HEAD_DIM}.cpp")
     configure_file(${FMHA_PREFILL_TEMPLATE} ${GENERATED_FILE} @ONLY)
     list(APPEND device_cpp_common ${GENERATED_FILE})
+
+    # FP8 prefill runner: only the paged head dims forward to it (the fp8 branch
+    # lives inside #if @EMIT_PAGED@ in the wrapper).
+    if(EMIT_PAGED)
+        set(GENERATED_FP8_FILE
+            "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_prefill_fp8_kernel_${HEAD_DIM}.cpp")
+        configure_file(${FMHA_PREFILL_FP8_TEMPLATE} ${GENERATED_FP8_FILE} @ONLY)
+        list(APPEND device_cpp_common ${GENERATED_FP8_FILE})
+    endif()
 endforeach()

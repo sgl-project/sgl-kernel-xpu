@@ -34,6 +34,15 @@ set(FMHA_DECODE_TEMPLATE
 set(FMHA_SPLIT_DECODE_TEMPLATE
     "${CMAKE_CURRENT_SOURCE_DIR}/sycl/xe_fmha_fwd_split_decode_kernel.cpp.in")
 
+# FP8 KV-cache paths are split into dedicated runner TUs (FmhaDecodeFp8Runner /
+# FmhaSplitDecodeFp8Runner) so their heavy e4m3/e5m2 kernel instantiations do not
+# inflate the bf16/fp16 decode / split-decode TUs' peak compiler memory.
+set(FMHA_DECODE_FP8_TEMPLATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/xe_fmha_fwd_decode_fp8_kernel.cpp.in")
+
+set(FMHA_SPLIT_DECODE_FP8_TEMPLATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/xe_fmha_fwd_split_decode_fp8_kernel.cpp.in")
+
 # Compile the union of the paged and non-paged head-dim sets. Each generated TU
 # is told via EMIT_PAGED / EMIT_NP which branch(es) to compile; the disabled
 # branch is preprocessed out. The split-decode kernel is a paged-only (split-KV)
@@ -83,10 +92,27 @@ foreach(QG_SZ ${FMHA_DECODE_QG_SIZES})
             configure_file(${FMHA_DECODE_TEMPLATE} ${GENERATED_FILE} @ONLY)
             list(APPEND device_cpp_common ${GENERATED_FILE})
 
+            # FP8 paged decode runner: only the paged head dims forward to it
+            # (the fp8 branch lives inside #if @EMIT_PAGED@ in the wrapper).
+            if(EMIT_PAGED)
+                set(GENERATED_FP8_FILE
+                    "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_fp8_kernel_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}.cpp")
+                configure_file(${FMHA_DECODE_FP8_TEMPLATE} ${GENERATED_FP8_FILE} @ONLY)
+                list(APPEND device_cpp_common ${GENERATED_FP8_FILE})
+            endif()
+
             set(GENERATED_SPLIT_FILE
                 "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_split_decode_kernel_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}.cpp")
             configure_file(${FMHA_SPLIT_DECODE_TEMPLATE} ${GENERATED_SPLIT_FILE} @ONLY)
             list(APPEND device_cpp_common ${GENERATED_SPLIT_FILE})
+
+            # FP8 split-decode runner: the split wrapper forwards to it
+            # unconditionally, so it is emitted for the full head-dim union to
+            # match FmhaSplitDecodeRunner symbol availability.
+            set(GENERATED_SPLIT_FP8_FILE
+                "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_split_decode_fp8_kernel_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}.cpp")
+            configure_file(${FMHA_SPLIT_DECODE_FP8_TEMPLATE} ${GENERATED_SPLIT_FP8_FILE} @ONLY)
+            list(APPEND device_cpp_common ${GENERATED_SPLIT_FP8_FILE})
         endforeach()
     endforeach()
 endforeach()

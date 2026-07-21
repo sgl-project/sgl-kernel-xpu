@@ -36,8 +36,8 @@ struct CompressDecodeKernel {
       int64_t raw0 = static_cast<int64_t>(req_to_token_row[pos0]);
 
       // Convert to swa indices
-      int64_t swa1 = full_to_swa_[raw1];
-      int64_t swa0 = full_to_swa_[raw0];
+      int64_t swa1 = full_to_state_[raw1];
+      int64_t swa0 = full_to_state_[raw0];
 
       // Compute ring buffer locations
       loc1 = (swa1 / swa_page_size_) * ring_size_ + (swa1 % ring_size_);
@@ -55,7 +55,7 @@ struct CompressDecodeKernel {
   const int64_t* req_pool_indices_;
   const int32_t* seq_lens_;
   const int32_t* req_to_token_;
-  const int64_t* full_to_swa_;
+  const int64_t* full_to_state_;
   int32_t* output_i32_;
   int64_t swa_page_size_;
   int64_t ring_size_;
@@ -78,14 +78,14 @@ inline sycl::nd_range<1> get_1d_range(int32_t size) {
 torch::Tensor plan_compress_decode(
     torch::Tensor req_pool_indices,
     torch::Tensor req_to_token,
-    torch::Tensor full_to_swa,
+  torch::Tensor full_to_state,
     torch::Tensor seq_lens,
     int64_t compress_ratio,
     int64_t swa_page_size,
     int64_t ring_size) {
   TORCH_CHECK(req_pool_indices.dtype() == torch::kInt64);
   TORCH_CHECK(req_to_token.dtype() == torch::kInt32);
-  TORCH_CHECK(full_to_swa.dtype() == torch::kInt64);
+  TORCH_CHECK(full_to_state.dtype() == torch::kInt64);
   TORCH_CHECK(seq_lens.dtype() == torch::kInt32);
   TORCH_CHECK(req_to_token.dim() == 2, "req_to_token must be a 2D tensor");
   TORCH_CHECK(req_to_token.stride(1) == 1, "req_to_token must be contiguous in the last dim");
@@ -107,7 +107,7 @@ torch::Tensor plan_compress_decode(
         req_pool_indices.data_ptr<int64_t>(),
         seq_lens.data_ptr<int32_t>(),
         req_to_token.data_ptr<int32_t>(),
-        full_to_swa.data_ptr<int64_t>(),
+        full_to_state.data_ptr<int64_t>(),
         output_i32,
         swa_page_size,
         ring_size,

@@ -236,7 +236,7 @@ def plan_compress_prefill(
 def plan_compress_decode(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
-    full_to_swa: torch.Tensor,
+    full_to_state: torch.Tensor,
     seq_lens: torch.Tensor,
     compress_ratio: int,
     swa_page_size: int,
@@ -245,7 +245,7 @@ def plan_compress_decode(
     return torch.ops.sgl_kernel.plan_compress_decode(
         req_pool_indices,
         req_to_token,
-        full_to_swa,
+        full_to_state,
         seq_lens.to(torch.int32),
         compress_ratio,
         swa_page_size,

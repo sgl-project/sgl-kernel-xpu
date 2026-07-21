@@ -618,7 +618,7 @@ namespace at::native::xpu {
 torch::Tensor plan_compress_decode(
     torch::Tensor req_pool_indices,
     torch::Tensor req_to_token,
-    torch::Tensor full_to_swa,
+    torch::Tensor full_to_state,
     torch::Tensor seq_lens,
     int64_t compress_ratio,
     int64_t swa_page_size,

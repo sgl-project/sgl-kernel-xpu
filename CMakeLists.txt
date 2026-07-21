@@ -33,6 +33,7 @@ include(${SGL_OPS_XPU_ROOT}/cmake/BuildFlags.cmake)
 if(EXISTS "/proc/meminfo")
   option(SGL_BUILD_MEMORY_MONITOR "Track build memory and guard host OOM" ON)
   set(SGL_BUILD_MEM_FILE_LIMIT_GIB "4" CACHE STRING "Per-file compile RSS threshold in GiB")
+  option(SGL_BUILD_MEM_FILE_LIMIT_FATAL "Fail the build if a single file's peak RSS reaches SGL_BUILD_MEM_FILE_LIMIT_GIB" ON)
   set(SGL_BUILD_MEM_GUARD_AVAIL_GIB "0.5" CACHE STRING "Kill compile when MemAvailable drops below this GiB" FORCE)
   set(SGL_BUILD_MEM_GUARD_USED_PCT "99" CACHE STRING "Kill compile when system used memory reaches this percent" FORCE)
 else()
@@ -57,11 +58,14 @@ if(SGL_BUILD_MEMORY_MONITOR)
     --guard-avail-gib ${SGL_BUILD_MEM_GUARD_AVAIL_GIB}
     --guard-used-pct ${SGL_BUILD_MEM_GUARD_USED_PCT}
   )
+  if(SGL_BUILD_MEM_FILE_LIMIT_FATAL)
+    list(APPEND SGL_BUILD_MEM_LAUNCHER --file-limit-fatal)
+  endif()
 
   set(CMAKE_C_COMPILER_LAUNCHER ${SGL_BUILD_MEM_LAUNCHER})
   set(CMAKE_CXX_COMPILER_LAUNCHER ${SGL_BUILD_MEM_LAUNCHER})
 
-  message(STATUS "Build memory monitor enabled (per-file limit=${SGL_BUILD_MEM_FILE_LIMIT_GIB}GiB, guard avail=${SGL_BUILD_MEM_GUARD_AVAIL_GIB}GiB, guard used=${SGL_BUILD_MEM_GUARD_USED_PCT}%)")
+  message(STATUS "Build memory monitor enabled (per-file limit=${SGL_BUILD_MEM_FILE_LIMIT_GIB}GiB fatal=${SGL_BUILD_MEM_FILE_LIMIT_FATAL}, guard avail=${SGL_BUILD_MEM_GUARD_AVAIL_GIB}GiB, guard used=${SGL_BUILD_MEM_GUARD_USED_PCT}%)")
 endif()
 
 include(FetchContent)

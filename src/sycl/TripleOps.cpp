@@ -51,6 +51,26 @@ struct gelu_erf_mul_dpcpp_functor {
   }
 };
 
+template <typename scalar_t>
+struct silu_and_mul_clamp_elem_functor {
+  float limit_bf16;
+  silu_mul_dpcpp_functor<scalar_t, float> silu_mul_fn;
+
+  scalar_t operator()(scalar_t a, scalar_t b) const {
+    using bf16_t = sycl::ext::oneapi::bfloat16;
+
+    // Match DeepGEMM semantics: clamp via bf16 round-trip before SiLU*mul.
+    const float gate_bf16 = static_cast<float>(static_cast<bf16_t>(static_cast<float>(a)));
+    const float up_bf16 = static_cast<float>(static_cast<bf16_t>(static_cast<float>(b)));
+
+    const float gate_c = static_cast<float>(static_cast<bf16_t>(sycl::fmin(gate_bf16, limit_bf16)));
+    const float up_c = static_cast<float>(
+        static_cast<bf16_t>(sycl::fmax(-limit_bf16, sycl::fmin(up_bf16, limit_bf16))));
+
+    return silu_mul_fn(static_cast<scalar_t>(gate_c), static_cast<scalar_t>(up_c));
+  }
+};
+
 template <typename scalar_t, typename func_t, int N>
 struct op_and_mul_functor {
   void operator()(sycl::nd_item<1> item) const {
@@ -58,24 +78,22 @@ struct op_and_mul_functor {
     int64_t offset = item.get_local_linear_id();
     int64_t step = item.get_local_range(0);
     int64_t token_id = item.get_group(0);
-    func_t fn;
     int64_t bound = dim / N;
     for (int64_t i = offset; i < bound; i += step) {
       auto unary_val = reinterpret_cast<aligned_vector_loop<scalar_t, N>*>(input_ptr)[token_id * bound * 2 + i];
       auto mul_val = reinterpret_cast<aligned_vector_loop<scalar_t, N>*>(input_ptr)[token_id * bound * 2 + i + bound];
 #pragma unroll
       for (int i = 0; i < N; ++i) {
-        auto a = unary_val[i], b = mul_val[i];
         unary_val[i] = fn(unary_val[i], mul_val[i]);
       }
       reinterpret_cast<aligned_vector_loop<scalar_t, N>*>(output_ptr)[token_id * bound + i] = unary_val;
     }
   }
-
   scalar_t* input_ptr;
   scalar_t* output_ptr;
   int64_t num_;
   int64_t dim;
+  func_t fn;
 };
 
 #define VEC_LAUNCH(KERNEL, N)                                                \
@@ -231,4 +249,98 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input) {
     gelu_and_mul_sycl<sycl::ext::oneapi::bfloat16, at::BFloat16>(queue, input, out);
   }
   return;
+}
+
+template <typename T = float>
+void get_clamp_config(
+    const at::Tensor& output,
+    int64_t& numel,
+    int64_t& dim,
+    int64_t& wg_size,
+    int64_t& num_group,
+    int& vec_size) {
+  auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
+  int64_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
+  numel = output.numel();
+  dim = output.size(-1);
+  int64_t tokens = numel / dim;
+  num_group = tokens;
+
+  // Keep clamp path's original work-group heuristic: largest power-of-two <= min(dim, max_wg_size).
+  int64_t wg_cap = std::min(dim, max_wg_size);
+  wg_size = 1;
+  while ((wg_size << 1) <= wg_cap) {
+    wg_size <<= 1;
+  }
+
+  vec_size = sizeof(float) * 4 / sizeof(T);
+  while ((vec_size >> 1) * wg_size >= dim) {
+    vec_size = vec_size >> 1;
+  }
+  if (dim % vec_size != 0) vec_size = 1;
+}
+
+template <typename T_to = float, typename T_from = float>
+void silu_and_mul_clamp_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out, float limit) {
+  auto _input = reinterpret_cast<T_to*>(input.data_ptr<T_from>());
+  auto _out = reinterpret_cast<T_to*>(out.data_ptr<T_from>());
+
+  int64_t numel;
+  int64_t dim;
+  int64_t wg_size;
+  int64_t num_group;
+  int vec_size;
+  get_clamp_config<T_to>(out, numel, dim, wg_size, num_group, vec_size);
+  const float limit_bf16 = static_cast<float>(static_cast<sycl::ext::oneapi::bfloat16>(limit));
+
+#define VEC_LAUNCH_CLAMP(N)                                                                                \
+  case N: {                                                                                                \
+    op_and_mul_functor<T_to, silu_and_mul_clamp_elem_functor<T_to>, N> kfn = {                           \
+        .input_ptr = _input,                                                                               \
+        .output_ptr = _out,                                                                                \
+        .num_ = numel,                                                                                     \
+        .dim = dim,                                                                                        \
+        .fn = silu_and_mul_clamp_elem_functor<T_to>{.limit_bf16 = limit_bf16}};                          \
+    sycl_kernel_submit(num_group* wg_size, wg_size, q, kfn);                                              \
+    break;                                                                                                 \
+  }
+
+  switch (vec_size) {
+    VEC_LAUNCH_CLAMP(1);
+    VEC_LAUNCH_CLAMP(2);
+    VEC_LAUNCH_CLAMP(4);
+    VEC_LAUNCH_CLAMP(8);
+    VEC_LAUNCH_CLAMP(16);
+    default:
+      TORCH_CHECK(false, "silu_and_mul_clamp: unsupported vec_size ", vec_size);
+  }
+
+#undef VEC_LAUNCH_CLAMP
+}
+
+void silu_and_mul_clamp(torch::Tensor& out, torch::Tensor& input, double swiglu_limit) {
+  CHECK_INPUT(input)
+  CHECK_INPUT(out)
+  TORCH_CHECK(out.dtype() == input.dtype(), "silu_and_mul_clamp: dtype mismatch");
+  TORCH_CHECK(input.size(-1) % 2 == 0, "silu_and_mul_clamp: input last dim must be even");
+  TORCH_CHECK(out.numel() * 2 == input.numel(), "silu_and_mul_clamp: output numel must be half of input numel");
+  TORCH_CHECK(swiglu_limit > 0.0, "silu_and_mul_clamp: swiglu_limit must be > 0");
+
+  input = input.contiguous();
+  out = out.contiguous();
+
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
+  float limit = static_cast<float>(swiglu_limit);
+
+  if (input.scalar_type() == at::ScalarType::Half) {
+    silu_and_mul_clamp_sycl<sycl::half, at::Half>(queue, input, out, limit);
+  } else if (input.scalar_type() == at::ScalarType::BFloat16) {
+    silu_and_mul_clamp_sycl<sycl::ext::oneapi::bfloat16, at::BFloat16>(queue, input, out, limit);
+  } else {
+    TORCH_CHECK(
+        input.dtype() == torch::kBFloat16 || input.dtype() == torch::kFloat16,
+        "silu_and_mul_clamp: only bf16 and fp16 are supported, got ",
+        input.dtype());
+  }
 }

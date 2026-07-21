@@ -242,24 +242,14 @@ def plan_compress_decode(
     swa_page_size: int,
     ring_size: int,
 ) -> torch.Tensor:
-    rid = req_pool_indices.long()
-    pos1 = seq_lens.long() - 1
-    pos0 = (pos1 - compress_ratio).clamp(min=0)
-
-    if compress_ratio == 128:
-        loc1 = _compute_c128_loc(rid, pos1, ring_size).to(torch.int32)
-        loc0 = _compute_c128_loc(rid, pos0, ring_size).to(torch.int32)
-    else:
-        raw1 = req_to_token[rid, pos1].long()
-        raw0 = req_to_token[rid, pos0].long()
-        swa1 = full_to_swa.index_select(0, raw1).long()
-        swa0 = full_to_swa.index_select(0, raw0).long()
-
-        loc1 = _compute_loc(swa1, swa_page_size, ring_size).to(torch.int32)
-        loc0 = _compute_loc(swa0, swa_page_size, ring_size).to(torch.int32)
-
-    return _pack_decode_plans(
-        seq_lens, loc1, loc0 // compress_ratio, loc1 // compress_ratio
+    return torch.ops.sgl_kernel.plan_compress_decode(
+        req_pool_indices,
+        req_to_token,
+        full_to_swa,
+        seq_lens.to(torch.int32),
+        compress_ratio,
+        swa_page_size,
+        ring_size,
     )
 
 

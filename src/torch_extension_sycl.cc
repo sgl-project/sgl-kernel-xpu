@@ -327,8 +327,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "plan_compress_decode(Tensor req_pool_indices, Tensor req_to_token, Tensor full_to_state, "
       "Tensor seq_lens, int compress_ratio, int swa_page_size, int ring_size) -> Tensor");
-  m.impl("plan_compress_decode", torch::kXPU,
-         &at::native::xpu::plan_compress_decode);
+  m.impl("plan_compress_decode", torch::kXPU, &at::native::xpu::plan_compress_decode);
 }
 
 REGISTER_EXTENSION(common_ops)

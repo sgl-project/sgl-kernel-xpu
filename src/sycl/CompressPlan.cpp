@@ -70,15 +70,14 @@ struct CompressDecodeKernel {
 inline sycl::nd_range<1> get_1d_range(int32_t size) {
   constexpr int32_t local_size = 256;
   return sycl::nd_range<1>(
-      sycl::range<1>((size + local_size - 1) / local_size * local_size),
-      sycl::range<1>(local_size));
+      sycl::range<1>((size + local_size - 1) / local_size * local_size), sycl::range<1>(local_size));
 }
 
 // XPU wrapper for plan_compress_decode
 torch::Tensor plan_compress_decode(
     torch::Tensor req_pool_indices,
     torch::Tensor req_to_token,
-  torch::Tensor full_to_state,
+    torch::Tensor full_to_state,
     torch::Tensor seq_lens,
     int64_t compress_ratio,
     int64_t swa_page_size,
@@ -97,8 +96,7 @@ torch::Tensor plan_compress_decode(
   }
 
   int64_t req_to_token_stride = req_to_token.stride(0);
-  auto output = torch::empty(
-      {batch_size, 16}, req_pool_indices.options().dtype(torch::kUInt8));
+  auto output = torch::empty({batch_size, 16}, req_pool_indices.options().dtype(torch::kUInt8));
   auto output_i32 = reinterpret_cast<int32_t*>(output.data_ptr<uint8_t>());
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();

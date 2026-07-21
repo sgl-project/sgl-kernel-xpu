@@ -246,7 +246,7 @@ def plan_compress_decode(
         req_pool_indices,
         req_to_token,
         full_to_state,
-        seq_lens.to(torch.int32),
+        seq_lens,
         compress_ratio,
         swa_page_size,
         ring_size,

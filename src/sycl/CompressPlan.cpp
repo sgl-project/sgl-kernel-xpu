@@ -18,7 +18,7 @@ struct CompressDecodeKernel {
     if (idx >= batch_size_) return;
 
     int64_t rid = req_pool_indices_[idx];
-    int32_t seq_len = seq_lens_[idx];
+    int64_t seq_len = seq_lens_[idx];
     int32_t pos1 = seq_len - 1;
     int32_t pos0 = sycl::max(pos1 - compress_ratio_, 0);
 
@@ -53,7 +53,7 @@ struct CompressDecodeKernel {
   }
 
   const int64_t* req_pool_indices_;
-  const int32_t* seq_lens_;
+  const int64_t* seq_lens_;
   const int32_t* req_to_token_;
   const int64_t* full_to_state_;
   int32_t* output_i32_;
@@ -86,7 +86,7 @@ torch::Tensor plan_compress_decode(
   TORCH_CHECK(req_pool_indices.dtype() == torch::kInt64);
   TORCH_CHECK(req_to_token.dtype() == torch::kInt32);
   TORCH_CHECK(full_to_state.dtype() == torch::kInt64);
-  TORCH_CHECK(seq_lens.dtype() == torch::kInt32);
+  TORCH_CHECK(seq_lens.dtype() == torch::kInt64);
   TORCH_CHECK(req_to_token.dim() == 2, "req_to_token must be a 2D tensor");
   TORCH_CHECK(req_to_token.stride(1) == 1, "req_to_token must be contiguous in the last dim");
   TORCH_CHECK(compress_ratio > 0, "compress_ratio must be > 0");
@@ -105,7 +105,7 @@ torch::Tensor plan_compress_decode(
   queue.submit([&](sycl::handler& cgh) {
     CompressPlanImpl::CompressDecodeKernel kernel{
         req_pool_indices.data_ptr<int64_t>(),
-        seq_lens.data_ptr<int32_t>(),
+        seq_lens.data_ptr<int64_t>(),
         req_to_token.data_ptr<int32_t>(),
         full_to_state.data_ptr<int64_t>(),
         output_i32,

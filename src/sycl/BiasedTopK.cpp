@@ -32,7 +32,7 @@ static inline float compute_score(float x) {
   if constexpr (kScoringFunc == ScoringFunc::kSigmoid) {
     return 1.0f / (1.0f + sycl::native::exp(-x));
   } else {
-    return sycl::native::sqrt(sycl::native::log(1.0f + sycl::native::exp(x)));
+    return sycl::native::sqrt(sycl::log1p(sycl::native::exp(x)));
   }
 }
 

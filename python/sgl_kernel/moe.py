@@ -157,9 +157,10 @@ def biased_topk(
     apply_routed_scaling_factor_on_output=False,
 ):
     scoring_func_int = _MOE_SCORING_FUNC_MAP.get(scoring_func.lower())
-    assert (
-        scoring_func_int is not None
-    ), f"Unknown scoring_func '{scoring_func}', must be one of {list(_MOE_SCORING_FUNC_MAP.keys())}"
+    if scoring_func_int is None or scoring_func_int == _MOE_SCORING_FUNC_MAP["softmax"]:
+        raise ValueError(
+            f"Unknown/unsupported scoring_func '{scoring_func}', must be one of ['sigmoid', 'sqrtsoftplus']"
+        )
 
     torch.ops.sgl_kernel.biased_topk.default(
         input_tensor,

@@ -1251,9 +1251,6 @@ std::vector<at::Tensor> mha_fwd(
   int64_t batch_size = cu_seqlens_q.size(0) - 1;
   TORCH_CHECK(batch_size >= 0, "cu_seqlens_q must have at least 1 element.");
 
-  auto seqlens_q = cu_seqlens_q.slice(0, 1, batch_size + 1).sub(cu_seqlens_q.slice(0, 0, batch_size));
-  auto is_prefill = seqlens_q.gt(1).contiguous();  // true for prefill batches
-
   // Forward every shared argument to a sub-kernel, overriding only the output
   // tensor (out_opt) and the per-batch skip mask.
   auto launch = [&](auto&& fn, std::optional<at::Tensor> out_opt, std::optional<at::Tensor> skip_mask) {
@@ -1289,6 +1286,15 @@ std::vector<at::Tensor> mha_fwd(
         std::move(out_opt),
         std::move(skip_mask));
   };
+
+  if (batch_size == 1 && max_seqlen_q > 1) {
+    auto out = launch(prefill::mha_fwd, std::move(out_), std::nullopt)[0];
+    auto empty_f = at::empty({0}, q.options().dtype(at::kFloat));
+    return {out, empty_f, empty_f, empty_f};
+  }
+
+  auto seqlens_q = cu_seqlens_q.slice(0, 1, batch_size + 1).sub(cu_seqlens_q.slice(0, 0, batch_size));
+  auto is_prefill = seqlens_q.gt(1).contiguous();  // true for prefill batches
 
   // Launch 1: decode allocates the shared output (or reuses the caller-provided
   // out_ buffer) and skips prefill batches.

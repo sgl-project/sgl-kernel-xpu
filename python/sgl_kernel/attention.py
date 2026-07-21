@@ -302,8 +302,8 @@ def flash_mla_with_kvcache(
             is_fp8_kvcache
         ), "sparse decode path requires is_fp8_kvcache=True (fp8-packed k_cache)"
         assert (
-            k_cache.dtype == torch.uint8
-        ), f"sparse decode k_cache must be uint8 fp8-packed cache, got {k_cache.dtype}"
+            k_cache.dtype == torch.float8_e4m3fn
+        ), f"sparse decode k_cache must be float8_e4m3fn packed storage, got {k_cache.dtype}"
         if topk_length is not None:
             assert (
                 topk_length.device == q.device

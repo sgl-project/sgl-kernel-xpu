@@ -138,8 +138,8 @@ def test_flash_mla_sparse_prefill_fwd(
     torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
 
-    # No-lse path returns just the output.
-    out_only = flash_mla_sparse_prefill(
+    # No-lse path returns (out, None, None).
+    out_only, max_logits_none, lse_none = flash_mla_sparse_prefill(
         q,
         kv,
         indices,
@@ -149,6 +149,8 @@ def test_flash_mla_sparse_prefill_fwd(
         topk_length=topk_length,
         return_softmax_lse=False,
     )
+    assert max_logits_none is None
+    assert lse_none is None
     torch.testing.assert_close(out_only, ref_out, atol=1e-2, rtol=1e-2)
 
 

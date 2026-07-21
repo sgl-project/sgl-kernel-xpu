@@ -117,8 +117,21 @@ std::vector<at::Tensor> flash_mla_sparse_decode_impl(
   at::Tensor out_tensor = torch::empty({b, s_q, h_q, d_v}, out_opts);
   at::Tensor lse = torch::empty({b, s_q, h_q}, q.options().dtype(torch::kFloat));
   const int gathered_topk = topk + extra_topk;
-  at::Tensor gathered_k = torch::empty({b, s_q, gathered_topk, d_qk}, out_opts);
-  at::Tensor gathered_valid_mask = torch::empty({b, s_q, gathered_topk}, q.options().dtype(torch::kInt32));
+
+  // Chunk gathered_k along the batch dim to bound peak device memory. The gather
+  // stage materializes a dense [chunk_b, s_q, gathered_topk, d_qk] bf16 workspace;
+  // without a cap it grows linearly with b*s_q*topk and can OOM at large batch.
+  // Use a loose cap so typical decode shapes stay a single launch and only
+  // pathologically large batch*topk get split across launches.
+  constexpr int64_t DECODE_GATHERED_K_MAX_BYTES = 512LL * 1024 * 1024;
+  const int64_t per_batch_gathered_bytes = static_cast<int64_t>(s_q) * gathered_topk * d_qk * 2;  // bf16 = 2 bytes
+  int chunk_b = per_batch_gathered_bytes > 0
+                    ? static_cast<int>(std::max<int64_t>(1, DECODE_GATHERED_K_MAX_BYTES / per_batch_gathered_bytes))
+                    : b;
+  chunk_b = std::min(chunk_b, b);
+
+  at::Tensor gathered_k = torch::empty({chunk_b, s_q, gathered_topk, d_qk}, out_opts);
+  at::Tensor gathered_valid_mask = torch::empty({chunk_b, s_q, gathered_topk}, q.options().dtype(torch::kInt32));
 
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = q.device().index();
@@ -193,11 +206,33 @@ std::vector<at::Tensor> flash_mla_sparse_decode_impl(
   params.num_sm = hw_info.sm_count;
   params.queue = at::xpu::getCurrentXPUStream().queue();
 
-  DISPATCH_BOOLEAN_FLAG(have_topk_length, HAVE_TOPK_LENGTH, [&] {
-    DISPATCH_BOOLEAN_FLAG(is_fp8_query, IS_FP8_QUERY, [&] {
-      launch_sparse_mla_decode_fp8_fwd_kernel<512, HAVE_TOPK_LENGTH, IS_FP8_QUERY>(params);
+  // Process the batch in chunks of chunk_b so the gather workspace stays bounded.
+  // Per chunk we re-base the batched input/output pointers (slicing preserves
+  // strides) and reuse the same gathered_k/gathered_valid_mask workspace, whose
+  // batch stride was sized for chunk_b.
+  for (int b0 = 0; b0 < b; b0 += chunk_b) {
+    const int cb = std::min(chunk_b, b - b0);
+    params.b = cb;
+    params.q = q.slice(0, b0, b0 + cb).data_ptr();
+    params.indices = reinterpret_cast<int*>(indices.slice(0, b0, b0 + cb).data_ptr());
+    params.out = reinterpret_cast<cutlass::bfloat16_t*>(out_tensor.slice(0, b0, b0 + cb).data_ptr());
+    params.lse = reinterpret_cast<float*>(lse.slice(0, b0, b0 + cb).data_ptr());
+    if (topk_length.has_value()) {
+      params.topk_length = reinterpret_cast<int*>(topk_length.value().slice(0, b0, b0 + cb).data_ptr());
+    }
+    if (extra_indices.has_value()) {
+      params.extra_indices = reinterpret_cast<int*>(extra_indices.value().slice(0, b0, b0 + cb).data_ptr());
+    }
+    if (extra_topk_length.has_value()) {
+      params.extra_topk_length = reinterpret_cast<int*>(extra_topk_length.value().slice(0, b0, b0 + cb).data_ptr());
+    }
+
+    DISPATCH_BOOLEAN_FLAG(have_topk_length, HAVE_TOPK_LENGTH, [&] {
+      DISPATCH_BOOLEAN_FLAG(is_fp8_query, IS_FP8_QUERY, [&] {
+        launch_sparse_mla_decode_fp8_fwd_kernel<512, HAVE_TOPK_LENGTH, IS_FP8_QUERY>(params);
+      });
     });
-  });
+  }
 
   if (return_softmax_lse) {
     return std::vector<at::Tensor>{out_tensor, lse};

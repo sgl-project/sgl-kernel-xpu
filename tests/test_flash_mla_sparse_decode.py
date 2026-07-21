@@ -258,3 +258,7 @@ def test_flash_mla_sparse_decode_fp8_kvcache(
     assert lse.shape == (b, s_q, h_q)
     torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

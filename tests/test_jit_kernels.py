@@ -18,11 +18,11 @@ except ImportError:
 try:
     from sgl_kernel.jit import apply_rope_inplace as jit_rope
     from sgl_kernel.jit import fused_inplace_qknorm as jit_qknorm
+    from sgl_kernel.jit import gelu_and_mul as jit_gelu_and_mul
+    from sgl_kernel.jit import gelu_tanh_and_mul as jit_gelu_tanh_and_mul
     from sgl_kernel.jit import (
         per_token_group_quant_8bit_v2 as jit_per_token_group_quant_8bit_v2,
     )
-    from sgl_kernel.jit import gelu_and_mul as jit_gelu_and_mul
-    from sgl_kernel.jit import gelu_tanh_and_mul as jit_gelu_tanh_and_mul
     from sgl_kernel.jit import rmsnorm as jit_rmsnorm
     from sgl_kernel.jit import silu_and_mul as jit_silu_and_mul
     from sgl_kernel.jit import timestep_embedding as jit_timestep_embedding
@@ -353,6 +353,7 @@ def test_per_token_group_quant_8bit_v2_jit_vs_aot(
         torch.testing.assert_close(
             dq(q_jit, s_jit), dq(q_aot, s_aot), rtol=1e-1, atol=1e-1
         )
+
 
 def _reference_act_and_mul(op_name: str, x: torch.Tensor) -> torch.Tensor:
     """PyTorch reference for the fused gated activations (fp32 compute)."""

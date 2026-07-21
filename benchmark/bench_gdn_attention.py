@@ -168,40 +168,167 @@ def make_inputs(mode: str, batch_size: int, seqlen: int, dtype: torch.dtype):
 
 
 # ── FLOPs / bytes models ─────────────────────────────────────────────────────
+#
+# Ported from LMProj, which model each piece of the GDN pipeline as a separate
+# graph node (conv1d+SiLU, Q/K L2-norm, GDNAttentionNode core).
+# Two adjustments for how fusion changes memory traffic:
+#   - L2-norm's read/write is NOT separate HBM traffic here (Q/K stay in
+#     registers between conv and the delta-rule GEMMs), so we add its FLOPs
+#     but not extra bytes.
+#   - conv1d's output (post-conv, pre-gate activations) likewise never
+#     round-trips through HBM; only its persistent conv_state does.
+
+GDN_CHUNK_SIZE = 64  # matches FLA's chunk-wise prefill kernel default
 
 
-def estimate_flops(n_tok: int, batch_size: int) -> int:
-    """Approximate arithmetic FLOPs for one GDN forward pass.
+def _gdn_decode_flops(batch: int) -> int:
+    """GDN core delta-rule FLOPs for one decode step (batch tokens), assuming
+    pre-normalized Q/K. Mirrors ``lmproj.ir.nodes.gdn_decode_flops``: 3 small
+    GEMMs (v_predict, state update, output) + gating/elementwise (softplus,
+    sigmoid, state decay, etc.)."""
+    hk, hv, qk_d, v_d = NK, NV, HK, HV
+    gemm_ops = batch * hv * (2 * v_d * qk_d) * 3  # v_predict, S_delta, output
+    non_gemm_ops = (
+        batch * hk * qk_d  # scale query
+        + batch * hv  # x = a + dt_bias
+        + batch * hv * 3  # softplus
+        + hv * 2
+        + batch * hv  # g = -exp(A_log) * softplus_x
+        + batch * hv  # alpha = exp(g)
+        + batch * hv  # beta = sigmoid(b)
+        + batch * hv * v_d * qk_d  # S *= alpha
+        + batch * hv * v_d  # v_error = v - v_predict
+        + batch * hv * v_d  # v_error *= beta
+        + batch * hv * v_d * qk_d  # S += S_delta
+    )
+    return gemm_ops + non_gemm_ops
 
-    Two main contributions:
-      (1) causal_conv1d: 2 · T · qkv_dim · width  (width multiply-accumulates per output)
-      (2) delta rule:    T · (7 · nv · hv · hk + 2 · nv · hv)
-                         ≈ T · (state GEMM + output GEMM + gating)
-    The factor 7 follows the vLLM-XPU benchmark and covers KKᵀ, WU-decomposition,
-    inter-chunk state update, and output projection.
+
+def _gdn_prefill_flops(
+    batch: int, seq_len: int, chunk_size: int = GDN_CHUNK_SIZE
+) -> int:
+    """GDN core delta-rule FLOPs for a chunk-wise prefill, assuming
+    pre-normalized Q/K. Mirrors
+    ``lmproj.ir.nodes.gdn_prefill_flops_breakdown``: per chunk of
+    ``chunk_size`` tokens, 8 intra/inter-chunk GEMMs (build decay matrix,
+    triangular solve, pseudo U/W, state scan, inter+intra output) plus the
+    elementwise ops (decay masks, exp, cumsum) around them. Grid is over
+    V-heads (gates are per-V-head), so every term scales with ``NV``.
     """
-    conv_flops = 2 * n_tok * QKV_DIM * W
-    delta_flops = n_tok * (7 * NV * HV * HK + 2 * NV * HV)
-    return conv_flops + delta_flops
+    Kd, Vd = HK, HV
+    C = chunk_size
+    n_chunks = max(1, (seq_len + C - 1) // C)
+
+    gemm_per_chunk = (
+        2 * C * Kd * C  # build A:      K K^T
+        + 2 * C * C * Vd  # pseudo U:     T (beta V)
+        + 2 * C * C * Kd  # pseudo W:     T (beta exp(gamma) K)
+        + 2 * C * Kd * Vd  # scan:         W S^T
+        + 2 * Kd * C * Vd  # scan:         S += K^T V_new
+        + 2 * C * Kd * Vd  # output inter: (exp(gamma) Q) S^T
+        + 2 * C * Kd * C  # output intra: Q K^T
+        + 2 * C * C * Vd  # output intra: tril(...) V_new
+    )
+    solve_flops_per_chunk = (2.0 / 3.0) * C**3  # tri-solve T = (I+A)^-1
+
+    non_gemm_per_chunk = (
+        C  # cumsum(g)
+        + 5 * C * C  # build A: sub + exp + decay-mul + beta-mul + tril-mask
+        + C  # exp(gamma) for chunk
+        + C * Vd  # beta ⊙ V
+        + 2 * C * Kd  # beta ⊙ K, * exp(gamma)
+        + C * Vd  # V_new = U - W S^T
+        + 2 * C  # decay-normalize factor
+        + C * Vd  # V_new *= decay
+        + 2 * Kd * Vd  # S *= decay, S += K^T V_new
+        + C  # exp(gamma) q-rows
+        + C * Vd  # o *= exp(gamma)
+        + 3 * C * C  # sub + exp + decay-mul (intra)
+        + C * C  # tril mask (intra)
+        + 3 * C * Vd  # o*scale + intra*scale
+    )
+
+    gemm_flops = batch * NV * n_chunks * (gemm_per_chunk + solve_flops_per_chunk)
+    non_gemm_flops = batch * NV * n_chunks * non_gemm_per_chunk
+    return int(gemm_flops + non_gemm_flops)
 
 
-def estimate_bytes(n_tok: int, batch_size: int, bpe: int, bpe_ssm: int = 4) -> int:
-    """Approximate bytes moved for one GDN forward pass.
+def estimate_flops(
+    mode: str,
+    n_tok: int,
+    batch_size: int,
+    seqlen: int,
+    chunk_size: int = GDN_CHUNK_SIZE,
+) -> int:
+    """Approximate arithmetic FLOPs for one fused GDN forward pass.
+
+    (1) causal_conv1d + SiLU: ``2·T·qkv_dim·width`` (MAC per tap) +
+        ``4·T·qkv_dim`` (SiLU), matching ``CausalConv1DNode``.
+    (2) Q/K L2-norm: ``2 · 3·T·(nk·hk)``, matching ``L2NormNode`` (applied
+        once each to Q and K).
+    (3) delta-rule core: chunk-wise GEMM+solve+elementwise for prefill
+        (``_gdn_prefill_flops``, matches ``gdn_prefill_flops_breakdown``)
+        or the single-step recurrent update for decode
+        (``_gdn_decode_flops``, matches ``gdn_decode_flops``).
+    """
+    conv_flops = 2 * n_tok * QKV_DIM * W + 4 * n_tok * QKV_DIM
+    l2norm_flops = 2 * (3 * n_tok * NK * HK)
+    if mode == "decode":
+        core_flops = _gdn_decode_flops(batch_size)
+    elif mode == "prefill":
+        core_flops = _gdn_prefill_flops(batch_size, seqlen, chunk_size)
+    else:
+        raise ValueError(f"Unknown mode: {mode!r}")
+    return conv_flops + l2norm_flops + core_flops
+
+
+def estimate_bytes(
+    mode: str,
+    n_tok: int,
+    batch_size: int,
+    seqlen: int,
+    bpe: int,
+    bpe_ssm: int = 4,
+    chunk_size: int = GDN_CHUNK_SIZE,
+) -> int:
+    """Approximate bytes moved for one fused GDN forward pass.
 
     Accounts for:
-      • Input read : qkvz + ba  (n_tok tokens)
+      • Input read : qkvz + ba  (n_tok tokens; includes the Q/K/V/Z + a/b
+        slices — L2-norm and conv don't add extra HBM traffic since they're
+        fused in registers between the input read and the core kernel)
       • Output write: core_attn_out + z  (n_tok tokens)
-      • Conv state  : R + W  (batch × (W-1) × qkv_dim)
-      • SSM state   : R + W  (batch × nv × hv × hk, float32)
-      • Conv weights + bias (loaded once; small vs state at large batch)
+      • Conv state  : R + W  (batch × (W-1) × qkv_dim), once per call
+      • Conv weights + bias (loaded once)
+      • A_log/dt_bias gate weights (loaded once per token-batch)
+      • SSM state   : R + W, float32. For decode this happens once per call
+        (one step). For prefill the chunk-wise algorithm reads/writes the
+        recurrent state once per **chunk boundary**, not once per call —
+        ``n_chunks = ceil(seqlen / chunk_size)`` round-trips per sequence,
+        matching ``proj_gdn_prefill_latency_s``.
     """
     input_bytes = n_tok * (QKVZ_DIM + BA_DIM) * bpe
     output_bytes = n_tok * NV * HV * bpe * 2  # core_out + z
     conv_state_bytes = batch_size * (W - 1) * QKV_DIM * bpe * 2  # R + W
-    ssm_state_bytes = batch_size * NV * HV * HK * bpe_ssm * 2  # R + W (fp32)
-    weight_bytes = (QKV_DIM * W + QKV_DIM) * bpe  # weights + bias
+    conv_weight_bytes = (QKV_DIM * W + QKV_DIM) * bpe  # weights + bias
+    gate_weight_bytes = NV * 2 * 4  # A_log (fp32) + dt_bias, loaded once
+
+    if mode == "decode":
+        n_chunks = 1
+    elif mode == "prefill":
+        n_chunks = max(1, (seqlen + chunk_size - 1) // chunk_size)
+    else:
+        raise ValueError(f"Unknown mode: {mode!r}")
+    state_bytes_per_roundtrip = NV * HV * HK * bpe_ssm
+    ssm_state_bytes = batch_size * n_chunks * state_bytes_per_roundtrip * 2  # R + W
+
     return (
-        input_bytes + output_bytes + conv_state_bytes + ssm_state_bytes + weight_bytes
+        input_bytes
+        + output_bytes
+        + conv_state_bytes
+        + ssm_state_bytes
+        + conv_weight_bytes
+        + gate_weight_bytes
     )
 
 
@@ -467,8 +594,8 @@ def main():
         n_tok = meta["n_tok"]
         name = f"{mode}_b{bs}" + (f"_s{sl}" if mode == "prefill" else "")
 
-        flops = estimate_flops(n_tok, bs)
-        nbytes = estimate_bytes(n_tok, bs, bpe, bpe_ssm)
+        flops = estimate_flops(mode, n_tok, bs, sl)
+        nbytes = estimate_bytes(mode, n_tok, bs, sl, bpe, bpe_ssm)
 
         # ── SYCL timing ──────────────────────────────────────────────────────
         conv0 = kwargs["conv_state"].clone()
@@ -553,11 +680,18 @@ def main():
     print()
     print("Notes:")
     print(f"  BW (GB/s) = bytes_moved / time, bytes_moved accounts for qkvz/ba input,")
+    print(f"    core_attn_out+z output, conv_state R+W, conv/gate weights,")
+    print(f"    and ssm_state R+W -- once per call for decode, once per chunk")
+    print(f"    (chunk_size={GDN_CHUNK_SIZE}) boundary for prefill.")
     print(
-        f"    core_attn_out+z output, conv_state R+W, ssm_state R+W, conv weights/bias."
+        f"  TFLOPS = conv1d+SiLU + Q/K L2-norm + delta-rule core. Prefill includes the"
     )
-    print(f"  TFLOPS = (2·T·{QKV_DIM}·{W} + T·(7·{NV}·{HV}·{HK}+2·{NV}·{HV})) / time")
-    print(f"    (conv FLOPs + delta-rule GEMMs; same denominator for SYCL and Triton).")
+    print(
+        f"    O(chunk_size^2) intra-chunk GEMMs (build/solve/output) per {GDN_CHUNK_SIZE}-token chunk;"
+    )
+    print(
+        f"    decode is the single-step recurrent update. Same denominator for SYCL and Triton."
+    )
     if compare:
         print(f"  speedup = Triton_time / SYCL_time  (>1 means SYCL is faster).")
         print()

@@ -93,8 +93,7 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       vec_in v;
       v.load(
           0,
-          sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(
-              probs + row_offset + i * kVecSize));
+          sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(probs + row_offset + i * kVecSize));
 #pragma unroll
       for (uint32_t j = 0; j < kVecSize; ++j) {
         thread_max = sycl::max(thread_max, static_cast<float>(v[j]));
@@ -107,12 +106,21 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const float pivot = p * row_max;
 
     float thread_sum = 0.0f;
-    for (uint32_t i = 0; i < num_chunks; ++i) {
-      const uint32_t col = i * kWgSize + tx;
-      if (col < d) {
-        const float x = static_cast<float>(probs[row_offset + col]);
-        if (x >= pivot) thread_sum += x;
-      }
+    const uint32_t n_valid = (tx < d) ? ((d - tx - 1) / kWgSize + 1) : 0;
+    uint32_t i = 0;
+    for (; i + 4 <= n_valid; i += 4) {
+      const float a = static_cast<float>(probs[row_offset + (i + 0) * kWgSize + tx]);
+      const float b = static_cast<float>(probs[row_offset + (i + 1) * kWgSize + tx]);
+      const float c = static_cast<float>(probs[row_offset + (i + 2) * kWgSize + tx]);
+      const float e = static_cast<float>(probs[row_offset + (i + 3) * kWgSize + tx]);
+      if (a >= pivot) thread_sum += a;
+      if (b >= pivot) thread_sum += b;
+      if (c >= pivot) thread_sum += c;
+      if (e >= pivot) thread_sum += e;
+    }
+    for (; i < n_valid; ++i) {
+      const float x = static_cast<float>(probs[row_offset + i * kWgSize + tx]);
+      if (x >= pivot) thread_sum += x;
     }
     const float q = sycl::reduce_over_group(grp, thread_sum, sycl::plus<float>());
 

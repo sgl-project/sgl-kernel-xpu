@@ -189,11 +189,14 @@ def torch_min_p_sampling(batch_size, vocab_size, p, normalized_prob):
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
-def test_min_p_sampling(batch_size, vocab_size, p):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_min_p_sampling(batch_size, vocab_size, p, dtype):
     torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device=f"{device}:0")
+    pre_norm_prob = torch.rand(
+        batch_size, vocab_size, device=f"{device}:0", dtype=dtype
+    )
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
-    mask = torch_min_p_sampling(batch_size, vocab_size, p, normalized_prob)
+    mask = torch_min_p_sampling(batch_size, vocab_size, p, normalized_prob.float())
 
     num_trails = 1000
     for _ in range(num_trails):
@@ -210,15 +213,19 @@ def test_min_p_sampling(batch_size, vocab_size, p):
 @pytest.mark.parametrize("batch_size", [1, 16, 128])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p_range", [(0.05, 0.2), (0.2, 0.7)])
-def test_min_p_sampling_array(batch_size, vocab_size, p_range):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_min_p_sampling_array(batch_size, vocab_size, p_range, dtype):
     p_min, p_max = p_range
     torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device=f"{device}:0")
+    pre_norm_prob = torch.rand(
+        batch_size, vocab_size, device=f"{device}:0", dtype=dtype
+    )
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
 
-    # Per-row min-p array with varied values
     min_p_arr = torch.empty(batch_size, device=f"{device}:0").uniform_(p_min, p_max)
-    mask = torch_min_p_sampling(batch_size, vocab_size, min_p_arr, normalized_prob)
+    mask = torch_min_p_sampling(
+        batch_size, vocab_size, min_p_arr, normalized_prob.float()
+    )
 
     num_trails = 1000
     for _ in range(num_trails):

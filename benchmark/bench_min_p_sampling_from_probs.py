@@ -8,15 +8,16 @@ from sgl_kernel import min_p_sampling_from_probs
 batch_size_range = [989, 99, 1]
 vocab_size_range = [128256, 32000, 1024]
 min_p_range = [0.05, 0.1, 0.5]
+dtype_range = [torch.float32, torch.float16, torch.bfloat16]
 
-configs = list(product(batch_size_range, vocab_size_range, min_p_range))
+configs = list(product(batch_size_range, vocab_size_range, min_p_range, dtype_range))
 
 all_results = []
 
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["batch_size", "vocab_size", "min_p"],
+        x_names=["batch_size", "vocab_size", "min_p", "dtype"],
         x_vals=configs,
         line_arg="provider",
         line_vals=["sgl_kernel"],
@@ -27,11 +28,10 @@ all_results = []
         args={},
     )
 )
-def benchmark(batch_size, vocab_size, min_p, provider):
+def benchmark(batch_size, vocab_size, min_p, dtype, provider):
     print(
-        f"benchmark {provider} with batch_size={batch_size} vocab_size={vocab_size} min_p={min_p}"
+        f"benchmark {provider} with batch_size={batch_size} vocab_size={vocab_size} min_p={min_p} dtype={dtype}"
     )
-    dtype = torch.float32
     torch.set_default_device("xpu")
     torch.xpu.manual_seed_all(42)
 
@@ -69,6 +69,7 @@ def benchmark(batch_size, vocab_size, min_p, provider):
             "batch_size": batch_size,
             "vocab_size": vocab_size,
             "min_p": min_p,
+            "dtype": str(dtype),
             "provider": provider,
             "bandwidth_gb_s": bandwidth_gb_s,
             "ms": ms,

@@ -311,7 +311,6 @@ def _min_p_sampling_from_probs_internal(
     generator: Optional[torch.Generator],
 ) -> torch.Tensor:
     with probs.device as device:
-        probs = probs.float()
         maybe_min_p_arr = (
             maybe_min_p_arr.float() if maybe_min_p_arr is not None else None
         )

@@ -11,19 +11,29 @@
 #include "Utils.h"
 #include "comm/Random.h"
 
-namespace {
+template <typename T>
+struct ToSyclElementType {
+  using type = T;
+};
+
+template <>
+struct ToSyclElementType<at::Half> {
+  using type = sycl::half;
+};
+
+template <>
+struct ToSyclElementType<at::BFloat16> {
+  using type = sycl::ext::oneapi::bfloat16;
+};
 
 //----------------- min-p rejection sampling --------------------//
-// One work-group processes one request row. Threshold = min_p * row_max, no
-// pivot search rounds needed (unlike top-k/top-p, min_p's cutoff is known in
-// closed form). Draw u, then walk the row to find the index where the
-// cumulative sum of retained (>= pivot) probs first crosses u. Mirrors the
-// flashinfer MinPSamplingFromProbKernel.
+// One work-group processes one request row.
 
+template <typename DType>
 struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr uint32_t kWgSize = 1024;
 
-  const float* probs;
+  const DType* probs;
   int32_t* output;
   const int64_t* maybe_indices;
   const float* maybe_min_p_arr;
@@ -33,8 +43,8 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   uint64_t philox_seed;
   uint64_t philox_offset;
 
-  sycl::local_accessor<int32_t, 1> shared_ids_;    // [0]=sampled_id, [1]=last_valid_id
-  sycl::local_accessor<float, 1> shared_scalars_;  // [0]=pivot, [1]=q (normalizing mass)
+  sycl::local_accessor<int32_t, 1> shared_ids_;
+  sycl::local_accessor<float, 1> shared_scalars_;
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
     shared_ids_ = sycl::local_accessor<int32_t, 1>(sycl::range<1>(2), cgh);
@@ -42,7 +52,7 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   }
 
   MinPSamplingKernel(
-      const float* probs,
+      const DType* probs,
       int32_t* output,
       const int64_t* maybe_indices,
       const float* maybe_min_p_arr,
@@ -75,12 +85,11 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const float p = (maybe_min_p_arr != nullptr) ? maybe_min_p_arr[row_idx] : min_p_val;
     const uint32_t num_chunks = (d + kWgSize - 1) / kWgSize;
 
-    // --- pass 1: row max ---
     float thread_max = -std::numeric_limits<float>::infinity();
     for (uint32_t i = 0; i < num_chunks; ++i) {
       const uint32_t col = i * kWgSize + tx;
       if (col < d) {
-        thread_max = sycl::max(thread_max, probs[row_offset + col]);
+        thread_max = sycl::max(thread_max, static_cast<float>(probs[row_offset + col]));
       }
     }
     const float row_max = sycl::reduce_over_group(grp, thread_max, sycl::maximum<float>());
@@ -89,31 +98,29 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     if (tx == 0) shared_scalars_[0] = pivot;
     item.barrier(sycl::access::fence_space::local_space);
 
-    // --- pass 2: normalizing mass q over retained (>= pivot) entries ---
     float thread_sum = 0.0f;
     for (uint32_t i = 0; i < num_chunks; ++i) {
       const uint32_t col = i * kWgSize + tx;
       if (col < d) {
-        const float x = probs[row_offset + col];
+        const float x = static_cast<float>(probs[row_offset + col]);
         if (x >= pivot) thread_sum += x;
       }
     }
     const float q = sycl::reduce_over_group(grp, thread_sum, sycl::plus<float>());
 
     if (tx == 0) {
-      shared_ids_[0] = static_cast<int32_t>(d);  // sampled_id sentinel
-      shared_ids_[1] = -1;                       // last_valid_id
+      shared_ids_[0] = static_cast<int32_t>(d);
+      shared_ids_[1] = -1;
     }
     item.barrier(sycl::access::fence_space::local_space);
 
     const float u = sgl::random::philox_uniform(philox_seed, philox_offset, bx, /*round=*/0) * q;
 
-    // --- pass 3: locate the crossing index ---
     float aggregate = 0.0f;
     for (uint32_t i = 0; i < num_chunks; ++i) {
       const uint32_t col = i * kWgSize + tx;
       const bool inb = col < d;
-      const float x = inb ? probs[row_offset + col] : 0.0f;
+      const float x = inb ? static_cast<float>(probs[row_offset + col]) : 0.0f;
       const bool keep = inb && (x >= pivot);
       const float pgt = keep ? x : 0.0f;
 
@@ -148,8 +155,6 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     if (tx == 0) {
       int32_t sampled_id = shared_ids_[0];
       if (sampled_id == static_cast<int32_t>(d)) {
-        // u fell beyond the retained mass (floating-point rounding); fall
-        // back to the last retained index.
         sampled_id = shared_ids_[1];
       }
       output[bx] = (sampled_id == -1) ? 0 : sampled_id;
@@ -157,8 +162,9 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   }
 };
 
+template <typename TensorDType>
 void launch_min_p_sampling(
-    const float* probs,
+    at::Tensor probs,
     int32_t* output,
     const int64_t* maybe_indices,
     const float* maybe_min_p_arr,
@@ -168,16 +174,18 @@ void launch_min_p_sampling(
     uint64_t philox_seed,
     uint64_t philox_offset,
     sycl::queue& queue) {
+  using KernelDType = typename ToSyclElementType<TensorDType>::type;
+
+  const KernelDType* probs_ptr = reinterpret_cast<const KernelDType*>(probs.data_ptr<TensorDType>());
+
   const int local_size = 1024;
   const int global_size = batch_size * local_size;
 
-  auto kernel = MinPSamplingKernel(
-      probs, output, maybe_indices, maybe_min_p_arr, min_p_val, batch_size, vocab_size, philox_seed, philox_offset);
+  auto kernel = MinPSamplingKernel<KernelDType>(
+      probs_ptr, output, maybe_indices, maybe_min_p_arr, min_p_val, batch_size, vocab_size, philox_seed, philox_offset);
 
   sycl_kernel_submit(global_size, local_size, queue, kernel);
 }
-
-}  // namespace
 
 void min_p_sampling_from_probs(
     at::Tensor probs,
@@ -190,7 +198,10 @@ void min_p_sampling_from_probs(
   CHECK_INPUT(probs);
   CHECK_INPUT(output);
   TORCH_CHECK(probs.dim() == 2, "probs must be a 2D tensor [batch_size, vocab_size]");
-  TORCH_CHECK(probs.scalar_type() == torch::kFloat32, "probs must be float32");
+  TORCH_CHECK(
+      probs.scalar_type() == torch::kFloat32 || probs.scalar_type() == torch::kHalf ||
+          probs.scalar_type() == torch::kBFloat16,
+      "probs must be float32, float16, or bfloat16");
   TORCH_CHECK(output.dim() == 1, "output must be a 1D tensor [batch_size]");
   TORCH_CHECK(output.scalar_type() == torch::kInt32, "output must be int32");
 
@@ -214,8 +225,6 @@ void min_p_sampling_from_probs(
     min_p_ptr = maybe_min_p_arr->data_ptr<float>();
   }
 
-  // Resolve the Philox seed/offset from the (default) XPU generator. Only one
-  // round is consumed per row since min_p needs no pivot-search rounds.
   auto generator = at::get_generator_or_default<at::XPUGeneratorImpl>(gen, at::xpu::detail::getDefaultXPUGenerator());
   uint64_t philox_seed, philox_offset;
   {
@@ -228,15 +237,42 @@ void min_p_sampling_from_probs(
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
 
-  launch_min_p_sampling(
-      probs.data_ptr<float>(),
-      output.data_ptr<int32_t>(),
-      indices_ptr,
-      min_p_ptr,
-      static_cast<float>(min_p_val),
-      batch_size,
-      vocab_size,
-      philox_seed,
-      philox_offset,
-      queue);
+  auto dtype = probs.scalar_type();
+  if (dtype == torch::kFloat32) {
+    launch_min_p_sampling<float>(
+        probs,
+        output.data_ptr<int32_t>(),
+        indices_ptr,
+        min_p_ptr,
+        static_cast<float>(min_p_val),
+        batch_size,
+        vocab_size,
+        philox_seed,
+        philox_offset,
+        queue);
+  } else if (dtype == torch::kHalf) {
+    launch_min_p_sampling<at::Half>(
+        probs,
+        output.data_ptr<int32_t>(),
+        indices_ptr,
+        min_p_ptr,
+        static_cast<float>(min_p_val),
+        batch_size,
+        vocab_size,
+        philox_seed,
+        philox_offset,
+        queue);
+  } else if (dtype == torch::kBFloat16) {
+    launch_min_p_sampling<at::BFloat16>(
+        probs,
+        output.data_ptr<int32_t>(),
+        indices_ptr,
+        min_p_ptr,
+        static_cast<float>(min_p_val),
+        batch_size,
+        vocab_size,
+        philox_seed,
+        philox_offset,
+        queue);
+  }
 }

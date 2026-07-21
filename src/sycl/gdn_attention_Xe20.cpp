@@ -7,4 +7,6 @@
 // compiled as separate TUs (see GdnAttnXe20.cmake).
 #define SYCL_INTEL_TARGET 20
 
-#include "kernels/gdn_attn/gdn_attn_interface_impl.hpp"
+#include "gdn_attn/gdn_attn_interface_impl.hpp"
+
+#undef SYCL_INTEL_TARGET

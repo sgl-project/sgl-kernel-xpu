@@ -64,8 +64,8 @@ struct silu_and_mul_clamp_elem_functor {
     const float up_bf16 = static_cast<float>(static_cast<bf16_t>(static_cast<float>(b)));
 
     const float gate_c = static_cast<float>(static_cast<bf16_t>(sycl::fmin(gate_bf16, limit_bf16)));
-    const float up_c = static_cast<float>(
-        static_cast<bf16_t>(sycl::fmax(-limit_bf16, sycl::fmin(up_bf16, limit_bf16))));
+    const float up_c =
+        static_cast<float>(static_cast<bf16_t>(sycl::fmax(-limit_bf16, sycl::fmin(up_bf16, limit_bf16))));
 
     return silu_mul_fn(static_cast<scalar_t>(gate_c), static_cast<scalar_t>(up_c));
   }
@@ -253,12 +253,7 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input) {
 
 template <typename T = float>
 void get_clamp_config(
-    const at::Tensor& output,
-    int64_t& numel,
-    int64_t& dim,
-    int64_t& wg_size,
-    int64_t& num_group,
-    int& vec_size) {
+    const at::Tensor& output, int64_t& numel, int64_t& dim, int64_t& wg_size, int64_t& num_group, int& vec_size) {
   auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
   int64_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
   numel = output.numel();
@@ -293,16 +288,16 @@ void silu_and_mul_clamp_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out,
   get_clamp_config<T_to>(out, numel, dim, wg_size, num_group, vec_size);
   const float limit_bf16 = static_cast<float>(static_cast<sycl::ext::oneapi::bfloat16>(limit));
 
-#define VEC_LAUNCH_CLAMP(N)                                                                                \
-  case N: {                                                                                                \
-    op_and_mul_functor<T_to, silu_and_mul_clamp_elem_functor<T_to>, N> kfn = {                           \
-        .input_ptr = _input,                                                                               \
-        .output_ptr = _out,                                                                                \
-        .num_ = numel,                                                                                     \
-        .dim = dim,                                                                                        \
-        .fn = silu_and_mul_clamp_elem_functor<T_to>{.limit_bf16 = limit_bf16}};                          \
-    sycl_kernel_submit(num_group* wg_size, wg_size, q, kfn);                                              \
-    break;                                                                                                 \
+#define VEC_LAUNCH_CLAMP(N)                                                     \
+  case N: {                                                                     \
+    op_and_mul_functor<T_to, silu_and_mul_clamp_elem_functor<T_to>, N> kfn = {  \
+        .input_ptr = _input,                                                    \
+        .output_ptr = _out,                                                     \
+        .num_ = numel,                                                          \
+        .dim = dim,                                                             \
+        .fn = silu_and_mul_clamp_elem_functor<T_to>{.limit_bf16 = limit_bf16}}; \
+    sycl_kernel_submit(num_group* wg_size, wg_size, q, kfn);                    \
+    break;                                                                      \
   }
 
   switch (vec_size) {

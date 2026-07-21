@@ -44,11 +44,9 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   uint64_t philox_offset;
 
   sycl::local_accessor<int32_t, 1> shared_ids_;
-  sycl::local_accessor<float, 1> shared_scalars_;
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
     shared_ids_ = sycl::local_accessor<int32_t, 1>(sycl::range<1>(2), cgh);
-    shared_scalars_ = sycl::local_accessor<float, 1>(sycl::range<1>(2), cgh);
   }
 
   MinPSamplingKernel(
@@ -85,18 +83,28 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const float p = (maybe_min_p_arr != nullptr) ? maybe_min_p_arr[row_idx] : min_p_val;
     const uint32_t num_chunks = (d + kWgSize - 1) / kWgSize;
 
+    constexpr uint32_t kVecSize = 4;
+    using vec_in = vec_t<DType, kVecSize>;
+    const uint32_t num_vec_elems = d / kVecSize;
+    const uint32_t vec_tail_start = num_vec_elems * kVecSize;
+
     float thread_max = -std::numeric_limits<float>::infinity();
-    for (uint32_t i = 0; i < num_chunks; ++i) {
-      const uint32_t col = i * kWgSize + tx;
-      if (col < d) {
-        thread_max = sycl::max(thread_max, static_cast<float>(probs[row_offset + col]));
+    for (uint32_t i = tx; i < num_vec_elems; i += kWgSize) {
+      vec_in v;
+      v.load(
+          0,
+          sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(
+              probs + row_offset + i * kVecSize));
+#pragma unroll
+      for (uint32_t j = 0; j < kVecSize; ++j) {
+        thread_max = sycl::max(thread_max, static_cast<float>(v[j]));
       }
+    }
+    for (uint32_t col = vec_tail_start + tx; col < d; col += kWgSize) {
+      thread_max = sycl::max(thread_max, static_cast<float>(probs[row_offset + col]));
     }
     const float row_max = sycl::reduce_over_group(grp, thread_max, sycl::maximum<float>());
     const float pivot = p * row_max;
-
-    if (tx == 0) shared_scalars_[0] = pivot;
-    item.barrier(sycl::access::fence_space::local_space);
 
     float thread_sum = 0.0f;
     for (uint32_t i = 0; i < num_chunks; ++i) {

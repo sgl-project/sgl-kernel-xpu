@@ -8,7 +8,7 @@ from sgl_kernel import min_p_sampling_from_probs
 batch_size_range = [989, 99, 1]
 vocab_size_range = [128256, 32000, 1024]
 min_p_range = [0.05, 0.1, 0.5]
-dtype_range = [torch.float32, torch.float16, torch.bfloat16]
+dtype_range = [torch.float32]
 
 configs = list(product(batch_size_range, vocab_size_range, min_p_range, dtype_range))
 

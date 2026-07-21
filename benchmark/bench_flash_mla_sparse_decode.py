@@ -23,15 +23,15 @@ HEAD_BYTES = DATA_BYTES_PER_TOKEN + SCALE_BYTES_PER_TOKEN  # 584
 BLOCK_SIZE = 64
 NUM_BLOCKS = 256  # 16384 cached tokens
 
-# (label, batch, h_q, topk, extra_topk)
+# (batch, h_q, topk, extra_topk)
 CONFIGS = [
-    ("TP=8  (16 heads) topk=2048", 64, 16, 2048, 0),
-    ("TP=4  (32 heads) topk=2048", 64, 32, 2048, 0),
-    ("TP=1 (128 heads) topk=2048", 64, 128, 2048, 0),
-    ("TP=8  (16 heads) topk=512", 128, 16, 512, 0),
-    ("TP=1 (128 heads) topk=512", 128, 128, 512, 0),
-    ("TP=8  (16 heads) topk=2048 extra=512", 64, 16, 2048, 512),
-    ("TP=1 (128 heads) topk=512 extra=512", 128, 128, 512, 512),
+    (64, 16, 2048, 0),
+    (64, 32, 2048, 0),
+    (64, 128, 2048, 0),
+    (128, 16, 512, 0),
+    (128, 128, 512, 0),
+    (64, 16, 2048, 512),
+    (128, 128, 512, 512),
 ]
 
 
@@ -142,11 +142,14 @@ def main():
         print("XPU not available")
         return
 
-    hdr = f"{'config':40s} {'ms':>9s} {'GB/s':>9s}"
+    hdr = (
+        f"{'head_q':>6s} {'batch':>6s} {'topk':>6s} {'extra':>6s} "
+        f"{'ms':>9s} {'GB/s':>9s}"
+    )
     print(hdr)
     print("-" * len(hdr))
 
-    for label, batch, h_q, topk, extra_topk in CONFIGS:
+    for batch, h_q, topk, extra_topk in CONFIGS:
         q, packed_kv, indices, extra_kv, extra_indices, extra_topk_length = (
             build_inputs(batch, h_q, topk, extra_topk)
         )
@@ -169,7 +172,10 @@ def main():
         avg_ms = bench(run_sgl)
         gbs = effective_bytes(batch, h_q, topk, extra_topk) / (avg_ms * 1e-3) / 1e9
 
-        print(f"{label:40s} {avg_ms:9.3f} {gbs:9.2f}")
+        print(
+            f"{h_q:6d} {batch:6d} {topk:6d} {extra_topk:6d} "
+            f"{avg_ms:9.3f} {gbs:9.2f}"
+        )
 
 
 if __name__ == "__main__":

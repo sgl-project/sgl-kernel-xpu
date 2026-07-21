@@ -16,13 +16,13 @@ D_V = 512
 H_KV = 1
 S_KV = 16384
 
-# (label, s_q, h_q, topk)
+# (s_q, h_q, topk)
 CONFIGS = [
-    ("TP=8  (16 heads) topk=2048", 512, 16, 2048),
-    ("TP=4  (32 heads) topk=2048", 512, 32, 2048),
-    ("TP=1 (128 heads) topk=2048", 512, 128, 2048),
-    ("TP=8  (16 heads) topk=512", 2048, 16, 512),
-    ("TP=1 (128 heads) topk=512", 2048, 128, 512),
+    (512, 16, 2048),
+    (512, 32, 2048),
+    (512, 128, 2048),
+    (2048, 16, 512),
+    (2048, 128, 512),
 ]
 
 
@@ -65,11 +65,11 @@ def main():
         print("XPU not available")
         return
 
-    hdr = f"{'config':30s} {'ms':>9s} {'GB/s':>9s}"
+    hdr = f"{'s_q':>6s} {'head_q':>6s} {'topk':>6s} " f"{'ms':>9s} {'GB/s':>9s}"
     print(hdr)
     print("-" * len(hdr))
 
-    for label, s_q, h_q, topk in CONFIGS:
+    for s_q, h_q, topk in CONFIGS:
         q, kv, indices = build_inputs(s_q, h_q, topk)
         sm_scale = D_QK**-0.5
 
@@ -82,7 +82,7 @@ def main():
         avg_ms = bench(run_sgl)
         gbs = effective_bytes(s_q, h_q, topk) / (avg_ms * 1e-3) / 1e9
 
-        print(f"{label:30s} {avg_ms:9.3f} {gbs:9.2f}")
+        print(f"{s_q:6d} {h_q:6d} {topk:6d} " f"{avg_ms:9.3f} {gbs:9.2f}")
 
 
 if __name__ == "__main__":

@@ -175,6 +175,7 @@ def get_benchmark(device: str = "xpu"):
 
 
 if __name__ == "__main__":
+    # configs from deepseek-v4
     sweep_params = {
         "num_tokens": [1, 32, 256, 1024, 8192],
         "num_experts": [256, 384],
@@ -194,5 +195,30 @@ if __name__ == "__main__":
     benchmark.run(print_data=False, show_plots=False, save_path=".")
 
     df = pd.DataFrame(all_results)
-    print("Kernel vs Triton implementation latency:")
-    print(df.to_markdown(index=False))
+    summary_key_cols = [
+        "num_tokens",
+        "num_experts",
+        "topk",
+        "dtype",
+        "scoring_func",
+        "renormalize",
+        "num_shared",
+        "scale",
+        "apply_scale",
+    ]
+    summary_df = (
+        df.pivot_table(
+            index=summary_key_cols,
+            columns="provider",
+            values="ms",
+            aggfunc="first",
+        )
+        .reset_index()
+        .rename(columns={"kernel": "sglang_kernel_ms", "triton": "triton_ms"})
+    )
+    summary_df["speedup"] = (
+        summary_df["triton_ms"] / summary_df["sglang_kernel_ms"]
+    ).map(lambda x: f"{x:.2f}")
+
+    print("Kernel vs Triton implementation latency summary:")
+    print(summary_df.to_markdown(index=False))

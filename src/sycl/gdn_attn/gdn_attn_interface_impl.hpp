@@ -8,7 +8,7 @@
 #include "chunk_causal_conv1d_tiled.hpp"
 #include "chunk_gated_delta_rule.h"
 #include "gated_delta_rule.hpp"
-#include "l2norm.h"
+#include "l2norm_kernel.hpp"
 
 void gdn_attention(
     torch::Tensor& core_attn_out,                // [num_actual_tokens, num_v_heads / tp_size,

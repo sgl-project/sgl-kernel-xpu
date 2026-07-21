@@ -38,9 +38,9 @@ _SGLANG_AVAILABLE = False
 _SGLANG_MISS_REASON = ""
 
 try:
-    from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
-    from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
+    from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
         causal_conv1d_fn,
         causal_conv1d_update,
     )
@@ -50,7 +50,7 @@ try:
             fused_sigmoid_gating_delta_rule_update,
         )
     except Exception:
-        from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+        from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
             fused_sigmoid_gating_delta_rule_update,
         )
 

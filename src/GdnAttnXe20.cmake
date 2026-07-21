@@ -4,5 +4,4 @@
 # live in a subdir and are added to the Xe20 source list explicitly so they
 # compile with -device bmg.
 list(APPEND device_cpp_xe20
-    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/gdn_attn/chunk_gated_delta_rule.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/gdn_attn/l2norm.cpp")
+    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/gdn_attn/chunk_gated_delta_rule.cpp")

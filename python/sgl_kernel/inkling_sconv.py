@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from typing import Optional, TypedDict
-
 import importlib
+from typing import Optional, TypedDict
 
 import torch
 
@@ -61,7 +60,9 @@ def _ensure_ops_registered() -> None:
             "inkling_sconv_ops extension before calling sgl_kernel.inkling_sconv."
         ) from exc
     if not _ops_registered():
-        raise RuntimeError("sgl_kernel.inkling_sconv_ops loaded without registering Inkling sconv ops")
+        raise RuntimeError(
+            "sgl_kernel.inkling_sconv_ops loaded without registering Inkling sconv ops"
+        )
 
 
 def fused_decode_sconv_metadata(
@@ -299,9 +300,11 @@ def fused_draft_extend_sconv_cache(
         bool(do_tracking),
         crossed if do_tracking else None,
         _as_int32(track_step) if do_tracking and track_step is not None else None,
-        _as_int64(mamba_track_indices)
-        if do_tracking and mamba_track_indices is not None
-        else None,
+        (
+            _as_int64(mamba_track_indices)
+            if do_tracking and mamba_track_indices is not None
+            else None
+        ),
     )
 
 

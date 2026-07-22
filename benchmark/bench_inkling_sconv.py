@@ -8,7 +8,9 @@ from typing import Optional
 import torch
 
 
-def _install_local_package(package_root: Optional[str], build_root: Optional[str]) -> None:
+def _install_local_package(
+    package_root: Optional[str], build_root: Optional[str]
+) -> None:
     if package_root is None:
         return
     root = Path(package_root).resolve()
@@ -79,7 +81,9 @@ def _make_forward_case(T: int, B: int, D: int, W: int, dtype: torch.dtype):
     cache_mask = torch.ones((B, 1, 1), dtype=torch.bool, device="xpu")
     safe_idx = torch.arange(B, dtype=torch.int64, device="xpu")
     cu = torch.arange(0, T + 1, tokens_per_seq, dtype=torch.int64, device="xpu")
-    si = torch.arange(B, dtype=torch.int32, device="xpu").repeat_interleave(tokens_per_seq)
+    si = torch.arange(B, dtype=torch.int32, device="xpu").repeat_interleave(
+        tokens_per_seq
+    )
     return x, weight, cache, cache_mask, safe_idx, cu, si
 
 
@@ -101,7 +105,9 @@ def _make_update_case(T: int, B: int, D: int, W: int, dtype: torch.dtype):
     cache = torch.randn((B, W - 1, D), dtype=dtype, device="xpu") * 0.1
     cache_indices = torch.arange(B, dtype=torch.int32, device="xpu")
     has_initial_state = torch.ones((B,), dtype=torch.bool, device="xpu")
-    query_start_loc = torch.arange(0, T + 1, tokens_per_seq, dtype=torch.int32, device="xpu")
+    query_start_loc = torch.arange(
+        0, T + 1, tokens_per_seq, dtype=torch.int32, device="xpu"
+    )
     return x, cache, cache_indices, has_initial_state, query_start_loc
 
 
@@ -117,7 +123,9 @@ def _make_gather_scatter_case(B: int, D: int, W: int, dtype: torch.dtype):
     return hidden, cache, track_idx, mask, dst
 
 
-def _make_draft_extend_case(B: int, D: int, W: int, draft_token_num: int, dtype: torch.dtype):
+def _make_draft_extend_case(
+    B: int, D: int, W: int, draft_token_num: int, dtype: torch.dtype
+):
     torch.manual_seed(127)
     W1 = W - 1
     hidden = torch.randn((B, draft_token_num, D), dtype=dtype, device="xpu")
@@ -127,7 +135,9 @@ def _make_draft_extend_case(B: int, D: int, W: int, draft_token_num: int, dtype:
     return hidden, cache, cache_indices, num_accepted
 
 
-def _make_windows_case(B: int, D: int, W: int, draft_token_num: int, dtype: torch.dtype):
+def _make_windows_case(
+    B: int, D: int, W: int, draft_token_num: int, dtype: torch.dtype
+):
     torch.manual_seed(128)
     W1 = W - 1
     hidden = torch.randn((B, draft_token_num, D), dtype=dtype, device="xpu")
@@ -161,7 +171,9 @@ def _print_result(name: str, median_ms: float, avg_ms: float, bytes_moved: int) 
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Benchmark Inkling SConv XPU ops with device timing.")
+    parser = argparse.ArgumentParser(
+        description="Benchmark Inkling SConv XPU ops with device timing."
+    )
     parser.add_argument(
         "--op",
         choices=[
@@ -214,8 +226,8 @@ def main() -> int:
     from sgl_kernel.inkling_sconv import (
         causal_conv1d,
         fused_causal_conv1d_update_decode,
-        fused_draft_extend_sconv_cache,
         fused_decode_sconv_metadata,
+        fused_draft_extend_sconv_cache,
         fused_extend_sconv_metadata,
         fused_gather_scatter_to_sconv_cache,
         save_intermediate_conv_windows,
@@ -267,7 +279,9 @@ def main() -> int:
                 use_residual=True,
             )
 
-        median_ms, avg_ms = _bench(run_fused_decode, warmup=args.warmup, iters=args.iters)
+        median_ms, avg_ms = _bench(
+            run_fused_decode, warmup=args.warmup, iters=args.iters
+        )
         bytes_moved = x.numel() * elem_size * (2 * args.W + 2)
         _print_result("fused_decode_update", median_ms, avg_ms, bytes_moved)
 
@@ -277,7 +291,9 @@ def main() -> int:
         )
 
         def run_update():
-            update_sconv_cache(x, cache, cache_indices, has_initial_state, query_start_loc)
+            update_sconv_cache(
+                x, cache, cache_indices, has_initial_state, query_start_loc
+            )
 
         median_ms, avg_ms = _bench(run_update, warmup=args.warmup, iters=args.iters)
         bytes_moved = cache.numel() * elem_size * 2
@@ -291,7 +307,9 @@ def main() -> int:
         def run_gather_scatter():
             fused_gather_scatter_to_sconv_cache(hidden, cache, track_idx, mask, dst)
 
-        median_ms, avg_ms = _bench(run_gather_scatter, warmup=args.warmup, iters=args.iters)
+        median_ms, avg_ms = _bench(
+            run_gather_scatter, warmup=args.warmup, iters=args.iters
+        )
         bytes_moved = hidden.numel() * elem_size * 2
         _print_result("gather_scatter", median_ms, avg_ms, bytes_moved)
 
@@ -310,7 +328,9 @@ def main() -> int:
                 do_tracking=False,
             )
 
-        median_ms, avg_ms = _bench(run_draft_extend, warmup=args.warmup, iters=args.iters)
+        median_ms, avg_ms = _bench(
+            run_draft_extend, warmup=args.warmup, iters=args.iters
+        )
         bytes_moved = args.B * (args.W - 1) * args.D * elem_size * 2
         _print_result("draft_extend", median_ms, avg_ms, bytes_moved)
 
@@ -339,7 +359,9 @@ def main() -> int:
         def run_decode_metadata():
             fused_decode_sconv_metadata(B=args.B, cache_indices=cache_indices)
 
-        median_ms, avg_ms = _bench(run_decode_metadata, warmup=args.warmup, iters=args.iters)
+        median_ms, avg_ms = _bench(
+            run_decode_metadata, warmup=args.warmup, iters=args.iters
+        )
         bytes_moved = args.B * (
             cache_indices.element_size()
             + torch.empty((), dtype=torch.bool).element_size() * 2
@@ -362,14 +384,20 @@ def main() -> int:
                 extend_seq_lens=lens,
             )
 
-        median_ms, avg_ms = _bench(run_extend_metadata, warmup=args.warmup, iters=args.iters)
-        bytes_moved = args.B * (
-            cache_indices.element_size()
-            + lens.element_size()
-            + torch.empty((), dtype=torch.bool).element_size() * 2
-            + torch.empty((), dtype=torch.int64).element_size() * 2
-            + torch.empty((), dtype=torch.int32).element_size() * 2
-        ) + T * torch.empty((), dtype=torch.int32).element_size()
+        median_ms, avg_ms = _bench(
+            run_extend_metadata, warmup=args.warmup, iters=args.iters
+        )
+        bytes_moved = (
+            args.B
+            * (
+                cache_indices.element_size()
+                + lens.element_size()
+                + torch.empty((), dtype=torch.bool).element_size() * 2
+                + torch.empty((), dtype=torch.int64).element_size() * 2
+                + torch.empty((), dtype=torch.int32).element_size() * 2
+            )
+            + T * torch.empty((), dtype=torch.int32).element_size()
+        )
         _print_result("extend_metadata", median_ms, avg_ms, bytes_moved)
 
     return 0

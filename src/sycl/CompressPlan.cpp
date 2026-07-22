@@ -89,21 +89,17 @@ torch::Tensor plan_compress_decode(
     torch::Tensor req_to_token,
     torch::Tensor full_to_state,
     torch::Tensor seq_lens,
-  int64_t compress_ratio,
-  int64_t swa_page_size,
-  int64_t ring_size) {
+    int64_t compress_ratio,
+    int64_t swa_page_size,
+    int64_t ring_size) {
   TORCH_CHECK(
       req_pool_indices.is_xpu() && req_pool_indices.dtype() == torch::kInt64,
       "req_pool_indices must be an int64 XPU tensor");
   TORCH_CHECK(
-      req_to_token.is_xpu() && req_to_token.dtype() == torch::kInt32,
-      "req_to_token must be an int32 XPU tensor");
+      req_to_token.is_xpu() && req_to_token.dtype() == torch::kInt32, "req_to_token must be an int32 XPU tensor");
   TORCH_CHECK(
-      full_to_state.is_xpu() && full_to_state.dtype() == torch::kInt64,
-      "full_to_state must be an int64 XPU tensor");
-  TORCH_CHECK(
-      seq_lens.is_xpu() && seq_lens.dtype() == torch::kInt64,
-      "seq_lens must be an int64 XPU tensor");
+      full_to_state.is_xpu() && full_to_state.dtype() == torch::kInt64, "full_to_state must be an int64 XPU tensor");
+  TORCH_CHECK(seq_lens.is_xpu() && seq_lens.dtype() == torch::kInt64, "seq_lens must be an int64 XPU tensor");
   TORCH_CHECK(req_to_token.dim() == 2, "req_to_token must be a 2D tensor");
   TORCH_CHECK(req_to_token.stride(1) == 1, "req_to_token must be contiguous in the last dim");
   TORCH_CHECK(compress_ratio > 0, "compress_ratio must be > 0");

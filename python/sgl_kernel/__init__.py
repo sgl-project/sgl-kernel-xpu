@@ -22,7 +22,7 @@ from sgl_kernel.attention import (
     merge_state,
     merge_state_v2,
 )
-from sgl_kernel.compress_plan_torch import (
+from sgl_kernel.compress_plan import (
     plan_compress_decode,
     plan_compress_decode_legacy,
     plan_compress_prefill,

@@ -21,7 +21,7 @@ inline std::tuple<int64_t, int64_t> _check_layer_norm_inputs(
     std::optional<torch::Tensor>& weight /* optional */,
     std::optional<torch::Tensor>& bias /* optional */) {
   CHECK_LAST_DIM_CONTIGUOUS(input);
-  TORCH_CHECK(input.dim() == 2 || input.dim() == 3, "input must be a 2D or 3D tensor");
+  TORCH_CHECK(input.dim() == 2 || input.dim() == 3 || input.dim() == 4, "input must be a 2D, 3D, or 4D tensor");
 #define TENSOR_CHECK(T)                          \
   if (T.has_value()) {                           \
     CHECK_LAST_DIM_CONTIGUOUS(T.value());        \

@@ -2,6 +2,9 @@
 
 file(GLOB device_cpp "sycl/*.cpp" "sycl/*.sycl")
 file(GLOB host_cpp "./*.cpp" "./*.cc")
+# Inkling owns a scoped extension. Keep it out of common_ops to avoid
+# registering the same schemas from two Python modules.
+list(FILTER host_cpp EXCLUDE REGEX ".*/torch_extension_inkling_sconv\\.cc$")
 
 # BMG only
 set(device_cpp_xe20)

@@ -111,7 +111,6 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const size_t row_offset = static_cast<size_t>(row_idx) * static_cast<size_t>(d);
 
     const float p = (maybe_min_p_arr != nullptr) ? maybe_min_p_arr[row_idx] : min_p_val;
-    const uint32_t num_chunks = (d + kWgSize - 1) / kWgSize;
 
     using max_vec_in = vec_t<DType, kMaxVecSize>;
     const uint32_t num_max_chunks = (d + kWgSize * kMaxVecSize - 1) / (kWgSize * kMaxVecSize);
@@ -132,27 +131,19 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const float row_max = sycl::reduce_over_group(grp, thread_max, sycl::maximum<float>());
     const float pivot = p * row_max;
 
-    constexpr uint32_t kVecSize = 4;
-    using vec_in = vec_t<DType, kVecSize>;
-    const uint32_t num_vec_elems = d / kVecSize;
-    const uint32_t vec_tail_start = num_vec_elems * kVecSize;
-
     float thread_sum = 0.0f;
-    const uint32_t n_valid = (tx < d) ? ((d - tx - 1) / kWgSize + 1) : 0;
-    uint32_t i = 0;
-    for (; i + 4 <= n_valid; i += 4) {
-      const float a = static_cast<float>(probs[row_offset + (i + 0) * kWgSize + tx]);
-      const float b = static_cast<float>(probs[row_offset + (i + 1) * kWgSize + tx]);
-      const float c = static_cast<float>(probs[row_offset + (i + 2) * kWgSize + tx]);
-      const float e = static_cast<float>(probs[row_offset + (i + 3) * kWgSize + tx]);
-      if (a >= pivot) thread_sum += a;
-      if (b >= pivot) thread_sum += b;
-      if (c >= pivot) thread_sum += c;
-      if (e >= pivot) thread_sum += e;
-    }
-    for (; i < n_valid; ++i) {
-      const float x = static_cast<float>(probs[row_offset + i * kWgSize + tx]);
-      if (x >= pivot) thread_sum += x;
+    for (uint32_t i = 0; i < num_max_chunks; ++i) {
+      const uint32_t col_base = (i * kWgSize + tx) * kMaxVecSize;
+      max_vec_in v(static_cast<DType>(0));
+      if (col_base < d) {
+        v.load(
+            0, sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(probs + row_offset + col_base));
+      }
+#pragma unroll
+      for (uint32_t j = 0; j < kMaxVecSize; ++j) {
+        const float x = static_cast<float>(v[j]);
+        if (x >= pivot) thread_sum += x;
+      }
     }
     const float q = sycl::reduce_over_group(grp, thread_sum, sycl::plus<float>());
 
@@ -165,34 +156,51 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const float u = sgl::random::philox_uniform(philox_seed, philox_offset, bx, /*round=*/0) * q;
 
     float aggregate = 0.0f;
-    for (uint32_t i = 0; i < num_chunks; ++i) {
-      const uint32_t col = i * kWgSize + tx;
-      const bool inb = col < d;
-      const float x = inb ? static_cast<float>(probs[row_offset + col]) : 0.0f;
-      const bool keep = inb && (x >= pivot);
-      const float pgt = keep ? x : 0.0f;
+    for (uint32_t i = 0; i < num_max_chunks; ++i) {
+      const uint32_t col_base = (i * kWgSize + tx) * kMaxVecSize;
+      max_vec_in v(static_cast<DType>(0));
+      if (col_base < d) {
+        v.load(
+            0, sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(probs + row_offset + col_base));
+      }
 
-      const float block_total = sycl::reduce_over_group(grp, pgt, sycl::plus<float>());
-
-      if (aggregate + block_total > u) {
-        const float excl = sycl::exclusive_scan_over_group(grp, pgt, sycl::plus<float>());
-        const float cdf = excl + pgt;
-        if (keep && (aggregate + cdf > u)) {
+      bool keep[kMaxVecSize];
+      float local_prefix[kMaxVecSize];
+      float running = 0.0f;
+#pragma unroll
+      for (uint32_t j = 0; j < kMaxVecSize; ++j) {
+        const bool inb = col_base + j < d;
+        const float x = inb ? static_cast<float>(v[j]) : 0.0f;
+        keep[j] = inb && (x >= pivot);
+        running += keep[j] ? x : 0.0f;
+        local_prefix[j] = running;
+        if (keep[j]) {
           sycl::atomic_ref<
               int32_t,
               sycl::memory_order::relaxed,
               sycl::memory_scope::work_group,
-              sycl::access::address_space::local_space>(shared_ids_[0])
-              .fetch_min(static_cast<int32_t>(col));
+              sycl::access::address_space::local_space>(shared_ids_[1])
+              .fetch_max(static_cast<int32_t>(col_base + j));
         }
       }
-      if (keep) {
-        sycl::atomic_ref<
-            int32_t,
-            sycl::memory_order::relaxed,
-            sycl::memory_scope::work_group,
-            sycl::access::address_space::local_space>(shared_ids_[1])
-            .fetch_max(static_cast<int32_t>(col));
+      const float thread_total = running;
+
+      const float thread_excl = sycl::exclusive_scan_over_group(grp, thread_total, sycl::plus<float>());
+      const float block_total = sycl::reduce_over_group(grp, thread_total, sycl::plus<float>());
+
+      if (aggregate + block_total > u) {
+        const float cdf_before_thread = aggregate + thread_excl;
+#pragma unroll
+        for (uint32_t j = 0; j < kMaxVecSize; ++j) {
+          if (keep[j] && (cdf_before_thread + local_prefix[j] > u)) {
+            sycl::atomic_ref<
+                int32_t,
+                sycl::memory_order::relaxed,
+                sycl::memory_scope::work_group,
+                sycl::access::address_space::local_space>(shared_ids_[0])
+                .fetch_min(static_cast<int32_t>(col_base + j));
+          }
+        }
       }
 
       aggregate += block_total;

@@ -51,8 +51,7 @@ namespace decode {
 
 #define EXTERN_FMHA_DECODE_RUNNER(QG, HD, PS) extern template struct FmhaDecodeRunner<QG, HD, PS>;
 
-#define EXTERN_FMHA_SPLIT_DECODE_RUNNER(QG, HD, PS) \
-  extern template struct FmhaSplitDecodeRunner<QG, HD, PS>;
+#define EXTERN_FMHA_SPLIT_DECODE_RUNNER(QG, HD, PS) extern template struct FmhaSplitDecodeRunner<QG, HD, PS>;
 
 #define EXTERN_FMHA_DECODE_NP_RUNNER(QG, HD) extern template struct FmhaDecodeNpRunner<QG, HD>;
 
@@ -127,20 +126,20 @@ EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG(192)
 // (FmhaDecodeRunner / FmhaSplitDecodeRunner). Each is a separate translation
 // unit / shared library.
 
-#define DISPATCH_DECODE_KERNEL(QG, HD, PS)                                   \
-  do {                                                                       \
+#define DISPATCH_DECODE_KERNEL(QG, HD, PS)                                    \
+  do {                                                                        \
     TORCH_CHECK(params.is_bf16, "Decode attention only supports bf16 query"); \
-    if (params.is_e4m3 || params.is_e5m2) {                                  \
-      if (params.use_split_kv) {                                             \
+    if (params.is_e4m3 || params.is_e5m2) {                                   \
+      if (params.use_split_kv) {                                              \
         FmhaSplitDecodeFp8Runner<QG, HD, PS>{}(params);                       \
-      } else {                                                               \
+      } else {                                                                \
         FmhaDecodeFp8Runner<QG, HD, PS>{}(params);                            \
-      }                                                                      \
-    } else if (params.use_split_kv) {                                        \
+      }                                                                       \
+    } else if (params.use_split_kv) {                                         \
       FmhaSplitDecodeRunner<QG, HD, PS>{}(params);                            \
-    } else {                                                                 \
+    } else {                                                                  \
       FmhaDecodeRunner<QG, HD, PS>{}(params);                                 \
-    }                                                                        \
+    }                                                                         \
   } while (0)
 
 #define DISPATCH_DECODE_PAGE_SIZE(QG, HD)                                                     \
@@ -213,8 +212,8 @@ EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG(192)
 // (no fp8 KV cache, no split-KV).
 // ---------------------------------------------------------------------------
 
-#define DISPATCH_DECODE_NOPAGE_KERNEL(QG, HD)                                          \
-  do {                                                                                 \
+#define DISPATCH_DECODE_NOPAGE_KERNEL(QG, HD)                                           \
+  do {                                                                                  \
     TORCH_CHECK(params.is_bf16, "Non-paged decode attention only supports bf16 query"); \
     FmhaDecodeNpRunner<QG, HD>{}(params);                                               \
   } while (0)

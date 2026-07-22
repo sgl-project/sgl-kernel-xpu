@@ -21,8 +21,8 @@ limitations under the License.
 #include <torch/library.h>
 #include <torch/torch.h>
 
-#include <sycl/sycl.hpp>
 #include <optional>
+#include <sycl/sycl.hpp>
 #include <tuple>
 #include <vector>
 
@@ -285,8 +285,7 @@ void inkling_draft_extend_sconv_cache(
     const std::optional<at::Tensor>& mamba_track_indices);
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 inkling_fused_decode_sconv_metadata(int64_t B, const at::Tensor& cache_indices);
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
-inkling_fused_extend_sconv_metadata(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> inkling_fused_extend_sconv_metadata(
     int64_t B,
     int64_t T,
     const at::Tensor& cache_indices,

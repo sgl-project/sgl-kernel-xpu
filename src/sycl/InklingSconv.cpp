@@ -141,10 +141,8 @@ struct SconvForwardKernel {
       } else {
         const int64_t prefix_pos = shifted - bos + (p.W - 1);
         if (shifted < bos && prefix_pos >= 0 && prefix_pos < p.W - 1) {
-          tap = mask *
-              to_float_device(
-                    p.cache
-                        [slot * p.cache_stride_slot + prefix_pos * p.cache_stride_w + d * p.cache_stride_d]);
+          tap = mask * to_float_device(
+                           p.cache[slot * p.cache_stride_slot + prefix_pos * p.cache_stride_w + d * p.cache_stride_d]);
         }
       }
       const int64_t weight_iw = p.weight_current_first ? iw : p.W - 1 - iw;
@@ -215,10 +213,9 @@ struct SconvForwardBlockKernel {
         } else {
           const int64_t prefix_pos = shifted - bos + (W - 1);
           if (shifted < bos && prefix_pos >= 0 && prefix_pos < W - 1) {
-            tap = mask *
-                to_float_device(
-                      p.cache
-                          [slot * p.cache_stride_slot + prefix_pos * p.cache_stride_w + d * p.cache_stride_d]);
+            tap =
+                mask * to_float_device(
+                           p.cache[slot * p.cache_stride_slot + prefix_pos * p.cache_stride_w + d * p.cache_stride_d]);
           }
         }
         acc += tap * weights[iw];
@@ -244,16 +241,11 @@ void launch_sconv_forward_block(sycl::queue& q, SconvForwardParams<scalar_t> con
   const int64_t token_blocks = div_up_i64(params.T, kForwardBlockT);
   SconvForwardBlockKernel<scalar_t, W, UseSilu, UseResidual, IsDecode> kernel{params};
   q.parallel_for<SconvForwardBlockKernel<scalar_t, W, UseSilu, UseResidual, IsDecode>>(
-      sycl::nd_range<2>(
-          sycl::range<2>(channel_global, token_blocks),
-          sycl::range<2>(kThreads, 1)),
-      kernel);
+      sycl::nd_range<2>(sycl::range<2>(channel_global, token_blocks), sycl::range<2>(kThreads, 1)), kernel);
 }
 
 template <typename scalar_t, int W, bool UseSilu, bool UseResidual>
-void launch_sconv_forward_block_decode_selected(
-    sycl::queue& q,
-    SconvForwardParams<scalar_t> const& params) {
+void launch_sconv_forward_block_decode_selected(sycl::queue& q, SconvForwardParams<scalar_t> const& params) {
   if (params.is_decode) {
     launch_sconv_forward_block<scalar_t, W, UseSilu, UseResidual, true>(q, params);
   } else {
@@ -262,9 +254,7 @@ void launch_sconv_forward_block_decode_selected(
 }
 
 template <typename scalar_t, int W, bool UseSilu>
-void launch_sconv_forward_block_residual_selected(
-    sycl::queue& q,
-    SconvForwardParams<scalar_t> const& params) {
+void launch_sconv_forward_block_residual_selected(sycl::queue& q, SconvForwardParams<scalar_t> const& params) {
   if (params.use_residual) {
     launch_sconv_forward_block_decode_selected<scalar_t, W, UseSilu, true>(q, params);
   } else {
@@ -273,9 +263,7 @@ void launch_sconv_forward_block_residual_selected(
 }
 
 template <typename scalar_t, int W>
-void launch_sconv_forward_block_activation_selected(
-    sycl::queue& q,
-    SconvForwardParams<scalar_t> const& params) {
+void launch_sconv_forward_block_activation_selected(sycl::queue& q, SconvForwardParams<scalar_t> const& params) {
   if (params.use_silu) {
     launch_sconv_forward_block_residual_selected<scalar_t, W, true>(q, params);
   } else {
@@ -402,8 +390,7 @@ struct UpdateSconvCachePackedKernel {
     }
 
     const bool is_vec_lane = lane < vec_count;
-    const int64_t channel =
-        is_vec_lane ? lane * pack_elems : vec_count * pack_elems + (lane - vec_count);
+    const int64_t channel = is_vec_lane ? lane * pack_elems : vec_count * pack_elems + (lane - vec_count);
     const int64_t cache_base = static_cast<int64_t>(slot) * p.cache_stride_slot;
     const bool has_state = p.has_initial_state[b];
 
@@ -436,9 +423,7 @@ struct UpdateSconvCachePackedKernel {
 };
 
 template <typename scalar_t, int StaticW1>
-bool launch_update_sconv_cache_packed_static(
-    sycl::queue& q,
-    UpdateSconvCacheParams<scalar_t> const& params) {
+bool launch_update_sconv_cache_packed_static(sycl::queue& q, UpdateSconvCacheParams<scalar_t> const& params) {
   if (params.B == 0 || params.D == 0 || params.W1 == 0) {
     return true;
   }
@@ -447,12 +432,10 @@ bool launch_update_sconv_cache_packed_static(
   }
 
   const int64_t pack_elems = kUpdateCopyBytes / static_cast<int64_t>(sizeof(scalar_t));
-  const bool aligned =
-      params.x_stride_t % pack_elems == 0 &&
-      params.cache_stride_slot % pack_elems == 0 &&
-      params.cache_stride_w % pack_elems == 0 &&
-      reinterpret_cast<std::uintptr_t>(params.x) % kUpdateCopyBytes == 0 &&
-      reinterpret_cast<std::uintptr_t>(params.cache) % kUpdateCopyBytes == 0;
+  const bool aligned = params.x_stride_t % pack_elems == 0 && params.cache_stride_slot % pack_elems == 0 &&
+                       params.cache_stride_w % pack_elems == 0 &&
+                       reinterpret_cast<std::uintptr_t>(params.x) % kUpdateCopyBytes == 0 &&
+                       reinterpret_cast<std::uintptr_t>(params.cache) % kUpdateCopyBytes == 0;
   const int64_t vec_count = aligned ? params.D / pack_elems : 0;
   const int64_t scalar_tail = params.D - vec_count * pack_elems;
   const int64_t lanes_per_batch = vec_count + scalar_tail;
@@ -462,8 +445,7 @@ bool launch_update_sconv_cache_packed_static(
 
   const int64_t total_lanes = params.B * lanes_per_batch;
   const int64_t global = div_up_i64(total_lanes, kThreads) * kThreads;
-  UpdateSconvCachePackedKernel<scalar_t, StaticW1> kernel{
-      params, lanes_per_batch, vec_count, pack_elems};
+  UpdateSconvCachePackedKernel<scalar_t, StaticW1> kernel{params, lanes_per_batch, vec_count, pack_elems};
   q.parallel_for<UpdateSconvCachePackedKernel<scalar_t, StaticW1>>(
       sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
   return true;
@@ -576,11 +558,9 @@ struct FusedDecodeUpdateKernel {
       track_base = p.track_indices[t * p.track_idx_stride] * p.cache_stride_slot + d * p.cache_stride_d;
     }
     for (int64_t iw = 0; iw < p.W - 1; ++iw) {
-      scalar_t next =
-          (iw < p.W - 2)
-              ? (mask != 0.0f ? p.cache[cache_base + (iw + 1) * p.cache_stride_w]
-                              : from_float_device<scalar_t>(0.0f))
-              : x_value;
+      scalar_t next = (iw < p.W - 2) ? (mask != 0.0f ? p.cache[cache_base + (iw + 1) * p.cache_stride_w]
+                                                     : from_float_device<scalar_t>(0.0f))
+                                     : x_value;
       p.cache[cache_base + iw * p.cache_stride_w] = next;
       if (do_track) {
         p.cache[track_base + iw * p.cache_stride_w] = next;
@@ -632,9 +612,7 @@ struct FusedDecodeUpdateW4PackedKernel {
     }
 #pragma unroll
     for (int v = 0; v < Vec; ++v) {
-      x_value[v] = element_from_pack4_device<scalar_t>(
-          x_pack[v / kFusedW4FastVec],
-          v % kFusedW4FastVec);
+      x_value[v] = element_from_pack4_device<scalar_t>(x_pack[v / kFusedW4FastVec], v % kFusedW4FastVec);
       acc[v] = 0.0f;
     }
 
@@ -650,15 +628,11 @@ struct FusedDecodeUpdateW4PackedKernel {
 #pragma unroll
       for (int pack = 0; pack < kPackCount; ++pack) {
         history_pack[pack] =
-            mask ? load_pack4_device(p.cache + cache_base + cache_pos * p.cache_stride_w +
-                                     pack * kFusedW4FastVec)
-                 : 0;
+            mask ? load_pack4_device(p.cache + cache_base + cache_pos * p.cache_stride_w + pack * kFusedW4FastVec) : 0;
       }
 #pragma unroll
       for (int v = 0; v < Vec; ++v) {
-        const scalar_t h = element_from_pack4_device<scalar_t>(
-            history_pack[v / kFusedW4FastVec],
-            v % kFusedW4FastVec);
+        const scalar_t h = element_from_pack4_device<scalar_t>(history_pack[v / kFusedW4FastVec], v % kFusedW4FastVec);
         const scalar_t w = element_from_pack4_device<scalar_t>(weight_pack[v], cache_pos);
         acc[v] += to_float_device(h) * to_float_device(w);
       }
@@ -702,18 +676,14 @@ struct FusedDecodeUpdateW4PackedKernel {
       for (int pack = 0; pack < kPackCount; ++pack) {
         const uint64_t next_pack =
             cache_pos < 2
-                ? (mask ? load_pack4_device(p.cache + cache_base + (cache_pos + 1) * p.cache_stride_w +
-                                            pack * kFusedW4FastVec)
+                ? (mask ? load_pack4_device(
+                              p.cache + cache_base + (cache_pos + 1) * p.cache_stride_w + pack * kFusedW4FastVec)
                         : 0)
                 : x_pack[pack];
-        store_pack4_device(
-            p.cache + cache_base + cache_pos * p.cache_stride_w + pack * kFusedW4FastVec,
-            next_pack);
+        store_pack4_device(p.cache + cache_base + cache_pos * p.cache_stride_w + pack * kFusedW4FastVec, next_pack);
         if constexpr (DoTrack) {
           if (do_track) {
-            store_pack4_device(
-                p.cache + track_base + cache_pos * p.cache_stride_w + pack * kFusedW4FastVec,
-                next_pack);
+            store_pack4_device(p.cache + track_base + cache_pos * p.cache_stride_w + pack * kFusedW4FastVec, next_pack);
           }
         }
       }
@@ -722,9 +692,7 @@ struct FusedDecodeUpdateW4PackedKernel {
 };
 
 template <typename scalar_t, int Vec, bool UseSilu, bool UseResidual, bool DoTrack>
-void launch_fused_decode_update_w4_packed(
-    sycl::queue& q,
-    FusedDecodeUpdateParams<scalar_t> const& params) {
+void launch_fused_decode_update_w4_packed(sycl::queue& q, FusedDecodeUpdateParams<scalar_t> const& params) {
   const int64_t total = params.T * (params.D / Vec);
   if (total == 0) {
     return;
@@ -737,8 +705,7 @@ void launch_fused_decode_update_w4_packed(
 
 template <typename scalar_t, int Vec, bool UseSilu, bool UseResidual>
 void launch_fused_decode_update_w4_packed_track_selected(
-    sycl::queue& q,
-    FusedDecodeUpdateParams<scalar_t> const& params) {
+    sycl::queue& q, FusedDecodeUpdateParams<scalar_t> const& params) {
   if (params.do_track) {
     launch_fused_decode_update_w4_packed<scalar_t, Vec, UseSilu, UseResidual, true>(q, params);
   } else {
@@ -748,8 +715,7 @@ void launch_fused_decode_update_w4_packed_track_selected(
 
 template <typename scalar_t, int Vec, bool UseSilu>
 void launch_fused_decode_update_w4_packed_residual_selected(
-    sycl::queue& q,
-    FusedDecodeUpdateParams<scalar_t> const& params) {
+    sycl::queue& q, FusedDecodeUpdateParams<scalar_t> const& params) {
   if (params.use_residual) {
     launch_fused_decode_update_w4_packed_track_selected<scalar_t, Vec, UseSilu, true>(q, params);
   } else {
@@ -759,8 +725,7 @@ void launch_fused_decode_update_w4_packed_residual_selected(
 
 template <typename scalar_t, int Vec>
 void launch_fused_decode_update_w4_packed_activation_selected(
-    sycl::queue& q,
-    FusedDecodeUpdateParams<scalar_t> const& params) {
+    sycl::queue& q, FusedDecodeUpdateParams<scalar_t> const& params) {
   if (params.use_silu) {
     launch_fused_decode_update_w4_packed_residual_selected<scalar_t, Vec, true>(q, params);
   } else {
@@ -769,9 +734,7 @@ void launch_fused_decode_update_w4_packed_activation_selected(
 }
 
 template <typename scalar_t>
-bool try_launch_fused_decode_update_w4_packed(
-    sycl::queue& q,
-    FusedDecodeUpdateParams<scalar_t> const& params) {
+bool try_launch_fused_decode_update_w4_packed(sycl::queue& q, FusedDecodeUpdateParams<scalar_t> const& params) {
   if constexpr (sizeof(scalar_t) != sizeof(uint16_t)) {
     return false;
   } else {
@@ -784,10 +747,8 @@ bool try_launch_fused_decode_update_w4_packed(
     if (params.weight_stride_w != 1 || params.weight_stride_d != 4) {
       return false;
     }
-    if (params.x_stride_t % kFusedW4FastVec != 0 ||
-        params.y_stride_t % kFusedW4FastVec != 0 ||
-        params.cache_stride_slot % kFusedW4FastVec != 0 ||
-        params.cache_stride_w % kFusedW4FastVec != 0) {
+    if (params.x_stride_t % kFusedW4FastVec != 0 || params.y_stride_t % kFusedW4FastVec != 0 ||
+        params.cache_stride_slot % kFusedW4FastVec != 0 || params.cache_stride_w % kFusedW4FastVec != 0) {
       return false;
     }
     if (reinterpret_cast<std::uintptr_t>(params.x) % sizeof(uint64_t) != 0 ||
@@ -928,12 +889,10 @@ bool launch_gather_scatter_packed_static(sycl::queue& q, GatherScatterParams<sca
   }
 
   const int64_t pack_elems = kUpdateCopyBytes / static_cast<int64_t>(sizeof(scalar_t));
-  const bool aligned =
-      params.hidden_stride_t % pack_elems == 0 &&
-      params.cache_stride_slot % pack_elems == 0 &&
-      params.cache_stride_w % pack_elems == 0 &&
-      reinterpret_cast<std::uintptr_t>(params.hidden) % kUpdateCopyBytes == 0 &&
-      reinterpret_cast<std::uintptr_t>(params.cache) % kUpdateCopyBytes == 0;
+  const bool aligned = params.hidden_stride_t % pack_elems == 0 && params.cache_stride_slot % pack_elems == 0 &&
+                       params.cache_stride_w % pack_elems == 0 &&
+                       reinterpret_cast<std::uintptr_t>(params.hidden) % kUpdateCopyBytes == 0 &&
+                       reinterpret_cast<std::uintptr_t>(params.cache) % kUpdateCopyBytes == 0;
   const int64_t vec_count = aligned ? params.D / pack_elems : 0;
   const int64_t scalar_tail = params.D - vec_count * pack_elems;
   const int64_t lanes_per_batch = vec_count + scalar_tail;
@@ -1151,7 +1110,8 @@ struct DraftExtendPackedKernel {
 
       for (int64_t w = 0; w < width; ++w) {
         scalar_t* dst_row = p.cache + cache_base + w * p.cache_stride_w;
-        store_pack(dst_row, lane, load_virtual_pack(init, hidden_base, static_cast<int64_t>(accepted) + w, lane, width));
+        store_pack(
+            dst_row, lane, load_virtual_pack(init, hidden_base, static_cast<int64_t>(accepted) + w, lane, width));
       }
     } else {
       scalar_t init[kPackedCopyMaxWindow];
@@ -1192,13 +1152,10 @@ bool launch_draft_extend_packed_static(sycl::queue& q, DraftExtendParams<scalar_
   }
 
   const int64_t pack_elems = kUpdateCopyBytes / static_cast<int64_t>(sizeof(scalar_t));
-  const bool aligned =
-      params.hidden_stride_b % pack_elems == 0 &&
-      params.hidden_stride_t % pack_elems == 0 &&
-      params.cache_stride_slot % pack_elems == 0 &&
-      params.cache_stride_w % pack_elems == 0 &&
-      reinterpret_cast<std::uintptr_t>(params.hidden) % kUpdateCopyBytes == 0 &&
-      reinterpret_cast<std::uintptr_t>(params.cache) % kUpdateCopyBytes == 0;
+  const bool aligned = params.hidden_stride_b % pack_elems == 0 && params.hidden_stride_t % pack_elems == 0 &&
+                       params.cache_stride_slot % pack_elems == 0 && params.cache_stride_w % pack_elems == 0 &&
+                       reinterpret_cast<std::uintptr_t>(params.hidden) % kUpdateCopyBytes == 0 &&
+                       reinterpret_cast<std::uintptr_t>(params.cache) % kUpdateCopyBytes == 0;
   const int64_t vec_count = aligned ? params.D / pack_elems : 0;
   const int64_t scalar_tail = params.D - vec_count * pack_elems;
   const int64_t lanes_per_batch = vec_count + scalar_tail;
@@ -1208,8 +1165,7 @@ bool launch_draft_extend_packed_static(sycl::queue& q, DraftExtendParams<scalar_
 
   const int64_t total_lanes = params.B * lanes_per_batch;
   const int64_t global = div_up_i64(total_lanes, kThreads) * kThreads;
-  DraftExtendPackedKernel<scalar_t, StaticW1, DoTrack> kernel{
-      params, lanes_per_batch, vec_count, pack_elems};
+  DraftExtendPackedKernel<scalar_t, StaticW1, DoTrack> kernel{params, lanes_per_batch, vec_count, pack_elems};
   q.parallel_for<DraftExtendPackedKernel<scalar_t, StaticW1, DoTrack>>(
       sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
   return true;
@@ -1285,8 +1241,7 @@ void launch_decode_metadata(sycl::queue& q, DecodeMetadataParams const& params) 
   const int64_t total = params.B + 1;
   const int64_t global = div_up_i64(total, kMetaThreads) * kMetaThreads;
   DecodeMetadataKernel kernel{params};
-  q.parallel_for<DecodeMetadataKernel>(
-      sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kMetaThreads)), kernel);
+  q.parallel_for<DecodeMetadataKernel>(sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kMetaThreads)), kernel);
 }
 
 enum HisMode {
@@ -1384,9 +1339,7 @@ void launch_extend_metadata(sycl::queue& q, ExtendMetadataParams const& params) 
   }
   ExtendMetadataKernel kernel{params};
   q.parallel_for<ExtendMetadataKernel>(
-      sycl::nd_range<1>(
-          sycl::range<1>(static_cast<std::size_t>(groups * kMetaThreads)),
-          sycl::range<1>(kMetaThreads)),
+      sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(groups * kMetaThreads)), sycl::range<1>(kMetaThreads)),
       kernel);
 }
 
@@ -1432,8 +1385,7 @@ void launch_track_indices(sycl::queue& q, TrackIndicesParams const& params) {
   }
   const int64_t global = div_up_i64(total, kThreads) * kThreads;
   TrackIndicesKernel kernel{params};
-  q.parallel_for<TrackIndicesKernel>(
-      sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
+  q.parallel_for<TrackIndicesKernel>(sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
 }
 
 template <typename scalar_t>
@@ -1577,17 +1529,13 @@ bool launch_save_windows_packed_static(sycl::queue& q, SaveWindowsParams<scalar_
 
   const int64_t pack_elems = kUpdateCopyBytes / static_cast<int64_t>(sizeof(scalar_t));
   const int64_t lane_elems = pack_elems * kWindowPacksPerLane;
-  const bool aligned =
-      params.cache_stride_slot % pack_elems == 0 &&
-      params.cache_stride_w % pack_elems == 0 &&
-      params.hidden_stride_b % pack_elems == 0 &&
-      params.hidden_stride_t % pack_elems == 0 &&
-      params.out_stride_b % pack_elems == 0 &&
-      params.out_stride_t % pack_elems == 0 &&
-      params.out_stride_w % pack_elems == 0 &&
-      reinterpret_cast<std::uintptr_t>(params.cache) % kUpdateCopyBytes == 0 &&
-      reinterpret_cast<std::uintptr_t>(params.hidden) % kUpdateCopyBytes == 0 &&
-      reinterpret_cast<std::uintptr_t>(params.out) % kUpdateCopyBytes == 0;
+  const bool aligned = params.cache_stride_slot % pack_elems == 0 && params.cache_stride_w % pack_elems == 0 &&
+                       params.hidden_stride_b % pack_elems == 0 && params.hidden_stride_t % pack_elems == 0 &&
+                       params.out_stride_b % pack_elems == 0 && params.out_stride_t % pack_elems == 0 &&
+                       params.out_stride_w % pack_elems == 0 &&
+                       reinterpret_cast<std::uintptr_t>(params.cache) % kUpdateCopyBytes == 0 &&
+                       reinterpret_cast<std::uintptr_t>(params.hidden) % kUpdateCopyBytes == 0 &&
+                       reinterpret_cast<std::uintptr_t>(params.out) % kUpdateCopyBytes == 0;
   const int64_t vec_count = aligned ? params.D / lane_elems : 0;
   const int64_t scalar_tail = params.D - vec_count * lane_elems;
   const int64_t lanes_per_row = vec_count + scalar_tail;
@@ -1598,8 +1546,7 @@ bool launch_save_windows_packed_static(sycl::queue& q, SaveWindowsParams<scalar_
   const int64_t width = StaticW1 > 0 ? StaticW1 : params.W1;
   const int64_t total_lanes = params.B * params.draft_tokens * width * lanes_per_row;
   const int64_t global = div_up_i64(total_lanes, kThreads) * kThreads;
-  SaveWindowsPackedKernel<scalar_t, StaticW1> kernel{
-      params, lanes_per_row, vec_count, pack_elems};
+  SaveWindowsPackedKernel<scalar_t, StaticW1> kernel{params, lanes_per_row, vec_count, pack_elems};
   q.parallel_for<SaveWindowsPackedKernel<scalar_t, StaticW1>>(
       sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
   return true;
@@ -1707,38 +1654,39 @@ at::Tensor inkling_sconv_forward(
   at::Tensor y = at::empty_strided({x.size(0), x.size(1)}, {x.size(1), 1}, x.options());
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = x.scalar_type();
-  SYCL_DISPATCH_FLOATING_TYPES(at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_sconv_forward", [&]() -> at::Tensor {
-    SconvForwardParams<scalar_t> params{
-        x.data_ptr<scalar_t>(),
-        sconv_cache.data_ptr<scalar_t>(),
-        cache_mask.data_ptr<bool>(),
-        safe_idx.data_ptr<int64_t>(),
-        cu.data_ptr<int64_t>(),
-        si.data_ptr<int32_t>(),
-        weight.data_ptr<scalar_t>(),
-        y.data_ptr<scalar_t>(),
-        x.size(0),
-        x.size(1),
-        weight_layout.W,
-        x.stride(0),
-        x.stride(1),
-        sconv_cache.stride(0),
-        sconv_cache.stride(1),
-        sconv_cache.stride(2),
-        cache_mask.stride(0),
-        weight_layout.stride_d,
-        weight_layout.stride_w,
-        y.stride(0),
-        y.stride(1),
-        silu_activation,
-        use_residual,
-        is_decode,
-        weight_layout.current_first};
-    if (!try_launch_sconv_forward_block<scalar_t>(queue, params)) {
-      launch_sconv_forward<scalar_t>(queue, params);
-    }
-    return y;
-  });
+  SYCL_DISPATCH_FLOATING_TYPES(
+      at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_sconv_forward", [&]() -> at::Tensor {
+        SconvForwardParams<scalar_t> params{
+            x.data_ptr<scalar_t>(),
+            sconv_cache.data_ptr<scalar_t>(),
+            cache_mask.data_ptr<bool>(),
+            safe_idx.data_ptr<int64_t>(),
+            cu.data_ptr<int64_t>(),
+            si.data_ptr<int32_t>(),
+            weight.data_ptr<scalar_t>(),
+            y.data_ptr<scalar_t>(),
+            x.size(0),
+            x.size(1),
+            weight_layout.W,
+            x.stride(0),
+            x.stride(1),
+            sconv_cache.stride(0),
+            sconv_cache.stride(1),
+            sconv_cache.stride(2),
+            cache_mask.stride(0),
+            weight_layout.stride_d,
+            weight_layout.stride_w,
+            y.stride(0),
+            y.stride(1),
+            silu_activation,
+            use_residual,
+            is_decode,
+            weight_layout.current_first};
+        if (!try_launch_sconv_forward_block<scalar_t>(queue, params)) {
+          launch_sconv_forward<scalar_t>(queue, params);
+        }
+        return y;
+      });
   return y;
 }
 
@@ -1767,23 +1715,24 @@ void inkling_update_sconv_cache(
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = x.scalar_type();
-  SYCL_DISPATCH_FLOATING_TYPES(at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_update_sconv_cache", [&]() {
-    UpdateSconvCacheParams<scalar_t> params{
-        x.data_ptr<scalar_t>(),
-        sconv_cache.data_ptr<scalar_t>(),
-        cache_indices.data_ptr<int32_t>(),
-        has_initial_state.data_ptr<bool>(),
-        query_start_loc.data_ptr<int32_t>(),
-        cache_indices.numel(),
-        x.size(1),
-        sconv_cache.size(1),
-        x.stride(0),
-        x.stride(1),
-        sconv_cache.stride(0),
-        sconv_cache.stride(1),
-        sconv_cache.stride(2)};
-    launch_update_sconv_cache<scalar_t>(queue, params);
-  });
+  SYCL_DISPATCH_FLOATING_TYPES(
+      at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_update_sconv_cache", [&]() {
+        UpdateSconvCacheParams<scalar_t> params{
+            x.data_ptr<scalar_t>(),
+            sconv_cache.data_ptr<scalar_t>(),
+            cache_indices.data_ptr<int32_t>(),
+            has_initial_state.data_ptr<bool>(),
+            query_start_loc.data_ptr<int32_t>(),
+            cache_indices.numel(),
+            x.size(1),
+            sconv_cache.size(1),
+            x.stride(0),
+            x.stride(1),
+            sconv_cache.stride(0),
+            sconv_cache.stride(1),
+            sconv_cache.stride(2)};
+        launch_update_sconv_cache<scalar_t>(queue, params);
+      });
 }
 
 at::Tensor inkling_fused_decode_update_sconv(
@@ -1828,38 +1777,43 @@ at::Tensor inkling_fused_decode_update_sconv(
   at::Tensor y = at::empty_strided({x.size(0), x.size(1)}, {x.size(1), 1}, x.options());
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = x.scalar_type();
-  SYCL_DISPATCH_FLOATING_TYPES(at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_fused_decode_update_sconv", [&]() -> at::Tensor {
-    FusedDecodeUpdateParams<scalar_t> params{
-        x.data_ptr<scalar_t>(),
-        sconv_cache.data_ptr<scalar_t>(),
-        cache_indices.data_ptr<int32_t>(),
-        cache_mask.data_ptr<bool>(),
-        weight.data_ptr<scalar_t>(),
-        y.data_ptr<scalar_t>(),
-        do_track ? track_mask.value().data_ptr<bool>() : nullptr,
-        do_track ? track_indices.value().data_ptr<int64_t>() : nullptr,
-        x.size(0),
-        x.size(1),
-        weight_layout.W,
-        x.stride(0),
-        x.stride(1),
-        sconv_cache.stride(0),
-        sconv_cache.stride(1),
-        sconv_cache.stride(2),
-        weight_layout.stride_d,
-        weight_layout.stride_w,
-        y.stride(0),
-        y.stride(1),
-        do_track ? track_indices.value().stride(0) : 0,
-        silu_activation,
-        use_residual,
-        do_track,
-        weight_layout.current_first};
-    if (!try_launch_fused_decode_update_w4_packed<scalar_t>(queue, params)) {
-      launch_fused_decode_update<scalar_t>(queue, params);
-    }
-    return y;
-  });
+  SYCL_DISPATCH_FLOATING_TYPES(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      input_type,
+      "inkling_fused_decode_update_sconv",
+      [&]() -> at::Tensor {
+        FusedDecodeUpdateParams<scalar_t> params{
+            x.data_ptr<scalar_t>(),
+            sconv_cache.data_ptr<scalar_t>(),
+            cache_indices.data_ptr<int32_t>(),
+            cache_mask.data_ptr<bool>(),
+            weight.data_ptr<scalar_t>(),
+            y.data_ptr<scalar_t>(),
+            do_track ? track_mask.value().data_ptr<bool>() : nullptr,
+            do_track ? track_indices.value().data_ptr<int64_t>() : nullptr,
+            x.size(0),
+            x.size(1),
+            weight_layout.W,
+            x.stride(0),
+            x.stride(1),
+            sconv_cache.stride(0),
+            sconv_cache.stride(1),
+            sconv_cache.stride(2),
+            weight_layout.stride_d,
+            weight_layout.stride_w,
+            y.stride(0),
+            y.stride(1),
+            do_track ? track_indices.value().stride(0) : 0,
+            silu_activation,
+            use_residual,
+            do_track,
+            weight_layout.current_first};
+        if (!try_launch_fused_decode_update_w4_packed<scalar_t>(queue, params)) {
+          launch_fused_decode_update<scalar_t>(queue, params);
+        }
+        return y;
+      });
   return y;
 }
 
@@ -1890,26 +1844,27 @@ void inkling_gather_scatter_sconv_cache(
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = hidden_states.scalar_type();
-  SYCL_DISPATCH_FLOATING_TYPES(at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_gather_scatter_sconv_cache", [&]() {
-    GatherScatterParams<scalar_t> params{
-        hidden_states.data_ptr<scalar_t>(),
-        sconv_cache.data_ptr<scalar_t>(),
-        track_conv_indices.data_ptr<int32_t>(),
-        mask.data_ptr<bool>(),
-        dst_indices.data_ptr<int64_t>(),
-        mask.numel(),
-        hidden_states.size(1),
-        sconv_cache.size(1),
-        hidden_states.stride(0),
-        hidden_states.stride(1),
-        sconv_cache.stride(0),
-        sconv_cache.stride(1),
-        sconv_cache.stride(2),
-        track_conv_indices.stride(0),
-        track_conv_indices.stride(1),
-        dst_indices.stride(0)};
-    launch_gather_scatter<scalar_t>(queue, params);
-  });
+  SYCL_DISPATCH_FLOATING_TYPES(
+      at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_gather_scatter_sconv_cache", [&]() {
+        GatherScatterParams<scalar_t> params{
+            hidden_states.data_ptr<scalar_t>(),
+            sconv_cache.data_ptr<scalar_t>(),
+            track_conv_indices.data_ptr<int32_t>(),
+            mask.data_ptr<bool>(),
+            dst_indices.data_ptr<int64_t>(),
+            mask.numel(),
+            hidden_states.size(1),
+            sconv_cache.size(1),
+            hidden_states.stride(0),
+            hidden_states.stride(1),
+            sconv_cache.stride(0),
+            sconv_cache.stride(1),
+            sconv_cache.stride(2),
+            track_conv_indices.stride(0),
+            track_conv_indices.stride(1),
+            dst_indices.stride(0)};
+        launch_gather_scatter<scalar_t>(queue, params);
+      });
 }
 
 void inkling_draft_extend_sconv_cache(
@@ -1926,7 +1881,8 @@ void inkling_draft_extend_sconv_cache(
   check_xpu_tensor(sconv_cache, "sconv_cache");
   check_xpu_tensor(cache_indices, "cache_indices");
   check_xpu_tensor(num_accepted_tokens, "num_accepted_tokens");
-  TORCH_CHECK(hidden_states.dim() == 2 || hidden_states.dim() == 3, "hidden_states must have shape [B*T, D] or [B, T, D]");
+  TORCH_CHECK(
+      hidden_states.dim() == 2 || hidden_states.dim() == 3, "hidden_states must have shape [B*T, D] or [B, T, D]");
   TORCH_CHECK(sconv_cache.dim() == 3, "sconv_cache must have shape [slots, W-1, D]");
   TORCH_CHECK(cache_indices.scalar_type() == at::ScalarType::Int, "cache_indices must be int32");
   TORCH_CHECK(num_accepted_tokens.scalar_type() == at::ScalarType::Int, "num_accepted_tokens must be int32");
@@ -1946,7 +1902,9 @@ void inkling_draft_extend_sconv_cache(
     TORCH_CHECK(hidden_states.size(2) == D, "hidden_states.size(2) must equal cache D");
   }
   if (do_tracking) {
-    TORCH_CHECK(crossed.has_value() && track_step.has_value() && mamba_track_indices.has_value(), "tracking tensors are required when do_tracking=True");
+    TORCH_CHECK(
+        crossed.has_value() && track_step.has_value() && mamba_track_indices.has_value(),
+        "tracking tensors are required when do_tracking=True");
     check_xpu_tensor(crossed.value(), "crossed");
     check_xpu_tensor(track_step.value(), "track_step");
     check_xpu_tensor(mamba_track_indices.value(), "mamba_track_indices");
@@ -1965,27 +1923,28 @@ void inkling_draft_extend_sconv_cache(
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = hidden_states.scalar_type();
-  SYCL_DISPATCH_FLOATING_TYPES(at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_draft_extend_sconv_cache", [&]() {
-    DraftExtendParams<scalar_t> params{
-        hidden_states.data_ptr<scalar_t>(),
-        sconv_cache.data_ptr<scalar_t>(),
-        cache_indices.data_ptr<int32_t>(),
-        num_accepted_tokens.data_ptr<int32_t>(),
-        do_tracking ? crossed.value().data_ptr<bool>() : nullptr,
-        do_tracking ? track_step.value().data_ptr<int32_t>() : nullptr,
-        do_tracking ? mamba_track_indices.value().data_ptr<int64_t>() : nullptr,
-        B,
-        D,
-        sconv_cache.size(1),
-        hidden_stride_b,
-        hidden_stride_t,
-        hidden_stride_d,
-        sconv_cache.stride(0),
-        sconv_cache.stride(1),
-        sconv_cache.stride(2),
-        do_tracking};
-    launch_draft_extend<scalar_t>(queue, params);
-  });
+  SYCL_DISPATCH_FLOATING_TYPES(
+      at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_draft_extend_sconv_cache", [&]() {
+        DraftExtendParams<scalar_t> params{
+            hidden_states.data_ptr<scalar_t>(),
+            sconv_cache.data_ptr<scalar_t>(),
+            cache_indices.data_ptr<int32_t>(),
+            num_accepted_tokens.data_ptr<int32_t>(),
+            do_tracking ? crossed.value().data_ptr<bool>() : nullptr,
+            do_tracking ? track_step.value().data_ptr<int32_t>() : nullptr,
+            do_tracking ? mamba_track_indices.value().data_ptr<int64_t>() : nullptr,
+            B,
+            D,
+            sconv_cache.size(1),
+            hidden_stride_b,
+            hidden_stride_t,
+            hidden_stride_d,
+            sconv_cache.stride(0),
+            sconv_cache.stride(1),
+            sconv_cache.stride(2),
+            do_tracking};
+        launch_draft_extend<scalar_t>(queue, params);
+      });
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
@@ -2016,8 +1975,7 @@ inkling_fused_decode_sconv_metadata(int64_t B, const at::Tensor& cache_indices) 
   return {query_start_loc, has_initial_state, cache_mask, safe_idx, cu, si};
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
-inkling_fused_extend_sconv_metadata(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> inkling_fused_extend_sconv_metadata(
     int64_t B,
     int64_t T,
     const at::Tensor& cache_indices,
@@ -2120,7 +2078,8 @@ void inkling_save_intermediate_conv_windows(
   check_xpu_tensor(cache_indices, "cache_indices");
   check_xpu_tensor(intermediate_out, "intermediate_out");
   TORCH_CHECK(sconv_cache.dim() == 3, "sconv_cache must have shape [slots, W-1, D]");
-  TORCH_CHECK(hidden_states.dim() == 2 || hidden_states.dim() == 3, "hidden_states must have shape [B*T, D] or [B, T, D]");
+  TORCH_CHECK(
+      hidden_states.dim() == 2 || hidden_states.dim() == 3, "hidden_states must have shape [B*T, D] or [B, T, D]");
   TORCH_CHECK(intermediate_out.dim() == 4, "intermediate_out must have shape [B, T, W-1, D]");
   TORCH_CHECK(cache_indices.scalar_type() == at::ScalarType::Int, "cache_indices must be int32");
   check_sconv_dtype(sconv_cache, hidden_states, "hidden_states");
@@ -2152,26 +2111,27 @@ void inkling_save_intermediate_conv_windows(
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = sconv_cache.scalar_type();
-  SYCL_DISPATCH_FLOATING_TYPES(at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_save_intermediate_conv_windows", [&]() {
-    SaveWindowsParams<scalar_t> params{
-        sconv_cache.data_ptr<scalar_t>(),
-        hidden_states.data_ptr<scalar_t>(),
-        cache_indices.data_ptr<int32_t>(),
-        intermediate_out.data_ptr<scalar_t>(),
-        batch_size,
-        draft_token_num,
-        sconv_cache.size(1),
-        D,
-        sconv_cache.stride(0),
-        sconv_cache.stride(1),
-        sconv_cache.stride(2),
-        hidden_stride_b,
-        hidden_stride_t,
-        hidden_stride_d,
-        intermediate_out.stride(0),
-        intermediate_out.stride(1),
-        intermediate_out.stride(2),
-        intermediate_out.stride(3)};
-    launch_save_windows<scalar_t>(queue, params);
-  });
+  SYCL_DISPATCH_FLOATING_TYPES(
+      at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_save_intermediate_conv_windows", [&]() {
+        SaveWindowsParams<scalar_t> params{
+            sconv_cache.data_ptr<scalar_t>(),
+            hidden_states.data_ptr<scalar_t>(),
+            cache_indices.data_ptr<int32_t>(),
+            intermediate_out.data_ptr<scalar_t>(),
+            batch_size,
+            draft_token_num,
+            sconv_cache.size(1),
+            D,
+            sconv_cache.stride(0),
+            sconv_cache.stride(1),
+            sconv_cache.stride(2),
+            hidden_stride_b,
+            hidden_stride_t,
+            hidden_stride_d,
+            intermediate_out.stride(0),
+            intermediate_out.stride(1),
+            intermediate_out.stride(2),
+            intermediate_out.stride(3)};
+        launch_save_windows<scalar_t>(queue, params);
+      });
 }

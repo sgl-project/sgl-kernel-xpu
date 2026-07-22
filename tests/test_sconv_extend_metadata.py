@@ -8,7 +8,6 @@ clamp, long, to(int64), arange, searchsorted, clamp, to(int32).
 
 import pytest
 import torch
-
 from sgl_kernel.inkling_sconv import (
     HIS_ONES,
     HIS_PREFIX,
@@ -19,7 +18,9 @@ from sgl_kernel.inkling_sconv import (
     precompute_helion_extend_metadata,
 )
 
-requires_cuda = pytest.mark.skipif(not (hasattr(torch, "xpu") and torch.xpu.is_available()), reason="XPU only")
+requires_cuda = pytest.mark.skipif(
+    not (hasattr(torch, "xpu") and torch.xpu.is_available()), reason="XPU only"
+)
 
 # cross si tiles (BLOCK_T=256) and the single-tile B bound
 BATCH_SIZES = [1, 2, 7, 64, 257, 1023]

@@ -90,8 +90,26 @@ void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Argume
 #if @HEAD_DIM@ == 64
     AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-        DecodeConfig<false, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
-            params);
+        if (params.is_bf16) {
+          DecodeConfig<false, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
+              params);
+        } else {
+          DecodeConfig<
+              false,
+              LocalMask,
+              Sink,
+              TileShapeQK,
+              TileShapePV,
+              TileShapeOutput,
+              SubgroupLayoutQK,
+              void,
+              1,
+              false,
+              cutlass::half_t,
+              cutlass::half_t,
+              cutlass::half_t,
+              cutlass::half_t>::run_paged(params);
+        }
       });
   });
 #else
@@ -99,8 +117,26 @@ void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Argume
         !params.use_sink,
         "sink is only supported for head_size == 64, got @HEAD_DIM@");
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-      DecodeConfig<false, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
-          params);
+      if (params.is_bf16) {
+        DecodeConfig<false, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
+            params);
+      } else {
+        DecodeConfig<
+            false,
+            LocalMask,
+            false,
+            TileShapeQK,
+            TileShapePV,
+            TileShapeOutput,
+            SubgroupLayoutQK,
+            void,
+            1,
+            false,
+            cutlass::half_t,
+            cutlass::half_t,
+            cutlass::half_t,
+            cutlass::half_t>::run_paged(params);
+      }
     });
 #endif
 #else

@@ -7,7 +7,6 @@ from .utils import is_xe2_arch
 _MOE_SCORING_FUNC_MAP = {
     "sigmoid": 0,
     "softmax": 1,
-    "sqrtsoftplus": 2,
 }
 
 _MOE_BIASED_TOPK_SCORING_MAP = {

@@ -14,54 +14,64 @@ namespace CompressPlanImpl {
 // Kernel for plan_compress_decode
 struct CompressDecodeKernel {
   void operator()(sycl::nd_item<1> item) const {
-    int32_t idx = item.get_global_id(0);
-    if (idx >= batch_size_) return;
+    uint32_t idx = item.get_global_id(0);
+    if (idx >= batch_size) return;
 
-    int64_t rid = req_pool_indices_[idx];
-    int64_t seq_len = seq_lens_[idx];
-    int32_t pos1 = seq_len - 1;
-    int32_t pos0 = sycl::max(pos1 - compress_ratio_, 0);
+    int64_t rid = rid_ptr[idx];
+    int32_t seq_len = static_cast<int32_t>(seq_ptr[idx]);
+    int32_t position_1 = seq_len - 1;
+    int32_t position_0 = sycl::max(position_1 - compress_ratio, 0);
 
-    int64_t loc1;
-    int64_t loc0;
-    if (compress_ratio_ == 128) {
-      // DeepSeek V4 c128 path uses request-local state indexing.
-      loc1 = rid * ring_size_ + (static_cast<int64_t>(pos1) % ring_size_);
-      loc0 = rid * ring_size_ + (static_cast<int64_t>(pos0) % ring_size_);
+    const auto compute_loc = [&](int32_t swa_loc) {
+      int32_t swa_page = swa_loc / swa_page_size;
+      int32_t ring_offset = swa_loc % ring_size;
+      return swa_page * ring_size + ring_offset;
+    };
+    const auto compute_c128_loc = [&](int64_t rid_, int32_t position) {
+      return static_cast<int32_t>(rid_ * ring_size + position % ring_size);
+    };
+
+    int32_t write_loc;
+    int32_t read_page_0;
+    int32_t read_page_1;
+    if (compress_ratio == 128) {
+      write_loc = compute_c128_loc(rid, position_1);
+      read_page_0 = compute_c128_loc(rid, position_0) / 128;
+      read_page_1 = compute_c128_loc(rid, position_1) / 128;
     } else {
-      const int32_t* req_to_token_row = req_to_token_ + rid * req_to_token_stride_;
+      const int32_t* mapping = r2t_ptr + rid * stride_r2t;
 
       // Look up full token indices
-      int64_t raw1 = static_cast<int64_t>(req_to_token_row[pos1]);
-      int64_t raw0 = static_cast<int64_t>(req_to_token_row[pos0]);
+      const auto raw_loc_0 = mapping[position_0];
+      const auto raw_loc_1 = mapping[position_1];
 
       // Convert to swa indices
-      int64_t swa1 = full_to_state_[raw1];
-      int64_t swa0 = full_to_state_[raw0];
-
+      const auto state_loc_0 = f2s_ptr[raw_loc_0];
+      const auto state_loc_1 = f2s_ptr[raw_loc_1];
       // Compute ring buffer locations
-      loc1 = (swa1 / swa_page_size_) * ring_size_ + (swa1 % ring_size_);
-      loc0 = (swa0 / swa_page_size_) * ring_size_ + (swa0 % ring_size_);
+      write_loc = static_cast<int32_t>(compute_loc(state_loc_1));
+      read_page_0 = static_cast<int32_t>(compute_loc(state_loc_0) / compress_ratio);
+      read_page_1 = static_cast<int32_t>(write_loc / compress_ratio);
     }
 
-    // Pack into output: [seq_len, loc1, loc0/compress_ratio, loc1/compress_ratio]
-    int32_t* output = output_i32_ + idx * 4;
-    output[0] = seq_len;
-    output[1] = static_cast<int32_t>(loc1);
-    output[2] = static_cast<int32_t>(loc0 / static_cast<int64_t>(compress_ratio_));
-    output[3] = static_cast<int32_t>(loc1 / static_cast<int64_t>(compress_ratio_));
+    // Pack into output: [seq_len, write_loc, read_page_0/compress_ratio, read_page_1/compress_ratio]
+    int32_t* plan_d = plan_d_i32 + idx * 4;
+    plan_d[0] = seq_len;
+    plan_d[1] = write_loc;
+    plan_d[2] = read_page_0;
+    plan_d[3] = read_page_1;
   }
 
-  const int64_t* req_pool_indices_;
-  const int64_t* seq_lens_;
-  const int32_t* req_to_token_;
-  const int64_t* full_to_state_;
-  int32_t* output_i32_;
-  int64_t swa_page_size_;
-  int64_t ring_size_;
-  int32_t compress_ratio_;
-  int64_t req_to_token_stride_;
-  int32_t batch_size_;
+  const int64_t* rid_ptr;
+  const int64_t* seq_ptr;
+  const int32_t* r2t_ptr;
+  const int64_t* f2s_ptr;
+  int32_t* plan_d_i32;
+  int32_t swa_page_size;
+  int32_t ring_size;
+  int32_t compress_ratio;
+  int64_t stride_r2t;
+  uint32_t batch_size;
 };
 
 }  // namespace CompressPlanImpl
@@ -79,25 +89,31 @@ torch::Tensor plan_compress_decode(
     torch::Tensor req_to_token,
     torch::Tensor full_to_state,
     torch::Tensor seq_lens,
-    int64_t compress_ratio,
-    int64_t swa_page_size,
-    int64_t ring_size) {
-  TORCH_CHECK(req_pool_indices.dtype() == torch::kInt64);
-  TORCH_CHECK(req_to_token.dtype() == torch::kInt32);
-  TORCH_CHECK(full_to_state.dtype() == torch::kInt64);
-  TORCH_CHECK(seq_lens.dtype() == torch::kInt64);
+  int64_t compress_ratio,
+  int64_t swa_page_size,
+  int64_t ring_size) {
+  TORCH_CHECK(
+      req_pool_indices.is_xpu() && req_pool_indices.dtype() == torch::kInt64,
+      "req_pool_indices must be an int64 XPU tensor");
+  TORCH_CHECK(
+      req_to_token.is_xpu() && req_to_token.dtype() == torch::kInt32,
+      "req_to_token must be an int32 XPU tensor");
+  TORCH_CHECK(
+      full_to_state.is_xpu() && full_to_state.dtype() == torch::kInt64,
+      "full_to_state must be an int64 XPU tensor");
+  TORCH_CHECK(
+      seq_lens.is_xpu() && seq_lens.dtype() == torch::kInt64,
+      "seq_lens must be an int64 XPU tensor");
   TORCH_CHECK(req_to_token.dim() == 2, "req_to_token must be a 2D tensor");
   TORCH_CHECK(req_to_token.stride(1) == 1, "req_to_token must be contiguous in the last dim");
   TORCH_CHECK(compress_ratio > 0, "compress_ratio must be > 0");
 
-  int32_t batch_size = static_cast<int32_t>(seq_lens.numel());
+  uint32_t batch_size = static_cast<uint32_t>(seq_lens.numel());
   if (batch_size == 0) {
     return torch::empty({0, 16}, req_pool_indices.options().dtype(torch::kUInt8));
   }
 
-  int64_t req_to_token_stride = req_to_token.stride(0);
   auto output = torch::empty({batch_size, 16}, req_pool_indices.options().dtype(torch::kUInt8));
-  auto output_i32 = reinterpret_cast<int32_t*>(output.data_ptr<uint8_t>());
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   queue.submit([&](sycl::handler& cgh) {
@@ -106,11 +122,11 @@ torch::Tensor plan_compress_decode(
         seq_lens.data_ptr<int64_t>(),
         req_to_token.data_ptr<int32_t>(),
         full_to_state.data_ptr<int64_t>(),
-        output_i32,
-        swa_page_size,
-        ring_size,
+        reinterpret_cast<int32_t*>(output.data_ptr<uint8_t>()),
+        static_cast<int32_t>(swa_page_size),
+        static_cast<int32_t>(ring_size),
         static_cast<int32_t>(compress_ratio),
-        req_to_token_stride,
+        req_to_token.size(1),
         batch_size};
     cgh.parallel_for(get_1d_range(batch_size), kernel);
   });

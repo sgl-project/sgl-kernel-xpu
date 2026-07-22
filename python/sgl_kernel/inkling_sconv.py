@@ -13,6 +13,7 @@ HIS_ZEROS = 0
 HIS_PREFIX = 1
 HIS_SEQ_MINUS_EXT = 2
 HIS_ONES = 3
+_FUSED_EXTEND_MAX_B = 1023
 
 
 class SconvDecodeMetadata(TypedDict):
@@ -93,7 +94,9 @@ def fused_extend_sconv_metadata(
     extend_seq_lens: Optional[torch.Tensor] = None,
     his_src: Optional[torch.Tensor] = None,
     draft_token_num: Optional[int] = None,
-) -> tuple[torch.Tensor, torch.Tensor, SconvExtendMetadata]:
+) -> Optional[tuple[torch.Tensor, torch.Tensor, SconvExtendMetadata]]:
+    if B > _FUSED_EXTEND_MAX_B or not getattr(cache_indices, "is_xpu", False):
+        return None
     _ensure_ops_registered()
     (
         query_start_loc,

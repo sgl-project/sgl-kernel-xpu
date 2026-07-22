@@ -58,6 +58,7 @@ from sgl_kernel.fused_norm_rope_v2_torch import compress_norm_rope_store
 from sgl_kernel.fused_q_indexer_rope_hadamard_quant_torch import (
     fused_q_indexer_rope_hadamard_quant,
 )
+from sgl_kernel.gdn_attn import gdn_attention
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,

@@ -101,9 +101,10 @@ EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(256)
 EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(512)
 
 // Non-paged (no_page) decode runners: np head dims only, no PAGE_SIZE
-// (FMHA_DECODE_NP_HEAD_DIMS = {64, 72, 96, 128, 192}). bf16 query only.
+// (FMHA_DECODE_NP_HEAD_DIMS = {64, 72, 80, 96, 128, 192}). bf16 query only.
 EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG(64)
 EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG(72)
+EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG(80)
 EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG(96)
 EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG(128)
 EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG(192)
@@ -226,6 +227,9 @@ EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG(192)
         break;                                                                                  \
       case 72:                                                                                  \
         DISPATCH_DECODE_NOPAGE_KERNEL(QG, 72);                                                  \
+        break;                                                                                  \
+      case 80:                                                                                  \
+        DISPATCH_DECODE_NOPAGE_KERNEL(QG, 80);                                                  \
         break;                                                                                  \
       case 96:                                                                                  \
         DISPATCH_DECODE_NOPAGE_KERNEL(QG, 96);                                                  \

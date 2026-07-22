@@ -48,15 +48,25 @@ struct RowStrides {
 };
 
 static inline RowStrides get_row_strides(const Tensor& t) {
-  TORCH_CHECK(t.dim() == 2 || t.dim() == 3, "get_row_strides: expected a 2D or 3D tensor, got ", t.dim(), "D");
+  TORCH_CHECK(
+      t.dim() == 2 || t.dim() == 3 || t.dim() == 4, "get_row_strides: expected a 2D/3D/4D tensor, got ", t.dim(), "D");
   if (t.dim() == 2) {
     return {t.stride(0), 1, 0};
   }
-  // 3D
-  int64_t outer_stride = t.stride(0);
-  int64_t inner_size = t.size(1);
-  int64_t inner_stride = t.stride(1);
-  if (t.size(0) == 1 || outer_stride == inner_size * inner_stride) {
+  if (t.dim() == 4) {
+    // 4D only: the leading batch-like dimension (dim 0) must be size 1,
+    // since our two-level (outer, inner) stride formula cannot represent
+    // a third level of striding.
+    TORCH_CHECK(
+        t.size(0) == 1, "get_row_strides: leading dimension 0 must have size 1 for a 4D tensor, got size ", t.size(0));
+  }
+
+  // For 3D/4D tensors, the outer is the second-to-last dimension and
+  // the inner is the last dimension.
+  int64_t outer_stride = t.stride(-3);
+  int64_t inner_size = t.size(-2);
+  int64_t inner_stride = t.stride(-2);
+  if (t.size(-2) == 1 || outer_stride == inner_size * inner_stride) {
     // Flattenable: a single stride describes all rows.
     return {inner_stride, 1, 0};
   }

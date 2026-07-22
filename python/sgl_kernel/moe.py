@@ -10,6 +10,11 @@ _MOE_SCORING_FUNC_MAP = {
     "sqrtsoftplus": 2,
 }
 
+_MOE_BIASED_TOPK_SCORING_MAP = {
+    "sigmoid": 0,
+    "sqrtsoftplus": 1,
+}
+
 
 def moe_align_block_size(
     topk_ids,
@@ -156,10 +161,10 @@ def biased_topk(
     routed_scaling_factor=1.0,
     apply_routed_scaling_factor_on_output=False,
 ):
-    scoring_func_int = _MOE_SCORING_FUNC_MAP.get(scoring_func.lower())
-    if scoring_func_int is None or scoring_func_int == _MOE_SCORING_FUNC_MAP["softmax"]:
+    scoring_func_int = _MOE_BIASED_TOPK_SCORING_MAP.get(scoring_func.lower())
+    if scoring_func_int is None:
         raise ValueError(
-            f"Unknown/unsupported scoring_func '{scoring_func}', must be one of ['sigmoid', 'sqrtsoftplus']"
+            f"Unknown scoring_func '{scoring_func}', must be one of {list(_MOE_BIASED_TOPK_SCORING_MAP.keys())}"
         )
 
     torch.ops.sgl_kernel.biased_topk.default(

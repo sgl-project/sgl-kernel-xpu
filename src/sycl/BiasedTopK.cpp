@@ -21,10 +21,9 @@ constexpr uint32_t kSmallTokenThreshold = 512;
 constexpr uint32_t kMaxExperts = 512;
 constexpr uint32_t kMaxTopK = 16;
 
-// Value '1' is used for softmax in frontend, which is not used for current kernel.
 enum class ScoringFunc : uint32_t {
   kSigmoid = 0,
-  kSqrtSoftplus = 2,
+  kSqrtSoftplus = 1,
 };
 
 template <ScoringFunc kScoringFunc>
@@ -110,8 +109,6 @@ struct BiasedTopkKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       shared_scores[e] = score_val + bias_val;
       shared_original_scores[e] = score_val;
     }
-
-    sycl::group_barrier(item.get_group(), sycl::memory_scope::work_group);
 
     const uint32_t topk_routed = topk_ - num_fused_shared_experts_;
     for (uint32_t k = 0; k < topk_routed; ++k) {
@@ -479,7 +476,7 @@ void biased_topk(
   TORCH_CHECK(input.size(1) <= kMaxExperts, "num_experts exceeds maximum supported value: ", kMaxExperts);
   TORCH_CHECK(topk > num_fused_shared_experts, "topk must be greater than num_fused_shared_experts");
   TORCH_CHECK(topk <= kMaxTopK, "topk exceeds maximum supported value: ", kMaxTopK);
-  TORCH_CHECK(scoring_func == 0 || scoring_func == 2, "scoring_func must be 0 (sigmoid) or 2 (sqrtsoftplus)");
+  TORCH_CHECK(scoring_func == 0 || scoring_func == 1, "scoring_func must be 0 (sigmoid) or 1 (sqrtsoftplus)");
   TORCH_CHECK(output.scalar_type() == torch::kFloat32, "output must be float32");
   TORCH_CHECK(indices.scalar_type() == torch::kInt32, "indices must be int32");
   TORCH_CHECK(output.dim() == 2, "output must be 2D, got ", output.dim(), "D");

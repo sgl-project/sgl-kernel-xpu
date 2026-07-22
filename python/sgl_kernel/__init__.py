@@ -93,6 +93,7 @@ from sgl_kernel.moe import (
     cutlass_fp4_group_mm,
     fp8_blockwise_scaled_grouped_mm,
     fused_experts,
+    hash_topk,
     moe_align_block_size,
     moe_fused_gate,
     moe_sum,

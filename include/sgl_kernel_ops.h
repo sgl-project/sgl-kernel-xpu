@@ -133,6 +133,13 @@ void topk_sigmoid(
     const c10::optional<at::Tensor>& correction_bias,
     double routed_scaling_factor = 1.0,
     int64_t num_fused_shared_experts = 0);
+void hash_topk(
+    at::Tensor& router_logits,
+    at::Tensor& input_id,
+    at::Tensor& tid2eid,
+    at::Tensor& topk_weights,
+    at::Tensor& topk_ids,
+    double routed_scaling_factor = 1.0);
 
 std::tuple<at::Tensor, at::Tensor> rotary_embedding(
     at::Tensor& positions,

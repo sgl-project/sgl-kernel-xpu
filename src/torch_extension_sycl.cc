@@ -58,6 +58,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "correction_bias, float routed_scaling_factor=1.0, int num_fused_shared_experts=0) -> ()");
   m.impl("topk_sigmoid", torch::kXPU, &at::native::xpu::topk_sigmoid);
 
+  m.def(
+      "hash_topk(Tensor router_logits, Tensor input_id, Tensor tid2eid, Tensor! topk_weights, Tensor! topk_ids, "
+      "float routed_scaling_factor=1.0) -> ()");
+  m.impl("hash_topk", torch::kXPU, &at::native::xpu::hash_topk);
+
   m.def("top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
   m.impl("top_k_renorm_probs", torch::kXPU, &top_k_renorm_probs);
 

@@ -63,6 +63,30 @@ def topk_sigmoid(
     )
 
 
+def hash_topk(
+    router_logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    tid2eid: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    routed_scaling_factor: float = 1.0,
+    scoring_func: str = "sqrtsoftplus",
+) -> None:
+    if scoring_func != "sqrtsoftplus":
+        raise ValueError(
+            f"hash_topk only supports scoring_func='sqrtsoftplus', got {scoring_func}"
+        )
+
+    torch.ops.sgl_kernel.hash_topk.default(
+        router_logits,
+        input_ids,
+        tid2eid,
+        topk_weights,
+        topk_ids,
+        routed_scaling_factor,
+    )
+
+
 def moe_sum_reduce(
     input_tensor,
     output_tensor,

@@ -4,6 +4,7 @@
 #include <torch/all.h>
 
 #include <cstdint>
+#include <numeric>
 #include <optional>
 #include <sycl/sycl.hpp>
 
@@ -26,10 +27,39 @@ struct ToSyclElementType<at::BFloat16> {
   using type = sycl::ext::oneapi::bfloat16;
 };
 
+#define DISPATCH_MINP_VEC_SIZE(vec_size, VEC_SIZE_VAR, ...) \
+  switch (vec_size) {                                       \
+    case 16: {                                              \
+      constexpr uint32_t VEC_SIZE_VAR = 16;                 \
+      __VA_ARGS__;                                          \
+      break;                                                \
+    }                                                       \
+    case 8: {                                               \
+      constexpr uint32_t VEC_SIZE_VAR = 8;                  \
+      __VA_ARGS__;                                          \
+      break;                                                \
+    }                                                       \
+    case 4: {                                               \
+      constexpr uint32_t VEC_SIZE_VAR = 4;                  \
+      __VA_ARGS__;                                          \
+      break;                                                \
+    }                                                       \
+    case 2: {                                               \
+      constexpr uint32_t VEC_SIZE_VAR = 2;                  \
+      __VA_ARGS__;                                          \
+      break;                                                \
+    }                                                       \
+    default: {                                              \
+      constexpr uint32_t VEC_SIZE_VAR = 1;                  \
+      __VA_ARGS__;                                          \
+      break;                                                \
+    }                                                       \
+  }
+
 //----------------- min-p rejection sampling --------------------//
 // One work-group processes one request row.
 
-template <typename DType>
+template <typename DType, uint32_t kMaxVecSize>
 struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr uint32_t kWgSize = 1024;
 
@@ -83,27 +113,29 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const float p = (maybe_min_p_arr != nullptr) ? maybe_min_p_arr[row_idx] : min_p_val;
     const uint32_t num_chunks = (d + kWgSize - 1) / kWgSize;
 
+    using max_vec_in = vec_t<DType, kMaxVecSize>;
+    const uint32_t num_max_chunks = (d + kWgSize * kMaxVecSize - 1) / (kWgSize * kMaxVecSize);
+
+    float thread_max = -std::numeric_limits<float>::infinity();
+    for (uint32_t i = 0; i < num_max_chunks; ++i) {
+      const uint32_t col_base = (i * kWgSize + tx) * kMaxVecSize;
+      max_vec_in v(static_cast<DType>(0));
+      if (col_base < d) {
+        v.load(
+            0, sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(probs + row_offset + col_base));
+      }
+#pragma unroll
+      for (uint32_t j = 0; j < kMaxVecSize; ++j) {
+        thread_max = sycl::max(thread_max, static_cast<float>(v[j]));
+      }
+    }
+    const float row_max = sycl::reduce_over_group(grp, thread_max, sycl::maximum<float>());
+    const float pivot = p * row_max;
+
     constexpr uint32_t kVecSize = 4;
     using vec_in = vec_t<DType, kVecSize>;
     const uint32_t num_vec_elems = d / kVecSize;
     const uint32_t vec_tail_start = num_vec_elems * kVecSize;
-
-    float thread_max = -std::numeric_limits<float>::infinity();
-    for (uint32_t i = tx; i < num_vec_elems; i += kWgSize) {
-      vec_in v;
-      v.load(
-          0,
-          sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(probs + row_offset + i * kVecSize));
-#pragma unroll
-      for (uint32_t j = 0; j < kVecSize; ++j) {
-        thread_max = sycl::max(thread_max, static_cast<float>(v[j]));
-      }
-    }
-    for (uint32_t col = vec_tail_start + tx; col < d; col += kWgSize) {
-      thread_max = sycl::max(thread_max, static_cast<float>(probs[row_offset + col]));
-    }
-    const float row_max = sycl::reduce_over_group(grp, thread_max, sycl::maximum<float>());
-    const float pivot = p * row_max;
 
     float thread_sum = 0.0f;
     const uint32_t n_valid = (tx < d) ? ((d - tx - 1) / kWgSize + 1) : 0;
@@ -197,10 +229,21 @@ void launch_min_p_sampling(
   const int local_size = 1024;
   const int global_size = batch_size * local_size;
 
-  auto kernel = MinPSamplingKernel<KernelDType>(
-      probs_ptr, output, maybe_indices, maybe_min_p_arr, min_p_val, batch_size, vocab_size, philox_seed, philox_offset);
+  const uint32_t vec_size = std::gcd(16 / sizeof(KernelDType), vocab_size);
 
-  sycl_kernel_submit(global_size, local_size, queue, kernel);
+  DISPATCH_MINP_VEC_SIZE(vec_size, kMaxVecSize, {
+    auto kernel = MinPSamplingKernel<KernelDType, kMaxVecSize>(
+        probs_ptr,
+        output,
+        maybe_indices,
+        maybe_min_p_arr,
+        min_p_val,
+        batch_size,
+        vocab_size,
+        philox_seed,
+        philox_offset);
+    sycl_kernel_submit(global_size, local_size, queue, kernel);
+  });
 }
 
 void min_p_sampling_from_probs(

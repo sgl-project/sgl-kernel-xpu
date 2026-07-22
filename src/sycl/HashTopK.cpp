@@ -11,7 +11,7 @@
 
 namespace at::native::xpu {
 
-namespace HashTopKImpl {
+namespace {
 
 static constexpr int kWarpSize = 32;
 static constexpr int kBlockSize = 128;
@@ -137,12 +137,12 @@ void launch_hash_topk(
   sycl_kernel_submit(global_size, kBlockSize, queue, task);
 }
 
-}  // namespace HashTopKImpl
+}  // namespace
 
 void hash_topk(
-    at::Tensor& router_logits,
-    at::Tensor& input_id,
-    at::Tensor& tid2eid,
+  const at::Tensor& router_logits,
+  const at::Tensor& input_id,
+  const at::Tensor& tid2eid,
     at::Tensor& topk_weights,
     at::Tensor& topk_ids,
     double routed_scaling_factor) {
@@ -172,7 +172,7 @@ void hash_topk(
 
   auto& queue = dpcppGetCurrentQueue();
   DISPATCH_FLOAT_TYPES(router_logits.scalar_type(), "hash_topk_xpu", [&] {
-    HashTopKImpl::launch_hash_topk<scalar_t>(
+    launch_hash_topk<scalar_t>(
         queue,
         router_logits.data_ptr<scalar_t>(),
         input_id.data_ptr<int64_t>(),

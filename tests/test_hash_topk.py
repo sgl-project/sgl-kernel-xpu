@@ -54,13 +54,15 @@ def hash_topk_torch_native(
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("num_tokens", [1, 64, 1024, 4096])
+@pytest.mark.parametrize("topk_routed", [6, 8])
 @pytest.mark.parametrize("num_fused_shared_experts", [0, 1])
 @pytest.mark.parametrize("num_routed_experts", [64, 256, 384])
-def test_hash_topk(dtype, num_tokens, num_fused_shared_experts, num_routed_experts):
+def test_hash_topk(
+    dtype, num_tokens, topk_routed, num_fused_shared_experts, num_routed_experts
+):
     torch.manual_seed(1024)
 
     vocab_size = 1024
-    topk_routed = 8
     routed_scaling_factor = 2.5
 
     router_logits = torch.randn(

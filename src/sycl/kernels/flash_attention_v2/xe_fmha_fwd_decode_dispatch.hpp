@@ -51,7 +51,10 @@ namespace decode {
 
 #define EXTERN_FMHA_DECODE_RUNNER(QG, HD, PS) extern template struct FmhaDecodeRunner<QG, HD, PS>;
 
-#define EXTERN_FMHA_SPLIT_DECODE_RUNNER(QG, HD, PS) extern template struct FmhaSplitDecodeRunner<QG, HD, PS>;
+#define EXTERN_FMHA_SPLIT_DECODE_RUNNER(QG, HD, PS) \
+  extern template struct FmhaSplitDecodeRunner<QG, HD, PS>;
+
+#define EXTERN_FMHA_DECODE_NP_RUNNER(QG, HD) extern template struct FmhaDecodeNpRunner<QG, HD>;
 
 #define EXTERN_FMHA_DECODE_RUNNER_ALL_PAGE_SIZES(QG, HD) \
   EXTERN_FMHA_DECODE_RUNNER(QG, HD, 64)                  \
@@ -75,8 +78,16 @@ namespace decode {
   EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_PAGE_SIZES(8, HD) \
   EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_PAGE_SIZES(16, HD)
 
+#define EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG(HD) \
+  EXTERN_FMHA_DECODE_NP_RUNNER(1, HD)           \
+  EXTERN_FMHA_DECODE_NP_RUNNER(2, HD)           \
+  EXTERN_FMHA_DECODE_NP_RUNNER(4, HD)           \
+  EXTERN_FMHA_DECODE_NP_RUNNER(8, HD)           \
+  EXTERN_FMHA_DECODE_NP_RUNNER(16, HD)
+
+// Paged decode + split-decode runners: paged head dims only
+// (FMHA_DECODE_PAGED_HEAD_DIMS = {64, 96, 128, 192, 256, 512}). bf16 query only.
 EXTERN_FMHA_DECODE_RUNNER_ALL_QG(64)
-EXTERN_FMHA_DECODE_RUNNER_ALL_QG(72)
 EXTERN_FMHA_DECODE_RUNNER_ALL_QG(96)
 EXTERN_FMHA_DECODE_RUNNER_ALL_QG(128)
 EXTERN_FMHA_DECODE_RUNNER_ALL_QG(192)
@@ -84,31 +95,52 @@ EXTERN_FMHA_DECODE_RUNNER_ALL_QG(256)
 EXTERN_FMHA_DECODE_RUNNER_ALL_QG(512)
 
 EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(64)
-EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(72)
 EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(96)
 EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(128)
 EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(192)
 EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(256)
 EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(512)
 
+// Non-paged (no_page) decode runners: np head dims only, no PAGE_SIZE
+// (FMHA_DECODE_NP_HEAD_DIMS = {64, 72, 96, 128, 192}). bf16 query only.
+EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG(64)
+EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG(72)
+EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG(96)
+EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG(128)
+EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG(192)
+
 #undef EXTERN_FMHA_DECODE_RUNNER
 #undef EXTERN_FMHA_SPLIT_DECODE_RUNNER
+#undef EXTERN_FMHA_DECODE_NP_RUNNER
 #undef EXTERN_FMHA_DECODE_RUNNER_ALL_PAGE_SIZES
 #undef EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_PAGE_SIZES
 #undef EXTERN_FMHA_DECODE_RUNNER_ALL_QG
 #undef EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG
+#undef EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG
 
 // Dispatch macros following the GroupGemmXe20.cpp pattern.
 // Directly call struct operator() - no function pointers.
 // These expand inside decode::mha_fwd where a local `params` is in scope.
+//
+// Paged decode supports bf16 query only. The KV layout is selected at runtime:
+// fp8 KV cache (FmhaDecodeFp8Runner / FmhaSplitDecodeFp8Runner) vs 16-bit KV
+// (FmhaDecodeRunner / FmhaSplitDecodeRunner). Each is a separate translation
+// unit / shared library.
 
-#define DISPATCH_DECODE_KERNEL(QG, HD, PS)         \
-  do {                                             \
-    if (params.use_split_kv) {                     \
-      FmhaSplitDecodeRunner<QG, HD, PS>{}(params); \
-    } else {                                       \
-      FmhaDecodeRunner<QG, HD, PS>{}(params);      \
-    }                                              \
+#define DISPATCH_DECODE_KERNEL(QG, HD, PS)                                   \
+  do {                                                                       \
+    TORCH_CHECK(params.is_bf16, "Decode attention only supports bf16 query"); \
+    if (params.is_e4m3 || params.is_e5m2) {                                  \
+      if (params.use_split_kv) {                                             \
+        FmhaSplitDecodeFp8Runner<QG, HD, PS>{}(params);                       \
+      } else {                                                               \
+        FmhaDecodeFp8Runner<QG, HD, PS>{}(params);                            \
+      }                                                                      \
+    } else if (params.use_split_kv) {                                        \
+      FmhaSplitDecodeRunner<QG, HD, PS>{}(params);                            \
+    } else {                                                                 \
+      FmhaDecodeRunner<QG, HD, PS>{}(params);                                 \
+    }                                                                        \
   } while (0)
 
 #define DISPATCH_DECODE_PAGE_SIZE(QG, HD)                                                     \
@@ -125,33 +157,30 @@ EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(512)
     }                                                                                         \
   } while (0)
 
-#define DISPATCH_DECODE_HEAD_DIM(QG)                                                  \
-  do {                                                                                \
-    switch (params.d) {                                                               \
-      case 64:                                                                        \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 64);                                            \
-        break;                                                                        \
-      case 72:                                                                        \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 72);                                            \
-        break;                                                                        \
-      case 96:                                                                        \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 96);                                            \
-        break;                                                                        \
-      case 128:                                                                       \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 128);                                           \
-        break;                                                                        \
-      case 192:                                                                       \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 192);                                           \
-        break;                                                                        \
-      case 256:                                                                       \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 256);                                           \
-        break;                                                                        \
-      case 512:                                                                       \
-        DISPATCH_DECODE_PAGE_SIZE(QG, 512);                                           \
-        break;                                                                        \
-      default:                                                                        \
-        TORCH_CHECK(false, "Unsupported head size for decode attention: ", params.d); \
-    }                                                                                 \
+#define DISPATCH_DECODE_HEAD_DIM(QG)                                                        \
+  do {                                                                                      \
+    switch (params.d) {                                                                     \
+      case 64:                                                                              \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 64);                                                  \
+        break;                                                                              \
+      case 96:                                                                              \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 96);                                                  \
+        break;                                                                              \
+      case 128:                                                                             \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 128);                                                 \
+        break;                                                                              \
+      case 192:                                                                             \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 192);                                                 \
+        break;                                                                              \
+      case 256:                                                                             \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 256);                                                 \
+        break;                                                                              \
+      case 512:                                                                             \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 512);                                                 \
+        break;                                                                              \
+      default:                                                                              \
+        TORCH_CHECK(false, "Unsupported head size for paged decode attention: ", params.d); \
+    }                                                                                       \
   } while (0)
 
 #define DISPATCH_DECODE(qg_sz)                                                                      \
@@ -175,6 +204,65 @@ EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(512)
       default:                                                                                      \
         TORCH_CHECK(false, "Unsupported q_group_size for decode attention: ", params.q_group_size); \
     }                                                                                               \
+  } while (0)
+
+// ---------------------------------------------------------------------------
+// Non-paged (no_page) decode dispatch. The non-paged path is compiled into its
+// own runner type (FmhaDecodeNpRunner, no PAGE_SIZE) so it links into shared
+// libraries separate from the paged decode path. It supports bf16 query only
+// (no fp8 KV cache, no split-KV).
+// ---------------------------------------------------------------------------
+
+#define DISPATCH_DECODE_NOPAGE_KERNEL(QG, HD)                                          \
+  do {                                                                                 \
+    TORCH_CHECK(params.is_bf16, "Non-paged decode attention only supports bf16 query"); \
+    FmhaDecodeNpRunner<QG, HD>{}(params);                                               \
+  } while (0)
+
+#define DISPATCH_DECODE_NOPAGE_HEAD_DIM(QG)                                                     \
+  do {                                                                                          \
+    switch (params.d) {                                                                         \
+      case 64:                                                                                  \
+        DISPATCH_DECODE_NOPAGE_KERNEL(QG, 64);                                                  \
+        break;                                                                                  \
+      case 72:                                                                                  \
+        DISPATCH_DECODE_NOPAGE_KERNEL(QG, 72);                                                  \
+        break;                                                                                  \
+      case 96:                                                                                  \
+        DISPATCH_DECODE_NOPAGE_KERNEL(QG, 96);                                                  \
+        break;                                                                                  \
+      case 128:                                                                                 \
+        DISPATCH_DECODE_NOPAGE_KERNEL(QG, 128);                                                 \
+        break;                                                                                  \
+      case 192:                                                                                 \
+        DISPATCH_DECODE_NOPAGE_KERNEL(QG, 192);                                                 \
+        break;                                                                                  \
+      default:                                                                                  \
+        TORCH_CHECK(false, "Unsupported head size for non-paged decode attention: ", params.d); \
+    }                                                                                           \
+  } while (0)
+
+#define DISPATCH_DECODE_NOPAGE(qg_sz)                                                                         \
+  do {                                                                                                        \
+    switch (qg_sz) {                                                                                          \
+      case 1:                                                                                                 \
+        DISPATCH_DECODE_NOPAGE_HEAD_DIM(1);                                                                   \
+        break;                                                                                                \
+      case 2:                                                                                                 \
+        DISPATCH_DECODE_NOPAGE_HEAD_DIM(2);                                                                   \
+        break;                                                                                                \
+      case 4:                                                                                                 \
+        DISPATCH_DECODE_NOPAGE_HEAD_DIM(4);                                                                   \
+        break;                                                                                                \
+      case 8:                                                                                                 \
+        DISPATCH_DECODE_NOPAGE_HEAD_DIM(8);                                                                   \
+        break;                                                                                                \
+      case 16:                                                                                                \
+        DISPATCH_DECODE_NOPAGE_HEAD_DIM(16);                                                                  \
+        break;                                                                                                \
+      default:                                                                                                \
+        TORCH_CHECK(false, "Unsupported q_group_size for non-paged decode attention: ", params.q_group_size); \
+    }                                                                                                         \
   } while (0)
 
 }  // namespace decode

@@ -48,29 +48,46 @@ void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const A
   using TileShapeOutput = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;
   using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<@PAGE_SIZE@ / 16>, cute::_1>>;
 
-  // FP8 KV cache (Q bf16/fp16, K/V e4m3/e5m2) is compiled in a separate
-  // translation unit (FmhaSplitDecodeFp8Runner, generated from
-  // xe_fmha_fwd_split_decode_fp8_kernel.cpp.in) so its heavy e4m3/e5m2 kernel
-  // instantiations do not inflate this TU's peak compiler memory.
-  if (params.is_e4m3 || params.is_e5m2) {
-    FmhaSplitDecodeFp8Runner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>{}(params);
-    return;
-  }
-
 #if @HEAD_DIM@ == 64
     AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-        SplitDecodeConfig<false, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(
-            params);
+          using Element = bfloat16_t;
+          SplitDecodeConfig<
+              false,
+              LocalMask,
+              Sink,
+              TileShapeQK,
+              TileShapePV,
+              TileShapeOutput,
+              SubgroupLayoutQK,
+              void,
+              1,
+              Element,
+              Element,
+              Element,
+              Element>::run(params);
       });
-  });
+    });
 #else
     TORCH_CHECK(
         !params.use_sink,
         "sink is only supported for head_size == 64, got @HEAD_DIM@");
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-      SplitDecodeConfig<false, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(
-          params);
+        using Element = bfloat16_t;
+        SplitDecodeConfig<
+            false,
+            LocalMask,
+            false,
+            TileShapeQK,
+            TileShapePV,
+            TileShapeOutput,
+            SubgroupLayoutQK,
+            void,
+            1,
+            Element,
+            Element,
+            Element,
+              Element>::run(params);
     });
 #endif
 }

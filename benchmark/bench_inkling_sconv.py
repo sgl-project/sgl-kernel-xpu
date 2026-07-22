@@ -137,6 +137,22 @@ def _make_windows_case(B: int, D: int, W: int, draft_token_num: int, dtype: torc
     return cache, hidden, cache_indices, out
 
 
+def _make_decode_metadata_case(B: int):
+    torch.manual_seed(129)
+    cache_indices = torch.randint(0, 65536, (B,), dtype=torch.int32, device="xpu")
+    cache_indices[torch.rand(B, device="xpu") < 0.05] = -1
+    return cache_indices
+
+
+def _make_extend_metadata_case(B: int, tokens_per_seq: int):
+    torch.manual_seed(130)
+    lens = torch.full((B,), tokens_per_seq, dtype=torch.int32, device="xpu")
+    lens[torch.rand(B, device="xpu") < 0.05] = 0
+    cache_indices = torch.randint(0, 65536, (B,), dtype=torch.int32, device="xpu")
+    cache_indices[torch.rand(B, device="xpu") < 0.05] = -1
+    return cache_indices, lens
+
+
 def _print_result(name: str, median_ms: float, avg_ms: float, bytes_moved: int) -> None:
     print(
         f"{name:24s} median={median_ms:8.4f} ms  avg={avg_ms:8.4f} ms  "
@@ -156,6 +172,8 @@ def main() -> int:
             "gather-scatter",
             "draft-extend",
             "windows",
+            "decode-metadata",
+            "extend-metadata",
         ],
         default="all",
     )
@@ -197,6 +215,8 @@ def main() -> int:
         causal_conv1d,
         fused_causal_conv1d_update_decode,
         fused_draft_extend_sconv_cache,
+        fused_decode_sconv_metadata,
+        fused_extend_sconv_metadata,
         fused_gather_scatter_to_sconv_cache,
         save_intermediate_conv_windows,
         update_sconv_cache,
@@ -312,6 +332,45 @@ def main() -> int:
         median_ms, avg_ms = _bench(run_windows, warmup=args.warmup, iters=args.iters)
         bytes_moved = out.numel() * elem_size * 2
         _print_result("windows", median_ms, avg_ms, bytes_moved)
+
+    if args.op in ("all", "decode-metadata"):
+        cache_indices = _make_decode_metadata_case(args.B)
+
+        def run_decode_metadata():
+            fused_decode_sconv_metadata(B=args.B, cache_indices=cache_indices)
+
+        median_ms, avg_ms = _bench(run_decode_metadata, warmup=args.warmup, iters=args.iters)
+        bytes_moved = args.B * (
+            cache_indices.element_size()
+            + torch.empty((), dtype=torch.bool).element_size() * 2
+            + torch.empty((), dtype=torch.int64).element_size() * 2
+            + torch.empty((), dtype=torch.int32).element_size() * 2
+        )
+        _print_result("decode_metadata", median_ms, avg_ms, bytes_moved)
+
+    if args.op in ("all", "extend-metadata"):
+        tokens_per_seq = max(1, args.T // args.B)
+        T = tokens_per_seq * args.B
+        cache_indices, lens = _make_extend_metadata_case(args.B, tokens_per_seq)
+
+        def run_extend_metadata():
+            fused_extend_sconv_metadata(
+                B=args.B,
+                T=T,
+                cache_indices=cache_indices,
+                his_mode=0,
+                extend_seq_lens=lens,
+            )
+
+        median_ms, avg_ms = _bench(run_extend_metadata, warmup=args.warmup, iters=args.iters)
+        bytes_moved = args.B * (
+            cache_indices.element_size()
+            + lens.element_size()
+            + torch.empty((), dtype=torch.bool).element_size() * 2
+            + torch.empty((), dtype=torch.int64).element_size() * 2
+            + torch.empty((), dtype=torch.int32).element_size() * 2
+        ) + T * torch.empty((), dtype=torch.int32).element_size()
+        _print_result("extend_metadata", median_ms, avg_ms, bytes_moved)
 
     return 0
 

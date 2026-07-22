@@ -72,11 +72,10 @@ def hash_topk(
     routed_scaling_factor: float = 1.0,
     scoring_func: str = "sqrtsoftplus",
 ) -> None:
-    if scoring_func != "sqrtsoftplus":
-        raise ValueError(
-            f"hash_topk only supports scoring_func='sqrtsoftplus', got {scoring_func}"
-        )
 
+    assert (
+        scoring_func == "sqrtsoftplus"
+    ), "hash_topk only supports scoring_func of 'sqrtsoftplus'"
     torch.ops.sgl_kernel.hash_topk.default(
         router_logits,
         input_ids,

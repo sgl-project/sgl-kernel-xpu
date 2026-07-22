@@ -570,14 +570,17 @@ void top_k_renorm_probs(
     int64_t top_k_val);
 
 void top_p_renorm_probs(
-    at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_p_arr, double top_p_val);
+    at::Tensor& renorm_probs,
+    const at::Tensor& probs,
+    const std::optional<at::Tensor>& maybe_top_p_arr,
+    double top_p_val);
 
 void top_k_top_p_sampling_from_probs(
     at::Tensor probs,
     at::Tensor output,
     std::optional<at::Tensor> maybe_indices,
     std::optional<at::Tensor> maybe_top_k_arr,
-    double top_k_val,
+    int64_t top_k_val,
     std::optional<at::Tensor> maybe_top_p_arr,
     double top_p_val,
     bool deterministic,

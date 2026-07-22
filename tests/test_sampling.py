@@ -10,9 +10,8 @@ import utils
 device = utils.get_device()
 
 
-@pytest.mark.skip(reason="not implemented")
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256, 151936])
 @pytest.mark.parametrize("p", [0.1, 0.5])
 def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
     torch.manual_seed(42)
@@ -55,25 +54,84 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
         ]
 
 
-@pytest.mark.skip(reason="not implemented")
-@pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
-@pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
-def test_top_p_renorm_probs(batch_size, vocab_size, p):
-    torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device=f"{device}:0")
-    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
-    sorted_prob, indices = torch.sort(normalized_prob, descending=False)
+def torch_top_p_renorm_probs(normalized_prob, p):
+    """Compute ground truth for top-p renormalization.
+
+    The reference algorithm runs entirely in float32 so that the sort/cumsum
+    accumulation error does not shift the selected nucleus. The kernel also
+    performs its internal reductions in float32 on the same bf16-promoted
+    values, so this matches the kernel's precision.
+
+    Args:
+        normalized_prob: [batch_size, vocab_size] probabilities
+        p: float or [batch_size] tensor of per-row p values
+    """
+    orig_dtype = normalized_prob.dtype
+    normalized_prob_f = normalized_prob.float()
+    batch_size, vocab_size = normalized_prob_f.size()
+    sorted_prob, indices = torch.sort(normalized_prob_f, descending=False)
     cdf = torch.cumsum(sorted_prob, dim=-1)
+    if isinstance(p, torch.Tensor):
+        # Per-row p array: [batch_size] -> [batch_size, 1] for broadcasting
+        threshold = (1 - p.float()).unsqueeze(-1)
+    else:
+        threshold = 1 - float(p)
     mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32, device=f"{device}:0")
-    mask.scatter_add_(1, indices, (cdf >= (1 - p)).int())
-    renorm_prob_ground_truth = normalized_prob.clone()
+    mask.scatter_add_(1, indices, (cdf >= threshold).int())
+    renorm_prob_ground_truth = normalized_prob_f.clone()
     renorm_prob_ground_truth[mask == 0] = 0
     renorm_prob_ground_truth = renorm_prob_ground_truth / renorm_prob_ground_truth.sum(
         dim=-1, keepdim=True
     )
+    return renorm_prob_ground_truth.to(orig_dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256, 151936])
+@pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
+def test_top_p_renorm_probs(dtype, batch_size, vocab_size, p):
+    torch.manual_seed(42)
+    # Normalize in float32 before casting: a large fp16 vocab (e.g. 151936)
+    # overflows fp16's 65504 max when summed, producing an all-zero (inf-divided)
+    # distribution that is not a meaningful test input.
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device=f"{device}:0")
+    normalized_prob = (pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)).to(
+        dtype
+    )
+    renorm_prob_ground_truth = torch_top_p_renorm_probs(normalized_prob, p)
 
     renorm_prob = sgl_kernel.top_p_renorm_prob(normalized_prob, p)
+    torch.testing.assert_close(
+        renorm_prob_ground_truth,
+        renorm_prob,
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("batch_size", [1, 16, 128])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("p_range", [(0.1, 0.5), (0.5, 0.9)])
+def test_top_p_renorm_probs_tensor(dtype, batch_size, vocab_size, p_range):
+    p_min, p_max = p_range
+    torch.manual_seed(42)
+    # Normalize in float32 before casting to avoid fp16 sum overflow at large vocab.
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device=f"{device}:0")
+    normalized_prob = (pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)).to(
+        dtype
+    )
+
+    # Create per-row top-p array with varied values
+    top_p_arr = torch.rand(batch_size, device=f"{device}:0") * (p_max - p_min) + p_min
+
+    # Compute ground truth using unified function
+    renorm_prob_ground_truth = torch_top_p_renorm_probs(normalized_prob, top_p_arr)
+
+    # Test with per-row p array
+    renorm_prob = sgl_kernel.top_p_renorm_prob(normalized_prob, top_p_arr)
+
     torch.testing.assert_close(
         renorm_prob_ground_truth,
         renorm_prob,
@@ -118,38 +176,44 @@ def torch_top_k_renorm_probs(normalized_prob, k):
         return renorm_prob_ground_truth
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
-def test_top_k_renorm_probs(batch_size, vocab_size, k):
+def test_top_k_renorm_probs(batch_size, vocab_size, k, dtype):
     # Note: SYCL kernel clamps k > vocab_size to vocab_size
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
     torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device=f"{device}:0")
+    pre_norm_prob = torch.rand(
+        batch_size, vocab_size, device=f"{device}:0", dtype=dtype
+    )
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     renorm_prob_ground_truth = torch_top_k_renorm_probs(normalized_prob, k)
 
     renorm_prob = sgl_kernel.top_k_renorm_prob(normalized_prob, k)
 
     torch.testing.assert_close(
-        renorm_prob_ground_truth,
-        renorm_prob,
+        renorm_prob_ground_truth.float(),
+        renorm_prob.float(),
         rtol=1e-3,
         atol=1e-3,
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("batch_size", [1, 16, 128])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k_range", [(10, 50), (50, 200)])
-def test_top_k_renorm_probs_array(batch_size, vocab_size, k_range):
+def test_top_k_renorm_probs_array(batch_size, vocab_size, k_range, dtype):
     # Note: SYCL kernel clamps k > vocab_size to vocab_size
     k_min, k_max = k_range
     if k_max > vocab_size:
         pytest.skip("k_max should be less than vocab_size")
     torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device=f"{device}:0")
+    pre_norm_prob = torch.rand(
+        batch_size, vocab_size, device=f"{device}:0", dtype=dtype
+    )
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
 
     # Create per-row top-k array with varied values
@@ -166,8 +230,8 @@ def test_top_k_renorm_probs_array(batch_size, vocab_size, k_range):
     renorm_prob = sgl_kernel.top_k_renorm_prob(normalized_prob, top_k_arr)
 
     torch.testing.assert_close(
-        renorm_prob_ground_truth,
-        renorm_prob,
+        renorm_prob_ground_truth.float(),
+        renorm_prob.float(),
         rtol=1e-3,
         atol=1e-3,
     )

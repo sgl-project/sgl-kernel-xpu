@@ -20,6 +20,12 @@ def parse_args():
         default=os.path.join(os.getcwd(), "build", "mem_monitor", "compile_mem.jsonl"),
     )
     p.add_argument("--file-limit-gib", type=float, default=4.0)
+    p.add_argument(
+        "--file-limit-fatal",
+        action="store_true",
+        help="Kill the compile and fail the build if a single file's peak RSS "
+        "reaches --file-limit-gib (instead of only reporting it).",
+    )
     p.add_argument("--guard-avail-gib", type=float, default=0.5)
     p.add_argument("--guard-used-pct", type=float, default=99.0)
     args, rest = p.parse_known_args()
@@ -109,6 +115,17 @@ def detect_source(args):
     return os.path.basename(args[0]) if args else "<unknown>"
 
 
+def terminate(proc):
+    """SIGTERM the compiler, then SIGKILL if it does not exit promptly."""
+    try:
+        proc.send_signal(signal.SIGTERM)
+        time.sleep(1.0)
+        if proc.poll() is None:
+            proc.kill()
+    except ProcessLookupError:
+        pass
+
+
 def append_record(db_path, record):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     lock_path = db_path + ".lock"
@@ -158,6 +175,7 @@ def main():
     peak_system_used_kb = 0
     killed_by_guard = False
     guard_reason = ""
+    file_limit_exceeded = False
 
     while proc.poll() is None:
         rss_kb = tree_rss_kb(proc.pid)
@@ -171,6 +189,20 @@ def main():
             peak_system_used_kb = used_kb
         used_pct = 0.0 if mem_total_kb == 0 else used_kb * 100.0 / mem_total_kb
 
+        # Per-file hard limit: kill as soon as a single compile's tree RSS
+        # reaches the threshold so the memory is actually reclaimed (not just
+        # reported after the fact) and the build fails fast.
+        if args.file_limit_fatal and rss_kb >= file_limit_kb:
+            file_limit_exceeded = True
+            print(
+                f"[{HEADER}] {source} reached the per-file limit "
+                f"({rss_kb / 1024.0 / 1024.0:.2f} GiB >= {args.file_limit_gib:.1f} GiB), "
+                "stopping build. Split this translation unit into smaller TUs.",
+                file=sys.stderr,
+            )
+            terminate(proc)
+            break
+
         if avail_kb <= guard_avail_kb or used_pct >= args.guard_used_pct:
             killed_by_guard = True
             guard_reason = (
@@ -180,13 +212,7 @@ def main():
                 f"[{HEADER}] OOM guard hit while building {source} ({guard_reason}), stopping build.",
                 file=sys.stderr,
             )
-            try:
-                proc.send_signal(signal.SIGTERM)
-                time.sleep(1.0)
-                if proc.poll() is None:
-                    proc.kill()
-            except ProcessLookupError:
-                pass
+            terminate(proc)
             break
 
         time.sleep(0.2)
@@ -200,11 +226,16 @@ def main():
         "exit_code": ret,
         "guard_triggered": killed_by_guard,
         "guard_reason": guard_reason,
+        "file_limit_exceeded": file_limit_exceeded,
         "cmd": " ".join(args.compiler_cmd),
     }
     append_record(args.db, rec)
-    if killed_by_guard:
+    if killed_by_guard or file_limit_exceeded:
         print_current_offenders(args.db, file_limit_kb)
+    # Signal failure to ninja/cmake on a limit breach even if the killed
+    # compiler happened to exit 0 in the race before the signal landed.
+    if file_limit_exceeded:
+        return ret or 3
     return ret
 
 

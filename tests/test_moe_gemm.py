@@ -220,7 +220,7 @@ def test_moe_gemm(
         gemm1_limit=gemm1_limit,
         routed_scaling_factor=routed_scaling_factor,
     )
-    sglang_output = fused_experts(
+    kernel_output = fused_experts(
         a,
         w1,
         w2,
@@ -234,7 +234,7 @@ def test_moe_gemm(
         routed_scaling_factor=routed_scaling_factor,
     )
 
-    torch.testing.assert_close(torch_output, sglang_output, rtol=rtol, atol=atol)
+    torch.testing.assert_close(torch_output, kernel_output, rtol=rtol, atol=atol)
 
 
 # ---------------------------------------------------------------------------
@@ -291,46 +291,81 @@ def _dequantize_weights_mxfp4(
 
 
 def _pack_int4_codes(codes: torch.Tensor) -> torch.Tensor:
-    return (codes[..., 0::2] | (codes[..., 1::2] << 4)).to(torch.uint8)
+    nibble_codes = torch.bitwise_and(codes.to(torch.int16), 0xF)
+    return (nibble_codes[..., 0::2] | (nibble_codes[..., 1::2] << 4)).to(torch.uint8)
+
+
+def _make_int4_weight(
+    num_experts: int,
+    output_size: int,
+    input_size: int,
+    group_size: int,
+    dtype: torch.dtype,
+    explicit_zero: bool,
+    permutations: torch.Tensor | None = None,
+):
+    assert input_size % group_size == 0
+    if explicit_zero:
+        codes = torch.randint(
+            0, 16, (num_experts, output_size, input_size), dtype=torch.int16
+        )
+        channel_zeros = torch.randint(
+            3, 13, (num_experts, output_size, 1), dtype=torch.int16
+        ).to(dtype)
+    else:
+        codes = torch.randint(
+            -8, 8, (num_experts, output_size, input_size), dtype=torch.int16
+        )
+        channel_zeros = None
+
+    channel_scales = torch.rand(num_experts, output_size, 1, dtype=dtype) * 0.02 + 0.005
+    num_groups = input_size // group_size
+    scales = channel_scales.expand(-1, -1, num_groups).contiguous()
+    zeros = (
+        channel_zeros.expand(-1, -1, num_groups).contiguous()
+        if channel_zeros is not None
+        else None
+    )
+
+    zero_for_reference = channel_zeros.float() if explicit_zero else 0.0
+    dequantized = ((codes.float() - zero_for_reference) * channel_scales.float()).to(
+        dtype
+    )
+
+    packed_codes = codes
+    if permutations is not None:
+        packed_codes = torch.gather(
+            codes,
+            2,
+            permutations[:, None, :].expand(-1, output_size, -1),
+        )
+
+    return _pack_int4_codes(packed_codes).view(torch.int8), scales, zeros, dequantized
 
 
 @pytest.mark.parametrize("explicit_zero", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_moe_grouped_mm_nt_xe20_int4_zero_point(explicit_zero, dtype):
+@pytest.mark.parametrize("group_size", [32, 64, 128, 256])
+def test_moe_grouped_mm_nt_xe20_int4_zero_point(explicit_zero, dtype, group_size):
     torch.manual_seed(0)
-    num_experts, rows_per_expert, gemm_n, gemm_k, group_size = 8, 2, 128, 128, 32
+    num_experts, rows_per_expert, gemm_n, gemm_k = 8, 2, 128, 256
     total_m = num_experts * rows_per_expert
 
     activations = torch.randn(total_m, gemm_k, dtype=dtype) * 0.1
-    codes = torch.randint(0, 16, (num_experts, gemm_n, gemm_k), dtype=torch.uint8)
-    scales = torch.rand(
-        num_experts, gemm_n, gemm_k // group_size, dtype=dtype
-    ) * 0.02
-    if explicit_zero:
-        zeros = torch.randint(
-            3,
-            13,
-            (num_experts, gemm_n, gemm_k // group_size),
-            dtype=torch.int32,
-        ).to(dtype)
-        packed = _pack_int4_codes(codes)
-    else:
-        zeros = None
-        packed = torch.bitwise_xor(_pack_int4_codes(codes), 0x88)
-
-    expanded_scales = scales.repeat_interleave(group_size, dim=-1).float()
-    expanded_zeros = (
-        zeros.repeat_interleave(group_size, dim=-1).float()
-        if zeros is not None
-        else 8.0
+    packed, scales, zeros, weights = _make_int4_weight(
+        num_experts,
+        gemm_n,
+        gemm_k,
+        group_size,
+        dtype,
+        explicit_zero,
     )
-    weights = (codes.float() - expanded_zeros) * expanded_scales
     expected = torch.cat(
         [
             activations[
                 expert * rows_per_expert : (expert + 1) * rows_per_expert
             ].float()
-            @ weights[expert].transpose(0, 1)
+            @ weights[expert].float().transpose(0, 1)
             for expert in range(num_experts)
         ]
     ).to(dtype)
@@ -339,19 +374,147 @@ def test_moe_grouped_mm_nt_xe20_int4_zero_point(explicit_zero, dtype):
     torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w4a16(
         output,
         activations.to("xpu"),
-        packed.view(torch.int8).to("xpu"),
+        packed.to("xpu"),
         scales.to("xpu"),
         zeros.to("xpu") if zeros is not None else None,
         None,
-        torch.full(
-            (num_experts,), rows_per_expert, dtype=torch.int32, device="xpu"
-        ),
+        torch.full((num_experts,), rows_per_expert, dtype=torch.int32, device="xpu"),
         num_experts,
         True,
         group_size,
     )
 
     torch.testing.assert_close(output.cpu(), expected, rtol=5e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("explicit_zero", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("activation", ["silu", "relu2"])
+def test_fused_experts_int4_w4a16(explicit_zero, dtype, with_bias, activation):
+    torch.manual_seed(1)
+    num_tokens, topk, num_experts = 5, 2, 8
+    hidden_size, intermediate_size, group_size = 128, 64, 32
+    gate_factor = 1 if activation == "relu2" else 2
+
+    activations = torch.randn(num_tokens, hidden_size, dtype=dtype) * 0.1
+    w1, w1_scale, w1_zero, w1_reference = _make_int4_weight(
+        num_experts,
+        gate_factor * intermediate_size,
+        hidden_size,
+        group_size,
+        dtype,
+        explicit_zero,
+    )
+    w2, w2_scale, w2_zero, w2_reference = _make_int4_weight(
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        group_size,
+        dtype,
+        explicit_zero,
+    )
+    topk_ids = torch.tensor([[0, 1], [2, 3], [4, 5], [6, 7], [0, 2]], dtype=torch.int64)
+    topk_weights = torch.rand(num_tokens, topk, dtype=torch.float32)
+    topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+
+    b1, b2 = None, None
+    if with_bias:
+        b1 = torch.randn(num_experts, gate_factor * intermediate_size) * 0.005
+        b2 = torch.randn(num_experts, hidden_size) * 0.005
+
+    expected = torch_naive_moe(
+        activations,
+        w1_reference,
+        w2_reference,
+        topk_ids,
+        topk_weights,
+        topk,
+        b1,
+        b2,
+        activations=activation,
+    )
+    actual = fused_experts(
+        activations.to("xpu"),
+        w1.to("xpu"),
+        w2.to("xpu"),
+        topk_weights.to("xpu"),
+        topk_ids.to("xpu"),
+        b1.to("xpu") if b1 is not None else None,
+        b2.to("xpu") if b2 is not None else None,
+        activation=activation,
+        use_int4_w4a16=True,
+        w1_scale=w1_scale.to("xpu"),
+        w2_scale=w2_scale.to("xpu"),
+        w1_zp=w1_zero.to("xpu") if w1_zero is not None else None,
+        w2_zp=w2_zero.to("xpu") if w2_zero is not None else None,
+    )
+
+    torch.testing.assert_close(actual.cpu(), expected, rtol=1e-1, atol=2e-2)
+
+
+def test_fused_experts_int4_w4a16_g_idx_permutations():
+    torch.manual_seed(2)
+    num_tokens, topk, num_experts = 4, 2, 8
+    hidden_size, intermediate_size = 128, 64
+    dtype = torch.bfloat16
+
+    w1_permutations = torch.stack(
+        [torch.randperm(hidden_size) for _ in range(num_experts)]
+    )
+    w2_permutations = torch.stack(
+        [torch.randperm(intermediate_size) for _ in range(num_experts)]
+    )
+    w1, w1_scale, w1_zero, w1_reference = _make_int4_weight(
+        num_experts,
+        2 * intermediate_size,
+        hidden_size,
+        32,
+        dtype,
+        True,
+        w1_permutations,
+    )
+    w2, w2_scale, w2_zero, w2_reference = _make_int4_weight(
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        32,
+        dtype,
+        True,
+        w2_permutations,
+    )
+    activations = torch.randn(num_tokens, hidden_size, dtype=dtype) * 0.1
+    # Experts 3-7 intentionally receive no rows.
+    topk_ids = torch.tensor([[0, 1], [1, 2], [2, 0], [0, 2]], dtype=torch.int64)
+    topk_weights = torch.rand(num_tokens, topk, dtype=torch.float32)
+    topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+
+    expected = torch_naive_moe(
+        activations,
+        w1_reference,
+        w2_reference,
+        topk_ids,
+        topk_weights,
+        topk,
+        None,
+        None,
+    )
+    actual = fused_experts(
+        activations.to("xpu"),
+        w1.to("xpu"),
+        w2.to("xpu"),
+        topk_weights.to("xpu"),
+        topk_ids.to("xpu"),
+        use_int4_w4a16=True,
+        w1_scale=w1_scale.to("xpu"),
+        w2_scale=w2_scale.to("xpu"),
+        w1_zp=w1_zero.to("xpu"),
+        w2_zp=w2_zero.to("xpu"),
+        w1_g_idx_perm=w1_permutations.to("xpu"),
+        w2_g_idx_perm=w2_permutations.to("xpu"),
+    )
+
+    torch.testing.assert_close(actual.cpu(), expected, rtol=1e-1, atol=2e-2)
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +598,7 @@ def test_moe_gemm_mxfp4_weights(
     # fused_experts expects packed weights as int8 (bitwise identical to the
     # uint8 reference packing) and raw uint8 E8M0 block scales.
     device = "xpu"
-    sglang_output = fused_experts(
+    kernel_output = fused_experts(
         a.to(device),
         w1_packed.view(torch.int8).to(device),
         w2_packed.view(torch.int8).to(device),
@@ -450,7 +613,7 @@ def test_moe_gemm_mxfp4_weights(
     )
 
     torch.testing.assert_close(
-        torch_output, sglang_output.to("cpu"), rtol=rtol, atol=atol
+        torch_output, kernel_output.to("cpu"), rtol=rtol, atol=atol
     )
 
 # ---------------------------------------------------------------------------
@@ -540,7 +703,7 @@ def test_moe_gemm_mxfp4_weights_gpt_oss(
     )
 
     device = "xpu"
-    sglang_output = fused_experts(
+    kernel_output = fused_experts(
         a.to(device),
         w1_packed.view(torch.int8).to(device),
         w2_packed.view(torch.int8).to(device),
@@ -557,18 +720,18 @@ def test_moe_gemm_mxfp4_weights_gpt_oss(
     )
 
     torch.testing.assert_close(
-        torch_output, sglang_output.to("cpu"), rtol=rtol, atol=atol
+        torch_output, kernel_output.to("cpu"), rtol=rtol, atol=atol
     )
 
 
 # ---------------------------------------------------------------------------
-# Op-level test: unified W4A16 MXFP4 vs. moe_grouped_mm_nt_xe20(dequant)
+# Op-level test: unified W4A16 MXFP4 vs. PyTorch(dequant)
 # ---------------------------------------------------------------------------
 #
 # Exercises the unified MXFP4 grouped GEMM op directly (no fused_experts
-# orchestrator). Compares against running the non-quantized bf16 grouped GEMM
-# on the dequantized weights — both paths see the same MXFP4-rounded weight
-# values, so any difference is bf16 GEMM arithmetic noise, not quantization.
+# orchestrator). Compares against PyTorch matmul on dequantized weights — both
+# paths see the same MXFP4-rounded weight values, so any difference is GEMM
+# arithmetic noise, not quantization.
 
 
 def _build_moe_gemm_inputs(
@@ -576,9 +739,10 @@ def _build_moe_gemm_inputs(
     avg_m_per_expert: int,
     gemm_n: int,
     gemm_k: int,
+    dtype: torch.dtype,
     seed: int = 0,
 ):
-    """Construct (activations, bf16_weights, mxfp4_packed, mxfp4_scales,
+    """Construct (activations, dequantized_weights, mxfp4_packed, mxfp4_scales,
     total_rows_for_experts, bias_or_none) on XPU for the op-level test."""
     torch.manual_seed(seed)
     torch.xpu.manual_seed_all(seed)
@@ -589,20 +753,20 @@ def _build_moe_gemm_inputs(
         (num_experts,), avg_m_per_expert, dtype=torch.int32, device="xpu"
     )
 
-    activations = create_random_xpu_tensor((total_m, gemm_k), torch.bfloat16)
+    activations = create_random_xpu_tensor((total_m, gemm_k), dtype)
 
-    # Build bf16 weights on CPU, quantize to mxfp4 there, then move to XPU.
-    w_bf16_cpu = create_random_cpu_tensor((num_experts, gemm_n, gemm_k), torch.bfloat16)
-    w_packed_cpu, w_scale_cpu = _quantize_weights_mxfp4(w_bf16_cpu)
-    w_dq_cpu = _dequantize_weights_mxfp4(w_packed_cpu, w_scale_cpu)
+    # Build weights on CPU, quantize to mxfp4 there, then move to XPU.
+    weights_cpu = create_random_cpu_tensor((num_experts, gemm_n, gemm_k), dtype)
+    w_packed_cpu, w_scale_cpu = _quantize_weights_mxfp4(weights_cpu)
+    w_dq_cpu = _dequantize_weights_mxfp4(w_packed_cpu, w_scale_cpu, dtype=dtype)
 
     # Unified W4A16 contract: int8 packed weights and raw uint8 E8M0 scales.
     w_dq_xpu = w_dq_cpu.to("xpu")
     w_packed_xpu = w_packed_cpu.view(torch.int8).to("xpu")
     w_scale_xpu = w_scale_cpu.to("xpu")
 
-    output_bf16 = torch.empty((total_m, gemm_n), dtype=torch.bfloat16, device="xpu")
-    output_mxfp4 = torch.empty((total_m, gemm_n), dtype=torch.bfloat16, device="xpu")
+    output_reference = torch.empty((total_m, gemm_n), dtype=dtype, device="xpu")
+    output_mxfp4 = torch.empty((total_m, gemm_n), dtype=dtype, device="xpu")
 
     return {
         "activations": activations,
@@ -610,22 +774,24 @@ def _build_moe_gemm_inputs(
         "w_packed": w_packed_xpu,
         "w_scale": w_scale_xpu,
         "total_rows": total_rows,
-        "output_bf16": output_bf16,
+        "output_reference": output_reference,
         "output_mxfp4": output_mxfp4,
     }
 
 
-@pytest.mark.parametrize("num_tokens_per_expert", [1, 33, 222])
+@pytest.mark.parametrize("num_tokens_per_expert", [2, 6, 33, 129])
 @pytest.mark.parametrize("num_experts", [8])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_op(
     num_tokens_per_expert,
     num_experts,
     hidden_size,
     intermediate_size,
+    dtype,
 ):
-    """Compare the unified MXFP4 op with BF16 GEMM on dequantized weights.
+    """Compare the unified MXFP4 op with GEMM on dequantized weights.
 
     gemm_k = hidden_size (activation's inner dim)
     gemm_n = 2*intermediate_size (w1 style).
@@ -640,21 +806,20 @@ def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_op(
         avg_m_per_expert=num_tokens_per_expert,
         gemm_n=gemm_n,
         gemm_k=gemm_k,
+        dtype=dtype,
     )
 
-    # Baseline: bf16 op on the dequantised weights.
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
-        inputs["output_bf16"],
-        inputs["activations"],
-        inputs["w_dq"],
-        None,
-        inputs["total_rows"],
-        num_experts,
-        0,
-        False,
-        1.702,
-        7.0,
-    )
+    rows_per_expert = num_tokens_per_expert
+    reference = torch.cat(
+        [
+            inputs["activations"][
+                expert * rows_per_expert : (expert + 1) * rows_per_expert
+            ].float()
+            @ inputs["w_dq"][expert].float().transpose(0, 1)
+            for expert in range(num_experts)
+        ]
+    ).to(dtype)
+    inputs["output_reference"].copy_(reference)
 
     torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w4a16(
         inputs["output_mxfp4"],
@@ -670,7 +835,7 @@ def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_op(
     )
 
     torch.testing.assert_close(
-        inputs["output_bf16"], inputs["output_mxfp4"], rtol=1e-1, atol=1e-2
+        inputs["output_reference"], inputs["output_mxfp4"], rtol=1e-1, atol=1e-2
     )
 
 

@@ -31,11 +31,13 @@
 #define SYCL_INTEL_TARGET 20
 
 #include <ATen/ATen.h>
+#include <c10/core/DeviceGuard.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
 #include <sycl/sycl.hpp>
 
+#include "sycl/Utils.h"
 #include "sycl/kernels/moe/xe20/w4a16/gemm_xe2_policy.hpp"
 
 namespace moe_w4a16 {
@@ -97,6 +99,31 @@ void moe_grouped_mm_nt_xe20_w4a16(
     const int64_t n_experts,
     bool is_int4,
     const int64_t group_size) {
+  CHECK_INPUT(output);
+  CHECK_INPUT(activations);
+  CHECK_INPUT(packed_weights);
+  CHECK_INPUT(scales);
+  CHECK_INPUT(rows_per_expert);
+  TORCH_CHECK(output.device() == activations.device(), "output must be on the same device as activations");
+  TORCH_CHECK(
+      packed_weights.device() == activations.device(), "packed_weights must be on the same device as activations");
+  TORCH_CHECK(scales.device() == activations.device(), "scales must be on the same device as activations");
+  TORCH_CHECK(
+      rows_per_expert.device() == activations.device(), "rows_per_expert must be on the same device as activations");
+  if (zeros.has_value()) {
+    const auto& zeros_tensor = *zeros;
+    CHECK_INPUT(zeros_tensor);
+    TORCH_CHECK(zeros_tensor.device() == activations.device(), "zeros must be on the same device as activations");
+  }
+  if (bias.has_value()) {
+    const auto& bias_tensor = *bias;
+    CHECK_INPUT(bias_tensor);
+    TORCH_CHECK(bias_tensor.device() == activations.device(), "bias must be on the same device as activations");
+  }
+
+  TORCH_CHECK(output.dim() == 2, "output must be 2D [total_m, N]");
+  TORCH_CHECK(activations.dim() == 2, "activations must be 2D [total_m, K]");
+  TORCH_CHECK(rows_per_expert.dim() == 1, "rows_per_expert must be 1D [E]");
   const int total_m = activations.size(0);
   const int gemm_k = activations.size(1);
 
@@ -125,6 +152,7 @@ void moe_grouped_mm_nt_xe20_w4a16(
     TORCH_CHECK(scales.scalar_type() == at::ScalarType::Byte, "mxfp4 scales must be uint8 (E8M0 exponent)");
   }
 
+  TORCH_CHECK(n_experts > 0, "n_experts must be positive");
   TORCH_CHECK(n_experts == rows_per_expert.size(0), "rows_per_expert must have n_experts elements");
   TORCH_CHECK(rows_per_expert.scalar_type() == at::ScalarType::Int, "rows_per_expert must be int32");
   TORCH_CHECK(output.size(0) == total_m, "output rows must match activations rows");
@@ -156,6 +184,7 @@ void moe_grouped_mm_nt_xe20_w4a16(
     zeros_ptr = zeros->data_ptr();
   }
 
+  c10::DeviceGuard device_guard(activations.device());
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
   at::Tensor atomic_buffer = at::empty({static_cast<long>(1)}, activations.options().dtype(at::kInt));

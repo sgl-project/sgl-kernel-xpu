@@ -32,15 +32,12 @@ def _apply_per_expert_channel_gather(
       out[:, c'] = x[:, perm[e, c']] for expert e's row block.
     - rows_per_expert: [num_experts] int32 row count per expert.
     """
-    counts = rows_per_expert.to("cpu", dtype=torch.int64).tolist()
-    start = 0
-    for e in range(num_experts):
-        cnt = counts[e]
-        if cnt > 0:
-            end = start + cnt
-            x[start:end] = x[start:end].index_select(1, perm[e])
-        start += cnt
-    return x
+    expert_ids = torch.repeat_interleave(
+        torch.arange(num_experts, device=x.device),
+        rows_per_expert.to(torch.int64),
+        output_size=x.size(0),
+    )
+    return x.gather(1, perm.index_select(0, expert_ids))
 
 
 def moe_align_block_size(
@@ -596,11 +593,12 @@ def fused_experts(
             assert swiglu_limit == 10
             # DeepSeek-V4 swiglu clamp. The 4-bit grouped GEMM no longer fuses
             # activation, so the clamp is applied in the unfused activation path
-            # below (see activation_type == 4 handling). Only the mxfp4 path
-            # ships DSV4 weights today.
+            # below (see activation_type == 4 handling).
             assert (
-                use_mxfp4_w4a16
-            ), "swiglu_limit (swiglu_deepseek_v4) is only supported with use_mxfp4_w4a16=True"
+                use_4bit_w4a16
+            ), (
+                "swiglu_limit requires use_mxfp4_w4a16=True or use_int4_w4a16=True"
+            )
             activation_type = 4
             activation = "swiglu_deepseek_v4"
             # Carry the clamp threshold in gemm1_limit (the only limit slot).

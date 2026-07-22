@@ -152,11 +152,11 @@ struct SconvForwardKernel {
       acc += tap * w;
     }
 
-    if (p.use_residual) {
-      acc += to_float_device(p.x[t * p.x_stride_t + d * p.x_stride_d]);
-    }
     if (p.use_silu) {
       acc = acc / (1.0f + sycl::native::exp(-acc));
+    }
+    if (p.use_residual) {
+      acc += to_float_device(p.x[t * p.x_stride_t + d * p.x_stride_d]);
     }
     p.y[t * p.y_stride_t + d * p.y_stride_d] = from_float_device<scalar_t>(acc);
   }
@@ -224,11 +224,11 @@ struct SconvForwardBlockKernel {
         acc += tap * weights[iw];
       }
 
-      if constexpr (UseResidual) {
-        acc += to_float_device(p.x[t * p.x_stride_t + d * p.x_stride_d]);
-      }
       if constexpr (UseSilu) {
         acc = acc / (1.0f + sycl::native::exp(-acc));
+      }
+      if constexpr (UseResidual) {
+        acc += to_float_device(p.x[t * p.x_stride_t + d * p.x_stride_d]);
       }
       p.y[t * p.y_stride_t + d * p.y_stride_d] = from_float_device<scalar_t>(acc);
     }
@@ -1702,7 +1702,7 @@ at::Tensor inkling_sconv_forward(
   TORCH_CHECK(si.numel() == x.size(0), "si must have one entry per token");
   TORCH_CHECK(x.stride(1) == 1, "x must be contiguous on D");
   TORCH_CHECK(sconv_cache.stride(2) == 1, "sconv_cache must be contiguous on D");
-  const WeightLayout weight_layout = resolve_weight_layout(weight, x.size(1), sconv_cache.size(1) + 1, true);
+  const WeightLayout weight_layout = resolve_weight_layout(weight, x.size(1), sconv_cache.size(1) + 1, false);
 
   at::Tensor y = at::empty_strided({x.size(0), x.size(1)}, {x.size(1), 1}, x.options());
   auto queue = c10::xpu::getCurrentXPUStream().queue();

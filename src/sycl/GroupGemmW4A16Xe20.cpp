@@ -157,7 +157,6 @@ void moe_grouped_mm_nt_xe20_w4a16(
   TORCH_CHECK(rows_per_expert.scalar_type() == at::ScalarType::Int, "rows_per_expert must be int32");
   TORCH_CHECK(output.size(0) == total_m, "output rows must match activations rows");
   TORCH_CHECK(output.size(1) == gemm_n, "output must have N columns");
-  TORCH_CHECK(n_experts % 8 == 0, "n_experts must be a multiple of 8 for the current implementation");
   TORCH_CHECK(gemm_n % 8 == 0, "N must be divisible by 8");
   TORCH_CHECK(
       activations.scalar_type() == at::ScalarType::BFloat16 || activations.scalar_type() == at::ScalarType::Half,

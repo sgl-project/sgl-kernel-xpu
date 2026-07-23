@@ -23,10 +23,10 @@
 #
 # Model shapes represent one rank of an 8-device SGLang deployment with
 # tp_size=8 and ep_size=8. In this mode moe_tp_size=1, so each rank keeps the
-# full intermediate width and stores one eighth of the experts. Set
-# SGL_MOE_BENCH_FULL_SHAPES=1 to include DeepSeek-V4 geometry (32 local experts,
-# hidden=7168, intermediate=2048 -> gemm1 N=4096/K=7168, gemm2 N=7168/K=2048;
-# gpt-oss: experts=4, hidden=2880, intermediate=2880).
+# full intermediate width and stores one eighth of the experts. The quick set
+# includes GPT-OSS geometry (4 local experts, hidden=2880, intermediate=2880).
+# Set SGL_MOE_BENCH_FULL_SHAPES=1 to also include DeepSeek-V4 geometry (32 local
+# experts, hidden=4096, intermediate=2048) and higher-load model points.
 #
 # Run:
 #   python benchmark/bench_moe_w4a16_grouped_gemm.py
@@ -65,43 +65,37 @@ except Exception as exc:
 
 QUICK_BENCH_SHAPES = [
     # (num_experts, avg_m_per_expert, gemm_n, gemm_k)  # total_m = experts*avg_m
-    (8, 16, 1024, 1024),
+    # Controlled sweep across the four avg_m dispatch policies.
+    (8, 4, 1024, 1024),
+    (8, 8, 1024, 1024),
     (8, 33, 1024, 1024),
-    (8, 64, 1024, 1024),
-    (8, 128, 1024, 1024),
-    (8, 33, 2048, 1024),
-    (8, 33, 1024, 2048),
-    (8, 128, 2048, 2048),
+    (8, 129, 1024, 1024),
+    # GPT-OSS-20B, TP=8/EP=8. avg_m=4 corresponds to 32 tokens under
+    # perfectly uniform routing: tokens * topk / global_experts = 32*4/32.
+    (4, 4, 5760, 2880),  # gemm1: [E, 2*intermediate, hidden]
+    (4, 4, 2880, 2880),  # gemm2: [E, hidden, intermediate]
 ]
 
-FULL_BENCH_SHAPES = [
+FULL_BENCH_SHAPES = QUICK_BENCH_SHAPES + [
     # (num_experts, avg_m_per_expert, gemm_n, gemm_k)  # total_m = experts*avg_m
-    #
-    # Generic square sweep (8 experts) — kept for a controlled shape ladder.
-    (8, 16, 1024, 1024),
-    (8, 33, 1024, 1024),
-    (8, 64, 1024, 1024),
-    (8, 128, 1024, 1024),
+    # N/K sensitivity at representative medium and large avg_m policies.
     (8, 33, 2048, 1024),
     (8, 33, 1024, 2048),
-    (8, 128, 2048, 2048),
-    #
+    (8, 129, 2048, 2048),
     # DeepSeek-V4 routed-expert GEMMs (32 of 256 experts per TP=8/EP=8 rank,
     # intermediate=2048, topk=6). gemm1 weight is [E, 2*inter, hidden] ->
-    # N=4096, K=7168; gemm2 weight is [E, hidden, inter] -> N=7168, K=2048.
+    # N=4096, K=4096; gemm2 weight is [E, hidden, inter] -> N=4096, K=2048.
     # avg_m is forced equal per expert: these are controlled load points, not
-    # a decode/prefill routing distribution. Total routed rows are E * avg_m.
-    (32, 1, 4096, 7168),  # dsv4 gemm1, EP=8 rank, avg_m=1
-    (32, 1, 7168, 2048),  # dsv4 gemm2, EP=8 rank, avg_m=1
-    (32, 48, 4096, 7168),  # dsv4 gemm1, EP=8 rank, avg_m=48
-    (32, 48, 7168, 2048),  # dsv4 gemm2, EP=8 rank, avg_m=48
-    #
-    # GPT-OSS routed-expert GEMMs (4 of 32 experts per TP=8/EP=8 rank,
-    # intermediate=2880, topk=4). gemm1 N=5760, K=2880; gemm2 N=2880, K=2880.
-    (4, 4, 5760, 2880),  # gpt-oss gemm1, EP=8 rank, avg_m=4
-    (4, 4, 2880, 2880),  # gpt-oss gemm2, EP=8 rank, avg_m=4
-    (4, 64, 5760, 2880),  # gpt-oss gemm1, EP=8 rank, avg_m=64
-    (4, 64, 2880, 2880),  # gpt-oss gemm2, EP=8 rank, avg_m=64
+    # a real routing distribution. avg_m=1 approximates a uniformly routed
+    # 43-token batch (43*6/256 ~= 1); avg_m=48 corresponds to 2048 tokens.
+    (32, 1, 4096, 4096),  # dsv4 gemm1, EP=8 rank, avg_m=1
+    (32, 1, 4096, 2048),  # dsv4 gemm2, EP=8 rank, avg_m=1
+    (32, 48, 4096, 4096),  # dsv4 gemm1, EP=8 rank, avg_m=48
+    (32, 48, 4096, 2048),  # dsv4 gemm2, EP=8 rank, avg_m=48
+    # GPT-OSS-20B higher-load point. avg_m=256 corresponds to 2048 tokens under
+    # uniform routing (2048*4/32 = 256), matching the fused benchmark's prefill.
+    (4, 256, 5760, 2880),  # gpt-oss gemm1, EP=8 rank, avg_m=256
+    (4, 256, 2880, 2880),  # gpt-oss gemm2, EP=8 rank, avg_m=256
 ]
 
 RUN_FULL_SHAPES = os.environ.get("SGL_MOE_BENCH_FULL_SHAPES") == "1"
@@ -123,7 +117,7 @@ def _quantize_bf16_weights_mxfp4(num_experts: int, N: int, K: int):
 
     Quantizes one expert at a time. Building the whole [E, N, K] bf16 tensor
     and calling `.float()` on it at once needs tens of GB of host RAM at the
-    real 256-expert / K=7168 shapes and trips the OOM killer. Per-expert
+    real 256-expert / N=4096/K=4096 shapes and trips the OOM killer. Per-expert
     normal_ draws consume the RNG in the same row-major order as one big draw,
     so the resulting weights are bit-identical to the naive version.
     """
@@ -555,12 +549,12 @@ def _correctness_check(rel_tol=CORRECTNESS_REL_TOL):
             rel_l2_err = diff / denom
             if not math.isfinite(rel_l2_err) or rel_l2_err > rel_tol:
                 failures.append(
-                    f"E{num_experts}x{avg_m}x{n}x{k}/{recipe}: "
+                        f"E{num_experts}x{avg_m}x{n}x{k}/{recipe}: "
                     f"{rel_l2_err:.5g} exceeds {rel_tol}"
                 )
             rows.append(
                 {
-                    "shape": f"E{num_experts}x{avg_m}x{n}x{k}",
+                        "shape": f"E{num_experts}x{avg_m}x{n}x{k}",
                     "recipe": recipe,
                     "rel_l2_err": round(rel_l2_err, 5),
                 }
@@ -596,7 +590,13 @@ if __name__ == "__main__":
         "weights_resident_MB",
     ]
     pv = df.pivot_table(
-        index=["num_experts", "avg_m", "total_m", "gemm_n", "gemm_k"],
+        index=[
+            "num_experts",
+            "avg_m",
+            "total_m",
+            "gemm_n",
+            "gemm_k",
+        ],
         columns="provider",
         values=pivot_cols,
         aggfunc="first",

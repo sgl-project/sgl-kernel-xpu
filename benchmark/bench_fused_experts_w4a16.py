@@ -17,7 +17,7 @@
 #
 # Shapes are TP=1 / EP=1 routed-expert model geometry:
 #   gpt-oss      : experts=32,  topk=4, hidden=2880, intermediate=2880
-#   deepseek-v4  : experts=256, topk=6, hidden=7168, intermediate=2048
+#   deepseek-v4  : experts=256, topk=6, hidden=4096, intermediate=2048
 #
 # Methodology mirrors that harness so single runs are not misleading:
 #   - deterministic per-route routing (softmax for gpt-oss, sqrt(softplus) +
@@ -33,13 +33,15 @@
 # must be importable in one env (vllm_xpu_kernels alongside sgl_kernel).
 #
 # Run:
-#   python benchmark/bench_fused_experts_w4a16.py                      # all
-#   python benchmark/bench_fused_experts_w4a16.py --profile deepseek-v4
+#   python benchmark/bench_fused_experts_w4a16.py                  # GPT-OSS
+#   SGL_MOE_BENCH_FULL_SHAPES=1 python benchmark/bench_fused_experts_w4a16.py
+#   SGL_MOE_BENCH_FULL_SHAPES=1 python benchmark/bench_fused_experts_w4a16.py --profile deepseek-v4
 #   python benchmark/bench_fused_experts_w4a16.py --sgl-only --tokens 1 32
 #   python benchmark/bench_fused_experts_w4a16.py --json-out out.json
 
 import gc
 import math
+import os
 import statistics
 import sys
 from pathlib import Path
@@ -82,7 +84,7 @@ MODEL_PROFILES = {
     "deepseek-v4": {
         "experts": 256,
         "topk": 6,
-        "hidden": 7168,
+        "hidden": 4096,
         "intermediate": 2048,
         "activation": "deepseek-v4",
         "router": "sqrtsoftplus",
@@ -92,15 +94,22 @@ MODEL_PROFILES = {
 # INT4 group size for the int4 providers. Matches the MXFP4 block size.
 INT4_GROUP_SIZE = 32
 
-DEFAULT_TOKENS = [1, 32]
+DEFAULT_TOKENS = [1, 32, 2048]
 DEFAULT_ROUTE_SEEDS = [0, 1, 2]
 DEFAULT_WARMUP = 20
 DEFAULT_REPETITIONS = 30
 DEFAULT_INNER = 10
 WEIGHT_SEED = 0
 DEFAULT_CORRECTNESS_REL_TOL = 2e-2
+PROVIDER_CHOICES = ["mxfp4_fused", "int4_fused", "vllm_mxfp4", "vllm_int4"]
+RUN_FULL_SHAPES = os.environ.get("SGL_MOE_BENCH_FULL_SHAPES") == "1"
+ENABLED_PROFILES = list(MODEL_PROFILES) if RUN_FULL_SHAPES else ["gpt-oss"]
 
 ALL_RESULTS = []
+
+
+def _recipe_for_provider(provider):
+    return "int4" if "int4" in provider else "mxfp4"
 
 
 def _build_and_quantize_weights_per_expert(E: int, rows: int, cols: int):
@@ -410,7 +419,7 @@ def benchmark_case(
     profile_name, tokens, provider, route_seeds, warmup, reps, inner, weights=None
 ):
     profile = MODEL_PROFILES[profile_name]
-    recipe = "int4" if provider.endswith("int4") else "mxfp4"
+    recipe = _recipe_for_provider(provider)
     backend = "vllm" if provider.startswith("vllm_") else "sgl"
 
     gc.collect()
@@ -467,14 +476,18 @@ def benchmark_case(
 
 
 def _correctness_check(
-    profiles, tokens_list, route_seed=0, rel_tol=DEFAULT_CORRECTNESS_REL_TOL
+    profiles,
+    tokens_list,
+    recipes,
+    route_seed=0,
+    rel_tol=DEFAULT_CORRECTNESS_REL_TOL,
 ):
     """Cross-check sgl_kernel vs vLLM MoE outputs on the same logical weights.
 
-    Runs the full MoE layer once per (profile, tokens, recipe) outside the
-    timed loop and reports the aggregate L2 relative error. sgl_kernel and vLLM
-    implement the same activation + combine, so a correct pair stays within a
-    few percent (bounded by 4-bit rounding + fp accumulation order).
+    Builds each (profile, recipe, backend) weight set once and reuses it across
+    token counts. The full MoE layer still runs once per token count outside
+    the timed loop. sgl_kernel and vLLM implement the same activation + combine,
+    so a correct pair stays within a few percent.
     """
     if not VLLM_REF_AVAILABLE:
         print("[correctness skipped: vllm_xpu_kernels unavailable]")
@@ -484,41 +497,58 @@ def _correctness_check(
     failures = []
     for profile_name in profiles:
         profile = MODEL_PROFILES[profile_name]
-        for tokens in tokens_list:
-            for recipe in ("mxfp4", "int4"):
-                try:
+        for recipe in recipes:
+            rel_by_tokens = {}
+            sgl_outputs = {}
+            sgl_w = None
+            vllm_w = None
+            try:
+                sgl_w = _build_weights(profile, recipe, "sgl")
+                for tokens in tokens_list:
                     x = _make_activations(tokens, profile, route_seed)
                     ids_cpu, w_cpu = _make_routing(tokens, profile, route_seed)
-
-                    sgl_w = _build_weights(profile, recipe, "sgl")
-                    sgl_out = _sgl_run(
+                    sgl_outputs[tokens] = _sgl_run(
                         sgl_w, x, _routing_for_backend(ids_cpu, w_cpu, "sgl"), profile
                     ).float()
-                    torch.xpu.synchronize()
-                    del sgl_w
-                    gc.collect()
-                    torch.xpu.empty_cache()
+                    del x
+                torch.xpu.synchronize()
+                sgl_w = None
+                gc.collect()
+                torch.xpu.empty_cache()
 
-                    vllm_w = _build_weights(profile, recipe, "vllm")
+                vllm_w = _build_weights(profile, recipe, "vllm")
+                for tokens in tokens_list:
+                    x = _make_activations(tokens, profile, route_seed)
+                    ids_cpu, w_cpu = _make_routing(tokens, profile, route_seed)
                     vllm_out = _vllm_run(
                         vllm_w, x, _routing_for_backend(ids_cpu, w_cpu, "vllm")
                     ).float()
                     torch.xpu.synchronize()
-                    diff = (sgl_out - vllm_out).norm().item()
+                    diff = (sgl_outputs[tokens] - vllm_out).norm().item()
                     denom = vllm_out.norm().clamp_min(1e-6).item()
                     rel = round(diff / denom, 5)
+                    rel_by_tokens[tokens] = rel
                     if not math.isfinite(rel) or rel > rel_tol:
                         failures.append(
                             f"{profile_name}/{tokens}tok/{recipe}: {rel} exceeds {rel_tol}"
                         )
-                    del vllm_w, vllm_out, sgl_out, x
-                    gc.collect()
-                    torch.xpu.empty_cache()
-                except Exception as exc:  # noqa: BLE001 — report, don't abort
-                    rel = f"ERR:{type(exc).__name__}"
-                    failures.append(f"{profile_name}/{tokens}tok/{recipe}: {rel}")
-                    gc.collect()
-                    torch.xpu.empty_cache()
+                    del vllm_out, sgl_outputs[tokens], x
+                vllm_w = None
+            except Exception as exc:  # noqa: BLE001 — report, don't abort
+                error = f"ERR:{type(exc).__name__}"
+                for tokens in tokens_list:
+                    if tokens not in rel_by_tokens:
+                        rel_by_tokens[tokens] = error
+                        failures.append(f"{profile_name}/{tokens}tok/{recipe}: {error}")
+            finally:
+                sgl_w = None
+                vllm_w = None
+                sgl_outputs.clear()
+                gc.collect()
+                torch.xpu.empty_cache()
+
+            for tokens in tokens_list:
+                rel = rel_by_tokens[tokens]
                 row = {
                     "profile": profile_name,
                     "tokens": tokens,
@@ -547,9 +577,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--profile",
-        choices=list(MODEL_PROFILES),
+        choices=ENABLED_PROFILES,
         default=None,
-        help="Run only this model profile (default: all).",
+        help=(
+            "Run only this enabled model profile. Set "
+            "SGL_MOE_BENCH_FULL_SHAPES=1 to enable deepseek-v4."
+        ),
     )
     parser.add_argument(
         "--tokens",
@@ -588,30 +621,64 @@ if __name__ == "__main__":
         help="Skip the vLLM reference providers (run only sgl_kernel).",
     )
     parser.add_argument(
+        "--providers",
+        choices=PROVIDER_CHOICES,
+        nargs="+",
+        default=None,
+        help="Run only these providers (default: all available providers).",
+    )
+    parser.add_argument(
         "--skip-correctness",
         action="store_true",
         help="Skip the sgl_kernel-vs-vLLM correctness gate before timing.",
     )
     args = parser.parse_args()
 
-    profiles = [args.profile] if args.profile else list(MODEL_PROFILES)
-    providers = ["mxfp4_fused", "int4_fused"]
-    if VLLM_REF_AVAILABLE and not args.sgl_only:
+    profiles = [args.profile] if args.profile else ENABLED_PROFILES
+    print(
+        f"[config] fused-experts shape set: "
+        f"{'full' if RUN_FULL_SHAPES else 'quick'} (profiles={profiles})",
+        flush=True,
+    )
+    providers = args.providers or ["mxfp4_fused", "int4_fused"]
+    if args.providers is None and VLLM_REF_AVAILABLE and not args.sgl_only:
         providers += ["vllm_mxfp4", "vllm_int4"]
+    if args.sgl_only:
+        providers = [
+            provider for provider in providers if not provider.startswith("vllm_")
+        ]
+    if not providers:
+        parser.error("no providers remain after applying --sgl-only")
+    if not VLLM_REF_AVAILABLE and any(
+        provider.startswith("vllm_") for provider in providers
+    ):
+        parser.error("a vLLM provider was requested but vllm_xpu_kernels is unavailable")
+    providers = list(dict.fromkeys(providers))
 
     correctness_results = {}
     if not args.sgl_only and not args.skip_correctness:
-        correctness_results = _correctness_check(
-            profiles,
-            args.tokens,
-            route_seed=args.route_seeds[0],
-            rel_tol=args.correctness_rel_tol,
-        )
+        correctness_recipes = []
+        for recipe, sgl_provider, vllm_provider in (
+            ("mxfp4", "mxfp4_fused", "vllm_mxfp4"),
+            ("int4", "int4_fused", "vllm_int4"),
+        ):
+            if sgl_provider in providers and vllm_provider in providers:
+                correctness_recipes.append(recipe)
+        if correctness_recipes:
+            correctness_results = _correctness_check(
+                profiles,
+                args.tokens,
+                correctness_recipes,
+                route_seed=args.route_seeds[0],
+                rel_tol=args.correctness_rel_tol,
+            )
+        else:
+            print("[correctness skipped: selected providers contain no backend pair]")
 
     for profile_name in profiles:
         profile = MODEL_PROFILES[profile_name]
         for provider in providers:
-            recipe = "int4" if provider.endswith("int4") else "mxfp4"
+            recipe = _recipe_for_provider(provider)
             backend = "vllm" if provider.startswith("vllm_") else "sgl"
             print(
                 f"[setup] profile={profile_name} provider={provider}: "
@@ -635,7 +702,7 @@ if __name__ == "__main__":
             torch.xpu.empty_cache()
 
     for row in ALL_RESULTS:
-        recipe = "int4" if row["provider"].endswith("int4") else "mxfp4"
+        recipe = _recipe_for_provider(row["provider"])
         row["correctness_rel_l2_err"] = correctness_results.get(
             (row["profile"], row["tokens"], recipe), "not_run"
         )

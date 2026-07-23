@@ -5,6 +5,13 @@ from typing import List, Tuple
 import torch
 
 
+def _compute_c128_loc(
+    rid: torch.Tensor, position: torch.Tensor, ring_size: int
+) -> torch.Tensor:
+    rid = rid.to(torch.int64)
+    return (rid * ring_size) + (position % ring_size)
+
+
 def _compute_loc(
     swa_loc: torch.Tensor, swa_page_size: int, ring_size: int
 ) -> torch.Tensor:
@@ -184,17 +191,25 @@ def plan_compress_prefill(
         has_buf = buf_len > 0
 
         rid = req_pool_indices.index_select(0, batch_id).long()
-        raw1 = req_to_token[rid, pos1].long()
-        raw0 = req_to_token[rid, pos0].long()
-        swa1 = full_to_swa.index_select(0, raw1).long()
-        swa0 = full_to_swa.index_select(0, raw0).long()
+        if compress_ratio == 128:
+            rp1 = (_compute_c128_loc(rid, pos1, ring_size) // compress_ratio).to(
+                torch.int32
+            )
+            rp0 = (_compute_c128_loc(rid, pos0, ring_size) // compress_ratio).to(
+                torch.int32
+            )
+        else:
+            raw1 = req_to_token[rid, pos1].long()
+            raw0 = req_to_token[rid, pos0].long()
+            swa1 = full_to_swa.index_select(0, raw1).long()
+            swa0 = full_to_swa.index_select(0, raw0).long()
 
-        rp1 = (_compute_loc(swa1, swa_page_size, ring_size) // compress_ratio).to(
-            torch.int32
-        )
-        rp0 = (_compute_loc(swa0, swa_page_size, ring_size) // compress_ratio).to(
-            torch.int32
-        )
+            rp1 = (_compute_loc(swa1, swa_page_size, ring_size) // compress_ratio).to(
+                torch.int32
+            )
+            rp0 = (_compute_loc(swa0, swa_page_size, ring_size) // compress_ratio).to(
+                torch.int32
+            )
 
         Ci32[:, 2] = torch.where(has_buf, rp0, torch.full_like(rp0, -1))
         Ci32[:, 3] = torch.where(has_buf, rp1, batch_id.to(torch.int32))
@@ -205,9 +220,12 @@ def plan_compress_prefill(
         pos = Wi32[:, 1].long() - 1
 
         rid = req_pool_indices.index_select(0, batch_id).long()
-        raw = req_to_token[rid, pos].long()
-        swa = full_to_swa.index_select(0, raw).long()
-        loc = _compute_loc(swa, swa_page_size, ring_size).to(torch.int32)
+        if compress_ratio == 128:
+            loc = _compute_c128_loc(rid, pos, ring_size).to(torch.int32)
+        else:
+            raw = req_to_token[rid, pos].long()
+            swa = full_to_swa.index_select(0, raw).long()
+            loc = _compute_loc(swa, swa_page_size, ring_size).to(torch.int32)
 
         Wi32[:, 0] = (Wi32[:, 0] & 0xFFFF).to(torch.int32)
         Wi32[:, 1] = loc
@@ -228,13 +246,17 @@ def plan_compress_decode(
     pos1 = seq_lens.long() - 1
     pos0 = (pos1 - compress_ratio).clamp(min=0)
 
-    raw1 = req_to_token[rid, pos1].long()
-    raw0 = req_to_token[rid, pos0].long()
-    swa1 = full_to_swa.index_select(0, raw1).long()
-    swa0 = full_to_swa.index_select(0, raw0).long()
+    if compress_ratio == 128:
+        loc1 = _compute_c128_loc(rid, pos1, ring_size).to(torch.int32)
+        loc0 = _compute_c128_loc(rid, pos0, ring_size).to(torch.int32)
+    else:
+        raw1 = req_to_token[rid, pos1].long()
+        raw0 = req_to_token[rid, pos0].long()
+        swa1 = full_to_swa.index_select(0, raw1).long()
+        swa0 = full_to_swa.index_select(0, raw0).long()
 
-    loc1 = _compute_loc(swa1, swa_page_size, ring_size).to(torch.int32)
-    loc0 = _compute_loc(swa0, swa_page_size, ring_size).to(torch.int32)
+        loc1 = _compute_loc(swa1, swa_page_size, ring_size).to(torch.int32)
+        loc0 = _compute_loc(swa0, swa_page_size, ring_size).to(torch.int32)
 
     return _pack_decode_plans(
         seq_lens, loc1, loc0 // compress_ratio, loc1 // compress_ratio

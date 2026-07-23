@@ -58,6 +58,7 @@ from sgl_kernel.fused_norm_rope_v2_torch import compress_norm_rope_store
 from sgl_kernel.fused_q_indexer_rope_hadamard_quant_torch import (
     fused_q_indexer_rope_hadamard_quant,
 )
+from sgl_kernel.gdn_attn import gdn_attention
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
@@ -79,6 +80,7 @@ from sgl_kernel.gemm import (
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.hadamard import hadamard_transform
 from sgl_kernel.lora import embedding_lora_a_fwd, sgemm_lora_a_fwd
+from sgl_kernel.mamba import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
 from sgl_kernel.memory import weak_ref_tensor
 from sgl_kernel.mhc import (
     hc_post,

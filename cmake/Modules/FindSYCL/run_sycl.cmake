@@ -124,9 +124,23 @@ if(WIN32)
 else()
   set(SYCL_dependency_file_args -MD -MF "${SYCL_generated_dependency_file}")
 endif()
+if("@SGL_BUILD_MEMORY_MONITOR@" STREQUAL "ON")
+  set(SYCL_compile_command
+    "@Python3_EXECUTABLE@"
+    "@PROJECT_SOURCE_DIR@/tools/memory/compiler_launcher.py"
+    --db "@SGL_BUILD_MEM_RECORDS@"
+    --file-limit-gib "@SGL_BUILD_MEM_FILE_LIMIT_GIB@"
+    --guard-avail-gib "@SGL_BUILD_MEM_GUARD_AVAIL_GIB@"
+    --guard-used-pct "@SGL_BUILD_MEM_GUARD_USED_PCT@"
+    "${SYCL_executable}"
+  )
+else()
+  set(SYCL_compile_command "${SYCL_executable}")
+endif()
+
 SYCL_execute_process(
   "Generating ${generated_file}"
-  COMMAND "${SYCL_executable}"
+  COMMAND ${SYCL_compile_command}
   ${SYCL_dependency_file_args}
   -c
   "${source_file}"

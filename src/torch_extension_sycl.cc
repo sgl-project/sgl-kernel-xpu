@@ -305,6 +305,34 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor seq_lens, Tensor block_tables, Tensor? schedule_metadata, "
       "int max_seq_len, bool clean_logits) -> Tensor");
   m.impl("fp8_paged_mqa_logits", torch::kXPU, &fp8_paged_mqa_logits);
+
+  /*
+   * From GDN (Gated DeltaNet) attention (Intel Xe2)
+   */
+  m.def(
+      "gdn_attention(Tensor! core_attn_out, Tensor! z, Tensor projected_states_qkvz, Tensor projected_states_ba, "
+      "int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim, "
+      "Tensor! conv_state, Tensor! ssm_state, Tensor conv_weights, Tensor? conv_bias, str activation, Tensor A_log, "
+      "Tensor dt_bias, int num_prefills, int num_decodes, int num_spec_decodes, Tensor? has_initial_state, "
+      "Tensor? non_spec_query_start_loc, Tensor? non_spec_token_indx, Tensor? non_spec_state_indices_tensor, "
+      "Tensor? spec_query_start_loc, Tensor? spec_token_indx, Tensor? spec_state_indices_tensor, "
+      "Tensor? num_accepted_tokens, int num_actual_tokens, int tp_size, bool reorder_input) -> ()");
+  m.impl("gdn_attention", torch::kXPU, &gdn_attention);
+
+  /*
+   * Mamba causal conv1d (XPU)
+   */
+  m.def(
+      "causal_conv1d_fwd(Tensor! x, Tensor weight, Tensor? bias_, Tensor(a!)? conv_states, "
+      "Tensor? query_start_loc, Tensor? cache_indices, Tensor? has_initial_state, "
+      "bool silu_activation, int pad_slot_id) -> ()");
+  m.impl("causal_conv1d_fwd", torch::kXPU, &causal_conv1d_fwd);
+
+  m.def(
+      "causal_conv1d_update(Tensor! x, Tensor! conv_state, Tensor weight, Tensor? bias_, "
+      "bool silu_activation, Tensor? cache_seqlens_, Tensor? conv_state_indices_, "
+      "int pad_slot_id) -> ()");
+  m.impl("causal_conv1d_update", torch::kXPU, &causal_conv1d_update);
 }
 
 REGISTER_EXTENSION(common_ops)

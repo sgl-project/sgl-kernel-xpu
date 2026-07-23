@@ -41,21 +41,52 @@ namespace prefill {
 //   HEAD_DIM in {64, 72, 96, 128, 192, 256, 512}
 
 #define EXTERN_FMHA_PREFILL_RUNNER(HD) extern template struct FmhaPrefillRunner<HD>;
+#define EXTERN_FMHA_PREFILL_NP_RUNNER(HD) extern template struct FmhaPrefillNpRunner<HD>;
 
+// Paged prefill runners: paged head dims only (64, 96, 128, 192, 256, 512).
+// bf16 query only.
 EXTERN_FMHA_PREFILL_RUNNER(64)
-EXTERN_FMHA_PREFILL_RUNNER(72)
 EXTERN_FMHA_PREFILL_RUNNER(96)
 EXTERN_FMHA_PREFILL_RUNNER(128)
 EXTERN_FMHA_PREFILL_RUNNER(192)
 EXTERN_FMHA_PREFILL_RUNNER(256)
 EXTERN_FMHA_PREFILL_RUNNER(512)
 
-#undef EXTERN_FMHA_PREFILL_RUNNER
+// Non-paged (no_page) prefill runners: np head dims only (64, 72, 80, 96, 128, 192).
+// bf16 query only.
+EXTERN_FMHA_PREFILL_NP_RUNNER(64)
+EXTERN_FMHA_PREFILL_NP_RUNNER(72)
+EXTERN_FMHA_PREFILL_NP_RUNNER(80)
+EXTERN_FMHA_PREFILL_NP_RUNNER(96)
+EXTERN_FMHA_PREFILL_NP_RUNNER(128)
+EXTERN_FMHA_PREFILL_NP_RUNNER(192)
 
-// Dispatch macro following the same pattern as decode.
+#undef EXTERN_FMHA_PREFILL_RUNNER
+#undef EXTERN_FMHA_PREFILL_NP_RUNNER
+
+// Dispatch macros following the same pattern as decode.
 // Directly call struct operator() - no function pointers.
 // Expands inside prefill::mha_fwd where a local `params` is in scope.
+//
+// Paged prefill supports bf16 query only. The KV layout is selected at runtime:
+// fp8 KV cache (FmhaPrefillFp8Runner) vs 16-bit KV (FmhaPrefillRunner). Each is
+// a separate translation unit / shared library.
 
-#define DISPATCH_PREFILL_KERNEL(HD) FmhaPrefillRunner<HD>{}(params)
+#define DISPATCH_PREFILL_KERNEL(HD)                                            \
+  do {                                                                         \
+    TORCH_CHECK(params.is_bf16, "Prefill attention only supports bf16 query"); \
+    if (params.is_e4m3 || params.is_e5m2) {                                    \
+      FmhaPrefillFp8Runner<HD>{}(params);                                      \
+    } else {                                                                   \
+      FmhaPrefillRunner<HD>{}(params);                                         \
+    }                                                                          \
+  } while (0)
+
+// Non-paged (no_page) prefill: bf16 query only (no fp8 KV cache).
+#define DISPATCH_PREFILL_NOPAGE_KERNEL(HD)                                               \
+  do {                                                                                   \
+    TORCH_CHECK(params.is_bf16, "Non-paged prefill attention only supports bf16 query"); \
+    FmhaPrefillNpRunner<HD>{}(params);                                                   \
+  } while (0)
 
 }  // namespace prefill

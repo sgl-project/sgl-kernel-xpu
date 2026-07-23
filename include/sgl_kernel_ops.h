@@ -728,6 +728,7 @@ void embedding_lora_a_fwd(
     const std::optional<torch::Tensor>& extra_embeddings,  // [num_loras, num_extra_tokens, max_rank]
     const std::optional<torch::Tensor>& seg_lens           // [num_segments,]
 );
+
 void sgemm_lora_a_fwd(
     torch::Tensor& output,         // [num_tokens, stacknum*max_rank]
     const torch::Tensor& input_x,  // [num_tokens, input_dim]
@@ -738,3 +739,61 @@ void sgemm_lora_a_fwd(
     const torch::Tensor& lora_ranks,              // [num_loras,]
     const std::optional<torch::Tensor>& seg_lens  // [num_segments,]
 );
+
+/*
+ * From GDN (Gated DeltaNet) attention (Intel Xe2)
+ */
+void gdn_attention(
+    torch::Tensor& core_attn_out,
+    torch::Tensor& z,
+    const torch::Tensor& projected_states_qkvz,
+    const torch::Tensor& projected_states_ba,
+    const int64_t num_k_heads,
+    const int64_t num_v_heads,
+    const int64_t head_k_dim,
+    const int64_t head_v_dim,
+    torch::Tensor& conv_state,
+    torch::Tensor& ssm_state,
+    const torch::Tensor& conv_weights,
+    const std::optional<torch::Tensor>& conv_bias,
+    const std::string& activation,
+    const torch::Tensor& A_log,
+    const torch::Tensor& dt_bias,
+    const int64_t num_prefills,
+    const int64_t num_decodes,
+    const int64_t num_spec_decodes,
+    const std::optional<torch::Tensor>& has_initial_state,
+    const std::optional<torch::Tensor>& non_spec_query_start_loc,
+    const std::optional<torch::Tensor>& non_spec_token_indx,
+    const std::optional<torch::Tensor>& non_spec_state_indices_tensor,
+    const std::optional<torch::Tensor>& spec_query_start_loc,
+    const std::optional<torch::Tensor>& spec_token_indx,
+    const std::optional<torch::Tensor>& spec_state_indices_tensor,
+    const std::optional<torch::Tensor>& num_accepted_tokens,
+    const int64_t num_actual_tokens,
+    const int64_t tp_size,
+    const bool reorder_input);
+
+/*
+ * Mamba causal conv1d (XPU)
+ */
+void causal_conv1d_fwd(
+    at::Tensor& x,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias_,
+    const std::optional<at::Tensor>& conv_states,
+    const std::optional<at::Tensor>& query_start_loc,
+    const std::optional<at::Tensor>& cache_indices,
+    const std::optional<at::Tensor>& has_initial_state,
+    bool silu_activation,
+    int64_t pad_slot_id);
+
+void causal_conv1d_update(
+    at::Tensor& x,
+    at::Tensor& conv_state,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias_,
+    bool silu_activation,
+    const std::optional<at::Tensor>& cache_seqlens_,
+    const std::optional<at::Tensor>& conv_state_indices_,
+    int64_t pad_slot_id);

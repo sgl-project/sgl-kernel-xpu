@@ -756,8 +756,9 @@ void launch_mla_prefill_fwd_kernel_policy(const XPUSparseAttnFwdParams& params) 
 }
 
 inline int sparse_mla_prefill_select_b_h(const XPUSparseAttnFwdParams& params) {
+  // Tuned B_H routing: head_q in (8, 32] runs fastest on the B_H=32 kernel
+  // (better MMA utilization than B_H=16, and lower padding cost than B_H=64).
   if (params.h_q <= 8) return 8;
-  if (params.h_q <= 16) return 16;
   if (params.h_q <= 32) return 32;
   return 64;
 }

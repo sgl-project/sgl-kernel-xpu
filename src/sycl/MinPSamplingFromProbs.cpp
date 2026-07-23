@@ -11,6 +11,7 @@
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "comm/Random.h"
+#include "comm/Sampling.h"
 
 template <typename T>
 struct ToSyclElementType {
@@ -110,44 +111,32 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const uint32_t tx = item.get_local_id(0);
     const uint32_t d = static_cast<uint32_t>(vocab_size);
     const uint32_t row_idx = (maybe_indices != nullptr) ? static_cast<uint32_t>(maybe_indices[bx]) : bx;
-    const size_t row_offset = static_cast<size_t>(row_idx) * static_cast<size_t>(d);
 
     const float p = (maybe_min_p_arr != nullptr) ? maybe_min_p_arr[bx] : min_p_val;
 
-    using vec_in = vec_t<DType, VEC_SIZE>;
-    const uint32_t num_chunks = (d + kWgSize * VEC_SIZE - 1) / (kWgSize * VEC_SIZE);
-
-    float thread_max = -std::numeric_limits<float>::infinity();
-    for (uint32_t i = 0; i < num_chunks; ++i) {
-      const uint32_t col_base = (i * kWgSize + tx) * VEC_SIZE;
-      vec_in v(static_cast<DType>(0));
-      if (col_base < d) {
-        v.load(
-            0, sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(probs + row_offset + col_base));
-      }
-#pragma unroll
-      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        thread_max = sycl::max(thread_max, static_cast<float>(v[j]));
-      }
-    }
-    const float max_val = sycl::reduce_over_group(grp, thread_max, sycl::maximum<float>());
+    const float max_val = sgl::sampling::get_max_value<DType, VEC_SIZE, kWgSize>(grp, probs, row_idx, tx, d);
     const float pivot = p * max_val;
 
-    float thread_sum = 0.0f;
-    for (uint32_t i = 0; i < num_chunks; ++i) {
-      const uint32_t col_base = (i * kWgSize + tx) * VEC_SIZE;
+    const size_t row_offset = static_cast<size_t>(row_idx) * static_cast<size_t>(d);
+    using vec_in = vec_t<DType, VEC_SIZE>;
+    float threadlocal_aggregate_gt_pivot = 0.0f;
+#pragma unroll
+    for (uint32_t i = 0; i < div_up(d, kWgSize * VEC_SIZE); ++i) {
       vec_in v(static_cast<DType>(0));
-      if (col_base < d) {
+      if ((i * kWgSize + tx) * VEC_SIZE < d) {
         v.load(
-            0, sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(probs + row_offset + col_base));
+            0,
+            sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(
+                probs + row_offset + (i * kWgSize + tx) * VEC_SIZE));
       }
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
         const float x = static_cast<float>(v[j]);
-        if (x >= pivot) thread_sum += x;
+        threadlocal_aggregate_gt_pivot += sycl::select(0.0f, x, x >= pivot);
       }
     }
-    const float q = sycl::reduce_over_group(grp, thread_sum, sycl::plus<float>());
+
+    const float aggregate_gt_pivot = sycl::reduce_over_group(grp, threadlocal_aggregate_gt_pivot, sycl::plus<float>());
 
     if (tx == 0) {
       sampled_id_[0] = static_cast<int32_t>(d);
@@ -155,60 +144,24 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     }
     item.barrier(sycl::access::fence_space::local_space);
 
-    const float u = sgl::random::philox_uniform(philox_seed, philox_offset, bx, /*round=*/0) * q;
+    const float u = sgl::random::philox_uniform(philox_seed, philox_offset, bx, /*round=*/0) * aggregate_gt_pivot;
 
     float aggregate = 0.0f;
-    for (uint32_t i = 0; i < num_chunks; ++i) {
-      const uint32_t col_base = (i * kWgSize + tx) * VEC_SIZE;
+#pragma unroll
+    for (uint32_t i = 0; i < div_up(d, kWgSize * VEC_SIZE); ++i) {
       vec_in v(static_cast<DType>(0));
-      if (col_base < d) {
+      if ((i * kWgSize + tx) * VEC_SIZE < d) {
         v.load(
-            0, sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(probs + row_offset + col_base));
+            0,
+            sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(
+                probs + row_offset + (i * kWgSize + tx) * VEC_SIZE));
       }
-
-      bool valid[VEC_SIZE];
-      float local_prefix[VEC_SIZE];
-      float running = 0.0f;
-#pragma unroll
-      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        const bool inb = col_base + j < d;
-        const float x = inb ? static_cast<float>(v[j]) : 0.0f;
-        valid[j] = inb && (x >= pivot);
-        running += valid[j] ? x : 0.0f;
-        local_prefix[j] = running;
-        if (valid[j]) {
-          sycl::atomic_ref<
-              int32_t,
-              sycl::memory_order::relaxed,
-              sycl::memory_scope::work_group,
-              sycl::access::address_space::local_space>(last_valid_id_[0])
-              .fetch_max(static_cast<int32_t>(col_base + j));
-        }
+      sgl::sampling::device_sampling_from_prob<DType, VEC_SIZE, kWgSize>(
+          item, i, d, [pivot](float x) { return x >= pivot; }, u, v, aggregate, sampled_id_, last_valid_id_);
+      if (aggregate > u) {
+        break;
       }
-      const float thread_total = running;
-
-      const float thread_excl = sycl::exclusive_scan_over_group(grp, thread_total, sycl::plus<float>());
-      const float block_total = sycl::reduce_over_group(grp, thread_total, sycl::plus<float>());
-
-      if (aggregate + block_total > u) {
-        const float cdf_before_thread = aggregate + thread_excl;
-#pragma unroll
-        for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-          if (valid[j] && (cdf_before_thread + local_prefix[j] > u)) {
-            sycl::atomic_ref<
-                int32_t,
-                sycl::memory_order::relaxed,
-                sycl::memory_scope::work_group,
-                sycl::access::address_space::local_space>(sampled_id_[0])
-                .fetch_min(static_cast<int32_t>(col_base + j));
-          }
-        }
-      }
-
-      aggregate += block_total;
-      if (aggregate > u) break;
     }
-    item.barrier(sycl::access::fence_space::local_space);
 
     if (tx == 0) {
       int32_t sampled_id = sampled_id_[0];

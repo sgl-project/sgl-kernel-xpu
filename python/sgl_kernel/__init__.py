@@ -79,6 +79,12 @@ from sgl_kernel.gemm import (
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.hadamard import hadamard_transform
+from sgl_kernel.inkling_attn_prologue import (
+    compile_inkling_attn_prologue,
+    inkling_attn_prologue_decode,
+    inkling_attn_prologue_extend,
+    inkling_attn_prologue_verify,
+)
 from sgl_kernel.lora import embedding_lora_a_fwd, sgemm_lora_a_fwd
 from sgl_kernel.mamba import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
 from sgl_kernel.memory import weak_ref_tensor

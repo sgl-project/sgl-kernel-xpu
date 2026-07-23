@@ -55,6 +55,7 @@
 #include <torch/all.h>
 
 #include <cute/tensor.hpp>
+#include <optional>
 #include <utility>
 
 #include "cutlass/bfloat16.h"
@@ -205,6 +206,14 @@ struct GroupGemmTypes {
 // c_ptrs aliased to d_ptrs; B-fwd passes beta=1 with a real residual C source).
 // All device pointers come from make_device_ptrs() and the meta tensors from
 // build_grouped_gemm_meta(); the caller keeps them alive across the kernel run.
+//
+// Per-segment alpha: the grouped epilogue (IntelXeGenericGroup) binds CUTLASS's
+// Sm90LinearCombinationPtrArray fusion. Its Sm90ScalarBroadcastPtrArray load
+// path indexes a *contiguous* scalar buffer through `alpha_ptr` when `dAlpha`
+// has a non-zero L-stride: `scalar = alpha_ptr[l_coord * stride]`. So pass
+// `alpha_values` as a device fp32 buffer of one alpha per segment (contiguous,
+// stride 1) to compute D = alpha[seg] * (A @ B) + beta * C -- what B-fwd needs. 
+// When it is std::nullopt the scalar`alpha` broadcasts to every segment with stride 0. 
 template <typename Types>
 inline typename Types::Gemm::Arguments args_from_options(
     const torch::Tensor& problem_sizes,  // int32  [num_segments, 3]  (M_s, N, K)
@@ -217,8 +226,10 @@ inline typename Types::Gemm::Arguments args_from_options(
     const torch::Tensor& stride_C,       // int64  [num_segments]     must equal stride_D
     const torch::Tensor& stride_D,       // int64  [num_segments]     leading dim of D = N
     int num_segments,
-    float alpha,   // epilogue scalar: D = alpha * (A @ B) + beta * C
-    float beta) {  //   A-fwd uses (1.0, 0.0); B-fwd / QKV-B-fwd use (1.0, 1.0) for in-place residual.
+    float alpha,   // epilogue scalar: D = alpha * (A @ B) + beta * C (used when alpha_values is null)
+    float beta,    //   A-fwd uses (1.0, 0.0); B-fwd / QKV-B-fwd use (1.0, 1.0) for in-place residual.
+    const std::optional<torch::Tensor>& alpha_values =
+        std::nullopt) {  // float32 [num_segments] contiguous per-segment alpha buffer (overrides scalar alpha)
   using GemmKernel = typename Types::GemmKernel;
   using ElementMma = typename Types::ElementMma;
   using ElementMmaB = typename Types::ElementMmaB;
@@ -261,15 +272,32 @@ inline typename Types::Gemm::Arguments args_from_options(
       typename GemmKernel::TileSchedulerArguments{1, RasterOrderOptions::AlongN}};
 
   // Epilogue thread arguments: D = alpha * acc + beta * C.
+  //
+  // alpha is either a single scalar broadcast to every segment (dAlpha stride 0)
+  // or a per-segment contiguous value buffer indexed by segment via alpha_ptr
+  // (dAlpha stride 1) -- see Sm90ScalarBroadcastPtrArray::update_scalar(). beta
+  // stays a broadcast scalar for both LoRA forward kernels. The alpha_ptr_array
+  // (array-of-pointers) path is left null; we use the value-buffer path.
+  using ElementScalar = typename Types::ElementAccumulator;  // fusion scalar type (== alpha/beta element)
   auto& fusion_args = arguments.epilogue.thread;
-  fusion_args.alpha = alpha;
   fusion_args.beta = beta;
-  fusion_args.alpha_ptr = nullptr;
   fusion_args.beta_ptr = nullptr;
   fusion_args.alpha_ptr_array = nullptr;
   fusion_args.beta_ptr_array = nullptr;
-  fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
   fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
+
+  if (alpha_values.has_value()) {
+    // Per-segment alpha: contiguous fp32 buffer, one value per segment; the
+    // fusion reads alpha_ptr[l_coord * 1] for group l_coord (dAlpha = {_0,_0,1}).
+    fusion_args.alpha = ElementScalar(0);
+    fusion_args.alpha_ptr = reinterpret_cast<ElementScalar const*>(alpha_values->data_ptr<float>());
+    fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 1};
+  } else {
+    // Single alpha broadcast to all segments (dAlpha = {_0,_0,0}).
+    fusion_args.alpha = alpha;
+    fusion_args.alpha_ptr = nullptr;
+    fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
+  }
 
   return arguments;
 }

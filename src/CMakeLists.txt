@@ -6,6 +6,7 @@ file(GLOB host_cpp "./*.cpp" "./*.cc")
 # registering the same schemas from multiple Python modules.
 list(FILTER host_cpp EXCLUDE REGEX ".*/torch_extension_inkling_sconv\\.cc$")
 list(FILTER host_cpp EXCLUDE REGEX ".*/torch_extension_inkling_attn_prologue\\.cc$")
+list(FILTER host_cpp EXCLUDE REGEX ".*/torch_extension_inkling_moe_gate\\.cc$")
 
 # BMG only
 set(device_cpp_xe20)

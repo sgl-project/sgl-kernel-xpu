@@ -21,7 +21,9 @@ setup_common_libraries()
 if(SYCL_COMPILER_VERSION GREATER_EQUAL 20250806)
   set(COMMON_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS})
   set(COMMON_DEVICE_LINK_FLAGS ${COMMON_DEVICE_LINK_FLAGS} -Xspirv-translator)
-  set(COMMON_DEVICE_LINK_FLAGS ${COMMON_DEVICE_LINK_FLAGS} -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+  set(COMMON_DEVICE_LINK_FLAGS
+      ${COMMON_DEVICE_LINK_FLAGS}
+      -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate)
 else()
   message(FATAL_ERROR
       "SYCL compiler version must be >= 20250806, "
@@ -40,7 +42,9 @@ foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
     SYCL_SOURCES ${sycl_src})
   # Inkling kernels register through scoped extensions, so common_ops does not
   # need to load their SYCL libraries transitively.
-  if(NOT name STREQUAL "InklingSconv" AND NOT name STREQUAL "InklingAttnPrologue")
+  if(NOT name STREQUAL "InklingSconv"
+      AND NOT name STREQUAL "InklingAttnPrologue"
+      AND NOT name STREQUAL "InklingMoEGate")
     target_link_libraries(common_ops PUBLIC ${sycl_lib})
   endif()
   list(APPEND SGL_OPS_LIBRARIES ${sycl_lib})
@@ -51,6 +55,8 @@ foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
     list(APPEND sycl_install_args COMPONENT inkling_sconv)
   elseif(name STREQUAL "InklingAttnPrologue")
     list(APPEND sycl_install_args COMPONENT inkling_attn_prologue)
+  elseif(name STREQUAL "InklingMoEGate")
+    list(APPEND sycl_install_args COMPONENT inkling_moe_gate)
   endif()
   install(TARGETS ${sycl_lib} ${sycl_install_args})
   set_target_properties(${sycl_lib} PROPERTIES
@@ -108,6 +114,20 @@ if(TARGET sgl-ops-sycl-InklingAttnPrologue)
   )
   target_link_libraries(inkling_attn_prologue_ops PUBLIC sgl-ops-sycl-InklingAttnPrologue)
   list(APPEND SGL_OPS_LIBRARIES inkling_attn_prologue_ops)
+endif()
+
+if(TARGET sgl-ops-sycl-InklingMoEGate)
+  Python3_add_library(
+    inkling_moe_gate_ops
+    MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI
+    torch_extension_inkling_moe_gate.cc)
+  install(TARGETS inkling_moe_gate_ops LIBRARY DESTINATION sgl_kernel COMPONENT inkling_moe_gate)
+  set_target_properties(inkling_moe_gate_ops PROPERTIES
+    INSTALL_RPATH "$ORIGIN"
+    BUILD_WITH_INSTALL_RPATH TRUE
+  )
+  target_link_libraries(inkling_moe_gate_ops PUBLIC sgl-ops-sycl-InklingMoEGate)
+  list(APPEND SGL_OPS_LIBRARIES inkling_moe_gate_ops)
 endif()
 
 set(SYCL_LINK_LIBRARIES_KEYWORD)

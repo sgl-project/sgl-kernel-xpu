@@ -509,6 +509,22 @@ std::vector<at::Tensor> inkling_moe_gate_gemv_fused(
     int64_t experts_per_workgroup,
     int64_t subgroup_size);
 
+std::tuple<at::Tensor, at::Tensor> inkling_relative_attention(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& q_to_seq,
+    const at::Tensor& q_pos,
+    const at::Tensor& cu_k,
+    const std::optional<at::Tensor>& rel_bias,
+    double softmax_scale,
+    bool causal,
+    int64_t window_size_left,
+    int64_t window_size_right,
+    double softcap,
+    int64_t local_size,
+    const std::optional<at::Tensor>& out);
+
 /*
  * From csrc/gemm
  */

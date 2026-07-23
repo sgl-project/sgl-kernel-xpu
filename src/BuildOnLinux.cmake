@@ -44,7 +44,8 @@ foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
   # need to load their SYCL libraries transitively.
   if(NOT name STREQUAL "InklingSconv"
       AND NOT name STREQUAL "InklingAttnPrologue"
-      AND NOT name STREQUAL "InklingMoEGate")
+      AND NOT name STREQUAL "InklingMoEGate"
+      AND NOT name STREQUAL "InklingRelativeAttention")
     target_link_libraries(common_ops PUBLIC ${sycl_lib})
   endif()
   list(APPEND SGL_OPS_LIBRARIES ${sycl_lib})
@@ -57,6 +58,8 @@ foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
     list(APPEND sycl_install_args COMPONENT inkling_attn_prologue)
   elseif(name STREQUAL "InklingMoEGate")
     list(APPEND sycl_install_args COMPONENT inkling_moe_gate)
+  elseif(name STREQUAL "InklingRelativeAttention")
+    list(APPEND sycl_install_args COMPONENT inkling_relative_attention)
   endif()
   install(TARGETS ${sycl_lib} ${sycl_install_args})
   set_target_properties(${sycl_lib} PROPERTIES
@@ -128,6 +131,20 @@ if(TARGET sgl-ops-sycl-InklingMoEGate)
   )
   target_link_libraries(inkling_moe_gate_ops PUBLIC sgl-ops-sycl-InklingMoEGate)
   list(APPEND SGL_OPS_LIBRARIES inkling_moe_gate_ops)
+endif()
+
+if(TARGET sgl-ops-sycl-InklingRelativeAttention)
+  Python3_add_library(
+    inkling_relative_attention_ops
+    MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI
+    torch_extension_inkling_relative_attention.cc)
+  install(TARGETS inkling_relative_attention_ops LIBRARY DESTINATION sgl_kernel COMPONENT inkling_relative_attention)
+  set_target_properties(inkling_relative_attention_ops PROPERTIES
+    INSTALL_RPATH "$ORIGIN"
+    BUILD_WITH_INSTALL_RPATH TRUE
+  )
+  target_link_libraries(inkling_relative_attention_ops PUBLIC sgl-ops-sycl-InklingRelativeAttention)
+  list(APPEND SGL_OPS_LIBRARIES inkling_relative_attention_ops)
 endif()
 
 set(SYCL_LINK_LIBRARIES_KEYWORD)

@@ -18,6 +18,7 @@ HEAD_BYTES = DATA_BYTES_PER_TOKEN + SCALE_BYTES_PER_TOKEN
 default_params = {
     "is_fp8_query": [False, True],
     "has_attn_sink": [False, True],
+    "has_topk_length": [False, True],
     "has_extra": [False, True],
     "extra_topk": [1024],
     "topk": [6, 512],
@@ -151,13 +152,14 @@ def _reference_sparse_decode(
 
 @pytest.mark.parametrize("is_fp8_query", default_params["is_fp8_query"])
 @pytest.mark.parametrize("has_attn_sink", default_params["has_attn_sink"])
+@pytest.mark.parametrize("has_topk_length", default_params["has_topk_length"])
 @pytest.mark.parametrize("has_extra", default_params["has_extra"])
 @pytest.mark.parametrize("extra_topk", default_params["extra_topk"])
 @pytest.mark.parametrize("topk", default_params["topk"])
 @pytest.mark.parametrize("h_q", default_params["h_q"])
 @pytest.mark.parametrize("s_q", default_params["s_q"])
 def test_flash_mla_sparse_decode_fp8_kvcache(
-    s_q, h_q, topk, extra_topk, is_fp8_query, has_attn_sink, has_extra
+    s_q, h_q, topk, extra_topk, is_fp8_query, has_attn_sink, has_topk_length, has_extra
 ):
     device = "xpu"
     torch.manual_seed(1234)
@@ -192,7 +194,9 @@ def test_flash_mla_sparse_decode_fp8_kvcache(
         0, num_blocks * block_size, (b, s_q, topk), device=device, dtype=torch.int32
     )
     indices[0, 0, -1] = num_blocks * block_size + 11
-    topk_length = torch.randint(1, topk + 1, (b,), device=device, dtype=torch.int32)
+    topk_length = None
+    if has_topk_length:
+        topk_length = torch.randint(1, topk + 1, (b,), device=device, dtype=torch.int32)
 
     attn_sink = None
     if has_attn_sink:

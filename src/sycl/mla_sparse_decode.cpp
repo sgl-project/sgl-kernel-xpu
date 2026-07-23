@@ -44,10 +44,10 @@ std::vector<at::Tensor> flash_mla_sparse_decode_impl(
   int h_kv = kv.size(2);
   int head_bytes = kv.size(3);
   int topk = indices.size(2);
-  bool have_topk_length = topk_length.has_value();
 
   TORCH_CHECK(indices.size(0) == b && indices.size(1) == s_q, "indices batch/query dims must match q");
   TORCH_CHECK(h_kv == 1, "sparse MLA decode currently requires h_kv == 1");
+  TORCH_CHECK(h_q > 0, "h_q must be > 0");
   TORCH_CHECK(d_qk == 512, "packed fp8 sparse MLA decode requires q head dim 512");
   TORCH_CHECK(d_v == 512, "d_v must be 512");
   TORCH_CHECK(head_bytes == SPARSE_MLA_FP8_HEAD_BYTES, "kv last dim must be packed head_bytes=584");
@@ -227,11 +227,8 @@ std::vector<at::Tensor> flash_mla_sparse_decode_impl(
       params.extra_topk_length = reinterpret_cast<int*>(extra_topk_length.value().slice(0, b0, b0 + cb).data_ptr());
     }
 
-    DISPATCH_BOOLEAN_FLAG(have_topk_length, HAVE_TOPK_LENGTH, [&] {
-      DISPATCH_BOOLEAN_FLAG(is_fp8_query, IS_FP8_QUERY, [&] {
-        launch_sparse_mla_decode_fp8_fwd_kernel<512, HAVE_TOPK_LENGTH, IS_FP8_QUERY>(params);
-      });
-    });
+    DISPATCH_BOOLEAN_FLAG(
+        is_fp8_query, IS_FP8_QUERY, [&] { launch_sparse_mla_decode_fp8_fwd_kernel<512, IS_FP8_QUERY>(params); });
   }
 
   if (return_softmax_lse) {

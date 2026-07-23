@@ -32,7 +32,6 @@ std::vector<at::Tensor> flash_mla_sparse_prefill_impl(
   int h_kv = kv.size(1);
   int d_qk = q.size(2);
   int topk = indices.size(2);
-  bool have_topk_length = topk_length.has_value();
 
   TORCH_CHECK(q.dim() == 3, "q must be 3D");
   TORCH_CHECK(kv.dim() == 3, "kv must be 3D");
@@ -44,6 +43,8 @@ std::vector<at::Tensor> flash_mla_sparse_prefill_impl(
     TORCH_CHECK(topk_length.value().dim() == 1, "topk_length must be 1D");
   }
 
+  TORCH_CHECK(h_kv == 1, "h_kv must be 1");
+  TORCH_CHECK(h_q > 0, "h_q must be > 0");
   TORCH_CHECK(d_qk == 576 || d_qk == 512, "d_qk must be 576 or 512");
   TORCH_CHECK(d_v == 512, "d_v must be 512");
 
@@ -129,10 +130,8 @@ std::vector<at::Tensor> flash_mla_sparse_prefill_impl(
       at::xpu::getCurrentXPUStream().queue()};
 
   DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&] {
-    DISPATCH_BOOLEAN_FLAG(have_topk_length, HAVE_TOPK_LENGTH, [&] {
-      DISPATCH_BOOLEAN_FLAG(attn_sink.has_value(), HAS_ATTN_SINK, [&] {
-        launch_sparse_mla_prefill_fwd_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH, HAS_ATTN_SINK>(params);
-      });
+    DISPATCH_BOOLEAN_FLAG(attn_sink.has_value(), HAS_ATTN_SINK, [&] {
+      launch_sparse_mla_prefill_fwd_kernel<HEAD_DIM_QK, HAS_ATTN_SINK>(params);
     });
   });
 

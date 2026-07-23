@@ -74,7 +74,7 @@ struct KernelTraits {
   using TiledMMAPV = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<TileShapePV>, SubgroupLayoutPV>::TiledMMA;
 };
 
-template <int D_QK, bool HAVE_TOPK_LENGTH, bool HAS_ATTN_SINK, typename Traits>
+template <int D_QK, bool HAS_ATTN_SINK, typename Traits>
 class DensePrefillFwdKernel {
  public:
   using ElementQ = typename Traits::ElementQ;
@@ -277,7 +277,7 @@ class DensePrefillFwdKernel {
     auto tSrS = thr_mma_qk.partition_sg_fragment_C(proxyP);
 
     // TODO: use inline asm for loading gmem?
-    const int real_topk_length = HAVE_TOPK_LENGTH ? *(topk_length + seq_idx) : params.topk;
+    const int real_topk_length = topk_length != nullptr ? *(topk_length + seq_idx) : params.topk;
 
     const int* gathered_valid_mask = params.gathered_valid_mask + seq_idx * params.stride_gathered_mask_s_q;
 
@@ -578,8 +578,7 @@ class DensePrefillFwdKernel {
       copy(tiled_copy_O, tOrO, tOgO);
     };
 
-    const int num_topk_blocks =
-        HAVE_TOPK_LENGTH ? ceil_div(real_topk_length, Traits::B_TOPK) : ceil_div(params.topk, Traits::B_TOPK);
+    const int num_topk_blocks = ceil_div(real_topk_length, Traits::B_TOPK);
 
     // mainloop
     CUTE_NO_UNROLL
@@ -615,7 +614,7 @@ class DensePrefillFwdKernel {
   }
 };
 
-template <int D_QK, bool HAVE_TOPK_LENGTH>
+template <int D_QK>
 class SparsePrefillGatherKernel {
  public:
   using ElementKV = cutlass::bfloat16_t;
@@ -641,7 +640,7 @@ class SparsePrefillGatherKernel {
     const int seq_idx = int(BlockIdxX());
     const int topk_block_idx = int(BlockIdxY());
     const int topk_base = topk_block_idx * B_TOPK;
-    const int real_topk_length = HAVE_TOPK_LENGTH ? params.topk_length[seq_idx] : params.topk;
+    const int real_topk_length = params.topk_length != nullptr ? params.topk_length[seq_idx] : params.topk;
 
     const int* indices = params.indices + seq_idx * params.stride_indices_s_q;
     ElementKV* gathered_k = params.gathered_k + seq_idx * params.stride_gathered_k_s_q;
@@ -693,9 +692,9 @@ class SparsePrefillGatherKernel {
   }
 };
 
-template <int D_QK, bool HAVE_TOPK_LENGTH>
+template <int D_QK>
 void launch_sparse_mla_prefill_gather_kernel(const XPUSparseAttnFwdParams& params) {
-  using Kernel = SparsePrefillGatherKernel<D_QK, HAVE_TOPK_LENGTH>;
+  using Kernel = SparsePrefillGatherKernel<D_QK>;
 
   dim3 block(Kernel::NUM_THREADS, 1, 1);
   dim3 grid(params.s_q, ceil_div(params.topk, Kernel::B_TOPK), 1);
@@ -723,16 +722,14 @@ void launch_sparse_mla_prefill_gather_kernel(const XPUSparseAttnFwdParams& param
       policy, params.queue, static_cast<SparseAttnFwdParams>(params));
 }
 
-template <int D_QK, bool HAVE_TOPK_LENGTH, bool HAS_ATTN_SINK, int B_H>
+template <int D_QK, bool HAS_ATTN_SINK, int B_H>
 void launch_mla_prefill_fwd_kernel_policy(const XPUSparseAttnFwdParams& params) {
   using Traits = KernelTraits<B_H>;
 
-  TORCH_CHECK(params.h_kv == 1, "h_kv must be 1");
-  TORCH_CHECK(params.h_q > 1, "h_q must be > 1");
   TORCH_CHECK(params.d_qk == D_QK, "Invalid d_qk for this kernel instantiation");
   TORCH_CHECK(params.d_v == Traits::D_V, "d_v must match KernelTraits::D_V");
 
-  using Kernel = DensePrefillFwdKernel<D_QK, HAVE_TOPK_LENGTH, HAS_ATTN_SINK, Traits>;
+  using Kernel = DensePrefillFwdKernel<D_QK, HAS_ATTN_SINK, Traits>;
 
   dim3 block(Traits::NUM_THREADS, 1, 1);
   dim3 grid(ceil_div(params.h_q, Traits::B_H) * params.s_q, Traits::V_SPLIT, 1);
@@ -759,32 +756,31 @@ void launch_mla_prefill_fwd_kernel_policy(const XPUSparseAttnFwdParams& params) 
 }
 
 inline int sparse_mla_prefill_select_b_h(const XPUSparseAttnFwdParams& params) {
-  TORCH_CHECK(params.h_q > 1, "h_q must be > 1");
-  if (params.h_q < 8) return 8;
-  if (params.h_q < 16) return 16;
-  if (params.h_q < 32) return 32;
+  if (params.h_q <= 8) return 8;
+  if (params.h_q <= 16) return 16;
+  if (params.h_q <= 32) return 32;
   return 64;
 }
 
-template <int D_QK, bool HAVE_TOPK_LENGTH, bool HAS_ATTN_SINK>
+template <int D_QK, bool HAS_ATTN_SINK>
 void launch_mla_prefill_fwd_kernel(const XPUSparseAttnFwdParams& params) {
   switch (sparse_mla_prefill_select_b_h(params)) {
     case 8:
-      launch_mla_prefill_fwd_kernel_policy<D_QK, HAVE_TOPK_LENGTH, HAS_ATTN_SINK, 8>(params);
+      launch_mla_prefill_fwd_kernel_policy<D_QK, HAS_ATTN_SINK, 8>(params);
       break;
     case 16:
-      launch_mla_prefill_fwd_kernel_policy<D_QK, HAVE_TOPK_LENGTH, HAS_ATTN_SINK, 16>(params);
+      launch_mla_prefill_fwd_kernel_policy<D_QK, HAS_ATTN_SINK, 16>(params);
       break;
     case 32:
-      launch_mla_prefill_fwd_kernel_policy<D_QK, HAVE_TOPK_LENGTH, HAS_ATTN_SINK, 32>(params);
+      launch_mla_prefill_fwd_kernel_policy<D_QK, HAS_ATTN_SINK, 32>(params);
       break;
     default:
-      launch_mla_prefill_fwd_kernel_policy<D_QK, HAVE_TOPK_LENGTH, HAS_ATTN_SINK, 64>(params);
+      launch_mla_prefill_fwd_kernel_policy<D_QK, HAS_ATTN_SINK, 64>(params);
       break;
   }
 }
 
-template <int D_QK, bool HAVE_TOPK_LENGTH, bool HAS_ATTN_SINK>
+template <int D_QK, bool HAS_ATTN_SINK>
 void launch_sparse_mla_prefill_fwd_kernel(const XPUSparseAttnFwdParams& params) {
   const int chunk_size = params.gathered_k_s_q_chunk;
   const int total_s_q = params.s_q;
@@ -797,16 +793,15 @@ void launch_sparse_mla_prefill_fwd_kernel(const XPUSparseAttnFwdParams& params) 
     chunk_params.s_q = cur_chunk;
     chunk_params.q = params.q + static_cast<int64_t>(chunk_start) * params.stride_q_s_q;
     chunk_params.indices = params.indices + static_cast<int64_t>(chunk_start) * params.stride_indices_s_q;
-    chunk_params.topk_length =
-        (HAVE_TOPK_LENGTH && params.topk_length != nullptr) ? params.topk_length + chunk_start : params.topk_length;
+    chunk_params.topk_length = params.topk_length != nullptr ? params.topk_length + chunk_start : params.topk_length;
     chunk_params.out = params.out + static_cast<int64_t>(chunk_start) * params.h_q * params.d_v;
     chunk_params.max_logits =
         params.max_logits != nullptr ? params.max_logits + static_cast<int64_t>(chunk_start) * params.h_q : nullptr;
     chunk_params.lse = params.lse != nullptr ? params.lse + static_cast<int64_t>(chunk_start) * params.h_q : nullptr;
     // gathered_k and gathered_valid_mask are workspace buffers reused each chunk (no offset needed)
 
-    launch_sparse_mla_prefill_gather_kernel<D_QK, HAVE_TOPK_LENGTH>(chunk_params);
-    launch_mla_prefill_fwd_kernel<D_QK, HAVE_TOPK_LENGTH, HAS_ATTN_SINK>(chunk_params);
+    launch_sparse_mla_prefill_gather_kernel<D_QK>(chunk_params);
+    launch_mla_prefill_fwd_kernel<D_QK, HAS_ATTN_SINK>(chunk_params);
   }
 }
 

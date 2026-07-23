@@ -336,7 +336,6 @@ def flash_mla_with_kvcache(
                 and extra_topk_length.dtype == torch.int32
                 and extra_topk_length.shape == (B,)
             ), "extra_topk_length must be int32 on the same device with shape [B]"
-        is_fp8_query = q.dtype == torch.float8_e4m3fn
         out, lse_bshq = torch.ops.sgl_kernel.flash_mla_sparse_decode.default(
             q,
             k_cache,
@@ -349,7 +348,7 @@ def flash_mla_with_kvcache(
             extra_indices_in_kvcache,
             extra_topk_length,
             None,  # q_scale
-            is_fp8_query,
+            False,  # is_fp8_query
             True,  # return_softmax_lse
         )
         # kernel returns lse as [B, s_q, H]; expose as [B, H, s_q]

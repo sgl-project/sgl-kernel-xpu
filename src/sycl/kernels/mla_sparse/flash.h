@@ -126,13 +126,13 @@ struct XPUSparseDecodeAttnFwdParams : public SparseAttnDecodeParams {
   sycl::queue queue;
 };
 
-template <int D_QK, bool HAVE_TOPK_LENGTH>
+template <int D_QK>
 void launch_sparse_mla_prefill_gather_kernel(const XPUSparseAttnFwdParams& params);
 
-template <int D_QK, bool HAVE_TOPK_LENGTH, bool HAS_ATTN_SINK>
+template <int D_QK, bool HAS_ATTN_SINK>
 void launch_sparse_mla_prefill_fwd_kernel(const XPUSparseAttnFwdParams& params);
 
-template <int D_QK, bool HAS_TOPK_LENGTH, bool IS_FP8_QUERY>
+template <int D_QK, bool IS_FP8_QUERY>
 void launch_sparse_mla_decode_fp8_fwd_kernel(const XPUSparseDecodeAttnFwdParams& params);
 
 }  // namespace FLASH_NAMESPACE

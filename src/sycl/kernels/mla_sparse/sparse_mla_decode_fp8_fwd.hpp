@@ -82,7 +82,7 @@ struct KernelTraits {
   using TiledMMAPV = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<TileShapePV>, SubgroupLayoutPV>::TiledMMA;
 };
 
-template <int D_QK, bool HAVE_TOPK_LENGTH>
+template <int D_QK>
 class SparseDecodeGatherDequantKernel {
  public:
   using Params = SparseAttnDecodeParams;
@@ -240,10 +240,8 @@ class SparseDecodeGatherDequantKernel {
                                          seq_idx * params.stride_extra_indices_s_q;
 
     auto resolve_topk_length = [&](const int* topk_length_ptr, int topk, int stride_b) {
-      if constexpr (HAVE_TOPK_LENGTH) {
-        if (topk_length_ptr != nullptr) {
-          return *(topk_length_ptr + batch_idx * stride_b);
-        }
+      if (topk_length_ptr != nullptr) {
+        return *(topk_length_ptr + batch_idx * stride_b);
       }
       return topk;
     };
@@ -741,17 +739,15 @@ class DenseDecodeFwdKernel {
   }
 };
 
-template <int D_QK, bool HAVE_TOPK_LENGTH, bool IS_FP8_QUERY, bool HAS_ATTN_SINK, int B_H>
+template <int D_QK, bool IS_FP8_QUERY, bool HAS_ATTN_SINK, int B_H>
 void launch_sparse_mla_decode_fp8_fwd_kernel_policy(const XPUSparseDecodeAttnFwdParams& params) {
   using Traits = KernelTraits<B_H>;
 
-  TORCH_CHECK(params.h_kv == 1, "h_kv must be 1");
-  TORCH_CHECK(params.h_q > 0, "h_q must be > 0");
   TORCH_CHECK(params.d_qk == D_QK, "Invalid d_qk for this kernel instantiation");
   TORCH_CHECK(params.d_v == Traits::D_V, "d_v must match KernelTraits::D_V");
   TORCH_CHECK(params.gathered_topk == params.topk + params.extra_topk, "gathered_topk must equal topk + extra_topk");
 
-  using GatherDequantKernel = SparseDecodeGatherDequantKernel<D_QK, HAVE_TOPK_LENGTH>;
+  using GatherDequantKernel = SparseDecodeGatherDequantKernel<D_QK>;
   using DenseKernel = DenseDecodeFwdKernel<D_QK, IS_FP8_QUERY, HAS_ATTN_SINK, Traits>;
 
   if (params.gathered_topk > 0) {
@@ -804,7 +800,6 @@ void launch_sparse_mla_decode_fp8_fwd_kernel_policy(const XPUSparseDecodeAttnFwd
 }
 
 inline int sparse_mla_decode_select_b_h(const XPUSparseDecodeAttnFwdParams& params) {
-  TORCH_CHECK(params.h_q > 0, "h_q must be > 0");
   // TODO: currently use simple rule to decide B_H, in fucture need to consider
   // smart heruistics to balance occupancy and per-WG workload
   if (params.h_q <= 8) return 8;
@@ -813,21 +808,21 @@ inline int sparse_mla_decode_select_b_h(const XPUSparseDecodeAttnFwdParams& para
   return 64;
 }
 
-template <int D_QK, bool HAS_TOPK_LENGTH, bool IS_FP8_QUERY>
+template <int D_QK, bool IS_FP8_QUERY>
 void launch_sparse_mla_decode_fp8_fwd_kernel(const XPUSparseDecodeAttnFwdParams& params) {
   DISPATCH_BOOLEAN_FLAG(params.attn_sink != nullptr, HAS_ATTN_SINK, [&] {
     switch (sparse_mla_decode_select_b_h(params)) {
       case 8:
-        launch_sparse_mla_decode_fp8_fwd_kernel_policy<D_QK, HAS_TOPK_LENGTH, IS_FP8_QUERY, HAS_ATTN_SINK, 8>(params);
+        launch_sparse_mla_decode_fp8_fwd_kernel_policy<D_QK, IS_FP8_QUERY, HAS_ATTN_SINK, 8>(params);
         break;
       case 16:
-        launch_sparse_mla_decode_fp8_fwd_kernel_policy<D_QK, HAS_TOPK_LENGTH, IS_FP8_QUERY, HAS_ATTN_SINK, 16>(params);
+        launch_sparse_mla_decode_fp8_fwd_kernel_policy<D_QK, IS_FP8_QUERY, HAS_ATTN_SINK, 16>(params);
         break;
       case 32:
-        launch_sparse_mla_decode_fp8_fwd_kernel_policy<D_QK, HAS_TOPK_LENGTH, IS_FP8_QUERY, HAS_ATTN_SINK, 32>(params);
+        launch_sparse_mla_decode_fp8_fwd_kernel_policy<D_QK, IS_FP8_QUERY, HAS_ATTN_SINK, 32>(params);
         break;
       default:
-        launch_sparse_mla_decode_fp8_fwd_kernel_policy<D_QK, HAS_TOPK_LENGTH, IS_FP8_QUERY, HAS_ATTN_SINK, 64>(params);
+        launch_sparse_mla_decode_fp8_fwd_kernel_policy<D_QK, IS_FP8_QUERY, HAS_ATTN_SINK, 64>(params);
         break;
     }
   });

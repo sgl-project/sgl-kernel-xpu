@@ -1,10 +1,10 @@
 // Auto-generated from sparse_mla_decode_fp8_fwd_kernel.cpp.in
-// Template parameters: D_QK=@D_QK@, HAS_TOPK_LENGTH=@HAS_TOPK_LENGTH@, IS_FP8_QUERY=@IS_FP8_QUERY@
+// Template parameters: D_QK=@D_QK@, IS_FP8_QUERY=@IS_FP8_QUERY@
 #include "sycl/kernels/mla_sparse/sparse_mla_decode_fp8_fwd.hpp"
 
 namespace FLASH_NAMESPACE {
 
-template void launch_sparse_mla_decode_fp8_fwd_kernel<@D_QK@, @HAS_TOPK_LENGTH@, @IS_FP8_QUERY@>(
+template void launch_sparse_mla_decode_fp8_fwd_kernel<@D_QK@, @IS_FP8_QUERY@>(
     const XPUSparseDecodeAttnFwdParams& params);
 
 }  // namespace FLASH_NAMESPACE

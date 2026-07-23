@@ -10,7 +10,7 @@ from sgl_kernel import flash_mla_sparse_prefill
 default_params = {
     "has_attn_sink": [False, True],
     "has_topk_length": [False, True],
-    "d_qk": [512],
+    "d_qk": [512, 576],
     "topk": [6, 512],
     "h_q": [6, 22, 64, 96],
     "s_q": [1, 32, 128],

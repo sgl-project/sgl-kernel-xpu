@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <limits>
 #include <sycl/sycl.hpp>
 
 #include "../SYCLHelpers.h"
@@ -9,22 +8,18 @@
 
 namespace sgl::sampling {
 
-template <typename DType, uint32_t VEC_SIZE>
-inline vec_t<DType, VEC_SIZE> load_vec_padded(const DType* row, uint32_t col_base, uint32_t d) {
-  vec_t<DType, VEC_SIZE> v(static_cast<DType>(0));
-  if (col_base < d) {
-    v.load(0, sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(row + col_base));
-  }
-  return v;
-}
-
 template <typename DType, uint32_t VEC_SIZE, uint32_t kWgSize, typename Group>
 inline float get_max_value(const Group& grp, const DType* probs, uint32_t row_idx, uint32_t tx, uint32_t d) {
-  const DType* row = probs + static_cast<size_t>(row_idx) * static_cast<size_t>(d);
-  float thread_max = -std::numeric_limits<float>::infinity();
+  const size_t row_offset = static_cast<size_t>(row_idx) * static_cast<size_t>(d);
+  float thread_max = 0.0f;
   for (uint32_t i = 0; i < div_up(d, kWgSize * VEC_SIZE); ++i) {
-    const uint32_t col_base = (i * kWgSize + tx) * VEC_SIZE;
-    const auto v = load_vec_padded<DType, VEC_SIZE>(row, col_base, d);
+    vec_t<DType, VEC_SIZE> v(static_cast<DType>(0));
+    if ((i * kWgSize + tx) * VEC_SIZE < d) {
+      v.load(
+          0,
+          sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(
+              probs + row_offset + (i * kWgSize + tx) * VEC_SIZE));
+    }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
       thread_max = sycl::max(thread_max, static_cast<float>(v[j]));

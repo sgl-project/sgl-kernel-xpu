@@ -17,6 +17,14 @@
 #include "sycl/kernels/mla_sparse/device/mla_sparse_decode_dispatch.hpp"
 #include "sycl/kernels/mla_sparse/device/mla_sparse_decode_types.hpp"
 
+// Compile-time toggle for the two-stage sparse MLA decode path (gather+dequant to
+// HBM, then dense flash-decode). The selector macro
+// SGLANG_USE_SPARSE_MLA_2STAGE is defined (default 1) in mla_sparse_decode_types.hpp
+// below; set it to 0 there for the fused path, or override at build time with
+// -DSGLANG_USE_SPARSE_MLA_2STAGE=<0|1>. Compile-time A/B toggle in the
+// SGL_DISABLE_PACKGQA style. The name follows the env-var-conventions naming rule
+// (SGLANG_ prefix + USE_ verb for an implementation selector).
+
 namespace {
 
 #define DISPATCH_MLA_SPARSE_DTYPE()                                              \
@@ -40,6 +48,46 @@ namespace {
         break;                                                                   \
       case at::ScalarType::BFloat16:                                             \
         mla_sparse_decode::launch_mla_sparse_decode_bf16_128(                    \
+            out,                                                                 \
+            lse_out,                                                             \
+            q,                                                                   \
+            k_cache,                                                             \
+            indices,                                                             \
+            topk_length,                                                         \
+            extra_k_cache,                                                       \
+            extra_indices,                                                       \
+            extra_topk_length,                                                   \
+            attn_sink,                                                           \
+            sm_scale,                                                            \
+            head_dim_v,                                                          \
+            is_fp8_kvcache);                                                     \
+        break;                                                                   \
+      default:                                                                   \
+        TORCH_CHECK(false, "Unsupported input data type for Sparse MLA decode"); \
+    }                                                                            \
+  } while (0)
+
+#define DISPATCH_MLA_SPARSE_DTYPE_2STAGE()                                       \
+  do {                                                                           \
+    switch (in_dtype) {                                                          \
+      case at::ScalarType::Half:                                                 \
+        mla_sparse_decode::launch_mla_sparse_decode_2stage_half_128(             \
+            out,                                                                 \
+            lse_out,                                                             \
+            q,                                                                   \
+            k_cache,                                                             \
+            indices,                                                             \
+            topk_length,                                                         \
+            extra_k_cache,                                                       \
+            extra_indices,                                                       \
+            extra_topk_length,                                                   \
+            attn_sink,                                                           \
+            sm_scale,                                                            \
+            head_dim_v,                                                          \
+            is_fp8_kvcache);                                                     \
+        break;                                                                   \
+      case at::ScalarType::BFloat16:                                             \
+        mla_sparse_decode::launch_mla_sparse_decode_2stage_bf16_128(             \
             out,                                                                 \
             lse_out,                                                             \
             q,                                                                   \
@@ -106,8 +154,13 @@ void flash_mla_sparse_decode(
       "Unsupported input data type for Sparse MLA decode");
   TORCH_CHECK(head_dim_v == 512, "head_dim_v must be 512 for DeepSeek V4 MLA");
 
+#if SGLANG_USE_SPARSE_MLA_2STAGE
+  DISPATCH_MLA_SPARSE_DTYPE_2STAGE();
+#else
   DISPATCH_MLA_SPARSE_DTYPE();
+#endif
 }
 
 #undef DISPATCH_MLA_SPARSE_DTYPE
+#undef DISPATCH_MLA_SPARSE_DTYPE_2STAGE
 #undef SYCL_INTEL_TARGET

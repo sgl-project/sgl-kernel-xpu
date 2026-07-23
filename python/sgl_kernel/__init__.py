@@ -82,6 +82,12 @@ from sgl_kernel.gemm import (
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.hadamard import hadamard_transform
+from sgl_kernel.inkling_attn_prologue import (
+    compile_inkling_attn_prologue,
+    inkling_attn_prologue_decode,
+    inkling_attn_prologue_extend,
+    inkling_attn_prologue_verify,
+)
 from sgl_kernel.inkling_sconv import (
     causal_conv1d,
     fused_causal_conv1d_update_decode,

@@ -38,11 +38,19 @@ foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
     ${COMMON_DEVICE_LINK_FLAGS}
     SHARED
     SYCL_SOURCES ${sycl_src})
-  target_link_libraries(common_ops PUBLIC ${sycl_lib})
+  # Inkling attention prologue registers through a scoped extension, so
+  # common_ops does not need to load its SYCL library transitively.
+  if(NOT name STREQUAL "InklingAttnPrologue")
+    target_link_libraries(common_ops PUBLIC ${sycl_lib})
+  endif()
   list(APPEND SGL_OPS_LIBRARIES ${sycl_lib})
 
   # Decouple with PyTorch cmake definition.
-  install(TARGETS ${sycl_lib} LIBRARY DESTINATION sgl_kernel)
+  set(sycl_install_args LIBRARY DESTINATION sgl_kernel)
+  if(name STREQUAL "InklingAttnPrologue")
+    list(APPEND sycl_install_args COMPONENT inkling_attn_prologue)
+  endif()
+  install(TARGETS ${sycl_lib} ${sycl_install_args})
   set_target_properties(${sycl_lib} PROPERTIES
     INSTALL_RPATH "$ORIGIN"
     BUILD_WITH_INSTALL_RPATH TRUE
@@ -71,6 +79,20 @@ foreach(sycl_src ${ATen_XPU_SYCL_XE20})
     BUILD_WITH_INSTALL_RPATH TRUE
   )
 endforeach()
+
+if(TARGET sgl-ops-sycl-InklingAttnPrologue)
+  Python3_add_library(
+    inkling_attn_prologue_ops
+    MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI
+    torch_extension_inkling_attn_prologue.cc)
+  install(TARGETS inkling_attn_prologue_ops LIBRARY DESTINATION sgl_kernel COMPONENT inkling_attn_prologue)
+  set_target_properties(inkling_attn_prologue_ops PROPERTIES
+    INSTALL_RPATH "$ORIGIN"
+    BUILD_WITH_INSTALL_RPATH TRUE
+  )
+  target_link_libraries(inkling_attn_prologue_ops PUBLIC sgl-ops-sycl-InklingAttnPrologue)
+  list(APPEND SGL_OPS_LIBRARIES inkling_attn_prologue_ops)
+endif()
 
 set(SYCL_LINK_LIBRARIES_KEYWORD)
 

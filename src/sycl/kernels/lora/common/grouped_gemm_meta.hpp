@@ -42,6 +42,7 @@
 
 #include <ATen/ATen.h>
 #include <torch/all.h>
+#include <optional>
 
 #include <sycl/sycl.hpp>
 
@@ -70,6 +71,11 @@ struct GroupedGemmMeta {
   torch::Tensor a_off;          // int64 [num_segments]     byte offset into A per segment (device)
   torch::Tensor b_off;          // int64 [num_segments]     byte offset into B per segment (device)
   torch::Tensor d_off;          // int64 [num_segments]     byte offset into D per segment (device)
+  // Per-segment epilogue alpha: a *contiguous* fp32 value buffer (one alpha per
+  // segment), consumed via the fusion's strided `alpha_ptr` path (dAlpha stride
+  // 1). Undefined tensor when no scalings were supplied (A-fwd), in which case
+  // the caller falls back to a single broadcast alpha.
+  torch::Tensor alpha;  // float32 [num_segments], or undefined
 };
 
 // One thread per segment: derive M_s / lora_id from the index tensors and write
@@ -77,6 +83,7 @@ struct GroupedGemmMeta {
 struct BuildGroupedGemmMetaKernel {
   const int32_t* seg_indptr;      // [num_segments + 1]
   const int32_t* weight_indices;  // [num_segments]
+  const float* scalings;          // [num_loras]
   int32_t* problem_sizes;         // [num_segments * 3]
   int64_t* stride_A;              // [num_segments]
   int64_t* stride_B;              // [num_segments]
@@ -84,6 +91,7 @@ struct BuildGroupedGemmMetaKernel {
   int64_t* a_off;                 // [num_segments]
   int64_t* b_off;                 // [num_segments]
   int64_t* d_off;                 // [num_segments]
+  float* alpha;                   // [num_segments] contiguous alpha values, or nullptr
   int N;
   int K;
   int64_t elem_bytes;
@@ -110,6 +118,10 @@ struct BuildGroupedGemmMetaKernel {
     a_off[s] = static_cast<int64_t>(row_start) * K * elem_bytes;
     b_off[s] = static_cast<int64_t>(lora_id) * static_cast<int64_t>(N) * K * elem_bytes;
     d_off[s] = static_cast<int64_t>(row_start) * N * elem_bytes;
+
+    if (scalings) {
+      alpha[s] = scalings[lora_id];
+    }
   }
 };
 
@@ -146,9 +158,12 @@ inline GroupedGemmMeta build_grouped_gemm_meta(
     const int num_segments,
     const int64_t elem_bytes,
     const at::Device device,
-    sycl::queue& queue) {
+    sycl::queue& queue,
+    const std::optional<torch::Tensor>& scalings = std::nullopt  // float32 [num_loras], or nullopt (A-fwd)
+) {
   auto opt_i32 = torch::TensorOptions().dtype(torch::kInt32).device(device);
   auto opt_i64 = torch::TensorOptions().dtype(torch::kInt64).device(device);
+  auto opt_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(device);
 
   GroupedGemmMeta meta;
   meta.problem_sizes = torch::empty({num_segments, 3}, opt_i32);
@@ -158,10 +173,16 @@ inline GroupedGemmMeta build_grouped_gemm_meta(
   meta.a_off = torch::empty({num_segments}, opt_i64);
   meta.b_off = torch::empty({num_segments}, opt_i64);
   meta.d_off = torch::empty({num_segments}, opt_i64);
+  // Only materialize the per-segment alpha buffer when scalings are supplied;
+  // otherwise leave it undefined so the caller uses a single broadcast alpha.
+  if (scalings.has_value()) {
+    meta.alpha = torch::empty({num_segments}, opt_f32);
+  }
 
   BuildGroupedGemmMetaKernel kernel{
       seg_indptr_i32.data_ptr<int32_t>(),
       weight_indices_i32.data_ptr<int32_t>(),
+      scalings.has_value() ? scalings->data_ptr<float>() : nullptr,
       meta.problem_sizes.data_ptr<int32_t>(),
       meta.stride_A.data_ptr<int64_t>(),
       meta.stride_B.data_ptr<int64_t>(),
@@ -169,6 +190,7 @@ inline GroupedGemmMeta build_grouped_gemm_meta(
       meta.a_off.data_ptr<int64_t>(),
       meta.b_off.data_ptr<int64_t>(),
       meta.d_off.data_ptr<int64_t>(),
+      meta.alpha.defined() ? meta.alpha.data_ptr<float>() : nullptr,
       N,
       K,
       elem_bytes,

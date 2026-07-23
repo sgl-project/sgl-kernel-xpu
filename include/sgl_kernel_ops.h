@@ -237,6 +237,87 @@ void apply_rope_pos_ids_cos_sin_cache(
     int64_t sycl_stream);
 
 /*
+ * Inkling fused attention prologue family.
+ */
+std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_verify(
+    const at::Tensor& qkvr,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& cache_mask,
+    const at::Tensor& k_weight,
+    const at::Tensor& v_weight,
+    at::Tensor& k_inter,
+    at::Tensor& v_inter,
+    const at::Tensor& q_gamma,
+    const at::Tensor& k_gamma,
+    double eps,
+    const at::Tensor& loc,
+    at::Tensor& k_buf,
+    at::Tensor& v_buf,
+    int64_t q_off,
+    int64_t k_off,
+    int64_t v_off,
+    int64_t dq,
+    int64_t dkv,
+    int64_t draft_token_num,
+    bool silu_activation,
+    bool use_residual,
+    bool do_store);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_decode(
+    const at::Tensor& qkvr,
+    at::Tensor& k_cache,
+    at::Tensor& v_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& cache_mask,
+    const at::Tensor& k_weight,
+    const at::Tensor& v_weight,
+    const std::optional<at::Tensor>& track_mask,
+    const std::optional<at::Tensor>& track_indices,
+    const at::Tensor& q_gamma,
+    const at::Tensor& k_gamma,
+    double eps,
+    const at::Tensor& loc,
+    at::Tensor& k_buf,
+    at::Tensor& v_buf,
+    int64_t q_off,
+    int64_t k_off,
+    int64_t v_off,
+    int64_t dq,
+    int64_t dkv,
+    bool silu_activation,
+    bool use_residual,
+    bool do_store);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_extend(
+    const at::Tensor& qkvr,
+    at::Tensor& k_cache,
+    at::Tensor& v_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& cache_mask,
+    const at::Tensor& has_initial_state,
+    const at::Tensor& cu,
+    const at::Tensor& si,
+    const at::Tensor& k_weight,
+    const at::Tensor& v_weight,
+    const std::optional<at::Tensor>& track_rows,
+    const std::optional<at::Tensor>& track_mask,
+    const std::optional<at::Tensor>& track_dst,
+    const at::Tensor& q_gamma,
+    const at::Tensor& k_gamma,
+    double eps,
+    const at::Tensor& loc,
+    at::Tensor& k_buf,
+    at::Tensor& v_buf,
+    int64_t q_off,
+    int64_t k_off,
+    int64_t v_off,
+    int64_t dq,
+    int64_t dkv,
+    bool silu_activation,
+    bool use_residual,
+    bool do_store);
+
+/*
  * From csrc/gemm
  */
 torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros);

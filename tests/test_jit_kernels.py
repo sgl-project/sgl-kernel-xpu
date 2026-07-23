@@ -20,6 +20,7 @@ try:
     from sgl_kernel.jit import fused_inplace_qknorm as jit_qknorm
     from sgl_kernel.jit import gelu_and_mul as jit_gelu_and_mul
     from sgl_kernel.jit import gelu_tanh_and_mul as jit_gelu_tanh_and_mul
+    from sgl_kernel.jit import moe_align_block_size as jit_moe_align_block_size
     from sgl_kernel.jit import (
         per_token_group_quant_8bit_v2 as jit_per_token_group_quant_8bit_v2,
     )
@@ -253,6 +254,106 @@ def test_timestep_embedding_jit_vs_reference():
 
     # Compare accuracy
     torch.testing.assert_close(y_jit, y_ref, rtol=1e-3, atol=1e-3)
+
+
+def _run_moe_align(use_aot, topk_ids, num_experts, block_size, pad):
+    """Allocate outputs and run the AOT or JIT moe_align_block_size op.
+
+    num_experts here is the real expert count; callers pass num_experts + 1 to
+    the op (the +1 offset bucket convention).
+    """
+    ne1 = num_experts + 1
+    numel = topk_ids.numel()
+    max_pad = numel + ne1 * (block_size - 1)
+    sorted_ids = torch.empty(max_pad, dtype=torch.int32, device=topk_ids.device)
+    if not pad:
+        sorted_ids.fill_(numel)
+    expert_ids = torch.zeros(
+        max_pad // block_size, dtype=torch.int32, device=topk_ids.device
+    )
+    num_tokens_post_pad = torch.empty(1, dtype=torch.int32, device=topk_ids.device)
+    cumsum = torch.zeros(ne1 + 1, dtype=torch.int32, device=topk_ids.device)
+
+    if use_aot:
+        sgl_kernel.moe_align_block_size(
+            topk_ids,
+            ne1,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            cumsum,
+            pad,
+        )
+    else:
+        jit_moe_align_block_size(
+            topk_ids,
+            ne1,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            cumsum,
+            pad,
+        )
+    return sorted_ids, expert_ids, num_tokens_post_pad, cumsum
+
+
+@pytest.mark.parametrize("block_size", [32, 128])
+@pytest.mark.parametrize(
+    "num_tokens,num_experts",
+    [
+        (8, 64),  # small-batch path (numel < 1024, experts <= 64)
+        (64, 64),  # small-batch path
+        (512, 160),  # general Blelloch-scan path
+        (2048, 256),  # general path, larger
+    ],
+)
+@pytest.mark.parametrize("topk", [2, 8])
+@pytest.mark.parametrize("pad_sorted_token_ids", [False, True])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.skipif(not HAS_SGL_KERNEL, reason="Requires AOT sgl_kernel")
+@pytest.mark.skipif(not HAS_SGLANG_JIT, reason="Requires SGLang for JIT compilation")
+@pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
+def test_moe_align_block_size_jit_vs_aot(
+    block_size, num_tokens, num_experts, topk, pad_sorted_token_ids, dtype
+):
+    """Test JIT moe_align_block_size vs the AOT op across both code paths.
+
+    expert_ids / num_tokens_post_pad / cumsum must match bit-exactly; the
+    sorted_token_ids order within an expert bucket is nondeterministic (atomic
+    scatter), so it is compared as the set of placed token ids.
+    """
+    device = "xpu"
+    torch.manual_seed(num_tokens + num_experts + topk)
+    topk_ids = (
+        torch.argsort(torch.rand(num_tokens, num_experts, device=device), dim=1)[
+            :, :topk
+        ]
+        .to(dtype)
+        .contiguous()
+    )
+    numel = topk_ids.numel()
+
+    s_aot, e_aot, n_aot, c_aot = _run_moe_align(
+        True, topk_ids, num_experts, block_size, pad_sorted_token_ids
+    )
+    s_jit, e_jit, n_jit, c_jit = _run_moe_align(
+        False, topk_ids, num_experts, block_size, pad_sorted_token_ids
+    )
+
+    assert torch.equal(e_jit, e_aot), "expert_ids mismatch"
+    assert torch.equal(n_jit, n_aot), "num_tokens_post_pad mismatch"
+    assert torch.equal(c_jit, c_aot), "cumsum mismatch"
+
+    # Compare placed token ids as a set (order within a bucket is racy).
+    def _placed(sorted_ids, ntpp):
+        v = sorted_ids[: int(ntpp.item())]
+        return torch.sort(v[v != numel]).values
+
+    assert torch.equal(
+        _placed(s_jit, n_jit), _placed(s_aot, n_aot)
+    ), "sorted_token_ids placed-set mismatch"
 
 
 def _make_ptgq_v2_scale(out_shape, group_size, column_major, device):

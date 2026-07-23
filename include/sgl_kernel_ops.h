@@ -388,6 +388,15 @@ void moe_grouped_mm_nt_xe20_mxfp4_w4a16(
     double gemm1_alpha = 1.702,
     double gemm1_limit = 7.0);
 
+void moe_grouped_mm_nt_xe20_mxfp8_w8a16(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& packed_weights,
+    const torch::Tensor& scales,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts);
+
 void prepare_moe_input(
     const torch::Tensor& topk_ids,
     torch::Tensor& expert_offsets,

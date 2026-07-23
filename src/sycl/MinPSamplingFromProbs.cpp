@@ -59,7 +59,7 @@ struct ToSyclElementType<at::BFloat16> {
 //----------------- min-p rejection sampling --------------------//
 // One work-group processes one request row.
 
-template <typename DType, uint32_t kMaxVecSize>
+template <typename DType, uint32_t VEC_SIZE>
 struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr uint32_t kWgSize = 1024;
 
@@ -73,10 +73,12 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   uint64_t philox_seed;
   uint64_t philox_offset;
 
-  sycl::local_accessor<int32_t, 1> shared_ids_;
+  sycl::local_accessor<int32_t, 1> sampled_id_;
+  sycl::local_accessor<int32_t, 1> last_valid_id_;
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
-    shared_ids_ = sycl::local_accessor<int32_t, 1>(sycl::range<1>(2), cgh);
+    sampled_id_ = sycl::local_accessor<int32_t, 1>(sycl::range<1>(1), cgh);
+    last_valid_id_ = sycl::local_accessor<int32_t, 1>(sycl::range<1>(1), cgh);
   }
 
   MinPSamplingKernel(
@@ -110,37 +112,37 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const uint32_t row_idx = (maybe_indices != nullptr) ? static_cast<uint32_t>(maybe_indices[bx]) : bx;
     const size_t row_offset = static_cast<size_t>(row_idx) * static_cast<size_t>(d);
 
-    const float p = (maybe_min_p_arr != nullptr) ? maybe_min_p_arr[row_idx] : min_p_val;
+    const float p = (maybe_min_p_arr != nullptr) ? maybe_min_p_arr[bx] : min_p_val;
 
-    using max_vec_in = vec_t<DType, kMaxVecSize>;
-    const uint32_t num_max_chunks = (d + kWgSize * kMaxVecSize - 1) / (kWgSize * kMaxVecSize);
+    using vec_in = vec_t<DType, VEC_SIZE>;
+    const uint32_t num_chunks = (d + kWgSize * VEC_SIZE - 1) / (kWgSize * VEC_SIZE);
 
     float thread_max = -std::numeric_limits<float>::infinity();
-    for (uint32_t i = 0; i < num_max_chunks; ++i) {
-      const uint32_t col_base = (i * kWgSize + tx) * kMaxVecSize;
-      max_vec_in v(static_cast<DType>(0));
+    for (uint32_t i = 0; i < num_chunks; ++i) {
+      const uint32_t col_base = (i * kWgSize + tx) * VEC_SIZE;
+      vec_in v(static_cast<DType>(0));
       if (col_base < d) {
         v.load(
             0, sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(probs + row_offset + col_base));
       }
 #pragma unroll
-      for (uint32_t j = 0; j < kMaxVecSize; ++j) {
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
         thread_max = sycl::max(thread_max, static_cast<float>(v[j]));
       }
     }
-    const float row_max = sycl::reduce_over_group(grp, thread_max, sycl::maximum<float>());
-    const float pivot = p * row_max;
+    const float max_val = sycl::reduce_over_group(grp, thread_max, sycl::maximum<float>());
+    const float pivot = p * max_val;
 
     float thread_sum = 0.0f;
-    for (uint32_t i = 0; i < num_max_chunks; ++i) {
-      const uint32_t col_base = (i * kWgSize + tx) * kMaxVecSize;
-      max_vec_in v(static_cast<DType>(0));
+    for (uint32_t i = 0; i < num_chunks; ++i) {
+      const uint32_t col_base = (i * kWgSize + tx) * VEC_SIZE;
+      vec_in v(static_cast<DType>(0));
       if (col_base < d) {
         v.load(
             0, sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(probs + row_offset + col_base));
       }
 #pragma unroll
-      for (uint32_t j = 0; j < kMaxVecSize; ++j) {
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
         const float x = static_cast<float>(v[j]);
         if (x >= pivot) thread_sum += x;
       }
@@ -148,38 +150,38 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const float q = sycl::reduce_over_group(grp, thread_sum, sycl::plus<float>());
 
     if (tx == 0) {
-      shared_ids_[0] = static_cast<int32_t>(d);
-      shared_ids_[1] = -1;
+      sampled_id_[0] = static_cast<int32_t>(d);
+      last_valid_id_[0] = -1;
     }
     item.barrier(sycl::access::fence_space::local_space);
 
     const float u = sgl::random::philox_uniform(philox_seed, philox_offset, bx, /*round=*/0) * q;
 
     float aggregate = 0.0f;
-    for (uint32_t i = 0; i < num_max_chunks; ++i) {
-      const uint32_t col_base = (i * kWgSize + tx) * kMaxVecSize;
-      max_vec_in v(static_cast<DType>(0));
+    for (uint32_t i = 0; i < num_chunks; ++i) {
+      const uint32_t col_base = (i * kWgSize + tx) * VEC_SIZE;
+      vec_in v(static_cast<DType>(0));
       if (col_base < d) {
         v.load(
             0, sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(probs + row_offset + col_base));
       }
 
-      bool keep[kMaxVecSize];
-      float local_prefix[kMaxVecSize];
+      bool valid[VEC_SIZE];
+      float local_prefix[VEC_SIZE];
       float running = 0.0f;
 #pragma unroll
-      for (uint32_t j = 0; j < kMaxVecSize; ++j) {
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
         const bool inb = col_base + j < d;
         const float x = inb ? static_cast<float>(v[j]) : 0.0f;
-        keep[j] = inb && (x >= pivot);
-        running += keep[j] ? x : 0.0f;
+        valid[j] = inb && (x >= pivot);
+        running += valid[j] ? x : 0.0f;
         local_prefix[j] = running;
-        if (keep[j]) {
+        if (valid[j]) {
           sycl::atomic_ref<
               int32_t,
               sycl::memory_order::relaxed,
               sycl::memory_scope::work_group,
-              sycl::access::address_space::local_space>(shared_ids_[1])
+              sycl::access::address_space::local_space>(last_valid_id_[0])
               .fetch_max(static_cast<int32_t>(col_base + j));
         }
       }
@@ -191,13 +193,13 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       if (aggregate + block_total > u) {
         const float cdf_before_thread = aggregate + thread_excl;
 #pragma unroll
-        for (uint32_t j = 0; j < kMaxVecSize; ++j) {
-          if (keep[j] && (cdf_before_thread + local_prefix[j] > u)) {
+        for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+          if (valid[j] && (cdf_before_thread + local_prefix[j] > u)) {
             sycl::atomic_ref<
                 int32_t,
                 sycl::memory_order::relaxed,
                 sycl::memory_scope::work_group,
-                sycl::access::address_space::local_space>(shared_ids_[0])
+                sycl::access::address_space::local_space>(sampled_id_[0])
                 .fetch_min(static_cast<int32_t>(col_base + j));
           }
         }
@@ -209,9 +211,9 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     item.barrier(sycl::access::fence_space::local_space);
 
     if (tx == 0) {
-      int32_t sampled_id = shared_ids_[0];
+      int32_t sampled_id = sampled_id_[0];
       if (sampled_id == static_cast<int32_t>(d)) {
-        sampled_id = shared_ids_[1];
+        sampled_id = last_valid_id_[0];
       }
       output[bx] = (sampled_id == -1) ? 0 : sampled_id;
     }
@@ -239,8 +241,8 @@ void launch_min_p_sampling(
 
   const uint32_t vec_size = std::gcd(16 / sizeof(KernelDType), vocab_size);
 
-  DISPATCH_MINP_VEC_SIZE(vec_size, kMaxVecSize, {
-    auto kernel = MinPSamplingKernel<KernelDType, kMaxVecSize>(
+  DISPATCH_MINP_VEC_SIZE(vec_size, VEC_SIZE, {
+    auto kernel = MinPSamplingKernel<KernelDType, VEC_SIZE>(
         probs_ptr,
         output,
         maybe_indices,

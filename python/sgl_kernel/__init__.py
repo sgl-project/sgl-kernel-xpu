@@ -85,6 +85,12 @@ from sgl_kernel.inkling_attn_prologue import (
     inkling_attn_prologue_extend,
     inkling_attn_prologue_verify,
 )
+from sgl_kernel.inkling_moe_gate import (
+    ensure_inkling_moe_gate_fused_scratch,
+    inkling_moe_gate_gemv,
+    inkling_moe_gate_gemv_fused,
+    inkling_moe_gate_topk_renorm,
+)
 from sgl_kernel.inkling_sconv import (
     HIS_ONES,
     HIS_PREFIX,

@@ -483,6 +483,32 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue
     int64_t page_size,
     const at::Tensor& log_tau);
 
+std::vector<at::Tensor> inkling_moe_gate_topk_renorm(
+    at::Tensor& logits,
+    at::Tensor& bias,
+    at::Tensor& global_scale,
+    double route_scale,
+    bool return_packed,
+    int64_t rows_per_workgroup);
+
+at::Tensor inkling_moe_gate_gemv(
+    at::Tensor& x,
+    at::Tensor& weight,
+    int64_t experts_per_workgroup,
+    int64_t subgroup_size);
+
+std::vector<at::Tensor> inkling_moe_gate_gemv_fused(
+    at::Tensor& x,
+    at::Tensor& weight,
+    at::Tensor& bias,
+    at::Tensor& global_scale,
+    at::Tensor& workspace,
+    at::Tensor& ticket,
+    double route_scale,
+    bool return_packed,
+    int64_t experts_per_workgroup,
+    int64_t subgroup_size);
+
 /*
  * From csrc/gemm
  */

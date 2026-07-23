@@ -18,10 +18,10 @@ except ImportError:
 try:
     from sgl_kernel.jit import apply_rope_inplace as jit_rope
     from sgl_kernel.jit import fused_inplace_qknorm as jit_qknorm
-    from sgl_kernel.jit import per_tensor_quant_fp8 as jit_per_tensor_quant_fp8
     from sgl_kernel.jit import gelu_and_mul as jit_gelu_and_mul
     from sgl_kernel.jit import gelu_tanh_and_mul as jit_gelu_tanh_and_mul
     from sgl_kernel.jit import moe_align_block_size as jit_moe_align_block_size
+    from sgl_kernel.jit import per_tensor_quant_fp8 as jit_per_tensor_quant_fp8
     from sgl_kernel.jit import (
         per_token_group_quant_8bit_v2 as jit_per_token_group_quant_8bit_v2,
     )
@@ -305,6 +305,7 @@ def test_per_tensor_quant_fp8_jit_vs_aot(shape, is_static, dtype):
     assert torch.equal(
         q_jit.view(torch.uint8), q_aot.view(torch.uint8)
     ), "JIT and AOT produced different fp8 codes"
+
 
 def _run_moe_align(use_aot, topk_ids, num_experts, block_size, pad):
     """Allocate outputs and run the AOT or JIT moe_align_block_size op.

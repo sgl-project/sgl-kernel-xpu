@@ -28,77 +28,15 @@ void FmhaSplitDecodeFp8Runner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(cons
   TORCH_CHECK(params.is_e4m3 || params.is_e5m2, "FmhaSplitDecodeFp8Runner requires an fp8 KV cache");
   TORCH_CHECK(!params.use_sink, "fp8 KV cache decode does not support sink logits");
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-    if (params.is_bf16) {
-      if (params.is_e4m3) {
-        SplitDecodeConfig<
-            false,
-            LocalMask,
-            false,
-            TileShapeQK,
-            TileShapePV,
-            TileShapeOutput,
-            SubgroupLayoutQK,
-            void,
-            1,
-            cutlass::bfloat16_t,
-            cutlass::float_e4m3_t,
-            cutlass::float_e4m3_t,
-            cutlass::bfloat16_t>::run(params);
-      } else {
-        SplitDecodeConfig<
-            false,
-            LocalMask,
-            false,
-            TileShapeQK,
-            TileShapePV,
-            TileShapeOutput,
-            SubgroupLayoutQK,
-            void,
-            1,
-            cutlass::bfloat16_t,
-            cutlass::float_e5m2_t,
-            cutlass::float_e5m2_t,
-            cutlass::bfloat16_t>::run(params);
-      }
+    using QElement = cutlass::bfloat16_t;
+    if (params.is_e4m3) {
+      SplitDecodeConfig<
+          false, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, 1,
+          QElement, cutlass::float_e4m3_t, cutlass::float_e4m3_t, QElement>::run(params);
     } else {
-#if @EMIT_FP8_FP16@
-      if (params.is_e4m3) {
-        SplitDecodeConfig<
-            false,
-            LocalMask,
-            false,
-            TileShapeQK,
-            TileShapePV,
-            TileShapeOutput,
-            SubgroupLayoutQK,
-            void,
-            1,
-            cutlass::half_t,
-            cutlass::float_e4m3_t,
-            cutlass::float_e4m3_t,
-            cutlass::half_t>::run(params);
-      } else {
-        SplitDecodeConfig<
-            false,
-            LocalMask,
-            false,
-            TileShapeQK,
-            TileShapePV,
-            TileShapeOutput,
-            SubgroupLayoutQK,
-            void,
-            1,
-            cutlass::half_t,
-            cutlass::float_e5m2_t,
-            cutlass::float_e5m2_t,
-            cutlass::half_t>::run(params);
-      }
-#else
-      TORCH_CHECK(
-          false,
-          "fp8 KV cache with fp16 query is disabled at compile time; "
-          "rebuild with -DSGL_FMHA_FP8_KV_ENABLE_FP16=ON to enable it");
-#endif
+      SplitDecodeConfig<
+          false, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, 1,
+          QElement, cutlass::float_e5m2_t, cutlass::float_e5m2_t, QElement>::run(params);
     }
   });
 }

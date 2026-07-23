@@ -1,0 +1,81 @@
+/***************************************************************************************************
+ * Copyright (c) 2024 - 2025 Codeplay Software Ltd. All rights reserved.
+ * Copyright (C) 2025 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ **************************************************************************************************/
+// Auto-generated from xe_fmha_fwd_decode_nopage_kernel.cpp.in
+// Template parameters: QG_SZ=@QG_SZ@, HEAD_DIM=@HEAD_DIM@ (non-paged / no_page attention)
+//
+// The non-paged (contiguous ragged) KV-cache decode path is compiled into its
+// own translation unit / runner type (FmhaDecodeNpRunner, no PAGE_SIZE template
+// parameter) so its kernel instantiations land in shared libraries separate
+// from the paged decode path. Non-paged decode supports bf16/fp16 queries only
+// (no fp8 KV cache, no split-KV).
+#define SYCL_INTEL_TARGET 20
+
+#include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
+
+namespace decode {
+
+template <>
+void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DIM@>::operator()(const Arguments& params) const {
+  // Non-paged (contiguous ragged) KV cache. The paged decode kernel ties its KV
+  // tile to PAGE_SIZE; the non-paged path has no page size, so it uses an
+  // independent KV-tile constant (@TILED_KV_NP@) that can be tuned separately.
+  TORCH_CHECK(
+      params.softmax_sink_ptr == nullptr,
+      "No-page attention does not support sink logits (softmax_sink_ptr must be null)");
+  using TileShapeQK_NP = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@TILED_KV_NP@>, cute::_64>;
+  using TileShapePV_NP = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@TILED_KV_NP@>>;
+  using TileShapeOutput_NP = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;
+  using SubgroupLayoutQK_NP = cute::Layout<cute::Shape<cute::_1, cute::Int<@TILED_KV_NP@ / 16>, cute::_1>>;
+  // No sink support for no_page path; always use Sink=false
+  AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+    using Element = bfloat16_t;
+    DecodeConfig<
+        false,
+        LocalMask,
+        false,
+        TileShapeQK_NP,
+        TileShapePV_NP,
+        TileShapeOutput_NP,
+        SubgroupLayoutQK_NP,
+        void,
+        1,
+        false,
+        Element,
+        Element,
+        Element,
+        Element>::run_nopaged(params);
+  });
+}
+
+template struct FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DIM@>;
+
+}  // namespace decode

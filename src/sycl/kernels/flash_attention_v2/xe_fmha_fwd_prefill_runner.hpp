@@ -485,4 +485,24 @@ struct FmhaPrefillRunner {
   void operator()(const Arguments& params) const;
 };
 
+// Non-paged (no_page) prefill is split into its own runner type so its kernel
+// instantiations are compiled in translation units separate from the paged
+// prefill path, producing independent shared libraries and lowering peak
+// compiler memory. Non-paged prefill supports bf16 queries only (no fp8).
+template <int HEAD_DIM>
+struct FmhaPrefillNpRunner {
+  void operator()(const Arguments& params) const;
+};
+
+// FP8 KV-cache prefill path is split into its own runner type so that the
+// (heavy) e4m3/e5m2 kernel instantiations — which also fan out over
+// is_local x is_causal — are compiled in a separate translation unit from the
+// bf16 paged prefill path. This keeps the peak compiler memory of any
+// single prefill TU low (avoids OOM during AOT build). The dispatch forwards to
+// this when params.is_e4m3 || is_e5m2.
+template <int HEAD_DIM>
+struct FmhaPrefillFp8Runner {
+  void operator()(const Arguments& params) const;
+};
+
 }  // namespace prefill

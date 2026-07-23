@@ -19,7 +19,13 @@ try:
     from sgl_kernel.jit import apply_rope_inplace as jit_rope
     from sgl_kernel.jit import fused_inplace_qknorm as jit_qknorm
     from sgl_kernel.jit import moe_align_block_size as jit_moe_align_block_size
+    from sgl_kernel.jit import gelu_and_mul as jit_gelu_and_mul
+    from sgl_kernel.jit import gelu_tanh_and_mul as jit_gelu_tanh_and_mul
+    from sgl_kernel.jit import (
+        per_token_group_quant_8bit_v2 as jit_per_token_group_quant_8bit_v2,
+    )
     from sgl_kernel.jit import rmsnorm as jit_rmsnorm
+    from sgl_kernel.jit import silu_and_mul as jit_silu_and_mul
     from sgl_kernel.jit import timestep_embedding as jit_timestep_embedding
 
     HAS_SGLANG_JIT = True
@@ -348,6 +354,155 @@ def test_moe_align_block_size_jit_vs_aot(
     assert torch.equal(
         _placed(s_jit, n_jit), _placed(s_aot, n_aot)
     ), "sorted_token_ids placed-set mismatch"
+
+def _make_ptgq_v2_scale(out_shape, group_size, column_major, device):
+    ng = out_shape[-1] // group_size
+    if column_major:
+        return torch.empty(
+            (ng,) + out_shape[:-1], device=device, dtype=torch.float32
+        ).permute(-1, -2)
+    return torch.empty(out_shape[:-1] + (ng,), device=device, dtype=torch.float32)
+
+
+@pytest.mark.parametrize("group_size", [64, 128])
+@pytest.mark.parametrize("column_major", [False, True])
+@pytest.mark.parametrize("fuse_silu_and_mul", [False, True])
+@pytest.mark.parametrize("out_dtype", [torch.float8_e4m3fn, torch.int8])
+@pytest.mark.parametrize("in_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.skipif(not HAS_SGL_KERNEL, reason="Requires AOT sgl_kernel")
+@pytest.mark.skipif(not HAS_SGLANG_JIT, reason="Requires SGLang for JIT compilation")
+@pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
+def test_per_token_group_quant_8bit_v2_jit_vs_aot(
+    group_size, column_major, fuse_silu_and_mul, out_dtype, in_dtype
+):
+    """JIT vs AOT per-token-group 8-bit v2 (vanilla / column-major / fused silu).
+
+    Scales match closely; quant codes agree with AOT to within one ULP (int8) or
+    one e4m3 step (fp8) -- both do the same reciprocal-multiply-then-clamp, so
+    they differ only at quantization boundaries, as the AOT kernel differs from
+    a pure-division reference.
+    """
+    # int8 output uses a row-major scale layout in this op.
+    if column_major and out_dtype == torch.int8:
+        pytest.skip("int8 path uses row-major scales")
+
+    device = "xpu"
+    hidden = 512
+    num_tokens = 128
+    eps = 1e-10
+    min_8bit, max_8bit = (-128.0, 127.0) if out_dtype == torch.int8 else (-448.0, 448.0)
+
+    torch.manual_seed(0)
+    x = torch.randn(
+        num_tokens,
+        hidden * (2 if fuse_silu_and_mul else 1),
+        dtype=in_dtype,
+        device=device,
+    )
+    out_shape = (num_tokens, hidden)
+
+    def _run(use_aot):
+        q = torch.empty(out_shape, device=device, dtype=out_dtype)
+        s = _make_ptgq_v2_scale(out_shape, group_size, column_major, device)
+        if use_aot:
+            torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit_v2.default(
+                x,
+                q,
+                s,
+                group_size,
+                eps,
+                min_8bit,
+                max_8bit,
+                False,
+                fuse_silu_and_mul,
+                None,
+            )
+        else:
+            jit_per_token_group_quant_8bit_v2(
+                x,
+                q,
+                s,
+                group_size,
+                eps,
+                min_8bit,
+                max_8bit,
+                scale_ue8m0=False,
+                fuse_silu_and_mul=fuse_silu_and_mul,
+                masked_m=None,
+            )
+        return q, s
+
+    q_aot, s_aot = _run(True)
+    q_jit, s_jit = _run(False)
+
+    # Scales match tightly.
+    torch.testing.assert_close(
+        s_jit.float().cpu(), s_aot.float().cpu(), rtol=1e-3, atol=1e-5
+    )
+
+    # Quant codes: bounded by one ULP (int8) / one e4m3 step (fp8).
+    if out_dtype == torch.int8:
+        max_ulp = (q_jit.to(torch.int32) - q_aot.to(torch.int32)).abs().max().item()
+        assert max_ulp <= 1, f"int8 quant differs from AOT by {max_ulp} > 1 ULP"
+    else:
+        ng = hidden // group_size
+        dq = lambda q, s: (
+            q.cpu().view(num_tokens, ng, group_size).to(torch.float32)
+            * s.float().cpu().reshape(num_tokens, ng, 1)
+        )
+        torch.testing.assert_close(
+            dq(q_jit, s_jit), dq(q_aot, s_aot), rtol=1e-1, atol=1e-1
+        )
+
+
+def _reference_act_and_mul(op_name: str, x: torch.Tensor) -> torch.Tensor:
+    """PyTorch reference for the fused gated activations (fp32 compute)."""
+    import torch.nn.functional as F
+
+    d = x.shape[-1] // 2
+    gate, up = x[..., :d].float(), x[..., d:].float()
+    if op_name == "silu":
+        act = F.silu(gate)
+    elif op_name == "gelu":
+        act = F.gelu(gate)  # erf / exact
+    elif op_name == "gelu_tanh":
+        act = F.gelu(gate, approximate="tanh")
+    else:
+        raise ValueError(op_name)
+    return (act * up).to(x.dtype)
+
+
+@pytest.mark.parametrize(
+    "op_name",
+    ["silu", "gelu", "gelu_tanh"],
+)
+@pytest.mark.parametrize(
+    "num_tokens,dim",
+    [(128, 1024), (37, 512), (256, 4096), (5, 14336)],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.skipif(not HAS_SGLANG_JIT, reason="Requires SGLang for JIT compilation")
+@pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
+def test_activation_and_mul_jit_vs_reference(op_name, num_tokens, dim, dtype):
+    """Test JIT silu/gelu/gelu_tanh + mul against the PyTorch reference.
+
+    Input is [num_tokens, 2*dim] (gate|up split); output is [num_tokens, dim].
+    """
+    device = "xpu"
+    jit_fn = {
+        "silu": jit_silu_and_mul,
+        "gelu": jit_gelu_and_mul,
+        "gelu_tanh": jit_gelu_tanh_and_mul,
+    }[op_name]
+
+    torch.manual_seed(0)
+    x = torch.randn(num_tokens, 2 * dim, dtype=dtype, device=device)
+
+    y_ref = _reference_act_and_mul(op_name, x)
+    y_jit = jit_fn(x.clone())
+
+    assert y_jit.shape == (num_tokens, dim)
+    torch.testing.assert_close(y_jit, y_ref, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":

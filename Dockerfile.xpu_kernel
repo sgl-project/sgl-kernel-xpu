@@ -19,13 +19,40 @@ ARG SG_LANG_BRANCH=main
 ARG SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git
 ARG SG_LANG_KERNEL_BRANCH=main
 
-# Install the latest UMD driver for SYCL-TLA
+# Pin the compute UMD + IGC. The kobuk-team PPA is rolling; an untested build
+# mismatched the host xe KMD and faulted libze_intel_gpu.so on the B580 runner.
+# Must stay in lockstep with the host KMD; override via --build-arg per workflow.
+ARG COMPUTE_RUNTIME_VERSION=26.05.37020.3
+ARG IGC_VERSION=2.28.4+20760
+ARG GMM_VERSION=22.9.0
 RUN apt-get install -y software-properties-common && \
     add-apt-repository -y ppa:kobuk-team/intel-graphics && \
     apt-get update  && \
-    apt-get install -y libze-intel-gpu1 libze1 intel-metrics-discovery intel-opencl-icd clinfo intel-gsc && \
+    # Loader + media/metrics from the PPA; GPU driver itself is pinned below.
+    apt-get install -y libze1 intel-metrics-discovery clinfo intel-gsc && \
     apt-get install -y intel-media-va-driver-non-free libmfx-gen1 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo && \
-    apt-get install -y libze-dev intel-ocloc
+    apt-get install -y libze-dev && \
+    # IGC first: libze-intel-gpu1 / intel-opencl-icd depend on it.
+    cd /tmp && \
+    igc_url="https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_VERSION%%+*}" && \
+    cr_url="https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_VERSION}" && \
+    curl -fsSL -O "${igc_url}/intel-igc-core-2_${IGC_VERSION}_amd64.deb" && \
+    curl -fsSL -O "${igc_url}/intel-igc-opencl-2_${IGC_VERSION}_amd64.deb" && \
+    curl -fsSL -O "${cr_url}/libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
+    curl -fsSL -O "${cr_url}/intel-opencl-icd_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
+    curl -fsSL -O "${cr_url}/intel-ocloc_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
+    curl -fsSL -O "${cr_url}/libigdgmm12_${GMM_VERSION}_amd64.deb" && \
+    apt-get install -y --allow-downgrades \
+        ./intel-igc-core-2_${IGC_VERSION}_amd64.deb \
+        ./intel-igc-opencl-2_${IGC_VERSION}_amd64.deb \
+        ./libigdgmm12_${GMM_VERSION}_amd64.deb \
+        ./libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb \
+        ./intel-opencl-icd_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb \
+        ./intel-ocloc_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb && \
+    rm -f /tmp/*.deb && \
+    # Hold so a later apt upgrade cannot pull the rolling PPA version.
+    apt-mark hold libze-intel-gpu1 intel-opencl-icd intel-ocloc libigdgmm12 \
+        intel-igc-core-2 intel-igc-opencl-2
 
 # Install Miniforge & PyTorch/Triton
 RUN curl -fsSL -v -o miniforge.sh -O https://github.com/conda-forge/miniforge/releases/download/25.1.1-0/Miniforge3-Linux-x86_64.sh && \

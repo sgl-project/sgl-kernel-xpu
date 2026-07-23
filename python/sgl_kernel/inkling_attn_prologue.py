@@ -44,18 +44,25 @@ def _ensure_ops_registered() -> None:
         )
 
 
-def _reject_mxfp8_or_tau(
-    *,
-    mxfp8_quant: bool,
+def _resolve_log_scaling_tau(
+    log_scaling_tau: Optional[torch.Tensor],
     log_tau: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    if log_scaling_tau is not None and log_tau is not None:
+        raise ValueError("pass only one of log_scaling_tau or log_tau")
+    return log_scaling_tau if log_scaling_tau is not None else log_tau
+
+
+def _reject_mxfp8_or_tau(
+    *, mxfp8_quant: bool, log_scaling_tau: Optional[torch.Tensor]
 ) -> None:
     if mxfp8_quant:
         raise NotImplementedError(
             "Inkling XPU attention prologue MXFP8 store is not wired yet"
         )
-    if log_tau is not None and log_tau.numel() > 0:
+    if log_scaling_tau is not None and log_scaling_tau.numel() > 0:
         raise NotImplementedError(
-            "Inkling XPU attention prologue log_tau path is not wired yet"
+            "Inkling XPU attention prologue log_scaling_tau path is not wired yet"
         )
 
 
@@ -104,10 +111,12 @@ def inkling_attn_prologue_verify(
     sfk: Optional[torch.Tensor] = None,
     sfv: Optional[torch.Tensor] = None,
     page_size: int = 128,
+    log_scaling_tau: Optional[torch.Tensor] = None,
     log_tau: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     del sfk, sfv, page_size
-    _reject_mxfp8_or_tau(mxfp8_quant=mxfp8_quant, log_tau=log_tau)
+    log_scaling_tau = _resolve_log_scaling_tau(log_scaling_tau, log_tau)
+    _reject_mxfp8_or_tau(mxfp8_quant=mxfp8_quant, log_scaling_tau=log_scaling_tau)
     _ensure_ops_registered()
     q_out, k_out, v_out = torch.ops.sgl_kernel.inkling_attn_prologue_verify(
         qkvr,
@@ -166,10 +175,12 @@ def inkling_attn_prologue_decode(
     sfk: Optional[torch.Tensor] = None,
     sfv: Optional[torch.Tensor] = None,
     page_size: int = 128,
+    log_scaling_tau: Optional[torch.Tensor] = None,
     log_tau: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     del sfk, sfv, page_size
-    _reject_mxfp8_or_tau(mxfp8_quant=mxfp8_quant, log_tau=log_tau)
+    log_scaling_tau = _resolve_log_scaling_tau(log_scaling_tau, log_tau)
+    _reject_mxfp8_or_tau(mxfp8_quant=mxfp8_quant, log_scaling_tau=log_scaling_tau)
     _ensure_ops_registered()
     q_out, k_out, v_out = torch.ops.sgl_kernel.inkling_attn_prologue_decode(
         qkvr,
@@ -231,10 +242,13 @@ def inkling_attn_prologue_extend(
     sfk: Optional[torch.Tensor] = None,
     sfv: Optional[torch.Tensor] = None,
     page_size: int = 128,
+    do_cache_update: bool = True,
+    log_scaling_tau: Optional[torch.Tensor] = None,
     log_tau: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     del sfk, sfv, page_size
-    _reject_mxfp8_or_tau(mxfp8_quant=mxfp8_quant, log_tau=log_tau)
+    log_scaling_tau = _resolve_log_scaling_tau(log_scaling_tau, log_tau)
+    _reject_mxfp8_or_tau(mxfp8_quant=mxfp8_quant, log_scaling_tau=log_scaling_tau)
     _ensure_ops_registered()
     q_out, k_out, v_out = torch.ops.sgl_kernel.inkling_attn_prologue_extend(
         qkvr,
@@ -264,6 +278,7 @@ def inkling_attn_prologue_extend(
         _activation_is_silu(activation),
         bool(use_residual),
         bool(do_store),
+        bool(do_cache_update),
     )
     return q_out, k_out, v_out, None
 

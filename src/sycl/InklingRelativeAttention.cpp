@@ -7,6 +7,10 @@
  * This file adapts the Inkling BMG relative-attention backend from
  * /data2/syk/cutlass-sycl/examples/17_bmg_relative_attention_backend for the
  * sgl-kernel XPU extension ABI.
+ *
+ * TODO(inkling): This standalone op is a temporary bring-up path. The long-term
+ * implementation should route relative attention through the XPU FMHA kernel by
+ * adding the relative-bias score modifier to the FMHA QK score/mainloop path.
  */
 
 #include <ATen/ATen.h>

@@ -285,6 +285,7 @@ struct AttnPrologueExtendParams {
   bool use_residual;
   bool do_track;
   bool do_store;
+  bool do_cache_update;
 };
 
 template <typename scalar_t, typename Params>
@@ -722,6 +723,9 @@ void launch_extend(sycl::queue& q, AttnPrologueExtendParams<scalar_t> const& par
         sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
   }
 
+  if (!params.do_cache_update) {
+    return;
+  }
   const int64_t update_total = params.B * 2 * (params.dkv / kHeadDim);
   if (update_total == 0) {
     return;
@@ -973,7 +977,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_extend(
     int64_t dkv,
     bool silu_activation,
     bool use_residual,
-    bool do_store) {
+    bool do_store,
+    bool do_cache_update) {
   check_common_inputs(
       qkvr, k_cache, v_cache, k_weight, v_weight, q_gamma, k_gamma, loc, k_buf, v_buf, q_off, k_off, v_off, dq, dkv);
   check_xpu_tensor(cache_indices, "cache_indices");
@@ -1070,7 +1075,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_extend(
             silu_activation,
             use_residual,
             do_track,
-            do_store};
+            do_store,
+            do_cache_update};
         launch_extend<scalar_t>(queue, params);
         return {q_out, k_out, v_out};
       });

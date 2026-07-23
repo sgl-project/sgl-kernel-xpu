@@ -220,11 +220,12 @@ def packed_q_view(T, dq, dkv, dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("activation", [None, "silu"])
-def test_attn_prologue_verify_matches_reference(dtype, activation):
+@pytest.mark.parametrize("dq,dkv", [(128, 128), (384, 256)])
+def test_attn_prologue_verify_matches_reference(dtype, activation, dq, dkv):
     from sgl_kernel.inkling_attn_prologue import inkling_attn_prologue_verify
 
     torch.manual_seed(11)
-    B, draft, dq, dkv, W = 3, 2, 128, 128, 4
+    B, draft, W = 3, 2, 4
     T = B * draft
     packed, q, q_off, k_off, v_off = packed_q_view(T, dq, dkv, dtype)
     k_cache = rand((8, W - 1, dkv), dtype, scale=0.1)
@@ -329,11 +330,12 @@ def test_attn_prologue_verify_matches_reference(dtype, activation):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_attn_prologue_decode_updates_cache_and_store(dtype):
+@pytest.mark.parametrize("dq,dkv", [(128, 128), (384, 256)])
+def test_attn_prologue_decode_updates_cache_and_store(dtype, dq, dkv):
     from sgl_kernel.inkling_attn_prologue import inkling_attn_prologue_decode
 
     torch.manual_seed(12)
-    T, dq, dkv, W = 4, 128, 128, 4
+    T, W = 4, 4
     packed, q, q_off, k_off, v_off = packed_q_view(T, dq, dkv, dtype)
     k_cache = rand((8, W - 1, dkv), dtype, scale=0.1)
     v_cache = rand((8, W - 1, dkv), dtype, scale=0.1)
@@ -420,11 +422,12 @@ def test_attn_prologue_decode_updates_cache_and_store(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_attn_prologue_extend_updates_cache_and_track(dtype):
+@pytest.mark.parametrize("dq,dkv", [(128, 128), (384, 256)])
+def test_attn_prologue_extend_updates_cache_and_track(dtype, dq, dkv):
     from sgl_kernel.inkling_attn_prologue import inkling_attn_prologue_extend
 
     torch.manual_seed(13)
-    dq, dkv, W = 128, 128, 4
+    W = 4
     cu = torch.tensor([0, 2, 2, 5], dtype=torch.int64, device="xpu")
     si = torch.tensor([0, 0, 2, 2, 2], dtype=torch.int32, device="xpu")
     T, B = 5, 3

@@ -215,6 +215,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("sgl_per_token_quant_fp8(Tensor input, Tensor(a!) output_q, Tensor(b!) output_s) -> ()");
   m.impl("sgl_per_token_quant_fp8", torch::kXPU, &sgl_per_token_quant_fp8);
+  m.def(
+      "fused_q_indexer_rope_hadamard_quant(Tensor q_input, Tensor(a!) q_fp8, Tensor weight, Tensor(b!) "
+      "weights_out, float weight_scale, Tensor rope_cache, Tensor positions) -> ()");
+  m.impl("fused_q_indexer_rope_hadamard_quant", torch::kXPU, &fused_q_indexer_rope_hadamard_quant);
 
   /*
    * From fused qk norm rope

@@ -271,6 +271,14 @@ void scaled_fp4_quant(
     torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_scale, torch::Tensor const& input_scale);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
+void fused_q_indexer_rope_hadamard_quant(
+    const at::Tensor& q_input,
+    at::Tensor& q_fp8,
+    const at::Tensor& weight,
+    at::Tensor& weights_out,
+    double weight_scale,
+    const at::Tensor& rope_cache,
+    const at::Tensor& positions);
 void bmm_fp8(
     at::Tensor A,
     at::Tensor B,

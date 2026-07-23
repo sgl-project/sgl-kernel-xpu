@@ -55,7 +55,7 @@ from sgl_kernel.flash_compress_128_torch import (
 )
 from sgl_kernel.fp8_paged_mqa_logits import fp8_paged_mqa_logits_triton
 from sgl_kernel.fused_norm_rope_v2_torch import compress_norm_rope_store
-from sgl_kernel.fused_q_indexer_rope_hadamard_quant_torch import (
+from sgl_kernel.fused_q_indexer_rope_hadamard_quant import (
     fused_q_indexer_rope_hadamard_quant,
 )
 from sgl_kernel.gdn_attn import gdn_attention

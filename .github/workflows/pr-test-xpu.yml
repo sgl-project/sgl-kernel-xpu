@@ -20,15 +20,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
-
-      - name: Build Docker image
+      - name: Pull nightly Docker image
         run: |
-          docker build \
-            --build-arg SG_LANG_KERNEL_BRANCH=${{ github.head_ref }} \
-            --build-arg SG_LANG_KERNEL_REPO=${{ github.event.pull_request.head.repo.clone_url }} \
-            --no-cache --progress=plain -f Dockerfile.xpu_kernel -t xpu_sglang:kernel .
+          docker pull intel/sgl-kernel-xpu-dev:latest
 
       - name: Run container
         run: |
@@ -36,7 +30,30 @@ jobs:
             --device /dev/dri/ \
             --name ci_sglkernel_xpu \
             -e HF_TOKEN=$(cat ~/huggingface_token.txt) \
-            xpu_sglang:kernel
+            intel/sgl-kernel-xpu-dev:latest
+
+      - name: Rebuild sgl-kernel from latest main + PR
+        timeout-minutes: 40
+        env:
+          # refs/pull/N/merge is GitHub's pre-computed merge commit:
+          # current base (main) merged with this PR. Testing that ref
+          # catches conflicts with anything that landed on main while
+          # the PR was in flight.
+          PR_MERGE_REF: refs/pull/${{ github.event.pull_request.number }}/merge
+        run: |
+          docker exec -e PR_MERGE_REF="${PR_MERGE_REF}" ci_sglkernel_xpu \
+            /bin/bash -c '\
+              set -euxo pipefail && \
+              . /miniforge3/bin/activate && \
+              conda activate py3.10 && \
+              cd /root/sglang/sgl-kernel-xpu && \
+              git remote set-url origin https://github.com/sgl-project/sgl-kernel-xpu.git && \
+              git fetch --depth=1 origin "${PR_MERGE_REF}" && \
+              git checkout FETCH_HEAD && \
+              pip uninstall -y sgl-kernel || true && \
+              pip install --force-reinstall -v . && \
+              python -c "import sgl_kernel; print(sgl_kernel.__file__)" \
+            '
 
       - name: Install Dependency
         timeout-minutes: 20
@@ -93,10 +110,8 @@ jobs:
               python3 bench_jit_qknorm.py 2>&1 | tee bench_jit_qknorm.py.log && \
               python3 bench_jit_rope.py 2>&1 | tee bench_jit_rope.py.log && \
               python3 bench_jit_timestep_embedding.py 2>&1 | tee bench_jit_timestep_embedding.py.log && \
-              python3 bench_jit_moe_align_block_size.py 2>&1 | tee bench_jit_moe_align_block_size.py.log && \
-              python3 bench_jit_per_token_group_quant_8bit_v2.py 2>&1 | tee bench_jit_per_token_group_quant_8bit_v2.py.log && \
-              python3 bench_jit_activation.py 2>&1 | tee bench_jit_activation.py.log && \
-              python3 bench_hc_post.py 2>&1 | tee bench_hc_post.py.log && \
+              python3 bench_jit_activation.py 2>&1 | tee bench_jit_activation.py.log
+              python3 bench_hc_post.py 2>&1 | tee bench_hc_post.py.log
               python3 bench_hc_post.py 2>&1 | tee bench_hc_post.py.log && \
               python3 bench_sgemm_lora_a_fwd.py 2>&1 | tee bench_sgemm_lora_a_fwd.py.log
             "

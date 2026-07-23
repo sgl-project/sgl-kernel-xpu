@@ -18,9 +18,9 @@ except ImportError:
 try:
     from sgl_kernel.jit import apply_rope_inplace as jit_rope
     from sgl_kernel.jit import fused_inplace_qknorm as jit_qknorm
-    from sgl_kernel.jit import moe_align_block_size as jit_moe_align_block_size
     from sgl_kernel.jit import gelu_and_mul as jit_gelu_and_mul
     from sgl_kernel.jit import gelu_tanh_and_mul as jit_gelu_tanh_and_mul
+    from sgl_kernel.jit import moe_align_block_size as jit_moe_align_block_size
     from sgl_kernel.jit import (
         per_token_group_quant_8bit_v2 as jit_per_token_group_quant_8bit_v2,
     )
@@ -354,6 +354,7 @@ def test_moe_align_block_size_jit_vs_aot(
     assert torch.equal(
         _placed(s_jit, n_jit), _placed(s_aot, n_aot)
     ), "sorted_token_ids placed-set mismatch"
+
 
 def _make_ptgq_v2_scale(out_shape, group_size, column_major, device):
     ng = out_shape[-1] // group_size

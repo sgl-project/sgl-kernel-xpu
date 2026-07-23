@@ -79,6 +79,23 @@ from sgl_kernel.gemm import (
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.hadamard import hadamard_transform
+from sgl_kernel.inkling_sconv import (
+    HIS_ONES,
+    HIS_PREFIX,
+    HIS_SEQ_MINUS_EXT,
+    HIS_ZEROS,
+    causal_conv1d,
+    fused_causal_conv1d_update_decode,
+    fused_decode_sconv_metadata,
+    fused_draft_extend_sconv_cache,
+    fused_extend_sconv_metadata,
+    fused_gather_scatter_to_sconv_cache,
+    precompute_helion_decode_metadata,
+    precompute_helion_extend_metadata,
+    save_intermediate_conv_windows,
+    track_conv_indices,
+    update_sconv_cache,
+)
 from sgl_kernel.lora import embedding_lora_a_fwd, sgemm_lora_a_fwd
 from sgl_kernel.mamba import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
 from sgl_kernel.memory import weak_ref_tensor

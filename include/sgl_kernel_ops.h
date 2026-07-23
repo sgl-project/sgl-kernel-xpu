@@ -21,6 +21,7 @@ limitations under the License.
 #include <torch/library.h>
 #include <torch/torch.h>
 
+#include <optional>
 #include <sycl/sycl.hpp>
 #include <tuple>
 #include <vector>
@@ -235,6 +236,77 @@ void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor pos_ids,
     bool interleave,
     int64_t sycl_stream);
+
+/*
+ * Inkling short convolution family.
+ */
+at::Tensor inkling_sconv_forward(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& sconv_cache,
+    const at::Tensor& cache_mask,
+    const at::Tensor& safe_idx,
+    const at::Tensor& cu,
+    const at::Tensor& si,
+    bool silu_activation,
+    bool use_residual,
+    bool is_decode);
+void inkling_update_sconv_cache(
+    const at::Tensor& x,
+    at::Tensor& sconv_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& has_initial_state,
+    const at::Tensor& query_start_loc);
+at::Tensor inkling_fused_decode_update_sconv(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    at::Tensor& sconv_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& cache_mask,
+    bool silu_activation,
+    bool use_residual,
+    const std::optional<at::Tensor>& track_mask,
+    const std::optional<at::Tensor>& track_indices);
+void inkling_gather_scatter_sconv_cache(
+    const at::Tensor& hidden_states,
+    at::Tensor& sconv_cache,
+    const at::Tensor& track_conv_indices,
+    const at::Tensor& mask,
+    const at::Tensor& dst_indices);
+void inkling_draft_extend_sconv_cache(
+    const at::Tensor& hidden_states,
+    at::Tensor& sconv_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& num_accepted_tokens,
+    int64_t draft_token_num,
+    bool do_tracking,
+    const std::optional<at::Tensor>& crossed,
+    const std::optional<at::Tensor>& track_step,
+    const std::optional<at::Tensor>& mamba_track_indices);
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+inkling_fused_decode_sconv_metadata(int64_t B, const at::Tensor& cache_indices);
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> inkling_fused_extend_sconv_metadata(
+    int64_t B,
+    int64_t T,
+    const at::Tensor& cache_indices,
+    int64_t his_mode,
+    const std::optional<at::Tensor>& extend_seq_lens,
+    const std::optional<at::Tensor>& his_src,
+    int64_t draft_token_num);
+at::Tensor inkling_track_conv_indices(
+    const at::Tensor& query_start_loc,
+    const at::Tensor& mamba_track_seqlens,
+    const at::Tensor& extend_prefix_lens,
+    int64_t width_minus_one,
+    int64_t chunk_size,
+    int64_t total_tokens);
+void inkling_save_intermediate_conv_windows(
+    const at::Tensor& sconv_cache,
+    const at::Tensor& hidden_states,
+    const at::Tensor& cache_indices,
+    at::Tensor& intermediate_out,
+    int64_t batch_size,
+    int64_t draft_token_num);
 
 /*
  * From csrc/gemm

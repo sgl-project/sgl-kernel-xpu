@@ -325,6 +325,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    * Compress plan kernels
    */
   m.def(
+      "plan_compress_prefill(Tensor req_pool_indices, Tensor req_to_token, Tensor full_to_state, "
+      "Tensor seq_lens, Tensor extend_lens, Tensor pin_buffer, int num_q_tokens, int compress_ratio, int "
+      "swa_page_size, "
+      "int ring_size, bool use_cuda_graph=False) -> (Tensor, Tensor)");
+  m.impl("plan_compress_prefill", torch::kXPU, &at::native::xpu::plan_compress_prefill);
+
+  m.def(
       "plan_compress_decode(Tensor req_pool_indices, Tensor req_to_token, Tensor full_to_state, "
       "Tensor seq_lens, int compress_ratio, int swa_page_size, int ring_size) -> Tensor");
   m.impl("plan_compress_decode", torch::kXPU, &at::native::xpu::plan_compress_decode);

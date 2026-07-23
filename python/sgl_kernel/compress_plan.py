@@ -76,7 +76,7 @@ def _prefill_buffer_len(j: int, compress_ratio: int) -> int:
 def plan_compress_prefill(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
-    full_to_swa: torch.Tensor,
+    full_to_state: torch.Tensor,
     seq_lens: torch.Tensor,
     extend_lens: torch.Tensor,
     pin_buffer: torch.Tensor,
@@ -86,151 +86,19 @@ def plan_compress_prefill(
     ring_size: int,
     use_cuda_graph: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert (
-        req_pool_indices.device.type != "cpu" and req_pool_indices.dtype == torch.int64
+    return torch.ops.sgl_kernel.plan_compress_prefill(
+        req_pool_indices,
+        req_to_token,
+        full_to_state,
+        seq_lens,
+        extend_lens,
+        pin_buffer,
+        num_q_tokens,
+        compress_ratio,
+        swa_page_size,
+        ring_size,
+        use_cuda_graph,
     )
-    assert req_to_token.device.type != "cpu" and req_to_token.dtype == torch.int32
-    assert full_to_swa.device.type != "cpu" and full_to_swa.dtype == torch.int64
-    assert (
-        pin_buffer.device.type == "cpu"
-        and pin_buffer.dtype == torch.uint8
-        and pin_buffer.is_contiguous()
-    )
-    assert pin_buffer.numel() >= num_q_tokens * (16 + 8)
-
-    device = req_pool_indices.device
-    is_overlap = compress_ratio == 4
-    mtp_pad = min(ring_size - compress_ratio, 4)
-
-    seq_list = seq_lens.cpu().tolist()
-    ext_list = extend_lens.cpu().tolist()
-
-    c_seq: List[int] = []
-    c_rid16: List[int] = []
-    c_buf16: List[int] = []
-    c_bid: List[int] = []
-    w_packed32: List[int] = []
-    w_pos1: List[int] = []
-
-    counter = 0
-    for b, (sl, el) in enumerate(zip(seq_list, ext_list)):
-        sl = int(sl)
-        el = int(el)
-        prefix_len = sl - el
-
-        last_c_pos = (sl // compress_ratio) * compress_ratio
-        first_w_pos = min(
-            last_c_pos - (compress_ratio if is_overlap else 0), sl - mtp_pad
-        )
-
-        for j in range(el):
-            position = prefix_len + j
-            ragged_id = counter + j
-
-            if (position + 1) % compress_ratio == 0:
-                buffer_len = _prefill_buffer_len(j, compress_ratio)
-
-                c_seq.append(position + 1)
-                c_rid16.append(ragged_id & 0xFFFF)
-                c_buf16.append(int(buffer_len) & 0xFFFF)
-                c_bid.append(b)
-
-            do_write = position >= first_w_pos
-            if not do_write and is_overlap:
-                do_write = (position % swa_page_size) >= (
-                    swa_page_size - compress_ratio
-                )
-            if do_write:
-                w_packed32.append(((b & 0xFFFF) << 16) | (ragged_id & 0xFFFF))
-                w_pos1.append(position + 1)
-
-        counter += el
-
-    num_c = len(c_seq)
-    num_w = len(w_packed32)
-
-    c_bytes = pin_buffer[: num_q_tokens * 16].reshape(num_q_tokens, 16)
-    w_bytes = pin_buffer[num_q_tokens * 16 : num_q_tokens * 24].reshape(num_q_tokens, 8)
-    plan_c_i32 = c_bytes.view(torch.int32).reshape(num_q_tokens, 4)
-    plan_w_i32 = w_bytes.view(torch.int32).reshape(num_q_tokens, 2)
-
-    plan_c_i32[:, 0] = -1
-    plan_c_i32[:, 1] = 0
-    plan_c_i32[:, 2] = -1
-    plan_c_i32[:, 3] = -1
-    plan_w_i32[:, 0] = -1
-    plan_w_i32[:, 1] = -1
-
-    if num_c:
-        seq_t = torch.tensor(c_seq, dtype=torch.int32)
-        rid16_t = torch.tensor(c_rid16, dtype=torch.int32)
-        buf16_t = torch.tensor(c_buf16, dtype=torch.int32)
-        bid_t = torch.tensor(c_bid, dtype=torch.int32)
-
-        plan_c_i32[:num_c, 0] = seq_t
-        plan_c_i32[:num_c, 1] = ((buf16_t & 0xFFFF) << 16) | (rid16_t & 0xFFFF)
-        plan_c_i32[:num_c, 2] = -1
-        plan_c_i32[:num_c, 3] = bid_t
-
-    if num_w:
-        plan_w_i32[:num_w, 0] = torch.tensor(w_packed32, dtype=torch.int32)
-        plan_w_i32[:num_w, 1] = torch.tensor(w_pos1, dtype=torch.int32)
-
-    plan_c = c_bytes[:num_c].to(device, non_blocking=True).clone()
-    plan_w = w_bytes[:num_w].to(device, non_blocking=True).clone()
-
-    # stage1 (kernel_1 semantics)
-    if num_c:
-        Ci32 = plan_c.view(torch.int32).reshape(num_c, 4)
-
-        batch_id = Ci32[:, 3].long()
-        pos1 = Ci32[:, 0].long() - 1
-        pos0 = (pos1 - compress_ratio).clamp(min=0)
-
-        buf_len = ((Ci32[:, 1] >> 16) & 0xFFFF).long()
-        has_buf = buf_len > 0
-
-        rid = req_pool_indices.index_select(0, batch_id).long()
-        if compress_ratio == 128:
-            rp1 = (_compute_c128_loc(rid, pos1, ring_size) // compress_ratio).to(
-                torch.int32
-            )
-            rp0 = (_compute_c128_loc(rid, pos0, ring_size) // compress_ratio).to(
-                torch.int32
-            )
-        else:
-            raw1 = req_to_token[rid, pos1].long()
-            raw0 = req_to_token[rid, pos0].long()
-            swa1 = full_to_swa.index_select(0, raw1).long()
-            swa0 = full_to_swa.index_select(0, raw0).long()
-
-            rp1 = (_compute_loc(swa1, swa_page_size, ring_size) // compress_ratio).to(
-                torch.int32
-            )
-            rp0 = (_compute_loc(swa0, swa_page_size, ring_size) // compress_ratio).to(
-                torch.int32
-            )
-
-        Ci32[:, 2] = torch.where(has_buf, rp0, torch.full_like(rp0, -1))
-        Ci32[:, 3] = torch.where(has_buf, rp1, batch_id.to(torch.int32))
-
-    if num_w:
-        Wi32 = plan_w.view(torch.int32).reshape(num_w, 2)
-        batch_id = (Wi32[:, 0] >> 16).long()
-        pos = Wi32[:, 1].long() - 1
-
-        rid = req_pool_indices.index_select(0, batch_id).long()
-        if compress_ratio == 128:
-            loc = _compute_c128_loc(rid, pos, ring_size).to(torch.int32)
-        else:
-            raw = req_to_token[rid, pos].long()
-            swa = full_to_swa.index_select(0, raw).long()
-            loc = _compute_loc(swa, swa_page_size, ring_size).to(torch.int32)
-
-        Wi32[:, 0] = (Wi32[:, 0] & 0xFFFF).to(torch.int32)
-        Wi32[:, 1] = loc
-
-    return plan_c, plan_w
 
 
 def plan_compress_decode(

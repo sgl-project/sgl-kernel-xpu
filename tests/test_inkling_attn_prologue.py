@@ -548,6 +548,48 @@ def test_attn_prologue_extend_updates_cache_and_track(dtype):
     torch.testing.assert_close(k_buf.cpu(), expected_k_buf, check_dtype=False)
     torch.testing.assert_close(v_buf.cpu(), expected_v_buf, check_dtype=False)
 
+    k_cache_skip = k_cache_before.clone()
+    v_cache_skip = v_cache_before.clone()
+    q_skip, k_skip, v_skip, _ = inkling_attn_prologue_extend(
+        q,
+        k_cache_skip,
+        v_cache_skip,
+        cache_indices,
+        cache_mask,
+        has_initial_state,
+        cu,
+        si,
+        k_weight,
+        v_weight,
+        track_rows,
+        track_mask,
+        track_dst,
+        q_gamma,
+        k_gamma,
+        1.0e-5,
+        loc,
+        k_buf,
+        v_buf,
+        q_off,
+        k_off,
+        v_off,
+        dq,
+        dkv,
+        do_store=False,
+        do_cache_update=False,
+        log_scaling_tau=torch.empty(0, dtype=torch.float32, device="xpu"),
+    )
+
+    assert_close_xpu(q_skip, q_ref, dtype)
+    assert_close_xpu(k_skip, k_ref, dtype)
+    assert_close_xpu(v_skip, v_ref, dtype)
+    torch.testing.assert_close(
+        k_cache_skip.cpu(), k_cache_before.cpu(), check_dtype=False
+    )
+    torch.testing.assert_close(
+        v_cache_skip.cpu(), v_cache_before.cpu(), check_dtype=False
+    )
+
 
 def extend_cache_update_ref(
     packed,

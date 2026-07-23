@@ -40,7 +40,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor k_weight, Tensor v_weight, Tensor? track_rows, Tensor? track_mask, Tensor? track_dst, "
       "Tensor q_gamma, Tensor k_gamma, float eps, Tensor loc, Tensor(a!) k_buf, Tensor(a!) v_buf, "
       "int q_off, int k_off, int v_off, int dq, int dkv, bool silu_activation, "
-      "bool use_residual, bool do_store) -> (Tensor, Tensor, Tensor)");
+      "bool use_residual, bool do_store, bool do_cache_update) -> (Tensor, Tensor, Tensor)");
   m.impl("inkling_attn_prologue_extend", torch::kXPU, &inkling_attn_prologue_extend);
 }
 

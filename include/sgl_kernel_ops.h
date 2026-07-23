@@ -315,7 +315,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_extend(
     int64_t dkv,
     bool silu_activation,
     bool use_residual,
-    bool do_store);
+    bool do_store,
+    bool do_cache_update);
 
 /*
  * From csrc/gemm

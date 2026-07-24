@@ -16,7 +16,7 @@ SCALE_BYTES_PER_TOKEN = 8
 HEAD_BYTES = DATA_BYTES_PER_TOKEN + SCALE_BYTES_PER_TOKEN
 
 default_params = {
-    "is_fp8_query": [False, True],
+    "is_fp8_query": [False],
     "has_attn_sink": [False, True],
     "has_topk_length": [False, True],
     "has_extra": [False, True],

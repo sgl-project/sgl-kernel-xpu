@@ -53,6 +53,8 @@ std::vector<at::Tensor> flash_mla_sparse_decode_impl(
   TORCH_CHECK(head_bytes == SPARSE_MLA_FP8_HEAD_BYTES, "kv last dim must be packed head_bytes=584");
   TORCH_CHECK(indices.dtype() == torch::kInt32, "indices must be int32");
   TORCH_CHECK(kv.dtype() == at::ScalarType::Float8_e4m3fn, "kv must be float8_e4m3fn packed storage");
+  TORCH_CHECK(
+      !is_fp8_query, "fp8 query decode path is disabled in this build (IS_FP8_QUERY=true template not generated)");
   if (is_fp8_query) {
     TORCH_CHECK(q.dtype() == at::ScalarType::Float8_e4m3fn, "fp8 query path requires q dtype float8_e4m3fn");
     TORCH_CHECK(q_scale.has_value(), "q_scale must be provided when is_fp8_query is true");
@@ -227,8 +229,9 @@ std::vector<at::Tensor> flash_mla_sparse_decode_impl(
       params.extra_topk_length = reinterpret_cast<int*>(extra_topk_length.value().slice(0, b0, b0 + cb).data_ptr());
     }
 
-    DISPATCH_BOOLEAN_FLAG(
-        is_fp8_query, IS_FP8_QUERY, [&] { launch_sparse_mla_decode_fp8_fwd_kernel<512, IS_FP8_QUERY>(params); });
+    // IS_FP8_QUERY=true template is disabled (not generated); only the bf16-query
+    // instantiation is compiled. is_fp8_query is rejected above via TORCH_CHECK.
+    launch_sparse_mla_decode_fp8_fwd_kernel<512, false>(params);
   }
 
   if (return_softmax_lse) {

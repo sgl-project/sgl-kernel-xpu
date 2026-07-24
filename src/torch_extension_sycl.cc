@@ -79,12 +79,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("swiglu_gpt_oss_sigmoid_alpha(Tensor x, float alpha, float limit) -> Tensor");
   m.impl("swiglu_gpt_oss_sigmoid_alpha", torch::kXPU, &swiglu_gpt_oss_sigmoid_alpha);
-  m.def(
-      "moe_fused_gate(Tensor input, Tensor? bias, int num_expert_group, int topk_group, int topk, int "
-      "num_fused_shared_experts, int scoring_func, bool renormalize, float routed_scaling_factor, bool "
-      "apply_routed_scaling_factor_on_output) -> "
-      "(Tensor[])");
-  m.impl("moe_fused_gate", torch::kXPU, &moe_fused_gate);
 
   m.def(
       "rotary_embedding(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
@@ -96,6 +90,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor indices) -> ()");
   m.impl("store_cache", torch::kXPU, &at::native::xpu::store_cache);
 
+#ifdef USE_MOE
+  m.def(
+      "moe_fused_gate(Tensor input, Tensor? bias, int num_expert_group, int topk_group, int topk, int "
+      "num_fused_shared_experts, int scoring_func, bool renormalize, float routed_scaling_factor, bool "
+      "apply_routed_scaling_factor_on_output) -> "
+      "(Tensor[])");
+  m.impl("moe_fused_gate", torch::kXPU, &moe_fused_gate);
   m.def("moe_sum_reduce(Tensor input, Tensor output, float routed_scaling_factor) -> ()");
   m.impl("moe_sum_reduce", torch::kXPU, &moe_sum_reduce);
   m.def(
@@ -130,6 +131,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "apply_shuffle_mul_sum(Tensor input, Tensor! output, Tensor permutation, float routed_scaling_factor, Tensor? "
       "factors) -> ()");
   m.impl("apply_shuffle_mul_sum", torch::kXPU, &apply_shuffle_mul_sum);
+#endif  // USE_MOE
 
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state_v2", torch::kXPU, &merge_state_v2);
@@ -139,6 +141,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From cutlass attention
    */
+#ifdef USE_FMHA
   m.def(
       "fwd(Tensor   q,"
       "    Tensor   k,"
@@ -170,7 +173,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    int      sm_margin,"
       "    Tensor(a!)?  out=None) -> (Tensor(a!), Tensor, Tensor, Tensor)");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
+#endif  // USE_FMHA
 
+#ifdef USE_MLA
   m.def("flash_mla_get_workspace_size", &flash_mla_get_workspace_size);
 
   m.def(
@@ -194,6 +199,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor! page_table, Tensor! workspace, float sm_scale, bool causal, int num_kv_splits) -> ()");
   ;
   m.impl("flash_mla_prefill", torch::kXPU, &flash_mla_prefill);
+#endif  // USE_MLA
 
   /*
    * From quantization ops

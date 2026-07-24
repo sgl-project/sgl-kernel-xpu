@@ -852,6 +852,7 @@ std::vector<at::Tensor> mha_fwd_nopage(
       TORCH_CHECK(false, "Unsupported head size for non-paged prefill attention: ", params.d);
   }
 
+  // TODO: Support prefill softmax_lse, now is 0
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
 
@@ -1188,6 +1189,7 @@ std::vector<at::Tensor> mha_fwd(
       TORCH_CHECK(false, "Unsupported head size for paged prefill attention: ", params.d);
   }
 
+  // TODO: Support prefill softmax_lse, now is 0
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
 
@@ -1255,6 +1257,8 @@ std::vector<at::Tensor> mha_fwd(
   TORCH_CHECK(batch_size >= 0, "cu_seqlens_q must have at least 1 element.");
 
   auto seqlens_q = cu_seqlens_q.slice(0, 1, batch_size + 1).sub(cu_seqlens_q.slice(0, 0, batch_size));
+  int total_q = q.size(0);
+  int num_heads = q.size(-2);
   auto is_prefill = seqlens_q.gt(1).contiguous();  // true for prefill batches
 
   // Forward every shared argument to a sub-kernel, overriding only the output
@@ -1301,8 +1305,9 @@ std::vector<at::Tensor> mha_fwd(
 
   // softmax_lse / accum tensors are not stitched here; return empty
   // placeholders to keep the Python ABI stable.
+  at::Tensor softmax_lse = at::empty({num_heads, total_q}, q.options().dtype(at::kFloat));
   auto empty_f = at::empty({0}, q.options().dtype(at::kFloat));
-  return {out, empty_f, empty_f, empty_f};
+  return {out, softmax_lse, empty_f, empty_f};
 }
 
 }  // namespace chunkprefill

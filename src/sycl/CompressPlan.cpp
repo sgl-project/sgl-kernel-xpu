@@ -9,6 +9,14 @@
 
 namespace at::native::xpu {
 
+struct alignas(16) DecodePlan {
+  uint32_t seq_len;
+  int32_t write_loc;
+  int32_t read_page_0;
+  int32_t read_page_1;
+};
+static_assert(sizeof(DecodePlan) == 16, "DecodePlan must be 16 bytes");
+
 namespace CompressPlanImpl {
 
 // Kernel for plan_compress_decode
@@ -37,7 +45,7 @@ struct CompressDecodeKernel {
     if (compress_ratio == 128) {
       write_loc = compute_c128_loc(rid, position_1);
       read_page_0 = compute_c128_loc(rid, position_0) / 128;
-      read_page_1 = compute_c128_loc(rid, position_1) / 128;
+      read_page_1 = write_loc / 128;
     } else {
       const int32_t* mapping = r2t_ptr + rid * stride_r2t;
 
@@ -54,19 +62,21 @@ struct CompressDecodeKernel {
       read_page_1 = static_cast<int32_t>(write_loc / compress_ratio);
     }
 
-    // Pack into output: [seq_len, write_loc, read_page_0/compress_ratio, read_page_1/compress_ratio]
-    int32_t* plan_d = plan_d_i32 + idx * 4;
-    plan_d[0] = seq_len;
-    plan_d[1] = write_loc;
-    plan_d[2] = read_page_0;
-    plan_d[3] = read_page_1;
+    // Pack into output: [seq_len, write_loc, read_page_0, read_page_1]
+    auto* plan_d = reinterpret_cast<DecodePlan*>(plan_d_ptr) + idx;
+    *plan_d = DecodePlan{
+        static_cast<uint32_t>(seq_len),
+        write_loc,
+        read_page_0,
+        read_page_1,
+    };
   }
 
   const int64_t* rid_ptr;
   const int64_t* seq_ptr;
   const int32_t* r2t_ptr;
   const int64_t* f2s_ptr;
-  int32_t* plan_d_i32;
+  uint8_t* plan_d_ptr;
   int32_t swa_page_size;
   int32_t ring_size;
   int32_t compress_ratio;
@@ -106,10 +116,12 @@ torch::Tensor plan_compress_decode(
 
   uint32_t batch_size = static_cast<uint32_t>(seq_lens.numel());
   if (batch_size == 0) {
-    return torch::empty({0, 16}, req_pool_indices.options().dtype(torch::kUInt8));
+    return torch::empty({0, static_cast<int64_t>(sizeof(DecodePlan))}, req_pool_indices.options().dtype(torch::kUInt8));
   }
 
-  auto output = torch::empty({batch_size, 16}, req_pool_indices.options().dtype(torch::kUInt8));
+  auto output = torch::empty(
+      {static_cast<int64_t>(batch_size), static_cast<int64_t>(sizeof(DecodePlan))},
+      req_pool_indices.options().dtype(torch::kUInt8));
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   queue.submit([&](sycl::handler& cgh) {
@@ -118,7 +130,7 @@ torch::Tensor plan_compress_decode(
         seq_lens.data_ptr<int64_t>(),
         req_to_token.data_ptr<int32_t>(),
         full_to_state.data_ptr<int64_t>(),
-        reinterpret_cast<int32_t*>(output.data_ptr<uint8_t>()),
+        output.data_ptr<uint8_t>(),
         static_cast<int32_t>(swa_page_size),
         static_cast<int32_t>(ring_size),
         static_cast<int32_t>(compress_ratio),

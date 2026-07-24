@@ -137,6 +137,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("merge_state", torch::kXPU, &merge_state);
 
   /*
+   * Inkling relative-attention helper kernels
+   */
+  m.def("inkling_row_scale_bf16(Tensor x, Tensor tau, Tensor(a!) out) -> Tensor(a!)");
+  m.impl("inkling_row_scale_bf16", torch::kXPU, &inkling_row_scale_bf16);
+  m.def("inkling_row_compact_bf16(Tensor x, Tensor(a!) out) -> Tensor(a!)");
+  m.impl("inkling_row_compact_bf16", torch::kXPU, &inkling_row_compact_bf16);
+  m.def("inkling_rel_proj_small_t(Tensor r, Tensor proj, Tensor? tau, Tensor(a!) out) -> Tensor(a!)");
+  m.impl("inkling_rel_proj_small_t", torch::kXPU, &inkling_rel_proj_small_t);
+
+  /*
    * From cutlass attention
    */
   m.def(

@@ -71,7 +71,7 @@ if(NOT USE_MLA)
     list(FILTER device_cpp EXCLUDE REGEX "/mla_(decode|prefill|sparse_decode)\\.cpp$")
 endif()
 if(NOT USE_MOE)
-    list(FILTER device_cpp EXCLUDE REGEX "/(GroupGemm(Xe20|W4A16Xe20)|MoE(Align|PrepareInputs|Sum|_fused_gate|_sum_reduce))\\.cpp$")
+    list(FILTER device_cpp EXCLUDE REGEX "/(GroupGemm(Xe20|W4A16Xe20|Fp8W8A8Xe20)|MoE(Align|PrepareInputs|Sum|_fused_gate|_sum_reduce))\\.cpp$")
 endif()
 
 # BMG only
@@ -106,6 +106,7 @@ endif()
 if(USE_MOE)
     include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmXe20.cmake)
     include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmW4A16Xe20.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmFp8W8A8Xe20.cmake)
 endif()
 
 

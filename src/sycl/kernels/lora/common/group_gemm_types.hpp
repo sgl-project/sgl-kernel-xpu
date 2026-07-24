@@ -209,11 +209,13 @@ struct GroupGemmTypes {
 //
 // Per-segment alpha: the grouped epilogue (IntelXeGenericGroup) binds CUTLASS's
 // Sm90LinearCombinationPtrArray fusion. Its Sm90ScalarBroadcastPtrArray load
-// path indexes a *contiguous* scalar buffer through `alpha_ptr` when `dAlpha`
-// has a non-zero L-stride: `scalar = alpha_ptr[l_coord * stride]`. So pass
-// `alpha_values` as a device fp32 buffer of one alpha per segment (contiguous,
-// stride 1) to compute D = alpha[seg] * (A @ B) + beta * C -- what B-fwd needs. 
-// When it is std::nullopt the scalar`alpha` broadcasts to every segment with stride 0. 
+// path supports per-group alpha through an *array of pointers* -- one pointer
+// per group -- read as `scalar = *(alpha_ptr_array[l_coord])` (no stride). So
+// pass `alpha_ptr_array` as a device int64 tensor holding one fp32* per segment
+// to compute D = alpha[seg] * (A @ B) + beta * C -- what B-fwd needs. (The
+// strided alpha_ptr value-buffer path is NOT used: on the Xe grouped epilogue
+// it collapses to alpha[0] for every group.) When alpha_ptr_array is
+// std::nullopt the scalar `alpha` broadcasts to every segment with stride 0.
 template <typename Types>
 inline typename Types::Gemm::Arguments args_from_options(
     const torch::Tensor& problem_sizes,  // int32  [num_segments, 3]  (M_s, N, K)
@@ -226,10 +228,10 @@ inline typename Types::Gemm::Arguments args_from_options(
     const torch::Tensor& stride_C,       // int64  [num_segments]     must equal stride_D
     const torch::Tensor& stride_D,       // int64  [num_segments]     leading dim of D = N
     int num_segments,
-    float alpha,   // epilogue scalar: D = alpha * (A @ B) + beta * C (used when alpha_values is null)
+    float alpha,   // epilogue scalar: D = alpha * (A @ B) + beta * C (used when alpha_ptr_array is null)
     float beta,    //   A-fwd uses (1.0, 0.0); B-fwd / QKV-B-fwd use (1.0, 1.0) for in-place residual.
-    const std::optional<torch::Tensor>& alpha_values =
-        std::nullopt) {  // float32 [num_segments] contiguous per-segment alpha buffer (overrides scalar alpha)
+    const std::optional<torch::Tensor>& alpha_ptr_array =
+        std::nullopt) {  // int64 [num_segments] device array-of-pointers, one fp32* per segment (overrides scalar alpha)
   using GemmKernel = typename Types::GemmKernel;
   using ElementMma = typename Types::ElementMma;
   using ElementMmaB = typename Types::ElementMmaB;
@@ -273,29 +275,30 @@ inline typename Types::Gemm::Arguments args_from_options(
 
   // Epilogue thread arguments: D = alpha * acc + beta * C.
   //
-  // alpha is either a single scalar broadcast to every segment (dAlpha stride 0)
-  // or a per-segment contiguous value buffer indexed by segment via alpha_ptr
-  // (dAlpha stride 1) -- see Sm90ScalarBroadcastPtrArray::update_scalar(). beta
-  // stays a broadcast scalar for both LoRA forward kernels. The alpha_ptr_array
-  // (array-of-pointers) path is left null; we use the value-buffer path.
+  // alpha is either a single scalar broadcast to every segment or a per-segment
+  // array-of-pointers indexed by group as *(alpha_ptr_array[l_coord]) -- see
+  // Sm90ScalarBroadcastPtrArray::update_scalar(). beta stays a broadcast scalar
+  // for both LoRA forward kernels. The strided alpha_ptr value-buffer path is
+  // left null: it does not index per-group on the Xe grouped epilogue.
   using ElementScalar = typename Types::ElementAccumulator;  // fusion scalar type (== alpha/beta element)
   auto& fusion_args = arguments.epilogue.thread;
   fusion_args.beta = beta;
   fusion_args.beta_ptr = nullptr;
-  fusion_args.alpha_ptr_array = nullptr;
+  fusion_args.alpha_ptr = nullptr;
   fusion_args.beta_ptr_array = nullptr;
   fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
 
-  if (alpha_values.has_value()) {
-    // Per-segment alpha: contiguous fp32 buffer, one value per segment; the
-    // fusion reads alpha_ptr[l_coord * 1] for group l_coord (dAlpha = {_0,_0,1}).
+  if (alpha_ptr_array.has_value()) {
+    // Per-segment alpha: device array of one fp32* per segment; the fusion reads
+    // *(alpha_ptr_array[l_coord]) for group l_coord (dAlpha L-stride 1).
     fusion_args.alpha = ElementScalar(0);
-    fusion_args.alpha_ptr = reinterpret_cast<ElementScalar const*>(alpha_values->data_ptr<float>());
+    fusion_args.alpha_ptr_array =
+        reinterpret_cast<ElementScalar const* const*>(alpha_ptr_array->data_ptr<int64_t>());
     fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 1};
   } else {
     // Single alpha broadcast to all segments (dAlpha = {_0,_0,0}).
     fusion_args.alpha = alpha;
-    fusion_args.alpha_ptr = nullptr;
+    fusion_args.alpha_ptr_array = nullptr;
     fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
   }
 

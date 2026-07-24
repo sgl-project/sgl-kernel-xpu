@@ -110,7 +110,12 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer_pf_lf,
     transfer_kv_per_layer_ph_lf,
 )
-from sgl_kernel.lora import embedding_lora_a_fwd, sgemm_lora_a_fwd
+from sgl_kernel.lora import (
+    embedding_lora_a_fwd, 
+    sgemm_lora_a_fwd, 
+    sgemm_lora_b_fwd,
+
+)
 from sgl_kernel.mamba import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
 from sgl_kernel.memory import weak_ref_tensor
 from sgl_kernel.mhc import (

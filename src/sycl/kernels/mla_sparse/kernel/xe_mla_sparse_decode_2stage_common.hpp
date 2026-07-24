@@ -156,7 +156,6 @@ struct SparseAttnDecodeParams {
   int num_sm;
 };
 
-// WA: avoid issue of not supported device-only copy
 struct XPUSparseDecodeAttnFwdParams : public SparseAttnDecodeParams {
   sycl::queue queue;
 };

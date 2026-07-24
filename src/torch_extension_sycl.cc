@@ -180,11 +180,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("flash_mla_decode", torch::kXPU, &flash_mla_decode);
 
   m.def(
-      "flash_mla_sparse_decode(Tensor! out, Tensor! lse_out, Tensor! q, Tensor! k_cache, "
-      "Tensor! indices, Tensor? topk_length, "
-      "Tensor? extra_k_cache, Tensor? extra_indices, Tensor? extra_topk_length, "
-      "Tensor? attn_sink, float sm_scale, int head_dim_v, bool is_fp8_kvcache) -> ()");
+      "flash_mla_sparse_decode(Tensor! q, Tensor! kv, Tensor! indices, float sm_scale, int d_v, "
+      "Tensor? topk_length, Tensor? attn_sink, Tensor? extra_kv, Tensor? extra_indices, "
+      "Tensor? extra_topk_length, Tensor? q_scale, bool is_fp8_query, bool return_softmax_lse) -> Tensor[]");
   m.impl("flash_mla_sparse_decode", torch::kXPU, &flash_mla_sparse_decode);
+
+  m.def(
+      "flash_mla_sparse_prefill(Tensor! q, Tensor! kv, Tensor! indices, float sm_scale, int d_v, "
+      "Tensor? attn_sink, Tensor? topk_length, bool return_softmax_lse) -> Tensor[]");
+  m.impl("flash_mla_sparse_prefill", torch::kXPU, &flash_mla_sparse_prefill);
 
   m.def("flash_mla_prefill_get_workspace_size", &flash_mla_prefill_get_workspace_size);
 

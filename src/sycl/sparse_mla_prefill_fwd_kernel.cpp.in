@@ -1,0 +1,10 @@
+// Auto-generated from sparse_mla_prefill_fwd_kernel.cpp.in
+// Template parameters: D_QK=@D_QK@, HAS_ATTN_SINK=@HAS_ATTN_SINK@
+#include "sycl/kernels/mla_sparse/sparse_mla_prefill_fwd.hpp"
+
+namespace FLASH_NAMESPACE {
+
+template void launch_sparse_mla_prefill_fwd_kernel<@D_QK@, @HAS_ATTN_SINK@>(
+    const XPUSparseAttnFwdParams& params);
+
+}  // namespace FLASH_NAMESPACE

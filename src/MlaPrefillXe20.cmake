@@ -20,6 +20,6 @@ foreach(_idx RANGE ${_num_elems})
         set(GENERATED_FILE
             "${CMAKE_CURRENT_BINARY_DIR}/sycl/mla_prefill_kernel_${ELEM_TAG}_${PAGE_SIZE}.cpp")
         configure_file(${MLA_PREFILL_TEMPLATE} ${GENERATED_FILE} @ONLY)
-        list(APPEND device_cpp_common ${GENERATED_FILE})
+        list(APPEND device_cpp_xe20 ${GENERATED_FILE})
     endforeach()
 endforeach()

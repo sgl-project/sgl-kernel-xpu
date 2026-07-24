@@ -1,21 +1,26 @@
-# Generate Sparse MLA decode kernel instantiation files for DeepSeek V4.
-# Each ELEM_TAG is compiled as a separate library to parallelize compilation.
+# Generate Sparse MLA fp8 decode kernel instantiation files for DeepSeek V4.
+# Each (D_QK, IS_FP8_QUERY) combination is compiled as a
+# separate library to parallelize and speed up compilation.
 
-set(MLA_SPARSE_DECODE_ELEM_TAGS half bf16)
-set(MLA_SPARSE_DECODE_ELEM_SYCL_TYPES "sycl::half" "sycl::ext::oneapi::bfloat16")
+set(MLA_SPARSE_DECODE_D_QKS 512)
+# NOTE: IS_FP8_QUERY=true is intentionally disabled by default to avoid
+# generating/compiling the fp8-query decode kernel. Re-add `true` here (and
+# restore the runtime dispatch in mla_sparse_decode.cpp) to enable it.
+set(MLA_SPARSE_DECODE_FP8_QUERIES false)
 
 set(MLA_SPARSE_DECODE_TEMPLATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/mla_sparse_decode_kernel.cpp.in")
+    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/sparse_mla_decode_fp8_fwd_kernel.cpp.in")
 
-list(LENGTH MLA_SPARSE_DECODE_ELEM_TAGS _num_elems)
-math(EXPR _num_elems "${_num_elems} - 1")
-
-foreach(_idx RANGE ${_num_elems})
-    list(GET MLA_SPARSE_DECODE_ELEM_TAGS ${_idx} ELEM_TAG)
-    list(GET MLA_SPARSE_DECODE_ELEM_SYCL_TYPES ${_idx} ELEM_SYCL_TYPE)
-
-    set(GENERATED_FILE
-        "${CMAKE_CURRENT_BINARY_DIR}/sycl/mla_sparse_decode_kernel_${ELEM_TAG}_128.cpp")
-    configure_file(${MLA_SPARSE_DECODE_TEMPLATE} ${GENERATED_FILE} @ONLY)
-    list(APPEND device_cpp_common ${GENERATED_FILE})
+foreach(D_QK ${MLA_SPARSE_DECODE_D_QKS})
+    foreach(IS_FP8_QUERY ${MLA_SPARSE_DECODE_FP8_QUERIES})
+        if(IS_FP8_QUERY)
+            set(_q_tag "qfp8")
+        else()
+            set(_q_tag "qbf16")
+        endif()
+        set(GENERATED_FILE
+            "${CMAKE_CURRENT_BINARY_DIR}/sycl/sparse_mla_decode_fp8_fwd_k${D_QK}_${_q_tag}.cpp")
+        configure_file(${MLA_SPARSE_DECODE_TEMPLATE} ${GENERATED_FILE} @ONLY)
+        list(APPEND device_cpp_xe20 ${GENERATED_FILE})
+    endforeach()
 endforeach()

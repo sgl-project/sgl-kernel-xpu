@@ -24,6 +24,7 @@ include(FMHAPrefillXe20.cmake)
 include(GdnAttnXe20.cmake)
 include(MlaDecodeXe20.cmake)
 include(MlaPrefillXe20.cmake)
+include(MlaSparsePrefillXe20.cmake)
 include(MlaSparseDecodeXe20.cmake)
 
 message(STATUS "BMG files: ${device_cpp_xe20}")

@@ -90,21 +90,32 @@ void flash_mla_decode(
 int64_t flash_mla_get_workspace_size(
     int64_t max_seq_len, int64_t num_batches, int64_t num_heads, int64_t page_size, int64_t num_kv_splits = -1);
 
-// DeepSeek V4 Sparse MLA decode (dual KV pools + attn_sink)
-void flash_mla_sparse_decode(
-    torch::Tensor& out,
-    torch::Tensor& lse_out,
-    const torch::Tensor& q,
-    const torch::Tensor& k_cache,
-    const torch::Tensor& indices,
-    const std::optional<torch::Tensor>& topk_length,
-    const std::optional<torch::Tensor>& extra_k_cache,
-    const std::optional<torch::Tensor>& extra_indices,
-    const std::optional<torch::Tensor>& extra_topk_length,
-    const std::optional<torch::Tensor>& attn_sink,
+// DeepSeek V4 Sparse MLA fp8 decode (packed fp8 KV cache gather + fused attention)
+std::vector<at::Tensor> flash_mla_sparse_decode(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
     double sm_scale,
-    int64_t head_dim_v,
-    bool is_fp8_kvcache = false);
+    int64_t d_v,
+    const std::optional<at::Tensor>& topk_length,
+    const std::optional<at::Tensor>& attn_sink,
+    const std::optional<at::Tensor>& extra_kv,
+    const std::optional<at::Tensor>& extra_indices,
+    const std::optional<at::Tensor>& extra_topk_length,
+    const std::optional<at::Tensor>& q_scale,
+    bool is_fp8_query,
+    bool return_softmax_lse);
+
+// DeepSeek V4 Sparse MLA prefill (dense gather + fused attention)
+std::vector<at::Tensor> flash_mla_sparse_prefill(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    double sm_scale,
+    int64_t d_v,
+    const std::optional<at::Tensor>& attn_sink,
+    const std::optional<at::Tensor>& topk_length,
+    bool return_softmax_lse);
 
 void flash_mla_prefill(
     torch::Tensor& out,

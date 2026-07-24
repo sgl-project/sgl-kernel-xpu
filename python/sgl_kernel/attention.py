@@ -290,10 +290,7 @@ def flash_mla_with_kvcache(
     if softmax_scale is None:
         softmax_scale = D_qk ** (-0.5)
 
-    assert q.dtype in (
-        torch.float16,
-        torch.bfloat16,
-    ), f"q.dtype must be fp16 or bf16, got {q.dtype}"
+    assert q.dtype == torch.bfloat16, f"q.dtype must be bf16, got {q.dtype}"
 
     # Allocate outputs
     out = q.new_empty((B, s_q, H, head_dim_v))
@@ -301,6 +298,12 @@ def flash_mla_with_kvcache(
 
     if block_table is None:
         assert indices is not None, "indices must be provided for sparse decode path"
+        assert (
+            is_fp8_kvcache
+        ), "sparse decode path requires is_fp8_kvcache=True (fp8-packed k_cache)"
+        assert (
+            k_cache.dtype == torch.float8_e4m3fn
+        ), f"sparse decode k_cache must be float8_e4m3fn packed storage, got {k_cache.dtype}"
         if topk_length is not None:
             assert (
                 topk_length.device == q.device
@@ -333,24 +336,146 @@ def flash_mla_with_kvcache(
                 and extra_topk_length.dtype == torch.int32
                 and extra_topk_length.shape == (B,)
             ), "extra_topk_length must be int32 on the same device with shape [B]"
-        torch.ops.sgl_kernel.flash_mla_sparse_decode.default(
-            out,
-            lse,
+        out, lse_bshq = torch.ops.sgl_kernel.flash_mla_sparse_decode.default(
             q,
             k_cache,
             indices,
+            softmax_scale,
+            head_dim_v,
             topk_length,
+            attn_sink,
             extra_k_cache,
             extra_indices_in_kvcache,
             extra_topk_length,
-            attn_sink,
-            softmax_scale,
-            head_dim_v,
-            is_fp8_kvcache,
+            None,  # q_scale
+            False,  # is_fp8_query
+            True,  # return_softmax_lse
         )
+        # kernel returns lse as [B, s_q, H]; expose as [B, H, s_q]
+        lse = lse_bshq.transpose(1, 2).contiguous()
     else:
         assert (
             block_table is not None and cache_seqlens is not None
         ), "block_table path is not enabled yet for xpu"
 
     return out, lse
+
+
+def flash_mla_sparse_prefill(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: Optional[float] = None,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    return_softmax_lse: bool = False,
+):
+    """DeepSeek V4 sparse MLA prefill (dense gather + fused attention).
+
+    Args:
+        q: [s_q, h_q, d_qk] bfloat16 query.
+        kv: [s_kv, h_kv, d_qk] bfloat16 key/value (h_kv must be 1).
+        indices: [s_q, h_kv, topk] int32 gathered token indices.
+        sm_scale: softmax scale. Defaults to d_qk ** -0.5.
+        d_v: value head dim (must be 512).
+        attn_sink: optional [h_q] float32 attention sink logits.
+        topk_length: optional [s_q] int32 valid topk length per query.
+        return_softmax_lse: if True, also return (max_logits, lse).
+
+    Returns:
+        (out [s_q, h_q, d_v], None, None) if return_softmax_lse is False, else
+        (out, max_logits, lse) with max_logits/lse shaped [s_q, h_q].
+    """
+    assert q.ndim == 3, f"q must be 3D [s_q, h_q, d_qk], got {q.ndim}D"
+    assert kv.ndim == 3, f"kv must be 3D [s_kv, h_kv, d_qk], got {kv.ndim}D"
+    assert (
+        indices.ndim == 3
+    ), f"indices must be 3D [s_q, h_kv, topk], got {indices.ndim}D"
+
+    d_qk = q.shape[2]
+    if sm_scale is None:
+        sm_scale = d_qk ** (-0.5)
+
+    outs = torch.ops.sgl_kernel.flash_mla_sparse_prefill.default(
+        q,
+        kv,
+        indices,
+        sm_scale,
+        d_v,
+        attn_sink,
+        topk_length,
+        return_softmax_lse,
+    )
+    if return_softmax_lse:
+        out, max_logits, lse = outs
+        return out, max_logits, lse
+    return outs[0], None, None
+
+
+def flash_mla_sparse_decode(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: Optional[float] = None,
+    d_v: int = 512,
+    topk_length: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    extra_kv: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+    q_scale: Optional[torch.Tensor] = None,
+    is_fp8_query: bool = False,
+    return_softmax_lse: bool = False,
+):
+    """DeepSeek V4 sparse MLA fp8 decode (packed fp8 KV cache gather + fused attention).
+
+    Args:
+        q: [b, s_q, h_q, d_qk] bfloat16 (or float8_e4m3fn when is_fp8_query) query.
+        kv: [num_blocks, page_block_size, h_kv, head_bytes=584] float8_e4m3fn packed KV cache
+            (h_kv must be 1).
+        indices: [b, s_q, topk] int32 gathered token indices.
+        sm_scale: softmax scale. Defaults to d_qk ** -0.5.
+        d_v: value head dim (must be 512).
+        topk_length: optional [b] int32 valid topk length per batch.
+        attn_sink: optional [h_q] float32 attention sink logits.
+        extra_kv: optional second packed fp8 KV pool, same layout as kv.
+        extra_indices: optional [b, s_q, extra_topk] int32 indices into extra_kv.
+        extra_topk_length: optional [b] int32 valid extra topk length per batch.
+        q_scale: required scalar or [h_q] float32 dequant scale when is_fp8_query is True.
+        is_fp8_query: whether q is float8_e4m3fn (requires q_scale).
+        return_softmax_lse: if True, also return lse.
+
+    Returns:
+        out [b, s_q, h_q, d_v] bfloat16 if return_softmax_lse is False, else
+        (out, lse) with lse shaped [b, s_q, h_q] float32.
+    """
+    assert q.ndim == 4, f"q must be 4D [b, s_q, h_q, d_qk], got {q.ndim}D"
+    assert (
+        kv.ndim == 4
+    ), f"kv must be 4D [num_blocks, page_block_size, h_kv, head_bytes], got {kv.ndim}D"
+    assert indices.ndim == 3, f"indices must be 3D [b, s_q, topk], got {indices.ndim}D"
+
+    d_qk = q.shape[3]
+    if sm_scale is None:
+        sm_scale = d_qk ** (-0.5)
+
+    outs = torch.ops.sgl_kernel.flash_mla_sparse_decode.default(
+        q,
+        kv,
+        indices,
+        sm_scale,
+        d_v,
+        topk_length,
+        attn_sink,
+        extra_kv,
+        extra_indices,
+        extra_topk_length,
+        q_scale,
+        is_fp8_query,
+        return_softmax_lse,
+    )
+    if return_softmax_lse:
+        out, lse = outs
+        return out, lse
+    return outs[0]

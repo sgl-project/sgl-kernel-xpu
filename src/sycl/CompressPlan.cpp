@@ -63,8 +63,7 @@ struct CompressDecodeKernel {
     }
 
     // Pack into output: [seq_len, write_loc, read_page_0, read_page_1]
-    auto* plan_d = reinterpret_cast<DecodePlan*>(plan_d_ptr) + idx;
-    *plan_d = DecodePlan{
+    plan_d[idx] = DecodePlan{
         static_cast<uint32_t>(seq_len),
         write_loc,
         read_page_0,
@@ -76,7 +75,7 @@ struct CompressDecodeKernel {
   const int64_t* seq_ptr;
   const int32_t* r2t_ptr;
   const int64_t* f2s_ptr;
-  uint8_t* plan_d_ptr;
+  DecodePlan* plan_d;
   int32_t swa_page_size;
   int32_t ring_size;
   int32_t compress_ratio;
@@ -130,7 +129,7 @@ torch::Tensor plan_compress_decode(
         seq_lens.data_ptr<int64_t>(),
         req_to_token.data_ptr<int32_t>(),
         full_to_state.data_ptr<int64_t>(),
-        output.data_ptr<uint8_t>(),
+        reinterpret_cast<DecodePlan*>(output.data_ptr<uint8_t>()),
         static_cast<int32_t>(swa_page_size),
         static_cast<int32_t>(ring_size),
         static_cast<int32_t>(compress_ratio),

@@ -338,6 +338,15 @@ std::tuple<at::Tensor, at::Tensor> inkling_ar_scattered_sconv(
     bool update_cache);
 
 /*
+ * Inkling audio helpers.
+ */
+at::Tensor inkling_mel_embedding_sum(
+    const at::Tensor& features,
+    const at::Tensor& weight,
+    int64_t chunk_size,
+    int64_t channels_per_item);
+
+/*
  * From csrc/gemm
  */
 torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros);

@@ -242,7 +242,7 @@ struct MOEAlignBlockSizeSmallBatchExpertFunctor : public __SYCL_KER_CONFIG_CONVE
     int32_t* tokens_cnts = shared_mem + num_experts + 1;
 
     for (int i = 0; i < num_experts; ++i) {
-      tokens_cnts[num_experts + i] = 0;
+      tokens_cnts[(tid + 1) * num_experts + i] = 0;
     }
     item.barrier(sycl::access::fence_space::local_space);
 

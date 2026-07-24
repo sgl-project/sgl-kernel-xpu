@@ -32,6 +32,7 @@ from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
     fused_add_rmsnorm,
     fused_inplace_qknorm_rope,
+    fused_q_norm_rope,
     fused_qk_norm_rope,
     fused_qk_rope,
     fused_qk_rope_with_cos_sin_cache_inplace,

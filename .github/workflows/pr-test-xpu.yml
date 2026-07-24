@@ -93,8 +93,10 @@ jobs:
               python3 bench_jit_qknorm.py 2>&1 | tee bench_jit_qknorm.py.log && \
               python3 bench_jit_rope.py 2>&1 | tee bench_jit_rope.py.log && \
               python3 bench_jit_timestep_embedding.py 2>&1 | tee bench_jit_timestep_embedding.py.log && \
-              python3 bench_jit_activation.py 2>&1 | tee bench_jit_activation.py.log
-              python3 bench_hc_post.py 2>&1 | tee bench_hc_post.py.log
+              python3 bench_jit_moe_align_block_size.py 2>&1 | tee bench_jit_moe_align_block_size.py.log && \
+              python3 bench_jit_per_token_group_quant_8bit_v2.py 2>&1 | tee bench_jit_per_token_group_quant_8bit_v2.py.log && \
+              python3 bench_jit_activation.py 2>&1 | tee bench_jit_activation.py.log && \
+              python3 bench_hc_post.py 2>&1 | tee bench_hc_post.py.log && \
               python3 bench_hc_post.py 2>&1 | tee bench_hc_post.py.log && \
               python3 bench_sgemm_lora_a_fwd.py 2>&1 | tee bench_sgemm_lora_a_fwd.py.log
             "

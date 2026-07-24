@@ -20,6 +20,10 @@ try:
     from sgl_kernel.jit import fused_inplace_qknorm as jit_qknorm
     from sgl_kernel.jit import gelu_and_mul as jit_gelu_and_mul
     from sgl_kernel.jit import gelu_tanh_and_mul as jit_gelu_tanh_and_mul
+    from sgl_kernel.jit import moe_align_block_size as jit_moe_align_block_size
+    from sgl_kernel.jit import (
+        per_token_group_quant_8bit_v2 as jit_per_token_group_quant_8bit_v2,
+    )
     from sgl_kernel.jit import rmsnorm as jit_rmsnorm
     from sgl_kernel.jit import silu_and_mul as jit_silu_and_mul
     from sgl_kernel.jit import timestep_embedding as jit_timestep_embedding
@@ -250,6 +254,206 @@ def test_timestep_embedding_jit_vs_reference():
 
     # Compare accuracy
     torch.testing.assert_close(y_jit, y_ref, rtol=1e-3, atol=1e-3)
+
+
+def _run_moe_align(use_aot, topk_ids, num_experts, block_size, pad):
+    """Allocate outputs and run the AOT or JIT moe_align_block_size op.
+
+    num_experts here is the real expert count; callers pass num_experts + 1 to
+    the op (the +1 offset bucket convention).
+    """
+    ne1 = num_experts + 1
+    numel = topk_ids.numel()
+    max_pad = numel + ne1 * (block_size - 1)
+    sorted_ids = torch.empty(max_pad, dtype=torch.int32, device=topk_ids.device)
+    if not pad:
+        sorted_ids.fill_(numel)
+    expert_ids = torch.zeros(
+        max_pad // block_size, dtype=torch.int32, device=topk_ids.device
+    )
+    num_tokens_post_pad = torch.empty(1, dtype=torch.int32, device=topk_ids.device)
+    cumsum = torch.zeros(ne1 + 1, dtype=torch.int32, device=topk_ids.device)
+
+    if use_aot:
+        sgl_kernel.moe_align_block_size(
+            topk_ids,
+            ne1,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            cumsum,
+            pad,
+        )
+    else:
+        jit_moe_align_block_size(
+            topk_ids,
+            ne1,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            cumsum,
+            pad,
+        )
+    return sorted_ids, expert_ids, num_tokens_post_pad, cumsum
+
+
+@pytest.mark.parametrize("block_size", [32, 128])
+@pytest.mark.parametrize(
+    "num_tokens,num_experts",
+    [
+        (8, 64),  # small-batch path (numel < 1024, experts <= 64)
+        (64, 64),  # small-batch path
+        (512, 160),  # general Blelloch-scan path
+        (2048, 256),  # general path, larger
+    ],
+)
+@pytest.mark.parametrize("topk", [2, 8])
+@pytest.mark.parametrize("pad_sorted_token_ids", [False, True])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.skipif(not HAS_SGL_KERNEL, reason="Requires AOT sgl_kernel")
+@pytest.mark.skipif(not HAS_SGLANG_JIT, reason="Requires SGLang for JIT compilation")
+@pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
+def test_moe_align_block_size_jit_vs_aot(
+    block_size, num_tokens, num_experts, topk, pad_sorted_token_ids, dtype
+):
+    """Test JIT moe_align_block_size vs the AOT op across both code paths.
+
+    expert_ids / num_tokens_post_pad / cumsum must match bit-exactly; the
+    sorted_token_ids order within an expert bucket is nondeterministic (atomic
+    scatter), so it is compared as the set of placed token ids.
+    """
+    device = "xpu"
+    torch.manual_seed(num_tokens + num_experts + topk)
+    topk_ids = (
+        torch.argsort(torch.rand(num_tokens, num_experts, device=device), dim=1)[
+            :, :topk
+        ]
+        .to(dtype)
+        .contiguous()
+    )
+    numel = topk_ids.numel()
+
+    s_aot, e_aot, n_aot, c_aot = _run_moe_align(
+        True, topk_ids, num_experts, block_size, pad_sorted_token_ids
+    )
+    s_jit, e_jit, n_jit, c_jit = _run_moe_align(
+        False, topk_ids, num_experts, block_size, pad_sorted_token_ids
+    )
+
+    assert torch.equal(e_jit, e_aot), "expert_ids mismatch"
+    assert torch.equal(n_jit, n_aot), "num_tokens_post_pad mismatch"
+    assert torch.equal(c_jit, c_aot), "cumsum mismatch"
+
+    # Compare placed token ids as a set (order within a bucket is racy).
+    def _placed(sorted_ids, ntpp):
+        v = sorted_ids[: int(ntpp.item())]
+        return torch.sort(v[v != numel]).values
+
+    assert torch.equal(
+        _placed(s_jit, n_jit), _placed(s_aot, n_aot)
+    ), "sorted_token_ids placed-set mismatch"
+
+
+def _make_ptgq_v2_scale(out_shape, group_size, column_major, device):
+    ng = out_shape[-1] // group_size
+    if column_major:
+        return torch.empty(
+            (ng,) + out_shape[:-1], device=device, dtype=torch.float32
+        ).permute(-1, -2)
+    return torch.empty(out_shape[:-1] + (ng,), device=device, dtype=torch.float32)
+
+
+@pytest.mark.parametrize("group_size", [64, 128])
+@pytest.mark.parametrize("column_major", [False, True])
+@pytest.mark.parametrize("fuse_silu_and_mul", [False, True])
+@pytest.mark.parametrize("out_dtype", [torch.float8_e4m3fn, torch.int8])
+@pytest.mark.parametrize("in_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.skipif(not HAS_SGL_KERNEL, reason="Requires AOT sgl_kernel")
+@pytest.mark.skipif(not HAS_SGLANG_JIT, reason="Requires SGLang for JIT compilation")
+@pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
+def test_per_token_group_quant_8bit_v2_jit_vs_aot(
+    group_size, column_major, fuse_silu_and_mul, out_dtype, in_dtype
+):
+    """JIT vs AOT per-token-group 8-bit v2 (vanilla / column-major / fused silu).
+
+    Scales match closely; quant codes agree with AOT to within one ULP (int8) or
+    one e4m3 step (fp8) -- both do the same reciprocal-multiply-then-clamp, so
+    they differ only at quantization boundaries, as the AOT kernel differs from
+    a pure-division reference.
+    """
+    # int8 output uses a row-major scale layout in this op.
+    if column_major and out_dtype == torch.int8:
+        pytest.skip("int8 path uses row-major scales")
+
+    device = "xpu"
+    hidden = 512
+    num_tokens = 128
+    eps = 1e-10
+    min_8bit, max_8bit = (-128.0, 127.0) if out_dtype == torch.int8 else (-448.0, 448.0)
+
+    torch.manual_seed(0)
+    x = torch.randn(
+        num_tokens,
+        hidden * (2 if fuse_silu_and_mul else 1),
+        dtype=in_dtype,
+        device=device,
+    )
+    out_shape = (num_tokens, hidden)
+
+    def _run(use_aot):
+        q = torch.empty(out_shape, device=device, dtype=out_dtype)
+        s = _make_ptgq_v2_scale(out_shape, group_size, column_major, device)
+        if use_aot:
+            torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit_v2.default(
+                x,
+                q,
+                s,
+                group_size,
+                eps,
+                min_8bit,
+                max_8bit,
+                False,
+                fuse_silu_and_mul,
+                None,
+            )
+        else:
+            jit_per_token_group_quant_8bit_v2(
+                x,
+                q,
+                s,
+                group_size,
+                eps,
+                min_8bit,
+                max_8bit,
+                scale_ue8m0=False,
+                fuse_silu_and_mul=fuse_silu_and_mul,
+                masked_m=None,
+            )
+        return q, s
+
+    q_aot, s_aot = _run(True)
+    q_jit, s_jit = _run(False)
+
+    # Scales match tightly.
+    torch.testing.assert_close(
+        s_jit.float().cpu(), s_aot.float().cpu(), rtol=1e-3, atol=1e-5
+    )
+
+    # Quant codes: bounded by one ULP (int8) / one e4m3 step (fp8).
+    if out_dtype == torch.int8:
+        max_ulp = (q_jit.to(torch.int32) - q_aot.to(torch.int32)).abs().max().item()
+        assert max_ulp <= 1, f"int8 quant differs from AOT by {max_ulp} > 1 ULP"
+    else:
+        ng = hidden // group_size
+        dq = lambda q, s: (
+            q.cpu().view(num_tokens, ng, group_size).to(torch.float32)
+            * s.float().cpu().reshape(num_tokens, ng, 1)
+        )
+        torch.testing.assert_close(
+            dq(q_jit, s_jit), dq(q_aot, s_aot), rtol=1e-1, atol=1e-1
+        )
 
 
 def _reference_act_and_mul(op_name: str, x: torch.Tensor) -> torch.Tensor:

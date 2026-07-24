@@ -31,8 +31,8 @@ from sgl_kernel.compress_plan_torch import (
 from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
     fused_add_rmsnorm,
+    fused_inplace_qknorm_rope,
     fused_qk_norm_rope,
-    fused_qk_norm_rope_with_cos_sin_cache_inplace,
     fused_qk_rope,
     fused_qk_rope_with_cos_sin_cache_inplace,
     gelu_and_mul,
@@ -58,6 +58,7 @@ from sgl_kernel.fused_norm_rope_v2_torch import compress_norm_rope_store
 from sgl_kernel.fused_q_indexer_rope_hadamard_quant_torch import (
     fused_q_indexer_rope_hadamard_quant,
 )
+from sgl_kernel.gdn_attn import gdn_attention
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,

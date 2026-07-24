@@ -91,6 +91,7 @@ from sgl_kernel.mhc import (
 )
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
+    biased_topk,
     cutlass_fp4_group_mm,
     fp8_blockwise_scaled_grouped_mm,
     fused_experts,

@@ -149,6 +149,8 @@ def fused_inplace_qknorm_rope(
     positions: torch.Tensor,
     is_neox: bool,
     eps: float = 1e-6,
+    head_dim: int = 0,
+    rope_dim: int = 0,
 ) -> None:
     r"""Apply fused RMSNorm + RoPE to Q/K using a precomputed cos/sin cache.
 
@@ -183,7 +185,16 @@ def fused_inplace_qknorm_rope(
     This is an in-place operation that modifies ``q`` and ``k`` directly.
     """
     torch.ops.sgl_kernel.fused_inplace_qknorm_rope(
-        q, k, q_weight, k_weight, cos_sin_cache, positions, is_neox, eps
+        q,
+        k,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        is_neox,
+        eps,
+        head_dim,
+        rope_dim,
     )
 
 

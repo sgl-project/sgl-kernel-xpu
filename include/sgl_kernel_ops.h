@@ -123,7 +123,9 @@ void fused_inplace_qknorm_rope(
     torch::Tensor& cos_sin_cache,
     torch::Tensor& positions,
     bool is_neox,
-    double eps);
+    double eps,
+    int64_t head_dim,
+    int64_t rope_dim);
 void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize);
 void topk_sigmoid(
     at::Tensor& topk_weights,

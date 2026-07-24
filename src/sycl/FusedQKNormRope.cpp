@@ -842,7 +842,9 @@ void fused_inplace_qknorm_rope(
     torch::Tensor& cos_sin_cache,
     torch::Tensor& positions,
     bool is_neox,
-    double eps) {
+    double eps,
+    int64_t head_dim,
+    int64_t rope_dim) {
   TORCH_CHECK(q.dim() == k.dim(), "q and k must have the same rank, got q:", q.dim(), " k:", k.dim());
   TORCH_CHECK(q.dim() == 3 || q.dim() == 4, "q/k must be 3D or 4D tensors, got q:", q.dim());
   TORCH_CHECK(q.scalar_type() == k.scalar_type(), "q and k must have the same dtype");
@@ -887,16 +889,34 @@ void fused_inplace_qknorm_rope(
   const int64_t num_tokens = q_view.size(0);
   const int64_t num_qo_heads = q_view.size(1);
   const int64_t num_kv_heads = k_view.size(1);
-  const int64_t head_dim = q_view.size(2);
+  const int64_t inferred_head_dim = q_view.size(2);
   const int64_t q_head_stride = q_view.stride(1);
   const int64_t k_head_stride = k_view.stride(1);
 
   TORCH_CHECK(q_weight.dim() == 1, "q_weight must be 1D [head_dim]");
   TORCH_CHECK(k_weight.dim() == 1, "k_weight must be 1D [head_dim]");
-  TORCH_CHECK(q_weight.size(0) == head_dim, "q_weight size must match head_dim");
-  TORCH_CHECK(k_weight.size(0) == head_dim, "k_weight size must match head_dim");
+  TORCH_CHECK(q_weight.size(0) == inferred_head_dim, "q_weight size must match head_dim");
+  TORCH_CHECK(k_weight.size(0) == inferred_head_dim, "k_weight size must match head_dim");
   TORCH_CHECK(cos_sin_cache.dim() == 2, "cos_sin_cache must be 2D [max_position, rope_dim]");
-  const int64_t rope_dim = cos_sin_cache.size(1);
+  const int64_t inferred_rope_dim = cos_sin_cache.size(1);
+  if (head_dim != 0) {
+    TORCH_CHECK(
+        head_dim == inferred_head_dim,
+        "head_dim must match q/k hidden size, got ",
+        head_dim,
+        " vs ",
+        inferred_head_dim);
+  }
+  if (rope_dim != 0) {
+    TORCH_CHECK(
+        rope_dim == inferred_rope_dim,
+        "rope_dim must match cos_sin_cache width, got ",
+        rope_dim,
+        " vs ",
+        inferred_rope_dim);
+  }
+  head_dim = inferred_head_dim;
+  rope_dim = inferred_rope_dim;
   TORCH_CHECK(rope_dim % 2 == 0, "rope_dim must be even");
   TORCH_CHECK(rope_dim <= head_dim, "rope_dim must be <= head_dim");
   TORCH_CHECK(positions.dim() == 1, "positions must be 1D [num_tokens]");

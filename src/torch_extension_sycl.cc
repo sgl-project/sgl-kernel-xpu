@@ -333,6 +333,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "bool silu_activation, Tensor? cache_seqlens_, Tensor? conv_state_indices_, "
       "int pad_slot_id) -> ()");
   m.impl("causal_conv1d_update", torch::kXPU, &causal_conv1d_update);
+
+  /*
+   * Compress plan kernels
+   */
+  m.def(
+      "plan_compress_decode(Tensor req_pool_indices, Tensor req_to_token, Tensor full_to_state, "
+      "Tensor seq_lens, int compress_ratio, int swa_page_size, int ring_size) -> Tensor");
+  m.impl("plan_compress_decode", torch::kXPU, &at::native::xpu::plan_compress_decode);
 }
 
 REGISTER_EXTENSION(common_ops)

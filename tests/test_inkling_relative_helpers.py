@@ -37,10 +37,44 @@ def test_row_scale_bf16_matches_reference(rows, inner, strided):
     assert torch.equal(out, ref)
 
 
+@pytest.mark.parametrize(
+    ("rows", "inner", "strided"),
+    [
+        (4096, 256, True),
+        (512, 16_384, False),
+    ],
+)
+def test_row_scale_bf16_production_shapes_match_reference(rows, inner, strided):
+    x = _make_row_input(rows, inner, strided)
+    tau = 1.0 + 0.1 * torch.rand(rows, device="xpu", dtype=torch.float32)
+
+    out = row_scale_bf16(x, tau)
+    ref = (x.float() * tau.view(-1, 1)).bfloat16()
+
+    assert out.is_contiguous()
+    assert torch.equal(out, ref)
+
+
 @pytest.mark.parametrize("rows", [1, 3, 41, 512])
 @pytest.mark.parametrize("inner", [4, 8, 19, 256])
 @pytest.mark.parametrize("strided", [False, True])
 def test_row_compact_bf16_matches_contiguous(rows, inner, strided):
+    x = _make_row_input(rows, inner, strided)
+
+    out = row_compact_bf16(x)
+
+    assert out.is_contiguous()
+    assert torch.equal(out, x.contiguous())
+
+
+@pytest.mark.parametrize(
+    ("rows", "inner", "strided"),
+    [
+        (4096, 256, True),
+        (512, 16_384, False),
+    ],
+)
+def test_row_compact_bf16_production_shapes_match_contiguous(rows, inner, strided):
     x = _make_row_input(rows, inner, strided)
 
     out = row_compact_bf16(x)
@@ -73,6 +107,27 @@ def _rel_proj_ref(
 @pytest.mark.parametrize("with_tau", [False, True])
 def test_rel_proj_small_t_matches_reference(t, strided, with_tau):
     h, d, e = 6, 16, 65
+    r = _make_r(t, h, d, strided)
+    proj = torch.randn(d, e, device="xpu", dtype=torch.bfloat16) * 0.1
+    tau = (
+        1.0 + 0.1 * torch.rand(t, device="xpu", dtype=torch.float32)
+        if with_tau
+        else None
+    )
+
+    out = rel_proj_small_t(r, proj, tau)
+    ref = _rel_proj_ref(r, proj, tau)
+
+    assert out.is_contiguous()
+    assert out.shape == (t, h, e)
+    torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("t", [1, 2, 4])
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("with_tau", [False, True])
+def test_rel_proj_small_t_production_esimd_matches_reference(t, strided, with_tau):
+    h, d, e = 16, 16, 1024
     r = _make_r(t, h, d, strided)
     proj = torch.randn(d, e, device="xpu", dtype=torch.bfloat16) * 0.1
     tau = (

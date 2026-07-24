@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <optional>
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/esimd.hpp>
 
 #include "Utils.h"
 
@@ -20,10 +21,13 @@ using bf16_t = sycl::ext::oneapi::bfloat16;
 
 constexpr int64_t kDefaultBlock = 256;
 constexpr int64_t kRowPackBytes = 16;
+constexpr int kRowPackWords = kRowPackBytes / static_cast<int>(sizeof(uint32_t));
 constexpr int64_t kRowPackElems = kRowPackBytes / static_cast<int64_t>(sizeof(bf16_t));
 constexpr int64_t kRowSmallLaneElems = kRowPackElems;
 constexpr int64_t kRowLargePacksPerLane = 4;
 constexpr int64_t kRowLargeLaneElems = kRowPackElems * kRowLargePacksPerLane;
+constexpr int kRowEsimdCopyWords = 64;
+constexpr int64_t kRowEsimdMinRows = 512;
 constexpr int64_t kRowSmallWorkItemsThreshold = 8192;
 constexpr int64_t kRelProjVec = 8;
 
@@ -80,6 +84,76 @@ struct RowParams {
   int64_t vec_count = 0;
 };
 
+class InklingRowCompactEsimdKernel {
+ public:
+  RowParams params;
+  int64_t chunks_per_row;
+
+  void operator()(sycl::item<1> item) const SYCL_ESIMD_KERNEL {
+    int64_t linear = static_cast<int64_t>(item.get_linear_id());
+    int64_t total = params.rows * chunks_per_row;
+    if (linear >= total) {
+      return;
+    }
+    int64_t row = linear / chunks_per_row;
+    int64_t chunk = linear - row * chunks_per_row;
+    const bf16_t* src_row = params.x + row * params.stride;
+    bf16_t* dst_row = params.out + row * params.inner;
+    auto value = sycl::ext::intel::esimd::block_load<uint32_t, kRowEsimdCopyWords>(
+        reinterpret_cast<const uint32_t*>(src_row) + chunk * kRowEsimdCopyWords);
+    sycl::ext::intel::esimd::block_store<uint32_t, kRowEsimdCopyWords>(
+        reinterpret_cast<uint32_t*>(dst_row) + chunk * kRowEsimdCopyWords, value);
+  }
+};
+
+class InklingRowScaleBf16EsimdKernel {
+ public:
+  RowParams params;
+  int64_t chunks_per_row;
+
+  void operator()(sycl::item<1> item) const SYCL_ESIMD_KERNEL {
+    int64_t linear = static_cast<int64_t>(item.get_linear_id());
+    int64_t total = params.rows * chunks_per_row;
+    if (linear >= total) {
+      return;
+    }
+    int64_t row = linear / chunks_per_row;
+    int64_t chunk = linear - row * chunks_per_row;
+    const bf16_t* src_row = params.x + row * params.stride;
+    bf16_t* dst_row = params.out + row * params.inner;
+    float scale = params.tau[row];
+
+    auto raw = sycl::ext::intel::esimd::block_load<uint32_t, kRowEsimdCopyWords>(
+        reinterpret_cast<const uint32_t*>(src_row) + chunk * kRowEsimdCopyWords);
+    auto lo_bits = (raw & 0x0000ffffu) << 16;
+    auto hi_bits = raw & 0xffff0000u;
+    auto lo = lo_bits.template bit_cast_view<float>();
+    auto hi = hi_bits.template bit_cast_view<float>();
+    lo = lo * scale;
+    hi = hi * scale;
+
+    auto lo_fbits = lo.template bit_cast_view<uint32_t>();
+    auto hi_fbits = hi.template bit_cast_view<uint32_t>();
+    auto lo_round = ((lo_fbits >> 16) & 1u) + 0x7fffu;
+    auto hi_round = ((hi_fbits >> 16) & 1u) + 0x7fffu;
+    auto out = ((lo_fbits + lo_round) >> 16) | (((hi_fbits + hi_round) >> 16) << 16);
+    sycl::ext::intel::esimd::block_store<uint32_t, kRowEsimdCopyWords>(
+        reinterpret_cast<uint32_t*>(dst_row) + chunk * kRowEsimdCopyWords, out);
+  }
+};
+
+inline void launch_row_compact_esimd(sycl::queue& queue, const RowParams& params, int64_t chunks_per_row) {
+  int64_t total = params.rows * chunks_per_row;
+  InklingRowCompactEsimdKernel kernel{params, chunks_per_row};
+  queue.parallel_for<InklingRowCompactEsimdKernel>(sycl::range<1>(static_cast<std::size_t>(total)), kernel);
+}
+
+inline void launch_row_scale_bf16_esimd(sycl::queue& queue, const RowParams& params, int64_t chunks_per_row) {
+  int64_t total = params.rows * chunks_per_row;
+  InklingRowScaleBf16EsimdKernel kernel{params, chunks_per_row};
+  queue.parallel_for<InklingRowScaleBf16EsimdKernel>(sycl::range<1>(static_cast<std::size_t>(total)), kernel);
+}
+
 template <bool HasTau, int64_t Vec>
 class InklingRowKernel {
  public:
@@ -134,6 +208,22 @@ void launch_row_kernel_static(sycl::queue& queue, RowParams params) {
 
   bool aligned = params.inner % kRowPackElems == 0 && params.stride % kRowPackElems == 0 &&
       is_aligned(params.x, kRowPackBytes) && is_aligned(params.out, kRowPackBytes);
+  int64_t row_bytes = params.inner * static_cast<int64_t>(sizeof(bf16_t));
+  int64_t row_words = row_bytes / static_cast<int64_t>(sizeof(uint32_t));
+  if constexpr (!HasTau) {
+    if (params.rows >= kRowEsimdMinRows && aligned && row_bytes % static_cast<int64_t>(sizeof(uint32_t)) == 0 &&
+        row_words % kRowEsimdCopyWords == 0) {
+      launch_row_compact_esimd(queue, params, row_words / kRowEsimdCopyWords);
+      return;
+    }
+  }
+  if constexpr (HasTau) {
+    if (params.rows >= kRowEsimdMinRows && aligned && row_bytes % static_cast<int64_t>(sizeof(uint32_t)) == 0 &&
+        row_words % kRowEsimdCopyWords == 0) {
+      launch_row_scale_bf16_esimd(queue, params, row_words / kRowEsimdCopyWords);
+      return;
+    }
+  }
 
   params.vec_count = aligned ? params.inner / Vec : 0;
   int64_t scalar_tail = params.inner - params.vec_count * Vec;
@@ -175,6 +265,66 @@ struct RelProjParams {
   int64_t e = 0;
   int64_t r_stride_t = 0;
 };
+
+template <bool HasTau>
+class InklingRelProjBf16D16EsimdKernel {
+ public:
+  RelProjParams params;
+  int64_t chunks_per_row;
+
+  void operator()(sycl::item<1> item) const SYCL_ESIMD_KERNEL {
+    int64_t linear = static_cast<int64_t>(item.get_linear_id());
+    int64_t total = params.t * params.h * chunks_per_row;
+    if (linear >= total) {
+      return;
+    }
+    int64_t chunk = linear % chunks_per_row;
+    int64_t th = linear / chunks_per_row;
+    int64_t ti = th / params.h;
+    int64_t hi = th - ti * params.h;
+    int64_t e0 = chunk * 16;
+
+    float scale = 1.0f;
+    if constexpr (HasTau) {
+      scale = params.tau[ti];
+    }
+
+    sycl::ext::intel::esimd::simd<float, 8> acc_lo(0.0f);
+    sycl::ext::intel::esimd::simd<float, 8> acc_hi(0.0f);
+    const bf16_t* r_row = params.r + ti * params.r_stride_t + hi * params.d;
+
+#pragma unroll
+    for (int d = 0; d < 16; ++d) {
+      float rv = bf16_to_float(r_row[d]);
+      if constexpr (HasTau) {
+        rv = bf16_to_float(float_to_bf16(rv * scale));
+      }
+      auto raw = sycl::ext::intel::esimd::block_load<uint32_t, 8>(
+          reinterpret_cast<const uint32_t*>(params.proj + static_cast<int64_t>(d) * params.e) + e0 / 2);
+      auto lo_bits = (raw & 0x0000ffffu) << 16;
+      auto hi_bits = raw & 0xffff0000u;
+      acc_lo += lo_bits.template bit_cast_view<float>() * rv;
+      acc_hi += hi_bits.template bit_cast_view<float>() * rv;
+    }
+
+    auto lo_fbits = acc_lo.template bit_cast_view<uint32_t>();
+    auto hi_fbits = acc_hi.template bit_cast_view<uint32_t>();
+    auto lo_round = ((lo_fbits >> 16) & 1u) + 0x7fffu;
+    auto hi_round = ((hi_fbits >> 16) & 1u) + 0x7fffu;
+    auto out = ((lo_fbits + lo_round) >> 16) | (((hi_fbits + hi_round) >> 16) << 16);
+    bf16_t* out_row = params.out + (ti * params.h + hi) * params.e;
+    sycl::ext::intel::esimd::block_store<uint32_t, 8>(reinterpret_cast<uint32_t*>(out_row) + e0 / 2, out);
+  }
+};
+
+template <bool HasTau>
+inline void launch_rel_proj_bf16_d16_esimd(sycl::queue& queue, const RelProjParams& params) {
+  int64_t chunks_per_row = params.e / 16;
+  int64_t total = params.t * params.h * chunks_per_row;
+  InklingRelProjBf16D16EsimdKernel<HasTau> kernel{params, chunks_per_row};
+  queue.parallel_for<InklingRelProjBf16D16EsimdKernel<HasTau>>(
+      sycl::range<1>(static_cast<std::size_t>(total)), kernel);
+}
 
 template <bool HasTau, int64_t Vec>
 class InklingRelProjKernel {
@@ -238,6 +388,11 @@ void launch_rel_proj_kernel(sycl::queue& queue, RelProjParams params) {
   int64_t e_vecs = ceil_div_i64(params.e, Vec);
   int64_t total = params.t * params.h * e_vecs;
   if (total == 0) {
+    return;
+  }
+
+  if (params.t <= 4 && params.d == 16 && params.e % 16 == 0) {
+    launch_rel_proj_bf16_d16_esimd<HasTau>(queue, params);
     return;
   }
 

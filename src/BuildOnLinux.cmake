@@ -28,16 +28,33 @@ else()
       "but got ${SYCL_COMPILER_VERSION}")
 endif()
 
+get_filename_component(SGL_SYCL_COMPILER_DIR "${SYCL_EXECUTABLE}" DIRECTORY)
+find_program(SGL_SYCL_ESIMD_HOST_COMPILER
+  NAMES icpx
+  HINTS "${SGL_SYCL_COMPILER_DIR}"
+  NO_DEFAULT_PATH)
+if(NOT SGL_SYCL_ESIMD_HOST_COMPILER)
+  find_program(SGL_SYCL_ESIMD_HOST_COMPILER NAMES icpx)
+endif()
+
 # common kernels
 foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
   get_filename_component(name ${sycl_src} NAME_WLE REALPATH)
   set(sycl_lib sgl-ops-sycl-${name})
+  set(_saved_SYCL_HOST_COMPILER "${SYCL_HOST_COMPILER}")
+  if(name STREQUAL "InklingRelativeHelpers")
+    if(NOT SGL_SYCL_ESIMD_HOST_COMPILER)
+      message(FATAL_ERROR "InklingRelativeHelpers uses ESIMD and requires icpx as the SYCL host compiler")
+    endif()
+    set(SYCL_HOST_COMPILER "${SGL_SYCL_ESIMD_HOST_COMPILER}")
+  endif()
   sycl_add_library(
     ${sycl_lib}
     ${SYCL_OFFLINE_COMPILER_FLAGS}
     ${COMMON_DEVICE_LINK_FLAGS}
     SHARED
     SYCL_SOURCES ${sycl_src})
+  set(SYCL_HOST_COMPILER "${_saved_SYCL_HOST_COMPILER}")
   target_link_libraries(common_ops PUBLIC ${sycl_lib})
   list(APPEND SGL_OPS_LIBRARIES ${sycl_lib})
 

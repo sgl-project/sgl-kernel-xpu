@@ -1579,12 +1579,527 @@ void launch_save_windows(sycl::queue& q, SaveWindowsParams<scalar_t> const& para
   }
 }
 
+enum class CommAllReduceVariant : int64_t {
+  kDirect = 0,
+  kTwoShot = 1,
+  kFullOneShot = 2,
+  kPushOneShot = 3,
+};
+
+template <typename scalar_t>
+struct CommAllReduceParams {
+  scalar_t const* partials;
+  scalar_t const* shared;
+  scalar_t* scratch;
+  scalar_t* stage;
+  scalar_t* out;
+  int64_t world;
+  int64_t n;
+  bool use_shared;
+};
+
+template <typename scalar_t>
+inline float folded_rank_value(CommAllReduceParams<scalar_t> const& p, int64_t rank, int64_t idx) {
+  const int64_t off = rank * p.n + idx;
+  float value = to_float_device(p.partials[off]);
+  if (p.use_shared) {
+    value += to_float_device(p.shared[off]);
+    value = to_float_device(from_float_device<scalar_t>(value));
+  }
+  return value;
+}
+
+template <typename scalar_t>
+inline float reduced_rank_stacked_value(
+    scalar_t const* partials,
+    scalar_t const* shared,
+    int64_t world,
+    int64_t T,
+    int64_t D,
+    int64_t t,
+    int64_t d,
+    bool use_shared) {
+  float acc = 0.0f;
+  for (int64_t r = 0; r < world; ++r) {
+    const int64_t off = (r * T + t) * D + d;
+    float value = to_float_device(partials[off]);
+    if (use_shared) {
+      value += to_float_device(shared[off]);
+      value = to_float_device(from_float_device<scalar_t>(value));
+    }
+    acc += value;
+  }
+  return to_float_device(from_float_device<scalar_t>(acc));
+}
+
+template <typename scalar_t>
+struct DirectAllReduceKernel {
+  CommAllReduceParams<scalar_t> p;
+
+  void operator()(sycl::nd_item<1> item) const {
+    const int64_t linear = static_cast<int64_t>(item.get_global_linear_id());
+    const int64_t total = p.world * p.n;
+    if (linear >= total) {
+      return;
+    }
+    const int64_t idx = linear % p.n;
+    float acc = 0.0f;
+    for (int64_t r = 0; r < p.world; ++r) {
+      acc += folded_rank_value(p, r, idx);
+    }
+    p.out[linear] = from_float_device<scalar_t>(acc);
+  }
+};
+
+template <typename scalar_t>
+struct TwoShotAllReduceKernel {
+  CommAllReduceParams<scalar_t> p;
+
+  void operator()(sycl::nd_item<1> item) const {
+    const int64_t idx = static_cast<int64_t>(item.get_global_linear_id());
+    if (idx >= p.n) {
+      return;
+    }
+    float acc = 0.0f;
+    for (int64_t r = 0; r < p.world; ++r) {
+      acc += folded_rank_value(p, r, idx);
+    }
+    p.scratch[idx] = from_float_device<scalar_t>(acc);
+  }
+};
+
+template <typename scalar_t>
+struct TwoShotAllGatherKernel {
+  CommAllReduceParams<scalar_t> p;
+
+  void operator()(sycl::nd_item<1> item) const {
+    const int64_t linear = static_cast<int64_t>(item.get_global_linear_id());
+    const int64_t total = p.world * p.n;
+    if (linear >= total) {
+      return;
+    }
+    p.out[linear] = p.scratch[linear % p.n];
+  }
+};
+
+template <typename scalar_t>
+struct PushStageKernel {
+  CommAllReduceParams<scalar_t> p;
+
+  void operator()(sycl::nd_item<1> item) const {
+    const int64_t linear = static_cast<int64_t>(item.get_global_linear_id());
+    const int64_t total = p.world * p.n;
+    if (linear >= total) {
+      return;
+    }
+    const int64_t rank = linear / p.n;
+    const int64_t idx = linear - rank * p.n;
+    p.stage[linear] = from_float_device<scalar_t>(folded_rank_value(p, rank, idx));
+  }
+};
+
+template <typename scalar_t>
+struct PushReduceKernel {
+  CommAllReduceParams<scalar_t> p;
+
+  void operator()(sycl::nd_item<1> item) const {
+    const int64_t linear = static_cast<int64_t>(item.get_global_linear_id());
+    const int64_t total = p.world * p.n;
+    if (linear >= total) {
+      return;
+    }
+    const int64_t idx = linear % p.n;
+    float acc = 0.0f;
+    for (int64_t r = 0; r < p.world; ++r) {
+      acc += to_float_device(p.stage[r * p.n + idx]);
+    }
+    p.out[linear] = from_float_device<scalar_t>(acc);
+  }
+};
+
+template <typename scalar_t>
+void launch_direct_all_reduce(sycl::queue& q, CommAllReduceParams<scalar_t> const& params) {
+  const int64_t total = params.world * params.n;
+  if (total == 0) {
+    return;
+  }
+  const int64_t global = div_up_i64(total, kThreads) * kThreads;
+  DirectAllReduceKernel<scalar_t> kernel{params};
+  q.parallel_for<DirectAllReduceKernel<scalar_t>>(
+      sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
+}
+
+template <typename scalar_t>
+void launch_twoshot_all_reduce(sycl::queue& q, CommAllReduceParams<scalar_t> const& params) {
+  if (params.n == 0 || params.world == 0) {
+    return;
+  }
+  const int64_t reduce_global = div_up_i64(params.n, kThreads) * kThreads;
+  TwoShotAllReduceKernel<scalar_t> reduce{params};
+  auto reduce_event = q.parallel_for<TwoShotAllReduceKernel<scalar_t>>(
+      sycl::nd_range<1>(sycl::range<1>(reduce_global), sycl::range<1>(kThreads)), reduce);
+  const int64_t total = params.world * params.n;
+  const int64_t gather_global = div_up_i64(total, kThreads) * kThreads;
+  q.submit([&](sycl::handler& cgh) {
+    cgh.depends_on(reduce_event);
+    TwoShotAllGatherKernel<scalar_t> gather{params};
+    cgh.parallel_for<TwoShotAllGatherKernel<scalar_t>>(
+        sycl::nd_range<1>(sycl::range<1>(gather_global), sycl::range<1>(kThreads)), gather);
+  });
+}
+
+template <typename scalar_t>
+void launch_push_all_reduce(sycl::queue& q, CommAllReduceParams<scalar_t> const& params) {
+  const int64_t total = params.world * params.n;
+  if (total == 0) {
+    return;
+  }
+  const int64_t global = div_up_i64(total, kThreads) * kThreads;
+  PushStageKernel<scalar_t> stage{params};
+  auto stage_event = q.parallel_for<PushStageKernel<scalar_t>>(
+      sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), stage);
+  q.submit([&](sycl::handler& cgh) {
+    cgh.depends_on(stage_event);
+    PushReduceKernel<scalar_t> reduce{params};
+    cgh.parallel_for<PushReduceKernel<scalar_t>>(
+        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), reduce);
+  });
+}
+
+template <typename scalar_t>
+struct ArFusedDecodeParams {
+  scalar_t const* partials;
+  scalar_t const* shared;
+  scalar_t const* residual_in;
+  scalar_t* residual_out;
+  scalar_t* hs_out;
+  scalar_t* cache;
+  int32_t const* cache_indices;
+  bool const* cache_mask;
+  scalar_t const* weight;
+  scalar_t const* norm_weight;
+  int64_t world;
+  int64_t T;
+  int64_t D;
+  int64_t W;
+  int64_t cache_stride_slot;
+  int64_t cache_stride_w;
+  int64_t cache_stride_d;
+  int64_t weight_stride_d;
+  int64_t weight_stride_w;
+  int64_t norm_weight_stride;
+  float eps;
+  bool use_silu;
+  bool use_residual;
+  bool use_shared;
+  bool weight_current_first;
+};
+
+template <typename scalar_t>
+class ArFusedDecodeKernel;
+
+template <typename scalar_t>
+void launch_ar_fused_decode(sycl::queue& q, ArFusedDecodeParams<scalar_t> const& params) {
+  if (params.T == 0 || params.D == 0) {
+    return;
+  }
+  const int64_t global = params.T * kThreads;
+  q.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> partial_sums(sycl::range<1>(kThreads), cgh);
+    cgh.parallel_for<ArFusedDecodeKernel<scalar_t>>(
+        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)),
+        [=](sycl::nd_item<1> item) {
+          const int64_t t = static_cast<int64_t>(item.get_group(0));
+          const int64_t lane = static_cast<int64_t>(item.get_local_id(0));
+          const int32_t ci = params.cache_indices[t];
+          const bool valid_slot = ci != kPadSlotId;
+          const int64_t slot = valid_slot ? static_cast<int64_t>(ci) : 0;
+          const bool use_cache = valid_slot && params.cache_mask[t];
+          float ssq = 0.0f;
+
+          for (int64_t d = lane; d < params.D; d += kThreads) {
+            const float xb = reduced_rank_stacked_value(
+                params.partials, params.shared, params.world, params.T, params.D, t, d, params.use_shared);
+            float acc = 0.0f;
+            for (int64_t iw = 0; iw < params.W - 1; ++iw) {
+              const float tap = use_cache
+                  ? to_float_device(
+                        params.cache[slot * params.cache_stride_slot + iw * params.cache_stride_w +
+                                     d * params.cache_stride_d])
+                  : 0.0f;
+              const int64_t weight_iw = params.weight_current_first ? params.W - 1 - iw : iw;
+              const float w =
+                  to_float_device(params.weight[d * params.weight_stride_d + weight_iw * params.weight_stride_w]);
+              acc += tap * w;
+            }
+            const int64_t current_weight_iw = params.weight_current_first ? 0 : params.W - 1;
+            acc += xb *
+                   to_float_device(
+                       params.weight[d * params.weight_stride_d + current_weight_iw * params.weight_stride_w]);
+            if (params.use_silu) {
+              acc = acc / (1.0f + sycl::native::exp(-acc));
+            }
+            if (params.use_residual) {
+              acc += xb;
+            }
+
+            const float residual = to_float_device(params.residual_in[t * params.D + d]) + acc;
+            params.residual_out[t * params.D + d] = from_float_device<scalar_t>(residual);
+            ssq += residual * residual;
+
+            if (valid_slot) {
+              const int64_t cache_base = slot * params.cache_stride_slot + d * params.cache_stride_d;
+              for (int64_t iw = 0; iw < params.W - 1; ++iw) {
+                scalar_t next = from_float_device<scalar_t>(0.0f);
+                if (iw < params.W - 2 && use_cache) {
+                  next = params.cache[cache_base + (iw + 1) * params.cache_stride_w];
+                } else if (iw == params.W - 2) {
+                  next = from_float_device<scalar_t>(xb);
+                }
+                params.cache[cache_base + iw * params.cache_stride_w] = next;
+              }
+            }
+          }
+
+          partial_sums[lane] = ssq;
+          item.barrier(sycl::access::fence_space::local_space);
+          for (int offset = kThreads / 2; offset > 0; offset >>= 1) {
+            if (lane < offset) {
+              partial_sums[lane] += partial_sums[lane + offset];
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+          }
+          const float inv_rms = sycl::native::rsqrt(partial_sums[0] / static_cast<float>(params.D) + params.eps);
+          for (int64_t d = lane; d < params.D; d += kThreads) {
+            const float residual = to_float_device(params.residual_out[t * params.D + d]);
+            const float gamma = to_float_device(params.norm_weight[d * params.norm_weight_stride]);
+            params.hs_out[t * params.D + d] = from_float_device<scalar_t>(residual * inv_rms * gamma);
+          }
+        });
+  });
+}
+
+template <typename scalar_t>
+struct ArScatteredReduceParams {
+  scalar_t const* partials;
+  scalar_t const* shared;
+  scalar_t* scratch;
+  int64_t world;
+  int64_t T;
+  int64_t D;
+  bool use_shared;
+};
+
+template <typename scalar_t>
+struct ArScatteredReduceKernel {
+  ArScatteredReduceParams<scalar_t> p;
+
+  void operator()(sycl::nd_item<1> item) const {
+    const int64_t linear = static_cast<int64_t>(item.get_global_linear_id());
+    const int64_t total = p.T * p.D;
+    if (linear >= total) {
+      return;
+    }
+    const int64_t d = linear % p.D;
+    const int64_t t = linear / p.D;
+    const float xb =
+        reduced_rank_stacked_value(p.partials, p.shared, p.world, p.T, p.D, t, d, p.use_shared);
+    p.scratch[linear] = from_float_device<scalar_t>(xb);
+  }
+};
+
+template <typename scalar_t>
+struct ArScatteredSconvParams {
+  scalar_t const* scratch;
+  scalar_t const* cache;
+  scalar_t* out;
+  int32_t const* cache_indices;
+  bool const* cache_mask;
+  int64_t const* cu;
+  int32_t const* si;
+  scalar_t const* weight;
+  int64_t world;
+  int64_t T;
+  int64_t D;
+  int64_t W;
+  int64_t B;
+  int64_t cache_stride_slot;
+  int64_t cache_stride_w;
+  int64_t cache_stride_d;
+  int64_t weight_stride_d;
+  int64_t weight_stride_w;
+  bool use_silu;
+  bool use_residual;
+  bool weight_current_first;
+};
+
+template <typename scalar_t>
+struct ArScatteredSconvKernel {
+  ArScatteredSconvParams<scalar_t> p;
+
+  void operator()(sycl::nd_item<1> item) const {
+    const int64_t linear = static_cast<int64_t>(item.get_global_linear_id());
+    const int64_t total = p.T * p.D;
+    if (linear >= total) {
+      return;
+    }
+    const int64_t d = linear % p.D;
+    const int64_t t = linear / p.D;
+    const int64_t seq = p.si[t];
+    const int64_t bos = p.cu[seq];
+    const int32_t ci = p.cache_indices[seq];
+    const bool valid_slot = ci != kPadSlotId;
+    const int64_t slot = valid_slot ? static_cast<int64_t>(ci) : 0;
+    const bool use_cache = valid_slot && p.cache_mask[seq];
+    const float xcur = to_float_device(p.scratch[t * p.D + d]);
+
+    float acc = 0.0f;
+    for (int64_t iw = 0; iw < p.W; ++iw) {
+      const int64_t shifted = t - (p.W - 1) + iw;
+      float tap = 0.0f;
+      if (shifted >= bos && shifted < p.T) {
+        tap = to_float_device(p.scratch[shifted * p.D + d]);
+      } else {
+        const int64_t prefix_pos = shifted - bos + (p.W - 1);
+        if (shifted < bos && prefix_pos >= 0 && prefix_pos < p.W - 1 && use_cache) {
+          tap = to_float_device(
+              p.cache[slot * p.cache_stride_slot + prefix_pos * p.cache_stride_w + d * p.cache_stride_d]);
+        }
+      }
+      const int64_t weight_iw = p.weight_current_first ? p.W - 1 - iw : iw;
+      const float w = to_float_device(p.weight[d * p.weight_stride_d + weight_iw * p.weight_stride_w]);
+      acc += tap * w;
+    }
+    if (p.use_silu) {
+      acc = acc / (1.0f + sycl::native::exp(-acc));
+    }
+    if (p.use_residual) {
+      acc += xcur;
+    }
+    const scalar_t y = from_float_device<scalar_t>(acc);
+    for (int64_t r = 0; r < p.world; ++r) {
+      p.out[(r * p.T + t) * p.D + d] = y;
+    }
+  }
+};
+
+template <typename scalar_t>
+struct ArScatteredCacheUpdateParams {
+  scalar_t const* scratch;
+  scalar_t* cache;
+  int32_t const* cache_indices;
+  bool const* has_initial_state;
+  int64_t const* cu;
+  int64_t B;
+  int64_t D;
+  int64_t W1;
+  int64_t cache_stride_slot;
+  int64_t cache_stride_w;
+  int64_t cache_stride_d;
+};
+
+template <typename scalar_t>
+struct ArScatteredCacheUpdateKernel {
+  ArScatteredCacheUpdateParams<scalar_t> p;
+
+  void operator()(sycl::nd_item<1> item) const {
+    const int64_t linear = static_cast<int64_t>(item.get_global_linear_id());
+    const int64_t total = p.B * p.D;
+    if (linear >= total) {
+      return;
+    }
+    const int64_t b = linear / p.D;
+    const int64_t d = linear - b * p.D;
+    const int32_t slot = p.cache_indices[b];
+    const int64_t start = p.cu[b];
+    const int64_t end = p.cu[b + 1];
+    const int64_t qlen = end - start;
+    if (slot == kPadSlotId || qlen <= 0) {
+      return;
+    }
+
+    const bool has_state = p.has_initial_state[b];
+    const int64_t cache_base = static_cast<int64_t>(slot) * p.cache_stride_slot + d * p.cache_stride_d;
+    for (int64_t w = 0; w < p.W1; ++w) {
+      scalar_t value = from_float_device<scalar_t>(0.0f);
+      if (qlen >= p.W1 - w) {
+        const int64_t x_idx = end - p.W1 + w;
+        value = p.scratch[x_idx * p.D + d];
+      } else if (has_state) {
+        value = p.cache[cache_base + (w + qlen) * p.cache_stride_w];
+      }
+      p.cache[cache_base + w * p.cache_stride_w] = value;
+    }
+  }
+};
+
+template <typename scalar_t>
+sycl::event launch_ar_scattered_reduce(sycl::queue& q, ArScatteredReduceParams<scalar_t> const& params) {
+  const int64_t total = params.T * params.D;
+  if (total == 0) {
+    return sycl::event{};
+  }
+  const int64_t global = div_up_i64(total, kThreads) * kThreads;
+  ArScatteredReduceKernel<scalar_t> kernel{params};
+  return q.parallel_for<ArScatteredReduceKernel<scalar_t>>(
+      sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
+}
+
+template <typename scalar_t>
+sycl::event launch_ar_scattered_sconv(
+    sycl::queue& q,
+    ArScatteredSconvParams<scalar_t> const& params,
+    sycl::event dependency) {
+  const int64_t total = params.T * params.D;
+  if (total == 0) {
+    return sycl::event{};
+  }
+  const int64_t global = div_up_i64(total, kThreads) * kThreads;
+  return q.submit([&](sycl::handler& cgh) {
+    cgh.depends_on(dependency);
+    ArScatteredSconvKernel<scalar_t> kernel{params};
+    cgh.parallel_for<ArScatteredSconvKernel<scalar_t>>(
+        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
+  });
+}
+
+template <typename scalar_t>
+void launch_ar_scattered_cache_update(
+    sycl::queue& q,
+    ArScatteredCacheUpdateParams<scalar_t> const& params,
+    sycl::event dependency) {
+  const int64_t total = params.B * params.D;
+  if (total == 0) {
+    return;
+  }
+  const int64_t global = div_up_i64(total, kThreads) * kThreads;
+  q.submit([&](sycl::handler& cgh) {
+    cgh.depends_on(dependency);
+    ArScatteredCacheUpdateKernel<scalar_t> kernel{params};
+    cgh.parallel_for<ArScatteredCacheUpdateKernel<scalar_t>>(
+        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
+  });
+}
+
 void check_xpu_tensor(const at::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.is_xpu(), name, " must be an XPU tensor");
 }
 
 void check_sconv_dtype(const at::Tensor& x, const at::Tensor& other, const char* name) {
   TORCH_CHECK(other.scalar_type() == x.scalar_type(), name, " dtype must match x dtype");
+}
+
+void check_optional_rank_stacked(
+    const at::Tensor& reference,
+    const std::optional<at::Tensor>& maybe_tensor,
+    const char* name) {
+  if (!maybe_tensor.has_value()) {
+    return;
+  }
+  check_xpu_tensor(maybe_tensor.value(), name);
+  TORCH_CHECK(maybe_tensor.value().sizes() == reference.sizes(), name, " shape must match partials");
+  check_sconv_dtype(reference, maybe_tensor.value(), name);
+  TORCH_CHECK(maybe_tensor.value().is_contiguous(), name, " must be contiguous");
 }
 
 struct WeightLayout {
@@ -2134,4 +2649,255 @@ void inkling_save_intermediate_conv_windows(
             intermediate_out.stride(3)};
         launch_save_windows<scalar_t>(queue, params);
       });
+}
+
+at::Tensor inkling_comm_all_reduce(
+    const at::Tensor& partials,
+    const std::optional<at::Tensor>& shared,
+    int64_t variant) {
+  check_xpu_tensor(partials, "partials");
+  TORCH_CHECK(partials.dim() >= 2, "partials must have shape [world, ...]");
+  TORCH_CHECK(partials.is_contiguous(), "partials must be contiguous");
+  TORCH_CHECK(partials.size(0) > 0, "partials world dimension must be positive");
+  TORCH_CHECK(
+      variant >= static_cast<int64_t>(CommAllReduceVariant::kDirect) &&
+          variant <= static_cast<int64_t>(CommAllReduceVariant::kPushOneShot),
+      "unsupported all-reduce variant");
+  check_optional_rank_stacked(partials, shared, "shared");
+
+  at::Tensor out = at::empty(partials.sizes(), partials.options());
+  const int64_t world = partials.size(0);
+  const int64_t n = partials.numel() / world;
+  at::Tensor scratch;
+  at::Tensor stage;
+  if (variant == static_cast<int64_t>(CommAllReduceVariant::kTwoShot)) {
+    scratch = at::empty({n}, partials.options());
+  } else if (variant == static_cast<int64_t>(CommAllReduceVariant::kPushOneShot)) {
+    stage = at::empty({partials.numel()}, partials.options());
+  }
+
+  auto queue = c10::xpu::getCurrentXPUStream().queue();
+  const auto input_type = partials.scalar_type();
+  SYCL_DISPATCH_FLOATING_TYPES(
+      at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_comm_all_reduce", [&]() -> at::Tensor {
+        CommAllReduceParams<scalar_t> params{
+            partials.data_ptr<scalar_t>(),
+            shared.has_value() ? shared.value().data_ptr<scalar_t>() : nullptr,
+            scratch.defined() ? scratch.data_ptr<scalar_t>() : nullptr,
+            stage.defined() ? stage.data_ptr<scalar_t>() : nullptr,
+            out.data_ptr<scalar_t>(),
+            world,
+            n,
+            shared.has_value()};
+        if (variant == static_cast<int64_t>(CommAllReduceVariant::kTwoShot)) {
+          launch_twoshot_all_reduce<scalar_t>(queue, params);
+        } else if (variant == static_cast<int64_t>(CommAllReduceVariant::kPushOneShot)) {
+          launch_push_all_reduce<scalar_t>(queue, params);
+        } else {
+          launch_direct_all_reduce<scalar_t>(queue, params);
+        }
+        return out;
+      });
+  return out;
+}
+
+std::tuple<at::Tensor, at::Tensor> inkling_ar_fused_decode(
+    const at::Tensor& partials,
+    const at::Tensor& residual,
+    at::Tensor& sconv_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& cache_mask,
+    const at::Tensor& weight,
+    const at::Tensor& norm_weight,
+    double eps,
+    bool silu_activation,
+    bool use_residual,
+    const std::optional<at::Tensor>& shared) {
+  check_xpu_tensor(partials, "partials");
+  check_xpu_tensor(residual, "residual");
+  check_xpu_tensor(sconv_cache, "sconv_cache");
+  check_xpu_tensor(cache_indices, "cache_indices");
+  check_xpu_tensor(cache_mask, "cache_mask");
+  check_xpu_tensor(weight, "weight");
+  check_xpu_tensor(norm_weight, "norm_weight");
+  TORCH_CHECK(partials.dim() == 3, "partials must have shape [world, T, D]");
+  TORCH_CHECK(partials.is_contiguous(), "partials must be contiguous");
+  TORCH_CHECK(residual.dim() == 2, "residual must have shape [T, D]");
+  TORCH_CHECK(residual.is_contiguous(), "residual must be contiguous");
+  TORCH_CHECK(sconv_cache.dim() == 3, "sconv_cache must have shape [slots, W-1, D]");
+  TORCH_CHECK(weight.dim() == 2, "weight must have shape [D, W] or [W, D]");
+  TORCH_CHECK(norm_weight.dim() == 1, "norm_weight must have shape [D]");
+  TORCH_CHECK(cache_indices.scalar_type() == at::ScalarType::Int, "cache_indices must be int32");
+  TORCH_CHECK(cache_mask.scalar_type() == at::ScalarType::Bool, "cache_mask must be bool");
+  check_sconv_dtype(partials, residual, "residual");
+  check_sconv_dtype(partials, sconv_cache, "sconv_cache");
+  check_sconv_dtype(partials, weight, "weight");
+  check_sconv_dtype(partials, norm_weight, "norm_weight");
+  check_optional_rank_stacked(partials, shared, "shared");
+
+  const int64_t world = partials.size(0);
+  const int64_t T = partials.size(1);
+  const int64_t D = partials.size(2);
+  TORCH_CHECK(world > 0, "partials world dimension must be positive");
+  TORCH_CHECK(residual.size(0) == T && residual.size(1) == D, "residual shape must be [T, D]");
+  TORCH_CHECK(sconv_cache.size(2) == D, "sconv_cache.size(2) must equal D");
+  TORCH_CHECK(cache_indices.numel() >= T, "cache_indices must have at least T entries");
+  TORCH_CHECK(cache_mask.numel() >= T, "cache_mask must have at least T entries");
+  TORCH_CHECK(norm_weight.numel() == D, "norm_weight must have D entries");
+  TORCH_CHECK(sconv_cache.stride(2) == 1, "sconv_cache must be contiguous on D");
+
+  const WeightLayout weight_layout = resolve_weight_layout(weight, D, sconv_cache.size(1) + 1, false);
+  at::Tensor hs_out = at::empty({T, D}, partials.options());
+  at::Tensor residual_out = at::empty({T, D}, partials.options());
+
+  auto queue = c10::xpu::getCurrentXPUStream().queue();
+  const auto input_type = partials.scalar_type();
+  SYCL_DISPATCH_FLOATING_TYPES(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      input_type,
+      "inkling_ar_fused_decode",
+      [&]() -> std::tuple<at::Tensor, at::Tensor> {
+        ArFusedDecodeParams<scalar_t> params{
+            partials.data_ptr<scalar_t>(),
+            shared.has_value() ? shared.value().data_ptr<scalar_t>() : nullptr,
+            residual.data_ptr<scalar_t>(),
+            residual_out.data_ptr<scalar_t>(),
+            hs_out.data_ptr<scalar_t>(),
+            sconv_cache.data_ptr<scalar_t>(),
+            cache_indices.data_ptr<int32_t>(),
+            cache_mask.data_ptr<bool>(),
+            weight.data_ptr<scalar_t>(),
+            norm_weight.data_ptr<scalar_t>(),
+            world,
+            T,
+            D,
+            weight_layout.W,
+            sconv_cache.stride(0),
+            sconv_cache.stride(1),
+            sconv_cache.stride(2),
+            weight_layout.stride_d,
+            weight_layout.stride_w,
+            norm_weight.stride(0),
+            static_cast<float>(eps),
+            silu_activation,
+            use_residual,
+            shared.has_value(),
+            weight_layout.current_first};
+        launch_ar_fused_decode<scalar_t>(queue, params);
+        return {hs_out, residual_out};
+      });
+  return {hs_out, residual_out};
+}
+
+std::tuple<at::Tensor, at::Tensor> inkling_ar_scattered_sconv(
+    const at::Tensor& partials,
+    at::Tensor& sconv_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& cache_mask,
+    const at::Tensor& cu,
+    const at::Tensor& si,
+    const at::Tensor& weight,
+    const at::Tensor& has_initial_state,
+    bool silu_activation,
+    bool use_residual,
+    const std::optional<at::Tensor>& shared,
+    bool update_cache) {
+  check_xpu_tensor(partials, "partials");
+  check_xpu_tensor(sconv_cache, "sconv_cache");
+  check_xpu_tensor(cache_indices, "cache_indices");
+  check_xpu_tensor(cache_mask, "cache_mask");
+  check_xpu_tensor(cu, "cu");
+  check_xpu_tensor(si, "si");
+  check_xpu_tensor(weight, "weight");
+  check_xpu_tensor(has_initial_state, "has_initial_state");
+  TORCH_CHECK(partials.dim() == 3, "partials must have shape [world, T, D]");
+  TORCH_CHECK(partials.is_contiguous(), "partials must be contiguous");
+  TORCH_CHECK(sconv_cache.dim() == 3, "sconv_cache must have shape [slots, W-1, D]");
+  TORCH_CHECK(weight.dim() == 2, "weight must have shape [D, W] or [W, D]");
+  TORCH_CHECK(cache_indices.scalar_type() == at::ScalarType::Int, "cache_indices must be int32");
+  TORCH_CHECK(cache_mask.scalar_type() == at::ScalarType::Bool, "cache_mask must be bool");
+  TORCH_CHECK(cu.scalar_type() == at::ScalarType::Long, "cu must be int64");
+  TORCH_CHECK(si.scalar_type() == at::ScalarType::Int, "si must be int32");
+  TORCH_CHECK(has_initial_state.scalar_type() == at::ScalarType::Bool, "has_initial_state must be bool");
+  check_sconv_dtype(partials, sconv_cache, "sconv_cache");
+  check_sconv_dtype(partials, weight, "weight");
+  check_optional_rank_stacked(partials, shared, "shared");
+
+  const int64_t world = partials.size(0);
+  const int64_t T = partials.size(1);
+  const int64_t D = partials.size(2);
+  const int64_t B = cache_indices.numel();
+  TORCH_CHECK(world > 0, "partials world dimension must be positive");
+  TORCH_CHECK(sconv_cache.size(2) == D, "sconv_cache.size(2) must equal D");
+  TORCH_CHECK(cache_mask.numel() >= B, "cache_mask must have at least B entries");
+  TORCH_CHECK(cu.numel() >= B + 1, "cu must have at least B + 1 entries");
+  TORCH_CHECK(si.numel() >= T, "si must have at least T entries");
+  TORCH_CHECK(has_initial_state.numel() >= B, "has_initial_state must have at least B entries");
+  TORCH_CHECK(sconv_cache.stride(2) == 1, "sconv_cache must be contiguous on D");
+
+  const WeightLayout weight_layout = resolve_weight_layout(weight, D, sconv_cache.size(1) + 1, false);
+  at::Tensor out = at::empty(partials.sizes(), partials.options());
+  at::Tensor scratch = at::empty({T, D}, partials.options());
+
+  auto queue = c10::xpu::getCurrentXPUStream().queue();
+  const auto input_type = partials.scalar_type();
+  SYCL_DISPATCH_FLOATING_TYPES(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      input_type,
+      "inkling_ar_scattered_sconv",
+      [&]() -> std::tuple<at::Tensor, at::Tensor> {
+        ArScatteredReduceParams<scalar_t> reduce_params{
+            partials.data_ptr<scalar_t>(),
+            shared.has_value() ? shared.value().data_ptr<scalar_t>() : nullptr,
+            scratch.data_ptr<scalar_t>(),
+            world,
+            T,
+            D,
+            shared.has_value()};
+        sycl::event reduce_event = launch_ar_scattered_reduce<scalar_t>(queue, reduce_params);
+
+        ArScatteredSconvParams<scalar_t> sconv_params{
+            scratch.data_ptr<scalar_t>(),
+            sconv_cache.data_ptr<scalar_t>(),
+            out.data_ptr<scalar_t>(),
+            cache_indices.data_ptr<int32_t>(),
+            cache_mask.data_ptr<bool>(),
+            cu.data_ptr<int64_t>(),
+            si.data_ptr<int32_t>(),
+            weight.data_ptr<scalar_t>(),
+            world,
+            T,
+            D,
+            weight_layout.W,
+            B,
+            sconv_cache.stride(0),
+            sconv_cache.stride(1),
+            sconv_cache.stride(2),
+            weight_layout.stride_d,
+            weight_layout.stride_w,
+            silu_activation,
+            use_residual,
+            weight_layout.current_first};
+        sycl::event sconv_event = launch_ar_scattered_sconv<scalar_t>(queue, sconv_params, reduce_event);
+
+        if (update_cache) {
+          ArScatteredCacheUpdateParams<scalar_t> update_params{
+              scratch.data_ptr<scalar_t>(),
+              sconv_cache.data_ptr<scalar_t>(),
+              cache_indices.data_ptr<int32_t>(),
+              has_initial_state.data_ptr<bool>(),
+              cu.data_ptr<int64_t>(),
+              B,
+              D,
+              sconv_cache.size(1),
+              sconv_cache.stride(0),
+              sconv_cache.stride(1),
+              sconv_cache.stride(2)};
+          launch_ar_scattered_cache_update<scalar_t>(queue, update_params, sconv_event);
+        }
+        return {out, scratch};
+      });
+  return {out, scratch};
 }

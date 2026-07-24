@@ -1,18 +1,13 @@
 #pragma once
+#include <oneapi/dpl/internal/random_impl/philox_engine.h>
+
 #include <array>
 #include <cstdint>
-
-// Include only the Philox engine header, not the <oneapi/dpl/random> umbrella:
-// the umbrella pulls in distribution headers (normal/extreme_value/...) that do
-// not compile under the SYCL host pass here. We only need the engine.
-#include <oneapi/dpl/internal/random_impl/philox_engine.h>
 
 namespace sgl::random {
 
 // One uniform in [0, 1) for a stream keyed by (subsequence, round), seeded from
 // the (seed, offset) pair produced by the torch generator's philox engine.
-// Distinct (subsequence, round) counters give independent draws, matching the
-// flashinfer approach of one Philox stream per request.
 // source:
 // https://www.intel.com/content/www/us/en/docs/onedpl/developer-guide/2022-13-0/random-number-generators.html#PREDEFINED-RANDOM-NUMBER-ENGINES
 inline float philox_uniform(uint64_t seed, uint64_t offset, uint32_t subsequence, uint32_t round) {

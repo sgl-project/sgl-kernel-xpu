@@ -60,9 +60,10 @@ struct ToSyclElementType<at::BFloat16> {
 //----------------- min-p rejection sampling --------------------//
 // One work-group processes one request row.
 
-template <typename DType, uint32_t VEC_SIZE>
+template <typename DType, uint32_t VEC_SIZE, bool DETERMINISTIC>
 struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr uint32_t kWgSize = 1024;
+  static constexpr uint32_t kNumWarps = kWgSize / 32;
 
   const DType* probs;
   int32_t* output;
@@ -76,10 +77,12 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
   sycl::local_accessor<int32_t, 1> sampled_id_;
   sycl::local_accessor<int32_t, 1> last_valid_id_;
+  sycl::local_accessor<float, 1> smem_prefix_sum_;
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
     sampled_id_ = sycl::local_accessor<int32_t, 1>(sycl::range<1>(1), cgh);
     last_valid_id_ = sycl::local_accessor<int32_t, 1>(sycl::range<1>(1), cgh);
+    smem_prefix_sum_ = sycl::local_accessor<float, 1>(sycl::range<1>(kNumWarps), cgh);
   }
 
   MinPSamplingKernel(
@@ -156,8 +159,9 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
             sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(
                 probs + row_offset + (i * kWgSize + tx) * VEC_SIZE));
       }
-      sgl::sampling::device_sampling_from_prob<DType, VEC_SIZE, kWgSize>(
-          item, i, d, [pivot](float x) { return x >= pivot; }, u, v, aggregate, sampled_id_, last_valid_id_);
+      auto pred = [pivot](float x) { return x >= pivot; };
+      sgl::sampling::device_sampling_from_prob<DType, VEC_SIZE, kWgSize, DETERMINISTIC>(
+          item, i, d, pred, u, v, aggregate, sampled_id_, last_valid_id_, smem_prefix_sum_);
       if (aggregate > u) {
         break;
       }
@@ -184,6 +188,7 @@ void launch_min_p_sampling(
     int vocab_size,
     uint64_t philox_seed,
     uint64_t philox_offset,
+    bool deterministic,
     sycl::queue& queue) {
   using KernelDType = typename ToSyclElementType<TensorDType>::type;
 
@@ -195,17 +200,25 @@ void launch_min_p_sampling(
   const uint32_t vec_size = std::gcd(16 / sizeof(KernelDType), vocab_size);
 
   DISPATCH_MINP_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto kernel = MinPSamplingKernel<KernelDType, VEC_SIZE>(
-        probs_ptr,
-        output,
-        maybe_indices,
-        maybe_min_p_arr,
-        min_p_val,
-        batch_size,
-        vocab_size,
-        philox_seed,
-        philox_offset);
-    sycl_kernel_submit(global_size, local_size, queue, kernel);
+    auto submit = [&](auto deterministic_tag) {
+      constexpr bool DETERMINISTIC = decltype(deterministic_tag)::value;
+      auto kernel = MinPSamplingKernel<KernelDType, VEC_SIZE, DETERMINISTIC>(
+          probs_ptr,
+          output,
+          maybe_indices,
+          maybe_min_p_arr,
+          min_p_val,
+          batch_size,
+          vocab_size,
+          philox_seed,
+          philox_offset);
+      sycl_kernel_submit(global_size, local_size, queue, kernel);
+    };
+    if (deterministic) {
+      submit(std::true_type{});
+    } else {
+      submit(std::false_type{});
+    }
   });
 }
 
@@ -271,6 +284,7 @@ void min_p_sampling_from_probs(
         vocab_size,
         philox_seed,
         philox_offset,
+        deterministic,
         queue);
   } else if (dtype == torch::kHalf) {
     launch_min_p_sampling<at::Half>(
@@ -283,6 +297,7 @@ void min_p_sampling_from_probs(
         vocab_size,
         philox_seed,
         philox_offset,
+        deterministic,
         queue);
   } else if (dtype == torch::kBFloat16) {
     launch_min_p_sampling<at::BFloat16>(
@@ -295,6 +310,7 @@ void min_p_sampling_from_probs(
         vocab_size,
         philox_seed,
         philox_offset,
+        deterministic,
         queue);
   }
 }

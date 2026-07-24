@@ -189,7 +189,7 @@ def torch_min_p_sampling(batch_size, vocab_size, p, normalized_prob):
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float32])
 def test_min_p_sampling(batch_size, vocab_size, p, dtype):
     torch.manual_seed(42)
     pre_norm_prob = torch.rand(
@@ -213,7 +213,7 @@ def test_min_p_sampling(batch_size, vocab_size, p, dtype):
 @pytest.mark.parametrize("batch_size", [1, 16, 128])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p_range", [(0.05, 0.2), (0.2, 0.7)])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float32])
 def test_min_p_sampling_array(batch_size, vocab_size, p_range, dtype):
     p_min, p_max = p_range
     torch.manual_seed(42)

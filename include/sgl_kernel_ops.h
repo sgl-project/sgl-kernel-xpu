@@ -583,6 +583,31 @@ at::Tensor inkling_hmlp_fold_timespace_to_depth(
     int64_t hw_fold);
 
 /*
+ * Inkling DFLASH helpers.
+ */
+std::tuple<at::Tensor, at::Tensor> inkling_dflash_cache_path(
+    const at::Tensor& req_to_token,
+    const at::Tensor& req_pool_indices,
+    const at::Tensor& pos2d,
+    const at::Tensor& mask,
+    const at::Tensor& out_offsets,
+    int64_t gather_count,
+    const at::Tensor& logits);
+std::tuple<at::Tensor, at::Tensor> inkling_dflash_device_guard(const at::Tensor& names);
+void inkling_scatter_mamba_states_after_mtp_verify(
+    at::Tensor& ssm_states,
+    const at::Tensor& ssm_intermediate,
+    at::Tensor& conv_a_states,
+    const at::Tensor& conv_a_intermediate,
+    at::Tensor& conv_b_states,
+    const at::Tensor& conv_b_intermediate,
+    const at::Tensor& slots,
+    const at::Tensor& steps,
+    const std::optional<at::Tensor>& track_slots,
+    const std::optional<at::Tensor>& track_steps,
+    int64_t t_max);
+
+/*
  * From csrc/gemm
  */
 torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros);

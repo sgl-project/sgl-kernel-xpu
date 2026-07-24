@@ -8,6 +8,7 @@ list(FILTER host_cpp EXCLUDE REGEX ".*/torch_extension_inkling_sconv\\.cc$")
 list(FILTER host_cpp EXCLUDE REGEX ".*/torch_extension_inkling_attn_prologue\\.cc$")
 list(FILTER host_cpp EXCLUDE REGEX ".*/torch_extension_inkling_moe_gate\\.cc$")
 list(FILTER host_cpp EXCLUDE REGEX ".*/torch_extension_inkling_relative_attention\\.cc$")
+list(FILTER host_cpp EXCLUDE REGEX ".*/torch_extension_inkling_mel_embedding\\.cc$")
 
 # BMG only
 set(device_cpp_xe20)

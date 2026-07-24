@@ -318,6 +318,44 @@ void inkling_save_intermediate_conv_windows(
     at::Tensor& intermediate_out,
     int64_t batch_size,
     int64_t draft_token_num);
+at::Tensor inkling_comm_all_reduce(
+    const at::Tensor& partials,
+    const std::optional<at::Tensor>& shared,
+    int64_t variant);
+std::tuple<at::Tensor, at::Tensor> inkling_ar_fused_decode(
+    const at::Tensor& partials,
+    const at::Tensor& residual,
+    at::Tensor& sconv_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& cache_mask,
+    const at::Tensor& weight,
+    const at::Tensor& norm_weight,
+    double eps,
+    bool silu_activation,
+    bool use_residual,
+    const std::optional<at::Tensor>& shared);
+std::tuple<at::Tensor, at::Tensor> inkling_ar_scattered_sconv(
+    const at::Tensor& partials,
+    at::Tensor& sconv_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& cache_mask,
+    const at::Tensor& cu,
+    const at::Tensor& si,
+    const at::Tensor& weight,
+    const at::Tensor& has_initial_state,
+    bool silu_activation,
+    bool use_residual,
+    const std::optional<at::Tensor>& shared,
+    bool update_cache);
+
+/*
+ * Inkling audio helpers.
+ */
+at::Tensor inkling_mel_embedding_sum(
+    const at::Tensor& features,
+    const at::Tensor& weight,
+    int64_t chunk_size,
+    int64_t channels_per_item);
 
 /*
  * Inkling fused attention prologue family.

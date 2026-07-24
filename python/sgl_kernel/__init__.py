@@ -111,6 +111,15 @@ from sgl_kernel.inkling_sconv import (
     track_conv_indices,
     update_sconv_cache,
 )
+from sgl_kernel.inkling_comm_ar_sconv import (
+    ALL_REDUCE_DIRECT,
+    ALL_REDUCE_FULL_ONESHOT,
+    ALL_REDUCE_PUSH_ONESHOT,
+    ALL_REDUCE_TWO_SHOT,
+    ar_fused_decode,
+    ar_scattered_sconv,
+    comm_all_reduce,
+)
 from sgl_kernel.lora import embedding_lora_a_fwd, sgemm_lora_a_fwd
 from sgl_kernel.mamba import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
 from sgl_kernel.memory import weak_ref_tensor

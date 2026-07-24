@@ -91,7 +91,9 @@ from sgl_kernel.inkling_moe_gate import (
     inkling_moe_gate_gemv_fused,
     inkling_moe_gate_topk_renorm,
 )
+from sgl_kernel.inkling_rel_proj import rel_proj_small_t
 from sgl_kernel.inkling_relative_attention import inkling_relative_attention
+from sgl_kernel.inkling_row_scale import row_compact_bf16, row_scale_bf16
 from sgl_kernel.inkling_sconv import (
     HIS_ONES,
     HIS_PREFIX,

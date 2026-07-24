@@ -109,6 +109,17 @@ void merge_state_v2(
 at::Tensor weak_ref_tensor(const at::Tensor& tensor);
 
 /*
+ * Inkling relative-attention helper kernels (XPU)
+ */
+at::Tensor inkling_row_scale_bf16(const at::Tensor& x, const at::Tensor& tau, const at::Tensor& out);
+at::Tensor inkling_row_compact_bf16(const at::Tensor& x, const at::Tensor& out);
+at::Tensor inkling_rel_proj_small_t(
+    const at::Tensor& r,
+    const at::Tensor& proj,
+    const std::optional<at::Tensor>& tau,
+    const at::Tensor& out);
+
+/*
  * From csrc/elementwise
  */
 namespace at::native::xpu {

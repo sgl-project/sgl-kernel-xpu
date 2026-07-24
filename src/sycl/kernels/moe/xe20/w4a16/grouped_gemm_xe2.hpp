@@ -30,6 +30,8 @@
  **************************************************************************************************/
 #pragma once
 
+#include <cute/util/compat.hpp>
+
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/gemm.h"
@@ -38,7 +40,6 @@
 #include "cutlass/kernel_hardware_info.hpp"
 #include "cutlass/platform/platform.h"
 #include "gemm_xe2.hpp"
-#include <cute/util/compat.hpp>
 
 #pragma clang diagnostic ignored "-Wpass-failed"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -50,11 +51,9 @@ template <typename T, char LayoutKind>
 CUTE_DEVICE auto make_moe_tensor(T* ptr, int r, int c) {
   auto shape = make_shape(r, c);
   if constexpr (LayoutKind == 'C')
-    return make_tensor(
-        make_gmem_ptr(ptr), make_layout(shape, make_stride(_1{}, r)));
+    return make_tensor(make_gmem_ptr(ptr), make_layout(shape, make_stride(_1{}, r)));
   else
-    return make_tensor(
-        make_gmem_ptr(ptr), make_layout(shape, make_stride(c, _1{})));
+    return make_tensor(make_gmem_ptr(ptr), make_layout(shape, make_stride(c, _1{})));
 }
 
 template <
@@ -87,10 +86,8 @@ CUTE_DEVICE void MoEGEMM(
     int32_t* atomic_buffer,
     const sycl::local_accessor<int32_t, 1>& slm_mem_const) {
   constexpr char actual_layout_of_B = LayoutKindB ^ ('R' ^ 'C');
-  static constexpr bool is_B_int4 = (std::is_same_v<ElementB, uint8_t>) &&
-                                    (!std::is_same_v<ElementS, uint8_t>);
-  static constexpr bool is_B_mxfp4 = (std::is_same_v<ElementB, uint8_t>) &&
-                                     (std::is_same_v<ElementS, uint8_t>);
+  static constexpr bool is_B_int4 = (std::is_same_v<ElementB, uint8_t>) && (!std::is_same_v<ElementS, uint8_t>);
+  static constexpr bool is_B_mxfp4 = (std::is_same_v<ElementB, uint8_t>) && (std::is_same_v<ElementS, uint8_t>);
   static constexpr bool is_B_4bits = std::is_same_v<ElementB, uint8_t>;
 
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -116,15 +113,12 @@ CUTE_DEVICE void MoEGEMM(
   int pre_rows = 0;
   int pre_tiles = 0;
 
-  int32_t* slm_mem = static_cast<int32_t*>(
-      slm_mem_const.template get_multi_ptr<sycl::access::decorated::no>()
-          .get());
+  int32_t* slm_mem = static_cast<int32_t*>(slm_mem_const.template get_multi_ptr<sycl::access::decorated::no>().get());
 
   for (int i = 0; i < num_experts; ++i) {
     int gemm_m = rows_per_expert[i];
     int cumsum_rows_for_experts = pre_rows + gemm_m;
-    int cumsum_tiles_for_experts =
-        (gemm_m + wg_tile_m - 1) / wg_tile_m + pre_tiles;
+    int cumsum_tiles_for_experts = (gemm_m + wg_tile_m - 1) / wg_tile_m + pre_tiles;
 
     if (group_m_id >= cumsum_tiles_for_experts) {
       pre_rows = cumsum_rows_for_experts;
@@ -133,24 +127,19 @@ CUTE_DEVICE void MoEGEMM(
     }
 
     int expert_id = i;
-    int64_t B_offset = static_cast<int64_t>(expert_id) *
-                       static_cast<int64_t>(gemm_n) *
-                       static_cast<int64_t>(gemm_k);
+    int64_t B_offset = static_cast<int64_t>(expert_id) * static_cast<int64_t>(gemm_n) * static_cast<int64_t>(gemm_k);
     if constexpr (is_B_4bits) {
       B_offset /= 2;
     }
-    ElementA* ptr_A_curr_batch =
-        const_cast<ElementA*>(Activations) + pre_rows * gemm_k;
+    ElementA* ptr_A_curr_batch = const_cast<ElementA*>(Activations) + pre_rows * gemm_k;
     ElementB* ptr_B_curr_batch = const_cast<ElementB*>(Weights) + B_offset;
     ElementD* ptr_D_curr_batch = Outputs + pre_rows * gemm_n;
     ElementS* ptr_Scales_curr_batch = const_cast<ElementS*>(Scales) + expert_id;
     ElementS* ptr_Zeros_curr_batch = nullptr;
     if constexpr (is_B_4bits) {
-      ptr_Scales_curr_batch =
-          const_cast<ElementS*>(Scales) + B_offset * 2 / group_size;
+      ptr_Scales_curr_batch = const_cast<ElementS*>(Scales) + B_offset * 2 / group_size;
       if constexpr (HasZero) {
-        ptr_Zeros_curr_batch =
-            const_cast<ElementS*>(Zeros) + B_offset * 2 / group_size;
+        ptr_Zeros_curr_batch = const_cast<ElementS*>(Zeros) + B_offset * 2 / group_size;
       }
     }
     ElementBI* ptr_Bias_curr_batch = nullptr;
@@ -158,8 +147,7 @@ CUTE_DEVICE void MoEGEMM(
       ptr_Bias_curr_batch = const_cast<ElementBI*>(Bias) + expert_id * gemm_n;
     }
 
-    auto A_tensor = make_moe_tensor<ElementA, LayoutKindA>(
-        ptr_A_curr_batch, gemm_m, gemm_k);
+    auto A_tensor = make_moe_tensor<ElementA, LayoutKindA>(ptr_A_curr_batch, gemm_m, gemm_k);
     auto B_tensor = [&]() {
       if constexpr (is_B_int4) {
         if constexpr (HasZero) {
@@ -173,12 +161,10 @@ CUTE_DEVICE void MoEGEMM(
         return make_moe_tensor<float_e2m1_t, actual_layout_of_B>(
             reinterpret_cast<float_e2m1_t*>(ptr_B_curr_batch), gemm_n, gemm_k);
       } else {
-        return make_moe_tensor<ElementB, actual_layout_of_B>(
-            ptr_B_curr_batch, gemm_n, gemm_k);
+        return make_moe_tensor<ElementB, actual_layout_of_B>(ptr_B_curr_batch, gemm_n, gemm_k);
       }
     }();
-    auto D_tensor = make_moe_tensor<ElementD, LayoutKindD>(
-      ptr_D_curr_batch, gemm_m, gemm_n);
+    auto D_tensor = make_moe_tensor<ElementD, LayoutKindD>(ptr_D_curr_batch, gemm_m, gemm_n);
 
     while (group_m_id < cumsum_tiles_for_experts) {
       int n_coord = (group_id * wg_tile_n) % gemm_n_pad / wg_tile_n;
@@ -188,13 +174,13 @@ CUTE_DEVICE void MoEGEMM(
       if constexpr (is_B_4bits) {
 #define XE_GEMM_4BITS_CALLER(GroupSize)                                              \
   xe_gemm_4bits<GmemTiledCopyA, GmemTiledCopyB, GmemTiledCopyD, GroupSize, HasZero>( \
-      A_tensor,                                                             \
-      B_tensor,                                                             \
-      ptr_Scales_curr_batch,                                                \
-      ptr_Zeros_curr_batch,                                                 \
-      ptr_Bias_curr_batch,                                                  \
-      D_tensor,                                                             \
-      tile_coord,                                                           \
+      A_tensor,                                                                      \
+      B_tensor,                                                                      \
+      ptr_Scales_curr_batch,                                                         \
+      ptr_Zeros_curr_batch,                                                          \
+      ptr_Bias_curr_batch,                                                           \
+      D_tensor,                                                                      \
+      tile_coord,                                                                    \
       mma);
         if (group_size == 32) {
           XE_GEMM_4BITS_CALLER(32)
@@ -208,13 +194,7 @@ CUTE_DEVICE void MoEGEMM(
 #undef XE_GEMM_4BITS_CALLER
       } else {
         xe_gemm<GmemTiledCopyA, GmemTiledCopyB, GmemTiledCopyD>(
-            A_tensor,
-            B_tensor,
-            ptr_Scales_curr_batch,
-            ptr_Bias_curr_batch,
-            D_tensor,
-            tile_coord,
-            mma);
+            A_tensor, B_tensor, ptr_Scales_curr_batch, ptr_Bias_curr_batch, D_tensor, tile_coord, mma);
       }
 
       if (local_id == 0) {

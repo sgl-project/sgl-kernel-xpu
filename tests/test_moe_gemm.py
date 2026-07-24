@@ -616,6 +616,7 @@ def test_moe_gemm_mxfp4_weights(
         torch_output, kernel_output.to("cpu"), rtol=rtol, atol=atol
     )
 
+
 # ---------------------------------------------------------------------------
 # MXFP4 expert-weight test — gpt-oss swiglu (ActType=2) + per-expert bias
 # ---------------------------------------------------------------------------

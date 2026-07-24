@@ -26,6 +26,7 @@ from mxfp4_utils import dequantize_mxfp4_2d  # noqa: E402
 from mxfp4_utils import quantize_mxfp4_2d  # noqa: E402
 from sgl_kernel import fused_experts  # noqa: E402
 
+
 def _torch_mxfp4_moe_reference(
     hidden_states,
     w1_packed,
@@ -40,9 +41,7 @@ def _torch_mxfp4_moe_reference(
     """Compute the reference while materializing only one expert at a time."""
     num_tokens, hidden = hidden_states.shape
     topk = topk_ids.shape[1]
-    routed_inputs = (
-        hidden_states[:, None, :].expand(-1, topk, -1).reshape(-1, hidden)
-    )
+    routed_inputs = hidden_states[:, None, :].expand(-1, topk, -1).reshape(-1, hidden)
     flat_ids = topk_ids.reshape(-1)
     routed_outputs = torch.zeros_like(routed_inputs)
 
@@ -58,9 +57,7 @@ def _torch_mxfp4_moe_reference(
         if swiglu_limit is not None:
             gate = gate.to(torch.bfloat16).clamp(max=swiglu_limit)
             up = up.to(torch.bfloat16).clamp(-swiglu_limit, swiglu_limit)
-            intermediate = (F.silu(gate.float()) * up.float()).to(
-                hidden_states.dtype
-            )
+            intermediate = (F.silu(gate.float()) * up.float()).to(hidden_states.dtype)
         else:
             intermediate = F.silu(gate) * up
 

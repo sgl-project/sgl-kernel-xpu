@@ -141,7 +141,9 @@ def _get_mxfp4_cpu_weights(num_experts: int, N: int, K: int):
     key = (num_experts, N, K)
     cached = _MXFP4_CPU_WEIGHT_CACHE.get(key)
     if cached is not None:
-        print(f"[weights] MXFP4 CPU cache hit: E={num_experts}, N={N}, K={K}", flush=True)
+        print(
+            f"[weights] MXFP4 CPU cache hit: E={num_experts}, N={N}, K={K}", flush=True
+        )
         return cached
     print(
         f"[weights] MXFP4 CPU cache miss; quantizing: "
@@ -160,7 +162,9 @@ INT4_GROUP_SIZE = 32
 CORRECTNESS_REL_TOL = 1e-2
 
 
-def _quantize_bf16_weights_int4_symmetric(num_experts: int, N: int, K: int, group_size: int):
+def _quantize_bf16_weights_int4_symmetric(
+    num_experts: int, N: int, K: int, group_size: int
+):
     """Draw + quantize per expert: -> ([E, N, K/2] int8 packed signed nibbles,
     [E, N, K/group_size] bf16 per-group scales).
 
@@ -236,9 +240,7 @@ def _quantize_bf16_weights_int4_vllm(num_experts: int, N: int, K: int, group_siz
         amax = w.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
         s = amax / 7.0
         # uint4 codes with zero-point 8: dequant = (code - 8) * scale.
-        codes = (
-            (torch.round(w / s).clamp_(-8, 7) + 8).to(torch.int32).reshape(N, K)
-        )
+        codes = (torch.round(w / s).clamp_(-8, 7) + 8).to(torch.int32).reshape(N, K)
         p_u8 = (codes[..., 0::2] | (codes[..., 1::2] << 4)).to(torch.uint8)
         packed[e].copy_(_vllm_implement_zp(p_u8))
         scales[e].copy_(s.reshape(N, num_groups).to(torch.bfloat16))
@@ -295,9 +297,7 @@ def _prepare_inputs(
         group_size = INT4_GROUP_SIZE
         is_int4 = True
     else:
-        packed_cpu, scales_cpu = _get_mxfp4_cpu_weights(
-            num_experts, gemm_n, gemm_k
-        )
+        packed_cpu, scales_cpu = _get_mxfp4_cpu_weights(num_experts, gemm_n, gemm_k)
         group_size = MXFP4_BLOCK_SIZE
         is_int4 = False
 
@@ -485,9 +485,7 @@ def benchmark(num_experts, avg_m, gemm_n, gemm_k, provider):
             num_experts * gemm_n * (gemm_k // 2 + (gemm_k // INT4_GROUP_SIZE) * 2)
         )
     else:
-        packed_bytes = (
-            num_experts * gemm_n * (gemm_k // 2 + gemm_k // MXFP4_BLOCK_SIZE)
-        )
+        packed_bytes = num_experts * gemm_n * (gemm_k // 2 + gemm_k // MXFP4_BLOCK_SIZE)
     weights_resident_bytes = packed_bytes
 
     tflops = flop / (ms / 1e3) / 1e12
@@ -506,9 +504,7 @@ def benchmark(num_experts, avg_m, gemm_n, gemm_k, provider):
             "ms_max": round(ms_max, 4),
             "tflops": round(tflops, 2),
             "b_gbps": round(b_gbps, 1),
-            "peak_extra_allocated_MB": round(
-                peak_extra_allocated / 1024 / 1024, 2
-            ),
+            "peak_extra_allocated_MB": round(peak_extra_allocated / 1024 / 1024, 2),
             "weights_resident_MB": round(weights_resident_bytes / 1024 / 1024, 2),
         }
     )
@@ -549,12 +545,12 @@ def _correctness_check(rel_tol=CORRECTNESS_REL_TOL):
             rel_l2_err = diff / denom
             if not math.isfinite(rel_l2_err) or rel_l2_err > rel_tol:
                 failures.append(
-                        f"E{num_experts}x{avg_m}x{n}x{k}/{recipe}: "
+                    f"E{num_experts}x{avg_m}x{n}x{k}/{recipe}: "
                     f"{rel_l2_err:.5g} exceeds {rel_tol}"
                 )
             rows.append(
                 {
-                        "shape": f"E{num_experts}x{avg_m}x{n}x{k}",
+                    "shape": f"E{num_experts}x{avg_m}x{n}x{k}",
                     "recipe": recipe,
                     "rel_l2_err": round(rel_l2_err, 5),
                 }

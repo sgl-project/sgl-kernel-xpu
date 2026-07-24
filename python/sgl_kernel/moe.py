@@ -357,14 +357,14 @@ def fused_experts(
         (int8, two E2M1 nibbles per byte) with corresponding uint8 E8M0
         block scales supplied via w1_scale and w2_scale.
         Routes through moe_grouped_mm_nt_xe20_w4a16, which dequantizes B
-        per-tile in registers and feeds BF16 × BF16 DPAS — no BF16 weight
-        tensor is ever materialized on device. Activations stay in BF16
-        (W4A16). Defaults to False.
+        per-tile in registers and feeds W4A16 DPAS with BF16 or FP16
+        activations — no dequantized weight tensor is materialized on device.
+        Defaults to False.
     - use_int4_w4a16 (bool): If True, w1 and w2 are in INT4 packed format
-        (int8, two 4-bit values per byte) with bfloat16 block scales
-        (direct multiplier) supplied via w1_scale and w2_scale. Zero-points
-        are optional and, if the checkpoint has them, must be supplied raw
-        (unfolded) via w1_zp/w2_zp -- see below. Shares the
+        (int8, two 4-bit values per byte) with BF16 or FP16 block scales
+        (direct multiplier) matching hidden_states.dtype, supplied via
+        w1_scale and w2_scale. Zero-points are optional and, if the checkpoint
+        has them, must be supplied raw (unfolded) via w1_zp/w2_zp -- see below. Shares the
         moe_grouped_mm_nt_xe20_w4a16 kernel with mxfp4. Mutually exclusive
         with use_mxfp4_w4a16. Defaults to False.
     - w1_scale (Optional[torch.Tensor]): Optional scale to be used for
@@ -373,8 +373,8 @@ def fused_experts(
         w2.
     - w1_zp (Optional[torch.Tensor]): Optional explicit per-group
         zero-point for w1, same [num_experts, output_channel,
-        hidden_dim // group_size] shape and bfloat16 dtype as w1_scale,
-        holding the raw zero-point in code units (i.e. weight dequants as
+        hidden_dim // group_size] shape and BF16 or FP16 dtype as w1_scale
+        (matching hidden_states.dtype), holding the raw zero-point in code units (i.e. weight dequants as
         `(code - zp) * scale`, not pre-folded into a signed 4-bit code).
         Only valid with use_int4_w4a16=True; None means the checkpoint has
         no zero-point (symmetric quantization).
@@ -455,24 +455,28 @@ def fused_experts(
                 and w2_scale.dtype == hidden_states.dtype
             ), "int4 scales dtype must match hidden_states dtype"
             if w1_zp is not None:
-                assert w1_zp.dtype == w1_scale.dtype and w1_zp.shape == w1_scale.shape, (
-                    "w1_zp must have the same dtype and shape as w1_scale"
-                )
+                assert (
+                    w1_zp.dtype == w1_scale.dtype and w1_zp.shape == w1_scale.shape
+                ), "w1_zp must have the same dtype and shape as w1_scale"
             if w2_zp is not None:
-                assert w2_zp.dtype == w2_scale.dtype and w2_zp.shape == w2_scale.shape, (
-                    "w2_zp must have the same dtype and shape as w2_scale"
-                )
+                assert (
+                    w2_zp.dtype == w2_scale.dtype and w2_zp.shape == w2_scale.shape
+                ), "w2_zp must have the same dtype and shape as w2_scale"
     else:
         assert w1_scale is None, "w1_scale is only supported for 4-bit W4A16 MoE"
         assert w2_scale is None, "w2_scale is only supported for 4-bit W4A16 MoE"
-        assert w1_zp is None and w2_zp is None, "w1_zp/w2_zp are only supported for 4-bit W4A16 MoE"
+        assert (
+            w1_zp is None and w2_zp is None
+        ), "w1_zp/w2_zp are only supported for 4-bit W4A16 MoE"
     # GPTQ desc_act/g_idx support: the caller sorts each expert's weight
     # K-dim by g_idx at weight-load time, and passes the corresponding
     # per-expert channel permutation here so the activation can be reordered
     # to match before the 4-bit GEMM. Only meaningful for int4 (mxfp4 weights
     # are never g_idx-permuted).
     if w1_g_idx_perm is not None or w2_g_idx_perm is not None:
-        assert use_int4_w4a16, "w1_g_idx_perm/w2_g_idx_perm only apply to use_int4_w4a16"
+        assert (
+            use_int4_w4a16
+        ), "w1_g_idx_perm/w2_g_idx_perm only apply to use_int4_w4a16"
     if b1 is not None:
         assert (
             b1.dtype == torch.bfloat16 or b1.dtype == torch.float32
@@ -596,9 +600,7 @@ def fused_experts(
             # below (see activation_type == 4 handling).
             assert (
                 use_4bit_w4a16
-            ), (
-                "swiglu_limit requires use_mxfp4_w4a16=True or use_int4_w4a16=True"
-            )
+            ), "swiglu_limit requires use_mxfp4_w4a16=True or use_int4_w4a16=True"
             activation_type = 4
             activation = "swiglu_deepseek_v4"
             # Carry the clamp threshold in gemm1_limit (the only limit slot).

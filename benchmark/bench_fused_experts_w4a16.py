@@ -144,9 +144,7 @@ def _build_int4_weights_per_expert(E: int, rows: int, cols: int, group_size: int
         )
         amax = w_e.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
         s_e = amax / 7.0
-        codes = (
-            torch.round(w_e / s_e).clamp_(-8, 7).to(torch.int16).reshape(rows, cols)
-        )
+        codes = torch.round(w_e / s_e).clamp_(-8, 7).to(torch.int16).reshape(rows, cols)
         nibbles = torch.bitwise_and(codes, 0xF)
         p_e = (nibbles[..., 0::2] | (nibbles[..., 1::2] << 4)).to(torch.uint8)
         packed[e].copy_(p_e.view(torch.int8))
@@ -200,8 +198,7 @@ def _build_weights(profile, recipe, backend):
     hidden = profile["hidden"]
     inter = profile["intermediate"]
     print(
-        f"[weights] quantizing {backend}/{recipe}: "
-        f"E={E}, H={hidden}, I={inter}",
+        f"[weights] quantizing {backend}/{recipe}: " f"E={E}, H={hidden}, I={inter}",
         flush=True,
     )
 
@@ -652,7 +649,9 @@ if __name__ == "__main__":
     if not VLLM_REF_AVAILABLE and any(
         provider.startswith("vllm_") for provider in providers
     ):
-        parser.error("a vLLM provider was requested but vllm_xpu_kernels is unavailable")
+        parser.error(
+            "a vLLM provider was requested but vllm_xpu_kernels is unavailable"
+        )
     providers = list(dict.fromkeys(providers))
 
     correctness_results = {}

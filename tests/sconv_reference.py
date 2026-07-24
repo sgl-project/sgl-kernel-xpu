@@ -154,6 +154,156 @@ def fused_decode_ref(
     return y, out_cache
 
 
+def _round_to_dtype(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return (
+        x.to(dtype).float()
+        if dtype in (torch.bfloat16, torch.float16)
+        else x.float()
+    )
+
+
+def comm_all_reduce_ref(partials, shared=None):
+    dtype = partials.dtype
+    partials_f = partials.detach().cpu().float()
+    if shared is not None:
+        folded = _round_to_dtype(partials_f + shared.detach().cpu().float(), dtype)
+    else:
+        folded = partials_f
+    reduced = _round_to_dtype(folded.sum(dim=0), dtype)
+    return reduced.unsqueeze(0).expand(partials.shape[0], *reduced.shape).contiguous()
+
+
+def ar_fused_decode_ref(
+    partials,
+    residual,
+    cache,
+    cache_indices,
+    cache_mask,
+    weight,
+    norm_weight,
+    *,
+    eps=1.0e-5,
+    activation=None,
+    use_residual=True,
+    shared=None,
+):
+    dtype = partials.dtype
+    xred = comm_all_reduce_ref(partials, shared=shared)[0]
+    xred = _round_to_dtype(xred, dtype)
+    residual_cpu = residual.detach().cpu().float()
+    weight_cpu = weight.detach().cpu().float()
+    norm_weight_cpu = norm_weight.detach().cpu().float()
+    cache_before = cache.detach().cpu().float()
+    out_cache = cache.detach().cpu().clone()
+    cache_indices = cache_indices.detach().cpu().int()
+    cache_mask = cache_mask.detach().cpu().reshape(-1).bool()
+    T, D = xred.shape
+    W = weight_cpu.shape[1]
+    residual_out_f = torch.empty((T, D), dtype=torch.float32)
+    residual_out = torch.empty((T, D), dtype=dtype)
+    hs_out = torch.empty((T, D), dtype=dtype)
+
+    for t in range(T):
+        slot = int(cache_indices[t])
+        valid = slot != -1
+        safe_slot = slot if valid else 0
+        mask = bool(valid and cache_mask[t])
+        ssq = 0.0
+        for d in range(D):
+            acc = 0.0
+            for iw in range(W - 1):
+                tap = float(cache_before[safe_slot, iw, d]) if mask else 0.0
+                acc += tap * float(weight_cpu[d, iw])
+            acc += float(xred[t, d]) * float(weight_cpu[d, W - 1])
+            val = torch.tensor(acc, dtype=torch.float32)
+            if activation in ("silu", "swish"):
+                val = silu(val)
+            if use_residual:
+                val = val + xred[t, d]
+            res = residual_cpu[t, d] + val
+            residual_out_f[t, d] = res
+            residual_out[t, d] = res.to(dtype)
+            ssq += float(res * res)
+        inv_rms = 1.0 / torch.sqrt(torch.tensor(ssq / D + eps, dtype=torch.float32))
+        hs_out[t] = (residual_out[t].float() * inv_rms * norm_weight_cpu).to(dtype)
+        if valid:
+            updated = torch.empty_like(out_cache[slot])
+            for iw in range(W - 1):
+                if iw < W - 2:
+                    updated[iw] = cache_before[slot, iw + 1] if mask else 0
+                else:
+                    updated[iw] = xred[t].to(dtype)
+            out_cache[slot] = updated
+    return hs_out.float(), residual_out.float(), out_cache, residual_out_f
+
+
+def ar_scattered_sconv_ref(
+    partials,
+    cache,
+    cache_indices,
+    cache_mask,
+    cu,
+    si,
+    weight,
+    has_initial_state,
+    *,
+    activation=None,
+    use_residual=True,
+    shared=None,
+    update_cache=True,
+):
+    dtype = partials.dtype
+    xred = comm_all_reduce_ref(partials, shared=shared)[0]
+    xred = _round_to_dtype(xred, dtype)
+    cache_before = cache.detach().cpu().float()
+    out_cache = cache.detach().cpu().clone()
+    cache_indices_cpu = cache_indices.detach().cpu().int()
+    cache_mask_cpu = cache_mask.detach().cpu().reshape(-1).bool()
+    cu_cpu = cu.detach().cpu().long()
+    si_cpu = si.detach().cpu().int()
+    weight_cpu = weight.detach().cpu().float()
+    T, D = xred.shape
+    W = weight_cpu.shape[1]
+    y = torch.empty((T, D), dtype=dtype)
+
+    for t in range(T):
+        seq = int(si_cpu[t])
+        bos = int(cu_cpu[seq])
+        slot = int(cache_indices_cpu[seq])
+        valid = slot != -1
+        safe_slot = slot if valid else 0
+        mask = bool(valid and cache_mask_cpu[seq])
+        for d in range(D):
+            acc = 0.0
+            for iw in range(W):
+                shifted = t - (W - 1) + iw
+                tap = 0.0
+                if shifted >= bos and shifted < T:
+                    tap = float(xred[shifted, d])
+                else:
+                    prefix_pos = shifted - bos + (W - 1)
+                    if shifted < bos and 0 <= prefix_pos < W - 1 and mask:
+                        tap = float(cache_before[safe_slot, prefix_pos, d])
+                acc += tap * float(weight_cpu[d, iw])
+            val = torch.tensor(acc, dtype=torch.float32)
+            if activation in ("silu", "swish"):
+                val = silu(val)
+            if use_residual:
+                val = val + xred[t, d]
+            y[t, d] = val.to(dtype)
+
+    out = y.unsqueeze(0).expand(partials.shape[0], *y.shape).contiguous().float()
+    if update_cache:
+        out_cache = update_cache_ref(
+            xred.to(dtype),
+            cache,
+            cache_indices,
+            has_initial_state,
+            cu.to(torch.int32),
+        )
+    return out, xred.float(), out_cache
+
+
 def gather_scatter_ref(hidden_states, cache, track_conv_indices, mask, dst_indices):
     out = cache.detach().cpu().clone()
     hidden = hidden_states.detach().cpu()

@@ -63,6 +63,21 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "inkling_save_intermediate_conv_windows(Tensor sconv_cache, Tensor hidden_states, Tensor cache_indices, "
       "Tensor(a!) intermediate_out, int batch_size, int draft_token_num) -> ()");
   m.impl("inkling_save_intermediate_conv_windows", torch::kXPU, &inkling_save_intermediate_conv_windows);
+
+  m.def("inkling_comm_all_reduce(Tensor partials, Tensor? shared=None, int variant=0) -> Tensor");
+  m.impl("inkling_comm_all_reduce", torch::kXPU, &inkling_comm_all_reduce);
+
+  m.def(
+      "inkling_ar_fused_decode(Tensor partials, Tensor residual, Tensor(a!) sconv_cache, "
+      "Tensor cache_indices, Tensor cache_mask, Tensor weight, Tensor norm_weight, float eps, "
+      "bool silu_activation, bool use_residual, Tensor? shared=None) -> (Tensor, Tensor)");
+  m.impl("inkling_ar_fused_decode", torch::kXPU, &inkling_ar_fused_decode);
+
+  m.def(
+      "inkling_ar_scattered_sconv(Tensor partials, Tensor(a!) sconv_cache, Tensor cache_indices, "
+      "Tensor cache_mask, Tensor cu, Tensor si, Tensor weight, Tensor has_initial_state, "
+      "bool silu_activation, bool use_residual, Tensor? shared=None, bool update_cache=True) -> (Tensor, Tensor)");
+  m.impl("inkling_ar_scattered_sconv", torch::kXPU, &inkling_ar_scattered_sconv);
 }
 
 REGISTER_EXTENSION(inkling_sconv_ops)

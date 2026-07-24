@@ -26,6 +26,11 @@ if is_xpu():
         is_icpx_available,
         load_jit_sycl,
     )
+    from .hisparse import (
+        load_cache_to_device_buffer_dsv4_mla,
+        load_cache_to_device_buffer_mla,
+        transfer_cache_dsv4_mla,
+    )
     from .moe_align_block_size import moe_align_block_size
     from .norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm, rmsnorm
     from .per_token_group_quant_8bit_v2 import per_token_group_quant_8bit_v2
@@ -52,6 +57,9 @@ if is_xpu():
         "apply_rope_inplace",
         "apply_rope_inplace_with_kvcache",
         "timestep_embedding",
+        "transfer_cache_dsv4_mla",
+        "load_cache_to_device_buffer_mla",
+        "load_cache_to_device_buffer_dsv4_mla",
     ]
 else:
     # Non-XPU environment - provide stubs

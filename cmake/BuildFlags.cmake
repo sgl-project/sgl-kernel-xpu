@@ -74,6 +74,10 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -ftemplate-backtrace-limit=0)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -fno-sycl-unnamed-lambda)
+  # ATen/torch headers included in device-compiled FMHA runners require C++20.
+  # -sycl-std sets the SYCL spec version, not the C++ language standard, so the
+  # C++ standard must be set explicitly to match SYCL_HOST_FLAGS (-std=c++20).
+  set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -std=c++20)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -sycl-std=2020)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -fhonor-nans)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -fhonor-infinities)

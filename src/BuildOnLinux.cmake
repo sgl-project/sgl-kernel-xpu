@@ -44,9 +44,10 @@ foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
   get_filename_component(name ${sycl_src} NAME_WLE REALPATH)
   set(sycl_lib sgl-ops-sycl-${name})
   set(_saved_SYCL_HOST_COMPILER "${SYCL_HOST_COMPILER}")
-  if(name STREQUAL "InklingRelativeHelpers")
+  if(name STREQUAL "InklingRelativeHelpers"
+      OR name STREQUAL "HmlpFoldTimespaceToDepth")
     if(NOT SGL_SYCL_ESIMD_HOST_COMPILER)
-      message(FATAL_ERROR "InklingRelativeHelpers uses ESIMD and requires icpx as the SYCL host compiler")
+      message(FATAL_ERROR "${name} uses ESIMD and requires icpx as the SYCL host compiler")
     endif()
     set(SYCL_HOST_COMPILER "${SGL_SYCL_ESIMD_HOST_COMPILER}")
   endif()
@@ -55,7 +56,7 @@ foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
     ${SYCL_OFFLINE_COMPILER_FLAGS}
     ${COMMON_DEVICE_LINK_FLAGS}
     SHARED
-    SYCL_SOURCES ${sycl_src})
+      SYCL_SOURCES ${sycl_src})
   set(SYCL_HOST_COMPILER "${_saved_SYCL_HOST_COMPILER}")
   # Inkling kernels register through scoped extensions, so common_ops does not
   # need to load their SYCL libraries transitively.
@@ -63,7 +64,8 @@ foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
       AND NOT name STREQUAL "InklingAttnPrologue"
       AND NOT name STREQUAL "InklingMoEGate"
       AND NOT name STREQUAL "InklingRelativeAttention"
-      AND NOT name STREQUAL "MelEmbeddingSum")
+      AND NOT name STREQUAL "MelEmbeddingSum"
+      AND NOT name STREQUAL "HmlpFoldTimespaceToDepth")
     target_link_libraries(common_ops PUBLIC ${sycl_lib})
   endif()
   list(APPEND SGL_OPS_LIBRARIES ${sycl_lib})
@@ -80,6 +82,8 @@ foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
     list(APPEND sycl_install_args COMPONENT inkling_relative_attention)
   elseif(name STREQUAL "MelEmbeddingSum")
     list(APPEND sycl_install_args COMPONENT inkling_mel_embedding)
+  elseif(name STREQUAL "HmlpFoldTimespaceToDepth")
+    list(APPEND sycl_install_args COMPONENT inkling_hmlp_fold)
   endif()
   install(TARGETS ${sycl_lib} ${sycl_install_args})
   set_target_properties(${sycl_lib} PROPERTIES
@@ -179,6 +183,20 @@ if(TARGET sgl-ops-sycl-MelEmbeddingSum)
   )
   target_link_libraries(inkling_mel_embedding_ops PUBLIC sgl-ops-sycl-MelEmbeddingSum)
   list(APPEND SGL_OPS_LIBRARIES inkling_mel_embedding_ops)
+endif()
+
+if(TARGET sgl-ops-sycl-HmlpFoldTimespaceToDepth)
+  Python3_add_library(
+    inkling_hmlp_fold_ops
+    MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI
+    torch_extension_inkling_hmlp_fold.cc)
+  install(TARGETS inkling_hmlp_fold_ops LIBRARY DESTINATION sgl_kernel COMPONENT inkling_hmlp_fold)
+  set_target_properties(inkling_hmlp_fold_ops PROPERTIES
+    INSTALL_RPATH "$ORIGIN"
+    BUILD_WITH_INSTALL_RPATH TRUE
+  )
+  target_link_libraries(inkling_hmlp_fold_ops PUBLIC sgl-ops-sycl-HmlpFoldTimespaceToDepth)
+  list(APPEND SGL_OPS_LIBRARIES inkling_hmlp_fold_ops)
 endif()
 
 set(SYCL_LINK_LIBRARIES_KEYWORD)

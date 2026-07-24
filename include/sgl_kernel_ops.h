@@ -575,6 +575,14 @@ std::tuple<at::Tensor, at::Tensor> inkling_relative_attention(
     const std::optional<at::Tensor>& out);
 
 /*
+ * Inkling HMLP helpers.
+ */
+at::Tensor inkling_hmlp_fold_timespace_to_depth(
+    const at::Tensor& x,
+    int64_t t_fold,
+    int64_t hw_fold);
+
+/*
  * From csrc/gemm
  */
 torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros);

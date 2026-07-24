@@ -311,11 +311,11 @@ def _min_p_sampling_from_probs_internal(
     generator: Optional[torch.Generator],
 ) -> torch.Tensor:
     with probs.device as device:
-        probs = probs.float()
         maybe_min_p_arr = (
             maybe_min_p_arr.float() if maybe_min_p_arr is not None else None
         )
-        samples = torch.empty(probs.size(0), dtype=torch.int32, device=device)
+        batch_size = indices.size(0) if indices is not None else probs.size(0)
+        samples = torch.empty(batch_size, dtype=torch.int32, device=device)
         torch.ops.sgl_kernel.min_p_sampling_from_probs.default(
             probs,
             samples,

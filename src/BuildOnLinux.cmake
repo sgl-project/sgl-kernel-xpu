@@ -94,6 +94,20 @@ if(TARGET sgl-ops-sycl-InklingSconv)
   list(APPEND SGL_OPS_LIBRARIES inkling_sconv_ops)
 endif()
 
+if(TARGET sgl-ops-sycl-MelEmbeddingSum)
+  Python3_add_library(
+    inkling_mel_embedding_ops
+    MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI
+    torch_extension_inkling_mel_embedding.cc)
+  install(TARGETS inkling_mel_embedding_ops LIBRARY DESTINATION sgl_kernel COMPONENT inkling_mel_embedding)
+  set_target_properties(inkling_mel_embedding_ops PROPERTIES
+    INSTALL_RPATH "$ORIGIN"
+    BUILD_WITH_INSTALL_RPATH TRUE
+  )
+  target_link_libraries(inkling_mel_embedding_ops PUBLIC sgl-ops-sycl-MelEmbeddingSum)
+  list(APPEND SGL_OPS_LIBRARIES inkling_mel_embedding_ops)
+endif()
+
 set(SYCL_LINK_LIBRARIES_KEYWORD)
 
 foreach(lib ${SGL_OPS_LIBRARIES})

@@ -30,7 +30,7 @@ inline T divUp(T m, T n) {
   return (m + n - 1) / n;
 }
 
-// Sub-group reduction for sum
+// Sub-group reduction for sum.
 template <typename T>
 inline T subGroupReduceSum(T val, const sycl::sub_group& sg) {
   return sycl::reduce_over_group(sg, val, sycl::plus<T>());

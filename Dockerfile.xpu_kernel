@@ -4,7 +4,7 @@
 
 
 # Set default Ubuntu version to 24.04
-FROM intel/deep-learning-essentials:2025.3.2-0-devel-ubuntu24.04
+FROM intel/deep-learning-essentials:2026.0.0-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 

@@ -179,6 +179,10 @@ def fused_inplace_qknorm_rope(
         Whether to apply NeoX-style rotary layout.
     eps: float
         Epsilon for RMS normalization.
+    head_dim: int
+        Optional explicit head dimension. Defaults to ``q.size(-1)`` when set to 0.
+    rope_dim: int
+        Optional explicit rotary dimension. Defaults to ``cos_sin_cache.size(-1)`` when set to 0.
 
     Note
     ----

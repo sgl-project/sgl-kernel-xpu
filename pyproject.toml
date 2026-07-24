@@ -6,22 +6,24 @@ requires = [
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "sgl-kernel"
-version = "0.11.0"
-description = "Kernel Library for SGLang"
+name = "sglang-kernel-xpu"
+version = "0.1.0"
+description = "XPU Kernel Library for SGLang"
 readme = "README.md"
-requires-python = ">=3.9"
-license = { file = "LICENSE" }
+requires-python = ">=3.10"
+license-files = [
+    "LICENSE",
+    "THIRDPARTYNOTICES.txt"
+]
 classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: Apache Software License",
-  "Environment :: GPU"
 ]
 dependencies = []
 
 [project.urls]
-"Homepage" = "https://github.com/sgl-project/sglang/tree/main/sgl-kernel"
-"Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+"Homepage" = "https://github.com/sgl-project/sgl-kernel-xpu"
+"Bug Tracker" = "https://github.com/sgl-project/sgl-kernel-xpu/issues"
 
 [tool.wheel]
 exclude = [
@@ -34,6 +36,6 @@ cmake.build-type = "Release"
 build-dir = "build"
 minimum-version = "build-system.requires"
 
-wheel.py-api = "cp39"
+wheel.py-api = "cp310"
 wheel.license-files = []
 wheel.packages = ["python/sgl_kernel"]

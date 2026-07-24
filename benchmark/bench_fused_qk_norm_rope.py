@@ -459,7 +459,7 @@ def benchmark_cache(
     elif provider == "cache_fused":
 
         def fn() -> None:
-            sgl_kernel.fused_qk_norm_rope_with_cos_sin_cache_inplace(
+            sgl_kernel.fused_inplace_qknorm_rope(
                 q,
                 k,
                 q_weight,

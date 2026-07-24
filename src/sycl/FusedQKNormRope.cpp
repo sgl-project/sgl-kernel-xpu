@@ -30,7 +30,7 @@ inline T divUp(T m, T n) {
   return (m + n - 1) / n;
 }
 
-// Sub-group reduction for sum
+// Sub-group reduction for sum.
 template <typename T>
 inline T subGroupReduceSum(T val, const sycl::sub_group& sg) {
   return sycl::reduce_over_group(sg, val, sycl::plus<T>());
@@ -834,7 +834,7 @@ void launchFusedQKNormRopeCacheImpl(
   });
 }
 
-void fused_qk_norm_rope_with_cos_sin_cache_inplace(
+void fused_inplace_qknorm_rope(
     torch::Tensor& q,
     torch::Tensor& k,
     torch::Tensor& q_weight,
@@ -904,55 +904,52 @@ void fused_qk_norm_rope_with_cos_sin_cache_inplace(
 
   auto queue = dpcppGetCurrentQueue();
 
-  dispatchFusedQKNormRopeScalarType<false>(
-      q_view.scalar_type(), "fused_qk_norm_rope_with_cos_sin_cache_inplace", [&](auto scalar_tag) {
-        using scalar_t = typename decltype(scalar_tag)::type;
-        dispatchFusedQKNormRopePositionsType(
-            positions.scalar_type(), "fused_qk_norm_rope_with_cos_sin_cache_inplace", [&](auto id_tag) {
-              using IdType = typename decltype(id_tag)::type;
-              dispatchFusedQKNormRopeHeadDim(
-                  head_dim, "fused_qk_norm_rope_with_cos_sin_cache_inplace", [&](auto head_dim_tag) {
-                    constexpr int64_t kHeadDimConst = decltype(head_dim_tag)::value;
-                    if (is_neox) {
-                      launchFusedQKNormRopeCacheImpl<kHeadDimConst, true, scalar_t, IdType>(
-                          static_cast<scalar_t*>(q_view.data_ptr()),
-                          static_cast<scalar_t*>(k_view.data_ptr()),
-                          static_cast<const scalar_t*>(q_weight.data_ptr()),
-                          static_cast<const scalar_t*>(k_weight.data_ptr()),
-                          static_cast<const float*>(cos_sin_cache.data_ptr()),
-                          static_cast<const IdType*>(positions.data_ptr()),
-                          q_view.stride(0),
-                          k_view.stride(0),
-                          q_head_stride,
-                          k_head_stride,
-                          num_tokens,
-                          num_qo_heads,
-                          num_kv_heads,
-                          rope_dim,
-                          static_cast<float>(eps),
-                          queue);
-                    } else {
-                      launchFusedQKNormRopeCacheImpl<kHeadDimConst, false, scalar_t, IdType>(
-                          static_cast<scalar_t*>(q_view.data_ptr()),
-                          static_cast<scalar_t*>(k_view.data_ptr()),
-                          static_cast<const scalar_t*>(q_weight.data_ptr()),
-                          static_cast<const scalar_t*>(k_weight.data_ptr()),
-                          static_cast<const float*>(cos_sin_cache.data_ptr()),
-                          static_cast<const IdType*>(positions.data_ptr()),
-                          q_view.stride(0),
-                          k_view.stride(0),
-                          q_head_stride,
-                          k_head_stride,
-                          num_tokens,
-                          num_qo_heads,
-                          num_kv_heads,
-                          rope_dim,
-                          static_cast<float>(eps),
-                          queue);
-                    }
-                  });
-            });
+  dispatchFusedQKNormRopeScalarType<false>(q_view.scalar_type(), "fused_inplace_qknorm_rope", [&](auto scalar_tag) {
+    using scalar_t = typename decltype(scalar_tag)::type;
+    dispatchFusedQKNormRopePositionsType(positions.scalar_type(), "fused_inplace_qknorm_rope", [&](auto id_tag) {
+      using IdType = typename decltype(id_tag)::type;
+      dispatchFusedQKNormRopeHeadDim(head_dim, "fused_inplace_qknorm_rope", [&](auto head_dim_tag) {
+        constexpr int64_t kHeadDimConst = decltype(head_dim_tag)::value;
+        if (is_neox) {
+          launchFusedQKNormRopeCacheImpl<kHeadDimConst, true, scalar_t, IdType>(
+              static_cast<scalar_t*>(q_view.data_ptr()),
+              static_cast<scalar_t*>(k_view.data_ptr()),
+              static_cast<const scalar_t*>(q_weight.data_ptr()),
+              static_cast<const scalar_t*>(k_weight.data_ptr()),
+              static_cast<const float*>(cos_sin_cache.data_ptr()),
+              static_cast<const IdType*>(positions.data_ptr()),
+              q_view.stride(0),
+              k_view.stride(0),
+              q_head_stride,
+              k_head_stride,
+              num_tokens,
+              num_qo_heads,
+              num_kv_heads,
+              rope_dim,
+              static_cast<float>(eps),
+              queue);
+        } else {
+          launchFusedQKNormRopeCacheImpl<kHeadDimConst, false, scalar_t, IdType>(
+              static_cast<scalar_t*>(q_view.data_ptr()),
+              static_cast<scalar_t*>(k_view.data_ptr()),
+              static_cast<const scalar_t*>(q_weight.data_ptr()),
+              static_cast<const scalar_t*>(k_weight.data_ptr()),
+              static_cast<const float*>(cos_sin_cache.data_ptr()),
+              static_cast<const IdType*>(positions.data_ptr()),
+              q_view.stride(0),
+              k_view.stride(0),
+              q_head_stride,
+              k_head_stride,
+              num_tokens,
+              num_qo_heads,
+              num_kv_heads,
+              rope_dim,
+              static_cast<float>(eps),
+              queue);
+        }
       });
+    });
+  });
 }
 
 }  // namespace at::native::xpu

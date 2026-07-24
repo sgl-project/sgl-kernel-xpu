@@ -28,19 +28,37 @@ else()
       "but got ${SYCL_COMPILER_VERSION}")
 endif()
 
+get_filename_component(SGL_SYCL_COMPILER_DIR "${SYCL_EXECUTABLE}" DIRECTORY)
+find_program(SGL_SYCL_ESIMD_HOST_COMPILER
+  NAMES icpx
+  HINTS "${SGL_SYCL_COMPILER_DIR}"
+  NO_DEFAULT_PATH)
+if(NOT SGL_SYCL_ESIMD_HOST_COMPILER)
+  find_program(SGL_SYCL_ESIMD_HOST_COMPILER NAMES icpx)
+endif()
+
 # common kernels
 foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
   get_filename_component(name ${sycl_src} NAME_WLE REALPATH)
   set(sycl_lib sgl-ops-sycl-${name})
+  set(_saved_SYCL_HOST_COMPILER "${SYCL_HOST_COMPILER}")
+  if(name STREQUAL "HmlpFoldTimespaceToDepth")
+    if(NOT SGL_SYCL_ESIMD_HOST_COMPILER)
+      message(FATAL_ERROR "HmlpFoldTimespaceToDepth uses ESIMD and requires icpx as the SYCL host compiler")
+    endif()
+    set(SYCL_HOST_COMPILER "${SGL_SYCL_ESIMD_HOST_COMPILER}")
+  endif()
   sycl_add_library(
     ${sycl_lib}
     ${SYCL_OFFLINE_COMPILER_FLAGS}
     ${COMMON_DEVICE_LINK_FLAGS}
     SHARED
     SYCL_SOURCES ${sycl_src})
-  # Inkling registers through inkling_sconv_ops, so common_ops does not need
-  # to load its SYCL library as a transitive dependency.
-  if(NOT name STREQUAL "InklingSconv")
+  set(SYCL_HOST_COMPILER "${_saved_SYCL_HOST_COMPILER}")
+  # Inkling registers through scoped extensions, so common_ops does not need
+  # to load those SYCL libraries as transitive dependencies.
+  if(NOT name STREQUAL "InklingSconv"
+      AND NOT name STREQUAL "HmlpFoldTimespaceToDepth")
     target_link_libraries(common_ops PUBLIC ${sycl_lib})
   endif()
   list(APPEND SGL_OPS_LIBRARIES ${sycl_lib})
@@ -49,6 +67,8 @@ foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
   set(sycl_install_args LIBRARY DESTINATION sgl_kernel)
   if(name STREQUAL "InklingSconv")
     list(APPEND sycl_install_args COMPONENT inkling_sconv)
+  elseif(name STREQUAL "HmlpFoldTimespaceToDepth")
+    list(APPEND sycl_install_args COMPONENT inkling_hmlp_fold)
   endif()
   install(TARGETS ${sycl_lib} ${sycl_install_args})
   set_target_properties(${sycl_lib} PROPERTIES
@@ -92,6 +112,20 @@ if(TARGET sgl-ops-sycl-InklingSconv)
   )
   target_link_libraries(inkling_sconv_ops PUBLIC sgl-ops-sycl-InklingSconv)
   list(APPEND SGL_OPS_LIBRARIES inkling_sconv_ops)
+endif()
+
+if(TARGET sgl-ops-sycl-HmlpFoldTimespaceToDepth)
+  Python3_add_library(
+    inkling_hmlp_fold_ops
+    MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI
+    torch_extension_inkling_hmlp_fold.cc)
+  install(TARGETS inkling_hmlp_fold_ops LIBRARY DESTINATION sgl_kernel COMPONENT inkling_hmlp_fold)
+  set_target_properties(inkling_hmlp_fold_ops PROPERTIES
+    INSTALL_RPATH "$ORIGIN"
+    BUILD_WITH_INSTALL_RPATH TRUE
+  )
+  target_link_libraries(inkling_hmlp_fold_ops PUBLIC sgl-ops-sycl-HmlpFoldTimespaceToDepth)
+  list(APPEND SGL_OPS_LIBRARIES inkling_hmlp_fold_ops)
 endif()
 
 set(SYCL_LINK_LIBRARIES_KEYWORD)

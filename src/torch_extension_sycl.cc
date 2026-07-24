@@ -225,12 +225,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "float factor, float low, float high, float attention_factor, int rotary_dim) -> ()");
   m.impl("fused_qk_norm_rope", torch::kXPU, &at::native::xpu::fused_qk_norm_rope);
   m.def(
-      "fused_qk_norm_rope_with_cos_sin_cache_inplace(Tensor! q, Tensor! k, Tensor q_weight, Tensor k_weight, "
+      "fused_inplace_qknorm_rope(Tensor! q, Tensor! k, Tensor q_weight, Tensor k_weight, "
       "Tensor cos_sin_cache, Tensor positions, bool is_neox, float eps) -> ()");
-  m.impl(
-      "fused_qk_norm_rope_with_cos_sin_cache_inplace",
-      torch::kXPU,
-      &at::native::xpu::fused_qk_norm_rope_with_cos_sin_cache_inplace);
+  m.impl("fused_inplace_qknorm_rope", torch::kXPU, &at::native::xpu::fused_inplace_qknorm_rope);
   /*
    * Fused QK RoPE (no RMS_Norm)
    */

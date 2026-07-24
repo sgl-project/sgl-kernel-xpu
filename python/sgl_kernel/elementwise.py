@@ -140,7 +140,7 @@ def gemma_fused_add_rmsnorm(
     torch.ops.sgl_kernel.gemma_fused_add_rmsnorm(input, residual, weight, eps)
 
 
-def fused_qk_norm_rope_with_cos_sin_cache_inplace(
+def fused_inplace_qknorm_rope(
     q: torch.Tensor,
     k: torch.Tensor,
     q_weight: torch.Tensor,
@@ -182,7 +182,7 @@ def fused_qk_norm_rope_with_cos_sin_cache_inplace(
     ----
     This is an in-place operation that modifies ``q`` and ``k`` directly.
     """
-    torch.ops.sgl_kernel.fused_qk_norm_rope_with_cos_sin_cache_inplace(
+    torch.ops.sgl_kernel.fused_inplace_qknorm_rope(
         q, k, q_weight, k_weight, cos_sin_cache, positions, is_neox, eps
     )
 

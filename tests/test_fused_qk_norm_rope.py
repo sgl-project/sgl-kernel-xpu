@@ -609,7 +609,7 @@ def test_fused_qk_norm_rope_with_cache(
 
     q_test = q.clone()
     k_test = k.clone()
-    sgl_kernel.fused_qk_norm_rope_with_cos_sin_cache_inplace(
+    sgl_kernel.fused_inplace_qknorm_rope(
         q_test,
         k_test,
         q_weight,
@@ -710,7 +710,7 @@ def test_fused_qk_norm_rope_with_cache_last_dim_strided(
         is_neox,
     )
 
-    sgl_kernel.fused_qk_norm_rope_with_cos_sin_cache_inplace(
+    sgl_kernel.fused_inplace_qknorm_rope(
         q,
         k,
         q_weight,

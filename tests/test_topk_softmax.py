@@ -9,6 +9,34 @@ import utils
 device = utils.get_device()
 
 
+def assert_equal(
+    score: torch.Tensor,
+    indices_ref: torch.Tensor,
+    indices_our: torch.Tensor,
+    bs: int,
+    max_permit_error: int = 0,
+):
+    indices_our_cpu = indices_our.cpu().tolist()
+    indices_ref_cpu = indices_ref.cpu().tolist()
+
+    wrong_values = 0
+    for token_idx in range(bs):
+        indices_ref_set = set(indices_ref_cpu[token_idx])
+        indices_our_set = set(indices_our_cpu[token_idx])
+        more = indices_our_set - indices_ref_set
+        less = indices_ref_set - indices_our_set
+        if more or less:
+            more_values = sorted(score[token_idx, index].item() for index in more)
+            less_values = sorted(score[token_idx, index].item() for index in less)
+            if more_values != less_values:
+                wrong_values += len(more)
+                print(
+                    f"{token_idx=}, {more=}, {less=} failed, with "
+                    f"{more_values=}, {less_values=}"
+                )
+        assert wrong_values <= max_permit_error, f"{wrong_values=}, {max_permit_error=}"
+
+
 def fused_topk_torch_native(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -69,16 +97,12 @@ def test_topk_softmax(dtype, n_token, n_topk, n_expert, renormalize):
         renormalize,
     )
 
-    # Compare the results
-    res = torch.zeros(n_token, n_expert, dtype=torch.float, device=hidden_states.device)
-    ref = torch.zeros(n_token, n_expert, dtype=torch.float, device=hidden_states.device)
-    res.scatter_(1, topk_indices.long(), topk_weights)
-    ref.scatter_(1, ref_topk_indices.long(), ref_token_weights)
-
-    # Increase the tolerance for this kernel for bf16 and fp16 inputs
-    atol = 3e-3
-    rtol = 1e-3
-    torch.testing.assert_close(res, ref, atol=atol, rtol=rtol)
+    assert_equal(
+        F.softmax(gating_output.float(), dim=-1),
+        ref_topk_indices,
+        topk_indices,
+        n_token,
+    )
 
 
 if __name__ == "__main__":

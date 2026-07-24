@@ -608,6 +608,17 @@ void inkling_scatter_mamba_states_after_mtp_verify(
     int64_t t_max);
 
 /*
+ * Inkling quantization helpers.
+ */
+std::tuple<at::Tensor, at::Tensor> inkling_mxfp4_mapping(
+    const at::Tensor& x,
+    bool column_major_scales,
+    double eps);
+std::tuple<at::Tensor, at::Tensor> inkling_nvfp4_layout(
+    const at::Tensor& x,
+    double global_scale);
+
+/*
  * From csrc/gemm
  */
 torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros);

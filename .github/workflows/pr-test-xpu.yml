@@ -43,7 +43,7 @@ jobs:
         run: |
           docker exec -e PR_MERGE_REF="${PR_MERGE_REF}" ci_sglkernel_xpu \
             /bin/bash -c '\
-              set -euxo pipefail && \
+              set -exo pipefail && \
               . /miniforge3/bin/activate && \
               conda activate py3.10 && \
               cd /root/sglang/sgl-kernel-xpu && \

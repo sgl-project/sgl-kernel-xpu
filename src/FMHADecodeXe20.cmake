@@ -8,10 +8,12 @@
 #   2. KV-cache dtype: 16-bit (bf16) vs fp8 (e4m3/e5m2) -> separate TUs.
 # The paged and non-paged KV paths support INDEPENDENT sets of head dimensions.
 # Non-paged decode supports 16-bit KV only (no fp8 KV cache, no split-KV).
-set(FMHA_DECODE_QG_SIZES 1 2 4 8 16)
-set(FMHA_DECODE_PAGED_HEAD_DIMS 64 96 128 192 256 512)
-set(FMHA_DECODE_NP_HEAD_DIMS 64 72 80 96 128 192)
-set(FMHA_DECODE_PAGE_SIZES 64 128)
+set(FMHA_DECODE_QG_SIZES 1 2 4 8 16 CACHE STRING "FMHA decode query-group sizes to instantiate")
+set(FMHA_DECODE_PAGED_HEAD_DIMS 64 96 128 192 256 512 CACHE STRING
+    "FMHA paged decode head dimensions to instantiate")
+set(FMHA_DECODE_NP_HEAD_DIMS 64 72 80 96 128 192 CACHE STRING
+    "FMHA non-paged decode head dimensions to instantiate")
+set(FMHA_DECODE_PAGE_SIZES 64 128 CACHE STRING "FMHA paged decode page sizes to instantiate")
 
 # Per-HEAD_DIM KV-tile size for the NON-PAGED (contiguous ragged) decode path.
 # The paged decode kernel uses PAGE_SIZE as its KV tile; the non-paged path has

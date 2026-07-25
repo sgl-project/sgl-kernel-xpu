@@ -8,8 +8,10 @@
 #   2. KV-cache dtype: 16-bit (bf16) vs fp8 (e4m3/e5m2) -> separate TUs.
 # The paged and non-paged KV paths support INDEPENDENT sets of head dimensions.
 # Non-paged prefill supports 16-bit KV only (no fp8 KV cache).
-set(FMHA_PREFILL_PAGED_HEAD_DIMS 64 96 128 192 256 512)
-set(FMHA_PREFILL_NP_HEAD_DIMS 64 72 80 96 128 192)
+set(FMHA_PREFILL_PAGED_HEAD_DIMS 64 96 128 192 256 512 CACHE STRING
+    "FMHA paged prefill head dimensions to instantiate")
+set(FMHA_PREFILL_NP_HEAD_DIMS 64 72 80 96 128 192 CACHE STRING
+    "FMHA non-paged prefill head dimensions to instantiate")
 
 # Paged prefill (FmhaPrefillRunner) and non-paged prefill (FmhaPrefillNpRunner).
 set(FMHA_PREFILL_TEMPLATE
@@ -48,7 +50,8 @@ set(FMHA_PREFILL_NUM_SG_256 32)
 set(FMHA_PREFILL_TILED_Q_512 256)
 set(FMHA_PREFILL_TILED_KV_512 64)
 set(FMHA_PREFILL_NUM_SG_512 32)
-set(FMHA_PREFILL_TILED_OUT_512 256)
+set(FMHA_PREFILL_TILED_OUT_512 256 CACHE STRING
+    "Paged prefill output tile head extent for HEAD_DIM=512")
 
 # Per-HEAD_DIM tile shape parameters for the NON-PAGED (contiguous ragged) KV
 # path (TILED_Q_NP, TILED_KV_NP, NUM_SG_NP). These are kept as a separate set so

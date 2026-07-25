@@ -1,0 +1,121 @@
+name: Nightly Test (XPU Kernel)
+
+# Runs against the nightly Docker image published by
+# release-docker-xpu-kernel-nightly.yml. The image already contains an
+# installed sgl-kernel wheel, so this workflow does NOT rebuild the
+# kernel from source — it exercises exactly what was shipped.
+#
+# Mirrors the structure of sglang/.github/workflows/nightly-test-intel.yml:
+#   - Cron + workflow_dispatch + workflow_call triggers
+#   - One GPU-count job per matrix entry (placeholder: 1-gpu only)
+#   - check-all-jobs aggregator so a single failure fails the workflow
+
+on:
+  schedule:
+    # A few hours after the nightly image publish (12:00 UTC).
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+    inputs:
+      continue_on_error:
+        description: 'Continue on error (do not fail the workflow on test failures)'
+        required: false
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      ref:
+        description: "Branch, tag or SHA to checkout"
+        required: false
+        type: string
+        default: ""
+      continue_on_error:
+        description: 'Continue on error (do not fail the workflow on test failures)'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: nightly-xpu-kernel-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
+
+jobs:
+  nightly-xpu-1-gpu:
+    if: github.repository == 'sgl-project/sgl-kernel-xpu'
+    runs-on: sglang-bmg
+    env:
+      DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
+      DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Pull nightly Docker image
+        run: |
+          docker pull intel/sgl-kernel-xpu-dev:latest
+
+      - name: Run container
+        run: |
+          docker run -dt \
+            --device /dev/dri/ \
+            --name nightly_sglkernel_xpu \
+            -e HF_TOKEN=$(cat ~/huggingface_token.txt) \
+            intel/sgl-kernel-xpu-dev:latest
+
+      - name: Install run_suite extras + HF login
+        timeout-minutes: 20
+        run: |
+          docker exec nightly_sglkernel_xpu /miniforge3/envs/py3.10/bin/python3 -m pip install --upgrade pip
+          docker exec nightly_sglkernel_xpu /miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub scipy tabulate
+          docker exec nightly_sglkernel_xpu /bin/bash -c '/miniforge3/envs/py3.10/bin/hf auth login --token ${HF_TOKEN}'
+          docker exec nightly_sglkernel_xpu /bin/bash -c "ln -sf /miniforge3/envs/py3.10/bin/python3 /usr/bin/python3"
+
+      - name: Verify pre-installed sgl-kernel wheel
+        run: |
+          docker exec nightly_sglkernel_xpu /miniforge3/envs/py3.10/bin/python3 -c \
+            "import sgl_kernel; print('sgl_kernel loaded from', sgl_kernel.__file__)"
+
+      - name: Nightly Test (1-GPU XPU Kernel)
+        timeout-minutes: 240
+        run: |
+          docker exec -w /root/sglang/sgl-kernel-xpu/tests nightly_sglkernel_xpu \
+            /miniforge3/envs/py3.10/bin/python3 run_suite.py \
+              --suite nightly-xpu \
+              --timeout-per-file 7200 \
+            || TEST_EXIT_CODE=$?
+          exit ${TEST_EXIT_CODE:-0}
+        # continue_on_error semantics: schedule/workflow_dispatch swallow
+        # failures per the input flag; workflow_call runs propagate as-is.
+        continue-on-error: ${{ github.event_name == 'schedule' || inputs.continue_on_error == true }}
+
+      # ------------------------------------------------------------------
+      # Placeholder for future multi-GPU nightly suites. Add
+      # nightly-xpu-2-gpu / nightly-xpu-4-gpu jobs modeled on the sglang
+      # nightly-test-intel.yml pattern once the corresponding suites
+      # exist in tests/run_suite.py.
+      # ------------------------------------------------------------------
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f nightly_sglkernel_xpu || true
+
+  check-all-jobs:
+    if: always() && (github.repository == 'sgl-project/sgl-kernel-xpu' || github.event_name == 'workflow_dispatch')
+    needs:
+      - nightly-xpu-1-gpu
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if any job failed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "One or more nightly test jobs failed"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more nightly test jobs were cancelled"
+            exit 1
+          fi
+          echo "All nightly test jobs passed"

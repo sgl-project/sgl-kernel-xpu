@@ -50,6 +50,12 @@ jobs:
               git remote set-url origin https://github.com/sgl-project/sgl-kernel-xpu.git && \
               git fetch --depth=1 origin "${PR_MERGE_REF}" && \
               git checkout FETCH_HEAD && \
+              # Nuke the image-baked build/ tree so Ninja recompiles against
+              # the freshly checked-out source. Without this, C++/SYCL PRs
+              # get silently linked against the prebuilt .o files from the
+              # nightly image and the wheel that ships to tests contains
+              # the pre-PR kernel code.
+              rm -rf build && \
               pip uninstall -y sgl-kernel || true && \
               pip install --force-reinstall -v . && \
               python -c "import sgl_kernel; print(sgl_kernel.__file__)" \

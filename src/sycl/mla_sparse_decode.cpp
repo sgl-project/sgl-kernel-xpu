@@ -67,40 +67,79 @@ namespace {
     }                                                                            \
   } while (0)
 
+// Two-stage dispatch: pick the QK head dim D_QK (always 512 for decode) and the
+// head-block size B_H (analog of page size) for this h_q, then the dtype, then the
+// runtime attn_sink flag, and call the matching generated per-(ELEM, D_QK, B_H,
+// HAS_ATTN_SINK) launcher.
+#define DISPATCH_MLA_SPARSE_2STAGE_B_H_SINK(ELEM, D_QK, B_H, SINK)                     \
+  mla_sparse_decode::launch_mla_sparse_decode_2stage_##ELEM##_##D_QK##_##B_H##_##SINK( \
+      out,                                                                             \
+      lse_out,                                                                         \
+      q,                                                                               \
+      k_cache,                                                                         \
+      indices,                                                                         \
+      topk_length,                                                                     \
+      extra_k_cache,                                                                   \
+      extra_indices,                                                                   \
+      extra_topk_length,                                                               \
+      attn_sink,                                                                       \
+      sm_scale,                                                                        \
+      head_dim_v,                                                                      \
+      is_fp8_kvcache)
+
+// Resolve the runtime attn_sink flag to the compile-time 0/1 launcher variant.
+#define DISPATCH_MLA_SPARSE_2STAGE_B_H(ELEM, D_QK, B_H)        \
+  do {                                                         \
+    if (attn_sink.has_value()) {                               \
+      DISPATCH_MLA_SPARSE_2STAGE_B_H_SINK(ELEM, D_QK, B_H, 1); \
+    } else {                                                   \
+      DISPATCH_MLA_SPARSE_2STAGE_B_H_SINK(ELEM, D_QK, B_H, 0); \
+    }                                                          \
+  } while (0)
+
+// Resolve the head-block B_H for this h_q, threading through the compile-time D_QK.
+#define DISPATCH_MLA_SPARSE_B_H_D_QK(ELEM, D_QK)                          \
+  do {                                                                    \
+    switch (mla_sparse_decode::sparse_mla_decode_select_b_h(q.size(2))) { \
+      case 8:                                                             \
+        DISPATCH_MLA_SPARSE_2STAGE_B_H(ELEM, D_QK, 8);                    \
+        break;                                                            \
+      case 16:                                                            \
+        DISPATCH_MLA_SPARSE_2STAGE_B_H(ELEM, D_QK, 16);                   \
+        break;                                                            \
+      case 32:                                                            \
+        DISPATCH_MLA_SPARSE_2STAGE_B_H(ELEM, D_QK, 32);                   \
+        break;                                                            \
+      default:                                                            \
+        DISPATCH_MLA_SPARSE_2STAGE_B_H(ELEM, D_QK, 64);                   \
+        break;                                                            \
+    }                                                                     \
+  } while (0)
+
+// Decode currently only supports d_qk == 512; resolve the runtime value to the
+// compile-time D_QK launcher variant, then dispatch B_H. Structured as a switch (like
+// the prefill path's {512, 576}) so a second d_qk can be added without reshaping the
+// dispatch -- add a case here + the D_QK to MlaSparseDecodeXe20.cmake / the dispatch
+// header declarations.
+#define DISPATCH_MLA_SPARSE_B_H(ELEM)                                                                \
+  do {                                                                                               \
+    switch (q.size(3)) {                                                                             \
+      case 512:                                                                                      \
+        DISPATCH_MLA_SPARSE_B_H_D_QK(ELEM, 512);                                                     \
+        break;                                                                                       \
+      default:                                                                                       \
+        TORCH_CHECK(false, "Unsupported d_qk for Sparse MLA decode (must be 512), got ", q.size(3)); \
+    }                                                                                                \
+  } while (0)
+
 #define DISPATCH_MLA_SPARSE_DTYPE_2STAGE()                                       \
   do {                                                                           \
     switch (in_dtype) {                                                          \
       case at::ScalarType::Half:                                                 \
-        mla_sparse_decode::launch_mla_sparse_decode_2stage_half_128(             \
-            out,                                                                 \
-            lse_out,                                                             \
-            q,                                                                   \
-            k_cache,                                                             \
-            indices,                                                             \
-            topk_length,                                                         \
-            extra_k_cache,                                                       \
-            extra_indices,                                                       \
-            extra_topk_length,                                                   \
-            attn_sink,                                                           \
-            sm_scale,                                                            \
-            head_dim_v,                                                          \
-            is_fp8_kvcache);                                                     \
+        DISPATCH_MLA_SPARSE_B_H(half);                                           \
         break;                                                                   \
       case at::ScalarType::BFloat16:                                             \
-        mla_sparse_decode::launch_mla_sparse_decode_2stage_bf16_128(             \
-            out,                                                                 \
-            lse_out,                                                             \
-            q,                                                                   \
-            k_cache,                                                             \
-            indices,                                                             \
-            topk_length,                                                         \
-            extra_k_cache,                                                       \
-            extra_indices,                                                       \
-            extra_topk_length,                                                   \
-            attn_sink,                                                           \
-            sm_scale,                                                            \
-            head_dim_v,                                                          \
-            is_fp8_kvcache);                                                     \
+        DISPATCH_MLA_SPARSE_B_H(bf16);                                           \
         break;                                                                   \
       default:                                                                   \
         TORCH_CHECK(false, "Unsupported input data type for Sparse MLA decode"); \

@@ -3,14 +3,24 @@
  * SPDX-License-Identifier: BSD-3-Clause
  **************************************************************************************************/
 // Auto-generated from mla_sparse_decode_2stage_kernel.cpp.in
-// Template parameters: ELEM_TAG=@ELEM_TAG@
+// Template parameters: ELEM_TAG=@ELEM_TAG@, D_QK=@D_QK@, B_H=@B_H@, HAS_ATTN_SINK=@HAS_ATTN_SINK@
+//
+// One translation unit per (ELEM_TAG, D_QK, B_H, HAS_ATTN_SINK) combination, mirroring
+// the fused MLA decode path's per-(ELEM_TAG, PAGE_SIZE) split (mla_decode_kernel.cpp.in).
+// D_QK is the QK head dim and B_H the sparse-decode analog of page size: together they
+// key the Stage-2 config instantiation; HAS_ATTN_SINK selects the sink epilogue variant.
+// Instantiating runMlaSparse2Stage<Elem, D_QK, B_H, HAS_ATTN_SINK> here confines the
+// heavy CUTLASS kernel codegen for one variant to this object file (bounds per-file
+// compile memory / avoids the build OOM guard -- one variant per file). The op
+// (mla_sparse_decode.cpp) dispatches dtype, then D_QK, then B_H, then the runtime
+// attn_sink flag, and calls the matching launcher below. Decode is always D_QK == 512.
 #define SYCL_INTEL_TARGET 20
 
 #include "sycl/kernels/mla_sparse/device/mla_sparse_decode_2stage_types.hpp"
 
 namespace mla_sparse_decode {
 
-void launch_mla_sparse_decode_2stage_@ELEM_TAG@_128(
+void launch_mla_sparse_decode_2stage_@ELEM_TAG@_@D_QK@_@B_H@_@HAS_ATTN_SINK@(
     at::Tensor& out,
     at::Tensor& lse_out,
     const at::Tensor& q,
@@ -24,7 +34,7 @@ void launch_mla_sparse_decode_2stage_@ELEM_TAG@_128(
     double sm_scale,
     int64_t head_dim_v,
     bool is_fp8_kvcache) {
-  runMlaSparse2Stage<@ELEM_SYCL_TYPE@>(
+  runMlaSparse2Stage<@ELEM_SYCL_TYPE@, @D_QK@, @B_H@, static_cast<bool>(@HAS_ATTN_SINK@)>(
       out, lse_out, q, k_cache, indices, topk_length,
       extra_k_cache, extra_indices, extra_topk_length,
       attn_sink, sm_scale, head_dim_v, is_fp8_kvcache);

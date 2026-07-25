@@ -270,8 +270,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "flash_mla_prefill(Tensor! out, Tensor! q_nope, Tensor! q_pe, Tensor! kv_c_and_k_pe_cache, "
       "Tensor! cu_seqlens_q, Tensor! seq_lens, int max_seqlen_q, "
       "Tensor! page_table, Tensor! workspace, float sm_scale, bool causal, int num_kv_splits) -> ()");
-  ;
   m.impl("flash_mla_prefill", torch::kXPU, &flash_mla_prefill);
+
+  m.def(
+      "flash_mla_sparse_prefill(Tensor! out, Tensor! max_logits, Tensor! lse, Tensor! q, Tensor! kv, "
+      "Tensor! indices, float sm_scale, int head_dim_v, "
+      "Tensor? attn_sink=None, Tensor? topk_length=None) -> ()");
+  m.impl("flash_mla_sparse_prefill", torch::kXPU, &flash_mla_sparse_prefill);
 #endif  // USE_MLA
 
   /*

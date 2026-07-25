@@ -21,16 +21,20 @@
 
 #pragma once
 
-#include "sycl/kernels/mla_sparse/kernel/xe_mla_sparse_decode_2stage_common.hpp"
+#include "sycl/kernels/mla_sparse/device/xe_mla_sparse_decode_2stage_common.hpp"
 
 namespace cutlass::flash_attention::collective {
 
+using cutlass::flash_attention::kernel::Epilogue2StageParams;
 using cutlass::flash_attention::kernel::LOG_2_E;
 using cutlass::flash_attention::kernel::LOG_E_2;
-using cutlass::flash_attention::kernel::SparseAttnDecodeParams;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-template <class CollectiveMainloop_, bool HAS_ATTN_SINK_>
+// HAS_MAX_LOGITS_ gates the prefill-only pre-sink row-max (max_logits) write: the
+// decode epilogue is instantiated with false so that store is compiled out; the
+// prefill config passes true. Kept a template param (rather than the old runtime
+// null-guard) so decode never emits the extra store path.
+template <class CollectiveMainloop_, bool HAS_ATTN_SINK_, bool HAS_MAX_LOGITS_ = false>
 class XeMlaSparseDecode2StageEpilogue {
  public:
   //
@@ -38,6 +42,7 @@ class XeMlaSparseDecode2StageEpilogue {
   //
   using CollectiveMainloop = CollectiveMainloop_;
   static constexpr bool HAS_ATTN_SINK = HAS_ATTN_SINK_;
+  static constexpr bool HAS_MAX_LOGITS = HAS_MAX_LOGITS_;
 
   using Traits = typename CollectiveMainloop::Traits;
   using ElementO = typename CollectiveMainloop::ElementO;
@@ -88,10 +93,13 @@ class XeMlaSparseDecode2StageEpilogue {
   using SharedStorage = conditional_t<(ReduceK{} > 1), SharedStorageReduceK, SharedStorageNonReduceK>;
 
   //
-  // Arguments / Params (flat SparseAttnDecodeParams, matching the launcher wiring)
+  // Arguments / Params: the epilogue's own slice (Epilogue2StageParams), carrying
+  // only the fields the reduce / normalize / LSE / max_logits / attn_sink / store
+  // path reads. to_underlying_arguments is identity; the kernel forwards
+  // params.epilogue.
   //
-  using Arguments = SparseAttnDecodeParams;
-  using Params = SparseAttnDecodeParams;
+  using Arguments = Epilogue2StageParams;
+  using Params = Epilogue2StageParams;
 
  private:
   Params params;
@@ -231,7 +239,7 @@ class XeMlaSparseDecode2StageEpilogue {
     if (v_split_idx == 0 && tid_in_sg < valid_tid_per_sg && sg_id * valid_tid_per_sg < Traits::B_H) {
       int local_head_idx = sg_id * valid_tid_per_sg + tid_in_sg;
       int head_idx = cur_head_start_idx + local_head_idx;
-      if (head_idx < params.shape.h_q) {
+      if (head_idx < params.h_q) {
         int lse_idx = batch_idx * params.stride_lse_b + seq_idx * params.stride_lse_s_q + head_idx;
 
         float row_max = -INFINITY;
@@ -244,6 +252,14 @@ class XeMlaSparseDecode2StageEpilogue {
           row_lse = row_max + sycl::native::log2(rA_sum(0)) * LOG_E_2;
         }
         lse[lse_idx] = row_lse;
+        // Prefill also returns the pre-sink row max (max_logits); decode is
+        // instantiated HAS_MAX_LOGITS=false so this store is compiled out. Uses the
+        // same [b, s_q, h_q] indexing as lse.
+        if constexpr (HAS_MAX_LOGITS) {
+          int max_logits_idx =
+              batch_idx * params.stride_max_logits_b + seq_idx * params.stride_max_logits_s_q + head_idx;
+          params.max_logits[max_logits_idx] = row_max;
+        }
       }
     }
 
@@ -258,7 +274,7 @@ class XeMlaSparseDecode2StageEpilogue {
           ElementA final_rescale = global_exp_sum != 0 ? ElementA(1) / global_exp_sum : ElementA(0);
           int local_head_idx = get<0>(rA.tv_layout()(0, i));
           int head_idx = cur_head_start_idx + reduce_head_offset + local_head_idx;
-          if (head_idx < params.shape.h_q) {
+          if (head_idx < params.h_q) {
             auto global_max = broadcast<0>(rA_max, rA, i);
             float attn_sink_val = params.attn_sink[head_idx];
             ElementA sink_exp_sum = sycl::native::exp2(static_cast<ElementA>(attn_sink_val * LOG_2_E) - global_max);
@@ -271,7 +287,7 @@ class XeMlaSparseDecode2StageEpilogue {
         if (tid_in_sg < valid_tid_per_sg && sg_id * valid_tid_per_sg < Traits::B_H) {
           int local_head_idx = sg_id * valid_tid_per_sg + tid_in_sg;
           int head_idx = cur_head_start_idx + local_head_idx;
-          if (head_idx < params.shape.h_q) {
+          if (head_idx < params.h_q) {
             float attn_sink_val = params.attn_sink[head_idx];
             CUTE_UNROLL
             for (int i = 0; i < rA_sum.size(); ++i) {

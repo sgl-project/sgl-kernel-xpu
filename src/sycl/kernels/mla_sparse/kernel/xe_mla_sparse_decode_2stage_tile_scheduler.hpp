@@ -21,7 +21,7 @@
 
 #pragma once
 
-#include "sycl/kernels/mla_sparse/kernel/xe_mla_sparse_decode_2stage_common.hpp"
+#include "sycl/kernels/mla_sparse/device/xe_mla_sparse_decode_2stage_common.hpp"
 
 namespace cutlass::flash_attention::kernel {
 
@@ -38,14 +38,19 @@ class XeMlaSparseDecode2StageIndividualTileScheduler {
  public:
   static constexpr int B_H = B_H_;
 
+  // The scheduler's own param slice: the two dims needed to enumerate head-blocks
+  // per query tile. Built by the host adapter as the composite's `scheduler` member
+  // and forwarded by the dense kernel (params.scheduler).
+  using Params = TileScheduler2StageParams;
+
   CUTLASS_DEVICE
-  XeMlaSparseDecode2StageIndividualTileScheduler(int h_q, int s_q) : valid_(true) {
-    const int num_head_blocks = ceil_div(h_q, B_H);
+  XeMlaSparseDecode2StageIndividualTileScheduler(Params const& params) : valid_(true) {
+    const int num_head_blocks = ceil_div(params.h_q, B_H);
     const int wg_id = int(BlockIdxX());
     const int q_tile_idx = wg_id / num_head_blocks;
 
-    tile_.batch_idx = q_tile_idx / s_q;
-    tile_.seq_idx = q_tile_idx - tile_.batch_idx * s_q;
+    tile_.batch_idx = q_tile_idx / params.s_q;
+    tile_.seq_idx = q_tile_idx - tile_.batch_idx * params.s_q;
     tile_.head_bid = wg_id % num_head_blocks;
     tile_.v_split_idx = int(BlockIdxY());
   }

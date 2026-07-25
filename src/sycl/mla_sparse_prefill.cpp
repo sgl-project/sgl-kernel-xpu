@@ -1,0 +1,133 @@
+/***************************************************************************************************
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ **************************************************************************************************/
+/*! \file
+    \brief Sparse MLA prefill dispatch interface for DeepSeek V4.
+
+    Two-stage sparse attention prefill: Stage 1 gathers the dense bf16 KV rows named
+    by `indices` into a dense HBM tile; Stage 2 runs the shared dense flash kernel
+    (reused from the 2-stage decode path) over that tile, emitting out / max_logits /
+    lse. Each query row is mapped to a decode "batch" (see
+    device/mla_sparse_prefill_2stage_types.hpp).
+*/
+#define SYCL_INTEL_TARGET 20
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/all.h>
+
+#include <sycl/sycl.hpp>
+
+#include "Utils.h"
+#include "sycl/kernels/mla_sparse/device/mla_sparse_prefill_dispatch.hpp"
+
+namespace {
+
+// Two-stage dispatch: pick the QK head dim D_QK ({512, 576} for prefill) and the
+// head-block size B_H (analog of page size) for this h_q, then the dtype, then the
+// runtime attn_sink flag, and call the matching generated per-(ELEM, D_QK, B_H,
+// HAS_ATTN_SINK) launcher.
+#define DISPATCH_MLA_SPARSE_PREFILL_2STAGE_B_H_SINK(ELEM, D_QK, B_H, SINK)               \
+  mla_sparse_prefill::launch_mla_sparse_prefill_2stage_##ELEM##_##D_QK##_##B_H##_##SINK( \
+      out, max_logits, lse, q, kv, indices, attn_sink, topk_length, sm_scale, head_dim_v)
+
+// Resolve the runtime attn_sink flag to the compile-time 0/1 launcher variant.
+#define DISPATCH_MLA_SPARSE_PREFILL_2STAGE_B_H(ELEM, D_QK, B_H)        \
+  do {                                                                 \
+    if (attn_sink.has_value()) {                                       \
+      DISPATCH_MLA_SPARSE_PREFILL_2STAGE_B_H_SINK(ELEM, D_QK, B_H, 1); \
+    } else {                                                           \
+      DISPATCH_MLA_SPARSE_PREFILL_2STAGE_B_H_SINK(ELEM, D_QK, B_H, 0); \
+    }                                                                  \
+  } while (0)
+
+// Resolve the head-block B_H for this h_q, threading through the compile-time D_QK.
+#define DISPATCH_MLA_SPARSE_PREFILL_B_H_D_QK(ELEM, D_QK)                    \
+  do {                                                                      \
+    switch (mla_sparse_prefill::sparse_mla_prefill_select_b_h(q.size(1))) { \
+      case 8:                                                               \
+        DISPATCH_MLA_SPARSE_PREFILL_2STAGE_B_H(ELEM, D_QK, 8);              \
+        break;                                                              \
+      case 16:                                                              \
+        DISPATCH_MLA_SPARSE_PREFILL_2STAGE_B_H(ELEM, D_QK, 16);             \
+        break;                                                              \
+      case 32:                                                              \
+        DISPATCH_MLA_SPARSE_PREFILL_2STAGE_B_H(ELEM, D_QK, 32);             \
+        break;                                                              \
+      default:                                                              \
+        DISPATCH_MLA_SPARSE_PREFILL_2STAGE_B_H(ELEM, D_QK, 64);             \
+        break;                                                              \
+    }                                                                       \
+  } while (0)
+
+// Prefill supports d_qk in {512, 576}; resolve the runtime value to the compile-time
+// D_QK launcher variant, then dispatch B_H.
+#define DISPATCH_MLA_SPARSE_PREFILL_B_H(ELEM)                                                                \
+  do {                                                                                                       \
+    switch (q.size(2)) {                                                                                     \
+      case 512:                                                                                              \
+        DISPATCH_MLA_SPARSE_PREFILL_B_H_D_QK(ELEM, 512);                                                     \
+        break;                                                                                               \
+      case 576:                                                                                              \
+        DISPATCH_MLA_SPARSE_PREFILL_B_H_D_QK(ELEM, 576);                                                     \
+        break;                                                                                               \
+      default:                                                                                               \
+        TORCH_CHECK(false, "Unsupported d_qk for Sparse MLA prefill (must be 512 or 576), got ", q.size(2)); \
+    }                                                                                                        \
+  } while (0)
+
+#define DISPATCH_MLA_SPARSE_PREFILL_DTYPE_2STAGE()                                \
+  do {                                                                            \
+    switch (in_dtype) {                                                           \
+      case at::ScalarType::Half:                                                  \
+        DISPATCH_MLA_SPARSE_PREFILL_B_H(half);                                    \
+        break;                                                                    \
+      case at::ScalarType::BFloat16:                                              \
+        DISPATCH_MLA_SPARSE_PREFILL_B_H(bf16);                                    \
+        break;                                                                    \
+      default:                                                                    \
+        TORCH_CHECK(false, "Unsupported input data type for Sparse MLA prefill"); \
+    }                                                                             \
+  } while (0)
+
+}  // namespace
+
+/// @brief Dispatch kernel implementation for V4 Sparse MLA prefill.
+void flash_mla_sparse_prefill(
+    torch::Tensor& out,            // [s_q, h_q, d_v]
+    torch::Tensor& max_logits,     // [s_q, h_q]
+    torch::Tensor& lse,            // [s_q, h_q]
+    const torch::Tensor& q,        // [s_q, h_q, d_qk=512]
+    const torch::Tensor& kv,       // [s_kv, h_kv=1, d_qk=512]
+    const torch::Tensor& indices,  // [s_q, h_kv=1, topk]
+    double sm_scale,
+    int64_t head_dim_v,
+    const std::optional<torch::Tensor>& attn_sink = std::nullopt,    // [h_q] or nullopt
+    const std::optional<torch::Tensor>& topk_length = std::nullopt)  // [s_q] or nullopt
+{
+  CHECK_INPUT(out);
+  CHECK_INPUT(max_logits);
+  CHECK_INPUT(lse);
+  CHECK_INPUT(q);
+  CHECK_INPUT(kv);
+  CHECK_INPUT(indices);
+
+  c10::DeviceGuard guard(q.device());
+
+  auto in_dtype = q.scalar_type();
+  TORCH_CHECK(q.dim() == 3, "q must have shape [s_q, h_q, d_qk]");
+  TORCH_CHECK(kv.dim() == 3 && kv.size(1) == 1, "kv must have shape [s_kv, 1, d_qk]");
+  TORCH_CHECK(
+      indices.dim() == 3 && indices.size(0) == q.size(0) && indices.size(1) == 1,
+      "indices must have shape [s_q, 1, topk]");
+  TORCH_CHECK((q.size(1) % 8) == 0, "num_heads must be a multiple of 8 (kernel fuses 8 heads per workgroup)");
+  TORCH_CHECK(
+      in_dtype == at::ScalarType::Half || in_dtype == at::ScalarType::BFloat16,
+      "Unsupported input data type for Sparse MLA prefill");
+  TORCH_CHECK(head_dim_v == 512, "head_dim_v must be 512 for DeepSeek V4 MLA");
+
+  DISPATCH_MLA_SPARSE_PREFILL_DTYPE_2STAGE();
+}
+
+#undef DISPATCH_MLA_SPARSE_PREFILL_DTYPE_2STAGE
+#undef SYCL_INTEL_TARGET

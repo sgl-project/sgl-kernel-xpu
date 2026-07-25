@@ -84,11 +84,13 @@ if(USE_MLA)
     include(MlaDecodeXe20.cmake)
     include(MlaPrefillXe20.cmake)
     include(MlaSparseDecodeXe20.cmake)
+    include(MlaSparsePrefillXe20.cmake)
 endif()
 if(USE_MOE)
     include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmXe20.cmake)
     include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmW4A16Xe20.cmake)
 endif()
+
 
 message(STATUS "BMG files: ${device_cpp_xe20}")
 message(STATUS "Common files: ${device_cpp_common}")

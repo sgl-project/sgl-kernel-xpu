@@ -194,9 +194,10 @@ class MLASparse {
     // dense gathered-KV HBM tile is materialized before the main kernel reads it;
     // the in-order XPU queue serializes the two launches. Mirrors MLA::run's
     // main-then-reduction dual launch (mla/device/mla_runner.hpp:202-213), inverted
-    // (companion-then-main) because the gather feeds the attention. The gather
-    // kernel's Params is the same flat SparseAttnDecodeParams as fmla_params, so it
-    // reuses that params block. Compiled away entirely when has_gather == false.
+    // (companion-then-main) because the gather feeds the attention. The dense kernel
+    // derives its Params from its GatherKernel, so both launches take the identical
+    // composite params object (fmla_params); the gather reads only its `.gather`
+    // slice, the dense kernel the rest. Compiled away entirely when has_gather == false.
     if constexpr (has_gather) {
       launch<GatherKernel, kGatherGrfSize>(params.fmla_params);
     }

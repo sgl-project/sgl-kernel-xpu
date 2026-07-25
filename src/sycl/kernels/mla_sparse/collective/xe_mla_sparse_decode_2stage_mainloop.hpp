@@ -22,13 +22,13 @@
 
 #pragma once
 
-#include "sycl/kernels/mla_sparse/kernel/xe_mla_sparse_decode_2stage_common.hpp"
+#include "sycl/kernels/mla_sparse/device/xe_mla_sparse_decode_2stage_common.hpp"
 
 namespace cutlass::flash_attention::collective {
 
 using cutlass::flash_attention::kernel::LOG_2_E;
 using cutlass::flash_attention::kernel::LOG_E_2;
-using cutlass::flash_attention::kernel::SparseAttnDecodeParams;
+using cutlass::flash_attention::kernel::Mainloop2StageParams;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 template <int D_QK_, bool IS_FP8_QUERY_, typename Traits_>
@@ -64,10 +64,12 @@ class XeMlaSparseDecode2StageMainloop {
   struct SharedStorage {};
 
   //
-  // Arguments / Params (flat SparseAttnDecodeParams, matching the launcher wiring)
+  // Arguments / Params: the mainloop's own slice (Mainloop2StageParams), carrying
+  // only the fields the QK/PV/softmax loop reads. to_underlying_arguments is
+  // identity; the kernel wrapper forwards params.mainloop.
   //
-  using Arguments = SparseAttnDecodeParams;
-  using Params = SparseAttnDecodeParams;
+  using Arguments = Mainloop2StageParams;
+  using Params = Mainloop2StageParams;
 
  private:
   Params params;
@@ -151,7 +153,7 @@ class XeMlaSparseDecode2StageMainloop {
           int row_idx = get<0>(tQcQ(i));
           int col_idx = get<1>(tQcQ(i)) + tile_idx * get<2>(TileShapeQK{});
           int global_head_idx = cur_head_start_idx + row_idx;
-          if (global_head_idx < params.shape.h_q) {
+          if (global_head_idx < params.h_q) {
             const auto* q_tile_ptr = q_fp8 + batch_idx * params.stride_q_b + seq_idx * params.stride_q_s_q +
                                      global_head_idx * params.stride_q_h_q;
             float scale = params.q_scale_numel == 1 ? params.q_scale[0] : params.q_scale[global_head_idx];
@@ -178,7 +180,7 @@ class XeMlaSparseDecode2StageMainloop {
       for (int i = 0; i < tSrS.size(); ++i) {
         int col_idx = get<1>(tCgC(i));
         int topk_idx = block_idx * Traits::B_TOPK + col_idx;
-        bool is_valid = topk_idx < params.shape.gathered_topk && gathered_valid_mask_ptr[topk_idx];
+        bool is_valid = topk_idx < params.gathered_topk && gathered_valid_mask_ptr[topk_idx];
         if (!is_valid) {
           tSrS(i) = cutlass::platform::numeric_limits<ElementS>::lowest();
         }
@@ -229,9 +231,42 @@ class XeMlaSparseDecode2StageMainloop {
       cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, local_v_tile_idx));
     };
 
-    const int num_topk_blocks = ceil_div(params.shape.gathered_topk, Traits::B_TOPK);
+    // Fully-masked-block skip: resolve the per-batch valid lengths of the two
+    // concatenated pools once, in registers, so we can cheaply prove an entire
+    // 64-column block lies outside every valid range and skip its QK/softmax/PV
+    // work. The valid columns are main [0, main_len) U extra [topk, topk+extra_len)
+    // (padding beyond topk_length[b] is invalid). This targets ragged / padded
+    // decode traffic (topk_length < topk); when the lengths are full it never
+    // fires, so the common all-valid path pays only two integer compares per block
+    // (no valid-mask scan, no barrier). Skipping an all-invalid block is
+    // mathematically identical to processing it: every score is -inf, so the block
+    // max is unchanged, its exp-sum contribution is 0, and the online-softmax
+    // rescale is 1 -- the running (max, sum, O) state is preserved exactly.
+    auto resolve_len = [&](const int* len_ptr, int cap, int stride_b) {
+      int v = (len_ptr != nullptr) ? *(len_ptr + batch_idx * stride_b) : cap;
+      return v < cap ? v : cap;  // clamp to the pool width, matching the gather
+    };
+    const int main_len = resolve_len(params.topk_length, params.topk, params.stride_topk_length_b);
+    const bool has_extra = params.extra_topk > 0;
+    const int extra_valid_end =
+        params.topk +
+        (has_extra ? resolve_len(params.extra_topk_length, params.extra_topk, params.stride_extra_topk_length_b) : 0);
+
+    const int num_topk_blocks = ceil_div(params.gathered_topk, Traits::B_TOPK);
     CUTE_NO_UNROLL
     for (int topk_idx = 0; topk_idx < num_topk_blocks; ++topk_idx) {
+      // Block covers gathered columns [c0, c1). It is fully invalid iff it misses
+      // the main valid range [0, main_len) AND the extra valid range
+      // [topk, extra_valid_end). Missing main: c0 >= main_len. Missing extra:
+      // no extra pool, or c1 <= topk, or c0 >= extra_valid_end.
+      const int c0 = topk_idx * Traits::B_TOPK;
+      const int c1 = c0 + Traits::B_TOPK;
+      const bool misses_main = c0 >= main_len;
+      const bool misses_extra = !has_extra || c1 <= params.topk || c0 >= extra_valid_end;
+      if (misses_main && misses_extra) {
+        continue;
+      }
+
       clear(tSrS);
       CUTE_UNROLL
       for (int i = 0; i < (D_QK / get<2>(TileShapeQK{})); ++i) {

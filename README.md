@@ -17,6 +17,34 @@ source /PATH/TO/ONEAPI/setvars.sh
 pip install -v .
 ```
 
+### Optional Build Toggles
+
+You can selectively disable feature groups during build with these environment
+variables (default is `ON` for all):
+
+| Variable | Default | Set to `OFF`/`0` to disable |
+| --- | --- | --- |
+| `USE_MOE` | `ON` | MoE group gemm kernels |
+| `USE_FMHA` | `ON` | Flash attention kernels (`fwd`) |
+| `USE_MLA` | `ON` | MLA decode/prefill/sparse-decode kernels |
+
+Notes:
+- `OFF` and `0` are both accepted.
+- Values are case-insensitive (`off`, `Off`, `OFF` all work).
+
+Examples:
+
+```bash
+# Disable MoE only
+USE_MOE=OFF pip install -v .
+
+# Same as above
+USE_MOE=0 pip install -v .
+
+# Disable all three
+USE_MOE=0 USE_FMHA=OFF USE_MLA=off pip install -v .
+```
+
 
 ### Build with [ccache](https://github.com/ccache/ccache)
 ```bash

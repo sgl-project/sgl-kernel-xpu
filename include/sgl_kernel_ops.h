@@ -115,7 +115,7 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
-void fused_qk_norm_rope_with_cos_sin_cache_inplace(
+void fused_inplace_qknorm_rope(
     torch::Tensor& q,
     torch::Tensor& k,
     torch::Tensor& q_weight,

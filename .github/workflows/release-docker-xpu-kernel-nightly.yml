@@ -1,0 +1,62 @@
+name: Release Docker Images Nightly (sgl-kernel-xpu)
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 12 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    if: github.repository == 'sgl-project/sgl-kernel-xpu'
+    runs-on: sglang-bmg
+    environment: 'prod'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: sgl-kernel-xpu-nightly-build
+          fetch-depth: 0
+
+      - name: Set date and commit hash
+        id: image_meta
+        run: |
+          cd sgl-kernel-xpu-nightly-build
+          date_tag=$(date +%Y%m%d)
+          commit_hash=$(git rev-parse --short=7 HEAD)
+          if [ -z "${commit_hash}" ]; then
+            echo "::error::Could not resolve commit hash"
+            exit 1
+          fi
+          image_tag="nightly-dev-xpu-bmg-${date_tag}-${commit_hash}"
+          echo "DATE=${date_tag}" >> $GITHUB_ENV
+          echo "commit_hash=${commit_hash}" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG=${image_tag}" >> $GITHUB_ENV
+          echo "Image tag: ${image_tag}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub (Intel)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
+
+      - name: Build intel/sgl-kernel-xpu-dev
+        run: |
+          echo "Building intel/sgl-kernel-xpu-dev:${{ env.IMAGE_TAG }}"
+          docker build sgl-kernel-xpu-nightly-build \
+            -f sgl-kernel-xpu-nightly-build/Dockerfile.xpu_kernel \
+            --build-arg SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git \
+            --build-arg SG_LANG_KERNEL_BRANCH=main \
+            --no-cache --progress=plain \
+            -t "intel/sgl-kernel-xpu-dev:${{ env.IMAGE_TAG }}" \
+            -t "intel/sgl-kernel-xpu-dev:latest"
+
+      - name: Push intel/sgl-kernel-xpu-dev
+        run: |
+          docker push "intel/sgl-kernel-xpu-dev:${{ env.IMAGE_TAG }}"
+          docker push "intel/sgl-kernel-xpu-dev:latest"

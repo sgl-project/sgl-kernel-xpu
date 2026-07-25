@@ -57,22 +57,22 @@ foreach(QG_SZ ${FMHA_DECODE_QG_SIZES})
             set(GENERATED_FILE
                 "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_paged_kernel_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}.cpp")
             configure_file(${FMHA_DECODE_TEMPLATE} ${GENERATED_FILE} @ONLY)
-            list(APPEND device_cpp_common ${GENERATED_FILE})
+            list(APPEND device_cpp_xe20 ${GENERATED_FILE})
 
             set(GENERATED_FP8_FILE
                 "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_fp8_kernel_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}.cpp")
             configure_file(${FMHA_DECODE_FP8_TEMPLATE} ${GENERATED_FP8_FILE} @ONLY)
-            list(APPEND device_cpp_common ${GENERATED_FP8_FILE})
+            list(APPEND device_cpp_xe20 ${GENERATED_FP8_FILE})
 
             set(GENERATED_SPLIT_FILE
                 "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_split_decode_kernel_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}.cpp")
             configure_file(${FMHA_SPLIT_DECODE_TEMPLATE} ${GENERATED_SPLIT_FILE} @ONLY)
-            list(APPEND device_cpp_common ${GENERATED_SPLIT_FILE})
+            list(APPEND device_cpp_xe20 ${GENERATED_SPLIT_FILE})
 
             set(GENERATED_SPLIT_FP8_FILE
                 "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_split_decode_fp8_kernel_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}.cpp")
             configure_file(${FMHA_SPLIT_DECODE_FP8_TEMPLATE} ${GENERATED_SPLIT_FP8_FILE} @ONLY)
-            list(APPEND device_cpp_common ${GENERATED_SPLIT_FP8_FILE})
+            list(APPEND device_cpp_xe20 ${GENERATED_SPLIT_FP8_FILE})
         endforeach()
     endforeach()
 
@@ -86,6 +86,6 @@ foreach(QG_SZ ${FMHA_DECODE_QG_SIZES})
         set(GENERATED_NP_FILE
             "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_nopage_kernel_${QG_SZ}_${HEAD_DIM}.cpp")
         configure_file(${FMHA_DECODE_NOPAGE_TEMPLATE} ${GENERATED_NP_FILE} @ONLY)
-        list(APPEND device_cpp_common ${GENERATED_NP_FILE})
+        list(APPEND device_cpp_xe20 ${GENERATED_NP_FILE})
     endforeach()
 endforeach()

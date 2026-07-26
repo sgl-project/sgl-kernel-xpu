@@ -610,6 +610,22 @@ void fast_topk_transform_ragged_interface(
     const at::Tensor& topk_indices_offset,
     std::optional<at::Tensor> row_starts_opt);
 
+/*
+ * Compress plan kernels
+ */
+namespace at::native::xpu {
+
+torch::Tensor plan_compress_decode(
+    torch::Tensor req_pool_indices,
+    torch::Tensor req_to_token,
+    torch::Tensor full_to_state,
+    torch::Tensor seq_lens,
+    int64_t compress_ratio,
+    int64_t swa_page_size,
+    int64_t ring_size);
+
+}  // namespace at::native::xpu
+
 namespace flash {
 /*
  * From fa2 sparse

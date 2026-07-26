@@ -50,7 +50,9 @@ def assert_equal(
         ref_output_by_index = dict(
             zip(indices_ref_cpu[token_idx], output_ref_cpu[token_idx])
         )
-        output_by_index = dict(zip(indices_our_cpu[token_idx], output_our_cpu[token_idx]))
+        output_by_index = dict(
+            zip(indices_our_cpu[token_idx], output_our_cpu[token_idx])
+        )
         for index in indices_ref_set & indices_our_set:
             expected = ref_output_by_index[index]
             actual = output_by_index[index]

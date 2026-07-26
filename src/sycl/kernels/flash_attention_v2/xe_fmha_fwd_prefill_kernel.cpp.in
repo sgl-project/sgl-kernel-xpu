@@ -36,6 +36,20 @@
 
 namespace prefill {
 
+namespace {
+
+template <typename TileShapeQK, typename TileShapePV, typename TileShapeOutput, typename SubgroupLayoutQK>
+void run_paged_tile(const Arguments& params) {
+  AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+      FMHAConfig<Causal, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
+          params);
+    });
+  });
+}
+
+}  // namespace
+
 template <>
 void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
   bool use_sink = (params.softmax_sink_ptr != nullptr);
@@ -48,6 +62,20 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
   using TileShapeOutput = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_OUT@>>;
   using SubgroupLayoutQK =
       cute::Layout<cute::Shape<cute::Int<@NUM_SG@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+
+#if @HEAD_DIM@ == 96
+  // Dense hkv8 batches already provide enough occupancy and run faster with the original sg8 tile.
+  if (params.b >= 8 && params.h_k >= 8) {
+    using DenseTileShapeQK = cute::Shape<cute::Int<128>, cute::Int<64>, cute::_32>;
+    using DenseTileShapePV = cute::Shape<cute::Int<128>, cute::_32, cute::Int<64>>;
+    using DenseTileShapeOutput = cute::Shape<cute::Int<128>, cute::Int<96>>;
+    using DenseSubgroupLayoutQK =
+        cute::Layout<cute::Shape<cute::Int<8>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+    TORCH_CHECK(!use_sink, "sink is only supported for head_size == 64, got @HEAD_DIM@");
+    run_paged_tile<DenseTileShapeQK, DenseTileShapePV, DenseTileShapeOutput, DenseSubgroupLayoutQK>(params);
+    return;
+  }
+#endif
 
 #if @HEAD_DIM@ == 64
   if (params.seqlen_q <= 256 &&

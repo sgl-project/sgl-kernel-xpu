@@ -1336,7 +1336,8 @@ void fused_q_norm_rope(
 // ============================================================================
 
 constexpr float FP8_E4M3_MAX = 448.0f;
-constexpr int64_t kElementsPerScaleChunk = 64;  // Each FP8 quantization scale chunk / warp covers 64 elements
+// Each FP8 quantization scale chunk / warp covers 64 elements
+constexpr int64_t kElementsPerScaleChunk = 64;
 
 inline uint8_t castToUE8M0(float x) {
   uint32_t bits = sycl::bit_cast<uint32_t>(x);

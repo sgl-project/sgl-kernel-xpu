@@ -19,12 +19,22 @@ ARG SG_LANG_BRANCH=main
 ARG SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git
 ARG SG_LANG_KERNEL_BRANCH=main
 
+# Cap the SYCL/cutlass build parallelism. Ninja defaults to nproc, and the
+# heavy cutlass template instantiations can OOM hosts with many cores but
+# limited RAM. Override via --build-arg for hosts with more memory per core.
+ARG CMAKE_BUILD_PARALLEL_LEVEL=8
+
 # Pin the compute UMD + IGC. The kobuk-team PPA is rolling; an untested build
 # mismatched the host xe KMD and faulted libze_intel_gpu.so on the B580 runner.
 # Must stay in lockstep with the host KMD; override via --build-arg per workflow.
 ARG COMPUTE_RUNTIME_VERSION=26.05.37020.3
 ARG IGC_VERSION=2.28.4+20760
 ARG GMM_VERSION=22.9.0
+# Workaround for build hosts whose system clock is out of sync (causes apt to
+# reject Release files as "not valid yet"). This does not change any behavior
+# on hosts with a correct clock.
+RUN echo 'Acquire::Check-Date "false";' > /etc/apt/apt.conf.d/99no-check-date
+
 RUN apt-get install -y software-properties-common && \
     add-apt-repository -y ppa:kobuk-team/intel-graphics && \
     apt-get update  && \
@@ -69,7 +79,7 @@ RUN --mount=type=secret,id=github_token \
     conda activate py${PYTHON_VERSION} && \
     # . /opt/intel/oneapi/setvars.sh --force && \
     # Install Torch
-    pip install torch==2.13.0 torchvision torchaudio triton-xpu --index-url https://download.pytorch.org/whl/xpu
+    pip install torch==2.13.0 torchvision triton-xpu --index-url https://download.pytorch.org/whl/xpu
 
 # Install SGlang from source
 RUN --mount=type=secret,id=github_token \
@@ -84,6 +94,7 @@ RUN --mount=type=secret,id=github_token \
     echo "cloning ${SG_LANG_KERNEL_REPO} from ${SG_LANG_KERNEL_BRANCH}" && \
     git clone --branch ${SG_LANG_KERNEL_BRANCH} --single-branch ${SG_LANG_KERNEL_REPO} && \
     cd sgl-kernel-xpu && \
+    export CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL} && \
     pip install -v . &&\
     # Install required packages for sglang workloads
     pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops matplotlib pandas --root-user-action=ignore aiohttp && \

@@ -8,6 +8,9 @@ import pytest
 import sgl_kernel
 import torch
 import utils
+from sgl_kernel.fused_k_norm_rope_flashmla_torch import (
+    fused_k_norm_rope_flashmla as fused_k_norm_rope_flashmla_ref,
+)
 from test_rope_utils import create_cos_sin_cache
 
 precision = {
@@ -725,6 +728,249 @@ def test_fused_qk_norm_rope_with_cache_last_dim_strided(
     )
     torch.testing.assert_close(
         k, k_ref.to(dtype), rtol=precision[dtype], atol=precision[dtype]
+    )
+
+
+def fused_q_norm_rope_reference(
+    q_input: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Pure-PyTorch reference for the DeepSeek-V4 Q path: unweighted
+    RMSNorm-self over the full head_dim, then RoPE on the last `rope_dim`
+    elements (interleaved re/im), matching `FusedQNormRopeKernel`
+    (python/sglang/jit_kernel/csrc/deepseek_v4/main_norm_rope.cuh).
+
+    Args:
+        q_input: (B, H, head_dim), any float dtype.
+        freqs_cis: (max_pos, rope_dim) fp32, interleaved
+            [re0, im0, re1, im1, ...].
+        positions: (B,) int32 or int64.
+        eps: RMSNorm epsilon.
+
+    Returns:
+        (B, H, head_dim) tensor with q_input's dtype.
+    """
+    B, H, head_dim = q_input.shape
+    rope_dim = freqs_cis.shape[-1]
+    nope_dim = head_dim - rope_dim
+
+    assert rope_dim % 2 == 0, "rope_dim must be even (interleaved re/im)"
+    assert nope_dim >= 0
+
+    # part 1: RMSNorm-self (no learned weight).
+    x = q_input.float()
+    rms = x.pow(2).mean(dim=-1, keepdim=True)
+    norm_factor = torch.rsqrt(rms + eps)
+    x = x * norm_factor
+
+    # part 2: RoPE on the last rope_dim elements.
+    freq_rows = freqs_cis[positions.long()].unsqueeze(1)  # (B, 1, rope_dim)
+    freq_re = freq_rows[..., 0::2]
+    freq_im = freq_rows[..., 1::2]
+
+    x_rope = x[..., nope_dim:]
+    x_re = x_rope[..., 0::2]
+    x_im = x_rope[..., 1::2]
+
+    rotated_re = x_re * freq_re - x_im * freq_im
+    rotated_im = x_re * freq_im + x_im * freq_re
+    rotated = torch.stack([rotated_re, rotated_im], dim=-1).flatten(-2)
+
+    out = torch.cat([x[..., :nope_dim], rotated], dim=-1)
+    return out.to(q_input.dtype)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 16])
+@pytest.mark.parametrize("num_heads", [1, 8])
+@pytest.mark.parametrize(
+    "head_dim,rope_dim",
+    [
+        (64, 64),  # warp path, exact fit
+        (128, 64),  # warp path
+        (256, 64),  # warp path
+        (320, 64),  # head_dim not in {64,128,256} -> CTA path
+        (512, 64),  # DeepSeek-V4 production shape -> CTA path
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_q_norm_rope(batch_size, num_heads, head_dim, rope_dim, dtype):
+    """Test the Q-only fused RMSNorm-self + RoPE kernel (warp and CTA paths)."""
+    torch.random.manual_seed(42)
+    max_pos = 512
+    eps = 1e-6
+
+    q_input = torch.randn(batch_size, num_heads, head_dim, dtype=dtype, device=device)
+    q_output = torch.empty_like(q_input)
+    freqs_cis = torch.randn(
+        max_pos, rope_dim // 2, dtype=torch.complex64, device=device
+    )
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    positions = torch.randint(
+        0, max_pos, (batch_size,), dtype=torch.int32, device=device
+    )
+
+    sgl_kernel.fused_q_norm_rope(q_input, q_output, freqs_real, positions, eps)
+
+    expected = fused_q_norm_rope_reference(q_input, freqs_real, positions, eps)
+
+    torch.testing.assert_close(
+        q_output.float(), expected.float(), rtol=precision[dtype], atol=precision[dtype]
+    )
+
+
+@pytest.mark.parametrize("head_dim,rope_dim", [(128, 64), (512, 64)])
+@pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
+def test_fused_q_norm_rope_position_dtype(head_dim, rope_dim, position_dtype):
+    """Test both supported `positions` dtypes for warp (128) and CTA (512) paths."""
+    torch.random.manual_seed(0)
+    batch_size, num_heads, max_pos, eps = 8, 4, 512, 1e-6
+    dtype = torch.bfloat16
+
+    q_input = torch.randn(batch_size, num_heads, head_dim, dtype=dtype, device=device)
+    q_output = torch.empty_like(q_input)
+    freqs_cis = torch.randn(
+        max_pos, rope_dim // 2, dtype=torch.complex64, device=device
+    )
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    positions = torch.randint(
+        0, max_pos, (batch_size,), dtype=position_dtype, device=device
+    )
+
+    sgl_kernel.fused_q_norm_rope(q_input, q_output, freqs_real, positions, eps)
+    expected = fused_q_norm_rope_reference(q_input, freqs_real, positions, eps)
+
+    torch.testing.assert_close(
+        q_output.float(), expected.float(), rtol=precision[dtype], atol=precision[dtype]
+    )
+
+
+def test_fused_q_norm_rope_zero_batch():
+    """Empty batch should not crash, for both warp and CTA head_dims."""
+    for head_dim in (128, 512):
+        q_input = torch.empty(0, 8, head_dim, dtype=torch.bfloat16, device=device)
+        q_output = torch.empty(0, 8, head_dim, dtype=torch.bfloat16, device=device)
+        freqs_cis = torch.randn(512, 32, dtype=torch.complex64, device=device)
+        freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+        positions = torch.empty(0, dtype=torch.int32, device=device)
+        sgl_kernel.fused_q_norm_rope(q_input, q_output, freqs_real, positions, 1e-6)
+        assert q_output.shape == q_input.shape
+
+
+@pytest.mark.parametrize("batch_size", [1, 7, 32, 128])
+@pytest.mark.parametrize("page_size", [16, 256])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_fused_k_norm_rope_flashmla(batch_size, page_size, dtype):
+    """Test fused K norm + RoPE + FlashMLA paged cache store kernel against reference."""
+    torch.random.manual_seed(42)
+    max_pos = 512
+    head_dim = 512
+    rope_dim = 64
+    eps = 1e-6
+
+    kv = torch.randn(batch_size, head_dim, dtype=dtype, device=device)
+    kv_weight = torch.randn(head_dim, dtype=dtype, device=device)
+    freqs_cis = torch.randn(
+        max_pos, rope_dim // 2, dtype=torch.complex64, device=device
+    )
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    positions = torch.randint(
+        0, max_pos, (batch_size,), dtype=torch.int32, device=device
+    )
+
+    out_loc = torch.randperm(batch_size, dtype=torch.int32, device=device)
+    if batch_size > 2:
+        out_loc[0] = -1
+
+    npages = (batch_size + page_size - 1) // page_size + 2
+    k_page_bytes = page_size * 584
+    kvcache_test = torch.zeros((npages, k_page_bytes), dtype=torch.uint8, device=device)
+    kvcache_ref = torch.zeros_like(kvcache_test)
+
+    sgl_kernel.fused_k_norm_rope_flashmla(
+        kv, kv_weight, freqs_real, positions, out_loc, kvcache_test, eps, page_size
+    )
+
+    fused_k_norm_rope_flashmla_ref(
+        kv, kv_weight, freqs_real, positions, out_loc, kvcache_ref, eps, page_size
+    )
+
+    # Note on tolerances for uint8 quantized byte comparisons:
+    # kvcache stores FP8 quantized bytes and UE8M0 scale bytes.
+    # Minor floating-point rounding differences between XPU C++ kernel and
+    # PyTorch reference near quantization boundary thresholds can produce
+    # 1-LSB uint8 integer offsets (e.g., 62 vs 63, delta = 1.0).
+    torch.testing.assert_close(
+        kvcache_test.float(),
+        kvcache_ref.float(),
+        rtol=1e-2,
+        atol=1.0,
+    )
+
+
+@pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
+def test_fused_k_norm_rope_flashmla_position_dtype(position_dtype):
+    """Test position tensor dtypes int32 and int64 for fused_k_norm_rope_flashmla."""
+    torch.random.manual_seed(42)
+    batch_size = 16
+    page_size = 128
+    max_pos = 512
+    head_dim = 512
+    rope_dim = 64
+    eps = 1e-6
+    dtype = torch.bfloat16
+
+    kv = torch.randn(batch_size, head_dim, dtype=dtype, device=device)
+    kv_weight = torch.randn(head_dim, dtype=dtype, device=device)
+    freqs_cis = torch.randn(
+        max_pos, rope_dim // 2, dtype=torch.complex64, device=device
+    )
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    positions = torch.randint(
+        0, max_pos, (batch_size,), dtype=position_dtype, device=device
+    )
+
+    out_loc = torch.randperm(batch_size, dtype=torch.int32, device=device)
+
+    npages = (batch_size + page_size - 1) // page_size + 2
+    k_page_bytes = page_size * 584
+    kvcache_test = torch.zeros((npages, k_page_bytes), dtype=torch.uint8, device=device)
+    kvcache_ref = torch.zeros_like(kvcache_test)
+
+    sgl_kernel.fused_k_norm_rope_flashmla(
+        kv, kv_weight, freqs_real, positions, out_loc, kvcache_test, eps, page_size
+    )
+
+    fused_k_norm_rope_flashmla_ref(
+        kv, kv_weight, freqs_real, positions, out_loc, kvcache_ref, eps, page_size
+    )
+
+    # Note on tolerances for uint8 quantized byte comparisons:
+    # kvcache stores FP8 quantized bytes and UE8M0 scale bytes.
+    # Minor floating-point rounding differences between XPU C++ kernel and
+    # PyTorch reference near quantization boundary thresholds can produce
+    # 1-LSB uint8 integer offsets (e.g., 62 vs 63, delta = 1.0).
+    torch.testing.assert_close(
+        kvcache_test.float(),
+        kvcache_ref.float(),
+        rtol=1e-2,
+        atol=1.0,
+    )
+
+
+def test_fused_k_norm_rope_flashmla_zero_batch():
+    """Empty batch for fused_k_norm_rope_flashmla should not crash."""
+    kv = torch.empty(0, 512, dtype=torch.bfloat16, device=device)
+    kv_weight = torch.randn(512, dtype=torch.bfloat16, device=device)
+    freqs_cis = torch.randn(512, 32, dtype=torch.complex64, device=device)
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    positions = torch.empty(0, dtype=torch.int32, device=device)
+    out_loc = torch.empty(0, dtype=torch.int32, device=device)
+    kvcache = torch.zeros((10, 584 * 16), dtype=torch.uint8, device=device)
+
+    sgl_kernel.fused_k_norm_rope_flashmla(
+        kv, kv_weight, freqs_real, positions, out_loc, kvcache, 1e-6, 16
     )
 
 

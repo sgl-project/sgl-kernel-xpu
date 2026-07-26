@@ -1,3 +1,4 @@
+import csv
 import itertools
 import os
 
@@ -6,6 +7,9 @@ import sgl_kernel
 import torch
 import triton
 from bench_fused_qk_rope_with_cache import create_cos_sin_cache
+from sgl_kernel.fused_k_norm_rope_flashmla_torch import (
+    fused_k_norm_rope_flashmla as fused_k_norm_rope_flashmla_ref,
+)
 
 # Supported dtypes and their properties
 DTYPE_MAP = {
@@ -742,10 +746,297 @@ def make_cache_inputs(
     return q, k, q_weight, k_weight, cos_sin_cache, positions
 
 
+# ============================================================================
+# DeepSeek-V4 `fused_q_norm_rope` and `fused_k_norm_rope_flashmla` benchmarks
+# ============================================================================
+
+DSV4_HEAD_DIM = 512
+DSV4_ROPE_DIM = 64
+DSV4_MAX_POSITION_EMBEDDINGS = 65536
+
+QNORM_ROPE_SHAPES = [
+    (1, 8, DSV4_HEAD_DIM, DSV4_ROPE_DIM, "dsv4_decode_tp8"),
+    (1, 16, DSV4_HEAD_DIM, DSV4_ROPE_DIM, "dsv4_decode_tp4"),
+    (1, 32, DSV4_HEAD_DIM, DSV4_ROPE_DIM, "dsv4_decode_tp2"),
+    (1, 64, DSV4_HEAD_DIM, DSV4_ROPE_DIM, "dsv4_decode_tp1"),
+    (128, 64, DSV4_HEAD_DIM, DSV4_ROPE_DIM, "dsv4_prefill_128"),
+    (512, 64, DSV4_HEAD_DIM, DSV4_ROPE_DIM, "dsv4_prefill_512"),
+    (2048, 64, DSV4_HEAD_DIM, DSV4_ROPE_DIM, "dsv4_prefill_2048"),
+    (128, 64, 64, 64, "warp_head64"),
+    (128, 64, 128, 64, "warp_head128"),
+    (128, 64, 256, 64, "warp_head256"),
+    (4608, 64, 64, 64, "warp_head64_large"),
+    (4608, 64, 128, 64, "warp_head128_large"),
+    (4608, 64, 256, 64, "warp_head256_large"),
+]
+
+
+def native_q_norm_rope(
+    q_input: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    B, H, head_dim = q_input.shape
+    rope_dim = freqs_cis.shape[-1]
+    nope_dim = head_dim - rope_dim
+
+    x = q_input.float()
+    rms = x.pow(2).mean(dim=-1, keepdim=True)
+    x = x * torch.rsqrt(rms + eps)
+
+    freq_rows = freqs_cis[positions.long()].unsqueeze(1)
+    freq_re = freq_rows[..., 0::2]
+    freq_im = freq_rows[..., 1::2]
+
+    x_rope = x[..., nope_dim:]
+    x_re = x_rope[..., 0::2]
+    x_im = x_rope[..., 1::2]
+    rotated_re = x_re * freq_re - x_im * freq_im
+    rotated_im = x_re * freq_im + x_im * freq_re
+    rotated = torch.stack([rotated_re, rotated_im], dim=-1).flatten(-2)
+
+    out = torch.cat([x[..., :nope_dim], rotated], dim=-1)
+    return out.to(q_input.dtype)
+
+
+def make_q_norm_rope_inputs(
+    dtype_name: str,
+    num_tokens: int,
+    num_heads: int,
+    head_dim: int,
+    rope_dim: int,
+    max_pos: int = DSV4_MAX_POSITION_EMBEDDINGS,
+):
+    dtype = DTYPE_MAP.get(dtype_name, torch.bfloat16)
+    device = torch.device("xpu")
+
+    q_input = torch.randn(
+        num_tokens, num_heads, head_dim, device=device, dtype=dtype
+    ).contiguous()
+    q_output = torch.empty_like(q_input)
+    freqs_cis_complex = torch.randn(
+        max_pos, rope_dim // 2, dtype=torch.complex64, device=device
+    )
+    freqs_real = torch.view_as_real(freqs_cis_complex).flatten(-2).contiguous()
+    positions = torch.randint(
+        0, max_pos, (num_tokens,), dtype=torch.int32, device=device
+    )
+    return q_input, q_output, freqs_real, positions
+
+
+def benchmark_q_norm_rope_shape(
+    dtype_name: str,
+    num_tokens: int,
+    num_heads: int,
+    head_dim: int,
+    rope_dim: int,
+    label: str,
+):
+    dtype = DTYPE_MAP.get(dtype_name, torch.bfloat16)
+    itemsize = torch.tensor([], dtype=dtype).element_size()
+    rows = []
+
+    q_input, q_output, freqs_real, positions = make_q_norm_rope_inputs(
+        dtype_name, num_tokens, num_heads, head_dim, rope_dim
+    )
+
+    def native_fn() -> None:
+        native_q_norm_rope(q_input, freqs_real, positions, 1e-6)
+
+    quantiles = [0.5, 0.2, 0.8]
+    native_ms, _, _ = triton.testing.do_bench(native_fn, quantiles=quantiles)
+
+    def fused_fn() -> None:
+        sgl_kernel.fused_q_norm_rope(q_input, q_output, freqs_real, positions, 1e-6)
+
+    fused_ms, _, _ = triton.testing.do_bench(fused_fn, quantiles=quantiles)
+
+    qnorm_bytes = num_tokens * num_heads * head_dim * itemsize * 2
+    for provider, latency_ms in (
+        ("native_unfused", native_ms),
+        ("fused_q_norm_rope", fused_ms),
+    ):
+        latency_us = latency_ms * 1000.0
+        rows.append(
+            {
+                "shape_label": label,
+                "provider": provider,
+                "dtype": dtype_name,
+                "num_tokens": num_tokens,
+                "num_heads": num_heads,
+                "head_dim": head_dim,
+                "rope_dim": rope_dim,
+                "bytes_moved": qnorm_bytes,
+                "latency_us": round(latency_us, 3),
+                "gbps": round(qnorm_bytes / (latency_us * 1e-6) / 1e9, 2),
+            }
+        )
+    return rows
+
+
+def run_qnorm_rope_benchmarks(dtype_name: str = "bf16"):
+    print("\n=== DeepSeek-V4 fused_q_norm_rope shape benchmark ===")
+    all_rows = []
+    for num_tokens, num_heads, head_dim, rope_dim, label in QNORM_ROPE_SHAPES:
+        all_rows.extend(
+            benchmark_q_norm_rope_shape(
+                dtype_name, num_tokens, num_heads, head_dim, rope_dim, label
+            )
+        )
+
+    os.makedirs("benchmark/results", exist_ok=True)
+    out_csv = "benchmark/results/dsv4_fused_q_norm_rope.csv"
+    fieldnames = list(all_rows[0].keys())
+    with open(out_csv, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(all_rows)
+
+    print("\t".join(fieldnames))
+    for row in all_rows:
+        print("\t".join(str(row[column]) for column in fieldnames))
+    print(f"Wrote results CSV: {out_csv}")
+
+
+FLASHMLA_K_SHAPES = [
+    (1, "dsv4_k_decode_b1"),
+    (8, "dsv4_k_decode_b8"),
+    (32, "dsv4_k_decode_b32"),
+    (128, "dsv4_k_prefill_128"),
+    (512, "dsv4_k_prefill_512"),
+    (2048, "dsv4_k_prefill_2048"),
+    (4608, "dsv4_k_prefill_4608"),
+]
+
+
+def make_flashmla_k_inputs(
+    dtype_name: str,
+    num_tokens: int,
+    head_dim: int = DSV4_HEAD_DIM,
+    rope_dim: int = DSV4_ROPE_DIM,
+    page_size: int = 256,
+    max_pos: int = DSV4_MAX_POSITION_EMBEDDINGS,
+):
+    dtype = DTYPE_MAP.get(dtype_name, torch.bfloat16)
+    device = torch.device("xpu")
+
+    kv = torch.randn(num_tokens, head_dim, device=device, dtype=dtype).contiguous()
+    kv_weight = torch.randn(head_dim, device=device, dtype=dtype).contiguous()
+    freqs_cis_complex = torch.randn(
+        max_pos, rope_dim // 2, dtype=torch.complex64, device=device
+    )
+    freqs_real = torch.view_as_real(freqs_cis_complex).flatten(-2).contiguous()
+    positions = torch.randint(
+        0, max_pos, (num_tokens,), dtype=torch.int32, device=device
+    )
+    out_loc = torch.randperm(num_tokens, dtype=torch.int32, device=device)
+
+    npages = (num_tokens + page_size - 1) // page_size + 2
+    k_page_bytes = page_size * 584
+    kvcache = torch.zeros((npages, k_page_bytes), dtype=torch.uint8, device=device)
+
+    return kv, kv_weight, freqs_real, positions, out_loc, kvcache
+
+
+def benchmark_flashmla_k_shape(
+    dtype_name: str,
+    num_tokens: int,
+    label: str,
+    page_size: int = 256,
+):
+    dtype = DTYPE_MAP.get(dtype_name, torch.bfloat16)
+    itemsize = torch.tensor([], dtype=dtype).element_size()
+    head_dim = DSV4_HEAD_DIM
+    rope_dim = DSV4_ROPE_DIM
+    rows = []
+
+    kv, kv_weight, freqs_real, positions, out_loc, kvcache = make_flashmla_k_inputs(
+        dtype_name, num_tokens, head_dim, rope_dim, page_size
+    )
+
+    kvcache_test = kvcache.clone()
+
+    def fused_k_fn():
+        sgl_kernel.fused_k_norm_rope_flashmla(
+            kv, kv_weight, freqs_real, positions, out_loc, kvcache_test, 1e-6, page_size
+        )
+
+    quantiles = [0.5, 0.2, 0.8]
+    fused_k_ms, _, _ = triton.testing.do_bench(fused_k_fn, quantiles=quantiles)
+
+    kvcache_ref = kvcache.clone()
+
+    def native_k_fn():
+        fused_k_norm_rope_flashmla_ref(
+            kv, kv_weight, freqs_real, positions, out_loc, kvcache_ref, 1e-6, page_size
+        )
+
+    native_k_ms, _, _ = triton.testing.do_bench(native_k_fn, quantiles=quantiles)
+
+    flashmla_k_bytes = num_tokens * (head_dim * itemsize + 584)
+    fused_k_us = fused_k_ms * 1000.0
+    native_k_us = native_k_ms * 1000.0
+
+    rows.append(
+        {
+            "shape_label": label,
+            "provider": "fused_k_norm_rope_flashmla",
+            "dtype": dtype_name,
+            "num_tokens": num_tokens,
+            "head_dim": head_dim,
+            "rope_dim": rope_dim,
+            "bytes_moved": flashmla_k_bytes,
+            "latency_us": round(fused_k_us, 3),
+            "gbps": round(flashmla_k_bytes / (fused_k_us * 1e-6) / 1e9, 2),
+        }
+    )
+
+    rows.append(
+        {
+            "shape_label": label,
+            "provider": "native_unfused_ref",
+            "dtype": dtype_name,
+            "num_tokens": num_tokens,
+            "head_dim": head_dim,
+            "rope_dim": rope_dim,
+            "bytes_moved": flashmla_k_bytes,
+            "latency_us": round(native_k_us, 3),
+            "gbps": round(flashmla_k_bytes / (native_k_us * 1e-6) / 1e9, 2),
+        }
+    )
+
+    return rows
+
+
+def run_flashmla_k_benchmarks(dtype_name: str = "bf16"):
+    print("\n=== DeepSeek-V4 fused_k_norm_rope_flashmla shape benchmark ===")
+    all_rows = []
+    for num_tokens, label in FLASHMLA_K_SHAPES:
+        all_rows.extend(benchmark_flashmla_k_shape(dtype_name, num_tokens, label))
+
+    os.makedirs("benchmark/results", exist_ok=True)
+    out_csv = "benchmark/results/dsv4_fused_k_norm_rope_flashmla.csv"
+    fieldnames = list(all_rows[0].keys())
+    with open(out_csv, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(all_rows)
+
+    print("\t".join(fieldnames))
+    for row in all_rows:
+        print("\t".join(str(row[column]) for column in fieldnames))
+    print(f"Wrote results CSV: {out_csv}")
+
+
 if __name__ == "__main__":
     print("Running benchmarks...")
     benchmark.run(print_data=True)
     benchmark_cache.run(print_data=True)
+
+    dtype_name = os.environ.get("DTYPE", "bf16")
+    run_qnorm_rope_benchmarks(dtype_name)
+    run_flashmla_k_benchmarks(dtype_name)
 
     # Ensure results dir exists and write per-chunk CSV
     os.makedirs("benchmark/results", exist_ok=True)

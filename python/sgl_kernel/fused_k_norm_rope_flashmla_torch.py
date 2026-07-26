@@ -159,11 +159,15 @@ def fused_k_norm_rope_flashmla(
     #   value_base[b] = page[b] * page_bytes + offset[b] * 576
     #   scale_base[b] = page[b] * page_bytes + page_size*576 + offset[b]*8
     # ------------------------------------------------------------------
-    pages = out_loc.long() >> page_bits  # (B,)
-    offsets = out_loc.long() & (page_size - 1)  # (B,)
+    valid = out_loc >= 0
+    if not valid.any():
+        return
 
-    value_base = pages * page_bytes + offsets * _VALUE_BYTES  # (B,)
-    scale_base = pages * page_bytes + page_size * _VALUE_BYTES + offsets * 8  # (B,)
+    pages = out_loc[valid].long() >> page_bits  # (V,)
+    offsets = out_loc[valid].long() & (page_size - 1)  # (V,)
+
+    value_base = pages * page_bytes + offsets * _VALUE_BYTES  # (V,)
+    scale_base = pages * page_bytes + page_size * _VALUE_BYTES + offsets * 8  # (V,)
 
     flat_cache = kvcache.view(-1)  # (npages*page_bytes,) uint8
 
@@ -171,11 +175,11 @@ def fused_k_norm_rope_flashmla(
     # Step 5a: Scatter FP8 nope bytes → value[0..447]
     #
     # fp8_nope: (B, 448) reinterpreted as uint8 (1 byte per element).
-    # nope_idx: (B, 448) flat byte addresses.
+    # nope_idx: (V, 448) flat byte addresses.
     # ------------------------------------------------------------------
-    fp8_bytes = fp8_nope.reshape(B, _NOPE_DIM).view(torch.uint8)  # (B, 448)
+    fp8_bytes = fp8_nope[valid].reshape(-1, _NOPE_DIM).view(torch.uint8)  # (V, 448)
     nope_cols = torch.arange(_NOPE_DIM, device=device)  # (448,)
-    nope_idx = value_base.unsqueeze(1) + nope_cols.unsqueeze(0)  # (B, 448)
+    nope_idx = value_base.unsqueeze(1) + nope_cols.unsqueeze(0)  # (V, 448)
     flat_cache.index_put_((nope_idx.reshape(-1),), fp8_bytes.reshape(-1))
 
     # ------------------------------------------------------------------
@@ -183,12 +187,12 @@ def fused_k_norm_rope_flashmla(
     #
     # rope_out: (B, 64) fp32 → bf16 → (B, 128) uint8  (2 bytes per elem).
     # ------------------------------------------------------------------
-    rope_bf16 = rope_out.to(torch.bfloat16)  # (B,  64)
-    rope_bytes = rope_bf16.view(torch.uint8)  # (B, 128)
+    rope_bf16 = rope_out[valid].to(torch.bfloat16)  # (V,  64)
+    rope_bytes = rope_bf16.view(torch.uint8)  # (V, 128)
     rope_cols = torch.arange(128, device=device)  # (128,)
     rope_idx = (value_base + _NOPE_DIM).unsqueeze(1) + rope_cols.unsqueeze(
         0
-    )  # (B, 128)
+    )  # (V, 128)
     flat_cache.index_put_((rope_idx.reshape(-1),), rope_bytes.reshape(-1))
 
     # ------------------------------------------------------------------
@@ -196,7 +200,7 @@ def fused_k_norm_rope_flashmla(
     #
     # ue8m0: (B, 7) int32 → uint8.
     # ------------------------------------------------------------------
-    ue8m0_bytes = ue8m0.to(torch.uint8)  # (B, 7)
+    ue8m0_bytes = ue8m0[valid].to(torch.uint8)  # (V, 7)
     scale_cols = torch.arange(_NOPE_WARPS, device=device)  # (7,)
-    scale_idx = scale_base.unsqueeze(1) + scale_cols.unsqueeze(0)  # (B, 7)
+    scale_idx = scale_base.unsqueeze(1) + scale_cols.unsqueeze(0)  # (V, 7)
     flat_cache.index_put_((scale_idx.reshape(-1),), ue8m0_bytes.reshape(-1))

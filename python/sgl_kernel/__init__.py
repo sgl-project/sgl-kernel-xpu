@@ -32,6 +32,7 @@ from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
     fused_add_rmsnorm,
     fused_inplace_qknorm_rope,
+    fused_k_norm_rope_flashmla,
     fused_q_norm_rope,
     fused_qk_norm_rope,
     fused_qk_rope,
@@ -55,7 +56,9 @@ from sgl_kernel.flash_compress_128_torch import (
     flash_compress128_prefill,
 )
 from sgl_kernel.fp8_paged_mqa_logits import fp8_paged_mqa_logits_triton
-from sgl_kernel.fused_k_norm_rope_flashmla_torch import fused_k_norm_rope_flashmla
+from sgl_kernel.fused_k_norm_rope_flashmla_torch import (
+    fused_k_norm_rope_flashmla as fused_k_norm_rope_flashmla_torch,
+)
 from sgl_kernel.fused_norm_rope_v2_torch import compress_norm_rope_store
 from sgl_kernel.fused_q_indexer_rope_hadamard_quant_torch import (
     fused_q_indexer_rope_hadamard_quant,

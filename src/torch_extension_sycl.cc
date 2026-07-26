@@ -234,6 +234,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_inplace_qknorm_rope(Tensor! q, Tensor! k, Tensor q_weight, Tensor k_weight, "
       "Tensor cos_sin_cache, Tensor positions, bool is_neox, float eps, int head_dim=0, int rope_dim=0) -> ()");
   m.impl("fused_inplace_qknorm_rope", torch::kXPU, &at::native::xpu::fused_inplace_qknorm_rope);
+  m.def(
+      "fused_q_norm_rope(Tensor q_input, Tensor! q_output, Tensor freqs_cis, Tensor positions, "
+      "float eps) -> ()");
+  m.impl("fused_q_norm_rope", torch::kXPU, &at::native::xpu::fused_q_norm_rope);
+  m.def(
+      "fused_k_norm_rope_flashmla(Tensor kv, Tensor kv_weight, Tensor freqs_cis, Tensor positions, "
+      "Tensor out_loc, Tensor! kvcache, float eps, int page_size) -> ()");
+  m.impl("fused_k_norm_rope_flashmla", torch::kXPU, &at::native::xpu::fused_k_norm_rope_flashmla);
   /*
    * Fused QK RoPE (no RMS_Norm)
    */

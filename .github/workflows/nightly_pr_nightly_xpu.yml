@@ -64,6 +64,15 @@ jobs:
             -e HF_TOKEN=$(cat ~/huggingface_token.txt) \
             intel/sgl-kernel-xpu-dev:latest
 
+      - name: Sync tests/ from checkout into container
+        # The nightly image bakes tests/ at build time, so any suite added to
+        # tests/run_suite.py after the last image publish is missing at runtime
+        # (e.g. --suite nightly-xpu → "invalid choice"). Copy the checked-out
+        # tests/ over the baked copy so the workflow always exercises the
+        # current source-of-truth harness against the shipped wheel.
+        run: |
+          docker cp ./tests/. nightly_sglkernel_xpu:/root/sglang/sgl-kernel-xpu/tests/
+
       - name: Install run_suite extras + HF login
         timeout-minutes: 20
         run: |

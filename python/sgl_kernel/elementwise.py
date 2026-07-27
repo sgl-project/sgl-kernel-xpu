@@ -149,6 +149,8 @@ def fused_inplace_qknorm_rope(
     positions: torch.Tensor,
     is_neox: bool,
     eps: float = 1e-6,
+    head_dim: int = 0,
+    rope_dim: int = 0,
 ) -> None:
     r"""Apply fused RMSNorm + RoPE to Q/K using a precomputed cos/sin cache.
 
@@ -177,13 +179,26 @@ def fused_inplace_qknorm_rope(
         Whether to apply NeoX-style rotary layout.
     eps: float
         Epsilon for RMS normalization.
+    head_dim: int
+        Optional explicit head dimension. Defaults to ``q.size(-1)`` when set to 0.
+    rope_dim: int
+        Optional explicit rotary dimension. Defaults to ``cos_sin_cache.size(-1)`` when set to 0.
 
     Note
     ----
     This is an in-place operation that modifies ``q`` and ``k`` directly.
     """
     torch.ops.sgl_kernel.fused_inplace_qknorm_rope(
-        q, k, q_weight, k_weight, cos_sin_cache, positions, is_neox, eps
+        q,
+        k,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        is_neox,
+        eps,
+        head_dim,
+        rope_dim,
     )
 
 

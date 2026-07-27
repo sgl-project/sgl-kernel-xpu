@@ -39,6 +39,10 @@
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "fmha_fusion.hpp"
 
+#ifndef FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+#define FMHA_PREFILL_ENABLE_SCORE_BLOCK2D 0
+#endif
+
 namespace cutlass::fmha {
 
 template <int Stages>
@@ -194,6 +198,7 @@ struct FMHAFwdMainloop<
   static constexpr bool PagedKV = PagedKV_;
   static constexpr bool LocalMask = LocalMask_;
   static constexpr bool PackGQA = PackGQA_;
+  static constexpr bool ScoreBlock2D = FMHA_PREFILL_ENABLE_SCORE_BLOCK2D;
 
   // FP8 KV cache: enabled when the K element type is an 8-bit float. The fp8
   // K/V are dequantized (cast to ElementQ and multiplied by the per-tensor
@@ -208,6 +213,7 @@ struct FMHAFwdMainloop<
     int max_num_pages_per_seq = 0;
     int window_size_left = -1;
     int window_size_right = -1;
+    ElementS* ptr_score = nullptr;
   };
 
   // Kernel-facing parameters
@@ -224,7 +230,7 @@ struct FMHAFwdMainloop<
 
   FMHAFwdMainloop(Params const& params_, SharedStorage&) : params(params_) {}
 
-  static constexpr Params to_underlying_arguments(Arguments const& args, void* /* workspace */) {
+  static constexpr Params to_underlying_arguments(Arguments const& args, void* workspace) {
     constexpr double kLog2e = 1.4426950408889634074;  // log_2(e)
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
     return Params{
@@ -233,7 +239,8 @@ struct FMHAFwdMainloop<
         args.page_size,
         args.max_num_pages_per_seq,
         args.window_size_left,
-        args.window_size_right};
+        args.window_size_right,
+        ScoreBlock2D ? reinterpret_cast<ElementS*>(workspace) : nullptr};
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
@@ -254,7 +261,7 @@ struct FMHAFwdMainloop<
     return params.ptr_page_table[batch_offset + next_page_logical_idx] * tiles_per_page + K % tiles_per_page;
   }
 
-  template <typename QVCoord>
+  template <int StaticScoreMode = -1, typename QVCoord>
   CUTLASS_DEVICE void operator()(
       TensorQ2D const& Q_2D,  // (q,d)
       TensorK2D const& K_2D,  // (k,d)
@@ -275,7 +282,8 @@ struct FMHAFwdMainloop<
       int discard_seq_coord,
       TensorK_cache2D const& K_cache_2D = TensorK_cache2D{},
       TensorV_cache2D const& V_cache_2D = TensorV_cache2D{},
-      float scale_k = 1.0f) {  // FP8 K per-tensor dequant scale
+      float scale_k = 1.0f,  // FP8 K per-tensor dequant scale
+      ElementS* score_head_ptr = nullptr) {
     using namespace sycl::ext::oneapi::this_work_item;
 
     // Short dimension names:
@@ -296,6 +304,12 @@ struct FMHAFwdMainloop<
     Tensor cK_cache = make_identity_tensor(K_cache_2D.shape());   // (k,d)
     Tensor cV_cache = make_identity_tensor(V_cache_2D.shape());   // (v,k)
     Tensor cP = make_identity_tensor(take<0, 2>(TileShapeQK{}));  // (q,k)
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+    auto score_shape = make_shape(int(size<0>(Q_2D)), seq_len_kv_cache);
+    auto score_layout = make_layout(score_shape, make_stride(seq_len_kv_cache, Int<1>{}));
+    Tensor Score = make_tensor(make_gmem_ptr(score_head_ptr), score_layout);
+    Tensor cScore = make_identity_tensor(score_shape);  // (q,k)
+#endif
 
     /* Partition global tensors into workgroup tiles */
     Tensor gQ = local_tile(cQ, TileShapeQK{}, append(blk_qv, _), Step<_1, X, _1>{});          // (q,d,D)
@@ -306,6 +320,9 @@ struct FMHAFwdMainloop<
     Tensor gK_cache = local_tile(cK_cache, TileShapeQK{}, make_coord(_, _, _), Step<X, _1, _1>{});        // (k,d,K,D)
     Tensor gV_cache = local_tile(cV_cache, tile_shape_v, make_coord(get<1>(blk_qv), _));                  // (v,k,K)
     Tensor gV_cache_split = local_tile(gV_cache, TileShapePV{}, make_coord(_, _, 0), Step<X, _1, _1>{});  // (v,k,VV,K)
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+    Tensor gScore = local_tile(cScore, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), _));  // (q,k,K)
+#endif
 
     /* Create global -> register copies */
     TiledCopyQ copy_q{Q_2D};
@@ -317,6 +334,10 @@ struct FMHAFwdMainloop<
     /* Create MMAs */
     TiledMMAQK mma_qk{};
     TiledMMAPV mma_pv{};
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+    auto copy_score_store = make_block_2d_copy_D(mma_qk, Score);
+    auto copy_score_load = make_block_2d_copy_C(mma_qk, Score);
+#endif
 
     /* Slice TiledCopy/TiledMMA operations down to to work-item level */
     auto thr_copy_q = copy_q.get_slice(thr_id);
@@ -326,6 +347,10 @@ struct FMHAFwdMainloop<
     auto thr_copy_v_cache = copy_v_cache.get_slice(thr_id);
     auto thr_mma_qk = mma_qk.get_slice(thr_id);
     auto thr_mma_pv = mma_pv.get_slice(thr_id);
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+    auto thr_copy_score_store = copy_score_store.get_slice(thr_id);
+    auto thr_copy_score_load = copy_score_load.get_slice(thr_id);
+#endif
 
     /* Partition coordinate tensors for copy */
     auto tQgQ = thr_copy_q.partition_S(gQ);        // (atom_val,q',d',D)
@@ -343,6 +368,12 @@ struct FMHAFwdMainloop<
 
     auto tSrS = thr_mma_qk.partition_sg_fragment_C(cP);
     auto tArP = thr_mma_pv.partition_sg_fragment_A(cP);
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+    auto tScoreStoreR = thr_copy_score_store.partition_sg_fragment_S(gScore(_, _, 0));
+    auto tScoreStoreG = thr_copy_score_store.partition_D(gScore);
+    auto tScoreLoadG = thr_copy_score_load.partition_S(gScore);
+    auto tScoreLoadR = thr_copy_score_load.partition_sg_fragment_D(gScore(_, _, 0));
+#endif
 
     auto tVrV = thr_copy_v.partition_sg_fragment_D(gV_split(_, _, 0, 0));
     auto tArV = thr_mma_pv.partition_sg_fragment_B(gV_split(_, _, 0, 0));
@@ -373,11 +404,13 @@ struct FMHAFwdMainloop<
     if constexpr (PagedKV) {
       next_page_idx = get_physical_k_tile(blk_k0, l_coord, seq_len_kv_cache);
     }
-    for (int D = 0; D < size<3>(pQgQ); D++) {
-      prefetch(prefetch_q, pQgQ(_, _, _, D));
-    }
-    for (int D = 0; D < size<4>(pKgK); D++) {
-      prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
+    if constexpr (!(ScoreBlock2D && StaticScoreMode == 1)) {
+      for (int D = 0; D < size<3>(pQgQ); D++) {
+        prefetch(prefetch_q, pQgQ(_, _, _, D));
+      }
+      for (int D = 0; D < size<4>(pKgK); D++) {
+        prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
+      }
     }
     // Always initialize the per-WG accumulators: the caller (kernel) may pass
     // blk_k0 > 0 when sliding-window pruning skips leading K blocks, so we can
@@ -414,15 +447,22 @@ struct FMHAFwdMainloop<
         next_page_idx = get_physical_k_tile(next_page_idx, l_coord, seq_len_kv_cache);
       }
 
-      /* GEMM 1: S = K * Q */
-      clear(tSrS);
-      CUTLASS_PRAGMA_UNROLL
-      for (int D = 0; D < size<4>(tKgK); D++) {
-        copy(copy_q, tQgQ(_, _, _, D), tQrQ);
-        copy(copy_k_cache, tKgK_cache(_, _, _, page_idx, D), tKrK);
-        reorder(tQrQ, tSrQ);
-        reorder(tKrK, tSrK);
-        cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
+      if constexpr (ScoreBlock2D && StaticScoreMode == 1) {
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+        copy(copy_score_load, tScoreLoadG(_, _, _, K), tScoreLoadR);
+        reorder(tScoreLoadR, tSrS);
+#endif
+      } else {
+        /* GEMM 1: S = K * Q */
+        clear(tSrS);
+        CUTLASS_PRAGMA_UNROLL
+        for (int D = 0; D < size<4>(tKgK); D++) {
+          copy(copy_q, tQgQ(_, _, _, D), tQrQ);
+          copy(copy_k_cache, tKgK_cache(_, _, _, page_idx, D), tKrK);
+          reorder(tQrQ, tSrQ);
+          reorder(tKrK, tSrK);
+          cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
+        }
       }
 
       /* V prefetch for GEMM 2 */
@@ -432,7 +472,7 @@ struct FMHAFwdMainloop<
       }
 
       /* Causal masking */
-      if constexpr (CausalMask) {
+      if constexpr (CausalMask && !(ScoreBlock2D && StaticScoreMode == 1)) {
         if (need_causal) {
           /* Masking scalars */
           // TODO: use a more general code path for causal masking.
@@ -459,7 +499,7 @@ struct FMHAFwdMainloop<
       }
 
       /* Local/sliding window masking */
-      if constexpr (LocalMask) {
+      if constexpr (LocalMask && !(ScoreBlock2D && StaticScoreMode == 1)) {
         Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
         Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
         auto cS_thread = thr_mma_qk.partition_C(gP);
@@ -480,6 +520,8 @@ struct FMHAFwdMainloop<
       }
 
       /* k masking for remainder tiles */
+      // The block2D score store clips tail columns at seq_len, so load mode
+      // must mask the remainder again before softmax.
       if (check_remainder_k && K == total_blk - 1) {
         FragSCol k_rem_mask;
         int k_val = get<0>(tKgK_cache(0, 0, 0, K, 0));
@@ -494,8 +536,23 @@ struct FMHAFwdMainloop<
         }
       }
 
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+      if constexpr (ScoreBlock2D && StaticScoreMode == 0) {
+        reorder(tSrS, tScoreStoreR);
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tScoreStoreR.size(); ++i) {
+          tScoreStoreR(i) *= qk_scale;
+        }
+        copy(copy_score_store, tScoreStoreR, tScoreStoreG(_, _, _, K));
+      }
+#endif
+
       /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
-      auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, qk_scale);
+      ElementS softmax_scale = qk_scale;
+      if constexpr (ScoreBlock2D && StaticScoreMode == 1) {
+        softmax_scale = ElementS(1);
+      }
+      auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, softmax_scale);
       reorder(tSrS, tArP);
 
       /* GEMM 2: A += P * V, split in v dimension. */
@@ -513,8 +570,10 @@ struct FMHAFwdMainloop<
       }
 
       /* K prefetch */
-      for (int D = 0; D < size<4>(pKgK); D++) {
-        prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
+      if constexpr (!(ScoreBlock2D && StaticScoreMode == 1)) {
+        for (int D = 0; D < size<4>(pKgK); D++) {
+          prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
+        }
       }
 
       barrier_wait(ScopeWorkgroup);

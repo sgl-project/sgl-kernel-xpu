@@ -9,15 +9,24 @@ batch_size_range = [989, 99, 1]
 vocab_size_range = [128256, 32000, 1024]
 min_p_range = [0.05, 0.1, 0.5]
 dtype_range = [torch.float32]
+deterministic_range = [True]
 
-configs = list(product(batch_size_range, vocab_size_range, min_p_range, dtype_range))
+configs = list(
+    product(
+        batch_size_range,
+        vocab_size_range,
+        min_p_range,
+        dtype_range,
+        deterministic_range,
+    )
+)
 
 all_results = []
 
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["batch_size", "vocab_size", "min_p", "dtype"],
+        x_names=["batch_size", "vocab_size", "min_p", "dtype", "deterministic"],
         x_vals=configs,
         line_arg="provider",
         line_vals=["sgl_kernel"],
@@ -28,9 +37,10 @@ all_results = []
         args={},
     )
 )
-def benchmark(batch_size, vocab_size, min_p, dtype, provider):
+def benchmark(batch_size, vocab_size, min_p, dtype, deterministic, provider):
     print(
-        f"benchmark {provider} with batch_size={batch_size} vocab_size={vocab_size} min_p={min_p} dtype={dtype}"
+        f"benchmark {provider} with batch_size={batch_size} vocab_size={vocab_size} "
+        f"min_p={min_p} dtype={dtype} deterministic={deterministic}"
     )
     torch.set_default_device("xpu")
     torch.xpu.manual_seed_all(42)
@@ -45,10 +55,12 @@ def benchmark(batch_size, vocab_size, min_p, dtype, provider):
     # Warmup
     output = None
     for _ in range(10):
-        output = min_p_sampling_from_probs(probs, min_p)
+        output = min_p_sampling_from_probs(probs, min_p, deterministic=deterministic)
     torch.xpu.synchronize()
 
-    bench_lambda = lambda: min_p_sampling_from_probs(probs, min_p)
+    bench_lambda = lambda: min_p_sampling_from_probs(
+        probs, min_p, deterministic=deterministic
+    )
 
     quantiles = [0.5, 0.25, 0.75]
     ms, _, _ = triton.testing.do_bench(
@@ -70,6 +82,7 @@ def benchmark(batch_size, vocab_size, min_p, dtype, provider):
             "vocab_size": vocab_size,
             "min_p": min_p,
             "dtype": str(dtype),
+            "deterministic": deterministic,
             "provider": provider,
             "bandwidth_gb_s": bandwidth_gb_s,
             "ms": ms,

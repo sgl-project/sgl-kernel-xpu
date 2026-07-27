@@ -28,7 +28,7 @@ inline float get_max_value(const Group& grp, const DType* probs, uint32_t row_id
   return sycl::reduce_over_group(grp, thread_max, sycl::maximum<float>());
 }
 
-// Slower than `sycl::inclusive_scan_over_group` but its deterministic.
+// Slower than `sycl::exclusive_scan_over_group` but its deterministic.
 template <uint32_t VEC_SIZE, uint32_t kWgSize, typename Item>
 inline void deterministic_inclusive_sum(
     const Item& item,

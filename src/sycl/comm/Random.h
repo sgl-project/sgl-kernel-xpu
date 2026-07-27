@@ -1,5 +1,4 @@
 #pragma once
-#include <oneapi/dpl/internal/random_impl/philox_engine.h>
 
 #include <array>
 #include <cstdint>
@@ -24,10 +23,7 @@ inline void philox_round(std::array<uint32_t, 4>& ctr, const std::array<uint32_t
   const uint32_t lo1 = static_cast<uint32_t>(prod1);
 
   const std::array<uint32_t, 4> out = {
-      static_cast<uint32_t>(hi1 ^ ctr[1] ^ key[0]),
-      lo1,
-      static_cast<uint32_t>(hi0 ^ ctr[3] ^ key[1]),
-      lo0};
+      static_cast<uint32_t>(hi1 ^ ctr[1] ^ key[0]), lo1, static_cast<uint32_t>(hi0 ^ ctr[3] ^ key[1]), lo0};
   ctr = out;
 }
 
@@ -47,10 +43,7 @@ inline uint32_t philox4x32_10(std::array<uint32_t, 4> ctr, std::array<uint32_t, 
 inline float philox_uniform(uint64_t seed, uint64_t offset, uint32_t subsequence, uint32_t round) {
   const std::array<uint32_t, 2> key = {static_cast<uint32_t>(seed), 0u};
   const std::array<uint32_t, 4> counter = {
-      static_cast<uint32_t>(offset),
-      static_cast<uint32_t>((offset >> 32) ^ (seed >> 32)),
-      subsequence,
-      round};
+      static_cast<uint32_t>(offset), static_cast<uint32_t>((offset >> 32) ^ (seed >> 32)), subsequence, round};
   const uint32_t x = philox::philox4x32_10(counter, key);
   // 24-bit mantissa uniform in [0, 1).
   return static_cast<float>(x >> 8) * (1.0f / 16777216.0f);

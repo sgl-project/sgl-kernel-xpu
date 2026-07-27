@@ -813,6 +813,16 @@ struct FmhaDecodeRunner {
   void operator()(const Arguments& params) const;
 };
 
+// Non-paged (no_page) decode is split into its own runner type (no PAGE_SIZE
+// template parameter) so its kernel instantiations are compiled in translation
+// units separate from the paged decode path, producing independent shared
+// libraries and lowering peak compiler memory. Non-paged decode supports bf16
+// queries only (no fp8 KV cache, no split-KV).
+template <int QG_SZ, int HEAD_DIM>
+struct FmhaDecodeNpRunner {
+  void operator()(const Arguments& params) const;
+};
+
 template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
 struct FmhaSplitDecodeRunner {
   void operator()(const Arguments& params) const;
@@ -820,9 +830,8 @@ struct FmhaSplitDecodeRunner {
 
 // FP8 KV-cache decode paths are split into their own runner types so that the
 // (heavy) fp8 e4m3/e5m2 kernel instantiations are compiled in a separate
-// translation unit from the bf16/fp16 paged decode path. This keeps the peak
+// translation unit from the bf16 paged decode path. This keeps the peak
 // compiler memory of any single decode TU low (avoids OOM during AOT build).
-// The paged decode wrapper forwards to these when params.is_e4m3 || is_e5m2.
 template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
 struct FmhaDecodeFp8Runner {
   void operator()(const Arguments& params) const;

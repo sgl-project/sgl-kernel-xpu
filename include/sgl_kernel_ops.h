@@ -115,7 +115,7 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
-void fused_qk_norm_rope_with_cos_sin_cache_inplace(
+void fused_inplace_qknorm_rope(
     torch::Tensor& q,
     torch::Tensor& k,
     torch::Tensor& q_weight,
@@ -123,7 +123,9 @@ void fused_qk_norm_rope_with_cos_sin_cache_inplace(
     torch::Tensor& cos_sin_cache,
     torch::Tensor& positions,
     bool is_neox,
-    double eps);
+    double eps,
+    int64_t head_dim,
+    int64_t rope_dim);
 void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize);
 void topk_sigmoid(
     at::Tensor& topk_weights,
@@ -617,6 +619,22 @@ void fast_topk_transform_ragged_interface(
     const at::Tensor& topk_indices_offset,
     std::optional<at::Tensor> row_starts_opt);
 
+/*
+ * Compress plan kernels
+ */
+namespace at::native::xpu {
+
+torch::Tensor plan_compress_decode(
+    torch::Tensor req_pool_indices,
+    torch::Tensor req_to_token,
+    torch::Tensor full_to_state,
+    torch::Tensor seq_lens,
+    int64_t compress_ratio,
+    int64_t swa_page_size,
+    int64_t ring_size);
+
+}  // namespace at::native::xpu
+
 namespace flash {
 /*
  * From fa2 sparse
@@ -746,6 +764,40 @@ void sgemm_lora_a_fwd(
     const torch::Tensor& lora_ranks,              // [num_loras,]
     const std::optional<torch::Tensor>& seg_lens  // [num_segments,]
 );
+
+/*
+ * From GDN (Gated DeltaNet) attention (Intel Xe2)
+ */
+void gdn_attention(
+    torch::Tensor& core_attn_out,
+    torch::Tensor& z,
+    const torch::Tensor& projected_states_qkvz,
+    const torch::Tensor& projected_states_ba,
+    const int64_t num_k_heads,
+    const int64_t num_v_heads,
+    const int64_t head_k_dim,
+    const int64_t head_v_dim,
+    torch::Tensor& conv_state,
+    torch::Tensor& ssm_state,
+    const torch::Tensor& conv_weights,
+    const std::optional<torch::Tensor>& conv_bias,
+    const std::string& activation,
+    const torch::Tensor& A_log,
+    const torch::Tensor& dt_bias,
+    const int64_t num_prefills,
+    const int64_t num_decodes,
+    const int64_t num_spec_decodes,
+    const std::optional<torch::Tensor>& has_initial_state,
+    const std::optional<torch::Tensor>& non_spec_query_start_loc,
+    const std::optional<torch::Tensor>& non_spec_token_indx,
+    const std::optional<torch::Tensor>& non_spec_state_indices_tensor,
+    const std::optional<torch::Tensor>& spec_query_start_loc,
+    const std::optional<torch::Tensor>& spec_token_indx,
+    const std::optional<torch::Tensor>& spec_state_indices_tensor,
+    const std::optional<torch::Tensor>& num_accepted_tokens,
+    const int64_t num_actual_tokens,
+    const int64_t tp_size,
+    const bool reorder_input);
 
 /*
  * Mamba causal conv1d (XPU)

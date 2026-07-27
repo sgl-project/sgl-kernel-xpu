@@ -115,7 +115,7 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
-void fused_qk_norm_rope_with_cos_sin_cache_inplace(
+void fused_inplace_qknorm_rope(
     torch::Tensor& q,
     torch::Tensor& k,
     torch::Tensor& q_weight,
@@ -609,6 +609,22 @@ void fast_topk_transform_ragged_interface(
     at::Tensor& topk_indices_ragged,
     const at::Tensor& topk_indices_offset,
     std::optional<at::Tensor> row_starts_opt);
+
+/*
+ * Compress plan kernels
+ */
+namespace at::native::xpu {
+
+torch::Tensor plan_compress_decode(
+    torch::Tensor req_pool_indices,
+    torch::Tensor req_to_token,
+    torch::Tensor full_to_state,
+    torch::Tensor seq_lens,
+    int64_t compress_ratio,
+    int64_t swa_page_size,
+    int64_t ring_size);
+
+}  // namespace at::native::xpu
 
 namespace flash {
 /*

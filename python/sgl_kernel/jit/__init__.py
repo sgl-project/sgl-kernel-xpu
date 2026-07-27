@@ -28,6 +28,7 @@ if is_xpu():
     )
     from .moe_align_block_size import moe_align_block_size
     from .norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm, rmsnorm
+    from .per_tensor_quant_fp8 import per_tensor_quant_fp8
     from .per_token_group_quant_8bit_v2 import per_token_group_quant_8bit_v2
     from .rope import apply_rope_inplace, apply_rope_inplace_with_kvcache
     from .timestep_embedding import timestep_embedding
@@ -43,6 +44,7 @@ if is_xpu():
         # Kernels
         "can_use_fused_inplace_qknorm",
         "fused_inplace_qknorm",
+        "per_tensor_quant_fp8",
         "moe_align_block_size",
         "per_token_group_quant_8bit_v2",
         "rmsnorm",

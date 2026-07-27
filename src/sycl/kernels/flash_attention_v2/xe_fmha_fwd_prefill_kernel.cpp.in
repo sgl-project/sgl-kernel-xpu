@@ -77,8 +77,13 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@>::opera
     using AppendSubgroupLayoutQK = cute::Layout<
         cute::Shape<cute::Int<@APPENDKV_Q256_NUM_SG@>, cute::_1, cute::_1>,
         cute::Stride<cute::_1, cute::_1, cute::_1>>;
+#if @HEAD_DIM@ == 64
     FMHAConfig<false, false, false, AppendTileShapeQK, AppendTileShapePV, AppendTileShapeOutput,
-               AppendSubgroupLayoutQK>::run_paged(params);
+               AppendSubgroupLayoutQK>::run_paged_wide_append(params);
+#else
+    FMHAConfig<false, false, false, AppendTileShapeQK, AppendTileShapePV, AppendTileShapeOutput,
+               AppendSubgroupLayoutQK>::run_paged_direct_append(params);
+#endif
     return;
   }
 #endif

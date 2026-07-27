@@ -375,7 +375,7 @@ def min_p_sampling_from_probs(
 
     Note
     ----
-    This function expects float32 inputs, and the output is int32.
+    Output of this function is int32.
     """
     if check_nan:
         if torch.any(torch.isnan(probs)):

@@ -243,12 +243,17 @@ void min_p_sampling_from_probs(
   const int batch_size = output.size(0);
   const int vocab_size = probs.size(1);
 
+  // Not bounds-checked (would need a device sync per call): caller must ensure
+  // maybe_indices values lie within [0, probs.size(0)).
   const int64_t* indices_ptr = nullptr;
   if (maybe_indices.has_value()) {
     CHECK_INPUT((*maybe_indices));
     TORCH_CHECK(maybe_indices->scalar_type() == torch::kInt64, "maybe_indices must be int64");
     TORCH_CHECK(maybe_indices->size(0) == batch_size, "maybe_indices size must match batch_size");
     indices_ptr = maybe_indices->data_ptr<int64_t>();
+  } else {
+    TORCH_CHECK(
+        probs.size(0) == batch_size, "probs.size(0) must match output.size(0) when maybe_indices is not provided");
   }
 
   const float* min_p_ptr = nullptr;
@@ -258,6 +263,8 @@ void min_p_sampling_from_probs(
     TORCH_CHECK(maybe_min_p_arr->scalar_type() == torch::kFloat32, "maybe_min_p_arr must be float32");
     TORCH_CHECK(maybe_min_p_arr->size(0) == batch_size, "maybe_min_p_arr size must match batch_size");
     min_p_ptr = maybe_min_p_arr->data_ptr<float>();
+  } else {
+    TORCH_CHECK(min_p_val >= 0.0 && min_p_val <= 1.0, "min_p_val must be within [0, 1]");
   }
 
   auto generator = at::get_generator_or_default<at::XPUGeneratorImpl>(gen, at::xpu::detail::getDefaultXPUGenerator());

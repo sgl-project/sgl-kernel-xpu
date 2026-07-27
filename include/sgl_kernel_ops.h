@@ -115,13 +115,26 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
+void fused_inplace_qknorm_rope(
+    torch::Tensor& q,
+    torch::Tensor& k,
+    torch::Tensor& q_weight,
+    torch::Tensor& k_weight,
+    torch::Tensor& cos_sin_cache,
+    torch::Tensor& positions,
+    bool is_neox,
+    double eps,
+    int64_t head_dim,
+    int64_t rope_dim);
 void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize);
 void topk_sigmoid(
     at::Tensor& topk_weights,
     at::Tensor& topk_indices,
     at::Tensor& gating_output,
     bool renormalize,
-    const c10::optional<at::Tensor>& correction_bias);
+    const c10::optional<at::Tensor>& correction_bias,
+    double routed_scaling_factor = 1.0,
+    int64_t num_fused_shared_experts = 0);
 
 std::tuple<at::Tensor, at::Tensor> rotary_embedding(
     at::Tensor& positions,
@@ -312,16 +325,20 @@ void topk_sigmoid(
     torch::Tensor& topk_indices,
     torch::Tensor& gating_output,
     bool renormalize,
-    const std::optional<torch::Tensor>& correction_bias);
+    const std::optional<torch::Tensor>& correction_bias,
+    double routed_scaling_factor = 1.0,
+    int64_t num_fused_shared_experts = 0);
 torch::Tensor swiglu_gpt_oss_sigmoid_alpha(torch::Tensor x, double alpha, double limit);
 
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
-    at::Tensor& bias,
+    const std::optional<at::Tensor>& bias,
     int64_t num_expert_group,
     int64_t topk_group,
     int64_t topk,
     int64_t num_fused_shared_experts,
+    int64_t scoring_func,
+    bool renormalize,
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output);
 
@@ -476,6 +493,16 @@ void hc_pre_big_fuse(
     std::optional<double> norm_eps = std::nullopt);
 
 /*
+ * hc_post
+ */
+void hc_post(
+    const at::Tensor& x,
+    const at::Tensor& residual,
+    const at::Tensor& post_layer_mix,
+    const at::Tensor& comb_res_mix,
+    at::Tensor& out);
+
+/*
  * hc_pre GEMM + row-wise square sum
  */
 void hc_pre_gemm_sqr_sum(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, const at::Tensor& B);
@@ -584,6 +611,22 @@ void fast_topk_transform_ragged_interface(
     at::Tensor& topk_indices_ragged,
     const at::Tensor& topk_indices_offset,
     std::optional<at::Tensor> row_starts_opt);
+
+/*
+ * Compress plan kernels
+ */
+namespace at::native::xpu {
+
+torch::Tensor plan_compress_decode(
+    torch::Tensor req_pool_indices,
+    torch::Tensor req_to_token,
+    torch::Tensor full_to_state,
+    torch::Tensor seq_lens,
+    int64_t compress_ratio,
+    int64_t swa_page_size,
+    int64_t ring_size);
+
+}  // namespace at::native::xpu
 
 namespace flash {
 /*
@@ -703,3 +746,72 @@ void embedding_lora_a_fwd(
     const std::optional<torch::Tensor>& extra_embeddings,  // [num_loras, num_extra_tokens, max_rank]
     const std::optional<torch::Tensor>& seg_lens           // [num_segments,]
 );
+
+void sgemm_lora_a_fwd(
+    torch::Tensor& output,         // [num_tokens, stacknum*max_rank]
+    const torch::Tensor& input_x,  // [num_tokens, input_dim]
+    const torch::Tensor& weights,  // [num_loras, stack_num*max_rank, input_dim]
+    const int64_t stack_num,
+    const torch::Tensor& seg_indptr,              // [num_segments + 1,]
+    const torch::Tensor& weight_indices,          // [num_segments,]
+    const torch::Tensor& lora_ranks,              // [num_loras,]
+    const std::optional<torch::Tensor>& seg_lens  // [num_segments,]
+);
+
+/*
+ * From GDN (Gated DeltaNet) attention (Intel Xe2)
+ */
+void gdn_attention(
+    torch::Tensor& core_attn_out,
+    torch::Tensor& z,
+    const torch::Tensor& projected_states_qkvz,
+    const torch::Tensor& projected_states_ba,
+    const int64_t num_k_heads,
+    const int64_t num_v_heads,
+    const int64_t head_k_dim,
+    const int64_t head_v_dim,
+    torch::Tensor& conv_state,
+    torch::Tensor& ssm_state,
+    const torch::Tensor& conv_weights,
+    const std::optional<torch::Tensor>& conv_bias,
+    const std::string& activation,
+    const torch::Tensor& A_log,
+    const torch::Tensor& dt_bias,
+    const int64_t num_prefills,
+    const int64_t num_decodes,
+    const int64_t num_spec_decodes,
+    const std::optional<torch::Tensor>& has_initial_state,
+    const std::optional<torch::Tensor>& non_spec_query_start_loc,
+    const std::optional<torch::Tensor>& non_spec_token_indx,
+    const std::optional<torch::Tensor>& non_spec_state_indices_tensor,
+    const std::optional<torch::Tensor>& spec_query_start_loc,
+    const std::optional<torch::Tensor>& spec_token_indx,
+    const std::optional<torch::Tensor>& spec_state_indices_tensor,
+    const std::optional<torch::Tensor>& num_accepted_tokens,
+    const int64_t num_actual_tokens,
+    const int64_t tp_size,
+    const bool reorder_input);
+
+/*
+ * Mamba causal conv1d (XPU)
+ */
+void causal_conv1d_fwd(
+    at::Tensor& x,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias_,
+    const std::optional<at::Tensor>& conv_states,
+    const std::optional<at::Tensor>& query_start_loc,
+    const std::optional<at::Tensor>& cache_indices,
+    const std::optional<at::Tensor>& has_initial_state,
+    bool silu_activation,
+    int64_t pad_slot_id);
+
+void causal_conv1d_update(
+    at::Tensor& x,
+    at::Tensor& conv_state,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias_,
+    bool silu_activation,
+    const std::optional<at::Tensor>& cache_seqlens_,
+    const std::optional<at::Tensor>& conv_state_indices_,
+    int64_t pad_slot_id);

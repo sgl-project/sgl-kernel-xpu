@@ -619,7 +619,7 @@ struct ApplyShuffleMulSum {
     float weights[MAX_TOPK];
     for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
       src_indices[k] = static_cast<int>(dst2src_map_[out_tkn_id * topk_ + k]);
-      weights[k] = (factors_ != nullptr) ? static_cast<float>(factors_[out_tkn_id * topk_ + k]) : 0.0f;
+      weights[k] = (factors_ != nullptr) ? static_cast<float>(factors_[out_tkn_id * topk_ + k]) : 1.0f;
     }
 
     T* dst_base = output_ + out_tkn_id * hidden_dim_ + local_id * ElemsPerItem;

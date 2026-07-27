@@ -32,6 +32,7 @@ suites = {
         TestFile("test_moe_fused_gate.py"),
         TestFile("test_mrope.py"),
         TestFile("test_per_tensor_quant_fp8.py"),
+        TestFile("test_per_token_quant_fp8.py"),
         TestFile("test_fused_qk_norm_rope.py"),
         TestFile("test_fused_qk_rope_with_cache.py"),
         TestFile("test_merge_state.py"),
@@ -55,6 +56,17 @@ suites = {
         TestFile("test_c4_v2.py"),
         TestFile("test_fused_q_indexer_rope_hadamard_quant.py"),
         TestFile("test_fused_norm_rope_v2.py"),
+        TestFile("test_hc_post.py"),
+        TestFile("test_jit_kernels.py"),
+        TestFile("test_embedding_lora_a_fwd.py"),
+        TestFile("test_sgemm_lora_a_fwd.py"),
+        TestFile("test_fused_q_norm_rope.py"),
+    ],
+    # Nightly suite: exercises the wheel installed in the intel/sgl-kernel-xpu-dev
+    # nightly image. Populate with longer-running or full-shape tests that are
+    # too slow for per-commit CI. Placeholder for now.
+    "nightly-xpu": [
+        TestFile("test_activation.py"),
     ],
 }
 

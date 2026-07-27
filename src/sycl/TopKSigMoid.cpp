@@ -25,6 +25,8 @@ struct FusedTopkSigmoid {
       const T* gating_output,
       const float* correction_bias,
       const bool renormalize,
+      const float routed_scaling_factor,
+      const int num_fused_shared_experts,
       const int tokens,
       const int experts,
       const int top_k)
@@ -33,6 +35,8 @@ struct FusedTopkSigmoid {
         gating_output(gating_output),
         correction_bias(correction_bias),
         renormalize(renormalize),
+        routed_scaling_factor(routed_scaling_factor),
+        num_fused_shared_experts(num_fused_shared_experts),
         tokens(tokens),
         experts(experts),
         top_k(top_k) {}
@@ -97,7 +101,10 @@ struct FusedTopkSigmoid {
     float topk_weights_local[malloc_per_item];
     int topk_ids_local[malloc_per_item];
 
-    for (int k = 0; k < top_k; ++k) {
+    const int routed_topk = top_k - num_fused_shared_experts;
+    float row_sum_for_renormalize = 0.0f;
+
+    for (int k = 0; k < routed_topk; ++k) {
       float k_max = kNegInfinity;
       int k_max_idx = -1;
       int remove_ix = -1;
@@ -135,28 +142,37 @@ struct FusedTopkSigmoid {
     // Reuse the selected ranking scores. When bias participates in ranking,
     // subtract it back out so outputs stay as raw sigmoid weights.
     if (correction_bias != nullptr) {
-      for (int i = 0; i < top_k; ++i) {
+      for (int i = 0; i < routed_topk; ++i) {
         int id = topk_ids_local[i];
         topk_weights_local[i] -= correction_bias[id];
       }
     }
 
-    // Optional renormalize on unbiased sigmoid values.
-    if (renormalize) {
-      float sum = 0.0f;
-      for (int i = 0; i < top_k; ++i)
-        sum += topk_weights_local[i];
-      if (sum > 0.0f)
-        for (int i = 0; i < top_k; ++i)
-          topk_weights_local[i] /= sum;
+    for (int i = 0; i < routed_topk; ++i) {
+      row_sum_for_renormalize += topk_weights_local[i];
     }
 
     // Write output
     if (sg_local_id == 0) {
       int offset = tid * top_k;
-      for (int i = 0; i < top_k; ++i) {
+      for (int i = 0; i < routed_topk; ++i) {
         topk_weights[offset + i] = topk_weights_local[i];
         topk_ids[offset + i] = (topk_ids_local[i] >= 0) ? topk_ids_local[i] : 0;
+      }
+
+      if (num_fused_shared_experts > 0) {
+        const int shared_idx = offset + routed_topk;
+        topk_ids[shared_idx] = experts;
+        topk_weights[shared_idx] = renormalize ? 1.0f : row_sum_for_renormalize / routed_scaling_factor;
+      }
+
+      if (renormalize) {
+        // Keep this tiny denominator guard aligned with CUDA
+        // Ref: https://github.com/sgl-project/sglang/blob/main/python/sglang/jit_kernel/csrc/moe/moe_topk_sigmoid.cuh
+        const float scale = routed_scaling_factor / (row_sum_for_renormalize + 1e-20f);
+        for (int i = 0; i < routed_topk; ++i) {
+          topk_weights[offset + i] *= scale;
+        }
       }
     }
   }
@@ -166,6 +182,8 @@ struct FusedTopkSigmoid {
   const T* gating_output;
   const float* correction_bias;
   const bool renormalize;
+  const float routed_scaling_factor;
+  const int num_fused_shared_experts;
   const int tokens;
   const int experts;
   const int top_k;
@@ -312,6 +330,8 @@ struct TopkGatingSigmoid {
 
     float row_sum_for_renormalize = 0;
 
+    const int topk = k + num_fused_shared_experts;
+
     for (int k_idx = 0; k_idx < k; ++k_idx) {
       // First, each thread does the local argmax
       float max_val = row_chunk[0];
@@ -354,7 +374,7 @@ struct TopkGatingSigmoid {
 
         // The lead thread from each sub-group will write out the final results to global memory. (This will be a
         // single) thread per row of the input/output matrices.
-        const int idx = k * thread_row + k_idx;
+        const int idx = topk * thread_row + k_idx;
         if (correction_bias != nullptr) {
           max_val -= correction_bias[expert];
         }
@@ -377,12 +397,18 @@ struct TopkGatingSigmoid {
       }
     }
 
+    if (num_fused_shared_experts > 0 && thread_group_idx == 0) {
+      const int last_idx = topk * thread_row + k;
+      output[last_idx] = renormalize ? 1.0f : row_sum_for_renormalize / routed_scaling_factor;
+      indices[last_idx] = NUM_EXPERTS;
+    }
+
     // Fuse renormalization of topk_weights into this kernel
     if (renormalize && thread_group_idx == 0) {
-      float row_sum_for_renormalize_inv = 1.f / row_sum_for_renormalize;
+      float row_sum_for_renormalize_inv = routed_scaling_factor / (row_sum_for_renormalize + 1e-20f);
 #pragma unroll
       for (int k_idx = 0; k_idx < k; ++k_idx) {
-        const int idx = k * thread_row + k_idx;
+        const int idx = topk * thread_row + k_idx;
         output[idx] = output[idx] * row_sum_for_renormalize_inv;
       }
     }
@@ -398,6 +424,8 @@ struct TopkGatingSigmoid {
   const int start_expert;
   const int end_expert;
   const bool renormalize;
+  const float routed_scaling_factor;
+  const int num_fused_shared_experts;
 };
 
 namespace detail {
@@ -425,6 +453,8 @@ void launch_topk_gating_sigmoid(
     const int start_expert,
     const int end_expert,
     const bool renormalize,
+    const float routed_scaling_factor,
+    const int num_fused_shared_experts,
     sycl::queue& queue) {
   static constexpr std::size_t MAX_BYTES_PER_LDG = 16;
 
@@ -440,7 +470,19 @@ void launch_topk_gating_sigmoid(
 
   using Kernel = TopkGatingSigmoid<T, VPT, NUM_EXPERTS, WARPS_PER_TB, BYTES_PER_LDG>;
 
-  Kernel task{input, finished, output, num_rows, indices, correction_bias, k, start_expert, end_expert, renormalize};
+  Kernel task{
+      input,
+      finished,
+      output,
+      num_rows,
+      indices,
+      correction_bias,
+      k,
+      start_expert,
+      end_expert,
+      renormalize,
+      routed_scaling_factor,
+      num_fused_shared_experts};
 
   sycl_kernel_submit(grid * block, block, queue, task);
 }
@@ -453,12 +495,24 @@ void launch_fused_topk_sigmoid(
     int* topk_indices,
     const float* correction_bias,
     const bool renormalize,
+    const float routed_scaling_factor,
+    const int num_fused_shared_experts,
     const int top_k,
     const int num_tokens,
     const int num_experts) {
   using Kernel = FusedTopkSigmoid<T>;
   auto range = Kernel::get_nd_range(num_tokens, num_experts);
-  Kernel task(topk_weights, topk_indices, gating_output, correction_bias, renormalize, num_tokens, num_experts, top_k);
+  Kernel task(
+      topk_weights,
+      topk_indices,
+      gating_output,
+      correction_bias,
+      renormalize,
+      routed_scaling_factor,
+      num_fused_shared_experts,
+      num_tokens,
+      num_experts,
+      top_k);
   sycl_kernel_submit(range.get_global_range(), range.get_local_range(), queue, task);
 }
 
@@ -469,6 +523,8 @@ void fused_topk_sigmoid(
     int* topk_indices,
     const float* correction_bias,
     const bool renormalize,
+    const float routed_scaling_factor,
+    const int num_fused_shared_experts,
     const int num_tokens,
     const int num_experts,
     const int topk) {
@@ -483,10 +539,12 @@ void fused_topk_sigmoid(
       topk_indices,                                            \
       correction_bias,                                         \
       num_tokens,                                              \
-      topk,                                                    \
+      topk - num_fused_shared_experts,                         \
       0,                                                       \
       num_experts,                                             \
       renormalize,                                             \
+      routed_scaling_factor,                                   \
+      num_fused_shared_experts,                                \
       queue);
 
   switch (num_experts) {
@@ -525,6 +583,8 @@ void fused_topk_sigmoid(
           topk_indices,
           correction_bias,
           renormalize,
+          routed_scaling_factor,
+          num_fused_shared_experts,
           topk,
           num_tokens,
           num_experts);
@@ -547,7 +607,9 @@ void topk_sigmoid(
     at::Tensor& topk_indices,
     at::Tensor& gating_output,
     bool renormalize,
-    const c10::optional<at::Tensor>& correction_bias) {
+    const c10::optional<at::Tensor>& correction_bias,
+    double routed_scaling_factor,
+    int64_t num_fused_shared_experts) {
   auto shape = gating_output.sizes().vec();
   TORCH_CHECK(shape.size() == 2, "gating_output must be 2D");
   int64_t n_tokens = shape[0];
@@ -560,6 +622,17 @@ void topk_sigmoid(
   // The max topk value is 8, which is constrained by 'malloc_per_item'.
   auto max_topk = n_experts < 8 ? n_experts : 8;
   TORCH_CHECK(0 < n_topk && n_topk <= max_topk, "topk must be less than or equal to num_experts and 8");
+  TORCH_CHECK(
+      num_fused_shared_experts >= 0 && num_fused_shared_experts <= 1, "num_fused_shared_experts must be in [0, 1]");
+  TORCH_CHECK(
+      n_topk > num_fused_shared_experts,
+      "topk must be greater than num_fused_shared_experts, got topk = ",
+      n_topk,
+      ", num_fused_shared_experts = ",
+      num_fused_shared_experts);
+  TORCH_CHECK(
+      !(num_fused_shared_experts > 0 && !renormalize && routed_scaling_factor == 0.0),
+      "routed_scaling_factor must be non-zero when num_fused_shared_experts > 0 and renormalize is false");
 
   const float* bias_ptr = nullptr;
   if (correction_bias.has_value()) {
@@ -580,6 +653,8 @@ void topk_sigmoid(
         topk_indices.data_ptr<int>(),
         bias_ptr,
         renormalize,
+        static_cast<float>(routed_scaling_factor),
+        static_cast<int>(num_fused_shared_experts),
         n_tokens,
         n_experts,
         n_topk);

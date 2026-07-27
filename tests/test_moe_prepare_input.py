@@ -1,4 +1,5 @@
 import itertools
+import sys
 
 import pytest
 import torch
@@ -14,9 +15,23 @@ from sgl_kernel import (
 @pytest.mark.parametrize("top_k", [1, 2, 4, 6, 8])
 @pytest.mark.parametrize("hidden_dims", [16, 32, 64, 128, 1024, 1536])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
-def test_prepare_input_moe(num_tokens, num_experts, top_k, hidden_dims, dtype):
+@pytest.mark.parametrize("use_factors", [True, False])
+def test_prepare_input_moe(
+    num_tokens, num_experts, top_k, hidden_dims, dtype, use_factors
+):
     if num_experts < top_k:
         pytest.skip("invalid combination")
+    if not use_factors:
+        # Keep a single representative config for the null-factors path.
+        keep_null_factors_case = (
+            num_tokens == 16
+            and num_experts == 8
+            and top_k == 4
+            and hidden_dims == 128
+            and dtype == torch.float32
+        )
+        if not keep_null_factors_case:
+            pytest.skip("reduce parameter space for null-factors coverage")
     torch.manual_seed(41)
 
     # Generate unique token
@@ -136,12 +151,23 @@ def test_prepare_input_moe(num_tokens, num_experts, top_k, hidden_dims, dtype):
         input_tensor_xpu, output_permutation_xpu, output_tensor_xpu
     )
     input_merge_xpu = torch.empty((num_tokens, hidden_dims), dtype=dtype, device=device)
-    # apply weights
-    factors = torch.ones(top_k * num_tokens, dtype=torch.float32, device=device).fill_(
-        1 / top_k
-    )
-    apply_shuffle_mul_sum(
-        output_tensor_xpu, input_merge_xpu, output_permutation_xpu, factors
-    )
-    # of same order as in input
-    torch.testing.assert_allclose(input_merge_xpu.to("cpu"), input_tensor)
+    if use_factors:
+        # Explicit per-route averaging weights.
+        factors = torch.ones(
+            top_k * num_tokens, dtype=torch.float32, device=device
+        ).fill_(1 / top_k)
+        apply_shuffle_mul_sum(
+            output_tensor_xpu, input_merge_xpu, output_permutation_xpu, factors
+        )
+    else:
+        # Null factors should default to unit weights in kernel.
+        apply_shuffle_mul_sum(
+            output_tensor_xpu, input_merge_xpu, output_permutation_xpu, None
+        )
+
+    expected = input_tensor if use_factors else input_tensor * top_k
+    torch.testing.assert_allclose(input_merge_xpu.to("cpu"), expected)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

@@ -818,6 +818,22 @@ def test_flash_attn_kvcache(
             window_size=window_size,
             key_leftpad=cache_leftpad,
         )
+        out_pt, _ = attention_ref(
+            q_ro,
+            k_cache_rep,
+            v_cache_rep,
+            softmax_scale,
+            sinks if use_sinks else None,
+            query_padding_mask,
+            key_padding_mask,
+            causal=causal,
+            qv=qv,
+            window_size=window_size,
+            upcast=False,
+            reorder_ops=True,
+            key_leftpad=cache_leftpad,
+            intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
+        )
         q = q.to(dtype)
         q_unpad = q_unpad.to(dtype) if varlen_q else None
         k_cache = k_cache.to(dtype)
@@ -879,9 +895,14 @@ def test_flash_attn_kvcache(
                 torch.xpu.synchronize()
                 out = out.flatten()
                 out_ref = out_ref.flatten()
+                out_pt = out_pt.flatten()
                 print(f"Output max diff: {(out - out_ref).abs().max().item()}")
                 print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+                print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+                print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
 
+                # Check that FlashAttention's numerical error is at most twice the numerical error
+                # of a Pytorch implementation.
                 if new_kv:
                     if page_size is None:
                         k_cache_select = (
@@ -936,6 +957,14 @@ def test_flash_attn_kvcache(
                             assert torch.allclose(
                                 k_cache_select, k_cache_ref, rtol=1e-1, atol=1e-1
                             )
+                mult = 4 if dtype == torch.float8_e4m3fn else 2
+                assert (out - out_ref).abs().max().item() <= mult * (
+                    out_pt - out_ref
+                ).abs().max().item() + 1e-5
+                mult_mean = 3 if dtype == torch.float8_e4m3fn else 1.5
+                assert (out - out_ref).abs().mean().item() <= mult_mean * (
+                    out_pt - out_ref
+                ).abs().mean().item()
 
 
 @pytest.mark.skipif(
@@ -1284,6 +1313,22 @@ def test_flash_attn_decode_kvcache(
             window_size=window_size,
             key_leftpad=cache_leftpad,
         )
+        out_pt, _ = attention_ref(
+            q_ro,
+            k_cache_rep,
+            v_cache_rep,
+            softmax_scale,
+            sinks if use_sinks else None,
+            query_padding_mask,
+            key_padding_mask,
+            causal=causal,
+            qv=qv,
+            window_size=window_size,
+            upcast=False,
+            reorder_ops=True,
+            key_leftpad=cache_leftpad,
+            intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
+        )
         q = q.to(dtype)
         q_unpad = q_unpad.to(dtype) if varlen_q else None
         k_cache = k_cache.to(dtype)
@@ -1346,9 +1391,14 @@ def test_flash_attn_decode_kvcache(
                 torch.xpu.synchronize()
                 out = out.flatten()
                 out_ref = out_ref.flatten()
+                out_pt = out_pt.flatten()
                 print(f"Output max diff: {(out - out_ref).abs().max().item()}")
                 print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+                print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+                print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
 
+                # Check that FlashAttention's numerical error is at most twice the numerical error
+                # of a Pytorch implementation.
                 if new_kv:
                     if page_size is None:
                         k_cache_select = (
@@ -1403,6 +1453,14 @@ def test_flash_attn_decode_kvcache(
                             assert torch.allclose(
                                 k_cache_select, k_cache_ref, rtol=1e-1, atol=1e-1
                             )
+                mult = 4 if dtype == torch.float8_e4m3fn else 2
+                assert (out - out_ref).abs().max().item() <= mult * (
+                    out_pt - out_ref
+                ).abs().max().item() + 1e-5
+                mult_mean = 3 if dtype == torch.float8_e4m3fn else 1.5
+                assert (out - out_ref).abs().mean().item() <= mult_mean * (
+                    out_pt - out_ref
+                ).abs().mean().item()
     torch.xpu.empty_cache()
 
 
@@ -1756,9 +1814,35 @@ def test_flash_attn_varlen_output(
             window_size=window_size,
             softcap=softcap,
         )
+        out_pt, _ = attention_ref(
+            q_ref,
+            k_ref,
+            v_ref,
+            softmax_scale,
+            sinks,
+            query_padding_mask=query_padding_mask,
+            key_padding_mask=key_padding_mask,
+            causal=causal,
+            qv=qv_ref,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            window_size=window_size,
+            softcap=softcap,
+            upcast=False,
+            reorder_ops=True,
+            intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
+        )
+
+        print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+        print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
 
         if query_unused_mask is not None:
             q_zero_masking = rearrange(query_unused_mask, "b s -> b s 1 1")
+
+        # Numerical error if we just do any arithmetic on out_ref
+        fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+        rtol = 2 if softcap == 0.0 else 3
 
         pack_gqa_vals = [False, True] if not DISABLE_PACKGQA else [False]
         num_splits_vals = [1, 3] if not DISABLE_SPLIT else [1]
@@ -1790,6 +1874,12 @@ def test_flash_attn_varlen_output(
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
 
+            # Check that FlashAttention's numerical error is at most 3x the numerical error
+            # of a Pytorch implementation.
+            assert (out - out_ref).abs().max().item() <= rtol * (
+                out_pt - out_ref
+            ).abs().max().item() + fwd_atol
+
     if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not has_qv:
         g_unpad = torch.randn_like(out_unpad)
         dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(
@@ -1807,12 +1897,39 @@ def test_flash_attn_varlen_output(
         g = output_pad_fn(g_unpad)
 
         dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), g)
+        dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
         print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
         print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
         print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
         print(f"dQ mean diff: {(dq - dq_ref).abs().mean().item()}")
         print(f"dK mean diff: {(dk - dk_ref).abs().mean().item()}")
         print(f"dV mean diff: {(dv - dv_ref).abs().mean().item()}")
+        print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
+        print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
+        print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
+        print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
+        print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
+        print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
+
+    if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not has_qv:
+        dq_atol = 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item() + (
+            0 if softcap == 0 else 3e-4
+        )
+        assert (dq - dq_ref).abs().max().item() <= rtol * (
+            dq_pt - dq_ref
+        ).abs().max().item() + dq_atol
+        dk_atol = 2 * (dk_ref + 0.3 - 0.3 - dk_ref).abs().max().item() + (
+            0 if softcap == 0 else 3e-4
+        )
+        assert (dk - dk_ref).abs().max().item() <= rtol * (
+            dk_pt - dk_ref
+        ).abs().max().item() + dk_atol
+        dv_atol = 2 * (dv_ref + 0.3 - 0.3 - dv_ref).abs().max().item() + (
+            0 if softcap == 0 else 3e-4
+        )
+        assert (dv - dv_ref).abs().max().item() <= rtol * (
+            dv_pt - dv_ref
+        ).abs().max().item() + dv_atol
 
 
 @pytest.mark.skipif(device.type != "xpu", reason="XPU not available")

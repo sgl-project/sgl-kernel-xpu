@@ -158,7 +158,8 @@ class PerTensorAbsMaxKernel {
   }
 };
 
-SGL_KERNEL_EXPORT void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static) {
+SGL_KERNEL_EXPORT void
+sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
   CHECK_INPUT(output_s);

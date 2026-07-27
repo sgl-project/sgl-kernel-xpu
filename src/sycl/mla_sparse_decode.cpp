@@ -14,9 +14,9 @@
 #include <sycl/sycl.hpp>
 
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 #include "sycl/kernels/mla_sparse/device/mla_sparse_decode_dispatch.hpp"
 #include "sycl/kernels/mla_sparse/device/mla_sparse_decode_types.hpp"
-#include "sgl_kernel_export.h"
 
 // Compile-time toggle for the two-stage sparse MLA decode path (gather+dequant to
 // HBM, then dense flash-decode). The selector macro

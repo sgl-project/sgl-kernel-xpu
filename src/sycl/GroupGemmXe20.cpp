@@ -21,8 +21,7 @@ using ElementAccumulator = float;  // <- data type of accumulator
 // dispatcher is built with -fvisibility=hidden, so mark the declaration default
 // so this cross-library reference stays dynamically resolvable.
 template <typename Tile, typename SGLayout, ActivationType ActType, bool FuseAct, bool WithBias>
-__attribute__((visibility("default")))
-void Xe20MoEGEMMLauncher(
+__attribute__((visibility("default"))) void Xe20MoEGEMMLauncher(
     sycl::queue q,
     const void* activations,
     const void* weights,

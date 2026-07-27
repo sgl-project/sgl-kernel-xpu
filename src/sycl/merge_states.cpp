@@ -386,8 +386,8 @@ void merge_state_launcher_sycl(
 #define CALL_MERGE_STATE_LAUNCHER_SYCL(scalar_t) \
   { merge_state_launcher_sycl<scalar_t>(v_a, s_a, v_b, s_b, v_merged, s_merged); }
 
-SGL_KERNEL_EXPORT void merge_state(
-    at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged) {
+SGL_KERNEL_EXPORT void
+merge_state(at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged) {
   CHECK_INPUT(v_a);
   CHECK_INPUT(s_a);
   CHECK_INPUT(v_b);

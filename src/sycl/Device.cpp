@@ -2,6 +2,7 @@
 #include <c10/xpu/XPUStream.h>
 
 #include <sycl/sycl.hpp>
+
 #include "sgl_kernel_export.h"
 
 namespace syclex = sycl::ext::oneapi::experimental;

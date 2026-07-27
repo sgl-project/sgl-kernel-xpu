@@ -41,9 +41,9 @@
 #include <sycl/sycl.hpp>
 
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 #include "sycl/kernels/mla/device/mla_decode_dispatch.hpp"
 #include "sycl/kernels/mla/device/mla_decode_types.hpp"
-#include "sgl_kernel_export.h"
 
 namespace {
 

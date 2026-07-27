@@ -13,11 +13,11 @@ static constexpr float LOG2E = 1.442695040888963f;
 
 template <typename scalar_t>
 struct FusedHCHeadKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
-  const scalar_t* __restrict__ x;  // [T, HC, D]
-  const float* __restrict__ hc_fn;  // [HC, HC*D]
+  const scalar_t* __restrict__ x;      // [T, HC, D]
+  const float* __restrict__ hc_fn;     // [HC, HC*D]
   const float* __restrict__ hc_scale;  // [1]
-  const float* __restrict__ hc_base;  // [HC]
-  scalar_t* __restrict__ y;  // [T, D]
+  const float* __restrict__ hc_base;   // [HC]
+  scalar_t* __restrict__ y;            // [T, D]
 
   int T;
   int hidden_size;

@@ -63,7 +63,9 @@ def test_fused_hc_head(T, hidden_size, dtype):
     hc_eps = 1e-6
 
     expected = hc_head_torch_ref(x, hc_fn, hc_scale, hc_base, norm_eps, hc_eps)
-    actual = fused_hc_head(x, hc_fn, hc_scale, hc_base, norm_eps=norm_eps, hc_eps=hc_eps)
+    actual = fused_hc_head(
+        x, hc_fn, hc_scale, hc_base, norm_eps=norm_eps, hc_eps=hc_eps
+    )
 
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
@@ -100,4 +102,6 @@ def test_fused_hc_head_perf(T, hidden_size, dtype):
         )
     )
 
-    assert t_our < t_ref, f"sgl-kernel ({t_our:.3f} ms) not faster than torch ({t_ref:.3f} ms)"
+    assert (
+        t_our < t_ref
+    ), f"sgl-kernel ({t_our:.3f} ms) not faster than torch ({t_ref:.3f} ms)"

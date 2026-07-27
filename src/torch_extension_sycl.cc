@@ -270,7 +270,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("hc_split_sinkhorn", torch::kXPU, &hc_split_sinkhorn);
 
   /* FUSED HC HEAD */
-  m.def("fused_hc_head(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, float norm_eps, float hc_eps) -> Tensor");
+  m.def(
+      "fused_hc_head(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, float norm_eps, float hc_eps) -> Tensor");
   m.impl("fused_hc_head", torch::kXPU, &fused_hc_head);
 
   /* HC PRE BIG FUSE */

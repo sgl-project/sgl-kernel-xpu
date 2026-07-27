@@ -94,7 +94,9 @@ template <
     // KV position, so per-row masking must use a fixed decode row. Default
     // false keeps prefill (and non-packed decode) unaffected.
     bool PackGQA_ = false,
-    bool AppendKV_ = false>
+    bool AppendKV_ = false,
+    bool DirectAppendKV_ = false,
+    bool WideAppendKV_ = false>
 struct FMHAFwdMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -121,7 +123,9 @@ template <
     class TiledCopyV_cache_,
     bool LocalMask_,
     bool PackGQA_,
-    bool AppendKV_>
+    bool AppendKV_,
+    bool DirectAppendKV_,
+    bool WideAppendKV_>
 struct FMHAFwdMainloop<
     XeDefault<Stages>,
     CausalMask_,
@@ -142,7 +146,9 @@ struct FMHAFwdMainloop<
     TiledCopyV_cache_,
     LocalMask_,
     PackGQA_,
-    AppendKV_> {
+    AppendKV_,
+    DirectAppendKV_,
+    WideAppendKV_> {
   //
   // Type Aliases
   //
@@ -221,6 +227,11 @@ struct FMHAFwdMainloop<
   // scale) inside the mainloop after the block-2D load.
   static constexpr bool Fp8KV = is_any_of_v<ElementK, float_e5m2_t, float_e4m3_t>;
   static constexpr bool AppendKV = AppendKV_;
+  static constexpr bool DirectAppendKV = DirectAppendKV_;
+  static constexpr bool WideAppendKV = WideAppendKV_;
+  static_assert(!DirectAppendKV || (AppendKV && PagedKV), "Direct AppendKV requires paged AppendKV");
+  static_assert(
+      !WideAppendKV || (AppendKV && PagedKV && !DirectAppendKV), "Wide AppendKV requires fused paged AppendKV");
   using AppendKVStorage =
       AppendKVParams<AppendKV, typename TensorK_cache::element_type, typename TensorV_cache::element_type>;
 
@@ -306,11 +317,14 @@ struct FMHAFwdMainloop<
       int kv_head,
       int num_heads_kv,
       int thr_id,
-      int append_store_len = -1) const {
+      int append_store_len = -1,
+      int append_store_begin = 0) const {
     if constexpr (AppendKV) {
       int const new_len_total = get_k_new_len(batch);
+      int const store_begin = cute::min(cute::max(append_store_begin, 0), new_len_total);
+      int const available_len = new_len_total - store_begin;
       int const new_len =
-          append_store_len < 0 ? new_len_total : (append_store_len < new_len_total ? append_store_len : new_len_total);
+          append_store_len < 0 ? available_len : (append_store_len < available_len ? append_store_len : available_len);
       if (new_len <= 0) {
         return;
       }
@@ -319,9 +333,10 @@ struct FMHAFwdMainloop<
       auto& V_dst = const_cast<TensorV_cache2D&>(V_cache_2D);
       int const lane_idx = thr_id % intel::sg_size;
       int const sub_group_id = thr_id / intel::sg_size;
-      int const new_begin = params.append.ptr_cu_seqlens_k_new != nullptr ? params.append.ptr_cu_seqlens_k_new[batch]
-                                                                          : batch * params.append.seq_len_kv_new;
-      int const cache_len_old = params.append.ptr_cache_seqlens[batch];
+      int const new_begin = (params.append.ptr_cu_seqlens_k_new != nullptr ? params.append.ptr_cu_seqlens_k_new[batch]
+                                                                           : batch * params.append.seq_len_kv_new) +
+                            store_begin;
+      int const cache_len_old = params.append.ptr_cache_seqlens[batch] + store_begin;
       int const head_size_qk = size<1>(K_cache_2D);
       int const head_size_vo = size<0>(V_cache_2D);
       int const max_hd = head_size_qk > head_size_vo ? head_size_qk : head_size_vo;
@@ -333,9 +348,10 @@ struct FMHAFwdMainloop<
       // idempotent and does not rely on a grid-wide producer.
       if constexpr (
           sizeof(typename TensorK_cache::element_type) == 2 && sizeof(typename TensorV_cache::element_type) == 2) {
-        // NHD bf16 rows are 16B-aligned when head_size is divisible by 8.
-        constexpr int kVecElems = 8;
-        using StoreVec = cutlass::ulonglong2;
+        // The q256 HD64 specialization uses 32B vectors to reduce flattened
+        // store index overhead; other paths retain the 16B transaction.
+        constexpr int kVecElems = WideAppendKV ? 16 : 8;
+        using StoreVec = cute::conditional_t<WideAppendKV, cutlass::ulonglong4, cutlass::ulonglong2>;
         if (head_size_qk == head_size_vo && (head_size_qk % kVecElems) == 0) {
           // Large appends are bandwidth-bound, so split tokens across SGs;
           // small appends keep the old single-SG path to avoid control overhead.
@@ -345,8 +361,8 @@ struct FMHAFwdMainloop<
             return;
           }
           int const head_size = head_size_qk;
-          int const vecs_per_token = head_size / kVecElems;
           bool const flatten_token_vectors = new_len >= kMinMultiSgTokens && head_size == 64;
+          int const vecs_per_token = head_size / kVecElems;
           int const worker = sub_group_id * intel::sg_size + lane_idx;
           int const worker_count = active_sg_count * intel::sg_size;
           bool single_dst_page = true;
@@ -481,6 +497,7 @@ struct FMHAFwdMainloop<
       (void)num_heads_kv;
       (void)thr_id;
       (void)append_store_len;
+      (void)append_store_begin;
     }
   }
 
@@ -506,6 +523,7 @@ struct FMHAFwdMainloop<
       int full_tile_offset,
       int discard_seq_coord,
       int append_store_len = -1,
+      int append_store_begin = 0,
       TensorK_cache2D const& K_cache_2D = TensorK_cache2D{},
       TensorV_cache2D const& V_cache_2D = TensorV_cache2D{},
       float scale_k = 1.0f) {  // FP8 K per-tensor dequant scale
@@ -599,26 +617,25 @@ struct FMHAFwdMainloop<
     // ------
 
     if constexpr (AppendKV) {
-      store_kv_new(K_cache_2D, V_cache_2D, l_coord, kv_head, num_heads_kv, thr_id, append_store_len);
-      barrier();
+      store_kv_new(
+          K_cache_2D, V_cache_2D, l_coord, kv_head, num_heads_kv, thr_id, append_store_len, append_store_begin);
+      if constexpr (DirectAppendKV) {
+        constexpr int kTileKV = get<1>(TileShapeQK{});
+        int const cache_len_old = params.append.ptr_cache_seqlens[l_coord];
+        int const new_begin = params.append.ptr_cu_seqlens_k_new != nullptr
+                                  ? params.append.ptr_cu_seqlens_k_new[l_coord]
+                                  : l_coord * params.append.seq_len_kv_new;
+        if ((cache_len_old % kTileKV) != 0 || (new_begin % kTileKV) != 0) {
+          barrier();
+        }
+      } else {
+        barrier();
+      }
     }
 
-    /* Initialization steps for first block: Q/K prefetch, O init */
-    /* TODO: limit D prefetch for large head size, and reorder K prefetches */
-    int kblocks_cache = ceil_div(seq_len_kv_cache, get<1>(TileShapeQK{}));
-    int page_idx = blk_k0;
-    int next_page_idx = blk_k0;
+    /* Initialization steps for first block: Q prefetch, O init */
     for (int D = 0; D < size<3>(pQgQ); D++) {
       prefetch(prefetch_q, pQgQ(_, _, _, D));
-    }
-    bool has_prefetch_k = blk_k0 < blk_k1 && blk_k0 < kblocks_cache;
-    if (has_prefetch_k) {
-      if constexpr (PagedKV) {
-        next_page_idx = get_physical_k_tile(blk_k0, l_coord, seq_len_kv_cache);
-      }
-      for (int D = 0; D < size<4>(pKgK); D++) {
-        prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
-      }
     }
     // Always initialize the per-WG accumulators: the caller (kernel) may pass
     // blk_k0 > 0 when sliding-window pruning skips leading K blocks, so we can
@@ -639,47 +656,103 @@ struct FMHAFwdMainloop<
       qk_scale = params.scale * static_cast<ElementS>(scale_k);
     }
 
-    /* Main loop, blocked in k. */
-    for (int K = blk_k0; K < blk_k1 && K < kblocks_cache; K++) {
-      /* Split barrier to keep threads together */
-      barrier_arrive(ScopeWorkgroup);
+    constexpr int kTileKV = get<1>(TileShapeQK{});
+    int const kblocks_total = ceil_div(seq_len_kv_cache, kTileKV);
+    bool direct_append = false;
+    int direct_block0 = kblocks_total;
+    int direct_source_block0 = 0;
+    if constexpr (DirectAppendKV) {
+      int const cache_len_old = params.append.ptr_cache_seqlens[l_coord];
+      int const new_begin = params.append.ptr_cu_seqlens_k_new != nullptr ? params.append.ptr_cu_seqlens_k_new[l_coord]
+                                                                          : l_coord * params.append.seq_len_kv_new;
+      direct_append = (cache_len_old % kTileKV) == 0 && (new_begin % kTileKV) == 0;
+      direct_block0 = cache_len_old / kTileKV;
+      direct_source_block0 = new_begin / kTileKV;
+    }
 
-      bool need_causal = false;
-      if constexpr (CausalMask) {
-        need_causal = K >= blk_k1_causal;
+    auto run_k_blocks = [&](auto source_tag, int loop_k0, int loop_k1) {
+      constexpr bool LoadDirect = decltype(source_tag)::value;
+      if (loop_k0 >= loop_k1) {
+        return;
       }
 
-      page_idx = next_page_idx;
-      int next_k = K + 1;
-      bool has_next_k = next_k < blk_k1 && next_k < kblocks_cache;
-      next_page_idx = next_k;
-      if constexpr (PagedKV) {
-        if (has_next_k) {
-          next_page_idx = get_physical_k_tile(next_k, l_coord, seq_len_kv_cache);
+      int next_source_idx = loop_k0;
+      if constexpr (LoadDirect) {
+        next_source_idx = direct_source_block0 + loop_k0 - direct_block0;
+        for (int D = 0; D < size<4>(pKgK); D++) {
+          prefetch(prefetch_k, pKgK(_, _, _, next_source_idx, D));
+        }
+      } else {
+        if constexpr (PagedKV) {
+          next_source_idx = get_physical_k_tile(loop_k0, l_coord, seq_len_kv_cache);
+        }
+        for (int D = 0; D < size<4>(pKgK); D++) {
+          prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_source_idx, D));
         }
       }
 
-      /* GEMM 1: S = K * Q */
-      clear(tSrS);
-      CUTLASS_PRAGMA_UNROLL
-      for (int D = 0; D < size<4>(tKgK); D++) {
-        copy(copy_q, tQgQ(_, _, _, D), tQrQ);
-        copy(copy_k_cache, tKgK_cache(_, _, _, page_idx, D), tKrK);
-        reorder(tQrQ, tSrQ);
-        reorder(tKrK, tSrK);
-        cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
-      }
+      for (int K = loop_k0; K < loop_k1 && K < kblocks_total; K++) {
+        barrier_arrive(ScopeWorkgroup);
 
-      /* V prefetch for GEMM 2 */
-      CUTLASS_PRAGMA_UNROLL
-      for (int VV = 0; VV < VTiles; VV++) {
-        prefetch(prefetch_v_cache, pVgV_cache(_, _, _, VV, page_idx));
-      }
+        bool need_causal = false;
+        if constexpr (CausalMask) {
+          need_causal = K >= blk_k1_causal;
+        }
 
-      /* Causal masking */
-      if constexpr (CausalMask) {
-        if (need_causal) {
-          // Need to get global col and row indices to mask the elements
+        int const source_idx = next_source_idx;
+        int const next_k = K + 1;
+        bool const has_next_k = next_k < loop_k1 && next_k < kblocks_total;
+        if constexpr (LoadDirect) {
+          next_source_idx = direct_source_block0 + next_k - direct_block0;
+        } else {
+          next_source_idx = next_k;
+          if constexpr (PagedKV) {
+            if (has_next_k) {
+              next_source_idx = get_physical_k_tile(next_k, l_coord, seq_len_kv_cache);
+            }
+          }
+        }
+
+        clear(tSrS);
+        CUTLASS_PRAGMA_UNROLL
+        for (int D = 0; D < size<4>(tKgK); D++) {
+          copy(copy_q, tQgQ(_, _, _, D), tQrQ);
+          if constexpr (LoadDirect) {
+            copy(copy_k, tKgK(_, _, _, source_idx, D), tKrK);
+          } else {
+            copy(copy_k_cache, tKgK_cache(_, _, _, source_idx, D), tKrK);
+          }
+          reorder(tQrQ, tSrQ);
+          reorder(tKrK, tSrK);
+          cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
+        }
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int VV = 0; VV < VTiles; VV++) {
+          if constexpr (LoadDirect) {
+            prefetch(prefetch_v, pVgV(_, _, _, VV, source_idx));
+          } else {
+            prefetch(prefetch_v_cache, pVgV_cache(_, _, _, VV, source_idx));
+          }
+        }
+
+        if constexpr (CausalMask) {
+          if (need_causal) {
+            Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
+            Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
+            auto cS_thread = thr_mma_qk.partition_C(gP);
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tSrS.size(); ++i) {
+              int row_idx = get<0>(cS_thread(i));
+              int col_idx = get<1>(cS_thread(i));
+              if (row_idx < col_idx - full_tile_offset) {
+                tSrS(i) = ElementS(-INFINITY);
+              }
+            }
+          }
+        }
+
+        if constexpr (LocalMask) {
           Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
           Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
           auto cS_thread = thr_mma_qk.partition_C(gP);
@@ -687,75 +760,71 @@ struct FMHAFwdMainloop<
           for (int i = 0; i < tSrS.size(); ++i) {
             int row_idx = get<0>(cS_thread(i));
             int col_idx = get<1>(cS_thread(i));
-            if (row_idx < col_idx - full_tile_offset) {
+            int row_kv_idx = (PackGQA_ ? 0 : row_idx) + full_tile_offset;
+            bool left_mask = col_idx < row_kv_idx - params.window_size_left;
+            bool right_mask = col_idx > row_kv_idx + params.window_size_right;
+            if (left_mask || right_mask) {
               tSrS(i) = ElementS(-INFINITY);
             }
           }
         }
-      }
 
-      /* Local/sliding window masking */
-      if constexpr (LocalMask) {
-        Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
-        Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
-        auto cS_thread = thr_mma_qk.partition_C(gP);
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < tSrS.size(); ++i) {
-          int row_idx = get<0>(cS_thread(i));
-          int col_idx = get<1>(cS_thread(i));
-          // PackGQA decode: every packed M row is the same decode token, so the
-          // KV position is full_tile_offset regardless of the per-row (head)
-          // index. Non-packed keeps the per-row sequence position.
-          int row_kv_idx = (PackGQA_ ? 0 : row_idx) + full_tile_offset;
-          bool left_mask = col_idx < row_kv_idx - params.window_size_left;
-          bool right_mask = col_idx > row_kv_idx + params.window_size_right;
-          if (left_mask || right_mask) {
-            tSrS(i) = ElementS(-INFINITY);
-          }
-        }
-      }
-
-      /* k masking for remainder tiles */
-      if (check_remainder_k && K == total_blk - 1) {
-        FragSCol k_rem_mask;
-        int k_val = get<0>(tKgK_cache(0, 0, 0, K, 0));
-        int k = k_val + get_sub_group().get_local_id()[0];
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < k_rem_mask.size(); i++, k += intel::sg_size) {
-          k_rem_mask(i) = (k < seq_len) ? ElementS(sycl::nan(0u)) : ElementS(-INFINITY);
-        }
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < tSrS.size(); i++) {
-          tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(k_rem_mask, tSrS, i));
-        }
-      }
-
-      /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
-      auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, qk_scale);
-      reorder(tSrS, tArP);
-
-      /* GEMM 2: A += P * V, split in v dimension. */
-      CUTLASS_PRAGMA_UNROLL
-      for (int VV = 0; VV < VTiles; VV++) {
-        copy(copy_v_cache, tVgV_cache(_, _, _, VV, page_idx), tVrV);
-        reorder(tVrV, tArV);
-        if (K != blk_k0) {
+        if (check_remainder_k && K == total_blk - 1) {
+          FragSCol k_rem_mask;
+          int k_val = get<0>(tKgK_cache(0, 0, 0, K, 0));
+          int k = k_val + get_sub_group().get_local_id()[0];
           CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tArA.size() / VTiles; i++) {
-            tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
+          for (int i = 0; i < k_rem_mask.size(); i++, k += intel::sg_size) {
+            k_rem_mask(i) = (k < seq_len) ? ElementS(sycl::nan(0u)) : ElementS(-INFINITY);
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); i++) {
+            tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(k_rem_mask, tSrS, i));
           }
         }
-        cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
-      }
 
-      /* K prefetch */
-      if (has_next_k) {
-        for (int D = 0; D < size<4>(pKgK); D++) {
-          prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
+        auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, qk_scale);
+        reorder(tSrS, tArP);
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int VV = 0; VV < VTiles; VV++) {
+          if constexpr (LoadDirect) {
+            copy(copy_v, tVgV(_, _, _, VV, source_idx), tVrV);
+          } else {
+            copy(copy_v_cache, tVgV_cache(_, _, _, VV, source_idx), tVrV);
+          }
+          reorder(tVrV, tArV);
+          if (K != blk_k0) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tArA.size() / VTiles; i++) {
+              tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
+            }
+          }
+          cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
         }
-      }
 
-      barrier_wait(ScopeWorkgroup);
+        if (has_next_k) {
+          if constexpr (LoadDirect) {
+            for (int D = 0; D < size<4>(pKgK); D++) {
+              prefetch(prefetch_k, pKgK(_, _, _, next_source_idx, D));
+            }
+          } else {
+            for (int D = 0; D < size<4>(pKgK); D++) {
+              prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_source_idx, D));
+            }
+          }
+        }
+
+        barrier_wait(ScopeWorkgroup);
+      }
+    };
+
+    int const cache_loop_k1 = direct_append ? cute::min(blk_k1, direct_block0) : blk_k1;
+    run_k_blocks(cute::false_type{}, blk_k0, cache_loop_k1);
+    if constexpr (DirectAppendKV) {
+      if (direct_append) {
+        run_k_blocks(cute::true_type{}, cute::max(blk_k0, direct_block0), blk_k1);
+      }
     }
   }
 

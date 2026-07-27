@@ -102,6 +102,7 @@ class XeFMHAFwdKernel {
 
   using FragA = typename CollectiveMainloop::FragA;
   using FragARow = typename CollectiveMainloop::FragARow;
+  static constexpr bool DirectAppendKV = CollectiveMainloop::DirectAppendKV;
 
   // Tile scheduler derived types
   using TileScheduler = TileScheduler_;
@@ -329,10 +330,29 @@ class XeFMHAFwdKernel {
       const int k_blocks_causal =
           CollectiveMainloop::CausalMask ? (seq_coord + full_tile_offset) / get<1>(TileShapeQK{}) : 0;
       int append_store_len = -1;
+      int append_store_begin = 0;
       if constexpr (CollectiveMainloop::AppendKV) {
         int const seq_k_new = get_k_new_len(params.mainloop, idx_b);
         if (seq_k_new > 0) {
           append_store_len = seq_k_new;
+          if constexpr (DirectAppendKV) {
+            int const cache_len_old = params.mainloop.append.ptr_cache_seqlens[idx_b];
+            int const new_begin = params.mainloop.append.ptr_cu_seqlens_k_new != nullptr
+                                      ? params.mainloop.append.ptr_cu_seqlens_k_new[idx_b]
+                                      : idx_b * params.mainloop.append.seq_len_kv_new;
+            constexpr int kTileKV = get<1>(TileShapeQK{});
+            bool const direct_batch = (cache_len_old % kTileKV) == 0 && (new_begin % kTileKV) == 0;
+            if (direct_batch) {
+              if (get<0>(blk_qv) == 0 && get<1>(blk_qv) == 0) {
+                int const writer = head_q % head_group_q;
+                append_store_begin = seq_k_new * writer / head_group_q;
+                int const append_store_end = seq_k_new * (writer + 1) / head_group_q;
+                append_store_len = append_store_end - append_store_begin;
+              } else {
+                append_store_len = 0;
+              }
+            }
+          }
           if constexpr (CollectiveMainloop::CausalMask && !PackGQA_) {
             // Without a grid-wide barrier, each WG must write every appended
             // token it may read; causal tiles only need the visible prefix.
@@ -395,15 +415,23 @@ class XeFMHAFwdKernel {
       // contiguous region, so the extent must be this batch's KV length to keep the
       // 2D block loads in-bounds.
       int kv_seq_extent = CollectiveMainloop::PagedKV ? int(s.seq_len_kv_cache.total_length) : int(seq_len_kv_cache);
+      int kv_input_extent = kv_seq_extent;
+      if constexpr (DirectAppendKV) {
+        kv_input_extent = int(s.seq_len_kv.total_length);
+      }
       // PackGQA folds the head_group_q query heads into M and grids over KV
       // heads, so the Q/O head extent collapses to num_heads_kv.
       auto q_head_count = PackGQA_ ? s.num_heads_kv : s.num_heads_q;
       auto shape_Q = make_shape(m_extent, s.head_size_qk, q_head_count, batch_dim);
-      auto shape_K = make_shape(kv_seq_extent, s.head_size_qk, s.num_heads_kv, batch_dim);
-      auto shape_V = make_shape(s.head_size_vo, kv_seq_extent, s.num_heads_kv, batch_dim);
+      auto shape_K = make_shape(kv_input_extent, s.head_size_qk, s.num_heads_kv, batch_dim);
+      auto shape_V = make_shape(s.head_size_vo, kv_input_extent, s.num_heads_kv, batch_dim);
+      auto shape_K_cache = make_shape(kv_seq_extent, s.head_size_qk, s.num_heads_kv, batch_dim);
+      auto shape_V_cache = make_shape(s.head_size_vo, kv_seq_extent, s.num_heads_kv, batch_dim);
       auto shape_O = make_shape(m_extent, s.head_size_vo, q_head_count, batch_dim);
 
       auto dcQ = const_cast<ElementQ*>(p.Q + offset_q);
+      auto dcK = const_cast<ElementK*>(DirectAppendKV ? p.K : p.K_cache);
+      auto dcV = const_cast<ElementV*>(DirectAppendKV ? p.V : p.V_cache);
       auto dcK_cache = const_cast<ElementK*>(p.K_cache + offset_k_cache);
       auto dcV_cache = const_cast<ElementV*>(p.V_cache + offset_v_cache);
       auto dcO = const_cast<ElementO*>(p.O + offset_o);
@@ -411,13 +439,19 @@ class XeFMHAFwdKernel {
       auto layout_q = is_var_len ? make_ordered_layout(shape_Q, VarLenQLayoutStep_{}) : make_layout(shape_Q, p.dQ);
       auto layout_k = is_var_len ? make_ordered_layout(shape_K, VarLenKLayoutStep_{}) : make_layout(shape_K, p.dK);
       auto layout_v = is_var_len ? make_ordered_layout(shape_V, VarLenVLayoutStep_{}) : make_layout(shape_V, p.dV);
+      auto layout_k_cache = is_var_len ? make_ordered_layout(shape_K_cache, VarLenKLayoutStep_{})
+                                       : make_layout(shape_K_cache, p.dK_cache);
+      auto layout_v_cache = is_var_len ? make_ordered_layout(shape_V_cache, VarLenVLayoutStep_{})
+                                       : make_layout(shape_V_cache, p.dV_cache);
 
       // NHD layout for GQA
       auto layout_o = is_var_len ? make_ordered_layout(shape_O, VarLenOLayoutStep_{}) : make_layout(shape_O, p.dO);
 
       Tensor Q = make_tensor(make_gmem_ptr(dcQ), layout_q);
-      Tensor K_cache = make_tensor(make_gmem_ptr(dcK_cache), layout_k);
-      Tensor V_cache = make_tensor(make_gmem_ptr(dcV_cache), layout_v);
+      Tensor K = make_tensor(make_gmem_ptr(dcK), layout_k);
+      Tensor V = make_tensor(make_gmem_ptr(dcV), layout_v);
+      Tensor K_cache = make_tensor(make_gmem_ptr(dcK_cache), layout_k_cache);
+      Tensor V_cache = make_tensor(make_gmem_ptr(dcV_cache), layout_v_cache);
       Tensor O = make_tensor(make_gmem_ptr(dcO), layout_o);
       // O accumulator types
       FragA tArA;
@@ -440,8 +474,8 @@ class XeFMHAFwdKernel {
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
       mainloop(
           Q(_, _, q_head_idx, l_coord),
-          K_cache(_, _, head, l_coord),
-          V_cache(_, _, head, l_coord),
+          K(_, _, head, l_coord),
+          V(_, _, head, l_coord),
           tArA,
           tA_max,
           tA_sum,
@@ -459,6 +493,7 @@ class XeFMHAFwdKernel {
           full_tile_offset,
           discard_seq_coord,
           append_store_len,
+          append_store_begin,
           K_cache(_, _, head, l_coord),
           V_cache(_, _, head, l_coord),
           scale_k);

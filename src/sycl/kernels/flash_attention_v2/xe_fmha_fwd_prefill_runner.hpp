@@ -315,9 +315,9 @@ struct PrefillRunner {
             shape,
             static_cast<const ElementQ*>(params.q_ptr),
             stride_Q,
-            nullptr,
+            CollectiveMainloop::DirectAppendKV ? static_cast<const ElementK*>(params.knew_ptr) : nullptr,
             stride_K,
-            nullptr,
+            CollectiveMainloop::DirectAppendKV ? static_cast<const ElementV*>(params.vnew_ptr) : nullptr,
             stride_V,
             static_cast<ElementO*>(params.o_ptr),
             stride_O,
@@ -391,7 +391,14 @@ struct FMHAConfig {
       decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{})),
       SubgroupLayoutPV_>;
 
-  template <bool isVarLen, bool CachedKV, bool PagedKV, bool AppendKV, class Scheduler>
+  template <
+      bool isVarLen,
+      bool CachedKV,
+      bool PagedKV,
+      bool AppendKV,
+      class Scheduler,
+      bool DirectAppendKV = false,
+      bool WideAppendKV = false>
   static int run(const Arguments& params) {
     // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
     // information is used by the underlying kernel.
@@ -443,7 +450,9 @@ struct FMHAConfig {
         GmemTiledCopyV_cache,
         LocalMask,
         false,
-        AppendKV>;
+        AppendKV,
+        DirectAppendKV,
+        WideAppendKV>;
 
     // Epilogue
     using CollectiveEpilogue =
@@ -486,6 +495,23 @@ struct FMHAConfig {
       return run<true, true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
     }
     return run<true, true, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+  }
+
+  static int run_paged_direct_append(const Arguments& params) {
+    TORCH_CHECK(params.cu_seqlens_q != nullptr, "direct AppendKV requires cu_seqlens_q");
+    TORCH_CHECK(params.cu_seqlens_k != nullptr, "direct AppendKV requires per-batch cache lengths");
+    TORCH_CHECK(params.page_table != nullptr, "direct AppendKV requires page_table");
+    TORCH_CHECK(params.page_size > 0, "direct AppendKV requires a positive page_size");
+    TORCH_CHECK(params.max_num_pages_per_seq > 0, "direct AppendKV requires max_num_pages_per_seq");
+    TORCH_CHECK(
+        params.total_knew > 0 && params.knew_ptr != nullptr && params.vnew_ptr != nullptr &&
+            params.cache_seqlens_old != nullptr,
+        "direct AppendKV requires k_new, v_new, and old cache lengths");
+    return run<true, true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler, true>(params);
+  }
+
+  static int run_paged_wide_append(const Arguments& params) {
+    return run<true, true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler, false, true>(params);
   }
 
   // Non-paged (contiguous ragged) KV cache: addressed via cu_seqlens_k offsets.

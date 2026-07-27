@@ -27,6 +27,7 @@ limitations under the License.
 
 #include "kernels/nsa/fp8_mqa_gemm_xe20.hpp"
 #include "kernels/nsa/fp8_mqa_logits_kernel.hpp"
+#include "sgl_kernel_export.h"
 
 namespace {
 
@@ -88,7 +89,7 @@ void fp8_gemm_xe20_batched_inplace(
 }  // namespace
 
 // fp8_paged_mqa_logits: decode path
-torch::Tensor fp8_paged_mqa_logits(
+SGL_KERNEL_EXPORT torch::Tensor fp8_paged_mqa_logits(
     const torch::Tensor& q_fp8,
     const torch::Tensor& kv_cache,
     const torch::Tensor& weights,

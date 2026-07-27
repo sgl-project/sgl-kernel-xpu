@@ -37,6 +37,7 @@
 #include "MemoryAccess.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 // TODO: Remove this when sycl float8 is supported
 using cutlass::float_e4m3_t;
@@ -157,7 +158,7 @@ class PerTensorAbsMaxKernel {
   }
 };
 
-void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static) {
+SGL_KERNEL_EXPORT void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
   CHECK_INPUT(output_s);

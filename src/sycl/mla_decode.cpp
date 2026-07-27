@@ -43,6 +43,7 @@
 #include "Utils.h"
 #include "sycl/kernels/mla/device/mla_decode_dispatch.hpp"
 #include "sycl/kernels/mla/device/mla_decode_types.hpp"
+#include "sgl_kernel_export.h"
 
 namespace {
 
@@ -131,7 +132,7 @@ int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int
 }  // namespace
 
 /// @brief Dispatch kernel implementation for MLA decode.
-void flash_mla_decode(
+SGL_KERNEL_EXPORT void flash_mla_decode(
     at::Tensor& out,                        // (batch, num_heads, latent_dim)
     const at::Tensor& q_nope,               // (batch, num_heads, latent_dim)
     const at::Tensor& q_pe,                 // (batch, num_heads, rope_dim)
@@ -188,7 +189,7 @@ int64_t mla_workspace_size(int64_t num_batches, int64_t num_heads, int64_t num_k
 }
 }  // namespace
 
-int64_t flash_mla_get_workspace_size(
+SGL_KERNEL_EXPORT int64_t flash_mla_get_workspace_size(
     int64_t max_seq_len, int64_t num_batches, int64_t num_heads, int64_t page_size, int64_t num_kv_splits) {
   if (num_kv_splits < 1) {
     TORCH_CHECK(num_heads > 0, "num_heads must be > 0 when num_kv_splits is auto-selected");

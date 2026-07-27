@@ -2,6 +2,7 @@
 #include <c10/xpu/XPUStream.h>
 
 #include <sycl/sycl.hpp>
+#include "sgl_kernel_export.h"
 
 namespace syclex = sycl::ext::oneapi::experimental;
 
@@ -11,7 +12,7 @@ static inline syclex::architecture get_device_architecture(at::DeviceIndex devic
   return raw_device.get_info<syclex::info::device::architecture>();
 }
 
-std::tuple<int64_t, int64_t> query_device(int64_t device_index = -1) {
+SGL_KERNEL_EXPORT std::tuple<int64_t, int64_t> query_device(int64_t device_index = -1) {
   auto device_arch = get_device_architecture(device_index);
   switch (device_arch) {
     case syclex::architecture::intel_gpu_bmg_g21:

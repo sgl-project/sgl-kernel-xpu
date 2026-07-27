@@ -16,6 +16,7 @@
 #include "Utils.h"
 #include "sycl/kernels/mla_sparse/device/mla_sparse_decode_dispatch.hpp"
 #include "sycl/kernels/mla_sparse/device/mla_sparse_decode_types.hpp"
+#include "sgl_kernel_export.h"
 
 // Compile-time toggle for the two-stage sparse MLA decode path (gather+dequant to
 // HBM, then dense flash-decode). The selector macro
@@ -146,7 +147,7 @@ namespace {
 }  // namespace
 
 /// @brief Dispatch kernel implementation for V4 Sparse MLA decode.
-void flash_mla_sparse_decode(
+SGL_KERNEL_EXPORT void flash_mla_sparse_decode(
     at::Tensor& out,                                     // [B, 1, H, head_dim_v]
     at::Tensor& lse_out,                                 // [B, H, 1]
     const at::Tensor& q,                                 // [B, 1, H, D_qk]

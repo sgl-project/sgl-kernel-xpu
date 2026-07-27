@@ -8,6 +8,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 namespace {
 constexpr int kTopK = 2048;
@@ -509,7 +510,7 @@ struct FastTopKTransformRaggedFusedKernel : public __SYCL_KER_CONFIG_CONVENTION_
 
 }  // namespace
 
-void fast_topk_interface(
+SGL_KERNEL_EXPORT void fast_topk_interface(
     const at::Tensor& score, at::Tensor& indices, const at::Tensor& lengths, std::optional<at::Tensor> row_starts_opt) {
   CHECK_INPUT(score);
   CHECK_DEVICE(indices);
@@ -529,7 +530,7 @@ void fast_topk_interface(
       sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock), queue, kernel);
 }
 
-void fast_topk_transform_interface(
+SGL_KERNEL_EXPORT void fast_topk_transform_interface(
     const at::Tensor& score,
     const at::Tensor& lengths,
     at::Tensor& dst_page_table,
@@ -584,7 +585,7 @@ void fast_topk_transform_interface(
   }
 }
 
-void fast_topk_transform_ragged_interface(
+SGL_KERNEL_EXPORT void fast_topk_transform_ragged_interface(
     const at::Tensor& score,
     const at::Tensor& lengths,
     at::Tensor& topk_indices_ragged,

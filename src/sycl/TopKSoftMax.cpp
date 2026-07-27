@@ -6,6 +6,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 namespace at::native::xpu {
 
@@ -580,7 +581,7 @@ void fused_topk_softmax(
  * @param renormalize The renormalize bool whether the topk_weights needs to be renormalized.
  * @return void.
  */
-void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize) {
+SGL_KERNEL_EXPORT void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize) {
   auto shape = gating_output.sizes().vec();
   TORCH_CHECK(shape.size() == 2, "gating_output must be 2D tensor, but got ", shape.size(), "D");
   int64_t n_tokens = shape[0];

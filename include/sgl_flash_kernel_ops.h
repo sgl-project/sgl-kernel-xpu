@@ -43,6 +43,9 @@ limitations under the License.
 /*
  * From flash-attention
  */
+// Defined in the FMHA/MLA SYCL shared libraries (built with -fvisibility=hidden)
+// and called from common_ops; keep them exported with default visibility.
+#pragma GCC visibility push(default)
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     const at::Tensor& q,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
@@ -134,3 +137,4 @@ void flash_mla_sparse_prefill(
     int64_t head_dim_v,
     const std::optional<torch::Tensor>& attn_sink = std::nullopt,
     const std::optional<torch::Tensor>& topk_length = std::nullopt);
+#pragma GCC visibility pop

@@ -42,6 +42,12 @@ limitations under the License.
 
 using fptr_t = int64_t;
 
+// The kernels below are defined in the per-kernel SYCL shared libraries and
+// called from common_ops (torch_extension_sycl.cc). The SYCL libraries are
+// built with -fvisibility=hidden, so their public entry points must be given
+// default visibility to remain exported and dynamically linkable.
+#pragma GCC visibility push(default)
+
 /*
  * From csrc/allreduce
  */
@@ -1101,3 +1107,5 @@ void causal_conv1d_update(
     const std::optional<at::Tensor>& cache_seqlens_,
     const std::optional<at::Tensor>& conv_state_indices_,
     int64_t pad_slot_id);
+
+#pragma GCC visibility pop

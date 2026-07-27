@@ -4,6 +4,7 @@
 
 #include "Utils.h"
 #include "comm/General.h"
+#include "sgl_kernel_export.h"
 
 namespace at::native::xpu {
 
@@ -71,7 +72,7 @@ struct StoreCacheKernel {
   int64_t vec_count_;
 };
 
-void store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices) {
+SGL_KERNEL_EXPORT void store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices) {
   CHECK_DEVICE(k);
   CHECK_DEVICE(v);
   CHECK_DEVICE(k_cache);

@@ -37,6 +37,7 @@
 
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_prefill_dispatch.hpp"
+#include "sgl_kernel_export.h"
 
 namespace {
 
@@ -1307,7 +1308,7 @@ std::vector<at::Tensor> mha_fwd(
 
 }  // namespace chunkprefill
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
+SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     const at::Tensor& q,  // (total_q, h, d) — ragged 3D
     const at::Tensor& k,  // (total_k, h_k, d) if non-paged, or (num_pages, page_size, h_k, d) if paged
     const at::Tensor& v,  // (total_k, h_k, dv) if non-paged, or (num_pages, page_size, h_k, dv) if paged

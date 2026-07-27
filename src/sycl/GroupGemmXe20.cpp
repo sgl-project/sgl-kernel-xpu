@@ -10,13 +10,18 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "kernels/moe/xe20/bf16/moe_kernel.hpp"
+#include "sgl_kernel_export.h"
 
 using namespace cute;
 using namespace MoE;
 
 using ElementAccumulator = float;  // <- data type of accumulator
 
+// Defined (explicitly instantiated) in the GroupGemmXe20_inst_* libraries. The
+// dispatcher is built with -fvisibility=hidden, so mark the declaration default
+// so this cross-library reference stays dynamically resolvable.
 template <typename Tile, typename SGLayout, ActivationType ActType, bool FuseAct, bool WithBias>
+__attribute__((visibility("default")))
 void Xe20MoEGEMMLauncher(
     sycl::queue q,
     const void* activations,
@@ -155,7 +160,7 @@ DECLARE_XE20_MOE_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
 #define DISPATCH_MOE(ActType, FuseAct, WithBias, ...) \
   DISPATCH_MOE_HELPER_ACT_TYPE(ActType, FuseAct, WithBias, __VA_ARGS__)
 
-void moe_grouped_mm_nt_xe20(
+SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
     torch::Tensor& output,
     const torch::Tensor& activations,
     const torch::Tensor& weights,

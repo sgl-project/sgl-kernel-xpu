@@ -63,6 +63,26 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@>::opera
   using SubgroupLayoutQK =
       cute::Layout<cute::Shape<cute::Int<@NUM_SG@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
 
+#if @APPENDKV_Q256_TILE@
+  if (params.total_knew > 0 && params.seqlen_q == @APPENDKV_Q256_Q@ &&
+      params.seqlen_knew == @APPENDKV_Q256_Q@ &&
+      params.total_q == params.b * @APPENDKV_Q256_Q@ &&
+      params.total_knew == params.b * @APPENDKV_Q256_Q@ && !params.is_causal && !params.is_local && !use_sink &&
+      params.d == @HEAD_DIM@ && params.dv == @HEAD_DIM@) {
+    using AppendTileShapeQK =
+        cute::Shape<cute::Int<@APPENDKV_Q256_Q@>, cute::Int<@APPENDKV_Q256_KV@>, cute::_32>;
+    using AppendTileShapePV =
+        cute::Shape<cute::Int<@APPENDKV_Q256_Q@>, cute::_32, cute::Int<@APPENDKV_Q256_KV@>>;
+    using AppendTileShapeOutput = cute::Shape<cute::Int<@APPENDKV_Q256_Q@>, cute::Int<@TILED_OUT@>>;
+    using AppendSubgroupLayoutQK = cute::Layout<
+        cute::Shape<cute::Int<@APPENDKV_Q256_NUM_SG@>, cute::_1, cute::_1>,
+        cute::Stride<cute::_1, cute::_1, cute::_1>>;
+    FMHAConfig<false, false, false, AppendTileShapeQK, AppendTileShapePV, AppendTileShapeOutput,
+               AppendSubgroupLayoutQK>::run_paged(params);
+    return;
+  }
+#endif
+
 #if @HEAD_DIM@ == 96
   // Dense hkv8 batches already provide enough occupancy and run faster with the original sg8 tile.
   if (params.b >= 8 && params.h_k >= 8) {

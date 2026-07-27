@@ -346,6 +346,9 @@ struct FMHAFwdMainloop<
           }
           int const head_size = head_size_qk;
           int const vecs_per_token = head_size / kVecElems;
+          bool const flatten_token_vectors = new_len >= kMinMultiSgTokens && head_size == 64;
+          int const worker = sub_group_id * intel::sg_size + lane_idx;
+          int const worker_count = active_sg_count * intel::sg_size;
           bool single_dst_page = true;
           int single_row_base = cache_len_old;
           if constexpr (PagedKV) {
@@ -377,16 +380,31 @@ struct FMHAFwdMainloop<
                     ((size_t)(new_begin + new_tok0) * (size_t)num_heads_kv + (size_t)kv_head) * (size_t)head_size;
                 size_t const token_stride = (size_t)num_heads_kv * (size_t)head_size;
 
-                for (int page_tok = sub_group_id; page_tok < page_len; page_tok += active_sg_count) {
-                  int const dst_row = row_base + page_tok;
-                  size_t const token_src_base = src_base + (size_t)page_tok * token_stride;
-                  for (int d_vec = lane_idx; d_vec < vecs_per_token; d_vec += intel::sg_size) {
+                if (flatten_token_vectors) {
+                  for (int page_vec = worker; page_vec < page_len * vecs_per_token; page_vec += worker_count) {
+                    int const page_tok = page_vec / vecs_per_token;
+                    int const d_vec = page_vec - page_tok * vecs_per_token;
+                    int const dst_row = row_base + page_tok;
+                    size_t const token_src_base = src_base + (size_t)page_tok * token_stride;
                     int const d = d_vec * kVecElems;
                     size_t const src = token_src_base + (size_t)d;
                     StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_K_new + src);
                     StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_V_new + src);
                     *reinterpret_cast<StoreVec*>(&K_dst(dst_row, d)) = k_value;
                     *reinterpret_cast<StoreVec*>(&V_dst(d, dst_row)) = v_value;
+                  }
+                } else {
+                  for (int page_tok = sub_group_id; page_tok < page_len; page_tok += active_sg_count) {
+                    int const dst_row = row_base + page_tok;
+                    size_t const token_src_base = src_base + (size_t)page_tok * token_stride;
+                    for (int d_vec = lane_idx; d_vec < vecs_per_token; d_vec += intel::sg_size) {
+                      int const d = d_vec * kVecElems;
+                      size_t const src = token_src_base + (size_t)d;
+                      StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_K_new + src);
+                      StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_V_new + src);
+                      *reinterpret_cast<StoreVec*>(&K_dst(dst_row, d)) = k_value;
+                      *reinterpret_cast<StoreVec*>(&V_dst(d, dst_row)) = v_value;
+                    }
                   }
                 }
                 new_tok0 += page_len;
@@ -395,28 +413,35 @@ struct FMHAFwdMainloop<
             }
           }
 
-          for (int new_tok = sub_group_id; new_tok < new_len; new_tok += active_sg_count) {
-            int const new_abs_tok = new_begin + new_tok;
-            int dst_row = single_row_base + new_tok;
-            if constexpr (PagedKV) {
-              if (!single_dst_page) {
-                int const dst_tok = cache_len_old + new_tok;
-                int const page = dst_tok / params.page_size;
-                int const tok_in_page = dst_tok - page * params.page_size;
-                int const logical_page = batch * params.max_num_pages_per_seq + page;
-                int const phys_page = params.ptr_page_table[logical_page];
-                dst_row = phys_page * params.page_size + tok_in_page;
-              }
-            }
-
-            size_t const src_base = ((size_t)new_abs_tok * (size_t)num_heads_kv + (size_t)kv_head) * (size_t)head_size;
-            for (int d_vec = lane_idx; d_vec < vecs_per_token; d_vec += intel::sg_size) {
+          if (flatten_token_vectors) {
+            for (int new_vec = worker; new_vec < new_len * vecs_per_token; new_vec += worker_count) {
+              int const new_tok = new_vec / vecs_per_token;
+              int const d_vec = new_vec - new_tok * vecs_per_token;
+              int const new_abs_tok = new_begin + new_tok;
+              int const dst_row = single_row_base + new_tok;
+              size_t const src_base =
+                  ((size_t)new_abs_tok * (size_t)num_heads_kv + (size_t)kv_head) * (size_t)head_size;
               int const d = d_vec * kVecElems;
               size_t const src = src_base + (size_t)d;
               StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_K_new + src);
               StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_V_new + src);
               *reinterpret_cast<StoreVec*>(&K_dst(dst_row, d)) = k_value;
               *reinterpret_cast<StoreVec*>(&V_dst(d, dst_row)) = v_value;
+            }
+          } else {
+            for (int new_tok = sub_group_id; new_tok < new_len; new_tok += active_sg_count) {
+              int const new_abs_tok = new_begin + new_tok;
+              int const dst_row = single_row_base + new_tok;
+              size_t const src_base =
+                  ((size_t)new_abs_tok * (size_t)num_heads_kv + (size_t)kv_head) * (size_t)head_size;
+              for (int d_vec = lane_idx; d_vec < vecs_per_token; d_vec += intel::sg_size) {
+                int const d = d_vec * kVecElems;
+                size_t const src = src_base + (size_t)d;
+                StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_K_new + src);
+                StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_V_new + src);
+                *reinterpret_cast<StoreVec*>(&K_dst(dst_row, d)) = k_value;
+                *reinterpret_cast<StoreVec*>(&V_dst(d, dst_row)) = v_value;
+              }
             }
           }
           return;

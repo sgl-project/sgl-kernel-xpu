@@ -205,13 +205,14 @@ struct CompressPrefillStage0Kernel {
     }
     item.barrier(sycl::access::fence_space::local_space);
 
-    // MTP-uniform means each request shares the same small extend length E.
+    // MTP-uniform: every batch shares the same small extend_len `E`, so we can decompose
+    // a global token id `k` into (batch_id, j) = (k / E, k % E) and skip the per-batch loop.
     const bool is_mtp_extend =
         (s_min_extend_[0] == s_max_extend_[0]) && (s_max_extend_[0] > 0) && (s_max_extend_[0] <= 32);
 
     // === Stage C: emit valid plans ===
     if (is_mtp_extend) {
-      // Path 1 (token-driven): map k -> (batch_id, j) via E.
+      // Path 1: token-driven. Each global token id maps to exactly one (batch_id, j).
       const uint32_t e = s_max_extend_[0];
       // num_q_tokens_ is padded capacity; cap work at real tokens for safety.
       const uint32_t num_real_q = batch_size_ * e;
@@ -370,6 +371,8 @@ struct CompressPrefillStage1Kernel {
       return static_cast<int32_t>(rid * ring_size_ + position % ring_size_);
     };
 
+    // Stage0 writes a compact/intermediate CompressPlan. Stage1 resolves it to
+    // final ring pages by looking up req->token and token->state mappings.
     auto plan_c = idx < num_c_ ? plan_c_[idx] : CompressPlan::invalid();
     if (!plan_c.is_invalid()) {
       if (plan_c.buffer_len > 0) {
@@ -396,6 +399,8 @@ struct CompressPrefillStage1Kernel {
       plan_c_[idx] = CompressPlan::invalid();
     }
 
+    // Stage0 packs (ragged_id, batch_id) into ragged_id and stores (position+1)
+    // in write_loc. Stage1 unpacks and resolves write_loc to final ring address.
     auto plan_w = idx < num_w_ ? plan_w_[idx] : WritePlan::invalid();
     if (!plan_w.is_invalid()) {
       const auto [ragged_id, batch_id] = unpack_w(plan_w);
@@ -524,6 +529,7 @@ std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill(
   TORCH_CHECK(seq_lens.numel() == extend_lens.numel(), "seq_lens and extend_lens must have the same length");
   TORCH_CHECK(req_pool_indices.numel() == seq_lens.numel(), "req_pool_indices and seq_lens must have the same length");
 
+  // Accept CPU metadata tensors and move them to the current XPU stream device.
   auto seq_lens_xpu = seq_lens;
   if (!seq_lens_xpu.is_xpu()) {
     seq_lens_xpu = seq_lens.to(req_pool_indices.options().dtype(torch::kInt64));

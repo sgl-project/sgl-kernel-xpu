@@ -782,15 +782,16 @@ def fused_q_norm_rope_reference(
     return out.to(q_input.dtype)
 
 
-@pytest.mark.parametrize("batch_size", [1, 4, 16])
-@pytest.mark.parametrize("num_heads", [1, 8])
+@pytest.mark.parametrize("batch_size", [1, 4, 16, 32])
+@pytest.mark.parametrize("num_heads", [1, 8, 64])
 @pytest.mark.parametrize(
     "head_dim,rope_dim",
     [
         (64, 64),  # warp path, exact fit
         (128, 64),  # warp path
+        (192, 84),  # warp path, different rope_dim to meet warp
         (256, 64),  # warp path
-        (320, 64),  # head_dim not in {64,128,256} -> CTA path
+        (320, 64),  # head_dim not in {64,128,192,256} -> CTA path
         (512, 64),  # DeepSeek-V4 production shape -> CTA path
     ],
 )
@@ -820,7 +821,7 @@ def test_fused_q_norm_rope(batch_size, num_heads, head_dim, rope_dim, dtype):
     )
 
 
-@pytest.mark.parametrize("head_dim,rope_dim", [(128, 64), (512, 64)])
+@pytest.mark.parametrize("head_dim,rope_dim", [(128, 64), (192, 84), (512, 64)])
 @pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
 def test_fused_q_norm_rope_position_dtype(head_dim, rope_dim, position_dtype):
     """Test both supported `positions` dtypes for warp (128) and CTA (512) paths."""
@@ -848,7 +849,7 @@ def test_fused_q_norm_rope_position_dtype(head_dim, rope_dim, position_dtype):
 
 def test_fused_q_norm_rope_zero_batch():
     """Empty batch should not crash, for both warp and CTA head_dims."""
-    for head_dim in (128, 512):
+    for head_dim in (128, 192, 512):
         q_input = torch.empty(0, 8, head_dim, dtype=torch.bfloat16, device=device)
         q_output = torch.empty(0, 8, head_dim, dtype=torch.bfloat16, device=device)
         freqs_cis = torch.randn(512, 32, dtype=torch.complex64, device=device)

@@ -750,25 +750,32 @@ def make_cache_inputs(
 # DeepSeek-V4 `fused_q_norm_rope` and `fused_k_norm_rope_flashmla` benchmarks
 # ============================================================================
 
-DSV4_HEAD_DIM = 512
-DSV4_ROPE_DIM = 64
+# DeepSeek-V4 production (head_dim, rope_dim) shapes: 128/512 pair with the
+# production rope_dim=64 (see `dsv4_fused_q_norm_rope` /
+# `dsv4_fused_k_norm_rope_flashmla` in
+# sgl-kernel/csrc/elementwise/dsv4_norm_rope.cu). head_dim=192 uses rope_dim=84
+# instead of 64 here so it actually exercises the XPU warp path (192's
+# kElemsPerThread=12 doesn't divide 64, so rope_dim=64 would silently fall
+# back to the CTA path).
+DSV4_HEAD_ROPE_DIM = [(128, 64), (192, 84), (512, 64)]
 DSV4_MAX_POSITION_EMBEDDINGS = 65536
 
-QNORM_ROPE_SHAPES = [
-    (1, 8, DSV4_HEAD_DIM, DSV4_ROPE_DIM, "dsv4_decode_tp8"),
-    (1, 16, DSV4_HEAD_DIM, DSV4_ROPE_DIM, "dsv4_decode_tp4"),
-    (1, 32, DSV4_HEAD_DIM, DSV4_ROPE_DIM, "dsv4_decode_tp2"),
-    (1, 64, DSV4_HEAD_DIM, DSV4_ROPE_DIM, "dsv4_decode_tp1"),
-    (128, 64, DSV4_HEAD_DIM, DSV4_ROPE_DIM, "dsv4_prefill_128"),
-    (512, 64, DSV4_HEAD_DIM, DSV4_ROPE_DIM, "dsv4_prefill_512"),
-    (2048, 64, DSV4_HEAD_DIM, DSV4_ROPE_DIM, "dsv4_prefill_2048"),
-    (128, 64, 64, 64, "warp_head64"),
-    (128, 64, 128, 64, "warp_head128"),
-    (128, 64, 256, 64, "warp_head256"),
-    (4608, 64, 64, 64, "warp_head64_large"),
-    (4608, 64, 128, 64, "warp_head128_large"),
-    (4608, 64, 256, 64, "warp_head256_large"),
-]
+# Only these real DSV4 (head_dim, rope_dim) shapes are benchmarked below --
+# no synthetic warp-path-only shapes (e.g. head_dim 64/256).
+QNORM_ROPE_SHAPES = []
+for _head_dim, _rope_dim in DSV4_HEAD_ROPE_DIM:
+    QNORM_ROPE_SHAPES.extend(
+        [
+            (1, 8, _head_dim, _rope_dim, f"dsv4_decode_tp8_h{_head_dim}"),
+            (1, 16, _head_dim, _rope_dim, f"dsv4_decode_tp4_h{_head_dim}"),
+            (1, 32, _head_dim, _rope_dim, f"dsv4_decode_tp2_h{_head_dim}"),
+            (1, 64, _head_dim, _rope_dim, f"dsv4_decode_tp1_h{_head_dim}"),
+            (128, 64, _head_dim, _rope_dim, f"dsv4_prefill_128_h{_head_dim}"),
+            (512, 64, _head_dim, _rope_dim, f"dsv4_prefill_512_h{_head_dim}"),
+            (2048, 64, _head_dim, _rope_dim, f"dsv4_prefill_2048_h{_head_dim}"),
+            (4608, 64, _head_dim, _rope_dim, f"dsv4_prefill_4608_h{_head_dim}"),
+        ]
+    )
 
 
 def native_q_norm_rope(
@@ -913,8 +920,8 @@ FLASHMLA_K_SHAPES = [
 def make_flashmla_k_inputs(
     dtype_name: str,
     num_tokens: int,
-    head_dim: int = DSV4_HEAD_DIM,
-    rope_dim: int = DSV4_ROPE_DIM,
+    head_dim: int = DSV4_HEAD_ROPE_DIM[-1][0],  # K-path (FlashMLA) is always 512
+    rope_dim: int = DSV4_HEAD_ROPE_DIM[-1][1],
     page_size: int = 256,
     max_pos: int = DSV4_MAX_POSITION_EMBEDDINGS,
 ):
@@ -947,8 +954,7 @@ def benchmark_flashmla_k_shape(
 ):
     dtype = DTYPE_MAP.get(dtype_name, torch.bfloat16)
     itemsize = torch.tensor([], dtype=dtype).element_size()
-    head_dim = DSV4_HEAD_DIM
-    rope_dim = DSV4_ROPE_DIM
+    head_dim, rope_dim = DSV4_HEAD_ROPE_DIM[-1]  # K-path (FlashMLA) is always 512/64
     rows = []
 
     kv, kv_weight, freqs_real, positions, out_loc, kvcache = make_flashmla_k_inputs(

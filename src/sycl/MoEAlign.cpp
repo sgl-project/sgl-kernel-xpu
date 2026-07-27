@@ -244,20 +244,20 @@ struct MOEAlignBlockSizeSmallBatchExpertFunctor : public __SYCL_KER_CONFIG_CONVE
     for (int i = 0; i < num_experts; ++i) {
       tokens_cnts[(tid + 1) * num_experts + i] = 0;
     }
-    item.barrier(sycl::access::fence_space::local_space);
+    item.barrier(sycl::access::fence_space::global_and_local);
 
     for (size_t i = tid; i < numel; i += stride) {
       ++tokens_cnts[(tid + 1) * num_experts + topk_ids[i] + 1];
     }
-    item.barrier(sycl::access::fence_space::local_space);
+    item.barrier(sycl::access::fence_space::global_and_local);
 
     if (tid < num_experts) {
       tokens_cnts[tid] = 0;
-      for (int i = 1; i <= block_dim; ++i) {
+      for (int i = 1; i <= (int)block_dim; ++i) {
         tokens_cnts[i * num_experts + tid] += tokens_cnts[(i - 1) * num_experts + tid];
       }
     }
-    item.barrier(sycl::access::fence_space::local_space);
+    item.barrier(sycl::access::fence_space::global_and_local);
 
     if (tid == 0) {
       cumsum[0] = 0;
@@ -266,7 +266,7 @@ struct MOEAlignBlockSizeSmallBatchExpertFunctor : public __SYCL_KER_CONFIG_CONVE
       }
       *total_tokens_post_pad = static_cast<int32_t>(cumsum[num_experts]);
     }
-    item.barrier(sycl::access::fence_space::local_space);
+    item.barrier(sycl::access::fence_space::global_and_local);
 
     if (tid < num_experts) {
       for (int i = cumsum[tid]; i < cumsum[tid + 1]; i += block_size) {
@@ -276,13 +276,16 @@ struct MOEAlignBlockSizeSmallBatchExpertFunctor : public __SYCL_KER_CONFIG_CONVE
 
     if (pad_sorted_token_ids) {
       Vec fill_vec{(int)numel, (int)numel, (int)numel, (int)numel};
-      int32_t total_vecs = (*total_tokens_post_pad + VEC_SIZE - 1) / VEC_SIZE;
+      // Read the total from SLM (fenced by the barriers above), not from the
+      // global scalar written by tid==0: a work-group barrier only guarantees
+      // cross-work-item visibility of the value held in shared local memory.
+      int32_t total_vecs = (cumsum[num_experts] + VEC_SIZE - 1) / VEC_SIZE;
       Vec* out_ptr = reinterpret_cast<Vec*>(sorted_token_ids);
       for (int32_t i = tid; i < total_vecs; i += stride) {
         out_ptr[i] = fill_vec;
       }
     }
-    item.barrier(sycl::access::fence_space::local_space);
+    item.barrier(sycl::access::fence_space::global_and_local);
 
     for (size_t i = tid; i < numel; i += stride) {
       int32_t expert_id = topk_ids[i] + 1;

@@ -35,4 +35,4 @@ foreach(policy w4a16_policy_m_8 w4a16_policy_m_16 w4a16_policy_m_32 w4a16_policy
     endforeach()
 endforeach()
 
-list(APPEND ATen_XPU_SYCL_XE20 ${GROUP_GEMM_W4A16_XE20_INST_SRCS})
+list(APPEND device_cpp_xe20 ${GROUP_GEMM_W4A16_XE20_INST_SRCS})

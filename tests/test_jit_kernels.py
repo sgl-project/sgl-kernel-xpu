@@ -18,10 +18,10 @@ except ImportError:
 try:
     from sgl_kernel.jit import apply_rope_inplace as jit_rope
     from sgl_kernel.jit import fused_inplace_qknorm as jit_qknorm
-    from sgl_kernel.jit import moe_fused_gate as jit_moe_fused_gate
     from sgl_kernel.jit import gelu_and_mul as jit_gelu_and_mul
     from sgl_kernel.jit import gelu_tanh_and_mul as jit_gelu_tanh_and_mul
     from sgl_kernel.jit import moe_align_block_size as jit_moe_align_block_size
+    from sgl_kernel.jit import moe_fused_gate as jit_moe_fused_gate
     from sgl_kernel.jit import per_tensor_quant_fp8 as jit_per_tensor_quant_fp8
     from sgl_kernel.jit import (
         per_token_group_quant_8bit_v2 as jit_per_token_group_quant_8bit_v2,
@@ -498,6 +498,7 @@ def test_moe_fused_gate_jit_vs_aot_combined(
         f"params {params}, num_fused_shared_experts {num_fused_shared_experts}"
     )
 
+
 @pytest.mark.parametrize(
     "shape",
     [(128, 1024), (1, 4096), (5120, 7168), (3, 17)],  # last one exercises scalar tail
@@ -796,7 +797,6 @@ def test_activation_and_mul_jit_vs_reference(op_name, num_tokens, dim, dtype):
 
     assert y_jit.shape == (num_tokens, dim)
     torch.testing.assert_close(y_jit, y_ref, rtol=1e-2, atol=1e-2)
-
 
 
 if __name__ == "__main__":

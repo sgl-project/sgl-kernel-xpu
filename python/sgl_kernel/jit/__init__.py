@@ -26,8 +26,8 @@ if is_xpu():
         is_icpx_available,
         load_jit_sycl,
     )
-    from .moe_fused_gate import can_use_moe_fused_gate, moe_fused_gate
     from .moe_align_block_size import moe_align_block_size
+    from .moe_fused_gate import can_use_moe_fused_gate, moe_fused_gate
     from .norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm, rmsnorm
     from .per_tensor_quant_fp8 import per_tensor_quant_fp8
     from .per_token_group_quant_8bit_v2 import per_token_group_quant_8bit_v2

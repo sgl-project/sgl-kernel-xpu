@@ -327,19 +327,25 @@ struct PrefillRunner {
     // Define device-global scratch memory
     size_t workspace_size = FMHAPrefillKernel::get_workspace_size(arguments);
     auto workspace = torch::empty(workspace_size, params.tensor_opts);
+    void* workspace_ptr = workspace.data_ptr();
 
     if (!FMHAPrefillKernel::can_implement(arguments)) {
       return cutlass::Status::kErrorInvalidProblem;
     }
 
     // Initialize the workspace
-    FMHAPrefillKernel::initialize_workspace(arguments, workspace.data_ptr());
-
-    // Convert host-side arguments to device-side arguments to be passed to the kernel
-    auto kernel_params = FMHAPrefillKernel::to_underlying_arguments(arguments, workspace.data_ptr());
+    FMHAPrefillKernel::initialize_workspace(arguments, workspace_ptr);
 
     // Run
-    launch<FMHAPrefillKernel>(kernel_params);
+    if constexpr (CollectiveMainloop::ScoreBlock2D) {
+      using ScoreStoreKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<0>;
+      using ScoreLoadKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<1>;
+
+      launch<ScoreStoreKernel>(ScoreStoreKernel::to_underlying_arguments(arguments, workspace_ptr));
+      launch<ScoreLoadKernel>(ScoreLoadKernel::to_underlying_arguments(arguments, workspace_ptr));
+    } else {
+      launch<FMHAPrefillKernel>(FMHAPrefillKernel::to_underlying_arguments(arguments, workspace_ptr));
+    }
     return cutlass::Status::kSuccess;
   }
 };

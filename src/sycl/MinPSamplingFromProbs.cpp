@@ -233,10 +233,8 @@ void min_p_sampling_from_probs(
   CHECK_INPUT(probs);
   CHECK_INPUT(output);
   TORCH_CHECK(probs.dim() == 2, "probs must be a 2D tensor [batch_size, vocab_size]");
-  TORCH_CHECK(
-      probs.scalar_type() == torch::kFloat32 || probs.scalar_type() == torch::kHalf ||
-          probs.scalar_type() == torch::kBFloat16,
-      "probs must be float32, float16, or bfloat16");
+  // kernel templated on DType so fp16/bf16 support can be re-enabled later.
+  TORCH_CHECK(probs.scalar_type() == torch::kFloat32, "probs must be float32");
   TORCH_CHECK(output.dim() == 1, "output must be a 1D tensor [batch_size]");
   TORCH_CHECK(output.scalar_type() == torch::kInt32, "output must be int32");
 
@@ -279,45 +277,16 @@ void min_p_sampling_from_probs(
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
 
-  auto dtype = probs.scalar_type();
-  if (dtype == torch::kFloat32) {
-    launch_min_p_sampling<float>(
-        probs,
-        output.data_ptr<int32_t>(),
-        indices_ptr,
-        min_p_ptr,
-        static_cast<float>(min_p_val),
-        batch_size,
-        vocab_size,
-        philox_seed,
-        philox_offset,
-        deterministic,
-        queue);
-  } else if (dtype == torch::kHalf) {
-    launch_min_p_sampling<at::Half>(
-        probs,
-        output.data_ptr<int32_t>(),
-        indices_ptr,
-        min_p_ptr,
-        static_cast<float>(min_p_val),
-        batch_size,
-        vocab_size,
-        philox_seed,
-        philox_offset,
-        deterministic,
-        queue);
-  } else if (dtype == torch::kBFloat16) {
-    launch_min_p_sampling<at::BFloat16>(
-        probs,
-        output.data_ptr<int32_t>(),
-        indices_ptr,
-        min_p_ptr,
-        static_cast<float>(min_p_val),
-        batch_size,
-        vocab_size,
-        philox_seed,
-        philox_offset,
-        deterministic,
-        queue);
-  }
+  launch_min_p_sampling<float>(
+      probs,
+      output.data_ptr<int32_t>(),
+      indices_ptr,
+      min_p_ptr,
+      static_cast<float>(min_p_val),
+      batch_size,
+      vocab_size,
+      philox_seed,
+      philox_offset,
+      deterministic,
+      queue);
 }

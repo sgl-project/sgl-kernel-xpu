@@ -311,6 +311,7 @@ def _min_p_sampling_from_probs_internal(
     generator: Optional[torch.Generator],
 ) -> torch.Tensor:
     with probs.device as device:
+        probs = probs.float()
         maybe_min_p_arr = (
             maybe_min_p_arr.float() if maybe_min_p_arr is not None else None
         )
@@ -375,7 +376,7 @@ def min_p_sampling_from_probs(
 
     Note
     ----
-    Output of this function is int32.
+    This function expects float32 inputs, and the output is int32.
     """
     if check_nan:
         if torch.any(torch.isnan(probs)):

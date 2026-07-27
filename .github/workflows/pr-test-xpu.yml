@@ -87,7 +87,8 @@ jobs:
               python3 bench_fused_experts_mxfp4.py 2>&1 | tee bench_fused_experts_mxfp4.py.log && \
               python3 bench_hc_pre_gemm_sqr_sum.py 2>&1 | tee bench_hc_pre_gemm_sqr_sum.py.log && \
               python3 bench_mhc_pre.py 2>&1 | tee bench_mhc_pre.py.log && \
-              python3 bench_silu_and_mul_clamp.py 2>&1 | tee bench_silu_and_mul_clamp.log
+              python3 bench_silu_and_mul_clamp.py 2>&1 | tee bench_silu_and_mul_clamp.log && \
+              python3 bench_min_p_sampling_from_probs.py 2>&1 | tee bench_min_p_sampling_from_probs.log
             "
 
       - name: Copy logs from container

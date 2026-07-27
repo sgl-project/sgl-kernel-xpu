@@ -440,13 +440,6 @@ struct CompressPrefillStage1Kernel {
 
 }  // namespace CompressPlanImpl
 
-// SYCL helper to launch kernels
-inline sycl::nd_range<1> get_1d_range(int32_t size) {
-  constexpr int32_t local_size = 256;
-  return sycl::nd_range<1>(
-      sycl::range<1>((size + local_size - 1) / local_size * local_size), sycl::range<1>(local_size));
-}
-
 // XPU wrapper for plan_compress_decode
 torch::Tensor plan_compress_decode(
     torch::Tensor req_pool_indices,
@@ -457,15 +450,21 @@ torch::Tensor plan_compress_decode(
     int64_t swa_page_size,
     int64_t ring_size) {
   TORCH_CHECK(
-      req_pool_indices.is_xpu() && req_pool_indices.dtype() == torch::kInt64,
-      "req_pool_indices must be an int64 XPU tensor");
+      req_pool_indices.is_xpu() && req_pool_indices.dtype() == torch::kInt64 && req_pool_indices.dim() == 1 &&
+          req_pool_indices.is_contiguous(),
+      "req_pool_indices must be a contiguous 1D int64 XPU tensor");
   TORCH_CHECK(
-      req_to_token.is_xpu() && req_to_token.dtype() == torch::kInt32, "req_to_token must be an int32 XPU tensor");
+      req_to_token.is_xpu() && req_to_token.dtype() == torch::kInt32 && req_to_token.dim() == 2 &&
+          req_to_token.is_contiguous(),
+      "req_to_token must be a contiguous 2D int32 XPU tensor");
   TORCH_CHECK(
-      full_to_state.is_xpu() && full_to_state.dtype() == torch::kInt64, "full_to_state must be an int64 XPU tensor");
-  TORCH_CHECK(seq_lens.is_xpu() && seq_lens.dtype() == torch::kInt64, "seq_lens must be an int64 XPU tensor");
-  TORCH_CHECK(req_to_token.dim() == 2, "req_to_token must be a 2D tensor");
-  TORCH_CHECK(req_to_token.stride(1) == 1, "req_to_token must be contiguous in the last dim");
+      full_to_state.is_xpu() && full_to_state.dtype() == torch::kInt64 && full_to_state.dim() == 1 &&
+          full_to_state.is_contiguous(),
+      "full_to_state must be a contiguous 1D int64 XPU tensor");
+  TORCH_CHECK(
+      seq_lens.is_xpu() && seq_lens.dtype() == torch::kInt64 && seq_lens.dim() == 1 && seq_lens.is_contiguous(),
+      "seq_lens must be a contiguous 1D int64 XPU tensor");
+  TORCH_CHECK(req_pool_indices.numel() == seq_lens.numel(), "req_pool_indices and seq_lens must have the same length");
   TORCH_CHECK(compress_ratio > 0, "compress_ratio must be > 0");
 
   uint32_t batch_size = static_cast<uint32_t>(seq_lens.numel());
@@ -479,6 +478,8 @@ torch::Tensor plan_compress_decode(
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   queue.submit([&](sycl::handler& cgh) {
+    constexpr uint32_t kLocalSize = 256;
+    const uint32_t global_size = ((batch_size + kLocalSize - 1) / kLocalSize) * kLocalSize;
     CompressPlanImpl::CompressDecodeKernel kernel{
         req_pool_indices.data_ptr<int64_t>(),
         seq_lens.data_ptr<int64_t>(),
@@ -490,7 +491,7 @@ torch::Tensor plan_compress_decode(
         static_cast<int32_t>(compress_ratio),
         req_to_token.size(1),
         batch_size};
-    cgh.parallel_for(get_1d_range(batch_size), kernel);
+    cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kLocalSize)), kernel);
   });
 
   return output;
@@ -512,20 +513,29 @@ std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill(
   (void)use_cuda_graph;
 
   TORCH_CHECK(
-      req_pool_indices.is_xpu() && req_pool_indices.dtype() == torch::kInt64 && req_pool_indices.dim() == 1,
-      "req_pool_indices must be a 1D int64 XPU tensor");
+      req_pool_indices.is_xpu() && req_pool_indices.dtype() == torch::kInt64 && req_pool_indices.dim() == 1 &&
+          req_pool_indices.is_contiguous(),
+      "req_pool_indices must be a contiguous 1D int64 XPU tensor");
   TORCH_CHECK(
-      req_to_token.is_xpu() && req_to_token.dtype() == torch::kInt32 && req_to_token.dim() == 2,
-      "req_to_token must be a 2D int32 XPU tensor");
+      req_to_token.is_xpu() && req_to_token.dtype() == torch::kInt32 && req_to_token.dim() == 2 &&
+          req_to_token.is_contiguous(),
+      "req_to_token must be a contiguous 2D int32 XPU tensor");
   TORCH_CHECK(
-      full_to_state.is_xpu() && full_to_state.dtype() == torch::kInt64, "full_to_state must be an int64 XPU tensor");
+      full_to_state.is_xpu() && full_to_state.dtype() == torch::kInt64 && full_to_state.dim() == 1 &&
+          full_to_state.is_contiguous(),
+      "full_to_state must be a contiguous 1D int64 XPU tensor");
   TORCH_CHECK(
-      (seq_lens.is_xpu() || seq_lens.device().is_cpu()) && seq_lens.dtype() == torch::kInt64 && seq_lens.dim() == 1,
-      "seq_lens must be a 1D int64 tensor on XPU or CPU");
+      (seq_lens.is_xpu() || seq_lens.device().is_cpu()) && seq_lens.dtype() == torch::kInt64 && seq_lens.dim() == 1 &&
+          seq_lens.is_contiguous(),
+      "seq_lens must be a contiguous 1D int64 tensor on XPU or CPU");
   TORCH_CHECK(
       (extend_lens.is_xpu() || extend_lens.device().is_cpu()) && extend_lens.dtype() == torch::kInt64 &&
-          extend_lens.dim() == 1,
-      "extend_lens must be a 1D int64 tensor on XPU or CPU");
+          extend_lens.dim() == 1 && extend_lens.is_contiguous(),
+      "extend_lens must be a contiguous 1D int64 tensor on XPU or CPU");
+  TORCH_CHECK(
+      pin_buffer.device().is_cpu() && pin_buffer.dtype() == torch::kUInt8 && pin_buffer.dim() == 1 &&
+          pin_buffer.is_contiguous(),
+      "pin_buffer must be a contiguous 1D uint8 CPU tensor");
   TORCH_CHECK(seq_lens.numel() == extend_lens.numel(), "seq_lens and extend_lens must have the same length");
   TORCH_CHECK(req_pool_indices.numel() == seq_lens.numel(), "req_pool_indices and seq_lens must have the same length");
 
@@ -608,6 +618,8 @@ std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill(
   const uint32_t num_work = std::max(num_c_padded, num_w_padded);
   if (num_q_tokens_u32 > 0) {
     queue.submit([&](sycl::handler& cgh) {
+      constexpr uint32_t kLocalSize = 256;
+      const uint32_t global_size = ((num_work + kLocalSize - 1) / kLocalSize) * kLocalSize;
       CompressPlanImpl::CompressPrefillStage1Kernel kernel{
           reinterpret_cast<CompressPlan*>(plan_c.data_ptr<uint8_t>()),
           reinterpret_cast<WritePlan*>(plan_w.data_ptr<uint8_t>()),
@@ -623,7 +635,7 @@ std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill(
           num_c_padded,
           num_w_padded,
           num_work};
-      cgh.parallel_for(get_1d_range(static_cast<int32_t>(num_work)), kernel);
+      cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kLocalSize)), kernel);
     });
   }
 

@@ -49,21 +49,21 @@
 using namespace cute;
 namespace prefill {
 struct Arguments {
-  // The QKV matrices.
+  // The query and KV cache matrices.
   void* __restrict__ q_ptr;
-  void* __restrict__ k_ptr;
-  void* __restrict__ v_ptr;
+  void* __restrict__ k_cache_ptr;
+  void* __restrict__ v_cache_ptr;
 
-  // The stride between rows of the Q, K and V matrices.
+  // The stride between rows of the query and KV cache matrices.
   int64_t q_batch_stride;
-  int64_t k_batch_stride;
-  int64_t v_batch_stride;
+  int64_t k_cache_batch_stride;
+  int64_t v_cache_batch_stride;
   int64_t q_row_stride;
-  int64_t k_row_stride;
-  int64_t v_row_stride;
+  int64_t k_cache_row_stride;
+  int64_t v_cache_row_stride;
   int64_t q_head_stride;
-  int64_t k_head_stride;
-  int64_t v_head_stride;
+  int64_t k_cache_head_stride;
+  int64_t v_cache_head_stride;
   int64_t v_dim_stride;
 
   // The number of heads.
@@ -84,9 +84,9 @@ struct Arguments {
   void* __restrict__ softmax_lseaccum_ptr;
 
   // The dimensions.
-  int b, seqlen_q, seqlen_k, seqlen_knew, d, d_rounded, rotary_dim;
-  int total_q, total_k;
-  int total_knew = 0;
+  int b, seqlen_q, seqlen_k_cache, seqlen_k, d, d_rounded, rotary_dim;
+  int total_q, total_k_cache;
+  int total_k = 0;
   int b_k;             // When having KV cache and with cache_batch_idx, K & V might have larger batch size than Q
   int dv, dv_rounded;  // For the case where V headdim is different from Q/K headdim
 
@@ -103,8 +103,8 @@ struct Arguments {
 
   // array of length b+1 holding starting offset of each sequence.
   int* __restrict__ cu_seqlens_q;
+  int* __restrict__ cu_seqlens_k_cache;
   int* __restrict__ cu_seqlens_k;
-  int* __restrict__ cu_seqlens_knew;
   int* __restrict__ leftpad_k;
 
   // If provided, the actual length of each q/k sequence.
@@ -123,17 +123,17 @@ struct Arguments {
   int64_t lseaccum_batch_stride;
   int64_t lseaccum_head_stride;
 
-  // The K_new and V_new matrices.
-  void* __restrict__ knew_ptr;
-  void* __restrict__ vnew_ptr;
+  // The K and V matrices to append.
+  void* __restrict__ k_ptr;
+  void* __restrict__ v_ptr;
 
   // The stride between rows of the Q, K and V matrices.
-  int64_t knew_batch_stride;
-  int64_t vnew_batch_stride;
-  int64_t knew_row_stride;
-  int64_t vnew_row_stride;
-  int64_t knew_head_stride;
-  int64_t vnew_head_stride;
+  int64_t k_batch_stride;
+  int64_t v_batch_stride;
+  int64_t k_row_stride;
+  int64_t v_row_stride;
+  int64_t k_head_stride;
+  int64_t v_head_stride;
 
   void* __restrict__ qv_ptr;
   int64_t qv_batch_stride;
@@ -232,16 +232,16 @@ struct PrefillRunner {
     get<0>(problem_size_for_init) = 1;  // concentrated batch
     get<1>(problem_size_for_init) = params.h;
     get<3>(problem_size_for_init) = params.total_q;
-    get<4>(problem_size_for_init) = params.total_knew;
-    get<5>(problem_size_for_init) = params.total_k;
+    get<4>(problem_size_for_init) = params.total_k;
+    get<5>(problem_size_for_init) = params.total_k_cache;
 
     ProblemShapeType problem_size_for_launch{
         .batch = get<0>(problem_size),
         .num_heads_q = get<1>(problem_size),
         .num_heads_kv = get<2>(problem_size),
         .seq_len_qo = {params.seqlen_q, params.total_q, nullptr},
-        .seq_len_kv = {params.seqlen_knew, params.total_knew},
-        .seq_len_kv_cache = {params.seqlen_k, params.total_k},
+        .seq_len_kv = {params.seqlen_k, params.total_k},
+        .seq_len_kv_cache = {params.seqlen_k_cache, params.total_k_cache},
         .head_size_qk = get<6>(problem_size),
         .head_size_vo = get<7>(problem_size),
     };
@@ -252,7 +252,7 @@ struct PrefillRunner {
   /// Initialize operands to be used in the GEMM and reference GEMM
   ProblemShapeType initialize(const Arguments& params) {
     auto problem_shape_in = cute::make_tuple(
-        params.b, params.h, params.h_k, params.seqlen_q, params.seqlen_knew, params.seqlen_k, params.d, params.dv);
+        params.b, params.h, params.h_k, params.seqlen_q, params.seqlen_k, params.seqlen_k_cache, params.d, params.dv);
     ProblemShapeType shape;
 
     decltype(problem_shape_in) problem_size;
@@ -284,8 +284,8 @@ struct PrefillRunner {
 
     if constexpr (isVarLen) {
       shape.seq_len_qo.cumulative_length = params.cu_seqlens_q;
-      shape.seq_len_kv.cumulative_length = params.cu_seqlens_knew;
-      shape.seq_len_kv_cache.cumulative_length = params.cu_seqlens_k;
+      shape.seq_len_kv.cumulative_length = params.cu_seqlens_k;
+      shape.seq_len_kv_cache.cumulative_length = params.cu_seqlens_k_cache;
     }
 
     return shape;
@@ -302,12 +302,12 @@ struct PrefillRunner {
         params.window_size_left,
         params.window_size_right};
     if constexpr (CollectiveMainloop::AppendKV) {
-      mainloop_args.append.ptr_K_new = static_cast<const ElementK*>(params.knew_ptr);
-      mainloop_args.append.ptr_V_new = static_cast<const ElementV*>(params.vnew_ptr);
-      mainloop_args.append.ptr_cu_seqlens_k_new = params.cu_seqlens_knew;
-      mainloop_args.append.ptr_cache_seqlens = params.cache_seqlens_old;
-      mainloop_args.append.seq_len_kv_new = params.seqlen_knew;
-      mainloop_args.append.total_k_new = params.total_knew;
+      mainloop_args.kv.ptr_K = static_cast<const ElementK*>(params.k_ptr);
+      mainloop_args.kv.ptr_V = static_cast<const ElementV*>(params.v_ptr);
+      mainloop_args.kv.ptr_cu_seqlens_k = params.cu_seqlens_k;
+      mainloop_args.kv.ptr_cache_seqlens = params.cache_seqlens_old;
+      mainloop_args.kv.seq_len_kv = params.seqlen_k;
+      mainloop_args.kv.total_kv = params.total_k;
     }
 
     typename FMHAPrefillKernel::Arguments arguments{
@@ -315,15 +315,15 @@ struct PrefillRunner {
             shape,
             static_cast<const ElementQ*>(params.q_ptr),
             stride_Q,
-            CollectiveMainloop::DirectAppendKV ? static_cast<const ElementK*>(params.knew_ptr) : nullptr,
+            CollectiveMainloop::DirectAppendKV ? static_cast<const ElementK*>(params.k_ptr) : nullptr,
             stride_K,
-            CollectiveMainloop::DirectAppendKV ? static_cast<const ElementV*>(params.vnew_ptr) : nullptr,
+            CollectiveMainloop::DirectAppendKV ? static_cast<const ElementV*>(params.v_ptr) : nullptr,
             stride_V,
             static_cast<ElementO*>(params.o_ptr),
             stride_O,
-            static_cast<const ElementK*>(params.k_ptr),
+            static_cast<const ElementK*>(params.k_cache_ptr),
             stride_K_cache,
-            static_cast<const ElementV*>(params.v_ptr),
+            static_cast<const ElementV*>(params.v_cache_ptr),
             stride_V_cache,
             static_cast<const typename FMHAPrefillKernel::ElementSink*>(params.softmax_sink_ptr),
             static_cast<const bool*>(params.skip_batch_mask_ptr),
@@ -486,13 +486,13 @@ struct FMHAConfig {
   // Paged KV cache: the page table encodes absolute KV positions.
   static int run_paged(const Arguments& params) {
     TORCH_CHECK(params.cu_seqlens_q != nullptr, "paged prefill requires cu_seqlens_q");
-    TORCH_CHECK(params.cu_seqlens_k != nullptr, "paged prefill requires per-batch cache lengths in cu_seqlens_k");
+    TORCH_CHECK(params.cu_seqlens_k_cache != nullptr, "paged prefill requires per-batch cache lengths in cu_seqlens_k_cache");
     TORCH_CHECK(params.page_table != nullptr, "paged prefill requires page_table");
     TORCH_CHECK(params.page_size > 0, "paged prefill requires a positive page_size");
     TORCH_CHECK(params.max_num_pages_per_seq > 0, "paged prefill requires max_num_pages_per_seq");
-    TORCH_CHECK(params.seqlen_q > 0 && params.seqlen_k > 0, "paged prefill requires positive max sequence lengths");
-    TORCH_CHECK(params.total_q > 0 && params.total_k > 0, "paged prefill requires positive total sequence lengths");
-    bool const has_append = params.total_knew > 0 && params.knew_ptr != nullptr && params.vnew_ptr != nullptr &&
+    TORCH_CHECK(params.seqlen_q > 0 && params.seqlen_k_cache > 0, "paged prefill requires positive max sequence lengths");
+    TORCH_CHECK(params.total_q > 0 && params.total_k_cache > 0, "paged prefill requires positive total sequence lengths");
+    bool const has_append = params.total_k > 0 && params.k_ptr != nullptr && params.v_ptr != nullptr &&
                             params.cache_seqlens_old != nullptr;
     // template <bool isVarLen, bool CachedKV, bool PagedKV, bool AppendKV, class Scheduler>
     if (has_append) {
@@ -503,18 +503,18 @@ struct FMHAConfig {
 
   static int run_paged_mixed_pack_gqa_append(const Arguments& params) {
     TORCH_CHECK(params.cu_seqlens_q != nullptr, "mixed PackGQA requires cu_seqlens_q");
-    TORCH_CHECK(params.cu_seqlens_k != nullptr, "mixed PackGQA requires per-batch cache lengths");
+    TORCH_CHECK(params.cu_seqlens_k_cache != nullptr, "mixed PackGQA requires per-batch cache lengths");
     TORCH_CHECK(params.page_table != nullptr, "mixed PackGQA requires page_table");
     TORCH_CHECK(params.page_size > 0 && params.max_num_pages_per_seq > 0, "mixed PackGQA requires paged KV");
     TORCH_CHECK(params.total_q != params.b * params.seqlen_q, "mixed PackGQA requires ragged query lengths");
     TORCH_CHECK(params.h > params.h_k && params.h % params.h_k == 0, "mixed PackGQA requires GQA");
     bool const append_kv =
-        params.total_knew > 0 && params.knew_ptr != nullptr && params.vnew_ptr != nullptr &&
+        params.total_k > 0 && params.k_ptr != nullptr && params.v_ptr != nullptr &&
         params.cache_seqlens_old != nullptr;
     if (!append_kv) {
       TORCH_CHECK(
-          params.total_knew == 0 && params.knew_ptr == nullptr && params.vnew_ptr == nullptr &&
-              params.cu_seqlens_knew != nullptr,
+          params.total_k == 0 && params.k_ptr == nullptr && params.v_ptr == nullptr &&
+              params.cu_seqlens_k != nullptr,
           "mixed PackGQA without fused AppendKV requires cumulative cache-length deltas");
       return run<
           true,
@@ -539,12 +539,12 @@ struct FMHAConfig {
 
   static int run_paged_direct_append(const Arguments& params) {
     TORCH_CHECK(params.cu_seqlens_q != nullptr, "direct AppendKV requires cu_seqlens_q");
-    TORCH_CHECK(params.cu_seqlens_k != nullptr, "direct AppendKV requires per-batch cache lengths");
+    TORCH_CHECK(params.cu_seqlens_k_cache != nullptr, "direct AppendKV requires per-batch cache lengths");
     TORCH_CHECK(params.page_table != nullptr, "direct AppendKV requires page_table");
     TORCH_CHECK(params.page_size > 0, "direct AppendKV requires a positive page_size");
     TORCH_CHECK(params.max_num_pages_per_seq > 0, "direct AppendKV requires max_num_pages_per_seq");
     TORCH_CHECK(
-        params.total_knew > 0 && params.knew_ptr != nullptr && params.vnew_ptr != nullptr &&
+        params.total_k > 0 && params.k_ptr != nullptr && params.v_ptr != nullptr &&
             params.cache_seqlens_old != nullptr,
         "direct AppendKV requires k_new, v_new, and old cache lengths");
     return run<true, true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler, true>(params);
@@ -554,14 +554,14 @@ struct FMHAConfig {
     return run<true, true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler, false, true>(params);
   }
 
-  // Non-paged (contiguous ragged) KV cache: addressed via cu_seqlens_k offsets.
+  // Non-paged (contiguous ragged) KV cache: addressed via cu_seqlens_k_cache offsets.
   static int run_nopaged(const Arguments& params) {
     TORCH_CHECK(params.cu_seqlens_q != nullptr, "non-paged prefill requires cu_seqlens_q");
-    TORCH_CHECK(params.cu_seqlens_k != nullptr, "non-paged prefill requires cumulative cu_seqlens_k");
+    TORCH_CHECK(params.cu_seqlens_k_cache != nullptr, "non-paged prefill requires cumulative cu_seqlens_k_cache");
     TORCH_CHECK(params.page_table == nullptr, "non-paged prefill expects page_table to be null");
-    TORCH_CHECK(params.seqlen_q > 0 && params.seqlen_k > 0, "non-paged prefill requires positive max sequence lengths");
-    TORCH_CHECK(params.total_q > 0 && params.total_k > 0, "non-paged prefill requires positive total sequence lengths");
-    bool const has_append = params.total_knew > 0 && params.knew_ptr != nullptr && params.vnew_ptr != nullptr &&
+    TORCH_CHECK(params.seqlen_q > 0 && params.seqlen_k_cache > 0, "non-paged prefill requires positive max sequence lengths");
+    TORCH_CHECK(params.total_q > 0 && params.total_k_cache > 0, "non-paged prefill requires positive total sequence lengths");
+    bool const has_append = params.total_k > 0 && params.k_ptr != nullptr && params.v_ptr != nullptr &&
                             params.cache_seqlens_old != nullptr;
     // template <bool isVarLen, bool CachedKV, bool PagedKV, bool AppendKV, class Scheduler>
     if (has_append) {

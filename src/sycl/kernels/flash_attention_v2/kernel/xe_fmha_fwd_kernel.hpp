@@ -231,7 +231,10 @@ class XeFMHAFwdKernel {
 
       int seq_len_q =
           problem_shape.seq_len_qo.cumulative_length[batch + 1] - problem_shape.seq_len_qo.cumulative_length[batch];
-      int seq_len_k_new = 0;
+      int seq_len_k = problem_shape.seq_len_kv.cumulative_length == nullptr
+                          ? int(problem_shape.seq_len_kv)
+                          : problem_shape.seq_len_kv.cumulative_length[batch + 1] -
+                              problem_shape.seq_len_kv.cumulative_length[batch];
       // Paged KV passes per-batch cache lengths in cu_seqlens_k (cumulative_length[b]
       // already holds this batch's KV length). Non-paged KV passes a cumulative
       // prefix-sum array (b+1 entries), so the per-batch length is the difference.
@@ -251,29 +254,10 @@ class XeFMHAFwdKernel {
         seq_len_k_cache = problem_shape.seq_len_kv_cache.cumulative_length[batch + 1] -
                           problem_shape.seq_len_kv_cache.cumulative_length[batch];
       }
-      return cute::make_tuple<int, int, int>(seq_len_q, seq_len_k_new, seq_len_k_cache);
+      return cute::make_tuple<int, int, int>(seq_len_q, seq_len_k, seq_len_k_cache);
 
     } else {
       return Shape<int, int, int>{problem_shape.seq_len_qo, problem_shape.seq_len_kv, problem_shape.seq_len_kv_cache};
-    }
-  }
-
-  CUTLASS_DEVICE
-  int get_k_new_len(MainloopParams const& mainloop, int batch) {
-    if constexpr (CollectiveMainloop::AppendKV) {
-      if (mainloop.append.ptr_K_new == nullptr || mainloop.append.ptr_V_new == nullptr ||
-          mainloop.append.ptr_cache_seqlens == nullptr || mainloop.append.total_k_new <= 0 ||
-          (mainloop.append.ptr_cu_seqlens_k_new == nullptr && mainloop.append.seq_len_kv_new <= 0)) {
-        return 0;
-      }
-      if (mainloop.append.ptr_cu_seqlens_k_new != nullptr) {
-        return mainloop.append.ptr_cu_seqlens_k_new[batch + 1] - mainloop.append.ptr_cu_seqlens_k_new[batch];
-      }
-      return mainloop.append.seq_len_kv_new;
-    } else {
-      (void)mainloop;
-      (void)batch;
-      return 0;
     }
   }
 
@@ -316,9 +300,8 @@ class XeFMHAFwdKernel {
       int head = packed_gqa ? head_q : head_q / head_group_q;
       int seq_k_eff = seq_len_kv_cache;
       if constexpr (CollectiveMainloop::AppendKV) {
-        int const seq_k_new = get_k_new_len(params.mainloop, idx_b);
-        if (seq_k_new > 0) {
-          seq_k_eff = params.mainloop.append.ptr_cache_seqlens[idx_b] + seq_k_new;
+        if (seq_len_kv > 0) {
+          seq_k_eff = params.mainloop.kv.ptr_cache_seqlens[idx_b] + seq_len_kv;
         }
       }
       // M extent of the Q/O tile: the packed GQA group for decode, otherwise the
@@ -351,21 +334,20 @@ class XeFMHAFwdKernel {
       int append_store_len = -1;
       int append_store_begin = 0;
       if constexpr (CollectiveMainloop::AppendKV) {
-        int const seq_k_new = get_k_new_len(params.mainloop, idx_b);
-        if (seq_k_new > 0) {
-          append_store_len = seq_k_new;
+        if (seq_len_kv > 0) {
+          append_store_len = seq_len_kv;
           if constexpr (DirectAppendKV) {
-            int const cache_len_old = params.mainloop.append.ptr_cache_seqlens[idx_b];
-            int const new_begin = params.mainloop.append.ptr_cu_seqlens_k_new != nullptr
-                                      ? params.mainloop.append.ptr_cu_seqlens_k_new[idx_b]
-                                      : idx_b * params.mainloop.append.seq_len_kv_new;
+            int const cache_len_old = params.mainloop.kv.ptr_cache_seqlens[idx_b];
+            int const kv_begin = params.mainloop.kv.ptr_cu_seqlens_k != nullptr
+                                     ? params.mainloop.kv.ptr_cu_seqlens_k[idx_b]
+                                     : idx_b * params.mainloop.kv.seq_len_kv;
             constexpr int kTileKV = get<1>(TileShapeQK{});
-            bool const direct_batch = (cache_len_old % kTileKV) == 0 && (new_begin % kTileKV) == 0;
+            bool const direct_batch = (cache_len_old % kTileKV) == 0 && (kv_begin % kTileKV) == 0;
             if (direct_batch) {
               if (get<0>(blk_qv) == 0 && get<1>(blk_qv) == 0) {
                 int const writer = head_q % head_group_q;
-                append_store_begin = seq_k_new * writer / head_group_q;
-                int const append_store_end = seq_k_new * (writer + 1) / head_group_q;
+                append_store_begin = seq_len_kv * writer / head_group_q;
+                int const append_store_end = seq_len_kv * (writer + 1) / head_group_q;
                 append_store_len = append_store_end - append_store_begin;
               } else {
                 append_store_len = 0;
@@ -376,12 +358,12 @@ class XeFMHAFwdKernel {
             if (!packed_gqa) {
               // Without a grid-wide barrier, each WG must write every appended
               // token it may read; causal tiles only need the visible prefix.
-              int const cache_len_old = params.mainloop.append.ptr_cache_seqlens[idx_b];
+              int const cache_len_old = params.mainloop.kv.ptr_cache_seqlens[idx_b];
               int const tile_q = get<0>(TileShapeQK{});
               int const q_tile_end = cute::min(seq_len_qo, (blk_q + 1) * tile_q);
               int const visible_k_end = cute::min(seq_k_eff, full_tile_offset + q_tile_end);
               append_store_len = cute::max(0, visible_k_end - cache_len_old);
-              append_store_len = cute::min(append_store_len, seq_k_new);
+              append_store_len = cute::min(append_store_len, seq_len_kv);
             }
           }
         }
@@ -505,6 +487,7 @@ class XeFMHAFwdKernel {
             full_tile_offset,
             discard_seq_coord,
             std::bool_constant<kPackedGQA>{},
+            seq_len_kv,
             append_store_len,
             append_store_begin,
             K_cache(_, _, head, l_coord),

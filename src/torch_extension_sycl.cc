@@ -181,9 +181,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fwd_appendkv(Tensor q,"
       "    Tensor   k,"
       "    Tensor   v,"
+      "    Tensor   k_new,"
+      "    Tensor   v_new,"
       "    Tensor?  q_v,"
       "    Tensor   cu_seqlens_q,"
       "    Tensor   cu_seqlens_k,"
+      "    Tensor   cu_seqlens_k_new,"
       "    int      max_seqlen_q,"
       "    int      max_seqlen_k,"
       "    Tensor?  page_table,"
@@ -206,10 +209,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    int      num_kv_splits,"
       "    bool?    pack_gqa,"
       "    int      sm_margin,"
-      "    Tensor(a!)?  out=None,"
-      "    Tensor?  k_new=None,"
-      "    Tensor?  v_new=None,"
-      "    Tensor?  cu_seqlens_k_new=None) -> (Tensor(a!), Tensor, Tensor, Tensor)");
+      "    Tensor(a!)?  out=None) -> (Tensor(a!), Tensor, Tensor, Tensor)");
   m.impl("fwd_appendkv", torch::kXPU, make_pytorch_shim(&mha_fwd_appendkv));
 #endif  // USE_FMHA
 

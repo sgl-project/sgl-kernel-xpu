@@ -80,9 +80,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd_appendkv(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
+    const at::Tensor& k_new,
+    const at::Tensor& v_new,
     std::optional<const at::Tensor>& q_v_,
     const at::Tensor& cu_seqlens_q,
     const at::Tensor& cu_seqlens_k,
+    const at::Tensor& cu_seqlens_k_new,
     int max_seqlen_q,
     int max_seqlen_k,
     std::optional<const at::Tensor>& page_table,
@@ -105,10 +108,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd_appendkv(
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin,
-    std::optional<at::Tensor>& out_,
-    std::optional<const at::Tensor>& k_new_,
-    std::optional<const at::Tensor>& v_new_,
-    std::optional<const at::Tensor>& cu_seqlens_k_new_);
+    std::optional<at::Tensor>& out_);
 
 void flash_mla_decode(
     torch::Tensor& out,

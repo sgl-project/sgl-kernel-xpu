@@ -49,10 +49,10 @@
 using namespace cute;
 namespace decode {
 struct Arguments {
-  // The QKV matrices.
+  // The query and KV cache matrices.
   void* __restrict__ q_ptr;
-  void* __restrict__ k_ptr;
-  void* __restrict__ v_ptr;
+  void* __restrict__ k_cache_ptr;
+  void* __restrict__ v_cache_ptr;
 
   // FP8 KV cache per-tensor descale. The single scalar lives on-device; the
   // kernel dereferences these pointers so no host-side D2H sync (.item()) is
@@ -63,16 +63,16 @@ struct Arguments {
   void* __restrict__ temp_out_ptr = nullptr;
   void* __restrict__ exp_sums_ptr = nullptr;
   void* __restrict__ max_logits_ptr = nullptr;
-  // The stride between rows of the Q, K and V matrices.
+  // The stride between rows of the query and KV cache matrices.
   int64_t q_batch_stride;
-  int64_t k_batch_stride;
-  int64_t v_batch_stride;
+  int64_t k_cache_batch_stride;
+  int64_t v_cache_batch_stride;
   int64_t q_row_stride;
-  int64_t k_row_stride;
-  int64_t v_row_stride;
+  int64_t k_cache_row_stride;
+  int64_t v_cache_row_stride;
   int64_t q_head_stride;
-  int64_t k_head_stride;
-  int64_t v_head_stride;
+  int64_t k_cache_head_stride;
+  int64_t v_cache_head_stride;
   int64_t v_dim_stride;
 
   int64_t k_stride_page = 0;
@@ -105,9 +105,9 @@ struct Arguments {
   void* __restrict__ softmax_lseaccum_ptr;
 
   // The dimensions.
-  int b, seqlen_q, seqlen_k, seqlen_knew, d, d_rounded, rotary_dim;
-  int total_q, total_k;
-  int total_knew = 0;
+  int b, seqlen_q, seqlen_k_cache, seqlen_k, d, d_rounded, rotary_dim;
+  int total_q, total_k_cache;
+  int total_k = 0;
   int b_k;             // When having KV cache and with cache_batch_idx, K & V might have larger batch size than Q
   int dv, dv_rounded;  // For the case where V headdim is different from Q/K headdim
 
@@ -118,8 +118,8 @@ struct Arguments {
 
   // array of length b+1 holding starting offset of each sequence.
   int* __restrict__ cu_seqlens_q;
+  int* __restrict__ cu_seqlens_k_cache;
   int* __restrict__ cu_seqlens_k;
-  int* __restrict__ cu_seqlens_knew;
   int* __restrict__ leftpad_k;
 
   // If provided, the actual length of each q/k sequence.
@@ -137,17 +137,17 @@ struct Arguments {
   int64_t lseaccum_batch_stride;
   int64_t lseaccum_head_stride;
 
-  // The K_new and V_new matrices.
-  void* __restrict__ knew_ptr;
-  void* __restrict__ vnew_ptr;
+  // The K and V matrices to append.
+  void* __restrict__ k_ptr;
+  void* __restrict__ v_ptr;
 
   // The stride between rows of the Q, K and V matrices.
-  int64_t knew_batch_stride;
-  int64_t vnew_batch_stride;
-  int64_t knew_row_stride;
-  int64_t vnew_row_stride;
-  int64_t knew_head_stride;
-  int64_t vnew_head_stride;
+  int64_t k_batch_stride;
+  int64_t v_batch_stride;
+  int64_t k_row_stride;
+  int64_t v_row_stride;
+  int64_t k_head_stride;
+  int64_t v_head_stride;
 
   void* __restrict__ qv_ptr;
   int64_t qv_batch_stride;
@@ -245,8 +245,8 @@ struct DecodeRunner {
     get<0>(problem_size_for_init) = 1;  // concentrated batch
     get<1>(problem_size_for_init) = params.h;
     get<3>(problem_size_for_init) = params.total_q;
-    get<4>(problem_size_for_init) = params.total_knew;
-    get<5>(problem_size_for_init) = params.total_k;
+    get<4>(problem_size_for_init) = params.total_k;
+    get<5>(problem_size_for_init) = params.total_k_cache;
 
     ProblemShapeType problem_size_for_launch{
         .batch = get<0>(problem_size),
@@ -254,8 +254,8 @@ struct DecodeRunner {
         .num_heads_kv = get<2>(problem_size),
         .seq_len_qo = {params.seqlen_q, params.total_q, nullptr},
 
-        .seq_len_kv = {params.seqlen_knew, params.total_knew},
-        .seq_len_kv_cache = {params.seqlen_k, params.total_k},
+        .seq_len_kv = {params.seqlen_k, params.total_k},
+        .seq_len_kv_cache = {params.seqlen_k_cache, params.total_k_cache},
         .head_size_qk = get<6>(problem_size),
         .head_size_vo = get<7>(problem_size),
     };
@@ -266,7 +266,7 @@ struct DecodeRunner {
   /// Initialize operands to be used in the GEMM and reference GEMM
   ProblemShapeType initialize(const Arguments& params) {
     auto problem_shape_in = cute::make_tuple(
-        params.b, params.h, params.h_k, params.seqlen_q, params.seqlen_knew, params.seqlen_k, params.d, params.dv);
+        params.b, params.h, params.h_k, params.seqlen_q, params.seqlen_k, params.seqlen_k_cache, params.d, params.dv);
     ProblemShapeType shape;
 
     decltype(problem_shape_in) problem_size;
@@ -298,8 +298,8 @@ struct DecodeRunner {
 
     if constexpr (isVarLen) {
       shape.seq_len_qo.cumulative_length = params.cu_seqlens_q;
-      shape.seq_len_kv.cumulative_length = params.cu_seqlens_knew;
-      shape.seq_len_kv_cache.cumulative_length = params.cu_seqlens_k;
+      shape.seq_len_kv.cumulative_length = params.cu_seqlens_k;
+      shape.seq_len_kv_cache.cumulative_length = params.cu_seqlens_k_cache;
     }
 
     return shape;
@@ -319,9 +319,9 @@ struct DecodeRunner {
             stride_V,
             static_cast<ElementO*>(params.o_ptr),
             stride_O,
-            static_cast<const ElementK*>(params.k_ptr),
+            static_cast<const ElementK*>(params.k_cache_ptr),
             stride_K_cache,
-            static_cast<const ElementV*>(params.v_ptr),
+            static_cast<const ElementV*>(params.v_cache_ptr),
             stride_V_cache,
             static_cast<const typename FMHADecodeKernel::ElementSink*>(params.softmax_sink_ptr),
             static_cast<const bool*>(params.skip_batch_mask_ptr),
@@ -399,15 +399,15 @@ struct SplitDecodeKernelRunner {
     if constexpr (isVarLen) {
       batch = shape_init.batch = 1;
       shape_init.seq_len_qo = params.total_q;
-      shape_init.seq_len_kv = params.total_k;
+      shape_init.seq_len_kv = params.total_k_cache;
 
       shape.seq_len_qo = cutlass::fmha::collective::VariableLength{params.seqlen_q};
       shape.seq_len_qo.cumulative_length = reinterpret_cast<int*>(params.cu_seqlens_q);
-      shape.seq_len_kv = cutlass::fmha::collective::VariableLength{params.seqlen_k};
-      shape.seq_len_kv.cumulative_length = reinterpret_cast<int*>(params.cu_seqlens_k);
+      shape.seq_len_kv = cutlass::fmha::collective::VariableLength{params.seqlen_k_cache};
+      shape.seq_len_kv.cumulative_length = reinterpret_cast<int*>(params.cu_seqlens_k_cache);
     } else {
       shape.seq_len_qo = shape_init.seq_len_qo = params.seqlen_q;
-      shape.seq_len_kv = shape_init.seq_len_kv = params.seqlen_k;
+      shape.seq_len_kv = shape_init.seq_len_kv = params.seqlen_k_cache;
     }
 
     auto seq_len_qo = shape_init.seq_len_qo;
@@ -476,9 +476,9 @@ struct SplitDecodeKernelRunner {
             shape,
             reinterpret_cast<ElementQ*>(params.q_ptr),
             stride_Q,
-            reinterpret_cast<ElementK*>(params.k_ptr),
+            reinterpret_cast<ElementK*>(params.k_cache_ptr),
             stride_K,
-            reinterpret_cast<ElementV*>(params.v_ptr),
+            reinterpret_cast<ElementV*>(params.v_cache_ptr),
             stride_V,
             reinterpret_cast<ElementO*>(params.temp_out_ptr),
             stride_Oaccum,
@@ -495,7 +495,7 @@ struct SplitDecodeKernelRunner {
          static_cast<int*>(params.page_table),
          params.page_size,
          params.max_num_pages_per_seq,
-         params.total_k,
+         params.total_k_cache,
          params.window_size_left,
          params.window_size_right},
         {},
@@ -694,7 +694,7 @@ struct DecodeConfig {
     return run<true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
   }
 
-  // Non-paged (contiguous ragged) KV cache: addressed via cu_seqlens_k offsets.
+  // Non-paged (contiguous ragged) KV cache: addressed via cu_seqlens_k_cache offsets.
   static int run_nopaged(const Arguments& params) {
     // template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
     return run<true, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);

@@ -305,8 +305,8 @@ std::vector<at::Tensor> mha_fwd_nopage(
   // Q / O are in ragged (total, h, d) format; KV is a contiguous ragged
   // (total_k, h_k, d) cache addressed via cu_seqlens_k offsets.
   params.q_ptr = q.data_ptr();
-  params.k_ptr = k.data_ptr();
-  params.v_ptr = v.data_ptr();
+  params.k_cache_ptr = k.data_ptr();
+  params.v_cache_ptr = v.data_ptr();
   params.q_row_stride = q.stride(-3);
   params.k_row_stride = k.stride(-3);
   params.v_row_stride = v.stride(-3);
@@ -322,14 +322,14 @@ std::vector<at::Tensor> mha_fwd_nopage(
   params.skip_batch_mask_ptr = skip_batch_mask_opt.has_value() ? skip_batch_mask_opt->data_ptr() : nullptr;
 
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
-  params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
+  params.cu_seqlens_k_cache = cu_seqlens_k.data_ptr<int>();
   // No "new" KV: the whole sequence lives in the contiguous cache buffer, so the
   // decode kernel reads everything from the K/V cache pointers (knew = 0).
-  params.knew_ptr = nullptr;
-  params.vnew_ptr = nullptr;
-  params.cu_seqlens_knew = nullptr;
-  params.seqlen_knew = 0;
-  params.total_knew = 0;
+  params.k_ptr = nullptr;
+  params.v_ptr = nullptr;
+  params.cu_seqlens_k = nullptr;
+  params.seqlen_k = 0;
+  params.total_k = 0;
 
   params.softmax_lse_ptr = softmax_lse.data_ptr();
 
@@ -340,7 +340,7 @@ std::vector<at::Tensor> mha_fwd_nopage(
   // tile, matching the paged decode path.
   params.q_group_size = num_heads / num_heads_k;
   params.seqlen_q = seqlen_q;
-  params.seqlen_k = seqlen_k;
+  params.seqlen_k_cache = seqlen_k;
   params.d = head_size;
   params.d_rounded = head_size_rounded;
 
@@ -372,7 +372,7 @@ std::vector<at::Tensor> mha_fwd_nopage(
   params.window_size_left = window_size_left;
   params.window_size_right = window_size_right;
   params.total_q = total_q;
-  params.total_k = total_k;
+  params.total_k_cache = total_k;
   params.b_k = batch_size;
   params.dv = head_size_v;
 
@@ -633,8 +633,8 @@ std::vector<at::Tensor> mha_fwd(
 
   // Set the pointers and strides.
   params.q_ptr = q.data_ptr();
-  params.k_ptr = k.data_ptr();
-  params.v_ptr = v.data_ptr();
+  params.k_cache_ptr = k.data_ptr();
+  params.v_cache_ptr = v.data_ptr();
   // All stride are in elements, not bytes.
   params.q_row_stride = q.stride(-3);
   params.k_row_stride = k.stride(-3);
@@ -662,18 +662,18 @@ std::vector<at::Tensor> mha_fwd(
   params.skip_batch_mask_ptr = skip_batch_mask_opt.has_value() ? skip_batch_mask_opt->data_ptr() : nullptr;
 
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
-  params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
-  params.knew_ptr = nullptr;
-  params.vnew_ptr = nullptr;
-  params.cu_seqlens_knew = nullptr;
-  params.seqlen_knew = 0;
-  params.total_knew = 0;
+  params.cu_seqlens_k_cache = cu_seqlens_k.data_ptr<int>();
+  params.k_ptr = nullptr;
+  params.v_ptr = nullptr;
+  params.cu_seqlens_k = nullptr;
+  params.seqlen_k = 0;
+  params.total_k = 0;
   if (cache_seqlens_delta_opt.has_value()) {
     auto const& cache_seqlens_delta = *cache_seqlens_delta_opt;
     CHECK_INPUT(cache_seqlens_delta);
     TORCH_CHECK(cache_seqlens_delta.dtype() == torch::kInt32, "cache_seqlens_delta must have dtype torch.int32");
     CHECK_SHAPE(cache_seqlens_delta, batch_size + 1);
-    params.cu_seqlens_knew = cache_seqlens_delta.data_ptr<int>();
+    params.cu_seqlens_k = cache_seqlens_delta.data_ptr<int>();
   }
   params.num_kv_splits = num_kv_splits;
 
@@ -686,7 +686,7 @@ std::vector<at::Tensor> mha_fwd(
   params.h_k = num_heads_k;
   params.q_group_size = num_heads / num_heads_k;
   params.seqlen_q = seqlen_q;
-  params.seqlen_k = seqlen_k;
+  params.seqlen_k_cache = seqlen_k;
   params.d = head_size;
   params.d_rounded = head_size_rounded;
 
@@ -736,7 +736,7 @@ std::vector<at::Tensor> mha_fwd(
   params.window_size_left = window_size_left;
   params.window_size_right = window_size_right;
   params.total_q = total_q;
-  params.total_k = total_k;
+  params.total_k_cache = total_k;
   params.b_k = batch_size_k;
   params.dv = head_size_v;
   params.page_table = page_table.value().data_ptr<int>();
@@ -912,8 +912,8 @@ std::vector<at::Tensor> mha_fwd_nopage(
   params.is_bf16 = q.dtype() == torch::kBFloat16;
 
   params.q_ptr = q.data_ptr();
-  params.k_ptr = k.data_ptr();
-  params.v_ptr = v.data_ptr();
+  params.k_cache_ptr = k.data_ptr();
+  params.v_cache_ptr = v.data_ptr();
   params.q_row_stride = q.stride(-3);
   params.k_row_stride = k.stride(-3);
   params.v_row_stride = v.stride(-3);
@@ -929,13 +929,13 @@ std::vector<at::Tensor> mha_fwd_nopage(
   params.skip_batch_mask_ptr = skip_batch_mask_opt.has_value() ? skip_batch_mask_opt->data_ptr() : nullptr;
 
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
-  params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
-  params.knew_ptr = nullptr;
-  params.vnew_ptr = nullptr;
-  params.cu_seqlens_knew = nullptr;
+  params.cu_seqlens_k_cache = cu_seqlens_k.data_ptr<int>();
+  params.k_ptr = nullptr;
+  params.v_ptr = nullptr;
+  params.cu_seqlens_k = nullptr;
   params.cache_seqlens_old = nullptr;
-  params.seqlen_knew = 0;
-  params.total_knew = 0;
+  params.seqlen_k = 0;
+  params.total_k = 0;
 
   params.softmax_lse_ptr = softmax_lse.data_ptr();
 
@@ -944,7 +944,7 @@ std::vector<at::Tensor> mha_fwd_nopage(
   params.h_k = num_heads_k;
   params.q_group_size = 1;
   params.seqlen_q = seqlen_q;
-  params.seqlen_k = seqlen_k;
+  params.seqlen_k_cache = seqlen_k;
   params.d = head_size;
   params.d_rounded = head_size_rounded;
 
@@ -969,7 +969,7 @@ std::vector<at::Tensor> mha_fwd_nopage(
   params.window_size_left = window_size_left;
   params.window_size_right = window_size_right;
   params.total_q = total_q;
-  params.total_k = total_k;
+  params.total_k_cache = total_k;
   params.b_k = batch_size;
   params.dv = head_size_v;
 
@@ -1190,8 +1190,8 @@ std::vector<at::Tensor> mha_fwd_appendkv(
 
   // Set the pointers and strides.
   params.q_ptr = q.data_ptr();
-  params.k_ptr = k.data_ptr();
-  params.v_ptr = v.data_ptr();
+  params.k_cache_ptr = k.data_ptr();
+  params.v_cache_ptr = v.data_ptr();
   // All stride are in elements, not bytes.
   params.q_row_stride = q.stride(-3);
   params.k_row_stride = k.stride(-3);
@@ -1208,7 +1208,7 @@ std::vector<at::Tensor> mha_fwd_appendkv(
   params.skip_batch_mask_ptr = skip_batch_mask_opt.has_value() ? skip_batch_mask_opt->data_ptr() : nullptr;
 
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
-  params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
+  params.cu_seqlens_k_cache = cu_seqlens_k.data_ptr<int>();
 
   // Softmax sum
   params.softmax_lse_ptr = softmax_lse.data_ptr();
@@ -1219,7 +1219,7 @@ std::vector<at::Tensor> mha_fwd_appendkv(
   params.h_k = num_heads_k;
   params.q_group_size = 1;
   params.seqlen_q = seqlen_q;
-  params.seqlen_k = seqlen_k;
+  params.seqlen_k_cache = seqlen_k;
   params.d = head_size;
   params.d_rounded = head_size_rounded;
 
@@ -1264,7 +1264,7 @@ std::vector<at::Tensor> mha_fwd_appendkv(
   params.window_size_left = window_size_left;
   params.window_size_right = window_size_right;
   params.total_q = total_q;
-  params.total_k = total_k;
+  params.total_k_cache = total_k;
   params.b_k = batch_size_k;
   params.dv = head_size_v;
   params.page_table = page_table.value().data_ptr<int>();
@@ -1273,12 +1273,12 @@ std::vector<at::Tensor> mha_fwd_appendkv(
   params.page_size = page_size;
   params.num_pages = num_pages;
 
-  params.knew_ptr = nullptr;
-  params.vnew_ptr = nullptr;
-  params.cu_seqlens_knew = nullptr;
+  params.k_ptr = nullptr;
+  params.v_ptr = nullptr;
+  params.cu_seqlens_k = nullptr;
   params.cache_seqlens_old = nullptr;
-  params.seqlen_knew = 0;
-  params.total_knew = 0;
+  params.seqlen_k = 0;
+  params.total_k = 0;
   if (has_new_kv) {
     TORCH_CHECK(k_new_.has_value() && v_new_.has_value(), "AppendKV requires both k_new and v_new");
     auto const& k_new = k_new_.value();
@@ -1311,13 +1311,13 @@ std::vector<at::Tensor> mha_fwd_appendkv(
       CHECK_INPUT(cu_seqlens_k_new);
       TORCH_CHECK(cu_seqlens_k_new.dtype() == torch::kInt32, "cu_seqlens_k_new must have dtype torch.int32");
       CHECK_SHAPE(cu_seqlens_k_new, batch_size + 1);
-      params.cu_seqlens_knew = cu_seqlens_k_new.data_ptr<int>();
+      params.cu_seqlens_k = cu_seqlens_k_new.data_ptr<int>();
     }
-    params.knew_ptr = k_new.data_ptr();
-    params.vnew_ptr = v_new.data_ptr();
+    params.k_ptr = k_new.data_ptr();
+    params.v_ptr = v_new.data_ptr();
     params.cache_seqlens_old = cu_seqlens_k.data_ptr<int>();
-    params.seqlen_knew = seqlen_knew;
-    params.total_knew = total_knew;
+    params.seqlen_k = seqlen_knew;
+    params.total_k = total_knew;
   }
   if (cache_seqlens_delta_opt.has_value()) {
     TORCH_CHECK(!has_new_kv, "cache_seqlens_delta cannot be combined with fused AppendKV");
@@ -1325,7 +1325,7 @@ std::vector<at::Tensor> mha_fwd_appendkv(
     CHECK_INPUT(cache_seqlens_delta);
     TORCH_CHECK(cache_seqlens_delta.dtype() == torch::kInt32, "cache_seqlens_delta must have dtype torch.int32");
     CHECK_SHAPE(cache_seqlens_delta, batch_size + 1);
-    params.cu_seqlens_knew = cache_seqlens_delta.data_ptr<int>();
+    params.cu_seqlens_k = cache_seqlens_delta.data_ptr<int>();
   }
 
   if (q_v_.has_value()) {
@@ -1718,9 +1718,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd_appendkv(
     const at::Tensor& q,  // (total_q, h, d) — ragged 3D
     const at::Tensor& k,  // (total_k, h_k, d) if non-paged, or (num_pages, page_size, h_k, d) if paged
     const at::Tensor& v,  // (total_k, h_k, dv) if non-paged, or (num_pages, page_size, h_k, dv) if paged
+    const at::Tensor& k_new,
+    const at::Tensor& v_new,
     std::optional<const at::Tensor>& q_v_,  // (total_q, h, dv) — not yet supported
     const at::Tensor& cu_seqlens_q,         // b+1
     const at::Tensor& cu_seqlens_k,         // b+1
+    const at::Tensor& cu_seqlens_k_new,
     int max_seqlen_q,
     int max_seqlen_k,
     std::optional<const at::Tensor>& page_table,       // (b_k, max_num_pages_per_seq)
@@ -1743,10 +1746,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd_appendkv(
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin,
-    std::optional<at::Tensor>& out_,
-    std::optional<const at::Tensor>& k_new_,
-    std::optional<const at::Tensor>& v_new_,
-    std::optional<const at::Tensor>& cu_seqlens_k_new_) {
+    std::optional<at::Tensor>& out_) {
+  std::optional<const at::Tensor> k_new_ = k_new;
+  std::optional<const at::Tensor> v_new_ = v_new;
+  std::optional<const at::Tensor> cu_seqlens_k_new_ = cu_seqlens_k_new;
   TORCH_CHECK(q.dim() == 3, "query must be in ragged format (total_q, h, d)");
   if (out_.has_value()) {
     const at::Tensor& out_val = out_.value();

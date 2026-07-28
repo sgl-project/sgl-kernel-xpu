@@ -266,6 +266,13 @@ def flash_attn_with_kvcache(
         cu_seqlens_k = cache_seqlens
     has_new_kv = k is not None or v is not None or cu_seqlens_k_new is not None
     if has_new_kv:
+        assert k is not None and v is not None
+        if cu_seqlens_k_new is None:
+            assert k.dim() == 4
+            cu_seqlens_k_new = (
+                torch.arange(k.size(0) + 1, dtype=torch.int32, device=k.device)
+                * k.size(1)
+            )
         native_max_seqlen_k = max_seqlen_k
         if native_max_seqlen_k is None or native_max_seqlen_k == 0:
             native_max_seqlen_k = (
@@ -275,9 +282,12 @@ def flash_attn_with_kvcache(
             q,
             k_cache,
             v_cache,
+            k,
+            v,
             qv,
             cu_seqlens_q,
             cu_seqlens_k,
+            cu_seqlens_k_new,
             max_seqlen_q,
             native_max_seqlen_k,
             page_table,
@@ -301,9 +311,6 @@ def flash_attn_with_kvcache(
             pack_gqa,
             sm_margin,
             out,
-            k,
-            v,
-            cu_seqlens_k_new,
         )
     else:
         out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(

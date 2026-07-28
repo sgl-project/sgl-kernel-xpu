@@ -812,7 +812,7 @@ def make_q_norm_rope_inputs(
     rope_dim: int,
     max_pos: int = DSV4_MAX_POSITION_EMBEDDINGS,
 ):
-    dtype = DTYPE_MAP.get(dtype_name, torch.bfloat16)
+    dtype = DTYPE_MAP[dtype_name]
     device = torch.device("xpu")
 
     q_input = torch.randn(
@@ -837,7 +837,7 @@ def benchmark_q_norm_rope_shape(
     rope_dim: int,
     label: str,
 ):
-    dtype = DTYPE_MAP.get(dtype_name, torch.bfloat16)
+    dtype = DTYPE_MAP[dtype_name]
     itemsize = torch.tensor([], dtype=dtype).element_size()
     rows = []
 
@@ -1032,7 +1032,7 @@ def make_flashmla_k_inputs(
     page_size: int = 256,
     max_pos: int = DSV4_MAX_POSITION_EMBEDDINGS,
 ):
-    dtype = DTYPE_MAP.get(dtype_name, torch.bfloat16)
+    dtype = DTYPE_MAP[dtype_name]
     device = torch.device("xpu")
 
     kv = torch.randn(num_tokens, head_dim, device=device, dtype=dtype).contiguous()
@@ -1059,7 +1059,7 @@ def benchmark_flashmla_k_shape(
     label: str,
     page_size: int = 256,
 ):
-    dtype = DTYPE_MAP.get(dtype_name, torch.bfloat16)
+    dtype = DTYPE_MAP[dtype_name]
     itemsize = torch.tensor([], dtype=dtype).element_size()
     head_dim, rope_dim = DSV4_HEAD_ROPE_DIM[-1]  # K-path (FlashMLA) is always 512/64
     rows = []

@@ -9,6 +9,7 @@
 #include "MemoryAccess.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "comm/Sampling.h"
 
 namespace {
 
@@ -145,23 +146,7 @@ struct TopPRenormProbsSingleCTA : public TopPRenormProbsParams<DType> {
     }
 
     // Compute the maximum probability in the row.
-    float thread_max = 0.0f;
-    for (uint32_t i = tid; i < num_vec_elems; i += kWgSize) {
-      vec_io v;
-      v.load(
-          0,
-          sycl::multi_ptr<const DType, sycl::access::address_space::global_space>(probs + row_offset + i * kVecSize));
-#pragma unroll
-      for (uint32_t j = 0; j < kVecSize; ++j) {
-        const float val = static_cast<float>(v[j]);
-        thread_max = (val > thread_max) ? val : thread_max;
-      }
-    }
-    for (uint32_t col = vec_tail_start + tid; col < vocab_u32; col += kWgSize) {
-      const float val = static_cast<float>(probs[row_offset + col]);
-      thread_max = (val > thread_max) ? val : thread_max;
-    }
-    const float max_val = sycl::reduce_over_group(grp, thread_max, sycl::maximum<float>());
+    const float max_val = sgl::sampling::get_max_value<DType, kVecSize, kWgSize>(grp, probs, row_idx, tid, vocab_u32);
 
     // TERNARY SEARCH:  for the pivot threshold `low` such that keeping probs > low
     // yields cumulative mass >= p while being the minimal such nucleus.

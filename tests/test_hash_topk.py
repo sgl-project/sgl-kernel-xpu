@@ -52,7 +52,7 @@ def hash_topk_torch_native(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("num_tokens", [1, 64, 1024, 4096])
 @pytest.mark.parametrize("topk_routed", [6, 8])
 @pytest.mark.parametrize("num_fused_shared_experts", [0, 1])

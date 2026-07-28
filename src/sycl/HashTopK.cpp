@@ -25,7 +25,7 @@ template <typename T>
 struct HashTopKKernel {
   HashTopKKernel(
       const T* router_logits,
-      const int64_t* input_id,
+      const int64_t* input_ids,
       const int32_t* tid2eid,
       int32_t* topk_ids,
       float* topk_weights,
@@ -36,7 +36,7 @@ struct HashTopKKernel {
       uint32_t topk_fused,
       float routed_scaling_factor)
       : router_logits(router_logits),
-        input_id(input_id),
+        input_ids(input_ids),
         tid2eid(tid2eid),
         topk_ids(topk_ids),
         topk_weights(topk_weights),
@@ -60,7 +60,7 @@ struct HashTopKKernel {
     int32_t expert_id = 0;
     float routed_weight = 0.0f;
     if (lane_id < topk_routed) {
-      const int64_t token_id = input_id[warp_id];
+      const int64_t token_id = input_ids[warp_id];
       if (token_id >= 0) {
         const uint32_t token_id_u32 = static_cast<uint32_t>(token_id);
         if (token_id_u32 < tid2eid_rows) {
@@ -92,7 +92,7 @@ struct HashTopKKernel {
   }
 
   const T* router_logits;
-  const int64_t* input_id;
+  const int64_t* input_ids;
   const int32_t* tid2eid;
   int32_t* topk_ids;
   float* topk_weights;
@@ -108,7 +108,7 @@ template <typename T>
 void launch_hash_topk(
     sycl::queue& queue,
     const T* router_logits,
-    const int64_t* input_id,
+    const int64_t* input_ids,
     const int32_t* tid2eid,
     int32_t* topk_ids,
     float* topk_weights,
@@ -124,7 +124,7 @@ void launch_hash_topk(
 
   HashTopKKernel<T> task(
       router_logits,
-      input_id,
+      input_ids,
       tid2eid,
       topk_ids,
       topk_weights,
@@ -141,13 +141,13 @@ void launch_hash_topk(
 
 void hash_topk(
     const at::Tensor& router_logits,
-    const at::Tensor& input_id,
+    const at::Tensor& input_ids,
     const at::Tensor& tid2eid,
     at::Tensor& topk_weights,
     at::Tensor& topk_ids,
     double routed_scaling_factor) {
   TORCH_CHECK(router_logits.dim() == 2, "router_logits must be 2D [num_tokens, num_routed_experts]");
-  TORCH_CHECK(input_id.dim() == 1, "input_id must be 1D [num_tokens]");
+  TORCH_CHECK(input_ids.dim() == 1, "input_ids must be 1D [num_tokens]");
   TORCH_CHECK(tid2eid.dim() == 2, "tid2eid must be 2D [vocab_size, topk_routed]");
   TORCH_CHECK(topk_weights.dim() == 2, "topk_weights must be 2D [num_tokens, topk_fused]");
   TORCH_CHECK(topk_ids.dim() == 2, "topk_ids must be 2D [num_tokens, topk_fused]");
@@ -156,7 +156,7 @@ void hash_topk(
       router_logits.scalar_type() == at::kFloat || router_logits.scalar_type() == at::kHalf ||
           router_logits.scalar_type() == at::kBFloat16,
       "router_logits must be float32/float16/bfloat16");
-  TORCH_CHECK(input_id.scalar_type() == at::kLong, "input_id must be int64");
+  TORCH_CHECK(input_ids.scalar_type() == at::kLong, "input_ids must be int64");
   TORCH_CHECK(tid2eid.scalar_type() == at::kInt, "tid2eid must be int32");
   TORCH_CHECK(topk_weights.scalar_type() == at::kFloat, "topk_weights must be float32");
   TORCH_CHECK(topk_ids.scalar_type() == at::kInt, "topk_ids must be int32");
@@ -175,7 +175,7 @@ void hash_topk(
     launch_hash_topk<scalar_t>(
         queue,
         router_logits.data_ptr<scalar_t>(),
-        input_id.data_ptr<int64_t>(),
+        input_ids.data_ptr<int64_t>(),
         tid2eid.data_ptr<int32_t>(),
         topk_ids.data_ptr<int32_t>(),
         topk_weights.data_ptr<float>(),

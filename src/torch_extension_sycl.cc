@@ -59,7 +59,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("topk_sigmoid", torch::kXPU, &at::native::xpu::topk_sigmoid);
 
   m.def(
-      "hash_topk(Tensor router_logits, Tensor input_id, Tensor tid2eid, Tensor! topk_weights, Tensor! topk_ids, "
+      "hash_topk(Tensor router_logits, Tensor input_ids, Tensor tid2eid, Tensor! topk_weights, Tensor! topk_ids, "
       "float routed_scaling_factor=1.0) -> ()");
   m.impl("hash_topk", torch::kXPU, &at::native::xpu::hash_topk);
 

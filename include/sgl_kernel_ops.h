@@ -137,7 +137,7 @@ void topk_sigmoid(
     int64_t num_fused_shared_experts = 0);
 void hash_topk(
     const at::Tensor& router_logits,
-    const at::Tensor& input_id,
+    const at::Tensor& input_ids,
     const at::Tensor& tid2eid,
     at::Tensor& topk_weights,
     at::Tensor& topk_ids,

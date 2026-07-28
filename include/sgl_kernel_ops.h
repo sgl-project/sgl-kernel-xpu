@@ -639,6 +639,9 @@ torch::Tensor plan_compress_decode(
     int64_t swa_page_size,
     int64_t ring_size);
 
+void flash_compress128_decode(
+    torch::Tensor kv_buffer, torch::Tensor kv_input, torch::Tensor kv_output, torch::Tensor ape, torch::Tensor plan_d);
+
 }  // namespace at::native::xpu
 
 namespace flash {

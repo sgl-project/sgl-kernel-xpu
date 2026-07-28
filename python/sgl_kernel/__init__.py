@@ -50,7 +50,7 @@ from sgl_kernel.flash_compress_4_torch import (
     flash_compress4_decode,
     flash_compress4_prefill,
 )
-from sgl_kernel.flash_compress_128_torch import (
+from sgl_kernel.flash_compress_128 import (
     flash_compress128_decode,
     flash_compress128_prefill,
 )

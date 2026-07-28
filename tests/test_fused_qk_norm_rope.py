@@ -784,11 +784,13 @@ def fused_q_norm_rope_reference(
 @pytest.mark.parametrize(
     "head_dim,rope_dim",
     [
-        (64, 64),  # warp path, exact fit
+        (64, 64),  # warp path, exact fit (nope_dim=0)
         (128, 64),  # warp path
         (192, 84),  # warp path, different rope_dim to meet warp
+        (192, 12),  # warp path, rotary_lanes=1 (minimal rope, corner case)
         (256, 64),  # warp path
         (320, 64),  # head_dim not in {64,128,192,256} -> CTA path
+        (320, 320),  # CTA path, nope_dim=0 (full rope, corner case)
         (512, 64),  # DeepSeek-V4 production shape -> CTA path
     ],
 )
@@ -854,6 +856,50 @@ def test_fused_q_norm_rope_zero_batch():
         positions = torch.empty(0, dtype=torch.int32, device=device)
         sgl_kernel.fused_q_norm_rope(q_input, q_output, freqs_real, positions, 1e-6)
         assert q_output.shape == q_input.shape
+
+
+@pytest.mark.parametrize(
+    "head_dim,rope_dim,last_dim_padding",
+    [
+        (128, 64, 32),  # warp path
+        (512, 64, 64),  # CTA path
+    ],
+)
+def test_fused_q_norm_rope_last_dim_strided(head_dim, rope_dim, last_dim_padding):
+    """Test fused Q norm + RoPE with non-contiguous input/output views (e.g.
+    sliced out of a larger padded buffer, matching production usage where
+    q_out is a slice of a TP-padded tensor)."""
+    torch.random.manual_seed(42)
+    batch_size, num_heads, max_pos, eps = 4, 8, 512, 1e-6
+    dtype = torch.bfloat16
+
+    q_storage = torch.randn(
+        batch_size, num_heads, head_dim + last_dim_padding, dtype=dtype, device=device
+    )
+    out_storage = torch.randn(
+        batch_size, num_heads, head_dim + last_dim_padding, dtype=dtype, device=device
+    )
+    q_input = q_storage[..., :head_dim]
+    q_output = out_storage[..., :head_dim]
+    assert q_input.stride(-1) == 1
+    assert q_output.stride(-1) == 1
+    assert not q_input.is_contiguous()
+    assert not q_output.is_contiguous()
+
+    freqs_cis = torch.randn(
+        max_pos, rope_dim // 2, dtype=torch.complex64, device=device
+    )
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    positions = torch.randint(
+        0, max_pos, (batch_size,), dtype=torch.int32, device=device
+    )
+
+    sgl_kernel.fused_q_norm_rope(q_input, q_output, freqs_real, positions, eps)
+    expected = fused_q_norm_rope_reference(q_input, freqs_real, positions, eps)
+
+    torch.testing.assert_close(
+        q_output.float(), expected.float(), rtol=precision[dtype], atol=precision[dtype]
+    )
 
 
 def fused_k_norm_rope_flashmla_reference(

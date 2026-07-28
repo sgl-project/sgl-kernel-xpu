@@ -154,6 +154,28 @@ SUITES = {
 }
 
 
+def auto_partition(files, rank, size):
+    """Balance ``files`` into ``size`` partitions by ``estimated_time`` and
+    return the ``rank``-th partition. Mirrors tests/run_suite.py.
+    """
+    weights = [f.estimated_time for f in files]
+    if not weights or size <= 0 or size > len(weights):
+        return []
+
+    indexed_weights = [(w, -i) for i, w in enumerate(weights)]
+    indexed_weights = sorted(indexed_weights, reverse=True)
+    indexed_weights = [(w, -i) for w, i in indexed_weights]
+
+    partitions = [[] for _ in range(size)]
+    sums = [0.0] * size
+    for weight, idx in indexed_weights:
+        min_sum_idx = sums.index(min(sums))
+        partitions[min_sum_idx].append(idx)
+        sums[min_sum_idx] += weight
+
+    return [files[i] for i in partitions[rank]]
+
+
 def run_tests(files: List[Entry], workdir: str, timeout_per_file: int) -> int:
     # Reuse tests/test_utils.run_unittest_files so nightly test execution matches
     # the harness per-commit CI uses.
@@ -216,10 +238,41 @@ if __name__ == "__main__":
         default=1800,
         help="Time limit per test/benchmark in seconds.",
     )
+    parser.add_argument(
+        "--range-begin",
+        type=int,
+        default=0,
+        help="Begin index (inclusive) of the slice to run.",
+    )
+    parser.add_argument(
+        "--range-end",
+        type=int,
+        default=None,
+        help="End index (exclusive) of the slice to run.",
+    )
+    parser.add_argument(
+        "--auto-partition-id",
+        type=int,
+        help="Auto load-balancing: partition index (0..size-1).",
+    )
+    parser.add_argument(
+        "--auto-partition-size",
+        type=int,
+        help="Auto load-balancing: total number of partitions.",
+    )
     args = parser.parse_args()
 
     kind, workdir, entries = SUITES[args.suite]
+
+    if args.auto_partition_size:
+        entries = auto_partition(
+            entries, args.auto_partition_id, args.auto_partition_size
+        )
+    else:
+        entries = entries[args.range_begin : args.range_end]
+
     print(f"Suite: {args.suite} ({kind}); {len(entries)} entries; workdir: {workdir}")
+    print("Selected entries:", [e.name for e in entries])
 
     if kind == "test":
         rc = run_tests(entries, workdir, args.timeout_per_file)

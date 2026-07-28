@@ -26,13 +26,18 @@
   SharedStorageSize). The config struct MlaSparseDecode2StageXe assembles the
   concrete instantiation (see device/mla_sparse_decode_2stage_types.hpp).
 
-  The kernel's Arguments == Params is the composite per-layer params object
-  (Decode / Prefill child of SparseAttn2StageParamsBase), shared with the Stage-1
-  gather companion so the runner can hand one object to both launches.
-  to_underlying_arguments fans out to each collective's slice (params.mainloop /
-  params.epilogue), and the kernel body forwards params.kernel / params.scheduler /
-  params.mainloop / params.epilogue to the layers that read them. Grid/block,
-  previously computed in the launcher, now live in get_grid_shape / get_block_shape.
+  The kernel's Arguments == Params is SparseAttn2StageParams, its own per-layer params
+  object -- Stage 1 is a separate kernel with separate params, so there is no gather
+  template parameter and no shared/derived params type here. The runner
+  (device::MLASparse) pairs the two, the same way device::MLA pairs the split-KV
+  attention kernel with its reduction companion. The two stages communicate only through
+  the gathered-KV HBM buffers (params.kernel.gathered_k /
+  params.mainloop.gathered_valid_mask), which Stage 1 fills before this kernel is
+  launched. to_underlying_arguments fans out to each collective's slice
+  (params.mainloop / params.epilogue), and the kernel body forwards params.kernel /
+  params.scheduler / params.mainloop / params.epilogue to the layers that read them.
+  Grid/block, previously computed in the launcher, now live in get_grid_shape /
+  get_block_shape.
 
   Shared declarations (the per-layer params blocks, constants, the copy_block_*
   rmem<->smem helpers) come from xe_mla_sparse_decode_2stage_common.hpp.
@@ -45,20 +50,16 @@
 #include "sycl/kernels/mla_sparse/collective/xe_mla_sparse_decode_2stage_epilogue.hpp"
 #include "sycl/kernels/mla_sparse/collective/xe_mla_sparse_decode_2stage_mainloop.hpp"
 #include "sycl/kernels/mla_sparse/device/xe_mla_sparse_decode_2stage_common.hpp"
-#include "sycl/kernels/mla_sparse/kernel/xe_mla_sparse_2stage_gather_kernel.hpp"
 #include "sycl/kernels/mla_sparse/kernel/xe_mla_sparse_decode_2stage_tile_scheduler.hpp"
 
 namespace cutlass::flash_attention::kernel {
 
-// GatherKernelTmpl selects the Stage-1 companion, keyed on D_QK. Defaults to the
-// decode gather (packed fp8 -> bf16 dequant); the prefill config supplies
-// SparsePrefillGatherKernel (dense bf16 copy) instead. Decode instantiations that
-// omit it are unchanged.
-template <
-    class CollectiveMainloop_,
-    class CollectiveEpilogue_,
-    class TileScheduler_,
-    template <int> class GatherKernelTmpl = SparseDecodeGatherDequantKernel>
+// Stage-2 only: this kernel knows nothing about Stage 1. It reads the gathered-KV
+// tile that Stage 1 already materialized in HBM (via its own kernel params), so it is
+// shaped like an ordinary dense MLA kernel -- same collectives + scheduler + Params
+// fan-out, no gather template parameter. The config struct pairs it with a Stage-1
+// kernel inside device::MLASparse, which launches gather-then-dense.
+template <class CollectiveMainloop_, class CollectiveEpilogue_, class TileScheduler_>
 class DenseDecodeFwdKernel {
  public:
   //
@@ -71,14 +72,6 @@ class DenseDecodeFwdKernel {
   using Traits = typename CollectiveMainloop::Traits;
   static constexpr int D_QK = CollectiveMainloop::D_QK;
 
-  // Stage-1 gather companion. Declaring this nested type opts the kernel into the
-  // device::MLASparse runner's two-launch path (gather then dense); the runner
-  // detects it via SFINAE (detail::GatherTraits) and launches it first. Both
-  // launches share ONE composite Params object (see below), so the dense kernel
-  // derives its Params/Arguments from the gather companion to keep the two in lock-
-  // step. Kept here (not in the config struct) so the runner finds it off the Kernel
-  // type alone.
-  using GatherKernel = GatherKernelTmpl<D_QK>;
   static constexpr bool IS_FP8_QUERY = CollectiveMainloop::IS_FP8_QUERY;
   static constexpr bool HAS_ATTN_SINK = CollectiveEpilogue::HAS_ATTN_SINK;
 
@@ -105,15 +98,14 @@ class DenseDecodeFwdKernel {
   static constexpr int SharedStorageSize = is_empty_v<SharedStorage> ? size_t(0) : sizeof(SharedStorage);
 
   //
-  // Arguments / Params: the composite per-layer params object, shared with the
-  // Stage-1 gather companion (the runner hands the same object to both launches).
-  // The concrete composite (Decode / Prefill child) is dictated by the gather
-  // companion, so the two kernels always agree on the type. to_underlying_arguments
-  // fans out per layer, mirroring the fused path (kernel/xe_mla_sparse_kernel.hpp):
-  // each collective / the scheduler builds its own slice; the gather slice passes
-  // through unchanged.
+  // Arguments / Params: this kernel's own per-layer params object, exactly like an
+  // ordinary dense MLA kernel. to_underlying_arguments fans out per layer, mirroring
+  // the fused path (kernel/xe_mla_sparse_kernel.hpp): each collective / the scheduler
+  // builds its own slice. Stage 1 has its own separate Params, so nothing here is
+  // shared with (or derived from) the gather kernel; the two stages meet only at the
+  // gathered-KV HBM buffers named in params.kernel / params.mainloop.
   //
-  using Params = typename GatherKernel::Params;
+  using Params = SparseAttn2StageParams;
   using Arguments = Params;
   using KernelArguments = Params;
 

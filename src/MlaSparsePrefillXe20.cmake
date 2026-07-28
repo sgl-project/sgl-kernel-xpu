@@ -3,8 +3,9 @@
 # Mirrors MlaSparseDecodeXe20.cmake; the prefill 2-stage path reuses the decode
 # 2-stage device stack (only the Stage-1 gather companion differs).
 
-set(MLA_SPARSE_PREFILL_ELEM_TAGS half bf16)
-set(MLA_SPARSE_PREFILL_ELEM_SYCL_TYPES "sycl::half" "sycl::ext::oneapi::bfloat16")
+# Single authoritative dtype list (see MlaSparseDecodeXe20.cmake): the C++ query type
+# is derived from ELEM_TAG in the loop, so there is no second list to keep index-aligned.
+set(MLA_SPARSE_PREFILL_ELEM_TAGS bf16)
 
 set(MLA_SPARSE_PREFILL_2STAGE_TEMPLATE
     "${CMAKE_CURRENT_SOURCE_DIR}/sycl/mla_sparse_prefill_2stage_kernel.cpp.in")
@@ -20,12 +21,15 @@ set(MLA_SPARSE_PREFILL_2STAGE_D_QK 512 576)
 set(MLA_SPARSE_PREFILL_2STAGE_B_H 8 16 32 64)
 set(MLA_SPARSE_PREFILL_2STAGE_HAS_ATTN_SINK 0 1)
 
-list(LENGTH MLA_SPARSE_PREFILL_ELEM_TAGS _num_prefill_elems)
-math(EXPR _num_prefill_elems "${_num_prefill_elems} - 1")
-
-foreach(_idx RANGE ${_num_prefill_elems})
-    list(GET MLA_SPARSE_PREFILL_ELEM_TAGS ${_idx} ELEM_TAG)
-    list(GET MLA_SPARSE_PREFILL_ELEM_SYCL_TYPES ${_idx} ELEM_SYCL_TYPE)
+foreach(ELEM_TAG ${MLA_SPARSE_PREFILL_ELEM_TAGS})
+    # Derive the C++ query type from the tag (no second list to keep in sync).
+    if(ELEM_TAG STREQUAL "half")
+        set(ELEM_SYCL_TYPE "sycl::half")
+    elseif(ELEM_TAG STREQUAL "bf16")
+        set(ELEM_SYCL_TYPE "sycl::ext::oneapi::bfloat16")
+    else()
+        message(FATAL_ERROR "Unknown MLA_SPARSE_PREFILL_ELEM_TAG '${ELEM_TAG}' (expected half or bf16)")
+    endif()
 
     # Two-stage: one TU per (ELEM_TAG, D_QK, B_H, HAS_ATTN_SINK).
     foreach(D_QK ${MLA_SPARSE_PREFILL_2STAGE_D_QK})

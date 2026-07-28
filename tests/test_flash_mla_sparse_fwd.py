@@ -11,16 +11,6 @@ import pytest
 import torch
 from sgl_kernel import flash_mla_sparse_fwd
 
-default_params = {
-    "has_attn_sink": [False, True],
-    "has_topk_length": [False, True],
-    "topk": [6, 512],
-    "h_q": [8, 24, 64, 96],
-    "s_q": [1, 32, 128],
-    # d_qk: 512 (dense latent) or 576 (nope-512 + rope-64). d_v stays 512.
-    "d_qk": [512, 576],
-}
-
 
 # https://github.com/deepseek-ai/FlashMLA/blob/main/tests/ref.py#L7
 def _merge_two_lse(lse0, lse1, s_q, h_q):
@@ -78,12 +68,12 @@ def reference_mla_sparse_prefill(
     return (out.to(kv.dtype), out, max_logits, orig_lse)
 
 
-@pytest.mark.parametrize("has_attn_sink", default_params["has_attn_sink"])
-@pytest.mark.parametrize("has_topk_length", default_params["has_topk_length"])
-@pytest.mark.parametrize("topk", default_params["topk"])
-@pytest.mark.parametrize("h_q", default_params["h_q"])
-@pytest.mark.parametrize("s_q", default_params["s_q"])
-@pytest.mark.parametrize("d_qk", default_params["d_qk"])
+@pytest.mark.parametrize("has_attn_sink", [False, True])
+@pytest.mark.parametrize("has_topk_length", [False, True])
+@pytest.mark.parametrize("topk", [6, 512])
+@pytest.mark.parametrize("h_q", [8, 24, 64, 96])
+@pytest.mark.parametrize("s_q", [1, 32, 128])
+@pytest.mark.parametrize("d_qk", [512, 576])
 def test_flash_mla_sparse_prefill_fwd(
     d_qk, s_q, h_q, topk, has_topk_length, has_attn_sink
 ):

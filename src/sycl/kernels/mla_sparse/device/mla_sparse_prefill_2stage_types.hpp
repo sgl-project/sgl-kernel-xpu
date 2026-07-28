@@ -40,18 +40,20 @@
   (SparsePrefillGatherKernel, a dense bf16 copy) via the decode config's GatherKernel
   template parameter.
 
-    - MlaSparsePrefill2StageXe<D_QK, HAS_ATTN_SINK, B_H>: alias of the decode config
-        MlaSparseDecode2StageXe with IS_FP8_QUERY=false, SparsePrefillGatherKernel as the
-        Stage-1 companion, and a prefill-tuned V-split (sparse_mla_prefill_v_split<B_H>).
-    - args_from_options_prefill_2stage<ElementSycl>: adapts the op's tensor arguments
-        to XPUSparseDecodeAttnFwdParams, applying the query-row -> batch mapping (no
-        allocation, no launch).
-    - runMlaSparsePrefill2StageImpl<ElementSycl, Config>: allocates the dense gathered-KV
-        + valid-mask HBM workspaces (chunked along the mapped batch = query rows to bound
+    - MlaSparsePrefill2StageXe<T, D_QK, HAS_ATTN_SINK, B_H>: alias of the decode config
+        MlaSparseDecode2StageXe with SparsePrefillGatherKernel as the Stage-1 companion
+        (dense bf16 copy) and a prefill-tuned V-split (sparse_mla_prefill_v_split<B_H>).
+        T is the query dtype (ElementQ resolved via SparseMlaToCutlassElementType).
+    - args_from_options_prefill_2stage<Config>: adapts the op's tensor arguments to the
+        runner's two-stage Arguments ({dense, gather}), applying the query-row -> batch
+        mapping (no allocation, no launch).
+    - runMlaSparsePrefill2StageImpl<Element, D_QK, B_H, HAS_ATTN_SINK>: resolves the
+        Stage-2 Config from the template params, allocates the dense gathered-KV +
+        valid-mask HBM workspaces (chunked along the mapped batch = query rows to bound
         peak memory), and runs the launch loop against Config::Fmla.
-    - runMlaSparsePrefill2Stage<ElementSycl, D_QK, B_H, HAS_ATTN_SINK>: op-facing entry.
-        Validates inputs, resolves the Config for the dispatched head dim {512,576} +
-        head-block size + attn_sink flag, and delegates to the Impl. Its signature matches
+    - runMlaSparsePrefill2Stage<Element, D_QK, B_H, HAS_ATTN_SINK>: op-facing entry.
+        Validates inputs and forwards the dispatched head dim {512,576} + head-block size +
+        attn_sink flag to the Impl (which resolves the Config). Its signature matches
         the generated instantiation stub (mla_sparse_prefill_2stage_kernel.cpp.in).
 
   The prefill problem is mapped onto the decode collectives by treating each query
@@ -61,8 +63,9 @@
   epilogue additionally emits max_logits (params.max_logits non-null) alongside lse.
 
   runMlaSparsePrefill2StageImpl / runMlaSparsePrefill2Stage are templated on the
-  resolved Stage-2 Config (head dim D_QK + head-block size B_H + attn_sink), so the
-  heavy Config::Fmla instantiation is keyed by (D_QK, B_H) exactly the way decode is.
+  config-keying params (head dim D_QK + head-block size B_H + attn_sink); the Impl
+  resolves the Stage-2 Config from them, so the heavy Config::Fmla instantiation is
+  keyed by (D_QK, B_H) exactly the way decode is.
   Each generated launcher launch_mla_sparse_prefill_2stage_<ELEM>_<D_QK>_<B_H>_<HAS_ATTN_SINK>
   (from mla_sparse_prefill_2stage_kernel.cpp.in) instantiates a single (D_QK, B_H, sink)
   variant in its own TU, so the CUTLASS codegen for one variant lands in a separate
@@ -102,9 +105,9 @@
 
 namespace cutlass::flash_attention::kernel {
 
-// Prefill Stage-2 config: the decode 2-stage config with IS_FP8_QUERY=false,
-// SparsePrefillGatherKernel as the Stage-1 companion (dense bf16 copy instead of
-// packed-fp8 dequant), and a prefill-tuned V-split. bf16 query only; D_QK is 512
+// Prefill Stage-2 config: the decode 2-stage config with SparsePrefillGatherKernel
+// as the Stage-1 companion (dense bf16 copy instead of packed-fp8 dequant) and a
+// prefill-tuned V-split. bf16 query only; D_QK is 512
 // (dense latent) or 576 (nope-512 + rope-64). The value / output width stays
 // D_V == 512 in both cases (V is the first-512 sub-view of each gathered row); only
 // the QK contraction widens for 576.
@@ -126,10 +129,10 @@ template <int B_H>
 inline constexpr int sparse_mla_prefill_v_split =
     (B_H <= 16) ? FLASH_MLA_PREFILL_V_SPLIT : FLASH_MLA_SPARSE_PREFILL_V_SPLIT;
 
-template <int D_QK, bool HAS_ATTN_SINK, int B_H>
+template <typename T, int D_QK, bool HAS_ATTN_SINK, int B_H>
 using MlaSparsePrefill2StageXe = MlaSparseDecode2StageXe<
+    T,
     D_QK,
-    /* IS_FP8_QUERY */ false,
     HAS_ATTN_SINK,
     B_H,
     SparsePrefillGatherKernel,
@@ -139,10 +142,11 @@ using MlaSparsePrefill2StageXe = MlaSparseDecode2StageXe<
 }  // namespace cutlass::flash_attention::kernel
 
 // ---------------------------------------------------------------------------
-// args_from_options_prefill_2stage: adapts the prefill op's tensor arguments to
-// the composite PrefillSparseAttn2StageParams, fanning each field into the layer
-// that reads it and applying the query-row -> batch-dim mapping. The prefill op
-// tensors are 3D:
+// args_from_options_prefill_2stage: adapts the prefill op's tensor arguments into the
+// runner's two-stage Arguments ({dense, gather}), fanning each field into the layer
+// that reads it and applying the query-row -> batch-dim mapping. T is the resolved
+// config struct, so the return type is its runner's Arguments (same convention as
+// args_from_options<T> in the dense MLA path). The prefill op tensors are 3D:
 //   q       [s_q, h_q, d_qk=512]      bf16
 //   kv      [s_kv, h_kv=1, d_qk=512]  bf16 (dense, unpaged)
 //   indices [s_q, h_kv=1, topk]       int32
@@ -154,8 +158,8 @@ using MlaSparsePrefill2StageXe = MlaSparseDecode2StageXe<
 // their strides are recorded here (no allocation / launch here). shape.b is set to
 // the full row count; the chunk loop in the Impl re-bases pointers per chunk.
 // ---------------------------------------------------------------------------
-template <typename ElementSycl>
-inline cutlass::flash_attention::kernel::PrefillSparseAttn2StageParams args_from_options_prefill_2stage(
+template <typename T>
+inline typename T::Fmla::Arguments args_from_options_prefill_2stage(
     at::Tensor& out,                               // [s_q, h_q, d_v]
     at::Tensor& max_logits,                        // [s_q, h_q]
     at::Tensor& lse,                               // [s_q, h_q]
@@ -207,7 +211,8 @@ inline cutlass::flash_attention::kernel::PrefillSparseAttn2StageParams args_from
   shape.extra_page_block_size = 0;
   shape.extra_topk = 0;
 
-  F::PrefillSparseAttn2StageParams params;
+  typename T::Fmla::Arguments args{};
+  auto& params = args.dense;
 
   // Strides. The batch (row) strides are the tensors' row-0 strides; s_q strides are
   // 0 (each mapped batch has s_q == 1, one row).
@@ -264,8 +269,10 @@ inline cutlass::flash_attention::kernel::PrefillSparseAttn2StageParams args_from
   ep.stride_max_logits_b = to_int_stride(max_logits.stride(0));
   ep.stride_max_logits_s_q = 0;
 
-  // --- Gather slice (prefill child): dense bf16 unpaged source. ---
-  auto& g = params.gather;
+  // --- Stage-1 gather params (prefill): dense bf16 unpaged source. Independent of the
+  // dense params above; the shared gathered_k / mask / topk_length pointers are copied
+  // across so each stage's params is self-contained. ---
+  auto& g = args.gather;
   g.b = s_q;
   g.s_q = 1;
   g.topk = topk;
@@ -291,22 +298,24 @@ inline cutlass::flash_attention::kernel::PrefillSparseAttn2StageParams args_from
   params.scheduler.s_q = 1;
 
   (void)hw_info;
-  return params;
+  return args;
 }
 
 // ---------------------------------------------------------------------------
 // runMlaSparsePrefill2StageImpl: allocates the dense gathered-KV + valid-mask HBM
 // workspaces (chunked along the mapped batch = query rows), builds the launcher
-// arguments, and runs the chunked launch loop against Config::Fmla. Analog of
-// runMlaSparse2StageImpl (decode), but chunking is over query rows.
+// arguments, and runs the chunked launch loop against
+// MlaSparsePrefill2StageXeType::Fmla. Analog of runMlaSparse2StageImpl (decode),
+// but chunking is over query rows.
 //
-// Config is a fully-resolved MlaSparsePrefill2StageXe<D_QK, HAS_ATTN_SINK, B_H>;
-// instantiating this function pulls in the heavy CUTLASS kernel for that single
+// The Stage-2 config is resolved here from the compile-time template params:
+// MlaSparsePrefill2StageXeType == MlaSparsePrefill2StageXe<Element, D_QK, HAS_ATTN_SINK, B_H>.
+// Instantiating this function pulls in the heavy CUTLASS kernel for that single
 // (D_QK, B_H), so the generated per-(dtype, B_H) TU keeps its codegen confined
-// (build OOM guard). ElementSycl is the query element type used only for the
+// (build OOM guard). Element is the query element type used only for the
 // host-side arg adaptation (the kernel is bf16-internal).
 // ---------------------------------------------------------------------------
-template <typename ElementSycl, typename Config>
+template <typename Element, int D_QK, int B_H, bool HAS_ATTN_SINK>
 inline void runMlaSparsePrefill2StageImpl(
     at::Tensor& out,
     at::Tensor& max_logits,
@@ -319,6 +328,12 @@ inline void runMlaSparsePrefill2StageImpl(
     double sm_scale,
     int64_t head_dim_v) {
   namespace F = cutlass::flash_attention::kernel;
+
+  // The Stage-2 config for this D_QK + B_H + attn_sink flag. All three are compile-time
+  // template params dispatched by the op (mla_sparse_prefill.cpp), so no runtime dispatch
+  // is needed here. The 2-stage codegen only emits bf16 (MlaSparsePrefillXe20.cmake), so
+  // Element is always bf16 and no per-dtype guard is required.
+  using MlaSparsePrefill2StageXeType = F::MlaSparsePrefill2StageXe<Element, D_QK, HAS_ATTN_SINK, B_H>;
 
   const int s_q = q.size(0);
   const int d_qk = q.size(2);
@@ -343,7 +358,7 @@ inline void runMlaSparsePrefill2StageImpl(
   at::Tensor gathered_k = at::empty({chunk_rows, 1, topk, d_qk}, bf16_opts);
   at::Tensor gathered_valid_mask = at::empty({chunk_rows, 1, topk}, i32_opts);
 
-  auto params = args_from_options_prefill_2stage<ElementSycl>(
+  auto args = args_from_options_prefill_2stage<MlaSparsePrefill2StageXeType>(
       out,
       max_logits,
       lse,
@@ -356,12 +371,16 @@ inline void runMlaSparsePrefill2StageImpl(
       gathered_valid_mask,
       sm_scale,
       head_dim_v);
+  auto& params = args.dense;
+  auto& gather_args = args.gather;
 
   // Config-level invariants (formerly checked in the deleted launch_..._policy):
   // the resolved config fixes D_QK / D_V, and the gathered tile width must equal
   // topk + extra_topk (extra_topk == 0 for prefill).
-  TORCH_CHECK(params.kernel.shape.d_qk == Config::D_QK, "Invalid d_qk for this kernel instantiation");
-  TORCH_CHECK(params.kernel.shape.d_v == Config::D_V, "d_v must match MlaSparseDecode2StageXe::D_V");
+  TORCH_CHECK(
+      params.kernel.shape.d_qk == MlaSparsePrefill2StageXeType::D_QK, "Invalid d_qk for this kernel instantiation");
+  TORCH_CHECK(
+      params.kernel.shape.d_v == MlaSparsePrefill2StageXeType::D_V, "d_v must match MlaSparseDecode2StageXe::D_V");
   TORCH_CHECK(
       params.kernel.shape.gathered_topk == params.kernel.shape.topk + params.kernel.shape.extra_topk,
       "gathered_topk must equal topk + extra_topk");
@@ -370,20 +389,20 @@ inline void runMlaSparsePrefill2StageImpl(
   // bounded. Per chunk we re-base the row-indexed input/output pointers (slicing
   // preserves strides) and reuse the same gathered_k/gathered_valid_mask workspace.
   //
-  // Both stages run through the device::MLASparse runner: the dense kernel declares
-  // SparsePrefillGatherKernel as its nested GatherKernel, so the runner launches
-  // gather-then-dense on the in-order XPU queue. Arguments == Params ==
-  // PrefillSparseAttn2StageParams (composite per-layer object); the dense kernel's
-  // to_underlying_arguments fans out per collective, the workspace is empty.
+  // Both stages run through one Fmla::run call: the runner holds one Params per stage
+  // and issues gather-then-dense on the in-order XPU queue (Stage 1 fills gathered_k /
+  // gathered_valid_mask, Stage 2 consumes them), the same way device::MLA runs the
+  // dense path's split-KV attention + reduction pair. to_underlying_arguments fans the
+  // dense arguments out per collective; the workspace is empty.
   //
   // Per row-chunk we re-base the row-indexed slices: the mapped batch count feeds
-  // kernel.shape.b + gather.b; q feeds kernel + mainloop; out -> kernel; lse /
+  // kernel.shape.b + gather_args.b; q feeds kernel + mainloop; out -> kernel; lse /
   // max_logits -> epilogue; indices -> gather; topk_length -> mainloop + gather.
-  typename Config::Fmla fmla;
+  typename MlaSparsePrefill2StageXeType::Fmla fmla;
   for (int r0 = 0; r0 < s_q; r0 += chunk_rows) {
     const int cr = std::min(chunk_rows, s_q - r0);
     params.kernel.shape.b = cr;
-    params.gather.b = cr;
+    gather_args.b = cr;
 
     void* q_ptr = q.slice(0, r0, r0 + cr).data_ptr();
     params.kernel.q = q_ptr;
@@ -391,29 +410,29 @@ inline void runMlaSparsePrefill2StageImpl(
     params.kernel.out = reinterpret_cast<cutlass::bfloat16_t*>(out.slice(0, r0, r0 + cr).data_ptr());
     params.epilogue.lse = reinterpret_cast<float*>(lse.slice(0, r0, r0 + cr).data_ptr());
     params.epilogue.max_logits = reinterpret_cast<float*>(max_logits.slice(0, r0, r0 + cr).data_ptr());
-    params.gather.indices = reinterpret_cast<int*>(indices.slice(0, r0, r0 + cr).data_ptr());
+    gather_args.indices = reinterpret_cast<int*>(indices.slice(0, r0, r0 + cr).data_ptr());
     if (topk_length.has_value()) {
       int* tl = reinterpret_cast<int*>(topk_length.value().slice(0, r0, r0 + cr).data_ptr());
       params.mainloop.topk_length = tl;
-      params.gather.topk_length = tl;
+      gather_args.topk_length = tl;
     }
 
-    CUTLASS_CHECK(Config::Fmla::can_implement(params));
-    CUTLASS_CHECK(fmla.run(params, /* workspace */ nullptr));
+    CUTLASS_CHECK(MlaSparsePrefill2StageXeType::Fmla::can_implement(args));
+    CUTLASS_CHECK(fmla.run(args, /* workspace */ nullptr));
   }
 }
 
 // ---------------------------------------------------------------------------
-// runMlaSparsePrefill2Stage: op-facing entry point. Validates inputs, resolves the
-// Stage-2 Config for the dispatched head dim (D_QK), head-block size (B_H), and
-// attn_sink flag (HAS_ATTN_SINK), and delegates to the Impl. The op
-// (mla_sparse_prefill.cpp) picks ElementSycl (dtype), D_QK {512,576}, B_H, and the
+// runMlaSparsePrefill2Stage: op-facing entry point. Validates inputs and forwards the
+// dispatched head dim (D_QK), head-block size (B_H), and attn_sink flag
+// (HAS_ATTN_SINK) to the Impl, which resolves the Stage-2 Config from them. The op
+// (mla_sparse_prefill.cpp) picks Element (dtype), D_QK {512,576}, B_H, and the
 // attn_sink flag, mirroring decode's dtype-then-D_QK-then-B_H-then-sink dispatch, and
 // each generated launcher launch_mla_sparse_prefill_2stage_<ELEM>_<D_QK>_<B_H>_<SINK>
 // instantiates a single (D_QK, B_H, HAS_ATTN_SINK) in its own TU (build OOM guard
 // preserved). Only bf16 query/kv is supported; d_v is 512.
 // ---------------------------------------------------------------------------
-template <typename ElementSycl, int D_QK, int B_H, bool HAS_ATTN_SINK>
+template <typename Element, int D_QK, int B_H, bool HAS_ATTN_SINK>
 inline void runMlaSparsePrefill2Stage(
     at::Tensor& out,                               // [s_q, h_q, d_v]
     at::Tensor& max_logits,                        // [s_q, h_q]
@@ -425,11 +444,9 @@ inline void runMlaSparsePrefill2Stage(
     const std::optional<at::Tensor>& topk_length,  // [s_q] or nullopt
     double sm_scale,
     int64_t head_dim_v) {
-  namespace F = cutlass::flash_attention::kernel;
-
   TORCH_CHECK(head_dim_v == 512, "head_dim_v must be 512 for DeepSeek V4 MLA prefill");
   TORCH_CHECK(
-      (std::is_same<ElementSycl, sycl::ext::oneapi::bfloat16>::value),
+      (std::is_same<Element, sycl::ext::oneapi::bfloat16>::value),
       "2-stage sparse MLA prefill currently supports only bf16 query");
   TORCH_CHECK(q.scalar_type() == at::kBFloat16, "2-stage sparse MLA prefill query must be bfloat16");
   TORCH_CHECK(kv.scalar_type() == at::kBFloat16, "2-stage sparse MLA prefill kv must be bfloat16");
@@ -452,16 +469,9 @@ inline void runMlaSparsePrefill2Stage(
   TORCH_CHECK(kv.size(1) == 1, "2-stage sparse MLA prefill requires h_kv == 1");
   TORCH_CHECK(attn_sink.has_value() == HAS_ATTN_SINK, "attn_sink presence must match the dispatched HAS_ATTN_SINK");
 
-  // The Stage-2 kernel is bf16-internal; only the bf16-query instantiation carries the
-  // heavy Config::Fmla. Guarding the Impl (and thus the CUTLASS instantiation) behind
-  // if constexpr keeps the generated half TUs cheap -- half query is rejected by the
-  // TORCH_CHECK above at runtime, so its Impl is dead code.
-  if constexpr (std::is_same_v<ElementSycl, sycl::ext::oneapi::bfloat16>) {
-    // The Stage-2 config for this D_QK + B_H + attn_sink flag. All three are compile-time
-    // template params dispatched by the op (mla_sparse_prefill.cpp), so no runtime
-    // dispatch is needed here.
-    using Config = F::MlaSparsePrefill2StageXe<D_QK, HAS_ATTN_SINK, B_H>;
-    runMlaSparsePrefill2StageImpl<ElementSycl, Config>(
-        out, max_logits, lse, q, kv, indices, topk_length, attn_sink, sm_scale, head_dim_v);
-  }
+  // Delegate to the Impl, forwarding the compile-time config-keying params
+  // (D_QK, B_H, HAS_ATTN_SINK). The Impl resolves the Stage-2 Config from them;
+  // no runtime dispatch is needed here.
+  runMlaSparsePrefill2StageImpl<Element, D_QK, B_H, HAS_ATTN_SINK>(
+      out, max_logits, lse, q, kv, indices, topk_length, attn_sink, sm_scale, head_dim_v);
 }

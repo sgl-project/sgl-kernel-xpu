@@ -14,8 +14,11 @@
     compute collective owning the MMA/tile/fragment type aliases, its Params, its
     SharedStorage, ctor (Params const&, SharedStorage&), and operator(). Shared
     declarations (SparseAttnDecodeParams, LOG_* constants, the copy_block_*
-    helpers) come from the kernel/ common header; the DPAS/tile config it reads
-    off its Traits template param is MlaSparseDecode2StageXe (host types header).
+    helpers) come from the kernel/ common header; the DPAS/tile geometry it reads
+    off its Traits template param is MlaSparseDecode2StageTileTraits (declared in that
+    same common header). Traits carries geometry only --
+    element types, MMA atoms, tile shapes, sizes -- never the assembly (which
+    collectives / kernels / runner), which is the config struct's business.
 
     Correctness reference: tests/test_flash_mla_with_kvcache.py _sm120_sparse_decode_fwd.
 */

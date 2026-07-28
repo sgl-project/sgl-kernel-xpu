@@ -10,11 +10,16 @@
     - LOG_2_E / LOG_E_2 log-base constants + packed FP8 KV layout constants.
     - SparseDecode2StageProblemShape: pure problem geometry.
     - The per-layer param blocks (Kernel2StageParams / Mainloop2StageParams /
-      Epilogue2StageParams / TileScheduler2StageParams / Gather2StageParams and its
-      decode / prefill children) and the composite {Decode,Prefill}SparseAttn2StageParams.
+      Epilogue2StageParams / TileScheduler2StageParams) bundled into the Stage-2
+      dense SparseAttn2StageParams, plus the independent Stage-1 Gather2StageParams
+      and its decode / prefill children.
     - DISPATCH_BOOLEAN_FLAG: compile-time boolean dispatch.
-    - FLASH_MLA_PREFILL_V_SPLIT: dense-decode V-split knob (the DPAS/tile config
-      struct MlaSparseDecode2StageXe that reads it lives in the host types header).
+    - FLASH_MLA_PREFILL_V_SPLIT: dense-decode V-split knob.
+    - MlaSparseDecode2StageTileTraits: the Stage-2 DPAS / tile geometry (element
+      types, MMA atoms, tile shapes, subgroup layouts, sizes) that the collectives
+      and the dense kernel wrapper receive as their `Traits`. The *assembly* around
+      it (which collectives / gather kernel / runner) is MlaSparseDecode2StageXe in
+      device/mla_sparse_decode_2stage_types.hpp.
 
   reference: tests/test_flash_mla_with_kvcache.py
     _gather_and_dequant (Stage 1) + _sm120_sparse_decode_fwd (Stage 2).
@@ -40,6 +45,7 @@
 #include "cutlass/bfloat16.h"
 #include "cutlass/device_kernel.h"
 #include "cutlass/float8.h"
+#include "cutlass/half.h"
 
 // rmem<->smem block copies (copy_block_r2s / copy_block_s2r, in namespace cute) used
 // by the dense kernel's cross-subgroup softmax reduction (only reached when V_SPLIT
@@ -49,6 +55,27 @@
 using namespace cute;
 
 namespace cutlass::flash_attention::kernel {
+
+// ---------------------------------------------------------------------------
+// Query element mapping (sycl -> cutlass). Local copy of the fused path's
+// SparseMlaToCutlassElementType (device/mla_sparse_decode_types.hpp), kept here so
+// the 2-stage config can resolve its ElementQ straight from the dispatched dtype
+// without pulling in the heavy fused kernel header. Same specializations.
+// ---------------------------------------------------------------------------
+template <typename T>
+struct SparseMlaToCutlassElementType {
+  using type = T;
+};
+
+template <>
+struct SparseMlaToCutlassElementType<sycl::half> {
+  using type = cutlass::half_t;
+};
+
+template <>
+struct SparseMlaToCutlassElementType<sycl::ext::oneapi::bfloat16> {
+  using type = cutlass::bfloat16_t;
+};
 
 // ---------------------------------------------------------------------------
 // log-base constants + packed FP8 KV layout.
@@ -99,10 +126,10 @@ struct SparseDecode2StageProblemShape {
 // (kernel/xe_mla_sparse_kernel.hpp: KernelParams / MainloopParams /
 // EpilogueParams / TileSchedulerParams). Each block carries ONLY the scalars,
 // pointers, and strides its own layer actually reads, so the coupling between a
-// layer and the fields it touches is explicit. The composite
-// {Decode,Prefill}SparseAttn2StageParams below assembles these into the single
-// Params object shared by the Stage-1 gather and Stage-2 dense launches (the
-// device::MLASparse runner hands the same object to both).
+// layer and the fields it touches is explicit. SparseAttn2StageParams below
+// assembles the Stage-2 blocks into the dense kernel's Params; the Stage-1 gather
+// blocks stay separate and are the gather kernel's own Params (the runner holds one
+// Params per stage and shares only the gathered-KV HBM buffers between them).
 //
 // Unused monolith fields (plain sm_scale, is_fp8_query, h_kv, the SplitKV block)
 // are intentionally dropped: they were host-set but never read on device.
@@ -168,10 +195,12 @@ struct Epilogue2StageParams {
   int stride_max_logits_b = 0, stride_max_logits_s_q = 0;
 };
 
-// Stage-1 gather common params (base). The subgroup-coalesced gather grid, the
-// per-(batch, seq) index/gathered base pointers, and the valid-mask write are
-// shared by decode and prefill; the path-specific KV *source* fields live in the
-// children below.
+// Stage-1 gather common params (base). This is the standalone Stage-1 kernel's own
+// Params (its decode / prefill child below is what SparseGatherKernel launches with)
+// -- independent of the Stage-2 SparseAttn2StageParams. The subgroup-coalesced
+// gather grid, the per-(batch, seq) index/gathered base pointers, and the valid-mask
+// write are shared by decode and prefill; the path-specific KV *source* fields live
+// in the children below.
 struct Gather2StageParams {
   int b = 0, s_q = 0, topk = 0, gathered_topk = 0;
 
@@ -212,36 +241,32 @@ struct PrefillGather2StageParams : Gather2StageParams {
 };
 
 // ---------------------------------------------------------------------------
-// Composite params: one base carrying the layers common to both paths, plus a
-// decode / prefill child adding the path-specific gather slice. This is the
-// single Params object the device::MLASparse runner shares between the Stage-1
-// gather launch and the Stage-2 dense launch (both take typename K::Params, and
-// the dense kernel derives its Params from its GatherKernel so the two always
-// agree). The Stage-2 dense kernel + collectives + tile scheduler read only the
-// base slices, so they are path-agnostic; only the gather kernel touches
-// `.gather`.
+// Stage-2 dense params: the layers the dense flash kernel actually consumes,
+// bundled the way a normal (non-sparse) MLA kernel bundles its Params fan-out.
+// It carries NO gather slice: Stage 1 is a separate kernel with its own Params
+// (the Gather2StageParams children above). The runner (device::MLASparse) holds one
+// Params member per stage and launches both, exactly as device::MLA does for the
+// split-KV attention + reduction pair. The two stages communicate only through the
+// gathered_k / gathered_valid_mask HBM buffers, whose pointers+strides each side
+// records in its own params.
+//
+// Both paths (decode / prefill) share this one type -- the Stage-2 dense kernel,
+// collectives, and tile scheduler are path-agnostic; the path-specific bits live
+// entirely in the Stage-1 gather params.
 // ---------------------------------------------------------------------------
-struct SparseAttn2StageParamsBase {
+struct SparseAttn2StageParams {
   Kernel2StageParams kernel;
   Mainloop2StageParams mainloop;
   Epilogue2StageParams epilogue;
   TileScheduler2StageParams scheduler;
 };
 
-struct DecodeSparseAttn2StageParams : SparseAttn2StageParamsBase {
-  DecodeGather2StageParams gather;
-};
-
-struct PrefillSparseAttn2StageParams : SparseAttn2StageParamsBase {
-  PrefillGather2StageParams gather;
-};
-
 // ===========================================================================
-// Stage-2 dense-decode DPAS/tile configuration knob. The full config struct
-// (MlaSparseDecode2StageXe) that assembles the tile shapes, MMAs, collectives,
-// and the device::MLASparse runner lives in
-// device/mla_sparse_decode_2stage_types.hpp (host side, matching the fused
-// path's MlaSparseXe convention); it reads this V-split knob.
+// Stage-2 dense-decode DPAS/tile configuration knob, consumed by
+// MlaSparseDecode2StageTileTraits below. The config struct that assembles the
+// collectives, kernels, and device::MLASparse runner around those traits is
+// MlaSparseDecode2StageXe in device/mla_sparse_decode_2stage_types.hpp (host side,
+// matching the fused path's MlaSparseXe convention), and it forwards this knob.
 // ===========================================================================
 
 #ifndef FLASH_MLA_PREFILL_V_SPLIT
@@ -265,5 +290,118 @@ struct PrefillSparseAttn2StageParams : SparseAttn2StageParamsBase {
 #ifndef FLASH_MLA_SPARSE_PREFILL_V_SPLIT
 #define FLASH_MLA_SPARSE_PREFILL_V_SPLIT 2
 #endif
+
+// ===========================================================================
+// Stage-2 dense-decode DPAS / tile geometry.
+//
+// MlaSparseDecode2StageTileTraits is the inner half of what used to be one
+// monolithic config struct: the pure Stage-2 *geometry* -- element types, DPAS MMA
+// atoms, tile shapes, subgroup layouts, and the derived size constants. It is what
+// the collectives and the dense kernel wrapper receive as their `Traits` template
+// parameter and read members off (Traits::B_H, Traits::TiledMMAQK, ...), which is
+// why it lives here in the shared header alongside the params blocks they also read.
+//
+// The outer half -- the *assembly* (which collectives, which tile scheduler, which
+// Stage-1 gather kernel, which runner) -- stays in the host types header as
+// MlaSparseDecode2StageXe (device/mla_sparse_decode_2stage_types.hpp).
+//
+// Why the split. The config struct previously passed *itself* as its collectives'
+// Traits, i.e. it was named as a template argument while still incomplete:
+//
+//     MlaSparseDecode2StageXe -> CollectiveMainloop<..., MlaSparseDecode2StageXe>
+//                             -> CollectiveEpilogue<CollectiveMainloop, ...>
+//                             -> DenseKernel -> Fmla
+//
+// That self-reference compiled only because every alias in the chain is lazy and
+// nothing inside them touched the enclosing type eagerly; a single member needing the
+// complete type would break it with an error that points nowhere useful. It also let
+// the collectives reach members that are none of their business -- including Fmla, the
+// runner that contains them, and GatherKernel, the other stage.
+//
+// With the geometry here, the traits type is COMPLETE before any collective names it,
+// the cycle is gone, and a collective can only see geometry. This also matches how the
+// dense (non-sparse) MLA path parameterizes XeMlaMainloop with explicit geometry
+// (TiledMMAQK / TiledMMAPV / VTiles / Tensor*), just bundled instead of spelled out
+// per-parameter -- there are 16 distinct members in use, which is well past the point
+// where individual template params are the clearer option.
+//
+// This is purely a compile-time / coupling concern: the traits type is never
+// instantiated (no object, no sizeof, no pass-by-value anywhere), so it costs no
+// registers, no SLM, and no kernel-argument bytes. Every use is
+// `typename Traits::X` or `Traits::kConstant`.
+//
+// T is the op's query dtype (sycl::half / sycl::ext::oneapi::bfloat16), resolved to a
+// cutlass element via SparseMlaToCutlassElementType exactly like the fused path's
+// MlaSparseXe, so the geometry can be instantiated straight from the dispatched dtype
+// without branching on it.
+//
+// Keyed by (T, D_QK, B_H, V_SPLIT) only -- the flags that select *behavior* rather
+// than geometry (HAS_ATTN_SINK, HAS_MAX_LOGITS) and the Stage-1 gather choice belong
+// to the assembly layer and are deliberately absent here.
+// ===========================================================================
+template <typename T, int D_QK_, int B_H_, int V_SPLIT_>
+struct MlaSparseDecode2StageTileTraits {
+  static constexpr int D_QK = D_QK_;
+
+  // Query element resolved from the op's dtype, mirroring the fused MlaSparseXe. K/V
+  // are the Stage-1 gathered bf16 latent and the out / gathered_k param slices are
+  // bf16, so those stay bf16 (the QK DPAS is bf16; a non-bf16 query is converted on
+  // load). IS_FP8_QUERY is deduced from the element -- true only for an fp8 query,
+  // which the current codegen never instantiates (half/bf16 only), so it is false in
+  // practice; the fp8 dequant path stays compiled behind it for when it is wired up.
+  using ElementType = typename SparseMlaToCutlassElementType<T>::type;
+  using ElementQ = ElementType;
+  using ElementKV = ElementType;
+  using ElementO = ElementType;
+  static constexpr bool IS_FP8_QUERY = cute::is_same_v<ElementQ, cutlass::float_e4m3_t>;
+
+  using StrideQ = cute::tuple<int, _1, int>;
+  using StrideKV = cute::tuple<int, _1, int>;
+  using StrideO = cute::tuple<int, _1, int>;
+
+  static constexpr int B_H = B_H_;  // h_q block size
+  static constexpr int SUBGROUP_SIZE = intel::sg_size;
+  static constexpr int NUM_SUBGROUPS = B_H > 16 ? (B_H > 32 ? 8 : 4) : 4;
+  static constexpr int NUM_THREADS = NUM_SUBGROUPS * SUBGROUP_SIZE;
+  static constexpr int B_TOPK = 64;  // topk_length block size
+
+  static constexpr int D_PE = 64;
+  static constexpr int D_V = 512;
+  // V-split factor: how many work-groups split the D_V output for one query tile.
+  // Decode and prefill pass different values (prefill's grid is already saturated by
+  // its s_q batch dim); see the knob comments just above.
+  static constexpr int V_SPLIT = V_SPLIT_;
+  static_assert(V_SPLIT >= 1, "V_SPLIT must be >= 1");
+  static_assert(D_V % V_SPLIT == 0, "D_V must be divisible by V_SPLIT");
+  static constexpr int D_V_PER_SPLIT = D_V / V_SPLIT;
+  static constexpr int HEAD_DIM_TILE_SIZE = 32;
+
+  static constexpr int stages = 64 / B_TOPK;
+  static_assert(stages == 1, "only support single stage for now");
+
+  // 576 / 32 = 18
+  // Q head packing size = B_H
+  using TileShapeQK = Shape<Int<B_H>, Int<B_TOPK>, Int<HEAD_DIM_TILE_SIZE>>;
+  using SubgroupLayoutQK =
+      conditional_t<(B_H > 16), Layout<Shape<Int<NUM_SUBGROUPS>, _1, _1>>, Layout<Shape<_1, Int<NUM_SUBGROUPS>, _1>>>;
+
+  using TileShapePV = Shape<Int<B_H>, Int<HEAD_DIM_TILE_SIZE>, Int<B_TOPK>>;
+  using SubgroupLayoutPV =
+      conditional_t<(B_H > 16), Layout<Shape<Int<NUM_SUBGROUPS>, _1, _1>>, Layout<Shape<_1, _1, Int<NUM_SUBGROUPS>>>>;
+
+  // D_V / 64 = 8 tiles for v_dim
+  using TileShapeOut = Shape<Int<B_H>, Int<D_V_PER_SPLIT>>;
+
+  using SmemTileLayoutK = Layout<Shape<Int<B_TOPK>, Int<HEAD_DIM_TILE_SIZE>>, Stride<Int<HEAD_DIM_TILE_SIZE>, _1>>;
+  using SmemTileLayoutV = Layout<Shape<Int<HEAD_DIM_TILE_SIZE>, Int<B_TOPK>>, Stride<Int<B_TOPK>, _1>>;
+
+  constexpr static int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
+  // bf16 dpas m8n16k16
+  // (8, 128, 64) / ((8, 16, 16) * (1, 16, 1)) = (1, 1, 4) iterations per subgroup
+  constexpr static int MAX_M_DPAS = 8;
+  using MMAOperation = XE_DPAS_TT<cute::gcd(SGTileQ, MAX_M_DPAS), float, ElementType>;
+  using TiledMMAQK = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<TileShapeQK>, SubgroupLayoutQK>::TiledMMA;
+  using TiledMMAPV = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<TileShapePV>, SubgroupLayoutPV>::TiledMMA;
+};
 
 }  // namespace cutlass::flash_attention::kernel

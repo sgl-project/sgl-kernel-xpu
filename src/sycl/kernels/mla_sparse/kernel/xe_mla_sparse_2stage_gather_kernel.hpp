@@ -22,14 +22,23 @@
         pool, no paging. Reference: tests/test_flash_mla_sparse_fwd.py
         reference_mla_sparse_prefill (Stage 1).
 
-  Shared declarations (SparseAttnDecodeParams, constants) come from
+  Shared declarations (the Gather2StageParams blocks, constants) come from
   xe_mla_sparse_decode_2stage_common.hpp. Stage 1 owns its own tile constants and
   does not use the Stage-2 config struct (MlaSparseDecode2StageXe).
 
-  The two aliases below preserve the historical names / `template <int> class`
-  interface expected by the config struct (MlaSparseDecode2StageXe's GatherKernelTmpl
-  parameter) and the device::MLASparse runner's SFINAE GatherKernel detection, so no
-  wiring changes are needed:
+  Stage 1 is a fully standalone kernel: its Params ARE the gather params (the source
+  policy's decode / prefill child), with no reference to the Stage-2 dense params. It is
+  the Stage-2 runner's companion kernel, wired in exactly like the dense MLA path's
+  split-KV reduction companion (kernel/xe_mla_reduce_split_kv.hpp): it exposes the same
+  host-side contract (Arguments/Params, to_underlying_arguments, can_implement,
+  get_workspace_size, get_grid_shape, get_block_shape) and device::MLASparse launches it
+  before the dense kernel on the in-order XPU queue. The two stages communicate only
+  through the gathered_k / gathered_valid_mask HBM buffers, which each stage's params
+  name independently.
+
+  The two aliases below give each path a `template <int> class` entry point keyed on
+  D_QK, which is how the Stage-2 config struct (MlaSparseDecode2StageXe's
+  GatherKernelTmpl parameter) selects the decode vs prefill gather:
     - SparseDecodeGatherDequantKernel<D_QK> == SparseGatherKernel<D_QK, DecodeFp8PagedSource>
     - SparsePrefillGatherKernel<D_QK>       == SparseGatherKernel<D_QK, PrefillDenseBf16Source>
 */
@@ -45,11 +54,9 @@ namespace cutlass::flash_attention::kernel {
 /////////////////////////////////////////////////////////////////////////////////////////////////
 template <int D_QK>
 struct DecodeFp8PagedSource {
-  // Composite params this source implies (decode variant), and the gather slice it
-  // reads. The gather kernel derives its Params from Source::Params so the Stage-1
-  // gather and Stage-2 dense launches share one composite type (the runner hands
-  // the same object to both).
-  using Params = DecodeSparseAttn2StageParams;
+  // The Stage-1 params this source reads. Stage 1 is a standalone kernel: these are
+  // its complete Params, independent of the Stage-2 dense params (the two stages
+  // share only the gathered-KV HBM buffers named in both).
   using GatherParams = DecodeGather2StageParams;
 
   static constexpr int SUBGROUP_SIZE = intel::sg_size;
@@ -264,9 +271,8 @@ struct DecodeFp8PagedSource {
 /////////////////////////////////////////////////////////////////////////////////////////////////
 template <int D_QK>
 struct PrefillDenseBf16Source {
-  // Composite params this source implies (prefill variant), and the gather slice it
-  // reads. See the decode source for why the gather kernel derives Params from here.
-  using Params = PrefillSparseAttn2StageParams;
+  // The Stage-1 params this source reads (prefill variant). See the decode source:
+  // these are the standalone gather kernel's complete Params.
   using GatherParams = PrefillGather2StageParams;
 
   static constexpr int SUBGROUP_SIZE = intel::sg_size;
@@ -367,13 +373,13 @@ class SparseGatherKernel {
  public:
   using Source = SourcePolicyTmpl<D_QK>;
 
-  // The gather kernel shares the composite Params with the Stage-2 dense kernel (the
-  // runner hands the same object to both launches); it reads only the `gather` slice.
-  // The composite type is dictated by the source policy (decode vs prefill child).
-  using Arguments = typename Source::Params;
-  using KernelArguments = typename Source::Params;
-  using Params = typename Source::Params;
+  // Stage 1 is a standalone kernel with its own Params: the source policy's gather
+  // params (decode or prefill child). It has no dependency on the Stage-2 dense
+  // kernel's params -- the two stages meet only at the gathered-KV HBM buffers.
   using GatherParams = typename Source::GatherParams;
+  using Arguments = GatherParams;
+  using KernelArguments = GatherParams;
+  using Params = GatherParams;
 
   static constexpr int NUM_THREADS = 128;
   static constexpr int SUBGROUP_SIZE = intel::sg_size;
@@ -383,10 +389,30 @@ class SparseGatherKernel {
   // Gather uses no SLM.
   static constexpr int SharedStorageSize = 0;
 
+  // Host-side contract for the device::MLASparse runner, mirroring what the split-KV
+  // reduction companion provides to device::MLA (kernel/xe_mla_reduce_split_kv.hpp):
+  // Arguments == Params (nothing to transform), no workspace of its own.
+  static Params to_underlying_arguments(Arguments const& args, void* /* workspace */) {
+    return args;
+  }
+
+  static bool can_implement(Arguments const& args) {
+    return args.b > 0 && args.s_q > 0 && args.gathered_topk > 0 && args.gathered_k != nullptr &&
+           args.gathered_valid_mask != nullptr;
+  }
+
+  static int get_workspace_size(Arguments const& /* args */) {
+    return 0;
+  }
+
+  static cutlass::Status initialize_workspace(Arguments const& /* args */, void* /* workspace */ = nullptr) {
+    return cutlass::Status::kSuccess;
+  }
+
   // launch<> contract: one work-group per (batch*seq, topk-block); B_TOPK topk
   // columns per work-group.
   static dim3 get_grid_shape(Params const& params) {
-    return dim3(params.gather.b * params.gather.s_q, ceil_div(params.gather.gathered_topk, B_TOPK), 1);
+    return dim3(params.b * params.s_q, ceil_div(params.gathered_topk, B_TOPK), 1);
   }
 
   static dim3 get_block_shape() {
@@ -395,7 +421,7 @@ class SparseGatherKernel {
 
   CUTLASS_DEVICE
   void operator()(const Params& params, char* smem_buf) const {
-    const GatherParams& gather = params.gather;
+    const GatherParams& gather = params;
     const int thr_id = int(ThreadIdxX());
     const int sg_id = thr_id / SUBGROUP_SIZE;
     const int lane_id = thr_id % SUBGROUP_SIZE;
@@ -428,9 +454,10 @@ class SparseGatherKernel {
   }
 };
 
-// Historical names / `template <int> class` interface preserved for the config
-// struct (MlaSparseDecode2StageXe GatherKernelTmpl param) and the device::MLASparse
-// runner's nested-GatherKernel SFINAE detection.
+// Per-path entry points with the `template <int> class` (D_QK-keyed) interface the
+// Stage-2 config struct's GatherKernelTmpl param selects on. The config resolves one of
+// these as MlaSparseDecode2StageXe::GatherKernel and passes it to device::MLASparse as
+// the companion kernel.
 template <int D_QK>
 using SparseDecodeGatherDequantKernel = SparseGatherKernel<D_QK, DecodeFp8PagedSource>;
 

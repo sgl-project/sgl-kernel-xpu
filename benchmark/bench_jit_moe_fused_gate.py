@@ -82,13 +82,14 @@ def benchmark(num_tokens, provider):
         fn = lambda: sgl_kernel.moe_fused_gate(
             scores.clone(),
             bias.clone(),
-            NUM_EXPERT_GROUP,
-            TOPK_GROUP,
-            TOPK,
-            0,
-            ROUTED_SCALING_FACTOR,
-            False,
+            num_expert_group=NUM_EXPERT_GROUP,
+            topk_group=TOPK_GROUP,
+            topk=TOPK,
+            renormalize=0,
+            routed_scaling_factor=ROUTED_SCALING_FACTOR,
+            apply_routed_scaling_factor_on_output=False,
         )
+
     elif provider == "jit":
         # Import here to allow optional dependency
         try:

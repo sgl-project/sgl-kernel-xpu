@@ -43,7 +43,7 @@
 #include "sycl/Utils.h"
 #include "sycl/comm/common.h"
 #include "sycl/kernels/flash_attention_v2/collective/fmha_fusion.hpp"
-#include "sycl/kernels/flash_attention_v2/kernel/xe_fhma_fwd_kernel.hpp"
+#include "sycl/kernels/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp"
 #include "sycl/kernels/flash_attention_v2/kernel/xe_tile_scheduler.hpp"
 
 using namespace cute;

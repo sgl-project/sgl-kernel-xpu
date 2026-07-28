@@ -94,12 +94,27 @@ NIGHTLY_BENCHMARKS: List[Entry] = [
     Entry("bench_mrope.py", tee_log="mrope.py.log"),
     Entry("bench_swiglu_alpha_limit.py", tee_log="swiglu_alpha_limit.py.log"),
     Entry("bench_fused_qk_norm_rope.py", tee_log="fused_qk_norm_rope.py.log"),
-    Entry("bench_fused_qk_rope_with_cache.py", tee_log="bench_fused_qk_rope_with_cache.py.log"),
-    Entry("bench_per_token_group_quant_mxfp4.py", tee_log="per_token_group_quant_mxfp4.py.log"),
-    Entry("bench_per_token_group_quant_8bit_v2.py", tee_log="bench_per_token_group_quant_8bit_v2.py.log"),
+    Entry(
+        "bench_fused_qk_rope_with_cache.py",
+        tee_log="bench_fused_qk_rope_with_cache.py.log",
+    ),
+    Entry(
+        "bench_per_token_group_quant_mxfp4.py",
+        tee_log="per_token_group_quant_mxfp4.py.log",
+    ),
+    Entry(
+        "bench_per_token_group_quant_8bit_v2.py",
+        tee_log="bench_per_token_group_quant_8bit_v2.py.log",
+    ),
     Entry("bench_per_token_quant_fp8.py", tee_log="bench_per_token_quant_fp8.py.log"),
-    Entry("bench_per_token_group_quant_mxfp4_fusion.py", tee_log="bench_per_token_group_quant_mxfp4_fusion.py.log"),
-    Entry("bench_scatter_tokens_to_experts.py", tee_log="bench_scatter_tokens_to_experts.py.log"),
+    Entry(
+        "bench_per_token_group_quant_mxfp4_fusion.py",
+        tee_log="bench_per_token_group_quant_mxfp4_fusion.py.log",
+    ),
+    Entry(
+        "bench_scatter_tokens_to_experts.py",
+        tee_log="bench_scatter_tokens_to_experts.py.log",
+    ),
     Entry("bench_top_k_renorm_probs.py", tee_log="bench_top_k_renorm_probs.py.log"),
     Entry("bench_hc_split_sinkhorn.py", tee_log="bench_hc_split_sinkhorn.py.log"),
     Entry("bench_hc_pre_fuse.py", tee_log="bench_hc_pre_fuse.py.log"),
@@ -112,10 +127,21 @@ NIGHTLY_BENCHMARKS: List[Entry] = [
     Entry("bench_jit_rmsnorm.py", tee_log="bench_jit_rmsnorm.py.log"),
     Entry("bench_jit_qknorm.py", tee_log="bench_jit_qknorm.py.log"),
     Entry("bench_jit_rope.py", tee_log="bench_jit_rope.py.log"),
-    Entry("bench_jit_timestep_embedding.py", tee_log="bench_jit_timestep_embedding.py.log"),
-    Entry("bench_jit_per_tensor_quant_fp8.py", tee_log="bench_jit_per_tensor_quant_fp8.py.log"),
-    Entry("bench_jit_moe_align_block_size.py", tee_log="bench_jit_moe_align_block_size.py.log"),
-    Entry("bench_jit_per_token_group_quant_8bit_v2.py", tee_log="bench_jit_per_token_group_quant_8bit_v2.py.log"),
+    Entry(
+        "bench_jit_timestep_embedding.py", tee_log="bench_jit_timestep_embedding.py.log"
+    ),
+    Entry(
+        "bench_jit_per_tensor_quant_fp8.py",
+        tee_log="bench_jit_per_tensor_quant_fp8.py.log",
+    ),
+    Entry(
+        "bench_jit_moe_align_block_size.py",
+        tee_log="bench_jit_moe_align_block_size.py.log",
+    ),
+    Entry(
+        "bench_jit_per_token_group_quant_8bit_v2.py",
+        tee_log="bench_jit_per_token_group_quant_8bit_v2.py.log",
+    ),
     Entry("bench_jit_activation.py", tee_log="bench_jit_activation.py.log"),
     Entry("bench_hc_post.py", tee_log="bench_hc_post.py.log"),
     Entry("bench_sgemm_lora_a_fwd.py", tee_log="bench_sgemm_lora_a_fwd.py.log"),
@@ -132,9 +158,8 @@ def run_tests(files: List[Entry], workdir: str, timeout_per_file: int) -> int:
     # Reuse tests/test_utils.run_unittest_files so nightly test execution matches
     # the harness per-commit CI uses.
     sys.path.insert(0, workdir)
-    from test_utils import run_unittest_files  # noqa: E402
-
     from run_suite import TestFile  # noqa: E402
+    from test_utils import run_unittest_files  # noqa: E402
 
     return run_unittest_files(
         [TestFile(f.name, f.estimated_time) for f in files],
@@ -147,7 +172,9 @@ def run_benchmarks(files: List[Entry], workdir: str, timeout_per_file: int) -> i
     for entry in files:
         script = os.path.join(workdir, entry.name)
         log_path = os.path.join(workdir, entry.tee_log or f"{entry.name}.log")
-        print(f"\n=== Running {entry.name} (log: {entry.tee_log or entry.name + '.log'}) ===")
+        print(
+            f"\n=== Running {entry.name} (log: {entry.tee_log or entry.name + '.log'}) ==="
+        )
         try:
             with open(log_path, "wb") as log_f:
                 proc = subprocess.run(

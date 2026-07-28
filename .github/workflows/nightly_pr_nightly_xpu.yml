@@ -86,14 +86,14 @@ jobs:
           docker exec nightly_sglkernel_xpu /miniforge3/envs/py3.10/bin/python3 -c \
             "import sgl_kernel; print('sgl_kernel loaded from', sgl_kernel.__file__)"
 
-      - name: Run Sglang Kernel Cases
+      - name: sgl-kernel-test (nightly kernel suite)
         timeout-minutes: 30
         run: |
           docker exec -w /root/sglang nightly_sglkernel_xpu \
             /bin/bash -c "cd /root/sglang/sgl-kernel-xpu/tests && /miniforge3/envs/py3.10/bin/python3 -m pip install scipy && \
-                          python3 run_suite.py --suite per-commit "
+                          python3 run_suite.py --suite sgl-kernel-test "
 
-      - name: Run Sglang Kernel Benchmarks
+      - name: sgl-kernel-benchmark (nightly benchmark suite)
         timeout-minutes: 40
         run: |
           docker exec -w /root/sglang nightly_sglkernel_xpu \
@@ -137,7 +137,6 @@ jobs:
               python3 bench_jit_moe_align_block_size.py 2>&1 | tee bench_jit_moe_align_block_size.py.log && \
               python3 bench_jit_per_token_group_quant_8bit_v2.py 2>&1 | tee bench_jit_per_token_group_quant_8bit_v2.py.log && \
               python3 bench_jit_activation.py 2>&1 | tee bench_jit_activation.py.log && \
-              python3 bench_hc_post.py 2>&1 | tee bench_hc_post.py.log && \
               python3 bench_hc_post.py 2>&1 | tee bench_hc_post.py.log && \
               python3 bench_sgemm_lora_a_fwd.py 2>&1 | tee bench_sgemm_lora_a_fwd.py.log
             "

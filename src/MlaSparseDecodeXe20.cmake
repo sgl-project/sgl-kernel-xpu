@@ -17,5 +17,5 @@ foreach(_idx RANGE ${_num_elems})
     set(GENERATED_FILE
         "${CMAKE_CURRENT_BINARY_DIR}/sycl/mla_sparse_decode_kernel_${ELEM_TAG}_128.cpp")
     configure_file(${MLA_SPARSE_DECODE_TEMPLATE} ${GENERATED_FILE} @ONLY)
-    list(APPEND device_cpp_common ${GENERATED_FILE})
+    list(APPEND device_cpp_xe20 ${GENERATED_FILE})
 endforeach()

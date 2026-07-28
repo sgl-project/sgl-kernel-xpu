@@ -279,6 +279,38 @@ def cutlass_fp4_group_mm(
     return c.to(dtype=out_dtype)
 
 
+def _quant_fp8_per_token(x: torch.Tensor):
+    """Quantize a bf16/half [num_tokens, hidden] tensor to fp8 e4m3 with one
+    fp32 scale per token (row). Thin wrapper around the existing
+    sgl_per_token_quant_fp8 op, used to prepare activations for the fp8
+    W8A8 MoE GEMM (moe_grouped_mm_nt_xe20_fp8_w8a8)."""
+    output_q = torch.empty(x.shape, device=x.device, dtype=torch.float8_e4m3fn)
+    output_s = torch.empty(x.shape[0], device=x.device, dtype=torch.float32)
+    torch.ops.sgl_kernel.sgl_per_token_quant_fp8.default(x, output_q, output_s)
+    return output_q, output_s
+
+
+def _expand_fp8_block_scale_to_per_row(
+    scale: torch.Tensor, n_full: int, k_full: int, group_size: int = 128
+) -> torch.Tensor:
+    """Expand a 2-D block-quant fp8 weight scale [E, ceil(n_full/group_size),
+    ceil(k_full/group_size)] to the per-N-row granularity
+    [E, n_full, ceil(k_full/group_size)] moe_grouped_mm_nt_xe20_fp8_w8a8
+    expects (see its kernel's moe_mainloop.hpp: weight scale is per-N-row,
+    per-group_size-K-group). This assumes group_size=128 (DeepSeek
+    convention); a differently-blocked checkpoint would need this (and the
+    kernel's compile-time FP8_GROUP_SIZE_K) updated together."""
+    assert (
+        scale.dim() == 3
+    ), f"expected 3D block scale [E, N/{group_size}, K/{group_size}], got {scale.shape}"
+    k_groups = (k_full + group_size - 1) // group_size
+    assert scale.shape[2] == k_groups, (
+        f"weight scale K-group dim {scale.shape[2]} does not match ceil(K/{group_size})={k_groups} "
+        f"(K={k_full}); only group_size={group_size} block-quant is supported by the fp8 W8A8 kernel"
+    )
+    return scale.repeat_interleave(group_size, dim=1)[:, :n_full, :].contiguous()
+
+
 def fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -350,18 +382,38 @@ def fused_experts(
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
 
-    assert use_fp8_w8a8 is False, "current MoE does not support use_fp8_w8a8"
-    assert a1_scale is None, "current MoE does not support a1_scale"
-    assert a2_scale is None, "current MoE does not support a2_scale"
+    assert not (
+        use_mxfp4_w4a16 and use_fp8_w8a8
+    ), "use_mxfp4_w4a16 and use_fp8_w8a8 are mutually exclusive"
+    assert (
+        a1_scale is None
+    ), "current MoE does not support a1_scale (fp8 activation scale is computed internally)"
+    assert (
+        a2_scale is None
+    ), "current MoE does not support a2_scale (fp8 activation scale is computed internally)"
     assert block_shape is None, "current MoE does not support block_shape"
-    assert activation in (
-        "silu",
-        "gelu",
-        "relu2",
-    ), f"Only silu, gelu and relu2 are supported but got {activation}"
+    if use_fp8_w8a8:
+        # v1: only silu is AOT-instantiated on the XPU fp8 W8A8 grouped GEMM
+        # (see sgl-kernel-xpu/src/sycl/GroupGemmFp8W8A8Xe20.cpp). The mainloop
+        # itself is not limited to silu; other activations are a matter of
+        # adding instantiations once the target fp8 checkpoints are known.
+        assert activation == "silu", (
+            "use_fp8_w8a8=True currently only supports activation='silu'; see "
+            "GroupGemmFp8W8A8Xe20.cpp/.cmake to add more activation instantiations"
+        )
+        assert gemm1_alpha is None and swiglu_limit is None, (
+            "use_fp8_w8a8=True does not support gpt-oss/deepseek-v4 style swiglu "
+            "clamping yet (only plain silu is AOT-instantiated for fp8)"
+        )
+    else:
+        assert activation in (
+            "silu",
+            "gelu",
+            "relu2",
+        ), f"Only silu, gelu and relu2 are supported but got {activation}"
 
     # For MXFP4 W4A16: validate packed int8 inputs and float32 scales.
-    # Scales must be None on all non-mxfp4 code paths.
+    # Scales must be None on all non-mxfp4/non-fp8 code paths.
     if use_mxfp4_w4a16:
         assert (
             w1.dtype == torch.int8
@@ -377,13 +429,37 @@ def fused_experts(
         ), "w2_scale (float32) must be provided when use_mxfp4_w4a16=True"
         assert w1_scale.dtype == torch.float32, "w1_scale must be float32"
         assert w2_scale.dtype == torch.float32, "w2_scale must be float32"
+    elif use_fp8_w8a8:
+        assert (
+            w1.dtype == torch.float8_e4m3fn
+        ), "use_fp8_w8a8=True requires w1 to be float8_e4m3fn"
+        assert (
+            w2.dtype == torch.float8_e4m3fn
+        ), "use_fp8_w8a8=True requires w2 to be float8_e4m3fn"
+        assert (
+            w1_scale is not None and w2_scale is not None
+        ), "w1_scale/w2_scale (float32 block scale) must be provided when use_fp8_w8a8=True"
+        assert w1_scale.dtype == torch.float32, "w1_scale must be float32"
+        assert w2_scale.dtype == torch.float32, "w2_scale must be float32"
+        # Only 2-D block-quant (e.g. DeepSeek-style 128x128) scale tensors are
+        # supported in this first version; per-tensor (single scalar) weight
+        # scale is intentionally not wired up yet (see
+        # xpu_fp8_moe_minimal_plan.md - "do not try to unify every
+        # quantization mode at first").
+        assert (
+            w1_scale.dim() == 3 and w2_scale.dim() == 3
+        ), "use_fp8_w8a8=True currently only supports 2-D block-quant weight scales [E, N/128, K/128]"
     else:
-        assert w1_scale is None, "w1_scale is only supported when use_mxfp4_w4a16=True"
-        assert w2_scale is None, "w2_scale is only supported when use_mxfp4_w4a16=True"
+        assert (
+            w1_scale is None
+        ), "w1_scale is only supported when use_mxfp4_w4a16/use_fp8_w8a8=True"
+        assert (
+            w2_scale is None
+        ), "w2_scale is only supported when use_mxfp4_w4a16/use_fp8_w8a8=True"
 
     # type check
     assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
-    if not use_mxfp4_w4a16:
+    if not use_mxfp4_w4a16 and not use_fp8_w8a8:
         assert w1.dtype == torch.bfloat16, "w1 must be bfloat16"
         assert w2.dtype == torch.bfloat16, "w2 must be bfloat16"
     if b1 is not None:
@@ -479,6 +555,66 @@ def fused_experts(
     intermediate_cache3 = torch.empty(
         (M * TopK, OutK), device=hidden_states.device, dtype=hidden_states.dtype
     )
+
+    if use_fp8_w8a8:
+        # FP8 (E4M3) W8A8 path. Activations are quantized per-token (one
+        # fp32 scale per row) right before each expert GEMM, matching the
+        # CUTLASS/FlashInfer fp8 MoE contract (see xpu_fp8_moe_minimal_plan.md).
+        # Weight scales are expected as 2-D block-quant [E, N/128, K/128]
+        # (DeepSeek-style) and are expanded to per-N-row here, since the
+        # kernel's block-scale granularity is (per-N-row, per-128-K-group) -
+        # see sgl-kernel-xpu/src/sycl/kernels/moe/xe20/fp8_w8a8/moe_mainloop.hpp.
+        #
+        # v1 always fuses GEMM1's gate/up activation in-kernel - there is no
+        # "unfused GEMM1 for huge-weight/small-M" heuristic yet (see
+        # GroupGemmFp8W8A8Xe20.cpp header comment), unlike the bf16/MXFP4
+        # paths below.
+        w1_scale_expanded = _expand_fp8_block_scale_to_per_row(w1_scale, w1.shape[1], K)
+        w2_scale_expanded = _expand_fp8_block_scale_to_per_row(w2_scale, OutK, N)
+
+        input_A_shuffle_fp8, a1_scale = _quant_fp8_per_token(input_A_shuffle)
+
+        intermediate_cache1 = torch.empty(
+            (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
+        )
+        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a8(
+            intermediate_cache1,
+            input_A_shuffle_fp8,
+            a1_scale,
+            w1,
+            w1_scale_expanded,
+            b1,
+            expert_offsets,
+            E,
+            0,  # activation_type: silu only in v1, see assert above
+            True,  # fuse_act
+            1.702,
+            7.0,
+        )
+
+        intermediate_cache1_fp8, a2_scale = _quant_fp8_per_token(intermediate_cache1)
+        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a8(
+            intermediate_cache3,
+            intermediate_cache1_fp8,
+            a2_scale,
+            w2,
+            w2_scale_expanded,
+            b2,
+            expert_offsets,
+            E,
+            0,
+            False,  # fuse_act
+            1.702,
+            7.0,
+        )
+
+        rsf = 1.0
+        if routed_scaling_factor is not None:
+            rsf = routed_scaling_factor
+        torch.ops.sgl_kernel.apply_shuffle_mul_sum.default(
+            intermediate_cache3, out_hidden_states, c_map, rsf, topk_weights
+        )
+        return out_hidden_states
 
     # 0=silu, 1=gelu, 2=swiglu (silu with alpha/limit clamping for gpt-oss),
     # 3=relu2, 4=swiglu_deepseek_v4 (clamp gate/up then plain silu * up).

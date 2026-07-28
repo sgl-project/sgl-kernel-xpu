@@ -390,6 +390,26 @@ void moe_grouped_mm_nt_xe20_mxfp4_w4a16(
     double gemm1_alpha = 1.702,
     double gemm1_limit = 7.0);
 
+// FP8 (E4M3) W8A8 MoE grouped GEMM. `activations`/`weights` are
+// float8_e4m3fn. `act_scales` is a per-token (per-M-row) fp32 direct
+// multiplier. `weight_scales` is a per-(N-row, K/128-group) fp32 direct
+// multiplier - a genuinely 2-D-blocked weight-scale tensor must be
+// pre-expanded to per-N-row by the caller before reaching this op. See
+// src/sycl/kernels/moe/xe20/fp8_w8a8/moe_mainloop.hpp for details.
+void moe_grouped_mm_nt_xe20_fp8_w8a8(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& act_scales,
+    const torch::Tensor& weights,
+    const torch::Tensor& weight_scales,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts,
+    const int64_t activation_type = 0,
+    bool fuse_act = false,
+    double gemm1_alpha = 1.702,
+    double gemm1_limit = 7.0);
+
 void prepare_moe_input(
     const torch::Tensor& topk_ids,
     torch::Tensor& expert_offsets,

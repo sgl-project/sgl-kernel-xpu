@@ -32,6 +32,7 @@
 #pragma once
 
 #include <cstdint>
+#include <type_traits>
 
 #include "cute/algorithm/functional.hpp"
 #include "cute/algorithm/gemm.hpp"
@@ -501,7 +502,7 @@ struct FMHAFwdMainloop<
     }
   }
 
-  template <typename QVCoord>
+  template <bool PackedGQA = PackGQA_, typename QVCoord>
   CUTLASS_DEVICE void operator()(
       TensorQ2D const& Q_2D,  // (q,d)
       TensorK2D const& K_2D,  // (k,d)
@@ -522,6 +523,7 @@ struct FMHAFwdMainloop<
       int num_heads_kv,
       int full_tile_offset,
       int discard_seq_coord,
+      std::bool_constant<PackedGQA> = {},
       int append_store_len = -1,
       int append_store_begin = 0,
       TensorK_cache2D const& K_cache_2D = TensorK_cache2D{},
@@ -738,15 +740,35 @@ struct FMHAFwdMainloop<
 
         if constexpr (CausalMask) {
           if (need_causal) {
-            Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
-            Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
-            auto cS_thread = thr_mma_qk.partition_C(gP);
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < tSrS.size(); ++i) {
-              int row_idx = get<0>(cS_thread(i));
-              int col_idx = get<1>(cS_thread(i));
-              if (row_idx < col_idx - full_tile_offset) {
-                tSrS(i) = ElementS(-INFINITY);
+            if constexpr (PackedGQA) {
+              Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
+              Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
+              auto cS_thread = thr_mma_qk.partition_C(gP);
+              CUTLASS_PRAGMA_UNROLL
+              for (int i = 0; i < tSrS.size(); ++i) {
+                int col_idx = get<1>(cS_thread(i));
+                if (full_tile_offset < col_idx) {
+                  tSrS(i) = ElementS(-INFINITY);
+                }
+              }
+            } else {
+              int lane_id = thr_id % intel::sg_size;
+              constexpr int sg_tile_q = get<0>(TileShapeQK{}) / SGPerWG::value;
+              int row_base = get<0>(blk_qv) * get<0>(TileShapeQK{}) + (thr_id / intel::sg_size) * sg_tile_q;
+              constexpr int kTileK = get<1>(TileShapeQK{});
+              constexpr int n_reps = kTileK / intel::sg_size;
+              constexpr int elems_per_n = cute::size_v<typename decltype(tSrS)::layout_type> / n_reps;
+              int k_base = K * kTileK;
+              CUTLASS_PRAGMA_UNROLL
+              for (int n = 0; n < n_reps; n++) {
+                int col = k_base + n * intel::sg_size + lane_id;
+                int causal_bound = col - full_tile_offset - row_base;
+                CUTLASS_PRAGMA_UNROLL
+                for (int j = 0; j < elems_per_n; j++) {
+                  if (j < causal_bound) {
+                    tSrS(n * elems_per_n + j) = ElementS(-INFINITY);
+                  }
+                }
               }
             }
           }
@@ -760,7 +782,7 @@ struct FMHAFwdMainloop<
           for (int i = 0; i < tSrS.size(); ++i) {
             int row_idx = get<0>(cS_thread(i));
             int col_idx = get<1>(cS_thread(i));
-            int row_kv_idx = (PackGQA_ ? 0 : row_idx) + full_tile_offset;
+            int row_kv_idx = (PackedGQA ? 0 : row_idx) + full_tile_offset;
             bool left_mask = col_idx < row_kv_idx - params.window_size_left;
             bool right_mask = col_idx > row_kv_idx + params.window_size_right;
             if (left_mask || right_mask) {

@@ -31,6 +31,8 @@
 
 #pragma once
 
+#include <type_traits>
+
 #include "cute/util/type_traits.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
@@ -48,6 +50,7 @@ using namespace cute;
 ///////////////////////////////////////////////////////////////////////////////
 template <bool IsVarLen_ = false>
 struct FMHAProblemShape {
+  static constexpr bool is_var_len = IsVarLen_;
   using SeqLenType = cute::conditional_t<IsVarLen_, cutlass::fmha::collective::VariableLength, int>;
   int batch;
   int num_heads_q, num_heads_kv;
@@ -71,7 +74,10 @@ template <
     // decode step. Only enabled by the decode runner for the plain attention
     // case (no causal/local mask, no sink); prefill keeps the default (false)
     // and is therefore unaffected.
-    bool PackGQA_ = false>
+    bool PackGQA_ = false,
+    // Mixed varlen prefill keeps normal token-M tiles for q_len > 1, but packs
+    // the GQA heads of q_len == 1 rows into M and grids those rows over KV heads.
+    bool PackGQADecode_ = false>
 class XeFMHAFwdKernel {
  public:
   //
@@ -232,6 +238,15 @@ class XeFMHAFwdKernel {
       int seq_len_k_cache;
       if constexpr (CollectiveMainloop::PagedKV) {
         seq_len_k_cache = problem_shape.seq_len_kv_cache.cumulative_length[batch];
+        if constexpr (!CollectiveMainloop::AppendKV) {
+          auto const* cache_seqlens_delta = problem_shape.seq_len_kv.cumulative_length;
+          if (cache_seqlens_delta != nullptr) {
+            seq_len_k_cache +=
+                cache_seqlens_delta == problem_shape.seq_len_qo.cumulative_length
+                ? seq_len_q
+                : cache_seqlens_delta[batch + 1] - cache_seqlens_delta[batch];
+          }
+        }
       } else {
         seq_len_k_cache = problem_shape.seq_len_kv_cache.cumulative_length[batch + 1] -
                           problem_shape.seq_len_kv_cache.cumulative_length[batch];
@@ -286,15 +301,19 @@ class XeFMHAFwdKernel {
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
       auto [blk_q, blk_v, head_q, idx_b, unused] = tile_scheduler.get_block_coord();  // (Q,V,h,b)
+      int const batch_idx = idx_b;
       // Mix-batch dispatch: skip batches not owned by this kernel launch.
       if (p.skip_batch_mask != nullptr && p.skip_batch_mask[idx_b]) continue;
       auto blk_qv = make_coord(blk_q, blk_v);
-      // PackGQA: the scheduler grids over KV heads, so head_q already is the KV
-      // head index and the head_group_q query heads are folded into the M tile.
-      int head = PackGQA_ ? head_q : head_q / head_group_q;
-
       auto sequence_length_shape = get_sequence_length_shape(s, idx_b);
       auto [seq_len_qo, seq_len_kv, seq_len_kv_cache] = sequence_length_shape;
+      bool const packed_gqa = PackGQA_ || (PackGQADecode_ && seq_len_qo == 1);
+      // Mixed PackGQA uses a query-head grid for prefill rows. Decode rows need
+      // only the first num_heads_kv coordinates, one packed tile per KV head.
+      if constexpr (PackGQADecode_) {
+        if (packed_gqa && head_q >= s.num_heads_kv) continue;
+      }
+      int head = packed_gqa ? head_q : head_q / head_group_q;
       int seq_k_eff = seq_len_kv_cache;
       if constexpr (CollectiveMainloop::AppendKV) {
         int const seq_k_new = get_k_new_len(params.mainloop, idx_b);
@@ -305,7 +324,7 @@ class XeFMHAFwdKernel {
       // M extent of the Q/O tile: the packed GQA group for decode, otherwise the
       // query sequence length. Masking below still uses the real seq_len_qo so
       // the decode KV position (seq_len_kv_cache - seq_len_qo) stays correct.
-      const int m_extent = PackGQA_ ? head_group_q : seq_len_qo;
+      const int m_extent = packed_gqa ? head_group_q : seq_len_qo;
       if (blk_q * get<0>(TileShapeQK{}) >= m_extent) continue;
       // auto offset = cute::min(seq_len_qo, seq_len_kv);
       // auto discard_seq_coord = seq_len_qo - offset;
@@ -353,15 +372,17 @@ class XeFMHAFwdKernel {
               }
             }
           }
-          if constexpr (CollectiveMainloop::CausalMask && !PackGQA_) {
-            // Without a grid-wide barrier, each WG must write every appended
-            // token it may read; causal tiles only need the visible prefix.
-            int const cache_len_old = params.mainloop.append.ptr_cache_seqlens[idx_b];
-            int const tile_q = get<0>(TileShapeQK{});
-            int const q_tile_end = cute::min(seq_len_qo, (blk_q + 1) * tile_q);
-            int const visible_k_end = cute::min(seq_k_eff, full_tile_offset + q_tile_end);
-            append_store_len = cute::max(0, visible_k_end - cache_len_old);
-            append_store_len = cute::min(append_store_len, seq_k_new);
+          if constexpr (CollectiveMainloop::CausalMask) {
+            if (!packed_gqa) {
+              // Without a grid-wide barrier, each WG must write every appended
+              // token it may read; causal tiles only need the visible prefix.
+              int const cache_len_old = params.mainloop.append.ptr_cache_seqlens[idx_b];
+              int const tile_q = get<0>(TileShapeQK{});
+              int const q_tile_end = cute::min(seq_len_qo, (blk_q + 1) * tile_q);
+              int const visible_k_end = cute::min(seq_k_eff, full_tile_offset + q_tile_end);
+              append_store_len = cute::max(0, visible_k_end - cache_len_old);
+              append_store_len = cute::min(append_store_len, seq_k_new);
+            }
           }
         }
       }
@@ -379,8 +400,8 @@ class XeFMHAFwdKernel {
         // PackGQA decode folds query heads (not sequence positions) into the M
         // tile, so every row is the single decode token at KV position
         // full_tile_offset; the sliding-window band is independent of blk_q.
-        const int q_tile_min_row_kv = PackGQA_ ? full_tile_offset : (blk_q * tile_q + full_tile_offset);
-        const int q_tile_max_row_kv = PackGQA_ ? full_tile_offset : (q_tile_min_row_kv + tile_q - 1);
+        const int q_tile_min_row_kv = packed_gqa ? full_tile_offset : (blk_q * tile_q + full_tile_offset);
+        const int q_tile_max_row_kv = packed_gqa ? full_tile_offset : (q_tile_min_row_kv + tile_q - 1);
         const int lo_kv = cute::max(0, q_tile_min_row_kv - params.mainloop.window_size_left);
         const int hi_kv_plus_one = q_tile_max_row_kv + params.mainloop.window_size_right + 1;
         blk_k0 = lo_kv / tile_k;
@@ -421,7 +442,7 @@ class XeFMHAFwdKernel {
       }
       // PackGQA folds the head_group_q query heads into M and grids over KV
       // heads, so the Q/O head extent collapses to num_heads_kv.
-      auto q_head_count = PackGQA_ ? s.num_heads_kv : s.num_heads_q;
+      auto q_head_count = packed_gqa ? s.num_heads_kv : s.num_heads_q;
       auto shape_Q = make_shape(m_extent, s.head_size_qk, q_head_count, batch_dim);
       auto shape_K = make_shape(kv_input_extent, s.head_size_qk, s.num_heads_kv, batch_dim);
       auto shape_V = make_shape(s.head_size_vo, kv_input_extent, s.num_heads_kv, batch_dim);
@@ -435,8 +456,6 @@ class XeFMHAFwdKernel {
       auto dcK_cache = const_cast<ElementK*>(p.K_cache + offset_k_cache);
       auto dcV_cache = const_cast<ElementV*>(p.V_cache + offset_v_cache);
       auto dcO = const_cast<ElementO*>(p.O + offset_o);
-      // NHD layout for GQA
-      auto layout_q = is_var_len ? make_ordered_layout(shape_Q, VarLenQLayoutStep_{}) : make_layout(shape_Q, p.dQ);
       auto layout_k = is_var_len ? make_ordered_layout(shape_K, VarLenKLayoutStep_{}) : make_layout(shape_K, p.dK);
       auto layout_v = is_var_len ? make_ordered_layout(shape_V, VarLenVLayoutStep_{}) : make_layout(shape_V, p.dV);
       auto layout_k_cache = is_var_len ? make_ordered_layout(shape_K_cache, VarLenKLayoutStep_{})
@@ -444,79 +463,91 @@ class XeFMHAFwdKernel {
       auto layout_v_cache = is_var_len ? make_ordered_layout(shape_V_cache, VarLenVLayoutStep_{})
                                        : make_layout(shape_V_cache, p.dV_cache);
 
-      // NHD layout for GQA
-      auto layout_o = is_var_len ? make_ordered_layout(shape_O, VarLenOLayoutStep_{}) : make_layout(shape_O, p.dO);
-
-      Tensor Q = make_tensor(make_gmem_ptr(dcQ), layout_q);
       Tensor K = make_tensor(make_gmem_ptr(dcK), layout_k);
       Tensor V = make_tensor(make_gmem_ptr(dcV), layout_v);
       Tensor K_cache = make_tensor(make_gmem_ptr(dcK_cache), layout_k_cache);
       Tensor V_cache = make_tensor(make_gmem_ptr(dcV_cache), layout_v_cache);
-      Tensor O = make_tensor(make_gmem_ptr(dcO), layout_o);
-      // O accumulator types
-      FragA tArA;
-      FragARow tA_max, tA_sum;
 
-      // Main loop
       int l_coord = is_var_len ? 0 : idx_b;
       // With PackGQA the Q/O head dimension is indexed by the KV head; otherwise
       // by the (un-grouped) query head.
-      int q_head_idx = PackGQA_ ? head : head_q;
-      // FP8 KV: the per-tensor dequant scale baked into KernelArguments is
-      // passed as a float function argument (scale_k) to the mainloop GEMM1.
-      // It defaults to 1.0f for non-fp8 KV; the fp8 dequant scalar is read
-      // on-device from scale_k_ptr (avoids a host-side .item() D2H sync) only
-      // in the fp8 instantiation, so non-fp8 kernels compile the read out.
-      float scale_k = 1.0f;
-      if constexpr (CollectiveMainloop::Fp8KV) {
-        scale_k = *p.scale_k_ptr;
-      }
-      CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
-      mainloop(
-          Q(_, _, q_head_idx, l_coord),
-          K(_, _, head, l_coord),
-          V(_, _, head, l_coord),
-          tArA,
-          tA_max,
-          tA_sum,
-          blk_qv,
-          blk_k0,
-          blk_k1,
-          k_blocks,
-          k_blocks_causal,
-          thr_id,
-          seq_len,
-          seq_k_eff,
-          idx_b,
-          head,
-          s.num_heads_kv,
-          full_tile_offset,
-          discard_seq_coord,
-          append_store_len,
-          append_store_begin,
-          K_cache(_, _, head, l_coord),
-          V_cache(_, _, head, l_coord),
-          scale_k);
+      int q_head_idx = packed_gqa ? head : head_q;
+      auto run_attention = [&](auto packed_gqa_tag, auto const& Q, auto const& O) {
+        constexpr bool kPackedGQA = decltype(packed_gqa_tag)::value;
+        FragA tArA;
+        FragARow tA_max, tA_sum;
 
-      if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
-        sycl::group_barrier(get_work_group<3>());
-      }
+        // FP8 KV: the per-tensor dequant scale baked into KernelArguments is
+        // passed as a float function argument (scale_k) to the mainloop GEMM1.
+        float scale_k = 1.0f;
+        if constexpr (CollectiveMainloop::Fp8KV) {
+          scale_k = *p.scale_k_ptr;
+        }
+        CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
+        mainloop(
+            Q(_, _, q_head_idx, l_coord),
+            K(_, _, head, l_coord),
+            V(_, _, head, l_coord),
+            tArA,
+            tA_max,
+            tA_sum,
+            blk_qv,
+            blk_k0,
+            blk_k1,
+            k_blocks,
+            k_blocks_causal,
+            thr_id,
+            seq_len,
+            seq_k_eff,
+            batch_idx,
+            head,
+            s.num_heads_kv,
+            full_tile_offset,
+            discard_seq_coord,
+            std::bool_constant<kPackedGQA>{},
+            append_store_len,
+            append_store_begin,
+            K_cache(_, _, head, l_coord),
+            V_cache(_, _, head, l_coord),
+            scale_k);
 
-      // Epilogue
-      CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
-      // FP8 KV: the per-tensor V dequant scale is applied once in the epilogue
-      // (folded into the softmax normalization) instead of per V element in the
-      // mainloop GEMM2. It defaults to 1.0f for non-fp8 KV; the fp8 dequant
-      // scalar is read on-device from scale_v_ptr only in the fp8 instantiation.
-      float scale_v = 1.0f;
-      if constexpr (CollectiveMainloop::Fp8KV) {
-        scale_v = *p.scale_v_ptr;
-      }
-      if constexpr (Sink) {
-        if constexpr (PackGQA_) {
-          // Packed decode: pass the per-row sink base for this KV head's group
-          // (heads head*head_group_q .. +head_group_q-1), applied per row in the
-          // epilogue.
+        if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
+          sycl::group_barrier(get_work_group<3>());
+        }
+
+        CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
+        float scale_v = 1.0f;
+        if constexpr (CollectiveMainloop::Fp8KV) {
+          scale_v = *p.scale_v_ptr;
+        }
+        if constexpr (Sink) {
+          if constexpr (PackGQA_ || PackGQADecode_) {
+            // Packed decode uses one sink per folded query head. Prefill rows
+            // use the scalar sink for their query-head coordinate.
+            epilogue(
+                O(_, _, q_head_idx, l_coord),
+                tArA,
+                tA_max,
+                tA_sum,
+                blk_qv,
+                thr_id,
+                scale_v,
+                p.sm_sink[q_head_idx],
+                p.sm_sink + head * head_group_q,
+                head_group_q,
+                kPackedGQA);
+          } else {
+            epilogue(
+                O(_, _, q_head_idx, l_coord),
+                tArA,
+                tA_max,
+                tA_sum,
+                blk_qv,
+                thr_id,
+                scale_v,
+                p.sm_sink[q_head_idx]);
+          }
+        } else {
           epilogue(
               O(_, _, q_head_idx, l_coord),
               tArA,
@@ -526,13 +557,35 @@ class XeFMHAFwdKernel {
               thr_id,
               scale_v,
               ElementSink{},
-              p.sm_sink + head * head_group_q,
-              head_group_q);
+              nullptr,
+              0,
+              kPackedGQA);
+        }
+      };
+
+      if constexpr (PackGQADecode_) {
+        if (packed_gqa) {
+          // q_len == 1: rows are the query heads within one KV-head group.
+          // Keep this order compile-time visible so block-2D Q/O operations
+          // retain valid static message constraints.
+          auto layout_q = make_ordered_layout(shape_Q, Step<_1, _0, _2, _3>{});
+          auto layout_o = make_ordered_layout(shape_O, Step<_1, _0, _2, _3>{});
+          Tensor Q = make_tensor(make_gmem_ptr(dcQ), layout_q);
+          Tensor O = make_tensor(make_gmem_ptr(dcO), layout_o);
+          run_attention(std::true_type{}, Q, O);
         } else {
-          epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, scale_v, p.sm_sink[q_head_idx]);
+          auto layout_q = make_ordered_layout(shape_Q, VarLenQLayoutStep_{});
+          auto layout_o = make_ordered_layout(shape_O, VarLenOLayoutStep_{});
+          Tensor Q = make_tensor(make_gmem_ptr(dcQ), layout_q);
+          Tensor O = make_tensor(make_gmem_ptr(dcO), layout_o);
+          run_attention(std::false_type{}, Q, O);
         }
       } else {
-        epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, scale_v);
+        auto layout_q = is_var_len ? make_ordered_layout(shape_Q, VarLenQLayoutStep_{}) : make_layout(shape_Q, p.dQ);
+        auto layout_o = is_var_len ? make_ordered_layout(shape_O, VarLenOLayoutStep_{}) : make_layout(shape_O, p.dO);
+        Tensor Q = make_tensor(make_gmem_ptr(dcQ), layout_q);
+        Tensor O = make_tensor(make_gmem_ptr(dcO), layout_o);
+        run_attention(std::bool_constant<PackGQA_>{}, Q, O);
       }
     }
   }

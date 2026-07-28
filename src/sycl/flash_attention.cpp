@@ -35,10 +35,150 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include "Utils.h"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_prefill_dispatch.hpp"
 
 namespace {
+
+template <typename scalar_t>
+struct StorePagedAppendKVKernel {
+  void operator()(sycl::nd_item<1> item) const {
+    int const lane = item.get_local_id(0);
+    int const group_size = item.get_local_range(0);
+    int const token_begin = item.get_group(0) * kTokensPerGroup;
+    int const token_end = sycl::min(token_begin + kTokensPerGroup, total_k_new);
+
+    for (int token = token_begin; token < token_end; ++token) {
+      int physical_page = 0;
+      int page_offset = 0;
+      if (lane == 0) {
+        int batch_begin = 0;
+        int batch_end = batch_size;
+        while (batch_begin + 1 < batch_end) {
+          int const batch_mid = (batch_begin + batch_end) / 2;
+          if (token < cu_seqlens_k_new[batch_mid]) {
+            batch_end = batch_mid;
+          } else {
+            batch_begin = batch_mid;
+          }
+        }
+        int const batch = batch_begin;
+        int const token_in_batch = token - cu_seqlens_k_new[batch];
+        int const cache_pos = cache_seqlens_old[batch] + token_in_batch;
+        int const logical_page = cache_pos / page_size;
+        page_offset = cache_pos - logical_page * page_size;
+        physical_page = page_table[batch * page_table_batch_stride + logical_page];
+      }
+      physical_page = sycl::group_broadcast(item.get_group(), physical_page, 0);
+      page_offset = sycl::group_broadcast(item.get_group(), page_offset, 0);
+      using pack_t = sycl::vec<uint32_t, 4>;
+      constexpr int kVecWidth = sizeof(pack_t) / sizeof(scalar_t);
+      auto* k_src = reinterpret_cast<uint32_t*>(const_cast<scalar_t*>(k_new + token * k_new_row_stride));
+      auto* v_src = reinterpret_cast<uint32_t*>(const_cast<scalar_t*>(v_new + token * v_new_row_stride));
+      auto* k_dst = reinterpret_cast<uint32_t*>(
+          k_cache + physical_page * k_cache_page_stride + page_offset * k_cache_row_stride);
+      auto* v_dst = reinterpret_cast<uint32_t*>(
+          v_cache + physical_page * v_cache_page_stride + page_offset * v_cache_row_stride);
+
+      int const k_pack_count = num_heads_kv * head_size / kVecWidth;
+      int const v_pack_count = num_heads_kv * head_size_v / kVecWidth;
+      int const common_pack_count = sycl::min(k_pack_count, v_pack_count);
+      for (int i = lane; i < common_pack_count; i += group_size) {
+        pack_t k_value;
+        pack_t v_value;
+        k_value.load(i, k_src);
+        v_value.load(i, v_src);
+        k_value.store(i, k_dst);
+        v_value.store(i, v_dst);
+      }
+      for (int i = common_pack_count + lane; i < k_pack_count; i += group_size) {
+        pack_t value;
+        value.load(i, k_src);
+        value.store(i, k_dst);
+      }
+      for (int i = common_pack_count + lane; i < v_pack_count; i += group_size) {
+        pack_t value;
+        value.load(i, v_src);
+        value.store(i, v_dst);
+      }
+    }
+  }
+
+  static constexpr int kTokensPerGroup = 1;
+  scalar_t const* k_new;
+  scalar_t const* v_new;
+  scalar_t* k_cache;
+  scalar_t* v_cache;
+  int const* cu_seqlens_k_new;
+  int const* cache_seqlens_old;
+  int const* page_table;
+  int batch_size;
+  int total_k_new;
+  int page_size;
+  int page_table_batch_stride;
+  int num_heads_kv;
+  int head_size;
+  int head_size_v;
+  int64_t k_new_row_stride;
+  int64_t v_new_row_stride;
+  int64_t k_cache_page_stride;
+  int64_t k_cache_row_stride;
+  int64_t v_cache_page_stride;
+  int64_t v_cache_row_stride;
+};
+
+void store_paged_append_kv(
+    const at::Tensor& k_new,
+    const at::Tensor& v_new,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& cu_seqlens_k_new,
+    const at::Tensor& cache_seqlens_old,
+    const at::Tensor& page_table) {
+  int const total_k_new = k_new.size(0);
+  if (total_k_new == 0) {
+    return;
+  }
+  int const batch_size = cu_seqlens_k_new.size(0) - 1;
+  int const row_dim = k_cache.size(2) * std::max(k_cache.size(3), v_cache.size(3));
+  int const group_size =
+      std::min<int>(std::min<int>(row_dim, 512), dpcppMaxWorkGroupSize(dpcppGetDeviceIdOfCurrentQueue()));
+  SYCL_DISPATCH_FLOATING_TYPES(
+      at::ScalarType::Half, at::ScalarType::BFloat16, k_new.scalar_type(), "store_paged_append_kv", [&]() {
+        StorePagedAppendKVKernel<scalar_t> kernel{
+            .k_new = k_new.data_ptr<scalar_t>(),
+            .v_new = v_new.data_ptr<scalar_t>(),
+            .k_cache = const_cast<scalar_t*>(k_cache.data_ptr<scalar_t>()),
+            .v_cache = const_cast<scalar_t*>(v_cache.data_ptr<scalar_t>()),
+            .cu_seqlens_k_new = cu_seqlens_k_new.data_ptr<int>(),
+            .cache_seqlens_old = cache_seqlens_old.data_ptr<int>(),
+            .page_table = page_table.data_ptr<int>(),
+            .batch_size = batch_size,
+            .total_k_new = total_k_new,
+            .page_size = static_cast<int>(k_cache.size(1)),
+            .page_table_batch_stride = static_cast<int>(page_table.stride(0)),
+            .num_heads_kv = static_cast<int>(k_cache.size(2)),
+            .head_size = static_cast<int>(k_cache.size(3)),
+            .head_size_v = static_cast<int>(v_cache.size(3)),
+            .k_new_row_stride = k_new.stride(0),
+            .v_new_row_stride = v_new.stride(0),
+            .k_cache_page_stride = k_cache.stride(0),
+            .k_cache_row_stride = k_cache.stride(1),
+            .v_cache_page_stride = v_cache.stride(0),
+            .v_cache_row_stride = v_cache.stride(1)};
+        dpcppGetCurrentQueue().submit([&](sycl::handler& cgh) {
+          cgh.parallel_for(
+              sycl::nd_range<1>(
+                  sycl::range<1>(
+                      static_cast<size_t>((total_k_new + StorePagedAppendKVKernel<scalar_t>::kTokensPerGroup - 1) /
+                                          StorePagedAppendKVKernel<scalar_t>::kTokensPerGroup) *
+                      group_size),
+                  sycl::range<1>(group_size)),
+              kernel);
+        });
+      });
+}
 
 const float*
 get_per_tensor_descale_ptr(const at::Tensor& descale, const at::Tensor& ref, const char* name, const char* context) {
@@ -305,7 +445,9 @@ std::vector<at::Tensor> mha_fwd(
     // chunkprefill two-launch path: pre-allocated shared output, and a per-batch
     // bool mask (length = batch) whose true entries are skipped by the kernel.
     std::optional<at::Tensor> out_opt = std::nullopt,
-    std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt) {
+    std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt,
+    std::optional<at::Tensor> softmax_lse_opt = std::nullopt,
+    std::optional<const at::Tensor> cache_seqlens_delta_opt = std::nullopt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
       q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
@@ -482,8 +624,8 @@ std::vector<at::Tensor> mha_fwd(
   // Cast to char to avoid compiler warning about narrowing
   c10::DeviceGuard device_guard(q.device());
 
-  at::Tensor softmax_lse;
-  softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
+  at::Tensor softmax_lse =
+      softmax_lse_opt.has_value() ? *softmax_lse_opt : torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
 
   // align with FA3
 
@@ -526,6 +668,13 @@ std::vector<at::Tensor> mha_fwd(
   params.cu_seqlens_knew = nullptr;
   params.seqlen_knew = 0;
   params.total_knew = 0;
+  if (cache_seqlens_delta_opt.has_value()) {
+    auto const& cache_seqlens_delta = *cache_seqlens_delta_opt;
+    CHECK_INPUT(cache_seqlens_delta);
+    TORCH_CHECK(cache_seqlens_delta.dtype() == torch::kInt32, "cache_seqlens_delta must have dtype torch.int32");
+    CHECK_SHAPE(cache_seqlens_delta, batch_size + 1);
+    params.cu_seqlens_knew = cache_seqlens_delta.data_ptr<int>();
+  }
   params.num_kv_splits = num_kv_splits;
 
   // Softmax sum
@@ -907,7 +1056,9 @@ std::vector<at::Tensor> mha_fwd_appendkv(
     std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt,
     std::optional<const at::Tensor> k_new_ = std::nullopt,
     std::optional<const at::Tensor> v_new_ = std::nullopt,
-    std::optional<const at::Tensor> cu_seqlens_k_new_ = std::nullopt) {
+    std::optional<const at::Tensor> cu_seqlens_k_new_ = std::nullopt,
+    std::optional<at::Tensor> softmax_lse_opt = std::nullopt,
+    std::optional<const at::Tensor> cache_seqlens_delta_opt = std::nullopt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
       q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
@@ -1030,8 +1181,8 @@ std::vector<at::Tensor> mha_fwd_appendkv(
   // Cast to char to avoid compiler warning about narrowing
   c10::DeviceGuard device_guard(q.device());
 
-  at::Tensor softmax_lse;
-  softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
+  at::Tensor softmax_lse =
+      softmax_lse_opt.has_value() ? *softmax_lse_opt : torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
 
   // align with FA3
   Arguments params;
@@ -1168,6 +1319,14 @@ std::vector<at::Tensor> mha_fwd_appendkv(
     params.seqlen_knew = seqlen_knew;
     params.total_knew = total_knew;
   }
+  if (cache_seqlens_delta_opt.has_value()) {
+    TORCH_CHECK(!has_new_kv, "cache_seqlens_delta cannot be combined with fused AppendKV");
+    auto const& cache_seqlens_delta = *cache_seqlens_delta_opt;
+    CHECK_INPUT(cache_seqlens_delta);
+    TORCH_CHECK(cache_seqlens_delta.dtype() == torch::kInt32, "cache_seqlens_delta must have dtype torch.int32");
+    CHECK_SHAPE(cache_seqlens_delta, batch_size + 1);
+    params.cu_seqlens_knew = cache_seqlens_delta.data_ptr<int>();
+  }
 
   if (q_v_.has_value()) {
     TORCH_CHECK(head_size <= 64, "q_v is only supported for head_size <= 64");
@@ -1291,7 +1450,9 @@ std::vector<at::Tensor> mha_fwd(
     std::optional<bool> pack_gqa_,
     int const sm_margin,
     std::optional<at::Tensor> out_opt = std::nullopt,
-    std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt) {
+    std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt,
+    std::optional<at::Tensor> softmax_lse_opt = std::nullopt,
+    std::optional<const at::Tensor> cache_seqlens_delta_opt = std::nullopt) {
   return mha_fwd_appendkv(
       q,
       k,
@@ -1325,7 +1486,9 @@ std::vector<at::Tensor> mha_fwd(
       std::move(skip_batch_mask_opt),
       std::nullopt,
       std::nullopt,
-      std::nullopt);
+      std::nullopt,
+      std::move(softmax_lse_opt),
+      std::move(cache_seqlens_delta_opt));
 }
 
 }  // namespace prefill
@@ -1370,7 +1533,8 @@ std::vector<at::Tensor> mha_fwd(
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin,
-    std::optional<at::Tensor> out_ = std::nullopt) {
+    std::optional<at::Tensor> out_ = std::nullopt,
+    std::optional<const at::Tensor> cache_seqlens_delta_opt = std::nullopt) {
   // Supports both paged (page_table != None) and non-paged (contiguous ragged
   // KV, page_table == None) layouts.
   // ``seqlens_rotary_`` is intentionally not checked here: callers pass it
@@ -1393,9 +1557,8 @@ std::vector<at::Tensor> mha_fwd(
 
   auto seqlens_q = cu_seqlens_q.slice(0, 1, batch_size + 1).sub(cu_seqlens_q.slice(0, 0, batch_size));
   auto is_prefill = seqlens_q.gt(1).contiguous();  // true for prefill batches
-
   // Forward every shared argument to a sub-kernel, overriding only the output
-  // tensor (out_opt) and the per-batch skip mask.
+  // tensor and the per-batch skip mask.
   auto launch = [&](auto&& fn, std::optional<at::Tensor> out_opt, std::optional<at::Tensor> skip_mask) {
     return fn(
         q,
@@ -1427,7 +1590,9 @@ std::vector<at::Tensor> mha_fwd(
         pack_gqa_,
         sm_margin,
         std::move(out_opt),
-        std::move(skip_mask));
+        std::move(skip_mask),
+        std::nullopt,
+        cache_seqlens_delta_opt);
   };
 
   // Launch 1: decode allocates the shared output (or reuses the caller-provided
@@ -1533,7 +1698,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
 
   if (max_seqlen_q == 1) {
     // Pure decode path
-    return dispatch(decode::mha_fwd, std::nullopt);
+    return dispatch(decode::mha_fwd, std::nullopt, std::nullopt, std::nullopt);
   } else if (!page_table.has_value() || batch_size == 1) {
     // Pure prefill path
     // Non-paged attn: assumption of all seqlen_q > 1;
@@ -1541,11 +1706,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     // is_prefill.all() — a device reduction + D2H sync that costs more than it saves.
     // But batch_size == 1 makes it provable from host scalars:
     // a single sequence with max_seqlen_q > 1 is prefill
-    return dispatch(prefill::mha_fwd, std::nullopt);
+    return dispatch(prefill::mha_fwd, std::nullopt, std::nullopt, std::nullopt);
   } else {
-    // Prefill path
+    // Chunk prefill path
     // Paged attn with max_seqlen_q > 1 and batch_size > 1
-    return dispatch(prefill::mha_fwd, std::nullopt);
+    return dispatch(chunkprefill::mha_fwd, std::nullopt);
   }
 }
 
@@ -1594,6 +1759,118 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd_appendkv(
     TORCH_CHECK(out_val.stride(-1) == 1, "out must have a contiguous last dimension");
   }
   auto to_tuple = [](std::vector<at::Tensor> v) { return std::make_tuple(v[0], v[1], v[2], v[3]); };
+  int64_t const batch_size = cu_seqlens_q.size(0) - 1;
+  bool const use_split_mixed_append =
+      page_table.has_value() && batch_size > 1 && max_seqlen_q > 1 && num_kv_splits == 1 &&
+      q.size(0) != batch_size * max_seqlen_q && q.size(-1) % 8 == 0 && q.size(-2) > k.size(-2) &&
+      (q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16) && k.scalar_type() == q.scalar_type() &&
+      v.scalar_type() == q.scalar_type() && !q_v_.has_value() && !kv_batch_idx_.has_value() &&
+      !leftpad_k_.has_value() && !rotary_cos_.has_value() && !rotary_sin_.has_value() &&
+      !q_descale_.has_value() && !k_descale_.has_value() && !v_descale_.has_value() &&
+      !scheduler_metadata_.has_value() && k_new_.has_value() && v_new_.has_value() &&
+      cu_seqlens_k_new_.has_value() && k.is_contiguous() && v.is_contiguous() &&
+      k_new_->is_contiguous() && v_new_->is_contiguous() && v.size(-1) % 8 == 0 &&
+      cu_seqlens_k_new_->data_ptr() == cu_seqlens_q.data_ptr();
+  if (use_split_mixed_append) {
+    auto const& k_new = *k_new_;
+    auto const& v_new = *v_new_;
+    auto const& cu_seqlens_k_new = *cu_seqlens_k_new_;
+    auto const& page_table_value = *page_table;
+    TORCH_CHECK(k_new.dim() == 3 && v_new.dim() == 3, "split mixed AppendKV requires packed 3D k_new/v_new");
+    TORCH_CHECK(
+        k_new.size(0) == v_new.size(0) && k_new.size(1) == k.size(-2) && v_new.size(1) == v.size(-2) &&
+            k_new.size(2) == k.size(-1) && v_new.size(2) == v.size(-1),
+        "split mixed AppendKV k_new/v_new shapes must match the KV cache");
+    TORCH_CHECK(
+        k_new.scalar_type() == k.scalar_type() && v_new.scalar_type() == v.scalar_type(),
+        "split mixed AppendKV k_new/v_new dtypes must match the KV cache");
+    TORCH_CHECK(
+        k_new.stride(-1) == 1 && v_new.stride(-1) == 1,
+        "split mixed AppendKV k_new/v_new must have contiguous last dimensions");
+    TORCH_CHECK(
+        cu_seqlens_k.scalar_type() == at::kInt && cu_seqlens_k.size(0) == batch_size,
+        "split mixed AppendKV requires int32 cache lengths with one entry per batch");
+    TORCH_CHECK(
+        cu_seqlens_k_new.scalar_type() == at::kInt && cu_seqlens_k_new.size(0) == batch_size + 1,
+        "split mixed AppendKV requires int32 cu_seqlens_k_new with batch + 1 entries");
+    TORCH_CHECK(
+        page_table_value.scalar_type() == at::kInt && page_table_value.dim() == 2 &&
+            page_table_value.size(0) == batch_size && page_table_value.stride(1) == 1,
+        "split mixed AppendKV requires a contiguous int32 page table");
+
+    store_paged_append_kv(k_new, v_new, k, v, cu_seqlens_k_new, cu_seqlens_k, page_table_value);
+    bool const use_unified_hd64 =
+        q.size(-1) == 64 && window_size_left < 0 && window_size_right < 0 && !sinks_.has_value() &&
+        (batch_size == 2 ||
+         (max_seqlen_q <= 256 &&
+          q.size(0) * 100 <= batch_size * static_cast<int64_t>(max_seqlen_q) * 13));
+    if (use_unified_hd64) {
+      return to_tuple(prefill::mha_fwd(
+          q,
+          k,
+          v,
+          q_v_,
+          cu_seqlens_q,
+          cu_seqlens_k,
+          max_seqlen_q,
+          max_seqlen_k,
+          page_table,
+          kv_batch_idx_,
+          leftpad_k_,
+          rotary_cos_,
+          rotary_sin_,
+          seqlens_rotary_,
+          q_descale_,
+          k_descale_,
+          v_descale_,
+          softmax_scale_,
+          sinks_,
+          is_causal,
+          window_size_left,
+          window_size_right,
+          softcap,
+          is_rotary_interleaved,
+          scheduler_metadata_,
+          num_kv_splits,
+          pack_gqa_,
+          sm_margin,
+          out_,
+          std::nullopt,
+          std::nullopt,
+          cu_seqlens_k_new));
+    }
+    return to_tuple(chunkprefill::mha_fwd(
+        q,
+        k,
+        v,
+        q_v_,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        page_table,
+        kv_batch_idx_,
+        leftpad_k_,
+        rotary_cos_,
+        rotary_sin_,
+        seqlens_rotary_,
+        q_descale_,
+        k_descale_,
+        v_descale_,
+        softmax_scale_,
+        sinks_,
+        is_causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        is_rotary_interleaved,
+        scheduler_metadata_,
+        num_kv_splits,
+        pack_gqa_,
+        sm_margin,
+        out_,
+        cu_seqlens_k_new));
+  }
   return to_tuple(prefill::mha_fwd_appendkv(
       q,
       k,

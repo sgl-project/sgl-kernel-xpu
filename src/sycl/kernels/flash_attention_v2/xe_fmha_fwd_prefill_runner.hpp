@@ -376,7 +376,8 @@ template <
     typename GmemTiledCopyQ = void, /* void -> default block 2D */
     typename GmemTiledCopyK = void,
     typename GmemTiledCopyV = void,
-    typename GmemTiledCopyO = void>
+    typename GmemTiledCopyO = void,
+    bool PackGQADecode = false>
 struct FMHAConfig {
   static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
   using MMAOperation = cute::conditional_t<
@@ -398,7 +399,8 @@ struct FMHAConfig {
       bool AppendKV,
       class Scheduler,
       bool DirectAppendKV = false,
-      bool WideAppendKV = false>
+      bool WideAppendKV = false,
+      bool MixedPackGQA = PackGQADecode>
   static int run(const Arguments& params) {
     // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
     // information is used by the underlying kernel.
@@ -449,14 +451,14 @@ struct FMHAConfig {
         GmemTiledCopyK_cache,
         GmemTiledCopyV_cache,
         LocalMask,
-        false,
+        MixedPackGQA,
         AppendKV,
         DirectAppendKV,
         WideAppendKV>;
 
     // Epilogue
-    using CollectiveEpilogue =
-        cutlass::fmha::collective::FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, Sink>;
+    using CollectiveEpilogue = cutlass::fmha::collective::
+        FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, Sink, MixedPackGQA>;
 
     static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
     using FMHAPrefillKernel = conditional_t<
@@ -471,7 +473,9 @@ struct FMHAConfig {
             Step<_2, _0, _1, _3>,
             Step<_2, _0, _1, _3>,
             Step<_0, _2, _1, _3>,
-            Step<_2, _0, _1, _3>>>;
+            Step<_2, _0, _1, _3>,
+            false,
+            MixedPackGQA>>;
 
     PrefillRunner<FMHAPrefillKernel, isVarLen> kernel;
 
@@ -495,6 +499,42 @@ struct FMHAConfig {
       return run<true, true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
     }
     return run<true, true, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+  }
+
+  static int run_paged_mixed_pack_gqa_append(const Arguments& params) {
+    TORCH_CHECK(params.cu_seqlens_q != nullptr, "mixed PackGQA requires cu_seqlens_q");
+    TORCH_CHECK(params.cu_seqlens_k != nullptr, "mixed PackGQA requires per-batch cache lengths");
+    TORCH_CHECK(params.page_table != nullptr, "mixed PackGQA requires page_table");
+    TORCH_CHECK(params.page_size > 0 && params.max_num_pages_per_seq > 0, "mixed PackGQA requires paged KV");
+    TORCH_CHECK(params.total_q != params.b * params.seqlen_q, "mixed PackGQA requires ragged query lengths");
+    TORCH_CHECK(params.h > params.h_k && params.h % params.h_k == 0, "mixed PackGQA requires GQA");
+    bool const append_kv =
+        params.total_knew > 0 && params.knew_ptr != nullptr && params.vnew_ptr != nullptr &&
+        params.cache_seqlens_old != nullptr;
+    if (!append_kv) {
+      TORCH_CHECK(
+          params.total_knew == 0 && params.knew_ptr == nullptr && params.vnew_ptr == nullptr &&
+              params.cu_seqlens_knew != nullptr,
+          "mixed PackGQA without fused AppendKV requires cumulative cache-length deltas");
+      return run<
+          true,
+          true,
+          true,
+          false,
+          cutlass::fmha::kernel::XeFHMAIndividualTileScheduler,
+          false,
+          false,
+          true>(params);
+    }
+    return run<
+        true,
+        true,
+        true,
+        true,
+        cutlass::fmha::kernel::XeFHMAIndividualTileScheduler,
+        false,
+        false,
+        true>(params);
   }
 
   static int run_paged_direct_append(const Arguments& params) {

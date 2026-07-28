@@ -44,13 +44,41 @@ struct XeFHMAIndividualTileScheduler {
     FastDivmod divmod_num_heads;
     FastDivmod divmod_batch;
     int num_kv_splits_ = -1;
+    int const* cu_seqlens_q = nullptr;
+    int batch = 0;
+    int tile_q = 0;
+    bool compact_varlen = false;
   };
 
   bool valid_ = true;
   Params params;
+  int idx_b_ = 0;
+  int blk_q_ = 0;
 
   CUTLASS_DEVICE
-  XeFHMAIndividualTileScheduler(Params const& params) : params(params) {}
+  XeFHMAIndividualTileScheduler(Params const& params) : params(params) {
+    if (params.compact_varlen) {
+      auto subgroup = sycl::ext::oneapi::this_work_item::get_sub_group();
+      int mapped_batch = -1;
+      int mapped_q_tile = 0;
+      if (subgroup.get_local_linear_id() == 0) {
+        int tile_ordinal = BlockIdxY();
+        for (int batch = 0; batch < params.batch; ++batch) {
+          int const seq_len = params.cu_seqlens_q[batch + 1] - params.cu_seqlens_q[batch];
+          int const num_tiles = cute::ceil_div(seq_len, params.tile_q);
+          if (tile_ordinal < num_tiles) {
+            mapped_batch = batch;
+            mapped_q_tile = tile_ordinal;
+            break;
+          }
+          tile_ordinal -= num_tiles;
+        }
+      }
+      idx_b_ = sycl::group_broadcast(subgroup, mapped_batch, 0);
+      blk_q_ = sycl::group_broadcast(subgroup, mapped_q_tile, 0);
+      valid_ = idx_b_ >= 0;
+    }
+  }
 
   template <class ProblemShape, class TileShape>
   static Params to_underlying_arguments(
@@ -71,7 +99,28 @@ struct XeFHMAIndividualTileScheduler {
       grid.z *= num_kv_splits;
       num_head = shape.num_heads_kv;
     }
-    return Params{grid, {num_head}, {shape.batch * num_head}, num_kv_splits};
+    Params params{grid, {num_head}, {shape.batch * num_head}, num_kv_splits};
+    if constexpr (ProblemShape::is_var_len) {
+      bool const is_ragged =
+          shape.seq_len_qo.cumulative_length != nullptr &&
+          shape.seq_len_qo.total_length != shape.batch * shape.seq_len_qo.max_length;
+      bool const is_sparse_ragged =
+          is_ragged &&
+          static_cast<int64_t>(shape.seq_len_qo.total_length) * 5 <=
+              static_cast<int64_t>(shape.batch) * shape.seq_len_qo.max_length;
+      if (num_kv_splits < 1 && is_sparse_ragged) {
+        int const tile_q = get<0>(tile_shape);
+        // sum(ceil(q_i / tile_q)) <= ceil(total_q / tile_q) + batch - 1.
+        grid.y = ceil_div(shape.seq_len_qo.total_length, tile_q) + shape.batch - 1;
+        grid.z = shape.num_heads_q;
+        params.grid = grid;
+        params.cu_seqlens_q = shape.seq_len_qo.cumulative_length;
+        params.batch = shape.batch;
+        params.tile_q = tile_q;
+        params.compact_varlen = true;
+      }
+    }
+    return params;
   }
 
   template <int Num_SGs>
@@ -87,6 +136,10 @@ struct XeFHMAIndividualTileScheduler {
   CUTLASS_DEVICE
   auto get_block_coord() {
     using namespace cute;
+    if (params.compact_varlen) {
+      return make_coord(unsigned(blk_q_), BlockIdxX(), int(BlockIdxZ()), idx_b_, (int)-1);
+    }
+
     int idx_kv_split = BlockIdxZ();
     int head, idx_b;
 

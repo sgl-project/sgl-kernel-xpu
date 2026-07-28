@@ -48,6 +48,16 @@ void run_paged_tile(const Arguments& params) {
   });
 }
 
+#if @HEAD_DIM@ == 64
+template <typename TileShapeQK, typename TileShapePV, typename TileShapeOutput, typename SubgroupLayoutQK>
+void run_paged_mixed_pack_gqa_tile(const Arguments& params) {
+  AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+    FMHAConfig<Causal, false, false, TileShapeQK, TileShapePV, TileShapeOutput,
+               SubgroupLayoutQK>::run_paged_mixed_pack_gqa_append(params);
+  });
+}
+#endif
+
 }  // namespace
 
 template <>
@@ -62,6 +72,43 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
   using TileShapeOutput = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_OUT@>>;
   using SubgroupLayoutQK =
       cute::Layout<cute::Shape<cute::Int<@NUM_SG@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+
+#if @HEAD_DIM@ == 64
+  if (params.total_q != params.b * params.seqlen_q &&
+      (params.total_knew > 0 ||
+       (params.cu_seqlens_knew != nullptr && params.skip_batch_mask_ptr == nullptr)) &&
+      params.h > params.h_k && !params.is_local && !use_sink) {
+    bool const sparse =
+        params.seqlen_q <= 256 &&
+        static_cast<int64_t>(params.total_q) * 100 <= static_cast<int64_t>(params.b) * params.seqlen_q * 15;
+    if (sparse) {
+      using MixedTileShapeQK = cute::Shape<cute::Int<32>, cute::Int<32>, cute::_32>;
+      using MixedTileShapePV = cute::Shape<cute::Int<32>, cute::_32, cute::Int<32>>;
+      using MixedTileShapeOutput = cute::Shape<cute::Int<32>, cute::Int<64>>;
+      using MixedSubgroupLayoutQK = cute::
+          Layout<cute::Shape<cute::Int<2>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+      run_paged_mixed_pack_gqa_tile<
+          MixedTileShapeQK,
+          MixedTileShapePV,
+          MixedTileShapeOutput,
+          MixedSubgroupLayoutQK>(params);
+    } else if (params.is_causal && params.seqlen_q <= 256) {
+      using MixedTileShapeQK = cute::Shape<cute::Int<64>, cute::Int<64>, cute::_32>;
+      using MixedTileShapePV = cute::Shape<cute::Int<64>, cute::_32, cute::Int<64>>;
+      using MixedTileShapeOutput = cute::Shape<cute::Int<64>, cute::Int<64>>;
+      using MixedSubgroupLayoutQK = cute::
+          Layout<cute::Shape<cute::Int<8>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+      run_paged_mixed_pack_gqa_tile<
+          MixedTileShapeQK,
+          MixedTileShapePV,
+          MixedTileShapeOutput,
+          MixedSubgroupLayoutQK>(params);
+    } else {
+      run_paged_mixed_pack_gqa_tile<TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>(params);
+    }
+    return;
+  }
+#endif
 
 #if @APPENDKV_Q256_TILE@
   if (params.total_knew > 0 && params.seqlen_q == @APPENDKV_Q256_Q@ &&

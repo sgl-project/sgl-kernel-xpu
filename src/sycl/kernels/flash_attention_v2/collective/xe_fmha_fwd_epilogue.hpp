@@ -153,7 +153,8 @@ class FMHAFwdEpilogue {
       float scale_v = 1.0f,                   // Per-tensor V dequant scale (fp8 path)
       ElementSink sink_val = ElementSink{},   // Per-head sink logit (non-packed, used when Sink==true)
       const ElementSink* sink_ptr = nullptr,  // Per-row sink logits base (PackGQA, used when Sink==true)
-      int head_group_q = 0) {                 // # packed query heads in the M tile (PackGQA)
+      int head_group_q = 0,                   // # packed query heads in the M tile (PackGQA)
+      bool packed_gqa = PackGQA_) {
     using namespace cute;
     using ElementA = typename FragA::element_type;
 
@@ -166,14 +167,20 @@ class FMHAFwdEpilogue {
     /* Non-packed sink (prefill / MHA decode): every row in this tile belongs to
        the SAME query head, so a single scalar sink applies to all rows. Add
        exp2(sink_val * log2e - row_max) to each row's running sum. */
-    if constexpr (Sink && !PackGQA_) {
+    if constexpr (Sink) {
       constexpr double kLog2e = 1.4426950408889634074;
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < rA_sum.size(); i++) {
-        // Only add sink if this row has at least some unmasked KV tokens (sum != 0).
-        // Fully-masked rows have sum==0 and max==lowest(), so skipping prevents overflow.
-        if (rA_sum(i) != ElementA(0)) {
-          rA_sum(i) += sycl::native::exp2(static_cast<ElementA>(sink_val * kLog2e) - rA_max_local(i));
+      bool apply_scalar_sink = true;
+      if constexpr (PackGQA_) {
+        apply_scalar_sink = !packed_gqa;
+      }
+      if (apply_scalar_sink) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < rA_sum.size(); i++) {
+          // Only add sink if this row has at least some unmasked KV tokens (sum != 0).
+          // Fully-masked rows have sum==0 and max==lowest(), so skipping prevents overflow.
+          if (rA_sum(i) != ElementA(0)) {
+            rA_sum(i) += sycl::native::exp2(static_cast<ElementA>(sink_val * kLog2e) - rA_max_local(i));
+          }
         }
       }
     }
@@ -191,86 +198,72 @@ class FMHAFwdEpilogue {
     auto tOgO = thr_copy_o.partition_D(gO);
 
     if constexpr (Sink && PackGQA_) {
-      /* Packed-GQA decode stacks head_group_q distinct query heads into the row
-         dimension, so each row needs its OWN sink logit. Unlike the split-decode
-         epilogue, the general mainloop's reduced row fragment does NOT preserve
-         the query-head order across (subgroup, lane), so we cannot index the
-         sink by lane. Instead fold the per-row sink into the denominator in
-         OUTPUT-element space, where tOgO gives each element's q coordinate
-         (= query head within the KV group). Build the per-element denominator
-         (sum of weights) and row max in the A layout via broadcast<0>, reorder
-         both into the output fragment layout, then divide each element by
-         (sum_w + sink_term) using that element's own head. */
-      constexpr double kLog2e = 1.4426950408889634074;
-      auto denom_e = rA;  // per-element softmax denominator (sum of weights)
-      auto max_e = rA;    // per-element row max
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < rA.size(); i++) {
-        denom_e(i) = broadcast<0>(rA_sum, rA, i);
-        max_e(i) = broadcast<0>(rA_max_local, rA, i);
-      }
-      // Keep numerator / denominator / row max in float (ElementA); the output
-      // fragment tOrO is ElementO (e.g. bf16), so doing the division there would
-      // round the denominator and degrade accuracy. Only the final result casts
-      // to ElementO when written into tOrO. reorder() requires SubgroupTensor
-      // destinations, so wrap the float fragments with tOrO's TV layout.
-      auto tv = tOrO.tv_layout();
-      auto tO_num = make_subgroup_tensor(make_fragment_like<ElementA>(tOrO.layout()), tv);
-      auto tO_denom = make_subgroup_tensor(make_fragment_like<ElementA>(tOrO.layout()), tv);
-      auto tO_max = make_subgroup_tensor(make_fragment_like<ElementA>(tOrO.layout()), tv);
-      reorder(rA, tO_num);  // un-normalized accumulator in output layout
-      reorder(denom_e, tO_denom);
-      reorder(max_e, tO_max);
+      if (packed_gqa) {
+        /* Packed-GQA decode stacks head_group_q distinct query heads into the
+           row dimension, so each row needs its own sink logit. */
+        constexpr double kLog2e = 1.4426950408889634074;
+        auto denom_e = rA;
+        auto max_e = rA;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < rA.size(); i++) {
+          denom_e(i) = broadcast<0>(rA_sum, rA, i);
+          max_e(i) = broadcast<0>(rA_max_local, rA, i);
+        }
+        auto tv = tOrO.tv_layout();
+        auto tO_num = make_subgroup_tensor(make_fragment_like<ElementA>(tOrO.layout()), tv);
+        auto tO_denom = make_subgroup_tensor(make_fragment_like<ElementA>(tOrO.layout()), tv);
+        auto tO_max = make_subgroup_tensor(make_fragment_like<ElementA>(tOrO.layout()), tv);
+        reorder(rA, tO_num);
+        reorder(denom_e, tO_denom);
+        reorder(max_e, tO_max);
 
-      CUTLASS_PRAGMA_UNROLL
-      for (int j = 0; j < int(tO_num.size()); j++) {
-        ElementA denom = tO_denom(j);
-        int head_off = int(get<0>(tOgO(j)));
-        // Guard against padded rows (qg_sz rounded up beyond head_group_q).
-        if (head_off < head_group_q) {
-          ElementA sink_term = sycl::native::exp2(static_cast<ElementA>(sink_ptr[head_off] * kLog2e) - tO_max(j));
-          if (sycl::isfinite(sink_term)) {
-            denom += sink_term;
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < int(tO_num.size()); j++) {
+          ElementA denom = tO_denom(j);
+          int head_off = int(get<0>(tOgO(j)));
+          if (head_off < head_group_q) {
+            ElementA sink_term =
+                sycl::native::exp2(static_cast<ElementA>(sink_ptr[head_off] * kLog2e) - tO_max(j));
+            if (sycl::isfinite(sink_term)) {
+              denom += sink_term;
+            }
           }
+          ElementA outv = (denom != ElementA(0)) ? (tO_num(j) / denom) : ElementA(0);
+          if constexpr (CollectiveMainloop::Fp8KV) {
+            outv *= ElementA(scale_v);
+          }
+          tOrO(j) = static_cast<ElementO>(outv);
         }
-        // Rows that attend to no (unmasked) keys have denom==0 -> emit 0, not NaN.
-        ElementA outv = (denom != ElementA(0)) ? (tO_num(j) / denom) : ElementA(0);
-        //  For an fp8 KV cache the per-tensor V dequant scale is folded in here
-        //  (O = scale_v * (P @ V_fp8) / sum), avoiding a per-element V scale in the
-        //  mainloop GEMM2.
-        if constexpr (CollectiveMainloop::Fp8KV) {
-          outv *= ElementA(scale_v);
-        }
-        tOrO(j) = static_cast<ElementO>(outv);
+        copy(copy_o, tOrO, tOgO);
+        return;
       }
-      copy(copy_o, tOrO, tOgO);
-    } else {
-      /* Complete softmax, dividing out sums. Rows whose denominator is exactly
-         zero attend to no (unmasked) keys -- e.g. a batch with zero KV length --
-         so emit 0 instead of NaN to match the reference implementation.
-         For an fp8 KV cache the per-tensor V dequant scale is folded in here
-         (O = scale_v * (P @ V_fp8) / sum), avoiding a per-element V scale in the
-         mainloop GEMM2. */
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < rA_sum.size(); i++) {
-        if constexpr (CollectiveMainloop::LocalMask || CollectiveMainloop::CausalMask) {
-          rA_sum(i) = safe_recip(rA_sum(i));
-        } else {
-          rA_sum(i) = ElementA(1) / rA_sum(i);
-        }
-        if constexpr (CollectiveMainloop::Fp8KV) {
-          rA_sum(i) *= ElementA(scale_v);
-        }
-      }
-
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < rA.size(); i++)
-        rA(i) *= broadcast<0>(rA_sum, rA, i);
-
-      /* Reorder tile and write out */
-      reorder(rA, tOrO);
-      copy(copy_o, tOrO, tOgO);
     }
+
+    /* Complete softmax, dividing out sums. Rows whose denominator is exactly
+       zero attend to no (unmasked) keys -- e.g. a batch with zero KV length --
+       so emit 0 instead of NaN to match the reference implementation.
+       For an fp8 KV cache the per-tensor V dequant scale is folded in here
+       (O = scale_v * (P @ V_fp8) / sum), avoiding a per-element V scale in the
+       mainloop GEMM2. */
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < rA_sum.size(); i++) {
+      if constexpr (CollectiveMainloop::LocalMask || CollectiveMainloop::CausalMask) {
+        rA_sum(i) = safe_recip(rA_sum(i));
+      } else {
+        rA_sum(i) = ElementA(1) / rA_sum(i);
+      }
+      if constexpr (CollectiveMainloop::Fp8KV) {
+        rA_sum(i) *= ElementA(scale_v);
+      }
+    }
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < rA.size(); i++)
+      rA(i) *= broadcast<0>(rA_sum, rA, i);
+
+    /* Reorder tile and write out */
+    reorder(rA, tOrO);
+    copy(copy_o, tOrO, tOgO);
   }
 
   // Reduce k-blocks of A and A_sum across WG, if needed.

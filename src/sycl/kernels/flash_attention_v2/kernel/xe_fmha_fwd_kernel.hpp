@@ -234,7 +234,7 @@ class XeFMHAFwdKernel {
       int seq_len_k = problem_shape.seq_len_kv.cumulative_length == nullptr
                           ? int(problem_shape.seq_len_kv)
                           : problem_shape.seq_len_kv.cumulative_length[batch + 1] -
-                              problem_shape.seq_len_kv.cumulative_length[batch];
+                                problem_shape.seq_len_kv.cumulative_length[batch];
       // Paged KV passes per-batch cache lengths in cu_seqlens_k (cumulative_length[b]
       // already holds this batch's KV length). Non-paged KV passes a cumulative
       // prefix-sum array (b+1 entries), so the per-batch length is the difference.
@@ -244,10 +244,9 @@ class XeFMHAFwdKernel {
         if constexpr (!CollectiveMainloop::AppendKV) {
           auto const* cache_seqlens_delta = problem_shape.seq_len_kv.cumulative_length;
           if (cache_seqlens_delta != nullptr) {
-            seq_len_k_cache +=
-                cache_seqlens_delta == problem_shape.seq_len_qo.cumulative_length
-                ? seq_len_q
-                : cache_seqlens_delta[batch + 1] - cache_seqlens_delta[batch];
+            seq_len_k_cache += cache_seqlens_delta == problem_shape.seq_len_qo.cumulative_length
+                                   ? seq_len_q
+                                   : cache_seqlens_delta[batch + 1] - cache_seqlens_delta[batch];
           }
         }
       } else {
@@ -521,14 +520,7 @@ class XeFMHAFwdKernel {
                 kPackedGQA);
           } else {
             epilogue(
-                O(_, _, q_head_idx, l_coord),
-                tArA,
-                tA_max,
-                tA_sum,
-                blk_qv,
-                thr_id,
-                scale_v,
-                p.sm_sink[q_head_idx]);
+                O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, scale_v, p.sm_sink[q_head_idx]);
           }
         } else {
           epilogue(

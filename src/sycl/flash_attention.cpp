@@ -76,10 +76,10 @@ struct StorePagedAppendKVKernel {
       constexpr int kVecWidth = sizeof(pack_t) / sizeof(scalar_t);
       auto* k_src = reinterpret_cast<uint32_t*>(const_cast<scalar_t*>(k_new + token * k_new_row_stride));
       auto* v_src = reinterpret_cast<uint32_t*>(const_cast<scalar_t*>(v_new + token * v_new_row_stride));
-      auto* k_dst = reinterpret_cast<uint32_t*>(
-          k_cache + physical_page * k_cache_page_stride + page_offset * k_cache_row_stride);
-      auto* v_dst = reinterpret_cast<uint32_t*>(
-          v_cache + physical_page * v_cache_page_stride + page_offset * v_cache_row_stride);
+      auto* k_dst =
+          reinterpret_cast<uint32_t*>(k_cache + physical_page * k_cache_page_stride + page_offset * k_cache_row_stride);
+      auto* v_dst =
+          reinterpret_cast<uint32_t*>(v_cache + physical_page * v_cache_page_stride + page_offset * v_cache_row_stride);
 
       int const k_pack_count = num_heads_kv * head_size / kVecWidth;
       int const v_pack_count = num_heads_kv * head_size_v / kVecWidth;
@@ -171,8 +171,9 @@ void store_paged_append_kv(
           cgh.parallel_for(
               sycl::nd_range<1>(
                   sycl::range<1>(
-                      static_cast<size_t>((total_k_new + StorePagedAppendKVKernel<scalar_t>::kTokensPerGroup - 1) /
-                                          StorePagedAppendKVKernel<scalar_t>::kTokensPerGroup) *
+                      static_cast<size_t>(
+                          (total_k_new + StorePagedAppendKVKernel<scalar_t>::kTokensPerGroup - 1) /
+                          StorePagedAppendKVKernel<scalar_t>::kTokensPerGroup) *
                       group_size),
                   sycl::range<1>(group_size)),
               kernel);
@@ -1768,10 +1769,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd_appendkv(
       q.size(0) != batch_size * max_seqlen_q && q.size(-1) % 8 == 0 && q.size(-2) > k.size(-2) &&
       (q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16) && k.scalar_type() == q.scalar_type() &&
       v.scalar_type() == q.scalar_type() && !q_v_.has_value() && !kv_batch_idx_.has_value() &&
-      !leftpad_k_.has_value() && !rotary_cos_.has_value() && !rotary_sin_.has_value() &&
-      !q_descale_.has_value() && !k_descale_.has_value() && !v_descale_.has_value() &&
-      !scheduler_metadata_.has_value() && k_new_.has_value() && v_new_.has_value() &&
-      cu_seqlens_k_new_.has_value() && k.is_contiguous() && v.is_contiguous() &&
+      !leftpad_k_.has_value() && !rotary_cos_.has_value() && !rotary_sin_.has_value() && !q_descale_.has_value() &&
+      !k_descale_.has_value() && !v_descale_.has_value() && !scheduler_metadata_.has_value() && k_new_.has_value() &&
+      v_new_.has_value() && cu_seqlens_k_new_.has_value() && k.is_contiguous() && v.is_contiguous() &&
       k_new_->is_contiguous() && v_new_->is_contiguous() && v.size(-1) % 8 == 0 &&
       cu_seqlens_k_new_->data_ptr() == cu_seqlens_q.data_ptr();
   if (use_split_mixed_append) {
@@ -1805,8 +1805,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd_appendkv(
     bool const use_unified_hd64 =
         q.size(-1) == 64 && window_size_left < 0 && window_size_right < 0 && !sinks_.has_value() &&
         (batch_size == 2 ||
-         (max_seqlen_q <= 256 &&
-          q.size(0) * 100 <= batch_size * static_cast<int64_t>(max_seqlen_q) * 13));
+         (max_seqlen_q <= 256 && q.size(0) * 100 <= batch_size * static_cast<int64_t>(max_seqlen_q) * 13));
     if (use_unified_hd64) {
       return to_tuple(prefill::mha_fwd(
           q,

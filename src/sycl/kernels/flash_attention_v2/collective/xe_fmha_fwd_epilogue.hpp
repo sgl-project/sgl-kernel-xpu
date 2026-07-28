@@ -222,8 +222,7 @@ class FMHAFwdEpilogue {
           ElementA denom = tO_denom(j);
           int head_off = int(get<0>(tOgO(j)));
           if (head_off < head_group_q) {
-            ElementA sink_term =
-                sycl::native::exp2(static_cast<ElementA>(sink_ptr[head_off] * kLog2e) - tO_max(j));
+            ElementA sink_term = sycl::native::exp2(static_cast<ElementA>(sink_ptr[head_off] * kLog2e) - tO_max(j));
             if (sycl::isfinite(sink_term)) {
               denom += sink_term;
             }

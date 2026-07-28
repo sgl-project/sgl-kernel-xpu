@@ -101,13 +101,10 @@ struct XeFHMAIndividualTileScheduler {
     }
     Params params{grid, {num_head}, {shape.batch * num_head}, num_kv_splits};
     if constexpr (ProblemShape::is_var_len) {
-      bool const is_ragged =
-          shape.seq_len_qo.cumulative_length != nullptr &&
-          shape.seq_len_qo.total_length != shape.batch * shape.seq_len_qo.max_length;
-      bool const is_sparse_ragged =
-          is_ragged &&
-          static_cast<int64_t>(shape.seq_len_qo.total_length) * 5 <=
-              static_cast<int64_t>(shape.batch) * shape.seq_len_qo.max_length;
+      bool const is_ragged = shape.seq_len_qo.cumulative_length != nullptr &&
+                             shape.seq_len_qo.total_length != shape.batch * shape.seq_len_qo.max_length;
+      bool const is_sparse_ragged = is_ragged && static_cast<int64_t>(shape.seq_len_qo.total_length) * 5 <=
+                                                     static_cast<int64_t>(shape.batch) * shape.seq_len_qo.max_length;
       if (num_kv_splits < 1 && is_sparse_ragged) {
         int const tile_q = get<0>(tile_shape);
         // sum(ceil(q_i / tile_q)) <= ceil(total_q / tile_q) + batch - 1.

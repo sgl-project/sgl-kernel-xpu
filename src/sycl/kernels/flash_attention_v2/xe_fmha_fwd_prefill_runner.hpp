@@ -486,14 +486,17 @@ struct FMHAConfig {
   // Paged KV cache: the page table encodes absolute KV positions.
   static int run_paged(const Arguments& params) {
     TORCH_CHECK(params.cu_seqlens_q != nullptr, "paged prefill requires cu_seqlens_q");
-    TORCH_CHECK(params.cu_seqlens_k_cache != nullptr, "paged prefill requires per-batch cache lengths in cu_seqlens_k_cache");
+    TORCH_CHECK(
+        params.cu_seqlens_k_cache != nullptr, "paged prefill requires per-batch cache lengths in cu_seqlens_k_cache");
     TORCH_CHECK(params.page_table != nullptr, "paged prefill requires page_table");
     TORCH_CHECK(params.page_size > 0, "paged prefill requires a positive page_size");
     TORCH_CHECK(params.max_num_pages_per_seq > 0, "paged prefill requires max_num_pages_per_seq");
-    TORCH_CHECK(params.seqlen_q > 0 && params.seqlen_k_cache > 0, "paged prefill requires positive max sequence lengths");
-    TORCH_CHECK(params.total_q > 0 && params.total_k_cache > 0, "paged prefill requires positive total sequence lengths");
-    bool const has_append = params.total_k > 0 && params.k_ptr != nullptr && params.v_ptr != nullptr &&
-                            params.cache_seqlens_old != nullptr;
+    TORCH_CHECK(
+        params.seqlen_q > 0 && params.seqlen_k_cache > 0, "paged prefill requires positive max sequence lengths");
+    TORCH_CHECK(
+        params.total_q > 0 && params.total_k_cache > 0, "paged prefill requires positive total sequence lengths");
+    bool const has_append =
+        params.total_k > 0 && params.k_ptr != nullptr && params.v_ptr != nullptr && params.cache_seqlens_old != nullptr;
     // template <bool isVarLen, bool CachedKV, bool PagedKV, bool AppendKV, class Scheduler>
     if (has_append) {
       return run<true, true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
@@ -509,32 +512,16 @@ struct FMHAConfig {
     TORCH_CHECK(params.total_q != params.b * params.seqlen_q, "mixed PackGQA requires ragged query lengths");
     TORCH_CHECK(params.h > params.h_k && params.h % params.h_k == 0, "mixed PackGQA requires GQA");
     bool const append_kv =
-        params.total_k > 0 && params.k_ptr != nullptr && params.v_ptr != nullptr &&
-        params.cache_seqlens_old != nullptr;
+        params.total_k > 0 && params.k_ptr != nullptr && params.v_ptr != nullptr && params.cache_seqlens_old != nullptr;
     if (!append_kv) {
       TORCH_CHECK(
-          params.total_k == 0 && params.k_ptr == nullptr && params.v_ptr == nullptr &&
-              params.cu_seqlens_k != nullptr,
+          params.total_k == 0 && params.k_ptr == nullptr && params.v_ptr == nullptr && params.cu_seqlens_k != nullptr,
           "mixed PackGQA without fused AppendKV requires cumulative cache-length deltas");
-      return run<
-          true,
-          true,
-          true,
-          false,
-          cutlass::fmha::kernel::XeFHMAIndividualTileScheduler,
-          false,
-          false,
-          true>(params);
+      return run<true, true, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler, false, false, true>(
+          params);
     }
-    return run<
-        true,
-        true,
-        true,
-        true,
-        cutlass::fmha::kernel::XeFHMAIndividualTileScheduler,
-        false,
-        false,
-        true>(params);
+    return run<true, true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler, false, false, true>(
+        params);
   }
 
   static int run_paged_direct_append(const Arguments& params) {
@@ -544,8 +531,7 @@ struct FMHAConfig {
     TORCH_CHECK(params.page_size > 0, "direct AppendKV requires a positive page_size");
     TORCH_CHECK(params.max_num_pages_per_seq > 0, "direct AppendKV requires max_num_pages_per_seq");
     TORCH_CHECK(
-        params.total_k > 0 && params.k_ptr != nullptr && params.v_ptr != nullptr &&
-            params.cache_seqlens_old != nullptr,
+        params.total_k > 0 && params.k_ptr != nullptr && params.v_ptr != nullptr && params.cache_seqlens_old != nullptr,
         "direct AppendKV requires k_new, v_new, and old cache lengths");
     return run<true, true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler, true>(params);
   }
@@ -559,10 +545,12 @@ struct FMHAConfig {
     TORCH_CHECK(params.cu_seqlens_q != nullptr, "non-paged prefill requires cu_seqlens_q");
     TORCH_CHECK(params.cu_seqlens_k_cache != nullptr, "non-paged prefill requires cumulative cu_seqlens_k_cache");
     TORCH_CHECK(params.page_table == nullptr, "non-paged prefill expects page_table to be null");
-    TORCH_CHECK(params.seqlen_q > 0 && params.seqlen_k_cache > 0, "non-paged prefill requires positive max sequence lengths");
-    TORCH_CHECK(params.total_q > 0 && params.total_k_cache > 0, "non-paged prefill requires positive total sequence lengths");
-    bool const has_append = params.total_k > 0 && params.k_ptr != nullptr && params.v_ptr != nullptr &&
-                            params.cache_seqlens_old != nullptr;
+    TORCH_CHECK(
+        params.seqlen_q > 0 && params.seqlen_k_cache > 0, "non-paged prefill requires positive max sequence lengths");
+    TORCH_CHECK(
+        params.total_q > 0 && params.total_k_cache > 0, "non-paged prefill requires positive total sequence lengths");
+    bool const has_append =
+        params.total_k > 0 && params.k_ptr != nullptr && params.v_ptr != nullptr && params.cache_seqlens_old != nullptr;
     // template <bool isVarLen, bool CachedKV, bool PagedKV, bool AppendKV, class Scheduler>
     if (has_append) {
       return run<true, true, false, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);

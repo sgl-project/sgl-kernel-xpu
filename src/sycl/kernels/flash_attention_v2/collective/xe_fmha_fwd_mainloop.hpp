@@ -315,9 +315,9 @@ struct FMHAFwdMainloop<
       auto& V_dst = const_cast<TensorV_cache2D&>(V_cache_2D);
       int const lane_idx = thr_id % intel::sg_size;
       int const sub_group_id = thr_id / intel::sg_size;
-      int const kv_begin = (params.kv.ptr_cu_seqlens_k != nullptr ? params.kv.ptr_cu_seqlens_k[batch]
-                                                                  : batch * params.kv.seq_len_kv) +
-                            store_begin;
+      int const kv_begin =
+          (params.kv.ptr_cu_seqlens_k != nullptr ? params.kv.ptr_cu_seqlens_k[batch] : batch * params.kv.seq_len_kv) +
+          store_begin;
       int const cache_len_old = params.kv.ptr_cache_seqlens[batch] + store_begin;
       int const head_size_qk = size<1>(K_cache_2D);
       int const head_size_vo = size<0>(V_cache_2D);
@@ -417,8 +417,7 @@ struct FMHAFwdMainloop<
               int const d_vec = kv_vec - kv_tok * vecs_per_token;
               int const kv_abs_tok = kv_begin + kv_tok;
               int const dst_row = single_row_base + kv_tok;
-              size_t const src_base =
-                  ((size_t)kv_abs_tok * (size_t)num_heads_kv + (size_t)kv_head) * (size_t)head_size;
+              size_t const src_base = ((size_t)kv_abs_tok * (size_t)num_heads_kv + (size_t)kv_head) * (size_t)head_size;
               int const d = d_vec * kVecElems;
               size_t const src = src_base + (size_t)d;
               StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.kv.ptr_K + src);
@@ -430,8 +429,7 @@ struct FMHAFwdMainloop<
             for (int kv_tok = sub_group_id; kv_tok < kv_len; kv_tok += active_sg_count) {
               int const kv_abs_tok = kv_begin + kv_tok;
               int const dst_row = single_row_base + kv_tok;
-              size_t const src_base =
-                  ((size_t)kv_abs_tok * (size_t)num_heads_kv + (size_t)kv_head) * (size_t)head_size;
+              size_t const src_base = ((size_t)kv_abs_tok * (size_t)num_heads_kv + (size_t)kv_head) * (size_t)head_size;
               for (int d_vec = lane_idx; d_vec < vecs_per_token; d_vec += intel::sg_size) {
                 int const d = d_vec * kVecElems;
                 size_t const src = src_base + (size_t)d;
@@ -615,9 +613,8 @@ struct FMHAFwdMainloop<
       if constexpr (DirectAppendKV) {
         constexpr int kTileKV = get<1>(TileShapeQK{});
         int const cache_len_old = params.kv.ptr_cache_seqlens[l_coord];
-        int const kv_begin =
-            params.kv.ptr_cu_seqlens_k != nullptr ? params.kv.ptr_cu_seqlens_k[l_coord]
-                                                  : l_coord * params.kv.seq_len_kv;
+        int const kv_begin = params.kv.ptr_cu_seqlens_k != nullptr ? params.kv.ptr_cu_seqlens_k[l_coord]
+                                                                   : l_coord * params.kv.seq_len_kv;
         if ((cache_len_old % kTileKV) != 0 || (kv_begin % kTileKV) != 0) {
           barrier();
         }
@@ -657,8 +654,7 @@ struct FMHAFwdMainloop<
     if constexpr (DirectAppendKV) {
       int const cache_len_old = params.kv.ptr_cache_seqlens[l_coord];
       int const kv_begin =
-          params.kv.ptr_cu_seqlens_k != nullptr ? params.kv.ptr_cu_seqlens_k[l_coord]
-                                                : l_coord * params.kv.seq_len_kv;
+          params.kv.ptr_cu_seqlens_k != nullptr ? params.kv.ptr_cu_seqlens_k[l_coord] : l_coord * params.kv.seq_len_kv;
       direct_append = (cache_len_old % kTileKV) == 0 && (kv_begin % kTileKV) == 0;
       direct_block0 = cache_len_old / kTileKV;
       direct_source_block0 = kv_begin / kTileKV;

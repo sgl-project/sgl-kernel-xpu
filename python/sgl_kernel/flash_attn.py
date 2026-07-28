@@ -269,10 +269,9 @@ def flash_attn_with_kvcache(
         assert k is not None and v is not None
         if cu_seqlens_k_new is None:
             assert k.dim() == 4
-            cu_seqlens_k_new = (
-                torch.arange(k.size(0) + 1, dtype=torch.int32, device=k.device)
-                * k.size(1)
-            )
+            cu_seqlens_k_new = torch.arange(
+                k.size(0) + 1, dtype=torch.int32, device=k.device
+            ) * k.size(1)
         native_max_seqlen_k = max_seqlen_k
         if native_max_seqlen_k is None or native_max_seqlen_k == 0:
             native_max_seqlen_k = (

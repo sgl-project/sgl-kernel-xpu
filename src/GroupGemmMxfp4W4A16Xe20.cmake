@@ -45,4 +45,4 @@ foreach(act_type 0 2 4)
     endforeach()
 endforeach()
 
-list(APPEND ATen_XPU_SYCL_XE20 ${GROUP_GEMM_MXFP4_W4A16_XE20_INST_SRCS})
+list(APPEND device_cpp_xe20 ${GROUP_GEMM_MXFP4_W4A16_XE20_INST_SRCS})

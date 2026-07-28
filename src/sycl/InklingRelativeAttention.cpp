@@ -146,10 +146,8 @@ template <typename scalar_t, bool UseRelativeBias, bool UseWindow, bool UseCausa
 class InklingRelativeAttentionRowKernel;
 
 template <typename scalar_t, bool UseRelativeBias, bool UseWindow, bool UseCausal>
-sycl::event launch_relative_attention_static(
-    sycl::queue& queue,
-    RelativeAttentionParams<scalar_t> const& params,
-    int local_size) {
+sycl::event
+launch_relative_attention_static(sycl::queue& queue, RelativeAttentionParams<scalar_t> const& params, int local_size) {
   if (params.total_q == 0 || params.heads == 0) {
     return {};
   }
@@ -161,8 +159,7 @@ sycl::event launch_relative_attention_static(
     sycl::local_accessor<float, 1> p_scratch(sycl::range<1>(static_cast<std::size_t>(local_size)), cgh);
     cgh.parallel_for<InklingRelativeAttentionRowKernel<scalar_t, UseRelativeBias, UseWindow, UseCausal>>(
         sycl::nd_range<1>(
-            sycl::range<1>(static_cast<std::size_t>(global)),
-            sycl::range<1>(static_cast<std::size_t>(local_size))),
+            sycl::range<1>(static_cast<std::size_t>(global)), sycl::range<1>(static_cast<std::size_t>(local_size))),
         [=](sycl::nd_item<1> item) {
           sycl::sub_group sg = item.get_sub_group();
           int local_id = static_cast<int>(item.get_local_id(0));
@@ -261,7 +258,9 @@ sycl::event launch_relative_attention_static(
               for (int n = 0; n < tile_count; ++n) {
                 int64_t v_k_local = valid_begin + tile_begin + n;
                 int64_t v_base = (kv_begin + v_k_local) * params.v_stride_t + kv_head * params.v_stride_h;
-                acc += p_scratch[n] * to_float_device(params.v[v_base + local_id]);
+                // Triton casts softmax probabilities to V's dtype before P@V.
+                scalar_t p = from_float_device<scalar_t>(p_scratch[n]);
+                acc += to_float_device(p) * to_float_device(params.v[v_base + local_id]);
               }
             }
 
@@ -277,8 +276,7 @@ sycl::event launch_relative_attention_static(
           }
           if (local_id == 0) {
             int64_t lse_offset = q_row * params.heads + head;
-            params.lse[lse_offset] = denom > 0.0f ? sycl::log(denom) + e_max :
-                -std::numeric_limits<float>::infinity();
+            params.lse[lse_offset] = denom > 0.0f ? sycl::log(denom) + e_max : -std::numeric_limits<float>::infinity();
           }
         });
   });
@@ -395,8 +393,8 @@ std::tuple<at::Tensor, at::Tensor> inkling_relative_attention(
   }
 
   bool use_window = window_size_left >= 0 || window_size_right >= 0;
-  int64_t local_size = local_size_arg <= 0 ? std::max<int64_t>(kDefaultLocalSize, next_power_of_2_i64(dv))
-                                           : local_size_arg;
+  int64_t local_size =
+      local_size_arg <= 0 ? std::max<int64_t>(kDefaultLocalSize, next_power_of_2_i64(dv)) : local_size_arg;
   TORCH_CHECK(is_power_of_2_i64(local_size), "local_size must be a power of two");
   TORCH_CHECK(local_size >= dv, "local_size must be >= v head dimension");
   TORCH_CHECK(local_size <= kMaxLocalSize, "local_size must be <= ", kMaxLocalSize);
@@ -453,8 +451,7 @@ std::tuple<at::Tensor, at::Tensor> inkling_relative_attention(
         params.bias_stride_h = bias_stride_h;
         params.window_left = window_size_left;
         params.window_right = window_size_right;
-        launch_relative_attention(
-            queue, params, use_relative_bias, use_window, causal, static_cast<int>(local_size));
+        launch_relative_attention(queue, params, use_relative_bias, use_window, causal, static_cast<int>(local_size));
         return {out, lse};
       });
 }

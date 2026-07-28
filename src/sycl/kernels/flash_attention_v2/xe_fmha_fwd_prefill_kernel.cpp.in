@@ -75,7 +75,7 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
 
 #if @HEAD_DIM@ == 64
   if (params.total_q != params.b * params.seqlen_q &&
-      (params.total_k > 0 || (params.cu_seqlens_k != nullptr && params.skip_batch_mask_ptr == nullptr)) &&
+      (params.total_k_new > 0 || (params.cu_seqlens_k_new != nullptr && params.skip_batch_mask_ptr == nullptr)) &&
       params.h > params.h_k && !params.is_local && !use_sink) {
     bool const sparse =
         params.seqlen_q <= 256 &&
@@ -111,7 +111,7 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
 
 #if @HEAD_DIM@ == 96
   bool const use_mixed_sg8 =
-      params.total_k == 0 && params.cu_seqlens_k != nullptr &&
+      params.total_k_new == 0 && params.cu_seqlens_k_new != nullptr &&
       params.total_q != params.b * params.seqlen_q && !params.is_local;
   if (use_mixed_sg8 || (params.b >= 8 && params.h_k >= 8)) {
     using MixedTileShapeQK = cute::Shape<cute::Int<128>, cute::Int<64>, cute::_32>;
@@ -127,7 +127,7 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
 
 #if @HEAD_DIM@ == 192 || @HEAD_DIM@ == 256
   bool const use_low_batch_long_mixed_tile =
-      params.total_k == 0 && params.cu_seqlens_k != nullptr &&
+      params.total_k_new == 0 && params.cu_seqlens_k_new != nullptr &&
       params.total_q != params.b * params.seqlen_q && params.b <= 2 && params.seqlen_q >= 512 &&
       !params.is_local;
   if (use_low_batch_long_mixed_tile) {
@@ -143,10 +143,10 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
 #endif
 
 #if @APPENDKV_Q256_TILE@
-  if (params.total_k > 0 && params.seqlen_q == @APPENDKV_Q256_Q@ &&
-      params.seqlen_k == @APPENDKV_Q256_Q@ &&
+  if (params.total_k_new > 0 && params.seqlen_q == @APPENDKV_Q256_Q@ &&
+      params.seqlen_k_new == @APPENDKV_Q256_Q@ &&
       params.total_q == params.b * @APPENDKV_Q256_Q@ &&
-      params.total_k == params.b * @APPENDKV_Q256_Q@ && !params.is_causal && !params.is_local && !use_sink &&
+      params.total_k_new == params.b * @APPENDKV_Q256_Q@ && !params.is_causal && !params.is_local && !use_sink &&
       params.d == @HEAD_DIM@ && params.dv == @HEAD_DIM@) {
     using AppendTileShapeQK =
         cute::Shape<cute::Int<@APPENDKV_Q256_Q@>, cute::Int<@APPENDKV_Q256_KV@>, cute::_32>;

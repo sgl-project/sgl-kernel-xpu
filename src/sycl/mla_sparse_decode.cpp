@@ -196,6 +196,10 @@ void flash_mla_sparse_decode(
 #if SGLANG_USE_SPARSE_MLA_2STAGE
   DISPATCH_MLA_SPARSE_DTYPE_2STAGE();
 #else
+#ifndef USE_MLA_SPARSE_FUSED
+#error \
+    "Fused sparse MLA decode selected (SGLANG_USE_SPARSE_MLA_2STAGE=0) but the fused kernel was not built. Reconfigure with -DUSE_MLA_SPARSE_FUSED=ON (or USE_MLA_SPARSE_FUSED=1)."
+#endif
   DISPATCH_MLA_SPARSE_DTYPE();
 #endif
 }

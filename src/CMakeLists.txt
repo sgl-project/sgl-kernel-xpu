@@ -15,8 +15,14 @@
 option(USE_MOE "Build MoE kernels" ON)
 option(USE_FMHA "Build flash attention kernels" ON)
 option(USE_MLA "Build MLA kernels" ON)
+# The fused (single-pass) sparse-MLA-decode kernel is the optimization track; the
+# 2-stage kernel is the shipping runtime default. Building the fused variant is
+# opt-in so default/CI builds don't pay for its extra instantiations. Turning it
+# OFF also pins the runtime dispatch to the 2-stage path (see below) so the fused
+# launchers are never referenced.
+option(USE_MLA_SPARSE_FUSED "Build the fused (single-pass) sparse MLA decode kernel (optimization track)" OFF)
 
-foreach(_toggle USE_MOE USE_FMHA USE_MLA)
+foreach(_toggle USE_MOE USE_FMHA USE_MLA USE_MLA_SPARSE_FUSED)
     if(DEFINED ENV{${_toggle}} AND NOT "$ENV{${_toggle}}" STREQUAL "")
         if("$ENV{${_toggle}}")
             set(${_toggle} ON)
@@ -29,6 +35,7 @@ endforeach()
 message(STATUS "USE_MOE=${USE_MOE}")
 message(STATUS "USE_FMHA=${USE_FMHA}")
 message(STATUS "USE_MLA=${USE_MLA}")
+message(STATUS "USE_MLA_SPARSE_FUSED=${USE_MLA_SPARSE_FUSED}")
 
 if(USE_MOE)
     add_compile_definitions(USE_MOE)
@@ -38,6 +45,13 @@ if(USE_FMHA)
 endif()
 if(USE_MLA)
     add_compile_definitions(USE_MLA)
+endif()
+if(USE_MLA_SPARSE_FUSED)
+    add_compile_definitions(USE_MLA_SPARSE_FUSED)
+else()
+    # Fused kernel not built -> force the runtime dispatch to the 2-stage path so
+    # mla_sparse_decode.cpp never references the (uncompiled) fused launchers.
+    add_compile_definitions(SGLANG_USE_SPARSE_MLA_2STAGE=1)
 endif()
 
 file(GLOB device_cpp "sycl/*.cpp" "sycl/*.sycl")

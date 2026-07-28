@@ -333,6 +333,7 @@ def test_topk_sigmoid_jit_vs_aot(
         atol=1e-2,
     )
 
+
 def reference_moe_fused_gate(scores, bias, num_expert_group, topk_group, topk):
     """PyTorch reference for the hierarchical grouped-topk MoE gate.
 

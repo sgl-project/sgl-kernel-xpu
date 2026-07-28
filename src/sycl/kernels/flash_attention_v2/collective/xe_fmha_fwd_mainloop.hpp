@@ -31,6 +31,8 @@
 
 #pragma once
 
+#include <array>
+
 #include "cute/algorithm/functional.hpp"
 #include "cute/algorithm/gemm.hpp"
 #include "cute/algorithm/subgroup_algorithms.hpp"
@@ -336,7 +338,9 @@ struct FMHAFwdMainloop<
 
     /* Create register fragments for MMA and copies */
     auto tQrQ = thr_copy_q.partition_sg_fragment_D(gQ(_, _, 0));
-    auto tSrQ = thr_mma_qk.partition_sg_fragment_A(gQ(_, _, 0));
+    // Q is invariant across K blocks: preload+reorder every D tile once into
+    // registers (below, before the main loop) and reuse in each GEMM1 pass.
+    std::array<decltype(thr_mma_qk.partition_sg_fragment_A(gQ(_, _, 0))), decltype(size<4>(tKgK))::value> tSrQ_arr;
 
     auto tKrK = thr_copy_k.partition_sg_fragment_D(gK(_, _, 0, 0));
     auto tSrK = thr_mma_qk.partition_sg_fragment_B(gK(_, _, 0, 0));
@@ -398,6 +402,13 @@ struct FMHAFwdMainloop<
       qk_scale = params.scale * static_cast<ElementS>(scale_k);
     }
 
+    /* Preload + reorder Q once; Q does not change across the K loop. */
+    CUTLASS_PRAGMA_UNROLL
+    for (int d = 0; d < int(tSrQ_arr.size()); d++) {
+      copy(copy_q, tQgQ(_, _, _, d), tQrQ);
+      reorder(tQrQ, tSrQ_arr[d]);
+    }
+
     /* Main loop, blocked in k. */
     for (int K = blk_k0; K < blk_k1 && K < kblocks_cache; K++) {
       /* Split barrier to keep threads together */
@@ -418,11 +429,9 @@ struct FMHAFwdMainloop<
       clear(tSrS);
       CUTLASS_PRAGMA_UNROLL
       for (int D = 0; D < size<4>(tKgK); D++) {
-        copy(copy_q, tQgQ(_, _, _, D), tQrQ);
         copy(copy_k_cache, tKgK_cache(_, _, _, page_idx, D), tKrK);
-        reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);
-        cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
+        cute::gemm(mma_qk, tSrQ_arr[D], tSrK, tSrS);
       }
 
       /* V prefetch for GEMM 2 */
@@ -785,7 +794,9 @@ struct DecodeFwdMainloop<
 
     /* Create register fragments for MMA and copies */
     auto tQrQ = thr_copy_q.partition_sg_fragment_D(gQ(_, _, 0));
-    auto tSrQ = thr_mma_qk.partition_sg_fragment_A(gQ(_, _, 0));
+    // Q is invariant across K blocks: preload+reorder every D tile once into
+    // registers (below, before the main loop) and reuse in each GEMM1 pass.
+    std::array<decltype(thr_mma_qk.partition_sg_fragment_A(gQ(_, _, 0))), decltype(size<4>(tKgK))::value> tSrQ_arr;
 
     auto tKrK = thr_copy_k.partition_sg_fragment_D(gK(_, _, 0, 0));
     auto tSrK = thr_mma_qk.partition_sg_fragment_B(gK(_, _, 0, 0));
@@ -845,6 +856,13 @@ struct DecodeFwdMainloop<
       qk_scale = params.scale * static_cast<ElementS>(scale_k);
     }
 
+    /* Preload + reorder Q once; Q does not change across the K loop. */
+    CUTLASS_PRAGMA_UNROLL
+    for (int d = 0; d < int(tSrQ_arr.size()); d++) {
+      copy(copy_q, tQgQ(_, _, _, d), tQrQ);
+      reorder(tQrQ, tSrQ_arr[d]);
+    }
+
     /* Main loop, blocked in k. */
     int next_tile_idx;
     for (int K = blk_k0; K < blk_k1; K++) {
@@ -857,13 +875,11 @@ struct DecodeFwdMainloop<
       /* GEMM 1: S = K * Q */
       clear(tSrS); /* TODO: fuse w/ initial gemm call */
       for (int D = 0; D < size<4>(tKgK); D++) {
-        copy(copy_q, tQgQ(_, _, _, D), tQrQ);
         copy(copy_k, tKgK_cache(_, _, _, D), tKrK);
 
-        reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);
 
-        cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
+        cute::gemm(mma_qk, tSrQ_arr[D], tSrK, tSrS);
       }
       /* V prefetch for GEMM 2 */
       prefetch(prefetch_v, pVgV(_, _, _, tile_idx));

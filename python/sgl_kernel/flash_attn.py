@@ -265,6 +265,7 @@ def flash_attn_with_kvcache(
         assert cache_seqlens.size(0) + 1 == cu_seqlens_q.size(0)
         cu_seqlens_k = cache_seqlens
     has_new_kv = k is not None or v is not None or cu_seqlens_k_new is not None
+    native_max_seqlen_k = 1
     if has_new_kv:
         assert k is not None and v is not None
         if cu_seqlens_k_new is None:
@@ -277,72 +278,40 @@ def flash_attn_with_kvcache(
             native_max_seqlen_k = (
                 k.shape[1] if k is not None and k.dim() == 4 else (max_seqlen_q or 1)
             )
-        out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd_appendkv.default(
-            q,
-            k_cache,
-            v_cache,
-            k,
-            v,
-            qv,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            cu_seqlens_k_new,
-            max_seqlen_q,
-            native_max_seqlen_k,
-            page_table,
-            cache_batch_idx,
-            cache_leftpad,
-            rotary_cos,
-            rotary_sin,
-            rotary_seqlens,
-            q_descale,
-            k_descale,
-            v_descale,
-            softmax_scale,
-            sinks,
-            causal,
-            window_size[0],
-            window_size[1],
-            softcap,
-            rotary_interleaved,
-            scheduler_metadata,
-            num_splits,
-            pack_gqa,
-            sm_margin,
-            out,
-        )
-    else:
-        out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
-            q,
-            k_cache,
-            v_cache,
-            qv,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            1,
-            page_table,
-            cache_batch_idx,
-            cache_leftpad,
-            rotary_cos,
-            rotary_sin,
-            rotary_seqlens,
-            q_descale,
-            k_descale,
-            v_descale,
-            softmax_scale,
-            sinks,
-            causal,
-            window_size[0],
-            window_size[1],
-            softcap,
-            rotary_interleaved,
-            scheduler_metadata,
-            num_splits,
-            pack_gqa,
-            sm_margin,
-            out,
-        )
+    out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
+        q,
+        k_cache,
+        v_cache,
+        k,
+        v,
+        qv,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_k_new,
+        max_seqlen_q,
+        native_max_seqlen_k,
+        page_table,
+        cache_batch_idx,
+        cache_leftpad,
+        rotary_cos,
+        rotary_sin,
+        rotary_seqlens,
+        q_descale,
+        k_descale,
+        v_descale,
+        softmax_scale,
+        sinks,
+        causal,
+        window_size[0],
+        window_size[1],
+        softcap,
+        rotary_interleaved,
+        scheduler_metadata,
+        num_splits,
+        pack_gqa,
+        sm_margin,
+        out,
+    )
     return (out, softmax_lse, *rest) if return_softmax_lse else out
 
 
@@ -390,9 +359,12 @@ def flash_attn_varlen_func(
         q,
         k,
         v,
+        None,  # k_new
+        None,  # v_new
         qv,  # qv
         cu_seqlens_q,
         cu_seqlens_k,
+        None,  # cu_seqlens_k_new
         max_seqlen_q,
         max_seqlen_k,
         None,  # page_table,

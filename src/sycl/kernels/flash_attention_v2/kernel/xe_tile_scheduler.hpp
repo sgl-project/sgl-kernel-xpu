@@ -38,7 +38,7 @@
 
 namespace cutlass::fmha::kernel {
 
-struct XeFHMAIndividualTileScheduler {
+struct XeFMHAIndividualTileScheduler {
   struct Params {
     dim3 grid;
     FastDivmod divmod_num_heads;
@@ -56,7 +56,7 @@ struct XeFHMAIndividualTileScheduler {
   int blk_q_ = 0;
 
   CUTLASS_DEVICE
-  XeFHMAIndividualTileScheduler(Params const& params) : params(params) {
+  XeFMHAIndividualTileScheduler(Params const& params) : params(params) {
     if (params.compact_varlen) {
       auto subgroup = sycl::ext::oneapi::this_work_item::get_sub_group();
       int mapped_batch = -1;
@@ -152,13 +152,13 @@ struct XeFHMAIndividualTileScheduler {
   }
 
   CUTLASS_DEVICE
-  XeFHMAIndividualTileScheduler& operator++() {
+  XeFMHAIndividualTileScheduler& operator++() {
     valid_ = false;
     return *this;
   }
 };
 
-struct XeFHMAIndividualPersistentTileScheduler {
+struct XeFMHAIndividualPersistentTileScheduler {
   struct Params {
     dim3 grid;
     FastDivmod divmod_num_heads;
@@ -172,7 +172,7 @@ struct XeFHMAIndividualPersistentTileScheduler {
   int num_batch_heads_;
 
   CUTLASS_DEVICE
-  XeFHMAIndividualPersistentTileScheduler(
+  XeFMHAIndividualPersistentTileScheduler(
       Params const& params, int kv_tile_size, int local_num_kv_blocks, int num_batch_heads)
       : params(params),
         kv_tile_size_(kv_tile_size),
@@ -221,7 +221,7 @@ struct XeFHMAIndividualPersistentTileScheduler {
   }
 
   CUTLASS_DEVICE
-  XeFHMAIndividualPersistentTileScheduler& operator++() {
+  XeFMHAIndividualPersistentTileScheduler& operator++() {
     valid_ = false;
     return *this;
   }

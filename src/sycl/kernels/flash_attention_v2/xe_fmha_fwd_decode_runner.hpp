@@ -668,7 +668,7 @@ struct DecodeConfig {
 
     static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
     using FMHADecodeKernel = conditional_t<
-        is_same_v<Scheduler, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>,
+        is_same_v<Scheduler, cutlass::fmha::kernel::XeFMHAIndividualPersistentTileScheduler>,
         cutlass::fmha::kernel::
             XeFMHAFwdDynamicSplitKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>,
         cutlass::fmha::kernel::XeFMHAFwdKernel<
@@ -691,13 +691,13 @@ struct DecodeConfig {
   // Paged KV cache: the page table encodes absolute KV positions.
   static int run_paged(const Arguments& params) {
     // template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
-    return run<true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+    return run<true, true, true, cutlass::fmha::kernel::XeFMHAIndividualTileScheduler>(params);
   }
 
   // Non-paged (contiguous ragged) KV cache: addressed via cu_seqlens_k_cache offsets.
   static int run_nopaged(const Arguments& params) {
     // template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
-    return run<true, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+    return run<true, true, false, cutlass::fmha::kernel::XeFMHAIndividualTileScheduler>(params);
   }
 
   static int run(const Arguments& params) {
@@ -798,7 +798,7 @@ struct SplitDecodeConfig {
   }
 
   static void run(const Arguments& params) {
-    return run<true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+    return run<true, true, true, cutlass::fmha::kernel::XeFMHAIndividualTileScheduler>(params);
   }
 };
 

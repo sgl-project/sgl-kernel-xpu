@@ -8,9 +8,6 @@ import pytest
 import sgl_kernel
 import torch
 import utils
-from sgl_kernel.fused_k_norm_rope_flashmla_torch import (
-    fused_k_norm_rope_flashmla as fused_k_norm_rope_flashmla_ref,
-)
 from test_rope_utils import create_cos_sin_cache
 
 precision = {
@@ -859,6 +856,119 @@ def test_fused_q_norm_rope_zero_batch():
         assert q_output.shape == q_input.shape
 
 
+def fused_k_norm_rope_flashmla_reference(
+    kv: torch.Tensor,  # (B, 512) input dtype (bf16/fp16/fp32)
+    kv_weight: torch.Tensor,  # (512,) same dtype as kv
+    freqs_cis: torch.Tensor,  # (max_pos, 64) fp32 interleaved [re0,im0,re1,im1,...]
+    positions: torch.Tensor,  # (B,) int32 or int64
+    out_loc: torch.Tensor,  # (B,) int32 cache-slot indices
+    kvcache: torch.Tensor,  # (npages, kPageBytes) uint8
+    eps: float,
+    page_size: int,  # must be a power of 2
+) -> None:
+    """Pure-PyTorch reference for fused K-norm + RoPE + FlashMLA paged cache
+    store. Fixed FlashMLA cache layout (head_dim=512, rope_dim=64,
+    nope_dim=448): value slot (576 bytes) = [0..447] FP8 E4M3 nope (7 warps x
+    64 elems) + [448..575] BF16 rope (64 elems); scale slot (8 bytes) =
+    [0..6] UE8M0 exponent per nope warp + [7] padding. Vectorized (no
+    per-token Python loop), stays on the input device.
+    """
+    fp8_max = 448.0
+    head_dim, rope_dim = 512, 64
+    nope_dim = head_dim - rope_dim  # 448
+    nope_warps = 7  # 64 elems each
+    epw = nope_dim // nope_warps  # 64
+    value_bytes = 576
+
+    assert kv.shape[-1] == head_dim, f"head_dim must be {head_dim}"
+    assert freqs_cis.shape[-1] == rope_dim, f"rope_dim must be {rope_dim}"
+    assert (page_size & (page_size - 1)) == 0, "page_size must be a power of 2"
+
+    B = kv.shape[0]
+    if B == 0:
+        return
+
+    device = kv.device
+    page_bits = int(math.log2(page_size))
+    page_bytes = kvcache.shape[1]
+
+    def cast_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
+        bits = x.float().clamp(min=1e-38).view(torch.int32)
+        exp = (bits >> 23) & 0xFF
+        round_up = (bits & 0x7FFFFF) != 0
+        return exp + round_up.to(torch.int32)
+
+    def inv_scale_ue8m0(ue8m0: torch.Tensor) -> torch.Tensor:
+        inv_exp = (254 - ue8m0).clamp(min=0)
+        inv_bits = (inv_exp << 23).to(torch.int32)
+        inv_f = inv_bits.view(torch.float32)
+        return torch.where(ue8m0 >= 254, torch.zeros_like(inv_f), inv_f)
+
+    # Step 1: block-wide RMSNorm with kv_weight.
+    x = kv.float()
+    rms = x.pow(2).mean(dim=-1, keepdim=True)
+    norm_factor = torch.rsqrt(rms + eps)
+    x = x * norm_factor * kv_weight.float().unsqueeze(0)
+
+    # Step 2: RoPE on the last rope_dim=64 elements.
+    freq = freqs_cis[positions.long()]
+    freq_re = freq[:, 0::2]
+    freq_im = freq[:, 1::2]
+
+    x_nope = x[:, :nope_dim]
+    x_rope = x[:, nope_dim:]
+    xr = x_rope[:, 0::2]
+    xi = x_rope[:, 1::2]
+
+    rotated_re = xr * freq_re - xi * freq_im
+    rotated_im = xr * freq_im + xi * freq_re
+    rope_out = torch.stack([rotated_re, rotated_im], dim=-1).flatten(-2)
+
+    # Step 3: per-warp FP8 E4M3 quantization of the nope region.
+    x_warps = x_nope.reshape(B, nope_warps, epw)
+    abs_max = x_warps.abs().amax(dim=-1)
+    scale_raw = abs_max.clamp(min=1e-4) / fp8_max
+    ue8m0 = cast_to_ue8m0(scale_raw)
+    inv_scale = inv_scale_ue8m0(ue8m0)
+    fp8_nope = (
+        (x_warps * inv_scale.unsqueeze(-1))
+        .clamp(-fp8_max, fp8_max)
+        .to(torch.float8_e4m3fn)
+    )
+
+    # Step 4: flat byte addresses for all scatter writes.
+    valid = out_loc >= 0
+    if not valid.any():
+        return
+
+    pages = out_loc[valid].long() >> page_bits
+    offsets = out_loc[valid].long() & (page_size - 1)
+
+    value_base = pages * page_bytes + offsets * value_bytes
+    scale_base = pages * page_bytes + page_size * value_bytes + offsets * 8
+
+    flat_cache = kvcache.view(-1)
+
+    # Step 5a: scatter FP8 nope bytes.
+    fp8_bytes = fp8_nope[valid].reshape(-1, nope_dim).view(torch.uint8)
+    nope_cols = torch.arange(nope_dim, device=device)
+    nope_idx = value_base.unsqueeze(1) + nope_cols.unsqueeze(0)
+    flat_cache.index_put_((nope_idx.reshape(-1),), fp8_bytes.reshape(-1))
+
+    # Step 5b: scatter BF16 rope bytes.
+    rope_bf16 = rope_out[valid].to(torch.bfloat16)
+    rope_bytes = rope_bf16.view(torch.uint8)
+    rope_cols = torch.arange(128, device=device)
+    rope_idx = (value_base + nope_dim).unsqueeze(1) + rope_cols.unsqueeze(0)
+    flat_cache.index_put_((rope_idx.reshape(-1),), rope_bytes.reshape(-1))
+
+    # Step 5c: scatter UE8M0 scale bytes.
+    ue8m0_bytes = ue8m0[valid].to(torch.uint8)
+    scale_cols = torch.arange(nope_warps, device=device)
+    scale_idx = scale_base.unsqueeze(1) + scale_cols.unsqueeze(0)
+    flat_cache.index_put_((scale_idx.reshape(-1),), ue8m0_bytes.reshape(-1))
+
+
 @pytest.mark.parametrize("batch_size", [1, 7, 32, 128])
 @pytest.mark.parametrize("page_size", [16, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -893,7 +1003,7 @@ def test_fused_k_norm_rope_flashmla(batch_size, page_size, dtype):
         kv, kv_weight, freqs_real, positions, out_loc, kvcache_test, eps, page_size
     )
 
-    fused_k_norm_rope_flashmla_ref(
+    fused_k_norm_rope_flashmla_reference(
         kv, kv_weight, freqs_real, positions, out_loc, kvcache_ref, eps, page_size
     )
 
@@ -943,7 +1053,7 @@ def test_fused_k_norm_rope_flashmla_position_dtype(position_dtype):
         kv, kv_weight, freqs_real, positions, out_loc, kvcache_test, eps, page_size
     )
 
-    fused_k_norm_rope_flashmla_ref(
+    fused_k_norm_rope_flashmla_reference(
         kv, kv_weight, freqs_real, positions, out_loc, kvcache_ref, eps, page_size
     )
 

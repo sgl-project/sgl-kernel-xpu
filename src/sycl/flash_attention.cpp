@@ -232,11 +232,10 @@ std::vector<at::Tensor> mha_fwd_nopage(
   params.b_k = batch_size;
   params.dv = head_size_v;
 
-  // Non-paged KV: no page table. The decode kernel branches on
-  // page_table == nullptr to take its non-paged path. page_size is set to 128
-  // purely to route the dispatch to the PAGE_SIZE==128 translation unit, which
-  // is where the non-paged decode kernel is emitted (the non-paged KV tile is
-  // FMHA_DECODE_TILED_KV_NP_*, independent of this routing value).
+  // Non-paged KV: no page table. The non-paged decode path is compiled into its
+  // own runner type (FmhaDecodeNpRunner, no PAGE_SIZE) and dispatched via
+  // DISPATCH_DECODE_NOPAGE. page_size is irrelevant here (the non-paged KV tile
+  // is FMHA_DECODE_TILED_KV_NP_*, independent of any page size).
   params.page_table = nullptr;
   params.page_table_batch_stride = 0;
   params.max_num_pages_per_seq = 0;
@@ -259,11 +258,11 @@ std::vector<at::Tensor> mha_fwd_nopage(
   // Non-paged decode supports its own (independent) set of head dims; see
   // FMHA_DECODE_NP_HEAD_DIMS in FMHADecodeXe20.cmake.
   TORCH_CHECK(
-      params.d == 64 || params.d == 72 || params.d == 96 || params.d == 128 || params.d == 192,
+      params.d == 64 || params.d == 72 || params.d == 80 || params.d == 96 || params.d == 128 || params.d == 192,
       "Unsupported head size for non-paged decode attention: ",
       params.d);
 
-  DISPATCH_DECODE(qg_sz);
+  DISPATCH_DECODE_NOPAGE(qg_sz);
 
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
@@ -826,25 +825,28 @@ std::vector<at::Tensor> mha_fwd_nopage(
   // Non-paged prefill supports its own (independent) set of head dims; see
   // FMHA_PREFILL_NP_HEAD_DIMS in FMHAPrefillXe20.cmake.
   TORCH_CHECK(
-      params.d == 64 || params.d == 72 || params.d == 96 || params.d == 128 || params.d == 192,
+      params.d == 64 || params.d == 72 || params.d == 80 || params.d == 96 || params.d == 128 || params.d == 192,
       "Unsupported head size for non-paged prefill attention: ",
       params.d);
 
   switch (params.d) {
     case 64:
-      DISPATCH_PREFILL_KERNEL(64);
+      DISPATCH_PREFILL_NOPAGE_KERNEL(64);
       break;
     case 72:
-      DISPATCH_PREFILL_KERNEL(72);
+      DISPATCH_PREFILL_NOPAGE_KERNEL(72);
+      break;
+    case 80:
+      DISPATCH_PREFILL_NOPAGE_KERNEL(80);
       break;
     case 96:
-      DISPATCH_PREFILL_KERNEL(96);
+      DISPATCH_PREFILL_NOPAGE_KERNEL(96);
       break;
     case 128:
-      DISPATCH_PREFILL_KERNEL(128);
+      DISPATCH_PREFILL_NOPAGE_KERNEL(128);
       break;
     case 192:
-      DISPATCH_PREFILL_KERNEL(192);
+      DISPATCH_PREFILL_NOPAGE_KERNEL(192);
       break;
     default:
       TORCH_CHECK(false, "Unsupported head size for non-paged prefill attention: ", params.d);

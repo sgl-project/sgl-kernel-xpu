@@ -42,12 +42,12 @@ struct FlashCompress128DecodeKernel {
       kv_dst[head_dim_ + h] = static_cast<buffer_t>(kv_src[head_dim_ + h]);
     }
 
-    item.barrier(sycl::access::fence_space::global_and_local);
-
     // Compress only when a 128-token chunk is completed.
     if ((plan.write_loc % 128) != 127) {
       return;
     }
+
+    item.barrier(sycl::access::fence_space::global_and_local);
 
     // Last split may be partial when head_dim is not divisible by kTileDim.
     if (h >= head_dim_) {

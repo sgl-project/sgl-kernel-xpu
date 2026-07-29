@@ -229,7 +229,7 @@ struct FMHAFwdMainloop<
     typename TensorK_cache::element_type const* ptr_K_new = nullptr;
     typename TensorV_cache::element_type const* ptr_V_new = nullptr;
     int const* ptr_cu_seqlens_k_new = nullptr;
-    int const* ptr_cache_seqlens = nullptr;
+    int const* ptr_kv_cache_seqlens = nullptr;
     int seq_len_kv_new = 0;
     int total_k_new = 0;
   };
@@ -261,7 +261,7 @@ struct FMHAFwdMainloop<
         args.ptr_K_new,
         args.ptr_V_new,
         args.ptr_cu_seqlens_k_new,
-        args.ptr_cache_seqlens,
+        args.ptr_kv_cache_seqlens,
         args.seq_len_kv_new,
         args.total_k_new};
   }
@@ -285,21 +285,33 @@ struct FMHAFwdMainloop<
   }
 
   CUTLASS_DEVICE
-  int get_k_new_len(int batch) const {
+  static int get_kv_len(int const* cu_seqlens, int seq_len, int total_len, int batch) {
+    if (total_len <= 0 || (cu_seqlens == nullptr && seq_len <= 0)) {
+      return 0;
+    }
+    if (cu_seqlens != nullptr) {
+      return cu_seqlens[batch + 1] - cu_seqlens[batch];
+    }
+    return seq_len;
+  }
+
+  CUTLASS_DEVICE
+  static int get_kv_new_len(Params const& params, int batch) {
     if constexpr (AppendKV) {
-      if (params.ptr_K_new == nullptr || params.ptr_V_new == nullptr ||
-          params.ptr_cache_seqlens == nullptr || params.total_k_new <= 0 ||
-          (params.ptr_cu_seqlens_k_new == nullptr && params.seq_len_kv_new <= 0)) {
+      if (params.ptr_K_new == nullptr || params.ptr_V_new == nullptr || params.ptr_kv_cache_seqlens == nullptr) {
         return 0;
       }
-      if (params.ptr_cu_seqlens_k_new != nullptr) {
-        return params.ptr_cu_seqlens_k_new[batch + 1] - params.ptr_cu_seqlens_k_new[batch];
-      }
-      return params.seq_len_kv_new;
+      return get_kv_len(params.ptr_cu_seqlens_k_new, params.seq_len_kv_new, params.total_k_new, batch);
     } else {
+      (void)params;
       (void)batch;
       return 0;
     }
+  }
+
+  CUTLASS_DEVICE
+  int get_kv_new_len(int batch) const {
+    return get_kv_new_len(params, batch);
   }
 
   CUTLASS_DEVICE
@@ -313,7 +325,7 @@ struct FMHAFwdMainloop<
       int append_store_len = -1,
       int append_store_begin = 0) const {
     if constexpr (AppendKV) {
-      int const new_len_total = get_k_new_len(batch);
+      int const new_len_total = get_kv_new_len(batch);
       int const store_begin = cute::min(cute::max(append_store_begin, 0), new_len_total);
       int const available_len = new_len_total - store_begin;
       int const new_len =
@@ -329,7 +341,7 @@ struct FMHAFwdMainloop<
       int const new_begin = (params.ptr_cu_seqlens_k_new != nullptr ? params.ptr_cu_seqlens_k_new[batch]
                                                                     : batch * params.seq_len_kv_new) +
                             store_begin;
-      int const cache_len_old = params.ptr_cache_seqlens[batch] + store_begin;
+      int const cache_len_old = params.ptr_kv_cache_seqlens[batch] + store_begin;
       int const head_size_qk = size<1>(K_cache_2D);
       int const head_size_vo = size<0>(V_cache_2D);
       int const max_hd = head_size_qk > head_size_vo ? head_size_qk : head_size_vo;
@@ -614,10 +626,9 @@ struct FMHAFwdMainloop<
           K_cache_2D, V_cache_2D, l_coord, kv_head, num_heads_kv, thr_id, append_store_len, append_store_begin);
       if constexpr (DirectAppendKV) {
         constexpr int kTileKV = get<1>(TileShapeQK{});
-        int const cache_len_old = params.ptr_cache_seqlens[l_coord];
-        int const new_begin = params.ptr_cu_seqlens_k_new != nullptr
-                                  ? params.ptr_cu_seqlens_k_new[l_coord]
-                                  : l_coord * params.seq_len_kv_new;
+        int const cache_len_old = params.ptr_kv_cache_seqlens[l_coord];
+        int const new_begin = params.ptr_cu_seqlens_k_new != nullptr ? params.ptr_cu_seqlens_k_new[l_coord]
+                                                                     : l_coord * params.seq_len_kv_new;
         if ((cache_len_old % kTileKV) != 0 || (new_begin % kTileKV) != 0) {
           barrier();
         }
@@ -654,7 +665,7 @@ struct FMHAFwdMainloop<
     int direct_block0 = kblocks_total;
     int direct_source_block0 = 0;
     if constexpr (DirectAppendKV) {
-      int const cache_len_old = params.ptr_cache_seqlens[l_coord];
+      int const cache_len_old = params.ptr_kv_cache_seqlens[l_coord];
       int const new_begin = params.ptr_cu_seqlens_k_new != nullptr ? params.ptr_cu_seqlens_k_new[l_coord]
                                                                    : l_coord * params.seq_len_kv_new;
       direct_append = (cache_len_old % kTileKV) == 0 && (new_begin % kTileKV) == 0;
@@ -730,15 +741,25 @@ struct FMHAFwdMainloop<
 
         if constexpr (CausalMask) {
           if (need_causal) {
-            Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
-            Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
-            auto cS_thread = thr_mma_qk.partition_C(gP);
+            /* Masking scalars */
+            // TODO: use a more general code path for causal masking.
+            int lane_id = thr_id % intel::sg_size;
+            constexpr int sg_tile_q = get<0>(TileShapeQK{}) / SGPerWG::value;
+            int row_base = get<0>(blk_qv) * get<0>(TileShapeQK{}) + (thr_id / intel::sg_size) * sg_tile_q;
+
+            constexpr int kTileK = get<1>(TileShapeQK{});
+            constexpr int n_reps = kTileK / intel::sg_size;
+            int const elems_per_n = tSrS.size() / n_reps;
+            int k_base = K * kTileK;
             CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < tSrS.size(); ++i) {
-              int row_idx = get<0>(cS_thread(i));
-              int col_idx = get<1>(cS_thread(i));
-              if (row_idx < col_idx - full_tile_offset) {
-                tSrS(i) = ElementS(-INFINITY);
+            for (int n = 0; n < n_reps; n++) {
+              int col = k_base + n * intel::sg_size + lane_id;
+              int causal_bound = col - full_tile_offset - row_base;
+              CUTLASS_PRAGMA_UNROLL
+              for (int j = 0; j < elems_per_n; j++) {
+                if (j < causal_bound) {
+                  tSrS(n * elems_per_n + j) = ElementS(-INFINITY);
+                }
               }
             }
           }

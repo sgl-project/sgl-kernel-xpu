@@ -244,25 +244,6 @@ class XeFMHAFwdKernel {
   }
 
   CUTLASS_DEVICE
-  int get_k_new_len(MainloopParams const& mainloop, int batch) {
-    if constexpr (CollectiveMainloop::AppendKV) {
-      if (mainloop.ptr_K_new == nullptr || mainloop.ptr_V_new == nullptr ||
-          mainloop.ptr_cache_seqlens == nullptr || mainloop.total_k_new <= 0 ||
-          (mainloop.ptr_cu_seqlens_k_new == nullptr && mainloop.seq_len_kv_new <= 0)) {
-        return 0;
-      }
-      if (mainloop.ptr_cu_seqlens_k_new != nullptr) {
-        return mainloop.ptr_cu_seqlens_k_new[batch + 1] - mainloop.ptr_cu_seqlens_k_new[batch];
-      }
-      return mainloop.seq_len_kv_new;
-    } else {
-      (void)mainloop;
-      (void)batch;
-      return 0;
-    }
-  }
-
-  CUTLASS_DEVICE
   void operator()(Params const& params, char* smem_buf) {
     using namespace sycl::ext::oneapi::this_work_item;
 
@@ -297,9 +278,9 @@ class XeFMHAFwdKernel {
       auto [seq_len_qo, seq_len_kv, seq_len_kv_cache] = sequence_length_shape;
       int seq_k_eff = seq_len_kv_cache;
       if constexpr (CollectiveMainloop::AppendKV) {
-        int const seq_k_new = get_k_new_len(params.mainloop, idx_b);
+        int const seq_k_new = CollectiveMainloop::get_kv_new_len(params.mainloop, idx_b);
         if (seq_k_new > 0) {
-          seq_k_eff = params.mainloop.ptr_cache_seqlens[idx_b] + seq_k_new;
+          seq_k_eff = params.mainloop.ptr_kv_cache_seqlens[idx_b] + seq_k_new;
         }
       }
       // M extent of the Q/O tile: the packed GQA group for decode, otherwise the
@@ -332,11 +313,11 @@ class XeFMHAFwdKernel {
       int append_store_len = -1;
       int append_store_begin = 0;
       if constexpr (CollectiveMainloop::AppendKV) {
-        int const seq_k_new = get_k_new_len(params.mainloop, idx_b);
+        int const seq_k_new = CollectiveMainloop::get_kv_new_len(params.mainloop, idx_b);
         if (seq_k_new > 0) {
           append_store_len = seq_k_new;
           if constexpr (DirectAppendKV) {
-            int const cache_len_old = params.mainloop.ptr_cache_seqlens[idx_b];
+            int const cache_len_old = params.mainloop.ptr_kv_cache_seqlens[idx_b];
             int const new_begin = params.mainloop.ptr_cu_seqlens_k_new != nullptr
                                       ? params.mainloop.ptr_cu_seqlens_k_new[idx_b]
                                       : idx_b * params.mainloop.seq_len_kv_new;
@@ -356,7 +337,7 @@ class XeFMHAFwdKernel {
           if constexpr (CollectiveMainloop::CausalMask && !PackGQA_) {
             // Without a grid-wide barrier, each WG must write every appended
             // token it may read; causal tiles only need the visible prefix.
-            int const cache_len_old = params.mainloop.ptr_cache_seqlens[idx_b];
+            int const cache_len_old = params.mainloop.ptr_kv_cache_seqlens[idx_b];
             int const tile_q = get<0>(TileShapeQK{});
             int const q_tile_end = cute::min(seq_len_qo, (blk_q + 1) * tile_q);
             int const visible_k_end = cute::min(seq_k_eff, full_tile_offset + q_tile_end);

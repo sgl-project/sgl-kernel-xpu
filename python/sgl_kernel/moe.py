@@ -332,6 +332,48 @@ def cutlass_fp4_group_mm(
     return c.to(dtype=out_dtype)
 
 
+_MOE_WS_HEADROOM = 1.25
+
+
+def _get_moe_ws(
+    workspace: Optional[Dict[str, torch.Tensor]],
+    name: str,
+    shape: tuple,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return a tensor of `shape`/`dtype` on `device`, backed by a flat 1-D
+    scratch buffer cached (grow-only, with headroom) in `workspace[name]`.
+    Reusing one stable-size buffer across calls/layers avoids the XPU caching
+    allocator accumulating many differently-shaped cached blocks (elevated
+    torch.xpu.memory_reserved() vs memory_allocated()). Falls back to a plain
+    `torch.empty` when `workspace` is None, so existing callers keep working
+    unchanged."""
+    if workspace is None:
+        return torch.empty(shape, dtype=dtype, device=device)
+    numel = 1
+    for d in shape:
+        numel *= d
+    cur = workspace.get(name)
+    if cur is None or cur.numel() < numel or cur.dtype != dtype or cur.device != device:
+        # Growing replaces (and thus lets go of) the previous buffer. Any
+        # not-yet-retired kernel from an earlier call may still be reading
+        # from/writing to that old buffer's memory; without a sync here the
+        # allocator could otherwise recycle those same bytes into the new,
+        # larger allocation while such a kernel is still in flight (a data
+        # race), which was observed to silently corrupt results. Growth only
+        # happens a handful of times total (buffers ramp up to their steady-
+        # state max size early on), so this sync is effectively free
+        # amortized over a server's lifetime.
+        if cur is not None:
+            torch.xpu.synchronize(device)
+        # the max here ensure it won't be less than numel.
+        new_numel = max(numel, int(numel * _MOE_WS_HEADROOM))
+        cur = torch.empty(new_numel, dtype=dtype, device=device)
+        workspace[name] = cur
+    return cur.narrow(0, 0, numel).view(shape)
+
+
 def fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -359,6 +401,7 @@ def fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     swiglu_limit: Optional[float] = None,
+    workspace: Optional[Dict[str, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -565,14 +608,20 @@ def fused_experts(
         out_hidden_states = torch.empty_like(hidden_states)
 
     topk_ids = topk_ids.int() if topk_ids.dtype == torch.long else topk_ids
-    expert_offsets = torch.empty((E), dtype=torch.int32, device=hidden_states.device)
-    problem_sizes1 = torch.empty((E, 3), dtype=torch.int32, device=hidden_states.device)
-    problem_sizes2 = torch.empty((E, 3), dtype=torch.int32, device=hidden_states.device)
-    a_map = torch.empty(
-        (topk_ids.numel()), dtype=torch.int32, device=hidden_states.device
+    expert_offsets = _get_moe_ws(
+        workspace, "expert_offsets", (E,), torch.int32, hidden_states.device
     )
-    c_map = torch.empty(
-        (topk_ids.numel()), dtype=torch.int32, device=hidden_states.device
+    problem_sizes1 = _get_moe_ws(
+        workspace, "problem_sizes1", (E, 3), torch.int32, hidden_states.device
+    )
+    problem_sizes2 = _get_moe_ws(
+        workspace, "problem_sizes2", (E, 3), torch.int32, hidden_states.device
+    )
+    a_map = _get_moe_ws(
+        workspace, "a_map", (topk_ids.numel(),), torch.int32, hidden_states.device
+    )
+    c_map = _get_moe_ws(
+        workspace, "c_map", (topk_ids.numel(),), torch.int32, hidden_states.device
     )
     torch.ops.sgl_kernel.prepare_moe_input.default(
         topk_ids,
@@ -586,8 +635,12 @@ def fused_experts(
         hidden_dims,
         TopK,
     )
-    input_A_shuffle = torch.empty(
-        (num_tokens * TopK, K), device=hidden_states.device, dtype=hidden_states.dtype
+    input_A_shuffle = _get_moe_ws(
+        workspace,
+        "input_A_shuffle",
+        (num_tokens * TopK, K),
+        hidden_states.dtype,
+        hidden_states.device,
     )
     # Use scatter_tokens_to_experts (IPEX MoEScatter style):
     # 1 WG per source token, reads sequentially, scatters to TopK destinations,
@@ -602,8 +655,12 @@ def fused_experts(
             input_A_shuffle, w1_g_idx_perm, expert_offsets, E
         )
 
-    intermediate_cache3 = torch.empty(
-        (M * TopK, OutK), device=hidden_states.device, dtype=hidden_states.dtype
+    intermediate_cache3 = _get_moe_ws(
+        workspace,
+        "intermediate_cache3",
+        (M * TopK, OutK),
+        hidden_states.dtype,
+        hidden_states.device,
     )
 
     # 0=silu, 1=gelu, 2=swiglu (silu with alpha/limit clamping for gpt-oss),
@@ -655,13 +712,19 @@ def fused_experts(
     # This preserves GEMM N-dimension parallelism.
     use_unfused_act = use_4bit_w4a16 or (avg_m <= 128 and big_weight)
     if use_unfused_act:
-        intermediate_cache1 = torch.empty(
+        intermediate_cache1 = _get_moe_ws(
+            workspace,
+            "intermediate_cache1_unfused",
             (M * TopK, gate_factor * N),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
+            hidden_states.dtype,
+            hidden_states.device,
         )
-        intermediate_cache2 = torch.empty(
-            (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
+        intermediate_cache2 = _get_moe_ws(
+            workspace,
+            "intermediate_cache2",
+            (M * TopK, N),
+            hidden_states.dtype,
+            hidden_states.device,
         )
         # GEMM1: B = w1 (gate+up).
         if use_4bit_w4a16:
@@ -740,8 +803,12 @@ def fused_experts(
                 gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
             )
     else:
-        intermediate_cache1 = torch.empty(
-            (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
+        intermediate_cache1 = _get_moe_ws(
+            workspace,
+            "intermediate_cache1_fused",
+            (M * TopK, N),
+            hidden_states.dtype,
+            hidden_states.device,
         )
         # GEMM1 (fused act): B = w1 (gate+up). The 4-bit W4A16 paths always use the
         # separate GEMM1 -> activation -> GEMM2 sequence above, so this branch is

@@ -323,7 +323,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor dt_bias, int num_prefills, int num_decodes, int num_spec_decodes, Tensor? has_initial_state, "
       "Tensor? non_spec_query_start_loc, Tensor? non_spec_token_indx, Tensor? non_spec_state_indices_tensor, "
       "Tensor? spec_query_start_loc, Tensor? spec_token_indx, Tensor? spec_state_indices_tensor, "
-      "Tensor? num_accepted_tokens, int num_actual_tokens, int tp_size, bool reorder_input) -> ()");
+      "Tensor? num_accepted_tokens, int num_actual_tokens, int tp_size, bool reorder_input, "
+      "Tensor[]? workspace=None) -> ()");
   m.impl("gdn_attention", torch::kXPU, &gdn_attention);
 
   /*

@@ -816,7 +816,11 @@ void gdn_attention(
     const std::optional<torch::Tensor>& num_accepted_tokens,
     const int64_t num_actual_tokens,
     const int64_t tp_size,
-    const bool reorder_input);
+    const bool reorder_input,
+    // Optional pre-allocated scratch buffers, packed as one fixed-order
+    // list to avoid a long positional-argument list. Order (when present):
+    // [0]=q, [1]=k, [2]=v, [3]=b, [4]=a, [5]=b_prefill, [6]=a_prefill.
+    const std::optional<std::vector<torch::Tensor>>& workspace);
 
 /*
  * Mamba causal conv1d (XPU)

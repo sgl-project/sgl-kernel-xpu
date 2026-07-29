@@ -101,40 +101,14 @@ def flash_compress128_prefill(
     plan_c_u8: torch.Tensor,  # [C, 16]
     plan_w_u8: torch.Tensor,  # [W, 8]
 ) -> None:
-    head_dim = _infer_head_dim_from_inputs(kv_input, ape, kv_output)
-
-    kv_flat = _flatten_slots_128(kv_buffer)
-    C = plan_c_u8.shape[0]
-    assert kv_output.shape == (C, head_dim), (kv_output.shape, C, head_dim)
-
-    seq_len, ragged_id, buffer_len, _rp0, rp1 = decode_plan_c(plan_c_u8)
-
-    # compress
-    for pid in range(C):
-        if seq_len[pid].item() < 0:
-            continue
-        P = int(ragged_id[pid].item())
-        bl = int(buffer_len[pid].item())
-        page = int(rp1[pid].item())
-        kv_buf_page = _page_slice_128(kv_flat, page)
-
-        c128_forward_torch(
-            kv_buf_page=kv_buf_page,
-            kv_input=kv_input,
-            ragged_id=P,
-            kv_out=kv_output[pid],
-            ape=ape,
-            buffer_len=bl,
-        )
-
-    # write after compress
-    rag_w, loc_w = decode_plan_w(plan_w_u8)
-    for i in range(plan_w_u8.shape[0]):
-        if rag_w[i].item() < 0:
-            continue
-        rid = int(rag_w[i].item())
-        loc = int(loc_w[i].item())
-        kv_flat[loc].copy_(kv_input[rid])
+    torch.ops.sgl_kernel.flash_compress128_prefill(
+        kv_buffer,
+        kv_input,
+        kv_output,
+        ape,
+        plan_c_u8,
+        plan_w_u8,
+    )
 
 
 def flash_compress128_decode(

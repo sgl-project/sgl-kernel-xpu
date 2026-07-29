@@ -780,6 +780,14 @@ torch::Tensor plan_compress_decode(
 void flash_compress128_decode(
     torch::Tensor kv_buffer, torch::Tensor kv_input, torch::Tensor kv_output, torch::Tensor ape, torch::Tensor plan_d);
 
+void flash_compress128_prefill(
+    torch::Tensor kv_buffer,
+    torch::Tensor kv_input,
+    torch::Tensor kv_output,
+    torch::Tensor ape,
+    torch::Tensor plan_c,
+    torch::Tensor plan_w);
+
 }  // namespace at::native::xpu
 
 namespace flash {

@@ -226,7 +226,7 @@ void gdn_attention(
     for (auto d : shape)
       numel *= d;
     if (workspace.has_value() && ws_idx < static_cast<int64_t>(workspace->size())) {
-      const torch::Tensor& ws = workspace->at(ws_idx);
+      const torch::Tensor& ws = workspace->at(ws_idx).view(-1);  // view to 1D to ensure contiguous access
       if (ws.defined() && ws.scalar_type() == st && ws.numel() >= numel) {
         auto t = ws.narrow(0, 0, numel).view(shape);
         if (zero_init) t.zero_();

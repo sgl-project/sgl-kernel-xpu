@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import List, Optional
 
 import torch
 
@@ -33,6 +33,7 @@ def gdn_attention(
     num_actual_tokens: int,
     tp_size: int,
     reorder_input: bool,
+    workspace: Optional[List[torch.Tensor]] = None,
 ) -> None:
     """Fused Gated-DeltaNet (GDN) attention for Intel Xe2 (BMG).
 
@@ -70,4 +71,5 @@ def gdn_attention(
         num_actual_tokens,
         tp_size,
         reorder_input,
+        workspace,
     )

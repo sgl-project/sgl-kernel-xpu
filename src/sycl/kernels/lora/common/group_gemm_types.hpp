@@ -71,6 +71,7 @@
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/half.h"
 #include "cutlass/layout/matrix.h"
+#include "sycl/kernels/lora/collective/xe_lora_epilogue.hpp"
 #include "sycl/kernels/lora/device/group_gemm_lora_launcher.hpp"
 
 namespace at::native::xpu {
@@ -153,8 +154,13 @@ struct GroupGemmTypes {
   using FusionCallbacks = cutlass::epilogue::fusion::
       FusionCallbacks<EpilogueDispatchPolicy, EpilogueOp, TileShape, decltype(cute::tile_shape(TiledMma()))>;
 
-  using CollectiveEpilogue = cutlass::epilogue::collective::CollectiveEpilogue<
-      EpilogueDispatchPolicy,
+  // Per-group scalar (alpha/beta) drop-in replacement for the stock
+  // CollectiveEpilogue<IntelXeGenericGroup, ...>. Same template arguments; it
+  // only overrides to_base_arguments() to offset the alpha/beta pointer arrays
+  // by the group index (the stock epilogue leaves them at [0] for every group
+  // because the array kernel hard-codes the tile L coord to 0). Inherits all
+  // other behaviour. See collective/xe_lora_epilogue.hpp.
+  using CollectiveEpilogue = GroupedEpiloguePerGroupScalar<
       TileShape,
       void,  // EpilogueTile (void = automatic)
       ElementAccumulator,

@@ -302,12 +302,12 @@ struct PrefillRunner {
         params.window_size_left,
         params.window_size_right};
     if constexpr (CollectiveMainloop::AppendKV) {
-      mainloop_args.append.ptr_K_new = static_cast<const ElementK*>(params.knew_ptr);
-      mainloop_args.append.ptr_V_new = static_cast<const ElementV*>(params.vnew_ptr);
-      mainloop_args.append.ptr_cu_seqlens_k_new = params.cu_seqlens_knew;
-      mainloop_args.append.ptr_cache_seqlens = params.cache_seqlens_old;
-      mainloop_args.append.seq_len_kv_new = params.seqlen_knew;
-      mainloop_args.append.total_k_new = params.total_knew;
+      mainloop_args.ptr_K_new = static_cast<const ElementK*>(params.knew_ptr);
+      mainloop_args.ptr_V_new = static_cast<const ElementV*>(params.vnew_ptr);
+      mainloop_args.ptr_cu_seqlens_k_new = params.cu_seqlens_knew;
+      mainloop_args.ptr_cache_seqlens = params.cache_seqlens_old;
+      mainloop_args.seq_len_kv_new = params.seqlen_knew;
+      mainloop_args.total_k_new = params.total_knew;
     }
 
     typename FMHAPrefillKernel::Arguments arguments{
@@ -490,7 +490,6 @@ struct FMHAConfig {
     TORCH_CHECK(params.total_q > 0 && params.total_k > 0, "paged prefill requires positive total sequence lengths");
     bool const has_append = params.total_knew > 0 && params.knew_ptr != nullptr && params.vnew_ptr != nullptr &&
                             params.cache_seqlens_old != nullptr;
-    // template <bool isVarLen, bool CachedKV, bool PagedKV, bool AppendKV, class Scheduler>
     if (has_append) {
       return run<true, true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
     }
@@ -523,7 +522,6 @@ struct FMHAConfig {
     TORCH_CHECK(params.total_q > 0 && params.total_k > 0, "non-paged prefill requires positive total sequence lengths");
     bool const has_append = params.total_knew > 0 && params.knew_ptr != nullptr && params.vnew_ptr != nullptr &&
                             params.cache_seqlens_old != nullptr;
-    // template <bool isVarLen, bool CachedKV, bool PagedKV, bool AppendKV, class Scheduler>
     if (has_append) {
       return run<true, true, false, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
     }

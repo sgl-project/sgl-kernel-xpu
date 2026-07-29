@@ -55,21 +55,6 @@ using namespace cute;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <bool AppendKV_, class ElementK_, class ElementV_>
-struct AppendKVParams {};
-
-template <class ElementK_, class ElementV_>
-struct AppendKVParams<true, ElementK_, ElementV_> {
-  ElementK_ const* ptr_K_new = nullptr;
-  ElementV_ const* ptr_V_new = nullptr;
-  int const* ptr_cu_seqlens_k_new = nullptr;
-  int const* ptr_cache_seqlens = nullptr;
-  int seq_len_kv_new = 0;
-  int total_k_new = 0;
-};
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
 template <
     class DispatchPolicy_,
     bool CausalMask_,
@@ -232,8 +217,6 @@ struct FMHAFwdMainloop<
   static_assert(!DirectAppendKV || (AppendKV && PagedKV), "Direct AppendKV requires paged AppendKV");
   static_assert(
       !WideAppendKV || (AppendKV && PagedKV && !DirectAppendKV), "Wide AppendKV requires fused paged AppendKV");
-  using AppendKVStorage =
-      AppendKVParams<AppendKV, typename TensorK_cache::element_type, typename TensorV_cache::element_type>;
 
   // User-facing arguments
   struct Arguments {
@@ -243,7 +226,12 @@ struct FMHAFwdMainloop<
     int max_num_pages_per_seq = 0;
     int window_size_left = -1;
     int window_size_right = -1;
-    AppendKVStorage append{};
+    typename TensorK_cache::element_type const* ptr_K_new = nullptr;
+    typename TensorV_cache::element_type const* ptr_V_new = nullptr;
+    int const* ptr_cu_seqlens_k_new = nullptr;
+    int const* ptr_cache_seqlens = nullptr;
+    int seq_len_kv_new = 0;
+    int total_k_new = 0;
   };
 
   // Kernel-facing parameters
@@ -270,7 +258,12 @@ struct FMHAFwdMainloop<
         args.max_num_pages_per_seq,
         args.window_size_left,
         args.window_size_right,
-        args.append};
+        args.ptr_K_new,
+        args.ptr_V_new,
+        args.ptr_cu_seqlens_k_new,
+        args.ptr_cache_seqlens,
+        args.seq_len_kv_new,
+        args.total_k_new};
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
@@ -294,15 +287,15 @@ struct FMHAFwdMainloop<
   CUTLASS_DEVICE
   int get_k_new_len(int batch) const {
     if constexpr (AppendKV) {
-      if (params.append.ptr_K_new == nullptr || params.append.ptr_V_new == nullptr ||
-          params.append.ptr_cache_seqlens == nullptr || params.append.total_k_new <= 0 ||
-          (params.append.ptr_cu_seqlens_k_new == nullptr && params.append.seq_len_kv_new <= 0)) {
+      if (params.ptr_K_new == nullptr || params.ptr_V_new == nullptr ||
+          params.ptr_cache_seqlens == nullptr || params.total_k_new <= 0 ||
+          (params.ptr_cu_seqlens_k_new == nullptr && params.seq_len_kv_new <= 0)) {
         return 0;
       }
-      if (params.append.ptr_cu_seqlens_k_new != nullptr) {
-        return params.append.ptr_cu_seqlens_k_new[batch + 1] - params.append.ptr_cu_seqlens_k_new[batch];
+      if (params.ptr_cu_seqlens_k_new != nullptr) {
+        return params.ptr_cu_seqlens_k_new[batch + 1] - params.ptr_cu_seqlens_k_new[batch];
       }
-      return params.append.seq_len_kv_new;
+      return params.seq_len_kv_new;
     } else {
       (void)batch;
       return 0;
@@ -333,10 +326,10 @@ struct FMHAFwdMainloop<
       auto& V_dst = const_cast<TensorV_cache2D&>(V_cache_2D);
       int const lane_idx = thr_id % intel::sg_size;
       int const sub_group_id = thr_id / intel::sg_size;
-      int const new_begin = (params.append.ptr_cu_seqlens_k_new != nullptr ? params.append.ptr_cu_seqlens_k_new[batch]
-                                                                           : batch * params.append.seq_len_kv_new) +
+      int const new_begin = (params.ptr_cu_seqlens_k_new != nullptr ? params.ptr_cu_seqlens_k_new[batch]
+                                                                    : batch * params.seq_len_kv_new) +
                             store_begin;
-      int const cache_len_old = params.append.ptr_cache_seqlens[batch] + store_begin;
+      int const cache_len_old = params.ptr_cache_seqlens[batch] + store_begin;
       int const head_size_qk = size<1>(K_cache_2D);
       int const head_size_vo = size<0>(V_cache_2D);
       int const max_hd = head_size_qk > head_size_vo ? head_size_qk : head_size_vo;
@@ -404,8 +397,8 @@ struct FMHAFwdMainloop<
                     size_t const token_src_base = src_base + (size_t)page_tok * token_stride;
                     int const d = d_vec * kVecElems;
                     size_t const src = token_src_base + (size_t)d;
-                    StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_K_new + src);
-                    StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_V_new + src);
+                    StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.ptr_K_new + src);
+                    StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.ptr_V_new + src);
                     *reinterpret_cast<StoreVec*>(&K_dst(dst_row, d)) = k_value;
                     *reinterpret_cast<StoreVec*>(&V_dst(d, dst_row)) = v_value;
                   }
@@ -416,8 +409,8 @@ struct FMHAFwdMainloop<
                     for (int d_vec = lane_idx; d_vec < vecs_per_token; d_vec += intel::sg_size) {
                       int const d = d_vec * kVecElems;
                       size_t const src = token_src_base + (size_t)d;
-                      StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_K_new + src);
-                      StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_V_new + src);
+                      StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.ptr_K_new + src);
+                      StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.ptr_V_new + src);
                       *reinterpret_cast<StoreVec*>(&K_dst(dst_row, d)) = k_value;
                       *reinterpret_cast<StoreVec*>(&V_dst(d, dst_row)) = v_value;
                     }
@@ -439,8 +432,8 @@ struct FMHAFwdMainloop<
                   ((size_t)new_abs_tok * (size_t)num_heads_kv + (size_t)kv_head) * (size_t)head_size;
               int const d = d_vec * kVecElems;
               size_t const src = src_base + (size_t)d;
-              StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_K_new + src);
-              StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_V_new + src);
+              StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.ptr_K_new + src);
+              StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.ptr_V_new + src);
               *reinterpret_cast<StoreVec*>(&K_dst(dst_row, d)) = k_value;
               *reinterpret_cast<StoreVec*>(&V_dst(d, dst_row)) = v_value;
             }
@@ -453,8 +446,8 @@ struct FMHAFwdMainloop<
               for (int d_vec = lane_idx; d_vec < vecs_per_token; d_vec += intel::sg_size) {
                 int const d = d_vec * kVecElems;
                 size_t const src = src_base + (size_t)d;
-                StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_K_new + src);
-                StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_V_new + src);
+                StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.ptr_K_new + src);
+                StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.ptr_V_new + src);
                 *reinterpret_cast<StoreVec*>(&K_dst(dst_row, d)) = k_value;
                 *reinterpret_cast<StoreVec*>(&V_dst(d, dst_row)) = v_value;
               }
@@ -481,12 +474,12 @@ struct FMHAFwdMainloop<
         if (d < head_size_qk) {
           size_t const src =
               ((size_t)new_abs_tok * (size_t)num_heads_kv + (size_t)kv_head) * (size_t)head_size_qk + (size_t)d;
-          K_dst(dst_row, d) = params.append.ptr_K_new[src];
+          K_dst(dst_row, d) = params.ptr_K_new[src];
         }
         if (d < head_size_vo) {
           size_t const src =
               ((size_t)new_abs_tok * (size_t)num_heads_kv + (size_t)kv_head) * (size_t)head_size_vo + (size_t)d;
-          V_dst(d, dst_row) = params.append.ptr_V_new[src];
+          V_dst(d, dst_row) = params.ptr_V_new[src];
         }
       }
     } else {
@@ -621,10 +614,10 @@ struct FMHAFwdMainloop<
           K_cache_2D, V_cache_2D, l_coord, kv_head, num_heads_kv, thr_id, append_store_len, append_store_begin);
       if constexpr (DirectAppendKV) {
         constexpr int kTileKV = get<1>(TileShapeQK{});
-        int const cache_len_old = params.append.ptr_cache_seqlens[l_coord];
-        int const new_begin = params.append.ptr_cu_seqlens_k_new != nullptr
-                                  ? params.append.ptr_cu_seqlens_k_new[l_coord]
-                                  : l_coord * params.append.seq_len_kv_new;
+        int const cache_len_old = params.ptr_cache_seqlens[l_coord];
+        int const new_begin = params.ptr_cu_seqlens_k_new != nullptr
+                                  ? params.ptr_cu_seqlens_k_new[l_coord]
+                                  : l_coord * params.seq_len_kv_new;
         if ((cache_len_old % kTileKV) != 0 || (new_begin % kTileKV) != 0) {
           barrier();
         }
@@ -633,7 +626,6 @@ struct FMHAFwdMainloop<
       }
     }
 
-    /* Initialization steps for first block: Q prefetch, O init */
     for (int D = 0; D < size<3>(pQgQ); D++) {
       prefetch(prefetch_q, pQgQ(_, _, _, D));
     }
@@ -662,9 +654,9 @@ struct FMHAFwdMainloop<
     int direct_block0 = kblocks_total;
     int direct_source_block0 = 0;
     if constexpr (DirectAppendKV) {
-      int const cache_len_old = params.append.ptr_cache_seqlens[l_coord];
-      int const new_begin = params.append.ptr_cu_seqlens_k_new != nullptr ? params.append.ptr_cu_seqlens_k_new[l_coord]
-                                                                          : l_coord * params.append.seq_len_kv_new;
+      int const cache_len_old = params.ptr_cache_seqlens[l_coord];
+      int const new_begin = params.ptr_cu_seqlens_k_new != nullptr ? params.ptr_cu_seqlens_k_new[l_coord]
+                                                                   : l_coord * params.seq_len_kv_new;
       direct_append = (cache_len_old % kTileKV) == 0 && (new_begin % kTileKV) == 0;
       direct_block0 = cache_len_old / kTileKV;
       direct_source_block0 = new_begin / kTileKV;

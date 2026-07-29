@@ -50,8 +50,6 @@ set(FMHA_PREFILL_TILED_Q_256 128)
 set(FMHA_PREFILL_TILED_KV_256 64)
 set(FMHA_PREFILL_NUM_SG_256 16)
 
-# A q256 tile reduces duplicate fused KV-cache stores for uniform 256-token
-# appends while retaining the tuned default tiles for shorter and ragged Q.
 set(FMHA_PREFILL_APPENDKV_Q256_HEAD_DIMS 64 192 256)
 set(FMHA_PREFILL_APPENDKV_Q256_Q_64 256)
 set(FMHA_PREFILL_APPENDKV_Q256_KV_64 64)

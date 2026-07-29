@@ -870,7 +870,7 @@ std::vector<at::Tensor> mha_fwd_nopage(
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
 
-std::vector<at::Tensor> mha_fwd_appendkv(
+std::vector<at::Tensor> mha_fwd(
     const at::Tensor& q,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
                           // h_k, d) if there is page_table.
@@ -1259,75 +1259,6 @@ std::vector<at::Tensor> mha_fwd_appendkv(
   return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
 
-std::vector<at::Tensor> mha_fwd(
-    const at::Tensor& q,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
-    const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
-                          // h_k, d) if there is page_table.
-    const at::Tensor& v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages,
-                          // page_size, h_k, dv) if there is page_table.
-    std::optional<const at::Tensor>& q_v_,  // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
-    const at::Tensor& cu_seqlens_q,         // b+1
-    const at::Tensor& cu_seqlens_k,         // b+1
-    int max_seqlen_q,
-    int max_seqlen_k,
-    std::optional<const at::Tensor>& page_table,       // (b_k, max_num_pages_per_seq)
-    std::optional<const at::Tensor>& kv_batch_idx_,    // b. indices to index into the KV cache
-    std::optional<const at::Tensor>& leftpad_k_,       // b
-    std::optional<const at::Tensor>& rotary_cos_,      // seqlen_ro x (rotary_dim / 2)
-    std::optional<const at::Tensor>& rotary_sin_,      // seqlen_ro x (rotary_dim / 2)
-    std::optional<const at::Tensor>& seqlens_rotary_,  // b
-    std::optional<at::Tensor>& q_descale_,             // (b, h_k), not (b, h)
-    std::optional<at::Tensor>& k_descale_,             // (b, h_k)
-    std::optional<at::Tensor>& v_descale_,             // (b, h_k)
-    const float softmax_scale_,
-    std::optional<const at::Tensor>& sinks_,
-    bool is_causal,
-    int window_size_left,
-    int window_size_right,
-    float const softcap,
-    bool const is_rotary_interleaved,  // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-    std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
-    int num_splits,
-    std::optional<bool> pack_gqa_,
-    int const sm_margin,
-    std::optional<at::Tensor> out_opt = std::nullopt,
-    std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt) {
-  return mha_fwd_appendkv(
-      q,
-      k,
-      v,
-      q_v_,
-      cu_seqlens_q,
-      cu_seqlens_k,
-      max_seqlen_q,
-      max_seqlen_k,
-      page_table,
-      kv_batch_idx_,
-      leftpad_k_,
-      rotary_cos_,
-      rotary_sin_,
-      seqlens_rotary_,
-      q_descale_,
-      k_descale_,
-      v_descale_,
-      softmax_scale_,
-      sinks_,
-      is_causal,
-      window_size_left,
-      window_size_right,
-      softcap,
-      is_rotary_interleaved,
-      scheduler_metadata_,
-      num_splits,
-      pack_gqa_,
-      sm_margin,
-      std::move(out_opt),
-      std::move(skip_batch_mask_opt),
-      std::nullopt,
-      std::nullopt,
-      std::nullopt);
-}
-
 }  // namespace prefill
 
 namespace chunkprefill {
@@ -1370,7 +1301,10 @@ std::vector<at::Tensor> mha_fwd(
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin,
-    std::optional<at::Tensor> out_ = std::nullopt) {
+    std::optional<at::Tensor> out_ = std::nullopt,
+    std::optional<const at::Tensor> k_new_ = std::nullopt,
+    std::optional<const at::Tensor> v_new_ = std::nullopt,
+    std::optional<const at::Tensor> cu_seqlens_k_new_ = std::nullopt) {
   // Supports both paged (page_table != None) and non-paged (contiguous ragged
   // KV, page_table == None) layouts.
   // ``seqlens_rotary_`` is intentionally not checked here: callers pass it
@@ -1381,12 +1315,14 @@ std::vector<at::Tensor> mha_fwd(
           !scheduler_metadata_.has_value(),
       "chunkprefill two-launch path does not yet support q_v / rotary / q_descale / scheduler_metadata.");
   TORCH_CHECK(cu_seqlens_q.scalar_type() == at::kInt, "cu_seqlens_q must be int32.");
+  bool const has_new_kv = k_new_.has_value() || v_new_.has_value() || cu_seqlens_k_new_.has_value();
   // Pre-allocated out requires paged KV: on the non-paged path zero-KV-length
   // rows are never written by the kernel, so a caller buffer would retain stale
   // values on graph replay. SGLang always provides page_table (paged KV cache),
   // so this check should never fire in practice.
   TORCH_CHECK(
       !out_.has_value() || page_table.has_value(), "chunkprefill: out buffer requires page_table (paged KV cache).");
+  TORCH_CHECK(!has_new_kv || page_table.has_value(), "chunkprefill: AppendKV requires page_table (paged KV cache).");
 
   int64_t batch_size = cu_seqlens_q.size(0) - 1;
   TORCH_CHECK(batch_size >= 0, "cu_seqlens_q must have at least 1 element.");
@@ -1434,7 +1370,40 @@ std::vector<at::Tensor> mha_fwd(
   // out_ buffer) and skips prefill batches.
   auto out = launch(decode::mha_fwd, std::move(out_), is_prefill)[0];
   // Launch 2: prefill writes into the same output and skips decode batches.
-  launch(prefill::mha_fwd, out, is_prefill.logical_not());
+  prefill::mha_fwd(
+      q,
+      k,
+      v,
+      q_v_,
+      cu_seqlens_q,
+      cu_seqlens_k,
+      max_seqlen_q,
+      max_seqlen_k,
+      page_table,
+      kv_batch_idx_,
+      leftpad_k_,
+      rotary_cos_,
+      rotary_sin_,
+      seqlens_rotary_,
+      q_descale_,
+      k_descale_,
+      v_descale_,
+      softmax_scale_,
+      sinks_,
+      is_causal,
+      window_size_left,
+      window_size_right,
+      softcap,
+      is_rotary_interleaved,
+      scheduler_metadata_,
+      num_kv_splits,
+      pack_gqa_,
+      sm_margin,
+      out,
+      is_prefill.logical_not(),
+      k_new_,
+      v_new_,
+      cu_seqlens_k_new_);
 
   // softmax_lse / accum tensors are not stitched here; return empty
   // placeholders to keep the Python ABI stable.
@@ -1473,7 +1442,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin,
-    std::optional<at::Tensor>& out_) {
+    std::optional<at::Tensor>& out_,
+    std::optional<const at::Tensor>& k_new_,
+    std::optional<const at::Tensor>& v_new_,
+    std::optional<const at::Tensor>& cu_seqlens_k_new_) {
   TORCH_CHECK(q.dim() == 3, "query must be in ragged format (total_q, h, d)");
   // k and v may be 3D (total_k, h_k, d) for non-paged or 4D (num_pages, page_size, h_k, d)
   // for paged KV cache; sub-functions validate their own shapes.
@@ -1541,92 +1513,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     // is_prefill.all() — a device reduction + D2H sync that costs more than it saves.
     // But batch_size == 1 makes it provable from host scalars:
     // a single sequence with max_seqlen_q > 1 is prefill
-    return dispatch(prefill::mha_fwd, std::nullopt);
+    return dispatch(prefill::mha_fwd, std::nullopt, std::nullopt, std::nullopt, std::nullopt);
   } else {
-    // Prefill path
+    // Chunk prefill path
     // Paged attn with max_seqlen_q > 1 and batch_size > 1
-    return dispatch(prefill::mha_fwd, std::nullopt);
+    return dispatch(chunkprefill::mha_fwd, k_new_, v_new_, cu_seqlens_k_new_);
   }
-}
-
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd_appendkv(
-    const at::Tensor& q,  // (total_q, h, d) — ragged 3D
-    const at::Tensor& k,  // (total_k, h_k, d) if non-paged, or (num_pages, page_size, h_k, d) if paged
-    const at::Tensor& v,  // (total_k, h_k, dv) if non-paged, or (num_pages, page_size, h_k, dv) if paged
-    std::optional<const at::Tensor>& q_v_,  // (total_q, h, dv) — not yet supported
-    const at::Tensor& cu_seqlens_q,         // b+1
-    const at::Tensor& cu_seqlens_k,         // b+1
-    int max_seqlen_q,
-    int max_seqlen_k,
-    std::optional<const at::Tensor>& page_table,       // (b_k, max_num_pages_per_seq)
-    std::optional<const at::Tensor>& kv_batch_idx_,    // b. indices to index into the KV cache
-    std::optional<const at::Tensor>& leftpad_k_,       // b
-    std::optional<const at::Tensor>& rotary_cos_,      // seqlen_ro x (rotary_dim / 2)
-    std::optional<const at::Tensor>& rotary_sin_,      // seqlen_ro x (rotary_dim / 2)
-    std::optional<const at::Tensor>& seqlens_rotary_,  // b
-    std::optional<at::Tensor>& q_descale_,             // (b, h_k), not (b, h)
-    std::optional<at::Tensor>& k_descale_,             // (b, h_k)
-    std::optional<at::Tensor>& v_descale_,             // (b, h_k)
-    const float softmax_scale_,
-    std::optional<const at::Tensor>& sinks_,
-    bool is_causal,
-    int window_size_left,
-    int window_size_right,
-    float const softcap,
-    bool const is_rotary_interleaved,  // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-    std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
-    int num_kv_splits,
-    std::optional<bool> pack_gqa_,
-    int const sm_margin,
-    std::optional<at::Tensor>& out_,
-    std::optional<const at::Tensor>& k_new_,
-    std::optional<const at::Tensor>& v_new_,
-    std::optional<const at::Tensor>& cu_seqlens_k_new_) {
-  TORCH_CHECK(q.dim() == 3, "query must be in ragged format (total_q, h, d)");
-  if (out_.has_value()) {
-    const at::Tensor& out_val = out_.value();
-    TORCH_CHECK(out_val.scalar_type() == q.scalar_type(), "out dtype must match q dtype");
-    TORCH_CHECK(
-        out_val.dim() == 3 && out_val.size(0) == q.size(0) && out_val.size(1) == q.size(1) &&
-            out_val.size(2) == v.size(-1),
-        "out shape must be [total_q, num_heads, head_size_v]");
-    TORCH_CHECK(out_val.device() == q.device(), "out must be on the same device as q");
-    TORCH_CHECK(out_val.stride(-1) == 1, "out must have a contiguous last dimension");
-  }
-  auto to_tuple = [](std::vector<at::Tensor> v) { return std::make_tuple(v[0], v[1], v[2], v[3]); };
-  return to_tuple(prefill::mha_fwd_appendkv(
-      q,
-      k,
-      v,
-      q_v_,
-      cu_seqlens_q,
-      cu_seqlens_k,
-      max_seqlen_q,
-      max_seqlen_k,
-      page_table,
-      kv_batch_idx_,
-      leftpad_k_,
-      rotary_cos_,
-      rotary_sin_,
-      seqlens_rotary_,
-      q_descale_,
-      k_descale_,
-      v_descale_,
-      softmax_scale_,
-      sinks_,
-      is_causal,
-      window_size_left,
-      window_size_right,
-      softcap,
-      is_rotary_interleaved,
-      scheduler_metadata_,
-      num_kv_splits,
-      pack_gqa_,
-      sm_margin,
-      out_,
-      std::nullopt,
-      k_new_,
-      v_new_,
-      cu_seqlens_k_new_));
 }
 #undef SYCL_INTEL_TARGET

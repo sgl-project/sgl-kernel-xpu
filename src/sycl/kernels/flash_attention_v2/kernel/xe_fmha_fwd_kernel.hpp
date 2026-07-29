@@ -246,15 +246,15 @@ class XeFMHAFwdKernel {
   CUTLASS_DEVICE
   int get_k_new_len(MainloopParams const& mainloop, int batch) {
     if constexpr (CollectiveMainloop::AppendKV) {
-      if (mainloop.append.ptr_K_new == nullptr || mainloop.append.ptr_V_new == nullptr ||
-          mainloop.append.ptr_cache_seqlens == nullptr || mainloop.append.total_k_new <= 0 ||
-          (mainloop.append.ptr_cu_seqlens_k_new == nullptr && mainloop.append.seq_len_kv_new <= 0)) {
+      if (mainloop.ptr_K_new == nullptr || mainloop.ptr_V_new == nullptr ||
+          mainloop.ptr_cache_seqlens == nullptr || mainloop.total_k_new <= 0 ||
+          (mainloop.ptr_cu_seqlens_k_new == nullptr && mainloop.seq_len_kv_new <= 0)) {
         return 0;
       }
-      if (mainloop.append.ptr_cu_seqlens_k_new != nullptr) {
-        return mainloop.append.ptr_cu_seqlens_k_new[batch + 1] - mainloop.append.ptr_cu_seqlens_k_new[batch];
+      if (mainloop.ptr_cu_seqlens_k_new != nullptr) {
+        return mainloop.ptr_cu_seqlens_k_new[batch + 1] - mainloop.ptr_cu_seqlens_k_new[batch];
       }
-      return mainloop.append.seq_len_kv_new;
+      return mainloop.seq_len_kv_new;
     } else {
       (void)mainloop;
       (void)batch;
@@ -299,7 +299,7 @@ class XeFMHAFwdKernel {
       if constexpr (CollectiveMainloop::AppendKV) {
         int const seq_k_new = get_k_new_len(params.mainloop, idx_b);
         if (seq_k_new > 0) {
-          seq_k_eff = params.mainloop.append.ptr_cache_seqlens[idx_b] + seq_k_new;
+          seq_k_eff = params.mainloop.ptr_cache_seqlens[idx_b] + seq_k_new;
         }
       }
       // M extent of the Q/O tile: the packed GQA group for decode, otherwise the
@@ -336,10 +336,10 @@ class XeFMHAFwdKernel {
         if (seq_k_new > 0) {
           append_store_len = seq_k_new;
           if constexpr (DirectAppendKV) {
-            int const cache_len_old = params.mainloop.append.ptr_cache_seqlens[idx_b];
-            int const new_begin = params.mainloop.append.ptr_cu_seqlens_k_new != nullptr
-                                      ? params.mainloop.append.ptr_cu_seqlens_k_new[idx_b]
-                                      : idx_b * params.mainloop.append.seq_len_kv_new;
+            int const cache_len_old = params.mainloop.ptr_cache_seqlens[idx_b];
+            int const new_begin = params.mainloop.ptr_cu_seqlens_k_new != nullptr
+                                      ? params.mainloop.ptr_cu_seqlens_k_new[idx_b]
+                                      : idx_b * params.mainloop.seq_len_kv_new;
             constexpr int kTileKV = get<1>(TileShapeQK{});
             bool const direct_batch = (cache_len_old % kTileKV) == 0 && (new_begin % kTileKV) == 0;
             if (direct_batch) {
@@ -356,7 +356,7 @@ class XeFMHAFwdKernel {
           if constexpr (CollectiveMainloop::CausalMask && !PackGQA_) {
             // Without a grid-wide barrier, each WG must write every appended
             // token it may read; causal tiles only need the visible prefix.
-            int const cache_len_old = params.mainloop.append.ptr_cache_seqlens[idx_b];
+            int const cache_len_old = params.mainloop.ptr_cache_seqlens[idx_b];
             int const tile_q = get<0>(TileShapeQK{});
             int const q_tile_end = cute::min(seq_len_qo, (blk_q + 1) * tile_q);
             int const visible_k_end = cute::min(seq_k_eff, full_tile_offset + q_tile_end);

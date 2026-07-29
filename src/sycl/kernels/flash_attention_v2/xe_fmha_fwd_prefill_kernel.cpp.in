@@ -89,7 +89,6 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@>::opera
 #endif
 
 #if @HEAD_DIM@ == 96
-  // Dense hkv8 batches already provide enough occupancy and run faster with the original sg8 tile.
   if (params.b >= 8 && params.h_k >= 8) {
     using DenseTileShapeQK = cute::Shape<cute::Int<128>, cute::Int<64>, cute::_32>;
     using DenseTileShapePV = cute::Shape<cute::Int<128>, cute::_32, cute::Int<64>>;

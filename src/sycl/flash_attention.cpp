@@ -183,8 +183,7 @@ std::vector<at::Tensor> mha_fwd_nopage(
 
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
-  // No "new" KV: the whole sequence lives in the contiguous cache buffer, so the
-  // decode kernel reads everything from the K/V cache pointers (knew = 0).
+  // No "new" KV: the whole sequence lives in the contiguous cache buffer.
   params.knew_ptr = nullptr;
   params.vnew_ptr = nullptr;
   params.cu_seqlens_knew = nullptr;
@@ -781,12 +780,12 @@ std::vector<at::Tensor> mha_fwd_nopage(
 
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
-  params.knew_ptr = nullptr;
-  params.vnew_ptr = nullptr;
-  params.cu_seqlens_knew = nullptr;
-  params.cache_seqlens_old = nullptr;
-  params.seqlen_knew = 0;
-  params.total_knew = 0;
+  params.k_new_ptr = nullptr;
+  params.v_new_ptr = nullptr;
+  params.cu_seqlens_kvnew = nullptr;
+  params.kv_cache_seqlens = nullptr;
+  params.seqlen_kvnew = 0;
+  params.total_kvnew = 0;
 
   params.softmax_lse_ptr = softmax_lse.data_ptr();
 
@@ -795,7 +794,7 @@ std::vector<at::Tensor> mha_fwd_nopage(
   params.h_k = num_heads_k;
   params.q_group_size = 1;
   params.seqlen_q = seqlen_q;
-  params.seqlen_k = seqlen_k;
+  params.seqlen_kvcache = seqlen_k;
   params.d = head_size;
   params.d_rounded = head_size_rounded;
 
@@ -820,7 +819,7 @@ std::vector<at::Tensor> mha_fwd_nopage(
   params.window_size_left = window_size_left;
   params.window_size_right = window_size_right;
   params.total_q = total_q;
-  params.total_k = total_k;
+  params.total_kvcache = total_k;
   params.b_k = batch_size;
   params.dv = head_size_v;
 
@@ -1068,7 +1067,7 @@ std::vector<at::Tensor> mha_fwd(
   params.h_k = num_heads_k;
   params.q_group_size = 1;
   params.seqlen_q = seqlen_q;
-  params.seqlen_k = seqlen_k;
+  params.seqlen_kvcache = seqlen_k;
   params.d = head_size;
   params.d_rounded = head_size_rounded;
 
@@ -1113,7 +1112,7 @@ std::vector<at::Tensor> mha_fwd(
   params.window_size_left = window_size_left;
   params.window_size_right = window_size_right;
   params.total_q = total_q;
-  params.total_k = total_k;
+  params.total_kvcache = total_k;
   params.b_k = batch_size_k;
   params.dv = head_size_v;
   params.page_table = page_table.value().data_ptr<int>();
@@ -1122,12 +1121,12 @@ std::vector<at::Tensor> mha_fwd(
   params.page_size = page_size;
   params.num_pages = num_pages;
 
-  params.knew_ptr = nullptr;
-  params.vnew_ptr = nullptr;
-  params.cu_seqlens_knew = nullptr;
-  params.cache_seqlens_old = nullptr;
-  params.seqlen_knew = 0;
-  params.total_knew = 0;
+  params.k_new_ptr = nullptr;
+  params.v_new_ptr = nullptr;
+  params.cu_seqlens_kvnew = nullptr;
+  params.kv_cache_seqlens = nullptr;
+  params.seqlen_kvnew = 0;
+  params.total_kvnew = 0;
   if (has_new_kv) {
     TORCH_CHECK(k_new_.has_value() && v_new_.has_value(), "AppendKV requires both k_new and v_new");
     auto const& k_new = k_new_.value();
@@ -1138,20 +1137,20 @@ std::vector<at::Tensor> mha_fwd(
     TORCH_CHECK(v_new.scalar_type() == v.scalar_type(), "v_new dtype must match KV cache value dtype");
     TORCH_CHECK(k_new.dim() == 3 || k_new.dim() == 4, "k_new must be [total_k_new, h_k, d] or [b, s, h_k, d]");
     TORCH_CHECK(v_new.dim() == k_new.dim(), "v_new rank must match k_new rank");
-    int total_knew = 0;
-    int seqlen_knew = max_seqlen_k > 0 ? max_seqlen_k : max_seqlen_q;
+    int total_kvnew = 0;
+    int seqlen_kvnew = max_seqlen_k > 0 ? max_seqlen_k : max_seqlen_q;
     if (k_new.dim() == 3) {
-      total_knew = k_new.size(0);
-      CHECK_SHAPE(k_new, total_knew, num_heads_k, head_size);
-      CHECK_SHAPE(v_new, total_knew, num_heads_k, head_size_v);
+      total_kvnew = k_new.size(0);
+      CHECK_SHAPE(k_new, total_kvnew, num_heads_k, head_size);
+      CHECK_SHAPE(v_new, total_kvnew, num_heads_k, head_size_v);
       TORCH_CHECK(
-          cu_seqlens_k_new_.has_value() || seqlen_knew > 0,
+          cu_seqlens_k_new_.has_value() || seqlen_kvnew > 0,
           "ragged k_new requires cu_seqlens_k_new or positive max_seqlen_k");
     } else {
       TORCH_CHECK(k_new.size(0) == batch_size, "batched k_new first dimension must match batch size");
       int const k_new_seqlen = k_new.size(1);
-      total_knew = batch_size * k_new_seqlen;
-      seqlen_knew = max_seqlen_k > 0 ? max_seqlen_k : k_new_seqlen;
+      total_kvnew = batch_size * k_new_seqlen;
+      seqlen_kvnew = max_seqlen_k > 0 ? max_seqlen_k : k_new_seqlen;
       CHECK_SHAPE(k_new, batch_size, k_new_seqlen, num_heads_k, head_size);
       CHECK_SHAPE(v_new, batch_size, k_new_seqlen, num_heads_k, head_size_v);
     }
@@ -1160,13 +1159,13 @@ std::vector<at::Tensor> mha_fwd(
       CHECK_INPUT(cu_seqlens_k_new);
       TORCH_CHECK(cu_seqlens_k_new.dtype() == torch::kInt32, "cu_seqlens_k_new must have dtype torch.int32");
       CHECK_SHAPE(cu_seqlens_k_new, batch_size + 1);
-      params.cu_seqlens_knew = cu_seqlens_k_new.data_ptr<int>();
+      params.cu_seqlens_kvnew = cu_seqlens_k_new.data_ptr<int>();
     }
-    params.knew_ptr = k_new.data_ptr();
-    params.vnew_ptr = v_new.data_ptr();
-    params.cache_seqlens_old = cu_seqlens_k.data_ptr<int>();
-    params.seqlen_knew = seqlen_knew;
-    params.total_knew = total_knew;
+    params.k_new_ptr = k_new.data_ptr();
+    params.v_new_ptr = v_new.data_ptr();
+    params.kv_cache_seqlens = cu_seqlens_k.data_ptr<int>();
+    params.seqlen_kvnew = seqlen_kvnew;
+    params.total_kvnew = total_kvnew;
   }
 
   if (q_v_.has_value()) {

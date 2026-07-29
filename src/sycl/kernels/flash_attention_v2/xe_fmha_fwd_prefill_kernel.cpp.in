@@ -64,10 +64,10 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
       cute::Layout<cute::Shape<cute::Int<@NUM_SG@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
 
 #if @APPENDKV_Q256_TILE@
-  if (params.total_knew > 0 && params.seqlen_q == @APPENDKV_Q256_Q@ &&
-      params.seqlen_knew == @APPENDKV_Q256_Q@ &&
+  if (params.total_kvnew > 0 && params.seqlen_q == @APPENDKV_Q256_Q@ &&
+      params.seqlen_kvnew == @APPENDKV_Q256_Q@ &&
       params.total_q == params.b * @APPENDKV_Q256_Q@ &&
-      params.total_knew == params.b * @APPENDKV_Q256_Q@ && !params.is_causal && !params.is_local && !use_sink &&
+      params.total_kvnew == params.b * @APPENDKV_Q256_Q@ && !params.is_causal && !params.is_local && !use_sink &&
       params.d == @HEAD_DIM@ && params.dv == @HEAD_DIM@) {
     using AppendTileShapeQK =
         cute::Shape<cute::Int<@APPENDKV_Q256_Q@>, cute::Int<@APPENDKV_Q256_KV@>, cute::_32>;

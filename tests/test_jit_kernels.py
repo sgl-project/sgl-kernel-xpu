@@ -327,6 +327,7 @@ def test_per_token_group_quant_8bit_jit_vs_aot(
             dq(q_jit, s_jit), dq(q_aot, s_aot), rtol=1e-1, atol=1e-1
         )
 
+
 @pytest.mark.parametrize(
     "num_experts",
     [8, 32, 128, 256, 5, 100],  # power-of-2 fast path + general fallback (5, 100)

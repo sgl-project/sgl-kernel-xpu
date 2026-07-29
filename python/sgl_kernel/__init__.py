@@ -22,7 +22,7 @@ from sgl_kernel.attention import (
     merge_state,
     merge_state_v2,
 )
-from sgl_kernel.compress_plan_torch import (
+from sgl_kernel.compress_plan import (
     plan_compress_decode,
     plan_compress_decode_legacy,
     plan_compress_prefill,
@@ -31,6 +31,8 @@ from sgl_kernel.compress_plan_torch import (
 from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
     fused_add_rmsnorm,
+    fused_inplace_qknorm_rope,
+    fused_q_norm_rope,
     fused_qk_norm_rope,
     fused_qk_rope,
     fused_qk_rope_with_cos_sin_cache_inplace,
@@ -53,10 +55,12 @@ from sgl_kernel.flash_compress_128_torch import (
     flash_compress128_prefill,
 )
 from sgl_kernel.fp8_paged_mqa_logits import fp8_paged_mqa_logits_triton
+from sgl_kernel.fused_k_norm_rope_flashmla_torch import fused_k_norm_rope_flashmla
 from sgl_kernel.fused_norm_rope_v2_torch import compress_norm_rope_store
 from sgl_kernel.fused_q_indexer_rope_hadamard_quant_torch import (
     fused_q_indexer_rope_hadamard_quant,
 )
+from sgl_kernel.gdn_attn import gdn_attention
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
@@ -92,7 +96,8 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer_pf_lf,
     transfer_kv_per_layer_ph_lf,
 )
-from sgl_kernel.lora import embedding_lora_a_fwd
+from sgl_kernel.lora import embedding_lora_a_fwd, sgemm_lora_a_fwd
+from sgl_kernel.mamba import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
 from sgl_kernel.memory import weak_ref_tensor
 from sgl_kernel.mhc import (
     hc_post,
@@ -103,9 +108,11 @@ from sgl_kernel.mhc import (
 )
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
+    biased_topk,
     cutlass_fp4_group_mm,
     fp8_blockwise_scaled_grouped_mm,
     fused_experts,
+    hash_topk,
     moe_align_block_size,
     moe_fused_gate,
     moe_sum,

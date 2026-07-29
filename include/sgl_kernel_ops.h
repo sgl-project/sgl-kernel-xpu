@@ -115,6 +115,17 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
+void fused_inplace_qknorm_rope(
+    torch::Tensor& q,
+    torch::Tensor& k,
+    torch::Tensor& q_weight,
+    torch::Tensor& k_weight,
+    torch::Tensor& cos_sin_cache,
+    torch::Tensor& positions,
+    bool is_neox,
+    double eps,
+    int64_t head_dim,
+    int64_t rope_dim);
 void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize);
 void topk_sigmoid(
     at::Tensor& topk_weights,
@@ -124,6 +135,13 @@ void topk_sigmoid(
     const c10::optional<at::Tensor>& correction_bias,
     double routed_scaling_factor = 1.0,
     int64_t num_fused_shared_experts = 0);
+void hash_topk(
+    const at::Tensor& router_logits,
+    const at::Tensor& input_ids,
+    const at::Tensor& tid2eid,
+    at::Tensor& topk_weights,
+    at::Tensor& topk_ids,
+    double routed_scaling_factor = 1.0);
 
 std::tuple<at::Tensor, at::Tensor> rotary_embedding(
     at::Tensor& positions,
@@ -212,6 +230,17 @@ void sgl_per_token_group_quant_fp4(
     double eps,
     std::optional<at::Tensor> input_secondary = std::nullopt);
 void store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices);
+void biased_topk(
+    const at::Tensor& input,
+    const at::Tensor& bias,
+    at::Tensor& output,
+    at::Tensor& indices,
+    int64_t topk,
+    int64_t scoring_func,
+    int64_t num_fused_shared_experts,
+    bool renormalize,
+    double routed_scaling_factor,
+    bool apply_routed_scaling_factor_on_output);
 }  // namespace at::native::xpu
 
 /*
@@ -435,7 +464,7 @@ torch::Tensor swiglu_gpt_oss_sigmoid_alpha(torch::Tensor x, double alpha, double
 
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
-    at::Tensor& bias,
+    const std::optional<at::Tensor>& bias,
     int64_t num_expert_group,
     int64_t topk_group,
     int64_t topk,
@@ -477,21 +506,27 @@ void moe_grouped_mm_nt_xe20(
     double gemm1_alpha = 1.702,
     double gemm1_limit = 7.0);
 
-// Tile-fused MXFP4-B × BF16-A MoE grouped GEMM. `packed_weights` is int8
-// with two E2M1 nibbles per byte (low nibble = smaller-K element).
-// `scales` is float32 direct-multiplier, one per 32-element K-block.
-void moe_grouped_mm_nt_xe20_mxfp4_w4a16(
+// Unified int4/mxfp4 W4A16 MoE grouped GEMM.
+// `packed_weights` is int8 [E, N, K/2] with two 4-bit values per byte.
+// `scales` is [E, N, K/group_size], N-outer: bfloat16 direct multiplier for
+// int4, or uint8 E8M0 exponent for mxfp4 (decoded in registers). `zeros` is
+// an optional [E, N, K/group_size] bfloat16 tensor (int4-only) holding the
+// raw per-group zero-point in code units; when supplied, weights dequant as
+// `(code - zp) * scale` instead of requiring the zero-point to be pre-folded
+// into a signed 4-bit code (which overflows for non-symmetric zero-points).
+// `rows_per_expert` holds the per-expert row counts. group_size must be
+// 32/64/128/256. The caller runs the activation between GEMM1 and GEMM2.
+void moe_grouped_mm_nt_xe20_w4a16(
     torch::Tensor& output,
     const torch::Tensor& activations,
     const torch::Tensor& packed_weights,
     const torch::Tensor& scales,
+    const std::optional<at::Tensor>& zeros,
     const std::optional<at::Tensor>& bias,
-    const torch::Tensor& total_rows_for_experts,
+    const torch::Tensor& rows_per_expert,
     const int64_t n_experts,
-    const int64_t activation_type = 0,
-    bool fuse_act = false,
-    double gemm1_alpha = 1.702,
-    double gemm1_limit = 7.0);
+    bool is_int4,
+    const int64_t group_size);
 
 void prepare_moe_input(
     const torch::Tensor& topk_ids,
@@ -715,6 +750,35 @@ void fast_topk_transform_ragged_interface(
     const at::Tensor& topk_indices_offset,
     std::optional<at::Tensor> row_starts_opt);
 
+/*
+ * Compress plan kernels
+ */
+namespace at::native::xpu {
+
+std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill(
+    torch::Tensor req_pool_indices,
+    torch::Tensor req_to_token,
+    torch::Tensor full_to_state,
+    torch::Tensor seq_lens,
+    torch::Tensor extend_lens,
+    torch::Tensor pin_buffer,
+    int64_t num_q_tokens,
+    int64_t compress_ratio,
+    int64_t swa_page_size,
+    int64_t ring_size,
+    bool use_cuda_graph);
+
+torch::Tensor plan_compress_decode(
+    torch::Tensor req_pool_indices,
+    torch::Tensor req_to_token,
+    torch::Tensor full_to_state,
+    torch::Tensor seq_lens,
+    int64_t compress_ratio,
+    int64_t swa_page_size,
+    int64_t ring_size);
+
+}  // namespace at::native::xpu
+
 namespace flash {
 /*
  * From fa2 sparse
@@ -833,3 +897,72 @@ void embedding_lora_a_fwd(
     const std::optional<torch::Tensor>& extra_embeddings,  // [num_loras, num_extra_tokens, max_rank]
     const std::optional<torch::Tensor>& seg_lens           // [num_segments,]
 );
+
+void sgemm_lora_a_fwd(
+    torch::Tensor& output,         // [num_tokens, stacknum*max_rank]
+    const torch::Tensor& input_x,  // [num_tokens, input_dim]
+    const torch::Tensor& weights,  // [num_loras, stack_num*max_rank, input_dim]
+    const int64_t stack_num,
+    const torch::Tensor& seg_indptr,              // [num_segments + 1,]
+    const torch::Tensor& weight_indices,          // [num_segments,]
+    const torch::Tensor& lora_ranks,              // [num_loras,]
+    const std::optional<torch::Tensor>& seg_lens  // [num_segments,]
+);
+
+/*
+ * From GDN (Gated DeltaNet) attention (Intel Xe2)
+ */
+void gdn_attention(
+    torch::Tensor& core_attn_out,
+    torch::Tensor& z,
+    const torch::Tensor& projected_states_qkvz,
+    const torch::Tensor& projected_states_ba,
+    const int64_t num_k_heads,
+    const int64_t num_v_heads,
+    const int64_t head_k_dim,
+    const int64_t head_v_dim,
+    torch::Tensor& conv_state,
+    torch::Tensor& ssm_state,
+    const torch::Tensor& conv_weights,
+    const std::optional<torch::Tensor>& conv_bias,
+    const std::string& activation,
+    const torch::Tensor& A_log,
+    const torch::Tensor& dt_bias,
+    const int64_t num_prefills,
+    const int64_t num_decodes,
+    const int64_t num_spec_decodes,
+    const std::optional<torch::Tensor>& has_initial_state,
+    const std::optional<torch::Tensor>& non_spec_query_start_loc,
+    const std::optional<torch::Tensor>& non_spec_token_indx,
+    const std::optional<torch::Tensor>& non_spec_state_indices_tensor,
+    const std::optional<torch::Tensor>& spec_query_start_loc,
+    const std::optional<torch::Tensor>& spec_token_indx,
+    const std::optional<torch::Tensor>& spec_state_indices_tensor,
+    const std::optional<torch::Tensor>& num_accepted_tokens,
+    const int64_t num_actual_tokens,
+    const int64_t tp_size,
+    const bool reorder_input);
+
+/*
+ * Mamba causal conv1d (XPU)
+ */
+void causal_conv1d_fwd(
+    at::Tensor& x,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias_,
+    const std::optional<at::Tensor>& conv_states,
+    const std::optional<at::Tensor>& query_start_loc,
+    const std::optional<at::Tensor>& cache_indices,
+    const std::optional<at::Tensor>& has_initial_state,
+    bool silu_activation,
+    int64_t pad_slot_id);
+
+void causal_conv1d_update(
+    at::Tensor& x,
+    at::Tensor& conv_state,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias_,
+    bool silu_activation,
+    const std::optional<at::Tensor>& cache_seqlens_,
+    const std::optional<at::Tensor>& conv_state_indices_,
+    int64_t pad_slot_id);

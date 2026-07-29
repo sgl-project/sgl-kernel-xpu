@@ -140,6 +140,68 @@ def gemma_fused_add_rmsnorm(
     torch.ops.sgl_kernel.gemma_fused_add_rmsnorm(input, residual, weight, eps)
 
 
+def fused_inplace_qknorm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    is_neox: bool,
+    eps: float = 1e-6,
+    head_dim: int = 0,
+    rope_dim: int = 0,
+) -> None:
+    r"""Apply fused RMSNorm + RoPE to Q/K using a precomputed cos/sin cache.
+
+    Step 1:
+    ``q = RMSNorm(q, q_weight)`` and ``k = RMSNorm(k, k_weight)``
+
+    Step 2:
+    ``q`` and ``k`` are rotated in-place using the cached cosine/sine values
+    indexed by ``positions``.
+
+    Parameters
+    ----------
+    q: torch.Tensor
+        Query tensor updated in-place.
+    k: torch.Tensor
+        Key tensor updated in-place.
+    q_weight: torch.Tensor
+        RMSNorm weights for query, shape ``(head_dim,)``.
+    k_weight: torch.Tensor
+        RMSNorm weights for key, shape ``(head_dim,)``.
+    cos_sin_cache: torch.Tensor
+        Precomputed RoPE cosine/sine cache, shape ``(max_pos, rope_dim)``.
+    positions: torch.Tensor
+        Position indices used to select rows from ``cos_sin_cache``.
+    is_neox: bool
+        Whether to apply NeoX-style rotary layout.
+    eps: float
+        Epsilon for RMS normalization.
+    head_dim: int
+        Optional explicit head dimension. Defaults to ``q.size(-1)`` when set to 0.
+    rope_dim: int
+        Optional explicit rotary dimension. Defaults to ``cos_sin_cache.size(-1)`` when set to 0.
+
+    Note
+    ----
+    This is an in-place operation that modifies ``q`` and ``k`` directly.
+    """
+    torch.ops.sgl_kernel.fused_inplace_qknorm_rope(
+        q,
+        k,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        is_neox,
+        eps,
+        head_dim,
+        rope_dim,
+    )
+
+
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
     assert input.ndim == output.ndim, f"{input.ndim} != {output.ndim}"
     assert (
@@ -577,3 +639,88 @@ def multimodal_rotary_embedding(
         is_neox,
         axis_map,
     )
+
+
+def fused_q_norm_rope(
+    q_input: torch.Tensor,  # (B, num_q_heads, head_dim)  any float dtype
+    q_output: torch.Tensor,  # (B, num_q_heads, head_dim)  same dtype, pre-allocated
+    freqs_cis: torch.Tensor,  # (max_pos, rope_dim) fp32, interleaved re/im
+    positions: torch.Tensor,  # (B,) int32 or int64
+    eps: float,
+) -> None:
+    """
+    In-place fused warp-per-(token, head) RMSNorm-self + RoPE.
+    Writes result into q_output (same shape as q_input).
+    Pure-PyTorch reference implementation of FusedQNormRopeKernel.
+
+    Matches the CUDA kernel in:
+      python/sglang/jit_kernel/csrc/deepseek_v4/main_norm_rope.cuh
+
+    Algorithm (per token, per head):
+      1. RMSNorm-self  – normalize the full head_dim vector (no learned weight).
+      2. NoPE region   – first (head_dim - rope_dim) elements written as-is.
+      3. RoPE region   – last rope_dim elements rotated with freqs_cis.
+
+    freqs_cis contract (from the call-site):
+      torch.view_as_real(freqs_cis).flatten(-2)  →  (max_pos, rope_dim) fp32
+      Layout is interleaved [re0, im0, re1, im1, ...] along the last axis,
+      so rope_dim pairs map to rope_dim/2 complex rotations.
+    """
+    # ------------------------------------------------------------------ #
+    # shapes / constants
+    # ------------------------------------------------------------------ #
+    B, H, head_dim = q_input.shape
+    rope_dim = freqs_cis.shape[-1]  # interleaved: rope_dim = 2 * num_pairs
+    nope_dim = head_dim - rope_dim
+
+    assert rope_dim % 2 == 0, "rope_dim must be even (interleaved re/im)"
+    assert nope_dim > 0
+    assert q_output.shape == (
+        B,
+        H,
+        head_dim,
+    ), f"q_output must have shape {(B, H, head_dim)}, got {tuple(q_output.shape)}"
+    assert freqs_cis.shape[-1] == rope_dim
+
+    # ------------------------------------------------------------------ #
+    # part 1: RMSNorm-self  (no learned weight)
+    #   norm_factor = rsqrt(mean(x^2) + eps)
+    # ------------------------------------------------------------------ #
+    x = q_input.float()  # (B, H, head_dim)
+
+    # mean of squares over the head dimension
+    rms = x.pow(2).mean(dim=-1, keepdim=True)  # (B, H, 1)
+    norm_factor = torch.rsqrt(rms + eps)  # (B, H, 1)
+    x = x * norm_factor  # (B, H, head_dim)  – normalised
+
+    # ------------------------------------------------------------------ #
+    # part 2: RoPE on the last rope_dim elements
+    #   freqs row for each token: shape (B, rope_dim)  [re0,im0,re1,im1,...]
+    # ------------------------------------------------------------------ #
+    # gather the per-token frequency rows
+    freq_rows = freqs_cis[positions.long()]  # (B, rope_dim)
+    # broadcast over heads: (B, 1, rope_dim)
+    freq_rows = freq_rows.unsqueeze(1)
+
+    # split interleaved [re, im, re, im, ...] into separate tensors
+    # shape of each: (B, 1, rope_dim/2)
+    freq_re = freq_rows[..., 0::2]  # cosines
+    freq_im = freq_rows[..., 1::2]  # sines
+
+    # rope tail from the normalised vector
+    x_rope = x[..., nope_dim:]  # (B, H, rope_dim)
+    x_re = x_rope[..., 0::2]  # (B, H, rope_dim/2)
+    x_im = x_rope[..., 1::2]  # (B, H, rope_dim/2)
+
+    # complex multiply: (x_re + i*x_im) * (freq_re + i*freq_im)
+    rotated_re = x_re * freq_re - x_im * freq_im  # (B, H, rope_dim/2)
+    rotated_im = x_re * freq_im + x_im * freq_re  # (B, H, rope_dim/2)
+
+    # re-interleave back to (B, H, rope_dim)
+    rotated = torch.stack([rotated_re, rotated_im], dim=-1).flatten(-2)
+
+    # ------------------------------------------------------------------ #
+    # part 3: assemble and write to q_output
+    # ------------------------------------------------------------------ #
+    out = torch.cat([x[..., :nope_dim], rotated], dim=-1)  # (B, H, head_dim)
+    q_output.copy_(out.to(q_output.dtype))

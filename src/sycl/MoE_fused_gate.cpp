@@ -122,7 +122,7 @@ struct moe_fused_gate_impl {
     int64_t token_row_chunk_offset = token_row_offset + thread_id * params_.VPT;
 
     auto* thread_row_ptr = input_ + token_row_chunk_offset;
-    auto* bias_ptr = bias_ + thread_id * params_.VPT;
+    auto* bias_ptr = bias_ ? (bias_ + thread_id * params_.VPT) : nullptr;
 
     T row_chunk[MAX_VPT];
     T bias_chunk[MAX_VPT];
@@ -130,7 +130,6 @@ struct moe_fused_gate_impl {
 #pragma unroll
       for (int i = 0; i < params_.VPT; ++i) {
         row_chunk[i] = thread_row_ptr[i];
-        bias_chunk[i] = bias_ptr[i];
       }
 
       if (scoring_func_ == static_cast<int32_t>(ScoringFunc::kSigmoid)) {
@@ -142,7 +141,7 @@ struct moe_fused_gate_impl {
 ////////////////////// Add Bias //////////////////////
 #pragma unroll
       for (int i = 0; i < params_.VPT; ++i) {
-        bias_chunk[i] = row_chunk[i] + bias_chunk[i];
+        bias_chunk[i] = row_chunk[i] + (bias_ptr ? bias_ptr[i] : T(0));
       }
     }
     ////////////////////// Exclude Groups //////////////////////
@@ -355,7 +354,7 @@ struct KernelParams {
 template <typename T, int VPT, int NUM_EXPERTS, int THREADS_PER_ROW>
 void moe_fused_gate_kernel(
     const torch::Tensor& input,
-    const torch::Tensor& bias,
+    const T* bias_ptr,
     torch::Tensor& output,
     torch::Tensor& indices,
     int64_t num_rows,
@@ -367,7 +366,6 @@ void moe_fused_gate_kernel(
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output) {
   auto input_ptr = reinterpret_cast<T*>(input.data_ptr());
-  auto bias_ptr = reinterpret_cast<T*>(bias.data_ptr());
   auto output_ptr = reinterpret_cast<float*>(output.data_ptr());
   auto indices_ptr = reinterpret_cast<int32_t*>(indices.data_ptr());
 
@@ -406,7 +404,7 @@ void moe_fused_gate_kernel(
     constexpr int VPT = (EXPERTS) / (EXPERT_GROUP);           \
     moe_fused_gate_kernel<T, VPT, (EXPERTS), (EXPERT_GROUP)>( \
         input,                                                \
-        bias,                                                 \
+        bias_ptr,                                             \
         output,                                               \
         indices,                                              \
         num_rows,                                             \
@@ -432,7 +430,7 @@ struct KernelParamsDynamic {
 template <typename T>
 void moe_fused_gate_kernel_dynamic(
     const torch::Tensor& input,
-    const torch::Tensor& bias,
+    const T* bias_ptr,
     torch::Tensor& output,
     torch::Tensor& indices,
     int64_t num_rows,
@@ -445,7 +443,6 @@ void moe_fused_gate_kernel_dynamic(
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output) {
   auto input_ptr = reinterpret_cast<T*>(input.data_ptr());
-  auto bias_ptr = reinterpret_cast<T*>(bias.data_ptr());
   auto output_ptr = reinterpret_cast<float*>(output.data_ptr());
   auto indices_ptr = reinterpret_cast<int32_t*>(indices.data_ptr());
   int32_t num_experts = input.size(1);
@@ -487,7 +484,7 @@ void moe_fused_gate_kernel_dynamic(
 //------------------------------------------------------------------------------
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
-    at::Tensor& bias,
+    const std::optional<at::Tensor>& bias,
     int64_t num_expert_group,
     int64_t topk_group,
     int64_t topk,
@@ -496,7 +493,16 @@ std::vector<at::Tensor> moe_fused_gate(
     bool renormalize,
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output) {
-  TORCH_CHECK(input.dtype() == bias.dtype(), "input and bias should have the same dtype");
+  if (bias.has_value()) {
+    TORCH_CHECK(input.dtype() == bias->dtype(), "input and bias should have the same dtype");
+    TORCH_CHECK(bias->dim() == 1, "bias must be a 1D tensor when provided");
+    TORCH_CHECK(
+        bias->size(0) == input.size(1),
+        "bias size must match the number of experts, but got ",
+        bias->size(0),
+        " vs ",
+        input.size(1));
+  }
   TORCH_CHECK(
       scoring_func == static_cast<int64_t>(ScoringFunc::kSigmoid) ||
           scoring_func == static_cast<int64_t>(ScoringFunc::kSoftmax),
@@ -537,6 +543,8 @@ std::vector<at::Tensor> moe_fused_gate(
 
   SYCL_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::BFloat16, at::ScalarType::Half, input.scalar_type(), "moe_sum_reduce_impl", [&]() {
+        auto bias_ptr = bias.has_value() ? reinterpret_cast<const scalar_t*>(bias->data_ptr())
+                                         : static_cast<const scalar_t*>(nullptr);
         switch (num_experts) {
           case 512:
             if (num_expert_group == 16) {
@@ -565,7 +573,7 @@ std::vector<at::Tensor> moe_fused_gate(
           // currently only support num_experts / num_expert_group <= 32 for dynamic kernels
           moe_fused_gate_kernel_dynamic<scalar_t>(
               input,
-              bias,
+              bias_ptr,
               output,
               indices,
               num_rows,

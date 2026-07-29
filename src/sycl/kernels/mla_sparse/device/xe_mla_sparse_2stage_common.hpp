@@ -4,7 +4,11 @@
  **************************************************************************************************/
 /*!
   \file
-  \brief Two-stage sparse MLA decode shared device declarations for DeepSeek V4.
+  \brief Two-stage sparse MLA shared device declarations for DeepSeek V4.
+
+  Shared by BOTH two-stage paths (decode and prefill): the Stage-2 dense kernel,
+  its collectives, and its tile geometry are path-agnostic, and the Stage-1 gather
+  params keep their common base here with one child per path.
 
   Contains:
     - LOG_2_E / LOG_E_2 log-base constants + packed FP8 KV layout constants.

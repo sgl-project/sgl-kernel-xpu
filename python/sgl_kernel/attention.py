@@ -290,10 +290,7 @@ def flash_mla_with_kvcache(
     if softmax_scale is None:
         softmax_scale = D_qk ** (-0.5)
 
-    assert q.dtype in (
-        torch.float16,
-        torch.bfloat16,
-    ), f"q.dtype must be fp16 or bf16, got {q.dtype}"
+    assert q.dtype in (torch.bfloat16,), f"q.dtype must be bf16, got {q.dtype}"
 
     # Allocate outputs
     out = q.new_empty((B, s_q, H, head_dim_v))

@@ -21,7 +21,7 @@
 
 #pragma once
 
-#include "sycl/kernels/mla_sparse/device/xe_mla_sparse_decode_2stage_common.hpp"
+#include "sycl/kernels/mla_sparse/device/xe_mla_sparse_2stage_common.hpp"
 
 namespace cutlass::flash_attention::collective {
 

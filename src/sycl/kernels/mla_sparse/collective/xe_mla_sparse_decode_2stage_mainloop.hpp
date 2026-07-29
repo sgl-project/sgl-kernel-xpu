@@ -15,17 +15,17 @@
     SharedStorage, ctor (Params const&, SharedStorage&), and operator(). Shared
     declarations (SparseAttnDecodeParams, LOG_* constants, the copy_block_*
     helpers) come from the kernel/ common header; the DPAS/tile geometry it reads
-    off its Traits template param is MlaSparseDecode2StageTileTraits (declared in that
-    same common header). Traits carries geometry only --
-    element types, MMA atoms, tile shapes, sizes -- never the assembly (which
-    collectives / kernels / runner), which is the config struct's business.
+    off its Traits template param is MlaSparseDecode2StageTileTraits, declared in that
+    same common header. Traits carries geometry only -- element types, MMA atoms, tile
+    shapes, sizes -- never the assembly (which collectives / kernels / runner), which
+    is the config struct's business.
 
     Correctness reference: tests/test_flash_mla_with_kvcache.py _sm120_sparse_decode_fwd.
 */
 
 #pragma once
 
-#include "sycl/kernels/mla_sparse/device/xe_mla_sparse_decode_2stage_common.hpp"
+#include "sycl/kernels/mla_sparse/device/xe_mla_sparse_2stage_common.hpp"
 
 namespace cutlass::flash_attention::collective {
 

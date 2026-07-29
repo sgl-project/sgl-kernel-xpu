@@ -16,7 +16,7 @@
         QK/PV GEMM + online softmax producing the O accumulator + row stats,
     - collective epilogue   (collective/xe_mla_sparse_decode_2stage_epilogue.hpp)
         cross-subgroup reduce, normalize, attn_sink merge, LSE, and store,
-    - tile scheduler        (kernel/xe_mla_sparse_decode_2stage_tile_scheduler.hpp)
+    - tile scheduler        (kernel/xe_mla_sparse_2stage_tile_scheduler.hpp)
         (batch, seq, head-block, v-split) work-tile decode.
 
   Like XeMlaSparseFwdKernel (the fused path), the collectives + scheduler are
@@ -40,7 +40,7 @@
   get_block_shape.
 
   Shared declarations (the per-layer params blocks, constants, the copy_block_*
-  rmem<->smem helpers) come from xe_mla_sparse_decode_2stage_common.hpp.
+  rmem<->smem helpers) come from xe_mla_sparse_2stage_common.hpp.
 
   Correctness reference: tests/test_flash_mla_with_kvcache.py _sm120_sparse_decode_fwd.
 */
@@ -49,8 +49,8 @@
 
 #include "sycl/kernels/mla_sparse/collective/xe_mla_sparse_decode_2stage_epilogue.hpp"
 #include "sycl/kernels/mla_sparse/collective/xe_mla_sparse_decode_2stage_mainloop.hpp"
-#include "sycl/kernels/mla_sparse/device/xe_mla_sparse_decode_2stage_common.hpp"
-#include "sycl/kernels/mla_sparse/kernel/xe_mla_sparse_decode_2stage_tile_scheduler.hpp"
+#include "sycl/kernels/mla_sparse/device/xe_mla_sparse_2stage_common.hpp"
+#include "sycl/kernels/mla_sparse/kernel/xe_mla_sparse_2stage_tile_scheduler.hpp"
 
 namespace cutlass::flash_attention::kernel {
 

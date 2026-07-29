@@ -71,11 +71,12 @@ def reference_mla_sparse_prefill(
 @pytest.mark.parametrize("has_attn_sink", [False, True])
 @pytest.mark.parametrize("has_topk_length", [False, True])
 @pytest.mark.parametrize("topk", [6, 512])
-@pytest.mark.parametrize("h_q", [8, 24, 64, 96])
+@pytest.mark.parametrize("h_q", [8, 64, 128])
 @pytest.mark.parametrize("s_q", [1, 32, 128])
 @pytest.mark.parametrize("d_qk", [512, 576])
+@pytest.mark.parametrize("s_kv", [1024, 16384])
 def test_flash_mla_sparse_prefill_fwd(
-    d_qk, s_q, h_q, topk, has_topk_length, has_attn_sink
+    d_qk, s_q, h_q, topk, has_topk_length, has_attn_sink, s_kv
 ):
     if not torch.xpu.is_available():
         pytest.skip("XPU not available")
@@ -83,9 +84,8 @@ def test_flash_mla_sparse_prefill_fwd(
     device = "xpu"
     dtype = torch.bfloat16
 
-    torch.manual_seed(88)
+    torch.manual_seed(42)
 
-    s_kv = 16384
     h_kv = 1
     # d_qk is 512 (dense latent) or 576 (nope-512 + rope-64); d_v stays 512.
     d_v = 512
@@ -99,7 +99,7 @@ def test_flash_mla_sparse_prefill_fwd(
             i_i = torch.randperm(max(1, t))[:topk]
             indices[t, h, : len(i_i)] = i_i
 
-    sm_scale = d_qk**-0.5
+    sm_scale = 128**-0.5 if d_qk == 512 else 192**-0.5
 
     topk_length = None
     if has_topk_length:

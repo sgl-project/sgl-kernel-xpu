@@ -18,7 +18,7 @@ set(MLA_SPARSE_PREFILL_2STAGE_TEMPLATE
 # per file instead of both). The op dispatches dtype, then D_QK, then B_H, then the
 # runtime attn_sink flag.
 set(MLA_SPARSE_PREFILL_2STAGE_D_QK 512 576)
-set(MLA_SPARSE_PREFILL_2STAGE_B_H 8 16 32 64)
+set(MLA_SPARSE_PREFILL_2STAGE_B_H 8 32 64)
 set(MLA_SPARSE_PREFILL_2STAGE_HAS_ATTN_SINK 0 1)
 
 foreach(ELEM_TAG ${MLA_SPARSE_PREFILL_ELEM_TAGS})

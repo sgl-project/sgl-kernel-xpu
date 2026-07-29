@@ -112,9 +112,9 @@ namespace cutlass::flash_attention::kernel {
 // path's MlaSparseXe (and MlaXe on the dense side).
 //
 // The DPAS/tile geometry itself lives in MlaSparseDecode2StageTileTraits
-// (xe_mla_sparse_decode_2stage_common.hpp, next to the params blocks the same
-// collectives read) and is what they receive as their `Traits`. That two-layer split
-// is deliberate: this struct used to pass
+// (xe_mla_sparse_2stage_common.hpp, next to the params blocks the same collectives
+// read) and is what they receive as their `Traits`. That two-layer split is
+// deliberate: this struct used to pass
 // *itself* as the collectives' Traits, i.e. name itself as a template argument while
 // still incomplete, which worked only because every alias in the chain is lazy -- and
 // which let the collectives reach members that are none of their business (Fmla, the

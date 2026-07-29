@@ -24,6 +24,7 @@ suites = {
         TestFile("test_flash_mla_decode.py"),
         TestFile("test_flash_mla_prefill.py"),
         TestFile("test_flash_mla_with_kvcache.py"),
+        TestFile("test_flash_mla_sparse_fwd.py"),
         TestFile("test_moe_align.py"),
         TestFile("test_moe_gemm.py"),
         TestFile("test_moe_sum_reduce.py"),

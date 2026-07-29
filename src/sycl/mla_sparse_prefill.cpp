@@ -62,9 +62,6 @@ namespace {
       case 8:                                                               \
         DISPATCH_MLA_SPARSE_PREFILL_SINK(ELEM, D_QK, 8);                    \
         break;                                                              \
-      case 16:                                                              \
-        DISPATCH_MLA_SPARSE_PREFILL_SINK(ELEM, D_QK, 16);                   \
-        break;                                                              \
       case 32:                                                              \
         DISPATCH_MLA_SPARSE_PREFILL_SINK(ELEM, D_QK, 32);                   \
         break;                                                              \

@@ -356,6 +356,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "flash_compress128_decode(Tensor! kv_buffer, Tensor kv_input, Tensor! kv_output, Tensor ape, Tensor plan_d) "
       "-> ()");
   m.impl("flash_compress128_decode", torch::kXPU, &at::native::xpu::flash_compress128_decode);
+
+    m.def(
+            "flash_compress128_prefill(Tensor! kv_buffer, Tensor kv_input, Tensor! kv_output, Tensor ape, Tensor plan_c, "
+            "Tensor plan_w) -> ()");
+    m.impl("flash_compress128_prefill", torch::kXPU, &at::native::xpu::flash_compress128_prefill);
 }
 
 REGISTER_EXTENSION(common_ops)

@@ -85,7 +85,12 @@ RUN --mount=type=secret,id=github_token \
     #git clone --branch ${SG_LANG_KERNEL_BRANCH} --single-branch ${SG_LANG_KERNEL_REPO} && \
     #cd sgl-kernel-xpu && \
     #pip install -v . &&\
+    export proxy_backup=${https_proxy} && \
+    unset https_proxy && \
+    unset HTTPS_PROXY && \
     pip install "sglang_kernel_xpu @ https://af01p-ba.devtools.intel.com/artifactory/aipc_releases-ba-local/gpu/new/validation/IPEX/nightly/PVC/UBUNTU/sglang/sglang_kernel_xpu_release/v0.1.0-rc0/sglang_kernel_xpu-0.1.0-cp310-abi3-manylinux_2_38_x86_64.whl"  && \
+    export https_proxy=${proxy_backup} && \
+    export HTTPS_PROXY=${proxy_backup} && \
     # Install required packages for sglang workloads
     pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops matplotlib pandas --root-user-action=ignore aiohttp && \
     conda install libsqlite=3.48.0 -y && \

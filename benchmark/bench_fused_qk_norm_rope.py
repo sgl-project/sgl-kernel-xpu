@@ -698,6 +698,7 @@ def build_cache_configs() -> (
     return list(CACHE_CONFIGS)
 
 
+_results = []
 cache_configs = CACHE_CONFIGS
 cache_results = []
 
@@ -759,9 +760,9 @@ DSV4_MAX_POSITION_EMBEDDINGS = 65536
 
 # Only these real DSV4 (head_dim, rope_dim) shapes are benchmarked below --
 # no synthetic warp-path-only shapes (e.g. head_dim 64/256).
-QNORM_ROPE_SHAPES = []
+QNORM_ROPE_CONFIGS = []
 for _head_dim, _rope_dim in DSV4_HEAD_ROPE_DIM:
-    QNORM_ROPE_SHAPES.extend(
+    QNORM_ROPE_CONFIGS.extend(
         [
             (1, 8, _head_dim, _rope_dim, f"dsv4_decode_tp8_h{_head_dim}"),
             (1, 16, _head_dim, _rope_dim, f"dsv4_decode_tp4_h{_head_dim}"),
@@ -773,6 +774,8 @@ for _head_dim, _rope_dim in DSV4_HEAD_ROPE_DIM:
             (4608, 64, _head_dim, _rope_dim, f"dsv4_prefill_4608_h{_head_dim}"),
         ]
     )
+
+q_results = []
 
 
 def native_q_norm_rope(
@@ -881,23 +884,17 @@ def benchmark_q_norm_rope_shape(
 
 def run_qnorm_rope_benchmarks(dtype_name: str = "bf16"):
     print("\n=== DeepSeek-V4 fused_q_norm_rope shape benchmark ===")
-    all_rows = []
-    for num_tokens, num_heads, head_dim, rope_dim, label in QNORM_ROPE_SHAPES:
-        all_rows.extend(
+    for num_tokens, num_heads, head_dim, rope_dim, label in QNORM_ROPE_CONFIGS:
+        q_results.extend(
             benchmark_q_norm_rope_shape(
                 dtype_name, num_tokens, num_heads, head_dim, rope_dim, label
             )
         )
 
-    os.makedirs("benchmark/results", exist_ok=True)
-    out_csv = "benchmark/results/dsv4_fused_q_norm_rope.csv"
-    fieldnames = list(all_rows[0].keys())
-    pd.DataFrame(all_rows).to_csv(out_csv, index=False)
-
+    fieldnames = list(q_results[0].keys())
     print("\t".join(fieldnames))
-    for row in all_rows:
+    for row in q_results:
         print("\t".join(str(row[column]) for column in fieldnames))
-    print(f"Wrote results CSV: {out_csv}")
 
 
 def native_k_norm_rope_flashmla(
@@ -1013,7 +1010,7 @@ def native_k_norm_rope_flashmla(
     flat_cache.index_put_((scale_idx.reshape(-1),), ue8m0_bytes.reshape(-1))
 
 
-FLASHMLA_K_SHAPES = [
+FLASHMLA_K_CONFIGS = [
     (1, "dsv4_k_decode_b1"),
     (8, "dsv4_k_decode_b8"),
     (32, "dsv4_k_decode_b32"),
@@ -1022,6 +1019,7 @@ FLASHMLA_K_SHAPES = [
     (2048, "dsv4_k_prefill_2048"),
     (4608, "dsv4_k_prefill_4608"),
 ]
+k_results = []
 
 
 def make_flashmla_k_inputs(
@@ -1124,19 +1122,13 @@ def benchmark_flashmla_k_shape(
 
 def run_flashmla_k_benchmarks(dtype_name: str = "bf16"):
     print("\n=== DeepSeek-V4 fused_k_norm_rope_flashmla shape benchmark ===")
-    all_rows = []
-    for num_tokens, label in FLASHMLA_K_SHAPES:
-        all_rows.extend(benchmark_flashmla_k_shape(dtype_name, num_tokens, label))
+    for num_tokens, label in FLASHMLA_K_CONFIGS:
+        k_results.extend(benchmark_flashmla_k_shape(dtype_name, num_tokens, label))
 
-    os.makedirs("benchmark/results", exist_ok=True)
-    out_csv = "benchmark/results/dsv4_fused_k_norm_rope_flashmla.csv"
-    fieldnames = list(all_rows[0].keys())
-    pd.DataFrame(all_rows).to_csv(out_csv, index=False)
-
+    fieldnames = list(k_results[0].keys())
     print("\t".join(fieldnames))
-    for row in all_rows:
+    for row in k_results:
         print("\t".join(str(row[column]) for column in fieldnames))
-    print(f"Wrote results CSV: {out_csv}")
 
 
 if __name__ == "__main__":
@@ -1234,3 +1226,79 @@ if __name__ == "__main__":
                     f"  {dt:>12s}: avg={sp.mean():.2f}x  max={sp.max():.2f}x  min={sp.min():.2f}x"
                 )
     print(f"Wrote results CSV: {out_csv}")
+
+    # === q_results (fused_q_norm_rope) summary ===
+    print("\n" + "=" * 80)
+    print("Q Norm+RoPE Benchmark Results")
+    print("=" * 80)
+    q_df = pd.DataFrame(q_results)
+    q_out_csv = os.path.join("benchmark/results", f"q_norm_rope.csv")
+    q_df.to_csv(q_out_csv, index=False)
+    print(f"Wrote results CSV: {q_out_csv}")
+
+    if not q_df.empty:
+        q_df["latency_us"] = q_df["latency_us"].round(3)
+        q_df["gbps"] = q_df["gbps"].round(2)
+        print(q_df.to_markdown(index=False))
+
+        q_summary = q_df.groupby(["dtype", "provider"]).agg(
+            {"latency_us": ["mean", "min", "max"], "gbps": ["mean", "min", "max"]}
+        )
+        print(q_summary.to_markdown())
+
+        q_pivot = q_df.pivot_table(
+            index=["shape_label", "dtype", "num_heads", "head_dim", "rope_dim"],
+            columns="provider",
+            values="latency_us",
+        )
+        if (
+            "native_unfused" in q_pivot.columns
+            and "fused_q_norm_rope" in q_pivot.columns
+        ):
+            q_pivot["speedup"] = (
+                q_pivot["native_unfused"] / q_pivot["fused_q_norm_rope"]
+            )
+            print(f"\nfused_q_norm_rope avg speedup: {q_pivot['speedup'].mean():.2f}x")
+            print(f"fused_q_norm_rope max speedup: {q_pivot['speedup'].max():.2f}x")
+            print(f"fused_q_norm_rope min speedup: {q_pivot['speedup'].min():.2f}x")
+
+    # === k_results (fused_k_norm_rope_flashmla) summary ===
+    print("\n" + "=" * 80)
+    print("K Norm+RoPE FlashMLA Benchmark Results")
+    print("=" * 80)
+    k_df = pd.DataFrame(k_results)
+    k_out_csv = os.path.join("benchmark/results", f"k_norm_rope_flashmla.csv")
+    k_df.to_csv(k_out_csv, index=False)
+    print(f"Wrote results CSV: {k_out_csv}")
+
+    if not k_df.empty:
+        k_df["latency_us"] = k_df["latency_us"].round(3)
+        k_df["gbps"] = k_df["gbps"].round(2)
+        print(k_df.to_markdown(index=False))
+
+        k_summary = k_df.groupby(["dtype", "provider"]).agg(
+            {"latency_us": ["mean", "min", "max"], "gbps": ["mean", "min", "max"]}
+        )
+        print(k_summary.to_markdown())
+
+        k_pivot = k_df.pivot_table(
+            index=["shape_label", "dtype", "head_dim", "rope_dim"],
+            columns="provider",
+            values="latency_us",
+        )
+        if (
+            "native_unfused_ref" in k_pivot.columns
+            and "fused_k_norm_rope_flashmla" in k_pivot.columns
+        ):
+            k_pivot["speedup"] = (
+                k_pivot["native_unfused_ref"] / k_pivot["fused_k_norm_rope_flashmla"]
+            )
+            print(
+                f"\nfused_k_norm_rope_flashmla avg speedup: {k_pivot['speedup'].mean():.2f}x"
+            )
+            print(
+                f"fused_k_norm_rope_flashmla max speedup: {k_pivot['speedup'].max():.2f}x"
+            )
+            print(
+                f"fused_k_norm_rope_flashmla min speedup: {k_pivot['speedup'].min():.2f}x"
+            )

@@ -400,13 +400,8 @@ def transfer_kv_per_layer_direct_pf_lf(
         for j in range(num_layers):
             # src is pf: [num_pages, num_layers, page_size, item_size]
             # copy page_size rows from src_ptrs[0 or 1][s_page][layer_id+j]
-            # to dst_ptrs[j] starting at d_start
-            src_kv = src_ptrs[
-                0 if is_mla else j
-            ]  # per-layer tensor already sliced by caller
-            # src_ptrs holds per-layer slices: shape [total_tokens, item_size]
-            # The pf tensor layout means the caller passes the pf pool and we index it.
-            # Here we mirror the CUDA fallback: src_ptrs[0].select(0, s_page).select(0, layer_id+j)
+            # to dst_ptrs[j] starting at d_start.
+            # Mirror the CUDA fallback: src_ptrs[0].select(0, s_page).select(0, layer_id+j)
             # gives a [page_size, item_size] slice.
             src_slice = (
                 src_ptrs[0 if is_mla else j].select(0, s_page).select(0, layer_id + j)

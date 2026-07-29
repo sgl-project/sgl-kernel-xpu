@@ -389,6 +389,15 @@ static int64_t div_up(int64_t x, int64_t y) {
   return (x + y - 1) / y;
 }
 
+// Validate a per-layer pointer table: it must hold exactly num_layers entries
+// and be a UInt64 tensor (each element is a raw data_ptr() value).  Reading it
+// as a uintptr_t table with a mismatched length or dtype would dereference
+// invalid addresses in the kernel.
+static void check_layer_ptr_table(const at::Tensor& tbl, int64_t num_layers, const char* name) {
+  TORCH_CHECK(tbl.scalar_type() == at::kUInt64, name, " must be a uint64 pointer table");
+  TORCH_CHECK(tbl.numel() == num_layers, name, " must have num_layers entries");
+}
+
 // Launch the standard (non-page-head) transfer kernel.
 // Uses TransferKVKernel<IsMLA>.
 template <bool IsMLA>
@@ -409,7 +418,9 @@ static void launch_transfer_kv(
     int64_t block_quota,
     int64_t sgs_per_wg) {
   TORCH_CHECK(item_size % 8 == 0, "item_size must be divisible by 8");
-  TORCH_CHECK(src_indices.scalar_type() == at::kLong, "indices must be int64");
+  TORCH_CHECK(sgs_per_wg > 0, "sgs_per_wg must be positive");
+  TORCH_CHECK(src_indices.scalar_type() == at::kLong, "src_indices must be int64");
+  TORCH_CHECK(dst_indices.scalar_type() == at::kLong, "dst_indices must be int64");
   TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "index count mismatch");
 
   const int64_t num_items = src_indices.numel();
@@ -477,7 +488,9 @@ static void launch_transfer_kv_page_first(
     int64_t block_quota,
     int64_t sgs_per_wg) {
   TORCH_CHECK(item_size % 8 == 0, "item_size must be divisible by 8");
-  TORCH_CHECK(src_indices.scalar_type() == at::kLong, "indices must be int64");
+  TORCH_CHECK(sgs_per_wg > 0, "sgs_per_wg must be positive");
+  TORCH_CHECK(src_indices.scalar_type() == at::kLong, "src_indices must be int64");
+  TORCH_CHECK(dst_indices.scalar_type() == at::kLong, "dst_indices must be int64");
   TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "index count mismatch");
 
   const int64_t num_items = src_indices.numel();
@@ -540,7 +553,11 @@ static void launch_transfer_kv_page_head(
     int64_t sgs_per_wg,
     int64_t start_layer = 0) {
   TORCH_CHECK(item_size % 8 == 0, "item_size must be divisible by 8");
+  TORCH_CHECK(head_num > 0, "head_num must be positive");
   TORCH_CHECK(item_size % head_num == 0, "item_size must be divisible by head_num");
+  TORCH_CHECK(sgs_per_wg > 0, "sgs_per_wg must be positive");
+  TORCH_CHECK(src_indices.scalar_type() == at::kLong, "src_indices must be int64");
+  TORCH_CHECK(dst_indices.scalar_type() == at::kLong, "dst_indices must be int64");
   TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "index count mismatch");
 
   const int64_t num_items = src_indices.numel();
@@ -655,7 +672,10 @@ void transfer_kv_all_layer(
     int64_t num_layers,
     int64_t block_quota,
     int64_t sgs_per_wg) {
-  TORCH_CHECK(num_layers == src_k_layers.size(0), "num_layers mismatch");
+  check_layer_ptr_table(src_k_layers, num_layers, "src_k_layers");
+  check_layer_ptr_table(dst_k_layers, num_layers, "dst_k_layers");
+  check_layer_ptr_table(src_v_layers, num_layers, "src_v_layers");
+  check_layer_ptr_table(dst_v_layers, num_layers, "dst_v_layers");
   launch_transfer_kv<false>(
       nullptr,
       nullptr,
@@ -684,7 +704,8 @@ void transfer_kv_all_layer_mla(
     int64_t num_layers,
     int64_t block_quota,
     int64_t sgs_per_wg) {
-  TORCH_CHECK(num_layers == src_layers.size(0), "num_layers mismatch");
+  check_layer_ptr_table(src_layers, num_layers, "src_layers");
+  check_layer_ptr_table(dst_layers, num_layers, "dst_layers");
   launch_transfer_kv<true>(
       nullptr,
       nullptr,
@@ -718,7 +739,8 @@ void transfer_kv_all_layer_lf_ph(
     int64_t head_num,
     int64_t block_quota,
     int64_t sgs_per_wg) {
-  TORCH_CHECK(num_layers == src_k_layers.size(0), "num_layers mismatch");
+  check_layer_ptr_table(src_k_layers, num_layers, "src_k_layers");
+  check_layer_ptr_table(src_v_layers, num_layers, "src_v_layers");
   launch_transfer_kv_page_head<true>(
       nullptr,
       dst_k.data_ptr(),
@@ -829,7 +851,8 @@ void transfer_kv_all_layer_lf_pf(
     int64_t num_layers,
     int64_t block_quota,
     int64_t sgs_per_wg) {
-  TORCH_CHECK(num_layers == src_k_layers.size(0), "num_layers mismatch");
+  check_layer_ptr_table(src_k_layers, num_layers, "src_k_layers");
+  check_layer_ptr_table(src_v_layers, num_layers, "src_v_layers");
   launch_transfer_kv_page_first<false, false>(
       nullptr,
       dst_k.data_ptr(),
@@ -892,7 +915,7 @@ void transfer_kv_all_layer_mla_lf_pf(
     int64_t num_layers,
     int64_t block_quota,
     int64_t sgs_per_wg) {
-  TORCH_CHECK(num_layers == src_layers.size(0), "num_layers mismatch");
+  check_layer_ptr_table(src_layers, num_layers, "src_layers");
   launch_transfer_kv_page_first<true, false>(
       nullptr,
       dst.data_ptr(),

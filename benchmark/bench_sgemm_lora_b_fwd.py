@@ -13,84 +13,82 @@ all_results = []
 #   input_x: (num_tokens, max_rank)
 #   weights: (num_loras, output_dim, max_rank)
 #   output:  (num_tokens, output_dim)
-# This is the mirror of LoRA-A: the reduction dim K is now the (small) LoRA
-# rank, and the (large) model dimension is the output (output_dim). The shapes
-# match bench_sgemm_lora_a_fwd; only the "rank dimension" role changes -- what
-# was input_dim (K) there is output_dim (N) here, and K is max_rank. LoRA-B has
-# no stacking, so there is no stack_num.
+# Cases with "use_base_output": True fuse a residual base_output:
+#   D = scalings[l] * (input_x @ weights[l]^T) + base_output   (beta=1);
+# otherwise only the scaled LoRA-B projection is computed (beta=0).
 DEFAULT_CASES: List[Dict[str, int]] = [
     {
-        "num_tokens": 4096,
+        "num_tokens": 65536,
         "num_segments": 4,
         "num_loras": 2,
         "max_rank": 16,
         "output_dim": 2048,
     },
     {
-        "num_tokens": 6144,
+        "num_tokens": 65536,
         "num_segments": 8,
         "num_loras": 4,
         "max_rank": 32,
         "output_dim": 4096,
     },
     {
-        "num_tokens": 8192,
+        "num_tokens": 65536,
         "num_segments": 8,
         "num_loras": 4,
         "max_rank": 64,
         "output_dim": 4096,
     },
     {
-        "num_tokens": 12288,
+        "num_tokens": 65536,
         "num_segments": 16,
         "num_loras": 2,
         "max_rank": 16,
         "output_dim": 4096,
     },
     {
-        "num_tokens": 16384,
+        "num_tokens": 65536,
         "num_segments": 16,
         "num_loras": 4,
         "max_rank": 32,
         "output_dim": 5120,
     },
     {
-        "num_tokens": 24576,
+        "num_tokens": 81920,
         "num_segments": 32,
         "num_loras": 8,
         "max_rank": 64,
         "output_dim": 4096,
     },
     {
-        "num_tokens": 32768,
+        "num_tokens": 81920,
         "num_segments": 32,
         "num_loras": 4,
         "max_rank": 16,
         "output_dim": 8192,
     },
     {
-        "num_tokens": 49152,
+        "num_tokens": 98304,
         "num_segments": 64,
         "num_loras": 8,
         "max_rank": 32,
         "output_dim": 4096,
     },
     {
-        "num_tokens": 65536,
+        "num_tokens": 98304,
         "num_segments": 64,
         "num_loras": 4,
         "max_rank": 64,
         "output_dim": 5120,
     },
     {
-        "num_tokens": 81920,
+        "num_tokens": 122880,
         "num_segments": 128,
         "num_loras": 8,
         "max_rank": 16,
         "output_dim": 8192,
     },
     {
-        "num_tokens": 98304,
+        "num_tokens": 122880,
         "num_segments": 128,
         "num_loras": 4,
         "max_rank": 32,
@@ -102,6 +100,32 @@ DEFAULT_CASES: List[Dict[str, int]] = [
         "num_loras": 8,
         "max_rank": 64,
         "output_dim": 8192,
+    },
+    # ----- Fused residual (base_output) cases: D = scalings*(x@W^T) + base_output
+    # (beta=1). Same shape family as above, exercising the fused-add epilogue path.
+    {
+        "num_tokens": 122880,
+        "num_segments": 32,
+        "num_loras": 4,
+        "max_rank": 16,
+        "output_dim": 8192,
+        "use_base_output": True,
+    },
+    {
+        "num_tokens": 122880,
+        "num_segments": 64,
+        "num_loras": 4,
+        "max_rank": 64,
+        "output_dim": 5120,
+        "use_base_output": True,
+    },
+    {
+        "num_tokens": 122880,
+        "num_segments": 256,
+        "num_loras": 8,
+        "max_rank": 64,
+        "output_dim": 8192,
+        "use_base_output": True,
     },
 ]
 
@@ -290,6 +314,13 @@ def _make_inputs(
     # Per-adapter scaling (lora_alpha / rank), exercising the per-segment alpha.
     scalings = torch.rand(num_loras, dtype=torch.float32, device=device) * 2.0 + 0.5
 
+    # Optional residual: when the case sets use_base_output, both backends fuse
+    # D = scalings[l] * (x @ W^T) + base_output (beta=1). Otherwise it stays None
+    # (beta=0, pure scaled projection). See _run_*_once for how each path uses it.
+    base_output = None
+    if case.get("use_base_output", False):
+        base_output = torch.randn(num_tokens, output_dim, dtype=dtype, device=device)
+
     return {
         "input_x": input_x,
         "weights": weights,
@@ -298,10 +329,13 @@ def _make_inputs(
         "weight_indices": weight_indices,
         "lora_ranks": lora_ranks,
         "scalings": scalings,
+        "base_output": base_output,
     }
 
 
 def _run_cutlass_once(args: Dict[str, Any]):
+    # base_output is a read-only residual source C here (the kernel writes a
+    # fresh output D), so it is never mutated and needs no per-call reset.
     return sgemm_lora_b_fwd(
         input_x=args["input_x"],
         weights=args["weights"],
@@ -310,7 +344,7 @@ def _run_cutlass_once(args: Dict[str, Any]):
         lora_ranks=args["lora_ranks"],
         scalings=args["scalings"],
         seg_lens=args["seg_lens"],
-        base_output=None,
+        base_output=args["base_output"],
     )
 
 
@@ -334,9 +368,15 @@ def _run_triton_once(args: Dict[str, Any]):
     max_len = int(seg_lens.max().item()) if seg_lens.numel() > 0 else 0
     bs = int(seg_lens.numel())
 
-    # base_output is None here, so the kernel accumulates onto a fresh zero
-    # buffer -> pure scaled LoRA-B projection (matches the CUTLASS call above).
-    output = torch.zeros((S, N), device=x.device, dtype=x.dtype)
+    # The Triton kernel accumulates in place (partial_sum += output). With a
+    # residual we start from a fresh copy of base_output so repeated do_bench
+    # invocations don't drift; without one we start from zeros -> pure scaled
+    # projection (matches the CUTLASS call above).
+    base_output = args["base_output"]
+    if base_output is not None:
+        output = base_output.clone()
+    else:
+        output = torch.zeros((S, N), device=x.device, dtype=x.dtype)
     if max_len == 0 or bs == 0:
         return output
 
@@ -373,9 +413,10 @@ def _dtype_from_provider(provider: str) -> torch.dtype:
 
 
 def _case_label(case: Dict[str, int]) -> str:
+    residual = "+base" if case.get("use_base_output", False) else ""
     return (
         f"tok={case['num_tokens']},seg={case['num_segments']},lora={case['num_loras']},"
-        f"r={case['max_rank']},N={case['output_dim']}"
+        f"r={case['max_rank']},N={case['output_dim']}{residual}"
     )
 
 
@@ -466,6 +507,7 @@ def benchmark(case_id, provider):
             "num_loras": case["num_loras"],
             "max_rank": case["max_rank"],
             "output_dim": case["output_dim"],
+            "use_base_output": case.get("use_base_output", False),
         }
     )
 
@@ -476,27 +518,33 @@ def benchmark(case_id, provider):
 def _sanity_check() -> None:
     torch.manual_seed(123)
     device = torch.device("xpu")
-    case = DEFAULT_CASES[0]
-    args = _make_inputs(case, torch.float16, device)
-    out = _run_cutlass_once(args)
-    out_triton = _run_triton_once(args)
 
-    expected = (case["num_tokens"], case["output_dim"])
-    if tuple(out.shape) != expected:
-        raise RuntimeError(
-            f"Unexpected CUTLASS output shape: got {tuple(out.shape)}, expected {expected}"
-        )
-    if tuple(out_triton.shape) != expected:
-        raise RuntimeError(
-            f"Unexpected Triton output shape: got {tuple(out_triton.shape)}, expected {expected}"
-        )
+    # Check both the pure projection (beta=0) and the fused residual (beta=1)
+    # paths so the base_output add is validated too, not just the shapes.
+    for label, case in (
+        ("no-residual", dict(DEFAULT_CASES[0], use_base_output=False)),
+        ("residual", dict(DEFAULT_CASES[0], use_base_output=True)),
+    ):
+        args = _make_inputs(case, torch.float16, device)
+        out = _run_cutlass_once(args)
+        out_triton = _run_triton_once(args)
 
-    diff = (out.float() - out_triton.float()).abs()
-    max_abs = diff.max().item()
-    print(
-        f"Sanity check passed: shapes OK, max |CUTLASS - Triton| = {max_abs:.4e} "
-        f"(fp16, N={case['output_dim']})."
-    )
+        expected = (case["num_tokens"], case["output_dim"])
+        if tuple(out.shape) != expected:
+            raise RuntimeError(
+                f"Unexpected CUTLASS output shape: got {tuple(out.shape)}, expected {expected}"
+            )
+        if tuple(out_triton.shape) != expected:
+            raise RuntimeError(
+                f"Unexpected Triton output shape: got {tuple(out_triton.shape)}, expected {expected}"
+            )
+
+        diff = (out.float() - out_triton.float()).abs()
+        max_abs = diff.max().item()
+        print(
+            f"Sanity check passed ({label}): shapes OK, "
+            f"max |CUTLASS - Triton| = {max_abs:.4e} (fp16, N={case['output_dim']})."
+        )
 
 
 def print_summary(title: str = "SGEMM LoRA-B Forward Benchmark Results"):

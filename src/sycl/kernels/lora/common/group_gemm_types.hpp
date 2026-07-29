@@ -147,7 +147,7 @@ struct GroupGemmTypes {
   using EpilogueOp = cutlass::epilogue::fusion::LinearCombination<
       ElementAccumulator,  // <- must be ElementAccumulator for Grouped GEMM
       ElementComputeEpilogue,
-      ElementAccumulator,
+      ElementOutput,  // ElementSource_ (C) -- matches base_output storage dtype
       ElementAccumulator,
       cutlass::FloatRoundStyle::round_to_nearest>;
 
@@ -163,7 +163,7 @@ struct GroupGemmTypes {
   using CollectiveEpilogue = GroupedEpiloguePerGroupScalar<
       TileShape,
       void,  // EpilogueTile (void = automatic)
-      ElementAccumulator,
+      ElementOutput,  // ElementC -- residual C (base_output) is bf16/fp16
       cutlass::gemm::TagToStrideC_t<LayoutC*>,
       ElementOutput,  // bf16/fp16 narrow here
       cutlass::gemm::TagToStrideC_t<LayoutD*>,

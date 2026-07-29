@@ -1,5 +1,5 @@
-import csv
 import itertools
+import math
 import os
 
 import pandas as pd
@@ -7,9 +7,6 @@ import sgl_kernel
 import torch
 import triton
 from bench_fused_qk_rope_with_cache import create_cos_sin_cache
-from sgl_kernel.fused_k_norm_rope_flashmla_torch import (
-    fused_k_norm_rope_flashmla as fused_k_norm_rope_flashmla_ref,
-)
 
 # Supported dtypes and their properties
 DTYPE_MAP = {
@@ -701,6 +698,7 @@ def build_cache_configs() -> (
     return list(CACHE_CONFIGS)
 
 
+_results = []
 cache_configs = CACHE_CONFIGS
 cache_results = []
 
@@ -750,25 +748,34 @@ def make_cache_inputs(
 # DeepSeek-V4 `fused_q_norm_rope` and `fused_k_norm_rope_flashmla` benchmarks
 # ============================================================================
 
-DSV4_HEAD_DIM = 512
-DSV4_ROPE_DIM = 64
+# DeepSeek-V4 production (head_dim, rope_dim) shapes: 128/512 pair with the
+# production rope_dim=64 (see `dsv4_fused_q_norm_rope` /
+# `dsv4_fused_k_norm_rope_flashmla` in
+# sgl-kernel/csrc/elementwise/dsv4_norm_rope.cu). head_dim=192 uses rope_dim=84
+# instead of 64 here so it actually exercises the XPU warp path (192's
+# kElemsPerThread=12 doesn't divide 64, so rope_dim=64 would silently fall
+# back to the CTA path).
+DSV4_HEAD_ROPE_DIM = [(128, 64), (192, 84), (512, 64)]
 DSV4_MAX_POSITION_EMBEDDINGS = 65536
 
-QNORM_ROPE_SHAPES = [
-    (1, 8, DSV4_HEAD_DIM, DSV4_ROPE_DIM, "dsv4_decode_tp8"),
-    (1, 16, DSV4_HEAD_DIM, DSV4_ROPE_DIM, "dsv4_decode_tp4"),
-    (1, 32, DSV4_HEAD_DIM, DSV4_ROPE_DIM, "dsv4_decode_tp2"),
-    (1, 64, DSV4_HEAD_DIM, DSV4_ROPE_DIM, "dsv4_decode_tp1"),
-    (128, 64, DSV4_HEAD_DIM, DSV4_ROPE_DIM, "dsv4_prefill_128"),
-    (512, 64, DSV4_HEAD_DIM, DSV4_ROPE_DIM, "dsv4_prefill_512"),
-    (2048, 64, DSV4_HEAD_DIM, DSV4_ROPE_DIM, "dsv4_prefill_2048"),
-    (128, 64, 64, 64, "warp_head64"),
-    (128, 64, 128, 64, "warp_head128"),
-    (128, 64, 256, 64, "warp_head256"),
-    (4608, 64, 64, 64, "warp_head64_large"),
-    (4608, 64, 128, 64, "warp_head128_large"),
-    (4608, 64, 256, 64, "warp_head256_large"),
-]
+# Only these real DSV4 (head_dim, rope_dim) shapes are benchmarked below --
+# no synthetic warp-path-only shapes (e.g. head_dim 64/256).
+QNORM_ROPE_CONFIGS = []
+for _head_dim, _rope_dim in DSV4_HEAD_ROPE_DIM:
+    QNORM_ROPE_CONFIGS.extend(
+        [
+            (1, 8, _head_dim, _rope_dim, f"dsv4_decode_tp8_h{_head_dim}"),
+            (1, 16, _head_dim, _rope_dim, f"dsv4_decode_tp4_h{_head_dim}"),
+            (1, 32, _head_dim, _rope_dim, f"dsv4_decode_tp2_h{_head_dim}"),
+            (1, 64, _head_dim, _rope_dim, f"dsv4_decode_tp1_h{_head_dim}"),
+            (128, 64, _head_dim, _rope_dim, f"dsv4_prefill_128_h{_head_dim}"),
+            (512, 64, _head_dim, _rope_dim, f"dsv4_prefill_512_h{_head_dim}"),
+            (2048, 64, _head_dim, _rope_dim, f"dsv4_prefill_2048_h{_head_dim}"),
+            (4608, 64, _head_dim, _rope_dim, f"dsv4_prefill_4608_h{_head_dim}"),
+        ]
+    )
+
+q_results = []
 
 
 def native_q_norm_rope(
@@ -808,7 +815,7 @@ def make_q_norm_rope_inputs(
     rope_dim: int,
     max_pos: int = DSV4_MAX_POSITION_EMBEDDINGS,
 ):
-    dtype = DTYPE_MAP.get(dtype_name, torch.bfloat16)
+    dtype = DTYPE_MAP[dtype_name]
     device = torch.device("xpu")
 
     q_input = torch.randn(
@@ -833,7 +840,7 @@ def benchmark_q_norm_rope_shape(
     rope_dim: int,
     label: str,
 ):
-    dtype = DTYPE_MAP.get(dtype_name, torch.bfloat16)
+    dtype = DTYPE_MAP[dtype_name]
     itemsize = torch.tensor([], dtype=dtype).element_size()
     rows = []
 
@@ -877,29 +884,133 @@ def benchmark_q_norm_rope_shape(
 
 def run_qnorm_rope_benchmarks(dtype_name: str = "bf16"):
     print("\n=== DeepSeek-V4 fused_q_norm_rope shape benchmark ===")
-    all_rows = []
-    for num_tokens, num_heads, head_dim, rope_dim, label in QNORM_ROPE_SHAPES:
-        all_rows.extend(
+    for num_tokens, num_heads, head_dim, rope_dim, label in QNORM_ROPE_CONFIGS:
+        q_results.extend(
             benchmark_q_norm_rope_shape(
                 dtype_name, num_tokens, num_heads, head_dim, rope_dim, label
             )
         )
 
-    os.makedirs("benchmark/results", exist_ok=True)
-    out_csv = "benchmark/results/dsv4_fused_q_norm_rope.csv"
-    fieldnames = list(all_rows[0].keys())
-    with open(out_csv, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(all_rows)
-
+    fieldnames = list(q_results[0].keys())
     print("\t".join(fieldnames))
-    for row in all_rows:
+    for row in q_results:
         print("\t".join(str(row[column]) for column in fieldnames))
-    print(f"Wrote results CSV: {out_csv}")
 
 
-FLASHMLA_K_SHAPES = [
+def native_k_norm_rope_flashmla(
+    kv: torch.Tensor,  # (B, 512) input dtype (bf16/fp16/fp32)
+    kv_weight: torch.Tensor,  # (512,) same dtype as kv
+    freqs_cis: torch.Tensor,  # (max_pos, 64) fp32 interleaved [re0,im0,re1,im1,...]
+    positions: torch.Tensor,  # (B,) int32 or int64
+    out_loc: torch.Tensor,  # (B,) int32 cache-slot indices
+    kvcache: torch.Tensor,  # (npages, kPageBytes) uint8
+    eps: float,
+    page_size: int,  # must be a power of 2
+) -> None:
+    """Pure-PyTorch reference for fused K-norm + RoPE + FlashMLA paged cache
+    store. Fixed FlashMLA cache layout (head_dim=512, rope_dim=64,
+    nope_dim=448): value slot (576 bytes) = [0..447] FP8 E4M3 nope (7 warps x
+    64 elems) + [448..575] BF16 rope (64 elems); scale slot (8 bytes) =
+    [0..6] UE8M0 exponent per nope warp + [7] padding. Vectorized (no
+    per-token Python loop), stays on the input device.
+    """
+    fp8_max = 448.0
+    head_dim, rope_dim = 512, 64
+    nope_dim = head_dim - rope_dim  # 448
+    nope_warps = 7  # 64 elems each
+    epw = nope_dim // nope_warps  # 64
+    value_bytes = 576
+
+    assert kv.shape[-1] == head_dim, f"head_dim must be {head_dim}"
+    assert freqs_cis.shape[-1] == rope_dim, f"rope_dim must be {rope_dim}"
+    assert (page_size & (page_size - 1)) == 0, "page_size must be a power of 2"
+
+    B = kv.shape[0]
+    if B == 0:
+        return
+
+    device = kv.device
+    page_bits = int(math.log2(page_size))
+    page_bytes = kvcache.shape[1]
+
+    def cast_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
+        bits = x.float().clamp(min=1e-38).view(torch.int32)
+        exp = (bits >> 23) & 0xFF
+        round_up = (bits & 0x7FFFFF) != 0
+        return exp + round_up.to(torch.int32)
+
+    def inv_scale_ue8m0(ue8m0: torch.Tensor) -> torch.Tensor:
+        inv_exp = (254 - ue8m0).clamp(min=0)
+        inv_bits = (inv_exp << 23).to(torch.int32)
+        inv_f = inv_bits.view(torch.float32)
+        return torch.where(ue8m0 >= 254, torch.zeros_like(inv_f), inv_f)
+
+    # Step 1: block-wide RMSNorm with kv_weight.
+    x = kv.float()
+    rms = x.pow(2).mean(dim=-1, keepdim=True)
+    norm_factor = torch.rsqrt(rms + eps)
+    x = x * norm_factor * kv_weight.float().unsqueeze(0)
+
+    # Step 2: RoPE on the last rope_dim=64 elements.
+    freq = freqs_cis[positions.long()]
+    freq_re = freq[:, 0::2]
+    freq_im = freq[:, 1::2]
+
+    x_nope = x[:, :nope_dim]
+    x_rope = x[:, nope_dim:]
+    xr = x_rope[:, 0::2]
+    xi = x_rope[:, 1::2]
+
+    rotated_re = xr * freq_re - xi * freq_im
+    rotated_im = xr * freq_im + xi * freq_re
+    rope_out = torch.stack([rotated_re, rotated_im], dim=-1).flatten(-2)
+
+    # Step 3: per-warp FP8 E4M3 quantization of the nope region.
+    x_warps = x_nope.reshape(B, nope_warps, epw)
+    abs_max = x_warps.abs().amax(dim=-1)
+    scale_raw = abs_max.clamp(min=1e-4) / fp8_max
+    ue8m0 = cast_to_ue8m0(scale_raw)
+    inv_scale = inv_scale_ue8m0(ue8m0)
+    fp8_nope = (
+        (x_warps * inv_scale.unsqueeze(-1))
+        .clamp(-fp8_max, fp8_max)
+        .to(torch.float8_e4m3fn)
+    )
+
+    # Step 4: flat byte addresses for all scatter writes.
+    valid = out_loc >= 0
+    if not valid.any():
+        return
+
+    pages = out_loc[valid].long() >> page_bits
+    offsets = out_loc[valid].long() & (page_size - 1)
+
+    value_base = pages * page_bytes + offsets * value_bytes
+    scale_base = pages * page_bytes + page_size * value_bytes + offsets * 8
+
+    flat_cache = kvcache.view(-1)
+
+    # Step 5a: scatter FP8 nope bytes.
+    fp8_bytes = fp8_nope[valid].reshape(-1, nope_dim).view(torch.uint8)
+    nope_cols = torch.arange(nope_dim, device=device)
+    nope_idx = value_base.unsqueeze(1) + nope_cols.unsqueeze(0)
+    flat_cache.index_put_((nope_idx.reshape(-1),), fp8_bytes.reshape(-1))
+
+    # Step 5b: scatter BF16 rope bytes.
+    rope_bf16 = rope_out[valid].to(torch.bfloat16)
+    rope_bytes = rope_bf16.view(torch.uint8)
+    rope_cols = torch.arange(128, device=device)
+    rope_idx = (value_base + nope_dim).unsqueeze(1) + rope_cols.unsqueeze(0)
+    flat_cache.index_put_((rope_idx.reshape(-1),), rope_bytes.reshape(-1))
+
+    # Step 5c: scatter UE8M0 scale bytes.
+    ue8m0_bytes = ue8m0[valid].to(torch.uint8)
+    scale_cols = torch.arange(nope_warps, device=device)
+    scale_idx = scale_base.unsqueeze(1) + scale_cols.unsqueeze(0)
+    flat_cache.index_put_((scale_idx.reshape(-1),), ue8m0_bytes.reshape(-1))
+
+
+FLASHMLA_K_CONFIGS = [
     (1, "dsv4_k_decode_b1"),
     (8, "dsv4_k_decode_b8"),
     (32, "dsv4_k_decode_b32"),
@@ -908,17 +1019,18 @@ FLASHMLA_K_SHAPES = [
     (2048, "dsv4_k_prefill_2048"),
     (4608, "dsv4_k_prefill_4608"),
 ]
+k_results = []
 
 
 def make_flashmla_k_inputs(
     dtype_name: str,
     num_tokens: int,
-    head_dim: int = DSV4_HEAD_DIM,
-    rope_dim: int = DSV4_ROPE_DIM,
+    head_dim: int = DSV4_HEAD_ROPE_DIM[-1][0],  # K-path (FlashMLA) is always 512
+    rope_dim: int = DSV4_HEAD_ROPE_DIM[-1][1],
     page_size: int = 256,
     max_pos: int = DSV4_MAX_POSITION_EMBEDDINGS,
 ):
-    dtype = DTYPE_MAP.get(dtype_name, torch.bfloat16)
+    dtype = DTYPE_MAP[dtype_name]
     device = torch.device("xpu")
 
     kv = torch.randn(num_tokens, head_dim, device=device, dtype=dtype).contiguous()
@@ -945,10 +1057,9 @@ def benchmark_flashmla_k_shape(
     label: str,
     page_size: int = 256,
 ):
-    dtype = DTYPE_MAP.get(dtype_name, torch.bfloat16)
+    dtype = DTYPE_MAP[dtype_name]
     itemsize = torch.tensor([], dtype=dtype).element_size()
-    head_dim = DSV4_HEAD_DIM
-    rope_dim = DSV4_ROPE_DIM
+    head_dim, rope_dim = DSV4_HEAD_ROPE_DIM[-1]  # K-path (FlashMLA) is always 512/64
     rows = []
 
     kv, kv_weight, freqs_real, positions, out_loc, kvcache = make_flashmla_k_inputs(
@@ -968,7 +1079,7 @@ def benchmark_flashmla_k_shape(
     kvcache_ref = kvcache.clone()
 
     def native_k_fn():
-        fused_k_norm_rope_flashmla_ref(
+        native_k_norm_rope_flashmla(
             kv, kv_weight, freqs_real, positions, out_loc, kvcache_ref, 1e-6, page_size
         )
 
@@ -1011,22 +1122,13 @@ def benchmark_flashmla_k_shape(
 
 def run_flashmla_k_benchmarks(dtype_name: str = "bf16"):
     print("\n=== DeepSeek-V4 fused_k_norm_rope_flashmla shape benchmark ===")
-    all_rows = []
-    for num_tokens, label in FLASHMLA_K_SHAPES:
-        all_rows.extend(benchmark_flashmla_k_shape(dtype_name, num_tokens, label))
+    for num_tokens, label in FLASHMLA_K_CONFIGS:
+        k_results.extend(benchmark_flashmla_k_shape(dtype_name, num_tokens, label))
 
-    os.makedirs("benchmark/results", exist_ok=True)
-    out_csv = "benchmark/results/dsv4_fused_k_norm_rope_flashmla.csv"
-    fieldnames = list(all_rows[0].keys())
-    with open(out_csv, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(all_rows)
-
+    fieldnames = list(k_results[0].keys())
     print("\t".join(fieldnames))
-    for row in all_rows:
+    for row in k_results:
         print("\t".join(str(row[column]) for column in fieldnames))
-    print(f"Wrote results CSV: {out_csv}")
 
 
 if __name__ == "__main__":
@@ -1124,3 +1226,79 @@ if __name__ == "__main__":
                     f"  {dt:>12s}: avg={sp.mean():.2f}x  max={sp.max():.2f}x  min={sp.min():.2f}x"
                 )
     print(f"Wrote results CSV: {out_csv}")
+
+    # === q_results (fused_q_norm_rope) summary ===
+    print("\n" + "=" * 80)
+    print("Q Norm+RoPE Benchmark Results")
+    print("=" * 80)
+    q_df = pd.DataFrame(q_results)
+    q_out_csv = os.path.join("benchmark/results", f"q_norm_rope.csv")
+    q_df.to_csv(q_out_csv, index=False)
+    print(f"Wrote results CSV: {q_out_csv}")
+
+    if not q_df.empty:
+        q_df["latency_us"] = q_df["latency_us"].round(3)
+        q_df["gbps"] = q_df["gbps"].round(2)
+        print(q_df.to_markdown(index=False))
+
+        q_summary = q_df.groupby(["dtype", "provider"]).agg(
+            {"latency_us": ["mean", "min", "max"], "gbps": ["mean", "min", "max"]}
+        )
+        print(q_summary.to_markdown())
+
+        q_pivot = q_df.pivot_table(
+            index=["shape_label", "dtype", "num_heads", "head_dim", "rope_dim"],
+            columns="provider",
+            values="latency_us",
+        )
+        if (
+            "native_unfused" in q_pivot.columns
+            and "fused_q_norm_rope" in q_pivot.columns
+        ):
+            q_pivot["speedup"] = (
+                q_pivot["native_unfused"] / q_pivot["fused_q_norm_rope"]
+            )
+            print(f"\nfused_q_norm_rope avg speedup: {q_pivot['speedup'].mean():.2f}x")
+            print(f"fused_q_norm_rope max speedup: {q_pivot['speedup'].max():.2f}x")
+            print(f"fused_q_norm_rope min speedup: {q_pivot['speedup'].min():.2f}x")
+
+    # === k_results (fused_k_norm_rope_flashmla) summary ===
+    print("\n" + "=" * 80)
+    print("K Norm+RoPE FlashMLA Benchmark Results")
+    print("=" * 80)
+    k_df = pd.DataFrame(k_results)
+    k_out_csv = os.path.join("benchmark/results", f"k_norm_rope_flashmla.csv")
+    k_df.to_csv(k_out_csv, index=False)
+    print(f"Wrote results CSV: {k_out_csv}")
+
+    if not k_df.empty:
+        k_df["latency_us"] = k_df["latency_us"].round(3)
+        k_df["gbps"] = k_df["gbps"].round(2)
+        print(k_df.to_markdown(index=False))
+
+        k_summary = k_df.groupby(["dtype", "provider"]).agg(
+            {"latency_us": ["mean", "min", "max"], "gbps": ["mean", "min", "max"]}
+        )
+        print(k_summary.to_markdown())
+
+        k_pivot = k_df.pivot_table(
+            index=["shape_label", "dtype", "head_dim", "rope_dim"],
+            columns="provider",
+            values="latency_us",
+        )
+        if (
+            "native_unfused_ref" in k_pivot.columns
+            and "fused_k_norm_rope_flashmla" in k_pivot.columns
+        ):
+            k_pivot["speedup"] = (
+                k_pivot["native_unfused_ref"] / k_pivot["fused_k_norm_rope_flashmla"]
+            )
+            print(
+                f"\nfused_k_norm_rope_flashmla avg speedup: {k_pivot['speedup'].mean():.2f}x"
+            )
+            print(
+                f"fused_k_norm_rope_flashmla max speedup: {k_pivot['speedup'].max():.2f}x"
+            )
+            print(
+                f"fused_k_norm_rope_flashmla min speedup: {k_pivot['speedup'].min():.2f}x"
+            )

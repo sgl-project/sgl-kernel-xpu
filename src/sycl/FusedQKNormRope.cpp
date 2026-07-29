@@ -868,7 +868,7 @@ void launchFusedQKNormRopeCacheImpl(
 //
 // Two paths, dispatched on head_dim:
 //   - Warp: one sub-group per (token, head) row. Only for head_dim in
-//     {64, 128, 256} with rope_dim aligned to a lane boundary (so the
+//     {64, 128, 192, 256} with rope_dim aligned to a lane boundary (so the
 //     real/imag pair always lands within one lane -- no cross-lane traffic).
 //   - CTA: one work-group per row, staged through local memory so the
 //     real/imag pairing works for any head_dim/rope_dim (e.g. DSV4's 512).
@@ -1280,7 +1280,7 @@ void fused_q_norm_rope(
       const float* freqs_ptr = static_cast<const float*>(freqs_cis.data_ptr());
       const IdType* pos_ptr = static_cast<const IdType*>(positions.data_ptr());
 
-      // Warp path for head_dim in {64,128,256} when rope_dim aligns to a
+      // Warp path for head_dim in {64,128,192,256} when rope_dim aligns to a
       // lane boundary; everything else (incl. head_dim > 256, e.g. DSV4's
       // 512) falls back to CTA. Try each head_dim through one lambda
       // instead of repeating the ~10-argument call three times.
@@ -1307,6 +1307,7 @@ void fused_q_norm_rope(
       };
       try_warp_head_dim(std::integral_constant<int64_t, 64>{});
       try_warp_head_dim(std::integral_constant<int64_t, 128>{});
+      try_warp_head_dim(std::integral_constant<int64_t, 192>{});
       try_warp_head_dim(std::integral_constant<int64_t, 256>{});
 
       if (!dispatched) {

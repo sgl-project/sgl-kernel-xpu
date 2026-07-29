@@ -56,17 +56,17 @@ namespace sgemm_lora_b_fwd_impl {
 
 // Each function is defined in a separate generated .cpp file from
 // sgemm_lora_b_fwd_kernel.cpp.in, compiled as its own library.
-#define DECLARE_SGEMM_LORA_B_FWD_LAUNCH(ELEM, TILE)      \
-  void launch_sgemm_lora_b_fwd_##ELEM##_##TILE(          \
-      const torch::Tensor& input_x,                      \
-      const torch::Tensor& weights,                      \
-      const torch::Tensor& seg_indptr_i32,               \
-      const torch::Tensor& weight_indices_i32,           \
-      const torch::Tensor& scalings,                     \
-      torch::Tensor& output,                             \
-      const std::optional<torch::Tensor>& base_output,   \
-      const int output_dim,                              \
-      const int num_segments,                            \
+#define DECLARE_SGEMM_LORA_B_FWD_LAUNCH(ELEM, TILE)    \
+  void launch_sgemm_lora_b_fwd_##ELEM##_##TILE(        \
+      const torch::Tensor& input_x,                    \
+      const torch::Tensor& weights,                    \
+      const torch::Tensor& seg_indptr_i32,             \
+      const torch::Tensor& weight_indices_i32,         \
+      const torch::Tensor& scalings,                   \
+      torch::Tensor& output,                           \
+      const std::optional<torch::Tensor>& base_output, \
+      const int output_dim,                            \
+      const int num_segments,                          \
       sycl::queue& queue);
 
 // One declaration per registered tile. Extend as tiles are added.

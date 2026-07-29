@@ -42,8 +42,8 @@
 
 #include <ATen/ATen.h>
 #include <torch/all.h>
-#include <optional>
 
+#include <optional>
 #include <sycl/sycl.hpp>
 
 #include "sycl/SYCLHelpers.h"

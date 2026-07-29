@@ -173,7 +173,9 @@ def test_sgemm_lora_b_fwd_base_output_residual(dtype, use_base_output):
 
     seg_indptr = torch.tensor([0, 20, 48], dtype=torch.int32, device="xpu")
     weight_indices = torch.tensor([1, 0], dtype=torch.int32, device="xpu")
-    lora_ranks = torch.tensor([max_rank, max_rank // 2], dtype=torch.int32, device="xpu")
+    lora_ranks = torch.tensor(
+        [max_rank, max_rank // 2], dtype=torch.int32, device="xpu"
+    )
     scalings = torch.tensor([1.5, 0.75], dtype=torch.float32, device="xpu")
 
     _run_and_compare(
@@ -522,7 +524,9 @@ def test_sgemm_lora_b_fwd_int64_index_tensors_accepted():
 
     seg_indptr = torch.tensor([0, 16, 32], dtype=torch.int64, device="xpu")
     weight_indices = torch.tensor([1, 0], dtype=torch.int64, device="xpu")
-    lora_ranks = torch.tensor([max_rank, max_rank // 2], dtype=torch.int32, device="xpu")
+    lora_ranks = torch.tensor(
+        [max_rank, max_rank // 2], dtype=torch.int32, device="xpu"
+    )
     scalings = torch.tensor([1.25, 0.75], dtype=torch.float32, device="xpu")
 
     _run_and_compare(
@@ -622,7 +626,9 @@ def test_sgemm_lora_b_fwd_input_validation(bad_case, expected_msg):
         kwargs["seg_indptr"] = torch.tensor([0, 3], dtype=torch.int32, device="xpu")
     elif bad_case == "seg_indptr_decreasing":
         # 3-segment indptr, decreasing in the middle (4 -> 2).
-        kwargs["seg_indptr"] = torch.tensor([0, 4, 2, 4], dtype=torch.int32, device="xpu")
+        kwargs["seg_indptr"] = torch.tensor(
+            [0, 4, 2, 4], dtype=torch.int32, device="xpu"
+        )
         kwargs["weight_indices"] = torch.tensor(
             [0, 0, 0], dtype=torch.int32, device="xpu"
         )

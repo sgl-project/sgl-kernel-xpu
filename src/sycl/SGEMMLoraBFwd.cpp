@@ -75,9 +75,9 @@ namespace {
 //----------------- Main API function --------------------//
 
 void sgemm_lora_b_fwd(
-    torch::Tensor& output,         // [num_tokens, output_dim]
-    const torch::Tensor& input_x,  // [num_tokens, K] (K = max_rank)
-    const torch::Tensor& weights,  // [num_loras, output_dim, K]
+    torch::Tensor& output,                // [num_tokens, output_dim]
+    const torch::Tensor& input_x,         // [num_tokens, K] (K = max_rank)
+    const torch::Tensor& weights,         // [num_loras, output_dim, K]
     const torch::Tensor& seg_indptr,      // [num_segments + 1,]
     const torch::Tensor& weight_indices,  // [num_segments,]
     const torch::Tensor& lora_ranks,      // [num_loras,]
@@ -85,7 +85,7 @@ void sgemm_lora_b_fwd(
     const std::optional<torch::Tensor>&
         seg_lens,  // [num_segments,] optional; currently unused, reserved for future per-segment optimizations
     const std::optional<torch::Tensor>&
-        base_output // [num_tokens, output_dim] optional; this can be the base model's output for a fused add operation
+        base_output  // [num_tokens, output_dim] optional; this can be the base model's output for a fused add operation
 ) {
   CHECK_INPUT(input_x);
   CHECK_INPUT(weights);

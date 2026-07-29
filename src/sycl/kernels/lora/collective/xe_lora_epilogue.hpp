@@ -95,18 +95,17 @@ template <
     class FusionCallbacks_,
     class CopyOpG2R_,
     class CopyOpR2G_>
-class GroupedEpiloguePerGroupScalar
-    : public cutlass::epilogue::collective::CollectiveEpilogue<
-          cutlass::epilogue::IntelXeGenericGroup,
-          WGTileMNK_,
-          EpilogueTile_,
-          ElementC_,
-          StrideC_,
-          ElementD_,
-          StrideD_,
-          FusionCallbacks_,
-          CopyOpG2R_,
-          CopyOpR2G_> {
+class GroupedEpiloguePerGroupScalar : public cutlass::epilogue::collective::CollectiveEpilogue<
+                                          cutlass::epilogue::IntelXeGenericGroup,
+                                          WGTileMNK_,
+                                          EpilogueTile_,
+                                          ElementC_,
+                                          StrideC_,
+                                          ElementD_,
+                                          StrideD_,
+                                          FusionCallbacks_,
+                                          CopyOpG2R_,
+                                          CopyOpR2G_> {
  private:
   using StockGroupEpilogue = cutlass::epilogue::collective::CollectiveEpilogue<
       cutlass::epilogue::IntelXeGenericGroup,
@@ -121,8 +120,9 @@ class GroupedEpiloguePerGroupScalar
       CopyOpR2G_>;
 
  public:
-  using Arguments = typename StockGroupEpilogue::Arguments;          // host-side epilogue args (fusion thread + C/D ptrs)
-  using BaseArguments = typename StockGroupEpilogue::BaseArguments;  // per-group args consumed by the underlying epilogue
+  using Arguments = typename StockGroupEpilogue::Arguments;  // host-side epilogue args (fusion thread + C/D ptrs)
+  using BaseArguments =
+      typename StockGroupEpilogue::BaseArguments;  // per-group args consumed by the underlying epilogue
 
   // Called once per group by the array kernel (guarded by did_group_change) with
   // idx == curr_group. Identical to the stock method except alpha/beta pointer

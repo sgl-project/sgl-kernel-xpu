@@ -75,12 +75,12 @@ namespace sgemm_lora_b_fwd_impl {
 // GroupGemmLoraFwd launcher.
 template <typename T, typename TileOpt>
 inline void runSgemmLoraBFwd(
-    const torch::Tensor& input_x,               // [num_tokens, K]  (K = max_rank)
-    const torch::Tensor& weights,               // [num_loras, output_dim, K]
-    const torch::Tensor& seg_indptr_i32,        // [num_segments + 1]
-    const torch::Tensor& weight_indices_i32,    // [num_segments]
-    const torch::Tensor& scalings,              // [num_loras] fp32 per-adapter scaling (lora_alpha / rank)
-    torch::Tensor& output,                      // [num_tokens, output_dim]
+    const torch::Tensor& input_x,                     // [num_tokens, K]  (K = max_rank)
+    const torch::Tensor& weights,                     // [num_loras, output_dim, K]
+    const torch::Tensor& seg_indptr_i32,              // [num_segments + 1]
+    const torch::Tensor& weight_indices_i32,          // [num_segments]
+    const torch::Tensor& scalings,                    // [num_loras] fp32 per-adapter scaling (lora_alpha / rank)
+    torch::Tensor& output,                            // [num_tokens, output_dim]
     const std::optional<torch::Tensor>& base_output,  // [num_tokens, output_dim] residual C, or nullopt
     const int output_dim,
     const int num_segments,

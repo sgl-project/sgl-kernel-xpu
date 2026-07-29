@@ -162,7 +162,7 @@ struct GroupGemmTypes {
   // other behaviour. See collective/xe_lora_epilogue.hpp.
   using CollectiveEpilogue = GroupedEpiloguePerGroupScalar<
       TileShape,
-      void,  // EpilogueTile (void = automatic)
+      void,           // EpilogueTile (void = automatic)
       ElementOutput,  // ElementC -- residual C (base_output) is bf16/fp16
       cutlass::gemm::TagToStrideC_t<LayoutC*>,
       ElementOutput,  // bf16/fp16 narrow here
@@ -234,10 +234,11 @@ inline typename Types::Gemm::Arguments args_from_options(
     const torch::Tensor& stride_C,       // int64  [num_segments]     must equal stride_D
     const torch::Tensor& stride_D,       // int64  [num_segments]     leading dim of D = N
     int num_segments,
-    float alpha,   // epilogue scalar: D = alpha * (A @ B) + beta * C (used when alpha_ptr_array is null)
-    float beta,    //   A-fwd uses (1.0, 0.0); B-fwd / QKV-B-fwd use (1.0, 1.0) for in-place residual.
+    float alpha,  // epilogue scalar: D = alpha * (A @ B) + beta * C (used when alpha_ptr_array is null)
+    float beta,   //   A-fwd uses (1.0, 0.0); B-fwd / QKV-B-fwd use (1.0, 1.0) for in-place residual.
     const std::optional<torch::Tensor>& alpha_ptr_array =
-        std::nullopt) {  // int64 [num_segments] device array-of-pointers, one fp32* per segment (overrides scalar alpha)
+        std::nullopt) {  // int64 [num_segments] device array-of-pointers, one fp32* per segment (overrides scalar
+                         // alpha)
   using GemmKernel = typename Types::GemmKernel;
   using ElementMma = typename Types::ElementMma;
   using ElementMmaB = typename Types::ElementMmaB;
@@ -298,8 +299,7 @@ inline typename Types::Gemm::Arguments args_from_options(
     // Per-segment alpha: device array of one fp32* per segment; the fusion reads
     // *(alpha_ptr_array[l_coord]) for group l_coord (dAlpha L-stride 1).
     fusion_args.alpha = ElementScalar(0);
-    fusion_args.alpha_ptr_array =
-        reinterpret_cast<ElementScalar const* const*>(alpha_ptr_array->data_ptr<int64_t>());
+    fusion_args.alpha_ptr_array = reinterpret_cast<ElementScalar const* const*>(alpha_ptr_array->data_ptr<int64_t>());
     fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 1};
   } else {
     // Single alpha broadcast to all segments (dAlpha = {_0,_0,0}).

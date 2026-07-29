@@ -356,13 +356,11 @@ def _get_moe_ws(
         numel *= d
     cur = workspace.get(name)
     if cur is None or cur.numel() < numel or cur.dtype != dtype or cur.device != device:
-        # Growing replaces the previous buffer. Without a sync here, an in-flight kernel
-        # from an earlier call may still be reading/writing that old buffer's memory,
-        # causing a data race. With the headroom, growth only happens a handful of times
-        # total, so this sync is effectively free amortized over a server's lifetime.
-        if cur is not None:
-            torch.xpu.synchronize(device)
-        # The max here ensures it won't be less than numel.
+        # Grow the buffer with headroom so reallocations are rare.
+        # No explicit sync is needed: PyTorch's caching allocator inserts a
+        # stream-ordered deallocation event when the old tensor is dropped, so
+        # its memory cannot be reused until all in-flight kernels referencing
+        # it have completed.
         new_numel = max(numel, int(numel * _MOE_WS_HEADROOM))
         cur = torch.empty(new_numel, dtype=dtype, device=device)
         workspace[name] = cur

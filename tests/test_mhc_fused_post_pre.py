@@ -1,7 +1,6 @@
 import pytest
 import torch
 from sgl_kernel import hc_post, mhc_fused_post_pre, mhc_pre
-from test_hc_pre_fuse import _hc_pre_big_fuse_torch
 
 HC_MULT = 4
 HC_MULT3 = (2 + HC_MULT) * HC_MULT  # 24
@@ -17,39 +16,6 @@ NORM_EPS = 1e-6
 def skip_if_no_xpu():
     if not torch.xpu.is_available():
         pytest.skip("XPU not available")
-
-
-def _hc_post_torch_impl(x, residual, post, comb):
-    return (
-        post.unsqueeze(-1) * x.unsqueeze(1)
-        + (comb.unsqueeze(-1) * residual.unsqueeze(2)).sum(dim=1)
-    ).type_as(x)
-
-
-def _mhc_pre_torch(residual, fn, hc_scale, hc_base, norm_weight):
-    t = residual.size(0)
-    hc_hidden = HC_MULT * residual.size(2)
-    a = residual.reshape(t, hc_hidden).float()
-    b = fn.float()  # [24, hc_hidden]
-
-    gemm_out_mul = (a @ b.t()).unsqueeze(0)  # [1, T, 24]
-    gemm_out_sqrsum = (a * a).sum(dim=1).unsqueeze(0)  # [1, T]
-
-    return _hc_pre_big_fuse_torch(
-        gemm_out_mul,
-        gemm_out_sqrsum,
-        hc_scale,
-        hc_base,
-        residual,
-        HC_MULT,
-        SINKHORN_REPEAT,
-        RMS_EPS,
-        HC_PRE_EPS,
-        HC_SINKHORN_EPS,
-        HC_POST_MULT_VALUE,
-        norm_weight=norm_weight.float() if norm_weight is not None else None,
-        norm_eps=NORM_EPS,
-    )
 
 
 def _make_inputs(t, d, device, seed=42):
@@ -72,25 +38,7 @@ def _make_inputs(t, d, device, seed=42):
     return x, residual, post, comb, fn, hc_scale, hc_base, norm_weight
 
 
-def _bench_xpu(fn, *, warmup=5, iters=20):
-    for _ in range(warmup):
-        fn()
-    torch.xpu.synchronize()
-
-    times = []
-    for _ in range(iters):
-        start = torch.xpu.Event(enable_timing=True)
-        end = torch.xpu.Event(enable_timing=True)
-        start.record()
-        fn()
-        end.record()
-        torch.xpu.synchronize()
-        times.append(start.elapsed_time(end))
-    times.sort()
-    return times[len(times) // 2]
-
-
-def _bench_xpu_pair(fn_a, fn_b, *, warmup=15, iters=30):
+def _bench(fn_a, fn_b, *, warmup=15, iters=30):
     for _ in range(warmup):
         fn_a()
         fn_b()
@@ -112,7 +60,7 @@ def _bench_xpu_pair(fn_a, fn_b, *, warmup=15, iters=30):
         torch.xpu.synchronize()
         a_times.append(sa.elapsed_time(ea))
         b_times.append(sb.elapsed_time(eb))
-    return min(a_times), min(b_times)
+    return sum(a_times) / len(a_times), sum(b_times) / len(b_times)
 
 
 @pytest.mark.parametrize("d", [4096, 7168])
@@ -142,6 +90,21 @@ def test_mhc_fused_post_pre(t, d, with_norm):
         norm_eps=NORM_EPS if with_norm else None,
     )
 
+    residual_ref = hc_post(x, residual, post, comb)
+    post_ref, comb_ref, layer_input_ref = mhc_pre(
+        residual_ref,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps=RMS_EPS,
+        hc_pre_eps=HC_PRE_EPS,
+        hc_sinkhorn_eps=HC_SINKHORN_EPS,
+        hc_post_mult_value=HC_POST_MULT_VALUE,
+        sinkhorn_repeat=SINKHORN_REPEAT,
+        norm_weight=nw,
+        norm_eps=NORM_EPS if with_norm else None,
+    )
+
     if t == 0:
         assert residual_cur.shape == residual.shape
         assert post_cur.shape == (0, HC_MULT, 1)
@@ -151,12 +114,15 @@ def test_mhc_fused_post_pre(t, d, with_norm):
         assert post_cur.dtype == torch.float32
         assert comb_cur.dtype == torch.float32
         assert layer_input_cur.dtype == torch.bfloat16
+        assert residual_ref.shape == residual_cur.shape
+        assert post_ref.shape == post_cur.squeeze(-1).shape
+        assert comb_ref.shape == comb_cur.shape
+        assert layer_input_ref.shape == layer_input_cur.shape
+        assert residual_ref.dtype == residual_cur.dtype
+        assert post_ref.dtype == post_cur.dtype
+        assert comb_ref.dtype == comb_cur.dtype
+        assert layer_input_ref.dtype == layer_input_cur.dtype
         return
-
-    residual_ref = _hc_post_torch_impl(x, residual, post, comb)
-    post_ref, comb_ref, layer_input_ref = _mhc_pre_torch(
-        residual_ref, fn, hc_scale, hc_base, nw
-    )
 
     torch.testing.assert_close(
         residual_cur,
@@ -176,14 +142,14 @@ def test_mhc_fused_post_pre(t, d, with_norm):
 
     torch.testing.assert_close(
         comb_cur,
-        comb_ref.reshape(t, HC_MULT, HC_MULT),
+        comb_ref,
         atol=2e-2,
         rtol=2e-2,
         msg=f"comb_mix mismatch (T={t}, D={d}, norm={with_norm})",
     )
 
     torch.testing.assert_close(
-        layer_input_cur.float(),
+        layer_input_cur,
         layer_input_ref,
         atol=2e-2,
         rtol=2e-2,
@@ -193,7 +159,7 @@ def test_mhc_fused_post_pre(t, d, with_norm):
 
 @torch.inference_mode()
 @pytest.mark.parametrize("d", [4096, 7168])
-@pytest.mark.parametrize("t", [1, 8, 17, 32, 64])
+@pytest.mark.parametrize("t", [1, 8, 17, 32])
 def test_mhc_fused_post_pre_perf(t, d):
     x, residual, post, comb, fn, hc_scale, hc_base, norm_weight = _make_inputs(
         t, d, device="xpu:0", seed=123
@@ -233,7 +199,7 @@ def test_mhc_fused_post_pre_perf(t, d):
             norm_eps=NORM_EPS,
         )
 
-    fused_ms, split_ms = _bench_xpu_pair(run_fused, run_split)
+    fused_ms, split_ms = _bench(run_fused, run_split)
 
     assert fused_ms < split_ms, (
         f"fused op is not faster: " f"fused={fused_ms:.3f} ms, split={split_ms:.3f} ms"

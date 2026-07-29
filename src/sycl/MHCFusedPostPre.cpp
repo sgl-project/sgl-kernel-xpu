@@ -111,6 +111,19 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mhc_fused_post_pre(
   TORCH_CHECK(
       comb_3d.size(0) == t && comb_3d.size(1) == hc_mult && comb_3d.size(2) == hc_mult, "comb_res_mix shape mismatch");
 
+  if (t == 0) {
+    at::Tensor residual_cur = at::empty_like(residual);
+    at::Tensor post_mix_cur = at::empty({0, hc_mult}, residual.options().dtype(at::kFloat));
+    at::Tensor comb_mix_cur = at::empty({0, hc_mult, hc_mult}, residual.options().dtype(at::kFloat));
+    at::Tensor layer_input_cur = at::empty({0, hidden_size}, residual.options());
+    return {
+        residual_cur,
+        post_mix_cur.unsqueeze(-1),
+        comb_mix_cur,
+        layer_input_cur,
+    };
+  }
+
   int64_t n_splits_pre = choose_n_splits(t, hc_hidden, n_splits);
 
   at::Tensor residual_cur = at::empty_like(residual);

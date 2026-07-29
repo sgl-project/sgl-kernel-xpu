@@ -266,8 +266,8 @@ def mhc_fused_post_pre(
     hc_post_mult_value: float = 2.0,
     sinkhorn_repeat: int = 20,
     n_splits: int = 0,
-    tile_n: int = 1,
     *,
+    tile_n: int = 1,
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: Optional[float] = None,
 ):

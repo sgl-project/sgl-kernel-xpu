@@ -1,10 +1,7 @@
 import pytest
 import torch
-import utils
 from sgl_kernel import hc_post, mhc_fused_post_pre, mhc_pre
 from test_hc_pre_fuse import _hc_pre_big_fuse_torch
-
-device = utils.get_device()
 
 HC_MULT = 4
 HC_MULT3 = (2 + HC_MULT) * HC_MULT  # 24
@@ -14,6 +11,12 @@ HC_PRE_EPS = 1e-6
 HC_SINKHORN_EPS = 1e-6
 HC_POST_MULT_VALUE = 2.0
 NORM_EPS = 1e-6
+
+
+@pytest.fixture(autouse=True)
+def skip_if_no_xpu():
+    if not torch.xpu.is_available():
+        pytest.skip("XPU not available")
 
 
 def _hc_post_torch_impl(x, residual, post, comb):
@@ -117,7 +120,7 @@ def _bench_xpu_pair(fn_a, fn_b, *, warmup=15, iters=30):
 @pytest.mark.parametrize("with_norm", [False, True])
 def test_mhc_fused_post_pre(t, d, with_norm):
     x, residual, post, comb, fn, hc_scale, hc_base, norm_weight = _make_inputs(
-        t, d, device=f"{device}:0"
+        t, d, device="xpu:0"
     )
 
     nw = norm_weight if with_norm else None
@@ -192,11 +195,8 @@ def test_mhc_fused_post_pre(t, d, with_norm):
 @pytest.mark.parametrize("d", [4096, 7168])
 @pytest.mark.parametrize("t", [1, 8, 17, 32, 64])
 def test_mhc_fused_post_pre_perf(t, d):
-    if not torch.xpu.is_available():
-        pytest.skip("XPU is required for perf test")
-
     x, residual, post, comb, fn, hc_scale, hc_base, norm_weight = _make_inputs(
-        t, d, device=f"{device}:0", seed=123
+        t, d, device="xpu:0", seed=123
     )
 
     def run_fused():

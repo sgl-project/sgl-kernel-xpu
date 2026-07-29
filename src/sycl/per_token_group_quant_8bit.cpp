@@ -136,11 +136,11 @@ struct PerTokenGroupQuant8bitKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       scale_output = reinterpret_cast<scale_element_t*>(output_s) +
                      (col_idx * scale_stride * num_elems_per_pack + row_idx * num_elems_per_pack + pack_idx);
     } else {
-      // Plain row-major scale layout. Supports float scales (non-UE8M0) and, when
-      // the kernel is instantiated with scale_packed_t=uint8_t, the UE8M0 byte
-      // written contiguously at the group index -- a plain [tokens, K/group] uint8
-      // scale (consumed directly by e.g. torch._scaled_mm BlockWise1x32).
-      scale_output = reinterpret_cast<scale_element_t*>(output_s) + global_group_id;
+      // Row-major: scale_packed_t is instantiated to scale_element_t
+      // (uint8_t for UE8M0, float otherwise), so this is a plain
+      // one-element-per-group index — no reinterpret needed.
+      static_assert(std::is_same_v<scale_packed_t, scale_element_t>);
+      scale_output = output_s + global_group_id;
     }
 
     using vec_type = vec_t<T, VEC_SIZE>;
@@ -361,7 +361,8 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_8bit(
         sycl_kernel_submit(global_range, local_range, queue, kernel);                         \
       }                                                                                       \
     } else if (scale_ue8m0) {                                                                 \
-      /* Plain row-major UE8M0: scale_packed_t=uint8_t, output_s is uint8 [M,K/g] */          \
+      /* Row-major uint8 UE8M0: override scale_packed_t=uint8_t so the storage */             \
+      /* type matches the tensor (no cross-type reinterpret). */                              \
       auto kernel = PerTokenGroupQuant8bitKernel<T, DST_DTYPE, GS, false, true, SG, uint8_t>( \
           static_cast<const T*>(input.data_ptr()),                                            \
           output_q.data_ptr(),                                                                \
@@ -370,9 +371,7 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_8bit(
           groups_per_block,                                                                   \
           static_cast<float>(eps),                                                            \
           static_cast<float>(min_8bit),                                                       \
-          static_cast<float>(max_8bit),                                                       \
-          num_groups_per_row,                                                                 \
-          scale_stride);                                                                      \
+          static_cast<float>(max_8bit));                                                      \
       sycl_kernel_submit(global_range, local_range, queue, kernel);                           \
     } else {                                                                                  \
       auto kernel = PerTokenGroupQuant8bitKernel<T, DST_DTYPE, GS, false, false, SG>(         \

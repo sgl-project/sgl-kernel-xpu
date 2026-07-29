@@ -1,18 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Benchmark script for FP8/MXFP8 (E4M3 + fp32 scales, block=128)
-Block-Scaled Grouped GEMM for MoE on Intel XPU.
+"""Benchmark FP8 / MXFP8 Blockwise Grouped GEMM (MoE) on Intel XPU.
 
-Two prep modes are exercised through the SAME public entry point
-``fp8_blockwise_scaled_grouped_mm``:
-
-  * legacy   — pointer arrays + transposed A-scales built in Python
-               (per-expert ``data_ptr()`` loop, per-expert ``s.t().contiguous()``).
-  * ondevice — empty int64 sentinel ptr-arrays + row-major A-scales.
-               Pointer table and A-scale transpose are built on device by a
-               single SYCL kernel inside the C++ entry point.
-
-In ``--prep-mode=compare`` the script benchmarks both paths back-to-back per
-shape and prints prep-included speedup.
+``--dtype`` picks FP8 (BS=128, fp32 scales, SW-scaled) or MXFP8 (BS=32,
+UE8M0 scales, HW-scaled). ``--prep-mode`` picks legacy (Python prep),
+ondevice (SYCL prep), or compare (both, with prep-included speedup).
 """
 
 import argparse
@@ -28,7 +19,8 @@ IS_CI = (
     or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
 )
 
-MXFP8_BLOCK_SIZE = 128
+FP8_BLOCK_SIZE = 128  # DSV3-style FP8, fp32 scales
+MXFP8_BLOCK_SIZE = 32  # OCP MXFP8, UE8M0 uint8 scales
 FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
 
 
@@ -57,9 +49,9 @@ def ceil_div(x: int, y: int) -> int:
 
 
 def quantize_to_fp8_e4m3(
-    tensor: torch.Tensor, block_size: int = MXFP8_BLOCK_SIZE
+    tensor: torch.Tensor, block_size: int = FP8_BLOCK_SIZE
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Quantize (M, K) float -> (FP8 e4m3 [M,K], fp32 scales [M, K//block_size])."""
+    """DSV3-style FP8 quant. (M, K) float -> (fp8_e4m3fn, fp32 scales [M, K//block_size])."""
     assert tensor.dim() == 2
     rows, cols = tensor.shape
     assert cols % block_size == 0
@@ -74,10 +66,11 @@ def quantize_to_fp8_e4m3(
 
 def quantize_matrix_blockwise_2d(
     tensor: torch.Tensor,
-    block_k: int = MXFP8_BLOCK_SIZE,
-    block_n: int = MXFP8_BLOCK_SIZE,
+    block_k: int = FP8_BLOCK_SIZE,
+    block_n: int = FP8_BLOCK_SIZE,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Quantize (N, K) float -> (FP8 e4m3, fp32 scales [N//block_n, K//block_k])."""
+    """DSV3-style FP8 2D-block quant. (N, K) float -> (fp8_e4m3fn, fp32 scales
+    [N//block_n, K//block_k])."""
     assert tensor.dim() == 2
     n, k = tensor.shape
     assert n % block_n == 0 and k % block_k == 0
@@ -91,21 +84,50 @@ def quantize_matrix_blockwise_2d(
     return clamped.reshape(n, k).to(torch.float8_e4m3fn), scales
 
 
+def quantize_to_mxfp8(
+    tensor: torch.Tensor, block_size: int = MXFP8_BLOCK_SIZE
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """OCP MXFP8 quant. UE8M0 scale stored as exponent + 127."""
+    assert tensor.dim() == 2
+    rows, cols = tensor.shape
+    assert cols % block_size == 0
+
+    blocks = tensor.float().reshape(rows, cols // block_size, block_size)
+    amax = blocks.abs().amax(dim=-1)
+    ratio = torch.where(amax > 0, amax / FP8_E4M3_MAX, torch.ones_like(amax))
+    exp = torch.clamp(torch.floor(torch.log2(ratio)), min=-127, max=127)
+    scale_fp = torch.pow(2.0, exp)
+    scaled = blocks / scale_fp.unsqueeze(-1)
+    q = (
+        scaled.clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX)
+        .reshape(rows, cols)
+        .to(torch.float8_e4m3fn)
+    )
+    scale_u8 = (exp.to(torch.int32) + 127).to(torch.uint8)
+    return q, scale_u8
+
+
 def ensure_contiguous(t: torch.Tensor) -> torch.Tensor:
     return t if t.is_contiguous() else t.contiguous()
 
 
 def construct_grouped_data(
-    num_groups: int, m: int, k: int, n: int, device: str
+    num_groups: int, m: int, k: int, n: int, device: str, dtype: str
 ) -> Tuple[list, list, list, list]:
+    """Build per-expert (A, B, sA, sB). fp8 uses fp32 scales; mxfp8 uses
+    UE8M0 uint8 per-row (un-transposed; kernel transposes on device)."""
     a_list, b_list, sa_list, sb_list = [], [], [], []
     for i in range(num_groups):
         torch.manual_seed(42 + i)
         a_orig = torch.randn(m, k, dtype=torch.float32) * 2.0
-        a_q, sa = quantize_to_fp8_e4m3(a_orig)
         torch.manual_seed(100 + i)
         b_orig = torch.randn(n, k, dtype=torch.float32) * 2.0
-        b_q, sb = quantize_matrix_blockwise_2d(b_orig)
+        if dtype == "mxfp8":
+            a_q, sa = quantize_to_mxfp8(a_orig)
+            b_q, sb = quantize_to_mxfp8(b_orig)
+        else:
+            a_q, sa = quantize_to_fp8_e4m3(a_orig)
+            b_q, sb = quantize_matrix_blockwise_2d(b_orig)
         a_list.append(ensure_contiguous(a_q).to(device))
         b_list.append(ensure_contiguous(b_q).to(device))
         sa_list.append(ensure_contiguous(sa).to(device))
@@ -280,29 +302,40 @@ def calculate_flops(m: int, n: int, k: int, num_groups: int) -> int:
     return num_groups * 2 * m * n * k
 
 
-def calculate_memory_bytes(m: int, n: int, k: int, num_groups: int) -> dict:
-    scale_k = k // MXFP8_BLOCK_SIZE
-    scale_n = n // MXFP8_BLOCK_SIZE
-    a_bytes = num_groups * m * k  # fp8: 1 byte/elem
-    b_bytes = num_groups * n * k
-    sa_bytes = num_groups * m * scale_k * 4  # fp32 scales
-    sb_bytes = num_groups * scale_n * scale_k * 4
+def calculate_memory_bytes(m: int, n: int, k: int, num_groups: int, dtype: str) -> dict:
+    """Bytes read+written per call. Scale layout differs by dtype."""
+    if dtype == "mxfp8":
+        bs = MXFP8_BLOCK_SIZE
+        scale_k = k // bs
+        a_bytes = num_groups * m * k  # fp8: 1 byte/elem
+        b_bytes = num_groups * n * k
+        sa_bytes = num_groups * m * scale_k * 1  # uint8 UE8M0
+        sb_bytes = num_groups * n * scale_k * 1  # uint8 UE8M0 per-row
+    else:
+        bs = FP8_BLOCK_SIZE
+        scale_k = k // bs
+        scale_n = n // bs
+        a_bytes = num_groups * m * k
+        b_bytes = num_groups * n * k
+        sa_bytes = num_groups * m * scale_k * 4
+        sb_bytes = num_groups * scale_n * scale_k * 4
     out_bytes = num_groups * m * n * 4  # fp32 output
     total_read = a_bytes + b_bytes + sa_bytes + sb_bytes
     return {"total_bytes": total_read + out_bytes}
 
 
-def calculate_metrics(m: int, n: int, k: int, num_groups: int, time_us: float) -> dict:
+def calculate_metrics(
+    m: int, n: int, k: int, num_groups: int, time_us: float, dtype: str
+) -> dict:
     time_s = time_us / 1e6
     total_flops = calculate_flops(m, n, k, num_groups)
-    bw = (calculate_memory_bytes(m, n, k, num_groups)["total_bytes"] / 1e9) / time_s
+    total_bytes = calculate_memory_bytes(m, n, k, num_groups, dtype)["total_bytes"]
     return {
         "total_flops": total_flops,
         "gflops": (total_flops / 1e9) / time_s,
         "tflops": (total_flops / 1e12) / time_s,
-        "total_bytes_mb": calculate_memory_bytes(m, n, k, num_groups)["total_bytes"]
-        / 1e6,
-        "bandwidth_gbs": bw,
+        "total_bytes_mb": total_bytes / 1e6,
+        "bandwidth_gbs": (total_bytes / 1e9) / time_s,
     }
 
 
@@ -371,15 +404,18 @@ class ShapeArg:
     num_groups: int
 
 
-def bench_one(shape: ShapeArg, prep_mode: str, num_warmup: int, num_run: int) -> dict:
+def bench_one(
+    shape: ShapeArg, prep_mode: str, dtype: str, num_warmup: int, num_run: int
+) -> dict:
     device = "xpu"
     alignment = 64
+    bs = MXFP8_BLOCK_SIZE if dtype == "mxfp8" else FP8_BLOCK_SIZE
     m = ceil_div(shape.expected_m_per_group, alignment) * alignment
-    k = ceil_div(shape.k, MXFP8_BLOCK_SIZE) * MXFP8_BLOCK_SIZE
-    n = ceil_div(shape.n, MXFP8_BLOCK_SIZE) * MXFP8_BLOCK_SIZE
+    k = ceil_div(shape.k, bs) * bs
+    n = ceil_div(shape.n, bs) * bs
 
     a_list, b_list, sa_list, sb_list = construct_grouped_data(
-        shape.num_groups, m, k, n, device
+        shape.num_groups, m, k, n, device, dtype
     )
 
     result = {
@@ -389,9 +425,11 @@ def bench_one(shape: ShapeArg, prep_mode: str, num_warmup: int, num_run: int) ->
         "k": k,
         "actual_k": k,
         "num_groups": shape.num_groups,
+        "dtype": dtype,
     }
 
-    if prep_mode in ("legacy", "compare"):
+    # Legacy Python prep is FP8-only (doesn't handle MXFP8 scale layouts).
+    if dtype != "mxfp8" and prep_mode in ("legacy", "compare"):
         inputs = prepare_kernel_inputs_legacy(a_list, b_list, sa_list, sb_list, device)
         kernel_us = _time_kernel_only(inputs, num_warmup, num_run)
         e2e_us = _time_prep_plus_kernel(
@@ -427,8 +465,8 @@ def bench_one(shape: ShapeArg, prep_mode: str, num_warmup: int, num_run: int) ->
         result["ondevice_e2e_us"] = e2e_us
         result["ondevice_prep_us"] = max(0.0, e2e_us - kernel_us)
 
-    if prep_mode == "compare":
-        # Speedup = legacy / ondevice (>1 means on-device is faster).
+    # `compare` only produces speedups when both paths ran; MXFP8 skips legacy.
+    if prep_mode == "compare" and "legacy_kernel_us" in result:
         result["speedup_kernel"] = (
             result["legacy_kernel_us"] / result["ondevice_kernel_us"]
         )
@@ -441,10 +479,10 @@ def bench_one(shape: ShapeArg, prep_mode: str, num_warmup: int, num_run: int) ->
         else:
             result["speedup_prep"] = float("inf")
 
-    # Use the path the user actually picked (or on-device in compare) for
-    # FLOPS/bandwidth — these are kernel-shape numbers, identical across paths.
-    chosen_kernel_us = result.get("ondevice_kernel_us") or result["legacy_kernel_us"]
-    metrics = calculate_metrics(m, n, k, shape.num_groups, chosen_kernel_us)
+    chosen_kernel_us = result.get("ondevice_kernel_us") or result.get(
+        "legacy_kernel_us"
+    )
+    metrics = calculate_metrics(m, n, k, shape.num_groups, chosen_kernel_us, dtype)
     result["time_us"] = chosen_kernel_us
     result.update(
         {
@@ -459,16 +497,20 @@ def bench_one(shape: ShapeArg, prep_mode: str, num_warmup: int, num_run: int) ->
 
 
 def benchmark_shapes(
-    shapes: List[ShapeArg], prep_mode: str, num_warmup: int, num_run: int
+    shapes: List[ShapeArg],
+    prep_mode: str,
+    dtype: str,
+    num_warmup: int,
+    num_run: int,
 ) -> List[dict]:
     all_results = []
     for shape in shapes:
         print(
-            f"\nBenchmark: expected_m_per_group={shape.expected_m_per_group}, "
+            f"\nBenchmark [{dtype}]: expected_m_per_group={shape.expected_m_per_group}, "
             f"n={shape.n}, k={shape.k}, num_groups={shape.num_groups}"
         )
         try:
-            r = bench_one(shape, prep_mode, num_warmup, num_run)
+            r = bench_one(shape, prep_mode, dtype, num_warmup, num_run)
             all_results.append(r)
 
             print(f"  Kernel-only time:  {r['time_us']:.2f} us")
@@ -476,7 +518,7 @@ def benchmark_shapes(
             print(
                 f"    Performance: {r['gflops']:.2f} GFLOPS ({r['tflops']:.4f} TFLOPS)"
             )
-            if prep_mode == "compare":
+            if prep_mode == "compare" and "legacy_e2e_us" in r:
                 print(
                     f"  Prep+kernel  legacy={r['legacy_e2e_us']:.2f} us  "
                     f"ondevice={r['ondevice_e2e_us']:.2f} us  "
@@ -488,6 +530,13 @@ def benchmark_shapes(
                 )
                 print(
                     f"  Kernel-only  speedup={r['speedup_kernel']:.2f}x  (should be ~1)"
+                )
+            elif prep_mode == "compare":
+                # dtype=mxfp8: legacy path is not applicable.
+                print(
+                    f"  ondevice_e2e={r['ondevice_e2e_us']:.2f} us  "
+                    f"ondevice_prep={r['ondevice_prep_us']:.2f} us  "
+                    "(legacy path skipped: MXFP8 is on-device-prep only)"
                 )
         except Exception as e:
             print(f"  FAILED - {e}")
@@ -526,7 +575,15 @@ def main():
         "--prep-mode",
         choices=("legacy", "ondevice", "compare"),
         default="compare",
-        help="legacy = Python prep; ondevice = SYCL prep; compare = both + speedup",
+        help="legacy = Python prep; ondevice = SYCL prep; compare = both + speedup. "
+        "MXFP8 ignores legacy (on-device-prep only).",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=("fp8", "mxfp8"),
+        default="fp8",
+        help="fp8 = DSV3-style E4M3 + fp32 scales, block=128 (SW-scaled); "
+        "mxfp8 = OCP MXFP8 E4M3 + UE8M0 uint8 scales, block=32 (HW-scaled).",
     )
     args = parser.parse_args()
 
@@ -534,7 +591,7 @@ def main():
         print("Error: Intel XPU not available")
         return
     if not is_cri_device():
-        print("Error: FP8 blockwise grouped GEMM requires a CRI (Xe3P) device")
+        print("Error: FP8/MXFP8 blockwise grouped GEMM requires a CRI (Xe3P) device")
         return
     try:
         from sgl_kernel import fp8_blockwise_scaled_grouped_mm
@@ -544,12 +601,14 @@ def main():
         print("Error: fp8_blockwise_scaled_grouped_mm kernel not available")
         return
 
+    bs = MXFP8_BLOCK_SIZE if args.dtype == "mxfp8" else FP8_BLOCK_SIZE
     print("Running FP8/MXFP8 Blockwise Group GEMM Benchmark")
     print(f"  Device: Intel XPU")
+    print(f"  Dtype: {args.dtype}")
     print(f"  Prep mode: {args.prep_mode}")
     print(f"  Warmup iterations: {args.num_warmup}")
     print(f"  Benchmark iterations: {args.num_run}")
-    print(f"  Block size: {MXFP8_BLOCK_SIZE}")
+    print(f"  Block size: {bs}")
 
     if IS_CI:
         shapes = [
@@ -576,7 +635,9 @@ def main():
             ShapeArg(expected_m_per_group=128, n=2048, k=2048, num_groups=64),
         ]
 
-    results = benchmark_shapes(shapes, args.prep_mode, args.num_warmup, args.num_run)
+    results = benchmark_shapes(
+        shapes, args.prep_mode, args.dtype, args.num_warmup, args.num_run
+    )
     print_summary(results, title="FP8/MXFP8 Blockwise Group GEMM Benchmark Results")
 
     if args.prep_mode == "compare":

@@ -20,12 +20,16 @@
         its params alone. Its Params slice is the *base* Gather2StageParams, so the
         one scheduler serves both the decode and prefill param children.
 
-      - XeMlaSparseDecode2StageIndividualTileScheduler<B_H> (Stage 2, dense flash).
+      - XeMlaSparse2StageIndividualTileScheduler<B_H> (Stage 2, dense flash).
         Grid is (ceil_div(h_q, B_H) * s_q * b, V_SPLIT, 1) (see
         launch_sparse_mla_decode_fp8_fwd_kernel_policy): BlockIdxX enumerates the
         (batch, seq, head-block) tuples row-major and BlockIdxY the V-split, decoded
         into a (batch_idx, seq_idx, head_bid, v_split_idx) coordinate — the exact
-        index math from the monolithic DenseDecodeFwdKernel, factored out.
+        index math the Stage-2 kernel carried before it was decomposed into
+        collectives + scheduler, factored out here.
+
+    Neither name carries "Decode": both stages' schedulers, like the Stage-2 kernel and
+    its collectives, are shared verbatim by the decode and prefill paths.
 */
 
 #pragma once
@@ -95,7 +99,7 @@ class XeMlaSparseGather2StageTileScheduler {
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 // A decoded Stage 2 work-tile coordinate.
-struct SparseDecode2StageWorkTile {
+struct Sparse2StageWorkTile {
   int batch_idx;
   int seq_idx;
   int head_bid;
@@ -103,7 +107,7 @@ struct SparseDecode2StageWorkTile {
 };
 
 template <int B_H_>
-class XeMlaSparseDecode2StageIndividualTileScheduler {
+class XeMlaSparse2StageIndividualTileScheduler {
  public:
   static constexpr int B_H = B_H_;
 
@@ -113,7 +117,7 @@ class XeMlaSparseDecode2StageIndividualTileScheduler {
   using Params = TileScheduler2StageParams;
 
   CUTLASS_DEVICE
-  XeMlaSparseDecode2StageIndividualTileScheduler(Params const& params) : valid_(true) {
+  XeMlaSparse2StageIndividualTileScheduler(Params const& params) : valid_(true) {
     const int num_head_blocks = ceil_div(params.h_q, B_H);
     const int wg_id = int(BlockIdxX());
     const int q_tile_idx = wg_id / num_head_blocks;
@@ -130,18 +134,18 @@ class XeMlaSparseDecode2StageIndividualTileScheduler {
   }
 
   CUTLASS_DEVICE
-  SparseDecode2StageWorkTile get_block_coord() const {
+  Sparse2StageWorkTile get_block_coord() const {
     return tile_;
   }
 
   CUTLASS_DEVICE
-  XeMlaSparseDecode2StageIndividualTileScheduler& operator++() {
+  XeMlaSparse2StageIndividualTileScheduler& operator++() {
     valid_ = false;
     return *this;
   }
 
  private:
-  SparseDecode2StageWorkTile tile_;
+  Sparse2StageWorkTile tile_;
   bool valid_;
 };
 

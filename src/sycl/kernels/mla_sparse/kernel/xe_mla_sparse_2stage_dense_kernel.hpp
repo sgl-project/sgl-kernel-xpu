@@ -4,17 +4,24 @@
  **************************************************************************************************/
 /*!
   \file
-  \brief Two-stage sparse MLA decode Stage 2 kernel for DeepSeek V4.
+  \brief Two-stage sparse MLA Stage 2 kernel for DeepSeek V4 (decode + prefill).
 
-  DenseDecodeFwdKernel: dense flash-decode over the Stage 1 gathered tile via XMX
-  DPAS QK/PV GEMMs, B_H head packing, V-split, online (log2) softmax, and
+  XeMlaSparse2StageDenseKernel: dense flash-decode over the Stage 1 gathered tile via
+  XMX DPAS QK/PV GEMMs, B_H head packing, V-split, online (log2) softmax, and
   attn_sink merge.
+
+  Shared verbatim by BOTH two-stage paths, which is why neither this kernel nor its
+  collectives / scheduler / work-tile carry "Decode" in their names: prefill maps each
+  query row to a decode "batch" and reuses all of them unchanged
+  (MlaSparsePrefill2StageXe is an alias of MlaSparseDecode2StageXe), so everything
+  path-specific lives in Stage 1. The algorithm is still decode-*shaped* -- one query
+  position per work-tile -- and that is precisely what lets prefill reuse it.
 
   Decomposed into the sycl-tla convention used by the fused MLA kernels: this
   file is the thin kernel wrapper that wires together
-    - collective mainloop  (collective/xe_mla_sparse_decode_2stage_mainloop.hpp)
+    - collective mainloop  (collective/xe_mla_sparse_2stage_mainloop.hpp)
         QK/PV GEMM + online softmax producing the O accumulator + row stats,
-    - collective epilogue   (collective/xe_mla_sparse_decode_2stage_epilogue.hpp)
+    - collective epilogue   (collective/xe_mla_sparse_2stage_epilogue.hpp)
         cross-subgroup reduce, normalize, attn_sink merge, LSE, and store,
     - tile scheduler        (kernel/xe_mla_sparse_2stage_tile_scheduler.hpp)
         (batch, seq, head-block, v-split) work-tile decode.
@@ -47,8 +54,8 @@
 
 #pragma once
 
-#include "sycl/kernels/mla_sparse/collective/xe_mla_sparse_decode_2stage_epilogue.hpp"
-#include "sycl/kernels/mla_sparse/collective/xe_mla_sparse_decode_2stage_mainloop.hpp"
+#include "sycl/kernels/mla_sparse/collective/xe_mla_sparse_2stage_epilogue.hpp"
+#include "sycl/kernels/mla_sparse/collective/xe_mla_sparse_2stage_mainloop.hpp"
 #include "sycl/kernels/mla_sparse/device/xe_mla_sparse_2stage_common.hpp"
 #include "sycl/kernels/mla_sparse/kernel/xe_mla_sparse_2stage_tile_scheduler.hpp"
 
@@ -60,7 +67,7 @@ namespace cutlass::flash_attention::kernel {
 // fan-out, no gather template parameter. The config struct pairs it with a Stage-1
 // kernel inside device::MLASparse, which launches gather-then-dense.
 template <class CollectiveMainloop_, class CollectiveEpilogue_, class TileScheduler_>
-class DenseDecodeFwdKernel {
+class XeMlaSparse2StageDenseKernel {
  public:
   //
   // Type Aliases

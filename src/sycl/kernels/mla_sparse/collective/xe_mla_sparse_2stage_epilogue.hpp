@@ -3,12 +3,16 @@
  * SPDX-License-Identifier: BSD-3-Clause
  **************************************************************************************************/
 /*! \file
-    \brief Two-stage sparse MLA decode Stage 2 epilogue collective for DeepSeek V4.
+    \brief Two-stage sparse MLA Stage 2 epilogue collective for DeepSeek V4
+           (decode + prefill).
 
     Cross-subgroup reduction of the per-split O accumulator + softmax row stats
     (reduce_L), pre-sink LSE emission, optional attn_sink merge, final softmax
     normalization, and the coalesced store of O. Consumes the tArA / tA_max /
-    tA_sum produced by XeMlaSparseDecode2StageMainloop.
+    tA_sum produced by XeMlaSparse2StageMainloop.
+
+    Path-agnostic: both two-stage paths use this collective unchanged (see the Stage-2
+    kernel wrapper, kernel/xe_mla_sparse_2stage_dense_kernel.hpp).
 
     Structural analog of collective/xe_mla_sparse_epilogue.hpp (the fused path):
     owns the reduction/output type aliases, the ReduceK SharedStorage, its Params,
@@ -35,7 +39,7 @@ using cutlass::flash_attention::kernel::LOG_E_2;
 // prefill config passes true. Kept a template param (rather than the old runtime
 // null-guard) so decode never emits the extra store path.
 template <class CollectiveMainloop_, bool HAS_ATTN_SINK_, bool HAS_MAX_LOGITS_ = false>
-class XeMlaSparseDecode2StageEpilogue {
+class XeMlaSparse2StageEpilogue {
  public:
   //
   // Type Aliases
@@ -110,8 +114,7 @@ class XeMlaSparseDecode2StageEpilogue {
   // methods
   //
   CUTLASS_DEVICE
-  XeMlaSparseDecode2StageEpilogue(Params const& params_, SharedStorage& shared)
-      : params(params_), shared_storage(shared) {}
+  XeMlaSparse2StageEpilogue(Params const& params_, SharedStorage& shared) : params(params_), shared_storage(shared) {}
 
   static constexpr Params to_underlying_arguments(Arguments const& args, void* /* workspace */) {
     return args;

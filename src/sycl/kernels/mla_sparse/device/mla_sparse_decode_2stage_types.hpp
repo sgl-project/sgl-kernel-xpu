@@ -93,16 +93,16 @@
 // sort under collective/ (before device/), so the runner always sees cute::intel
 // even after include re-alphabetization. (Matches the fused path, which likewise
 // includes its collectives before the runner.)
-#include "sycl/kernels/mla_sparse/collective/xe_mla_sparse_decode_2stage_epilogue.hpp"
-#include "sycl/kernels/mla_sparse/collective/xe_mla_sparse_decode_2stage_mainloop.hpp"
+#include "sycl/kernels/mla_sparse/collective/xe_mla_sparse_2stage_epilogue.hpp"
+#include "sycl/kernels/mla_sparse/collective/xe_mla_sparse_2stage_mainloop.hpp"
 #include "sycl/kernels/mla_sparse/device/mla_sparse_runner.hpp"
 // The two stages' kernels, included as peers: the config struct below resolves one of
 // each (GatherKernel / DenseKernel) and hands both to the runner, which launches them
 // in order. The dense kernel transitively includes the common prologue (the per-layer params blocks /
 // LOG_2_E / the V-split knobs / DISPATCH_BOOLEAN_FLAG), the tile scheduler, and both
 // collectives; the gather kernel is independent of it.
+#include "sycl/kernels/mla_sparse/kernel/xe_mla_sparse_2stage_dense_kernel.hpp"
 #include "sycl/kernels/mla_sparse/kernel/xe_mla_sparse_2stage_gather_kernel.hpp"
-#include "sycl/kernels/mla_sparse/kernel/xe_mla_sparse_decode_2stage_dense_kernel.hpp"
 
 namespace cutlass::flash_attention::kernel {
 
@@ -162,13 +162,13 @@ struct MlaSparseDecode2StageXe {
   // Collective mainloop / epilogue + tile scheduler + kernel wrapper, parameterized on
   // the tile geometry above.
   using CollectiveMainloop =
-      cutlass::flash_attention::collective::XeMlaSparseDecode2StageMainloop<D_QK, IS_FP8_QUERY, TileTraits>;
+      cutlass::flash_attention::collective::XeMlaSparse2StageMainloop<D_QK, IS_FP8_QUERY, TileTraits>;
   using CollectiveEpilogue = cutlass::flash_attention::collective::
-      XeMlaSparseDecode2StageEpilogue<CollectiveMainloop, HAS_ATTN_SINK, HAS_MAX_LOGITS>;
-  using TileScheduler = cutlass::flash_attention::kernel::XeMlaSparseDecode2StageIndividualTileScheduler<B_H_>;
+      XeMlaSparse2StageEpilogue<CollectiveMainloop, HAS_ATTN_SINK, HAS_MAX_LOGITS>;
+  using TileScheduler = cutlass::flash_attention::kernel::XeMlaSparse2StageIndividualTileScheduler<B_H_>;
 
-  using DenseKernel =
-      cutlass::flash_attention::kernel::DenseDecodeFwdKernel<CollectiveMainloop, CollectiveEpilogue, TileScheduler>;
+  using DenseKernel = cutlass::flash_attention::kernel::
+      XeMlaSparse2StageDenseKernel<CollectiveMainloop, CollectiveEpilogue, TileScheduler>;
 
   // Stage-1 gather kernel: an independent kernel with its own Arguments/Params,
   // selected here (decode dequant vs prefill dense copy). This config struct is the

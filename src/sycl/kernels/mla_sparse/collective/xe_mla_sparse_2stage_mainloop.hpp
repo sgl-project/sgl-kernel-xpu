@@ -3,12 +3,16 @@
  * SPDX-License-Identifier: BSD-3-Clause
  **************************************************************************************************/
 /*! \file
-    \brief Two-stage sparse MLA decode Stage 2 mainloop collective for DeepSeek V4.
+    \brief Two-stage sparse MLA Stage 2 mainloop collective for DeepSeek V4
+           (decode + prefill).
 
     QK/PV DPAS GEMM engine + online (log2) softmax over the Stage 1 gathered tile.
     Consumes the per-(batch, seq, v-split) gmem Q/K/V tiles built by the kernel
     wrapper and produces the O accumulator + softmax max/sum row stats, which the
     epilogue collective then reduces, normalizes, and writes out.
+
+    Path-agnostic: both two-stage paths use this collective unchanged (see the Stage-2
+    kernel wrapper, kernel/xe_mla_sparse_2stage_dense_kernel.hpp).
 
     Structural analog of collective/xe_mla_sparse_mainloop.hpp (the fused path): a
     compute collective owning the MMA/tile/fragment type aliases, its Params, its
@@ -35,7 +39,7 @@ using cutlass::flash_attention::kernel::Mainloop2StageParams;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 template <int D_QK_, bool IS_FP8_QUERY_, typename Traits_>
-class XeMlaSparseDecode2StageMainloop {
+class XeMlaSparse2StageMainloop {
  public:
   //
   // Type Aliases
@@ -82,7 +86,7 @@ class XeMlaSparseDecode2StageMainloop {
   // methods
   //
   CUTLASS_HOST_DEVICE
-  XeMlaSparseDecode2StageMainloop(Params const& params_, SharedStorage& /* shared */) : params(params_) {}
+  XeMlaSparse2StageMainloop(Params const& params_, SharedStorage& /* shared */) : params(params_) {}
 
   static constexpr Params to_underlying_arguments(Arguments const& args, void* /* workspace */) {
     return args;

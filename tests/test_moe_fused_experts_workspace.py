@@ -1,13 +1,7 @@
 """Tests for the optional ``workspace`` argument of ``sgl_kernel.fused_experts``
 and its ``_get_moe_ws`` scratch-buffer helper (Intel Xe2 / BMG).
 
-``fused_experts(..., workspace=some_dict)`` lets a caller (see ``sglang``'s
-``unquant.py``'s module-level ``_MOE_WS`` cache) reuse persistent, grow-only
-scratch buffers across calls/layers -- keyed by buffer name in the dict --
-instead of the function issuing ~9 freshly-shaped ``torch.empty`` scratch
-allocations on every call. This avoids XPU caching-allocator fragmentation
-(elevated ``torch.xpu.memory_reserved()`` vs ``memory_allocated()``) at
-larger/varying batch sizes. These tests cover:
+These tests cover:
   * ``_get_moe_ws`` in isolation: first-call allocation with headroom,
     reuse (same storage / ``data_ptr()``) for equal-or-smaller shapes,
     regrowth for larger shapes, and forced reallocation on dtype/device

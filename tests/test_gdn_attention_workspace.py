@@ -1,17 +1,8 @@
 """Tests for the optional ``workspace`` argument of the fused GDN attention op
 (Intel Xe2 / BMG): ``torch.ops.sgl_kernel.gdn_attention(..., workspace=...)``.
 
-``workspace`` is a fixed-order list of caller-provided scratch buffers
-``[q, k, v, b, a, b_prefill, a_prefill]`` that lets a caller (see
-``sglang``'s ``gdn_backend.py:forward_fused_gdn``/``_get_gdn_ws``) reuse one
-persistent, grow-only buffer per slot across calls/layers instead of the op
-issuing a fresh ``torch::empty``/``torch::zeros`` of a call-varying shape
-every time -- avoiding XPU caching-allocator fragmentation (elevated
-``torch.xpu.memory_reserved()`` vs ``memory_allocated()``) at larger batch
-sizes. These tests only check functional correctness of the op's use of the
-``workspace`` argument (matching the no-workspace baseline exactly, and
-being safe to reuse/narrow across differently-shaped successive calls);
-they don't attempt to measure/assert on actual memory usage.
+These tests only check functional correctness of the op's use of the
+``workspace`` argument; they don't attempt to measure/assert on actual memory usage.
 """
 
 import pytest
@@ -104,14 +95,9 @@ def _run_op_ws(i, conv_state, ssm_state, state_idx, reorder_input, workspace):
 
 
 def _assert_matches(candidate, baseline, conv_cand, conv_ref, ssm_cand, ssm_ref):
-    # A small (not exactly-zero) tolerance: the reduction order in the
-    # underlying chunk-scan kernel is not guaranteed bit-identical between
-    # two separate invocations (harmless GPU floating-point
-    # non-associativity, occasionally visible as a handful of ~1e-4-scale
-    # fp16 diffs), so exact equality is not a meaningful invariant here.
-    # What this helper actually needs to catch -- a workspace buffer
-    # aliasing/corruption bug -- would show up as large, widespread
-    # mismatches, not an isolated few-ULP difference.
+    # A small tolerance is needed here to accommodate the harmless GPU floating-point
+    # non-associativity. It does not prevent the test from catching a workspace buffer
+    # aliasing/corruption bug, which would show up as large, widespread mismatches.
     rtol, atol = 1e-2, 2e-3
     torch.testing.assert_close(
         candidate["core_attn_out"], baseline["core_attn_out"], rtol=rtol, atol=atol
@@ -152,12 +138,9 @@ def test_gdn_attention_workspace_matches_baseline(mode, batch_size, seqlen, dtyp
 def test_gdn_attention_workspace_reused_across_varying_shapes(dtype):
     """One workspace list, sized for the largest case in the sequence, must
     be safe to reuse unmodified across a sequence of differently-shaped
-    decode/prefill calls -- mirroring how `gdn_backend.py` shares one
-    grow-only workspace across every GDN layer and forward step. Each call
-    is checked against a fresh no-workspace baseline of the same shape, so
-    any cross-call aliasing corruption (stale data leaking in from a
-    previous call's narrower view, or a later call corrupting data an
-    earlier call's outputs still depended on) would be caught."""
+    decode/prefill calls.
+    Each call is checked against a fresh no-workspace baseline of the same
+    shape, so any cross-call aliasing corruption would be caught."""
     device = torch.device("xpu")
     sequence = [
         ("decode", 1, 1),

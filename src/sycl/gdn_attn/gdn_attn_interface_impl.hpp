@@ -212,14 +212,9 @@ void gdn_attention(
   auto dtype = projected_states_qkvz.dtype();
   auto device = projected_states_qkvz.device();
 
-  // Reuse a caller-provided persistent workspace buffer (viewed/narrowed to the
-  // exact shape needed for this call) instead of issuing a fresh torch::empty/
-  // torch::zeros of a shape that varies call-to-call (different token counts
-  // across prefill/decode steps). Reusing one fixed-size buffer avoids the XPU
-  // caching allocator accumulating many differently-sized cached blocks (seen
-  // as elevated torch.xpu.memory_reserved() vs memory_allocated()). Falls back
-  // to the original allocate-per-call behavior when no workspace is supplied
-  // or it is too small / wrong dtype, so existing callers keep working.
+  // Reuse a caller-provided persistent workspace buffer to reduce allocations.
+  // Falls back to the original allocate-per-call behavior when no workspace is
+  // supplied or it is too small / wrong dtype, so existing callers keep working.
   auto make_ws_tensor =
       [&](int64_t ws_idx, std::vector<int64_t> shape, torch::ScalarType st, bool zero_init) -> torch::Tensor {
     int64_t numel = 1;

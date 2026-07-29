@@ -356,18 +356,13 @@ def _get_moe_ws(
         numel *= d
     cur = workspace.get(name)
     if cur is None or cur.numel() < numel or cur.dtype != dtype or cur.device != device:
-        # Growing replaces (and thus lets go of) the previous buffer. Any
-        # not-yet-retired kernel from an earlier call may still be reading
-        # from/writing to that old buffer's memory; without a sync here the
-        # allocator could otherwise recycle those same bytes into the new,
-        # larger allocation while such a kernel is still in flight (a data
-        # race), which was observed to silently corrupt results. Growth only
-        # happens a handful of times total (buffers ramp up to their steady-
-        # state max size early on), so this sync is effectively free
-        # amortized over a server's lifetime.
+        # Growing replaces the previous buffer. Without a sync here, an in-flight kernel
+        # from an earlier call may still be reading/writing that old buffer's memory,
+        # causing a data race. With the headroom, growth only happens a handful of times
+        # total, so this sync is effectively free amortized over a server's lifetime.
         if cur is not None:
             torch.xpu.synchronize(device)
-        # the max here ensure it won't be less than numel.
+        # The max here ensures it won't be less than numel.
         new_numel = max(numel, int(numel * _MOE_WS_HEADROOM))
         cur = torch.empty(new_numel, dtype=dtype, device=device)
         workspace[name] = cur

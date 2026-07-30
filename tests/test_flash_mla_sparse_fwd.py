@@ -99,6 +99,8 @@ def test_flash_mla_sparse_prefill_fwd(
             i_i = torch.randperm(max(1, t))[:topk]
             indices[t, h, : len(i_i)] = i_i
 
+    # currently only support d_qk in {512, 576} for prefill
+    assert d_qk in (512, 576), f"unexpected d_qk={d_qk}"
     sm_scale = 128**-0.5 if d_qk == 512 else 192**-0.5
 
     topk_length = None

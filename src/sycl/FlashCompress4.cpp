@@ -116,6 +116,160 @@ struct FlashCompress4DecodeKernel {
   uint32_t num_split_;
 };
 
+template <typename buffer_t, typename input_t, typename out_t>
+struct FlashCompress4CompressKernel {
+  [[sycl::reqd_sub_group_size(16)]]
+  void operator()(sycl::nd_item<1> item) const {
+    const uint32_t gid = static_cast<uint32_t>(item.get_group(0));
+    const uint32_t lid = static_cast<uint32_t>(item.get_local_id(0));
+    const uint32_t global_wid = gid * 4U + (lid / 16U);
+    const uint32_t pid = global_wid / num_split_;
+    const uint32_t split_id = global_wid % num_split_;
+    const int64_t split_offset = static_cast<int64_t>(split_id) * kTileDim;
+    const uint32_t tid_in_warp = lid % 16U;
+
+    if (pid >= num_compress_) {
+      return;
+    }
+
+    const CompressPlan plan = plan_c_[pid];
+    if (plan.is_invalid()) {
+      return;
+    }
+
+    const bool need_overlap = plan.seq_len > 4;
+    const int32_t buffer_len = static_cast<int32_t>(plan.buffer_len);
+    const buffer_t* kv_buf_0 = kv_buffer_ + static_cast<int64_t>(plan.read_page_0) * page_elem_size_;
+    const buffer_t* kv_buf_1 = kv_buffer_ + static_cast<int64_t>(plan.read_page_1) * page_elem_size_;
+    // kv_src points to position ragged_id in the ragged input
+    const input_t* kv_src = kv_input_ + static_cast<int64_t>(plan.ragged_id) * elem_size_;
+    out_t* out_row = kv_output_ + static_cast<int64_t>(pid) * head_dim_;
+
+    for (int32_t i = 0; i < kTileElements; ++i) {
+      const int64_t h = split_offset + static_cast<int64_t>(i) * 16 + tid_in_warp;
+      if (h >= head_dim_) {
+        continue;
+      }
+
+      // First pass: max score
+      float max_score = -std::numeric_limits<float>::infinity();
+      for (int32_t t = 0; t < 8; ++t) {
+        const int64_t row_off = static_cast<int64_t>(t % 4) * elem_size_;
+        float score_val;
+        if (t < 4) {
+          if (need_overlap && t < buffer_len) {
+            score_val = static_cast<float>(kv_buf_0[row_off + 2 * head_dim_ + h]);
+          } else if (need_overlap) {
+            // fallback: ragged input at position ragged_id - (7 - t)
+            score_val = static_cast<float>(kv_src[(static_cast<int64_t>(t) - 7) * elem_size_ + 2 * head_dim_ + h]);
+          } else {
+            score_val = -std::numeric_limits<float>::infinity();
+          }
+        } else {
+          if (t < buffer_len) {
+            score_val = static_cast<float>(kv_buf_1[row_off + 3 * head_dim_ + h]);
+          } else {
+            // fallback: ragged input, j = t-4, position ragged_id - (3 - j)
+            const int32_t j = t - 4;
+            score_val = static_cast<float>(kv_src[(static_cast<int64_t>(j) - 3) * elem_size_ + 3 * head_dim_ + h]);
+          }
+        }
+        max_score =
+            sycl::fmax(max_score, score_val + static_cast<float>(ape_[static_cast<int64_t>(t) * head_dim_ + h]));
+      }
+
+      // Second pass: weighted sum
+      float exp_sum = 0.0f;
+      float weighted_sum = 0.0f;
+      for (int32_t t = 0; t < 8; ++t) {
+        const int64_t row_off = static_cast<int64_t>(t % 4) * elem_size_;
+        float kv_val, score_val;
+        if (t < 4) {
+          if (need_overlap && t < buffer_len) {
+            kv_val = static_cast<float>(kv_buf_0[row_off + h]);
+            score_val = static_cast<float>(kv_buf_0[row_off + 2 * head_dim_ + h]);
+          } else if (need_overlap) {
+            const int64_t offset = (static_cast<int64_t>(t) - 7) * elem_size_;
+            kv_val = static_cast<float>(kv_src[offset + h]);
+            score_val = static_cast<float>(kv_src[offset + 2 * head_dim_ + h]);
+          } else {
+            kv_val = 0.0f;
+            score_val = -std::numeric_limits<float>::infinity();
+          }
+        } else {
+          if (t < buffer_len) {
+            kv_val = static_cast<float>(kv_buf_1[row_off + head_dim_ + h]);
+            score_val = static_cast<float>(kv_buf_1[row_off + 3 * head_dim_ + h]);
+          } else {
+            const int32_t j = t - 4;
+            const int64_t offset = (static_cast<int64_t>(j) - 3) * elem_size_;
+            kv_val = static_cast<float>(kv_src[offset + head_dim_ + h]);
+            score_val = static_cast<float>(kv_src[offset + 3 * head_dim_ + h]);
+          }
+        }
+        const float w =
+            sycl::exp(score_val + static_cast<float>(ape_[static_cast<int64_t>(t) * head_dim_ + h]) - max_score);
+        exp_sum += w;
+        weighted_sum += kv_val * w;
+      }
+
+      out_row[h] = static_cast<out_t>(weighted_sum / exp_sum);
+    }
+  }
+
+  buffer_t* kv_buffer_;
+  const input_t* kv_input_;
+  out_t* kv_output_;
+  const input_t* ape_;
+  const CompressPlan* plan_c_;
+  uint32_t num_compress_;
+  int64_t head_dim_;
+  int64_t elem_size_;       // 4 * head_dim
+  int64_t page_elem_size_;  // 16 * head_dim
+  uint32_t num_split_;
+};
+
+template <typename buffer_t, typename input_t>
+struct FlashCompress4WriteKernel {
+  [[sycl::reqd_sub_group_size(16)]]
+  void operator()(sycl::nd_item<1> item) const {
+    const uint32_t gid = static_cast<uint32_t>(item.get_group(0));
+    const uint32_t lid = static_cast<uint32_t>(item.get_local_id(0));
+    const uint32_t global_wid = gid * 4U + (lid / 16U);
+    const uint32_t pid = global_wid / num_split_;
+    const uint32_t split_id = global_wid % num_split_;
+    // Split over full elem_size (4 * head_dim); each sub-group covers kTileDim consecutive elements
+    const int64_t split_offset = static_cast<int64_t>(split_id) * kTileDim;
+    const uint32_t tid_in_warp = lid % 16U;
+
+    if (pid >= num_write_) {
+      return;
+    }
+
+    const WritePlan plan = plan_w_[pid];
+    if (plan.is_invalid()) {
+      return;
+    }
+
+    const input_t* kv_src = kv_input_ + static_cast<int64_t>(plan.ragged_id) * elem_size_ + split_offset;
+    buffer_t* kv_dst = kv_buffer_ + static_cast<int64_t>(plan.write_loc) * elem_size_ + split_offset;
+
+    for (int32_t i = 0; i < kTileElements; ++i) {
+      const int64_t pos = static_cast<int64_t>(i) * 16 + tid_in_warp;
+      if (split_offset + pos < elem_size_) {
+        kv_dst[pos] = static_cast<buffer_t>(kv_src[pos]);
+      }
+    }
+  }
+
+  buffer_t* kv_buffer_;
+  const input_t* kv_input_;
+  const WritePlan* plan_w_;
+  uint32_t num_write_;
+  int64_t elem_size_;  // 4 * head_dim
+  uint32_t num_split_;
+};
+
 }  // namespace FlashCompress4Impl
 
 SGL_KERNEL_EXPORT void flash_compress4_decode(
@@ -180,6 +334,95 @@ SGL_KERNEL_EXPORT void flash_compress4_decode(
         const uint32_t global_size = num_groups * kLocalSize;
         cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kLocalSize)), kernel);
       });
+    });
+  });
+}
+
+void flash_compress4_prefill(
+    torch::Tensor kv_buffer,
+    torch::Tensor kv_input,
+    torch::Tensor kv_output,
+    torch::Tensor ape,
+    torch::Tensor plan_c,
+    torch::Tensor plan_w) {
+  TORCH_CHECK(
+      kv_buffer.is_xpu() && kv_buffer.dim() == 3 && kv_buffer.is_contiguous(),
+      "kv_buffer must be a contiguous 3D XPU tensor");
+  TORCH_CHECK(
+      kv_input.is_xpu() && kv_input.dim() == 2 && kv_input.is_contiguous(),
+      "kv_input must be a contiguous 2D XPU tensor");
+  TORCH_CHECK(
+      kv_output.is_xpu() && kv_output.dim() == 2 && kv_output.is_contiguous(),
+      "kv_output must be a contiguous 2D XPU tensor");
+  TORCH_CHECK(ape.is_xpu() && ape.dim() == 2 && ape.is_contiguous(), "ape must be a contiguous 2D XPU tensor");
+  TORCH_CHECK(
+      plan_c.is_xpu() && plan_c.dim() == 2 && plan_c.dtype() == torch::kUInt8 && plan_c.is_contiguous(),
+      "plan_c must be a contiguous 2D XPU uint8 tensor");
+  TORCH_CHECK(
+      plan_w.is_xpu() && plan_w.dim() == 2 && plan_w.dtype() == torch::kUInt8 && plan_w.is_contiguous(),
+      "plan_w must be a contiguous 2D XPU uint8 tensor");
+  TORCH_CHECK(kv_input.dtype() == kv_output.dtype(), "kv_input and kv_output must have the same dtype");
+  TORCH_CHECK(kv_input.dtype() == ape.dtype(), "kv_input and ape must have same dtype");
+
+  const int64_t num_compress = plan_c.size(0);
+  const int64_t num_write = plan_w.size(0);
+  const int64_t elem_size = kv_input.size(1);
+  const int64_t head_dim = kv_output.size(1);
+  TORCH_CHECK(elem_size == 4 * head_dim, "kv_input last dim must be 4 * head_dim");
+  TORCH_CHECK(
+      kv_buffer.size(1) == 4 && kv_buffer.size(2) == elem_size, "kv_buffer shape must be [num_pages, 4, 4*head_dim]");
+  TORCH_CHECK(ape.size(0) == 8 && ape.size(1) == head_dim, "ape shape must be [8, head_dim]");
+  TORCH_CHECK(
+      plan_c.size(1) == static_cast<int64_t>(sizeof(CompressPlan)), "plan_c row size must be sizeof(CompressPlan)");
+  TORCH_CHECK(plan_w.size(1) == static_cast<int64_t>(sizeof(WritePlan)), "plan_w row size must be sizeof(WritePlan)");
+  TORCH_CHECK(kv_output.size(0) == num_compress, "kv_output rows must match num compress plans");
+
+  if (num_compress == 0 && num_write == 0) {
+    return;
+  }
+
+  const int64_t page_elem_size = 4 * elem_size;
+  const uint32_t num_split = static_cast<uint32_t>((head_dim + kTileDim - 1) / kTileDim);
+  auto queue = c10::xpu::getCurrentXPUStream().queue();
+
+  SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, kv_input.scalar_type(), "FlashCompress4Prefill", [&]() {
+    using input_t = scalar_t;
+    using output_t = scalar_t;
+    SYCL_DISPATCH_WEIGHT_TYPES(at::kHalf, at::kBFloat16, kv_buffer.scalar_type(), "FlashCompress4Prefill", [&]() {
+      if (num_compress > 0) {
+        queue.submit([&](sycl::handler& cgh) {
+          FlashCompress4Impl::FlashCompress4CompressKernel<weight_t, input_t, output_t> kernel{
+              kv_buffer.data_ptr<weight_t>(),
+              kv_input.data_ptr<input_t>(),
+              kv_output.data_ptr<output_t>(),
+              ape.data_ptr<input_t>(),
+              reinterpret_cast<const CompressPlan*>(plan_c.data_ptr<uint8_t>()),
+              static_cast<uint32_t>(num_compress),
+              head_dim,
+              elem_size,
+              page_elem_size,
+              num_split};
+          constexpr uint32_t kLocalSize = 64;
+          const uint32_t global_size = static_cast<uint32_t>(num_compress) * num_split * 16;
+          cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kLocalSize)), kernel);
+        });
+      }
+      if (num_write > 0) {
+        // num_split_write covers elem_size = 4 * head_dim at kTileDim elements per split
+        const uint32_t num_split_write = num_split * 4;
+        queue.submit([&](sycl::handler& cgh) {
+          FlashCompress4Impl::FlashCompress4WriteKernel<weight_t, input_t> kernel{
+              kv_buffer.data_ptr<weight_t>(),
+              kv_input.data_ptr<input_t>(),
+              reinterpret_cast<const WritePlan*>(plan_w.data_ptr<uint8_t>()),
+              static_cast<uint32_t>(num_write),
+              elem_size,
+              num_split_write};
+          constexpr uint32_t kLocalSize = 64;
+          const uint32_t global_size = static_cast<uint32_t>(num_write) * num_split_write * 16;
+          cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kLocalSize)), kernel);
+        });
+      }
     });
   });
 }

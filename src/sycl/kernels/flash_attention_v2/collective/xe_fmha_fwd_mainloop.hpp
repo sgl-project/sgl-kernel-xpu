@@ -58,6 +58,7 @@ using namespace cute;
 enum class AppendKVMode {
   kNone,
   kStore,
+  kStoreWide,
   kStoreAndDirectLoad,
 };
 
@@ -214,6 +215,7 @@ struct FMHAFwdMainloop<
   static constexpr AppendKVMode AppendMode = AppendKVMode_;
   static constexpr bool AppendKV = AppendMode != AppendKVMode::kNone;
   static constexpr bool AppendDirectLoad = AppendMode == AppendKVMode::kStoreAndDirectLoad && PagedKV;
+  static constexpr bool AppendWideStore = AppendMode == AppendKVMode::kStoreWide && PagedKV;
 
   // User-facing arguments
   struct Arguments {
@@ -478,7 +480,7 @@ struct FMHAFwdMainloop<
       // idempotent and does not rely on a grid-wide producer.
       if constexpr (
           sizeof(typename TensorK_cache::element_type) == 2 && sizeof(typename TensorV_cache::element_type) == 2) {
-        if constexpr (!AppendDirectLoad) {
+        if constexpr (AppendWideStore) {
           if (store_kv_new_vectorized<16, cutlass::ulonglong4>(
                   K_cache_2D,
                   V_cache_2D,

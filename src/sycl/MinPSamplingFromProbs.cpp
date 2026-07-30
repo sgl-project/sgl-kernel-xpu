@@ -8,6 +8,7 @@
 #include <optional>
 #include <sycl/sycl.hpp>
 
+#include "MemoryAccess.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "comm/Random.h"
@@ -60,9 +61,11 @@ struct ToSyclElementType<at::BFloat16> {
 //----------------- min-p rejection sampling --------------------//
 // One work-group processes one request row.
 
+constexpr uint32_t kMinPWgSize = 1024;
+
 template <typename DType, uint32_t VEC_SIZE, bool DETERMINISTIC>
 struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
-  static constexpr uint32_t kWgSize = 1024;
+  static constexpr uint32_t kWgSize = kMinPWgSize;
   static constexpr uint32_t kNumWarps = kWgSize / 32;
 
   const DType* probs;
@@ -179,7 +182,7 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
 template <typename TensorDType>
 void launch_min_p_sampling(
-    at::Tensor probs,
+    const at::Tensor& probs,
     int32_t* output,
     const int64_t* maybe_indices,
     const float* maybe_min_p_arr,
@@ -194,14 +197,14 @@ void launch_min_p_sampling(
 
   const KernelDType* probs_ptr = reinterpret_cast<const KernelDType*>(probs.data_ptr<TensorDType>());
 
-  const int local_size = 1024;
+  const int local_size = kMinPWgSize;
   const int global_size = batch_size * local_size;
 
-  const uint32_t vec_size = std::gcd(16 / sizeof(KernelDType), vocab_size);
+  const uint32_t preferred_vec_size = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), sizeof(KernelDType));
+  const uint32_t vec_size = std::gcd(preferred_vec_size, vocab_size);
 
   DISPATCH_MINP_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto submit = [&](auto deterministic_tag) {
-      constexpr bool DETERMINISTIC = decltype(deterministic_tag)::value;
+    AT_DISPATCH_BOOL_NO_RETURN(deterministic, DETERMINISTIC, {
       auto kernel = MinPSamplingKernel<KernelDType, VEC_SIZE, DETERMINISTIC>(
           probs_ptr,
           output,
@@ -213,23 +216,18 @@ void launch_min_p_sampling(
           philox_seed,
           philox_offset);
       sycl_kernel_submit(global_size, local_size, queue, kernel);
-    };
-    if (deterministic) {
-      submit(std::true_type{});
-    } else {
-      submit(std::false_type{});
-    }
+    });
   });
 }
 
 void min_p_sampling_from_probs(
-    at::Tensor probs,
-    at::Tensor output,
-    std::optional<at::Tensor> maybe_indices,
-    std::optional<at::Tensor> maybe_min_p_arr,
+    const at::Tensor& probs,
+    at::Tensor& output,
+    const std::optional<at::Tensor>& maybe_indices,
+    const std::optional<at::Tensor>& maybe_min_p_arr,
     double min_p_val,
     bool deterministic,
-    std::optional<at::Generator> gen) {
+    const std::optional<at::Generator>& gen) {
   CHECK_INPUT(probs);
   CHECK_INPUT(output);
   TORCH_CHECK(probs.dim() == 2, "probs must be a 2D tensor [batch_size, vocab_size]");
@@ -245,10 +243,11 @@ void min_p_sampling_from_probs(
   // maybe_indices values lie within [0, probs.size(0)).
   const int64_t* indices_ptr = nullptr;
   if (maybe_indices.has_value()) {
-    CHECK_INPUT((*maybe_indices));
-    TORCH_CHECK(maybe_indices->scalar_type() == torch::kInt64, "maybe_indices must be int64");
-    TORCH_CHECK(maybe_indices->size(0) == batch_size, "maybe_indices size must match batch_size");
-    indices_ptr = maybe_indices->data_ptr<int64_t>();
+    const at::Tensor& indices = maybe_indices.value();
+    CHECK_INPUT(indices);
+    TORCH_CHECK(indices.scalar_type() == torch::kInt64, "maybe_indices must be int64");
+    TORCH_CHECK(indices.size(0) == batch_size, "maybe_indices size must match batch_size");
+    indices_ptr = indices.data_ptr<int64_t>();
   } else {
     TORCH_CHECK(
         probs.size(0) == batch_size, "probs.size(0) must match output.size(0) when maybe_indices is not provided");
@@ -256,11 +255,12 @@ void min_p_sampling_from_probs(
 
   const float* min_p_ptr = nullptr;
   if (maybe_min_p_arr.has_value()) {
-    CHECK_INPUT((*maybe_min_p_arr));
-    TORCH_CHECK(maybe_min_p_arr->dim() == 1, "maybe_min_p_arr must be a 1D tensor");
-    TORCH_CHECK(maybe_min_p_arr->scalar_type() == torch::kFloat32, "maybe_min_p_arr must be float32");
-    TORCH_CHECK(maybe_min_p_arr->size(0) == batch_size, "maybe_min_p_arr size must match batch_size");
-    min_p_ptr = maybe_min_p_arr->data_ptr<float>();
+    const at::Tensor& min_p_arr = maybe_min_p_arr.value();
+    CHECK_INPUT(min_p_arr);
+    TORCH_CHECK(min_p_arr.dim() == 1, "maybe_min_p_arr must be a 1D tensor");
+    TORCH_CHECK(min_p_arr.scalar_type() == torch::kFloat32, "maybe_min_p_arr must be float32");
+    TORCH_CHECK(min_p_arr.size(0) == batch_size, "maybe_min_p_arr size must match batch_size");
+    min_p_ptr = min_p_arr.data_ptr<float>();
   } else {
     TORCH_CHECK(min_p_val >= 0.0 && min_p_val <= 1.0, "min_p_val must be within [0, 1]");
   }

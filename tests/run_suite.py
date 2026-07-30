@@ -15,8 +15,10 @@ class TestFile:
 suites = {
     "per-commit": [
         TestFile("test_awq_dequant.py"),
+        TestFile("test_biased_topk.py"),
         TestFile("test_topk_sigmoid.py"),
         TestFile("test_topk_softmax.py"),
+        TestFile("test_hash_topk.py"),
         TestFile("test_flash_attention.py"),
         TestFile("test_flash_attn_sparse.py"),
         TestFile("test_flash_mla_decode.py"),

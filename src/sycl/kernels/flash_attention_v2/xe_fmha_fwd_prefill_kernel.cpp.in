@@ -77,8 +77,10 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@>::opera
     using AppendSubgroupLayoutQK = cute::Layout<
         cute::Shape<cute::Int<@APPENDKV_Q256_NUM_SG@>, cute::_1, cute::_1>,
         cute::Stride<cute::_1, cute::_1, cute::_1>>;
+    constexpr auto append_mode = @HEAD_DIM@ == 64 ? cutlass::fmha::collective::AppendKVMode::kStoreWide
+                                                  : cutlass::fmha::collective::AppendKVMode::kStoreAndDirectLoad;
     FMHAConfig<false, false, false, AppendTileShapeQK, AppendTileShapePV, AppendTileShapeOutput,
-               AppendSubgroupLayoutQK>::run_paged(params);
+               AppendSubgroupLayoutQK>::template run_paged<append_mode>(params);
     return;
   }
 #endif

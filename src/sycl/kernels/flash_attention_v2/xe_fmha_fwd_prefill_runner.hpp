@@ -483,6 +483,10 @@ struct FMHAConfig {
   }
 
   // Paged KV cache: the page table encodes absolute KV positions.
+  template <
+      cutlass::fmha::collective::AppendKVMode AppendMode = int(get<1>(TileShapeOutput{})) == 64
+                                                               ? cutlass::fmha::collective::AppendKVMode::kStoreWide
+                                                               : cutlass::fmha::collective::AppendKVMode::kStore>
   static int run_paged(const Arguments& params) {
     TORCH_CHECK(params.cu_seqlens_q != nullptr, "paged prefill requires cu_seqlens_q");
     TORCH_CHECK(params.cu_seqlens_k != nullptr, "paged prefill requires per-batch cache lengths in cu_seqlens_k");
@@ -496,10 +500,7 @@ struct FMHAConfig {
     bool const has_append = params.total_kvnew > 0 && params.k_new_ptr != nullptr && params.v_new_ptr != nullptr &&
                             params.kv_cache_seqlens != nullptr;
     if (has_append) {
-      constexpr auto append_mode = int(get<1>(TileShapeOutput{})) == 64
-                                       ? cutlass::fmha::collective::AppendKVMode::kStoreWide
-                                       : cutlass::fmha::collective::AppendKVMode::kStoreAndDirectLoad;
-      return run<true, true, true, append_mode, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+      return run<true, true, true, AppendMode, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
     }
     return run<
         true,

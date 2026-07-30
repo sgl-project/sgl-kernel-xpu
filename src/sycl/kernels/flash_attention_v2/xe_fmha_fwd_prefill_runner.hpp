@@ -497,7 +497,7 @@ struct FMHAConfig {
                             params.kv_cache_seqlens != nullptr;
     if (has_append) {
       constexpr auto append_mode = int(get<1>(TileShapeOutput{})) == 64
-                                       ? cutlass::fmha::collective::AppendKVMode::kStore
+                                       ? cutlass::fmha::collective::AppendKVMode::kStoreWide
                                        : cutlass::fmha::collective::AppendKVMode::kStoreAndDirectLoad;
       return run<true, true, true, append_mode, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
     }

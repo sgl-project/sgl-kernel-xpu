@@ -572,8 +572,8 @@ void top_k_renorm_probs(
     int64_t top_k_val);
 
 void top_p_renorm_probs(
-    at::Tensor& renorm_probs,
     const at::Tensor& probs,
+    at::Tensor& renorm_probs,
     const std::optional<at::Tensor>& maybe_top_p_arr,
     double top_p_val);
 

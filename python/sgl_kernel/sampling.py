@@ -57,10 +57,11 @@ def _top_p_renorm_probs_internal(
     maybe_top_p_arr: Optional[torch.Tensor],
     top_p_val: float,
 ) -> torch.Tensor:
-    maybe_top_p_arr = maybe_top_p_arr if maybe_top_p_arr is not None else None
+    probs = probs.float()
+    maybe_top_p_arr = maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
     renorm_probs = torch.empty_like(probs)
     torch.ops.sgl_kernel.top_p_renorm_probs.default(
-        renorm_probs, probs, maybe_top_p_arr, top_p_val
+        probs, renorm_probs, maybe_top_p_arr, top_p_val
     )
     return renorm_probs
 

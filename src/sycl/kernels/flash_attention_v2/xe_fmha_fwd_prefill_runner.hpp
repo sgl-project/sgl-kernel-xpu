@@ -322,9 +322,9 @@ struct PrefillRunner {
             shape,
             static_cast<const ElementQ*>(params.q_ptr),
             stride_Q,
-            CollectiveMainloop::DirectAppendKV ? static_cast<const ElementK*>(params.k_new_ptr) : nullptr,
+            CollectiveMainloop::AppendKV ? static_cast<const ElementK*>(params.k_new_ptr) : nullptr,
             stride_K,
-            CollectiveMainloop::DirectAppendKV ? static_cast<const ElementV*>(params.v_new_ptr) : nullptr,
+            CollectiveMainloop::AppendKV ? static_cast<const ElementV*>(params.v_new_ptr) : nullptr,
             stride_V,
             static_cast<ElementO*>(params.o_ptr),
             stride_O,
@@ -402,10 +402,8 @@ struct FMHAConfig {
       bool isVarLen,
       bool CachedKV,
       bool PagedKV,
-      bool AppendKV,
-      class Scheduler,
-      bool DirectAppendKV = false,
-      bool WideAppendKV = false>
+      cutlass::fmha::collective::AppendKVMode AppendMode,
+      class Scheduler>
   static int run(const Arguments& params) {
     // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
     // information is used by the underlying kernel.
@@ -457,9 +455,7 @@ struct FMHAConfig {
         GmemTiledCopyV_cache,
         LocalMask,
         false,
-        AppendKV,
-        DirectAppendKV,
-        WideAppendKV>;
+        AppendMode>;
 
     // Epilogue
     using CollectiveEpilogue =
@@ -500,26 +496,17 @@ struct FMHAConfig {
     bool const has_append = params.total_kvnew > 0 && params.k_new_ptr != nullptr && params.v_new_ptr != nullptr &&
                             params.kv_cache_seqlens != nullptr;
     if (has_append) {
-      return run<true, true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+      constexpr auto append_mode = int(get<1>(TileShapeOutput{})) == 64
+                                       ? cutlass::fmha::collective::AppendKVMode::kStore
+                                       : cutlass::fmha::collective::AppendKVMode::kStoreAndDirectLoad;
+      return run<true, true, true, append_mode, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
     }
-    return run<true, true, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
-  }
-
-  static int run_paged_direct_append(const Arguments& params) {
-    TORCH_CHECK(params.cu_seqlens_q != nullptr, "direct AppendKV requires cu_seqlens_q");
-    TORCH_CHECK(params.cu_seqlens_k != nullptr, "direct AppendKV requires per-batch cache lengths");
-    TORCH_CHECK(params.page_table != nullptr, "direct AppendKV requires page_table");
-    TORCH_CHECK(params.page_size > 0, "direct AppendKV requires a positive page_size");
-    TORCH_CHECK(params.max_num_pages_per_seq > 0, "direct AppendKV requires max_num_pages_per_seq");
-    TORCH_CHECK(
-        params.total_kvnew > 0 && params.k_new_ptr != nullptr && params.v_new_ptr != nullptr &&
-            params.kv_cache_seqlens != nullptr,
-        "direct AppendKV requires k_new, v_new, and old cache lengths");
-    return run<true, true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler, true>(params);
-  }
-
-  static int run_paged_wide_append(const Arguments& params) {
-    return run<true, true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler, false, true>(params);
+    return run<
+        true,
+        true,
+        true,
+        cutlass::fmha::collective::AppendKVMode::kNone,
+        cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
   }
 
   // Non-paged (contiguous ragged) KV cache: addressed via cu_seqlens_k offsets.
@@ -534,9 +521,19 @@ struct FMHAConfig {
     bool const has_append = params.total_kvnew > 0 && params.k_new_ptr != nullptr && params.v_new_ptr != nullptr &&
                             params.kv_cache_seqlens != nullptr;
     if (has_append) {
-      return run<true, true, false, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+      return run<
+          true,
+          true,
+          false,
+          cutlass::fmha::collective::AppendKVMode::kStore,
+          cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
     }
-    return run<true, true, false, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+    return run<
+        true,
+        true,
+        false,
+        cutlass::fmha::collective::AppendKVMode::kNone,
+        cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
   }
 
   static int run(const Arguments& params) {

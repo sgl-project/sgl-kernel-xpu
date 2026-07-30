@@ -1007,6 +1007,15 @@ std::vector<at::Tensor> mha_fwd(
   CHECK_SHAPE(v, num_pages, page_size, num_heads_k, head_size_v);
   CHECK_SHAPE(page_table.value(), batch_size_k, max_num_pages_per_seq);
 
+  at::Tensor page_table_for_kernel = page_table.value();
+  if (kv_batch_idx_.has_value()) {
+    auto kv_batch_idx = kv_batch_idx_.value();
+    CHECK_INPUT(kv_batch_idx);
+    TORCH_CHECK(kv_batch_idx.scalar_type() == torch::kInt32, "kv_batch_idx must have dtype int32");
+    CHECK_SHAPE(kv_batch_idx, batch_size);
+    page_table_for_kernel = page_table_for_kernel.index_select(0, kv_batch_idx.toType(torch::kLong));
+  }
+
   if (leftpad_k_.has_value()) {
     auto leftpad_k = leftpad_k_.value();
     TORCH_CHECK(leftpad_k.dtype() == torch::kInt32, "leftpad_k must have dtype int32");
@@ -1113,10 +1122,10 @@ std::vector<at::Tensor> mha_fwd(
   params.window_size_right = window_size_right;
   params.total_q = total_q;
   params.total_kvcache = total_k;
-  params.b_k = batch_size_k;
+  params.b_k = page_table_for_kernel.size(0);
   params.dv = head_size_v;
-  params.page_table = page_table.value().data_ptr<int>();
-  params.page_table_batch_stride = page_table.value().stride(0);
+  params.page_table = page_table_for_kernel.data_ptr<int>();
+  params.page_table_batch_stride = page_table_for_kernel.stride(0);
   params.max_num_pages_per_seq = max_num_pages_per_seq;
   params.page_size = page_size;
   params.num_pages = num_pages;
@@ -1462,6 +1471,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
   int const num_heads = q.size(-2);
   int const num_heads_k = k.size(-2);
   int64_t batch_size = cu_seqlens_q.size(0) - 1;
+  bool const has_new_kv = k_new_.has_value() || v_new_.has_value() || cu_seqlens_k_new_.has_value();
 
   // decode / prefill / chunkprefill all take the same leading argument list;
   // only the trailing parameters differ. Bind the shared arguments once here so
@@ -1502,7 +1512,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
            std::forward<decltype(tail)>(tail)...));
   };
 
-  if (max_seqlen_q == 1) {
+  if (has_new_kv) {
+    return dispatch(prefill::mha_fwd, std::nullopt, k_new_, v_new_, cu_seqlens_k_new_);
+  } else if (max_seqlen_q == 1) {
     // Pure decode path
     return dispatch(decode::mha_fwd, std::nullopt);
   } else if (!page_table.has_value() || batch_size == 1) {

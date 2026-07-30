@@ -77,13 +77,8 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
     using AppendSubgroupLayoutQK = cute::Layout<
         cute::Shape<cute::Int<@APPENDKV_Q256_NUM_SG@>, cute::_1, cute::_1>,
         cute::Stride<cute::_1, cute::_1, cute::_1>>;
-#if @HEAD_DIM@ == 64
     FMHAConfig<false, false, false, AppendTileShapeQK, AppendTileShapePV, AppendTileShapeOutput,
-               AppendSubgroupLayoutQK>::run_paged_wide_append(params);
-#else
-    FMHAConfig<false, false, false, AppendTileShapeQK, AppendTileShapePV, AppendTileShapeOutput,
-               AppendSubgroupLayoutQK>::run_paged_direct_append(params);
-#endif
+               AppendSubgroupLayoutQK>::run_paged(params);
     return;
   }
 #endif

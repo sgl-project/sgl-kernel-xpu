@@ -652,9 +652,9 @@ def fused_q_norm_rope(
 
     Writes the result into ``q_output`` (same shape/dtype as ``q_input``).
     Dispatches to a sub-group ("warp") kernel for ``head_dim`` in
-    ``{64, 128, 256}`` (when the nope/rope boundary aligns with a lane
-    boundary), and to a work-group ("CTA") kernel otherwise -- including
-    every ``head_dim > 256``, e.g. DeepSeek-V4's ``head_dim=512``.
+    ``{64, 128, 192, 256}`` when ``rope_dim`` aligns with a lane boundary
+    (i.e. ``rope_dim % (head_dim // 16) == 0``), and to a work-group ("CTA")
+    kernel otherwise (including all ``head_dim > 256``, e.g. DeepSeek-V4's ``512``).
 
     Algorithm (per token, per head):
       1. RMSNorm-self  -- normalize the full head_dim vector (no learned weight).

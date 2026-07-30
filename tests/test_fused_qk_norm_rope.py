@@ -736,8 +736,8 @@ def fused_q_norm_rope_reference(
 ) -> torch.Tensor:
     """Pure-PyTorch reference for the DeepSeek-V4 Q path: unweighted
     RMSNorm-self over the full head_dim, then RoPE on the last `rope_dim`
-    elements (interleaved re/im), matching `FusedQNormRopeKernel`
-    (python/sglang/jit_kernel/csrc/deepseek_v4/main_norm_rope.cuh).
+    elements (interleaved re/im), matching the XPU implementation in
+    `src/sycl/FusedQKNormRope.cpp` (`fused_q_norm_rope`).
 
     Args:
         q_input: (B, H, head_dim), any float dtype.

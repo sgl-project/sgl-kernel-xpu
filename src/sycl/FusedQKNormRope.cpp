@@ -1648,6 +1648,7 @@ void fused_k_norm_rope_flashmla(
   TORCH_CHECK(freqs_cis.scalar_type() == at::ScalarType::Float, "freqs_cis must be float32");
   TORCH_CHECK(freqs_cis.dim() == 2, "freqs_cis must be 2D [max_pos, rope_dim]");
   const int64_t rope_dim = freqs_cis.size(1);
+  TORCH_CHECK(rope_dim % 2 == 0, "rope_dim must be even");
   TORCH_CHECK(rope_dim > 0 && rope_dim <= head_dim, "rope_dim must be in (0, head_dim]");
   TORCH_CHECK(positions.dim() == 1, "positions must be 1D [num_tokens]");
   TORCH_CHECK(out_loc.dim() == 1, "out_loc must be 1D [num_tokens]");

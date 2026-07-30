@@ -66,6 +66,7 @@ __attribute__((visibility("default"))) void FmhaPrefillNpRunner<@HEAD_DIM@>::ope
           TileShapePV,
           TileShapeOutput,
           SubgroupLayoutQK,
+          ((@HEAD_DIM@ + 31) / 32) * 32,
           void,
           2,
           false,

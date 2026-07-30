@@ -193,7 +193,7 @@ using LayoutV = cutlass::layout::RowMajor;
 using LayoutO = cutlass::layout::RowMajor;
 
 template <class FMHAPrefillKernel, bool isVarLen = false>
-struct PrefillRunner {
+struct __attribute__((visibility("hidden"))) PrefillRunner {
   using StrideQ = typename FMHAPrefillKernel::StrideQ;
   using StrideK = typename FMHAPrefillKernel::StrideK;
   using StrideV = typename FMHAPrefillKernel::StrideV;
@@ -338,11 +338,19 @@ struct PrefillRunner {
 
     // Run
     if constexpr (CollectiveMainloop::ScoreBlock2D) {
-      using ScoreStoreKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<0>;
-      using ScoreLoadKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<1>;
-
-      launch<ScoreStoreKernel>(ScoreStoreKernel::to_underlying_arguments(arguments, workspace_ptr));
-      launch<ScoreLoadKernel>(ScoreLoadKernel::to_underlying_arguments(arguments, workspace_ptr));
+      static constexpr int kLaunches = FMHAPrefillKernel::kOutputTiles;
+      static_assert(kLaunches >= 2, "ScoreBlock2D needs at least a store and a load launch");
+      auto launch_mode = [&](auto mode) {
+        using ScoreKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<decltype(mode)::value>;
+        launch<ScoreKernel>(ScoreKernel::to_underlying_arguments(arguments, workspace_ptr));
+        // The XPU queue may execute independent submissions out of order. Each
+        // score-load launch must wait for the preceding launch to populate the
+        // shared global-memory workspace.
+        dpcppGetCurrentQueue().ext_oneapi_submit_barrier();
+      };
+      [&]<int... Modes>(cute::integer_sequence<int, Modes...>) {
+        (launch_mode(cute::C<Modes>{}), ...);
+      }(cute::make_integer_sequence<int, kLaunches>{});
     } else {
       launch<FMHAPrefillKernel>(FMHAPrefillKernel::to_underlying_arguments(arguments, workspace_ptr));
     }
@@ -357,6 +365,7 @@ template <
     typename TileShapePV,
     typename TileShapeOutput,
     typename SubgroupLayoutQK,
+    int PaddedHeadDimVO = 0,
     typename SubgroupLayoutPV_ = void, /* void -> default */
     int PipelineStages = 2,            // TODO: This is hard-coded as 1 in kernel.
     bool persistent = false,
@@ -373,7 +382,9 @@ template <
     typename GmemTiledCopyK = void,
     typename GmemTiledCopyV = void,
     typename GmemTiledCopyO = void>
-struct FMHAConfig {
+struct __attribute__((visibility("hidden"))) FMHAConfig {
+  static constexpr int kOutputTiles =
+      PaddedHeadDimVO == 0 ? 1 : ceil_div(PaddedHeadDimVO, get<1>(TileShapeOutput{}));
   static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
   using MMAOperation = cute::conditional_t<
       is_void_v<MMAOperation_>,
@@ -456,7 +467,10 @@ struct FMHAConfig {
             Step<_2, _0, _1, _3>,
             Step<_2, _0, _1, _3>,
             Step<_0, _2, _1, _3>,
-            Step<_2, _0, _1, _3>>>;
+            Step<_2, _0, _1, _3>,
+            /*PackGQA=*/false,
+            /*StaticScoreMode=*/-1,
+            kOutputTiles>>;
 
     PrefillRunner<FMHAPrefillKernel, isVarLen> kernel;
 

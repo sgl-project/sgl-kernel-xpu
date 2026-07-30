@@ -43,6 +43,20 @@
 #define FMHA_PREFILL_ENABLE_SCORE_BLOCK2D 0
 #endif
 
+#ifndef FMHA_PREFILL_QK_GROUP
+#define FMHA_PREFILL_QK_GROUP 1
+#endif
+
+#ifndef FMHA_PREFILL_ZIGZAG_D
+#define FMHA_PREFILL_ZIGZAG_D 1
+#endif
+
+// 0 keeps the split barrier, 1 drops it everywhere, and 2 drops it only
+// from ScoreBlock2D load launches.
+#ifndef FMHA_PREFILL_NO_SPLIT_BARRIER
+#define FMHA_PREFILL_NO_SPLIT_BARRIER 2
+#endif
+
 namespace cutlass::fmha {
 
 template <int Stages>
@@ -187,6 +201,7 @@ struct FMHAFwdMainloop<
   using FragSRow = decltype(reduce<1>(FragS{}, sycl::plus<void>{}));
   using FragSCol = decltype(reduce<0>(FragS{}, sycl::plus<void>{}));
   using ElementS = typename TiledMMAQK::ValTypeD;
+  using ElementScoreStore = half_t;
 
   using SingleFragA = FragC<TiledMMAPV>;                       // (atom val,q',v')
   using FragA = expand_sg_fragment_t<SingleFragA, 1, VTiles>;  // (atom val,q',v',VV)
@@ -199,6 +214,14 @@ struct FMHAFwdMainloop<
   static constexpr bool LocalMask = LocalMask_;
   static constexpr bool PackGQA = PackGQA_;
   static constexpr bool ScoreBlock2D = FMHA_PREFILL_ENABLE_SCORE_BLOCK2D;
+  static constexpr int QKGroup = FMHA_PREFILL_QK_GROUP;
+  static_assert(QKGroup >= 1, "FMHA_PREFILL_QK_GROUP must be at least 1");
+  template <int Mode>
+  static constexpr int group_for_mode() {
+    return (ScoreBlock2D && Mode >= 1) ? 1 : QKGroup;
+  }
+  static constexpr bool ZigzagD = FMHA_PREFILL_ZIGZAG_D;
+  static constexpr int NoSplitBarrierMode = FMHA_PREFILL_NO_SPLIT_BARRIER;
 
   // FP8 KV cache: enabled when the K element type is an 8-bit float. The fp8
   // K/V are dequantized (cast to ElementQ and multiplied by the per-tensor
@@ -213,7 +236,7 @@ struct FMHAFwdMainloop<
     int max_num_pages_per_seq = 0;
     int window_size_left = -1;
     int window_size_right = -1;
-    ElementS* ptr_score = nullptr;
+    ElementScoreStore* ptr_score = nullptr;
   };
 
   // Kernel-facing parameters
@@ -240,7 +263,7 @@ struct FMHAFwdMainloop<
         args.max_num_pages_per_seq,
         args.window_size_left,
         args.window_size_right,
-        ScoreBlock2D ? reinterpret_cast<ElementS*>(workspace) : nullptr};
+        ScoreBlock2D ? reinterpret_cast<ElementScoreStore*>(workspace) : nullptr};
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
@@ -283,7 +306,7 @@ struct FMHAFwdMainloop<
       TensorK_cache2D const& K_cache_2D = TensorK_cache2D{},
       TensorV_cache2D const& V_cache_2D = TensorV_cache2D{},
       float scale_k = 1.0f,  // FP8 K per-tensor dequant scale
-      ElementS* score_head_ptr = nullptr) {
+      ElementScoreStore* score_head_ptr = nullptr) {
     using namespace sycl::ext::oneapi::this_work_item;
 
     // Short dimension names:
@@ -305,7 +328,7 @@ struct FMHAFwdMainloop<
     Tensor cV_cache = make_identity_tensor(V_cache_2D.shape());   // (v,k)
     Tensor cP = make_identity_tensor(take<0, 2>(TileShapeQK{}));  // (q,k)
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
-    auto score_shape = make_shape(int(size<0>(Q_2D)), seq_len_kv_cache);
+    auto score_shape = make_shape(get<0>(TileShapeQK{}), seq_len_kv_cache);
     auto score_layout = make_layout(score_shape, make_stride(seq_len_kv_cache, Int<1>{}));
     Tensor Score = make_tensor(make_gmem_ptr(score_head_ptr), score_layout);
     Tensor cScore = make_identity_tensor(score_shape);  // (q,k)
@@ -321,7 +344,7 @@ struct FMHAFwdMainloop<
     Tensor gV_cache = local_tile(cV_cache, tile_shape_v, make_coord(get<1>(blk_qv), _));                  // (v,k,K)
     Tensor gV_cache_split = local_tile(gV_cache, TileShapePV{}, make_coord(_, _, 0), Step<X, _1, _1>{});  // (v,k,VV,K)
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
-    Tensor gScore = local_tile(cScore, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), _));  // (q,k,K)
+    Tensor gScore = local_tile(cScore, take<0, 2>(TileShapeQK{}), make_coord(_0{}, _));  // (q,k,K)
 #endif
 
     /* Create global -> register copies */
@@ -366,7 +389,8 @@ struct FMHAFwdMainloop<
     auto tKrK = thr_copy_k.partition_sg_fragment_D(gK(_, _, 0, 0));
     auto tSrK = thr_mma_qk.partition_sg_fragment_B(gK(_, _, 0, 0));
 
-    auto tSrS = thr_mma_qk.partition_sg_fragment_C(cP);
+    constexpr int KGrp = group_for_mode<StaticScoreMode>();
+    FragS tSrS_grp[KGrp];
     auto tArP = thr_mma_pv.partition_sg_fragment_A(cP);
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
     auto tScoreStoreR = thr_copy_score_store.partition_sg_fragment_S(gScore(_, _, 0));
@@ -404,7 +428,7 @@ struct FMHAFwdMainloop<
     if constexpr (PagedKV) {
       next_page_idx = get_physical_k_tile(blk_k0, l_coord, seq_len_kv_cache);
     }
-    if constexpr (!(ScoreBlock2D && StaticScoreMode == 1)) {
+    if constexpr (!(ScoreBlock2D && StaticScoreMode >= 1)) {
       for (int D = 0; D < size<3>(pQgQ); D++) {
         prefetch(prefetch_q, pQgQ(_, _, _, D));
       }
@@ -431,152 +455,166 @@ struct FMHAFwdMainloop<
       qk_scale = params.scale * static_cast<ElementS>(scale_k);
     }
 
-    /* Main loop, blocked in k. */
-    for (int K = blk_k0; K < blk_k1 && K < kblocks_cache; K++) {
-      /* Split barrier to keep threads together */
-      barrier_arrive(ScopeWorkgroup);
+    constexpr bool SkipSplitBarrier =
+        (NoSplitBarrierMode == 1) || (NoSplitBarrierMode == 2 && ScoreBlock2D && StaticScoreMode >= 1);
 
-      bool need_causal = false;
-      if constexpr (CausalMask) {
-        need_causal = K >= blk_k1_causal;
-      }
-
-      page_idx = next_page_idx;
-      next_page_idx = K + 1;
-      if constexpr (PagedKV) {
-        next_page_idx = get_physical_k_tile(next_page_idx, l_coord, seq_len_kv_cache);
-      }
-
-      if constexpr (ScoreBlock2D && StaticScoreMode == 1) {
-#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
-        copy(copy_score_load, tScoreLoadG(_, _, _, K), tScoreLoadR);
-        reorder(tScoreLoadR, tSrS);
-#endif
-      } else {
-        /* GEMM 1: S = K * Q */
-        clear(tSrS);
+    const int k_end = cute::min(blk_k1, kblocks_cache);
+    for (int K_grp = blk_k0; K_grp < k_end; K_grp += KGrp) {
+      // GEMM1 runs outside the per-K barrier region. At QKGroup > 1 one pass
+      // over Q feeds several score accumulators; the default keeps one.
+      if constexpr (!(ScoreBlock2D && StaticScoreMode >= 1)) {
+        int grp_page_idx[KGrp];
         CUTLASS_PRAGMA_UNROLL
-        for (int D = 0; D < size<4>(tKgK); D++) {
+        for (int g = 0; g < KGrp; g++) {
+          int Kg = cute::min(K_grp + g, k_end - 1);
+          grp_page_idx[g] = PagedKV ? get_physical_k_tile(Kg, l_coord, seq_len_kv_cache) : Kg;
+          clear(tSrS_grp[g]);
+        }
+
+        const int nD = size<4>(tKgK);
+        CUTLASS_PRAGMA_UNROLL
+        for (int Di = 0; Di < nD; Di++) {
+          const int D = (ZigzagD && ((K_grp / KGrp) & 1)) ? (nD - 1 - Di) : Di;
           copy(copy_q, tQgQ(_, _, _, D), tQrQ);
-          copy(copy_k_cache, tKgK_cache(_, _, _, page_idx, D), tKrK);
           reorder(tQrQ, tSrQ);
-          reorder(tKrK, tSrK);
-          cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
+          CUTLASS_PRAGMA_UNROLL
+          for (int g = 0; g < KGrp; g++) {
+            copy(copy_k_cache, tKgK_cache(_, _, _, grp_page_idx[g], D), tKrK);
+            reorder(tKrK, tSrK);
+            cute::gemm(mma_qk, tSrQ, tSrK, tSrS_grp[g]);
+          }
         }
       }
 
-      /* V prefetch for GEMM 2 */
       CUTLASS_PRAGMA_UNROLL
-      for (int VV = 0; VV < VTiles; VV++) {
-        prefetch(prefetch_v_cache, pVgV_cache(_, _, _, VV, page_idx));
-      }
+      for (int g = 0; g < KGrp; g++) {
+        const int K = K_grp + g;
+        if (K >= k_end) {
+          break;
+        }
+        auto& tSrS = tSrS_grp[g];
 
-      /* Causal masking */
-      if constexpr (CausalMask && !(ScoreBlock2D && StaticScoreMode == 1)) {
-        if (need_causal) {
-          /* Masking scalars */
-          // TODO: use a more general code path for causal masking.
-          int lane_id = thr_id % intel::sg_size;
-          constexpr int sg_tile_q = get<0>(TileShapeQK{}) / SGPerWG::value;
-          int row_base = get<0>(blk_qv) * get<0>(TileShapeQK{}) + (thr_id / intel::sg_size) * sg_tile_q;
+        if constexpr (!SkipSplitBarrier) {
+          barrier_arrive(ScopeWorkgroup);
+        }
 
-          constexpr int kTileK = get<1>(TileShapeQK{});
-          constexpr int n_reps = kTileK / intel::sg_size;
-          constexpr int elems_per_n = tSrS.size() / n_reps;
-          int k_base = K * kTileK;
-          CUTLASS_PRAGMA_UNROLL
-          for (int n = 0; n < n_reps; n++) {
-            int col = k_base + n * intel::sg_size + lane_id;
-            int causal_bound = col - full_tile_offset - row_base;
+        bool need_causal = false;
+        if constexpr (CausalMask) {
+          need_causal = K >= blk_k1_causal;
+        }
+
+        page_idx = next_page_idx;
+        next_page_idx = K + 1;
+        if constexpr (PagedKV) {
+          next_page_idx = get_physical_k_tile(next_page_idx, l_coord, seq_len_kv_cache);
+        }
+
+        if constexpr (ScoreBlock2D && StaticScoreMode >= 1) {
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+          copy(copy_score_load, tScoreLoadG(_, _, _, K), tScoreLoadR);
+          reorder(tScoreLoadR, tSrS);
+#endif
+        }
+
+        /* V prefetch for GEMM 2 */
+        CUTLASS_PRAGMA_UNROLL
+        for (int VV = 0; VV < VTiles; VV++) {
+          prefetch(prefetch_v_cache, pVgV_cache(_, _, _, VV, page_idx));
+        }
+
+        /* Causal masking */
+        if constexpr (CausalMask && !(ScoreBlock2D && StaticScoreMode >= 1)) {
+          if (need_causal) {
+            int lane_id = thr_id % intel::sg_size;
+            constexpr int sg_tile_q = get<0>(TileShapeQK{}) / SGPerWG::value;
+            int row_base = get<0>(blk_qv) * get<0>(TileShapeQK{}) + (thr_id / intel::sg_size) * sg_tile_q;
+
+            constexpr int kTileK = get<1>(TileShapeQK{});
+            constexpr int n_reps = kTileK / intel::sg_size;
+            constexpr int elems_per_n = FragS{}.size() / n_reps;
+            int k_base = K * kTileK;
             CUTLASS_PRAGMA_UNROLL
-            for (int j = 0; j < elems_per_n; j++) {
-              if (j < causal_bound) {
-                tSrS(n * elems_per_n + j) = ElementS(-INFINITY);
+            for (int n = 0; n < n_reps; n++) {
+              int col = k_base + n * intel::sg_size + lane_id;
+              int causal_bound = col - full_tile_offset - row_base;
+              CUTLASS_PRAGMA_UNROLL
+              for (int j = 0; j < elems_per_n; j++) {
+                if (j < causal_bound) {
+                  tSrS(n * elems_per_n + j) = ElementS(-INFINITY);
+                }
               }
             }
           }
         }
-      }
 
-      /* Local/sliding window masking */
-      if constexpr (LocalMask && !(ScoreBlock2D && StaticScoreMode == 1)) {
-        Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
-        Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
-        auto cS_thread = thr_mma_qk.partition_C(gP);
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < tSrS.size(); ++i) {
-          int row_idx = get<0>(cS_thread(i));
-          int col_idx = get<1>(cS_thread(i));
-          // PackGQA decode: every packed M row is the same decode token, so the
-          // KV position is full_tile_offset regardless of the per-row (head)
-          // index. Non-packed keeps the per-row sequence position.
-          int row_kv_idx = (PackGQA_ ? 0 : row_idx) + full_tile_offset;
-          bool left_mask = col_idx < row_kv_idx - params.window_size_left;
-          bool right_mask = col_idx > row_kv_idx + params.window_size_right;
-          if (left_mask || right_mask) {
-            tSrS(i) = ElementS(-INFINITY);
+        /* Local/sliding window masking */
+        if constexpr (LocalMask && !(ScoreBlock2D && StaticScoreMode >= 1)) {
+          Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
+          Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
+          auto cS_thread = thr_mma_qk.partition_C(gP);
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); ++i) {
+            int row_idx = get<0>(cS_thread(i));
+            int col_idx = get<1>(cS_thread(i));
+            int row_kv_idx = (PackGQA_ ? 0 : row_idx) + full_tile_offset;
+            bool left_mask = col_idx < row_kv_idx - params.window_size_left;
+            bool right_mask = col_idx > row_kv_idx + params.window_size_right;
+            if (left_mask || right_mask) {
+              tSrS(i) = ElementS(-INFINITY);
+            }
           }
         }
-      }
 
-      /* k masking for remainder tiles */
-      // The block2D score store clips tail columns at seq_len, so load mode
-      // must mask the remainder again before softmax.
-      if (check_remainder_k && K == total_blk - 1) {
-        FragSCol k_rem_mask;
-        int k_val = get<0>(tKgK_cache(0, 0, 0, K, 0));
-        int k = k_val + get_sub_group().get_local_id()[0];
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < k_rem_mask.size(); i++, k += intel::sg_size) {
-          k_rem_mask(i) = (k < seq_len) ? ElementS(sycl::nan(0u)) : ElementS(-INFINITY);
+        // The block2D score store clips tail columns at seq_len, so load mode
+        // must mask the remainder again before softmax.
+        if (check_remainder_k && K == total_blk - 1) {
+          FragSCol k_rem_mask;
+          int k_val = get<0>(tKgK_cache(0, 0, 0, K, 0));
+          int k = k_val + get_sub_group().get_local_id()[0];
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < k_rem_mask.size(); i++, k += intel::sg_size) {
+            k_rem_mask(i) = (k < seq_len) ? ElementS(sycl::nan(0u)) : ElementS(-INFINITY);
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); i++) {
+            tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(k_rem_mask, tSrS, i));
+          }
         }
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < tSrS.size(); i++) {
-          tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(k_rem_mask, tSrS, i));
-        }
-      }
 
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
-      if constexpr (ScoreBlock2D && StaticScoreMode == 0) {
-        reorder(tSrS, tScoreStoreR);
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < tScoreStoreR.size(); ++i) {
-          tScoreStoreR(i) *= qk_scale;
+        if constexpr (ScoreBlock2D && StaticScoreMode == 0) {
+          reorder(tSrS, tScoreStoreR);
+          copy(copy_score_store, tScoreStoreR, tScoreStoreG(_, _, _, K));
         }
-        copy(copy_score_store, tScoreStoreR, tScoreStoreG(_, _, _, K));
-      }
 #endif
 
-      /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
-      ElementS softmax_scale = qk_scale;
-      if constexpr (ScoreBlock2D && StaticScoreMode == 1) {
-        softmax_scale = ElementS(1);
-      }
-      auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, softmax_scale);
-      reorder(tSrS, tArP);
+        auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, qk_scale);
+        reorder(tSrS, tArP);
 
-      /* GEMM 2: A += P * V, split in v dimension. */
-      CUTLASS_PRAGMA_UNROLL
-      for (int VV = 0; VV < VTiles; VV++) {
-        copy(copy_v_cache, tVgV_cache(_, _, _, VV, page_idx), tVrV);
-        reorder(tVrV, tArV);
-        if (K != blk_k0) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tArA.size() / VTiles; i++) {
-            tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
+        /* GEMM 2: A += P * V, split in v dimension. */
+        CUTLASS_PRAGMA_UNROLL
+        for (int VV = 0; VV < VTiles; VV++) {
+          copy(copy_v_cache, tVgV_cache(_, _, _, VV, page_idx), tVrV);
+          reorder(tVrV, tArV);
+          if (K != blk_k0) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tArA.size() / VTiles; i++) {
+              tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
+            }
+          }
+          cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
+        }
+
+        if constexpr (!(ScoreBlock2D && StaticScoreMode >= 1)) {
+          for (int D = 0; D < size<4>(pKgK); D++) {
+            prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
           }
         }
-        cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
-      }
 
-      /* K prefetch */
-      if constexpr (!(ScoreBlock2D && StaticScoreMode == 1)) {
-        for (int D = 0; D < size<4>(pKgK); D++) {
-          prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
+        if constexpr (!SkipSplitBarrier) {
+          barrier_wait(ScopeWorkgroup);
         }
       }
-
-      barrier_wait(ScopeWorkgroup);
     }
   }
 

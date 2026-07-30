@@ -72,7 +72,8 @@ template <
     // case (no causal/local mask, no sink); prefill keeps the default (false)
     // and is therefore unaffected.
     bool PackGQA_ = false,
-    int StaticScoreMode_ = -1>
+    int StaticScoreMode_ = -1,
+    int OutputTiles_ = 2>
 class XeFMHAFwdKernel {
  public:
   //
@@ -93,7 +94,9 @@ class XeFMHAFwdKernel {
       VarLenVLayoutStep_,
       VarLenOLayoutStep_,
       PackGQA_,
-      ScoreMode>;
+      ScoreMode,
+      OutputTiles_>;
+  static constexpr int kOutputTiles = OutputTiles_;
 
   // Mainloop derived types
   using CollectiveMainloop = CollectiveMainloop_;
@@ -233,19 +236,29 @@ class XeFMHAFwdKernel {
     return CollectiveMainloop::can_implement(args.mainloop) && CollectiveEpilogue::can_implement(args.epilogue);
   }
 
-  static int get_workspace_size(Arguments const& args) {
+  static constexpr size_t kScoreRowsPerWG = size_t(get<0>(TileShapeQK{}));
+
+  static size_t get_score_block_bytes(Arguments const& args) {
+    size_t score_k_extent;
+    if constexpr (is_var_len) {
+      score_k_extent = size_t(args.kernel.shape.seq_len_kv_cache.max_length);
+    } else {
+      score_k_extent = size_t(args.kernel.shape.seq_len_kv_cache);
+    }
+    return kScoreRowsPerWG * score_k_extent * sizeof(typename CollectiveMainloop::ElementScoreStore);
+  }
+
+  static size_t get_workspace_size(Arguments const& args) {
     if constexpr (CollectiveMainloop::ScoreBlock2D) {
-      int score_q_extent;
-      int score_k_extent;
+      size_t score_q_extent;
       if constexpr (is_var_len) {
-        score_q_extent = int(args.kernel.shape.seq_len_qo.max_length);
-        score_k_extent = int(args.kernel.shape.seq_len_kv_cache.max_length);
+        score_q_extent = size_t(args.kernel.shape.seq_len_qo.max_length);
       } else {
-        score_q_extent = int(args.kernel.shape.seq_len_qo);
-        score_k_extent = int(args.kernel.shape.seq_len_kv_cache);
+        score_q_extent = size_t(args.kernel.shape.seq_len_qo);
       }
-      return int(args.kernel.shape.batch) * int(args.kernel.shape.num_heads_q) * score_q_extent * score_k_extent *
-             int(sizeof(typename CollectiveMainloop::ElementS));
+      const size_t q_tiles = (score_q_extent + kScoreRowsPerWG - 1) / kScoreRowsPerWG;
+      const size_t num_wg = size_t(args.kernel.shape.batch) * size_t(args.kernel.shape.num_heads_q) * q_tiles;
+      return num_wg * get_score_block_bytes(args);
     }
     return 0;
   }
@@ -321,7 +334,7 @@ class XeFMHAFwdKernel {
       // Mix-batch dispatch: skip batches not owned by this kernel launch.
       if (p.skip_batch_mask != nullptr && p.skip_batch_mask[idx_b]) continue;
       if constexpr (CollectiveMainloop::ScoreBlock2D) {
-        static_assert(StaticScoreMode_ == 0 || StaticScoreMode_ == 1);
+        static_assert(StaticScoreMode_ >= 0 && StaticScoreMode_ < OutputTiles_);
         blk_v = StaticScoreMode_;
       }
       auto blk_qv = make_coord(blk_q, blk_v);
@@ -442,7 +455,7 @@ class XeFMHAFwdKernel {
       // With PackGQA the Q/O head dimension is indexed by the KV head; otherwise
       // by the (un-grouped) query head.
       int q_head_idx = PackGQA_ ? head : head_q;
-      typename CollectiveMainloop::ElementS* score_head_ptr = nullptr;
+      typename CollectiveMainloop::ElementScoreStore* score_head_ptr = nullptr;
       if constexpr (CollectiveMainloop::ScoreBlock2D) {
         int score_q_extent;
         int score_k_extent;
@@ -456,8 +469,10 @@ class XeFMHAFwdKernel {
           score_k_extent = int(s.seq_len_kv_cache);
           score_batch = l_coord;
         }
-        score_head_ptr =
-            params.mainloop.ptr_score + (score_batch * s.num_heads_q + q_head_idx) * score_q_extent * score_k_extent;
+        constexpr int q_tile = int(get<0>(TileShapeQK{}));
+        const int q_tiles = (score_q_extent + q_tile - 1) / q_tile;
+        const size_t wg_slot = (size_t(score_batch) * s.num_heads_q + q_head_idx) * q_tiles + blk_q;
+        score_head_ptr = params.mainloop.ptr_score + wg_slot * size_t(q_tile) * size_t(score_k_extent);
       }
       // FP8 KV: the per-tensor dequant scale baked into KernelArguments is
       // passed as a float function argument (scale_k) to the mainloop GEMM1.

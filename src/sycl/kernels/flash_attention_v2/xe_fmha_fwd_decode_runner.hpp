@@ -327,6 +327,8 @@ struct DecodeRunner {
             static_cast<const bool*>(params.skip_batch_mask_ptr),
             params.k_scale_ptr,
             params.v_scale_ptr,
+            static_cast<float*>(params.softmax_lse_ptr),
+            static_cast<int64_t>(params.total_q),
         },
         {params.softmax_scale,
          params.page_table,
@@ -490,6 +492,8 @@ struct SplitDecodeKernelRunner {
             static_cast<const bool*>(params.skip_batch_mask_ptr),
             params.k_scale_ptr,
             params.v_scale_ptr,
+            static_cast<float*>(params.softmax_lse_ptr),
+            static_cast<int64_t>(params.total_q),
         },
         {params.softmax_scale,
          static_cast<int*>(params.page_table),
@@ -513,7 +517,9 @@ struct SplitDecodeKernelRunner {
          reinterpret_cast<ElementLSE*>(params.max_logits_ptr),
          stride_max_logits,
          params.window_size_left,
-         static_cast<const bool*>(params.skip_batch_mask_ptr)},
+         static_cast<const bool*>(params.skip_batch_mask_ptr),
+         static_cast<float*>(params.softmax_lse_ptr),
+         static_cast<int64_t>(params.total_q)},
         hw_info,
         params.num_kv_splits};
 

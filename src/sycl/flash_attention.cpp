@@ -1258,8 +1258,6 @@ std::vector<at::Tensor> mha_fwd(
   TORCH_CHECK(batch_size >= 0, "cu_seqlens_q must have at least 1 element.");
 
   auto seqlens_q = cu_seqlens_q.slice(0, 1, batch_size + 1).sub(cu_seqlens_q.slice(0, 0, batch_size));
-  int total_q = q.size(0);
-  int num_heads = q.size(-2);
   auto is_prefill = seqlens_q.gt(1).contiguous();  // true for prefill batches
 
   // Forward every shared argument to a sub-kernel, overriding only the output
@@ -1299,14 +1297,27 @@ std::vector<at::Tensor> mha_fwd(
   };
 
   // Launch 1: decode allocates the shared output (or reuses the caller-provided
-  // out_ buffer) and skips prefill batches.
-  auto out = launch(decode::mha_fwd, std::move(out_), is_prefill)[0];
-  // Launch 2: prefill writes into the same output and skips decode batches.
-  launch(prefill::mha_fwd, out, is_prefill.logical_not());
+  // out_ buffer) and skips prefill batches. It also allocates a full
+  // (num_heads, total_q) softmax_lse and fills only the decode rows.
+  auto decode_ret = launch(decode::mha_fwd, std::move(out_), is_prefill);
+  auto out = decode_ret[0];
+  auto lse_decode = decode_ret[1];  // (num_heads, total_q), valid only on decode rows
+  // Launch 2: prefill writes into the same output and skips decode batches. Its
+  // softmax_lse likewise spans all total_q rows but is only valid on prefill rows.
+  auto prefill_ret = launch(prefill::mha_fwd, out, is_prefill.logical_not());
+  auto lse_prefill = prefill_ret[1];  // (num_heads, total_q), valid only on prefill rows
 
-  // softmax_lse / accum tensors are not stitched here; return empty
-  // placeholders to keep the Python ABI stable.
-  at::Tensor softmax_lse = at::empty({num_heads, total_q}, q.options().dtype(at::kFloat));
+  // Stitch softmax_lse: each sub-launch skipped the other's batches, leaving those
+  // rows uninitialized in its own LSE tensor. Select per query token from the
+  // launch that actually computed it. Columns are query tokens (total_q); a token
+  // belongs to a prefill batch iff its batch has seqlen_q > 1. at::where is a pure
+  // element-wise select, so the uninitialized rows are never read out. This runs
+  // entirely on device (no D2H sync).
+  auto token_is_prefill = is_prefill.repeat_interleave(seqlens_q.to(at::kLong));         // (total_q,)
+  auto softmax_lse = at::where(token_is_prefill.unsqueeze(0), lse_prefill, lse_decode);  // (num_heads, total_q)
+
+  // accum tensors are internal to split-KV reduction and unused by the Python
+  // caller; return empty placeholders to keep the ABI stable.
   auto empty_f = at::empty({0}, q.options().dtype(at::kFloat));
   return {out, softmax_lse, empty_f, empty_f};
 }

@@ -153,9 +153,27 @@ class FMHAFwdEpilogue {
       float scale_v = 1.0f,                   // Per-tensor V dequant scale (fp8 path)
       ElementSink sink_val = ElementSink{},   // Per-head sink logit (non-packed, used when Sink==true)
       const ElementSink* sink_ptr = nullptr,  // Per-row sink logits base (PackGQA, used when Sink==true)
-      int head_group_q = 0) {                 // # packed query heads in the M tile (PackGQA)
+      int head_group_q = 0,                   // # packed query heads in the M tile (PackGQA)
+      // Optional softmax LSE output (natural-log log-sum-exp), row-major
+      // (num_heads_q, total_q). Null => don't write. LSE is written in
+      // output-element space at the v==0 column so each query row is emitted
+      // exactly once.
+      float* lse_ptr = nullptr,     // Base pointer of softmax_lse, or null
+      int64_t lse_head_stride = 0,  // Row stride (= total_q)
+      int lse_q_base = 0,           // Query-token base (non-packed: batch offset; packed: this token)
+      int lse_head_base = 0,        // Head base (non-packed: q head; packed: head*head_group_q)
+      // Number of VALID query rows in this tile (non-packed only). The Q tile is
+      // padded up to TileShapeQK's M extent, so rows [seq_len_qo, TileM) are
+      // padding whose softmax state is degenerate (denom == seq_len_k, max == 0,
+      // i.e. LSE == log(seq_len_k)). Without this bound the per-row LSE store
+      // writes those padding rows at qtok = lse_q_base + row, which spills past
+      // this batch's tokens and corrupts other heads' rows in the row-major
+      // (num_heads_q, total_q) buffer. -1 => unbounded (legacy callers).
+      int lse_num_rows = -1) {
     using namespace cute;
     using ElementA = typename FragA::element_type;
+    // ln(2): converts the log2-domain row max back to the natural log used by LSE.
+    constexpr float kRcpLog2e = 0.6931471805599453f;
 
     // Reduce k-blocks of A and A_sum across WG, if needed.
     auto [rA, rA_max_local, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
@@ -233,6 +251,12 @@ class FMHAFwdEpilogue {
             denom += sink_term;
           }
         }
+        // Emit the natural-log LSE once per query head (at the v==0 column).
+        if (lse_ptr != nullptr && int(get<1>(tOgO(j))) == 0 && head_off < head_group_q) {
+          float d = float(denom);
+          float lse = (d > 0.f) ? (float(tO_max(j)) * kRcpLog2e + sycl::log(d)) : -INFINITY;
+          lse_ptr[(lse_head_base + head_off) * lse_head_stride + lse_q_base] = lse;
+        }
         // Rows that attend to no (unmasked) keys have denom==0 -> emit 0, not NaN.
         ElementA outv = (denom != ElementA(0)) ? (tO_num(j) / denom) : ElementA(0);
         //  For an fp8 KV cache the per-tensor V dequant scale is folded in here
@@ -251,6 +275,43 @@ class FMHAFwdEpilogue {
          For an fp8 KV cache the per-tensor V dequant scale is folded in here
          (O = scale_v * (P @ V_fp8) / sum), avoiding a per-element V scale in the
          mainloop GEMM2. */
+      // Emit the natural-log LSE in output-element space (before rA_sum is
+      // overwritten by its reciprocal). Each query row writes exactly once, at
+      // the v==0 column. Works for both non-packed (prefill / MHA decode) and
+      // non-sink PackGQA decode tiles.
+      if (lse_ptr != nullptr) {
+        auto denom_e = rA;  // per-element softmax denominator (sum of weights)
+        auto max_e = rA;    // per-element row max
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < rA.size(); i++) {
+          denom_e(i) = broadcast<0>(rA_sum, rA, i);
+          max_e(i) = broadcast<0>(rA_max_local, rA, i);
+        }
+        auto tv = tOrO.tv_layout();
+        auto tO_denom = make_subgroup_tensor(make_fragment_like<ElementA>(tOrO.layout()), tv);
+        auto tO_max = make_subgroup_tensor(make_fragment_like<ElementA>(tOrO.layout()), tv);
+        reorder(denom_e, tO_denom);
+        reorder(max_e, tO_max);
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < int(tO_denom.size()); j++) {
+          if (int(get<1>(tOgO(j))) != 0) continue;
+          int row = int(get<0>(tOgO(j)));
+          int h, qtok;
+          if constexpr (PackGQA_) {
+            if (row >= head_group_q) continue;
+            h = lse_head_base + row;
+            qtok = lse_q_base;
+          } else {
+            // Skip padding rows beyond the real query length (see lse_num_rows).
+            if (lse_num_rows >= 0 && row >= lse_num_rows) continue;
+            h = lse_head_base;
+            qtok = lse_q_base + row;
+          }
+          float d = float(tO_denom(j));
+          float lse = (d > 0.f) ? (float(tO_max(j)) * kRcpLog2e + sycl::log(d)) : -INFINITY;
+          lse_ptr[int64_t(h) * lse_head_stride + qtok] = lse;
+        }
+      }
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < rA_sum.size(); i++) {
         if constexpr (CollectiveMainloop::LocalMask || CollectiveMainloop::CausalMask) {
@@ -554,7 +615,13 @@ class DecodeFwdEpilogue {
       int head_group_q,
       TensorSink& tSink,  // Sink for current head
       int num_kv_splits,
-      bool is_single_split) {
+      bool is_single_split,
+      // Optional softmax LSE output (natural log). Written only for
+      // single-split sequences; multi-split LSE is produced by ReduceSplitK.
+      float* lse_ptr = nullptr,     // Base pointer of softmax_lse, or null
+      int64_t lse_head_stride = 0,  // Row stride (= total_q)
+      int lse_q_base = 0,           // Query-token index for this decode step
+      int lse_head_base = 0) {      // Head base (= head * head_group_q)
     using namespace cute;
     using ElementA = typename FragA::element_type;
 
@@ -593,6 +660,16 @@ class DecodeFwdEpilogue {
         exp_sums(thr_id, idx_kv_split) = rA_sum(0);
         max_logits(thr_id, idx_kv_split) = rA_max(0);
       }
+    }
+
+    // Single-split sequences are normalized here (ReduceSplitK is a pass-through
+    // for them), so emit their LSE directly. Multi-split LSE is written by
+    // ReduceSplitK after the cross-split reduction.
+    if (lse_ptr != nullptr && thr_id < head_group_q && (is_single_split || num_kv_splits <= 1)) {
+      constexpr float kRcpLog2e = 0.6931471805599453f;  // ln(2)
+      float d = float(rA_sum(0));
+      float lse = (d > 0.f) ? (float(rA_max(0)) * kRcpLog2e + sycl::log(d)) : -INFINITY;
+      lse_ptr[int64_t(lse_head_base + thr_id) * lse_head_stride + lse_q_base] = lse;
     }
 
     /* Some subgroups may not have any work to do; if so, quit early. */

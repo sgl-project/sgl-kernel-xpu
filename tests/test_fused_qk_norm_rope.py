@@ -865,26 +865,37 @@ def test_fused_q_norm_rope_zero_batch():
         (512, 64, 64),  # CTA path
     ],
 )
-def test_fused_q_norm_rope_last_dim_strided(head_dim, rope_dim, last_dim_padding):
-    """Test fused Q norm + RoPE with non-contiguous input/output views (e.g.
-    sliced out of a larger padded buffer, matching production usage where
-    q_out is a slice of a TP-padded tensor)."""
+def test_fused_q_norm_rope_non_flattenable(head_dim, rope_dim, last_dim_padding):
+    """Test fused Q norm + RoPE with non-contiguous input/output views where
+    stride(0) != size(1) * stride(1), i.e. the leading dimensions are not
+    flattenable. Mirrors real production usage where q is sliced from a packed
+    QKV buffer and unflattened to (tokens, heads, head_dim)."""
     torch.random.manual_seed(42)
     batch_size, num_heads, max_pos, eps = 4, 8, 512, 1e-6
     dtype = torch.bfloat16
 
+    total_heads = num_heads + last_dim_padding
     q_storage = torch.randn(
-        batch_size, num_heads, head_dim + last_dim_padding, dtype=dtype, device=device
+        batch_size, total_heads * head_dim, dtype=dtype, device=device
     )
     out_storage = torch.randn(
-        batch_size, num_heads, head_dim + last_dim_padding, dtype=dtype, device=device
+        batch_size, total_heads * head_dim, dtype=dtype, device=device
     )
-    q_input = q_storage[..., :head_dim]
-    q_output = out_storage[..., :head_dim]
+
+    q_flat = q_storage[:, : num_heads * head_dim]
+    # Unflatten to 3D – strides become (total_heads*head_dim, head_dim, 1)
+    q_input = q_flat.unflatten(-1, (num_heads, head_dim))
+
+    out_flat = out_storage[:, : num_heads * head_dim]
+    # Unflatten to 3D – strides become (total_heads*head_dim, head_dim, 1)
+    q_output = out_flat.unflatten(-1, (num_heads, head_dim))
+
     assert q_input.stride(-1) == 1
     assert q_output.stride(-1) == 1
     assert not q_input.is_contiguous()
     assert not q_output.is_contiguous()
+    assert q_input.stride(0) != q_input.size(1) * q_input.stride(1)
+    assert q_output.stride(0) != q_output.size(1) * q_output.stride(1)
 
     freqs_cis = torch.randn(
         max_pos, rope_dim // 2, dtype=torch.complex64, device=device

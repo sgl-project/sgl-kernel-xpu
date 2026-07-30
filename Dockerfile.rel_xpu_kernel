@@ -1,0 +1,100 @@
+# If the device is Battlemage, we need to set UBUNTU_VERSION to 24.10
+
+# Usage: docker build \
+#   --build-arg UBUNTU_VERSION=24.04 \
+#   --build-arg PYTHON_VERSION=3.10 \
+#   --build-arg WHEEL_URL=https://sgl-kernel-xpu.s3.us-east-1.amazonaws.com/wheels/release-v0.1.0/sglang_kernel_xpu-0.1.0-cp310-abi3-manylinux_2_38_x86_64.whl \
+#   -t sglang:rel_xpu_kernel -f Dockerfile.rel_xpu_kernel --no-cache .
+
+
+# Set default Ubuntu version to 24.04
+FROM intel/deep-learning-essentials:2026.0.0-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Define build arguments
+ARG PYTHON_VERSION=3.10
+
+# Set environment variables
+
+ARG SG_LANG_REPO=https://github.com/sgl-project/sglang.git
+ARG SG_LANG_BRANCH=main
+
+# Pre-built sgl-kernel-xpu wheel uploaded to S3 by build-and-upload-wheel.yml.
+ARG WHEEL_URL=https://sgl-kernel-xpu.s3.us-east-1.amazonaws.com/wheels/release-v0.1.0/sglang_kernel_xpu-0.1.0-cp310-abi3-manylinux_2_38_x86_64.whl
+
+# Pin the compute UMD + IGC. The kobuk-team PPA is rolling; an untested build
+# mismatched the host xe KMD and faulted libze_intel_gpu.so on the B580 runner.
+# Must stay in lockstep with the host KMD; override via --build-arg per workflow.
+ARG COMPUTE_RUNTIME_VERSION=26.18.38308.1
+ARG IGC_VERSION=2.34.4+21428
+ARG GMM_VERSION=22.10.0
+RUN apt-get install -y software-properties-common && \
+    add-apt-repository -y ppa:kobuk-team/intel-graphics && \
+    apt-get update  && \
+    # Loader + media/metrics from the PPA; GPU driver itself is pinned below.
+    apt-get install -y libze1 intel-metrics-discovery clinfo intel-gsc && \
+    apt-get install -y intel-media-va-driver-non-free libmfx-gen1 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo && \
+    apt-get install -y libze-dev && \
+    # IGC first: libze-intel-gpu1 / intel-opencl-icd depend on it.
+    cd /tmp && \
+    igc_url="https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_VERSION%%+*}" && \
+    cr_url="https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_VERSION}" && \
+    curl -fsSL -O "${igc_url}/intel-igc-core-2_${IGC_VERSION}_amd64.deb" && \
+    curl -fsSL -O "${igc_url}/intel-igc-opencl-2_${IGC_VERSION}_amd64.deb" && \
+    curl -fsSL -O "${cr_url}/libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
+    curl -fsSL -O "${cr_url}/intel-opencl-icd_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
+    curl -fsSL -O "${cr_url}/intel-ocloc_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
+    curl -fsSL -O "${cr_url}/libigdgmm12_${GMM_VERSION}_amd64.deb" && \
+    apt-get install -y --allow-downgrades \
+        ./intel-igc-core-2_${IGC_VERSION}_amd64.deb \
+        ./intel-igc-opencl-2_${IGC_VERSION}_amd64.deb \
+        ./libigdgmm12_${GMM_VERSION}_amd64.deb \
+        ./libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb \
+        ./intel-opencl-icd_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb \
+        ./intel-ocloc_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb && \
+    rm -f /tmp/*.deb && \
+    # Hold so a later apt upgrade cannot pull the rolling PPA version.
+    apt-mark hold libze-intel-gpu1 intel-opencl-icd intel-ocloc libigdgmm12 \
+        intel-igc-core-2 intel-igc-opencl-2
+
+# Install Miniforge & PyTorch/Triton
+RUN curl -fsSL -v -o miniforge.sh -O https://github.com/conda-forge/miniforge/releases/download/25.1.1-0/Miniforge3-Linux-x86_64.sh && \
+    bash miniforge.sh -b -p ./miniforge3 && \
+    rm miniforge.sh && \
+    . ./miniforge3/bin/activate && \
+    conda create -y -n py${PYTHON_VERSION} python=${PYTHON_VERSION} && conda activate py${PYTHON_VERSION} && \
+    conda install pip && \
+    echo ". /miniforge3/bin/activate; conda activate py${PYTHON_VERSION}; . /opt/intel/oneapi/setvars.sh; cd /root/" >> /root/.bashrc;
+
+RUN --mount=type=secret,id=github_token \
+    cd /root && \
+    . /miniforge3/bin/activate && \
+    conda activate py${PYTHON_VERSION} && \
+    # . /opt/intel/oneapi/setvars.sh --force && \
+    # Install Torch
+    pip install torch==2.13.0 torchvision triton-xpu --index-url https://download.pytorch.org/whl/xpu
+
+# Install SGlang from source; install sgl-kernel-xpu from the pre-built wheel on S3.
+RUN --mount=type=secret,id=github_token \
+    cd /root && \
+    . /miniforge3/bin/activate && \
+    conda activate py${PYTHON_VERSION} && \
+    echo "cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
+    git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} && \
+    cd sglang && \
+    # Download the release wheel from S3 and install it.
+    echo "fetching sgl-kernel-xpu wheel from ${WHEEL_URL}" && \
+    mkdir -p /root/rel-wheel && \
+    curl -fSL --retry 5 --retry-delay 10 -o "/root/rel-wheel/$(basename "${WHEEL_URL%%\?*}")" "${WHEEL_URL}" && \
+    ls -la /root/rel-wheel/ && \
+    pip install "/root/rel-wheel/$(basename "${WHEEL_URL%%\?*}")" && \
+    # Install required packages for sglang workloads
+    pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops matplotlib pandas --root-user-action=ignore aiohttp && \
+    conda install libsqlite=3.48.0 -y && \
+    echo ". /miniforge3/bin/activate; conda activate py${PYTHON_VERSION}; cd /root/" >> /root/.bashrc;
+
+# Set the default shell to bash
+SHELL ["bash", "-c"]
+CMD ["bash", "-c", "source /root/.bashrc && exec bash"]
+USER root

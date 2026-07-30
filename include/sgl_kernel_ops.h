@@ -751,7 +751,7 @@ void fast_topk_transform_ragged_interface(
     std::optional<at::Tensor> row_starts_opt);
 
 /*
- * Compress plan kernels
+ * Compress plan and execution kernels
  */
 namespace at::native::xpu {
 

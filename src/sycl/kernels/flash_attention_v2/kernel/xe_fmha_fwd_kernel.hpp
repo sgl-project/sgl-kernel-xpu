@@ -102,7 +102,6 @@ class XeFMHAFwdKernel {
 
   using FragA = typename CollectiveMainloop::FragA;
   using FragARow = typename CollectiveMainloop::FragARow;
-  static constexpr bool DirectAppendKV = CollectiveMainloop::DirectAppendKV;
 
   // Tile scheduler derived types
   using TileScheduler = TileScheduler_;
@@ -316,7 +315,7 @@ class XeFMHAFwdKernel {
         int const seq_k_new = CollectiveMainloop::get_kv_new_len(params.mainloop, idx_b);
         if (seq_k_new > 0) {
           append_store_len = seq_k_new;
-          if constexpr (DirectAppendKV) {
+          if constexpr (CollectiveMainloop::AppendDirectLoad) {
             int const cache_len_old = params.mainloop.ptr_kv_cache_seqlens[idx_b];
             int const new_begin = params.mainloop.ptr_cu_seqlens_k_new != nullptr
                                       ? params.mainloop.ptr_cu_seqlens_k_new[idx_b]
@@ -397,7 +396,9 @@ class XeFMHAFwdKernel {
       // 2D block loads in-bounds.
       int kv_seq_extent = CollectiveMainloop::PagedKV ? int(s.seq_len_kv_cache.total_length) : int(seq_len_kv_cache);
       int kv_input_extent = kv_seq_extent;
-      if constexpr (DirectAppendKV) {
+      bool use_direct_append_source = false;
+      if constexpr (CollectiveMainloop::AppendDirectLoad) {
+        use_direct_append_source = true;
         kv_input_extent = int(s.seq_len_kv.total_length);
       }
       // PackGQA folds the head_group_q query heads into M and grids over KV
@@ -411,8 +412,8 @@ class XeFMHAFwdKernel {
       auto shape_O = make_shape(m_extent, s.head_size_vo, q_head_count, batch_dim);
 
       auto dcQ = const_cast<ElementQ*>(p.Q + offset_q);
-      auto dcK = const_cast<ElementK*>(DirectAppendKV ? p.K : p.K_cache);
-      auto dcV = const_cast<ElementV*>(DirectAppendKV ? p.V : p.V_cache);
+      auto dcK = const_cast<ElementK*>(use_direct_append_source ? p.K : p.K_cache);
+      auto dcV = const_cast<ElementV*>(use_direct_append_source ? p.V : p.V_cache);
       auto dcK_cache = const_cast<ElementK*>(p.K_cache + offset_k_cache);
       auto dcV_cache = const_cast<ElementV*>(p.V_cache + offset_v_cache);
       auto dcO = const_cast<ElementO*>(p.O + offset_o);

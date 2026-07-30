@@ -55,6 +55,12 @@ using namespace cute;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+enum class AppendKVMode {
+  kNone,
+  kStore,
+  kStoreAndDirectLoad,
+};
+
 template <
     class DispatchPolicy_,
     bool CausalMask_,
@@ -79,9 +85,7 @@ template <
     // KV position, so per-row masking must use a fixed decode row. Default
     // false keeps prefill (and non-packed decode) unaffected.
     bool PackGQA_ = false,
-    bool AppendKV_ = false,
-    bool DirectAppendKV_ = false,
-    bool WideAppendKV_ = false>
+    AppendKVMode AppendKVMode_ = AppendKVMode::kNone>
 struct FMHAFwdMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -108,9 +112,7 @@ template <
     class TiledCopyV_cache_,
     bool LocalMask_,
     bool PackGQA_,
-    bool AppendKV_,
-    bool DirectAppendKV_,
-    bool WideAppendKV_>
+    AppendKVMode AppendKVMode_>
 struct FMHAFwdMainloop<
     XeDefault<Stages>,
     CausalMask_,
@@ -131,9 +133,7 @@ struct FMHAFwdMainloop<
     TiledCopyV_cache_,
     LocalMask_,
     PackGQA_,
-    AppendKV_,
-    DirectAppendKV_,
-    WideAppendKV_> {
+    AppendKVMode_> {
   //
   // Type Aliases
   //
@@ -211,12 +211,9 @@ struct FMHAFwdMainloop<
   // K/V are dequantized (cast to ElementQ and multiplied by the per-tensor
   // scale) inside the mainloop after the block-2D load.
   static constexpr bool Fp8KV = is_any_of_v<ElementK, float_e5m2_t, float_e4m3_t>;
-  static constexpr bool AppendKV = AppendKV_;
-  static constexpr bool DirectAppendKV = DirectAppendKV_;
-  static constexpr bool WideAppendKV = WideAppendKV_;
-  static_assert(!DirectAppendKV || (AppendKV && PagedKV), "Direct AppendKV requires paged AppendKV");
-  static_assert(
-      !WideAppendKV || (AppendKV && PagedKV && !DirectAppendKV), "Wide AppendKV requires fused paged AppendKV");
+  static constexpr AppendKVMode AppendMode = AppendKVMode_;
+  static constexpr bool AppendKV = AppendMode != AppendKVMode::kNone;
+  static constexpr bool AppendDirectLoad = AppendMode == AppendKVMode::kStoreAndDirectLoad && PagedKV;
 
   // User-facing arguments
   struct Arguments {
@@ -314,6 +311,134 @@ struct FMHAFwdMainloop<
     return get_kv_new_len(params, batch);
   }
 
+  template <int kVecElems, class StoreVec>
+  CUTLASS_DEVICE bool store_kv_new_vectorized(
+      TensorK_cache2D const& K_cache_2D,
+      TensorV_cache2D const& V_cache_2D,
+      int batch,
+      int kv_head,
+      int num_heads_kv,
+      int lane_idx,
+      int sub_group_id,
+      int new_len,
+      int new_begin,
+      int cache_len_old,
+      int head_size_qk,
+      int head_size_vo) const {
+    if (head_size_qk != head_size_vo || (head_size_qk % kVecElems) != 0) {
+      return false;
+    }
+
+    auto& K_dst = const_cast<TensorK_cache2D&>(K_cache_2D);
+    auto& V_dst = const_cast<TensorV_cache2D&>(V_cache_2D);
+    // Large appends are bandwidth-bound, so split tokens across SGs;
+    // small appends keep the old single-SG path to avoid control overhead.
+    constexpr int kMinMultiSgTokens = 64;
+    int const active_sg_count = new_len >= kMinMultiSgTokens ? int(SGPerWG::value) : 1;
+    if (sub_group_id >= active_sg_count) {
+      return true;
+    }
+    int const head_size = head_size_qk;
+    bool const flatten_token_vectors = new_len >= kMinMultiSgTokens && head_size == 64;
+    int const vecs_per_token = head_size / kVecElems;
+    int const worker = sub_group_id * intel::sg_size + lane_idx;
+    int const worker_count = active_sg_count * intel::sg_size;
+    bool single_dst_page = true;
+    int single_row_base = cache_len_old;
+    if constexpr (PagedKV) {
+      int const first_dst_page = cache_len_old / params.page_size;
+      int const last_dst_page = (cache_len_old + new_len - 1) / params.page_size;
+      single_dst_page = first_dst_page == last_dst_page;
+      if (single_dst_page) {
+        int const first_page_token = first_dst_page * params.page_size;
+        int const logical_page = batch * params.max_num_pages_per_seq + first_dst_page;
+        int const phys_page = params.ptr_page_table[logical_page];
+        single_row_base = phys_page * params.page_size + (cache_len_old - first_page_token);
+      }
+    }
+
+    if constexpr (PagedKV) {
+      if (!single_dst_page) {
+        // Cross-page append is common for large k_new; resolve the page
+        // table once per destination page instead of once per token.
+        for (int new_tok0 = 0; new_tok0 < new_len;) {
+          int const dst_tok0 = cache_len_old + new_tok0;
+          int const page = dst_tok0 / params.page_size;
+          int const tok_in_page0 = dst_tok0 - page * params.page_size;
+          int const tokens_in_page = params.page_size - tok_in_page0;
+          int const page_len = tokens_in_page < (new_len - new_tok0) ? tokens_in_page : (new_len - new_tok0);
+          int const logical_page = batch * params.max_num_pages_per_seq + page;
+          int const phys_page = params.ptr_page_table[logical_page];
+          int const row_base = phys_page * params.page_size + tok_in_page0;
+          size_t src_base =
+              ((size_t)(new_begin + new_tok0) * (size_t)num_heads_kv + (size_t)kv_head) * (size_t)head_size;
+          size_t const token_stride = (size_t)num_heads_kv * (size_t)head_size;
+
+          if (flatten_token_vectors) {
+            for (int page_vec = worker; page_vec < page_len * vecs_per_token; page_vec += worker_count) {
+              int const page_tok = page_vec / vecs_per_token;
+              int const d_vec = page_vec - page_tok * vecs_per_token;
+              int const dst_row = row_base + page_tok;
+              size_t const token_src_base = src_base + (size_t)page_tok * token_stride;
+              int const d = d_vec * kVecElems;
+              size_t const src = token_src_base + (size_t)d;
+              StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.ptr_K_new + src);
+              StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.ptr_V_new + src);
+              *reinterpret_cast<StoreVec*>(&K_dst(dst_row, d)) = k_value;
+              *reinterpret_cast<StoreVec*>(&V_dst(d, dst_row)) = v_value;
+            }
+          } else {
+            for (int page_tok = sub_group_id; page_tok < page_len; page_tok += active_sg_count) {
+              int const dst_row = row_base + page_tok;
+              size_t const token_src_base = src_base + (size_t)page_tok * token_stride;
+              for (int d_vec = lane_idx; d_vec < vecs_per_token; d_vec += intel::sg_size) {
+                int const d = d_vec * kVecElems;
+                size_t const src = token_src_base + (size_t)d;
+                StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.ptr_K_new + src);
+                StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.ptr_V_new + src);
+                *reinterpret_cast<StoreVec*>(&K_dst(dst_row, d)) = k_value;
+                *reinterpret_cast<StoreVec*>(&V_dst(d, dst_row)) = v_value;
+              }
+            }
+          }
+          new_tok0 += page_len;
+        }
+        return true;
+      }
+    }
+
+    if (flatten_token_vectors) {
+      for (int new_vec = worker; new_vec < new_len * vecs_per_token; new_vec += worker_count) {
+        int const new_tok = new_vec / vecs_per_token;
+        int const d_vec = new_vec - new_tok * vecs_per_token;
+        int const new_abs_tok = new_begin + new_tok;
+        int const dst_row = single_row_base + new_tok;
+        size_t const src_base = ((size_t)new_abs_tok * (size_t)num_heads_kv + (size_t)kv_head) * (size_t)head_size;
+        int const d = d_vec * kVecElems;
+        size_t const src = src_base + (size_t)d;
+        StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.ptr_K_new + src);
+        StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.ptr_V_new + src);
+        *reinterpret_cast<StoreVec*>(&K_dst(dst_row, d)) = k_value;
+        *reinterpret_cast<StoreVec*>(&V_dst(d, dst_row)) = v_value;
+      }
+    } else {
+      for (int new_tok = sub_group_id; new_tok < new_len; new_tok += active_sg_count) {
+        int const new_abs_tok = new_begin + new_tok;
+        int const dst_row = single_row_base + new_tok;
+        size_t const src_base = ((size_t)new_abs_tok * (size_t)num_heads_kv + (size_t)kv_head) * (size_t)head_size;
+        for (int d_vec = lane_idx; d_vec < vecs_per_token; d_vec += intel::sg_size) {
+          int const d = d_vec * kVecElems;
+          size_t const src = src_base + (size_t)d;
+          StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.ptr_K_new + src);
+          StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.ptr_V_new + src);
+          *reinterpret_cast<StoreVec*>(&K_dst(dst_row, d)) = k_value;
+          *reinterpret_cast<StoreVec*>(&V_dst(d, dst_row)) = v_value;
+        }
+      }
+    }
+    return true;
+  }
+
   CUTLASS_DEVICE
   void store_kv_new(
       TensorK_cache2D const& K_cache_2D,
@@ -353,119 +478,38 @@ struct FMHAFwdMainloop<
       // idempotent and does not rely on a grid-wide producer.
       if constexpr (
           sizeof(typename TensorK_cache::element_type) == 2 && sizeof(typename TensorV_cache::element_type) == 2) {
-        // The q256 HD64 specialization uses 32B vectors to reduce flattened
-        // store index overhead; other paths retain the 16B transaction.
-        constexpr int kVecElems = WideAppendKV ? 16 : 8;
-        using StoreVec = cute::conditional_t<WideAppendKV, cutlass::ulonglong4, cutlass::ulonglong2>;
-        if (head_size_qk == head_size_vo && (head_size_qk % kVecElems) == 0) {
-          // Large appends are bandwidth-bound, so split tokens across SGs;
-          // small appends keep the old single-SG path to avoid control overhead.
-          constexpr int kMinMultiSgTokens = 64;
-          int const active_sg_count = new_len >= kMinMultiSgTokens ? int(SGPerWG::value) : 1;
-          if (sub_group_id >= active_sg_count) {
+        if constexpr (!AppendDirectLoad) {
+          if (store_kv_new_vectorized<16, cutlass::ulonglong4>(
+                  K_cache_2D,
+                  V_cache_2D,
+                  batch,
+                  kv_head,
+                  num_heads_kv,
+                  lane_idx,
+                  sub_group_id,
+                  new_len,
+                  new_begin,
+                  cache_len_old,
+                  head_size_qk,
+                  head_size_vo)) {
             return;
           }
-          int const head_size = head_size_qk;
-          bool const flatten_token_vectors = new_len >= kMinMultiSgTokens && head_size == 64;
-          int const vecs_per_token = head_size / kVecElems;
-          int const worker = sub_group_id * intel::sg_size + lane_idx;
-          int const worker_count = active_sg_count * intel::sg_size;
-          bool single_dst_page = true;
-          int single_row_base = cache_len_old;
-          if constexpr (PagedKV) {
-            int const first_dst_page = cache_len_old / params.page_size;
-            int const last_dst_page = (cache_len_old + new_len - 1) / params.page_size;
-            single_dst_page = first_dst_page == last_dst_page;
-            if (single_dst_page) {
-              int const first_page_token = first_dst_page * params.page_size;
-              int const logical_page = batch * params.max_num_pages_per_seq + first_dst_page;
-              int const phys_page = params.ptr_page_table[logical_page];
-              single_row_base = phys_page * params.page_size + (cache_len_old - first_page_token);
-            }
+        } else {
+          if (store_kv_new_vectorized<8, cutlass::ulonglong2>(
+                  K_cache_2D,
+                  V_cache_2D,
+                  batch,
+                  kv_head,
+                  num_heads_kv,
+                  lane_idx,
+                  sub_group_id,
+                  new_len,
+                  new_begin,
+                  cache_len_old,
+                  head_size_qk,
+                  head_size_vo)) {
+            return;
           }
-
-          if constexpr (PagedKV) {
-            if (!single_dst_page) {
-              // Cross-page append is common for large k_new; resolve the page
-              // table once per destination page instead of once per token.
-              for (int new_tok0 = 0; new_tok0 < new_len;) {
-                int const dst_tok0 = cache_len_old + new_tok0;
-                int const page = dst_tok0 / params.page_size;
-                int const tok_in_page0 = dst_tok0 - page * params.page_size;
-                int const tokens_in_page = params.page_size - tok_in_page0;
-                int const page_len = tokens_in_page < (new_len - new_tok0) ? tokens_in_page : (new_len - new_tok0);
-                int const logical_page = batch * params.max_num_pages_per_seq + page;
-                int const phys_page = params.ptr_page_table[logical_page];
-                int const row_base = phys_page * params.page_size + tok_in_page0;
-                size_t src_base =
-                    ((size_t)(new_begin + new_tok0) * (size_t)num_heads_kv + (size_t)kv_head) * (size_t)head_size;
-                size_t const token_stride = (size_t)num_heads_kv * (size_t)head_size;
-
-                if (flatten_token_vectors) {
-                  for (int page_vec = worker; page_vec < page_len * vecs_per_token; page_vec += worker_count) {
-                    int const page_tok = page_vec / vecs_per_token;
-                    int const d_vec = page_vec - page_tok * vecs_per_token;
-                    int const dst_row = row_base + page_tok;
-                    size_t const token_src_base = src_base + (size_t)page_tok * token_stride;
-                    int const d = d_vec * kVecElems;
-                    size_t const src = token_src_base + (size_t)d;
-                    StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.ptr_K_new + src);
-                    StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.ptr_V_new + src);
-                    *reinterpret_cast<StoreVec*>(&K_dst(dst_row, d)) = k_value;
-                    *reinterpret_cast<StoreVec*>(&V_dst(d, dst_row)) = v_value;
-                  }
-                } else {
-                  for (int page_tok = sub_group_id; page_tok < page_len; page_tok += active_sg_count) {
-                    int const dst_row = row_base + page_tok;
-                    size_t const token_src_base = src_base + (size_t)page_tok * token_stride;
-                    for (int d_vec = lane_idx; d_vec < vecs_per_token; d_vec += intel::sg_size) {
-                      int const d = d_vec * kVecElems;
-                      size_t const src = token_src_base + (size_t)d;
-                      StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.ptr_K_new + src);
-                      StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.ptr_V_new + src);
-                      *reinterpret_cast<StoreVec*>(&K_dst(dst_row, d)) = k_value;
-                      *reinterpret_cast<StoreVec*>(&V_dst(d, dst_row)) = v_value;
-                    }
-                  }
-                }
-                new_tok0 += page_len;
-              }
-              return;
-            }
-          }
-
-          if (flatten_token_vectors) {
-            for (int new_vec = worker; new_vec < new_len * vecs_per_token; new_vec += worker_count) {
-              int const new_tok = new_vec / vecs_per_token;
-              int const d_vec = new_vec - new_tok * vecs_per_token;
-              int const new_abs_tok = new_begin + new_tok;
-              int const dst_row = single_row_base + new_tok;
-              size_t const src_base =
-                  ((size_t)new_abs_tok * (size_t)num_heads_kv + (size_t)kv_head) * (size_t)head_size;
-              int const d = d_vec * kVecElems;
-              size_t const src = src_base + (size_t)d;
-              StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.ptr_K_new + src);
-              StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.ptr_V_new + src);
-              *reinterpret_cast<StoreVec*>(&K_dst(dst_row, d)) = k_value;
-              *reinterpret_cast<StoreVec*>(&V_dst(d, dst_row)) = v_value;
-            }
-          } else {
-            for (int new_tok = sub_group_id; new_tok < new_len; new_tok += active_sg_count) {
-              int const new_abs_tok = new_begin + new_tok;
-              int const dst_row = single_row_base + new_tok;
-              size_t const src_base =
-                  ((size_t)new_abs_tok * (size_t)num_heads_kv + (size_t)kv_head) * (size_t)head_size;
-              for (int d_vec = lane_idx; d_vec < vecs_per_token; d_vec += intel::sg_size) {
-                int const d = d_vec * kVecElems;
-                size_t const src = src_base + (size_t)d;
-                StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.ptr_K_new + src);
-                StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.ptr_V_new + src);
-                *reinterpret_cast<StoreVec*>(&K_dst(dst_row, d)) = k_value;
-                *reinterpret_cast<StoreVec*>(&V_dst(d, dst_row)) = v_value;
-              }
-            }
-          }
-          return;
         }
       }
 
@@ -624,15 +668,15 @@ struct FMHAFwdMainloop<
     if constexpr (AppendKV) {
       store_kv_new(
           K_cache_2D, V_cache_2D, l_coord, kv_head, num_heads_kv, thr_id, append_store_len, append_store_begin);
-      if constexpr (DirectAppendKV) {
+      bool direct_append = false;
+      if constexpr (AppendDirectLoad) {
         constexpr int kTileKV = get<1>(TileShapeQK{});
         int const cache_len_old = params.ptr_kv_cache_seqlens[l_coord];
         int const new_begin = params.ptr_cu_seqlens_k_new != nullptr ? params.ptr_cu_seqlens_k_new[l_coord]
                                                                      : l_coord * params.seq_len_kv_new;
-        if ((cache_len_old % kTileKV) != 0 || (new_begin % kTileKV) != 0) {
-          barrier();
-        }
-      } else {
+        direct_append = (cache_len_old % kTileKV) == 0 && (new_begin % kTileKV) == 0;
+      }
+      if (!direct_append) {
         barrier();
       }
     }
@@ -664,7 +708,7 @@ struct FMHAFwdMainloop<
     bool direct_append = false;
     int direct_block0 = kblocks_total;
     int direct_source_block0 = 0;
-    if constexpr (DirectAppendKV) {
+    if constexpr (AppendDirectLoad) {
       int const cache_len_old = params.ptr_kv_cache_seqlens[l_coord];
       int const new_begin = params.ptr_cu_seqlens_k_new != nullptr ? params.ptr_cu_seqlens_k_new[l_coord]
                                                                    : l_coord * params.seq_len_kv_new;
@@ -834,7 +878,7 @@ struct FMHAFwdMainloop<
 
     int const cache_loop_k1 = direct_append ? cute::min(blk_k1, direct_block0) : blk_k1;
     run_k_blocks(cute::false_type{}, blk_k0, cache_loop_k1);
-    if constexpr (DirectAppendKV) {
+    if constexpr (AppendDirectLoad) {
       if (direct_append) {
         run_k_blocks(cute::true_type{}, cute::max(blk_k0, direct_block0), blk_k1);
       }

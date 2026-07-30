@@ -698,7 +698,6 @@ def build_cache_configs() -> (
     return list(CACHE_CONFIGS)
 
 
-_results = []
 cache_configs = CACHE_CONFIGS
 cache_results = []
 
@@ -764,14 +763,12 @@ QNORM_ROPE_CONFIGS = []
 for _head_dim, _rope_dim in DSV4_HEAD_ROPE_DIM:
     QNORM_ROPE_CONFIGS.extend(
         [
-            (1, 8, _head_dim, _rope_dim, f"dsv4_decode_tp8_h{_head_dim}"),
-            (1, 16, _head_dim, _rope_dim, f"dsv4_decode_tp4_h{_head_dim}"),
-            (1, 32, _head_dim, _rope_dim, f"dsv4_decode_tp2_h{_head_dim}"),
-            (1, 64, _head_dim, _rope_dim, f"dsv4_decode_tp1_h{_head_dim}"),
-            (128, 64, _head_dim, _rope_dim, f"dsv4_prefill_128_h{_head_dim}"),
-            (512, 64, _head_dim, _rope_dim, f"dsv4_prefill_512_h{_head_dim}"),
-            (2048, 64, _head_dim, _rope_dim, f"dsv4_prefill_2048_h{_head_dim}"),
-            (4608, 64, _head_dim, _rope_dim, f"dsv4_prefill_4608_h{_head_dim}"),
+            (1, 8, _head_dim, _rope_dim, f"dsv4_bz8_h{_head_dim}"),
+            (1, 16, _head_dim, _rope_dim, f"dsv4_bz16_h{_head_dim}"),
+            (1, 32, _head_dim, _rope_dim, f"dsv4_bz32_h{_head_dim}"),
+            (1, 64, _head_dim, _rope_dim, f"dsv4_bz64_h{_head_dim}"),
+            (128, 64, _head_dim, _rope_dim, f"dsv4_bz8192_h{_head_dim}"),
+            (512, 64, _head_dim, _rope_dim, f"dsv4_bz32768_h{_head_dim}"),
         ]
     )
 
@@ -1011,13 +1008,12 @@ def native_k_norm_rope_flashmla(
 
 
 FLASHMLA_K_CONFIGS = [
-    (1, "dsv4_k_decode_b1"),
-    (8, "dsv4_k_decode_b8"),
-    (32, "dsv4_k_decode_b32"),
-    (128, "dsv4_k_prefill_128"),
-    (512, "dsv4_k_prefill_512"),
-    (2048, "dsv4_k_prefill_2048"),
-    (4608, "dsv4_k_prefill_4608"),
+    (1, "dsv4_k_bz1"),
+    (8, "dsv4_k_bz8"),
+    (32, "dsv4_k_bz32"),
+    (128, "dsv4_k_bz128"),
+    (512, "dsv4_k_bz512"),
+    (2048, "dsv4_k_bz2048"),
 ]
 k_results = []
 

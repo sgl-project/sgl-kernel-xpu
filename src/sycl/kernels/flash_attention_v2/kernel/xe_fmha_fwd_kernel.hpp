@@ -171,6 +171,10 @@ class XeFMHAFwdKernel {
     // a host-side D2H sync (tensor.item()). Null => non-fp8 KV (scale = 1.0f).
     const float* scale_k_ptr = nullptr;
     const float* scale_v_ptr = nullptr;
+    // Optional softmax LSE output (natural-log log-sum-exp), row-major
+    // (num_heads_q, total_q). Null => don't write.
+    float* softmax_lse = nullptr;
+    int64_t lse_head_stride = 0;  // = total_q
   };
   using KernelParams = KernelArguments;
 
@@ -544,6 +548,18 @@ class XeFMHAFwdKernel {
       if constexpr (CollectiveMainloop::Fp8KV) {
         scale_v = *p.scale_v_ptr;
       }
+      // softmax_lse output coordinates. get<0>(tOgO) inside the epilogue is the
+      // global row within this head/batch O slice, so the query-token base is
+      // just this batch's offset (the epilogue adds the row for non-packed
+      // tiles). For PackGQA decode the single query token maps to lse_q_base and
+      // the row selects the query head within the KV group.
+      int lse_q_base = 0;
+      if constexpr (is_var_len) {
+        lse_q_base = s.seq_len_qo.cumulative_length[idx_b];
+      } else {
+        lse_q_base = idx_b * seq_len_qo;
+      }
+      int lse_head_base = PackGQA_ ? (head * head_group_q) : q_head_idx;
       if constexpr (Sink) {
         if constexpr (PackGQA_) {
           // Packed decode: pass the per-row sink base for this KV head's group
@@ -559,12 +575,47 @@ class XeFMHAFwdKernel {
               scale_v,
               ElementSink{},
               p.sm_sink + head * head_group_q,
-              head_group_q);
+              head_group_q,
+              p.softmax_lse,
+              p.lse_head_stride,
+              lse_q_base,
+              lse_head_base,
+              seq_len_qo);
         } else {
-          epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, scale_v, p.sm_sink[q_head_idx]);
+          epilogue(
+              O(_, _, q_head_idx, l_coord),
+              tArA,
+              tA_max,
+              tA_sum,
+              blk_qv,
+              thr_id,
+              scale_v,
+              p.sm_sink[q_head_idx],
+              nullptr,
+              0,
+              p.softmax_lse,
+              p.lse_head_stride,
+              lse_q_base,
+              lse_head_base,
+              seq_len_qo);
         }
       } else {
-        epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, scale_v);
+        epilogue(
+            O(_, _, q_head_idx, l_coord),
+            tArA,
+            tA_max,
+            tA_sum,
+            blk_qv,
+            thr_id,
+            scale_v,
+            ElementSink{},
+            nullptr,
+            head_group_q,
+            p.softmax_lse,
+            p.lse_head_stride,
+            lse_q_base,
+            lse_head_base,
+            seq_len_qo);
       }
     }
   }
@@ -1116,6 +1167,11 @@ class XeFMHAFwdSplitKVKernel {
     const float* scale_k_ptr = nullptr;
     const float* scale_v_ptr = nullptr;
     int min_blocks_for_split = 2;
+    // Optional softmax LSE output (natural-log log-sum-exp), row-major
+    // (num_heads_q, total_q). Written here only for single-split sequences;
+    // multi-split LSE is produced by ReduceSplitK. Null => don't write.
+    float* softmax_lse = nullptr;
+    int64_t lse_head_stride = 0;  // = total_q
   };
   using KernelParams = KernelArguments;
 
@@ -1244,6 +1300,9 @@ class XeFMHAFwdSplitKVKernel {
 
       int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
       int offset_exp_sums = 0, offset_max_logits = 0;
+      // Query-token index in the (num_heads_q, total_q) softmax_lse output. For
+      // decode seq_len_qo == 1, so each (batch) maps to a single token.
+      int lse_q_base = idx_b;
       if constexpr (is_var_len) {
         auto qo_cumulative = s.seq_len_qo.cumulative_length;
 
@@ -1251,6 +1310,7 @@ class XeFMHAFwdSplitKVKernel {
         offset_o = s.num_heads_q * s.head_size_vo * num_kv_splits * qo_cumulative[idx_b];
         offset_exp_sums = s.num_heads_q * num_kv_splits * qo_cumulative[idx_b];
         offset_max_logits = s.num_heads_q * num_kv_splits * qo_cumulative[idx_b];
+        lse_q_base = qo_cumulative[idx_b];
 
         // for gqa packing, seq_len_qo must be 1
         seq_len_qo = 1;
@@ -1387,7 +1447,11 @@ class XeFMHAFwdSplitKVKernel {
             head_group_q,
             sinks_per_kv,
             num_kv_splits,
-            is_single_split);
+            is_single_split,
+            p.softmax_lse,
+            p.lse_head_stride,
+            lse_q_base,
+            head_q_start);
       } else {
         epilogue(
             O(_, _, head, idx_kv_split, l_coord),
@@ -1403,7 +1467,11 @@ class XeFMHAFwdSplitKVKernel {
             head_group_q,
             sinks,
             num_kv_splits,
-            is_single_split);
+            is_single_split,
+            p.softmax_lse,
+            p.lse_head_stride,
+            lse_q_base,
+            head_q_start);
       }
     }
   }

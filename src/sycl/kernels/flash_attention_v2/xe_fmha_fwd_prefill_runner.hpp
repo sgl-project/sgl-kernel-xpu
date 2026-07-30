@@ -343,6 +343,8 @@ struct PrefillRunner {
             static_cast<const bool*>(params.skip_batch_mask_ptr),
             params.k_scale_ptr,
             params.v_scale_ptr,
+            static_cast<float*>(params.softmax_lse_ptr),
+            static_cast<int64_t>(params.total_q),
         },
         {
             params.softmax_scale,

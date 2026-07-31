@@ -429,6 +429,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "plan_compress_decode(Tensor req_pool_indices, Tensor req_to_token, Tensor full_to_state, "
       "Tensor seq_lens, int compress_ratio, int swa_page_size, int ring_size) -> Tensor");
   m.impl("plan_compress_decode", torch::kXPU, &at::native::xpu::plan_compress_decode);
+
+  m.def(
+      "flash_compress128_decode(Tensor! kv_buffer, Tensor kv_input, Tensor! kv_output, Tensor ape, Tensor plan_d) "
+      "-> ()");
+  m.impl("flash_compress128_decode", torch::kXPU, &at::native::xpu::flash_compress128_decode);
 }
 
 REGISTER_EXTENSION(common_ops)

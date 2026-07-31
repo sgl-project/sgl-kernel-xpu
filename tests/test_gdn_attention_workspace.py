@@ -1,9 +1,10 @@
 """Tests for the optional ``workspace`` argument of the fused GDN attention op
 (Intel Xe2 / BMG): ``torch.ops.sgl_kernel.gdn_attention(..., workspace=...)``.
-
 These tests only check functional correctness of the op's use of the
 ``workspace`` argument; they don't attempt to measure/assert on actual memory usage.
 """
+
+import sys
 
 import pytest
 import sgl_kernel  # noqa: F401  registers torch.ops.sgl_kernel.gdn_attention
@@ -39,23 +40,25 @@ def _padded_tokens(mode, batch_size, num_actual):
 
 
 def _make_workspace(max_padded_tokens, dtype, device, nk=NUM_K_HEADS, nv=NUM_V_HEADS):
-    """Allocate flat 1-D scratch buffers, generously sized for
-    `max_padded_tokens`, matching the ``[q, k, v, b, a, b_prefill,
-    a_prefill]`` order/dtypes ``gdn_backend.py``'s ``forward_fused_gdn``
-    passes to the op."""
+    """Allocate a single flat 1-D ``torch.uint8`` scratch buffer, generously
+    sized to hold whichever set of internal scratch tensors (decode:
+    q/k/v/b/a, or prefill/chunk: q/k/v/b_prefill/a_prefill -- these two sets
+    are mutually exclusive within a single call) the op needs for
+    `max_padded_tokens`. The op itself computes byte offsets for each
+    tensor internally; callers only need to size the buffer generously
+    enough (no fixed internal layout is exposed)."""
     n = max_padded_tokens * _SAFETY_MARGIN
-    qk_numel = n * nk * HEAD_K_DIM
-    v_numel = n * nv * HEAD_V_DIM
-    ba_numel = n * nv
-    return [
-        torch.empty(qk_numel, dtype=dtype, device=device),  # q
-        torch.empty(qk_numel, dtype=dtype, device=device),  # k
-        torch.empty(v_numel, dtype=dtype, device=device),  # v
-        torch.empty(ba_numel, dtype=dtype, device=device),  # b
-        torch.empty(ba_numel, dtype=dtype, device=device),  # a
-        torch.empty(ba_numel, dtype=torch.float32, device=device),  # b_prefill
-        torch.empty(ba_numel, dtype=torch.float32, device=device),  # a_prefill
-    ]
+    itemsize = torch.empty(0, dtype=dtype).element_size()
+    qk_bytes = n * nk * HEAD_K_DIM * itemsize
+    v_bytes = n * nv * HEAD_V_DIM * itemsize
+    ba_bytes = n * nv * itemsize
+    ba_prefill_bytes = n * nv * 4  # b_prefill/a_prefill are always float32
+    decode_bytes = 2 * qk_bytes + v_bytes + 2 * ba_bytes
+    prefill_bytes = 2 * qk_bytes + v_bytes + 2 * ba_prefill_bytes
+    # Generous alignment/rounding slack per carved-out tensor (the op aligns
+    # each to 256 bytes internally) plus overall safety margin.
+    total_bytes = max(decode_bytes, prefill_bytes) + 5 * 256
+    return torch.empty(total_bytes, dtype=torch.uint8, device=device)
 
 
 def _run_op_ws(i, conv_state, ssm_state, state_idx, reorder_input, workspace):
@@ -175,9 +178,35 @@ def test_gdn_attention_workspace_reused_across_varying_shapes(dtype):
     "mode,batch_size,seqlen", [("decode", 4, 1), ("prefill", 2, 128)]
 )
 def test_gdn_attention_workspace_undersized_falls_back(mode, batch_size, seqlen):
-    """A too-small / wrong-dtype / missing workspace entry must be silently
-    ignored for that slot (the op falls back to its original per-call
-    allocation), matching the no-workspace baseline exactly -- not crash or
+    """A too-small workspace buffer must be silently ignored (the op falls
+    back to its original per-call allocation), matching the no-workspace
+    baseline exactly -- not crash or silently corrupt results."""
+    device = torch.device("xpu")
+    dtype = torch.bfloat16
+
+    baseline = _make_inputs(mode, batch_size, seqlen, dtype, device)
+    conv_ref = baseline["conv_state"].clone()
+    ssm_ref = baseline["ssm_state"].clone()
+    _run_op_ws(baseline, conv_ref, ssm_ref, baseline["state_idx"], False, None)
+
+    candidate = _make_inputs(mode, batch_size, seqlen, dtype, device)
+    conv_cand = candidate["conv_state"].clone()
+    ssm_cand = candidate["ssm_state"].clone()
+    # Deliberately far too small to hold even the first scratch tensor.
+    undersized_ws = torch.empty(4, dtype=torch.uint8, device=device)
+    _run_op_ws(
+        candidate, conv_cand, ssm_cand, candidate["state_idx"], False, undersized_ws
+    )
+
+    _assert_matches(candidate, baseline, conv_cand, conv_ref, ssm_cand, ssm_ref)
+
+
+@pytest.mark.parametrize(
+    "mode,batch_size,seqlen", [("decode", 4, 1), ("prefill", 2, 128)]
+)
+def test_gdn_attention_workspace_wrong_dtype_falls_back(mode, batch_size, seqlen):
+    """A workspace buffer that isn't a 1-D ``torch.uint8`` tensor must be
+    silently ignored (falls back to fresh per-call allocation), not crash or
     silently corrupt results."""
     device = torch.device("xpu")
     dtype = torch.bfloat16
@@ -190,18 +219,14 @@ def test_gdn_attention_workspace_undersized_falls_back(mode, batch_size, seqlen)
     candidate = _make_inputs(mode, batch_size, seqlen, dtype, device)
     conv_cand = candidate["conv_state"].clone()
     ssm_cand = candidate["ssm_state"].clone()
-    # Deliberately too small (1 element, q/k/v/a), one slot wrong-dtype (b),
-    # and the trailing two slots omitted entirely (a list shorter than 7).
-    undersized_ws = [
-        torch.empty(1, dtype=dtype, device=device),  # q: too small
-        torch.empty(1, dtype=dtype, device=device),  # k: too small
-        torch.empty(1, dtype=dtype, device=device),  # v: too small
-        torch.empty(1, dtype=torch.float32, device=device),  # b: wrong dtype
-        torch.empty(1, dtype=dtype, device=device),  # a: too small
-        # b_prefill, a_prefill intentionally omitted.
-    ]
+    # Plenty big, but wrong dtype (float32 instead of uint8).
+    wrong_dtype_ws = torch.empty(1 << 20, dtype=torch.float32, device=device)
     _run_op_ws(
-        candidate, conv_cand, ssm_cand, candidate["state_idx"], False, undersized_ws
+        candidate, conv_cand, ssm_cand, candidate["state_idx"], False, wrong_dtype_ws
     )
 
     _assert_matches(candidate, baseline, conv_cand, conv_ref, ssm_cand, ssm_ref)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

@@ -51,10 +51,7 @@ void gdn_attention(
     const int64_t num_actual_tokens,
     const int64_t tp_size,
     const bool reorder_input,
-    // Optional pre-allocated scratch buffers, packed as one fixed-order
-    // list to avoid a long positional-argument list. Order (when present):
-    // [0]=q, [1]=k, [2]=v, [3]=b, [4]=a, [5]=b_prefill, [6]=a_prefill.
-    const std::optional<std::vector<torch::Tensor>>& workspace) {
+    const std::optional<torch::Tensor>& workspace) {  // Optional pre-allocated scratch buffer. See below for details.
   TORCH_CHECK(core_attn_out.is_contiguous(), "core_attn_out must be contiguous");
   TORCH_CHECK(z.is_contiguous(), "z must be contiguous");
   TORCH_CHECK(projected_states_qkvz.is_contiguous(), "projected_states_qkvz must be contiguous");
@@ -212,23 +209,40 @@ void gdn_attention(
   auto dtype = projected_states_qkvz.dtype();
   auto device = projected_states_qkvz.device();
 
+  // Details about `workspace` scratch buffer management:
   // Reuse a caller-provided persistent workspace buffer to reduce allocations.
-  // Falls back to the original allocate-per-call behavior when no workspace is
-  // supplied or it is too small / wrong dtype, so existing callers keep working.
-  auto make_ws_tensor =
-      [&](int64_t ws_idx, std::vector<int64_t> shape, torch::ScalarType st, bool zero_init) -> torch::Tensor {
+  // When provided, it is assumed to be a single flat 1D torch::kUInt8 tensor.
+  // Internal scratch tensors (q/k/v/b/a for decode, or q/k/v/b_prefill/a_prefill
+  // for prefill/chunk) are carved out of it by this function as tightly-packed,
+  // aligned byte sub-ranges computed from their own shapes/dtypes -- callers do
+  // not need to know the internal layout, only the total number of bytes required
+  // (which can grow across calls; too-small or wrong-dtype buffers gracefully
+  // fall back to fresh per-call allocations).
+  constexpr int64_t kWsAlign = 256;
+  bool ws_active = workspace.has_value() && workspace->defined() && workspace->dim() == 1 &&
+                   workspace->scalar_type() == torch::kUInt8 && workspace->is_contiguous();
+  uint8_t* ws_base = ws_active ? reinterpret_cast<uint8_t*>(workspace->data_ptr()) : nullptr;
+  int64_t ws_capacity_bytes = ws_active ? workspace->numel() : 0;
+  int64_t ws_cursor_bytes = 0;
+  auto make_ws_tensor = [&](const std::vector<int64_t>& shape, torch::ScalarType st, bool zero_init) -> torch::Tensor {
     int64_t numel = 1;
     for (auto d : shape)
       numel *= d;
-    if (workspace.has_value() && ws_idx < static_cast<int64_t>(workspace->size())) {
-      const torch::Tensor& ws = workspace->at(ws_idx).view(-1);  // view to 1D to ensure contiguous access
-      if (ws.defined() && ws.scalar_type() == st && ws.numel() >= numel) {
-        auto t = ws.narrow(0, 0, numel).view(shape);
+    auto opts = torch::dtype(st).device(device).requires_grad(false);
+    if (ws_active) {
+      int64_t nbytes = numel * static_cast<int64_t>(c10::elementSize(st));
+      int64_t aligned_offset = (ws_cursor_bytes + kWsAlign - 1) / kWsAlign * kWsAlign;
+      if (aligned_offset + nbytes <= ws_capacity_bytes) {
+        torch::Tensor t = torch::from_blob(ws_base + aligned_offset, shape, opts);
+        ws_cursor_bytes = aligned_offset + nbytes;
         if (zero_init) t.zero_();
         return t;
       }
+      // Once a section fails to fit, stop trying to use the workspace for the
+      // remaining sections in this call too, to avoid a partially-workspace
+      // -backed, hard-to-reason-about layout.
+      ws_active = false;
     }
-    auto opts = torch::dtype(st).device(device).requires_grad(false);
     return zero_init ? torch::zeros(shape, opts) : torch::empty(shape, opts);
   };
   gdn::ActMode act_mode;
@@ -302,60 +316,60 @@ void gdn_attention(
   }
 
   if (non_spec_token > 0) {
-#define NATIVE_LAUNCHER                                                                                          \
-  do {                                                                                                           \
-    auto dtype_st = projected_states_qkvz.scalar_type();                                                         \
-    torch::Tensor q =                                                                                            \
-        make_ws_tensor(0, {non_spec_token, num_k_heads / tp_size, head_k_dim}, dtype_st, /*zero_init=*/false);   \
-    torch::Tensor k =                                                                                            \
-        make_ws_tensor(1, {non_spec_token, num_k_heads / tp_size, head_k_dim}, dtype_st, /*zero_init=*/false);   \
-    torch::Tensor v =                                                                                            \
-        make_ws_tensor(2, {non_spec_token, num_v_heads / tp_size, head_v_dim}, dtype_st, /*zero_init=*/false);   \
-    torch::Tensor b = make_ws_tensor(3, {non_spec_token, num_v_heads / tp_size}, dtype_st, /*zero_init=*/false); \
-    torch::Tensor a = make_ws_tensor(4, {non_spec_token, num_v_heads / tp_size}, dtype_st, /*zero_init=*/false); \
-    gdn::causal_conv1d(                                                                                          \
-        queue,                                                                                                   \
-        q,                                                                                                       \
-        k,                                                                                                       \
-        v,                                                                                                       \
-        z_active,                                                                                                \
-        b,                                                                                                       \
-        a,                                                                                                       \
-        projected_states_qkvz_active,                                                                            \
-        projected_states_ba_active,                                                                              \
-        conv_weights,                                                                                            \
-        conv_bias,                                                                                               \
-        conv_state,                                                                                              \
-        non_spec_query_start_loc,                                                                                \
-        non_spec_token_indx,                                                                                     \
-        non_spec_state_indices_tensor,                                                                           \
-        has_initial_state,                                                                                       \
-        empty_tensor,                                                                                            \
-        act_mode,                                                                                                \
-        pad_slot_id,                                                                                             \
-        num_prefills,                                                                                            \
-        num_decodes,                                                                                             \
-        num_spec_decodes,                                                                                        \
-        reorder_input);                                                                                          \
-    gdn::gated_delta_rule(                                                                                       \
-        queue,                                                                                                   \
-        core_attn_out_active,                                                                                    \
-        q,                                                                                                       \
-        k,                                                                                                       \
-        v,                                                                                                       \
-        b,                                                                                                       \
-        a,                                                                                                       \
-        A_log,                                                                                                   \
-        dt_bias,                                                                                                 \
-        ssm_state,                                                                                               \
-        non_spec_query_start_loc,                                                                                \
-        non_spec_token_indx,                                                                                     \
-        non_spec_state_indices_tensor,                                                                           \
-        has_initial_state,                                                                                       \
-        empty_tensor,                                                                                            \
-        num_prefills,                                                                                            \
-        num_decodes,                                                                                             \
-        num_spec_decodes);                                                                                       \
+#define NATIVE_LAUNCHER                                                                                       \
+  do {                                                                                                        \
+    auto dtype_st = projected_states_qkvz.scalar_type();                                                      \
+    torch::Tensor q =                                                                                         \
+        make_ws_tensor({non_spec_token, num_k_heads / tp_size, head_k_dim}, dtype_st, /*zero_init=*/false);   \
+    torch::Tensor k =                                                                                         \
+        make_ws_tensor({non_spec_token, num_k_heads / tp_size, head_k_dim}, dtype_st, /*zero_init=*/false);   \
+    torch::Tensor v =                                                                                         \
+        make_ws_tensor({non_spec_token, num_v_heads / tp_size, head_v_dim}, dtype_st, /*zero_init=*/false);   \
+    torch::Tensor b = make_ws_tensor({non_spec_token, num_v_heads / tp_size}, dtype_st, /*zero_init=*/false); \
+    torch::Tensor a = make_ws_tensor({non_spec_token, num_v_heads / tp_size}, dtype_st, /*zero_init=*/false); \
+    gdn::causal_conv1d(                                                                                       \
+        queue,                                                                                                \
+        q,                                                                                                    \
+        k,                                                                                                    \
+        v,                                                                                                    \
+        z_active,                                                                                             \
+        b,                                                                                                    \
+        a,                                                                                                    \
+        projected_states_qkvz_active,                                                                         \
+        projected_states_ba_active,                                                                           \
+        conv_weights,                                                                                         \
+        conv_bias,                                                                                            \
+        conv_state,                                                                                           \
+        non_spec_query_start_loc,                                                                             \
+        non_spec_token_indx,                                                                                  \
+        non_spec_state_indices_tensor,                                                                        \
+        has_initial_state,                                                                                    \
+        empty_tensor,                                                                                         \
+        act_mode,                                                                                             \
+        pad_slot_id,                                                                                          \
+        num_prefills,                                                                                         \
+        num_decodes,                                                                                          \
+        num_spec_decodes,                                                                                     \
+        reorder_input);                                                                                       \
+    gdn::gated_delta_rule(                                                                                    \
+        queue,                                                                                                \
+        core_attn_out_active,                                                                                 \
+        q,                                                                                                    \
+        k,                                                                                                    \
+        v,                                                                                                    \
+        b,                                                                                                    \
+        a,                                                                                                    \
+        A_log,                                                                                                \
+        dt_bias,                                                                                              \
+        ssm_state,                                                                                            \
+        non_spec_query_start_loc,                                                                             \
+        non_spec_token_indx,                                                                                  \
+        non_spec_state_indices_tensor,                                                                        \
+        has_initial_state,                                                                                    \
+        empty_tensor,                                                                                         \
+        num_prefills,                                                                                         \
+        num_decodes,                                                                                          \
+        num_spec_decodes);                                                                                    \
   } while (0)
 
     // XE2 chunk path handles all non-spec tokens whenever there are prefills,
@@ -372,27 +386,22 @@ void gdn_attention(
 
       auto dtype_st = projected_states_qkvz.scalar_type();
       torch::Tensor q = make_ws_tensor(
-          0,
           {non_spec_token + padding_size, num_k_heads / tp_size, head_k_dim},
           dtype_st,
           /*zero_init=*/true);
       torch::Tensor k = make_ws_tensor(
-          1,
           {non_spec_token + padding_size, num_k_heads / tp_size, head_k_dim},
           dtype_st,
           /*zero_init=*/true);
       torch::Tensor v = make_ws_tensor(
-          2,
           {non_spec_token + padding_size, num_v_heads / tp_size, head_v_dim},
           dtype_st,
           /*zero_init=*/true);
       torch::Tensor b = make_ws_tensor(
-          5,
           {num_v_heads / tp_size, non_spec_token + padding_size},
           torch::kFloat32,
           /*zero_init=*/true);
       torch::Tensor a = make_ws_tensor(
-          6,
           {num_v_heads / tp_size, non_spec_token + padding_size},
           torch::kFloat32,
           /*zero_init=*/true);

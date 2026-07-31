@@ -63,6 +63,7 @@ struct TopPRenormProbsSingleCTA {
     // Fast path: p >= 1.0 keeps every element, so just renormalize.
     if (p >= 1.0f) {
       float thread_sum = 0.0f;
+#pragma unroll 2
       for (uint32_t i = tid; i < num_vec_elems; i += kWgSize) {
         vec_io v;
         v.load(
@@ -78,8 +79,9 @@ struct TopPRenormProbsSingleCTA {
       }
 
       const float row_sum = sycl::reduce_over_group(grp, thread_sum, sycl::plus<float>());
-      const float normalizer = (row_sum <= 1e-8f) ? 1.0f : 1.0f / row_sum;
+      const float normalizer = (row_sum <= 1e-8f) ? 1.0f : sycl::native::recip(row_sum);
 
+#pragma unroll 2
       for (uint32_t i = tid; i < num_vec_elems; i += kWgSize) {
         vec_io v;
         v.load(
@@ -124,6 +126,7 @@ struct TopPRenormProbsSingleCTA {
       float thr_min_gt_low = static_cast<float>(high);
       float thr_max_le_high = static_cast<float>(low);
 
+#pragma unroll 2
       for (uint32_t i = tid; i < num_vec_elems; i += kWgSize) {
         vec_io v;
         v.load(
@@ -158,22 +161,20 @@ struct TopPRenormProbsSingleCTA {
       //          and shrink the upper bound to the largest prob ≤ high (which is still ≥ pivot_1).
       // case C:  f(pivot_0) < p, so the pivot is too high; shrink the upper bound to pivot_0,
       //          and shrink the lower bound to the smallest prob > low (which is still ≤ pivot_0).
-      if (agg1 >= p) {
-        low = pivot_1;
-        sum_low = agg1;
-      } else if (agg0 >= p) {
-        low = pivot_0;
-        const double mlh = static_cast<double>(max_le_high);
-        high = (pivot_1 < mlh) ? pivot_1 : mlh;
-        sum_low = agg0;
-      } else {
-        const double mlh = static_cast<double>(max_le_high);
-        high = (pivot_0 < mlh) ? pivot_0 : mlh;
-      }
-    } while (min_gt_low != max_le_high);
+      const bool keep1 = agg1 >= p;  // case A
+      const bool keep0 = agg0 >= p;  // case A or B
+      const double mlh = static_cast<double>(max_le_high);
+      const double hi_shrink_src = keep0 ? pivot_1 : pivot_0;
+      const double hi_shrunk = (hi_shrink_src < mlh) ? hi_shrink_src : mlh;
 
-    const float normalizer = 1.0f / ((sum_low > 1e-8f) ? sum_low : 1e-8f);
+      low = keep1 ? pivot_1 : (keep0 ? pivot_0 : low);
+      high = keep1 ? high : hi_shrunk;
+      sum_low = keep1 ? agg1 : (keep0 ? agg0 : sum_low);
+    } while (min_gt_low < max_le_high && sycl::nextafter(min_gt_low, max_le_high) < max_le_high);
 
+    const float normalizer = sycl::native::recip((sum_low > 1e-8f) ? sum_low : 1e-8f);
+
+#pragma unroll 2
     for (uint32_t i = tid; i < num_vec_elems; i += kWgSize) {
       vec_io v;
       v.load(

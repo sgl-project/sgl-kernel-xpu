@@ -258,10 +258,13 @@ struct MainKernel {
                       hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
                       output_token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
     } else {
-      // Plain row-major scale layout. Supports float scales (non-UE8M0) and, when
-      // instantiated with scale_packed_t=uint8_t, the UE8M0 byte written
-      // contiguously at the group index -- a plain [tokens, K/group] uint8 scale.
-      scale_output = reinterpret_cast<scale_element_t*>(output_s) + offset_num_groups;
+      // Row-major: scale_packed_t is instantiated to scale_element_t
+      // (uint8_t for UE8M0, float otherwise), so this is a plain
+      // one-element-per-group index -- no reinterpret needed. This is the
+      // plain [tokens, K/group] uint8 UE8M0 scale consumed directly by e.g.
+      // torch._scaled_mm BlockWise1x32.
+      static_assert(std::is_same_v<scale_packed_t, scale_element_t>);
+      scale_output = output_s + offset_num_groups;
     }
 
     // TMA alignment padding for column-major mode
@@ -953,37 +956,36 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_8bit_v2(
             SUB_GROUP_SIZE_SEL,                                                                            \
             VEC_NUM_BYTES_SEL);                                                                            \
       }                                                                                                    \
+    } else if (scale_ue8m0) {                                                                              \
+      /* Plain row-major UE8M0: output_s is uint8 [tokens, K/group]; override */                           \
+      /* scale_packed_t=uint8_t so storage type matches the tensor. */                                     \
+      LAUNCH_KERNEL_INNER(                                                                                 \
+          NaiveScheduler,                                                                                  \
+          GROUP_SIZE,                                                                                      \
+          THREADS_PER_SUBWARP,                                                                             \
+          T,                                                                                               \
+          DST_DTYPE,                                                                                       \
+          uint8_t,                                                                                         \
+          false,                                                                                           \
+          true,                                                                                            \
+          false,                                                                                           \
+          uint8_t,                                                                                         \
+          SUB_GROUP_SIZE_SEL,                                                                              \
+          VEC_NUM_BYTES_SEL);                                                                              \
     } else {                                                                                               \
-      if (scale_ue8m0) {                                                                                   \
-        /* Plain row-major UE8M0: output_s is uint8 [tokens, K/group] */                                   \
-        LAUNCH_KERNEL_INNER(                                                                               \
-            NaiveScheduler,                                                                                \
-            GROUP_SIZE,                                                                                    \
-            THREADS_PER_SUBWARP,                                                                           \
-            T,                                                                                             \
-            DST_DTYPE,                                                                                     \
-            uint8_t,                                                                                       \
-            false,                                                                                         \
-            true,                                                                                          \
-            false,                                                                                         \
-            uint8_t,                                                                                       \
-            SUB_GROUP_SIZE_SEL,                                                                            \
-            VEC_NUM_BYTES_SEL);                                                                            \
-      } else {                                                                                             \
-        LAUNCH_KERNEL_INNER(                                                                               \
-            NaiveScheduler,                                                                                \
-            GROUP_SIZE,                                                                                    \
-            THREADS_PER_SUBWARP,                                                                           \
-            T,                                                                                             \
-            DST_DTYPE,                                                                                     \
-            float,                                                                                         \
-            false,                                                                                         \
-            false,                                                                                         \
-            false,                                                                                         \
-            float,                                                                                         \
-            SUB_GROUP_SIZE_SEL,                                                                            \
-            VEC_NUM_BYTES_SEL);                                                                            \
-      }                                                                                                    \
+      LAUNCH_KERNEL_INNER(                                                                                 \
+          NaiveScheduler,                                                                                  \
+          GROUP_SIZE,                                                                                      \
+          THREADS_PER_SUBWARP,                                                                             \
+          T,                                                                                               \
+          DST_DTYPE,                                                                                       \
+          float,                                                                                           \
+          false,                                                                                           \
+          false,                                                                                           \
+          false,                                                                                           \
+          float,                                                                                           \
+          SUB_GROUP_SIZE_SEL,                                                                              \
+          VEC_NUM_BYTES_SEL);                                                                              \
     }                                                                                                      \
   } while (0)
 

@@ -232,21 +232,32 @@ def test_moe_gemm(
         gemm1_limit=gemm1_limit,
         routed_scaling_factor=routed_scaling_factor,
     )
+
+    device = "xpu"
+    a_xpu = a.clone().to(device)
+    w1_xpu = w1.clone().to(device)
+    w2_xpu = w2.clone().to(device)
+    topk_weight_xpu = topk_weight.clone().to(device)
+    topk_ids_xpu = topk_ids.clone().to(device)
+    b1_xpu = b1.clone().to(device) if with_bias else None
+    b2_xpu = b2.clone().to(device) if with_bias else None
+
     sglang_output = fused_experts(
-        a,
-        w1,
-        w2,
-        topk_weight,
-        topk_ids,
-        b1,
-        b2,
+        a_xpu,
+        w1_xpu,
+        w2_xpu,
+        topk_weight_xpu,
+        topk_ids_xpu,
+        b1_xpu,
+        b2_xpu,
         activation=act_type,
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
         routed_scaling_factor=routed_scaling_factor,
     )
-
-    torch.testing.assert_close(torch_output, sglang_output, rtol=rtol, atol=atol)
+    torch.testing.assert_close(
+        torch_output, sglang_output.to("cpu"), rtol=rtol, atol=atol
+    )
 
 
 # ---------------------------------------------------------------------------

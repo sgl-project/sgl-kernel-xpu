@@ -443,14 +443,16 @@ def test_gemma_norm_3d_non_flattenable(
 ###############################################################################
 # 4D tensor tests for gemma_rmsnorm
 ###############################################################################
-'''
+
 
 def _make_non_flattenable_4d(num_tokens, num_heads, head_dim, dtype, extra_heads=4):
     """Create a 4D tensor [1, tokens, heads, head_dim] whose row strides are
     not flattenable by a single outer stride.
     """
     total_heads = num_heads + extra_heads
-    full = torch.randn(1, num_tokens, total_heads * head_dim, device=device, dtype=dtype)
+    full = torch.randn(
+        1, num_tokens, total_heads * head_dim, device=device, dtype=dtype
+    )
     q_flat = full[:, :, : num_heads * head_dim]
     q_4d = q_flat.unflatten(-1, (num_heads, head_dim))
     assert q_4d.size(0) == 1
@@ -505,7 +507,7 @@ def test_gemma_norm_4d_invalid_leading_dim_size_raises():
 
     with pytest.raises(RuntimeError, match="leading dimension 0 must have size 1"):
         sgl_kernel.gemma_rmsnorm(x, w)
-'''
+
 
 ###############################################################################
 # Mixed input/weight dtype tests

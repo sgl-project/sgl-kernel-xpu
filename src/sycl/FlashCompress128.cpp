@@ -12,7 +12,9 @@ namespace at::native::xpu {
 
 constexpr int64_t kTileDim = 64;
 constexpr int64_t kTokenGroups = 8;
-constexpr int64_t kTokensPerGroup = 128 / kTokenGroups;  // 16
+constexpr int64_t kTokensPerGroup = 128 / kTokenGroups;                          // 16
+constexpr uint32_t kBlockSize = static_cast<uint32_t>(kTileDim * kTokenGroups);  // 512
+constexpr uint32_t kWriteBlockSize = 64;
 
 namespace FlashCompress128Impl {
 
@@ -307,9 +309,8 @@ void flash_compress128_decode(
             page_elem_size,
             num_split,
             shared};
-        constexpr uint32_t kLocalSize = static_cast<uint32_t>(kTileDim * kTokenGroups);  // 512
-        const uint32_t global_size = static_cast<uint32_t>(batch_size) * num_split * kLocalSize;
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kLocalSize)), kernel);
+        const uint32_t global_size = static_cast<uint32_t>(batch_size) * num_split * kBlockSize;
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kBlockSize)), kernel);
       });
     });
   });
@@ -385,9 +386,8 @@ void flash_compress128_prefill(
               page_elem_size,
               num_split,
               shared};
-          constexpr uint32_t kLocalSizeCompress = static_cast<uint32_t>(kTileDim * kTokenGroups);  // 512
-          const uint32_t global_size = static_cast<uint32_t>(num_compress) * num_split * kLocalSizeCompress;
-          cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kLocalSizeCompress)), kernel);
+          const uint32_t global_size = static_cast<uint32_t>(num_compress) * num_split * kBlockSize;
+          cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kBlockSize)), kernel);
         });
       }
 
@@ -401,9 +401,8 @@ void flash_compress128_prefill(
               head_dim,
               elem_size,
               num_split};
-          constexpr uint32_t kLocalSize = 64;
-          const uint32_t global_size = static_cast<uint32_t>(num_write) * num_split * kLocalSize;
-          cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kLocalSize)), kernel);
+          const uint32_t global_size = static_cast<uint32_t>(num_write) * num_split * kWriteBlockSize;
+          cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kWriteBlockSize)), kernel);
         });
       }
     });

@@ -12,6 +12,7 @@ namespace at::native::xpu {
 
 constexpr int64_t kTileDim = 64;  // kTileElements (4) * kWarpThreads (16)
 constexpr int64_t kTileElements = 4;
+constexpr uint32_t kWarpThreads = 16;
 
 namespace FlashCompress4Impl {
 
@@ -19,97 +20,86 @@ template <typename buffer_t, typename input_t, typename out_t>
 struct FlashCompress4DecodeKernel {
   [[sycl::reqd_sub_group_size(16)]]
   void operator()(sycl::nd_item<1> item) const {
-    const uint32_t gid = static_cast<uint32_t>(item.get_group(0));
-    const uint32_t lid = static_cast<uint32_t>(item.get_local_id(0));
+    const uint32_t global_tid = static_cast<uint32_t>(item.get_global_id(0));
+    const uint32_t local_tid = static_cast<uint32_t>(item.get_local_id(0));
 
-    // Compute global warp id: group_id*4 + local_warp_id (since local_size=64 = 4 warps)
-    const uint32_t global_wid = gid * 4U + (lid / 16U);
-    const uint32_t bid = global_wid / num_split_;
-    const uint32_t split_id = global_wid % num_split_;
-    const int64_t split_offset = static_cast<int64_t>(split_id) * kTileDim;
-    const uint32_t tid_in_warp = lid % 16U;
+    const uint32_t global_wid = global_tid / kWarpThreads;  // warp id
+    const uint32_t global_bid = global_wid / num_split_;    // batch id
+    const uint32_t global_sid = global_wid % num_split_;    // split id
+    const int64_t split_offset = static_cast<int64_t>(global_sid) * kTileDim;
+    const uint32_t lane_id = local_tid % kWarpThreads;
 
-    if (bid >= batch_size_) {
+    if (global_bid >= batch_size_) {
       return;
     }
 
-    const DecodePlan plan = plan_d_[bid];
+    const DecodePlan plan = plan_d_[global_bid];
     if (plan.seq_len == 0 || plan.write_loc < 0) {
       return;
     }
 
-    // Write current token to buffer
+    // Decode path: write the current token to page buffer first.
     const int64_t write_loc = static_cast<int64_t>(plan.write_loc);
     buffer_t* kv_dst = kv_buffer_ + write_loc * elem_size_;
-    const input_t* kv_src = kv_input_ + static_cast<int64_t>(bid) * elem_size_;
+    const input_t* kv_src = kv_input_ + static_cast<int64_t>(global_bid) * elem_size_;
 
-    // Each thread processes 4 consecutive head_dim positions
+    // One warp handles one split; each lane processes strided head_dim elements.
     for (int32_t i = 0; i < kTileElements; ++i) {
-      const int64_t h = split_offset + i * 16 + tid_in_warp;
-      if (h < head_dim_) {
-        // Write all 4 * head_dim elements (kv + score pairs for 4 positions)
-        for (int64_t j = 0; j < 4; ++j) {
-          kv_dst[j * head_dim_ + h] = static_cast<buffer_t>(kv_src[j * head_dim_ + h]);
-        }
+      const int64_t h = split_offset + static_cast<int64_t>(i) * kWarpThreads + lane_id;
+      for (int64_t j = 0; j < 4; ++j) {
+        kv_dst[j * head_dim_ + h] = static_cast<buffer_t>(kv_src[j * head_dim_ + h]);
       }
     }
 
-    item.barrier(sycl::access::fence_space::global_and_local);
-
-    // Compress only when a 4-token chunk is completed (every 4 tokens).
+    // Compress only when we close a 4-token chunk.
     if (plan.seq_len % 4 != 0) {
       return;
     }
 
-    // Buffer row layout per token: | kv_overlap(head_dim) | kv(head_dim) | score_overlap(head_dim) | score(head_dim) |
-    // row stride = elem_size_ = 4 * head_dim_
-    // Overlap positions (t=0..3): from kv_buf_0, kv_overlap at [row+0], score_overlap at [row+2*head_dim]
-    // Fresh positions  (t=4..7): from kv_buf_1, kv at [row+head_dim], score at [row+3*head_dim]
+    // Buffer row layout:
+    // [kv_overlap | kv | score_overlap | score], row stride = elem_size_.
+    // t in [0, 3] reads overlap terms from kv_buf_0; t in [4, 7] reads fresh terms from kv_buf_1.
     const bool need_overlap = plan.seq_len > 4;
     const buffer_t* kv_buf_0 = kv_buffer_ + static_cast<int64_t>(plan.read_page_0) * page_elem_size_;
     const buffer_t* kv_buf_1 = kv_buffer_ + static_cast<int64_t>(plan.read_page_1) * page_elem_size_;
-    out_t* out_row = kv_output_ + static_cast<int64_t>(bid) * head_dim_;
+    out_t* kv_out = kv_output_ + static_cast<int64_t>(global_bid) * head_dim_;
 
     for (int32_t i = 0; i < kTileElements; ++i) {
-      const int64_t h = split_offset + static_cast<int64_t>(i) * 16 + tid_in_warp;
-      if (h >= head_dim_) {
-        continue;
+      const int64_t h = split_offset + static_cast<int64_t>(i) * kWarpThreads + lane_id;
+
+      // Load all 8 tokens into registers (overlap [0,3] from kv_buf_0, fresh [4,7] from kv_buf_1).
+      float kv_reg[8];
+      float score_reg[8];
+      for (int32_t t = 0; t < 4; ++t) {
+        const int64_t row_off = static_cast<int64_t>(t) * elem_size_;
+        kv_reg[t] = need_overlap ? static_cast<float>(kv_buf_0[row_off + h]) : 0.0f;
+        score_reg[t] = (need_overlap ? static_cast<float>(kv_buf_0[row_off + 2 * head_dim_ + h])
+                                     : -std::numeric_limits<float>::infinity()) +
+                       static_cast<float>(ape_[static_cast<int64_t>(t) * head_dim_ + h]);
+      }
+      for (int32_t t = 0; t < 4; ++t) {
+        const int64_t row_off = static_cast<int64_t>(t) * elem_size_;
+        kv_reg[t + 4] = static_cast<float>(kv_buf_1[row_off + head_dim_ + h]);
+        score_reg[t + 4] = static_cast<float>(kv_buf_1[row_off + 3 * head_dim_ + h]) +
+                           static_cast<float>(ape_[static_cast<int64_t>(t + 4) * head_dim_ + h]);
       }
 
-      // First pass: max score
-      float max_score = -std::numeric_limits<float>::infinity();
-      for (int64_t t = 0; t < 8; ++t) {
-        const int64_t row_off = (t % 4) * elem_size_;
-        float score_val;
-        if (t < 4) {
-          score_val = need_overlap ? static_cast<float>(kv_buf_0[row_off + 2 * head_dim_ + h])
-                                   : -std::numeric_limits<float>::infinity();
-        } else {
-          score_val = static_cast<float>(kv_buf_1[row_off + 3 * head_dim_ + h]);
-        }
-        max_score = sycl::fmax(max_score, score_val + static_cast<float>(ape_[t * head_dim_ + h]));
+      // Pass 1: max score.
+      float max_score = score_reg[0];
+      for (int32_t t = 1; t < 8; ++t) {
+        max_score = sycl::fmax(max_score, score_reg[t]);
       }
 
-      // Second pass: weighted sum
+      // Pass 2: weighted kv reduction.
       float exp_sum = 0.0f;
       float weighted_sum = 0.0f;
-      for (int64_t t = 0; t < 8; ++t) {
-        const int64_t row_off = (t % 4) * elem_size_;
-        float kv_val, score_val;
-        if (t < 4) {
-          kv_val = need_overlap ? static_cast<float>(kv_buf_0[row_off + h]) : 0.0f;
-          score_val = need_overlap ? static_cast<float>(kv_buf_0[row_off + 2 * head_dim_ + h])
-                                   : -std::numeric_limits<float>::infinity();
-        } else {
-          kv_val = static_cast<float>(kv_buf_1[row_off + head_dim_ + h]);
-          score_val = static_cast<float>(kv_buf_1[row_off + 3 * head_dim_ + h]);
-        }
-        const float w = sycl::exp(score_val + static_cast<float>(ape_[t * head_dim_ + h]) - max_score);
+      for (int32_t t = 0; t < 8; ++t) {
+        const float w = sycl::exp(score_reg[t] - max_score);
         exp_sum += w;
-        weighted_sum += kv_val * w;
+        weighted_sum += kv_reg[t] * w;
       }
 
-      out_row[h] = static_cast<out_t>(weighted_sum / exp_sum);
+      kv_out[h] = static_cast<out_t>(weighted_sum / exp_sum);
     }
   }
 
@@ -148,6 +138,7 @@ void flash_compress4_decode(
   const int64_t batch_size = kv_input.size(0);
   const int64_t elem_size = kv_input.size(1);
   const int64_t head_dim = kv_output.size(1);
+  TORCH_CHECK(head_dim % kTileDim == 0, "flash_compress4_decode requires head_dim divisible by ", kTileDim);
   TORCH_CHECK(elem_size == 4 * head_dim, "kv_input last dim must be 4 * head_dim");
   TORCH_CHECK(
       kv_buffer.size(1) == 4 && kv_buffer.size(2) == elem_size, "kv_buffer shape must be [num_pages, 4, 4*head_dim]");
@@ -161,8 +152,8 @@ void flash_compress4_decode(
     return;
   }
 
-  const int64_t page_elem_size = 4 * elem_size;  // 4 positions * 4 * head_dim
-  const uint32_t num_split = static_cast<uint32_t>((head_dim + kTileDim - 1) / kTileDim);
+  const int64_t page_elem_size = 4 * elem_size;
+  const uint32_t num_split = static_cast<uint32_t>(head_dim / kTileDim);
   auto queue = c10::xpu::getCurrentXPUStream().queue();
 
   SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, kv_input.scalar_type(), "FlashCompress4Decode", [&]() {
@@ -181,8 +172,11 @@ void flash_compress4_decode(
             elem_size,
             page_elem_size,
             num_split};
-        constexpr uint32_t kLocalSize = 64;  // 4 sub_groups, each handling 1 warp's work
-        const uint32_t global_size = static_cast<uint32_t>(batch_size) * num_split * 16;
+        constexpr uint32_t kWarpsPerGroup = 4;
+        constexpr uint32_t kLocalSize = kWarpsPerGroup * kWarpThreads;
+        const uint32_t num_warps = static_cast<uint32_t>(batch_size) * num_split;
+        const uint32_t num_groups = (num_warps + kWarpsPerGroup - 1) / kWarpsPerGroup;
+        const uint32_t global_size = num_groups * kLocalSize;
         cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kLocalSize)), kernel);
       });
     });

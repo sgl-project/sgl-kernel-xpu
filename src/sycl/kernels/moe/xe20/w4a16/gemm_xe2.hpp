@@ -37,6 +37,7 @@
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <sycl/sycl.hpp>
 
+#include "../common/block_2d_copy_d.hpp"
 #include "cutlass/kernel_hardware_info.h"
 #include "cutlass/platform/platform.h"
 #include "cutlass/tensor_ref.h"
@@ -112,7 +113,7 @@ CUTE_DEVICE void xe_gemm(
 
   auto copy_a = get_block_2d_copy_A<GmemTiledCopyA>(mma, A);
   auto copy_b = get_block_2d_copy_B<GmemTiledCopyB>(mma, B);
-  auto copy_c = get_block_2d_copy_D<GmemTiledCopyC>(mma, C);
+  auto copy_c = moe_xe20::make_moe_block_2d_copy_D<GmemTiledCopyC>(mma, C);
 
   auto thr_mma = mma.get_slice(local_id);
   auto thr_copy_a = copy_a.get_slice(local_id);
@@ -265,7 +266,7 @@ CUTE_DEVICE void xe_gemm_4bits(
 
   auto copy_a = get_block_2d_copy_A<GmemTiledCopyA>(mma, A);
   auto copy_b = get_block_2d_copy_B<GmemTiledCopyB>(mma, B);
-  auto copy_c = get_block_2d_copy_D<GmemTiledCopyC>(mma, C);
+  auto copy_c = moe_xe20::make_moe_block_2d_copy_D<GmemTiledCopyC>(mma, C);
 
   auto thr_mma = mma.get_slice(local_id);
   auto thr_copy_a = copy_a.get_slice(local_id);

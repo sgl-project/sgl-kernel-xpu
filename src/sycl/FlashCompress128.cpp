@@ -34,54 +34,86 @@ struct FlashCompress128DecodeKernel {
       return;
     }
 
-    const int64_t write_loc = static_cast<int64_t>(plan.write_loc);
-    buffer_t* kv_dst = kv_buffer_ + write_loc * elem_size_;
-    const input_t* kv_src = kv_input_ + static_cast<int64_t>(bid) * elem_size_;
+    // lid decomposition: tg = token group (0..7), h_lane = column within split (0..63)
+    const int64_t h_lane = static_cast<int64_t>(lid % static_cast<uint32_t>(kTileDim));
+    const int64_t tg = static_cast<int64_t>(lid / static_cast<uint32_t>(kTileDim));
+    const int64_t h = split_offset + h_lane;
 
-    const int64_t h = split_offset + static_cast<int64_t>(lid);
-    if (h < head_dim_) {
+    // Only tg=0 writes: all tg groups share the same h columns, avoid duplicate stores.
+    if (tg == 0 && h < head_dim_) {
+      buffer_t* kv_dst = kv_buffer_ + static_cast<int64_t>(plan.write_loc) * elem_size_;
+      const input_t* kv_src = kv_input_ + static_cast<int64_t>(bid) * elem_size_;
       kv_dst[h] = static_cast<buffer_t>(kv_src[h]);
       kv_dst[head_dim_ + h] = static_cast<buffer_t>(kv_src[head_dim_ + h]);
     }
 
     // Compress only when a 128-token chunk is completed.
-    if ((plan.write_loc % 128) != 127) {
+    if (plan.seq_len % 128 != 0) {
       return;
     }
 
     item.barrier(sycl::access::fence_space::global_and_local);
 
-    // Last split may be partial when head_dim is not divisible by kTileDim.
-    if (h >= head_dim_) {
-      return;
+    const buffer_t* kv_page = kv_buffer_ + static_cast<int64_t>(plan.read_page_1) * page_elem_size_;
+    const int64_t t_start = tg * kTokensPerGroup;
+
+    // Load all kTokensPerGroup tokens into registers.
+    float kv_reg[kTokensPerGroup];
+    float score_reg[kTokensPerGroup];
+    for (int64_t i = 0; i < kTokensPerGroup; ++i) {
+      const int64_t t = t_start + i;
+      const buffer_t* row_ptr = kv_page + t * elem_size_;
+      kv_reg[i] = static_cast<float>(row_ptr[h]);
+      score_reg[i] = static_cast<float>(row_ptr[head_dim_ + h]) + static_cast<float>(ape_[t * head_dim_ + h]);
     }
 
-    const int64_t page = static_cast<int64_t>(plan.read_page_1);
-    const buffer_t* kv_page = kv_buffer_ + page * page_elem_size_;
-    out_t* out_row = kv_output_ + static_cast<int64_t>(bid) * head_dim_;
-
-    // Numerically stable softmax: first pass computes max(logits).
-    float max_score = -std::numeric_limits<float>::infinity();
-    for (int64_t t = 0; t < 128; ++t) {
-      const int64_t row_off = t * elem_size_;
-      const float score =
-          static_cast<float>(kv_page[row_off + head_dim_ + h]) + static_cast<float>(ape_[t * head_dim_ + h]);
-      max_score = sycl::fmax(max_score, score);
+    // Pass 1: compute local max over kTokensPerGroup scores.
+    float local_max = score_reg[0];
+    for (int64_t i = 1; i < kTokensPerGroup; ++i) {
+      local_max = sycl::fmax(local_max, score_reg[i]);
     }
 
-    // Second pass computes exp-sum and weighted value sum in fp32.
-    float exp_sum = 0.0f;
-    float weighted_sum = 0.0f;
-    for (int64_t t = 0; t < 128; ++t) {
-      const int64_t row_off = t * elem_size_;
-      const float score =
-          static_cast<float>(kv_page[row_off + head_dim_ + h]) + static_cast<float>(ape_[t * head_dim_ + h]);
-      const float w = sycl::exp(score - max_score);
-      exp_sum += w;
-      weighted_sum += static_cast<float>(kv_page[row_off + h]) * w;
+    // Pass 2: compute partial exp_sum and weighted_sum.
+    float local_exp_sum = 0.0f;
+    float local_weighted_sum = 0.0f;
+    for (int64_t i = 0; i < kTokensPerGroup; ++i) {
+      const float exp_score = sycl::exp(score_reg[i] - local_max);
+      local_exp_sum += exp_score;
+      local_weighted_sum += kv_reg[i] * exp_score;
     }
 
-    out_row[h] = static_cast<out_t>(weighted_sum / exp_sum);
+    // Shared memory layout (3 sections, each [kTokenGroups][kTileDim]):
+    //   section 0: local_max           [tg * kTileDim + h_lane]
+    //   section 1: scaled exp_sum      [kSmemSection + ...]
+    //   section 2: scaled weighted_sum [2*kSmemSection + ...]
+    const size_t kSmemSection = static_cast<size_t>(kTokenGroups * kTileDim);
+    const size_t smem_idx = static_cast<size_t>(tg * kTileDim + h_lane);
+
+    shared_[smem_idx] = local_max;
+    item.barrier(sycl::access::fence_space::local_space);
+
+    // Compute global max across all token groups for this h_lane.
+    float global_max = local_max;
+    for (int64_t g = 0; g < kTokenGroups; ++g) {
+      global_max = sycl::fmax(global_max, shared_[static_cast<size_t>(g * kTileDim) + static_cast<size_t>(h_lane)]);
+    }
+
+    // Rescale this group's partial sums to the global max and store.
+    const float rescale = sycl::exp(local_max - global_max);
+    shared_[kSmemSection + smem_idx] = local_exp_sum * rescale;
+    shared_[2 * kSmemSection + smem_idx] = local_weighted_sum * rescale;
+    item.barrier(sycl::access::fence_space::local_space);
+
+    // Token group 0 reduces all scaled partial sums and writes the final output.
+    if (tg == 0) {
+      float exp_sum = 0.0f;
+      float weighted_sum = 0.0f;
+      for (int64_t g = 0; g < kTokenGroups; ++g) {
+        exp_sum += shared_[kSmemSection + static_cast<size_t>(g * kTileDim) + static_cast<size_t>(h_lane)];
+        weighted_sum += shared_[2 * kSmemSection + static_cast<size_t>(g * kTileDim) + static_cast<size_t>(h_lane)];
+      }
+      kv_output_[static_cast<int64_t>(bid) * head_dim_ + h] = static_cast<out_t>(weighted_sum / exp_sum);
+    }
   }
 
   buffer_t* kv_buffer_;
@@ -94,6 +126,7 @@ struct FlashCompress128DecodeKernel {
   int64_t elem_size_;
   int64_t page_elem_size_;
   uint32_t num_split_;
+  sycl::local_accessor<float, 1> shared_;
 };
 
 template <typename buffer_t, typename input_t, typename out_t>
@@ -114,19 +147,14 @@ struct FlashCompress128PrefillCompressKernel {
       return;
     }
 
+    // lid decomposition: tg = token group (0..7), h_lane = column within split (0..63)
     const int64_t h_lane = static_cast<int64_t>(lid % static_cast<uint32_t>(kTileDim));
     const int64_t tg = static_cast<int64_t>(lid / static_cast<uint32_t>(kTileDim));
     const int64_t h = split_offset + h_lane;
-    if (h >= head_dim_) {
-      return;
-    }
 
-    const int64_t ragged_id = static_cast<int64_t>(plan.ragged_id);
     const int64_t buffer_len = static_cast<int64_t>(plan.buffer_len);
-    const int64_t fresh_start = ragged_id - 127 + buffer_len;
-    const int64_t page = static_cast<int64_t>(plan.read_page_1);
-    const buffer_t* kv_page = kv_buffer_ + page * page_elem_size_;
-
+    const int64_t fresh_start = static_cast<int64_t>(plan.ragged_id) - 127 + buffer_len;
+    const buffer_t* kv_page = kv_buffer_ + static_cast<int64_t>(plan.read_page_1) * page_elem_size_;
     const int64_t t_start = tg * kTokensPerGroup;
 
     // Load all kTokensPerGroup tokens into registers.
@@ -228,16 +256,8 @@ struct FlashCompress128PrefillWriteKernel {
     }
 
     const int64_t h = split_offset + static_cast<int64_t>(lid);
-    if (h >= head_dim_) {
-      return;
-    }
-
-    const int64_t write_loc = static_cast<int64_t>(plan.write_loc);
-    const int64_t ragged_id = static_cast<int64_t>(plan.ragged_id);
-
-    buffer_t* kv_dst = kv_buffer_ + write_loc * elem_size_;
-    const input_t* kv_src = kv_input_ + ragged_id * elem_size_;
-
+    buffer_t* kv_dst = kv_buffer_ + static_cast<int64_t>(plan.write_loc) * elem_size_;
+    const input_t* kv_src = kv_input_ + static_cast<int64_t>(plan.ragged_id) * elem_size_;
     kv_dst[h] = static_cast<buffer_t>(kv_src[h]);
     kv_dst[head_dim_ + h] = static_cast<buffer_t>(kv_src[head_dim_ + h]);
   }
@@ -274,6 +294,7 @@ void flash_compress128_decode(
   const int64_t batch_size = kv_input.size(0);
   const int64_t elem_size = kv_input.size(1);
   const int64_t head_dim = kv_output.size(1);
+  TORCH_CHECK(head_dim % kTileDim == 0, "flash_compress128_decode requires head_dim divisible by ", kTileDim);
   TORCH_CHECK(elem_size == 2 * head_dim, "kv_input last dim must be 2 * head_dim");
   TORCH_CHECK(
       kv_buffer.size(1) == 128 && kv_buffer.size(2) == elem_size,
@@ -289,7 +310,7 @@ void flash_compress128_decode(
   }
 
   const int64_t page_elem_size = 128 * elem_size;
-  const uint32_t num_split = static_cast<uint32_t>((head_dim + kTileDim - 1) / kTileDim);
+  const uint32_t num_split = static_cast<uint32_t>(head_dim / kTileDim);
   auto queue = c10::xpu::getCurrentXPUStream().queue();
 
   SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, kv_input.scalar_type(), "FlashCompress128Decode", [&]() {
@@ -297,6 +318,9 @@ void flash_compress128_decode(
     using output_t = scalar_t;
     SYCL_DISPATCH_WEIGHT_TYPES(at::kHalf, at::kBFloat16, kv_buffer.scalar_type(), "FlashCompress128Decode", [&]() {
       queue.submit([&](sycl::handler& cgh) {
+        // Shared memory: 3 sections × [kTokenGroups × kTileDim] floats.
+        const size_t kSmemElems = static_cast<size_t>(3 * kTokenGroups * kTileDim);
+        sycl::local_accessor<float, 1> shared(sycl::range<1>(kSmemElems), cgh);
         FlashCompress128Impl::FlashCompress128DecodeKernel<weight_t, input_t, output_t> kernel{
             kv_buffer.data_ptr<weight_t>(),
             kv_input.data_ptr<input_t>(),
@@ -307,8 +331,9 @@ void flash_compress128_decode(
             head_dim,
             elem_size,
             page_elem_size,
-            num_split};
-        constexpr uint32_t kLocalSize = 64;
+            num_split,
+            shared};
+        constexpr uint32_t kLocalSize = static_cast<uint32_t>(kTileDim * kTokenGroups);  // 512
         const uint32_t global_size = static_cast<uint32_t>(batch_size) * num_split * kLocalSize;
         cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kLocalSize)), kernel);
       });
@@ -347,6 +372,7 @@ void flash_compress128_prefill(
   const int64_t num_compress = kv_output.size(0);
   const int64_t num_write = plan_w.size(0);
 
+  TORCH_CHECK(head_dim % kTileDim == 0, "flash_compress128_prefill requires head_dim divisible by ", kTileDim);
   TORCH_CHECK(elem_size == 2 * head_dim, "kv_input last dim must be 2 * head_dim");
   TORCH_CHECK(
       kv_buffer.size(1) == 128 && kv_buffer.size(2) == elem_size,
@@ -362,7 +388,7 @@ void flash_compress128_prefill(
   }
 
   const int64_t page_elem_size = 128 * elem_size;
-  const uint32_t num_split = static_cast<uint32_t>((head_dim + kTileDim - 1) / kTileDim);
+  const uint32_t num_split = static_cast<uint32_t>(head_dim / kTileDim);
   auto queue = c10::xpu::getCurrentXPUStream().queue();
 
   SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, kv_input.scalar_type(), "FlashCompress128Prefill", [&]() {

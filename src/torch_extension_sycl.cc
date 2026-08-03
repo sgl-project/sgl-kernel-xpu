@@ -58,8 +58,18 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "correction_bias, float routed_scaling_factor=1.0, int num_fused_shared_experts=0) -> ()");
   m.impl("topk_sigmoid", torch::kXPU, &at::native::xpu::topk_sigmoid);
 
+  m.def(
+      "hash_topk(Tensor router_logits, Tensor input_ids, Tensor tid2eid, Tensor! topk_weights, Tensor! topk_ids, "
+      "float routed_scaling_factor=1.0) -> ()");
+  m.impl("hash_topk", torch::kXPU, &at::native::xpu::hash_topk);
+
   m.def("top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
   m.impl("top_k_renorm_probs", torch::kXPU, &top_k_renorm_probs);
+
+  m.def(
+      "min_p_sampling_from_probs(Tensor probs, Tensor! output, Tensor? maybe_indices, Tensor? "
+      "maybe_min_p_arr, float min_p_val, bool deterministic, Generator? gen) -> ()");
+  m.impl("min_p_sampling_from_probs", torch::kXPU, &min_p_sampling_from_probs);
 
   /*
    * Fast radix top-k (DeepSeek V3.2 indexer)
@@ -81,6 +91,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("swiglu_gpt_oss_sigmoid_alpha", torch::kXPU, &swiglu_gpt_oss_sigmoid_alpha);
 
   m.def(
+      "biased_topk(Tensor input, Tensor bias, Tensor! output, Tensor! indices, int topk, int scoring_func, int "
+      "num_fused_shared_experts, bool renormalize, float routed_scaling_factor, bool "
+      "apply_routed_scaling_factor_on_output) -> ()");
+  m.impl("biased_topk", torch::kXPU, &at::native::xpu::biased_topk);
+
+  m.def(
       "rotary_embedding(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
       "bool is_neox) -> (Tensor, Tensor)");
   m.impl("rotary_embedding", torch::kXPU, &at::native::xpu::rotary_embedding);
@@ -89,6 +105,69 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "store_cache(Tensor k, Tensor v, Tensor(a!) k_cache, Tensor(b!) v_cache, "
       "Tensor indices) -> ()");
   m.impl("store_cache", torch::kXPU, &at::native::xpu::store_cache);
+
+  // KV cache transfer ops
+  m.def(
+      "transfer_kv_per_layer(Tensor src_k, Tensor(a!) dst_k, Tensor src_v, Tensor(b!) dst_v, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_per_layer", torch::kXPU, &transfer_kv_per_layer);
+
+  m.def(
+      "transfer_kv_per_layer_mla(Tensor src, Tensor(a!) dst, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_per_layer_mla", torch::kXPU, &transfer_kv_per_layer_mla);
+
+  m.def(
+      "transfer_kv_all_layer(Tensor src_k_layers, Tensor(a!) dst_k_layers, "
+      "Tensor src_v_layers, Tensor(b!) dst_v_layers, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int num_layers, "
+      "int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_all_layer", torch::kXPU, &transfer_kv_all_layer);
+
+  m.def(
+      "transfer_kv_all_layer_mla(Tensor src_layers, Tensor(a!) dst_layers, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int num_layers, "
+      "int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_all_layer_mla", torch::kXPU, &transfer_kv_all_layer_mla);
+
+  m.def(
+      "transfer_kv_all_layer_lf_ph(Tensor src_k_layers, Tensor(a!) dst_k, "
+      "Tensor src_v_layers, Tensor(b!) dst_v, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, "
+      "int num_layers, int page_size, int head_num, int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_all_layer_lf_ph", torch::kXPU, &transfer_kv_all_layer_lf_ph);
+
+  m.def(
+      "transfer_kv_per_layer_ph_lf(Tensor src_k, Tensor(a!) dst_k, "
+      "Tensor src_v, Tensor(b!) dst_v, "
+      "Tensor src_indices, Tensor dst_indices, int layer_id, int item_size, int src_layout_dim, "
+      "int page_size, int head_num, int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_per_layer_ph_lf", torch::kXPU, &transfer_kv_per_layer_ph_lf);
+
+  m.def(
+      "transfer_kv_per_layer_pf_lf(Tensor src_k, Tensor(a!) dst_k, Tensor src_v, Tensor(b!) dst_v, "
+      "Tensor src_indices, Tensor dst_indices, int layer_id, int item_size, int src_layout_dim, "
+      "int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_per_layer_pf_lf", torch::kXPU, &transfer_kv_per_layer_pf_lf);
+
+  m.def(
+      "transfer_kv_all_layer_lf_pf(Tensor src_k_layers, Tensor(a!) dst_k, "
+      "Tensor src_v_layers, Tensor(b!) dst_v, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, "
+      "int num_layers, int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_all_layer_lf_pf", torch::kXPU, &transfer_kv_all_layer_lf_pf);
+
+  m.def(
+      "transfer_kv_per_layer_mla_pf_lf(Tensor src, Tensor(a!) dst, "
+      "Tensor src_indices, Tensor dst_indices, int layer_id, int item_size, int src_layout_dim, "
+      "int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_per_layer_mla_pf_lf", torch::kXPU, &transfer_kv_per_layer_mla_pf_lf);
+
+  m.def(
+      "transfer_kv_all_layer_mla_lf_pf(Tensor src_layers, Tensor(a!) dst, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, "
+      "int num_layers, int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_all_layer_mla_lf_pf", torch::kXPU, &transfer_kv_all_layer_mla_lf_pf);
 
 #ifdef USE_MOE
   m.def(
@@ -115,10 +194,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("moe_grouped_mm_nt_xe20", torch::kXPU, &moe_grouped_mm_nt_xe20);
 
   m.def(
-      "moe_grouped_mm_nt_xe20_mxfp4_w4a16(Tensor! output, Tensor activations, Tensor packed_weights, Tensor scales, "
-      "Tensor? bias, Tensor total_rows_for_experts, int n_experts, int activation_type, bool fuse_act, "
-      "float gemm1_alpha=1.702, float gemm1_limit=7.0) -> ()");
-  m.impl("moe_grouped_mm_nt_xe20_mxfp4_w4a16", torch::kXPU, &moe_grouped_mm_nt_xe20_mxfp4_w4a16);
+      "moe_grouped_mm_nt_xe20_w4a16(Tensor! output, Tensor activations, Tensor packed_weights, Tensor scales, "
+      "Tensor? zeros, Tensor? bias, Tensor rows_per_expert, int n_experts, bool is_int4, int group_size) -> ()");
+  m.impl("moe_grouped_mm_nt_xe20_w4a16", torch::kXPU, &moe_grouped_mm_nt_xe20_w4a16);
 
   m.def(
       "prepare_moe_input(Tensor topk_ids, Tensor! expert_offsets, Tensor? blockscale_offsets, Tensor! problem_sizes1,"
@@ -197,8 +275,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "flash_mla_prefill(Tensor! out, Tensor! q_nope, Tensor! q_pe, Tensor! kv_c_and_k_pe_cache, "
       "Tensor! cu_seqlens_q, Tensor! seq_lens, int max_seqlen_q, "
       "Tensor! page_table, Tensor! workspace, float sm_scale, bool causal, int num_kv_splits) -> ()");
-  ;
   m.impl("flash_mla_prefill", torch::kXPU, &flash_mla_prefill);
+
+  m.def(
+      "flash_mla_sparse_prefill(Tensor! out, Tensor! max_logits, Tensor! lse, Tensor! q, Tensor! kv, "
+      "Tensor! indices, float sm_scale, int head_dim_v, "
+      "Tensor? attn_sink=None, Tensor? topk_length=None) -> ()");
+  m.impl("flash_mla_sparse_prefill", torch::kXPU, &flash_mla_sparse_prefill);
 #endif  // USE_MLA
 
   /*
@@ -349,9 +432,21 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    * Compress plan kernels
    */
   m.def(
+      "plan_compress_prefill(Tensor req_pool_indices, Tensor req_to_token, Tensor full_to_state, "
+      "Tensor seq_lens, Tensor extend_lens, Tensor pin_buffer, int num_q_tokens, int compress_ratio, int "
+      "swa_page_size, "
+      "int ring_size, bool use_cuda_graph=False) -> (Tensor, Tensor)");
+  m.impl("plan_compress_prefill", torch::kXPU, &at::native::xpu::plan_compress_prefill);
+
+  m.def(
       "plan_compress_decode(Tensor req_pool_indices, Tensor req_to_token, Tensor full_to_state, "
       "Tensor seq_lens, int compress_ratio, int swa_page_size, int ring_size) -> Tensor");
   m.impl("plan_compress_decode", torch::kXPU, &at::native::xpu::plan_compress_decode);
+
+  m.def(
+      "flash_compress128_decode(Tensor! kv_buffer, Tensor kv_input, Tensor! kv_output, Tensor ape, Tensor plan_d) "
+      "-> ()");
+  m.impl("flash_compress128_decode", torch::kXPU, &at::native::xpu::flash_compress128_decode);
 }
 
 REGISTER_EXTENSION(common_ops)

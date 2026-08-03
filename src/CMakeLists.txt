@@ -15,8 +15,14 @@
 option(USE_MOE "Build MoE kernels" ON)
 option(USE_FMHA "Build flash attention kernels" ON)
 option(USE_MLA "Build MLA kernels" ON)
+# The fused (single-pass) sparse-MLA-decode kernel is the optimization track; the
+# 2-stage kernel is the shipping runtime default. Building the fused variant is
+# opt-in so default/CI builds don't pay for its extra instantiations. Turning it
+# OFF also pins the runtime dispatch to the 2-stage path (see below) so the fused
+# launchers are never referenced.
+option(USE_MLA_SPARSE_FUSED "Build the fused (single-pass) sparse MLA decode kernel (optimization track)" OFF)
 
-foreach(_toggle USE_MOE USE_FMHA USE_MLA)
+foreach(_toggle USE_MOE USE_FMHA USE_MLA USE_MLA_SPARSE_FUSED)
     if(DEFINED ENV{${_toggle}} AND NOT "$ENV{${_toggle}}" STREQUAL "")
         if("$ENV{${_toggle}}")
             set(${_toggle} ON)
@@ -29,6 +35,7 @@ endforeach()
 message(STATUS "USE_MOE=${USE_MOE}")
 message(STATUS "USE_FMHA=${USE_FMHA}")
 message(STATUS "USE_MLA=${USE_MLA}")
+message(STATUS "USE_MLA_SPARSE_FUSED=${USE_MLA_SPARSE_FUSED}")
 
 if(USE_MOE)
     add_compile_definitions(USE_MOE)
@@ -38,6 +45,13 @@ if(USE_FMHA)
 endif()
 if(USE_MLA)
     add_compile_definitions(USE_MLA)
+endif()
+if(USE_MLA_SPARSE_FUSED)
+    add_compile_definitions(USE_MLA_SPARSE_FUSED)
+else()
+    # Fused kernel not built -> force the runtime dispatch to the 2-stage path so
+    # mla_sparse_decode.cpp never references the (uncompiled) fused launchers.
+    add_compile_definitions(SGLANG_USE_SPARSE_MLA_2STAGE=1)
 endif()
 
 file(GLOB device_cpp "sycl/*.cpp" "sycl/*.sycl")
@@ -55,7 +69,7 @@ if(NOT USE_MLA)
     list(FILTER device_cpp EXCLUDE REGEX "/mla_(decode|prefill|sparse_decode)\\.cpp$")
 endif()
 if(NOT USE_MOE)
-    list(FILTER device_cpp EXCLUDE REGEX "/(GroupGemm(Xe20|Mxfp4W4A16Xe20)|MoE(Align|PrepareInputs|Sum|_fused_gate|_sum_reduce))\\.cpp$")
+    list(FILTER device_cpp EXCLUDE REGEX "/(GroupGemm(Xe20|W4A16Xe20)|MoE(Align|PrepareInputs|Sum|_fused_gate|_sum_reduce))\\.cpp$")
 endif()
 
 # BMG only
@@ -84,11 +98,13 @@ if(USE_MLA)
     include(MlaDecodeXe20.cmake)
     include(MlaPrefillXe20.cmake)
     include(MlaSparseDecodeXe20.cmake)
+    include(MlaSparsePrefillXe20.cmake)
 endif()
 if(USE_MOE)
     include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmXe20.cmake)
-    include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmMxfp4W4A16Xe20.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmW4A16Xe20.cmake)
 endif()
+
 
 message(STATUS "BMG files: ${device_cpp_xe20}")
 message(STATUS "Common files: ${device_cpp_common}")
@@ -96,7 +112,6 @@ message(STATUS "Common files: ${device_cpp_common}")
 list(APPEND ATen_XPU_CPP_SRCS ${host_cpp})
 list(APPEND ATen_XPU_SYCL_COMMON ${device_cpp_common})
 list(APPEND ATen_XPU_SYCL_XE20 ${device_cpp_xe20})
-
 set(ATen_XPU_CPP_SRCS ${ATen_XPU_CPP_SRCS} PARENT_SCOPE)
 set(ATen_XPU_SYCL_COMMON ${ATen_XPU_SYCL_COMMON} PARENT_SCOPE)
 set(ATen_XPU_SYCL_XE20 ${ATen_XPU_SYCL_XE20} PARENT_SCOPE)

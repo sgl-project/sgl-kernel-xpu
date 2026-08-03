@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 
@@ -370,29 +370,25 @@ def cutlass_fp4_group_mm(
 
 
 _MOE_WS_HEADROOM = 1.25
+_moe_ws_cache: Dict[Tuple[str, torch.device], torch.Tensor] = {}
 
 
 def _get_moe_ws(
-    workspace: Optional[Dict[str, torch.Tensor]],
     name: str,
     shape: tuple,
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
     """Return a tensor of `shape`/`dtype` on `device`, backed by a flat 1-D
-    scratch buffer cached (grow-only, with headroom) in `workspace[name]`.
-    Reusing one stable-size buffer across calls/layers avoids the XPU caching
-    allocator accumulating many differently-shaped cached blocks (elevated
-    torch.xpu.memory_reserved() vs memory_allocated()). Falls back to a plain
-    `torch.empty` when `workspace` is None, so existing callers keep working
-    unchanged."""
-    if workspace is None:
-        return torch.empty(shape, dtype=dtype, device=device)
+    process-wide scratch buffer cached grow-only inside sgl-kernel-xpu.
+    Reusing stable buffers across calls and MoE layers avoids the XPU caching
+    allocator accumulating differently-shaped cached blocks."""
     numel = 1
     for d in shape:
         numel *= d
-    cur = workspace.get(name)
-    if cur is None or cur.numel() < numel or cur.dtype != dtype or cur.device != device:
+    key = (name, device)
+    cur = _moe_ws_cache.get(key)
+    if cur is None or cur.numel() < numel or cur.dtype != dtype:
         # Grow the buffer with headroom so reallocations are rare.
         # No explicit sync is needed: PyTorch's caching allocator inserts a
         # stream-ordered deallocation event when the old tensor is dropped, so
@@ -400,7 +396,7 @@ def _get_moe_ws(
         # it have completed.
         new_numel = max(numel, int(numel * _MOE_WS_HEADROOM))
         cur = torch.empty(new_numel, dtype=dtype, device=device)
-        workspace[name] = cur
+        _moe_ws_cache[key] = cur
     return cur.narrow(0, 0, numel).view(shape)
 
 
@@ -431,7 +427,6 @@ def fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     swiglu_limit: Optional[float] = None,
-    workspace: Optional[Dict[str, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -639,20 +634,16 @@ def fused_experts(
 
     topk_ids = topk_ids.int() if topk_ids.dtype == torch.long else topk_ids
     expert_offsets = _get_moe_ws(
-        workspace, "expert_offsets", (E,), torch.int32, hidden_states.device
+        "expert_offsets", (E,), torch.int32, hidden_states.device
     )
     problem_sizes1 = _get_moe_ws(
-        workspace, "problem_sizes1", (E, 3), torch.int32, hidden_states.device
+        "problem_sizes1", (E, 3), torch.int32, hidden_states.device
     )
     problem_sizes2 = _get_moe_ws(
-        workspace, "problem_sizes2", (E, 3), torch.int32, hidden_states.device
+        "problem_sizes2", (E, 3), torch.int32, hidden_states.device
     )
-    a_map = _get_moe_ws(
-        workspace, "a_map", (topk_ids.numel(),), torch.int32, hidden_states.device
-    )
-    c_map = _get_moe_ws(
-        workspace, "c_map", (topk_ids.numel(),), torch.int32, hidden_states.device
-    )
+    a_map = _get_moe_ws("a_map", (topk_ids.numel(),), torch.int32, hidden_states.device)
+    c_map = _get_moe_ws("c_map", (topk_ids.numel(),), torch.int32, hidden_states.device)
     torch.ops.sgl_kernel.prepare_moe_input.default(
         topk_ids,
         expert_offsets,
@@ -666,7 +657,6 @@ def fused_experts(
         TopK,
     )
     input_A_shuffle = _get_moe_ws(
-        workspace,
         "input_A_shuffle",
         (num_tokens * TopK, K),
         hidden_states.dtype,
@@ -686,7 +676,6 @@ def fused_experts(
         )
 
     intermediate_cache3 = _get_moe_ws(
-        workspace,
         "intermediate_cache3",
         (M * TopK, OutK),
         hidden_states.dtype,
@@ -743,14 +732,12 @@ def fused_experts(
     use_unfused_act = use_4bit_w4a16 or (avg_m <= 128 and big_weight)
     if use_unfused_act:
         intermediate_cache1 = _get_moe_ws(
-            workspace,
             "intermediate_cache1_unfused",
             (M * TopK, gate_factor * N),
             hidden_states.dtype,
             hidden_states.device,
         )
         intermediate_cache2 = _get_moe_ws(
-            workspace,
             "intermediate_cache2",
             (M * TopK, N),
             hidden_states.dtype,
@@ -834,7 +821,6 @@ def fused_experts(
             )
     else:
         intermediate_cache1 = _get_moe_ws(
-            workspace,
             "intermediate_cache1_fused",
             (M * TopK, N),
             hidden_states.dtype,

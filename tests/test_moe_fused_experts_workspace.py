@@ -1,15 +1,12 @@
-"""Tests for the optional ``workspace`` argument of ``sgl_kernel.fused_experts``
-and its ``_get_moe_ws`` scratch-buffer helper (Intel Xe2 / BMG).
+"""Tests for the internal ``sgl_kernel.fused_experts`` workspace cache and its
+``_get_moe_ws`` scratch-buffer helper (Intel Xe2 / BMG).
 
 These tests cover:
-  * ``_get_moe_ws`` in isolation: first-call allocation with headroom,
-    reuse (same storage / ``data_ptr()``) for equal-or-smaller shapes,
-    regrowth for larger shapes, and forced reallocation on dtype/device
-    mismatch.
-  * ``fused_experts`` end-to-end: passing a workspace dict must match the
-    no-workspace baseline (and the pure-torch reference) exactly, both for
-    a single call and across a sequence of varying-token-count calls
-    sharing one workspace dict.
+  * ``_get_moe_ws`` in isolation: first-call allocation with headroom, reuse
+    for equal-or-smaller shapes, regrowth for larger shapes, and replacement
+    on dtype changes.
+  * ``fused_experts`` end-to-end: the internal process-wide cache must produce
+    the pure-torch reference result across varying token counts.
   * A regression test for a real aliasing bug found during development:
     ``out_hidden_states`` (the function's return value) must never be
     workspace-backed, since the caller keeps using the returned tensor
@@ -18,10 +15,12 @@ These tests cover:
     the still-in-use earlier result.
 """
 
+import sys
+
 import pytest
 import torch
 from sgl_kernel import fused_experts
-from sgl_kernel.moe import _MOE_WS_HEADROOM, _get_moe_ws
+from sgl_kernel.moe import _MOE_WS_HEADROOM, _get_moe_ws, _moe_ws_cache
 from test_moe_gemm import create_random_xpu_tensor, torch_naive_moe
 
 pytestmark = pytest.mark.skipif(
@@ -39,85 +38,87 @@ def _xpu_device() -> torch.device:
     return torch.device("xpu", torch.xpu.current_device())
 
 
+@pytest.fixture(autouse=True)
+def clear_moe_workspace_cache():
+    _moe_ws_cache.clear()
+    yield
+    _moe_ws_cache.clear()
+
+
+def _cache_key(name: str):
+    return (name, _xpu_device())
+
+
 # ---------------------------------------------------------------------------
 # `_get_moe_ws` unit tests (pure Python scratch-buffer helper logic).
 # ---------------------------------------------------------------------------
 
 
-def test_get_moe_ws_none_workspace_returns_plain_empty():
-    """`workspace=None` must behave exactly like a plain `torch.empty` call
-    (the default/back-compat path for callers that don't opt in)."""
-    t = _get_moe_ws(None, "foo", (4, 8), torch.float32, _xpu_device())
-    assert t.shape == (4, 8)
-    assert t.dtype == torch.float32
-    assert t.device.type == "xpu"
-
-
 def test_get_moe_ws_first_call_allocates_with_headroom():
-    ws = {}
     numel = 4 * 8
-    t = _get_moe_ws(ws, "foo", (4, 8), torch.float32, _xpu_device())
+    t = _get_moe_ws("foo", (4, 8), torch.float32, _xpu_device())
+    cached = _moe_ws_cache[_cache_key("foo")]
     assert t.shape == (4, 8)
-    assert "foo" in ws
     expected_numel = max(numel, int(numel * _MOE_WS_HEADROOM))
-    assert ws["foo"].numel() == expected_numel
-    assert ws["foo"].numel() >= numel
+    assert cached.numel() == expected_numel
+    assert cached.numel() >= numel
 
 
 def test_get_moe_ws_reuses_same_storage_for_equal_or_smaller_shape():
-    ws = {}
-    t1 = _get_moe_ws(ws, "foo", (100,), torch.float32, _xpu_device())
-    ptr1 = ws["foo"].data_ptr()
-    numel1 = ws["foo"].numel()
+    _get_moe_ws("foo", (100,), torch.float32, _xpu_device())
+    key = _cache_key("foo")
+    ptr1 = _moe_ws_cache[key].data_ptr()
+    numel1 = _moe_ws_cache[key].numel()
 
     # Same shape: must reuse the exact same underlying buffer.
-    t2 = _get_moe_ws(ws, "foo", (100,), torch.float32, _xpu_device())
-    assert ws["foo"].data_ptr() == ptr1
-    assert ws["foo"].numel() == numel1
+    _get_moe_ws("foo", (100,), torch.float32, _xpu_device())
+    assert _moe_ws_cache[key].data_ptr() == ptr1
+    assert _moe_ws_cache[key].numel() == numel1
 
     # Smaller shape: must also reuse (no reallocation needed).
-    t3 = _get_moe_ws(ws, "foo", (10,), torch.float32, _xpu_device())
-    assert ws["foo"].data_ptr() == ptr1
+    t3 = _get_moe_ws("foo", (10,), torch.float32, _xpu_device())
+    assert _moe_ws_cache[key].data_ptr() == ptr1
     assert t3.shape == (10,)
 
 
 def test_get_moe_ws_grows_for_larger_shape():
-    ws = {}
-    _get_moe_ws(ws, "foo", (100,), torch.float32, _xpu_device())
-    ptr1 = ws["foo"].data_ptr()
-    numel1 = ws["foo"].numel()
+    _get_moe_ws("foo", (100,), torch.float32, _xpu_device())
+    key = _cache_key("foo")
+    ptr1 = _moe_ws_cache[key].data_ptr()
+    numel1 = _moe_ws_cache[key].numel()
 
-    t2 = _get_moe_ws(ws, "foo", (numel1 + 1,), torch.float32, _xpu_device())
+    t2 = _get_moe_ws("foo", (numel1 + 1,), torch.float32, _xpu_device())
     assert t2.shape == (numel1 + 1,)
     # Must have grown (new, larger buffer -- old one is no longer referenced).
-    assert ws["foo"].numel() >= numel1 + 1
-    assert ws["foo"].numel() == max(numel1 + 1, int((numel1 + 1) * _MOE_WS_HEADROOM))
+    assert _moe_ws_cache[key].data_ptr() != ptr1
+    assert _moe_ws_cache[key].numel() >= numel1 + 1
+    assert _moe_ws_cache[key].numel() == max(
+        numel1 + 1, int((numel1 + 1) * _MOE_WS_HEADROOM)
+    )
 
 
-def test_get_moe_ws_dtype_or_device_mismatch_forces_reallocation():
-    ws = {}
-    _get_moe_ws(ws, "foo", (100,), torch.float32, _xpu_device())
-    numel_before = ws["foo"].numel()
-
-    # Same numel, different dtype -> must reallocate (not reinterpret bytes).
-    t = _get_moe_ws(ws, "foo", (100,), torch.bfloat16, _xpu_device())
-    assert ws["foo"].dtype == torch.bfloat16
-    assert t.dtype == torch.bfloat16
-    assert ws["foo"].numel() >= 100
+def test_get_moe_ws_dtype_change_replaces_buffer():
+    f32 = _get_moe_ws("foo", (100,), torch.float32, _xpu_device())
+    f32_ptr = f32.data_ptr()
+    bf16 = _get_moe_ws("foo", (100,), torch.bfloat16, _xpu_device())
+    assert f32.dtype == torch.float32
+    assert bf16.dtype == torch.bfloat16
+    assert bf16.data_ptr() != f32_ptr
+    assert _moe_ws_cache[_cache_key("foo")].dtype == torch.bfloat16
 
 
 def test_get_moe_ws_view_is_correctly_shaped_and_independent_per_name():
-    ws = {}
-    a = _get_moe_ws(ws, "a", (2, 3), torch.float32, _xpu_device())
-    b = _get_moe_ws(ws, "b", (5,), torch.float32, _xpu_device())
+    a = _get_moe_ws("a", (2, 3), torch.float32, _xpu_device())
+    b = _get_moe_ws("b", (5,), torch.float32, _xpu_device())
     assert a.shape == (2, 3)
     assert b.shape == (5,)
-    assert "a" in ws and "b" in ws
-    assert ws["a"].data_ptr() != ws["b"].data_ptr()
+    assert _cache_key("a") in _moe_ws_cache
+    assert _cache_key("b") in _moe_ws_cache
+    assert a.data_ptr() != b.data_ptr()
 
 
 # ---------------------------------------------------------------------------
-# `fused_experts(..., workspace=...)` end-to-end correctness.
+# `fused_experts` internal workspace end-to-end correctness.
 # ---------------------------------------------------------------------------
 
 _E, _HIDDEN, _INTER, _TOPK = 8, 256, 512, 2
@@ -134,33 +135,23 @@ def _make_moe_case(num_tokens, seed=0):
     return a, w1, w2, topk_weight, topk_ids
 
 
-def test_fused_experts_workspace_matches_baseline_and_reference():
-    """A single call with a workspace dict must match both the no-workspace
-    call and the pure-torch reference."""
+def test_fused_experts_internal_workspace_matches_reference():
     a, w1, w2, topk_weight, topk_ids = _make_moe_case(num_tokens=37, seed=1)
 
     ref = torch_naive_moe(a, w1, w2, topk_ids, topk_weight, _TOPK, None, None)
-    no_ws = fused_experts(a, w1, w2, topk_weight, topk_ids)
+    out = fused_experts(a, w1, w2, topk_weight, topk_ids)
 
-    ws: dict = {}
-    with_ws = fused_experts(a, w1, w2, topk_weight, topk_ids, workspace=ws)
-
-    torch.testing.assert_close(no_ws, ref, rtol=1e-4, atol=1e-3)
-    torch.testing.assert_close(with_ws, no_ws, rtol=0, atol=0)
-    # The workspace dict must actually have been populated (buffers reused
-    # for internal scratch), not silently ignored.
-    assert len(ws) > 0
-    assert "out_hidden_states" not in ws  # must never be workspace-backed
+    torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-3)
+    assert len(_moe_ws_cache) > 0
+    assert all(key[0] != "out_hidden_states" for key in _moe_ws_cache)
 
 
 def test_fused_experts_workspace_reused_across_varying_token_counts():
     """A regression test for the aliasing bug found during development: a
-    shared workspace dict, reused across a sequence of calls with varying
-    (growing and shrinking) token counts, must never let a later call
-    corrupt an earlier call's still-referenced output, and every call's
-    result must exactly match its own no-workspace/reference computation."""
+    shared internal workspace, reused across calls with varying token counts,
+    must never let a later call corrupt an earlier call's still-referenced
+    output, and every result must match its pure-torch reference."""
     token_counts = [37, 91, 8, 257, 37, 1]
-    ws: dict = {}
     results = []
     references = []
 
@@ -169,7 +160,7 @@ def test_fused_experts_workspace_reused_across_varying_token_counts():
             num_tokens=num_tokens, seed=100 + step
         )
         ref = torch_naive_moe(a, w1, w2, topk_ids, topk_weight, _TOPK, None, None)
-        out = fused_experts(a, w1, w2, topk_weight, topk_ids, workspace=ws)
+        out = fused_experts(a, w1, w2, topk_weight, topk_ids)
         # Clone immediately, exactly as a real caller (e.g. the next model
         # layer) would keep using the returned tensor independently of any
         # later call that might reuse/regrow the shared workspace buffers.
@@ -188,19 +179,21 @@ def test_fused_experts_workspace_reused_across_varying_token_counts():
 
 def test_fused_experts_workspace_output_not_aliased_across_calls():
     """Directly exercises the exact bug scenario found during development:
-    two back-to-back calls sharing one workspace, where the second call's
-    output tensor must be independent storage from the first call's output
-    (never aliasing a workspace buffer), so the first call's result survives
-    the second call untouched even without an explicit `.clone()`."""
-    ws: dict = {}
+    two back-to-back calls sharing the internal cache, where the second call's
+    output must use independent storage so the first result survives the second
+    call untouched even without an explicit `.clone()`."""
     a1, w1_, w2_, tw1, ti1 = _make_moe_case(num_tokens=37, seed=7)
-    out1 = fused_experts(a1, w1_, w2_, tw1, ti1, workspace=ws)
+    out1 = fused_experts(a1, w1_, w2_, tw1, ti1)
     out1_snapshot = out1.clone()
 
     a2, w1_, w2_, tw2, ti2 = _make_moe_case(num_tokens=91, seed=8)
-    out2 = fused_experts(a2, w1_, w2_, tw2, ti2, workspace=ws)
+    out2 = fused_experts(a2, w1_, w2_, tw2, ti2)
 
     # out1 must be untouched by the second call (would fail if
     # `out_hidden_states` were ever routed through the workspace cache).
     torch.testing.assert_close(out1, out1_snapshot, rtol=0, atol=0)
     assert out1.data_ptr() != out2.data_ptr()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

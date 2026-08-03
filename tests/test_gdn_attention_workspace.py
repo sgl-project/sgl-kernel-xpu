@@ -137,6 +137,53 @@ def test_gdn_attention_workspace_matches_baseline(mode, batch_size, seqlen, dtyp
     _assert_matches(candidate, baseline, conv_cand, conv_ref, ssm_cand, ssm_ref)
 
 
+@pytest.mark.parametrize(
+    "batch_size,seqlen",
+    [(1, 1), (1, 63), (1, 65), (2, 63)],
+)
+def test_gdn_attention_prefill_clears_stale_workspace(batch_size, seqlen):
+    device = torch.device("xpu")
+    dtype = torch.bfloat16
+
+    reference = _make_inputs("prefill", batch_size, seqlen, dtype, device)
+    conv_ref = reference["conv_state"].clone()
+    ssm_ref = reference["ssm_state"].clone()
+    workspace_ref = _make_workspace(
+        _padded_tokens("prefill", batch_size, reference["num_actual"]),
+        dtype,
+        device,
+    )
+    workspace_ref.zero_()
+    _run_op_ws(
+        reference,
+        conv_ref,
+        ssm_ref,
+        reference["state_idx"],
+        False,
+        workspace_ref,
+    )
+
+    candidate = _make_inputs("prefill", batch_size, seqlen, dtype, device)
+    conv_cand = candidate["conv_state"].clone()
+    ssm_cand = candidate["ssm_state"].clone()
+    workspace = _make_workspace(
+        _padded_tokens("prefill", batch_size, candidate["num_actual"]),
+        dtype,
+        device,
+    )
+    workspace.fill_(0x7F)
+    _run_op_ws(
+        candidate,
+        conv_cand,
+        ssm_cand,
+        candidate["state_idx"],
+        False,
+        workspace,
+    )
+
+    _assert_matches(candidate, reference, conv_cand, conv_ref, ssm_cand, ssm_ref)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_gdn_attention_workspace_reused_across_varying_shapes(dtype):
     """One workspace list, sized for the largest case in the sequence, must

@@ -332,7 +332,7 @@ void rotary_embedding_2D_kernel_impl(
     const at::Tensor& cos_sin_cache,  // [max_position, rot_dim]
     bool is_neox,
     int64_t rot_dim) {
-  int64_t num_tokens = positions.view(-1).size(0);
+  int64_t num_tokens = query.size(0);
   int64_t num_heads = query.size(-1) / head_size;
   int64_t num_kv_heads = key.size(-1) / head_size;
   int64_t query_stride = query.stride(-2);
@@ -465,6 +465,11 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding(
   TORCH_CHECK(
       input_dim == 2 || input_dim == 3,
       " Query/Key must be 2D [num_tokens, num_heads*head_size] or 3D [num_tokens, num_heads, head_size] tensor");
+  TORCH_CHECK(
+      positions.dim() == 1 || positions.dim() == 2,
+      "positions must be 1D [num_tokens] or 2D [num_dims, num_tokens], got ",
+      positions.dim(),
+      "D");
   if (input_dim == 2) {
     rotary_embedding_2D_kernel_impl(positions, query, key, head_size, cos_sin_cache, is_neox, rotary_dim);
     return {query, key};

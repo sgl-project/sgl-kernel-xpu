@@ -720,7 +720,7 @@ void top_k_top_p_sampling_from_probs(
     at::Tensor output,
     std::optional<at::Tensor> maybe_indices,
     std::optional<at::Tensor> maybe_top_k_arr,
-    int64_t top_k_val,
+    double top_k_val,
     std::optional<at::Tensor> maybe_top_p_arr,
     double top_p_val,
     bool deterministic,

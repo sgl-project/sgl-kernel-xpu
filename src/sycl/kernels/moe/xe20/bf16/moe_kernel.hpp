@@ -31,6 +31,7 @@
  **************************************************************************************************/
 #pragma once
 
+#include "cute/atom/copy_traits_xe_2d.hpp"
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/gemm.h"
@@ -66,7 +67,7 @@ class MoEGEMM {
  public:
   using TiledCopyA = decltype(make_block_2d_copy_A(TiledMMA{}, TensorA{}));
   using TiledCopyB = decltype(make_block_2d_copy_B(TiledMMA{}, TensorB{}));
-  using TiledCopyD = decltype(make_block_2d_copy_D(TiledMMA{}, TensorD{}));
+  using TiledCopyD = decltype(make_block_2d_copy_CD(cute::XE_STORE_2D<16, 8, 32>{}, TiledMMA{}, TensorD{}));
   using SGPerWG = decltype(product(take<1, 4>(shape(typename TiledMMA::ThrLayoutVMNK{}))));
 
   constexpr static int Stages = 3;

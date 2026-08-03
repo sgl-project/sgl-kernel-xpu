@@ -179,11 +179,8 @@ struct MoEMainloop<
     SubgroupTensor tCrC = thr_mma.partition_sg_fragment_C(gD);
 
     /* Partition D */
-    using TD = typename DTensor::element_type;
-    TD tCrD_final_frag[tCrC.size()];
-    Tensor tCrD_final_tensor = make_tensor(make_rmem_ptr(tCrD_final_frag), tCrC.layout());
-    SubgroupTensor tCrD_final_sg_tensor = make_subgroup_tensor(tCrD_final_tensor, tCrC.tv_layout());
-    Tensor tCgD = thr_mma.partition_C(gD);
+    auto tCrD_out = thr_copy_d.partition_sg_fragment_S(gD);
+    Tensor tCgD = thr_copy_d.partition_D(gD);
 
     /* Create TiledCopy objects for prefetches */
     auto prefetch_a = make_block_2d_prefetch(tiled_copy_a);
@@ -244,8 +241,8 @@ struct MoEMainloop<
       }
     }
 
-    reorder(tCrC, tCrD_final_sg_tensor);
-    copy(tiled_copy_d, tCrD_final_sg_tensor, tCgD);
+    reorder(tCrC, tCrD_out);
+    copy(tiled_copy_d, tCrD_out, tCgD);
   }
 
   template <typename Coord>
@@ -316,15 +313,8 @@ struct MoEMainloop<
     SubgroupTensor tCrC1 = thr_mma.partition_sg_fragment_C(gC1);
 
     /* Partition D */
-    using TD = typename DTensor::element_type;
-    TD tCrD_final_frag0[tCrC0.size()];
-    Tensor tCrD_final_tensor0 = make_tensor(make_rmem_ptr(tCrD_final_frag0), tCrC0.layout());
-    SubgroupTensor tCrD_final_sg_tensor0 = make_subgroup_tensor(tCrD_final_tensor0, tCrC0.tv_layout());
-    TD tCrD_final_frag1[tCrC1.size()];
-    Tensor tCrD_final_tensor1 = make_tensor(make_rmem_ptr(tCrD_final_frag1), tCrC1.layout());
-    SubgroupTensor tCrD_final_sg_tensor1 = make_subgroup_tensor(tCrD_final_tensor1, tCrC1.tv_layout());
-
-    Tensor tCgD = thr_mma.partition_C(gC0);
+    auto tCrD_out = thr_copy_d.partition_sg_fragment_S(gC0);
+    Tensor tCgD = thr_copy_d.partition_D(gC0);
 
     /* Create TiledCopy objects for prefetches */
     auto prefetch_a = make_block_2d_prefetch(tiled_copy_a);
@@ -387,8 +377,8 @@ struct MoEMainloop<
           moe_xe20::apply_fused_activation<static_cast<int>(ActType)>(tCrC0(i), tCrC1(i), gemm1_alpha, gemm1_limit);
     }
 
-    reorder(tCrC0, tCrD_final_sg_tensor0);
-    copy(tiled_copy_d, tCrD_final_sg_tensor0, tCgD);
+    reorder(tCrC0, tCrD_out);
+    copy(tiled_copy_d, tCrD_out, tCgD);
   }
 
   template <

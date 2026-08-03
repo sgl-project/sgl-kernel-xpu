@@ -441,6 +441,75 @@ def test_gemma_norm_3d_non_flattenable(
 
 
 ###############################################################################
+# 4D tensor tests for gemma_rmsnorm
+###############################################################################
+
+
+def _make_non_flattenable_4d(num_tokens, num_heads, head_dim, dtype, extra_heads=4):
+    """Create a 4D tensor [1, tokens, heads, head_dim] whose row strides are
+    not flattenable by a single outer stride.
+    """
+    total_heads = num_heads + extra_heads
+    full = torch.randn(
+        1, num_tokens, total_heads * head_dim, device=device, dtype=dtype
+    )
+    q_flat = full[:, :, : num_heads * head_dim]
+    q_4d = q_flat.unflatten(-1, (num_heads, head_dim))
+    assert q_4d.size(0) == 1
+    assert q_4d.stride(-3) == total_heads * head_dim
+    assert q_4d.stride(-3) != q_4d.size(-2) * q_4d.stride(-2)
+    return q_4d
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7])
+@pytest.mark.parametrize("num_heads", [4, 8])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("specify_out", [True, False])
+def test_gemma_norm_4d(num_tokens, num_heads, head_dim, dtype, specify_out):
+    x = torch.randn(1, num_tokens, num_heads, head_dim, device=device, dtype=dtype)
+    w = torch.randn(head_dim, device=device, dtype=dtype)
+
+    y_ref = gemma_rms_norm(x, w)
+    if specify_out:
+        y = torch.empty_like(x)
+        sgl_kernel.gemma_rmsnorm(x, w, out=y)
+    else:
+        y = sgl_kernel.gemma_rmsnorm(x, w)
+
+    torch.testing.assert_close(y_ref, y, **norm_tolerances(dtype))
+
+
+@pytest.mark.parametrize("num_tokens", [7, 32])
+@pytest.mark.parametrize("num_heads", [4, 8])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("specify_out", [True, False])
+def test_gemma_norm_4d_non_flattenable(
+    num_tokens, num_heads, head_dim, dtype, specify_out
+):
+    x = _make_non_flattenable_4d(num_tokens, num_heads, head_dim, dtype)
+    w = torch.randn(head_dim, device=device, dtype=dtype)
+
+    y_ref = gemma_rms_norm(x.clone(), w)
+    if specify_out:
+        y = torch.empty_strided(x.shape, x.stride(), device=device, dtype=x.dtype)
+        sgl_kernel.gemma_rmsnorm(x, w, out=y)
+    else:
+        y = sgl_kernel.gemma_rmsnorm(x, w)
+
+    torch.testing.assert_close(y_ref, y, **norm_tolerances(dtype))
+
+
+def test_gemma_norm_4d_invalid_leading_dim_size_raises():
+    x = torch.randn(2, 7, 4, 128, device=device, dtype=torch.float16)
+    w = torch.randn(128, device=device, dtype=torch.float16)
+
+    with pytest.raises(RuntimeError, match="leading dimension 0 must have size 1"):
+        sgl_kernel.gemma_rmsnorm(x, w)
+
+
+###############################################################################
 # Mixed input/weight dtype tests
 ###############################################################################
 

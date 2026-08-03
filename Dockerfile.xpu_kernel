@@ -17,7 +17,7 @@ ARG SG_LANG_REPO=https://github.com/sgl-project/sglang.git
 ARG SG_LANG_BRANCH=main
 
 ARG SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git
-ARG SG_LANG_KERNEL_BRANCH=main
+ARG SG_LANG_KERNEL_BRANCH=release/v0.1.0
 
 # Pin the compute UMD + IGC. The kobuk-team PPA is rolling; an untested build
 # mismatched the host xe KMD and faulted libze_intel_gpu.so on the B580 runner.

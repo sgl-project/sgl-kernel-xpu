@@ -424,7 +424,7 @@ if __name__ == "__main__":
         fn_triton = lambda: flash_mla_sparse_decode_triton(**inputs)
         ms_triton, _, _ = triton.testing.do_bench(fn_triton, quantiles=[0.5, 0.2, 0.8])
         bw_triton = total_bytes / (ms_triton / 1e3) / 1e9
-
+        torch.xpu.synchronize()
         # SGL Kernel
         fn_sgl = lambda: flash_mla_with_kvcache(
             q=inputs["q"],
@@ -446,6 +446,7 @@ if __name__ == "__main__":
         )
         ms_sgl, _, _ = triton.testing.do_bench(fn_sgl, quantiles=[0.5, 0.2, 0.8])
         bw_sgl = total_bytes / (ms_sgl / 1e3) / 1e9
+        torch.xpu.synchronize()
 
         results.append((b, topk, extra_topk, ms_triton, ms_sgl, bw_triton, bw_sgl))
 

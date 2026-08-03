@@ -290,10 +290,7 @@ def flash_mla_with_kvcache(
     if softmax_scale is None:
         softmax_scale = D_qk ** (-0.5)
 
-    assert q.dtype in (
-        torch.float16,
-        torch.bfloat16,
-    ), f"q.dtype must be fp16 or bf16, got {q.dtype}"
+    assert q.dtype in (torch.bfloat16,), f"q.dtype must be bf16, got {q.dtype}"
 
     # Allocate outputs
     out = q.new_empty((B, s_q, H, head_dim_v))
@@ -354,3 +351,47 @@ def flash_mla_with_kvcache(
         ), "block_table path is not enabled yet for xpu"
 
     return out, lse
+
+
+def flash_mla_sparse_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Sparse attention prefill kernel
+
+    Args:
+        q: [s_q, h_q, d_qk], bfloat16
+        kv: [s_kv, h_kv, d_qk], bfloat16
+        indices: [s_q, h_kv, topk], int32. Invalid indices should be set to -1 or numbers >= s_kv
+        sm_scale: float
+        d_v: The dimension of value vectors. Can only be 512
+        attn_sink: optional, [h_q], float32.
+            If attn_sink is provided, when computing output, output will be additionally multiplied by exp(lse) / (exp(lse) + exp(attn_sink)).
+            +-inf in attn_sink will be handled normally (i.e., -inf has no effect, +inf will make corresponding output all zeros).
+            This argument has no effect on lse and max_logits.
+        topk_length: optional, [s_q], int32. If provided, the i-th q token will only attend to k tokens specified by indices[i, :, :topk_length[i]], ignoring later k/v tokens (even if provided in indices).
+            In extremely rare cases (topk_length provided, there is a valid topk index between topk_length[i] ~ s_kv, and that topk index points to a k token containing NaN), operator output will contain NaN, so please avoid this situation.
+
+    Returns:
+        (output, max_logits, lse)
+        Please refer to tests/ref.py for the precise definitions of these parameters.
+        - output: [s_q, h_q, d_v], bfloat16
+        - max_logits:  [s_q, h_q], float
+        - lse: [s_q, h_q], float, log-sum-exp of attention scores
+    """
+    output = torch.empty((q.shape[0], q.shape[1], d_v), device=q.device, dtype=q.dtype)
+    max_logits = torch.empty(
+        (q.shape[0], q.shape[1]), device=q.device, dtype=torch.float32
+    )
+    lse = torch.empty((q.shape[0], q.shape[1]), device=q.device, dtype=torch.float32)
+
+    torch.ops.sgl_kernel.flash_mla_sparse_prefill.default(
+        output, max_logits, lse, q, kv, indices, sm_scale, d_v, attn_sink, topk_length
+    )
+    return output, max_logits, lse

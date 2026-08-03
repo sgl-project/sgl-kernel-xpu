@@ -16,6 +16,77 @@ constexpr int64_t kTokensPerGroup = 128 / kTokenGroups;  // 16
 
 namespace FlashCompress128Impl {
 
+// Load + online softmax + weighted reduction shared by decode and prefill compress.
+// For decode, pass buffer_len=128 so all tokens load from kv_page.
+template <typename buffer_t, typename input_t, typename out_t>
+inline void c128_forward(
+    const buffer_t* kv_page,
+    const input_t* kv_input,
+    const input_t* ape,
+    int64_t fresh_start,
+    int64_t buffer_len,
+    int64_t t_start,
+    int64_t head_dim,
+    int64_t elem_size,
+    int64_t h,
+    int64_t tg,
+    int64_t h_lane,
+    out_t* kv_out_row,
+    sycl::nd_item<1> item,
+    sycl::local_accessor<float, 1> shared) {
+  float kv_reg[kTokensPerGroup];
+  float score_reg[kTokensPerGroup];
+  for (int64_t i = 0; i < kTokensPerGroup; ++i) {
+    const int64_t t = t_start + i;
+    if (t < buffer_len) {
+      const buffer_t* row_ptr = kv_page + t * elem_size;
+      kv_reg[i] = static_cast<float>(row_ptr[h]);
+      score_reg[i] = static_cast<float>(row_ptr[head_dim + h]) + static_cast<float>(ape[t * head_dim + h]);
+    } else {
+      const input_t* row_ptr = kv_input + (fresh_start + (t - buffer_len)) * elem_size;
+      kv_reg[i] = static_cast<float>(row_ptr[h]);
+      score_reg[i] = static_cast<float>(row_ptr[head_dim + h]) + static_cast<float>(ape[t * head_dim + h]);
+    }
+  }
+
+  float local_max = score_reg[0];
+  for (int64_t i = 1; i < kTokensPerGroup; ++i)
+    local_max = sycl::fmax(local_max, score_reg[i]);
+
+  float local_exp_sum = 0.0f;
+  float local_weighted_sum = 0.0f;
+  for (int64_t i = 0; i < kTokensPerGroup; ++i) {
+    const float exp_score = sycl::exp(score_reg[i] - local_max);
+    local_exp_sum += exp_score;
+    local_weighted_sum += kv_reg[i] * exp_score;
+  }
+
+  // Shared memory layout (3 sections, each [kTokenGroups][kTileDim]).
+  const size_t kSmemSection = static_cast<size_t>(kTokenGroups * kTileDim);
+  const size_t smem_idx = static_cast<size_t>(tg * kTileDim + h_lane);
+  shared[smem_idx] = local_max;
+  item.barrier(sycl::access::fence_space::local_space);
+
+  float global_max = local_max;
+  for (int64_t g = 0; g < kTokenGroups; ++g)
+    global_max = sycl::fmax(global_max, shared[static_cast<size_t>(g * kTileDim) + static_cast<size_t>(h_lane)]);
+
+  const float rescale = sycl::exp(local_max - global_max);
+  shared[kSmemSection + smem_idx] = local_exp_sum * rescale;
+  shared[2 * kSmemSection + smem_idx] = local_weighted_sum * rescale;
+  item.barrier(sycl::access::fence_space::local_space);
+
+  if (tg == 0) {
+    float exp_sum = 0.0f;
+    float weighted_sum = 0.0f;
+    for (int64_t g = 0; g < kTokenGroups; ++g) {
+      exp_sum += shared[kSmemSection + static_cast<size_t>(g * kTileDim) + static_cast<size_t>(h_lane)];
+      weighted_sum += shared[2 * kSmemSection + static_cast<size_t>(g * kTileDim) + static_cast<size_t>(h_lane)];
+    }
+    kv_out_row[h] = static_cast<out_t>(weighted_sum / exp_sum);
+  }
+}
+
 template <typename buffer_t, typename input_t, typename out_t>
 struct FlashCompress128DecodeKernel {
   [[sycl::reqd_sub_group_size(16)]]
@@ -54,65 +125,22 @@ struct FlashCompress128DecodeKernel {
 
     item.barrier(sycl::access::fence_space::global_and_local);
 
-    const buffer_t* kv_page = kv_buffer_ + static_cast<int64_t>(plan.read_page_1) * page_elem_size_;
-    const int64_t t_start = tg * kTokensPerGroup;
-
-    // Load all kTokensPerGroup tokens into registers.
-    float kv_reg[kTokensPerGroup];
-    float score_reg[kTokensPerGroup];
-    for (int64_t i = 0; i < kTokensPerGroup; ++i) {
-      const int64_t t = t_start + i;
-      const buffer_t* row_ptr = kv_page + t * elem_size_;
-      kv_reg[i] = static_cast<float>(row_ptr[h]);
-      score_reg[i] = static_cast<float>(row_ptr[head_dim_ + h]) + static_cast<float>(ape_[t * head_dim_ + h]);
-    }
-
-    // Pass 1: compute local max over kTokensPerGroup scores.
-    float local_max = score_reg[0];
-    for (int64_t i = 1; i < kTokensPerGroup; ++i) {
-      local_max = sycl::fmax(local_max, score_reg[i]);
-    }
-
-    // Pass 2: compute partial exp_sum and weighted_sum.
-    float local_exp_sum = 0.0f;
-    float local_weighted_sum = 0.0f;
-    for (int64_t i = 0; i < kTokensPerGroup; ++i) {
-      const float exp_score = sycl::exp(score_reg[i] - local_max);
-      local_exp_sum += exp_score;
-      local_weighted_sum += kv_reg[i] * exp_score;
-    }
-
-    // Shared memory layout (3 sections, each [kTokenGroups][kTileDim]):
-    //   section 0: local_max           [tg * kTileDim + h_lane]
-    //   section 1: scaled exp_sum      [kSmemSection + ...]
-    //   section 2: scaled weighted_sum [2*kSmemSection + ...]
-    const size_t kSmemSection = static_cast<size_t>(kTokenGroups * kTileDim);
-    const size_t smem_idx = static_cast<size_t>(tg * kTileDim + h_lane);
-    shared_[smem_idx] = local_max;
-    item.barrier(sycl::access::fence_space::local_space);
-
-    // Compute global max across all token groups for this h_lane.
-    float global_max = local_max;
-    for (int64_t g = 0; g < kTokenGroups; ++g) {
-      global_max = sycl::fmax(global_max, shared_[static_cast<size_t>(g * kTileDim) + static_cast<size_t>(h_lane)]);
-    }
-
-    // Rescale this group's partial sums to the global max and store.
-    const float rescale = sycl::exp(local_max - global_max);
-    shared_[kSmemSection + smem_idx] = local_exp_sum * rescale;
-    shared_[2 * kSmemSection + smem_idx] = local_weighted_sum * rescale;
-    item.barrier(sycl::access::fence_space::local_space);
-
-    // Token group 0 reduces all scaled partial sums and writes the final output.
-    if (tg == 0) {
-      float exp_sum = 0.0f;
-      float weighted_sum = 0.0f;
-      for (int64_t g = 0; g < kTokenGroups; ++g) {
-        exp_sum += shared_[kSmemSection + static_cast<size_t>(g * kTileDim) + static_cast<size_t>(h_lane)];
-        weighted_sum += shared_[2 * kSmemSection + static_cast<size_t>(g * kTileDim) + static_cast<size_t>(h_lane)];
-      }
-      kv_output_[static_cast<int64_t>(bid) * head_dim_ + h] = static_cast<out_t>(weighted_sum / exp_sum);
-    }
+    // buffer_len=128: all tokens come from kv_page, kv_input/fresh_start unused.
+    c128_forward(
+        kv_buffer_ + static_cast<int64_t>(plan.read_page_1) * page_elem_size_,
+        kv_input_,
+        ape_,
+        0,
+        128,
+        tg * kTokensPerGroup,
+        head_dim_,
+        elem_size_,
+        h,
+        tg,
+        h_lane,
+        kv_output_ + static_cast<int64_t>(bid) * head_dim_,
+        item,
+        shared_);
   }
 
   buffer_t* kv_buffer_;
@@ -152,72 +180,22 @@ struct FlashCompress128PrefillCompressKernel {
     const int64_t h = split_offset + h_lane;
     const int64_t buffer_len = static_cast<int64_t>(plan.buffer_len);
     const int64_t fresh_start = static_cast<int64_t>(plan.ragged_id) - 127 + buffer_len;
-    const buffer_t* kv_page = kv_buffer_ + static_cast<int64_t>(plan.read_page_1) * page_elem_size_;
-    const int64_t t_start = tg * kTokensPerGroup;
 
-    // Load all kTokensPerGroup tokens into registers.
-    float kv_reg[kTokensPerGroup];
-    float score_reg[kTokensPerGroup];
-    for (int64_t i = 0; i < kTokensPerGroup; ++i) {
-      const int64_t t = t_start + i;
-      if (t < buffer_len) {
-        const buffer_t* row_ptr = kv_page + t * elem_size_;
-        kv_reg[i] = static_cast<float>(row_ptr[h]);
-        score_reg[i] = static_cast<float>(row_ptr[head_dim_ + h]) + static_cast<float>(ape_[t * head_dim_ + h]);
-      } else {
-        const int64_t src_row = fresh_start + (t - buffer_len);
-        const input_t* row_ptr = kv_input_ + src_row * elem_size_;
-        kv_reg[i] = static_cast<float>(row_ptr[h]);
-        score_reg[i] = static_cast<float>(row_ptr[head_dim_ + h]) + static_cast<float>(ape_[t * head_dim_ + h]);
-      }
-    }
-
-    // Pass 1: compute local max over kTokensPerGroup scores.
-    float local_max = score_reg[0];
-    for (int64_t i = 1; i < kTokensPerGroup; ++i) {
-      local_max = sycl::fmax(local_max, score_reg[i]);
-    }
-
-    // Pass 2: compute partial exp_sum and weighted_sum.
-    float local_exp_sum = 0.0f;
-    float local_weighted_sum = 0.0f;
-    for (int64_t i = 0; i < kTokensPerGroup; ++i) {
-      const float exp_score = sycl::exp(score_reg[i] - local_max);
-      local_exp_sum += exp_score;
-      local_weighted_sum += kv_reg[i] * exp_score;
-    }
-
-    // Shared memory layout (3 sections, each [kTokenGroups][kTileDim]):
-    //   section 0: local_max           [tg * kTileDim + h_lane]
-    //   section 1: scaled exp_sum      [kSmemSection + ...]
-    //   section 2: scaled weighted_sum [2*kSmemSection + ...]
-    const size_t kSmemSection = static_cast<size_t>(kTokenGroups * kTileDim);
-    const size_t smem_idx = static_cast<size_t>(tg * kTileDim + h_lane);
-    shared_[smem_idx] = local_max;
-    item.barrier(sycl::access::fence_space::local_space);
-
-    // Compute global max across all token groups for this h_lane.
-    float global_max = local_max;
-    for (int64_t g = 0; g < kTokenGroups; ++g) {
-      global_max = sycl::fmax(global_max, shared_[static_cast<size_t>(g * kTileDim) + static_cast<size_t>(h_lane)]);
-    }
-
-    // Rescale this group's partial sums to the global max and store.
-    const float rescale_to_global = sycl::exp(local_max - global_max);
-    shared_[kSmemSection + smem_idx] = local_exp_sum * rescale_to_global;
-    shared_[2 * kSmemSection + smem_idx] = local_weighted_sum * rescale_to_global;
-    item.barrier(sycl::access::fence_space::local_space);
-
-    // Token group 0 reduces all scaled partial sums and writes the final output.
-    if (tg == 0) {
-      float exp_sum = 0.0f;
-      float weighted_sum = 0.0f;
-      for (int64_t g = 0; g < kTokenGroups; ++g) {
-        exp_sum += shared_[kSmemSection + static_cast<size_t>(g * kTileDim) + static_cast<size_t>(h_lane)];
-        weighted_sum += shared_[2 * kSmemSection + static_cast<size_t>(g * kTileDim) + static_cast<size_t>(h_lane)];
-      }
-      kv_output_[static_cast<int64_t>(pid) * head_dim_ + h] = static_cast<out_t>(weighted_sum / exp_sum);
-    }
+    c128_forward(
+        kv_buffer_ + static_cast<int64_t>(plan.read_page_1) * page_elem_size_,
+        kv_input_,
+        ape_,
+        fresh_start,
+        buffer_len,
+        tg * kTokensPerGroup,
+        head_dim_,
+        elem_size_,
+        h,
+        tg,
+        h_lane,
+        kv_output_ + static_cast<int64_t>(pid) * head_dim_,
+        item,
+        shared_);
   }
 
   buffer_t* kv_buffer_;

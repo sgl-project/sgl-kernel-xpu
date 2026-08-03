@@ -129,7 +129,8 @@ jobs:
               python3 bench_hc_post.py 2>&1 | tee bench_hc_post.py.log && \
               python3 bench_sgemm_lora_a_fwd.py 2>&1 | tee bench_sgemm_lora_a_fwd.py.log && \
               python3 bench_biased_topk.py 2>&1 | tee bench_biased_topk.py.log && \
-              python3 bench_min_p_sampling_from_probs.py 2>&1 | tee bench_min_p_sampling_from_probs.py.log
+              python3 bench_min_p_sampling_from_probs.py 2>&1 | tee bench_min_p_sampling_from_probs.py.log && \
+              python3 bench_top_k_top_p_sampling_from_probs.py 2>&1 | tee bench_top_k_top_p_sampling_from_probs.py.log
             "
 
       - name: Copy logs from container

@@ -66,6 +66,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
   m.impl("top_k_renorm_probs", torch::kXPU, &top_k_renorm_probs);
 
+  m.def(
+      "min_p_sampling_from_probs(Tensor probs, Tensor! output, Tensor? maybe_indices, Tensor? "
+      "maybe_min_p_arr, float min_p_val, bool deterministic, Generator? gen) -> ()");
+  m.impl("min_p_sampling_from_probs", torch::kXPU, &min_p_sampling_from_probs);
+
   /*
    * Fast radix top-k (DeepSeek V3.2 indexer)
    */
@@ -86,6 +91,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("swiglu_gpt_oss_sigmoid_alpha", torch::kXPU, &swiglu_gpt_oss_sigmoid_alpha);
 
   m.def(
+      "biased_topk(Tensor input, Tensor bias, Tensor! output, Tensor! indices, int topk, int scoring_func, int "
+      "num_fused_shared_experts, bool renormalize, float routed_scaling_factor, bool "
+      "apply_routed_scaling_factor_on_output) -> ()");
+  m.impl("biased_topk", torch::kXPU, &at::native::xpu::biased_topk);
+
+  m.def(
       "rotary_embedding(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
       "bool is_neox) -> (Tensor, Tensor)");
   m.impl("rotary_embedding", torch::kXPU, &at::native::xpu::rotary_embedding);
@@ -94,6 +105,69 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "store_cache(Tensor k, Tensor v, Tensor(a!) k_cache, Tensor(b!) v_cache, "
       "Tensor indices) -> ()");
   m.impl("store_cache", torch::kXPU, &at::native::xpu::store_cache);
+
+  // KV cache transfer ops
+  m.def(
+      "transfer_kv_per_layer(Tensor src_k, Tensor(a!) dst_k, Tensor src_v, Tensor(b!) dst_v, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_per_layer", torch::kXPU, &transfer_kv_per_layer);
+
+  m.def(
+      "transfer_kv_per_layer_mla(Tensor src, Tensor(a!) dst, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_per_layer_mla", torch::kXPU, &transfer_kv_per_layer_mla);
+
+  m.def(
+      "transfer_kv_all_layer(Tensor src_k_layers, Tensor(a!) dst_k_layers, "
+      "Tensor src_v_layers, Tensor(b!) dst_v_layers, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int num_layers, "
+      "int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_all_layer", torch::kXPU, &transfer_kv_all_layer);
+
+  m.def(
+      "transfer_kv_all_layer_mla(Tensor src_layers, Tensor(a!) dst_layers, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int num_layers, "
+      "int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_all_layer_mla", torch::kXPU, &transfer_kv_all_layer_mla);
+
+  m.def(
+      "transfer_kv_all_layer_lf_ph(Tensor src_k_layers, Tensor(a!) dst_k, "
+      "Tensor src_v_layers, Tensor(b!) dst_v, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, "
+      "int num_layers, int page_size, int head_num, int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_all_layer_lf_ph", torch::kXPU, &transfer_kv_all_layer_lf_ph);
+
+  m.def(
+      "transfer_kv_per_layer_ph_lf(Tensor src_k, Tensor(a!) dst_k, "
+      "Tensor src_v, Tensor(b!) dst_v, "
+      "Tensor src_indices, Tensor dst_indices, int layer_id, int item_size, int src_layout_dim, "
+      "int page_size, int head_num, int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_per_layer_ph_lf", torch::kXPU, &transfer_kv_per_layer_ph_lf);
+
+  m.def(
+      "transfer_kv_per_layer_pf_lf(Tensor src_k, Tensor(a!) dst_k, Tensor src_v, Tensor(b!) dst_v, "
+      "Tensor src_indices, Tensor dst_indices, int layer_id, int item_size, int src_layout_dim, "
+      "int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_per_layer_pf_lf", torch::kXPU, &transfer_kv_per_layer_pf_lf);
+
+  m.def(
+      "transfer_kv_all_layer_lf_pf(Tensor src_k_layers, Tensor(a!) dst_k, "
+      "Tensor src_v_layers, Tensor(b!) dst_v, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, "
+      "int num_layers, int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_all_layer_lf_pf", torch::kXPU, &transfer_kv_all_layer_lf_pf);
+
+  m.def(
+      "transfer_kv_per_layer_mla_pf_lf(Tensor src, Tensor(a!) dst, "
+      "Tensor src_indices, Tensor dst_indices, int layer_id, int item_size, int src_layout_dim, "
+      "int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_per_layer_mla_pf_lf", torch::kXPU, &transfer_kv_per_layer_mla_pf_lf);
+
+  m.def(
+      "transfer_kv_all_layer_mla_lf_pf(Tensor src_layers, Tensor(a!) dst, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, "
+      "int num_layers, int block_quota, int sgs_per_wg) -> ()");
+  m.impl("transfer_kv_all_layer_mla_lf_pf", torch::kXPU, &transfer_kv_all_layer_mla_lf_pf);
 
 #ifdef USE_MOE
   m.def(
@@ -356,6 +430,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "plan_compress_decode(Tensor req_pool_indices, Tensor req_to_token, Tensor full_to_state, "
       "Tensor seq_lens, int compress_ratio, int swa_page_size, int ring_size) -> Tensor");
   m.impl("plan_compress_decode", torch::kXPU, &at::native::xpu::plan_compress_decode);
+
+  m.def(
+      "flash_compress128_decode(Tensor! kv_buffer, Tensor kv_input, Tensor! kv_output, Tensor ape, Tensor plan_d) "
+      "-> ()");
+  m.impl("flash_compress128_decode", torch::kXPU, &at::native::xpu::flash_compress128_decode);
 }
 
 REGISTER_EXTENSION(common_ops)

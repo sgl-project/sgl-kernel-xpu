@@ -230,7 +230,132 @@ void sgl_per_token_group_quant_fp4(
     double eps,
     std::optional<at::Tensor> input_secondary = std::nullopt);
 void store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices);
+void biased_topk(
+    const at::Tensor& input,
+    const at::Tensor& bias,
+    at::Tensor& output,
+    at::Tensor& indices,
+    int64_t topk,
+    int64_t scoring_func,
+    int64_t num_fused_shared_experts,
+    bool renormalize,
+    double routed_scaling_factor,
+    bool apply_routed_scaling_factor_on_output);
 }  // namespace at::native::xpu
+
+/*
+ * From csrc/kvcacheio — KV cache scatter/gather transfer kernels
+ */
+void transfer_kv_per_layer(
+    const at::Tensor& src_k,
+    at::Tensor& dst_k,
+    const at::Tensor& src_v,
+    at::Tensor& dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t block_quota,
+    int64_t sgs_per_wg);
+void transfer_kv_per_layer_mla(
+    const at::Tensor& src,
+    at::Tensor& dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t block_quota,
+    int64_t sgs_per_wg);
+void transfer_kv_all_layer(
+    const at::Tensor& src_k_layers,
+    const at::Tensor& dst_k_layers,
+    const at::Tensor& src_v_layers,
+    const at::Tensor& dst_v_layers,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t sgs_per_wg);
+void transfer_kv_all_layer_mla(
+    const at::Tensor& src_layers,
+    const at::Tensor& dst_layers,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t sgs_per_wg);
+void transfer_kv_all_layer_lf_ph(
+    const at::Tensor& src_k_layers,
+    at::Tensor& dst_k,
+    const at::Tensor& src_v_layers,
+    at::Tensor& dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers,
+    int64_t page_size,
+    int64_t head_num,
+    int64_t block_quota,
+    int64_t sgs_per_wg);
+void transfer_kv_per_layer_ph_lf(
+    const at::Tensor& src_k,
+    at::Tensor& dst_k,
+    const at::Tensor& src_v,
+    at::Tensor& dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t page_size,
+    int64_t head_num,
+    int64_t block_quota,
+    int64_t sgs_per_wg);
+void transfer_kv_per_layer_pf_lf(
+    const at::Tensor& src_k,
+    at::Tensor& dst_k,
+    const at::Tensor& src_v,
+    at::Tensor& dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t block_quota,
+    int64_t sgs_per_wg);
+void transfer_kv_all_layer_lf_pf(
+    const at::Tensor& src_k_layers,
+    at::Tensor& dst_k,
+    const at::Tensor& src_v_layers,
+    at::Tensor& dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t sgs_per_wg);
+void transfer_kv_per_layer_mla_pf_lf(
+    const at::Tensor& src,
+    at::Tensor& dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t block_quota,
+    int64_t sgs_per_wg);
+void transfer_kv_all_layer_mla_lf_pf(
+    const at::Tensor& src_layers,
+    at::Tensor& dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t sgs_per_wg);
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void silu_and_mul_clamp(torch::Tensor& out, torch::Tensor& input, double swiglu_limit);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
@@ -570,13 +695,13 @@ void segment_packbits(
  * From FlashInfer
  */
 void min_p_sampling_from_probs(
-    at::Tensor probs,
-    at::Tensor output,
-    std::optional<at::Tensor> maybe_indices,
-    std::optional<at::Tensor> maybe_min_p_arr,
+    const at::Tensor& probs,
+    at::Tensor& output,
+    const std::optional<at::Tensor>& maybe_indices,
+    const std::optional<at::Tensor>& maybe_min_p_arr,
     double min_p_val,
     bool deterministic,
-    std::optional<at::Generator> gen);
+    const std::optional<at::Generator>& gen);
 
 void top_k_renorm_probs(
     const at::Tensor& probs,
@@ -651,6 +776,9 @@ torch::Tensor plan_compress_decode(
     int64_t compress_ratio,
     int64_t swa_page_size,
     int64_t ring_size);
+
+void flash_compress128_decode(
+    torch::Tensor kv_buffer, torch::Tensor kv_input, torch::Tensor kv_output, torch::Tensor ape, torch::Tensor plan_d);
 
 }  // namespace at::native::xpu
 

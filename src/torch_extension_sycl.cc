@@ -401,6 +401,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? workspace=None) -> ()");
   m.impl("gdn_attention", torch::kXPU, &gdn_attention);
 
+  m.def(
+      "gdn_attention_workspace_bytes_needed(int num_prefills, int num_decodes, int non_spec_token, "
+      "int batch_size, int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim, int tp_size, "
+      "ScalarType dtype) -> int");
+  m.impl(
+      "gdn_attention_workspace_bytes_needed", c10::DispatchKey::BackendSelect, &gdn_attention_workspace_bytes_needed);
+
   /*
    * Mamba causal conv1d (XPU)
    */

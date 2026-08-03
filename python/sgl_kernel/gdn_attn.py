@@ -2,14 +2,6 @@ from typing import Dict, Optional
 
 import torch
 
-# Must match `gdn::chunk_size_xe2` in sgl-kernel-xpu's
-# src/sycl/gdn_attn/gdn_attn_utils.h -- the prefill/chunk-scan path pads
-# non-spec tokens up to a multiple of this chunk size.
-_GDN_CHUNK_SIZE_XE2 = 64
-# Byte alignment the C++ side (`gdn_attention`'s `make_ws_tensor`) uses when
-# carving scratch tensors out of the workspace buffer. Kept in sync so the
-# byte-size computed here exactly matches what the op will actually consume.
-_GDN_WS_ALIGN = 256
 # Headroom applied when (re)growing the cached workspace buffer, so a call
 # that needs slightly more than the previous largest call doesn't force a
 # reallocation on every subsequent call of a similar size.
@@ -19,10 +11,6 @@ _GDN_WS_HEADROOM = 1.25
 # device and shared process-wide across every caller/layer that goes through
 # this wrapper.
 _gdn_ws_cache: Dict[torch.device, torch.Tensor] = {}
-
-
-def _align_up(nbytes: int) -> int:
-    return (nbytes + _GDN_WS_ALIGN - 1) // _GDN_WS_ALIGN * _GDN_WS_ALIGN
 
 
 def _gdn_workspace_bytes_needed(
@@ -38,30 +26,19 @@ def _gdn_workspace_bytes_needed(
     dtype: torch.dtype,
 ) -> int:
     """Compute the exact number of bytes `gdn_attention`'s C++ implementation
-    will carve out of the workspace buffer for this call's shapes, mirroring
-    its internal (aligned, sequential-cursor) layout math exactly -- so the
-    Python-side buffer is grown to precisely the size actually needed (no
-    guessing/duplication of unrelated logic, no over/under allocation)."""
-    if non_spec_token <= 0 or (num_prefills + num_decodes) <= 0:
-        return 0
-    nk = num_k_heads // tp_size
-    nv = num_v_heads // tp_size
-    itemsize = torch.tensor([], dtype=dtype).element_size()
-    if num_prefills > 0:
-        # Prefill/chunk path: q, k, v (activation dtype) + b_prefill,
-        # a_prefill (always float32), all padded to a chunk-size multiple.
-        padding_size = batch_size * (_GDN_CHUNK_SIZE_XE2 - 1)
-        n = non_spec_token + padding_size
-        qk_bytes = _align_up(n * nk * head_k_dim * itemsize)
-        v_bytes = _align_up(n * nv * head_v_dim * itemsize)
-        ba_bytes = _align_up(n * nv * 4)  # float32
-    else:
-        # Decode path: q, k, v, b, a, all activation dtype, unpadded.
-        n = non_spec_token
-        qk_bytes = _align_up(n * nk * head_k_dim * itemsize)
-        v_bytes = _align_up(n * nv * head_v_dim * itemsize)
-        ba_bytes = _align_up(n * nv * itemsize)
-    return 2 * qk_bytes + v_bytes + 2 * ba_bytes
+    will carve out of the workspace buffer for this call's shapes."""
+    return torch.ops.sgl_kernel.gdn_attention_workspace_bytes_needed.default(
+        num_prefills,
+        num_decodes,
+        non_spec_token,
+        batch_size,
+        num_k_heads,
+        num_v_heads,
+        head_k_dim,
+        head_v_dim,
+        tp_size,
+        dtype,
+    )
 
 
 def _get_gdn_workspace(nbytes: int, device: torch.device) -> torch.Tensor:

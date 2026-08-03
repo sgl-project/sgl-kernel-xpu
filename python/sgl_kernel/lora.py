@@ -198,7 +198,7 @@ def sgemm_lora_b_fwd(
       segment's rows via the grouped-GEMM epilogue.
     - The reduction dimension ``K`` is ``max_rank`` (``input_x.size(1)``), so the
       caller is expected to have zero-padded the rank columns beyond each adapter's
-      ``R_l`` in both ``input_x`` and ``weights``.
+      ``R_l`` in ``weights`` (i.e. weight columns ``R_l:`` are zero).
 
     Parameters
     ----------

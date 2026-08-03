@@ -125,7 +125,7 @@ void sgemm_lora_b_fwd(
   // Validate output tensor size and dtype
   TORCH_CHECK(
       output.size(0) == num_tokens_i64 && output.size(1) == output_dim,
-      "Output tensor must have shape (num_tokens, ouput_dim)");
+      "Output tensor must have shape (num_tokens, output_dim)");
   TORCH_CHECK(output.scalar_type() == weights.scalar_type(), "Output tensor dtype must match weights dtype");
   TORCH_CHECK(weights.scalar_type() == input_x.scalar_type(), "Input tensor dtype must match weights dtype");
   if (base_output.has_value()) {

@@ -72,9 +72,9 @@ struct GroupedGemmMeta {
   torch::Tensor b_off;          // int64 [num_segments]     byte offset into B per segment (device)
   torch::Tensor d_off;          // int64 [num_segments]     byte offset into D per segment (device)
   // Per-segment epilogue alpha: a *contiguous* fp32 value buffer (one alpha per
-  // segment), consumed via the fusion's strided `alpha_ptr` path (dAlpha stride
-  // 1). Undefined tensor when no scalings were supplied (A-fwd), in which case
-  // the caller falls back to a single broadcast alpha.
+  // segment). Callers may build an alpha_ptr_array (one pointer per segment into
+  // this buffer) for the grouped epilogue. Undefined when no scalings were
+  // supplied (A-fwd), in which case the caller falls back to a single broadcast alpha.
   torch::Tensor alpha;  // float32 [num_segments], or undefined
 };
 

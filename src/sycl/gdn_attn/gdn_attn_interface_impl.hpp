@@ -388,7 +388,7 @@ void gdn_attention(
       torch::Tensor q = make_ws_tensor(
           {non_spec_token + padding_size, num_k_heads / tp_size, head_k_dim},
           dtype_st,
-          /*zero_init=*/false);
+          /*zero_init=*/true);
       torch::Tensor k = make_ws_tensor(
           {non_spec_token + padding_size, num_k_heads / tp_size, head_k_dim},
           dtype_st,

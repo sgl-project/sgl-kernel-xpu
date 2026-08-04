@@ -113,8 +113,8 @@ struct TopKTopPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const uint32_t row_idx = (maybe_indices != nullptr) ? static_cast<uint32_t>(maybe_indices[bx]) : bx;
     const size_t row_offset = static_cast<size_t>(row_idx) * static_cast<size_t>(d);
 
-    const int k = (maybe_top_k_arr != nullptr) ? static_cast<int>(maybe_top_k_arr[row_idx]) : top_k_val;
-    const float p = (maybe_top_p_arr != nullptr) ? maybe_top_p_arr[row_idx] : top_p_val;
+    const int k = (maybe_top_k_arr != nullptr) ? static_cast<int>(maybe_top_k_arr[bx]) : top_k_val;
+    const float p = (maybe_top_p_arr != nullptr) ? maybe_top_p_arr[bx] : top_p_val;
 
     // vec_size is chosen as gcd(16/sizeof(float), vocab_size) on the host, so
     // VEC_SIZE always divides d exactly: every chunk is a full vector.
@@ -293,6 +293,9 @@ void top_k_top_p_sampling_from_probs(
     TORCH_CHECK(maybe_indices->scalar_type() == torch::kInt64, "maybe_indices must be int64");
     TORCH_CHECK(maybe_indices->size(0) == batch_size, "maybe_indices size must match batch_size");
     indices_ptr = maybe_indices->data_ptr<int64_t>();
+  } else {
+    TORCH_CHECK(
+        probs.size(0) == batch_size, "probs.size(0) must match output.size(0) when maybe_indices is not provided");
   }
 
   const int32_t* top_k_ptr = nullptr;
@@ -300,7 +303,10 @@ void top_k_top_p_sampling_from_probs(
     CHECK_INPUT((*maybe_top_k_arr));
     TORCH_CHECK(maybe_top_k_arr->dim() == 1, "maybe_top_k_arr must be a 1D tensor");
     TORCH_CHECK(maybe_top_k_arr->scalar_type() == torch::kInt32, "maybe_top_k_arr must be int32");
+    TORCH_CHECK(maybe_top_k_arr->size(0) == batch_size, "maybe_top_k_arr size must match batch_size");
     top_k_ptr = maybe_top_k_arr->data_ptr<int32_t>();
+  } else {
+    TORCH_CHECK(top_k_val > 0 && top_k_val <= vocab_size, "top_k_val must be within (0, vocab_size]");
   }
 
   const float* top_p_ptr = nullptr;
@@ -308,7 +314,10 @@ void top_k_top_p_sampling_from_probs(
     CHECK_INPUT((*maybe_top_p_arr));
     TORCH_CHECK(maybe_top_p_arr->dim() == 1, "maybe_top_p_arr must be a 1D tensor");
     TORCH_CHECK(maybe_top_p_arr->scalar_type() == torch::kFloat32, "maybe_top_p_arr must be float32");
+    TORCH_CHECK(maybe_top_p_arr->size(0) == batch_size, "maybe_top_p_arr size must match batch_size");
     top_p_ptr = maybe_top_p_arr->data_ptr<float>();
+  } else {
+    TORCH_CHECK(top_p_val > 0.0 && top_p_val <= 1.0, "top_p_val must be within (0, 1]");
   }
 
   // Resolve the Philox seed/offset from the (default) XPU generator.

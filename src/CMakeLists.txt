@@ -56,7 +56,6 @@ endif()
 
 file(GLOB device_cpp "sycl/*.cpp" "sycl/*.sycl")
 file(GLOB host_cpp "./*.cpp" "./*.cc")
-# Inkling sconv is registered by common_ops.
 
 # Filter out source files belonging to disabled features BEFORE splitting them
 # into common/Xe20 buckets. The disabled base sources (flash_attention.cpp,

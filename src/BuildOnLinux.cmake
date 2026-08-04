@@ -38,13 +38,11 @@ foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
     ${COMMON_DEVICE_LINK_FLAGS}
     SHARED
     SYCL_SOURCES ${sycl_src})
-  # Inkling sconv is registered by common_ops and must be linked into it.
   target_link_libraries(common_ops PUBLIC ${sycl_lib})
   list(APPEND SGL_OPS_LIBRARIES ${sycl_lib})
 
   # Decouple with PyTorch cmake definition.
-  set(sycl_install_args LIBRARY DESTINATION sgl_kernel)
-  install(TARGETS ${sycl_lib} ${sycl_install_args})
+  install(TARGETS ${sycl_lib} LIBRARY DESTINATION sgl_kernel)
   set_target_properties(${sycl_lib} PROPERTIES
     INSTALL_RPATH "$ORIGIN"
     BUILD_WITH_INSTALL_RPATH TRUE

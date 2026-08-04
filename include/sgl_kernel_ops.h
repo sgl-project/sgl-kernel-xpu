@@ -418,7 +418,15 @@ void inkling_draft_extend_sconv_cache(
     const std::optional<at::Tensor>& track_step,
     const std::optional<at::Tensor>& mamba_track_indices);
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
-inkling_fused_decode_sconv_metadata(int64_t B, const at::Tensor& cache_indices);
+inkling_fused_decode_sconv_metadata(
+    int64_t B,
+    const at::Tensor& cache_indices,
+    const std::optional<at::Tensor>& query_start_loc_out,
+    const std::optional<at::Tensor>& has_initial_state_out,
+    const std::optional<at::Tensor>& cache_mask_out,
+    const std::optional<at::Tensor>& safe_idx_out,
+    const std::optional<at::Tensor>& cu_out,
+    const std::optional<at::Tensor>& si_out);
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> inkling_fused_extend_sconv_metadata(
     int64_t B,
     int64_t T,
@@ -426,7 +434,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     int64_t his_mode,
     const std::optional<at::Tensor>& extend_seq_lens,
     const std::optional<at::Tensor>& his_src,
-    int64_t draft_token_num);
+    int64_t draft_token_num,
+    const std::optional<at::Tensor>& query_start_loc_out,
+    const std::optional<at::Tensor>& has_initial_state_out,
+    const std::optional<at::Tensor>& cache_mask_out,
+    const std::optional<at::Tensor>& safe_idx_out,
+    const std::optional<at::Tensor>& cu_out,
+    const std::optional<at::Tensor>& si_out);
 at::Tensor inkling_track_conv_indices(
     const at::Tensor& query_start_loc,
     const at::Tensor& mamba_track_seqlens,

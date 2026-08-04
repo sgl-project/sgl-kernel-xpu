@@ -14,6 +14,7 @@
 #include <torch/all.h>
 
 #include <cstdint>
+#include <initializer_list>
 #include <optional>
 #include <sycl/sycl.hpp>
 #include <tuple>
@@ -1587,6 +1588,30 @@ void check_sconv_dtype(const at::Tensor& x, const at::Tensor& other, const char*
   TORCH_CHECK(other.scalar_type() == x.scalar_type(), name, " dtype must match x dtype");
 }
 
+at::Tensor allocate_or_validate_metadata_output(
+    const std::optional<at::Tensor>& maybe_output,
+    const at::Tensor& reference,
+    at::ScalarType dtype,
+    std::initializer_list<int64_t> shape,
+    const char* name) {
+  if (!maybe_output.has_value()) {
+    return at::empty(shape, reference.options().dtype(dtype));
+  }
+
+  const at::Tensor& output = maybe_output.value();
+  check_xpu_tensor(output, name);
+  TORCH_CHECK(output.device() == reference.device(), name, " must be on the same XPU device as cache_indices");
+  TORCH_CHECK(output.scalar_type() == dtype, name, " has an unexpected dtype");
+  TORCH_CHECK(output.dim() == static_cast<int64_t>(shape.size()), name, " has an unexpected rank");
+  int64_t dim = 0;
+  for (int64_t expected : shape) {
+    TORCH_CHECK(output.size(dim) == expected, name, " has an unexpected shape");
+    ++dim;
+  }
+  TORCH_CHECK(output.is_contiguous(), name, " must be contiguous");
+  return output;
+}
+
 struct WeightLayout {
   int64_t W;
   int64_t stride_d;
@@ -1948,19 +1973,28 @@ void inkling_draft_extend_sconv_cache(
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
-inkling_fused_decode_sconv_metadata(int64_t B, const at::Tensor& cache_indices) {
+inkling_fused_decode_sconv_metadata(
+    int64_t B,
+    const at::Tensor& cache_indices,
+    const std::optional<at::Tensor>& query_start_loc_out,
+    const std::optional<at::Tensor>& has_initial_state_out,
+    const std::optional<at::Tensor>& cache_mask_out,
+    const std::optional<at::Tensor>& safe_idx_out,
+    const std::optional<at::Tensor>& cu_out,
+    const std::optional<at::Tensor>& si_out) {
   check_xpu_tensor(cache_indices, "cache_indices");
   TORCH_CHECK(cache_indices.scalar_type() == at::ScalarType::Int, "cache_indices must be int32");
   TORCH_CHECK(cache_indices.numel() >= B, "cache_indices must have at least B entries");
-  auto int32_opts = cache_indices.options().dtype(at::ScalarType::Int);
-  auto bool_opts = cache_indices.options().dtype(at::ScalarType::Bool);
-  auto int64_opts = cache_indices.options().dtype(at::ScalarType::Long);
-  at::Tensor query_start_loc = at::empty({B + 1}, int32_opts);
-  at::Tensor has_initial_state = at::empty({B}, bool_opts);
-  at::Tensor cache_mask = at::empty({B, 1, 1}, bool_opts);
-  at::Tensor safe_idx = at::empty({B}, int64_opts);
-  at::Tensor cu = at::empty({B + 1}, int64_opts);
-  at::Tensor si = at::empty({B}, int32_opts);
+  at::Tensor query_start_loc = allocate_or_validate_metadata_output(
+      query_start_loc_out, cache_indices, at::ScalarType::Int, {B + 1}, "query_start_loc_out");
+  at::Tensor has_initial_state = allocate_or_validate_metadata_output(
+      has_initial_state_out, cache_indices, at::ScalarType::Bool, {B}, "has_initial_state_out");
+  at::Tensor cache_mask = allocate_or_validate_metadata_output(
+      cache_mask_out, cache_indices, at::ScalarType::Bool, {B, 1, 1}, "cache_mask_out");
+  at::Tensor safe_idx = allocate_or_validate_metadata_output(
+      safe_idx_out, cache_indices, at::ScalarType::Long, {B}, "safe_idx_out");
+  at::Tensor cu = allocate_or_validate_metadata_output(cu_out, cache_indices, at::ScalarType::Long, {B + 1}, "cu_out");
+  at::Tensor si = allocate_or_validate_metadata_output(si_out, cache_indices, at::ScalarType::Int, {B}, "si_out");
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   DecodeMetadataParams params{
       cache_indices.data_ptr<int32_t>(),
@@ -1982,7 +2016,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     int64_t his_mode,
     const std::optional<at::Tensor>& extend_seq_lens,
     const std::optional<at::Tensor>& his_src,
-    int64_t draft_token_num) {
+    int64_t draft_token_num,
+    const std::optional<at::Tensor>& query_start_loc_out,
+    const std::optional<at::Tensor>& has_initial_state_out,
+    const std::optional<at::Tensor>& cache_mask_out,
+    const std::optional<at::Tensor>& safe_idx_out,
+    const std::optional<at::Tensor>& cu_out,
+    const std::optional<at::Tensor>& si_out) {
   check_xpu_tensor(cache_indices, "cache_indices");
   TORCH_CHECK(cache_indices.scalar_type() == at::ScalarType::Int, "cache_indices must be int32");
   TORCH_CHECK(cache_indices.numel() >= B, "cache_indices must have at least B entries");
@@ -2005,15 +2045,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     TORCH_CHECK(draft_token_num > 0, "draft_token_num must be positive for HIS_ONES");
   }
 
-  auto int32_opts = cache_indices.options().dtype(at::ScalarType::Int);
-  auto bool_opts = cache_indices.options().dtype(at::ScalarType::Bool);
-  auto int64_opts = cache_indices.options().dtype(at::ScalarType::Long);
-  at::Tensor query_start_loc = at::empty({B + 1}, int32_opts);
-  at::Tensor has_initial_state = at::empty({B}, bool_opts);
-  at::Tensor cache_mask = at::empty({B, 1, 1}, bool_opts);
-  at::Tensor safe_idx = at::empty({B}, int64_opts);
-  at::Tensor cu = at::empty({B + 1}, int64_opts);
-  at::Tensor si = at::empty({T}, int32_opts);
+  at::Tensor query_start_loc = allocate_or_validate_metadata_output(
+      query_start_loc_out, cache_indices, at::ScalarType::Int, {B + 1}, "query_start_loc_out");
+  at::Tensor has_initial_state = allocate_or_validate_metadata_output(
+      has_initial_state_out, cache_indices, at::ScalarType::Bool, {B}, "has_initial_state_out");
+  at::Tensor cache_mask = allocate_or_validate_metadata_output(
+      cache_mask_out, cache_indices, at::ScalarType::Bool, {B, 1, 1}, "cache_mask_out");
+  at::Tensor safe_idx = allocate_or_validate_metadata_output(
+      safe_idx_out, cache_indices, at::ScalarType::Long, {B}, "safe_idx_out");
+  at::Tensor cu = allocate_or_validate_metadata_output(cu_out, cache_indices, at::ScalarType::Long, {B + 1}, "cu_out");
+  at::Tensor si = allocate_or_validate_metadata_output(si_out, cache_indices, at::ScalarType::Int, {T}, "si_out");
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   ExtendMetadataParams params{
       cache_indices.data_ptr<int32_t>(),

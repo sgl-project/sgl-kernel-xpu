@@ -25,12 +25,11 @@ def _install_local_package(
         candidates.append(pkg_dir.parent.parent / "build/src")
     candidates.append(Path.cwd() / "build/src")
     for candidate in candidates:
-        if (candidate / "inkling_sconv_ops.abi3.so").is_file():
+        if (candidate / "common_ops.abi3.so").is_file():
             extension_dirs.append(str(candidate))
     pkg = types.ModuleType("sgl_kernel")
     pkg.__path__ = [str(pkg_dir), *extension_dirs]
     sys.modules["sgl_kernel"] = pkg
-    sys.modules["sgl_kernel.common_ops"] = types.ModuleType("sgl_kernel.common_ops")
 
 
 def _load_libraries(paths: list[str]) -> None:
@@ -203,7 +202,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--build-root",
-        help="Optional local build library directory containing inkling_sconv_ops.abi3.so.",
+        help="Optional local build library directory containing common_ops.abi3.so.",
     )
     parser.add_argument(
         "--load-library",

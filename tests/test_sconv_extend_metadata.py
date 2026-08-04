@@ -6,8 +6,23 @@ The unfused reference is the exact op sequence _prepare_extend_common_metadata
 clamp, long, to(int64), arange, searchsorted, clamp, to(int32).
 """
 
+import sys
+import types
+from pathlib import Path
+
 import pytest
 import torch
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_LOCAL_PKG = _REPO_ROOT / "python" / "sgl_kernel"
+_LOCAL_EXT = _REPO_ROOT / "build" / "src" / "common_ops.abi3.so"
+
+if _LOCAL_PKG.is_dir() and _LOCAL_EXT.is_file() and "sgl_kernel" not in sys.modules:
+    pkg = types.ModuleType("sgl_kernel")
+    pkg.__path__ = [str(_LOCAL_PKG)]
+    sys.modules["sgl_kernel"] = pkg
+    torch.ops.load_library(str(_LOCAL_EXT))
+
 from sgl_kernel.inkling_sconv import (
     HIS_ONES,
     HIS_PREFIX,
@@ -85,6 +100,29 @@ def _cache_indices(b, idx_dtype):
     return ci
 
 
+def _metadata_out(B, T):
+    return {
+        "query_start_loc": torch.empty(B + 1, dtype=torch.int32, device="xpu"),
+        "has_initial_state": torch.empty(B, dtype=torch.bool, device="xpu"),
+        "cache_mask": torch.empty((B, 1, 1), dtype=torch.bool, device="xpu"),
+        "safe_idx": torch.empty(B, dtype=torch.int64, device="xpu"),
+        "cu": torch.empty(B + 1, dtype=torch.int64, device="xpu"),
+        "si": torch.empty(T, dtype=torch.int32, device="xpu"),
+    }
+
+
+def _assert_uses_out(got, out):
+    for got_tensor, out_tensor in (
+        (got[0], out["query_start_loc"]),
+        (got[1], out["has_initial_state"]),
+        (got[2]["cache_mask"], out["cache_mask"]),
+        (got[2]["safe_idx"], out["safe_idx"]),
+        (got[2]["cu"], out["cu"]),
+        (got[2]["si"], out["si"]),
+    ):
+        assert got_tensor.data_ptr() == out_tensor.data_ptr()
+
+
 @requires_cuda
 @pytest.mark.parametrize("b", BATCH_SIZES)
 @pytest.mark.parametrize("his_mode", [HIS_ZEROS, HIS_PREFIX, HIS_SEQ_MINUS_EXT])
@@ -113,6 +151,33 @@ def test_extend_matches_unfused(b, his_mode, lens_dtype):
     )
     assert got is not None
     _assert_equal(got, ref)
+
+
+@requires_cuda
+def test_writes_graph_static_outputs():
+    b = 7
+    lens = torch.tensor([3, 0, 4, 1, 2, 0, 5], dtype=torch.int32, device="xpu")
+    cache_indices = torch.tensor(
+        [0, PAD_SLOT_ID, 2, 3, 4, 5, 6], dtype=torch.int32, device="xpu"
+    )
+    his_src = lens + 1
+    T = int(lens.sum().item())
+    out = _metadata_out(b, T)
+    got = fused_extend_sconv_metadata(
+        B=b,
+        T=T,
+        cache_indices=cache_indices,
+        his_mode=HIS_SEQ_MINUS_EXT,
+        extend_seq_lens=lens,
+        his_src=his_src,
+        out=out,
+    )
+
+    assert got is not None
+    _assert_uses_out(got, out)
+    _assert_equal(
+        got, _ref_extend(b, lens, HIS_SEQ_MINUS_EXT, his_src, cache_indices, T)
+    )
 
 
 @requires_cuda

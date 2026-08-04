@@ -29,6 +29,37 @@ class SconvExtendMetadata(TypedDict):
     si: torch.Tensor
 
 
+class SconvMetadataOut(TypedDict):
+    query_start_loc: torch.Tensor
+    has_initial_state: torch.Tensor
+    cache_mask: torch.Tensor
+    safe_idx: torch.Tensor
+    cu: torch.Tensor
+    si: torch.Tensor
+
+
+def _metadata_out_tensors(
+    out: Optional[SconvMetadataOut],
+) -> tuple[
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
+    if out is None:
+        return (None, None, None, None, None, None)
+    return (
+        out["query_start_loc"],
+        out["has_initial_state"],
+        out["cache_mask"],
+        out["safe_idx"],
+        out["cu"],
+        out["si"],
+    )
+
+
 def _as_int32(x: torch.Tensor) -> torch.Tensor:
     return x if x.dtype == torch.int32 else x.to(torch.int32)
 
@@ -53,22 +84,23 @@ def _ensure_ops_registered() -> None:
     if _ops_registered():
         return
     try:
-        importlib.import_module("sgl_kernel.inkling_sconv_ops")
+        importlib.import_module("sgl_kernel.common_ops")
     except ImportError as exc:
         raise ImportError(
             "Inkling sconv ops are not registered. Build/install the "
-            "inkling_sconv_ops extension before calling sgl_kernel.inkling_sconv."
+            "common_ops extension before calling sgl_kernel.inkling_sconv."
         ) from exc
     if not _ops_registered():
         raise RuntimeError(
-            "sgl_kernel.inkling_sconv_ops loaded without registering Inkling sconv ops"
+            "sgl_kernel.common_ops loaded without registering Inkling sconv ops"
         )
 
 
 def fused_decode_sconv_metadata(
-    B: int, cache_indices: torch.Tensor
+    B: int, cache_indices: torch.Tensor, out: Optional[SconvMetadataOut] = None
 ) -> tuple[torch.Tensor, torch.Tensor, SconvDecodeMetadata]:
     _ensure_ops_registered()
+    out_tensors = _metadata_out_tensors(out)
     (
         query_start_loc,
         has_initial_state,
@@ -77,7 +109,7 @@ def fused_decode_sconv_metadata(
         cu,
         si,
     ) = torch.ops.sgl_kernel.inkling_fused_decode_sconv_metadata(
-        B, _as_int32(cache_indices)
+        B, _as_int32(cache_indices), *out_tensors
     )
     return (
         query_start_loc,
@@ -95,10 +127,12 @@ def fused_extend_sconv_metadata(
     extend_seq_lens: Optional[torch.Tensor] = None,
     his_src: Optional[torch.Tensor] = None,
     draft_token_num: Optional[int] = None,
+    out: Optional[SconvMetadataOut] = None,
 ) -> Optional[tuple[torch.Tensor, torch.Tensor, SconvExtendMetadata]]:
     if B > _FUSED_EXTEND_MAX_B or not getattr(cache_indices, "is_xpu", False):
         return None
     _ensure_ops_registered()
+    out_tensors = _metadata_out_tensors(out)
     (
         query_start_loc,
         has_initial_state,
@@ -114,6 +148,7 @@ def fused_extend_sconv_metadata(
         _as_int32(extend_seq_lens) if extend_seq_lens is not None else None,
         _as_int32(his_src) if his_src is not None else None,
         1 if draft_token_num is None else int(draft_token_num),
+        *out_tensors,
     )
     return (
         query_start_loc,

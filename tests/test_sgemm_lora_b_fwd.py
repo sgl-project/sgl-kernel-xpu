@@ -45,25 +45,33 @@ def _reference_sgemm_lora_b_fwd(
     scalings: torch.Tensor,
     base_output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Reference computed on CPU in fp32, narrowed to weight dtype.
+    """Reference computed on-device (XPU) in fp32, narrowed to weight dtype.
 
     Implements ``D = scalings[l] * (input_x @ weights[l]^T) + base_output`` where
     the residual term is only added when ``base_output`` is supplied (beta == 1);
     otherwise the pure scaled LoRA projection is returned (beta == 0).
-    """
-    input_x_cpu = input_x.cpu()
-    weights_cpu = weights.cpu()
-    seg_cpu = seg_indptr.cpu()
-    wi_cpu = weight_indices.cpu()
-    scal_cpu = scalings.cpu().float()
 
-    num_tokens = input_x_cpu.size(0)
-    output_dim = weights_cpu.size(1)
+    Everything stays on the input device: torch's generic fp32 matmul is a
+    separate code path from the CUTLASS kernel under test, so accumulating in
+    fp32 here still yields an independent higher-precision oracle without a host
+    round-trip. Only the small segment/index scalars are read on the host to
+    drive the Python loop.
+    """
+    device = input_x.device
+    scal = scalings.float()
+
+    num_tokens = input_x.size(0)
+    output_dim = weights.size(1)
 
     if base_output is not None:
-        out = base_output.cpu().float().clone()
+        out = base_output.float().clone()
     else:
-        out = torch.zeros((num_tokens, output_dim), dtype=torch.float32)
+        out = torch.zeros((num_tokens, output_dim), dtype=torch.float32, device=device)
+
+    # seg_indptr / weight_indices are tiny; read them on the host to bound the
+    # loop (the heavy matmuls stay on device).
+    seg_cpu = seg_indptr.cpu()
+    wi_cpu = weight_indices.cpu()
 
     num_segments = seg_cpu.numel() - 1
     for s in range(num_segments):
@@ -72,10 +80,10 @@ def _reference_sgemm_lora_b_fwd(
         if end == start:
             continue
         lora = int(wi_cpu[s].item())
-        x = input_x_cpu[start:end].float()  # [seg, max_rank]
-        w = weights_cpu[lora].float()  # [output_dim, max_rank]
-        out[start:end] += float(scal_cpu[lora].item()) * (x @ w.T)
-    return out.to(weights_cpu.dtype)
+        x = input_x[start:end].float()  # [seg, max_rank]
+        w = weights[lora].float()  # [output_dim, max_rank]
+        out[start:end] += scal[lora] * (x @ w.T)
+    return out.to(weights.dtype)
 
 
 def _run_and_compare(
@@ -120,12 +128,12 @@ def _run_and_compare(
         input_x, weights, seg_indptr, weight_indices, scalings, base_output
     )
 
-    out_cpu = out.cpu()
-
-    assert out_cpu.shape == (num_tokens, output_dim)
-    assert out_cpu.dtype == dtype
+    assert out.shape == (num_tokens, output_dim)
+    assert out.dtype == dtype
+    # Compare on device: both `out` and `ref` live on XPU, so torch.testing
+    # validates them without a host round-trip.
     rtol, atol = _tolerances(dtype)
-    torch.testing.assert_close(out_cpu, ref, rtol=rtol, atol=atol)
+    torch.testing.assert_close(out, ref, rtol=rtol, atol=atol)
 
 
 # ----------------------------------------------------------------------------

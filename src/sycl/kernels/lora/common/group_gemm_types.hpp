@@ -160,7 +160,7 @@ struct GroupGemmTypes {
   // by the group index (the stock epilogue leaves them at [0] for every group
   // because the array kernel hard-codes the tile L coord to 0). Inherits all
   // other behaviour. See collective/xe_lora_epilogue.hpp.
-  using CollectiveEpilogue = GroupedEpiloguePerGroupScalar<
+  using CollectiveEpilogue = cutlass::lora::kernel::GroupedEpiloguePerGroupScalar<
       TileShape,
       void,           // EpilogueTile (void = automatic)
       ElementOutput,  // ElementC -- residual C (base_output) is bf16/fp16
@@ -293,19 +293,19 @@ inline typename Types::Gemm::Arguments args_from_options(
   fusion_args.beta_ptr = nullptr;
   fusion_args.alpha_ptr = nullptr;
   fusion_args.beta_ptr_array = nullptr;
-  fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
+  fusion_args.dBeta = cute::make_stride(cute::_0{}, cute::_0{}, 0);
 
   if (alpha_ptr_array.has_value()) {
     // Per-segment alpha: device array of one fp32* per segment; the fusion reads
     // *(alpha_ptr_array[l_coord]) for group l_coord (dAlpha L-stride 1).
     fusion_args.alpha = ElementScalar(0);
     fusion_args.alpha_ptr_array = reinterpret_cast<ElementScalar const* const*>(alpha_ptr_array->data_ptr<int64_t>());
-    fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 1};
+    fusion_args.dAlpha = cute::make_stride(cute::_0{}, cute::_0{}, 1);
   } else {
-    // Single alpha broadcast to all segments (dAlpha = {_0,_0,0}).
+    // Single alpha broadcast to all segments (dAlpha L-stride 0).
     fusion_args.alpha = alpha;
     fusion_args.alpha_ptr_array = nullptr;
-    fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
+    fusion_args.dAlpha = cute::make_stride(cute::_0{}, cute::_0{}, 0);
   }
 
   return arguments;

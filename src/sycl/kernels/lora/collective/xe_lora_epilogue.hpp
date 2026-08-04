@@ -79,7 +79,7 @@
 #include "cutlass/epilogue/collective/xe_array_epilogue.hpp"
 #include "cutlass/epilogue/dispatch_policy.hpp"
 
-namespace at::native::xpu {
+namespace cutlass::lora::kernel {
 
 // Drop-in replacement for
 //   cutlass::epilogue::collective::CollectiveEpilogue<IntelXeGenericGroup, Ts...>
@@ -141,4 +141,4 @@ class GroupedEpiloguePerGroupScalar : public cutlass::epilogue::collective::Coll
   }
 };
 
-}  // namespace at::native::xpu
+}  // namespace cutlass::lora::kernel

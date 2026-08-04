@@ -1,12 +1,11 @@
 import pytest
 import torch
 import torch.nn.functional as F
-import utils
 from sgl_kernel import fused_hc_head
 
 pytestmark = pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU required")
 
-device = utils.get_device()
+device = torch.device("xpu")
 
 
 def _bench(fn, *, warmup: int = 5, iters: int = 20) -> float:

@@ -21,6 +21,8 @@ def compress_norm_rope_store(
     compress_ratio: int,
     page_size: int,
     use_fp4: bool,
+    preshuffle_size: int = 0,
+    use_bf16_store: bool = False,
 ) -> None:
     """FusedNormRopeKernel::forward for XPU.
 
@@ -38,4 +40,6 @@ def compress_norm_rope_store(
         int(compress_ratio),
         int(page_size),
         use_fp4,
+        int(preshuffle_size),
+        use_bf16_store,
     )

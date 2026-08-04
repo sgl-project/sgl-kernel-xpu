@@ -993,7 +993,9 @@ void fused_norm_rope_store(
     bool is_decode,
     int64_t compress_ratio,
     int64_t page_size,
-    bool use_fp4);
+    bool use_fp4,
+    int64_t preshuffle_size,
+    bool use_bf16_store);
 
 }  // namespace at::native::xpu
 

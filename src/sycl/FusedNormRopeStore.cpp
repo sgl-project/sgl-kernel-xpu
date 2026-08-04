@@ -6,29 +6,40 @@
 #include <sycl/sycl.hpp>
 
 #include "Compress.h"
+#include "QuantUtils.h"
 #include "Utils.h"
+#include "cutlass/float8.h"
+#include "sgl_kernel_export.h"
+
+using cutlass::float_e4m3_t;
 
 namespace at::native::xpu {
 
 namespace {
 
-constexpr int64_t kHeadDimIndexer = 128;
-constexpr int64_t kHeadDimFlashMLA = 512;
+constexpr uint32_t kSubGroupSize = 16;
 constexpr int64_t kRopeDim = 64;
 constexpr float kFp8E4m3Max = 448.0f;
-constexpr int64_t kNopeDimFlashMLA = kHeadDimFlashMLA - kRopeDim;  // 448
-constexpr int64_t kNopeWarpsFlashMLA = 7;
-constexpr int64_t kElemsPerNopeWarp = kNopeDimFlashMLA / kNopeWarpsFlashMLA;  // 64
 
-constexpr uint32_t kIndexerLocalSize = 64;
-constexpr uint32_t kFlashMLALocalSize = 256;
+// Indexer variant constants
+constexpr int64_t kIndexerHeadDim = 128;
+constexpr uint32_t kIndexerBlockSize = kIndexerHeadDim / 2;  // 64
+constexpr uint32_t kFp4GroupDim = 32;
+constexpr uint32_t kFp4Groups = kIndexerHeadDim / kFp4GroupDim;  // 4
+
+// FlashMLA variant constants
+constexpr int64_t kFlashMLAHeadDim = 512;
+constexpr uint32_t kFlashMLABlockSize = kFlashMLAHeadDim / 2;      // 256
+constexpr int64_t kFlashMLANopeDim = kFlashMLAHeadDim - kRopeDim;  // 448
+constexpr int64_t kFlashMLANopeSgs = 7;
+constexpr int64_t kFlashMLAElemsPerNopeSg = kFlashMLANopeDim / kFlashMLANopeSgs;  // 64
 
 inline int64_t flashmla_page_bytes(int64_t page_size) {
-  return ((584 * page_size + 575) / 576) * 576;
-}
-
-inline bool is_power_of_two(int64_t v) {
-  return v > 0 && (v & (v - 1)) == 0;
+  // FlashMLA per-token cache layout: NoPE FP8 + RoPE BF16 + scales.
+  constexpr int64_t kFlashMLAValueBytes = kFlashMLANopeDim + kRopeDim * 2;  // 576
+  constexpr int64_t kFlashMLAScaleBytes = 8;
+  constexpr int64_t kFlashMLAPerTokenBytes = kFlashMLAValueBytes + kFlashMLAScaleBytes;  // 584
+  return ((kFlashMLAPerTokenBytes * page_size + kFlashMLAValueBytes - 1) / kFlashMLAValueBytes) * kFlashMLAValueBytes;
 }
 
 inline int64_t log2_i64(int64_t v) {
@@ -37,32 +48,6 @@ inline int64_t log2_i64(int64_t v) {
     ++bits;
   }
   return bits;
-}
-
-template <typename T>
-inline float to_float(T v) {
-  return static_cast<float>(v);
-}
-
-inline uint8_t cast_to_ue8m0(float x) {
-  const float clamped = sycl::fmax(x, 1.0e-38f);
-  const uint32_t bits = sycl::bit_cast<uint32_t>(clamped);
-  int32_t exp = static_cast<int32_t>((bits >> 23) & 0xFF);
-  const uint32_t mant = bits & 0x7FFFFF;
-  exp += (mant != 0u) ? 1 : 0;
-  if (exp > 255) {
-    exp = 255;
-  }
-  return static_cast<uint8_t>(exp);
-}
-
-inline float inv_scale_ue8m0(uint8_t ue8m0) {
-  const int32_t inv_exp = sycl::max(0, 254 - static_cast<int32_t>(ue8m0));
-  const uint32_t inv_bits = static_cast<uint32_t>(inv_exp) << 23;
-  if (ue8m0 >= 254) {
-    return 0.0f;
-  }
-  return sycl::bit_cast<float>(inv_bits);
 }
 
 inline uint8_t quant_fp4_e2m1(float x) {
@@ -83,56 +68,8 @@ inline uint8_t quant_fp4_e2m1(float x) {
 
 inline uint8_t cvt_float_to_fp8_e4m3(float x) {
   x = sycl::fmax(sycl::fmin(x, kFp8E4m3Max), -kFp8E4m3Max);
-  if (x == 0.0f) {
-    return 0;
-  }
-
-  const uint32_t u = sycl::bit_cast<uint32_t>(x);
-  const uint8_t sign = static_cast<uint8_t>((u >> 31) & 1u);
-  const int32_t exp32 = static_cast<int32_t>((u >> 23) & 0xFFu) - 127;
-  const int32_t mant23 = static_cast<int32_t>(u & 0x7FFFFFu);
-
-  constexpr int32_t bias = 7;
-  constexpr int32_t max_exp = 15;
-  constexpr int32_t min_sub = -9;
-  constexpr int32_t min_norm = -6;
-  constexpr uint8_t saturate = 0x7E;
-
-  if (exp32 < min_sub) {
-    return static_cast<uint8_t>(sign << 7);
-  }
-
-  int32_t exp8 = 0;
-  int32_t mant3 = 0;
-
-  if (exp32 < min_norm) {
-    const int32_t shift = (-(bias - 1) - exp32);
-    const int32_t base = 0x800000 | mant23;
-    int32_t subnorm_mant = base >> (shift + 20);
-    const int32_t round_bit = (base >> (shift + 19)) & 1;
-    subnorm_mant += round_bit;
-
-    if (subnorm_mant > 7) {
-      exp8 = 1;
-      mant3 = 0;
-    } else {
-      exp8 = 0;
-      mant3 = subnorm_mant & 0x7;
-    }
-  } else {
-    exp8 = exp32 + bias;
-    mant3 = (mant23 >> 20) + ((mant23 >> 19) & 1);
-    if (mant3 > 7) {
-      mant3 = 0;
-      exp8 += 1;
-    }
-    if (exp8 > max_exp) {
-      exp8 = static_cast<int32_t>(saturate >> 3);
-      mant3 = static_cast<int32_t>(saturate & 0x7);
-    }
-  }
-
-  return static_cast<uint8_t>((sign << 7) | ((exp8 & 0x1F) << 3) | (mant3 & 0x7));
+  const float_e4m3_t fp8 = static_cast<float_e4m3_t>(x);
+  return sycl::bit_cast<uint8_t>(fp8);
 }
 
 inline uint16_t float_to_bf16_bits(float x) {
@@ -140,181 +77,266 @@ inline uint16_t float_to_bf16_bits(float x) {
   return sycl::bit_cast<uint16_t>(bf);
 }
 
+inline uint16_t pack_u8x2(uint8_t lo, uint8_t hi) {
+  return static_cast<uint16_t>(lo) | (static_cast<uint16_t>(hi) << 8);
+}
+
+inline float subgroup_xor_reduce_sum_16(sycl::sub_group sg, float v) {
+  v += sycl::permute_group_by_xor(sg, v, 8);
+  v += sycl::permute_group_by_xor(sg, v, 4);
+  v += sycl::permute_group_by_xor(sg, v, 2);
+  v += sycl::permute_group_by_xor(sg, v, 1);
+  return v;
+}
+
+inline float subgroup_xor_reduce_max_16(sycl::sub_group sg, float v) {
+  v = sycl::fmax(v, sycl::permute_group_by_xor(sg, v, 8));
+  v = sycl::fmax(v, sycl::permute_group_by_xor(sg, v, 4));
+  v = sycl::fmax(v, sycl::permute_group_by_xor(sg, v, 2));
+  v = sycl::fmax(v, sycl::permute_group_by_xor(sg, v, 1));
+  return v;
+}
+
+// Reduces local_val across the work-group; result in red[0]. num_sg = local_size / 16.
+inline void local_reduce_sum_sg16(
+    float* red, sycl::nd_item<1> item, sycl::sub_group sg, uint32_t lid, float local_val, uint32_t num_sg) {
+  const uint32_t lane_id = lid & (kSubGroupSize - 1u);
+  const uint32_t sg_id = lid / kSubGroupSize;
+  const float sg_sum = subgroup_xor_reduce_sum_16(sg, local_val);
+  if (lane_id == 0) {
+    red[sg_id] = sg_sum;
+  }
+  item.barrier(sycl::access::fence_space::local_space);
+
+  if (sg_id == 0) {
+    const float block_sum = subgroup_xor_reduce_sum_16(sg, (lane_id < num_sg) ? red[lane_id] : 0.0f);
+    if (lane_id == 0) {
+      red[0] = block_sum;
+    }
+  }
+  item.barrier(sycl::access::fence_space::local_space);
+}
+
+inline void local_reduce_max_64_sg16(float* red, sycl::nd_item<1> item, sycl::sub_group sg, uint32_t lid) {
+  const uint32_t lane_id = lid & (kSubGroupSize - 1u);
+  const uint32_t sg_id = lid / kSubGroupSize;
+  const float sg_max = subgroup_xor_reduce_max_16(sg, red[lid]);
+  if (lane_id == 0) {
+    red[sg_id] = sg_max;
+  }
+  item.barrier(sycl::access::fence_space::local_space);
+
+  if (sg_id == 0) {
+    const float block_max =
+        subgroup_xor_reduce_max_16(sg, (lane_id < kIndexerBlockSize / kSubGroupSize) ? red[lane_id] : 0.0f);
+    if (lane_id == 0) {
+      red[0] = block_max;
+    }
+  }
+  item.barrier(sycl::access::fence_space::local_space);
+}
+
+struct PlanSlot {
+  int64_t position;
+  int64_t slot;
+  bool active;
+};
+
+inline PlanSlot read_plan_slot(
+    const DecodePlan* plan_d,
+    const CompressPlan* plan_c,
+    const int64_t* out_loc,
+    uint32_t group_id,
+    uint32_t compress_ratio,
+    bool is_decode) {
+  PlanSlot r{0, -1, false};
+  if (is_decode) {
+    const DecodePlan plan = plan_d[group_id];
+    if (plan.seq_len != 0 && plan.seq_len % compress_ratio == 0) {
+      r.position = static_cast<int64_t>(plan.seq_len) - static_cast<int64_t>(compress_ratio);
+      r.slot = out_loc[group_id];
+      r.active = true;
+    }
+  } else {
+    const CompressPlan plan = plan_c[group_id];
+    if (!plan.is_invalid()) {
+      r.position = static_cast<int64_t>(plan.seq_len) - static_cast<int64_t>(compress_ratio);
+      r.slot = out_loc[static_cast<int64_t>(plan.ragged_id)];
+      r.active = true;
+    }
+  }
+  return r;
+}
+
 template <typename input_t>
 struct FusedNormRopeIndexerKernel {
-  [[sycl::reqd_sub_group_size(16)]]
+  // Indexer variant: head_dim=128, one token per work-group (64 threads).
+  // Each lane_id handles 2 elements, covering all 128 dims per token.
+  // Cache layout per token:
+  //  - FP8 path: 128 value bytes + 4-byte fp32 scale
+  //  - FP4 path: 64 packed bytes + 4 UE8M0 scale bytes
+  [[sycl::reqd_sub_group_size(kSubGroupSize)]]
   void operator()(sycl::nd_item<1> item) const {
-    const uint32_t group_id = static_cast<uint32_t>(item.get_group(0));
-    const uint32_t tid = static_cast<uint32_t>(item.get_local_id(0));
-    if (group_id >= num_tokens) {
+    const uint32_t gid = static_cast<uint32_t>(item.get_group(0));
+    const uint32_t lid = static_cast<uint32_t>(item.get_local_id(0));
+    if (gid >= num_tokens) {
       return;
     }
 
-    int64_t position = 0;
-    int64_t slot = -1;
-    bool active = false;
-
-    if (is_decode) {
-      const DecodePlan plan = plan_d[group_id];
-      if (plan.seq_len != 0 && plan.seq_len % compress_ratio == 0) {
-        position = static_cast<int64_t>(plan.seq_len) - static_cast<int64_t>(compress_ratio);
-        slot = out_loc[group_id];
-        active = true;
-      }
-    } else {
-      const CompressPlan plan = plan_c[group_id];
-      if (!plan.is_invalid()) {
-        position = static_cast<int64_t>(plan.seq_len) - static_cast<int64_t>(compress_ratio);
-        slot = out_loc[static_cast<int64_t>(plan.ragged_id)];
-        active = true;
-      }
-    }
-
-    if (!active || slot < 0) {
+    const auto ps = read_plan_slot(plan_d, plan_c, out_loc, gid, compress_ratio, is_decode);
+    if (!ps.active || ps.slot < 0) {
       return;
     }
-
     float* data = smem_data.template get_multi_ptr<sycl::access::decorated::no>().get();
     float* red = smem_red.template get_multi_ptr<sycl::access::decorated::no>().get();
     float* group_inv = smem_group_inv.template get_multi_ptr<sycl::access::decorated::no>().get();
     uint8_t* group_ue8 = smem_group_ue8.template get_multi_ptr<sycl::access::decorated::no>().get();
+    auto sg = item.get_sub_group();
 
-    const input_t* row_in = input + static_cast<int64_t>(group_id) * kHeadDimIndexer;
+    const input_t* row_in = input + static_cast<int64_t>(gid) * kIndexerHeadDim;
 
-    float local_sum = 0.0f;
-    for (int64_t i = tid; i < kHeadDimIndexer; i += kIndexerLocalSize) {
-      const float x = to_float(row_in[i]);
-      local_sum += x * x;
-      data[i] = x;
-    }
+    const int64_t d0 = static_cast<int64_t>(lid);
+    const int64_t d1 = d0 + static_cast<int64_t>(kIndexerBlockSize);
 
-    red[tid] = local_sum;
+    // Part 1: RMSNorm over the full 128-d vector.
+    data[d0] = static_cast<float>(row_in[d0]);
+    data[d1] = static_cast<float>(row_in[d1]);
+    const float local_sum = data[d0] * data[d0] + data[d1] * data[d1];
+    local_reduce_sum_sg16(red, item, sg, lid, local_sum, kIndexerBlockSize / kSubGroupSize);
+
+    const float norm_factor = sycl::rsqrt(red[0] / static_cast<float>(kIndexerHeadDim) + eps);
+    data[d0] = data[d0] * norm_factor * static_cast<float>(weight[d0]);
+    data[d1] = data[d1] * norm_factor * static_cast<float>(weight[d1]);
     item.barrier(sycl::access::fence_space::local_space);
 
-    for (uint32_t stride = kIndexerLocalSize / 2; stride > 0; stride >>= 1) {
-      if (tid < stride) {
-        red[tid] += red[tid + stride];
-      }
-      item.barrier(sycl::access::fence_space::local_space);
-    }
-
-    const float norm_factor = sycl::rsqrt(red[0] / static_cast<float>(kHeadDimIndexer) + eps);
-    for (int64_t i = tid; i < kHeadDimIndexer; i += kIndexerLocalSize) {
-      data[i] = data[i] * norm_factor * to_float(weight[i]);
-    }
-    item.barrier(sycl::access::fence_space::local_space);
-
-    const float* freq = freqs_cis + position * kRopeDim;
-    for (int64_t p = tid; p < kRopeDim / 2; p += kIndexerLocalSize) {
+    // Part 2: RoPE on the tail 64 dims.
+    const float* freq = freqs_cis + ps.position * kRopeDim;
+    if (lid < static_cast<uint32_t>(kRopeDim / 2)) {
+      const int64_t p = static_cast<int64_t>(lid);
       const int64_t base = 64 + 2 * p;
-      const float xr = data[base + 0];
-      const float xi = data[base + 1];
-      const float fr = freq[2 * p + 0];
-      const float fi = freq[2 * p + 1];
-      data[base + 0] = xr * fr - xi * fi;
-      data[base + 1] = xr * fi + xi * fr;
+      const float tmp = data[base + 0];
+      data[base + 0] = tmp * freq[2 * p + 0] - data[base + 1] * freq[2 * p + 1];
+      data[base + 1] = tmp * freq[2 * p + 1] + data[base + 1] * freq[2 * p + 0];
     }
     item.barrier(sycl::access::fence_space::local_space);
 
-    for (int64_t step = 1; step < kHeadDimIndexer; step <<= 1) {
-      for (int64_t pair_id = tid; pair_id < kHeadDimIndexer / 2; pair_id += kIndexerLocalSize) {
-        const int64_t block = (pair_id / step) * (2 * step);
-        const int64_t off = pair_id % step;
-        const int64_t a = block + off;
-        const int64_t b = a + step;
-        const float u = data[a];
-        const float v = data[b];
-        data[a] = u + v;
-        data[b] = u - v;
-      }
+    // Part 3: hadamard transform.
+    // 1) register-local pair butterfly (a+b, a-b)
+    float h0 = data[d0] + data[d1];
+    float h1 = data[d0] - data[d1];
+
+    // 2) intra-subgroup XOR butterflies (mask 1/2/4/8)
+    const uint32_t lane_id = lid & 0xFu;
+    for (uint32_t mask = 1; mask <= 8; mask <<= 1) {
+      const float o0 = sycl::permute_group_by_xor(sg, h0, mask);
+      const float o1 = sycl::permute_group_by_xor(sg, h1, mask);
+      h0 = (lane_id & mask) ? (o0 - h0) : (h0 + o0);
+      h1 = (lane_id & mask) ? (o1 - h1) : (h1 + o1);
+    }
+
+    data[d0] = h0;
+    data[d1] = h1;
+    item.barrier(sycl::access::fence_space::local_space);
+
+    // 3) cross-subgroup butterflies (mask 16/32) via local memory
+    for (uint32_t mask = kSubGroupSize; mask <= 32; mask <<= 1) {
+      const uint32_t peer = lid ^ mask;
+      const float o0 = data[static_cast<int64_t>(peer)];
+      const float o1 = data[static_cast<int64_t>(peer) + kIndexerBlockSize];
+      h0 = (lid & mask) ? (o0 - h0) : (h0 + o0);
+      h1 = (lid & mask) ? (o1 - h1) : (h1 + o1);
+      data[d0] = h0;
+      data[d1] = h1;
       item.barrier(sycl::access::fence_space::local_space);
     }
 
-    // 1 / sqrt(128)
-    constexpr float kHadamardScale = 0.08838834764831845f;
-    for (int64_t i = tid; i < kHeadDimIndexer; i += kIndexerLocalSize) {
-      data[i] *= kHadamardScale;
-    }
+    constexpr float kHadamardScale = 0.08838834764831845f;  // 1 / sqrt(128)
+    data[d0] = h0 * kHadamardScale;
+    data[d1] = h1 * kHadamardScale;
     item.barrier(sycl::access::fence_space::local_space);
 
-    const int64_t page = slot >> page_bits;
-    const int64_t offset = slot & (page_size - 1);
+    const int64_t page = ps.slot >> page_bits;
+    const int64_t offset = ps.slot & (page_size - 1);
 
+    // Part 4a: FP8 store. For preshuffle_size>0, values are written in tiled
+    // order to match the pre-shuffled consumer layout.
     if (!use_fp4) {
-      float local_max = 0.0f;
-      for (int64_t i = tid; i < kHeadDimIndexer; i += kIndexerLocalSize) {
-        local_max = sycl::fmax(local_max, sycl::fabs(data[i]));
-      }
-      red[tid] = local_max;
-      item.barrier(sycl::access::fence_space::local_space);
-
-      for (uint32_t stride = kIndexerLocalSize / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-          red[tid] = sycl::fmax(red[tid], red[tid + stride]);
-        }
-        item.barrier(sycl::access::fence_space::local_space);
-      }
+      float local_max = sycl::fmax(sycl::fabs(data[d0]), sycl::fabs(data[d1]));
+      red[lid] = local_max;
+      local_reduce_max_64_sg16(red, item, sg, lid);
 
       const float scale = sycl::fmax(1.0e-4f, red[0]) / kFp8E4m3Max;
       const float inv_scale = 1.0f / scale;
-      const int64_t value_base = page * page_bytes + offset * 128;
-      const int64_t scale_base = page * page_bytes + 128 * page_size + offset * 4;
+      const int64_t scale_base =
+          page * page_bytes + kIndexerHeadDim * page_size + offset * static_cast<int64_t>(sizeof(float));
+      for (int64_t pair = lid; pair < kIndexerHeadDim / 2; pair += kIndexerBlockSize) {
+        const int64_t i0 = 2 * pair;
+        const int64_t i1 = i0 + 1;
+        const uint8_t q0 = cvt_float_to_fp8_e4m3(data[i0] * inv_scale);
+        const uint8_t q1 = cvt_float_to_fp8_e4m3(data[i1] * inv_scale);
 
-      for (int64_t i = tid; i < kHeadDimIndexer; i += kIndexerLocalSize) {
-        const uint8_t q = cvt_float_to_fp8_e4m3(data[i] * inv_scale);
-        kvcache[value_base + i] = q;
+        if (preshuffle_size == 0) {
+          const int64_t value_base = page * page_bytes + offset * kIndexerHeadDim;
+          reinterpret_cast<uint16_t*>(kvcache + value_base)[pair] = pack_u8x2(q0, q1);
+          continue;
+        }
+
+        const int64_t token_tile_id = offset / preshuffle_size;
+        const int64_t token_in_tile = offset % preshuffle_size;
+
+        const int64_t col_tile_id0 = i0 / preshuffle_size;
+        const int64_t col_in_tile0 = i0 % preshuffle_size;
+        const int64_t value_offset0 = token_tile_id * (preshuffle_size * kIndexerHeadDim) +
+                                      col_tile_id0 * (preshuffle_size * preshuffle_size) +
+                                      token_in_tile * preshuffle_size + col_in_tile0;
+        kvcache[page * page_bytes + value_offset0] = q0;
+
+        const int64_t col_tile_id1 = i1 / preshuffle_size;
+        const int64_t col_in_tile1 = i1 % preshuffle_size;
+        const int64_t value_offset1 = token_tile_id * (preshuffle_size * kIndexerHeadDim) +
+                                      col_tile_id1 * (preshuffle_size * preshuffle_size) +
+                                      token_in_tile * preshuffle_size + col_in_tile1;
+        kvcache[page * page_bytes + value_offset1] = q1;
       }
 
-      if (tid == 0) {
-        const uint32_t bits = sycl::bit_cast<uint32_t>(scale);
-        kvcache[scale_base + 0] = static_cast<uint8_t>(bits & 0xFFu);
-        kvcache[scale_base + 1] = static_cast<uint8_t>((bits >> 8) & 0xFFu);
-        kvcache[scale_base + 2] = static_cast<uint8_t>((bits >> 16) & 0xFFu);
-        kvcache[scale_base + 3] = static_cast<uint8_t>((bits >> 24) & 0xFFu);
+      if (lid == 0) {
+        reinterpret_cast<uint32_t*>(kvcache + scale_base)[0] = sycl::bit_cast<uint32_t>(scale);
       }
       return;
     }
 
-    for (int64_t g = 0; g < 4; ++g) {
+    // Part 4b: FP4 store (kFp4Groups groups x kFp4GroupDim dims), each group owns one UE8M0 scale.
+    for (int64_t g = 0; g < kFp4Groups; ++g) {
       float g_local_max = 0.0f;
-      for (int64_t j = tid; j < 32; j += kIndexerLocalSize) {
-        const float v = sycl::fabs(data[g * 32 + j]);
-        g_local_max = sycl::fmax(g_local_max, v);
+      if (lid < kFp4GroupDim) {
+        g_local_max = sycl::fabs(data[g * static_cast<int64_t>(kFp4GroupDim) + static_cast<int64_t>(lid)]);
       }
-      red[tid] = g_local_max;
-      item.barrier(sycl::access::fence_space::local_space);
+      red[lid] = g_local_max;
+      local_reduce_max_64_sg16(red, item, sg, lid);
 
-      for (uint32_t stride = kIndexerLocalSize / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-          red[tid] = sycl::fmax(red[tid], red[tid + stride]);
-        }
-        item.barrier(sycl::access::fence_space::local_space);
-      }
-
-      if (tid == 0) {
+      if (lid == 0) {
         const float scale_raw = sycl::fmax(1.0e-4f, red[0]) / 6.0f;
-        const uint8_t ue8 = cast_to_ue8m0(scale_raw);
+        const uint8_t ue8 = castToUE8M0(scale_raw);
         group_ue8[g] = ue8;
-        group_inv[g] = inv_scale_ue8m0(ue8);
+        group_inv[g] = invScaleUE8M0(ue8);
       }
       item.barrier(sycl::access::fence_space::local_space);
     }
 
-    const int64_t value_base = page * page_bytes + offset * 64;
-    const int64_t scale_base = page * page_bytes + 64 * page_size + offset * 4;
+    const int64_t value_base = page * page_bytes + offset * (kIndexerHeadDim / 2);
+    const int64_t scale_base = page * page_bytes + (kIndexerHeadDim / 2) * page_size + offset * kFp4Groups;
 
-    for (int64_t i = tid; i < 64; i += kIndexerLocalSize) {
-      const int64_t i0 = 2 * i;
-      const int64_t i1 = i0 + 1;
-      const int64_t g0 = i0 / 32;
-      const int64_t g1 = i1 / 32;
-      const uint8_t q0 = quant_fp4_e2m1(data[i0] * group_inv[g0]);
-      const uint8_t q1 = quant_fp4_e2m1(data[i1] * group_inv[g1]);
-      kvcache[value_base + i] = static_cast<uint8_t>((q0 & 0x0F) | ((q1 & 0x0F) << 4));
-    }
+    const int64_t i = static_cast<int64_t>(lid);
+    const int64_t i0 = 2 * i;
+    const int64_t i1 = i0 + 1;
+    const int64_t g0 = i0 / static_cast<int64_t>(kFp4GroupDim);
+    const int64_t g1 = i1 / static_cast<int64_t>(kFp4GroupDim);
+    const uint8_t q0 = quant_fp4_e2m1(data[i0] * group_inv[g0]);
+    const uint8_t q1 = quant_fp4_e2m1(data[i1] * group_inv[g1]);
+    kvcache[value_base + i] = static_cast<uint8_t>((q0 & 0x0F) | ((q1 & 0x0F) << 4));
 
-    if (tid < 4) {
-      kvcache[scale_base + tid] = group_ue8[tid];
+    if (lid < kFp4Groups) {
+      kvcache[scale_base + lid] = group_ue8[lid];
     }
   }
 
@@ -333,6 +355,7 @@ struct FusedNormRopeIndexerKernel {
   float eps;
   bool is_decode;
   bool use_fp4;
+  int64_t preshuffle_size;
   sycl::local_accessor<float, 1> smem_data;
   sycl::local_accessor<float, 1> smem_red;
   sycl::local_accessor<float, 1> smem_group_inv;
@@ -341,141 +364,140 @@ struct FusedNormRopeIndexerKernel {
 
 template <typename input_t>
 struct FusedNormRopeFlashMLAKernel {
-  [[sycl::reqd_sub_group_size(16)]]
+  // FlashMLA variant: head_dim=512, one token per work-group (256 threads).
+  // Each lane_id handles 2 elements, covering all 512 dims per token.
+  [[sycl::reqd_sub_group_size(kSubGroupSize)]]
   void operator()(sycl::nd_item<1> item) const {
-    const uint32_t group_id = static_cast<uint32_t>(item.get_group(0));
-    const uint32_t tid = static_cast<uint32_t>(item.get_local_id(0));
-    if (group_id >= num_tokens) {
+    const uint32_t gid = static_cast<uint32_t>(item.get_group(0));
+    const uint32_t lid = static_cast<uint32_t>(item.get_local_id(0));
+    if (gid >= num_tokens) {
       return;
     }
 
-    int64_t position = 0;
-    int64_t slot = -1;
-    bool active = false;
-
-    if (is_decode) {
-      const DecodePlan plan = plan_d[group_id];
-      if (plan.seq_len != 0 && plan.seq_len % compress_ratio == 0) {
-        position = static_cast<int64_t>(plan.seq_len) - static_cast<int64_t>(compress_ratio);
-        slot = out_loc[group_id];
-        active = true;
-      }
-    } else {
-      const CompressPlan plan = plan_c[group_id];
-      if (!plan.is_invalid()) {
-        position = static_cast<int64_t>(plan.seq_len) - static_cast<int64_t>(compress_ratio);
-        slot = out_loc[static_cast<int64_t>(plan.ragged_id)];
-        active = true;
-      }
-    }
-
-    if (!active || slot < 0) {
+    const auto ps = read_plan_slot(plan_d, plan_c, out_loc, gid, compress_ratio, is_decode);
+    if (!ps.active || ps.slot < 0) {
       return;
     }
-
     float* data = smem_data.template get_multi_ptr<sycl::access::decorated::no>().get();
     float* red = smem_red.template get_multi_ptr<sycl::access::decorated::no>().get();
     float* group_inv = smem_group_inv.template get_multi_ptr<sycl::access::decorated::no>().get();
     uint8_t* group_ue8 = smem_group_ue8.template get_multi_ptr<sycl::access::decorated::no>().get();
+    auto sg = item.get_sub_group();
 
-    const input_t* row_in = input + static_cast<int64_t>(group_id) * kHeadDimFlashMLA;
+    const input_t* row_in = input + static_cast<int64_t>(gid) * kFlashMLAHeadDim;
 
+    // Part 1: RMSNorm over head_dim=512 using subgroup partial reductions.
     float local_sum = 0.0f;
-    const int64_t d0 = static_cast<int64_t>(tid) * 2;
+    const int64_t d0 = static_cast<int64_t>(lid) * 2;
     const int64_t d1 = d0 + 1;
-    if (d0 < kHeadDimFlashMLA) {
-      const float x0 = to_float(row_in[d0]);
+    if (d0 < kFlashMLAHeadDim) {
+      const float x0 = static_cast<float>(row_in[d0]);
       data[d0] = x0;
       local_sum += x0 * x0;
     }
-    if (d1 < kHeadDimFlashMLA) {
-      const float x1 = to_float(row_in[d1]);
+    if (d1 < kFlashMLAHeadDim) {
+      const float x1 = static_cast<float>(row_in[d1]);
       data[d1] = x1;
       local_sum += x1 * x1;
     }
 
-    red[tid] = local_sum;
+    const uint32_t lane_id = lid & (kSubGroupSize - 1u);
+    const uint32_t sg_id = lid / kSubGroupSize;
+    local_reduce_sum_sg16(red, item, sg, lid, local_sum, kFlashMLABlockSize / kSubGroupSize);
+
+    const float norm_factor = sycl::rsqrt(red[0] / static_cast<float>(kFlashMLAHeadDim) + eps);
+    if (d0 < kFlashMLAHeadDim) {
+      data[d0] = data[d0] * norm_factor * static_cast<float>(weight[d0]);
+    }
+    if (d1 < kFlashMLAHeadDim) {
+      data[d1] = data[d1] * norm_factor * static_cast<float>(weight[d1]);
+    }
     item.barrier(sycl::access::fence_space::local_space);
 
-    for (uint32_t stride = kFlashMLALocalSize / 2; stride > 0; stride >>= 1) {
-      if (tid < stride) {
-        red[tid] += red[tid + stride];
+    // Part 2: RoPE on the tail 64 dims.
+    const float* freq = freqs_cis + ps.position * kRopeDim;
+    for (int64_t p = lid; p < kRopeDim / 2; p += kFlashMLABlockSize) {
+      const int64_t base = kFlashMLANopeDim + 2 * p;
+      const float tmp = data[base + 0];
+      data[base + 0] = tmp * freq[2 * p + 0] - data[base + 1] * freq[2 * p + 1];
+      data[base + 1] = tmp * freq[2 * p + 1] + data[base + 1] * freq[2 * p + 0];
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+
+    if (use_bf16_store) {
+      // Optional mode: write the whole 512-d output as plain BF16.
+      const int64_t page = ps.slot >> page_bits;
+      const int64_t offset = ps.slot & (page_size - 1);
+      const int64_t value_base = page * page_bytes + offset * (kFlashMLAHeadDim * 2);
+      uint16_t* value_ptr = reinterpret_cast<uint16_t*>(kvcache + value_base);
+      if (d0 < kFlashMLAHeadDim) {
+        value_ptr[d0] = float_to_bf16_bits(data[d0]);
       }
-      item.barrier(sycl::access::fence_space::local_space);
+      if (d1 < kFlashMLAHeadDim) {
+        value_ptr[d1] = float_to_bf16_bits(data[d1]);
+      }
+      return;
     }
 
-    const float norm_factor = sycl::rsqrt(red[0] / static_cast<float>(kHeadDimFlashMLA) + eps);
-    if (d0 < kHeadDimFlashMLA) {
-      data[d0] = data[d0] * norm_factor * to_float(weight[d0]);
-    }
-    if (d1 < kHeadDimFlashMLA) {
-      data[d1] = data[d1] * norm_factor * to_float(weight[d1]);
-    }
-    item.barrier(sycl::access::fence_space::local_space);
+    const int64_t g_d0 = (d0 < kFlashMLANopeDim) ? (d0 / kFlashMLAElemsPerNopeSg) : -1;
+    const int64_t g_d1 = (d1 < kFlashMLANopeDim) ? (d1 / kFlashMLAElemsPerNopeSg) : -1;
 
-    const float* freq = freqs_cis + position * kRopeDim;
-    for (int64_t p = tid; p < kRopeDim / 2; p += kFlashMLALocalSize) {
-      const int64_t base = kNopeDimFlashMLA + 2 * p;
-      const float xr = data[base + 0];
-      const float xi = data[base + 1];
-      const float fr = freq[2 * p + 0];
-      const float fi = freq[2 * p + 1];
-      data[base + 0] = xr * fr - xi * fi;
-      data[base + 1] = xr * fi + xi * fr;
-    }
-    item.barrier(sycl::access::fence_space::local_space);
-
-    for (int64_t g = 0; g < kNopeWarpsFlashMLA; ++g) {
-      const int64_t start = g * kElemsPerNopeWarp;
-      const int64_t end = start + kElemsPerNopeWarp;
-
+    // Part 3: NoPE FP8 quantization. Each 64-d group gets one UE8M0 scale.
+#pragma unroll
+    for (int64_t g = 0; g < kFlashMLANopeSgs; ++g) {
       float g_local_max = 0.0f;
-      if (d0 >= start && d0 < end) {
-        g_local_max = sycl::fmax(g_local_max, sycl::fabs(data[d0]));
+      if (g_d0 == g) {
+        g_local_max = sycl::fabs(data[d0]);
       }
-      if (d1 >= start && d1 < end) {
+      if (g_d1 == g) {
         g_local_max = sycl::fmax(g_local_max, sycl::fabs(data[d1]));
       }
 
-      red[tid] = g_local_max;
+      const float sg_max = subgroup_xor_reduce_max_16(sg, g_local_max);
+      if (lane_id == 0) {
+        red[sg_id] = sg_max;
+      }
       item.barrier(sycl::access::fence_space::local_space);
 
-      for (uint32_t stride = kFlashMLALocalSize / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-          red[tid] = sycl::fmax(red[tid], red[tid + stride]);
-        }
-        item.barrier(sycl::access::fence_space::local_space);
-      }
-
-      if (tid == 0) {
-        const float scale_raw = sycl::fmax(1.0e-4f, red[0]) / kFp8E4m3Max;
-        const uint8_t ue8 = cast_to_ue8m0(scale_raw);
+      if (lid == 0) {
+        const uint32_t sg0 = static_cast<uint32_t>(g * 2);
+        const float abs_max = sycl::fmax(red[sg0], red[sg0 + 1]);
+        const float scale_raw = sycl::fmax(1.0e-4f, abs_max) / kFp8E4m3Max;
+        const uint8_t ue8 = castToUE8M0(scale_raw);
         group_ue8[g] = ue8;
-        group_inv[g] = inv_scale_ue8m0(ue8);
+        group_inv[g] = invScaleUE8M0(ue8);
       }
       item.barrier(sycl::access::fence_space::local_space);
     }
 
-    const int64_t page = slot >> page_bits;
-    const int64_t offset = slot & (page_size - 1);
+    const int64_t page = ps.slot >> page_bits;
+    const int64_t offset = ps.slot & (page_size - 1);
     const int64_t value_base = page * page_bytes + offset * 576;
     const int64_t scale_base = page * page_bytes + 576 * page_size + offset * 8;
 
-    for (int64_t i = tid; i < kNopeDimFlashMLA; i += kFlashMLALocalSize) {
-      const int64_t group = i / kElemsPerNopeWarp;
-      const uint8_t q = cvt_float_to_fp8_e4m3(data[i] * group_inv[group]);
-      kvcache[value_base + i] = q;
+    // NoPE values: 448 FP8 bytes packed as uint16 pairs.
+    uint16_t* nope_ptr = reinterpret_cast<uint16_t*>(kvcache + value_base);
+    if (lid < static_cast<uint32_t>(kFlashMLANopeDim / 2)) {
+      const int64_t pair = static_cast<int64_t>(lid);
+      const int64_t i0 = 2 * pair;
+      const int64_t i1 = i0 + 1;
+      const int64_t g0 = i0 / kFlashMLAElemsPerNopeSg;
+      const int64_t g1 = i1 / kFlashMLAElemsPerNopeSg;
+      const uint8_t q0 = cvt_float_to_fp8_e4m3(data[i0] * group_inv[g0]);
+      const uint8_t q1 = cvt_float_to_fp8_e4m3(data[i1] * group_inv[g1]);
+      nope_ptr[pair] = pack_u8x2(q0, q1);
     }
 
-    for (int64_t i = tid; i < kRopeDim; i += kFlashMLALocalSize) {
-      const uint16_t bits = float_to_bf16_bits(data[kNopeDimFlashMLA + i]);
-      const int64_t byte_off = value_base + kNopeDimFlashMLA + i * 2;
-      kvcache[byte_off + 0] = static_cast<uint8_t>(bits & 0xFFu);
-      kvcache[byte_off + 1] = static_cast<uint8_t>((bits >> 8) & 0xFFu);
+    // RoPE tail: 64 BF16 values.
+    uint16_t* rope_ptr = reinterpret_cast<uint16_t*>(kvcache + value_base + kFlashMLANopeDim);
+    if (lid < static_cast<uint32_t>(kRopeDim)) {
+      const int64_t i = static_cast<int64_t>(lid);
+      rope_ptr[i] = float_to_bf16_bits(data[kFlashMLANopeDim + i]);
     }
 
-    if (tid < static_cast<uint32_t>(kNopeWarpsFlashMLA)) {
-      kvcache[scale_base + tid] = group_ue8[tid];
+    // Scale region: first 7 bytes are valid scales (one per NoPE group).
+    if (lid < static_cast<uint32_t>(kFlashMLANopeSgs)) {
+      kvcache[scale_base + lid] = group_ue8[lid];
     }
   }
 
@@ -493,6 +515,7 @@ struct FusedNormRopeFlashMLAKernel {
   int64_t page_bytes;
   float eps;
   bool is_decode;
+  bool use_bf16_store;
   sycl::local_accessor<float, 1> smem_data;
   sycl::local_accessor<float, 1> smem_red;
   sycl::local_accessor<float, 1> smem_group_inv;
@@ -501,7 +524,7 @@ struct FusedNormRopeFlashMLAKernel {
 
 }  // namespace
 
-void fused_norm_rope_store(
+SGL_KERNEL_EXPORT void fused_norm_rope_store(
     torch::Tensor input,
     torch::Tensor plan,
     torch::Tensor norm_weight,
@@ -512,31 +535,36 @@ void fused_norm_rope_store(
     bool is_decode,
     int64_t compress_ratio,
     int64_t page_size,
-    bool use_fp4) {
-  TORCH_CHECK(input.is_xpu() && input.dim() == 2 && input.is_contiguous(), "input must be contiguous [N, head_dim] XPU tensor");
-  TORCH_CHECK(
-      plan.is_xpu() && plan.dtype() == torch::kUInt8 && plan.dim() == 2 && plan.is_contiguous(),
-      "plan must be contiguous [N, 16] uint8 XPU tensor");
-  TORCH_CHECK(
-      norm_weight.is_xpu() && norm_weight.dim() == 1 && norm_weight.is_contiguous(),
-      "norm_weight must be contiguous [head_dim] XPU tensor");
-  TORCH_CHECK(
-      freq_cis.is_xpu() && freq_cis.dtype() == torch::kFloat && freq_cis.dim() == 2 && freq_cis.is_contiguous(),
-      "freq_cis must be contiguous [max_pos, 64] float32 XPU tensor");
-  TORCH_CHECK(out_loc.is_xpu() && out_loc.dim() == 1 && out_loc.is_contiguous(), "out_loc must be contiguous [M] XPU tensor");
-  TORCH_CHECK(
-      kvcache.is_xpu() && kvcache.dtype() == torch::kUInt8 && kvcache.dim() == 2 && kvcache.is_contiguous(),
-      "kvcache must be contiguous [num_pages, page_bytes] uint8 XPU tensor");
+    bool use_fp4,
+    int64_t preshuffle_size,
+    bool use_bf16_store) {
+  CHECK_INPUT(input);
+  CHECK_DIM(2, input);
+  CHECK_INPUT(plan);
+  CHECK_DIM(2, plan);
+  CHECK_EQ(plan.dtype(), torch::kUInt8);
+  CHECK_INPUT(norm_weight);
+  CHECK_DIM(1, norm_weight);
+  CHECK_INPUT(freq_cis);
+  CHECK_DIM(2, freq_cis);
+  CHECK_EQ(freq_cis.dtype(), torch::kFloat);
+  CHECK_INPUT(out_loc);
+  CHECK_DIM(1, out_loc);
+  CHECK_INPUT(kvcache);
+  CHECK_DIM(2, kvcache);
+  CHECK_EQ(kvcache.dtype(), torch::kUInt8);
 
   const int64_t num_tokens = input.size(0);
   const int64_t head_dim = input.size(1);
 
-  TORCH_CHECK(head_dim == kHeadDimIndexer || head_dim == kHeadDimFlashMLA, "head_dim must be 128 or 512, got ", head_dim);
+  TORCH_CHECK(
+      head_dim == kIndexerHeadDim || head_dim == kFlashMLAHeadDim, "head_dim must be 128 or 512, got ", head_dim);
   TORCH_CHECK(norm_weight.size(0) == head_dim, "norm_weight size must equal head_dim");
   TORCH_CHECK(freq_cis.size(1) == kRopeDim, "freq_cis last dim must be 64");
-  TORCH_CHECK(plan.size(0) == num_tokens && plan.size(1) == static_cast<int64_t>(sizeof(DecodePlan)), "plan must be [N, 16]");
+  TORCH_CHECK(
+      plan.size(0) == num_tokens && plan.size(1) == static_cast<int64_t>(sizeof(DecodePlan)), "plan must be [N, 16]");
   TORCH_CHECK(compress_ratio > 0, "compress_ratio must be > 0");
-  TORCH_CHECK(is_power_of_two(page_size), "page_size must be power of 2");
+  TORCH_CHECK(page_size > 0 && (page_size & (page_size - 1)) == 0, "page_size must be power of 2");
 
   TORCH_CHECK(input.scalar_type() == norm_weight.scalar_type(), "input and norm_weight dtypes must match");
   TORCH_CHECK(
@@ -545,12 +573,27 @@ void fused_norm_rope_store(
       "input dtype must be fp16/bf16/fp32");
 
   if (use_fp4) {
-    TORCH_CHECK(head_dim == kHeadDimIndexer, "use_fp4 is only supported for head_dim=128");
+    TORCH_CHECK(head_dim == kIndexerHeadDim, "use_fp4 is only supported for head_dim=128");
   }
 
-  const int64_t expected_page_bytes = (head_dim == kHeadDimIndexer)
-      ? ((use_fp4 ? 68 : 132) * page_size)
-      : flashmla_page_bytes(page_size);
+  TORCH_CHECK(preshuffle_size >= 0, "preshuffle_size must be >= 0");
+  if (preshuffle_size > 0) {
+    TORCH_CHECK(head_dim == kIndexerHeadDim, "preshuffle_size is only supported for head_dim=128");
+    TORCH_CHECK(!use_fp4, "preshuffle_size is not supported with use_fp4=True");
+    TORCH_CHECK(preshuffle_size % 2 == 0, "preshuffle_size must be even");
+    TORCH_CHECK(kIndexerHeadDim % preshuffle_size == 0, "head_dim(128) must be divisible by preshuffle_size");
+    TORCH_CHECK(page_size % preshuffle_size == 0, "page_size must be divisible by preshuffle_size");
+  }
+
+  if (use_bf16_store) {
+    TORCH_CHECK(head_dim == kFlashMLAHeadDim, "use_bf16_store is only supported for head_dim=512");
+    TORCH_CHECK(!use_fp4, "use_bf16_store is not supported with use_fp4=True");
+  }
+
+  const int64_t expected_page_bytes =
+      (head_dim == kIndexerHeadDim)
+          ? ((use_fp4 ? 68 : 132) * page_size)
+          : (use_bf16_store ? (kFlashMLAHeadDim * 2 * page_size) : flashmla_page_bytes(page_size));
   TORCH_CHECK(
       kvcache.size(1) == expected_page_bytes,
       "kvcache page_bytes mismatch. expected ",
@@ -573,12 +616,12 @@ void fused_norm_rope_store(
   SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, input.scalar_type(), "fused_norm_rope_store", [&]() {
     using input_t = scalar_t;
 
-    if (head_dim == kHeadDimIndexer) {
+    if (head_dim == kIndexerHeadDim) {
       queue.submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<float, 1> smem_data(sycl::range<1>(kHeadDimIndexer), cgh);
-        sycl::local_accessor<float, 1> smem_red(sycl::range<1>(kIndexerLocalSize), cgh);
-        sycl::local_accessor<float, 1> smem_group_inv(sycl::range<1>(4), cgh);
-        sycl::local_accessor<uint8_t, 1> smem_group_ue8(sycl::range<1>(4), cgh);
+        sycl::local_accessor<float, 1> smem_data(sycl::range<1>(kIndexerHeadDim), cgh);
+        sycl::local_accessor<float, 1> smem_red(sycl::range<1>(kIndexerBlockSize), cgh);
+        sycl::local_accessor<float, 1> smem_group_inv(sycl::range<1>(kFp4Groups), cgh);
+        sycl::local_accessor<uint8_t, 1> smem_group_ue8(sycl::range<1>(kFp4Groups), cgh);
 
         FusedNormRopeIndexerKernel<input_t> kernel{
             input.data_ptr<input_t>(),
@@ -596,24 +639,24 @@ void fused_norm_rope_store(
             static_cast<float>(norm_eps),
             is_decode,
             use_fp4,
+            preshuffle_size,
             smem_data,
             smem_red,
             smem_group_inv,
             smem_group_ue8,
         };
 
-        const uint32_t global_size = static_cast<uint32_t>(num_tokens) * kIndexerLocalSize;
-        cgh.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kIndexerLocalSize)), kernel);
+        const uint32_t global_size = static_cast<uint32_t>(num_tokens) * kIndexerBlockSize;
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kIndexerBlockSize)), kernel);
       });
       return;
     }
 
     queue.submit([&](sycl::handler& cgh) {
-      sycl::local_accessor<float, 1> smem_data(sycl::range<1>(kHeadDimFlashMLA), cgh);
-      sycl::local_accessor<float, 1> smem_red(sycl::range<1>(kFlashMLALocalSize), cgh);
-      sycl::local_accessor<float, 1> smem_group_inv(sycl::range<1>(kNopeWarpsFlashMLA), cgh);
-      sycl::local_accessor<uint8_t, 1> smem_group_ue8(sycl::range<1>(kNopeWarpsFlashMLA), cgh);
+      sycl::local_accessor<float, 1> smem_data(sycl::range<1>(kFlashMLAHeadDim), cgh);
+      sycl::local_accessor<float, 1> smem_red(sycl::range<1>(kFlashMLABlockSize), cgh);
+      sycl::local_accessor<float, 1> smem_group_inv(sycl::range<1>(kFlashMLANopeSgs), cgh);
+      sycl::local_accessor<uint8_t, 1> smem_group_ue8(sycl::range<1>(kFlashMLANopeSgs), cgh);
 
       FusedNormRopeFlashMLAKernel<input_t> kernel{
           input.data_ptr<input_t>(),
@@ -630,15 +673,15 @@ void fused_norm_rope_store(
           kvcache.stride(0),
           static_cast<float>(norm_eps),
           is_decode,
+          use_bf16_store,
           smem_data,
           smem_red,
           smem_group_inv,
           smem_group_ue8,
       };
 
-      const uint32_t global_size = static_cast<uint32_t>(num_tokens) * kFlashMLALocalSize;
-      cgh.parallel_for(
-          sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kFlashMLALocalSize)), kernel);
+      const uint32_t global_size = static_cast<uint32_t>(num_tokens) * kFlashMLABlockSize;
+      cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kFlashMLABlockSize)), kernel);
     });
   });
 }

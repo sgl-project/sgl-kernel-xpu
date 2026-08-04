@@ -5,20 +5,6 @@ from typing import List, Tuple
 import torch
 
 
-def _compute_c128_loc(
-    rid: torch.Tensor, position: torch.Tensor, ring_size: int
-) -> torch.Tensor:
-    rid = rid.to(torch.int64)
-    return (rid * ring_size) + (position % ring_size)
-
-
-def _compute_loc(
-    swa_loc: torch.Tensor, swa_page_size: int, ring_size: int
-) -> torch.Tensor:
-    swa_loc = swa_loc.to(torch.int64)
-    return (swa_loc // swa_page_size) * ring_size + (swa_loc % ring_size)
-
-
 def _legacy_page(
     rid: torch.Tensor, position: torch.Tensor, compress_ratio: int
 ) -> torch.Tensor:

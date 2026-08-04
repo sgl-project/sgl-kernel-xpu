@@ -104,6 +104,11 @@ struct Sparse2StageWorkTile {
   int seq_idx;
   int head_bid;
   int v_split_idx;
+  // Split-K index over the gathered topk dim; 0 when split-K is disabled. Unlike the
+  // paged MLA scheduler, which has to divmod-pack the kv-split into z alongside
+  // (batch, head) (kernel/mla_tile_scheduler.hpp:104), Stage 2's grid.z is otherwise
+  // unused, so the split index is just BlockIdxZ().
+  int kv_split_idx;
 };
 
 template <int B_H_>
@@ -126,6 +131,7 @@ class XeMlaSparse2StageIndividualTileScheduler {
     tile_.seq_idx = q_tile_idx - tile_.batch_idx * params.s_q;
     tile_.head_bid = wg_id % num_head_blocks;
     tile_.v_split_idx = int(BlockIdxY());
+    tile_.kv_split_idx = int(BlockIdxZ());
   }
 
   CUTLASS_DEVICE

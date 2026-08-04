@@ -38,7 +38,18 @@ using cutlass::flash_attention::kernel::LOG_E_2;
 // decode epilogue is instantiated with false so that store is compiled out; the
 // prefill config passes true. Kept a template param (rather than the old runtime
 // null-guard) so decode never emits the extra store path.
-template <class CollectiveMainloop_, bool HAS_ATTN_SINK_, bool HAS_MAX_LOGITS_ = false>
+//
+// IS_SPLIT_KV_ turns this into the split-K *publishing* epilogue: instead of finishing
+// the row (attn_sink merge, softmax normalization, LSE) and writing `out`, it stores the
+// UNNORMALIZED partial O plus this split's (max, exp-sum) row stats to the split-K
+// workspace, and the reduction kernel
+// (kernel/xe_mla_sparse_2stage_reduce_split_kv.hpp) does the finishing. The store path
+// itself is shared verbatim: the kernel wrapper hands us an o_accum-based [h_q, D_V]
+// view with the same shape as `out`, so gO / TiledCopyO / tOgO are unchanged and only
+// the base pointer differs. Everything the split path must NOT do (normalize, merge the
+// sink, emit LSE / max_logits) is compiled out rather than runtime-branched, so the
+// non-split kernel is bit-identical to before.
+template <class CollectiveMainloop_, bool HAS_ATTN_SINK_, bool HAS_MAX_LOGITS_ = false, bool IS_SPLIT_KV_ = false>
 class XeMlaSparse2StageEpilogue {
  public:
   //
@@ -47,6 +58,7 @@ class XeMlaSparse2StageEpilogue {
   using CollectiveMainloop = CollectiveMainloop_;
   static constexpr bool HAS_ATTN_SINK = HAS_ATTN_SINK_;
   static constexpr bool HAS_MAX_LOGITS = HAS_MAX_LOGITS_;
+  static constexpr bool IS_SPLIT_KV = IS_SPLIT_KV_;
 
   using Traits = typename CollectiveMainloop::Traits;
   using ElementO = typename CollectiveMainloop::ElementO;
@@ -126,9 +138,12 @@ class XeMlaSparse2StageEpilogue {
 
   // Reduce O / softmax stats across the ReduceK subgroups that share a query row,
   // then normalize (with optional attn_sink merge), emit pre-sink LSE, and store O.
+  //
+  // Under IS_SPLIT_KV the tail is replaced by "publish the partial + stats and return":
+  // `O` is then the o_accum slice for kv_split_idx rather than the final output.
   template <class TensorO>
   CUTLASS_DEVICE void operator()(
-      TensorO const& O,  // [h_q, D_V] gmem, offset to (batch, seq)
+      TensorO const& O,  // [h_q, D_V] gmem, offset to (batch, seq) -- or to (batch, seq, kv-split) of o_accum
       FragA& tArA,
       FragARow& tA_max,
       FragARow& tA_sum,
@@ -139,7 +154,10 @@ class XeMlaSparse2StageEpilogue {
       int head_bid,
       int cur_head_start_idx,
       int batch_idx,
-      int seq_idx) {
+      int seq_idx,
+      // Which split of the gathered topk dim produced tArA / tA_max / tA_sum. Read only
+      // under IS_SPLIT_KV; the non-split instantiation ignores it.
+      int kv_split_idx = 0) {
     float* lse = params.lse;
 
     TiledMMAPV mma_pv{};
@@ -239,6 +257,38 @@ class XeMlaSparse2StageEpilogue {
     constexpr int valid_tid_per_sg = Traits::B_H / get<0>(typename Traits::SubgroupLayoutQK{}.shape());
     static_assert(
         valid_tid_per_sg <= Traits::SUBGROUP_SIZE, "valid_tid_per_sg must be less than or equal to SUBGROUP_SIZE");
+
+    // Split-K publish-and-return. Everything below (LSE, sink, normalize) is the *row*
+    // finish, which cannot be done from one split alone and moves to the reduction kernel.
+    // Compiled out entirely for the non-split instantiation.
+    if constexpr (IS_SPLIT_KV) {
+      // Row stats are identical across V-splits (every V-split work-group recomputes the
+      // same QK + softmax and only narrows the PV output slice), so only v_split_idx == 0
+      // publishes them -- one writer per (batch, seq, kv-split, head). The head indexing
+      // is the same (sg_id, tid_in_sg) -> head mapping the LSE store below uses, so these
+      // stats are correct wherever the non-split LSE is.
+      if (v_split_idx == 0 && tid_in_sg < valid_tid_per_sg && sg_id * valid_tid_per_sg < Traits::B_H) {
+        int local_head_idx = sg_id * valid_tid_per_sg + tid_in_sg;
+        int head_idx = cur_head_start_idx + local_head_idx;
+        if (head_idx < params.h_q) {
+          int stat_idx = batch_idx * params.stride_split_stats_b + seq_idx * params.stride_split_stats_s_q +
+                         kv_split_idx * params.stride_split_stats_split + head_idx;
+          // An empty / fully-masked split lands here with tA_sum still 0 (the mainloop's
+          // topk loop ran zero times), which is exactly the reduction's skip signal.
+          params.split_exp_sums[stat_idx] = rA_sum(0);
+          params.split_max_logits[stat_idx] = rA_max(0);
+        }
+      }
+
+      // Unnormalized partial O -> o_accum, via the same block-2D store as the final
+      // output. Stored unconditionally, including for an empty split: the reduction skips
+      // that split on its exp_sum == 0 signal and never reads the slice, so its contents
+      // do not matter and no zero-fill is needed here.
+      reorder(rA, tOrO);
+      copy(tiled_copy_O, tOrO, tOgO);
+      return;
+    }
+
     if (v_split_idx == 0 && tid_in_sg < valid_tid_per_sg && sg_id * valid_tid_per_sg < Traits::B_H) {
       int local_head_idx = sg_id * valid_tid_per_sg + tid_in_sg;
       int head_idx = cur_head_start_idx + local_head_idx;

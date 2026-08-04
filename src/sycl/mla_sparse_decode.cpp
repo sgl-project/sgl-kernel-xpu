@@ -186,9 +186,7 @@ SGL_KERNEL_EXPORT void flash_mla_sparse_decode(
       (!extra_k_cache.has_value() && !extra_indices.has_value()) ||
           (extra_k_cache.has_value() && extra_indices.has_value()),
       "extra_k_cache and extra_indices must be provided together");
-  TORCH_CHECK(
-      in_dtype == at::ScalarType::Half || in_dtype == at::ScalarType::BFloat16,
-      "Unsupported input data type for Sparse MLA decode");
+  TORCH_CHECK(in_dtype == at::ScalarType::BFloat16, "Unsupported input data type for Sparse MLA decode");
   TORCH_CHECK(head_dim_v == 512, "head_dim_v must be 512 for DeepSeek V4 MLA");
 
 #if SGLANG_USE_SPARSE_MLA_2STAGE

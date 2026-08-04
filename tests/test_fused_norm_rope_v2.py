@@ -6,9 +6,7 @@ Covers both head-dim variants of ``compress_norm_rope_store`` with ``use_fp4=Fal
 
 Like test_fp4_indexer, the test calls the public ``compress_norm_rope_store`` wrapper
 once and compares the written cache against an independent inline reference. The wrapper
-dispatches to the JIT CUDA kernel on CUDA and to the torch fallback on any non-CUDA
-device (e.g. XPU), so the fallback is exercised exactly where it is actually used and
-is never tested against itself on CUDA.
+dispatches to the native kernel op path.
 
 The cache is decoded back to value space (fp8 bytes * scale) before comparison rather
 than compared byte-exact: the software fp8 e4m3 cast and the per-warp abs-max reduction

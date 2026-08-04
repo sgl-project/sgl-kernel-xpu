@@ -31,6 +31,8 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include "cute/util/type_traits.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
@@ -223,7 +225,16 @@ class XeFMHAFwdKernel {
     auto scheduler_params =
         TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{}, sched_num_kv_splits);
     if constexpr (CollectiveMainloop::ScoreBlock2D && StaticScoreMode_ >= 0) {
-      scheduler_params.grid.x = 1;
+      // DIAGNOSTIC (temporary): FMHA_DBG_NO_GRID_PIN=1 leaves the V grid extent
+      // alone so the only remaining difference from the non-ScoreBlock2D path is
+      // the forced blk_v.
+      static const bool dbg_no_grid_pin = [] {
+        const char* e = std::getenv("FMHA_DBG_NO_GRID_PIN");
+        return e && *e != '0';
+      }();
+      if (!dbg_no_grid_pin) {
+        scheduler_params.grid.x = 1;
+      }
     }
     return {
         kernel_params,

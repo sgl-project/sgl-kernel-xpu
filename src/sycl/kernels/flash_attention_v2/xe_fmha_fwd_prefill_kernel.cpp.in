@@ -32,10 +32,6 @@
 // Template parameters: HEAD_DIM=@HEAD_DIM@, TILED_Q=@TILED_Q@, TILED_KV=@TILED_KV@, NUM_SG=@NUM_SG@
 #define SYCL_INTEL_TARGET 20
 
-#if @ENABLE_SCORE_BLOCK2D@
-#define FMHA_PREFILL_ENABLE_SCORE_BLOCK2D 1
-#endif
-
 #include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_runner.hpp"
 
 namespace prefill {

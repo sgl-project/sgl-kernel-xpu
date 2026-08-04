@@ -35,6 +35,7 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include <cstdlib>
 #include <cute/tensor.hpp>
 #include <random>
 
@@ -320,6 +321,12 @@ struct __attribute__((visibility("hidden"))) PrefillRunner {
             params.max_num_pages_per_seq,
             params.window_size_left,
             params.window_size_right,
+            nullptr,
+            // DIAGNOSTIC (temporary): see CollectiveMainloop::Arguments::dbg_flags.
+            [] {
+              const char* e = std::getenv("FMHA_DBG_SCORE_FLAGS");
+              return e ? int(std::strtol(e, nullptr, 0)) : 0;
+            }(),
         },
         {},
         hw_info};
@@ -340,7 +347,17 @@ struct __attribute__((visibility("hidden"))) PrefillRunner {
     if constexpr (CollectiveMainloop::ScoreBlock2D) {
       static constexpr int kLaunches = FMHAPrefillKernel::kOutputTiles;
       static_assert(kLaunches >= 2, "ScoreBlock2D needs at least a store and a load launch");
+      // DIAGNOSTIC (temporary): FMHA_DBG_SCORE_MODES is a bitmask of which score
+      // launches to actually submit, so a hang can be attributed to the store
+      // launch (bit 0) or a load launch (bit 1..) without rebuilding.
+      static const unsigned dbg_modes = [] {
+        const char* e = std::getenv("FMHA_DBG_SCORE_MODES");
+        return e ? unsigned(std::strtoul(e, nullptr, 0)) : ~0u;
+      }();
       auto launch_mode = [&](auto mode) {
+        if (((dbg_modes >> decltype(mode)::value) & 1u) == 0u) {
+          return;
+        }
         using ScoreKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<decltype(mode)::value>;
         launch<ScoreKernel>(ScoreKernel::to_underlying_arguments(arguments, workspace_ptr));
         // The XPU queue may execute independent submissions out of order. Each
@@ -383,8 +400,16 @@ template <
     typename GmemTiledCopyV = void,
     typename GmemTiledCopyO = void>
 struct __attribute__((visibility("hidden"))) FMHAConfig {
-  static constexpr int kOutputTiles =
-      PaddedHeadDimVO == 0 ? 1 : ceil_div(PaddedHeadDimVO, get<1>(TileShapeOutput{}));
+  static constexpr int kOutputTiles = PaddedHeadDimVO == 0 ? 1 : ceil_div(PaddedHeadDimVO, get<1>(TileShapeOutput{}));
+  // Reuse the QK scores across output tiles only when the output tile actually
+  // splits the head dim; with a single tile there is nothing to reuse them for.
+  // Today only HEAD_DIM=512 (padded 512, tile 256) yields kOutputTiles == 2.
+  static constexpr bool kScoreBlock2D = kOutputTiles > 1;
+  // Skew GEMM1's head-dim walk per subgroup (see FMHAFwdMainloop's DSkew_) only
+  // where the walk is long enough for the rotation to spread the subgroups' K
+  // requests over distinct chunks: measured a win at head dim 512, neutral or
+  // worse below it, so shorter head dims keep the plain walk.
+  static constexpr int kDSkew = PaddedHeadDimVO >= 512 ? 1 : 0;
   static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
   using MMAOperation = cute::conditional_t<
       is_void_v<MMAOperation_>,
@@ -448,7 +473,10 @@ struct __attribute__((visibility("hidden"))) FMHAConfig {
         GmemTiledCopyV,
         GmemTiledCopyK_cache,
         GmemTiledCopyV_cache,
-        LocalMask>;
+        LocalMask,
+        /*PackGQA=*/false,
+        kScoreBlock2D,
+        kDSkew>;
 
     // Epilogue
     using CollectiveEpilogue =

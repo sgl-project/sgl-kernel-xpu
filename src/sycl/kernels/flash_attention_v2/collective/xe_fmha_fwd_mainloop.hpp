@@ -39,10 +39,6 @@
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "fmha_fusion.hpp"
 
-#ifndef FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
-#define FMHA_PREFILL_ENABLE_SCORE_BLOCK2D 0
-#endif
-
 #ifndef FMHA_PREFILL_QK_GROUP
 #define FMHA_PREFILL_QK_GROUP 1
 #endif
@@ -93,7 +89,39 @@ template <
     // (decode only, seq_len_qo == 1). All packed rows share the single decode
     // KV position, so per-row masking must use a fixed decode row. Default
     // false keeps prefill (and non-packed decode) unaffected.
-    bool PackGQA_ = false>
+    bool PackGQA_ = false,
+    // ScoreBlock2D: stage the QK scores to global memory in the first output
+    // tile and reload them in later tiles, instead of recomputing GEMM1 per
+    // tile. Only meaningful when the output tile splits the head dim
+    // (kOutputTiles > 1), which the caller decides.
+    //
+    // This MUST be a template parameter, not a per-TU macro: the mainloop's
+    // template arguments are identical for HEAD_DIM 256 and 512 (head_size
+    // only enters via TileShapeOutput/PaddedHeadDimVO, neither of which is a
+    // mainloop parameter), so a macro made two TUs emit same-mangled,
+    // different-bodied definitions of this class. Those symbols are weak and
+    // default-visibility, and common_ops links every per-HEAD_DIM library into
+    // one module, so the dynamic linker kept whichever came first and the
+    // other head dim silently got the wrong ptr_score.
+    bool ScoreBlock2D_ = false,
+    // DSkew: stagger where each subgroup starts GEMM1's head-dim walk, by this
+    // many chunks per subgroup (0 = off, all subgroups start at chunk 0).
+    //
+    // SubgroupLayoutQK splits Q only, so every subgroup walks the head dim in
+    // lockstep and issues the *same* K address in the same cycle, serializing on
+    // one cache line. That request simultaneity -- not request volume -- is what
+    // costs time at head_dim=512: pinning K's address measures +3.3 TFLOPS while
+    // halving GEMM1's K request count (KSTEP=64) measures 0%. GEMM1's head-dim
+    // loop is a reduction into tSrS, so any per-subgroup permutation of it is
+    // valid (only the fp summation order changes), which is why this costs no
+    // registers where widening the tiles or holding Q resident all spill.
+    //
+    // Only worth it where the head-dim walk is long enough for the skew to spread
+    // requests over distinct chunks, so the caller enables it for HEAD_DIM=512
+    // and leaves the shorter head dims on the plain walk. Like ScoreBlock2D_ this
+    // MUST be a template parameter rather than a per-TU macro, or head dims 256
+    // and 512 would emit same-mangled, different-bodied definitions.
+    int DSkew_ = 0>
 struct FMHAFwdMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -119,7 +147,9 @@ template <
     class TiledCopyK_cache_,
     class TiledCopyV_cache_,
     bool LocalMask_,
-    bool PackGQA_>
+    bool PackGQA_,
+    bool ScoreBlock2D_,
+    int DSkew_>
 struct FMHAFwdMainloop<
     XeDefault<Stages>,
     CausalMask_,
@@ -139,7 +169,9 @@ struct FMHAFwdMainloop<
     TiledCopyK_cache_,
     TiledCopyV_cache_,
     LocalMask_,
-    PackGQA_> {
+    PackGQA_,
+    ScoreBlock2D_,
+    DSkew_> {
   //
   // Type Aliases
   //
@@ -213,7 +245,7 @@ struct FMHAFwdMainloop<
   static constexpr bool PagedKV = PagedKV_;
   static constexpr bool LocalMask = LocalMask_;
   static constexpr bool PackGQA = PackGQA_;
-  static constexpr bool ScoreBlock2D = FMHA_PREFILL_ENABLE_SCORE_BLOCK2D;
+  static constexpr bool ScoreBlock2D = ScoreBlock2D_;
   static constexpr int QKGroup = FMHA_PREFILL_QK_GROUP;
   static_assert(QKGroup >= 1, "FMHA_PREFILL_QK_GROUP must be at least 1");
   template <int Mode>
@@ -221,6 +253,8 @@ struct FMHAFwdMainloop<
     return (ScoreBlock2D && Mode >= 1) ? 1 : QKGroup;
   }
   static constexpr bool ZigzagD = FMHA_PREFILL_ZIGZAG_D;
+  // Per-subgroup rotation of GEMM1's head-dim walk; 0 = off. See DSkew_.
+  static constexpr int DSkew = DSkew_;
   static constexpr int NoSplitBarrierMode = FMHA_PREFILL_NO_SPLIT_BARRIER;
 
   // FP8 KV cache: enabled when the K element type is an 8-bit float. The fp8
@@ -237,6 +271,9 @@ struct FMHAFwdMainloop<
     int window_size_left = -1;
     int window_size_right = -1;
     ElementScoreStore* ptr_score = nullptr;
+    // DIAGNOSTIC (temporary): bit 0 skips the score store copy, bit 1 skips the
+    // score load copy. Set from FMHA_DBG_SCORE_FLAGS in the runner.
+    int dbg_flags = 0;
   };
 
   // Kernel-facing parameters
@@ -263,7 +300,8 @@ struct FMHAFwdMainloop<
         args.max_num_pages_per_seq,
         args.window_size_left,
         args.window_size_right,
-        ScoreBlock2D ? reinterpret_cast<ElementScoreStore*>(workspace) : nullptr};
+        ScoreBlock2D ? reinterpret_cast<ElementScoreStore*>(workspace) : nullptr,
+        args.dbg_flags};
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
@@ -327,12 +365,15 @@ struct FMHAFwdMainloop<
     Tensor cK_cache = make_identity_tensor(K_cache_2D.shape());   // (k,d)
     Tensor cV_cache = make_identity_tensor(V_cache_2D.shape());   // (v,k)
     Tensor cP = make_identity_tensor(take<0, 2>(TileShapeQK{}));  // (q,k)
-#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+    // Score staging tensors/copies are built unconditionally: they are pure
+    // local coordinate tensors and copy atoms with no side effects, so the
+    // compiler drops them when ScoreBlock2D is off and every use below is
+    // guarded by `if constexpr (ScoreBlock2D && ...)`. When off, score_head_ptr
+    // is null and nothing dereferences it.
     auto score_shape = make_shape(get<0>(TileShapeQK{}), seq_len_kv_cache);
     auto score_layout = make_layout(score_shape, make_stride(seq_len_kv_cache, Int<1>{}));
     Tensor Score = make_tensor(make_gmem_ptr(score_head_ptr), score_layout);
     Tensor cScore = make_identity_tensor(score_shape);  // (q,k)
-#endif
 
     /* Partition global tensors into workgroup tiles */
     Tensor gQ = local_tile(cQ, TileShapeQK{}, append(blk_qv, _), Step<_1, X, _1>{});          // (q,d,D)
@@ -343,9 +384,7 @@ struct FMHAFwdMainloop<
     Tensor gK_cache = local_tile(cK_cache, TileShapeQK{}, make_coord(_, _, _), Step<X, _1, _1>{});        // (k,d,K,D)
     Tensor gV_cache = local_tile(cV_cache, tile_shape_v, make_coord(get<1>(blk_qv), _));                  // (v,k,K)
     Tensor gV_cache_split = local_tile(gV_cache, TileShapePV{}, make_coord(_, _, 0), Step<X, _1, _1>{});  // (v,k,VV,K)
-#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
-    Tensor gScore = local_tile(cScore, take<0, 2>(TileShapeQK{}), make_coord(_0{}, _));  // (q,k,K)
-#endif
+    Tensor gScore = local_tile(cScore, take<0, 2>(TileShapeQK{}), make_coord(_0{}, _));                   // (q,k,K)
 
     /* Create global -> register copies */
     TiledCopyQ copy_q{Q_2D};
@@ -357,10 +396,8 @@ struct FMHAFwdMainloop<
     /* Create MMAs */
     TiledMMAQK mma_qk{};
     TiledMMAPV mma_pv{};
-#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
     auto copy_score_store = make_block_2d_copy_D(mma_qk, Score);
     auto copy_score_load = make_block_2d_copy_C(mma_qk, Score);
-#endif
 
     /* Slice TiledCopy/TiledMMA operations down to to work-item level */
     auto thr_copy_q = copy_q.get_slice(thr_id);
@@ -370,10 +407,8 @@ struct FMHAFwdMainloop<
     auto thr_copy_v_cache = copy_v_cache.get_slice(thr_id);
     auto thr_mma_qk = mma_qk.get_slice(thr_id);
     auto thr_mma_pv = mma_pv.get_slice(thr_id);
-#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
     auto thr_copy_score_store = copy_score_store.get_slice(thr_id);
     auto thr_copy_score_load = copy_score_load.get_slice(thr_id);
-#endif
 
     /* Partition coordinate tensors for copy */
     auto tQgQ = thr_copy_q.partition_S(gQ);        // (atom_val,q',d',D)
@@ -392,12 +427,10 @@ struct FMHAFwdMainloop<
     constexpr int KGrp = group_for_mode<StaticScoreMode>();
     FragS tSrS_grp[KGrp];
     auto tArP = thr_mma_pv.partition_sg_fragment_A(cP);
-#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
     auto tScoreStoreR = thr_copy_score_store.partition_sg_fragment_S(gScore(_, _, 0));
     auto tScoreStoreG = thr_copy_score_store.partition_D(gScore);
     auto tScoreLoadG = thr_copy_score_load.partition_S(gScore);
     auto tScoreLoadR = thr_copy_score_load.partition_sg_fragment_D(gScore(_, _, 0));
-#endif
 
     auto tVrV = thr_copy_v.partition_sg_fragment_D(gV_split(_, _, 0, 0));
     auto tArV = thr_mma_pv.partition_sg_fragment_B(gV_split(_, _, 0, 0));
@@ -458,7 +491,8 @@ struct FMHAFwdMainloop<
     constexpr bool SkipSplitBarrier =
         (NoSplitBarrierMode == 1) || (NoSplitBarrierMode == 2 && ScoreBlock2D && StaticScoreMode >= 1);
 
-    const int k_end = cute::min(blk_k1, kblocks_cache);
+    // DIAGNOSTIC (temporary): bit 2 skips the K loop entirely.
+    const int k_end = (params.dbg_flags & 4) ? blk_k0 : cute::min(blk_k1, kblocks_cache);
     for (int K_grp = blk_k0; K_grp < k_end; K_grp += KGrp) {
       // GEMM1 runs outside the per-K barrier region. At QKGroup > 1 one pass
       // over Q feeds several score accumulators; the default keeps one.
@@ -471,10 +505,20 @@ struct FMHAFwdMainloop<
           clear(tSrS_grp[g]);
         }
 
-        const int nD = size<4>(tKgK);
+        const int num_D = size<4>(tKgK);
         CUTLASS_PRAGMA_UNROLL
-        for (int Di = 0; Di < nD; Di++) {
-          const int D = (ZigzagD && ((K_grp / KGrp) & 1)) ? (nD - 1 - Di) : Di;
+        for (int Di = 0; Di < num_D; Di++) {
+          int D = (ZigzagD && ((K_grp / KGrp) & 1)) ? (num_D - 1 - Di) : Di;
+          if constexpr (DSkew > 0) {  // See the DSkew_ template parameter.
+            // Rotate each subgroup's start point in the head-dim walk so the subgroups
+            // request distinct K chunks instead of colliding on one address. Valid because
+            // this loop is a reduction into tSrS. Subtract-if rather than a modulo: num_D is
+            // a dynamic int, so % would emit a division inside the hot loop.
+            D += (int(thr_id / intel::sg_size) * DSkew) % num_D;
+            if (D >= num_D) {
+              D -= num_D;
+            }
+          }
           copy(copy_q, tQgQ(_, _, _, D), tQrQ);
           reorder(tQrQ, tSrQ);
           CUTLASS_PRAGMA_UNROLL
@@ -510,10 +554,12 @@ struct FMHAFwdMainloop<
         }
 
         if constexpr (ScoreBlock2D && StaticScoreMode >= 1) {
-#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
-          copy(copy_score_load, tScoreLoadG(_, _, _, K), tScoreLoadR);
-          reorder(tScoreLoadR, tSrS);
-#endif
+          if ((params.dbg_flags & 2) == 0) {
+            copy(copy_score_load, tScoreLoadG(_, _, _, K), tScoreLoadR);
+            reorder(tScoreLoadR, tSrS);
+          } else {
+            clear(tSrS);
+          }
         }
 
         /* V prefetch for GEMM 2 */
@@ -581,12 +627,12 @@ struct FMHAFwdMainloop<
           }
         }
 
-#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
         if constexpr (ScoreBlock2D && StaticScoreMode == 0) {
-          reorder(tSrS, tScoreStoreR);
-          copy(copy_score_store, tScoreStoreR, tScoreStoreG(_, _, _, K));
+          if ((params.dbg_flags & 1) == 0) {
+            reorder(tSrS, tScoreStoreR);
+            copy(copy_score_store, tScoreStoreR, tScoreStoreG(_, _, _, K));
+          }
         }
-#endif
 
         auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, qk_scale);
         reorder(tSrS, tArP);

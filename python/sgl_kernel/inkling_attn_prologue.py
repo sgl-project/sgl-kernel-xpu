@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 from typing import Optional
 
 import torch
@@ -20,28 +19,6 @@ def _as_int32(x: torch.Tensor) -> torch.Tensor:
 
 def _as_int64(x: torch.Tensor) -> torch.Tensor:
     return x if x.dtype == torch.int64 else x.to(torch.int64)
-
-
-def _ops_registered() -> bool:
-    return hasattr(torch.ops.sgl_kernel, "inkling_attn_prologue_verify")
-
-
-def _ensure_ops_registered() -> None:
-    if _ops_registered():
-        return
-    try:
-        importlib.import_module("sgl_kernel.inkling_attn_prologue_ops")
-    except ImportError as exc:
-        raise ImportError(
-            "Inkling attention prologue ops are not registered. Build/install "
-            "the inkling_attn_prologue_ops extension before calling "
-            "sgl_kernel.inkling_attn_prologue."
-        ) from exc
-    if not _ops_registered():
-        raise RuntimeError(
-            "sgl_kernel.inkling_attn_prologue_ops loaded without registering "
-            "Inkling attention prologue ops"
-        )
 
 
 def _resolve_log_scaling_tau(
@@ -117,7 +94,6 @@ def inkling_attn_prologue_verify(
     del sfk, sfv, page_size
     log_scaling_tau = _resolve_log_scaling_tau(log_scaling_tau, log_tau)
     _reject_mxfp8_or_tau(mxfp8_quant=mxfp8_quant, log_scaling_tau=log_scaling_tau)
-    _ensure_ops_registered()
     q_out, k_out, v_out = torch.ops.sgl_kernel.inkling_attn_prologue_verify(
         qkvr,
         k_cache,
@@ -181,7 +157,6 @@ def inkling_attn_prologue_decode(
     del sfk, sfv, page_size
     log_scaling_tau = _resolve_log_scaling_tau(log_scaling_tau, log_tau)
     _reject_mxfp8_or_tau(mxfp8_quant=mxfp8_quant, log_scaling_tau=log_scaling_tau)
-    _ensure_ops_registered()
     q_out, k_out, v_out = torch.ops.sgl_kernel.inkling_attn_prologue_decode(
         qkvr,
         k_cache,
@@ -249,7 +224,6 @@ def inkling_attn_prologue_extend(
     del sfk, sfv, page_size
     log_scaling_tau = _resolve_log_scaling_tau(log_scaling_tau, log_tau)
     _reject_mxfp8_or_tau(mxfp8_quant=mxfp8_quant, log_scaling_tau=log_scaling_tau)
-    _ensure_ops_registered()
     q_out, k_out, v_out = torch.ops.sgl_kernel.inkling_attn_prologue_extend(
         qkvr,
         k_cache,
@@ -295,4 +269,3 @@ def compile_inkling_attn_prologue(
         raise NotImplementedError(
             "Inkling XPU attention prologue MXFP8 store is not wired yet"
         )
-    _ensure_ops_registered()

@@ -219,7 +219,7 @@ def packed_q_view(T, dq, dkv, dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("activation", [None, "silu"])
+@pytest.mark.parametrize("activation", [None, "silu", "swish"])
 @pytest.mark.parametrize("dq,dkv", [(128, 128), (384, 256)])
 def test_attn_prologue_verify_matches_reference(dtype, activation, dq, dkv):
     from sgl_kernel.inkling_attn_prologue import inkling_attn_prologue_verify

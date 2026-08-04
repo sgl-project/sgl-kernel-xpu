@@ -98,10 +98,6 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer_ph_lf,
 )
 from sgl_kernel.inkling_sconv import (
-    HIS_ONES,
-    HIS_PREFIX,
-    HIS_SEQ_MINUS_EXT,
-    HIS_ZEROS,
     causal_conv1d,
     fused_causal_conv1d_update_decode,
     fused_decode_sconv_metadata,

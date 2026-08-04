@@ -8,10 +8,11 @@ import torch
 PAD_SLOT_ID = -1
 CHUNK_SIZE = 64
 
-HIS_ZEROS = 0
-HIS_PREFIX = 1
-HIS_SEQ_MINUS_EXT = 2
-HIS_ONES = 3
+# has_initial_state variants for the fused extend metadata kernel.
+HIS_ZEROS = 0  # boundary-KV draft extend: force conv to run fresh
+HIS_PREFIX = 1  # extend_prefix_lens > 0
+HIS_SEQ_MINUS_EXT = 2  # (seq_lens[:B] - extend_seq_lens) > 0 (draft_extend_v2 capture)
+HIS_ONES = 3  # target_verify: always has initial state
 _FUSED_EXTEND_MAX_B = 1023
 
 

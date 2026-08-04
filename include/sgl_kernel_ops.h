@@ -751,7 +751,7 @@ void fast_topk_transform_ragged_interface(
     std::optional<at::Tensor> row_starts_opt);
 
 /*
- * Compress plan kernels
+ * Compress plan and execution kernels
  */
 namespace at::native::xpu {
 
@@ -779,6 +779,14 @@ torch::Tensor plan_compress_decode(
 
 void flash_compress128_decode(
     torch::Tensor kv_buffer, torch::Tensor kv_input, torch::Tensor kv_output, torch::Tensor ape, torch::Tensor plan_d);
+
+void flash_compress128_prefill(
+    torch::Tensor kv_buffer,
+    torch::Tensor kv_input,
+    torch::Tensor kv_output,
+    torch::Tensor ape,
+    torch::Tensor plan_c,
+    torch::Tensor plan_w);
 
 }  // namespace at::native::xpu
 

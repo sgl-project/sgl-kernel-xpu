@@ -80,7 +80,7 @@ struct Dsv3GemmRunner {
     auto problem_shape = cute::make_shape(M, N, K, L);
 
     auto shape_A = cute::make_shape(M, K, L);
-    auto shape_B = cute::make_shape(K, N, L);
+    auto shape_B = cute::make_shape(N, K, L);  // CUTLASS B convention: (N, K, L)
     auto shape_CD = cute::make_shape(M, N, L);
 
     StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, shape_A);

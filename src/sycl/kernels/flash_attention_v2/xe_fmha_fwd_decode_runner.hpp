@@ -90,6 +90,9 @@ struct Arguments {
   bool use_sink = false;
   bool is_causal = false;
   bool is_local = false;
+  // When false, the epilogue skips writing softmax_lse (paged bf16 only; other
+  // paths always write). Threaded as a template constexpr via DecodeConfig.
+  bool return_softmax_lse = false;
 
   // The O matrix (output).
   void* __restrict__ o_ptr;
@@ -566,6 +569,7 @@ template <
     bool Causal,
     bool LocalMask,
     bool Sink,
+    bool LSE,
     typename TileShapeQK,
     typename TileShapePV,
     typename TileShapeOutput,
@@ -670,7 +674,7 @@ struct DecodeConfig {
 
     // Epilogue
     using CollectiveEpilogue = cutlass::fmha::collective::
-        FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, Sink, PackGQA>;
+        FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, Sink, PackGQA, LSE>;
 
     static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
     using FMHADecodeKernel = conditional_t<

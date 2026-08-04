@@ -57,7 +57,10 @@ template <
     // (decode only). Each packed row is a distinct query head with its own sink
     // logit, so the sink is applied per row. Default false keeps prefill and
     // non-packed decode on the scalar (per-head) path.
-    bool PackGQA_ = false>
+    bool PackGQA_ = false,
+    // LSE: when false, the epilogue skips writing softmax_lse.
+    // Defaults to false; every instantiation site threads the flag explicitly.
+    bool LSE_ = false>
 class FMHAFwdEpilogue {
  public:
   //
@@ -78,6 +81,7 @@ class FMHAFwdEpilogue {
 
   // Sink support
   static constexpr bool Sink = Sink_;
+  static constexpr bool LSE = LSE_;
   using ElementSink = typename CollectiveMainloop::TensorQ::element_type;
 
   // Split k-reduced tiles between participating subgroups.
@@ -252,10 +256,12 @@ class FMHAFwdEpilogue {
           }
         }
         // Emit the natural-log LSE once per query head (at the v==0 column).
-        if (lse_ptr != nullptr && int(get<1>(tOgO(j))) == 0 && head_off < head_group_q) {
-          float d = float(denom);
-          float lse = (d > 0.f) ? (float(tO_max(j)) * kRcpLog2e + sycl::log(d)) : -INFINITY;
-          lse_ptr[(lse_head_base + head_off) * lse_head_stride + lse_q_base] = lse;
+        if constexpr (LSE) {
+          if (int(get<1>(tOgO(j))) == 0 && head_off < head_group_q) {
+            float d = float(denom);
+            float lse = (d > 0.f) ? (float(tO_max(j)) * kRcpLog2e + sycl::log(d)) : -INFINITY;
+            lse_ptr[(lse_head_base + head_off) * lse_head_stride + lse_q_base] = lse;
+          }
         }
         // Rows that attend to no (unmasked) keys have denom==0 -> emit 0, not NaN.
         ElementA outv = (denom != ElementA(0)) ? (tO_num(j) / denom) : ElementA(0);
@@ -279,7 +285,7 @@ class FMHAFwdEpilogue {
       // overwritten by its reciprocal). Each query row writes exactly once, at
       // the v==0 column. Works for both non-packed (prefill / MHA decode) and
       // non-sink PackGQA decode tiles.
-      if (lse_ptr != nullptr) {
+      if constexpr (LSE) {
         auto denom_e = rA;  // per-element softmax denominator (sum of weights)
         auto max_e = rA;    // per-element row max
         CUTLASS_PRAGMA_UNROLL
@@ -449,7 +455,8 @@ template <
     class TensorLSE_ = void,   // Optional tensor for storing intermediate exp
                                // sums and max logits
     class TiledCopyO_ = void,  // Optional TiledCopy for loading O
-    bool Sink_ = false>        // Whether to sink softmax into epilogue
+    bool Sink_ = false,        // Whether to sink softmax into epilogue
+    bool LSE_ = false>         // Whether to emit softmax log-sum-exp
 class DecodeFwdEpilogue {
  public:
   //
@@ -477,6 +484,8 @@ class DecodeFwdEpilogue {
 
   // softmax sink, same dtype
   static constexpr bool Sink = Sink_;
+  // Whether to emit the softmax log-sum-exp output.
+  static constexpr bool LSE = LSE_;
   using ElementSink = typename CollectiveMainloop::TensorQ::element_type;
 
   // Split k-reduced tiles between participating subgroups.
@@ -665,11 +674,13 @@ class DecodeFwdEpilogue {
     // Single-split sequences are normalized here (ReduceSplitK is a pass-through
     // for them), so emit their LSE directly. Multi-split LSE is written by
     // ReduceSplitK after the cross-split reduction.
-    if (lse_ptr != nullptr && thr_id < head_group_q && (is_single_split || num_kv_splits <= 1)) {
-      constexpr float kRcpLog2e = 0.6931471805599453f;  // ln(2)
-      float d = float(rA_sum(0));
-      float lse = (d > 0.f) ? (float(rA_max(0)) * kRcpLog2e + sycl::log(d)) : -INFINITY;
-      lse_ptr[int64_t(lse_head_base + thr_id) * lse_head_stride + lse_q_base] = lse;
+    if constexpr (LSE) {
+      if (thr_id < head_group_q && (is_single_split || num_kv_splits <= 1)) {
+        constexpr float kRcpLog2e = 0.6931471805599453f;  // ln(2)
+        float d = float(rA_sum(0));
+        float lse = (d > 0.f) ? (float(rA_max(0)) * kRcpLog2e + sycl::log(d)) : -INFINITY;
+        lse_ptr[int64_t(lse_head_base + thr_id) * lse_head_stride + lse_q_base] = lse;
+      }
     }
 
     /* Some subgroups may not have any work to do; if so, quit early. */

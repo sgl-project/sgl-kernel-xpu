@@ -94,6 +94,7 @@ std::vector<at::Tensor> mha_fwd_nopage(
     int window_size_left,
     int window_size_right,
     float const softcap,
+    bool return_softmax_lse,
     std::optional<at::Tensor> out_opt,
     std::optional<at::Tensor> skip_batch_mask_opt) {
   auto q_type = q.scalar_type();
@@ -191,6 +192,7 @@ std::vector<at::Tensor> mha_fwd_nopage(
   params.total_knew = 0;
 
   params.softmax_lse_ptr = softmax_lse.data_ptr();
+  params.return_softmax_lse = return_softmax_lse;
 
   params.b = batch_size;
   params.h = num_heads;
@@ -302,6 +304,7 @@ std::vector<at::Tensor> mha_fwd(
     // chunkprefill two-launch path: pre-allocated shared output, and a per-batch
     // bool mask (length = batch) whose true entries are skipped by the kernel.
     std::optional<at::Tensor> out_opt = std::nullopt,
+    bool return_softmax_lse = false,
     std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
@@ -347,6 +350,7 @@ std::vector<at::Tensor> mha_fwd(
         window_size_left,
         window_size_right,
         softcap,
+        return_softmax_lse,
         std::move(out_opt),
         std::move(skip_batch_mask_opt));
   }
@@ -479,8 +483,12 @@ std::vector<at::Tensor> mha_fwd(
   // Cast to char to avoid compiler warning about narrowing
   c10::DeviceGuard device_guard(q.device());
 
+  // Only allocate the (num_heads, total_q) LSE tensor when the caller asked for
+  // it; otherwise a zero-element placeholder keeps the return ABI stable while
+  // the kernel (LSE=false) skips every LSE write.
   at::Tensor softmax_lse;
-  softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
+  softmax_lse = return_softmax_lse ? torch::empty({num_heads, total_q}, opts.dtype(at::kFloat))
+                                   : torch::empty({0}, opts.dtype(at::kFloat));
 
   // align with FA3
 
@@ -520,8 +528,10 @@ std::vector<at::Tensor> mha_fwd(
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
   params.num_kv_splits = num_kv_splits;
 
-  // Softmax sum
-  params.softmax_lse_ptr = softmax_lse.data_ptr();
+  // Softmax sum (null when the caller does not request it, matching the empty
+  // placeholder tensor above).
+  params.softmax_lse_ptr = return_softmax_lse ? softmax_lse.data_ptr() : nullptr;
+  params.return_softmax_lse = return_softmax_lse;
 
   // Set the dimensions.
   params.b = batch_size;
@@ -891,6 +901,7 @@ std::vector<at::Tensor> mha_fwd(
     // chunkprefill two-launch path: pre-allocated shared output, and a per-batch
     // bool mask (length = batch) whose true entries are skipped by the kernel.
     std::optional<at::Tensor> out_opt = std::nullopt,
+    bool return_softmax_lse = false,
     std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
@@ -1011,8 +1022,12 @@ std::vector<at::Tensor> mha_fwd(
   // Cast to char to avoid compiler warning about narrowing
   c10::DeviceGuard device_guard(q.device());
 
+  // Only allocate the (num_heads, total_q) LSE tensor when the caller asked for
+  // it; otherwise a zero-element placeholder keeps the return ABI stable while
+  // the kernel (LSE=false) skips every LSE write.
   at::Tensor softmax_lse;
-  softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
+  softmax_lse = return_softmax_lse ? torch::empty({num_heads, total_q}, opts.dtype(at::kFloat))
+                                   : torch::empty({0}, opts.dtype(at::kFloat));
 
   // align with FA3
   Arguments params;
@@ -1040,8 +1055,10 @@ std::vector<at::Tensor> mha_fwd(
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
 
-  // Softmax sum
-  params.softmax_lse_ptr = softmax_lse.data_ptr();
+  // Softmax sum (null when the caller does not request it, matching the empty
+  // placeholder tensor above).
+  params.softmax_lse_ptr = return_softmax_lse ? softmax_lse.data_ptr() : nullptr;
+  params.return_softmax_lse = return_softmax_lse;
 
   // Set the dimensions.
   params.b = batch_size;
@@ -1236,7 +1253,8 @@ std::vector<at::Tensor> mha_fwd(
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin,
-    std::optional<at::Tensor> out_ = std::nullopt) {
+    std::optional<at::Tensor> out_ = std::nullopt,
+    bool return_softmax_lse = false) {
   // Supports both paged (page_table != None) and non-paged (contiguous ragged
   // KV, page_table == None) layouts.
   // ``seqlens_rotary_`` is intentionally not checked here: callers pass it
@@ -1293,12 +1311,14 @@ std::vector<at::Tensor> mha_fwd(
         pack_gqa_,
         sm_margin,
         std::move(out_opt),
+        return_softmax_lse,
         std::move(skip_mask));
   };
 
   // Launch 1: decode allocates the shared output (or reuses the caller-provided
-  // out_ buffer) and skips prefill batches. It also allocates a full
-  // (num_heads, total_q) softmax_lse and fills only the decode rows.
+  // out_ buffer) and skips prefill batches. When return_softmax_lse is set it
+  // also allocates a full (num_heads, total_q) softmax_lse and fills only the
+  // decode rows (otherwise an empty placeholder).
   auto decode_ret = launch(decode::mha_fwd, std::move(out_), is_prefill);
   auto out = decode_ret[0];
   auto lse_decode = decode_ret[1];  // (num_heads, total_q), valid only on decode rows
@@ -1312,9 +1332,16 @@ std::vector<at::Tensor> mha_fwd(
   // launch that actually computed it. Columns are query tokens (total_q); a token
   // belongs to a prefill batch iff its batch has seqlen_q > 1. at::where is a pure
   // element-wise select, so the uninitialized rows are never read out. This runs
-  // entirely on device (no D2H sync).
-  auto token_is_prefill = is_prefill.repeat_interleave(seqlens_q.to(at::kLong));         // (total_q,)
-  auto softmax_lse = at::where(token_is_prefill.unsqueeze(0), lse_prefill, lse_decode);  // (num_heads, total_q)
+  // entirely on device (no D2H sync). When return_softmax_lse is false the two
+  // sub-launches allocated empty LSE placeholders (no LSE compute), so skip the
+  // stitch and return an empty placeholder as well.
+  at::Tensor softmax_lse;
+  if (return_softmax_lse) {
+    auto token_is_prefill = is_prefill.repeat_interleave(seqlens_q.to(at::kLong));    // (total_q,)
+    softmax_lse = at::where(token_is_prefill.unsqueeze(0), lse_prefill, lse_decode);  // (num_heads, total_q)
+  } else {
+    softmax_lse = at::empty({0}, q.options().dtype(at::kFloat));
+  }
 
   // accum tensors are internal to split-KV reduction and unused by the Python
   // caller; return empty placeholders to keep the ABI stable.
@@ -1353,7 +1380,8 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin,
-    std::optional<at::Tensor>& out_) {
+    std::optional<at::Tensor>& out_,
+    bool return_softmax_lse = false) {
   TORCH_CHECK(q.dim() == 3, "query must be in ragged format (total_q, h, d)");
   // k and v may be 3D (total_k, h_k, d) for non-paged or 4D (num_pages, page_size, h_k, d)
   // for paged KV cache; sub-functions validate their own shapes.
@@ -1408,6 +1436,7 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha
            pack_gqa_,
            sm_margin,
            out_,
+           return_softmax_lse,
            std::forward<decltype(tail)>(tail)...));
   };
 

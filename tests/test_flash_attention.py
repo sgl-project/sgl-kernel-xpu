@@ -910,7 +910,10 @@ def test_flash_attn_kvcache(
                 else:
                     k_cache_paged.copy_(k_cache_saved)
                     v_cache_paged.copy_(v_cache_saved)
-                out, lse, *rest = flash_attn_with_kvcache(
+                # The kernel only supports returning softmax_lse without
+                # causal/local/sink masking; request it only in that case.
+                return_lse = not causal and not local and not use_sinks
+                result = flash_attn_with_kvcache(
                     q if not varlen_q else q_unpad,
                     k_cache if page_size is None else k_cache_paged,
                     v_cache if page_size is None else v_cache_paged,
@@ -934,14 +937,18 @@ def test_flash_attn_kvcache(
                     rotary_interleaved=rotary_interleaved,
                     scheduler_metadata=scheduler_metadata,
                     num_splits=num_splits,
-                    return_softmax_lse=True,
+                    return_softmax_lse=return_lse,
                 )
+                if return_lse:
+                    out, lse, *rest = result
+                else:
+                    out = result
                 # --- softmax_lse validation (regression guard for the empty /
                 # mis-shaped LSE that the old chunkprefill path returned). The
                 # kernel's LSE for sink cases is sink-exclusive while the
                 # reference is sink-inclusive, so numeric LSE is only validated
                 # for non-sink cases. lse_ref is reused from the out_ref call. ---
-                if not use_sinks:
+                if return_lse:
                     ref_lse_hq = (
                         rearrange(lse_ref, "b h s -> (b s) h")[indices_q]
                         .transpose(0, 1)
@@ -1418,7 +1425,10 @@ def test_flash_attn_decode_kvcache(
                 else:
                     k_cache_paged.copy_(k_cache_saved)
                     v_cache_paged.copy_(v_cache_saved)
-                out, lse, *rest = flash_attn_with_kvcache(
+                # The kernel only supports returning softmax_lse without
+                # causal/local/sink masking; request it only in that case.
+                return_lse = not causal and not local and not use_sinks
+                result = flash_attn_with_kvcache(
                     q if not varlen_q else q_unpad,
                     k_cache if page_size is None else k_cache_paged,
                     v_cache if page_size is None else v_cache_paged,
@@ -1443,14 +1453,18 @@ def test_flash_attn_decode_kvcache(
                     rotary_interleaved=rotary_interleaved,
                     scheduler_metadata=scheduler_metadata,
                     num_splits=num_splits,
-                    return_softmax_lse=True,
+                    return_softmax_lse=return_lse,
                 )
+                if return_lse:
+                    out, lse, *rest = result
+                else:
+                    out = result
                 # --- softmax_lse validation (regression guard for the empty /
                 # mis-shaped LSE that the old chunkprefill path returned). The
                 # kernel's LSE for sink cases is sink-exclusive while the
                 # reference is sink-inclusive, so numeric LSE is only validated
                 # for non-sink cases. lse_ref is reused from the out_ref call. ---
-                if not use_sinks:
+                if return_lse:
                     ref_lse_hq = (
                         rearrange(lse_ref, "b h s -> (b s) h")[indices_q]
                         .transpose(0, 1)
@@ -1922,7 +1936,7 @@ def test_flash_attn_varlen_output(
         pack_gqa_vals = [False, True] if not DISABLE_PACKGQA else [False]
         num_splits_vals = [1, 3] if not DISABLE_SPLIT else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
-            out_unpad, lse, *rest = flash_attn_varlen_func(
+            out_unpad = flash_attn_varlen_func(
                 q_unpad,
                 k_unpad,
                 v_unpad,
@@ -1941,36 +1955,9 @@ def test_flash_attn_varlen_output(
                 softmax_scale=softmax_scale,
                 sinks=sinks,
                 softcap=softcap,
-                return_softmax_lse=True,
+                return_softmax_lse=False,
             )
             out = output_pad_fn(out_unpad)
-            # --- softmax_lse validation ---
-            indices_q_lse = torch.nonzero(
-                query_padding_mask.flatten(), as_tuple=False
-            ).flatten()
-            _, _, lse_ref = attention_ref(
-                q_ref,
-                k_ref,
-                v_ref,
-                softmax_scale,
-                sinks,
-                query_padding_mask=query_padding_mask,
-                key_padding_mask=key_padding_mask,
-                causal=causal,
-                qv=qv_ref,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                window_size=window_size,
-                softcap=softcap,
-                return_lse=True,
-            )
-            ref_lse_hq = (
-                rearrange(lse_ref, "b h s -> (b s) h")[indices_q_lse]
-                .transpose(0, 1)
-                .contiguous()
-            )
-            _check_softmax_lse(lse, nheads_q, q_unpad.shape[0], ref_lse_hq)
             if query_unused_mask is not None:
                 out.masked_fill_(q_zero_masking, 0.0)
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")

@@ -294,6 +294,7 @@ def flash_attn_with_kvcache(
         pack_gqa,
         sm_margin,
         out,
+        return_softmax_lse,
     )
     return (out, softmax_lse, *rest) if return_softmax_lse else out
 
@@ -367,6 +368,8 @@ def flash_attn_varlen_func(
         num_splits,
         pack_gqa,
         sm_margin,
+        None,  # out
+        return_softmax_lse,
     )
 
     return (out, softmax_lse, *rest) if return_softmax_lse else out

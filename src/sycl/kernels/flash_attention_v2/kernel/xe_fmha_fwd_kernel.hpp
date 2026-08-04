@@ -120,6 +120,8 @@ class XeFMHAFwdKernel {
 
   // Sink support from epilogue
   static constexpr bool Sink = CollectiveEpilogue::Sink;
+  // Whether the epilogue emits softmax log-sum-exp.
+  static constexpr bool LSE = CollectiveEpilogue::LSE;
   using ElementSink = typename CollectiveEpilogue::ElementSink;
 
   // Kernel level shared memory storage
@@ -442,12 +444,15 @@ class XeFMHAFwdKernel {
       // tiles). For PackGQA decode the single query token maps to lse_q_base and
       // the row selects the query head within the KV group.
       int lse_q_base = 0;
-      if constexpr (is_var_len) {
-        lse_q_base = s.seq_len_qo.cumulative_length[idx_b];
-      } else {
-        lse_q_base = idx_b * seq_len_qo;
+      int lse_head_base = 0;
+      if constexpr (LSE) {
+        if constexpr (is_var_len) {
+          lse_q_base = s.seq_len_qo.cumulative_length[idx_b];
+        } else {
+          lse_q_base = idx_b * seq_len_qo;
+        }
+        lse_head_base = PackGQA_ ? (head * head_group_q) : q_head_idx;
       }
-      int lse_head_base = PackGQA_ ? (head * head_group_q) : q_head_idx;
       if constexpr (Sink) {
         if constexpr (PackGQA_) {
           // Packed decode: pass the per-row sink base for this KV head's group
@@ -1015,7 +1020,8 @@ class XeFMHAFwdSplitKVKernel {
   using ElementLSE = typename CollectiveEpilogue::ElementLSE;
   using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
 
-  // Kernel level shared memory storage
+  // Whether the epilogue emits softmax log-sum-exp.
+  static constexpr bool LSE = CollectiveEpilogue::LSE;
   using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
   using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
   union SharedStorage {
@@ -1162,7 +1168,10 @@ class XeFMHAFwdSplitKVKernel {
       // Mix-batch dispatch: skip batches not owned by this kernel launch.
       if (p.skip_batch_mask != nullptr && p.skip_batch_mask[idx_b]) continue;
       auto blk_qv = make_coord(blk_q, blk_v);
-      int head_q_start = head * head_group_q;
+      int head_q_start = 0;
+      if constexpr (LSE) {
+        head_q_start = head * head_group_q;
+      }
 
       auto sequence_length_shape = get_sequence_length_shape(s, idx_b);
       auto [seq_len_qo, seq_len_kv] = sequence_length_shape;
@@ -1189,7 +1198,10 @@ class XeFMHAFwdSplitKVKernel {
       int offset_exp_sums = 0, offset_max_logits = 0;
       // Query-token index in the (num_heads_q, total_q) softmax_lse output. For
       // decode seq_len_qo == 1, so each (batch) maps to a single token.
-      int lse_q_base = idx_b;
+      int lse_q_base = 0;
+      if constexpr (LSE) {
+        lse_q_base = idx_b;
+      }
       if constexpr (is_var_len) {
         auto qo_cumulative = s.seq_len_qo.cumulative_length;
 
@@ -1197,7 +1209,9 @@ class XeFMHAFwdSplitKVKernel {
         offset_o = s.num_heads_q * s.head_size_vo * num_kv_splits * qo_cumulative[idx_b];
         offset_exp_sums = s.num_heads_q * num_kv_splits * qo_cumulative[idx_b];
         offset_max_logits = s.num_heads_q * num_kv_splits * qo_cumulative[idx_b];
-        lse_q_base = qo_cumulative[idx_b];
+        if constexpr (LSE) {
+          lse_q_base = qo_cumulative[idx_b];
+        }
 
         // for gqa packing, seq_len_qo must be 1
         seq_len_qo = 1;

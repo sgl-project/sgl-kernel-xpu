@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 from typing import Optional, TypedDict
 
 import torch
@@ -77,30 +76,9 @@ def _activation_is_silu(activation: Optional[str]) -> bool:
     return activation == "silu"
 
 
-def _ops_registered() -> bool:
-    return hasattr(torch.ops.sgl_kernel, "inkling_sconv_forward")
-
-
-def _ensure_ops_registered() -> None:
-    if _ops_registered():
-        return
-    try:
-        importlib.import_module("sgl_kernel.common_ops")
-    except ImportError as exc:
-        raise ImportError(
-            "Inkling sconv ops are not registered. Build/install the "
-            "common_ops extension before calling sgl_kernel.inkling_sconv."
-        ) from exc
-    if not _ops_registered():
-        raise RuntimeError(
-            "sgl_kernel.common_ops loaded without registering Inkling sconv ops"
-        )
-
-
 def fused_decode_sconv_metadata(
     B: int, cache_indices: torch.Tensor, out: Optional[SconvMetadataOut] = None
 ) -> tuple[torch.Tensor, torch.Tensor, SconvDecodeMetadata]:
-    _ensure_ops_registered()
     out_tensors = _metadata_out_tensors(out)
     (
         query_start_loc,
@@ -132,7 +110,6 @@ def fused_extend_sconv_metadata(
 ) -> Optional[tuple[torch.Tensor, torch.Tensor, SconvExtendMetadata]]:
     if B > _FUSED_EXTEND_MAX_B or not getattr(cache_indices, "is_xpu", False):
         return None
-    _ensure_ops_registered()
     out_tensors = _metadata_out_tensors(out)
     (
         query_start_loc,
@@ -209,7 +186,6 @@ def track_conv_indices(
     chunk_size: int = CHUNK_SIZE,
     total_tokens: Optional[int] = None,
 ) -> torch.Tensor:
-    _ensure_ops_registered()
     if total_tokens is None:
         total_tokens = int(query_start_loc[-1].item())
     return torch.ops.sgl_kernel.inkling_track_conv_indices(
@@ -234,7 +210,6 @@ def causal_conv1d(
     use_residual: bool = True,
     is_decode: bool = False,
 ) -> torch.Tensor:
-    _ensure_ops_registered()
     if x.shape[0] == 0:
         return torch.empty_like(x)
     return torch.ops.sgl_kernel.inkling_sconv_forward(
@@ -258,7 +233,6 @@ def update_sconv_cache(
     has_initial_state: torch.Tensor,
     query_start_loc: torch.Tensor,
 ) -> None:
-    _ensure_ops_registered()
     torch.ops.sgl_kernel.inkling_update_sconv_cache(
         x,
         sconv_cache,
@@ -279,7 +253,6 @@ def fused_causal_conv1d_update_decode(
     track_mask: Optional[torch.Tensor] = None,
     track_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    _ensure_ops_registered()
     return torch.ops.sgl_kernel.inkling_fused_decode_update_sconv(
         x,
         weight,
@@ -300,7 +273,6 @@ def fused_gather_scatter_to_sconv_cache(
     mask: torch.Tensor,
     dst_indices: torch.Tensor,
 ) -> None:
-    _ensure_ops_registered()
     torch.ops.sgl_kernel.inkling_gather_scatter_sconv_cache(
         hidden_states,
         sconv_cache,
@@ -322,7 +294,6 @@ def fused_draft_extend_sconv_cache(
     mamba_track_indices: Optional[torch.Tensor] = None,
     num_accepted_tokens: Optional[torch.Tensor] = None,
 ) -> None:
-    _ensure_ops_registered()
     if num_accepted_tokens is None:
         if num_accept_tokens is None:
             raise TypeError("num_accept_tokens or num_accepted_tokens is required")
@@ -352,7 +323,6 @@ def save_intermediate_conv_windows(
     batch_size: int,
     draft_token_num: int,
 ) -> None:
-    _ensure_ops_registered()
     torch.ops.sgl_kernel.inkling_save_intermediate_conv_windows(
         sconv_cache,
         hidden_states,

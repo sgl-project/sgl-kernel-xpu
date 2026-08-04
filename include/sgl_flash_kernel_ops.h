@@ -77,7 +77,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin,
-    std::optional<at::Tensor>& out_);
+    std::optional<at::Tensor>& out_,
+    bool return_softmax_lse);
 
 void flash_mla_decode(
     torch::Tensor& out,

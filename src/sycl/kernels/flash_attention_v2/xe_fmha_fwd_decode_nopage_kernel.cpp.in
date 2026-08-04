@@ -60,6 +60,35 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
   static constexpr int kKvSubgroups_NP = kv_subgroups_for_slm(
       @TILED_KV_NP@ / 16, @QG_SZ@, ((@HEAD_DIM@ + 31) / 32) * 32);
   using SubgroupLayoutQK_NP = cute::Layout<cute::Shape<cute::_1, cute::Int<kKvSubgroups_NP>, cute::_1>>;
+
+  // softmax_lse output is only threaded as a template constexpr for the base
+  // (non-local / non-sink) configuration, mirroring the paged decode path. It is
+  // used by the cascade tree-verify "expand" pass, which runs the non-paged
+  // decode kernel over a dense ragged branch-KV buffer and needs the LSE to
+  // merge with the paged prefix pass.
+  if (params.return_softmax_lse) {
+    TORCH_CHECK(
+        !params.is_local && !params.use_sink,
+        "return_softmax_lse is only supported without local/sink masking");
+    using Element = bfloat16_t;
+    DecodeConfig<
+        false,
+        false,
+        false,
+        /*LSE=*/true,
+        TileShapeQK_NP,
+        TileShapePV_NP,
+        TileShapeOutput_NP,
+        SubgroupLayoutQK_NP,
+        void,
+        1,
+        false,
+        Element,
+        Element,
+        Element,
+        Element>::run_nopaged(params);
+    return;
+  }
   // No sink support for no_page path; always use Sink=false
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     using Element = @ELEM_TYPE@;
@@ -67,6 +96,7 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
         false,
         LocalMask,
         false,
+        /*LSE=*/false,
         TileShapeQK_NP,
         TileShapePV_NP,
         TileShapeOutput_NP,

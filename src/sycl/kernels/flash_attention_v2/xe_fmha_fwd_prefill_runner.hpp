@@ -177,6 +177,9 @@ struct Arguments {
   bool is_e5m2 = false;
   bool is_causal;
   bool is_local;
+  // When false, the epilogue skips writing softmax_lse (paged bf16 only; other
+  // paths always write). Threaded as a template constexpr via FMHAConfig.
+  bool return_softmax_lse = false;
 
   bool is_rotary_interleaved;
 
@@ -423,6 +426,7 @@ template <
     bool Causal,
     bool LocalMask,
     bool Sink,
+    bool LSE,
     typename TileShapeQK,
     typename TileShapePV,
     typename TileShapeOutput,
@@ -510,8 +514,8 @@ struct FMHAConfig {
         LocalMask>;
 
     // Epilogue
-    using CollectiveEpilogue =
-        cutlass::fmha::collective::FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, Sink>;
+    using CollectiveEpilogue = cutlass::fmha::collective::
+        FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, Sink, /*PackGQA*/ false, LSE>;
 
     static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
     using FMHAPrefillKernel = conditional_t<

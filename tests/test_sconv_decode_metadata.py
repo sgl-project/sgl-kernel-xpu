@@ -7,14 +7,15 @@ used to launch: two arange calls + ones + precompute_helion_decode_metadata
 
 import pytest
 import torch
-
 from sgl_kernel.inkling_sconv import (
     PAD_SLOT_ID,
     fused_decode_sconv_metadata,
     precompute_helion_decode_metadata,
 )
 
-requires_cuda = pytest.mark.skipif(not (hasattr(torch, "xpu") and torch.xpu.is_available()), reason="XPU only")
+requires_cuda = pytest.mark.skipif(
+    not (hasattr(torch, "xpu") and torch.xpu.is_available()), reason="XPU only"
+)
 
 # cross the BLOCK=1024 grid boundary and hit odd sizes
 BATCH_SIZES = [1, 2, 3, 17, 64, 160, 257, 1023, 1024, 1025]

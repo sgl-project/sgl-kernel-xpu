@@ -35,7 +35,7 @@ def benchmark(batch_size, vocab_size, top_p, provider):
     print(
         f"benchmark {provider} with batch_size={batch_size} vocab_size={vocab_size} top_p={top_p}"
     )
-    dtype = torch.bfloat16
+    dtype = torch.float32
     torch.set_default_device("xpu")
     torch.xpu.manual_seed_all(42)
 
@@ -61,9 +61,7 @@ def benchmark(batch_size, vocab_size, top_p, provider):
     torch.xpu.empty_cache()
 
     # Calculate memory bandwidth
-    num_elements = batch_size * vocab_size
-
-    total_bytes = 2 * (num_elements * 2)  # read and write
+    total_bytes = 2 * (probs.numel() * probs.element_size())  # read and write
     bandwidth_gb_s = total_bytes / (ms / 1e3) / 1e9
 
     del probs

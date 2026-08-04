@@ -417,8 +417,7 @@ void inkling_draft_extend_sconv_cache(
     const std::optional<at::Tensor>& crossed,
     const std::optional<at::Tensor>& track_step,
     const std::optional<at::Tensor>& mamba_track_indices);
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
-inkling_fused_decode_sconv_metadata(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> inkling_fused_decode_sconv_metadata(
     int64_t B,
     const at::Tensor& cache_indices,
     const std::optional<at::Tensor>& query_start_loc_out,

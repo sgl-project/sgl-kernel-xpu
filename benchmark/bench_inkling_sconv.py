@@ -2,7 +2,6 @@ import argparse
 
 import torch
 import triton
-
 from sgl_kernel.inkling_sconv import (
     causal_conv1d,
     fused_causal_conv1d_update_decode,
@@ -227,9 +226,7 @@ def main() -> int:
             quantiles=quantiles,
         )
         bytes_moved = x.numel() * elem_size * (2 * args.W + 2)
-        _print_result(
-            "fused_decode_update", median_ms, p20_ms, p80_ms, bytes_moved
-        )
+        _print_result("fused_decode_update", median_ms, p20_ms, p80_ms, bytes_moved)
 
     if args.op in ("all", "update-cache"):
         x, cache, cache_indices, has_initial_state, query_start_loc = _make_update_case(

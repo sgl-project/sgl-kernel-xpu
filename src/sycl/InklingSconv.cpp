@@ -1972,8 +1972,7 @@ void inkling_draft_extend_sconv_cache(
       });
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
-inkling_fused_decode_sconv_metadata(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> inkling_fused_decode_sconv_metadata(
     int64_t B,
     const at::Tensor& cache_indices,
     const std::optional<at::Tensor>& query_start_loc_out,
@@ -1991,8 +1990,8 @@ inkling_fused_decode_sconv_metadata(
       has_initial_state_out, cache_indices, at::ScalarType::Bool, {B}, "has_initial_state_out");
   at::Tensor cache_mask = allocate_or_validate_metadata_output(
       cache_mask_out, cache_indices, at::ScalarType::Bool, {B, 1, 1}, "cache_mask_out");
-  at::Tensor safe_idx = allocate_or_validate_metadata_output(
-      safe_idx_out, cache_indices, at::ScalarType::Long, {B}, "safe_idx_out");
+  at::Tensor safe_idx =
+      allocate_or_validate_metadata_output(safe_idx_out, cache_indices, at::ScalarType::Long, {B}, "safe_idx_out");
   at::Tensor cu = allocate_or_validate_metadata_output(cu_out, cache_indices, at::ScalarType::Long, {B + 1}, "cu_out");
   at::Tensor si = allocate_or_validate_metadata_output(si_out, cache_indices, at::ScalarType::Int, {B}, "si_out");
   auto queue = c10::xpu::getCurrentXPUStream().queue();
@@ -2051,8 +2050,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
       has_initial_state_out, cache_indices, at::ScalarType::Bool, {B}, "has_initial_state_out");
   at::Tensor cache_mask = allocate_or_validate_metadata_output(
       cache_mask_out, cache_indices, at::ScalarType::Bool, {B, 1, 1}, "cache_mask_out");
-  at::Tensor safe_idx = allocate_or_validate_metadata_output(
-      safe_idx_out, cache_indices, at::ScalarType::Long, {B}, "safe_idx_out");
+  at::Tensor safe_idx =
+      allocate_or_validate_metadata_output(safe_idx_out, cache_indices, at::ScalarType::Long, {B}, "safe_idx_out");
   at::Tensor cu = allocate_or_validate_metadata_output(cu_out, cache_indices, at::ScalarType::Long, {B + 1}, "cu_out");
   at::Tensor si = allocate_or_validate_metadata_output(si_out, cache_indices, at::ScalarType::Int, {T}, "si_out");
   auto queue = c10::xpu::getCurrentXPUStream().queue();

@@ -279,6 +279,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "bias) -> Tensor");
   m.impl("fp8_scaled_mm", torch::kXPU, &fp8_scaled_mm_xpu);
   m.def(
+      "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype)"
+      " -> Tensor");
+  m.impl("fp8_blockwise_scaled_mm", torch::kXPU, &fp8_blockwise_scaled_mm);
+  m.def(
       "mxfp4_blockwise_scaled_grouped_mm(Tensor! output, Tensor! a_ptrs, Tensor! b_ptrs, Tensor! out_ptrs, "
       "Tensor! a_scales_ptrs, Tensor! b_scales_ptrs, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, "
       "Tensor problem_sizes, Tensor expert_offsets, Tensor workspace) -> ()");

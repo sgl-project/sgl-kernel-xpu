@@ -74,7 +74,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin,
-    std::optional<at::Tensor>& out_);
+    std::optional<at::Tensor>& out_,
+    std::optional<const at::Tensor>& k_new_,
+    std::optional<const at::Tensor>& v_new_,
+    std::optional<const at::Tensor>& cu_seqlens_k_new_);
 
 void flash_mla_decode(
     torch::Tensor& out,

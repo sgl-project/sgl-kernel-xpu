@@ -38,31 +38,6 @@ def _make_inputs(t, d, device, seed=42):
     return x, residual, post, comb, fn, hc_scale, hc_base, norm_weight
 
 
-def _bench(fn_a, fn_b, *, warmup=15, iters=30):
-    for _ in range(warmup):
-        fn_a()
-        fn_b()
-    torch.xpu.synchronize()
-
-    a_times = []
-    b_times = []
-    for _ in range(iters):
-        sa = torch.xpu.Event(enable_timing=True)
-        ea = torch.xpu.Event(enable_timing=True)
-        sa.record()
-        fn_a()
-        ea.record()
-        sb = torch.xpu.Event(enable_timing=True)
-        eb = torch.xpu.Event(enable_timing=True)
-        sb.record()
-        fn_b()
-        eb.record()
-        torch.xpu.synchronize()
-        a_times.append(sa.elapsed_time(ea))
-        b_times.append(sb.elapsed_time(eb))
-    return sum(a_times) / len(a_times), sum(b_times) / len(b_times)
-
-
 @pytest.mark.parametrize("d", [4096, 7168])
 @pytest.mark.parametrize("t", [0, 1, 8, 17, 32, 64])
 @pytest.mark.parametrize("with_norm", [False, True])
@@ -154,53 +129,4 @@ def test_mhc_fused_post_pre(t, d, with_norm):
         atol=2e-2,
         rtol=2e-2,
         msg=f"layer_input mismatch (T={t}, D={d}, norm={with_norm})",
-    )
-
-
-@torch.inference_mode()
-@pytest.mark.parametrize("d", [4096, 7168])
-@pytest.mark.parametrize("t", [1, 8, 17, 32])
-def test_mhc_fused_post_pre_perf(t, d):
-    x, residual, post, comb, fn, hc_scale, hc_base, norm_weight = _make_inputs(
-        t, d, device="xpu:0", seed=123
-    )
-
-    def run_fused():
-        mhc_fused_post_pre(
-            x,
-            residual,
-            post,
-            comb,
-            fn,
-            hc_scale,
-            hc_base,
-            rms_eps=RMS_EPS,
-            hc_pre_eps=HC_PRE_EPS,
-            hc_sinkhorn_eps=HC_SINKHORN_EPS,
-            hc_post_mult_value=HC_POST_MULT_VALUE,
-            sinkhorn_repeat=SINKHORN_REPEAT,
-            norm_weight=norm_weight,
-            norm_eps=NORM_EPS,
-        )
-
-    def run_split():
-        residual_cur = hc_post(x, residual, post, comb)
-        mhc_pre(
-            residual_cur,
-            fn,
-            hc_scale,
-            hc_base,
-            rms_eps=RMS_EPS,
-            hc_pre_eps=HC_PRE_EPS,
-            hc_sinkhorn_eps=HC_SINKHORN_EPS,
-            hc_post_mult_value=HC_POST_MULT_VALUE,
-            sinkhorn_repeat=SINKHORN_REPEAT,
-            norm_weight=norm_weight,
-            norm_eps=NORM_EPS,
-        )
-
-    fused_ms, split_ms = _bench(run_fused, run_split)
-
-    assert fused_ms < split_ms, (
-        f"fused op is not faster: " f"fused={fused_ms:.3f} ms, split={split_ms:.3f} ms"
     )

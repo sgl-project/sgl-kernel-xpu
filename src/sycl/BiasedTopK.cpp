@@ -10,6 +10,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 namespace at::native::xpu {
 
@@ -454,7 +455,7 @@ void launch_biased_topk(
 }
 }  // namespace
 
-void biased_topk(
+SGL_KERNEL_EXPORT void biased_topk(
     const at::Tensor& input,
     const at::Tensor& bias,
     at::Tensor& output,

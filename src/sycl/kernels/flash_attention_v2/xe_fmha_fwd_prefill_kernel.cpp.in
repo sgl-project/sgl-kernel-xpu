@@ -37,7 +37,7 @@
 namespace prefill {
 
 template <>
-void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
+__attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
   bool use_sink = (params.softmax_sink_ptr != nullptr);
 
   using TileShapeQK = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_KV@>, cute::_32>;

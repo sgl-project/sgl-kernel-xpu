@@ -19,6 +19,7 @@
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "cutlass/float8.h"
+#include "sgl_kernel_export.h"
 
 // TODO: Remove this when sycl float8 is supported
 using cutlass::float_e4m3_t;
@@ -502,7 +503,7 @@ void launchFusedQKNormRopeImpl(
   });
 }
 
-void fused_qk_norm_rope(
+SGL_KERNEL_EXPORT void fused_qk_norm_rope(
     torch::Tensor& qkv,
     int64_t num_heads_q,
     int64_t num_heads_k,
@@ -1231,7 +1232,7 @@ void launchFusedQNormRopeCTA(
   });
 }
 
-void fused_q_norm_rope(
+SGL_KERNEL_EXPORT void fused_q_norm_rope(
     torch::Tensor& q_input, torch::Tensor& q_output, torch::Tensor& freqs_cis, torch::Tensor& positions, double eps) {
   TORCH_CHECK(q_input.dim() == 3, "q_input must be 3D: [num_tokens, num_heads, head_dim]");
   TORCH_CHECK(q_output.dim() == 3, "q_output must be 3D: [num_tokens, num_heads, head_dim]");
@@ -1630,7 +1631,7 @@ void launchFusedKNormRopeFlashMLA(
   });
 }
 
-void fused_k_norm_rope_flashmla(
+SGL_KERNEL_EXPORT void fused_k_norm_rope_flashmla(
     torch::Tensor& kv,
     torch::Tensor& kv_weight,
     torch::Tensor& freqs_cis,
@@ -1732,7 +1733,7 @@ void fused_k_norm_rope_flashmla(
   });
 }
 
-void fused_inplace_qknorm_rope(
+SGL_KERNEL_EXPORT void fused_inplace_qknorm_rope(
     torch::Tensor& q,
     torch::Tensor& k,
     torch::Tensor& q_weight,

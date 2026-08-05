@@ -38,7 +38,7 @@
 namespace decode {
 
 template <>
-void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Arguments& params) const {
+__attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Arguments& params) const {
   using TileShapeQK = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@PAGE_SIZE@>, cute::_64>;
   using TileShapePV = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@PAGE_SIZE@>>;
   // Round the head-dim of the output tile up to a multiple of get<1>(TileShapePV) (32) so that

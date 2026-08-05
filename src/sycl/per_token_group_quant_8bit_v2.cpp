@@ -38,6 +38,7 @@
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "cutlass/float8.h"
+#include "sgl_kernel_export.h"
 
 namespace at::native::xpu {
 
@@ -710,7 +711,7 @@ void per_token_group_quant_8bit_kernel_impl(
   }
 }
 
-void sgl_per_token_group_quant_8bit_v2(
+SGL_KERNEL_EXPORT void sgl_per_token_group_quant_8bit_v2(
     // vanilla: (num_tokens, hidden_size)
     // fuse_silu_and_mul: (num_tokens, hidden_size * 2)
     // fuse_silu_and_mul + masked_layout: (num_experts, num_tokens-with-padding, hidden_size * 2)

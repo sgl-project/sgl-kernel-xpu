@@ -7,6 +7,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 namespace at::native::xpu {
 
@@ -602,7 +603,7 @@ void fused_topk_sigmoid(
  * @param correction_bias The correction_bias tensor of shape [num_experts].
  * @return void.
  */
-void topk_sigmoid(
+SGL_KERNEL_EXPORT void topk_sigmoid(
     at::Tensor& topk_weights,
     at::Tensor& topk_indices,
     at::Tensor& gating_output,

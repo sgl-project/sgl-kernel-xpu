@@ -5,6 +5,7 @@
 
 #include "Utils.h"
 #include "comm/General.h"
+#include "sgl_kernel_export.h"
 
 namespace at::native::xpu {
 
@@ -453,7 +454,7 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_3D_kernel_impl(
   return {query_out, key_out};
 }
 
-std::tuple<at::Tensor, at::Tensor> rotary_embedding(
+SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor> rotary_embedding(
     at::Tensor& positions,
     at::Tensor& query,
     at::Tensor& key,

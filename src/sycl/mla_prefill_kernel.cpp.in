@@ -36,7 +36,7 @@
 
 namespace mla_prefill {
 
-void launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_small(
+__attribute__((visibility("default"))) void launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_small(
     at::Tensor& out,
     const at::Tensor& q_nope,
     const at::Tensor& q_pe,
@@ -55,7 +55,7 @@ void launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_small(
       workspace, sm_scale, causal, num_kv_splits);
 }
 
-void launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_medium(
+__attribute__((visibility("default"))) void launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_medium(
     at::Tensor& out,
     const at::Tensor& q_nope,
     const at::Tensor& q_pe,
@@ -74,7 +74,7 @@ void launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_medium(
       workspace, sm_scale, causal, num_kv_splits);
 }
 
-void launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_large(
+__attribute__((visibility("default"))) void launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_large(
     at::Tensor& out,
     const at::Tensor& q_nope,
     const at::Tensor& q_pe,

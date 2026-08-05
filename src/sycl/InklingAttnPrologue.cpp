@@ -20,6 +20,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 namespace {
 
@@ -1011,7 +1012,7 @@ void launch_extend(sycl::queue& q, AttnPrologueExtendParams<scalar_t> const& par
 
 }  // namespace
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_verify(
+SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_verify(
     const at::Tensor& qkvr,
     const at::Tensor& k_cache,
     const at::Tensor& v_cache,
@@ -1131,7 +1132,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_verify(
   return {q_out, k_out, v_out};
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_decode(
+SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_decode(
     const at::Tensor& qkvr,
     at::Tensor& k_cache,
     at::Tensor& v_cache,
@@ -1245,7 +1246,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_decode(
   return {q_out, k_out, v_out};
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_extend(
+SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_extend(
     const at::Tensor& qkvr,
     at::Tensor& k_cache,
     at::Tensor& v_cache,
@@ -1389,7 +1390,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_extend(
   return {q_out, k_out, v_out};
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_verify_mxfp8(
+SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_verify_mxfp8(
     const at::Tensor& qkvr,
     const at::Tensor& k_cache,
     const at::Tensor& v_cache,
@@ -1531,7 +1532,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue
   return {q_out, k_out, v_out, q_scale};
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_decode_mxfp8(
+SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_decode_mxfp8(
     const at::Tensor& qkvr,
     at::Tensor& k_cache,
     at::Tensor& v_cache,
@@ -1667,7 +1668,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue
   return {q_out, k_out, v_out, q_scale};
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_extend_mxfp8(
+SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_extend_mxfp8(
     const at::Tensor& qkvr,
     at::Tensor& k_cache,
     at::Tensor& v_cache,

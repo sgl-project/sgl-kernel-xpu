@@ -33,6 +33,9 @@ static constexpr int kSubGroupSize = 32;
 template <int BLOCK_SIZE>
 class TransferCacheDsv4MlaKernel {
  public:
+  static_assert(
+      BLOCK_SIZE % kSubGroupSize == 0,
+      "BLOCK_SIZE must be a multiple of the sub-group size (32).");
   static constexpr int kNumSubGroups = BLOCK_SIZE / kSubGroupSize;
 
   TransferCacheDsv4MlaKernel(

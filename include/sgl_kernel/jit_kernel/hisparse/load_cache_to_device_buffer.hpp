@@ -73,6 +73,10 @@ struct SmemLayout {
   // int16_t region: lru_slots_out + hash_vals
   static constexpr int TOTAL_INT16 = HOT_BUFFER_SIZE + HASH_SIZE;
   static constexpr size_t BYTES = TOTAL_INT32 * sizeof(int32_t) + TOTAL_INT16 * sizeof(int16_t);
+  // Round int16 region up to whole int32 slots so a single int32_t local_accessor
+  // holds both regions and stays 4-byte aligned throughout.
+  static constexpr int TOTAL_INT32_SLOTS =
+      TOTAL_INT32 + (TOTAL_INT16 * sizeof(int16_t) + sizeof(int32_t) - 1) / sizeof(int32_t);
 };
 
 // Local (shared) memory atomic CAS returning the previous value, matching
@@ -118,6 +122,9 @@ template <
 class LoadCacheToDeviceBufferKernel {
  public:
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
+  static_assert(
+      BLOCK_SIZE % kWarpSize == 0,
+      "BLOCK_SIZE must be a multiple of the warp size (32).");
 
   using Layout = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>;
   static constexpr int NUM_WARPS = BLOCK_SIZE / kWarpSize;
@@ -146,7 +153,7 @@ class LoadCacheToDeviceBufferKernel {
       int64_t top_k_device_locs_stride,
       int64_t page_size,
       int64_t item_size_bytes,
-      ::sycl::local_accessor<char, 1> smem)
+      ::sycl::local_accessor<int32_t, 1> smem)
       : top_k_tokens_(top_k_tokens),
         device_buffer_tokens_(device_buffer_tokens),
         host_cache_locs_(host_cache_locs),
@@ -205,10 +212,10 @@ class LoadCacheToDeviceBufferKernel {
       return;
     }
 
-    // Carve up the shared-memory scratch: int32 region first, then int16.
-    // SYCL local memory is allocated max-aligned, so the int32 reinterpret is safe.
-    char* smem_raw = &smem_[0];
-    int32_t* smem_i32 = reinterpret_cast<int32_t*>(smem_raw);
+    // Scratch is allocated as int32_t (see kernel launch), giving 4-byte
+    // alignment for the int32 region. int16 region follows immediately after
+    // TOTAL_INT32 int32 slots, so its base is also 4-byte aligned.
+    int32_t* smem_i32 = &smem_[0];
     int32_t* s_top_k_tokens = smem_i32;                                        // NUM_TOP_K
     int32_t* s_chunk_offset = s_top_k_tokens + NUM_TOP_K;                       // NUM_BUFFER_CHUNKS + 1
     int32_t* s_evict_chunk_offset = s_chunk_offset + (NUM_BUFFER_CHUNKS + 1);   // NUM_BUFFER_CHUNKS + 1
@@ -457,7 +464,7 @@ class LoadCacheToDeviceBufferKernel {
   int64_t top_k_device_locs_stride_;
   int64_t page_size_;
   int64_t item_size_bytes_;
-  ::sycl::local_accessor<char, 1> smem_;
+  ::sycl::local_accessor<int32_t, 1> smem_;
 };
 
 template <
@@ -502,10 +509,10 @@ void load_cache_to_device_buffer_launcher(
       IsDsv4Layout,
       SeqLensT,
       ReqPoolIndicesT>;
-  constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
+  constexpr size_t smem_slots = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::TOTAL_INT32_SLOTS;
 
   queue.submit([&](::sycl::handler& cgh) {
-    ::sycl::local_accessor<char, 1> smem(::sycl::range<1>(smem_bytes), cgh);
+    ::sycl::local_accessor<int32_t, 1> smem(::sycl::range<1>(smem_slots), cgh);
     cgh.parallel_for(
         ::sycl::nd_range<1>(
             ::sycl::range<1>(static_cast<size_t>(batch_size) * BLOCK_SIZE), ::sycl::range<1>(BLOCK_SIZE)),

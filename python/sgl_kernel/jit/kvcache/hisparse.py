@@ -19,12 +19,8 @@ import ctypes
 
 import torch
 
-from .compiler import load_jit_sycl
-from .utils import cache_once
-
-# Block sizes for which the transfer kernel is pre-instantiated in the header's
-# default (non-macro) path. Other sizes are compiled on demand via -D.
-_SUPPORTED_TRANSFER_BLOCK_SIZES = (256, 512, 1024)
+from sgl_kernel.jit.compiler import load_jit_sycl
+from sgl_kernel.jit.utils import cache_once
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +158,13 @@ def _jit_load_cache_module(
 
 
 def _dtype_suffix(t: torch.Tensor) -> str:
-    return "i64" if t.dtype == torch.int64 else "i32"
+    if t.dtype == torch.int64:
+        return "i64"
+    if t.dtype == torch.int32:
+        return "i32"
+    raise TypeError(
+        f"seq_lens / req_pool_indices must be int32 or int64, got {t.dtype}"
+    )
 
 
 def _load_cache_to_device_buffer_mla(
@@ -188,6 +190,31 @@ def _load_cache_to_device_buffer_mla(
     assert (
         hot_buffer_size >= num_top_k
     ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+
+    # Kernel gets only stride(0); rows must be contiguous. device_buffer_tokens
+    # and device_buffer_locs share stride(0) (reused inside the kernel).
+    _expected_dtypes = {
+        "top_k_tokens": (top_k_tokens, torch.int32),
+        "device_buffer_tokens": (device_buffer_tokens, torch.int32),
+        "host_cache_locs": (host_cache_locs, torch.int64),
+        "device_buffer_locs": (device_buffer_locs, torch.int32),
+        "top_k_device_locs": (top_k_device_locs, torch.int32),
+        "lru_slots": (lru_slots, torch.int16),
+    }
+    for name, (t, expected) in _expected_dtypes.items():
+        if t.dtype != expected:
+            raise TypeError(f"{name} must be {expected}, got {t.dtype}")
+        if t.device.type != "xpu":
+            raise ValueError(f"{name} must be on XPU, got {t.device}")
+        if t.dim() >= 2 and t.stride(-1) != 1:
+            raise ValueError(
+                f"{name} must be row-contiguous (stride(-1)==1), got stride={t.stride()}"
+            )
+    if device_buffer_tokens.stride(0) != device_buffer_locs.stride(0):
+        raise ValueError(
+            "device_buffer_tokens and device_buffer_locs must share stride(0), "
+            f"got {device_buffer_tokens.stride(0)} vs {device_buffer_locs.stride(0)}"
+        )
 
     module = _jit_load_cache_module(
         block_size,

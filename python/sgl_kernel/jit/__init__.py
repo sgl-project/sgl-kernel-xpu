@@ -35,6 +35,7 @@ if is_xpu():
     from .per_token_group_quant_8bit_v2 import per_token_group_quant_8bit_v2
     from .rope import apply_rope_inplace, apply_rope_inplace_with_kvcache
     from .timestep_embedding import timestep_embedding
+    from . import minimax 
 
     __all__ = [
         # Utilities

@@ -235,7 +235,11 @@ struct TopPRenormProbsRadixCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr uint32_t kRadix = 1u << kRadixBits;
   static constexpr uint32_t kNumRounds = 32u / kRadixBits;
   static constexpr uint32_t kSubGroupSize = 32;
-  static constexpr uint32_t kNumSubGroups = kWgSize / kSubGroupSize;
+  // One histogram per sub-group. Rounds 1-3 jam every element straight into local
+  // memory with a plain atomic, so the replicas are what keep those atomics from
+  // all landing on the same address.
+  static constexpr uint32_t kNumHistCopies = kWgSize / kSubGroupSize;
+  static constexpr uint32_t kHistElems = kNumHistCopies * kRadix;
 
   using vec_io = vec_t<float, kVecSize>;
 
@@ -246,8 +250,8 @@ struct TopPRenormProbsRadixCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
   int batch_size;
   int vocab_size;
 
-  // One histogram per sub-group, so the accumulating atomics only contend
-  // within a sub-group; the copies are folded together after each pass.
+  // kNumHistCopies histograms, so the accumulating atomics spread over several
+  // addresses instead of all landing on one; folded together after each pass.
   sycl::local_accessor<float, 1> sg_hist_;
   // prefix_[0]: the ordered-bit prefix fixed by the rounds so far.
   sycl::local_accessor<uint32_t, 1> prefix_;
@@ -255,7 +259,7 @@ struct TopPRenormProbsRadixCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
   sycl::local_accessor<float, 1> mass_;
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
-    sg_hist_ = sycl::local_accessor<float, 1>(sycl::range<1>(kNumSubGroups * kRadix), cgh);
+    sg_hist_ = sycl::local_accessor<float, 1>(sycl::range<1>(kHistElems), cgh);
     prefix_ = sycl::local_accessor<uint32_t, 1>(sycl::range<1>(1), cgh);
     mass_ = sycl::local_accessor<float, 1>(sycl::range<1>(2), cgh);
   }
@@ -320,7 +324,7 @@ struct TopPRenormProbsRadixCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
     }
 
     sycl::sub_group sg = item.get_sub_group();
-    const uint32_t hist_base = sg.get_group_id()[0] * kRadix;
+    const uint32_t hist_base = (sg.get_group_id()[0] % kNumHistCopies) * kRadix;
 
     if (tid == 0) {
       prefix_[0] = 0u;
@@ -336,36 +340,26 @@ struct TopPRenormProbsRadixCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
       // Bits fixed by earlier rounds; round 0 accepts every element.
       const uint32_t prefix_mask = (round == 0u) ? 0u : (~0u << (32u - round * kRadixBits));
 
-      for (uint32_t i = tid; i < kNumSubGroups * kRadix; i += kWgSize) {
+      for (uint32_t i = tid; i < kHistElems; i += kWgSize) {
         sg_hist_[i] = 0.0f;
       }
       item.barrier(sycl::access::fence_space::local_space);
 
-      // `accumulate` reduces across the sub-group, so every lane has to reach it
-      // the same number of times. Both loops therefore run a trip count that is
-      // uniform over the work-group, with out-of-range lanes passing 0.0f (which
-      // lands in no bucket and contributes nothing).
-      const uint32_t vec_iters = div_up(num_vec_elems, kWgSize);
-      for (uint32_t it = 0; it < vec_iters; ++it) {
-        const uint32_t i = it * kWgSize + tid;
-        vec_io v(0.0f);
-        if (i < num_vec_elems) load_vec(v, row_offset, i);
-#pragma unroll
-        for (uint32_t j = 0; j < kVecSize; ++j) {
-          accumulate(sg, i < num_vec_elems ? v[j] : 0.0f, cur_prefix, prefix_mask, shift, hist_base);
-        }
-      }
-      const uint32_t tail_iters = div_up(vocab_u32 - vec_tail_start, kWgSize);
-      for (uint32_t it = 0; it < tail_iters; ++it) {
-        const uint32_t col = vec_tail_start + it * kWgSize + tid;
-        accumulate(sg, col < vocab_u32 ? probs[row_offset + col] : 0.0f, cur_prefix, prefix_mask, shift, hist_base);
+      // Round 0's leading digit is degenerate, so it wants the ballot; the mantissa
+      // rounds want plain atomics. See accumulate().
+      if (round == 0u) {
+        histogram_pass<true>(
+            sg, tid, row_offset, vocab_u32, num_vec_elems, vec_tail_start, cur_prefix, prefix_mask, shift, hist_base);
+      } else {
+        histogram_pass<false>(
+            sg, tid, row_offset, vocab_u32, num_vec_elems, vec_tail_start, cur_prefix, prefix_mask, shift, hist_base);
       }
       item.barrier(sycl::access::fence_space::local_space);
 
-      // Fold the per-sub-group copies down into bins [0, kRadix).
+      // Fold the copies down into bins [0, kRadix).
       for (uint32_t bin = tid; bin < kRadix; bin += kWgSize) {
         float total = 0.0f;
-        for (uint32_t s = 1; s < kNumSubGroups; ++s) {
+        for (uint32_t s = 1; s < kNumHistCopies; ++s) {
           total += sg_hist_[s * kRadix + bin];
         }
         sg_hist_[bin] += total;
@@ -407,39 +401,99 @@ struct TopPRenormProbsRadixCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
         0, sycl::multi_ptr<const float, sycl::access::address_space::global_space>(probs + row_offset + i * kVecSize));
   }
 
+  // Accumulate the whole row into sg_hist_ for one radix round.
+  //
+  // The ballot variant of accumulate() reduces across the sub-group, so every lane
+  // has to reach it the same number of times: the loops below therefore run a trip
+  // count uniform over the work-group and pass 0.0f for out-of-range lanes, which
+  // lands in no bucket and contributes nothing.
+  template <bool kBallot>
+  inline void histogram_pass(
+      sycl::sub_group sg,
+      uint32_t tid,
+      size_t row_offset,
+      uint32_t vocab_u32,
+      uint32_t num_vec_elems,
+      uint32_t vec_tail_start,
+      uint32_t cur_prefix,
+      uint32_t prefix_mask,
+      uint32_t shift,
+      uint32_t hist_base) const {
+    const uint32_t vec_iters = div_up(num_vec_elems, kWgSize);
+    for (uint32_t it = 0; it < vec_iters; ++it) {
+      const uint32_t i = it * kWgSize + tid;
+      vec_io v(0.0f);
+      if (i < num_vec_elems) load_vec(v, row_offset, i);
+#pragma unroll
+      for (uint32_t j = 0; j < kVecSize; ++j) {
+        accumulate<kBallot>(sg, i < num_vec_elems ? v[j] : 0.0f, cur_prefix, prefix_mask, shift, hist_base);
+      }
+    }
+    const uint32_t tail_iters = div_up(vocab_u32 - vec_tail_start, kWgSize);
+    for (uint32_t it = 0; it < tail_iters; ++it) {
+      const uint32_t col = vec_tail_start + it * kWgSize + tid;
+      accumulate<kBallot>(
+          sg, col < vocab_u32 ? probs[row_offset + col] : 0.0f, cur_prefix, prefix_mask, shift, hist_base);
+    }
+  }
+
   // Add `val` into its bucket, if it still matches the prefix fixed so far.
   //
-  // A plain one-atomic-per-element loop collapses here: the leading radix digit
-  // is the sign plus 7 exponent bits, and probabilities cluster into a couple of
-  // exponent octaves, so round 0 drops ~half the row into a single bucket and
-  // every lane contends on one address. Instead the sub-group first agrees on
-  // which buckets it holds and reduces each one locally, so a bucket costs one
-  // atomic no matter how many lanes feed it. `kSentinel` marks a lane as done;
-  // real buckets are always < kRadix, so it can never collide with one.
+  // Two strategies, because the bucket distribution differs sharply by round.
+  //
+  // Round 0 keys on the sign plus 7 exponent bits, and probabilities cluster into a
+  // couple of exponent octaves, so ~half the row lands in one bucket and a plain
+  // atomic would serialize the whole sub-group onto one address. There the
+  // sub-group first agrees on which buckets it holds and reduces each locally, so a
+  // bucket costs one atomic however many lanes feed it. `kSentinel` marks a lane as
+  // done; real buckets are always < kRadix, so it can never collide with one.
+  //
+  // Rounds 1-3 key on mantissa bits, which are close to uniform over the 256
+  // buckets: 32 lanes hold ~32 distinct buckets, so that ballot runs ~32 iterations
+  // of two sub-group reductions each -- roughly 10-20 shuffle ops per element to
+  // save a single uncontended atomic. There a direct atomic is far cheaper, and the
+  // per-sub-group replicas keep the addresses spread.
+  template <bool kBallot>
   inline void accumulate(
       sycl::sub_group sg, float val, uint32_t cur_prefix, uint32_t prefix_mask, uint32_t shift, uint32_t hist_base)
       const {
-    constexpr uint32_t kSentinel = ~0u;
     const uint32_t ordered = top_p_to_ordered(val);
     const bool active = (ordered & prefix_mask) == cur_prefix;
-    uint32_t bucket = active ? ((ordered >> shift) & (kRadix - 1u)) : kSentinel;
 
-    // Uniform across the sub-group, so every lane runs the same trip count and
-    // the reductions below stay convergent.
-    while (true) {
-      const uint32_t lead = sycl::reduce_over_group(sg, bucket, sycl::minimum<uint32_t>());
-      if (lead == kSentinel) break;
-      const bool mine = (bucket == lead);
-      const float bucket_sum = sycl::reduce_over_group(sg, mine ? val : 0.0f, sycl::plus<float>());
-      if (sg.leader()) {
+    if constexpr (!kBallot) {
+      // `val == 0.0f` marks an out-of-range lane and contributes nothing, so it can
+      // take the atomic unconditionally rather than diverging.
+      if (active && val != 0.0f) {
+        const uint32_t bucket = (ordered >> shift) & (kRadix - 1u);
         sycl::atomic_ref<
             float,
             sycl::memory_order::relaxed,
             sycl::memory_scope::work_group,
-            sycl::access::address_space::local_space>(sg_hist_[hist_base + lead])
-            .fetch_add(bucket_sum);
+            sycl::access::address_space::local_space>(sg_hist_[hist_base + bucket])
+            .fetch_add(val);
       }
-      if (mine) bucket = kSentinel;
+      return;
+    } else {
+      constexpr uint32_t kSentinel = ~0u;
+      uint32_t bucket = active ? ((ordered >> shift) & (kRadix - 1u)) : kSentinel;
+
+      // Uniform across the sub-group, so every lane runs the same trip count and
+      // the reductions below stay convergent.
+      while (true) {
+        const uint32_t lead = sycl::reduce_over_group(sg, bucket, sycl::minimum<uint32_t>());
+        if (lead == kSentinel) break;
+        const bool mine = (bucket == lead);
+        const float bucket_sum = sycl::reduce_over_group(sg, mine ? val : 0.0f, sycl::plus<float>());
+        if (sg.leader()) {
+          sycl::atomic_ref<
+              float,
+              sycl::memory_order::relaxed,
+              sycl::memory_scope::work_group,
+              sycl::access::address_space::local_space>(sg_hist_[hist_base + lead])
+              .fetch_add(bucket_sum);
+        }
+        if (mine) bucket = kSentinel;
+      }
     }
   }
 
@@ -489,7 +543,13 @@ void launch_top_p_renorm_kernel(
 
   // Pick the vectorization width the device prefers for a float element,
   // matching the approach used by per_tensor_quant_fp8, instead of hardcoding 4.
-  const int vec_size = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), sizeof(float));
+  // Then clamp it to what the actual buffers support: probs_ptr/renorm_probs_ptr
+  // are only guaranteed element-aligned (row_offset is a plain element count), so
+  // an unlucky base address can leave them short of 16B/8B alignment even when the
+  // device prefers a wide vector, matching the alignment check RMSNorm.cpp uses via
+  // get_min_vec_size.
+  int vec_size = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), sizeof(float));
+  vec_size = get_min_vec_size(vec_size, const_cast<float*>(probs_ptr), renorm_probs_ptr);
 
 #define LAUNCH_TOP_P(VEC_SIZE)           \
   sycl_kernel_submit(                    \

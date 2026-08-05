@@ -27,18 +27,8 @@ constexpr int64_t kHeadDim = 128;
 constexpr int64_t kThreads = 128;
 
 template <typename scalar_t>
-inline float to_float_device(scalar_t value) {
-  return static_cast<float>(value);
-}
-
-template <typename scalar_t>
-inline scalar_t from_float_device(float value) {
-  return static_cast<scalar_t>(value);
-}
-
-template <typename scalar_t>
 inline float round_to_scalar_float(float value) {
-  return to_float_device(from_float_device<scalar_t>(value));
+  return static_cast<float>(static_cast<scalar_t>(value));
 }
 
 inline int64_t div_up_i64(int64_t x, int64_t y) {
@@ -82,27 +72,7 @@ WeightLayout resolve_weight_layout(const at::Tensor& weight, int64_t D, int64_t 
 template <typename scalar_t>
 inline float weight_at(const scalar_t* weight, int64_t d, int64_t iw_oldest, const WeightLayout& layout) {
   const int64_t iw = layout.current_first ? (layout.W - 1 - iw_oldest) : iw_oldest;
-  return to_float_device(weight[d * layout.stride_d + iw * layout.stride_w]);
-}
-
-void check_xpu_tensor(const at::Tensor& tensor, const char* name) {
-  TORCH_CHECK(tensor.is_xpu(), name, " must be an XPU tensor");
-}
-
-void check_same_dtype(const at::Tensor& ref, const at::Tensor& other, const char* name) {
-  TORCH_CHECK(other.scalar_type() == ref.scalar_type(), name, " dtype must match qkvr dtype");
-}
-
-void check_bool_tensor(const at::Tensor& tensor, const char* name) {
-  TORCH_CHECK(tensor.scalar_type() == at::ScalarType::Bool, name, " must be bool");
-}
-
-void check_int32_tensor(const at::Tensor& tensor, const char* name) {
-  TORCH_CHECK(tensor.scalar_type() == at::ScalarType::Int, name, " must be int32");
-}
-
-void check_int64_tensor(const at::Tensor& tensor, const char* name) {
-  TORCH_CHECK(tensor.scalar_type() == at::ScalarType::Long, name, " must be int64");
+  return static_cast<float>(weight[d * layout.stride_d + iw * layout.stride_w]);
 }
 
 void check_common_inputs(
@@ -121,16 +91,16 @@ void check_common_inputs(
     int64_t v_off,
     int64_t dq,
     int64_t dkv) {
-  check_xpu_tensor(qkvr, "qkvr");
-  check_xpu_tensor(k_cache, "k_cache");
-  check_xpu_tensor(v_cache, "v_cache");
-  check_xpu_tensor(k_weight, "k_weight");
-  check_xpu_tensor(v_weight, "v_weight");
-  check_xpu_tensor(q_gamma, "q_gamma");
-  check_xpu_tensor(k_gamma, "k_gamma");
-  check_xpu_tensor(loc, "loc");
-  check_xpu_tensor(k_buf, "k_buf");
-  check_xpu_tensor(v_buf, "v_buf");
+  TORCH_CHECK(qkvr.is_xpu(), "qkvr must be an XPU tensor");
+  TORCH_CHECK(k_cache.is_xpu(), "k_cache must be an XPU tensor");
+  TORCH_CHECK(v_cache.is_xpu(), "v_cache must be an XPU tensor");
+  TORCH_CHECK(k_weight.is_xpu(), "k_weight must be an XPU tensor");
+  TORCH_CHECK(v_weight.is_xpu(), "v_weight must be an XPU tensor");
+  TORCH_CHECK(q_gamma.is_xpu(), "q_gamma must be an XPU tensor");
+  TORCH_CHECK(k_gamma.is_xpu(), "k_gamma must be an XPU tensor");
+  TORCH_CHECK(loc.is_xpu(), "loc must be an XPU tensor");
+  TORCH_CHECK(k_buf.is_xpu(), "k_buf must be an XPU tensor");
+  TORCH_CHECK(v_buf.is_xpu(), "v_buf must be an XPU tensor");
   TORCH_CHECK(qkvr.dim() == 2, "qkvr must be a 2D row-major tensor/view");
   TORCH_CHECK(qkvr.stride(1) == 1, "qkvr must be contiguous on the last dimension");
   TORCH_CHECK(k_cache.dim() == 3, "k_cache must have shape [slots, W-1, Dkv]");
@@ -146,15 +116,15 @@ void check_common_inputs(
   TORCH_CHECK(k_buf.dim() == 2 && v_buf.dim() == 2, "k_buf/v_buf must be flattened [slots, dkv] views");
   TORCH_CHECK(k_buf.size(1) == dkv && v_buf.size(1) == dkv, "k_buf/v_buf second dimension must equal dkv");
   TORCH_CHECK(k_buf.stride(1) == 1 && v_buf.stride(1) == 1, "k_buf/v_buf must be contiguous on D");
-  check_same_dtype(qkvr, k_cache, "k_cache");
-  check_same_dtype(qkvr, v_cache, "v_cache");
-  check_same_dtype(qkvr, k_weight, "k_weight");
-  check_same_dtype(qkvr, v_weight, "v_weight");
-  check_same_dtype(qkvr, q_gamma, "q_gamma");
-  check_same_dtype(qkvr, k_gamma, "k_gamma");
-  check_same_dtype(qkvr, k_buf, "k_buf");
-  check_same_dtype(qkvr, v_buf, "v_buf");
-  check_int64_tensor(loc, "loc");
+  TORCH_CHECK(k_cache.scalar_type() == qkvr.scalar_type(), "k_cache dtype must match qkvr dtype");
+  TORCH_CHECK(v_cache.scalar_type() == qkvr.scalar_type(), "v_cache dtype must match qkvr dtype");
+  TORCH_CHECK(k_weight.scalar_type() == qkvr.scalar_type(), "k_weight dtype must match qkvr dtype");
+  TORCH_CHECK(v_weight.scalar_type() == qkvr.scalar_type(), "v_weight dtype must match qkvr dtype");
+  TORCH_CHECK(q_gamma.scalar_type() == qkvr.scalar_type(), "q_gamma dtype must match qkvr dtype");
+  TORCH_CHECK(k_gamma.scalar_type() == qkvr.scalar_type(), "k_gamma dtype must match qkvr dtype");
+  TORCH_CHECK(k_buf.scalar_type() == qkvr.scalar_type(), "k_buf dtype must match qkvr dtype");
+  TORCH_CHECK(v_buf.scalar_type() == qkvr.scalar_type(), "v_buf dtype must match qkvr dtype");
+  TORCH_CHECK(loc.scalar_type() == at::ScalarType::Long, "loc must be int64");
 }
 
 template <typename scalar_t>
@@ -293,15 +263,15 @@ static inline void compute_q_head(const Params& p, int64_t t, int64_t head) {
   const int64_t base_d = head * kHeadDim;
   float ss = 0.0f;
   for (int64_t i = 0; i < kHeadDim; ++i) {
-    const float x = to_float_device(p.qkvr[t * p.qkvr_stride_t + p.q_off + base_d + i]);
+    const float x = static_cast<float>(p.qkvr[t * p.qkvr_stride_t + p.q_off + base_d + i]);
     ss += x * x;
   }
   const float inv = 1.0f / sycl::sqrt(ss / static_cast<float>(kHeadDim) + p.eps);
   for (int64_t i = 0; i < kHeadDim; ++i) {
     const int64_t d = base_d + i;
-    const float x = to_float_device(p.qkvr[t * p.qkvr_stride_t + p.q_off + d]);
-    const float g = to_float_device(p.q_gamma[i]);
-    p.q_out[t * p.dq + d] = from_float_device<scalar_t>(x * inv * g);
+    const float x = static_cast<float>(p.qkvr[t * p.qkvr_stride_t + p.q_off + d]);
+    const float g = static_cast<float>(p.q_gamma[i]);
+    p.q_out[t * p.dq + d] = static_cast<scalar_t>(x * inv * g);
   }
 }
 
@@ -325,17 +295,17 @@ static inline float verify_or_extend_conv_value(
     bool use_residual) {
   const int64_t W = layout.W;
   const int64_t W1 = W - 1;
-  const float xj = to_float_device(qkvr[t * qkvr_stride_t + x_off + d]);
+  const float xj = static_cast<float>(qkvr[t * qkvr_stride_t + x_off + d]);
   float acc = 0.0f;
   for (int64_t iw = 0; iw < W1; ++iw) {
     const int64_t shifted = t - W1 + iw;
     float tap = 0.0f;
     if (shifted >= bos) {
-      tap = to_float_device(qkvr[shifted * qkvr_stride_t + x_off + d]);
+      tap = static_cast<float>(qkvr[shifted * qkvr_stride_t + x_off + d]);
     } else {
       const int64_t prefix_pos = shifted - bos + W1;
       if (prefix_pos >= 0 && cache_multiplier != 0.0f) {
-        tap = cache_multiplier * to_float_device(cache[slot * cache_stride_slot + prefix_pos * cache_stride_w + ch]);
+        tap = cache_multiplier * static_cast<float>(cache[slot * cache_stride_slot + prefix_pos * cache_stride_w + ch]);
       }
     }
     acc += tap * weight_at(weight, d, iw, layout);
@@ -387,7 +357,7 @@ compute_kv_head_from_prefix(const Params& p, int64_t t, int64_t seq, int64_t bos
       y[i] = round_to_scalar_float<scalar_t>(acc);
       ss += y[i] * y[i];
     } else {
-      out[t * p.dkv + d] = from_float_device<scalar_t>(acc);
+      out[t * p.dkv + d] = static_cast<scalar_t>(acc);
     }
   }
 
@@ -400,7 +370,7 @@ compute_kv_head_from_prefix(const Params& p, int64_t t, int64_t seq, int64_t bos
         const int64_t position = tq + 1 + w;
         for (int64_t i = 0; i < kHeadDim; ++i) {
           const int64_t d = base_d + i;
-          scalar_t val = from_float_device<scalar_t>(0.0f);
+          scalar_t val = static_cast<scalar_t>(0.0f);
           if (position < W1) {
             val = cache[slot * p.cache_stride_slot + position * p.cache_stride_w + d];
           } else {
@@ -417,8 +387,8 @@ compute_kv_head_from_prefix(const Params& p, int64_t t, int64_t seq, int64_t bos
     const float inv = 1.0f / sycl::sqrt(ss / static_cast<float>(kHeadDim) + p.eps);
     for (int64_t i = 0; i < kHeadDim; ++i) {
       const int64_t d = base_d + i;
-      const float g = to_float_device(p.k_gamma[i]);
-      out[t * p.dkv + d] = from_float_device<scalar_t>(y[i] * inv * g);
+      const float g = static_cast<float>(p.k_gamma[i]);
+      out[t * p.dkv + d] = static_cast<scalar_t>(y[i] * inv * g);
     }
   }
 
@@ -480,10 +450,10 @@ static inline float decode_conv_value(
     bool use_residual) {
   const int64_t W = layout.W;
   const int64_t W1 = W - 1;
-  const float xj = to_float_device(qkvr[t * qkvr_stride_t + x_off + d]);
+  const float xj = static_cast<float>(qkvr[t * qkvr_stride_t + x_off + d]);
   float acc = 0.0f;
   for (int64_t iw = 0; iw < W1; ++iw) {
-    const float h = to_float_device(cache[slot * cache_stride_slot + iw * cache_stride_w + d]);
+    const float h = static_cast<float>(cache[slot * cache_stride_slot + iw * cache_stride_w + d]);
     acc += h * cache_multiplier * weight_at(weight, d, iw, layout);
   }
   acc += xj * weight_at(weight, d, W1, layout);
@@ -552,7 +522,7 @@ struct AttnPrologueDecodeKernel {
         y[i] = round_to_scalar_float<scalar_t>(acc);
         ss += y[i] * y[i];
       } else {
-        out[t * p.dkv + d] = from_float_device<scalar_t>(acc);
+        out[t * p.dkv + d] = static_cast<scalar_t>(acc);
       }
     }
 
@@ -565,7 +535,7 @@ struct AttnPrologueDecodeKernel {
           scalar_t nv;
           if (iw < W1 - 1) {
             nv = cache_multiplier != 0.0f ? cache[slot * p.cache_stride_slot + (iw + 1) * p.cache_stride_w + d]
-                                          : from_float_device<scalar_t>(0.0f);
+                                          : static_cast<scalar_t>(0.0f);
           } else {
             nv = p.qkvr[t * p.qkvr_stride_t + x_off + d];
           }
@@ -581,8 +551,8 @@ struct AttnPrologueDecodeKernel {
       const float inv = 1.0f / sycl::sqrt(ss / static_cast<float>(kHeadDim) + p.eps);
       for (int64_t i = 0; i < kHeadDim; ++i) {
         const int64_t d = base_d + i;
-        const float g = to_float_device(p.k_gamma[i]);
-        out[t * p.dkv + d] = from_float_device<scalar_t>(y[i] * inv * g);
+        const float g = static_cast<float>(p.k_gamma[i]);
+        out[t * p.dkv + d] = static_cast<scalar_t>(y[i] * inv * g);
       }
     }
 
@@ -664,7 +634,7 @@ struct AttnPrologueExtendUpdateKernel {
           } else if (has_init) {
             nv = cache[slot * p.cache_stride_slot + (iw + qlen) * p.cache_stride_w + d];
           } else {
-            nv = from_float_device<scalar_t>(0.0f);
+            nv = static_cast<scalar_t>(0.0f);
           }
           cache[slot * p.cache_stride_slot + iw * p.cache_stride_w + d] = nv;
         }
@@ -765,14 +735,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_verify(
     bool do_store) {
   check_common_inputs(
       qkvr, k_cache, v_cache, k_weight, v_weight, q_gamma, k_gamma, loc, k_buf, v_buf, q_off, k_off, v_off, dq, dkv);
-  check_xpu_tensor(cache_indices, "cache_indices");
-  check_xpu_tensor(cache_mask, "cache_mask");
-  check_xpu_tensor(k_inter, "k_inter");
-  check_xpu_tensor(v_inter, "v_inter");
-  check_int32_tensor(cache_indices, "cache_indices");
-  check_bool_tensor(cache_mask, "cache_mask");
-  check_same_dtype(qkvr, k_inter, "k_inter");
-  check_same_dtype(qkvr, v_inter, "v_inter");
+  TORCH_CHECK(cache_indices.is_xpu(), "cache_indices must be an XPU tensor");
+  TORCH_CHECK(cache_mask.is_xpu(), "cache_mask must be an XPU tensor");
+  TORCH_CHECK(k_inter.is_xpu(), "k_inter must be an XPU tensor");
+  TORCH_CHECK(v_inter.is_xpu(), "v_inter must be an XPU tensor");
+  TORCH_CHECK(cache_indices.scalar_type() == at::ScalarType::Int, "cache_indices must be int32");
+  TORCH_CHECK(cache_mask.scalar_type() == at::ScalarType::Bool, "cache_mask must be bool");
+  TORCH_CHECK(k_inter.scalar_type() == qkvr.scalar_type(), "k_inter dtype must match qkvr dtype");
+  TORCH_CHECK(v_inter.scalar_type() == qkvr.scalar_type(), "v_inter dtype must match qkvr dtype");
   TORCH_CHECK(draft_token_num > 0, "draft_token_num must be positive");
   const int64_t T = qkvr.size(0);
   const int64_t B = cache_indices.numel();
@@ -873,10 +843,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_decode(
     bool do_store) {
   check_common_inputs(
       qkvr, k_cache, v_cache, k_weight, v_weight, q_gamma, k_gamma, loc, k_buf, v_buf, q_off, k_off, v_off, dq, dkv);
-  check_xpu_tensor(cache_indices, "cache_indices");
-  check_xpu_tensor(cache_mask, "cache_mask");
-  check_int32_tensor(cache_indices, "cache_indices");
-  check_bool_tensor(cache_mask, "cache_mask");
+  TORCH_CHECK(cache_indices.is_xpu(), "cache_indices must be an XPU tensor");
+  TORCH_CHECK(cache_mask.is_xpu(), "cache_mask must be an XPU tensor");
+  TORCH_CHECK(cache_indices.scalar_type() == at::ScalarType::Int, "cache_indices must be int32");
+  TORCH_CHECK(cache_mask.scalar_type() == at::ScalarType::Bool, "cache_mask must be bool");
   const int64_t T = qkvr.size(0);
   TORCH_CHECK(cache_indices.numel() >= T, "cache_indices must have at least T entries");
   TORCH_CHECK(cache_mask.numel() >= T, "cache_mask must have at least T entries");
@@ -884,10 +854,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_decode(
   const bool do_track = track_mask.has_value();
   if (do_track) {
     TORCH_CHECK(track_indices.has_value(), "track_indices is required when track_mask is provided");
-    check_xpu_tensor(track_mask.value(), "track_mask");
-    check_xpu_tensor(track_indices.value(), "track_indices");
-    check_bool_tensor(track_mask.value(), "track_mask");
-    check_int64_tensor(track_indices.value(), "track_indices");
+    TORCH_CHECK(track_mask.value().is_xpu(), "track_mask must be an XPU tensor");
+    TORCH_CHECK(track_indices.value().is_xpu(), "track_indices must be an XPU tensor");
+    TORCH_CHECK(track_mask.value().scalar_type() == at::ScalarType::Bool, "track_mask must be bool");
+    TORCH_CHECK(track_indices.value().scalar_type() == at::ScalarType::Long, "track_indices must be int64");
     TORCH_CHECK(track_mask.value().numel() >= T, "track_mask must have at least T entries");
     TORCH_CHECK(track_indices.value().numel() >= T, "track_indices must have at least T entries");
   }
@@ -981,16 +951,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_extend(
     bool do_cache_update) {
   check_common_inputs(
       qkvr, k_cache, v_cache, k_weight, v_weight, q_gamma, k_gamma, loc, k_buf, v_buf, q_off, k_off, v_off, dq, dkv);
-  check_xpu_tensor(cache_indices, "cache_indices");
-  check_xpu_tensor(cache_mask, "cache_mask");
-  check_xpu_tensor(has_initial_state, "has_initial_state");
-  check_xpu_tensor(cu, "cu");
-  check_xpu_tensor(si, "si");
-  check_int32_tensor(cache_indices, "cache_indices");
-  check_bool_tensor(cache_mask, "cache_mask");
-  check_bool_tensor(has_initial_state, "has_initial_state");
-  check_int64_tensor(cu, "cu");
-  check_int32_tensor(si, "si");
+  TORCH_CHECK(cache_indices.is_xpu(), "cache_indices must be an XPU tensor");
+  TORCH_CHECK(cache_mask.is_xpu(), "cache_mask must be an XPU tensor");
+  TORCH_CHECK(has_initial_state.is_xpu(), "has_initial_state must be an XPU tensor");
+  TORCH_CHECK(cu.is_xpu(), "cu must be an XPU tensor");
+  TORCH_CHECK(si.is_xpu(), "si must be an XPU tensor");
+  TORCH_CHECK(cache_indices.scalar_type() == at::ScalarType::Int, "cache_indices must be int32");
+  TORCH_CHECK(cache_mask.scalar_type() == at::ScalarType::Bool, "cache_mask must be bool");
+  TORCH_CHECK(has_initial_state.scalar_type() == at::ScalarType::Bool, "has_initial_state must be bool");
+  TORCH_CHECK(cu.scalar_type() == at::ScalarType::Long, "cu must be int64");
+  TORCH_CHECK(si.scalar_type() == at::ScalarType::Int, "si must be int32");
   const int64_t T = qkvr.size(0);
   const int64_t B = cache_indices.numel();
   TORCH_CHECK(cache_mask.numel() >= B, "cache_mask must have at least B entries");
@@ -1002,12 +972,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_extend(
   if (do_track) {
     TORCH_CHECK(
         track_rows.has_value() && track_dst.has_value(), "track_rows and track_dst are required with track_mask");
-    check_xpu_tensor(track_rows.value(), "track_rows");
-    check_xpu_tensor(track_mask.value(), "track_mask");
-    check_xpu_tensor(track_dst.value(), "track_dst");
-    check_int64_tensor(track_rows.value(), "track_rows");
-    check_bool_tensor(track_mask.value(), "track_mask");
-    check_int64_tensor(track_dst.value(), "track_dst");
+    TORCH_CHECK(track_rows.value().is_xpu(), "track_rows must be an XPU tensor");
+    TORCH_CHECK(track_mask.value().is_xpu(), "track_mask must be an XPU tensor");
+    TORCH_CHECK(track_dst.value().is_xpu(), "track_dst must be an XPU tensor");
+    TORCH_CHECK(track_rows.value().scalar_type() == at::ScalarType::Long, "track_rows must be int64");
+    TORCH_CHECK(track_mask.value().scalar_type() == at::ScalarType::Bool, "track_mask must be bool");
+    TORCH_CHECK(track_dst.value().scalar_type() == at::ScalarType::Long, "track_dst must be int64");
     TORCH_CHECK(track_rows.value().dim() == 2, "track_rows must have shape [B, W-1]");
     TORCH_CHECK(track_rows.value().size(0) >= B, "track_rows must cover B");
     TORCH_CHECK(track_mask.value().numel() >= B, "track_mask must cover B");

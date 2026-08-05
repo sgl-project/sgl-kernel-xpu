@@ -75,8 +75,8 @@ def run_capture(
 
 
 INSTALL_COMMANDS = {
-    "auditwheel": ["pip", "install", "auditwheel"],
-    "patchelf": ["apt-get", "install", "patchelf", "-y"],
+    "auditwheel": [sys.executable, "-m", "pip", "install", "auditwheel"],
+    "patchelf": ["bash", "-lc", "apt-get update && apt-get install -y patchelf"],
 }
 
 

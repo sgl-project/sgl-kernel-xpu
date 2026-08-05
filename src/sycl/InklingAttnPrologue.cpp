@@ -18,6 +18,7 @@
 #include <sycl/sycl.hpp>
 #include <tuple>
 
+#include "SYCLHelpers.h"
 #include "Utils.h"
 
 namespace {
@@ -665,8 +666,7 @@ void launch_verify(sycl::queue& q, AttnPrologueVerifyParams<scalar_t> const& par
   }
   const int64_t global = div_up_i64(total, kThreads) * kThreads;
   AttnPrologueVerifyKernel<scalar_t> kernel{params};
-  q.parallel_for<AttnPrologueVerifyKernel<scalar_t>>(
-      sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
+  sycl_kernel_submit(global, kThreads, q, kernel);
 }
 
 template <typename scalar_t>
@@ -678,8 +678,7 @@ void launch_decode(sycl::queue& q, AttnPrologueDecodeParams<scalar_t> const& par
   }
   const int64_t global = div_up_i64(total, kThreads) * kThreads;
   AttnPrologueDecodeKernel<scalar_t> kernel{params};
-  q.parallel_for<AttnPrologueDecodeKernel<scalar_t>>(
-      sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
+  sycl_kernel_submit(global, kThreads, q, kernel);
 }
 
 template <typename scalar_t>
@@ -689,8 +688,7 @@ void launch_extend(sycl::queue& q, AttnPrologueExtendParams<scalar_t> const& par
   if (total != 0) {
     const int64_t global = div_up_i64(total, kThreads) * kThreads;
     AttnPrologueExtendKernel<scalar_t> kernel{params};
-    q.parallel_for<AttnPrologueExtendKernel<scalar_t>>(
-        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
+    sycl_kernel_submit(global, kThreads, q, kernel);
   }
 
   if (!params.do_cache_update) {
@@ -702,8 +700,7 @@ void launch_extend(sycl::queue& q, AttnPrologueExtendParams<scalar_t> const& par
   }
   const int64_t update_global = div_up_i64(update_total, kThreads) * kThreads;
   AttnPrologueExtendUpdateKernel<scalar_t> update_kernel{params};
-  q.parallel_for<AttnPrologueExtendUpdateKernel<scalar_t>>(
-      sycl::nd_range<1>(sycl::range<1>(update_global), sycl::range<1>(kThreads)), update_kernel);
+  sycl_kernel_submit(update_global, kThreads, q, update_kernel);
 }
 
 }  // namespace

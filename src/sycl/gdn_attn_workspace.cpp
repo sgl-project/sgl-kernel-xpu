@@ -5,8 +5,9 @@
 #include <torch/all.h>
 
 #include "gdn_attn/gdn_attn_utils.h"
+#include "sgl_kernel_export.h"
 
-int64_t gdn_attention_workspace_bytes_needed(
+SGL_KERNEL_EXPORT int64_t gdn_attention_workspace_bytes_needed(
     const int64_t num_prefills,
     const int64_t num_decodes,
     const int64_t non_spec_token,

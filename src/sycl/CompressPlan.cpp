@@ -452,7 +452,7 @@ SGL_KERNEL_EXPORT torch::Tensor plan_compress_decode(
   return output;
 }
 
-std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill(
+SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill(
     torch::Tensor req_pool_indices,
     torch::Tensor req_to_token,
     torch::Tensor full_to_state,

@@ -8,6 +8,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 namespace at::native::xpu {
 
@@ -139,7 +140,7 @@ void launch_hash_topk(
 
 }  // namespace
 
-void hash_topk(
+SGL_KERNEL_EXPORT void hash_topk(
     const at::Tensor& router_logits,
     const at::Tensor& input_ids,
     const at::Tensor& tid2eid,

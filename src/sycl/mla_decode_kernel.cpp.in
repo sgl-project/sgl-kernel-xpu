@@ -36,7 +36,7 @@
 
 namespace mla_decode {
 
-void launch_mla_decode_@ELEM_TAG@_@PAGE_SIZE@(
+__attribute__((visibility("default"))) void launch_mla_decode_@ELEM_TAG@_@PAGE_SIZE@(
     at::Tensor& out,
     const at::Tensor& q_nope,
     const at::Tensor& q_pe,

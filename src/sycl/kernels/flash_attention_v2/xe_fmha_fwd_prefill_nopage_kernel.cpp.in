@@ -43,7 +43,7 @@
 namespace prefill {
 
 template <>
-void FmhaPrefillNpRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
+__attribute__((visibility("default"))) void FmhaPrefillNpRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
   // Non-paged (contiguous ragged) KV cache. Uses an independent tile-shape
   // configuration so it can be tuned separately from the paged path.
   TORCH_CHECK(

@@ -1232,7 +1232,7 @@ void launchFusedQNormRopeCTA(
   });
 }
 
-void fused_q_norm_rope(
+SGL_KERNEL_EXPORT void fused_q_norm_rope(
     torch::Tensor& q_input, torch::Tensor& q_output, torch::Tensor& freqs_cis, torch::Tensor& positions, double eps) {
   TORCH_CHECK(q_input.dim() == 3, "q_input must be 3D: [num_tokens, num_heads, head_dim]");
   TORCH_CHECK(q_output.dim() == 3, "q_output must be 3D: [num_tokens, num_heads, head_dim]");
@@ -1631,7 +1631,7 @@ void launchFusedKNormRopeFlashMLA(
   });
 }
 
-void fused_k_norm_rope_flashmla(
+SGL_KERNEL_EXPORT void fused_k_norm_rope_flashmla(
     torch::Tensor& kv,
     torch::Tensor& kv_weight,
     torch::Tensor& freqs_cis,

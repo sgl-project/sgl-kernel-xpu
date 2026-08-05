@@ -9,10 +9,11 @@
 #include "chunk_gated_delta_rule.h"
 #include "gated_delta_rule.hpp"
 #include "l2norm_kernel.hpp"
+#include "sgl_kernel_export.h"
 
 // TODO: Further optimize these GDN kernel functions.
 
-void gdn_attention(
+SGL_KERNEL_EXPORT void gdn_attention(
     torch::Tensor& core_attn_out,                // [num_actual_tokens, num_v_heads / tp_size,
                                                  // head_v_dim]
     torch::Tensor& z,                            // [num_actual_tokens, num_v_heads / tp_size, head_v_dim]

@@ -43,6 +43,7 @@
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "kernels/lora/device/sgemm_lora_b_fwd_dispatch.hpp"
+#include "sgl_kernel_export.h"
 
 namespace {
 
@@ -74,7 +75,7 @@ namespace {
 
 //----------------- Main API function --------------------//
 
-void sgemm_lora_b_fwd(
+SGL_KERNEL_EXPORT void sgemm_lora_b_fwd(
     torch::Tensor& output,                // [num_tokens, output_dim]
     const torch::Tensor& input_x,         // [num_tokens, K] (K = max_rank)
     const torch::Tensor& weights,         // [num_loras, output_dim, K]

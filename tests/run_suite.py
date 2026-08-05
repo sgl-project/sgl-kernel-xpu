@@ -63,6 +63,7 @@ suites = {
         TestFile("test_jit_kernels.py"),
         TestFile("test_embedding_lora_a_fwd.py"),
         TestFile("test_sgemm_lora_a_fwd.py"),
+        TestFile("test_sgemm_lora_b_fwd.py"),
     ],
     # Nightly suite: exercises the wheel installed in the intel/sgl-kernel-xpu-dev
     # nightly image. Populate with longer-running or full-shape tests that are

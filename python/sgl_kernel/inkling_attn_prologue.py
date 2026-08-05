@@ -13,12 +13,10 @@ def _activation_is_silu(activation: Optional[str]) -> bool:
     return activation == "silu"
 
 
-def _as_int32(x: torch.Tensor) -> torch.Tensor:
-    return x if x.dtype == torch.int32 else x.to(torch.int32)
-
-
-def _as_int64(x: torch.Tensor) -> torch.Tensor:
-    return x if x.dtype == torch.int64 else x.to(torch.int64)
+def _require_dtype(x: torch.Tensor, dtype: torch.dtype, name: str) -> torch.Tensor:
+    if x.dtype != dtype:
+        raise ValueError(f"{name} must have dtype {dtype}, got {x.dtype}")
+    return x
 
 
 def _resolve_log_scaling_tau(
@@ -138,7 +136,7 @@ def inkling_attn_prologue_verify(
                 qkvr,
                 k_cache,
                 v_cache,
-                _as_int32(cache_indices),
+                _require_dtype(cache_indices, torch.int32, "cache_indices"),
                 cache_mask.reshape(-1),
                 k_weight,
                 v_weight,
@@ -147,7 +145,7 @@ def inkling_attn_prologue_verify(
                 q_gamma,
                 k_gamma,
                 float(eps),
-                _as_int64(loc),
+                _require_dtype(loc, torch.int64, "loc"),
                 k_view,
                 v_view,
                 sfk_u8,
@@ -171,7 +169,7 @@ def inkling_attn_prologue_verify(
         qkvr,
         k_cache,
         v_cache,
-        _as_int32(cache_indices),
+        _require_dtype(cache_indices, torch.int32, "cache_indices"),
         cache_mask.reshape(-1),
         k_weight,
         v_weight,
@@ -180,7 +178,7 @@ def inkling_attn_prologue_verify(
         q_gamma,
         k_gamma,
         float(eps),
-        _as_int64(loc),
+        _require_dtype(loc, torch.int64, "loc"),
         _kv_view(k_buf, int(dkv)),
         _kv_view(v_buf, int(dkv)),
         int(q_off),
@@ -239,16 +237,18 @@ def inkling_attn_prologue_decode(
                 qkvr,
                 k_cache,
                 v_cache,
-                _as_int32(cache_indices),
+                _require_dtype(cache_indices, torch.int32, "cache_indices"),
                 cache_mask.reshape(-1),
                 k_weight,
                 v_weight,
                 track_mask.reshape(-1) if track_mask is not None else None,
-                _as_int64(track_indices) if track_indices is not None else None,
+                _require_dtype(track_indices, torch.int64, "track_indices")
+                if track_indices is not None
+                else None,
                 q_gamma,
                 k_gamma,
                 float(eps),
-                _as_int64(loc),
+                _require_dtype(loc, torch.int64, "loc"),
                 k_view,
                 v_view,
                 sfk_u8,
@@ -271,16 +271,18 @@ def inkling_attn_prologue_decode(
         qkvr,
         k_cache,
         v_cache,
-        _as_int32(cache_indices),
+        _require_dtype(cache_indices, torch.int32, "cache_indices"),
         cache_mask.reshape(-1),
         k_weight,
         v_weight,
         track_mask.reshape(-1) if track_mask is not None else None,
-        _as_int64(track_indices) if track_indices is not None else None,
+        _require_dtype(track_indices, torch.int64, "track_indices")
+        if track_indices is not None
+        else None,
         q_gamma,
         k_gamma,
         float(eps),
-        _as_int64(loc),
+        _require_dtype(loc, torch.int64, "loc"),
         _kv_view(k_buf, int(dkv)),
         _kv_view(v_buf, int(dkv)),
         int(q_off),
@@ -343,20 +345,24 @@ def inkling_attn_prologue_extend(
                 qkvr,
                 k_cache,
                 v_cache,
-                _as_int32(cache_indices),
+                _require_dtype(cache_indices, torch.int32, "cache_indices"),
                 cache_mask.reshape(-1),
                 has_initial_state.reshape(-1),
-                _as_int64(cu),
-                _as_int32(si),
+                _require_dtype(cu, torch.int64, "cu"),
+                _require_dtype(si, torch.int32, "si"),
                 k_weight,
                 v_weight,
-                _as_int64(track_rows) if track_rows is not None else None,
+                _require_dtype(track_rows, torch.int64, "track_rows")
+                if track_rows is not None
+                else None,
                 track_mask.reshape(-1) if track_mask is not None else None,
-                _as_int64(track_dst) if track_dst is not None else None,
+                _require_dtype(track_dst, torch.int64, "track_dst")
+                if track_dst is not None
+                else None,
                 q_gamma,
                 k_gamma,
                 float(eps),
-                _as_int64(loc),
+                _require_dtype(loc, torch.int64, "loc"),
                 k_view,
                 v_view,
                 sfk_u8,
@@ -380,20 +386,24 @@ def inkling_attn_prologue_extend(
         qkvr,
         k_cache,
         v_cache,
-        _as_int32(cache_indices),
+        _require_dtype(cache_indices, torch.int32, "cache_indices"),
         cache_mask.reshape(-1),
         has_initial_state.reshape(-1),
-        _as_int64(cu),
-        _as_int32(si),
+        _require_dtype(cu, torch.int64, "cu"),
+        _require_dtype(si, torch.int32, "si"),
         k_weight,
         v_weight,
-        _as_int64(track_rows) if track_rows is not None else None,
+        _require_dtype(track_rows, torch.int64, "track_rows")
+        if track_rows is not None
+        else None,
         track_mask.reshape(-1) if track_mask is not None else None,
-        _as_int64(track_dst) if track_dst is not None else None,
+        _require_dtype(track_dst, torch.int64, "track_dst")
+        if track_dst is not None
+        else None,
         q_gamma,
         k_gamma,
         float(eps),
-        _as_int64(loc),
+        _require_dtype(loc, torch.int64, "loc"),
         _kv_view(k_buf, int(dkv)),
         _kv_view(v_buf, int(dkv)),
         int(q_off),

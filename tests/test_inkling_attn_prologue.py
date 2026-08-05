@@ -302,7 +302,7 @@ def packed_q_view(T, dq, dkv, dtype):
     return packed, q, 0, dq + gap, dq + gap + dkv
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("activation", [None, "silu", "swish"])
 @pytest.mark.parametrize("dq,dkv", [(128, 128), (384, 256)])
 def test_attn_prologue_verify_matches_reference(dtype, activation, dq, dkv):
@@ -577,7 +577,7 @@ def test_attn_prologue_verify_mxfp8_quantizes_q_and_stores_kv():
             )
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("dq,dkv", [(128, 128), (384, 256)])
 def test_attn_prologue_decode_updates_cache_and_store(dtype, dq, dkv):
     from sgl_kernel.inkling_attn_prologue import inkling_attn_prologue_decode
@@ -763,7 +763,7 @@ def test_attn_prologue_decode_mxfp8_updates_valid_slots_only():
             )
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("dq,dkv", [(128, 128), (384, 256)])
 def test_attn_prologue_extend_updates_cache_and_track(dtype, dq, dkv):
     from sgl_kernel.inkling_attn_prologue import inkling_attn_prologue_extend

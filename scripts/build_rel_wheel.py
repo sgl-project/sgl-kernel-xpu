@@ -516,7 +516,7 @@ def main() -> int:
         cleanup_intermediate_outputs(output_wheel)
         log("done")
         return 0
-    except (BuildError, subprocess.CalledProcessError) as exc:
+    except (BuildError, subprocess.CalledProcessError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

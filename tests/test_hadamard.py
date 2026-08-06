@@ -11,22 +11,29 @@ from sgl_kernel import hadamard_transform
 from utils import get_device
 
 
-# Small cache: each test calls the reference twice with the same (dim, dtype),
-# so 2 entries already collapse the duplicate build. Keeping it small bounds
-# residency — a single fp32 32768x32768 matrix is 4 GiB.
+# Cache the HOST-side int8 matrix only, never a device tensor. The cost being
+# avoided is scipy's build (~10s at dim=32768, and every case calls the
+# reference twice), which is host work; caching the device copy instead would
+# pin it for the whole session, and the conftest's empty_cache() fixture cannot
+# free memory that a cache still references. At dim=32768 an fp32 device matrix
+# is 4 GiB, which alone would not fit alongside the rest on an 11 GB card.
+#
+# int8 is safe here: Hadamard entries are +-1, so the cast below is
+# bit-identical to scipy's float64 matrix at 1/8th the host memory.
 @lru_cache(maxsize=2)
-def _hadamard_matrix(dim_padded, dtype, device):
-    """Hadamard matrix for the reference, cached per (dim, dtype, device).
-
-    Built as int8 and cast: entries are +-1, so this is bit-identical to
-    scipy's float64 matrix while allocating 8x less and building ~8x faster
-    (at dim=32768 the float64 build alone costs ~10s, and every case in this
-    file calls the reference twice).
-    """
+def _hadamard_matrix_cpu(dim_padded):
+    """Host-side +-1 Hadamard matrix, cached per padded dim."""
     if hadamard is None:
         raise ImportError("Please install scipy")
-    h = hadamard(dim_padded, dtype=np.int8)
-    return torch.tensor(h, dtype=dtype, device=device)
+    return torch.from_numpy(hadamard(dim_padded, dtype=np.int8))
+
+
+def _hadamard_matrix(dim_padded, dtype, device):
+    """Hadamard matrix on *device* with *dtype*, freshly allocated each call.
+
+    Deliberately uncached so the caller's tensor is released between tests.
+    """
+    return _hadamard_matrix_cpu(dim_padded).to(device=device, dtype=dtype)
 
 
 def hadamard_transform_ref(x, scale=1.0):

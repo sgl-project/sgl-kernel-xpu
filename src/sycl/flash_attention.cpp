@@ -95,7 +95,7 @@ void mha_fwd_nopage(
     int window_size_right,
     float const softcap,
     at::Tensor& out,
-    at::Tensor& softmax_lse,
+    std::optional<at::Tensor>& softmax_lse,
     std::optional<at::Tensor> skip_batch_mask_opt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
@@ -150,9 +150,9 @@ void mha_fwd_nopage(
   TORCH_CHECK(head_size_v % alignment == 0, "head_size_v should be a multiple of " + std::to_string(alignment));
 
   // ``out`` is caller-provided and written in place. Whether to compute the
-  // softmax logsumexp is derived from the caller-provided ``softmax_lse`` buffer
-  // (a non-empty tensor requests it; an empty one skips the LSE computation).
-  bool const return_softmax_lse = softmax_lse.numel() > 0;
+  // softmax logsumexp is derived from the caller-provided ``softmax_lse``
+  // optional (a present tensor requests it; std::nullopt skips it).
+  bool const return_softmax_lse = softmax_lse.has_value();
 
   int const head_size_rounded = round_up_headdim(head_size);
 
@@ -189,7 +189,7 @@ void mha_fwd_nopage(
   params.seqlen_knew = 0;
   params.total_knew = 0;
 
-  params.softmax_lse_ptr = return_softmax_lse ? softmax_lse.data_ptr() : nullptr;
+  params.softmax_lse_ptr = return_softmax_lse ? softmax_lse->data_ptr() : nullptr;
   params.return_softmax_lse = return_softmax_lse;
 
   params.b = batch_size;
@@ -297,11 +297,11 @@ void mha_fwd(
     std::optional<bool> pack_gqa_,
     int const sm_margin,
     // Caller-provided output buffers written in place: ``out`` receives the
-    // attention result and ``softmax_lse`` the logsumexp when non-empty. A
+    // attention result and ``softmax_lse`` the logsumexp when present. A
     // per-batch skip mask (length = batch, chunkprefill two-launch path) selects
     // which batches this launch processes.
     at::Tensor& out,
-    at::Tensor& softmax_lse,
+    std::optional<at::Tensor>& softmax_lse,
     std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
@@ -417,9 +417,9 @@ void mha_fwd(
   TORCH_CHECK(head_size_v % alignment == 0, "head_size_v should be a multiple of " + std::to_string(alignment));
 
   // ``out`` is caller-provided and written in place. Whether to compute the
-  // softmax logsumexp is derived from the caller-provided ``softmax_lse`` buffer
-  // (a non-empty tensor requests it; an empty one skips the LSE computation).
-  bool const return_softmax_lse = softmax_lse.numel() > 0;
+  // softmax logsumexp is derived from the caller-provided ``softmax_lse``
+  // optional (a present tensor requests it; std::nullopt skips it).
+  bool const return_softmax_lse = softmax_lse.has_value();
   at::Tensor temp_out;    // [batch, num_kv_splits, num_head_q, seq_q, head_size]
   at::Tensor exp_sums;    // [batch, num_head_q, seq_q, num_kv_splits]
   at::Tensor max_logits;  // [batch, num_head_q, seq_q, num_kv_splits]
@@ -533,9 +533,8 @@ void mha_fwd(
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
   params.num_kv_splits = num_kv_splits;
 
-  // Softmax sum (null when the caller does not request it, matching the empty
-  // placeholder tensor above).
-  params.softmax_lse_ptr = return_softmax_lse ? softmax_lse.data_ptr() : nullptr;
+  // Softmax sum (null when the caller passes std::nullopt).
+  params.softmax_lse_ptr = return_softmax_lse ? softmax_lse->data_ptr() : nullptr;
   params.return_softmax_lse = return_softmax_lse;
 
   // Set the dimensions.
@@ -698,7 +697,7 @@ void mha_fwd_nopage(
     int window_size_right,
     float const softcap,
     at::Tensor& out,
-    at::Tensor& softmax_lse,
+    std::optional<at::Tensor>& softmax_lse,
     std::optional<at::Tensor> skip_batch_mask_opt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
@@ -783,7 +782,7 @@ void mha_fwd_nopage(
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
 
-  params.softmax_lse_ptr = softmax_lse.numel() > 0 ? softmax_lse.data_ptr() : nullptr;
+  params.softmax_lse_ptr = softmax_lse.has_value() ? softmax_lse->data_ptr() : nullptr;
 
   params.b = batch_size;
   params.h = num_heads;
@@ -902,11 +901,11 @@ void mha_fwd(
     std::optional<bool> pack_gqa_,
     int const sm_margin,
     // Caller-provided output buffers written in place: ``out`` receives the
-    // attention result and ``softmax_lse`` the logsumexp when non-empty. A
+    // attention result and ``softmax_lse`` the logsumexp when present. A
     // per-batch skip mask (length = batch, chunkprefill two-launch path) selects
     // which batches this launch processes.
     at::Tensor& out,
-    at::Tensor& softmax_lse,
+    std::optional<at::Tensor>& softmax_lse,
     std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
@@ -1019,9 +1018,9 @@ void mha_fwd(
   TORCH_CHECK(head_size_v % alignment == 0, "head_size_v should be a multiple of " + std::to_string(alignment));
 
   // ``out`` is caller-provided and written in place. Whether to compute the
-  // softmax logsumexp is derived from the caller-provided ``softmax_lse`` buffer
-  // (a non-empty tensor requests it; an empty one skips the LSE computation).
-  bool const return_softmax_lse = softmax_lse.numel() > 0;
+  // softmax logsumexp is derived from the caller-provided ``softmax_lse``
+  // optional (a present tensor requests it; std::nullopt skips it).
+  bool const return_softmax_lse = softmax_lse.has_value();
 
   int const head_size_rounded = round_up_headdim(head_size);
   int const head_size_v_rounded = head_size_v == head_size ? head_size_rounded : round_up_headdim(head_size_v);
@@ -1060,9 +1059,8 @@ void mha_fwd(
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
 
-  // Softmax sum (null when the caller does not request it, matching the empty
-  // placeholder tensor above).
-  params.softmax_lse_ptr = return_softmax_lse ? softmax_lse.data_ptr() : nullptr;
+  // Softmax sum (null when the caller passes std::nullopt).
+  params.softmax_lse_ptr = return_softmax_lse ? softmax_lse->data_ptr() : nullptr;
   params.return_softmax_lse = return_softmax_lse;
 
   // Set the dimensions.
@@ -1256,7 +1254,7 @@ void mha_fwd(
     std::optional<bool> pack_gqa_,
     int const sm_margin,
     at::Tensor& out,
-    at::Tensor& softmax_lse) {
+    std::optional<at::Tensor>& softmax_lse) {
   // Supports both paged (page_table != None) and non-paged (contiguous ragged
   // KV, page_table == None) layouts.
   // ``seqlens_rotary_`` is intentionally not checked here: callers pass it
@@ -1357,11 +1355,11 @@ SGL_KERNEL_EXPORT void mha_fwd(
     std::optional<bool> pack_gqa_,
     int const sm_margin,
     // Caller-provided output buffers, written in place (no value is returned).
-    // ``softmax_lse`` doubles as the "return LSE" flag: a non-empty tensor
-    // requests the logsumexp be computed and written; an empty (numel == 0)
-    // tensor skips the LSE computation entirely.
+    // ``softmax_lse`` doubles as the "return LSE" flag: a present optional
+    // requests the logsumexp be computed and written; std::nullopt skips the
+    // LSE computation entirely.
     at::Tensor& out,
-    at::Tensor& softmax_lse) {
+    std::optional<at::Tensor>& softmax_lse) {
   TORCH_CHECK(q.dim() == 3, "query must be in ragged format (total_q, h, d)");
   // k and v may be 3D (total_k, h_k, d) for non-paged or 4D (num_pages, page_size, h_k, d)
   // for paged KV cache; sub-functions validate their own shapes.
@@ -1373,14 +1371,14 @@ SGL_KERNEL_EXPORT void mha_fwd(
   TORCH_CHECK(out.stride(-1) == 1, "out must have a contiguous last dimension");
 
   // Whether to compute the softmax logsumexp is derived from the caller-provided
-  // ``softmax_lse`` buffer: a non-empty tensor requests it. The sub-kernels
+  // ``softmax_lse`` optional: a present tensor requests it. The sub-kernels
   // derive the same flag and write into the buffer directly.
-  if (softmax_lse.numel() > 0) {
-    TORCH_CHECK(softmax_lse.scalar_type() == at::kFloat, "softmax_lse must be float32");
+  if (softmax_lse.has_value()) {
+    TORCH_CHECK(softmax_lse->scalar_type() == at::kFloat, "softmax_lse must be float32");
     TORCH_CHECK(
-        softmax_lse.dim() == 2 && softmax_lse.size(0) == q.size(1) && softmax_lse.size(1) == q.size(0),
+        softmax_lse->dim() == 2 && softmax_lse->size(0) == q.size(1) && softmax_lse->size(1) == q.size(0),
         "softmax_lse shape must be [num_heads, total_q]");
-    TORCH_CHECK(softmax_lse.device() == q.device(), "softmax_lse must be on the same device as q");
+    TORCH_CHECK(softmax_lse->device() == q.device(), "softmax_lse must be on the same device as q");
   }
 
   int64_t batch_size = cu_seqlens_q.size(0) - 1;

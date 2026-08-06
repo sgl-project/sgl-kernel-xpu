@@ -7,6 +7,7 @@
 
 #include "Compress.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 namespace at::native::xpu {
 
@@ -117,7 +118,7 @@ struct FlashCompress4DecodeKernel {
 
 }  // namespace FlashCompress4Impl
 
-void flash_compress4_decode(
+SGL_KERNEL_EXPORT void flash_compress4_decode(
     torch::Tensor kv_buffer, torch::Tensor kv_input, torch::Tensor kv_output, torch::Tensor ape, torch::Tensor plan_d) {
   TORCH_CHECK(
       kv_buffer.is_xpu() && kv_buffer.dim() == 3 && kv_buffer.is_contiguous(),

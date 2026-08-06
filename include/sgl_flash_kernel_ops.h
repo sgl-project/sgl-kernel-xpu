@@ -78,7 +78,7 @@ void mha_fwd(
     std::optional<bool> pack_gqa_,
     int const sm_margin,
     at::Tensor& out,
-    at::Tensor& softmax_lse);
+    std::optional<at::Tensor>& softmax_lse);
 
 void flash_mla_decode(
     torch::Tensor& out,

@@ -267,8 +267,8 @@ def flash_attn_with_kvcache(
 
     # Pre-construct the output buffers and let the kernel write into them in
     # place (passed by reference); nothing is returned by the op. Whether the
-    # logsumexp is computed is signalled by passing a non-empty ``softmax_lse``
-    # buffer (an empty tensor skips the LSE computation).
+    # logsumexp is computed is signalled by passing ``softmax_lse``: a real
+    # tensor requests it, ``None`` skips the LSE computation.
     total_q = q.size(0)
     num_heads = q.size(-2)
     head_size_v = v_cache.size(-1)
@@ -277,7 +277,7 @@ def flash_attn_with_kvcache(
     softmax_lse = (
         q.new_empty(num_heads, total_q, dtype=torch.float32)
         if return_softmax_lse
-        else q.new_empty(0, dtype=torch.float32)
+        else None
     )
     torch.ops.sgl_kernel.fwd.default(
         q,
@@ -356,8 +356,8 @@ def flash_attn_varlen_func(
 
     # Pre-construct the output buffers and let the kernel write into them in
     # place (passed by reference); nothing is returned by the op. Whether the
-    # logsumexp is computed is signalled by passing a non-empty ``softmax_lse``
-    # buffer (an empty tensor skips the LSE computation).
+    # logsumexp is computed is signalled by passing ``softmax_lse``: a real
+    # tensor requests it, ``None`` skips the LSE computation.
     total_q = q.size(0)
     num_heads = q.size(-2)
     head_size_v = v.size(-1)
@@ -365,7 +365,7 @@ def flash_attn_varlen_func(
     softmax_lse = (
         q.new_empty(num_heads, total_q, dtype=torch.float32)
         if return_softmax_lse
-        else q.new_empty(0, dtype=torch.float32)
+        else None
     )
     torch.ops.sgl_kernel.fwd.default(
         q,

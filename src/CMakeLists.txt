@@ -64,6 +64,8 @@ file(GLOB host_cpp "./*.cpp" "./*.cc")
 # keep them out of the build.
 if(NOT USE_FMHA)
     list(FILTER device_cpp EXCLUDE REGEX "/flash_attention\\.cpp$")
+    # GDN (Gated DeltaNet) attention shares the USE_FMHA toggle to skip its heavy Xe20 build.
+    list(FILTER device_cpp EXCLUDE REGEX "/gdn_attention_Xe20\\.cpp$")
 endif()
 if(NOT USE_MLA)
     list(FILTER device_cpp EXCLUDE REGEX "/mla_(decode|prefill|sparse_decode)\\.cpp$")
@@ -88,12 +90,12 @@ foreach(file ${device_cpp})
 
 endforeach()
 
-include(GdnAttnXe20.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/SGEMMLoraAFwdXe20.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/SGEMMLoraBFwdXe20.cmake)
 if(USE_FMHA)
     include(FMHADecodeXe20.cmake)
     include(FMHAPrefillXe20.cmake)
+    include(GdnAttnXe20.cmake)
 endif()
 if(USE_MLA)
     include(MlaDecodeXe20.cmake)

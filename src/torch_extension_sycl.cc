@@ -495,6 +495,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From GDN (Gated DeltaNet) attention (Intel Xe2)
    */
+#ifdef USE_FMHA
   m.def(
       "gdn_attention(Tensor! core_attn_out, Tensor! z, Tensor projected_states_qkvz, Tensor projected_states_ba, "
       "int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim, "
@@ -512,6 +513,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "ScalarType dtype) -> int");
   m.impl(
       "gdn_attention_workspace_bytes_needed", c10::DispatchKey::BackendSelect, &gdn_attention_workspace_bytes_needed);
+#endif  // USE_FMHA
 
   /*
    * Mamba causal conv1d (XPU)

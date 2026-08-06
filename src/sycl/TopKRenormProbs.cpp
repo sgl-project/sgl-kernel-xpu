@@ -9,6 +9,7 @@
 #include "MemoryAccess.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 //----------------- set element type options --------------------//
 
@@ -296,7 +297,7 @@ void launch_single_cta_kernel(
   sycl_kernel_submit(global_size, local_size, queue, kernel);
 }
 
-void top_k_renorm_probs(
+SGL_KERNEL_EXPORT void top_k_renorm_probs(
     const at::Tensor& probs,
     at::Tensor& renorm_probs,
     const std::optional<at::Tensor>& maybe_top_k_arr,

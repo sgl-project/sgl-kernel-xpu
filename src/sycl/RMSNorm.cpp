@@ -14,6 +14,7 @@
 #include "Norm.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 namespace at::native::xpu {
 template <typename ScalarType, int Dims = 1>
@@ -789,7 +790,7 @@ void GemmaFusedAddRMSNormKernelImplInternal(
   launch_vectorized_rmsnorm_no_rstd_kernel<scalar_t, weight_t>(gemma_add_rms_norm_no_rstd_forward, config);
 }
 
-void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
+SGL_KERNEL_EXPORT void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
   auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
@@ -823,7 +824,8 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
       });
 }
 
-void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps) {
+SGL_KERNEL_EXPORT void
+fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps) {
   TORCH_CHECK(input.is_contiguous(), "fused_add_rmsnorm: input must be contiguous");
   TORCH_CHECK(residual.is_contiguous(), "fused_add_rmsnorm: residual must be contiguous");
   std::optional<torch::Tensor> opt_weight = weight;
@@ -845,7 +847,7 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
       });
 }
 
-void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
+SGL_KERNEL_EXPORT void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
   auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
@@ -875,7 +877,8 @@ void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& w
       });
 }
 
-void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps) {
+SGL_KERNEL_EXPORT void
+gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps) {
   TORCH_CHECK(input.is_contiguous(), "gemma_fused_add_rmsnorm: input must be contiguous");
   TORCH_CHECK(residual.is_contiguous(), "gemma_fused_add_rmsnorm: residual must be contiguous");
   std::optional<torch::Tensor> opt_weight = weight;

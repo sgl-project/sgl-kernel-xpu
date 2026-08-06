@@ -27,7 +27,11 @@ if is_xpu():
         load_jit_sycl,
     )
     from .moe_align_block_size import moe_align_block_size
+    from .moe_fused_gate import can_use_moe_fused_gate, moe_fused_gate
+    from .moe_topk_sigmoid import topk_sigmoid
     from .norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm, rmsnorm
+    from .per_tensor_quant_fp8 import per_tensor_quant_fp8
+    from .per_token_group_quant_8bit import per_token_group_quant_8bit
     from .per_token_group_quant_8bit_v2 import per_token_group_quant_8bit_v2
     from .rope import apply_rope_inplace, apply_rope_inplace_with_kvcache
     from .timestep_embedding import timestep_embedding
@@ -43,6 +47,10 @@ if is_xpu():
         # Kernels
         "can_use_fused_inplace_qknorm",
         "fused_inplace_qknorm",
+        "topk_sigmoid",
+        "moe_fused_gate",
+        "can_use_moe_fused_gate",
+        "per_tensor_quant_fp8",
         "moe_align_block_size",
         "per_token_group_quant_8bit_v2",
         "rmsnorm",

@@ -10,7 +10,7 @@
 
 namespace mla_sparse_decode {
 
-void launch_mla_sparse_decode_@ELEM_TAG@_128(
+__attribute__((visibility("default"))) void launch_mla_sparse_decode_@ELEM_TAG@_128(
     at::Tensor& out,
     at::Tensor& lse_out,
     const at::Tensor& q,

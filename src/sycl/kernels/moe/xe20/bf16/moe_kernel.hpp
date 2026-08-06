@@ -31,6 +31,7 @@
  **************************************************************************************************/
 #pragma once
 
+#include "../common/block_2d_copy_d.hpp"
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/gemm.h"
@@ -61,12 +62,16 @@ template <
     typename ElementA,
     typename ElementB = ElementA,
     typename ElementS = ElementA,
-    typename ElementD = ElementA>
+    typename ElementD = ElementA,
+    // D-store atom. void => widest legal atom for the subgroup output tile
+    // (see moe_xe20::select_block_2d_store_D); or name an XE_STORE_2D<...>
+    // explicitly to pin the store geometry for a specific shape.
+    typename GmemTiledCopyD = void>
 class MoEGEMM {
  public:
   using TiledCopyA = decltype(make_block_2d_copy_A(TiledMMA{}, TensorA{}));
   using TiledCopyB = decltype(make_block_2d_copy_B(TiledMMA{}, TensorB{}));
-  using TiledCopyD = decltype(make_block_2d_copy_D(TiledMMA{}, TensorD{}));
+  using TiledCopyD = decltype(moe_xe20::make_moe_block_2d_copy_D<GmemTiledCopyD>(TiledMMA{}, TensorD{}));
   using SGPerWG = decltype(product(take<1, 4>(shape(typename TiledMMA::ThrLayoutVMNK{}))));
 
   constexpr static int Stages = 3;

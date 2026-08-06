@@ -7,6 +7,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 constexpr int block_size = 128;
 
@@ -455,7 +456,7 @@ void compute_arg_sorts_sycl_impl(
 #undef THRESHOLD
 }
 
-void prepare_moe_input(
+SGL_KERNEL_EXPORT void prepare_moe_input(
     const torch::Tensor& topk_ids,
     torch::Tensor& expert_offsets,
     const std::optional<torch::Tensor>& blockscale_offsets,
@@ -567,7 +568,7 @@ void scatter_tokens_to_experts_impl(
   sycl_kernel_submit(global_range, local_range, queue, task);
 }
 
-void scatter_tokens_to_experts(
+SGL_KERNEL_EXPORT void scatter_tokens_to_experts(
     const torch::Tensor& input_tensor, const torch::Tensor& src2dst_map, torch::Tensor& output_tensor) {
   TORCH_CHECK(
       input_tensor.scalar_type() == output_tensor.scalar_type(),
@@ -687,7 +688,7 @@ void apply_shuffle_mul_sum_impl(
   return;
 }
 
-void apply_shuffle_mul_sum(
+SGL_KERNEL_EXPORT void apply_shuffle_mul_sum(
     const torch::Tensor& input,
     torch::Tensor& output,
     const torch::Tensor& permutation,

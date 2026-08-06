@@ -40,6 +40,8 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   list(APPEND SYCL_HOST_FLAGS -Wno-deprecated)
   list(APPEND SYCL_HOST_FLAGS -Wno-attributes)
   list(APPEND SYCL_HOST_FLAGS -Wno-sign-compare)
+  list(APPEND SYCL_HOST_FLAGS -fvisibility=hidden)
+  list(APPEND SYCL_HOST_FLAGS -fvisibility-inlines-hidden)
 
   if(CMAKE_BUILD_TYPE MATCHES Debug)
     list(APPEND SYCL_HOST_FLAGS -g -fno-omit-frame-pointer -O0)

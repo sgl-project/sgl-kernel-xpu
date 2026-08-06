@@ -21,12 +21,18 @@ try:
     from sgl_kernel.jit import gelu_and_mul as jit_gelu_and_mul
     from sgl_kernel.jit import gelu_tanh_and_mul as jit_gelu_tanh_and_mul
     from sgl_kernel.jit import moe_align_block_size as jit_moe_align_block_size
+    from sgl_kernel.jit import moe_fused_gate as jit_moe_fused_gate
+    from sgl_kernel.jit import per_tensor_quant_fp8 as jit_per_tensor_quant_fp8
+    from sgl_kernel.jit import (
+        per_token_group_quant_8bit as jit_per_token_group_quant_8bit,
+    )
     from sgl_kernel.jit import (
         per_token_group_quant_8bit_v2 as jit_per_token_group_quant_8bit_v2,
     )
     from sgl_kernel.jit import rmsnorm as jit_rmsnorm
     from sgl_kernel.jit import silu_and_mul as jit_silu_and_mul
     from sgl_kernel.jit import timestep_embedding as jit_timestep_embedding
+    from sgl_kernel.jit import topk_sigmoid as jit_topk_sigmoid
 
     HAS_SGLANG_JIT = True
 except ImportError:
@@ -254,6 +260,438 @@ def test_timestep_embedding_jit_vs_reference():
 
     # Compare accuracy
     torch.testing.assert_close(y_jit, y_ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "num_tokens,hidden_dim,group_size",
+    [
+        (128, 1024, 128),
+        (64, 512, 64),
+        (256, 4096, 256),
+        (5120, 7168, 128),  # prefill-ish shape
+    ],
+)
+@pytest.mark.parametrize("dst_dtype", [torch.float8_e4m3fn, torch.int8])
+@pytest.mark.parametrize("src_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.skipif(not HAS_SGL_KERNEL, reason="Requires AOT sgl_kernel")
+@pytest.mark.skipif(not HAS_SGLANG_JIT, reason="Requires SGLang for JIT compilation")
+@pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
+def test_per_token_group_quant_8bit_jit_vs_aot(
+    num_tokens, hidden_dim, group_size, dst_dtype, src_dtype
+):
+    """JIT vs AOT per-token-group 8-bit quantization (row-major scales).
+
+    Scales match closely; quant codes agree with AOT to within one ULP (int8)
+    or one e4m3 step (fp8) -- both kernels do a reciprocal-multiply-then-clamp,
+    so results only differ at quantization boundaries, exactly as the AOT kernel
+    differs from a pure-division reference.
+    """
+    device = "xpu"
+    eps = 1e-10
+    fp8_max = float(torch.finfo(dst_dtype).max) if dst_dtype != torch.int8 else 127.0
+    fp8_min = -fp8_max
+
+    torch.manual_seed(0)
+    x = torch.randn(num_tokens, hidden_dim, dtype=src_dtype, device=device)
+    num_groups = hidden_dim // group_size
+
+    def _empty_outputs():
+        q = torch.empty(num_tokens, hidden_dim, dtype=dst_dtype, device=device)
+        s = torch.empty(num_tokens, num_groups, dtype=torch.float32, device=device)
+        return q, s
+
+    q_aot, s_aot = _empty_outputs()
+    torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit.default(
+        x, q_aot, s_aot, group_size, eps, fp8_min, fp8_max, False
+    )
+
+    q_jit, s_jit = _empty_outputs()
+    jit_per_token_group_quant_8bit(
+        x, q_jit, s_jit, group_size, eps, fp8_min, fp8_max, scale_ue8m0=False
+    )
+
+    # Scales match tightly.
+    torch.testing.assert_close(s_jit, s_aot, rtol=1e-3, atol=1e-5)
+
+    # Quant codes: bounded difference (boundary rounding only).
+    if dst_dtype == torch.int8:
+        max_ulp = (q_jit.to(torch.int32) - q_aot.to(torch.int32)).abs().max().item()
+        assert max_ulp <= 1, f"int8 quant differs from AOT by {max_ulp} > 1 ULP"
+    else:
+        # Compare dequantized magnitudes (fp8 codes aren't ordered as raw bytes).
+        dq = lambda q, s: (
+            q.view(num_tokens, num_groups, group_size).to(torch.float32)
+            * s.unsqueeze(2)
+        )
+        torch.testing.assert_close(
+            dq(q_jit, s_jit), dq(q_aot, s_aot), rtol=1e-1, atol=1e-1
+        )
+
+
+@pytest.mark.parametrize(
+    "num_experts",
+    [8, 32, 128, 256, 5, 100],  # power-of-2 fast path + general fallback (5, 100)
+)
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("num_fused_shared_experts", [0, 1])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.skipif(not HAS_SGL_KERNEL, reason="Requires AOT sgl_kernel")
+@pytest.mark.skipif(not HAS_SGLANG_JIT, reason="Requires SGLang for JIT compilation")
+@pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
+def test_topk_sigmoid_jit_vs_aot(
+    num_experts, with_bias, num_fused_shared_experts, dtype
+):
+    """Test JIT fused sigmoid top-k gate vs the AOT sgl_kernel.topk_sigmoid op.
+
+    Covers both AOT code paths: the power-of-2 optimized kernel (8/32/128/256)
+    and the general fallback (5/100), plus bias-aware ranking, renormalization,
+    and the fused shared expert.
+    """
+    device = "xpu"
+    num_tokens = 64
+    routed_scaling_factor = 2.5
+    renormalize = True
+    topk = min(num_experts, 6)
+    if topk <= num_fused_shared_experts:
+        pytest.skip("topk must be > num_fused_shared_experts")
+
+    torch.manual_seed(0)
+    gating = torch.randn(num_tokens, num_experts, dtype=dtype, device=device)
+    bias = (
+        torch.randn(num_experts, dtype=torch.float32, device=device)
+        if with_bias
+        else None
+    )
+
+    def _run(use_aot):
+        w = torch.empty(num_tokens, topk, dtype=torch.float32, device=device)
+        idx = torch.empty(num_tokens, topk, dtype=torch.int32, device=device)
+        if use_aot:
+            torch.ops.sgl_kernel.topk_sigmoid.default(
+                w,
+                idx,
+                gating,
+                renormalize,
+                bias,
+                routed_scaling_factor,
+                num_fused_shared_experts,
+            )
+        else:
+            jit_topk_sigmoid(
+                w,
+                idx,
+                gating,
+                renormalize,
+                bias,
+                routed_scaling_factor,
+                num_fused_shared_experts,
+            )
+        return w, idx
+
+    w_aot, idx_aot = _run(True)
+    w_jit, idx_jit = _run(False)
+
+    # Selected experts (as a per-row set) and their weights must match AOT.
+    assert torch.equal(
+        idx_jit.sort(dim=-1).values, idx_aot.sort(dim=-1).values
+    ), "JIT and AOT selected different experts"
+    torch.testing.assert_close(
+        w_jit.sort(dim=-1).values,
+        w_aot.sort(dim=-1).values,
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+def reference_moe_fused_gate(scores, bias, num_expert_group, topk_group, topk):
+    """PyTorch reference for the hierarchical grouped-topk MoE gate.
+
+    Mirrors biased_grouped_topk (renormalize=True, no fused shared experts) and
+    serves as ground truth for the JIT kernel. The reference computes in fp32.
+
+    Note: the AOT *dynamic* fallback kernel groups by topk_group instead of
+    num_expert_group, so it disagrees with this reference (and with the JIT
+    kernel) whenever topk_group != num_expert_group; the JIT kernel
+    intentionally follows this reference.
+    """
+    s = scores.float().sigmoid()
+    n, e = s.shape
+    scores_for_choice = s + bias.float().unsqueeze(0)
+    group_scores = (
+        scores_for_choice.view(n, num_expert_group, -1).topk(2, dim=-1)[0].sum(dim=-1)
+    )
+    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[1]
+    group_mask = torch.zeros_like(group_scores)
+    group_mask.scatter_(1, group_idx, 1)
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(n, num_expert_group, e // num_expert_group)
+        .reshape(n, -1)
+    )
+    tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
+    _, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
+    topk_weights = s.gather(1, topk_ids)
+    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
+@pytest.mark.parametrize(
+    "num_experts,num_expert_group,topk_group,topk",
+    [
+        (256, 8, 4, 8),  # DeepSeek-V3  (AOT templated path)
+        (128, 4, 2, 4),  # AOT templated path
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.skipif(not HAS_SGL_KERNEL, reason="Requires AOT sgl_kernel")
+@pytest.mark.skipif(not HAS_SGLANG_JIT, reason="Requires SGLang for JIT compilation")
+@pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
+def test_moe_fused_gate_jit_vs_aot(
+    num_experts, num_expert_group, topk_group, topk, dtype
+):
+    """JIT vs AOT for configs AOT handles via its (correct) templated path.
+
+    The native-dtype compute paths are bit-identical, so this is an exact match
+    even in bf16. (The AOT dynamic fallback is not exercised here — it groups by
+    topk_group rather than num_expert_group; see test below.)
+    """
+    device = "xpu"
+    num_rows = 64
+    routed_scaling_factor = 2.5
+
+    torch.manual_seed(0)
+    x = torch.randn(num_rows, num_experts, dtype=dtype, device=device)
+    bias = torch.randn(num_experts, dtype=dtype, device=device)
+
+    out_aot, idx_aot = sgl_kernel.moe_fused_gate(
+        x.clone(),
+        bias.clone(),
+        num_expert_group,
+        topk_group,
+        topk,
+        num_fused_shared_experts=0,
+        routed_scaling_factor=routed_scaling_factor,
+        apply_routed_scaling_factor_on_output=False,
+    )
+    out_jit, idx_jit = jit_moe_fused_gate(
+        x.clone(),
+        bias.clone(),
+        num_expert_group,
+        topk_group,
+        topk,
+        num_fused_shared_experts=0,
+        routed_scaling_factor=routed_scaling_factor,
+        apply_routed_scaling_factor_on_output=False,
+    )
+
+    assert torch.equal(
+        idx_jit.sort(dim=-1).values, idx_aot.sort(dim=-1).values
+    ), "JIT and AOT selected different experts"
+    torch.testing.assert_close(
+        out_jit.sort(dim=-1).values,
+        out_aot.sort(dim=-1).values,
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+@pytest.mark.parametrize(
+    "num_experts,num_expert_group,topk_group,topk",
+    [
+        (256, 8, 4, 8),  # DeepSeek-V3
+        (128, 4, 2, 4),
+        (64, 8, 4, 6),  # dynamic config, topk_group != num_expert_group
+    ],
+)
+@pytest.mark.skipif(not HAS_SGLANG_JIT, reason="Requires SGLang for JIT compilation")
+@pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
+def test_moe_fused_gate_jit_vs_reference(
+    num_experts, num_expert_group, topk_group, topk
+):
+    """JIT vs PyTorch grouped-topk ground truth (covers the dynamic-only config).
+
+    Uses fp16. In bf16 the sigmoid scores carry only ~2-3 significant digits, so
+    many group/expert scores collide to identical values; the kernel's
+    shuffle-argmax tie-break and torch.topk's tie-break then legitimately pick
+    different (equal-scoring) experts. bf16 correctness is covered instead by
+    test_moe_fused_gate_jit_vs_aot, which is bit-exact against the AOT kernel.
+    """
+    device = "xpu"
+    num_rows = 64
+    dtype = torch.float16
+
+    torch.manual_seed(0)
+    x = torch.randn(num_rows, num_experts, dtype=dtype, device=device)
+    bias = torch.randn(num_experts, dtype=dtype, device=device)
+
+    out_ref, idx_ref = reference_moe_fused_gate(
+        x, bias, num_expert_group, topk_group, topk
+    )
+    out_jit, idx_jit = jit_moe_fused_gate(
+        x.clone(),
+        bias.clone(),
+        num_expert_group,
+        topk_group,
+        topk,
+        num_fused_shared_experts=0,
+        routed_scaling_factor=1.0,
+        apply_routed_scaling_factor_on_output=False,
+    )
+
+    assert torch.equal(
+        idx_jit.sort(dim=-1).values, idx_ref.sort(dim=-1).values
+    ), "JIT and reference selected different experts"
+    torch.testing.assert_close(
+        out_jit.sort(dim=-1).values,
+        out_ref.sort(dim=-1).values,
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+@pytest.mark.parametrize(
+    "seq_length",
+    list(range(1, 10))
+    + [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536],
+)
+@pytest.mark.parametrize(
+    "params",
+    [
+        (128, 4, 2, 4),
+        (256, 8, 4, 8),  # deepseek v3
+        (512, 16, 8, 16),
+    ],
+)
+# @pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
+@pytest.mark.parametrize("num_fused_shared_experts", [0])
+@pytest.mark.parametrize("apply_routed_scaling_factor_on_output", [False, True])
+@pytest.mark.skipif(not HAS_SGL_KERNEL, reason="Requires AOT sgl_kernel")
+@pytest.mark.skipif(not HAS_SGLANG_JIT, reason="Requires SGLang for JIT compilation")
+@pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
+def test_moe_fused_gate_jit_vs_aot_combined(
+    seq_length, params, num_fused_shared_experts, apply_routed_scaling_factor_on_output
+):
+    """Sweep JIT vs AOT across the full AOT test matrix (fp32).
+
+    fp32 avoids the bf16 tie-break ambiguity, and all three configs route
+    through AOT's (correct) templated path, so JIT must match AOT exactly.
+    """
+    num_experts, num_expert_group, topk_group, topk = params
+    dtype = torch.float32
+    routed_scaling_factor = 2.5
+
+    torch.manual_seed(seq_length)
+    tensor = torch.rand((seq_length, num_experts), dtype=dtype, device="xpu")
+    bias = torch.rand(num_experts, dtype=dtype, device="xpu")
+    topk = topk + num_fused_shared_experts
+
+    out_aot, idx_aot = sgl_kernel.moe_fused_gate(
+        tensor.clone(),
+        bias.clone(),
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        topk=topk,
+        num_fused_shared_experts=num_fused_shared_experts,
+        routed_scaling_factor=routed_scaling_factor,
+        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+    )
+    out_jit, idx_jit = jit_moe_fused_gate(
+        tensor.clone(),
+        bias.clone(),
+        num_expert_group,
+        topk_group,
+        topk,
+        num_fused_shared_experts=num_fused_shared_experts,
+        routed_scaling_factor=routed_scaling_factor,
+        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+    )
+
+    # When num_fused_shared_experts > 0, the last topk slots are shared experts;
+    # only validate that both place them in [num_experts, num_experts + n).
+    if num_fused_shared_experts > 0:
+        valid_min = num_experts
+        valid_max = num_experts + num_fused_shared_experts
+        for tag, ids in (("JIT", idx_jit), ("AOT", idx_aot)):
+            shared = ids[:, -num_fused_shared_experts:]
+            assert torch.all(
+                (shared >= valid_min) & (shared < valid_max)
+            ), f"{tag} shared expert indices out of [{valid_min}, {valid_max})"
+        idx_jit = idx_jit[:, :-num_fused_shared_experts]
+        idx_aot = idx_aot[:, :-num_fused_shared_experts]
+        out_jit = out_jit[:, :-num_fused_shared_experts]
+        out_aot = out_aot[:, :-num_fused_shared_experts]
+
+    idx_check = torch.allclose(
+        idx_jit.sort(dim=-1)[0].to(torch.int32),
+        idx_aot.sort(dim=-1)[0].to(torch.int32),
+        rtol=1e-04,
+        atol=1e-05,
+    )
+    output_check = torch.allclose(
+        out_jit.sort(dim=-1)[0].to(torch.float32),
+        out_aot.sort(dim=-1)[0].to(torch.float32),
+        rtol=1e-02,
+        atol=1e-03,
+    )
+
+    assert idx_check, (
+        f"JIT/AOT indices mismatch at seq_length {seq_length}, dtype {dtype}, "
+        f"params {params}, num_fused_shared_experts {num_fused_shared_experts}"
+    )
+    assert output_check, (
+        f"JIT/AOT output mismatch at seq_length {seq_length}, dtype {dtype}, "
+        f"params {params}, num_fused_shared_experts {num_fused_shared_experts}"
+    )
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [(128, 1024), (1, 4096), (5120, 7168), (3, 17)],  # last one exercises scalar tail
+)
+@pytest.mark.parametrize("is_static", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.skipif(not HAS_SGL_KERNEL, reason="Requires AOT sgl_kernel")
+@pytest.mark.skipif(not HAS_SGLANG_JIT, reason="Requires SGLang for JIT compilation")
+@pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
+def test_per_tensor_quant_fp8_jit_vs_aot(shape, is_static, dtype):
+    """Test JIT per-tensor FP8 quant vs the AOT op (dynamic and static paths).
+
+    The compute is a plain scale-clip-cast, so JIT matches AOT bit-exactly:
+    scales agree and the fp8 quant codes are byte-identical.
+    """
+    device = "xpu"
+    torch.manual_seed(0)
+    x = torch.randn(*shape, dtype=dtype, device=device)
+
+    def _run(use_aot, scale=None):
+        xq = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+        xs = torch.empty(1, dtype=torch.float32, device=device)
+        if is_static:
+            xs.copy_(scale)
+        else:
+            xs.zero_()
+        if use_aot:
+            torch.ops.sgl_kernel.sgl_per_tensor_quant_fp8.default(x, xq, xs, is_static)
+        else:
+            jit_per_tensor_quant_fp8(x, xq, xs, is_static)
+        return xq, xs
+
+    if is_static:
+        # Precompute a scale with the AOT dynamic path, then feed it to both.
+        scale = torch.zeros(1, dtype=torch.float32, device=device)
+        tmp_q = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+        torch.ops.sgl_kernel.sgl_per_tensor_quant_fp8.default(x, tmp_q, scale, False)
+        q_aot, _ = _run(True, scale)
+        q_jit, _ = _run(False, scale)
+    else:
+        q_aot, s_aot = _run(True)
+        q_jit, s_jit = _run(False)
+        torch.testing.assert_close(s_jit, s_aot, rtol=1e-4, atol=1e-6)
+
+    # fp8 quant codes must be byte-identical.
+    assert torch.equal(
+        q_jit.view(torch.uint8), q_aot.view(torch.uint8)
+    ), "JIT and AOT produced different fp8 codes"
 
 
 def _run_moe_align(use_aot, topk_ids, num_experts, block_size, pad):

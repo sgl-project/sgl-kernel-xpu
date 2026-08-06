@@ -264,7 +264,22 @@ def flash_attn_with_kvcache(
     if cache_seqlens is not None:
         assert cache_seqlens.size(0) + 1 == cu_seqlens_q.size(0)
         cu_seqlens_k = cache_seqlens
-    out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
+
+    # Pre-construct the output buffers and let the kernel write into them in
+    # place (passed by reference); nothing is returned by the op. Whether the
+    # logsumexp is computed is signalled by passing a non-empty ``softmax_lse``
+    # buffer (an empty tensor skips the LSE computation).
+    total_q = q.size(0)
+    num_heads = q.size(-2)
+    head_size_v = v_cache.size(-1)
+    if out is None:
+        out = q.new_empty(total_q, num_heads, head_size_v)
+    softmax_lse = (
+        q.new_empty(num_heads, total_q, dtype=torch.float32)
+        if return_softmax_lse
+        else q.new_empty(0, dtype=torch.float32)
+    )
+    torch.ops.sgl_kernel.fwd.default(
         q,
         k_cache,
         v_cache,
@@ -294,9 +309,9 @@ def flash_attn_with_kvcache(
         pack_gqa,
         sm_margin,
         out,
-        return_softmax_lse,
+        softmax_lse,
     )
-    return (out, softmax_lse, *rest) if return_softmax_lse else out
+    return (out, softmax_lse) if return_softmax_lse else out
 
 
 def flash_attn_varlen_func(
@@ -339,7 +354,20 @@ def flash_attn_varlen_func(
         max_seqlen_q = q.size(1)
         q = q.view(-1, q.size(-2), q.size(-1)).contiguous()
 
-    out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
+    # Pre-construct the output buffers and let the kernel write into them in
+    # place (passed by reference); nothing is returned by the op. Whether the
+    # logsumexp is computed is signalled by passing a non-empty ``softmax_lse``
+    # buffer (an empty tensor skips the LSE computation).
+    total_q = q.size(0)
+    num_heads = q.size(-2)
+    head_size_v = v.size(-1)
+    out = q.new_empty(total_q, num_heads, head_size_v)
+    softmax_lse = (
+        q.new_empty(num_heads, total_q, dtype=torch.float32)
+        if return_softmax_lse
+        else q.new_empty(0, dtype=torch.float32)
+    )
+    torch.ops.sgl_kernel.fwd.default(
         q,
         k,
         v,
@@ -368,8 +396,8 @@ def flash_attn_varlen_func(
         num_splits,
         pack_gqa,
         sm_margin,
-        None,  # out
-        return_softmax_lse,
+        out,
+        softmax_lse,
     )
 
-    return (out, softmax_lse, *rest) if return_softmax_lse else out
+    return (out, softmax_lse) if return_softmax_lse else out

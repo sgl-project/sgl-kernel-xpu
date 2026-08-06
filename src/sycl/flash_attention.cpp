@@ -80,7 +80,7 @@ namespace decode {
 // chunkprefill dispatcher run on the decode-optimized kernel. The non-paged
 // decode kernel carries its own tile configuration (FMHA_DECODE_TILED_KV_NP_*)
 // so it can be tuned independently of both the paged decode and prefill paths.
-std::vector<at::Tensor> mha_fwd_nopage(
+void mha_fwd_nopage(
     const at::Tensor& q,             // (total_q, h, d)
     const at::Tensor& k,             // (total_k, h_k, d)
     const at::Tensor& v,             // (total_k, h_k, dv)
@@ -94,8 +94,8 @@ std::vector<at::Tensor> mha_fwd_nopage(
     int window_size_left,
     int window_size_right,
     float const softcap,
-    bool return_softmax_lse,
-    std::optional<at::Tensor> out_opt,
+    at::Tensor& out,
+    at::Tensor& softmax_lse,
     std::optional<at::Tensor> skip_batch_mask_opt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
@@ -149,17 +149,14 @@ std::vector<at::Tensor> mha_fwd_nopage(
   TORCH_CHECK(head_size % alignment == 0, "head_size should be a multiple of " + std::to_string(alignment));
   TORCH_CHECK(head_size_v % alignment == 0, "head_size_v should be a multiple of " + std::to_string(alignment));
 
-  auto opts = q.options();
-  // Use the caller-provided shared output when present (two-launch path); the
-  // first launch zero-initializes so that rows of batches with zero KV length
-  // (never written by the kernel) read back their correct value of 0.
-  at::Tensor out = out_opt.has_value() ? *out_opt : torch::zeros({total_q, num_heads, head_size_v}, opts);
+  // ``out`` is caller-provided and written in place. Whether to compute the
+  // softmax logsumexp is derived from the caller-provided ``softmax_lse`` buffer
+  // (a non-empty tensor requests it; an empty one skips the LSE computation).
+  bool const return_softmax_lse = softmax_lse.numel() > 0;
 
   int const head_size_rounded = round_up_headdim(head_size);
 
   c10::DeviceGuard device_guard(q.device());
-
-  at::Tensor softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
 
   Arguments params;
   params.is_bf16 = q.dtype() == torch::kBFloat16;
@@ -192,7 +189,7 @@ std::vector<at::Tensor> mha_fwd_nopage(
   params.seqlen_knew = 0;
   params.total_knew = 0;
 
-  params.softmax_lse_ptr = softmax_lse.data_ptr();
+  params.softmax_lse_ptr = return_softmax_lse ? softmax_lse.data_ptr() : nullptr;
   params.return_softmax_lse = return_softmax_lse;
 
   params.b = batch_size;
@@ -255,8 +252,6 @@ std::vector<at::Tensor> mha_fwd_nopage(
 
   params.tensor_opts = torch::TensorOptions().dtype(torch::kUInt8).device(q.device());
 
-  at::Tensor out_accum, softmax_lse_accum;
-
   int qg_sz = nextPowerOf2(params.q_group_size);
   TORCH_CHECK(qg_sz >= 1 && qg_sz <= 16, "Unsupported q_group_size for decode attention: ", params.q_group_size);
   // Non-paged decode supports its own (independent) set of head dims; see
@@ -268,11 +263,9 @@ std::vector<at::Tensor> mha_fwd_nopage(
       params.d);
 
   DISPATCH_DECODE_NOPAGE(qg_sz);
-
-  return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
 
-std::vector<at::Tensor> mha_fwd(
+void mha_fwd(
     const at::Tensor& q,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
                           // h_k, d) if there is page_table.
@@ -303,10 +296,12 @@ std::vector<at::Tensor> mha_fwd(
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin,
-    // chunkprefill two-launch path: pre-allocated shared output, and a per-batch
-    // bool mask (length = batch) whose true entries are skipped by the kernel.
-    std::optional<at::Tensor> out_opt = std::nullopt,
-    bool return_softmax_lse = false,
+    // Caller-provided output buffers written in place: ``out`` receives the
+    // attention result and ``softmax_lse`` the logsumexp when non-empty. A
+    // per-batch skip mask (length = batch, chunkprefill two-launch path) selects
+    // which batches this launch processes.
+    at::Tensor& out,
+    at::Tensor& softmax_lse,
     std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
@@ -338,7 +333,7 @@ std::vector<at::Tensor> mha_fwd(
   // the decode-specific non-paged entry (decode::mha_fwd_nopage) so it can carry
   // its own parameter configuration independently of the prefill path.
   if (!page_table.has_value()) {
-    return mha_fwd_nopage(
+    mha_fwd_nopage(
         q,
         k,
         v,
@@ -352,9 +347,10 @@ std::vector<at::Tensor> mha_fwd(
         window_size_left,
         window_size_right,
         softcap,
-        return_softmax_lse,
-        std::move(out_opt),
+        out,
+        softmax_lse,
         std::move(skip_batch_mask_opt));
+    return;
   }
 
   TORCH_CHECK(page_table.value().dtype() == torch::kInt32, "page_table must have dtype torch.int32");
@@ -420,12 +416,13 @@ std::vector<at::Tensor> mha_fwd(
   TORCH_CHECK(head_size % alignment == 0, "head_size should be a multiple of " + std::to_string(alignment));
   TORCH_CHECK(head_size_v % alignment == 0, "head_size_v should be a multiple of " + std::to_string(alignment));
 
-  auto opts = q.options();
-  at::Tensor out;
+  // ``out`` is caller-provided and written in place. Whether to compute the
+  // softmax logsumexp is derived from the caller-provided ``softmax_lse`` buffer
+  // (a non-empty tensor requests it; an empty one skips the LSE computation).
+  bool const return_softmax_lse = softmax_lse.numel() > 0;
   at::Tensor temp_out;    // [batch, num_kv_splits, num_head_q, seq_q, head_size]
   at::Tensor exp_sums;    // [batch, num_head_q, seq_q, num_kv_splits]
   at::Tensor max_logits;  // [batch, num_head_q, seq_q, num_kv_splits]
-  out = out_opt.has_value() ? *out_opt : torch::empty({total_q, num_heads, head_size_v}, opts);
   Arguments params;
   // num_kv_splits semantics (host-side scalar, no D2H sync):
   //   -1 or 1 -> split-KV disabled, use the non-split FmhaDecodeRunner
@@ -494,12 +491,8 @@ std::vector<at::Tensor> mha_fwd(
   // Cast to char to avoid compiler warning about narrowing
   c10::DeviceGuard device_guard(q.device());
 
-  // Only allocate the (num_heads, total_q) LSE tensor when the caller asked for
-  // it; otherwise a zero-element placeholder keeps the return ABI stable while
-  // the kernel (LSE=false) skips every LSE write.
-  at::Tensor softmax_lse;
-  softmax_lse = return_softmax_lse ? torch::empty({num_heads, total_q}, opts.dtype(at::kFloat))
-                                   : torch::empty({0}, opts.dtype(at::kFloat));
+  // ``softmax_lse`` is caller-provided; empty (numel == 0) when the LSE was not
+  // requested, in which case the kernel skips every LSE write.
 
   // align with FA3
 
@@ -665,8 +658,6 @@ std::vector<at::Tensor> mha_fwd(
 
   params.tensor_opts = torch::TensorOptions().dtype(torch::kUInt8).device(q.device());
 
-  at::Tensor out_accum, softmax_lse_accum;
-
   int qg_sz = nextPowerOf2(params.q_group_size);
   TORCH_CHECK(qg_sz >= 1 && qg_sz <= 16, "Unsupported q_group_size for decode attention: ", params.q_group_size);
   // Paged decode supports its own (independent) set of head dims; see
@@ -681,8 +672,6 @@ std::vector<at::Tensor> mha_fwd(
       params.page_size);
 
   DISPATCH_DECODE(qg_sz);
-
-  return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
 
 }  // namespace decode
@@ -691,9 +680,10 @@ namespace prefill {
 
 // Non-paged (contiguous ragged KV) prefill entry. Drives both the prefill and
 // the decode sub-launches of the no-page chunkprefill two-launch path: the
-// caller passes a shared output (out_opt) and a per-batch skip mask
-// (skip_batch_mask_opt) selecting which batches this launch processes.
-std::vector<at::Tensor> mha_fwd_nopage(
+// caller passes shared ``out`` / ``softmax_lse`` buffers (written in place) and
+// a per-batch skip mask (skip_batch_mask_opt) selecting which batches this
+// launch processes.
+void mha_fwd_nopage(
     const at::Tensor& q,             // (total_q, h, d)
     const at::Tensor& k,             // (total_k, h_k, d)
     const at::Tensor& v,             // (total_k, h_k, dv)
@@ -707,7 +697,8 @@ std::vector<at::Tensor> mha_fwd_nopage(
     int window_size_left,
     int window_size_right,
     float const softcap,
-    std::optional<at::Tensor> out_opt,
+    at::Tensor& out,
+    at::Tensor& softmax_lse,
     std::optional<at::Tensor> skip_batch_mask_opt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
@@ -761,17 +752,12 @@ std::vector<at::Tensor> mha_fwd_nopage(
   TORCH_CHECK(head_size % alignment == 0, "head_size should be a multiple of " + std::to_string(alignment));
   TORCH_CHECK(head_size_v % alignment == 0, "head_size_v should be a multiple of " + std::to_string(alignment));
 
-  auto opts = q.options();
-  // Use the caller-provided shared output when present (two-launch path); the
-  // first launch zero-initializes so that rows of batches with zero KV length
-  // (never written by the kernel) read back their correct value of 0.
-  at::Tensor out = out_opt.has_value() ? *out_opt : torch::zeros({total_q, num_heads, head_size_v}, opts);
+  // ``out`` is caller-provided and written in place. Non-paged prefill does not
+  // currently compute the softmax logsumexp (``softmax_lse`` is left untouched).
 
   int const head_size_rounded = round_up_headdim(head_size);
 
   c10::DeviceGuard device_guard(q.device());
-
-  at::Tensor softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
 
   Arguments params;
   params.is_bf16 = q.dtype() == torch::kBFloat16;
@@ -797,7 +783,7 @@ std::vector<at::Tensor> mha_fwd_nopage(
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
 
-  params.softmax_lse_ptr = softmax_lse.data_ptr();
+  params.softmax_lse_ptr = softmax_lse.numel() > 0 ? softmax_lse.data_ptr() : nullptr;
 
   params.b = batch_size;
   params.h = num_heads;
@@ -844,8 +830,6 @@ std::vector<at::Tensor> mha_fwd_nopage(
 
   params.tensor_opts = torch::TensorOptions().dtype(torch::kUInt8).device(q.device());
 
-  at::Tensor out_accum, softmax_lse_accum;
-
   // Non-paged prefill supports its own (independent) set of head dims; see
   // FMHA_PREFILL_NP_HEAD_DIMS in FMHAPrefillXe20.cmake.
   TORCH_CHECK(
@@ -884,10 +868,9 @@ std::vector<at::Tensor> mha_fwd_nopage(
   }
 
   // TODO: Support prefill softmax_lse, now is 0
-  return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
 
-std::vector<at::Tensor> mha_fwd(
+void mha_fwd(
     const at::Tensor& q,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
                           // h_k, d) if there is page_table.
@@ -918,10 +901,12 @@ std::vector<at::Tensor> mha_fwd(
     int num_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin,
-    // chunkprefill two-launch path: pre-allocated shared output, and a per-batch
-    // bool mask (length = batch) whose true entries are skipped by the kernel.
-    std::optional<at::Tensor> out_opt = std::nullopt,
-    bool return_softmax_lse = false,
+    // Caller-provided output buffers written in place: ``out`` receives the
+    // attention result and ``softmax_lse`` the logsumexp when non-empty. A
+    // per-batch skip mask (length = batch, chunkprefill two-launch path) selects
+    // which batches this launch processes.
+    at::Tensor& out,
+    at::Tensor& softmax_lse,
     std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
@@ -950,7 +935,7 @@ std::vector<at::Tensor> mha_fwd(
 
   // Non-paged (page_table == nullopt) prefill: contiguous ragged KV cache.
   if (!page_table.has_value()) {
-    return mha_fwd_nopage(
+    mha_fwd_nopage(
         q,
         k,
         v,
@@ -964,8 +949,10 @@ std::vector<at::Tensor> mha_fwd(
         window_size_left,
         window_size_right,
         softcap,
-        std::move(out_opt),
+        out,
+        softmax_lse,
         std::move(skip_batch_mask_opt));
+    return;
   }
 
   TORCH_CHECK(page_table.value().dtype() == torch::kInt32, "page_table must have dtype torch.int32");
@@ -1031,9 +1018,10 @@ std::vector<at::Tensor> mha_fwd(
   TORCH_CHECK(head_size % alignment == 0, "head_size should be a multiple of " + std::to_string(alignment));
   TORCH_CHECK(head_size_v % alignment == 0, "head_size_v should be a multiple of " + std::to_string(alignment));
 
-  auto opts = q.options();
-  at::Tensor out;
-  out = out_opt.has_value() ? *out_opt : torch::empty({total_q, num_heads, head_size_v}, opts);
+  // ``out`` is caller-provided and written in place. Whether to compute the
+  // softmax logsumexp is derived from the caller-provided ``softmax_lse`` buffer
+  // (a non-empty tensor requests it; an empty one skips the LSE computation).
+  bool const return_softmax_lse = softmax_lse.numel() > 0;
 
   int const head_size_rounded = round_up_headdim(head_size);
   int const head_size_v_rounded = head_size_v == head_size ? head_size_rounded : round_up_headdim(head_size_v);
@@ -1042,12 +1030,8 @@ std::vector<at::Tensor> mha_fwd(
   // Cast to char to avoid compiler warning about narrowing
   c10::DeviceGuard device_guard(q.device());
 
-  // Only allocate the (num_heads, total_q) LSE tensor when the caller asked for
-  // it; otherwise a zero-element placeholder keeps the return ABI stable while
-  // the kernel (LSE=false) skips every LSE write.
-  at::Tensor softmax_lse;
-  softmax_lse = return_softmax_lse ? torch::empty({num_heads, total_q}, opts.dtype(at::kFloat))
-                                   : torch::empty({0}, opts.dtype(at::kFloat));
+  // ``softmax_lse`` is caller-provided; empty (numel == 0) when the LSE was not
+  // requested, in which case the kernel skips every LSE write.
 
   // align with FA3
   Arguments params;
@@ -1196,8 +1180,6 @@ std::vector<at::Tensor> mha_fwd(
 
   params.tensor_opts = torch::TensorOptions().dtype(torch::kUInt8).device(q.device());
 
-  at::Tensor out_accum, softmax_lse_accum;
-
   // Paged prefill supports its own (independent) set of head dims; see
   // FMHA_PREFILL_PAGED_HEAD_DIMS in FMHAPrefillXe20.cmake.
   TORCH_CHECK(
@@ -1229,7 +1211,6 @@ std::vector<at::Tensor> mha_fwd(
   }
 
   // TODO: Support prefill softmax_lse, now is 0
-  return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
 
 }  // namespace prefill
@@ -1245,7 +1226,7 @@ namespace chunkprefill {
 // Limitations: paged KV cache required; rotary / q_v / descale / scheduler
 // metadata are not supported on this path. Sliding window and attention sinks
 // are forwarded to both sub-kernels, which support them.
-std::vector<at::Tensor> mha_fwd(
+void mha_fwd(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
@@ -1274,8 +1255,8 @@ std::vector<at::Tensor> mha_fwd(
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin,
-    std::optional<at::Tensor> out_ = std::nullopt,
-    bool return_softmax_lse = false) {
+    at::Tensor& out,
+    at::Tensor& softmax_lse) {
   // Supports both paged (page_table != None) and non-paged (contiguous ragged
   // KV, page_table == None) layouts.
   // ``seqlens_rotary_`` is intentionally not checked here: callers pass it
@@ -1286,12 +1267,10 @@ std::vector<at::Tensor> mha_fwd(
           !scheduler_metadata_.has_value(),
       "chunkprefill two-launch path does not yet support q_v / rotary / q_descale / scheduler_metadata.");
   TORCH_CHECK(cu_seqlens_q.scalar_type() == at::kInt, "cu_seqlens_q must be int32.");
-  // Pre-allocated out requires paged KV: on the non-paged path zero-KV-length
-  // rows are never written by the kernel, so a caller buffer would retain stale
-  // values on graph replay. SGLang always provides page_table (paged KV cache),
-  // so this check should never fire in practice.
-  TORCH_CHECK(
-      !out_.has_value() || page_table.has_value(), "chunkprefill: out buffer requires page_table (paged KV cache).");
+  // chunkprefill is only reached for paged KV (the public dispatcher routes the
+  // non-paged and single-batch cases to the pure prefill path), so the
+  // caller-provided ``out`` buffer is always backed by a page table.
+  TORCH_CHECK(page_table.has_value(), "chunkprefill: requires page_table (paged KV cache).");
 
   int64_t batch_size = cu_seqlens_q.size(0) - 1;
   TORCH_CHECK(batch_size >= 0, "cu_seqlens_q must have at least 1 element.");
@@ -1299,80 +1278,56 @@ std::vector<at::Tensor> mha_fwd(
   auto seqlens_q = cu_seqlens_q.slice(0, 1, batch_size + 1).sub(cu_seqlens_q.slice(0, 0, batch_size));
   auto is_prefill = seqlens_q.gt(1).contiguous();  // true for prefill batches
 
-  // Forward every shared argument to a sub-kernel, overriding only the output
-  // tensor (out_opt) and the per-batch skip mask.
-  auto launch = [&](auto&& fn, std::optional<at::Tensor> out_opt, std::optional<at::Tensor> skip_mask) {
-    return fn(
-        q,
-        k,
-        v,
-        q_v_,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        page_table,
-        kv_batch_idx_,
-        leftpad_k_,
-        rotary_cos_,
-        rotary_sin_,
-        seqlens_rotary_,
-        q_descale_,
-        k_descale_,
-        v_descale_,
-        softmax_scale_,
-        sinks_,
-        is_causal,
-        window_size_left,
-        window_size_right,
-        softcap,
-        is_rotary_interleaved,
-        scheduler_metadata_,
-        num_kv_splits,
-        pack_gqa_,
-        sm_margin,
-        std::move(out_opt),
-        return_softmax_lse,
-        std::move(skip_mask));
+  // Forward every shared argument to a sub-kernel, overriding only the per-batch
+  // skip mask. Both launches write into the same caller-provided ``out`` and
+  // ``softmax_lse`` buffers.
+  auto launch = [&](auto&& fn, std::optional<at::Tensor> skip_mask) {
+    fn(q,
+       k,
+       v,
+       q_v_,
+       cu_seqlens_q,
+       cu_seqlens_k,
+       max_seqlen_q,
+       max_seqlen_k,
+       page_table,
+       kv_batch_idx_,
+       leftpad_k_,
+       rotary_cos_,
+       rotary_sin_,
+       seqlens_rotary_,
+       q_descale_,
+       k_descale_,
+       v_descale_,
+       softmax_scale_,
+       sinks_,
+       is_causal,
+       window_size_left,
+       window_size_right,
+       softcap,
+       is_rotary_interleaved,
+       scheduler_metadata_,
+       num_kv_splits,
+       pack_gqa_,
+       sm_margin,
+       out,
+       softmax_lse,
+       std::move(skip_mask));
   };
 
-  // Launch 1: decode allocates the shared output (or reuses the caller-provided
-  // out_ buffer) and skips prefill batches. When return_softmax_lse is set it
-  // also allocates a full (num_heads, total_q) softmax_lse and fills only the
-  // decode rows (otherwise an empty placeholder).
-  auto decode_ret = launch(decode::mha_fwd, std::move(out_), is_prefill);
-  auto out = decode_ret[0];
-  auto lse_decode = decode_ret[1];  // (num_heads, total_q), valid only on decode rows
-  // Launch 2: prefill writes into the same output and skips decode batches. Its
-  // softmax_lse likewise spans all total_q rows but is only valid on prefill rows.
-  auto prefill_ret = launch(prefill::mha_fwd, out, is_prefill.logical_not());
-  auto lse_prefill = prefill_ret[1];  // (num_heads, total_q), valid only on prefill rows
-
-  // Stitch softmax_lse: each sub-launch skipped the other's batches, leaving those
-  // rows uninitialized in its own LSE tensor. Select per query token from the
-  // launch that actually computed it. Columns are query tokens (total_q); a token
-  // belongs to a prefill batch iff its batch has seqlen_q > 1. at::where is a pure
-  // element-wise select, so the uninitialized rows are never read out. This runs
-  // entirely on device (no D2H sync). When return_softmax_lse is false the two
-  // sub-launches allocated empty LSE placeholders (no LSE compute), so skip the
-  // stitch and return an empty placeholder as well.
-  at::Tensor softmax_lse;
-  if (return_softmax_lse) {
-    auto token_is_prefill = is_prefill.repeat_interleave(seqlens_q.to(at::kLong));    // (total_q,)
-    softmax_lse = at::where(token_is_prefill.unsqueeze(0), lse_prefill, lse_decode);  // (num_heads, total_q)
-  } else {
-    softmax_lse = at::empty({0}, q.options().dtype(at::kFloat));
-  }
-
-  // accum tensors are internal to split-KV reduction and unused by the Python
-  // caller; return empty placeholders to keep the ABI stable.
-  auto empty_f = at::empty({0}, q.options().dtype(at::kFloat));
-  return {out, softmax_lse, empty_f, empty_f};
+  // Launch 1: decode writes the decode rows of ``out`` (and, when requested, of
+  // ``softmax_lse``) and skips prefill batches, leaving their rows untouched.
+  launch(decode::mha_fwd, is_prefill);
+  // Launch 2: prefill writes the prefill rows into the same buffers and skips
+  // decode batches. The two complementary skip masks partition every query token
+  // across the launches, so the shared buffers end up fully written with no
+  // stitching or extra copies needed.
+  launch(prefill::mha_fwd, is_prefill.logical_not());
 }
 
 }  // namespace chunkprefill
 
-SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
+SGL_KERNEL_EXPORT void mha_fwd(
     const at::Tensor& q,  // (total_q, h, d) — ragged 3D
     const at::Tensor& k,  // (total_k, h_k, d) if non-paged, or (num_pages, page_size, h_k, d) if paged
     const at::Tensor& v,  // (total_k, h_k, dv) if non-paged, or (num_pages, page_size, h_k, dv) if paged
@@ -1401,69 +1356,79 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin,
-    std::optional<at::Tensor>& out_,
-    bool return_softmax_lse = false) {
+    // Caller-provided output buffers, written in place (no value is returned).
+    // ``softmax_lse`` doubles as the "return LSE" flag: a non-empty tensor
+    // requests the logsumexp be computed and written; an empty (numel == 0)
+    // tensor skips the LSE computation entirely.
+    at::Tensor& out,
+    at::Tensor& softmax_lse) {
   TORCH_CHECK(q.dim() == 3, "query must be in ragged format (total_q, h, d)");
   // k and v may be 3D (total_k, h_k, d) for non-paged or 4D (num_pages, page_size, h_k, d)
   // for paged KV cache; sub-functions validate their own shapes.
-  if (out_.has_value()) {
-    const at::Tensor& out_val = out_.value();
-    TORCH_CHECK(out_val.scalar_type() == q.scalar_type(), "out dtype must match q dtype");
+  TORCH_CHECK(out.scalar_type() == q.scalar_type(), "out dtype must match q dtype");
+  TORCH_CHECK(
+      out.dim() == 3 && out.size(0) == q.size(0) && out.size(1) == q.size(1) && out.size(2) == v.size(-1),
+      "out shape must be [total_q, num_heads, head_size_v]");
+  TORCH_CHECK(out.device() == q.device(), "out must be on the same device as q");
+  TORCH_CHECK(out.stride(-1) == 1, "out must have a contiguous last dimension");
+
+  // Whether to compute the softmax logsumexp is derived from the caller-provided
+  // ``softmax_lse`` buffer: a non-empty tensor requests it. The sub-kernels
+  // derive the same flag and write into the buffer directly.
+  if (softmax_lse.numel() > 0) {
+    TORCH_CHECK(softmax_lse.scalar_type() == at::kFloat, "softmax_lse must be float32");
     TORCH_CHECK(
-        out_val.dim() == 3 && out_val.size(0) == q.size(0) && out_val.size(1) == q.size(1) &&
-            out_val.size(2) == v.size(-1),
-        "out shape must be [total_q, num_heads, head_size_v]");
-    TORCH_CHECK(out_val.device() == q.device(), "out must be on the same device as q");
-    TORCH_CHECK(out_val.stride(-1) == 1, "out must have a contiguous last dimension");
+        softmax_lse.dim() == 2 && softmax_lse.size(0) == q.size(1) && softmax_lse.size(1) == q.size(0),
+        "softmax_lse shape must be [num_heads, total_q]");
+    TORCH_CHECK(softmax_lse.device() == q.device(), "softmax_lse must be on the same device as q");
   }
-  auto to_tuple = [](std::vector<at::Tensor> v) { return std::make_tuple(v[0], v[1], v[2], v[3]); };
-  int const num_heads = q.size(-2);
-  int const num_heads_k = k.size(-2);
+
   int64_t batch_size = cu_seqlens_q.size(0) - 1;
 
   // decode / prefill / chunkprefill all take the same leading argument list;
   // only the trailing parameters differ. Bind the shared arguments once here so
-  // each branch reduces to a single call. ``tail`` carries the callee-specific
-  // suffix: decode and prefill additionally accept a per-batch skip mask (unused
-  // at this top level, so left as std::nullopt); chunkprefill has no such slot.
+  // each branch reduces to a single call. ``out`` and ``softmax_lse`` are
+  // threaded by reference and written in place; ``tail`` carries the
+  // callee-specific suffix: decode and prefill additionally accept a per-batch
+  // skip mask (unused at this top level, so left as std::nullopt); chunkprefill
+  // has no such slot.
   auto dispatch = [&](auto&& fn, auto&&... tail) {
-    return to_tuple(
-        fn(q,
-           k,
-           v,
-           q_v_,
-           cu_seqlens_q,
-           cu_seqlens_k,
-           max_seqlen_q,
-           max_seqlen_k,
-           page_table,
-           kv_batch_idx_,
-           leftpad_k_,
-           rotary_cos_,
-           rotary_sin_,
-           seqlens_rotary_,
-           q_descale_,
-           k_descale_,
-           v_descale_,
-           softmax_scale_,
-           sinks_,
-           is_causal,
-           window_size_left,
-           window_size_right,
-           softcap,
-           is_rotary_interleaved,
-           scheduler_metadata_,
-           num_kv_splits,
-           pack_gqa_,
-           sm_margin,
-           out_,
-           return_softmax_lse,
-           std::forward<decltype(tail)>(tail)...));
+    fn(q,
+       k,
+       v,
+       q_v_,
+       cu_seqlens_q,
+       cu_seqlens_k,
+       max_seqlen_q,
+       max_seqlen_k,
+       page_table,
+       kv_batch_idx_,
+       leftpad_k_,
+       rotary_cos_,
+       rotary_sin_,
+       seqlens_rotary_,
+       q_descale_,
+       k_descale_,
+       v_descale_,
+       softmax_scale_,
+       sinks_,
+       is_causal,
+       window_size_left,
+       window_size_right,
+       softcap,
+       is_rotary_interleaved,
+       scheduler_metadata_,
+       num_kv_splits,
+       pack_gqa_,
+       sm_margin,
+       out,
+       softmax_lse,
+       std::forward<decltype(tail)>(tail)...);
   };
 
   if (max_seqlen_q == 1) {
     // Pure decode path
-    return dispatch(decode::mha_fwd, std::nullopt);
+    dispatch(decode::mha_fwd, std::nullopt);
   } else if (!page_table.has_value() || batch_size == 1) {
     // Pure prefill path
     // Non-paged attn: assumption of all seqlen_q > 1;
@@ -1471,11 +1436,11 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha
     // is_prefill.all() — a device reduction + D2H sync that costs more than it saves.
     // But batch_size == 1 makes it provable from host scalars:
     // a single sequence with max_seqlen_q > 1 is prefill
-    return dispatch(prefill::mha_fwd, std::nullopt);
+    dispatch(prefill::mha_fwd, std::nullopt);
   } else {
     // Chunk prefill path
     // Paged attn with max_seqlen_q > 1 and batch_size > 1
-    return dispatch(chunkprefill::mha_fwd);
+    dispatch(chunkprefill::mha_fwd);
   }
 }
 #undef SYCL_INTEL_TARGET

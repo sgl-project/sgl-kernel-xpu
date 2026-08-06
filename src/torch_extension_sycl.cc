@@ -354,8 +354,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    int      num_kv_splits,"
       "    bool?    pack_gqa,"
       "    int      sm_margin,"
-      "    Tensor(a!)?  out=None,"
-      "    bool     return_softmax_lse=False) -> (Tensor(a!), Tensor, Tensor, Tensor)");
+      "    Tensor(a!)  out,"
+      "    Tensor(b!)  softmax_lse) -> ()");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
 #endif  // USE_FMHA
 

@@ -115,18 +115,19 @@ suites = {
         # --- LoRA ---
         BenchFile("bench_embedding_lora_a_fwd.py", estimated_time=40),
         BenchFile("bench_sgemm_lora_a_fwd.py", estimated_time=25),
+        # disabled temporialy due to env issue
         # --- JIT kernels (need icpx from the oneAPI toolchain) ---
-        BenchFile("bench_jit_rmsnorm.py"),
-        BenchFile("bench_jit_qknorm.py"),
-        BenchFile("bench_jit_rope.py"),
-        BenchFile("bench_jit_timestep_embedding.py"),
-        BenchFile("bench_jit_per_token_group_quant_8bit.py"),
-        BenchFile("bench_jit_moe_topk_sigmoid.py"),
-        BenchFile("bench_jit_moe_fused_gate.py"),
-        BenchFile("bench_jit_per_tensor_quant_fp8.py"),
-        BenchFile("bench_jit_moe_align_block_size.py"),
-        BenchFile("bench_jit_per_token_group_quant_8bit_v2.py"),
-        BenchFile("bench_jit_activation.py"),
+        # BenchFile("bench_jit_rmsnorm.py"),
+        # BenchFile("bench_jit_qknorm.py"),
+        # BenchFile("bench_jit_rope.py"),
+        # BenchFile("bench_jit_timestep_embedding.py"),
+        # BenchFile("bench_jit_per_token_group_quant_8bit.py"),
+        # BenchFile("bench_jit_moe_topk_sigmoid.py"),
+        # BenchFile("bench_jit_moe_fused_gate.py"),
+        # BenchFile("bench_jit_per_tensor_quant_fp8.py"),
+        # BenchFile("bench_jit_moe_align_block_size.py"),
+        # BenchFile("bench_jit_per_token_group_quant_8bit_v2.py"),
+        # BenchFile("bench_jit_activation.py"),
     ],
 }
 

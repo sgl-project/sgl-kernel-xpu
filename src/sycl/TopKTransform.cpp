@@ -81,8 +81,8 @@ inline void run_cumsum(sycl::nd_item<1>& item, int32_t* s_histogram_buf /* [2][k
   }
 }
 
-inline void fast_topk_radix(
-    sycl::nd_item<1>& item, const float* input, int32_t* index, int row_start, int length, int topk = kTopK) {
+inline void
+radix_topk(sycl::nd_item<1>& item, const float* input, int32_t* index, int row_start, int length, int topk = kTopK) {
   // ``topk`` is a runtime parameter (must satisfy 0 < topk <= kTopK). The
   // shared-memory staging buffers are sized against the compile-time ``kTopK``,
   // so any topk within that bound is safe.
@@ -301,12 +301,13 @@ inline void naive_topk_transform_paged(
     int32_t* dst_page_entry,
     const int32_t* src_page_entry,
     int32_t* dst_raw_entry,
-    int page_size) {
+    int page_bits) {
+  const int32_t page_mask = (1 << page_bits) - 1;
   const int tx = static_cast<int>(item.get_local_id(0));
   for (int i = tx; i < topk; i += kThreadsPerBlock) {
     if (i < length) {
-      const int32_t page_id = src_page_entry[i / page_size];
-      dst_page_entry[i] = page_id * page_size + (i % page_size);
+      const int32_t page_id = src_page_entry[i >> page_bits];
+      dst_page_entry[i] = (page_id << page_bits) | (i & page_mask);
       if (dst_raw_entry) dst_raw_entry[i] = i;
     } else {
       dst_page_entry[i] = -1;
@@ -374,7 +375,7 @@ struct FastTopKKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     if (length <= kTopK) {
       naive_topk(item, indice, length);
     } else {
-      fast_topk_radix(item, score, indice, row_start, length);
+      radix_topk(item, score, indice, row_start, length);
     }
   }
 };
@@ -409,7 +410,7 @@ struct FastTopKTransformFusedDecodeKernel : public __SYCL_KER_CONFIG_CONVENTION_
 
     int32_t* s_idx = s_indices_.get_multi_ptr<sycl::access::decorated::no>().get();
 
-    fast_topk_radix(item, score, s_idx, /*row_start=*/0, length);
+    radix_topk(item, score, s_idx, /*row_start=*/0, length);
 
     static_assert(kTopK == 2 * kThreadsPerBlock, "kTopK must be 2 * kThreadsPerBlock");
     const int i0 = tid;
@@ -480,7 +481,7 @@ struct FastTopKTransformFusedPrefillKernel : public __SYCL_KER_CONFIG_CONVENTION
 
     int32_t* s_idx = s_indices_.get_multi_ptr<sycl::access::decorated::no>().get();
 
-    fast_topk_radix(item, score, s_idx, row_start, length);
+    radix_topk(item, score, s_idx, row_start, length);
 
     static_assert(kTopK == 2 * kThreadsPerBlock, "kTopK must be 2 * kThreadsPerBlock");
     const int i0 = tid;
@@ -522,7 +523,7 @@ struct FastTopKTransformRaggedFusedKernel : public __SYCL_KER_CONFIG_CONVENTION_
 
     int32_t* s_idx = s_indices_.get_multi_ptr<sycl::access::decorated::no>().get();
 
-    fast_topk_radix(item, score, s_idx, row_start, length);
+    radix_topk(item, score, s_idx, row_start, length);
 
     static_assert(kTopK == 2 * kThreadsPerBlock, "kTopK must be 2 * kThreadsPerBlock");
     const int i0 = tid;
@@ -540,7 +541,7 @@ struct TopKTransform512Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   int32_t* out_raw_indices;
   int64_t score_row_stride;
   int64_t page_table_row_stride;
-  int page_size;
+  int page_bits;
   int topk;
 
   sycl::local_accessor<int32_t, 1> s_indices_;
@@ -553,7 +554,7 @@ struct TopKTransform512Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       int32_t* out_raw_indices,
       int64_t score_row_stride,
       int64_t page_table_row_stride,
-      int page_size,
+      int page_bits,
       int topk)
       : score(score),
         seq_lens(seq_lens),
@@ -562,7 +563,7 @@ struct TopKTransform512Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         out_raw_indices(out_raw_indices),
         score_row_stride(score_row_stride),
         page_table_row_stride(page_table_row_stride),
-        page_size(page_size),
+        page_bits(page_bits),
         topk(topk) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
@@ -579,18 +580,19 @@ struct TopKTransform512Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const float* row_score = score + bid * score_row_stride;
 
     if (length <= topk) {
-      naive_topk_transform_paged(item, length, topk, dst_pi, src_pt, dst_ri, page_size);
+      naive_topk_transform_paged(item, length, topk, dst_pi, src_pt, dst_ri, page_bits);
       return;
     }
 
     int32_t* s_idx = s_indices_.get_multi_ptr<sycl::access::decorated::no>().get();
 
-    fast_topk_radix(item, row_score, s_idx, /*row_start=*/0, length, topk);
+    radix_topk(item, row_score, s_idx, /*row_start=*/0, length, topk);
 
+    const int32_t page_mask = (1 << page_bits) - 1;
     for (int i = tid; i < topk; i += kThreadsPerBlock) {
       const int p = s_idx[i];
-      const int32_t page_id = src_pt[p / page_size];
-      dst_pi[i] = page_id * page_size + (p % page_size);
+      const int32_t page_id = src_pt[p >> page_bits];
+      dst_pi[i] = (page_id << page_bits) | (p & page_mask);
       if (dst_ri) dst_ri[i] = p;
     }
   }
@@ -750,6 +752,8 @@ void topk_transform_512_launch(
   const int64_t topk = out_page_indices.size(1);
   TORCH_CHECK(0 < topk && topk <= kTopK, "topk (out_page_indices.size(1)) must be in (0, ", kTopK, "]");
   TORCH_CHECK(page_size > 0, "page_size must be positive");
+  TORCH_CHECK((page_size & (page_size - 1)) == 0, "page_size must be a power of 2");
+  const int page_bits = __builtin_ctzll(static_cast<uint64_t>(page_size));
 
   int32_t* out_raw_ptr = nullptr;
   if (out_raw_indices_opt.has_value()) {
@@ -773,7 +777,7 @@ void topk_transform_512_launch(
       out_raw_ptr,
       scores.stride(0),
       page_tables.stride(0),
-      static_cast<int>(page_size),
+      page_bits,
       static_cast<int>(topk));
   sycl_kernel_submit(
       sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock), queue, kernel);

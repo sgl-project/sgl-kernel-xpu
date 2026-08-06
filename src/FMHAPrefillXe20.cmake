@@ -9,7 +9,7 @@
 # The paged and non-paged KV paths support INDEPENDENT sets of head dimensions.
 # Non-paged prefill supports 16-bit KV only (no fp8 KV cache).
 set(FMHA_PREFILL_PAGED_HEAD_DIMS 64 96 128 192 256 512)
-set(FMHA_PREFILL_NP_HEAD_DIMS 64 72 80 96 128 192)
+set(FMHA_PREFILL_NP_HEAD_DIMS 64 72 80 96 128 192 256 512)
 
 # Paged prefill (FmhaPrefillRunner) and non-paged prefill (FmhaPrefillNpRunner).
 set(FMHA_PREFILL_TEMPLATE
@@ -77,6 +77,14 @@ set(FMHA_PREFILL_NUM_SG_NP_128 16)
 set(FMHA_PREFILL_TILED_Q_NP_192 256)
 set(FMHA_PREFILL_TILED_KV_NP_192 32)
 set(FMHA_PREFILL_NUM_SG_NP_192 16)
+
+set(FMHA_PREFILL_TILED_Q_NP_256 128)
+set(FMHA_PREFILL_TILED_KV_NP_256 64)
+set(FMHA_PREFILL_NUM_SG_NP_256 16)
+
+set(FMHA_PREFILL_TILED_Q_NP_512 128)
+set(FMHA_PREFILL_TILED_KV_NP_512 128)
+set(FMHA_PREFILL_NUM_SG_NP_512 16)
 
 # --- Paged prefill + FP8: paged head dims only, bf16 query only. ---
 # prefill_paged (16-bit KV) and prefill_fp8 (e4m3/e5m2 KV) are independent

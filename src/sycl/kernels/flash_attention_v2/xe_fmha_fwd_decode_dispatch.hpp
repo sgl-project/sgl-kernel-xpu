@@ -240,6 +240,12 @@ EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG(192)
       case 192:                                                                                 \
         DISPATCH_DECODE_NOPAGE_KERNEL(QG, 192);                                                 \
         break;                                                                                  \
+      case 256:                                                                                 \
+        DISPATCH_DECODE_NOPAGE_KERNEL(QG, 256);                                                 \
+        break;                                                                                  \
+      case 512:                                                                                 \
+        DISPATCH_DECODE_NOPAGE_KERNEL(QG, 512);                                                 \
+        break;                                                                                  \
       default:                                                                                  \
         TORCH_CHECK(false, "Unsupported head size for non-paged decode attention: ", params.d); \
     }                                                                                           \

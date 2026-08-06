@@ -3,8 +3,10 @@ import math
 import pytest
 import torch
 from sgl_kernel import fused_q_indexer_rope_hadamard_quant
-from utils import get_device
 
+pytestmark = pytest.mark.skipif(
+    not torch.xpu.is_available(), reason="XPU not available"
+)
 _FP8_E4M3_MAX = 448.0
 _HEAD_DIM = 128
 _ROPE_DIM = 64
@@ -92,7 +94,7 @@ def test_fused_q_indexer_rope_hadamard_quant(batch_size):
     head_dim = 128
     rope_dim = 64
     max_pos = 256
-    device = get_device()
+    device = torch.device("xpu")
 
     q_input = torch.randn(batch_size, num_heads, head_dim, dtype=torch.bfloat16)
     q_input_xpu = q_input.to(device=device)
@@ -151,7 +153,7 @@ def test_fused_q_indexer_rope_hadamard_quant_perf():
     head_dim = 128
     rope_dim = 64
     max_pos = 256
-    device = get_device()
+    device = torch.device("xpu")
 
     q_input = torch.randn(batch_size, num_heads, head_dim, dtype=torch.bfloat16)
     q_input_xpu = q_input.to(device=device)

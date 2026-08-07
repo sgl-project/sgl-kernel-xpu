@@ -49,9 +49,11 @@ constexpr int kTopKTopPMaxRounds = 32;
 //----------------- joint top-k / top-p rejection sampling --------------------//
 // One work-group processes one request row.
 
+constexpr uint32_t kTopKTopPWgSize = 1024;
+
 template <uint32_t VEC_SIZE, bool DETERMINISTIC>
 struct TopKTopPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
-  static constexpr uint32_t kWgSize = 1024;
+  static constexpr uint32_t kWgSize = kTopKTopPWgSize;
   static constexpr uint32_t kNumWarps = kWgSize / 32;
   static constexpr int kMaxRounds = kTopKTopPMaxRounds;
 
@@ -235,14 +237,13 @@ void launch_top_k_top_p_sampling(
     uint64_t philox_offset,
     bool deterministic,
     sycl::queue& queue) {
-  const int local_size = 1024;
+  const int local_size = kTopKTopPWgSize;
   const int global_size = batch_size * local_size;
 
   const uint32_t vec_size = std::gcd(16 / sizeof(float), static_cast<uint32_t>(vocab_size));
 
   DISPATCH_TOPKTOPP_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto submit = [&](auto deterministic_tag) {
-      constexpr bool DETERMINISTIC = decltype(deterministic_tag)::value;
+    AT_DISPATCH_BOOL_NO_RETURN(deterministic, DETERMINISTIC, {
       auto kernel = TopKTopPSamplingKernel<VEC_SIZE, DETERMINISTIC>(
           probs,
           output,
@@ -256,12 +257,7 @@ void launch_top_k_top_p_sampling(
           philox_seed,
           philox_offset);
       sycl_kernel_submit(global_size, local_size, queue, kernel);
-    };
-    if (deterministic) {
-      submit(std::true_type{});
-    } else {
-      submit(std::false_type{});
-    }
+    });
   });
 }
 

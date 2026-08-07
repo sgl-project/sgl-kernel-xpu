@@ -13,6 +13,7 @@
 #include "Utils.h"
 #include "comm/Random.h"
 #include "comm/Sampling.h"
+#include "sgl_kernel_export.h"
 
 template <typename T>
 struct ToSyclElementType {
@@ -220,7 +221,7 @@ void launch_min_p_sampling(
   });
 }
 
-void min_p_sampling_from_probs(
+SGL_KERNEL_EXPORT void min_p_sampling_from_probs(
     const at::Tensor& probs,
     at::Tensor& output,
     const std::optional<at::Tensor>& maybe_indices,

@@ -37,6 +37,7 @@ limitations under the License.
 
 #include "Utils.h"
 #include "comm/General.h"
+#include "sgl_kernel_export.h"
 
 // Sub-group size on Xe2/BMG.  WARP_SIZE in the CUDA source = 32;
 // Xe2 sub-group size = 16.  All work-items within one sub-group cooperate
@@ -605,7 +606,7 @@ static void launch_transfer_kv_page_head(
 // ---------------------------------------------------------------------------
 
 // Single-layer, lf→lf, K+V.
-void transfer_kv_per_layer(
+SGL_KERNEL_EXPORT void transfer_kv_per_layer(
     const at::Tensor& src_k,
     at::Tensor& dst_k,
     const at::Tensor& src_v,
@@ -634,7 +635,7 @@ void transfer_kv_per_layer(
 }
 
 // Single-layer, lf→lf, K only (MLA).
-void transfer_kv_per_layer_mla(
+SGL_KERNEL_EXPORT void transfer_kv_per_layer_mla(
     const at::Tensor& src,
     at::Tensor& dst,
     const at::Tensor& src_indices,
@@ -661,7 +662,7 @@ void transfer_kv_per_layer_mla(
 }
 
 // All-layers, lf_tbl→lf_tbl, K+V.
-void transfer_kv_all_layer(
+SGL_KERNEL_EXPORT void transfer_kv_all_layer(
     const at::Tensor& src_k_layers,
     const at::Tensor& dst_k_layers,
     const at::Tensor& src_v_layers,
@@ -695,7 +696,7 @@ void transfer_kv_all_layer(
 }
 
 // All-layers, lf_tbl→lf_tbl, K only (MLA).
-void transfer_kv_all_layer_mla(
+SGL_KERNEL_EXPORT void transfer_kv_all_layer_mla(
     const at::Tensor& src_layers,
     const at::Tensor& dst_layers,
     const at::Tensor& src_indices,
@@ -725,7 +726,7 @@ void transfer_kv_all_layer_mla(
 }
 
 // All-layers, lf_tbl→ph (page-head destination).
-void transfer_kv_all_layer_lf_ph(
+SGL_KERNEL_EXPORT void transfer_kv_all_layer_lf_ph(
     const at::Tensor& src_k_layers,
     at::Tensor& dst_k,
     const at::Tensor& src_v_layers,
@@ -765,7 +766,7 @@ void transfer_kv_all_layer_lf_ph(
 // Single-layer, ph→lf.
 // layer_id: which layer slot to read from the page-head source layout.
 // dst_k/dst_v already point to the correct layer's contiguous buffer.
-void transfer_kv_per_layer_ph_lf(
+SGL_KERNEL_EXPORT void transfer_kv_per_layer_ph_lf(
     const at::Tensor& src_k,
     at::Tensor& dst_k,
     const at::Tensor& src_v,
@@ -806,7 +807,7 @@ void transfer_kv_per_layer_ph_lf(
 // Single-layer, pf→lf, K+V.
 // src_k/src_v are the page-first pool base pointers; layer_id selects the layer
 // slot within each page.  dst_k/dst_v are the contiguous per-layer buffers.
-void transfer_kv_per_layer_pf_lf(
+SGL_KERNEL_EXPORT void transfer_kv_per_layer_pf_lf(
     const at::Tensor& src_k,
     at::Tensor& dst_k,
     const at::Tensor& src_v,
@@ -839,7 +840,7 @@ void transfer_kv_per_layer_pf_lf(
 }
 
 // All-layers, lf_tbl→pf, K+V.
-void transfer_kv_all_layer_lf_pf(
+SGL_KERNEL_EXPORT void transfer_kv_all_layer_lf_pf(
     const at::Tensor& src_k_layers,
     at::Tensor& dst_k,
     const at::Tensor& src_v_layers,
@@ -874,7 +875,7 @@ void transfer_kv_all_layer_lf_pf(
 }
 
 // Single-layer, pf→lf, K only (MLA).
-void transfer_kv_per_layer_mla_pf_lf(
+SGL_KERNEL_EXPORT void transfer_kv_per_layer_mla_pf_lf(
     const at::Tensor& src,
     at::Tensor& dst,
     const at::Tensor& src_indices,
@@ -905,7 +906,7 @@ void transfer_kv_per_layer_mla_pf_lf(
 }
 
 // All-layers, lf_tbl→pf, K only (MLA).
-void transfer_kv_all_layer_mla_lf_pf(
+SGL_KERNEL_EXPORT void transfer_kv_all_layer_mla_lf_pf(
     const at::Tensor& src_layers,
     at::Tensor& dst,
     const at::Tensor& src_indices,

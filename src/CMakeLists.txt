@@ -90,6 +90,7 @@ endforeach()
 
 include(GdnAttnXe20.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/SGEMMLoraAFwdXe20.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/SGEMMLoraBFwdXe20.cmake)
 if(USE_FMHA)
     include(FMHADecodeXe20.cmake)
     include(FMHAPrefillXe20.cmake)

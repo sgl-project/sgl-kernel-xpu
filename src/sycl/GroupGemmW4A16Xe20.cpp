@@ -37,6 +37,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include "sgl_kernel_export.h"
 #include "sycl/Utils.h"
 #include "sycl/kernels/moe/xe20/w4a16/gemm_xe2_policy.hpp"
 
@@ -88,7 +89,7 @@ DECLARE_W4A16_POLICY(w4a16_policy)
 #undef DECLARE_W4A16_POLICY
 #undef DECLARE_W4A16_EXTERN
 
-void moe_grouped_mm_nt_xe20_w4a16(
+SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
     torch::Tensor& output,                   // [total_m, N] bf16/fp16
     const torch::Tensor& activations,        // [total_m, K] bf16 or fp16
     const torch::Tensor& packed_weights,     // [E, N, K/2] int8 (two 4-bit values per byte)

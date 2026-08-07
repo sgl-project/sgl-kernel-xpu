@@ -465,6 +465,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("hc_post(Tensor x, Tensor residual, Tensor post_layer_mix, Tensor comb_res_mix, Tensor! out) -> ()");
   m.impl("hc_post", torch::kXPU, &hc_post);
 
+  /* MHC FUSED POST+PRE */
+  m.def(
+      "mhc_fused_post_pre_fma(Tensor x, Tensor residual, Tensor post_layer_mix, Tensor comb_res_mix, "
+      "Tensor fn, int n_splits=0) -> (Tensor, Tensor, Tensor)");
+  m.impl("mhc_fused_post_pre_fma", torch::kXPU, &mhc_fused_post_pre_fma);
+
   /*
    * From LoRA
    */

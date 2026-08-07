@@ -828,6 +828,14 @@ void hc_post(
  */
 void hc_pre_gemm_sqr_sum(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, const at::Tensor& B);
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor> mhc_fused_post_pre_fma(
+    const at::Tensor& x,
+    const at::Tensor& residual,
+    const at::Tensor& post_layer_mix,
+    const at::Tensor& comb_res_mix,
+    const at::Tensor& fn,
+    int64_t n_splits = 0);
+
 /*
  * From csrc/speculative
  */

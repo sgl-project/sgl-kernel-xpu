@@ -2,6 +2,20 @@ from typing import Optional
 
 import torch
 
+XPU_FUSED_FALLBACK_HIDDEN_SIZE = 7168
+XPU_FUSED_FALLBACK_TOKENS = 32
+XPU_SMALL_BATCH_TOKENS = 32
+
+
+def _choose_small_batch_splits(num_tokens: int, n_splits_hint: int) -> int:
+    if n_splits_hint > 0:
+        return n_splits_hint
+    if num_tokens <= 4:
+        return 32
+    if num_tokens <= 16:
+        return 8
+    return 4
+
 
 def hc_split_sinkhorn(
     mixes: torch.Tensor,
@@ -250,3 +264,116 @@ def mhc_pre(
     )
 
     return post_mix, comb_mix, layer_input
+
+
+def mhc_fused_post_pre(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 2.0,
+    sinkhorn_repeat: int = 20,
+    n_splits: int = 0,
+    *,
+    tile_n: int = 1,
+    norm_weight: Optional[torch.Tensor] = None,
+    norm_eps: Optional[float] = None,
+):
+    del tile_n  # SYCL path currently ignores tile_n (TileLang-specific tuning knob).
+
+    num_tokens = x.shape[0]
+    hidden_size = x.shape[-1]
+    post_2d = (
+        post_layer_mix.squeeze(-1) if post_layer_mix.dim() == 3 else post_layer_mix
+    )
+    use_split_path = (
+        hidden_size >= XPU_FUSED_FALLBACK_HIDDEN_SIZE
+        and num_tokens >= XPU_FUSED_FALLBACK_TOKENS
+    ) or num_tokens > XPU_SMALL_BATCH_TOKENS
+
+    if use_split_path:
+        residual_cur = hc_post(x, residual, post_2d, comb_res_mix)
+        post_mix_cur, comb_mix_cur, layer_input_cur = mhc_pre(
+            residual_cur,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps=float(rms_eps),
+            hc_pre_eps=float(hc_pre_eps),
+            hc_sinkhorn_eps=float(hc_sinkhorn_eps),
+            hc_post_mult_value=float(hc_post_mult_value),
+            sinkhorn_repeat=int(sinkhorn_repeat),
+            n_splits=1,
+            n_splits_pre=(int(n_splits) if n_splits > 0 else None),
+            norm_weight=norm_weight,
+            norm_eps=(float(norm_eps) if norm_eps is not None else 1e-6),
+        )
+        return residual_cur, post_mix_cur.unsqueeze(-1), comb_mix_cur, layer_input_cur
+
+    split_k = _choose_small_batch_splits(num_tokens, int(n_splits))
+    residual_cur, gemm_out_mul, gemm_out_sqrsum = mhc_fused_post_pre_fma(
+        x,
+        residual,
+        post_2d,
+        comb_res_mix,
+        fn,
+        n_splits=split_k,
+    )
+
+    hc_mult = residual_cur.size(1)
+    hidden_size = residual_cur.size(2)
+    post_mix_cur = torch.empty(
+        num_tokens, hc_mult, dtype=torch.float32, device=residual_cur.device
+    )
+    comb_mix_cur = torch.empty(
+        num_tokens, hc_mult, hc_mult, dtype=torch.float32, device=residual_cur.device
+    )
+    layer_input_cur = torch.empty(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device=residual_cur.device
+    )
+
+    hc_pre_big_fuse(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual_cur,
+        post_mix_cur,
+        comb_mix_cur,
+        layer_input_cur,
+        hc_mult=hc_mult,
+        sinkhorn_iters=int(sinkhorn_repeat),
+        n_splits=split_k,
+        rms_eps=float(rms_eps),
+        hc_pre_eps=float(hc_pre_eps),
+        hc_sinkhorn_eps=float(hc_sinkhorn_eps),
+        hc_post_mult_value=float(hc_post_mult_value),
+        norm_weight=norm_weight,
+        norm_eps=(float(norm_eps) if norm_eps is not None else 1e-6),
+    )
+
+    return residual_cur, post_mix_cur.unsqueeze(-1), comb_mix_cur, layer_input_cur
+
+
+def mhc_fused_post_pre_fma(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    n_splits: int = 0,
+):
+    return torch.ops.sgl_kernel.mhc_fused_post_pre_fma.default(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        int(n_splits),
+    )

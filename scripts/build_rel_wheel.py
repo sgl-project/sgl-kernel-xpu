@@ -52,12 +52,16 @@ def log(message: str) -> None:
     print(f"[build-wheel] {message}", flush=True)
 
 
-def run(cmd: list[str], *, cwd: Path = PROJECT_ROOT, env: dict[str, str] | None = None) -> None:
+def run(
+    cmd: list[str], *, cwd: Path = PROJECT_ROOT, env: dict[str, str] | None = None
+) -> None:
     log("$ " + " ".join(cmd))
     subprocess.run(cmd, cwd=cwd, env=env, check=True)
 
 
-def run_capture(cmd: list[str], *, cwd: Path = PROJECT_ROOT, env: dict[str, str] | None = None) -> str:
+def run_capture(
+    cmd: list[str], *, cwd: Path = PROJECT_ROOT, env: dict[str, str] | None = None
+) -> str:
     log("$ " + " ".join(cmd))
     proc = subprocess.run(
         cmd,
@@ -82,12 +86,18 @@ def ensure_tool(name: str) -> None:
 
     install_cmd = INSTALL_COMMANDS.get(name)
     if install_cmd is None:
-        raise BuildError(f"required tool '{name}' was not found on PATH and no installer is configured")
+        raise BuildError(
+            f"required tool '{name}' was not found on PATH and no installer is configured"
+        )
 
-    log(f"required tool '{name}' was not found; installing with: {' '.join(install_cmd)}")
+    log(
+        f"required tool '{name}' was not found; installing with: {' '.join(install_cmd)}"
+    )
     run(install_cmd)
     if shutil.which(name) is None:
-        raise BuildError(f"tool '{name}' is still not available on PATH after: {' '.join(install_cmd)}")
+        raise BuildError(
+            f"tool '{name}' is still not available on PATH after: {' '.join(install_cmd)}"
+        )
 
 
 def clean_previous_outputs() -> None:
@@ -136,7 +146,9 @@ def oneapi_lib_dirs(env: dict[str, str]) -> list[Path]:
 
 def prepend_ld_library_path(env: dict[str, str], paths: Iterable[Path]) -> None:
     new_entries = [str(path) for path in paths]
-    existing_entries = [entry for entry in env.get("LD_LIBRARY_PATH", "").split(os.pathsep) if entry]
+    existing_entries = [
+        entry for entry in env.get("LD_LIBRARY_PATH", "").split(os.pathsep) if entry
+    ]
     env["LD_LIBRARY_PATH"] = os.pathsep.join(new_entries + existing_entries)
 
 
@@ -154,19 +166,31 @@ def auditwheel_env() -> dict[str, str]:
 def find_single_wheel(directory: Path, *, exclude: Iterable[Path] = ()) -> Path:
     excluded = {p.resolve() for p in exclude}
     wheels = sorted(
-        p for p in directory.glob("*.whl") if p.resolve() not in excluded and p.is_file()
+        p
+        for p in directory.glob("*.whl")
+        if p.resolve() not in excluded and p.is_file()
     )
     if len(wheels) != 1:
-        names = "\n  ".join(str(p.relative_to(PROJECT_ROOT)) for p in wheels) or "<none>"
-        raise BuildError(f"expected exactly one wheel in {directory}, found:\n  {names}")
+        names = (
+            "\n  ".join(str(p.relative_to(PROJECT_ROOT)) for p in wheels) or "<none>"
+        )
+        raise BuildError(
+            f"expected exactly one wheel in {directory}, found:\n  {names}"
+        )
     return wheels[0]
 
 
 def build_wheel(args: argparse.Namespace) -> Path:
     DIST_DIR.mkdir(exist_ok=True)
     if args.skip_build:
-        wheel = Path(args.input_wheel).resolve() if args.input_wheel else find_single_wheel(DIST_DIR)
-        log(f"using existing wheel: {wheel.relative_to(PROJECT_ROOT) if wheel.is_relative_to(PROJECT_ROOT) else wheel}")
+        wheel = (
+            Path(args.input_wheel).resolve()
+            if args.input_wheel
+            else find_single_wheel(DIST_DIR)
+        )
+        log(
+            f"using existing wheel: {wheel.relative_to(PROJECT_ROOT) if wheel.is_relative_to(PROJECT_ROOT) else wheel}"
+        )
         return wheel
 
     for wheel in DIST_DIR.glob("*.whl"):
@@ -184,7 +208,9 @@ def build_wheel(args: argparse.Namespace) -> Path:
     return find_single_wheel(DIST_DIR)
 
 
-def auditwheel_repair(input_wheel: Path, excludes: list[str], env: dict[str, str]) -> Path:
+def auditwheel_repair(
+    input_wheel: Path, excludes: list[str], env: dict[str, str]
+) -> Path:
     if WHEELHOUSE_DIR.exists():
         shutil.rmtree(WHEELHOUSE_DIR)
     cmd = ["auditwheel", "repair", "--strip", "--wheel-dir", str(WHEELHOUSE_DIR)]
@@ -228,7 +254,9 @@ def discover_excluded_libs(repaired_wheel: Path, work_dir: Path) -> list[str]:
     with zipfile.ZipFile(repaired_wheel) as zf:
         zf.extractall(unpack_dir)
 
-    libs_dirs = sorted(p for p in unpack_dir.iterdir() if p.is_dir() and p.name.endswith(".libs"))
+    libs_dirs = sorted(
+        p for p in unpack_dir.iterdir() if p.is_dir() and p.name.endswith(".libs")
+    )
     if not libs_dirs:
         log("no *.libs directory found in first repair; no auditwheel excludes needed")
         return []
@@ -259,7 +287,9 @@ def auditwheel_hashed_lib_map(unpacked_dir: Path) -> dict[str, str]:
     un-hashed external soname.
     """
     mapping: dict[str, str] = {}
-    for libs_dir in sorted(p for p in unpacked_dir.iterdir() if p.is_dir() and p.name.endswith(".libs")):
+    for libs_dir in sorted(
+        p for p in unpacked_dir.iterdir() if p.is_dir() and p.name.endswith(".libs")
+    ):
         for path in sorted(libs_dir.iterdir()):
             if path.is_file() and ".so" in path.name:
                 mapping[path.name] = strip_auditwheel_hash(path.name)
@@ -306,7 +336,9 @@ def choose_payload_dirs(unpacked_dir: Path) -> tuple[Path, Path, Path]:
 
     missing = [str(p.name) for p in (include_dir, package_dir) if not p.is_dir()]
     if missing:
-        raise BuildError(f"final repaired wheel is missing expected payload dirs: {', '.join(missing)}")
+        raise BuildError(
+            f"final repaired wheel is missing expected payload dirs: {', '.join(missing)}"
+        )
     if len(dist_infos) != 1:
         found = ", ".join(p.name for p in dist_infos) or "<none>"
         raise BuildError(f"expected exactly one *.dist-info directory, found: {found}")
@@ -334,7 +366,11 @@ def copy_publishable_payload(repaired_wheel: Path, work_dir: Path) -> Path:
 
 def wheel_record_hash(path: Path) -> tuple[str, str]:
     data = path.read_bytes()
-    digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode("ascii").rstrip("=")
+    digest = (
+        base64.urlsafe_b64encode(hashlib.sha256(data).digest())
+        .decode("ascii")
+        .rstrip("=")
+    )
     return f"sha256={digest}", str(len(data))
 
 
@@ -415,17 +451,27 @@ def verify_wheel(output_wheel: Path) -> None:
             raise BuildError(f"output wheel has no entries under {prefix}")
     if not any(name.endswith(".dist-info/RECORD") for name in names):
         raise BuildError("output wheel has no dist-info RECORD")
-    forbidden = [n for n in names if n.startswith(("lib/", "test/", "tests/")) or ".libs/" in n]
+    forbidden = [
+        n for n in names if n.startswith(("lib/", "test/", "tests/")) or ".libs/" in n
+    ]
     if forbidden:
         preview = "\n  ".join(sorted(forbidden)[:20])
-        raise BuildError(f"output wheel still contains forbidden lib/test/.libs entries:\n  {preview}")
+        raise BuildError(
+            f"output wheel still contains forbidden lib/test/.libs entries:\n  {preview}"
+        )
     log("zip integrity and payload checks passed")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--skip-build", action="store_true", help="reuse --input-wheel or the only wheel already in dist/")
-    parser.add_argument("--input-wheel", help="existing wheel to repair; implies --skip-build")
+    parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="reuse --input-wheel or the only wheel already in dist/",
+    )
+    parser.add_argument(
+        "--input-wheel", help="existing wheel to repair; implies --skip-build"
+    )
 
     parser.add_argument(
         "--build-command",
@@ -435,7 +481,10 @@ def parse_args() -> argparse.Namespace:
             "The command must leave exactly one .whl in dist/ unless --input-wheel is used."
         ),
     )
-    parser.add_argument("--output", help="final wheel filename; written under dist/ and defaults to the repaired manylinux wheel name")
+    parser.add_argument(
+        "--output",
+        help="final wheel filename; written under dist/ and defaults to the repaired manylinux wheel name",
+    )
     args = parser.parse_args()
     if args.input_wheel:
         args.skip_build = True

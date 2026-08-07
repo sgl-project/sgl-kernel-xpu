@@ -87,6 +87,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor topk_indices_offset, Tensor? row_starts) -> ()");
   m.impl("fast_topk_transform_ragged_fused", torch::kXPU, &fast_topk_transform_ragged_interface);
 
+  m.def(
+      "topk_transform_512(Tensor scores, Tensor seq_lens, Tensor page_tables, Tensor! out_page_indices, "
+      "int page_size, Tensor? out_raw_indices) -> ()");
+  m.impl("topk_transform_512", torch::kXPU, &topk_transform_512_interface);
+
+  m.def(
+      "topk_transform_512_v2(Tensor scores, Tensor seq_lens, Tensor page_tables, "
+      "Tensor! out_page_indices, int page_size, Tensor metadata, Tensor? out_raw_indices) -> ()");
+  m.impl("topk_transform_512_v2", torch::kXPU, &topk_transform_512_v2_interface);
+
   m.def("swiglu_gpt_oss_sigmoid_alpha(Tensor x, float alpha, float limit) -> Tensor");
   m.impl("swiglu_gpt_oss_sigmoid_alpha", torch::kXPU, &swiglu_gpt_oss_sigmoid_alpha);
 

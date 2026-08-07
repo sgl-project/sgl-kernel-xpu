@@ -400,6 +400,8 @@ void transfer_kv_mamba_lf_pf(
     int64_t item_size,
     int64_t dst_layout_dim,
     int64_t num_layers);
+void indexed_scale_shift_bf16_(torch::Tensor& x, torch::Tensor& shift, torch::Tensor& scale, torch::Tensor& indices);
+void indexed_gate_bf16_(torch::Tensor& x, torch::Tensor& gate, torch::Tensor& other, torch::Tensor& indices);
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void silu_and_mul_clamp(torch::Tensor& out, torch::Tensor& input, double swiglu_limit);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);

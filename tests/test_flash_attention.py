@@ -217,6 +217,7 @@ def attention_ref(
     upcast=True,
     reorder_ops=False,
     intermediate_dtype=None,
+    return_lse=False,
 ):
     """
     Arguments:
@@ -290,6 +291,9 @@ def attention_ref(
             scores.size()[0], scores.size()[1], scores.size()[2], 1
         )
         scores = torch.cat([scores, sink_expanded], dim=-1)
+    # Log-sum-exp over the key dimension (includes the sink column when present
+    # and excludes -inf masked entries): matches the kernel's softmax_lse.
+    softmax_lse_ref = torch.logsumexp(scores.float(), dim=-1)
     attention = torch.softmax(scores, dim=-1).to(v.dtype)
     if sink is not None:
         attention = attention[..., :-1]
@@ -321,7 +325,48 @@ def attention_ref(
     output = torch.einsum("bhts,bshd->bthd", attention_drop, v * dropout_scaling)
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
+    if return_lse:
+        return (
+            output.to(dtype=dtype_og),
+            attention.to(dtype=dtype_og),
+            softmax_lse_ref,
+        )
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
+
+
+def _check_softmax_lse(lse, nheads_q, total_q, ref_lse_hq=None, atol=1e-1, rtol=1e-1):
+    """Validate a returned softmax_lse tensor.
+
+    Guards against the regression where the XPU chunkprefill path returned an
+    empty / mis-shaped placeholder instead of a real (nheads, total_q) LSE.
+    When ``ref_lse_hq`` (shape (nheads_q, total_q)) is given, the values on the
+    finite rows are also compared (fully-masked rows are -inf and skipped).
+    """
+    assert lse is not None, "softmax_lse must not be None when return_softmax_lse=True"
+    assert isinstance(
+        lse, torch.Tensor
+    ), f"softmax_lse must be a tensor, got {type(lse)}"
+    assert (
+        lse.dim() == 2
+    ), f"softmax_lse must be 2D (nheads, total_q), got shape {tuple(lse.shape)}"
+    assert tuple(lse.shape) == (
+        nheads_q,
+        total_q,
+    ), f"softmax_lse shape {tuple(lse.shape)} != expected {(nheads_q, total_q)}"
+    assert lse.dtype == torch.float32, f"softmax_lse dtype {lse.dtype} != float32"
+    lse_f = lse.float()
+    assert not torch.isnan(lse_f).any(), "softmax_lse contains NaN"
+    assert not torch.isposinf(lse_f).any(), "softmax_lse contains +inf"
+    if ref_lse_hq is not None:
+        finite = torch.isfinite(ref_lse_hq)
+        if finite.any():
+            diff = (lse_f[finite] - ref_lse_hq[finite].to(lse_f.dtype)).abs()
+            tol = atol + rtol * ref_lse_hq[finite].abs()
+            max_diff = diff.max().item()
+            assert (diff <= tol).all(), (
+                f"softmax_lse numeric mismatch: max diff {max_diff} exceeds "
+                f"tolerance (atol={atol}, rtol={rtol})"
+            )
 
 
 def generate_qkv(
@@ -805,7 +850,7 @@ def test_flash_attn_kvcache(
         v_cache_rep = repeat(
             v_cache_ref, "b s h d -> b s (h g) d", g=nheads_q // nheads_kv
         )
-        out_ref, _ = attention_ref(
+        out_ref, _, lse_ref = attention_ref(
             q_ro,
             k_cache_rep,
             v_cache_rep,
@@ -817,6 +862,7 @@ def test_flash_attn_kvcache(
             qv=qv,
             window_size=window_size,
             key_leftpad=cache_leftpad,
+            return_lse=True,
         )
         out_pt, _ = attention_ref(
             q_ro,
@@ -864,7 +910,10 @@ def test_flash_attn_kvcache(
                 else:
                     k_cache_paged.copy_(k_cache_saved)
                     v_cache_paged.copy_(v_cache_saved)
-                out, lse, *rest = flash_attn_with_kvcache(
+                # The kernel only supports returning softmax_lse without
+                # causal/local/sink masking; request it only in that case.
+                return_lse = not causal and not local and not use_sinks
+                result = flash_attn_with_kvcache(
                     q if not varlen_q else q_unpad,
                     k_cache if page_size is None else k_cache_paged,
                     v_cache if page_size is None else v_cache_paged,
@@ -888,8 +937,24 @@ def test_flash_attn_kvcache(
                     rotary_interleaved=rotary_interleaved,
                     scheduler_metadata=scheduler_metadata,
                     num_splits=num_splits,
-                    return_softmax_lse=True,
+                    return_softmax_lse=return_lse,
                 )
+                if return_lse:
+                    out, lse, *rest = result
+                else:
+                    out = result
+                # --- softmax_lse validation (regression guard for the empty /
+                # mis-shaped LSE that the old chunkprefill path returned). The
+                # kernel's LSE for sink cases is sink-exclusive while the
+                # reference is sink-inclusive, so numeric LSE is only validated
+                # for non-sink cases. lse_ref is reused from the out_ref call. ---
+                if return_lse:
+                    ref_lse_hq = (
+                        rearrange(lse_ref, "b h s -> (b s) h")[indices_q]
+                        .transpose(0, 1)
+                        .contiguous()
+                    )
+                    _check_softmax_lse(lse, nheads_q, q_unpad.shape[0], ref_lse_hq)
                 if varlen_q:
                     out = output_pad_fn(out)
                 torch.xpu.synchronize()
@@ -1300,7 +1365,7 @@ def test_flash_attn_decode_kvcache(
         v_cache_rep = repeat(
             v_cache_ref, "b s h d -> b s (h g) d", g=nheads_q // nheads_kv
         )
-        out_ref, _ = attention_ref(
+        out_ref, _, lse_ref = attention_ref(
             q_ro,
             k_cache_rep,
             v_cache_rep,
@@ -1312,6 +1377,7 @@ def test_flash_attn_decode_kvcache(
             qv=qv,
             window_size=window_size,
             key_leftpad=cache_leftpad,
+            return_lse=True,
         )
         out_pt, _ = attention_ref(
             q_ro,
@@ -1359,7 +1425,10 @@ def test_flash_attn_decode_kvcache(
                 else:
                     k_cache_paged.copy_(k_cache_saved)
                     v_cache_paged.copy_(v_cache_saved)
-                out, lse, *rest = flash_attn_with_kvcache(
+                # The kernel only supports returning softmax_lse without
+                # causal/local/sink masking; request it only in that case.
+                return_lse = not causal and not local and not use_sinks
+                result = flash_attn_with_kvcache(
                     q if not varlen_q else q_unpad,
                     k_cache if page_size is None else k_cache_paged,
                     v_cache if page_size is None else v_cache_paged,
@@ -1384,8 +1453,24 @@ def test_flash_attn_decode_kvcache(
                     rotary_interleaved=rotary_interleaved,
                     scheduler_metadata=scheduler_metadata,
                     num_splits=num_splits,
-                    return_softmax_lse=True,
+                    return_softmax_lse=return_lse,
                 )
+                if return_lse:
+                    out, lse, *rest = result
+                else:
+                    out = result
+                # --- softmax_lse validation (regression guard for the empty /
+                # mis-shaped LSE that the old chunkprefill path returned). The
+                # kernel's LSE for sink cases is sink-exclusive while the
+                # reference is sink-inclusive, so numeric LSE is only validated
+                # for non-sink cases. lse_ref is reused from the out_ref call. ---
+                if return_lse:
+                    ref_lse_hq = (
+                        rearrange(lse_ref, "b h s -> (b s) h")[indices_q]
+                        .transpose(0, 1)
+                        .contiguous()
+                    )
+                    _check_softmax_lse(lse, nheads_q, q_unpad.shape[0], ref_lse_hq)
                 if varlen_q:
                     out = output_pad_fn(out)
                 torch.xpu.synchronize()
@@ -1551,7 +1636,7 @@ def test_flash_attn_fp8_kvcache(
 
     q = torch.randn(batch_size, seqlen_q, nheads_q, d, device=device, dtype=q_dtype)
 
-    out = flash_attn_with_kvcache(
+    out, lse, *rest = flash_attn_with_kvcache(
         q,
         k_cache_paged,
         v_cache_paged,
@@ -1561,7 +1646,11 @@ def test_flash_attn_fp8_kvcache(
         v_descale=v_descale,
         softmax_scale=softmax_scale,
         causal=causal,
+        return_softmax_lse=True,
     )
+    # --- softmax_lse validation (structural: the fp8 lse numeric convention is
+    # kernel-specific, so only shape / finiteness are checked here) ---
+    _check_softmax_lse(lse, nheads_q, batch_size * seqlen_q)
     out = out.reshape(batch_size, seqlen_q, nheads_q, d)
     torch.xpu.synchronize()
 
@@ -1847,7 +1936,7 @@ def test_flash_attn_varlen_output(
         pack_gqa_vals = [False, True] if not DISABLE_PACKGQA else [False]
         num_splits_vals = [1, 3] if not DISABLE_SPLIT else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
-            out_unpad, lse, *rest = flash_attn_varlen_func(
+            out_unpad = flash_attn_varlen_func(
                 q_unpad,
                 k_unpad,
                 v_unpad,
@@ -1866,7 +1955,7 @@ def test_flash_attn_varlen_output(
                 softmax_scale=softmax_scale,
                 sinks=sinks,
                 softcap=softcap,
-                return_softmax_lse=True,
+                return_softmax_lse=False,
             )
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:
@@ -1966,14 +2055,17 @@ def test_flash_attn_with_kvcache_out_buffer():
     # Preallocate out buffer: shape [total_q, nheads, d] = [batch*seqlen_q, nheads, d]
     total_q = batch_size * seqlen_q
     out_buf = torch.empty(total_q, nheads, d, device=device, dtype=dtype)
-    result = flash_attn_with_kvcache(
+    result, lse, *rest = flash_attn_with_kvcache(
         q,
         k_cache,
         v_cache,
         cache_seqlens=cache_seqlens,
         page_table=page_table,
         out=out_buf,
+        return_softmax_lse=True,
     )
+    # --- softmax_lse validation (structural) ---
+    _check_softmax_lse(lse, nheads, total_q)
 
     # The returned tensor must alias the provided buffer (same storage)
     assert (

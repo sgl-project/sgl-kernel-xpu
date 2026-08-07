@@ -71,6 +71,9 @@ class ReduceSplitK {
 
   using ElementLSE = typename FMHAKernel_::ElementLSE;
 
+  // Whether the split kernel emits softmax log-sum-exp.
+  static constexpr bool LSE = FMHAKernel_::LSE;
+
   using SGPerWG = typename FMHAKernel_::SGPerWG;
 
   // num values (head_dim) processed by each thread
@@ -97,6 +100,12 @@ class ReduceSplitK {
     // Per-batch skip mask for two-kernel mix-batch dispatch
     // (see https://github.com/vllm-project/vllm-xpu-kernels/pull/218).
     const bool* skip_batch_mask = nullptr;
+    // Optional softmax LSE output (natural-log log-sum-exp), row-major
+    // (num_heads_q, total_q). Written here only for genuinely multi-split
+    // sequences; single-split LSE is emitted by the split epilogue. Null =>
+    // don't write.
+    float* softmax_lse = nullptr;
+    int64_t lse_head_stride = 0;  // = total_q
   };
   using KernelParams = KernelArguments;
 
@@ -211,6 +220,11 @@ class ReduceSplitK {
 
       int offset_o = 0, offset_o_accum = 0;
       int offset_exp_sums = 0, offset_max_logits = 0;
+      // Query-token index in the (num_heads_q, total_q) softmax_lse output.
+      int lse_q_base = 0;
+      if constexpr (LSE) {
+        lse_q_base = idx_b * seq_len_qo;
+      }
 
       if constexpr (is_var_len) {
         auto qo_cumulative = s.seq_len_qo.cumulative_length;
@@ -220,6 +234,9 @@ class ReduceSplitK {
         offset_max_logits = s.num_heads_q * num_kv_splits * qo_cumulative[idx_b];
 
         offset_o = s.num_heads_q * s.head_size_vo * qo_cumulative[idx_b];
+        if constexpr (LSE) {
+          lse_q_base = qo_cumulative[idx_b];
+        }
       }
 
       auto shape_O = make_shape(seq_len_qo, head_size_vo, num_heads_q, batch_dim);
@@ -301,6 +318,23 @@ class ReduceSplitK {
 
         acc *= inv_global_exp_sums;
         O(seq_idx, idx, head_q, l_coord) = static_cast<ElementO>(acc);
+      }
+
+      // Emit the natural-log LSE for genuinely multi-split sequences. Short
+      // (single-split) sequences store sentinel exp_sums/max_logits (making this
+      // reduction a pass-through), so their LSE is written directly by the split
+      // epilogue instead; skip them here to avoid clobbering with a wrong value.
+      // thr_id == 0 retains a valid global_exp_sums from its idx==0 iteration
+      // (the combined sum is identical across idx).
+      if constexpr (LSE) {
+        constexpr int kMinBlocksForSplit = 128;
+        bool is_single_split = (num_kv_splits > 1) && (windowed_k_blocks < kMinBlocksForSplit);
+        if (!is_single_split && thr_id == 0) {
+          constexpr float kRcpLog2e = 0.6931471805599453f;  // ln(2)
+          float d = float(global_exp_sums);
+          float lse = (d > 0.f) ? (float(global_max_logits) * kRcpLog2e + sycl::log(d)) : -INFINITY;
+          p.softmax_lse[int64_t(head_q) * p.lse_head_stride + (lse_q_base + seq_idx)] = lse;
+        }
       }
     }
   }

@@ -39,6 +39,16 @@
 
 #include <sycl/sycl.hpp>
 
+// Compile-time selector for the sparse MLA decode implementation:
+//   1 -> two-stage path (gather+dequant to HBM, then dense flash-decode)
+//   0 -> fused path (SLM per-d-slice gather + inline DPAS)
+// Set here for convenience; a build-time -DSGLANG_USE_SPARSE_MLA_2STAGE=<0|1>
+// override still wins because of the guard. Consumed by an #if in
+// mla_sparse_decode.cpp (SGL_DISABLE_PACKGQA-style A/B toggle).
+#ifndef SGLANG_USE_SPARSE_MLA_2STAGE
+#define SGLANG_USE_SPARSE_MLA_2STAGE 1
+#endif
+
 namespace mla_sparse_decode {
 
 // Each function is defined in a separate generated .cpp file from
@@ -69,5 +79,62 @@ DECLARE_MLA_SPARSE_DECODE_LAUNCH(half)
 DECLARE_MLA_SPARSE_DECODE_LAUNCH(bf16)
 
 #undef DECLARE_MLA_SPARSE_DECODE_LAUNCH
+
+// Two-stage variant (gather+dequant to HBM, then dense flash-decode). Selected at
+// compile time via SGLANG_USE_SPARSE_MLA_2STAGE. Generated from
+// mla_sparse_decode_2stage_kernel.cpp.in, one TU per (ELEM_TAG, D_QK, B_H,
+// HAS_ATTN_SINK) -- D_QK is the QK head dim (always 512 for decode) and B_H the
+// sparse-decode analog of the fused path's PAGE_SIZE, together keying the Stage-2
+// config; HAS_ATTN_SINK selects the sink epilogue variant. One variant lands in its
+// own object file (heavy CUTLASS instantiation split per file).
+//
+// Naming: launch_mla_sparse_decode_2stage_<ELEM_TAG>_<D_QK>_<B_H>_<HAS_ATTN_SINK>
+//   ELEM_TAG      in {half, bf16}
+//   D_QK          in {512}
+//   B_H           in {8, 16, 32, 64}
+//   HAS_ATTN_SINK in {0, 1}
+#define DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, D_QK, B_H, SINK)   \
+  void launch_mla_sparse_decode_2stage_##ELEM##_##D_QK##_##B_H##_##SINK( \
+      at::Tensor& out,                                                   \
+      at::Tensor& lse_out,                                               \
+      const at::Tensor& q,                                               \
+      const at::Tensor& k_cache,                                         \
+      const at::Tensor& indices,                                         \
+      const std::optional<at::Tensor>& topk_length,                      \
+      const std::optional<at::Tensor>& extra_k_cache,                    \
+      const std::optional<at::Tensor>& extra_indices,                    \
+      const std::optional<at::Tensor>& extra_topk_length,                \
+      const std::optional<at::Tensor>& attn_sink,                        \
+      double sm_scale,                                                   \
+      int64_t head_dim_v,                                                \
+      bool is_fp8_kvcache);
+
+#define DECLARE_MLA_SPARSE_DECODE_2STAGE_ALL_B_H(ELEM)      \
+  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, 512, 8, 0)  \
+  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, 512, 8, 1)  \
+  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, 512, 16, 0) \
+  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, 512, 16, 1) \
+  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, 512, 32, 0) \
+  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, 512, 32, 1) \
+  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, 512, 64, 0) \
+  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, 512, 64, 1)
+
+DECLARE_MLA_SPARSE_DECODE_2STAGE_ALL_B_H(bf16)
+
+#undef DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH
+#undef DECLARE_MLA_SPARSE_DECODE_2STAGE_ALL_B_H
+
+// Head-block (B_H) selection rule for the two-stage path. B_H is the sparse-decode
+// analog of the fused path's page_size: it keys the per-(ELEM, B_H) launcher. Pure
+// host logic (h_q -> B_H) with no CUTLASS dependency, so the op TU can pick the
+// launcher without pulling in the heavy Stage-2 config header.
+// TODO: currently a simple rule; a smarter heuristic could balance occupancy and
+// per-WG workload.
+inline int sparse_mla_decode_select_b_h(int h_q) {
+  if (h_q <= 8) return 8;
+  if (h_q <= 16) return 16;
+  if (h_q <= 32) return 32;
+  return 64;
+}
 
 }  // namespace mla_sparse_decode

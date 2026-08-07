@@ -609,7 +609,7 @@ def test_fused_qk_norm_rope_with_cache(
 
     q_test = q.clone()
     k_test = k.clone()
-    sgl_kernel.fused_qk_norm_rope_with_cos_sin_cache_inplace(
+    sgl_kernel.fused_inplace_qknorm_rope(
         q_test,
         k_test,
         q_weight,
@@ -710,7 +710,7 @@ def test_fused_qk_norm_rope_with_cache_last_dim_strided(
         is_neox,
     )
 
-    sgl_kernel.fused_qk_norm_rope_with_cos_sin_cache_inplace(
+    sgl_kernel.fused_inplace_qknorm_rope(
         q,
         k,
         q_weight,
@@ -725,6 +725,420 @@ def test_fused_qk_norm_rope_with_cache_last_dim_strided(
     )
     torch.testing.assert_close(
         k, k_ref.to(dtype), rtol=precision[dtype], atol=precision[dtype]
+    )
+
+
+def fused_q_norm_rope_reference(
+    q_input: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Pure-PyTorch reference for the DeepSeek-V4 Q path: unweighted
+    RMSNorm-self over the full head_dim, then RoPE on the last `rope_dim`
+    elements (interleaved re/im), matching the XPU implementation in
+    `src/sycl/FusedQKNormRope.cpp` (`fused_q_norm_rope`).
+
+    Args:
+        q_input: (B, H, head_dim), any float dtype.
+        freqs_cis: (max_pos, rope_dim) fp32, interleaved
+            [re0, im0, re1, im1, ...].
+        positions: (B,) int32 or int64.
+        eps: RMSNorm epsilon.
+
+    Returns:
+        (B, H, head_dim) tensor with q_input's dtype.
+    """
+    B, H, head_dim = q_input.shape
+    rope_dim = freqs_cis.shape[-1]
+    nope_dim = head_dim - rope_dim
+
+    assert rope_dim % 2 == 0, "rope_dim must be even (interleaved re/im)"
+    assert nope_dim >= 0
+
+    # part 1: RMSNorm-self (no learned weight).
+    x = q_input.float()
+    rms = x.pow(2).mean(dim=-1, keepdim=True)
+    norm_factor = torch.rsqrt(rms + eps)
+    x = x * norm_factor
+
+    # part 2: RoPE on the last rope_dim elements.
+    freq_rows = freqs_cis[positions.long()].unsqueeze(1)  # (B, 1, rope_dim)
+    freq_re = freq_rows[..., 0::2]
+    freq_im = freq_rows[..., 1::2]
+
+    x_rope = x[..., nope_dim:]
+    x_re = x_rope[..., 0::2]
+    x_im = x_rope[..., 1::2]
+
+    rotated_re = x_re * freq_re - x_im * freq_im
+    rotated_im = x_re * freq_im + x_im * freq_re
+    rotated = torch.stack([rotated_re, rotated_im], dim=-1).flatten(-2)
+
+    out = torch.cat([x[..., :nope_dim], rotated], dim=-1)
+    return out.to(q_input.dtype)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 16, 32])
+@pytest.mark.parametrize("num_heads", [1, 8, 64])
+@pytest.mark.parametrize(
+    "head_dim,rope_dim",
+    [
+        (64, 64),  # warp path, exact fit (nope_dim=0)
+        (128, 64),  # warp path
+        (192, 84),  # warp path, different rope_dim to meet warp
+        (192, 12),  # warp path, rotary_lanes=1 (minimal rope, corner case)
+        (256, 64),  # warp path
+        (320, 64),  # head_dim not in {64,128,192,256} -> CTA path
+        (320, 320),  # CTA path, nope_dim=0 (full rope, corner case)
+        (512, 64),  # DeepSeek-V4 production shape -> CTA path
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_q_norm_rope(batch_size, num_heads, head_dim, rope_dim, dtype):
+    """Test the Q-only fused RMSNorm-self + RoPE kernel (warp and CTA paths)."""
+    torch.random.manual_seed(42)
+    max_pos = 512
+    eps = 1e-6
+
+    q_input = torch.randn(batch_size, num_heads, head_dim, dtype=dtype, device=device)
+    q_output = torch.empty_like(q_input)
+    freqs_cis = torch.randn(
+        max_pos, rope_dim // 2, dtype=torch.complex64, device=device
+    )
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    positions = torch.randint(
+        0, max_pos, (batch_size,), dtype=torch.int32, device=device
+    )
+
+    sgl_kernel.fused_q_norm_rope(q_input, q_output, freqs_real, positions, eps)
+
+    expected = fused_q_norm_rope_reference(q_input, freqs_real, positions, eps)
+
+    torch.testing.assert_close(
+        q_output.float(), expected.float(), rtol=precision[dtype], atol=precision[dtype]
+    )
+
+
+@pytest.mark.parametrize("head_dim,rope_dim", [(128, 64), (192, 84), (512, 64)])
+@pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
+def test_fused_q_norm_rope_position_dtype(head_dim, rope_dim, position_dtype):
+    """Test both supported `positions` dtypes for warp (128) and CTA (512) paths."""
+    torch.random.manual_seed(0)
+    batch_size, num_heads, max_pos, eps = 8, 4, 512, 1e-6
+    dtype = torch.bfloat16
+
+    q_input = torch.randn(batch_size, num_heads, head_dim, dtype=dtype, device=device)
+    q_output = torch.empty_like(q_input)
+    freqs_cis = torch.randn(
+        max_pos, rope_dim // 2, dtype=torch.complex64, device=device
+    )
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    positions = torch.randint(
+        0, max_pos, (batch_size,), dtype=position_dtype, device=device
+    )
+
+    sgl_kernel.fused_q_norm_rope(q_input, q_output, freqs_real, positions, eps)
+    expected = fused_q_norm_rope_reference(q_input, freqs_real, positions, eps)
+
+    torch.testing.assert_close(
+        q_output.float(), expected.float(), rtol=precision[dtype], atol=precision[dtype]
+    )
+
+
+def test_fused_q_norm_rope_zero_batch():
+    """Empty batch should not crash, for both warp and CTA head_dims."""
+    for head_dim in (128, 192, 512):
+        q_input = torch.empty(0, 8, head_dim, dtype=torch.bfloat16, device=device)
+        q_output = torch.empty(0, 8, head_dim, dtype=torch.bfloat16, device=device)
+        freqs_cis = torch.randn(512, 32, dtype=torch.complex64, device=device)
+        freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+        positions = torch.empty(0, dtype=torch.int32, device=device)
+        sgl_kernel.fused_q_norm_rope(q_input, q_output, freqs_real, positions, 1e-6)
+        assert q_output.shape == q_input.shape
+
+
+@pytest.mark.parametrize(
+    "head_dim,rope_dim,last_dim_padding",
+    [
+        (128, 64, 32),  # warp path
+        (512, 64, 64),  # CTA path
+    ],
+)
+def test_fused_q_norm_rope_non_flattenable(head_dim, rope_dim, last_dim_padding):
+    """Test fused Q norm + RoPE with non-contiguous input/output views where
+    stride(0) != size(1) * stride(1), i.e. the leading dimensions are not
+    flattenable. Mirrors real production usage where q is sliced from a packed
+    QKV buffer and unflattened to (tokens, heads, head_dim)."""
+    torch.random.manual_seed(42)
+    batch_size, num_heads, max_pos, eps = 4, 8, 512, 1e-6
+    dtype = torch.bfloat16
+
+    total_heads = num_heads + last_dim_padding
+    q_storage = torch.randn(
+        batch_size, total_heads * head_dim, dtype=dtype, device=device
+    )
+    out_storage = torch.randn(
+        batch_size, total_heads * head_dim, dtype=dtype, device=device
+    )
+
+    q_flat = q_storage[:, : num_heads * head_dim]
+    # Unflatten to 3D – strides become (total_heads*head_dim, head_dim, 1)
+    q_input = q_flat.unflatten(-1, (num_heads, head_dim))
+
+    out_flat = out_storage[:, : num_heads * head_dim]
+    # Unflatten to 3D – strides become (total_heads*head_dim, head_dim, 1)
+    q_output = out_flat.unflatten(-1, (num_heads, head_dim))
+
+    assert q_input.stride(-1) == 1
+    assert q_output.stride(-1) == 1
+    assert not q_input.is_contiguous()
+    assert not q_output.is_contiguous()
+    assert q_input.stride(0) != q_input.size(1) * q_input.stride(1)
+    assert q_output.stride(0) != q_output.size(1) * q_output.stride(1)
+
+    freqs_cis = torch.randn(
+        max_pos, rope_dim // 2, dtype=torch.complex64, device=device
+    )
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    positions = torch.randint(
+        0, max_pos, (batch_size,), dtype=torch.int32, device=device
+    )
+
+    sgl_kernel.fused_q_norm_rope(q_input, q_output, freqs_real, positions, eps)
+    expected = fused_q_norm_rope_reference(q_input, freqs_real, positions, eps)
+
+    torch.testing.assert_close(
+        q_output.float(), expected.float(), rtol=precision[dtype], atol=precision[dtype]
+    )
+
+
+def fused_k_norm_rope_flashmla_reference(
+    kv: torch.Tensor,  # (B, 512) input dtype (bf16/fp16/fp32)
+    kv_weight: torch.Tensor,  # (512,) same dtype as kv
+    freqs_cis: torch.Tensor,  # (max_pos, 64) fp32 interleaved [re0,im0,re1,im1,...]
+    positions: torch.Tensor,  # (B,) int32 or int64
+    out_loc: torch.Tensor,  # (B,) int32 cache-slot indices
+    kvcache: torch.Tensor,  # (npages, kPageBytes) uint8
+    eps: float,
+    page_size: int,  # must be a power of 2
+) -> None:
+    """Pure-PyTorch reference for fused K-norm + RoPE + FlashMLA paged cache
+    store. Fixed FlashMLA cache layout (head_dim=512, rope_dim=64,
+    nope_dim=448): value slot (576 bytes) = [0..447] FP8 E4M3 nope (7 warps x
+    64 elems) + [448..575] BF16 rope (64 elems); scale slot (8 bytes) =
+    [0..6] UE8M0 exponent per nope warp + [7] padding. Vectorized (no
+    per-token Python loop), stays on the input device.
+    """
+    fp8_max = 448.0
+    head_dim, rope_dim = 512, 64
+    nope_dim = head_dim - rope_dim  # 448
+    nope_warps = 7  # 64 elems each
+    epw = nope_dim // nope_warps  # 64
+    value_bytes = 576
+
+    assert kv.shape[-1] == head_dim, f"head_dim must be {head_dim}"
+    assert freqs_cis.shape[-1] == rope_dim, f"rope_dim must be {rope_dim}"
+    assert (page_size & (page_size - 1)) == 0, "page_size must be a power of 2"
+
+    B = kv.shape[0]
+    if B == 0:
+        return
+
+    device = kv.device
+    page_bits = int(math.log2(page_size))
+    page_bytes = kvcache.shape[1]
+
+    def cast_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
+        bits = x.float().clamp(min=1e-38).view(torch.int32)
+        exp = (bits >> 23) & 0xFF
+        round_up = (bits & 0x7FFFFF) != 0
+        return exp + round_up.to(torch.int32)
+
+    def inv_scale_ue8m0(ue8m0: torch.Tensor) -> torch.Tensor:
+        inv_exp = (254 - ue8m0).clamp(min=0)
+        inv_bits = (inv_exp << 23).to(torch.int32)
+        inv_f = inv_bits.view(torch.float32)
+        return torch.where(ue8m0 >= 254, torch.zeros_like(inv_f), inv_f)
+
+    # Step 1: block-wide RMSNorm with kv_weight.
+    x = kv.float()
+    rms = x.pow(2).mean(dim=-1, keepdim=True)
+    norm_factor = torch.rsqrt(rms + eps)
+    x = x * norm_factor * kv_weight.float().unsqueeze(0)
+
+    # Step 2: RoPE on the last rope_dim=64 elements.
+    freq = freqs_cis[positions.long()]
+    freq_re = freq[:, 0::2]
+    freq_im = freq[:, 1::2]
+
+    x_nope = x[:, :nope_dim]
+    x_rope = x[:, nope_dim:]
+    xr = x_rope[:, 0::2]
+    xi = x_rope[:, 1::2]
+
+    rotated_re = xr * freq_re - xi * freq_im
+    rotated_im = xr * freq_im + xi * freq_re
+    rope_out = torch.stack([rotated_re, rotated_im], dim=-1).flatten(-2)
+
+    # Step 3: per-warp FP8 E4M3 quantization of the nope region.
+    x_warps = x_nope.reshape(B, nope_warps, epw)
+    abs_max = x_warps.abs().amax(dim=-1)
+    scale_raw = abs_max.clamp(min=1e-4) / fp8_max
+    ue8m0 = cast_to_ue8m0(scale_raw)
+    inv_scale = inv_scale_ue8m0(ue8m0)
+    fp8_nope = (
+        (x_warps * inv_scale.unsqueeze(-1))
+        .clamp(-fp8_max, fp8_max)
+        .to(torch.float8_e4m3fn)
+    )
+
+    # Step 4: flat byte addresses for all scatter writes.
+    valid = out_loc >= 0
+    if not valid.any():
+        return
+
+    pages = out_loc[valid].long() >> page_bits
+    offsets = out_loc[valid].long() & (page_size - 1)
+
+    value_base = pages * page_bytes + offsets * value_bytes
+    scale_base = pages * page_bytes + page_size * value_bytes + offsets * 8
+
+    flat_cache = kvcache.view(-1)
+
+    # Step 5a: scatter FP8 nope bytes.
+    fp8_bytes = fp8_nope[valid].reshape(-1, nope_dim).view(torch.uint8)
+    nope_cols = torch.arange(nope_dim, device=device)
+    nope_idx = value_base.unsqueeze(1) + nope_cols.unsqueeze(0)
+    flat_cache.index_put_((nope_idx.reshape(-1),), fp8_bytes.reshape(-1))
+
+    # Step 5b: scatter BF16 rope bytes.
+    rope_bf16 = rope_out[valid].to(torch.bfloat16)
+    rope_bytes = rope_bf16.view(torch.uint8)
+    rope_cols = torch.arange(128, device=device)
+    rope_idx = (value_base + nope_dim).unsqueeze(1) + rope_cols.unsqueeze(0)
+    flat_cache.index_put_((rope_idx.reshape(-1),), rope_bytes.reshape(-1))
+
+    # Step 5c: scatter UE8M0 scale bytes.
+    ue8m0_bytes = ue8m0[valid].to(torch.uint8)
+    scale_cols = torch.arange(nope_warps, device=device)
+    scale_idx = scale_base.unsqueeze(1) + scale_cols.unsqueeze(0)
+    flat_cache.index_put_((scale_idx.reshape(-1),), ue8m0_bytes.reshape(-1))
+
+
+@pytest.mark.parametrize("batch_size", [1, 7, 32, 128])
+@pytest.mark.parametrize("page_size", [16, 256])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_fused_k_norm_rope_flashmla(batch_size, page_size, dtype):
+    """Test fused K norm + RoPE + FlashMLA paged cache store kernel against reference."""
+    torch.random.manual_seed(42)
+    max_pos = 512
+    head_dim = 512
+    rope_dim = 64
+    eps = 1e-6
+
+    kv = torch.randn(batch_size, head_dim, dtype=dtype, device=device)
+    kv_weight = torch.randn(head_dim, dtype=dtype, device=device)
+    freqs_cis = torch.randn(
+        max_pos, rope_dim // 2, dtype=torch.complex64, device=device
+    )
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    positions = torch.randint(
+        0, max_pos, (batch_size,), dtype=torch.int32, device=device
+    )
+
+    out_loc = torch.randperm(batch_size, dtype=torch.int32, device=device)
+    if batch_size > 2:
+        out_loc[0] = -1
+
+    npages = (batch_size + page_size - 1) // page_size + 2
+    k_page_bytes = page_size * 584
+    kvcache_test = torch.zeros((npages, k_page_bytes), dtype=torch.uint8, device=device)
+    kvcache_ref = torch.zeros_like(kvcache_test)
+
+    sgl_kernel.fused_k_norm_rope_flashmla(
+        kv, kv_weight, freqs_real, positions, out_loc, kvcache_test, eps, page_size
+    )
+
+    fused_k_norm_rope_flashmla_reference(
+        kv, kv_weight, freqs_real, positions, out_loc, kvcache_ref, eps, page_size
+    )
+
+    # Note on tolerances for uint8 quantized byte comparisons:
+    # kvcache stores FP8 quantized bytes and UE8M0 scale bytes.
+    # Minor floating-point rounding differences between XPU C++ kernel and
+    # PyTorch reference near quantization boundary thresholds can produce
+    # 1-LSB uint8 integer offsets (e.g., 62 vs 63, delta = 1.0).
+    torch.testing.assert_close(
+        kvcache_test.float(),
+        kvcache_ref.float(),
+        rtol=1e-2,
+        atol=1.0,
+    )
+
+
+@pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
+def test_fused_k_norm_rope_flashmla_position_dtype(position_dtype):
+    """Test position tensor dtypes int32 and int64 for fused_k_norm_rope_flashmla."""
+    torch.random.manual_seed(42)
+    batch_size = 16
+    page_size = 128
+    max_pos = 512
+    head_dim = 512
+    rope_dim = 64
+    eps = 1e-6
+    dtype = torch.bfloat16
+
+    kv = torch.randn(batch_size, head_dim, dtype=dtype, device=device)
+    kv_weight = torch.randn(head_dim, dtype=dtype, device=device)
+    freqs_cis = torch.randn(
+        max_pos, rope_dim // 2, dtype=torch.complex64, device=device
+    )
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    positions = torch.randint(
+        0, max_pos, (batch_size,), dtype=position_dtype, device=device
+    )
+
+    out_loc = torch.randperm(batch_size, dtype=torch.int32, device=device)
+
+    npages = (batch_size + page_size - 1) // page_size + 2
+    k_page_bytes = page_size * 584
+    kvcache_test = torch.zeros((npages, k_page_bytes), dtype=torch.uint8, device=device)
+    kvcache_ref = torch.zeros_like(kvcache_test)
+
+    sgl_kernel.fused_k_norm_rope_flashmla(
+        kv, kv_weight, freqs_real, positions, out_loc, kvcache_test, eps, page_size
+    )
+
+    fused_k_norm_rope_flashmla_reference(
+        kv, kv_weight, freqs_real, positions, out_loc, kvcache_ref, eps, page_size
+    )
+
+    # Note on tolerances for uint8 quantized byte comparisons:
+    # kvcache stores FP8 quantized bytes and UE8M0 scale bytes.
+    # Minor floating-point rounding differences between XPU C++ kernel and
+    # PyTorch reference near quantization boundary thresholds can produce
+    # 1-LSB uint8 integer offsets (e.g., 62 vs 63, delta = 1.0).
+    torch.testing.assert_close(
+        kvcache_test.float(),
+        kvcache_ref.float(),
+        rtol=1e-2,
+        atol=1.0,
+    )
+
+
+def test_fused_k_norm_rope_flashmla_zero_batch():
+    """Empty batch for fused_k_norm_rope_flashmla should not crash."""
+    kv = torch.empty(0, 512, dtype=torch.bfloat16, device=device)
+    kv_weight = torch.randn(512, dtype=torch.bfloat16, device=device)
+    freqs_cis = torch.randn(512, 32, dtype=torch.complex64, device=device)
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    positions = torch.empty(0, dtype=torch.int32, device=device)
+    out_loc = torch.empty(0, dtype=torch.int32, device=device)
+    kvcache = torch.zeros((10, 584 * 16), dtype=torch.uint8, device=device)
+
+    sgl_kernel.fused_k_norm_rope_flashmla(
+        kv, kv_weight, freqs_real, positions, out_loc, kvcache, 1e-6, 16
     )
 
 

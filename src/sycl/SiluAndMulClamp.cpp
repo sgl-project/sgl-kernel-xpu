@@ -32,6 +32,7 @@
 #include "MemoryAccess.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 static constexpr float LOG2E = 1.442695040888963f;  // log2(e) for exp2 conversion
 
@@ -166,7 +167,7 @@ static void silu_and_mul_clamp_sycl(sycl::queue& q, at::Tensor& input, at::Tenso
 #undef VEC_LAUNCH_CLAMP
 }
 
-void silu_and_mul_clamp(torch::Tensor& output, torch::Tensor& input, double swiglu_limit) {
+SGL_KERNEL_EXPORT void silu_and_mul_clamp(torch::Tensor& output, torch::Tensor& input, double swiglu_limit) {
   CHECK_INPUT(input)
   CHECK_INPUT(output)
   TORCH_CHECK(output.dtype() == input.dtype(), "silu_and_mul_clamp: dtype mismatch");

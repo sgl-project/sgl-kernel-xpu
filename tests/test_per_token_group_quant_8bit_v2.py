@@ -839,5 +839,68 @@ def test_per_token_group_quant_with_column_major(
         raise
 
 
+@pytest.mark.parametrize(
+    "num_tokens, hidden_dim, group_size",
+    [
+        (128, 1024, 128),
+        (64, 512, 128),
+        (32, 512, 64),
+        (5, 2048, 128),
+        (256, 2048, 128),
+    ],
+)
+def test_plain_row_major_ue8m0_v2(num_tokens, hidden_dim, group_size):
+    """Plain row-major UE8M0 scale output for the v2 kernel.
+
+    scale_ue8m0=True with a plain, contiguous [tokens, hidden/group] uint8
+    scale tensor (row-major, non column-major, no fuse_silu_and_mul, no
+    masked layout). The kernel writes one float8_e8m0fnu byte (exponent + 127)
+    per block, the layout consumed directly by torch._scaled_mm BlockWise1x32,
+    instead of the column-major uint32-packed layout used by the fused path.
+    """
+    device = torch.device("xpu")
+    torch.manual_seed(0)
+    x = torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.bfloat16)
+
+    num_groups = hidden_dim // group_size
+    fp8_max_ = torch.finfo(fp8_dtype).max
+    eps = 1e-10
+
+    # row-major uint8 scale -> stride(-2) > stride(-1): non column-major path
+    x_s = torch.empty((num_tokens, num_groups), device=device, dtype=torch.uint8)
+    x_q = torch.empty((num_tokens, hidden_dim), device=device, dtype=fp8_dtype)
+
+    torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit_v2.default(
+        x,
+        x_q,
+        x_s,
+        group_size,
+        eps,
+        -fp8_max_,
+        fp8_max_,
+        True,  # scale_ue8m0
+        False,  # fuse_silu_and_mul
+        None,  # masked_m
+    )
+
+    assert x_s.shape == (num_tokens, num_groups)
+    assert x_s.dtype == torch.uint8
+
+    # Reference UE8M0 byte: exp = ceil(log2(max(amax / 448, 1e-10))); byte = exp + 127
+    xv = x.cpu().view(num_tokens, num_groups, group_size).float()
+    amax = xv.abs().amax(dim=2).clamp(min=eps)
+    exp_s = torch.ceil(torch.log2((amax / fp8_max_).clamp(min=1e-10)))
+    byte_ref = (exp_s.to(torch.int32) + 127).to(torch.uint8)
+    torch.testing.assert_close(x_s.cpu(), byte_ref, rtol=0, atol=0)
+
+    # Dequant round-trip sanity.
+    scale = torch.pow(2.0, (x_s.cpu().to(torch.int32) - 127).float())
+    x_dq = (
+        x_q.cpu().view(num_tokens, num_groups, group_size).float() * scale.unsqueeze(2)
+    ).view(num_tokens, hidden_dim)
+    cos = F.cosine_similarity(x_dq.flatten(), x.cpu().float().flatten(), dim=0).item()
+    assert cos >= 0.99, f"dequant cosine too low: {cos}"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

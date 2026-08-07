@@ -12,8 +12,6 @@ _MAX_N = 1 << _MAX_LOG_N
 
 
 def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    if not x.is_xpu:
-        raise RuntimeError("hadamard_transform only supports XPU tensors")
     if x.dtype not in _SUPPORTED_XPU_DTYPES:
         raise RuntimeError(
             f"hadamard_transform only supports dtypes {_SUPPORTED_XPU_DTYPES}, got {x.dtype}"

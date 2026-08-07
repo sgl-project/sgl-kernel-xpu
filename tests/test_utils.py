@@ -19,10 +19,17 @@ MAX_INFRA_RETRIES = int(os.environ.get("SGL_KERNEL_INFRA_RETRIES", "1"))
 # Wait for the GPU engine reset / L0 teardown to settle before retrying.
 _XPU_RECOVER_WAIT = float(os.environ.get("SGL_KERNEL_XPU_RECOVER_WAIT", "20"))
 
+# Longer wait after a hard timeout: a hung kernel leaves the L0 context and
+# engine in a worse state than a plain segfault, so give the driver more time
+# to tear it down before the retry starts allocating again.
+_XPU_TIMEOUT_RECOVER_WAIT = float(
+    os.environ.get("SGL_KERNEL_XPU_TIMEOUT_RECOVER_WAIT", "60")
+)
 
-def _recover_xpu() -> None:
+
+def _recover_xpu(wait: float = _XPU_RECOVER_WAIT) -> None:
     """Wait for the XPU to reset; log health via xpu-smi if available."""
-    time.sleep(_XPU_RECOVER_WAIT)
+    time.sleep(wait)
     try:
         subprocess.run(
             ["xpu-smi", "health", "-d", "0"],
@@ -112,6 +119,8 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
             return process.returncode
 
         # Negative return code = killed by signal (GPU fault); retry.
+        # TimeoutError = watchdog fired (likely XPU wedge); retry after a
+        # longer recovery wait.
         # Positive return code = real test failure; do not retry.
         crashed = False
         for attempt in range(MAX_INFRA_RETRIES + 1):
@@ -126,6 +135,16 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
                     f"\nTimeout after {timeout_per_file} seconds when running {filename}\n",
                     flush=True,
                 )
+                if attempt < MAX_INFRA_RETRIES:
+                    print(
+                        f"\n{filename} hit timeout (likely an XPU wedge). "
+                        f"Waiting {_XPU_TIMEOUT_RECOVER_WAIT:.0f}s for device "
+                        f"recovery, then retrying "
+                        f"(attempt {attempt + 1}/{MAX_INFRA_RETRIES}).\n",
+                        flush=True,
+                    )
+                    _recover_xpu(wait=_XPU_TIMEOUT_RECOVER_WAIT)
+                    continue
                 crashed = True
                 break
 

@@ -10,6 +10,7 @@
 #include "Compress.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 namespace at::native::xpu {
 
@@ -395,7 +396,7 @@ struct CompressPrefillStage1Kernel {
 }  // namespace CompressPlanImpl
 
 // XPU wrapper for plan_compress_decode
-torch::Tensor plan_compress_decode(
+SGL_KERNEL_EXPORT torch::Tensor plan_compress_decode(
     torch::Tensor req_pool_indices,
     torch::Tensor req_to_token,
     torch::Tensor full_to_state,
@@ -451,7 +452,7 @@ torch::Tensor plan_compress_decode(
   return output;
 }
 
-std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill(
+SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill(
     torch::Tensor req_pool_indices,
     torch::Tensor req_to_token,
     torch::Tensor full_to_state,

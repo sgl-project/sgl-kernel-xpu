@@ -21,6 +21,7 @@ limitations under the License.
 #include <torch/library.h>
 #include <torch/torch.h>
 
+#include <optional>
 #include <sycl/sycl.hpp>
 #include <tuple>
 #include <vector>
@@ -40,6 +41,12 @@ limitations under the License.
   }
 
 using fptr_t = int64_t;
+
+// The kernels below are defined in the per-kernel SYCL shared libraries and
+// called from common_ops (torch_extension_sycl.cc). The SYCL libraries are
+// built with -fvisibility=hidden, so their public entry points must be given
+// default visibility to remain exported and dynamically linkable.
+#pragma GCC visibility push(default)
 
 /*
  * From csrc/allreduce
@@ -115,6 +122,17 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
+void fused_q_norm_rope(
+    torch::Tensor& q_input, torch::Tensor& q_output, torch::Tensor& freqs_cis, torch::Tensor& positions, double eps);
+void fused_k_norm_rope_flashmla(
+    torch::Tensor& kv,
+    torch::Tensor& kv_weight,
+    torch::Tensor& freqs_cis,
+    torch::Tensor& positions,
+    torch::Tensor& out_loc,
+    torch::Tensor& kvcache,
+    double eps,
+    int64_t page_size);
 void fused_inplace_qknorm_rope(
     torch::Tensor& q,
     torch::Tensor& k,
@@ -369,6 +387,171 @@ void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor pos_ids,
     bool interleave,
     int64_t sycl_stream);
+
+/*
+ * Inkling short convolution family.
+ */
+at::Tensor inkling_sconv_forward(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& sconv_cache,
+    const at::Tensor& cache_mask,
+    const at::Tensor& safe_idx,
+    const at::Tensor& cu,
+    const at::Tensor& si,
+    bool silu_activation,
+    bool use_residual,
+    bool is_decode);
+void inkling_update_sconv_cache(
+    const at::Tensor& x,
+    at::Tensor& sconv_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& has_initial_state,
+    const at::Tensor& query_start_loc);
+at::Tensor inkling_fused_decode_update_sconv(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    at::Tensor& sconv_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& cache_mask,
+    bool silu_activation,
+    bool use_residual,
+    const std::optional<at::Tensor>& track_mask,
+    const std::optional<at::Tensor>& track_indices);
+void inkling_gather_scatter_sconv_cache(
+    const at::Tensor& hidden_states,
+    at::Tensor& sconv_cache,
+    const at::Tensor& track_conv_indices,
+    const at::Tensor& mask,
+    const at::Tensor& dst_indices);
+void inkling_draft_extend_sconv_cache(
+    const at::Tensor& hidden_states,
+    at::Tensor& sconv_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& num_accepted_tokens,
+    int64_t draft_token_num,
+    bool do_tracking,
+    const std::optional<at::Tensor>& crossed,
+    const std::optional<at::Tensor>& track_step,
+    const std::optional<at::Tensor>& mamba_track_indices);
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> inkling_fused_decode_sconv_metadata(
+    int64_t B,
+    const at::Tensor& cache_indices,
+    const std::optional<at::Tensor>& query_start_loc_out,
+    const std::optional<at::Tensor>& has_initial_state_out,
+    const std::optional<at::Tensor>& cache_mask_out,
+    const std::optional<at::Tensor>& safe_idx_out,
+    const std::optional<at::Tensor>& cu_out,
+    const std::optional<at::Tensor>& si_out);
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> inkling_fused_extend_sconv_metadata(
+    int64_t B,
+    int64_t T,
+    const at::Tensor& cache_indices,
+    int64_t his_mode,
+    const std::optional<at::Tensor>& extend_seq_lens,
+    const std::optional<at::Tensor>& his_src,
+    int64_t draft_token_num,
+    const std::optional<at::Tensor>& query_start_loc_out,
+    const std::optional<at::Tensor>& has_initial_state_out,
+    const std::optional<at::Tensor>& cache_mask_out,
+    const std::optional<at::Tensor>& safe_idx_out,
+    const std::optional<at::Tensor>& cu_out,
+    const std::optional<at::Tensor>& si_out);
+at::Tensor inkling_track_conv_indices(
+    const at::Tensor& query_start_loc,
+    const at::Tensor& mamba_track_seqlens,
+    const at::Tensor& extend_prefix_lens,
+    int64_t width_minus_one,
+    int64_t chunk_size,
+    int64_t total_tokens);
+void inkling_save_intermediate_conv_windows(
+    const at::Tensor& sconv_cache,
+    const at::Tensor& hidden_states,
+    const at::Tensor& cache_indices,
+    at::Tensor& intermediate_out,
+    int64_t batch_size,
+    int64_t draft_token_num);
+/*
+ * Inkling fused attention prologue family.
+ */
+std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_verify(
+    const at::Tensor& qkvr,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& cache_mask,
+    const at::Tensor& k_weight,
+    const at::Tensor& v_weight,
+    at::Tensor& k_inter,
+    at::Tensor& v_inter,
+    const at::Tensor& q_gamma,
+    const at::Tensor& k_gamma,
+    double eps,
+    const at::Tensor& loc,
+    at::Tensor& k_buf,
+    at::Tensor& v_buf,
+    int64_t q_off,
+    int64_t k_off,
+    int64_t v_off,
+    int64_t dq,
+    int64_t dkv,
+    int64_t draft_token_num,
+    bool silu_activation,
+    bool use_residual,
+    bool do_store);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_decode(
+    const at::Tensor& qkvr,
+    at::Tensor& k_cache,
+    at::Tensor& v_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& cache_mask,
+    const at::Tensor& k_weight,
+    const at::Tensor& v_weight,
+    const std::optional<at::Tensor>& track_mask,
+    const std::optional<at::Tensor>& track_indices,
+    const at::Tensor& q_gamma,
+    const at::Tensor& k_gamma,
+    double eps,
+    const at::Tensor& loc,
+    at::Tensor& k_buf,
+    at::Tensor& v_buf,
+    int64_t q_off,
+    int64_t k_off,
+    int64_t v_off,
+    int64_t dq,
+    int64_t dkv,
+    bool silu_activation,
+    bool use_residual,
+    bool do_store);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_extend(
+    const at::Tensor& qkvr,
+    at::Tensor& k_cache,
+    at::Tensor& v_cache,
+    const at::Tensor& cache_indices,
+    const at::Tensor& cache_mask,
+    const at::Tensor& has_initial_state,
+    const at::Tensor& cu,
+    const at::Tensor& si,
+    const at::Tensor& k_weight,
+    const at::Tensor& v_weight,
+    const std::optional<at::Tensor>& track_rows,
+    const std::optional<at::Tensor>& track_mask,
+    const std::optional<at::Tensor>& track_dst,
+    const at::Tensor& q_gamma,
+    const at::Tensor& k_gamma,
+    double eps,
+    const at::Tensor& loc,
+    at::Tensor& k_buf,
+    at::Tensor& v_buf,
+    int64_t q_off,
+    int64_t k_off,
+    int64_t v_off,
+    int64_t dq,
+    int64_t dkv,
+    bool silu_activation,
+    bool use_residual,
+    bool do_store,
+    bool do_cache_update);
 
 /*
  * From csrc/gemm
@@ -768,7 +951,7 @@ void topk_transform_512_v2_interface(
     std::optional<at::Tensor> out_raw_indices_opt);
 
 /*
- * Compress plan kernels
+ * Compress plan and execution kernels
  */
 namespace at::native::xpu {
 
@@ -795,6 +978,17 @@ torch::Tensor plan_compress_decode(
     int64_t ring_size);
 
 void flash_compress128_decode(
+    torch::Tensor kv_buffer, torch::Tensor kv_input, torch::Tensor kv_output, torch::Tensor ape, torch::Tensor plan_d);
+
+void flash_compress128_prefill(
+    torch::Tensor kv_buffer,
+    torch::Tensor kv_input,
+    torch::Tensor kv_output,
+    torch::Tensor ape,
+    torch::Tensor plan_c,
+    torch::Tensor plan_w);
+
+void flash_compress4_decode(
     torch::Tensor kv_buffer, torch::Tensor kv_input, torch::Tensor kv_output, torch::Tensor ape, torch::Tensor plan_d);
 
 }  // namespace at::native::xpu
@@ -929,6 +1123,18 @@ void sgemm_lora_a_fwd(
     const std::optional<torch::Tensor>& seg_lens  // [num_segments,]
 );
 
+void sgemm_lora_b_fwd(
+    torch::Tensor& output,                           // [num_tokens, output_dim]
+    const torch::Tensor& input_x,                    // [num_tokens, max_rank]
+    const torch::Tensor& weights,                    // [num_loras, output_dim, max_rank]
+    const torch::Tensor& seg_indptr,                 // [num_segments + 1,]
+    const torch::Tensor& weight_indices,             // [num_segments,]
+    const torch::Tensor& lora_ranks,                 // [num_loras,]
+    const torch::Tensor& scalings,                   // [num_loras,]
+    const std::optional<torch::Tensor>& seg_lens,    // [num_segments,]
+    const std::optional<torch::Tensor>& base_output  // [num_tokens, output_dim]
+);
+
 /*
  * From GDN (Gated DeltaNet) attention (Intel Xe2)
  */
@@ -961,7 +1167,23 @@ void gdn_attention(
     const std::optional<torch::Tensor>& num_accepted_tokens,
     const int64_t num_actual_tokens,
     const int64_t tp_size,
-    const bool reorder_input);
+    const bool reorder_input,
+    // Optional pre-allocated scratch buffer: a single flat torch::kUInt8 tensor.
+    const std::optional<torch::Tensor>& workspace);
+
+// Exact number of bytes `gdn_attention` will carve out of its `workspace`
+// argument for a call with the given shapes/dtype.
+int64_t gdn_attention_workspace_bytes_needed(
+    const int64_t num_prefills,
+    const int64_t num_decodes,
+    const int64_t non_spec_token,
+    const int64_t batch_size,
+    const int64_t num_k_heads,
+    const int64_t num_v_heads,
+    const int64_t head_k_dim,
+    const int64_t head_v_dim,
+    const int64_t tp_size,
+    const torch::ScalarType dtype);
 
 /*
  * Mamba causal conv1d (XPU)
@@ -986,3 +1208,5 @@ void causal_conv1d_update(
     const std::optional<at::Tensor>& cache_seqlens_,
     const std::optional<at::Tensor>& conv_state_indices_,
     int64_t pad_slot_id);
+
+#pragma GCC visibility pop

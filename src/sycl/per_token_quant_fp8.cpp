@@ -45,6 +45,7 @@
 #include "MemoryAccess.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 // TODO: Remove CUTLASS emulation and use native SYCL FP8 when available.
 using cutlass::float_e4m3_t;
@@ -197,7 +198,7 @@ class PerTokenQuantFP8BlockKernel {
   }
 };
 
-void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s) {
+SGL_KERNEL_EXPORT void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
   CHECK_INPUT(output_s);

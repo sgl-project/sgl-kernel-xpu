@@ -132,7 +132,8 @@ void w4a16_launch(
 
 }  // namespace moe_w4a16
 
-template void moe_w4a16::w4a16_launch<moe_w4a16::@POLICY@, @ELEMENT_S@, @ELEMENT_A@>(
+template __attribute__((visibility("default")))
+void moe_w4a16::w4a16_launch<moe_w4a16::@POLICY@, @ELEMENT_S@, @ELEMENT_A@>(
     sycl::queue,
     const void*,
     const void*,

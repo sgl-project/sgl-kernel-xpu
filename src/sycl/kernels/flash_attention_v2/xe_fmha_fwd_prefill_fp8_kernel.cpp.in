@@ -16,7 +16,7 @@
 namespace prefill {
 
 template <>
-void FmhaPrefillFp8Runner<@HEAD_DIM@>::operator()(const Arguments& params) const {
+__attribute__((visibility("default"))) void FmhaPrefillFp8Runner<@HEAD_DIM@>::operator()(const Arguments& params) const {
   using TileShapeQK = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_KV@>, cute::_32>;
   using TileShapePV = cute::Shape<cute::Int<@TILED_Q@>, cute::_32, cute::Int<@TILED_KV@>>;
   using TileShapeOutput = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_OUT@>>;

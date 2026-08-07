@@ -13,6 +13,7 @@
 #include "MemoryAccess.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 #define DPCPP_CONSTANT __attribute__((opencl_constant))
 
@@ -136,7 +137,7 @@ void silu_and_mul_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out) {
   return;
 }
 
-void silu_and_mul(at::Tensor& out, at::Tensor& input) {
+SGL_KERNEL_EXPORT void silu_and_mul(at::Tensor& out, at::Tensor& input) {
   input = input.contiguous();
   out = out.contiguous();
 
@@ -177,7 +178,7 @@ void gelu_tanh_and_mul_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out) 
   return;
 }
 
-void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input) {
+SGL_KERNEL_EXPORT void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input) {
   input = input.contiguous();
   out = out.contiguous();
 
@@ -218,7 +219,7 @@ void gelu_and_mul_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out) {
   return;
 }
 
-void gelu_and_mul(at::Tensor& out, at::Tensor& input) {
+SGL_KERNEL_EXPORT void gelu_and_mul(at::Tensor& out, at::Tensor& input) {
   input = input.contiguous();
   out = out.contiguous();
 

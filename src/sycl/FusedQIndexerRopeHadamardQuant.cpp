@@ -6,6 +6,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 using cutlass::float_e4m3_t;
 
@@ -196,7 +197,7 @@ void launch_fused_q_indexer_rope_hadamard_quant(
 
 }  // namespace
 
-void fused_q_indexer_rope_hadamard_quant(
+SGL_KERNEL_EXPORT void fused_q_indexer_rope_hadamard_quant(
     const at::Tensor& q_input,
     at::Tensor& q_fp8,
     const at::Tensor& weight,

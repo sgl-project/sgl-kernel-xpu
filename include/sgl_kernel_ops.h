@@ -974,6 +974,29 @@ void flash_compress128_prefill(
 void flash_compress4_decode(
     torch::Tensor kv_buffer, torch::Tensor kv_input, torch::Tensor kv_output, torch::Tensor ape, torch::Tensor plan_d);
 
+void flash_compress4_prefill(
+    torch::Tensor kv_buffer,
+    torch::Tensor kv_input,
+    torch::Tensor kv_output,
+    torch::Tensor ape,
+    torch::Tensor plan_c,
+    torch::Tensor plan_w);
+
+void fused_norm_rope_store(
+    torch::Tensor input,
+    torch::Tensor plan,
+    torch::Tensor norm_weight,
+    double norm_eps,
+    torch::Tensor freq_cis,
+    torch::Tensor out_loc,
+    torch::Tensor kvcache,
+    bool is_decode,
+    int64_t compress_ratio,
+    int64_t page_size,
+    bool use_fp4,
+    int64_t preshuffle_size,
+    bool use_bf16_store);
+
 }  // namespace at::native::xpu
 
 namespace flash {

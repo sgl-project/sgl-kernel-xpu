@@ -4,6 +4,7 @@
 
 #include <limits>
 #include <sycl/sycl.hpp>
+#include <type_traits>
 
 #include "Compress.h"
 #include "Utils.h"
@@ -11,13 +12,44 @@
 
 namespace at::native::xpu {
 
-constexpr int64_t kTileDim = 64;
+constexpr int64_t kTileElements = 4;
+constexpr uint32_t kWarpThreads = 16;
+constexpr int64_t kTileDim = kTileElements * static_cast<int64_t>(kWarpThreads);  // 64
 constexpr int64_t kTokenGroups = 8;
 constexpr int64_t kTokensPerGroup = 128 / kTokenGroups;                          // 16
 constexpr uint32_t kBlockSize = static_cast<uint32_t>(kTileDim * kTokenGroups);  // 512
-constexpr uint32_t kWriteBlockSize = 64;
+constexpr uint32_t kWriteBlockSize = 128;
+constexpr uint32_t kWarpsPerWriteBlock = kWriteBlockSize / kWarpThreads;  // 8
 
 namespace FlashCompress128Impl {
+
+template <typename buffer_t, typename input_t>
+inline void c128_write_token_strided(
+    buffer_t* kv_dst,
+    const input_t* kv_src,
+    const int64_t split_offset,
+    const uint32_t lane_id,
+    const int64_t row_stride) {
+  const int64_t lane_base = split_offset + static_cast<int64_t>(lane_id) * kTileElements;
+
+  if constexpr (std::is_same_v<buffer_t, input_t> && sizeof(input_t) == 2) {
+    // Fast path: copy 4 contiguous elements (8 bytes) per row via two 32-bit moves.
+    const uint32_t* src32_row0 = reinterpret_cast<const uint32_t*>(kv_src + lane_base);
+    const uint32_t* src32_row1 = reinterpret_cast<const uint32_t*>(kv_src + row_stride + lane_base);
+    uint32_t* dst32_row0 = reinterpret_cast<uint32_t*>(kv_dst + lane_base);
+    uint32_t* dst32_row1 = reinterpret_cast<uint32_t*>(kv_dst + row_stride + lane_base);
+    dst32_row0[0] = src32_row0[0];
+    dst32_row0[1] = src32_row0[1];
+    dst32_row1[0] = src32_row1[0];
+    dst32_row1[1] = src32_row1[1];
+  } else {
+    // Mixed dtype fallback: preserve conversion semantics.
+    for (int64_t x = 0; x < kTileElements; ++x) {
+      kv_dst[lane_base + x] = static_cast<buffer_t>(kv_src[lane_base + x]);
+      kv_dst[row_stride + lane_base + x] = static_cast<buffer_t>(kv_src[row_stride + lane_base + x]);
+    }
+  }
+}
 
 // Load + online softmax + weighted reduction shared by decode and prefill compress.
 // For decode, pass buffer_len=128 so all tokens load from kv_page.
@@ -112,17 +144,19 @@ struct FlashCompress128DecodeKernel {
     const int64_t h_lane = static_cast<int64_t>(lid % static_cast<uint32_t>(kTileDim));
     const int64_t tg = static_cast<int64_t>(lid / static_cast<uint32_t>(kTileDim));
     const int64_t h = split_offset + h_lane;
+    const uint32_t sg_id = lid / kWarpThreads;
+    const uint32_t lane_id = lid % kWarpThreads;
 
-    // Only tg=0 writes: all tg groups share the same h columns, avoid duplicate stores.
-    if (tg == 0 && h < head_dim_) {
+    // only the first subgroup performs decode writeback.
+    constexpr uint32_t kWriteSubGroupId = 0;
+    if (sg_id == kWriteSubGroupId) {
       buffer_t* kv_dst = kv_buffer_ + static_cast<int64_t>(plan.write_loc) * elem_size_;
       const input_t* kv_src = kv_input_ + static_cast<int64_t>(bid) * elem_size_;
-      kv_dst[h] = static_cast<buffer_t>(kv_src[h]);
-      kv_dst[head_dim_ + h] = static_cast<buffer_t>(kv_src[head_dim_ + h]);
+      c128_write_token_strided<buffer_t, input_t>(kv_dst, kv_src, split_offset, lane_id, head_dim_);
     }
 
-    // Compress only when a 128-token chunk is completed.
-    if (plan.seq_len % 128 != 0) {
+    // Compress only when write location reaches page tail.
+    if (plan.write_loc % 128 != 127) {
       return;
     }
 
@@ -220,8 +254,11 @@ struct FlashCompress128PrefillWriteKernel {
   void operator()(sycl::nd_item<1> item) const {
     const uint32_t gid = static_cast<uint32_t>(item.get_group(0));
     const uint32_t lid = static_cast<uint32_t>(item.get_local_id(0));
-    const uint32_t pid = gid / num_split_;
-    const int64_t split_offset = static_cast<int64_t>(gid % num_split_) * kTileDim;
+    const uint32_t global_tid = gid * kWriteBlockSize + lid;
+    const uint32_t global_wid = global_tid / kWarpThreads;
+    const uint32_t pid = global_wid / num_split_;
+    // Contiguous flatten split: split [head_dim * 2] into num_split tiles of size (kTileDim * 2).
+    const int64_t split_offset = static_cast<int64_t>(global_wid % num_split_) * (kTileDim * 2);
 
     if (pid >= num_write_) {
       return;
@@ -232,18 +269,16 @@ struct FlashCompress128PrefillWriteKernel {
       return;
     }
 
-    const int64_t h = split_offset + static_cast<int64_t>(lid);
     buffer_t* kv_dst = kv_buffer_ + static_cast<int64_t>(plan.write_loc) * elem_size_;
     const input_t* kv_src = kv_input_ + static_cast<int64_t>(plan.ragged_id) * elem_size_;
-    kv_dst[h] = static_cast<buffer_t>(kv_src[h]);
-    kv_dst[head_dim_ + h] = static_cast<buffer_t>(kv_src[head_dim_ + h]);
+    const uint32_t lane_id = lid % kWarpThreads;
+    c128_write_token_strided<buffer_t, input_t>(kv_dst, kv_src, split_offset, lane_id, kTileDim);
   }
 
   buffer_t* kv_buffer_;
   const input_t* kv_input_;
   const WritePlan* plan_w_;
   uint32_t num_write_;
-  int64_t head_dim_;
   int64_t elem_size_;
   uint32_t num_split_;
 };
@@ -343,6 +378,7 @@ SGL_KERNEL_EXPORT void flash_compress128_prefill(
   TORCH_CHECK(kv_input.dtype() == kv_output.dtype(), "kv_input and kv_output must have the same dtype");
   TORCH_CHECK(kv_input.dtype() == ape.dtype(), "kv_input and ape must have same dtype");
 
+  const int64_t num_q_tokens = kv_input.size(0);
   const int64_t elem_size = kv_input.size(1);
   const int64_t head_dim = kv_output.size(1);
   const int64_t num_compress = kv_output.size(0);
@@ -357,6 +393,7 @@ SGL_KERNEL_EXPORT void flash_compress128_prefill(
       plan_c.size(0) == num_compress && plan_c.size(1) == static_cast<int64_t>(sizeof(CompressPlan)),
       "plan_c shape must be [C, 16]");
   TORCH_CHECK(plan_w.size(1) == static_cast<int64_t>(sizeof(WritePlan)), "plan_w shape must be [W, 8]");
+  TORCH_CHECK(num_q_tokens >= num_write, "invalid prefill plan: num_q < num_w");
 
   if (num_compress == 0 && num_write == 0) {
     return;
@@ -399,10 +436,11 @@ SGL_KERNEL_EXPORT void flash_compress128_prefill(
               kv_input.data_ptr<input_t>(),
               reinterpret_cast<const WritePlan*>(plan_w.data_ptr<uint8_t>()),
               static_cast<uint32_t>(num_write),
-              head_dim,
               elem_size,
               num_split};
-          const uint32_t global_size = static_cast<uint32_t>(num_write) * num_split * kWriteBlockSize;
+          const uint32_t total_warps = static_cast<uint32_t>(num_write) * num_split;
+          const uint32_t num_w_blocks = (total_warps + kWarpsPerWriteBlock - 1) / kWarpsPerWriteBlock;
+          const uint32_t global_size = num_w_blocks * kWriteBlockSize;
           cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kWriteBlockSize)), kernel);
         });
       }

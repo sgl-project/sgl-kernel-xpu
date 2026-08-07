@@ -43,6 +43,7 @@
 #include "sycl/Utils.h"
 #include "sycl/comm/common.h"
 #include "sycl/kernels/flash_attention_v2/collective/fmha_fusion.hpp"
+#include "sycl/kernels/flash_attention_v2/kernel/xe_fmha_append_kv.hpp"
 #include "sycl/kernels/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp"
 #include "sycl/kernels/flash_attention_v2/kernel/xe_tile_scheduler.hpp"
 
@@ -192,6 +193,38 @@ using LayoutQ = cutlass::layout::RowMajor;
 using LayoutK = cutlass::layout::ColumnMajor;
 using LayoutV = cutlass::layout::RowMajor;
 using LayoutO = cutlass::layout::RowMajor;
+
+constexpr int kAppendKVPrepassMinTokens = 64;
+
+inline bool use_append_kv_prepass(const Arguments& params) {
+  return params.total_kvnew >= kAppendKVPrepassMinTokens &&
+         params.k_new_ptr != nullptr && params.v_new_ptr != nullptr &&
+         params.kv_cache_seqlens != nullptr && !params.is_e4m3 && !params.is_e5m2;
+}
+
+template <class ElementK, class ElementV>
+void launch_append_kv_prepass(const Arguments& params) {
+  using AppendKernel = cutlass::fmha::kernel::XeFMHAAppendKVKernel<ElementK, ElementV>;
+  typename AppendKernel::Arguments args{};
+  args.ptr_K_cache = static_cast<ElementK*>(params.k_ptr);
+  args.ptr_V_cache = static_cast<ElementV*>(params.v_ptr);
+  args.ptr_K_new = static_cast<ElementK const*>(params.k_new_ptr);
+  args.ptr_V_new = static_cast<ElementV const*>(params.v_new_ptr);
+  args.ptr_cu_seqlens_k_new = params.cu_seqlens_kvnew;
+  args.seq_len_kv_new = params.seqlen_kvnew;
+  args.ptr_cache_seqlens = params.kv_cache_seqlens;
+  args.ptr_page_table = params.page_table;
+  args.page_size = params.page_size;
+  args.max_num_pages_per_seq = params.max_num_pages_per_seq;
+  args.batch = params.b;
+  args.num_heads_kv = params.h_k;
+  args.head_size_qk = params.d;
+  args.head_size_vo = params.dv;
+  args.max_seq_len_kv_new = params.seqlen_kvnew;
+  args.skip_batch_mask = static_cast<const bool*>(params.skip_batch_mask_ptr);
+  TORCH_CHECK(AppendKernel::can_implement(args), "AppendKV pre-pass cannot implement these arguments");
+  launch<AppendKernel>(AppendKernel::to_underlying_arguments(args, nullptr));
+}
 
 template <class FMHAPrefillKernel, bool isVarLen = false>
 struct PrefillRunner {
@@ -500,6 +533,18 @@ struct FMHAConfig {
     bool const has_append = params.total_kvnew > 0 && params.k_new_ptr != nullptr && params.v_new_ptr != nullptr &&
                             params.kv_cache_seqlens != nullptr;
     if (has_append) {
+      if (use_append_kv_prepass(params)) {
+        launch_append_kv_prepass<ElementK, ElementV>(params);
+        // Re-enter the existing no-append dispatch rather than instantiating a
+        // second copy of every attention tile for this runtime-only decision.
+        Arguments cached_kv_params = params;
+        cached_kv_params.k_new_ptr = nullptr;
+        cached_kv_params.v_new_ptr = nullptr;
+        cached_kv_params.cu_seqlens_kvnew = nullptr;
+        cached_kv_params.kv_cache_seqlens = nullptr;
+        cached_kv_params.total_kvnew = 0;
+        return run_paged(cached_kv_params);
+      }
       return run<true, true, true, AppendMode, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
     }
     return run<

@@ -98,6 +98,29 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
   }
 #endif
 
+#if @HEAD_DIM@ == 256 && @HD256_PAGED_LARGE_TILE@
+  if (params.seqlen_q >= @HD256_PAGED_LARGE_TILE_MIN_Q@ &&
+      (params.total_kvnew == 0 || use_append_kv_prepass(params)) &&
+      params.d == 256 && params.dv == 256) {
+    using LargeTileShapeQK =
+        cute::Shape<cute::Int<@HD256_PAGED_LARGE_TILE_Q@>, cute::Int<@HD256_PAGED_LARGE_TILE_KV@>, cute::_32>;
+    using LargeTileShapePV =
+        cute::Shape<cute::Int<@HD256_PAGED_LARGE_TILE_Q@>, cute::_32, cute::Int<@HD256_PAGED_LARGE_TILE_KV@>>;
+    using LargeTileShapeOutput = cute::Shape<cute::Int<@HD256_PAGED_LARGE_TILE_Q@>, cute::Int<256>>;
+    using LargeSubgroupLayoutQK = cute::Layout<
+        cute::Shape<cute::Int<@HD256_PAGED_LARGE_NUM_SG@>, cute::_1, cute::_1>,
+        cute::Stride<cute::_1, cute::_1, cute::_1>>;
+    TORCH_CHECK(!use_sink, "sink is only supported for head_size == 64, got @HEAD_DIM@");
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+        FMHAConfig<Causal, LocalMask, false, LargeTileShapeQK, LargeTileShapePV, LargeTileShapeOutput,
+                   LargeSubgroupLayoutQK>::run_paged(params);
+      });
+    });
+    return;
+  }
+#endif
+
 #if @HEAD_DIM@ == 64
   if (params.seqlen_q <= 256 &&
       static_cast<int64_t>(params.total_q) * 100 <= static_cast<int64_t>(params.b) * params.seqlen_q * 15 &&

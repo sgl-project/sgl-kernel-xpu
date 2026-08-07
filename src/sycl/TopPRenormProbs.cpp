@@ -41,8 +41,6 @@ struct TopPRenormProbsRadixCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr uint32_t kNumHistCopies = kWgSize / kSubGroupSize;
   static constexpr uint32_t kHistElems = kNumHistCopies * kRadix;
 
-  using vec_io = vec_t<float, kVecSize>;
-
   const float* probs;
   float* renorm_probs;
   const float* maybe_top_p_arr;
@@ -93,7 +91,7 @@ struct TopPRenormProbsRadixCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
       float thread_sum = 0.0f;
 #pragma unroll 2
       for (uint32_t i = tid; i < num_vec_elems; i += kWgSize) {
-        vec_io v;
+        sycl::vec<float, kVecSize> v;
         load_vec(v, row_offset, i);
 #pragma unroll
         for (uint32_t j = 0; j < kVecSize; ++j) {
@@ -181,9 +179,9 @@ struct TopPRenormProbsRadixCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
     write_scaled(tid, row_offset, vocab_u32, num_vec_elems, vec_tail_start, pivot, normalizer);
   }
 
-  inline void load_vec(vec_io& v, size_t row_offset, uint32_t i) const {
-    v.load(
-        0, sycl::multi_ptr<const float, sycl::access::address_space::global_space>(probs + row_offset + i * kVecSize));
+  inline void load_vec(sycl::vec<float, kVecSize>& v, size_t row_offset, uint32_t i) const {
+    const sycl::vec<float, kVecSize>* q = (const sycl::vec<float, kVecSize>*)(&(probs[row_offset + i * kVecSize]));
+    v = *q;
   }
 
   template <bool kBallot>
@@ -201,7 +199,7 @@ struct TopPRenormProbsRadixCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
     const uint32_t vec_iters = div_up(num_vec_elems, kWgSize);
     for (uint32_t it = 0; it < vec_iters; ++it) {
       const uint32_t i = it * kWgSize + tid;
-      vec_io v(0.0f);
+      sycl::vec<float, kVecSize> v(0.0f);
       if (i < num_vec_elems) load_vec(v, row_offset, i);
 #pragma unroll
       for (uint32_t j = 0; j < kVecSize; ++j) {
@@ -267,17 +265,16 @@ struct TopPRenormProbsRadixCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
       float normalizer) const {
 #pragma unroll 2
     for (uint32_t i = tid; i < num_vec_elems; i += kWgSize) {
-      vec_io v;
+      sycl::vec<float, kVecSize> v;
       load_vec(v, row_offset, i);
-      vec_io out;
+      sycl::vec<float, kVecSize> out;
 #pragma unroll
       for (uint32_t j = 0; j < kVecSize; ++j) {
         const float val = v[j];
         out[j] = (val >= pivot) ? val * normalizer : 0.0f;
       }
-      out.store(
-          0,
-          sycl::multi_ptr<float, sycl::access::address_space::global_space>(renorm_probs + row_offset + i * kVecSize));
+      sycl::vec<float, kVecSize>* r = (sycl::vec<float, kVecSize>*)(&(renorm_probs[row_offset + i * kVecSize]));
+      *r = out;
     }
     for (uint32_t col = vec_tail_start + tid; col < vocab_u32; col += kWgSize) {
       const float val = probs[row_offset + col];

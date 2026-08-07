@@ -7,6 +7,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 namespace at::native::xpu {
 
@@ -226,7 +227,7 @@ inline void hadamard_dispatch(
 
 }  // anonymous namespace
 
-void hadamard_transform(at::Tensor& output, const at::Tensor& input, double scale) {
+SGL_KERNEL_EXPORT void hadamard_transform(at::Tensor& output, const at::Tensor& input, double scale) {
   CHECK_INPUT(output);
   CHECK_INPUT(input);
   TORCH_CHECK(input.is_xpu(), "hadamard_transform: input must be an XPU tensor");

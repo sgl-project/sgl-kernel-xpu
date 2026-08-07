@@ -119,6 +119,9 @@ inline void dispatchFusedQKNormRopeHeadDim(int64_t head_dim, const char* kernel_
     case 64:
       fn(std::integral_constant<int64_t, 64>{});
       break;
+    case 96:
+      fn(std::integral_constant<int64_t, 96>{});
+      break;
     case 128:
       fn(std::integral_constant<int64_t, 128>{});
       break;

@@ -32,6 +32,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("silu_and_mul_clamp(Tensor! out, Tensor input, float swiglu_limit) -> ()");
   m.impl("silu_and_mul_clamp", torch::kXPU, &silu_and_mul_clamp);
 
+  m.def(
+      "indexed_scale_shift_bf16_(Tensor! x, Tensor shift, Tensor scale, Tensor indices) -> ()");
+  m.impl("indexed_scale_shift_bf16_", torch::kXPU, &indexed_scale_shift_bf16_);
+
+  m.def(
+      "indexed_gate_bf16_(Tensor! x, Tensor gate, Tensor other, Tensor indices) -> ()");
+  m.impl("indexed_gate_bf16_", torch::kXPU, &indexed_gate_bf16_);
+
   m.def("gelu_tanh_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("gelu_tanh_and_mul", torch::kXPU, &gelu_tanh_and_mul);
 

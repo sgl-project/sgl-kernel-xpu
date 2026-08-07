@@ -42,6 +42,8 @@ from sgl_kernel.elementwise import (
     gelu_tanh_and_mul,
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
+    indexed_gate_bf16_,
+    indexed_scale_shift_bf16_,
     multimodal_rotary_embedding,
     rmsnorm,
     silu_and_mul,

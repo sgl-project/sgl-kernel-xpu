@@ -374,6 +374,8 @@ void transfer_kv_all_layer_mla_lf_pf(
     int64_t num_layers,
     int64_t block_quota,
     int64_t sgs_per_wg);
+void indexed_scale_shift_bf16_(torch::Tensor& x, torch::Tensor& shift, torch::Tensor& scale, torch::Tensor& indices);
+void indexed_gate_bf16_(torch::Tensor& x, torch::Tensor& gate, torch::Tensor& other, torch::Tensor& indices);
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void silu_and_mul_clamp(torch::Tensor& out, torch::Tensor& input, double swiglu_limit);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);

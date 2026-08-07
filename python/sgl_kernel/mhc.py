@@ -3,6 +3,57 @@ from typing import Optional
 import torch
 
 
+def fused_hc_head(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_eps: float = 1e-6,
+    hc_eps: float = 1e-6,
+) -> torch.Tensor:
+    if x.ndim != 3:
+        raise ValueError(
+            f"x must be [T, hc_mult, hidden_size] (3 dimensions), got shape={tuple(x.shape)}"
+        )
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(f"x must be bf16/fp16, got {x.dtype}")
+
+    hc_mult = x.shape[1]
+    hidden_size = x.shape[2]
+    if hc_mult != 4:
+        raise ValueError(
+            "fused_hc_head currently supports only hc_mult=4 "
+            f"(kernel is specialized/unrolled for this value), got hc_mult={hc_mult}"
+        )
+
+    hc_fn_c = hc_fn.to(device=x.device, dtype=torch.float32).contiguous()
+    hc_scale_c = hc_scale.to(device=x.device, dtype=torch.float32).contiguous()
+    hc_base_c = hc_base.to(device=x.device, dtype=torch.float32).contiguous()
+    x_c = x.contiguous()
+
+    expected_fn_shape = (hc_mult, hc_mult * hidden_size)
+    if tuple(hc_fn_c.shape) != expected_fn_shape:
+        raise ValueError(
+            "hc_fn shape mismatch for fused_hc_head: "
+            f"expected {expected_fn_shape}, got {tuple(hc_fn_c.shape)}"
+        )
+    if hc_scale_c.numel() != 1:
+        raise ValueError(f"hc_scale must have one element, got {hc_scale_c.numel()}")
+    if hc_base_c.numel() != hc_mult:
+        raise ValueError(
+            f"hc_base must have hc_mult={hc_mult} elements, got {hc_base_c.numel()}"
+        )
+
+    return torch.ops.sgl_kernel.fused_hc_head.default(
+        x_c,
+        hc_fn_c,
+        hc_scale_c,
+        hc_base_c,
+        float(norm_eps),
+        float(hc_eps),
+    )
+
+
 def hc_split_sinkhorn(
     mixes: torch.Tensor,
     hc_scale: torch.Tensor,

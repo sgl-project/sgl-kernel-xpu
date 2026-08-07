@@ -794,6 +794,14 @@ void hc_split_sinkhorn(
     int64_t sinkhorn_iters,
     double eps);
 
+at::Tensor fused_hc_head(
+    const at::Tensor& x,
+    const at::Tensor& hc_fn,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    double norm_eps,
+    double hc_eps);
+
 void hc_pre_big_fuse(
     const at::Tensor& gemm_out_mul,
     const at::Tensor& gemm_out_sqrsum,

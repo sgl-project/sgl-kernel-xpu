@@ -275,8 +275,7 @@ template <
     typename weight_t,
     int vec_size,
     int ITERS,
-    template <typename, typename, typename>
-    class Norm,
+    typename Norm,
     bool cache_inputs,
     typename mean_t = float,
     typename index_t = uint32_t>
@@ -301,10 +300,10 @@ struct NormKernelFunctor {
         item_id, cfg, x_group_offset, y_group_offset, rstd, reg);
   }
 
-  NormKernelFunctor(Norm<scalar_t, weight_t, mean_t> norm_, NormConfig cfg_) : norm(norm_), cfg(cfg_) {}
+  NormKernelFunctor(Norm norm_, NormConfig cfg_) : norm(norm_), cfg(cfg_) {}
 
  private:
-  Norm<scalar_t, weight_t, mean_t> norm;
+  Norm norm;
   const NormConfig cfg;
 };
 

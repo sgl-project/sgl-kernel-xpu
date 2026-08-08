@@ -35,6 +35,8 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <cute/tensor.hpp>
 #include <random>
 
@@ -194,6 +196,8 @@ using LayoutO = cutlass::layout::RowMajor;
 
 template <class FMHAPrefillKernel, bool isVarLen = false>
 struct PrefillRunner {
+  static constexpr int DefaultScoreWorkspaceCapMiB = 1024;
+
   using StrideQ = typename FMHAPrefillKernel::StrideQ;
   using StrideK = typename FMHAPrefillKernel::StrideK;
   using StrideV = typename FMHAPrefillKernel::StrideV;
@@ -290,6 +294,32 @@ struct PrefillRunner {
     return shape;
   }
 
+  // Rebase one kernel launch onto [batch_lo, batch_lo + batch_len). Paged
+  // prefill uses absolute offsets in its cumulative-length arrays, so the data
+  // pointers stay unchanged while the per-batch metadata advances.
+  template <class Kernel>
+  typename Kernel::Arguments slice_arguments(typename Kernel::Arguments args, int batch_lo, int batch_len) const {
+    args.kernel.shape.batch = batch_len;
+    if constexpr (isVarLen) {
+      if (args.kernel.shape.seq_len_qo.cumulative_length != nullptr) {
+        args.kernel.shape.seq_len_qo.cumulative_length += batch_lo;
+      }
+      if (args.kernel.shape.seq_len_kv.cumulative_length != nullptr) {
+        args.kernel.shape.seq_len_kv.cumulative_length += batch_lo;
+      }
+      if (args.kernel.shape.seq_len_kv_cache.cumulative_length != nullptr) {
+        args.kernel.shape.seq_len_kv_cache.cumulative_length += batch_lo;
+      }
+    }
+    if (args.mainloop.ptr_page_table != nullptr) {
+      args.mainloop.ptr_page_table += size_t(batch_lo) * size_t(args.mainloop.max_num_pages_per_seq);
+    }
+    if (args.kernel.skip_batch_mask != nullptr) {
+      args.kernel.skip_batch_mask += batch_lo;
+    }
+    return args;
+  }
+
   cutlass::Status run(const Arguments& params, const cutlass::KernelHardwareInfo& hw_info) {
     ProblemShapeType shape = initialize(params);
 
@@ -324,22 +354,65 @@ struct PrefillRunner {
         {},
         hw_info};
 
-    // Define device-global scratch memory
-    size_t workspace_size = FMHAPrefillKernel::get_workspace_size(arguments);
+    const int batch_total = params.b;
+    int batch_slice = batch_total;
+    if constexpr (CollectiveMainloop::ScoreBlock2D) {
+      static const int cap_mb = [] {
+        if (const char* env = std::getenv("FMHA_SCORE_WS_CAP_MB")) {
+          return std::atoi(env);
+        }
+        return DefaultScoreWorkspaceCapMiB;
+      }();
+      if (cap_mb > 0 && batch_total > 1) {
+        const size_t cap_bytes = size_t(cap_mb) << 20;
+        auto one_batch = slice_arguments<FMHAPrefillKernel>(arguments, 0, 1);
+        const size_t per_batch = FMHAPrefillKernel::get_workspace_size(one_batch);
+        if (per_batch > 0 && per_batch * size_t(batch_total) > cap_bytes) {
+          batch_slice = int(cute::max(size_t(1), cap_bytes / per_batch));
+        }
+      }
+    }
+    const int num_slices = cute::ceil_div(batch_total, batch_slice);
+
+    // Every slice reuses the same device-global score buffer.
+    auto workspace_shape = num_slices > 1 ? slice_arguments<FMHAPrefillKernel>(arguments, 0, batch_slice) : arguments;
+    size_t workspace_size = FMHAPrefillKernel::get_workspace_size(workspace_shape);
+    if constexpr (CollectiveMainloop::ScoreBlock2D) {
+      if (std::getenv("FMHA_SCORE_WS_VERBOSE") != nullptr) {
+        std::fprintf(
+            stderr,
+            "[fmha] score workspace: batch=%d slice=%d slices=%d bytes=%zu (%.1f MiB)\n",
+            batch_total,
+            batch_slice,
+            num_slices,
+            workspace_size,
+            double(workspace_size) / (1024.0 * 1024.0));
+      }
+    }
     auto workspace = torch::empty(workspace_size, params.tensor_opts);
+    void* workspace_ptr = workspace.data_ptr();
 
     if (!FMHAPrefillKernel::can_implement(arguments)) {
       return cutlass::Status::kErrorInvalidProblem;
     }
 
     // Initialize the workspace
-    FMHAPrefillKernel::initialize_workspace(arguments, workspace.data_ptr());
-
-    // Convert host-side arguments to device-side arguments to be passed to the kernel
-    auto kernel_params = FMHAPrefillKernel::to_underlying_arguments(arguments, workspace.data_ptr());
+    FMHAPrefillKernel::initialize_workspace(arguments, workspace_ptr);
 
     // Run
-    launch<FMHAPrefillKernel>(kernel_params);
+    if constexpr (CollectiveMainloop::ScoreBlock2D) {
+      using ScoreStoreKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<0>;
+      using ScoreLoadKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<1>;
+
+      for (int batch_lo = 0; batch_lo < batch_total; batch_lo += batch_slice) {
+        const int batch_len = cute::min(batch_slice, batch_total - batch_lo);
+        auto slice = slice_arguments<FMHAPrefillKernel>(arguments, batch_lo, batch_len);
+        launch<ScoreStoreKernel>(ScoreStoreKernel::to_underlying_arguments(slice, workspace_ptr));
+        launch<ScoreLoadKernel>(ScoreLoadKernel::to_underlying_arguments(slice, workspace_ptr));
+      }
+    } else {
+      launch<FMHAPrefillKernel>(FMHAPrefillKernel::to_underlying_arguments(arguments, workspace_ptr));
+    }
     return cutlass::Status::kSuccess;
   }
 };

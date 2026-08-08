@@ -43,6 +43,53 @@
 #define FMHA_PREFILL_ENABLE_SCORE_BLOCK2D 0
 #endif
 
+#ifndef FMHA_PREFILL_ZIGZAG_D
+#define FMHA_PREFILL_ZIGZAG_D 1
+#endif
+
+#ifndef FMHA_PREFILL_INIT_PF_DEPTH
+#define FMHA_PREFILL_INIT_PF_DEPTH 8
+#endif
+
+#ifndef FMHA_PREFILL_PF_ZIGZAG
+#define FMHA_PREFILL_PF_ZIGZAG 1
+#endif
+
+#ifndef FMHA_PREFILL_NO_SPLIT_BARRIER
+#define FMHA_PREFILL_NO_SPLIT_BARRIER 2
+#endif
+
+#ifndef FMHA_PREFILL_D_SKEW
+#define FMHA_PREFILL_D_SKEW 1
+#endif
+
+#ifndef FMHA_PREFILL_V_PF_NEXT
+#define FMHA_PREFILL_V_PF_NEXT 2
+#endif
+
+#ifndef FMHA_PREFILL_SCORE_PF_AUTO
+#define FMHA_PREFILL_SCORE_PF_AUTO 1
+#endif
+
+#ifndef FMHA_PREFILL_SCORE_PF_AUTO_KB_LO
+#define FMHA_PREFILL_SCORE_PF_AUTO_KB_LO 29
+#endif
+
+#ifndef FMHA_PREFILL_SCORE_PF_AUTO_KB_HI
+#define FMHA_PREFILL_SCORE_PF_AUTO_KB_HI 44
+#endif
+
+#ifndef FMHA_PREFILL_SCORE_PF_AUTO_Q_MIN
+#define FMHA_PREFILL_SCORE_PF_AUTO_Q_MIN 2048
+#endif
+
+// Cap, in MiB, on the ScoreBlock2D score workspace. Above the cap the runner
+// slices the batch and reuses one slice-sized buffer across the launch pairs.
+// 0 disables slicing. FMHA_SCORE_WS_CAP_MB overrides this at runtime.
+#ifndef FMHA_PREFILL_SCORE_WS_CAP_MB
+#define FMHA_PREFILL_SCORE_WS_CAP_MB 1024
+#endif
+
 namespace cutlass::fmha {
 
 template <int Stages>
@@ -187,6 +234,7 @@ struct FMHAFwdMainloop<
   using FragSRow = decltype(reduce<1>(FragS{}, sycl::plus<void>{}));
   using FragSCol = decltype(reduce<0>(FragS{}, sycl::plus<void>{}));
   using ElementS = typename TiledMMAQK::ValTypeD;
+  using ElementScoreStore = half_t;
 
   using SingleFragA = FragC<TiledMMAPV>;                       // (atom val,q',v')
   using FragA = expand_sg_fragment_t<SingleFragA, 1, VTiles>;  // (atom val,q',v',VV)
@@ -199,6 +247,13 @@ struct FMHAFwdMainloop<
   static constexpr bool LocalMask = LocalMask_;
   static constexpr bool PackGQA = PackGQA_;
   static constexpr bool ScoreBlock2D = FMHA_PREFILL_ENABLE_SCORE_BLOCK2D;
+  static constexpr bool ZigzagD = ScoreBlock2D && FMHA_PREFILL_ZIGZAG_D;
+  static constexpr int DSkew = ScoreBlock2D ? FMHA_PREFILL_D_SKEW : 0;
+  static constexpr bool PfZigzag = ScoreBlock2D && FMHA_PREFILL_PF_ZIGZAG;
+  static constexpr int InitPfDepth = ScoreBlock2D ? FMHA_PREFILL_INIT_PF_DEPTH : 0;
+  static constexpr int NoSplitBarrierMode = FMHA_PREFILL_NO_SPLIT_BARRIER;
+  static constexpr int VPfNextMode = FMHA_PREFILL_V_PF_NEXT;
+  static constexpr bool ScorePfAuto = ScoreBlock2D && FMHA_PREFILL_SCORE_PF_AUTO;
 
   // FP8 KV cache: enabled when the K element type is an 8-bit float. The fp8
   // K/V are dequantized (cast to ElementQ and multiplied by the per-tensor
@@ -213,7 +268,9 @@ struct FMHAFwdMainloop<
     int max_num_pages_per_seq = 0;
     int window_size_left = -1;
     int window_size_right = -1;
-    ElementS* ptr_score = nullptr;
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+    ElementScoreStore* ptr_score = nullptr;
+#endif
   };
 
   // Kernel-facing parameters
@@ -240,7 +297,11 @@ struct FMHAFwdMainloop<
         args.max_num_pages_per_seq,
         args.window_size_left,
         args.window_size_right,
-        ScoreBlock2D ? reinterpret_cast<ElementS*>(workspace) : nullptr};
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+        ScoreBlock2D ? reinterpret_cast<ElementScoreStore*>(workspace) : nullptr};
+#else
+    };
+#endif
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
@@ -282,8 +343,15 @@ struct FMHAFwdMainloop<
       int discard_seq_coord,
       TensorK_cache2D const& K_cache_2D = TensorK_cache2D{},
       TensorV_cache2D const& V_cache_2D = TensorV_cache2D{},
-      float scale_k = 1.0f,  // FP8 K per-tensor dequant scale
-      ElementS* score_head_ptr = nullptr) {
+      float scale_k = 1.0f  // FP8 K per-tensor dequant scale
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+      ,
+      ElementScoreStore* score_head_ptr = nullptr,
+      int score_region_cols = 0,
+      int score_blk_in_region = 0,
+      bool score_pf_q_ok = false
+#endif
+  ) {
     using namespace sycl::ext::oneapi::this_work_item;
 
     // Short dimension names:
@@ -305,8 +373,10 @@ struct FMHAFwdMainloop<
     Tensor cV_cache = make_identity_tensor(V_cache_2D.shape());   // (v,k)
     Tensor cP = make_identity_tensor(take<0, 2>(TileShapeQK{}));  // (q,k)
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
-    auto score_shape = make_shape(int(size<0>(Q_2D)), seq_len_kv_cache);
-    auto score_layout = make_layout(score_shape, make_stride(seq_len_kv_cache, Int<1>{}));
+    const int score_rows = int(get<0>(TileShapeQK{}));
+    const int score_cols = score_region_cols > 0 ? score_region_cols : seq_len_kv_cache;
+    auto score_shape = make_shape(score_rows, score_cols);
+    auto score_layout = make_layout(score_shape, make_stride(score_cols, Int<1>{}));
     Tensor Score = make_tensor(make_gmem_ptr(score_head_ptr), score_layout);
     Tensor cScore = make_identity_tensor(score_shape);  // (q,k)
 #endif
@@ -321,7 +391,7 @@ struct FMHAFwdMainloop<
     Tensor gV_cache = local_tile(cV_cache, tile_shape_v, make_coord(get<1>(blk_qv), _));                  // (v,k,K)
     Tensor gV_cache_split = local_tile(gV_cache, TileShapePV{}, make_coord(_, _, 0), Step<X, _1, _1>{});  // (v,k,VV,K)
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
-    Tensor gScore = local_tile(cScore, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), _));  // (q,k,K)
+    Tensor gScore = local_tile(cScore, take<0, 2>(TileShapeQK{}), make_coord(score_blk_in_region, _));  // (q,k,K)
 #endif
 
     /* Create global -> register copies */
@@ -337,6 +407,7 @@ struct FMHAFwdMainloop<
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
     auto copy_score_store = make_block_2d_copy_D(mma_qk, Score);
     auto copy_score_load = make_block_2d_copy_C(mma_qk, Score);
+    auto prefetch_score = make_block_2d_prefetch(copy_score_load);
 #endif
 
     /* Slice TiledCopy/TiledMMA operations down to to work-item level */
@@ -373,6 +444,7 @@ struct FMHAFwdMainloop<
     auto tScoreStoreG = thr_copy_score_store.partition_D(gScore);
     auto tScoreLoadG = thr_copy_score_load.partition_S(gScore);
     auto tScoreLoadR = thr_copy_score_load.partition_sg_fragment_D(gScore(_, _, 0));
+    auto pScoreG = prefetch_score.get_slice(thr_id).partition_S(gScore);
 #endif
 
     auto tVrV = thr_copy_v.partition_sg_fragment_D(gV_split(_, _, 0, 0));
@@ -397,19 +469,38 @@ struct FMHAFwdMainloop<
     // ------
 
     /* Initialization steps for first block: Q/K prefetch, O init */
-    /* TODO: limit D prefetch for large head size, and reorder K prefetches */
     int kblocks_cache = ceil_div(seq_len_kv_cache, get<1>(TileShapeQK{}));
+    const int k_end = cute::min(blk_k1, kblocks_cache);
     int page_idx = blk_k0;
     int next_page_idx = blk_k0;
     if constexpr (PagedKV) {
       next_page_idx = get_physical_k_tile(blk_k0, l_coord, seq_len_kv_cache);
     }
     if constexpr (!(ScoreBlock2D && StaticScoreMode == 1)) {
-      for (int D = 0; D < size<3>(pQgQ); D++) {
+      const int nQpf = InitPfDepth > 0 ? cute::min(int(size<3>(pQgQ)), InitPfDepth) : int(size<3>(pQgQ));
+      const int nKpf = InitPfDepth > 0 ? cute::min(int(size<4>(pKgK)), InitPfDepth) : int(size<4>(pKgK));
+      const int sg = int(thr_id / intel::sg_size);
+      for (int Di = 0; Di < nQpf; Di++) {
+        int D = Di;
+        if constexpr (DSkew > 0) {
+          D += (sg * DSkew) % nQpf;
+          if (D >= nQpf) {
+            D -= nQpf;
+          }
+        }
         prefetch(prefetch_q, pQgQ(_, _, _, D));
       }
-      for (int D = 0; D < size<4>(pKgK); D++) {
-        prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
+      if (blk_k0 < k_end) {
+        for (int Di = 0; Di < nKpf; Di++) {
+          int D = Di;
+          if constexpr (DSkew > 0) {
+            D += (sg * DSkew) % nKpf;
+            if (D >= nKpf) {
+              D -= nKpf;
+            }
+          }
+          prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
+        }
       }
     }
     // Always initialize the per-WG accumulators: the caller (kernel) may pass
@@ -431,10 +522,24 @@ struct FMHAFwdMainloop<
       qk_scale = params.scale * static_cast<ElementS>(scale_k);
     }
 
+    constexpr bool SkipSplitBarrier =
+        (NoSplitBarrierMode == 1) || (NoSplitBarrierMode == 2 && ScoreBlock2D && StaticScoreMode == 1);
+    constexpr bool VPfNext = (VPfNextMode == 1) || (VPfNextMode == 2 && ScoreBlock2D && StaticScoreMode == 1);
+
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+    int score_pf_dist = 0;
+    if constexpr (ScorePfAuto) {
+      const int kb = kblocks_cache;
+      score_pf_dist =
+          (score_pf_q_ok && kb >= FMHA_PREFILL_SCORE_PF_AUTO_KB_LO && kb < FMHA_PREFILL_SCORE_PF_AUTO_KB_HI) ? 1 : 0;
+    }
+#endif
+
     /* Main loop, blocked in k. */
-    for (int K = blk_k0; K < blk_k1 && K < kblocks_cache; K++) {
-      /* Split barrier to keep threads together */
-      barrier_arrive(ScopeWorkgroup);
+    for (int K = blk_k0; K < k_end; K++) {
+      if constexpr (!ScoreBlock2D && !SkipSplitBarrier) {
+        barrier_arrive(ScopeWorkgroup);
+      }
 
       bool need_causal = false;
       if constexpr (CausalMask) {
@@ -442,21 +547,26 @@ struct FMHAFwdMainloop<
       }
 
       page_idx = next_page_idx;
-      next_page_idx = K + 1;
-      if constexpr (PagedKV) {
-        next_page_idx = get_physical_k_tile(next_page_idx, l_coord, seq_len_kv_cache);
+      if constexpr (!ScoreBlock2D) {
+        next_page_idx = K + 1;
+        if constexpr (PagedKV) {
+          next_page_idx = get_physical_k_tile(next_page_idx, l_coord, seq_len_kv_cache);
+        }
       }
 
-      if constexpr (ScoreBlock2D && StaticScoreMode == 1) {
-#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
-        copy(copy_score_load, tScoreLoadG(_, _, _, K), tScoreLoadR);
-        reorder(tScoreLoadR, tSrS);
-#endif
-      } else {
+      if constexpr (!(ScoreBlock2D && StaticScoreMode == 1)) {
         /* GEMM 1: S = K * Q */
         clear(tSrS);
+        const int d_tiles = size<4>(tKgK);
         CUTLASS_PRAGMA_UNROLL
-        for (int D = 0; D < size<4>(tKgK); D++) {
+        for (int Di = 0; Di < d_tiles; Di++) {
+          int D = (ZigzagD && (K & 1)) ? (d_tiles - 1 - Di) : Di;
+          if constexpr (DSkew > 0) {
+            D += (int(thr_id / intel::sg_size) * DSkew) % d_tiles;
+            if (D >= d_tiles) {
+              D -= d_tiles;
+            }
+          }
           copy(copy_q, tQgQ(_, _, _, D), tQrQ);
           copy(copy_k_cache, tKgK_cache(_, _, _, page_idx, D), tKrK);
           reorder(tQrQ, tSrQ);
@@ -465,10 +575,36 @@ struct FMHAFwdMainloop<
         }
       }
 
+      /* Split barrier to keep threads together */
+      if constexpr (ScoreBlock2D && !SkipSplitBarrier) {
+        barrier_arrive(ScopeWorkgroup);
+      }
+
+      if constexpr (ScoreBlock2D) {
+        next_page_idx = cute::min(K + 1, k_end - 1);
+        if constexpr (PagedKV) {
+          next_page_idx = get_physical_k_tile(next_page_idx, l_coord, seq_len_kv_cache);
+        }
+      }
+
+      if constexpr (ScoreBlock2D && StaticScoreMode == 1) {
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+        if (score_pf_dist > 0) {
+          prefetch(prefetch_score, pScoreG(_, _, _, cute::min(K + score_pf_dist, k_end - 1)));
+        }
+        copy(copy_score_load, tScoreLoadG(_, _, _, K), tScoreLoadR);
+        reorder(tScoreLoadR, tSrS);
+#endif
+      }
+
       /* V prefetch for GEMM 2 */
+      int v_pf_idx = page_idx;
+      if constexpr (VPfNext) {
+        v_pf_idx = next_page_idx;
+      }
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
-        prefetch(prefetch_v_cache, pVgV_cache(_, _, _, VV, page_idx));
+        prefetch(prefetch_v_cache, pVgV_cache(_, _, _, VV, v_pf_idx));
       }
 
       /* Causal masking */
@@ -538,21 +674,15 @@ struct FMHAFwdMainloop<
 
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
       if constexpr (ScoreBlock2D && StaticScoreMode == 0) {
+        // Store raw logits in fp16. Applying qk_scale after the reload keeps the
+        // narrowing error out of the exponent's unscaled input.
         reorder(tSrS, tScoreStoreR);
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < tScoreStoreR.size(); ++i) {
-          tScoreStoreR(i) *= qk_scale;
-        }
         copy(copy_score_store, tScoreStoreR, tScoreStoreG(_, _, _, K));
       }
 #endif
 
       /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
-      ElementS softmax_scale = qk_scale;
-      if constexpr (ScoreBlock2D && StaticScoreMode == 1) {
-        softmax_scale = ElementS(1);
-      }
-      auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, softmax_scale);
+      auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, qk_scale);
       reorder(tSrS, tArP);
 
       /* GEMM 2: A += P * V, split in v dimension. */
@@ -571,12 +701,26 @@ struct FMHAFwdMainloop<
 
       /* K prefetch */
       if constexpr (!(ScoreBlock2D && StaticScoreMode == 1)) {
-        for (int D = 0; D < size<4>(pKgK); D++) {
-          prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
+        if (ScoreBlock2D || K + 1 < k_end) {
+          const int nPf = size<4>(pKgK);
+          const bool rev = PfZigzag && ZigzagD && ((K + 1) & 1);
+          const int pf_skew = (DSkew > 0) ? (int(thr_id / intel::sg_size) * DSkew) % nPf : 0;
+          for (int Di = 0; Di < nPf; Di++) {
+            int D = rev ? (nPf - 1 - Di) : Di;
+            if constexpr (DSkew > 0) {
+              D += pf_skew;
+              if (D >= nPf) {
+                D -= nPf;
+              }
+            }
+            prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
+          }
         }
       }
 
-      barrier_wait(ScopeWorkgroup);
+      if constexpr (!SkipSplitBarrier) {
+        barrier_wait(ScopeWorkgroup);
+      }
     }
   }
 

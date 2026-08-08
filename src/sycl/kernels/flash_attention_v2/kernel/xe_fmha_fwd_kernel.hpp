@@ -233,19 +233,22 @@ class XeFMHAFwdKernel {
     return CollectiveMainloop::can_implement(args.mainloop) && CollectiveEpilogue::can_implement(args.epilogue);
   }
 
-  static int get_workspace_size(Arguments const& args) {
+  static size_t get_workspace_size(Arguments const& args) {
     if constexpr (CollectiveMainloop::ScoreBlock2D) {
-      int score_q_extent;
-      int score_k_extent;
+      size_t score_q_extent;
+      size_t score_k_extent;
       if constexpr (is_var_len) {
-        score_q_extent = int(args.kernel.shape.seq_len_qo.max_length);
-        score_k_extent = int(args.kernel.shape.seq_len_kv_cache.max_length);
+        score_q_extent = size_t(args.kernel.shape.seq_len_qo.max_length);
+        score_k_extent = size_t(args.kernel.shape.seq_len_kv_cache.max_length);
       } else {
-        score_q_extent = int(args.kernel.shape.seq_len_qo);
-        score_k_extent = int(args.kernel.shape.seq_len_kv_cache);
+        score_q_extent = size_t(args.kernel.shape.seq_len_qo);
+        score_k_extent = size_t(args.kernel.shape.seq_len_kv_cache);
       }
-      return int(args.kernel.shape.batch) * int(args.kernel.shape.num_heads_q) * score_q_extent * score_k_extent *
-             int(sizeof(typename CollectiveMainloop::ElementS));
+      const size_t score_rows_per_wg = size_t(get<0>(TileShapeQK{}));
+      const size_t q_tiles = cute::ceil_div(score_q_extent, score_rows_per_wg);
+      score_k_extent = cute::round_up(score_k_extent, size_t(get<1>(TileShapeQK{})));
+      return size_t(args.kernel.shape.batch) * size_t(args.kernel.shape.num_heads_q) * q_tiles * score_rows_per_wg *
+             score_k_extent * sizeof(typename CollectiveMainloop::ElementScoreStore);
     }
     return 0;
   }
@@ -442,7 +445,10 @@ class XeFMHAFwdKernel {
       // With PackGQA the Q/O head dimension is indexed by the KV head; otherwise
       // by the (un-grouped) query head.
       int q_head_idx = PackGQA_ ? head : head_q;
-      typename CollectiveMainloop::ElementS* score_head_ptr = nullptr;
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+      typename CollectiveMainloop::ElementScoreStore* score_head_ptr = nullptr;
+      int score_region_cols = 0;
+      bool score_pf_q_ok = false;
       if constexpr (CollectiveMainloop::ScoreBlock2D) {
         int score_q_extent;
         int score_k_extent;
@@ -456,9 +462,14 @@ class XeFMHAFwdKernel {
           score_k_extent = int(s.seq_len_kv_cache);
           score_batch = l_coord;
         }
-        score_head_ptr =
-            params.mainloop.ptr_score + (score_batch * s.num_heads_q + q_head_idx) * score_q_extent * score_k_extent;
+        score_k_extent = cute::round_up(score_k_extent, int(get<1>(TileShapeQK{})));
+        score_region_cols = score_k_extent;
+        score_pf_q_ok = score_q_extent >= FMHA_PREFILL_SCORE_PF_AUTO_Q_MIN;
+        const int q_tiles = cute::ceil_div(score_q_extent, int(get<0>(TileShapeQK{})));
+        const size_t wg_slot = (size_t(score_batch) * s.num_heads_q + q_head_idx) * q_tiles + size_t(blk_q);
+        score_head_ptr = params.mainloop.ptr_score + wg_slot * size_t(get<0>(TileShapeQK{})) * size_t(score_k_extent);
       }
+#endif
       // FP8 KV: the per-tensor dequant scale baked into KernelArguments is
       // passed as a float function argument (scale_k) to the mainloop GEMM1.
       // It defaults to 1.0f for non-fp8 KV; the fp8 dequant scalar is read
@@ -469,6 +480,7 @@ class XeFMHAFwdKernel {
         scale_k = *p.scale_k_ptr;
       }
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
       mainloop.template operator()<StaticScoreMode_>(
           Q(_, _, q_head_idx, l_coord),
           K_cache(_, _, head, l_coord),
@@ -490,7 +502,33 @@ class XeFMHAFwdKernel {
           K_cache(_, _, head, l_coord),
           V_cache(_, _, head, l_coord),
           scale_k,
-          score_head_ptr);
+          score_head_ptr,
+          score_region_cols,
+          0,
+          score_pf_q_ok);
+#else
+      mainloop(
+          Q(_, _, q_head_idx, l_coord),
+          K_cache(_, _, head, l_coord),
+          V_cache(_, _, head, l_coord),
+          tArA,
+          tA_max,
+          tA_sum,
+          blk_qv,
+          blk_k0,
+          blk_k1,
+          k_blocks,
+          k_blocks_causal,
+          thr_id,
+          seq_len,
+          seq_len_kv_cache,
+          idx_b,
+          full_tile_offset,
+          discard_seq_coord,
+          K_cache(_, _, head, l_coord),
+          V_cache(_, _, head, l_coord),
+          scale_k);
+#endif
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());

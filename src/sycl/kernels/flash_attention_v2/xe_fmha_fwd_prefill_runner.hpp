@@ -196,6 +196,8 @@ using LayoutO = cutlass::layout::RowMajor;
 
 template <class FMHAPrefillKernel, bool isVarLen = false>
 struct PrefillRunner {
+  static constexpr int DefaultScoreWorkspaceCapMiB = 1024;
+
   using StrideQ = typename FMHAPrefillKernel::StrideQ;
   using StrideK = typename FMHAPrefillKernel::StrideK;
   using StrideV = typename FMHAPrefillKernel::StrideV;
@@ -359,7 +361,7 @@ struct PrefillRunner {
         if (const char* env = std::getenv("FMHA_SCORE_WS_CAP_MB")) {
           return std::atoi(env);
         }
-        return int(FMHA_PREFILL_SCORE_WS_CAP_MB);
+        return DefaultScoreWorkspaceCapMiB;
       }();
       if (cap_mb > 0 && batch_total > 1) {
         const size_t cap_bytes = size_t(cap_mb) << 20;

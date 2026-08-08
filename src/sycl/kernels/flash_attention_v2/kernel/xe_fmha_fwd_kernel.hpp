@@ -464,7 +464,7 @@ class XeFMHAFwdKernel {
         }
         score_k_extent = cute::round_up(score_k_extent, int(get<1>(TileShapeQK{})));
         score_region_cols = score_k_extent;
-        score_pf_q_ok = score_q_extent >= FMHA_PREFILL_SCORE_PF_AUTO_Q_MIN;
+        score_pf_q_ok = score_q_extent >= cutlass::fmha::ScoreBlock2DPolicy::ScorePrefetchQMin;
         const int q_tiles = cute::ceil_div(score_q_extent, int(get<0>(TileShapeQK{})));
         const size_t wg_slot = (size_t(score_batch) * s.num_heads_q + q_head_idx) * q_tiles + size_t(blk_q);
         score_head_ptr = params.mainloop.ptr_score + wg_slot * size_t(get<0>(TileShapeQK{})) * size_t(score_k_extent);

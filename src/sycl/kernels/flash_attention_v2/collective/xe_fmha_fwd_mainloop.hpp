@@ -43,57 +43,19 @@
 #define FMHA_PREFILL_ENABLE_SCORE_BLOCK2D 0
 #endif
 
-#ifndef FMHA_PREFILL_ZIGZAG_D
-#define FMHA_PREFILL_ZIGZAG_D 1
-#endif
-
-#ifndef FMHA_PREFILL_INIT_PF_DEPTH
-#define FMHA_PREFILL_INIT_PF_DEPTH 8
-#endif
-
-#ifndef FMHA_PREFILL_PF_ZIGZAG
-#define FMHA_PREFILL_PF_ZIGZAG 1
-#endif
-
-#ifndef FMHA_PREFILL_NO_SPLIT_BARRIER
-#define FMHA_PREFILL_NO_SPLIT_BARRIER 2
-#endif
-
-#ifndef FMHA_PREFILL_D_SKEW
-#define FMHA_PREFILL_D_SKEW 1
-#endif
-
-#ifndef FMHA_PREFILL_V_PF_NEXT
-#define FMHA_PREFILL_V_PF_NEXT 2
-#endif
-
-#ifndef FMHA_PREFILL_SCORE_PF_AUTO
-#define FMHA_PREFILL_SCORE_PF_AUTO 1
-#endif
-
-#ifndef FMHA_PREFILL_SCORE_PF_AUTO_KB_LO
-#define FMHA_PREFILL_SCORE_PF_AUTO_KB_LO 29
-#endif
-
-#ifndef FMHA_PREFILL_SCORE_PF_AUTO_KB_HI
-#define FMHA_PREFILL_SCORE_PF_AUTO_KB_HI 44
-#endif
-
-#ifndef FMHA_PREFILL_SCORE_PF_AUTO_Q_MIN
-#define FMHA_PREFILL_SCORE_PF_AUTO_Q_MIN 2048
-#endif
-
-// Cap, in MiB, on the ScoreBlock2D score workspace. Above the cap the runner
-// slices the batch and reuses one slice-sized buffer across the launch pairs.
-// 0 disables slicing. FMHA_SCORE_WS_CAP_MB overrides this at runtime.
-#ifndef FMHA_PREFILL_SCORE_WS_CAP_MB
-#define FMHA_PREFILL_SCORE_WS_CAP_MB 1024
-#endif
-
 namespace cutlass::fmha {
 
 template <int Stages>
 class XeDefault {};  // Default FMHA mainloop, P in registers.
+
+struct ScoreBlock2DPolicy {
+  static constexpr bool ZigzagD = true;
+  static constexpr int DSkew = 1;
+  static constexpr int InitialPrefetchDepth = 8;
+  static constexpr int ScorePrefetchKBlockMin = 29;
+  static constexpr int ScorePrefetchKBlockMax = 44;
+  static constexpr int ScorePrefetchQMin = 2048;
+};
 
 };  // namespace cutlass::fmha
 
@@ -247,13 +209,9 @@ struct FMHAFwdMainloop<
   static constexpr bool LocalMask = LocalMask_;
   static constexpr bool PackGQA = PackGQA_;
   static constexpr bool ScoreBlock2D = FMHA_PREFILL_ENABLE_SCORE_BLOCK2D;
-  static constexpr bool ZigzagD = ScoreBlock2D && FMHA_PREFILL_ZIGZAG_D;
-  static constexpr int DSkew = ScoreBlock2D ? FMHA_PREFILL_D_SKEW : 0;
-  static constexpr bool PfZigzag = ScoreBlock2D && FMHA_PREFILL_PF_ZIGZAG;
-  static constexpr int InitPfDepth = ScoreBlock2D ? FMHA_PREFILL_INIT_PF_DEPTH : 0;
-  static constexpr int NoSplitBarrierMode = FMHA_PREFILL_NO_SPLIT_BARRIER;
-  static constexpr int VPfNextMode = FMHA_PREFILL_V_PF_NEXT;
-  static constexpr bool ScorePfAuto = ScoreBlock2D && FMHA_PREFILL_SCORE_PF_AUTO;
+  static constexpr bool ZigzagD = ScoreBlock2D && ScoreBlock2DPolicy::ZigzagD;
+  static constexpr int DSkew = ScoreBlock2D ? ScoreBlock2DPolicy::DSkew : 0;
+  static constexpr int InitPfDepth = ScoreBlock2D ? ScoreBlock2DPolicy::InitialPrefetchDepth : 0;
 
   // FP8 KV cache: enabled when the K element type is an 8-bit float. The fp8
   // K/V are dequantized (cast to ElementQ and multiplied by the per-tensor
@@ -522,16 +480,17 @@ struct FMHAFwdMainloop<
       qk_scale = params.scale * static_cast<ElementS>(scale_k);
     }
 
-    constexpr bool SkipSplitBarrier =
-        (NoSplitBarrierMode == 1) || (NoSplitBarrierMode == 2 && ScoreBlock2D && StaticScoreMode == 1);
-    constexpr bool VPfNext = (VPfNextMode == 1) || (VPfNextMode == 2 && ScoreBlock2D && StaticScoreMode == 1);
+    constexpr bool SkipSplitBarrier = ScoreBlock2D && StaticScoreMode == 1;
+    constexpr bool VPfNext = ScoreBlock2D && StaticScoreMode == 1;
 
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
     int score_pf_dist = 0;
-    if constexpr (ScorePfAuto) {
+    if constexpr (ScoreBlock2D) {
       const int kb = kblocks_cache;
-      score_pf_dist =
-          (score_pf_q_ok && kb >= FMHA_PREFILL_SCORE_PF_AUTO_KB_LO && kb < FMHA_PREFILL_SCORE_PF_AUTO_KB_HI) ? 1 : 0;
+      score_pf_dist = (score_pf_q_ok && kb >= ScoreBlock2DPolicy::ScorePrefetchKBlockMin &&
+                       kb < ScoreBlock2DPolicy::ScorePrefetchKBlockMax)
+                          ? 1
+                          : 0;
     }
 #endif
 
@@ -703,7 +662,7 @@ struct FMHAFwdMainloop<
       if constexpr (!(ScoreBlock2D && StaticScoreMode == 1)) {
         if (ScoreBlock2D || K + 1 < k_end) {
           const int nPf = size<4>(pKgK);
-          const bool rev = PfZigzag && ZigzagD && ((K + 1) & 1);
+          const bool rev = ZigzagD && ((K + 1) & 1);
           const int pf_skew = (DSkew > 0) ? (int(thr_id / intel::sg_size) * DSkew) % nPf : 0;
           for (int Di = 0; Di < nPf; Di++) {
             int D = rev ? (nPf - 1 - Di) : Di;

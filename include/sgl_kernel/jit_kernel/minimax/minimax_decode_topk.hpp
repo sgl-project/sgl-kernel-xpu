@@ -24,14 +24,21 @@
  *                                        elements per thread in registers,
  *                                        with a uint32_t liveness bitmask.
  *
- * Semantics match the CUDA reference bit-for-bit apart from PDL
- * (Programmatic Dependent Launch, Hopper-only) which has no XPU equivalent
- * and is dropped.
+ * Differences from the CUDA reference:
+ *   * PDL (Programmatic Dependent Launch, Hopper-only) has no XPU equivalent
+ *     and is dropped.
+ *   * Tie-breaking among exactly-equal scores is unspecified in the two radix
+ *     regimes: write positions come from an atomic counter, so the order among
+ *     equal keys depends on arrival. The small regime does reproduce CUDA's
+ *     "lower block id wins". The *set* of selected ids is deterministic either
+ *     way; only the order within it (and which of several equal-scoring blocks
+ *     lands in the last slot) can differ.
  */
 
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <sycl/sycl.hpp>
 
 namespace sgl {
@@ -69,10 +76,11 @@ static constexpr int32_t kInvalidBlockId = -1;
 // Shared-memory layouts
 // ============================================================================
 
-// Mirrors ``TopKTrait::Smem`` in the CUDA source. Kept as a POD reinterpret
-// target for the ``local_accessor<char, 1>`` scratch region. ``alignas(64)``
-// on the counters keeps them on separate cache lines (Xe2 has 64-byte L1
-// lines; CUDA used 128, which was NVIDIA-specific).
+// Mirrors ``TopKTrait::Smem`` in the CUDA source. Allocated directly as a
+// ``local_accessor<TopKSmem, 1>`` so the struct's own alignment is guaranteed
+// (``atomic_ref`` on the counters needs it). ``alignas(64)`` on the counters
+// keeps them on separate cache lines (Xe2 has 64-byte L1 lines; CUDA used 128,
+// which was NVIDIA-specific).
 struct TopKSmem {
   uint32_t warp_sum[kNumWarps];              // 64 B (16 warps)
   alignas(64) uint32_t counter;
@@ -461,7 +469,7 @@ class MinimaxDecodeTopKBlockKernel {
       int32_t max_seqblock,
       int32_t block_size,
       int32_t topk,
-      ::sycl::local_accessor<char, 1> smem)
+      ::sycl::local_accessor<TopKSmem, 1> smem)
       : score_(score),
         seq_lens_(seq_lens),
         topk_idx_(topk_idx),
@@ -510,11 +518,9 @@ class MinimaxDecodeTopKBlockKernel {
     for (int i = tx; i < topk_; i += kCTASize) {
       out[i] = kInvalidBlockId;
     }
-    item.barrier(::sycl::access::fence_space::local_space);
+    item.barrier();
 
-    // Reinterpret the raw smem into the trait scratch layout.
-    char* smem_raw = &smem_[0];
-    TopKSmem* smem_typed = reinterpret_cast<TopKSmem*>(smem_raw);
+    TopKSmem* smem_typed = &smem_[0];
 
     const float* row = score_ + (static_cast<int64_t>(h) * batch_ + b) *
                                     static_cast<int64_t>(max_seqblock_);
@@ -532,7 +538,7 @@ class MinimaxDecodeTopKBlockKernel {
   int32_t max_seqblock_;
   int32_t block_size_;
   int32_t topk_;
-  ::sycl::local_accessor<char, 1> smem_;
+  ::sycl::local_accessor<TopKSmem, 1> smem_;
 };
 
 // ============================================================================
@@ -551,11 +557,10 @@ void minimax_decode_topk_launcher(
     int32_t block_size,
     int32_t topk) {
   if (batch == 0 || num_heads == 0) return;
-  constexpr size_t smem_bytes = sizeof(TopKSmem);
 
   const size_t num_groups = static_cast<size_t>(batch) * num_heads;
   queue.submit([&](::sycl::handler& cgh) {
-    ::sycl::local_accessor<char, 1> smem(::sycl::range<1>(smem_bytes), cgh);
+    ::sycl::local_accessor<TopKSmem, 1> smem(::sycl::range<1>(1), cgh);
     cgh.parallel_for(
         ::sycl::nd_range<1>(
             ::sycl::range<1>(num_groups * kCTASize),
@@ -601,7 +606,7 @@ class MinimaxDecodeTopKPageTableKernel {
       int32_t r2t_stride,
       int32_t max_kv_len,
       int32_t max_sparse_pages,
-      ::sycl::local_accessor<char, 1> smem)
+      ::sycl::local_accessor<PageTableSmem, 1> smem)
       : score_(score),
         seq_lens_(seq_lens),
         req_to_token_(req_to_token),
@@ -658,10 +663,8 @@ class MinimaxDecodeTopKPageTableKernel {
       return;
     }
 
-    // Non-trivial: reinterpret shared memory into the page-table scratch and
-    // run top-k -> ascending sort -> effective KV -> page emit.
-    char* smem_raw = &smem_[0];
-    PageTableSmem* smem_typed = reinterpret_cast<PageTableSmem*>(smem_raw);
+    // Non-trivial: run top-k -> ascending sort -> effective KV -> page emit.
+    PageTableSmem* smem_typed = &smem_[0];
 
     const int k_eff = topk_;
     const float* row = score_ + (static_cast<int64_t>(h) * batch_ + b) *
@@ -733,7 +736,7 @@ class MinimaxDecodeTopKPageTableKernel {
   int32_t r2t_stride_;
   int32_t max_kv_len_;
   int32_t max_sparse_pages_;
-  ::sycl::local_accessor<char, 1> smem_;
+  ::sycl::local_accessor<PageTableSmem, 1> smem_;
 };
 
 // ============================================================================
@@ -759,11 +762,10 @@ void minimax_decode_topk_page_table_launcher(
     int32_t max_kv_len,
     int32_t max_sparse_pages) {
   if (batch == 0 || num_heads == 0) return;
-  constexpr size_t smem_bytes = sizeof(PageTableSmem);
 
   const size_t num_groups = static_cast<size_t>(batch) * num_heads;
   queue.submit([&](::sycl::handler& cgh) {
-    ::sycl::local_accessor<char, 1> smem(::sycl::range<1>(smem_bytes), cgh);
+    ::sycl::local_accessor<PageTableSmem, 1> smem(::sycl::range<1>(1), cgh);
     cgh.parallel_for(
         ::sycl::nd_range<1>(
             ::sycl::range<1>(num_groups * kCTASize),

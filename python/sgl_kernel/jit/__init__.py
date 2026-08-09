@@ -19,6 +19,7 @@ def is_xpu() -> bool:
 
 
 if is_xpu():
+    from . import minimax
     from .activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
     from .compiler import (
         SYCLModule,
@@ -35,7 +36,6 @@ if is_xpu():
     from .per_token_group_quant_8bit_v2 import per_token_group_quant_8bit_v2
     from .rope import apply_rope_inplace, apply_rope_inplace_with_kvcache
     from .timestep_embedding import timestep_embedding
-    from . import minimax 
 
     __all__ = [
         # Utilities
@@ -61,6 +61,8 @@ if is_xpu():
         "apply_rope_inplace",
         "apply_rope_inplace_with_kvcache",
         "timestep_embedding",
+        # Submodules
+        "minimax",
     ]
 else:
     # Non-XPU environment - provide stubs

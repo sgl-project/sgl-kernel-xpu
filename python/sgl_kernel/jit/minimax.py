@@ -104,11 +104,13 @@ def minimax_decode_topk(
 ) -> torch.Tensor:
     """Select the top-k highest-scoring block ids per (head, batch) row.
 
-    Output contract (matches the CUDA kernel bit-for-bit):
+    Output contract:
       - ``out[h, b, 0:k_eff)`` = selected block ids (front-packed, unordered).
       - ``out[h, b, k_eff:topk)`` = ``-1``.
       - ``k_eff = min(topk, num_blocks_for_batch_b)``.
-      - Ties in score broken by lower block id winning.
+      - Tie-breaking among exactly-equal scores is unspecified: which of several
+        equal-scoring blocks lands in the last slot may differ from the CUDA
+        kernel and between runs. Compare selections as sets, not element-wise.
     """
     if score.dtype != torch.float32:
         raise ValueError(f"score must be float32, got {score.dtype}")
@@ -121,6 +123,15 @@ def minimax_decode_topk(
             f"score and seq_lens must be on the same device "
             f"({score.device} vs {seq_lens.device})"
         )
+
+    if block_size < 1:
+        raise ValueError(f"block_size must be >= 1, got {block_size}")
+    # topk < 1 would enter the radix path with topk_remain == 0, leaving
+    # threshold_bin uninitialized in find_threshold.
+    if topk < 1:
+        raise ValueError(f"topk must be >= 1, got {topk}")
+    if topk > _MAX_TOPK:
+        raise ValueError(f"topk ({topk}) exceeds kMaxTopK ({_MAX_TOPK})")
 
     num_heads, batch, max_seqblock = score.shape
     if seq_lens.shape[0] != batch:
@@ -207,6 +218,12 @@ def minimax_decode_topk_page_table(
         )
     if slot_ids.dtype != torch.int64:
         raise ValueError(f"slot_ids must be int64, got {slot_ids.dtype}")
+    if block_size < 1:
+        raise ValueError(f"block_size must be >= 1, got {block_size}")
+    if page_size < 1:
+        raise ValueError(f"page_size must be >= 1, got {page_size}")
+    if topk < 1:
+        raise ValueError(f"topk must be >= 1, got {topk}")
     if block_size % page_size != 0:
         raise ValueError(
             f"block_size ({block_size}) must be a multiple of page_size "
@@ -224,7 +241,26 @@ def minimax_decode_topk_page_table(
     if score.device != slot_ids.device:
         raise ValueError("score and slot_ids must be on the same device")
 
+    if seq_lens.dim() != 1:
+        raise ValueError(f"seq_lens must be 1-D, got shape {tuple(seq_lens.shape)}")
+    if slot_ids.dim() != 1:
+        raise ValueError(f"slot_ids must be 1-D, got shape {tuple(slot_ids.shape)}")
+    if req_to_token.dim() != 2:
+        raise ValueError(
+            f"req_to_token must be 2-D, got shape {tuple(req_to_token.shape)}"
+        )
+
     num_heads, batch, max_seqblock = score.shape
+    # The kernel reads seq_lens_[b] / slot_ids_[b] for every b < batch, and
+    # slot_ids_[b] feeds r2t pointer arithmetic.
+    if seq_lens.shape[0] != batch:
+        raise ValueError(
+            f"seq_lens length ({seq_lens.shape[0]}) must match batch ({batch})"
+        )
+    if slot_ids.shape[0] != batch:
+        raise ValueError(
+            f"slot_ids length ({slot_ids.shape[0]}) must match batch ({batch})"
+        )
     if max_seqblock > _MAX_NUM_BLOCKS:
         raise ValueError(
             f"max_seqblock ({max_seqblock}) exceeds kMaxNumBlocks "
@@ -242,6 +278,14 @@ def minimax_decode_topk_page_table(
     max_sparse_pages = topk * ppb
     max_kv_len = req_to_token.shape[1]
     r2t_stride = req_to_token.stride(0)
+    # The kernel addresses req_to_token as flat row-major (r2t_base + tok), so
+    # the inner stride must be 1. A row-pitched slice of a larger pool tensor
+    # (stride(0) > shape[1]) is fine and common, hence no full contiguity check.
+    if req_to_token.stride(1) != 1:
+        raise ValueError(
+            f"req_to_token must have unit inner stride, got strides "
+            f"{tuple(req_to_token.stride())}"
+        )
 
     page_table = torch.empty(
         (batch * num_heads, max_sparse_pages),

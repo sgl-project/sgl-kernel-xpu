@@ -1,8 +1,8 @@
 """Accuracy tests for the XPU/SYCL MiniMax decode block-top-k kernels.
 
-PyTorch reference is inlined so the test is self-contained; matches the CUDA
-kernel's output contract bit-for-bit apart from tie-breaking, which is
-compared as sets rather than element-wise.
+PyTorch reference is inlined so the test is self-contained. Block-id selections
+are compared as sets rather than element-wise because tie-breaking among
+exactly-equal scores is unspecified in the kernel's radix regimes.
 """
 
 from __future__ import annotations
@@ -31,8 +31,9 @@ def _ref_topk_block_ids(
     block_size: int,
     topk: int,
 ) -> torch.Tensor:
-    """Reference block-id output: front-packed, ``-1`` padded, tie-break by
-    lower block id winning (matches CUDA ``is_greater`` comparator)."""
+    """Reference block-id output: front-packed, ``-1`` padded. Breaks ties by
+    lower block id winning; the kernel only matches that in the small regime,
+    so callers compare selections as sets (see ``_assert_topk_matches``)."""
     num_heads, batch, max_seqblock = score.shape
     out = torch.full(
         (num_heads, batch, topk),
@@ -142,6 +143,7 @@ def _assert_topk_matches(
     seq_lens: torch.Tensor,
     block_size: int,
     topk: int,
+    max_seqblock: int,
 ) -> None:
     """Block-id top-k is compared as SETS per (head, batch) because the CUDA
     tie-break vs the reference tie-break may differ under identical scores.
@@ -149,7 +151,11 @@ def _assert_topk_matches(
     num_heads, batch, _ = kernel_out.shape
     seq_lens_l = seq_lens.to(torch.int64).tolist()
     for b in range(batch):
-        num_blocks = (seq_lens_l[b] + block_size - 1) // block_size
+        # Clamp to max_seqblock: kernel and reference both stop at the
+        # materialized score columns, so k_eff must too.
+        num_blocks = min(
+            (seq_lens_l[b] + block_size - 1) // block_size, max_seqblock
+        )
         k_eff = min(topk, num_blocks)
         for h in range(num_heads):
             kernel_set = set(kernel_out[h, b, :k_eff].tolist())
@@ -181,7 +187,9 @@ class TestMinimaxDecodeTopKBlockId:
         )
         kernel_out = minimax_decode_topk(score, seq_lens, block_size, topk)
         ref_out = _ref_topk_block_ids(score, seq_lens, block_size, topk)
-        _assert_topk_matches(kernel_out, ref_out, seq_lens, block_size, topk)
+        _assert_topk_matches(
+            kernel_out, ref_out, seq_lens, block_size, topk, max_seqblock
+        )
 
     def test_small_regime(self) -> None:
         """num_blocks in (topk, kSmallThreshold=128] -> O(n^2) rank-by-compare."""
@@ -193,7 +201,9 @@ class TestMinimaxDecodeTopKBlockId:
         )
         kernel_out = minimax_decode_topk(score, seq_lens, block_size, topk)
         ref_out = _ref_topk_block_ids(score, seq_lens, block_size, topk)
-        _assert_topk_matches(kernel_out, ref_out, seq_lens, block_size, topk)
+        _assert_topk_matches(
+            kernel_out, ref_out, seq_lens, block_size, topk, max_seqblock
+        )
 
     def test_register_1_regime(self) -> None:
         """num_blocks in (kSmallThreshold, kCTASize=512] -> one-elem-per-thread radix."""
@@ -205,7 +215,9 @@ class TestMinimaxDecodeTopKBlockId:
         )
         kernel_out = minimax_decode_topk(score, seq_lens, block_size, topk)
         ref_out = _ref_topk_block_ids(score, seq_lens, block_size, topk)
-        _assert_topk_matches(kernel_out, ref_out, seq_lens, block_size, topk)
+        _assert_topk_matches(
+            kernel_out, ref_out, seq_lens, block_size, topk, max_seqblock
+        )
 
     def test_register_M_regime(self) -> None:
         """num_blocks in (kCTASize, kMaxNumBlocks=4096] -> multi-elem-per-thread radix."""
@@ -217,7 +229,9 @@ class TestMinimaxDecodeTopKBlockId:
         )
         kernel_out = minimax_decode_topk(score, seq_lens, block_size, topk)
         ref_out = _ref_topk_block_ids(score, seq_lens, block_size, topk)
-        _assert_topk_matches(kernel_out, ref_out, seq_lens, block_size, topk)
+        _assert_topk_matches(
+            kernel_out, ref_out, seq_lens, block_size, topk, max_seqblock
+        )
 
     def test_seqlens_i64(self) -> None:
         """int64 seq_lens dispatches to the ``_i64`` exported symbol."""
@@ -234,7 +248,9 @@ class TestMinimaxDecodeTopKBlockId:
         )
         kernel_out = minimax_decode_topk(score, seq_lens, block_size, topk)
         ref_out = _ref_topk_block_ids(score, seq_lens, block_size, topk)
-        _assert_topk_matches(kernel_out, ref_out, seq_lens, block_size, topk)
+        _assert_topk_matches(
+            kernel_out, ref_out, seq_lens, block_size, topk, max_seqblock
+        )
 
     def test_topk_1(self) -> None:
         """topk=1 exercises the single-selection path."""
@@ -246,7 +262,9 @@ class TestMinimaxDecodeTopKBlockId:
         )
         kernel_out = minimax_decode_topk(score, seq_lens, block_size, topk)
         ref_out = _ref_topk_block_ids(score, seq_lens, block_size, topk)
-        _assert_topk_matches(kernel_out, ref_out, seq_lens, block_size, topk)
+        _assert_topk_matches(
+            kernel_out, ref_out, seq_lens, block_size, topk, max_seqblock
+        )
 
     def test_out_param(self) -> None:
         """Caller-supplied ``out`` tensor is written in-place and returned."""
@@ -264,7 +282,9 @@ class TestMinimaxDecodeTopKBlockId:
         )
         assert kernel_out.data_ptr() == out.data_ptr()
         ref_out = _ref_topk_block_ids(score, seq_lens, block_size, topk)
-        _assert_topk_matches(kernel_out, ref_out, seq_lens, block_size, topk)
+        _assert_topk_matches(
+            kernel_out, ref_out, seq_lens, block_size, topk, max_seqblock
+        )
 
 
 

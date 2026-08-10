@@ -10,6 +10,7 @@
 #include "MemoryAccess.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 namespace {
 
@@ -330,7 +331,7 @@ void launch_top_p_renorm_kernel(
 
 }  // namespace
 
-void top_p_renorm_probs(
+SGL_KERNEL_EXPORT void top_p_renorm_probs(
     const at::Tensor& probs,
     at::Tensor& renorm_probs,
     const std::optional<at::Tensor>& maybe_top_p_arr,

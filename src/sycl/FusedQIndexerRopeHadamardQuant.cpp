@@ -264,18 +264,6 @@ SGL_KERNEL_EXPORT void fused_q_indexer_rope_hadamard_quant(
   TORCH_CHECK(
       q_fp8.stride(0) == expected_q_stride0, "q_fp8 must be contiguous (B,H,128); got stride[0]=", q_fp8.stride(0));
 
-  if (positions.numel() > 0) {
-    const auto min_position = positions.min().item<int64_t>();
-    const auto max_position = positions.max().item<int64_t>();
-    TORCH_CHECK(min_position >= 0, "positions must be non-negative, got min position ", min_position);
-    TORCH_CHECK(
-        max_position < rope_cache.size(0),
-        "positions must be smaller than rope_cache.size(0)=",
-        rope_cache.size(0),
-        "; got max position ",
-        max_position);
-  }
-
   DISPATCH_FLOAT_TYPES(q_input.scalar_type(), "fused_q_indexer_rope_hadamard_quant", [&]() {
     using sycl_in_t = typename SyclInputType<scalar_t>::type;
     if (positions.scalar_type() == at::kInt) {

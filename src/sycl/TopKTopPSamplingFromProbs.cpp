@@ -10,6 +10,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 #include "comm/Random.h"
 #include "comm/Sampling.h"
 
@@ -263,7 +264,7 @@ void launch_top_k_top_p_sampling(
 
 }  // namespace
 
-void top_k_top_p_sampling_from_probs(
+SGL_KERNEL_EXPORT void top_k_top_p_sampling_from_probs(
     at::Tensor probs,
     at::Tensor output,
     std::optional<at::Tensor> maybe_indices,

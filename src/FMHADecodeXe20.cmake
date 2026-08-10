@@ -1,11 +1,13 @@
 # Generate FMHA decode kernel instantiation files.
 #
-# All FMHA kernels use a bf16 query. The generated translation units (and thus
-# the resulting shared libraries) are split along two dimensions to keep peak
+# 16-bit-query FMHA kernels support bf16 and fp16 queries (each compiled into
+# independent shared libraries). The generated translation units (and thus the
+# resulting shared libraries) are split along these dimensions to keep peak
 # compiler memory low:
 #   1. paged vs non-paged (no_page) attention -> separate runner types
 #      (FmhaDecodeRunner<QG,HD,PS> vs FmhaDecodeNpRunner<QG,HD>);
-#   2. KV-cache dtype: 16-bit (bf16) vs fp8 (e4m3/e5m2) -> separate TUs.
+#   2. KV-cache dtype: 16-bit (bf16/fp16) vs fp8 (e4m3/e5m2) -> separate TUs;
+#   3. for the 16-bit paths, query dtype bf16 vs fp16 -> separate TUs.
 # The paged and non-paged KV paths support INDEPENDENT sets of head dimensions.
 # Non-paged decode supports 16-bit KV only (no fp8 KV cache, no split-KV).
 set(FMHA_DECODE_QG_SIZES 1 2 4 8 16)
@@ -48,28 +50,44 @@ set(FMHA_DECODE_FP8_TEMPLATE
 set(FMHA_SPLIT_DECODE_FP8_TEMPLATE
     "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe_fmha_fwd_split_decode_fp8_kernel.cpp.in")
 
+# 16-bit query element tags. Each tag produces INDEPENDENT shared libraries for
+# the 16-bit-KV decode / split-decode / non-paged paths so bf16 and fp16 do not
+# share a translation unit. bf16 keeps the historical (untagged) file names; fp16
+# gets a `_fp16` suffix. ELEM_TYPE selects the cutlass query/KV/out element type.
+set(FMHA_DECODE_ELEM_TAGS bf16 fp16)
+
 foreach(QG_SZ ${FMHA_DECODE_QG_SIZES})
-    # --- Paged decode + split-decode: paged head dims only, bf16 query only. ---
+    # --- Paged decode + split-decode: paged head dims only. ---
     # Each (QG, HEAD_DIM, PAGE_SIZE) yields independent shared libraries split by
     # KV-cache dtype:
-    #   decode_paged / split_decode         (16-bit KV)
-    #   decode_fp8   / split_decode_fp8      (e4m3/e5m2 KV)
+    #   decode_paged / split_decode         (16-bit KV: bf16 + fp16)
+    #   decode_fp8   / split_decode_fp8      (e4m3/e5m2 KV, bf16 query)
     foreach(HEAD_DIM ${FMHA_DECODE_PAGED_HEAD_DIMS})
         foreach(PAGE_SIZE ${FMHA_DECODE_PAGE_SIZES})
-            set(GENERATED_FILE
-                "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_paged_kernel_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}.cpp")
-            configure_file(${FMHA_DECODE_TEMPLATE} ${GENERATED_FILE} @ONLY)
-            list(APPEND device_cpp_xe20 ${GENERATED_FILE})
+            foreach(ELEM_TAG ${FMHA_DECODE_ELEM_TAGS})
+                if(ELEM_TAG STREQUAL "bf16")
+                    set(ELEM_TYPE "cutlass::bfloat16_t")
+                    set(ELEM_SUFFIX "")
+                else()
+                    set(ELEM_TYPE "cutlass::half_t")
+                    set(ELEM_SUFFIX "_${ELEM_TAG}")
+                endif()
+
+                set(GENERATED_FILE
+                    "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_paged_kernel_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}${ELEM_SUFFIX}.cpp")
+                configure_file(${FMHA_DECODE_TEMPLATE} ${GENERATED_FILE} @ONLY)
+                list(APPEND device_cpp_xe20 ${GENERATED_FILE})
+
+                set(GENERATED_SPLIT_FILE
+                    "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_split_decode_kernel_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}${ELEM_SUFFIX}.cpp")
+                configure_file(${FMHA_SPLIT_DECODE_TEMPLATE} ${GENERATED_SPLIT_FILE} @ONLY)
+                list(APPEND device_cpp_xe20 ${GENERATED_SPLIT_FILE})
+            endforeach()
 
             set(GENERATED_FP8_FILE
                 "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_fp8_kernel_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}.cpp")
             configure_file(${FMHA_DECODE_FP8_TEMPLATE} ${GENERATED_FP8_FILE} @ONLY)
             list(APPEND device_cpp_xe20 ${GENERATED_FP8_FILE})
-
-            set(GENERATED_SPLIT_FILE
-                "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_split_decode_kernel_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}.cpp")
-            configure_file(${FMHA_SPLIT_DECODE_TEMPLATE} ${GENERATED_SPLIT_FILE} @ONLY)
-            list(APPEND device_cpp_xe20 ${GENERATED_SPLIT_FILE})
 
             set(GENERATED_SPLIT_FP8_FILE
                 "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_split_decode_fp8_kernel_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}.cpp")
@@ -78,16 +96,27 @@ foreach(QG_SZ ${FMHA_DECODE_QG_SIZES})
         endforeach()
     endforeach()
 
-    # --- Non-paged (no_page) decode: np head dims only, no page size, no fp8, bf16 only. ---
+    # --- Non-paged (no_page) decode: np head dims only, no page size, no fp8. ---
+    # 16-bit KV only (bf16 + fp16), no split-KV.
     foreach(HEAD_DIM ${FMHA_DECODE_NP_HEAD_DIMS})
         set(TILED_KV_NP ${FMHA_DECODE_TILED_KV_NP_${HEAD_DIM}})
         if(NOT TILED_KV_NP)
             message(FATAL_ERROR "Missing non-paged KV tile (FMHA_DECODE_TILED_KV_NP_${HEAD_DIM}) for decode HEAD_DIM=${HEAD_DIM}")
         endif()
 
-        set(GENERATED_NP_FILE
-            "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_nopage_kernel_${QG_SZ}_${HEAD_DIM}.cpp")
-        configure_file(${FMHA_DECODE_NOPAGE_TEMPLATE} ${GENERATED_NP_FILE} @ONLY)
-        list(APPEND device_cpp_xe20 ${GENERATED_NP_FILE})
+        foreach(ELEM_TAG ${FMHA_DECODE_ELEM_TAGS})
+            if(ELEM_TAG STREQUAL "bf16")
+                set(ELEM_TYPE "cutlass::bfloat16_t")
+                set(ELEM_SUFFIX "")
+            else()
+                set(ELEM_TYPE "cutlass::half_t")
+                set(ELEM_SUFFIX "_${ELEM_TAG}")
+            endif()
+
+            set(GENERATED_NP_FILE
+                "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_nopage_kernel_${QG_SZ}_${HEAD_DIM}${ELEM_SUFFIX}.cpp")
+            configure_file(${FMHA_DECODE_NOPAGE_TEMPLATE} ${GENERATED_NP_FILE} @ONLY)
+            list(APPEND device_cpp_xe20 ${GENERATED_NP_FILE})
+        endforeach()
     endforeach()
 endforeach()

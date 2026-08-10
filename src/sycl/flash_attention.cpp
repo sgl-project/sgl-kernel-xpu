@@ -162,6 +162,7 @@ std::vector<at::Tensor> mha_fwd_nopage(
 
   Arguments params;
   params.is_bf16 = q.dtype() == torch::kBFloat16;
+  params.is_fp16 = q.dtype() == torch::kHalf;
 
   // Q / O are in ragged (total, h, d) format; KV is a contiguous ragged
   // (total_k, h_k, d) cache addressed via cu_seqlens_k offsets.
@@ -486,6 +487,7 @@ std::vector<at::Tensor> mha_fwd(
   // align with FA3
 
   params.is_bf16 = q.dtype() == torch::kBFloat16;
+  params.is_fp16 = q.dtype() == torch::kHalf;
 
   // Set the pointers and strides.
   params.q_ptr = q.data_ptr();
@@ -754,6 +756,7 @@ std::vector<at::Tensor> mha_fwd_nopage(
 
   Arguments params;
   params.is_bf16 = q.dtype() == torch::kBFloat16;
+  params.is_fp16 = q.dtype() == torch::kHalf;
 
   params.q_ptr = q.data_ptr();
   params.k_ptr = k.data_ptr();
@@ -1024,6 +1027,7 @@ std::vector<at::Tensor> mha_fwd(
   // align with FA3
   Arguments params;
   params.is_bf16 = q.dtype() == torch::kBFloat16;
+  params.is_fp16 = q.dtype() == torch::kHalf;
 
   // Set the pointers and strides.
   params.q_ptr = q.data_ptr();

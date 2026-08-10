@@ -48,6 +48,33 @@
 #include "sycl/kernels/flash_attention_v2/kernel/xe_tile_scheduler.hpp"
 using namespace cute;
 namespace decode {
+
+// Number of subgroups the KV (page) tile is split across, capped so the epilogue
+// cross-subgroup reduction buffer fits in shared local memory.
+//
+// The reduction path (FMHAFwdEpilogue::SharedStorageReduceK) allocates
+//   num_sg * (qg * head_dim_rounded + 2 * aligned_qg) floats
+// of SLM (each of the num_sg subgroups stores its full partial O tile plus a
+// padded row of running sum/max). For large head dims combined with large GQA
+// query groups and large page sizes this exceeds the device SLM budget (128 KiB),
+// which hangs the device instead of failing cleanly (e.g. HEAD_DIM=512, qg=8,
+// PAGE_SIZE=128 -> 132 KiB). Reducing the subgroup count keeps the buffer within
+// budget; it only lowers KV parallelism and does not affect correctness.
+//
+// full_kv_subgroups (= PAGE_SIZE / 16) is always a power of two, so the returned
+// value is the largest power-of-two divisor that fits the budget (>= 1).
+constexpr int kv_subgroups_for_slm(int full_kv_subgroups, int qg, int head_dim_rounded) {
+  constexpr int slm_float_budget = (128 * 1024) / static_cast<int>(sizeof(float));
+  const int aligned_qg = ((qg + 15) / 16) * 16;
+  const int floats_per_subgroup = qg * head_dim_rounded + 2 * aligned_qg;
+  const int max_subgroups = slm_float_budget / floats_per_subgroup;
+  int sg = full_kv_subgroups;
+  while (sg > 1 && sg > max_subgroups) {
+    sg /= 2;
+  }
+  return sg < 1 ? 1 : sg;
+}
+
 struct Arguments {
   // The QKV matrices.
   void* __restrict__ q_ptr;

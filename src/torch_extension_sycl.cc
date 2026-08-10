@@ -220,6 +220,93 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("merge_state", torch::kXPU, &merge_state);
 
   /*
+   * Inkling short convolution
+   */
+  m.def(
+      "inkling_sconv_forward(Tensor x, Tensor weight, Tensor sconv_cache, Tensor cache_mask, Tensor safe_idx, "
+      "Tensor cu, Tensor si, bool silu_activation, bool use_residual, bool is_decode) -> Tensor");
+  m.impl("inkling_sconv_forward", torch::kXPU, &inkling_sconv_forward);
+
+  m.def(
+      "inkling_update_sconv_cache(Tensor x, Tensor(a!) sconv_cache, Tensor cache_indices, "
+      "Tensor has_initial_state, Tensor query_start_loc) -> ()");
+  m.impl("inkling_update_sconv_cache", torch::kXPU, &inkling_update_sconv_cache);
+
+  m.def(
+      "inkling_fused_decode_update_sconv(Tensor x, Tensor weight, Tensor(a!) sconv_cache, "
+      "Tensor cache_indices, Tensor cache_mask, bool silu_activation, bool use_residual, "
+      "Tensor? track_mask=None, Tensor? track_indices=None) -> Tensor");
+  m.impl("inkling_fused_decode_update_sconv", torch::kXPU, &inkling_fused_decode_update_sconv);
+
+  m.def(
+      "inkling_gather_scatter_sconv_cache(Tensor hidden_states, Tensor(a!) sconv_cache, "
+      "Tensor track_conv_indices, Tensor mask, Tensor dst_indices) -> ()");
+  m.impl("inkling_gather_scatter_sconv_cache", torch::kXPU, &inkling_gather_scatter_sconv_cache);
+
+  m.def(
+      "inkling_draft_extend_sconv_cache(Tensor hidden_states, Tensor(a!) sconv_cache, Tensor cache_indices, "
+      "Tensor num_accepted_tokens, int draft_token_num, bool do_tracking, Tensor? crossed=None, "
+      "Tensor? track_step=None, Tensor? mamba_track_indices=None) -> ()");
+  m.impl("inkling_draft_extend_sconv_cache", torch::kXPU, &inkling_draft_extend_sconv_cache);
+
+  m.def(
+      "inkling_fused_decode_sconv_metadata(int B, Tensor cache_indices, "
+      "Tensor(a!)? query_start_loc_out=None, Tensor(b!)? has_initial_state_out=None, "
+      "Tensor(c!)? cache_mask_out=None, Tensor(d!)? safe_idx_out=None, "
+      "Tensor(e!)? cu_out=None, Tensor(f!)? si_out=None) -> "
+      "(Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!))");
+  m.impl("inkling_fused_decode_sconv_metadata", torch::kXPU, &inkling_fused_decode_sconv_metadata);
+
+  m.def(
+      "inkling_fused_extend_sconv_metadata(int B, int T, Tensor cache_indices, int his_mode, "
+      "Tensor? extend_seq_lens=None, Tensor? his_src=None, int draft_token_num=1, "
+      "Tensor(a!)? query_start_loc_out=None, Tensor(b!)? has_initial_state_out=None, "
+      "Tensor(c!)? cache_mask_out=None, Tensor(d!)? safe_idx_out=None, "
+      "Tensor(e!)? cu_out=None, Tensor(f!)? si_out=None) -> "
+      "(Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!))");
+  m.impl("inkling_fused_extend_sconv_metadata", torch::kXPU, &inkling_fused_extend_sconv_metadata);
+
+  m.def(
+      "inkling_track_conv_indices(Tensor query_start_loc, Tensor mamba_track_seqlens, Tensor extend_prefix_lens, "
+      "int width_minus_one, int chunk_size, int total_tokens) -> Tensor");
+  m.impl("inkling_track_conv_indices", torch::kXPU, &inkling_track_conv_indices);
+
+  m.def(
+      "inkling_save_intermediate_conv_windows(Tensor sconv_cache, Tensor hidden_states, Tensor cache_indices, "
+      "Tensor(a!) intermediate_out, int batch_size, int draft_token_num) -> ()");
+  m.impl("inkling_save_intermediate_conv_windows", torch::kXPU, &inkling_save_intermediate_conv_windows);
+
+  /*
+   * Inkling fused attention prologue
+   */
+  m.def(
+      "inkling_attn_prologue_verify(Tensor qkvr, Tensor k_cache, Tensor v_cache, "
+      "Tensor cache_indices, Tensor cache_mask, Tensor k_weight, Tensor v_weight, "
+      "Tensor(a!) k_inter, Tensor(a!) v_inter, Tensor q_gamma, Tensor k_gamma, float eps, "
+      "Tensor loc, Tensor(a!) k_buf, Tensor(a!) v_buf, int q_off, int k_off, int v_off, "
+      "int dq, int dkv, int draft_token_num, bool silu_activation, bool use_residual, "
+      "bool do_store) -> (Tensor, Tensor, Tensor)");
+  m.impl("inkling_attn_prologue_verify", torch::kXPU, &inkling_attn_prologue_verify);
+
+  m.def(
+      "inkling_attn_prologue_decode(Tensor qkvr, Tensor(a!) k_cache, Tensor(a!) v_cache, "
+      "Tensor cache_indices, Tensor cache_mask, Tensor k_weight, Tensor v_weight, "
+      "Tensor? track_mask, Tensor? track_indices, Tensor q_gamma, Tensor k_gamma, float eps, "
+      "Tensor loc, Tensor(a!) k_buf, Tensor(a!) v_buf, int q_off, int k_off, int v_off, "
+      "int dq, int dkv, bool silu_activation, bool use_residual, bool do_store) "
+      "-> (Tensor, Tensor, Tensor)");
+  m.impl("inkling_attn_prologue_decode", torch::kXPU, &inkling_attn_prologue_decode);
+
+  m.def(
+      "inkling_attn_prologue_extend(Tensor qkvr, Tensor(a!) k_cache, Tensor(a!) v_cache, "
+      "Tensor cache_indices, Tensor cache_mask, Tensor has_initial_state, Tensor cu, Tensor si, "
+      "Tensor k_weight, Tensor v_weight, Tensor? track_rows, Tensor? track_mask, Tensor? track_dst, "
+      "Tensor q_gamma, Tensor k_gamma, float eps, Tensor loc, Tensor(a!) k_buf, Tensor(a!) v_buf, "
+      "int q_off, int k_off, int v_off, int dq, int dkv, bool silu_activation, "
+      "bool use_residual, bool do_store, bool do_cache_update) -> (Tensor, Tensor, Tensor)");
+  m.impl("inkling_attn_prologue_extend", torch::kXPU, &inkling_attn_prologue_extend);
+
+  /*
    * From cutlass attention
    */
 #ifdef USE_FMHA
@@ -320,6 +407,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_inplace_qknorm_rope(Tensor! q, Tensor! k, Tensor q_weight, Tensor k_weight, "
       "Tensor cos_sin_cache, Tensor positions, bool is_neox, float eps, int head_dim=0, int rope_dim=0) -> ()");
   m.impl("fused_inplace_qknorm_rope", torch::kXPU, &at::native::xpu::fused_inplace_qknorm_rope);
+  m.def(
+      "fused_q_norm_rope(Tensor q_input, Tensor! q_output, Tensor freqs_cis, Tensor positions, "
+      "float eps) -> ()");
+  m.impl("fused_q_norm_rope", torch::kXPU, &at::native::xpu::fused_q_norm_rope);
+  m.def(
+      "fused_k_norm_rope_flashmla(Tensor kv, Tensor kv_weight, Tensor freqs_cis, Tensor positions, "
+      "Tensor out_loc, Tensor! kvcache, float eps, int page_size) -> ()");
+  m.impl("fused_k_norm_rope_flashmla", torch::kXPU, &at::native::xpu::fused_k_norm_rope_flashmla);
   /*
    * Fused QK RoPE (no RMS_Norm)
    */
@@ -386,6 +481,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor weight_indices, "
       "Tensor lora_ranks, Tensor? seg_lens) -> ()");
   m.impl("sgemm_lora_a_fwd", torch::kXPU, &sgemm_lora_a_fwd);
+  m.def(
+      "sgemm_lora_b_fwd(Tensor! output, Tensor input_x, Tensor weights, Tensor seg_indptr, "
+      "Tensor weight_indices, "
+      "Tensor lora_ranks, Tensor scalings, Tensor? seg_lens, Tensor? base_output) -> ()");
+  m.impl("sgemm_lora_b_fwd", torch::kXPU, &sgemm_lora_b_fwd);
 
   /* NSA (Native Sparse Attention) indexer scoring */
   // fp8_mqa_logits (prefill) is implemented in pure Python via sgl_kernel.nsa.
@@ -405,8 +505,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor dt_bias, int num_prefills, int num_decodes, int num_spec_decodes, Tensor? has_initial_state, "
       "Tensor? non_spec_query_start_loc, Tensor? non_spec_token_indx, Tensor? non_spec_state_indices_tensor, "
       "Tensor? spec_query_start_loc, Tensor? spec_token_indx, Tensor? spec_state_indices_tensor, "
-      "Tensor? num_accepted_tokens, int num_actual_tokens, int tp_size, bool reorder_input) -> ()");
+      "Tensor? num_accepted_tokens, int num_actual_tokens, int tp_size, bool reorder_input, "
+      "Tensor? workspace=None) -> ()");
   m.impl("gdn_attention", torch::kXPU, &gdn_attention);
+
+  m.def(
+      "gdn_attention_workspace_bytes_needed(int num_prefills, int num_decodes, int non_spec_token, "
+      "int batch_size, int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim, int tp_size, "
+      "ScalarType dtype) -> int");
+  m.impl(
+      "gdn_attention_workspace_bytes_needed", c10::DispatchKey::BackendSelect, &gdn_attention_workspace_bytes_needed);
 
   /*
    * Mamba causal conv1d (XPU)
@@ -442,6 +550,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "flash_compress128_decode(Tensor! kv_buffer, Tensor kv_input, Tensor! kv_output, Tensor ape, Tensor plan_d) "
       "-> ()");
   m.impl("flash_compress128_decode", torch::kXPU, &at::native::xpu::flash_compress128_decode);
+
+  m.def(
+      "flash_compress128_prefill(Tensor! kv_buffer, Tensor kv_input, Tensor! kv_output, Tensor ape, Tensor plan_c, "
+      "Tensor plan_w) -> ()");
+  m.impl("flash_compress128_prefill", torch::kXPU, &at::native::xpu::flash_compress128_prefill);
+
+  m.def(
+      "flash_compress4_decode(Tensor! kv_buffer, Tensor kv_input, Tensor! kv_output, Tensor ape, Tensor plan_d) "
+      "-> ()");
+  m.impl("flash_compress4_decode", torch::kXPU, &at::native::xpu::flash_compress4_decode);
 }
 
 REGISTER_EXTENSION(common_ops)

@@ -8,6 +8,7 @@
 #include <sycl/sycl.hpp>
 
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 template <typename scalar_t>
 struct SwigluScalarKernel {
@@ -149,7 +150,7 @@ void swiglu_gpt_oss_sigmoid_alpha_sycl(
         reinterpret_cast<const scalar_t*>(x_ptr), reinterpret_cast<scalar_t*>(y_ptr), B, H, alpha, limit); \
   }
 
-torch::Tensor swiglu_gpt_oss_sigmoid_alpha(
+SGL_KERNEL_EXPORT torch::Tensor swiglu_gpt_oss_sigmoid_alpha(
     torch::Tensor x,  // [B, 2H]
     double alpha,
     double limit) {

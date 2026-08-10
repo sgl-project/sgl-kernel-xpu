@@ -19,6 +19,7 @@
 #include <sycl/sycl.hpp>
 
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 #include "sycl/kernels/mla_sparse/device/mla_sparse_prefill_dispatch.hpp"
 
 namespace {
@@ -104,7 +105,7 @@ namespace {
 }  // namespace
 
 /// @brief Dispatch kernel implementation for V4 Sparse MLA prefill.
-void flash_mla_sparse_prefill(
+SGL_KERNEL_EXPORT void flash_mla_sparse_prefill(
     torch::Tensor& out,            // [s_q, h_q, d_v]
     torch::Tensor& max_logits,     // [s_q, h_q]
     torch::Tensor& lse,            // [s_q, h_q]

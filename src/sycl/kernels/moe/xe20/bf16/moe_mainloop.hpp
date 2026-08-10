@@ -178,12 +178,13 @@ struct MoEMainloop<
     /* Partition C */
     SubgroupTensor tCrC = thr_mma.partition_sg_fragment_C(gD);
 
-    /* Partition D */
-    using TD = typename DTensor::element_type;
-    TD tCrD_final_frag[tCrC.size()];
-    Tensor tCrD_final_tensor = make_tensor(make_rmem_ptr(tCrD_final_frag), tCrC.layout());
-    SubgroupTensor tCrD_final_sg_tensor = make_subgroup_tensor(tCrD_final_tensor, tCrC.tv_layout());
-    Tensor tCgD = thr_mma.partition_C(gD);
+    /* Partition D.
+       The D fragment and its global target come from the *copy*, not the MMA:
+       the store atom may be wider than one MMA-C atom (CUTLASS9-656), in which
+       case the MMA-C register order no longer matches the store's. reorder()
+       below bridges the two. */
+    SubgroupTensor tCrD_final_sg_tensor = thr_copy_d.partition_sg_fragment_S(gD);
+    Tensor tCgD = thr_copy_d.partition_D(gD);
 
     /* Create TiledCopy objects for prefetches */
     auto prefetch_a = make_block_2d_prefetch(tiled_copy_a);
@@ -315,16 +316,13 @@ struct MoEMainloop<
     SubgroupTensor tCrC0 = thr_mma.partition_sg_fragment_C(gC0);
     SubgroupTensor tCrC1 = thr_mma.partition_sg_fragment_C(gC1);
 
-    /* Partition D */
-    using TD = typename DTensor::element_type;
-    TD tCrD_final_frag0[tCrC0.size()];
-    Tensor tCrD_final_tensor0 = make_tensor(make_rmem_ptr(tCrD_final_frag0), tCrC0.layout());
-    SubgroupTensor tCrD_final_sg_tensor0 = make_subgroup_tensor(tCrD_final_tensor0, tCrC0.tv_layout());
-    TD tCrD_final_frag1[tCrC1.size()];
-    Tensor tCrD_final_tensor1 = make_tensor(make_rmem_ptr(tCrD_final_frag1), tCrC1.layout());
-    SubgroupTensor tCrD_final_sg_tensor1 = make_subgroup_tensor(tCrD_final_tensor1, tCrC1.tv_layout());
-
-    Tensor tCgD = thr_mma.partition_C(gC0);
+    /* Partition D.  Fragment and global target come from the *copy*, not the
+       MMA: the store atom may be wider than one MMA-C atom (CUTLASS9-656), so
+       the MMA-C register order no longer matches the store's; reorder() below
+       bridges the two.  Only tCrC0 is stored -- the gated activation folds
+       tCrC1 into it -- so a single D fragment suffices. */
+    SubgroupTensor tCrD_final_sg_tensor0 = thr_copy_d.partition_sg_fragment_S(gC0);
+    Tensor tCgD = thr_copy_d.partition_D(gC0);
 
     /* Create TiledCopy objects for prefetches */
     auto prefetch_a = make_block_2d_prefetch(tiled_copy_a);

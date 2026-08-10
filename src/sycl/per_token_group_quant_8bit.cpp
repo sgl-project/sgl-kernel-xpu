@@ -8,6 +8,7 @@
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "cutlass/float8.h"
+#include "sgl_kernel_export.h"
 
 // TODO: improve performance when FP8 native support is added
 
@@ -218,7 +219,7 @@ struct PerTokenGroupQuant8bitKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   int scale_stride;
 };
 
-void sgl_per_token_group_quant_8bit(
+SGL_KERNEL_EXPORT void sgl_per_token_group_quant_8bit(
     torch::Tensor input,
     torch::Tensor output_q,
     torch::Tensor output_s,

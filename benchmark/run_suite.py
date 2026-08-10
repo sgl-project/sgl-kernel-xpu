@@ -101,6 +101,7 @@ suites = {
         BenchFile("bench_per_token_quant_fp8.py"),
         BenchFile("bench_per_token_group_quant_mxfp4_fusion.py"),
         BenchFile("bench_top_k_renorm_probs.py"),
+        BenchFile("bench_top_k_top_p_sampling_from_probs.py"),
         BenchFile("bench_min_p_sampling_from_probs.py"),
         BenchFile("bench_biased_topk.py"),
         BenchFile(
@@ -115,6 +116,7 @@ suites = {
         # --- LoRA ---
         BenchFile("bench_embedding_lora_a_fwd.py", estimated_time=40),
         BenchFile("bench_sgemm_lora_a_fwd.py", estimated_time=25),
+        BenchFile("bench_sgemm_lora_b_fwd.py"),
         # disabled temporialy due to env issue
         # --- JIT kernels (need icpx from the oneAPI toolchain) ---
         # BenchFile("bench_jit_rmsnorm.py"),

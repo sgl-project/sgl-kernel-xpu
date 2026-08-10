@@ -66,24 +66,30 @@ def ref_mla_prefill_varlen(
         q_full = torch.cat([q_n, q_p], dim=-1)  # (seqlen_q, H, D_ckv)
         q_full = q_full.permute(1, 0, 2)  # (H, seqlen_q, D_ckv)
 
-        k_full = kv.unsqueeze(0).expand(H, -1, -1)  # (H, seqlen_k, D_ckv)
-        v_full = kv[:, :D_latent].unsqueeze(0).expand(H, -1, -1)
+        # Attend with the KV shared across heads rather than expanded to
+        # (H, seqlen_k, D_ckv), and with a single (seqlen_q, seqlen_k) mask
+        # that broadcasts over heads. SDPA on an expanded K/V plus an
+        # H-replicated mask dominated the cost of this file.
+        k_full = kv  # (seqlen_k, D_ckv)
+        v_full = kv[:, :D_latent]  # (seqlen_k, D_latent)
 
         if causal:
             # Causal mask: k_idx <= (seqlen_k - seqlen_q) + q_idx
             causal_offset = seqlen_k - seqlen_q
             q_idx = torch.arange(seqlen_q).unsqueeze(1)
             k_idx = torch.arange(seqlen_k).unsqueeze(0)
-            mask = k_idx > (causal_offset + q_idx)
             attn_mask = torch.zeros(seqlen_q, seqlen_k, dtype=torch.float32)
-            attn_mask.masked_fill_(mask, float("-inf"))
-            attn_mask = attn_mask.unsqueeze(0).expand(H, -1, -1)
-
-            o = F.scaled_dot_product_attention(
-                q_full, k_full, v_full, scale=scale, attn_mask=attn_mask
-            )
+            attn_mask.masked_fill_(k_idx > (causal_offset + q_idx), float("-inf"))
         else:
-            o = F.scaled_dot_product_attention(q_full, k_full, v_full, scale=scale)
+            attn_mask = None
+
+        o = F.scaled_dot_product_attention(
+            q_full,  # (H, seqlen_q, D_ckv)
+            k_full.unsqueeze(0),  # (1, seqlen_k, D_ckv) — broadcast over heads
+            v_full.unsqueeze(0),  # (1, seqlen_k, D_latent)
+            scale=scale,
+            attn_mask=attn_mask,
+        )
 
         out[q_start:q_end] = o.permute(1, 0, 2)
 

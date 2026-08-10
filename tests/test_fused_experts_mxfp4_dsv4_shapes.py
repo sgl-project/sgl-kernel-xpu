@@ -14,6 +14,7 @@ directly when a targeted DSV4 regression check is needed:
 """
 
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 import pytest
@@ -73,9 +74,14 @@ def _torch_mxfp4_moe_reference(
     ).sum(dim=1) * routed_scaling_factor
 
 
+@lru_cache(maxsize=None)
 def _build_packed_weights(E, N, K):
     # Quantize one expert at a time to avoid materializing a full
     # (E, N, K) bf16 tensor plus its fp32 copy on the host.
+    #
+    # Cached: the host-side MXFP4 quantization is the dominant cost of this
+    # file (tens of seconds per (E, N, K) at DSV4 sizes) and the weights only
+    # depend on the shape, so the swiglu_limit cases reuse one build.
     packed = torch.empty((E, N, K // 2), dtype=torch.uint8)
     scales = torch.empty((E, N, K // MXFP4_BLOCK_SIZE), dtype=torch.uint8)
     for e in range(E):
@@ -151,6 +157,11 @@ def test_fused_experts_dsv4_shape(
         num_experts, 2 * intermediate, hidden
     )
     w2_packed, w2_scale_u8 = _build_packed_weights(num_experts, hidden, intermediate)
+
+    # Re-seed: _build_packed_weights is cached, so whether it consumed RNG
+    # depends on which case ran first. Re-seeding keeps the routing below
+    # identical regardless of cache state / test order.
+    torch.manual_seed(0)
 
     # Keep raw E8M0 scales for both the W4A16 kernel and reference decoder.
     w1_scale = w1_scale_u8.to("xpu")

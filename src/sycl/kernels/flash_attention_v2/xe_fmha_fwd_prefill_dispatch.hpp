@@ -40,11 +40,11 @@ namespace prefill {
 // Parameters:
 //   HEAD_DIM in {64, 72, 96, 128, 192, 256, 512}
 
-#define EXTERN_FMHA_PREFILL_RUNNER(HD)             \
-  extern template struct FmhaPrefillRunner<HD>;    \
+#define EXTERN_FMHA_PREFILL_RUNNER(HD)          \
+  extern template struct FmhaPrefillRunner<HD>; \
   extern template struct FmhaPrefillRunner<HD, cutlass::half_t>;
-#define EXTERN_FMHA_PREFILL_NP_RUNNER(HD)          \
-  extern template struct FmhaPrefillNpRunner<HD>;  \
+#define EXTERN_FMHA_PREFILL_NP_RUNNER(HD)         \
+  extern template struct FmhaPrefillNpRunner<HD>; \
   extern template struct FmhaPrefillNpRunner<HD, cutlass::half_t>;
 
 // Paged prefill runners: paged head dims only (64, 96, 128, 192, 256, 512).
@@ -79,34 +79,31 @@ EXTERN_FMHA_PREFILL_NP_RUNNER(512)
 // (FmhaPrefillRunner<HD, Element>). Each (query dtype, KV dtype) is a separate
 // translation unit / shared library.
 
-#define DISPATCH_PREFILL_KERNEL(HD)                                                    \
-  do {                                                                                 \
-    TORCH_CHECK(                                                                        \
-        params.is_bf16 || params.is_fp16, "Prefill attention only supports bf16/fp16 query"); \
-    if (params.is_e4m3 || params.is_e5m2) {                                            \
-      if (params.is_fp16) {                                                            \
-        FmhaPrefillFp8Runner<HD, cutlass::half_t>{}(params);                           \
-      } else {                                                                         \
-        FmhaPrefillFp8Runner<HD>{}(params);                                            \
-      }                                                                                \
-    } else if (params.is_fp16) {                                                       \
-      FmhaPrefillRunner<HD, cutlass::half_t>{}(params);                                \
-    } else {                                                                           \
-      FmhaPrefillRunner<HD>{}(params);                                                 \
-    }                                                                                  \
+#define DISPATCH_PREFILL_KERNEL(HD)                                                                   \
+  do {                                                                                                \
+    TORCH_CHECK(params.is_bf16 || params.is_fp16, "Prefill attention only supports bf16/fp16 query"); \
+    if (params.is_e4m3 || params.is_e5m2) {                                                           \
+      if (params.is_fp16) {                                                                           \
+        FmhaPrefillFp8Runner<HD, cutlass::half_t>{}(params);                                          \
+      } else {                                                                                        \
+        FmhaPrefillFp8Runner<HD>{}(params);                                                           \
+      }                                                                                               \
+    } else if (params.is_fp16) {                                                                      \
+      FmhaPrefillRunner<HD, cutlass::half_t>{}(params);                                               \
+    } else {                                                                                          \
+      FmhaPrefillRunner<HD>{}(params);                                                                \
+    }                                                                                                 \
   } while (0)
 
 // Non-paged (no_page) prefill: 16-bit (bf16/fp16) query only (no fp8 KV cache).
-#define DISPATCH_PREFILL_NOPAGE_KERNEL(HD)                                                       \
-  do {                                                                                           \
-    TORCH_CHECK(                                                                                  \
-        params.is_bf16 || params.is_fp16,                                                        \
-        "Non-paged prefill attention only supports bf16/fp16 query");                            \
-    if (params.is_fp16) {                                                                        \
-      FmhaPrefillNpRunner<HD, cutlass::half_t>{}(params);                                        \
-    } else {                                                                                     \
-      FmhaPrefillNpRunner<HD>{}(params);                                                         \
-    }                                                                                            \
+#define DISPATCH_PREFILL_NOPAGE_KERNEL(HD)                                                                      \
+  do {                                                                                                          \
+    TORCH_CHECK(params.is_bf16 || params.is_fp16, "Non-paged prefill attention only supports bf16/fp16 query"); \
+    if (params.is_fp16) {                                                                                       \
+      FmhaPrefillNpRunner<HD, cutlass::half_t>{}(params);                                                       \
+    } else {                                                                                                    \
+      FmhaPrefillNpRunner<HD>{}(params);                                                                        \
+    }                                                                                                           \
   } while (0)
 
 }  // namespace prefill

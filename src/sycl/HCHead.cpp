@@ -6,6 +6,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 static constexpr int WG_SIZE = 256;
 static constexpr int HC_MULT = 4;
@@ -156,7 +157,7 @@ static at::Tensor launch_fused_hc_head(
   return y;
 }
 
-at::Tensor fused_hc_head(
+at::Tensor SGL_KERNEL_EXPORT fused_hc_head(
     const at::Tensor& x,
     const at::Tensor& hc_fn,
     const at::Tensor& hc_scale,

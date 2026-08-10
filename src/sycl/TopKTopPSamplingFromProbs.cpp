@@ -10,9 +10,9 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
-#include "sgl_kernel_export.h"
 #include "comm/Random.h"
 #include "comm/Sampling.h"
+#include "sgl_kernel_export.h"
 
 namespace {
 

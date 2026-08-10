@@ -30,13 +30,17 @@
  *
  **************************************************************************************************/
 // Auto-generated from xe_fmha_fwd_prefill_nopage_kernel.cpp.in
-// Template parameters: HEAD_DIM=@HEAD_DIM@ (non-paged / no_page attention)
+// Template parameters: HEAD_DIM=@HEAD_DIM@, TILED_OUT_NP=@TILED_OUT_NP@ (non-paged / no_page attention)
 //
 // The non-paged (contiguous ragged) KV-cache prefill path is compiled into its
 // own translation unit / runner type (FmhaPrefillNpRunner) so its kernel
 // instantiations land in shared libraries separate from the paged prefill path.
 // Non-paged prefill supports bf16/fp16 queries only (no fp8 KV cache).
 #define SYCL_INTEL_TARGET 20
+
+#if @ENABLE_SCORE_BLOCK2D@
+#define FMHA_PREFILL_ENABLE_SCORE_BLOCK2D 1
+#endif
 
 #include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_runner.hpp"
 
@@ -51,7 +55,7 @@ __attribute__((visibility("default"))) void FmhaPrefillNpRunner<@HEAD_DIM@>::ope
       "No-page attention does not support sink logits (softmax_sink_ptr must be null)");
   using TileShapeQK = cute::Shape<cute::Int<@TILED_Q_NP@>, cute::Int<@TILED_KV_NP@>, cute::_32>;
   using TileShapePV = cute::Shape<cute::Int<@TILED_Q_NP@>, cute::_32, cute::Int<@TILED_KV_NP@>>;
-  using TileShapeOutput = cute::Shape<cute::Int<@TILED_Q_NP@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;
+  using TileShapeOutput = cute::Shape<cute::Int<@TILED_Q_NP@>, cute::Int<@TILED_OUT_NP@>>;
   using SubgroupLayoutQK = cute::
       Layout<cute::Shape<cute::Int<@NUM_SG_NP@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
   // No sink support for no_page path; always use Sink=false

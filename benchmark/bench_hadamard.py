@@ -6,7 +6,6 @@ import torch
 import triton
 from sgl_kernel import hadamard_transform
 
-# Sweep configuration.
 batch_size_range = [1, 16, 64, 256]
 dim_range = [64, 256, 1024, 4096, 8192, 16384, 32768]
 dtype_range = [torch.float16, torch.bfloat16, torch.float32]

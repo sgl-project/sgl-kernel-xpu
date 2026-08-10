@@ -51,7 +51,7 @@ set(FMHA_PREFILL_NUM_SG_512 32)
 set(FMHA_PREFILL_TILED_OUT_512 256)
 option(
     FMHA_PREFILL_ENABLE_SCORE_BLOCK2D_512
-    "Reuse QK scores across the two output tiles for paged HEAD_DIM=512 prefill"
+    "Reuse QK scores across the two output tiles for HEAD_DIM=512 prefill"
     ON)
 
 # Per-HEAD_DIM tile shape parameters for the NON-PAGED (contiguous ragged) KV
@@ -89,6 +89,7 @@ set(FMHA_PREFILL_NUM_SG_NP_256 16)
 set(FMHA_PREFILL_TILED_Q_NP_512 128)
 set(FMHA_PREFILL_TILED_KV_NP_512 128)
 set(FMHA_PREFILL_NUM_SG_NP_512 16)
+set(FMHA_PREFILL_TILED_OUT_NP_512 256)
 
 # --- Paged prefill + FP8: paged head dims only, bf16 query only. ---
 # prefill_paged (16-bit KV) and prefill_fp8 (e4m3/e5m2 KV) are independent
@@ -131,6 +132,16 @@ foreach(HEAD_DIM ${FMHA_PREFILL_NP_HEAD_DIMS})
     set(NUM_SG_NP ${FMHA_PREFILL_NUM_SG_NP_${HEAD_DIM}})
     if(NOT TILED_Q_NP OR NOT TILED_KV_NP OR NOT NUM_SG_NP)
         message(FATAL_ERROR "Missing non-paged tile params for prefill HEAD_DIM=${HEAD_DIM}")
+    endif()
+
+    math(EXPR TILED_OUT_NP "((${HEAD_DIM} + 31) / 32) * 32")
+    if(DEFINED FMHA_PREFILL_TILED_OUT_NP_${HEAD_DIM})
+        set(TILED_OUT_NP ${FMHA_PREFILL_TILED_OUT_NP_${HEAD_DIM}})
+    endif()
+
+    set(ENABLE_SCORE_BLOCK2D 0)
+    if(HEAD_DIM STREQUAL "512" AND FMHA_PREFILL_ENABLE_SCORE_BLOCK2D_512)
+        set(ENABLE_SCORE_BLOCK2D 1)
     endif()
 
     set(GENERATED_NP_FILE

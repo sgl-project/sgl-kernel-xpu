@@ -102,21 +102,17 @@ def _test_accuracy_once(M, N, K, out_dtype, device):
     reason="fp8_blockwise_scaled_mm is only registered on Xe3 (CRI) builds",
 )
 # K and N must be multiples of 128 for the blockwise (1,128)+(128,128) kernel.
-# The default shape set is kept small so the CI simulator can finish it in a
-# reasonable time; the production-sized sweep is gated on LONG_TESTS=1.
-# The small non-multiple-of-128 M values are cheap and cover the ragged-M path.
+# N and K sweep the full production shape set; only the large-M variants stay
+# behind LONG_TESTS=1. The small non-multiple-of-128 M values are cheap and
+# cover the ragged-M path.
 @pytest.mark.parametrize(
     "M", [1, 3, 5, 127, 128, 512] + ([1024, 4096] if LONG_TESTS else [])
 )
 @pytest.mark.parametrize(
-    "N",
-    [128, 256, 512]
-    + ([768, 1024, 2048, 4096, 5120, 8192, 14080, 25600, 28672] if LONG_TESTS else []),
+    "N", [128, 256, 512, 768, 1024, 2048, 4096, 5120, 8192, 14080, 25600, 28672]
 )
 @pytest.mark.parametrize(
-    "K",
-    [128, 256, 512]
-    + ([1024, 2048, 4096, 5120, 8192, 14080, 16384] if LONG_TESTS else []),
+    "K", [128, 256, 512, 1024, 2048, 4096, 5120, 8192, 14080, 16384]
 )
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 def test_accuracy(M, N, K, out_dtype):

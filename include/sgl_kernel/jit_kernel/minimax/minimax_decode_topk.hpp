@@ -605,6 +605,7 @@ class MinimaxDecodeTopKPageTableKernel {
       int32_t page_size,
       int32_t r2t_stride,
       int32_t max_kv_len,
+      int32_t max_reqs,
       int32_t max_sparse_pages,
       ::sycl::local_accessor<PageTableSmem, 1> smem)
       : score_(score),
@@ -621,6 +622,7 @@ class MinimaxDecodeTopKPageTableKernel {
         page_size_(page_size),
         r2t_stride_(r2t_stride),
         max_kv_len_(max_kv_len),
+        max_reqs_(max_reqs),
         max_sparse_pages_(max_sparse_pages),
         smem_(smem) {}
 
@@ -644,8 +646,10 @@ class MinimaxDecodeTopKPageTableKernel {
 
     const int64_t out_row = static_cast<int64_t>(b) * num_heads_ + h;
     int32_t* pt_row = page_table_ + out_row * max_sparse_pages_;
-    const int64_t r2t_base =
-        static_cast<int64_t>(slot_ids_[b]) * r2t_stride_;
+    // Wrap the slot into range like the Triton reference does: out-of-range or
+    // negative slot_ids would otherwise index req_to_token out of bounds.
+    const int64_t slot = static_cast<int64_t>(slot_ids_[b]) % max_reqs_;
+    const int64_t r2t_base = (slot < 0 ? slot + max_reqs_ : slot) * r2t_stride_;
 
     if (num_blocks <= topk_) {
       // Trivial: every block selected in ascending order, all tokens valid.
@@ -735,6 +739,7 @@ class MinimaxDecodeTopKPageTableKernel {
   int32_t page_size_;
   int32_t r2t_stride_;
   int32_t max_kv_len_;
+  int32_t max_reqs_;
   int32_t max_sparse_pages_;
   ::sycl::local_accessor<PageTableSmem, 1> smem_;
 };
@@ -760,8 +765,9 @@ void minimax_decode_topk_page_table_launcher(
     int32_t page_size,
     int32_t r2t_stride,
     int32_t max_kv_len,
+    int32_t max_reqs,
     int32_t max_sparse_pages) {
-  if (batch == 0 || num_heads == 0) return;
+  if (batch == 0 || num_heads == 0 || max_reqs == 0) return;
 
   const size_t num_groups = static_cast<size_t>(batch) * num_heads;
   queue.submit([&](::sycl::handler& cgh) {
@@ -785,6 +791,7 @@ void minimax_decode_topk_page_table_launcher(
             page_size,
             r2t_stride,
             max_kv_len,
+            max_reqs,
             max_sparse_pages,
             smem));
   });
@@ -833,12 +840,13 @@ void minimax_decode_topk_page_table_launcher(
       int32_t page_size,                                                           \
       int32_t r2t_stride,                                                          \
       int32_t max_kv_len,                                                          \
+      int32_t max_reqs,                                                            \
       int32_t max_sparse_pages) {                                                  \
     auto& queue = *static_cast<::sycl::queue*>(queue_ptr);                         \
     minimax_decode_topk_page_table_launcher<T>(                                    \
         queue, score, seq_lens, req_to_token, slot_ids, page_table,                \
         seq_lens_out, batch, num_heads, max_seqblock, block_size, topk,            \
-        page_size, r2t_stride, max_kv_len, max_sparse_pages);                      \
+        page_size, r2t_stride, max_kv_len, max_reqs, max_sparse_pages);            \
   }
 #define DEFINE_MINIMAX_DECODE_TOPK_PAGE_TABLE(SUFFIX, T) \
   _DEFINE_MINIMAX_DECODE_TOPK_PAGE_TABLE(SUFFIX, T)

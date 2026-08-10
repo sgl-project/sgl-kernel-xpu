@@ -481,6 +481,38 @@ class TestMinimaxDecodeTopKPageTable:
         assert torch.equal(sl_kernel, sl_ref)
         assert torch.equal(pt_kernel, pt_ref)
 
+    @pytest.mark.parametrize("offset", [-1, 1, 3])
+    def test_slot_ids_wrapped(self, offset: int) -> None:
+        """Out-of-range / negative slot_ids wrap modulo max_reqs instead of
+        reading req_to_token out of bounds."""
+        num_heads, batch = 2, 3
+        block_size, topk, page_size = 64, 16, 1
+        max_seqblock = 128
+        seq_lens_list = [block_size * 100, block_size * 128, block_size * 90]
+        max_kv_len = max_seqblock * block_size
+        score, seq_lens, req_to_token, slot_ids = _build_page_table_inputs(
+            num_heads, batch, max_seqblock, seq_lens_list, max_kv_len,
+            contiguous_r2t=False, seed=17,
+        )
+        max_reqs = req_to_token.shape[0]
+        # Shift every slot out of range by a multiple of max_reqs; wrapping
+        # must land back on the original rows, so results are unchanged.
+        shifted = slot_ids + offset * max_reqs
+        assert bool(
+            ((shifted < 0) | (shifted >= max_reqs)).all().item()
+        ), "test inputs must actually be out of range"
+
+        pt_shifted, sl_shifted = minimax_decode_topk_page_table(
+            score, seq_lens, req_to_token, shifted,
+            block_size, topk, page_size,
+        )
+        pt_ref, sl_ref = _ref_page_table(
+            score, seq_lens, req_to_token, slot_ids,
+            block_size, topk, page_size,
+        )
+        assert torch.equal(sl_shifted, sl_ref)
+        assert torch.equal(pt_shifted, pt_ref)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

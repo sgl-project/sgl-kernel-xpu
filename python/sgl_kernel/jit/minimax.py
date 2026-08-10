@@ -65,6 +65,7 @@ _PAGE_TABLE_ARGTYPES = [
     ctypes.c_int32,   # page_size
     ctypes.c_int32,   # r2t_stride
     ctypes.c_int32,   # max_kv_len
+    ctypes.c_int32,   # max_reqs
     ctypes.c_int32,   # max_sparse_pages
 ]
 
@@ -207,6 +208,10 @@ def minimax_decode_topk_page_table(
             ``base_page * num_heads + h``.
         real_seq_lens: ``[batch * num_kv_heads]`` int32. Effective KV length
             per pseudo-request (only the final selected block can be partial).
+
+    ``slot_ids`` is wrapped modulo ``req_to_token.shape[0]`` in the kernel, as
+    the Triton reference does, so out-of-range or negative values cannot read
+    out of bounds.
     """
     if score.dtype != torch.float32:
         raise ValueError(f"score must be float32, got {score.dtype}")
@@ -277,6 +282,7 @@ def minimax_decode_topk_page_table(
     ppb = block_size // page_size
     max_sparse_pages = topk * ppb
     max_kv_len = req_to_token.shape[1]
+    max_reqs = req_to_token.shape[0]
     r2t_stride = req_to_token.stride(0)
     # The kernel addresses req_to_token as flat row-major (r2t_base + tok), so
     # the inner stride must be 1. A row-pitched slice of a larger pool tensor
@@ -319,6 +325,7 @@ def minimax_decode_topk_page_table(
         int(page_size),
         int(r2t_stride),
         int(max_kv_len),
+        int(max_reqs),
         int(max_sparse_pages),
     )
     return page_table, real_seq_lens

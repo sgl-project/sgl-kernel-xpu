@@ -131,9 +131,9 @@ EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG(512)
 // These expand inside decode::mha_fwd where a local `params` is in scope.
 //
 // Paged decode supports 16-bit (bf16/fp16) query. The KV layout is selected at
-// runtime: fp8 KV cache (FmhaDecodeFp8Runner / FmhaSplitDecodeFp8Runner, bf16
-// query) vs 16-bit KV (FmhaDecodeRunner / FmhaSplitDecodeRunner, bf16/fp16).
-// Each is a separate translation unit / shared library.
+// runtime: fp8 KV cache (FmhaDecodeFp8Runner / FmhaSplitDecodeFp8Runner, bf16 or
+// fp16 query) vs 16-bit KV (FmhaDecodeRunner / FmhaSplitDecodeRunner, bf16/fp16).
+// Each (query dtype, KV dtype) is a separate translation unit / shared library.
 
 #define DISPATCH_DECODE_KERNEL(QG, HD, PS)                                    \
   do {                                                                        \
@@ -141,7 +141,13 @@ EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG(512)
         params.is_bf16 || params.is_fp16,                                     \
         "Decode attention only supports bf16/fp16 query");                    \
     if (params.is_e4m3 || params.is_e5m2) {                                   \
-      if (params.use_split_kv) {                                              \
+      if (params.is_fp16) {                                                   \
+        if (params.use_split_kv) {                                            \
+          FmhaSplitDecodeFp8Runner<QG, HD, PS, cutlass::half_t>{}(params);    \
+        } else {                                                              \
+          FmhaDecodeFp8Runner<QG, HD, PS, cutlass::half_t>{}(params);         \
+        }                                                                     \
+      } else if (params.use_split_kv) {                                       \
         FmhaSplitDecodeFp8Runner<QG, HD, PS>{}(params);                       \
       } else {                                                                \
         FmhaDecodeFp8Runner<QG, HD, PS>{}(params);                            \

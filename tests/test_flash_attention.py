@@ -1469,7 +1469,7 @@ def test_flash_attn_decode_kvcache(
     reason="fp8 KV cache attention is an XPU (sgl-kernel-xpu) feature",
 )
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("q_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("q_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("nheads_q,nheads_kv", [(8, 8), (8, 2)])
 @pytest.mark.parametrize("d", [128, 256])

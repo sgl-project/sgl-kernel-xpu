@@ -75,16 +75,20 @@ EXTERN_FMHA_PREFILL_NP_RUNNER(512)
 // Expands inside prefill::mha_fwd where a local `params` is in scope.
 //
 // Paged prefill supports 16-bit (bf16/fp16) query. The KV layout is selected at
-// runtime: fp8 KV cache (FmhaPrefillFp8Runner, bf16 query) vs 16-bit KV
-// (FmhaPrefillRunner<HD, Element>). Each is a separate translation unit / shared
-// library.
+// runtime: fp8 KV cache (FmhaPrefillFp8Runner, bf16 or fp16 query) vs 16-bit KV
+// (FmhaPrefillRunner<HD, Element>). Each (query dtype, KV dtype) is a separate
+// translation unit / shared library.
 
 #define DISPATCH_PREFILL_KERNEL(HD)                                                    \
   do {                                                                                 \
     TORCH_CHECK(                                                                        \
         params.is_bf16 || params.is_fp16, "Prefill attention only supports bf16/fp16 query"); \
     if (params.is_e4m3 || params.is_e5m2) {                                            \
-      FmhaPrefillFp8Runner<HD>{}(params);                                              \
+      if (params.is_fp16) {                                                            \
+        FmhaPrefillFp8Runner<HD, cutlass::half_t>{}(params);                           \
+      } else {                                                                         \
+        FmhaPrefillFp8Runner<HD>{}(params);                                            \
+      }                                                                                \
     } else if (params.is_fp16) {                                                       \
       FmhaPrefillRunner<HD, cutlass::half_t>{}(params);                                \
     } else {                                                                           \

@@ -831,14 +831,15 @@ struct FmhaSplitDecodeRunner {
 
 // FP8 KV-cache decode paths are split into their own runner types so that the
 // (heavy) fp8 e4m3/e5m2 kernel instantiations are compiled in a separate
-// translation unit from the bf16 paged decode path. This keeps the peak
+// translation unit from the 16-bit paged decode path. This keeps the peak
 // compiler memory of any single decode TU low (avoids OOM during AOT build).
-template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
+// The trailing Element is the QUERY dtype (bf16 or fp16); K/V stay fp8.
+template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE, class Element = cutlass::bfloat16_t>
 struct FmhaDecodeFp8Runner {
   void operator()(const Arguments& params) const;
 };
 
-template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
+template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE, class Element = cutlass::bfloat16_t>
 struct FmhaSplitDecodeFp8Runner {
   void operator()(const Arguments& params) const;
 };

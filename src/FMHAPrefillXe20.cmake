@@ -22,7 +22,8 @@ set(FMHA_PREFILL_NOPAGE_TEMPLATE
 
 # FP8 KV-cache prefill path is split into a dedicated runner TU
 # (FmhaPrefillFp8Runner) so its heavy e4m3/e5m2 kernel instantiations do not
-# inflate the bf16/fp16 prefill TU's peak compiler memory.
+# inflate the 16-bit-KV prefill TU's peak compiler memory. The KV cache is fp8
+# while the query dtype is bf16 or fp16 (each its own TU / .so).
 set(FMHA_PREFILL_FP8_TEMPLATE
     "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_fp8_kernel.cpp.in")
 
@@ -94,11 +95,13 @@ set(FMHA_PREFILL_NUM_SG_NP_512 16)
 set(FMHA_PREFILL_TILED_OUT_NP_512 256)
 
 # --- Paged prefill + FP8: paged head dims only. ---
-# prefill_paged (16-bit KV: bf16 + fp16) and prefill_fp8 (e4m3/e5m2 KV, bf16
-# query) are independent shared libraries per HEAD_DIM.
+# prefill_page (16-bit KV) and prefill_page (fp8 KV) are independent shared
+# libraries per (HEAD_DIM, query dtype, KV dtype).
 #
-# 16-bit query element tags. bf16 keeps the historical (untagged) file names;
-# fp16 gets a `_fp16` suffix so it links into an independent shared library.
+# Generated file name order (so name = lib<file>.so):
+#   xe_fmha_fwd_prefill_<page|nopage>_<HEAD_DIM>_<Qtype>_<KVtype>
+# where the trailing tags are the query dtype then the KV-cache dtype (16-bit:
+# KV==Q -> *_bf16_bf16 / *_fp16_fp16; fp8: KV=fp8 -> *_bf16_fp8 / *_fp16_fp8).
 set(FMHA_PREFILL_ELEM_TAGS bf16 fp16)
 
 foreach(HEAD_DIM ${FMHA_PREFILL_PAGED_HEAD_DIMS})
@@ -124,25 +127,26 @@ foreach(HEAD_DIM ${FMHA_PREFILL_PAGED_HEAD_DIMS})
     foreach(ELEM_TAG ${FMHA_PREFILL_ELEM_TAGS})
         if(ELEM_TAG STREQUAL "bf16")
             set(ELEM_TYPE "cutlass::bfloat16_t")
-            set(ELEM_SUFFIX "")
         else()
             set(ELEM_TYPE "cutlass::half_t")
-            set(ELEM_SUFFIX "_${ELEM_TAG}")
         endif()
+        set(DT16 "${ELEM_TAG}_${ELEM_TAG}")
+        set(DTFP8 "${ELEM_TAG}_fp8")
 
         set(GENERATED_FILE
-            "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_prefill_paged_kernel_${HEAD_DIM}${ELEM_SUFFIX}.cpp")
+            "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_prefill_page_${HEAD_DIM}_${DT16}.cpp")
         configure_file(${FMHA_PREFILL_TEMPLATE} ${GENERATED_FILE} @ONLY)
         list(APPEND device_cpp_xe20 ${GENERATED_FILE})
-    endforeach()
 
-    set(GENERATED_FP8_FILE
-        "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_prefill_fp8_kernel_${HEAD_DIM}.cpp")
-    configure_file(${FMHA_PREFILL_FP8_TEMPLATE} ${GENERATED_FP8_FILE} @ONLY)
-    list(APPEND device_cpp_xe20 ${GENERATED_FP8_FILE})
+        # FP8 KV cache with a bf16/fp16 query (KV dtype = fp8, Q dtype = ELEM_TYPE).
+        set(GENERATED_FP8_FILE
+            "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_prefill_page_${HEAD_DIM}_${DTFP8}.cpp")
+        configure_file(${FMHA_PREFILL_FP8_TEMPLATE} ${GENERATED_FP8_FILE} @ONLY)
+        list(APPEND device_cpp_xe20 ${GENERATED_FP8_FILE})
+    endforeach()
 endforeach()
 
-# --- Non-paged (no_page) prefill: np head dims only, no fp8. 16-bit KV (bf16 + fp16). ---
+# --- Non-paged (no_page) prefill: np head dims only, no fp8. 16-bit KV (KV==Q). ---
 foreach(HEAD_DIM ${FMHA_PREFILL_NP_HEAD_DIMS})
     set(TILED_Q_NP ${FMHA_PREFILL_TILED_Q_NP_${HEAD_DIM}})
     set(TILED_KV_NP ${FMHA_PREFILL_TILED_KV_NP_${HEAD_DIM}})
@@ -164,14 +168,13 @@ foreach(HEAD_DIM ${FMHA_PREFILL_NP_HEAD_DIMS})
     foreach(ELEM_TAG ${FMHA_PREFILL_ELEM_TAGS})
         if(ELEM_TAG STREQUAL "bf16")
             set(ELEM_TYPE "cutlass::bfloat16_t")
-            set(ELEM_SUFFIX "")
         else()
             set(ELEM_TYPE "cutlass::half_t")
-            set(ELEM_SUFFIX "_${ELEM_TAG}")
         endif()
+        set(DT16 "${ELEM_TAG}_${ELEM_TAG}")
 
         set(GENERATED_NP_FILE
-            "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_prefill_nopage_kernel_${HEAD_DIM}${ELEM_SUFFIX}.cpp")
+            "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_prefill_nopage_${HEAD_DIM}_${DT16}.cpp")
         configure_file(${FMHA_PREFILL_NOPAGE_TEMPLATE} ${GENERATED_NP_FILE} @ONLY)
         list(APPEND device_cpp_xe20 ${GENERATED_NP_FILE})
     endforeach()

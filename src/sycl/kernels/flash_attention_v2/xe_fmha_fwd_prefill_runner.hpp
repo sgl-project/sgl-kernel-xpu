@@ -571,10 +571,11 @@ struct FmhaPrefillNpRunner {
 // FP8 KV-cache prefill path is split into its own runner type so that the
 // (heavy) e4m3/e5m2 kernel instantiations — which also fan out over
 // is_local x is_causal — are compiled in a separate translation unit from the
-// bf16 paged prefill path. This keeps the peak compiler memory of any
+// 16-bit paged prefill path. This keeps the peak compiler memory of any
 // single prefill TU low (avoids OOM during AOT build). The dispatch forwards to
-// this when params.is_e4m3 || is_e5m2.
-template <int HEAD_DIM>
+// this when params.is_e4m3 || is_e5m2. The trailing Element is the QUERY dtype
+// (bf16 or fp16); K/V stay fp8.
+template <int HEAD_DIM, class Element = cutlass::bfloat16_t>
 struct FmhaPrefillFp8Runner {
   void operator()(const Arguments& params) const;
 };

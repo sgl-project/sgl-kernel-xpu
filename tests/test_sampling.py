@@ -10,9 +10,30 @@ import utils
 device = utils.get_device()
 
 
-@pytest.mark.skip(reason="not implemented")
+def torch_top_k_top_p_joint_mask(
+    batch_size, vocab_size, k, p, normalized_prob, eps=1e-4
+):
+    dev = normalized_prob.device
+    if not isinstance(k, torch.Tensor):
+        k = torch.full((batch_size,), k, dtype=torch.int64, device=dev)
+    if not isinstance(p, torch.Tensor):
+        p = torch.full((batch_size,), p, dtype=normalized_prob.dtype, device=dev)
+    # top-p mask
+    sorted_prob, indices = torch.sort(normalized_prob, descending=False)
+    cdf = torch.cumsum(sorted_prob, dim=-1)
+    mask_top_p = torch.zeros(batch_size, vocab_size, dtype=torch.int32, device=dev)
+    threshold_p = (1 - p).unsqueeze(-1) - eps
+    mask_top_p.scatter_add_(1, indices, (cdf > threshold_p).int())
+    # top-k mask
+    sorted_prob, _ = torch.sort(normalized_prob, descending=True)
+    pivot = sorted_prob[torch.arange(batch_size, device=dev), k - 1]
+    mask_top_k = (normalized_prob >= pivot.unsqueeze(-1)).int()
+    # overall mask
+    return torch.minimum(mask_top_p, mask_top_k)
+
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256, 151936])
 @pytest.mark.parametrize("p", [0.1, 0.5])
 def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
     torch.manual_seed(42)
@@ -22,24 +43,50 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
         k = int(vocab_size * 0.1)
     else:
         raise ValueError("p not recognized")
-    eps = 1e-4
     pre_norm_prob = torch.rand(batch_size, vocab_size, device=f"{device}:0")
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
-    # top-p mask
-    sorted_prob, indices = torch.sort(normalized_prob, descending=False)
-    cdf = torch.cumsum(sorted_prob, dim=-1)
-    mask_top_p = torch.zeros(
-        batch_size, vocab_size, dtype=torch.int32, device=f"{device}:0"
-    )
-    mask_top_p.scatter_add_(1, indices, (cdf > (1 - p) - eps).int())
-    # top-k mask
-    sorted_prob, _ = torch.sort(normalized_prob, descending=True)
-    pivot = sorted_prob[:, k - 1]
-    mask_top_k = (normalized_prob >= pivot.unsqueeze(-1)).int()
-    # overall mask
-    mask = torch.minimum(mask_top_p, mask_top_k)
+    mask = torch_top_k_top_p_joint_mask(batch_size, vocab_size, k, p, normalized_prob)
     top_p_tensor = torch.full((batch_size,), p, device=f"{device}:0")
     top_k_tensor = torch.full((batch_size,), k, device=f"{device}:0")
+
+    num_trails = 1000
+    for _ in range(num_trails):
+        samples = sgl_kernel.top_k_top_p_sampling_from_probs(
+            normalized_prob,
+            top_k_tensor,
+            top_p_tensor,
+            filter_apply_order="joint",
+        )
+        assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
+        assert torch.all(mask[torch.arange(batch_size), samples] == 1), normalized_prob[
+            torch.arange(batch_size), samples
+        ]
+
+
+@pytest.mark.parametrize("batch_size", [1, 16, 128])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("k_range", [(10, 50), (50, 200)])
+@pytest.mark.parametrize("p_range", [(0.1, 0.3), (0.3, 0.7)])
+def test_top_k_top_p_joint_sampling_from_probs_array(
+    batch_size, vocab_size, k_range, p_range
+):
+    # per-request top_k and top_p arrays, exercised together against the joint kernel
+    k_min, k_max = k_range
+    if k_max > vocab_size:
+        pytest.skip("k_max should be less than vocab_size")
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device=f"{device}:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    top_k_tensor = torch.randint(
+        k_min, k_max, (batch_size,), dtype=torch.int64, device=f"{device}:0"
+    )
+    top_p_tensor = torch.empty(batch_size, device=f"{device}:0").uniform_(
+        p_range[0], p_range[1]
+    )
+    mask = torch_top_k_top_p_joint_mask(
+        batch_size, vocab_size, top_k_tensor, top_p_tensor, normalized_prob
+    )
 
     num_trails = 1000
     for _ in range(num_trails):

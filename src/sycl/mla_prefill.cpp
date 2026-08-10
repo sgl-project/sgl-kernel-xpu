@@ -46,6 +46,7 @@
 #include <sycl/sycl.hpp>
 
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 #include "sycl/kernels/mla/device/mla_decode_types.hpp"  // MlaXe workspace helper
 #include "sycl/kernels/mla/device/mla_prefill_dispatch.hpp"
 #include "sycl/kernels/mla/device/mla_prefill_types.hpp"
@@ -177,7 +178,7 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
 }  // namespace
 
 /// @brief Dispatch kernel for MLA prefill with varlen/ragged Q and causal mask.
-void flash_mla_prefill(
+SGL_KERNEL_EXPORT void flash_mla_prefill(
     at::Tensor& out,                        // (total_q, num_heads, latent_dim)
     const at::Tensor& q_nope,               // (total_q, num_heads, latent_dim)
     const at::Tensor& q_pe,                 // (total_q, num_heads, rope_dim)
@@ -264,7 +265,7 @@ void flash_mla_prefill(
 /// @brief Workspace size for MLA prefill (currently 0 – no split-K).
 /// Signature mirrors flash_mla_get_workspace_size for caller ergonomics; on XPU
 /// the device sm_count is queried internally, so callers don't pass it.
-int64_t flash_mla_prefill_get_workspace_size(
+SGL_KERNEL_EXPORT int64_t flash_mla_prefill_get_workspace_size(
     int64_t /*max_seq_len*/,
     int64_t /*num_batches*/,
     int64_t /*num_heads*/,

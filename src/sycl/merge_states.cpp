@@ -8,6 +8,7 @@
 #include <sycl/sycl.hpp>
 
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 inline float to_float(float u) {
   return u;
@@ -334,7 +335,7 @@ void merge_attn_states_launcher_sycl(
 #define CALL_MERGE_ATTN_STATES_LAUNCHER_SYCL(scalar_t) \
   { merge_attn_states_launcher_sycl<scalar_t>(v_a, s_a, v_b, s_b, v_merged, s_merged); }
 
-void merge_state_v2(
+SGL_KERNEL_EXPORT void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged) {
   CHECK_INPUT(v_a);
   CHECK_INPUT(s_a);
@@ -385,8 +386,8 @@ void merge_state_launcher_sycl(
 #define CALL_MERGE_STATE_LAUNCHER_SYCL(scalar_t) \
   { merge_state_launcher_sycl<scalar_t>(v_a, s_a, v_b, s_b, v_merged, s_merged); }
 
-void merge_state(
-    at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged) {
+SGL_KERNEL_EXPORT void
+merge_state(at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged) {
   CHECK_INPUT(v_a);
   CHECK_INPUT(s_a);
   CHECK_INPUT(v_b);

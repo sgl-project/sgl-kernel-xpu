@@ -55,6 +55,7 @@
 #include <torch/all.h>
 
 #include <cute/tensor.hpp>
+#include <optional>
 #include <utility>
 
 #include "cutlass/bfloat16.h"
@@ -70,6 +71,7 @@
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/half.h"
 #include "cutlass/layout/matrix.h"
+#include "sycl/kernels/lora/collective/xe_lora_epilogue.hpp"
 #include "sycl/kernels/lora/device/group_gemm_lora_launcher.hpp"
 
 namespace at::native::xpu {
@@ -145,18 +147,23 @@ struct GroupGemmTypes {
   using EpilogueOp = cutlass::epilogue::fusion::LinearCombination<
       ElementAccumulator,  // <- must be ElementAccumulator for Grouped GEMM
       ElementComputeEpilogue,
-      ElementAccumulator,
+      ElementOutput,  // ElementSource_ (C) -- matches base_output storage dtype
       ElementAccumulator,
       cutlass::FloatRoundStyle::round_to_nearest>;
 
   using FusionCallbacks = cutlass::epilogue::fusion::
       FusionCallbacks<EpilogueDispatchPolicy, EpilogueOp, TileShape, decltype(cute::tile_shape(TiledMma()))>;
 
-  using CollectiveEpilogue = cutlass::epilogue::collective::CollectiveEpilogue<
-      EpilogueDispatchPolicy,
+  // Per-group scalar (alpha/beta) drop-in replacement for the stock
+  // CollectiveEpilogue<IntelXeGenericGroup, ...>. Same template arguments; it
+  // only overrides to_base_arguments() to offset the alpha/beta pointer arrays
+  // by the group index (the stock epilogue leaves them at [0] for every group
+  // because the array kernel hard-codes the tile L coord to 0). Inherits all
+  // other behaviour. See collective/xe_lora_epilogue.hpp.
+  using CollectiveEpilogue = cutlass::lora::kernel::GroupedEpiloguePerGroupScalar<
       TileShape,
-      void,  // EpilogueTile (void = automatic)
-      ElementAccumulator,
+      void,           // EpilogueTile (void = automatic)
+      ElementOutput,  // ElementC -- residual C (base_output) is bf16/fp16
       cutlass::gemm::TagToStrideC_t<LayoutC*>,
       ElementOutput,  // bf16/fp16 narrow here
       cutlass::gemm::TagToStrideC_t<LayoutD*>,
@@ -205,6 +212,16 @@ struct GroupGemmTypes {
 // c_ptrs aliased to d_ptrs; B-fwd passes beta=1 with a real residual C source).
 // All device pointers come from make_device_ptrs() and the meta tensors from
 // build_grouped_gemm_meta(); the caller keeps them alive across the kernel run.
+//
+// Per-segment alpha: the grouped epilogue (IntelXeGenericGroup) binds CUTLASS's
+// Sm90LinearCombinationPtrArray fusion. Its Sm90ScalarBroadcastPtrArray load
+// path supports per-group alpha through an *array of pointers* -- one pointer
+// per group -- read as `scalar = *(alpha_ptr_array[l_coord])` (no stride). So
+// pass `alpha_ptr_array` as a device int64 tensor holding one fp32* per segment
+// to compute D = alpha[seg] * (A @ B) + beta * C -- what B-fwd needs. (The
+// strided alpha_ptr value-buffer path is NOT used: on the Xe grouped epilogue
+// it collapses to alpha[0] for every group.) When alpha_ptr_array is
+// std::nullopt the scalar `alpha` broadcasts to every segment with stride 0.
 template <typename Types>
 inline typename Types::Gemm::Arguments args_from_options(
     const torch::Tensor& problem_sizes,  // int32  [num_segments, 3]  (M_s, N, K)
@@ -217,8 +234,11 @@ inline typename Types::Gemm::Arguments args_from_options(
     const torch::Tensor& stride_C,       // int64  [num_segments]     must equal stride_D
     const torch::Tensor& stride_D,       // int64  [num_segments]     leading dim of D = N
     int num_segments,
-    float alpha,   // epilogue scalar: D = alpha * (A @ B) + beta * C
-    float beta) {  //   A-fwd uses (1.0, 0.0); B-fwd / QKV-B-fwd use (1.0, 1.0) for in-place residual.
+    float alpha,  // epilogue scalar: D = alpha * (A @ B) + beta * C (used when alpha_ptr_array is null)
+    float beta,   //   A-fwd uses (1.0, 0.0); B-fwd / QKV-B-fwd use (1.0, 1.0) for in-place residual.
+    const std::optional<torch::Tensor>& alpha_ptr_array =
+        std::nullopt) {  // int64 [num_segments] device array-of-pointers, one fp32* per segment (overrides scalar
+                         // alpha)
   using GemmKernel = typename Types::GemmKernel;
   using ElementMma = typename Types::ElementMma;
   using ElementMmaB = typename Types::ElementMmaB;
@@ -261,15 +281,34 @@ inline typename Types::Gemm::Arguments args_from_options(
       typename GemmKernel::TileSchedulerArguments{1, RasterOrderOptions::AlongN}};
 
   // Epilogue thread arguments: D = alpha * acc + beta * C.
+  //
+  // alpha is either a single scalar broadcast to every segment or a per-segment
+  // array-of-pointers indexed by group as *(alpha_ptr_array[l_coord]) -- see
+  // Sm90ScalarBroadcastPtrArray::update_scalar(). beta stays a broadcast scalar
+  // for both LoRA forward kernels. The strided alpha_ptr value-buffer path is
+  // left null: it does not index per-group on the Xe grouped epilogue.
+  using ElementScalar = typename Types::ElementAccumulator;  // fusion scalar type (== alpha/beta element)
   auto& fusion_args = arguments.epilogue.thread;
-  fusion_args.alpha = alpha;
   fusion_args.beta = beta;
-  fusion_args.alpha_ptr = nullptr;
   fusion_args.beta_ptr = nullptr;
-  fusion_args.alpha_ptr_array = nullptr;
+  fusion_args.alpha_ptr = nullptr;
   fusion_args.beta_ptr_array = nullptr;
-  fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
-  fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
+  // The L (group) stride is a runtime int64 in the fusion's Stride<_0,_0,int64_t>,
+  // so the literal must be int64_t -- an int literal deduces the wrong tuple type.
+  fusion_args.dBeta = cute::make_stride(cute::_0{}, cute::_0{}, int64_t{0});
+
+  if (alpha_ptr_array.has_value()) {
+    // Per-segment alpha: device array of one fp32* per segment; the fusion reads
+    // *(alpha_ptr_array[l_coord]) for group l_coord (dAlpha L-stride 1).
+    fusion_args.alpha = ElementScalar(0);
+    fusion_args.alpha_ptr_array = reinterpret_cast<ElementScalar const* const*>(alpha_ptr_array->data_ptr<int64_t>());
+    fusion_args.dAlpha = cute::make_stride(cute::_0{}, cute::_0{}, int64_t{1});
+  } else {
+    // Single alpha broadcast to all segments (dAlpha L-stride 0).
+    fusion_args.alpha = alpha;
+    fusion_args.alpha_ptr_array = nullptr;
+    fusion_args.dAlpha = cute::make_stride(cute::_0{}, cute::_0{}, int64_t{0});
+  }
 
   return arguments;
 }

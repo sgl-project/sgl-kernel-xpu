@@ -6,6 +6,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 #define VEC_SIZE 4
 static constexpr int sub_group_size = 32;
@@ -242,7 +243,7 @@ struct MOEAlignBlockSizeSmallBatchExpertFunctor : public __SYCL_KER_CONFIG_CONVE
     int32_t* tokens_cnts = shared_mem + num_experts + 1;
 
     for (int i = 0; i < num_experts; ++i) {
-      tokens_cnts[num_experts + i] = 0;
+      tokens_cnts[(tid + 1) * num_experts + i] = 0;
     }
     item.barrier(sycl::access::fence_space::local_space);
 
@@ -309,7 +310,7 @@ struct MOEAlignBlockSizeSmallBatchExpertFunctor : public __SYCL_KER_CONFIG_CONVE
   sycl::local_accessor<int32_t> slm_;
 };
 
-void moe_align_block_size(
+SGL_KERNEL_EXPORT void moe_align_block_size(
     torch::Tensor topk_ids,
     int64_t num_experts,
     int64_t block_size,
@@ -326,7 +327,12 @@ void moe_align_block_size(
   DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
     auto stream = at::xpu::getCurrentXPUStream();
     auto queue = stream.queue();
-    bool small_batch_expert_mode = (topk_ids.numel() < 1024) && (num_experts <= 64);
+    // The small-batch path (MOEAlignBlockSizeSmallBatchExpertFunctor) is disabled:
+    // it produced incorrect all-zero expert_ids on some Intel GPU/driver stacks
+    // (e.g. B580 with IGC 2.28.4 / compute-runtime 26.05) even though it is
+    // logically equivalent to the CUDA reference and passes on newer stacks. The
+    // general path below handles these inputs correctly across all tested devices.
+    bool small_batch_expert_mode = false;
 
     if (small_batch_expert_mode) {
       const int32_t threads_local = std::max((int32_t)num_experts, sub_group_size);

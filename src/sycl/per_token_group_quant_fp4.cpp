@@ -32,6 +32,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 namespace at::native::xpu {
 
@@ -302,7 +303,7 @@ struct PerTokenGroupQuantFP4Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   int hidden_dim_num_groups;  // For column-major interleaving
 };
 
-void sgl_per_token_group_quant_fp4(
+SGL_KERNEL_EXPORT void sgl_per_token_group_quant_fp4(
     torch::Tensor input,
     torch::Tensor output_q,
     torch::Tensor output_s,

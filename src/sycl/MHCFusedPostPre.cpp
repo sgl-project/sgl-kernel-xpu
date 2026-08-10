@@ -6,6 +6,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 #include "sgl_kernel_ops.h"
 
 namespace {
@@ -376,7 +377,7 @@ void mhc_fused_post_pre_fma_kernel(
 
 }  // namespace
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> mhc_fused_post_pre_fma(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> SGL_KERNEL_EXPORT mhc_fused_post_pre_fma(
     const at::Tensor& x,
     const at::Tensor& residual,
     const at::Tensor& post_layer_mix,

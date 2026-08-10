@@ -54,7 +54,12 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
   using TileShapeQK_NP = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@TILED_KV_NP@>, cute::_64>;
   using TileShapePV_NP = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@TILED_KV_NP@>>;
   using TileShapeOutput_NP = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;
-  using SubgroupLayoutQK_NP = cute::Layout<cute::Shape<cute::_1, cute::Int<@TILED_KV_NP@ / 16>, cute::_1>>;
+  // Cap KV subgroups so the epilogue cross-subgroup reduction buffer fits in shared
+  // local memory (see kv_subgroups_for_slm); the full TILED_KV_NP/16 split overflows SLM
+  // for large head dims / GQA groups / KV tiles and hangs the device.
+  static constexpr int kKvSubgroups_NP = kv_subgroups_for_slm(
+      @TILED_KV_NP@ / 16, @QG_SZ@, ((@HEAD_DIM@ + 31) / 32) * 32);
+  using SubgroupLayoutQK_NP = cute::Layout<cute::Shape<cute::_1, cute::Int<kKvSubgroups_NP>, cute::_1>>;
   // No sink support for no_page path; always use Sink=false
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     using Element = bfloat16_t;

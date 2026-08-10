@@ -49,6 +49,15 @@
 using namespace cute;
 namespace decode {
 
+// Device shared-local-memory budget in bytes, keyed to the target Xe arch.
+#if SYCL_INTEL_TARGET == 20
+constexpr int slm_byte_budget = 128 * 1024;  // Xe20: 128 KiB SLM
+#elif SYCL_INTEL_TARGET == 35
+constexpr int slm_byte_budget = 384 * 1024;  // Xe35: 384 KiB SLM
+#else
+#error "Unsupported SYCL_INTEL_TARGET for decode SLM budget"
+#endif
+
 // Number of subgroups the KV (page) tile is split across, capped so the epilogue
 // cross-subgroup reduction buffer fits in shared local memory.
 //
@@ -61,11 +70,16 @@ namespace decode {
 // PAGE_SIZE=128 -> 132 KiB). Reducing the subgroup count keeps the buffer within
 // budget; it only lowers KV parallelism and does not affect correctness.
 //
+// This mirrors the epilogue's SLM layout by hand; the DecodeRunner/
+// SplitDecodeKernelRunner run() paths add a static_assert on the fully
+// instantiated kernel's real SharedStorageSize as a compile-time backstop in
+// case that layout ever diverges from this formula.
+//
 // full_kv_subgroups (= PAGE_SIZE / 16) is always a power of two, so the returned
 // value is the largest power-of-two divisor that fits the budget (>= 1).
 constexpr int kv_subgroups_for_slm(int full_kv_subgroups, int qg, int head_dim_rounded) {
-  constexpr int slm_float_budget = (128 * 1024) / static_cast<int>(sizeof(float));
-  const int aligned_qg = ((qg + 15) / 16) * 16;
+  constexpr int slm_float_budget = slm_byte_budget / static_cast<int>(sizeof(float));
+  const int aligned_qg = ((qg + intel::sg_size - 1) / intel::sg_size) * intel::sg_size;
   const int floats_per_subgroup = qg * head_dim_rounded + 2 * aligned_qg;
   const int max_subgroups = slm_float_budget / floats_per_subgroup;
   int sg = full_kv_subgroups;
@@ -333,6 +347,10 @@ struct DecodeRunner {
   }
 
   cutlass::Status run(const Arguments& params, const cutlass::KernelHardwareInfo& hw_info) {
+    static_assert(
+        FMHADecodeKernel::SharedStorageSize <= slm_byte_budget,
+        "Decode kernel SharedStorage exceeds the device SLM budget; lower the KV "
+        "subgroup split (see kv_subgroups_for_slm).");
     ProblemShapeType shape = initialize(params);
 
     typename FMHADecodeKernel::Arguments arguments{
@@ -496,6 +514,10 @@ struct SplitDecodeKernelRunner {
   }
 
   cutlass::Status run(const Arguments& params, const cutlass::KernelHardwareInfo& hw_info) {
+    static_assert(
+        FMHAKernel::SharedStorageSize <= slm_byte_budget && ReductionSplitKernel::SharedStorageSize <= slm_byte_budget,
+        "Split-decode kernel SharedStorage exceeds the device SLM budget; lower the "
+        "KV subgroup split (see kv_subgroups_for_slm).");
     ProblemShapeType shape = initialize(params);
 
     typename FMHAKernel::Arguments arguments{

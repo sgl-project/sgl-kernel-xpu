@@ -786,7 +786,7 @@ void topk_transform_512_launch(
 
 }  // namespace
 
-void topk_transform_512_interface(
+SGL_KERNEL_EXPORT void topk_transform_512_interface(
     const at::Tensor& scores,
     const at::Tensor& seq_lens,
     const at::Tensor& page_tables,
@@ -796,7 +796,7 @@ void topk_transform_512_interface(
   topk_transform_512_launch(scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices_opt);
 }
 
-void topk_transform_512_v2_interface(
+SGL_KERNEL_EXPORT void topk_transform_512_v2_interface(
     const at::Tensor& scores,
     const at::Tensor& seq_lens,
     const at::Tensor& page_tables,

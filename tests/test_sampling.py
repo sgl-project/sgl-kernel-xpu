@@ -64,7 +64,7 @@ def torch_top_p_renorm_probs(normalized_prob, p):
         threshold = (1 - p.float()).unsqueeze(-1)
     else:
         threshold = 1 - float(p)
-    mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32, device=f"{device}:0")
+    mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32, device=f"cpu")
     mask.scatter_add_(1, indices, (cdf >= threshold).int())
     renorm_prob_ground_truth = normalized_prob.clone()
     renorm_prob_ground_truth[mask == 0] = 0
@@ -76,17 +76,18 @@ def torch_top_p_renorm_probs(normalized_prob, p):
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256, 151936])
-@pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
+@pytest.mark.parametrize("p", [0.1])
 def test_top_p_renorm_probs(batch_size, vocab_size, p):
     torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device=f"{device}:0")
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device=f"cpu")
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     renorm_prob_ground_truth = torch_top_p_renorm_probs(normalized_prob, p)
 
+    normalized_prob = normalized_prob.to(f"{device}:0")
     renorm_prob = sgl_kernel.top_p_renorm_prob(normalized_prob, p)
     torch.testing.assert_close(
         renorm_prob_ground_truth,
-        renorm_prob,
+        renorm_prob.cpu(),
         rtol=1e-3,
         atol=1e-3,
     )

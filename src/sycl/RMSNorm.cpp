@@ -472,8 +472,12 @@ void rmsnorm_no_rstd_kernel(Norm& norm, const NormConfig& config) {
   using KernelFunctor = NormKernelFunctor<scalar_t, weight_t, vec_size, ITERS, Norm, cache_inputs>;
 
   KernelFunctor kfn(norm, config);
-  sycl::range<1> local_range{static_cast<size_t>(config.workgroup_size)};
-  sycl::range<1> global_range{static_cast<size_t>(config.workgroup_num * config.workgroup_size)};
+  sycl::range<3> local_range{
+      static_cast<size_t>(1), static_cast<size_t>(1), static_cast<size_t>(config.workgroup_size)};
+  sycl::range<3> global_range{
+      static_cast<size_t>(config.workgroup_num),
+      static_cast<size_t>(config.workgroup_num_foreach),
+      static_cast<size_t>(config.workgroup_size)};
   sycl_kernel_submit(global_range, local_range, queue, kfn);
 }
 

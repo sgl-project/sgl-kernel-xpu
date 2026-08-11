@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <sycl/sycl.hpp>
 
@@ -14,8 +15,13 @@
 
 namespace {
 
-// Work-group size
+// SLM/WG constants
 constexpr uint32_t kTopPRenormWgSize = 1024;
+constexpr uint32_t kTopPRenormSubGroupSize = 32;
+constexpr uint32_t kTopPRenormRadixBits = 8;
+constexpr uint32_t kTopPRenormRadix = 1u << kTopPRenormRadixBits;
+constexpr uint32_t kTopPRenormHistCopies = kTopPRenormWgSize / kTopPRenormSubGroupSize;
+constexpr uint32_t kTopPRenormHistElems = kTopPRenormHistCopies * kTopPRenormRadix;
 
 //----------------- bit-pattern transformation --------------------//
 
@@ -35,12 +41,12 @@ inline float top_p_from_ordered(uint32_t ordered) {
 template <uint32_t kVecSize>
 struct TopPRenormProbsRadixCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr uint32_t kWgSize = kTopPRenormWgSize;
-  static constexpr uint32_t kRadixBits = 8;
-  static constexpr uint32_t kRadix = 1u << kRadixBits;
+  static constexpr uint32_t kRadixBits = kTopPRenormRadixBits;
+  static constexpr uint32_t kRadix = kTopPRenormRadix;
   static constexpr uint32_t kNumRounds = 32u / kRadixBits;
-  static constexpr uint32_t kSubGroupSize = 32;
-  static constexpr uint32_t kNumHistCopies = kWgSize / kSubGroupSize;
-  static constexpr uint32_t kHistElems = kNumHistCopies * kRadix;
+  static constexpr uint32_t kSubGroupSize = kTopPRenormSubGroupSize;
+  static constexpr uint32_t kNumHistCopies = kTopPRenormHistCopies;
+  static constexpr uint32_t kHistElems = kTopPRenormHistElems;
 
   const float* probs;
   float* renorm_probs;
@@ -51,12 +57,15 @@ struct TopPRenormProbsRadixCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
 
   sycl::local_accessor<float, 1> sg_hist_;
   sycl::local_accessor<uint32_t, 1> prefix_;
-  sycl::local_accessor<float, 1> mass_;
+  // Mass above the bucket being refined, excluding and including that bucket.
+  sycl::local_accessor<float, 1> mass_excl_;
+  sycl::local_accessor<float, 1> mass_incl_;
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
     sg_hist_ = sycl::local_accessor<float, 1>(sycl::range<1>(kHistElems), cgh);
     prefix_ = sycl::local_accessor<uint32_t, 1>(sycl::range<1>(1), cgh);
-    mass_ = sycl::local_accessor<float, 1>(sycl::range<1>(2), cgh);
+    mass_excl_ = sycl::local_accessor<float, 1>(sycl::range<1>(1), cgh);
+    mass_incl_ = sycl::local_accessor<float, 1>(sycl::range<1>(1), cgh);
   }
 
   TopPRenormProbsRadixCTA(
@@ -73,7 +82,7 @@ struct TopPRenormProbsRadixCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
         batch_size(batch_size),
         vocab_size(vocab_size) {}
 
-  [[sycl::reqd_sub_group_size(32)]]
+  [[sycl::reqd_sub_group_size(kTopPRenormSubGroupSize)]]
   void operator()(sycl::nd_item<1> item) const {
     auto grp = item.get_group();
     const uint32_t row_idx = item.get_group(0);
@@ -121,14 +130,14 @@ struct TopPRenormProbsRadixCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
 
     if (tid == 0) {
       prefix_[0] = 0u;
-      mass_[0] = 0.0f;
-      mass_[1] = 1.0f;
+      mass_excl_[0] = 0.0f;
+      mass_incl_[0] = 1.0f;
     }
     item.barrier(sycl::access::fence_space::local_space);
 
     for (uint32_t round = 0; round < kNumRounds; ++round) {
       const uint32_t cur_prefix = prefix_[0];
-      const float mass_above = mass_[0];
+      const float mass_above = mass_excl_[0];
       const uint32_t shift = 32u - (round + 1u) * kRadixBits;
       const uint32_t prefix_mask = (round == 0u) ? 0u : (~0u << (32u - round * kRadixBits));
 
@@ -137,6 +146,9 @@ struct TopPRenormProbsRadixCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
       }
       item.barrier(sycl::access::fence_space::local_space);
 
+      // Round 0 has every element active, so atomic contention on the bins peaks;
+      // aggregate per sub-group first. Later rounds touch only the elements under
+      // the fixed prefix, few enough that plain atomics are cheaper.
       if (round == 0u) {
         histogram_pass<true>(
             sg, tid, row_offset, vocab_u32, num_vec_elems, vec_tail_start, cur_prefix, prefix_mask, shift, hist_base);
@@ -167,14 +179,14 @@ struct TopPRenormProbsRadixCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
           }
         }
         prefix_[0] = cur_prefix | (chosen << shift);
-        mass_[0] = mass_above + (suffix - sg_hist_[chosen]);
-        mass_[1] = mass_above + suffix;
+        mass_excl_[0] = mass_above + (suffix - sg_hist_[chosen]);
+        mass_incl_[0] = mass_above + suffix;
       }
       item.barrier(sycl::access::fence_space::local_space);
     }
 
     const float pivot = top_p_from_ordered(prefix_[0]);
-    const float nucleus = mass_[1];
+    const float nucleus = mass_incl_[0];
     const float normalizer = sycl::native::recip((nucleus > 1e-8f) ? nucleus : 1e-8f);
 
     write_scaled(tid, row_offset, vocab_u32, num_vec_elems, vec_tail_start, pivot, normalizer);
@@ -235,6 +247,8 @@ struct TopPRenormProbsRadixCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
       }
       return;
     } else {
+      // One sub-group reduction per distinct bucket, so each bucket costs a single
+      // atomic from the leader instead of one per lane.
       constexpr uint32_t kSentinel = ~0u;
       uint32_t bucket = active ? ((ordered >> shift) & (kRadix - 1u)) : kSentinel;
 
@@ -300,6 +314,9 @@ void launch_top_p_renorm_kernel(
 
   int vec_size = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), sizeof(float));
   vec_size = get_min_vec_size(vec_size, const_cast<float*>(probs_ptr), renorm_probs_ptr);
+
+  // align vec_size with vocab_size
+  vec_size = std::gcd(vec_size, vocab_size);
 
 #define LAUNCH_TOP_P(VEC_SIZE)           \
   sycl_kernel_submit(                    \

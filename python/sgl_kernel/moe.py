@@ -445,7 +445,7 @@ def fused_experts(
     - use_fp8_w8a8 (bool): If True, use fp8 arithmetic to compute the inner
         products for w1 and w2. Defaults to False.
     - use_mxfp4_w4a16 (bool): If True, w1 and w2 are in MXFP4 packed format
-        (int8, two E2M1 nibbles per byte) with corresponding E8M0 block
+        (int8 or uint8, two E2M1 nibbles per byte) with corresponding E8M0 block
         scales supplied via w1_scale and w2_scale. Scales may be represented
         as uint8 exponent bytes or torch.float8_e8m0fnu.
         Routes through moe_grouped_mm_nt_xe20_w4a16, which dequantizes B
@@ -453,7 +453,7 @@ def fused_experts(
         activations — no dequantized weight tensor is materialized on device.
         Defaults to False.
     - use_int4_w4a16 (bool): If True, w1 and w2 are in INT4 packed format
-        (int8, two 4-bit values per byte) with BF16 or FP16 block scales
+        (int8 or uint8, two 4-bit values per byte) with BF16 or FP16 block scales
         (direct multiplier) matching hidden_states.dtype, supplied via
         w1_scale and w2_scale. Zero-points are optional and, if the checkpoint
         has them, must be supplied raw (unfolded) via w1_zp/w2_zp -- see below. Shares the
@@ -512,7 +512,7 @@ def fused_experts(
         "relu2",
     ), f"Only silu, gelu and relu2 are supported but got {activation}"
 
-    # Unified 4-bit W4A16 MoE (mxfp4 or int4). Weights are packed int8
+    # Unified 4-bit W4A16 MoE (mxfp4 or int4). Weights are packed int8/uint8
     # [E, N, K/2]; scales are [E, N, K/group_size] N-outer. For mxfp4 the
     # scale is an E8M0 byte (uint8 or float8_e8m0fnu); for int4 it is a direct multiplier
     # with the same dtype as hidden_states. int4 may optionally carry an explicit per-group
@@ -527,11 +527,11 @@ def fused_experts(
     ), "use_mxfp4_w4a16 and use_int4_w4a16 are mutually exclusive"
     if use_4bit_w4a16:
         assert (
-            w1.dtype == torch.int8
-        ), "4-bit W4A16 requires w1 to be int8 (packed [E, N, K/2])"
+            w1.dtype == torch.int8 or w1.dtype == torch.uint8
+        ), "4-bit W4A16 requires w1 to be int8 or uint8 (packed [E, N, K/2])"
         assert (
-            w2.dtype == torch.int8
-        ), "4-bit W4A16 requires w2 to be int8 (packed [E, N, K/2])"
+            w2.dtype == torch.int8 or w2.dtype == torch.uint8
+        ), "4-bit W4A16 requires w2 to be int8 or uint8 (packed [E, N, K/2])"
         assert w1_scale is not None, "w1_scale must be provided for 4-bit W4A16"
         assert w2_scale is not None, "w2_scale must be provided for 4-bit W4A16"
         if use_mxfp4_w4a16:

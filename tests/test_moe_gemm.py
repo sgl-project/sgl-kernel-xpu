@@ -303,6 +303,7 @@ def _make_int4_weight(
     dtype: torch.dtype,
     explicit_zero: bool,
     permutations: torch.Tensor | None = None,
+    weight_dtype: torch.dtype = torch.int8,
 ):
     assert input_size % group_size == 0
     if explicit_zero:
@@ -340,13 +341,16 @@ def _make_int4_weight(
             permutations[:, None, :].expand(-1, output_size, -1),
         )
 
-    return _pack_int4_codes(packed_codes).view(torch.int8), scales, zeros, dequantized
+    return _pack_int4_codes(packed_codes).view(weight_dtype), scales, zeros, dequantized
 
 
 @pytest.mark.parametrize("explicit_zero", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("group_size", [32, 64, 128, 256])
-def test_moe_grouped_mm_nt_xe20_int4_zero_point(explicit_zero, dtype, group_size):
+@pytest.mark.parametrize("weight_dtype", [torch.int8, torch.uint8])
+def test_moe_grouped_mm_nt_xe20_int4_zero_point(
+    explicit_zero, dtype, group_size, weight_dtype
+):
     torch.manual_seed(0)
     num_experts, rows_per_expert, gemm_n, gemm_k = 8, 2, 128, 256
     total_m = num_experts * rows_per_expert
@@ -359,6 +363,7 @@ def test_moe_grouped_mm_nt_xe20_int4_zero_point(explicit_zero, dtype, group_size
         group_size,
         dtype,
         explicit_zero,
+        weight_dtype=weight_dtype,
     )
     expected = torch.cat(
         [
@@ -391,7 +396,10 @@ def test_moe_grouped_mm_nt_xe20_int4_zero_point(explicit_zero, dtype, group_size
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("with_bias", [False, True])
 @pytest.mark.parametrize("activation", ["silu", "relu2"])
-def test_fused_experts_int4_w4a16(explicit_zero, dtype, with_bias, activation):
+@pytest.mark.parametrize("weight_dtype", [torch.int8, torch.uint8])
+def test_fused_experts_int4_w4a16(
+    explicit_zero, dtype, with_bias, activation, weight_dtype
+):
     torch.manual_seed(1)
     num_tokens, topk, num_experts = 5, 2, 8
     hidden_size, intermediate_size, group_size = 128, 64, 32
@@ -405,6 +413,7 @@ def test_fused_experts_int4_w4a16(explicit_zero, dtype, with_bias, activation):
         group_size,
         dtype,
         explicit_zero,
+        weight_dtype=weight_dtype,
     )
     w2, w2_scale, w2_zero, w2_reference = _make_int4_weight(
         num_experts,
@@ -413,6 +422,7 @@ def test_fused_experts_int4_w4a16(explicit_zero, dtype, with_bias, activation):
         group_size,
         dtype,
         explicit_zero,
+        weight_dtype=weight_dtype,
     )
     topk_ids = torch.tensor([[0, 1], [2, 3], [4, 5], [6, 7], [0, 2]], dtype=torch.int64)
     topk_weights = torch.rand(num_tokens, topk, dtype=torch.float32)
@@ -544,7 +554,7 @@ def test_moe_gemm_mxfp4_weights(
     """Test fused_experts with MXFP4-packed expert weights (W4A16).
 
     Weights are quantized to MXFP4 on CPU and passed to fused_experts as packed
-    int8 tensors together with their UE8M0 block scales via the
+    uint8 tensors together with their UE8M0 block scales via the
     ``use_mxfp4_w4a16=True`` flag. Scales may use either the uint8 or
     float8_e8m0fnu representation. Activations remain in BF16 throughout.
 
@@ -601,8 +611,8 @@ def test_moe_gemm_mxfp4_weights(
     device = "xpu"
     kernel_output = fused_experts(
         a.to(device),
-        w1_packed.view(torch.int8).to(device),
-        w2_packed.view(torch.int8).to(device),
+        w1_packed.to(device),
+        w2_packed.to(device),
         topk_weight.to(device),
         topk_ids.to(device),
         None,
@@ -742,6 +752,7 @@ def _build_moe_gemm_inputs(
     gemm_n: int,
     gemm_k: int,
     dtype: torch.dtype,
+    weight_dtype: torch.dtype,
     scale_dtype: torch.dtype,
     seed: int = 0,
 ):
@@ -764,7 +775,7 @@ def _build_moe_gemm_inputs(
     w_dq_cpu = _dequantize_weights_mxfp4(w_packed_cpu, w_scale_cpu, dtype=dtype)
 
     w_dq_xpu = w_dq_cpu.to("xpu")
-    w_packed_xpu = w_packed_cpu.view(torch.int8).to("xpu")
+    w_packed_xpu = w_packed_cpu.view(weight_dtype).to("xpu")
     w_scale_xpu = w_scale_cpu.view(scale_dtype).to("xpu")
 
     output_reference = torch.empty((total_m, gemm_n), dtype=dtype, device="xpu")
@@ -786,6 +797,7 @@ def _build_moe_gemm_inputs(
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [512])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("weight_dtype", [torch.int8, torch.uint8])
 @pytest.mark.parametrize("scale_dtype", [torch.uint8, torch.float8_e8m0fnu])
 def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_op(
     num_tokens_per_expert,
@@ -793,6 +805,7 @@ def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_op(
     hidden_size,
     intermediate_size,
     dtype,
+    weight_dtype,
     scale_dtype,
 ):
     """Compare the unified MXFP4 op with GEMM on dequantized weights.
@@ -811,6 +824,7 @@ def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_op(
         gemm_n=gemm_n,
         gemm_k=gemm_k,
         dtype=dtype,
+        weight_dtype=weight_dtype,
         scale_dtype=scale_dtype,
     )
 

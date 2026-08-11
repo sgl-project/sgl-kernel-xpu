@@ -690,7 +690,7 @@ void moe_grouped_mm_nt_xe20(
     double gemm1_limit = 7.0);
 
 // Unified int4/mxfp4 W4A16 MoE grouped GEMM.
-// `packed_weights` is int8 [E, N, K/2] with two 4-bit values per byte.
+// `packed_weights` is int8 or uint8 [E, N, K/2] with two 4-bit values per byte.
 // `scales` is [E, N, K/group_size], N-outer: activation-dtype direct
 // multiplier for int4, or an E8M0 exponent represented as uint8 or
 // float8_e8m0fnu for mxfp4 (decoded in registers). `zeros` is an optional

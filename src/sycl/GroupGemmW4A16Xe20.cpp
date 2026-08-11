@@ -92,7 +92,7 @@ DECLARE_W4A16_POLICY(w4a16_policy)
 SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
     torch::Tensor& output,                   // [total_m, N] bf16/fp16
     const torch::Tensor& activations,        // [total_m, K] bf16 or fp16
-    const torch::Tensor& packed_weights,     // [E, N, K/2] int8 (two 4-bit values per byte)
+    const torch::Tensor& packed_weights,     // [E, N, K/2] int8/uint8 (two 4-bit values per byte)
     const torch::Tensor& scales,             // [E, N, K/group_size]: int4=activation dtype, mxfp4=E8M0 byte
     const std::optional<at::Tensor>& zeros,  // [E, N, K/group_size], same dtype as int4 scales, optional
     const std::optional<at::Tensor>& bias,   // [E, N] float32, optional
@@ -133,7 +133,10 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
   const int gemm_n = pw_shape[1];
   TORCH_CHECK(pw_shape[0] == n_experts, "packed_weights.size(0) must equal n_experts");
   TORCH_CHECK(pw_shape[2] == gemm_k / 2, "packed_weights.size(2) must equal K/2 (two 4-bit values per byte)");
-  TORCH_CHECK(packed_weights.scalar_type() == at::ScalarType::Char, "packed_weights must be int8");
+  TORCH_CHECK(
+      packed_weights.scalar_type() == at::ScalarType::Char ||
+          packed_weights.scalar_type() == at::ScalarType::Byte,
+      "packed_weights must be int8 or uint8");
 
   TORCH_CHECK(
       group_size == 32 || group_size == 64 || group_size == 128 || group_size == 256,

@@ -101,7 +101,7 @@ set(FMHA_PREFILL_TILED_OUT_NP_512 256)
 # Generated file name order (so name = lib<file>.so):
 #   xe_fmha_fwd_prefill_<page|nopage>_<HEAD_DIM>_<Qtype>_<KVtype>
 # where the trailing tags are the query dtype then the KV-cache dtype (16-bit:
-# KV==Q -> *_bf16_bf16 / *_fp16_fp16; fp8: KV=fp8 -> *_bf16_fp8 / *_fp16_fp8).
+# KV==Q -> *_bf16_bf16 / *_fp16_fp16; fp8: KV=fp8 -> *_bf16_fp8, bf16 query only).
 set(FMHA_PREFILL_ELEM_TAGS bf16 fp16)
 
 foreach(HEAD_DIM ${FMHA_PREFILL_PAGED_HEAD_DIMS})
@@ -138,11 +138,14 @@ foreach(HEAD_DIM ${FMHA_PREFILL_PAGED_HEAD_DIMS})
         configure_file(${FMHA_PREFILL_TEMPLATE} ${GENERATED_FILE} @ONLY)
         list(APPEND device_cpp_xe20 ${GENERATED_FILE})
 
-        # FP8 KV cache with a bf16/fp16 query (KV dtype = fp8, Q dtype = ELEM_TYPE).
-        set(GENERATED_FP8_FILE
-            "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_prefill_page_${HEAD_DIM}_${DTFP8}.cpp")
-        configure_file(${FMHA_PREFILL_FP8_TEMPLATE} ${GENERATED_FP8_FILE} @ONLY)
-        list(APPEND device_cpp_xe20 ${GENERATED_FP8_FILE})
+        # FP8 KV cache: bf16 query only (KV dtype = fp8, Q dtype = bf16).
+        # fp16 query + fp8 KV is intentionally not built.
+        if(ELEM_TAG STREQUAL "bf16")
+            set(GENERATED_FP8_FILE
+                "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_prefill_page_${HEAD_DIM}_${DTFP8}.cpp")
+            configure_file(${FMHA_PREFILL_FP8_TEMPLATE} ${GENERATED_FP8_FILE} @ONLY)
+            list(APPEND device_cpp_xe20 ${GENERATED_FP8_FILE})
+        endif()
     endforeach()
 endforeach()
 

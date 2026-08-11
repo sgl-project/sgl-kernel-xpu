@@ -66,7 +66,7 @@ foreach(QG_SZ ${FMHA_DECODE_QG_SIZES})
     # Each (QG, HEAD_DIM, PAGE_SIZE) yields independent shared libraries split by
     # KV-cache dtype:
     #   decode_page / split_decode_page   (16-bit KV: *_bf16_bf16 / *_fp16_fp16)
-    #   decode_page / split_decode_page   (fp8 KV:    *_bf16_fp8  / *_fp16_fp8)
+    #   decode_page / split_decode_page   (fp8 KV:    *_bf16_fp8, bf16 query only)
     foreach(HEAD_DIM ${FMHA_DECODE_PAGED_HEAD_DIMS})
         foreach(PAGE_SIZE ${FMHA_DECODE_PAGE_SIZES})
             foreach(ELEM_TAG ${FMHA_DECODE_ELEM_TAGS})
@@ -90,16 +90,19 @@ foreach(QG_SZ ${FMHA_DECODE_QG_SIZES})
                 configure_file(${FMHA_SPLIT_DECODE_TEMPLATE} ${GENERATED_SPLIT_FILE} @ONLY)
                 list(APPEND device_cpp_xe20 ${GENERATED_SPLIT_FILE})
 
-                # FP8 KV cache with a bf16/fp16 query (KV dtype = fp8, Q dtype = ELEM_TYPE).
-                set(GENERATED_FP8_FILE
-                    "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_page_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}_${DTFP8}.cpp")
-                configure_file(${FMHA_DECODE_FP8_TEMPLATE} ${GENERATED_FP8_FILE} @ONLY)
-                list(APPEND device_cpp_xe20 ${GENERATED_FP8_FILE})
+                # FP8 KV cache: bf16 query only (KV dtype = fp8, Q dtype = bf16).
+                # fp16 query + fp8 KV is intentionally not built.
+                if(ELEM_TAG STREQUAL "bf16")
+                    set(GENERATED_FP8_FILE
+                        "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_page_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}_${DTFP8}.cpp")
+                    configure_file(${FMHA_DECODE_FP8_TEMPLATE} ${GENERATED_FP8_FILE} @ONLY)
+                    list(APPEND device_cpp_xe20 ${GENERATED_FP8_FILE})
 
-                set(GENERATED_SPLIT_FP8_FILE
-                    "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_split_decode_page_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}_${DTFP8}.cpp")
-                configure_file(${FMHA_SPLIT_DECODE_FP8_TEMPLATE} ${GENERATED_SPLIT_FP8_FILE} @ONLY)
-                list(APPEND device_cpp_xe20 ${GENERATED_SPLIT_FP8_FILE})
+                    set(GENERATED_SPLIT_FP8_FILE
+                        "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_split_decode_page_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}_${DTFP8}.cpp")
+                    configure_file(${FMHA_SPLIT_DECODE_FP8_TEMPLATE} ${GENERATED_SPLIT_FP8_FILE} @ONLY)
+                    list(APPEND device_cpp_xe20 ${GENERATED_SPLIT_FP8_FILE})
+                endif()
             endforeach()
         endforeach()
     endforeach()

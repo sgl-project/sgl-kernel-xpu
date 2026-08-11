@@ -139,13 +139,8 @@ EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG(512)
   do {                                                                                               \
     TORCH_CHECK(params.is_bf16 || params.is_fp16, "Decode attention only supports bf16/fp16 query"); \
     if (params.is_e4m3 || params.is_e5m2) {                                                          \
-      if (params.is_fp16) {                                                                          \
-        if (params.use_split_kv) {                                                                   \
-          FmhaSplitDecodeFp8Runner<QG, HD, PS, cutlass::half_t>{}(params);                           \
-        } else {                                                                                     \
-          FmhaDecodeFp8Runner<QG, HD, PS, cutlass::half_t>{}(params);                                \
-        }                                                                                            \
-      } else if (params.use_split_kv) {                                                              \
+      TORCH_CHECK(params.is_bf16, "fp8 KV cache decode only supports a bf16 query");                 \
+      if (params.use_split_kv) {                                                                     \
         FmhaSplitDecodeFp8Runner<QG, HD, PS>{}(params);                                              \
       } else {                                                                                       \
         FmhaDecodeFp8Runner<QG, HD, PS>{}(params);                                                   \

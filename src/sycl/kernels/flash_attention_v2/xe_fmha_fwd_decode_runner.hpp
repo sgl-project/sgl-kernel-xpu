@@ -48,6 +48,47 @@
 #include "sycl/kernels/flash_attention_v2/kernel/xe_tile_scheduler.hpp"
 using namespace cute;
 namespace decode {
+
+// Device shared-local-memory budget in bytes, keyed to the target Xe arch.
+#if SYCL_INTEL_TARGET == 20
+constexpr int slm_byte_budget = 128 * 1024;  // Xe20: 128 KiB SLM
+#elif SYCL_INTEL_TARGET == 35
+constexpr int slm_byte_budget = 384 * 1024;  // Xe35: 384 KiB SLM
+#else
+#error "Unsupported SYCL_INTEL_TARGET for decode SLM budget"
+#endif
+
+// Number of subgroups the KV (page) tile is split across, capped so the epilogue
+// cross-subgroup reduction buffer fits in shared local memory.
+//
+// The reduction path (FMHAFwdEpilogue::SharedStorageReduceK) allocates
+//   num_sg * (qg * head_dim_rounded + 2 * aligned_qg) floats
+// of SLM (each of the num_sg subgroups stores its full partial O tile plus a
+// padded row of running sum/max). For large head dims combined with large GQA
+// query groups and large page sizes this exceeds the device SLM budget (128 KiB),
+// which hangs the device instead of failing cleanly (e.g. HEAD_DIM=512, qg=8,
+// PAGE_SIZE=128 -> 132 KiB). Reducing the subgroup count keeps the buffer within
+// budget; it only lowers KV parallelism and does not affect correctness.
+//
+// This mirrors the epilogue's SLM layout by hand; the DecodeRunner/
+// SplitDecodeKernelRunner run() paths add a static_assert on the fully
+// instantiated kernel's real SharedStorageSize as a compile-time backstop in
+// case that layout ever diverges from this formula.
+//
+// full_kv_subgroups (= PAGE_SIZE / 16) is always a power of two, so the returned
+// value is the largest power-of-two divisor that fits the budget (>= 1).
+constexpr int kv_subgroups_for_slm(int full_kv_subgroups, int qg, int head_dim_rounded) {
+  constexpr int slm_float_budget = slm_byte_budget / static_cast<int>(sizeof(float));
+  const int aligned_qg = ((qg + intel::sg_size - 1) / intel::sg_size) * intel::sg_size;
+  const int floats_per_subgroup = qg * head_dim_rounded + 2 * aligned_qg;
+  const int max_subgroups = slm_float_budget / floats_per_subgroup;
+  int sg = full_kv_subgroups;
+  while (sg > 1 && sg > max_subgroups) {
+    sg /= 2;
+  }
+  return sg < 1 ? 1 : sg;
+}
+
 struct Arguments {
   // The QKV matrices.
   void* __restrict__ q_ptr;
@@ -185,6 +226,7 @@ struct Arguments {
   uint64_t* rng_state;
 
   bool is_bf16;
+  bool is_fp16 = false;
   bool is_fp32;
   bool is_e4m3 = false;
   bool is_e5m2 = false;
@@ -306,6 +348,10 @@ struct DecodeRunner {
   }
 
   cutlass::Status run(const Arguments& params, const cutlass::KernelHardwareInfo& hw_info) {
+    static_assert(
+        FMHADecodeKernel::SharedStorageSize <= slm_byte_budget,
+        "Decode kernel SharedStorage exceeds the device SLM budget; lower the KV "
+        "subgroup split (see kv_subgroups_for_slm).");
     ProblemShapeType shape = initialize(params);
 
     typename FMHADecodeKernel::Arguments arguments{
@@ -469,6 +515,10 @@ struct SplitDecodeKernelRunner {
   }
 
   cutlass::Status run(const Arguments& params, const cutlass::KernelHardwareInfo& hw_info) {
+    static_assert(
+        FMHAKernel::SharedStorageSize <= slm_byte_budget && ReductionSplitKernel::SharedStorageSize <= slm_byte_budget,
+        "Split-decode kernel SharedStorage exceeds the device SLM budget; lower the "
+        "KV subgroup split (see kv_subgroups_for_slm).");
     ProblemShapeType shape = initialize(params);
 
     typename FMHAKernel::Arguments arguments{
@@ -808,7 +858,7 @@ struct SplitDecodeConfig {
 // xe_fmha_fwd_split_decode_kernel.cpp.in) so the compiler only emits code
 // for the combinations that are actually needed.
 
-template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
+template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE, class Element = cutlass::bfloat16_t>
 struct FmhaDecodeRunner {
   void operator()(const Arguments& params) const;
 };
@@ -816,28 +866,29 @@ struct FmhaDecodeRunner {
 // Non-paged (no_page) decode is split into its own runner type (no PAGE_SIZE
 // template parameter) so its kernel instantiations are compiled in translation
 // units separate from the paged decode path, producing independent shared
-// libraries and lowering peak compiler memory. Non-paged decode supports bf16
-// queries only (no fp8 KV cache, no split-KV).
-template <int QG_SZ, int HEAD_DIM>
+// libraries and lowering peak compiler memory. Non-paged decode supports 16-bit
+// (bf16/fp16) queries only (no fp8 KV cache, no split-KV).
+template <int QG_SZ, int HEAD_DIM, class Element = cutlass::bfloat16_t>
 struct FmhaDecodeNpRunner {
   void operator()(const Arguments& params) const;
 };
 
-template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
+template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE, class Element = cutlass::bfloat16_t>
 struct FmhaSplitDecodeRunner {
   void operator()(const Arguments& params) const;
 };
 
 // FP8 KV-cache decode paths are split into their own runner types so that the
 // (heavy) fp8 e4m3/e5m2 kernel instantiations are compiled in a separate
-// translation unit from the bf16 paged decode path. This keeps the peak
+// translation unit from the 16-bit paged decode path. This keeps the peak
 // compiler memory of any single decode TU low (avoids OOM during AOT build).
-template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
+// The trailing Element is the QUERY dtype (bf16 or fp16); K/V stay fp8.
+template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE, class Element = cutlass::bfloat16_t>
 struct FmhaDecodeFp8Runner {
   void operator()(const Arguments& params) const;
 };
 
-template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
+template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE, class Element = cutlass::bfloat16_t>
 struct FmhaSplitDecodeFp8Runner {
   void operator()(const Arguments& params) const;
 };

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  **************************************************************************************************/
 // Auto-generated from xe_fmha_fwd_prefill_fp8_kernel.cpp.in
-// Template parameters: HEAD_DIM=@HEAD_DIM@
+// Template parameters: HEAD_DIM=@HEAD_DIM@, ELEM_TAG=@ELEM_TAG@
 //
 // FP8 KV-cache prefill path, split out of xe_fmha_fwd_prefill_kernel.cpp.in so
 // the e4m3/e5m2 kernel instantiations (which fan out over is_local x is_causal)
@@ -16,7 +16,7 @@
 namespace prefill {
 
 template <>
-__attribute__((visibility("default"))) void FmhaPrefillFp8Runner<@HEAD_DIM@>::operator()(const Arguments& params) const {
+__attribute__((visibility("default"))) void FmhaPrefillFp8Runner<@HEAD_DIM@, @ELEM_TYPE@>::operator()(const Arguments& params) const {
   using TileShapeQK = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_KV@>, cute::_32>;
   using TileShapePV = cute::Shape<cute::Int<@TILED_Q@>, cute::_32, cute::Int<@TILED_KV@>>;
   using TileShapeOutput = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_OUT@>>;
@@ -30,7 +30,7 @@ __attribute__((visibility("default"))) void FmhaPrefillFp8Runner<@HEAD_DIM@>::op
       params.softmax_sink_ptr == nullptr, "fp8 KV cache prefill does not support sink logits");
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
-      using QElement = cutlass::bfloat16_t;
+      using QElement = @ELEM_TYPE@;
       if (params.is_e4m3) {
         FMHAConfig<
             Causal, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, 2, false,
@@ -44,6 +44,6 @@ __attribute__((visibility("default"))) void FmhaPrefillFp8Runner<@HEAD_DIM@>::op
   });
 }
 
-template struct FmhaPrefillFp8Runner<@HEAD_DIM@>;
+template struct FmhaPrefillFp8Runner<@HEAD_DIM@, @ELEM_TYPE@>;
 
 }  // namespace prefill

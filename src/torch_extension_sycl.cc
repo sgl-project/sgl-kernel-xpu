@@ -70,6 +70,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("top_p_renorm_probs", torch::kXPU, &top_p_renorm_probs);
 
   m.def(
+      "top_k_top_p_sampling_from_probs(Tensor probs, Tensor! output, Tensor? maybe_indices, Tensor? "
+      "maybe_top_k_arr, int top_k_val, Tensor? maybe_top_p_arr, float top_p_val, bool deterministic, Generator? "
+      "gen) -> ()");
+  m.impl("top_k_top_p_sampling_from_probs", torch::kXPU, &top_k_top_p_sampling_from_probs);
+  m.def(
       "min_p_sampling_from_probs(Tensor probs, Tensor! output, Tensor? maybe_indices, Tensor? "
       "maybe_min_p_arr, float min_p_val, bool deterministic, Generator? gen) -> ()");
   m.impl("min_p_sampling_from_probs", torch::kXPU, &min_p_sampling_from_probs);
@@ -498,6 +503,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From GDN (Gated DeltaNet) attention (Intel Xe2)
    */
+#ifdef USE_FMHA
   m.def(
       "gdn_attention(Tensor! core_attn_out, Tensor! z, Tensor projected_states_qkvz, Tensor projected_states_ba, "
       "int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim, "
@@ -515,6 +521,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "ScalarType dtype) -> int");
   m.impl(
       "gdn_attention_workspace_bytes_needed", c10::DispatchKey::BackendSelect, &gdn_attention_workspace_bytes_needed);
+#endif  // USE_FMHA
 
   /*
    * Mamba causal conv1d (XPU)

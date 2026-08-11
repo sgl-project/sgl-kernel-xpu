@@ -142,15 +142,24 @@ jobs:
           python3 benchmark/update_baseline_from_log.py
 
       - name: Install GitHub CLI
-        if: contains(join(github.event.pull_request.labels.*.name, ','), 'perf')
+        # Only run on same-repo PRs. Fork PRs get read-only creds by GitHub design,
+        # so pushing / opening the auto baseline PR is impossible from here.
+        if: >
+          contains(join(github.event.pull_request.labels.*.name, ','), 'perf') &&
+          github.event.pull_request.head.repo.full_name == github.repository
         run: |
           sudo apt update
           sudo apt install -y gh
 
       - name: Auto PR for baseline.json update
+        # Same-repo perf PRs only: secrets.PAT is unavailable for fork PRs
+        # (GitHub withholds secrets from pull_request runs originating on forks),
+        # which is exactly what caused the 403 on PR #342. For fork PRs, the
+        # step below uploads baseline.json as an artifact for maintainers.
         if: >
           success() &&
           contains(join(github.event.pull_request.labels.*.name, ','), 'perf') &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
           hashFiles('ci_has_lower.txt') != ''
         run: |
           SRC_PR=${{ github.event.pull_request.number }}
@@ -215,6 +224,32 @@ jobs:
               --repo sgl-project/sgl-kernel-xpu \
               --body-file ci_pr_body.md
           fi
+
+      - name: Notify maintainers (fork PR baseline update needed)
+        # Fork PRs cannot push directly. Surface a warning in the run summary
+        # so the maintainer knows to grab the artifact below.
+        if: >
+          success() &&
+          contains(join(github.event.pull_request.labels.*.name, ','), 'perf') &&
+          github.event.pull_request.head.repo.full_name != github.repository &&
+          hashFiles('ci_has_lower.txt') != ''
+        run: |
+          echo "::warning::PR #${{ github.event.pull_request.number }} is from a fork (${{ github.event.pull_request.head.repo.full_name }}). GitHub does not expose secrets to fork PRs, so the auto baseline PR cannot be pushed. Download the 'baseline-update-pr-${{ github.event.pull_request.number }}' artifact below and commit benchmark/baseline.json manually from an internal branch."
+
+      - name: Upload baseline update artifact (fork PRs)
+        if: >
+          success() &&
+          contains(join(github.event.pull_request.labels.*.name, ','), 'perf') &&
+          github.event.pull_request.head.repo.full_name != github.repository &&
+          hashFiles('ci_has_lower.txt') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-update-pr-${{ github.event.pull_request.number }}
+          path: |
+            benchmark/baseline.json
+            ci_pr_body.md
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Run E2E Bfloat16 tests
         timeout-minutes: 20

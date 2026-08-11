@@ -445,8 +445,9 @@ def fused_experts(
     - use_fp8_w8a8 (bool): If True, use fp8 arithmetic to compute the inner
         products for w1 and w2. Defaults to False.
     - use_mxfp4_w4a16 (bool): If True, w1 and w2 are in MXFP4 packed format
-        (int8, two E2M1 nibbles per byte) with corresponding uint8 E8M0
-        block scales supplied via w1_scale and w2_scale.
+        (int8, two E2M1 nibbles per byte) with corresponding E8M0 block
+        scales supplied via w1_scale and w2_scale. Scales may be represented
+        as uint8 exponent bytes or torch.float8_e8m0fnu.
         Routes through moe_grouped_mm_nt_xe20_w4a16, which dequantizes B
         per-tile in registers and feeds W4A16 DPAS with BF16 or FP16
         activations — no dequantized weight tensor is materialized on device.
@@ -513,7 +514,7 @@ def fused_experts(
 
     # Unified 4-bit W4A16 MoE (mxfp4 or int4). Weights are packed int8
     # [E, N, K/2]; scales are [E, N, K/group_size] N-outer. For mxfp4 the
-    # scale is a uint8 E8M0 exponent; for int4 it is a direct multiplier
+    # scale is an E8M0 byte (uint8 or float8_e8m0fnu); for int4 it is a direct multiplier
     # with the same dtype as hidden_states. int4 may optionally carry an explicit per-group
     # zero-point (w1_zp/w2_zp, same shape/dtype as the scale) applied as
     # `(code - zp) * scale` in-kernel -- this is NOT folded into the packed
@@ -534,9 +535,11 @@ def fused_experts(
         assert w1_scale is not None, "w1_scale must be provided for 4-bit W4A16"
         assert w2_scale is not None, "w2_scale must be provided for 4-bit W4A16"
         if use_mxfp4_w4a16:
+            mxfp4_scale_dtypes = (torch.uint8, torch.float8_e8m0fnu)
             assert (
-                w1_scale.dtype == torch.uint8 and w2_scale.dtype == torch.uint8
-            ), "mxfp4 scales must be uint8 (E8M0 exponent)"
+                w1_scale.dtype in mxfp4_scale_dtypes
+                and w2_scale.dtype in mxfp4_scale_dtypes
+            ), "mxfp4 scales must be uint8 or float8_e8m0fnu (E8M0 exponent)"
             assert (
                 w1_zp is None and w2_zp is None
             ), "w1_zp/w2_zp are not supported for use_mxfp4_w4a16 (mxfp4 has no zero-point)"

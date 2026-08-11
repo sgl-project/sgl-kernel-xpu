@@ -185,6 +185,7 @@ struct Arguments {
   uint64_t* rng_state;
 
   bool is_bf16;
+  bool is_fp16 = false;
   bool is_fp32;
   bool is_e4m3 = false;
   bool is_e5m2 = false;
@@ -808,7 +809,7 @@ struct SplitDecodeConfig {
 // xe_fmha_fwd_split_decode_kernel.cpp.in) so the compiler only emits code
 // for the combinations that are actually needed.
 
-template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
+template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE, class Element = cutlass::bfloat16_t>
 struct FmhaDecodeRunner {
   void operator()(const Arguments& params) const;
 };
@@ -816,28 +817,29 @@ struct FmhaDecodeRunner {
 // Non-paged (no_page) decode is split into its own runner type (no PAGE_SIZE
 // template parameter) so its kernel instantiations are compiled in translation
 // units separate from the paged decode path, producing independent shared
-// libraries and lowering peak compiler memory. Non-paged decode supports bf16
-// queries only (no fp8 KV cache, no split-KV).
-template <int QG_SZ, int HEAD_DIM>
+// libraries and lowering peak compiler memory. Non-paged decode supports 16-bit
+// (bf16/fp16) queries only (no fp8 KV cache, no split-KV).
+template <int QG_SZ, int HEAD_DIM, class Element = cutlass::bfloat16_t>
 struct FmhaDecodeNpRunner {
   void operator()(const Arguments& params) const;
 };
 
-template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
+template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE, class Element = cutlass::bfloat16_t>
 struct FmhaSplitDecodeRunner {
   void operator()(const Arguments& params) const;
 };
 
 // FP8 KV-cache decode paths are split into their own runner types so that the
 // (heavy) fp8 e4m3/e5m2 kernel instantiations are compiled in a separate
-// translation unit from the bf16 paged decode path. This keeps the peak
+// translation unit from the 16-bit paged decode path. This keeps the peak
 // compiler memory of any single decode TU low (avoids OOM during AOT build).
-template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
+// The trailing Element is the QUERY dtype (bf16 or fp16); K/V stay fp8.
+template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE, class Element = cutlass::bfloat16_t>
 struct FmhaDecodeFp8Runner {
   void operator()(const Arguments& params) const;
 };
 
-template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE>
+template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE, class Element = cutlass::bfloat16_t>
 struct FmhaSplitDecodeFp8Runner {
   void operator()(const Arguments& params) const;
 };

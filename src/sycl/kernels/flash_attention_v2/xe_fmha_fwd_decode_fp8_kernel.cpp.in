@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  **************************************************************************************************/
 // Auto-generated from xe_fmha_fwd_decode_fp8_kernel.cpp.in
-// Template parameters: QG_SZ=@QG_SZ@, HEAD_DIM=@HEAD_DIM@, PAGE_SIZE=@PAGE_SIZE@
+// Template parameters: QG_SZ=@QG_SZ@, HEAD_DIM=@HEAD_DIM@, PAGE_SIZE=@PAGE_SIZE@, ELEM_TAG=@ELEM_TAG@
 //
 // FP8 KV-cache decode path, split out of xe_fmha_fwd_decode_kernel.cpp.in so the
 // e4m3/e5m2 kernel instantiations compile in their own translation unit. This
@@ -15,7 +15,7 @@
 namespace decode {
 
 template <>
-__attribute__((visibility("default"))) void FmhaDecodeFp8Runner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Arguments& params) const {
+__attribute__((visibility("default"))) void FmhaDecodeFp8Runner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@, @ELEM_TYPE@>::operator()(const Arguments& params) const {
   using TileShapeQK = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@PAGE_SIZE@>, cute::_64>;
   using TileShapePV = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@PAGE_SIZE@>>;
   using TileShapeOutput = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;
@@ -27,7 +27,7 @@ __attribute__((visibility("default"))) void FmhaDecodeFp8Runner<@QG_SZ@, @HEAD_D
   TORCH_CHECK(params.is_e4m3 || params.is_e5m2, "FmhaDecodeFp8Runner requires an fp8 KV cache");
   TORCH_CHECK(!params.use_sink, "fp8 KV cache decode does not support sink logits");
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-    using QElement = cutlass::bfloat16_t;
+    using QElement = @ELEM_TYPE@;
     if (params.is_e4m3) {
       DecodeConfig<
           false, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, 1, false,
@@ -40,6 +40,6 @@ __attribute__((visibility("default"))) void FmhaDecodeFp8Runner<@QG_SZ@, @HEAD_D
   });
 }
 
-template struct FmhaDecodeFp8Runner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>;
+template struct FmhaDecodeFp8Runner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@, @ELEM_TYPE@>;
 
 }  // namespace decode

@@ -30,7 +30,7 @@
  *
  **************************************************************************************************/
 // Auto-generated from xe_fmha_fwd_decode_nopage_kernel.cpp.in
-// Template parameters: QG_SZ=@QG_SZ@, HEAD_DIM=@HEAD_DIM@ (non-paged / no_page attention)
+// Template parameters: QG_SZ=@QG_SZ@, HEAD_DIM=@HEAD_DIM@, ELEM_TAG=@ELEM_TAG@ (non-paged / no_page attention)
 //
 // The non-paged (contiguous ragged) KV-cache decode path is compiled into its
 // own translation unit / runner type (FmhaDecodeNpRunner, no PAGE_SIZE template
@@ -44,7 +44,7 @@
 namespace decode {
 
 template <>
-__attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DIM@>::operator()(const Arguments& params) const {
+__attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DIM@, @ELEM_TYPE@>::operator()(const Arguments& params) const {
   // Non-paged (contiguous ragged) KV cache. The paged decode kernel ties its KV
   // tile to PAGE_SIZE; the non-paged path has no page size, so it uses an
   // independent KV-tile constant (@TILED_KV_NP@) that can be tuned separately.
@@ -57,7 +57,7 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
   using SubgroupLayoutQK_NP = cute::Layout<cute::Shape<cute::_1, cute::Int<@TILED_KV_NP@ / 16>, cute::_1>>;
   // No sink support for no_page path; always use Sink=false
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-    using Element = bfloat16_t;
+    using Element = @ELEM_TYPE@;
     DecodeConfig<
         false,
         LocalMask,
@@ -76,6 +76,6 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
   });
 }
 
-template struct FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DIM@>;
+template struct FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DIM@, @ELEM_TYPE@>;
 
 }  // namespace decode

@@ -171,6 +171,7 @@ struct Arguments {
   uint64_t* rng_state;
 
   bool is_bf16;
+  bool is_fp16 = false;
   bool is_fp32;
   bool is_e4m3 = false;
   bool is_e5m2 = false;
@@ -553,7 +554,7 @@ struct FMHAConfig {
 // generated .cpp file (from xe_fmha_fwd_prefill_kernel.cpp.in) so the compiler
 // only emits code for the combinations that are actually needed.
 
-template <int HEAD_DIM>
+template <int HEAD_DIM, class Element = cutlass::bfloat16_t>
 struct FmhaPrefillRunner {
   void operator()(const Arguments& params) const;
 };
@@ -561,8 +562,8 @@ struct FmhaPrefillRunner {
 // Non-paged (no_page) prefill is split into its own runner type so its kernel
 // instantiations are compiled in translation units separate from the paged
 // prefill path, producing independent shared libraries and lowering peak
-// compiler memory. Non-paged prefill supports bf16 queries only (no fp8).
-template <int HEAD_DIM>
+// compiler memory. Non-paged prefill supports 16-bit (bf16/fp16) queries only (no fp8).
+template <int HEAD_DIM, class Element = cutlass::bfloat16_t>
 struct FmhaPrefillNpRunner {
   void operator()(const Arguments& params) const;
 };
@@ -570,10 +571,11 @@ struct FmhaPrefillNpRunner {
 // FP8 KV-cache prefill path is split into its own runner type so that the
 // (heavy) e4m3/e5m2 kernel instantiations — which also fan out over
 // is_local x is_causal — are compiled in a separate translation unit from the
-// bf16 paged prefill path. This keeps the peak compiler memory of any
+// 16-bit paged prefill path. This keeps the peak compiler memory of any
 // single prefill TU low (avoids OOM during AOT build). The dispatch forwards to
-// this when params.is_e4m3 || is_e5m2.
-template <int HEAD_DIM>
+// this when params.is_e4m3 || is_e5m2. The trailing Element is the QUERY dtype
+// (bf16 or fp16); K/V stay fp8.
+template <int HEAD_DIM, class Element = cutlass::bfloat16_t>
 struct FmhaPrefillFp8Runner {
   void operator()(const Arguments& params) const;
 };

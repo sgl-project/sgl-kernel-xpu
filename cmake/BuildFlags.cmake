@@ -94,8 +94,12 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -D__INTEL_LLVM_COMPILER_VERSION=${__INTEL_LLVM_COMPILER})
 
+  # -fsycl-fp64-conv-emu is an AOT-only flag; skip it under JIT (spir64) to avoid
+  # per-TU -Wunused-command-line-argument warnings.
   CHECK_SYCL_FLAG("-fsycl-fp64-conv-emu" SUPPORTS_FP64_CONV_EMU)
-  if(SUPPORTS_FP64_CONV_EMU)
+  if(USE_SYCL_JIT)
+    # Skipped in JIT mode.
+  elseif(SUPPORTS_FP64_CONV_EMU)
     set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -fsycl-fp64-conv-emu)
   else()
     message(WARNING "The compiler does not support the '-fsycl-fp64-conv-emu' flag, \
@@ -124,23 +128,35 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 
 
   string(REPLACE "," ";" DPCPP_SYCL_TARGET_LIST "${DPCPP_SYCL_TARGET}")
-  message(STATUS "Compile Intel GPU AOT Targets for ${DPCPP_SYCL_TARGET_LIST}")
 
-  foreach(TGT IN LISTS DPCPP_SYCL_TARGET_LIST)
-    if(TGT STREQUAL "intel_gpu_bmg" OR TGT STREQUAL "bmg")
-      list(APPEND AOT_TARGETS "bmg")
-    elseif(TGT STREQUAL "intel_gpu_pvc" OR TGT STREQUAL "pvc")
-      list(APPEND AOT_TARGETS "pvc")
-    endif()
-  endforeach()
+  if(USE_SYCL_JIT)
+    # JIT mode: compile to portable SPIR-V; the runtime JIT-compiles to native
+    # ISA at kernel launch. Drop only the AOT-specific -device option; keep the
+    # -cl-* codegen options so the offline-flags argument stays non-empty (an
+    # empty positional would collapse and steal -fsycl from the device link
+    # flags in cmake/Modules/FindSYCL.cmake).
+    set(SYCL_TARGETS_OPTION -fsycl-targets=spir64)
+    set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} ${SYCL_TARGETS_OPTION})
+    set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} ${SYCL_TARGETS_OPTION})
+    set(SYCL_OFFLINE_COMPILER_AOT_OPTIONS "")
+    message(STATUS "Compile Intel GPU with JIT SPIR-V target (-fsycl-targets=spir64)")
+  else()
+    foreach(TGT IN LISTS DPCPP_SYCL_TARGET_LIST)
+      if(TGT STREQUAL "intel_gpu_bmg" OR TGT STREQUAL "bmg")
+        list(APPEND AOT_TARGETS "bmg")
+      elseif(TGT STREQUAL "intel_gpu_pvc" OR TGT STREQUAL "pvc")
+        list(APPEND AOT_TARGETS "pvc")
+      endif()
+    endforeach()
 
-  list(REMOVE_DUPLICATES AOT_TARGETS)
-  string(JOIN "," AOT_TARGETS_STR ${AOT_TARGETS})
-  set(SYCL_TARGETS_OPTION -fsycl-targets=spir64_gen)
-  set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} ${SYCL_TARGETS_OPTION})
-  set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} ${SYCL_TARGETS_OPTION})
-  set(SYCL_OFFLINE_COMPILER_AOT_OPTIONS "-device ${AOT_TARGETS}")
-  message(STATUS "Compile Intel GPU AOT Targets for ${AOT_TARGETS}")
+    list(REMOVE_DUPLICATES AOT_TARGETS)
+    string(JOIN "," AOT_TARGETS_STR ${AOT_TARGETS})
+    set(SYCL_TARGETS_OPTION -fsycl-targets=spir64_gen)
+    set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} ${SYCL_TARGETS_OPTION})
+    set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} ${SYCL_TARGETS_OPTION})
+    set(SYCL_OFFLINE_COMPILER_AOT_OPTIONS "-device ${AOT_TARGETS}")
+    message(STATUS "Compile Intel GPU AOT Targets for ${AOT_TARGETS}")
+  endif()
   # SYCL compiler in basekit after 2025.2 needs more spirv arguments.
   if(SYCL_COMPILER_VERSION GREATER_EQUAL 20250806)
     set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} -Xspirv-translator;-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate)

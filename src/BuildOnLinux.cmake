@@ -50,7 +50,12 @@ foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
 endforeach()
 
 # xe20 kernels
-set(XE20_OFFLINE_COMPILER_AOT_OPTIONS "-device bmg")
+if(USE_SYCL_JIT)
+  # JIT (spir64): -device is AOT-only; keep CG options so the offline arg is non-empty.
+  set(XE20_OFFLINE_COMPILER_AOT_OPTIONS "")
+else()
+  set(XE20_OFFLINE_COMPILER_AOT_OPTIONS "-device bmg")
+endif()
 set(XE20_OFFLINE_COMPILER_FLAGS "${XE20_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
 foreach(sycl_src ${ATen_XPU_SYCL_XE20})
   get_filename_component(name ${sycl_src} NAME_WLE REALPATH)

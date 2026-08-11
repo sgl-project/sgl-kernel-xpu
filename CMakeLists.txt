@@ -25,7 +25,26 @@ find_package(Torch REQUIRED)
 set(SGL_OPS_XPU_ROOT ${PROJECT_SOURCE_DIR})
 list(APPEND CMAKE_MODULE_PATH ${SGL_OPS_XPU_ROOT}/cmake/Modules)
 
-set(DPCPP_SYCL_TARGET "bmg" CACHE STRING "dpcpp target device" FORCE)
+# When the environment variable USE_SYCL_JIT is truthy (1/on/On/ON/true/yes),
+# compile SYCL kernels to portable SPIR-V (-fsycl-targets=spir64) and let the
+# runtime JIT-compile to native ISA at launch, instead of device-specific AOT
+# (spir64_gen + -device).
+set(USE_SYCL_JIT OFF)
+if(DEFINED ENV{USE_SYCL_JIT})
+  string(TOUPPER "$ENV{USE_SYCL_JIT}" _use_sycl_jit_env)
+  if(_use_sycl_jit_env STREQUAL "ON" OR _use_sycl_jit_env STREQUAL "1"
+     OR _use_sycl_jit_env STREQUAL "TRUE" OR _use_sycl_jit_env STREQUAL "YES")
+    set(USE_SYCL_JIT ON)
+  endif()
+endif()
+
+# Drive both our kernels (cmake/BuildFlags.cmake) and the fetched CUTLASS
+# (sycl-tla FindDPCPP.cmake) from a single target: spir64 -> JIT, bmg -> AOT.
+if(USE_SYCL_JIT)
+  set(DPCPP_SYCL_TARGET "spir64" CACHE STRING "dpcpp target device" FORCE)
+else()
+  set(DPCPP_SYCL_TARGET "bmg" CACHE STRING "dpcpp target device" FORCE)
+endif()
 
 include(${SGL_OPS_XPU_ROOT}/cmake/SYCL.cmake)
 include(${SGL_OPS_XPU_ROOT}/cmake/BuildFlags.cmake)

@@ -121,8 +121,8 @@ struct CompressPrefillStage0Kernel {
     }
 
     if (tx < kStage0NumSubGroups) {
-      warp_max_[tx] = 0;
-      warp_min_[tx] = 0xFFFFFFFFu;
+      sg_max_[tx] = 0;
+      sg_min_[tx] = 0xFFFFFFFFu;
     }
 
     uint32_t local_max_extend = 0;
@@ -142,15 +142,15 @@ struct CompressPrefillStage0Kernel {
     uint32_t sg_max = sycl::reduce_over_group(sg, local_max_extend, sycl::maximum<uint32_t>());
     uint32_t sg_min = sycl::reduce_over_group(sg, local_min_extend, sycl::minimum<uint32_t>());
     if (lane_id == 0) {
-      warp_max_[sg_id] = sg_max;
-      warp_min_[sg_id] = sg_min;
+      sg_max_[sg_id] = sg_max;
+      sg_min_[sg_id] = sg_min;
     }
     item.barrier(sycl::access::fence_space::local_space);
 
     // Level 2: subgroup 0 reduces subgroup outputs to block-wide min/max.
     if (sg_id == 0) {
-      uint32_t v_max = (lane_id < kStage0NumSubGroups) ? warp_max_[lane_id] : 0u;
-      uint32_t v_min = (lane_id < kStage0NumSubGroups) ? warp_min_[lane_id] : 0xFFFFFFFFu;
+      uint32_t v_max = (lane_id < kStage0NumSubGroups) ? sg_max_[lane_id] : 0u;
+      uint32_t v_min = (lane_id < kStage0NumSubGroups) ? sg_min_[lane_id] : 0xFFFFFFFFu;
       uint32_t block_max = sycl::reduce_over_group(sg, v_max, sycl::maximum<uint32_t>());
       uint32_t block_min = sycl::reduce_over_group(sg, v_min, sycl::minimum<uint32_t>());
       if (lane_id == 0) {
@@ -305,8 +305,8 @@ struct CompressPrefillStage0Kernel {
   sycl::local_accessor<uint32_t, 1> counter_w_local_;
   sycl::local_accessor<int32_t, 1> s_seq_len_;
   sycl::local_accessor<int32_t, 1> s_prefix_len_;
-  sycl::local_accessor<uint32_t, 1> warp_max_;
-  sycl::local_accessor<uint32_t, 1> warp_min_;
+  sycl::local_accessor<uint32_t, 1> sg_max_;
+  sycl::local_accessor<uint32_t, 1> sg_min_;
   sycl::local_accessor<uint32_t, 1> s_max_extend_;
   sycl::local_accessor<uint32_t, 1> s_min_extend_;
 };
@@ -539,8 +539,8 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill
     sycl::local_accessor<uint32_t, 1> counter_w_local(sycl::range<1>(1), cgh);
     sycl::local_accessor<int32_t, 1> s_seq_len(sycl::range<1>(kMaxPrefillBatchSize), cgh);
     sycl::local_accessor<int32_t, 1> s_prefix_len(sycl::range<1>(kMaxPrefillBatchSize), cgh);
-    sycl::local_accessor<uint32_t, 1> warp_max(sycl::range<1>(kStage0NumSubGroups), cgh);
-    sycl::local_accessor<uint32_t, 1> warp_min(sycl::range<1>(kStage0NumSubGroups), cgh);
+    sycl::local_accessor<uint32_t, 1> sg_max(sycl::range<1>(kStage0NumSubGroups), cgh);
+    sycl::local_accessor<uint32_t, 1> sg_min(sycl::range<1>(kStage0NumSubGroups), cgh);
     sycl::local_accessor<uint32_t, 1> s_max_extend(sycl::range<1>(1), cgh);
     sycl::local_accessor<uint32_t, 1> s_min_extend(sycl::range<1>(1), cgh);
 
@@ -558,8 +558,8 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill
         counter_w_local,
         s_seq_len,
         s_prefix_len,
-        warp_max,
-        warp_min,
+        sg_max,
+        sg_min,
         s_max_extend,
         s_min_extend};
     cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(kStage0BlockSize), sycl::range<1>(kStage0BlockSize)), kernel);

@@ -13,10 +13,10 @@
 namespace at::native::xpu {
 
 constexpr int64_t kTileElements = 4;
-constexpr uint32_t kWarpThreads = 16;
-constexpr int64_t kTileDim = kTileElements * static_cast<int64_t>(kWarpThreads);  // 64
-constexpr uint32_t kWarpsPerGroup = 4;
-constexpr uint32_t kLocalSize = kWarpsPerGroup * kWarpThreads;  // 64
+constexpr uint32_t kSubGroupSize = 16;
+constexpr int64_t kTileDim = kTileElements * static_cast<int64_t>(kSubGroupSize);  // 64
+constexpr uint32_t kSubGroupsPerBlock = 4;
+constexpr uint32_t kBlockSize = kSubGroupsPerBlock * kSubGroupSize;  // 64
 
 namespace FlashCompress4Impl {
 
@@ -63,7 +63,7 @@ inline void c4_forward(
     const int64_t head_dim,
     const int64_t elem_size) {
   for (int32_t i = 0; i < kTileElements; ++i) {
-    const int64_t h = split_offset + static_cast<int64_t>(i) * kWarpThreads + lane_id;
+    const int64_t h = split_offset + static_cast<int64_t>(i) * kSubGroupSize + lane_id;
 
     float kv_reg[8];
     float score_reg[8];
@@ -120,16 +120,16 @@ inline void c4_forward(
 
 template <typename buffer_t, typename input_t, typename out_t>
 struct FlashCompress4DecodeKernel {
-  [[sycl::reqd_sub_group_size(16)]]
+  [[sycl::reqd_sub_group_size(kSubGroupSize)]]
   void operator()(sycl::nd_item<1> item) const {
-    const uint32_t global_tid = static_cast<uint32_t>(item.get_global_id(0));
-    const uint32_t local_tid = static_cast<uint32_t>(item.get_local_id(0));
+    const uint32_t gid = static_cast<uint32_t>(item.get_group(0));
+    const uint32_t lid = static_cast<uint32_t>(item.get_local_id(0));
 
-    const uint32_t global_wid = global_tid / kWarpThreads;  // warp id
-    const uint32_t global_bid = global_wid / num_split_;    // batch id
-    const uint32_t global_sid = global_wid % num_split_;    // split id
+    const uint32_t global_sg_id = gid * kSubGroupsPerBlock + (lid / kSubGroupSize);
+    const uint32_t global_bid = global_sg_id / num_split_;  // batch id
+    const uint32_t global_sid = global_sg_id % num_split_;  // split id
     const int64_t split_offset = static_cast<int64_t>(global_sid) * kTileDim;
-    const uint32_t lane_id = local_tid % kWarpThreads;
+    const uint32_t lane_id = lid % kSubGroupSize;
 
     if (global_bid >= batch_size_) {
       return;
@@ -145,7 +145,7 @@ struct FlashCompress4DecodeKernel {
     buffer_t* kv_dst = kv_buffer_ + write_loc * elem_size_;
     const input_t* kv_src = kv_input_ + static_cast<int64_t>(global_bid) * elem_size_;
 
-    // One warp handles one split; each lane copies a contiguous 4-element chunk per row.
+    // One sub-group handles one split; each lane copies a contiguous 4-element chunk per row.
     c4_write_token_strided<buffer_t, input_t>(kv_dst, kv_src, split_offset, lane_id, head_dim_);
 
     // Compress only when we close a 4-token chunk.
@@ -188,15 +188,15 @@ struct FlashCompress4DecodeKernel {
 
 template <typename buffer_t, typename input_t, typename out_t>
 struct FlashCompress4CompressKernel {
-  [[sycl::reqd_sub_group_size(16)]]
+  [[sycl::reqd_sub_group_size(kSubGroupSize)]]
   void operator()(sycl::nd_item<1> item) const {
     const uint32_t gid = static_cast<uint32_t>(item.get_group(0));
     const uint32_t lid = static_cast<uint32_t>(item.get_local_id(0));
-    const uint32_t global_wid = gid * 4U + (lid / 16U);
-    const uint32_t pid = global_wid / num_split_;
-    const uint32_t split_id = global_wid % num_split_;
+    const uint32_t global_sg_id = gid * kSubGroupsPerBlock + (lid / kSubGroupSize);
+    const uint32_t pid = global_sg_id / num_split_;
+    const uint32_t split_id = global_sg_id % num_split_;
     const int64_t split_offset = static_cast<int64_t>(split_id) * kTileDim;
-    const uint32_t tid_in_warp = lid % 16U;
+    const uint32_t lane_id = lid % kSubGroupSize;
 
     if (pid >= num_compress_) {
       return;
@@ -230,7 +230,7 @@ struct FlashCompress4CompressKernel {
         need_overlap,
         buffer_len,
         split_offset,
-        tid_in_warp,
+        lane_id,
         head_dim_,
         elem_size_);
   }
@@ -249,16 +249,17 @@ struct FlashCompress4CompressKernel {
 
 template <typename buffer_t, typename input_t>
 struct FlashCompress4WriteKernel {
-  [[sycl::reqd_sub_group_size(16)]]
+  [[sycl::reqd_sub_group_size(kSubGroupSize)]]
   void operator()(sycl::nd_item<1> item) const {
     const uint32_t gid = static_cast<uint32_t>(item.get_group(0));
     const uint32_t lid = static_cast<uint32_t>(item.get_local_id(0));
-    const uint32_t global_wid = gid * 4U + (lid / 16U);
-    const uint32_t pid = global_wid / num_split_;
-    const uint32_t split_id = global_wid % num_split_;
-    // Contiguous-tile mapping for prefill write: one warp copies one contiguous 4*kTileDim region.
-    const int64_t split_offset = static_cast<int64_t>(split_id) * (kTileDim * 4);
-    const uint32_t lane_id = lid % 16U;
+    const uint32_t global_sg_id = gid * kSubGroupsPerBlock + (lid / kSubGroupSize);
+    const uint32_t pid = global_sg_id / num_split_;
+    const uint32_t split_id = global_sg_id % num_split_;
+    // Split along head_dim columns (kTileDim=64) and copy all 4 rows with stride=head_dim.
+    const int64_t head_dim = elem_size_ / 4;
+    const int64_t split_offset = static_cast<int64_t>(split_id) * kTileDim;
+    const uint32_t lane_id = lid % kSubGroupSize;
 
     if (pid >= num_write_) {
       return;
@@ -272,7 +273,7 @@ struct FlashCompress4WriteKernel {
     const input_t* kv_src = kv_input_ + static_cast<int64_t>(plan.ragged_id) * elem_size_;
     buffer_t* kv_dst = kv_buffer_ + static_cast<int64_t>(plan.write_loc) * elem_size_;
 
-    c4_write_token_strided<buffer_t, input_t>(kv_dst, kv_src, split_offset, lane_id, kTileDim);
+    c4_write_token_strided<buffer_t, input_t>(kv_dst, kv_src, split_offset, lane_id, head_dim);
   }
 
   buffer_t* kv_buffer_;
@@ -340,10 +341,10 @@ SGL_KERNEL_EXPORT void flash_compress4_decode(
             elem_size,
             page_elem_size,
             num_split};
-        const uint32_t num_warps = static_cast<uint32_t>(batch_size) * num_split;
-        const uint32_t num_groups = (num_warps + kWarpsPerGroup - 1) / kWarpsPerGroup;
-        const uint32_t global_size = num_groups * kLocalSize;
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kLocalSize)), kernel);
+        const uint32_t num_sgs = static_cast<uint32_t>(batch_size) * num_split;
+        const uint32_t num_blocks = (num_sgs + kSubGroupsPerBlock - 1) / kSubGroupsPerBlock;
+        const uint32_t global_size = num_blocks * kBlockSize;
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kBlockSize)), kernel);
       });
     });
   });
@@ -416,10 +417,10 @@ SGL_KERNEL_EXPORT void flash_compress4_prefill(
               elem_size,
               page_elem_size,
               num_split};
-          const uint32_t num_warps = static_cast<uint32_t>(num_compress) * num_split;
-          const uint32_t num_groups = (num_warps + kWarpsPerGroup - 1) / kWarpsPerGroup;
-          const uint32_t global_size = num_groups * kLocalSize;
-          cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kLocalSize)), kernel);
+          const uint32_t num_sgs = static_cast<uint32_t>(num_compress) * num_split;
+          const uint32_t num_blocks = (num_sgs + kSubGroupsPerBlock - 1) / kSubGroupsPerBlock;
+          const uint32_t global_size = num_blocks * kBlockSize;
+          cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kBlockSize)), kernel);
         });
       }
       if (num_write > 0) {
@@ -433,10 +434,10 @@ SGL_KERNEL_EXPORT void flash_compress4_prefill(
               static_cast<uint32_t>(num_write),
               elem_size,
               num_split_write};
-          const uint32_t num_warps = static_cast<uint32_t>(num_write) * num_split_write;
-          const uint32_t num_groups = (num_warps + kWarpsPerGroup - 1) / kWarpsPerGroup;
-          const uint32_t global_size = num_groups * kLocalSize;
-          cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kLocalSize)), kernel);
+          const uint32_t num_sgs = static_cast<uint32_t>(num_write) * num_split_write;
+          const uint32_t num_blocks = (num_sgs + kSubGroupsPerBlock - 1) / kSubGroupsPerBlock;
+          const uint32_t global_size = num_blocks * kBlockSize;
+          cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kBlockSize)), kernel);
         });
       }
     });

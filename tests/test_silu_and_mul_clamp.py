@@ -94,13 +94,16 @@ def silu_and_mul_clamp_torch(
 @pytest.mark.parametrize("M", [16, 128])
 @pytest.mark.parametrize("H", [32, 64])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_silu_and_mul_clamp(M, H, dtype):
+@pytest.mark.parametrize("swiglu_limit", [10.0, 7.0, 2.0])
+def test_silu_and_mul_clamp(M, H, dtype, swiglu_limit):
     "Test silu_and_mul_clamp against reference"
     torch.manual_seed(42)
-    swiglu_limit = 10.0
     device = "xpu"
 
-    inp = torch.randn((M, 2 * H), dtype=dtype, device=device)
+    # Scale well past swiglu_limit so both the gate upper-clamp and the
+    # up two-sided clamp actually engage, instead of only exercising the
+    # unclamped SiLU*mul path.
+    inp = torch.randn((M, 2 * H), dtype=dtype, device=device) * (4 * swiglu_limit)
     out = torch.randn((M, H), dtype=dtype, device=device)
     ref_out = torch.zeros_like(out)
 
@@ -108,3 +111,78 @@ def test_silu_and_mul_clamp(M, H, dtype):
     silu_and_mul_clamp_torch(inp, ref_out, swiglu_limit)
 
     torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("M", [16, 128])
+@pytest.mark.parametrize("H", [48, 80])  # non-power-of-two -> vec_size=1 fallback
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_silu_and_mul_clamp_non_power_of_two_h(M, H, dtype):
+    "Test silu_and_mul_clamp with non-power-of-two H, exercising the vec_size=1 fallback path"
+    torch.manual_seed(42)
+    device = "xpu"
+    swiglu_limit = 7.0
+
+    inp = torch.randn((M, 2 * H), dtype=dtype, device=device) * (4 * swiglu_limit)
+    out = torch.randn((M, H), dtype=dtype, device=device)
+    ref_out = torch.zeros_like(out)
+
+    silu_and_mul_clamp(inp, out, swiglu_limit)
+    silu_and_mul_clamp_torch(inp, ref_out, swiglu_limit)
+
+    torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_silu_and_mul_clamp_boundary_values(dtype):
+    "Test silu_and_mul_clamp with inputs exactly at +-swiglu_limit"
+    device = "xpu"
+    swiglu_limit = 5.0
+    H = 8
+
+    gate = torch.full((1, H), swiglu_limit, dtype=dtype, device=device)
+    up = torch.tensor(
+        [swiglu_limit if i % 2 == 0 else -swiglu_limit for i in range(H)],
+        dtype=dtype,
+        device=device,
+    ).unsqueeze(0)
+    inp = torch.cat([gate, up], dim=-1)
+    out = torch.zeros((1, H), dtype=dtype, device=device)
+    ref_out = torch.zeros_like(out)
+
+    silu_and_mul_clamp(inp, out, swiglu_limit)
+    silu_and_mul_clamp_torch(inp, ref_out, swiglu_limit)
+
+    torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
+
+
+def test_silu_and_mul_clamp_dtype_mismatch_raises():
+    "out.dtype() == input.dtype() check"
+    device = "xpu"
+    inp = torch.randn((4, 16), dtype=torch.bfloat16, device=device)
+    out = torch.randn((4, 8), dtype=torch.float16, device=device)
+
+    with pytest.raises(RuntimeError):
+        silu_and_mul_clamp(inp, out, 7.0)
+
+
+def test_silu_and_mul_clamp_non_positive_limit_raises():
+    "swiglu_limit must be > 0"
+    device = "xpu"
+    inp = torch.randn((4, 16), dtype=torch.bfloat16, device=device)
+    out = torch.randn((4, 8), dtype=torch.bfloat16, device=device)
+
+    with pytest.raises(RuntimeError):
+        silu_and_mul_clamp(inp, out, 0.0)
+
+    with pytest.raises(RuntimeError):
+        silu_and_mul_clamp(inp, out, -1.0)
+
+
+def test_silu_and_mul_clamp_unsupported_dtype_raises():
+    "only bf16 and fp16 are supported"
+    device = "xpu"
+    inp = torch.randn((4, 16), dtype=torch.float32, device=device)
+    out = torch.randn((4, 8), dtype=torch.float32, device=device)
+
+    with pytest.raises(RuntimeError):
+        silu_and_mul_clamp(inp, out, 7.0)

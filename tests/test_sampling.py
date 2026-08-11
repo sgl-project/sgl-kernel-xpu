@@ -62,6 +62,7 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
             torch.arange(batch_size), samples
         ]
 
+
 @pytest.mark.parametrize("batch_size", [1, 16, 128])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k_range", [(10, 50), (50, 200)])
@@ -104,7 +105,7 @@ def test_top_k_top_p_joint_sampling_from_probs_array(
 def torch_top_p_renorm_probs(normalized_prob, p):
     batch_size, vocab_size = normalized_prob.size()
     torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device=f"{device}:0")
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device=normalized_prob.device)
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     sorted_prob, indices = torch.sort(normalized_prob, descending=False)
     cdf = torch.cumsum(sorted_prob, dim=-1)
@@ -113,7 +114,9 @@ def torch_top_p_renorm_probs(normalized_prob, p):
         threshold = (1 - p.float()).unsqueeze(-1)
     else:
         threshold = 1 - float(p)
-    mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32, device=f"cpu")
+    mask = torch.zeros(
+        batch_size, vocab_size, dtype=torch.int32, device=normalized_prob.device
+    )
     mask.scatter_add_(1, indices, (cdf >= threshold).int())
     renorm_prob_ground_truth = normalized_prob.clone()
     renorm_prob_ground_truth[mask == 0] = 0

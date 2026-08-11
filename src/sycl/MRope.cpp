@@ -8,6 +8,7 @@
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "comm/Numerics.h"
+#include "sgl_kernel_export.h"
 
 namespace at::native::xpu {
 
@@ -168,7 +169,7 @@ void launch_mrope(
 
 }  // namespace
 
-void multimodal_rotary_embedding(
+SGL_KERNEL_EXPORT void multimodal_rotary_embedding(
     at::Tensor& query,
     at::Tensor& key,
     const at::Tensor& cos_sin_cache,

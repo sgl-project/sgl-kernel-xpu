@@ -140,6 +140,68 @@ def gemma_fused_add_rmsnorm(
     torch.ops.sgl_kernel.gemma_fused_add_rmsnorm(input, residual, weight, eps)
 
 
+def fused_inplace_qknorm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    is_neox: bool,
+    eps: float = 1e-6,
+    head_dim: int = 0,
+    rope_dim: int = 0,
+) -> None:
+    r"""Apply fused RMSNorm + RoPE to Q/K using a precomputed cos/sin cache.
+
+    Step 1:
+    ``q = RMSNorm(q, q_weight)`` and ``k = RMSNorm(k, k_weight)``
+
+    Step 2:
+    ``q`` and ``k`` are rotated in-place using the cached cosine/sine values
+    indexed by ``positions``.
+
+    Parameters
+    ----------
+    q: torch.Tensor
+        Query tensor updated in-place.
+    k: torch.Tensor
+        Key tensor updated in-place.
+    q_weight: torch.Tensor
+        RMSNorm weights for query, shape ``(head_dim,)``.
+    k_weight: torch.Tensor
+        RMSNorm weights for key, shape ``(head_dim,)``.
+    cos_sin_cache: torch.Tensor
+        Precomputed RoPE cosine/sine cache, shape ``(max_pos, rope_dim)``.
+    positions: torch.Tensor
+        Position indices used to select rows from ``cos_sin_cache``.
+    is_neox: bool
+        Whether to apply NeoX-style rotary layout.
+    eps: float
+        Epsilon for RMS normalization.
+    head_dim: int
+        Optional explicit head dimension. Defaults to ``q.size(-1)`` when set to 0.
+    rope_dim: int
+        Optional explicit rotary dimension. Defaults to ``cos_sin_cache.size(-1)`` when set to 0.
+
+    Note
+    ----
+    This is an in-place operation that modifies ``q`` and ``k`` directly.
+    """
+    torch.ops.sgl_kernel.fused_inplace_qknorm_rope(
+        q,
+        k,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        is_neox,
+        eps,
+        head_dim,
+        rope_dim,
+    )
+
+
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
     assert input.ndim == output.ndim, f"{input.ndim} != {output.ndim}"
     assert (
@@ -576,4 +638,82 @@ def multimodal_rotary_embedding(
         mrope_interleaved_glm,
         is_neox,
         axis_map,
+    )
+
+
+def fused_q_norm_rope(
+    q_input: torch.Tensor,  # (B, num_q_heads, head_dim)  any float dtype
+    q_output: torch.Tensor,  # (B, num_q_heads, head_dim)  same dtype, pre-allocated
+    freqs_cis: torch.Tensor,  # (max_pos, rope_dim) fp32, interleaved re/im
+    positions: torch.Tensor,  # (B,) int32 or int64
+    eps: float,
+) -> None:
+    r"""Fused unweighted RMSNorm-self + RoPE for the DeepSeek-V4 Q path.
+
+    Writes the result into ``q_output`` (same shape/dtype as ``q_input``).
+    Dispatches to a sub-group ("warp") kernel for ``head_dim`` in
+    ``{64, 128, 192, 256}`` when ``rope_dim`` aligns with a lane boundary
+    (i.e. ``rope_dim % (head_dim // 16) == 0``), and to a work-group ("CTA")
+    kernel otherwise (including all ``head_dim > 256``, e.g. DeepSeek-V4's ``512``).
+
+    Algorithm (per token, per head):
+      1. RMSNorm-self  -- normalize the full head_dim vector (no learned weight).
+      2. NoPE region   -- first ``(head_dim - rope_dim)`` elements written as-is.
+      3. RoPE region   -- last ``rope_dim`` elements rotated with ``freqs_cis``.
+
+    Parameters
+    ----------
+    q_input: torch.Tensor
+        Shape ``(B, num_q_heads, head_dim)``.
+    q_output: torch.Tensor
+        Pre-allocated output, same shape/dtype as ``q_input``.
+    freqs_cis: torch.Tensor
+        Shape ``(max_pos, rope_dim)`` fp32, interleaved
+        ``[re0, im0, re1, im1, ...]`` (i.e.
+        ``torch.view_as_real(freqs_cis_complex).flatten(-2)``).
+    positions: torch.Tensor
+        Shape ``(B,)``, int32 or int64.
+    eps: float
+        RMSNorm epsilon.
+
+    Note
+    ----
+    This is an in-place operation that writes into ``q_output`` directly.
+    """
+    torch.ops.sgl_kernel.fused_q_norm_rope(q_input, q_output, freqs_cis, positions, eps)
+
+
+def fused_k_norm_rope_flashmla(
+    kv: torch.Tensor,
+    kv_weight: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    eps: float,
+    page_size: int,
+) -> None:
+    r"""Fused K-norm + RoPE + FlashMLA paged cache store for DeepSeek-V4.
+
+    Parameters
+    ----------
+    kv: torch.Tensor
+        Shape ``(B, 512)``, bf16/fp16/fp32.
+    kv_weight: torch.Tensor
+        Shape ``(512,)``, same dtype as ``kv``.
+    freqs_cis: torch.Tensor
+        Shape ``(max_pos, 64)`` fp32, interleaved ``[re0, im0, re1, im1, ...]``.
+    positions: torch.Tensor
+        Shape ``(B,)``, int32 or int64.
+    out_loc: torch.Tensor
+        Shape ``(B,)``, int32 cache slot indices. Negative values skip store.
+    kvcache: torch.Tensor
+        Shape ``(npages, kPageBytes)``, uint8 tensor.
+    eps: float
+        RMSNorm epsilon.
+    page_size: int
+        Page size (must be a power of 2).
+    """
+    torch.ops.sgl_kernel.fused_k_norm_rope_flashmla(
+        kv, kv_weight, freqs_cis, positions, out_loc, kvcache, eps, page_size
     )

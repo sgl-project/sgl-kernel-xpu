@@ -1,0 +1,127 @@
+from __future__ import annotations
+
+from typing import Tuple
+
+import torch
+
+
+def _as_i32_view(x_u8: torch.Tensor, words: int) -> torch.Tensor:
+    assert x_u8.dtype == torch.uint8 and x_u8.is_contiguous()
+    return x_u8.view(torch.int32).reshape(x_u8.shape[0], words)
+
+
+def decode_plan_c(
+    plan_c_u8: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    i32 = _as_i32_view(plan_c_u8, 4)
+    seq_len = i32[:, 0].to(torch.int64)
+    word1 = i32[:, 1].to(torch.int64) & 0xFFFFFFFF
+    ragged_id = (word1 & 0xFFFF).to(torch.int64)
+    buffer_len = ((word1 >> 16) & 0xFFFF).to(torch.int64)
+    rp0 = i32[:, 2].to(torch.int64)
+    rp1 = i32[:, 3].to(torch.int64)
+    return seq_len, ragged_id, buffer_len, rp0, rp1
+
+
+def decode_plan_w(plan_w_u8: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    i32 = _as_i32_view(plan_w_u8, 2).to(torch.int64)
+    return i32[:, 0], i32[:, 1]
+
+
+def decode_plan_d(
+    plan_d_u8: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    i32 = _as_i32_view(plan_d_u8, 4).to(torch.int64)
+    return i32[:, 0], i32[:, 1], i32[:, 2], i32[:, 3]
+
+
+def _infer_head_dim_from_inputs(
+    kv_input: torch.Tensor, ape: torch.Tensor, kv_output: torch.Tensor
+) -> int:
+    assert (
+        kv_output.ndim == 2
+    ), f"kv_output must be [*, head_dim], got {kv_output.shape}"
+    head_dim = int(kv_output.shape[1])
+    assert (
+        ape.shape[1] == head_dim
+    ), f"ape head_dim {ape.shape[1]} != kv_output head_dim {head_dim}"
+    assert (
+        kv_input.shape[1] == 2 * head_dim
+    ), f"kv_input last dim {kv_input.shape[1]} != 2*head_dim {2*head_dim}"
+    return head_dim
+
+
+def _flatten_slots_128(kv_buffer: torch.Tensor) -> torch.Tensor:
+    assert kv_buffer.ndim == 3, f"expected [num_pages,128,elem], got {kv_buffer.shape}"
+    num_pages, page_size, elem = kv_buffer.shape
+    assert page_size == 128, f"c128 expects page_size=128, got {page_size}"
+    return kv_buffer.reshape(num_pages * page_size, elem)
+
+
+def _page_slice_128(kv_flat: torch.Tensor, page_idx: int) -> torch.Tensor:
+    base = page_idx * 128
+    return kv_flat[base : base + 128]
+
+
+def c128_forward_torch(
+    kv_buf_page: torch.Tensor,  # [128, head_dim*2]
+    kv_input: torch.Tensor,  # [N, head_dim*2]
+    ragged_id: int,  # position row index
+    kv_out: torch.Tensor,  # [head_dim]
+    ape: torch.Tensor,  # [128, head_dim]
+    buffer_len: int,
+) -> None:
+    head_dim = kv_out.numel()
+    P = ragged_id
+
+    # Window = first ``buffer_len`` rows from the state buffer page, then the
+    # ``128 - buffer_len`` fresh tokens ending at row P. The fresh slice starts at
+    # ``P - 127 + buffer_len`` (== P - 127 when buffer_len == 0). Concatenating
+    # avoids slicing kv_input with a negative start when P < 127, which happens
+    # for the first compress event of a short / non-ratio-aligned extend chunk.
+    if buffer_len <= 0:
+        window = kv_input[P - 127 : P + 1]  # [128, 2*head_dim]
+    elif buffer_len >= 128:
+        window = kv_buf_page
+    else:
+        fresh = kv_input[P - 127 + buffer_len : P + 1]  # [128 - buffer_len, ...]
+        window = torch.cat([kv_buf_page[:buffer_len], fresh], dim=0)
+
+    kv = window[:, :head_dim]
+    sc = window[:, head_dim : 2 * head_dim] + ape
+    w = torch.softmax(sc, dim=0)
+    kv_out.copy_((kv * w).sum(dim=0))
+
+
+def flash_compress128_prefill(
+    kv_buffer: torch.Tensor,  # [num_pages, 128, head_dim*2]
+    kv_input: torch.Tensor,  # [N, head_dim*2]
+    kv_output: torch.Tensor,  # [C, head_dim] (compact)
+    ape: torch.Tensor,  # [128, head_dim]
+    plan_c_u8: torch.Tensor,  # [C, 16]
+    plan_w_u8: torch.Tensor,  # [W, 8]
+) -> None:
+    torch.ops.sgl_kernel.flash_compress128_prefill(
+        kv_buffer,
+        kv_input,
+        kv_output,
+        ape,
+        plan_c_u8,
+        plan_w_u8,
+    )
+
+
+def flash_compress128_decode(
+    kv_buffer: torch.Tensor,  # [num_pages, 128, head_dim*2]
+    kv_input: torch.Tensor,  # [B, head_dim*2]
+    kv_output: torch.Tensor,  # [B, head_dim]
+    ape: torch.Tensor,  # [128, head_dim]
+    plan_d_u8: torch.Tensor,  # [B, 16]
+) -> None:
+    torch.ops.sgl_kernel.flash_compress128_decode(
+        kv_buffer,
+        kv_input,
+        kv_output,
+        ape,
+        plan_d_u8,
+    )

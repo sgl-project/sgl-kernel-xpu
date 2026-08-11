@@ -30,6 +30,44 @@ set(DPCPP_SYCL_TARGET "bmg" CACHE STRING "dpcpp target device" FORCE)
 include(${SGL_OPS_XPU_ROOT}/cmake/SYCL.cmake)
 include(${SGL_OPS_XPU_ROOT}/cmake/BuildFlags.cmake)
 
+if(EXISTS "/proc/meminfo")
+  option(SGL_BUILD_MEMORY_MONITOR "Track build memory and guard host OOM" ON)
+  set(SGL_BUILD_MEM_FILE_LIMIT_GIB "4" CACHE STRING "Per-file compile RSS threshold in GiB")
+  option(SGL_BUILD_MEM_FILE_LIMIT_FATAL "Fail the build if a single file's peak RSS reaches SGL_BUILD_MEM_FILE_LIMIT_GIB" ON)
+  set(SGL_BUILD_MEM_GUARD_AVAIL_GIB "0.5" CACHE STRING "Kill compile when MemAvailable drops below this GiB" FORCE)
+  set(SGL_BUILD_MEM_GUARD_USED_PCT "99" CACHE STRING "Kill compile when system used memory reaches this percent" FORCE)
+else()
+  option(SGL_BUILD_MEMORY_MONITOR "Track build memory and guard host OOM" OFF)
+endif()
+
+if(SGL_BUILD_MEMORY_MONITOR)
+  set(SGL_BUILD_MEM_DIR ${CMAKE_BINARY_DIR}/mem_monitor)
+  file(MAKE_DIRECTORY ${SGL_BUILD_MEM_DIR})
+  set(SGL_BUILD_MEM_RECORDS ${SGL_BUILD_MEM_DIR}/compile_mem.jsonl)
+  set(SGL_BUILD_MEM_START_TS_FILE ${SGL_BUILD_MEM_DIR}/build_start_epoch.txt)
+  file(REMOVE ${SGL_BUILD_MEM_RECORDS})
+  execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c "import pathlib,time; pathlib.Path(r\"${SGL_BUILD_MEM_START_TS_FILE}\").write_text(str(time.time()))"
+  )
+
+  set(SGL_BUILD_MEM_LAUNCHER
+    ${Python3_EXECUTABLE}
+    ${PROJECT_SOURCE_DIR}/tools/memory/compiler_launcher.py
+    --db ${SGL_BUILD_MEM_RECORDS}
+    --file-limit-gib ${SGL_BUILD_MEM_FILE_LIMIT_GIB}
+    --guard-avail-gib ${SGL_BUILD_MEM_GUARD_AVAIL_GIB}
+    --guard-used-pct ${SGL_BUILD_MEM_GUARD_USED_PCT}
+  )
+  if(SGL_BUILD_MEM_FILE_LIMIT_FATAL)
+    list(APPEND SGL_BUILD_MEM_LAUNCHER --file-limit-fatal)
+  endif()
+
+  set(CMAKE_C_COMPILER_LAUNCHER ${SGL_BUILD_MEM_LAUNCHER})
+  set(CMAKE_CXX_COMPILER_LAUNCHER ${SGL_BUILD_MEM_LAUNCHER})
+
+  message(STATUS "Build memory monitor enabled (per-file limit=${SGL_BUILD_MEM_FILE_LIMIT_GIB}GiB fatal=${SGL_BUILD_MEM_FILE_LIMIT_FATAL}, guard avail=${SGL_BUILD_MEM_GUARD_AVAIL_GIB}GiB, guard used=${SGL_BUILD_MEM_GUARD_USED_PCT}%)")
+endif()
+
 include(FetchContent)
 
 # SYCL support in cutlass
@@ -61,3 +99,8 @@ add_subdirectory(${SGL_OPS_XPU_ROOT}/src)
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/sgl_kernel/jit_kernel
         DESTINATION sgl_kernel/include/sgl_kernel
         FILES_MATCHING PATTERN "*.hpp")
+
+if(SGL_BUILD_MEMORY_MONITOR)
+  install(CODE
+    "execute_process(COMMAND \"${Python3_EXECUTABLE}\" \"${PROJECT_SOURCE_DIR}/tools/memory/report_peaks.py\" --db \"${SGL_BUILD_MEM_RECORDS}\" --limit-gib \"${SGL_BUILD_MEM_FILE_LIMIT_GIB}\" --start-epoch-file \"${SGL_BUILD_MEM_START_TS_FILE}\")")
+endif()

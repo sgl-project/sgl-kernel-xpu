@@ -13,11 +13,36 @@ class TestFile:
     estimated_time: float = 60
 
 
+# Retry a signal-killed (likely GPU-faulted) test file this many times.
+MAX_INFRA_RETRIES = int(os.environ.get("SGL_KERNEL_INFRA_RETRIES", "1"))
+
+# Wait for the GPU engine reset / L0 teardown to settle before retrying.
+_XPU_RECOVER_WAIT = float(os.environ.get("SGL_KERNEL_XPU_RECOVER_WAIT", "20"))
+
+# Longer wait after a hard timeout: a hung kernel leaves the L0 context and
+# engine in a worse state than a plain segfault, so give the driver more time
+# to tear it down before the retry starts allocating again.
+_XPU_TIMEOUT_RECOVER_WAIT = float(
+    os.environ.get("SGL_KERNEL_XPU_TIMEOUT_RECOVER_WAIT", "60")
+)
+
+
+def _recover_xpu(wait: float = _XPU_RECOVER_WAIT) -> None:
+    """Wait for the XPU to reset; log health via xpu-smi if available."""
+    time.sleep(wait)
+    try:
+        subprocess.run(
+            ["xpu-smi", "health", "-d", "0"],
+            timeout=30,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+
 def _terminate_process_tree(process: Optional[subprocess.Popen]) -> None:
-    # On XPU the child holds a Level Zero context; leaving it alive after a
-    # timeout wedges the device for later CI jobs on the same runner. The
-    # subprocess is launched with start_new_session=True so its PID is a
-    # process-group leader — SIGKILL to that PGID reaps the whole tree.
+    # SIGKILL the whole PGID: the child owns an L0 context that wedges
+    # the XPU for later CI jobs if left alive.
     if process is None or process.poll() is not None:
         return
     try:
@@ -75,11 +100,8 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
             )
             tic = time.perf_counter()
 
-            # Run via `pytest -x --tb=short` so the first failing parametrization
-            # stops the file. Without -x, one bad case that wedges the XPU/L0
-            # context cascades into thousands of downstream failures and can
-            # eventually SIGSEGV pytest inside saferepr on a corrupt tensor —
-            # burying the real first failure and bloating CI time.
+            # -x stops at first failure so an XPU-wedging case does not
+            # cascade into thousands of downstream failures / a saferepr SIGSEGV.
             process = subprocess.Popen(
                 ["python3", "-m", "pytest", "-x", "--tb=short", filename],
                 stdout=None,
@@ -96,20 +118,65 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
             )
             return process.returncode
 
+        # Negative return code = killed by signal (GPU fault); retry.
+        # TimeoutError = watchdog fired (likely XPU wedge); retry after a
+        # longer recovery wait.
+        # Positive return code = real test failure; do not retry.
+        crashed = False
+        for attempt in range(MAX_INFRA_RETRIES + 1):
+            try:
+                ret_code = run_with_timeout(
+                    run_one_file, args=(filename,), timeout=timeout_per_file
+                )
+            except TimeoutError:
+                _terminate_process_tree(process)
+                time.sleep(5)
+                print(
+                    f"\nTimeout after {timeout_per_file} seconds when running {filename}\n",
+                    flush=True,
+                )
+                if attempt < MAX_INFRA_RETRIES:
+                    print(
+                        f"\n{filename} hit timeout (likely an XPU wedge). "
+                        f"Waiting {_XPU_TIMEOUT_RECOVER_WAIT:.0f}s for device "
+                        f"recovery, then retrying "
+                        f"(attempt {attempt + 1}/{MAX_INFRA_RETRIES}).\n",
+                        flush=True,
+                    )
+                    _recover_xpu(wait=_XPU_TIMEOUT_RECOVER_WAIT)
+                    continue
+                crashed = True
+                break
+
+            if ret_code >= 0:
+                break
+
+            if attempt < MAX_INFRA_RETRIES:
+                print(
+                    f"\n{filename} was killed by signal {-ret_code} "
+                    f"(likely a GPU/driver fault, not a test failure). "
+                    f"Recovering device and retrying "
+                    f"(attempt {attempt + 1}/{MAX_INFRA_RETRIES}).\n",
+                    flush=True,
+                )
+                _recover_xpu()
+            else:
+                print(
+                    f"\n{filename} still crashing with signal {-ret_code} after "
+                    f"{MAX_INFRA_RETRIES} retry(ies); treating as failure.\n",
+                    flush=True,
+                )
+
+        if crashed:
+            success = False
+            break
+
         try:
-            ret_code = run_with_timeout(
-                run_one_file, args=(filename,), timeout=timeout_per_file
-            )
             assert (
                 ret_code == 0
             ), f"expected return code 0, but {filename} returned {ret_code}"
-        except TimeoutError:
-            _terminate_process_tree(process)
-            time.sleep(5)
-            print(
-                f"\nTimeout after {timeout_per_file} seconds when running {filename}\n",
-                flush=True,
-            )
+        except AssertionError as e:
+            print(f"\n{e}\n", flush=True)
             success = False
             break
 

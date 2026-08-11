@@ -15,13 +15,16 @@ class TestFile:
 suites = {
     "per-commit": [
         TestFile("test_awq_dequant.py"),
+        TestFile("test_biased_topk.py"),
         TestFile("test_topk_sigmoid.py"),
         TestFile("test_topk_softmax.py"),
+        TestFile("test_hash_topk.py"),
         TestFile("test_flash_attention.py"),
         TestFile("test_flash_attn_sparse.py"),
         TestFile("test_flash_mla_decode.py"),
         TestFile("test_flash_mla_prefill.py"),
         TestFile("test_flash_mla_with_kvcache.py"),
+        TestFile("test_flash_mla_sparse_fwd.py"),
         TestFile("test_moe_align.py"),
         TestFile("test_moe_gemm.py"),
         TestFile("test_moe_sum_reduce.py"),
@@ -32,6 +35,7 @@ suites = {
         TestFile("test_moe_fused_gate.py"),
         TestFile("test_mrope.py"),
         TestFile("test_per_tensor_quant_fp8.py"),
+        TestFile("test_per_token_quant_fp8.py"),
         TestFile("test_fused_qk_norm_rope.py"),
         TestFile("test_fused_qk_rope_with_cache.py"),
         TestFile("test_merge_state.py"),
@@ -57,6 +61,23 @@ suites = {
         TestFile("test_fused_norm_rope_v2.py"),
         TestFile("test_hc_post.py"),
         TestFile("test_jit_kernels.py"),
+        TestFile("test_embedding_lora_a_fwd.py"),
+        TestFile("test_sgemm_lora_a_fwd.py"),
+        TestFile("test_sgemm_lora_b_fwd.py"),
+        TestFile("test_sconv_causal_conv1d.py"),
+        TestFile("test_sconv_decode_metadata.py"),
+        TestFile("test_sconv_extend_metadata.py"),
+        TestFile("test_sconv_fused_decode_update.py"),
+        TestFile("test_sconv_gather_scatter_and_draft_extend.py"),
+        TestFile("test_sconv_metadata_and_windows.py"),
+        TestFile("test_sconv_update_sconv_cache.py"),
+        TestFile("test_inkling_attn_prologue.py"),
+    ],
+    # Nightly suite: exercises the wheel installed in the intel/sgl-kernel-xpu-dev
+    # nightly image. Populate with longer-running or full-shape tests that are
+    # too slow for per-commit CI. Placeholder for now.
+    "nightly-xpu": [
+        TestFile("test_activation.py"),
     ],
 }
 

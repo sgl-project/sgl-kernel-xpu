@@ -14,10 +14,59 @@ import torch
 from sgl_kernel import moe_fused_gate
 
 
+def assert_equal(
+    score: torch.Tensor,
+    indices_ref: torch.Tensor,
+    indices_our: torch.Tensor,
+    output_ref: torch.Tensor,
+    output_our: torch.Tensor,
+    bs: int,
+    rtol: float = 1e-2,
+    atol: float = 1e-3,
+    max_permit_error: int = 0,
+):
+    indices_our_cpu = indices_our.cpu().tolist()
+    indices_ref_cpu = indices_ref.cpu().tolist()
+    output_our_cpu = output_our.cpu().tolist()
+    output_ref_cpu = output_ref.cpu().tolist()
+
+    wrong_values = 0
+    for token_idx in range(bs):
+        indices_ref_set = set(indices_ref_cpu[token_idx])
+        indices_our_set = set(indices_our_cpu[token_idx])
+        more = indices_our_set - indices_ref_set
+        less = indices_ref_set - indices_our_set
+        if more or less:
+            more_values = sorted(score[token_idx, index].item() for index in more)
+            less_values = sorted(score[token_idx, index].item() for index in less)
+            if more_values != less_values:
+                wrong_values += len(more)
+                print(
+                    f"{token_idx=}, {more=}, {less=} failed, with "
+                    f"{more_values=}, {less_values=}"
+                )
+        assert wrong_values <= max_permit_error, f"{wrong_values=}, {max_permit_error=}"
+
+        ref_output_by_index = dict(
+            zip(indices_ref_cpu[token_idx], output_ref_cpu[token_idx])
+        )
+        output_by_index = dict(
+            zip(indices_our_cpu[token_idx], output_our_cpu[token_idx])
+        )
+        for index in indices_ref_set & indices_our_set:
+            expected = ref_output_by_index[index]
+            actual = output_by_index[index]
+            tolerance = atol + rtol * abs(expected)
+            assert abs(actual - expected) <= tolerance, (
+                f"Output mismatch at token {token_idx}, expert {index}: "
+                f"expected {expected}, got {actual}, tolerance {tolerance}"
+            )
+
+
 def biased_grouped_topk_native(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
+    correction_bias: Optional[torch.Tensor],
     topk: int,
     renormalize: bool,
     num_expert_group: Optional[int] = None,
@@ -39,7 +88,9 @@ def biased_grouped_topk_native(
 
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
-    scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
+    scores_for_choice = scores.view(num_token, -1)
+    if correction_bias is not None:
+        scores_for_choice = scores_for_choice + correction_bias.unsqueeze(0)
     group_sum_count = 1 if scoring_func == "softmax" else 2
     group_scores = (
         scores_for_choice.view(num_token, num_expert_group, -1)
@@ -125,10 +176,16 @@ def test_moe_fused_gate_combined(
     tensor = torch.rand((seq_length, num_experts), dtype=dtype, device="xpu")
     scores = tensor.clone()
     if scoring_func == "softmax":
-        # grouped_topk with softmax activation doesn't have bias
-        bias = torch.zeros(num_experts, dtype=dtype, device="xpu")
+        # grouped_topk with softmax activation does not use correction bias.
+        bias = None
     else:
         bias = torch.rand(num_experts, dtype=dtype, device="xpu")
+    if scoring_func == "sigmoid":
+        selection_scores = tensor.sigmoid()
+    else:
+        selection_scores = torch.softmax(tensor, dim=-1)
+    if bias is not None:
+        selection_scores = selection_scores + bias.unsqueeze(0)
     topk = topk + num_fused_shared_experts
     output, indices = moe_fused_gate(
         tensor,
@@ -178,27 +235,13 @@ def test_moe_fused_gate_combined(
                 (shared_ref_indices >= valid_min) & (shared_ref_indices < valid_max)
             ), f"Shared expert reference indices out of range: found values outside [{valid_min}, {valid_max})"
 
-    idx_check = torch.allclose(
-        ref_indices.sort()[0].to(torch.int32),
-        indices.sort()[0].to(torch.int32),
-        rtol=1e-04,
-        atol=1e-05,
-    )
-    output_check = torch.allclose(
-        ref_output.sort()[0].to(torch.float32),
-        output.sort()[0].to(torch.float32),
-        rtol=1e-02,
-        atol=1e-03,
-    )
-
-    assert idx_check, (
-        f"Indices mismatch at seq_length {seq_length}, dtype {dtype}, "
-        f"params {params}, num_fused_shared_experts {num_fused_shared_experts}"
-    )
-
-    assert output_check, (
-        f"Output mismatch at seq_length {seq_length}, dtype {dtype}, "
-        f"params {params}, num_fused_shared_experts {num_fused_shared_experts}"
+    assert_equal(
+        selection_scores,
+        ref_indices,
+        indices,
+        ref_output,
+        output,
+        seq_length,
     )
 
 

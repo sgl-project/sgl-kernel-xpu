@@ -104,7 +104,8 @@ void Xe20MoEGEMMLauncher(
   });
 }
 
-template void Xe20MoEGEMMLauncher<@TILE@, @SGLAYOUT@, static_cast<ActivationType>(@ACT_TYPE@), @FUSE_ACT@, @WITH_BIAS@>(
+template __attribute__((visibility("default")))
+void Xe20MoEGEMMLauncher<@TILE@, @SGLAYOUT@, static_cast<ActivationType>(@ACT_TYPE@), @FUSE_ACT@, @WITH_BIAS@>(
     sycl::queue,
     const void*,
     const void*,

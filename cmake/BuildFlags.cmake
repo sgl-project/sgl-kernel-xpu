@@ -53,6 +53,17 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     list(APPEND SYCL_HOST_FLAGS -DAT_PER_OPERATOR_HEADERS)
   endif()
   list(APPEND SYCL_HOST_FLAGS -D__INTEL_LLVM_COMPILER_VERSION=${__INTEL_LLVM_COMPILER})
+
+  # Shrink output: per-function/data sections + linker GC drop unused CUTLASS/torch
+  # template code; strip the symbol table in non-debug builds (keeps .dynsym,
+  # .init_array and the embedded SYCL device image intact).
+  list(APPEND SYCL_HOST_FLAGS -ffunction-sections -fdata-sections)
+  string(APPEND CMAKE_SHARED_LINKER_FLAGS " -Wl,--gc-sections")
+  string(APPEND CMAKE_MODULE_LINKER_FLAGS " -Wl,--gc-sections")
+  if(NOT CMAKE_BUILD_TYPE MATCHES "Debug|RelWithDebInfo")
+    string(APPEND CMAKE_SHARED_LINKER_FLAGS " -Wl,-s")
+    string(APPEND CMAKE_MODULE_LINKER_FLAGS " -Wl,-s")
+  endif()
   # -- Kernel flags (SYCL_KERNEL_OPTIONS)
   # The fast-math will be enabled by default in SYCL compiler.
   # Refer to [https://clang.llvm.org/docs/UsersManual.html#cmdoption-fno-fast-math]

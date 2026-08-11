@@ -978,7 +978,7 @@ def test_flash_attn_kvcache(
     [torch.bfloat16, torch.float16]
     + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []),
 )
-@pytest.mark.parametrize("nheads_q,nheads_kv", [(16, 16), (16, 4)])
+@pytest.mark.parametrize("nheads_q,nheads_kv", [(16, 16), (16, 4), (16, 1)])
 @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("local", [True, False])
@@ -1642,7 +1642,7 @@ def _generate_block_kvcache(
     [torch.bfloat16, torch.float16]
     + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []),
 )
-@pytest.mark.parametrize("nheads_q,nheads_kv", [(16, 16), (16, 4)])
+@pytest.mark.parametrize("nheads_q,nheads_kv", [(16, 16), (16, 4), (16, 1)])
 @pytest.mark.parametrize("has_qv", [False])
 @pytest.mark.parametrize("deterministic", [False])
 @pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))

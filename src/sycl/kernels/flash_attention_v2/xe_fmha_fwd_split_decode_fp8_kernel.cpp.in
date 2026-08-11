@@ -20,7 +20,12 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeFp8Runner<@QG_SZ@, @H
   using TileShapeQK = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@PAGE_SIZE@>, cute::_64>;
   using TileShapePV = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@PAGE_SIZE@>>;
   using TileShapeOutput = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;
-  using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<@PAGE_SIZE@ / 16>, cute::_1>>;
+  // Cap KV subgroups so the epilogue cross-subgroup reduction buffer fits in shared
+  // local memory (see kv_subgroups_for_slm); the full PAGE_SIZE/16 split overflows SLM
+  // for large head dims / GQA groups / page sizes and hangs the device.
+  static constexpr int kKvSubgroups = kv_subgroups_for_slm(
+      @PAGE_SIZE@ / 16, @QG_SZ@, ((@HEAD_DIM@ + 31) / 32) * 32);
+  using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<kKvSubgroups>, cute::_1>>;
 
   // FP8 KV cache: Q is bf16 or fp16 while K/V cache are fp8 (e4m3 or e5m2); the
   // split-KV mainloop dequantizes K/V with the per-tensor k/v descale. Sink

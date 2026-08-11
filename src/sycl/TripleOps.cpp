@@ -314,7 +314,7 @@ void silu_and_mul_clamp_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out,
 #undef VEC_LAUNCH_CLAMP
 }
 
-void silu_and_mul_clamp(torch::Tensor& out, torch::Tensor& input, double swiglu_limit) {
+SGL_KERNEL_EXPORT void silu_and_mul_clamp(torch::Tensor& out, torch::Tensor& input, double swiglu_limit) {
   CHECK_INPUT(input)
   CHECK_INPUT(out)
   TORCH_CHECK(out.dtype() == input.dtype(), "silu_and_mul_clamp: dtype mismatch");

@@ -59,7 +59,8 @@ inline PointerInfo get_pointer_paged(void* cache, int32_t index) {
 // Copy one C4 item (value + scale) between page-padded caches, cooperatively
 // across a sub-group. `lane_id`/`sg_size` are the sub-group local id and width;
 // the strided loops make this correct for any Intel SIMD width (8/16/32).
-inline void transfer_item(int lane_id, int sg_size, void* dst_cache, void* src_cache, int32_t dst_index, int32_t src_index) {
+inline void
+transfer_item(int lane_id, int sg_size, void* dst_cache, void* src_cache, int32_t dst_index, int32_t src_index) {
   const PointerInfo dst = get_pointer_paged(dst_cache, dst_index);
   const PointerInfo src = get_pointer_paged(src_cache, src_index);
 

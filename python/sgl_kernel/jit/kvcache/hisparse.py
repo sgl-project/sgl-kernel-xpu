@@ -18,10 +18,8 @@ from __future__ import annotations
 import ctypes
 
 import torch
-
 from sgl_kernel.jit.compiler import load_jit_sycl
 from sgl_kernel.jit.utils import cache_once
-
 
 # ---------------------------------------------------------------------------
 # transfer_cache_dsv4_mla

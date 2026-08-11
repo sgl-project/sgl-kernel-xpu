@@ -26,6 +26,7 @@ if is_xpu():
         is_icpx_available,
         load_jit_sycl,
     )
+
     # hisparse lives under kvcache/ to mirror sglang's CUDA-side layout
     from .kvcache.hisparse import (
         load_cache_to_device_buffer_dsv4_mla,

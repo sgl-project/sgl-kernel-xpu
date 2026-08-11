@@ -188,7 +188,9 @@ def _make_swapin_state(batch_size, num_top_k, hot_buffer_size, is_dsv4, regime):
         device_buffer_tokens[:, :hot_buffer_size] = (
             base
             + num_top_k
-            + torch.arange(hot_buffer_size, dtype=torch.int32, device=DEVICE).view(1, -1)
+            + torch.arange(hot_buffer_size, dtype=torch.int32, device=DEVICE).view(
+                1, -1
+            )
         )
     device_buffer_tokens[:, hot_buffer_size] = top_k_tokens[:, -1]
 
@@ -321,7 +323,9 @@ def _swapin_call(provider, state, is_dsv4):
         _torch_swapin(state, is_dsv4)
 
 
-def _time_miss_regime(provider, batch_size, num_top_k, hot_buffer_size, is_dsv4, reps=20):
+def _time_miss_regime(
+    provider, batch_size, num_top_k, hot_buffer_size, is_dsv4, reps=20
+):
     """Time the cold (all-miss) path, rebuilding state outside the timed window.
 
     ``do_bench`` cannot be used here: the first call makes every token
@@ -397,9 +401,7 @@ def benchmark_swapin(batch_size, num_top_k, hot_buffer_size, provider):
     is_dsv4 = layout == "dsv4"
 
     if regime == "miss":
-        ms = _time_miss_regime(
-            impl, batch_size, num_top_k, hot_buffer_size, is_dsv4
-        )
+        ms = _time_miss_regime(impl, batch_size, num_top_k, hot_buffer_size, is_dsv4)
         min_ms = max_ms = ms
     else:
         state = _make_swapin_state(
@@ -482,7 +484,12 @@ TRANSFER_PROVIDERS = ["sglang-bs256", "sglang-bs512", "sglang-bs1024", "torch"]
         x_vals=transfer_configs,
         line_arg="provider",
         line_vals=TRANSFER_PROVIDERS,
-        line_names=["sglang block=256", "sglang block=512", "sglang block=1024", "torch"],
+        line_names=[
+            "sglang block=256",
+            "sglang block=512",
+            "sglang block=1024",
+            "torch",
+        ],
         styles=[("blue", "-"), ("green", "-"), ("red", "-"), ("orange", "--")],
         ylabel="us",
         plot_name="hisparse-transfer-cache-dsv4-mla-performance",

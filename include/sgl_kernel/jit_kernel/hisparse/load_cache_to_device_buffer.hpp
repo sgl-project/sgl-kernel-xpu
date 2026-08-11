@@ -122,9 +122,7 @@ template <
 class LoadCacheToDeviceBufferKernel {
  public:
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
-  static_assert(
-      BLOCK_SIZE % kWarpSize == 0,
-      "BLOCK_SIZE must be a multiple of the warp size (32).");
+  static_assert(BLOCK_SIZE % kWarpSize == 0, "BLOCK_SIZE must be a multiple of the warp size (32).");
 
   using Layout = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>;
   static constexpr int NUM_WARPS = BLOCK_SIZE / kWarpSize;
@@ -217,15 +215,15 @@ class LoadCacheToDeviceBufferKernel {
     // TOTAL_INT32 int32 slots, so its base is also 4-byte aligned.
     int32_t* smem_i32 = &smem_[0];
     int32_t* s_top_k_tokens = smem_i32;                                        // NUM_TOP_K
-    int32_t* s_chunk_offset = s_top_k_tokens + NUM_TOP_K;                       // NUM_BUFFER_CHUNKS + 1
-    int32_t* s_evict_chunk_offset = s_chunk_offset + (NUM_BUFFER_CHUNKS + 1);   // NUM_BUFFER_CHUNKS + 1
-    int32_t* s_hash_keys = s_evict_chunk_offset + (NUM_BUFFER_CHUNKS + 1);      // HASH_SIZE
-    int32_t* s_total_hits_ptr = s_hash_keys + HASH_SIZE;                        // 1
-    int32_t* s_newest_hit_ptr = s_hash_keys + HASH_SIZE + 1;                    // 1
+    int32_t* s_chunk_offset = s_top_k_tokens + NUM_TOP_K;                      // NUM_BUFFER_CHUNKS + 1
+    int32_t* s_evict_chunk_offset = s_chunk_offset + (NUM_BUFFER_CHUNKS + 1);  // NUM_BUFFER_CHUNKS + 1
+    int32_t* s_hash_keys = s_evict_chunk_offset + (NUM_BUFFER_CHUNKS + 1);     // HASH_SIZE
+    int32_t* s_total_hits_ptr = s_hash_keys + HASH_SIZE;                       // 1
+    int32_t* s_newest_hit_ptr = s_hash_keys + HASH_SIZE + 1;                   // 1
 
     int16_t* smem_i16 = reinterpret_cast<int16_t*>(smem_i32 + Layout::TOTAL_INT32);
-    int16_t* s_lru_slots_out = smem_i16;                                       // HOT_BUFFER_SIZE
-    int16_t* s_hash_vals = s_lru_slots_out + HOT_BUFFER_SIZE;                   // HASH_SIZE
+    int16_t* s_lru_slots_out = smem_i16;                       // HOT_BUFFER_SIZE
+    int16_t* s_hash_vals = s_lru_slots_out + HOT_BUFFER_SIZE;  // HASH_SIZE
 
     // Initialize counters, hash table, and prefix-sum offsets.
     if (tid == 0) {
@@ -317,8 +315,8 @@ class LoadCacheToDeviceBufferKernel {
       item.barrier(::sycl::access::fence_space::local_space);
 
       if (warp_id == 0) {
-        total_hit_count =
-            warp_inclusive_scan(sg, s_chunk_offset, lane_id, sg_size, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_hit_count);
+        total_hit_count = warp_inclusive_scan(
+            sg, s_chunk_offset, lane_id, sg_size, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_hit_count);
         total_evict_count = warp_inclusive_scan(
             sg, s_evict_chunk_offset, lane_id, sg_size, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_evict_count);
         if (tid == 0) {
@@ -378,8 +376,8 @@ class LoadCacheToDeviceBufferKernel {
       item.barrier(::sycl::access::fence_space::local_space);
 
       if (warp_id == 0) {
-        total_misses =
-            warp_inclusive_scan(sg, s_chunk_offset, lane_id, sg_size, chunk_idx + 1, NUM_TOKEN_CHUNKS + 1, total_misses);
+        total_misses = warp_inclusive_scan(
+            sg, s_chunk_offset, lane_id, sg_size, chunk_idx + 1, NUM_TOKEN_CHUNKS + 1, total_misses);
       }
       item.barrier(::sycl::access::fence_space::local_space);
 
@@ -551,61 +549,61 @@ void load_cache_to_device_buffer_launcher(
 // dtype combination (i32/i64) is selected at call time by picking the matching
 // exported symbol.
 
-#define _DEFINE_LOAD_CACHE(SEQ_SUFFIX, SEQ_T, RPI_SUFFIX, RPI_T)                                                    \
-  extern "C" void load_cache_to_device_buffer_##SEQ_SUFFIX##_##RPI_SUFFIX(                                           \
-      void* queue_ptr,                                                                                               \
-      const void* top_k_tokens,                                                                                      \
-      void* device_buffer_tokens,                                                                                    \
-      const void* host_cache_locs,                                                                                   \
-      const void* device_buffer_locs,                                                                                \
-      const void* host_cache_k,                                                                                      \
-      const void* host_cache_v,                                                                                      \
-      void* device_buffer_k,                                                                                         \
-      void* device_buffer_v,                                                                                         \
-      void* top_k_device_locs,                                                                                       \
-      const void* req_pool_indices,                                                                                  \
-      const void* seq_lens,                                                                                          \
-      void* lru_slots,                                                                                               \
-      const void* num_real_reqs,                                                                                     \
-      int64_t batch_size,                                                                                            \
-      int64_t buffer_stride_0,                                                                                       \
-      int64_t host_stride,                                                                                           \
-      int64_t lru_slot_stride_0,                                                                                     \
-      int64_t top_k_tokens_stride,                                                                                   \
-      int64_t top_k_device_locs_stride,                                                                              \
-      int64_t page_size,                                                                                             \
-      int64_t item_size_bytes) {                                                                                     \
-    auto& queue = *static_cast<::sycl::queue*>(queue_ptr);                                                           \
-    load_cache_to_device_buffer_launcher<                                                                           \
-        SGL_HISPARSE_BLOCK_SIZE,                                                                                     \
-        SGL_HISPARSE_NUM_TOP_K,                                                                                      \
-        SGL_HISPARSE_HOT_BUFFER_SIZE,                                                                                \
-        (SGL_HISPARSE_IS_MLA != 0),                                                                                  \
-        (SGL_HISPARSE_IS_DSV4 != 0),                                                                                 \
-        SEQ_T,                                                                                                       \
-        RPI_T>(                                                                                                      \
-        queue,                                                                                                       \
-        top_k_tokens,                                                                                                \
-        device_buffer_tokens,                                                                                        \
-        host_cache_locs,                                                                                             \
-        device_buffer_locs,                                                                                          \
-        host_cache_k,                                                                                                \
-        host_cache_v,                                                                                                \
-        device_buffer_k,                                                                                             \
-        device_buffer_v,                                                                                             \
-        top_k_device_locs,                                                                                           \
-        req_pool_indices,                                                                                            \
-        seq_lens,                                                                                                    \
-        lru_slots,                                                                                                   \
-        num_real_reqs,                                                                                               \
-        batch_size,                                                                                                  \
-        buffer_stride_0,                                                                                             \
-        host_stride,                                                                                                 \
-        lru_slot_stride_0,                                                                                           \
-        top_k_tokens_stride,                                                                                         \
-        top_k_device_locs_stride,                                                                                    \
-        page_size,                                                                                                   \
-        item_size_bytes);                                                                                            \
+#define _DEFINE_LOAD_CACHE(SEQ_SUFFIX, SEQ_T, RPI_SUFFIX, RPI_T)           \
+  extern "C" void load_cache_to_device_buffer_##SEQ_SUFFIX##_##RPI_SUFFIX( \
+      void* queue_ptr,                                                     \
+      const void* top_k_tokens,                                            \
+      void* device_buffer_tokens,                                          \
+      const void* host_cache_locs,                                         \
+      const void* device_buffer_locs,                                      \
+      const void* host_cache_k,                                            \
+      const void* host_cache_v,                                            \
+      void* device_buffer_k,                                               \
+      void* device_buffer_v,                                               \
+      void* top_k_device_locs,                                             \
+      const void* req_pool_indices,                                        \
+      const void* seq_lens,                                                \
+      void* lru_slots,                                                     \
+      const void* num_real_reqs,                                           \
+      int64_t batch_size,                                                  \
+      int64_t buffer_stride_0,                                             \
+      int64_t host_stride,                                                 \
+      int64_t lru_slot_stride_0,                                           \
+      int64_t top_k_tokens_stride,                                         \
+      int64_t top_k_device_locs_stride,                                    \
+      int64_t page_size,                                                   \
+      int64_t item_size_bytes) {                                           \
+    auto& queue = *static_cast<::sycl::queue*>(queue_ptr);                 \
+    load_cache_to_device_buffer_launcher<                                  \
+        SGL_HISPARSE_BLOCK_SIZE,                                           \
+        SGL_HISPARSE_NUM_TOP_K,                                            \
+        SGL_HISPARSE_HOT_BUFFER_SIZE,                                      \
+        (SGL_HISPARSE_IS_MLA != 0),                                        \
+        (SGL_HISPARSE_IS_DSV4 != 0),                                       \
+        SEQ_T,                                                             \
+        RPI_T>(                                                            \
+        queue,                                                             \
+        top_k_tokens,                                                      \
+        device_buffer_tokens,                                              \
+        host_cache_locs,                                                   \
+        device_buffer_locs,                                                \
+        host_cache_k,                                                      \
+        host_cache_v,                                                      \
+        device_buffer_k,                                                   \
+        device_buffer_v,                                                   \
+        top_k_device_locs,                                                 \
+        req_pool_indices,                                                  \
+        seq_lens,                                                          \
+        lru_slots,                                                         \
+        num_real_reqs,                                                     \
+        batch_size,                                                        \
+        buffer_stride_0,                                                   \
+        host_stride,                                                       \
+        lru_slot_stride_0,                                                 \
+        top_k_tokens_stride,                                               \
+        top_k_device_locs_stride,                                          \
+        page_size,                                                         \
+        item_size_bytes);                                                  \
   }
 #define DEFINE_LOAD_CACHE(SEQ_SUFFIX, SEQ_T, RPI_SUFFIX, RPI_T) _DEFINE_LOAD_CACHE(SEQ_SUFFIX, SEQ_T, RPI_SUFFIX, RPI_T)
 

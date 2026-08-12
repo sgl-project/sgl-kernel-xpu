@@ -29,7 +29,7 @@ inline void c4_write_token_strided(
     const int64_t row_stride) {
   const int64_t lane_base = split_offset + static_cast<int64_t>(lane_id) * kTileElements;
 
-  if constexpr (std::is_same_v<buffer_t, input_t> && sizeof(input_t) == 2) {
+  if constexpr (std::is_same_v<buffer_t, input_t> && at::is_reduced_floating_point_v<input_t>) {
     // Fast path: copy 4 contiguous elements (8 bytes) per row via two 32-bit moves.
     for (int64_t i = 0; i < kTileElements; ++i) {
       const int64_t row_off = lane_base + i * row_stride;

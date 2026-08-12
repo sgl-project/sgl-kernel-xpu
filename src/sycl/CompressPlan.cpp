@@ -404,22 +404,19 @@ SGL_KERNEL_EXPORT torch::Tensor plan_compress_decode(
     int64_t compress_ratio,
     int64_t swa_page_size,
     int64_t ring_size) {
-  TORCH_CHECK(
-      req_pool_indices.is_xpu() && req_pool_indices.dtype() == torch::kInt64 && req_pool_indices.dim() == 1 &&
-          req_pool_indices.is_contiguous(),
-      "req_pool_indices must be a contiguous 1D int64 XPU tensor");
-  TORCH_CHECK(
-      req_to_token.is_xpu() && req_to_token.dtype() == torch::kInt32 && req_to_token.dim() == 2 &&
-          req_to_token.is_contiguous(),
-      "req_to_token must be a contiguous 2D int32 XPU tensor");
-  TORCH_CHECK(
-      full_to_state.is_xpu() && full_to_state.dtype() == torch::kInt64 && full_to_state.dim() == 1 &&
-          full_to_state.is_contiguous(),
-      "full_to_state must be a contiguous 1D int64 XPU tensor");
-  TORCH_CHECK(
-      seq_lens.is_xpu() && seq_lens.dtype() == torch::kInt64 && seq_lens.dim() == 1 && seq_lens.is_contiguous(),
-      "seq_lens must be a contiguous 1D int64 XPU tensor");
-  TORCH_CHECK(req_pool_indices.numel() == seq_lens.numel(), "req_pool_indices and seq_lens must have the same length");
+  CHECK_INPUT(req_pool_indices);
+  CHECK_DIM(1, req_pool_indices);
+  CHECK_EQ(req_pool_indices.dtype(), torch::kInt64);
+  CHECK_INPUT(req_to_token);
+  CHECK_DIM(2, req_to_token);
+  CHECK_EQ(req_to_token.dtype(), torch::kInt32);
+  CHECK_INPUT(full_to_state);
+  CHECK_DIM(1, full_to_state);
+  CHECK_EQ(full_to_state.dtype(), torch::kInt64);
+  CHECK_INPUT(seq_lens);
+  CHECK_DIM(1, seq_lens);
+  CHECK_EQ(seq_lens.dtype(), torch::kInt64);
+  CHECK_EQ(req_pool_indices.numel(), seq_lens.numel());
   TORCH_CHECK(compress_ratio > 0, "compress_ratio must be > 0");
 
   uint32_t batch_size = static_cast<uint32_t>(seq_lens.numel());
@@ -467,18 +464,15 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill
   (void)pin_buffer;
   (void)use_cuda_graph;
 
-  TORCH_CHECK(
-      req_pool_indices.is_xpu() && req_pool_indices.dtype() == torch::kInt64 && req_pool_indices.dim() == 1 &&
-          req_pool_indices.is_contiguous(),
-      "req_pool_indices must be a contiguous 1D int64 XPU tensor");
-  TORCH_CHECK(
-      req_to_token.is_xpu() && req_to_token.dtype() == torch::kInt32 && req_to_token.dim() == 2 &&
-          req_to_token.is_contiguous(),
-      "req_to_token must be a contiguous 2D int32 XPU tensor");
-  TORCH_CHECK(
-      full_to_state.is_xpu() && full_to_state.dtype() == torch::kInt64 && full_to_state.dim() == 1 &&
-          full_to_state.is_contiguous(),
-      "full_to_state must be a contiguous 1D int64 XPU tensor");
+  CHECK_INPUT(req_pool_indices);
+  CHECK_DIM(1, req_pool_indices);
+  CHECK_EQ(req_pool_indices.dtype(), torch::kInt64);
+  CHECK_INPUT(req_to_token);
+  CHECK_DIM(2, req_to_token);
+  CHECK_EQ(req_to_token.dtype(), torch::kInt32);
+  CHECK_INPUT(full_to_state);
+  CHECK_DIM(1, full_to_state);
+  CHECK_EQ(full_to_state.dtype(), torch::kInt64);
   TORCH_CHECK(
       (seq_lens.is_xpu() || seq_lens.device().is_cpu()) && seq_lens.dtype() == torch::kInt64 && seq_lens.dim() == 1 &&
           seq_lens.is_contiguous(),
@@ -491,8 +485,8 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill
       pin_buffer.device().is_cpu() && pin_buffer.dtype() == torch::kUInt8 && pin_buffer.dim() == 1 &&
           pin_buffer.is_contiguous(),
       "pin_buffer must be a contiguous 1D uint8 CPU tensor");
-  TORCH_CHECK(seq_lens.numel() == extend_lens.numel(), "seq_lens and extend_lens must have the same length");
-  TORCH_CHECK(req_pool_indices.numel() == seq_lens.numel(), "req_pool_indices and seq_lens must have the same length");
+  CHECK_EQ(seq_lens.numel(), extend_lens.numel());
+  CHECK_EQ(req_pool_indices.numel(), seq_lens.numel());
 
   // Accept CPU metadata tensors and move them to the current XPU stream device.
   auto seq_lens_xpu = seq_lens;

@@ -286,21 +286,19 @@ struct FlashCompress128PrefillWriteKernel {
 
 SGL_KERNEL_EXPORT void flash_compress128_decode(
     torch::Tensor kv_buffer, torch::Tensor kv_input, torch::Tensor kv_output, torch::Tensor ape, torch::Tensor plan_d) {
-  TORCH_CHECK(
-      kv_buffer.is_xpu() && kv_buffer.dim() == 3 && kv_buffer.is_contiguous(),
-      "kv_buffer must be a contiguous 3D XPU tensor");
-  TORCH_CHECK(
-      kv_input.is_xpu() && kv_input.dim() == 2 && kv_input.is_contiguous(),
-      "kv_input must be a contiguous 2D XPU tensor");
-  TORCH_CHECK(
-      kv_output.is_xpu() && kv_output.dim() == 2 && kv_output.is_contiguous(),
-      "kv_output must be a contiguous 2D XPU tensor");
-  TORCH_CHECK(ape.is_xpu() && ape.dim() == 2 && ape.is_contiguous(), "ape must be a contiguous 2D XPU tensor");
-  TORCH_CHECK(
-      plan_d.is_xpu() && plan_d.dim() == 2 && plan_d.dtype() == torch::kUInt8 && plan_d.is_contiguous(),
-      "plan_d must be a contiguous 2D XPU uint8 tensor");
-  TORCH_CHECK(kv_input.dtype() == kv_output.dtype(), "kv_input and kv_output must have the same dtype");
-  TORCH_CHECK(kv_input.dtype() == ape.dtype(), "kv_input and ape must have same dtype");
+  CHECK_INPUT(kv_buffer);
+  CHECK_DIM(3, kv_buffer);
+  CHECK_INPUT(kv_input);
+  CHECK_DIM(2, kv_input);
+  CHECK_INPUT(kv_output);
+  CHECK_DIM(2, kv_output);
+  CHECK_INPUT(ape);
+  CHECK_DIM(2, ape);
+  CHECK_INPUT(plan_d);
+  CHECK_DIM(2, plan_d);
+  CHECK_EQ(plan_d.dtype(), torch::kUInt8);
+  CHECK_EQ(kv_input.dtype(), kv_output.dtype());
+  CHECK_EQ(kv_input.dtype(), ape.dtype());
 
   const int64_t batch_size = kv_input.size(0);
   const int64_t elem_size = kv_input.size(1);
@@ -358,24 +356,22 @@ SGL_KERNEL_EXPORT void flash_compress128_prefill(
     torch::Tensor ape,
     torch::Tensor plan_c,
     torch::Tensor plan_w) {
-  TORCH_CHECK(
-      kv_buffer.is_xpu() && kv_buffer.dim() == 3 && kv_buffer.is_contiguous(),
-      "kv_buffer must be a contiguous 3D XPU tensor");
-  TORCH_CHECK(
-      kv_input.is_xpu() && kv_input.dim() == 2 && kv_input.is_contiguous(),
-      "kv_input must be a contiguous 2D XPU tensor");
-  TORCH_CHECK(
-      kv_output.is_xpu() && kv_output.dim() == 2 && kv_output.is_contiguous(),
-      "kv_output must be a contiguous 2D XPU tensor");
-  TORCH_CHECK(ape.is_xpu() && ape.dim() == 2 && ape.is_contiguous(), "ape must be a contiguous 2D XPU tensor");
-  TORCH_CHECK(
-      plan_c.is_xpu() && plan_c.dim() == 2 && plan_c.dtype() == torch::kUInt8 && plan_c.is_contiguous(),
-      "plan_c must be a contiguous 2D XPU uint8 tensor");
-  TORCH_CHECK(
-      plan_w.is_xpu() && plan_w.dim() == 2 && plan_w.dtype() == torch::kUInt8 && plan_w.is_contiguous(),
-      "plan_w must be a contiguous 2D XPU uint8 tensor");
-  TORCH_CHECK(kv_input.dtype() == kv_output.dtype(), "kv_input and kv_output must have the same dtype");
-  TORCH_CHECK(kv_input.dtype() == ape.dtype(), "kv_input and ape must have same dtype");
+  CHECK_INPUT(kv_buffer);
+  CHECK_DIM(3, kv_buffer);
+  CHECK_INPUT(kv_input);
+  CHECK_DIM(2, kv_input);
+  CHECK_INPUT(kv_output);
+  CHECK_DIM(2, kv_output);
+  CHECK_INPUT(ape);
+  CHECK_DIM(2, ape);
+  CHECK_INPUT(plan_c);
+  CHECK_DIM(2, plan_c);
+  CHECK_EQ(plan_c.dtype(), torch::kUInt8);
+  CHECK_INPUT(plan_w);
+  CHECK_DIM(2, plan_w);
+  CHECK_EQ(plan_w.dtype(), torch::kUInt8);
+  CHECK_EQ(kv_input.dtype(), kv_output.dtype());
+  CHECK_EQ(kv_input.dtype(), ape.dtype());
 
   const int64_t num_q_tokens = kv_input.size(0);
   const int64_t elem_size = kv_input.size(1);

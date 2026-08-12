@@ -134,8 +134,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
   TORCH_CHECK(pw_shape[0] == n_experts, "packed_weights.size(0) must equal n_experts");
   TORCH_CHECK(pw_shape[2] == gemm_k / 2, "packed_weights.size(2) must equal K/2 (two 4-bit values per byte)");
   TORCH_CHECK(
-      packed_weights.scalar_type() == at::ScalarType::Char ||
-          packed_weights.scalar_type() == at::ScalarType::Byte,
+      packed_weights.scalar_type() == at::ScalarType::Char || packed_weights.scalar_type() == at::ScalarType::Byte,
       "packed_weights must be int8 or uint8");
 
   TORCH_CHECK(
@@ -153,8 +152,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
     TORCH_CHECK(scales.scalar_type() == activations.scalar_type(), "int4 scales dtype must match activations dtype");
   } else {
     TORCH_CHECK(
-        scales.scalar_type() == at::ScalarType::Byte ||
-            scales.scalar_type() == at::ScalarType::Float8_e8m0fnu,
+        scales.scalar_type() == at::ScalarType::Byte || scales.scalar_type() == at::ScalarType::Float8_e8m0fnu,
         "mxfp4 scales must be uint8 or float8_e8m0fnu (E8M0 exponent)");
   }
 

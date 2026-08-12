@@ -55,7 +55,7 @@ struct gelu_erf_mul_dpcpp_functor {
 template <typename scalar_t>
 struct silu_and_mul_clamp_elem_functor {
   float limit_bf16;
-  silu_mul_dpcpp_functor<scalar_t, float> silu_mul_fn;
+  silu_mul_dpcpp_functor<float, at::opmath_type<float>> silu_mul_fn;
 
   scalar_t operator()(scalar_t a, scalar_t b) const {
     using bf16_t = sycl::ext::oneapi::bfloat16;
@@ -315,15 +315,12 @@ void silu_and_mul_clamp_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out,
 }
 
 SGL_KERNEL_EXPORT void silu_and_mul_clamp(torch::Tensor& out, torch::Tensor& input, double swiglu_limit) {
-  CHECK_INPUT(input)
-  CHECK_INPUT(out)
+  input = input.contiguous();
+  out = out.contiguous();
   TORCH_CHECK(out.dtype() == input.dtype(), "silu_and_mul_clamp: dtype mismatch");
   TORCH_CHECK(input.size(-1) % 2 == 0, "silu_and_mul_clamp: input last dim must be even");
   TORCH_CHECK(out.numel() * 2 == input.numel(), "silu_and_mul_clamp: output numel must be half of input numel");
   TORCH_CHECK(swiglu_limit > 0.0, "silu_and_mul_clamp: swiglu_limit must be > 0");
-
-  input = input.contiguous();
-  out = out.contiguous();
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();

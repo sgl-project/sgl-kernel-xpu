@@ -92,7 +92,7 @@ def silu_and_mul_clamp_torch(
 
 
 @pytest.mark.parametrize("M", [16, 128])
-@pytest.mark.parametrize("H", [32, 64])
+@pytest.mark.parametrize("H", [32, 48, 64, 80])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("swiglu_limit", [10.0, 7.0, 2.0])
 def test_silu_and_mul_clamp(M, H, dtype, swiglu_limit):
@@ -103,25 +103,6 @@ def test_silu_and_mul_clamp(M, H, dtype, swiglu_limit):
     # Scale well past swiglu_limit so both the gate upper-clamp and the
     # up two-sided clamp actually engage, instead of only exercising the
     # unclamped SiLU*mul path.
-    inp = torch.randn((M, 2 * H), dtype=dtype, device=device) * (4 * swiglu_limit)
-    out = torch.randn((M, H), dtype=dtype, device=device)
-    ref_out = torch.zeros_like(out)
-
-    silu_and_mul_clamp(inp, out, swiglu_limit)
-    silu_and_mul_clamp_torch(inp, ref_out, swiglu_limit)
-
-    torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
-
-
-@pytest.mark.parametrize("M", [16, 128])
-@pytest.mark.parametrize("H", [48, 80])  # non-power-of-two -> vec_size=1 fallback
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_silu_and_mul_clamp_non_power_of_two_h(M, H, dtype):
-    "Test silu_and_mul_clamp with non-power-of-two H, exercising the vec_size=1 fallback path"
-    torch.manual_seed(42)
-    device = "xpu"
-    swiglu_limit = 7.0
-
     inp = torch.randn((M, 2 * H), dtype=dtype, device=device) * (4 * swiglu_limit)
     out = torch.randn((M, H), dtype=dtype, device=device)
     ref_out = torch.zeros_like(out)

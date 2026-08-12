@@ -45,6 +45,33 @@ USE_MOE=0 pip install -v .
 USE_MOE=0 USE_FMHA=OFF USE_MLA=off pip install -v .
 ```
 
+### JIT vs AOT Compilation (`USE_SYCL_JIT`)
+
+By default, SYCL kernels are compiled Ahead-Of-Time (AOT) to device-specific
+native ISA (`-fsycl-targets=spir64_gen -device bmg`). Setting the environment
+variable `USE_SYCL_JIT` compiles kernels to portable SPIR-V
+(`-fsycl-targets=spir64`) instead, which the runtime JIT-compiles to native ISA
+on first launch.
+
+| Variable | Default | Effect when enabled |
+| --- | --- | --- |
+| `USE_SYCL_JIT` | `OFF` (AOT) | Build portable SPIR-V for runtime JIT |
+
+- Accepts `1`, `ON`, `on`, `On`, `true`, `yes` (case-insensitive) to enable.
+- Drives both the in-tree kernels and the fetched CUTLASS (sycl-tla) build.
+- Trade-off: smaller wheel and device-portable binaries, but a one-time JIT
+  compilation cost at first kernel launch.
+
+```bash
+# Build JIT (SPIR-V) instead of AOT
+USE_SYCL_JIT=ON pip install -v .
+
+# Verify a built .so is JIT (spir64) vs AOT (spir64_gen)
+strings -a <lib>.so | grep -oE '__CLANG_OFFLOAD_BUNDLE__sycl-spir64(_gen)?' | sort -u
+# __CLANG_OFFLOAD_BUNDLE__sycl-spir64      -> JIT
+# __CLANG_OFFLOAD_BUNDLE__sycl-spir64_gen  -> AOT
+```
+
 
 ### Build with [ccache](https://github.com/ccache/ccache)
 ```bash

@@ -167,3 +167,7 @@ def test_silu_and_mul_clamp_unsupported_dtype_raises():
 
     with pytest.raises(RuntimeError):
         silu_and_mul_clamp(inp, out, 7.0)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

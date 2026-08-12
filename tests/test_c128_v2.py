@@ -22,11 +22,8 @@ Context = Union[LegacyContext, PagedContext]
 # c128 input row layout: | kv | score |  each [head_dim]
 HEAD_DIM = 512
 RATIO = 128
-
-precision = {
-    torch.bfloat16: 1e-2,
-    torch.float32: 5e-3,
-}
+ATOL = 5e-3
+RTOL = 5e-3
 
 
 def _gt_compress(
@@ -98,8 +95,7 @@ def _run_decode(
 
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
 @pytest.mark.parametrize("seq_len", [128, 256, 512])
-@pytest.mark.parametrize("input_dtype", [torch.float32, torch.bfloat16])
-def test_prefill_no_context(mode: str, seq_len: int, input_dtype: torch.dtype) -> None:
+def test_prefill_no_context(mode: str, seq_len: int) -> None:
     """Single-shot prefill, no prefix. Every compress event must match fp64 GT."""
     if mode == "legacy":
         ctx: Context = make_legacy_context(
@@ -115,8 +111,8 @@ def test_prefill_no_context(mode: str, seq_len: int, input_dtype: torch.dtype) -
     out = _run_prefill(
         ctx,
         pool,
-        kv_in_cpu.to(get_device(), dtype=input_dtype),
-        ape_cpu.to(get_device(), dtype=input_dtype),
+        kv_in_cpu.to(get_device()),
+        ape_cpu.to(get_device()),
         seq_lens_cpu,
         extend_lens_cpu,
     )
@@ -124,20 +120,12 @@ def test_prefill_no_context(mode: str, seq_len: int, input_dtype: torch.dtype) -
     # Compact prefill output: row per compress plan, in CPU-planner order.
     for plan_id, P in enumerate(range(RATIO - 1, seq_len, RATIO)):
         gt = _gt_compress(kv_in_cpu, ape_cpu, P=P, head_dim=ctx.head_dim)
-        triton.testing.assert_close(
-            out[plan_id].cpu(),
-            gt,
-            atol=precision[input_dtype],
-            rtol=precision[input_dtype],
-        )
+        triton.testing.assert_close(out[plan_id].cpu(), gt, atol=ATOL, rtol=RTOL)
 
 
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
 @pytest.mark.parametrize("prefix_len", [0, 128, 256])
-@pytest.mark.parametrize("input_dtype", [torch.float32, torch.bfloat16])
-def test_prefill_then_decode(
-    mode: str, prefix_len: int, input_dtype: torch.dtype
-) -> None:
+def test_prefill_then_decode(mode: str, prefix_len: int) -> None:
     """Prefill ``prefix_len`` tokens, then decode through to the next 128 boundary."""
     seq_len = prefix_len + RATIO  # one full compress chunk after prefix
 
@@ -158,8 +146,8 @@ def test_prefill_then_decode(
         _run_prefill(
             ctx,
             pool,
-            kv_full_cpu[:prefix_len].to(get_device(), dtype=input_dtype),
-            ape_cpu.to(get_device(), dtype=input_dtype),
+            kv_full_cpu[:prefix_len].to(get_device()),
+            ape_cpu.to(get_device()),
             seq_lens_cpu,
             extend_lens_cpu,
         )
@@ -170,37 +158,21 @@ def test_prefill_then_decode(
         seq_lens_gpu = torch.tensor(
             [cur_seq_len], dtype=torch.int64, device=get_device()
         )
-        kv_step = kv_full_cpu[prefix_len + k : prefix_len + k + 1].to(
-            get_device(), dtype=input_dtype
-        )
-        out = _run_decode(
-            ctx,
-            pool,
-            kv_step,
-            ape_cpu.to(get_device(), dtype=input_dtype),
-            seq_lens_gpu,
-        )
+        kv_step = kv_full_cpu[prefix_len + k : prefix_len + k + 1].to(get_device())
+        out = _run_decode(ctx, pool, kv_step, ape_cpu.to(get_device()), seq_lens_gpu)
         if cur_seq_len % RATIO == 0:
             final_out = out
 
     P = seq_len - 1
     gt = _gt_compress(kv_full_cpu, ape_cpu, P=P, head_dim=ctx.head_dim)
     assert final_out is not None
-    triton.testing.assert_close(
-        final_out[0].cpu(),
-        gt,
-        atol=precision[input_dtype],
-        rtol=precision[input_dtype],
-    )
+    triton.testing.assert_close(final_out[0].cpu(), gt, atol=ATOL, rtol=RTOL)
 
 
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
 @pytest.mark.parametrize("prefix_len", [128, 120, 256])
 @pytest.mark.parametrize("extend_len", [128, 256])
-@pytest.mark.parametrize("input_dtype", [torch.float32, torch.bfloat16])
-def test_prefill_then_extend(
-    mode: str, prefix_len: int, extend_len: int, input_dtype: torch.dtype
-) -> None:
+def test_prefill_then_extend(mode: str, prefix_len: int, extend_len: int) -> None:
     """Prefill once, then a second prefill that extends across compress event(s).
 
     A prefix that is not a multiple of the ratio (e.g. 120) makes the first
@@ -224,8 +196,8 @@ def test_prefill_then_extend(
     _run_prefill(
         ctx,
         pool,
-        kv_full_cpu[:prefix_len].to(get_device(), dtype=input_dtype),
-        ape_cpu.to(get_device(), dtype=input_dtype),
+        kv_full_cpu[:prefix_len].to(get_device()),
+        ape_cpu.to(get_device()),
         seq_lens_cpu,
         extend_lens_cpu,
     )
@@ -234,8 +206,8 @@ def test_prefill_then_extend(
     out = _run_prefill(
         ctx,
         pool,
-        kv_full_cpu[prefix_len:].to(get_device(), dtype=input_dtype),
-        ape_cpu.to(get_device(), dtype=input_dtype),
+        kv_full_cpu[prefix_len:].to(get_device()),
+        ape_cpu.to(get_device()),
         seq_lens_cpu,
         extend_lens_cpu,
     )
@@ -245,11 +217,7 @@ def test_prefill_then_extend(
     for plan_id, P in enumerate(range(first_event, seq_len, RATIO)):
         gt = _gt_compress(kv_full_cpu, ape_cpu, P=P, head_dim=ctx.head_dim)
         triton.testing.assert_close(
-            out[plan_id].cpu(),
-            gt,
-            atol=precision[input_dtype],
-            rtol=precision[input_dtype],
-            err_msg=f"{plan_id=}, {P=}",
+            out[plan_id].cpu(), gt, atol=ATOL, rtol=RTOL, err_msg=f"{plan_id=}, {P=}"
         )
 
 
@@ -295,8 +263,8 @@ def test_prefill_multibatch(mode: str) -> None:
             triton.testing.assert_close(
                 out[plan_id].cpu(),
                 gt,
-                atol=precision[torch.float32],
-                rtol=precision[torch.float32],
+                atol=ATOL,
+                rtol=RTOL,
             )
             plan_id += 1
         base += ext

@@ -1,8 +1,8 @@
 #include <ATen/ATen.h>
 #include <ATen/OpMathType.h>
 #include <ATen/Parallel.h>
+#include <at/all.h>
 #include <c10/xpu/XPUStream.h>
-#include <torch/all.h>
 
 #include <cmath>
 #include <cstdint>
@@ -314,7 +314,7 @@ void silu_and_mul_clamp_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out,
 #undef VEC_LAUNCH_CLAMP
 }
 
-SGL_KERNEL_EXPORT void silu_and_mul_clamp(torch::Tensor& out, torch::Tensor& input, double swiglu_limit) {
+SGL_KERNEL_EXPORT void silu_and_mul_clamp(at::Tensor& out, at::Tensor& input, double swiglu_limit) {
   input = input.contiguous();
   out = out.contiguous();
   TORCH_CHECK(out.dtype() == input.dtype(), "silu_and_mul_clamp: dtype mismatch");
@@ -332,7 +332,7 @@ SGL_KERNEL_EXPORT void silu_and_mul_clamp(torch::Tensor& out, torch::Tensor& inp
     silu_and_mul_clamp_sycl<sycl::ext::oneapi::bfloat16, at::BFloat16>(queue, input, out, limit);
   } else {
     TORCH_CHECK(
-        input.dtype() == torch::kBFloat16 || input.dtype() == torch::kFloat16,
+        input.dtype() == at::kBFloat16 || input.dtype() == at::kFloat16,
         "silu_and_mul_clamp: only bf16 and fp16 are supported, got ",
         input.dtype());
   }

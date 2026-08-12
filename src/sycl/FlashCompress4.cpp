@@ -300,6 +300,7 @@ SGL_KERNEL_EXPORT void flash_compress4_decode(
   CHECK_INPUT(plan_d);
   CHECK_DIM(2, plan_d);
   CHECK_EQ(plan_d.dtype(), torch::kUInt8);
+  CHECK_EQ(kv_input.dtype(), torch::kFloat);
   CHECK_EQ(kv_input.dtype(), kv_output.dtype());
   CHECK_EQ(kv_input.dtype(), ape.dtype());
 
@@ -324,27 +325,25 @@ SGL_KERNEL_EXPORT void flash_compress4_decode(
   const uint32_t num_split = static_cast<uint32_t>(head_dim / kTileDim);
   auto queue = c10::xpu::getCurrentXPUStream().queue();
 
-  SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, kv_input.scalar_type(), "FlashCompress4Decode", [&]() {
-    using input_t = scalar_t;
-    using output_t = scalar_t;
-    SYCL_DISPATCH_WEIGHT_TYPES(at::kHalf, at::kBFloat16, kv_buffer.scalar_type(), "FlashCompress4Decode", [&]() {
-      queue.submit([&](sycl::handler& cgh) {
-        FlashCompress4Impl::FlashCompress4DecodeKernel<weight_t, input_t, output_t> kernel{
-            kv_buffer.data_ptr<weight_t>(),
-            kv_input.data_ptr<input_t>(),
-            kv_output.data_ptr<output_t>(),
-            ape.data_ptr<input_t>(),
-            reinterpret_cast<const DecodePlan*>(plan_d.data_ptr<uint8_t>()),
-            static_cast<uint32_t>(batch_size),
-            head_dim,
-            elem_size,
-            page_elem_size,
-            num_split};
-        const uint32_t num_sgs = static_cast<uint32_t>(batch_size) * num_split;
-        const uint32_t num_blocks = (num_sgs + kSubGroupsPerBlock - 1) / kSubGroupsPerBlock;
-        const uint32_t global_size = num_blocks * kBlockSize;
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kBlockSize)), kernel);
-      });
+  using input_t = float;
+  using output_t = float;
+  SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, kv_buffer.scalar_type(), "FlashCompress4Decode", [&]() {
+    queue.submit([&](sycl::handler& cgh) {
+      FlashCompress4Impl::FlashCompress4DecodeKernel<scalar_t, input_t, output_t> kernel{
+          kv_buffer.data_ptr<scalar_t>(),
+          kv_input.data_ptr<input_t>(),
+          kv_output.data_ptr<output_t>(),
+          ape.data_ptr<input_t>(),
+          reinterpret_cast<const DecodePlan*>(plan_d.data_ptr<uint8_t>()),
+          static_cast<uint32_t>(batch_size),
+          head_dim,
+          elem_size,
+          page_elem_size,
+          num_split};
+      const uint32_t num_sgs = static_cast<uint32_t>(batch_size) * num_split;
+      const uint32_t num_blocks = (num_sgs + kSubGroupsPerBlock - 1) / kSubGroupsPerBlock;
+      const uint32_t global_size = num_blocks * kBlockSize;
+      cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kBlockSize)), kernel);
     });
   });
 }
@@ -370,6 +369,7 @@ SGL_KERNEL_EXPORT void flash_compress4_prefill(
   CHECK_INPUT(plan_w);
   CHECK_DIM(2, plan_w);
   CHECK_EQ(plan_w.dtype(), torch::kUInt8);
+  CHECK_EQ(kv_input.dtype(), torch::kFloat);
   CHECK_EQ(kv_input.dtype(), kv_output.dtype());
   CHECK_EQ(kv_input.dtype(), ape.dtype());
 
@@ -397,47 +397,45 @@ SGL_KERNEL_EXPORT void flash_compress4_prefill(
   const uint32_t num_split = static_cast<uint32_t>(head_dim / kTileDim);
   auto queue = c10::xpu::getCurrentXPUStream().queue();
 
-  SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, kv_input.scalar_type(), "FlashCompress4Prefill", [&]() {
-    using input_t = scalar_t;
-    using output_t = scalar_t;
-    SYCL_DISPATCH_WEIGHT_TYPES(at::kHalf, at::kBFloat16, kv_buffer.scalar_type(), "FlashCompress4Prefill", [&]() {
-      if (num_compress > 0) {
-        queue.submit([&](sycl::handler& cgh) {
-          FlashCompress4Impl::FlashCompress4CompressKernel<weight_t, input_t, output_t> kernel{
-              kv_buffer.data_ptr<weight_t>(),
-              kv_input.data_ptr<input_t>(),
-              kv_output.data_ptr<output_t>(),
-              ape.data_ptr<input_t>(),
-              reinterpret_cast<const CompressPlan*>(plan_c.data_ptr<uint8_t>()),
-              static_cast<uint32_t>(num_compress),
-              head_dim,
-              elem_size,
-              page_elem_size,
-              num_split};
-          const uint32_t num_sgs = static_cast<uint32_t>(num_compress) * num_split;
-          const uint32_t num_blocks = (num_sgs + kSubGroupsPerBlock - 1) / kSubGroupsPerBlock;
-          const uint32_t global_size = num_blocks * kBlockSize;
-          cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kBlockSize)), kernel);
-        });
-      }
-      if (num_write > 0) {
-        // Write path uses the same split count as head_dim partitioning.
-        const uint32_t num_split_write = num_split;
-        queue.submit([&](sycl::handler& cgh) {
-          FlashCompress4Impl::FlashCompress4WriteKernel<weight_t, input_t> kernel{
-              kv_buffer.data_ptr<weight_t>(),
-              kv_input.data_ptr<input_t>(),
-              reinterpret_cast<const WritePlan*>(plan_w.data_ptr<uint8_t>()),
-              static_cast<uint32_t>(num_write),
-              elem_size,
-              num_split_write};
-          const uint32_t num_sgs = static_cast<uint32_t>(num_write) * num_split_write;
-          const uint32_t num_blocks = (num_sgs + kSubGroupsPerBlock - 1) / kSubGroupsPerBlock;
-          const uint32_t global_size = num_blocks * kBlockSize;
-          cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kBlockSize)), kernel);
-        });
-      }
-    });
+  using input_t = float;
+  using output_t = float;
+  SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, kv_buffer.scalar_type(), "FlashCompress4Prefill", [&]() {
+    if (num_compress > 0) {
+      queue.submit([&](sycl::handler& cgh) {
+        FlashCompress4Impl::FlashCompress4CompressKernel<scalar_t, input_t, output_t> kernel{
+            kv_buffer.data_ptr<scalar_t>(),
+            kv_input.data_ptr<input_t>(),
+            kv_output.data_ptr<output_t>(),
+            ape.data_ptr<input_t>(),
+            reinterpret_cast<const CompressPlan*>(plan_c.data_ptr<uint8_t>()),
+            static_cast<uint32_t>(num_compress),
+            head_dim,
+            elem_size,
+            page_elem_size,
+            num_split};
+        const uint32_t num_sgs = static_cast<uint32_t>(num_compress) * num_split;
+        const uint32_t num_blocks = (num_sgs + kSubGroupsPerBlock - 1) / kSubGroupsPerBlock;
+        const uint32_t global_size = num_blocks * kBlockSize;
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kBlockSize)), kernel);
+      });
+    }
+    if (num_write > 0) {
+      // Write path uses the same split count as head_dim partitioning.
+      const uint32_t num_split_write = num_split;
+      queue.submit([&](sycl::handler& cgh) {
+        FlashCompress4Impl::FlashCompress4WriteKernel<scalar_t, input_t> kernel{
+            kv_buffer.data_ptr<scalar_t>(),
+            kv_input.data_ptr<input_t>(),
+            reinterpret_cast<const WritePlan*>(plan_w.data_ptr<uint8_t>()),
+            static_cast<uint32_t>(num_write),
+            elem_size,
+            num_split_write};
+        const uint32_t num_sgs = static_cast<uint32_t>(num_write) * num_split_write;
+        const uint32_t num_blocks = (num_sgs + kSubGroupsPerBlock - 1) / kSubGroupsPerBlock;
+        const uint32_t global_size = num_blocks * kBlockSize;
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kBlockSize)), kernel);
+      });
+    }
   });
 }
 

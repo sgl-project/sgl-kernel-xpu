@@ -297,6 +297,7 @@ SGL_KERNEL_EXPORT void flash_compress128_decode(
   CHECK_INPUT(plan_d);
   CHECK_DIM(2, plan_d);
   CHECK_EQ(plan_d.dtype(), torch::kUInt8);
+  CHECK_EQ(kv_input.dtype(), torch::kFloat);
   CHECK_EQ(kv_input.dtype(), kv_output.dtype());
   CHECK_EQ(kv_input.dtype(), ape.dtype());
 
@@ -322,29 +323,27 @@ SGL_KERNEL_EXPORT void flash_compress128_decode(
   const uint32_t num_split = static_cast<uint32_t>(head_dim / kTileDim);
   auto queue = c10::xpu::getCurrentXPUStream().queue();
 
-  SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, kv_input.scalar_type(), "FlashCompress128Decode", [&]() {
-    using input_t = scalar_t;
-    using output_t = scalar_t;
-    SYCL_DISPATCH_WEIGHT_TYPES(at::kHalf, at::kBFloat16, kv_buffer.scalar_type(), "FlashCompress128Decode", [&]() {
-      queue.submit([&](sycl::handler& cgh) {
-        // Shared memory: 3 sections × [kTokenGroups × kTileDim] floats.
-        const size_t kSmemElems = static_cast<size_t>(3 * kTokenGroups * kTileDim);
-        sycl::local_accessor<float, 1> shared(sycl::range<1>(kSmemElems), cgh);
-        FlashCompress128Impl::FlashCompress128DecodeKernel<weight_t, input_t, output_t> kernel{
-            kv_buffer.data_ptr<weight_t>(),
-            kv_input.data_ptr<input_t>(),
-            kv_output.data_ptr<output_t>(),
-            ape.data_ptr<input_t>(),
-            reinterpret_cast<const DecodePlan*>(plan_d.data_ptr<uint8_t>()),
-            static_cast<uint32_t>(batch_size),
-            head_dim,
-            elem_size,
-            page_elem_size,
-            num_split,
-            shared};
-        const uint32_t global_size = static_cast<uint32_t>(batch_size) * num_split * kBlockSize;
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kBlockSize)), kernel);
-      });
+  using input_t = float;
+  using output_t = float;
+  SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, kv_buffer.scalar_type(), "FlashCompress128Decode", [&]() {
+    queue.submit([&](sycl::handler& cgh) {
+      // Shared memory: 3 sections × [kTokenGroups × kTileDim] floats.
+      const size_t kSmemElems = static_cast<size_t>(3 * kTokenGroups * kTileDim);
+      sycl::local_accessor<float, 1> shared(sycl::range<1>(kSmemElems), cgh);
+      FlashCompress128Impl::FlashCompress128DecodeKernel<scalar_t, input_t, output_t> kernel{
+          kv_buffer.data_ptr<scalar_t>(),
+          kv_input.data_ptr<input_t>(),
+          kv_output.data_ptr<output_t>(),
+          ape.data_ptr<input_t>(),
+          reinterpret_cast<const DecodePlan*>(plan_d.data_ptr<uint8_t>()),
+          static_cast<uint32_t>(batch_size),
+          head_dim,
+          elem_size,
+          page_elem_size,
+          num_split,
+          shared};
+      const uint32_t global_size = static_cast<uint32_t>(batch_size) * num_split * kBlockSize;
+      cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kBlockSize)), kernel);
     });
   });
 }
@@ -370,6 +369,7 @@ SGL_KERNEL_EXPORT void flash_compress128_prefill(
   CHECK_INPUT(plan_w);
   CHECK_DIM(2, plan_w);
   CHECK_EQ(plan_w.dtype(), torch::kUInt8);
+  CHECK_EQ(kv_input.dtype(), torch::kFloat);
   CHECK_EQ(kv_input.dtype(), kv_output.dtype());
   CHECK_EQ(kv_input.dtype(), ape.dtype());
 
@@ -398,48 +398,46 @@ SGL_KERNEL_EXPORT void flash_compress128_prefill(
   const uint32_t num_split = static_cast<uint32_t>(head_dim / kTileDim);
   auto queue = c10::xpu::getCurrentXPUStream().queue();
 
-  SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, kv_input.scalar_type(), "FlashCompress128Prefill", [&]() {
-    using input_t = scalar_t;
-    using output_t = scalar_t;
-    SYCL_DISPATCH_WEIGHT_TYPES(at::kHalf, at::kBFloat16, kv_buffer.scalar_type(), "FlashCompress128Prefill", [&]() {
-      if (num_compress > 0) {
-        queue.submit([&](sycl::handler& cgh) {
-          // Shared memory: 3 sections × [kTokenGroups × kTileDim] floats.
-          const size_t kSmemElems = static_cast<size_t>(3 * kTokenGroups * kTileDim);
-          sycl::local_accessor<float, 1> shared(sycl::range<1>(kSmemElems), cgh);
-          FlashCompress128Impl::FlashCompress128PrefillCompressKernel<weight_t, input_t, output_t> kernel{
-              kv_buffer.data_ptr<weight_t>(),
-              kv_input.data_ptr<input_t>(),
-              kv_output.data_ptr<output_t>(),
-              ape.data_ptr<input_t>(),
-              reinterpret_cast<const CompressPlan*>(plan_c.data_ptr<uint8_t>()),
-              static_cast<uint32_t>(num_compress),
-              head_dim,
-              elem_size,
-              page_elem_size,
-              num_split,
-              shared};
-          const uint32_t global_size = static_cast<uint32_t>(num_compress) * num_split * kBlockSize;
-          cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kBlockSize)), kernel);
-        });
-      }
+  using input_t = float;
+  using output_t = float;
+  SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, kv_buffer.scalar_type(), "FlashCompress128Prefill", [&]() {
+    if (num_compress > 0) {
+      queue.submit([&](sycl::handler& cgh) {
+        // Shared memory: 3 sections × [kTokenGroups × kTileDim] floats.
+        const size_t kSmemElems = static_cast<size_t>(3 * kTokenGroups * kTileDim);
+        sycl::local_accessor<float, 1> shared(sycl::range<1>(kSmemElems), cgh);
+        FlashCompress128Impl::FlashCompress128PrefillCompressKernel<scalar_t, input_t, output_t> kernel{
+            kv_buffer.data_ptr<scalar_t>(),
+            kv_input.data_ptr<input_t>(),
+            kv_output.data_ptr<output_t>(),
+            ape.data_ptr<input_t>(),
+            reinterpret_cast<const CompressPlan*>(plan_c.data_ptr<uint8_t>()),
+            static_cast<uint32_t>(num_compress),
+            head_dim,
+            elem_size,
+            page_elem_size,
+            num_split,
+            shared};
+        const uint32_t global_size = static_cast<uint32_t>(num_compress) * num_split * kBlockSize;
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kBlockSize)), kernel);
+      });
+    }
 
-      if (num_write > 0) {
-        queue.submit([&](sycl::handler& cgh) {
-          FlashCompress128Impl::FlashCompress128PrefillWriteKernel<weight_t, input_t> kernel{
-              kv_buffer.data_ptr<weight_t>(),
-              kv_input.data_ptr<input_t>(),
-              reinterpret_cast<const WritePlan*>(plan_w.data_ptr<uint8_t>()),
-              static_cast<uint32_t>(num_write),
-              elem_size,
-              num_split};
-          const uint32_t total_sgs = static_cast<uint32_t>(num_write) * num_split;
-          const uint32_t num_w_blocks = (total_sgs + kSubGroupsPerWriteBlock - 1) / kSubGroupsPerWriteBlock;
-          const uint32_t global_size = num_w_blocks * kWriteBlockSize;
-          cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kWriteBlockSize)), kernel);
-        });
-      }
-    });
+    if (num_write > 0) {
+      queue.submit([&](sycl::handler& cgh) {
+        FlashCompress128Impl::FlashCompress128PrefillWriteKernel<scalar_t, input_t> kernel{
+            kv_buffer.data_ptr<scalar_t>(),
+            kv_input.data_ptr<input_t>(),
+            reinterpret_cast<const WritePlan*>(plan_w.data_ptr<uint8_t>()),
+            static_cast<uint32_t>(num_write),
+            elem_size,
+            num_split};
+        const uint32_t total_sgs = static_cast<uint32_t>(num_write) * num_split;
+        const uint32_t num_w_blocks = (total_sgs + kSubGroupsPerWriteBlock - 1) / kSubGroupsPerWriteBlock;
+        const uint32_t global_size = num_w_blocks * kWriteBlockSize;
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kWriteBlockSize)), kernel);
+      });
+    }
   });
 }
 

@@ -681,13 +681,7 @@ struct DecodeConfig {
     // non-causal (a single query token cannot be masked by a causal rule), so
     // packing is always enabled here. Prefill keeps the default false on all
     // three components and is unaffected.
-    // SGL_DISABLE_PACKGQA: benchmark/debug escape hatch to force the unpacked
-    // (per-head launch) decode path for A/B perf comparison.
-#ifdef SGL_DISABLE_PACKGQA
-    constexpr bool PackGQA = false;
-#else
     constexpr bool PackGQA = true;
-#endif
 
     // Mainloop
     using MainloopDispatchPolicy = cutlass::fmha::XeDefault<PipelineStages>;

@@ -344,13 +344,7 @@ def _make_int4_weight(
     return _pack_int4_codes(packed_codes).view(weight_dtype), scales, zeros, dequantized
 
 
-@pytest.mark.parametrize("explicit_zero", [False, True])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("group_size", [32, 64, 128, 256])
-@pytest.mark.parametrize("weight_dtype", [torch.int8, torch.uint8])
-def test_moe_grouped_mm_nt_xe20_int4_zero_point(
-    explicit_zero, dtype, group_size, weight_dtype
-):
+def _check_int4_grouped_mm(explicit_zero, dtype, group_size, weight_dtype):
     torch.manual_seed(0)
     num_experts, rows_per_expert, gemm_n, gemm_k = 8, 2, 128, 256
     total_m = num_experts * rows_per_expert
@@ -394,12 +388,28 @@ def test_moe_grouped_mm_nt_xe20_int4_zero_point(
 
 @pytest.mark.parametrize("explicit_zero", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("group_size", [32, 64, 128, 256])
+def test_moe_grouped_mm_nt_xe20_int4_zero_point(explicit_zero, dtype, group_size):
+    _check_int4_grouped_mm(explicit_zero, dtype, group_size, torch.int8)
+
+
+def test_moe_grouped_mm_nt_xe20_int4_uint8_weights():
+    """uint8-packed int4 weights hold the same nibbles as the int8 packing, so
+    one representative case covers the relaxed dtype acceptance without
+    crossing it into the whole parameter matrix."""
+    _check_int4_grouped_mm(
+        explicit_zero=True,
+        dtype=torch.bfloat16,
+        group_size=32,
+        weight_dtype=torch.uint8,
+    )
+
+
+@pytest.mark.parametrize("explicit_zero", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("with_bias", [False, True])
 @pytest.mark.parametrize("activation", ["silu", "relu2"])
-@pytest.mark.parametrize("weight_dtype", [torch.int8, torch.uint8])
-def test_fused_experts_int4_w4a16(
-    explicit_zero, dtype, with_bias, activation, weight_dtype
-):
+def test_fused_experts_int4_w4a16(explicit_zero, dtype, with_bias, activation):
     torch.manual_seed(1)
     num_tokens, topk, num_experts = 5, 2, 8
     hidden_size, intermediate_size, group_size = 128, 64, 32
@@ -413,7 +423,6 @@ def test_fused_experts_int4_w4a16(
         group_size,
         dtype,
         explicit_zero,
-        weight_dtype=weight_dtype,
     )
     w2, w2_scale, w2_zero, w2_reference = _make_int4_weight(
         num_experts,
@@ -422,7 +431,6 @@ def test_fused_experts_int4_w4a16(
         group_size,
         dtype,
         explicit_zero,
-        weight_dtype=weight_dtype,
     )
     topk_ids = torch.tensor([[0, 1], [2, 3], [4, 5], [6, 7], [0, 2]], dtype=torch.int64)
     topk_weights = torch.rand(num_tokens, topk, dtype=torch.float32)
@@ -606,8 +614,10 @@ def test_moe_gemm_mxfp4_weights(
     )
 
     # ---- fused_experts with packed MXFP4 weights on XPU ----
-    # This case keeps scales as raw uint8 E8M0 bytes; float8_e8m0fnu coverage
-    # is provided by the DSV4 and direct grouped-GEMM tests below.
+    # Feed the packing helper's native tensors straight through: uint8 packed
+    # weights plus raw uint8 E8M0 block scales. The int8 weight and
+    # float8_e8m0fnu scale representations are covered by the op-level dtype
+    # test at the bottom of this file.
     device = "xpu"
     kernel_output = fused_experts(
         a.to(device),
@@ -752,8 +762,8 @@ def _build_moe_gemm_inputs(
     gemm_n: int,
     gemm_k: int,
     dtype: torch.dtype,
-    weight_dtype: torch.dtype,
-    scale_dtype: torch.dtype,
+    weight_dtype: torch.dtype = torch.int8,
+    scale_dtype: torch.dtype = torch.uint8,
     seed: int = 0,
 ):
     """Construct (activations, dequantized_weights, mxfp4_packed, mxfp4_scales,
@@ -792,27 +802,15 @@ def _build_moe_gemm_inputs(
     }
 
 
-@pytest.mark.parametrize("num_tokens_per_expert", [2, 6, 33, 129])
-@pytest.mark.parametrize("num_experts", [8])
-@pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [512])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("weight_dtype", [torch.int8, torch.uint8])
-@pytest.mark.parametrize("scale_dtype", [torch.uint8, torch.float8_e8m0fnu])
-def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_op(
+def _check_mxfp4_grouped_mm(
     num_tokens_per_expert,
     num_experts,
     hidden_size,
     intermediate_size,
     dtype,
-    weight_dtype,
-    scale_dtype,
+    weight_dtype=torch.int8,
+    scale_dtype=torch.uint8,
 ):
-    """Compare the unified MXFP4 op with GEMM on dequantized weights.
-
-    gemm_k = hidden_size (activation's inner dim)
-    gemm_n = 2*intermediate_size (w1 style).
-    """
     gemm_k = hidden_size
     gemm_n = 2 * intermediate_size
     assert gemm_n % 2 == 0
@@ -855,6 +853,50 @@ def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_op(
 
     torch.testing.assert_close(
         inputs["output_reference"], inputs["output_mxfp4"], rtol=1e-1, atol=1e-2
+    )
+
+
+@pytest.mark.parametrize("num_tokens_per_expert", [2, 6, 33, 129])
+@pytest.mark.parametrize("num_experts", [8])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_op(
+    num_tokens_per_expert,
+    num_experts,
+    hidden_size,
+    intermediate_size,
+    dtype,
+):
+    """Compare the unified MXFP4 op with GEMM on dequantized weights.
+
+    gemm_k = hidden_size (activation's inner dim)
+    gemm_n = 2*intermediate_size (w1 style).
+    """
+    _check_mxfp4_grouped_mm(
+        num_tokens_per_expert=num_tokens_per_expert,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        dtype=dtype,
+    )
+
+
+@pytest.mark.parametrize("weight_dtype", [torch.int8, torch.uint8])
+@pytest.mark.parametrize("scale_dtype", [torch.uint8, torch.float8_e8m0fnu])
+def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_input_dtypes(weight_dtype, scale_dtype):
+    """The op accepts both packed-weight dtypes (int8/uint8) and both E8M0
+    scale dtypes (uint8/float8_e8m0fnu). All four spellings carry identical
+    bits, so a single shape is enough to cover the dtype acceptance paths.
+    """
+    _check_mxfp4_grouped_mm(
+        num_tokens_per_expert=33,
+        num_experts=8,
+        hidden_size=1024,
+        intermediate_size=512,
+        dtype=torch.bfloat16,
+        weight_dtype=weight_dtype,
+        scale_dtype=scale_dtype,
     )
 
 

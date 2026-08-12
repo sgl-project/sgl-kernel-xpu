@@ -50,6 +50,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps) -> ()");
   m.impl("gemma_fused_add_rmsnorm", torch::kXPU, &at::native::xpu::gemma_fused_add_rmsnorm);
 
+  m.def("hadamard_transform(Tensor! output, Tensor input, float scale) -> ()");
+  m.impl("hadamard_transform", torch::kXPU, &at::native::xpu::hadamard_transform);
+
   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
 
@@ -91,6 +94,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fast_topk_transform_ragged_fused(Tensor score, Tensor lengths, Tensor! topk_indices_ragged, "
       "Tensor topk_indices_offset, Tensor? row_starts) -> ()");
   m.impl("fast_topk_transform_ragged_fused", torch::kXPU, &fast_topk_transform_ragged_interface);
+
+  m.def(
+      "topk_transform_512(Tensor scores, Tensor seq_lens, Tensor page_tables, Tensor! out_page_indices, "
+      "int page_size, Tensor? out_raw_indices) -> ()");
+  m.impl("topk_transform_512", torch::kXPU, &topk_transform_512_interface);
+
+  m.def(
+      "topk_transform_512_v2(Tensor scores, Tensor seq_lens, Tensor page_tables, "
+      "Tensor! out_page_indices, int page_size, Tensor metadata, Tensor? out_raw_indices) -> ()");
+  m.impl("topk_transform_512_v2", torch::kXPU, &topk_transform_512_v2_interface);
 
   m.def("swiglu_gpt_oss_sigmoid_alpha(Tensor x, float alpha, float limit) -> Tensor");
   m.impl("swiglu_gpt_oss_sigmoid_alpha", torch::kXPU, &swiglu_gpt_oss_sigmoid_alpha);
@@ -396,6 +409,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("sgl_per_token_quant_fp8(Tensor input, Tensor(a!) output_q, Tensor(b!) output_s) -> ()");
   m.impl("sgl_per_token_quant_fp8", torch::kXPU, &sgl_per_token_quant_fp8);
+  m.def(
+      "fused_q_indexer_rope_hadamard_quant(Tensor q_input, Tensor(a!) q_fp8, Tensor weight, Tensor(b!) "
+      "weights_out, float weight_scale, Tensor rope_cache, Tensor positions) -> ()");
+  m.impl("fused_q_indexer_rope_hadamard_quant", torch::kXPU, &fused_q_indexer_rope_hadamard_quant);
 
   /*
    * From fused qk norm rope
@@ -452,6 +469,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int hc_mult, int sinkhorn_iters, float eps) -> ()");
   m.impl("hc_split_sinkhorn", torch::kXPU, &hc_split_sinkhorn);
 
+  /* FUSED HC HEAD */
+  m.def(
+      "fused_hc_head(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, float norm_eps, float hc_eps) -> Tensor");
+  m.impl("fused_hc_head", torch::kXPU, &fused_hc_head);
+
   /* HC PRE BIG FUSE */
   m.def(
       "hc_pre_big_fuse(Tensor gemm_out_mul, Tensor gemm_out_sqrsum, "
@@ -469,6 +491,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /* HC POST */
   m.def("hc_post(Tensor x, Tensor residual, Tensor post_layer_mix, Tensor comb_res_mix, Tensor! out) -> ()");
   m.impl("hc_post", torch::kXPU, &hc_post);
+
+  /* MHC FUSED POST+PRE */
+  m.def(
+      "mhc_fused_post_pre_fma(Tensor x, Tensor residual, Tensor post_layer_mix, Tensor comb_res_mix, "
+      "Tensor fn, int n_splits=0) -> (Tensor, Tensor, Tensor)");
+  m.impl("mhc_fused_post_pre_fma", torch::kXPU, &mhc_fused_post_pre_fma);
 
   /*
    * From LoRA
@@ -564,6 +592,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "flash_compress4_decode(Tensor! kv_buffer, Tensor kv_input, Tensor! kv_output, Tensor ape, Tensor plan_d) "
       "-> ()");
   m.impl("flash_compress4_decode", torch::kXPU, &at::native::xpu::flash_compress4_decode);
+
+  m.def(
+      "flash_compress4_prefill(Tensor! kv_buffer, Tensor kv_input, Tensor! kv_output, Tensor ape, Tensor plan_c, "
+      "Tensor plan_w) -> ()");
+  m.impl("flash_compress4_prefill", torch::kXPU, &at::native::xpu::flash_compress4_prefill);
+
+  m.def(
+      "fused_norm_rope_store(Tensor input, Tensor plan, Tensor norm_weight, float norm_eps, Tensor freq_cis, "
+      "Tensor out_loc, Tensor! kvcache, bool is_decode, int compress_ratio, int page_size, bool use_fp4, "
+      "int preshuffle_size=0, bool use_bf16_store=False) -> ()");
+  m.impl("fused_norm_rope_store", torch::kXPU, &at::native::xpu::fused_norm_rope_store);
 }
 
 REGISTER_EXTENSION(common_ops)

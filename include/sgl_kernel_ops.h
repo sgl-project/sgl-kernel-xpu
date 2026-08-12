@@ -122,6 +122,7 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
+void hadamard_transform(at::Tensor& output, const at::Tensor& input, double scale);
 void fused_q_norm_rope(
     torch::Tensor& q_input, torch::Tensor& q_output, torch::Tensor& freqs_cis, torch::Tensor& positions, double eps);
 void fused_k_norm_rope_flashmla(
@@ -588,6 +589,14 @@ void scaled_fp4_quant(
     torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_scale, torch::Tensor const& input_scale);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
+void fused_q_indexer_rope_hadamard_quant(
+    const at::Tensor& q_input,
+    at::Tensor& q_fp8,
+    const at::Tensor& weight,
+    at::Tensor& weights_out,
+    double weight_scale,
+    const at::Tensor& rope_cache,
+    const at::Tensor& positions);
 void bmm_fp8(
     at::Tensor A,
     at::Tensor B,
@@ -794,6 +803,14 @@ void hc_split_sinkhorn(
     int64_t sinkhorn_iters,
     double eps);
 
+at::Tensor fused_hc_head(
+    const at::Tensor& x,
+    const at::Tensor& hc_fn,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    double norm_eps,
+    double hc_eps);
+
 void hc_pre_big_fuse(
     const at::Tensor& gemm_out_mul,
     const at::Tensor& gemm_out_sqrsum,
@@ -827,6 +844,14 @@ void hc_post(
  * hc_pre GEMM + row-wise square sum
  */
 void hc_pre_gemm_sqr_sum(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, const at::Tensor& B);
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> mhc_fused_post_pre_fma(
+    const at::Tensor& x,
+    const at::Tensor& residual,
+    const at::Tensor& post_layer_mix,
+    const at::Tensor& comb_res_mix,
+    const at::Tensor& fn,
+    int64_t n_splits = 0);
 
 /*
  * From csrc/speculative
@@ -933,6 +958,23 @@ void fast_topk_transform_ragged_interface(
     const at::Tensor& topk_indices_offset,
     std::optional<at::Tensor> row_starts_opt);
 
+void topk_transform_512_interface(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    const at::Tensor& page_tables,
+    at::Tensor& out_page_indices,
+    int64_t page_size,
+    std::optional<at::Tensor> out_raw_indices_opt);
+
+void topk_transform_512_v2_interface(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    const at::Tensor& page_tables,
+    at::Tensor& out_page_indices,
+    int64_t page_size,
+    const at::Tensor& metadata,
+    std::optional<at::Tensor> out_raw_indices_opt);
+
 /*
  * Compress plan and execution kernels
  */
@@ -973,6 +1015,29 @@ void flash_compress128_prefill(
 
 void flash_compress4_decode(
     torch::Tensor kv_buffer, torch::Tensor kv_input, torch::Tensor kv_output, torch::Tensor ape, torch::Tensor plan_d);
+
+void flash_compress4_prefill(
+    torch::Tensor kv_buffer,
+    torch::Tensor kv_input,
+    torch::Tensor kv_output,
+    torch::Tensor ape,
+    torch::Tensor plan_c,
+    torch::Tensor plan_w);
+
+void fused_norm_rope_store(
+    torch::Tensor input,
+    torch::Tensor plan,
+    torch::Tensor norm_weight,
+    double norm_eps,
+    torch::Tensor freq_cis,
+    torch::Tensor out_loc,
+    torch::Tensor kvcache,
+    bool is_decode,
+    int64_t compress_ratio,
+    int64_t page_size,
+    bool use_fp4,
+    int64_t preshuffle_size,
+    bool use_bf16_store);
 
 }  // namespace at::native::xpu
 

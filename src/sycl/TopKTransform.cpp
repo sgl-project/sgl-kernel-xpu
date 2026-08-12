@@ -82,7 +82,11 @@ inline void run_cumsum(sycl::nd_item<1>& item, int32_t* s_histogram_buf /* [2][k
   }
 }
 
-inline void fast_topk_radix(sycl::nd_item<1>& item, const float* input, int32_t* index, int row_start, int length) {
+inline void
+radix_topk(sycl::nd_item<1>& item, const float* input, int32_t* index, int row_start, int length, int topk = kTopK) {
+  // ``topk`` is a runtime parameter (must satisfy 0 < topk <= kTopK). The
+  // shared-memory staging buffers are sized against the compile-time ``kTopK``,
+  // so any topk within that bound is safe.
   auto g = item.get_group();
 
   int32_t* s_histogram_buf = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[2 * kHistStride]>(g);
@@ -100,7 +104,7 @@ inline void fast_topk_radix(sycl::nd_item<1>& item, const float* input, int32_t*
     s_histogram_buf[kHistStride + tx] = 0;
   }
   if (tx == 0) {
-    s_topk = kTopK;
+    s_topk = topk;
   }
   item.barrier(sycl::access::fence_space::local_space);
 
@@ -251,7 +255,7 @@ inline void fast_topk_radix(sycl::nd_item<1>& item, const float* input, int32_t*
         const int want_last = (valid && bin == threshold_bin) ? 1 : 0;
         const int last_pos = wg_reserve_dec(item, s_last_remain, want_last);
         if (want_last && last_pos > 0) {
-          index[kTopK - last_pos] = idx;
+          index[topk - last_pos] = idx;
         }
       } else {
         const int want_stash = (valid && bin == threshold_bin) ? 1 : 0;
@@ -268,26 +272,48 @@ inline void fast_topk_radix(sycl::nd_item<1>& item, const float* input, int32_t*
   }
 }
 
-inline void naive_topk(sycl::nd_item<1>& item, int32_t* indices, int length) {
+inline void naive_topk(sycl::nd_item<1>& item, int32_t* indices, int length, int topk = kTopK) {
   const int tx = static_cast<int>(item.get_local_id(0));
-  for (int i = tx; i < kTopK; i += kThreadsPerBlock) {
+  for (int i = tx; i < topk; i += kThreadsPerBlock) {
     indices[i] = (i < length) ? i : -1;
   }
 }
 
-inline void
-naive_topk_transform(sycl::nd_item<1>& item, int length, int32_t* dst_page_entry, const int32_t* src_page_entry) {
+inline void naive_topk_transform(
+    sycl::nd_item<1>& item, int length, int32_t* dst_page_entry, const int32_t* src_page_entry, int topk = kTopK) {
   const int tx = static_cast<int>(item.get_local_id(0));
-  for (int i = tx; i < kTopK; i += kThreadsPerBlock) {
+  for (int i = tx; i < topk; i += kThreadsPerBlock) {
     dst_page_entry[i] = (i < length) ? src_page_entry[i] : -1;
   }
 }
 
-inline void
-naive_topk_transform_ragged(sycl::nd_item<1>& item, int length, int32_t* dst_indices_entry, int32_t offset) {
+inline void naive_topk_transform_ragged(
+    sycl::nd_item<1>& item, int length, int32_t* dst_indices_entry, int32_t offset, int topk = kTopK) {
   const int tx = static_cast<int>(item.get_local_id(0));
-  for (int i = tx; i < kTopK; i += kThreadsPerBlock) {
+  for (int i = tx; i < topk; i += kThreadsPerBlock) {
     dst_indices_entry[i] = (i < length) ? (i + offset) : -1;
+  }
+}
+
+inline void naive_topk_transform_paged(
+    sycl::nd_item<1>& item,
+    int length,
+    int topk,
+    int32_t* dst_page_entry,
+    const int32_t* src_page_entry,
+    int32_t* dst_raw_entry,
+    int page_bits) {
+  const int32_t page_mask = (1 << page_bits) - 1;
+  const int tx = static_cast<int>(item.get_local_id(0));
+  for (int i = tx; i < topk; i += kThreadsPerBlock) {
+    if (i < length) {
+      const int32_t page_id = src_page_entry[i >> page_bits];
+      dst_page_entry[i] = (page_id << page_bits) | (i & page_mask);
+      if (dst_raw_entry) dst_raw_entry[i] = i;
+    } else {
+      dst_page_entry[i] = -1;
+      if (dst_raw_entry) dst_raw_entry[i] = -1;
+    }
   }
 }
 
@@ -350,7 +376,7 @@ struct FastTopKKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     if (length <= kTopK) {
       naive_topk(item, indice, length);
     } else {
-      fast_topk_radix(item, score, indice, row_start, length);
+      radix_topk(item, score, indice, row_start, length);
     }
   }
 };
@@ -385,7 +411,7 @@ struct FastTopKTransformFusedDecodeKernel : public __SYCL_KER_CONFIG_CONVENTION_
 
     int32_t* s_idx = s_indices_.get_multi_ptr<sycl::access::decorated::no>().get();
 
-    fast_topk_radix(item, score, s_idx, /*row_start=*/0, length);
+    radix_topk(item, score, s_idx, /*row_start=*/0, length);
 
     static_assert(kTopK == 2 * kThreadsPerBlock, "kTopK must be 2 * kThreadsPerBlock");
     const int i0 = tid;
@@ -456,7 +482,7 @@ struct FastTopKTransformFusedPrefillKernel : public __SYCL_KER_CONFIG_CONVENTION
 
     int32_t* s_idx = s_indices_.get_multi_ptr<sycl::access::decorated::no>().get();
 
-    fast_topk_radix(item, score, s_idx, row_start, length);
+    radix_topk(item, score, s_idx, row_start, length);
 
     static_assert(kTopK == 2 * kThreadsPerBlock, "kTopK must be 2 * kThreadsPerBlock");
     const int i0 = tid;
@@ -498,13 +524,78 @@ struct FastTopKTransformRaggedFusedKernel : public __SYCL_KER_CONFIG_CONVENTION_
 
     int32_t* s_idx = s_indices_.get_multi_ptr<sycl::access::decorated::no>().get();
 
-    fast_topk_radix(item, score, s_idx, row_start, length);
+    radix_topk(item, score, s_idx, row_start, length);
 
     static_assert(kTopK == 2 * kThreadsPerBlock, "kTopK must be 2 * kThreadsPerBlock");
     const int i0 = tid;
     const int i1 = tid + kThreadsPerBlock;
     dst_entry[i0] = s_idx[i0] + offset;
     dst_entry[i1] = s_idx[i1] + offset;
+  }
+};
+
+struct TopKTransform512Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
+  const float* score;
+  const int32_t* seq_lens;
+  const int32_t* page_tables;
+  int32_t* out_page_indices;
+  int32_t* out_raw_indices;
+  int64_t score_row_stride;
+  int64_t page_table_row_stride;
+  int page_bits;
+  int topk;
+
+  sycl::local_accessor<int32_t, 1> s_indices_;
+
+  TopKTransform512Kernel(
+      const float* score,
+      const int32_t* seq_lens,
+      const int32_t* page_tables,
+      int32_t* out_page_indices,
+      int32_t* out_raw_indices,
+      int64_t score_row_stride,
+      int64_t page_table_row_stride,
+      int page_bits,
+      int topk)
+      : score(score),
+        seq_lens(seq_lens),
+        page_tables(page_tables),
+        out_page_indices(out_page_indices),
+        out_raw_indices(out_raw_indices),
+        score_row_stride(score_row_stride),
+        page_table_row_stride(page_table_row_stride),
+        page_bits(page_bits),
+        topk(topk) {}
+
+  void sycl_ker_config_convention(sycl::handler& cgh) {
+    s_indices_ = sycl::local_accessor<int32_t, 1>(kTopK, cgh);
+  }
+
+  [[sycl::reqd_sub_group_size(32)]] void operator()(sycl::nd_item<1> item) const {
+    const int64_t bid = static_cast<int64_t>(item.get_group(0));
+    const int tid = static_cast<int>(item.get_local_id(0));
+    const int length = seq_lens[bid];
+    const int32_t* src_pt = page_tables + bid * page_table_row_stride;
+    int32_t* dst_pi = out_page_indices + bid * static_cast<int64_t>(topk);
+    int32_t* dst_ri = out_raw_indices ? (out_raw_indices + bid * static_cast<int64_t>(topk)) : nullptr;
+    const float* row_score = score + bid * score_row_stride;
+
+    if (length <= topk) {
+      naive_topk_transform_paged(item, length, topk, dst_pi, src_pt, dst_ri, page_bits);
+      return;
+    }
+
+    int32_t* s_idx = s_indices_.get_multi_ptr<sycl::access::decorated::no>().get();
+
+    radix_topk(item, row_score, s_idx, /*row_start=*/0, length, topk);
+
+    const int32_t page_mask = (1 << page_bits) - 1;
+    for (int i = tid; i < topk; i += kThreadsPerBlock) {
+      const int p = s_idx[i];
+      const int32_t page_id = src_pt[p >> page_bits];
+      dst_pi[i] = (page_id << page_bits) | (p & page_mask);
+      if (dst_ri) dst_ri[i] = p;
+    }
   }
 };
 
@@ -616,4 +707,103 @@ SGL_KERNEL_EXPORT void fast_topk_transform_ragged_interface(
       params, topk_indices_ragged.data_ptr<int32_t>(), topk_indices_offset.data_ptr<int32_t>());
   sycl_kernel_submit(
       sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock), queue, kernel);
+}
+
+namespace {
+void topk_transform_512_launch(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    const at::Tensor& page_tables,
+    at::Tensor& out_page_indices,
+    int64_t page_size,
+    std::optional<at::Tensor> out_raw_indices_opt) {
+  CHECK_DEVICE(scores);
+  CHECK_DEVICE(seq_lens);
+  CHECK_DEVICE(page_tables);
+  CHECK_DEVICE(out_page_indices);
+  if (out_raw_indices_opt.has_value()) {
+    CHECK_DEVICE(out_raw_indices_opt.value());
+  }
+
+  TORCH_CHECK(scores.dim() == 2, "scores must be 2D");
+  TORCH_CHECK(scores.stride(1) == 1, "scores must have unit last-dim stride");
+  TORCH_CHECK(scores.scalar_type() == at::kFloat, "scores must be float32");
+
+  const int64_t B = scores.size(0);
+
+  at::Tensor seq_lens_flat = seq_lens;
+  if (seq_lens_flat.dim() == 2) {
+    TORCH_CHECK(seq_lens_flat.size(1) == 1, "2-D seq_lens must have size(1) == 1");
+    seq_lens_flat = seq_lens_flat.squeeze(-1);
+  }
+  TORCH_CHECK(seq_lens_flat.dim() == 1, "seq_lens must be 1-D or (B, 1)");
+  TORCH_CHECK(seq_lens_flat.size(0) == B, "seq_lens.size(0) must equal scores.size(0)");
+  TORCH_CHECK(seq_lens_flat.is_contiguous(), "seq_lens must be contiguous after squeeze");
+  TORCH_CHECK(seq_lens_flat.scalar_type() == at::kInt, "seq_lens must be int32");
+
+  TORCH_CHECK(page_tables.dim() == 2, "page_tables must be 2D");
+  TORCH_CHECK(page_tables.size(0) == B, "page_tables.size(0) must equal scores.size(0)");
+  TORCH_CHECK(page_tables.stride(1) == 1, "page_tables must have unit last-dim stride");
+  TORCH_CHECK(page_tables.scalar_type() == at::kInt, "page_tables must be int32");
+
+  TORCH_CHECK(out_page_indices.dim() == 2, "out_page_indices must be 2D");
+  TORCH_CHECK(out_page_indices.is_contiguous(), "out_page_indices must be contiguous");
+  TORCH_CHECK(out_page_indices.size(0) == B, "out_page_indices.size(0) must equal scores.size(0)");
+  TORCH_CHECK(out_page_indices.scalar_type() == at::kInt, "out_page_indices must be int32");
+  const int64_t topk = out_page_indices.size(1);
+  TORCH_CHECK(0 < topk && topk <= kTopK, "topk (out_page_indices.size(1)) must be in (0, ", kTopK, "]");
+  TORCH_CHECK(page_size > 0, "page_size must be positive");
+  TORCH_CHECK((page_size & (page_size - 1)) == 0, "page_size must be a power of 2");
+  const int page_bits = __builtin_ctzll(static_cast<uint64_t>(page_size));
+
+  int32_t* out_raw_ptr = nullptr;
+  if (out_raw_indices_opt.has_value()) {
+    const auto& out_raw_indices = out_raw_indices_opt.value();
+    TORCH_CHECK(out_raw_indices.dim() == 2, "out_raw_indices must be 2D");
+    TORCH_CHECK(out_raw_indices.is_contiguous(), "out_raw_indices must be contiguous");
+    TORCH_CHECK(out_raw_indices.size(0) == B, "out_raw_indices.size(0) must equal scores.size(0)");
+    TORCH_CHECK(out_raw_indices.size(1) == topk, "out_raw_indices.size(1) must equal topk");
+    TORCH_CHECK(out_raw_indices.scalar_type() == at::kInt, "out_raw_indices must be int32");
+    out_raw_ptr = out_raw_indices.data_ptr<int32_t>();
+  }
+
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto& queue = stream.queue();
+
+  TopKTransform512Kernel kernel(
+      scores.data_ptr<float>(),
+      seq_lens_flat.data_ptr<int32_t>(),
+      page_tables.data_ptr<int32_t>(),
+      out_page_indices.data_ptr<int32_t>(),
+      out_raw_ptr,
+      scores.stride(0),
+      page_tables.stride(0),
+      page_bits,
+      static_cast<int>(topk));
+  sycl_kernel_submit(
+      sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock), queue, kernel);
+}
+
+}  // namespace
+
+SGL_KERNEL_EXPORT void topk_transform_512_interface(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    const at::Tensor& page_tables,
+    at::Tensor& out_page_indices,
+    int64_t page_size,
+    std::optional<at::Tensor> out_raw_indices_opt) {
+  topk_transform_512_launch(scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices_opt);
+}
+
+SGL_KERNEL_EXPORT void topk_transform_512_v2_interface(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    const at::Tensor& page_tables,
+    at::Tensor& out_page_indices,
+    int64_t page_size,
+    const at::Tensor& metadata,
+    std::optional<at::Tensor> out_raw_indices_opt) {
+  (void)metadata;
+  topk_transform_512_launch(scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices_opt);
 }

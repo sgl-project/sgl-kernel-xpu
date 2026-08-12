@@ -6,9 +6,7 @@ Covers both head-dim variants of ``compress_norm_rope_store`` with ``use_fp4=Fal
 
 Like test_fp4_indexer, the test calls the public ``compress_norm_rope_store`` wrapper
 once and compares the written cache against an independent inline reference. The wrapper
-dispatches to the JIT CUDA kernel on CUDA and to the torch fallback on any non-CUDA
-device (e.g. XPU), so the fallback is exercised exactly where it is actually used and
-is never tested against itself on CUDA.
+dispatches to the native kernel op path.
 
 The cache is decoded back to value space (fp8 bytes * scale) before comparison rather
 than compared byte-exact: the software fp8 e4m3 cast and the per-warp abs-max reduction
@@ -107,7 +105,16 @@ def _page_bytes(head_dim: int) -> int:
     return 132 * PAGE_SIZE if head_dim == 128 else _flashmla_page_bytes()
 
 
-def _run(head_dim: int, num_tokens: int):
+def _flashmla_bf16_page_bytes() -> int:
+    return 512 * 2 * PAGE_SIZE
+
+
+def _run(
+    head_dim: int,
+    num_tokens: int,
+    preshuffle_size: int = 0,
+    use_bf16_store: bool = False,
+):
     """Store FP8 norm+rope output for ``num_tokens`` decode events.
 
     Returns ``(cache, kv, norm_weight, freqs_cis, positions)`` so the test can build
@@ -132,9 +139,10 @@ def _run(head_dim: int, num_tokens: int):
     freqs_cis = precompute_freqs_cis(
         ROPE_DIM, int(seq_lens.max().item()) + 1, 0, 10000, 1, 32, 1
     ).to(device)
-    cache = torch.zeros(
-        num_pages, _page_bytes(head_dim), device=device, dtype=torch.uint8
-    )
+    page_bytes = _page_bytes(head_dim)
+    if use_bf16_store:
+        page_bytes = _flashmla_bf16_page_bytes()
+    cache = torch.zeros(num_pages, page_bytes, device=device, dtype=torch.uint8)
 
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
 
@@ -150,6 +158,8 @@ def _run(head_dim: int, num_tokens: int):
         compress_ratio=plan.compress_ratio,
         page_size=PAGE_SIZE,
         use_fp4=False,
+        preshuffle_size=preshuffle_size,
+        use_bf16_store=use_bf16_store,
     )
     # Decode RoPE position for token i is its seq_len minus the current compress step.
     positions = seq_lens - COMPRESS_RATIO
@@ -230,6 +240,33 @@ def _dequant_indexer(cache: torch.Tensor, num_tokens: int) -> torch.Tensor:
     return torch.stack(vals)
 
 
+def _dequant_indexer_preshuffle(
+    cache: torch.Tensor, num_tokens: int, preshuffle_size: int
+) -> torch.Tensor:
+    """head_dim=128 preshuffle layout: dequantize fp8 values with fp32 scales."""
+    vals = []
+    for tok in range(num_tokens):
+        page, off = tok // PAGE_SIZE, tok % PAGE_SIZE
+        sbase = _IDX_VALUE_BYTES * PAGE_SIZE + off * _IDX_SCALE_BYTES
+        packed = torch.empty(_IDX_VALUE_BYTES, device=cache.device, dtype=torch.uint8)
+        for d in range(_IDX_VALUE_BYTES):
+            token_tile_id = off // preshuffle_size
+            token_in_tile = off % preshuffle_size
+            col_tile_id = d // preshuffle_size
+            col_in_tile = d % preshuffle_size
+            value_offset = (
+                token_tile_id * (preshuffle_size * _IDX_VALUE_BYTES)
+                + col_tile_id * (preshuffle_size * preshuffle_size)
+                + token_in_tile * preshuffle_size
+                + col_in_tile
+            )
+            packed[d] = cache[page, value_offset]
+        fp8 = packed.view(torch.float8_e4m3fn)
+        scale = cache[page, sbase : sbase + _IDX_SCALE_BYTES].view(torch.float32)
+        vals.append(fp8.float() * scale)
+    return torch.stack(vals)
+
+
 def _dequant_flashmla(cache: torch.Tensor, num_tokens: int):
     """head_dim=512: dequantize the fp8 nope region (7 warps x UE8M0) and read rope.
 
@@ -251,6 +288,19 @@ def _dequant_flashmla(cache: torch.Tensor, num_tokens: int):
         rope_bytes = cache[page, vbase + _MLA_NOPE_BYTES : vbase + _MLA_SLOT_BYTES]
         rope.append(rope_bytes.view(torch.bfloat16).float())
     return torch.stack(nope), torch.stack(rope)
+
+
+def _dequant_flashmla_bf16store(cache: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    """head_dim=512 bf16-store layout: read full bf16 vector from slot."""
+    vals = []
+    slot_bytes = 512 * 2
+    for tok in range(num_tokens):
+        page, off = tok // PAGE_SIZE, tok % PAGE_SIZE
+        vbase = off * slot_bytes
+        vals.append(
+            cache[page, vbase : vbase + slot_bytes].view(torch.bfloat16).float()
+        )
+    return torch.stack(vals)
 
 
 def _assert_value_close(ref: torch.Tensor, got: torch.Tensor, label: str) -> None:
@@ -295,6 +345,34 @@ def test_flashmla_fp8_matches_ref(num_tokens: int) -> None:
     got_nope, got_rope = _dequant_flashmla(cache, num_tokens)
     torch.testing.assert_close(got_rope, ref_rope, atol=0, rtol=0)
     _assert_value_close(ref_nope, got_nope, "flashmla nope")
+
+
+@pytest.mark.parametrize("num_tokens", [1, 16, 96])
+def test_indexer_fp8_preshuffle_matches_ref(num_tokens: int) -> None:
+    """head_dim=128 preshuffle layout dequantizes to the same value-space reference."""
+    preshuffle_size = 16
+    cache, kv, norm_weight, freqs_cis, positions = _run(
+        128, num_tokens, preshuffle_size=preshuffle_size
+    )
+    ref = hadamard_transform(
+        _ref_norm_rope(kv, norm_weight, freqs_cis, positions), scale=128**-0.5
+    )
+    ref = _ref_quant_indexer(ref)
+    got = _dequant_indexer_preshuffle(cache, num_tokens, preshuffle_size)
+    _assert_value_close(ref, got, "indexer preshuffle")
+
+
+@pytest.mark.parametrize("num_tokens", [1, 16, 96])
+def test_flashmla_bf16store_matches_ref(num_tokens: int) -> None:
+    """head_dim=512 bf16-store layout writes full bf16 norm+rope vector."""
+    cache, kv, norm_weight, freqs_cis, positions = _run(
+        512, num_tokens, use_bf16_store=True
+    )
+    ref = (
+        _ref_norm_rope(kv, norm_weight, freqs_cis, positions).to(torch.bfloat16).float()
+    )
+    got = _dequant_flashmla_bf16store(cache, num_tokens)
+    torch.testing.assert_close(got, ref, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

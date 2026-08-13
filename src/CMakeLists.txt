@@ -21,8 +21,13 @@ option(USE_MLA "Build MLA kernels" ON)
 # OFF also pins the runtime dispatch to the 2-stage path (see below) so the fused
 # launchers are never referenced.
 option(USE_MLA_SPARSE_FUSED "Build the fused (single-pass) sparse MLA decode kernel (optimization track)" OFF)
+# Master runtime-JIT switch (opt-in, default OFF). When ON, kernels that support
+# runtime codegen (currently FMHA decode/prefill) are compiled on demand via
+# src/jit instead of being instantiated ahead of time. Enable with USE_JIT=ON
+# (or 1 / On) as a CMake option or environment variable.
+option(USE_JIT "Enable runtime-JIT kernels (opt-in; drops their AOT .so instances)" OFF)
 
-foreach(_toggle USE_MOE USE_FMHA USE_MLA USE_MLA_SPARSE_FUSED)
+foreach(_toggle USE_MOE USE_FMHA USE_MLA USE_MLA_SPARSE_FUSED USE_JIT)
     if(DEFINED ENV{${_toggle}} AND NOT "$ENV{${_toggle}}" STREQUAL "")
         if("$ENV{${_toggle}}")
             set(${_toggle} ON)
@@ -36,12 +41,27 @@ message(STATUS "USE_MOE=${USE_MOE}")
 message(STATUS "USE_FMHA=${USE_FMHA}")
 message(STATUS "USE_MLA=${USE_MLA}")
 message(STATUS "USE_MLA_SPARSE_FUSED=${USE_MLA_SPARSE_FUSED}")
+message(STATUS "USE_JIT=${USE_JIT}")
 
 if(USE_MOE)
     add_compile_definitions(USE_MOE)
 endif()
 if(USE_FMHA)
     add_compile_definitions(USE_FMHA)
+endif()
+if(USE_FMHA AND USE_JIT)
+    # Route decode/prefill dispatch (flash_attention.cpp) through the runtime-JIT
+    # path; the AOT FMHA instances are not generated (see include() guard below).
+    add_compile_definitions(USE_FMHA_JIT)
+endif()
+if(USE_MOE AND USE_JIT)
+    # Route the bf16 grouped GEMM dispatch (GroupGemmXe20.cpp) through the
+    # runtime-JIT path; its AOT instances are not generated.
+    add_compile_definitions(USE_MOE_JIT)
+endif()
+if(USE_MLA AND USE_JIT)
+    # Route the MLA decode dispatch (mla_decode.cpp) through the runtime-JIT path.
+    add_compile_definitions(USE_MLA_JIT)
 endif()
 if(USE_MLA)
     add_compile_definitions(USE_MLA)
@@ -94,24 +114,49 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/SGEMMLoraAFwdXe20.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/SGEMMLoraBFwdXe20.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/QKVLoraBFwdXe20.cmake)
 if(USE_FMHA)
-    include(FMHADecodeXe20.cmake)
-    include(FMHAPrefillXe20.cmake)
+    if(NOT USE_JIT)
+        include(FMHADecodeXe20.cmake)
+        include(FMHAPrefillXe20.cmake)
+    endif()
     include(GdnAttnXe20.cmake)
 endif()
 if(USE_MLA)
-    include(MlaDecodeXe20.cmake)
-    include(MlaPrefillXe20.cmake)
+    if(NOT USE_JIT)
+        include(MlaDecodeXe20.cmake)
+        include(MlaPrefillXe20.cmake)
+    endif()
     include(MlaSparseDecodeXe20.cmake)
     include(MlaSparsePrefillXe20.cmake)
 endif()
 if(USE_MOE)
-    include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmXe20.cmake)
-    include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmW4A16Xe20.cmake)
+    if(NOT USE_JIT)
+        include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmXe20.cmake)
+        include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmW4A16Xe20.cmake)
+    endif()
 endif()
 
 
 message(STATUS "BMG files: ${device_cpp_xe20}")
 message(STATUS "Common files: ${device_cpp_common}")
+
+# Ship the headers + templates the runtime-JIT kernels need to compile: the sgl
+# source-header tree (so quote-includes like "sycl/kernels/..." resolve) plus the
+# *.cpp.in templates and the CUTLASS-SYCL headers. These are text (highly
+# compressible) and replace the precompiled FMHA / grouped-GEMM .so instances.
+if(USE_JIT)
+    install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/sycl
+            DESTINATION sgl_kernel/include/sgl_src
+            FILES_MATCHING PATTERN "*.hpp" PATTERN "*.h" PATTERN "*.cpp.in")
+    if(DEFINED repo-cutlass-sycl_SOURCE_DIR)
+        install(DIRECTORY ${repo-cutlass-sycl_SOURCE_DIR}/include/
+                DESTINATION sgl_kernel/include/cutlass_sycl/include)
+        install(DIRECTORY ${repo-cutlass-sycl_SOURCE_DIR}/tools/util/include/
+                DESTINATION sgl_kernel/include/cutlass_sycl/tools/util/include)
+    else()
+        message(WARNING "repo-cutlass-sycl_SOURCE_DIR not set; FMHA JIT headers "
+                        "will not be packaged. Set SGL_JIT_CUTLASS_INCLUDE at runtime.")
+    endif()
+endif()
 
 list(APPEND ATen_XPU_CPP_SRCS ${host_cpp})
 list(APPEND ATen_XPU_SYCL_COMMON ${device_cpp_common})

@@ -48,3 +48,10 @@ __attribute__((visibility("default"))) void FmhaDecodeFp8Runner<@QG_SZ@, @HEAD_D
 template struct FmhaDecodeFp8Runner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@, @ELEM_TYPE@>;
 
 }  // namespace decode
+
+#ifdef SGL_FMHA_JIT_ENTRY
+extern "C" __attribute__((visibility("default"))) void sgl_fmha_entry(const void* params) {
+  decode::FmhaDecodeFp8Runner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@, @ELEM_TYPE@>{}(
+      *static_cast<const decode::Arguments*>(params));
+}
+#endif

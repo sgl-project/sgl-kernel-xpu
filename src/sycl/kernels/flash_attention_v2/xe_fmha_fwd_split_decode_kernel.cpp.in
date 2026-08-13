@@ -101,3 +101,10 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
 template struct FmhaSplitDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@, @ELEM_TYPE@>;
 
 }  // namespace decode
+
+#ifdef SGL_FMHA_JIT_ENTRY
+extern "C" __attribute__((visibility("default"))) void sgl_fmha_entry(const void* params) {
+  decode::FmhaSplitDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@, @ELEM_TYPE@>{}(
+      *static_cast<const decode::Arguments*>(params));
+}
+#endif

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <fstream>
 #include <sstream>
 
@@ -246,12 +247,26 @@ void* get_or_compile(const CompileSpec& spec, const JitConfig& config, std::stri
     for (const auto& l : config.link_flags) cmd += " " + shell_quote(l);
 
     std::string out;
+    // Cold compiles take tens of seconds with no other output; log so a first-use
+    // compile is not mistaken for a hang (silence with SGL_JIT_QUIET=1).
+    const bool verbose = env_or_empty("SGL_JIT_QUIET") != "1";
+    const std::time_t t0 = std::time(nullptr);
+    if (verbose) {
+      std::fprintf(stderr, "[sgl_kernel JIT] compiling %s (first use, ~30-90s)...\n",
+                   spec.name.c_str());
+      std::fflush(stderr);
+    }
     int rc = run_command(cmd, &out);
     ::unlink(tmp_cpp.c_str());
     if (rc != 0) {
       ::unlink(tmp_so.c_str());
       return set_err("icpx JIT compile failed (rc=" + std::to_string(rc) + ") for " +
                      spec.name + "\nCMD: " + cmd + "\nOUTPUT:\n" + out);
+    }
+    if (verbose) {
+      std::fprintf(stderr, "[sgl_kernel JIT] compiled %s in %llds\n", spec.name.c_str(),
+                   static_cast<long long>(std::time(nullptr) - t0));
+      std::fflush(stderr);
     }
     if (::rename(tmp_so.c_str(), so_path.c_str()) != 0) {
       ::unlink(tmp_so.c_str());

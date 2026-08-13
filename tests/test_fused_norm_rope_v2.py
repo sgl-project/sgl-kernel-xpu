@@ -1,7 +1,7 @@
-"""FP8 path of the V2 fused norm+RoPE+store kernel vs an inline torch reference.
+"""V2 fused norm+RoPE+store kernel vs inline torch references.
 
-Covers both head-dim variants of ``compress_norm_rope_store`` with ``use_fp4=False``:
-  * Indexer  (head_dim=128): RMSNorm + RoPE + 128-pt WHT + FP8 -> indexer cache.
+Covers both head-dim variants of ``compress_norm_rope_store``:
+    * Indexer  (head_dim=128): RMSNorm + RoPE + 128-pt WHT + FP8/FP4 -> indexer cache.
   * FlashMLA (head_dim=512): RMSNorm + RoPE -> FlashMLA paged cache.
 
 Like test_fp4_indexer, the test calls the public ``compress_norm_rope_store`` wrapper
@@ -114,6 +114,7 @@ def _run(
     num_tokens: int,
     preshuffle_size: int = 0,
     use_bf16_store: bool = False,
+    use_fp4: bool = False,
 ):
     """Store FP8 norm+rope output for ``num_tokens`` decode events.
 
@@ -140,6 +141,8 @@ def _run(
         ROPE_DIM, int(seq_lens.max().item()) + 1, 0, 10000, 1, 32, 1
     ).to(device)
     page_bytes = _page_bytes(head_dim)
+    if head_dim == 128 and use_fp4:
+        page_bytes = 68 * PAGE_SIZE
     if use_bf16_store:
         page_bytes = _flashmla_bf16_page_bytes()
     cache = torch.zeros(num_pages, page_bytes, device=device, dtype=torch.uint8)
@@ -157,7 +160,7 @@ def _run(
         is_decode=plan.is_decode,
         compress_ratio=plan.compress_ratio,
         page_size=PAGE_SIZE,
-        use_fp4=False,
+        use_fp4=use_fp4,
         preshuffle_size=preshuffle_size,
         use_bf16_store=use_bf16_store,
     )
@@ -202,6 +205,34 @@ def _ref_quant_indexer(x: torch.Tensor) -> torch.Tensor:
     scale = abs_max.clamp(min=1e-4) / _FP8_E4M3_MAX  # fp32 scale, stored verbatim
     fp8 = (x / scale).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn)
     return fp8.float() * scale
+
+
+def _ref_quant_indexer_fp4(x: torch.Tensor) -> torch.Tensor:
+    """Per-group fp4(e2m1) quant + dequant of (N, 128), matching kernel path."""
+    xg = x.reshape(x.shape[0], 4, 32)
+    abs_max = xg.abs().amax(dim=-1)
+    scale_raw = abs_max.clamp(min=1e-4) / 6.0
+    ue8 = _ceil_ue8m0(scale_raw)
+    inv = _ue8m0_inv_scale(ue8).unsqueeze(-1)
+    scaled = xg * inv
+    ax = scaled.abs().clamp(max=6.0)
+
+    code = torch.zeros_like(ax, dtype=torch.uint8)
+    code += (ax > 0.25).to(torch.uint8)
+    code += (ax > 0.75).to(torch.uint8)
+    code += (ax > 1.25).to(torch.uint8)
+    code += (ax > 1.75).to(torch.uint8)
+    code += (ax > 2.5).to(torch.uint8)
+    code += (ax > 3.5).to(torch.uint8)
+    code += (ax > 5.0).to(torch.uint8)
+    code = torch.where((scaled < 0) & (code != 0), code | 0x8, code)
+
+    mag = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=x.device)
+    val = mag[(code & 0x7).to(torch.long)]
+    sign = torch.where((code & 0x8) != 0, -1.0, 1.0)
+    dq = val * sign
+    scale = 1.0 / inv.clamp(min=1e-30)
+    return (dq * scale).reshape(x.shape[0], -1)
 
 
 def _ref_quant_flashmla_nope(x_nope: torch.Tensor) -> torch.Tensor:
@@ -267,6 +298,32 @@ def _dequant_indexer_preshuffle(
     return torch.stack(vals)
 
 
+def _dequant_indexer_fp4(cache: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    """head_dim=128 fp4 layout: decode packed e2m1 values with per-group UE8M0 scales."""
+    vals = []
+    mag = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=cache.device)
+    for tok in range(num_tokens):
+        page, off = tok // PAGE_SIZE, tok % PAGE_SIZE
+        vbase = off * 64
+        sbase = 64 * PAGE_SIZE + off * 4
+        packed = cache[page, vbase : vbase + 64]
+        lo = packed & 0x0F
+        hi = (packed >> 4) & 0x0F
+        codes = torch.empty(128, dtype=torch.uint8, device=cache.device)
+        codes[0::2] = lo
+        codes[1::2] = hi
+
+        scales = cache[page, sbase : sbase + 4]
+        inv = _ue8m0_inv_scale(scales)
+        scale = 1.0 / inv.clamp(min=1e-30)
+        group_scale = scale.repeat_interleave(32)
+
+        val = mag[(codes & 0x7).to(torch.long)]
+        sign = torch.where((codes & 0x8) != 0, -1.0, 1.0)
+        vals.append(val * sign * group_scale)
+    return torch.stack(vals)
+
+
 def _dequant_flashmla(cache: torch.Tensor, num_tokens: int):
     """head_dim=512: dequantize the fp8 nope region (7 warps x UE8M0) and read rope.
 
@@ -315,19 +372,27 @@ def _assert_value_close(ref: torch.Tensor, got: torch.Tensor, label: str) -> Non
 
 
 @pytest.mark.parametrize("num_tokens", [1, 16, 96])
-def test_indexer_fp8_matches_ref(num_tokens: int) -> None:
-    """head_dim=128 indexer FP8: cache dequantizes to the inline norm+rope+WHT reference.
+@pytest.mark.parametrize("use_fp4", [False, True])
+def test_indexer_matches_ref(num_tokens: int, use_fp4: bool) -> None:
+    """head_dim=128 indexer FP8/FP4: cache dequantizes to inline norm+rope+WHT reference.
 
     The reference applies the same per-tensor fp8 quantization, so only the
     hardware-vs-software fp8 cast remains on CUDA (exact on XPU).
     """
-    cache, kv, norm_weight, freqs_cis, positions = _run(128, num_tokens)
+    cache, kv, norm_weight, freqs_cis, positions = _run(
+        128, num_tokens, use_fp4=use_fp4
+    )
     ref = hadamard_transform(
         _ref_norm_rope(kv, norm_weight, freqs_cis, positions), scale=128**-0.5
     )
-    ref = _ref_quant_indexer(ref)
-    got = _dequant_indexer(cache, num_tokens)
-    _assert_value_close(ref, got, "indexer")
+    if use_fp4:
+        ref = _ref_quant_indexer_fp4(ref)
+        got = _dequant_indexer_fp4(cache, num_tokens)
+        _assert_value_close(ref, got, "indexer fp4")
+    else:
+        ref = _ref_quant_indexer(ref)
+        got = _dequant_indexer(cache, num_tokens)
+        _assert_value_close(ref, got, "indexer fp8")
 
 
 @pytest.mark.parametrize("num_tokens", [1, 16, 96])

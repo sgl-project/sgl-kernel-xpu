@@ -245,6 +245,7 @@ struct FusedNormRopeIndexerKernel {
       const float o1 = data[static_cast<int64_t>(peer) + kIndexerBlockSize];
       h0 = (lid & mask) ? (o0 - h0) : (h0 + o0);
       h1 = (lid & mask) ? (o1 - h1) : (h1 + o1);
+      item.barrier(sycl::access::fence_space::local_space);
       data[d0] = h0;
       data[d1] = h1;
       item.barrier(sycl::access::fence_space::local_space);

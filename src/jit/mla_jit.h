@@ -49,5 +49,45 @@ bool mla_prefill_launch(
     int64_t num_kv_splits,
     std::string* err = nullptr);
 
+// Launch sparse MLA decode (2-stage) for (dtype, d_qk, b_h, has_attn_sink).
+// Tensor / std::optional<at::Tensor> args are passed as pointers via void*.
+bool sparse_decode_launch(
+    bool is_fp16,
+    int d_qk,
+    int b_h,
+    bool has_attn_sink,
+    void* out,
+    void* lse_out,
+    const void* q,
+    const void* k_cache,
+    const void* indices,
+    const void* topk_length,
+    const void* extra_k_cache,
+    const void* extra_indices,
+    const void* extra_topk_length,
+    const void* attn_sink,
+    double sm_scale,
+    int64_t head_dim_v,
+    bool is_fp8_kvcache,
+    std::string* err = nullptr);
+
+// Launch sparse MLA prefill (2-stage) for (dtype, d_qk, b_h, has_attn_sink).
+bool sparse_prefill_launch(
+    bool is_fp16,
+    int d_qk,
+    int b_h,
+    bool has_attn_sink,
+    void* out,
+    void* max_logits,
+    void* lse,
+    const void* q,
+    const void* kv,
+    const void* indices,
+    const void* attn_sink,
+    const void* topk_length,
+    double sm_scale,
+    int64_t head_dim_v,
+    std::string* err = nullptr);
+
 }  // namespace mla_jit
 }  // namespace sgl

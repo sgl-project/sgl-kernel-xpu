@@ -21,6 +21,9 @@
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 #include "sycl/kernels/mla_sparse/device/mla_sparse_prefill_dispatch.hpp"
+#ifdef USE_MLA_JIT
+#include "jit/mla_jit.h"
+#endif
 
 namespace {
 
@@ -138,7 +141,20 @@ SGL_KERNEL_EXPORT void flash_mla_sparse_prefill(
       "Unsupported input data type for Sparse MLA prefill");
   TORCH_CHECK(head_dim_v == 512, "head_dim_v must be 512 for DeepSeek V4 MLA");
 
+#ifdef USE_MLA_JIT
+  {
+    const int d_qk = static_cast<int>(q.size(2));
+    const int b_h = mla_sparse_prefill::sparse_mla_prefill_select_b_h(q.size(1));
+    std::string jit_err;
+    TORCH_CHECK(
+        sgl::mla_jit::sparse_prefill_launch(
+            in_dtype == at::ScalarType::Half, d_qk, b_h, attn_sink.has_value(), &out, &max_logits,
+            &lse, &q, &kv, &indices, &attn_sink, &topk_length, sm_scale, head_dim_v, &jit_err),
+        jit_err);
+  }
+#else
   DISPATCH_MLA_SPARSE_PREFILL_DTYPE_2STAGE();
+#endif
 }
 
 #undef DISPATCH_MLA_SPARSE_PREFILL_DTYPE_2STAGE

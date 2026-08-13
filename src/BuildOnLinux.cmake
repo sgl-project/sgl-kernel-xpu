@@ -74,6 +74,12 @@ endif()
 if(USE_MLA AND USE_JIT AND TARGET sgl-ops-sycl-mla_prefill)
   target_link_libraries(sgl-ops-sycl-mla_prefill PRIVATE sgl_jit)
 endif()
+if(USE_MLA AND USE_JIT AND TARGET sgl-ops-sycl-mla_sparse_decode)
+  target_link_libraries(sgl-ops-sycl-mla_sparse_decode PRIVATE sgl_jit)
+endif()
+if(USE_MLA AND USE_JIT AND TARGET sgl-ops-sycl-mla_sparse_prefill)
+  target_link_libraries(sgl-ops-sycl-mla_sparse_prefill PRIVATE sgl_jit)
+endif()
 
 # xe20 kernels
 set(XE20_OFFLINE_COMPILER_AOT_OPTIONS "-device bmg")

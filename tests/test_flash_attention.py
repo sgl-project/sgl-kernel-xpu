@@ -978,7 +978,7 @@ def test_flash_attn_kvcache(
     [torch.bfloat16, torch.float16]
     + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []),
 )
-@pytest.mark.parametrize("nheads_q,nheads_kv", [(16, 16), (16, 4), (16, 1)])
+@pytest.mark.parametrize("nheads_q,nheads_kv", [(16, 16), (16, 4), (16, 1), (8, 1)])
 @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("local", [True, False])
@@ -1006,9 +1006,18 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize(
     "seqlen_k",
     [
-        128,
+        1,
+        63,
+        64,
+        65,
+        129,
+        512,
         1024,
+        4033,
         4096,
+        4097,
+        4608,
+        5120,
         8192,
     ],
 )
@@ -1035,8 +1044,10 @@ def test_flash_attn_decode_kvcache(
 ):
     from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
-    if page_size is not None and seqlen_k % page_size != 0:
-        pytest.skip("page_size must divide seqlen_k")
+    if (nheads_q, nheads_kv) == (8, 1) and (
+        batch_size != 1 or d != 512 or page_size != 64
+    ):
+        pytest.skip("Gemma4 Split-K coverage only targets B=1, D=512, page_size=64")
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip("new_kv requires seqlen_q <= seqlen_k")
     if not new_kv and rotary_fraction > 0.0:
@@ -1349,7 +1360,15 @@ def test_flash_attn_decode_kvcache(
         sin = sin.to(dtype) if sin is not None else None
         k_cache_saved = k_cache.clone() if page_size is None else k_cache_paged.clone()
         v_cache_saved = v_cache.clone() if page_size is None else v_cache_paged.clone()
-        num_splits_vals = [1, 0] if not DISABLE_SPLIT else [1]
+        num_splits_vals = (
+            [1, 0]
+            if batch_size == 1
+            and nheads_q == 8
+            and nheads_kv == 1
+            and d == 512
+            and page_size == 64
+            else [1]
+        )
         precompute_metadata_vals = [False]
         for num_splits, precompute_metadata in itertools.product(
             num_splits_vals, precompute_metadata_vals

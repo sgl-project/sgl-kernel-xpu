@@ -138,3 +138,10 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
 template struct FmhaPrefillRunner<@HEAD_DIM@, @ELEM_TYPE@>;
 
 }  // namespace prefill
+
+#ifdef SGL_FMHA_JIT_ENTRY
+extern "C" __attribute__((visibility("default"))) void sgl_fmha_entry(const void* params) {
+  prefill::FmhaPrefillRunner<@HEAD_DIM@, @ELEM_TYPE@>{}(
+      *static_cast<const prefill::Arguments*>(params));
+}
+#endif

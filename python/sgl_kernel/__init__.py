@@ -7,6 +7,26 @@ import torch
 
 SYSTEM_ARCH = platform.machine()
 
+
+def _export_jit_toolchain_env() -> None:
+    """Expose torch's include/lib dirs to the C++ runtime-JIT engine (src/jit).
+
+    Only Python knows torch's install location; the C++ engine reads these env
+    vars to build the icpx command line for on-demand FMHA kernel compilation.
+    """
+    try:
+        from torch.utils.cpp_extension import include_paths
+
+        os.environ.setdefault("SGL_JIT_TORCH_INCLUDE", os.pathsep.join(include_paths()))
+        os.environ.setdefault(
+            "SGL_JIT_TORCH_LIB", os.path.join(os.path.dirname(torch.__file__), "lib")
+        )
+    except Exception:
+        pass
+
+
+_export_jit_toolchain_env()
+
 cuda_path = f"/usr/local/cuda/targets/{SYSTEM_ARCH}-linux/lib/libcudart.so.12"
 if os.path.exists(cuda_path):
     ctypes.CDLL(cuda_path, mode=ctypes.RTLD_GLOBAL)

@@ -10,6 +10,9 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "kernels/moe/xe20/bf16/moe_kernel.hpp"
+#ifdef USE_MOE_JIT
+#include "jit/moe_jit.h"
+#endif
 #include "sgl_kernel_export.h"
 
 using namespace cute;
@@ -226,6 +229,19 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
   bool small_weight = (int64_t)gemm_k * gemm_n <= MOE_GROUPED_GEMM_SMALL_WEIGHT_THRESHOLD;
   int ld_b = static_cast<int>(weights.stride(1));
 
+#ifdef USE_MOE_JIT
+  {
+    std::string jit_err;
+    TORCH_CHECK(
+        sgl::moe_jit::grouped_gemm_launch(
+            avg_m, static_cast<int>(activation_type), fuse_act, with_bias, &queue,
+            activations.data_ptr(), weights.data_ptr(), /*scales=*/nullptr, bias_ptr,
+            output.data_ptr(), gemm_n, gemm_k, total_rows_for_experts.data_ptr<int>(),
+            static_cast<int>(n_experts), atomic_buffer.data_ptr<int>(),
+            static_cast<float>(gemm1_alpha), static_cast<float>(gemm1_limit), ld_b, &jit_err),
+        jit_err);
+  }
+#else
   bool narrow_k = gemm_k <= 256;
   bool narrow_n_fused = fuse_act && (gemm_n <= 512);
 
@@ -273,6 +289,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
           activation_type, false, with_bias, Shape<_256, _256, _32>, Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>);
     }
   }
+#endif
 }
 
 #undef SYCL_INTEL_TARGET

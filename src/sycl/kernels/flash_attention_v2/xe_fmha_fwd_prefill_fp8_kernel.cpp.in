@@ -47,3 +47,10 @@ __attribute__((visibility("default"))) void FmhaPrefillFp8Runner<@HEAD_DIM@, @EL
 template struct FmhaPrefillFp8Runner<@HEAD_DIM@, @ELEM_TYPE@>;
 
 }  // namespace prefill
+
+#ifdef SGL_FMHA_JIT_ENTRY
+extern "C" __attribute__((visibility("default"))) void sgl_fmha_entry(const void* params) {
+  prefill::FmhaPrefillFp8Runner<@HEAD_DIM@, @ELEM_TYPE@>{}(
+      *static_cast<const prefill::Arguments*>(params));
+}
+#endif

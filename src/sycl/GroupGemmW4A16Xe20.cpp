@@ -40,6 +40,9 @@
 #include "sgl_kernel_export.h"
 #include "sycl/Utils.h"
 #include "sycl/kernels/moe/xe20/w4a16/gemm_xe2_policy.hpp"
+#ifdef USE_MOE_JIT
+#include "jit/moe_jit.h"
+#endif
 
 namespace moe_w4a16 {
 template <typename Policy, typename ElementS, typename ElementA>
@@ -276,7 +279,20 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
     }                                  \
   } while (0)
 
+#ifdef USE_MOE_JIT
+  {
+    std::string jit_err;
+    TORCH_CHECK(
+        sgl::moe_jit::w4a16_grouped_gemm_launch(
+            avg_m, is_int4, is_fp16_act, &queue, activations.data_ptr(),
+            packed_weights.data_ptr(), scales.data_ptr(), zeros_ptr, bias_ptr, output.data_ptr(),
+            gemm_n, gemm_k, rows_per_expert.data_ptr<int>(), static_cast<int>(n_experts),
+            static_cast<int>(group_size), atomic_buffer.data_ptr<int>(), &jit_err),
+        jit_err);
+  }
+#else
   DISPATCH_W4A16_POLICY();
+#endif
 
 #undef DISPATCH_W4A16_POLICY
 #undef LAUNCH_W4A16

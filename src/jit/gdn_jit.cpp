@@ -1,0 +1,161 @@
+#include "jit/gdn_jit.h"
+
+#include <cstdint>
+#include <mutex>
+#include <unordered_map>
+
+#include "jit/sycl_template_jit.h"
+
+namespace sgl {
+namespace gdn_jit {
+
+namespace {
+
+using ChunkFn = void (*)(
+    void*,
+    void*,
+    const void*,
+    const void*,
+    const void*,
+    void*,
+    void*,
+    void*,
+    const void*,
+    const void*,
+    const void*,
+    const void*,
+    void*,
+    int,
+    const int*,
+    const int*,
+    const bool*,
+    const int*,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int);
+
+// @SCALAR_T@ / @STATE_T@ template substitutions. Indexed by is_half and
+// state_code (0=fp32, 1=bf16, 2=half).
+const char* scalar_type(bool is_half) {
+  return is_half ? "cutlass::half_t" : "cutlass::bfloat16_t";
+}
+
+const char* state_type(int state_code) {
+  switch (state_code) {
+    case 0:
+      return "float";
+    case 1:
+      return "cutlass::bfloat16_t";
+    default:
+      return "cutlass::half_t";
+  }
+}
+
+uint64_t pack_key(bool is_half, int state_code) {
+  return (static_cast<uint64_t>(is_half ? 1u : 0u) << 8) | (static_cast<uint64_t>(state_code) & 0xFF);
+}
+
+std::mutex g_mu;
+std::unordered_map<uint64_t, ChunkFn> g_fns;
+
+ChunkFn resolve(bool is_half, int state_code, std::string* err) {
+  const uint64_t key = pack_key(is_half, state_code);
+  {
+    std::lock_guard<std::mutex> lk(g_mu);
+    auto it = g_fns.find(key);
+    if (it != g_fns.end()) return it->second;
+  }
+
+  const jit::JitConfig& cfg = jit::default_config();
+  if (!cfg.valid) {
+    if (err) *err = "GDN chunk JIT unavailable: " + cfg.error;
+    return nullptr;
+  }
+  if (cfg.src_root.empty()) {
+    if (err) *err = "GDN chunk JIT: source template root not resolved";
+    return nullptr;
+  }
+
+  jit::CompileSpec spec;
+  spec.template_path = cfg.src_root + "/sycl/kernels/gdn_attn/chunk_gated_delta_rule_jit_instance.cpp.in";
+  spec.subs["SCALAR_T"] = scalar_type(is_half);
+  spec.subs["STATE_T"] = state_type(state_code);
+  spec.extra_flags = {"-DSGL_GDN_JIT_ENTRY"};
+  spec.entry_symbol = "sgl_gdn_chunk_entry";
+  spec.name = std::string("gdn_chunk_") + (is_half ? "f16" : "bf16") + "_s" + std::to_string(state_code);
+
+  void* sym = jit::get_or_compile(spec, cfg, err);
+  if (!sym) return nullptr;
+
+  ChunkFn fn = reinterpret_cast<ChunkFn>(sym);
+  {
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_fns[key] = fn;
+  }
+  return fn;
+}
+
+}  // namespace
+
+bool chunk_launch(
+    bool is_half,
+    int state_code,
+    void* queue,
+    void* core_attn_out,
+    const void* q,
+    const void* k,
+    const void* v,
+    void* A,
+    void* w,
+    void* u,
+    const void* b,
+    const void* a,
+    const void* A_log,
+    const void* dt_bias,
+    void* ssm_state,
+    int ssm_state_stride_0,
+    const int* query_start_loc,
+    const int* cache_indices,
+    const bool* has_initial_state,
+    const int* token_indx,
+    int batch_size,
+    int total_virtual_seqlen,
+    int num_k_heads,
+    int head_k_dim,
+    int num_v_heads,
+    int head_v_dim,
+    std::string* err) {
+  ChunkFn fn = resolve(is_half, state_code, err);
+  if (!fn) return false;
+  fn(queue,
+     core_attn_out,
+     q,
+     k,
+     v,
+     A,
+     w,
+     u,
+     b,
+     a,
+     A_log,
+     dt_bias,
+     ssm_state,
+     ssm_state_stride_0,
+     query_start_loc,
+     cache_indices,
+     has_initial_state,
+     token_indx,
+     batch_size,
+     total_virtual_seqlen,
+     num_k_heads,
+     head_k_dim,
+     num_v_heads,
+     head_v_dim);
+  return true;
+}
+
+}  // namespace gdn_jit
+}  // namespace sgl

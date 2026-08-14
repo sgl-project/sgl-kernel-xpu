@@ -804,23 +804,22 @@ SGL_KERNEL_EXPORT void rmsnorm(torch::Tensor& output, torch::Tensor& input, torc
 
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "RMSNormKernelImpl", [&]() {
-        SYCL_DISPATCH_WEIGHT_TYPES(
-            at::ScalarType::Half, at::ScalarType::BFloat16, weight_.scalar_type(), "RMSNormKernelImpl", [&]() {
-              RMSNormKernelImplInternal<scalar_t, weight_t>(
-                  input,
-                  weight_,
-                  M,
-                  N,
-                  static_cast<acc_type<scalar_t>>(eps),
-                  output,
-                  rstd,
-                  in_strides.batch_stride,
-                  out_strides.batch_stride,
-                  in_strides.inner_size,
-                  in_strides.inner_stride,
-                  out_strides.inner_size,
-                  out_strides.inner_stride);
-            });
+        SYCL_DISPATCH_WEIGHT_MATCH_OR_FP32(input.scalar_type(), weight_.scalar_type(), "RMSNormKernelImpl", [&]() {
+          RMSNormKernelImplInternal<scalar_t, weight_t>(
+              input,
+              weight_,
+              M,
+              N,
+              static_cast<acc_type<scalar_t>>(eps),
+              output,
+              rstd,
+              in_strides.batch_stride,
+              out_strides.batch_stride,
+              in_strides.inner_size,
+              in_strides.inner_stride,
+              out_strides.inner_size,
+              out_strides.inner_stride);
+        });
       });
 }
 
@@ -839,8 +838,8 @@ fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor wei
 
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
-        SYCL_DISPATCH_WEIGHT_TYPES(
-            at::ScalarType::Half, at::ScalarType::BFloat16, weight.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
+        SYCL_DISPATCH_WEIGHT_MATCH_OR_FP32(
+            input_.scalar_type(), weight.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
               FusedAddRMSNormKernelImplInternal<scalar_t, weight_t>(
                   input_, weight, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual_);
             });
@@ -858,22 +857,21 @@ SGL_KERNEL_EXPORT void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input
 
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
-        SYCL_DISPATCH_WEIGHT_TYPES(
-            at::ScalarType::Half, at::ScalarType::BFloat16, weight_.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
-              GemmaRMSNormKernelImplInternal<scalar_t, weight_t>(
-                  input,
-                  weight_,
-                  M,
-                  N,
-                  static_cast<acc_type<scalar_t>>(eps),
-                  output,
-                  in_strides.batch_stride,
-                  out_strides.batch_stride,
-                  in_strides.inner_size,
-                  in_strides.inner_stride,
-                  out_strides.inner_size,
-                  out_strides.inner_stride);
-            });
+        SYCL_DISPATCH_WEIGHT_MATCH_OR_FP32(input.scalar_type(), weight_.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
+          GemmaRMSNormKernelImplInternal<scalar_t, weight_t>(
+              input,
+              weight_,
+              M,
+              N,
+              static_cast<acc_type<scalar_t>>(eps),
+              output,
+              in_strides.batch_stride,
+              out_strides.batch_stride,
+              in_strides.inner_size,
+              in_strides.inner_stride,
+              out_strides.inner_size,
+              out_strides.inner_stride);
+        });
       });
 }
 
@@ -892,12 +890,8 @@ gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Te
 
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "GemmaFusedAddRMSNormKernelImpl", [&]() {
-        SYCL_DISPATCH_WEIGHT_TYPES(
-            at::ScalarType::Half,
-            at::ScalarType::BFloat16,
-            weight_.scalar_type(),
-            "GemmaFusedAddRMSNormKernelImpl",
-            [&]() {
+        SYCL_DISPATCH_WEIGHT_MATCH_OR_FP32(
+            input_.scalar_type(), weight_.scalar_type(), "GemmaFusedAddRMSNormKernelImpl", [&]() {
               GemmaFusedAddRMSNormKernelImplInternal<scalar_t, weight_t>(
                   input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), residual_);
             });

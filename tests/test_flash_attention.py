@@ -66,9 +66,7 @@ DISABLE_PACKGQA = True
 DISABLE_FP16 = True
 DISABLE_FP8 = True
 
-EXTENDED_KVCACHE_TESTS = (
-    os.getenv("FLASH_ATTENTION_KVCACHE_EXTENDED_TESTS") == "1"
-)
+EXTENDED_KVCACHE_TESTS = os.getenv("FLASH_ATTENTION_KVCACHE_EXTENDED_TESTS") == "1"
 KVCACHE_BATCH_SIZES = [5]
 KVCACHE_HEAD_CONFIGS = [(16, 16), (16, 4), (8, 1)]
 KVCACHE_SEQLEN_CONFIGS = [
@@ -159,9 +157,16 @@ if EXTENDED_KVCACHE_TESTS:
         ["e4m3", "e5m2"],
         ["scalar", "expanded"],
     )
-    for batch_size, heads, seqlens, d, page_size, causal, dtype_name, layout in (
-        fp8_common
-    ):
+    for (
+        batch_size,
+        heads,
+        seqlens,
+        d,
+        page_size,
+        causal,
+        dtype_name,
+        layout,
+    ) in fp8_common:
         FP8_KVCACHE_CROSS_MATRIX_CASES.append(
             (
                 batch_size,
@@ -2186,10 +2191,7 @@ def test_flash_attn_varlen_output(
 if EXTENDED_KVCACHE_TESTS:
 
     @pytest.mark.parametrize(
-        (
-            "nheads_q,nheads_kv,seqlen_q,seqlen_k,d,"
-            "causal,local,dtype_name"
-        ),
+        ("nheads_q,nheads_kv,seqlen_q,seqlen_k,d," "causal,local,dtype_name"),
         VARLEN_CROSS_MATRIX_CASES,
     )
     def test_flash_attn_varlen_cross_matrix(

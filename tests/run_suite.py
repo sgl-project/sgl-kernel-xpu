@@ -65,6 +65,7 @@ suites = {
         TestFile("test_embedding_lora_a_fwd.py"),
         TestFile("test_sgemm_lora_a_fwd.py"),
         TestFile("test_sgemm_lora_b_fwd.py"),
+        TestFile("test_qkv_lora_b_fwd.py"),
         TestFile("test_sconv_causal_conv1d.py"),
         TestFile("test_sconv_decode_metadata.py"),
         TestFile("test_sconv_extend_metadata.py"),

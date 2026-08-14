@@ -1153,6 +1153,20 @@ void sgemm_lora_b_fwd(
     const std::optional<torch::Tensor>& base_output  // [num_tokens, output_dim]
 );
 
+void qkv_lora_b_fwd(
+    torch::Tensor& output,                // [num_tokens, N_Q + 2N_{KV}]
+    const torch::Tensor& input_x,         // [num_tokens, 3*max_rank]
+    const torch::Tensor& qkv_lora_b,      // [num_loras, N_Q + 2N_{KV}, max_rank]
+    const torch::Tensor& output_offset,   // [4,]
+    const int64_t max_qkv_out_dim,        // max(output_q_dim, output_kv_dim)
+    const torch::Tensor& seg_indptr,      // [num_segments + 1,]
+    const torch::Tensor& weight_indices,  // [num_segments,]
+    const torch::Tensor& lora_ranks,      // [num_loras,]
+    const torch::Tensor& scalings,        // [num_loras,]
+    const std::optional<torch::Tensor>& seg_lens,    // [num_segments,]
+    const std::optional<torch::Tensor>& base_output  // [num_tokens, N_Q + 2N_{KV}]
+);
+
 /*
  * From GDN (Gated DeltaNet) attention (Intel Xe2)
  */

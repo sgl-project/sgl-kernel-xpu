@@ -108,7 +108,7 @@ if EXTENDED_KVCACHE_TESTS:
         [1, 5],
         cross_matrix_heads,
         cross_matrix_seqlens,
-        [64, 128, 256, 512],
+        [64, 96, 128, 192, 256, 512],
         [(False, False), (True, False)],
     )
     for batch_size, heads, seqlens, d, mask in cross_matrix_common:
@@ -121,16 +121,25 @@ if EXTENDED_KVCACHE_TESTS:
         KVCACHE_CROSS_MATRIX_CASES.append(
             (5, 8, 1, 513, 1024, cache_seqlen, 512, 128, True, False, "bf16")
         )
+    varlen_cross_matrix_seqlens = [
+        (seqlen_q, seqlen_k) for seqlen_q, seqlen_k, _ in cross_matrix_seqlens[::2]
+    ] + [
+        # Varlen has no page-size requirement. Exercise K tails explicitly.
+        (33, 127),
+        (65, 129),
+        (129, 255),
+        (257, 511),
+        (513, 1023),
+        (769, 1001),
+    ]
     for heads, seqlens, d, mask, dtype_name in itertools.product(
         [(16, 16), (2, 1), (8, 1), (16, 1)],
-        cross_matrix_seqlens[::2],
+        varlen_cross_matrix_seqlens,
         [64, 128, 256, 512],
         [(False, False), (True, False)],
         ["bf16", "fp16"],
     ):
-        VARLEN_CROSS_MATRIX_CASES.append(
-            (*heads, seqlens[0], seqlens[1], d, *mask, dtype_name)
-        )
+        VARLEN_CROSS_MATRIX_CASES.append((*heads, *seqlens, d, *mask, dtype_name))
     fp8_seqlens = [
         (1, 128, 1),
         (33, 128, 33),
@@ -153,7 +162,7 @@ if EXTENDED_KVCACHE_TESTS:
         fp8_seqlens,
         [64, 128, 256, 512],
         [64, 128],
-        [False, True],
+        [False],
         ["e4m3", "e5m2"],
         ["scalar", "expanded"],
     )
@@ -178,6 +187,19 @@ if EXTENDED_KVCACHE_TESTS:
                 dtype_name,
                 layout,
             )
+        )
+    fp8_causal_smoke = itertools.product(
+        # Cover the separate causal decode and prefill kernel paths without
+        # duplicating the full FP8 quantization/descale matrix.
+        [(1, 128, 1), (129, 256, 129)],
+        [256, 512],
+        [64, 128],
+        ["e4m3", "e5m2"],
+        ["scalar", "expanded"],
+    )
+    for seqlens, d, page_size, dtype_name, layout in fp8_causal_smoke:
+        FP8_KVCACHE_CROSS_MATRIX_CASES.append(
+            (1, 8, 1, *seqlens, d, page_size, True, dtype_name, layout)
         )
     for cache_seqlen in (639, 640, 641, 767, 768):
         FP8_KVCACHE_CROSS_MATRIX_CASES.append(

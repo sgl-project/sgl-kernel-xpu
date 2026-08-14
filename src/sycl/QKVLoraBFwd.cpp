@@ -57,14 +57,14 @@ namespace {
 
 //----------------- Per-(dtype, tile) dispatch macros --------------------//
 // QKV LoRA-B is a K-thin (rank 16..64), memory-bandwidth-bound grouped GEMM.
-// After trying different shapes, a single tall/thin 32x512 workgroup tile 
+// After trying different shapes, a single tall/thin 32x512 workgroup tile
 // fastest across the shape space, so tile selection currently has a single option (tall).
 // Add tiles to DISPATCH_QKV_LORA_B_FWD_TILE (and to QKVLoraBFwdXe20.cmake +
 // qkv_lora_b_fwd_dispatch.hpp + qkv_lora_b_fwd_types.hpp) with a runtime
 // heuristic picking the tag.
-#define DISPATCH_QKV_LORA_B_FWD_TILE(ELEM, ...)                                \
-  do {                                                                         \
-    qkv_lora_b_fwd_impl::launch_qkv_lora_b_fwd_##ELEM##_tall(__VA_ARGS__);      \
+#define DISPATCH_QKV_LORA_B_FWD_TILE(ELEM, ...)                            \
+  do {                                                                     \
+    qkv_lora_b_fwd_impl::launch_qkv_lora_b_fwd_##ELEM##_tall(__VA_ARGS__); \
   } while (0)
 #define DISPATCH_QKV_LORA_B_FWD_DTYPE(...)                                                                     \
   do {                                                                                                         \
@@ -150,7 +150,8 @@ SGL_KERNEL_EXPORT void qkv_lora_b_fwd(
     TORCH_CHECK(
         base_output->size(0) == num_tokens_i64 && base_output->size(1) == n_total_i64,
         "base_output must have shape (num_tokens, N_Q + 2 * N_KV)");
-    TORCH_CHECK(base_output->scalar_type() == qkv_lora_b.scalar_type(), "base_output dtype must match qkv_lora_b dtype");
+    TORCH_CHECK(
+        base_output->scalar_type() == qkv_lora_b.scalar_type(), "base_output dtype must match qkv_lora_b dtype");
   }
 
   // output_offset defines the q/k/v output-column bands: [0, N_Q, N_Q + N_KV,
@@ -162,8 +163,7 @@ SGL_KERNEL_EXPORT void qkv_lora_b_fwd(
   const int32_t* oo = oo_cpu.data_ptr<int32_t>();
   TORCH_CHECK(oo[0] == 0, "output_offset[0] must be 0");
   TORCH_CHECK(oo[3] == n_total_i64, "output_offset[-1] must equal qkv_lora_b.size(1) (N_Q + 2 * N_KV)");
-  TORCH_CHECK(
-      oo[0] <= oo[1] && oo[1] <= oo[2] && oo[2] <= oo[3], "output_offset must be non-decreasing");
+  TORCH_CHECK(oo[0] <= oo[1] && oo[1] <= oo[2] && oo[2] <= oo[3], "output_offset must be non-decreasing");
   const int64_t widest = std::max({oo[1] - oo[0], oo[2] - oo[1], oo[3] - oo[2]});
   TORCH_CHECK(
       max_qkv_out_dim == widest,
@@ -207,8 +207,8 @@ SGL_KERNEL_EXPORT void qkv_lora_b_fwd(
       weight_indices.scalar_type() == torch::kInt32 ? weight_indices : weight_indices.to(torch::kInt32);
   auto scalings_f32 = scalings.scalar_type() == torch::kFloat32 ? scalings : scalings.to(torch::kFloat32);
   // Keep output_offset_i32 on-device for the metadata kernel.
-  output_offset_i32 = output_offset_i32.device() == input_x.device() ? output_offset_i32
-                                                                      : output_offset_i32.to(input_x.device());
+  output_offset_i32 =
+      output_offset_i32.device() == input_x.device() ? output_offset_i32 : output_offset_i32.to(input_x.device());
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();

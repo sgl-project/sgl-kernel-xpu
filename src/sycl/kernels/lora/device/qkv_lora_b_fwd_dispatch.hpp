@@ -56,8 +56,8 @@ namespace qkv_lora_b_fwd_impl {
 
 // Each function is defined in a separate generated .cpp file from
 // qkv_lora_b_fwd_kernel.cpp.in, compiled as its own library.
-#define DECLARE_QKV_LORA_B_FWD_LAUNCH(ELEM, TILE)     \
-  void launch_qkv_lora_b_fwd_##ELEM##_##TILE(         \
+#define DECLARE_QKV_LORA_B_FWD_LAUNCH(ELEM, TILE)      \
+  void launch_qkv_lora_b_fwd_##ELEM##_##TILE(          \
       const torch::Tensor& input_x,                    \
       const torch::Tensor& qkv_lora_b,                 \
       const torch::Tensor& output_offset_i32,          \

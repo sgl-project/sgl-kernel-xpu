@@ -117,9 +117,9 @@ struct BuildGroupedGemmMetaKernel {
   int K;                          // reduction dim
   int64_t elem_bytes;
   int num_segments;
-  int n_slices;              // projections packed per segment (1 = plain)
-  int64_t a_row_stride;      // leading dim of A (K when unsliced, n_slices*K for packed B-fwd)
-  int64_t a_slice_stride;    // per-slice column advance in A (0 when A is shared, K for packed B-fwd)
+  int n_slices;            // projections packed per segment (1 = plain)
+  int64_t a_row_stride;    // leading dim of A (K when unsliced, n_slices*K for packed B-fwd)
+  int64_t a_slice_stride;  // per-slice column advance in A (0 when A is shared, K for packed B-fwd)
 
   void operator()(sycl::nd_item<1> item) const {
     const int g = static_cast<int>(item.get_global_linear_id());
@@ -198,7 +198,7 @@ inline GroupedGemmMeta build_grouped_gemm_meta(
     const int64_t elem_bytes,
     const at::Device device,
     sycl::queue& queue,
-    const std::optional<torch::Tensor>& scalings = std::nullopt,        // float32 [num_loras], or nullopt (A-fwd)
+    const std::optional<torch::Tensor>& scalings = std::nullopt,           // float32 [num_loras], or nullopt (A-fwd)
     const std::optional<torch::Tensor>& output_offset_i32 = std::nullopt,  // int32 [n_slices + 1], or nullopt (1 slice)
     const int n_slices = 1,
     const int64_t a_row_stride = 0,   // leading dim of A; 0 -> default K (single-slice A)

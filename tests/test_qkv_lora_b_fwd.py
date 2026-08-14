@@ -611,7 +611,9 @@ def _make_valid_kwargs():
     num_loras = 1
 
     return dict(
-        input_x=torch.randn(num_tokens, 3 * max_rank, dtype=torch.float16, device="xpu"),
+        input_x=torch.randn(
+            num_tokens, 3 * max_rank, dtype=torch.float16, device="xpu"
+        ),
         qkv_lora_b=torch.randn(
             num_loras, n_total, max_rank, dtype=torch.float16, device="xpu"
         ),

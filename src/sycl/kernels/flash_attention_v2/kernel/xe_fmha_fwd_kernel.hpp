@@ -1115,6 +1115,7 @@ class XeFMHAFwdSplitKVKernel {
     // a host-side D2H sync (tensor.item()). Null => non-fp8 KV (scale = 1.0f).
     const float* scale_k_ptr = nullptr;
     const float* scale_v_ptr = nullptr;
+    int min_blocks_for_split = 2;
   };
   using KernelParams = KernelArguments;
 
@@ -1273,8 +1274,7 @@ class XeFMHAFwdSplitKVKernel {
       // Per-sequence split decision: short sequences are treated as
       // single-split even when num_kv_splits > 1, avoiding precision
       // loss from the split-reduce roundtrip.
-      constexpr int kMinBlocksForSplit = 128;
-      bool is_single_split = (num_kv_splits > 1) && (windowed_k_blocks < kMinBlocksForSplit);
+      bool is_single_split = (num_kv_splits > 1) && (windowed_k_blocks < p.min_blocks_for_split);
 
       int kv_split_offset;
       int num_effective_kv_blocks;

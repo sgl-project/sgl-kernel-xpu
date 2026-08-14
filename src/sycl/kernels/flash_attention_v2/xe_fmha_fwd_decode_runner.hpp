@@ -447,13 +447,16 @@ struct SplitDecodeKernelRunner {
       shape_init.seq_len_qo = params.total_q;
       shape_init.seq_len_kv = params.total_k;
 
-      shape.seq_len_qo = cutlass::fmha::collective::VariableLength{params.seqlen_q};
-      shape.seq_len_qo.cumulative_length = reinterpret_cast<int*>(params.cu_seqlens_q);
-      shape.seq_len_kv = cutlass::fmha::collective::VariableLength{params.seqlen_k};
-      shape.seq_len_kv.cumulative_length = reinterpret_cast<int*>(params.cu_seqlens_k);
+      shape.seq_len_qo = cutlass::fmha::collective::VariableLength{
+          params.seqlen_q, params.total_q, reinterpret_cast<int*>(params.cu_seqlens_q)};
+      shape.seq_len_kv = cutlass::fmha::collective::VariableLength{
+          params.seqlen_k, params.total_k, reinterpret_cast<int*>(params.cu_seqlens_k)};
+      shape.seq_len_kv_cache = cutlass::fmha::collective::VariableLength{
+          params.seqlen_k, params.total_k, reinterpret_cast<int*>(params.cu_seqlens_k)};
     } else {
       shape.seq_len_qo = shape_init.seq_len_qo = params.seqlen_q;
       shape.seq_len_kv = shape_init.seq_len_kv = params.seqlen_k;
+      shape.seq_len_kv_cache = shape_init.seq_len_kv_cache = params.seqlen_k;
     }
 
     auto seq_len_qo = shape_init.seq_len_qo;
@@ -573,6 +576,16 @@ struct SplitDecodeKernelRunner {
     torch::Tensor workspace = torch::empty(
         {static_cast<int64_t>(workspace_size + reduce_workspace_size)}, torch::device(torch::kXPU).dtype(torch::kByte));
     uint8_t* workspace_ptr = static_cast<uint8_t*>(workspace.data_ptr());
+
+    TORCH_CHECK(
+        params.num_kv_splits <= FMHAKernel::max_num_kv_splits,
+        "num_splits (",
+        params.num_kv_splits,
+        ") exceeds the maximum the split-KV decode kernel supports for page_size ",
+        params.page_size,
+        " (",
+        int(FMHAKernel::max_num_kv_splits),
+        ")");
 
     if (!FMHAKernel::can_implement(arguments)) {
       // std::cout << "Invalid Problem Size: " << params.batch_size << 'x'

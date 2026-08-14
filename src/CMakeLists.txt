@@ -70,6 +70,12 @@ if(USE_MLA AND USE_JIT)
     # Route the MLA decode dispatch (mla_decode.cpp) through the runtime-JIT path.
     add_compile_definitions(USE_MLA_JIT)
 endif()
+if(USE_FMHA AND USE_JIT)
+    # Route the GDN chunk delta-rule dispatch (chunk_gated_delta_rule) through the
+    # runtime-JIT path; its per-dtype kernel_launcher instances are not compiled
+    # ahead of time (GDN shares the USE_FMHA toggle).
+    add_compile_definitions(USE_GDN_JIT)
+endif()
 if(USE_MLA)
     add_compile_definitions(USE_MLA)
 endif()

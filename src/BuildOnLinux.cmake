@@ -11,7 +11,8 @@ if(USE_JIT)
     ${SGL_OPS_XPU_ROOT}/src/jit/sycl_template_jit.cpp
     ${SGL_OPS_XPU_ROOT}/src/jit/fmha_jit.cpp
     ${SGL_OPS_XPU_ROOT}/src/jit/moe_jit.cpp
-    ${SGL_OPS_XPU_ROOT}/src/jit/mla_jit.cpp)
+    ${SGL_OPS_XPU_ROOT}/src/jit/mla_jit.cpp
+    ${SGL_OPS_XPU_ROOT}/src/jit/gdn_jit.cpp)
   set_target_properties(sgl_jit PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_include_directories(sgl_jit PUBLIC ${SGL_OPS_XPU_ROOT}/src)
   target_compile_features(sgl_jit PRIVATE cxx_std_17)
@@ -201,6 +202,10 @@ endif()
 # The W4A16 grouped GEMM dispatch in GroupGemmW4A16Xe20.cpp calls the JIT engine.
 if(USE_MOE AND USE_JIT AND TARGET sgl-ops-sycl-GroupGemmW4A16Xe20)
   target_link_libraries(sgl-ops-sycl-GroupGemmW4A16Xe20 PRIVATE sgl_jit)
+endif()
+# The GDN chunk delta-rule dispatch (chunk_gated_delta_rule.cpp) calls the JIT engine.
+if(USE_FMHA AND USE_JIT AND TARGET sgl-ops-sycl-chunk_gated_delta_rule)
+  target_link_libraries(sgl-ops-sycl-chunk_gated_delta_rule PRIVATE sgl_jit)
 endif()
 
 set(SYCL_LINK_LIBRARIES_KEYWORD)

@@ -310,71 +310,6 @@ inline int64_t choose_n_splits(int64_t t, int64_t hc_hidden, int64_t n_splits_hi
   return choose_large_batch_n_splits(t, hc_hidden);
 }
 
-void mhc_fused_post_pre_fma_kernel(
-    const at::Tensor& x,
-    const at::Tensor& residual,
-    const at::Tensor& post_layer_mix_2d,
-    const at::Tensor& comb_res_mix_3d,
-    const at::Tensor& fn,
-    at::Tensor& residual_out,
-    at::Tensor& mixes_partial_out,
-    at::Tensor& sqrsum_partial_out,
-    int64_t split_k) {
-  using bf16_t = sycl::ext::oneapi::bfloat16;
-
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16, "x must be bfloat16");
-  TORCH_CHECK(residual.scalar_type() == at::kBFloat16, "residual must be bfloat16");
-  TORCH_CHECK(post_layer_mix_2d.scalar_type() == at::kFloat, "post_layer_mix must be float32");
-  TORCH_CHECK(comb_res_mix_3d.scalar_type() == at::kFloat, "comb_res_mix must be float32");
-  TORCH_CHECK(fn.scalar_type() == at::kFloat, "fn must be float32");
-  TORCH_CHECK(residual_out.scalar_type() == at::kBFloat16, "residual_out must be bfloat16");
-  TORCH_CHECK(mixes_partial_out.scalar_type() == at::kFloat, "mixes_partial_out must be float32");
-  TORCH_CHECK(sqrsum_partial_out.scalar_type() == at::kFloat, "sqrsum_partial_out must be float32");
-
-  const int64_t T = x.size(0);
-  const int64_t D = x.size(1);
-
-  TORCH_CHECK(
-      residual.size(0) == T && residual.size(1) == SMALL_BATCH_HC && residual.size(2) == D,
-      "residual shape mismatch in small-batch fused kernel");
-  TORCH_CHECK(
-      post_layer_mix_2d.size(0) == T && post_layer_mix_2d.size(1) == SMALL_BATCH_HC, "post_layer_mix shape mismatch");
-  TORCH_CHECK(
-      comb_res_mix_3d.size(0) == T && comb_res_mix_3d.size(1) == SMALL_BATCH_HC &&
-          comb_res_mix_3d.size(2) == SMALL_BATCH_HC,
-      "comb_res_mix shape mismatch");
-  TORCH_CHECK(fn.dim() == 2 && fn.size(0) == SMALL_BATCH_HC3 && fn.size(1) == SMALL_BATCH_HC * D, "fn shape mismatch");
-  TORCH_CHECK(residual_out.sizes() == residual.sizes(), "residual_out shape mismatch");
-  TORCH_CHECK(
-      mixes_partial_out.dim() == 3 && mixes_partial_out.size(0) == split_k && mixes_partial_out.size(1) == T &&
-          mixes_partial_out.size(2) == SMALL_BATCH_HC3,
-      "mixes_partial_out shape mismatch");
-  TORCH_CHECK(
-      sqrsum_partial_out.dim() == 2 && sqrsum_partial_out.size(0) == split_k && sqrsum_partial_out.size(1) == T,
-      "sqrsum_partial_out shape mismatch");
-
-  if (T == 0 || split_k == 0) return;
-
-  auto q = dpcppGetCurrentQueue();
-
-  MHCFusedPostPreFmaKernel ker(
-      reinterpret_cast<const bf16_t*>(x.data_ptr<at::BFloat16>()),
-      reinterpret_cast<const bf16_t*>(residual.data_ptr<at::BFloat16>()),
-      post_layer_mix_2d.data_ptr<float>(),
-      comb_res_mix_3d.data_ptr<float>(),
-      fn.data_ptr<float>(),
-      reinterpret_cast<bf16_t*>(residual_out.data_ptr<at::BFloat16>()),
-      mixes_partial_out.data_ptr<float>(),
-      sqrsum_partial_out.data_ptr<float>(),
-      static_cast<int>(T),
-      static_cast<int>(D),
-      static_cast<int>(split_k));
-
-  sycl::range<2> global(static_cast<size_t>(T) * SMALL_BATCH_WG_SIZE, static_cast<size_t>(split_k));
-  sycl::range<2> local(SMALL_BATCH_WG_SIZE, 1);
-  sycl_kernel_submit(global, local, q, ker);
-}
-
 }  // namespace
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> SGL_KERNEL_EXPORT mhc_fused_post_pre_fma(
@@ -435,8 +370,29 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> SGL_KERNEL_EXPORT mhc_fused_post_
   at::Tensor gemm_out_sqrsum = at::empty({n_splits_pre, t}, residual.options().dtype(at::kFloat));
 
   if (t > 0) {
-    mhc_fused_post_pre_fma_kernel(
-        x, residual, post_2d, comb_3d, fn, residual_cur, gemm_out_mul, gemm_out_sqrsum, n_splits_pre);
+    using bf16_t = sycl::ext::oneapi::bfloat16;
+
+    TORCH_CHECK(residual_cur.scalar_type() == at::kBFloat16, "residual_cur must be bfloat16");
+    TORCH_CHECK(gemm_out_mul.scalar_type() == at::kFloat, "gemm_out_mul must be float32");
+    TORCH_CHECK(gemm_out_sqrsum.scalar_type() == at::kFloat, "gemm_out_sqrsum must be float32");
+
+    auto q = dpcppGetCurrentQueue();
+    MHCFusedPostPreFmaKernel ker(
+        reinterpret_cast<const bf16_t*>(x.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const bf16_t*>(residual.data_ptr<at::BFloat16>()),
+        post_2d.data_ptr<float>(),
+        comb_3d.data_ptr<float>(),
+        fn.data_ptr<float>(),
+        reinterpret_cast<bf16_t*>(residual_cur.data_ptr<at::BFloat16>()),
+        gemm_out_mul.data_ptr<float>(),
+        gemm_out_sqrsum.data_ptr<float>(),
+        static_cast<int>(t),
+        static_cast<int>(hidden_size),
+        static_cast<int>(n_splits_pre));
+
+    sycl::range<2> global(static_cast<size_t>(t) * SMALL_BATCH_WG_SIZE, static_cast<size_t>(n_splits_pre));
+    sycl::range<2> local(SMALL_BATCH_WG_SIZE, 1);
+    sycl_kernel_submit(global, local, q, ker);
   }
 
   return {residual_cur, gemm_out_mul, gemm_out_sqrsum};

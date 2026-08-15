@@ -2,9 +2,9 @@ from typing import Optional
 
 import torch
 
-XPU_FUSED_FALLBACK_HIDDEN_SIZE = 7168
-XPU_FUSED_FALLBACK_TOKENS = 32
-XPU_SMALL_BATCH_TOKENS = 32
+# Keep only the CUDA-side baseline threshold; XPU should not add its own
+# fallback tuning knobs unless we have evidence they are necessary.
+XPU_SMALL_BATCH_TOKENS = 32  # token_count > 32 => treat as larger-batch path
 
 
 def _choose_small_batch_splits(num_tokens: int, n_splits_hint: int) -> int:
@@ -292,10 +292,7 @@ def mhc_fused_post_pre(
     post_2d = (
         post_layer_mix.squeeze(-1) if post_layer_mix.dim() == 3 else post_layer_mix
     )
-    use_split_path = (
-        hidden_size >= XPU_FUSED_FALLBACK_HIDDEN_SIZE
-        and num_tokens >= XPU_FUSED_FALLBACK_TOKENS
-    ) or num_tokens > XPU_SMALL_BATCH_TOKENS
+    use_split_path = num_tokens > XPU_SMALL_BATCH_TOKENS
 
     if use_split_path:
         residual_cur = hc_post(x, residual, post_2d, comb_res_mix)

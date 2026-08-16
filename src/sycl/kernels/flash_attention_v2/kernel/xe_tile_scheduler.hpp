@@ -36,6 +36,8 @@
 #include "cutlass/fast_math.h"
 #include "cutlass/kernel_hardware_info.h"
 
+constexpr int kReduceSplitKDimTile = 16;
+
 namespace cutlass::fmha::kernel {
 
 struct XeFHMAIndividualTileScheduler {
@@ -178,10 +180,13 @@ struct XeFHMAIndividualPersistentTileScheduler {
 };
 
 struct XeReduceSplitKTileScheduler {
+  static constexpr int kDimTile = kReduceSplitKDimTile;
+
   struct Params {
     dim3 grid;
     FastDivmod divmod_num_heads;
     int num_kv_splits = -1;
+    FastDivmod divmod_dim_tiles;
   };
 
   bool valid_ = true;
@@ -198,8 +203,9 @@ struct XeReduceSplitKTileScheduler {
       const int& num_kv_splits = -1) {
     using namespace cute;
 
-    dim3 grid(shape.seq_len_qo, shape.num_heads_q, shape.batch);
-    return Params{grid, {shape.num_heads_q}, num_kv_splits};
+    int const dim_tiles = ceil_div(shape.head_size_vo, kDimTile);
+    dim3 grid(shape.seq_len_qo * dim_tiles, shape.num_heads_q, shape.batch);
+    return Params{grid, {shape.num_heads_q}, num_kv_splits, {dim_tiles}};
   }
 
   template <int Num_SGs>
@@ -216,7 +222,9 @@ struct XeReduceSplitKTileScheduler {
   auto get_block_coord() {
     using namespace cute;
 
-    return make_coord(BlockIdxX(), BlockIdxY(), BlockIdxZ());
+    int seq_idx, dim_tile;
+    params.divmod_dim_tiles(seq_idx, dim_tile, int(BlockIdxX()));
+    return make_coord(seq_idx, BlockIdxY(), BlockIdxZ(), dim_tile);
   }
 
   CUTLASS_DEVICE

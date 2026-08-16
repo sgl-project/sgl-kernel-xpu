@@ -4,7 +4,8 @@ set(GROUP_GEMM_W4A16_XE20_INST_SRCS)
 file(MAKE_DIRECTORY ${GROUP_GEMM_W4A16_XE20_GEN_DIR})
 
 # Generate one translation unit per (policy, ElementS, ElementA) combo.
-# For int4, ELEMENT_S matches ELEMENT_A; for mxfp4 it is uint8_t (E8M0).
+# For int4, ELEMENT_S matches ELEMENT_A. For mxfp4, both accepted tensor
+# dtypes share the same E8M0 byte encoding, which the kernel reads as uint8_t.
 function(add_group_gemm_w4a16_xe20_inst POLICY ELEMENT_S ELEMENT_A SANITIZED)
     set(GEN_SRC
         "${GROUP_GEMM_W4A16_XE20_GEN_DIR}/GroupGemmW4A16Xe20_inst_${POLICY}_${SANITIZED}.cpp")
@@ -30,7 +31,7 @@ foreach(policy w4a16_policy_m_8 w4a16_policy_m_16 w4a16_policy_m_32 w4a16_policy
         endif()
         # int4: scale and activation use the same dtype.
         add_group_gemm_w4a16_xe20_inst(${policy} "${element_a}" "${element_a}" "int4_${act_tag}")
-        # mxfp4: scale is a uint8 E8M0 exponent.
+        # mxfp4: read the raw E8M0 byte from uint8 or float8_e8m0fnu tensors.
         add_group_gemm_w4a16_xe20_inst(${policy} "uint8_t" "${element_a}" "mxfp4_${act_tag}")
     endforeach()
 endforeach()

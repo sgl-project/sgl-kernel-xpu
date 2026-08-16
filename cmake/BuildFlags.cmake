@@ -24,6 +24,7 @@ endfunction()
 
 # Support GCC on Linux.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  message(STATUS "sgl-kernel-xpu build type: ${CMAKE_BUILD_TYPE}")
   set(SYCL_HOST_FLAGS)
   set(SYCL_KERNEL_OPTIONS)
   set(SYCL_COMPILE_FLAGS ${SYCL_FLAGS})
@@ -88,7 +89,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   if(CMAKE_BUILD_TYPE MATCHES Debug)
     set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -g -O0 -Rno-debug-disables-optimization)
   elseif(CMAKE_BUILD_TYPE MATCHES RelWithDebInfo)
-    set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -gline-tables-only -O2)
+    set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -g -fdebug-info-for-profiling -O2)
   endif()
 
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -D__INTEL_LLVM_COMPILER_VERSION=${__INTEL_LLVM_COMPILER})

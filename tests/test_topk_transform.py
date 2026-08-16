@@ -511,8 +511,8 @@ def test_topk_transform_512(
 # (bs, length) rows all satisfy length <= topk for every topk in {512, 1024, 2048},
 # so every row exercises the naive page-map path.
 _TRIVIAL_CONFIGS = [
-    (1, 1),      # single row, minimum length
-    (8, 64),     # small, uniform
+    (1, 1),  # single row, minimum length
+    (8, 64),  # small, uniform
     (16, 256),
     (132, 511),  # just under smallest topk
 ]

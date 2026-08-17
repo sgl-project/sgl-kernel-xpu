@@ -26,8 +26,8 @@ DEVICE = "xpu"
 
 
 def _ref_topk_block_ids(
-    score: torch.Tensor,       # [H, B, S] fp32
-    seq_lens: torch.Tensor,    # [B]
+    score: torch.Tensor,  # [H, B, S] fp32
+    seq_lens: torch.Tensor,  # [B]
     block_size: int,
     topk: int,
 ) -> torch.Tensor:
@@ -58,10 +58,10 @@ def _ref_topk_block_ids(
 
 
 def _ref_page_table(
-    score: torch.Tensor,        # [num_kv_heads, B, S] fp32
-    seq_lens: torch.Tensor,     # [B]
-    req_to_token: torch.Tensor, # [max_reqs, max_kv_len] int32
-    slot_ids: torch.Tensor,     # [B] int64
+    score: torch.Tensor,  # [num_kv_heads, B, S] fp32
+    seq_lens: torch.Tensor,  # [B]
+    req_to_token: torch.Tensor,  # [max_reqs, max_kv_len] int32
+    slot_ids: torch.Tensor,  # [B] int64
     block_size: int,
     topk: int,
     page_size: int,
@@ -107,12 +107,11 @@ def _ref_page_table(
             real_seq_lens[out_row] = eff_kv
             k_eff = selected.shape[0]
             offsets = (
-                torch.arange(ppb, dtype=torch.int64, device=score.device)
-                * page_size
+                torch.arange(ppb, dtype=torch.int64, device=score.device) * page_size
             )
-            tok = (
-                selected[:, None] * block_size + offsets[None, :]
-            ).clamp(max=max_kv_len - 1)
+            tok = (selected[:, None] * block_size + offsets[None, :]).clamp(
+                max=max_kv_len - 1
+            )
             pages = r2t_row[tok] // page_size * num_heads + h
             pages_flat = pages.reshape(-1).to(torch.int32)
             total = k_eff * ppb
@@ -153,9 +152,7 @@ def _assert_topk_matches(
     for b in range(batch):
         # Clamp to max_seqblock: kernel and reference both stop at the
         # materialized score columns, so k_eff must too.
-        num_blocks = min(
-            (seq_lens_l[b] + block_size - 1) // block_size, max_seqblock
-        )
+        num_blocks = min((seq_lens_l[b] + block_size - 1) // block_size, max_seqblock)
         k_eff = min(topk, num_blocks)
         for h in range(num_heads):
             kernel_set = set(kernel_out[h, b, :k_eff].tolist())
@@ -168,7 +165,6 @@ def _assert_topk_matches(
                 assert (
                     (kernel_out[h, b, k_eff:] == -1).all().item()
                 ), f"padding not -1 at (h={h}, b={b}): {kernel_out[h, b, k_eff:].tolist()}"
-
 
 
 @pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
@@ -274,18 +270,13 @@ class TestMinimaxDecodeTopKBlockId:
         score, seq_lens = _build_topk_inputs(
             num_heads, batch, max_seqblock, seq_lens_list, seed=7
         )
-        out = torch.empty(
-            (num_heads, batch, topk), dtype=torch.int32, device=DEVICE
-        )
-        kernel_out = minimax_decode_topk(
-            score, seq_lens, block_size, topk, out=out
-        )
+        out = torch.empty((num_heads, batch, topk), dtype=torch.int32, device=DEVICE)
+        kernel_out = minimax_decode_topk(score, seq_lens, block_size, topk, out=out)
         assert kernel_out.data_ptr() == out.data_ptr()
         ref_out = _ref_topk_block_ids(score, seq_lens, block_size, topk)
         _assert_topk_matches(
             kernel_out, ref_out, seq_lens, block_size, topk, max_seqblock
         )
-
 
 
 def _build_page_table_inputs(
@@ -298,9 +289,7 @@ def _build_page_table_inputs(
     contiguous_r2t: bool = True,
     seq_dtype: torch.dtype = torch.int32,
     seed: int = 0,
-) -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     torch.manual_seed(seed)
     score = torch.randn(
         (num_heads, batch, max_seqblock), dtype=torch.float32, device=DEVICE
@@ -310,9 +299,7 @@ def _build_page_table_inputs(
     max_reqs = batch
     slot_ids = torch.arange(batch, dtype=torch.int64, device=DEVICE)
     if contiguous_r2t:
-        base = (
-            torch.arange(batch, dtype=torch.int32, device=DEVICE) * max_kv_len
-        )
+        base = torch.arange(batch, dtype=torch.int32, device=DEVICE) * max_kv_len
         req_to_token = (
             base[:, None]
             + torch.arange(max_kv_len, dtype=torch.int32, device=DEVICE)[None, :]
@@ -343,12 +330,22 @@ class TestMinimaxDecodeTopKPageTable:
             num_heads, batch, max_seqblock, seq_lens_list, max_kv_len, seed=11
         )
         pt_kernel, sl_kernel = minimax_decode_topk_page_table(
-            score, seq_lens, req_to_token, slot_ids,
-            block_size, topk, page_size,
+            score,
+            seq_lens,
+            req_to_token,
+            slot_ids,
+            block_size,
+            topk,
+            page_size,
         )
         pt_ref, sl_ref = _ref_page_table(
-            score, seq_lens, req_to_token, slot_ids,
-            block_size, topk, page_size,
+            score,
+            seq_lens,
+            req_to_token,
+            slot_ids,
+            block_size,
+            topk,
+            page_size,
         )
         # Trivial-row real_seq_lens is deterministic: block-set is identity so
         # ordering matches -> compare exactly.
@@ -379,12 +376,22 @@ class TestMinimaxDecodeTopKPageTable:
             num_heads, batch, max_seqblock, seq_lens_list, max_kv_len, seed=12
         )
         pt_kernel, sl_kernel = minimax_decode_topk_page_table(
-            score, seq_lens, req_to_token, slot_ids,
-            block_size, topk, page_size,
+            score,
+            seq_lens,
+            req_to_token,
+            slot_ids,
+            block_size,
+            topk,
+            page_size,
         )
         pt_ref, sl_ref = _ref_page_table(
-            score, seq_lens, req_to_token, slot_ids,
-            block_size, topk, page_size,
+            score,
+            seq_lens,
+            req_to_token,
+            slot_ids,
+            block_size,
+            topk,
+            page_size,
         )
         # real_seq_lens depends only on the *set* of selected blocks: same set
         # -> same total. Kernel tie-break may differ from reference tie-break
@@ -406,12 +413,22 @@ class TestMinimaxDecodeTopKPageTable:
             num_heads, batch, max_seqblock, seq_lens_list, max_kv_len, seed=13
         )
         pt_kernel, sl_kernel = minimax_decode_topk_page_table(
-            score, seq_lens, req_to_token, slot_ids,
-            block_size, topk, page_size,
+            score,
+            seq_lens,
+            req_to_token,
+            slot_ids,
+            block_size,
+            topk,
+            page_size,
         )
         pt_ref, sl_ref = _ref_page_table(
-            score, seq_lens, req_to_token, slot_ids,
-            block_size, topk, page_size,
+            score,
+            seq_lens,
+            req_to_token,
+            slot_ids,
+            block_size,
+            topk,
+            page_size,
         )
         assert torch.equal(sl_kernel, sl_ref)
         assert torch.equal(pt_kernel, pt_ref)
@@ -424,16 +441,31 @@ class TestMinimaxDecodeTopKPageTable:
         seq_lens_list = [block_size * 100, block_size * 128, block_size * 90]
         max_kv_len = max_seqblock * block_size
         score, seq_lens, req_to_token, slot_ids = _build_page_table_inputs(
-            num_heads, batch, max_seqblock, seq_lens_list, max_kv_len,
-            contiguous_r2t=False, seed=14,
+            num_heads,
+            batch,
+            max_seqblock,
+            seq_lens_list,
+            max_kv_len,
+            contiguous_r2t=False,
+            seed=14,
         )
         pt_kernel, sl_kernel = minimax_decode_topk_page_table(
-            score, seq_lens, req_to_token, slot_ids,
-            block_size, topk, page_size,
+            score,
+            seq_lens,
+            req_to_token,
+            slot_ids,
+            block_size,
+            topk,
+            page_size,
         )
         pt_ref, sl_ref = _ref_page_table(
-            score, seq_lens, req_to_token, slot_ids,
-            block_size, topk, page_size,
+            score,
+            seq_lens,
+            req_to_token,
+            slot_ids,
+            block_size,
+            topk,
+            page_size,
         )
         assert torch.equal(sl_kernel, sl_ref)
         assert torch.equal(pt_kernel, pt_ref)
@@ -449,12 +481,22 @@ class TestMinimaxDecodeTopKPageTable:
             num_heads, batch, max_seqblock, seq_lens_list, max_kv_len, seed=15
         )
         pt_kernel, sl_kernel = minimax_decode_topk_page_table(
-            score, seq_lens, req_to_token, slot_ids,
-            block_size, topk, page_size,
+            score,
+            seq_lens,
+            req_to_token,
+            slot_ids,
+            block_size,
+            topk,
+            page_size,
         )
         pt_ref, sl_ref = _ref_page_table(
-            score, seq_lens, req_to_token, slot_ids,
-            block_size, topk, page_size,
+            score,
+            seq_lens,
+            req_to_token,
+            slot_ids,
+            block_size,
+            topk,
+            page_size,
         )
         assert torch.equal(sl_kernel, sl_ref)
         assert torch.equal(pt_kernel, pt_ref)
@@ -467,16 +509,31 @@ class TestMinimaxDecodeTopKPageTable:
         seq_lens_list = [block_size * 200, block_size * 240]
         max_kv_len = max_seqblock * block_size
         score, seq_lens, req_to_token, slot_ids = _build_page_table_inputs(
-            num_heads, batch, max_seqblock, seq_lens_list, max_kv_len,
-            seq_dtype=torch.int64, seed=16,
+            num_heads,
+            batch,
+            max_seqblock,
+            seq_lens_list,
+            max_kv_len,
+            seq_dtype=torch.int64,
+            seed=16,
         )
         pt_kernel, sl_kernel = minimax_decode_topk_page_table(
-            score, seq_lens, req_to_token, slot_ids,
-            block_size, topk, page_size,
+            score,
+            seq_lens,
+            req_to_token,
+            slot_ids,
+            block_size,
+            topk,
+            page_size,
         )
         pt_ref, sl_ref = _ref_page_table(
-            score, seq_lens, req_to_token, slot_ids,
-            block_size, topk, page_size,
+            score,
+            seq_lens,
+            req_to_token,
+            slot_ids,
+            block_size,
+            topk,
+            page_size,
         )
         assert torch.equal(sl_kernel, sl_ref)
         assert torch.equal(pt_kernel, pt_ref)
@@ -491,8 +548,13 @@ class TestMinimaxDecodeTopKPageTable:
         seq_lens_list = [block_size * 100, block_size * 128, block_size * 90]
         max_kv_len = max_seqblock * block_size
         score, seq_lens, req_to_token, slot_ids = _build_page_table_inputs(
-            num_heads, batch, max_seqblock, seq_lens_list, max_kv_len,
-            contiguous_r2t=False, seed=17,
+            num_heads,
+            batch,
+            max_seqblock,
+            seq_lens_list,
+            max_kv_len,
+            contiguous_r2t=False,
+            seed=17,
         )
         max_reqs = req_to_token.shape[0]
         # Shift every slot out of range by a multiple of max_reqs; wrapping
@@ -503,12 +565,22 @@ class TestMinimaxDecodeTopKPageTable:
         ), "test inputs must actually be out of range"
 
         pt_shifted, sl_shifted = minimax_decode_topk_page_table(
-            score, seq_lens, req_to_token, shifted,
-            block_size, topk, page_size,
+            score,
+            seq_lens,
+            req_to_token,
+            shifted,
+            block_size,
+            topk,
+            page_size,
         )
         pt_ref, sl_ref = _ref_page_table(
-            score, seq_lens, req_to_token, slot_ids,
-            block_size, topk, page_size,
+            score,
+            seq_lens,
+            req_to_token,
+            slot_ids,
+            block_size,
+            topk,
+            page_size,
         )
         assert torch.equal(sl_shifted, sl_ref)
         assert torch.equal(pt_shifted, pt_ref)

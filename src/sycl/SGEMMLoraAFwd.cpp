@@ -93,6 +93,16 @@ SGL_KERNEL_EXPORT void sgemm_lora_a_fwd(
   CHECK_INPUT(lora_ranks);
   CHECK_INPUT(output);
 
+  const auto dev = input_x.device();
+  TORCH_CHECK(weights.device() == dev, "weights must be on the same device as input_x");
+  TORCH_CHECK(seg_indptr.device() == dev, "seg_indptr must be on the same device as input_x");
+  TORCH_CHECK(weight_indices.device() == dev, "weight_indices must be on the same device as input_x");
+  TORCH_CHECK(lora_ranks.device() == dev, "lora_ranks must be on the same device as input_x");
+  TORCH_CHECK(output.device() == dev, "output must be on the same device as input_x");
+  if (seg_lens.has_value()) {
+    TORCH_CHECK(seg_lens->device() == dev, "seg_lens must be on the same device as input_x");
+  }
+
   TORCH_CHECK(input_x.dim() == 2, "input_x must be a 2D tensor");
   TORCH_CHECK(weights.dim() == 3, "weights must be a 3D tensor");
   TORCH_CHECK(seg_indptr.dim() == 1, "seg_indptr must be a 1D tensor");

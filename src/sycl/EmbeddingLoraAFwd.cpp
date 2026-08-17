@@ -238,6 +238,19 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
     CHECK_INPUT(extra_embeddings.value());
   }
 
+  const auto dev = input_ids.device();
+  TORCH_CHECK(weights.device() == dev, "weights must be on the same device as input_ids");
+  TORCH_CHECK(seg_indptr.device() == dev, "seg_indptr must be on the same device as input_ids");
+  TORCH_CHECK(weight_indices.device() == dev, "weight_indices must be on the same device as input_ids");
+  TORCH_CHECK(lora_ranks.device() == dev, "lora_ranks must be on the same device as input_ids");
+  TORCH_CHECK(output.device() == dev, "output must be on the same device as input_ids");
+  if (extra_embeddings.has_value()) {
+    TORCH_CHECK(extra_embeddings->device() == dev, "extra_embeddings must be on the same device as input_ids");
+  }
+  if (seg_lens.has_value()) {
+    TORCH_CHECK(seg_lens->device() == dev, "seg_lens must be on the same device as input_ids");
+  }
+
   TORCH_CHECK(input_ids.dim() == 1, "input_ids must be a 1D tensor");
   TORCH_CHECK(weights.dim() == 3, "weights must be a 3D tensor");
   TORCH_CHECK(weights.size(2) == vocab_size, "weights' vocab_size dimension must match the provided vocab_size");

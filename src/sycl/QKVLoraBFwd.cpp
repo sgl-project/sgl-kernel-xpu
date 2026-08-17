@@ -57,7 +57,7 @@ namespace {
 
 //----------------- Per-(dtype, tile) dispatch macros --------------------//
 // QKV LoRA-B is a K-thin (rank 16..64), memory-bandwidth-bound grouped GEMM.
-// After trying different shapes, a single tall/thin 32x512 workgroup tile
+// After trying different shapes, a single tall/thin 32x512 workgroup tile is
 // fastest across the shape space, so tile selection currently has a single option (tall).
 // Add tiles to DISPATCH_QKV_LORA_B_FWD_TILE (and to QKVLoraBFwdXe20.cmake +
 // qkv_lora_b_fwd_dispatch.hpp + qkv_lora_b_fwd_types.hpp) with a runtime
@@ -107,6 +107,21 @@ SGL_KERNEL_EXPORT void qkv_lora_b_fwd(
   CHECK_INPUT(lora_ranks);
   CHECK_INPUT(scalings);
   CHECK_INPUT(output);
+
+  const auto dev = input_x.device();
+  TORCH_CHECK(qkv_lora_b.device() == dev, "qkv_lora_b must be on the same device as input_x");
+  TORCH_CHECK(output_offset.device() == dev, "output_offset must be on the same device as input_x");
+  TORCH_CHECK(seg_indptr.device() == dev, "seg_indptr must be on the same device as input_x");
+  TORCH_CHECK(weight_indices.device() == dev, "weight_indices must be on the same device as input_x");
+  TORCH_CHECK(lora_ranks.device() == dev, "lora_ranks must be on the same device as input_x");
+  TORCH_CHECK(scalings.device() == dev, "scalings must be on the same device as input_x");
+  TORCH_CHECK(output.device() == dev, "output must be on the same device as input_x");
+  if (seg_lens.has_value()) {
+    TORCH_CHECK(seg_lens->device() == dev, "seg_lens must be on the same device as input_x");
+  }
+  if (base_output.has_value()) {
+    TORCH_CHECK(base_output->device() == dev, "base_output must be on the same device as input_x");
+  }
 
   TORCH_CHECK(input_x.dim() == 2, "input_x must be a 2D tensor");
   TORCH_CHECK(qkv_lora_b.dim() == 3, "qkv_lora_b must be a 3D tensor");

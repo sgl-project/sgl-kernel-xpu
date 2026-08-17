@@ -123,6 +123,8 @@ from sgl_kernel.mhc import (
     hc_split_sinkhorn,
     mhc_pre,
 )
+
+fused_hc_head = torch.ops.sgl_kernel.fused_hc_head.default
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     biased_topk,

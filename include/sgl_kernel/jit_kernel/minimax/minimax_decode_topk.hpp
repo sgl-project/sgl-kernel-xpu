@@ -62,8 +62,8 @@ static constexpr int kMaxNumBlocks = 4096;  // register-M regime cap
 
 // Radix / small-regime constants.
 static constexpr int kRadixBits = 8;
-static constexpr int kRadixSize = 1 << kRadixBits;      // 256
-static constexpr int kSmallThreshold = 8 * kNumWarps;   // 128
+static constexpr int kRadixSize = 1 << kRadixBits;           // 256
+static constexpr int kSmallThreshold = 8 * kNumWarps;        // 128
 static constexpr int kItersRegM = kMaxNumBlocks / kCTASize;  // 8, fits in uint32_t bitmask
 
 static constexpr float kNegInf = -std::numeric_limits<float>::infinity();
@@ -82,14 +82,14 @@ static constexpr int32_t kInvalidBlockId = -1;
 // keeps them on separate cache lines (Xe2 has 64-byte L1 lines; CUDA used 128,
 // which was NVIDIA-specific).
 struct TopKSmem {
-  uint32_t warp_sum[kNumWarps];              // 64 B (16 warps)
+  uint32_t warp_sum[kNumWarps];  // 64 B (16 warps)
   alignas(64) uint32_t counter;
   alignas(64) uint32_t counter_final;
   alignas(64) uint32_t threshold_bin;
   uint32_t equal_count;
   uint32_t above_count;
   alignas(64) uint32_t histogram[2][kRadixSize];  // 2 KB (double-buffered)
-  float small_scores[kSmallThreshold];             // 512 B (small regime only)
+  float small_scores[kSmallThreshold];            // 512 B (small regime only)
 };
 
 // Extra scratch for the page-table kernel: the trait's shared-memory output
@@ -115,7 +115,9 @@ inline uint32_t score_to_key(float x) {
 
 // Replace NaN with -inf so NaN scores never win the top-k. Matches CUDA
 // ``clip_nan``.
-inline float clip_nan(float x) { return ::sycl::isnan(x) ? kNegInf : x; }
+inline float clip_nan(float x) {
+  return ::sycl::isnan(x) ? kNegInf : x;
+}
 
 // Local-memory atomic add returning the previous value. Matches CUDA
 // ``atomicAdd(&smem_counter, 1)`` semantics on shared memory.
@@ -175,8 +177,8 @@ inline void find_threshold(
     // the CUDA source used via warp::reduce_sum + masking.
     const uint32_t masked = (lane_id < warp_id) ? smem->warp_sum[lane_id] : 0u;
     const uint32_t inter = ::sycl::reduce_over_group(sg, masked, ::sycl::plus<uint32_t>());
-    const uint32_t prefix = inter + warp_inc;             // count in bins [0, tx]
-    const uint32_t above = total_active - prefix;         // count in bins > tx
+    const uint32_t prefix = inter + warp_inc;      // count in bins [0, tx]
+    const uint32_t above = total_active - prefix;  // count in bins > tx
     if (above < topk_remain && above + hist_val >= topk_remain) {
       smem->threshold_bin = tx;
       smem->above_count = above;
@@ -235,8 +237,7 @@ inline void topk_small(
     for (int j = 0; j < kNumTargets; ++j) {
       const int delta = lane_id + j * kWarpSize - idx;
       // Tie-break: lower block id wins (matches CUDA is_greater lambda).
-      const bool outranks = (target[j] > candidates[i]) ||
-                            ((target[j] == candidates[i]) && (delta < 0));
+      const bool outranks = (target[j] > candidates[i]) || ((target[j] == candidates[i]) && (delta < 0));
       rank += outranks ? 1u : 0u;
     }
     // Sum per-lane partial ranks across the warp.
@@ -296,8 +297,7 @@ inline void topk_radix_reg1(
     }
     item.barrier(::sycl::access::fence_space::local_space);
 
-    find_threshold(item, sg, smem, histogram, tx, warp_id, lane_id,
-                   total_active, topk_remain);
+    find_threshold(item, sg, smem, histogram, tx, warp_id, lane_id, total_active, topk_remain);
 
     const uint32_t threshold_bin = smem->threshold_bin;
     const uint32_t above_count = smem->above_count;
@@ -315,8 +315,7 @@ inline void topk_radix_reg1(
       } else if (bin < threshold_bin) {
         active = false;
       } else if (round == 3) {
-        write_pos = topk - topk_remain +
-                    atomic_add_local_u32(&smem->counter_final, 1u);
+        write_pos = topk - topk_remain + atomic_add_local_u32(&smem->counter_final, 1u);
       }
       // bin == threshold_bin && round < 3: stay active for the next pass.
     }
@@ -382,8 +381,7 @@ inline void topk_radix_regM(
     }
     item.barrier(::sycl::access::fence_space::local_space);
 
-    find_threshold(item, sg, smem, smem->histogram[hb], tx, warp_id, lane_id,
-                   total_active, topk_remain);
+    find_threshold(item, sg, smem, smem->histogram[hb], tx, warp_id, lane_id, total_active, topk_remain);
     const uint32_t threshold_bin = smem->threshold_bin;
     const uint32_t above_count = smem->above_count;
     const uint32_t equal_count = smem->equal_count;
@@ -402,8 +400,7 @@ inline void topk_radix_regM(
         } else if (bin < threshold_bin) {
           active &= ~(1u << i);
         } else if (round == 3) {
-          const uint32_t pos = topk - topk_remain +
-                               atomic_add_local_u32(&smem->counter_final, 1u);
+          const uint32_t pos = topk - topk_remain + atomic_add_local_u32(&smem->counter_final, 1u);
           if (pos < topk) topk_out[pos] = i * kCTASize + tx;
         }
         // bin == threshold_bin && round < 3: slot stays live for the next pass.
@@ -440,11 +437,9 @@ inline void topk_forward(
     // before reading s_topk for the ascending sort).
     topk_small(item, sg, scores, num_blocks, topk_out, topk, smem, tx, warp_id, lane_id);
   } else if (num_blocks <= static_cast<uint32_t>(kCTASize)) {
-    topk_radix_reg1(item, sg, scores, num_blocks, topk_out, topk, smem,
-                    tx, warp_id, lane_id);
+    topk_radix_reg1(item, sg, scores, num_blocks, topk_out, topk, smem, tx, warp_id, lane_id);
   } else {
-    topk_radix_regM(item, sg, scores, num_blocks, topk_out, topk, smem,
-                    tx, warp_id, lane_id);
+    topk_radix_regM(item, sg, scores, num_blocks, topk_out, topk, smem, tx, warp_id, lane_id);
   }
 }
 
@@ -480,8 +475,7 @@ class MinimaxDecodeTopKBlockKernel {
         topk_(topk),
         smem_(smem) {}
 
-  [[sycl::reqd_sub_group_size(kWarpSize)]] void operator()(
-      ::sycl::nd_item<1> item) const {
+  [[sycl::reqd_sub_group_size(kWarpSize)]] void operator()(::sycl::nd_item<1> item) const {
     const int group = static_cast<int>(item.get_group(0));
     // Recover (b, h) from the flattened group id. b-major so consecutive
     // groups share seq_lens[b], matching the head-major score row indexing.
@@ -494,12 +488,10 @@ class MinimaxDecodeTopKBlockKernel {
     const int lane_id = static_cast<int>(sg.get_local_linear_id());
 
     const int64_t seq_len = static_cast<int64_t>(seq_lens_[b]);
-    const int num_blocks_raw =
-        static_cast<int>((seq_len + block_size_ - 1) / block_size_);
+    const int num_blocks_raw = static_cast<int>((seq_len + block_size_ - 1) / block_size_);
     // Never scan past the materialized score columns (cuda-graph static shape
     // can be larger than the live seq_len).
-    const int num_blocks =
-        num_blocks_raw < max_seqblock_ ? num_blocks_raw : max_seqblock_;
+    const int num_blocks = num_blocks_raw < max_seqblock_ ? num_blocks_raw : max_seqblock_;
 
     int32_t* out = topk_idx_ + (static_cast<int64_t>(h) * batch_ + b) * topk_;
 
@@ -522,11 +514,18 @@ class MinimaxDecodeTopKBlockKernel {
 
     TopKSmem* smem_typed = &smem_[0];
 
-    const float* row = score_ + (static_cast<int64_t>(h) * batch_ + b) *
-                                    static_cast<int64_t>(max_seqblock_);
-    topk_forward(item, sg, row, static_cast<uint32_t>(num_blocks), out,
-                 static_cast<uint32_t>(topk_), smem_typed,
-                 tx, warp_id, lane_id);
+    const float* row = score_ + (static_cast<int64_t>(h) * batch_ + b) * static_cast<int64_t>(max_seqblock_);
+    topk_forward(
+        item,
+        sg,
+        row,
+        static_cast<uint32_t>(num_blocks),
+        out,
+        static_cast<uint32_t>(topk_),
+        smem_typed,
+        tx,
+        warp_id,
+        lane_id);
   }
 
  private:
@@ -562,9 +561,7 @@ void minimax_decode_topk_launcher(
   queue.submit([&](::sycl::handler& cgh) {
     ::sycl::local_accessor<TopKSmem, 1> smem(::sycl::range<1>(1), cgh);
     cgh.parallel_for(
-        ::sycl::nd_range<1>(
-            ::sycl::range<1>(num_groups * kCTASize),
-            ::sycl::range<1>(kCTASize)),
+        ::sycl::nd_range<1>(::sycl::range<1>(num_groups * kCTASize), ::sycl::range<1>(kCTASize)),
         MinimaxDecodeTopKBlockKernel<SeqLenT>(
             static_cast<const float*>(score),
             static_cast<const SeqLenT*>(seq_lens),
@@ -626,8 +623,7 @@ class MinimaxDecodeTopKPageTableKernel {
         max_sparse_pages_(max_sparse_pages),
         smem_(smem) {}
 
-  [[sycl::reqd_sub_group_size(kWarpSize)]] void operator()(
-      ::sycl::nd_item<1> item) const {
+  [[sycl::reqd_sub_group_size(kWarpSize)]] void operator()(::sycl::nd_item<1> item) const {
     const int group = static_cast<int>(item.get_group(0));
     const int b = group / num_heads_;
     const int h = group - b * num_heads_;
@@ -638,10 +634,8 @@ class MinimaxDecodeTopKPageTableKernel {
     const int lane_id = static_cast<int>(sg.get_local_linear_id());
 
     const int64_t seq_len = static_cast<int64_t>(seq_lens_[b]);
-    const int num_blocks_raw =
-        static_cast<int>((seq_len + block_size_ - 1) / block_size_);
-    const int num_blocks =
-        num_blocks_raw < max_seqblock_ ? num_blocks_raw : max_seqblock_;
+    const int num_blocks_raw = static_cast<int>((seq_len + block_size_ - 1) / block_size_);
+    const int num_blocks = num_blocks_raw < max_seqblock_ ? num_blocks_raw : max_seqblock_;
     const int ppb = block_size_ / page_size_;
 
     const int64_t out_row = static_cast<int64_t>(b) * num_heads_ + h;
@@ -671,8 +665,7 @@ class MinimaxDecodeTopKPageTableKernel {
     PageTableSmem* smem_typed = &smem_[0];
 
     const int k_eff = topk_;
-    const float* row = score_ + (static_cast<int64_t>(h) * batch_ + b) *
-                                    static_cast<int64_t>(max_seqblock_);
+    const float* row = score_ + (static_cast<int64_t>(h) * batch_ + b) * static_cast<int64_t>(max_seqblock_);
 
     // Zero the s_topk slots that the trait may not touch (e.g. the equal-scan
     // tail underfills). Since num_blocks > topk here, k_eff == topk, so the
@@ -685,9 +678,17 @@ class MinimaxDecodeTopKPageTableKernel {
     }
     item.barrier(::sycl::access::fence_space::local_space);
 
-    topk_forward(item, sg, row, static_cast<uint32_t>(num_blocks),
-                 smem_typed->s_topk, static_cast<uint32_t>(topk_),
-                 &smem_typed->base, tx, warp_id, lane_id);
+    topk_forward(
+        item,
+        sg,
+        row,
+        static_cast<uint32_t>(num_blocks),
+        smem_typed->s_topk,
+        static_cast<uint32_t>(topk_),
+        &smem_typed->base,
+        tx,
+        warp_id,
+        lane_id);
     item.barrier(::sycl::access::fence_space::local_space);
 
     // Ascending sort by rank-by-compare (k_eff <= kMaxTopK = 32). Each slot
@@ -702,8 +703,7 @@ class MinimaxDecodeTopKPageTableKernel {
         if (smem_typed->s_topk[j] < v) ++rank;
       }
       smem_typed->s_sorted[rank] = v;
-      const int rem = static_cast<int>(seq_len -
-                                       static_cast<int64_t>(v) * block_size_);
+      const int rem = static_cast<int>(seq_len - static_cast<int64_t>(v) * block_size_);
       const int contrib = rem < block_size_ ? rem : block_size_;
       atomic_add_local_i32(&smem_typed->s_eff_kv, contrib);
     }
@@ -773,9 +773,7 @@ void minimax_decode_topk_page_table_launcher(
   queue.submit([&](::sycl::handler& cgh) {
     ::sycl::local_accessor<PageTableSmem, 1> smem(::sycl::range<1>(1), cgh);
     cgh.parallel_for(
-        ::sycl::nd_range<1>(
-            ::sycl::range<1>(num_groups * kCTASize),
-            ::sycl::range<1>(kCTASize)),
+        ::sycl::nd_range<1>(::sycl::range<1>(num_groups * kCTASize), ::sycl::range<1>(kCTASize)),
         MinimaxDecodeTopKPageTableKernel<SeqLenT>(
             static_cast<const float*>(score),
             static_cast<const SeqLenT*>(seq_lens),
@@ -805,51 +803,63 @@ void minimax_decode_topk_page_table_launcher(
 // Two exported symbols per kernel, one per SeqLenT variant (i32/i64). Two-level
 // macro so a caller can #define the suffix as a token before invoking.
 
-#define _DEFINE_MINIMAX_DECODE_TOPK(SUFFIX, T)                                     \
-  extern "C" void minimax_decode_topk_##SUFFIX(                                    \
-      void* queue_ptr,                                                             \
-      const void* score,                                                           \
-      const void* seq_lens,                                                        \
-      void* topk_idx,                                                              \
-      int32_t batch,                                                               \
-      int32_t num_heads,                                                           \
-      int32_t max_seqblock,                                                        \
-      int32_t block_size,                                                          \
-      int32_t topk) {                                                              \
-    auto& queue = *static_cast<::sycl::queue*>(queue_ptr);                         \
-    minimax_decode_topk_launcher<T>(                                               \
-        queue, score, seq_lens, topk_idx, batch, num_heads, max_seqblock,          \
-        block_size, topk);                                                         \
+#define _DEFINE_MINIMAX_DECODE_TOPK(SUFFIX, T)                                               \
+  extern "C" void minimax_decode_topk_##SUFFIX(                                              \
+      void* queue_ptr,                                                                       \
+      const void* score,                                                                     \
+      const void* seq_lens,                                                                  \
+      void* topk_idx,                                                                        \
+      int32_t batch,                                                                         \
+      int32_t num_heads,                                                                     \
+      int32_t max_seqblock,                                                                  \
+      int32_t block_size,                                                                    \
+      int32_t topk) {                                                                        \
+    auto& queue = *static_cast<::sycl::queue*>(queue_ptr);                                   \
+    minimax_decode_topk_launcher<T>(                                                         \
+        queue, score, seq_lens, topk_idx, batch, num_heads, max_seqblock, block_size, topk); \
   }
 #define DEFINE_MINIMAX_DECODE_TOPK(SUFFIX, T) _DEFINE_MINIMAX_DECODE_TOPK(SUFFIX, T)
 
-#define _DEFINE_MINIMAX_DECODE_TOPK_PAGE_TABLE(SUFFIX, T)                          \
-  extern "C" void minimax_decode_topk_page_table_##SUFFIX(                         \
-      void* queue_ptr,                                                             \
-      const void* score,                                                           \
-      const void* seq_lens,                                                        \
-      const void* req_to_token,                                                    \
-      const void* slot_ids,                                                        \
-      void* page_table,                                                            \
-      void* seq_lens_out,                                                          \
-      int32_t batch,                                                               \
-      int32_t num_heads,                                                           \
-      int32_t max_seqblock,                                                        \
-      int32_t block_size,                                                          \
-      int32_t topk,                                                                \
-      int32_t page_size,                                                           \
-      int32_t r2t_stride,                                                          \
-      int32_t max_kv_len,                                                          \
-      int32_t max_reqs,                                                            \
-      int32_t max_sparse_pages) {                                                  \
-    auto& queue = *static_cast<::sycl::queue*>(queue_ptr);                         \
-    minimax_decode_topk_page_table_launcher<T>(                                    \
-        queue, score, seq_lens, req_to_token, slot_ids, page_table,                \
-        seq_lens_out, batch, num_heads, max_seqblock, block_size, topk,            \
-        page_size, r2t_stride, max_kv_len, max_reqs, max_sparse_pages);            \
+#define _DEFINE_MINIMAX_DECODE_TOPK_PAGE_TABLE(SUFFIX, T)  \
+  extern "C" void minimax_decode_topk_page_table_##SUFFIX( \
+      void* queue_ptr,                                     \
+      const void* score,                                   \
+      const void* seq_lens,                                \
+      const void* req_to_token,                            \
+      const void* slot_ids,                                \
+      void* page_table,                                    \
+      void* seq_lens_out,                                  \
+      int32_t batch,                                       \
+      int32_t num_heads,                                   \
+      int32_t max_seqblock,                                \
+      int32_t block_size,                                  \
+      int32_t topk,                                        \
+      int32_t page_size,                                   \
+      int32_t r2t_stride,                                  \
+      int32_t max_kv_len,                                  \
+      int32_t max_reqs,                                    \
+      int32_t max_sparse_pages) {                          \
+    auto& queue = *static_cast<::sycl::queue*>(queue_ptr); \
+    minimax_decode_topk_page_table_launcher<T>(            \
+        queue,                                             \
+        score,                                             \
+        seq_lens,                                          \
+        req_to_token,                                      \
+        slot_ids,                                          \
+        page_table,                                        \
+        seq_lens_out,                                      \
+        batch,                                             \
+        num_heads,                                         \
+        max_seqblock,                                      \
+        block_size,                                        \
+        topk,                                              \
+        page_size,                                         \
+        r2t_stride,                                        \
+        max_kv_len,                                        \
+        max_reqs,                                          \
+        max_sparse_pages);                                 \
   }
-#define DEFINE_MINIMAX_DECODE_TOPK_PAGE_TABLE(SUFFIX, T) \
-  _DEFINE_MINIMAX_DECODE_TOPK_PAGE_TABLE(SUFFIX, T)
+#define DEFINE_MINIMAX_DECODE_TOPK_PAGE_TABLE(SUFFIX, T) _DEFINE_MINIMAX_DECODE_TOPK_PAGE_TABLE(SUFFIX, T)
 
 DEFINE_MINIMAX_DECODE_TOPK(i32, int32_t)
 DEFINE_MINIMAX_DECODE_TOPK(i64, int64_t)

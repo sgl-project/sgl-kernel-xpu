@@ -42,11 +42,11 @@ _TOPK_ARGTYPES = [
     ctypes.c_void_p,  # score (const float*)
     ctypes.c_void_p,  # seq_lens (const SeqLenT*)
     ctypes.c_void_p,  # topk_idx (int32_t*, out)
-    ctypes.c_int32,   # batch
-    ctypes.c_int32,   # num_heads
-    ctypes.c_int32,   # max_seqblock
-    ctypes.c_int32,   # block_size
-    ctypes.c_int32,   # topk
+    ctypes.c_int32,  # batch
+    ctypes.c_int32,  # num_heads
+    ctypes.c_int32,  # max_seqblock
+    ctypes.c_int32,  # block_size
+    ctypes.c_int32,  # topk
 ]
 
 _PAGE_TABLE_ARGTYPES = [
@@ -57,16 +57,16 @@ _PAGE_TABLE_ARGTYPES = [
     ctypes.c_void_p,  # slot_ids (const int64_t*)
     ctypes.c_void_p,  # page_table (int32_t*, out)
     ctypes.c_void_p,  # seq_lens_out (int32_t*, out)
-    ctypes.c_int32,   # batch
-    ctypes.c_int32,   # num_heads
-    ctypes.c_int32,   # max_seqblock
-    ctypes.c_int32,   # block_size
-    ctypes.c_int32,   # topk
-    ctypes.c_int32,   # page_size
-    ctypes.c_int32,   # r2t_stride
-    ctypes.c_int32,   # max_kv_len
-    ctypes.c_int32,   # max_reqs
-    ctypes.c_int32,   # max_sparse_pages
+    ctypes.c_int32,  # batch
+    ctypes.c_int32,  # num_heads
+    ctypes.c_int32,  # max_seqblock
+    ctypes.c_int32,  # block_size
+    ctypes.c_int32,  # topk
+    ctypes.c_int32,  # page_size
+    ctypes.c_int32,  # r2t_stride
+    ctypes.c_int32,  # max_kv_len
+    ctypes.c_int32,  # max_reqs
+    ctypes.c_int32,  # max_sparse_pages
 ]
 
 # Bounds inherited from the CUDA header's TopKTrait.
@@ -91,14 +91,12 @@ def _seq_lens_suffix(seq_lens: torch.Tensor) -> str:
         return "i32"
     if seq_lens.dtype == torch.int64:
         return "i64"
-    raise ValueError(
-        f"seq_lens must be int32 or int64, got {seq_lens.dtype}"
-    )
+    raise ValueError(f"seq_lens must be int32 or int64, got {seq_lens.dtype}")
 
 
 def minimax_decode_topk(
-    score: torch.Tensor,        # [num_heads, batch, max_seqblock] fp32
-    seq_lens: torch.Tensor,     # [batch] int32/int64
+    score: torch.Tensor,  # [num_heads, batch, max_seqblock] fp32
+    seq_lens: torch.Tensor,  # [batch] int32/int64
     block_size: int,
     topk: int,
     out: Optional[torch.Tensor] = None,  # [num_heads, batch, topk] int32
@@ -189,10 +187,10 @@ def minimax_decode_topk(
 
 
 def minimax_decode_topk_page_table(
-    score: torch.Tensor,          # [num_kv_heads, batch, max_seqblock] fp32
-    seq_lens: torch.Tensor,       # [batch] int32/int64
-    req_to_token: torch.Tensor,   # [max_reqs, max_kv_len] int32
-    slot_ids: torch.Tensor,       # [batch] int64 (req_pool_indices)
+    score: torch.Tensor,  # [num_kv_heads, batch, max_seqblock] fp32
+    seq_lens: torch.Tensor,  # [batch] int32/int64
+    req_to_token: torch.Tensor,  # [max_reqs, max_kv_len] int32
+    slot_ids: torch.Tensor,  # [batch] int64 (req_pool_indices)
     block_size: int,
     topk: int,
     page_size: int,
@@ -218,9 +216,7 @@ def minimax_decode_topk_page_table(
     if score.dim() != 3:
         raise ValueError(f"score must be 3-D, got shape {tuple(score.shape)}")
     if req_to_token.dtype != torch.int32:
-        raise ValueError(
-            f"req_to_token must be int32, got {req_to_token.dtype}"
-        )
+        raise ValueError(f"req_to_token must be int32, got {req_to_token.dtype}")
     if slot_ids.dtype != torch.int64:
         raise ValueError(f"slot_ids must be int64, got {slot_ids.dtype}")
     if block_size < 1:

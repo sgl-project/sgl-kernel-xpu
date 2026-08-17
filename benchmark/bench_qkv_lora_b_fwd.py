@@ -37,7 +37,7 @@ DEFAULT_CASES: List[Dict[str, int]] = [
     },
     {
         "num_tokens": 65536,
-        "num_segments": 16,
+        "num_segments": 32,
         "num_loras": 16,
         "max_rank": 16,
         "n_q": 4096,
@@ -45,7 +45,7 @@ DEFAULT_CASES: List[Dict[str, int]] = [
     },
     {
         "num_tokens": 81920,
-        "num_segments": 32,
+        "num_segments": 64,
         "num_loras": 32,
         "max_rank": 16,
         "n_q": 8192,
@@ -54,7 +54,7 @@ DEFAULT_CASES: List[Dict[str, int]] = [
     {
         "num_tokens": 98304,
         "num_segments": 64,
-        "num_loras": 64,
+        "num_loras": 16,
         "max_rank": 32,
         "n_q": 4096,
         "n_kv": 512,
@@ -62,7 +62,7 @@ DEFAULT_CASES: List[Dict[str, int]] = [
     {
         "num_tokens": 122880,
         "num_segments": 128,
-        "num_loras": 128,
+        "num_loras": 32,
         "max_rank": 16,
         "n_q": 8192,
         "n_kv": 1024,
@@ -70,7 +70,7 @@ DEFAULT_CASES: List[Dict[str, int]] = [
     {
         "num_tokens": 122880,
         "num_segments": 256,
-        "num_loras": 256,
+        "num_loras": 128,
         "max_rank": 64,
         "n_q": 8192,
         "n_kv": 1024,
@@ -80,7 +80,7 @@ DEFAULT_CASES: List[Dict[str, int]] = [
     {
         "num_tokens": 122880,
         "num_segments": 32,
-        "num_loras": 32,
+        "num_loras": 16,
         "max_rank": 16,
         "n_q": 8192,
         "n_kv": 1024,
@@ -89,7 +89,7 @@ DEFAULT_CASES: List[Dict[str, int]] = [
     {
         "num_tokens": 122880,
         "num_segments": 64,
-        "num_loras": 64,
+        "num_loras": 16,
         "max_rank": 64,
         "n_q": 4096,
         "n_kv": 512,
@@ -98,7 +98,7 @@ DEFAULT_CASES: List[Dict[str, int]] = [
     {
         "num_tokens": 122880,
         "num_segments": 256,
-        "num_loras": 256,
+        "num_loras": 64,
         "max_rank": 64,
         "n_q": 8192,
         "n_kv": 1024,

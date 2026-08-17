@@ -1,3 +1,4 @@
+import os
 from itertools import product
 
 import torch
@@ -139,6 +140,23 @@ configs = list(
         ],
     )
 )
+
+# Prefill-only subset (env FMHA_BENCH_PREFILL_ONLY): the persistent scheduler
+# only affects prefill (q_seq_length > 1), so trim to prefill configs (drop
+# decode q=1, local/sink/fp8, and rare head dims) for a fast A/B/C comparison.
+if os.environ.get("FMHA_BENCH_PREFILL_ONLY", "0") not in ("0", "", "false", "False"):
+    _prefill_head_dims = {128, 256}
+    configs = [
+        c
+        for c in configs
+        if c[4] > 1  # q_seq_length > 1
+        and not c[1]  # local == False
+        and not c[2]  # use_sinks == False
+        and c[10] == "bf16"  # kv_dtype
+        and c[5] in _prefill_head_dims  # head_dim
+        and c[3] in (1, 8)  # batch_size (skip the heavy 16)
+    ]
+
 all_results = []
 
 
@@ -347,10 +365,110 @@ def benchmark(
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=False)
-    print("Benchmark finished!")
+    import argparse
+    import json
+    import os
+    import subprocess
+    import sys
+    import tempfile
 
-    import pandas as pd
+    parser = argparse.ArgumentParser(description="Flash attention benchmark")
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Dump per-config results to this JSON path (in addition to printing).",
+    )
+    parser.add_argument(
+        "--compare",
+        action="store_true",
+        help="Run default / persistent / persistent+atomic prefill schedulers in "
+        "separate subprocesses and print a merged A/B/C comparison table. Each "
+        "mode needs its own process because the scheduler reads its env toggle "
+        "once at first use.",
+    )
+    parser.add_argument(
+        "--prefill-only",
+        action="store_true",
+        help="Restrict to prefill configs (q_seq_length > 1, bf16, no local/sink) "
+        "for a fast comparison; the persistent scheduler only affects prefill.",
+    )
+    cli_args = parser.parse_args()
 
-    df = pd.DataFrame(all_results)
-    print(df.to_markdown())
+    # A/B/C driver: the persistent-scheduler env toggles are cached per process,
+    # so each mode is benchmarked in a fresh subprocess and the ms results are
+    # merged on the config key.
+    if cli_args.compare:
+        import numpy as np
+        import pandas as pd
+
+        modes = [
+            ("default", {}),
+            ("persistent", {"SGL_KERNEL_FMHA_PREFILL_PERSISTENT": "1"}),
+            (
+                "persistent_atomic",
+                {
+                    "SGL_KERNEL_FMHA_PREFILL_PERSISTENT": "1",
+                    "SGL_KERNEL_FMHA_PREFILL_PERSISTENT_ATOMIC": "1",
+                },
+            ),
+        ]
+        tmpdir = tempfile.mkdtemp(prefix="fmha_bench_")
+        mode_files = {}
+        for name, extra_env in modes:
+            out_path = os.path.join(tmpdir, f"{name}.json")
+            env = dict(os.environ)
+            env.pop("SGL_KERNEL_FMHA_PREFILL_PERSISTENT", None)
+            env.pop("SGL_KERNEL_FMHA_PREFILL_PERSISTENT_ATOMIC", None)
+            env.update(extra_env)
+            if cli_args.prefill_only:
+                env["FMHA_BENCH_PREFILL_ONLY"] = "1"
+            print(f"[compare] running mode={name} ...", flush=True)
+            subprocess.run(
+                [sys.executable, __file__, "--out", out_path], env=env, check=True
+            )
+            mode_files[name] = out_path
+
+        key_cols = [
+            "batch",
+            "q_seq_length",
+            "kv_seq_length",
+            "num_heads_q",
+            "num_heads_kv",
+            "head_dim",
+            "causal",
+            "local",
+            "use_sinks",
+            "page_size",
+            "kv_dtype",
+        ]
+        merged = None
+        for name, _ in modes:
+            with open(mode_files[name]) as f:
+                d = pd.DataFrame(json.load(f))
+            d = d[key_cols + ["ms"]].rename(columns={"ms": f"ms_{name}"})
+            merged = d if merged is None else merged.merge(d, on=key_cols, how="outer")
+
+        for name, _ in modes[1:]:
+            merged[f"speedup_{name}"] = merged["ms_default"] / merged[f"ms_{name}"]
+
+        pd.set_option("display.width", 240)
+        print(merged.to_markdown(index=False))
+
+        for name, _ in modes[1:]:
+            s = merged[f"speedup_{name}"].replace([np.inf, -np.inf], np.nan).dropna()
+            if len(s):
+                geo = float(np.exp(np.log(s).mean()))
+                print(
+                    f"[summary] {name}: geomean speedup vs default = {geo:.4f}, "
+                    f"min = {s.min():.4f}, max = {s.max():.4f}"
+                )
+    else:
+        benchmark.run(print_data=False)
+        print("Benchmark finished!")
+
+        import pandas as pd
+
+        df = pd.DataFrame(all_results)
+        if cli_args.out:
+            df.to_json(cli_args.out, orient="records")
+        print(df.to_markdown())

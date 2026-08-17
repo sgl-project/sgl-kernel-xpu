@@ -45,6 +45,13 @@ namespace cutlass::fmha::kernel {
 
 using namespace cute;
 
+// Detect the persistent tile scheduler so XeFMHAFwdKernel can reserve + zero a
+// small device workspace counter for its atomic work-stealing mode.
+template <class T>
+struct is_persistent_tile_scheduler : cute::false_type {};
+template <bool Causal>
+struct is_persistent_tile_scheduler<XeFHMAPersistentTileScheduler<Causal>> : cute::true_type {};
+
 ///////////////////////////////////////////////////////////////////////////////
 template <bool IsVarLen_ = false>
 struct FMHAProblemShape {
@@ -194,6 +201,31 @@ class XeFMHAFwdKernel {
   // Methods
   //
 
+  // Persistent scheduler reserves a small device counter (atomic work-stealing
+  // ticket) at the tail of the workspace, after any ScoreBlock2D score buffer.
+  static constexpr bool kIsPersistent = is_persistent_tile_scheduler<TileScheduler_>::value;
+
+  template <class ArgumentsT>
+  static size_t score_workspace_bytes(ArgumentsT const& args) {
+    if constexpr (CollectiveMainloop::ScoreBlock2D) {
+      size_t score_q_extent;
+      size_t score_k_extent;
+      if constexpr (is_var_len) {
+        score_q_extent = size_t(args.kernel.shape.seq_len_qo.max_length);
+        score_k_extent = size_t(args.kernel.shape.seq_len_kv_cache.max_length);
+      } else {
+        score_q_extent = size_t(args.kernel.shape.seq_len_qo);
+        score_k_extent = size_t(args.kernel.shape.seq_len_kv_cache);
+      }
+      const size_t score_rows_per_wg = size_t(get<0>(TileShapeQK{}));
+      const size_t q_tiles = cute::ceil_div(score_q_extent, score_rows_per_wg);
+      score_k_extent = cute::round_up(score_k_extent, size_t(get<1>(TileShapeQK{})));
+      return size_t(args.kernel.shape.batch) * size_t(args.kernel.shape.num_heads_q) * q_tiles * score_rows_per_wg *
+             score_k_extent * sizeof(typename CollectiveMainloop::ElementScoreStore);
+    }
+    return 0;
+  }
+
   template <class ArgumentsT>
   static Params to_underlying_arguments(ArgumentsT const& args, void* workspace) {
     // When packing GQA into M, grid over KV heads instead of Q heads by reusing
@@ -222,6 +254,10 @@ class XeFMHAFwdKernel {
     if constexpr (CollectiveMainloop::ScoreBlock2D && StaticScoreMode_ >= 0) {
       scheduler_params.grid.x = 1;
     }
+    if constexpr (kIsPersistent) {
+      scheduler_params.atomic_counter =
+          reinterpret_cast<int32_t*>(reinterpret_cast<char*>(workspace) + score_workspace_bytes(args));
+    }
     return {
         kernel_params,
         CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
@@ -234,23 +270,11 @@ class XeFMHAFwdKernel {
   }
 
   static size_t get_workspace_size(Arguments const& args) {
-    if constexpr (CollectiveMainloop::ScoreBlock2D) {
-      size_t score_q_extent;
-      size_t score_k_extent;
-      if constexpr (is_var_len) {
-        score_q_extent = size_t(args.kernel.shape.seq_len_qo.max_length);
-        score_k_extent = size_t(args.kernel.shape.seq_len_kv_cache.max_length);
-      } else {
-        score_q_extent = size_t(args.kernel.shape.seq_len_qo);
-        score_k_extent = size_t(args.kernel.shape.seq_len_kv_cache);
-      }
-      const size_t score_rows_per_wg = size_t(get<0>(TileShapeQK{}));
-      const size_t q_tiles = cute::ceil_div(score_q_extent, score_rows_per_wg);
-      score_k_extent = cute::round_up(score_k_extent, size_t(get<1>(TileShapeQK{})));
-      return size_t(args.kernel.shape.batch) * size_t(args.kernel.shape.num_heads_q) * q_tiles * score_rows_per_wg *
-             score_k_extent * sizeof(typename CollectiveMainloop::ElementScoreStore);
+    size_t bytes = score_workspace_bytes(args);
+    if constexpr (kIsPersistent) {
+      bytes += sizeof(int32_t);  // atomic work-stealing tile counter
     }
-    return 0;
+    return bytes;
   }
 
   static cutlass::Status initialize_workspace(
@@ -258,6 +282,12 @@ class XeFMHAFwdKernel {
       void* workspace = nullptr,
       cudaStream_t stream = nullptr,
       CudaHostAdapter* cuda_adapter = nullptr) {
+    if constexpr (kIsPersistent) {
+      if (workspace != nullptr) {
+        auto* counter = reinterpret_cast<int32_t*>(reinterpret_cast<char*>(workspace) + score_workspace_bytes(args));
+        compat::fill(counter, int32_t(0), 1);
+      }
+    }
     return Status::kSuccess;
   }
 

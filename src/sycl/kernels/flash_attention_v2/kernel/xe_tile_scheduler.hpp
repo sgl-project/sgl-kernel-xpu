@@ -32,6 +32,8 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include "cutlass/cutlass.h"
 #include "cutlass/fast_math.h"
 #include "cutlass/kernel_hardware_info.h"
@@ -173,6 +175,133 @@ struct XeFHMAIndividualPersistentTileScheduler {
   CUTLASS_DEVICE
   XeFHMAIndividualPersistentTileScheduler& operator++() {
     valid_ = false;
+    return *this;
+  }
+};
+
+// Persistent tile scheduler for the full-attention XeFMHAFwdKernel (prefill /
+// non-split decode). Launches a fixed pool of work-groups (grid.z = sm_count)
+// that walk the flattened (V, Q, batch*num_heads_q) tile space, so each WG
+// processes multiple output tiles. This keeps all XeCores busy and balances the
+// uneven per-tile work of causal prefill (later Q tiles scan more K blocks)
+// instead of one static tile per WG.
+//
+// Two work-distribution modes (Params::use_atomic, env-selected):
+//   - grid-stride (default): WG z takes tiles z, z+num_wg, z+2*num_wg, ...
+//   - atomic work-stealing:  each WG pulls the next global ticket via an atomic
+//     counter, so WGs that finish light tiles immediately grab more work.
+// Causal (template param) reorders the ticket space heavy-first (LPT): larger
+// blk_q (more K blocks) is dispatched before smaller blk_q so the longest tiles
+// start earliest and only light tiles remain at the tail.
+template <bool Causal = false>
+struct XeFHMAPersistentTileScheduler {
+  struct Params {
+    dim3 grid;  // launch grid = (1, 1, num_wg)
+    int total_tiles;
+    int v_tiles;
+    int q_tiles;
+    int hb;                        // batch * num_heads_q
+    FastDivmod divmod_num_heads;   // divisor = num_heads_q
+    int32_t* atomic_counter = nullptr;  // global work-stealing ticket (device workspace)
+    bool use_atomic = false;
+  };
+
+  bool valid_ = true;
+  Params params;
+  int cur_tile_;
+  int grid_stride_;
+
+  CUTLASS_DEVICE
+  int next_atomic_ticket() {
+    // One work-item pulls the global ticket; broadcast it to the whole WG so
+    // every work-item processes the same tile (uniform control flow keeps the
+    // in-kernel work-group barriers matched).
+    int ticket = 0;
+    if (int(ThreadIdxX()) == 0) {
+      sycl::atomic_ref<
+          int32_t,
+          sycl::memory_order::relaxed,
+          sycl::memory_scope::device,
+          sycl::access::address_space::global_space>
+          ref(*params.atomic_counter);
+      ticket = ref.fetch_add(1);
+    }
+    return sycl::group_broadcast(sycl::ext::oneapi::this_work_item::get_work_group<1>(), ticket, 0);
+  }
+
+  CUTLASS_DEVICE
+  XeFHMAPersistentTileScheduler(Params const& params) : params(params), grid_stride_(int(GridDimZ())) {
+    cur_tile_ = params.use_atomic ? next_atomic_ticket() : int(BlockIdxZ());
+    valid_ = cur_tile_ < params.total_tiles;
+  }
+
+  template <class ProblemShape, class TileShape>
+  static Params to_underlying_arguments(
+      ProblemShape const& shape,
+      KernelHardwareInfo hw_info,
+      TileShape const& tile_shape,
+      const int& num_kv_splits = -1) {
+    using namespace cute;
+
+    int v_tiles = size(ceil_div(shape.head_size_vo, get<1>(tile_shape)));
+    int q_tiles = size(ceil_div(shape.seq_len_qo, get<0>(tile_shape)));
+    int hb = size(shape.batch * shape.num_heads_q);
+    int total_tiles = v_tiles * q_tiles * hb;
+    int num_wg = total_tiles < hw_info.sm_count ? total_tiles : hw_info.sm_count;
+    if (num_wg < 1) num_wg = 1;
+
+    // Atomic work-stealing is opt-in; env read once (host side).
+    static const bool use_atomic = [] {
+      const char* env = std::getenv("SGL_KERNEL_FMHA_PREFILL_PERSISTENT_ATOMIC");
+      return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+
+    dim3 grid(1, 1, num_wg);
+    Params p{grid, total_tiles, v_tiles, q_tiles, hb, {shape.num_heads_q}};
+    p.use_atomic = use_atomic;
+    return p;
+  }
+
+  template <int Num_SGs>
+  static dim3 get_grid_shape(Params const& params) {
+    return params.grid;
+  }
+
+  CUTLASS_DEVICE
+  bool is_valid() {
+    return valid_;
+  }
+
+  CUTLASS_DEVICE
+  auto get_block_coord() {
+    using namespace cute;
+    int i = cur_tile_;
+    int blk_q, blk_v, hb_idx;
+    if constexpr (Causal) {
+      // Heavy-first: outer key is descending blk_q so all head-batches' longest
+      // tiles are dispatched before shorter ones (LPT makespan balancing).
+      int hbv = params.hb * params.v_tiles;
+      int qrev = i / hbv;
+      int rem = i - qrev * hbv;
+      hb_idx = rem / params.v_tiles;
+      blk_v = rem - hb_idx * params.v_tiles;
+      blk_q = (params.q_tiles - 1) - qrev;
+    } else {
+      int vq = params.v_tiles * params.q_tiles;
+      hb_idx = i / vq;
+      int rem = i - hb_idx * vq;
+      blk_q = rem / params.v_tiles;
+      blk_v = rem - blk_q * params.v_tiles;
+    }
+    int head, idx_b;
+    params.divmod_num_heads(idx_b, head, hb_idx);  // idx_b = hb / num_heads_q, head = hb % num_heads_q
+    return make_coord(blk_q, blk_v, head, idx_b, (int)-1);
+  }
+
+  CUTLASS_DEVICE
+  XeFHMAPersistentTileScheduler& operator++() {
+    cur_tile_ = params.use_atomic ? next_atomic_ticket() : (cur_tile_ + grid_stride_);
+    valid_ = cur_tile_ < params.total_tiles;
     return *this;
   }
 };

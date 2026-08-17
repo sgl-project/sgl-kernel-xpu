@@ -12,15 +12,15 @@ using cutlass::float_e4m3_t;
 
 namespace {
 
-constexpr int kSubGroupSize = 32;
-constexpr int kBlockSize = 128;
+constexpr int kSubGroupSize = 32;  // one warp on XPU/SYCL
+constexpr int kBlockSize = 128;    // 4 warps per block; matches the 128-dim head layout
 constexpr int kWarpsPerBlock = kBlockSize / kSubGroupSize;
-constexpr int kHeadDim = 128;
-constexpr int kRopeDim = 64;
-constexpr int kVecSize = 4;
+constexpr int kHeadDim = 128;  // fused Q indexer contract: [B, H, 128]
+constexpr int kRopeDim = 64;   // RoPE uses the last 64 dims of the 128-dim head
+constexpr int kVecSize = 4;    // per-lane vectorized load/store width
 constexpr int kRopeSize = kRopeDim / kVecSize;
-constexpr float kFp8E4M3Max = 448.0f;
-constexpr float kHadamardScale = 0.08838834764831845f;  // 1/sqrt(128)
+constexpr float kFp8E4M3Max = 448.0f;                   // max finite value for FP8 E4M3
+constexpr float kHadamardScale = 0.08838834764831845f;  // 1/sqrt(128) for FWHT normalization
 
 template <typename T>
 inline float to_float(T v) {
@@ -86,24 +86,14 @@ struct FusedQIndexerRopeHadamardQuantKernel {
     }
 
     {
-      const float a0 = data[0];
-      const float a1 = data[1];
-      const float a2 = data[2];
-      const float a3 = data[3];
-      data[0] = a0 + a1;
-      data[1] = a0 - a1;
-      data[2] = a2 + a3;
-      data[3] = a2 - a3;
-    }
-    {
-      const float a0 = data[0];
-      const float a1 = data[1];
-      const float a2 = data[2];
-      const float a3 = data[3];
-      data[0] = a0 + a2;
-      data[1] = a1 + a3;
-      data[2] = a0 - a2;
-      data[3] = a1 - a3;
+      const float x0 = data[0] + data[1];
+      const float x1 = data[0] - data[1];
+      const float x2 = data[2] + data[3];
+      const float x3 = data[2] - data[3];
+      data[0] = x0 + x2;
+      data[1] = x1 + x3;
+      data[2] = x0 - x2;
+      data[3] = x1 - x3;
     }
 
     const auto sg = item.get_sub_group();
@@ -141,24 +131,6 @@ struct FusedQIndexerRopeHadamardQuantKernel {
       weights_out[work_id] = weight_val * weight_scale * scale;
     }
   }
-};
-
-template <typename T>
-struct SyclInputType;
-
-template <>
-struct SyclInputType<at::Half> {
-  using type = sycl::half;
-};
-
-template <>
-struct SyclInputType<at::BFloat16> {
-  using type = sycl::ext::oneapi::bfloat16;
-};
-
-template <>
-struct SyclInputType<float> {
-  using type = float;
 };
 
 template <typename DType, typename PosT>
@@ -205,31 +177,38 @@ SGL_KERNEL_EXPORT void fused_q_indexer_rope_hadamard_quant(
     double weight_scale,
     const at::Tensor& rope_cache,
     const at::Tensor& positions) {
-  CHECK_DEVICE(q_input);
-  CHECK_DEVICE(q_fp8);
-  CHECK_DEVICE(weight);
-  CHECK_DEVICE(weights_out);
-  CHECK_DEVICE(rope_cache);
-  CHECK_DEVICE(positions);
+  CHECK_INPUT(q_input);
+  CHECK_INPUT(q_fp8);
+  CHECK_INPUT(weight);
+  CHECK_INPUT(weights_out);
+  CHECK_INPUT(rope_cache);
+  CHECK_INPUT(positions);
 
-  TORCH_CHECK(q_input.dim() == 3, "q_input must be [B, H, 128]");
-  TORCH_CHECK(q_fp8.dim() == 3, "q_fp8 must be [B, H, 128]");
-  TORCH_CHECK(weight.dim() == 2, "weight must be [B, H]");
-  TORCH_CHECK(weights_out.dim() == 3, "weights_out must be [B, H, 1]");
-  TORCH_CHECK(rope_cache.dim() == 2, "rope_cache must be [max_pos, 64]");
-  TORCH_CHECK(positions.dim() == 1, "positions must be [B]");
+  CHECK_DIM(3, q_input);
+  CHECK_DIM(3, q_fp8);
+  CHECK_DIM(2, weight);
+  CHECK_DIM(3, weights_out);
+  CHECK_DIM(2, rope_cache);
+  CHECK_DIM(1, positions);
+
+  CHECK_SHAPE(q_input, q_input.size(0), q_input.size(1), kHeadDim);
+  CHECK_SHAPE(q_fp8, q_fp8.size(0), q_fp8.size(1), kHeadDim);
+  CHECK_SHAPE(weight, weight.size(0), weight.size(1));
+  CHECK_SHAPE(weights_out, weights_out.size(0), weights_out.size(1), 1);
+  CHECK_SHAPE(rope_cache, rope_cache.size(0), kRopeDim);
+  CHECK_SHAPE(positions, positions.size(0));
+
+  CHECK_SAME_SHAPE(q_input, q_fp8);
+  TORCH_CHECK(
+      q_input.size(0) == weight.size(0) && q_input.size(1) == weight.size(1), "q_input and weight batch/head mismatch");
+  TORCH_CHECK(
+      weights_out.size(0) == q_input.size(0) && weights_out.size(1) == q_input.size(1) && weights_out.size(2) == 1,
+      "weights_out must be [B, H, 1]");
+  TORCH_CHECK(q_input.size(0) == positions.size(0), "q_input and positions batch mismatch");
 
   TORCH_CHECK(q_input.size(2) == kHeadDim, "q_input head_dim must be 128, got ", q_input.size(2));
   TORCH_CHECK(q_fp8.size(2) == kHeadDim, "q_fp8 head_dim must be 128, got ", q_fp8.size(2));
   TORCH_CHECK(rope_cache.size(1) == kRopeDim, "rope_cache last dim must be 64, got ", rope_cache.size(1));
-  TORCH_CHECK(weights_out.size(2) == 1, "weights_out last dim must be 1");
-
-  TORCH_CHECK(q_input.size(0) == q_fp8.size(0) && q_input.size(1) == q_fp8.size(1), "q_input/q_fp8 shape mismatch");
-  TORCH_CHECK(q_input.size(0) == weight.size(0) && q_input.size(1) == weight.size(1), "q_input/weight shape mismatch");
-  TORCH_CHECK(
-      q_input.size(0) == weights_out.size(0) && q_input.size(1) == weights_out.size(1),
-      "q_input/weights_out shape mismatch");
-  TORCH_CHECK(q_input.size(0) == positions.size(0), "q_input and positions batch mismatch");
 
   TORCH_CHECK(
       q_input.scalar_type() == at::kHalf || q_input.scalar_type() == at::kBFloat16 ||
@@ -264,14 +243,11 @@ SGL_KERNEL_EXPORT void fused_q_indexer_rope_hadamard_quant(
   TORCH_CHECK(
       q_fp8.stride(0) == expected_q_stride0, "q_fp8 must be contiguous (B,H,128); got stride[0]=", q_fp8.stride(0));
 
-  DISPATCH_FLOAT_TYPES(q_input.scalar_type(), "fused_q_indexer_rope_hadamard_quant", [&]() {
-    using sycl_in_t = typename SyclInputType<scalar_t>::type;
-    if (positions.scalar_type() == at::kInt) {
-      launch_fused_q_indexer_rope_hadamard_quant<sycl_in_t, int32_t>(
-          q_input, q_fp8, weight, weights_out, weight_scale, rope_cache, positions);
-    } else {
-      launch_fused_q_indexer_rope_hadamard_quant<sycl_in_t, int64_t>(
-          q_input, q_fp8, weight, weights_out, weight_scale, rope_cache, positions);
-    }
-  });
+  SYCL_DISPATCH_FLOATING_TYPES_AND2(
+      at::kBFloat16, at::kHalf, q_input.scalar_type(), "fused_q_indexer_rope_hadamard_quant", [&]() {
+        AT_DISPATCH_INDEX_TYPES(positions.scalar_type(), "fused_q_indexer_rope_hadamard_quant", [&]() {
+          launch_fused_q_indexer_rope_hadamard_quant<scalar_t, scalar_t>(
+              q_input, q_fp8, weight, weights_out, weight_scale, rope_cache, positions);
+        });
+      });
 }

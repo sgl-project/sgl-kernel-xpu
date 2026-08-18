@@ -108,21 +108,6 @@ SGL_KERNEL_EXPORT void qkv_lora_b_fwd(
   CHECK_INPUT(scalings);
   CHECK_INPUT(output);
 
-  const auto dev = input_x.device();
-  TORCH_CHECK(qkv_lora_b.device() == dev, "qkv_lora_b must be on the same device as input_x");
-  TORCH_CHECK(output_offset.device() == dev, "output_offset must be on the same device as input_x");
-  TORCH_CHECK(seg_indptr.device() == dev, "seg_indptr must be on the same device as input_x");
-  TORCH_CHECK(weight_indices.device() == dev, "weight_indices must be on the same device as input_x");
-  TORCH_CHECK(lora_ranks.device() == dev, "lora_ranks must be on the same device as input_x");
-  TORCH_CHECK(scalings.device() == dev, "scalings must be on the same device as input_x");
-  TORCH_CHECK(output.device() == dev, "output must be on the same device as input_x");
-  if (seg_lens.has_value()) {
-    TORCH_CHECK(seg_lens->device() == dev, "seg_lens must be on the same device as input_x");
-  }
-  if (base_output.has_value()) {
-    TORCH_CHECK(base_output->device() == dev, "base_output must be on the same device as input_x");
-  }
-
   TORCH_CHECK(input_x.dim() == 2, "input_x must be a 2D tensor");
   TORCH_CHECK(qkv_lora_b.dim() == 3, "qkv_lora_b must be a 3D tensor");
   TORCH_CHECK(output_offset.dim() == 1, "output_offset must be a 1D tensor");
@@ -221,9 +206,6 @@ SGL_KERNEL_EXPORT void qkv_lora_b_fwd(
   auto weight_indices_i32 =
       weight_indices.scalar_type() == torch::kInt32 ? weight_indices : weight_indices.to(torch::kInt32);
   auto scalings_f32 = scalings.scalar_type() == torch::kFloat32 ? scalings : scalings.to(torch::kFloat32);
-  // Keep output_offset_i32 on-device for the metadata kernel.
-  output_offset_i32 =
-      output_offset_i32.device() == input_x.device() ? output_offset_i32 : output_offset_i32.to(input_x.device());
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();

@@ -400,17 +400,6 @@ def _get_moe_ws(
     return cur.narrow(0, 0, numel).view(shape)
 
 
-def _quant_fp8_per_token(x: torch.Tensor):
-    """Quantize a bf16/half [num_tokens, hidden] tensor to fp8 e4m3 with one
-    fp32 scale per token (row). Thin wrapper around the existing
-    sgl_per_token_quant_fp8 op, used to prepare activations for the fp8
-    W8A8 MoE GEMM (moe_grouped_mm_nt_xe20_fp8_w8a8)."""
-    output_q = torch.empty(x.shape, device=x.device, dtype=torch.float8_e4m3fn)
-    output_s = torch.empty(x.shape[0], device=x.device, dtype=torch.float32)
-    torch.ops.sgl_kernel.sgl_per_token_quant_fp8.default(x, output_q, output_s)
-    return output_q, output_s
-
-
 def _quant_fp8_per_token_group(x: torch.Tensor, group_size: int = 128):
     """Quantize a BF16/FP16 tensor to FP8 with one FP32 scale per K group."""
     assert x.ndim == 2 and x.shape[1] % group_size == 0
@@ -842,19 +831,17 @@ def fused_experts(
         else:
             activation_type = 0
 
-        # FP8 fuses GEMM1's gate/up activation in-kernel. The AOT matrix keeps
-        # only one ActType for the unfused GEMM2, so activation variants add
-        # only fused-GEMM1 binaries.
-        # "unfused GEMM1 for huge-weight/small-M" heuristic yet (see
-        # GroupGemmFp8W8A8Xe20.cpp header comment), unlike the bf16/MXFP4
-        # paths below.
+        # Keep GEMM1 activation-neutral, like W4A16. Unlike BF16, where
+        # fuse_act is shape-selected, the tested Xe2 TP2/4/8 FP8 shapes show
+        # split activation is no slower and often faster, while removing the
+        # ActType variants from the FP8 AOT matrix.
         w1_scale_expanded = _expand_fp8_block_scale_to_per_row(w1_scale, w1.shape[1], K)
         w2_scale_expanded = _expand_fp8_block_scale_to_per_row(w2_scale, OutK, N)
 
         input_A_shuffle_fp8, a1_scale = _quant_fp8_per_token_group(input_A_shuffle)
 
         intermediate_cache1 = torch.empty(
-            (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
+            (M * TopK, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype
         )
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a8(
             intermediate_cache1,
@@ -865,14 +852,34 @@ def fused_experts(
             b1,
             expert_offsets,
             E,
-            activation_type,
-            True,  # fuse_act
+            0,
+            False,
             float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
             float(gemm1_limit) if gemm1_limit is not None else 7.0,
         )
 
+        intermediate_cache2 = torch.empty(
+            (M * TopK, N), device=hidden_states.device, dtype=hidden_states.dtype
+        )
+        if activation_type == 0:
+            torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
+        elif activation_type == 4:
+            torch.ops.sgl_kernel.silu_and_mul_clamp(
+                intermediate_cache2, intermediate_cache1, swiglu_limit
+            )
+        elif activation_type == 1:
+            torch.ops.sgl_kernel.gelu_tanh_and_mul(
+                intermediate_cache2, intermediate_cache1
+            )
+        elif activation_type == 2:
+            intermediate_cache2 = torch.ops.sgl_kernel.swiglu_gpt_oss_sigmoid_alpha(
+                intermediate_cache1, gemm1_alpha, gemm1_limit
+            )
+        else:
+            raise AssertionError(f"unsupported FP8 activation type: {activation_type}")
+
         intermediate_cache1_fp8, a2_scale = _quant_fp8_per_token_group(
-            intermediate_cache1
+            intermediate_cache2
         )
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a8(
             intermediate_cache3,

@@ -924,8 +924,8 @@ def test_fp8_moe_rejects_per_channel_weight_scales():
         _expand_fp8_block_scale_to_per_row(per_channel_scale, n_full=256, k_full=128)
 
 
-@pytest.mark.parametrize("gemm_n, fuse_act", [(65, False), (130, True)])
-def test_fp8_moe_rejects_non_aligned_output_width(gemm_n, fuse_act):
+@pytest.mark.parametrize("gemm_n", [65])
+def test_fp8_moe_rejects_non_aligned_output_width(gemm_n):
     """The current unpredicated N-tile copies must reject partial N tiles."""
     num_experts, total_m, gemm_k = 8, 17, 128
     activations = torch.zeros(
@@ -941,7 +941,7 @@ def test_fp8_moe_rejects_non_aligned_output_width(gemm_n, fuse_act):
         dtype=torch.float32,
     )
     output = torch.empty(
-        (total_m, gemm_n // 2 if fuse_act else gemm_n),
+        (total_m, gemm_n),
         device="xpu",
         dtype=torch.bfloat16,
     )
@@ -959,7 +959,7 @@ def test_fp8_moe_rejects_non_aligned_output_width(gemm_n, fuse_act):
             rows,
             num_experts,
             0,
-            fuse_act,
+            False,
             1.702,
             7.0,
         )
@@ -976,6 +976,18 @@ def _quant_dequant_fp8_per_token(x: torch.Tensor):
     scale = amax / FP8_E4M3_MAX
     q = (x_f32 / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
     dq = (q.float() * scale).to(x.dtype)
+    return scale.squeeze(-1), dq
+
+
+def _quant_dequant_fp8_per_token_group(
+    x: torch.Tensor, group_size: int = FP8_BLOCK_SIZE
+):
+    """Per-token-group FP8 E4M3 quantize + dequantize for the FP8 MoE path."""
+    assert x.ndim == 2 and x.shape[1] % group_size == 0
+    x_f32 = x.float().reshape(x.shape[0], x.shape[1] // group_size, group_size)
+    scale = x_f32.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / FP8_E4M3_MAX
+    q = (x_f32 / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+    dq = (q.float() * scale).reshape_as(x).to(x.dtype)
     return scale.squeeze(-1), dq
 
 
@@ -1011,19 +1023,19 @@ def torch_naive_moe_fp8_w8a8(
     b1,
     b2,
     routed_scaling_factor=None,
+    activation="silu",
 ):
     """Reference for the fp8 W8A8 path. Unlike torch_naive_moe, this models
-    the *actual* two-stage quantization pipeline fused_experts(use_fp8_w8a8=
-    True) runs: activations are fp8-quantized per-token before GEMM1, AND the
-    post-silu intermediate is fp8-quantized per-token again before GEMM2 (the
-    kernel's activation scale is per-token and applied once per GEMM - see
-    moe_mainloop.hpp). w1_dq/w2_dq must already be the dequantized (rounded)
+    the actual two-stage quantization pipeline fused_experts(use_fp8_w8a8=True)
+    runs: activations are fp8-quantized per K-group before GEMM1, AND the
+    post-activation intermediate is quantized per K-group again before GEMM2.
+    w1_dq/w2_dq must already be the dequantized (rounded)
     weights so weight-quantization noise is factored out the same way the
     MXFP4 reference does it.
     """
     B, D = a.shape
     a_rep = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
-    _, a_dq = _quant_dequant_fp8_per_token(a_rep)
+    _, a_dq = _quant_dequant_fp8_per_token_group(a_rep)
 
     out = torch.zeros(B * topk, w2_dq.shape[1], dtype=a.dtype, device=a.device)
     topk_weight = topk_weight.view(-1)
@@ -1045,8 +1057,14 @@ def torch_naive_moe_fp8_w8a8(
             gemm1 = (a_dq[mask].float() @ w1_dq[i].float().transpose(0, 1)) + b1[
                 i
             ].float()
-            tmp = apply_act_and_mul(gemm1.to(a.dtype), F.silu)
-            _, tmp_dq = _quant_dequant_fp8_per_token(tmp)
+            if activation == "silu":
+                act_fn = F.silu
+            elif activation == "gelu":
+                act_fn = lambda x: F.gelu(x, approximate="tanh")
+            else:
+                raise AssertionError(f"unsupported test activation: {activation}")
+            tmp = apply_act_and_mul(gemm1.to(a.dtype), act_fn)
+            _, tmp_dq = _quant_dequant_fp8_per_token_group(tmp)
             gemm2 = (tmp_dq.float() @ w2_dq[i].float().transpose(0, 1)) + b2[i].float()
             out[mask] = gemm2.to(a.dtype)
 
@@ -1089,14 +1107,13 @@ def test_moe_gemm_fp8_w8a8_weights(
     Weights are block-quantized (128x128, DeepSeek-style) then dequantized
     for the reference so both paths see identical fp8-rounded weights; the
     reference (torch_naive_moe_fp8_w8a8) also replicates the kernel's
-    per-token activation quantization before each of the two expert GEMMs.
+    per-token-group-128 activation quantization before each of the two expert
+    GEMMs.
     Any remaining numerical difference should be GEMM arithmetic noise only.
 
-    v1 of the fp8 W8A8 kernel only supports activation=silu and 2-D
-    block-quant weight scales (see GroupGemmFp8W8A8Xe20.cpp/.cmake and
-    xpu_fp8_moe_minimal_plan.md), so this test pins those. Expert bias is
-    optional at runtime and shares the same AOT instances as the bias-free
-    path.
+    This matrix pins the common SiLU path; a separate small GELU case covers
+    external activation dispatch. Expert bias is optional at runtime and
+    shares the same AOT instances as the bias-free path.
     """
     torch.manual_seed(0)
     torch.xpu.manual_seed_all(0)
@@ -1156,6 +1173,54 @@ def test_moe_gemm_fp8_w8a8_weights(
 
     torch.testing.assert_close(
         torch_output, sglang_output.to("cpu"), rtol=rtol, atol=atol
+    )
+
+
+def test_moe_gemm_fp8_w8a8_gelu_split_activation():
+    """Keep one small GELU case covering FP8's external activation wiring."""
+    torch.manual_seed(1)
+    torch.xpu.manual_seed_all(1)
+    num_tokens, topk, num_experts = 17, 2, 8
+    hidden_size = intermediate_size = 256
+
+    a = create_random_cpu_tensor((num_tokens, hidden_size), torch.bfloat16)
+    w1_bf16 = create_random_cpu_tensor(
+        (num_experts, 2 * intermediate_size, hidden_size), torch.bfloat16
+    )
+    w2_bf16 = create_random_cpu_tensor(
+        (num_experts, hidden_size, intermediate_size), torch.bfloat16
+    )
+    score = torch.randn((num_tokens, num_experts), dtype=torch.bfloat16)
+    topk_weight, topk_ids = torch.topk(
+        torch.softmax(score, dim=-1, dtype=torch.float32), topk
+    )
+    w1_scale, w1_dq = _quant_dequant_fp8_block(w1_bf16)
+    w2_scale, w2_dq = _quant_dequant_fp8_block(w2_bf16)
+
+    torch_output = torch_naive_moe_fp8_w8a8(
+        a,
+        w1_dq,
+        w2_dq,
+        topk_ids,
+        topk_weight,
+        topk,
+        None,
+        None,
+        activation="gelu",
+    )
+    sglang_output = fused_experts(
+        a.to("xpu"),
+        w1_dq.to(torch.float8_e4m3fn).to("xpu"),
+        w2_dq.to(torch.float8_e4m3fn).to("xpu"),
+        topk_weight.to("xpu"),
+        topk_ids.to("xpu"),
+        activation="gelu",
+        use_fp8_w8a8=True,
+        w1_scale=w1_scale.to("xpu"),
+        w2_scale=w2_scale.to("xpu"),
+    )
+    torch.testing.assert_close(
+        torch_output, sglang_output.to("cpu"), rtol=1e-1, atol=1e-2
     )
 
 
@@ -1223,21 +1288,17 @@ def _build_moe_gemm_inputs_fp8(
 @pytest.mark.parametrize("num_experts", [8])
 @pytest.mark.parametrize("hidden_size", [256])
 @pytest.mark.parametrize("intermediate_size", [256])
-@pytest.mark.parametrize("fuse_act", [False, True])
 def test_moe_grouped_mm_nt_xe20_fp8_w8a8_op(
     num_tokens_per_expert,
     num_experts,
     hidden_size,
     intermediate_size,
-    fuse_act,
 ):
-    """Direct op-level comparison: fp8 W8A8 fused op vs. bf16 op, both fed
+    """Direct op-level comparison: fp8 W8A8 split GEMM vs. bf16 GEMM, both fed
     the same fp8-rounded (quantize+dequantize) activations/weights.
 
-    v1 of the fp8 W8A8 kernel is silu + no-unfused-heuristic only (see
-    GroupGemmFp8W8A8Xe20.cpp/.cmake), so this op-level test pins
-    activation_type=0. Runtime bias is covered by the fused_experts-level
-    matrix above.
+    Activation is tested separately by the fused_experts-level path; this
+    op-level test covers the activation-neutral GEMM contract.
     """
     activation_type = 0  # silu
     gemm_k = hidden_size
@@ -1251,7 +1312,7 @@ def test_moe_grouped_mm_nt_xe20_fp8_w8a8_op(
         gemm_n=gemm_n,
         gemm_k=gemm_k,
         with_bias=False,
-        fuse_act=fuse_act,
+        fuse_act=False,
     )
 
     # Baseline: bf16 op on the fp8-rounded (dequantized) activations/weights.
@@ -1263,12 +1324,12 @@ def test_moe_grouped_mm_nt_xe20_fp8_w8a8_op(
         inputs["total_rows"],
         num_experts,
         activation_type,
-        fuse_act,
+        False,
         1.702,
         7.0,
     )
 
-    # Fused fp8 W8A8 path, fed the genuine fp8 tensors + scales.
+    # Split fp8 W8A8 GEMM path, fed the genuine fp8 tensors + scales.
     torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a8(
         inputs["output_fp8"],
         inputs["a_fp8"],
@@ -1279,7 +1340,7 @@ def test_moe_grouped_mm_nt_xe20_fp8_w8a8_op(
         inputs["total_rows"],
         num_experts,
         activation_type,
-        fuse_act,
+        False,
         1.702,
         7.0,
     )

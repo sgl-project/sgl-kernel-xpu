@@ -15,20 +15,13 @@
 //     multiplier - see moe_mainloop.hpp for why this granularity, and the
 //     Python-side expectation that a genuinely 2-D-blocked scale tensor is
 //     pre-expanded to per-N-row before reaching this op).
-//   - A per-token (per-M-row) float32 activation-scale array is threaded
-//     through as a flat pointer indexed by the same shuffled-token order
-//     as Activations (no per-expert offset math beyond `pre_rows`, exactly
-//     like Activations itself).
+//   - Activation scales are indexed by the same shuffled-token order as
+//     Activations. Production uses [M, K/128] per-token-group scales; the
+//     kernel also retains the legacy [M] per-token form for direct-op callers.
 //
-// NOTE: unlike the bf16/MXFP4 kernels, there is currently only ONE
-// operator() dispatch shape used from Python for GEMM1 (always fuse_act
-// for gated activations) - the "unfused GEMM1 for huge-weight/small-M"
-// heuristic that GroupGemmXe20.cpp/moe.py apply for bf16 was not ported
-// here yet. The non-fused operator() overload below is still fully
-// implemented (it's what down-projection/GEMM2 always uses), so wiring up
-// an unfused GEMM1 path later is just a dispatch-side change, not a new
-// mainloop. Flagged here since this is a real (if second-order) perf gap
-// vs. the bf16 path for the huge-weight/small-M corner case.
+// Unlike BF16, the Python FP8 path always keeps GEMM1 activation-neutral. The
+// class retains the fused overloads for code reuse, but the FP8 AOT matrix only
+// instantiates FuseAct=false and ActType=0.
 
 #pragma once
 

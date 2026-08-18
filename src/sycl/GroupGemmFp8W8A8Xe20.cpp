@@ -80,22 +80,7 @@ using SG_1_4_1 = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
   DECLARE_XE20_MOE_FP8_EXTERN(Tile, SGLayout, ActType, FuseAct, false)       \
   DECLARE_XE20_MOE_FP8_EXTERN(Tile, SGLayout, ActType, FuseAct, true)
 
-#define DECLARE_XE20_MOE_FP8_FUSED_ACT_VARIANTS(Tile, SGLayout, ActType) \
-  DECLARE_XE20_MOE_FP8_BIAS_VARIANTS(Tile, SGLayout, ActType, true)
-
 #define DECLARE_XE20_MOE_FP8_TILES                                      \
-  DECLARE_XE20_MOE_FP8_FUSED_ACT_VARIANTS(Tile_8_64_32, SG_1_4_1, 0)    \
-  DECLARE_XE20_MOE_FP8_FUSED_ACT_VARIANTS(Tile_8_64_32, SG_1_4_1, 1)    \
-  DECLARE_XE20_MOE_FP8_FUSED_ACT_VARIANTS(Tile_8_64_32, SG_1_4_1, 2)    \
-  DECLARE_XE20_MOE_FP8_FUSED_ACT_VARIANTS(Tile_8_64_32, SG_1_4_1, 4)    \
-  DECLARE_XE20_MOE_FP8_FUSED_ACT_VARIANTS(Tile_16_64_32, SG_1_4_1, 0)   \
-  DECLARE_XE20_MOE_FP8_FUSED_ACT_VARIANTS(Tile_16_64_32, SG_1_4_1, 1)   \
-  DECLARE_XE20_MOE_FP8_FUSED_ACT_VARIANTS(Tile_16_64_32, SG_1_4_1, 2)   \
-  DECLARE_XE20_MOE_FP8_FUSED_ACT_VARIANTS(Tile_16_64_32, SG_1_4_1, 4)   \
-  DECLARE_XE20_MOE_FP8_FUSED_ACT_VARIANTS(Tile_32_64_32, SG_1_4_1, 0)   \
-  DECLARE_XE20_MOE_FP8_FUSED_ACT_VARIANTS(Tile_32_64_32, SG_1_4_1, 1)   \
-  DECLARE_XE20_MOE_FP8_FUSED_ACT_VARIANTS(Tile_32_64_32, SG_1_4_1, 2)   \
-  DECLARE_XE20_MOE_FP8_FUSED_ACT_VARIANTS(Tile_32_64_32, SG_1_4_1, 4)   \
   DECLARE_XE20_MOE_FP8_BIAS_VARIANTS(Tile_8_64_32, SG_1_4_1, 0, false)  \
   DECLARE_XE20_MOE_FP8_BIAS_VARIANTS(Tile_16_64_32, SG_1_4_1, 0, false) \
   DECLARE_XE20_MOE_FP8_BIAS_VARIANTS(Tile_32_64_32, SG_1_4_1, 0, false)
@@ -103,7 +88,6 @@ using SG_1_4_1 = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
 DECLARE_XE20_MOE_FP8_TILES
 
 #undef DECLARE_XE20_MOE_FP8_TILES
-#undef DECLARE_XE20_MOE_FP8_FUSED_ACT_VARIANTS
 #undef DECLARE_XE20_MOE_FP8_BIAS_VARIANTS
 #undef DECLARE_XE20_MOE_FP8_EXTERN
 
@@ -127,52 +111,22 @@ DECLARE_XE20_MOE_FP8_TILES
       act_scales.dim() == 2,                         \
       act_scales.dim() == 2 ? static_cast<int>(act_scales.size(1)) : 1)
 
-// GEMM2 is activation-neutral; reuse its ActType=0 specialization for every model.
-#define DISPATCH_MOE_FP8(ActType, FuseAct, ...)                                   \
-  do {                                                                            \
-    const bool with_bias = bias.has_value();                                      \
-    if (FuseAct) {                                                                \
-      switch (ActType) {                                                          \
-        case 0:                                                                   \
-          if (with_bias)                                                          \
-            LAUNCH_MOE_FP8(true, __VA_ARGS__, 0, true);                           \
-          else                                                                    \
-            LAUNCH_MOE_FP8(false, __VA_ARGS__, 0, true);                          \
-          break;                                                                  \
-        case 1:                                                                   \
-          if (with_bias)                                                          \
-            LAUNCH_MOE_FP8(true, __VA_ARGS__, 1, true);                           \
-          else                                                                    \
-            LAUNCH_MOE_FP8(false, __VA_ARGS__, 1, true);                          \
-          break;                                                                  \
-        case 2:                                                                   \
-          if (with_bias)                                                          \
-            LAUNCH_MOE_FP8(true, __VA_ARGS__, 2, true);                           \
-          else                                                                    \
-            LAUNCH_MOE_FP8(false, __VA_ARGS__, 2, true);                          \
-          break;                                                                  \
-        case 4:                                                                   \
-          if (with_bias)                                                          \
-            LAUNCH_MOE_FP8(true, __VA_ARGS__, 4, true);                           \
-          else                                                                    \
-            LAUNCH_MOE_FP8(false, __VA_ARGS__, 4, true);                          \
-          break;                                                                  \
-        default:                                                                  \
-          TORCH_CHECK(false, "unsupported FP8 fused activation type: ", ActType); \
-      }                                                                           \
-    } else {                                                                      \
-      if (with_bias) {                                                            \
-        LAUNCH_MOE_FP8(true, __VA_ARGS__, 0, false);                              \
-      } else {                                                                    \
-        LAUNCH_MOE_FP8(false, __VA_ARGS__, 0, false);                             \
-      }                                                                           \
-    }                                                                             \
+// Activation is always external to the FP8 GEMM. Keep the public arguments for
+// API compatibility, but dispatch only the activation-neutral ActType=0 path.
+#define DISPATCH_MOE_FP8(...)                       \
+  do {                                              \
+    if (bias.has_value()) {                         \
+      LAUNCH_MOE_FP8(true, __VA_ARGS__, 0, false);  \
+    } else {                                        \
+      LAUNCH_MOE_FP8(false, __VA_ARGS__, 0, false); \
+    }                                               \
   } while (0)
 
 // FP8 (E4M3) W8A8 MoE grouped GEMM. `activations`/`weights` are
-// float8_e4m3fn raw bytes. `act_scales` is a per-token (per-M-row) fp32
-// direct multiplier. `weight_scales` is a per-(N-row, K-group) fp32 direct
-// multiplier with FP8_GROUP_SIZE_K (128) elements per K-group - see
+// float8_e4m3fn raw bytes. `act_scales` is either legacy [M] per-token or
+// production [M, K/128] per-token-group fp32 direct multipliers.
+// `weight_scales` is a per-(N-row, K-group) fp32 direct multiplier with
+// FP8_GROUP_SIZE_K (128) elements per K-group - see
 // moe_mainloop.hpp. A genuinely 2-D-blocked (e.g. DeepSeek 128x128)
 // weight-scale tensor must be pre-expanded to per-N-row by the caller
 // (python/sgl_kernel/moe.py does this via repeat_interleave) before
@@ -222,22 +176,19 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_fp8_w8a8(
   int avg_m = total_m / n_experts;
   int tile_n = 64;
 
+  TORCH_CHECK(!fuse_act, "FP8 W8A8 MoE requires activation outside GEMM1");
+
   TORCH_CHECK(weights_shape[0] == n_experts, "weights must have n_experts as the first dimension");
   TORCH_CHECK(weights_shape[2] == gemm_k, "weights last dim must equal K (fp8 is 1 byte/element, no packing)");
   TORCH_CHECK(
       weights_shape[0] == total_rows_for_experts.size(0),
       "rows_for_experts must have the same size as the first dimension of weights");
   TORCH_CHECK(output.sizes()[0] == total_m, "output must have the same number of rows as activations");
-  if (fuse_act) {
-    TORCH_CHECK(gemm_n % 2 == 0, "gemm_n must be even when fuse_act is true");
-    TORCH_CHECK(output.sizes()[1] == gemm_n / 2, "output must have half the number of columns when fuse_act is true");
-  } else {
-    TORCH_CHECK(output.sizes()[1] == gemm_n, "output must have the same number of columns as activations");
-  }
+  TORCH_CHECK(output.sizes()[1] == gemm_n, "output must have the same number of columns as activations");
   TORCH_CHECK(
-      (fuse_act ? gemm_n / 2 : gemm_n) % tile_n == 0,
+      gemm_n % tile_n == 0,
       "FP8 W8A8 MoE requires the output width to be divisible by the selected tile width (output width=",
-      fuse_act ? gemm_n / 2 : gemm_n,
+      gemm_n,
       ", tile width=",
       tile_n,
       "); non-aligned N is not supported yet");
@@ -276,11 +227,11 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_fp8_w8a8(
   int ld_b = static_cast<int>(weights.stride(1));
 
   if (avg_m <= 8) {
-    DISPATCH_MOE_FP8(activation_type, fuse_act, Tile_8_64_32, SG_1_4_1);
+    DISPATCH_MOE_FP8(Tile_8_64_32, SG_1_4_1);
   } else if (avg_m <= 16) {
-    DISPATCH_MOE_FP8(activation_type, fuse_act, Tile_16_64_32, SG_1_4_1);
+    DISPATCH_MOE_FP8(Tile_16_64_32, SG_1_4_1);
   } else {
-    DISPATCH_MOE_FP8(activation_type, fuse_act, Tile_32_64_32, SG_1_4_1);
+    DISPATCH_MOE_FP8(Tile_32_64_32, SG_1_4_1);
   }
 }
 

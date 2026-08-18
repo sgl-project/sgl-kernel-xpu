@@ -29,13 +29,9 @@
 //     the op-level comment in GroupGemmFp8W8A8Xe20.cpp. Per-tensor
 //     (single-scalar) weight scale is NOT supported by this first version;
 //     only block-quant is wired up (see xpu_fp8_moe_minimal_plan.md).
-//   - Activation (A) is quantized per-token (one fp32 scale per M-row, no
-//     K-grouping). Because a per-token scale does not vary across K, it
-//     is algebraically a common factor of the whole K-sum and is applied
-//     ONCE to the fp32 accumulator after the K-loop (before bias), instead
-//     of being threaded through the k-tile loop like the B-side scale.
-//     This is cheaper than MXFP4-style per-tile scale application and
-//     avoids adding any A-side scale-reload machinery.
+//   - Activation (A) is production-quantized per token and K-group (128
+//     elements). The current group scale is applied to each A fragment in the
+//     K-loop; the legacy [M] per-token form is applied once after the K-loop.
 //
 // BLK_K stays 32 (same as every other MoE tile in this repo) rather than
 // being raised to 128 to exactly match FP8_GROUP_SIZE_K. This means the
@@ -382,9 +378,8 @@ struct MoEMainloopFp8W8A8<
       barrier_wait(barrier_scope);
     }
 
-    // Descale (per-token activation scale factors out of the K-sum, see
-    // file header), then bias - both operate on the real/dequantized
-    // scale, matching standard quantized-GEMM epilogue ordering.
+    // Legacy [M] activation scales factor out of the K-sum and are applied
+    // here; grouped [M, K/128] scales were applied in the K-loop above.
     if (!act_scale_grouped) {
       apply_A_token_scale(tCrC, tCrC_coord, a_scale_gmem, wg_m * BLK_M);
     }

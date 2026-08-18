@@ -21,20 +21,13 @@ endfunction()
 #   - tile menu: _8/_16/_32 x _64 (SG_1_4_1); the initial _128 variants were
 #     measured slower than Tile32 for wider-N and larger-M shapes and are not
 #     instantiated until a narrow-N workload justifies their binary cost.
-#   - fused act_type: 0 (silu), 1 (gelu), 2 (GPT-OSS SwiGLU), and 4
-#     (DeepSeek-V4 clamped SwiGLU), covering the previously identified FP8
-#     MoE model families.
-#   - unfused act_type: only 0. FuseAct=false is used for GEMM2, where the
-#     activation type is dead and should not multiply the AOT matrix.
+#   - activation is intentionally outside the FP8 GEMMs: tested Xe2 TP2/4/8
+#     shapes show no split-path regression, and this removes ActType variants.
+#     The Python path uses shared XPU activation kernels between GEMM1 and GEMM2.
 # Generate separate WithBias=false/true instances so the epilogue can eliminate
 # the bias decision entirely while the host dispatches based on bias presence.
 # Keep both GEMM shapes in the shared matrix; the runtime uses Tile32 for
 # avg_m above 16, including the TP>1 local shapes measured on Xe2.
-foreach(act_type 0 1 2 4)
-    add_group_gemm_fp8_w8a8_xe20_inst("_8" "_64" "_32" "_1, _4, _1" "_4, _1, _0" ${act_type} true)
-    add_group_gemm_fp8_w8a8_xe20_inst("_16" "_64" "_32" "_1, _4, _1" "_4, _1, _0" ${act_type} true)
-    add_group_gemm_fp8_w8a8_xe20_inst("_32" "_64" "_32" "_1, _4, _1" "_4, _1, _0" ${act_type} true)
-endforeach()
 add_group_gemm_fp8_w8a8_xe20_inst("_8" "_64" "_32" "_1, _4, _1" "_4, _1, _0" 0 false)
 add_group_gemm_fp8_w8a8_xe20_inst("_16" "_64" "_32" "_1, _4, _1" "_4, _1, _0" 0 false)
 add_group_gemm_fp8_w8a8_xe20_inst("_32" "_64" "_32" "_1, _4, _1" "_4, _1, _0" 0 false)

@@ -290,9 +290,8 @@ struct MHCFusedPostPreFmaKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   }
 };
 
-inline int64_t choose_small_batch_split_k(int64_t t) {
-  if (t <= 4) return 32;
-  if (t <= 16) return 8;
+inline int64_t choose_small_batch_split_k(int64_t t, int64_t hidden_size) {
+  if (t < 8) return (hidden_size <= 4096) ? 8 : 4;
   return 4;
 }
 
@@ -300,12 +299,12 @@ inline int64_t choose_large_batch_n_splits(int64_t t, int64_t) {
   return t <= 2048 ? 32 : 1;
 }
 
-inline int64_t choose_n_splits(int64_t t, int64_t hc_hidden, int64_t n_splits_hint) {
+inline int64_t choose_n_splits(int64_t t, int64_t hc_hidden, int64_t hidden_size, int64_t n_splits_hint) {
   if (n_splits_hint > 0) {
     return n_splits_hint;
   }
   if (t <= kSmallBatchThreshold) {
-    return choose_small_batch_split_k(t);
+    return choose_small_batch_split_k(t, hidden_size);
   }
   return choose_large_batch_n_splits(t, hc_hidden);
 }
@@ -364,7 +363,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> SGL_KERNEL_EXPORT mhc_fused_post_
   TORCH_CHECK(
       comb_3d.size(0) == t && comb_3d.size(1) == hc_mult && comb_3d.size(2) == hc_mult, "comb_res_mix shape mismatch");
 
-  const int64_t n_splits_pre = choose_n_splits(t, hc_hidden, n_splits);
+  const int64_t n_splits_pre = choose_n_splits(t, hc_hidden, hidden_size, n_splits);
   at::Tensor residual_cur = at::empty_like(residual);
   at::Tensor gemm_out_mul = at::empty({n_splits_pre, t, hc_mult3}, residual.options().dtype(at::kFloat));
   at::Tensor gemm_out_sqrsum = at::empty({n_splits_pre, t}, residual.options().dtype(at::kFloat));

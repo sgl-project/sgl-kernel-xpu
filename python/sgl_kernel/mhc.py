@@ -7,13 +7,13 @@ import torch
 XPU_SMALL_BATCH_TOKENS = 32  # token_count > 32 => treat as larger-batch path
 
 
-def _choose_small_batch_splits(num_tokens: int, n_splits_hint: int) -> int:
+def _choose_small_batch_splits(
+    num_tokens: int, hidden_size: int, n_splits_hint: int
+) -> int:
     if n_splits_hint > 0:
         return n_splits_hint
-    if num_tokens <= 4:
-        return 32
-    if num_tokens <= 16:
-        return 8
+    if num_tokens < 8:
+        return 8 if hidden_size <= 4096 else 4
     return 4
 
 
@@ -313,7 +313,8 @@ def mhc_fused_post_pre(
         )
         return residual_cur, post_mix_cur.unsqueeze(-1), comb_mix_cur, layer_input_cur
 
-    split_k = _choose_small_batch_splits(num_tokens, int(n_splits))
+    tile_n = 2 if num_tokens < 8 else 3
+    split_k = _choose_small_batch_splits(num_tokens, hidden_size, int(n_splits))
     residual_cur, gemm_out_mul, gemm_out_sqrsum = mhc_fused_post_pre_fma(
         x,
         residual,

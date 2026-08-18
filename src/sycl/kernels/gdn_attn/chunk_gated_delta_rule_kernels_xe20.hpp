@@ -3,6 +3,7 @@
 #include <torch/all.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <sycl/sycl.hpp>
 
 #include "../../Utils.h"
@@ -139,32 +140,32 @@ CUTE_DEVICE void chunk_compute_A_kernel(
     const int num_v_heads,
     const int head_v_dim) {
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-  int local_id = item.get_local_linear_id();
-  int local_range = item.get_local_range(2);
-  int chunk_id = item.get_group(1);
-  const int global_chunk_range = item.get_group_range(1);
+  int local_id = item.get_local_linear_id();               // flattened ID in workgroup
+  int local_range = item.get_local_range(2);               // 64
+  int chunk_id = item.get_group(1);                        // workgroup ID in the second dimension
+  const int global_chunk_range = item.get_group_range(1);  // total number of workgroups in the second dimension
 
-  auto sg = item.get_sub_group();
-  int sg_local_id = sg.get_local_linear_id();
+  auto sg = item.get_sub_group();              // subgroup object
+  int sg_local_id = sg.get_local_linear_id();  // flattened ID in subgroup
 
   float* slm_mem = static_cast<float*>(slm_mem_const.template get_multi_ptr<sycl::access::decorated::no>().get());
   float* g_slm_ptr = slm_mem;
 
   TiledMMA mma{};
-  auto wg_tile = mma.tile_mnk();
-  auto thr_mma = mma.get_slice(local_id);
+  auto wg_tile = mma.tile_mnk();           // (64, 64, 32)
+  auto thr_mma = mma.get_slice(local_id);  // get the thread slice of the MMA operation for this thread
 
-  static constexpr auto tile_m = get<0>(wg_tile);
-  static constexpr auto tile_n = get<1>(wg_tile);
+  static constexpr auto tile_m = get<0>(wg_tile);  // 64
+  static constexpr auto tile_n = get<1>(wg_tile);  // 64
 
-  static constexpr auto ATOM_M = get<1>(typename TiledMMA::ThrLayoutVMNK{}.shape());
-  static constexpr auto ATOM_N = get<2>(typename TiledMMA::ThrLayoutVMNK{}.shape());
+  static constexpr auto ATOM_M = get<1>(typename TiledMMA::ThrLayoutVMNK{}.shape());  // 2
+  static constexpr auto ATOM_N = get<2>(typename TiledMMA::ThrLayoutVMNK{}.shape());  // 2
 
-  static constexpr auto SG_M = tile_m / ATOM_M;  // BLK_M / ATOM_M;
-  static constexpr auto SG_N = tile_n / ATOM_N;  // BLK_N / ATOM_N;
+  static constexpr auto SG_M = tile_m / ATOM_M;  // BLK_M / ATOM_M; // 32
+  static constexpr auto SG_N = tile_n / ATOM_N;  // BLK_N / ATOM_N; // 32
 
-  auto sg_local_m_coord = cutlass::get_sub_group_id() / ATOM_N;
-  auto sg_local_n_coord = cutlass::get_sub_group_id() % ATOM_N;
+  auto sg_local_m_coord = cutlass::get_sub_group_id() / ATOM_N;  // m index of subgroup
+  auto sg_local_n_coord = cutlass::get_sub_group_id() % ATOM_N;  // n index of subgroup
   int m_tile_start = 0;
   int n_tile_start = 0;
   int m_sg_start = sg_local_m_coord * SG_M;
@@ -251,6 +252,129 @@ CUTE_DEVICE void chunk_compute_A_kernel(
     }
     pre_chunks = cumsum_chunks;
   }
+}
+
+// Conventional (non-persistent) counterpart of chunk_compute_A_kernel: each
+// workgroup is launched for exactly one (chunk, v_head) pair and retires
+// after doing that single unit of work, relying on the GPU's hardware block
+// scheduler for dynamic load balancing instead of a software grid-stride
+// loop. The grid is over-provisioned to an upper bound on the total chunk
+// count (see kernel_launcher) because the real chunk count depends on the
+// ragged per-batch sequence lengths in query_start_loc, which is only known
+// on device; workgroups beyond the real chunk count exit immediately.
+template <typename T, class TiledMMA>
+CUTE_DEVICE void chunk_compute_A_kernel_conventional(
+    const sycl::local_accessor<float, 1>& slm_mem_const,
+    T* A,
+    const T* k,
+    const T* v,
+    const float* b,
+    const float* a,
+    const int* query_start_loc,
+    const int total_virtual_seqlen,
+    const int batch_size,
+    const int num_k_heads,
+    const int head_k_dim,
+    const int num_v_heads,
+    const int head_v_dim) {
+  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+  int local_id = item.get_local_linear_id();
+  int local_range = item.get_local_range(2);
+  const int flat_chunk_id = item.get_group(0);
+  const int v_head_id = item.get_group(1);
+
+  auto sg = item.get_sub_group();
+  int sg_local_id = sg.get_local_linear_id();
+
+  // The grid is over-provisioned (see kernel_launcher), so out-of-range
+  // workgroups exit without touching any memory.
+  int total_chunks = 0;
+  for (int b = 0; b < batch_size; ++b) {
+    const int seq_len = query_start_loc[b + 1] - query_start_loc[b];
+    total_chunks += (seq_len + chunk_size - 1) / chunk_size;
+  }
+  if (flat_chunk_id >= total_chunks) {
+    return;
+  }
+
+  float* slm_mem = static_cast<float*>(slm_mem_const.template get_multi_ptr<sycl::access::decorated::no>().get());
+  float* g_slm_ptr = slm_mem;
+
+  TiledMMA mma{};
+  auto wg_tile = mma.tile_mnk();
+  auto thr_mma = mma.get_slice(local_id);
+
+  static constexpr auto tile_m = get<0>(wg_tile);
+  static constexpr auto tile_n = get<1>(wg_tile);
+
+  static constexpr auto ATOM_M = get<1>(typename TiledMMA::ThrLayoutVMNK{}.shape());
+  static constexpr auto ATOM_N = get<2>(typename TiledMMA::ThrLayoutVMNK{}.shape());
+
+  static constexpr auto SG_M = tile_m / ATOM_M;
+  static constexpr auto SG_N = tile_n / ATOM_N;
+
+  auto sg_local_m_coord = cutlass::get_sub_group_id() / ATOM_N;
+  auto sg_local_n_coord = cutlass::get_sub_group_id() % ATOM_N;
+  int m_tile_start = 0;
+  int n_tile_start = 0;
+  int m_sg_start = sg_local_m_coord * SG_M;
+  int n_sg_start = sg_local_n_coord * SG_N;
+
+  const int kv_ratio = num_v_heads / num_k_heads;
+  const int chunk_start_offset = flat_chunk_id * chunk_size;
+
+  // Unlike the persistent kernel, no earlier loop iteration shares this
+  // workgroup's SLM, so no leading WAR fence is needed before the first fill.
+  CUTE_UNROLL
+  for (int e = local_id; e < chunk_size; e += local_range) {
+    g_slm_ptr[e] = a[(chunk_start_offset + e) + v_head_id * total_virtual_seqlen];
+  }
+
+  item.barrier(sycl::access::fence_space::local_space);
+
+  auto k_ptr =
+      k + static_cast<int64_t>(chunk_start_offset) * num_k_heads * head_k_dim + (v_head_id / kv_ratio) * head_k_dim;
+  auto K_tensor_shape = make_shape(chunk_size, head_k_dim);
+  auto K_tensor =
+      make_tensor(make_gmem_ptr(k_ptr), make_layout(K_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
+
+  auto A_ptr =
+      A + static_cast<int64_t>(v_head_id) * total_virtual_seqlen * chunk_size + chunk_start_offset * chunk_size;
+  auto A_tensor_shape = make_shape(chunk_size, chunk_size);
+  auto A_tensor = make_tensor(make_gmem_ptr(A_ptr), make_layout(A_tensor_shape, make_stride(chunk_size, _1{})));
+
+  Tensor cA = make_identity_tensor(A_tensor.shape());
+  Tensor gA_C = local_tile(cA, wg_tile, make_coord(0, 0, 0), Step<_1, _1, X>{});
+
+  auto copy_A_c = get_block_2d_copy_D<void>(mma, A_tensor);
+  auto thr_copy_A_c = copy_A_c.get_slice(local_id);
+  auto tCrA_c = thr_copy_A_c.partition_sg_fragment_S(gA_C);
+  auto tCgA_c = thr_copy_A_c.partition_D(gA_C);
+  auto tSrA_c = thr_mma.partition_sg_fragment_C(gA_C);
+
+  clear(tSrA_c);
+  gemm_TTS(K_tensor, K_tensor, tSrA_c, 0, 0, mma);
+
+  CUTE_UNROLL
+  for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
+    int n_idx = n_tile_start + n_sg_start + sn * sub_group_size + sg_local_id;
+    CUTE_UNROLL
+    for (int sm = 0; sm < SG_M; ++sm) {
+      int m_idx = m_tile_start + m_sg_start + sm;
+      float beta_value = b[(chunk_start_offset + m_idx) + v_head_id * total_virtual_seqlen];
+
+      tSrA_c(sn * SG_M + sm) *= sycl::exp(g_slm_ptr[(m_idx)] - g_slm_ptr[n_idx]) * beta_value;
+      if (m_idx == n_idx) {
+        tSrA_c(sn * SG_M + sm) = 1.0f;
+      }
+      if (m_idx < n_idx) {
+        tSrA_c(sn * SG_M + sm) = 0.0f;
+      }
+    }
+  }
+
+  reorder(tSrA_c, tCrA_c);
+  copy(copy_A_c, tCrA_c, tCgA_c);
 }
 
 template <typename T>
@@ -1100,6 +1224,9 @@ template <typename T, typename StateTag>
 class ChunkComputeAKernel;
 
 template <typename T, typename StateTag>
+class ChunkComputeAKernelConventional;
+
+template <typename T, typename StateTag>
 class ChunkInverseOptKernel;
 
 template <typename T, typename StateTag>
@@ -1142,7 +1269,7 @@ void kernel_launcher(
   auto op = XE_DPAS_TT<8, float, Element_non_CV>{};
 
   int sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
-  static constexpr int MaxThreadsPerSM = 512;
+  static constexpr int MaxThreadsPerSM = 512;  // 8 EU per sm, 4 HW thread per EU, 16 threads per HW thread
 
   namespace syclex = sycl::ext::oneapi::experimental;
   namespace intelex = sycl::ext::intel::experimental;
@@ -1168,31 +1295,73 @@ void kernel_launcher(
   using MMAComputeA =
       typename TiledMMAHelper<MMA_Atom<decltype(op)>, Layout<WGTileComputeA>, SGLayoutComputeA>::TiledMMA;
   auto mmaComputeA = MMAComputeA{};
-  int MaxThreadsPerWorkgroupComputeA = size(mmaComputeA);
-  sycl::range<3> local_compute_A(1, 1, MaxThreadsPerWorkgroupComputeA);
-  sycl::range<3> global_compute_A(1, sm_count * MaxThreadsPerSM / MaxThreadsPerWorkgroupComputeA, 1);
-  int slm_size_compute_A = chunk_size;
+  int MaxThreadsPerWorkgroupComputeA =
+      size(mmaComputeA);  // 64 = 4 subgroup (HW thread) * 16 threads per subgroup -> 1 EU
+  sycl::range<3> local_compute_A(
+      1, 1, MaxThreadsPerWorkgroupComputeA);  // 64 threads per workgroup -> one MMA tile -> 1 EU
+  int slm_size_compute_A = chunk_size;        // 64 hardcoded
 
-  queue.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<float, 1> local_mem(sycl::range<1>(slm_size_compute_A), cgh);
-    cgh.parallel_for<ChunkComputeAKernel<T, StateT>>(
-        sycl::nd_range<3>{global_compute_A * local_compute_A, local_compute_A}, kernel_props, [=](auto) {
-          chunk_compute_A_kernel<T, MMAComputeA>(
-              local_mem,
-              A,
-              k,
-              v,
-              b,
-              a,
-              query_start_loc,
-              total_virtual_seqlen,
-              batch_size,
-              num_k_heads,
-              head_k_dim,
-              num_v_heads,
-              head_v_dim);
-        });
-  });
+  // Runtime toggle (default off) to compare the persistent, grid-stride
+  // chunk_compute_A_kernel design against chunk_compute_A_kernel_conventional,
+  // which launches one workgroup per (chunk, v_head) pair and relies on the
+  // hardware block scheduler for load balancing.
+  static const bool use_conventional_compute_A = std::getenv("SGLANG_GDN_COMPUTE_A_CONVENTIONAL") != nullptr;
+
+  if (use_conventional_compute_A) {
+    // Grid is over-provisioned since the real chunk count depends on the
+    // ragged per-batch sequence lengths in query_start_loc, which is only
+    // known on device; out-of-range workgroups exit immediately (see
+    // chunk_compute_A_kernel_conventional).
+    std::cout << "Using the conventional kernel for compute A (one workgroup per chunk, v_head pair)" << std::endl;
+    const int total_chunks_upper_bound =
+        (total_virtual_seqlen + batch_size * (chunk_size - 1) + chunk_size - 1) / chunk_size;
+    sycl::range<3> global_compute_A_conv(total_chunks_upper_bound, num_v_heads, 1);
+
+    queue.submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<float, 1> local_mem(sycl::range<1>(slm_size_compute_A), cgh);
+      cgh.parallel_for<ChunkComputeAKernelConventional<T, StateT>>(
+          sycl::nd_range<3>{global_compute_A_conv * local_compute_A, local_compute_A}, kernel_props, [=](auto) {
+            chunk_compute_A_kernel_conventional<T, MMAComputeA>(
+                local_mem,
+                A,
+                k,
+                v,
+                b,
+                a,
+                query_start_loc,
+                total_virtual_seqlen,
+                batch_size,
+                num_k_heads,
+                head_k_dim,
+                num_v_heads,
+                head_v_dim);
+          });
+    });
+  } else {
+    sycl::range<3> global_compute_A(
+        1, sm_count * MaxThreadsPerSM / MaxThreadsPerWorkgroupComputeA, 1);  // = (1, 160, 1) = total EU number
+
+    queue.submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<float, 1> local_mem(sycl::range<1>(slm_size_compute_A), cgh);
+      cgh.parallel_for<ChunkComputeAKernel<T, StateT>>(
+          sycl::nd_range<3>{global_compute_A * local_compute_A, local_compute_A}, kernel_props, [=](auto) {
+            chunk_compute_A_kernel<T, MMAComputeA>(
+                local_mem,
+                A,
+                k,
+                v,
+                b,
+                a,
+                query_start_loc,
+                total_virtual_seqlen,
+                batch_size,
+                num_k_heads,
+                head_k_dim,
+                num_v_heads,
+                head_v_dim);
+          });
+    });
+  }
 
   using WGTileInverse = chunk_gemm_policy_inverse::WGTile;
   using SGLayoutInverse = chunk_gemm_policy_inverse::SGLayout;

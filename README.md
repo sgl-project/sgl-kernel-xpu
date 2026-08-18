@@ -1,6 +1,6 @@
 # SGL Kernel for XPU
 
-A fork of [Kernel Library](https://github.com/sgl-project/sglang/tree/main/sgl-kernel) for SGLang support on Intel GPU backend
+sglang-kernel-xpu is the official kernel library of the [SGLang](https://github.com/sgl-project/sglang) framework for Intel XPU, which delivers high-performance, production-ready compute primitives on Intel XPU platforms.
 
 [![PyPI](https://img.shields.io/pypi/v/sgl-kernel)](https://pypi.org/project/sgl-kernel)
 

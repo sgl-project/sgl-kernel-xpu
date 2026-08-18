@@ -690,10 +690,11 @@ void moe_grouped_mm_nt_xe20(
     double gemm1_limit = 7.0);
 
 // Unified int4/mxfp4 W4A16 MoE grouped GEMM.
-// `packed_weights` is int8 [E, N, K/2] with two 4-bit values per byte.
-// `scales` is [E, N, K/group_size], N-outer: bfloat16 direct multiplier for
-// int4, or uint8 E8M0 exponent for mxfp4 (decoded in registers). `zeros` is
-// an optional [E, N, K/group_size] bfloat16 tensor (int4-only) holding the
+// `packed_weights` is int8 or uint8 [E, N, K/2] with two 4-bit values per byte.
+// `scales` is [E, N, K/group_size], N-outer: activation-dtype direct
+// multiplier for int4, or an E8M0 exponent represented as uint8 or
+// float8_e8m0fnu for mxfp4 (decoded in registers). `zeros` is an optional
+// [E, N, K/group_size] activation-dtype tensor (int4-only) holding the
 // raw per-group zero-point in code units; when supplied, weights dequant as
 // `(code - zp) * scale` instead of requiring the zero-point to be pre-folded
 // into a signed 4-bit code (which overflows for non-symmetric zero-points).
@@ -793,6 +794,14 @@ void hc_split_sinkhorn(
     int64_t hc_mult,
     int64_t sinkhorn_iters,
     double eps);
+
+at::Tensor fused_hc_head(
+    const at::Tensor& x,
+    const at::Tensor& hc_fn,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    double norm_eps,
+    double hc_eps);
 
 void hc_pre_big_fuse(
     const at::Tensor& gemm_out_mul,
@@ -901,14 +910,17 @@ void top_k_renorm_probs(
     int64_t top_k_val);
 
 void top_p_renorm_probs(
-    at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_p_arr, double top_p_val);
+    const at::Tensor& probs,
+    at::Tensor& renorm_probs,
+    const std::optional<at::Tensor>& maybe_top_p_arr,
+    double top_p_val);
 
 void top_k_top_p_sampling_from_probs(
     at::Tensor probs,
     at::Tensor output,
     std::optional<at::Tensor> maybe_indices,
     std::optional<at::Tensor> maybe_top_k_arr,
-    double top_k_val,
+    int64_t top_k_val,
     std::optional<at::Tensor> maybe_top_p_arr,
     double top_p_val,
     bool deterministic,
@@ -981,6 +993,29 @@ void flash_compress128_prefill(
 
 void flash_compress4_decode(
     torch::Tensor kv_buffer, torch::Tensor kv_input, torch::Tensor kv_output, torch::Tensor ape, torch::Tensor plan_d);
+
+void flash_compress4_prefill(
+    torch::Tensor kv_buffer,
+    torch::Tensor kv_input,
+    torch::Tensor kv_output,
+    torch::Tensor ape,
+    torch::Tensor plan_c,
+    torch::Tensor plan_w);
+
+void fused_norm_rope_store(
+    torch::Tensor input,
+    torch::Tensor plan,
+    torch::Tensor norm_weight,
+    double norm_eps,
+    torch::Tensor freq_cis,
+    torch::Tensor out_loc,
+    torch::Tensor kvcache,
+    bool is_decode,
+    int64_t compress_ratio,
+    int64_t page_size,
+    bool use_fp4,
+    int64_t preshuffle_size,
+    bool use_bf16_store);
 
 }  // namespace at::native::xpu
 

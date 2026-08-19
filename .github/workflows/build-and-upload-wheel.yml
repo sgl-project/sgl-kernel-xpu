@@ -1,0 +1,109 @@
+name: Publish Wheel to S3
+
+on:
+  workflow_dispatch:
+    inputs:
+      wheel_url:
+        description: 'Wheel URL to fetch and upload'
+        required: true
+        default: 'https://af01p-ba.devtools.intel.com/artifactory/aipc_releases-ba-local/gpu/new/validation/IPEX/nightly/PVC/UBUNTU/sglang/sglang_kernel_xpu_release/v0.1.0-rc0/sglang_kernel_xpu-0.1.0-cp310-abi3-manylinux_2_38_x86_64.whl'
+      s3_prefix:
+        description: 'Override S3 key prefix (default: wheels/<branch>/<short-sha>/)'
+        required: false
+        default: ''
+
+concurrency:
+  group: publish-wheel-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-east-1
+  S3_BUCKET: sgl-kernel-xpu
+
+jobs:
+  publish:
+    runs-on: sglang-bmg
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Compute S3 prefix
+        id: meta
+        run: |
+          set -e
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          SAFE_REF="${GITHUB_REF_NAME//\//-}"
+          if [ -n "${{ inputs.s3_prefix }}" ]; then
+            S3_PREFIX="${{ inputs.s3_prefix }}"
+          else
+            S3_PREFIX="wheels/${SAFE_REF}/${SHORT_SHA}"
+          fi
+          S3_PREFIX="${S3_PREFIX#/}"
+          S3_PREFIX="${S3_PREFIX%/}"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "s3_prefix=${S3_PREFIX}" >> "$GITHUB_OUTPUT"
+          echo "Target: s3://${S3_BUCKET}/${S3_PREFIX}/"
+
+      - name: Fetch wheel
+        env:
+          WHEEL_URL: ${{ inputs.wheel_url }}
+        run: |
+          set -e
+          mkdir -p dist
+          FNAME=$(basename "${WHEEL_URL%%\?*}")
+          case "$FNAME" in
+            *.whl) ;;
+            *)
+              echo "::error::URL does not point to a .whl file: ${WHEEL_URL}"
+              exit 1
+              ;;
+          esac
+          echo "Downloading ${WHEEL_URL} -> dist/${FNAME}"
+          curl -fSL --retry 5 --retry-delay 10 -o "dist/${FNAME}" "${WHEEL_URL}"
+          ls -la dist/
+          python3 -c "import zipfile, sys; zipfile.ZipFile('dist/${FNAME}').testzip() or print('wheel OK')"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload wheel to S3
+        env:
+          S3_PREFIX: ${{ steps.meta.outputs.s3_prefix }}
+        run: |
+          set -e
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [ ${#wheels[@]} -eq 0 ]; then
+            echo "::error::No wheels found in dist/"
+            exit 1
+          fi
+          for wheel in "${wheels[@]}"; do
+            fname=$(basename "$wheel")
+            dest="s3://${S3_BUCKET}/${S3_PREFIX}/${fname}"
+            echo "Uploading ${wheel} -> ${dest}"
+            aws s3 cp "$wheel" "$dest" --no-progress
+          done
+          echo ""
+          echo "Uploaded wheels:"
+          aws s3 ls "s3://${S3_BUCKET}/${S3_PREFIX}/"
+
+      - name: Summary
+        if: always()
+        env:
+          S3_PREFIX: ${{ steps.meta.outputs.s3_prefix }}
+        run: |
+          {
+            echo "### Wheel publish"
+            echo ""
+            echo "- Source URL: ${{ inputs.wheel_url }}"
+            echo "- Commit: \`${{ steps.meta.outputs.short_sha }}\`"
+            echo "- S3 location: \`s3://${S3_BUCKET}/${S3_PREFIX}/\`"
+          } >> "$GITHUB_STEP_SUMMARY"

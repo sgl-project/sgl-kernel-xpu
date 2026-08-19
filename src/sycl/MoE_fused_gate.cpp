@@ -7,6 +7,7 @@
 #include "MemoryAccess.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 static constexpr int ROWS_PER_WG = 8;  // maximum CTA per work group
 static constexpr int MAX_VPT = 32;     // maximum VPT we support, > params.VPT = num_expert / num_expert_group
@@ -482,7 +483,7 @@ void moe_fused_gate_kernel_dynamic(
 //------------------------------------------------------------------------------
 // Host Launcher Function
 //------------------------------------------------------------------------------
-std::vector<at::Tensor> moe_fused_gate(
+SGL_KERNEL_EXPORT std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
     const std::optional<at::Tensor>& bias,
     int64_t num_expert_group,

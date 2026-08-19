@@ -6,6 +6,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 static constexpr int WG_SIZE = 256;  // threads per WG; tokens_per_wg = WG_SIZE / (HC*HC)
 static constexpr int HC = 4;
@@ -96,7 +97,7 @@ struct HCSplitSinkhornKernel {
   }
 };
 
-void hc_split_sinkhorn(
+SGL_KERNEL_EXPORT void hc_split_sinkhorn(
     const at::Tensor& mixes,
     const at::Tensor& hc_scale,
     const at::Tensor& hc_base,

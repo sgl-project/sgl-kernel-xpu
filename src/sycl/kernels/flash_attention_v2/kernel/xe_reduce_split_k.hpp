@@ -115,6 +115,8 @@ class ReduceSplitK {
   struct SharedStorage {
     cutlass::Array<ElementLSE, FMHAKernel_::max_num_kv_splits> max_logits_slm_array;
     cutlass::Array<ElementLSE, FMHAKernel_::max_num_kv_splits> exp_sums_slm_array;
+    cutlass::Array<ElementLSE, SGPerWG::value * intel::sg_size> acc_slm_array;
+    cutlass::Array<ElementLSE, SGPerWG::value * intel::sg_size> sum_slm_array;
   };
 
   static constexpr int SharedStorageSize = is_empty_v<SharedStorage> ? size_t(0) : sizeof(SharedStorage);
@@ -192,7 +194,7 @@ class ReduceSplitK {
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
-      auto [seq_idx, head_q, idx_b] = tile_scheduler.get_block_coord();
+      auto [seq_idx, head_q, idx_b, dim_tile] = tile_scheduler.get_block_coord();
       // Mix-batch dispatch: skip batches not owned by this kernel launch.
       if (p.skip_batch_mask != nullptr && p.skip_batch_mask[idx_b]) continue;
 
@@ -272,10 +274,15 @@ class ReduceSplitK {
       // broadcast to all other threads
       global_max_logits = sycl::group_broadcast(get_work_group<1>(), global_max_logits, 0);
 
-      for (int idx = thr_id; idx < s.head_size_vo; idx += SGPerWG::value * intel::sg_size) {
-        ElementLSE acc = 0;
-        global_exp_sums = 0;
-        for (int i = 0; i < num_kv_splits; ++i) {
+      constexpr int kDimTile = TileScheduler::kDimTile;
+      static_assert(kDimTile <= intel::sg_size, "reduction dim tile must fit in one sub-group");
+      int const dim_lo = dim_tile * kDimTile;
+      int const dim_hi = cute::min(dim_lo + kDimTile, s.head_size_vo);
+      int const idx = dim_lo + tid_in_sg;
+      ElementLSE acc = 0;
+      global_exp_sums = 0;
+      if (idx < dim_hi) {
+        for (int i = sub_group_id; i < num_kv_splits; i += SGPerWG::value) {
           if (i * num_blocks_per_split >= windowed_k_blocks) {
             break;
           }
@@ -296,11 +303,25 @@ class ReduceSplitK {
           // update global exp sum
           global_exp_sums += local_exp_sum * rescale;
         }
+      }
 
-        ElementLSE inv_global_exp_sums = 1. / global_exp_sums;
+      for (int sg = 0; sg < SGPerWG::value; ++sg) {
+        if (sub_group_id == sg) {
+          shared_storage.acc_slm_array[sg * intel::sg_size + tid_in_sg] = acc;
+          shared_storage.sum_slm_array[sg * intel::sg_size + tid_in_sg] = global_exp_sums;
+        }
+      }
+      sycl::group_barrier(get_work_group<3>());
 
-        acc *= inv_global_exp_sums;
-        O(seq_idx, idx, head_q, l_coord) = static_cast<ElementO>(acc);
+      if (sub_group_id == 0 && idx < dim_hi) {
+        ElementLSE total_acc = 0;
+        ElementLSE total_sum = 0;
+        CUTLASS_PRAGMA_UNROLL
+        for (int sg = 0; sg < SGPerWG::value; ++sg) {
+          total_acc += shared_storage.acc_slm_array[sg * intel::sg_size + tid_in_sg];
+          total_sum += shared_storage.sum_slm_array[sg * intel::sg_size + tid_in_sg];
+        }
+        O(seq_idx, idx, head_q, l_coord) = static_cast<ElementO>(total_acc / total_sum);
       }
     }
   }

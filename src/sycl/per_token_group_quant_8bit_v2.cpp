@@ -38,6 +38,7 @@
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "cutlass/float8.h"
+#include "sgl_kernel_export.h"
 
 namespace at::native::xpu {
 
@@ -221,8 +222,10 @@ struct MainKernel {
                       hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
                       output_token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
     } else {
-      static_assert(!SCALE_UE8M0);
-      scale_output = output_s + offset_num_groups;
+      // Plain row-major scale layout. Supports float scales (non-UE8M0) and, when
+      // instantiated with scale_packed_t=uint8_t, the UE8M0 byte written
+      // contiguously at the group index -- a plain [tokens, K/group] uint8 scale.
+      scale_output = reinterpret_cast<scale_element_t*>(output_s) + offset_num_groups;
     }
 
     // TMA alignment padding for column-major mode
@@ -708,7 +711,7 @@ void per_token_group_quant_8bit_kernel_impl(
   }
 }
 
-void sgl_per_token_group_quant_8bit_v2(
+SGL_KERNEL_EXPORT void sgl_per_token_group_quant_8bit_v2(
     // vanilla: (num_tokens, hidden_size)
     // fuse_silu_and_mul: (num_tokens, hidden_size * 2)
     // fuse_silu_and_mul + masked_layout: (num_experts, num_tokens-with-padding, hidden_size * 2)
@@ -794,7 +797,13 @@ void sgl_per_token_group_quant_8bit_v2(
         LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, true);            \
       }                                                                                                             \
     } else {                                                                                                        \
-      LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false);             \
+      if (scale_ue8m0) {                                                                                            \
+        /* Plain row-major UE8M0: output_s is uint8 [tokens, K/group] */                                            \
+        LAUNCH_KERNEL_INNER(                                                                                        \
+            NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, uint8_t, false, true, false, uint8_t);   \
+      } else {                                                                                                      \
+        LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false);           \
+      }                                                                                                             \
     }                                                                                                               \
   } while (0)
 

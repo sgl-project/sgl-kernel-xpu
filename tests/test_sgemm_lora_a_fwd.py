@@ -519,34 +519,59 @@ def _make_valid_kwargs():
 @pytest.mark.parametrize(
     "bad_case, expected_msg",
     [
-        ("input_x_dim", "input_x must be a 2D tensor"),
-        ("weights_dim", "weights must be a 3D tensor"),
-        ("seg_indptr_dim", "seg_indptr must be a 1D tensor"),
-        ("weight_indices_dim", "weight_indices must be a 1D tensor"),
-        ("lora_ranks_dim", "lora_ranks must be a 1D tensor"),
-        (
+        pytest.param("input_x_dim", "input_x must be a 2D tensor", id="input_x_dim"),
+        pytest.param("weights_dim", "weights must be a 3D tensor", id="weights_dim"),
+        pytest.param(
+            "seg_indptr_dim", "seg_indptr must be a 1D tensor", id="seg_indptr_dim"
+        ),
+        pytest.param(
+            "weight_indices_dim",
+            "weight_indices must be a 1D tensor",
+            id="weight_indices_dim",
+        ),
+        pytest.param(
+            "lora_ranks_dim", "lora_ranks must be a 1D tensor", id="lora_ranks_dim"
+        ),
+        pytest.param(
             "lora_ranks_size",
             "lora_ranks.numel\\(\\) must equal weights.size\\(0\\)",
+            id="lora_ranks_size",
         ),
-        (
+        pytest.param(
             "weight_indices_size",
             "weight_indices.numel\\(\\) must equal seg_indptr.numel\\(\\) - 1",
+            id="weight_indices_size",
         ),
-        (
+        pytest.param(
             "weight_indices_out_of_range",
             "weight_indices values must be in",
+            id="weight_indices_out_of_range",
         ),
-        ("seg_indptr_start_nonzero", "seg_indptr\\[0\\] must be 0"),
-        (
+        pytest.param(
+            "seg_indptr_start_nonzero",
+            "seg_indptr\\[0\\] must be 0",
+            id="seg_indptr_start_nonzero",
+        ),
+        pytest.param(
             "seg_indptr_end_mismatch",
             "seg_indptr\\[-1\\] must equal num_tokens",
+            id="seg_indptr_end_mismatch",
         ),
-        ("seg_indptr_decreasing", "seg_indptr must be non-decreasing"),
-        (
+        pytest.param(
+            "seg_indptr_decreasing",
+            "seg_indptr must be non-decreasing",
+            id="seg_indptr_decreasing",
+        ),
+        pytest.param(
             "lora_ranks_out_of_range",
             "lora_ranks must be within the range",
+            id="lora_ranks_out_of_range",
         ),
-        ("dtype_mismatch", "Input tensor dtype must match weights dtype"),
+        pytest.param(
+            "dtype_mismatch",
+            "Input tensor dtype must match weights dtype",
+            id="dtype_mismatch",
+        ),
     ],
 )
 def test_sgemm_lora_a_fwd_input_validation(bad_case, expected_msg):

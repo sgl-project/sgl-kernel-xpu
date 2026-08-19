@@ -6,6 +6,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 static constexpr int WG_SIZE = 256;
 static constexpr int D_BLOCK = 1024;  // Process D in 1024-element blocks
@@ -137,7 +138,7 @@ static void launch_hc_post_kernel(
   sycl_kernel_submit(sycl::range<2>(grid_x * WG_SIZE, grid_y), sycl::range<2>(WG_SIZE, 1), q, ker);
 }
 
-void hc_post(
+SGL_KERNEL_EXPORT void hc_post(
     const at::Tensor& x,
     const at::Tensor& residual,
     const at::Tensor& post_layer_mix,

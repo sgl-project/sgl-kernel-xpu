@@ -44,6 +44,12 @@
 #include "Utils.h"
 #include "kernels/lora/device/sgemm_lora_b_fwd_dispatch.hpp"
 #include "sgl_kernel_export.h"
+#ifdef USE_LORA_JIT
+#include <mutex>
+#include <string>
+
+#include "jit/lora_jit.h"
+#endif
 
 namespace {
 
@@ -57,6 +63,58 @@ namespace {
     sgemm_lora_b_fwd_impl::launch_sgemm_lora_b_fwd_##ELEM##_large(__VA_ARGS__); \
   } while (0)
 
+#ifdef USE_LORA_JIT
+using LoraBFwdFn = void (*)(
+    const torch::Tensor&,
+    const torch::Tensor&,
+    const torch::Tensor&,
+    const torch::Tensor&,
+    const torch::Tensor&,
+    torch::Tensor&,
+    const std::optional<torch::Tensor>&,
+    const int,
+    const int,
+    sycl::queue&);
+
+LoraBFwdFn resolve_lora_b_fwd(bool is_half, std::string* err) {
+  static std::mutex mu;
+  static LoraBFwdFn cache[2] = {nullptr, nullptr};
+  const int idx = is_half ? 0 : 1;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    if (cache[idx]) return cache[idx];
+  }
+  void* sym = sgl::lora_jit::resolve(
+      "sgemm_lora_b_fwd_kernel.cpp.in",
+      is_half ? "half" : "bf16",
+      "large",
+      is_half ? "at::Half" : "at::BFloat16",
+      "sgemm_lora_b_fwd_impl::LoraBFwdTileLarge",
+      "SGL_LORA_B_JIT_ENTRY",
+      "sgl_lora_b_fwd_entry",
+      is_half ? "sgemm_lora_b_fwd_half_large" : "sgemm_lora_b_fwd_bf16_large",
+      err);
+  LoraBFwdFn fn = reinterpret_cast<LoraBFwdFn>(sym);
+  if (fn) {
+    std::lock_guard<std::mutex> lk(mu);
+    cache[idx] = fn;
+  }
+  return fn;
+}
+
+#define DISPATCH_SGEMM_LORA_B_FWD_DTYPE(...)                                                               \
+  do {                                                                                                     \
+    const bool _is_half = weights.scalar_type() == torch::kHalf;                                           \
+    TORCH_CHECK(                                                                                           \
+        _is_half || weights.scalar_type() == torch::kBFloat16,                                             \
+        "Unsupported data type for sgemm_lora_b_fwd weights: ",                                            \
+        weights.scalar_type());                                                                           \
+    std::string _jit_err;                                                                                  \
+    LoraBFwdFn _fn = resolve_lora_b_fwd(_is_half, &_jit_err);                                               \
+    TORCH_CHECK(_fn, "sgemm_lora_b_fwd JIT: ", _jit_err);                                                   \
+    _fn(__VA_ARGS__);                                                                                       \
+  } while (0)
+#else
 #define DISPATCH_SGEMM_LORA_B_FWD_DTYPE(...)                                                               \
   do {                                                                                                     \
     switch (weights.scalar_type()) {                                                                       \
@@ -70,6 +128,7 @@ namespace {
         TORCH_CHECK(false, "Unsupported data type for sgemm_lora_b_fwd weights: ", weights.scalar_type()); \
     }                                                                                                      \
   } while (0)
+#endif
 
 }  // namespace
 

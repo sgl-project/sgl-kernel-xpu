@@ -76,11 +76,24 @@ if(USE_SYCL_JIT)
     # ahead of time. NSA/FP8 kernels have no feature toggle, so gate on JIT only.
     add_compile_definitions(USE_FP8_MQA_JIT)
 endif()
+if(USE_SYCL_JIT)
+    # Route the LoRA grouped-GEMM dispatch (SGEMMLoraAFwd/SGEMMLoraBFwd/QKVLoraBFwd)
+    # through the runtime-JIT path; their AOT per-(dtype,tile) instances are not
+    # generated (see the guarded includes below). LoRA has no feature toggle.
+    add_compile_definitions(USE_LORA_JIT)
+endif()
 if(USE_FMHA AND USE_SYCL_JIT)
     # Route the GDN chunk delta-rule dispatch (chunk_gated_delta_rule) through the
     # runtime-JIT path; its per-dtype kernel_launcher instances are not compiled
     # ahead of time (GDN shares the USE_FMHA toggle).
     add_compile_definitions(USE_GDN_JIT)
+endif()
+if(USE_FMHA AND USE_SYCL_JIT)
+    # Route the GDN non-chunk leaf kernels (causal_conv1d, gated_delta_rule,
+    # chunk_causal_conv1d[_tiled], l2norm) through the runtime-JIT path; their
+    # heavy per-(width,dtype,...) instances are compiled on demand instead of
+    # being baked into gdn_attention_Xe20.cpp.
+    add_compile_definitions(USE_GDN_ATTN_JIT)
 endif()
 if(USE_MLA)
     add_compile_definitions(USE_MLA)
@@ -131,9 +144,11 @@ foreach(file ${device_cpp})
 
 endforeach()
 
-include(${CMAKE_CURRENT_SOURCE_DIR}/SGEMMLoraAFwdXe20.cmake)
-include(${CMAKE_CURRENT_SOURCE_DIR}/SGEMMLoraBFwdXe20.cmake)
-include(${CMAKE_CURRENT_SOURCE_DIR}/QKVLoraBFwdXe20.cmake)
+if(NOT USE_SYCL_JIT)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/SGEMMLoraAFwdXe20.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/SGEMMLoraBFwdXe20.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/QKVLoraBFwdXe20.cmake)
+endif()
 if(USE_FMHA)
     if(NOT USE_SYCL_JIT)
         include(FMHADecodeXe20.cmake)

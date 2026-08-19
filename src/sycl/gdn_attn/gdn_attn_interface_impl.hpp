@@ -3,12 +3,18 @@
 #include <sycl/sycl.hpp>
 
 #include "../Utils.h"
+#ifdef USE_GDN_ATTN_JIT
+// JIT mode: the heavy leaf kernels are compiled on demand; pull in only their
+// inline forwarders so they are not instantiated into the AOT library.
+#include "gdn_attn_launchers.h"
+#else
 #include "causal_conv1d.hpp"
 #include "chunk_causal_conv1d.hpp"
 #include "chunk_causal_conv1d_tiled.hpp"
-#include "chunk_gated_delta_rule.h"
 #include "gated_delta_rule.hpp"
 #include "l2norm_kernel.hpp"
+#endif
+#include "chunk_gated_delta_rule.h"
 #include "sgl_kernel_export.h"
 
 // TODO: Further optimize these GDN kernel functions.

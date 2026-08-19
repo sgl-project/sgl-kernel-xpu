@@ -52,6 +52,12 @@
 #include "Utils.h"
 #include "kernels/lora/device/qkv_lora_b_fwd_dispatch.hpp"
 #include "sgl_kernel_export.h"
+#ifdef USE_LORA_JIT
+#include <mutex>
+#include <string>
+
+#include "jit/lora_jit.h"
+#endif
 
 namespace {
 
@@ -66,6 +72,59 @@ namespace {
   do {                                                                     \
     qkv_lora_b_fwd_impl::launch_qkv_lora_b_fwd_##ELEM##_tall(__VA_ARGS__); \
   } while (0)
+#ifdef USE_LORA_JIT
+using QKVLoraBFwdFn = void (*)(
+    const torch::Tensor&,
+    const torch::Tensor&,
+    const torch::Tensor&,
+    const torch::Tensor&,
+    const torch::Tensor&,
+    const torch::Tensor&,
+    torch::Tensor&,
+    const std::optional<torch::Tensor>&,
+    const int,
+    const int,
+    sycl::queue&);
+
+QKVLoraBFwdFn resolve_qkv_lora_b_fwd(bool is_half, std::string* err) {
+  static std::mutex mu;
+  static QKVLoraBFwdFn cache[2] = {nullptr, nullptr};
+  const int idx = is_half ? 0 : 1;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    if (cache[idx]) return cache[idx];
+  }
+  void* sym = sgl::lora_jit::resolve(
+      "qkv_lora_b_fwd_kernel.cpp.in",
+      is_half ? "half" : "bf16",
+      "tall",
+      is_half ? "at::Half" : "at::BFloat16",
+      "qkv_lora_b_fwd_impl::QKVLoraBFwdTileTall",
+      "SGL_LORA_QKV_B_JIT_ENTRY",
+      "sgl_lora_qkv_b_fwd_entry",
+      is_half ? "qkv_lora_b_fwd_half_tall" : "qkv_lora_b_fwd_bf16_tall",
+      err);
+  QKVLoraBFwdFn fn = reinterpret_cast<QKVLoraBFwdFn>(sym);
+  if (fn) {
+    std::lock_guard<std::mutex> lk(mu);
+    cache[idx] = fn;
+  }
+  return fn;
+}
+
+#define DISPATCH_QKV_LORA_B_FWD_DTYPE(...)                                                                     \
+  do {                                                                                                         \
+    const bool _is_half = qkv_lora_b.scalar_type() == torch::kHalf;                                            \
+    TORCH_CHECK(                                                                                               \
+        _is_half || qkv_lora_b.scalar_type() == torch::kBFloat16,                                              \
+        "Unsupported data type for qkv_lora_b_fwd qkv_lora_b: ",                                               \
+        qkv_lora_b.scalar_type());                                                                            \
+    std::string _jit_err;                                                                                      \
+    QKVLoraBFwdFn _fn = resolve_qkv_lora_b_fwd(_is_half, &_jit_err);                                            \
+    TORCH_CHECK(_fn, "qkv_lora_b_fwd JIT: ", _jit_err);                                                         \
+    _fn(__VA_ARGS__);                                                                                          \
+  } while (0)
+#else
 #define DISPATCH_QKV_LORA_B_FWD_DTYPE(...)                                                                     \
   do {                                                                                                         \
     switch (qkv_lora_b.scalar_type()) {                                                                        \
@@ -79,6 +138,7 @@ namespace {
         TORCH_CHECK(false, "Unsupported data type for qkv_lora_b_fwd qkv_lora_b: ", qkv_lora_b.scalar_type()); \
     }                                                                                                          \
   } while (0)
+#endif
 
 }  // namespace
 

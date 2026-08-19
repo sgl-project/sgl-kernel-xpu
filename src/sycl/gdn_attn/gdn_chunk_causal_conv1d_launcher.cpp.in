@@ -1,0 +1,39 @@
+// Standalone runtime-JIT module for gdn::chunk_causal_conv1d (untiled prefill).
+#define SYCL_INTEL_TARGET 20
+
+#include "sycl/gdn_attn/gdn_attn_utils.h"
+#include "sycl/gdn_attn/chunk_causal_conv1d.hpp"
+
+#ifdef SGL_GDN_CHUNK_CAUSAL_CONV1D_JIT_ENTRY
+extern "C" __attribute__((visibility("default"))) void sgl_gdn_chunk_causal_conv1d_entry(
+    sycl::queue& queue,
+    torch::Tensor& q_out,
+    torch::Tensor& k_out,
+    torch::Tensor& v_out,
+    torch::Tensor& z_out,
+    torch::Tensor& b_out,
+    torch::Tensor& a_out,
+    const torch::Tensor& mixed_qkvz,
+    const torch::Tensor& mixed_ba,
+    const torch::Tensor& conv_weights,
+    const std::optional<torch::Tensor>& conv_bias,
+    torch::Tensor& conv_states,
+    const torch::Tensor& query_start_loc,
+    const torch::Tensor& cache_indices,
+    const std::optional<torch::Tensor>& has_initial_state,
+    const gdn::ActMode& act_mode,
+    const int& pad_slot_id,
+    const int num_prefills,
+    const int num_decodes,
+    const bool reorder_input,
+    const int* token_indx,
+    int num_actual_tokens_override,
+    const bool fuse_l2norm) {
+  gdn::chunk_causal_conv1d(
+      queue, q_out, k_out, v_out, z_out, b_out, a_out, mixed_qkvz, mixed_ba, conv_weights, conv_bias, conv_states,
+      query_start_loc, cache_indices, has_initial_state, act_mode, pad_slot_id, num_prefills, num_decodes,
+      reorder_input, token_indx, num_actual_tokens_override, fuse_l2norm);
+}
+#endif
+
+#undef SYCL_INTEL_TARGET

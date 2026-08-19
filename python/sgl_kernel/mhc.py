@@ -250,5 +250,3 @@ def mhc_pre(
     )
 
     return post_mix, comb_mix, layer_input
-
-

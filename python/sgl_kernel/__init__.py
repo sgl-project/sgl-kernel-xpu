@@ -157,6 +157,7 @@ from sgl_kernel.sparse_flash_attn import (
     sparse_attn_varlen_func,
 )
 from sgl_kernel.speculative import (
+    TreeMaskMode,
     build_tree_kernel_efficient,
     segment_packbits,
     tree_speculative_sampling_target_only,

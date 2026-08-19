@@ -867,6 +867,8 @@ void verify_tree_greedy(
     at::Tensor target_predict,
     int64_t sycl_stream = 0);
 
+// tree_mask_mode mirrors sglang.srt.speculative.eagle_utils.TreeMaskMode:
+// 0 = FULL_MASK, 1 = QLEN_ONLY. QLEN_ONLY_BITPACKING (2) is not implemented.
 void build_tree_kernel_efficient(
     at::Tensor parent_list,
     at::Tensor selected_index,
@@ -878,7 +880,8 @@ void build_tree_kernel_efficient(
     at::Tensor retrive_next_sibling,
     int64_t topk,
     int64_t depth,
-    int64_t draft_token_num);
+    int64_t draft_token_num,
+    int64_t tree_mask_mode = 0);
 
 void segment_packbits(
     at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr, at::Tensor y, int64_t sycl_stream);

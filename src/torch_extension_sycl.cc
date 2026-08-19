@@ -480,9 +480,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   /* MHC FUSED POST+PRE */
   m.def(
-      "mhc_fused_post_pre_fma(Tensor x, Tensor residual, Tensor post_layer_mix, Tensor comb_res_mix, "
-      "Tensor fn, int n_splits=0) -> (Tensor, Tensor, Tensor)");
-  m.impl("mhc_fused_post_pre_fma", torch::kXPU, &mhc_fused_post_pre_fma);
+      "mhc_fused_post_pre(Tensor x, Tensor residual, Tensor post_layer_mix, Tensor comb_res_mix, "
+      "Tensor fn, Tensor hc_scale, Tensor hc_base, float rms_eps=1e-6, float hc_pre_eps=1e-6, "
+      "float hc_sinkhorn_eps=1e-6, float hc_post_mult_value=2.0, int sinkhorn_repeat=20, int n_splits=0, "
+      "Tensor? norm_weight=None, float? norm_eps=None) -> (Tensor, Tensor, Tensor, Tensor)");
+  m.impl("mhc_fused_post_pre", torch::kXPU, &mhc_fused_post_pre);
 
   /*
    * From LoRA

@@ -837,13 +837,22 @@ void hc_post(
  */
 void hc_pre_gemm_sqr_sum(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, const at::Tensor& B);
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> mhc_fused_post_pre_fma(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mhc_fused_post_pre(
     const at::Tensor& x,
     const at::Tensor& residual,
     const at::Tensor& post_layer_mix,
     const at::Tensor& comb_res_mix,
     const at::Tensor& fn,
-    int64_t n_splits = 0);
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    double rms_eps = 1e-6,
+    double hc_pre_eps = 1e-6,
+    double hc_sinkhorn_eps = 1e-6,
+    double hc_post_mult_value = 2.0,
+    int64_t sinkhorn_repeat = 20,
+    int64_t n_splits = 0,
+    std::optional<at::Tensor> norm_weight = std::nullopt,
+    std::optional<double> norm_eps = std::nullopt);
 
 /*
  * From csrc/speculative

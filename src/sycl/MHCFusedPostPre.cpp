@@ -396,3 +396,122 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> SGL_KERNEL_EXPORT mhc_fused_post_
 
   return {residual_cur, gemm_out_mul, gemm_out_sqrsum};
 }
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> SGL_KERNEL_EXPORT mhc_fused_post_pre(
+    const at::Tensor& x,
+    const at::Tensor& residual,
+    const at::Tensor& post_layer_mix,
+    const at::Tensor& comb_res_mix,
+    const at::Tensor& fn,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    double rms_eps,
+    double hc_pre_eps,
+    double hc_sinkhorn_eps,
+    double hc_post_mult_value,
+    int64_t sinkhorn_repeat,
+    int64_t n_splits,
+    std::optional<at::Tensor> norm_weight,
+    std::optional<double> norm_eps) {
+  CHECK_INPUT(x);
+  CHECK_INPUT(residual);
+  CHECK_INPUT(post_layer_mix);
+  CHECK_INPUT(comb_res_mix);
+  CHECK_INPUT(fn);
+  CHECK_INPUT(hc_scale);
+  CHECK_INPUT(hc_base);
+
+  TORCH_CHECK(x.dim() == 2, "x must be 2D [T, D]");
+  TORCH_CHECK(residual.dim() == 3, "residual must be 3D [T, HC, D]");
+
+  const int64_t num_tokens = x.size(0);
+  const int64_t hidden_size = x.size(1);
+  const int64_t hc_mult = residual.size(1);
+  TORCH_CHECK(hc_mult == 4, "mhc_fused_post_pre currently supports only HC=4");
+
+  at::Tensor post_2d = post_layer_mix;
+  if (post_2d.dim() == 3) {
+    TORCH_CHECK(post_2d.size(2) == 1, "post_layer_mix last dim must be 1 when rank=3");
+    post_2d = post_2d.squeeze(-1);
+  }
+  TORCH_CHECK(post_2d.dim() == 2, "post_layer_mix must be [T, HC] or [T, HC, 1]");
+  TORCH_CHECK(post_2d.size(0) == num_tokens && post_2d.size(1) == hc_mult, "post_layer_mix shape mismatch");
+
+  at::Tensor comb_3d = comb_res_mix;
+  if (comb_3d.dim() == 2) {
+    TORCH_CHECK(comb_3d.size(1) == hc_mult * hc_mult, "comb_res_mix rank-2 shape mismatch");
+    comb_3d = comb_3d.view({num_tokens, hc_mult, hc_mult});
+  }
+  TORCH_CHECK(comb_3d.dim() == 3, "comb_res_mix must be [T, HC, HC] or [T, HC*HC]");
+  TORCH_CHECK(
+      comb_3d.size(0) == num_tokens && comb_3d.size(1) == hc_mult && comb_3d.size(2) == hc_mult,
+      "comb_res_mix shape mismatch");
+
+  if (num_tokens > kSmallBatchThreshold) {
+    at::Tensor residual_cur = at::empty_like(residual);
+    hc_post(x, residual, post_2d, comb_3d, residual_cur);
+
+    const int64_t n_splits_pre = (n_splits > 0) ? n_splits : choose_large_batch_n_splits(num_tokens, hidden_size);
+    const int64_t hc_hidden = hc_mult * hidden_size;
+    const int64_t hc_mult3 = (2 + hc_mult) * hc_mult;
+
+    at::Tensor A = residual_cur.reshape({num_tokens, hc_hidden});
+    at::Tensor gemm_out_mul = at::empty({n_splits_pre, num_tokens, hc_mult3}, residual.options().dtype(at::kFloat));
+    at::Tensor gemm_out_sqrsum = at::empty({n_splits_pre, num_tokens}, residual.options().dtype(at::kFloat));
+    hc_pre_gemm_sqr_sum(gemm_out_mul, gemm_out_sqrsum, A, fn);
+
+    at::Tensor post_mix_cur = at::empty({num_tokens, hc_mult}, residual.options().dtype(at::kFloat));
+    at::Tensor comb_mix_cur = at::empty({num_tokens, hc_mult, hc_mult}, residual.options().dtype(at::kFloat));
+    at::Tensor layer_input_cur = at::empty({num_tokens, hidden_size}, x.options().dtype(at::kBFloat16));
+
+    hc_pre_big_fuse(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual_cur,
+        post_mix_cur,
+        comb_mix_cur,
+        layer_input_cur,
+        hc_mult,
+        sinkhorn_repeat,
+        n_splits_pre,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        norm_weight,
+        norm_eps);
+
+    return {residual_cur, post_mix_cur.unsqueeze(-1), comb_mix_cur, layer_input_cur};
+  }
+
+  const int64_t split_k = choose_n_splits(num_tokens, hc_mult * hidden_size, hidden_size, n_splits);
+  auto [residual_cur, gemm_out_mul, gemm_out_sqrsum] =
+      mhc_fused_post_pre_fma(x, residual, post_2d, comb_3d, fn, split_k);
+
+  at::Tensor post_mix_cur = at::empty({num_tokens, hc_mult}, residual.options().dtype(at::kFloat));
+  at::Tensor comb_mix_cur = at::empty({num_tokens, hc_mult, hc_mult}, residual.options().dtype(at::kFloat));
+  at::Tensor layer_input_cur = at::empty({num_tokens, hidden_size}, x.options().dtype(at::kBFloat16));
+
+  hc_pre_big_fuse(
+      gemm_out_mul,
+      gemm_out_sqrsum,
+      hc_scale,
+      hc_base,
+      residual_cur,
+      post_mix_cur,
+      comb_mix_cur,
+      layer_input_cur,
+      hc_mult,
+      sinkhorn_repeat,
+      split_k,
+      rms_eps,
+      hc_pre_eps,
+      hc_sinkhorn_eps,
+      hc_post_mult_value,
+      norm_weight,
+      norm_eps);
+
+  return {residual_cur, post_mix_cur.unsqueeze(-1), comb_mix_cur, layer_input_cur};
+}

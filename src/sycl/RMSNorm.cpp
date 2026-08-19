@@ -66,7 +66,7 @@ static inline RowStrides get_row_strides(const Tensor& t) {
   int64_t outer_stride = t.stride(-3);
   int64_t inner_size = t.size(-2);
   int64_t inner_stride = t.stride(-2);
-  if (((t.dim() == 3) && (t.size(0) == 1)) || t.size(-2) == 1 || outer_stride == inner_size * inner_stride) {
+  if (t.size(-3) == 1 || outer_stride == inner_size * inner_stride) {
     // Flattenable: a single stride describes all rows.
     return {inner_stride, 1, 0};
   }

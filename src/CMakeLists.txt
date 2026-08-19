@@ -63,6 +63,12 @@ if(USE_MLA AND USE_SYCL_JIT)
     # Route the MLA decode dispatch (mla_decode.cpp) through the runtime-JIT path.
     add_compile_definitions(USE_MLA_JIT)
 endif()
+if(USE_SYCL_JIT)
+    # Route the FP8 MQA-logits batched GEMM (Fp8MqaLogitsXe20.cpp) through the
+    # runtime-JIT path; its single heavy SYCL-TLA GEMM instance is not compiled
+    # ahead of time. NSA/FP8 kernels have no feature toggle, so gate on JIT only.
+    add_compile_definitions(USE_FP8_MQA_JIT)
+endif()
 if(USE_FMHA AND USE_SYCL_JIT)
     # Route the GDN chunk delta-rule dispatch (chunk_gated_delta_rule) through the
     # runtime-JIT path; its per-dtype kernel_launcher instances are not compiled

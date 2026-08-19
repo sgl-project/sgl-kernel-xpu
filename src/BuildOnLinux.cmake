@@ -6,7 +6,7 @@ set(SYCL_LINK_LIBRARIES_KEYWORD PRIVATE)
 # Runtime-JIT engine (pure host C++, depends only on libdl). Linked into the
 # SYCL libraries whose dispatch renders/compiles the *.cpp.in templates on
 # demand (flash_attention for FMHA, GroupGemmXe20 for MoE grouped GEMM).
-if(USE_JIT)
+if(USE_SYCL_JIT)
   add_library(sgl_jit STATIC
     ${SGL_OPS_XPU_ROOT}/src/jit/sycl_template_jit.cpp
     ${SGL_OPS_XPU_ROOT}/src/jit/fmha_jit.cpp
@@ -66,19 +66,19 @@ foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
 endforeach()
 
 # Dispatchers that call the runtime-JIT engine link the static JIT library.
-if(USE_FMHA AND USE_JIT AND TARGET sgl-ops-sycl-flash_attention)
+if(USE_FMHA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-flash_attention)
   target_link_libraries(sgl-ops-sycl-flash_attention PRIVATE sgl_jit)
 endif()
-if(USE_MLA AND USE_JIT AND TARGET sgl-ops-sycl-mla_decode)
+if(USE_MLA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-mla_decode)
   target_link_libraries(sgl-ops-sycl-mla_decode PRIVATE sgl_jit)
 endif()
-if(USE_MLA AND USE_JIT AND TARGET sgl-ops-sycl-mla_prefill)
+if(USE_MLA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-mla_prefill)
   target_link_libraries(sgl-ops-sycl-mla_prefill PRIVATE sgl_jit)
 endif()
-if(USE_MLA AND USE_JIT AND TARGET sgl-ops-sycl-mla_sparse_decode)
+if(USE_MLA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-mla_sparse_decode)
   target_link_libraries(sgl-ops-sycl-mla_sparse_decode PRIVATE sgl_jit)
 endif()
-if(USE_MLA AND USE_JIT AND TARGET sgl-ops-sycl-mla_sparse_prefill)
+if(USE_MLA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-mla_sparse_prefill)
   target_link_libraries(sgl-ops-sycl-mla_sparse_prefill PRIVATE sgl_jit)
 endif()
 
@@ -196,15 +196,15 @@ foreach(sycl_src ${ATen_XPU_SYCL_XE20})
 endforeach()
 
 # The bf16 grouped GEMM dispatch in GroupGemmXe20.cpp calls the runtime-JIT engine.
-if(USE_MOE AND USE_JIT AND TARGET sgl-ops-sycl-GroupGemmXe20)
+if(USE_MOE AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-GroupGemmXe20)
   target_link_libraries(sgl-ops-sycl-GroupGemmXe20 PRIVATE sgl_jit)
 endif()
 # The W4A16 grouped GEMM dispatch in GroupGemmW4A16Xe20.cpp calls the JIT engine.
-if(USE_MOE AND USE_JIT AND TARGET sgl-ops-sycl-GroupGemmW4A16Xe20)
+if(USE_MOE AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-GroupGemmW4A16Xe20)
   target_link_libraries(sgl-ops-sycl-GroupGemmW4A16Xe20 PRIVATE sgl_jit)
 endif()
 # The GDN chunk delta-rule dispatch (chunk_gated_delta_rule.cpp) calls the JIT engine.
-if(USE_FMHA AND USE_JIT AND TARGET sgl-ops-sycl-chunk_gated_delta_rule)
+if(USE_FMHA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-chunk_gated_delta_rule)
   target_link_libraries(sgl-ops-sycl-chunk_gated_delta_rule PRIVATE sgl_jit)
 endif()
 

@@ -311,57 +311,18 @@ inline int64_t choose_n_splits(int64_t t, int64_t hc_hidden, int64_t hidden_size
 
 }  // namespace
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> SGL_KERNEL_EXPORT mhc_fused_post_pre_fma(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> launch_mhc_fused_post_pre_fma_kernel(
     const at::Tensor& x,
     const at::Tensor& residual,
-    const at::Tensor& post_layer_mix,
-    const at::Tensor& comb_res_mix,
+    const at::Tensor& post_2d,
+    const at::Tensor& comb_3d,
     const at::Tensor& fn,
     int64_t n_splits) {
-  CHECK_INPUT(x);
-  CHECK_INPUT(residual);
-  CHECK_INPUT(post_layer_mix);
-  CHECK_INPUT(comb_res_mix);
-  CHECK_INPUT(fn);
-
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16, "x must be bfloat16");
-  TORCH_CHECK(residual.scalar_type() == at::kBFloat16, "residual must be bfloat16");
-  TORCH_CHECK(post_layer_mix.scalar_type() == at::kFloat, "post_layer_mix must be float32");
-  TORCH_CHECK(comb_res_mix.scalar_type() == at::kFloat, "comb_res_mix must be float32");
-  TORCH_CHECK(fn.scalar_type() == at::kFloat, "fn must be float32");
-
-  TORCH_CHECK(x.dim() == 2, "x must be 2D [T, D]");
-  TORCH_CHECK(residual.dim() == 3, "residual must be 3D [T, HC, D]");
-
   const int64_t t = x.size(0);
   const int64_t hidden_size = x.size(1);
   const int64_t hc_mult = residual.size(1);
   const int64_t hc_mult3 = (2 + hc_mult) * hc_mult;
   const int64_t hc_hidden = hc_mult * hidden_size;
-
-  TORCH_CHECK(residual.size(0) == t, "residual T mismatch");
-  TORCH_CHECK(residual.size(2) == hidden_size, "residual D mismatch");
-  TORCH_CHECK(hc_mult == 4, "mhc_fused_post_pre_fma currently supports only HC=4");
-  TORCH_CHECK(fn.dim() == 2, "fn must be 2D [HC3, HC*D]");
-  TORCH_CHECK(fn.size(0) == hc_mult3, "fn row mismatch");
-  TORCH_CHECK(fn.size(1) == hc_hidden, "fn column mismatch");
-
-  at::Tensor post_2d = post_layer_mix;
-  if (post_2d.dim() == 3) {
-    TORCH_CHECK(post_2d.size(2) == 1, "post_layer_mix last dim must be 1 when rank=3");
-    post_2d = post_2d.squeeze(-1);
-  }
-  TORCH_CHECK(post_2d.dim() == 2, "post_layer_mix must be [T, HC] or [T, HC, 1]");
-  TORCH_CHECK(post_2d.size(0) == t && post_2d.size(1) == hc_mult, "post_layer_mix shape mismatch");
-
-  at::Tensor comb_3d = comb_res_mix;
-  if (comb_3d.dim() == 2) {
-    TORCH_CHECK(comb_3d.size(1) == hc_mult * hc_mult, "comb_res_mix rank-2 shape mismatch");
-    comb_3d = comb_3d.view({t, hc_mult, hc_mult});
-  }
-  TORCH_CHECK(comb_3d.dim() == 3, "comb_res_mix must be [T, HC, HC] or [T, HC*HC]");
-  TORCH_CHECK(
-      comb_3d.size(0) == t && comb_3d.size(1) == hc_mult && comb_3d.size(2) == hc_mult, "comb_res_mix shape mismatch");
 
   const int64_t n_splits_pre = choose_n_splits(t, hc_hidden, hidden_size, n_splits);
   at::Tensor residual_cur = at::empty_like(residual);
@@ -488,7 +449,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> SGL_KERNEL_EXPORT mhc
 
   const int64_t split_k = choose_n_splits(num_tokens, hc_mult * hidden_size, hidden_size, n_splits);
   auto [residual_cur, gemm_out_mul, gemm_out_sqrsum] =
-      mhc_fused_post_pre_fma(x, residual, post_2d, comb_3d, fn, split_k);
+      launch_mhc_fused_post_pre_fma_kernel(x, residual, post_2d, comb_3d, fn, split_k);
 
   at::Tensor post_mix_cur = at::empty({num_tokens, hc_mult}, residual.options().dtype(at::kFloat));
   at::Tensor comb_mix_cur = at::empty({num_tokens, hc_mult, hc_mult}, residual.options().dtype(at::kFloat));

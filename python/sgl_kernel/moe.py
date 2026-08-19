@@ -561,17 +561,17 @@ def fused_experts(
     ), "current MoE does not support a2_scale (fp8 activation scale is computed internally)"
     assert block_shape is None, "current MoE does not support block_shape"
     if use_fp8_w8a8:
-        assert activation in ("silu", "gelu"), (
-            "use_fp8_w8a8=True supports silu, gelu, GPT-OSS SwiGLU, and "
-            "DeepSeek-V4 clamped SwiGLU only"
+        assert activation in ("silu", "gelu", "relu2"), (
+            "use_fp8_w8a8=True supports silu, gelu, relu2, GPT-OSS SwiGLU, "
+            "and DeepSeek-V4 clamped SwiGLU only"
         )
         assert (
             w1_g_idx_perm is None and w2_g_idx_perm is None
         ), "w1_g_idx_perm/w2_g_idx_perm are only supported by the INT4 W4A16 path"
-        if activation == "gelu":
+        if activation == "gelu" or activation == "relu2":
             assert (
                 gemm1_alpha is None and gemm1_limit is None and swiglu_limit is None
-            ), "gelu cannot be combined with a SwiGLU alpha or clamp"
+            ), f"{activation} cannot be combined with a SwiGLU alpha or clamp"
         elif gemm1_alpha is not None:
             assert gemm1_limit is not None and swiglu_limit is None, (
                 "GPT-OSS SwiGLU requires gemm1_alpha and gemm1_limit, "
@@ -815,15 +815,25 @@ def fused_experts(
     if use_fp8_w8a8:
         # FP8 (E4M3) W8A8 path. Activations are quantized per-token (one
         # fp32 scale per row) right before each expert GEMM, matching the
-        # CUTLASS/FlashInfer fp8 MoE contract (see xpu_fp8_moe_minimal_plan.md).
+        # CUTLASS/FlashInfer fp8 MoE contract.
         # Weight scales are expected as 2-D block-quant [E, N/128, K/128]
         # (DeepSeek-style) and are expanded to per-N-row here, since the
-        # kernel's block-scale granularity is (per-N-row, per-128-K-group) -
-        # see sgl-kernel-xpu/src/sycl/kernels/moe/xe20/fp8_w8a8/moe_mainloop.hpp.
-        #
+        # kernel's block-scale granularity is (per-N-row, per-128-K-group).
+
         if activation == "gelu":
             activation_type = 1
+        elif activation == "relu2":
+            activation_type = 3
+        elif activation != "silu":
+            raise ValueError(
+                f"FP8 W8A8 MoE does not support activation={activation!r}; "
+                "supported activations are 'silu', 'gelu', and 'relu2'"
+            )
         elif gemm1_alpha is not None:
+            if gemm1_limit is None:
+                raise AssertionError(
+                    "gemm1_limit must be provided when gemm1_alpha is set for swiglu for GPT-OSS"
+                )
             activation_type = 2
         elif swiglu_limit is not None:
             activation_type = 4
@@ -840,8 +850,11 @@ def fused_experts(
 
         input_A_shuffle_fp8, a1_scale = _quant_fp8_per_token_group(input_A_shuffle)
 
+        gemm1_output_width = N if activation_type == 3 else 2 * N
         intermediate_cache1 = torch.empty(
-            (M * TopK, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype
+            (M * TopK, gemm1_output_width),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
         )
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a8(
             intermediate_cache1,
@@ -875,6 +888,8 @@ def fused_experts(
             intermediate_cache2 = torch.ops.sgl_kernel.swiglu_gpt_oss_sigmoid_alpha(
                 intermediate_cache1, gemm1_alpha, gemm1_limit
             )
+        elif activation_type == 3:
+            intermediate_cache2 = torch.square(torch.relu(intermediate_cache1))
         else:
             raise AssertionError(f"unsupported FP8 activation type: {activation_type}")
 

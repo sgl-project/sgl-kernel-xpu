@@ -1059,11 +1059,14 @@ def torch_naive_moe_fp8_w8a8(
             ].float()
             if activation == "silu":
                 act_fn = F.silu
+            elif activation == "relu2":
+                tmp = torch.square(torch.relu(gemm1.to(a.dtype)))
             elif activation == "gelu":
                 act_fn = lambda x: F.gelu(x, approximate="tanh")
             else:
                 raise AssertionError(f"unsupported test activation: {activation}")
-            tmp = apply_act_and_mul(gemm1.to(a.dtype), act_fn)
+            if activation != "relu2":
+                tmp = apply_act_and_mul(gemm1.to(a.dtype), act_fn)
             _, tmp_dq = _quant_dequant_fp8_per_token_group(tmp)
             gemm2 = (tmp_dq.float() @ w2_dq[i].float().transpose(0, 1)) + b2[i].float()
             out[mask] = gemm2.to(a.dtype)
@@ -1215,6 +1218,60 @@ def test_moe_gemm_fp8_w8a8_gelu_split_activation():
         topk_weight.to("xpu"),
         topk_ids.to("xpu"),
         activation="gelu",
+        use_fp8_w8a8=True,
+        w1_scale=w1_scale.to("xpu"),
+        w2_scale=w2_scale.to("xpu"),
+    )
+    torch.testing.assert_close(
+        torch_output, sglang_output.to("cpu"), rtol=1e-1, atol=1e-2
+    )
+
+
+def test_moe_gemm_fp8_w8a8_relu2():
+    """Cover FP8's non-gated ReLU2 path with a single-width GEMM1 output."""
+    torch.manual_seed(2)
+    torch.xpu.manual_seed_all(2)
+    num_tokens, topk, num_experts = 17, 2, 8
+    hidden_size = intermediate_size = 256
+
+    a = create_random_cpu_tensor((num_tokens, hidden_size), torch.bfloat16)
+    w1_bf16 = create_random_cpu_tensor(
+        (num_experts, intermediate_size, hidden_size), torch.bfloat16
+    )
+    w2_bf16 = create_random_cpu_tensor(
+        (num_experts, hidden_size, intermediate_size), torch.bfloat16
+    )
+    b1 = create_random_cpu_tensor(
+        (num_experts, intermediate_size), torch.float32, std=0.005
+    )
+    b2 = create_random_cpu_tensor((num_experts, hidden_size), torch.float32, std=0.005)
+    score = torch.randn((num_tokens, num_experts), dtype=torch.bfloat16)
+    topk_weight, topk_ids = torch.topk(
+        torch.softmax(score, dim=-1, dtype=torch.float32), topk
+    )
+    w1_scale, w1_dq = _quant_dequant_fp8_block(w1_bf16)
+    w2_scale, w2_dq = _quant_dequant_fp8_block(w2_bf16)
+
+    torch_output = torch_naive_moe_fp8_w8a8(
+        a,
+        w1_dq,
+        w2_dq,
+        topk_ids,
+        topk_weight,
+        topk,
+        b1,
+        b2,
+        activation="relu2",
+    )
+    sglang_output = fused_experts(
+        a.to("xpu"),
+        w1_dq.to(torch.float8_e4m3fn).to("xpu"),
+        w2_dq.to(torch.float8_e4m3fn).to("xpu"),
+        topk_weight.to("xpu"),
+        topk_ids.to("xpu"),
+        b1.to("xpu"),
+        b2.to("xpu"),
+        activation="relu2",
         use_fp8_w8a8=True,
         w1_scale=w1_scale.to("xpu"),
         w2_scale=w2_scale.to("xpu"),

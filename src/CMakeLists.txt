@@ -32,10 +32,18 @@ option(USE_SYCL_JIT "Enable runtime-JIT kernels (opt-in; drops their AOT .so ins
 
 foreach(_toggle USE_MOE USE_FMHA USE_GDN USE_MLA USE_MLA_SPARSE_FUSED USE_SYCL_JIT)
     if(DEFINED ENV{${_toggle}} AND NOT "$ENV{${_toggle}}" STREQUAL "")
-        if("$ENV{${_toggle}}")
+        # Normalize the env value so 1 / On / ON / on / true / yes all enable and
+        # 0 / Off / OFF / false / no disable, independent of CMake's if(<string>)
+        # constant quirks.
+        string(TOUPPER "$ENV{${_toggle}}" _toggle_val)
+        if(_toggle_val MATCHES "^(1|ON|YES|TRUE|Y)$")
             set(${_toggle} ON)
-        else()
+        elseif(_toggle_val MATCHES "^(0|OFF|NO|FALSE|N)$")
             set(${_toggle} OFF)
+        else()
+            message(FATAL_ERROR
+                "Invalid value for ${_toggle}: '$ENV{${_toggle}}' "
+                "(expected one of 1/ON/On/true/yes or 0/OFF/Off/false/no)")
         endif()
     endif()
 endforeach()

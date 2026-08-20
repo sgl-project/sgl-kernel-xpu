@@ -9,6 +9,7 @@ set(SYCL_LINK_LIBRARIES_KEYWORD PRIVATE)
 if(USE_SYCL_JIT)
   add_library(sgl_jit STATIC
     ${SGL_OPS_XPU_ROOT}/src/jit/sycl_template_jit.cpp
+    ${SGL_OPS_XPU_ROOT}/src/jit/jit_arch.cpp
     ${SGL_OPS_XPU_ROOT}/src/jit/fmha_jit.cpp
     ${SGL_OPS_XPU_ROOT}/src/jit/moe_jit.cpp
     ${SGL_OPS_XPU_ROOT}/src/jit/mla_jit.cpp

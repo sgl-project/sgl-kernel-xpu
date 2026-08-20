@@ -135,18 +135,26 @@ Caches& caches() {
 
 }  // namespace
 
+const std::string& default_sycl_target() {
+  static const std::string target = [] {
+    // Default AOT target is Battlemage (Xe20). Override with
+    // SGLANG_SYCL_AOT_TARGETS (same knob as the Python JIT path); e.g. "spir64"
+    // emits portable SPIR-V and defers device codegen to the runtime driver JIT.
+    // Per-architecture callers pass an explicit CompileSpec::target instead.
+    if (const char* t = std::getenv("SGLANG_SYCL_AOT_TARGETS")) {
+      if (*t) return std::string(t);
+    }
+    return std::string("intel_gpu_bmg_g21");
+  }();
+  return target;
+}
+
 const std::vector<std::string>& default_sycl_flags() {
   static const std::vector<std::string> flags = [] {
-    // Default AOT target is Battlemage: fast first kernel launch but a slow
-    // (~45s) icpx compile because the ocloc/IGC device-ISA stage dominates.
-    // Override with SGLANG_SYCL_AOT_TARGETS (same knob as the Python JIT path):
-    // e.g. "spir64" emits portable SPIR-V and defers device codegen to the
-    // runtime driver JIT, which cuts the compile sharply (skips ocloc/IGC) at
-    // the cost of a one-time driver JIT on first launch (driver-cached).
-    std::string target = "intel_gpu_bmg_g21";
-    if (const char* t = std::getenv("SGLANG_SYCL_AOT_TARGETS")) {
-      if (*t) target = t;
-    }
+    // NOTE: `-fsycl-targets` is intentionally NOT here -- it is appended
+    // per-spec in get_or_compile from CompileSpec::target (or
+    // default_sycl_target) so that Xe20 (BMG) and Xe35 (XE3P) kernels, whose
+    // device code differs, compile with distinct targets in the same process.
     return std::vector<std::string>{
         "-fsycl",
         "-sycl-std=2020",
@@ -164,7 +172,6 @@ const std::vector<std::string>& default_sycl_flags() {
         "-fno-sycl-instrument-device-code",
         "-D_GLIBCXX_USE_CXX11_ABI=1",
         "-DCUTLASS_ENABLE_SYCL",
-        "-fsycl-targets=" + target,
         "-Xspirv-translator",
         "-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,"
         "+SPV_INTEL_subgroup_matrix_multiply_accumulate",
@@ -219,6 +226,10 @@ void* get_or_compile(const CompileSpec& spec, const JitConfig& config, std::stri
     flags.push_back(f);
   for (const auto& f : spec.extra_flags)
     flags.push_back(f);
+  // Device target is per-spec so distinct GPU archs (Xe20/Xe35) compile
+  // separately in one process. It is part of `flags` => part of the cache key
+  // below, so each target gets its own cached .so.
+  flags.push_back("-fsycl-targets=" + (spec.target.empty() ? default_sycl_target() : spec.target));
 
   // Cache key: rendered source + flags + includes + entry + compiler version.
   std::string key_material = source;

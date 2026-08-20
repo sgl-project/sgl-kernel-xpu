@@ -5,6 +5,7 @@
 #include <unordered_map>
 
 #include "jit/sycl_template_jit.h"
+#include "jit/jit_arch.h"
 
 namespace sgl {
 namespace moe_jit {
@@ -60,8 +61,9 @@ int select_tile(int avg_m, int gemm_k, int gemm_n, bool fuse_act) {
   return fuse_act ? 5 : 6;
 }
 
-uint64_t pack_key(int tile_id, int act, bool fuse, bool bias) {
-  uint64_t k = static_cast<uint64_t>(tile_id) & 0xFF;
+uint64_t pack_key(int tile_id, int act, bool fuse, bool bias, int arch) {
+  uint64_t k = static_cast<uint64_t>(arch) & 0xFF;
+  k = (k << 8) | (static_cast<uint64_t>(tile_id) & 0xFF);
   k = (k << 8) | (static_cast<uint64_t>(act) & 0xFF);
   k = (k << 1) | (fuse ? 1u : 0u);
   k = (k << 1) | (bias ? 1u : 0u);
@@ -71,8 +73,8 @@ uint64_t pack_key(int tile_id, int act, bool fuse, bool bias) {
 std::mutex g_mu;
 std::unordered_map<uint64_t, KernelFn> g_fns;
 
-KernelFn resolve(int tile_id, int act, bool fuse, bool bias, std::string* err) {
-  const uint64_t key = pack_key(tile_id, act, fuse, bias);
+KernelFn resolve(int tile_id, int act, bool fuse, bool bias, int arch, std::string* err) {
+  const uint64_t key = pack_key(tile_id, act, fuse, bias, arch);
   {
     std::lock_guard<std::mutex> lk(g_mu);
     auto it = g_fns.find(key);
@@ -96,10 +98,13 @@ KernelFn resolve(int tile_id, int act, bool fuse, bool bias, std::string* err) {
   spec.subs["ACT_TYPE"] = std::to_string(act);
   spec.subs["FUSE_ACT"] = fuse ? "true" : "false";
   spec.subs["WITH_BIAS"] = bias ? "true" : "false";
+  const jit::ArchProfile& prof = jit::arch_profile(static_cast<jit::Arch>(arch));
   spec.extra_flags = {"-DSGL_MOE_JIT_ENTRY"};
+  if (!prof.macro.empty()) spec.extra_flags.push_back("-D" + prof.macro);
+  spec.target = prof.target;
   spec.entry_symbol = "sgl_moe_gg_entry";
   spec.name = std::string("group_gemm_xe20_t") + std::to_string(tile_id) + "_a" + std::to_string(act) + "_f" +
-              (fuse ? "1" : "0") + "_b" + (bias ? "1" : "0");
+              (fuse ? "1" : "0") + "_b" + (bias ? "1" : "0") + "_" + prof.suffix;
 
   void* sym = jit::get_or_compile(spec, cfg, err);
   if (!sym) return nullptr;
@@ -133,9 +138,10 @@ bool grouped_gemm_launch(
     float gemm1_alpha,
     float gemm1_limit,
     int ld_b,
+    int arch,
     std::string* err) {
   const int tile_id = select_tile(avg_m, gemm_k, gemm_n, fuse_act);
-  KernelFn fn = resolve(tile_id, activation_type, fuse_act, with_bias, err);
+  KernelFn fn = resolve(tile_id, activation_type, fuse_act, with_bias, arch, err);
   if (!fn) return false;
   fn(queue,
      activations,
@@ -190,8 +196,9 @@ int w4a16_policy_id(int avg_m) {
   return 3;
 }
 
-uint64_t pack_w4a16_key(int policy_id, bool is_int4, bool is_fp16) {
-  uint64_t k = static_cast<uint64_t>(policy_id) & 0xFF;
+uint64_t pack_w4a16_key(int policy_id, bool is_int4, bool is_fp16, int arch) {
+  uint64_t k = static_cast<uint64_t>(arch) & 0xFF;
+  k = (k << 8) | (static_cast<uint64_t>(policy_id) & 0xFF);
   k = (k << 1) | (is_int4 ? 1u : 0u);
   k = (k << 1) | (is_fp16 ? 1u : 0u);
   return k;
@@ -200,9 +207,9 @@ uint64_t pack_w4a16_key(int policy_id, bool is_int4, bool is_fp16) {
 std::mutex g_w4a16_mu;
 std::unordered_map<uint64_t, W4A16Fn> g_w4a16_fns;
 
-W4A16Fn resolve_w4a16(int avg_m, bool is_int4, bool is_fp16, std::string* err) {
+W4A16Fn resolve_w4a16(int avg_m, bool is_int4, bool is_fp16, int arch, std::string* err) {
   const int policy_id = w4a16_policy_id(avg_m);
-  const uint64_t key = pack_w4a16_key(policy_id, is_int4, is_fp16);
+  const uint64_t key = pack_w4a16_key(policy_id, is_int4, is_fp16, arch);
   {
     std::lock_guard<std::mutex> lk(g_w4a16_mu);
     auto it = g_w4a16_fns.find(key);
@@ -226,10 +233,13 @@ W4A16Fn resolve_w4a16(int avg_m, bool is_int4, bool is_fp16, std::string* err) {
   spec.subs["POLICY"] = w4a16_policy(avg_m);
   spec.subs["ELEMENT_A"] = elem_a;
   spec.subs["ELEMENT_S"] = is_int4 ? elem_a : "uint8_t";
+  const jit::ArchProfile& prof = jit::arch_profile(static_cast<jit::Arch>(arch));
   spec.extra_flags = {"-DSGL_W4A16_JIT_ENTRY"};
+  if (!prof.macro.empty()) spec.extra_flags.push_back("-D" + prof.macro);
+  spec.target = prof.target;
   spec.entry_symbol = "sgl_moe_w4a16_entry";
   spec.name = std::string("group_gemm_w4a16_p") + std::to_string(policy_id) + (is_int4 ? "_int4" : "_mxfp4") +
-              (is_fp16 ? "_fp16" : "_bf16");
+              (is_fp16 ? "_fp16" : "_bf16") + "_" + prof.suffix;
 
   void* sym = jit::get_or_compile(spec, cfg, err);
   if (!sym) return nullptr;
@@ -261,8 +271,9 @@ bool w4a16_grouped_gemm_launch(
     int num_experts,
     int group_size,
     int* atomic_buffer,
+    int arch,
     std::string* err) {
-  W4A16Fn fn = resolve_w4a16(avg_m, is_int4, is_fp16, err);
+  W4A16Fn fn = resolve_w4a16(avg_m, is_int4, is_fp16, arch, err);
   if (!fn) return false;
   fn(queue,
      activations,

@@ -58,6 +58,7 @@ suites = {
         TestFile("test_fp8_paged_mqa_logits.py"),
         TestFile("test_c128_v2.py"),
         TestFile("test_c4_v2.py"),
+        TestFile("test_dsv4_attn_metadata.py"),
         TestFile("test_fused_q_indexer_rope_hadamard_quant.py"),
         TestFile("test_fused_norm_rope_v2.py"),
         TestFile("test_hc_post.py"),

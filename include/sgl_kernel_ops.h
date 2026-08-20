@@ -1013,6 +1013,16 @@ void flash_compress128_prefill(
     torch::Tensor plan_c,
     torch::Tensor plan_w);
 
+void dsv4_expand_prefill_causally_out(
+    torch::Tensor req_pool_indices,
+    torch::Tensor seq_lens,
+    torch::Tensor extend_seq_lens,
+    std::optional<torch::Tensor> extend_start_loc,
+    torch::Tensor seq_lens_causal,
+    torch::Tensor req_pool_indices_repeated,
+    int64_t num_tokens,
+    int64_t padded_num_tokens);
+
 void flash_compress4_decode(
     torch::Tensor kv_buffer, torch::Tensor kv_input, torch::Tensor kv_output, torch::Tensor ape, torch::Tensor plan_d);
 

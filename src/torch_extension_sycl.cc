@@ -603,6 +603,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor out_loc, Tensor! kvcache, bool is_decode, int compress_ratio, int page_size, bool use_fp4, "
       "int preshuffle_size=0, bool use_bf16_store=False) -> ()");
   m.impl("fused_norm_rope_store", torch::kXPU, &at::native::xpu::fused_norm_rope_store);
+
+  m.def(
+      "dsv4_expand_prefill_causally_out(Tensor req_pool_indices, Tensor seq_lens, Tensor extend_seq_lens, "
+      "Tensor? extend_start_loc, Tensor(a!) seq_lens_causal, Tensor(b!) req_pool_indices_repeated, "
+      "int num_tokens, int padded_num_tokens) -> ()");
+  m.impl("dsv4_expand_prefill_causally_out", torch::kXPU, &at::native::xpu::dsv4_expand_prefill_causally_out);
 }
 
 REGISTER_EXTENSION(common_ops)

@@ -71,6 +71,7 @@ NIGHTLY_TESTS: List[Entry] = [
     Entry("test_fp8_paged_mqa_logits.py"),
     Entry("test_c128_v2.py"),
     Entry("test_c4_v2.py"),
+    Entry("test_dsv4_attn_metadata.py"),
     Entry("test_fused_q_indexer_rope_hadamard_quant.py"),
     Entry("test_fused_norm_rope_v2.py"),
     Entry("test_hc_post.py"),

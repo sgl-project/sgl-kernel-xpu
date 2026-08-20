@@ -175,3 +175,4 @@ from sgl_kernel.version import __version__
 build_tree_kernel = (
     None  # TODO(ying): remove this after updating the sglang python code.
 )
+from .dsv4_prefill import dsv4_expand_prefill_causally_out

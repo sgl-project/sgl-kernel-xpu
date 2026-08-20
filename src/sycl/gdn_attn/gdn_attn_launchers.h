@@ -13,7 +13,6 @@
 
 #include <optional>
 #include <string>
-
 #include <sycl/sycl.hpp>
 
 #include "gdn_attn_utils.h"  // gdn::ActMode, gdn::gdn_workspace_sections
@@ -61,9 +60,29 @@ inline void causal_conv1d(
         &err));
     TORCH_CHECK(fn, "GDN causal_conv1d JIT: ", err);
   }
-  fn(queue, q_out, k_out, v_out, z_out, b_out, a_out, mixed_qkvz, mixed_ba, conv_weights, conv_bias, conv_states,
-     query_start_loc, token_indx, cache_indices, has_initial_state, num_accepted_tokens, act_mode, pad_slot_id,
-     num_prefills, num_decodes, num_spec_decodes, reorder_input);
+  fn(queue,
+     q_out,
+     k_out,
+     v_out,
+     z_out,
+     b_out,
+     a_out,
+     mixed_qkvz,
+     mixed_ba,
+     conv_weights,
+     conv_bias,
+     conv_states,
+     query_start_loc,
+     token_indx,
+     cache_indices,
+     has_initial_state,
+     num_accepted_tokens,
+     act_mode,
+     pad_slot_id,
+     num_prefills,
+     num_decodes,
+     num_spec_decodes,
+     reorder_input);
 }
 
 inline void gated_delta_rule(
@@ -97,8 +116,24 @@ inline void gated_delta_rule(
         &err));
     TORCH_CHECK(fn, "GDN gated_delta_rule JIT: ", err);
   }
-  fn(queue, core_attn_out, q, k, v, b, a, A_log, dt_bias, ssm_state, query_start_loc, token_indx, cache_indices,
-     has_initial_state, num_accepted_tokens, num_prefills, num_decodes, num_spec_decodes);
+  fn(queue,
+     core_attn_out,
+     q,
+     k,
+     v,
+     b,
+     a,
+     A_log,
+     dt_bias,
+     ssm_state,
+     query_start_loc,
+     token_indx,
+     cache_indices,
+     has_initial_state,
+     num_accepted_tokens,
+     num_prefills,
+     num_decodes,
+     num_spec_decodes);
 }
 
 inline void chunk_causal_conv1d(
@@ -126,10 +161,29 @@ inline void chunk_causal_conv1d(
     int num_actual_tokens_override = -1,
     const bool fuse_l2norm = false) {
   using FnT = void (*)(
-      sycl::queue&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&,
-      const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, const std::optional<torch::Tensor>&,
-      torch::Tensor&, const torch::Tensor&, const torch::Tensor&, const std::optional<torch::Tensor>&, const ActMode&,
-      const int&, const int, const int, const bool, const int*, int, const bool);
+      sycl::queue&,
+      torch::Tensor&,
+      torch::Tensor&,
+      torch::Tensor&,
+      torch::Tensor&,
+      torch::Tensor&,
+      torch::Tensor&,
+      const torch::Tensor&,
+      const torch::Tensor&,
+      const torch::Tensor&,
+      const std::optional<torch::Tensor>&,
+      torch::Tensor&,
+      const torch::Tensor&,
+      const torch::Tensor&,
+      const std::optional<torch::Tensor>&,
+      const ActMode&,
+      const int&,
+      const int,
+      const int,
+      const bool,
+      const int*,
+      int,
+      const bool);
   static FnT fn = nullptr;
   if (!fn) {
     std::string err;
@@ -141,9 +195,29 @@ inline void chunk_causal_conv1d(
         &err));
     TORCH_CHECK(fn, "GDN chunk_causal_conv1d JIT: ", err);
   }
-  fn(queue, q_out, k_out, v_out, z_out, b_out, a_out, mixed_qkvz, mixed_ba, conv_weights, conv_bias, conv_states,
-     query_start_loc, cache_indices, has_initial_state, act_mode, pad_slot_id, num_prefills, num_decodes, reorder_input,
-     token_indx, num_actual_tokens_override, fuse_l2norm);
+  fn(queue,
+     q_out,
+     k_out,
+     v_out,
+     z_out,
+     b_out,
+     a_out,
+     mixed_qkvz,
+     mixed_ba,
+     conv_weights,
+     conv_bias,
+     conv_states,
+     query_start_loc,
+     cache_indices,
+     has_initial_state,
+     act_mode,
+     pad_slot_id,
+     num_prefills,
+     num_decodes,
+     reorder_input,
+     token_indx,
+     num_actual_tokens_override,
+     fuse_l2norm);
 }
 
 inline void chunk_causal_conv1d_tiled(
@@ -171,10 +245,29 @@ inline void chunk_causal_conv1d_tiled(
     int num_actual_tokens_override = -1,
     const bool fuse_l2norm = false) {
   using FnT = void (*)(
-      sycl::queue&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&,
-      const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, const std::optional<torch::Tensor>&,
-      torch::Tensor&, const torch::Tensor&, const torch::Tensor&, const std::optional<torch::Tensor>&, const ActMode&,
-      const int&, const int, const int, const bool, const int*, int, const bool);
+      sycl::queue&,
+      torch::Tensor&,
+      torch::Tensor&,
+      torch::Tensor&,
+      torch::Tensor&,
+      torch::Tensor&,
+      torch::Tensor&,
+      const torch::Tensor&,
+      const torch::Tensor&,
+      const torch::Tensor&,
+      const std::optional<torch::Tensor>&,
+      torch::Tensor&,
+      const torch::Tensor&,
+      const torch::Tensor&,
+      const std::optional<torch::Tensor>&,
+      const ActMode&,
+      const int&,
+      const int,
+      const int,
+      const bool,
+      const int*,
+      int,
+      const bool);
   static FnT fn = nullptr;
   if (!fn) {
     std::string err;
@@ -186,9 +279,29 @@ inline void chunk_causal_conv1d_tiled(
         &err));
     TORCH_CHECK(fn, "GDN chunk_causal_conv1d_tiled JIT: ", err);
   }
-  fn(queue, q_out, k_out, v_out, z_out, b_out, a_out, mixed_qkvz, mixed_ba, conv_weights, conv_bias, conv_states,
-     query_start_loc, cache_indices, has_initial_state, act_mode, pad_slot_id, num_prefills, num_decodes, reorder_input,
-     token_indx, num_actual_tokens_override, fuse_l2norm);
+  fn(queue,
+     q_out,
+     k_out,
+     v_out,
+     z_out,
+     b_out,
+     a_out,
+     mixed_qkvz,
+     mixed_ba,
+     conv_weights,
+     conv_bias,
+     conv_states,
+     query_start_loc,
+     cache_indices,
+     has_initial_state,
+     act_mode,
+     pad_slot_id,
+     num_prefills,
+     num_decodes,
+     reorder_input,
+     token_indx,
+     num_actual_tokens_override,
+     fuse_l2norm);
 }
 
 }  // namespace gdn

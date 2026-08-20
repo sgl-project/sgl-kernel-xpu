@@ -270,8 +270,13 @@ void mha_fwd_nopage(
     std::string jit_err;
     TORCH_CHECK(
         sgl::fmha_jit::decode_launch(
-            sgl::fmha_jit::DecodeOp::kDecodeNoPage, qg_sz, params.d, /*page_size=*/0, params.is_fp16,
-            &params, &jit_err),
+            sgl::fmha_jit::DecodeOp::kDecodeNoPage,
+            qg_sz,
+            params.d,
+            /*page_size=*/0,
+            params.is_fp16,
+            &params,
+            &jit_err),
         jit_err);
   }
 #else
@@ -698,8 +703,7 @@ void mha_fwd(
     }
     std::string jit_err;
     TORCH_CHECK(
-        sgl::fmha_jit::decode_launch(op, qg_sz, params.d, params.page_size, is_fp16, &params, &jit_err),
-        jit_err);
+        sgl::fmha_jit::decode_launch(op, qg_sz, params.d, params.page_size, is_fp16, &params, &jit_err), jit_err);
   }
 #else
   DISPATCH_DECODE(qg_sz);

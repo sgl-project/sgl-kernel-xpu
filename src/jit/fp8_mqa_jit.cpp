@@ -10,8 +10,7 @@ namespace fp8_mqa_jit {
 
 namespace {
 
-using KernelFn = void (*)(
-    void*, const void*, const void*, void*, int, int, int, int, int64_t, int64_t, int64_t);
+using KernelFn = void (*)(void*, const void*, const void*, void*, int, int, int, int, int64_t, int64_t, int64_t);
 
 std::mutex g_mu;
 KernelFn g_fn = nullptr;
@@ -54,8 +53,18 @@ KernelFn resolve(std::string* err) {
 }  // namespace
 
 bool gemm_launch(
-    void* queue, const void* A_fp8, const void* B_fp8, void* D_f32, int batch, int M, int N, int K,
-    int64_t A_batch_stride, int64_t B_batch_stride, int64_t D_batch_stride, std::string* err) {
+    void* queue,
+    const void* A_fp8,
+    const void* B_fp8,
+    void* D_f32,
+    int batch,
+    int M,
+    int N,
+    int K,
+    int64_t A_batch_stride,
+    int64_t B_batch_stride,
+    int64_t D_batch_stride,
+    std::string* err) {
   KernelFn fn = resolve(err);
   if (!fn) return false;
   fn(queue, A_fp8, B_fp8, D_f32, batch, M, N, K, A_batch_stride, B_batch_stride, D_batch_stride);

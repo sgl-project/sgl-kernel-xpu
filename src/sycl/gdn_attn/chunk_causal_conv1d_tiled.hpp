@@ -814,12 +814,8 @@ void chunk_causal_conv1d_tiled(
     using scalar_t = sycl::half;
     TILED_SPLIT_DISPATCH(scalar_t, width, reorder_input)
   } else {
-    // fp32 GDN never reaches here: chunk_gated_delta_rule already requires
-    // fp16/bf16, so the float scalar_t path is dead and intentionally dropped.
-    TORCH_CHECK(
-        false,
-        "GDN chunk_causal_conv1d_tiled: input dtype must be float16/bfloat16, but got ",
-        mixed_qkvz.scalar_type());
+    using scalar_t = float;
+    TILED_SPLIT_DISPATCH(scalar_t, width, reorder_input)
   }
 #undef TILED_SPLIT_DISPATCH
 #undef TILED_WIDTH_DISPATCH

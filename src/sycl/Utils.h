@@ -258,14 +258,12 @@ inline void check_shape(const at::Tensor& a, const at::Tensor& b, const char* a_
     return __VA_ARGS__();                       \
   }
 
-// fp64 is intentionally omitted: these XPU inference kernels never receive
-// double tensors, and fp64 device-kernel instantiations dominate the binary
-// size (they are emulated on BMG). Dropping Double keeps the wheel small.
 #define SYCL_DISPATCH_FLOATING_TYPES(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)                             \
   {                                                                                                         \
     const auto& the_type = TYPE;                                                                            \
     at::ScalarType _st = ::detail::scalar_type(the_type);                                                   \
     switch (_st) {                                                                                          \
+      PRIVATE_CASE_TYPE(at::ScalarType::Double, double, __VA_ARGS__)                                        \
       PRIVATE_CASE_TYPE(at::ScalarType::Float, float, __VA_ARGS__)                                          \
       PRIVATE_CASE_TYPE(SCALARTYPE1, decltype(c10::impl::ScalarTypeToCPPType<SCALARTYPE1>::t), __VA_ARGS__) \
       PRIVATE_CASE_TYPE(SCALARTYPE2, decltype(c10::impl::ScalarTypeToCPPType<SCALARTYPE2>::t), __VA_ARGS__) \
@@ -293,36 +291,13 @@ inline void check_shape(const at::Tensor& a, const at::Tensor& b, const char* a_
     const auto& the_weight_type = TYPE;                                                                            \
     at::ScalarType _wt = ::detail::scalar_type(the_weight_type);                                                   \
     switch (_wt) {                                                                                                 \
+      PRIVATE_CASE_WEIGHT_TYPE(at::ScalarType::Double, double, __VA_ARGS__)                                        \
       PRIVATE_CASE_WEIGHT_TYPE(at::ScalarType::Float, float, __VA_ARGS__)                                          \
       PRIVATE_CASE_WEIGHT_TYPE(SCALARTYPE1, decltype(c10::impl::ScalarTypeToCPPType<SCALARTYPE1>::t), __VA_ARGS__) \
       PRIVATE_CASE_WEIGHT_TYPE(SCALARTYPE2, decltype(c10::impl::ScalarTypeToCPPType<SCALARTYPE2>::t), __VA_ARGS__) \
       default:                                                                                                     \
         AT_ERROR(#NAME, " not implemented for weight type '", toString(TYPE), "'");                                \
     }                                                                                                              \
-  }
-
-// Restricts weight_t to {scalar_t (the input dtype), float}: real norm weights
-// are either the same dtype as the input or upcast to fp32. Non-fp32 weights that
-// differ from the input dtype are rejected (they would otherwise reinterpret the
-// buffer). This avoids instantiating the nonsensical mixed low-precision combos
-// (e.g. bf16 input / fp16 weight), roughly halving the weight cross-product.
-// scalar_t must be in scope (from the enclosing SYCL_DISPATCH_FLOATING_TYPES).
-#define SYCL_DISPATCH_WEIGHT_MATCH_OR_FP32(INPUT_STYPE, WEIGHT_STYPE, NAME, ...)  \
-  {                                                                               \
-    if ((WEIGHT_STYPE) == at::ScalarType::Float) {                                \
-      using weight_t = float;                                                     \
-      __VA_ARGS__();                                                              \
-    } else {                                                                      \
-      TORCH_CHECK(                                                                \
-          (WEIGHT_STYPE) == (INPUT_STYPE),                                        \
-          #NAME,                                                                  \
-          ": weight dtype must be float32 or match input dtype, but got weight=", \
-          toString(WEIGHT_STYPE),                                                 \
-          " input=",                                                              \
-          toString(INPUT_STYPE));                                                 \
-      using weight_t = scalar_t;                                                  \
-      __VA_ARGS__();                                                              \
-    }                                                                             \
   }
 
 #define SYCL_DISPATCH_FLOATING_TYPES_AND2(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)    \

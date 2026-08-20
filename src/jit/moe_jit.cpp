@@ -4,8 +4,8 @@
 #include <mutex>
 #include <unordered_map>
 
-#include "jit/sycl_template_jit.h"
 #include "jit/jit_arch.h"
+#include "jit/sycl_template_jit.h"
 
 namespace sgl {
 namespace moe_jit {

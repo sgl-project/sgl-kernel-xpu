@@ -42,7 +42,7 @@ struct CompileSpec {
   std::map<std::string, std::string> subs;  // @KEY@ -> value substitutions
   std::vector<std::string> extra_flags;     // per-kernel flags (macros, ...)
   std::string entry_symbol;                 // extern "C" symbol to resolve
-  std::string target;                            // -fsycl-targets value; empty => default_sycl_target()
+  std::string target;                       // -fsycl-targets value; empty => default_sycl_target()
 };
 
 // Base flags every SYCL JIT compile needs (SYCL std, fp behavior, SPIRV

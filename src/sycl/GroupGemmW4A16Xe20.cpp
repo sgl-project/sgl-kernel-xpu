@@ -300,6 +300,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
             static_cast<int>(n_experts),
             static_cast<int>(group_size),
             atomic_buffer.data_ptr<int>(),
+            jit_arch_code(),
             &jit_err),
         jit_err);
   }

@@ -35,6 +35,7 @@ bool grouped_gemm_launch(
     float gemm1_alpha,
     float gemm1_limit,
     int ld_b,
+    int arch = 0,  // sgl::jit::Arch code (0=BMG/Xe20, 1=XE3P/Xe35)
     std::string* err = nullptr);
 
 // Launch the W4A16 (int4 / mxfp4) grouped GEMM. The policy is selected from
@@ -57,6 +58,7 @@ bool w4a16_grouped_gemm_launch(
     int num_experts,
     int group_size,
     int* atomic_buffer,
+    int arch = 0,  // sgl::jit::Arch code (0=BMG/Xe20, 1=XE3P/Xe35)
     std::string* err = nullptr);
 
 }  // namespace moe_jit

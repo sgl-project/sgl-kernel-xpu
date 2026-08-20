@@ -42,11 +42,18 @@ struct CompileSpec {
   std::map<std::string, std::string> subs;  // @KEY@ -> value substitutions
   std::vector<std::string> extra_flags;     // per-kernel flags (macros, ...)
   std::string entry_symbol;                 // extern "C" symbol to resolve
+  std::string target;                            // -fsycl-targets value; empty => default_sycl_target()
 };
 
-// Base flags every SYCL JIT compile needs (SYCL std, fp behavior, target, SPIRV
-// extensions for CUTLASS Xe kernels). Appended to JitConfig::extra_flags.
+// Base flags every SYCL JIT compile needs (SYCL std, fp behavior, SPIRV
+// extensions for CUTLASS Xe kernels). The device target is NOT included here --
+// it is appended per-spec (see CompileSpec::target / default_sycl_target) so
+// distinct GPU architectures (Xe20 BMG vs Xe35 XE3P) compile in one process.
 const std::vector<std::string>& default_sycl_flags();
+
+// The default device target (`-fsycl-targets` value) used when a CompileSpec
+// leaves `target` empty. Reads SGLANG_SYCL_AOT_TARGETS, else Battlemage.
+const std::string& default_sycl_target();
 
 // Resolve (compiling + caching on first use) the entry symbol for `spec`.
 // Returns nullptr and sets `err` on failure. Thread-safe.

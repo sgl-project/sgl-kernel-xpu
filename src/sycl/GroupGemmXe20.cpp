@@ -252,6 +252,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
             static_cast<float>(gemm1_alpha),
             static_cast<float>(gemm1_limit),
             ld_b,
+            jit_arch_code(),
             &jit_err),
         jit_err);
   }

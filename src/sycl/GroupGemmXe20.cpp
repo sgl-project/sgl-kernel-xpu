@@ -234,25 +234,11 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
     std::string jit_err;
     TORCH_CHECK(
         sgl::moe_jit::grouped_gemm_launch(
-            avg_m,
-            static_cast<int>(activation_type),
-            fuse_act,
-            with_bias,
-            &queue,
-            activations.data_ptr(),
-            weights.data_ptr(),
-            /*scales=*/nullptr,
-            bias_ptr,
-            output.data_ptr(),
-            gemm_n,
-            gemm_k,
-            total_rows_for_experts.data_ptr<int>(),
-            static_cast<int>(n_experts),
-            atomic_buffer.data_ptr<int>(),
-            static_cast<float>(gemm1_alpha),
-            static_cast<float>(gemm1_limit),
-            ld_b,
-            &jit_err),
+            avg_m, static_cast<int>(activation_type), fuse_act, with_bias, &queue,
+            activations.data_ptr(), weights.data_ptr(), /*scales=*/nullptr, bias_ptr,
+            output.data_ptr(), gemm_n, gemm_k, total_rows_for_experts.data_ptr<int>(),
+            static_cast<int>(n_experts), atomic_buffer.data_ptr<int>(),
+            static_cast<float>(gemm1_alpha), static_cast<float>(gemm1_limit), ld_b, &jit_err),
         jit_err);
   }
 #else

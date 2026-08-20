@@ -69,24 +69,4 @@ __attribute__((visibility("default"))) void launch_qkv_lora_b_fwd_@ELEM_TAG@_@TI
 
 }  // namespace qkv_lora_b_fwd_impl
 
-// Stable C ABI entry for the runtime-JIT path (one config per .so).
-#ifdef SGL_LORA_QKV_B_JIT_ENTRY
-extern "C" __attribute__((visibility("default"))) void sgl_lora_qkv_b_fwd_entry(
-    const torch::Tensor& input_x,
-    const torch::Tensor& qkv_lora_b,
-    const torch::Tensor& output_offset_i32,
-    const torch::Tensor& seg_indptr_i32,
-    const torch::Tensor& weight_indices_i32,
-    const torch::Tensor& scalings,
-    torch::Tensor& output,
-    const std::optional<torch::Tensor>& base_output,
-    const int N_total,
-    const int num_segments,
-    sycl::queue& queue) {
-  qkv_lora_b_fwd_impl::launch_qkv_lora_b_fwd_@ELEM_TAG@_@TILE_TAG@(
-      input_x, qkv_lora_b, output_offset_i32, seg_indptr_i32, weight_indices_i32, scalings, output, base_output,
-      N_total, num_segments, queue);
-}
-#endif
-
 #undef SYCL_INTEL_TARGET

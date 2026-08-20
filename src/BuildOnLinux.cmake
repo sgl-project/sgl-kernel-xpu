@@ -12,10 +12,7 @@ if(USE_SYCL_JIT)
     ${SGL_OPS_XPU_ROOT}/src/jit/fmha_jit.cpp
     ${SGL_OPS_XPU_ROOT}/src/jit/moe_jit.cpp
     ${SGL_OPS_XPU_ROOT}/src/jit/mla_jit.cpp
-    ${SGL_OPS_XPU_ROOT}/src/jit/gdn_jit.cpp
-    ${SGL_OPS_XPU_ROOT}/src/jit/fp8_mqa_jit.cpp
-    ${SGL_OPS_XPU_ROOT}/src/jit/lora_jit.cpp
-    ${SGL_OPS_XPU_ROOT}/src/jit/gdn_attn_jit.cpp)
+    ${SGL_OPS_XPU_ROOT}/src/jit/gdn_jit.cpp)
   set_target_properties(sgl_jit PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_include_directories(sgl_jit PUBLIC ${SGL_OPS_XPU_ROOT}/src)
   target_compile_features(sgl_jit PRIVATE cxx_std_17)
@@ -210,20 +207,6 @@ endif()
 if(USE_FMHA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-chunk_gated_delta_rule)
   target_link_libraries(sgl-ops-sycl-chunk_gated_delta_rule PRIVATE sgl_jit)
 endif()
-# The GDN non-chunk leaf kernels (gdn_attention_Xe20.cpp) render/compile via the JIT engine.
-if(USE_FMHA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-gdn_attention_Xe20)
-  target_link_libraries(sgl-ops-sycl-gdn_attention_Xe20 PRIVATE sgl_jit)
-endif()
-# The FP8 MQA-logits GEMM dispatch (Fp8MqaLogitsXe20.cpp) calls the JIT engine.
-if(USE_SYCL_JIT AND TARGET sgl-ops-sycl-Fp8MqaLogitsXe20)
-  target_link_libraries(sgl-ops-sycl-Fp8MqaLogitsXe20 PRIVATE sgl_jit)
-endif()
-# The LoRA grouped-GEMM dispatchers render/compile their kernels via the JIT engine.
-foreach(_lora_disp SGEMMLoraAFwd SGEMMLoraBFwd QKVLoraBFwd)
-  if(USE_SYCL_JIT AND TARGET sgl-ops-sycl-${_lora_disp})
-    target_link_libraries(sgl-ops-sycl-${_lora_disp} PRIVATE sgl_jit)
-  endif()
-endforeach()
 
 set(SYCL_LINK_LIBRARIES_KEYWORD)
 

@@ -27,9 +27,6 @@ limitations under the License.
 
 #include "kernels/nsa/fp8_mqa_gemm_xe20.hpp"
 #include "kernels/nsa/fp8_mqa_logits_kernel.hpp"
-#ifdef USE_FP8_MQA_JIT
-#include "jit/fp8_mqa_jit.h"
-#endif
 #include "sgl_kernel_export.h"
 
 namespace {
@@ -75,16 +72,8 @@ void fp8_gemm_xe20_batched_inplace(
   auto d_ptr = d_f32.data_ptr<float>();
 
   if (M % get<0>(GemmTileShape{}) == 0 && N % get<1>(GemmTileShape{}) == 0 && K % get<2>(GemmTileShape{}) == 0) {
-#ifdef USE_FP8_MQA_JIT
-    std::string jit_err;
-    TORCH_CHECK(
-        sgl::fp8_mqa_jit::gemm_launch(
-            &queue, a_ptr, b_ptr, d_ptr, batch, M, N, K, a_batch_stride, b_batch_stride, d_batch_stride, &jit_err),
-        jit_err);
-#else
     nsa::fp8_mqa_gemm_batched_launch<GemmTileShape>(
         &queue, a_ptr, b_ptr, d_ptr, batch, M, N, K, a_batch_stride, b_batch_stride, d_batch_stride);
-#endif
     return;
   }
 

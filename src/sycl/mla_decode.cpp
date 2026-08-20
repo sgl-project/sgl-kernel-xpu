@@ -179,8 +179,17 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
     std::string jit_err;
     TORCH_CHECK(
         sgl::mla_jit::mla_decode_launch(
-            in_dtype == at::ScalarType::Half, page_size, &out, &q_nope, &q_pe,
-            &kv_c_and_k_pe_cache, &seq_lens, &page_table, &workspace, sm_scale, num_kv_splits,
+            in_dtype == at::ScalarType::Half,
+            page_size,
+            &out,
+            &q_nope,
+            &q_pe,
+            &kv_c_and_k_pe_cache,
+            &seq_lens,
+            &page_table,
+            &workspace,
+            sm_scale,
+            num_kv_splits,
             &jit_err),
         jit_err);
   }

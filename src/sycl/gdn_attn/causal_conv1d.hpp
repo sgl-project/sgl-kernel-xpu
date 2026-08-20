@@ -1107,9 +1107,8 @@ void causal_conv1d(
     using scalar_t = sycl::half;
     SPLIT_DISPATCH(scalar_t, width, reorder_input)
   } else {
-    // fp32 GDN never reaches here: chunk_gated_delta_rule already requires
-    // fp16/bf16, so the float scalar_t path is dead and intentionally dropped.
-    TORCH_CHECK(false, "GDN causal_conv1d: input dtype must be float16/bfloat16, but got ", mixed_qkvz.scalar_type());
+    using scalar_t = float;
+    SPLIT_DISPATCH(scalar_t, width, reorder_input)
   }
 #undef SPLIT_DISPATCH
 #undef WIDTH_DISPATCH

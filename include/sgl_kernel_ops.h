@@ -698,10 +698,11 @@ void moe_grouped_mm_nt_xe20(
     double gemm1_limit = 7.0);
 
 // Unified int4/mxfp4 W4A16 MoE grouped GEMM.
-// `packed_weights` is int8 [E, N, K/2] with two 4-bit values per byte.
-// `scales` is [E, N, K/group_size], N-outer: bfloat16 direct multiplier for
-// int4, or uint8 E8M0 exponent for mxfp4 (decoded in registers). `zeros` is
-// an optional [E, N, K/group_size] bfloat16 tensor (int4-only) holding the
+// `packed_weights` is int8 or uint8 [E, N, K/2] with two 4-bit values per byte.
+// `scales` is [E, N, K/group_size], N-outer: activation-dtype direct
+// multiplier for int4, or an E8M0 exponent represented as uint8 or
+// float8_e8m0fnu for mxfp4 (decoded in registers). `zeros` is an optional
+// [E, N, K/group_size] activation-dtype tensor (int4-only) holding the
 // raw per-group zero-point in code units; when supplied, weights dequant as
 // `(code - zp) * scale` instead of requiring the zero-point to be pre-folded
 // into a signed 4-bit code (which overflows for non-symmetric zero-points).
@@ -802,6 +803,14 @@ void hc_split_sinkhorn(
     int64_t sinkhorn_iters,
     double eps);
 
+at::Tensor fused_hc_head(
+    const at::Tensor& x,
+    const at::Tensor& hc_fn,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    double norm_eps,
+    double hc_eps);
+
 void hc_pre_big_fuse(
     const at::Tensor& gemm_out_mul,
     const at::Tensor& gemm_out_sqrsum,
@@ -835,6 +844,23 @@ void hc_post(
  * hc_pre GEMM + row-wise square sum
  */
 void hc_pre_gemm_sqr_sum(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, const at::Tensor& B);
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mhc_fused_post_pre(
+    const at::Tensor& x,
+    const at::Tensor& residual,
+    const at::Tensor& post_layer_mix,
+    const at::Tensor& comb_res_mix,
+    const at::Tensor& fn,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    double rms_eps = 1e-6,
+    double hc_pre_eps = 1e-6,
+    double hc_sinkhorn_eps = 1e-6,
+    double hc_post_mult_value = 2.0,
+    int64_t sinkhorn_repeat = 20,
+    int64_t n_splits = 0,
+    std::optional<at::Tensor> norm_weight = std::nullopt,
+    std::optional<double> norm_eps = std::nullopt);
 
 /*
  * From csrc/speculative
@@ -901,14 +927,17 @@ void top_k_renorm_probs(
     int64_t top_k_val);
 
 void top_p_renorm_probs(
-    at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_p_arr, double top_p_val);
+    const at::Tensor& probs,
+    at::Tensor& renorm_probs,
+    const std::optional<at::Tensor>& maybe_top_p_arr,
+    double top_p_val);
 
 void top_k_top_p_sampling_from_probs(
     at::Tensor probs,
     at::Tensor output,
     std::optional<at::Tensor> maybe_indices,
     std::optional<at::Tensor> maybe_top_k_arr,
-    double top_k_val,
+    int64_t top_k_val,
     std::optional<at::Tensor> maybe_top_p_arr,
     double top_p_val,
     bool deterministic,
@@ -981,6 +1010,29 @@ void flash_compress128_prefill(
 
 void flash_compress4_decode(
     torch::Tensor kv_buffer, torch::Tensor kv_input, torch::Tensor kv_output, torch::Tensor ape, torch::Tensor plan_d);
+
+void flash_compress4_prefill(
+    torch::Tensor kv_buffer,
+    torch::Tensor kv_input,
+    torch::Tensor kv_output,
+    torch::Tensor ape,
+    torch::Tensor plan_c,
+    torch::Tensor plan_w);
+
+void fused_norm_rope_store(
+    torch::Tensor input,
+    torch::Tensor plan,
+    torch::Tensor norm_weight,
+    double norm_eps,
+    torch::Tensor freq_cis,
+    torch::Tensor out_loc,
+    torch::Tensor kvcache,
+    bool is_decode,
+    int64_t compress_ratio,
+    int64_t page_size,
+    bool use_fp4,
+    int64_t preshuffle_size,
+    bool use_bf16_store);
 
 }  // namespace at::native::xpu
 
@@ -1124,6 +1176,20 @@ void sgemm_lora_b_fwd(
     const torch::Tensor& scalings,                   // [num_loras,]
     const std::optional<torch::Tensor>& seg_lens,    // [num_segments,]
     const std::optional<torch::Tensor>& base_output  // [num_tokens, output_dim]
+);
+
+void qkv_lora_b_fwd(
+    torch::Tensor& output,                           // [num_tokens, N_Q + 2N_{KV}]
+    const torch::Tensor& input_x,                    // [num_tokens, 3*max_rank]
+    const torch::Tensor& qkv_lora_b,                 // [num_loras, N_Q + 2N_{KV}, max_rank]
+    const torch::Tensor& output_offset,              // [4,]
+    const int64_t max_qkv_out_dim,                   // max(output_q_dim, output_kv_dim)
+    const torch::Tensor& seg_indptr,                 // [num_segments + 1,]
+    const torch::Tensor& weight_indices,             // [num_segments,]
+    const torch::Tensor& lora_ranks,                 // [num_loras,]
+    const torch::Tensor& scalings,                   // [num_loras,]
+    const std::optional<torch::Tensor>& seg_lens,    // [num_segments,]
+    const std::optional<torch::Tensor>& base_output  // [num_tokens, N_Q + 2N_{KV}]
 );
 
 /*

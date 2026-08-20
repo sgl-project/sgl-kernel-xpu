@@ -1,6 +1,7 @@
 import ctypes
 import os
 import platform
+from typing import Optional
 
 import torch
 
@@ -54,7 +55,7 @@ from sgl_kernel.flash_compress_128 import (
     flash_compress128_prefill,
 )
 from sgl_kernel.fp8_paged_mqa_logits import fp8_paged_mqa_logits_triton
-from sgl_kernel.fused_norm_rope_v2_torch import compress_norm_rope_store
+from sgl_kernel.fused_norm_rope_v2 import compress_norm_rope_store
 from sgl_kernel.gdn_attn import gdn_attention
 
 fused_q_indexer_rope_hadamard_quant = (
@@ -114,7 +115,12 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer_pf_lf,
     transfer_kv_per_layer_ph_lf,
 )
-from sgl_kernel.lora import embedding_lora_a_fwd, sgemm_lora_a_fwd, sgemm_lora_b_fwd
+from sgl_kernel.lora import (
+    embedding_lora_a_fwd,
+    qkv_lora_b_fwd,
+    sgemm_lora_a_fwd,
+    sgemm_lora_b_fwd,
+)
 from sgl_kernel.mamba import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
 from sgl_kernel.memory import weak_ref_tensor
 from sgl_kernel.mhc import (
@@ -124,6 +130,9 @@ from sgl_kernel.mhc import (
     hc_split_sinkhorn,
     mhc_pre,
 )
+
+fused_hc_head = torch.ops.sgl_kernel.fused_hc_head.default
+mhc_fused_post_pre = torch.ops.sgl_kernel.mhc_fused_post_pre.default
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     biased_topk,

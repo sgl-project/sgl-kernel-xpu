@@ -340,11 +340,11 @@ inline T safe_recip(T x) {
   return sycl::select(T(0), inv, nz);
 }
 
-int nextPowerOf2(uint32_t a) {
+inline int nextPowerOf2(uint32_t a) {
   if (a <= 1) return 1;
   return 1 << (32 - __builtin_clz(a - 1));
 };
-int round_up_headdim(int head_size) {
+inline int round_up_headdim(int head_size) {
   if (head_size <= 64) return 64;
   if (head_size <= 96) return 96;
   if (head_size <= 128) return 128;

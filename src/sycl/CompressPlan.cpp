@@ -121,8 +121,8 @@ struct CompressPrefillStage0Kernel {
     }
 
     if (tx < kStage0NumSubGroups) {
-      warp_max_[tx] = 0;
-      warp_min_[tx] = 0xFFFFFFFFu;
+      sg_max_[tx] = 0;
+      sg_min_[tx] = 0xFFFFFFFFu;
     }
 
     uint32_t local_max_extend = 0;
@@ -142,15 +142,15 @@ struct CompressPrefillStage0Kernel {
     uint32_t sg_max = sycl::reduce_over_group(sg, local_max_extend, sycl::maximum<uint32_t>());
     uint32_t sg_min = sycl::reduce_over_group(sg, local_min_extend, sycl::minimum<uint32_t>());
     if (lane_id == 0) {
-      warp_max_[sg_id] = sg_max;
-      warp_min_[sg_id] = sg_min;
+      sg_max_[sg_id] = sg_max;
+      sg_min_[sg_id] = sg_min;
     }
     item.barrier(sycl::access::fence_space::local_space);
 
     // Level 2: subgroup 0 reduces subgroup outputs to block-wide min/max.
     if (sg_id == 0) {
-      uint32_t v_max = (lane_id < kStage0NumSubGroups) ? warp_max_[lane_id] : 0u;
-      uint32_t v_min = (lane_id < kStage0NumSubGroups) ? warp_min_[lane_id] : 0xFFFFFFFFu;
+      uint32_t v_max = (lane_id < kStage0NumSubGroups) ? sg_max_[lane_id] : 0u;
+      uint32_t v_min = (lane_id < kStage0NumSubGroups) ? sg_min_[lane_id] : 0xFFFFFFFFu;
       uint32_t block_max = sycl::reduce_over_group(sg, v_max, sycl::maximum<uint32_t>());
       uint32_t block_min = sycl::reduce_over_group(sg, v_min, sycl::minimum<uint32_t>());
       if (lane_id == 0) {
@@ -305,8 +305,8 @@ struct CompressPrefillStage0Kernel {
   sycl::local_accessor<uint32_t, 1> counter_w_local_;
   sycl::local_accessor<int32_t, 1> s_seq_len_;
   sycl::local_accessor<int32_t, 1> s_prefix_len_;
-  sycl::local_accessor<uint32_t, 1> warp_max_;
-  sycl::local_accessor<uint32_t, 1> warp_min_;
+  sycl::local_accessor<uint32_t, 1> sg_max_;
+  sycl::local_accessor<uint32_t, 1> sg_min_;
   sycl::local_accessor<uint32_t, 1> s_max_extend_;
   sycl::local_accessor<uint32_t, 1> s_min_extend_;
 };
@@ -404,22 +404,19 @@ SGL_KERNEL_EXPORT torch::Tensor plan_compress_decode(
     int64_t compress_ratio,
     int64_t swa_page_size,
     int64_t ring_size) {
-  TORCH_CHECK(
-      req_pool_indices.is_xpu() && req_pool_indices.dtype() == torch::kInt64 && req_pool_indices.dim() == 1 &&
-          req_pool_indices.is_contiguous(),
-      "req_pool_indices must be a contiguous 1D int64 XPU tensor");
-  TORCH_CHECK(
-      req_to_token.is_xpu() && req_to_token.dtype() == torch::kInt32 && req_to_token.dim() == 2 &&
-          req_to_token.is_contiguous(),
-      "req_to_token must be a contiguous 2D int32 XPU tensor");
-  TORCH_CHECK(
-      full_to_state.is_xpu() && full_to_state.dtype() == torch::kInt64 && full_to_state.dim() == 1 &&
-          full_to_state.is_contiguous(),
-      "full_to_state must be a contiguous 1D int64 XPU tensor");
-  TORCH_CHECK(
-      seq_lens.is_xpu() && seq_lens.dtype() == torch::kInt64 && seq_lens.dim() == 1 && seq_lens.is_contiguous(),
-      "seq_lens must be a contiguous 1D int64 XPU tensor");
-  TORCH_CHECK(req_pool_indices.numel() == seq_lens.numel(), "req_pool_indices and seq_lens must have the same length");
+  CHECK_INPUT(req_pool_indices);
+  CHECK_DIM(1, req_pool_indices);
+  CHECK_EQ(req_pool_indices.dtype(), torch::kInt64);
+  CHECK_INPUT(req_to_token);
+  CHECK_DIM(2, req_to_token);
+  CHECK_EQ(req_to_token.dtype(), torch::kInt32);
+  CHECK_INPUT(full_to_state);
+  CHECK_DIM(1, full_to_state);
+  CHECK_EQ(full_to_state.dtype(), torch::kInt64);
+  CHECK_INPUT(seq_lens);
+  CHECK_DIM(1, seq_lens);
+  CHECK_EQ(seq_lens.dtype(), torch::kInt64);
+  CHECK_EQ(req_pool_indices.numel(), seq_lens.numel());
   TORCH_CHECK(compress_ratio > 0, "compress_ratio must be > 0");
 
   uint32_t batch_size = static_cast<uint32_t>(seq_lens.numel());
@@ -467,18 +464,15 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill
   (void)pin_buffer;
   (void)use_cuda_graph;
 
-  TORCH_CHECK(
-      req_pool_indices.is_xpu() && req_pool_indices.dtype() == torch::kInt64 && req_pool_indices.dim() == 1 &&
-          req_pool_indices.is_contiguous(),
-      "req_pool_indices must be a contiguous 1D int64 XPU tensor");
-  TORCH_CHECK(
-      req_to_token.is_xpu() && req_to_token.dtype() == torch::kInt32 && req_to_token.dim() == 2 &&
-          req_to_token.is_contiguous(),
-      "req_to_token must be a contiguous 2D int32 XPU tensor");
-  TORCH_CHECK(
-      full_to_state.is_xpu() && full_to_state.dtype() == torch::kInt64 && full_to_state.dim() == 1 &&
-          full_to_state.is_contiguous(),
-      "full_to_state must be a contiguous 1D int64 XPU tensor");
+  CHECK_INPUT(req_pool_indices);
+  CHECK_DIM(1, req_pool_indices);
+  CHECK_EQ(req_pool_indices.dtype(), torch::kInt64);
+  CHECK_INPUT(req_to_token);
+  CHECK_DIM(2, req_to_token);
+  CHECK_EQ(req_to_token.dtype(), torch::kInt32);
+  CHECK_INPUT(full_to_state);
+  CHECK_DIM(1, full_to_state);
+  CHECK_EQ(full_to_state.dtype(), torch::kInt64);
   TORCH_CHECK(
       (seq_lens.is_xpu() || seq_lens.device().is_cpu()) && seq_lens.dtype() == torch::kInt64 && seq_lens.dim() == 1 &&
           seq_lens.is_contiguous(),
@@ -491,8 +485,8 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill
       pin_buffer.device().is_cpu() && pin_buffer.dtype() == torch::kUInt8 && pin_buffer.dim() == 1 &&
           pin_buffer.is_contiguous(),
       "pin_buffer must be a contiguous 1D uint8 CPU tensor");
-  TORCH_CHECK(seq_lens.numel() == extend_lens.numel(), "seq_lens and extend_lens must have the same length");
-  TORCH_CHECK(req_pool_indices.numel() == seq_lens.numel(), "req_pool_indices and seq_lens must have the same length");
+  CHECK_EQ(seq_lens.numel(), extend_lens.numel());
+  CHECK_EQ(req_pool_indices.numel(), seq_lens.numel());
 
   // Accept CPU metadata tensors and move them to the current XPU stream device.
   auto seq_lens_xpu = seq_lens;
@@ -539,8 +533,8 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill
     sycl::local_accessor<uint32_t, 1> counter_w_local(sycl::range<1>(1), cgh);
     sycl::local_accessor<int32_t, 1> s_seq_len(sycl::range<1>(kMaxPrefillBatchSize), cgh);
     sycl::local_accessor<int32_t, 1> s_prefix_len(sycl::range<1>(kMaxPrefillBatchSize), cgh);
-    sycl::local_accessor<uint32_t, 1> warp_max(sycl::range<1>(kStage0NumSubGroups), cgh);
-    sycl::local_accessor<uint32_t, 1> warp_min(sycl::range<1>(kStage0NumSubGroups), cgh);
+    sycl::local_accessor<uint32_t, 1> sg_max(sycl::range<1>(kStage0NumSubGroups), cgh);
+    sycl::local_accessor<uint32_t, 1> sg_min(sycl::range<1>(kStage0NumSubGroups), cgh);
     sycl::local_accessor<uint32_t, 1> s_max_extend(sycl::range<1>(1), cgh);
     sycl::local_accessor<uint32_t, 1> s_min_extend(sycl::range<1>(1), cgh);
 
@@ -558,8 +552,8 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill
         counter_w_local,
         s_seq_len,
         s_prefix_len,
-        warp_max,
-        warp_min,
+        sg_max,
+        sg_min,
         s_max_extend,
         s_min_extend};
     cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(kStage0BlockSize), sycl::range<1>(kStage0BlockSize)), kernel);

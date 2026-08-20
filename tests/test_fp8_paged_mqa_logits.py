@@ -10,6 +10,10 @@ Coverage:
   integers instead of FP8
 - Variable per-batch seq_lens with 0.0 masking semantics
 - Shape-assertion guards
+- Shapes covering more than one page per program, including a page count that
+  does not divide the pages-per-program tile
+- The pages-per-program heuristic, which must stay a power of two so the number
+  of distinct Triton binaries is bounded
 
 Triton implementation on any GPU with Triton support.
 """
@@ -29,7 +33,12 @@ from unittest.case import _ShouldStop
 import torch
 import torch.nn.functional as F
 from sgl_kernel import fp8_paged_mqa_logits_triton
-from sgl_kernel.fp8_paged_mqa_logits import FP8_DTYPE
+from sgl_kernel.fp8_paged_mqa_logits import (
+    FP8_DTYPE,
+    _MAX_PAGES_PER_PROG,
+    _MIN_PROGRAMS,
+    _pages_per_prog,
+)
 from utils import get_device
 
 # DSv4 indexer cache layout (fixed by deepseek_v4_memory_pool.DeepSeekV4IndexerPool):
@@ -387,6 +396,15 @@ class TestTritonPagedMqaLogitsTorch(CustomTestCase):
         )
         _compare(ref, tri, sl)
 
+    def test_equiv_multi_page_per_program(self):
+        """Page count of 513 at batch 8 selects two pages per program.
+
+        513 is odd, so the last program covers one page instead of two and the
+        in-kernel page guard is exercised.
+        """
+        self.assertEqual(_pages_per_prog(8, 513), 2)
+        self._run_one(8, [32832, 32832, 20000, 12345, 64, 65, 8192, 32832], FP8_DTYPE)
+
     def test_shape_assertions(self):
         """Wrong head_dim or block_size must raise."""
         q, kv, w, sl, pt, msl = _build_inputs(
@@ -403,6 +421,39 @@ class TestTritonPagedMqaLogitsTorch(CustomTestCase):
             fp8_paged_mqa_logits_triton(
                 q, kv, w, sl, pt, None, max_seq_len=msl, clean_logits=True
             )
+
+
+class TestPagesPerProg(CustomTestCase):
+    """The pages-per-program tile is a tl.constexpr, so its value set is the
+    set of kernel binaries Triton compiles. Anything but powers of two makes
+    that set unbounded and compiles new kernels while the server is running.
+    """
+
+    def test_always_power_of_two(self):
+        for batch_size in (1, 2, 3, 5, 8, 13, 64, 257, 1024):
+            for num_pages_req in (1, 3, 7, 64, 129, 513, 4096, 100000):
+                ppp = _pages_per_prog(batch_size, num_pages_req)
+                with self.subTest(batch_size=batch_size, num_pages_req=num_pages_req):
+                    self.assertGreaterEqual(ppp, 1)
+                    self.assertLessEqual(ppp, _MAX_PAGES_PER_PROG)
+                    self.assertEqual(ppp & (ppp - 1), 0)
+
+    def test_small_shapes_maximize_programs(self):
+        self.assertEqual(_pages_per_prog(1, 1), 1)
+        self.assertEqual(_pages_per_prog(1, 512), 1)
+        self.assertEqual(_pages_per_prog(4, 512), 1)
+
+    def test_rounds_down_never_up(self):
+        for batch_size in (8, 16, 64, 128):
+            for num_pages_req in (129, 513, 1025, 3000):
+                ppp = _pages_per_prog(batch_size, num_pages_req)
+                with self.subTest(batch_size=batch_size, num_pages_req=num_pages_req):
+                    programs = -(-num_pages_req // ppp) * batch_size
+                    self.assertGreaterEqual(programs, min(_MIN_PROGRAMS, num_pages_req))
+
+    def test_large_shapes_reach_the_cap(self):
+        self.assertEqual(_pages_per_prog(256, 512), _MAX_PAGES_PER_PROG)
+        self.assertEqual(_pages_per_prog(1024, 128), _MAX_PAGES_PER_PROG)
 
 
 if __name__ == "__main__":

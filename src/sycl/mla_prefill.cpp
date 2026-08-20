@@ -255,9 +255,22 @@ SGL_KERNEL_EXPORT void flash_mla_prefill(
     std::string jit_err;
     TORCH_CHECK(
         sgl::mla_jit::mla_prefill_launch(
-            in_dtype == at::ScalarType::Half, page_size, bucket_id, &out, &q_nope, &q_pe,
-            &kv_c_and_k_pe_cache, &cu_seqlens_q, &seq_lens, max_seqlen_q, &page_table, &workspace,
-            sm_scale, causal, num_kv_splits, &jit_err),
+            in_dtype == at::ScalarType::Half,
+            page_size,
+            bucket_id,
+            &out,
+            &q_nope,
+            &q_pe,
+            &kv_c_and_k_pe_cache,
+            &cu_seqlens_q,
+            &seq_lens,
+            max_seqlen_q,
+            &page_table,
+            &workspace,
+            sm_scale,
+            causal,
+            num_kv_splits,
+            &jit_err),
         jit_err);
   }
 #else

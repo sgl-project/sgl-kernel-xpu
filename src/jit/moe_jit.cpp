@@ -12,8 +12,20 @@ namespace moe_jit {
 namespace {
 
 using KernelFn = void (*)(
-    void*, const void*, const void*, const void*, const void*, void*, int, int, const int*, int,
-    int*, float, float, int);
+    void*,
+    const void*,
+    const void*,
+    const void*,
+    const void*,
+    void*,
+    int,
+    int,
+    const int*,
+    int,
+    int*,
+    float,
+    float,
+    int);
 
 struct TileCfg {
   const char* tile;
@@ -35,8 +47,7 @@ const TileCfg kTiles[7] = {
 constexpr int64_t kSmallWeightThreshold = int64_t(4096) * 4096;
 
 int select_tile(int avg_m, int gemm_k, int gemm_n, bool fuse_act) {
-  const bool small_weight =
-      static_cast<int64_t>(gemm_k) * gemm_n <= kSmallWeightThreshold;
+  const bool small_weight = static_cast<int64_t>(gemm_k) * gemm_n <= kSmallWeightThreshold;
   const bool narrow_k = gemm_k <= 256;
   const bool narrow_n_fused = fuse_act && (gemm_n <= 512);
 
@@ -87,8 +98,8 @@ KernelFn resolve(int tile_id, int act, bool fuse, bool bias, std::string* err) {
   spec.subs["WITH_BIAS"] = bias ? "true" : "false";
   spec.extra_flags = {"-DSGL_MOE_JIT_ENTRY"};
   spec.entry_symbol = "sgl_moe_gg_entry";
-  spec.name = std::string("group_gemm_xe20_t") + std::to_string(tile_id) + "_a" +
-              std::to_string(act) + "_f" + (fuse ? "1" : "0") + "_b" + (bias ? "1" : "0");
+  spec.name = std::string("group_gemm_xe20_t") + std::to_string(tile_id) + "_a" + std::to_string(act) + "_f" +
+              (fuse ? "1" : "0") + "_b" + (bias ? "1" : "0");
 
   void* sym = jit::get_or_compile(spec, cfg, err);
   if (!sym) return nullptr;
@@ -104,15 +115,42 @@ KernelFn resolve(int tile_id, int act, bool fuse, bool bias, std::string* err) {
 }  // namespace
 
 bool grouped_gemm_launch(
-    int avg_m, int activation_type, bool fuse_act, bool with_bias, void* queue,
-    const void* activations, const void* weights, const void* scales, const void* bias,
-    void* outputs, int gemm_n, int gemm_k, const int* num_rows_per_expert, int num_experts,
-    int* workspace, float gemm1_alpha, float gemm1_limit, int ld_b, std::string* err) {
+    int avg_m,
+    int activation_type,
+    bool fuse_act,
+    bool with_bias,
+    void* queue,
+    const void* activations,
+    const void* weights,
+    const void* scales,
+    const void* bias,
+    void* outputs,
+    int gemm_n,
+    int gemm_k,
+    const int* num_rows_per_expert,
+    int num_experts,
+    int* workspace,
+    float gemm1_alpha,
+    float gemm1_limit,
+    int ld_b,
+    std::string* err) {
   const int tile_id = select_tile(avg_m, gemm_k, gemm_n, fuse_act);
   KernelFn fn = resolve(tile_id, activation_type, fuse_act, with_bias, err);
   if (!fn) return false;
-  fn(queue, activations, weights, scales, bias, outputs, gemm_n, gemm_k, num_rows_per_expert,
-     num_experts, workspace, gemm1_alpha, gemm1_limit, ld_b);
+  fn(queue,
+     activations,
+     weights,
+     scales,
+     bias,
+     outputs,
+     gemm_n,
+     gemm_k,
+     num_rows_per_expert,
+     num_experts,
+     workspace,
+     gemm1_alpha,
+     gemm1_limit,
+     ld_b);
   return true;
 }
 
@@ -123,8 +161,19 @@ bool grouped_gemm_launch(
 namespace {
 
 using W4A16Fn = void (*)(
-    void*, const void*, const void*, const void*, const void*, const void*, void*, int, int,
-    const int*, int, int, int*);
+    void*,
+    const void*,
+    const void*,
+    const void*,
+    const void*,
+    const void*,
+    void*,
+    int,
+    int,
+    const int*,
+    int,
+    int,
+    int*);
 
 // Policy name selected from avg_m (mirrors GroupGemmW4A16Xe20.cpp).
 const char* w4a16_policy(int avg_m) {
@@ -179,8 +228,8 @@ W4A16Fn resolve_w4a16(int avg_m, bool is_int4, bool is_fp16, std::string* err) {
   spec.subs["ELEMENT_S"] = is_int4 ? elem_a : "uint8_t";
   spec.extra_flags = {"-DSGL_W4A16_JIT_ENTRY"};
   spec.entry_symbol = "sgl_moe_w4a16_entry";
-  spec.name = std::string("group_gemm_w4a16_p") + std::to_string(policy_id) +
-              (is_int4 ? "_int4" : "_mxfp4") + (is_fp16 ? "_fp16" : "_bf16");
+  spec.name = std::string("group_gemm_w4a16_p") + std::to_string(policy_id) + (is_int4 ? "_int4" : "_mxfp4") +
+              (is_fp16 ? "_fp16" : "_bf16");
 
   void* sym = jit::get_or_compile(spec, cfg, err);
   if (!sym) return nullptr;
@@ -196,14 +245,38 @@ W4A16Fn resolve_w4a16(int avg_m, bool is_int4, bool is_fp16, std::string* err) {
 }  // namespace
 
 bool w4a16_grouped_gemm_launch(
-    int avg_m, bool is_int4, bool is_fp16, void* queue, const void* activations,
-    const void* packed_weights, const void* scales, const void* zeros, const void* bias,
-    void* outputs, int gemm_n, int gemm_k, const int* rows_per_expert, int num_experts,
-    int group_size, int* atomic_buffer, std::string* err) {
+    int avg_m,
+    bool is_int4,
+    bool is_fp16,
+    void* queue,
+    const void* activations,
+    const void* packed_weights,
+    const void* scales,
+    const void* zeros,
+    const void* bias,
+    void* outputs,
+    int gemm_n,
+    int gemm_k,
+    const int* rows_per_expert,
+    int num_experts,
+    int group_size,
+    int* atomic_buffer,
+    std::string* err) {
   W4A16Fn fn = resolve_w4a16(avg_m, is_int4, is_fp16, err);
   if (!fn) return false;
-  fn(queue, activations, packed_weights, scales, zeros, bias, outputs, gemm_n, gemm_k,
-     rows_per_expert, num_experts, group_size, atomic_buffer);
+  fn(queue,
+     activations,
+     packed_weights,
+     scales,
+     zeros,
+     bias,
+     outputs,
+     gemm_n,
+     gemm_k,
+     rows_per_expert,
+     num_experts,
+     group_size,
+     atomic_buffer);
   return true;
 }
 

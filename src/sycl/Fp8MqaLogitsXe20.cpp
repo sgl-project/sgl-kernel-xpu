@@ -25,6 +25,8 @@ limitations under the License.
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include <cstdlib>
+
 #include "kernels/nsa/fp8_mqa_gemm_xe20.hpp"
 #include "kernels/nsa/fp8_mqa_logits_kernel.hpp"
 #include "sgl_kernel_export.h"
@@ -167,57 +169,99 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_paged_mqa_logits(
   bool use_gemm = (H >= MIN_M_GEMM && msl >= MIN_N_GEMM);
 
   if (use_gemm) {
-    // Stage 1: Gather K from pages into contiguous buffer
-    auto k_gathered = torch::empty({B_next * msl, D}, torch::dtype(torch::kUInt8).device(q_fp8.device()));
-    auto k_scale_gathered = torch::zeros({B_next, msl}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
+    // Stage 1/2 temporaries (k_gathered: B*msl*D bytes, dots: B*H*msl*4 bytes)
+    // scale with the *full* decode batch B_next.
+    // Chunk over the batch dimension so peak temporary memory is bounded by a
+    // fixed budget, mirroring the batch-slicing done for the FMHA prefill score workspace.
+    constexpr int64_t kDefaultChunkBudgetBytes = 512LL * 1024 * 1024;  // 512 MiB
+    static const int64_t chunk_budget_bytes = [] {
+      if (const char* env = std::getenv("SGL_KERNEL_FP8_PAGED_MQA_CHUNK_MB")) {
+        int64_t mb = std::atoll(env);
+        if (mb > 0) return mb << 20;
+      }
+      return kDefaultChunkBudgetBytes;
+    }();
+    // Per-row bytes for the two chunked temporaries: k_gathered (msl*D uint8) + dots (H*msl*4 float32).
+    int64_t per_row_bytes = static_cast<int64_t>(H) * msl * sizeof(float) + static_cast<int64_t>(msl) * D;
+    int chunk_b = static_cast<int>(std::max<int64_t>(1, chunk_budget_bytes / std::max<int64_t>(per_row_bytes, 1)));
+    chunk_b = std::min(chunk_b, B_next);
+    if (std::getenv("SGL_KERNEL_FP8_PAGED_MQA_VERBOSE") != nullptr) {
+      TORCH_WARN(
+          "fp8_paged_mqa_logits: B=",
+          B_next,
+          " H=",
+          H,
+          " msl=",
+          msl,
+          " -> chunk_b=",
+          chunk_b,
+          " (",
+          cdiv(B_next, chunk_b),
+          " chunks)");
+    }
 
-    nsa::PagedKGatherKernel gather_kernel{
-        kv_contig.data_ptr<uint8_t>(),
-        block_tables_contig.data_ptr<int32_t>(),
-        seq_lens_flat.data_ptr<int32_t>(),
-        k_gathered.data_ptr<uint8_t>(),
-        k_scale_gathered.data_ptr<float>(),
-        B_next,
-        D,
-        page_size,
-        max_num_blocks,
-        msl,
-        head_dim_with_sf};
-    launch_2d_kernel(queue, gather_kernel, B_next, msl);
+    for (int start = 0; start < B_next; start += chunk_b) {
+      int cur_b = std::min(chunk_b, B_next - start);
 
-    // Stage 2: Batched SYCL-TLA FP8 GEMM — all B_next GEMMs in one launch.
-    // TODO: switch to torch._scaled_grouped_mm once it is implemented on XPU
-    // (currently aten::_scaled_grouped_mm_v2 is unimplemented and 3D batched
-    // _scaled_mm is unsupported, so the only torch option is a per-batch
-    // _scaled_mm loop that does not scale with B). The custom batched SYCL-TLA
-    // kernel is 4-15x faster than that loop for B>=4, so we keep it for decode.
-    auto dots = torch::empty({B_next, H, msl}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
+      auto q_chunk = q_contig.narrow(0, start, cur_b);
+      auto seq_lens_chunk = seq_lens_flat.narrow(0, start, cur_b);
+      auto block_tables_chunk = block_tables_contig.narrow(0, start, cur_b);
+      auto weights_chunk = weights_contig.narrow(0, start, cur_b);
+      auto logits_chunk = logits.narrow(0, start, cur_b);
 
-    fp8_gemm_xe20_batched_inplace(
-        queue,
-        q_contig,    // (B,1,H,D), A batch stride = H*D
-        k_gathered,  // (B*msl,D), B batch stride = msl*D
-        dots,        // (B,H,msl), D batch stride = H*msl
-        B_next,
-        H,
-        msl,
-        D,
-        static_cast<int64_t>(H) * D,
-        static_cast<int64_t>(msl) * D,
-        static_cast<int64_t>(H) * msl,
-        q_fp8.device());
+      // Stage 1: Gather K from pages into contiguous buffer (sized for this chunk only)
+      auto k_gathered =
+          torch::empty({static_cast<int64_t>(cur_b) * msl, D}, torch::dtype(torch::kUInt8).device(q_fp8.device()));
+      auto k_scale_gathered = torch::zeros({cur_b, msl}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
 
-    // Stage 3: Reduction
-    nsa::Fp8PagedMqaLogitsReduceKernel reduce_kernel{
-        dots.data_ptr<float>(),
-        weights_contig.data_ptr<float>(),
-        k_scale_gathered.data_ptr<float>(),
-        seq_lens_flat.data_ptr<int32_t>(),
-        logits.data_ptr<float>(),
-        B_next,
-        H,
-        msl};
-    launch_2d_kernel(queue, reduce_kernel, B_next, msl);
+      nsa::PagedKGatherKernel gather_kernel{
+          kv_contig.data_ptr<uint8_t>(),
+          block_tables_chunk.data_ptr<int32_t>(),
+          seq_lens_chunk.data_ptr<int32_t>(),
+          k_gathered.data_ptr<uint8_t>(),
+          k_scale_gathered.data_ptr<float>(),
+          cur_b,
+          D,
+          page_size,
+          max_num_blocks,
+          msl,
+          head_dim_with_sf};
+      launch_2d_kernel(queue, gather_kernel, cur_b, msl);
+
+      // Stage 2: Batched SYCL-TLA FP8 GEMM — all cur_b GEMMs in this chunk in one launch.
+      // TODO: switch to torch._scaled_grouped_mm once it is implemented on XPU
+      // (currently aten::_scaled_grouped_mm_v2 is unimplemented and 3D batched
+      // _scaled_mm is unsupported, so the only torch option is a per-batch
+      // _scaled_mm loop that does not scale with B). The custom batched SYCL-TLA
+      // kernel is 4-15x faster than that loop for B>=4, so we keep it for decode.
+      auto dots = torch::empty({cur_b, H, msl}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
+
+      fp8_gemm_xe20_batched_inplace(
+          queue,
+          q_chunk,     // (cur_b,1,H,D), A batch stride = H*D
+          k_gathered,  // (cur_b*msl,D), B batch stride = msl*D
+          dots,        // (cur_b,H,msl), D batch stride = H*msl
+          cur_b,
+          H,
+          msl,
+          D,
+          static_cast<int64_t>(H) * D,
+          static_cast<int64_t>(msl) * D,
+          static_cast<int64_t>(H) * msl,
+          q_fp8.device());
+
+      // Stage 3: Reduction
+      nsa::Fp8PagedMqaLogitsReduceKernel reduce_kernel{
+          dots.data_ptr<float>(),
+          weights_chunk.data_ptr<float>(),
+          k_scale_gathered.data_ptr<float>(),
+          seq_lens_chunk.data_ptr<int32_t>(),
+          logits_chunk.data_ptr<float>(),
+          cur_b,
+          H,
+          msl};
+      launch_2d_kernel(queue, reduce_kernel, cur_b, msl);
+    }
     return logits;
   }
 

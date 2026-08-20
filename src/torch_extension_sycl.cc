@@ -730,6 +730,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "minimax_decode_topk_page_table(Tensor score, Tensor seq_lens, Tensor req_to_token, "
       "Tensor slot_ids, int block_size, int topk, int page_size) -> (Tensor, Tensor)");
   m.impl("minimax_decode_topk_page_table", torch::kXPU, &minimax_decode_topk_page_table);
+
+  m.def(
+      "dsv4_expand_prefill_causally_out(Tensor req_pool_indices, Tensor seq_lens, Tensor extend_seq_lens, "
+      "Tensor? extend_start_loc, Tensor(a!) seq_lens_causal, Tensor(b!) req_pool_indices_repeated, "
+      "int num_tokens, int padded_num_tokens) -> ()");
+  m.impl("dsv4_expand_prefill_causally_out", torch::kXPU, &at::native::xpu::dsv4_expand_prefill_causally_out);
 }
 
 REGISTER_EXTENSION(common_ops)

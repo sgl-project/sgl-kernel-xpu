@@ -10,8 +10,9 @@ namespace mla_jit {
 
 namespace {
 
-using DecodeFn =
-    void (*)(void*, const void*, const void*, const void*, const void*, const void*, void*, double, int64_t);
+using DecodeFn = void (*)(
+    void*, const void*, const void*, const void*, const void*, const void*, void*, double,
+    int64_t);
 
 uint64_t pack_decode_key(bool is_fp16, int page_size) {
   return (static_cast<uint64_t>(page_size) << 1) | (is_fp16 ? 1u : 0u);
@@ -45,7 +46,8 @@ DecodeFn resolve_decode(bool is_fp16, int page_size, std::string* err) {
   spec.subs["PAGE_SIZE"] = std::to_string(page_size);
   spec.extra_flags = {"-DSGL_MLA_JIT_ENTRY"};
   spec.entry_symbol = "sgl_mla_decode_entry";
-  spec.name = std::string("mla_decode_") + (is_fp16 ? "half" : "bf16") + "_" + std::to_string(page_size);
+  spec.name = std::string("mla_decode_") + (is_fp16 ? "half" : "bf16") + "_" +
+              std::to_string(page_size);
 
   void* sym = jit::get_or_compile(spec, cfg, err);
   if (!sym) return nullptr;
@@ -61,21 +63,13 @@ DecodeFn resolve_decode(bool is_fp16, int page_size, std::string* err) {
 }  // namespace
 
 bool mla_decode_launch(
-    bool is_fp16,
-    int page_size,
-    void* out,
-    const void* q_nope,
-    const void* q_pe,
-    const void* kv_c_and_k_pe_cache,
-    const void* seq_lens,
-    const void* page_table,
-    void* workspace,
-    double sm_scale,
-    int64_t num_kv_splits,
-    std::string* err) {
+    bool is_fp16, int page_size, void* out, const void* q_nope, const void* q_pe,
+    const void* kv_c_and_k_pe_cache, const void* seq_lens, const void* page_table, void* workspace,
+    double sm_scale, int64_t num_kv_splits, std::string* err) {
   DecodeFn fn = resolve_decode(is_fp16, page_size, err);
   if (!fn) return false;
-  fn(out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+  fn(out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale,
+     num_kv_splits);
   return true;
 }
 
@@ -86,19 +80,8 @@ bool mla_decode_launch(
 namespace {
 
 using PrefillFn = void (*)(
-    int,
-    void*,
-    const void*,
-    const void*,
-    const void*,
-    const void*,
-    const void*,
-    int64_t,
-    const void*,
-    void*,
-    double,
-    bool,
-    int64_t);
+    int, void*, const void*, const void*, const void*, const void*, const void*, int64_t,
+    const void*, void*, double, bool, int64_t);
 
 std::mutex g_prefill_mu;
 std::unordered_map<uint64_t, PrefillFn> g_prefill_fns;
@@ -128,7 +111,8 @@ PrefillFn resolve_prefill(bool is_fp16, int page_size, std::string* err) {
   spec.subs["PAGE_SIZE"] = std::to_string(page_size);
   spec.extra_flags = {"-DSGL_MLA_JIT_ENTRY"};
   spec.entry_symbol = "sgl_mla_prefill_entry";
-  spec.name = std::string("mla_prefill_") + (is_fp16 ? "half" : "bf16") + "_" + std::to_string(page_size);
+  spec.name = std::string("mla_prefill_") + (is_fp16 ? "half" : "bf16") + "_" +
+              std::to_string(page_size);
 
   void* sym = jit::get_or_compile(spec, cfg, err);
   if (!sym) return nullptr;
@@ -144,37 +128,14 @@ PrefillFn resolve_prefill(bool is_fp16, int page_size, std::string* err) {
 }  // namespace
 
 bool mla_prefill_launch(
-    bool is_fp16,
-    int page_size,
-    int bucket,
-    void* out,
-    const void* q_nope,
-    const void* q_pe,
-    const void* kv_c_and_k_pe_cache,
-    const void* cu_seqlens_q,
-    const void* seq_lens,
-    int64_t max_seqlen_q,
-    const void* page_table,
-    void* workspace,
-    double sm_scale,
-    bool causal,
-    int64_t num_kv_splits,
-    std::string* err) {
+    bool is_fp16, int page_size, int bucket, void* out, const void* q_nope, const void* q_pe,
+    const void* kv_c_and_k_pe_cache, const void* cu_seqlens_q, const void* seq_lens,
+    int64_t max_seqlen_q, const void* page_table, void* workspace, double sm_scale, bool causal,
+    int64_t num_kv_splits, std::string* err) {
   PrefillFn fn = resolve_prefill(is_fp16, page_size, err);
   if (!fn) return false;
-  fn(bucket,
-     out,
-     q_nope,
-     q_pe,
-     kv_c_and_k_pe_cache,
-     cu_seqlens_q,
-     seq_lens,
-     max_seqlen_q,
-     page_table,
-     workspace,
-     sm_scale,
-     causal,
-     num_kv_splits);
+  fn(bucket, out, q_nope, q_pe, kv_c_and_k_pe_cache, cu_seqlens_q, seq_lens, max_seqlen_q,
+     page_table, workspace, sm_scale, causal, num_kv_splits);
   return true;
 }
 
@@ -184,9 +145,7 @@ bool mla_prefill_launch(
 
 namespace {
 
-const char* elem_tag(bool is_fp16) {
-  return is_fp16 ? "half" : "bf16";
-}
+const char* elem_tag(bool is_fp16) { return is_fp16 ? "half" : "bf16"; }
 const char* elem_sycl_type(bool is_fp16) {
   return is_fp16 ? "sycl::half" : "sycl::ext::oneapi::bfloat16";
 }
@@ -200,21 +159,11 @@ uint64_t pack_sparse_key(bool is_fp16, int d_qk, int b_h, bool sink) {
 }
 
 using SparseDecodeFn = void (*)(
-    void*,
-    void*,
-    const void*,
-    const void*,
-    const void*,
-    const void*,
-    const void*,
-    const void*,
-    const void*,
-    const void*,
-    double,
-    int64_t,
-    bool);
-using SparsePrefillFn =
-    void (*)(void*, void*, void*, const void*, const void*, const void*, const void*, const void*, double, int64_t);
+    void*, void*, const void*, const void*, const void*, const void*, const void*, const void*,
+    const void*, const void*, double, int64_t, bool);
+using SparsePrefillFn = void (*)(
+    void*, void*, void*, const void*, const void*, const void*, const void*, const void*, double,
+    int64_t);
 
 std::mutex g_sparse_dec_mu;
 std::unordered_map<uint64_t, SparseDecodeFn> g_sparse_dec_fns;
@@ -222,14 +171,8 @@ std::mutex g_sparse_pre_mu;
 std::unordered_map<uint64_t, SparsePrefillFn> g_sparse_pre_fns;
 
 void* resolve_sparse(
-    const char* template_rel,
-    const char* entry,
-    bool is_fp16,
-    int d_qk,
-    int b_h,
-    bool sink,
-    const char* name_prefix,
-    std::string* err) {
+    const char* template_rel, const char* entry, bool is_fp16, int d_qk, int b_h, bool sink,
+    const char* name_prefix, std::string* err) {
   const jit::JitConfig& cfg = jit::default_config();
   if (!cfg.valid) {
     if (err) *err = std::string(name_prefix) + " JIT unavailable: " + cfg.error;
@@ -248,32 +191,18 @@ void* resolve_sparse(
   spec.subs["HAS_ATTN_SINK"] = sink ? "1" : "0";
   spec.extra_flags = {"-DSGL_MLA_JIT_ENTRY"};
   spec.entry_symbol = entry;
-  spec.name = std::string(name_prefix) + "_" + elem_tag(is_fp16) + "_" + std::to_string(d_qk) + "_" +
-              std::to_string(b_h) + "_" + (sink ? "1" : "0");
+  spec.name = std::string(name_prefix) + "_" + elem_tag(is_fp16) + "_" + std::to_string(d_qk) +
+              "_" + std::to_string(b_h) + "_" + (sink ? "1" : "0");
   return jit::get_or_compile(spec, cfg, err);
 }
 
 }  // namespace
 
 bool sparse_decode_launch(
-    bool is_fp16,
-    int d_qk,
-    int b_h,
-    bool has_attn_sink,
-    void* out,
-    void* lse_out,
-    const void* q,
-    const void* k_cache,
-    const void* indices,
-    const void* topk_length,
-    const void* extra_k_cache,
-    const void* extra_indices,
-    const void* extra_topk_length,
-    const void* attn_sink,
-    double sm_scale,
-    int64_t head_dim_v,
-    bool is_fp8_kvcache,
-    std::string* err) {
+    bool is_fp16, int d_qk, int b_h, bool has_attn_sink, void* out, void* lse_out, const void* q,
+    const void* k_cache, const void* indices, const void* topk_length, const void* extra_k_cache,
+    const void* extra_indices, const void* extra_topk_length, const void* attn_sink,
+    double sm_scale, int64_t head_dim_v, bool is_fp8_kvcache, std::string* err) {
   const uint64_t key = pack_sparse_key(is_fp16, d_qk, b_h, has_attn_sink);
   SparseDecodeFn fn = nullptr;
   {
@@ -283,51 +212,22 @@ bool sparse_decode_launch(
   }
   if (!fn) {
     void* sym = resolve_sparse(
-        "mla_sparse_decode_2stage_kernel.cpp.in",
-        "sgl_mla_sparse_decode_entry",
-        is_fp16,
-        d_qk,
-        b_h,
-        has_attn_sink,
-        "mla_sparse_decode",
-        err);
+        "mla_sparse_decode_2stage_kernel.cpp.in", "sgl_mla_sparse_decode_entry", is_fp16, d_qk,
+        b_h, has_attn_sink, "mla_sparse_decode", err);
     if (!sym) return false;
     fn = reinterpret_cast<SparseDecodeFn>(sym);
     std::lock_guard<std::mutex> lk(g_sparse_dec_mu);
     g_sparse_dec_fns[key] = fn;
   }
-  fn(out,
-     lse_out,
-     q,
-     k_cache,
-     indices,
-     topk_length,
-     extra_k_cache,
-     extra_indices,
-     extra_topk_length,
-     attn_sink,
-     sm_scale,
-     head_dim_v,
-     is_fp8_kvcache);
+  fn(out, lse_out, q, k_cache, indices, topk_length, extra_k_cache, extra_indices,
+     extra_topk_length, attn_sink, sm_scale, head_dim_v, is_fp8_kvcache);
   return true;
 }
 
 bool sparse_prefill_launch(
-    bool is_fp16,
-    int d_qk,
-    int b_h,
-    bool has_attn_sink,
-    void* out,
-    void* max_logits,
-    void* lse,
-    const void* q,
-    const void* kv,
-    const void* indices,
-    const void* attn_sink,
-    const void* topk_length,
-    double sm_scale,
-    int64_t head_dim_v,
-    std::string* err) {
+    bool is_fp16, int d_qk, int b_h, bool has_attn_sink, void* out, void* max_logits, void* lse,
+    const void* q, const void* kv, const void* indices, const void* attn_sink,
+    const void* topk_length, double sm_scale, int64_t head_dim_v, std::string* err) {
   const uint64_t key = pack_sparse_key(is_fp16, d_qk, b_h, has_attn_sink);
   SparsePrefillFn fn = nullptr;
   {
@@ -337,14 +237,8 @@ bool sparse_prefill_launch(
   }
   if (!fn) {
     void* sym = resolve_sparse(
-        "mla_sparse_prefill_2stage_kernel.cpp.in",
-        "sgl_mla_sparse_prefill_entry",
-        is_fp16,
-        d_qk,
-        b_h,
-        has_attn_sink,
-        "mla_sparse_prefill",
-        err);
+        "mla_sparse_prefill_2stage_kernel.cpp.in", "sgl_mla_sparse_prefill_entry", is_fp16, d_qk,
+        b_h, has_attn_sink, "mla_sparse_prefill", err);
     if (!sym) return false;
     fn = reinterpret_cast<SparsePrefillFn>(sym);
     std::lock_guard<std::mutex> lk(g_sparse_pre_mu);

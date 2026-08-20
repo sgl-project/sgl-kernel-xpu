@@ -148,21 +148,8 @@ SGL_KERNEL_EXPORT void flash_mla_sparse_prefill(
     std::string jit_err;
     TORCH_CHECK(
         sgl::mla_jit::sparse_prefill_launch(
-            in_dtype == at::ScalarType::Half,
-            d_qk,
-            b_h,
-            attn_sink.has_value(),
-            &out,
-            &max_logits,
-            &lse,
-            &q,
-            &kv,
-            &indices,
-            &attn_sink,
-            &topk_length,
-            sm_scale,
-            head_dim_v,
-            &jit_err),
+            in_dtype == at::ScalarType::Half, d_qk, b_h, attn_sink.has_value(), &out, &max_logits,
+            &lse, &q, &kv, &indices, &attn_sink, &topk_length, sm_scale, head_dim_v, &jit_err),
         jit_err);
   }
 #else

@@ -1,9 +1,5 @@
 /**
- * HiSparse C4 paged-cache layout helpers (SYCL / Intel XPU).
- *
- * Ports device::hisparse::{get_pointer_paged, transfer_item} from the CUDA
- * kernel (sglang jit_kernel/include/sgl_kernel/deepseek_v4/kvcacheio.cuh).
- *
+ * HiSparse C4 paged-cache layout helpers.
  * Paged C4 cache layout (per page of kPageSize tokens):
  *   VALUE 0, VALUE 1, ..., VALUE 63,     (kValueBytes each)
  *   SCALE 0, SCALE 1, ..., SCALE 63,     (kScaleBytes each)
@@ -21,7 +17,9 @@ namespace sgl {
 namespace sycl_kernel {
 namespace hisparse {
 
-// C4 paged layout constants (must match kvcacheio.cuh exactly).
+inline constexpr int kSubGroupSize = 32;
+
+// C4 paged layout constants (must match the model-side cache layout exactly).
 inline constexpr int64_t kPageSize = 64;
 inline constexpr int64_t kPageBits = 6;  // log2(kPageSize)
 inline constexpr int64_t kValueBytes = 576;

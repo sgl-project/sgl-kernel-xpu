@@ -1,39 +1,31 @@
 """
 Accuracy tests for the XPU/SYCL HiSparse swap-in kernels.
 
-Ported from the CUDA oracle (sglang test/registered/jit/test_hisparse.py). The
-SYCL kernels pin the logical warp to a 32-lane sub-group, so the slot<->lane
-mapping and eviction ordering match the CUDA kernel bit-for-bit; the expected
-values below are therefore identical to the CUDA reference.
+The kernels pin the sub-group to 32 lanes, so the slot<->lane mapping and
+eviction ordering are fully determined and the expected values below are exact.
 
 Guarded failure modes (derived-property + bug-regression):
   - LRU hit/evict compaction and MRU/LRU write-back ordering.
   - Miss classification, evict-slot reuse, and host->device miss copy.
-  - Fast-path (seq_len <= hot_buffer) short-circuit leaves state untouched.
-  - CUDA-graph padding (num_real_reqs) leaves padded request rows untouched.
+  - Multi-iteration chunk scan (hot_buffer_size past one sub-group window).
+  - Fast-path (seq_len <= hot_buffer) short-circuit leaves cache state untouched
+    while still writing -1 to every output slot it cannot resolve.
+  - Graph-capture padding (num_real_reqs) leaves padded requests' cache state
+    untouched and writes -1 across their output rows.
   - DSv4 page-padded C4 addressing on both the transfer and swap-in paths.
 """
 
 import pytest
 import torch
+from sgl_kernel import (
+    load_cache_to_device_buffer_dsv4_mla,
+    load_cache_to_device_buffer_mla,
+    transfer_cache_dsv4_mla,
+)
 
-HAS_XPU = hasattr(torch, "xpu") and torch.xpu.is_available()
+HAS_XPU = torch.xpu.is_available()
 
-try:
-    from sgl_kernel.jit import (
-        load_cache_to_device_buffer_dsv4_mla,
-        load_cache_to_device_buffer_mla,
-        transfer_cache_dsv4_mla,
-    )
-
-    HAS_SGL_JIT = True
-except ImportError:
-    HAS_SGL_JIT = False
-
-pytestmark = [
-    pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device"),
-    pytest.mark.skipif(not HAS_SGL_JIT, reason="Requires sgl_kernel JIT HiSparse"),
-]
+pytestmark = pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
 
 DEVICE = "xpu"
 DTYPE = torch.float32
@@ -116,6 +108,7 @@ def _run_kernel(
     seq_lens_dtype: torch.dtype = torch.int32,
     req_pool_indices: torch.Tensor | None = None,
     num_real_reqs: int | None = None,
+    output_fill_value: int = -1,
 ) -> torch.Tensor:
     batch_size = top_k_tokens.shape[0]
     if req_pool_indices is None:
@@ -127,7 +120,9 @@ def _run_kernel(
     if num_real_reqs is None:
         num_real_reqs = batch_size
 
-    out = torch.full_like(top_k_tokens, -1)
+    # Cases that assert the kernel *writes* -1 (rather than merely leaving a slot
+    # alone) pass output_fill_value, so the default -1 cannot mask a skipped write.
+    out = torch.full_like(top_k_tokens, output_fill_value)
     load_cache_to_device_buffer_mla(
         top_k_tokens=top_k_tokens,
         device_buffer_tokens=device_buffer_tokens,
@@ -319,6 +314,23 @@ def test_load_cache_to_device_buffer_fast_path(seq_lens_dtype: torch.dtype) -> N
     assert torch.equal(device_buffer.cpu(), device_buffer_before.cpu())
 
 
+def test_load_cache_to_device_buffer_fast_path_overwrites_stale_output() -> None:
+    # The fast path must write every one of the num_top_k output slots, not just
+    # the first `count = min(seq_len, num_top_k)`: slots past seq_len, and slots
+    # whose token position is negative, have to be set to -1 rather than left
+    # holding whatever the caller's buffer contained.
+    state = _make_state([[9, 7, 3, 5, 11]], [[0, 1, 2, 3, -1]], [4])
+
+    out = _run_kernel(
+        top_k_tokens=torch.tensor([[1, -1, 0, 0]], dtype=torch.int32, device=DEVICE),
+        seq_len=2,
+        output_fill_value=123456,
+        **state,
+    )
+
+    assert torch.equal(out.cpu(), torch.tensor([[7, -1, -1, -1]], dtype=torch.int32))
+
+
 def test_load_cache_to_device_buffer_hits_newest_and_updates_lru() -> None:
     state = _long_case()
 
@@ -399,6 +411,98 @@ def test_load_cache_to_device_buffer_multiple_misses_copy_all_slots() -> None:
         )
 
 
+def test_load_cache_to_device_buffer_multi_iteration_scan_compacts_evictables() -> None:
+    # Regression for the multi-iteration prefix scan over the hot-buffer chunks.
+    #
+    # If the classification loop scans s_evict_chunk_offset with the full
+    # num_buffer_chunks + 1 element count, all 32 lanes participate even though
+    # only num_sub_groups entries were written this iteration: the lanes past that
+    # window re-read what an earlier iteration's scan left behind and fold it into
+    # the accumulator, so every later iteration compacts evictable slots to the
+    # wrong positions in s_lru_slots_out.
+    #
+    # Reproducing it needs a stale region inside the second iteration's window:
+    #   num_buffer_chunks > 2 * num_sub_groups -> hot_buffer_size > 512 at block
+    # 256. At block_size 512 or 1024 num_sub_groups is >= 16 and it cannot
+    # trigger. 8192 additionally keeps the corrupted offsets inside
+    # s_lru_slots_out, so the failure is a deterministic wrong LRU order rather
+    # than an out-of-bounds local-memory write.
+    hot_buffer_size = 8192
+    num_top_k = 32
+    padded_size = hot_buffer_size + 1
+    seq_len = hot_buffer_size + 1  # > hot_buffer_size, so the fast path is skipped
+
+    host_cache = _pinned((num_top_k, 1, KV_DIM), DTYPE)
+    host_cache.copy_(torch.arange(host_cache.numel(), dtype=DTYPE).view_as(host_cache))
+    device_buffer = torch.full(
+        (padded_size, 1, KV_DIM), -1.0, dtype=DTYPE, device=DEVICE
+    )
+    # Identity slot -> device loc mapping keeps the expected values readable.
+    device_buffer_locs = torch.arange(
+        padded_size, dtype=torch.int32, device=DEVICE
+    ).view(1, -1)
+    # Nothing is resident, so every buffer slot is evictable (the path whose
+    # chunk counts are non-zero, hence the one that carries the corruption) and
+    # every query is a miss.
+    device_buffer_tokens = torch.full(
+        (1, padded_size), -1, dtype=torch.int32, device=DEVICE
+    )
+    lru_slots = torch.arange(hot_buffer_size, dtype=torch.int16, device=DEVICE).view(
+        1, -1
+    )
+    host_cache_locs = torch.arange(seq_len, dtype=torch.int64, device=DEVICE).view(
+        1, -1
+    )
+    top_k_tokens = torch.arange(num_top_k, dtype=torch.int32, device=DEVICE).view(1, -1)
+    out = torch.full_like(top_k_tokens, -1)
+
+    load_cache_to_device_buffer_mla(
+        top_k_tokens=top_k_tokens,
+        device_buffer_tokens=device_buffer_tokens,
+        host_cache_locs=host_cache_locs,
+        device_buffer_locs=device_buffer_locs,
+        host_cache=host_cache,
+        device_buffer=device_buffer,
+        top_k_device_locs=out,
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([seq_len], dtype=torch.int32, device=DEVICE),
+        lru_slots=lru_slots,
+        item_size_bytes=ITEM_SIZE_BYTES,
+        num_top_k=num_top_k,
+        hot_buffer_size=hot_buffer_size,
+        page_size=1,
+        block_size=256,
+        num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
+    )
+    torch.xpu.synchronize()
+
+    # Evictables compact backwards from hot_buffer_size - 1 in LRU order, so
+    # miss j takes buffer slot j, and the LRU list rotates left by num_top_k as
+    # the just-filled slots move to the MRU tail.
+    assert torch.equal(
+        out.cpu(), torch.arange(num_top_k, dtype=torch.int32).view(1, -1)
+    )
+    assert torch.equal(
+        device_buffer_tokens[0, :num_top_k].cpu(),
+        torch.arange(num_top_k, dtype=torch.int32),
+    )
+    assert torch.equal(
+        device_buffer_tokens[0, num_top_k:].cpu(),
+        torch.full((padded_size - num_top_k,), -1, dtype=torch.int32),
+    )
+    assert torch.equal(
+        lru_slots[0].cpu(),
+        torch.cat(
+            [
+                torch.arange(num_top_k, hot_buffer_size, dtype=torch.int16),
+                torch.arange(num_top_k, dtype=torch.int16),
+            ]
+        ),
+    )
+    for token in range(num_top_k):
+        assert torch.equal(device_buffer[token].cpu(), host_cache[token])
+
+
 def test_load_cache_to_device_buffer_batched_with_padding() -> None:
     state = _make_state(
         [
@@ -423,6 +527,8 @@ def test_load_cache_to_device_buffer_batched_with_padding() -> None:
         ),
         seq_lens=torch.tensor([8, 3, 8], dtype=torch.int32, device=DEVICE),
         num_real_reqs=2,
+        # The padded row must be *written* as -1, not merely left alone.
+        output_fill_value=123456,
         **state,
     )
 

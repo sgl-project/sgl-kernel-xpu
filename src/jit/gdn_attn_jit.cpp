@@ -8,11 +8,7 @@ namespace sgl {
 namespace gdn_attn_jit {
 
 void* resolve(
-    const char* template_file,
-    const char* entry_macro,
-    const char* entry_symbol,
-    const char* name,
-    std::string* err) {
+    const char* template_file, const char* entry_macro, const char* entry_symbol, const char* name, std::string* err) {
   const jit::JitConfig& cfg = jit::default_config();
   if (!cfg.valid) {
     if (err) *err = "GDN attn JIT unavailable: " + cfg.error;

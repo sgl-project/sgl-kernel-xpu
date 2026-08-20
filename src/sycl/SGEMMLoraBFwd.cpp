@@ -102,17 +102,17 @@ LoraBFwdFn resolve_lora_b_fwd(bool is_half, std::string* err) {
   return fn;
 }
 
-#define DISPATCH_SGEMM_LORA_B_FWD_DTYPE(...)                                                               \
-  do {                                                                                                     \
-    const bool _is_half = weights.scalar_type() == torch::kHalf;                                           \
-    TORCH_CHECK(                                                                                           \
-        _is_half || weights.scalar_type() == torch::kBFloat16,                                             \
-        "Unsupported data type for sgemm_lora_b_fwd weights: ",                                            \
-        weights.scalar_type());                                                                           \
-    std::string _jit_err;                                                                                  \
-    LoraBFwdFn _fn = resolve_lora_b_fwd(_is_half, &_jit_err);                                               \
-    TORCH_CHECK(_fn, "sgemm_lora_b_fwd JIT: ", _jit_err);                                                   \
-    _fn(__VA_ARGS__);                                                                                       \
+#define DISPATCH_SGEMM_LORA_B_FWD_DTYPE(...)                     \
+  do {                                                           \
+    const bool _is_half = weights.scalar_type() == torch::kHalf; \
+    TORCH_CHECK(                                                 \
+        _is_half || weights.scalar_type() == torch::kBFloat16,   \
+        "Unsupported data type for sgemm_lora_b_fwd weights: ",  \
+        weights.scalar_type());                                  \
+    std::string _jit_err;                                        \
+    LoraBFwdFn _fn = resolve_lora_b_fwd(_is_half, &_jit_err);    \
+    TORCH_CHECK(_fn, "sgemm_lora_b_fwd JIT: ", _jit_err);        \
+    _fn(__VA_ARGS__);                                            \
   } while (0)
 #else
 #define DISPATCH_SGEMM_LORA_B_FWD_DTYPE(...)                                                               \

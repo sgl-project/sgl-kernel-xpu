@@ -18,11 +18,7 @@ namespace gdn_attn_jit {
 // it with -D<entry_macro>, and resolve `entry_symbol`. `name` is the cache id
 // for the compiled .so. Returns nullptr and sets *err on failure. Thread-safe.
 void* resolve(
-    const char* template_file,
-    const char* entry_macro,
-    const char* entry_symbol,
-    const char* name,
-    std::string* err);
+    const char* template_file, const char* entry_macro, const char* entry_symbol, const char* name, std::string* err);
 
 }  // namespace gdn_attn_jit
 }  // namespace sgl

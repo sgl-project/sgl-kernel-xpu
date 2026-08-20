@@ -201,9 +201,24 @@ SGL_KERNEL_EXPORT void flash_mla_sparse_decode(
     std::string jit_err;
     TORCH_CHECK(
         sgl::mla_jit::sparse_decode_launch(
-            in_dtype == at::ScalarType::Half, d_qk, b_h, attn_sink.has_value(), &out, &lse_out,
-            &q, &k_cache, &indices, &topk_length, &extra_k_cache, &extra_indices,
-            &extra_topk_length, &attn_sink, sm_scale, head_dim_v, is_fp8_kvcache, &jit_err),
+            in_dtype == at::ScalarType::Half,
+            d_qk,
+            b_h,
+            attn_sink.has_value(),
+            &out,
+            &lse_out,
+            &q,
+            &k_cache,
+            &indices,
+            &topk_length,
+            &extra_k_cache,
+            &extra_indices,
+            &extra_topk_length,
+            &attn_sink,
+            sm_scale,
+            head_dim_v,
+            is_fp8_kvcache,
+            &jit_err),
         jit_err);
   }
 #else

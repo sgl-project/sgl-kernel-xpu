@@ -26,22 +26,22 @@ namespace jit {
 // package layout (via dladdr) plus environment overrides.
 struct JitConfig {
   std::vector<std::string> include_dirs;
-  std::vector<std::string> extra_flags;   // e.g. -DFOO, -fsycl-targets=...
-  std::vector<std::string> link_flags;    // e.g. -L.../torch/lib -ltorch
-  std::string cache_dir;                  // where compiled .so are cached
-  std::string src_root;                   // dir under which "sycl/..." templates live
+  std::vector<std::string> extra_flags;  // e.g. -DFOO, -fsycl-targets=...
+  std::vector<std::string> link_flags;   // e.g. -L.../torch/lib -ltorch
+  std::string cache_dir;                 // where compiled .so are cached
+  std::string src_root;                  // dir under which "sycl/..." templates live
   std::string compiler = "icpx";
-  bool valid = false;                     // false => environment incomplete
-  std::string error;                      // populated when !valid
+  bool valid = false;  // false => environment incomplete
+  std::string error;   // populated when !valid
 };
 
 // A single kernel instantiation request.
 struct CompileSpec {
-  std::string name;                              // short id for the .so filename
-  std::string template_path;                     // absolute path to a *.cpp.in
-  std::map<std::string, std::string> subs;       // @KEY@ -> value substitutions
-  std::vector<std::string> extra_flags;          // per-kernel flags (macros, ...)
-  std::string entry_symbol;                      // extern "C" symbol to resolve
+  std::string name;                         // short id for the .so filename
+  std::string template_path;                // absolute path to a *.cpp.in
+  std::map<std::string, std::string> subs;  // @KEY@ -> value substitutions
+  std::vector<std::string> extra_flags;     // per-kernel flags (macros, ...)
+  std::string entry_symbol;                 // extern "C" symbol to resolve
 };
 
 // Base flags every SYCL JIT compile needs (SYCL std, fp behavior, target, SPIRV
@@ -63,8 +63,7 @@ const JitConfig& default_config();
 
 // Render a template string, replacing every `@KEY@` with subs[KEY] (mirrors
 // CMake configure_file @ONLY). Exposed for testing.
-std::string render_template(const std::string& tmpl,
-                            const std::map<std::string, std::string>& subs);
+std::string render_template(const std::string& tmpl, const std::map<std::string, std::string>& subs);
 
 }  // namespace jit
 }  // namespace sgl

@@ -112,17 +112,17 @@ QKVLoraBFwdFn resolve_qkv_lora_b_fwd(bool is_half, std::string* err) {
   return fn;
 }
 
-#define DISPATCH_QKV_LORA_B_FWD_DTYPE(...)                                                                     \
-  do {                                                                                                         \
-    const bool _is_half = qkv_lora_b.scalar_type() == torch::kHalf;                                            \
-    TORCH_CHECK(                                                                                               \
-        _is_half || qkv_lora_b.scalar_type() == torch::kBFloat16,                                              \
-        "Unsupported data type for qkv_lora_b_fwd qkv_lora_b: ",                                               \
-        qkv_lora_b.scalar_type());                                                                            \
-    std::string _jit_err;                                                                                      \
-    QKVLoraBFwdFn _fn = resolve_qkv_lora_b_fwd(_is_half, &_jit_err);                                            \
-    TORCH_CHECK(_fn, "qkv_lora_b_fwd JIT: ", _jit_err);                                                         \
-    _fn(__VA_ARGS__);                                                                                          \
+#define DISPATCH_QKV_LORA_B_FWD_DTYPE(...)                           \
+  do {                                                               \
+    const bool _is_half = qkv_lora_b.scalar_type() == torch::kHalf;  \
+    TORCH_CHECK(                                                     \
+        _is_half || qkv_lora_b.scalar_type() == torch::kBFloat16,    \
+        "Unsupported data type for qkv_lora_b_fwd qkv_lora_b: ",     \
+        qkv_lora_b.scalar_type());                                   \
+    std::string _jit_err;                                            \
+    QKVLoraBFwdFn _fn = resolve_qkv_lora_b_fwd(_is_half, &_jit_err); \
+    TORCH_CHECK(_fn, "qkv_lora_b_fwd JIT: ", _jit_err);              \
+    _fn(__VA_ARGS__);                                                \
   } while (0)
 #else
 #define DISPATCH_QKV_LORA_B_FWD_DTYPE(...)                                                                     \

@@ -1,6 +1,7 @@
 import ctypes
 import os
 import platform
+from typing import Optional
 
 import torch
 
@@ -130,6 +131,7 @@ from sgl_kernel.mhc import (
 )
 
 fused_hc_head = torch.ops.sgl_kernel.fused_hc_head.default
+mhc_fused_post_pre = torch.ops.sgl_kernel.mhc_fused_post_pre.default
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     biased_topk,
@@ -171,6 +173,8 @@ from sgl_kernel.top_k import (
     fast_topk_transform_fused,
     fast_topk_transform_ragged_fused,
     fast_topk_v2,
+    topk_transform_512,
+    topk_transform_512_v2,
 )
 from sgl_kernel.utils import get_device_capability, is_xe2_arch
 from sgl_kernel.version import __version__

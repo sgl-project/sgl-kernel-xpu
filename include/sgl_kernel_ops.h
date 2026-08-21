@@ -837,6 +837,23 @@ void hc_post(
  */
 void hc_pre_gemm_sqr_sum(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, const at::Tensor& B);
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mhc_fused_post_pre(
+    const at::Tensor& x,
+    const at::Tensor& residual,
+    const at::Tensor& post_layer_mix,
+    const at::Tensor& comb_res_mix,
+    const at::Tensor& fn,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    double rms_eps = 1e-6,
+    double hc_pre_eps = 1e-6,
+    double hc_sinkhorn_eps = 1e-6,
+    double hc_post_mult_value = 2.0,
+    int64_t sinkhorn_repeat = 20,
+    int64_t n_splits = 0,
+    std::optional<at::Tensor> norm_weight = std::nullopt,
+    std::optional<double> norm_eps = std::nullopt);
+
 /*
  * From csrc/speculative
  */
@@ -944,6 +961,23 @@ void fast_topk_transform_ragged_interface(
     at::Tensor& topk_indices_ragged,
     const at::Tensor& topk_indices_offset,
     std::optional<at::Tensor> row_starts_opt);
+
+void topk_transform_512_interface(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    const at::Tensor& page_tables,
+    at::Tensor& out_page_indices,
+    int64_t page_size,
+    std::optional<at::Tensor> out_raw_indices_opt);
+
+void topk_transform_512_v2_interface(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    const at::Tensor& page_tables,
+    at::Tensor& out_page_indices,
+    int64_t page_size,
+    const at::Tensor& metadata,
+    std::optional<at::Tensor> out_raw_indices_opt);
 
 /*
  * Compress plan and execution kernels

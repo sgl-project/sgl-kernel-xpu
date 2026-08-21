@@ -84,3 +84,10 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
 template struct FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DIM@, @ELEM_TYPE@>;
 
 }  // namespace decode
+
+#ifdef SGL_FMHA_JIT_ENTRY
+extern "C" __attribute__((visibility("default"))) void sgl_fmha_entry(const void* params) {
+  decode::FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DIM@, @ELEM_TYPE@>{}(
+      *static_cast<const decode::Arguments*>(params));
+}
+#endif

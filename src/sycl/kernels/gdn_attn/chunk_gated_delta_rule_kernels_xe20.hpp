@@ -153,7 +153,7 @@ CUTE_DEVICE void chunk_compute_A_kernel(
   int total_chunks = 0;
   for (int b = 0; b < batch_size; ++b) {
     const int seq_len = query_start_loc[b + 1] - query_start_loc[b];
-    total_chunks += (seq_len + chunk_size - 1) / chunk_size;
+    total_chunks += div_up(seq_len, chunk_size);
   }
   if (flat_chunk_id >= total_chunks) {
     return;
@@ -1159,8 +1159,7 @@ void kernel_launcher(
   // Grid is over-provisioned since the real chunk count depends on the
   // ragged per-batch sequence lengths in query_start_loc, which is only
   // known on device
-  const int total_chunks_upper_bound =
-      (total_virtual_seqlen + batch_size * (chunk_size - 1) + chunk_size - 1) / chunk_size;
+  const int total_chunks_upper_bound = div_up(total_virtual_seqlen, chunk_size);
   sycl::range<3> global_compute_A(total_chunks_upper_bound, num_v_heads, 1);
 
   queue.submit([&](sycl::handler& cgh) {

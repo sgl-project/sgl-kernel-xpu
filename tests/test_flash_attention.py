@@ -2249,33 +2249,120 @@ if EXTENDED_KVCACHE_TESTS:
         not is_fa3_supported(),
         reason="flash_attn at sgl-kernel is only supported on BMG and later",
     )
-    def test_flash_attn_varlen_hd512_32k_score_workspace():
-        """Regression for the HD512 ScoreBlock2D workspace OOM reported in PR 342."""
+    @pytest.mark.parametrize(
+        "batch_size,nheads_q,nheads_kv,seqlen_q,seqlen_k",
+        [
+            (1, 16, 2, 32768, 32768),
+            # 16 Q tiles per head: requires two query heads to cover both BMG
+            # (20 Xe-cores) and CRI (32 Xe-cores) without a 4 GiB score buffer.
+            (1, 16, 2, 4096, 32768),
+            # A low-head, high-batch case must accumulate Q tiles across batch
+            # slices instead of allocating all eight score matrices at once.
+            (8, 1, 1, 4096, 32768),
+            # Exercises nested batch and GQA-head slicing: one unsliced batch
+            # needs 2 GiB and the complete problem needs 8 GiB.
+            (4, 8, 1, 4096, 32768),
+        ],
+    )
+    def test_flash_attn_varlen_hd512_large_score_workspace(
+        batch_size, nheads_q, nheads_kv, seqlen_q, seqlen_k
+    ):
+        """Large ScoreBlock2D cases that require batch and GQA-head slicing."""
         from sgl_kernel.flash_attn import flash_attn_varlen_func
 
-        seqlen = 32768
-        nheads_q = 16
-        nheads_kv = 2
         head_dim = 512
         torch.manual_seed(0)
 
-        q = torch.randn(seqlen, nheads_q, head_dim, device=device, dtype=torch.bfloat16)
-        k = torch.randn(seqlen, nheads_kv, head_dim, device=device, dtype=torch.bfloat16)
-        v = torch.randn(seqlen, nheads_kv, head_dim, device=device, dtype=torch.bfloat16)
-        cu_seqlens = torch.tensor([0, seqlen], device=device, dtype=torch.int32)
+        total_q = batch_size * seqlen_q
+        total_k = batch_size * seqlen_k
+        q = torch.randn(total_q, nheads_q, head_dim, device=device, dtype=torch.bfloat16)
+        k = torch.randn(total_k, nheads_kv, head_dim, device=device, dtype=torch.bfloat16)
+        v = torch.randn(total_k, nheads_kv, head_dim, device=device, dtype=torch.bfloat16)
+        cu_seqlens_q = torch.arange(
+            0, total_q + 1, seqlen_q, device=device, dtype=torch.int32
+        )
+        cu_seqlens_k = torch.arange(
+            0, total_k + 1, seqlen_k, device=device, dtype=torch.int32
+        )
 
         out = flash_attn_varlen_func(
             q,
             k,
             v,
-            cu_seqlens,
-            cu_seqlens,
-            seqlen,
-            seqlen,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqlen_q,
+            seqlen_k,
             causal=True,
         )
         torch.xpu.synchronize()
-        assert out.shape == (seqlen, nheads_q, head_dim)
+        assert out.shape == (total_q, nheads_q, head_dim)
+        assert out.dtype == torch.bfloat16
+        assert torch.isfinite(out).all()
+
+    @pytest.mark.parametrize(
+        "batch_size,nheads_q,nheads_kv",
+        [
+            (1, 16, 2),
+            (8, 1, 1),
+        ],
+    )
+    def test_flash_attn_paged_hd512_large_score_workspace(
+        batch_size, nheads_q, nheads_kv
+    ):
+        """Paged ScoreBlock2D cases that previously required a 4 GiB workspace."""
+        from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+        seqlen_q = 4096
+        seqlen_k = 32768
+        page_size = 128
+        head_dim = 512
+        pages_per_seq = seqlen_k // page_size
+        num_pages = batch_size * pages_per_seq
+        torch.manual_seed(0)
+
+        q = torch.randn(
+            batch_size * seqlen_q,
+            nheads_q,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        k_cache = torch.randn(
+            num_pages,
+            page_size,
+            nheads_kv,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        v_cache = torch.randn_like(k_cache)
+        page_table = torch.arange(
+            num_pages, device=device, dtype=torch.int32
+        ).reshape(batch_size, pages_per_seq)
+        cache_seqlens = torch.full(
+            (batch_size,), seqlen_k, device=device, dtype=torch.int32
+        )
+        cu_seqlens_q = torch.arange(
+            0,
+            batch_size * seqlen_q + 1,
+            seqlen_q,
+            device=device,
+            dtype=torch.int32,
+        )
+
+        out = flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=cache_seqlens,
+            page_table=page_table,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=seqlen_q,
+            causal=True,
+        )
+        torch.xpu.synchronize()
+        assert out.shape == (batch_size * seqlen_q, nheads_q, head_dim)
         assert out.dtype == torch.bfloat16
         assert torch.isfinite(out).all()
 

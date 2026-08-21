@@ -254,7 +254,10 @@ def test_fused_add_rmsnorm_3d(batch_size, seq_len, hidden_size, dtype):
 
 @pytest.mark.parametrize("batch_size", [1, 4, 19])
 @pytest.mark.parametrize("seq_len", [1, 7, 32])
-@pytest.mark.parametrize("hidden_size", [111, 1024, 4096])
+# hidden_size=1 exercises the "other dim == 1" shape (excluding the leading
+# batch dim) that bypasses the flattenable fast-path check but still yields
+# a correct result.
+@pytest.mark.parametrize("hidden_size", [1, 111, 1024, 4096])
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("specify_out", [True, False])
 def test_gemma_norm_3d(batch_size, seq_len, hidden_size, dtype, specify_out):
@@ -462,8 +465,11 @@ def _make_non_flattenable_4d(num_tokens, num_heads, head_dim, dtype, extra_heads
 
 
 @pytest.mark.parametrize("num_tokens", [1, 7])
-@pytest.mark.parametrize("num_heads", [4, 8])
-@pytest.mark.parametrize("head_dim", [64, 128])
+# num_heads=1 and head_dim=1 exercise the "other dim == 1" shapes (excluding
+# the leading batch/token dims) that bypass the flattenable fast-path check
+# but still yield a correct result.
+@pytest.mark.parametrize("num_heads", [1, 4, 8])
+@pytest.mark.parametrize("head_dim", [1, 64, 128])
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("specify_out", [True, False])
 def test_gemma_norm_4d(num_tokens, num_heads, head_dim, dtype, specify_out):
@@ -478,6 +484,68 @@ def test_gemma_norm_4d(num_tokens, num_heads, head_dim, dtype, specify_out):
         y = sgl_kernel.gemma_rmsnorm(x, w)
 
     torch.testing.assert_close(y_ref, y, **norm_tolerances(dtype))
+
+
+###############################################################################
+# Non-contiguous 4D tensor tests (sliced last-dim, flattenable leading dims)
+###############################################################################
+
+
+def _make_non_contiguous_4d(num_tokens, num_heads, head_dim, dtype, extra=64):
+    """Create a last-dim-non-contiguous 4D tensor [1, tokens, heads, head_dim]
+    by slicing a larger tensor along the last dimension."""
+    full = torch.randn(
+        1, num_tokens, num_heads, head_dim + extra, device=device, dtype=dtype
+    )
+    view = full[..., :head_dim]
+    assert view.stride(-1) == 1
+    assert view.stride(-2) == head_dim + extra
+    return view
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7])
+@pytest.mark.parametrize("num_heads", [4, 8])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_gemma_norm_4d_non_contiguous(num_tokens, num_heads, head_dim, dtype):
+    x_nc = _make_non_contiguous_4d(num_tokens, num_heads, head_dim, dtype)
+    w = torch.randn(head_dim, device=device, dtype=dtype)
+
+    y_ref = gemma_rms_norm(x_nc.clone(), w)
+    y = sgl_kernel.gemma_rmsnorm(x_nc, w)
+
+    torch.testing.assert_close(y_ref, y, **norm_tolerances(dtype))
+
+
+def test_gemma_norm_4d_non_flattenable_row_strides():
+    x = _make_non_flattenable_4d(7, 4, 128, torch.float16)
+    w = torch.randn(x.size(-1), device=device, dtype=x.dtype)
+
+    assert x.size(-2) > 1
+    assert x.stride(-2) != 0
+    assert x.stride(-3) != x.size(-2) * x.stride(-2)
+
+    y = torch.empty_strided(x.shape, x.stride(), device=device, dtype=x.dtype)
+    y_ref = gemma_rms_norm(x.clone(), w)
+    sgl_kernel.gemma_rmsnorm(x, w, out=y)
+
+    torch.testing.assert_close(y_ref, y, **norm_tolerances(x.dtype))
+
+
+def test_gemma_norm_4d_non_flattenable_unaligned_row_strides():
+    full = torch.randn(1, 7, 8, 130, device=device, dtype=torch.float16)
+    x = full[:, :, :4, :128]
+    w = torch.randn(x.size(-1), device=device, dtype=x.dtype)
+
+    assert x.stride(-3) != x.size(-2) * x.stride(-2)
+    assert x.size(-1) % 8 == 0
+    assert x.stride(-2) % 8 != 0
+
+    y = torch.empty_strided(x.shape, x.stride(), device=device, dtype=x.dtype)
+    y_ref = gemma_rms_norm(x.clone(), w)
+    sgl_kernel.gemma_rmsnorm(x, w, out=y)
+
+    torch.testing.assert_close(y_ref, y, **norm_tolerances(x.dtype))
 
 
 @pytest.mark.parametrize("num_tokens", [7, 32])

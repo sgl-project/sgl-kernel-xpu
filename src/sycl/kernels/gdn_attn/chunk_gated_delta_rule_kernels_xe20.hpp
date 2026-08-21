@@ -254,14 +254,7 @@ CUTE_DEVICE void chunk_compute_A_kernel(
   }
 }
 
-// Conventional (non-persistent) counterpart of chunk_compute_A_kernel: each
-// workgroup is launched for exactly one (chunk, v_head) pair and retires
-// after doing that single unit of work, relying on the GPU's hardware block
-// scheduler for dynamic load balancing instead of a software grid-stride
-// loop. The grid is over-provisioned to an upper bound on the total chunk
-// count (see kernel_launcher) because the real chunk count depends on the
-// ragged per-batch sequence lengths in query_start_loc, which is only known
-// on device; workgroups beyond the real chunk count exit immediately.
+// Each workgroup is responsible for one (chunk, v_head) pair
 template <typename T, class TiledMMA>
 CUTE_DEVICE void chunk_compute_A_kernel_conventional(
     const sycl::local_accessor<float, 1>& slm_mem_const,
@@ -323,8 +316,6 @@ CUTE_DEVICE void chunk_compute_A_kernel_conventional(
   const int kv_ratio = num_v_heads / num_k_heads;
   const int chunk_start_offset = flat_chunk_id * chunk_size;
 
-  // Unlike the persistent kernel, no earlier loop iteration shares this
-  // workgroup's SLM, so no leading WAR fence is needed before the first fill.
   CUTE_UNROLL
   for (int e = local_id; e < chunk_size; e += local_range) {
     g_slm_ptr[e] = a[(chunk_start_offset + e) + v_head_id * total_virtual_seqlen];
@@ -1295,72 +1286,37 @@ void kernel_launcher(
   using MMAComputeA =
       typename TiledMMAHelper<MMA_Atom<decltype(op)>, Layout<WGTileComputeA>, SGLayoutComputeA>::TiledMMA;
   auto mmaComputeA = MMAComputeA{};
-  int MaxThreadsPerWorkgroupComputeA =
-      size(mmaComputeA);  // 64 = 4 subgroup (HW thread) * 16 threads per subgroup -> 1 EU
-  sycl::range<3> local_compute_A(
-      1, 1, MaxThreadsPerWorkgroupComputeA);  // 64 threads per workgroup -> one MMA tile -> 1 EU
-  int slm_size_compute_A = chunk_size;        // 64 hardcoded
+  int MaxThreadsPerWorkgroupComputeA = size(mmaComputeA);
+  sycl::range<3> local_compute_A(1, 1, MaxThreadsPerWorkgroupComputeA);
+  int slm_size_compute_A = chunk_size;
 
-  // Runtime toggle (default off) to compare the persistent, grid-stride
-  // chunk_compute_A_kernel design against chunk_compute_A_kernel_conventional,
-  // which launches one workgroup per (chunk, v_head) pair and relies on the
-  // hardware block scheduler for load balancing.
-  static const bool use_conventional_compute_A = std::getenv("SGLANG_GDN_COMPUTE_A_CONVENTIONAL") != nullptr;
+  // Grid is over-provisioned since the real chunk count depends on the
+  // ragged per-batch sequence lengths in query_start_loc, which is only
+  // known on device
+  const int total_chunks_upper_bound =
+      (total_virtual_seqlen + batch_size * (chunk_size - 1) + chunk_size - 1) / chunk_size;
+  sycl::range<3> global_compute_A(total_chunks_upper_bound, num_v_heads, 1);
 
-  if (use_conventional_compute_A) {
-    // Grid is over-provisioned since the real chunk count depends on the
-    // ragged per-batch sequence lengths in query_start_loc, which is only
-    // known on device; out-of-range workgroups exit immediately (see
-    // chunk_compute_A_kernel_conventional).
-    const int total_chunks_upper_bound =
-        (total_virtual_seqlen + batch_size * (chunk_size - 1) + chunk_size - 1) / chunk_size;
-    sycl::range<3> global_compute_A_conv(total_chunks_upper_bound, num_v_heads, 1);
-
-    queue.submit([&](sycl::handler& cgh) {
-      sycl::local_accessor<float, 1> local_mem(sycl::range<1>(slm_size_compute_A), cgh);
-      cgh.parallel_for<ChunkComputeAKernelConventional<T, StateT>>(
-          sycl::nd_range<3>{global_compute_A_conv * local_compute_A, local_compute_A}, kernel_props, [=](auto) {
-            chunk_compute_A_kernel_conventional<T, MMAComputeA>(
-                local_mem,
-                A,
-                k,
-                v,
-                b,
-                a,
-                query_start_loc,
-                total_virtual_seqlen,
-                batch_size,
-                num_k_heads,
-                head_k_dim,
-                num_v_heads,
-                head_v_dim);
-          });
-    });
-  } else {
-    sycl::range<3> global_compute_A(
-        1, sm_count * MaxThreadsPerSM / MaxThreadsPerWorkgroupComputeA, 1);  // = (1, 160, 1) = total EU number
-
-    queue.submit([&](sycl::handler& cgh) {
-      sycl::local_accessor<float, 1> local_mem(sycl::range<1>(slm_size_compute_A), cgh);
-      cgh.parallel_for<ChunkComputeAKernel<T, StateT>>(
-          sycl::nd_range<3>{global_compute_A * local_compute_A, local_compute_A}, kernel_props, [=](auto) {
-            chunk_compute_A_kernel<T, MMAComputeA>(
-                local_mem,
-                A,
-                k,
-                v,
-                b,
-                a,
-                query_start_loc,
-                total_virtual_seqlen,
-                batch_size,
-                num_k_heads,
-                head_k_dim,
-                num_v_heads,
-                head_v_dim);
-          });
-    });
-  }
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> local_mem(sycl::range<1>(slm_size_compute_A), cgh);
+    cgh.parallel_for<ChunkComputeAKernelConventional<T, StateT>>(
+        sycl::nd_range<3>{global_compute_A * local_compute_A, local_compute_A}, kernel_props, [=](auto) {
+          chunk_compute_A_kernel_conventional<T, MMAComputeA>(
+              local_mem,
+              A,
+              k,
+              v,
+              b,
+              a,
+              query_start_loc,
+              total_virtual_seqlen,
+              batch_size,
+              num_k_heads,
+              head_k_dim,
+              num_v_heads,
+              head_v_dim);
+        });
+  });
 
   using WGTileInverse = chunk_gemm_policy_inverse::WGTile;
   using SGLayoutInverse = chunk_gemm_policy_inverse::SGLayout;

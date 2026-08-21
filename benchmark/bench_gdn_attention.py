@@ -560,6 +560,8 @@ def main():
         ("prefill", 1, 4096),
         ("prefill", 4, 1024),
         ("prefill", 4, 4096),
+        ("prefill", 8, 1024),
+        ("prefill", 8, 4096),
         ("decode", 1, 1),
         ("decode", 4, 1),
     ]

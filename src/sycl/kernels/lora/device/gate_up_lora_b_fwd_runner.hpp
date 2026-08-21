@@ -97,10 +97,10 @@ inline void runGateUpLoraBFwd(
   namespace core = at::native::xpu;
   using Types = typename TileOpt::template Types<T>;
 
-  constexpr int n_slices = 2;                              // gate + up
+  constexpr int n_slices = 2;                                  // gate + up
   const int K = static_cast<int>(input_x.size(1) / n_slices);  // reduction dim == max_rank
   const int N = output_dim;
-  const int N_total = n_slices * N;                       // gate_up_lora_b.size(1)
+  const int N_total = n_slices * N;  // gate_up_lora_b.size(1)
   const int num_groups = n_slices * num_segments;
   const int64_t elem_bytes = static_cast<int64_t>(sizeof(T));
   const auto device = input_x.device();

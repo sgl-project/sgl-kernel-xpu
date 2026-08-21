@@ -65,23 +65,23 @@ namespace {
 // tiles to DISPATCH_GATE_UP_LORA_B_FWD_TILE (and to GateUpLoraBFwdXe20.cmake +
 // gate_up_lora_b_fwd_dispatch.hpp + gate_up_lora_b_fwd_types.hpp) with a runtime
 // heuristic picking the tag.
-#define DISPATCH_GATE_UP_LORA_B_FWD_TILE(ELEM, ...)                            \
-  do {                                                                         \
+#define DISPATCH_GATE_UP_LORA_B_FWD_TILE(ELEM, ...)                                \
+  do {                                                                             \
     gate_up_lora_b_fwd_impl::launch_gate_up_lora_b_fwd_##ELEM##_tall(__VA_ARGS__); \
   } while (0)
-#define DISPATCH_GATE_UP_LORA_B_FWD_DTYPE(...)                                                                       \
-  do {                                                                                                               \
-    switch (gate_up_lora_b.scalar_type()) {                                                                          \
-      case torch::kHalf:                                                                                             \
-        DISPATCH_GATE_UP_LORA_B_FWD_TILE(half, __VA_ARGS__);                                                         \
-        break;                                                                                                       \
-      case torch::kBFloat16:                                                                                         \
-        DISPATCH_GATE_UP_LORA_B_FWD_TILE(bf16, __VA_ARGS__);                                                         \
-        break;                                                                                                       \
-      default:                                                                                                       \
-        TORCH_CHECK(                                                                                                 \
-            false, "Unsupported data type for gate_up_lora_b_fwd gate_up_lora_b: ", gate_up_lora_b.scalar_type());   \
-    }                                                                                                                \
+#define DISPATCH_GATE_UP_LORA_B_FWD_DTYPE(...)                                                                     \
+  do {                                                                                                             \
+    switch (gate_up_lora_b.scalar_type()) {                                                                        \
+      case torch::kHalf:                                                                                           \
+        DISPATCH_GATE_UP_LORA_B_FWD_TILE(half, __VA_ARGS__);                                                       \
+        break;                                                                                                     \
+      case torch::kBFloat16:                                                                                       \
+        DISPATCH_GATE_UP_LORA_B_FWD_TILE(bf16, __VA_ARGS__);                                                       \
+        break;                                                                                                     \
+      default:                                                                                                     \
+        TORCH_CHECK(                                                                                               \
+            false, "Unsupported data type for gate_up_lora_b_fwd gate_up_lora_b: ", gate_up_lora_b.scalar_type()); \
+    }                                                                                                              \
   } while (0)
 
 }  // namespace
@@ -145,7 +145,8 @@ SGL_KERNEL_EXPORT void gate_up_lora_b_fwd(
   TORCH_CHECK(
       output.size(0) == num_tokens_i64 && output.size(1) == n_total_i64,
       "Output tensor must have shape (num_tokens, 2 * N)");
-  TORCH_CHECK(output.scalar_type() == gate_up_lora_b.scalar_type(), "Output tensor dtype must match gate_up_lora_b dtype");
+  TORCH_CHECK(
+      output.scalar_type() == gate_up_lora_b.scalar_type(), "Output tensor dtype must match gate_up_lora_b dtype");
   TORCH_CHECK(
       gate_up_lora_b.scalar_type() == input_x.scalar_type(), "Input tensor dtype must match gate_up_lora_b dtype");
   if (base_output.has_value()) {
@@ -155,7 +156,8 @@ SGL_KERNEL_EXPORT void gate_up_lora_b_fwd(
         base_output->size(0) == num_tokens_i64 && base_output->size(1) == n_total_i64,
         "base_output must have shape (num_tokens, 2 * N)");
     TORCH_CHECK(
-        base_output->scalar_type() == gate_up_lora_b.scalar_type(), "base_output dtype must match gate_up_lora_b dtype");
+        base_output->scalar_type() == gate_up_lora_b.scalar_type(),
+        "base_output dtype must match gate_up_lora_b dtype");
   }
 
   if (num_tokens_i64 == 0) {

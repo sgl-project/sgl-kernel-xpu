@@ -6,7 +6,9 @@ import torch
 from sgl_kernel import gate_up_lora_b_fwd
 
 if not torch.xpu.is_available():
-    pytest.skip(reason="gate_up_lora_b_fwd requires XPU device.", allow_module_level=True)
+    pytest.skip(
+        reason="gate_up_lora_b_fwd requires XPU device.", allow_module_level=True
+    )
 
 
 def _tolerances(dtype: torch.dtype):
@@ -585,7 +587,9 @@ def test_gate_up_lora_b_fwd_int64_index_tensors_accepted():
 
 def _make_valid_kwargs():
     num_tokens = 4
-    max_rank = 4  # K; input_x.size(1) == 2 * max_rank, gate_up_lora_b.size(2) == max_rank
+    max_rank = (
+        4  # K; input_x.size(1) == 2 * max_rank, gate_up_lora_b.size(2) == max_rank
+    )
     output_dim = 8
     n_total = 2 * output_dim
     num_loras = 1
@@ -616,9 +620,15 @@ def _make_valid_kwargs():
         ("weight_indices_dim", "weight_indices must be a 1D tensor"),
         ("lora_ranks_dim", "lora_ranks must be a 1D tensor"),
         ("scalings_dim", "scalings must be a 1D tensor"),
-        ("output_dim_mismatch", "gate_up_lora_b.size\\(1\\) must equal 2 \\* output_dim"),
+        (
+            "output_dim_mismatch",
+            "gate_up_lora_b.size\\(1\\) must equal 2 \\* output_dim",
+        ),
         ("input_x_rank_mismatch", "input_x.size\\(1\\) must equal 2 \\* max_rank"),
-        ("lora_ranks_size", "lora_ranks.numel\\(\\) must equal gate_up_lora_b.size\\(0\\)"),
+        (
+            "lora_ranks_size",
+            "lora_ranks.numel\\(\\) must equal gate_up_lora_b.size\\(0\\)",
+        ),
         ("scalings_size", "scalings.numel\\(\\) must equal gate_up_lora_b.size\\(0\\)"),
         (
             "weight_indices_size",

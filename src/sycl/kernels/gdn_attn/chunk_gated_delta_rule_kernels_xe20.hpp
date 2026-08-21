@@ -3,7 +3,6 @@
 #include <torch/all.h>
 
 #include <cstdint>
-#include <cstdlib>
 #include <sycl/sycl.hpp>
 
 #include "../../Utils.h"
@@ -1127,7 +1126,7 @@ void kernel_launcher(
   auto op = XE_DPAS_TT<8, float, Element_non_CV>{};
 
   int sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
-  static constexpr int MaxThreadsPerSM = 512;  // 8 EU per sm, 4 HW thread per EU, 16 threads per HW thread
+  static constexpr int MaxThreadsPerSM = 512;
 
   namespace syclex = sycl::ext::oneapi::experimental;
   namespace intelex = sycl::ext::intel::experimental;

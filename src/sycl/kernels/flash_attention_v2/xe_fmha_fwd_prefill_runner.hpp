@@ -328,8 +328,8 @@ struct PrefillRunner {
   // to KV heads. The original NHD strides remain in the arguments because the
   // source tensors still contain all heads.
   template <class Kernel>
-  typename Kernel::Arguments slice_query_head_arguments(
-      typename Kernel::Arguments args, int query_head, int query_head_count) const {
+  typename Kernel::Arguments
+  slice_query_head_arguments(typename Kernel::Arguments args, int query_head, int query_head_count) const {
     const int head_group_q = args.kernel.shape.num_heads_q / args.kernel.shape.num_heads_kv;
     const int kv_head = query_head / head_group_q;
     const int head_offset_in_group = query_head % head_group_q;
@@ -412,8 +412,7 @@ struct PrefillRunner {
           batch_slice = int(cute::max(size_t(1), cap_bytes / full_batch_workspace));
           batch_slice = cute::min(batch_total, batch_slice);
         } else {
-          const int q_tiles = cute::ceil_div(
-              params.seqlen_q, int(get<0>(typename FMHAPrefillKernel::TileShapeQK{})));
+          const int q_tiles = cute::ceil_div(params.seqlen_q, int(get<0>(typename FMHAPrefillKernel::TileShapeQK{})));
           const int target_heads = cute::ceil_div(cute::max(1, hw_info.sm_count), cute::max(1, q_tiles));
           query_head_slice = cute::min(params.h, target_heads);
           const int first_head_slice = get_query_head_slice_size(0, params.h, head_group_q, query_head_slice);
@@ -437,7 +436,8 @@ struct PrefillRunner {
       if (std::getenv("FMHA_SCORE_WS_VERBOSE") != nullptr) {
         std::fprintf(
             stderr,
-            "[fmha] score workspace: batch=%d batch_slice=%d slices=%d query_head_slice=%d q_tile_rows=%d bytes=%zu (%.1f MiB)\n",
+            "[fmha] score workspace: batch=%d batch_slice=%d slices=%d query_head_slice=%d q_tile_rows=%d bytes=%zu "
+            "(%.1f MiB)\n",
             batch_total,
             batch_slice,
             num_slices,
@@ -449,8 +449,8 @@ struct PrefillRunner {
     }
     // get_workspace_size() is expressed in bytes. Keep the score workspace byte-addressed
     // so BF16/FP16 tensor options do not allocate two bytes for every requested byte.
-    auto workspace = torch::empty(
-        {static_cast<int64_t>(workspace_size)}, torch::device(torch::kXPU).dtype(torch::kByte));
+    auto workspace =
+        torch::empty({static_cast<int64_t>(workspace_size)}, torch::device(torch::kXPU).dtype(torch::kByte));
     void* workspace_ptr = workspace.data_ptr();
 
     if (!FMHAPrefillKernel::can_implement(arguments)) {

@@ -1312,7 +1312,6 @@ void kernel_launcher(
     // ragged per-batch sequence lengths in query_start_loc, which is only
     // known on device; out-of-range workgroups exit immediately (see
     // chunk_compute_A_kernel_conventional).
-    std::cout << "Using the conventional kernel for compute A (one workgroup per chunk, v_head pair)" << std::endl;
     const int total_chunks_upper_bound =
         (total_virtual_seqlen + batch_size * (chunk_size - 1) + chunk_size - 1) / chunk_size;
     sycl::range<3> global_compute_A_conv(total_chunks_upper_bound, num_v_heads, 1);

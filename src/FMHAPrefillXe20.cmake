@@ -55,7 +55,7 @@ set(FMHA_PREFILL_TILED_OUT_512 256)
 option(
     FMHA_PREFILL_ENABLE_SCORE_BLOCK2D_512
     "Reuse QK scores across the two output tiles for HEAD_DIM=512 prefill"
-    ON)
+    OFF)
 
 # Per-HEAD_DIM tile shape parameters for the NON-PAGED (contiguous ragged) KV
 # path (TILED_Q_NP, TILED_KV_NP, NUM_SG_NP). These are kept as a separate set so

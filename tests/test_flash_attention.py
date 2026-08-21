@@ -2364,9 +2364,15 @@ if EXTENDED_KVCACHE_TESTS:
 
         total_q = batch_size * seqlen_q
         total_k = batch_size * seqlen_k
-        q = torch.randn(total_q, nheads_q, head_dim, device=device, dtype=torch.bfloat16)
-        k = torch.randn(total_k, nheads_kv, head_dim, device=device, dtype=torch.bfloat16)
-        v = torch.randn(total_k, nheads_kv, head_dim, device=device, dtype=torch.bfloat16)
+        q = torch.randn(
+            total_q, nheads_q, head_dim, device=device, dtype=torch.bfloat16
+        )
+        k = torch.randn(
+            total_k, nheads_kv, head_dim, device=device, dtype=torch.bfloat16
+        )
+        v = torch.randn(
+            total_k, nheads_kv, head_dim, device=device, dtype=torch.bfloat16
+        )
         cu_seqlens_q = torch.arange(
             0, total_q + 1, seqlen_q, device=device, dtype=torch.int32
         )
@@ -2426,9 +2432,9 @@ if EXTENDED_KVCACHE_TESTS:
             dtype=torch.bfloat16,
         )
         v_cache = torch.randn_like(k_cache)
-        page_table = torch.arange(
-            num_pages, device=device, dtype=torch.int32
-        ).reshape(batch_size, pages_per_seq)
+        page_table = torch.arange(num_pages, device=device, dtype=torch.int32).reshape(
+            batch_size, pages_per_seq
+        )
         cache_seqlens = torch.full(
             (batch_size,), seqlen_k, device=device, dtype=torch.int32
         )

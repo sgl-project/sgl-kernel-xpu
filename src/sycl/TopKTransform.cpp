@@ -272,14 +272,14 @@ radix_topk(sycl::nd_item<1>& item, const float* input, int32_t* index, int row_s
   }
 }
 
-inline void naive_topk(sycl::nd_item<1>& item, int32_t* indices, int length, int topk = kTopK) {
+inline void trivial_topk(sycl::nd_item<1>& item, int32_t* indices, int length, int topk = kTopK) {
   const int tx = static_cast<int>(item.get_local_id(0));
   for (int i = tx; i < topk; i += kThreadsPerBlock) {
     indices[i] = (i < length) ? i : -1;
   }
 }
 
-inline void naive_topk_transform(
+inline void trivial_topk_transform(
     sycl::nd_item<1>& item, int length, int32_t* dst_page_entry, const int32_t* src_page_entry, int topk = kTopK) {
   const int tx = static_cast<int>(item.get_local_id(0));
   for (int i = tx; i < topk; i += kThreadsPerBlock) {
@@ -287,7 +287,7 @@ inline void naive_topk_transform(
   }
 }
 
-inline void naive_topk_transform_ragged(
+inline void trivial_topk_transform_ragged(
     sycl::nd_item<1>& item, int length, int32_t* dst_indices_entry, int32_t offset, int topk = kTopK) {
   const int tx = static_cast<int>(item.get_local_id(0));
   for (int i = tx; i < topk; i += kThreadsPerBlock) {
@@ -295,7 +295,7 @@ inline void naive_topk_transform_ragged(
   }
 }
 
-inline void naive_topk_transform_paged(
+inline void trivial_topk_transform_paged(
     sycl::nd_item<1>& item,
     int length,
     int topk,
@@ -374,7 +374,7 @@ struct FastTopKKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const float* score = params.input + bid * params.input_stride;
 
     if (length <= kTopK) {
-      naive_topk(item, indice, length);
+      trivial_topk(item, indice, length);
     } else {
       radix_topk(item, score, indice, row_start, length);
     }
@@ -405,7 +405,7 @@ struct FastTopKTransformFusedDecodeKernel : public __SYCL_KER_CONFIG_CONVENTION_
     const float* score = params.input + bid * params.input_stride;
 
     if (length <= kTopK) {
-      naive_topk_transform(item, length, dst_entry, src_entry);
+      trivial_topk_transform(item, length, dst_entry, src_entry);
       return;
     }
 
@@ -476,7 +476,7 @@ struct FastTopKTransformFusedPrefillKernel : public __SYCL_KER_CONFIG_CONVENTION
     const int32_t* src_entry = src_page_table + s_src_row[0] * src_stride;
 
     if (length <= kTopK) {
-      naive_topk_transform(item, length, dst_entry, src_entry);
+      trivial_topk_transform(item, length, dst_entry, src_entry);
       return;
     }
 
@@ -518,7 +518,7 @@ struct FastTopKTransformRaggedFusedKernel : public __SYCL_KER_CONFIG_CONVENTION_
     const int32_t offset = topk_indices_offset[bid];
 
     if (length <= kTopK) {
-      naive_topk_transform_ragged(item, length, dst_entry, offset);
+      trivial_topk_transform_ragged(item, length, dst_entry, offset);
       return;
     }
 
@@ -581,7 +581,7 @@ struct TopKTransform512Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const float* row_score = score + bid * score_row_stride;
 
     if (length <= topk) {
-      naive_topk_transform_paged(item, length, topk, dst_pi, src_pt, dst_ri, page_bits);
+      trivial_topk_transform_paged(item, length, topk, dst_pi, src_pt, dst_ri, page_bits);
       return;
     }
 

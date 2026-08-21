@@ -8,8 +8,20 @@
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 
+// Work-group size (threads per token). Intel XPU specialized tuning; 256 is
+// 2x CUDA/Triton's 128 threads/token (num_warps=4 * warp=32) because BMG needs
+// more per-token threads to hide HBM latency, especially on decode (T=1).
 static constexpr int WG_SIZE = 256;
+// Sub-group size (SIMD width). Matches CUDA/Triton warp=32
+static constexpr int SG_SIZE = 32;
+
+// Matches CUDA/Triton: DSV4 uses hc_mult=4; the kernel is specialized/unrolled
+// for this value, so callers must pass x with shape (T, 4, D).
 static constexpr int HC_MULT = 4;
+
+// log2(e), used to rewrite sigmoid(x) = 1 / (1 + exp2(-x * log2e)) so we can
+// call sycl::native::exp2 (single hardware instruction on Intel GPU) instead
+// of exp. CUDA/Triton version just calls tl.sigmoid and does not need this.
 static constexpr float LOG2E = 1.442695040888963f;
 
 template <typename scalar_t>
@@ -54,7 +66,8 @@ struct FusedHCHeadKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     slm_ = sycl::local_accessor<float, 1>(slm_size, cgh);
   }
 
-  [[sycl::reqd_work_group_size(WG_SIZE)]] void operator()(sycl::nd_item<1> item) const {
+  [[sycl::reqd_work_group_size(WG_SIZE)]] [[sycl::reqd_sub_group_size(SG_SIZE)]] void
+  operator()(sycl::nd_item<1> item) const {
     const int token_id = static_cast<int>(item.get_group(0));
     const int tid = static_cast<int>(item.get_local_id(0));
     if (token_id >= T) {
@@ -170,7 +183,6 @@ at::Tensor SGL_KERNEL_EXPORT fused_hc_head(
   CHECK_INPUT(hc_base);
 
   TORCH_CHECK(x.dim() == 3, "x must be [T, hc_mult, hidden_size], got shape=", x.sizes());
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kHalf, "x must be bf16/fp16");
   TORCH_CHECK(hc_fn.scalar_type() == at::kFloat, "hc_fn must be float32");
   TORCH_CHECK(hc_scale.scalar_type() == at::kFloat, "hc_scale must be float32");
   TORCH_CHECK(hc_base.scalar_type() == at::kFloat, "hc_base must be float32");
@@ -196,11 +208,11 @@ at::Tensor SGL_KERNEL_EXPORT fused_hc_head(
   TORCH_CHECK(D < std::numeric_limits<int>::max(), "hidden_size must fit in int32, got ", D);
 
   auto q = dpcppGetCurrentQueue();
-  if (x.scalar_type() == at::kBFloat16) {
-    return launch_fused_hc_head<sycl::ext::oneapi::bfloat16>(
-        q, x, hc_fn, hc_scale, hc_base, T, D, static_cast<float>(norm_eps), static_cast<float>(hc_eps));
-  }
-
-  return launch_fused_hc_head<sycl::half>(
-      q, x, hc_fn, hc_scale, hc_base, T, D, static_cast<float>(norm_eps), static_cast<float>(hc_eps));
+  at::Tensor y;
+  SYCL_DISPATCH_ONLY_FLOATING16_TYPES(
+      at::ScalarType::BFloat16, at::ScalarType::Half, x.scalar_type(), "fused_hc_head", [&]() {
+        y = launch_fused_hc_head<scalar_t>(
+            q, x, hc_fn, hc_scale, hc_base, T, D, static_cast<float>(norm_eps), static_cast<float>(hc_eps));
+      });
+  return y;
 }

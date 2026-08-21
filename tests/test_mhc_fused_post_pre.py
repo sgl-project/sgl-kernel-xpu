@@ -80,6 +80,21 @@ def test_mhc_fused_post_pre(t, d, with_norm):
         norm_eps=NORM_EPS if with_norm else None,
     )
 
+    residual_ref = hc_post(x, residual, post, comb)
+    post_ref, comb_ref, layer_input_ref = mhc_pre(
+        residual_ref,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps=RMS_EPS,
+        hc_pre_eps=HC_PRE_EPS,
+        hc_sinkhorn_eps=HC_SINKHORN_EPS,
+        hc_post_mult_value=HC_POST_MULT_VALUE,
+        sinkhorn_repeat=SINKHORN_REPEAT,
+        norm_weight=nw,
+        norm_eps=NORM_EPS if with_norm else None,
+    )
+
     if t == 0:
         assert residual_cur.shape == residual.shape
         assert post_cur.shape == (0, HC_MULT, 1)

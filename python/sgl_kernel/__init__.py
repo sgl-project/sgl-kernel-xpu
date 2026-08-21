@@ -1,6 +1,7 @@
 import ctypes
 import os
 import platform
+from typing import Optional
 
 import torch
 
@@ -117,14 +118,15 @@ from sgl_kernel.lora import embedding_lora_a_fwd, sgemm_lora_a_fwd, sgemm_lora_b
 from sgl_kernel.mamba import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
 from sgl_kernel.memory import weak_ref_tensor
 from sgl_kernel.mhc import (
-    fused_hc_head,
     hc_post,
     hc_pre_big_fuse,
     hc_pre_gemm_sqr_sum,
     hc_split_sinkhorn,
-    mhc_fused_post_pre,
     mhc_pre,
 )
+
+fused_hc_head = torch.ops.sgl_kernel.fused_hc_head.default
+mhc_fused_post_pre = torch.ops.sgl_kernel.mhc_fused_post_pre.default
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     biased_topk,

@@ -290,9 +290,8 @@ struct MHCFusedPostPreFmaKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   }
 };
 
-inline int64_t choose_small_batch_split_k(int64_t t) {
-  if (t <= 4) return 32;
-  if (t <= 16) return 8;
+inline int64_t choose_small_batch_split_k(int64_t t, int64_t hidden_size) {
+  if (t < 8) return (hidden_size <= 4096) ? 8 : 4;
   return 4;
 }
 
@@ -300,117 +299,96 @@ inline int64_t choose_large_batch_n_splits(int64_t t, int64_t) {
   return t <= 2048 ? 32 : 1;
 }
 
-inline int64_t choose_n_splits(int64_t t, int64_t hc_hidden, int64_t n_splits_hint) {
+inline int64_t choose_n_splits(int64_t t, int64_t hc_hidden, int64_t hidden_size, int64_t n_splits_hint) {
   if (n_splits_hint > 0) {
     return n_splits_hint;
   }
   if (t <= kSmallBatchThreshold) {
-    return choose_small_batch_split_k(t);
+    return choose_small_batch_split_k(t, hidden_size);
   }
   return choose_large_batch_n_splits(t, hc_hidden);
 }
 
-void mhc_fused_post_pre_fma_kernel(
-    const at::Tensor& x,
-    const at::Tensor& residual,
-    const at::Tensor& post_layer_mix_2d,
-    const at::Tensor& comb_res_mix_3d,
-    const at::Tensor& fn,
-    at::Tensor& residual_out,
-    at::Tensor& mixes_partial_out,
-    at::Tensor& sqrsum_partial_out,
-    int64_t split_k) {
-  using bf16_t = sycl::ext::oneapi::bfloat16;
-
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16, "x must be bfloat16");
-  TORCH_CHECK(residual.scalar_type() == at::kBFloat16, "residual must be bfloat16");
-  TORCH_CHECK(post_layer_mix_2d.scalar_type() == at::kFloat, "post_layer_mix must be float32");
-  TORCH_CHECK(comb_res_mix_3d.scalar_type() == at::kFloat, "comb_res_mix must be float32");
-  TORCH_CHECK(fn.scalar_type() == at::kFloat, "fn must be float32");
-  TORCH_CHECK(residual_out.scalar_type() == at::kBFloat16, "residual_out must be bfloat16");
-  TORCH_CHECK(mixes_partial_out.scalar_type() == at::kFloat, "mixes_partial_out must be float32");
-  TORCH_CHECK(sqrsum_partial_out.scalar_type() == at::kFloat, "sqrsum_partial_out must be float32");
-
-  const int64_t T = x.size(0);
-  const int64_t D = x.size(1);
-
-  TORCH_CHECK(
-      residual.size(0) == T && residual.size(1) == SMALL_BATCH_HC && residual.size(2) == D,
-      "residual shape mismatch in small-batch fused kernel");
-  TORCH_CHECK(
-      post_layer_mix_2d.size(0) == T && post_layer_mix_2d.size(1) == SMALL_BATCH_HC, "post_layer_mix shape mismatch");
-  TORCH_CHECK(
-      comb_res_mix_3d.size(0) == T && comb_res_mix_3d.size(1) == SMALL_BATCH_HC &&
-          comb_res_mix_3d.size(2) == SMALL_BATCH_HC,
-      "comb_res_mix shape mismatch");
-  TORCH_CHECK(fn.dim() == 2 && fn.size(0) == SMALL_BATCH_HC3 && fn.size(1) == SMALL_BATCH_HC * D, "fn shape mismatch");
-  TORCH_CHECK(residual_out.sizes() == residual.sizes(), "residual_out shape mismatch");
-  TORCH_CHECK(
-      mixes_partial_out.dim() == 3 && mixes_partial_out.size(0) == split_k && mixes_partial_out.size(1) == T &&
-          mixes_partial_out.size(2) == SMALL_BATCH_HC3,
-      "mixes_partial_out shape mismatch");
-  TORCH_CHECK(
-      sqrsum_partial_out.dim() == 2 && sqrsum_partial_out.size(0) == split_k && sqrsum_partial_out.size(1) == T,
-      "sqrsum_partial_out shape mismatch");
-
-  if (T == 0 || split_k == 0) return;
-
-  auto q = dpcppGetCurrentQueue();
-
-  MHCFusedPostPreFmaKernel ker(
-      reinterpret_cast<const bf16_t*>(x.data_ptr<at::BFloat16>()),
-      reinterpret_cast<const bf16_t*>(residual.data_ptr<at::BFloat16>()),
-      post_layer_mix_2d.data_ptr<float>(),
-      comb_res_mix_3d.data_ptr<float>(),
-      fn.data_ptr<float>(),
-      reinterpret_cast<bf16_t*>(residual_out.data_ptr<at::BFloat16>()),
-      mixes_partial_out.data_ptr<float>(),
-      sqrsum_partial_out.data_ptr<float>(),
-      static_cast<int>(T),
-      static_cast<int>(D),
-      static_cast<int>(split_k));
-
-  sycl::range<2> global(static_cast<size_t>(T) * SMALL_BATCH_WG_SIZE, static_cast<size_t>(split_k));
-  sycl::range<2> local(SMALL_BATCH_WG_SIZE, 1);
-  sycl_kernel_submit(global, local, q, ker);
-}
-
 }  // namespace
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> SGL_KERNEL_EXPORT mhc_fused_post_pre_fma(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> launch_mhc_fused_post_pre_fma_kernel(
     const at::Tensor& x,
     const at::Tensor& residual,
-    const at::Tensor& post_layer_mix,
-    const at::Tensor& comb_res_mix,
+    const at::Tensor& post_2d,
+    const at::Tensor& comb_3d,
     const at::Tensor& fn,
     int64_t n_splits) {
-  CHECK_INPUT(x);
-  CHECK_INPUT(residual);
-  CHECK_INPUT(post_layer_mix);
-  CHECK_INPUT(comb_res_mix);
-  CHECK_INPUT(fn);
-
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16, "x must be bfloat16");
-  TORCH_CHECK(residual.scalar_type() == at::kBFloat16, "residual must be bfloat16");
-  TORCH_CHECK(post_layer_mix.scalar_type() == at::kFloat, "post_layer_mix must be float32");
-  TORCH_CHECK(comb_res_mix.scalar_type() == at::kFloat, "comb_res_mix must be float32");
-  TORCH_CHECK(fn.scalar_type() == at::kFloat, "fn must be float32");
-
-  TORCH_CHECK(x.dim() == 2, "x must be 2D [T, D]");
-  TORCH_CHECK(residual.dim() == 3, "residual must be 3D [T, HC, D]");
-
   const int64_t t = x.size(0);
   const int64_t hidden_size = x.size(1);
   const int64_t hc_mult = residual.size(1);
   const int64_t hc_mult3 = (2 + hc_mult) * hc_mult;
   const int64_t hc_hidden = hc_mult * hidden_size;
 
-  TORCH_CHECK(residual.size(0) == t, "residual T mismatch");
-  TORCH_CHECK(residual.size(2) == hidden_size, "residual D mismatch");
-  TORCH_CHECK(hc_mult == 4, "mhc_fused_post_pre_fma currently supports only HC=4");
-  TORCH_CHECK(fn.dim() == 2, "fn must be 2D [HC3, HC*D]");
-  TORCH_CHECK(fn.size(0) == hc_mult3, "fn row mismatch");
-  TORCH_CHECK(fn.size(1) == hc_hidden, "fn column mismatch");
+  const int64_t n_splits_pre = choose_n_splits(t, hc_hidden, hidden_size, n_splits);
+  at::Tensor residual_cur = at::empty_like(residual);
+  at::Tensor gemm_out_mul = at::empty({n_splits_pre, t, hc_mult3}, residual.options().dtype(at::kFloat));
+  at::Tensor gemm_out_sqrsum = at::empty({n_splits_pre, t}, residual.options().dtype(at::kFloat));
+
+  if (t > 0) {
+    using bf16_t = sycl::ext::oneapi::bfloat16;
+
+    TORCH_CHECK(residual_cur.scalar_type() == at::kBFloat16, "residual_cur must be bfloat16");
+    TORCH_CHECK(gemm_out_mul.scalar_type() == at::kFloat, "gemm_out_mul must be float32");
+    TORCH_CHECK(gemm_out_sqrsum.scalar_type() == at::kFloat, "gemm_out_sqrsum must be float32");
+
+    auto q = dpcppGetCurrentQueue();
+    MHCFusedPostPreFmaKernel ker(
+        reinterpret_cast<const bf16_t*>(x.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const bf16_t*>(residual.data_ptr<at::BFloat16>()),
+        post_2d.data_ptr<float>(),
+        comb_3d.data_ptr<float>(),
+        fn.data_ptr<float>(),
+        reinterpret_cast<bf16_t*>(residual_cur.data_ptr<at::BFloat16>()),
+        gemm_out_mul.data_ptr<float>(),
+        gemm_out_sqrsum.data_ptr<float>(),
+        static_cast<int>(t),
+        static_cast<int>(hidden_size),
+        static_cast<int>(n_splits_pre));
+
+    sycl::range<2> global(static_cast<size_t>(t) * SMALL_BATCH_WG_SIZE, static_cast<size_t>(n_splits_pre));
+    sycl::range<2> local(SMALL_BATCH_WG_SIZE, 1);
+    sycl_kernel_submit(global, local, q, ker);
+  }
+
+  return {residual_cur, gemm_out_mul, gemm_out_sqrsum};
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> SGL_KERNEL_EXPORT mhc_fused_post_pre(
+    const at::Tensor& x,
+    const at::Tensor& residual,
+    const at::Tensor& post_layer_mix,
+    const at::Tensor& comb_res_mix,
+    const at::Tensor& fn,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    double rms_eps,
+    double hc_pre_eps,
+    double hc_sinkhorn_eps,
+    double hc_post_mult_value,
+    int64_t sinkhorn_repeat,
+    int64_t n_splits,
+    std::optional<at::Tensor> norm_weight,
+    std::optional<double> norm_eps) {
+  CHECK_INPUT(x);
+  CHECK_INPUT(residual);
+  CHECK_INPUT(post_layer_mix);
+  CHECK_INPUT(comb_res_mix);
+  CHECK_INPUT(fn);
+  CHECK_INPUT(hc_scale);
+  CHECK_INPUT(hc_base);
+
+  TORCH_CHECK(x.dim() == 2, "x must be 2D [T, D]");
+  TORCH_CHECK(residual.dim() == 3, "residual must be 3D [T, HC, D]");
+
+  const int64_t num_tokens = x.size(0);
+  const int64_t hidden_size = x.size(1);
+  const int64_t hc_mult = residual.size(1);
+  TORCH_CHECK(hc_mult == 4, "mhc_fused_post_pre currently supports only HC=4");
 
   at::Tensor post_2d = post_layer_mix;
   if (post_2d.dim() == 3) {
@@ -418,26 +396,83 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> SGL_KERNEL_EXPORT mhc_fused_post_
     post_2d = post_2d.squeeze(-1);
   }
   TORCH_CHECK(post_2d.dim() == 2, "post_layer_mix must be [T, HC] or [T, HC, 1]");
-  TORCH_CHECK(post_2d.size(0) == t && post_2d.size(1) == hc_mult, "post_layer_mix shape mismatch");
+  TORCH_CHECK(post_2d.size(0) == num_tokens && post_2d.size(1) == hc_mult, "post_layer_mix shape mismatch");
 
   at::Tensor comb_3d = comb_res_mix;
   if (comb_3d.dim() == 2) {
     TORCH_CHECK(comb_3d.size(1) == hc_mult * hc_mult, "comb_res_mix rank-2 shape mismatch");
-    comb_3d = comb_3d.view({t, hc_mult, hc_mult});
+    comb_3d = comb_3d.view({num_tokens, hc_mult, hc_mult});
   }
   TORCH_CHECK(comb_3d.dim() == 3, "comb_res_mix must be [T, HC, HC] or [T, HC*HC]");
   TORCH_CHECK(
-      comb_3d.size(0) == t && comb_3d.size(1) == hc_mult && comb_3d.size(2) == hc_mult, "comb_res_mix shape mismatch");
+      comb_3d.size(0) == num_tokens && comb_3d.size(1) == hc_mult && comb_3d.size(2) == hc_mult,
+      "comb_res_mix shape mismatch");
 
-  const int64_t n_splits_pre = choose_n_splits(t, hc_hidden, n_splits);
-  at::Tensor residual_cur = at::empty_like(residual);
-  at::Tensor gemm_out_mul = at::empty({n_splits_pre, t, hc_mult3}, residual.options().dtype(at::kFloat));
-  at::Tensor gemm_out_sqrsum = at::empty({n_splits_pre, t}, residual.options().dtype(at::kFloat));
+  if (num_tokens > kSmallBatchThreshold) {
+    at::Tensor residual_cur = at::empty_like(residual);
+    hc_post(x, residual, post_2d, comb_3d, residual_cur);
 
-  if (t > 0) {
-    mhc_fused_post_pre_fma_kernel(
-        x, residual, post_2d, comb_3d, fn, residual_cur, gemm_out_mul, gemm_out_sqrsum, n_splits_pre);
+    const int64_t n_splits_pre = (n_splits > 0) ? n_splits : choose_large_batch_n_splits(num_tokens, hidden_size);
+    const int64_t hc_hidden = hc_mult * hidden_size;
+    const int64_t hc_mult3 = (2 + hc_mult) * hc_mult;
+
+    at::Tensor A = residual_cur.reshape({num_tokens, hc_hidden});
+    at::Tensor gemm_out_mul = at::empty({n_splits_pre, num_tokens, hc_mult3}, residual.options().dtype(at::kFloat));
+    at::Tensor gemm_out_sqrsum = at::empty({n_splits_pre, num_tokens}, residual.options().dtype(at::kFloat));
+    hc_pre_gemm_sqr_sum(gemm_out_mul, gemm_out_sqrsum, A, fn);
+
+    at::Tensor post_mix_cur = at::empty({num_tokens, hc_mult}, residual.options().dtype(at::kFloat));
+    at::Tensor comb_mix_cur = at::empty({num_tokens, hc_mult, hc_mult}, residual.options().dtype(at::kFloat));
+    at::Tensor layer_input_cur = at::empty({num_tokens, hidden_size}, x.options().dtype(at::kBFloat16));
+
+    hc_pre_big_fuse(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual_cur,
+        post_mix_cur,
+        comb_mix_cur,
+        layer_input_cur,
+        hc_mult,
+        sinkhorn_repeat,
+        n_splits_pre,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        norm_weight,
+        norm_eps);
+
+    return {residual_cur, post_mix_cur.unsqueeze(-1), comb_mix_cur, layer_input_cur};
   }
 
-  return {residual_cur, gemm_out_mul, gemm_out_sqrsum};
+  const int64_t split_k = choose_n_splits(num_tokens, hc_mult * hidden_size, hidden_size, n_splits);
+  auto [residual_cur, gemm_out_mul, gemm_out_sqrsum] =
+      launch_mhc_fused_post_pre_fma_kernel(x, residual, post_2d, comb_3d, fn, split_k);
+
+  at::Tensor post_mix_cur = at::empty({num_tokens, hc_mult}, residual.options().dtype(at::kFloat));
+  at::Tensor comb_mix_cur = at::empty({num_tokens, hc_mult, hc_mult}, residual.options().dtype(at::kFloat));
+  at::Tensor layer_input_cur = at::empty({num_tokens, hidden_size}, x.options().dtype(at::kBFloat16));
+
+  hc_pre_big_fuse(
+      gemm_out_mul,
+      gemm_out_sqrsum,
+      hc_scale,
+      hc_base,
+      residual_cur,
+      post_mix_cur,
+      comb_mix_cur,
+      layer_input_cur,
+      hc_mult,
+      sinkhorn_repeat,
+      split_k,
+      rms_eps,
+      hc_pre_eps,
+      hc_sinkhorn_eps,
+      hc_post_mult_value,
+      norm_weight,
+      norm_eps);
+
+  return {residual_cur, post_mix_cur.unsqueeze(-1), comb_mix_cur, layer_input_cur};
 }

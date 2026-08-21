@@ -352,7 +352,7 @@ struct HCPreBigFuseWithNormKernel : public HCPreBigFuseKernelBase<scalar_t, VEC_
       }
 
       local_sqr_sum = sycl::reduce_over_group(sg, local_sqr_sum, sycl::plus<float>());
-      if (lane_id == 0) {
+      if (sg_id > 0 && lane_id == 0) {
         this->slm_[sg_id - 1] = local_sqr_sum;
       }
     }

@@ -2334,6 +2334,40 @@ if EXTENDED_KVCACHE_TESTS:
             dtype=dtype,
         )
 
+    @pytest.mark.skipif(
+        not is_fa3_supported(),
+        reason="flash_attn at sgl-kernel is only supported on BMG and later",
+    )
+    def test_flash_attn_varlen_hd512_32k_score_workspace():
+        """Regression for the HD512 ScoreBlock2D workspace OOM reported in PR 342."""
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+        seqlen = 32768
+        nheads_q = 16
+        nheads_kv = 2
+        head_dim = 512
+        torch.manual_seed(0)
+
+        q = torch.randn(seqlen, nheads_q, head_dim, device=device, dtype=torch.bfloat16)
+        k = torch.randn(seqlen, nheads_kv, head_dim, device=device, dtype=torch.bfloat16)
+        v = torch.randn(seqlen, nheads_kv, head_dim, device=device, dtype=torch.bfloat16)
+        cu_seqlens = torch.tensor([0, seqlen], device=device, dtype=torch.int32)
+
+        out = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens,
+            seqlen,
+            seqlen,
+            causal=True,
+        )
+        torch.xpu.synchronize()
+        assert out.shape == (seqlen, nheads_q, head_dim)
+        assert out.dtype == torch.bfloat16
+        assert torch.isfinite(out).all()
+
 
 @pytest.mark.skipif(device.type != "xpu", reason="XPU not available")
 def test_flash_attn_with_kvcache_out_buffer():

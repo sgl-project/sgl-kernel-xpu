@@ -37,11 +37,11 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeFp8Runner<@QG_SZ@, @H
     using QElement = @ELEM_TYPE@;
     if (params.is_e4m3) {
       SplitDecodeConfig<
-          false, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, 1,
+          false, LocalMask, false, /*LSE=*/false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, 1,
           QElement, cutlass::float_e4m3_t, cutlass::float_e4m3_t, QElement>::run(params);
     } else {
       SplitDecodeConfig<
-          false, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, 1,
+          false, LocalMask, false, /*LSE=*/false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, 1,
           QElement, cutlass::float_e5m2_t, cutlass::float_e5m2_t, QElement>::run(params);
     }
   });

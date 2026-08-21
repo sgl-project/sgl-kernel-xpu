@@ -35,11 +35,11 @@ __attribute__((visibility("default"))) void FmhaDecodeFp8Runner<@QG_SZ@, @HEAD_D
     using QElement = @ELEM_TYPE@;
     if (params.is_e4m3) {
       DecodeConfig<
-          false, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, 1, false,
+          false, LocalMask, false, /*LSE=*/false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, 1, false,
           QElement, cutlass::float_e4m3_t, cutlass::float_e4m3_t, QElement>::run_paged(params);
     } else {
       DecodeConfig<
-          false, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, 1, false,
+          false, LocalMask, false, /*LSE=*/false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, 1, false,
           QElement, cutlass::float_e5m2_t, cutlass::float_e5m2_t, QElement>::run_paged(params);
     }
   });

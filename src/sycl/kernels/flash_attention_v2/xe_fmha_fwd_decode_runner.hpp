@@ -131,8 +131,8 @@ struct Arguments {
   bool use_sink = false;
   bool is_causal = false;
   bool is_local = false;
-  // When false, the epilogue skips writing softmax_lse (paged bf16 only; other
-  // paths always write). Threaded as a template constexpr via DecodeConfig.
+  // When false, the epilogue skips writing softmax_lse. Threaded as a template
+  // constexpr via DecodeConfig.
   bool return_softmax_lse = false;
 
   // The O matrix (output).
@@ -548,6 +548,7 @@ struct SplitDecodeKernelRunner {
             static_cast<const bool*>(params.skip_batch_mask_ptr),
             params.k_scale_ptr,
             params.v_scale_ptr,
+            /*min_blocks_for_split=*/2,
             static_cast<float*>(params.softmax_lse_ptr),
             static_cast<int64_t>(params.total_q),
         },
@@ -644,6 +645,7 @@ template <
     typename ElementK = bfloat16_t,
     typename ElementV = bfloat16_t,
     typename ElementO = bfloat16_t,
+    bool PackGQAEnabled = true,
     typename MMAOperation_ = void, /* void -> default */
     typename StrideQ = Stride<int, _1, int, int>,
     typename StrideK = Stride<int, _1, int, int>,
@@ -709,7 +711,7 @@ struct DecodeConfig {
 #ifdef SGL_DISABLE_PACKGQA
     constexpr bool PackGQA = false;
 #else
-    constexpr bool PackGQA = true;
+    constexpr bool PackGQA = PackGQAEnabled;
 #endif
 
     // Mainloop
@@ -782,6 +784,7 @@ template <
     bool Causal,
     bool LocalMask,
     bool Sink,
+    bool LSE,
     typename TileShapeQK,
     typename TileShapePV,
     typename TileShapeOutput,
@@ -857,7 +860,7 @@ struct SplitDecodeConfig {
 
     // Epilogue
     using CollectiveEpilogue = cutlass::fmha::collective::
-        DecodeFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, TensorLSE, void, Sink>;
+        DecodeFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, TensorLSE, void, Sink, LSE>;
 
     using FMHAKernel = cutlass::fmha::kernel::
         XeFMHAFwdSplitKVKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>;

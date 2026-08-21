@@ -177,8 +177,8 @@ struct Arguments {
   bool is_e5m2 = false;
   bool is_causal;
   bool is_local;
-  // When false, the epilogue skips writing softmax_lse (paged bf16 only; other
-  // paths always write). Threaded as a template constexpr via FMHAConfig.
+  // When false, the epilogue skips writing softmax_lse. Threaded as a template
+  // constexpr via FMHAConfig.
   bool return_softmax_lse = false;
 
   bool is_rotary_interleaved;

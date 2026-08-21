@@ -219,6 +219,7 @@ class ReduceSplitK {
       const int k_block0 = LocalMask ? cute::max(seq_len_kv - 1 - p.window_size_left, 0) / get<1>(TileShapeQK{}) : 0;
       const int windowed_k_blocks = k_blocks - k_block0;
       int num_blocks_per_split = cute::ceil_div(windowed_k_blocks, num_kv_splits);
+      bool is_single_split = (num_kv_splits > 1) && (windowed_k_blocks < 2);
 
       int offset_o = 0, offset_o_accum = 0;
       int offset_exp_sums = 0, offset_max_logits = 0;
@@ -339,22 +340,14 @@ class ReduceSplitK {
           total_sum += shared_storage.sum_slm_array[sg * intel::sg_size + tid_in_sg];
         }
         O(seq_idx, idx, head_q, l_coord) = static_cast<ElementO>(total_acc / total_sum);
-      }
 
-      // Emit the natural-log LSE for genuinely multi-split sequences. Short
-      // (single-split) sequences store sentinel exp_sums/max_logits (making this
-      // reduction a pass-through), so their LSE is written directly by the split
-      // epilogue instead; skip them here to avoid clobbering with a wrong value.
-      // thr_id == 0 retains a valid global_exp_sums from its idx==0 iteration
-      // (the combined sum is identical across idx).
-      if constexpr (LSE) {
-        constexpr int kMinBlocksForSplit = 128;
-        bool is_single_split = (num_kv_splits > 1) && (windowed_k_blocks < kMinBlocksForSplit);
-        if (!is_single_split && thr_id == 0) {
-          constexpr float kRcpLog2e = 0.6931471805599453f;  // ln(2)
-          float d = float(global_exp_sums);
-          float lse = (d > 0.f) ? (float(global_max_logits) * kRcpLog2e + sycl::log(d)) : -INFINITY;
-          p.softmax_lse[int64_t(head_q) * p.lse_head_stride + (lse_q_base + seq_idx)] = lse;
+        if constexpr (LSE) {
+          if (!is_single_split && idx == 0) {
+            constexpr float kRcpLog2e = 0.6931471805599453f;  // ln(2)
+            float d = float(total_sum);
+            float lse = (d > 0.f) ? (float(global_max_logits) * kRcpLog2e + sycl::log(d)) : -INFINITY;
+            p.softmax_lse[int64_t(head_q) * p.lse_head_stride + (lse_q_base + seq_idx)] = lse;
+          }
         }
       }
     }

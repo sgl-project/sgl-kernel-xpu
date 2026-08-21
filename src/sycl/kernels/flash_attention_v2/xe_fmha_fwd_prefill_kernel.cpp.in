@@ -61,7 +61,7 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
     TORCH_CHECK(
         !params.is_causal && !params.is_local && !use_sink,
         "return_softmax_lse is only supported without causal/local/sink masking");
-    using Element = bfloat16_t;
+    using Element = @ELEM_TYPE@;
     FMHAConfig<
         false,
         false,

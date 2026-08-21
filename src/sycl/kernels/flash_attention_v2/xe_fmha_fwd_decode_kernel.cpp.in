@@ -61,7 +61,7 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
     TORCH_CHECK(
         !params.is_local && !params.use_sink,
         "return_softmax_lse is only supported without local/sink masking");
-    using Element = bfloat16_t;
+    using Element = @ELEM_TYPE@;
     DecodeConfig<
         false,
         false,
@@ -77,7 +77,8 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
         Element,
         Element,
         Element,
-        Element>::run_paged(params);
+        Element,
+        /*PackGQAEnabled=*/false>::run_paged(params);
     return;
   }
 

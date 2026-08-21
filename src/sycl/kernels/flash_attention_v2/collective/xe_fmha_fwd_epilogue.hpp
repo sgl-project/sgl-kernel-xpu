@@ -257,7 +257,7 @@ class FMHAFwdEpilogue {
         }
         // Emit the natural-log LSE once per query head (at the v==0 column).
         if constexpr (LSE) {
-          if (int(get<1>(tOgO(j))) == 0 && head_off < head_group_q) {
+          if (int(get<1>(blk_qv)) == 0 && int(get<1>(tOgO(j))) == 0 && head_off < head_group_q) {
             float d = float(denom);
             float lse = (d > 0.f) ? (float(tO_max(j)) * kRcpLog2e + sycl::log(d)) : -INFINITY;
             lse_ptr[(lse_head_base + head_off) * lse_head_stride + lse_q_base] = lse;
@@ -300,7 +300,7 @@ class FMHAFwdEpilogue {
         reorder(max_e, tO_max);
         CUTLASS_PRAGMA_UNROLL
         for (int j = 0; j < int(tO_denom.size()); j++) {
-          if (int(get<1>(tOgO(j))) != 0) continue;
+          if (int(get<1>(blk_qv)) != 0 || int(get<1>(tOgO(j))) != 0) continue;
           int row = int(get<0>(tOgO(j)));
           int h, qtok;
           if constexpr (PackGQA_) {
@@ -675,7 +675,7 @@ class DecodeFwdEpilogue {
     // for them), so emit their LSE directly. Multi-split LSE is written by
     // ReduceSplitK after the cross-split reduction.
     if constexpr (LSE) {
-      if (thr_id < head_group_q && (is_single_split || num_kv_splits <= 1)) {
+      if (int(get<1>(blk_qv)) == 0 && thr_id < head_group_q && (is_single_split || num_kv_splits <= 1)) {
         constexpr float kRcpLog2e = 0.6931471805599453f;  // ln(2)
         float d = float(rA_sum(0));
         float lse = (d > 0.f) ? (float(rA_max(0)) * kRcpLog2e + sycl::log(d)) : -INFINITY;

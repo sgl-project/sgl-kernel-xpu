@@ -222,7 +222,9 @@ class XeFMHAFwdKernel {
         args.kernel.sm_sink,
         args.kernel.skip_batch_mask,
         args.kernel.scale_k_ptr,
-        args.kernel.scale_v_ptr};
+        args.kernel.scale_v_ptr,
+        args.kernel.softmax_lse,
+        args.kernel.lse_head_stride};
     auto scheduler_params =
         TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{}, sched_num_kv_splits);
     if constexpr (CollectiveMainloop::ScoreBlock2D && StaticScoreMode_ >= 0) {

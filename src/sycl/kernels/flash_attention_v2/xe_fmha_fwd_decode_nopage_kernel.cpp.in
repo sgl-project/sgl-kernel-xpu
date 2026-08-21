@@ -70,7 +70,7 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
     TORCH_CHECK(
         !params.is_local && !params.use_sink,
         "return_softmax_lse is only supported without local/sink masking");
-    using Element = bfloat16_t;
+    using Element = @ELEM_TYPE@;
     DecodeConfig<
         false,
         false,

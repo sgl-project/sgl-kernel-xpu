@@ -398,18 +398,18 @@ class XeFMHAFwdKernel {
       if constexpr (is_var_len) {
         auto qo_cumulative = s.seq_len_qo.cumulative_length;
         auto kv_cumulative = s.seq_len_kv.cumulative_length;
-        offset_q = s.num_heads_q * s.head_size_qk * qo_cumulative[idx_b];
+        offset_q = get<0>(p.dQ) * qo_cumulative[idx_b];
         // offset_k = s.num_heads_kv * s.head_size_qk * kv_cumulative[idx_b];
         // offset_v = s.num_heads_kv * s.head_size_vo * kv_cumulative[idx_b];
-        offset_o = s.num_heads_q * s.head_size_vo * qo_cumulative[idx_b];
+        offset_o = get<0>(p.dO) * qo_cumulative[idx_b];
         if (s.seq_len_kv_cache.cumulative_length) {
           auto kv_cumulative_cache = s.seq_len_kv_cache.cumulative_length;
           // Non-paged KV stores all batches in one contiguous ragged buffer, so each
           // batch starts at its cumulative KV offset. Paged KV uses the page table for
           // absolute addressing, so no base offset is applied here.
           if constexpr (!CollectiveMainloop::PagedKV) {
-            offset_k_cache = s.num_heads_kv * s.head_size_qk * kv_cumulative_cache[idx_b];
-            offset_v_cache = s.num_heads_kv * s.head_size_vo * kv_cumulative_cache[idx_b];
+            offset_k_cache = get<0>(p.dK_cache) * kv_cumulative_cache[idx_b];
+            offset_v_cache = get<1>(p.dV_cache) * kv_cumulative_cache[idx_b];
           }
         }
       }
@@ -433,12 +433,32 @@ class XeFMHAFwdKernel {
       auto dcV_cache = const_cast<ElementV*>(p.V_cache + offset_v_cache);
       auto dcO = const_cast<ElementO*>(p.O + offset_o);
       // NHD layout for GQA
-      auto layout_q = is_var_len ? make_ordered_layout(shape_Q, VarLenQLayoutStep_{}) : make_layout(shape_Q, p.dQ);
-      auto layout_k = is_var_len ? make_ordered_layout(shape_K, VarLenKLayoutStep_{}) : make_layout(shape_K, p.dK);
-      auto layout_v = is_var_len ? make_ordered_layout(shape_V, VarLenVLayoutStep_{}) : make_layout(shape_V, p.dV);
+      auto layout_q = [&] {
+        if constexpr (is_var_len && !CollectiveMainloop::ScoreBlock2D) {
+          return make_ordered_layout(shape_Q, VarLenQLayoutStep_{});
+        }
+        return make_layout(shape_Q, p.dQ);
+      }();
+      auto layout_k = [&] {
+        if constexpr (is_var_len && !CollectiveMainloop::ScoreBlock2D) {
+          return make_ordered_layout(shape_K, VarLenKLayoutStep_{});
+        }
+        return make_layout(shape_K, p.dK);
+      }();
+      auto layout_v = [&] {
+        if constexpr (is_var_len && !CollectiveMainloop::ScoreBlock2D) {
+          return make_ordered_layout(shape_V, VarLenVLayoutStep_{});
+        }
+        return make_layout(shape_V, p.dV);
+      }();
 
       // NHD layout for GQA
-      auto layout_o = is_var_len ? make_ordered_layout(shape_O, VarLenOLayoutStep_{}) : make_layout(shape_O, p.dO);
+      auto layout_o = [&] {
+        if constexpr (is_var_len && !CollectiveMainloop::ScoreBlock2D) {
+          return make_ordered_layout(shape_O, VarLenOLayoutStep_{});
+        }
+        return make_layout(shape_O, p.dO);
+      }();
 
       Tensor Q = make_tensor(make_gmem_ptr(dcQ), layout_q);
       Tensor K_cache = make_tensor(make_gmem_ptr(dcK_cache), layout_k);

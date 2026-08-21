@@ -47,14 +47,15 @@
 #include "sycl/kernels/flash_attention_v2/collective/fmha_fusion.hpp"
 #include "sycl/kernels/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp"
 #include "sycl/kernels/flash_attention_v2/kernel/xe_tile_scheduler.hpp"
+#include "sycl/kernels/flash_attention_v2/relative_attention.hpp"
 
 using namespace cute;
 namespace prefill {
-inline constexpr int kRelBiasQTile = 256;
-inline constexpr int kRelBiasKTile = 32;
+inline constexpr int kRelBiasQTile = flash_attention_v2::relative_attention::kQTile;
+inline constexpr int kRelBiasKTile = flash_attention_v2::relative_attention::kKTile;
 
 inline constexpr int rel_bias_padded_cols(int rel_extent) {
-  return cutlass::fmha::collective::rel_bias_padded_cols(rel_extent, kRelBiasQTile, kRelBiasKTile);
+  return flash_attention_v2::relative_attention::padded_cols(rel_extent);
 }
 
 struct Arguments {
@@ -365,7 +366,7 @@ struct PrefillRunner {
             params.max_num_pages_per_seq,
             params.window_size_left,
             params.window_size_right,
-            static_cast<const cutlass::bfloat16_t*>(params.rel_bias_ptr),
+            static_cast<const ElementQ*>(params.rel_bias_ptr),
             params.rel_bias_token_stride,
             params.rel_bias_head_stride,
             params.rel_bias_extent,
@@ -525,7 +526,7 @@ struct FMHAConfig {
         GmemTiledCopyK_cache,
         GmemTiledCopyV_cache,
         LocalMask,
-        false,
+        false,  // PackGQA is decode-only; relative attention always uses prefill.
         HasRelBias>;
 
     // Epilogue

@@ -37,6 +37,7 @@
 
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_prefill_dispatch.hpp"
+#include "kernels/flash_attention_v2/relative_attention.hpp"
 #include "sgl_kernel_export.h"
 
 namespace {
@@ -305,8 +306,7 @@ std::vector<at::Tensor> mha_fwd(
     // bool mask (length = batch) whose true entries are skipped by the kernel.
     std::optional<at::Tensor> out_opt = std::nullopt,
     std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt,
-    std::optional<const at::Tensor> rel_bias_ = std::nullopt,
-    int rel_bias_extent = 0) {
+    std::optional<const at::Tensor> rel_bias_ = std::nullopt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
       q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
@@ -913,8 +913,7 @@ std::vector<at::Tensor> mha_fwd(
     // bool mask (length = batch) whose true entries are skipped by the kernel.
     std::optional<at::Tensor> out_opt = std::nullopt,
     std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt,
-    std::optional<const at::Tensor> rel_bias_ = std::nullopt,
-    int rel_bias_extent = 0) {
+    std::optional<const at::Tensor> rel_bias_ = std::nullopt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
       q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
@@ -1000,19 +999,14 @@ std::vector<at::Tensor> mha_fwd(
     const at::Tensor& rel_bias = rel_bias_.value();
     TORCH_CHECK(head_size == 128 && head_size_v == 128, "relative attention requires head_dim=head_dim_v=128");
     TORCH_CHECK(!is_fp8_kv, "relative attention does not support fp8 KV cache");
-    TORCH_CHECK(rel_bias.scalar_type() == at::ScalarType::BFloat16, "relative bias must be bfloat16");
+    TORCH_CHECK(rel_bias.scalar_type() == q.scalar_type(), "relative bias must have the same dtype as query");
     TORCH_CHECK(rel_bias.device() == q.device(), "relative bias must be on the same device as query");
-    TORCH_CHECK(rel_bias.dim() == 3, "relative bias must have shape [total_q, num_heads, sheared_cols]");
+    TORCH_CHECK(rel_bias.dim() == 3, "relative bias must have shape [total_q, num_heads, extent]");
     TORCH_CHECK(
         rel_bias.size(0) == total_q && rel_bias.size(1) == num_heads,
-        "relative bias must have shape [total_q, num_heads, sheared_cols]");
+        "relative bias must have shape [total_q, num_heads, extent]");
     TORCH_CHECK(rel_bias.stride(-1) == 1, "relative bias must have a contiguous K dimension");
-    TORCH_CHECK(rel_bias_extent > 0, "relative bias extent must be positive");
-    TORCH_CHECK(
-        rel_bias.size(-1) == prefill::rel_bias_padded_cols(rel_bias_extent),
-        "relative bias must be sheared with ",
-        prefill::rel_bias_padded_cols(rel_bias_extent),
-        " columns for this extent");
+    TORCH_CHECK(rel_bias.size(-1) > 0, "relative bias extent must be positive");
   }
 
   // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
@@ -1076,12 +1070,20 @@ std::vector<at::Tensor> mha_fwd(
   params.o_ptr = out.data_ptr();
   params.o_row_stride = out.stride(-3);
   params.o_head_stride = out.stride(-2);
+  at::Tensor sheared_rel_bias;
   if (rel_bias_.has_value()) {
     const at::Tensor& rel_bias = rel_bias_.value();
-    params.rel_bias_ptr = rel_bias.data_ptr();
-    params.rel_bias_token_stride = rel_bias.stride(0);
-    params.rel_bias_head_stride = rel_bias.stride(1);
-    params.rel_bias_extent = rel_bias_extent;
+    if (q.scalar_type() == at::ScalarType::BFloat16) {
+      sheared_rel_bias = flash_attention_v2::relative_attention::prepare_bias<at::BFloat16>(
+          rel_bias, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k);
+    } else {
+      sheared_rel_bias = flash_attention_v2::relative_attention::prepare_bias<at::Half>(
+          rel_bias, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k);
+    }
+    params.rel_bias_ptr = sheared_rel_bias.data_ptr();
+    params.rel_bias_token_stride = sheared_rel_bias.stride(0);
+    params.rel_bias_head_stride = sheared_rel_bias.stride(1);
+    params.rel_bias_extent = rel_bias.size(-1);
   }
 
   // Per-batch skip mask for the chunkprefill two-launch dispatcher.
@@ -1286,8 +1288,7 @@ std::vector<at::Tensor> mha_fwd(
     std::optional<bool> pack_gqa_,
     int const sm_margin,
     std::optional<at::Tensor> out_ = std::nullopt,
-    std::optional<const at::Tensor> rel_bias_ = std::nullopt,
-    int rel_bias_extent = 0) {
+    std::optional<const at::Tensor> rel_bias_ = std::nullopt) {
   // Supports both paged (page_table != None) and non-paged (contiguous ragged
   // KV, page_table == None) layouts.
   // ``seqlens_rotary_`` is intentionally not checked here: callers pass it
@@ -1345,8 +1346,7 @@ std::vector<at::Tensor> mha_fwd(
         sm_margin,
         std::move(out_opt),
         std::move(skip_mask),
-        std::nullopt,
-        0);
+        std::nullopt);
   };
 
   // Launch 1: decode allocates the shared output (or reuses the caller-provided
@@ -1393,8 +1393,7 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha
     std::optional<bool> pack_gqa_,
     int const sm_margin,
     std::optional<at::Tensor>& out_,
-    std::optional<const at::Tensor>& rel_bias_,
-    int rel_bias_extent) {
+    std::optional<const at::Tensor>& rel_bias_) {
   TORCH_CHECK(q.dim() == 3, "query must be in ragged format (total_q, h, d)");
   // k and v may be 3D (total_k, h_k, d) for non-paged or 4D (num_pages, page_size, h_k, d)
   // for paged KV cache; sub-functions validate their own shapes.
@@ -1448,8 +1447,7 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha
         sm_margin,
         out_,
         std::nullopt,
-        rel_bias_,
-        rel_bias_extent));
+        rel_bias_));
   }
 
   // decode / prefill / chunkprefill all take the same leading argument list;
@@ -1489,8 +1487,7 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha
            sm_margin,
            out_,
            std::forward<decltype(tail)>(tail)...,
-           std::nullopt,
-           0));
+           std::nullopt));
   };
 
   if (max_seqlen_q == 1) {

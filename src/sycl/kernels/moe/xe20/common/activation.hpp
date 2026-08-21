@@ -20,6 +20,7 @@ namespace moe_xe20 {
 inline constexpr int ACT_SILU = 0;
 inline constexpr int ACT_GELU = 1;
 inline constexpr int ACT_SWIGLU_GPT_OSS = 2;
+inline constexpr int ACT_SWIGLU_DEEPSEEK_V4 = 4;
 
 // One-element fused gate-and-mul. `x` is the gate accumulator output, `y`
 // is the up accumulator output, both in fp32. Returns the fp32 fused
@@ -38,6 +39,11 @@ CUTLASS_DEVICE float apply_fused_activation(float x, float y, float alpha, float
     float t = gate * alpha;
     float s = 1.0f / (1.0f + sycl::native::exp(-t));
     return gate * s * (up + 1.0f);
+  } else if constexpr (ActType == ACT_SWIGLU_DEEPSEEK_V4) {
+    float gate = sycl::fmin(x, limit);
+    float up = sycl::fmax(-limit, sycl::fmin(y, limit));
+    float s = 1.0f / (1.0f + sycl::native::exp(-gate));
+    return gate * s * up;
   } else {                                        // GELU (tanh approx)
     constexpr float kBeta = 0.7978845608028654f;  // sqrt(2.0f / pi)
     constexpr float kAlpha = 0.044715f;

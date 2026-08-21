@@ -397,6 +397,19 @@ static int64_t div_up(int64_t x, int64_t y) {
 static void check_layer_ptr_table(const at::Tensor& tbl, int64_t num_layers, const char* name) {
   TORCH_CHECK(tbl.scalar_type() == at::kUInt64, name, " must be a uint64 pointer table");
   TORCH_CHECK(tbl.numel() == num_layers, name, " must have num_layers entries");
+  TORCH_CHECK(tbl.is_xpu(), name, " must be an XPU tensor");
+  TORCH_CHECK(tbl.is_contiguous(), name, " must be contiguous");
+}
+
+static void check_indices(const at::Tensor& src_indices, const at::Tensor& dst_indices) {
+  TORCH_CHECK(src_indices.scalar_type() == at::kLong, "src_indices must be int64");
+  TORCH_CHECK(dst_indices.scalar_type() == at::kLong, "dst_indices must be int64");
+  TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "index count mismatch");
+  TORCH_CHECK(src_indices.is_xpu(), "src_indices must be an XPU tensor");
+  TORCH_CHECK(dst_indices.is_xpu(), "dst_indices must be an XPU tensor");
+  TORCH_CHECK(src_indices.is_contiguous(), "src_indices must be contiguous");
+  TORCH_CHECK(dst_indices.is_contiguous(), "dst_indices must be contiguous");
+  TORCH_CHECK(src_indices.device() == dst_indices.device(), "indices must be on the same XPU device");
 }
 
 // Launch the standard (non-page-head) transfer kernel.
@@ -420,9 +433,7 @@ static void launch_transfer_kv(
     int64_t sgs_per_wg) {
   TORCH_CHECK(item_size % 8 == 0, "item_size must be divisible by 8");
   TORCH_CHECK(sgs_per_wg > 0, "sgs_per_wg must be positive");
-  TORCH_CHECK(src_indices.scalar_type() == at::kLong, "src_indices must be int64");
-  TORCH_CHECK(dst_indices.scalar_type() == at::kLong, "dst_indices must be int64");
-  TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "index count mismatch");
+  check_indices(src_indices, dst_indices);
 
   const int64_t num_items = src_indices.numel();
   if (num_items == 0) return;  // nothing to transfer; avoids div-by-zero below
@@ -490,9 +501,7 @@ static void launch_transfer_kv_page_first(
     int64_t sgs_per_wg) {
   TORCH_CHECK(item_size % 8 == 0, "item_size must be divisible by 8");
   TORCH_CHECK(sgs_per_wg > 0, "sgs_per_wg must be positive");
-  TORCH_CHECK(src_indices.scalar_type() == at::kLong, "src_indices must be int64");
-  TORCH_CHECK(dst_indices.scalar_type() == at::kLong, "dst_indices must be int64");
-  TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "index count mismatch");
+  check_indices(src_indices, dst_indices);
 
   const int64_t num_items = src_indices.numel();
   if (num_items == 0) return;  // nothing to transfer; avoids div-by-zero below
@@ -556,10 +565,9 @@ static void launch_transfer_kv_page_head(
   TORCH_CHECK(item_size % 8 == 0, "item_size must be divisible by 8");
   TORCH_CHECK(head_num > 0, "head_num must be positive");
   TORCH_CHECK(item_size % head_num == 0, "item_size must be divisible by head_num");
+  TORCH_CHECK((item_size / head_num) % 8 == 0, "per-head item size must be divisible by 8");
   TORCH_CHECK(sgs_per_wg > 0, "sgs_per_wg must be positive");
-  TORCH_CHECK(src_indices.scalar_type() == at::kLong, "src_indices must be int64");
-  TORCH_CHECK(dst_indices.scalar_type() == at::kLong, "dst_indices must be int64");
-  TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "index count mismatch");
+  check_indices(src_indices, dst_indices);
 
   const int64_t num_items = src_indices.numel();
   if (num_items == 0) return;  // nothing to transfer; avoids div-by-zero below

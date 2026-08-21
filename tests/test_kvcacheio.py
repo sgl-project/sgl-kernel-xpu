@@ -903,5 +903,60 @@ def test_transfer_kv_empty_indices(dtype: torch.dtype):
     torch.set_default_dtype(original_dtype)
 
 
+def test_transfer_kv_rejects_invalid_index_metadata():
+    src = torch.zeros(8, 8, device=device)
+    dst = torch.zeros_like(src)
+    xpu_indices = torch.arange(4, dtype=torch.int64, device=device)
+
+    with pytest.raises(RuntimeError, match="src_indices must be an XPU tensor"):
+        transfer_kv_per_layer_mla(
+            src, dst, xpu_indices.cpu(), xpu_indices, item_size=32
+        )
+
+    noncontiguous = torch.arange(8, dtype=torch.int64, device=device).view(2, 4).t()
+    with pytest.raises(RuntimeError, match="src_indices must be contiguous"):
+        transfer_kv_per_layer_mla(
+            src, dst, noncontiguous, noncontiguous, item_size=32
+        )
+
+
+def test_transfer_kv_rejects_invalid_pointer_table():
+    indices = torch.arange(1, dtype=torch.int64, device=device)
+    pointer_table = torch.tensor([0], dtype=torch.uint64)
+
+    with pytest.raises(RuntimeError, match="src_layers must be an XPU tensor"):
+        transfer_kv_all_layer_mla(
+            pointer_table,
+            pointer_table.to(device),
+            indices,
+            indices,
+            item_size=8,
+            num_layers=1,
+        )
+
+
+def test_transfer_kv_page_head_rejects_unaligned_heads():
+    indices = torch.arange(1, dtype=torch.int64, device=device)
+    src = torch.zeros(1, 24, device=device)
+    ptrs = torch.tensor([src.data_ptr()], dtype=torch.uint64, device=device)
+    dst_k = torch.zeros(1, 2, 1, 1, 12).pin_memory()
+    dst_v = torch.zeros_like(dst_k).pin_memory()
+
+    with pytest.raises(RuntimeError, match="per-head item size must be divisible by 8"):
+        transfer_kv_all_layer_lf_ph(
+            ptrs,
+            dst_k,
+            ptrs,
+            dst_v,
+            indices,
+            indices,
+            item_size=24,
+            dst_layout_dim=24,
+            num_layers=1,
+            page_size=1,
+            head_num=2,
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

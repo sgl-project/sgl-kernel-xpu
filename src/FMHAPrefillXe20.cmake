@@ -34,7 +34,7 @@ set(FMHA_PREFILL_FP8_TEMPLATE
 option(
     FMHA_PREFILL_ENABLE_SCORE_BLOCK2D_512
     "Reuse QK scores across the two output tiles for HEAD_DIM=512 prefill"
-    ON)
+    OFF)
 
 # --- Paged prefill + FP8: paged head dims only. ---
 # prefill_page (16-bit KV) and prefill_page (fp8 KV) are independent shared

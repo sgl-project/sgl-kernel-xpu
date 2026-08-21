@@ -104,3 +104,36 @@ def fast_topk_transform_ragged_fused(
         score, lengths, topk_indices_ragged, topk_indices_offset, row_starts
     )
     return topk_indices_ragged
+
+
+def topk_transform_512(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    torch.ops.sgl_kernel.topk_transform_512.default(
+        scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+    )
+
+
+def topk_transform_512_v2(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    metadata: torch.Tensor,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    torch.ops.sgl_kernel.topk_transform_512_v2.default(
+        scores,
+        seq_lens,
+        page_tables,
+        out_page_indices,
+        page_size,
+        metadata,
+        out_raw_indices,
+    )

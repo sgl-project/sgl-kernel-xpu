@@ -68,6 +68,7 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
               TileShapeOutput,
               SubgroupLayoutQK,
               void,
+              false,
               2,
               false,
               Element,
@@ -81,6 +82,46 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
   TORCH_CHECK(
       !use_sink,
       "sink is only supported for head_size == 64, got @HEAD_DIM@");
+#if @HEAD_DIM@ == 128
+  if (params.rel_bias_ptr != nullptr) {
+    TORCH_CHECK(params.dv == 128, "relative attention requires head_dim_v == 128");
+    TORCH_CHECK(!params.is_e4m3 && !params.is_e5m2, "relative attention does not support fp8 KV cache");
+    TORCH_CHECK(
+        params.rel_bias_head_stride == prefill::rel_bias_padded_cols(params.rel_bias_extent),
+        "relative attention expects a sheared bias with ",
+        prefill::rel_bias_padded_cols(params.rel_bias_extent),
+        " columns");
+    using RelTileShapeQK = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::Int<prefill::kRelBiasKTile>, cute::_32>;
+    using RelTileShapePV = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::_32, cute::Int<32>>;
+    using RelTileShapeOutput = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::Int<128>>;
+    using RelSubgroupLayoutQK =
+        cute::Layout<cute::Shape<cute::Int<16>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+        using Element = @ELEM_TYPE@;
+        FMHAConfig<
+            Causal,
+            LocalMask,
+            false,
+            RelTileShapeQK,
+            RelTileShapePV,
+            RelTileShapeOutput,
+            RelSubgroupLayoutQK,
+            void,
+            true,
+            2,
+            false,
+            Element,
+            Element,
+            Element,
+            Element>::run_paged(params);
+      });
+    });
+    return;
+  }
+#else
+  TORCH_CHECK(params.rel_bias_ptr == nullptr, "relative attention is only compiled for head_dim == 128");
+#endif
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
 
@@ -94,6 +135,7 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
             TileShapeOutput,
             SubgroupLayoutQK,
             void,
+            false,
             2,
             false,
             Element,

@@ -445,6 +445,12 @@ class XeFMHAFwdKernel {
       // With PackGQA the Q/O head dimension is indexed by the KV head; otherwise
       // by the (un-grouped) query head.
       int q_head_idx = PackGQA_ ? head : head_q;
+      int q_token_offset = 0;
+      if constexpr (is_var_len) {
+        q_token_offset = s.seq_len_qo.cumulative_length[idx_b];
+      } else {
+        q_token_offset = idx_b * int(s.seq_len_qo);
+      }
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
       typename CollectiveMainloop::ElementScoreStore* score_head_ptr = nullptr;
       int score_region_cols = 0;
@@ -497,6 +503,8 @@ class XeFMHAFwdKernel {
           seq_len,
           seq_len_kv_cache,
           idx_b,
+          q_head_idx,
+          q_token_offset,
           full_tile_offset,
           discard_seq_coord,
           K_cache(_, _, head, l_coord),
@@ -523,6 +531,8 @@ class XeFMHAFwdKernel {
           seq_len,
           seq_len_kv_cache,
           idx_b,
+          q_head_idx,
+          q_token_offset,
           full_tile_offset,
           discard_seq_coord,
           K_cache(_, _, head, l_coord),

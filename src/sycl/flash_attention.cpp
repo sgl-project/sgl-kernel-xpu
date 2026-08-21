@@ -304,7 +304,9 @@ std::vector<at::Tensor> mha_fwd(
     // chunkprefill two-launch path: pre-allocated shared output, and a per-batch
     // bool mask (length = batch) whose true entries are skipped by the kernel.
     std::optional<at::Tensor> out_opt = std::nullopt,
-    std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt) {
+    std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt,
+    std::optional<const at::Tensor> rel_bias_ = std::nullopt,
+    int rel_bias_extent = 0) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
       q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
@@ -910,7 +912,9 @@ std::vector<at::Tensor> mha_fwd(
     // chunkprefill two-launch path: pre-allocated shared output, and a per-batch
     // bool mask (length = batch) whose true entries are skipped by the kernel.
     std::optional<at::Tensor> out_opt = std::nullopt,
-    std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt) {
+    std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt,
+    std::optional<const at::Tensor> rel_bias_ = std::nullopt,
+    int rel_bias_extent = 0) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
       q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
@@ -938,6 +942,7 @@ std::vector<at::Tensor> mha_fwd(
 
   // Non-paged (page_table == nullopt) prefill: contiguous ragged KV cache.
   if (!page_table.has_value()) {
+    TORCH_CHECK(!rel_bias_.has_value(), "relative attention requires paged KV cache");
     return mha_fwd_nopage(
         q,
         k,
@@ -991,6 +996,24 @@ std::vector<at::Tensor> mha_fwd(
   static constexpr int max_headdim = 512;
   TORCH_CHECK(head_size <= max_headdim, "FlashAttention forward only supports head dimension at most ", max_headdim);
   TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+  if (rel_bias_.has_value()) {
+    const at::Tensor& rel_bias = rel_bias_.value();
+    TORCH_CHECK(head_size == 128 && head_size_v == 128, "relative attention requires head_dim=head_dim_v=128");
+    TORCH_CHECK(!is_fp8_kv, "relative attention does not support fp8 KV cache");
+    TORCH_CHECK(rel_bias.scalar_type() == at::ScalarType::BFloat16, "relative bias must be bfloat16");
+    TORCH_CHECK(rel_bias.device() == q.device(), "relative bias must be on the same device as query");
+    TORCH_CHECK(rel_bias.dim() == 3, "relative bias must have shape [total_q, num_heads, sheared_cols]");
+    TORCH_CHECK(
+        rel_bias.size(0) == total_q && rel_bias.size(1) == num_heads,
+        "relative bias must have shape [total_q, num_heads, sheared_cols]");
+    TORCH_CHECK(rel_bias.stride(-1) == 1, "relative bias must have a contiguous K dimension");
+    TORCH_CHECK(rel_bias_extent > 0, "relative bias extent must be positive");
+    TORCH_CHECK(
+        rel_bias.size(-1) == prefill::rel_bias_padded_cols(rel_bias_extent),
+        "relative bias must be sheared with ",
+        prefill::rel_bias_padded_cols(rel_bias_extent),
+        " columns for this extent");
+  }
 
   // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
   // TODO: check this
@@ -1053,6 +1076,13 @@ std::vector<at::Tensor> mha_fwd(
   params.o_ptr = out.data_ptr();
   params.o_row_stride = out.stride(-3);
   params.o_head_stride = out.stride(-2);
+  if (rel_bias_.has_value()) {
+    const at::Tensor& rel_bias = rel_bias_.value();
+    params.rel_bias_ptr = rel_bias.data_ptr();
+    params.rel_bias_token_stride = rel_bias.stride(0);
+    params.rel_bias_head_stride = rel_bias.stride(1);
+    params.rel_bias_extent = rel_bias_extent;
+  }
 
   // Per-batch skip mask for the chunkprefill two-launch dispatcher.
   params.skip_batch_mask_ptr = skip_batch_mask_opt.has_value() ? skip_batch_mask_opt->data_ptr() : nullptr;
@@ -1255,7 +1285,9 @@ std::vector<at::Tensor> mha_fwd(
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin,
-    std::optional<at::Tensor> out_ = std::nullopt) {
+    std::optional<at::Tensor> out_ = std::nullopt,
+    std::optional<const at::Tensor> rel_bias_ = std::nullopt,
+    int rel_bias_extent = 0) {
   // Supports both paged (page_table != None) and non-paged (contiguous ragged
   // KV, page_table == None) layouts.
   // ``seqlens_rotary_`` is intentionally not checked here: callers pass it
@@ -1312,7 +1344,9 @@ std::vector<at::Tensor> mha_fwd(
         pack_gqa_,
         sm_margin,
         std::move(out_opt),
-        std::move(skip_mask));
+        std::move(skip_mask),
+        std::nullopt,
+        0);
   };
 
   // Launch 1: decode allocates the shared output (or reuses the caller-provided
@@ -1358,7 +1392,9 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin,
-    std::optional<at::Tensor>& out_) {
+    std::optional<at::Tensor>& out_,
+    std::optional<const at::Tensor>& rel_bias_,
+    int rel_bias_extent) {
   TORCH_CHECK(q.dim() == 3, "query must be in ragged format (total_q, h, d)");
   // k and v may be 3D (total_k, h_k, d) for non-paged or 4D (num_pages, page_size, h_k, d)
   // for paged KV cache; sub-functions validate their own shapes.
@@ -1376,6 +1412,45 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha
   int const num_heads = q.size(-2);
   int const num_heads_k = k.size(-2);
   int64_t batch_size = cu_seqlens_q.size(0) - 1;
+
+  if (rel_bias_.has_value()) {
+    // Relative attention is prefill-only. Use one prefill launch for every
+    // batch, including single-token rows, instead of a host-visible reduction
+    // or the decode/prefill split dispatcher.
+    return to_tuple(prefill::mha_fwd(
+        q,
+        k,
+        v,
+        q_v_,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        page_table,
+        kv_batch_idx_,
+        leftpad_k_,
+        rotary_cos_,
+        rotary_sin_,
+        seqlens_rotary_,
+        q_descale_,
+        k_descale_,
+        v_descale_,
+        softmax_scale_,
+        sinks_,
+        is_causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        is_rotary_interleaved,
+        scheduler_metadata_,
+        num_kv_splits,
+        pack_gqa_,
+        sm_margin,
+        out_,
+        std::nullopt,
+        rel_bias_,
+        rel_bias_extent));
+  }
 
   // decode / prefill / chunkprefill all take the same leading argument list;
   // only the trailing parameters differ. Bind the shared arguments once here so
@@ -1413,7 +1488,9 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha
            pack_gqa_,
            sm_margin,
            out_,
-           std::forward<decltype(tail)>(tail)...));
+           std::forward<decltype(tail)>(tail)...,
+           std::nullopt,
+           0));
   };
 
   if (max_seqlen_q == 1) {

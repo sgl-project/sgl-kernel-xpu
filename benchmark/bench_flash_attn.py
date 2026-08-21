@@ -1,3 +1,4 @@
+import math
 from itertools import product
 
 import torch
@@ -21,6 +22,8 @@ def flash_attn_baseline(
     max_seqlen_k,
     k_descale=None,
     v_descale=None,
+    rel_bias=None,
+    rel_bias_extent=0,
 ):
     """Baseline Flash Attention implementation"""
     if page_table is not None:
@@ -38,6 +41,8 @@ def flash_attn_baseline(
             max_seqlen_q=max_seqlen_q,
             k_descale=k_descale,
             v_descale=v_descale,
+            rel_bias=rel_bias,
+            rel_bias_extent=rel_bias_extent,
             return_softmax_lse=True,
         )
         return out, lse
@@ -84,6 +89,34 @@ def get_effective_attention_pairs(
     return effective_pairs
 
 
+def make_relative_bias(batch_size, q_seq_length, kv_seq_length, num_heads, extent):
+    bias_cols = math.ceil(extent / 32) * 32 + 256 + 32
+    bias = torch.zeros(
+        batch_size * q_seq_length,
+        num_heads,
+        bias_cols,
+        device="xpu",
+        dtype=torch.bfloat16,
+    )
+    values = torch.randn(
+        batch_size * q_seq_length,
+        num_heads,
+        extent,
+        device="xpu",
+        dtype=torch.bfloat16,
+    )
+    for q_global in range(batch_size * q_seq_length):
+        q_idx = q_global % q_seq_length
+        row_kv = kv_seq_length - q_seq_length + q_idx
+        row_kv_first = row_kv - q_idx % 256
+        col_origin = ((row_kv_first - math.ceil(extent / 32) * 32 + 1) // 32) * 32
+        columns = torch.arange(bias_cols, device="xpu") + col_origin
+        relative = row_kv - columns
+        valid = (relative >= 0) & (relative < extent)
+        bias[q_global, :, valid] = values[q_global, :, relative[valid]]
+    return bias
+
+
 # Benchmark configurations
 causal = [True, False]
 local = [True, False]
@@ -101,6 +134,7 @@ page_size_range = [0, 128]
 # in-kernel via per-tensor k_descale / v_descale. fp8 only runs on the paged
 # path.
 kv_dtype_range = ["bf16", "fp8_e4m3", "fp8_e5m2"]
+attention_mode_range = ["standard", "relative"]
 configs = list(
     filter(
         lambda cfg: (
@@ -119,6 +153,18 @@ configs = list(
             # Condition 7: fp8 KV cache requires the paged path and is exercised
             # without sinks / local masking (matches the supported fp8 path)
             and (cfg[10] == "bf16" or (cfg[9] != 0 and not cfg[2] and not cfg[1]))
+            # Condition 8: relative attention is paged BF16 prefill at head_dim 128.
+            and (
+                cfg[11] == "standard"
+                or (
+                    cfg[9] != 0
+                    and cfg[10] == "bf16"
+                    and cfg[5] == 128
+                    and cfg[4] > 1
+                    and not cfg[1]
+                    and not cfg[2]
+                )
+            )
         ),
         [
             cfg
@@ -135,6 +181,7 @@ configs = list(
                 kv_seq_length_range,
                 [page_size],
                 kv_dtype_range,
+                attention_mode_range,
             )
         ],
     )
@@ -156,6 +203,7 @@ all_results = []
             "kv_seq_length",
             "page_size",
             "kv_dtype",
+            "attention_mode",
         ],
         x_vals=[list(c) for c in configs],
         line_arg="provider",
@@ -179,6 +227,7 @@ def benchmark(
     kv_seq_length,
     page_size,
     kv_dtype,
+    attention_mode,
     provider,
 ):
     dtype = torch.bfloat16
@@ -262,6 +311,11 @@ def benchmark(
     sinks = torch.randn(num_heads_q, device=device, dtype=dtype) if use_sinks else None
 
     softmax_scale = 1.0 / (head_dim**0.5)
+    rel_bias = (
+        make_relative_bias(batch_size, q_seq_length, kv_seq_length, num_heads_q, 1024)
+        if attention_mode == "relative"
+        else None
+    )
 
     quantiles = [0.5, 0.2, 0.8]
 
@@ -283,6 +337,8 @@ def benchmark(
                 max_seqlen_k=max_seqlen_k,
                 k_descale=k_descale,
                 v_descale=v_descale,
+                rel_bias=rel_bias,
+                rel_bias_extent=1024 if rel_bias is not None else 0,
             ),
             quantiles=quantiles,
         )
@@ -337,6 +393,7 @@ def benchmark(
             "use_sinks": use_sinks,
             "page_size": page_size,
             "kv_dtype": kv_dtype,
+            "attention_mode": attention_mode,
             "provider": provider,
             "tflops": tflops,
             "bandwidth": bandwidth,

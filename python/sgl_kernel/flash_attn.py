@@ -133,6 +133,8 @@ def flash_attn_with_kvcache(
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     out=None,
+    rel_bias=None,
+    rel_bias_extent=0,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -219,6 +221,12 @@ def flash_attn_with_kvcache(
             capture to avoid allocating a new output tensor each step. Requires
             ``page_table`` to be provided (paged KV cache); passing ``out`` without a
             page table raises a ``RuntimeError``.
+        rel_bias [optional]: device-resident BF16 relative logits with shape
+            ``(total_q, nheads, ceil(extent / 32) * 32 + 288)``. The bias must
+            be sheared by the producer for the fixed 256x32 relative-attention
+            tiles; this kernel consumes it directly with no host-side staging.
+            Supported only for paged KV prefill with head dimensions 128.
+        rel_bias_extent: width of the nonzero relative-attention band.
 
     Return:
         out: (total_q, nheads, headdim_v), where total_q = batch_size * seqlen (non-varlen)
@@ -310,6 +318,8 @@ def flash_attn_with_kvcache(
         sm_margin,
         out,
         softmax_lse,
+        rel_bias,
+        rel_bias_extent,
     )
     return (out, softmax_lse) if return_softmax_lse else out
 

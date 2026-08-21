@@ -482,5 +482,57 @@ def test_causal_conv1d_varlen(
     )
 
 
+@pytest.mark.parametrize("itype", [torch.bfloat16])
+@pytest.mark.parametrize("width", [4])
+@pytest.mark.parametrize("dim", [2048])
+def test_causal_conv1d_update_ignores_spec_decode_kwargs(dim, width, itype):
+    """Extra keyword arguments must not break the XPU signature.
+
+    The GDN target-verify path in sglang passes speculative-decoding tree
+    arguments to `causal_conv1d_update`. They are not honored by the XPU
+    kernel yet, but they must be accepted instead of raising a TypeError.
+    See https://github.com/sgl-project/sglang/issues/34720.
+    """
+    rtol, atol = 1e-2, 5e-2
+
+    batch, seqlen = 2, 1
+    x = torch.randn(batch, dim, seqlen, device=device, dtype=itype)
+    x_ref = x.clone()
+    conv_state = torch.randn(batch, dim, width - 1, device=device, dtype=itype)
+    conv_state_ref = conv_state.detach().clone()
+    weight = torch.randn(dim, width, device=device, dtype=itype)
+    bias = torch.randn(dim, device=device, dtype=itype)
+
+    draft_token_num = 4
+    out = causal_conv1d_update_xpu(
+        x,
+        conv_state,
+        weight,
+        bias,
+        "silu",
+        intermediate_conv_window=torch.zeros(
+            batch, draft_token_num, dim, width - 1, device=device, dtype=itype
+        ),
+        intermediate_state_indices=torch.arange(
+            batch, dtype=torch.int32, device=device
+        ),
+        retrieve_next_token=torch.full(
+            (batch, draft_token_num), -1, dtype=torch.int64, device=device
+        ),
+        retrieve_next_sibling=torch.full(
+            (batch, draft_token_num), -1, dtype=torch.int64, device=device
+        ),
+        retrieve_parent_token=torch.zeros(
+            (batch, draft_token_num), dtype=torch.int64, device=device
+        ),
+    )
+    out_ref = causal_conv1d_update_ref(
+        x_ref, conv_state_ref, weight, bias, activation="silu"
+    )
+
+    assert torch.equal(conv_state, conv_state_ref)
+    assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

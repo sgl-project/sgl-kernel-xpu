@@ -39,8 +39,10 @@ def causal_conv1d_update_xpu(
     cache_seqlens: Optional[torch.Tensor] = None,
     conv_state_indices: Optional[torch.Tensor] = None,
     pad_slot_id: int = -1,
+    **kwargs,
 ):
 
+    _ = kwargs
     unsqueeze = x.dim() == 2
     if unsqueeze:
         x = x.unsqueeze(-1)

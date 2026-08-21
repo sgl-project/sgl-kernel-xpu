@@ -22,6 +22,8 @@ from sgl_kernel.attention import (
 from sgl_kernel.cutlass_moe import (
     cutlass_fused_experts_fp8,
     cutlass_fused_experts_mxfp4,
+    cutlass_fused_experts_nvfp4_woq,
+    nvfp4_woq_prepare_weights,
 )
 from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
@@ -67,6 +69,10 @@ from sgl_kernel.mhc import (
     hc_pre_gemm_sqr_sum,
     hc_split_sinkhorn,
     mhc_pre,
+)
+from sgl_kernel.nvfp4 import (
+    nvfp4_woq_mxfp8_scaled_grouped_mm,
+    nvfp4_woq_prep,
 )
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,

@@ -205,6 +205,13 @@ void multimodal_rotary_embedding(
 void sgl_per_token_group_quant_fp4(
     at::Tensor input, at::Tensor output_q, at::Tensor output_s, int64_t group_size, double eps);
 void store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices);
+
+// NVFP4 weight-only-quantization support (see src/sycl/nvfp4_woq.cpp).
+void nvfp4_woq_prep(
+    torch::Tensor& out_c,
+    torch::Tensor& out_sfmx,
+    const torch::Tensor& w_s,
+    const torch::Tensor& w_gs);
 }  // namespace at::native::xpu
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
@@ -735,6 +742,19 @@ void mxfp4_blockwise_scaled_grouped_mm(
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& workspace);
+// Fused NVFP4 weight-only-quantized MXFP8 grouped GEMM (see
+// src/sycl/xe35/blockwise_moe_nvfp4_woq.cpp). B stays NVFP4 in memory and is
+// requantized to MXFP8 inside the mainloop.
+void nvfp4_woq_mxfp8_scaled_grouped_mm(
+    torch::Tensor& output,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& sfmx_b,
+    const torch::Tensor& c_b,
     const torch::Tensor& problem_sizes,
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace);

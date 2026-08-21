@@ -2484,26 +2484,6 @@ def test_relative_attention(
             ).to(device)
         q_start += q_len
 
-    # Match the device-side producer contract: each 256-row Q tile stores its
-    # diagonal band in a compact K-aligned rectangle.
-    bias_cols = math.ceil(extent / 32) * 32 + 256 + 32
-    rel_bias = torch.zeros(
-        sum(seqlens_q), num_heads, bias_cols, dtype=torch.bfloat16, device=device
-    )
-    q_start = 0
-    for q_len, k_len in zip(seqlens_q, seqlens_k):
-        for q_idx in range(q_len):
-            row_kv = k_len - q_len + q_idx
-            row_kv_first = row_kv - q_idx % 256
-            left = row_kv_first - math.ceil(extent / 32) * 32 + 1
-            col_origin = (left // 32) * 32
-            columns = torch.arange(bias_cols, device=device) + col_origin
-            valid = (columns >= 0) & (columns < k_len)
-            rel_bias[q_start + q_idx, :, valid] = dense_rel_bias[
-                q_start + q_idx, :, columns[valid]
-            ]
-        q_start += q_len
-
     reference = torch.empty_like(q, device="cpu")
     q_start = 0
     for q_len, k_len, k_seq, v_seq in zip(seqlens_q, seqlens_k, k, v):
@@ -2533,8 +2513,7 @@ def test_relative_attention(
         max_seqlen_q=max(seqlens_q),
         max_seqlen_k=max(seqlens_k),
         causal=causal,
-        rel_bias=rel_bias,
-        rel_bias_extent=extent,
+        rel_bias=table.to(dtype).to(device).unsqueeze(0).expand(sum(seqlens_q), -1, -1),
     )
     torch.xpu.synchronize()
     torch.testing.assert_close(
@@ -2571,11 +2550,7 @@ def test_relative_attention_zero_bias_matches_prefill():
         q,
         k_cache,
         v_cache,
-        rel_bias=torch.zeros(
-            batch * seqlen_q, num_heads, math.ceil(64 / 32) * 32 + 256 + 32,
-            dtype=torch.bfloat16, device=device
-        ),
-        rel_bias_extent=64,
+        rel_bias=torch.zeros(batch * seqlen_q, num_heads, 64, dtype=q.dtype, device=device),
         **common,
     )
     torch.xpu.synchronize()

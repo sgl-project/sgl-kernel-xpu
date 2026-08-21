@@ -50,6 +50,13 @@
 
 using namespace cute;
 namespace prefill {
+inline constexpr int kRelBiasQTile = 256;
+inline constexpr int kRelBiasKTile = 32;
+
+inline constexpr int rel_bias_padded_cols(int rel_extent) {
+  return cutlass::fmha::collective::rel_bias_padded_cols(rel_extent, kRelBiasQTile, kRelBiasKTile);
+}
+
 struct Arguments {
   // The QKV matrices.
   void* __restrict__ q_ptr;
@@ -75,6 +82,13 @@ struct Arguments {
   // The O matrix (output).
   void* __restrict__ o_ptr;
   void* __restrict__ oaccum_ptr;
+
+  // Sheared relative logits in bf16: [total_q, h, rel_bias_padded_cols(extent)].
+  // This is device-produced and consumed directly without host-side staging.
+  void* __restrict__ rel_bias_ptr = nullptr;
+  int64_t rel_bias_token_stride = 0;
+  int64_t rel_bias_head_stride = 0;
+  int rel_bias_extent = 0;
 
   // The stride between rows of O.
   int64_t o_batch_stride;
@@ -403,6 +417,10 @@ struct PrefillRunner {
             params.max_num_pages_per_seq,
             params.window_size_left,
             params.window_size_right,
+            static_cast<const cutlass::bfloat16_t*>(params.rel_bias_ptr),
+            params.rel_bias_token_stride,
+            params.rel_bias_head_stride,
+            params.rel_bias_extent,
         },
         {},
         hw_info};
@@ -569,6 +587,7 @@ template <
     typename TileShapeOutput,
     typename SubgroupLayoutQK,
     typename SubgroupLayoutPV_ = void, /* void -> default */
+    bool HasRelBias = false,
     int PipelineStages = 2,            // TODO: This is hard-coded as 1 in kernel.
     bool persistent = false,
     typename ElementQ = bfloat16_t,
@@ -648,7 +667,9 @@ struct FMHAConfig {
         GmemTiledCopyV,
         GmemTiledCopyK_cache,
         GmemTiledCopyV_cache,
-        LocalMask>;
+        LocalMask,
+        false,
+        HasRelBias>;
 
     // Epilogue
     using CollectiveEpilogue = cutlass::fmha::collective::

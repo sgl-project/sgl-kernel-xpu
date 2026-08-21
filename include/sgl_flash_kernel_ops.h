@@ -78,7 +78,11 @@ void mha_fwd(
     std::optional<bool> pack_gqa_,
     int const sm_margin,
     at::Tensor& out,
-    std::optional<at::Tensor>& softmax_lse);
+    std::optional<at::Tensor>& softmax_lse,
+    // Device-resident BF16 [total_q, num_heads, padded_k] logits. The caller
+    // must zero values outside the relative-attention band.
+    std::optional<const at::Tensor>& rel_bias_,
+    int rel_bias_extent);
 
 void flash_mla_decode(
     torch::Tensor& out,

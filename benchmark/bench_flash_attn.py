@@ -1,4 +1,3 @@
-import math
 from itertools import product
 
 import torch
@@ -23,7 +22,6 @@ def flash_attn_baseline(
     k_descale=None,
     v_descale=None,
     rel_bias=None,
-    rel_bias_extent=0,
 ):
     """Baseline Flash Attention implementation"""
     # Kernel only supports LSE without causal/local/sink masking.
@@ -45,7 +43,6 @@ def flash_attn_baseline(
             k_descale=k_descale,
             v_descale=v_descale,
             rel_bias=rel_bias,
-            rel_bias_extent=rel_bias_extent,
             return_softmax_lse=return_lse,
         )
     else:
@@ -97,31 +94,13 @@ def get_effective_attention_pairs(
 
 
 def make_relative_bias(batch_size, q_seq_length, kv_seq_length, num_heads, extent):
-    bias_cols = math.ceil(extent / 32) * 32 + 256 + 32
-    bias = torch.zeros(
-        batch_size * q_seq_length,
-        num_heads,
-        bias_cols,
-        device="xpu",
-        dtype=torch.bfloat16,
-    )
-    values = torch.randn(
+    return torch.randn(
         batch_size * q_seq_length,
         num_heads,
         extent,
         device="xpu",
         dtype=torch.bfloat16,
     )
-    for q_global in range(batch_size * q_seq_length):
-        q_idx = q_global % q_seq_length
-        row_kv = kv_seq_length - q_seq_length + q_idx
-        row_kv_first = row_kv - q_idx % 256
-        col_origin = ((row_kv_first - math.ceil(extent / 32) * 32 + 1) // 32) * 32
-        columns = torch.arange(bias_cols, device="xpu") + col_origin
-        relative = row_kv - columns
-        valid = (relative >= 0) & (relative < extent)
-        bias[q_global, :, valid] = values[q_global, :, relative[valid]]
-    return bias
 
 
 # Benchmark configurations
@@ -345,7 +324,6 @@ def benchmark(
                 k_descale=k_descale,
                 v_descale=v_descale,
                 rel_bias=rel_bias,
-                rel_bias_extent=1024 if rel_bias is not None else 0,
             ),
             quantiles=quantiles,
         )

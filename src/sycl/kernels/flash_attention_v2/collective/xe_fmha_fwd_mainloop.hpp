@@ -252,7 +252,7 @@ struct FMHAFwdMainloop<
     int max_num_pages_per_seq = 0;
     int window_size_left = -1;
     int window_size_right = -1;
-    cutlass::bfloat16_t const* ptr_rel_bias = nullptr;
+    ElementQ const* ptr_rel_bias = nullptr;
     int64_t rel_bias_token_stride = 0;
     int64_t rel_bias_head_stride = 0;
     int rel_bias_extent = 0;
@@ -346,8 +346,7 @@ struct FMHAFwdMainloop<
       auto thr_copy_bias_load = copy_bias_load.get_slice(thr_id);
       auto tBiasLoadG = thr_copy_bias_load.partition_S(gBias);
       auto tBiasLoadR = thr_copy_bias_load.partition_sg_fragment_D(gBias(_, _, 0));
-      auto bias =
-          make_subgroup_tensor(make_fragment_like<cutlass::bfloat16_t>(scores.layout()), scores.tv_layout());
+      auto bias = make_subgroup_tensor(make_fragment_like<ElementQ>(scores.layout()), scores.tv_layout());
       copy(copy_bias_load, tBiasLoadG(_, _, _, bias_col / k_tile), tBiasLoadR);
       reorder(tBiasLoadR, bias);
       CUTLASS_PRAGMA_UNROLL

@@ -79,10 +79,9 @@ void mha_fwd(
     int const sm_margin,
     at::Tensor& out,
     std::optional<at::Tensor>& softmax_lse,
-    // Device-resident BF16 [total_q, num_heads, padded_k] logits. The caller
-    // must zero values outside the relative-attention band.
-    std::optional<const at::Tensor>& rel_bias_,
-    int rel_bias_extent);
+    // Device-resident Inkling logits [total_q, num_heads, extent], matching Q's dtype.
+    // The XPU FMHA path shears this source on the current stream.
+    std::optional<const at::Tensor>& rel_bias_);
 
 void flash_mla_decode(
     torch::Tensor& out,

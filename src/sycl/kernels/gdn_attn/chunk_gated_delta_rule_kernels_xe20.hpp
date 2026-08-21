@@ -1215,9 +1215,6 @@ template <typename T, typename StateTag>
 class ChunkComputeAKernel;
 
 template <typename T, typename StateTag>
-class ChunkComputeAKernelConventional;
-
-template <typename T, typename StateTag>
 class ChunkInverseOptKernel;
 
 template <typename T, typename StateTag>
@@ -1299,7 +1296,7 @@ void kernel_launcher(
 
   queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> local_mem(sycl::range<1>(slm_size_compute_A), cgh);
-    cgh.parallel_for<ChunkComputeAKernelConventional<T, StateT>>(
+    cgh.parallel_for<ChunkComputeAKernel<T, StateT>>(
         sycl::nd_range<3>{global_compute_A * local_compute_A, local_compute_A}, kernel_props, [=](auto) {
           chunk_compute_A_kernel<T, MMAComputeA>(
               local_mem,

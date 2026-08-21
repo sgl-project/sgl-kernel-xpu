@@ -256,7 +256,7 @@ CUTE_DEVICE void chunk_compute_A_kernel(
 
 // Each workgroup is responsible for one (chunk, v_head) pair
 template <typename T, class TiledMMA>
-CUTE_DEVICE void chunk_compute_A_kernel_conventional(
+CUTE_DEVICE void chunk_compute_A_kernel(
     const sycl::local_accessor<float, 1>& slm_mem_const,
     T* A,
     const T* k,
@@ -1301,7 +1301,7 @@ void kernel_launcher(
     sycl::local_accessor<float, 1> local_mem(sycl::range<1>(slm_size_compute_A), cgh);
     cgh.parallel_for<ChunkComputeAKernelConventional<T, StateT>>(
         sycl::nd_range<3>{global_compute_A * local_compute_A, local_compute_A}, kernel_props, [=](auto) {
-          chunk_compute_A_kernel_conventional<T, MMAComputeA>(
+          chunk_compute_A_kernel<T, MMAComputeA>(
               local_mem,
               A,
               k,

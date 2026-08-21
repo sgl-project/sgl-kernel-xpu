@@ -116,6 +116,7 @@ from sgl_kernel.kvcacheio import (
 )
 from sgl_kernel.lora import (
     embedding_lora_a_fwd,
+    gate_up_lora_b_fwd,
     qkv_lora_b_fwd,
     sgemm_lora_a_fwd,
     sgemm_lora_b_fwd,

@@ -519,6 +519,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor seg_indptr, Tensor weight_indices, Tensor lora_ranks, Tensor scalings, Tensor? seg_lens, "
       "Tensor? base_output) -> ()");
   m.impl("qkv_lora_b_fwd", torch::kXPU, &qkv_lora_b_fwd);
+  m.def(
+      "gate_up_lora_b_fwd(Tensor! output, Tensor input_x, Tensor gate_up_lora_b, int output_dim, "
+      "Tensor seg_indptr, Tensor weight_indices, Tensor lora_ranks, Tensor scalings, Tensor? seg_lens, "
+      "Tensor? base_output) -> ()");
+  m.impl("gate_up_lora_b_fwd", torch::kXPU, &gate_up_lora_b_fwd);
 
   /* NSA (Native Sparse Attention) indexer scoring */
   // fp8_mqa_logits (prefill) is implemented in pure Python via sgl_kernel.nsa.

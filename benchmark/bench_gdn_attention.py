@@ -545,7 +545,7 @@ def main():
     print()
 
     # ── Workloads ─────────────────────────────────────────────────────────────
-    # Matches the Qwen3.5-9B serving spec: BS=(1,4), input_len(ISL)=(1024,4096),
+    # Matches the Qwen3.5-9B serving spec: BS=(1,4,8), input_len(ISL)=(1024,4096),
     # output_len(OSL)=1024.
     #   Prefill: one call per (batch, ISL) — the full input_len is processed as
     #   a single chunked-prefill call.

@@ -321,6 +321,39 @@ struct PrefillRunner {
     return args;
   }
 
+  // ScoreBlock2D slices contiguous query heads while preserving their mapping
+  // to KV heads. The original NHD strides remain in the arguments because the
+  // source tensors still contain all heads.
+  template <class Kernel>
+  typename Kernel::Arguments
+  slice_query_head_arguments(typename Kernel::Arguments args, int query_head, int query_head_count) const {
+    const int head_group_q = args.kernel.shape.num_heads_q / args.kernel.shape.num_heads_kv;
+    const int kv_head = query_head / head_group_q;
+    const int head_offset_in_group = query_head % head_group_q;
+    const int kv_head_count =
+        query_head_count <= head_group_q - head_offset_in_group ? 1 : query_head_count / head_group_q;
+    const int head_size_qk = args.kernel.shape.head_size_qk;
+    const int head_size_vo = args.kernel.shape.head_size_vo;
+
+    args.kernel.shape.num_heads_q = query_head_count;
+    args.kernel.shape.num_heads_kv = kv_head_count;
+    args.kernel.Q += size_t(query_head) * size_t(head_size_qk);
+    args.kernel.O += size_t(query_head) * size_t(head_size_vo);
+    args.kernel.K_cache += size_t(kv_head) * size_t(head_size_qk);
+    args.kernel.V_cache += size_t(kv_head) * size_t(head_size_vo);
+    return args;
+  }
+
+  static int get_query_head_slice_size(int query_head, int query_heads, int head_group_q, int requested_heads) {
+    const int heads_remaining = query_heads - query_head;
+    const int head_offset_in_group = query_head % head_group_q;
+    if (head_offset_in_group != 0 || requested_heads < head_group_q) {
+      return cute::min(requested_heads, cute::min(heads_remaining, head_group_q - head_offset_in_group));
+    }
+    // A KV-head-group-aligned slice may include multiple complete GQA groups.
+    return cute::min(heads_remaining, (requested_heads / head_group_q) * head_group_q);
+  }
+
   cutlass::Status run(const Arguments& params, const cutlass::KernelHardwareInfo& hw_info) {
     ProblemShapeType shape = initialize(params);
 
@@ -357,6 +390,7 @@ struct PrefillRunner {
 
     const int batch_total = params.b;
     int batch_slice = batch_total;
+    int query_head_slice = params.h;
     if constexpr (CollectiveMainloop::ScoreBlock2D) {
       static const int cap_mb = [] {
         if (const char* env = std::getenv("FMHA_SCORE_WS_CAP_MB")) {
@@ -364,33 +398,54 @@ struct PrefillRunner {
         }
         return DefaultScoreWorkspaceCapMiB;
       }();
-      if (cap_mb > 0 && batch_total > 1) {
+      if (cap_mb > 0) {
         const size_t cap_bytes = size_t(cap_mb) << 20;
+        const int head_group_q = params.h / params.h_k;
         auto one_batch = slice_arguments<FMHAPrefillKernel>(arguments, 0, 1);
-        const size_t per_batch = FMHAPrefillKernel::get_workspace_size(one_batch);
-        if (per_batch > 0 && per_batch * size_t(batch_total) > cap_bytes) {
+        const size_t full_batch_workspace = FMHAPrefillKernel::get_workspace_size(one_batch);
+        if (full_batch_workspace <= cap_bytes) {
+          batch_slice = int(cute::max(size_t(1), cap_bytes / full_batch_workspace));
+          batch_slice = cute::min(batch_total, batch_slice);
+        } else {
+          const int q_tiles = cute::ceil_div(params.seqlen_q, int(get<0>(typename FMHAPrefillKernel::TileShapeQK{})));
+          const int target_heads = cute::ceil_div(cute::max(1, hw_info.sm_count), cute::max(1, q_tiles));
+          query_head_slice = cute::min(params.h, target_heads);
+          const int first_head_slice = get_query_head_slice_size(0, params.h, head_group_q, query_head_slice);
+          const size_t per_batch = FMHAPrefillKernel::get_workspace_size(
+              slice_query_head_arguments<FMHAPrefillKernel>(one_batch, 0, first_head_slice));
           batch_slice = int(cute::max(size_t(1), cap_bytes / per_batch));
+          batch_slice = cute::min(batch_total, batch_slice);
         }
       }
     }
     const int num_slices = cute::ceil_div(batch_total, batch_slice);
 
-    // Every slice reuses the same device-global score buffer.
-    auto workspace_shape = num_slices > 1 ? slice_arguments<FMHAPrefillKernel>(arguments, 0, batch_slice) : arguments;
-    size_t workspace_size = FMHAPrefillKernel::get_workspace_size(workspace_shape);
+    const int head_group_q = params.h / params.h_k;
+    const int first_head_slice = get_query_head_slice_size(0, params.h, head_group_q, query_head_slice);
+    // Every batch/head slice reuses the score buffer.
+    const size_t workspace_size = FMHAPrefillKernel::get_workspace_size(slice_query_head_arguments<FMHAPrefillKernel>(
+        num_slices > 1 ? slice_arguments<FMHAPrefillKernel>(arguments, 0, batch_slice) : arguments,
+        0,
+        first_head_slice));
     if constexpr (CollectiveMainloop::ScoreBlock2D) {
       if (std::getenv("FMHA_SCORE_WS_VERBOSE") != nullptr) {
         std::fprintf(
             stderr,
-            "[fmha] score workspace: batch=%d slice=%d slices=%d bytes=%zu (%.1f MiB)\n",
+            "[fmha] score workspace: batch=%d batch_slice=%d slices=%d query_head_slice=%d q_tile_rows=%d bytes=%zu "
+            "(%.1f MiB)\n",
             batch_total,
             batch_slice,
             num_slices,
+            query_head_slice,
+            int(get<0>(typename FMHAPrefillKernel::TileShapeQK{})),
             workspace_size,
             double(workspace_size) / (1024.0 * 1024.0));
       }
     }
-    auto workspace = torch::empty(workspace_size, params.tensor_opts);
+    // get_workspace_size() is expressed in bytes. Keep the score workspace byte-addressed
+    // so BF16/FP16 tensor options do not allocate two bytes for every requested byte.
+    auto workspace =
+        torch::empty({static_cast<int64_t>(workspace_size)}, torch::device(torch::kXPU).dtype(torch::kByte));
     void* workspace_ptr = workspace.data_ptr();
 
     if (!FMHAPrefillKernel::can_implement(arguments)) {
@@ -407,9 +462,14 @@ struct PrefillRunner {
 
       for (int batch_lo = 0; batch_lo < batch_total; batch_lo += batch_slice) {
         const int batch_len = cute::min(batch_slice, batch_total - batch_lo);
-        auto slice = slice_arguments<FMHAPrefillKernel>(arguments, batch_lo, batch_len);
-        launch<ScoreStoreKernel>(ScoreStoreKernel::to_underlying_arguments(slice, workspace_ptr));
-        launch<ScoreLoadKernel>(ScoreLoadKernel::to_underlying_arguments(slice, workspace_ptr));
+        auto batch_args = slice_arguments<FMHAPrefillKernel>(arguments, batch_lo, batch_len);
+        for (int query_head = 0; query_head < params.h;) {
+          const int head_count = get_query_head_slice_size(query_head, params.h, head_group_q, query_head_slice);
+          auto slice = slice_query_head_arguments<FMHAPrefillKernel>(batch_args, query_head, head_count);
+          launch<ScoreStoreKernel>(ScoreStoreKernel::to_underlying_arguments(slice, workspace_ptr));
+          launch<ScoreLoadKernel>(ScoreLoadKernel::to_underlying_arguments(slice, workspace_ptr));
+          query_head += head_count;
+        }
       }
     } else {
       launch<FMHAPrefillKernel>(FMHAPrefillKernel::to_underlying_arguments(arguments, workspace_ptr));

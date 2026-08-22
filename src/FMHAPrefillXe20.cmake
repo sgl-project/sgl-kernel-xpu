@@ -55,7 +55,7 @@ set(FMHA_PREFILL_TILED_OUT_512 256)
 option(
     FMHA_PREFILL_ENABLE_SCORE_BLOCK2D_512
     "Reuse QK scores across the two output tiles for HEAD_DIM=512 prefill"
-    ON)
+    OFF)
 
 # Per-HEAD_DIM tile shape parameters for the NON-PAGED (contiguous ragged) KV
 # path (TILED_Q_NP, TILED_KV_NP, NUM_SG_NP). These are kept as a separate set so
@@ -137,6 +137,7 @@ foreach(HEAD_DIM ${FMHA_PREFILL_PAGED_HEAD_DIMS})
             "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_prefill_page_${HEAD_DIM}_${DT16}.cpp")
         configure_file(${FMHA_PREFILL_TEMPLATE} ${GENERATED_FILE} @ONLY)
         list(APPEND device_cpp_xe20 ${GENERATED_FILE})
+        list(APPEND device_cpp_xe35 ${GENERATED_FILE})
 
         # FP8 KV cache: bf16 query only (KV dtype = fp8, Q dtype = bf16).
         # fp16 query + fp8 KV is intentionally not built.
@@ -145,6 +146,7 @@ foreach(HEAD_DIM ${FMHA_PREFILL_PAGED_HEAD_DIMS})
                 "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_prefill_page_${HEAD_DIM}_${DTFP8}.cpp")
             configure_file(${FMHA_PREFILL_FP8_TEMPLATE} ${GENERATED_FP8_FILE} @ONLY)
             list(APPEND device_cpp_xe20 ${GENERATED_FP8_FILE})
+            list(APPEND device_cpp_xe35 ${GENERATED_FP8_FILE})
         endif()
     endforeach()
 endforeach()
@@ -180,5 +182,6 @@ foreach(HEAD_DIM ${FMHA_PREFILL_NP_HEAD_DIMS})
             "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_prefill_nopage_${HEAD_DIM}_${DT16}.cpp")
         configure_file(${FMHA_PREFILL_NOPAGE_TEMPLATE} ${GENERATED_NP_FILE} @ONLY)
         list(APPEND device_cpp_xe20 ${GENERATED_NP_FILE})
+        list(APPEND device_cpp_xe35 ${GENERATED_NP_FILE})
     endforeach()
 endforeach()

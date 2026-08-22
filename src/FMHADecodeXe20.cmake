@@ -84,11 +84,13 @@ foreach(QG_SZ ${FMHA_DECODE_QG_SIZES})
                     "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_page_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}_${DT16}.cpp")
                 configure_file(${FMHA_DECODE_TEMPLATE} ${GENERATED_FILE} @ONLY)
                 list(APPEND device_cpp_xe20 ${GENERATED_FILE})
+                list(APPEND device_cpp_xe35 ${GENERATED_FILE})
 
                 set(GENERATED_SPLIT_FILE
                     "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_split_decode_page_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}_${DT16}.cpp")
                 configure_file(${FMHA_SPLIT_DECODE_TEMPLATE} ${GENERATED_SPLIT_FILE} @ONLY)
                 list(APPEND device_cpp_xe20 ${GENERATED_SPLIT_FILE})
+                list(APPEND device_cpp_xe35 ${GENERATED_SPLIT_FILE})
 
                 # FP8 KV cache: bf16 query only (KV dtype = fp8, Q dtype = bf16).
                 # fp16 query + fp8 KV is intentionally not built.
@@ -97,11 +99,13 @@ foreach(QG_SZ ${FMHA_DECODE_QG_SIZES})
                         "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_page_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}_${DTFP8}.cpp")
                     configure_file(${FMHA_DECODE_FP8_TEMPLATE} ${GENERATED_FP8_FILE} @ONLY)
                     list(APPEND device_cpp_xe20 ${GENERATED_FP8_FILE})
+                    list(APPEND device_cpp_xe35 ${GENERATED_FP8_FILE})
 
                     set(GENERATED_SPLIT_FP8_FILE
                         "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_split_decode_page_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}_${DTFP8}.cpp")
                     configure_file(${FMHA_SPLIT_DECODE_FP8_TEMPLATE} ${GENERATED_SPLIT_FP8_FILE} @ONLY)
                     list(APPEND device_cpp_xe20 ${GENERATED_SPLIT_FP8_FILE})
+                    list(APPEND device_cpp_xe35 ${GENERATED_SPLIT_FP8_FILE})
                 endif()
             endforeach()
         endforeach()
@@ -127,6 +131,7 @@ foreach(QG_SZ ${FMHA_DECODE_QG_SIZES})
                 "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_nopage_${QG_SZ}_${HEAD_DIM}_${DT16}.cpp")
             configure_file(${FMHA_DECODE_NOPAGE_TEMPLATE} ${GENERATED_NP_FILE} @ONLY)
             list(APPEND device_cpp_xe20 ${GENERATED_NP_FILE})
+            list(APPEND device_cpp_xe35 ${GENERATED_NP_FILE})
         endforeach()
     endforeach()
 endforeach()

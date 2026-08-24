@@ -447,8 +447,7 @@ struct PrefillRunner {
             // An entire Q-head set cannot fit even for one Q tile. Reduce
             // heads only as far as required by the workspace cap.
             for (int requested_heads = params.h; requested_heads > 0;) {
-              const int candidate_heads =
-                  get_query_head_slice_size(0, params.h, head_group_q, requested_heads);
+              const int candidate_heads = get_query_head_slice_size(0, params.h, head_group_q, requested_heads);
               if (score_workspace_size(1, candidate_heads, 1) <= cap_bytes) {
                 query_head_slice = candidate_heads;
                 break;
@@ -464,8 +463,7 @@ struct PrefillRunner {
           }
 
           query_tile_slice = cute::min(q_tiles, int(cute::max(size_t(1), cap_bytes / one_q_tile_workspace)));
-          const size_t per_batch =
-              score_workspace_size(1, query_head_slice, query_tile_slice);
+          const size_t per_batch = score_workspace_size(1, query_head_slice, query_tile_slice);
           batch_slice = int(cute::max(size_t(1), cap_bytes / per_batch));
           batch_slice = cute::min(batch_total, batch_slice);
         }

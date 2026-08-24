@@ -134,6 +134,7 @@ def flash_attn_with_kvcache(
     return_softmax_lse=False,
     out=None,
     rel_bias=None,
+    rel_bias_is_sheared=False,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -224,7 +225,12 @@ def flash_attn_with_kvcache(
             ``(total_q, nheads, extent)``. The kernel shears this source on the
             current XPU stream for its fixed 256x32 relative-attention tiles. Its
             dtype must match ``q``.
-            Supported only for paged KV prefill with head dimensions 128.
+            Supported for paged KV attention with head dimension 128, and with
+            head dimension 512 for single-token decode.
+        rel_bias_is_sheared: decode-only fast path for a producer that already
+            emits the sheared relative-bias surface. The surface's final
+            dimension must be the decode padded width (a multiple of page size);
+            this avoids the compatibility shear dispatch.
 
     Return:
         out: (total_q, nheads, headdim_v), where total_q = batch_size * seqlen (non-varlen)
@@ -301,6 +307,7 @@ def flash_attn_with_kvcache(
         sm_margin,
         out,
         rel_bias,
+        rel_bias_is_sheared,
     )
     return (out, softmax_lse, *rest) if return_softmax_lse else out
 

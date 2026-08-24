@@ -2465,5 +2465,121 @@ def test_relative_attention_zero_bias_matches_prefill():
     torch.testing.assert_close(relative.float(), baseline.float(), rtol=0, atol=5e-4)
 
 
+@pytest.mark.skipif(
+    device.type != "xpu", reason="relative attention requires an XPU device"
+)
+def test_relative_attention_decode_pre_sheared_matches_raw():
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    torch.manual_seed(29)
+    batch, seqlen_k, num_heads, num_heads_k, head_dim, page_size, extent = 1, 65, 8, 1, 128, 64, 128
+    pages = math.ceil(seqlen_k / page_size)
+    q = torch.randn(batch, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k_cache = torch.randn(
+        batch * pages, page_size, num_heads_k, head_dim, dtype=torch.bfloat16, device=device
+    )
+    v_cache = torch.randn_like(k_cache)
+    raw_bias = torch.randn(batch, num_heads, extent, dtype=torch.bfloat16, device=device)
+    cols = math.ceil(extent / page_size) * page_size + page_size
+    sheared_bias = torch.zeros(batch, num_heads, cols, dtype=torch.bfloat16, device=device)
+    row_kv = seqlen_k - 1
+    origin = ((row_kv - math.ceil(extent / page_size) * page_size + 1) // page_size) * page_size
+    for col in range(cols):
+        rel = row_kv - (origin + col)
+        if 0 <= rel < extent:
+            sheared_bias[:, :, col] = raw_bias[:, :, rel]
+
+    common = dict(
+        cache_seqlens=torch.tensor([seqlen_k], dtype=torch.int32, device=device),
+        page_table=torch.arange(batch * pages, dtype=torch.int32, device=device).view(batch, pages),
+        cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        max_seqlen_q=1,
+        max_seqlen_k=seqlen_k,
+        causal=False,
+    )
+    raw = flash_attn_with_kvcache(q, k_cache, v_cache, rel_bias=raw_bias, **common)
+    sheared = flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        rel_bias=sheared_bias,
+        rel_bias_is_sheared=True,
+        **common,
+    )
+    torch.xpu.synchronize()
+    torch.testing.assert_close(sheared.float(), raw.float(), rtol=0, atol=1e-3)
+
+
+@pytest.mark.skipif(
+    device.type != "xpu", reason="relative attention requires an XPU device"
+)
+@pytest.mark.parametrize(
+    "seqlen_k,extent",
+    [(1, 1), (63, 64), (64, 64), (65, 64), (4097, 128), (4097, 4097), (5120, 192)],
+)
+def test_relative_attention_decode_d512_bias_only_matches_reference_and_pre_sheared(
+    seqlen_k, extent
+):
+    """Cover the Gemma4 D=512 decode specialization from the reference commit."""
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    torch.manual_seed(43 + seqlen_k + extent)
+    batch, num_heads, num_heads_k, head_dim, page_size = 1, 8, 1, 512, 64
+    pages = math.ceil(seqlen_k / page_size)
+    q = torch.zeros(batch, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k_cache = torch.zeros(
+        batch * pages, page_size, num_heads_k, head_dim, dtype=torch.bfloat16, device=device
+    )
+    v_cache = torch.randn_like(k_cache)
+    table = (
+        torch.arange(1, num_heads + 1, dtype=torch.float32).unsqueeze(1)
+        * torch.linspace(-8.0, 8.0, extent, dtype=torch.float32).unsqueeze(0)
+        / num_heads
+    )
+    raw_bias = table.to(torch.bfloat16).to(device).unsqueeze(0)
+
+    cols = math.ceil(extent / page_size) * page_size + page_size
+    sheared_bias = torch.zeros(batch, num_heads, cols, dtype=torch.bfloat16, device=device)
+    row_kv = seqlen_k - 1
+    origin = ((row_kv - math.ceil(extent / page_size) * page_size + 1) // page_size) * page_size
+    for col in range(cols):
+        rel = row_kv - (origin + col)
+        if 0 <= rel < extent:
+            sheared_bias[:, :, col] = raw_bias[:, :, rel]
+
+    common = dict(
+        cache_seqlens=torch.tensor([seqlen_k], dtype=torch.int32, device=device),
+        page_table=torch.arange(batch * pages, dtype=torch.int32, device=device).view(batch, pages),
+        cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        max_seqlen_q=1,
+        max_seqlen_k=seqlen_k,
+        # Gemma4's production decode scale. Keep Q/K zero so the expected
+        # result is determined by relative bias without relying on the
+        # existing D=512 zero-scale edge case in the plain decode kernel.
+        softmax_scale=1.0,
+        causal=False,
+    )
+    raw = flash_attn_with_kvcache(q, k_cache, v_cache, rel_bias=raw_bias, **common)
+    sheared = flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        rel_bias=sheared_bias,
+        rel_bias_is_sheared=True,
+        **common,
+    )
+    v_logical = v_cache.flatten(0, 1)[:seqlen_k, 0].float().cpu()
+    rel = row_kv - torch.arange(seqlen_k)
+    logits = torch.zeros(num_heads, seqlen_k, dtype=torch.float32)
+    in_band = rel < extent
+    logits[:, in_band] = table[:, rel[in_band]]
+    weights = torch.softmax(logits, dim=-1)
+    reference = torch.einsum("hk,kd->hd", weights, v_logical).to(torch.bfloat16)
+
+    torch.xpu.synchronize()
+    torch.testing.assert_close(raw.cpu().float()[0], reference.float(), rtol=0, atol=2e-2)
+    torch.testing.assert_close(sheared.float(), raw.float(), rtol=0, atol=2e-2)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

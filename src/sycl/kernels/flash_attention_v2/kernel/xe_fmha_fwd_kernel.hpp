@@ -504,6 +504,7 @@ class XeFMHAFwdKernel {
           seq_len_kv_cache,
           idx_b,
           q_head_idx,
+          PackGQA_ ? head * head_group_q : head_q,
           q_token_offset,
           full_tile_offset,
           discard_seq_coord,
@@ -532,6 +533,7 @@ class XeFMHAFwdKernel {
           seq_len_kv_cache,
           idx_b,
           q_head_idx,
+          PackGQA_ ? head * head_group_q : head_q,
           q_token_offset,
           full_tile_offset,
           discard_seq_coord,
@@ -927,6 +929,9 @@ class XeFMHAFwdDynamicSplitKernel {
             local_k_blocks,
             thr_id,
             s.seq_len_kv,
+            0,
+            0,
+            0,
             0,
             0,
             0,
@@ -1356,6 +1361,11 @@ class XeFMHAFwdSplitKVKernel {
         scale_v = *p.scale_v_ptr;
       }
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
+      int bias_row_base = 0;
+      if constexpr (CollectiveMainloop::HasRelBias) {
+        int const q_token = is_var_len ? s.seq_len_qo.cumulative_length[idx_b] : idx_b * seq_len_qo;
+        bias_row_base = q_token * s.num_heads_q + head_q_start;
+      }
 
       mainloop(
           Q(_, _, head, l_coord),
@@ -1373,7 +1383,8 @@ class XeFMHAFwdSplitKVKernel {
           seq_len,
           full_tile_offset,
           discard_seq_coord,
-          scale_k);
+          scale_k,
+          bias_row_base);
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());

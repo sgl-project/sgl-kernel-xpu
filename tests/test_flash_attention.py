@@ -2,6 +2,7 @@
 import itertools
 import math
 import os
+import re
 import sys
 
 import pytest
@@ -2342,8 +2343,9 @@ if EXTENDED_KVCACHE_TESTS:
         "batch_size,nheads_q,nheads_kv,seqlen_q,seqlen_k",
         [
             (1, 16, 2, 32768, 32768),
-            # 16 Q tiles per head: requires two query heads to cover both BMG
-            # (20 Xe-cores) and CRI (32 Xe-cores) without a 4 GiB score buffer.
+            # Non-paged HD512 uses 32 Q tiles per head. Q-tile chunking keeps
+            # one query head sufficient to cover BMG (20 Xe-cores) without a
+            # 4 GiB score buffer.
             (1, 16, 2, 4096, 32768),
             # A low-head, high-batch case must accumulate Q tiles across batch
             # slices instead of allocating all eight score matrices at once.
@@ -2354,13 +2356,14 @@ if EXTENDED_KVCACHE_TESTS:
         ],
     )
     def test_flash_attn_varlen_hd512_large_score_workspace(
-        batch_size, nheads_q, nheads_kv, seqlen_q, seqlen_k
+        batch_size, nheads_q, nheads_kv, seqlen_q, seqlen_k, monkeypatch, capfd
     ):
-        """Large ScoreBlock2D cases that require batch and GQA-head slicing."""
+        """Large ScoreBlock2D cases that require batch, GQA-head, and Q-tile slicing."""
         from sgl_kernel.flash_attn import flash_attn_varlen_func
 
         head_dim = 512
         torch.manual_seed(0)
+        monkeypatch.setenv("FMHA_SCORE_WS_VERBOSE", "1")
 
         total_q = batch_size * seqlen_q
         total_k = batch_size * seqlen_k
@@ -2394,6 +2397,15 @@ if EXTENDED_KVCACHE_TESTS:
         assert out.shape == (total_q, nheads_q, head_dim)
         assert out.dtype == torch.bfloat16
         assert torch.isfinite(out).all()
+        _, stderr = capfd.readouterr()
+        match = re.search(
+            r"query_tile_slice=(\d+) q_tile_rows=(\d+) bytes=(\d+)", stderr
+        )
+        assert match, f"missing ScoreBlock2D workspace report: {stderr}"
+        q_tile_slice, q_tile_rows, workspace_bytes = map(int, match.groups())
+        total_q_tiles = math.ceil(seqlen_q / q_tile_rows)
+        assert 1 <= q_tile_slice <= total_q_tiles
+        assert workspace_bytes <= 1024 * 1024 * 1024
 
     @pytest.mark.parametrize(
         "batch_size,nheads_q,nheads_kv",

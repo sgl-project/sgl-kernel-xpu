@@ -177,6 +177,10 @@ class XeFMHAFwdKernel {
     // (num_heads_q, total_q). Null => don't write.
     float* softmax_lse = nullptr;
     int64_t lse_head_stride = 0;  // = total_q
+    // ScoreBlock2D processes this contiguous Q-tile interval. Non-score paths
+    // leave q_tile_count at -1 and use the complete Q extent.
+    int q_tile_start = 0;
+    int q_tile_count = -1;
   };
   using KernelParams = KernelArguments;
 
@@ -224,11 +228,17 @@ class XeFMHAFwdKernel {
         args.kernel.scale_k_ptr,
         args.kernel.scale_v_ptr,
         args.kernel.softmax_lse,
-        args.kernel.lse_head_stride};
+        args.kernel.lse_head_stride,
+        args.kernel.q_tile_start,
+        args.kernel.q_tile_count};
     auto scheduler_params =
         TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{}, sched_num_kv_splits);
     if constexpr (CollectiveMainloop::ScoreBlock2D && StaticScoreMode_ >= 0) {
       scheduler_params.grid.x = 1;
+      scheduler_params.q_tile_start = args.kernel.q_tile_start;
+      if (args.kernel.q_tile_count > 0) {
+        scheduler_params.grid.y = args.kernel.q_tile_count;
+      }
     }
     return {
         kernel_params,
@@ -253,7 +263,9 @@ class XeFMHAFwdKernel {
         score_k_extent = size_t(args.kernel.shape.seq_len_kv_cache);
       }
       const size_t score_rows_per_wg = size_t(get<0>(TileShapeQK{}));
-      const size_t q_tiles = cute::ceil_div(score_q_extent, score_rows_per_wg);
+      const size_t total_q_tiles = cute::ceil_div(score_q_extent, score_rows_per_wg);
+      const size_t q_tiles =
+          args.kernel.q_tile_count > 0 ? cute::min(total_q_tiles, size_t(args.kernel.q_tile_count)) : total_q_tiles;
       score_k_extent = cute::round_up(score_k_extent, size_t(get<1>(TileShapeQK{})));
       return size_t(args.kernel.shape.batch) * size_t(args.kernel.shape.num_heads_q) * q_tiles * score_rows_per_wg *
              score_k_extent * sizeof(typename CollectiveMainloop::ElementScoreStore);
@@ -493,8 +505,10 @@ class XeFMHAFwdKernel {
         score_k_extent = cute::round_up(score_k_extent, int(get<1>(TileShapeQK{})));
         score_region_cols = score_k_extent;
         score_pf_q_ok = score_q_extent >= cutlass::fmha::ScoreBlock2DPolicy::ScorePrefetchQMin;
-        const int q_tiles = cute::ceil_div(score_q_extent, int(get<0>(TileShapeQK{})));
-        const size_t wg_slot = (size_t(score_batch) * s.num_heads_q + q_head_idx) * q_tiles + size_t(blk_q);
+        const int total_q_tiles = cute::ceil_div(score_q_extent, int(get<0>(TileShapeQK{})));
+        const int q_tiles = p.q_tile_count > 0 ? cute::min(total_q_tiles, p.q_tile_count) : total_q_tiles;
+        const int q_tile_slot = blk_q - p.q_tile_start;
+        const size_t wg_slot = (size_t(score_batch) * s.num_heads_q + q_head_idx) * q_tiles + size_t(q_tile_slot);
         score_head_ptr = params.mainloop.ptr_score + wg_slot * size_t(get<0>(TileShapeQK{})) * size_t(score_k_extent);
       }
 #endif

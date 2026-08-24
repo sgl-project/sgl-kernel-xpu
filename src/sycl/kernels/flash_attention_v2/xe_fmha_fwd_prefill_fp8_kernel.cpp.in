@@ -33,11 +33,11 @@ __attribute__((visibility("default"))) void FmhaPrefillFp8Runner<@HEAD_DIM@, @EL
       using QElement = @ELEM_TYPE@;
       if (params.is_e4m3) {
         FMHAConfig<
-             Causal, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, false, 2, false,
+             Causal, LocalMask, false, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, false, 2, false,
              QElement, cutlass::float_e4m3_t, cutlass::float_e4m3_t, QElement>::run_paged(params);
        } else {
          FMHAConfig<
-             Causal, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, false, 2, false,
+             Causal, LocalMask, false, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, false, 2, false,
              QElement, cutlass::float_e5m2_t, cutlass::float_e5m2_t, QElement>::run_paged(params);
       }
     });

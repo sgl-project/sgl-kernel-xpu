@@ -81,7 +81,8 @@ void mha_fwd(
     std::optional<at::Tensor>& softmax_lse,
     // Device-resident Inkling logits [total_q, num_heads, extent], matching Q's dtype.
     // The XPU FMHA path shears this source on the current stream.
-    std::optional<const at::Tensor>& rel_bias_);
+    std::optional<const at::Tensor>& rel_bias_,
+    bool rel_bias_is_sheared);
 
 void flash_mla_decode(
     torch::Tensor& out,

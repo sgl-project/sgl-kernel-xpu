@@ -6,6 +6,7 @@ between DSV3-style FP8 (BS=128, fp32 scales) and OCP MXFP8 (BS=32, UE8M0
 uint8 scales); C++ dispatches on scales_a dtype.
 """
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -26,6 +27,16 @@ _FP8_E4M3_MIN = -448.0
 _FP8_E4M3_MAX = 448.0
 
 _MXFP8_BLOCK_SIZE = 32
+_NVFP4_WOQ_COMPUTE_ENV = "SGLANG_NVFP4_WOQ_COMPUTE"
+
+
+def _nvfp4_woq_compute_mode() -> str:
+    mode = os.getenv(_NVFP4_WOQ_COMPUTE_ENV, "mxfp8").strip().lower()
+    if mode not in ("mxfp8", "bf16"):
+        raise ValueError(
+            f"{_NVFP4_WOQ_COMPUTE_ENV} must be 'mxfp8' or 'bf16', got {mode!r}"
+        )
+    return mode
 
 
 def _per_token_group_quant_fp8(x: torch.Tensor, group_size: int = 128):
@@ -427,7 +438,7 @@ def cutlass_fused_experts_mxfp4(
 
 
 # ---------------------------------------------------------------------------
-# NVFP4 (software-emulated via MXFP8)
+# NVFP4 weight-only quantization (MXFP8 or BF16 compute)
 # ---------------------------------------------------------------------------
 
 def nvfp4_woq_prepare_weights(
@@ -459,13 +470,11 @@ def cutlass_fused_experts_nvfp4_woq(
     output: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Fused MoE with NVFP4 weights, requantized to MXFP8 inside the GEMM.
+    """Fused MoE with NVFP4 weights and MXFP8 or BF16 computation.
 
-    The weights stay 4-bit in memory: each GEMM's mainloop dequantizes B to
-    BF16 and requantizes it to MXFP8 in registers.  Weight traffic stays at
-    NVFP4 density, which is what makes NVFP4 worth emulating in the first
-    place — materializing MXFP8 weights for a 256-expert model would need
-    roughly twice the footprint.
+    The weights stay 4-bit in memory. ``SGLANG_NVFP4_WOQ_COMPUTE`` selects
+    ``mxfp8`` (default, in-register weight requantization) or ``bf16``
+    (in-register weight dequantization with BF16 activations and MMA).
 
     Args:
         a: (M, K) activations, fp16 or bf16.
@@ -479,13 +488,17 @@ def cutlass_fused_experts_nvfp4_woq(
     Returns:
         (M, K) tensor in ``a.dtype``.
     """
-    from sgl_kernel.nvfp4 import nvfp4_woq_mxfp8_scaled_grouped_mm
+    from sgl_kernel.nvfp4 import (
+        nvfp4_woq_bf16_grouped_mm,
+        nvfp4_woq_mxfp8_scaled_grouped_mm,
+    )
 
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert w1_q.dtype == torch.uint8 and w2_q.dtype == torch.uint8, "weights must be packed E2M1 uint8"
     assert w1_q.dim() == 3 and w2_q.dim() == 3, "weights must be 3D (E, N, K/2)"
     assert w1_q.shape[0] == w2_q.shape[0], "expert count mismatch w1/w2"
     assert a.dtype in (torch.half, torch.bfloat16), "invalid input dtype"
+    compute_mode = _nvfp4_woq_compute_mode()
 
     out_dtype = a.dtype
     num_experts = w1_q.size(0)
@@ -515,28 +528,72 @@ def cutlass_fused_experts_nvfp4_woq(
     if workspace is None:
         workspace = torch.zeros((64 * 1024 * 1024,), dtype=torch.uint8, device=device)
 
-    # XPU scatter doesn't support fp8; scatter in a.dtype then quantize.
-    rep_a = torch.empty((m * topk, k), dtype=a.dtype, device=device)
-    scatter_tokens_to_experts(a, c_map, rep_a)
-    rep_a_q, rep_a_s = _per_token_group_quant_mxfp8(rep_a, group_size=_MXFP8_BLOCK_SIZE)
-
     c1 = torch.zeros((m * topk, n * 2), dtype=torch.float32, device=device)
-    nvfp4_woq_mxfp8_scaled_grouped_mm(
-        c1, rep_a_q, w1_q, rep_a_s, prepared["w1_sfmx"], prepared["w1_c"],
-        problem_sizes1, expert_starts, workspace,
-    )
-
-    intermediate = torch.empty((m * topk, n), dtype=out_dtype, device=device)
-    silu_and_mul(c1.to(out_dtype), intermediate)
-    inter_q, inter_s = _per_token_group_quant_mxfp8(
-        intermediate, group_size=_MXFP8_BLOCK_SIZE
-    )
-
     c2 = torch.zeros((m * topk, k), dtype=torch.float32, device=device)
-    nvfp4_woq_mxfp8_scaled_grouped_mm(
-        c2, inter_q, w2_q, inter_s, prepared["w2_sfmx"], prepared["w2_c"],
-        problem_sizes2, expert_starts, workspace,
-    )
+    if compute_mode == "bf16":
+        # Both GEMMs consume BF16 directly. Convert FP16 inputs once before the
+        # routing scatter and keep the intermediate activation in BF16.
+        a_bf16 = a if a.dtype == torch.bfloat16 else a.to(torch.bfloat16)
+        rep_a = torch.empty((m * topk, k), dtype=torch.bfloat16, device=device)
+        scatter_tokens_to_experts(a_bf16, c_map, rep_a)
+        nvfp4_woq_bf16_grouped_mm(
+            c1,
+            rep_a,
+            w1_q,
+            prepared["w1_sfmx"],
+            prepared["w1_c"],
+            problem_sizes1,
+            expert_starts,
+            workspace,
+        )
+
+        intermediate = torch.empty((m * topk, n), dtype=torch.bfloat16, device=device)
+        silu_and_mul(c1.to(torch.bfloat16), intermediate)
+        nvfp4_woq_bf16_grouped_mm(
+            c2,
+            intermediate,
+            w2_q,
+            prepared["w2_sfmx"],
+            prepared["w2_c"],
+            problem_sizes2,
+            expert_starts,
+            workspace,
+        )
+    else:
+        # XPU scatter doesn't support fp8; scatter in a.dtype then quantize.
+        rep_a = torch.empty((m * topk, k), dtype=a.dtype, device=device)
+        scatter_tokens_to_experts(a, c_map, rep_a)
+        rep_a_q, rep_a_s = _per_token_group_quant_mxfp8(
+            rep_a, group_size=_MXFP8_BLOCK_SIZE
+        )
+        nvfp4_woq_mxfp8_scaled_grouped_mm(
+            c1,
+            rep_a_q,
+            w1_q,
+            rep_a_s,
+            prepared["w1_sfmx"],
+            prepared["w1_c"],
+            problem_sizes1,
+            expert_starts,
+            workspace,
+        )
+
+        intermediate = torch.empty((m * topk, n), dtype=out_dtype, device=device)
+        silu_and_mul(c1.to(out_dtype), intermediate)
+        inter_q, inter_s = _per_token_group_quant_mxfp8(
+            intermediate, group_size=_MXFP8_BLOCK_SIZE
+        )
+        nvfp4_woq_mxfp8_scaled_grouped_mm(
+            c2,
+            inter_q,
+            w2_q,
+            inter_s,
+            prepared["w2_sfmx"],
+            prepared["w2_c"],
+            problem_sizes2,
+            expert_starts,
+            workspace,
+        )
 
     if output is None:
         output = torch.empty((m, k), dtype=out_dtype, device=device)

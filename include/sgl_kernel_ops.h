@@ -758,6 +758,17 @@ void nvfp4_woq_mxfp8_scaled_grouped_mm(
     const torch::Tensor& problem_sizes,
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace);
+// Direct BF16 compute variant. A stays BF16 and packed NVFP4 B is dequantized
+// to the BF16 MMA fragment inside the mainloop.
+void nvfp4_woq_bf16_grouped_mm(
+    torch::Tensor& output,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& sfmx_b,
+    const torch::Tensor& c_b,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& workspace);
 #endif
 
 // Xe40 only kernels

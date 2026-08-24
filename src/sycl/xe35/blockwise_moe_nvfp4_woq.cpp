@@ -28,12 +28,15 @@
 
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <torch/extension.h>
 
 #include <cute/tensor.hpp>
 #include <cute/arch/mma_xe.hpp>
+#include <cute/util/compat.hpp>
 
 #include "cutlass/cutlass.h"
+#include "cutlass/device_kernel.h"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/epilogue/collective/xe_epilogue.hpp"
 #include "cutlass/epilogue/fusion/xe_callbacks.hpp"
@@ -47,6 +50,7 @@
 #include "cutlass/util/packed_stride.hpp"
 
 #include "moe_group_gemm_helper.hpp"
+#include "nvfp4_woq_bf16_mainloop.hpp"
 #include "nvfp4_woq_mxfp8_mainloop.hpp"
 
 using namespace cute;
@@ -98,25 +102,25 @@ struct NvFp4WoqTypes {
   // (expert, subgroup) on each launch. SG_N=64 is bit-exact and deterministic on
   // the same shape. Do not narrow N without re-running that case.
   //
-  // SG_M stays at 32 because the register budget forbids more, not for want of
-  // trying. The conversion:MMA ratio is exactly 1/SG_M (changing BLK_M at fixed
-  // SG_M cancels out), so SG_M is the only knob on emulation overhead — but at
-  // SG_M=64 the accumulator alone is SG_M*SG_N/16 = 256 floats = 1 KB/lane,
-  // which is the whole 256-GRF budget this kernel is compiled with. Measured on
-  // E=2, M/g=64, N=128, K=256 (WoQ kernel time; MXFP8 baseline 16.5-16.9 ms
-  // across runs, i.e. ~1-2% run-to-run noise):
+  // CRI uses CUTLASS's grf_size<512> launch setting. IGC reports that mode as
+  // 256 physical 64-byte GRFs (16 KiB per thread). SG_M=64 would consume all
+  // 256 physical GRFs with its FP32 accumulator alone, so the mainloop still
+  // spills despite requesting CRI's maximum register mode.
   //
-  //   <256,256,64> 8x4  SG_M=32  no spills   29.9   <- kept
-  //   <256,256,64> 4x4  SG_M=64  308 spills  33.0   (+10%)
+  // CRI simulator, E=2, N=256, K=64 (CUTLASS GPU_Clock):
+  //   SG_M=32: decode 0.0485 ms, prefill 0.0504 ms
+  //   SG_M=64: decode 0.1004 ms, prefill 0.1016 ms
+  //
+  // Keep SG_M=32 while retaining the explicit CRI launch setting.
+  // Current IGC output:
+  //   SG_M=32: 12,928-byte spill,  8,171 instructions
+  //   SG_M=64: 19,840-byte spill, 10,434 instructions
+  // Historical larger-shape timings:
+  //
+  //   <256,256,64> 8x4  SG_M=32              29.9
+  //   <256,256,64> 4x4  SG_M=64  308 spills  33.0
   //   <512,256,64> 8x4  SG_M=64  309 spills  41.1   (+38%, also 2x the tile)
   //   <256,256,64> 8x4  + Stages=3           30.0   (within noise)
-  //
-  // Halving the conversion work did not pay for the spills. Raising SG_M needs
-  // 512-GRF mode first, which is not a kernel parameter: CUTLASS's
-  // GemmUniversalAdapter::run hard-codes kernel_properties{sub_group_size<16>}
-  // with no grf_size, so it needs either a hand-rolled launch here or an opt-in
-  // hook upstream. Worth doing — at SG_M=64 the 512-tile variant was already
-  // 1.45x more efficient per MMA instruction despite spilling.
   using TileShape    = Shape<_256, _256, _64>;
   using ThreadLayout = cute::Layout<cute::Shape<cute::_8, cute::_4, cute::_1>,
                                     cute::Stride<cute::_4, cute::_1, cute::_0>>;
@@ -177,6 +181,39 @@ struct NvFp4WoqTypes {
 
 using Gemm = NvFp4WoqTypes::Gemm;
 using GemmKernel = Gemm::GemmKernel;
+
+template <class GemmAdapter>
+cutlass::Status run_large_grf(
+    GemmAdapter const& gemm_op,
+    sycl::queue& queue) {
+  using Kernel = typename GemmAdapter::GemmKernel;
+  auto params = gemm_op.params();
+  compat::dim3 const block = Kernel::get_block_shape();
+  compat::dim3 const grid = Kernel::get_grid_shape(params);
+  constexpr int smem_size = Kernel::SharedStorageSize;
+
+  namespace syclex = sycl::ext::oneapi::experimental;
+  namespace intelex = sycl::ext::intel::experimental;
+  compat::experimental::launch_properties launch_props{
+      syclex::work_group_scratch_size(smem_size)};
+  compat::experimental::kernel_properties kernel_props{
+      syclex::sub_group_size<16>, intelex::grf_size<512>};
+  compat::experimental::launch_policy policy{
+      grid, block, launch_props, kernel_props};
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto event = compat::experimental::launch<
+      cutlass::device_kernel<Kernel>,
+      Kernel>(policy, queue, params);
+  EventManager::getInstance().addEvent(event);
+#else
+  compat::experimental::launch<
+      cutlass::device_kernel<Kernel>,
+      Kernel,
+      false>(policy, queue, params);
+#endif
+  return cutlass::Status::kSuccess;
+}
 
 /// Launch the grouped GEMM. All pointer arrays are device-resident.
 void run_nvfp4_woq_gemm(
@@ -269,8 +306,175 @@ void run_nvfp4_woq_gemm(
               "nvfp4_woq_mxfp8_scaled_grouped_mm: workspace insufficient, need ", workspace_size, " bytes");
   TORCH_CHECK(gemm_op.initialize(gemm_args, workspace.data_ptr()) == cutlass::Status::kSuccess,
               "nvfp4_woq_mxfp8_scaled_grouped_mm: failed to initialize");
-  TORCH_CHECK(gemm_op.run(&queue) == cutlass::Status::kSuccess,
+  TORCH_CHECK(run_large_grf(gemm_op, queue) == cutlass::Status::kSuccess,
               "nvfp4_woq_mxfp8_scaled_grouped_mm: failed to run");
+}
+
+// NVFP4-B x BF16-A: B is converted and scaled to BF16 in registers, then a
+// regular BF16 DPAS performs the matrix multiply with FP32 accumulation.
+struct NvFp4WoqBf16Types {
+  using ElementInputA = cutlass::bfloat16_t;
+  using ElementInputB = cutlass::float_e2m1_t;
+  using ElementScale = uint8_t;
+  using ElementMult = cutlass::bfloat16_t;
+  using ElementAccumulator = float;
+  using ElementComputeEpilogue = float;
+  using ElementOutput = float;
+
+  using LayoutA = cutlass::layout::RowMajor;
+  using LayoutB = cutlass::layout::ColumnMajor;
+  using LayoutC = cutlass::layout::RowMajor;
+  using LayoutD = cutlass::layout::RowMajor;
+
+  // K=32 holds two NVFP4 scale groups and keeps the wider BF16 B fragment
+  // within the same register footprint as the K=64 MXFP8 path.
+  using TileShape = Shape<_256, _256, _32>;
+  using ThreadLayout = cute::Layout<cute::Shape<cute::_8, cute::_4, cute::_1>,
+                                    cute::Stride<cute::_4, cute::_1, cute::_0>>;
+  using TiledMma = typename cute::TiledMMAHelper<
+      cute::MMA_Atom<cute::XE_DPAS_TT<8, float, ElementInputA>>,
+      cute::Layout<TileShape>,
+      ThreadLayout>::TiledMMA;
+
+  static constexpr int PipelineStages = 2;
+  using GEMMDispatchPolicy =
+      sgl_xpu::MainloopXeNvFp4WoqBf16Group<PipelineStages>;
+  using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeXMX16Group;
+
+  using EpilogueOp = cutlass::epilogue::fusion::LinearCombination<
+      ElementOutput,
+      ElementComputeEpilogue,
+      ElementAccumulator,
+      ElementAccumulator,
+      cutlass::FloatRoundStyle::round_to_nearest>;
+  using FusionCallBacks = cutlass::epilogue::fusion::FusionCallbacks<
+      EpilogueDispatchPolicy,
+      EpilogueOp,
+      TileShape,
+      decltype(cute::tile_shape(TiledMma()))>;
+  using CollectiveEpilogue = cutlass::epilogue::collective::CollectiveEpilogue<
+      EpilogueDispatchPolicy,
+      TileShape,
+      ElementAccumulator,
+      cutlass::gemm::TagToStrideC_t<LayoutC*>,
+      ElementOutput,
+      cutlass::gemm::TagToStrideC_t<LayoutD*>,
+      FusionCallBacks,
+      XE_2D_U32x8x16_LD_N,
+      void,
+      void,
+      XE_2D_U32x8x16_ST_N,
+      void,
+      void>;
+  using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+      GEMMDispatchPolicy,
+      TileShape,
+      ElementInputA,
+      cutlass::gemm::TagToStrideA_t<LayoutA*>,
+      ElementInputB,
+      cutlass::gemm::TagToStrideB_t<LayoutB*>,
+      TiledMma,
+      void,
+      void,
+      void,
+      cute::identity,
+      void,
+      void,
+      void,
+      cute::identity>;
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      NvFp4GroupedProblemShape,
+      CollectiveMainloop,
+      CollectiveEpilogue,
+      cutlass::gemm::GroupScheduler>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+  using StrideA = typename GemmKernel::InternalStrideA;
+  using StrideB = typename GemmKernel::InternalStrideB;
+  using StrideC = typename GemmKernel::InternalStrideC;
+  using StrideD = typename GemmKernel::InternalStrideD;
+};
+
+void run_nvfp4_woq_bf16_gemm(
+    int num_groups,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& ptr_table,  // {4, E}: a, b, out, sfmx
+    const torch::Tensor& cb_ptrs,
+    const torch::Tensor& cb_ld,
+    const torch::Tensor& workspace,
+    at::Device device) {
+  using Types = NvFp4WoqBf16Types;
+  using Bf16Gemm = Types::Gemm;
+  using Bf16GemmKernel = Types::GemmKernel;
+
+  auto N_col = problem_sizes.select(1, 1);
+  auto K_col = problem_sizes.select(1, 2);
+  auto stride_A_dev = K_col.to(torch::kInt64).contiguous();
+  auto stride_B_dev = K_col.to(torch::kInt64).contiguous();
+  auto stride_CD_dev = N_col.to(torch::kInt64).contiguous();
+
+  cutlass::KernelHardwareInfo hw_info;
+  hw_info.device_id = static_cast<int>(device.index());
+  hw_info.sm_count =
+      cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+
+  auto stream = at::xpu::getCurrentXPUStream(device.index());
+  sycl::queue& queue = stream.queue();
+
+  typename Bf16Gemm::Arguments arguments;
+  decltype(arguments.epilogue.thread) fusion_args;
+  fusion_args.alpha = 1.0f;
+  fusion_args.beta = 0.0f;
+  fusion_args.alpha_ptr = nullptr;
+  fusion_args.beta_ptr = nullptr;
+  fusion_args.alpha_ptr_array = nullptr;
+  fusion_args.beta_ptr_array = nullptr;
+  fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
+  fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
+
+  using RasterOrderOptions = typename cutlass::gemm::kernel::detail::
+      PersistentTileSchedulerXeGroup<NvFp4GroupedProblemShape>::RasterOrderOptions;
+  auto row = [&](int i) { return ptr_table[i].data_ptr(); };
+
+  typename Bf16GemmKernel::Arguments gemm_args{
+      cutlass::gemm::GemmUniversalMode::kGrouped,
+      typename Bf16GemmKernel::ProblemShape{
+          num_groups,
+          reinterpret_cast<NvFp4UnderlyingProblemShapeType*>(
+              problem_sizes.data_ptr<int32_t>()),
+          nullptr},
+      typename Bf16GemmKernel::MainloopArguments{
+          reinterpret_cast<Types::ElementInputA const**>(row(0)),
+          reinterpret_cast<Types::StrideA*>(stride_A_dev.data_ptr<int64_t>()),
+          reinterpret_cast<Types::ElementInputB const**>(row(1)),
+          reinterpret_cast<Types::StrideB*>(stride_B_dev.data_ptr<int64_t>()),
+          reinterpret_cast<Types::ElementScale const**>(row(3)),
+          reinterpret_cast<Types::ElementMult const**>(cb_ptrs.data_ptr()),
+          cb_ld.data_ptr<int64_t>()},
+      typename Bf16GemmKernel::EpilogueArguments{
+          fusion_args,
+          reinterpret_cast<Types::ElementOutput const**>(row(2)),
+          reinterpret_cast<Types::StrideC*>(stride_CD_dev.data_ptr<int64_t>()),
+          reinterpret_cast<Types::ElementOutput**>(row(2)),
+          reinterpret_cast<Types::StrideD*>(stride_CD_dev.data_ptr<int64_t>())},
+      hw_info,
+      typename Bf16GemmKernel::TileSchedulerArguments{
+          1, RasterOrderOptions::AlongN}};
+
+  Bf16Gemm gemm_op;
+  const size_t workspace_size = Bf16Gemm::get_workspace_size(gemm_args);
+  TORCH_CHECK(
+      static_cast<size_t>(workspace.numel()) >= workspace_size,
+      "nvfp4_woq_bf16_grouped_mm: workspace insufficient, need ",
+      workspace_size,
+      " bytes");
+  TORCH_CHECK(
+      gemm_op.initialize(gemm_args, workspace.data_ptr()) ==
+          cutlass::Status::kSuccess,
+      "nvfp4_woq_bf16_grouped_mm: failed to initialize");
+  TORCH_CHECK(
+      gemm_op.run(&queue) == cutlass::Status::kSuccess,
+      "nvfp4_woq_bf16_grouped_mm: failed to run");
 }
 
 }  // namespace at::native::xpu
@@ -391,4 +595,116 @@ void nvfp4_woq_mxfp8_scaled_grouped_mm(
   at::native::xpu::run_nvfp4_woq_gemm(
       E, problem_sizes, ptr_table, cb_ptrs.contiguous(), cb_ld,
       static_cast<int>(scales_a_t.stride(1)), workspace, device);
+}
+
+class NvFp4WoqBf16BuildPointers;
+
+void nvfp4_woq_bf16_grouped_mm(
+    torch::Tensor& output,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& sfmx_b,
+    const torch::Tensor& c_b,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& workspace) {
+  using Types = at::native::xpu::NvFp4WoqBf16Types;
+  constexpr int BLK_K = cute::get<2>(Types::TileShape{});
+
+  TORCH_CHECK(a.device().is_xpu(), "nvfp4_woq_bf16: A must be on XPU");
+  TORCH_CHECK(b.device().is_xpu(), "nvfp4_woq_bf16: B must be on XPU");
+  TORCH_CHECK(output.device().is_xpu(), "nvfp4_woq_bf16: output must be on XPU");
+  TORCH_CHECK(workspace.device().is_xpu(), "nvfp4_woq_bf16: workspace must be on XPU");
+  TORCH_CHECK(a.scalar_type() == torch::kBFloat16, "nvfp4_woq_bf16: A must be bfloat16");
+  TORCH_CHECK(b.scalar_type() == torch::kUInt8, "nvfp4_woq_bf16: B must be uint8 (packed E2M1)");
+  TORCH_CHECK(sfmx_b.scalar_type() == torch::kUInt8, "nvfp4_woq_bf16: sfmx_b must be uint8 (UE8M0)");
+  TORCH_CHECK(c_b.scalar_type() == torch::kBFloat16, "nvfp4_woq_bf16: c_b must be bfloat16");
+  TORCH_CHECK(output.scalar_type() == torch::kFloat32, "nvfp4_woq_bf16: output must be float32");
+  TORCH_CHECK(a.dim() == 2, "nvfp4_woq_bf16: A must be flat 2D (sum_m, K)");
+  TORCH_CHECK(output.dim() == 2, "nvfp4_woq_bf16: output must be flat 2D (sum_m, N)");
+  TORCH_CHECK(b.dim() == 3, "nvfp4_woq_bf16: B must be 3D (E, N, K/2)");
+  TORCH_CHECK(sfmx_b.dim() == 3, "nvfp4_woq_bf16: sfmx_b must be 3D (E, K/32, N)");
+  TORCH_CHECK(c_b.dim() == 3, "nvfp4_woq_bf16: c_b must be 3D (E, N, K/16)");
+  TORCH_CHECK(
+      a.is_contiguous() && b.is_contiguous() && sfmx_b.is_contiguous() &&
+          c_b.is_contiguous() && output.is_contiguous(),
+      "nvfp4_woq_bf16: all tensors must be contiguous");
+  TORCH_CHECK(
+      problem_sizes.dim() == 2 && problem_sizes.size(1) == 3,
+      "nvfp4_woq_bf16: problem_sizes must be (E, 3) int32");
+  TORCH_CHECK(
+      problem_sizes.scalar_type() == torch::kInt32 &&
+          expert_offsets.scalar_type() == torch::kInt32,
+      "nvfp4_woq_bf16: problem_sizes / expert_offsets must be int32");
+
+  const int E = static_cast<int>(expert_offsets.size(0));
+  const int K = static_cast<int>(a.size(1));
+  const int N = static_cast<int>(output.size(1));
+  TORCH_CHECK(E > 0, "nvfp4_woq_bf16: expert count must be positive");
+  TORCH_CHECK(
+      problem_sizes.size(0) == E,
+      "nvfp4_woq_bf16: problem_sizes / expert_offsets expert mismatch");
+  TORCH_CHECK(
+      output.size(0) == a.size(0),
+      "nvfp4_woq_bf16: A and output flat row counts must match");
+  TORCH_CHECK(
+      K % BLK_K == 0,
+      "nvfp4_woq_bf16: K must be a multiple of ",
+      BLK_K,
+      " (got ",
+      K,
+      ")");
+  TORCH_CHECK(
+      b.size(0) == E && b.size(1) == N && b.size(2) == K / 2,
+      "nvfp4_woq_bf16: B must be (E, N, K/2)");
+  TORCH_CHECK(
+      sfmx_b.size(0) == E && sfmx_b.size(1) == K / 32 &&
+          sfmx_b.size(2) == N,
+      "nvfp4_woq_bf16: sfmx_b must be (E, K/32, N)");
+  TORCH_CHECK(
+      c_b.size(0) == E && c_b.size(1) == N && c_b.size(2) == K / 16,
+      "nvfp4_woq_bf16: c_b must be (E, N, K/16)");
+
+  auto device = a.device();
+  auto opts_i64 = torch::TensorOptions().dtype(torch::kInt64).device(device);
+  auto ptr_table = torch::empty({4, E}, opts_i64);
+
+  const int32_t* offsets_ptr = expert_offsets.data_ptr<int32_t>();
+  int64_t* ptrs = ptr_table.data_ptr<int64_t>();
+  const int64_t a_base = reinterpret_cast<int64_t>(a.data_ptr());
+  const int64_t b_base = reinterpret_cast<int64_t>(b.data_ptr());
+  const int64_t out_base = reinterpret_cast<int64_t>(output.data_ptr());
+  const int64_t sfmx_base = reinterpret_cast<int64_t>(sfmx_b.data_ptr());
+  const int64_t a_row_bytes = static_cast<int64_t>(K) * a.element_size();
+  const int64_t out_row_bytes = static_cast<int64_t>(N) * output.element_size();
+  const int64_t b_expert_bytes = b.stride(0) * b.element_size();
+  const int64_t sfmx_expert_bytes = sfmx_b.stride(0) * sfmx_b.element_size();
+
+  auto& queue = at::xpu::getCurrentXPUStream(device.index()).queue();
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<NvFp4WoqBf16BuildPointers>(
+        sycl::range<1>(static_cast<size_t>(E)), [=](sycl::id<1> id) {
+          const int e = static_cast<int>(id[0]);
+          const int64_t row = static_cast<int64_t>(offsets_ptr[e]);
+          ptrs[0 * E + e] = a_base + row * a_row_bytes;
+          ptrs[1 * E + e] = b_base + static_cast<int64_t>(e) * b_expert_bytes;
+          ptrs[2 * E + e] = out_base + row * out_row_bytes;
+          ptrs[3 * E + e] =
+              sfmx_base + static_cast<int64_t>(e) * sfmx_expert_bytes;
+        });
+  });
+
+  auto cb_ptrs =
+      torch::arange(E, opts_i64) * (c_b.stride(0) * c_b.element_size()) +
+      reinterpret_cast<int64_t>(c_b.data_ptr());
+  auto cb_ld =
+      torch::full({E}, static_cast<int64_t>(c_b.stride(1)), opts_i64);
+  at::native::xpu::run_nvfp4_woq_bf16_gemm(
+      E,
+      problem_sizes,
+      ptr_table,
+      cb_ptrs.contiguous(),
+      cb_ld,
+      workspace,
+      device);
 }

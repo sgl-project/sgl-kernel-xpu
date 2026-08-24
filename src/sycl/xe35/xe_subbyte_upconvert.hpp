@@ -46,6 +46,7 @@
 // clang-format off
 #include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/experimental/float_8bit/types.hpp>
+#include <sycl/ext/oneapi/experimental/float_4bit/types.hpp>
 
 #include <cute/tensor.hpp>
 #include <cute/algorithm/reorder.hpp>
@@ -106,23 +107,6 @@ pack_selected_nibbles(uint64_t bytes, int nibble_shift) {
   return static_cast<uint32_t>(x | (x >> 16));
 }
 
-/// Decode one E2M1 code to binary16 without invoking CUTLASS's scalar
-/// conversion machinery. Positive codes are {0, .5, 1, 1.5, 2, 3, 4, 6};
-/// the high bit is the sign, including signed zero.
-CUTLASS_DEVICE _Float16
-e2m1_to_half(uint32_t code) {
-  const uint16_t magnitude = static_cast<uint16_t>(code & 0x7);
-  const uint16_t nonzero_mask = static_cast<uint16_t>(
-      -static_cast<int16_t>(magnitude != 0));
-  const uint16_t mantissa_mask = static_cast<uint16_t>(
-      -static_cast<int16_t>(magnitude > 1));
-  const uint16_t bits =
-      static_cast<uint16_t>((code & 0x8) << 12) |
-      (static_cast<uint16_t>(((magnitude >> 1) + 14) << 10) & nonzero_mask) |
-      (static_cast<uint16_t>((magnitude & 1) << 9) & mantissa_mask);
-  return sycl::bit_cast<_Float16>(bits);
-}
-
 template <class Dst, class Scale>
 CUTLASS_DEVICE void
 convert_native_e2m1x8(
@@ -141,6 +125,10 @@ convert_native_e2m1x8(
   // every value that can survive E4M3 rounding.
   CUTLASS_PRAGMA_UNROLL
   for (int pair = 0; pair < 4; ++pair) {
+    sycl::detail::fp4_uint8_vec1 packed_pair{
+        static_cast<uint8_t>(packed >> (8 * pair))};
+    auto decoded =
+        __builtin_spirv_ConvertE2M1ToFP16INTEL(packed_pair);
     sycl::detail::float16_vec2 scaled;
     CUTLASS_PRAGMA_UNROLL
     for (int j = 0; j < 2; ++j) {
@@ -150,8 +138,7 @@ convert_native_e2m1x8(
       const int q = parity + 2 * c;
       const int dst_idx = p + 4 * q + 32 * r + 128 * s;
       scaled[j] = static_cast<_Float16>(
-          static_cast<float>(detail::e2m1_to_half(
-              (packed >> (4 * local)) & 0xf)) * scale(dst_idx));
+          static_cast<float>(decoded[j]) * scale(dst_idx));
     }
 
     auto converted = __builtin_spirv_ClampConvertFP16ToE4M3INTEL(scaled);

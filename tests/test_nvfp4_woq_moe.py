@@ -22,6 +22,7 @@ from nvfp4_utils import (
     NVFP4_BLOCK_SIZE,
     dequantize_mxfp8,
     dequantize_nvfp4,
+    dequantize_nvfp4_via_bf16_prepared,
     dequantize_nvfp4_via_mxfp8,
     e2m1_lut,
     nvfp4_to_mxfp8_ref,
@@ -34,6 +35,18 @@ from nvfp4_utils import (
 LONG_TESTS = os.getenv("LONG_TESTS") == "1"
 
 WORKSPACE_BYTES = 64 * 1024 * 1024
+
+
+def test_compute_mode_environment(monkeypatch):
+    from sgl_kernel.cutlass_moe import _nvfp4_woq_compute_mode
+
+    monkeypatch.delenv("SGLANG_NVFP4_WOQ_COMPUTE", raising=False)
+    assert _nvfp4_woq_compute_mode() == "mxfp8"
+    monkeypatch.setenv("SGLANG_NVFP4_WOQ_COMPUTE", " BF16 ")
+    assert _nvfp4_woq_compute_mode() == "bf16"
+    monkeypatch.setenv("SGLANG_NVFP4_WOQ_COMPUTE", "invalid")
+    with pytest.raises(ValueError, match="must be 'mxfp8' or 'bf16'"):
+        _nvfp4_woq_compute_mode()
 
 
 def is_xpu_available() -> bool:
@@ -125,9 +138,9 @@ def test_nvfp4_roundtrip_on_grid():
     lut = e2m1_lut()
     torch.manual_seed(0)
     x = lut[torch.randint(0, 16, (8, 64))] * 0.25
+    x.reshape(8, 4, NVFP4_BLOCK_SIZE)[:, :, 0] = 1.5
     q, sf, gs = quantize_nvfp4(x)
-    # amax = 1.5 -> gs = 2688/1.5 = 1792, sf = 448 (exact in E4M3) for every
-    # block that contains a +-6 entry.
+    # amax = 1.5 -> gs = 2688/1.5 = 1792, sf = 448 (exact in E4M3).
     assert torch.equal(sf.float(), torch.full_like(sf.float(), 448.0))
     assert torch.equal(dequantize_nvfp4(q, sf, gs), x)
 
@@ -256,6 +269,75 @@ def test_fused_woq_matches_host_requantized_mxfp8(ms, n, k):
     )
 
 
+def test_bf16_gemm_covers_all_e2m1_codes():
+    """Every nibble and packed-byte position must reach the right BF16 lane."""
+    skip_if_no_cri()
+    from sgl_kernel import nvfp4_woq_bf16_grouped_mm
+
+    dev = "xpu"
+    e, m, n, k = 1, 32, 64, 32
+    codes = torch.arange(n * k, dtype=torch.uint8).remainder(16).reshape(n, k)
+    packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).unsqueeze(0).to(dev)
+    a = torch.eye(m, k, dtype=torch.bfloat16, device=dev)
+    c_b = torch.ones((e, n, k // 16), dtype=torch.bfloat16, device=dev)
+    sfmx_b = torch.full((e, k // 32, n), 127, dtype=torch.uint8, device=dev)
+    problem_sizes, expert_offsets = make_grouped_layout([m], n, k, dev)
+    workspace = torch.empty((WORKSPACE_BYTES,), dtype=torch.uint8, device=dev)
+    out = torch.zeros((m, n), dtype=torch.float32, device=dev)
+
+    nvfp4_woq_bf16_grouped_mm(
+        out, a, packed, sfmx_b, c_b, problem_sizes, expert_offsets, workspace
+    )
+    torch.xpu.synchronize()
+    expected = e2m1_lut()[codes.long()].T.float()
+    assert torch.equal(out.cpu(), expected)
+
+
+@pytest.mark.parametrize(
+    "ms,n,k",
+    [
+        ([32, 96], 128, 256),
+        ([33, 31], 192, 64),
+        ([1, 7], 128, 32),
+        pytest.param(
+            [64, 64],
+            128,
+            1024,
+            marks=pytest.mark.skipif(not LONG_TESTS, reason="set LONG_TESTS=1"),
+        ),
+    ],
+)
+def test_bf16_grouped_gemm_matches_direct_dequant(ms, n, k):
+    skip_if_no_cri()
+    from sgl_kernel import nvfp4_woq_bf16_grouped_mm, nvfp4_woq_prep
+
+    dev = "xpu"
+    m_total = sum(ms)
+    packed, sf, gs_dq, _ = make_nvfp4_weights(len(ms), n, k, dev, seed=21)
+    torch.manual_seed(22)
+    a_cpu = (torch.randn(m_total, k) * 0.5).to(torch.bfloat16)
+    a = a_cpu.to(dev)
+    c_b, sfmx_b = nvfp4_woq_prep(sf, gs_dq)
+    problem_sizes, expert_offsets = make_grouped_layout(ms, n, k, dev)
+    workspace = torch.empty((WORKSPACE_BYTES,), dtype=torch.uint8, device=dev)
+    out = torch.zeros((m_total, n), dtype=torch.float32, device=dev)
+
+    nvfp4_woq_bf16_grouped_mm(
+        out, a, packed, sfmx_b, c_b, problem_sizes, expert_offsets, workspace
+    )
+    torch.xpu.synchronize()
+
+    weights = dequantize_nvfp4_via_bf16_prepared(packed.cpu(), c_b.cpu(), sfmx_b.cpu())
+    ref = torch.zeros((m_total, n), dtype=torch.float32)
+    start = 0
+    for expert, expert_m in enumerate(ms):
+        ref[start : start + expert_m] = (
+            a_cpu[start : start + expert_m].float() @ weights[expert].float().T
+        )
+        start += expert_m
+    torch.testing.assert_close(out.cpu(), ref, rtol=0.02, atol=0.02)
+
+
 def test_unaligned_scale_stride_is_rejected():
     """Shapes whose per-expert B-scale slice isn't 64-byte aligned must raise.
 
@@ -288,7 +370,7 @@ def test_unaligned_scale_stride_is_rejected():
 # ---------------------------------------------------------------------------
 
 
-def _moe_reference(a, w1_eff, w2_eff, topk_weights, topk_ids, n_inter):
+def _moe_reference(a, w1_eff, w2_eff, topk_weights, topk_ids, n_inter, mode):
     """Fused-MoE reference over already-dequantized (emulated) weights.
 
     Mirrors the kernel path: MXFP8-quantize the activations, SiLU-and-mul in the
@@ -296,7 +378,10 @@ def _moe_reference(a, w1_eff, w2_eff, topk_weights, topk_ids, n_inter):
     """
     m, _ = a.shape
     dt = a.dtype
-    a_dq = dequantize_mxfp8(*quantize_mxfp8(a.float()))
+    if mode == "bf16":
+        a_dq = a.to(torch.bfloat16).float()
+    else:
+        a_dq = dequantize_mxfp8(*quantize_mxfp8(a.float()))
     out = torch.zeros(m, w2_eff.shape[1], dtype=torch.float32)
     for t in range(m):
         for j in range(topk_ids.shape[1]):
@@ -304,15 +389,32 @@ def _moe_reference(a, w1_eff, w2_eff, topk_weights, topk_ids, n_inter):
             h = a_dq[t] @ w1_eff[e].T
             gate, up = h[:n_inter], h[n_inter:]
             inter = torch.nn.functional.silu(gate.to(dt).float()) * up.to(dt).float()
-            inter_dq = dequantize_mxfp8(*quantize_mxfp8(inter.unsqueeze(0).to(dt).float()))[0]
+            if mode == "bf16":
+                inter_dq = inter.to(torch.bfloat16).float()
+            else:
+                inter_dq = dequantize_mxfp8(
+                    *quantize_mxfp8(inter.unsqueeze(0).to(dt).float())
+                )[0]
             out[t] += float(topk_weights[t, j]) * (inter_dq @ w2_eff[e].T)
     return out
 
 
-def test_fused_experts_nvfp4_woq():
+@pytest.mark.parametrize("mode", ["mxfp8", "bf16"])
+def test_fused_experts_nvfp4_woq(mode, monkeypatch):
     """End-to-end MoE with NVFP4 weights through the fused WoQ path."""
     skip_if_no_cri()
     from sgl_kernel import cutlass_fused_experts_nvfp4_woq, nvfp4_woq_prepare_weights
+    import sgl_kernel.cutlass_moe as cutlass_moe
+
+    monkeypatch.setenv("SGLANG_NVFP4_WOQ_COMPUTE", mode)
+    if mode == "bf16":
+
+        def unexpected_quantization(*args, **kwargs):
+            raise AssertionError("BF16 dispatch must not quantize activations to MXFP8")
+
+        monkeypatch.setattr(
+            cutlass_moe, "_per_token_group_quant_mxfp8", unexpected_quantization
+        )
 
     dev = "xpu"
     dt = torch.bfloat16
@@ -331,13 +433,31 @@ def test_fused_experts_nvfp4_woq():
     )
     torch.xpu.synchronize()
 
-    w1_eff = torch.stack(
-        [dequantize_nvfp4_via_mxfp8(w1_q[i].cpu(), w1_sf[i].cpu(), w1_gs[i].cpu()) for i in range(e)]
-    )
-    w2_eff = torch.stack(
-        [dequantize_nvfp4_via_mxfp8(w2_q[i].cpu(), w2_sf[i].cpu(), w2_gs[i].cpu()) for i in range(e)]
-    )
-    ref = _moe_reference(a, w1_eff, w2_eff, topk_weights, topk_ids, n_inter)
+    if mode == "bf16":
+        w1_eff = dequantize_nvfp4_via_bf16_prepared(
+            w1_q.cpu(), prepared["w1_c"].cpu(), prepared["w1_sfmx"].cpu()
+        ).float()
+        w2_eff = dequantize_nvfp4_via_bf16_prepared(
+            w2_q.cpu(), prepared["w2_c"].cpu(), prepared["w2_sfmx"].cpu()
+        ).float()
+    else:
+        w1_eff = torch.stack(
+            [
+                dequantize_nvfp4_via_mxfp8(
+                    w1_q[i].cpu(), w1_sf[i].cpu(), w1_gs[i].cpu()
+                )
+                for i in range(e)
+            ]
+        )
+        w2_eff = torch.stack(
+            [
+                dequantize_nvfp4_via_mxfp8(
+                    w2_q[i].cpu(), w2_sf[i].cpu(), w2_gs[i].cpu()
+                )
+                for i in range(e)
+            ]
+        )
+    ref = _moe_reference(a, w1_eff, w2_eff, topk_weights, topk_ids, n_inter, mode)
 
     rel = ((out.float().cpu() - ref).norm() / ref.norm()).item()
     # Residual is BF16 output rounding plus accumulation order; the requantization

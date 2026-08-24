@@ -71,6 +71,7 @@ from sgl_kernel.mhc import (
     mhc_pre,
 )
 from sgl_kernel.nvfp4 import (
+    nvfp4_woq_bf16_grouped_mm,
     nvfp4_woq_mxfp8_scaled_grouped_mm,
     nvfp4_woq_prep,
 )

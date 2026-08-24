@@ -248,6 +248,29 @@ def nvfp4_to_mxfp8_ref(
     return scaled.to(torch.float8_e4m3fn), sfmx
 
 
+def dequantize_nvfp4_via_bf16_prepared(
+    q: torch.Tensor,
+    c: torch.Tensor,
+    sfmx: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Direct-BF16 reference using the prepared ``(c, sfmx)`` scale pair.
+
+    ``sfmx`` uses the device layout ``(..., K/32, N)``. The BF16 mainloop
+    reconstructs the full per-16 multiplier, converts E2M1 exactly to BF16,
+    and rounds the scaled value back to BF16 before DPAS.
+    """
+    nibbles = unpack_nvfp4(q).long()
+    vals = e2m1_lut(device=q.device, dtype=torch.bfloat16)[nibbles]
+    k = vals.shape[-1]
+    kexp = sfmx.transpose(-1, -2).to(torch.int32) - UE8M0_BIAS
+    full_scale = (c.float() * torch.exp2(kexp.float()).repeat_interleave(2, dim=-1)).to(
+        torch.bfloat16
+    )
+    blocks = vals.reshape(*vals.shape[:-1], k // NVFP4_BLOCK_SIZE, NVFP4_BLOCK_SIZE)
+    return (blocks * full_scale.unsqueeze(-1)).reshape(*vals.shape).to(dtype)
+
+
 def dequantize_nvfp4_via_mxfp8(
     q: torch.Tensor,
     sf16: torch.Tensor,

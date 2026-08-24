@@ -3,8 +3,9 @@
 Xe3P has no native NVFP4 MMA — the ``bdpas`` block-scaled instruction only
 accepts UE8M0 scale factors with a fixed block size of 32, while NVFP4 uses
 E4M3 scale factors with block size 16 plus one FP32 per-tensor global scale.
-NVFP4 weights are therefore emulated: dequantize to BF16, requantize to MXFP8,
-then run a normal MXFP8 block-scaled GEMM.
+NVFP4 weights can therefore be emulated either by requantizing to MXFP8 or by
+dequantizing directly into a BF16 MMA fragment. Both paths leave the packed
+4-bit payload in memory.
 
 ``nvfp4_woq_prep`` rewrites only the scales into the ``(c, sfmx)`` pair consumed
 by the fused WoQ mainloop, which keeps the 4-bit payload in memory and
@@ -97,4 +98,40 @@ def nvfp4_woq_mxfp8_scaled_grouped_mm(
     ), "nvfp4_woq_mxfp8_scaled_grouped_mm is only supported on CRI (Xe3P) devices"
     torch.ops.sgl_kernel.nvfp4_woq_mxfp8_scaled_grouped_mm.default(
         output, a, b, scales_a, sfmx_b, c_b, problem_sizes, expert_offsets, workspace
+    )
+
+
+def nvfp4_woq_bf16_grouped_mm(
+    output: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    sfmx_b: torch.Tensor,
+    c_b: torch.Tensor,
+    problem_sizes: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    workspace: torch.Tensor,
+) -> None:
+    """NVFP4 weight-only-quantized BF16 grouped GEMM (Xe3P / CRI only).
+
+    Activations remain BF16. Packed E2M1 weights are converted and multiplied
+    by their reconstructed per-16 BF16 scale inside the mainloop, then consumed
+    by BF16 DPAS with FP32 accumulation.
+
+    Args:
+        output: (sum_m, N) float32, ragged over experts.
+        a: (sum_m, K) bfloat16 activations.
+        b: (E, N, K/2) uint8 packed E2M1 weights.
+        sfmx_b: (E, K/32, N) uint8 prepared exponent component.
+        c_b: (E, N, K/16) bfloat16 prepared multiplier component.
+        problem_sizes: (E, 3) int32 per-expert (M, N, K).
+        expert_offsets: (E,) int32 cumulative row starts.
+        workspace: uint8 scratch for the grouped GEMM.
+    """
+    from sgl_kernel import is_xe3_arch
+
+    assert (
+        is_xe3_arch()
+    ), "nvfp4_woq_bf16_grouped_mm is only supported on CRI (Xe3P) devices"
+    torch.ops.sgl_kernel.nvfp4_woq_bf16_grouped_mm.default(
+        output, a, b, sfmx_b, c_b, problem_sizes, expert_offsets, workspace
     )

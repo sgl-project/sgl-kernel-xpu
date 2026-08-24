@@ -118,7 +118,16 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} --offload-compress)
 
   set(SYCL_OFFLINE_COMPILER_CG_OPTIONS "${SYCL_OFFLINE_COMPILER_CG_OPTIONS} -options -cl-poison-unsupported-fp64-kernels")
-  set(SYCL_OFFLINE_COMPILER_CG_OPTIONS "${SYCL_OFFLINE_COMPILER_CG_OPTIONS} -options -cl-intel-enable-auto-large-GRF-mode")
+  # Default GRF (thread register file) mode. IGC's auto heuristic only ever
+  # chooses between the 128-GRF default and the 256-GRF large mode. Kept in its
+  # own variable so a translation unit can substitute a different mode; see
+  # SYCL_GRF_MODE_512_OPTION and XE35_LARGE_GRF_KERNELS in src/BuildOnLinux.cmake.
+  set(SYCL_GRF_MODE_OPTION "-options -cl-intel-enable-auto-large-GRF-mode")
+  # Xe3P (CRI) additionally has a 512-GRF thread mode. It cannot be requested
+  # from the kernel: the SYCL ext::intel::experimental::grf_size<512> property is
+  # accepted by the header but dropped before SPIR-V, so it never reaches IGC.
+  set(SYCL_GRF_MODE_512_OPTION "-options -cl-intel-512-GRF-per-thread")
+  set(SYCL_OFFLINE_COMPILER_CG_OPTIONS "${SYCL_OFFLINE_COMPILER_CG_OPTIONS} ${SYCL_GRF_MODE_OPTION}")
   set(SYCL_OFFLINE_COMPILER_CG_OPTIONS "${SYCL_OFFLINE_COMPILER_CG_OPTIONS} -options -cl-fp32-correctly-rounded-divide-sqrt")
   set(SYCL_OFFLINE_COMPILER_CG_OPTIONS "${SYCL_OFFLINE_COMPILER_CG_OPTIONS} -options -cl-intel-greater-than-4GB-buffer-required")
 

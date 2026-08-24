@@ -78,12 +78,63 @@ endif()
 if(DPCPP_SYCL_TARGET MATCHES "cri")
   set(XE35_OFFLINE_COMPILER_AOT_OPTIONS "-device cri")
   set(XE35_OFFLINE_COMPILER_FLAGS "${XE35_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
+
+  # GEMM kernels get a different GRF (thread register file) mode from the rest.
+  #
+  # A GEMM mainloop holds a large FP32 accumulator live across the whole k-loop,
+  # plus operand fragments and any dequant/scale state, so it spills in the
+  # 256-GRF large mode that IGC's auto heuristic picks. CRI has a 512-GRF thread
+  # mode that removes those spills. Element-wise and other latency-bound kernels
+  # keep the original auto-large-GRF flags: they carry little live state and would
+  # rather have the threads-per-EU that 512 GRF halves. Element-wise kernels are
+  # built by the "common kernels" loop above, which is left untouched.
+  #
+  # Measured on the NVFP4 WoQ mainloops (IGC asm dumps, k-tile loop body):
+  #
+  #                    256 GRF (auto)              512 GRF
+  #   MXFP8 WoQ    12,736 B spill, 651 sends    no spill, 114 sends
+  #   BF16  WoQ     7,296 B spill, 300 sends    no spill, 104 sends
+  #
+  # The sends removed are scratch-memory spill/fill traffic in the innermost loop.
+  #
+  # Matched against the source basename (no extension) so that the generated
+  # instantiation TUs (GroupGemm*_inst_xe35__*, sgemm_lora_a_fwd_kernel_*) are
+  # covered along with their parent kernel. Attention (flash_attention*,
+  # mla_decode_*) is intentionally excluded: it is register-heavy too, but it is
+  # occupancy-sensitive and separately tuned, so it needs its own measurement
+  # before being moved.
+  set(XE35_GEMM_KERNEL_PATTERNS
+      "^blockwise_moe_"              # MoE grouped GEMMs (mxfp4, mxfp8, nvfp4_woq)
+      "_gemm$"                       # dsv3_fused_a_gemm, dsv3_router_gemm, fp8_blockwise_gemm
+      "^fp8_scaled_mm$"
+      "^GroupGemm"                   # GroupGemm, GroupGemmMxfp4W4A16 + generated instantiations
+      "^sgemm_lora_a_fwd_kernel_")   # LoRA A-projection GEMM instantiations
+  string(REPLACE
+      "${SYCL_GRF_MODE_OPTION}" "${SYCL_GRF_MODE_512_OPTION}"
+      XE35_CG_OPTIONS_GEMM "${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
+  set(XE35_OFFLINE_COMPILER_FLAGS_GEMM
+      "${XE35_OFFLINE_COMPILER_AOT_OPTIONS}${XE35_CG_OPTIONS_GEMM}")
+
   foreach(sycl_src ${ATen_XPU_SYCL_XE35})
     get_filename_component(name ${sycl_src} NAME_WLE REALPATH)
     set(sycl_lib sgl-ops-sycl-${name})
+    set(_xe35_is_gemm FALSE)
+    foreach(_pat ${XE35_GEMM_KERNEL_PATTERNS})
+      if(name MATCHES "${_pat}")
+        set(_xe35_is_gemm TRUE)
+        break()
+      endif()
+    endforeach()
+    if(_xe35_is_gemm)
+      set(_xe35_offline_flags "${XE35_OFFLINE_COMPILER_FLAGS_GEMM}")
+      list(APPEND XE35_GEMM_512GRF_KERNELS ${name})
+    else()
+      set(_xe35_offline_flags "${XE35_OFFLINE_COMPILER_FLAGS}")
+      list(APPEND XE35_DEFAULT_GRF_KERNELS ${name})
+    endif()
     sycl_add_library(
       ${sycl_lib}
-      ${XE35_OFFLINE_COMPILER_FLAGS}
+      ${_xe35_offline_flags}
       ${COMMON_DEVICE_LINK_FLAGS}
       SHARED
       SYCL_SOURCES ${sycl_src})
@@ -97,6 +148,11 @@ if(DPCPP_SYCL_TARGET MATCHES "cri")
       BUILD_WITH_INSTALL_RPATH TRUE
     )
   endforeach()
+  list(LENGTH XE35_GEMM_512GRF_KERNELS _n_gemm)
+  list(LENGTH XE35_DEFAULT_GRF_KERNELS _n_other)
+  message(STATUS "CRI GRF modes: ${_n_gemm} GEMM kernels at 512 GRF, "
+                 "${_n_other} kernels at default auto-large-GRF")
+  message(STATUS "CRI default-GRF kernels: ${XE35_DEFAULT_GRF_KERNELS}")
 endif()
 
 # xe40 kernels (JGS only)

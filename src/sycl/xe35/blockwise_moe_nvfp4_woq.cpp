@@ -93,7 +93,7 @@ struct NvFp4WoqTypes {
   using GmemTiledCopyScaleA = void;
   using GmemTiledCopyScaleB = void;
 
-  // 256x256x64 with an 8x4 subgroup layout gives SG_M=32, SG_N=64, SG_K=64.
+  // 256x256x64 with a 4x4 subgroup layout gives SG_M=64, SG_N=64, SG_K=64.
   //
   // SG_N must stay at 64. With SG_N=32 the block-scaled scale copy narrows to
   // MXFP_SCALE_LOAD_2D<8, H, 32, 32> (scale_traits_num = 1), a configuration the
@@ -102,27 +102,52 @@ struct NvFp4WoqTypes {
   // (expert, subgroup) on each launch. SG_N=64 is bit-exact and deterministic on
   // the same shape. Do not narrow N without re-running that case.
   //
-  // CRI uses CUTLASS's grf_size<512> launch setting. IGC reports that mode as
-  // 256 physical 64-byte GRFs (16 KiB per thread). SG_M=64 would consume all
-  // 256 physical GRFs with its FP32 accumulator alone, so the mainloop still
-  // spills despite requesting CRI's maximum register mode.
+  // GRF budget. The grf_size<512> in run_large_grf below is a no-op: that SYCL
+  // property is dropped before SPIR-V, so it never reaches IGC (the sibling
+  // sub_group_size<16> does survive, as !intel_reqd_sub_group_size). The thread
+  // register file is selected by the build instead — this TU is listed in
+  // XE35_GEMM_KERNEL_PATTERNS (src/BuildOnLinux.cmake), which compiles it with
+  // -cl-intel-512-GRF-per-thread; IGC's auto-large-GRF heuristic used elsewhere
+  // only ever picks 128 or 256.
   //
-  // CRI simulator, E=2, N=256, K=64 (CUTLASS GPU_Clock):
-  //   SG_M=32: decode 0.0485 ms, prefill 0.0504 ms
-  //   SG_M=64: decode 0.1004 ms, prefill 0.1016 ms
+  // At 512 GRF this mainloop no longer spills (verified in the IGC asm dump:
+  // no `.spill size`, RA drops from GRAPH_COLORING_SPILL_FF_BC_RA to
+  // GRAPH_COLORING_FF_BC_RA, and sends in the k-tile body fall 651 -> 114).
+  // Measured effect on the grouped GEMM, device time, E=2 N=1536 K=2048 M=1024:
+  // 4669 us -> 3720 us.
   //
-  // Keep SG_M=32 while retaining the explicit CRI launch setting.
-  // Current IGC output:
-  //   SG_M=32: 12,928-byte spill,  8,171 instructions
-  //   SG_M=64: 19,840-byte spill, 10,434 instructions
-  // Historical larger-shape timings:
+  // SG_M=64 is what 512 GRF buys. The B operand is dequantized and requantized
+  // per subgroup, so that cost is paid once per SG_M rows of A: doubling SG_M
+  // halves the conversion work per MAC. At 256 GRF the 64x64 FP32 accumulator
+  // alone (256 GRFs) filled the budget, which is why every earlier attempt at
+  // SG_M=64 spilled and lost. At 512 GRF none of these variants spill, and
+  // SG_M=64 via 4x4 wins. Grouped-GEMM device time, N=1536 K=2048 unless noted:
   //
+  //                              8x4 <256,..>   8x4 <512,..>   4x4 <256,..>
+  //                                 SG_M=32       SG_M=64        SG_M=64
+  //   E=2 m/g=512                    3719 us       3895 us      2972 us  -20%
+  //   E=2 m/g=1750                  11103        [ 7742 ]       8866     -20%
+  //   E=2 m/g=512 N=2048 K=768       1434         1597          1228     -14%
+  //   E=8 m/g=64                     7420         7711          5913     -20%
+  //   E=8 m/g=8                      7420         7707          5912     -20%
+  //
+  // 4x4 keeps BLK_M at 256; the 8x4 <512,...> column doubles it, which only pays
+  // off at large per-expert M (bracketed) and wastes most of the tile at decode
+  // sizes, where B conversion is charged for rows that do not exist.
+  //
+  // Superseded numbers, all taken at 256 GRF while spilling -- kept only so they
+  // are not re-derived as evidence against SG_M=64:
+  //   CRI simulator, E=2, N=256, K=64 (CUTLASS GPU_Clock)
+  //     SG_M=32: decode 0.0485 ms, prefill 0.0504 ms
+  //     SG_M=64: decode 0.1004 ms, prefill 0.1016 ms
+  //   IGC output: SG_M=32 12,928-byte spill / 8,171 instr
+  //               SG_M=64 19,840-byte spill / 10,434 instr
   //   <256,256,64> 8x4  SG_M=32              29.9
   //   <256,256,64> 4x4  SG_M=64  308 spills  33.0
-  //   <512,256,64> 8x4  SG_M=64  309 spills  41.1   (+38%, also 2x the tile)
+  //   <512,256,64> 8x4  SG_M=64  309 spills  41.1
   //   <256,256,64> 8x4  + Stages=3           30.0   (within noise)
   using TileShape    = Shape<_256, _256, _64>;
-  using ThreadLayout = cute::Layout<cute::Shape<cute::_8, cute::_4, cute::_1>,
+  using ThreadLayout = cute::Layout<cute::Shape<cute::_4, cute::_4, cute::_1>,
                                     cute::Stride<cute::_4, cute::_1, cute::_0>>;
 
   using TiledMma = typename cute::TiledMMAHelper<
@@ -328,6 +353,16 @@ struct NvFp4WoqBf16Types {
 
   // K=32 holds two NVFP4 scale groups and keeps the wider BF16 B fragment
   // within the same register footprint as the K=64 MXFP8 path.
+  //
+  // This path keeps SG_M=32 (8x4) even though the MXFP8 WoQ path above moved to
+  // SG_M=64. SG_M=64 was measured both ways here at 512 GRF and lost every time:
+  //   4x4 <256,256,32>  SG_M=64 : +36% (gemm1 M=1024 1225 -> 1667 us)
+  //   8x4 <512,256,32>  SG_M=64 : +47% (                  1225 -> 1802 us)
+  // Neither variant spills, so this is not register pressure. With BLK_K=32 this
+  // mainloop runs twice the k-iterations of the MXFP8 path for half the work
+  // each, which leaves it latency- rather than ALU-bound; halving the subgroups
+  // per workgroup (4x4) or doubling the tile (BLK_M=512) both cost more in
+  // latency hiding than the extra SG_M saves in B-conversion work.
   using TileShape = Shape<_256, _256, _32>;
   using ThreadLayout = cute::Layout<cute::Shape<cute::_8, cute::_4, cute::_1>,
                                     cute::Stride<cute::_4, cute::_1, cute::_0>>;

@@ -165,11 +165,12 @@ SGL_KERNEL_EXPORT void hc_post(
   TORCH_CHECK(residual.size(2) == D, "residual D mismatch");
 
   at::Tensor post_layer_mix_2d = post_layer_mix;
-  if (post_layer_mix.dim() == 3 && post_layer_mix.size(-1) == 1) {
-    post_layer_mix_2d = post_layer_mix.squeeze(-1);
+  if (post_layer_mix_2d.dim() == 3) {
+    TORCH_CHECK(post_layer_mix_2d.size(2) == 1, "post_layer_mix last dim must be 1 when rank=3");
+    post_layer_mix_2d = post_layer_mix_2d.squeeze(-1);
   }
 
-  TORCH_CHECK(post_layer_mix_2d.dim() == 2, "post_layer_mix must be 2D [T, HC]");
+  TORCH_CHECK(post_layer_mix_2d.dim() == 2, "post_layer_mix must be [T, HC] or [T, HC, 1]");
   TORCH_CHECK(post_layer_mix_2d.size(0) == T, "post_layer_mix T mismatch");
   TORCH_CHECK(post_layer_mix_2d.size(1) == 4, "post_layer_mix must have 4 elements (HC=4)");
 

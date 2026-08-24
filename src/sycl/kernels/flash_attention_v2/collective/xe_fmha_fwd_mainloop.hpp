@@ -38,6 +38,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "fmha_fusion.hpp"
+#include "fmha_relative_bias.hpp"
 
 #ifndef FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
 #define FMHA_PREFILL_ENABLE_SCORE_BLOCK2D 0
@@ -65,21 +66,8 @@ using namespace cute;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Relative bias is sheared by a preceding device kernel into a compact surface.
-// Keeping the band K-tile aligned makes every block-2D load surface legal.
-CUTLASS_HOST_DEVICE constexpr int rel_bias_band_cols(int rel_extent, int k_tile) {
-  return (rel_extent + k_tile - 1) / k_tile * k_tile;
-}
-
-CUTLASS_HOST_DEVICE constexpr int rel_bias_padded_cols(int rel_extent, int q_tile, int k_tile) {
-  return rel_bias_band_cols(rel_extent, k_tile) + q_tile + k_tile;
-}
-
-CUTLASS_HOST_DEVICE constexpr int rel_bias_col_origin(int row_kv_first, int rel_extent, int k_tile) {
-  int const left = row_kv_first - rel_bias_band_cols(rel_extent, k_tile) + 1;
-  int const q = left / k_tile;
-  return ((left % k_tile != 0 && left < 0) ? q - 1 : q) * k_tile;
-}
+// The sheared relative-bias surface (rel_bias_band_cols / rel_bias_padded_cols /
+// rel_bias_col_origin) and its producer contract live in fmha_relative_bias.hpp.
 
 ///////////////////////////////////////////////////////////////////////////////////////////////
 

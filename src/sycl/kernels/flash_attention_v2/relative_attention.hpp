@@ -4,7 +4,7 @@
 #include <c10/xpu/XPUStream.h>
 #include <sycl/sycl.hpp>
 
-#include "sycl/kernels/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp"
+#include "sycl/kernels/flash_attention_v2/collective/fmha_relative_bias.hpp"
 
 namespace flash_attention_v2::relative_attention {
 

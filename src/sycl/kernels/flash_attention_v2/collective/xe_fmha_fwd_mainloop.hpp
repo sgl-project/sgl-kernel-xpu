@@ -310,6 +310,7 @@ struct FMHAFwdMainloop<
       TiledMMAQK const& mma_qk,
       int seq_len_kv_cache,
       int q_head,
+      int bias_head_start,
       int q_token_offset,
       QVCoord const& blk_qv,
       int thr_id,
@@ -318,25 +319,43 @@ struct FMHAFwdMainloop<
       constexpr ElementS kLog2e = ElementS(1.4426950408889634074);
       constexpr int k_tile = get<1>(TileShapeQK{});
       constexpr int q_tile = get<0>(TileShapeQK{});
-      int const row_kv_first = get<0>(blk_qv) * q_tile + full_tile_offset;
+      int const row_kv_first = PackGQA ? full_tile_offset : get<0>(blk_qv) * q_tile + full_tile_offset;
       int const bias_col = K * k_tile - rel_bias_col_origin(row_kv_first, params.rel_bias_extent, k_tile);
       int const bias_cols = static_cast<int>(params.rel_bias_head_stride);
       if (bias_col < 0 || bias_col >= bias_cols) return;
 
-      int const bias_rows = seq_len_kv_cache - full_tile_offset;
-      auto surface_shape = make_shape(q_token_offset + bias_rows, (q_head + 1) * bias_cols);
-      auto surface_layout = make_layout(surface_shape, make_stride(params.rel_bias_token_stride, Int<1>{}));
-      Tensor Bias = make_tensor(make_gmem_ptr(params.ptr_rel_bias), surface_layout);
-      Tensor cBias = domain_offset(
-          make_coord(q_token_offset, q_head * bias_cols), make_identity_tensor(make_shape(bias_rows, bias_cols)));
-      Tensor gBias = local_tile(cBias, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), _));
-      auto copy_bias_load = make_block_2d_copy_C(mma_qk, Bias);
-      auto thr_copy_bias_load = copy_bias_load.get_slice(thr_id);
-      auto tBiasLoadG = thr_copy_bias_load.partition_S(gBias);
-      auto tBiasLoadR = thr_copy_bias_load.partition_sg_fragment_D(gBias(_, _, 0));
       auto bias = make_subgroup_tensor(make_fragment_like<ElementQ>(scores.layout()), scores.tv_layout());
-      copy(copy_bias_load, tBiasLoadG(_, _, _, bias_col / k_tile), tBiasLoadR);
-      reorder(tBiasLoadR, bias);
+      if constexpr (PackGQA) {
+        // Decode packs query heads along M. Flatten [token, head] into the
+        // surface row so the block copy reads each query head's own bias.
+        int const num_heads = params.rel_bias_token_stride / params.rel_bias_head_stride;
+        int const bias_row = q_token_offset * num_heads + bias_head_start;
+        auto surface_shape = make_shape(bias_row + q_tile, bias_cols);
+        auto surface_layout = make_layout(surface_shape, make_stride(params.rel_bias_head_stride, Int<1>{}));
+        Tensor Bias = make_tensor(make_gmem_ptr(params.ptr_rel_bias), surface_layout);
+        Tensor cBias = domain_offset(make_coord(bias_row, 0), make_identity_tensor(make_shape(q_tile, bias_cols)));
+        Tensor gBias = local_tile(cBias, take<0, 2>(TileShapeQK{}), make_coord(0, _));
+        auto copy_bias_load = make_block_2d_copy_C(mma_qk, Bias);
+        auto thr_copy_bias_load = copy_bias_load.get_slice(thr_id);
+        auto tBiasLoadG = thr_copy_bias_load.partition_S(gBias);
+        auto tBiasLoadR = thr_copy_bias_load.partition_sg_fragment_D(gBias(_, _, 0));
+        copy(copy_bias_load, tBiasLoadG(_, _, _, bias_col / k_tile), tBiasLoadR);
+        reorder(tBiasLoadR, bias);
+      } else {
+        int const bias_rows = seq_len_kv_cache - full_tile_offset;
+        auto surface_shape = make_shape(q_token_offset + bias_rows, (q_head + q_tile) * bias_cols);
+        auto surface_layout = make_layout(surface_shape, make_stride(params.rel_bias_token_stride, Int<1>{}));
+        Tensor Bias = make_tensor(make_gmem_ptr(params.ptr_rel_bias), surface_layout);
+        Tensor cBias = domain_offset(
+            make_coord(q_token_offset, q_head * bias_cols), make_identity_tensor(make_shape(bias_rows, bias_cols)));
+        Tensor gBias = local_tile(cBias, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), _));
+        auto copy_bias_load = make_block_2d_copy_C(mma_qk, Bias);
+        auto thr_copy_bias_load = copy_bias_load.get_slice(thr_id);
+        auto tBiasLoadG = thr_copy_bias_load.partition_S(gBias);
+        auto tBiasLoadR = thr_copy_bias_load.partition_sg_fragment_D(gBias(_, _, 0));
+        copy(copy_bias_load, tBiasLoadG(_, _, _, bias_col / k_tile), tBiasLoadR);
+        reorder(tBiasLoadR, bias);
+      }
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < scores.size(); ++i) {
         ElementS const scaled_bias = kLog2e * static_cast<ElementS>(bias(i));
@@ -364,6 +383,7 @@ struct FMHAFwdMainloop<
       int seq_len_kv_cache,
       int l_coord,
       int q_head,
+      int bias_head_start,
       int q_token_offset,
       int full_tile_offset,
       int discard_seq_coord,
@@ -715,7 +735,17 @@ struct FMHAFwdMainloop<
       // original scale for the next K tile.
       ElementS score_scale = qk_scale;
       apply_relative_bias(
-          tSrS, K, score_scale, mma_qk, seq_len_kv_cache, q_head, q_token_offset, blk_qv, thr_id, full_tile_offset);
+          tSrS,
+          K,
+          score_scale,
+          mma_qk,
+          seq_len_kv_cache,
+          q_head,
+          bias_head_start,
+          q_token_offset,
+          blk_qv,
+          thr_id,
+          full_tile_offset);
       /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
       auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, score_scale);
       reorder(tSrS, tArP);
@@ -816,7 +846,8 @@ template <
     class TiledCopyQ_ = void,  // Optional TiledCopy for loading Q
     class TiledCopyK_ = void,  // Optional TiledCopy for loading K
     class TiledCopyV_ = void,  // Optional TiledCopy for loading V
-    bool LocalMask_ = false>
+    bool LocalMask_ = false,
+    bool HasRelBias_ = false>
 struct DecodeFwdMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -834,7 +865,8 @@ template <
     class TiledCopyQ_,
     class TiledCopyK_,
     class TiledCopyV_,
-    bool LocalMask_>
+    bool LocalMask_,
+    bool HasRelBias_>
 struct DecodeFwdMainloop<
     XeDefault<Stages>,
     PagedKV_,
@@ -848,7 +880,8 @@ struct DecodeFwdMainloop<
     TiledCopyQ_,
     TiledCopyK_,
     TiledCopyV_,
-    LocalMask_> {
+    LocalMask_,
+    HasRelBias_> {
   //
   // Type Aliases
   //
@@ -910,6 +943,9 @@ struct DecodeFwdMainloop<
   static constexpr bool CausalMask = CausalMask_;
   static constexpr bool Fp8KV = is_any_of_v<ElementK, float_e5m2_t, float_e4m3_t>;
   static constexpr bool LocalMask = LocalMask_;
+  static constexpr bool HasRelBias = HasRelBias_;
+  static_assert(!HasRelBias || get<1>(TileShapeQK{}) % 8 == 0, "relative bias requires a 16B surface pitch");
+  static_assert(!HasRelBias || 2 * get<1>(TileShapeQK{}) >= 32, "relative bias requires a 64B minimum surface width");
 
   // User-facing arguments
   struct Arguments {
@@ -922,6 +958,9 @@ struct DecodeFwdMainloop<
     // Local Mask
     int window_size_left;
     int window_size_right;
+    ElementQ const* ptr_rel_bias = nullptr;
+    int64_t rel_bias_row_stride = 0;
+    int rel_bias_extent = 0;
   };
 
   // Kernel-facing parameters
@@ -948,11 +987,58 @@ struct DecodeFwdMainloop<
         args.max_pages_per_seq,
         args.total_seqlen_kv,
         args.window_size_left,
-        args.window_size_right};
+        args.window_size_right,
+        args.ptr_rel_bias,
+        args.rel_bias_row_stride,
+        args.rel_bias_extent};
   }
 
-  CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
+  CUTLASS_HOST_DEVICE static bool can_implement(Arguments const& args) {
+    if constexpr (HasRelBias) {
+      constexpr int k_tile = get<1>(TileShapeQK{});
+      if (args.ptr_rel_bias == nullptr || args.rel_bias_extent <= 0) return false;
+      if (args.rel_bias_row_stride != rel_bias_padded_cols(args.rel_bias_extent, /*m_drift=*/0, k_tile)) return false;
+    }
     return true;
+  }
+
+  template <typename QVCoord>
+  CUTLASS_DEVICE void apply_relative_bias(
+      FragS& scores,
+      int K,
+      ElementS& score_scale,
+      TiledMMAQK const& mma_qk,
+      int row_kv,
+      int bias_row_base,
+      QVCoord const& blk_qv,
+      int thr_id) const {
+    if constexpr (HasRelBias) {
+      constexpr ElementS kLog2e = ElementS(1.4426950408889634074);
+      constexpr int k_tile = get<1>(TileShapeQK{});
+      constexpr int m_tile = get<0>(TileShapeQK{});
+      int const bias_cols = static_cast<int>(params.rel_bias_row_stride);
+      int const bias_col = K * k_tile - rel_bias_col_origin(row_kv, params.rel_bias_extent, k_tile);
+      if (bias_col < 0 || bias_col >= bias_cols) return;
+
+      int const row_base = bias_row_base + get<0>(blk_qv) * m_tile;
+      auto surface_shape = make_shape(row_base + m_tile, bias_cols);
+      auto surface_layout = make_layout(surface_shape, make_stride(params.rel_bias_row_stride, Int<1>{}));
+      Tensor Bias = make_tensor(make_gmem_ptr(params.ptr_rel_bias), surface_layout);
+      Tensor cBias = domain_offset(make_coord(row_base, 0), make_identity_tensor(make_shape(m_tile, bias_cols)));
+      Tensor gBias = local_tile(cBias, take<0, 2>(TileShapeQK{}), make_coord(0, _));
+      auto copy_bias_load = make_block_2d_copy_C(mma_qk, Bias);
+      auto thr_copy_bias_load = copy_bias_load.get_slice(thr_id);
+      auto tBiasLoadG = thr_copy_bias_load.partition_S(gBias);
+      auto tBiasLoadR = thr_copy_bias_load.partition_sg_fragment_D(gBias(_, _, 0));
+      auto bias = make_subgroup_tensor(make_fragment_like<ElementQ>(scores.layout()), scores.tv_layout());
+      copy(copy_bias_load, tBiasLoadG(_, _, _, bias_col / k_tile), tBiasLoadR);
+      reorder(tBiasLoadR, bias);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < scores.size(); ++i) {
+        scores(i) = sycl::mad(score_scale, scores(i), kLog2e * static_cast<ElementS>(bias(i)));
+      }
+      score_scale = ElementS(1);
+    }
   }
 
   template <typename QVCoord>
@@ -972,7 +1058,8 @@ struct DecodeFwdMainloop<
       int seq_len,
       int full_tile_offset,
       int discard_seq_coord,
-      float scale_k = 1.0f) {  // FP8 K per-tensor dequant scale (applied in GEMM1)
+      float scale_k = 1.0f,  // FP8 K per-tensor dequant scale (applied in GEMM1)
+      int bias_row_base = 0) {
     using namespace sycl::ext::oneapi::this_work_item;
 
     // Short dimension names:
@@ -1158,8 +1245,13 @@ struct DecodeFwdMainloop<
         }
       }
 
-      /* Apply softmax and scaling */
-      softmax(K == 0, tSrS, tA_max, tA_sum, tArA, qk_scale);
+      if constexpr (HasRelBias) {
+        ElementS block_scale = qk_scale;
+        apply_relative_bias(tSrS, K, block_scale, mma_qk, seq_len - 1, bias_row_base, blk_qv, thr_id);
+        softmax(K == 0, tSrS, tA_max, tA_sum, tArA, block_scale);
+      } else {
+        softmax(K == 0, tSrS, tA_max, tA_sum, tArA, qk_scale);
+      }
       reorder(tSrS, tArP);
 
       /* GEMM 2: A += P * V, split in v dimension */

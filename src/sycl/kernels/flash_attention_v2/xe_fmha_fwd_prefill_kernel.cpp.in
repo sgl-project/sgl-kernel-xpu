@@ -53,6 +53,34 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
   using SubgroupLayoutQK =
       cute::Layout<cute::Shape<cute::Int<@NUM_SG@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
 
+  // softmax_lse output is only threaded as a template constexpr for the base
+  // (non-causal / non-local / non-sink) configuration, matching the paged
+  // cascade-attention use case. All other mask combinations keep the always-off
+  // LSE path (LSE is not written).
+  if (params.return_softmax_lse) {
+    TORCH_CHECK(
+        !params.is_causal && !params.is_local && !use_sink,
+        "return_softmax_lse is only supported without causal/local/sink masking");
+    using Element = @ELEM_TYPE@;
+    FMHAConfig<
+        false,
+        false,
+        false,
+        /*LSE=*/true,
+        TileShapeQK,
+        TileShapePV,
+        TileShapeOutput,
+        SubgroupLayoutQK,
+        void,
+        2,
+        false,
+        Element,
+        Element,
+        Element,
+        Element>::run_paged(params);
+    return;
+  }
+
 #if @HEAD_DIM@ == 64
   AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
@@ -63,6 +91,7 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
               Causal,
               LocalMask,
               Sink,
+              /*LSE=*/false,
               TileShapeQK,
               TileShapePV,
               TileShapeOutput,
@@ -89,6 +118,7 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
             Causal,
             LocalMask,
             false,
+            /*LSE=*/false,
             TileShapeQK,
             TileShapePV,
             TileShapeOutput,

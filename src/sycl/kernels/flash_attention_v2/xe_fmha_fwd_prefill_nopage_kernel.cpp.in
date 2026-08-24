@@ -66,6 +66,7 @@ __attribute__((visibility("default"))) void FmhaPrefillNpRunner<@HEAD_DIM@, @ELE
           Causal,
           LocalMask,
           false,
+          /*LSE=*/false,
           TileShapeQK,
           TileShapePV,
           TileShapeOutput,

@@ -2336,13 +2336,20 @@ if EXTENDED_KVCACHE_TESTS:
         )
 
     @pytest.mark.skipif(
-        not is_fa3_supported(),
-        reason="flash_attn at sgl-kernel is only supported on BMG and later",
+        device.type != "xpu" or not is_fa3_supported(),
+        reason="large ScoreBlock2D workspace coverage is only supported on BMG XPU",
     )
     @pytest.mark.parametrize(
         "batch_size,nheads_q,nheads_kv,seqlen_q,seqlen_k",
         [
             (1, 16, 2, 32768, 32768),
+            # These all require the 1 GiB score workspace cap to slice a
+            # 32K x 32K HD512 problem.
+            (4, 16, 2, 32768, 32768),
+            (1, 32, 4, 32768, 32768),
+            (8, 8, 1, 32768, 32768),
+            (32, 4, 1, 32768, 32768),
+            (4, 8, 2, 32768, 32768),
             # Non-paged HD512 uses 32 Q tiles per head. Q-tile chunking keeps
             # one query head sufficient to cover BMG (20 Xe-cores) without a
             # 4 GiB score buffer.

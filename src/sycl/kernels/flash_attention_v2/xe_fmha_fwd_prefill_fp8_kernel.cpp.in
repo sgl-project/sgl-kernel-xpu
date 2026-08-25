@@ -11,17 +11,19 @@
 // the (bf16/fp16) paged prefill TU low.
 #define SYCL_INTEL_TARGET 20
 
+#include "sycl/kernels/flash_attention_v2/fmha_tile_dispatch.h"
 #include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_runner.hpp"
 
 namespace prefill {
 
 template <>
 __attribute__((visibility("default"))) void FmhaPrefillFp8Runner<@HEAD_DIM@, @ELEM_TYPE@>::operator()(const Arguments& params) const {
-  using TileShapeQK = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_KV@>, cute::_32>;
-  using TileShapePV = cute::Shape<cute::Int<@TILED_Q@>, cute::_32, cute::Int<@TILED_KV@>>;
-  using TileShapeOutput = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_OUT@>>;
+  constexpr auto kTile = sgl::fmha::prefill_paged_tile(@HEAD_DIM@);
+  using TileShapeQK = cute::Shape<cute::Int<kTile.tiled_q>, cute::Int<kTile.tiled_kv>, cute::_32>;
+  using TileShapePV = cute::Shape<cute::Int<kTile.tiled_q>, cute::_32, cute::Int<kTile.tiled_kv>>;
+  using TileShapeOutput = cute::Shape<cute::Int<kTile.tiled_q>, cute::Int<sgl::fmha::prefill_tiled_out(@HEAD_DIM@)>>;
   using SubgroupLayoutQK =
-      cute::Layout<cute::Shape<cute::Int<@NUM_SG@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+      cute::Layout<cute::Shape<cute::Int<kTile.num_sg>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
 
   // FP8 KV cache: Q is bf16 or fp16, K/V cache are fp8 (e4m3 or e5m2). The
   // mainloop dequantizes K/V with the per-tensor k_scale/v_scale (Fp8KV path).

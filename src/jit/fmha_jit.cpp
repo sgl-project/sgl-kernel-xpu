@@ -6,6 +6,7 @@
 
 #include "jit/jit_arch.h"
 #include "jit/sycl_template_jit.h"
+#include "sycl/kernels/flash_attention_v2/fmha_tile_dispatch.h"
 
 namespace sgl {
 namespace fmha_jit {
@@ -61,12 +62,6 @@ uint64_t pack_key(int arch, DecodeOp op, int qg, int hd, int ps, bool is_fp16) {
 std::mutex g_mu;
 std::unordered_map<uint64_t, KernelFn> g_fns;  // O(1) hot-path cache
 
-// Non-paged decode KV-tile constant. Mirrors FMHADecodeXe20.cmake
-// (FMHA_DECODE_TILED_KV_NP_*): 512 for head_dim <= 192, 128 for 256/512.
-int decode_tiled_kv_np(int hd) {
-  return hd >= 256 ? 128 : 512;
-}
-
 // Resolve (compiling on first use) the kernel entry for a config.
 KernelFn resolve(DecodeOp op, int qg, int hd, int ps, bool is_fp16, int arch, std::string* err) {
   const uint64_t key = pack_key(arch, op, qg, hd, ps, is_fp16);
@@ -96,7 +91,7 @@ KernelFn resolve(DecodeOp op, int qg, int hd, int ps, bool is_fp16, int arch, st
     spec.subs["PAGE_SIZE"] = std::to_string(ps);
   } else {
     // Non-paged decode has no page size; it uses an independent KV tile.
-    spec.subs["TILED_KV_NP"] = std::to_string(decode_tiled_kv_np(hd));
+    spec.subs["TILED_KV_NP"] = std::to_string(sgl::fmha::decode_tiled_kv_np(hd));
   }
   spec.subs["ELEM_TYPE"] = is_fp16 ? "cutlass::half_t" : "cutlass::bfloat16_t";
   spec.subs["ELEM_TAG"] = is_fp16 ? "fp16" : "bf16";
@@ -120,77 +115,9 @@ KernelFn resolve(DecodeOp op, int qg, int hd, int ps, bool is_fp16, int arch, st
 }
 
 // ---------------------------------------------------------------------------
-// Prefill: dispatch on head dim only; per-head-dim tile params mirror
-// FMHAPrefillXe20.cmake (kept in sync by hand).
+// Prefill: dispatch on head dim only; per-head-dim tile params come from the
+// shared fmha_tile_dispatch.h (single source of truth with the AOT templates).
 // ---------------------------------------------------------------------------
-
-struct PrefillTile {
-  int tiled_q;
-  int tiled_kv;
-  int num_sg;
-};
-
-int round32(int hd) {
-  return ((hd + 31) / 32) * 32;
-}
-
-// Paged / fp8 prefill tile params. Returns false for an unsupported head dim.
-bool paged_prefill_tile(int hd, PrefillTile* t) {
-  switch (hd) {
-    case 64:
-      *t = {128, 64, 8};
-      return true;
-    case 96:
-      *t = {128, 64, 8};
-      return true;
-    case 128:
-      *t = {256, 32, 16};
-      return true;
-    case 192:
-      *t = {256, 64, 32};
-      return true;
-    case 256:
-      *t = {256, 64, 32};
-      return true;
-    case 512:
-      *t = {256, 64, 32};
-      return true;
-    default:
-      return false;
-  }
-}
-
-// Non-paged prefill tile params.
-bool nopage_prefill_tile(int hd, PrefillTile* t) {
-  switch (hd) {
-    case 64:
-      *t = {128, 64, 8};
-      return true;
-    case 72:
-      *t = {256, 64, 16};
-      return true;
-    case 80:
-      *t = {256, 64, 16};
-      return true;
-    case 96:
-      *t = {256, 64, 16};
-      return true;
-    case 128:
-      *t = {256, 32, 16};
-      return true;
-    case 192:
-      *t = {256, 32, 16};
-      return true;
-    case 256:
-      *t = {128, 64, 16};
-      return true;
-    case 512:
-      *t = {128, 128, 16};
-      return true;
-    default:
-      return false;
-  }
-}
 
 const char* prefill_template_file(PrefillOp op) {
   switch (op) {
@@ -249,13 +176,12 @@ KernelFn resolve_prefill(PrefillOp op, int hd, bool is_fp16, int arch, std::stri
   // fp8 prefill is bf16-query only.
   const bool fp16 = (op == PrefillOp::kPrefillFp8) ? false : is_fp16;
 
-  PrefillTile tile;
-  const bool ok = nopage ? nopage_prefill_tile(hd, &tile) : paged_prefill_tile(hd, &tile);
-  if (!ok) {
+  const sgl::fmha::PrefillTile tile = nopage ? sgl::fmha::prefill_nopage_tile(hd) : sgl::fmha::prefill_paged_tile(hd);
+  if (!tile.ok) {
     if (err) *err = "FMHA prefill JIT: unsupported head dim " + std::to_string(hd);
     return nullptr;
   }
-  const int tiled_out = (hd == 512) ? 256 : round32(hd);
+  const int tiled_out = sgl::fmha::prefill_tiled_out(hd);
   const int enable_score_block2d = (hd == 512) ? 1 : 0;
 
   jit::CompileSpec spec;

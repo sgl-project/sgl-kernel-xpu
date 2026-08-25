@@ -42,6 +42,7 @@
 #define FMHA_PREFILL_ENABLE_SCORE_BLOCK2D 1
 #endif
 
+#include "sycl/kernels/flash_attention_v2/fmha_tile_dispatch.h"
 #include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_runner.hpp"
 
 namespace prefill {
@@ -53,11 +54,12 @@ __attribute__((visibility("default"))) void FmhaPrefillNpRunner<@HEAD_DIM@, @ELE
   TORCH_CHECK(
       params.softmax_sink_ptr == nullptr,
       "No-page attention does not support sink logits (softmax_sink_ptr must be null)");
-  using TileShapeQK = cute::Shape<cute::Int<@TILED_Q_NP@>, cute::Int<@TILED_KV_NP@>, cute::_32>;
-  using TileShapePV = cute::Shape<cute::Int<@TILED_Q_NP@>, cute::_32, cute::Int<@TILED_KV_NP@>>;
-  using TileShapeOutput = cute::Shape<cute::Int<@TILED_Q_NP@>, cute::Int<@TILED_OUT_NP@>>;
+  constexpr auto kTile = sgl::fmha::prefill_nopage_tile(@HEAD_DIM@);
+  using TileShapeQK = cute::Shape<cute::Int<kTile.tiled_q>, cute::Int<kTile.tiled_kv>, cute::_32>;
+  using TileShapePV = cute::Shape<cute::Int<kTile.tiled_q>, cute::_32, cute::Int<kTile.tiled_kv>>;
+  using TileShapeOutput = cute::Shape<cute::Int<kTile.tiled_q>, cute::Int<sgl::fmha::prefill_tiled_out(@HEAD_DIM@)>>;
   using SubgroupLayoutQK = cute::
-      Layout<cute::Shape<cute::Int<@NUM_SG_NP@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+      Layout<cute::Shape<cute::Int<kTile.num_sg>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
   if (params.return_softmax_lse) {
     TORCH_CHECK(
         !params.is_causal && !params.is_local,

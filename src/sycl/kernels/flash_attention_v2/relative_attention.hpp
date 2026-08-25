@@ -2,6 +2,7 @@
 
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
+
 #include <sycl/sycl.hpp>
 
 #include "sycl/kernels/flash_attention_v2/collective/fmha_relative_bias.hpp"

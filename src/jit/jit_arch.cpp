@@ -21,5 +21,15 @@ const ArchProfile& arch_profile(Arch a) {
   }
 }
 
+ArchSpec arch_spec(Arch a, const std::string& base_macro) {
+  const ArchProfile& prof = arch_profile(a);
+  ArchSpec s;
+  s.extra_flags.push_back(base_macro);
+  if (!prof.macro.empty()) s.extra_flags.push_back("-D" + prof.macro);
+  s.target = prof.target;
+  s.suffix = prof.suffix;
+  return s;
+}
+
 }  // namespace jit
 }  // namespace sgl

@@ -10,6 +10,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace sgl {
 namespace jit {
@@ -32,6 +33,18 @@ struct ArchProfile {
 
 // Profile for `a`. Unknown/unspecified archs fall back to BMG.
 const ArchProfile& arch_profile(Arch a);
+
+// Per-arch compile inputs for a kernel whose JIT entry is gated by `base_macro`
+// (e.g. "-DSGL_FMHA_JIT_ENTRY"): the CompileSpec extra_flags, -fsycl-targets
+// value, and the name suffix. Centralizes the arch_profile plumbing shared by
+// every op's resolve().
+struct ArchSpec {
+  std::vector<std::string> extra_flags;  // base_macro, plus the arch macro if any
+  std::string target;                    // -fsycl-targets value (may be empty)
+  std::string suffix;                    // name tag (e.g. "bmg")
+};
+
+ArchSpec arch_spec(Arch a, const std::string& base_macro);
 
 }  // namespace jit
 }  // namespace sgl

@@ -6,6 +6,7 @@
 
 #include "jit/jit_arch.h"
 #include "jit/sycl_template_jit.h"
+#include "sycl/kernels/moe/xe20/bf16/grouped_gemm_dispatch.h"
 
 namespace sgl {
 namespace moe_jit {
@@ -33,33 +34,19 @@ struct TileCfg {
   const char* sglayout;
 };
 
-// (tile, subgroup layout) pairs, matching src/sycl/GroupGemmXe20.cpp.
-const TileCfg kTiles[7] = {
-    {"Shape<_8, _64, _32>", "Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>"},
-    {"Shape<_16, _64, _32>", "Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>"},
-    {"Shape<_32, _64, _32>", "Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>"},
-    {"Shape<_128, _64, _32>", "Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>"},
-    {"Shape<_128, _128, _32>", "Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>"},
-    {"Shape<_256, _64, _32>", "Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>"},
-    {"Shape<_256, _256, _32>", "Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>"},
-};
-
-// Mirror MOE_GROUPED_GEMM_SMALL_WEIGHT_THRESHOLD in src/sycl/Utils.h.
-constexpr int64_t kSmallWeightThreshold = int64_t(4096) * 4096;
-
-int select_tile(int avg_m, int gemm_k, int gemm_n, bool fuse_act) {
-  const bool small_weight = static_cast<int64_t>(gemm_k) * gemm_n <= kSmallWeightThreshold;
-  const bool narrow_k = gemm_k <= 256;
-  const bool narrow_n_fused = fuse_act && (gemm_n <= 512);
-
-  if (avg_m <= 8) return 0;
-  if (avg_m <= 16 && small_weight) return 1;
-  if (avg_m <= 32 && small_weight) return 2;
-  if (avg_m <= 128 && small_weight) return fuse_act ? 3 : 4;
-  if (narrow_k) return fuse_act ? 3 : 4;
-  if (narrow_n_fused) return 3;
-  return fuse_act ? 5 : 6;
-}
+// (tile, subgroup layout) strings generated from the SAME per-tile tokens the
+// AOT dispatcher (GroupGemmXe20.cpp) pastes into cute Shape<>/Layout<>. Both
+// sides consume sgl::moe::SGL_MOE_GG_{SHAPE,LAYOUT}_n, so the tile table is
+// defined exactly once (grouped_gemm_dispatch.h).
+#define SGL_MOE_STR(...) #__VA_ARGS__
+#define SGL_MOE_XSTR(...) SGL_MOE_STR(__VA_ARGS__)
+#define SGL_MOE_TILE_ROW(id) {SGL_MOE_XSTR(SGL_MOE_GG_SHAPE_##id), SGL_MOE_XSTR(SGL_MOE_GG_LAYOUT_##id)},
+const TileCfg kTiles[sgl::moe::kGroupedGemmNumTiles] = {
+    SGL_MOE_TILE_ROW(0) SGL_MOE_TILE_ROW(1) SGL_MOE_TILE_ROW(2) SGL_MOE_TILE_ROW(3) SGL_MOE_TILE_ROW(4)
+        SGL_MOE_TILE_ROW(5) SGL_MOE_TILE_ROW(6)};
+#undef SGL_MOE_TILE_ROW
+#undef SGL_MOE_XSTR
+#undef SGL_MOE_STR
 
 uint64_t pack_key(int tile_id, int act, bool fuse, bool bias, int arch) {
   uint64_t k = static_cast<uint64_t>(arch) & 0xFF;
@@ -98,13 +85,12 @@ KernelFn resolve(int tile_id, int act, bool fuse, bool bias, int arch, std::stri
   spec.subs["ACT_TYPE"] = std::to_string(act);
   spec.subs["FUSE_ACT"] = fuse ? "true" : "false";
   spec.subs["WITH_BIAS"] = bias ? "true" : "false";
-  const jit::ArchProfile& prof = jit::arch_profile(static_cast<jit::Arch>(arch));
-  spec.extra_flags = {"-DSGL_MOE_JIT_ENTRY"};
-  if (!prof.macro.empty()) spec.extra_flags.push_back("-D" + prof.macro);
-  spec.target = prof.target;
+  const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_MOE_JIT_ENTRY");
+  spec.extra_flags = as.extra_flags;
+  spec.target = as.target;
   spec.entry_symbol = "sgl_moe_gg_entry";
   spec.name = std::string("group_gemm_xe20_t") + std::to_string(tile_id) + "_a" + std::to_string(act) + "_f" +
-              (fuse ? "1" : "0") + "_b" + (bias ? "1" : "0") + "_" + prof.suffix;
+              (fuse ? "1" : "0") + "_b" + (bias ? "1" : "0") + "_" + as.suffix;
 
   void* sym = jit::get_or_compile(spec, cfg, err);
   if (!sym) return nullptr;
@@ -140,7 +126,7 @@ bool grouped_gemm_launch(
     int ld_b,
     int arch,
     std::string* err) {
-  const int tile_id = select_tile(avg_m, gemm_k, gemm_n, fuse_act);
+  const int tile_id = sgl::moe::grouped_gemm_select_tile(avg_m, gemm_k, gemm_n, fuse_act);
   KernelFn fn = resolve(tile_id, activation_type, fuse_act, with_bias, arch, err);
   if (!fn) return false;
   fn(queue,
@@ -233,13 +219,12 @@ W4A16Fn resolve_w4a16(int avg_m, bool is_int4, bool is_fp16, int arch, std::stri
   spec.subs["POLICY"] = w4a16_policy(avg_m);
   spec.subs["ELEMENT_A"] = elem_a;
   spec.subs["ELEMENT_S"] = is_int4 ? elem_a : "uint8_t";
-  const jit::ArchProfile& prof = jit::arch_profile(static_cast<jit::Arch>(arch));
-  spec.extra_flags = {"-DSGL_W4A16_JIT_ENTRY"};
-  if (!prof.macro.empty()) spec.extra_flags.push_back("-D" + prof.macro);
-  spec.target = prof.target;
+  const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_W4A16_JIT_ENTRY");
+  spec.extra_flags = as.extra_flags;
+  spec.target = as.target;
   spec.entry_symbol = "sgl_moe_w4a16_entry";
   spec.name = std::string("group_gemm_w4a16_p") + std::to_string(policy_id) + (is_int4 ? "_int4" : "_mxfp4") +
-              (is_fp16 ? "_fp16" : "_bf16") + "_" + prof.suffix;
+              (is_fp16 ? "_fp16" : "_bf16") + "_" + as.suffix;
 
   void* sym = jit::get_or_compile(spec, cfg, err);
   if (!sym) return nullptr;

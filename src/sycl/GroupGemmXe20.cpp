@@ -9,6 +9,7 @@
 #include "Utils.h"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
+#include "kernels/moe/xe20/bf16/grouped_gemm_dispatch.h"
 #include "kernels/moe/xe20/bf16/moe_kernel.hpp"
 #ifdef USE_MOE_JIT
 #include "jit/moe_jit.h"
@@ -226,7 +227,6 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
   at::Tensor atomic_buffer = at::empty({static_cast<long>(1)}, activations.options().dtype(at::kInt));
   bool with_bias = bias.has_value();
   void* bias_ptr = with_bias ? bias->data_ptr() : nullptr;
-  bool small_weight = (int64_t)gemm_k * gemm_n <= MOE_GROUPED_GEMM_SMALL_WEIGHT_THRESHOLD;
   int ld_b = static_cast<int>(weights.stride(1));
 
 #ifdef USE_MOE_JIT
@@ -257,53 +257,27 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
         jit_err);
   }
 #else
-  bool narrow_k = gemm_k <= 256;
-  bool narrow_n_fused = fuse_act && (gemm_n <= 512);
-
-  if (avg_m <= 8) {
-    DISPATCH_MOE(
-        activation_type, fuse_act, with_bias, Shape<_8, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
-  } else if (avg_m <= 16 && small_weight) {
-    DISPATCH_MOE(
-        activation_type, fuse_act, with_bias, Shape<_16, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
-  } else if (avg_m <= 32 && small_weight) {
-    DISPATCH_MOE(
-        activation_type, fuse_act, with_bias, Shape<_32, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
-  } else if (avg_m <= 128 && small_weight) {
-    if (fuse_act) {
-      DISPATCH_MOE(
-          activation_type, true, with_bias, Shape<_128, _64, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
-    } else {
-      DISPATCH_MOE(
-          activation_type, false, with_bias, Shape<_128, _128, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
-    }
-  } else if (narrow_k) {
-    // Narrow-K (e.g. K=176 for MoE down-projection): few K-loop iterations
-    // starve the pipeline. Unfused: Tile_128_128 (Shape<_128, _128, _32>);
-    // fused: Tile_128_64 (Shape<_128, _64, _32>). Both use 8 SGs/WG and
-    // balance occupancy with good N-coverage (22 tiles for N=2816) and
-    // M-tail utilization.
-    if (fuse_act) {
-      DISPATCH_MOE(
-          activation_type, true, with_bias, Shape<_128, _64, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
-    } else {
-      DISPATCH_MOE(
-          activation_type, false, with_bias, Shape<_128, _128, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
-    }
-  } else if (narrow_n_fused) {
-    // Narrow-N fused (e.g. N=352 → effective N/2=176 for MoE up-projection):
-    // Use 128-tile for better M-tail utilization vs 256-tile.
-    DISPATCH_MOE(
-        activation_type, true, with_bias, Shape<_128, _64, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
-  } else {
-    if (fuse_act) {
-      DISPATCH_MOE(
-          activation_type, true, with_bias, Shape<_256, _64, _32>, Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>);
-    } else {
-      DISPATCH_MOE(
-          activation_type, false, with_bias, Shape<_256, _256, _32>, Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>);
-    }
+  // Tile selection is shared with the runtime-JIT path via
+  // sgl::moe::grouped_gemm_select_tile (grouped_gemm_dispatch.h); each tile id
+  // maps to the same Shape/Layout tokens both sides consume. FuseAct is passed
+  // as the runtime flag: DISPATCH_MOE_HELPER_FUSE_ACT emits both fused and
+  // non-fused instantiations regardless, so this matches the prior tree exactly.
+#define MOE_GG_CASE(id)                                                                              \
+  case id:                                                                                           \
+    DISPATCH_MOE(activation_type, fuse_act, with_bias, SGL_MOE_GG_SHAPE_##id, SGL_MOE_GG_LAYOUT_##id); \
+    break;
+  switch (sgl::moe::grouped_gemm_select_tile(avg_m, gemm_k, gemm_n, fuse_act)) {
+    MOE_GG_CASE(0)
+    MOE_GG_CASE(1)
+    MOE_GG_CASE(2)
+    MOE_GG_CASE(3)
+    MOE_GG_CASE(4)
+    MOE_GG_CASE(5)
+    MOE_GG_CASE(6)
+    default:
+      TORCH_CHECK(false, "MoE grouped GEMM: invalid tile id");
   }
+#undef MOE_GG_CASE
 #endif
 }
 

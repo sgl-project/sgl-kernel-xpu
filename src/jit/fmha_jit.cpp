@@ -100,14 +100,13 @@ KernelFn resolve(DecodeOp op, int qg, int hd, int ps, bool is_fp16, int arch, st
   }
   spec.subs["ELEM_TYPE"] = is_fp16 ? "cutlass::half_t" : "cutlass::bfloat16_t";
   spec.subs["ELEM_TAG"] = is_fp16 ? "fp16" : "bf16";
-  const jit::ArchProfile& prof = jit::arch_profile(static_cast<jit::Arch>(arch));
-  spec.extra_flags = {"-DSGL_FMHA_JIT_ENTRY"};
-  if (!prof.macro.empty()) spec.extra_flags.push_back("-D" + prof.macro);
-  spec.target = prof.target;
+  const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_FMHA_JIT_ENTRY");
+  spec.extra_flags = as.extra_flags;
+  spec.target = as.target;
   spec.entry_symbol = "sgl_fmha_entry";
 
   spec.name = std::string("xe_fmha_fwd_") + op_tag(op) + "_" + std::to_string(qg) + "_" + std::to_string(hd) +
-              (no_page ? "" : "_" + std::to_string(ps)) + "_" + (is_fp16 ? "fp16" : "bf16") + "_" + prof.suffix;
+              (no_page ? "" : "_" + std::to_string(ps)) + "_" + (is_fp16 ? "fp16" : "bf16") + "_" + as.suffix;
 
   void* sym = jit::get_or_compile(spec, cfg, err);
   if (!sym) return nullptr;
@@ -276,13 +275,12 @@ KernelFn resolve_prefill(PrefillOp op, int hd, bool is_fp16, int arch, std::stri
     spec.subs["NUM_SG"] = std::to_string(tile.num_sg);
     spec.subs["TILED_OUT"] = std::to_string(tiled_out);
   }
-  spec.extra_flags = {"-DSGL_FMHA_JIT_ENTRY"};
-  const jit::ArchProfile& prof = jit::arch_profile(static_cast<jit::Arch>(arch));
-  if (!prof.macro.empty()) spec.extra_flags.push_back("-D" + prof.macro);
-  spec.target = prof.target;
+  const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_FMHA_JIT_ENTRY");
+  spec.extra_flags = as.extra_flags;
+  spec.target = as.target;
   spec.entry_symbol = "sgl_fmha_entry";
   spec.name = std::string("xe_fmha_fwd_") + prefill_op_tag(op) + "_" + std::to_string(hd) + "_" +
-              (fp16 ? "fp16" : "bf16") + "_" + prof.suffix;
+              (fp16 ? "fp16" : "bf16") + "_" + as.suffix;
 
   void* sym = jit::get_or_compile(spec, cfg, err);
   if (!sym) return nullptr;

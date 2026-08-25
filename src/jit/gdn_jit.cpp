@@ -87,13 +87,12 @@ ChunkFn resolve(bool is_half, int state_code, int arch, std::string* err) {
   spec.template_path = cfg.src_root + "/sycl/kernels/gdn_attn/chunk_gated_delta_rule_jit_instance.cpp.in";
   spec.subs["SCALAR_T"] = scalar_type(is_half);
   spec.subs["STATE_T"] = state_type(state_code);
-  const jit::ArchProfile& prof = jit::arch_profile(static_cast<jit::Arch>(arch));
-  spec.extra_flags = {"-DSGL_GDN_JIT_ENTRY"};
-  if (!prof.macro.empty()) spec.extra_flags.push_back("-D" + prof.macro);
-  spec.target = prof.target;
+  const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_GDN_JIT_ENTRY");
+  spec.extra_flags = as.extra_flags;
+  spec.target = as.target;
   spec.entry_symbol = "sgl_gdn_chunk_entry";
   spec.name = std::string("gdn_chunk_") + (is_half ? "f16" : "bf16") + "_s" + std::to_string(state_code) + "_" +
-              prof.suffix;
+              as.suffix;
 
   void* sym = jit::get_or_compile(spec, cfg, err);
   if (!sym) return nullptr;

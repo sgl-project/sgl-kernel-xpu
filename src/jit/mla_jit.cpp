@@ -47,13 +47,12 @@ DecodeFn resolve_decode(bool is_fp16, int page_size, int arch, std::string* err)
   spec.subs["ELEM_TAG"] = is_fp16 ? "half" : "bf16";
   spec.subs["ELEM_SYCL_TYPE"] = is_fp16 ? "sycl::half" : "sycl::ext::oneapi::bfloat16";
   spec.subs["PAGE_SIZE"] = std::to_string(page_size);
-  const jit::ArchProfile& prof = jit::arch_profile(static_cast<jit::Arch>(arch));
-  spec.extra_flags = {"-DSGL_MLA_JIT_ENTRY"};
-  if (!prof.macro.empty()) spec.extra_flags.push_back("-D" + prof.macro);
-  spec.target = prof.target;
+  const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_MLA_JIT_ENTRY");
+  spec.extra_flags = as.extra_flags;
+  spec.target = as.target;
   spec.entry_symbol = "sgl_mla_decode_entry";
   spec.name = std::string("mla_decode_") + (is_fp16 ? "half" : "bf16") + "_" + std::to_string(page_size) + "_" +
-              prof.suffix;
+              as.suffix;
 
   void* sym = jit::get_or_compile(spec, cfg, err);
   if (!sym) return nullptr;
@@ -135,13 +134,12 @@ PrefillFn resolve_prefill(bool is_fp16, int page_size, int arch, std::string* er
   spec.subs["ELEM_TAG"] = is_fp16 ? "half" : "bf16";
   spec.subs["ELEM_SYCL_TYPE"] = is_fp16 ? "sycl::half" : "sycl::ext::oneapi::bfloat16";
   spec.subs["PAGE_SIZE"] = std::to_string(page_size);
-  const jit::ArchProfile& prof = jit::arch_profile(static_cast<jit::Arch>(arch));
-  spec.extra_flags = {"-DSGL_MLA_JIT_ENTRY"};
-  if (!prof.macro.empty()) spec.extra_flags.push_back("-D" + prof.macro);
-  spec.target = prof.target;
+  const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_MLA_JIT_ENTRY");
+  spec.extra_flags = as.extra_flags;
+  spec.target = as.target;
   spec.entry_symbol = "sgl_mla_prefill_entry";
   spec.name = std::string("mla_prefill_") + (is_fp16 ? "half" : "bf16") + "_" + std::to_string(page_size) + "_" +
-              prof.suffix;
+              as.suffix;
 
   void* sym = jit::get_or_compile(spec, cfg, err);
   if (!sym) return nullptr;
@@ -262,13 +260,12 @@ void* resolve_sparse(
   spec.subs["D_QK"] = std::to_string(d_qk);
   spec.subs["B_H"] = std::to_string(b_h);
   spec.subs["HAS_ATTN_SINK"] = sink ? "1" : "0";
-  const jit::ArchProfile& prof = jit::arch_profile(static_cast<jit::Arch>(arch));
-  spec.extra_flags = {"-DSGL_MLA_JIT_ENTRY"};
-  if (!prof.macro.empty()) spec.extra_flags.push_back("-D" + prof.macro);
-  spec.target = prof.target;
+  const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_MLA_JIT_ENTRY");
+  spec.extra_flags = as.extra_flags;
+  spec.target = as.target;
   spec.entry_symbol = entry;
   spec.name = std::string(name_prefix) + "_" + elem_tag(is_fp16) + "_" + std::to_string(d_qk) + "_" +
-              std::to_string(b_h) + "_" + (sink ? "1" : "0") + "_" + prof.suffix;
+              std::to_string(b_h) + "_" + (sink ? "1" : "0") + "_" + as.suffix;
   return jit::get_or_compile(spec, cfg, err);
 }
 

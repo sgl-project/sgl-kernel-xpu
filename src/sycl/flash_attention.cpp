@@ -35,9 +35,9 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include "kernels/flash_attention_v2/relative_attention.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_prefill_dispatch.hpp"
-#include "kernels/flash_attention_v2/relative_attention.hpp"
 #include "sgl_kernel_export.h"
 
 namespace {
@@ -1451,8 +1451,7 @@ SGL_KERNEL_EXPORT void mha_fwd(
         out,
         softmax_lse,
         std::nullopt,
-        rel_bias_,
-        );
+        rel_bias_, );
     return;
   }
 

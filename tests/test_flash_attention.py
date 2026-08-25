@@ -2451,7 +2451,9 @@ def test_relative_attention(
         (len(k), max(pages_per_seq)), dtype=torch.int32, device=device
     )
     k_cache = torch.zeros(
-        (sum(pages_per_seq), page_size, num_heads_k, head_dim), dtype=dtype, device=device
+        (sum(pages_per_seq), page_size, num_heads_k, head_dim),
+        dtype=dtype,
+        device=device,
     )
     v_cache = torch.zeros_like(k_cache)
     page = 0
@@ -2459,8 +2461,12 @@ def test_relative_attention(
         page_table[batch, :page_count] = torch.arange(
             page, page + page_count, dtype=torch.int32, device=device
         )
-        k_cache[page : page + page_count].flatten(0, 1)[: k_seq.size(0)].copy_(k_seq.to(device))
-        v_cache[page : page + page_count].flatten(0, 1)[: v_seq.size(0)].copy_(v_seq.to(device))
+        k_cache[page : page + page_count].flatten(0, 1)[: k_seq.size(0)].copy_(
+            k_seq.to(device)
+        )
+        v_cache[page : page + page_count].flatten(0, 1)[: v_seq.size(0)].copy_(
+            v_seq.to(device)
+        )
         page += page_count
 
     dense_rel_bias = torch.zeros(
@@ -2471,17 +2477,19 @@ def test_relative_attention(
         device=device,
     )
     distance = torch.arange(extent, dtype=torch.float32)
-    table = 0.02 * torch.arange(1, num_heads + 1, dtype=torch.float32).unsqueeze(
-        1
-    ) * torch.cos(distance.unsqueeze(0) / 7.0)
+    table = (
+        0.02
+        * torch.arange(1, num_heads + 1, dtype=torch.float32).unsqueeze(1)
+        * torch.cos(distance.unsqueeze(0) / 7.0)
+    )
     q_start = 0
     for q_len, k_len in zip(seqlens_q, seqlens_k):
         for q_idx in range(q_len):
             row_kv = k_len - q_len + q_idx
             columns = torch.arange(max(0, row_kv - extent + 1), row_kv + 1)
-            dense_rel_bias[q_start + q_idx, :, columns] = table[:, row_kv - columns].to(
-                torch.bfloat16
-            ).to(device)
+            dense_rel_bias[q_start + q_idx, :, columns] = (
+                table[:, row_kv - columns].to(torch.bfloat16).to(device)
+            )
         q_start += q_len
 
     reference = torch.empty_like(q, device="cpu")
@@ -2491,17 +2499,26 @@ def test_relative_attention(
         k_seq = repeat(k_seq.float(), "s h d -> s (h g) d", g=num_heads // num_heads_k)
         v_seq = repeat(v_seq.float(), "s h d -> s (h g) d", g=num_heads // num_heads_k)
         scores = torch.einsum("qhd,khd->hqk", q_seq, k_seq) * head_dim**-0.5
-        scores += dense_rel_bias[q_start : q_start + q_len, :, :k_len].float().permute(1, 0, 2).cpu()
+        scores += (
+            dense_rel_bias[q_start : q_start + q_len, :, :k_len]
+            .float()
+            .permute(1, 0, 2)
+            .cpu()
+        )
         if causal:
             q_rows = torch.arange(q_len).unsqueeze(1) + k_len - q_len
-            scores.masked_fill_(torch.arange(k_len).unsqueeze(0) > q_rows, float("-inf"))
+            scores.masked_fill_(
+                torch.arange(k_len).unsqueeze(0) > q_rows, float("-inf")
+            )
         reference[q_start : q_start + q_len] = torch.einsum(
             "hqk,khd->qhd", torch.softmax(scores, dim=-1), v_seq
         ).to(dtype)
         q_start += q_len
 
     cu_seqlens_q = torch.tensor(
-        [0, *torch.tensor(seqlens_q).cumsum(0).tolist()], dtype=torch.int32, device=device
+        [0, *torch.tensor(seqlens_q).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device=device,
     )
     out = flash_attn_with_kvcache(
         q.to(device),
@@ -2532,15 +2549,26 @@ def test_relative_attention_zero_bias_matches_prefill():
 
     torch.manual_seed(23)
     batch, seqlen_q, seqlen_k, num_heads, head_dim, page_size = 2, 129, 256, 8, 128, 128
-    q = torch.randn(batch * seqlen_q, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    q = torch.randn(
+        batch * seqlen_q, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
     k_cache = torch.randn(
-        batch * (seqlen_k // page_size), page_size, num_heads, head_dim, dtype=torch.bfloat16, device=device
+        batch * (seqlen_k // page_size),
+        page_size,
+        num_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
     )
     v_cache = torch.randn_like(k_cache)
     common = dict(
         cache_seqlens=torch.full((batch,), seqlen_k, dtype=torch.int32, device=device),
-        page_table=torch.arange(batch * (seqlen_k // page_size), dtype=torch.int32, device=device).view(batch, -1),
-        cu_seqlens_q=torch.arange(0, batch * seqlen_q + 1, seqlen_q, dtype=torch.int32, device=device),
+        page_table=torch.arange(
+            batch * (seqlen_k // page_size), dtype=torch.int32, device=device
+        ).view(batch, -1),
+        cu_seqlens_q=torch.arange(
+            0, batch * seqlen_q + 1, seqlen_q, dtype=torch.int32, device=device
+        ),
         max_seqlen_q=seqlen_q,
         max_seqlen_k=seqlen_k,
         causal=True,
@@ -2550,7 +2578,9 @@ def test_relative_attention_zero_bias_matches_prefill():
         q,
         k_cache,
         v_cache,
-        rel_bias=torch.zeros(batch * seqlen_q, num_heads, 64, dtype=q.dtype, device=device),
+        rel_bias=torch.zeros(
+            batch * seqlen_q, num_heads, 64, dtype=q.dtype, device=device
+        ),
         **common,
     )
     torch.xpu.synchronize()

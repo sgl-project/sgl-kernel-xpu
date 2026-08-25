@@ -452,7 +452,7 @@ template <
     typename SubgroupLayoutQK,
     typename SubgroupLayoutPV_ = void, /* void -> default */
     bool HasRelBias = false,
-    int PipelineStages = 2,            // TODO: This is hard-coded as 1 in kernel.
+    int PipelineStages = 2,  // TODO: This is hard-coded as 1 in kernel.
     bool persistent = false,
     typename ElementQ = bfloat16_t,
     typename ElementK = bfloat16_t,

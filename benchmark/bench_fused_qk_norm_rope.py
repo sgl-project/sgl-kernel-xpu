@@ -1,3 +1,4 @@
+import gc
 import itertools
 import math
 import os
@@ -7,6 +8,17 @@ import sgl_kernel
 import torch
 import triton
 from bench_fused_qk_rope_with_cache import create_cos_sin_cache
+
+
+def _free_xpu_memory():
+    """Best-effort release of cached XPU allocations between configs."""
+    gc.collect()
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        try:
+            torch.xpu.empty_cache()
+        except Exception:
+            pass
+
 
 # Supported dtypes and their properties
 DTYPE_MAP = {
@@ -146,6 +158,7 @@ def fused_qk_norm_rope_reference(
     # Apply RMSNorm to Q and K
     q_normalized = llama_rms_norm(q, q_weight, eps)
     k_normalized = llama_rms_norm(k, k_weight, eps)
+    del q, k, qkv_reshaped
 
     # Compute RoPE frequencies
     inv_freq = compute_inv_freq_yarn(
@@ -155,39 +168,37 @@ def fused_qk_norm_rope_reference(
     # Compute cos and sin for each position
     positions = position_ids.to(torch.float32)
     freqs = torch.outer(positions, inv_freq)
-    cos = freqs.cos()
-    sin = freqs.sin()
-
-    # Apply attention factor
-    cos = cos * attention_factor
-    sin = sin * attention_factor
+    cos = freqs.cos() * attention_factor
+    sin = freqs.sin() * attention_factor
+    del inv_freq, positions, freqs
 
     # Apply RoPE to Q and K (only to rotary_dim portion)
     q_rot = q_normalized[..., :rotary_dim]
     q_pass = q_normalized[..., rotary_dim:]
     q_rot = apply_rotary_emb_native(q_rot, cos, sin, is_neox)
     q_final = torch.cat([q_rot, q_pass], dim=-1)
+    del q_normalized, q_rot, q_pass
 
     k_rot = k_normalized[..., :rotary_dim]
     k_pass = k_normalized[..., rotary_dim:]
     k_rot = apply_rotary_emb_native(k_rot, cos, sin, is_neox)
     k_final = torch.cat([k_rot, k_pass], dim=-1)
+    del k_normalized, k_rot, k_pass, cos, sin
 
     # Concatenate Q, K, V back together
-    result = torch.cat([q_final, k_final, v], dim=1)
-    result = result.view(num_tokens, total_heads * head_dim)
-
-    return result
+    v_cast = v.to(q_final.dtype) if v.dtype != q_final.dtype else v
+    result = torch.cat([q_final, k_final, v_cast], dim=1)
+    del q_final, k_final, v_cast
+    return result.view(num_tokens, total_heads * head_dim)
 
 
 # Benchmark configurations
-batch_size_range = [1, 2, 4, 8]
-seq_len_range = [64, 128, 256, 512, 1024]
-# DeepSeek-V3 config: 128 Q heads, 128 KV heads (MLA)
+batch_size_range = [1, 4]
+seq_len_range = [128, 512, 1024]
 head_config_range = [
-    (32, 8, 8, 128),  # Standard MQA config
+    (32, 8, 8, 128),  # Standard GQA config
     (32, 32, 32, 128),  # Standard MHA config
-    (128, 128, 128, 128),  # DeepSeek-V3 style
+    (128, 1, 1, 128),  # DeepSeek-V3 / MLA style
 ]
 is_neox_range = [True, False]
 dtype_range = ["fp16", "bf16", "fp8_e4m3fn"]
@@ -475,6 +486,7 @@ def benchmark_cache(
         raise ValueError(f"Unknown provider: {provider}")
 
     quantiles = [0.5, 0.2, 0.8]
+    _free_xpu_memory()
     ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
 
     flat_tokens = batch_size * seq_len if use_4d else batch_size
@@ -648,6 +660,7 @@ def benchmark(
             rotary_dim=rotary_dim,
         )
 
+    _free_xpu_memory()
     ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
 
     # Calculate effective bandwidth using the correct bytes-per-element for this dtype

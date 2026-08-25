@@ -181,8 +181,10 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_paged_mqa_logits(
       }
       return kDefaultChunkBudgetBytes;
     }();
-    // Per-row bytes for the two chunked temporaries: k_gathered (msl*D uint8) + dots (H*msl*4 float32).
-    int64_t per_row_bytes = static_cast<int64_t>(H) * msl * sizeof(float) + static_cast<int64_t>(msl) * D;
+    // Per-row bytes for the two chunked temporaries: k_gathered (msl*D uint8) + dots (H*msl*4 float32) +
+    // k_scale_gathered (msl*4 float32).
+    int64_t per_row_bytes = static_cast<int64_t>(H) * msl * sizeof(float) + static_cast<int64_t>(msl) * D +
+                            static_cast<int64_t>(msl) * sizeof(float);
     int chunk_b = static_cast<int>(std::max<int64_t>(1, chunk_budget_bytes / std::max<int64_t>(per_row_bytes, 1)));
     chunk_b = std::min(chunk_b, B_next);
     if (std::getenv("SGL_KERNEL_FP8_PAGED_MQA_VERBOSE") != nullptr) {
@@ -200,6 +202,8 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_paged_mqa_logits(
           " chunks)");
     }
 
+    // TODO: use a fused kernel to reduce launch overhead for large number of B chunks.
+    // For now, the overhead is negligible (~2%) in the cases we tested.
     for (int start = 0; start < B_next; start += chunk_b) {
       int cur_b = std::min(chunk_b, B_next - start);
 

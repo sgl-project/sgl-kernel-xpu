@@ -162,6 +162,7 @@ def test_fp8_mqa_logits_masking():
         (1, 4, 128, 4),  # small H, page_size=4
         (1, 4, 128, 8),  # small H, page_size=8
         (1, 64, 128, 64),  # large H / SYCL-TLA (xe20) path
+        (4, 128, 128, 64),  # large H / SYCL-TLA (xe20) path
     ],
 )
 def test_fp8_paged_mqa_logits(B, H, D, page_size):
@@ -174,8 +175,10 @@ def test_fp8_paged_mqa_logits(B, H, D, page_size):
     kv_cache = make_kv_cache(num_pages, page_size, D, device)
     q = make_fp8_tensor((B, 1, H, D), device)
     weights = torch.rand(B, H, dtype=torch.float32, device=device)
-    seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
-    block_tables = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([seq_len] * B, dtype=torch.int32, device=device)
+    block_tables = torch.tensor(
+        [[0, 1, 2, 3] for _ in range(B)], dtype=torch.int32, device=device
+    )
 
     logits = torch.ops.sgl_kernel.fp8_paged_mqa_logits.default(
         q.view(torch.uint8),
@@ -200,7 +203,7 @@ def test_fp8_paged_mqa_logits(B, H, D, page_size):
 
     logits_cpu = logits.cpu()
     torch.testing.assert_close(logits_cpu, ref, rtol=2e-3, atol=0.1)
-    assert logits_cpu[0, seq_len:].abs().max().item() == 0.0
+    assert logits_cpu[:, seq_len:].abs().max().item() == 0.0
 
 
 def test_fp8_paged_mqa_logits_noncontiguous_pages():

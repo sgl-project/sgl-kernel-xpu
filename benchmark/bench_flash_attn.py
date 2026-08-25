@@ -23,8 +23,8 @@ def flash_attn_baseline(
     v_descale=None,
 ):
     """Baseline Flash Attention implementation"""
-    # Kernel only supports LSE without local/sink masking.
-    return_lse = window_size == (-1, -1) and sinks is None
+    # Kernel only supports LSE without causal/local/sink masking.
+    return_lse = not causal and window_size == (-1, -1) and sinks is None
 
     if page_table is not None:
         result = flash_attn_with_kvcache(

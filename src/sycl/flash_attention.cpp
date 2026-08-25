@@ -276,6 +276,7 @@ void mha_fwd_nopage(
             /*page_size=*/0,
             params.is_fp16,
             &params,
+            jit_arch_code(),
             &jit_err),
         jit_err);
   }
@@ -703,7 +704,8 @@ void mha_fwd(
     }
     std::string jit_err;
     TORCH_CHECK(
-        sgl::fmha_jit::decode_launch(op, qg_sz, params.d, params.page_size, is_fp16, &params, &jit_err), jit_err);
+        sgl::fmha_jit::decode_launch(op, qg_sz, params.d, params.page_size, is_fp16, &params, jit_arch_code(), &jit_err),
+        jit_err);
   }
 #else
   DISPATCH_DECODE(qg_sz);
@@ -880,7 +882,7 @@ void mha_fwd_nopage(
     std::string jit_err;
     TORCH_CHECK(
         sgl::fmha_jit::prefill_launch(
-            sgl::fmha_jit::PrefillOp::kPrefillNoPage, params.d, params.is_fp16, &params, &jit_err),
+            sgl::fmha_jit::PrefillOp::kPrefillNoPage, params.d, params.is_fp16, &params, jit_arch_code(), &jit_err),
         jit_err);
   }
 #else
@@ -1246,7 +1248,7 @@ void mha_fwd(
       op = PrefillOp::kPrefill;
     }
     std::string jit_err;
-    TORCH_CHECK(sgl::fmha_jit::prefill_launch(op, params.d, is_fp16, &params, &jit_err), jit_err);
+    TORCH_CHECK(sgl::fmha_jit::prefill_launch(op, params.d, is_fp16, &params, jit_arch_code(), &jit_err), jit_err);
   }
 #else
   switch (params.d) {

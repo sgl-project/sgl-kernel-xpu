@@ -216,13 +216,19 @@ void* get_or_compile(const CompileSpec& spec, const JitConfig& config, std::stri
   // below, so each target gets its own cached .so.
   flags.push_back("-fsycl-targets=" + (spec.target.empty() ? default_sycl_target() : spec.target));
 
-  // Cache key: rendered source + flags + includes + entry + compiler version.
+  // Cache key: rendered source + compile/link inputs + entry + compiler identity.
+  // link_flags and the compiler path are keyed so a shared cache dir never
+  // reuses a .so linked against a different torch install or built by a
+  // different compiler.
   std::string key_material = source;
   for (const auto& f : flags)
     key_material += "\n" + f;
   for (const auto& d : config.include_dirs)
     key_material += "\nI:" + d;
+  for (const auto& l : config.link_flags)
+    key_material += "\nL:" + l;
   key_material += "\nENTRY:" + spec.entry_symbol;
+  key_material += "\nCOMPILER:" + config.compiler;
   key_material += "\nVER:" + icpx_version(config.compiler);
   std::string hash = content_hash(key_material);
   std::string cache_key = spec.name + "_" + hash + ":" + spec.entry_symbol;

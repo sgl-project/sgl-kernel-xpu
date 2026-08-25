@@ -1434,6 +1434,7 @@ void chunk_gated_delta_rule_impl_xe20(
       head_k_dim,
       num_v_heads,
       head_v_dim,
+      jit_arch_code(),
       &jit_err);
   TORCH_CHECK(ok, "GDN chunk JIT launch failed: ", jit_err);
 #else

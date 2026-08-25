@@ -218,6 +218,7 @@ SGL_KERNEL_EXPORT void flash_mla_sparse_decode(
             sm_scale,
             head_dim_v,
             is_fp8_kvcache,
+            jit_arch_code(),
             &jit_err),
         jit_err);
   }

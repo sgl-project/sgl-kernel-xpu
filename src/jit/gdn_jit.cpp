@@ -4,6 +4,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "jit/jit_arch.h"
 #include "jit/sycl_template_jit.h"
 
 namespace sgl {
@@ -54,15 +55,18 @@ const char* state_type(int state_code) {
   }
 }
 
-uint64_t pack_key(bool is_half, int state_code) {
-  return (static_cast<uint64_t>(is_half ? 1u : 0u) << 8) | (static_cast<uint64_t>(state_code) & 0xFF);
+uint64_t pack_key(int arch, bool is_half, int state_code) {
+  uint64_t k = static_cast<uint64_t>(arch) & 0xFF;
+  k = (k << 8) | (static_cast<uint64_t>(is_half ? 1u : 0u));
+  k = (k << 8) | (static_cast<uint64_t>(state_code) & 0xFF);
+  return k;
 }
 
 std::mutex g_mu;
 std::unordered_map<uint64_t, ChunkFn> g_fns;
 
-ChunkFn resolve(bool is_half, int state_code, std::string* err) {
-  const uint64_t key = pack_key(is_half, state_code);
+ChunkFn resolve(bool is_half, int state_code, int arch, std::string* err) {
+  const uint64_t key = pack_key(arch, is_half, state_code);
   {
     std::lock_guard<std::mutex> lk(g_mu);
     auto it = g_fns.find(key);
@@ -83,9 +87,13 @@ ChunkFn resolve(bool is_half, int state_code, std::string* err) {
   spec.template_path = cfg.src_root + "/sycl/kernels/gdn_attn/chunk_gated_delta_rule_jit_instance.cpp.in";
   spec.subs["SCALAR_T"] = scalar_type(is_half);
   spec.subs["STATE_T"] = state_type(state_code);
+  const jit::ArchProfile& prof = jit::arch_profile(static_cast<jit::Arch>(arch));
   spec.extra_flags = {"-DSGL_GDN_JIT_ENTRY"};
+  if (!prof.macro.empty()) spec.extra_flags.push_back("-D" + prof.macro);
+  spec.target = prof.target;
   spec.entry_symbol = "sgl_gdn_chunk_entry";
-  spec.name = std::string("gdn_chunk_") + (is_half ? "f16" : "bf16") + "_s" + std::to_string(state_code);
+  spec.name = std::string("gdn_chunk_") + (is_half ? "f16" : "bf16") + "_s" + std::to_string(state_code) + "_" +
+              prof.suffix;
 
   void* sym = jit::get_or_compile(spec, cfg, err);
   if (!sym) return nullptr;
@@ -127,8 +135,9 @@ bool chunk_launch(
     int head_k_dim,
     int num_v_heads,
     int head_v_dim,
+    int arch,
     std::string* err) {
-  ChunkFn fn = resolve(is_half, state_code, err);
+  ChunkFn fn = resolve(is_half, state_code, arch, err);
   if (!fn) return false;
   fn(queue,
      core_attn_out,

@@ -4,6 +4,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "jit/jit_arch.h"
 #include "jit/sycl_template_jit.h"
 
 namespace sgl {
@@ -47,8 +48,9 @@ const char* op_tag(DecodeOp op) {
 }
 
 // Pack the config into a fast integer key for the front cache.
-uint64_t pack_key(DecodeOp op, int qg, int hd, int ps, bool is_fp16) {
-  uint64_t k = static_cast<uint64_t>(op) & 0xFF;
+uint64_t pack_key(int arch, DecodeOp op, int qg, int hd, int ps, bool is_fp16) {
+  uint64_t k = static_cast<uint64_t>(arch) & 0xFF;
+  k = (k << 8) | (static_cast<uint64_t>(op) & 0xFF);
   k = (k << 12) | (static_cast<uint64_t>(qg) & 0xFFF);
   k = (k << 16) | (static_cast<uint64_t>(hd) & 0xFFFF);
   k = (k << 16) | (static_cast<uint64_t>(ps) & 0xFFFF);
@@ -66,8 +68,8 @@ int decode_tiled_kv_np(int hd) {
 }
 
 // Resolve (compiling on first use) the kernel entry for a config.
-KernelFn resolve(DecodeOp op, int qg, int hd, int ps, bool is_fp16, std::string* err) {
-  const uint64_t key = pack_key(op, qg, hd, ps, is_fp16);
+KernelFn resolve(DecodeOp op, int qg, int hd, int ps, bool is_fp16, int arch, std::string* err) {
+  const uint64_t key = pack_key(arch, op, qg, hd, ps, is_fp16);
   {
     std::lock_guard<std::mutex> lk(g_mu);
     auto it = g_fns.find(key);
@@ -98,11 +100,14 @@ KernelFn resolve(DecodeOp op, int qg, int hd, int ps, bool is_fp16, std::string*
   }
   spec.subs["ELEM_TYPE"] = is_fp16 ? "cutlass::half_t" : "cutlass::bfloat16_t";
   spec.subs["ELEM_TAG"] = is_fp16 ? "fp16" : "bf16";
+  const jit::ArchProfile& prof = jit::arch_profile(static_cast<jit::Arch>(arch));
   spec.extra_flags = {"-DSGL_FMHA_JIT_ENTRY"};
+  if (!prof.macro.empty()) spec.extra_flags.push_back("-D" + prof.macro);
+  spec.target = prof.target;
   spec.entry_symbol = "sgl_fmha_entry";
 
   spec.name = std::string("xe_fmha_fwd_") + op_tag(op) + "_" + std::to_string(qg) + "_" + std::to_string(hd) +
-              (no_page ? "" : "_" + std::to_string(ps)) + "_" + (is_fp16 ? "fp16" : "bf16");
+              (no_page ? "" : "_" + std::to_string(ps)) + "_" + (is_fp16 ? "fp16" : "bf16") + "_" + prof.suffix;
 
   void* sym = jit::get_or_compile(spec, cfg, err);
   if (!sym) return nullptr;
@@ -212,8 +217,9 @@ const char* prefill_op_tag(PrefillOp op) {
   return "";
 }
 
-uint64_t pack_prefill_key(PrefillOp op, int hd, bool is_fp16) {
-  uint64_t k = static_cast<uint64_t>(op) & 0xFF;
+uint64_t pack_prefill_key(int arch, PrefillOp op, int hd, bool is_fp16) {
+  uint64_t k = static_cast<uint64_t>(arch) & 0xFF;
+  k = (k << 8) | (static_cast<uint64_t>(op) & 0xFF);
   k = (k << 16) | (static_cast<uint64_t>(hd) & 0xFFFF);
   k = (k << 1) | (is_fp16 ? 1u : 0u);
   return k;
@@ -222,8 +228,8 @@ uint64_t pack_prefill_key(PrefillOp op, int hd, bool is_fp16) {
 std::mutex g_prefill_mu;
 std::unordered_map<uint64_t, KernelFn> g_prefill_fns;
 
-KernelFn resolve_prefill(PrefillOp op, int hd, bool is_fp16, std::string* err) {
-  const uint64_t key = pack_prefill_key(op, hd, is_fp16);
+KernelFn resolve_prefill(PrefillOp op, int hd, bool is_fp16, int arch, std::string* err) {
+  const uint64_t key = pack_prefill_key(arch, op, hd, is_fp16);
   {
     std::lock_guard<std::mutex> lk(g_prefill_mu);
     auto it = g_prefill_fns.find(key);
@@ -271,9 +277,12 @@ KernelFn resolve_prefill(PrefillOp op, int hd, bool is_fp16, std::string* err) {
     spec.subs["TILED_OUT"] = std::to_string(tiled_out);
   }
   spec.extra_flags = {"-DSGL_FMHA_JIT_ENTRY"};
+  const jit::ArchProfile& prof = jit::arch_profile(static_cast<jit::Arch>(arch));
+  if (!prof.macro.empty()) spec.extra_flags.push_back("-D" + prof.macro);
+  spec.target = prof.target;
   spec.entry_symbol = "sgl_fmha_entry";
-  spec.name =
-      std::string("xe_fmha_fwd_") + prefill_op_tag(op) + "_" + std::to_string(hd) + "_" + (fp16 ? "fp16" : "bf16");
+  spec.name = std::string("xe_fmha_fwd_") + prefill_op_tag(op) + "_" + std::to_string(hd) + "_" +
+              (fp16 ? "fp16" : "bf16") + "_" + prof.suffix;
 
   void* sym = jit::get_or_compile(spec, cfg, err);
   if (!sym) return nullptr;
@@ -288,26 +297,27 @@ KernelFn resolve_prefill(PrefillOp op, int hd, bool is_fp16, std::string* err) {
 
 }  // namespace
 
-bool decode_launch(DecodeOp op, int qg, int hd, int ps, bool is_fp16, const void* params, std::string* err) {
-  KernelFn fn = resolve(op, qg, hd, ps, is_fp16, err);
+bool decode_launch(
+    DecodeOp op, int qg, int hd, int ps, bool is_fp16, const void* params, int arch, std::string* err) {
+  KernelFn fn = resolve(op, qg, hd, ps, is_fp16, arch, err);
   if (!fn) return false;
   fn(params);
   return true;
 }
 
-bool decode_prewarm(DecodeOp op, int qg, int hd, int ps, bool is_fp16, std::string* err) {
-  return resolve(op, qg, hd, ps, is_fp16, err) != nullptr;
+bool decode_prewarm(DecodeOp op, int qg, int hd, int ps, bool is_fp16, int arch, std::string* err) {
+  return resolve(op, qg, hd, ps, is_fp16, arch, err) != nullptr;
 }
 
-bool prefill_launch(PrefillOp op, int hd, bool is_fp16, const void* params, std::string* err) {
-  KernelFn fn = resolve_prefill(op, hd, is_fp16, err);
+bool prefill_launch(PrefillOp op, int hd, bool is_fp16, const void* params, int arch, std::string* err) {
+  KernelFn fn = resolve_prefill(op, hd, is_fp16, arch, err);
   if (!fn) return false;
   fn(params);
   return true;
 }
 
-bool prefill_prewarm(PrefillOp op, int hd, bool is_fp16, std::string* err) {
-  return resolve_prefill(op, hd, is_fp16, err) != nullptr;
+bool prefill_prewarm(PrefillOp op, int hd, bool is_fp16, int arch, std::string* err) {
+  return resolve_prefill(op, hd, is_fp16, arch, err) != nullptr;
 }
 
 }  // namespace fmha_jit

@@ -190,6 +190,7 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
             &workspace,
             sm_scale,
             num_kv_splits,
+            jit_arch_code(),
             &jit_err),
         jit_err);
   }

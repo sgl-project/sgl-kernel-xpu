@@ -3,6 +3,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "jit/jit_arch.h"
 #include "jit/sycl_template_jit.h"
 
 namespace sgl {
@@ -13,15 +14,18 @@ namespace {
 using DecodeFn =
     void (*)(void*, const void*, const void*, const void*, const void*, const void*, void*, double, int64_t);
 
-uint64_t pack_decode_key(bool is_fp16, int page_size) {
-  return (static_cast<uint64_t>(page_size) << 1) | (is_fp16 ? 1u : 0u);
+uint64_t pack_decode_key(int arch, bool is_fp16, int page_size) {
+  uint64_t k = static_cast<uint64_t>(arch) & 0xFF;
+  k = (k << 16) | (static_cast<uint64_t>(page_size) & 0xFFFF);
+  k = (k << 1) | (is_fp16 ? 1u : 0u);
+  return k;
 }
 
 std::mutex g_mu;
 std::unordered_map<uint64_t, DecodeFn> g_decode_fns;
 
-DecodeFn resolve_decode(bool is_fp16, int page_size, std::string* err) {
-  const uint64_t key = pack_decode_key(is_fp16, page_size);
+DecodeFn resolve_decode(bool is_fp16, int page_size, int arch, std::string* err) {
+  const uint64_t key = pack_decode_key(arch, is_fp16, page_size);
   {
     std::lock_guard<std::mutex> lk(g_mu);
     auto it = g_decode_fns.find(key);
@@ -43,9 +47,13 @@ DecodeFn resolve_decode(bool is_fp16, int page_size, std::string* err) {
   spec.subs["ELEM_TAG"] = is_fp16 ? "half" : "bf16";
   spec.subs["ELEM_SYCL_TYPE"] = is_fp16 ? "sycl::half" : "sycl::ext::oneapi::bfloat16";
   spec.subs["PAGE_SIZE"] = std::to_string(page_size);
+  const jit::ArchProfile& prof = jit::arch_profile(static_cast<jit::Arch>(arch));
   spec.extra_flags = {"-DSGL_MLA_JIT_ENTRY"};
+  if (!prof.macro.empty()) spec.extra_flags.push_back("-D" + prof.macro);
+  spec.target = prof.target;
   spec.entry_symbol = "sgl_mla_decode_entry";
-  spec.name = std::string("mla_decode_") + (is_fp16 ? "half" : "bf16") + "_" + std::to_string(page_size);
+  spec.name = std::string("mla_decode_") + (is_fp16 ? "half" : "bf16") + "_" + std::to_string(page_size) + "_" +
+              prof.suffix;
 
   void* sym = jit::get_or_compile(spec, cfg, err);
   if (!sym) return nullptr;
@@ -72,8 +80,9 @@ bool mla_decode_launch(
     void* workspace,
     double sm_scale,
     int64_t num_kv_splits,
+    int arch,
     std::string* err) {
-  DecodeFn fn = resolve_decode(is_fp16, page_size, err);
+  DecodeFn fn = resolve_decode(is_fp16, page_size, arch, err);
   if (!fn) return false;
   fn(out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
   return true;
@@ -103,8 +112,8 @@ using PrefillFn = void (*)(
 std::mutex g_prefill_mu;
 std::unordered_map<uint64_t, PrefillFn> g_prefill_fns;
 
-PrefillFn resolve_prefill(bool is_fp16, int page_size, std::string* err) {
-  const uint64_t key = pack_decode_key(is_fp16, page_size);
+PrefillFn resolve_prefill(bool is_fp16, int page_size, int arch, std::string* err) {
+  const uint64_t key = pack_decode_key(arch, is_fp16, page_size);
   {
     std::lock_guard<std::mutex> lk(g_prefill_mu);
     auto it = g_prefill_fns.find(key);
@@ -126,9 +135,13 @@ PrefillFn resolve_prefill(bool is_fp16, int page_size, std::string* err) {
   spec.subs["ELEM_TAG"] = is_fp16 ? "half" : "bf16";
   spec.subs["ELEM_SYCL_TYPE"] = is_fp16 ? "sycl::half" : "sycl::ext::oneapi::bfloat16";
   spec.subs["PAGE_SIZE"] = std::to_string(page_size);
+  const jit::ArchProfile& prof = jit::arch_profile(static_cast<jit::Arch>(arch));
   spec.extra_flags = {"-DSGL_MLA_JIT_ENTRY"};
+  if (!prof.macro.empty()) spec.extra_flags.push_back("-D" + prof.macro);
+  spec.target = prof.target;
   spec.entry_symbol = "sgl_mla_prefill_entry";
-  spec.name = std::string("mla_prefill_") + (is_fp16 ? "half" : "bf16") + "_" + std::to_string(page_size);
+  spec.name = std::string("mla_prefill_") + (is_fp16 ? "half" : "bf16") + "_" + std::to_string(page_size) + "_" +
+              prof.suffix;
 
   void* sym = jit::get_or_compile(spec, cfg, err);
   if (!sym) return nullptr;
@@ -159,8 +172,9 @@ bool mla_prefill_launch(
     double sm_scale,
     bool causal,
     int64_t num_kv_splits,
+    int arch,
     std::string* err) {
-  PrefillFn fn = resolve_prefill(is_fp16, page_size, err);
+  PrefillFn fn = resolve_prefill(is_fp16, page_size, arch, err);
   if (!fn) return false;
   fn(bucket,
      out,
@@ -191,8 +205,9 @@ const char* elem_sycl_type(bool is_fp16) {
   return is_fp16 ? "sycl::half" : "sycl::ext::oneapi::bfloat16";
 }
 
-uint64_t pack_sparse_key(bool is_fp16, int d_qk, int b_h, bool sink) {
-  uint64_t k = is_fp16 ? 1u : 0u;
+uint64_t pack_sparse_key(int arch, bool is_fp16, int d_qk, int b_h, bool sink) {
+  uint64_t k = static_cast<uint64_t>(arch) & 0xFF;
+  k = (k << 1) | (is_fp16 ? 1u : 0u);
   k = (k << 16) | (static_cast<uint64_t>(d_qk) & 0xFFFF);
   k = (k << 8) | (static_cast<uint64_t>(b_h) & 0xFF);
   k = (k << 1) | (sink ? 1u : 0u);
@@ -228,6 +243,7 @@ void* resolve_sparse(
     int d_qk,
     int b_h,
     bool sink,
+    int arch,
     const char* name_prefix,
     std::string* err) {
   const jit::JitConfig& cfg = jit::default_config();
@@ -246,10 +262,13 @@ void* resolve_sparse(
   spec.subs["D_QK"] = std::to_string(d_qk);
   spec.subs["B_H"] = std::to_string(b_h);
   spec.subs["HAS_ATTN_SINK"] = sink ? "1" : "0";
+  const jit::ArchProfile& prof = jit::arch_profile(static_cast<jit::Arch>(arch));
   spec.extra_flags = {"-DSGL_MLA_JIT_ENTRY"};
+  if (!prof.macro.empty()) spec.extra_flags.push_back("-D" + prof.macro);
+  spec.target = prof.target;
   spec.entry_symbol = entry;
   spec.name = std::string(name_prefix) + "_" + elem_tag(is_fp16) + "_" + std::to_string(d_qk) + "_" +
-              std::to_string(b_h) + "_" + (sink ? "1" : "0");
+              std::to_string(b_h) + "_" + (sink ? "1" : "0") + "_" + prof.suffix;
   return jit::get_or_compile(spec, cfg, err);
 }
 
@@ -273,8 +292,9 @@ bool sparse_decode_launch(
     double sm_scale,
     int64_t head_dim_v,
     bool is_fp8_kvcache,
+    int arch,
     std::string* err) {
-  const uint64_t key = pack_sparse_key(is_fp16, d_qk, b_h, has_attn_sink);
+  const uint64_t key = pack_sparse_key(arch, is_fp16, d_qk, b_h, has_attn_sink);
   SparseDecodeFn fn = nullptr;
   {
     std::lock_guard<std::mutex> lk(g_sparse_dec_mu);
@@ -289,6 +309,7 @@ bool sparse_decode_launch(
         d_qk,
         b_h,
         has_attn_sink,
+        arch,
         "mla_sparse_decode",
         err);
     if (!sym) return false;
@@ -327,8 +348,9 @@ bool sparse_prefill_launch(
     const void* topk_length,
     double sm_scale,
     int64_t head_dim_v,
+    int arch,
     std::string* err) {
-  const uint64_t key = pack_sparse_key(is_fp16, d_qk, b_h, has_attn_sink);
+  const uint64_t key = pack_sparse_key(arch, is_fp16, d_qk, b_h, has_attn_sink);
   SparsePrefillFn fn = nullptr;
   {
     std::lock_guard<std::mutex> lk(g_sparse_pre_mu);
@@ -343,6 +365,7 @@ bool sparse_prefill_launch(
         d_qk,
         b_h,
         has_attn_sink,
+        arch,
         "mla_sparse_prefill",
         err);
     if (!sym) return false;

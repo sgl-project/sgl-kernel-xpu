@@ -162,6 +162,7 @@ SGL_KERNEL_EXPORT void flash_mla_sparse_prefill(
             &topk_length,
             sm_scale,
             head_dim_v,
+            jit_arch_code(),
             &jit_err),
         jit_err);
   }

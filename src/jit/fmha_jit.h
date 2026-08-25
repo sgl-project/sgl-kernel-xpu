@@ -26,14 +26,23 @@ enum class DecodeOp {
 };
 
 // Launch a decode kernel. `is_fp16` selects the query dtype (false => bf16).
-// `page_size` is ignored for kDecodeNoPage. Returns true on success; on failure
-// returns false and, if `err` is non-null, fills it with a diagnostic.
+// `page_size` is ignored for kDecodeNoPage. `arch` is the sgl::jit::Arch code
+// (0=BMG/Xe20, 1=XE3P/Xe35) selecting the per-arch kernel build. Returns true on
+// success; on failure returns false and, if `err` is non-null, fills a diagnostic.
 bool decode_launch(
-    DecodeOp op, int qg, int head_dim, int page_size, bool is_fp16, const void* params, std::string* err = nullptr);
+    DecodeOp op,
+    int qg,
+    int head_dim,
+    int page_size,
+    bool is_fp16,
+    const void* params,
+    int arch = 0,
+    std::string* err = nullptr);
 
 // Force-compile (warm the cache) for a config without launching. Useful for
 // startup pre-warm to hide first-use compile latency.
-bool decode_prewarm(DecodeOp op, int qg, int head_dim, int page_size, bool is_fp16, std::string* err = nullptr);
+bool decode_prewarm(
+    DecodeOp op, int qg, int head_dim, int page_size, bool is_fp16, int arch = 0, std::string* err = nullptr);
 
 // Prefill-family kernel variants (each backed by its own *.cpp.in template).
 enum class PrefillOp {
@@ -43,10 +52,12 @@ enum class PrefillOp {
 };
 
 // Launch a prefill kernel. Prefill dispatches on head dim only; per-head-dim
-// tile params are resolved internally (mirroring FMHAPrefillXe20.cmake).
-bool prefill_launch(PrefillOp op, int head_dim, bool is_fp16, const void* params, std::string* err = nullptr);
+// tile params are resolved internally (mirroring FMHAPrefillXe20.cmake). `arch`
+// is the sgl::jit::Arch code selecting the per-arch kernel build.
+bool prefill_launch(
+    PrefillOp op, int head_dim, bool is_fp16, const void* params, int arch = 0, std::string* err = nullptr);
 
-bool prefill_prewarm(PrefillOp op, int head_dim, bool is_fp16, std::string* err = nullptr);
+bool prefill_prewarm(PrefillOp op, int head_dim, bool is_fp16, int arch = 0, std::string* err = nullptr);
 
 }  // namespace fmha_jit
 }  // namespace sgl

@@ -270,6 +270,7 @@ SGL_KERNEL_EXPORT void flash_mla_prefill(
             sm_scale,
             causal,
             num_kv_splits,
+            jit_arch_code(),
             &jit_err),
         jit_err);
   }

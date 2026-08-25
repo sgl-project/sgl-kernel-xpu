@@ -41,6 +41,7 @@ bool chunk_launch(
     int head_k_dim,
     int num_v_heads,
     int head_v_dim,
+    int arch = 0,
     std::string* err = nullptr);
 
 }  // namespace gdn_jit

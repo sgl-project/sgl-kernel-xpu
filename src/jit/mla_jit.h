@@ -27,6 +27,7 @@ bool mla_decode_launch(
     void* workspace,
     double sm_scale,
     int64_t num_kv_splits,
+    int arch = 0,
     std::string* err = nullptr);
 
 // Launch MLA prefill for (query dtype, page size). `bucket` selects the Q-tile
@@ -47,6 +48,7 @@ bool mla_prefill_launch(
     double sm_scale,
     bool causal,
     int64_t num_kv_splits,
+    int arch = 0,
     std::string* err = nullptr);
 
 // Launch sparse MLA decode (2-stage) for (dtype, d_qk, b_h, has_attn_sink).
@@ -69,6 +71,7 @@ bool sparse_decode_launch(
     double sm_scale,
     int64_t head_dim_v,
     bool is_fp8_kvcache,
+    int arch = 0,
     std::string* err = nullptr);
 
 // Launch sparse MLA prefill (2-stage) for (dtype, d_qk, b_h, has_attn_sink).
@@ -87,6 +90,7 @@ bool sparse_prefill_launch(
     const void* topk_length,
     double sm_scale,
     int64_t head_dim_v,
+    int arch = 0,
     std::string* err = nullptr);
 
 }  // namespace mla_jit

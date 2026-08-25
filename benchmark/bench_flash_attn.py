@@ -23,8 +23,11 @@ def flash_attn_baseline(
     v_descale=None,
 ):
     """Baseline Flash Attention implementation"""
+    # Kernel only supports LSE without local/sink masking.
+    return_lse = window_size == (-1, -1) and sinks is None
+
     if page_table is not None:
-        out, lse, *rest = flash_attn_with_kvcache(
+        result = flash_attn_with_kvcache(
             q,
             k_cache,
             v_cache,
@@ -38,11 +41,10 @@ def flash_attn_baseline(
             max_seqlen_q=max_seqlen_q,
             k_descale=k_descale,
             v_descale=v_descale,
-            return_softmax_lse=True,
+            return_softmax_lse=return_lse,
         )
-        return out, lse
     else:
-        out, lse, *rest = flash_attn_varlen_func(
+        result = flash_attn_varlen_func(
             q,
             k_cache,
             v_cache,
@@ -54,9 +56,14 @@ def flash_attn_baseline(
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
-            return_softmax_lse=True,
+            return_softmax_lse=return_lse,
         )
-        return out, lse
+
+    if return_lse:
+        out, lse, *_ = result
+    else:
+        out, lse = result, None
+    return out, lse
 
 
 def get_effective_attention_pairs(

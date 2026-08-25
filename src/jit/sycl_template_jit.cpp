@@ -151,31 +151,16 @@ const std::string& default_sycl_target() {
 
 const std::vector<std::string>& default_sycl_flags() {
   static const std::vector<std::string> flags = [] {
-    // NOTE: `-fsycl-targets` is intentionally NOT here -- it is appended
-    // per-spec in get_or_compile from CompileSpec::target (or
-    // default_sycl_target) so that Xe20 (BMG) and Xe35 (XE3P) kernels, whose
-    // device code differs, compile with distinct targets in the same process.
-    return std::vector<std::string>{
-        "-fsycl",
-        "-sycl-std=2020",
+    std::vector<std::string> flags{
         "-std=c++20",
-        "-O2",
         "-fPIC",
         "-shared",
-        "-ftemplate-backtrace-limit=0",
-        "-fno-sycl-unnamed-lambda",
-        "-fhonor-nans",
-        "-fhonor-infinities",
-        "-fno-associative-math",
-        "-fno-approx-func",
-        "-no-ftz",
-        "-fno-sycl-instrument-device-code",
-        "-D_GLIBCXX_USE_CXX11_ABI=1",
-        "-DCUTLASS_ENABLE_SYCL",
-        "-Xspirv-translator",
-        "-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,"
-        "+SPV_INTEL_subgroup_matrix_multiply_accumulate",
     };
+    std::istringstream input(SGL_JIT_SYCL_FLAGS);
+    for (std::string flag; input >> flag;) {
+      if (flag.find("-fsycl-targets=") != 0) flags.push_back(flag);
+    }
+    return flags;
   }();
   return flags;
 }

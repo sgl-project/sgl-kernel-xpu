@@ -2414,6 +2414,83 @@ if EXTENDED_KVCACHE_TESTS:
         assert 1 <= q_tile_slice <= total_q_tiles
         assert workspace_bytes <= 1024 * 1024 * 1024
 
+    @pytest.mark.skipif(
+        device.type != "xpu" or not is_fa3_supported(),
+        reason="ScoreBlock2D LSE coverage is only supported on BMG XPU",
+    )
+    def test_flash_attn_varlen_hd512_score_workspace_lse_head_slicing(
+        monkeypatch, capfd
+    ):
+        """LSE rows remain globally indexed when ScoreBlock2D slices Q heads."""
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+        batch_size = 1
+        nheads_q = 4
+        nheads_kv = 1
+        seqlen_q = 256
+        seqlen_k = 4096
+        head_dim = 512
+        torch.manual_seed(0)
+        # A Q tile stores 128 * 4096 fp16 scores (1 MiB) per Q head. The
+        # 2 MiB cap forces the four Q heads to launch as two head slices.
+        monkeypatch.setenv("FMHA_SCORE_WS_CAP_MB", "2")
+        monkeypatch.setenv("FMHA_SCORE_WS_VERBOSE", "1")
+
+        q = torch.randn(
+            batch_size * seqlen_q,
+            nheads_q,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        k = torch.randn(
+            batch_size * seqlen_k,
+            nheads_kv,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        v = torch.randn(
+            batch_size * seqlen_k,
+            nheads_kv,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        cu_seqlens_q = torch.tensor([0, seqlen_q], device=device, dtype=torch.int32)
+        cu_seqlens_k = torch.tensor([0, seqlen_k], device=device, dtype=torch.int32)
+
+        out, lse = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqlen_q,
+            seqlen_k,
+            return_softmax_lse=True,
+        )
+        torch.xpu.synchronize()
+
+        _, _, lse_ref = attention_ref(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            softmax_scale=head_dim**-0.5,
+            return_lse=True,
+        )
+        _check_softmax_lse(
+            lse,
+            nheads_q,
+            batch_size * seqlen_q,
+            lse_ref.squeeze(0),
+        )
+        assert out.shape == (batch_size * seqlen_q, nheads_q, head_dim)
+        _, stderr = capfd.readouterr()
+        match = re.search(r"query_head_slice=(\d+)", stderr)
+        assert match, f"missing ScoreBlock2D workspace report: {stderr}"
+        assert int(match.group(1)) < nheads_q
+
     @pytest.mark.parametrize(
         "batch_size,nheads_q,nheads_kv",
         [

@@ -783,6 +783,7 @@ void mha_fwd_nopage(
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
 
   params.softmax_lse_ptr = softmax_lse.has_value() ? softmax_lse->data_ptr() : nullptr;
+  params.return_softmax_lse = softmax_lse.has_value();
 
   params.b = batch_size;
   params.h = num_heads;

@@ -344,6 +344,9 @@ struct PrefillRunner {
     args.kernel.O += size_t(query_head) * size_t(head_size_vo);
     args.kernel.K_cache += size_t(kv_head) * size_t(head_size_qk);
     args.kernel.V_cache += size_t(kv_head) * size_t(head_size_vo);
+    if (args.kernel.softmax_lse != nullptr) {
+      args.kernel.softmax_lse += size_t(query_head) * size_t(args.kernel.lse_head_stride);
+    }
     return args;
   }
 

@@ -151,16 +151,32 @@ const std::string& default_sycl_target() {
 
 const std::vector<std::string>& default_sycl_flags() {
   static const std::vector<std::string> flags = [] {
-    std::vector<std::string> flags{
-        "-std=c++20",
-        "-fPIC",
-        "-shared",
-    };
+    // All flags (host + kernel + device-link + -shared) are sourced from CMake
+    // via SGL_JIT_SYCL_FLAGS so the JIT compile mirrors the AOT build. Drop the
+    // AOT -fsycl-targets token; the per-spec JIT target is appended by the caller.
+    std::vector<std::string> flags;
     std::istringstream input(SGL_JIT_SYCL_FLAGS);
     for (std::string flag; input >> flag;) {
       if (flag.find("-fsycl-targets=") != 0) flags.push_back(flag);
     }
     return flags;
+  }();
+  return flags;
+}
+
+const std::vector<std::string>& default_xs_flags() {
+  // AOT hands the IGC/ocloc backend its codegen options (correctly-rounded fp32
+  // div/sqrt, >4GB buffers, auto large-GRF, fp64 poison) via `-Xs`; mirror them
+  // so JIT device code matches its AOT sibling. One -Xs argument, never split.
+  // SGL_JIT_XS_FLAGS is always defined alongside SGL_JIT_SYCL_FLAGS by the
+  // sgl_jit target; it is empty only when the AOT CG options are empty.
+  static const std::vector<std::string> flags = [] {
+    std::vector<std::string> f;
+    if (std::string xs = SGL_JIT_XS_FLAGS; !xs.empty()) {
+      f.push_back("-Xs");
+      f.push_back(std::move(xs));
+    }
+    return f;
   }();
   return flags;
 }
@@ -215,6 +231,10 @@ void* get_or_compile(const CompileSpec& spec, const JitConfig& config, std::stri
   // separately in one process. It is part of `flags` => part of the cache key
   // below, so each target gets its own cached .so.
   flags.push_back("-fsycl-targets=" + (spec.target.empty() ? default_sycl_target() : spec.target));
+  // Mirror the AOT `-Xs` device-backend codegen options so JIT device code
+  // matches its AOT sibling (see default_xs_flags()).
+  for (const auto& f : default_xs_flags())
+    flags.push_back(f);
 
   // Cache key: rendered source + compile/link inputs + entry + compiler identity.
   // link_flags and the compiler path are keyed so a shared cache dir never

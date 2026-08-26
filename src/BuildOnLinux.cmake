@@ -3,6 +3,17 @@
 set(SGL_OPS_LIBRARIES)
 set(SYCL_LINK_LIBRARIES_KEYWORD PRIVATE)
 
+# AOT device link flags, shared by every SYCL kernel library below and reused
+# verbatim by the runtime-JIT compile so both paths link identically.
+if(SYCL_COMPILER_VERSION GREATER_EQUAL 20250806)
+  set(COMMON_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS})
+  set(COMMON_DEVICE_LINK_FLAGS ${COMMON_DEVICE_LINK_FLAGS} ${SGL_SYCL_SPIRV_EXT_FLAGS})
+else()
+  message(FATAL_ERROR
+      "SYCL compiler version must be >= 20250806, "
+      "but got ${SYCL_COMPILER_VERSION}")
+endif()
+
 # Runtime-JIT engine (pure host C++, depends only on libdl). Linked into the
 # SYCL libraries whose dispatch renders/compiles the *.cpp.in templates on
 # demand (flash_attention for FMHA, GroupGemmXe20 for MoE grouped GEMM).
@@ -16,17 +27,28 @@ if(USE_SYCL_JIT)
     ${SGL_OPS_XPU_ROOT}/src/jit/gdn_jit.cpp)
   set_target_properties(sgl_jit PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_include_directories(sgl_jit PUBLIC ${SGL_OPS_XPU_ROOT}/src)
-  # cutlass-sycl headers (e.g. cute/util/debug.hpp) select the SYCL backend only
-  # when CUTLASS_ENABLE_SYCL is defined; the AOT build sets it globally via
-  # add_compile_definitions, so mirror it into the runtime-JIT compile flags or
-  # the on-demand icpx compile falls back to the CUDA path and fails on
-  # <cuda_runtime_api.h>. The spirv-translator extensions mirror the AOT
-  # SYCL_DEVICE_LINK_FLAGS so device codegen (split barrier, 2D block IO,
-  # subgroup MMA) is enabled for the single-shot JIT compile+link.
+  # Feed the runtime-JIT compile the exact AOT flags: host flags (-fPIC,
+  # -std=c++20, visibility, warnings) + kernel compile options + shared
+  # device-link flags, so a JIT-compiled kernel is byte-for-byte equivalent to
+  # its AOT sibling. -shared makes the single-shot compile emit a .so;
+  # -DCUTLASS_ENABLE_SYCL is added on top because the AOT build supplies it
+  # globally via add_compile_definitions (not part of SYCL_COMPILE_FLAGS) and
+  # without it cutlass-sycl headers take the CUDA path and fail on
+  # <cuda_runtime_api.h>. default_sycl_flags() drops the -fsycl-targets token so
+  # the per-arch JIT target wins.
   string(REPLACE ";" " " SGL_JIT_SYCL_FLAGS_VALUE
-    "${SYCL_COMPILE_FLAGS};-DCUTLASS_ENABLE_SYCL;-Xspirv-translator;-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate")
+    "-shared;${SYCL_HOST_FLAGS};${SYCL_COMPILE_FLAGS};${COMMON_DEVICE_LINK_FLAGS};-DCUTLASS_ENABLE_SYCL")
+  # AOT feeds the IGC/ocloc backend the -cl-* codegen options via `-Xs` at the
+  # device-link step (SYCL_OFFLINE_COMPILER_CG_OPTIONS). The single-shot JIT must
+  # pass the same options (e.g. correctly-rounded fp32 div/sqrt, >4GB buffers,
+  # auto large-GRF) or its device code diverges from the AOT sibling. Kept as a
+  # separate macro: it is one `-Xs` argument and must NOT be whitespace-split
+  # like SGL_JIT_SYCL_FLAGS. The AOT `-device` selector is omitted because the
+  # per-arch -fsycl-targets alias already fixes the JIT device.
+  string(STRIP "${SYCL_OFFLINE_COMPILER_CG_OPTIONS}" SGL_JIT_XS_FLAGS_VALUE)
   target_compile_definitions(sgl_jit PRIVATE
-    SGL_JIT_SYCL_FLAGS=\"${SGL_JIT_SYCL_FLAGS_VALUE}\")
+    SGL_JIT_SYCL_FLAGS=\"${SGL_JIT_SYCL_FLAGS_VALUE}\"
+    SGL_JIT_XS_FLAGS=\"${SGL_JIT_XS_FLAGS_VALUE}\")
   target_compile_features(sgl_jit PRIVATE cxx_std_17)
   target_link_libraries(sgl_jit PUBLIC ${CMAKE_DL_LIBS})
 endif()
@@ -45,16 +67,6 @@ macro(setup_common_libraries)
 endmacro()
 
 setup_common_libraries()
-
-if(SYCL_COMPILER_VERSION GREATER_EQUAL 20250806)
-  set(COMMON_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS})
-  set(COMMON_DEVICE_LINK_FLAGS ${COMMON_DEVICE_LINK_FLAGS} -Xspirv-translator)
-  set(COMMON_DEVICE_LINK_FLAGS ${COMMON_DEVICE_LINK_FLAGS} -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-else()
-  message(FATAL_ERROR
-      "SYCL compiler version must be >= 20250806, "
-      "but got ${SYCL_COMPILER_VERSION}")
-endif()
 
 # common kernels
 foreach(sycl_src ${ATen_XPU_SYCL_COMMON})

@@ -75,6 +75,7 @@ suites = {
         TestFile("test_sconv_metadata_and_windows.py"),
         TestFile("test_sconv_update_sconv_cache.py"),
         TestFile("test_inkling_attn_prologue.py"),
+        TestFile("test_hisparse.py"),
     ],
     # Nightly suite: exercises the wheel installed in the intel/sgl-kernel-xpu-dev
     # nightly image. Populate with longer-running or full-shape tests that are

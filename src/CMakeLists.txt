@@ -9,7 +9,7 @@
 #   USE_MLA  -> MLA decode/prefill/sparse-decode kernels
 #   USE_MLA_SPARSE_FUSED -> fused (single-pass) sparse-MLA-decode kernel (optimization track)
 #
-# All default to ON. Each toggle can be set either as a CMake option
+# Defaults are set in the option() declarations below. Each toggle can be set either as a CMake option
 # (-DUSE_MOE=OFF) or, for convenience with `pip install`, via an environment
 # variable of the same name (e.g. `USE_MOE=OFF pip install -v .` or
 # `USE_MOE=0 pip install -v .`). Both `OFF` and `0` (case-insensitive) disable a
@@ -74,6 +74,7 @@ if(NOT USE_FMHA)
 endif()
 if(NOT USE_GDN)
     list(FILTER device_cpp EXCLUDE REGEX "/gdn_attention_Xe20\\.cpp$")
+    list(FILTER device_cpp EXCLUDE REGEX "/gdn_attn_workspace\\.cpp$")
 endif()
 if(NOT USE_MLA)
     list(FILTER device_cpp EXCLUDE REGEX "/mla_(decode|prefill|sparse_decode)\\.cpp$")

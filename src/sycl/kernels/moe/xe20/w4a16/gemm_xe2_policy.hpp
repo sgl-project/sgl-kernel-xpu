@@ -54,6 +54,17 @@ class w4a16_policy : public xe_gemm_policy_base {
   using SGLayout = Layout<Shape<_4, _8, _1>, Stride<_8, _1, _0>>;
 };
 
+template <int BlkM, int BlkN, int SgCountM, int SgCountN>
+class w4a16_tile : public xe_gemm_policy_base {
+ public:
+  using WGTile = Shape<Int<BlkM>, Int<BlkN>, _32>;
+  using SGLayout = Layout<Shape<Int<SgCountM>, Int<SgCountN>, _1>, Stride<Int<SgCountN>, _1, _0>>;
+};
+
+// GPT-OSS prefill tile from the optimized implementation.
+using w4a16_policy_m_64 = w4a16_tile<64, 256, 1, 16>;
+using w4a16_policy_m_64_n128 = w4a16_tile<64, 128, 1, 8>;
+
 // avg_m <= 4
 class w4a16_policy_m_8 : public xe_gemm_policy_base {
  public:

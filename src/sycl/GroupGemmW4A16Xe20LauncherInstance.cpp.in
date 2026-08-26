@@ -35,6 +35,8 @@ void MoEGEMMLauncher(
         const int gemm_n,
         const int gemm_k,
         const int* rows_per_expert,
+        const int* row_offsets,
+        const int total_rows,
         const int num_experts,
         const int group_size,
         int32_t* atomic_buffer) {
@@ -64,12 +66,28 @@ void MoEGEMMLauncher(
     using GmemTiledCopyA = typename policy::GmemTiledCopyA;
     using GmemTiledCopyB = typename policy::GmemTiledCopyB;
     using GmemTiledCopyD = typename policy::GmemTiledCopyD;
+    // The GPT-OSS prefill policies use the measured short pipeline. GEMM2's
+    // narrower N tile amortizes its work-stealing atomic over four tiles.
+    static constexpr bool kWidePrefillTile = std::is_same_v<policy, w4a16_policy_m_64>;
+    static constexpr bool kNarrowPrefillTile = std::is_same_v<policy, w4a16_policy_m_64_n128>;
+    static constexpr int kStealChunk = kNarrowPrefillTile ? 4 : 1;
+    static constexpr int kPrefetchDist = (kWidePrefillTile || kNarrowPrefillTile) ? 2 : 3;
 
     stream.submit([&](sycl::handler& cgh) {
         sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), cgh);
         cgh.parallel_for<GemmCuteName<ElementA, ElementB, ElementS, ElementD, HasZero, layoutA, layoutB, policy>>(
                 sycl::nd_range<3>{global * local, local}, kernel_props, [=](auto) {
-            moe_w4a16::MoEGEMM<GmemTiledCopyA, GmemTiledCopyB, GmemTiledCopyD, layoutA, layoutB, 'R', HasZero>(
+            moe_w4a16::MoEGEMM<
+                    GmemTiledCopyA,
+                    GmemTiledCopyB,
+                    GmemTiledCopyD,
+                    layoutA,
+                    layoutB,
+                    'R',
+                    HasZero,
+                    kDiagNone,
+                    kStealChunk,
+                    kPrefetchDist>(
                     activations,
                     weights,
                     scales,
@@ -78,6 +96,8 @@ void MoEGEMMLauncher(
                     outputs,
                     mma,
                     rows_per_expert,
+                    row_offsets,
+                    total_rows,
                     num_experts,
                     group_size,
                     gemm_n,
@@ -100,6 +120,8 @@ void w4a16_launch(
         const int gemm_n,
         const int gemm_k,
         const int* rows_per_expert,
+        const int* row_offsets,
+        const int total_rows,
         const int num_experts,
         const int group_size,
         int32_t* atomic_buffer) {
@@ -116,6 +138,8 @@ void w4a16_launch(
                 gemm_n,
                 gemm_k,
                 rows_per_expert,
+                row_offsets,
+                total_rows,
                 num_experts,
                 group_size,
                 atomic_buffer);
@@ -144,6 +168,8 @@ void moe_w4a16::w4a16_launch<moe_w4a16::@POLICY@, @ELEMENT_S@, @ELEMENT_A@>(
     const int,
     const int,
     const int*,
+    const int*,
+    const int,
     const int,
     const int,
     int32_t*);

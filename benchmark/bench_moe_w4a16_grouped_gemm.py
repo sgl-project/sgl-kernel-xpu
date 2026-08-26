@@ -27,6 +27,10 @@
 # includes GPT-OSS geometry (4 local experts, hidden=2880, intermediate=2880).
 # Set SGL_MOE_BENCH_FULL_SHAPES=1 to also include DeepSeek-V4 geometry (32 local
 # experts, hidden=4096, intermediate=2048) and higher-load model points.
+# Set SGL_MOE_BENCH_CLAIM_ONLY=1 for the Arc Pro B60 claim shape from the
+# optimized W4A16 kernel: E=128, M=128, N=1472, K=2880.
+# Set SGL_MOE_BENCH_GPT_OSS=1 to additionally run the two real GPT-OSS-120B
+# TP=4 prefill-L0 routing examples from the upstream W4A16 benchmark.
 #
 # Run:
 #   python benchmark/bench_moe_w4a16_grouped_gemm.py
@@ -99,10 +103,155 @@ FULL_BENCH_SHAPES = QUICK_BENCH_SHAPES + [
 ]
 
 RUN_FULL_SHAPES = os.environ.get("SGL_MOE_BENCH_FULL_SHAPES") == "1"
-BENCH_SHAPES = FULL_BENCH_SHAPES if RUN_FULL_SHAPES else QUICK_BENCH_SHAPES
+RUN_CLAIM_ONLY = os.environ.get("SGL_MOE_BENCH_CLAIM_ONLY") == "1"
+CLAIM_BENCH_SHAPES = [(128, 128, 1472, 2880)]
+BENCH_SHAPES = (
+    CLAIM_BENCH_SHAPES
+    if RUN_CLAIM_ONLY
+    else FULL_BENCH_SHAPES if RUN_FULL_SHAPES else QUICK_BENCH_SHAPES
+)
+
+# Per-expert routed rows for GPT-OSS-120B TP=4 prefill layer 0.  Keeping the
+# real, ragged distribution is important: it exercises work stealing and the
+# 64x256/64x128 dispatch decisions that a uniform average cannot represent.
+GPT_OSS_120B_TP4_L0_ROWS = (
+    50,
+    32,
+    48,
+    37,
+    60,
+    54,
+    32,
+    267,
+    100,
+    33,
+    72,
+    12,
+    1422,
+    47,
+    70,
+    176,
+    474,
+    21,
+    76,
+    35,
+    47,
+    72,
+    45,
+    37,
+    41,
+    101,
+    27,
+    102,
+    699,
+    48,
+    65,
+    80,
+    43,
+    46,
+    62,
+    59,
+    114,
+    12,
+    33,
+    4,
+    56,
+    74,
+    86,
+    56,
+    74,
+    78,
+    199,
+    3,
+    138,
+    36,
+    98,
+    81,
+    42,
+    228,
+    58,
+    205,
+    117,
+    82,
+    88,
+    47,
+    107,
+    58,
+    56,
+    78,
+    69,
+    128,
+    51,
+    88,
+    110,
+    55,
+    83,
+    349,
+    51,
+    67,
+    67,
+    30,
+    1028,
+    58,
+    46,
+    55,
+    39,
+    39,
+    52,
+    538,
+    398,
+    112,
+    72,
+    190,
+    196,
+    21,
+    61,
+    33,
+    35,
+    23,
+    208,
+    43,
+    39,
+    18,
+    46,
+    137,
+    53,
+    42,
+    57,
+    682,
+    48,
+    124,
+    32,
+    32,
+    151,
+    29,
+    56,
+    82,
+    53,
+    59,
+    98,
+    88,
+    39,
+    151,
+    51,
+    124,
+    39,
+    45,
+    49,
+    80,
+    85,
+    40,
+    20,
+    2340,
+)
+GPT_OSS_BENCH_EXAMPLES = (
+    ("gpt-oss-120b-tp4-prefill-l0-gemm1", 1472, 2880, GPT_OSS_120B_TP4_L0_ROWS),
+    ("gpt-oss-120b-tp4-prefill-l0-gemm2", 2880, 736, GPT_OSS_120B_TP4_L0_ROWS),
+)
 print(
     f"[config] grouped-GEMM shape set: "
-    f"{'full' if RUN_FULL_SHAPES else 'quick'} ({len(BENCH_SHAPES)} shapes)",
+    f"{'claim-only' if RUN_CLAIM_ONLY else 'full' if RUN_FULL_SHAPES else 'quick'} "
+    f"({len(BENCH_SHAPES)} shapes)",
     flush=True,
 )
 
@@ -255,6 +404,7 @@ def _prepare_inputs(
     gemm_k: int,
     recipe: str = "mxfp4",
     backend: str = "sgl",
+    rows_per_expert: tuple[int, ...] | None = None,
 ):
     """Build the XPU tensors for one provider.
 
@@ -278,8 +428,12 @@ def _prepare_inputs(
     torch.manual_seed(0)
     torch.xpu.manual_seed_all(0)
 
-    total_m = num_experts * avg_m
-    total_rows = torch.full((num_experts,), avg_m, dtype=torch.int32, device="xpu")
+    if rows_per_expert is None:
+        rows_per_expert = (avg_m,) * num_experts
+    if len(rows_per_expert) != num_experts:
+        raise ValueError("rows_per_expert length must equal num_experts")
+    total_m = sum(rows_per_expert)
+    total_rows = torch.tensor(rows_per_expert, dtype=torch.int32, device="xpu")
 
     a = torch.empty((total_m, gemm_k), dtype=torch.bfloat16, device="xpu").normal_(
         0, 0.01
@@ -316,6 +470,7 @@ def _prepare_inputs(
         "gemm_n": gemm_n,
         "gemm_k": gemm_k,
         "avg_m": avg_m,
+        "rows_per_expert": rows_per_expert,
         "num_experts": num_experts,
         "group_size": group_size,
         "is_int4": is_int4,
@@ -570,9 +725,55 @@ def _correctness_check(rel_tol=CORRECTNESS_REL_TOL):
         )
 
 
+def _run_gpt_oss_benchmark_examples():
+    """Device-time MXFP4 measurements for the upstream GPT-OSS claim cases."""
+    if os.environ.get("SGL_MOE_BENCH_GPT_OSS") != "1":
+        return
+
+    rows = []
+    for name, n, k, routed_rows in GPT_OSS_BENCH_EXAMPLES:
+        inputs = _prepare_inputs(
+            len(routed_rows),
+            sum(routed_rows) // len(routed_rows),
+            n,
+            k,
+            "mxfp4",
+            "sgl",
+            routed_rows,
+        )
+        for _ in range(20):
+            _run_mxfp4_fused(inputs)
+        torch.xpu.synchronize()
+        ms = triton.testing.do_bench(
+            lambda: _run_mxfp4_fused(inputs), warmup=20, rep=300, quantiles=[0.5]
+        )
+        total_m = inputs["total_m"]
+        tflops = 2 * total_m * n * k / (ms / 1e3) / 1e12
+        rows.append(
+            {
+                "workload": name,
+                "experts": len(routed_rows),
+                "total_m": total_m,
+                "N": n,
+                "K": k,
+                "median_ms": round(ms, 4),
+                "TOPS": round(tflops, 2),
+            }
+        )
+        del inputs
+        gc.collect()
+        torch.xpu.empty_cache()
+
+    import pandas as pd
+
+    print("\n[GPT-OSS-120B upstream routing benchmarks; device-time median]")
+    print(pd.DataFrame(rows).to_markdown(index=False))
+
+
 if __name__ == "__main__":
     _correctness_check()
     benchmark.run(print_data=False)
+    _run_gpt_oss_benchmark_examples()
     print("\nBenchmark finished!\n")
     import pandas as pd
 

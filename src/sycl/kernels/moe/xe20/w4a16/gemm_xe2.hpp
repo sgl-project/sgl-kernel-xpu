@@ -41,6 +41,7 @@
 #include "cutlass/kernel_hardware_info.h"
 #include "cutlass/platform/platform.h"
 #include "cutlass/tensor_ref.h"
+#include "mxfp4_dequant.hpp"
 
 #pragma clang diagnostic ignored "-Wpass-failed"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -74,6 +75,15 @@ CUTE_DEVICE TB apply_scale(TB& x, float& y) {
 #endif
   return sycl::bit_cast<TB>(z);
 }
+
+enum Diag : int {
+  kDiagNone = 0,
+  kDiagConstScale = 1,
+  kDiagNoDequant = 2,
+  kDiagNoPrefetch = 4,
+  kDiagUnfusedScale = 16,
+  kDiagScalePrefetch = 32,
+};
 
 template <
     class GmemTiledCopyA,
@@ -229,6 +239,8 @@ template <
     class GmemTiledCopyC,
     int GroupSize,
     bool HasZero,
+    int DiagMask,
+    int PrefetchDist,
     class ATensor,
     class BTensor,
     class DTensor,
@@ -296,9 +308,8 @@ CUTE_DEVICE void xe_gemm_4bits(
   auto pAgA = thr_prefetch_A.partition_S(gA);
   auto pBgB = thr_prefetch_B.partition_S(gB);
 
-  const int prefetch_dist = 6;
-
-  constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
+  static_assert(PrefetchDist > 0, "prefetch distance must be positive");
+  constexpr int prefetch_dist = PrefetchDist;
 
   int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
   int k_tile_prefetch = 0;
@@ -329,18 +340,61 @@ CUTE_DEVICE void xe_gemm_4bits(
   scaleStoreType scales[thr_N * channel_num];
   conditional_t<HasZero, TA, uint8_t> zeros[thr_N * channel_num];
 
+  const int scale_col_bound = size<0>(B.shape()) - 1;
+  int scale_col_offset[thr_N * channel_num];
+  CUTLASS_PRAGMA_UNROLL
+  for (int n = 0; n < thr_N; ++n) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int c = 0; c < channel_num; ++c) {
+      const int col = n_tile_start + n_sg_start + n * sg_local_range + x_idx + c * (sg_local_range / channel_num);
+      scale_col_offset[n * channel_num + c] = cute::min(col, scale_col_bound) * group_num;
+    }
+  }
+
+  static constexpr bool kFuseDequant = std::is_same_v<TB, float_e2m1_t> && std::is_same_v<TA, bfloat16_t> && !HasZero &&
+                                       !(DiagMask & (kDiagUnfusedScale | kDiagNoDequant | kDiagConstScale));
+  intel::vector_t<float, 2> mul_pairs[kFuseDequant ? thr_N : 1];
+  static constexpr int frag_mode0 = size<0>(tCrB.shape());
+  auto mul_of = [&](auto dv) -> intel::vector_t<float, 2> const& {
+    constexpr int n = (decltype(dv)::value / frag_mode0) % thr_N;
+    return mul_pairs[n];
+  };
+  if constexpr (kFuseDequant) {
+    using BFragLayout = decltype(tCrB.layout());
+    static_assert(channel_num == 2, "the folded multiply covers exactly two channels");
+    static_assert(std::is_same_v<scaleStoreType, float>, "the folded multiply takes f32 multipliers");
+    static_assert(
+        stride<0, 0>(BFragLayout{}) == 1 && stride<0, 1>(BFragLayout{}) == channel_num &&
+            (thr_N == 1 || stride<1>(BFragLayout{}) == frag_mode0),
+        "the folded dequant needs a channel-innermost B fragment with n above mode 0");
+    static_assert(frag_mode0 % 8 == 0, "an 8-value reorder chunk must stay inside one n-block");
+  }
+
   clear(tCrC);
 
   using ElementB = typename BTensor::element_type;
   static constexpr bool is_B_fp8_type =
       std::is_same_v<ElementB, cutlass::float_e5m2_t> || std::is_same_v<ElementB, cutlass::float_e4m3_t>;
 
+  if constexpr (DiagMask & kDiagConstScale) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < thr_N * channel_num; ++i)
+      scales[i] = scaleStoreType(1.0f);
+  }
+
+  static constexpr int kScalePrefetchSlop = 64;
+  const int scale_prefetch_bound = (scale_col_bound + 1) * group_num - kScalePrefetchSlop;
   auto prefetch_scale_group = [&](int scale_k_tile) {
+    if constexpr (!(DiagMask & kDiagScalePrefetch)) return;
+    if constexpr (DiagMask & kDiagConstScale) return;
     if (scale_k_tile >= k_tile_count || scale_k_tile * tile_k % group_size != 0) {
       return;
     }
 
     int scale_group_idx = scale_k_tile * tile_k / group_size;
+    if ((n_tile_start + n_sg_start + SG_N - 1) * group_num + scale_group_idx > scale_prefetch_bound) {
+      return;
+    }
     auto next_scales_tensor = make_tensor(
         make_gmem_ptr(
             reinterpret_cast<const ElementS*>(Scales + (n_tile_start + n_sg_start) * group_num + scale_group_idx)),
@@ -353,56 +407,68 @@ CUTE_DEVICE void xe_gemm_4bits(
 
   CUTE_UNROLL
   for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
-    prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
-    prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+    if constexpr (!(DiagMask & kDiagNoPrefetch)) {
+      prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
+      prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+    }
     prefetch_scale_group(k_tile_prefetch);
   }
 
   for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
-    barrier_arrive(barrier_scope);
-
     copy(copy_a, tAgA(_, _, _, k_tile), tArA);
     copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
 
-    if (k_tile * tile_k % group_size == 0) {
+    if (!(DiagMask & kDiagConstScale) && k_tile * tile_k % group_size == 0) {
       int group_idx = (k_tile * tile_k) / group_size;
 
       CUTLASS_PRAGMA_UNROLL
       for (int n = 0; n < thr_N; ++n) {
         CUTLASS_PRAGMA_UNROLL
         for (int c = 0; c < channel_num; ++c) {
-          int real_idx = x_idx + c * (sg_local_range / channel_num);
-          int sg_local_n = n * sg_local_range + real_idx;
+          int idx = scale_col_offset[n * channel_num + c] + group_idx;
           scaleStoreType scale;
           if constexpr (std::is_same_v<TB, int4_t>) {
-            scale = Scales[(n_tile_start + n_sg_start + sg_local_n) * group_num + group_idx];
+            scale = Scales[idx];
           } else if constexpr (std::is_same_v<TB, uint4_t>) {
-            int idx = (n_tile_start + n_sg_start + sg_local_n) * group_num + group_idx;
             scale = static_cast<scaleStoreType>(Scales[idx]);
             if constexpr (HasZero) {
               zeros[n * channel_num + c] = static_cast<TA>(Zeros[idx]);
             }
           } else if constexpr (std::is_same_v<TB, float_e2m1_t>) {
-            uint32_t scale_u32 = Scales[(n_tile_start + n_sg_start + sg_local_n) * group_num + group_idx] << 23;
-            scale = static_cast<scaleStoreType>(reinterpret_cast<float&>(scale_u32));
+            uint8_t e8m0 = Scales[idx];
+            if constexpr (kFuseDequant) {
+              scale = mxfp4_fold_multiplier(e8m0);
+            } else {
+              uint32_t scale_u32 = static_cast<uint32_t>(e8m0) << 23;
+              scale = static_cast<scaleStoreType>(reinterpret_cast<float&>(scale_u32));
+            }
           }
 
           scales[n * channel_num + c] = scale;
+          if constexpr (kFuseDequant) {
+            mul_pairs[n][c] = scale;
+          }
         }
       }
     }
 
     if (k_tile_prefetch < k_tile_count) {
-      prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
-      prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+      if constexpr (!(DiagMask & kDiagNoPrefetch)) {
+        prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
+        prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+      }
     }
     prefetch_scale_group(k_tile_prefetch);
 
     reorder(tArA, tCrA);
-    reorder(tBrB, tCrB);
+    if constexpr (kFuseDequant) {
+      mxfp4_reorder_dequant(tBrB, tCrB, mul_of);
+    } else {
+      reorder(tBrB, tCrB);
+    }
 
     CUTLASS_PRAGMA_UNROLL
-    for (int n = 0; n < thr_N; ++n) {
+    for (int n = 0; n < thr_N && !kFuseDequant && !(DiagMask & kDiagNoDequant); ++n) {
       CUTLASS_PRAGMA_UNROLL
       for (int c = 0; c < channel_num; ++c) {
         CUTLASS_PRAGMA_UNROLL
@@ -427,8 +493,10 @@ CUTE_DEVICE void xe_gemm_4bits(
     }
 
     cute::gemm(mma, tCrA, tCrB, tCrC);
+  }
 
-    barrier_wait(barrier_scope);
+  if constexpr (kFuseDequant) {
+    mxfp4_unfold(tCrC);
   }
 
   if (Bias != nullptr) {

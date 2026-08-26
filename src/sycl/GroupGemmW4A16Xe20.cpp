@@ -54,6 +54,8 @@ void w4a16_launch(
     const int gemm_n,
     const int gemm_k,
     const int* rows_per_expert,
+    const int* row_offsets,
+    const int total_rows,
     const int num_experts,
     const int group_size,
     int32_t* atomic_buffer);
@@ -71,6 +73,8 @@ void w4a16_launch(
       const int,                                                                       \
       const int,                                                                       \
       const int*,                                                                      \
+      const int*,                                                                      \
+      const int,                                                                       \
       const int,                                                                       \
       const int,                                                                       \
       int32_t*);
@@ -84,7 +88,8 @@ void w4a16_launch(
 DECLARE_W4A16_POLICY(w4a16_policy_m_8)
 DECLARE_W4A16_POLICY(w4a16_policy_m_16)
 DECLARE_W4A16_POLICY(w4a16_policy_m_32)
-DECLARE_W4A16_POLICY(w4a16_policy)
+DECLARE_W4A16_POLICY(w4a16_policy_m_64)
+DECLARE_W4A16_POLICY(w4a16_policy_m_64_n128)
 
 #undef DECLARE_W4A16_POLICY
 #undef DECLARE_W4A16_EXTERN
@@ -191,6 +196,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
   at::Tensor atomic_buffer = at::empty({static_cast<long>(1)}, activations.options().dtype(at::kInt));
+  queue.memset(atomic_buffer.data_ptr<int>(), 0, sizeof(int32_t));
 
   const int avg_m = total_m / static_cast<int>(n_experts);
   const bool is_fp16_act = activations.scalar_type() == at::ScalarType::Half;
@@ -209,6 +215,8 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
             gemm_n,                                                                           \
             gemm_k,                                                                           \
             rows_per_expert.data_ptr<int>(),                                                  \
+            nullptr,                                                                          \
+            total_m,                                                                          \
             static_cast<int>(n_experts),                                                      \
             static_cast<int>(group_size),                                                     \
             atomic_buffer.data_ptr<int>());                                                   \
@@ -224,6 +232,8 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
             gemm_n,                                                                           \
             gemm_k,                                                                           \
             rows_per_expert.data_ptr<int>(),                                                  \
+            nullptr,                                                                          \
+            total_m,                                                                          \
             static_cast<int>(n_experts),                                                      \
             static_cast<int>(group_size),                                                     \
             atomic_buffer.data_ptr<int>());                                                   \
@@ -241,6 +251,8 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
             gemm_n,                                                                           \
             gemm_k,                                                                           \
             rows_per_expert.data_ptr<int>(),                                                  \
+            nullptr,                                                                          \
+            total_m,                                                                          \
             static_cast<int>(n_experts),                                                      \
             static_cast<int>(group_size),                                                     \
             atomic_buffer.data_ptr<int>());                                                   \
@@ -256,6 +268,8 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
             gemm_n,                                                                           \
             gemm_k,                                                                           \
             rows_per_expert.data_ptr<int>(),                                                  \
+            nullptr,                                                                          \
+            total_m,                                                                          \
             static_cast<int>(n_experts),                                                      \
             static_cast<int>(group_size),                                                     \
             atomic_buffer.data_ptr<int>());                                                   \
@@ -263,17 +277,19 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
     }                                                                                         \
   } while (0)
 
-#define DISPATCH_W4A16_POLICY()        \
-  do {                                 \
-    if (avg_m <= 4) {                  \
-      LAUNCH_W4A16(w4a16_policy_m_8);  \
-    } else if (avg_m <= 8) {           \
-      LAUNCH_W4A16(w4a16_policy_m_16); \
-    } else if (avg_m <= 128) {         \
-      LAUNCH_W4A16(w4a16_policy_m_32); \
-    } else {                           \
-      LAUNCH_W4A16(w4a16_policy);      \
-    }                                  \
+#define DISPATCH_W4A16_POLICY()             \
+  do {                                      \
+    if (avg_m <= 4) {                       \
+      LAUNCH_W4A16(w4a16_policy_m_8);       \
+    } else if (avg_m <= 8) {                \
+      LAUNCH_W4A16(w4a16_policy_m_16);      \
+    } else if (avg_m <= 32) {               \
+      LAUNCH_W4A16(w4a16_policy_m_32);      \
+    } else if (gemm_k <= 1024) {            \
+      LAUNCH_W4A16(w4a16_policy_m_64_n128); \
+    } else {                                \
+      LAUNCH_W4A16(w4a16_policy_m_64);      \
+    }                                       \
   } while (0)
 
   DISPATCH_W4A16_POLICY();

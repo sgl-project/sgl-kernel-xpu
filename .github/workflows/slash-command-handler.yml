@@ -1,0 +1,67 @@
+name: Slash Command Handler
+
+on:
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  handle-command:
+    if: github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          repository: ${{ github.repository }}
+
+      - name: Handle command
+        env:
+          ACTOR: ${{ github.actor }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          IFS= read -r command <<< "$COMMENT_BODY"
+          command="${command%$'\r'}"
+          case "$command" in
+            /run-ci|/rerun-ci) ;;
+            *) exit 0 ;;
+          esac
+
+          pr_author=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq .user.login)
+          if [[ "$ACTOR" != "$pr_author" ]]; then
+            permission=$(gh api "repos/$REPOSITORY/collaborators/$ACTOR/permission" --jq '.role_name // .permission' 2>/dev/null || true)
+            case "$permission" in
+              write|admin|maintain) ;;
+              *) exit 0 ;;
+            esac
+          fi
+
+          if [[ "$command" == "/run-ci" ]]; then
+            gh issue edit "$PR_NUMBER" --repo "$REPOSITORY" --add-label run-ci
+          else
+            head_sha=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha)
+            run_id=$(gh api --method GET \
+              "repos/$REPOSITORY/actions/workflows/pr-test-xpu.yml/runs" \
+              -f event=pull_request \
+              -f head_sha="$head_sha" \
+              -f per_page=1 \
+              --jq '.workflow_runs[0].id // empty')
+            [[ -n "$run_id" ]] || exit 0
+            gh run rerun "$run_id" --repo "$REPOSITORY" --failed
+          fi
+
+          gh api --method POST \
+            "repos/$REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
+            -f content='+1' >/dev/null

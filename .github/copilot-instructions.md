@@ -98,6 +98,11 @@ Apply labels:
 - Always: `run-ci`
 - If perf-sensitive: `perf`
 
+The PR author or a collaborator with `write`, `maintain`, or `admin` permission can use these commands on the first line of a pull request comment:
+
+- `/run-ci`: add the `run-ci` label and start XPU CI for the current commit
+- `/rerun-ci`: rerun failed jobs from the latest XPU CI run for the current commit; use `/run-ci` if the earlier run was skipped before the label was added
+
 ## 9) Safety and quality bar
 
 - Do not claim tests or benchmarks were run if they were not run.

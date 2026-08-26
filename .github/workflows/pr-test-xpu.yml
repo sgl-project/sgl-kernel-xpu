@@ -3,6 +3,7 @@ name: PR Test (XPU)
 on:
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 
 concurrency:

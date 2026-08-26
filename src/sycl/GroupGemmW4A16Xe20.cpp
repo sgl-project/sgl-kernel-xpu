@@ -87,10 +87,48 @@ void w4a16_launch(
 DECLARE_W4A16_POLICY(w4a16_policy_m_8)
 DECLARE_W4A16_POLICY(w4a16_policy_m_16)
 DECLARE_W4A16_POLICY(w4a16_policy_m_32)
-DECLARE_W4A16_POLICY(w4a16_policy)
+DECLARE_W4A16_POLICY(w4a16_policy_m_64_n_128)
+DECLARE_W4A16_POLICY(w4a16_policy_m_128_n_128)
 
 #undef DECLARE_W4A16_POLICY
 #undef DECLARE_W4A16_EXTERN
+
+namespace {
+
+// Rows-per-expert -> M tile, weighted by how much of that tile an expert fills.
+//
+// The grouped GEMM tiles every expert's rows independently, so a policy with an
+// M tile of T computes ceil(avg_m / T) * T rows per expert whatever avg_m is.
+// Picking the widest tile unconditionally therefore falls off a cliff just past
+// a multiple of T: at avg_m = 129 an M=128 tile does 256 rows of work for 129
+// rows of data and loses half the machine. Scoring each candidate by its peak
+// throughput times that fill factor picks the tile that finishes first.
+//
+// The peaks below are measured on Xe2 (Arc Pro B60, bf16 activations) at
+// avg_m values that fill each tile exactly, in TFLOP/s. They are only ever
+// compared against each other, so the absolute scale does not matter -- what
+// matters is that a wider tile is worth more per row but wastes more of a
+// partial tile. GPT-OSS gemm1 (N=5760, K=2880) and DeepSeek-V4 gemm1
+// (N=4096, K=4096) agree on this ordering.
+constexpr int kW4A16TileM[] = {32, 64, 128};
+constexpr float kW4A16TilePeakTflops[] = {49.0f, 64.0f, 68.0f};
+
+int select_w4a16_tile_m(int avg_m) {
+  int best_tile_m = kW4A16TileM[0];
+  float best_score = 0.0f;
+  for (size_t i = 0; i < sizeof(kW4A16TileM) / sizeof(kW4A16TileM[0]); ++i) {
+    const int tile_m = kW4A16TileM[i];
+    const int rows_computed = ((avg_m + tile_m - 1) / tile_m) * tile_m;
+    const float score = kW4A16TilePeakTflops[i] * static_cast<float>(avg_m) / static_cast<float>(rows_computed);
+    if (score > best_score) {
+      best_score = score;
+      best_tile_m = tile_m;
+    }
+  }
+  return best_tile_m;
+}
+
+}  // namespace
 
 SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
     torch::Tensor& output,                   // [total_m, N] bf16/fp16
@@ -196,6 +234,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
   at::Tensor atomic_buffer = at::empty({static_cast<long>(1)}, activations.options().dtype(at::kInt));
 
   const int avg_m = total_m / static_cast<int>(n_experts);
+  const int tile_m = select_w4a16_tile_m(avg_m);
   const bool is_fp16_act = activations.scalar_type() == at::ScalarType::Half;
 #define LAUNCH_W4A16(Policy)                                                                  \
   do {                                                                                        \
@@ -266,17 +305,19 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
     }                                                                                         \
   } while (0)
 
-#define DISPATCH_W4A16_POLICY()        \
-  do {                                 \
-    if (avg_m <= 4) {                  \
-      LAUNCH_W4A16(w4a16_policy_m_8);  \
-    } else if (avg_m <= 8) {           \
-      LAUNCH_W4A16(w4a16_policy_m_16); \
-    } else if (avg_m <= 128) {         \
-      LAUNCH_W4A16(w4a16_policy_m_32); \
-    } else {                           \
-      LAUNCH_W4A16(w4a16_policy);      \
-    }                                  \
+#define DISPATCH_W4A16_POLICY()               \
+  do {                                        \
+    if (avg_m <= 4) {                         \
+      LAUNCH_W4A16(w4a16_policy_m_8);         \
+    } else if (avg_m <= 8) {                  \
+      LAUNCH_W4A16(w4a16_policy_m_16);        \
+    } else if (tile_m <= 32) {                \
+      LAUNCH_W4A16(w4a16_policy_m_32);        \
+    } else if (tile_m <= 64) {                \
+      LAUNCH_W4A16(w4a16_policy_m_64_n_128);  \
+    } else {                                  \
+      LAUNCH_W4A16(w4a16_policy_m_128_n_128); \
+    }                                         \
   } while (0)
 
 #ifdef USE_MOE_JIT

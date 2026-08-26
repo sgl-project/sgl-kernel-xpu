@@ -30,8 +30,6 @@
 #pragma once
 
 #include "sycl/kernels/mla_sparse/device/xe_mla_sparse_2stage_common.hpp"
-#define THR_ID 0
-#define BLK_ID 0
 
 namespace cutlass::flash_attention::collective {
 

@@ -198,7 +198,9 @@ class XeMlaSparse2StageReduceSplitKV {
     // attn_sink joins the denominator only, after LSE (which is pre-sink) -- same order
     // and same exp2 formulation as the non-split epilogue's ReduceK == 1 branch.
     if constexpr (HAS_ATTN_SINK) {
-      total_exp_sum += sycl::native::exp2(static_cast<ElementAcc>(ep.attn_sink[head_idx] * LOG_2_E) - global_max);
+      if (row_has_mass) {
+        total_exp_sum += sycl::native::exp2(static_cast<ElementAcc>(ep.attn_sink[head_idx] * LOG_2_E) - global_max);
+      }
     }
     const ElementAcc inv_exp_sum = total_exp_sum != ElementAcc(0) ? ElementAcc(1) / total_exp_sum : ElementAcc(0);
 

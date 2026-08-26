@@ -149,12 +149,12 @@ class XeMlaSparse2StageDenseKernel {
   // Stage 2 as well as Stage 1's gathered-KV tile; as on the gather side, the buffers are
   // allocated by the host orchestrator and reach the kernel through the params pointers
   // rather than through the opaque workspace blob. Zero without split-K.
-  static int get_workspace_size(Arguments const& args) {
+  static size_t get_workspace_size(Arguments const& args) {
     if constexpr (is_split_kv) {
       auto const& s = args.kernel.shape;
       SparseSplitKV2StageWorkspaceLayout layout(
           s.b, s.s_q, s.h_q, args.scheduler.num_kv_splits, Traits::D_V, sizeof(ElementO));
-      return static_cast<int>(layout.total_bytes);
+      return layout.total_bytes;
     } else {
       return 0;
     }

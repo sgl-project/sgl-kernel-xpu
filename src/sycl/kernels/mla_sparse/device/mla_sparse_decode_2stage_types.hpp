@@ -217,6 +217,10 @@ struct MlaSparseDecode2StageXe {
 // ---------------------------------------------------------------------------
 static inline int resolve_sparse_2stage_num_kv_splits(
     int b, int s_q, int h_q, int B_H, int V_SPLIT, int gathered_topk, int B_TOPK, int kv_max_splits) {
+  // will remove the case for b == 8 and gathered_topk >= 512 in the future.
+  if (b == 8 && gathered_topk >= 512) {
+    return 1;
+  }
   const int num_topk_blocks = std::max(1, (gathered_topk + B_TOPK - 1) / B_TOPK);
   constexpr int WGS_PER_CORE = 8;
   constexpr int MIN_BLOCKS_PER_SPLIT = 2;

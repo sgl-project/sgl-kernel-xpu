@@ -14,6 +14,7 @@ from sgl_kernel import common_ops
 from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
     flash_mla_decode,
+    flash_mla_decode_get_workspace_size,
     flash_mla_get_workspace_size,
     flash_mla_prefill,
     flash_mla_prefill_get_workspace_size,

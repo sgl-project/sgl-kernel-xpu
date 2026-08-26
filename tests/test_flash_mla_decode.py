@@ -5,7 +5,7 @@ import sys
 import pytest
 import torch
 import torch.nn.functional as F
-from sgl_kernel import flash_mla_decode, flash_mla_get_workspace_size
+from sgl_kernel import flash_mla_decode, flash_mla_decode_get_workspace_size
 from torch import Tensor
 
 LONG_TESTS = os.getenv("LONG_TESTS") == "1"
@@ -122,7 +122,7 @@ def test_flash_mla_decode(
     seq_lens_xpu = seq_lens_cpu.to(device=device)
     del q_cpu, kv_cache_cpu, block_table_cpu, seq_lens_cpu
 
-    workspace_size = flash_mla_get_workspace_size(
+    workspace_size = flash_mla_decode_get_workspace_size(
         block_num * block_size, bs, h_q, block_size, num_kv_splits=num_kv_splits
     )
     workspace = torch.empty(workspace_size, device=device, dtype=torch.uint8)

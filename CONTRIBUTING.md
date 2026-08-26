@@ -23,9 +23,9 @@ We encourage you to open Pull Request from the following 4 perspectives:
 * Pass all CI tests.
 
 ### XPU CI Commands:
-The PR author or a collaborator with `write`, `maintain`, or `admin` permission can comment one of these commands on the first line of a pull request comment:
+Same-repo PR authors, or collaborators with `write` / `maintain` / `admin`, can comment one of these commands on the first line of a pull request comment. Fork PRs require a collaborator (the fork author cannot start XPU CI).
 * `/run-ci` adds the `run-ci` label and starts XPU CI for the current commit.
-* `/rerun-ci` reruns failed jobs from the latest XPU CI run for the current commit. If CI was skipped because the label was missing, use `/run-ci` instead.
+* `/rerun-ci` reruns failed jobs from the latest completed XPU CI run for the current commit. If CI was skipped because the label was missing, use `/run-ci` instead.
 
 ### Extra Requirements:
 * For public Pull Requests on sglang repo, conduct internal review first before requesting reviews from community.

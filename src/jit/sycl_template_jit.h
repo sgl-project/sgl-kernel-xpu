@@ -72,5 +72,41 @@ const JitConfig& default_config();
 // CMake configure_file @ONLY). Exposed for testing.
 std::string render_template(const std::string& tmpl, const std::map<std::string, std::string>& subs);
 
+// Generic per-op function cache shared by all *_jit.cpp dispatchers. Wraps the
+// "mutex + map<uint64_t, Fn> + double-checked lookup + backfill" boilerplate
+// that every op otherwise repeats. Fn is the resolved entry's function-pointer
+// type; Builder returns void* (the dlsym result) or nullptr on failure.
+template <typename Fn>
+class JitFnCache {
+ public:
+  explicit JitFnCache(const char* op_name) : op_name_(op_name) {}
+
+  // Look up `key`; on miss calls build() to resolve the symbol and caches it.
+  // Returns nullptr and fills *err (prefixed with the op name) on failure.
+  template <typename Build>
+  Fn get(uint64_t key, Build&& build, std::string* err) {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      auto it = fns_.find(key);
+      if (it != fns_.end()) return it->second;
+    }
+    std::string build_err;
+    void* sym = build(&build_err);
+    if (!sym) {
+      if (err) *err = std::string(op_name_) + " JIT: " + build_err;
+      return nullptr;
+    }
+    Fn fn = reinterpret_cast<Fn>(sym);
+    std::lock_guard<std::mutex> lk(mu_);
+    fns_.emplace(key, fn);  // emplace: never overwrite an existing entry
+    return fn;
+  }
+
+ private:
+  const char* op_name_;
+  std::mutex mu_;
+  std::unordered_map<uint64_t, Fn> fns_;
+};
+
 }  // namespace jit
 }  // namespace sgl

@@ -397,7 +397,9 @@ void* get_or_compile(const CompileSpec& spec, const JitConfig& config, std::stri
     handle = ::dlopen(so_path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!handle) return set_err(std::string("dlopen failed: ") + dlerror());
     std::lock_guard<std::mutex> lk(c.mu);
-    c.handles[so_path] = handle;
+    // emplace: if another thread raced us and already cached a handle for this
+    // path, keep theirs (ours would leak -- dlopen'd handles are never closed).
+    c.handles.emplace(so_path, handle);
   }
 
   ::dlerror();

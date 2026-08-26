@@ -1,8 +1,5 @@
 #include "jit/mla_jit.h"
 
-#include <mutex>
-#include <unordered_map>
-
 #include "jit/jit_arch.h"
 #include "jit/sycl_template_jit.h"
 
@@ -10,6 +7,27 @@ namespace sgl {
 namespace mla_jit {
 
 namespace {
+
+const char* elem_tag(bool is_fp16) {
+  return is_fp16 ? "half" : "bf16";
+}
+const char* elem_sycl_type(bool is_fp16) {
+  return is_fp16 ? "sycl::half" : "sycl::ext::oneapi::bfloat16";
+}
+
+// Shared config validation for all MLA JIT resolves.
+bool check_config(const char* op_label, std::string* err) {
+  const jit::JitConfig& cfg = jit::default_config();
+  if (!cfg.valid) {
+    if (err) *err = std::string(op_label) + " JIT unavailable: " + cfg.error;
+    return false;
+  }
+  if (cfg.src_root.empty()) {
+    if (err) *err = std::string(op_label) + " JIT: source template root not resolved";
+    return false;
+  }
+  return true;
+}
 
 using DecodeFn =
     void (*)(void*, const void*, const void*, const void*, const void*, const void*, void*, double, int64_t);
@@ -21,48 +39,27 @@ uint64_t pack_decode_key(int arch, bool is_fp16, int page_size) {
   return k;
 }
 
-std::mutex g_mu;
-std::unordered_map<uint64_t, DecodeFn> g_decode_fns;
+jit::JitFnCache<DecodeFn> g_decode_fns("MLA decode");
 
 DecodeFn resolve_decode(bool is_fp16, int page_size, int arch, std::string* err) {
   const uint64_t key = pack_decode_key(arch, is_fp16, page_size);
-  {
-    std::lock_guard<std::mutex> lk(g_mu);
-    auto it = g_decode_fns.find(key);
-    if (it != g_decode_fns.end()) return it->second;
-  }
+  auto build = [&](std::string* berr) -> void* {
+    if (!check_config("MLA decode", berr)) return nullptr;
 
-  const jit::JitConfig& cfg = jit::default_config();
-  if (!cfg.valid) {
-    if (err) *err = "MLA decode JIT unavailable: " + cfg.error;
-    return nullptr;
-  }
-  if (cfg.src_root.empty()) {
-    if (err) *err = "MLA decode JIT: source template root not resolved";
-    return nullptr;
-  }
+    jit::CompileSpec spec;
+    spec.template_path = jit::default_config().src_root + "/sycl/mla_decode_kernel.cpp.in";
+    spec.subs["ELEM_TAG"] = elem_tag(is_fp16);
+    spec.subs["ELEM_SYCL_TYPE"] = elem_sycl_type(is_fp16);
+    spec.subs["PAGE_SIZE"] = std::to_string(page_size);
+    const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_MLA_JIT_ENTRY");
+    spec.extra_flags = as.extra_flags;
+    spec.target = as.target;
+    spec.entry_symbol = "sgl_mla_decode_entry";
+    spec.name = std::string("mla_decode_") + elem_tag(is_fp16) + "_" + std::to_string(page_size) + "_" + as.suffix;
 
-  jit::CompileSpec spec;
-  spec.template_path = cfg.src_root + "/sycl/mla_decode_kernel.cpp.in";
-  spec.subs["ELEM_TAG"] = is_fp16 ? "half" : "bf16";
-  spec.subs["ELEM_SYCL_TYPE"] = is_fp16 ? "sycl::half" : "sycl::ext::oneapi::bfloat16";
-  spec.subs["PAGE_SIZE"] = std::to_string(page_size);
-  const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_MLA_JIT_ENTRY");
-  spec.extra_flags = as.extra_flags;
-  spec.target = as.target;
-  spec.entry_symbol = "sgl_mla_decode_entry";
-  spec.name =
-      std::string("mla_decode_") + (is_fp16 ? "half" : "bf16") + "_" + std::to_string(page_size) + "_" + as.suffix;
-
-  void* sym = jit::get_or_compile(spec, cfg, err);
-  if (!sym) return nullptr;
-
-  DecodeFn fn = reinterpret_cast<DecodeFn>(sym);
-  {
-    std::lock_guard<std::mutex> lk(g_mu);
-    g_decode_fns[key] = fn;
-  }
-  return fn;
+    return jit::get_or_compile(spec, jit::default_config(), berr);
+  };
+  return g_decode_fns.get(key, build, err);
 }
 
 }  // namespace
@@ -108,48 +105,27 @@ using PrefillFn = void (*)(
     bool,
     int64_t);
 
-std::mutex g_prefill_mu;
-std::unordered_map<uint64_t, PrefillFn> g_prefill_fns;
+jit::JitFnCache<PrefillFn> g_prefill_fns("MLA prefill");
 
 PrefillFn resolve_prefill(bool is_fp16, int page_size, int arch, std::string* err) {
   const uint64_t key = pack_decode_key(arch, is_fp16, page_size);
-  {
-    std::lock_guard<std::mutex> lk(g_prefill_mu);
-    auto it = g_prefill_fns.find(key);
-    if (it != g_prefill_fns.end()) return it->second;
-  }
+  auto build = [&](std::string* berr) -> void* {
+    if (!check_config("MLA prefill", berr)) return nullptr;
 
-  const jit::JitConfig& cfg = jit::default_config();
-  if (!cfg.valid) {
-    if (err) *err = "MLA prefill JIT unavailable: " + cfg.error;
-    return nullptr;
-  }
-  if (cfg.src_root.empty()) {
-    if (err) *err = "MLA prefill JIT: source template root not resolved";
-    return nullptr;
-  }
+    jit::CompileSpec spec;
+    spec.template_path = jit::default_config().src_root + "/sycl/mla_prefill_kernel.cpp.in";
+    spec.subs["ELEM_TAG"] = elem_tag(is_fp16);
+    spec.subs["ELEM_SYCL_TYPE"] = elem_sycl_type(is_fp16);
+    spec.subs["PAGE_SIZE"] = std::to_string(page_size);
+    const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_MLA_JIT_ENTRY");
+    spec.extra_flags = as.extra_flags;
+    spec.target = as.target;
+    spec.entry_symbol = "sgl_mla_prefill_entry";
+    spec.name = std::string("mla_prefill_") + elem_tag(is_fp16) + "_" + std::to_string(page_size) + "_" + as.suffix;
 
-  jit::CompileSpec spec;
-  spec.template_path = cfg.src_root + "/sycl/mla_prefill_kernel.cpp.in";
-  spec.subs["ELEM_TAG"] = is_fp16 ? "half" : "bf16";
-  spec.subs["ELEM_SYCL_TYPE"] = is_fp16 ? "sycl::half" : "sycl::ext::oneapi::bfloat16";
-  spec.subs["PAGE_SIZE"] = std::to_string(page_size);
-  const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_MLA_JIT_ENTRY");
-  spec.extra_flags = as.extra_flags;
-  spec.target = as.target;
-  spec.entry_symbol = "sgl_mla_prefill_entry";
-  spec.name =
-      std::string("mla_prefill_") + (is_fp16 ? "half" : "bf16") + "_" + std::to_string(page_size) + "_" + as.suffix;
-
-  void* sym = jit::get_or_compile(spec, cfg, err);
-  if (!sym) return nullptr;
-
-  PrefillFn fn = reinterpret_cast<PrefillFn>(sym);
-  {
-    std::lock_guard<std::mutex> lk(g_prefill_mu);
-    g_prefill_fns[key] = fn;
-  }
-  return fn;
+    return jit::get_or_compile(spec, jit::default_config(), berr);
+  };
+  return g_prefill_fns.get(key, build, err);
 }
 
 }  // namespace
@@ -196,13 +172,6 @@ bool mla_prefill_launch(
 
 namespace {
 
-const char* elem_tag(bool is_fp16) {
-  return is_fp16 ? "half" : "bf16";
-}
-const char* elem_sycl_type(bool is_fp16) {
-  return is_fp16 ? "sycl::half" : "sycl::ext::oneapi::bfloat16";
-}
-
 uint64_t pack_sparse_key(int arch, bool is_fp16, int d_qk, int b_h, bool sink) {
   uint64_t k = static_cast<uint64_t>(arch) & 0xFF;
   k = (k << 1) | (is_fp16 ? 1u : 0u);
@@ -229,11 +198,10 @@ using SparseDecodeFn = void (*)(
 using SparsePrefillFn =
     void (*)(void*, void*, void*, const void*, const void*, const void*, const void*, const void*, double, int64_t);
 
-std::mutex g_sparse_dec_mu;
-std::unordered_map<uint64_t, SparseDecodeFn> g_sparse_dec_fns;
-std::mutex g_sparse_pre_mu;
-std::unordered_map<uint64_t, SparsePrefillFn> g_sparse_pre_fns;
+jit::JitFnCache<SparseDecodeFn> g_sparse_dec_fns("MLA sparse decode");
+jit::JitFnCache<SparsePrefillFn> g_sparse_pre_fns("MLA sparse prefill");
 
+// Build the CompileSpec for a sparse (2-stage) MLA kernel and resolve it.
 void* resolve_sparse(
     const char* template_rel,
     const char* entry,
@@ -244,17 +212,9 @@ void* resolve_sparse(
     int arch,
     const char* name_prefix,
     std::string* err) {
-  const jit::JitConfig& cfg = jit::default_config();
-  if (!cfg.valid) {
-    if (err) *err = std::string(name_prefix) + " JIT unavailable: " + cfg.error;
-    return nullptr;
-  }
-  if (cfg.src_root.empty()) {
-    if (err) *err = std::string(name_prefix) + " JIT: source template root not resolved";
-    return nullptr;
-  }
+  if (!check_config(name_prefix, err)) return nullptr;
   jit::CompileSpec spec;
-  spec.template_path = cfg.src_root + "/sycl/" + template_rel;
+  spec.template_path = jit::default_config().src_root + "/sycl/" + template_rel;
   spec.subs["ELEM_TAG"] = elem_tag(is_fp16);
   spec.subs["ELEM_SYCL_TYPE"] = elem_sycl_type(is_fp16);
   spec.subs["D_QK"] = std::to_string(d_qk);
@@ -266,7 +226,7 @@ void* resolve_sparse(
   spec.entry_symbol = entry;
   spec.name = std::string(name_prefix) + "_" + elem_tag(is_fp16) + "_" + std::to_string(d_qk) + "_" +
               std::to_string(b_h) + "_" + (sink ? "1" : "0") + "_" + as.suffix;
-  return jit::get_or_compile(spec, cfg, err);
+  return jit::get_or_compile(spec, jit::default_config(), err);
 }
 
 }  // namespace
@@ -292,14 +252,8 @@ bool sparse_decode_launch(
     int arch,
     std::string* err) {
   const uint64_t key = pack_sparse_key(arch, is_fp16, d_qk, b_h, has_attn_sink);
-  SparseDecodeFn fn = nullptr;
-  {
-    std::lock_guard<std::mutex> lk(g_sparse_dec_mu);
-    auto it = g_sparse_dec_fns.find(key);
-    if (it != g_sparse_dec_fns.end()) fn = it->second;
-  }
-  if (!fn) {
-    void* sym = resolve_sparse(
+  auto build = [&](std::string* berr) -> void* {
+    return resolve_sparse(
         "mla_sparse_decode_2stage_kernel.cpp.in",
         "sgl_mla_sparse_decode_entry",
         is_fp16,
@@ -308,12 +262,10 @@ bool sparse_decode_launch(
         has_attn_sink,
         arch,
         "mla_sparse_decode",
-        err);
-    if (!sym) return false;
-    fn = reinterpret_cast<SparseDecodeFn>(sym);
-    std::lock_guard<std::mutex> lk(g_sparse_dec_mu);
-    g_sparse_dec_fns[key] = fn;
-  }
+        berr);
+  };
+  SparseDecodeFn fn = g_sparse_dec_fns.get(key, build, err);
+  if (!fn) return false;
   fn(out,
      lse_out,
      q,
@@ -348,14 +300,8 @@ bool sparse_prefill_launch(
     int arch,
     std::string* err) {
   const uint64_t key = pack_sparse_key(arch, is_fp16, d_qk, b_h, has_attn_sink);
-  SparsePrefillFn fn = nullptr;
-  {
-    std::lock_guard<std::mutex> lk(g_sparse_pre_mu);
-    auto it = g_sparse_pre_fns.find(key);
-    if (it != g_sparse_pre_fns.end()) fn = it->second;
-  }
-  if (!fn) {
-    void* sym = resolve_sparse(
+  auto build = [&](std::string* berr) -> void* {
+    return resolve_sparse(
         "mla_sparse_prefill_2stage_kernel.cpp.in",
         "sgl_mla_sparse_prefill_entry",
         is_fp16,
@@ -364,12 +310,10 @@ bool sparse_prefill_launch(
         has_attn_sink,
         arch,
         "mla_sparse_prefill",
-        err);
-    if (!sym) return false;
-    fn = reinterpret_cast<SparsePrefillFn>(sym);
-    std::lock_guard<std::mutex> lk(g_sparse_pre_mu);
-    g_sparse_pre_fns[key] = fn;
-  }
+        berr);
+  };
+  SparsePrefillFn fn = g_sparse_pre_fns.get(key, build, err);
+  if (!fn) return false;
   fn(out, max_logits, lse, q, kv, indices, attn_sink, topk_length, sm_scale, head_dim_v);
   return true;
 }

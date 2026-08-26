@@ -270,8 +270,8 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
       DISPATCH_MOE_ACT(activation_type, false, with_bias, Tile, SGLayout);
     }
   };
-#define MOE_GG_CASE(id)                                                                    \
-  case id:                                                                                 \
+#define MOE_GG_CASE(id)                                                                     \
+  case id:                                                                                  \
     dispatch_tile.template operator()<id, SGL_MOE_GG_SHAPE_##id, SGL_MOE_GG_LAYOUT_##id>(); \
     break;
   switch (sgl::moe::grouped_gemm_select_tile(avg_m, gemm_k, gemm_n, fuse_act)) {

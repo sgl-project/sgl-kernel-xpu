@@ -1,8 +1,6 @@
 #include "jit/moe_jit.h"
 
 #include <cstdint>
-#include <mutex>
-#include <unordered_map>
 
 #include "jit/jit_arch.h"
 #include "jit/sycl_template_jit.h"
@@ -56,50 +54,38 @@ uint64_t pack_key(int tile_id, int act, bool fuse, bool bias, int arch) {
   return k;
 }
 
-std::mutex g_mu;
-std::unordered_map<uint64_t, KernelFn> g_fns;
+jit::JitFnCache<KernelFn> g_fns("MoE grouped GEMM");
 
 KernelFn resolve(int tile_id, int act, bool fuse, bool bias, int arch, std::string* err) {
   const uint64_t key = pack_key(tile_id, act, fuse, bias, arch);
-  {
-    std::lock_guard<std::mutex> lk(g_mu);
-    auto it = g_fns.find(key);
-    if (it != g_fns.end()) return it->second;
-  }
+  auto build = [&](std::string* berr) -> void* {
+    const jit::JitConfig& cfg = jit::default_config();
+    if (!cfg.valid) {
+      *berr = "unavailable: " + cfg.error;
+      return nullptr;
+    }
+    if (cfg.src_root.empty()) {
+      *berr = "source template root not resolved";
+      return nullptr;
+    }
 
-  const jit::JitConfig& cfg = jit::default_config();
-  if (!cfg.valid) {
-    if (err) *err = "MoE grouped GEMM JIT unavailable: " + cfg.error;
-    return nullptr;
-  }
-  if (cfg.src_root.empty()) {
-    if (err) *err = "MoE grouped GEMM JIT: source template root not resolved";
-    return nullptr;
-  }
+    jit::CompileSpec spec;
+    spec.template_path = cfg.src_root + "/sycl/GroupGemmXe20LauncherInstance.cpp.in";
+    spec.subs["TILE"] = kTiles[tile_id].tile;
+    spec.subs["SGLAYOUT"] = kTiles[tile_id].sglayout;
+    spec.subs["ACT_TYPE"] = std::to_string(act);
+    spec.subs["FUSE_ACT"] = fuse ? "true" : "false";
+    spec.subs["WITH_BIAS"] = bias ? "true" : "false";
+    const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_MOE_JIT_ENTRY");
+    spec.extra_flags = as.extra_flags;
+    spec.target = as.target;
+    spec.entry_symbol = "sgl_moe_gg_entry";
+    spec.name = std::string("group_gemm_xe20_t") + std::to_string(tile_id) + "_a" + std::to_string(act) + "_f" +
+                (fuse ? "1" : "0") + "_b" + (bias ? "1" : "0") + "_" + as.suffix;
 
-  jit::CompileSpec spec;
-  spec.template_path = cfg.src_root + "/sycl/GroupGemmXe20LauncherInstance.cpp.in";
-  spec.subs["TILE"] = kTiles[tile_id].tile;
-  spec.subs["SGLAYOUT"] = kTiles[tile_id].sglayout;
-  spec.subs["ACT_TYPE"] = std::to_string(act);
-  spec.subs["FUSE_ACT"] = fuse ? "true" : "false";
-  spec.subs["WITH_BIAS"] = bias ? "true" : "false";
-  const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_MOE_JIT_ENTRY");
-  spec.extra_flags = as.extra_flags;
-  spec.target = as.target;
-  spec.entry_symbol = "sgl_moe_gg_entry";
-  spec.name = std::string("group_gemm_xe20_t") + std::to_string(tile_id) + "_a" + std::to_string(act) + "_f" +
-              (fuse ? "1" : "0") + "_b" + (bias ? "1" : "0") + "_" + as.suffix;
-
-  void* sym = jit::get_or_compile(spec, cfg, err);
-  if (!sym) return nullptr;
-
-  KernelFn fn = reinterpret_cast<KernelFn>(sym);
-  {
-    std::lock_guard<std::mutex> lk(g_mu);
-    g_fns[key] = fn;
-  }
-  return fn;
+    return jit::get_or_compile(spec, cfg, berr);
+  };
+  return g_fns.get(key, build, err);
 }
 
 }  // namespace
@@ -193,51 +179,39 @@ uint64_t pack_w4a16_key(int policy_id, bool is_int4, bool is_fp16, int arch) {
   return k;
 }
 
-std::mutex g_w4a16_mu;
-std::unordered_map<uint64_t, W4A16Fn> g_w4a16_fns;
+jit::JitFnCache<W4A16Fn> g_w4a16_fns("W4A16 grouped GEMM");
 
 W4A16Fn resolve_w4a16(int avg_m, bool is_int4, bool is_fp16, int arch, std::string* err) {
   const int policy_id = w4a16_policy_id(avg_m);
   const uint64_t key = pack_w4a16_key(policy_id, is_int4, is_fp16, arch);
-  {
-    std::lock_guard<std::mutex> lk(g_w4a16_mu);
-    auto it = g_w4a16_fns.find(key);
-    if (it != g_w4a16_fns.end()) return it->second;
-  }
+  auto build = [&](std::string* berr) -> void* {
+    const jit::JitConfig& cfg = jit::default_config();
+    if (!cfg.valid) {
+      *berr = "unavailable: " + cfg.error;
+      return nullptr;
+    }
+    if (cfg.src_root.empty()) {
+      *berr = "source template root not resolved";
+      return nullptr;
+    }
 
-  const jit::JitConfig& cfg = jit::default_config();
-  if (!cfg.valid) {
-    if (err) *err = "W4A16 grouped GEMM JIT unavailable: " + cfg.error;
-    return nullptr;
-  }
-  if (cfg.src_root.empty()) {
-    if (err) *err = "W4A16 grouped GEMM JIT: source template root not resolved";
-    return nullptr;
-  }
+    const char* elem_a = is_fp16 ? "cutlass::half_t" : "cutlass::bfloat16_t";
 
-  const char* elem_a = is_fp16 ? "cutlass::half_t" : "cutlass::bfloat16_t";
+    jit::CompileSpec spec;
+    spec.template_path = cfg.src_root + "/sycl/GroupGemmW4A16Xe20LauncherInstance.cpp.in";
+    spec.subs["POLICY"] = w4a16_policy(avg_m);
+    spec.subs["ELEMENT_A"] = elem_a;
+    spec.subs["ELEMENT_S"] = is_int4 ? elem_a : "uint8_t";
+    const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_W4A16_JIT_ENTRY");
+    spec.extra_flags = as.extra_flags;
+    spec.target = as.target;
+    spec.entry_symbol = "sgl_moe_w4a16_entry";
+    spec.name = std::string("group_gemm_w4a16_p") + std::to_string(policy_id) + (is_int4 ? "_int4" : "_mxfp4") +
+                (is_fp16 ? "_fp16" : "_bf16") + "_" + as.suffix;
 
-  jit::CompileSpec spec;
-  spec.template_path = cfg.src_root + "/sycl/GroupGemmW4A16Xe20LauncherInstance.cpp.in";
-  spec.subs["POLICY"] = w4a16_policy(avg_m);
-  spec.subs["ELEMENT_A"] = elem_a;
-  spec.subs["ELEMENT_S"] = is_int4 ? elem_a : "uint8_t";
-  const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_W4A16_JIT_ENTRY");
-  spec.extra_flags = as.extra_flags;
-  spec.target = as.target;
-  spec.entry_symbol = "sgl_moe_w4a16_entry";
-  spec.name = std::string("group_gemm_w4a16_p") + std::to_string(policy_id) + (is_int4 ? "_int4" : "_mxfp4") +
-              (is_fp16 ? "_fp16" : "_bf16") + "_" + as.suffix;
-
-  void* sym = jit::get_or_compile(spec, cfg, err);
-  if (!sym) return nullptr;
-
-  W4A16Fn fn = reinterpret_cast<W4A16Fn>(sym);
-  {
-    std::lock_guard<std::mutex> lk(g_w4a16_mu);
-    g_w4a16_fns[key] = fn;
-  }
-  return fn;
+    return jit::get_or_compile(spec, cfg, berr);
+  };
+  return g_w4a16_fns.get(key, build, err);
 }
 
 }  // namespace

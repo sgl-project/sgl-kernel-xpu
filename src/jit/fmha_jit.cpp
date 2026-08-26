@@ -1,8 +1,6 @@
 #include "jit/fmha_jit.h"
 
 #include <cstdint>
-#include <mutex>
-#include <unordered_map>
 
 #include "jit/jit_arch.h"
 #include "jit/sycl_template_jit.h"
@@ -59,59 +57,52 @@ uint64_t pack_key(int arch, DecodeOp op, int qg, int hd, int ps, bool is_fp16) {
   return k;
 }
 
-std::mutex g_mu;
-std::unordered_map<uint64_t, KernelFn> g_fns;  // O(1) hot-path cache
+jit::JitFnCache<KernelFn> g_fns("FMHA decode");
+jit::JitFnCache<KernelFn> g_prefill_fns("FMHA prefill");
 
-// Resolve (compiling on first use) the kernel entry for a config.
-KernelFn resolve(DecodeOp op, int qg, int hd, int ps, bool is_fp16, int arch, std::string* err) {
-  const uint64_t key = pack_key(arch, op, qg, hd, ps, is_fp16);
-  {
-    std::lock_guard<std::mutex> lk(g_mu);
-    auto it = g_fns.find(key);
-    if (it != g_fns.end()) return it->second;
-  }
-
+// Shared config-validation + spec-assembly for both decode and prefill.
+void* resolve_spec(
+    const char* op_label, const std::string& template_rel, jit::CompileSpec& spec, int arch, std::string* err) {
   const jit::JitConfig& cfg = jit::default_config();
   if (!cfg.valid) {
-    if (err) *err = "FMHA JIT unavailable: " + cfg.error;
+    if (err) *err = std::string(op_label) + " JIT unavailable: " + cfg.error;
     return nullptr;
   }
   if (cfg.src_root.empty()) {
-    if (err) *err = "FMHA JIT: source template root not resolved";
+    if (err) *err = std::string(op_label) + " JIT: source template root not resolved";
     return nullptr;
   }
-
-  const bool no_page = (op == DecodeOp::kDecodeNoPage);
-
-  jit::CompileSpec spec;
-  spec.template_path = cfg.src_root + "/sycl/kernels/flash_attention_v2/" + template_file(op);
-  spec.subs["QG_SZ"] = std::to_string(qg);
-  spec.subs["HEAD_DIM"] = std::to_string(hd);
-  if (!no_page) {
-    spec.subs["PAGE_SIZE"] = std::to_string(ps);
-  } else {
-    // Non-paged decode has no page size; it uses an independent KV tile.
-    spec.subs["TILED_KV_NP"] = std::to_string(sgl::fmha::decode_tiled_kv_np(hd));
-  }
-  spec.subs["ELEM_TYPE"] = is_fp16 ? "cutlass::half_t" : "cutlass::bfloat16_t";
-  spec.subs["ELEM_TAG"] = is_fp16 ? "fp16" : "bf16";
+  spec.template_path = cfg.src_root + "/sycl/kernels/flash_attention_v2/" + template_rel;
   const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_FMHA_JIT_ENTRY");
   spec.extra_flags = as.extra_flags;
   spec.target = as.target;
   spec.entry_symbol = "sgl_fmha_entry";
+  return jit::get_or_compile(spec, cfg, err);
+}
 
-  spec.name = std::string("xe_fmha_fwd_") + op_tag(op) + "_" + std::to_string(qg) + "_" + std::to_string(hd) +
-              (no_page ? "" : "_" + std::to_string(ps)) + "_" + (is_fp16 ? "fp16" : "bf16") + "_" + as.suffix;
+KernelFn resolve(DecodeOp op, int qg, int hd, int ps, bool is_fp16, int arch, std::string* err) {
+  const uint64_t key = pack_key(arch, op, qg, hd, ps, is_fp16);
+  auto build = [&](std::string* berr) -> void* {
+    const bool no_page = (op == DecodeOp::kDecodeNoPage);
 
-  void* sym = jit::get_or_compile(spec, cfg, err);
-  if (!sym) return nullptr;
+    jit::CompileSpec spec;
+    spec.subs["QG_SZ"] = std::to_string(qg);
+    spec.subs["HEAD_DIM"] = std::to_string(hd);
+    if (!no_page) {
+      spec.subs["PAGE_SIZE"] = std::to_string(ps);
+    } else {
+      // Non-paged decode has no page size; it uses an independent KV tile.
+      spec.subs["TILED_KV_NP"] = std::to_string(sgl::fmha::decode_tiled_kv_np(hd));
+    }
+    spec.subs["ELEM_TYPE"] = is_fp16 ? "cutlass::half_t" : "cutlass::bfloat16_t";
+    spec.subs["ELEM_TAG"] = is_fp16 ? "fp16" : "bf16";
 
-  KernelFn fn = reinterpret_cast<KernelFn>(sym);
-  {
-    std::lock_guard<std::mutex> lk(g_mu);
-    g_fns[key] = fn;
-  }
-  return fn;
+    spec.name = std::string("xe_fmha_fwd_") + op_tag(op) + "_" + std::to_string(qg) + "_" + std::to_string(hd) +
+                (no_page ? "" : "_" + std::to_string(ps)) + "_" + (is_fp16 ? "fp16" : "bf16");
+
+    return resolve_spec("FMHA", template_file(op), spec, arch, berr);
+  };
+  return g_fns.get(key, build, err);
 }
 
 // ---------------------------------------------------------------------------
@@ -151,72 +142,43 @@ uint64_t pack_prefill_key(int arch, PrefillOp op, int hd, bool is_fp16) {
   return k;
 }
 
-std::mutex g_prefill_mu;
-std::unordered_map<uint64_t, KernelFn> g_prefill_fns;
-
 KernelFn resolve_prefill(PrefillOp op, int hd, bool is_fp16, int arch, std::string* err) {
   const uint64_t key = pack_prefill_key(arch, op, hd, is_fp16);
-  {
-    std::lock_guard<std::mutex> lk(g_prefill_mu);
-    auto it = g_prefill_fns.find(key);
-    if (it != g_prefill_fns.end()) return it->second;
-  }
+  auto build = [&](std::string* berr) -> void* {
+    const bool nopage = (op == PrefillOp::kPrefillNoPage);
+    // fp8 prefill is bf16-query only.
+    const bool fp16 = (op == PrefillOp::kPrefillFp8) ? false : is_fp16;
 
-  const jit::JitConfig& cfg = jit::default_config();
-  if (!cfg.valid) {
-    if (err) *err = "FMHA prefill JIT unavailable: " + cfg.error;
-    return nullptr;
-  }
-  if (cfg.src_root.empty()) {
-    if (err) *err = "FMHA prefill JIT: source template root not resolved";
-    return nullptr;
-  }
+    const sgl::fmha::PrefillTile tile = nopage ? sgl::fmha::prefill_nopage_tile(hd) : sgl::fmha::prefill_paged_tile(hd);
+    if (!tile.ok) {
+      *berr = "unsupported head dim " + std::to_string(hd);
+      return nullptr;
+    }
+    const int tiled_out = sgl::fmha::prefill_tiled_out(hd);
+    const int enable_score_block2d = (hd == 512) ? 1 : 0;
 
-  const bool nopage = (op == PrefillOp::kPrefillNoPage);
-  // fp8 prefill is bf16-query only.
-  const bool fp16 = (op == PrefillOp::kPrefillFp8) ? false : is_fp16;
+    jit::CompileSpec spec;
+    spec.subs["HEAD_DIM"] = std::to_string(hd);
+    spec.subs["ELEM_TYPE"] = fp16 ? "cutlass::half_t" : "cutlass::bfloat16_t";
+    spec.subs["ELEM_TAG"] = fp16 ? "fp16" : "bf16";
+    spec.subs["ENABLE_SCORE_BLOCK2D"] = std::to_string(enable_score_block2d);
+    if (nopage) {
+      spec.subs["TILED_Q_NP"] = std::to_string(tile.tiled_q);
+      spec.subs["TILED_KV_NP"] = std::to_string(tile.tiled_kv);
+      spec.subs["NUM_SG_NP"] = std::to_string(tile.num_sg);
+      spec.subs["TILED_OUT_NP"] = std::to_string(tiled_out);
+    } else {
+      spec.subs["TILED_Q"] = std::to_string(tile.tiled_q);
+      spec.subs["TILED_KV"] = std::to_string(tile.tiled_kv);
+      spec.subs["NUM_SG"] = std::to_string(tile.num_sg);
+      spec.subs["TILED_OUT"] = std::to_string(tiled_out);
+    }
+    spec.name =
+        std::string("xe_fmha_fwd_") + prefill_op_tag(op) + "_" + std::to_string(hd) + "_" + (fp16 ? "fp16" : "bf16");
 
-  const sgl::fmha::PrefillTile tile = nopage ? sgl::fmha::prefill_nopage_tile(hd) : sgl::fmha::prefill_paged_tile(hd);
-  if (!tile.ok) {
-    if (err) *err = "FMHA prefill JIT: unsupported head dim " + std::to_string(hd);
-    return nullptr;
-  }
-  const int tiled_out = sgl::fmha::prefill_tiled_out(hd);
-  const int enable_score_block2d = (hd == 512) ? 1 : 0;
-
-  jit::CompileSpec spec;
-  spec.template_path = cfg.src_root + "/sycl/kernels/flash_attention_v2/" + prefill_template_file(op);
-  spec.subs["HEAD_DIM"] = std::to_string(hd);
-  spec.subs["ELEM_TYPE"] = fp16 ? "cutlass::half_t" : "cutlass::bfloat16_t";
-  spec.subs["ELEM_TAG"] = fp16 ? "fp16" : "bf16";
-  spec.subs["ENABLE_SCORE_BLOCK2D"] = std::to_string(enable_score_block2d);
-  if (nopage) {
-    spec.subs["TILED_Q_NP"] = std::to_string(tile.tiled_q);
-    spec.subs["TILED_KV_NP"] = std::to_string(tile.tiled_kv);
-    spec.subs["NUM_SG_NP"] = std::to_string(tile.num_sg);
-    spec.subs["TILED_OUT_NP"] = std::to_string(tiled_out);
-  } else {
-    spec.subs["TILED_Q"] = std::to_string(tile.tiled_q);
-    spec.subs["TILED_KV"] = std::to_string(tile.tiled_kv);
-    spec.subs["NUM_SG"] = std::to_string(tile.num_sg);
-    spec.subs["TILED_OUT"] = std::to_string(tiled_out);
-  }
-  const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_FMHA_JIT_ENTRY");
-  spec.extra_flags = as.extra_flags;
-  spec.target = as.target;
-  spec.entry_symbol = "sgl_fmha_entry";
-  spec.name = std::string("xe_fmha_fwd_") + prefill_op_tag(op) + "_" + std::to_string(hd) + "_" +
-              (fp16 ? "fp16" : "bf16") + "_" + as.suffix;
-
-  void* sym = jit::get_or_compile(spec, cfg, err);
-  if (!sym) return nullptr;
-
-  KernelFn fn = reinterpret_cast<KernelFn>(sym);
-  {
-    std::lock_guard<std::mutex> lk(g_prefill_mu);
-    g_prefill_fns[key] = fn;
-  }
-  return fn;
+    return resolve_spec("FMHA prefill", prefill_template_file(op), spec, arch, berr);
+  };
+  return g_prefill_fns.get(key, build, err);
 }
 
 }  // namespace

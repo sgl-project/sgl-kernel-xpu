@@ -1,8 +1,6 @@
 #include "jit/gdn_jit.h"
 
 #include <cstdint>
-#include <mutex>
-#include <unordered_map>
 
 #include "jit/jit_arch.h"
 #include "jit/sycl_template_jit.h"
@@ -62,47 +60,35 @@ uint64_t pack_key(int arch, bool is_half, int state_code) {
   return k;
 }
 
-std::mutex g_mu;
-std::unordered_map<uint64_t, ChunkFn> g_fns;
+jit::JitFnCache<ChunkFn> g_fns("GDN chunk");
 
 ChunkFn resolve(bool is_half, int state_code, int arch, std::string* err) {
   const uint64_t key = pack_key(arch, is_half, state_code);
-  {
-    std::lock_guard<std::mutex> lk(g_mu);
-    auto it = g_fns.find(key);
-    if (it != g_fns.end()) return it->second;
-  }
+  auto build = [&](std::string* berr) -> void* {
+    const jit::JitConfig& cfg = jit::default_config();
+    if (!cfg.valid) {
+      *berr = "unavailable: " + cfg.error;
+      return nullptr;
+    }
+    if (cfg.src_root.empty()) {
+      *berr = "source template root not resolved";
+      return nullptr;
+    }
 
-  const jit::JitConfig& cfg = jit::default_config();
-  if (!cfg.valid) {
-    if (err) *err = "GDN chunk JIT unavailable: " + cfg.error;
-    return nullptr;
-  }
-  if (cfg.src_root.empty()) {
-    if (err) *err = "GDN chunk JIT: source template root not resolved";
-    return nullptr;
-  }
+    jit::CompileSpec spec;
+    spec.template_path = cfg.src_root + "/sycl/kernels/gdn_attn/chunk_gated_delta_rule_jit_instance.cpp.in";
+    spec.subs["SCALAR_T"] = scalar_type(is_half);
+    spec.subs["STATE_T"] = state_type(state_code);
+    const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_GDN_JIT_ENTRY");
+    spec.extra_flags = as.extra_flags;
+    spec.target = as.target;
+    spec.entry_symbol = "sgl_gdn_chunk_entry";
+    spec.name =
+        std::string("gdn_chunk_") + (is_half ? "f16" : "bf16") + "_s" + std::to_string(state_code) + "_" + as.suffix;
 
-  jit::CompileSpec spec;
-  spec.template_path = cfg.src_root + "/sycl/kernels/gdn_attn/chunk_gated_delta_rule_jit_instance.cpp.in";
-  spec.subs["SCALAR_T"] = scalar_type(is_half);
-  spec.subs["STATE_T"] = state_type(state_code);
-  const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_GDN_JIT_ENTRY");
-  spec.extra_flags = as.extra_flags;
-  spec.target = as.target;
-  spec.entry_symbol = "sgl_gdn_chunk_entry";
-  spec.name =
-      std::string("gdn_chunk_") + (is_half ? "f16" : "bf16") + "_s" + std::to_string(state_code) + "_" + as.suffix;
-
-  void* sym = jit::get_or_compile(spec, cfg, err);
-  if (!sym) return nullptr;
-
-  ChunkFn fn = reinterpret_cast<ChunkFn>(sym);
-  {
-    std::lock_guard<std::mutex> lk(g_mu);
-    g_fns[key] = fn;
-  }
-  return fn;
+    return jit::get_or_compile(spec, cfg, berr);
+  };
+  return g_fns.get(key, build, err);
 }
 
 }  // namespace

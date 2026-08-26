@@ -429,48 +429,59 @@ void mha_fwd(
   //         0 -> auto: pick a split count from the device-occupancy heuristic
   //        >1 -> use the caller-provided split count with FmhaSplitDecodeRunner
   if (num_kv_splits == 0) {
-    auto get_num_splits =
-        [](int batch_size, int num_heads_q, int num_heads_kv, int head_size_v, int max_seqlen_k, int block_size) {
-          auto stream = at::xpu::getCurrentXPUStream();
-          auto queue = stream.queue();
-          auto device = queue.get_device();
-          int num_xe_cores = device.get_info<sycl::ext::intel::info::device::gpu_slices>() *
-                             device.get_info<sycl::ext::intel::info::device::gpu_subslices_per_slice>();
-          int parallel_ = num_xe_cores;
-          int parallel_2 = num_xe_cores * 2;
-          int cur_parallel_d = batch_size * num_heads_kv;
-          int num_splits = (parallel_ + cur_parallel_d - 1) / cur_parallel_d;
-          if (cur_parallel_d * num_splits > parallel_ && num_splits > 1) {
-            num_splits = std::ceil(parallel_2 / static_cast<float>(cur_parallel_d)) - 1;
-          }
+    auto get_num_splits = [](int batch_size,
+                             int num_heads_q,
+                             int num_heads_kv,
+                             int head_size_v,
+                             int max_seqlen_k,
+                             int block_size,
+                             int window_size_left) {
+      auto stream = at::xpu::getCurrentXPUStream();
+      auto queue = stream.queue();
+      auto device = queue.get_device();
+      int num_xe_cores = device.get_info<sycl::ext::intel::info::device::gpu_slices>() *
+                         device.get_info<sycl::ext::intel::info::device::gpu_subslices_per_slice>();
+      int parallel_ = num_xe_cores;
+      int parallel_2 = num_xe_cores * 2;
+      int cur_parallel_d = batch_size * num_heads_kv;
+      int num_splits = (parallel_ + cur_parallel_d - 1) / cur_parallel_d;
+      if (cur_parallel_d * num_splits > parallel_ && num_splits > 1) {
+        num_splits = std::ceil(parallel_2 / static_cast<float>(cur_parallel_d)) - 1;
+      }
 
-          int total_blocks = (max_seqlen_k + block_size - 1) / block_size;
-          constexpr int kMinBlocksToSplit = 64;
-          constexpr int kAlwaysSplitHeadSizeV = 512;
-          if (total_blocks <= kMinBlocksToSplit && head_size_v < kAlwaysSplitHeadSizeV) {
-            return 1;
-          }
+      int const total_blocks = (max_seqlen_k + block_size - 1) / block_size;
+      int const effective_seqlen_k =
+          window_size_left >= 0 ? std::min(max_seqlen_k, window_size_left + 1) : max_seqlen_k;
+      int const effective_blocks = (effective_seqlen_k + block_size - 1) / block_size;
+      int const effective_batch = batch_size * num_heads_kv;
+      constexpr int kMinBlocksToSplit = 64;
+      constexpr int kMinWorkToSplitPerBatch = 512;
+      if (effective_blocks <= kMinBlocksToSplit ||
+          effective_blocks * head_size_v < kMinWorkToSplitPerBatch * effective_batch) {
+        return 1;
+      }
 
-          if (batch_size == 1 && num_heads_q == 8 && num_heads_kv == 1 && head_size_v == 512 && block_size == 64) {
-            int const current_parallelism = 2;
-            int const target_splits = (3 * num_xe_cores + current_parallelism - 1) / current_parallelism;
-            int const split_limit = std::min({target_splits, total_blocks, 64});
-            int best_splits = 1;
-            int best_iters = total_blocks;
-            for (int splits = 1; splits <= split_limit; ++splits) {
-              int const iters = (total_blocks + splits - 1) / splits;
-              if (iters < best_iters) {
-                best_iters = iters;
-                best_splits = splits;
-              }
-            }
-            return best_splits;
+      if (batch_size == 1 && num_heads_q == 8 && num_heads_kv == 1 && head_size_v == 512 && block_size == 64) {
+        int const current_parallelism = 2;
+        int const target_splits = (3 * num_xe_cores + current_parallelism - 1) / current_parallelism;
+        int const split_limit = std::min({target_splits, total_blocks, 64});
+        int best_splits = 1;
+        int best_iters = total_blocks;
+        for (int splits = 1; splits <= split_limit; ++splits) {
+          int const iters = (total_blocks + splits - 1) / splits;
+          if (iters < best_iters) {
+            best_iters = iters;
+            best_splits = splits;
           }
+        }
+        return best_splits;
+      }
 
-          int max_splits = std::min(total_blocks, parallel_);
-          return std::min(num_splits, max_splits);
-        };
-    num_kv_splits = get_num_splits(batch_size, num_heads, num_heads_k, head_size_v, seqlen_k, page_size);
+      int max_splits = std::min(total_blocks, parallel_);
+      return std::min(num_splits, max_splits);
+    };
+    num_kv_splits =
+        get_num_splits(batch_size, num_heads, num_heads_k, head_size_v, seqlen_k, page_size, window_size_left);
   }
   // Only split when the resolved count is > 1; -1 / 1 fall back to non-split.
   params.use_split_kv = num_kv_splits > 1;

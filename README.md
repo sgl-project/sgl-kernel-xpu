@@ -26,7 +26,9 @@ variables (default is `ON` for all):
 | --- | --- | --- |
 | `USE_MOE` | `ON` | MoE group gemm kernels |
 | `USE_FMHA` | `ON` | Flash attention kernels (`fwd`) |
+| `USE_GDN` | `ON` | Gated DeltaNet attention kernels |
 | `USE_MLA` | `ON` | MLA decode/prefill/sparse-decode kernels |
+| `USE_MLA_SPARSE_FUSED` | `OFF` | Fused (single-pass) sparse MLA decode kernel (optimization track) |
 
 Notes:
 - `OFF` and `0` are both accepted.

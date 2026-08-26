@@ -172,6 +172,11 @@ if(USE_SYCL_JIT)
     install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/sycl
             DESTINATION sgl_kernel/include/sgl_src
             FILES_MATCHING PATTERN "*.hpp" PATTERN "*.h" PATTERN "*.cpp.in")
+    # sycl/Utils.h quote-includes "jit/jit_arch.h"; ship the JIT host headers so
+    # they resolve against the sgl_src include root during the on-demand compile.
+    install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/jit
+            DESTINATION sgl_kernel/include/sgl_src
+            FILES_MATCHING PATTERN "*.hpp" PATTERN "*.h")
     if(DEFINED repo-cutlass-sycl_SOURCE_DIR)
         install(DIRECTORY ${repo-cutlass-sycl_SOURCE_DIR}/include/
                 DESTINATION sgl_kernel/include/cutlass_sycl/include)

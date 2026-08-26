@@ -16,7 +16,15 @@ if(USE_SYCL_JIT)
     ${SGL_OPS_XPU_ROOT}/src/jit/gdn_jit.cpp)
   set_target_properties(sgl_jit PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_include_directories(sgl_jit PUBLIC ${SGL_OPS_XPU_ROOT}/src)
-  string(REPLACE ";" " " SGL_JIT_SYCL_FLAGS_VALUE "${SYCL_COMPILE_FLAGS}")
+  # cutlass-sycl headers (e.g. cute/util/debug.hpp) select the SYCL backend only
+  # when CUTLASS_ENABLE_SYCL is defined; the AOT build sets it globally via
+  # add_compile_definitions, so mirror it into the runtime-JIT compile flags or
+  # the on-demand icpx compile falls back to the CUDA path and fails on
+  # <cuda_runtime_api.h>. The spirv-translator extensions mirror the AOT
+  # SYCL_DEVICE_LINK_FLAGS so device codegen (split barrier, 2D block IO,
+  # subgroup MMA) is enabled for the single-shot JIT compile+link.
+  string(REPLACE ";" " " SGL_JIT_SYCL_FLAGS_VALUE
+    "${SYCL_COMPILE_FLAGS};-DCUTLASS_ENABLE_SYCL;-Xspirv-translator;-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate")
   target_compile_definitions(sgl_jit PRIVATE
     SGL_JIT_SYCL_FLAGS=\"${SGL_JIT_SYCL_FLAGS_VALUE}\")
   target_compile_features(sgl_jit PRIVATE cxx_std_17)

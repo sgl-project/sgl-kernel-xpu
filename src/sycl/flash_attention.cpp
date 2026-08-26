@@ -704,7 +704,8 @@ void mha_fwd(
     }
     std::string jit_err;
     TORCH_CHECK(
-        sgl::fmha_jit::decode_launch(op, qg_sz, params.d, params.page_size, is_fp16, &params, jit_arch_code(), &jit_err),
+        sgl::fmha_jit::decode_launch(
+            op, qg_sz, params.d, params.page_size, is_fp16, &params, jit_arch_code(), &jit_err),
         jit_err);
   }
 #else

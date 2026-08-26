@@ -41,9 +41,8 @@ struct TileCfg {
 #define SGL_MOE_STR(...) #__VA_ARGS__
 #define SGL_MOE_XSTR(...) SGL_MOE_STR(__VA_ARGS__)
 #define SGL_MOE_TILE_ROW(id) {SGL_MOE_XSTR(SGL_MOE_GG_SHAPE_##id), SGL_MOE_XSTR(SGL_MOE_GG_LAYOUT_##id)},
-const TileCfg kTiles[sgl::moe::kGroupedGemmNumTiles] = {
-    SGL_MOE_TILE_ROW(0) SGL_MOE_TILE_ROW(1) SGL_MOE_TILE_ROW(2) SGL_MOE_TILE_ROW(3) SGL_MOE_TILE_ROW(4)
-        SGL_MOE_TILE_ROW(5) SGL_MOE_TILE_ROW(6)};
+const TileCfg kTiles[sgl::moe::kGroupedGemmNumTiles] = {SGL_MOE_TILE_ROW(0) SGL_MOE_TILE_ROW(1) SGL_MOE_TILE_ROW(
+    2) SGL_MOE_TILE_ROW(3) SGL_MOE_TILE_ROW(4) SGL_MOE_TILE_ROW(5) SGL_MOE_TILE_ROW(6)};
 #undef SGL_MOE_TILE_ROW
 #undef SGL_MOE_XSTR
 #undef SGL_MOE_STR

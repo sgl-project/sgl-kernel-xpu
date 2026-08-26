@@ -262,8 +262,8 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
   // maps to the same Shape/Layout tokens both sides consume. FuseAct is passed
   // as the runtime flag: DISPATCH_MOE_HELPER_FUSE_ACT emits both fused and
   // non-fused instantiations regardless, so this matches the prior tree exactly.
-#define MOE_GG_CASE(id)                                                                              \
-  case id:                                                                                           \
+#define MOE_GG_CASE(id)                                                                                \
+  case id:                                                                                             \
     DISPATCH_MOE(activation_type, fuse_act, with_bias, SGL_MOE_GG_SHAPE_##id, SGL_MOE_GG_LAYOUT_##id); \
     break;
   switch (sgl::moe::grouped_gemm_select_tile(avg_m, gemm_k, gemm_n, fuse_act)) {

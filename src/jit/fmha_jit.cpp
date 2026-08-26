@@ -221,8 +221,7 @@ KernelFn resolve_prefill(PrefillOp op, int hd, bool is_fp16, int arch, std::stri
 
 }  // namespace
 
-bool decode_launch(
-    DecodeOp op, int qg, int hd, int ps, bool is_fp16, const void* params, int arch, std::string* err) {
+bool decode_launch(DecodeOp op, int qg, int hd, int ps, bool is_fp16, const void* params, int arch, std::string* err) {
   KernelFn fn = resolve(op, qg, hd, ps, is_fp16, arch, err);
   if (!fn) return false;
   fn(params);

@@ -51,8 +51,8 @@ DecodeFn resolve_decode(bool is_fp16, int page_size, int arch, std::string* err)
   spec.extra_flags = as.extra_flags;
   spec.target = as.target;
   spec.entry_symbol = "sgl_mla_decode_entry";
-  spec.name = std::string("mla_decode_") + (is_fp16 ? "half" : "bf16") + "_" + std::to_string(page_size) + "_" +
-              as.suffix;
+  spec.name =
+      std::string("mla_decode_") + (is_fp16 ? "half" : "bf16") + "_" + std::to_string(page_size) + "_" + as.suffix;
 
   void* sym = jit::get_or_compile(spec, cfg, err);
   if (!sym) return nullptr;
@@ -138,8 +138,8 @@ PrefillFn resolve_prefill(bool is_fp16, int page_size, int arch, std::string* er
   spec.extra_flags = as.extra_flags;
   spec.target = as.target;
   spec.entry_symbol = "sgl_mla_prefill_entry";
-  spec.name = std::string("mla_prefill_") + (is_fp16 ? "half" : "bf16") + "_" + std::to_string(page_size) + "_" +
-              as.suffix;
+  spec.name =
+      std::string("mla_prefill_") + (is_fp16 ? "half" : "bf16") + "_" + std::to_string(page_size) + "_" + as.suffix;
 
   void* sym = jit::get_or_compile(spec, cfg, err);
   if (!sym) return nullptr;

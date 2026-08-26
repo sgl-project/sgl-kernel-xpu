@@ -91,8 +91,8 @@ ChunkFn resolve(bool is_half, int state_code, int arch, std::string* err) {
   spec.extra_flags = as.extra_flags;
   spec.target = as.target;
   spec.entry_symbol = "sgl_gdn_chunk_entry";
-  spec.name = std::string("gdn_chunk_") + (is_half ? "f16" : "bf16") + "_s" + std::to_string(state_code) + "_" +
-              as.suffix;
+  spec.name =
+      std::string("gdn_chunk_") + (is_half ? "f16" : "bf16") + "_s" + std::to_string(state_code) + "_" + as.suffix;
 
   void* sym = jit::get_or_compile(spec, cfg, err);
   if (!sym) return nullptr;

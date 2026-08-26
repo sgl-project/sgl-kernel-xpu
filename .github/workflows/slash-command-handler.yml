@@ -12,18 +12,15 @@ permissions:
 
 jobs:
   handle-command:
-    if: github.event.issue.pull_request
+    if: >
+      github.event.issue.pull_request &&
+      (contains(github.event.comment.body, '/run-ci') ||
+       contains(github.event.comment.body, '/rerun-ci'))
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout main
-        uses: actions/checkout@v4
-        with:
-          ref: main
-          repository: ${{ github.repository }}
-
       - name: Handle command
         env:
-          ACTOR: ${{ github.actor }}
+          ACTOR: ${{ github.event.comment.user.login }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           COMMENT_ID: ${{ github.event.comment.id }}
           GH_TOKEN: ${{ github.token }}
@@ -32,8 +29,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          IFS= read -r command <<< "$COMMENT_BODY"
-          command="${command%$'\r'}"
+          rerun_latest() {
+            local failed_only="$1"
+            local head_sha run_id
+            head_sha=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha)
+            run_id=$(gh api --method GET \
+              "repos/$REPOSITORY/actions/workflows/pr-test-xpu.yml/runs" \
+              -f event=pull_request \
+              -f head_sha="$head_sha" \
+              -f per_page=1 \
+              --jq '.workflow_runs[0].id // empty')
+            [[ -n "$run_id" ]] || return 1
+            if [[ "$failed_only" == "1" ]]; then
+              gh run rerun "$run_id" --repo "$REPOSITORY" --failed
+            else
+              gh run rerun "$run_id" --repo "$REPOSITORY"
+            fi
+          }
+
+          IFS= read -r first_line <<< "$COMMENT_BODY"
+          first_line="${first_line%$'\r'}"
+          first_line="${first_line#"${first_line%%[![:space:]]*}"}"
+          command="${first_line%%[[:space:]]*}"
           case "$command" in
             /run-ci|/rerun-ci) ;;
             *) exit 0 ;;
@@ -49,17 +66,16 @@ jobs:
           fi
 
           if [[ "$command" == "/run-ci" ]]; then
-            gh issue edit "$PR_NUMBER" --repo "$REPOSITORY" --add-label run-ci
+            has_label=$(gh api "repos/$REPOSITORY/issues/$PR_NUMBER" \
+              --jq '[.labels[].name] | index("run-ci") != null')
+            if [[ "$has_label" == "true" ]]; then
+              # Label already present: no new labeled event. Rerun current SHA.
+              rerun_latest 0
+            else
+              gh issue edit "$PR_NUMBER" --repo "$REPOSITORY" --add-label run-ci
+            fi
           else
-            head_sha=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha)
-            run_id=$(gh api --method GET \
-              "repos/$REPOSITORY/actions/workflows/pr-test-xpu.yml/runs" \
-              -f event=pull_request \
-              -f head_sha="$head_sha" \
-              -f per_page=1 \
-              --jq '.workflow_runs[0].id // empty')
-            [[ -n "$run_id" ]] || exit 0
-            gh run rerun "$run_id" --repo "$REPOSITORY" --failed
+            rerun_latest 1
           fi
 
           gh api --method POST \

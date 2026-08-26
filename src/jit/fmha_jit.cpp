@@ -61,15 +61,15 @@ jit::JitFnCache<KernelFn> g_fns("FMHA decode");
 jit::JitFnCache<KernelFn> g_prefill_fns("FMHA prefill");
 
 // Shared config-validation + spec-assembly for both decode and prefill.
-void* resolve_spec(
-    const char* op_label, const std::string& template_rel, jit::CompileSpec& spec, int arch, std::string* err) {
+// Error messages are bare (no op prefix); JitFnCache::get adds the prefix.
+void* resolve_spec(const std::string& template_rel, jit::CompileSpec& spec, int arch, std::string* err) {
   const jit::JitConfig& cfg = jit::default_config();
   if (!cfg.valid) {
-    if (err) *err = std::string(op_label) + " JIT unavailable: " + cfg.error;
+    if (err) *err = std::string("unavailable: ") + cfg.error;
     return nullptr;
   }
   if (cfg.src_root.empty()) {
-    if (err) *err = std::string(op_label) + " JIT: source template root not resolved";
+    if (err) *err = "source template root not resolved";
     return nullptr;
   }
   spec.template_path = cfg.src_root + "/sycl/kernels/flash_attention_v2/" + template_rel;
@@ -100,7 +100,7 @@ KernelFn resolve(DecodeOp op, int qg, int hd, int ps, bool is_fp16, int arch, st
     spec.name = std::string("xe_fmha_fwd_") + op_tag(op) + "_" + std::to_string(qg) + "_" + std::to_string(hd) +
                 (no_page ? "" : "_" + std::to_string(ps)) + "_" + (is_fp16 ? "fp16" : "bf16");
 
-    return resolve_spec("FMHA", template_file(op), spec, arch, berr);
+    return resolve_spec(template_file(op), spec, arch, berr);
   };
   return g_fns.get(key, build, err);
 }
@@ -176,7 +176,7 @@ KernelFn resolve_prefill(PrefillOp op, int hd, bool is_fp16, int arch, std::stri
     spec.name =
         std::string("xe_fmha_fwd_") + prefill_op_tag(op) + "_" + std::to_string(hd) + "_" + (fp16 ? "fp16" : "bf16");
 
-    return resolve_spec("FMHA prefill", prefill_template_file(op), spec, arch, berr);
+    return resolve_spec(prefill_template_file(op), spec, arch, berr);
   };
   return g_prefill_fns.get(key, build, err);
 }

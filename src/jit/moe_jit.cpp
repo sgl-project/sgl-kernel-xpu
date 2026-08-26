@@ -126,7 +126,11 @@ bool grouped_gemm_launch(
     int arch,
     std::string* err) {
   const int tile_id = sgl::moe::grouped_gemm_select_tile(avg_m, gemm_k, gemm_n, fuse_act);
-  KernelFn fn = resolve(tile_id, activation_type, fuse_act, with_bias, arch, err);
+  // Honor the same per-tile fuse policy the AOT dispatcher uses (single source in
+  // grouped_gemm_dispatch.h) so both paths select the identical fuse variant for
+  // a given tile; tiles whose fuse is fixed compile only that variant.
+  const bool eff_fuse = sgl::moe::grouped_gemm_effective_fuse(tile_id, fuse_act);
+  KernelFn fn = resolve(tile_id, activation_type, eff_fuse, with_bias, arch, err);
   if (!fn) return false;
   fn(queue,
      activations,

@@ -131,37 +131,30 @@ DECLARE_XE20_MOE_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
     }                                                             \
   } while (0)
 
-#define DISPATCH_MOE_HELPER_FUSE_ACT(ActType, FuseAct, WithBias, ...)  \
-  do {                                                                 \
-    if (FuseAct) {                                                     \
-      DISPATCH_MOE_HELPER_BIAS(ActType, true, WithBias, __VA_ARGS__);  \
-    } else {                                                           \
-      DISPATCH_MOE_HELPER_BIAS(ActType, false, WithBias, __VA_ARGS__); \
-    }                                                                  \
+// Dispatch on activation type with a compile-time fuse literal. The caller picks
+// the fuse value -- pinned by the tile's fuse policy, or the runtime flag for
+// kEither tiles -- so only reachable (act, fuse, bias) launchers are
+// instantiated and the single-variant large tiles never emit a dead fuse branch
+// (which would reference an undefined Xe20MoEGEMMLauncher symbol).
+#define DISPATCH_MOE_ACT(ActType, FuseLit, WithBias, ...)                                         \
+  do {                                                                                            \
+    switch (ActType) {                                                                            \
+      case 0:                                                                                     \
+        DISPATCH_MOE_HELPER_BIAS(ActivationType::SILU, FuseLit, WithBias, __VA_ARGS__);           \
+        break;                                                                                    \
+      case 1:                                                                                     \
+        DISPATCH_MOE_HELPER_BIAS(ActivationType::GELU, FuseLit, WithBias, __VA_ARGS__);           \
+        break;                                                                                    \
+      case 2:                                                                                     \
+        DISPATCH_MOE_HELPER_BIAS(ActivationType::SWIGLU_GPT_OSS, FuseLit, WithBias, __VA_ARGS__); \
+        break;                                                                                    \
+      case 3:                                                                                     \
+        DISPATCH_MOE_HELPER_BIAS(ActivationType::RELU2, FuseLit, false, __VA_ARGS__);             \
+        break;                                                                                    \
+      default:                                                                                    \
+        TORCH_CHECK(false, "Unsupported activation type");                                        \
+    }                                                                                             \
   } while (0)
-
-#define DISPATCH_MOE_HELPER_ACT_TYPE(ActType, FuseAct, WithBias, ...)                                 \
-  do {                                                                                                \
-    switch (ActType) {                                                                                \
-      case 0:                                                                                         \
-        DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::SILU, FuseAct, WithBias, __VA_ARGS__);           \
-        break;                                                                                        \
-      case 1:                                                                                         \
-        DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::GELU, FuseAct, WithBias, __VA_ARGS__);           \
-        break;                                                                                        \
-      case 2:                                                                                         \
-        DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::SWIGLU_GPT_OSS, FuseAct, WithBias, __VA_ARGS__); \
-        break;                                                                                        \
-      case 3:                                                                                         \
-        DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::RELU2, FuseAct, false, __VA_ARGS__);             \
-        break;                                                                                        \
-      default:                                                                                        \
-        TORCH_CHECK(false, "Unsupported activation type");                                            \
-    }                                                                                                 \
-  } while (0)
-
-#define DISPATCH_MOE(ActType, FuseAct, WithBias, ...) \
-  DISPATCH_MOE_HELPER_ACT_TYPE(ActType, FuseAct, WithBias, __VA_ARGS__)
 
 SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
     torch::Tensor& output,
@@ -257,14 +250,29 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
         jit_err);
   }
 #else
-  // Tile selection is shared with the runtime-JIT path via
-  // sgl::moe::grouped_gemm_select_tile (grouped_gemm_dispatch.h); each tile id
-  // maps to the same Shape/Layout tokens both sides consume. FuseAct is passed
-  // as the runtime flag: DISPATCH_MOE_HELPER_FUSE_ACT emits both fused and
-  // non-fused instantiations regardless, so this matches the prior tree exactly.
-#define MOE_GG_CASE(id)                                                                                \
-  case id:                                                                                             \
-    DISPATCH_MOE(activation_type, fuse_act, with_bias, SGL_MOE_GG_SHAPE_##id, SGL_MOE_GG_LAYOUT_##id); \
+  // Tile selection AND the per-tile fuse reachability are shared with the
+  // runtime-JIT path via grouped_gemm_dispatch.h. A per-tile template lambda
+  // lets `if constexpr` genuinely discard the unreachable branch: tiles whose
+  // fuse_act is fixed by the selector (grouped_gemm_tile_fuse_policy != kEither)
+  // instantiate only that fuse variant, so the compiler never references the
+  // uninstantiated (undefined) opposite variant of the large tiles; kEither
+  // tiles keep the runtime split. (A non-template `if constexpr` would still
+  // compile the discarded branch and reintroduce the undefined symbol.)
+  auto dispatch_tile = [&]<int TileId, typename Tile, typename SGLayout>() {
+    constexpr auto kPolicy = sgl::moe::grouped_gemm_tile_fuse_policy(TileId);
+    if constexpr (kPolicy == sgl::moe::GroupedGemmFusePolicy::kFusedOnly) {
+      DISPATCH_MOE_ACT(activation_type, true, with_bias, Tile, SGLayout);
+    } else if constexpr (kPolicy == sgl::moe::GroupedGemmFusePolicy::kNonFusedOnly) {
+      DISPATCH_MOE_ACT(activation_type, false, with_bias, Tile, SGLayout);
+    } else if (fuse_act) {
+      DISPATCH_MOE_ACT(activation_type, true, with_bias, Tile, SGLayout);
+    } else {
+      DISPATCH_MOE_ACT(activation_type, false, with_bias, Tile, SGLayout);
+    }
+  };
+#define MOE_GG_CASE(id)                                                                    \
+  case id:                                                                                 \
+    dispatch_tile.template operator()<id, SGL_MOE_GG_SHAPE_##id, SGL_MOE_GG_LAYOUT_##id>(); \
     break;
   switch (sgl::moe::grouped_gemm_select_tile(avg_m, gemm_k, gemm_n, fuse_act)) {
     MOE_GG_CASE(0)

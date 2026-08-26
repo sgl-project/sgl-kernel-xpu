@@ -59,5 +59,42 @@ inline int grouped_gemm_select_tile(int avg_m, int gemm_k, int gemm_n, bool fuse
   return fuse_act ? 5 : 6;
 }
 
+// Fuse-activation reachability per tile id, mirroring grouped_gemm_select_tile:
+// tiles 3/5 are only ever returned with fuse_act==true, tiles 4/6 only with
+// fuse_act==false, tiles 0-2 with either. This is the single source both build
+// paths honor: the AOT dispatcher instantiates only the reachable fuse variant
+// (large tiles ship one fuse variant, so instantiating the other would reference
+// an undefined launcher symbol); the JIT wrapper compiles the exact tile/fuse
+// pair select_tile returns, so it needs no separate mapping.
+enum class GroupedGemmFusePolicy { kEither, kFusedOnly, kNonFusedOnly };
+
+inline constexpr GroupedGemmFusePolicy grouped_gemm_tile_fuse_policy(int tile_id) {
+  switch (tile_id) {
+    case 3:
+    case 5:
+      return GroupedGemmFusePolicy::kFusedOnly;
+    case 4:
+    case 6:
+      return GroupedGemmFusePolicy::kNonFusedOnly;
+    default:
+      return GroupedGemmFusePolicy::kEither;
+  }
+}
+
+// Effective fuse variant for a selected tile: pinned by the policy when the tile
+// ships a single fuse variant, else the caller's runtime `fuse_act`. Both build
+// paths call this so the tile->fuse decision has exactly one definition (the JIT
+// wrapper compiles this variant; the AOT dispatcher instantiates only it).
+inline constexpr bool grouped_gemm_effective_fuse(int tile_id, bool fuse_act) {
+  switch (grouped_gemm_tile_fuse_policy(tile_id)) {
+    case GroupedGemmFusePolicy::kFusedOnly:
+      return true;
+    case GroupedGemmFusePolicy::kNonFusedOnly:
+      return false;
+    default:
+      return fuse_act;
+  }
+}
+
 }  // namespace moe
 }  // namespace sgl

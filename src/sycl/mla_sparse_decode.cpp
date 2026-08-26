@@ -194,7 +194,11 @@ SGL_KERNEL_EXPORT void flash_mla_sparse_decode(
       "Unsupported input data type for Sparse MLA decode");
   TORCH_CHECK(head_dim_v == 512, "head_dim_v must be 512 for DeepSeek V4 MLA");
 
-#ifdef USE_MLA_JIT
+// The JIT path only covers the 2-stage template (the fused template has no
+// SGL_MLA_JIT_ENTRY). When the fused path is selected
+// (SGLANG_USE_SPARSE_MLA_2STAGE=0), fall through to the AOT dispatch below so
+// the compile-time A/B toggle stays authoritative on both paths.
+#if defined(USE_MLA_JIT) && SGLANG_USE_SPARSE_MLA_2STAGE
   {
     const int d_qk = static_cast<int>(q.size(3));
     const int b_h = mla_sparse_decode::sparse_mla_decode_select_b_h(q.size(2));

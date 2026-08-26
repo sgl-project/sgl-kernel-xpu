@@ -81,7 +81,14 @@ static inline int jit_arch_code(at::DeviceIndex device_index = -1) {
     // case syclex::architecture::intel_gpu_<xe35>:
     //   return static_cast<int>(sgl::jit::Arch::XE3P);  // Xe35, when the enum lands
     default:
-      return static_cast<int>(sgl::jit::Arch::BMG);  // default to BMG
+      // Unknown architecture: fail loudly instead of silently compiling BMG
+      // device code, which would produce wrong results at runtime.
+      TORCH_CHECK(
+          false,
+          "Runtime-JIT does not support this XPU architecture yet. "
+          "Set SGLANG_DISABLE_SYCL_JIT=1 or rebuild with USE_SYCL_JIT=OFF to "
+          "use the AOT kernels.");
+      return static_cast<int>(sgl::jit::Arch::BMG);  // unreachable
   }
 }
 

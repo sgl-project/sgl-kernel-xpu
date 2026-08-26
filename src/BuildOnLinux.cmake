@@ -6,8 +6,9 @@ set(SYCL_LINK_LIBRARIES_KEYWORD PRIVATE)
 # AOT device link flags, shared by every SYCL kernel library below and reused
 # verbatim by the runtime-JIT compile so both paths link identically.
 if(SYCL_COMPILER_VERSION GREATER_EQUAL 20250806)
+  # SYCL_DEVICE_LINK_FLAGS already contains SGL_SYCL_SPIRV_EXT_FLAGS
+  # (appended in cmake/BuildFlags.cmake); do not append it again.
   set(COMMON_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS})
-  set(COMMON_DEVICE_LINK_FLAGS ${COMMON_DEVICE_LINK_FLAGS} ${SGL_SYCL_SPIRV_EXT_FLAGS})
 else()
   message(FATAL_ERROR
       "SYCL compiler version must be >= 20250806, "

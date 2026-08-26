@@ -7,8 +7,9 @@
 
 #include "../Utils.h"
 #include "../kernels/gdn_attn/chunk_gated_delta_rule_kernels_xe20.hpp"
+#include "sgl_kernel_export.h"
 
-void chunk_gated_delta_rule(
+SGL_KERNEL_EXPORT void chunk_gated_delta_rule(
     sycl::queue& queue,
     torch::Tensor& core_attn_out,                           // [total_seqlen, num_v_heads, head_v_dim]
     const torch::Tensor& q,                                 // [total_virtual_seqlen, num_k_heads, head_k_dim]

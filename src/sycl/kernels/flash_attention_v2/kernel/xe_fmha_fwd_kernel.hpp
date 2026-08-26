@@ -71,7 +71,8 @@ template <
     // decode step. Only enabled by the decode runner for the plain attention
     // case (no causal/local mask, no sink); prefill keeps the default (false)
     // and is therefore unaffected.
-    bool PackGQA_ = false>
+    bool PackGQA_ = false,
+    int StaticScoreMode_ = -1>
 class XeFMHAFwdKernel {
  public:
   //
@@ -80,6 +81,20 @@ class XeFMHAFwdKernel {
   using ProblemShape = ProblemShape_;
   using VariableLength = cutlass::fmha::collective::VariableLength;
   static constexpr bool is_var_len = cutlass::fmha::collective::is_variable_length_v<typename ProblemShape::SeqLenType>;
+
+  template <int ScoreMode>
+  using WithStaticScoreMode = XeFMHAFwdKernel<
+      ProblemShape_,
+      CollectiveMainloop_,
+      CollectiveEpilogue_,
+      TileScheduler_,
+      VarLenQLayoutStep_,
+      VarLenKLayoutStep_,
+      VarLenVLayoutStep_,
+      VarLenOLayoutStep_,
+      PackGQA_,
+      ScoreMode>;
+
   // Mainloop derived types
   using CollectiveMainloop = CollectiveMainloop_;
   using MainloopArguments = typename CollectiveMainloop::Arguments;
@@ -120,6 +135,8 @@ class XeFMHAFwdKernel {
 
   // Sink support from epilogue
   static constexpr bool Sink = CollectiveEpilogue::Sink;
+  // Whether the epilogue emits softmax log-sum-exp.
+  static constexpr bool LSE = CollectiveEpilogue::LSE;
   using ElementSink = typename CollectiveEpilogue::ElementSink;
 
   // Kernel level shared memory storage
@@ -156,6 +173,10 @@ class XeFMHAFwdKernel {
     // a host-side D2H sync (tensor.item()). Null => non-fp8 KV (scale = 1.0f).
     const float* scale_k_ptr = nullptr;
     const float* scale_v_ptr = nullptr;
+    // Optional softmax LSE output (natural-log log-sum-exp), row-major
+    // (num_heads_q, total_q). Null => don't write.
+    float* softmax_lse = nullptr;
+    int64_t lse_head_stride = 0;  // = total_q
   };
   using KernelParams = KernelArguments;
 
@@ -179,22 +200,64 @@ class XeFMHAFwdKernel {
   // Methods
   //
 
-  static Params to_underlying_arguments(Arguments const& args, void* workspace) {
+  template <class ArgumentsT>
+  static Params to_underlying_arguments(ArgumentsT const& args, void* workspace) {
     // When packing GQA into M, grid over KV heads instead of Q heads by reusing
     // the scheduler's num_heads_kv path (num_kv_splits == 1, no actual split).
     const int sched_num_kv_splits = PackGQA_ ? 1 : -1;
+    KernelParams kernel_params{
+        args.kernel.shape,
+        args.kernel.Q,
+        args.kernel.dQ,
+        args.kernel.K,
+        args.kernel.dK,
+        args.kernel.V,
+        args.kernel.dV,
+        args.kernel.O,
+        args.kernel.dO,
+        args.kernel.K_cache,
+        args.kernel.dK_cache,
+        args.kernel.V_cache,
+        args.kernel.dV_cache,
+        args.kernel.sm_sink,
+        args.kernel.skip_batch_mask,
+        args.kernel.scale_k_ptr,
+        args.kernel.scale_v_ptr,
+        args.kernel.softmax_lse,
+        args.kernel.lse_head_stride};
+    auto scheduler_params =
+        TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{}, sched_num_kv_splits);
+    if constexpr (CollectiveMainloop::ScoreBlock2D && StaticScoreMode_ >= 0) {
+      scheduler_params.grid.x = 1;
+    }
     return {
-        args.kernel,
+        kernel_params,
         CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
         CollectiveEpilogue::to_underlying_arguments(args.epilogue, workspace),
-        TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{}, sched_num_kv_splits)};
+        scheduler_params};
   }
 
   static bool can_implement(Arguments const& args) {
     return CollectiveMainloop::can_implement(args.mainloop) && CollectiveEpilogue::can_implement(args.epilogue);
   }
 
-  static int get_workspace_size(Arguments const& args) {
+  static size_t get_workspace_size(Arguments const& args) {
+    if constexpr (CollectiveMainloop::ScoreBlock2D) {
+      size_t score_q_extent;
+      size_t score_k_extent;
+      if constexpr (is_var_len) {
+        score_q_extent = size_t(args.kernel.shape.seq_len_qo.max_length);
+        score_k_extent = size_t(args.kernel.shape.seq_len_kv_cache.max_length);
+      } else {
+        score_q_extent = size_t(args.kernel.shape.seq_len_qo);
+        score_k_extent = size_t(args.kernel.shape.seq_len_kv_cache);
+      }
+      const size_t score_rows_per_wg = size_t(get<0>(TileShapeQK{}));
+      const size_t q_tiles = cute::ceil_div(score_q_extent, score_rows_per_wg);
+      score_k_extent = cute::round_up(score_k_extent, size_t(get<1>(TileShapeQK{})));
+      return size_t(args.kernel.shape.batch) * size_t(args.kernel.shape.num_heads_q) * q_tiles * score_rows_per_wg *
+             score_k_extent * sizeof(typename CollectiveMainloop::ElementScoreStore);
+    }
     return 0;
   }
 
@@ -268,6 +331,10 @@ class XeFMHAFwdKernel {
       auto [blk_q, blk_v, head_q, idx_b, unused] = tile_scheduler.get_block_coord();  // (Q,V,h,b)
       // Mix-batch dispatch: skip batches not owned by this kernel launch.
       if (p.skip_batch_mask != nullptr && p.skip_batch_mask[idx_b]) continue;
+      if constexpr (CollectiveMainloop::ScoreBlock2D) {
+        static_assert(StaticScoreMode_ == 0 || StaticScoreMode_ == 1);
+        blk_v = StaticScoreMode_;
+      }
       auto blk_qv = make_coord(blk_q, blk_v);
       // PackGQA: the scheduler grids over KV heads, so head_q already is the KV
       // head index and the head_group_q query heads are folded into the M tile.
@@ -386,6 +453,31 @@ class XeFMHAFwdKernel {
       // With PackGQA the Q/O head dimension is indexed by the KV head; otherwise
       // by the (un-grouped) query head.
       int q_head_idx = PackGQA_ ? head : head_q;
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+      typename CollectiveMainloop::ElementScoreStore* score_head_ptr = nullptr;
+      int score_region_cols = 0;
+      bool score_pf_q_ok = false;
+      if constexpr (CollectiveMainloop::ScoreBlock2D) {
+        int score_q_extent;
+        int score_k_extent;
+        int score_batch;
+        if constexpr (is_var_len) {
+          score_q_extent = int(s.seq_len_qo.max_length);
+          score_k_extent = int(s.seq_len_kv_cache.max_length);
+          score_batch = idx_b;
+        } else {
+          score_q_extent = int(s.seq_len_qo);
+          score_k_extent = int(s.seq_len_kv_cache);
+          score_batch = l_coord;
+        }
+        score_k_extent = cute::round_up(score_k_extent, int(get<1>(TileShapeQK{})));
+        score_region_cols = score_k_extent;
+        score_pf_q_ok = score_q_extent >= cutlass::fmha::ScoreBlock2DPolicy::ScorePrefetchQMin;
+        const int q_tiles = cute::ceil_div(score_q_extent, int(get<0>(TileShapeQK{})));
+        const size_t wg_slot = (size_t(score_batch) * s.num_heads_q + q_head_idx) * q_tiles + size_t(blk_q);
+        score_head_ptr = params.mainloop.ptr_score + wg_slot * size_t(get<0>(TileShapeQK{})) * size_t(score_k_extent);
+      }
+#endif
       // FP8 KV: the per-tensor dequant scale baked into KernelArguments is
       // passed as a float function argument (scale_k) to the mainloop GEMM1.
       // It defaults to 1.0f for non-fp8 KV; the fp8 dequant scalar is read
@@ -396,6 +488,33 @@ class XeFMHAFwdKernel {
         scale_k = *p.scale_k_ptr;
       }
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+      mainloop.template operator()<StaticScoreMode_>(
+          Q(_, _, q_head_idx, l_coord),
+          K_cache(_, _, head, l_coord),
+          V_cache(_, _, head, l_coord),
+          tArA,
+          tA_max,
+          tA_sum,
+          blk_qv,
+          blk_k0,
+          blk_k1,
+          k_blocks,
+          k_blocks_causal,
+          thr_id,
+          seq_len,
+          seq_len_kv_cache,
+          idx_b,
+          full_tile_offset,
+          discard_seq_coord,
+          K_cache(_, _, head, l_coord),
+          V_cache(_, _, head, l_coord),
+          scale_k,
+          score_head_ptr,
+          score_region_cols,
+          0,
+          score_pf_q_ok);
+#else
       mainloop(
           Q(_, _, q_head_idx, l_coord),
           K_cache(_, _, head, l_coord),
@@ -417,6 +536,7 @@ class XeFMHAFwdKernel {
           K_cache(_, _, head, l_coord),
           V_cache(_, _, head, l_coord),
           scale_k);
+#endif
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());
@@ -431,6 +551,21 @@ class XeFMHAFwdKernel {
       float scale_v = 1.0f;
       if constexpr (CollectiveMainloop::Fp8KV) {
         scale_v = *p.scale_v_ptr;
+      }
+      // softmax_lse output coordinates. get<0>(tOgO) inside the epilogue is the
+      // global row within this head/batch O slice, so the query-token base is
+      // just this batch's offset (the epilogue adds the row for non-packed
+      // tiles). For PackGQA decode the single query token maps to lse_q_base and
+      // the row selects the query head within the KV group.
+      int lse_q_base = 0;
+      int lse_head_base = 0;
+      if constexpr (LSE) {
+        if constexpr (is_var_len) {
+          lse_q_base = s.seq_len_qo.cumulative_length[idx_b];
+        } else {
+          lse_q_base = idx_b * seq_len_qo;
+        }
+        lse_head_base = PackGQA_ ? (head * head_group_q) : q_head_idx;
       }
       if constexpr (Sink) {
         if constexpr (PackGQA_) {
@@ -447,12 +582,47 @@ class XeFMHAFwdKernel {
               scale_v,
               ElementSink{},
               p.sm_sink + head * head_group_q,
-              head_group_q);
+              head_group_q,
+              p.softmax_lse,
+              p.lse_head_stride,
+              lse_q_base,
+              lse_head_base,
+              seq_len_qo);
         } else {
-          epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, scale_v, p.sm_sink[q_head_idx]);
+          epilogue(
+              O(_, _, q_head_idx, l_coord),
+              tArA,
+              tA_max,
+              tA_sum,
+              blk_qv,
+              thr_id,
+              scale_v,
+              p.sm_sink[q_head_idx],
+              nullptr,
+              0,
+              p.softmax_lse,
+              p.lse_head_stride,
+              lse_q_base,
+              lse_head_base,
+              seq_len_qo);
         }
       } else {
-        epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, scale_v);
+        epilogue(
+            O(_, _, q_head_idx, l_coord),
+            tArA,
+            tA_max,
+            tA_sum,
+            blk_qv,
+            thr_id,
+            scale_v,
+            ElementSink{},
+            nullptr,
+            head_group_q,
+            p.softmax_lse,
+            p.lse_head_stride,
+            lse_q_base,
+            lse_head_base,
+            seq_len_qo);
       }
     }
   }
@@ -964,7 +1134,8 @@ class XeFMHAFwdSplitKVKernel {
   using ElementLSE = typename CollectiveEpilogue::ElementLSE;
   using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
 
-  // Kernel level shared memory storage
+  // Whether the epilogue emits softmax log-sum-exp.
+  static constexpr bool LSE = CollectiveEpilogue::LSE;
   using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
   using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
   union SharedStorage {
@@ -1003,6 +1174,12 @@ class XeFMHAFwdSplitKVKernel {
     // a host-side D2H sync (tensor.item()). Null => non-fp8 KV (scale = 1.0f).
     const float* scale_k_ptr = nullptr;
     const float* scale_v_ptr = nullptr;
+    int min_blocks_for_split = 2;
+    // Optional softmax LSE output (natural-log log-sum-exp), row-major
+    // (num_heads_q, total_q). Written here only for single-split sequences;
+    // multi-split LSE is produced by ReduceSplitK. Null => don't write.
+    float* softmax_lse = nullptr;
+    int64_t lse_head_stride = 0;  // = total_q
   };
   using KernelParams = KernelArguments;
 
@@ -1106,7 +1283,10 @@ class XeFMHAFwdSplitKVKernel {
       // Mix-batch dispatch: skip batches not owned by this kernel launch.
       if (p.skip_batch_mask != nullptr && p.skip_batch_mask[idx_b]) continue;
       auto blk_qv = make_coord(blk_q, blk_v);
-      int head_q_start = head * head_group_q;
+      int head_q_start = 0;
+      if constexpr (LSE) {
+        head_q_start = head * head_group_q;
+      }
 
       auto sequence_length_shape = get_sequence_length_shape(s, idx_b);
       auto [seq_len_qo, seq_len_kv] = sequence_length_shape;
@@ -1131,6 +1311,12 @@ class XeFMHAFwdSplitKVKernel {
 
       int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
       int offset_exp_sums = 0, offset_max_logits = 0;
+      // Query-token index in the (num_heads_q, total_q) softmax_lse output. For
+      // decode seq_len_qo == 1, so each (batch) maps to a single token.
+      int lse_q_base = 0;
+      if constexpr (LSE) {
+        lse_q_base = idx_b;
+      }
       if constexpr (is_var_len) {
         auto qo_cumulative = s.seq_len_qo.cumulative_length;
 
@@ -1138,6 +1324,9 @@ class XeFMHAFwdSplitKVKernel {
         offset_o = s.num_heads_q * s.head_size_vo * num_kv_splits * qo_cumulative[idx_b];
         offset_exp_sums = s.num_heads_q * num_kv_splits * qo_cumulative[idx_b];
         offset_max_logits = s.num_heads_q * num_kv_splits * qo_cumulative[idx_b];
+        if constexpr (LSE) {
+          lse_q_base = qo_cumulative[idx_b];
+        }
 
         // for gqa packing, seq_len_qo must be 1
         seq_len_qo = 1;
@@ -1161,8 +1350,7 @@ class XeFMHAFwdSplitKVKernel {
       // Per-sequence split decision: short sequences are treated as
       // single-split even when num_kv_splits > 1, avoiding precision
       // loss from the split-reduce roundtrip.
-      constexpr int kMinBlocksForSplit = 128;
-      bool is_single_split = (num_kv_splits > 1) && (windowed_k_blocks < kMinBlocksForSplit);
+      bool is_single_split = (num_kv_splits > 1) && (windowed_k_blocks < p.min_blocks_for_split);
 
       int kv_split_offset;
       int num_effective_kv_blocks;
@@ -1275,7 +1463,11 @@ class XeFMHAFwdSplitKVKernel {
             head_group_q,
             sinks_per_kv,
             num_kv_splits,
-            is_single_split);
+            is_single_split,
+            p.softmax_lse,
+            p.lse_head_stride,
+            lse_q_base,
+            head_q_start);
       } else {
         epilogue(
             O(_, _, head, idx_kv_split, l_coord),
@@ -1291,7 +1483,11 @@ class XeFMHAFwdSplitKVKernel {
             head_group_q,
             sinks,
             num_kv_splits,
-            is_single_split);
+            is_single_split,
+            p.softmax_lse,
+            p.lse_head_stride,
+            lse_q_base,
+            head_q_start);
       }
     }
   }

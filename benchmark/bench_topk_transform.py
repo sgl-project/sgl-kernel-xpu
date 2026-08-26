@@ -7,6 +7,8 @@ from sgl_kernel import (
     fast_topk_transform_fused,
     fast_topk_transform_ragged_fused,
     fast_topk_v2,
+    topk_transform_512,
+    topk_transform_512_v2,
 )
 
 # Sweep configuration (skip bs=1 per request).
@@ -246,10 +248,148 @@ def benchmark_fast_topk_transform_ragged_fused(
     return ms
 
 
+topk_transform_configs = [
+    (bs, topk, seq_len, page_size)
+    for bs, topk, seq_len, page_size in product(
+        batch_size_range,
+        [512, 1024],
+        [4096, 16384, 65536],
+        [64, 256],
+    )
+]
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["bs", "topk", "seq_len", "page_size"],
+        x_vals=topk_transform_configs,
+        line_arg="provider",
+        line_vals=["sgl_kernel"],
+        line_names=["SGL Kernel"],
+        styles=[("blue", "-")],
+        ylabel="Time (ms)",
+        plot_name="topk-transform-512-performance",
+        args={},
+    )
+)
+def benchmark_topk_transform_512(bs, topk, seq_len, page_size, provider):
+    print(
+        f"benchmark topk_transform_512 {provider} bs={bs} topk={topk} "
+        f"seq_len={seq_len} page_size={page_size}"
+    )
+    torch.xpu.manual_seed_all(42)
+
+    score = torch.randn(bs, seq_len, dtype=torch.float32, device="xpu")
+    lengths = torch.full((bs,), seq_len, dtype=torch.int32, device="xpu")
+    num_pages = (seq_len + page_size - 1) // page_size
+    page_table = (
+        torch.arange(0, num_pages, dtype=torch.int32, device="xpu")
+        .unsqueeze(0)
+        .expand(bs, -1)
+        .contiguous()
+    )
+    out_page = torch.full((bs, topk), -1, dtype=torch.int32, device="xpu")
+
+    fn = lambda: topk_transform_512(
+        score, lengths, page_table, out_page, page_size, None
+    )
+
+    for _ in range(5):
+        fn()
+    torch.xpu.synchronize()
+
+    quantiles = [0.5, 0.25, 0.75]
+    ms, _, _ = triton.testing.do_bench(fn, quantiles=quantiles, return_mode="median")
+
+    torch.xpu.empty_cache()
+
+    total_bytes = score.numel() * score.element_size()
+    bandwidth_gb_s = total_bytes / (ms / 1e3) / 1e9
+
+    all_results.append(
+        {
+            "op": "topk_transform_512",
+            "bs": bs,
+            "topk": topk,
+            "seq_len": seq_len,
+            "page_size": page_size,
+            "provider": provider,
+            "bandwidth_gb_s": bandwidth_gb_s,
+            "ms": ms,
+        }
+    )
+    return ms
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["bs", "topk", "seq_len", "page_size"],
+        x_vals=topk_transform_configs,
+        line_arg="provider",
+        line_vals=["sgl_kernel"],
+        line_names=["SGL Kernel"],
+        styles=[("blue", "-")],
+        ylabel="Time (ms)",
+        plot_name="topk-transform-512-v2-performance",
+        args={},
+    )
+)
+def benchmark_topk_transform_512_v2(bs, topk, seq_len, page_size, provider):
+    print(
+        f"benchmark topk_transform_512_v2 {provider} bs={bs} topk={topk} "
+        f"seq_len={seq_len} page_size={page_size}"
+    )
+    torch.xpu.manual_seed_all(42)
+
+    score = torch.randn(bs, seq_len, dtype=torch.float32, device="xpu")
+    lengths = torch.full((bs,), seq_len, dtype=torch.int32, device="xpu")
+    num_pages = (seq_len + page_size - 1) // page_size
+    page_table = (
+        torch.arange(0, num_pages, dtype=torch.int32, device="xpu")
+        .unsqueeze(0)
+        .expand(bs, -1)
+        .contiguous()
+    )
+    out_page = torch.full((bs, topk), -1, dtype=torch.int32, device="xpu")
+    metadata = torch.empty((bs + 1, 2), dtype=torch.int32, device="xpu")
+
+    fn = lambda: topk_transform_512_v2(
+        score, lengths, page_table, out_page, page_size, metadata, None
+    )
+
+    for _ in range(5):
+        fn()
+    torch.xpu.synchronize()
+
+    quantiles = [0.5, 0.25, 0.75]
+    ms, _, _ = triton.testing.do_bench(fn, quantiles=quantiles, return_mode="median")
+
+    torch.xpu.empty_cache()
+
+    total_bytes = score.numel() * score.element_size()
+    bandwidth_gb_s = total_bytes / (ms / 1e3) / 1e9
+
+    all_results.append(
+        {
+            "op": "topk_transform_512_v2",
+            "bs": bs,
+            "topk": topk,
+            "seq_len": seq_len,
+            "page_size": page_size,
+            "provider": provider,
+            "bandwidth_gb_s": bandwidth_gb_s,
+            "ms": ms,
+        }
+    )
+    return ms
+
+
 if __name__ == "__main__":
     benchmark_fast_topk_v2.run(print_data=False)
     benchmark_fast_topk_transform_fused.run(print_data=False)
     benchmark_fast_topk_transform_ragged_fused.run(print_data=False)
+    benchmark_topk_transform_512.run(print_data=False)
+    benchmark_topk_transform_512_v2.run(print_data=False)
     print("Benchmark finished!")
 
     df = pd.DataFrame(all_results)

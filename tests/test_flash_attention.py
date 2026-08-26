@@ -66,6 +66,158 @@ DISABLE_PACKGQA = True
 DISABLE_FP16 = True
 DISABLE_FP8 = True
 
+EXTENDED_KVCACHE_TESTS = os.getenv("FLASH_ATTENTION_KVCACHE_EXTENDED_TESTS") == "1"
+KVCACHE_BATCH_SIZES = [5]
+KVCACHE_HEAD_CONFIGS = [(16, 16), (16, 4), (8, 1)]
+KVCACHE_SEQLEN_CONFIGS = [
+    (3, 1024),
+    (64, 800),
+    (64, 256),
+    (3, 799),
+    (64, 2048),
+    (128, 128),
+    (256, 512),  # To test appending KV with more than 1 block
+    (512, 512),  # HD512 paged GQA resource regression
+    (2048, 3577),  # Enough tile to test persistent scheduler
+]
+
+KVCACHE_CROSS_MATRIX_CASES = []
+VARLEN_CROSS_MATRIX_CASES = []
+FP8_KVCACHE_CROSS_MATRIX_CASES = []
+if EXTENDED_KVCACHE_TESTS:
+    cross_matrix_seqlens = [
+        # (query length, cache capacity, actual cache length)
+        (33, 128, 33),
+        (63, 128, 63),
+        (65, 128, 65),
+        (97, 128, 97),
+        (65, 256, 65),
+        (127, 256, 127),
+        (129, 256, 129),
+        (193, 256, 193),
+        (255, 512, 255),
+        (257, 512, 257),
+        (385, 512, 385),
+        (257, 1024, 257),
+        (511, 1024, 511),
+        (513, 1024, 513),
+        (769, 1024, 769),
+    ]
+    cross_matrix_heads = [(16, 16)] + [(ratio, 1) for ratio in range(2, 17)]
+    cross_matrix_common = itertools.product(
+        [1, 5],
+        cross_matrix_heads,
+        cross_matrix_seqlens,
+        [64, 96, 128, 192, 256, 512],
+        [(False, False), (True, False)],
+    )
+    for batch_size, heads, seqlens, d, mask in cross_matrix_common:
+        for page_size in (64, 128):
+            for dtype_name in ("bf16", "fp16"):
+                KVCACHE_CROSS_MATRIX_CASES.append(
+                    (batch_size, *heads, *seqlens, d, page_size, *mask, dtype_name)
+                )
+    for cache_seqlen in (639, 640, 641, 767, 768):
+        KVCACHE_CROSS_MATRIX_CASES.append(
+            (5, 8, 1, 513, 1024, cache_seqlen, 512, 128, True, False, "bf16")
+        )
+    varlen_cross_matrix_seqlens = [
+        (seqlen_q, seqlen_k) for seqlen_q, seqlen_k, _ in cross_matrix_seqlens[::2]
+    ] + [
+        # Varlen has no page-size requirement. Exercise K tails explicitly.
+        (33, 127),
+        (65, 129),
+        (129, 255),
+        (257, 511),
+        (513, 1023),
+        (769, 1001),
+    ]
+    for heads, seqlens, d, mask, dtype_name in itertools.product(
+        [(16, 16), (2, 1), (8, 1), (16, 1)],
+        varlen_cross_matrix_seqlens,
+        [64, 128, 256, 512],
+        [(False, False), (True, False)],
+        ["bf16", "fp16"],
+    ):
+        VARLEN_CROSS_MATRIX_CASES.append((*heads, *seqlens, d, *mask, dtype_name))
+    fp8_seqlens = [
+        (1, 128, 1),
+        (33, 128, 33),
+        (63, 128, 63),
+        (65, 128, 65),
+        (97, 128, 97),
+        (127, 256, 127),
+        (129, 256, 129),
+        (193, 256, 193),
+        (255, 512, 255),
+        (257, 512, 257),
+        (385, 512, 385),
+        (511, 1024, 511),
+        (513, 1024, 513),
+        (769, 1024, 769),
+    ]
+    fp8_common = itertools.product(
+        [1, 5],
+        [(16, 16), (2, 1), (4, 1), (8, 1), (16, 1)],
+        fp8_seqlens,
+        [64, 128, 256, 512],
+        [64, 128],
+        [False],
+        ["e4m3", "e5m2"],
+        ["scalar", "expanded"],
+    )
+    for (
+        batch_size,
+        heads,
+        seqlens,
+        d,
+        page_size,
+        causal,
+        dtype_name,
+        layout,
+    ) in fp8_common:
+        FP8_KVCACHE_CROSS_MATRIX_CASES.append(
+            (
+                batch_size,
+                *heads,
+                *seqlens,
+                d,
+                page_size,
+                causal,
+                dtype_name,
+                layout,
+            )
+        )
+    fp8_causal_smoke = itertools.product(
+        # Cover the separate causal decode and prefill kernel paths without
+        # duplicating the full FP8 quantization/descale matrix.
+        [(1, 128, 1), (129, 256, 129)],
+        [256, 512],
+        [64, 128],
+        ["e4m3", "e5m2"],
+        ["scalar", "expanded"],
+    )
+    for seqlens, d, page_size, dtype_name, layout in fp8_causal_smoke:
+        FP8_KVCACHE_CROSS_MATRIX_CASES.append(
+            (1, 8, 1, *seqlens, d, page_size, True, dtype_name, layout)
+        )
+    for cache_seqlen in (639, 640, 641, 767, 768):
+        FP8_KVCACHE_CROSS_MATRIX_CASES.append(
+            (
+                5,
+                8,
+                1,
+                513,
+                1024,
+                cache_seqlen,
+                512,
+                128,
+                True,
+                "e4m3",
+                "expanded",
+            )
+        )
+
 
 # Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/hopper/padding.py
 def unpad_input(hidden_states, attention_mask, unused_mask=None):
@@ -217,6 +369,7 @@ def attention_ref(
     upcast=True,
     reorder_ops=False,
     intermediate_dtype=None,
+    return_lse=False,
 ):
     """
     Arguments:
@@ -290,6 +443,9 @@ def attention_ref(
             scores.size()[0], scores.size()[1], scores.size()[2], 1
         )
         scores = torch.cat([scores, sink_expanded], dim=-1)
+    # Log-sum-exp over the key dimension (includes the sink column when present
+    # and excludes -inf masked entries): matches the kernel's softmax_lse.
+    softmax_lse_ref = torch.logsumexp(scores.float(), dim=-1)
     attention = torch.softmax(scores, dim=-1).to(v.dtype)
     if sink is not None:
         attention = attention[..., :-1]
@@ -321,7 +477,48 @@ def attention_ref(
     output = torch.einsum("bhts,bshd->bthd", attention_drop, v * dropout_scaling)
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
+    if return_lse:
+        return (
+            output.to(dtype=dtype_og),
+            attention.to(dtype=dtype_og),
+            softmax_lse_ref,
+        )
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
+
+
+def _check_softmax_lse(lse, nheads_q, total_q, ref_lse_hq=None, atol=1e-1, rtol=1e-1):
+    """Validate a returned softmax_lse tensor.
+
+    Guards against the regression where the XPU chunkprefill path returned an
+    empty / mis-shaped placeholder instead of a real (nheads, total_q) LSE.
+    When ``ref_lse_hq`` (shape (nheads_q, total_q)) is given, the values on the
+    finite rows are also compared (fully-masked rows are -inf and skipped).
+    """
+    assert lse is not None, "softmax_lse must not be None when return_softmax_lse=True"
+    assert isinstance(
+        lse, torch.Tensor
+    ), f"softmax_lse must be a tensor, got {type(lse)}"
+    assert (
+        lse.dim() == 2
+    ), f"softmax_lse must be 2D (nheads, total_q), got shape {tuple(lse.shape)}"
+    assert tuple(lse.shape) == (
+        nheads_q,
+        total_q,
+    ), f"softmax_lse shape {tuple(lse.shape)} != expected {(nheads_q, total_q)}"
+    assert lse.dtype == torch.float32, f"softmax_lse dtype {lse.dtype} != float32"
+    lse_f = lse.float()
+    assert not torch.isnan(lse_f).any(), "softmax_lse contains NaN"
+    assert not torch.isposinf(lse_f).any(), "softmax_lse contains +inf"
+    if ref_lse_hq is not None:
+        finite = torch.isfinite(ref_lse_hq)
+        if finite.any():
+            diff = (lse_f[finite] - ref_lse_hq[finite].to(lse_f.dtype)).abs()
+            tol = atol + rtol * ref_lse_hq[finite].abs()
+            max_diff = diff.max().item()
+            assert (diff <= tol).all(), (
+                f"softmax_lse numeric mismatch: max diff {max_diff} exceeds "
+                f"tolerance (atol={atol}, rtol={rtol})"
+            )
 
 
 def generate_qkv(
@@ -476,9 +673,12 @@ def generate_qkv(
     reason="flash_attn at sgl-kernel is only supported on sm90 and above",
 )
 @pytest.mark.parametrize(
-    "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
+    "dtype",
+    [torch.bfloat16, torch.float16]
+    + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []),
 )
-@pytest.mark.parametrize("nheads_q,nheads_kv", [(16, 16), (16, 4)])
+@pytest.mark.parametrize("batch_size", KVCACHE_BATCH_SIZES)
+@pytest.mark.parametrize("nheads_q,nheads_kv", KVCACHE_HEAD_CONFIGS)
 @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("causal,local", [(False, True), (False, False), (True, False)])
 @pytest.mark.parametrize("use_sinks", [True, False])
@@ -500,19 +700,7 @@ def generate_qkv(
 @pytest.mark.parametrize("has_batch_idx", [False])
 @pytest.mark.parametrize("varlen_q", [True])
 @pytest.mark.parametrize("d", [64, 128, 256, 512])
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_k",
-    [
-        (3, 1024),
-        (64, 800),
-        (64, 256),
-        (3, 799),
-        (64, 2048),
-        (128, 128),
-        (256, 512),  # To test appending KV with more than 1 block
-        (2048, 3577),  # Enough tile to test persistent scheduler
-    ],
-)
+@pytest.mark.parametrize("seqlen_q,seqlen_k", KVCACHE_SEQLEN_CONFIGS)
 def test_flash_attn_kvcache(
     seqlen_q,
     seqlen_k,
@@ -529,9 +717,11 @@ def test_flash_attn_kvcache(
     local,
     use_sinks,
     new_kv,
+    batch_size,
     nheads_q,
     nheads_kv,
     dtype,
+    cache_seqlen=None,
 ):
     from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
@@ -550,7 +740,6 @@ def test_flash_attn_kvcache(
         pytest.skip("use_sinks is only supported when d == 64")
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 5
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
     assert nheads_q % nheads_kv == 0
 
@@ -691,14 +880,23 @@ def test_flash_attn_kvcache(
                 dtype,
                 dtype_ref,
             )
-        cache_seqlens = torch.randint(
-            seqlen_q,
-            # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
-            seqlen_k,
-            (batch_size,),
-            dtype=torch.int32,
-            device=device,
-        )
+        if cache_seqlen is not None:
+            assert seqlen_q <= cache_seqlen < seqlen_k
+            cache_seqlens = torch.full(
+                (batch_size,),
+                cache_seqlen,
+                dtype=torch.int32,
+                device=device,
+            )
+        else:
+            cache_seqlens = torch.randint(
+                seqlen_q,
+                # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
+                seqlen_k,
+                (batch_size,),
+                dtype=torch.int32,
+                device=device,
+            )
         if has_leftpad:
             cache_leftpad = torch.cat(
                 [
@@ -805,7 +1003,7 @@ def test_flash_attn_kvcache(
         v_cache_rep = repeat(
             v_cache_ref, "b s h d -> b s (h g) d", g=nheads_q // nheads_kv
         )
-        out_ref, _ = attention_ref(
+        out_ref, _, lse_ref = attention_ref(
             q_ro,
             k_cache_rep,
             v_cache_rep,
@@ -817,6 +1015,7 @@ def test_flash_attn_kvcache(
             qv=qv,
             window_size=window_size,
             key_leftpad=cache_leftpad,
+            return_lse=True,
         )
         out_pt, _ = attention_ref(
             q_ro,
@@ -864,7 +1063,10 @@ def test_flash_attn_kvcache(
                 else:
                     k_cache_paged.copy_(k_cache_saved)
                     v_cache_paged.copy_(v_cache_saved)
-                out, lse, *rest = flash_attn_with_kvcache(
+                # The kernel only supports returning softmax_lse without
+                # causal/local/sink masking; request it only in that case.
+                return_lse = not causal and not local and not use_sinks
+                result = flash_attn_with_kvcache(
                     q if not varlen_q else q_unpad,
                     k_cache if page_size is None else k_cache_paged,
                     v_cache if page_size is None else v_cache_paged,
@@ -888,8 +1090,24 @@ def test_flash_attn_kvcache(
                     rotary_interleaved=rotary_interleaved,
                     scheduler_metadata=scheduler_metadata,
                     num_splits=num_splits,
-                    return_softmax_lse=True,
+                    return_softmax_lse=return_lse,
                 )
+                if return_lse:
+                    out, lse, *rest = result
+                else:
+                    out = result
+                # --- softmax_lse validation (regression guard for the empty /
+                # mis-shaped LSE that the old chunkprefill path returned). The
+                # kernel's LSE for sink cases is sink-exclusive while the
+                # reference is sink-inclusive, so numeric LSE is only validated
+                # for non-sink cases. lse_ref is reused from the out_ref call. ---
+                if return_lse:
+                    ref_lse_hq = (
+                        rearrange(lse_ref, "b h s -> (b s) h")[indices_q]
+                        .transpose(0, 1)
+                        .contiguous()
+                    )
+                    _check_softmax_lse(lse, nheads_q, q_unpad.shape[0], ref_lse_hq)
                 if varlen_q:
                     out = output_pad_fn(out)
                 torch.xpu.synchronize()
@@ -967,14 +1185,66 @@ def test_flash_attn_kvcache(
                 ).abs().mean().item()
 
 
+if EXTENDED_KVCACHE_TESTS:
+
+    @pytest.mark.parametrize(
+        (
+            "batch_size,nheads_q,nheads_kv,seqlen_q,seqlen_k,cache_seqlen,d,"
+            "page_size,causal,local,dtype_name"
+        ),
+        KVCACHE_CROSS_MATRIX_CASES,
+    )
+    def test_flash_attn_kvcache_cross_matrix(
+        batch_size,
+        nheads_q,
+        nheads_kv,
+        seqlen_q,
+        seqlen_k,
+        cache_seqlen,
+        d,
+        page_size,
+        causal,
+        local,
+        dtype_name,
+    ):
+        dtype = {
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+        }[dtype_name]
+        test_flash_attn_kvcache(
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            d=d,
+            varlen_q=page_size is not None,
+            has_batch_idx=False,
+            has_leftpad=False,
+            page_size=page_size,
+            rotary_fraction=0.0,
+            rotary_interleaved=False,
+            has_rotary_seqlens=False,
+            seqlen_new_eq_seqlen_q=True,
+            causal=causal,
+            local=local,
+            use_sinks=False,
+            new_kv=False,
+            batch_size=batch_size,
+            nheads_q=nheads_q,
+            nheads_kv=nheads_kv,
+            dtype=dtype,
+            cache_seqlen=cache_seqlen,
+        )
+
+
 @pytest.mark.skipif(
     not is_fa3_supported(),
     reason="flash_attn at sgl-kernel is only supported on sm90 and above",
 )
 @pytest.mark.parametrize(
-    "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
+    "dtype",
+    [torch.bfloat16, torch.float16]
+    + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []),
 )
-@pytest.mark.parametrize("nheads_q,nheads_kv", [(16, 16), (16, 4)])
+@pytest.mark.parametrize("nheads_q,nheads_kv", [(16, 16), (16, 4), (16, 1), (8, 1)])
 @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("local", [True, False])
@@ -1002,9 +1272,18 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize(
     "seqlen_k",
     [
-        128,
+        1,
+        63,
+        64,
+        65,
+        129,
+        512,
         1024,
+        4033,
         4096,
+        4097,
+        4608,
+        5120,
         8192,
     ],
 )
@@ -1031,8 +1310,10 @@ def test_flash_attn_decode_kvcache(
 ):
     from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
-    if page_size is not None and seqlen_k % page_size != 0:
-        pytest.skip("page_size must divide seqlen_k")
+    if (nheads_q, nheads_kv) == (8, 1) and (
+        batch_size != 1 or d != 512 or page_size != 64
+    ):
+        pytest.skip("Gemma4 Split-K coverage only targets B=1, D=512, page_size=64")
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip("new_kv requires seqlen_q <= seqlen_k")
     if not new_kv and rotary_fraction > 0.0:
@@ -1300,7 +1581,7 @@ def test_flash_attn_decode_kvcache(
         v_cache_rep = repeat(
             v_cache_ref, "b s h d -> b s (h g) d", g=nheads_q // nheads_kv
         )
-        out_ref, _ = attention_ref(
+        out_ref, _, lse_ref = attention_ref(
             q_ro,
             k_cache_rep,
             v_cache_rep,
@@ -1312,6 +1593,7 @@ def test_flash_attn_decode_kvcache(
             qv=qv,
             window_size=window_size,
             key_leftpad=cache_leftpad,
+            return_lse=True,
         )
         out_pt, _ = attention_ref(
             q_ro,
@@ -1345,7 +1627,15 @@ def test_flash_attn_decode_kvcache(
         sin = sin.to(dtype) if sin is not None else None
         k_cache_saved = k_cache.clone() if page_size is None else k_cache_paged.clone()
         v_cache_saved = v_cache.clone() if page_size is None else v_cache_paged.clone()
-        num_splits_vals = [1, 0] if not DISABLE_SPLIT else [1]
+        num_splits_vals = (
+            [1, 0]
+            if batch_size == 1
+            and nheads_q == 8
+            and nheads_kv == 1
+            and d == 512
+            and page_size == 64
+            else [1]
+        )
         precompute_metadata_vals = [False]
         for num_splits, precompute_metadata in itertools.product(
             num_splits_vals, precompute_metadata_vals
@@ -1359,7 +1649,10 @@ def test_flash_attn_decode_kvcache(
                 else:
                     k_cache_paged.copy_(k_cache_saved)
                     v_cache_paged.copy_(v_cache_saved)
-                out, lse, *rest = flash_attn_with_kvcache(
+                # The kernel only supports returning softmax_lse without
+                # causal/local/sink masking; request it only in that case.
+                return_lse = not causal and not local and not use_sinks
+                result = flash_attn_with_kvcache(
                     q if not varlen_q else q_unpad,
                     k_cache if page_size is None else k_cache_paged,
                     v_cache if page_size is None else v_cache_paged,
@@ -1384,8 +1677,24 @@ def test_flash_attn_decode_kvcache(
                     rotary_interleaved=rotary_interleaved,
                     scheduler_metadata=scheduler_metadata,
                     num_splits=num_splits,
-                    return_softmax_lse=True,
+                    return_softmax_lse=return_lse,
                 )
+                if return_lse:
+                    out, lse, *rest = result
+                else:
+                    out = result
+                # --- softmax_lse validation (regression guard for the empty /
+                # mis-shaped LSE that the old chunkprefill path returned). The
+                # kernel's LSE for sink cases is sink-exclusive while the
+                # reference is sink-inclusive, so numeric LSE is only validated
+                # for non-sink cases. lse_ref is reused from the out_ref call. ---
+                if return_lse:
+                    ref_lse_hq = (
+                        rearrange(lse_ref, "b h s -> (b s) h")[indices_q]
+                        .transpose(0, 1)
+                        .contiguous()
+                    )
+                    _check_softmax_lse(lse, nheads_q, q_unpad.shape[0], ref_lse_hq)
                 if varlen_q:
                     out = output_pad_fn(out)
                 torch.xpu.synchronize()
@@ -1477,7 +1786,9 @@ def test_flash_attn_decode_kvcache(
 @pytest.mark.parametrize("seqlen_q", [1, 32, 64])
 @pytest.mark.parametrize("seqlen_k", [256, 512])
 @pytest.mark.parametrize("descale_layout", ["scalar", "expanded"])
+@pytest.mark.parametrize("batch_size", [3])
 def test_flash_attn_fp8_kvcache(
+    batch_size,
     seqlen_k,
     seqlen_q,
     page_size,
@@ -1488,6 +1799,7 @@ def test_flash_attn_fp8_kvcache(
     q_dtype,
     causal,
     descale_layout,
+    cache_seqlen=None,
 ):
     """Attention with an fp8 (e4m3 or e5m2) paged KV cache.
 
@@ -1504,7 +1816,6 @@ def test_flash_attn_fp8_kvcache(
     assert nheads_q % nheads_kv == 0
 
     torch.manual_seed(0)
-    batch_size = 3
     softmax_scale = d**-0.5
     # Largest finite magnitude representable by each fp8 format.
     fp8_max = 448.0 if fp8_dtype == torch.float8_e4m3fn else 57344.0
@@ -1545,13 +1856,16 @@ def test_flash_attn_fp8_kvcache(
         batch_size * num_blocks_per_seq, dtype=torch.int32, device=device
     ).reshape(batch_size, num_blocks_per_seq)
 
+    if cache_seqlen is None:
+        cache_seqlen = seqlen_k
+    assert seqlen_q <= cache_seqlen <= seqlen_k
     cache_seqlens = torch.full(
-        (batch_size,), seqlen_k, dtype=torch.int32, device=device
+        (batch_size,), cache_seqlen, dtype=torch.int32, device=device
     )
 
     q = torch.randn(batch_size, seqlen_q, nheads_q, d, device=device, dtype=q_dtype)
 
-    out = flash_attn_with_kvcache(
+    out, lse, *rest = flash_attn_with_kvcache(
         q,
         k_cache_paged,
         v_cache_paged,
@@ -1561,7 +1875,11 @@ def test_flash_attn_fp8_kvcache(
         v_descale=v_descale,
         softmax_scale=softmax_scale,
         causal=causal,
+        return_softmax_lse=True,
     )
+    # --- softmax_lse validation (structural: the fp8 lse numeric convention is
+    # kernel-specific, so only shape / finiteness are checked here) ---
+    _check_softmax_lse(lse, nheads_q, batch_size * seqlen_q)
     out = out.reshape(batch_size, seqlen_q, nheads_q, d)
     torch.xpu.synchronize()
 
@@ -1572,6 +1890,10 @@ def test_flash_attn_fp8_kvcache(
         k_cache,
         v_cache,
         softmax_scale,
+        key_padding_mask=(
+            rearrange(torch.arange(seqlen_k, device=device), "s -> 1 s")
+            < rearrange(cache_seqlens, "b -> b 1")
+        ),
         causal=causal,
         k_descale=k_descale_ref,
         v_descale=v_descale_ref,
@@ -1595,6 +1917,49 @@ def test_flash_attn_fp8_kvcache(
     else:
         assert max_diff <= 1e-1
         assert mean_diff <= 2e-2
+
+
+if EXTENDED_KVCACHE_TESTS:
+
+    @pytest.mark.parametrize(
+        (
+            "batch_size,nheads_q,nheads_kv,seqlen_q,seqlen_k,cache_seqlen,d,"
+            "page_size,causal,dtype_name,"
+            "descale_layout"
+        ),
+        FP8_KVCACHE_CROSS_MATRIX_CASES,
+    )
+    def test_flash_attn_fp8_kvcache_cross_matrix(
+        batch_size,
+        nheads_q,
+        nheads_kv,
+        seqlen_q,
+        seqlen_k,
+        cache_seqlen,
+        d,
+        page_size,
+        causal,
+        dtype_name,
+        descale_layout,
+    ):
+        fp8_dtype = {
+            "e4m3": torch.float8_e4m3fn,
+            "e5m2": torch.float8_e5m2,
+        }[dtype_name]
+        test_flash_attn_fp8_kvcache(
+            batch_size=batch_size,
+            seqlen_k=seqlen_k,
+            seqlen_q=seqlen_q,
+            page_size=page_size,
+            d=d,
+            nheads_q=nheads_q,
+            nheads_kv=nheads_kv,
+            fp8_dtype=fp8_dtype,
+            q_dtype=torch.bfloat16,
+            causal=causal,
+            descale_layout=descale_layout,
+            cache_seqlen=cache_seqlen,
+        )
 
 
 def _generate_block_kvcache(
@@ -1634,15 +1999,17 @@ def _generate_block_kvcache(
     reason="flash_attn at sgl-kernel is only supported on sm90 and above",
 )
 @pytest.mark.parametrize(
-    "dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else [])
+    "dtype",
+    [torch.bfloat16, torch.float16]
+    + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []),
 )
-@pytest.mark.parametrize("nheads_q,nheads_kv", [(16, 16), (16, 4)])
+@pytest.mark.parametrize("nheads_q,nheads_kv", [(16, 16), (16, 4), (16, 1)])
 @pytest.mark.parametrize("has_qv", [False])
 @pytest.mark.parametrize("deterministic", [False])
 @pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
 @pytest.mark.parametrize("causal,local", [(False, True), (False, False), (True, False)])
 @pytest.mark.parametrize("add_unused_qkv", [False])
-@pytest.mark.parametrize("d", [72, 80, 128, 192])
+@pytest.mark.parametrize("d", [72, 80, 128, 192, 256, 512])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -1847,7 +2214,7 @@ def test_flash_attn_varlen_output(
         pack_gqa_vals = [False, True] if not DISABLE_PACKGQA else [False]
         num_splits_vals = [1, 3] if not DISABLE_SPLIT else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
-            out_unpad, lse, *rest = flash_attn_varlen_func(
+            out_unpad = flash_attn_varlen_func(
                 q_unpad,
                 k_unpad,
                 v_unpad,
@@ -1866,7 +2233,7 @@ def test_flash_attn_varlen_output(
                 softmax_scale=softmax_scale,
                 sinks=sinks,
                 softcap=softcap,
-                return_softmax_lse=True,
+                return_softmax_lse=False,
             )
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:
@@ -1932,6 +2299,42 @@ def test_flash_attn_varlen_output(
         ).abs().max().item() + dv_atol
 
 
+if EXTENDED_KVCACHE_TESTS:
+
+    @pytest.mark.parametrize(
+        ("nheads_q,nheads_kv,seqlen_q,seqlen_k,d," "causal,local,dtype_name"),
+        VARLEN_CROSS_MATRIX_CASES,
+    )
+    def test_flash_attn_varlen_cross_matrix(
+        nheads_q,
+        nheads_kv,
+        seqlen_q,
+        seqlen_k,
+        d,
+        causal,
+        local,
+        dtype_name,
+    ):
+        dtype = {
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+        }[dtype_name]
+        test_flash_attn_varlen_output(
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            d=d,
+            add_unused_qkv=False,
+            causal=causal,
+            local=local,
+            softcap=0.0,
+            deterministic=False,
+            has_qv=False,
+            nheads_q=nheads_q,
+            nheads_kv=nheads_kv,
+            dtype=dtype,
+        )
+
+
 @pytest.mark.skipif(device.type != "xpu", reason="XPU not available")
 def test_flash_attn_with_kvcache_out_buffer():
     """Test that a preallocated out buffer is reused and the result is correct."""
@@ -1966,14 +2369,17 @@ def test_flash_attn_with_kvcache_out_buffer():
     # Preallocate out buffer: shape [total_q, nheads, d] = [batch*seqlen_q, nheads, d]
     total_q = batch_size * seqlen_q
     out_buf = torch.empty(total_q, nheads, d, device=device, dtype=dtype)
-    result = flash_attn_with_kvcache(
+    result, lse, *rest = flash_attn_with_kvcache(
         q,
         k_cache,
         v_cache,
         cache_seqlens=cache_seqlens,
         page_table=page_table,
         out=out_buf,
+        return_softmax_lse=True,
     )
+    # --- softmax_lse validation (structural) ---
+    _check_softmax_lse(lse, nheads, total_q)
 
     # The returned tensor must alias the provided buffer (same storage)
     assert (

@@ -2,12 +2,14 @@
 
 Exercises ``torch.ops.sgl_kernel.gdn_attention`` on synthetic Qwen3-Next/3.5
 shaped inputs for both the decode and prefill paths, asserting the in-place
-outputs have the expected shapes and are finite.
+outputs have the expected shapes, are finite, and match an independent
+pure-PyTorch reference implementation (see ``gdn_reference.py``).
 """
 
 import pytest
 import sgl_kernel  # noqa: F401  registers torch.ops.sgl_kernel.gdn_attention
 import torch
+from gdn_reference import reference_gdn_attention
 
 pytestmark = pytest.mark.skipif(
     not torch.xpu.is_available() or not hasattr(torch.ops.sgl_kernel, "gdn_attention"),
@@ -85,12 +87,24 @@ def _make_inputs(
 
 @pytest.mark.parametrize(
     "mode,batch_size,seqlen",
-    [("decode", 1, 1), ("decode", 4, 1), ("prefill", 1, 256), ("prefill", 2, 128)],
+    [
+        ("decode", 1, 1),
+        ("decode", 4, 1),
+        ("prefill", 1, 256),
+        ("prefill", 2, 128),
+        ("prefill", 2, 200),
+        ("prefill", 4, 179),
+    ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_gdn_attention_smoke(mode, batch_size, seqlen, dtype):
     device = torch.device("xpu")
     i = _make_inputs(mode, batch_size, seqlen, dtype, device)
+
+    # Snapshot the pre-call state so the reference implementation can use the
+    # exact same initial conv/ssm state as the op (which updates them in place).
+    conv_state_before = i["conv_state"].clone()
+    ssm_state_before = i["ssm_state"].clone()
 
     torch.ops.sgl_kernel.gdn_attention(
         i["core_attn_out"],
@@ -130,6 +144,39 @@ def test_gdn_attention_smoke(mode, batch_size, seqlen, dtype):
     assert torch.isfinite(i["core_attn_out"].float()).all()
     assert torch.isfinite(i["z"].float()).all()
     assert torch.isfinite(i["ssm_state"].float()).all()
+
+    ref_out, ref_z, ref_ssm_state = reference_gdn_attention(
+        i["qkvz"],
+        i["ba"],
+        conv_state_before,
+        ssm_state_before,
+        i["conv_w"],
+        i["conv_b"],
+        i["A_log"],
+        i["dt_bias"],
+        i["qsl"],
+        i["has_init"],
+        i["state_idx"],
+        NUM_K_HEADS,
+        NUM_V_HEADS,
+        HEAD_K_DIM,
+        HEAD_V_DIM,
+    )
+
+    # bf16/fp16 have limited mantissa precision, and the kernel's chunked
+    # prefill path additionally round-trips intermediate W/U buffers through
+    # the compute dtype (rather than accumulating entirely in float32 like
+    # this reference), so a small but non-zero tolerance is required.
+    # Empirically, observed max abs diffs are ~3e-3 (bf16) / ~4e-4 (fp16) for
+    # core_attn_out/z, and ~2e-2 (bf16) / ~3e-3 (fp16) for ssm_state.
+    rtol, atol = (3e-2, 5e-2) if dtype == torch.bfloat16 else (1e-2, 1e-2)
+    torch.testing.assert_close(
+        i["core_attn_out"].float(), ref_out, rtol=rtol, atol=atol
+    )
+    torch.testing.assert_close(i["z"].float(), ref_z, rtol=rtol, atol=atol)
+    torch.testing.assert_close(
+        i["ssm_state"].float(), ref_ssm_state, rtol=rtol, atol=atol
+    )
 
 
 def _run_op(

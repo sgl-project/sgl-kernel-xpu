@@ -16,9 +16,11 @@
 
 #include "MemoryAccess.h"
 #include "Norm.h"
+#include "QuantUtils.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "cutlass/float8.h"
+#include "sgl_kernel_export.h"
 
 // TODO: Remove this when sycl float8 is supported
 using cutlass::float_e4m3_t;
@@ -502,7 +504,7 @@ void launchFusedQKNormRopeImpl(
   });
 }
 
-void fused_qk_norm_rope(
+SGL_KERNEL_EXPORT void fused_qk_norm_rope(
     torch::Tensor& qkv,
     int64_t num_heads_q,
     int64_t num_heads_k,
@@ -1231,7 +1233,7 @@ void launchFusedQNormRopeCTA(
   });
 }
 
-void fused_q_norm_rope(
+SGL_KERNEL_EXPORT void fused_q_norm_rope(
     torch::Tensor& q_input, torch::Tensor& q_output, torch::Tensor& freqs_cis, torch::Tensor& positions, double eps) {
   TORCH_CHECK(q_input.dim() == 3, "q_input must be 3D: [num_tokens, num_heads, head_dim]");
   TORCH_CHECK(q_output.dim() == 3, "q_output must be 3D: [num_tokens, num_heads, head_dim]");
@@ -1339,20 +1341,6 @@ void fused_q_norm_rope(
 constexpr float FP8_E4M3_MAX = 448.0f;
 // Each FP8 quantization scale chunk / warp covers 64 elements
 constexpr int64_t kElementsPerScaleChunk = 64;
-
-inline uint8_t castToUE8M0(float x) {
-  uint32_t bits = sycl::bit_cast<uint32_t>(x);
-  uint32_t exp = (bits >> 23) & 0xFF;
-  uint32_t round_up = (bits & 0x7FFFFF) != 0 ? 1 : 0;
-  return static_cast<uint8_t>(exp + round_up);
-}
-
-inline float invScaleUE8M0(uint8_t ue8m0) {
-  if (ue8m0 >= 254) return 0.0f;
-  uint32_t inv_exp = 254 - ue8m0;
-  uint32_t inv_bits = inv_exp << 23;
-  return sycl::bit_cast<float>(inv_bits);
-}
 
 template <typename scalar_t, typename IdType, int64_t kVecSize>
 struct FusedKNormRopeFlashMLAKernel {
@@ -1630,7 +1618,7 @@ void launchFusedKNormRopeFlashMLA(
   });
 }
 
-void fused_k_norm_rope_flashmla(
+SGL_KERNEL_EXPORT void fused_k_norm_rope_flashmla(
     torch::Tensor& kv,
     torch::Tensor& kv_weight,
     torch::Tensor& freqs_cis,
@@ -1732,7 +1720,7 @@ void fused_k_norm_rope_flashmla(
   });
 }
 
-void fused_inplace_qknorm_rope(
+SGL_KERNEL_EXPORT void fused_inplace_qknorm_rope(
     torch::Tensor& q,
     torch::Tensor& k,
     torch::Tensor& q_weight,

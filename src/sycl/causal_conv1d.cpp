@@ -25,6 +25,7 @@ limitations under the License.
 #include <sycl/sycl.hpp>
 
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 struct ConvParamsBase {
   using index_t = uint32_t;
@@ -395,7 +396,7 @@ static void launch_causal_conv1d_update(const ConvParamsBase& params) {
   TORCH_CHECK(false, "causal_conv1d only supports width between 2 and 4");
 }
 
-void causal_conv1d_fwd(
+SGL_KERNEL_EXPORT void causal_conv1d_fwd(
     at::Tensor& x,
     const at::Tensor& weight,
     const std::optional<at::Tensor>& bias_,
@@ -503,7 +504,7 @@ void causal_conv1d_fwd(
   });
 }
 
-void causal_conv1d_update(
+SGL_KERNEL_EXPORT void causal_conv1d_update(
     at::Tensor& x,
     at::Tensor& conv_state,
     const at::Tensor& weight,

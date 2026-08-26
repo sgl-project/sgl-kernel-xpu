@@ -20,6 +20,7 @@
 #include <tuple>
 
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 namespace {
 
@@ -1642,7 +1643,7 @@ WeightLayout resolve_weight_layout(const at::Tensor& weight, int64_t D, int64_t 
 
 }  // namespace
 
-at::Tensor inkling_sconv_forward(
+SGL_KERNEL_EXPORT at::Tensor inkling_sconv_forward(
     const at::Tensor& x,
     const at::Tensor& weight,
     const at::Tensor& sconv_cache,
@@ -1715,7 +1716,7 @@ at::Tensor inkling_sconv_forward(
   return y;
 }
 
-void inkling_update_sconv_cache(
+SGL_KERNEL_EXPORT void inkling_update_sconv_cache(
     const at::Tensor& x,
     at::Tensor& sconv_cache,
     const at::Tensor& cache_indices,
@@ -1760,7 +1761,7 @@ void inkling_update_sconv_cache(
       });
 }
 
-at::Tensor inkling_fused_decode_update_sconv(
+SGL_KERNEL_EXPORT at::Tensor inkling_fused_decode_update_sconv(
     const at::Tensor& x,
     const at::Tensor& weight,
     at::Tensor& sconv_cache,
@@ -1842,7 +1843,7 @@ at::Tensor inkling_fused_decode_update_sconv(
   return y;
 }
 
-void inkling_gather_scatter_sconv_cache(
+SGL_KERNEL_EXPORT void inkling_gather_scatter_sconv_cache(
     const at::Tensor& hidden_states,
     at::Tensor& sconv_cache,
     const at::Tensor& track_conv_indices,
@@ -1892,7 +1893,7 @@ void inkling_gather_scatter_sconv_cache(
       });
 }
 
-void inkling_draft_extend_sconv_cache(
+SGL_KERNEL_EXPORT void inkling_draft_extend_sconv_cache(
     const at::Tensor& hidden_states,
     at::Tensor& sconv_cache,
     const at::Tensor& cache_indices,
@@ -1972,7 +1973,8 @@ void inkling_draft_extend_sconv_cache(
       });
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> inkling_fused_decode_sconv_metadata(
+SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+inkling_fused_decode_sconv_metadata(
     int64_t B,
     const at::Tensor& cache_indices,
     const std::optional<at::Tensor>& query_start_loc_out,
@@ -2008,7 +2010,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
   return {query_start_loc, has_initial_state, cache_mask, safe_idx, cu, si};
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> inkling_fused_extend_sconv_metadata(
+SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+inkling_fused_extend_sconv_metadata(
     int64_t B,
     int64_t T,
     const at::Tensor& cache_indices,
@@ -2073,7 +2076,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
   return {query_start_loc, has_initial_state, cache_mask, safe_idx, cu, si};
 }
 
-at::Tensor inkling_track_conv_indices(
+SGL_KERNEL_EXPORT at::Tensor inkling_track_conv_indices(
     const at::Tensor& query_start_loc,
     const at::Tensor& mamba_track_seqlens,
     const at::Tensor& extend_prefix_lens,
@@ -2106,7 +2109,7 @@ at::Tensor inkling_track_conv_indices(
   return out;
 }
 
-void inkling_save_intermediate_conv_windows(
+SGL_KERNEL_EXPORT void inkling_save_intermediate_conv_windows(
     const at::Tensor& sconv_cache,
     const at::Tensor& hidden_states,
     const at::Tensor& cache_indices,

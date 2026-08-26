@@ -6,6 +6,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 template <typename scalar_t, int TOPK>
 struct MoeSumKernel {
@@ -30,7 +31,7 @@ struct MoeSumKernel {
   int hidden_size;
 };
 
-void moe_sum(
+SGL_KERNEL_EXPORT void moe_sum(
     torch::Tensor& input,   // [num_tokens, topk, hidden_size]
     torch::Tensor& output)  // [num_tokens, hidden_size]
 {

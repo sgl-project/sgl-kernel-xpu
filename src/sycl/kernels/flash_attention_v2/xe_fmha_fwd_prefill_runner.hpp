@@ -35,6 +35,8 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <cute/tensor.hpp>
 #include <random>
 
@@ -169,11 +171,15 @@ struct Arguments {
   uint64_t* rng_state;
 
   bool is_bf16;
+  bool is_fp16 = false;
   bool is_fp32;
   bool is_e4m3 = false;
   bool is_e5m2 = false;
   bool is_causal;
   bool is_local;
+  // When false, the epilogue skips writing softmax_lse. Threaded as a template
+  // constexpr via FMHAConfig.
+  bool return_softmax_lse = false;
 
   bool is_rotary_interleaved;
 
@@ -194,6 +200,8 @@ using LayoutO = cutlass::layout::RowMajor;
 
 template <class FMHAPrefillKernel, bool isVarLen = false>
 struct PrefillRunner {
+  static constexpr int DefaultScoreWorkspaceCapMiB = 1024;
+
   using StrideQ = typename FMHAPrefillKernel::StrideQ;
   using StrideK = typename FMHAPrefillKernel::StrideK;
   using StrideV = typename FMHAPrefillKernel::StrideV;
@@ -290,6 +298,32 @@ struct PrefillRunner {
     return shape;
   }
 
+  // Rebase one kernel launch onto [batch_lo, batch_lo + batch_len). Paged
+  // prefill uses absolute offsets in its cumulative-length arrays, so the data
+  // pointers stay unchanged while the per-batch metadata advances.
+  template <class Kernel>
+  typename Kernel::Arguments slice_arguments(typename Kernel::Arguments args, int batch_lo, int batch_len) const {
+    args.kernel.shape.batch = batch_len;
+    if constexpr (isVarLen) {
+      if (args.kernel.shape.seq_len_qo.cumulative_length != nullptr) {
+        args.kernel.shape.seq_len_qo.cumulative_length += batch_lo;
+      }
+      if (args.kernel.shape.seq_len_kv.cumulative_length != nullptr) {
+        args.kernel.shape.seq_len_kv.cumulative_length += batch_lo;
+      }
+      if (args.kernel.shape.seq_len_kv_cache.cumulative_length != nullptr) {
+        args.kernel.shape.seq_len_kv_cache.cumulative_length += batch_lo;
+      }
+    }
+    if (args.mainloop.ptr_page_table != nullptr) {
+      args.mainloop.ptr_page_table += size_t(batch_lo) * size_t(args.mainloop.max_num_pages_per_seq);
+    }
+    if (args.kernel.skip_batch_mask != nullptr) {
+      args.kernel.skip_batch_mask += batch_lo;
+    }
+    return args;
+  }
+
   cutlass::Status run(const Arguments& params, const cutlass::KernelHardwareInfo& hw_info) {
     ProblemShapeType shape = initialize(params);
 
@@ -312,6 +346,8 @@ struct PrefillRunner {
             static_cast<const bool*>(params.skip_batch_mask_ptr),
             params.k_scale_ptr,
             params.v_scale_ptr,
+            static_cast<float*>(params.softmax_lse_ptr),
+            static_cast<int64_t>(params.total_q),
         },
         {
             params.softmax_scale,
@@ -324,22 +360,65 @@ struct PrefillRunner {
         {},
         hw_info};
 
-    // Define device-global scratch memory
-    size_t workspace_size = FMHAPrefillKernel::get_workspace_size(arguments);
+    const int batch_total = params.b;
+    int batch_slice = batch_total;
+    if constexpr (CollectiveMainloop::ScoreBlock2D) {
+      static const int cap_mb = [] {
+        if (const char* env = std::getenv("FMHA_SCORE_WS_CAP_MB")) {
+          return std::atoi(env);
+        }
+        return DefaultScoreWorkspaceCapMiB;
+      }();
+      if (cap_mb > 0 && batch_total > 1) {
+        const size_t cap_bytes = size_t(cap_mb) << 20;
+        auto one_batch = slice_arguments<FMHAPrefillKernel>(arguments, 0, 1);
+        const size_t per_batch = FMHAPrefillKernel::get_workspace_size(one_batch);
+        if (per_batch > 0 && per_batch * size_t(batch_total) > cap_bytes) {
+          batch_slice = int(cute::max(size_t(1), cap_bytes / per_batch));
+        }
+      }
+    }
+    const int num_slices = cute::ceil_div(batch_total, batch_slice);
+
+    // Every slice reuses the same device-global score buffer.
+    auto workspace_shape = num_slices > 1 ? slice_arguments<FMHAPrefillKernel>(arguments, 0, batch_slice) : arguments;
+    size_t workspace_size = FMHAPrefillKernel::get_workspace_size(workspace_shape);
+    if constexpr (CollectiveMainloop::ScoreBlock2D) {
+      if (std::getenv("FMHA_SCORE_WS_VERBOSE") != nullptr) {
+        std::fprintf(
+            stderr,
+            "[fmha] score workspace: batch=%d slice=%d slices=%d bytes=%zu (%.1f MiB)\n",
+            batch_total,
+            batch_slice,
+            num_slices,
+            workspace_size,
+            double(workspace_size) / (1024.0 * 1024.0));
+      }
+    }
     auto workspace = torch::empty(workspace_size, params.tensor_opts);
+    void* workspace_ptr = workspace.data_ptr();
 
     if (!FMHAPrefillKernel::can_implement(arguments)) {
       return cutlass::Status::kErrorInvalidProblem;
     }
 
     // Initialize the workspace
-    FMHAPrefillKernel::initialize_workspace(arguments, workspace.data_ptr());
-
-    // Convert host-side arguments to device-side arguments to be passed to the kernel
-    auto kernel_params = FMHAPrefillKernel::to_underlying_arguments(arguments, workspace.data_ptr());
+    FMHAPrefillKernel::initialize_workspace(arguments, workspace_ptr);
 
     // Run
-    launch<FMHAPrefillKernel>(kernel_params);
+    if constexpr (CollectiveMainloop::ScoreBlock2D) {
+      using ScoreStoreKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<0>;
+      using ScoreLoadKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<1>;
+
+      for (int batch_lo = 0; batch_lo < batch_total; batch_lo += batch_slice) {
+        const int batch_len = cute::min(batch_slice, batch_total - batch_lo);
+        auto slice = slice_arguments<FMHAPrefillKernel>(arguments, batch_lo, batch_len);
+        launch<ScoreStoreKernel>(ScoreStoreKernel::to_underlying_arguments(slice, workspace_ptr));
+        launch<ScoreLoadKernel>(ScoreLoadKernel::to_underlying_arguments(slice, workspace_ptr));
+      }
+    } else {
+      launch<FMHAPrefillKernel>(FMHAPrefillKernel::to_underlying_arguments(arguments, workspace_ptr));
+    }
     return cutlass::Status::kSuccess;
   }
 };
@@ -347,6 +426,7 @@ template <
     bool Causal,
     bool LocalMask,
     bool Sink,
+    bool LSE,
     typename TileShapeQK,
     typename TileShapePV,
     typename TileShapeOutput,
@@ -434,8 +514,8 @@ struct FMHAConfig {
         LocalMask>;
 
     // Epilogue
-    using CollectiveEpilogue =
-        cutlass::fmha::collective::FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, Sink>;
+    using CollectiveEpilogue = cutlass::fmha::collective::
+        FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, Sink, /*PackGQA*/ false, LSE>;
 
     static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
     using FMHAPrefillKernel = conditional_t<
@@ -480,7 +560,7 @@ struct FMHAConfig {
 // generated .cpp file (from xe_fmha_fwd_prefill_kernel.cpp.in) so the compiler
 // only emits code for the combinations that are actually needed.
 
-template <int HEAD_DIM>
+template <int HEAD_DIM, class Element = cutlass::bfloat16_t>
 struct FmhaPrefillRunner {
   void operator()(const Arguments& params) const;
 };
@@ -488,8 +568,8 @@ struct FmhaPrefillRunner {
 // Non-paged (no_page) prefill is split into its own runner type so its kernel
 // instantiations are compiled in translation units separate from the paged
 // prefill path, producing independent shared libraries and lowering peak
-// compiler memory. Non-paged prefill supports bf16 queries only (no fp8).
-template <int HEAD_DIM>
+// compiler memory. Non-paged prefill supports 16-bit (bf16/fp16) queries only (no fp8).
+template <int HEAD_DIM, class Element = cutlass::bfloat16_t>
 struct FmhaPrefillNpRunner {
   void operator()(const Arguments& params) const;
 };
@@ -497,10 +577,11 @@ struct FmhaPrefillNpRunner {
 // FP8 KV-cache prefill path is split into its own runner type so that the
 // (heavy) e4m3/e5m2 kernel instantiations — which also fan out over
 // is_local x is_causal — are compiled in a separate translation unit from the
-// bf16 paged prefill path. This keeps the peak compiler memory of any
+// 16-bit paged prefill path. This keeps the peak compiler memory of any
 // single prefill TU low (avoids OOM during AOT build). The dispatch forwards to
-// this when params.is_e4m3 || is_e5m2.
-template <int HEAD_DIM>
+// this when params.is_e4m3 || is_e5m2. The trailing Element is the QUERY dtype
+// (bf16 or fp16); K/V stay fp8.
+template <int HEAD_DIM, class Element = cutlass::bfloat16_t>
 struct FmhaPrefillFp8Runner {
   void operator()(const Arguments& params) const;
 };

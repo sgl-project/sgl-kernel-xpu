@@ -1,6 +1,7 @@
 import ctypes
 import os
 import platform
+from typing import Optional
 
 import torch
 
@@ -48,16 +49,13 @@ from sgl_kernel.elementwise import (
     silu_and_mul_clamp,
     store_cache_xpu,
 )
-from sgl_kernel.flash_compress_4_torch import (
-    flash_compress4_decode,
-    flash_compress4_prefill,
-)
+from sgl_kernel.flash_compress_4 import flash_compress4_decode, flash_compress4_prefill
 from sgl_kernel.flash_compress_128 import (
     flash_compress128_decode,
     flash_compress128_prefill,
 )
 from sgl_kernel.fp8_paged_mqa_logits import fp8_paged_mqa_logits_triton
-from sgl_kernel.fused_norm_rope_v2_torch import compress_norm_rope_store
+from sgl_kernel.fused_norm_rope_v2 import compress_norm_rope_store
 from sgl_kernel.fused_q_indexer_rope_hadamard_quant_torch import (
     fused_q_indexer_rope_hadamard_quant,
 )
@@ -82,6 +80,17 @@ from sgl_kernel.gemm import (
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.hadamard import hadamard_transform
+from sgl_kernel.hisparse import (
+    load_cache_to_device_buffer_dsv4_mla,
+    load_cache_to_device_buffer_mla,
+    transfer_cache_dsv4_mla,
+)
+from sgl_kernel.inkling_attn_prologue import (
+    compile_inkling_attn_prologue,
+    inkling_attn_prologue_decode,
+    inkling_attn_prologue_extend,
+    inkling_attn_prologue_verify,
+)
 from sgl_kernel.inkling_sconv import (
     causal_conv1d,
     fused_causal_conv1d_update_decode,
@@ -110,7 +119,12 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer_pf_lf,
     transfer_kv_per_layer_ph_lf,
 )
-from sgl_kernel.lora import embedding_lora_a_fwd, sgemm_lora_a_fwd, sgemm_lora_b_fwd
+from sgl_kernel.lora import (
+    embedding_lora_a_fwd,
+    qkv_lora_b_fwd,
+    sgemm_lora_a_fwd,
+    sgemm_lora_b_fwd,
+)
 from sgl_kernel.mamba import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
 from sgl_kernel.memory import weak_ref_tensor
 from sgl_kernel.mhc import (
@@ -120,6 +134,9 @@ from sgl_kernel.mhc import (
     hc_split_sinkhorn,
     mhc_pre,
 )
+
+fused_hc_head = torch.ops.sgl_kernel.fused_hc_head.default
+mhc_fused_post_pre = torch.ops.sgl_kernel.mhc_fused_post_pre.default
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     biased_topk,
@@ -161,6 +178,8 @@ from sgl_kernel.top_k import (
     fast_topk_transform_fused,
     fast_topk_transform_ragged_fused,
     fast_topk_v2,
+    topk_transform_512,
+    topk_transform_512_v2,
 )
 from sgl_kernel.utils import get_device_capability, is_xe2_arch
 from sgl_kernel.version import __version__

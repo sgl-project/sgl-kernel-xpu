@@ -837,6 +837,23 @@ void hc_post(
  */
 void hc_pre_gemm_sqr_sum(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, const at::Tensor& B);
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mhc_fused_post_pre(
+    const at::Tensor& x,
+    const at::Tensor& residual,
+    const at::Tensor& post_layer_mix,
+    const at::Tensor& comb_res_mix,
+    const at::Tensor& fn,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    double rms_eps = 1e-6,
+    double hc_pre_eps = 1e-6,
+    double hc_sinkhorn_eps = 1e-6,
+    double hc_post_mult_value = 2.0,
+    int64_t sinkhorn_repeat = 20,
+    int64_t n_splits = 0,
+    std::optional<at::Tensor> norm_weight = std::nullopt,
+    std::optional<double> norm_eps = std::nullopt);
+
 /*
  * From csrc/speculative
  */
@@ -947,6 +964,23 @@ void fast_topk_transform_ragged_interface(
     at::Tensor& topk_indices_ragged,
     const at::Tensor& topk_indices_offset,
     std::optional<at::Tensor> row_starts_opt);
+
+void topk_transform_512_interface(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    const at::Tensor& page_tables,
+    at::Tensor& out_page_indices,
+    int64_t page_size,
+    std::optional<at::Tensor> out_raw_indices_opt);
+
+void topk_transform_512_v2_interface(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    const at::Tensor& page_tables,
+    at::Tensor& out_page_indices,
+    int64_t page_size,
+    const at::Tensor& metadata,
+    std::optional<at::Tensor> out_raw_indices_opt);
 
 /*
  * Compress plan and execution kernels
@@ -1156,6 +1190,20 @@ void sgemm_lora_b_fwd(
     const std::optional<torch::Tensor>& base_output  // [num_tokens, output_dim]
 );
 
+void qkv_lora_b_fwd(
+    torch::Tensor& output,                           // [num_tokens, N_Q + 2N_{KV}]
+    const torch::Tensor& input_x,                    // [num_tokens, 3*max_rank]
+    const torch::Tensor& qkv_lora_b,                 // [num_loras, N_Q + 2N_{KV}, max_rank]
+    const torch::Tensor& output_offset,              // [4,]
+    const int64_t max_qkv_out_dim,                   // max(output_q_dim, output_kv_dim)
+    const torch::Tensor& seg_indptr,                 // [num_segments + 1,]
+    const torch::Tensor& weight_indices,             // [num_segments,]
+    const torch::Tensor& lora_ranks,                 // [num_loras,]
+    const torch::Tensor& scalings,                   // [num_loras,]
+    const std::optional<torch::Tensor>& seg_lens,    // [num_segments,]
+    const std::optional<torch::Tensor>& base_output  // [num_tokens, N_Q + 2N_{KV}]
+);
+
 /*
  * From GDN (Gated DeltaNet) attention (Intel Xe2)
  */
@@ -1229,5 +1277,34 @@ void causal_conv1d_update(
     const std::optional<at::Tensor>& cache_seqlens_,
     const std::optional<at::Tensor>& conv_state_indices_,
     int64_t pad_slot_id);
+
+/*
+ * HiSparse hierarchical sparse KV cache (DeepSeek DSA / V4)
+ */
+void transfer_cache_dsv4_mla(
+    const at::Tensor& src_ptrs,
+    const at::Tensor& dst_ptrs,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t block_size);
+
+void load_cache_to_device_buffer_mla(
+    const at::Tensor& top_k_tokens,
+    const at::Tensor& device_buffer_tokens,
+    const at::Tensor& host_cache_locs,
+    const at::Tensor& device_buffer_locs,
+    const at::Tensor& host_cache,
+    const at::Tensor& device_buffer,
+    const at::Tensor& top_k_device_locs,
+    const at::Tensor& req_pool_indices,
+    const at::Tensor& seq_lens,
+    const at::Tensor& lru_slots,
+    const std::optional<at::Tensor>& num_real_reqs,
+    int64_t item_size_bytes,
+    int64_t num_top_k,
+    int64_t hot_buffer_size,
+    int64_t page_size,
+    int64_t block_size,
+    bool is_dsv4_layout);
 
 #pragma GCC visibility pop

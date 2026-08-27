@@ -51,6 +51,7 @@ suites = {
         TestFile("test_store_cache_xpu.py"),
         TestFile("test_hc_pre_gemm_sqr_sum.py"),
         TestFile("test_mhc_pre.py"),
+        TestFile("test_mhc_fused_post_pre.py"),
         TestFile("test_hc_head.py"),
         TestFile("test_per_token_group_quant_mxfp4_fused.py"),
         TestFile("test_silu_and_mul_clamp.py"),
@@ -65,6 +66,7 @@ suites = {
         TestFile("test_embedding_lora_a_fwd.py"),
         TestFile("test_sgemm_lora_a_fwd.py"),
         TestFile("test_sgemm_lora_b_fwd.py"),
+        TestFile("test_qkv_lora_b_fwd.py"),
         TestFile("test_sconv_causal_conv1d.py"),
         TestFile("test_sconv_decode_metadata.py"),
         TestFile("test_sconv_extend_metadata.py"),
@@ -73,6 +75,7 @@ suites = {
         TestFile("test_sconv_metadata_and_windows.py"),
         TestFile("test_sconv_update_sconv_cache.py"),
         TestFile("test_inkling_attn_prologue.py"),
+        TestFile("test_hisparse.py"),
     ],
     # Nightly suite: exercises the wheel installed in the intel/sgl-kernel-xpu-dev
     # nightly image. Populate with longer-running or full-shape tests that are

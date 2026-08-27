@@ -2,6 +2,7 @@
 import itertools
 import math
 import os
+import re
 import sys
 
 import pytest
@@ -369,6 +370,7 @@ def attention_ref(
     upcast=True,
     reorder_ops=False,
     intermediate_dtype=None,
+    return_lse=False,
 ):
     """
     Arguments:
@@ -442,6 +444,9 @@ def attention_ref(
             scores.size()[0], scores.size()[1], scores.size()[2], 1
         )
         scores = torch.cat([scores, sink_expanded], dim=-1)
+    # Log-sum-exp over the key dimension (includes the sink column when present
+    # and excludes -inf masked entries): matches the kernel's softmax_lse.
+    softmax_lse_ref = torch.logsumexp(scores.float(), dim=-1)
     attention = torch.softmax(scores, dim=-1).to(v.dtype)
     if sink is not None:
         attention = attention[..., :-1]
@@ -473,7 +478,48 @@ def attention_ref(
     output = torch.einsum("bhts,bshd->bthd", attention_drop, v * dropout_scaling)
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
+    if return_lse:
+        return (
+            output.to(dtype=dtype_og),
+            attention.to(dtype=dtype_og),
+            softmax_lse_ref,
+        )
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
+
+
+def _check_softmax_lse(lse, nheads_q, total_q, ref_lse_hq=None, atol=1e-1, rtol=1e-1):
+    """Validate a returned softmax_lse tensor.
+
+    Guards against the regression where the XPU chunkprefill path returned an
+    empty / mis-shaped placeholder instead of a real (nheads, total_q) LSE.
+    When ``ref_lse_hq`` (shape (nheads_q, total_q)) is given, the values on the
+    finite rows are also compared (fully-masked rows are -inf and skipped).
+    """
+    assert lse is not None, "softmax_lse must not be None when return_softmax_lse=True"
+    assert isinstance(
+        lse, torch.Tensor
+    ), f"softmax_lse must be a tensor, got {type(lse)}"
+    assert (
+        lse.dim() == 2
+    ), f"softmax_lse must be 2D (nheads, total_q), got shape {tuple(lse.shape)}"
+    assert tuple(lse.shape) == (
+        nheads_q,
+        total_q,
+    ), f"softmax_lse shape {tuple(lse.shape)} != expected {(nheads_q, total_q)}"
+    assert lse.dtype == torch.float32, f"softmax_lse dtype {lse.dtype} != float32"
+    lse_f = lse.float()
+    assert not torch.isnan(lse_f).any(), "softmax_lse contains NaN"
+    assert not torch.isposinf(lse_f).any(), "softmax_lse contains +inf"
+    if ref_lse_hq is not None:
+        finite = torch.isfinite(ref_lse_hq)
+        if finite.any():
+            diff = (lse_f[finite] - ref_lse_hq[finite].to(lse_f.dtype)).abs()
+            tol = atol + rtol * ref_lse_hq[finite].abs()
+            max_diff = diff.max().item()
+            assert (diff <= tol).all(), (
+                f"softmax_lse numeric mismatch: max diff {max_diff} exceeds "
+                f"tolerance (atol={atol}, rtol={rtol})"
+            )
 
 
 def generate_qkv(
@@ -958,7 +1004,7 @@ def test_flash_attn_kvcache(
         v_cache_rep = repeat(
             v_cache_ref, "b s h d -> b s (h g) d", g=nheads_q // nheads_kv
         )
-        out_ref, _ = attention_ref(
+        out_ref, _, lse_ref = attention_ref(
             q_ro,
             k_cache_rep,
             v_cache_rep,
@@ -970,6 +1016,7 @@ def test_flash_attn_kvcache(
             qv=qv,
             window_size=window_size,
             key_leftpad=cache_leftpad,
+            return_lse=True,
         )
         out_pt, _ = attention_ref(
             q_ro,
@@ -1017,7 +1064,10 @@ def test_flash_attn_kvcache(
                 else:
                     k_cache_paged.copy_(k_cache_saved)
                     v_cache_paged.copy_(v_cache_saved)
-                out, lse, *rest = flash_attn_with_kvcache(
+                # The kernel only supports returning softmax_lse without
+                # causal/local/sink masking; request it only in that case.
+                return_lse = not causal and not local and not use_sinks
+                result = flash_attn_with_kvcache(
                     q if not varlen_q else q_unpad,
                     k_cache if page_size is None else k_cache_paged,
                     v_cache if page_size is None else v_cache_paged,
@@ -1041,8 +1091,24 @@ def test_flash_attn_kvcache(
                     rotary_interleaved=rotary_interleaved,
                     scheduler_metadata=scheduler_metadata,
                     num_splits=num_splits,
-                    return_softmax_lse=True,
+                    return_softmax_lse=return_lse,
                 )
+                if return_lse:
+                    out, lse, *rest = result
+                else:
+                    out = result
+                # --- softmax_lse validation (regression guard for the empty /
+                # mis-shaped LSE that the old chunkprefill path returned). The
+                # kernel's LSE for sink cases is sink-exclusive while the
+                # reference is sink-inclusive, so numeric LSE is only validated
+                # for non-sink cases. lse_ref is reused from the out_ref call. ---
+                if return_lse:
+                    ref_lse_hq = (
+                        rearrange(lse_ref, "b h s -> (b s) h")[indices_q]
+                        .transpose(0, 1)
+                        .contiguous()
+                    )
+                    _check_softmax_lse(lse, nheads_q, q_unpad.shape[0], ref_lse_hq)
                 if varlen_q:
                     out = output_pad_fn(out)
                 torch.xpu.synchronize()
@@ -1516,7 +1582,7 @@ def test_flash_attn_decode_kvcache(
         v_cache_rep = repeat(
             v_cache_ref, "b s h d -> b s (h g) d", g=nheads_q // nheads_kv
         )
-        out_ref, _ = attention_ref(
+        out_ref, _, lse_ref = attention_ref(
             q_ro,
             k_cache_rep,
             v_cache_rep,
@@ -1528,6 +1594,7 @@ def test_flash_attn_decode_kvcache(
             qv=qv,
             window_size=window_size,
             key_leftpad=cache_leftpad,
+            return_lse=True,
         )
         out_pt, _ = attention_ref(
             q_ro,
@@ -1583,7 +1650,10 @@ def test_flash_attn_decode_kvcache(
                 else:
                     k_cache_paged.copy_(k_cache_saved)
                     v_cache_paged.copy_(v_cache_saved)
-                out, lse, *rest = flash_attn_with_kvcache(
+                # The kernel only supports returning softmax_lse without
+                # causal/local/sink masking; request it only in that case.
+                return_lse = not causal and not local and not use_sinks
+                result = flash_attn_with_kvcache(
                     q if not varlen_q else q_unpad,
                     k_cache if page_size is None else k_cache_paged,
                     v_cache if page_size is None else v_cache_paged,
@@ -1608,8 +1678,24 @@ def test_flash_attn_decode_kvcache(
                     rotary_interleaved=rotary_interleaved,
                     scheduler_metadata=scheduler_metadata,
                     num_splits=num_splits,
-                    return_softmax_lse=True,
+                    return_softmax_lse=return_lse,
                 )
+                if return_lse:
+                    out, lse, *rest = result
+                else:
+                    out = result
+                # --- softmax_lse validation (regression guard for the empty /
+                # mis-shaped LSE that the old chunkprefill path returned). The
+                # kernel's LSE for sink cases is sink-exclusive while the
+                # reference is sink-inclusive, so numeric LSE is only validated
+                # for non-sink cases. lse_ref is reused from the out_ref call. ---
+                if return_lse:
+                    ref_lse_hq = (
+                        rearrange(lse_ref, "b h s -> (b s) h")[indices_q]
+                        .transpose(0, 1)
+                        .contiguous()
+                    )
+                    _check_softmax_lse(lse, nheads_q, q_unpad.shape[0], ref_lse_hq)
                 if varlen_q:
                     out = output_pad_fn(out)
                 torch.xpu.synchronize()
@@ -1780,7 +1866,7 @@ def test_flash_attn_fp8_kvcache(
 
     q = torch.randn(batch_size, seqlen_q, nheads_q, d, device=device, dtype=q_dtype)
 
-    out = flash_attn_with_kvcache(
+    out, lse, *rest = flash_attn_with_kvcache(
         q,
         k_cache_paged,
         v_cache_paged,
@@ -1790,7 +1876,11 @@ def test_flash_attn_fp8_kvcache(
         v_descale=v_descale,
         softmax_scale=softmax_scale,
         causal=causal,
+        return_softmax_lse=True,
     )
+    # --- softmax_lse validation (structural: the fp8 lse numeric convention is
+    # kernel-specific, so only shape / finiteness are checked here) ---
+    _check_softmax_lse(lse, nheads_q, batch_size * seqlen_q)
     out = out.reshape(batch_size, seqlen_q, nheads_q, d)
     torch.xpu.synchronize()
 
@@ -2125,7 +2215,7 @@ def test_flash_attn_varlen_output(
         pack_gqa_vals = [False, True] if not DISABLE_PACKGQA else [False]
         num_splits_vals = [1, 3] if not DISABLE_SPLIT else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
-            out_unpad, lse, *rest = flash_attn_varlen_func(
+            out_unpad = flash_attn_varlen_func(
                 q_unpad,
                 k_unpad,
                 v_unpad,
@@ -2144,7 +2234,7 @@ def test_flash_attn_varlen_output(
                 softmax_scale=softmax_scale,
                 sinks=sinks,
                 softcap=softcap,
-                return_softmax_lse=True,
+                return_softmax_lse=False,
             )
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:
@@ -2245,6 +2335,228 @@ if EXTENDED_KVCACHE_TESTS:
             dtype=dtype,
         )
 
+    @pytest.mark.skipif(
+        device.type != "xpu" or not is_fa3_supported(),
+        reason="large ScoreBlock2D workspace coverage is only supported on BMG XPU",
+    )
+    @pytest.mark.parametrize(
+        "batch_size,nheads_q,nheads_kv,seqlen_q,seqlen_k",
+        [
+            (1, 16, 2, 32768, 32768),
+            # These all require the 1 GiB score workspace cap to slice a
+            # 32K x 32K HD512 problem.
+            (4, 16, 2, 32768, 32768),
+            (1, 32, 4, 32768, 32768),
+            (8, 8, 1, 32768, 32768),
+            (32, 4, 1, 32768, 32768),
+            (4, 8, 2, 32768, 32768),
+            # Non-paged HD512 uses 32 Q tiles per head. Q-tile chunking keeps
+            # one query head sufficient to cover BMG (20 Xe-cores) without a
+            # 4 GiB score buffer.
+            (1, 16, 2, 4096, 32768),
+            # A low-head, high-batch case must accumulate Q tiles across batch
+            # slices instead of allocating all eight score matrices at once.
+            (8, 1, 1, 4096, 32768),
+            # Exercises nested batch and GQA-head slicing: one unsliced batch
+            # needs 2 GiB and the complete problem needs 8 GiB.
+            (4, 8, 1, 4096, 32768),
+        ],
+    )
+    def test_flash_attn_varlen_hd512_large_score_workspace(
+        batch_size, nheads_q, nheads_kv, seqlen_q, seqlen_k, monkeypatch, capfd
+    ):
+        """Large ScoreBlock2D cases that require batch, GQA-head, and Q-tile slicing."""
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+        head_dim = 512
+        torch.manual_seed(0)
+        monkeypatch.setenv("FMHA_SCORE_WS_VERBOSE", "1")
+
+        total_q = batch_size * seqlen_q
+        total_k = batch_size * seqlen_k
+        q = torch.randn(
+            total_q, nheads_q, head_dim, device=device, dtype=torch.bfloat16
+        )
+        k = torch.randn(
+            total_k, nheads_kv, head_dim, device=device, dtype=torch.bfloat16
+        )
+        v = torch.randn(
+            total_k, nheads_kv, head_dim, device=device, dtype=torch.bfloat16
+        )
+        cu_seqlens_q = torch.arange(
+            0, total_q + 1, seqlen_q, device=device, dtype=torch.int32
+        )
+        cu_seqlens_k = torch.arange(
+            0, total_k + 1, seqlen_k, device=device, dtype=torch.int32
+        )
+
+        out = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqlen_q,
+            seqlen_k,
+            causal=True,
+        )
+        torch.xpu.synchronize()
+        assert out.shape == (total_q, nheads_q, head_dim)
+        assert out.dtype == torch.bfloat16
+        assert torch.isfinite(out).all()
+        _, stderr = capfd.readouterr()
+        match = re.search(
+            r"query_tile_slice=(\d+) q_tile_rows=(\d+) bytes=(\d+)", stderr
+        )
+        assert match, f"missing ScoreBlock2D workspace report: {stderr}"
+        q_tile_slice, q_tile_rows, workspace_bytes = map(int, match.groups())
+        total_q_tiles = math.ceil(seqlen_q / q_tile_rows)
+        assert 1 <= q_tile_slice <= total_q_tiles
+        assert workspace_bytes <= 1024 * 1024 * 1024
+
+    @pytest.mark.skipif(
+        device.type != "xpu" or not is_fa3_supported(),
+        reason="ScoreBlock2D LSE coverage is only supported on BMG XPU",
+    )
+    def test_flash_attn_varlen_hd512_score_workspace_lse_head_slicing(
+        monkeypatch, capfd
+    ):
+        """LSE rows remain globally indexed when ScoreBlock2D slices Q heads."""
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+        batch_size = 1
+        nheads_q = 4
+        nheads_kv = 1
+        seqlen_q = 256
+        seqlen_k = 4096
+        head_dim = 512
+        torch.manual_seed(0)
+        # A Q tile stores 128 * 4096 fp16 scores (1 MiB) per Q head. The
+        # 2 MiB cap forces the four Q heads to launch as two head slices.
+        monkeypatch.setenv("FMHA_SCORE_WS_CAP_MB", "2")
+        monkeypatch.setenv("FMHA_SCORE_WS_VERBOSE", "1")
+
+        q = torch.randn(
+            batch_size * seqlen_q,
+            nheads_q,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        k = torch.randn(
+            batch_size * seqlen_k,
+            nheads_kv,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        v = torch.randn(
+            batch_size * seqlen_k,
+            nheads_kv,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        cu_seqlens_q = torch.tensor([0, seqlen_q], device=device, dtype=torch.int32)
+        cu_seqlens_k = torch.tensor([0, seqlen_k], device=device, dtype=torch.int32)
+
+        out, lse = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqlen_q,
+            seqlen_k,
+            return_softmax_lse=True,
+        )
+        torch.xpu.synchronize()
+
+        _, _, lse_ref = attention_ref(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            softmax_scale=head_dim**-0.5,
+            return_lse=True,
+        )
+        _check_softmax_lse(
+            lse,
+            nheads_q,
+            batch_size * seqlen_q,
+            lse_ref.squeeze(0),
+        )
+        assert out.shape == (batch_size * seqlen_q, nheads_q, head_dim)
+        _, stderr = capfd.readouterr()
+        match = re.search(r"query_head_slice=(\d+)", stderr)
+        assert match, f"missing ScoreBlock2D workspace report: {stderr}"
+        assert int(match.group(1)) < nheads_q
+
+    @pytest.mark.parametrize(
+        "batch_size,nheads_q,nheads_kv",
+        [
+            (1, 16, 2),
+            (8, 1, 1),
+        ],
+    )
+    def test_flash_attn_paged_hd512_large_score_workspace(
+        batch_size, nheads_q, nheads_kv
+    ):
+        """Paged ScoreBlock2D cases that previously required a 4 GiB workspace."""
+        from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+        seqlen_q = 4096
+        seqlen_k = 32768
+        page_size = 128
+        head_dim = 512
+        pages_per_seq = seqlen_k // page_size
+        num_pages = batch_size * pages_per_seq
+        torch.manual_seed(0)
+
+        q = torch.randn(
+            batch_size * seqlen_q,
+            nheads_q,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        k_cache = torch.randn(
+            num_pages,
+            page_size,
+            nheads_kv,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        v_cache = torch.randn_like(k_cache)
+        page_table = torch.arange(num_pages, device=device, dtype=torch.int32).reshape(
+            batch_size, pages_per_seq
+        )
+        cache_seqlens = torch.full(
+            (batch_size,), seqlen_k, device=device, dtype=torch.int32
+        )
+        cu_seqlens_q = torch.arange(
+            0,
+            batch_size * seqlen_q + 1,
+            seqlen_q,
+            device=device,
+            dtype=torch.int32,
+        )
+
+        out = flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=cache_seqlens,
+            page_table=page_table,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=seqlen_q,
+            causal=True,
+        )
+        torch.xpu.synchronize()
+        assert out.shape == (batch_size * seqlen_q, nheads_q, head_dim)
+        assert out.dtype == torch.bfloat16
+        assert torch.isfinite(out).all()
+
 
 @pytest.mark.skipif(device.type != "xpu", reason="XPU not available")
 def test_flash_attn_with_kvcache_out_buffer():
@@ -2280,14 +2592,17 @@ def test_flash_attn_with_kvcache_out_buffer():
     # Preallocate out buffer: shape [total_q, nheads, d] = [batch*seqlen_q, nheads, d]
     total_q = batch_size * seqlen_q
     out_buf = torch.empty(total_q, nheads, d, device=device, dtype=dtype)
-    result = flash_attn_with_kvcache(
+    result, lse, *rest = flash_attn_with_kvcache(
         q,
         k_cache,
         v_cache,
         cache_seqlens=cache_seqlens,
         page_table=page_table,
         out=out_buf,
+        return_softmax_lse=True,
     )
+    # --- softmax_lse validation (structural) ---
+    _check_softmax_lse(lse, nheads, total_q)
 
     # The returned tensor must alias the provided buffer (same storage)
     assert (

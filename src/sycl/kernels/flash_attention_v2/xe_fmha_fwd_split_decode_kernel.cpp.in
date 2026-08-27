@@ -54,6 +54,29 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
       kv_subgroups_for_slm(@PAGE_SIZE@ / 16, @QG_SZ@, kOutputTile);
   using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<kKvSubgroups>, cute::_1>>;
 
+    if (params.return_softmax_lse) {
+        TORCH_CHECK(
+                !params.is_local && !params.use_sink,
+                "return_softmax_lse is only supported without local/sink masking");
+        using Element = @ELEM_TYPE@;
+        SplitDecodeConfig<
+                false,
+                false,
+                false,
+                /*LSE=*/true,
+                TileShapeQK,
+                TileShapePV,
+                TileShapeOutput,
+                SubgroupLayoutQK,
+                void,
+                1,
+                Element,
+                Element,
+                Element,
+                Element>::run(params);
+        return;
+    }
+
 #if @HEAD_DIM@ == 64
     AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
@@ -62,6 +85,7 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
               false,
               LocalMask,
               Sink,
+              /*LSE=*/false,
               TileShapeQK,
               TileShapePV,
               TileShapeOutput,
@@ -84,6 +108,7 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
             false,
             LocalMask,
             false,
+            /*LSE=*/false,
             TileShapeQK,
             TileShapePV,
             TileShapeOutput,

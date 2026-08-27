@@ -82,28 +82,33 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * Fast radix top-k (DeepSeek V3.2 indexer)
    */
-  m.def("fast_topk(Tensor score, Tensor! indices, Tensor lengths, Tensor? row_starts) -> ()");
-  m.impl("fast_topk", torch::kXPU, &fast_topk_interface);
+  m.def("fast_topk(Tensor score, Tensor lengths, int topk, Tensor? row_starts) -> Tensor");
+  m.impl("fast_topk", torch::kXPU, &fast_topk);
 
   m.def(
-      "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor! dst_page_table, Tensor src_page_table, "
-      "Tensor cu_seqlens_q, Tensor? row_starts) -> ()");
-  m.impl("fast_topk_transform_fused", torch::kXPU, &fast_topk_transform_interface);
+      "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor src_page_table, "
+      "Tensor cu_seqlens_q, int topk, Tensor? row_starts) -> Tensor");
+  m.impl("fast_topk_transform_fused", torch::kXPU, &fast_topk_transform_fused);
 
   m.def(
-      "fast_topk_transform_ragged_fused(Tensor score, Tensor lengths, Tensor! topk_indices_ragged, "
-      "Tensor topk_indices_offset, Tensor? row_starts) -> ()");
-  m.impl("fast_topk_transform_ragged_fused", torch::kXPU, &fast_topk_transform_ragged_interface);
+      "fast_topk_transform_ragged_fused(Tensor score, Tensor lengths, "
+      "Tensor topk_indices_offset, int topk, Tensor? row_starts) -> Tensor");
+  m.impl("fast_topk_transform_ragged_fused", torch::kXPU, &fast_topk_transform_ragged_fused);
 
   m.def(
-      "topk_transform_512(Tensor scores, Tensor seq_lens, Tensor page_tables, Tensor! out_page_indices, "
+      "topk_transform(Tensor scores, Tensor seq_lens, Tensor page_tables, Tensor! out_page_indices, "
       "int page_size, Tensor? out_raw_indices) -> ()");
-  m.impl("topk_transform_512", torch::kXPU, &topk_transform_512_interface);
+  m.impl("topk_transform", torch::kXPU, &topk_transform);
 
   m.def(
-      "topk_transform_512_v2(Tensor scores, Tensor seq_lens, Tensor page_tables, "
-      "Tensor! out_page_indices, int page_size, Tensor metadata, Tensor? out_raw_indices) -> ()");
-  m.impl("topk_transform_512_v2", torch::kXPU, &topk_transform_512_v2_interface);
+      "topk_transform_paged(Tensor scores, Tensor seq_lens, Tensor? page_tables, "
+      "Tensor! out_page_indices, int page_size, Tensor metadata) -> ()");
+  m.impl("topk_transform_paged", torch::kXPU, &topk_transform_paged);
+
+  m.def(
+      "topk_transform_ragged(Tensor scores, Tensor seq_lens, Tensor! out_indices, "
+      "Tensor out_offsets, Tensor? row_starts) -> ()");
+  m.impl("topk_transform_ragged", torch::kXPU, &topk_transform_ragged);
 
   m.def("swiglu_gpt_oss_sigmoid_alpha(Tensor x, float alpha, float limit) -> Tensor");
   m.impl("swiglu_gpt_oss_sigmoid_alpha", torch::kXPU, &swiglu_gpt_oss_sigmoid_alpha);

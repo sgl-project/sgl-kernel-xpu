@@ -41,3 +41,38 @@ __attribute__((visibility("default"))) void launch_mla_sparse_decode_2stage_@ELE
 }
 
 }  // namespace mla_sparse_decode
+
+#ifdef SGL_MLA_JIT_ENTRY
+// Stable C ABI entry for the runtime-JIT path. Tensors / std::optional<at::Tensor>
+// cross the dlopen boundary as pointers (shared <torch/all.h> -> identical layout).
+// One config (@ELEM_TAG@,@D_QK@,@B_H@,@HAS_ATTN_SINK@) per .so.
+extern "C" __attribute__((visibility("default"))) void sgl_mla_sparse_decode_entry(
+    void* out,
+    void* lse_out,
+    const void* q,
+    const void* k_cache,
+    const void* indices,
+    const void* topk_length,
+    const void* extra_k_cache,
+    const void* extra_indices,
+    const void* extra_topk_length,
+    const void* attn_sink,
+    double sm_scale,
+    int64_t head_dim_v,
+    bool is_fp8_kvcache) {
+  mla_sparse_decode::launch_mla_sparse_decode_2stage_@ELEM_TAG@_@D_QK@_@B_H@_@HAS_ATTN_SINK@(
+      *static_cast<at::Tensor*>(out),
+      *static_cast<at::Tensor*>(lse_out),
+      *static_cast<const at::Tensor*>(q),
+      *static_cast<const at::Tensor*>(k_cache),
+      *static_cast<const at::Tensor*>(indices),
+      *static_cast<const std::optional<at::Tensor>*>(topk_length),
+      *static_cast<const std::optional<at::Tensor>*>(extra_k_cache),
+      *static_cast<const std::optional<at::Tensor>*>(extra_indices),
+      *static_cast<const std::optional<at::Tensor>*>(extra_topk_length),
+      *static_cast<const std::optional<at::Tensor>*>(attn_sink),
+      sm_scale,
+      head_dim_v,
+      is_fp8_kvcache);
+}
+#endif

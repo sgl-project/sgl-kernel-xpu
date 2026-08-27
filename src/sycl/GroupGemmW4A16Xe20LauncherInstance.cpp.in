@@ -174,4 +174,38 @@ void moe_w4a16::w4a16_launch<moe_w4a16::@POLICY@, @ELEMENT_S@, @ELEMENT_A@>(
     const int,
     int32_t*);
 
+#ifdef SGL_W4A16_JIT_ENTRY
+// Stable C ABI entry for the runtime-JIT path (one config per .so, so the fixed
+// symbol name never collides across the AOT translation units).
+extern "C" __attribute__((visibility("default"))) void sgl_moe_w4a16_entry(
+    void* queue_ptr,
+    const void* activations,
+    const void* packed_weights,
+    const void* scales,
+    const void* zeros,
+    const void* bias,
+    void* outputs,
+    int gemm_n,
+    int gemm_k,
+    const int* rows_per_expert,
+    int num_experts,
+    int group_size,
+    int* atomic_buffer) {
+  moe_w4a16::w4a16_launch<moe_w4a16::@POLICY@, @ELEMENT_S@, @ELEMENT_A@>(
+      *static_cast<sycl::queue*>(queue_ptr),
+      activations,
+      packed_weights,
+      scales,
+      zeros,
+      bias,
+      outputs,
+      gemm_n,
+      gemm_k,
+      rows_per_expert,
+      num_experts,
+      group_size,
+      atomic_buffer);
+}
+#endif
+
 #undef SYCL_INTEL_TARGET

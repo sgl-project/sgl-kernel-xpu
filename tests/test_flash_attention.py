@@ -2,6 +2,7 @@
 import itertools
 import math
 import os
+import re
 import sys
 
 import pytest
@@ -2333,6 +2334,228 @@ if EXTENDED_KVCACHE_TESTS:
             nheads_kv=nheads_kv,
             dtype=dtype,
         )
+
+    @pytest.mark.skipif(
+        device.type != "xpu" or not is_fa3_supported(),
+        reason="large ScoreBlock2D workspace coverage is only supported on BMG XPU",
+    )
+    @pytest.mark.parametrize(
+        "batch_size,nheads_q,nheads_kv,seqlen_q,seqlen_k",
+        [
+            (1, 16, 2, 32768, 32768),
+            # These all require the 1 GiB score workspace cap to slice a
+            # 32K x 32K HD512 problem.
+            (4, 16, 2, 32768, 32768),
+            (1, 32, 4, 32768, 32768),
+            (8, 8, 1, 32768, 32768),
+            (32, 4, 1, 32768, 32768),
+            (4, 8, 2, 32768, 32768),
+            # Non-paged HD512 uses 32 Q tiles per head. Q-tile chunking keeps
+            # one query head sufficient to cover BMG (20 Xe-cores) without a
+            # 4 GiB score buffer.
+            (1, 16, 2, 4096, 32768),
+            # A low-head, high-batch case must accumulate Q tiles across batch
+            # slices instead of allocating all eight score matrices at once.
+            (8, 1, 1, 4096, 32768),
+            # Exercises nested batch and GQA-head slicing: one unsliced batch
+            # needs 2 GiB and the complete problem needs 8 GiB.
+            (4, 8, 1, 4096, 32768),
+        ],
+    )
+    def test_flash_attn_varlen_hd512_large_score_workspace(
+        batch_size, nheads_q, nheads_kv, seqlen_q, seqlen_k, monkeypatch, capfd
+    ):
+        """Large ScoreBlock2D cases that require batch, GQA-head, and Q-tile slicing."""
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+        head_dim = 512
+        torch.manual_seed(0)
+        monkeypatch.setenv("FMHA_SCORE_WS_VERBOSE", "1")
+
+        total_q = batch_size * seqlen_q
+        total_k = batch_size * seqlen_k
+        q = torch.randn(
+            total_q, nheads_q, head_dim, device=device, dtype=torch.bfloat16
+        )
+        k = torch.randn(
+            total_k, nheads_kv, head_dim, device=device, dtype=torch.bfloat16
+        )
+        v = torch.randn(
+            total_k, nheads_kv, head_dim, device=device, dtype=torch.bfloat16
+        )
+        cu_seqlens_q = torch.arange(
+            0, total_q + 1, seqlen_q, device=device, dtype=torch.int32
+        )
+        cu_seqlens_k = torch.arange(
+            0, total_k + 1, seqlen_k, device=device, dtype=torch.int32
+        )
+
+        out = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqlen_q,
+            seqlen_k,
+            causal=True,
+        )
+        torch.xpu.synchronize()
+        assert out.shape == (total_q, nheads_q, head_dim)
+        assert out.dtype == torch.bfloat16
+        assert torch.isfinite(out).all()
+        _, stderr = capfd.readouterr()
+        match = re.search(
+            r"query_tile_slice=(\d+) q_tile_rows=(\d+) bytes=(\d+)", stderr
+        )
+        assert match, f"missing ScoreBlock2D workspace report: {stderr}"
+        q_tile_slice, q_tile_rows, workspace_bytes = map(int, match.groups())
+        total_q_tiles = math.ceil(seqlen_q / q_tile_rows)
+        assert 1 <= q_tile_slice <= total_q_tiles
+        assert workspace_bytes <= 1024 * 1024 * 1024
+
+    @pytest.mark.skipif(
+        device.type != "xpu" or not is_fa3_supported(),
+        reason="ScoreBlock2D LSE coverage is only supported on BMG XPU",
+    )
+    def test_flash_attn_varlen_hd512_score_workspace_lse_head_slicing(
+        monkeypatch, capfd
+    ):
+        """LSE rows remain globally indexed when ScoreBlock2D slices Q heads."""
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+        batch_size = 1
+        nheads_q = 4
+        nheads_kv = 1
+        seqlen_q = 256
+        seqlen_k = 4096
+        head_dim = 512
+        torch.manual_seed(0)
+        # A Q tile stores 128 * 4096 fp16 scores (1 MiB) per Q head. The
+        # 2 MiB cap forces the four Q heads to launch as two head slices.
+        monkeypatch.setenv("FMHA_SCORE_WS_CAP_MB", "2")
+        monkeypatch.setenv("FMHA_SCORE_WS_VERBOSE", "1")
+
+        q = torch.randn(
+            batch_size * seqlen_q,
+            nheads_q,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        k = torch.randn(
+            batch_size * seqlen_k,
+            nheads_kv,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        v = torch.randn(
+            batch_size * seqlen_k,
+            nheads_kv,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        cu_seqlens_q = torch.tensor([0, seqlen_q], device=device, dtype=torch.int32)
+        cu_seqlens_k = torch.tensor([0, seqlen_k], device=device, dtype=torch.int32)
+
+        out, lse = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqlen_q,
+            seqlen_k,
+            return_softmax_lse=True,
+        )
+        torch.xpu.synchronize()
+
+        _, _, lse_ref = attention_ref(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            softmax_scale=head_dim**-0.5,
+            return_lse=True,
+        )
+        _check_softmax_lse(
+            lse,
+            nheads_q,
+            batch_size * seqlen_q,
+            lse_ref.squeeze(0),
+        )
+        assert out.shape == (batch_size * seqlen_q, nheads_q, head_dim)
+        _, stderr = capfd.readouterr()
+        match = re.search(r"query_head_slice=(\d+)", stderr)
+        assert match, f"missing ScoreBlock2D workspace report: {stderr}"
+        assert int(match.group(1)) < nheads_q
+
+    @pytest.mark.parametrize(
+        "batch_size,nheads_q,nheads_kv",
+        [
+            (1, 16, 2),
+            (8, 1, 1),
+        ],
+    )
+    def test_flash_attn_paged_hd512_large_score_workspace(
+        batch_size, nheads_q, nheads_kv
+    ):
+        """Paged ScoreBlock2D cases that previously required a 4 GiB workspace."""
+        from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+        seqlen_q = 4096
+        seqlen_k = 32768
+        page_size = 128
+        head_dim = 512
+        pages_per_seq = seqlen_k // page_size
+        num_pages = batch_size * pages_per_seq
+        torch.manual_seed(0)
+
+        q = torch.randn(
+            batch_size * seqlen_q,
+            nheads_q,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        k_cache = torch.randn(
+            num_pages,
+            page_size,
+            nheads_kv,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        v_cache = torch.randn_like(k_cache)
+        page_table = torch.arange(num_pages, device=device, dtype=torch.int32).reshape(
+            batch_size, pages_per_seq
+        )
+        cache_seqlens = torch.full(
+            (batch_size,), seqlen_k, device=device, dtype=torch.int32
+        )
+        cu_seqlens_q = torch.arange(
+            0,
+            batch_size * seqlen_q + 1,
+            seqlen_q,
+            device=device,
+            dtype=torch.int32,
+        )
+
+        out = flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=cache_seqlens,
+            page_table=page_table,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=seqlen_q,
+            causal=True,
+        )
+        torch.xpu.synchronize()
+        assert out.shape == (batch_size * seqlen_q, nheads_q, head_dim)
+        assert out.dtype == torch.bfloat16
+        assert torch.isfinite(out).all()
 
 
 @pytest.mark.skipif(device.type != "xpu", reason="XPU not available")

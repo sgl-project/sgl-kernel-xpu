@@ -92,6 +92,9 @@ def build_tree_kernel_efficient(
         request.
     ``QLEN_ONLY_BITPACKING`` is not implemented on XPU.
     """
+    if tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
+        raise NotImplementedError("QLEN_ONLY_BITPACKING is not implemented on XPU")
+
     torch.ops.sgl_kernel.build_tree_kernel_efficient.default(
         parent_list,
         selected_index,

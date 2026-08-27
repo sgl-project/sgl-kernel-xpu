@@ -5,15 +5,18 @@
 # registered as torch ops (guarded by matching macros in torch_extension_sycl.cc).
 #   USE_MOE  -> MoE kernels
 #   USE_FMHA -> flash attention (fwd / mha_fwd)
+#   USE_GDN  -> Gated DeltaNet attention kernels
 #   USE_MLA  -> MLA decode/prefill/sparse-decode kernels
+#   USE_MLA_SPARSE_FUSED -> fused (single-pass) sparse-MLA-decode kernel (optimization track)
 #
-# All default to ON. Each toggle can be set either as a CMake option
+# Defaults are set in the option() declarations below. Each toggle can be set either as a CMake option
 # (-DUSE_MOE=OFF) or, for convenience with `pip install`, via an environment
 # variable of the same name (e.g. `USE_MOE=OFF pip install -v .` or
 # `USE_MOE=0 pip install -v .`). Both `OFF` and `0` (case-insensitive) disable a
 # feature; the environment variable takes precedence when set.
 option(USE_MOE "Build MoE kernels" ON)
 option(USE_FMHA "Build flash attention kernels" ON)
+option(USE_GDN "Build Gated DeltaNet attention kernels" ON)
 option(USE_MLA "Build MLA kernels" ON)
 # The fused (single-pass) sparse-MLA-decode kernel is the optimization track; the
 # 2-stage kernel is the shipping runtime default. Building the fused variant is
@@ -22,7 +25,7 @@ option(USE_MLA "Build MLA kernels" ON)
 # launchers are never referenced.
 option(USE_MLA_SPARSE_FUSED "Build the fused (single-pass) sparse MLA decode kernel (optimization track)" OFF)
 
-foreach(_toggle USE_MOE USE_FMHA USE_MLA USE_MLA_SPARSE_FUSED)
+foreach(_toggle USE_MOE USE_FMHA USE_MLA USE_MLA_SPARSE_FUSED USE_GDN)
     if(DEFINED ENV{${_toggle}} AND NOT "$ENV{${_toggle}}" STREQUAL "")
         if("$ENV{${_toggle}}")
             set(${_toggle} ON)
@@ -34,6 +37,7 @@ endforeach()
 
 message(STATUS "USE_MOE=${USE_MOE}")
 message(STATUS "USE_FMHA=${USE_FMHA}")
+message(STATUS "USE_GDN=${USE_GDN}")
 message(STATUS "USE_MLA=${USE_MLA}")
 message(STATUS "USE_MLA_SPARSE_FUSED=${USE_MLA_SPARSE_FUSED}")
 
@@ -42,6 +46,9 @@ if(USE_MOE)
 endif()
 if(USE_FMHA)
     add_compile_definitions(USE_FMHA)
+endif()
+if(USE_GDN)
+    add_compile_definitions(USE_GDN)
 endif()
 if(USE_MLA)
     add_compile_definitions(USE_MLA)
@@ -64,8 +71,10 @@ file(GLOB host_cpp "./*.cpp" "./*.cc")
 # keep them out of the build.
 if(NOT USE_FMHA)
     list(FILTER device_cpp EXCLUDE REGEX "/flash_attention\\.cpp$")
-    # GDN (Gated DeltaNet) attention shares the USE_FMHA toggle to skip its heavy Xe20 build.
+endif()
+if(NOT USE_GDN)
     list(FILTER device_cpp EXCLUDE REGEX "/gdn_attention_Xe20\\.cpp$")
+    list(FILTER device_cpp EXCLUDE REGEX "/gdn_attn_workspace\\.cpp$")
 endif()
 if(NOT USE_MLA)
     list(FILTER device_cpp EXCLUDE REGEX "/mla_(decode|prefill|sparse_decode)\\.cpp$")
@@ -96,6 +105,8 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/QKVLoraBFwdXe20.cmake)
 if(USE_FMHA)
     include(FMHADecodeXe20.cmake)
     include(FMHAPrefillXe20.cmake)
+endif()
+if(USE_GDN)
     include(GdnAttnXe20.cmake)
 endif()
 if(USE_MLA)

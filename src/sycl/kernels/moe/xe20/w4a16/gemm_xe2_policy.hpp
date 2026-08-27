@@ -59,14 +59,14 @@ class xe_gemm_policy_base {
 // select_w4a16_tile_m() in GroupGemmW4A16Xe20.cpp.
 
 // avg_m <= 4
-class w4a16_policy_m_8 : public xe_gemm_policy_base {
+class w4a16_policy_m_8_n_64 : public xe_gemm_policy_base {
  public:
   using WGTile = Shape<_8, _64, _32>;
   using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
 };
 
 // avg_m <= 8
-class w4a16_policy_m_16 : public xe_gemm_policy_base {
+class w4a16_policy_m_16_n_64 : public xe_gemm_policy_base {
  public:
   using WGTile = Shape<_16, _64, _32>;
   using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
@@ -74,7 +74,7 @@ class w4a16_policy_m_16 : public xe_gemm_policy_base {
 
 // Small avg_m: the 64-wide N tile beats a 256-wide one at this M (the wide-N
 // variant measures ~35 TFLOP/s against this one's ~49).
-class w4a16_policy_m_32 : public xe_gemm_policy_base {
+class w4a16_policy_m_32_n_64 : public xe_gemm_policy_base {
  public:
   using WGTile = Shape<_32, _64, _32>;
   using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;

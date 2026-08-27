@@ -84,9 +84,9 @@ void w4a16_launch(
   DECLARE_W4A16_EXTERN(Policy, uint8_t, cutlass::bfloat16_t)             \
   DECLARE_W4A16_EXTERN(Policy, uint8_t, cutlass::half_t)
 
-DECLARE_W4A16_POLICY(w4a16_policy_m_8)
-DECLARE_W4A16_POLICY(w4a16_policy_m_16)
-DECLARE_W4A16_POLICY(w4a16_policy_m_32)
+DECLARE_W4A16_POLICY(w4a16_policy_m_8_n_64)
+DECLARE_W4A16_POLICY(w4a16_policy_m_16_n_64)
+DECLARE_W4A16_POLICY(w4a16_policy_m_32_n_64)
 DECLARE_W4A16_POLICY(w4a16_policy_m_64_n_128)
 DECLARE_W4A16_POLICY(w4a16_policy_m_128_n_128)
 
@@ -132,6 +132,16 @@ int select_w4a16_tile_m(int avg_m, int gemm_n) {
     }
   }
   return best_tile_m;
+}
+
+int select_w4a16_policy_id(int avg_m, int gemm_n) {
+  if (avg_m <= 4) return 0;
+  if (avg_m <= 8) return 1;
+
+  const int tile_m = select_w4a16_tile_m(avg_m, gemm_n);
+  if (tile_m <= 32) return 2;
+  if (tile_m <= 64) return 3;
+  return 4;
 }
 
 }  // namespace
@@ -240,7 +250,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
   at::Tensor atomic_buffer = at::empty({static_cast<long>(1)}, activations.options().dtype(at::kInt));
 
   const int avg_m = total_m / static_cast<int>(n_experts);
-  const int tile_m = select_w4a16_tile_m(avg_m, gemm_n);
+  const int policy_id = select_w4a16_policy_id(avg_m, gemm_n);
   const bool is_fp16_act = activations.scalar_type() == at::ScalarType::Half;
 #define LAUNCH_W4A16(Policy)                                                                  \
   do {                                                                                        \
@@ -311,19 +321,25 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
     }                                                                                         \
   } while (0)
 
-#define DISPATCH_W4A16_POLICY()               \
-  do {                                        \
-    if (avg_m <= 4) {                         \
-      LAUNCH_W4A16(w4a16_policy_m_8);         \
-    } else if (avg_m <= 8) {                  \
-      LAUNCH_W4A16(w4a16_policy_m_16);        \
-    } else if (tile_m <= 32) {                \
-      LAUNCH_W4A16(w4a16_policy_m_32);        \
-    } else if (tile_m <= 64) {                \
-      LAUNCH_W4A16(w4a16_policy_m_64_n_128);  \
-    } else {                                  \
-      LAUNCH_W4A16(w4a16_policy_m_128_n_128); \
-    }                                         \
+#define DISPATCH_W4A16_POLICY()                 \
+  do {                                          \
+    switch (policy_id) {                        \
+      case 0:                                   \
+        LAUNCH_W4A16(w4a16_policy_m_8_n_64);    \
+        break;                                  \
+      case 1:                                   \
+        LAUNCH_W4A16(w4a16_policy_m_16_n_64);   \
+        break;                                  \
+      case 2:                                   \
+        LAUNCH_W4A16(w4a16_policy_m_32_n_64);   \
+        break;                                  \
+      case 3:                                   \
+        LAUNCH_W4A16(w4a16_policy_m_64_n_128);  \
+        break;                                  \
+      case 4:                                   \
+        LAUNCH_W4A16(w4a16_policy_m_128_n_128); \
+        break;                                  \
+    }                                           \
   } while (0)
 
 #ifdef USE_MOE_JIT
@@ -331,7 +347,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
     std::string jit_err;
     TORCH_CHECK(
         sgl::moe_jit::w4a16_grouped_gemm_launch(
-            avg_m,
+            policy_id,
             is_int4,
             is_fp16_act,
             &queue,

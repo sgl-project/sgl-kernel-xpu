@@ -85,6 +85,7 @@ jobs:
           docker exec -w /root/sglang ci_sglkernel_xpu \
             /bin/bash -c "\
               set -eo pipefail
+              export PYTHONPATH=/root/sglang/python
               /miniforge3/envs/py3.10/bin/python3 -m pip install tabulate
               cd /root/sglang/sgl-kernel-xpu/benchmark
               python3 bench_flash_attn.py 2>&1 | tee flash.log

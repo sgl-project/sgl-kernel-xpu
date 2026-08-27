@@ -1,8 +1,8 @@
 """Benchmark build_tree_kernel_efficient (EAGLE draft-tree metadata) on XPU.
 
-Compares the SYCL kernel against the upstream Triton kernel, which is vendored
-below verbatim from sglang/kernels/ops/speculative/spec_tree.py so the baseline
-is exactly what the XPU path runs today (eagle_utils dispatches _is_xpu ->
+Compares the SYCL kernel against the upstream Triton kernel (sgl_kernel.eagle_utils,
+ported from sglang/kernels/ops/speculative/spec_tree.py) so the baseline is
+exactly what the XPU path runs today (eagle_utils dispatches _is_xpu ->
 sgl_build_tree_kernel_triton).
 
 The Triton baseline times its cumsum too: the Triton kernel takes
@@ -19,157 +19,8 @@ import itertools
 import pandas as pd
 import torch
 import triton
-import triton.language as tl
 from sgl_kernel import TreeMaskMode, build_tree_kernel_efficient
-
-
-# ---------------------------------------------------------------------------
-# Upstream Triton kernel (vendored; sgl-project/sglang spec_tree.py)
-# ---------------------------------------------------------------------------
-@triton.jit
-def sgl_build_tree_kernel_efficient_triton(
-    parent_list_ptr,
-    selected_index_ptr,
-    verified_seq_len_ptr,
-    seq_len_prefix_sum_ptr,
-    tree_mask_ptr,
-    positions_ptr,
-    retrieve_index_ptr,
-    retrieve_next_token_ptr,
-    retrieve_next_sibling_ptr,
-    topk: tl.constexpr,
-    depth: tl.constexpr,
-    draft_token_num: tl.constexpr,
-    tree_mask_mode: tl.constexpr,
-    batch_size: tl.constexpr,
-    parent_list_stride: tl.constexpr,
-    selected_index_stride: tl.constexpr,
-):
-    batch_idx = tl.program_id(0)
-
-    seq_len = tl.load(verified_seq_len_ptr + batch_idx)
-    seq_len_prefix_sum = tl.load(seq_len_prefix_sum_ptr + batch_idx)
-
-    seq_tree_idx = (
-        tl.cast(draft_token_num * draft_token_num * batch_idx, seq_len.dtype)
-        + seq_len_prefix_sum * draft_token_num
-    )
-
-    positions_offset = batch_idx * draft_token_num
-    tl.store(positions_ptr + positions_offset, seq_len)
-
-    retrieve_index_offset = batch_idx * draft_token_num
-
-    for i in range(draft_token_num - 1, 0, -1):
-        current_token_idx = retrieve_index_offset + i
-        tl.store(
-            retrieve_index_ptr + batch_idx * draft_token_num + i,
-            current_token_idx,
-        )
-
-        parent_tb_idx = (
-            tl.load(selected_index_ptr + batch_idx * selected_index_stride + (i - 1))
-            // topk
-        )
-        parent_position = 0
-        found = 0
-
-        if parent_tb_idx == 0:
-            found = 1
-        else:
-            parent_token_idx = tl.load(
-                parent_list_ptr + batch_idx * parent_list_stride + parent_tb_idx
-            )
-
-            for pp in range(draft_token_num - 1):
-                if found == 0:
-                    sel_idx = tl.load(
-                        selected_index_ptr + batch_idx * selected_index_stride + pp
-                    )
-                    if sel_idx == parent_token_idx:
-                        parent_position = pp + 1
-                        found = 1
-
-        if found == 1:
-            next_tok_addr = (
-                retrieve_next_token_ptr + batch_idx * draft_token_num + parent_position
-            )
-            next_tok = tl.load(next_tok_addr)
-
-            if next_tok == -1:
-                tl.store(next_tok_addr, i)
-            else:
-                tl.store(next_tok_addr, i)
-                tl.store(
-                    retrieve_next_sibling_ptr + batch_idx * draft_token_num + i,
-                    next_tok,
-                )
-
-    tl.store(retrieve_index_ptr + batch_idx * draft_token_num, retrieve_index_offset)
-
-    for draft_tokenx in range(draft_token_num):
-        if tree_mask_mode == 0:  # FULL_MASK
-            token_tree_idx = (
-                seq_tree_idx + (seq_len + draft_token_num) * draft_tokenx + seq_len + 1
-            )
-        else:
-            token_tree_idx = (
-                draft_token_num * draft_token_num * batch_idx
-                + draft_token_num * draft_tokenx
-                + 1
-            )
-
-        tl.store(tree_mask_ptr + token_tree_idx - 1, 1)
-        for i in range(draft_token_num - 1):
-            tl.store(tree_mask_ptr + token_tree_idx + i, 0)
-
-        if draft_tokenx > 0:
-            cur_position = draft_tokenx - 1
-            position = 0
-            should_continue = 1
-
-            for _ in range(depth):
-                if should_continue:
-                    position += 1
-                    tl.store(tree_mask_ptr + token_tree_idx + cur_position, 1)
-
-                    parent_tb_idx = (
-                        tl.load(
-                            selected_index_ptr
-                            + batch_idx * selected_index_stride
-                            + cur_position
-                        )
-                        // topk
-                    )
-                    if parent_tb_idx == 0:
-                        should_continue = 0
-                    else:
-                        parent_token_idx = tl.load(
-                            parent_list_ptr
-                            + batch_idx * parent_list_stride
-                            + parent_tb_idx
-                        )
-
-                        found = 0
-                        for cp in range(draft_token_num - 1):
-                            if found == 0:
-                                if (
-                                    tl.load(
-                                        selected_index_ptr
-                                        + batch_idx * selected_index_stride
-                                        + cp
-                                    )
-                                    == parent_token_idx
-                                ):
-                                    cur_position = cp
-                                    found = 1
-                        if found == 0:
-                            should_continue = 0
-
-            tl.store(
-                positions_ptr + batch_idx * draft_token_num + draft_tokenx,
-                position + seq_len,
-            )
+from sgl_kernel.eagle_utils import sgl_build_tree_kernel_triton
 
 
 def run_triton(
@@ -183,28 +34,19 @@ def run_triton(
     mode,
 ):
     tree_mask, positions, r_index, r_next_token, r_next_sibling = bufs
-    batch_size = seq_lens.shape[0]
-    # Part of the Triton path's cost: the kernel consumes the prefix sum.
-    seq_len_prefix_sum = torch.cumsum(seq_lens, dim=0) - seq_lens
-    sgl_build_tree_kernel_efficient_triton[(batch_size,)](
+    sgl_build_tree_kernel_triton(
         parent_list,
         selected_index,
         seq_lens,
-        seq_len_prefix_sum,
         tree_mask,
         positions,
         r_index,
         r_next_token,
         r_next_sibling,
-        topk=topk,
-        depth=depth,
-        draft_token_num=draft_token_num,
-        tree_mask_mode=int(mode),
-        batch_size=batch_size,
-        parent_list_stride=(
-            parent_list.stride(0) if parent_list.dim() > 1 else parent_list.shape[0]
-        ),
-        selected_index_stride=selected_index.stride(0),
+        topk,
+        depth,
+        draft_token_num,
+        mode,
     )
 
 

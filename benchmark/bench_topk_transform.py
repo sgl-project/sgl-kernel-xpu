@@ -360,9 +360,10 @@ def benchmark_topk_transform_paged(bs, topk, seq_len, page_size, provider):
         .contiguous()
     )
     out_page = torch.full((bs, topk), -1, dtype=torch.int32, device="xpu")
+    metadata = torch.empty((0,), dtype=torch.int32, device="cpu")
 
     fn = lambda: topk_transform_paged(
-        score, lengths, page_table, out_page, page_size, None
+        score, lengths, page_table, out_page, page_size, metadata
     )
 
     for _ in range(5):

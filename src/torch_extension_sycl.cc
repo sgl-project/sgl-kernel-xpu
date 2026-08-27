@@ -532,7 +532,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From GDN (Gated DeltaNet) attention (Intel Xe2)
    */
-#ifdef USE_FMHA
+#ifdef USE_GDN
   m.def(
       "gdn_attention(Tensor! core_attn_out, Tensor! z, Tensor projected_states_qkvz, Tensor projected_states_ba, "
       "int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim, "
@@ -550,7 +550,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "ScalarType dtype) -> int");
   m.impl(
       "gdn_attention_workspace_bytes_needed", c10::DispatchKey::BackendSelect, &gdn_attention_workspace_bytes_needed);
-#endif  // USE_FMHA
+#endif  // USE_GDN
 
   /*
    * Mamba causal conv1d (XPU)
@@ -607,6 +607,23 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor out_loc, Tensor! kvcache, bool is_decode, int compress_ratio, int page_size, bool use_fp4, "
       "int preshuffle_size=0, bool use_bf16_store=False) -> ()");
   m.impl("fused_norm_rope_store", torch::kXPU, &at::native::xpu::fused_norm_rope_store);
+
+  /*
+   * HiSparse hierarchical sparse KV cache kernels
+   */
+  m.def(
+      "transfer_cache_dsv4_mla(Tensor src_ptrs, Tensor(a!) dst_ptrs, "
+      "Tensor src_indices, Tensor dst_indices, int block_size) -> ()");
+  m.impl("transfer_cache_dsv4_mla", torch::kXPU, &transfer_cache_dsv4_mla);
+
+  m.def(
+      "load_cache_to_device_buffer_mla(Tensor top_k_tokens, Tensor(a!) device_buffer_tokens, "
+      "Tensor host_cache_locs, Tensor device_buffer_locs, Tensor host_cache, "
+      "Tensor(b!) device_buffer, Tensor(c!) top_k_device_locs, Tensor req_pool_indices, "
+      "Tensor seq_lens, Tensor(d!) lru_slots, Tensor? num_real_reqs, int item_size_bytes, "
+      "int num_top_k, int hot_buffer_size, int page_size, int block_size, "
+      "bool is_dsv4_layout) -> ()");
+  m.impl("load_cache_to_device_buffer_mla", torch::kXPU, &load_cache_to_device_buffer_mla);
 }
 
 REGISTER_EXTENSION(common_ops)

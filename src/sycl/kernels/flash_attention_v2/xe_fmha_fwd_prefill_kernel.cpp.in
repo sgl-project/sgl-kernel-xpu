@@ -36,6 +36,7 @@
 #define FMHA_PREFILL_ENABLE_SCORE_BLOCK2D 1
 #endif
 
+#include "sycl/kernels/flash_attention_v2/fmha_tile_dispatch.h"
 #include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_runner.hpp"
 
 namespace prefill {
@@ -44,14 +45,13 @@ template <>
 __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_TYPE@>::operator()(const Arguments& params) const {
   bool use_sink = (params.softmax_sink_ptr != nullptr);
 
-  using TileShapeQK = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_KV@>, cute::_32>;
-  using TileShapePV = cute::Shape<cute::Int<@TILED_Q@>, cute::_32, cute::Int<@TILED_KV@>>;
-  // Use the configured output tile head extent. CMake sets @TILED_OUT@ to a
-  // default rounded head size, and may override specific head dims (e.g. 512)
-  // to improve occupancy by splitting the output tile across V.
-  using TileShapeOutput = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_OUT@>>;
+  constexpr auto kTile = sgl::fmha::prefill_paged_tile(@HEAD_DIM@);
+  using TileShapeQK = cute::Shape<cute::Int<kTile.tiled_q>, cute::Int<kTile.tiled_kv>, cute::_32>;
+  using TileShapePV = cute::Shape<cute::Int<kTile.tiled_q>, cute::_32, cute::Int<kTile.tiled_kv>>;
+  // Output-tile head extent from the shared tile table (512 chunks the head).
+  using TileShapeOutput = cute::Shape<cute::Int<kTile.tiled_q>, cute::Int<sgl::fmha::prefill_tiled_out(@HEAD_DIM@)>>;
   using SubgroupLayoutQK =
-      cute::Layout<cute::Shape<cute::Int<@NUM_SG@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+      cute::Layout<cute::Shape<cute::Int<kTile.num_sg>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
 
   // softmax_lse output is only threaded as a template constexpr for the base
   // (non-causal / non-local / non-sink) configuration, matching the paged
@@ -138,3 +138,10 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
 template struct FmhaPrefillRunner<@HEAD_DIM@, @ELEM_TYPE@>;
 
 }  // namespace prefill
+
+#ifdef SGL_FMHA_JIT_ENTRY
+extern "C" __attribute__((visibility("default"))) void sgl_fmha_entry(const void* params) {
+  prefill::FmhaPrefillRunner<@HEAD_DIM@, @ELEM_TYPE@>{}(
+      *static_cast<const prefill::Arguments*>(params));
+}
+#endif

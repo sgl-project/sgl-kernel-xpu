@@ -177,6 +177,10 @@ class XeFMHAFwdKernel {
     // (num_heads_q, total_q). Null => don't write.
     float* softmax_lse = nullptr;
     int64_t lse_head_stride = 0;  // = total_q
+    // ScoreBlock2D processes this contiguous Q-tile interval. Non-score paths
+    // leave q_tile_count at -1 and use the complete Q extent.
+    int q_tile_start = 0;
+    int q_tile_count = -1;
   };
   using KernelParams = KernelArguments;
 
@@ -224,11 +228,17 @@ class XeFMHAFwdKernel {
         args.kernel.scale_k_ptr,
         args.kernel.scale_v_ptr,
         args.kernel.softmax_lse,
-        args.kernel.lse_head_stride};
+        args.kernel.lse_head_stride,
+        args.kernel.q_tile_start,
+        args.kernel.q_tile_count};
     auto scheduler_params =
         TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{}, sched_num_kv_splits);
     if constexpr (CollectiveMainloop::ScoreBlock2D && StaticScoreMode_ >= 0) {
       scheduler_params.grid.x = 1;
+      scheduler_params.q_tile_start = args.kernel.q_tile_start;
+      if (args.kernel.q_tile_count > 0) {
+        scheduler_params.grid.y = args.kernel.q_tile_count;
+      }
     }
     return {
         kernel_params,
@@ -253,7 +263,9 @@ class XeFMHAFwdKernel {
         score_k_extent = size_t(args.kernel.shape.seq_len_kv_cache);
       }
       const size_t score_rows_per_wg = size_t(get<0>(TileShapeQK{}));
-      const size_t q_tiles = cute::ceil_div(score_q_extent, score_rows_per_wg);
+      const size_t total_q_tiles = cute::ceil_div(score_q_extent, score_rows_per_wg);
+      const size_t q_tiles =
+          args.kernel.q_tile_count > 0 ? cute::min(total_q_tiles, size_t(args.kernel.q_tile_count)) : total_q_tiles;
       score_k_extent = cute::round_up(score_k_extent, size_t(get<1>(TileShapeQK{})));
       return size_t(args.kernel.shape.batch) * size_t(args.kernel.shape.num_heads_q) * q_tiles * score_rows_per_wg *
              score_k_extent * sizeof(typename CollectiveMainloop::ElementScoreStore);
@@ -398,18 +410,18 @@ class XeFMHAFwdKernel {
       if constexpr (is_var_len) {
         auto qo_cumulative = s.seq_len_qo.cumulative_length;
         auto kv_cumulative = s.seq_len_kv.cumulative_length;
-        offset_q = s.num_heads_q * s.head_size_qk * qo_cumulative[idx_b];
+        offset_q = get<0>(p.dQ) * qo_cumulative[idx_b];
         // offset_k = s.num_heads_kv * s.head_size_qk * kv_cumulative[idx_b];
         // offset_v = s.num_heads_kv * s.head_size_vo * kv_cumulative[idx_b];
-        offset_o = s.num_heads_q * s.head_size_vo * qo_cumulative[idx_b];
+        offset_o = get<0>(p.dO) * qo_cumulative[idx_b];
         if (s.seq_len_kv_cache.cumulative_length) {
           auto kv_cumulative_cache = s.seq_len_kv_cache.cumulative_length;
           // Non-paged KV stores all batches in one contiguous ragged buffer, so each
           // batch starts at its cumulative KV offset. Paged KV uses the page table for
           // absolute addressing, so no base offset is applied here.
           if constexpr (!CollectiveMainloop::PagedKV) {
-            offset_k_cache = s.num_heads_kv * s.head_size_qk * kv_cumulative_cache[idx_b];
-            offset_v_cache = s.num_heads_kv * s.head_size_vo * kv_cumulative_cache[idx_b];
+            offset_k_cache = get<0>(p.dK_cache) * kv_cumulative_cache[idx_b];
+            offset_v_cache = get<1>(p.dV_cache) * kv_cumulative_cache[idx_b];
           }
         }
       }
@@ -433,12 +445,32 @@ class XeFMHAFwdKernel {
       auto dcV_cache = const_cast<ElementV*>(p.V_cache + offset_v_cache);
       auto dcO = const_cast<ElementO*>(p.O + offset_o);
       // NHD layout for GQA
-      auto layout_q = is_var_len ? make_ordered_layout(shape_Q, VarLenQLayoutStep_{}) : make_layout(shape_Q, p.dQ);
-      auto layout_k = is_var_len ? make_ordered_layout(shape_K, VarLenKLayoutStep_{}) : make_layout(shape_K, p.dK);
-      auto layout_v = is_var_len ? make_ordered_layout(shape_V, VarLenVLayoutStep_{}) : make_layout(shape_V, p.dV);
+      auto layout_q = [&] {
+        if constexpr (is_var_len && !CollectiveMainloop::ScoreBlock2D) {
+          return make_ordered_layout(shape_Q, VarLenQLayoutStep_{});
+        }
+        return make_layout(shape_Q, p.dQ);
+      }();
+      auto layout_k = [&] {
+        if constexpr (is_var_len && !CollectiveMainloop::ScoreBlock2D) {
+          return make_ordered_layout(shape_K, VarLenKLayoutStep_{});
+        }
+        return make_layout(shape_K, p.dK);
+      }();
+      auto layout_v = [&] {
+        if constexpr (is_var_len && !CollectiveMainloop::ScoreBlock2D) {
+          return make_ordered_layout(shape_V, VarLenVLayoutStep_{});
+        }
+        return make_layout(shape_V, p.dV);
+      }();
 
       // NHD layout for GQA
-      auto layout_o = is_var_len ? make_ordered_layout(shape_O, VarLenOLayoutStep_{}) : make_layout(shape_O, p.dO);
+      auto layout_o = [&] {
+        if constexpr (is_var_len && !CollectiveMainloop::ScoreBlock2D) {
+          return make_ordered_layout(shape_O, VarLenOLayoutStep_{});
+        }
+        return make_layout(shape_O, p.dO);
+      }();
 
       Tensor Q = make_tensor(make_gmem_ptr(dcQ), layout_q);
       Tensor K_cache = make_tensor(make_gmem_ptr(dcK_cache), layout_k);
@@ -473,8 +505,10 @@ class XeFMHAFwdKernel {
         score_k_extent = cute::round_up(score_k_extent, int(get<1>(TileShapeQK{})));
         score_region_cols = score_k_extent;
         score_pf_q_ok = score_q_extent >= cutlass::fmha::ScoreBlock2DPolicy::ScorePrefetchQMin;
-        const int q_tiles = cute::ceil_div(score_q_extent, int(get<0>(TileShapeQK{})));
-        const size_t wg_slot = (size_t(score_batch) * s.num_heads_q + q_head_idx) * q_tiles + size_t(blk_q);
+        const int total_q_tiles = cute::ceil_div(score_q_extent, int(get<0>(TileShapeQK{})));
+        const int q_tiles = p.q_tile_count > 0 ? cute::min(total_q_tiles, p.q_tile_count) : total_q_tiles;
+        const int q_tile_slot = blk_q - p.q_tile_start;
+        const size_t wg_slot = (size_t(score_batch) * s.num_heads_q + q_head_idx) * q_tiles + size_t(q_tile_slot);
         score_head_ptr = params.mainloop.ptr_score + wg_slot * size_t(get<0>(TileShapeQK{})) * size_t(score_k_extent);
       }
 #endif

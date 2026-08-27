@@ -17,6 +17,9 @@
 #include "sgl_kernel_export.h"
 #include "sycl/kernels/mla_sparse/device/mla_sparse_decode_dispatch.hpp"
 #include "sycl/kernels/mla_sparse/device/mla_sparse_decode_types.hpp"
+#ifdef USE_MLA_JIT
+#include "jit/mla_jit.h"
+#endif
 
 // Compile-time toggle for the two-stage sparse MLA decode path (gather+dequant to
 // HBM, then dense flash-decode). The selector macro
@@ -191,6 +194,39 @@ SGL_KERNEL_EXPORT void flash_mla_sparse_decode(
       "Unsupported input data type for Sparse MLA decode");
   TORCH_CHECK(head_dim_v == 512, "head_dim_v must be 512 for DeepSeek V4 MLA");
 
+// The JIT path only covers the 2-stage template (the fused template has no
+// SGL_MLA_JIT_ENTRY). When the fused path is selected
+// (SGLANG_USE_SPARSE_MLA_2STAGE=0), fall through to the AOT dispatch below so
+// the compile-time A/B toggle stays authoritative on both paths.
+#if defined(USE_MLA_JIT) && SGLANG_USE_SPARSE_MLA_2STAGE
+  {
+    const int d_qk = static_cast<int>(q.size(3));
+    const int b_h = mla_sparse_decode::sparse_mla_decode_select_b_h(q.size(2));
+    std::string jit_err;
+    TORCH_CHECK(
+        sgl::mla_jit::sparse_decode_launch(
+            in_dtype == at::ScalarType::Half,
+            d_qk,
+            b_h,
+            attn_sink.has_value(),
+            &out,
+            &lse_out,
+            &q,
+            &k_cache,
+            &indices,
+            &topk_length,
+            &extra_k_cache,
+            &extra_indices,
+            &extra_topk_length,
+            &attn_sink,
+            sm_scale,
+            head_dim_v,
+            is_fp8_kvcache,
+            jit_arch_code(),
+            &jit_err),
+        jit_err);
+  }
+#else
 #if SGLANG_USE_SPARSE_MLA_2STAGE
   DISPATCH_MLA_SPARSE_DTYPE_2STAGE();
 #else
@@ -199,6 +235,7 @@ SGL_KERNEL_EXPORT void flash_mla_sparse_decode(
     "Fused sparse MLA decode selected (SGLANG_USE_SPARSE_MLA_2STAGE=0) but the fused kernel was not built. Reconfigure with -DUSE_MLA_SPARSE_FUSED=ON (or USE_MLA_SPARSE_FUSED=1)."
 #endif
   DISPATCH_MLA_SPARSE_DTYPE();
+#endif
 #endif
 }
 

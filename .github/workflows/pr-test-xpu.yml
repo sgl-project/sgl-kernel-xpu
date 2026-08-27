@@ -45,7 +45,7 @@ jobs:
             /bin/bash -c '\
               set -exo pipefail && \
               . /miniforge3/bin/activate && \
-              conda activate py3.10 && \
+              conda activate py3.12 && \
               cd /root/sglang/sgl-kernel-xpu && \
               git remote set-url origin https://github.com/sgl-project/sgl-kernel-xpu.git && \
               git fetch --depth=1 origin "${PR_MERGE_REF}" && \
@@ -64,16 +64,16 @@ jobs:
       - name: Install Dependency
         timeout-minutes: 20
         run: |
-          docker exec ci_sglkernel_xpu /miniforge3/envs/py3.10/bin/python3 -m pip install --upgrade pip
-          docker exec ci_sglkernel_xpu /miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub
-          docker exec ci_sglkernel_xpu /bin/bash -c '/miniforge3/envs/py3.10/bin/hf auth login --token ${HF_TOKEN} '
-          docker exec ci_sglkernel_xpu /bin/bash -c "ln -sf /miniforge3/envs/py3.10/bin/python3 /usr/bin/python3"
+          docker exec ci_sglkernel_xpu /miniforge3/envs/py3.12/bin/python3 -m pip install --upgrade pip
+          docker exec ci_sglkernel_xpu /miniforge3/envs/py3.12/bin/python3 -m pip install pytest expecttest ray huggingface_hub
+          docker exec ci_sglkernel_xpu /bin/bash -c '/miniforge3/envs/py3.12/bin/hf auth login --token ${HF_TOKEN} '
+          docker exec ci_sglkernel_xpu /bin/bash -c "ln -sf /miniforge3/envs/py3.12/bin/python3 /usr/bin/python3"
 
       - name: Run Sglang Kernel Cases
         timeout-minutes: 70
         run: |
           docker exec -w /root/sglang ci_sglkernel_xpu \
-            /bin/bash -c "cd /root/sglang/sgl-kernel-xpu/tests && /miniforge3/envs/py3.10/bin/python3 -m pip install scipy && \
+            /bin/bash -c "cd /root/sglang/sgl-kernel-xpu/tests && /miniforge3/envs/py3.12/bin/python3 -m pip install scipy && \
                           python3 run_suite.py --suite per-commit "
 
       - name: Run Sglang Kernel Benchmarks

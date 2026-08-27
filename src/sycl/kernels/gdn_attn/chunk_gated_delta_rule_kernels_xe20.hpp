@@ -62,6 +62,7 @@ CUTE_DEVICE void chunk_prepare_kernel(
     const float* a,
     const float* A_log,
     const T* dt_bias,
+    int* total_chunks,
     const int* query_start_loc,
     const int total_virtual_seqlen,
     const int batch_size,
@@ -129,6 +130,7 @@ CUTE_DEVICE void chunk_prepare_kernel(
     }
     pre_chunks = cumsum_chunks;
   }
+  *total_chunks = pre_chunks;
 }
 
 // Each workgroup is responsible for one (chunk, v_head) pair
@@ -141,6 +143,7 @@ CUTE_DEVICE void chunk_compute_A_kernel(
     const float* b,
     const float* a,
     const int* query_start_loc,
+    const int* total_chunks,
     const int total_virtual_seqlen,
     const int batch_size,
     const int num_k_heads,
@@ -156,14 +159,7 @@ CUTE_DEVICE void chunk_compute_A_kernel(
   auto sg = item.get_sub_group();
   int sg_local_id = sg.get_local_linear_id();
 
-  // The grid is over-provisioned (see kernel_launcher), so out-of-range
-  // workgroups exit without touching any memory.
-  int total_chunks = 0;
-  for (int b = 0; b < batch_size; ++b) {
-    const int seq_len = query_start_loc[b + 1] - query_start_loc[b];
-    total_chunks += div_up(seq_len, chunk_size);
-  }
-  if (flat_chunk_id >= total_chunks) {
+  if (flat_chunk_id >= *total_chunks) {
     return;
   }
 
@@ -193,6 +189,7 @@ CUTE_DEVICE void chunk_compute_A_kernel(
   const int kv_ratio = num_v_heads / num_k_heads;
   const int chunk_start_offset = flat_chunk_id * chunk_size;
 
+  // load a to slm. a.shape = [v_head_num, total_virtual_seqlen]
   CUTE_UNROLL
   for (int e = local_id; e < chunk_size; e += local_range) {
     g_slm_ptr[e] = a[(chunk_start_offset + e) + v_head_id * total_virtual_seqlen];
@@ -200,12 +197,14 @@ CUTE_DEVICE void chunk_compute_A_kernel(
 
   item.barrier(sycl::access::fence_space::local_space);
 
+  // k.shape = [total_virtual_seqlen, num_k_heads, head_k_dim]
   auto k_ptr =
       k + static_cast<int64_t>(chunk_start_offset) * num_k_heads * head_k_dim + (v_head_id / kv_ratio) * head_k_dim;
   auto K_tensor_shape = make_shape(chunk_size, head_k_dim);
   auto K_tensor =
       make_tensor(make_gmem_ptr(k_ptr), make_layout(K_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
 
+  // A is the output. A.shape = [num_v_heads, total_virtual_seqlen, chunk_size]
   auto A_ptr =
       A + static_cast<int64_t>(v_head_id) * total_virtual_seqlen * chunk_size + chunk_start_offset * chunk_size;
   auto A_tensor_shape = make_shape(chunk_size, chunk_size);
@@ -1113,6 +1112,7 @@ void kernel_launcher(
     T* A,
     T* w,
     T* u,
+    int* total_chunks,
     const float* b,
     const float* a,
     const float* A_log,
@@ -1150,7 +1150,15 @@ void kernel_launcher(
     cgh.parallel_for<ChunkPrepareKernel<T, StateT>>(
         sycl::nd_range<3>{global_prepare * local_prepare, local_prepare}, kernel_props, [=](auto) {
           chunk_prepare_kernel<T>(
-              a, A_log, dt_bias, query_start_loc, total_virtual_seqlen, batch_size, num_v_heads, head_v_dim);
+              a,
+              A_log,
+              dt_bias,
+              total_chunks,
+              query_start_loc,
+              total_virtual_seqlen,
+              batch_size,
+              num_v_heads,
+              head_v_dim);
         });
   });
 
@@ -1182,6 +1190,7 @@ void kernel_launcher(
               b,
               a,
               query_start_loc,
+              total_chunks,
               total_virtual_seqlen,
               batch_size,
               num_k_heads,
@@ -1344,6 +1353,7 @@ void chunk_gated_delta_rule_impl_xe20(
       {num_v_heads, total_seqlen + padding_size, head_k_dim}, torch::dtype(dtype).device(device).requires_grad(false));
   torch::Tensor u = torch::zeros(
       {num_v_heads, total_seqlen + padding_size, head_v_dim}, torch::dtype(dtype).device(device).requires_grad(false));
+  torch::Tensor total_chunks = torch::zeros({1}, torch::dtype(torch::kInt32).device(device).requires_grad(false));
 
 #define KERNEL_LAUNCHER(scalar_t, state_scalar_t)                                                       \
   kernel_launcher<scalar_t, state_scalar_t>(                                                            \
@@ -1355,6 +1365,7 @@ void chunk_gated_delta_rule_impl_xe20(
       reinterpret_cast<scalar_t*>(A.data_ptr()),                                                        \
       reinterpret_cast<scalar_t*>(w.data_ptr()),                                                        \
       reinterpret_cast<scalar_t*>(u.data_ptr()),                                                        \
+      reinterpret_cast<int*>(total_chunks.data_ptr()),                                                  \
       reinterpret_cast<float*>(b.data_ptr()),                                                           \
       reinterpret_cast<float*>(a.data_ptr()),                                                           \
       reinterpret_cast<float*>(A_log.data_ptr()),                                                       \

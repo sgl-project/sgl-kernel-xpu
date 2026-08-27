@@ -217,6 +217,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("moe_grouped_mm_nt_xe20_w4a16", torch::kXPU, &moe_grouped_mm_nt_xe20_w4a16);
 
   m.def(
+      "moe_grouped_mm_nt_xe20_fp8_w8a16(Tensor! output, Tensor activations, Tensor weights, "
+      "Tensor weight_scales, Tensor? bias, Tensor total_rows_for_experts, int n_experts) -> ()");
+  m.impl("moe_grouped_mm_nt_xe20_fp8_w8a16", torch::kXPU, &moe_grouped_mm_nt_xe20_fp8_w8a16);
+
+  m.def(
       "prepare_moe_input(Tensor topk_ids, Tensor! expert_offsets, Tensor? blockscale_offsets, Tensor! problem_sizes1,"
       " Tensor! problem_sizes2, Tensor! input_permutation, Tensor! output_permutation, int num_experts, int n, int k)"
       " -> ()");

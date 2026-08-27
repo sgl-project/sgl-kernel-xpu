@@ -712,6 +712,18 @@ void moe_grouped_mm_nt_xe20_w4a16(
     bool is_int4,
     const int64_t group_size);
 
+// FP8 weight-only MoE grouped GEMM. Activations are BF16, weights are FP8
+// E4M3, and weight_scales is [E, 1]/[E, 2] for per-expert scalar scales or
+// [E, ceil(N/128), K/128] for 128x128 block scales.
+void moe_grouped_mm_nt_xe20_fp8_w8a16(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& weights,
+    const torch::Tensor& weight_scales,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts);
+
 void prepare_moe_input(
     const torch::Tensor& topk_ids,
     torch::Tensor& expert_offsets,

@@ -127,6 +127,7 @@ set(XE20_OFFLINE_COMPILER_FLAGS "${XE20_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFL
 set(SGL_XE20_BUNDLE_PREFIXES
   "GroupGemmXe20_inst_"
   "GroupGemmW4A16Xe20_inst_"
+  "GroupGemmFp8Xe20_inst_"
   "xe_fmha_fwd_decode_page_"
   "xe_fmha_fwd_decode_nopage_"
   "xe_fmha_fwd_split_decode_page_"
@@ -227,6 +228,19 @@ endif()
 # The W4A16 grouped GEMM dispatch in GroupGemmW4A16Xe20.cpp calls the JIT engine.
 if(USE_MOE AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-GroupGemmW4A16Xe20)
   target_link_libraries(sgl-ops-sycl-GroupGemmW4A16Xe20 PRIVATE sgl_jit)
+endif()
+# The FP8 W8A16 grouped GEMM dispatcher follows the same JIT path.
+if(USE_MOE AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-GroupGemmFp8W8A16Xe20)
+  target_link_libraries(sgl-ops-sycl-GroupGemmFp8W8A16Xe20 PRIVATE sgl_jit)
+endif()
+# In AOT builds, keep the bundled FP8 instances as an explicit dependency of
+# their dispatcher so --as-needed does not drop them from the runtime graph.
+if(USE_MOE AND NOT USE_SYCL_JIT
+   AND TARGET sgl-ops-sycl-GroupGemmFp8W8A16Xe20
+   AND TARGET sgl-ops-sycl-GroupGemmFp8Xe20_inst)
+  target_link_libraries(
+    sgl-ops-sycl-GroupGemmFp8W8A16Xe20
+    PUBLIC sgl-ops-sycl-GroupGemmFp8Xe20_inst)
 endif()
 # The GDN chunk delta-rule dispatch (chunk_gated_delta_rule.cpp) calls the JIT engine.
 if(USE_FMHA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-chunk_gated_delta_rule)

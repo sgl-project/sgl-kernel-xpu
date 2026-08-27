@@ -58,6 +58,29 @@ __attribute__((visibility("default"))) void FmhaPrefillNpRunner<@HEAD_DIM@, @ELE
   using TileShapeOutput = cute::Shape<cute::Int<@TILED_Q_NP@>, cute::Int<@TILED_OUT_NP@>>;
   using SubgroupLayoutQK = cute::
       Layout<cute::Shape<cute::Int<@NUM_SG_NP@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+  if (params.return_softmax_lse) {
+    TORCH_CHECK(
+        !params.is_causal && !params.is_local,
+        "return_softmax_lse is only supported without causal/local masking");
+    using Element = @ELEM_TYPE@;
+    FMHAConfig<
+        false,
+        false,
+        false,
+        /*LSE=*/true,
+        TileShapeQK,
+        TileShapePV,
+        TileShapeOutput,
+        SubgroupLayoutQK,
+        void,
+        2,
+        false,
+        Element,
+        Element,
+        Element,
+        Element>::run_nopaged(params);
+    return;
+  }
   // No sink support for no_page path; always use Sink=false
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {

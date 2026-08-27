@@ -1,0 +1,72 @@
+// Runtime-JIT instance of the GDN chunk delta-rule launcher.
+//
+// Rendered by src/jit/gdn_jit.cpp with @SCALAR_T@ / @STATE_T@ substituted, then
+// icpx-compiled into a standalone .so on first use. Compiling with
+// SGL_GDN_JIT_ENTRY defined excludes chunk_gated_delta_rule_impl_xe20 (torch
+// marshalling stays in the AOT dispatcher) so this TU only instantiates the one
+// selected kernel_launcher<@SCALAR_T@, @STATE_T@> config.
+#define SYCL_INTEL_TARGET 20
+
+#include <torch/all.h>
+
+#include <sycl/sycl.hpp>
+
+#include "sycl/kernels/gdn_attn/chunk_gated_delta_rule_kernels_xe20.hpp"
+
+#ifdef SGL_GDN_JIT_ENTRY
+// Stable C ABI entry for the runtime-JIT path. The fixed symbol name never
+// collides because each config is compiled into its own .so.
+extern "C" __attribute__((visibility("default"))) void sgl_gdn_chunk_entry(
+    void* queue_ptr,
+    void* core_attn_out,
+    const void* q,
+    const void* k,
+    const void* v,
+    void* A,
+    void* w,
+    void* u,
+    const void* b,
+    const void* a,
+    const void* A_log,
+    const void* dt_bias,
+    void* ssm_state,
+    int ssm_state_stride_0,
+    const int* query_start_loc,
+    const int* cache_indices,
+    const bool* has_initial_state,
+    const int* token_indx,
+    int batch_size,
+    int total_virtual_seqlen,
+    int num_k_heads,
+    int head_k_dim,
+    int num_v_heads,
+    int head_v_dim) {
+  gdn::kernel_launcher<@SCALAR_T@, @STATE_T@>(
+      *static_cast<sycl::queue*>(queue_ptr),
+      static_cast<@SCALAR_T@*>(core_attn_out),
+      static_cast<const @SCALAR_T@*>(q),
+      static_cast<const @SCALAR_T@*>(k),
+      static_cast<const @SCALAR_T@*>(v),
+      static_cast<@SCALAR_T@*>(A),
+      static_cast<@SCALAR_T@*>(w),
+      static_cast<@SCALAR_T@*>(u),
+      static_cast<const float*>(b),
+      static_cast<const float*>(a),
+      static_cast<const float*>(A_log),
+      static_cast<const @SCALAR_T@*>(dt_bias),
+      static_cast<@STATE_T@*>(ssm_state),
+      ssm_state_stride_0,
+      query_start_loc,
+      cache_indices,
+      has_initial_state,
+      token_indx,
+      batch_size,
+      total_virtual_seqlen,
+      num_k_heads,
+      head_k_dim,
+      num_v_heads,
+      head_v_dim);
+}
+#endif
+
+#undef SYCL_INTEL_TARGET

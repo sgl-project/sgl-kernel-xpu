@@ -365,7 +365,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 #endif  // USE_FMHA
 
 #ifdef USE_MLA
-  m.def("flash_mla_get_workspace_size", &flash_mla_get_workspace_size);
+  m.def("flash_mla_decode_get_workspace_size", &flash_mla_decode_get_workspace_size);
 
   m.def(
       "flash_mla_decode(Tensor! out, Tensor! q_nope, Tensor! q_pe, Tensor! kv_c_and_k_pe_cache, Tensor! seq_lens, "

@@ -3,13 +3,12 @@ import sys
 
 import pytest
 import torch
-from sgl_kernel.moe import _should_use_small_moe_prepare
-
 from sgl_kernel import (
     apply_shuffle_mul_sum,
     prepare_moe_input,
     scatter_tokens_to_experts,
 )
+from sgl_kernel.moe import _should_use_small_moe_prepare
 
 
 @pytest.mark.parametrize(

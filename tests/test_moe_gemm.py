@@ -11,7 +11,6 @@ import torch.nn.functional as F
 from mxfp4_utils import MXFP4_BLOCK_SIZE
 from mxfp4_utils import dequantize_mxfp4_2d as _dequantize_mxfp4_2d
 from mxfp4_utils import quantize_mxfp4_2d as _quantize_mxfp4_2d
-
 from sgl_kernel import fused_experts
 
 

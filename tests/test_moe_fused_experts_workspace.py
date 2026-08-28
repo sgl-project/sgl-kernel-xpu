@@ -19,6 +19,7 @@ import sys
 
 import pytest
 import torch
+from sgl_kernel import fused_experts
 from sgl_kernel.moe import (
     _MOE_WS_HEADROOM,
     _get_moe_ws,
@@ -26,8 +27,6 @@ from sgl_kernel.moe import (
     _moe_ws_view_cache,
 )
 from test_moe_gemm import create_random_xpu_tensor, torch_naive_moe
-
-from sgl_kernel import fused_experts
 
 pytestmark = pytest.mark.skipif(
     not torch.xpu.is_available(), reason="Requires Intel XPU"

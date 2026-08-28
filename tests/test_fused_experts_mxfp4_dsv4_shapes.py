@@ -14,6 +14,7 @@ directly when a targeted DSV4 regression check is needed:
 """
 
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 import pytest
@@ -48,7 +49,9 @@ def _torch_mxfp4_moe_reference(
     for expert in flat_ids.unique().cpu().tolist():
         mask = flat_ids == expert
         expert_w1 = dequantize_mxfp4_2d(
-            w1_packed[expert], w1_scale[expert], dtype=hidden_states.dtype
+            w1_packed[expert],
+            w1_scale[expert].view(torch.uint8),
+            dtype=hidden_states.dtype,
         )
         gate_up = routed_inputs[mask] @ expert_w1.transpose(0, 1)
         del expert_w1
@@ -62,7 +65,9 @@ def _torch_mxfp4_moe_reference(
             intermediate = F.silu(gate) * up
 
         expert_w2 = dequantize_mxfp4_2d(
-            w2_packed[expert], w2_scale[expert], dtype=hidden_states.dtype
+            w2_packed[expert],
+            w2_scale[expert].view(torch.uint8),
+            dtype=hidden_states.dtype,
         )
         routed_outputs[mask] = intermediate @ expert_w2.transpose(0, 1)
         del expert_w2
@@ -73,9 +78,14 @@ def _torch_mxfp4_moe_reference(
     ).sum(dim=1) * routed_scaling_factor
 
 
+@lru_cache(maxsize=None)
 def _build_packed_weights(E, N, K):
     # Quantize one expert at a time to avoid materializing a full
     # (E, N, K) bf16 tensor plus its fp32 copy on the host.
+    #
+    # Cached: the host-side MXFP4 quantization is the dominant cost of this
+    # file (tens of seconds per (E, N, K) at DSV4 sizes) and the weights only
+    # depend on the shape, so the swiglu_limit cases reuse one build.
     packed = torch.empty((E, N, K // 2), dtype=torch.uint8)
     scales = torch.empty((E, N, K // MXFP4_BLOCK_SIZE), dtype=torch.uint8)
     for e in range(E):
@@ -128,8 +138,8 @@ def test_fused_experts_dsv4_shape(
       x.shape                 = [47, 4096]       bfloat16
       w13_weight.shape        = [256, 512, 2048] int8   (E, 2*I, H/2)
       w2_weight.shape         = [256, 4096, 128] int8   (E, H, I/2)
-      w13_weight_scale        = [256, 512, 128]  uint8 E8M0
-      w2_weight_scale         = [256, 4096, 8]   uint8 E8M0
+      w13_weight_scale        = [256, 512, 128]  float8_e8m0fnu
+      w2_weight_scale         = [256, 4096, 8]   float8_e8m0fnu
       topk_weights.shape      = [47, 6]          float32
       topk_ids.shape          = [47, 6]          int64
       activation='silu', routed_scaling_factor=1.5, swiglu_limit=10
@@ -152,9 +162,15 @@ def test_fused_experts_dsv4_shape(
     )
     w2_packed, w2_scale_u8 = _build_packed_weights(num_experts, hidden, intermediate)
 
-    # Keep raw E8M0 scales for both the W4A16 kernel and reference decoder.
-    w1_scale = w1_scale_u8.to("xpu")
-    w2_scale = w2_scale_u8.to("xpu")
+    # Re-seed: _build_packed_weights is cached, so whether it consumed RNG
+    # depends on which case ran first. Re-seeding keeps the routing below
+    # identical regardless of cache state / test order.
+    torch.manual_seed(0)
+
+    # Exercise the production float8_e8m0fnu representation. The W4A16 kernel
+    # consumes its raw E8M0 byte encoding without a numeric dtype conversion.
+    w1_scale = w1_scale_u8.view(torch.float8_e8m0fnu).to("xpu")
+    w2_scale = w2_scale_u8.view(torch.float8_e8m0fnu).to("xpu")
     w1_packed_xpu = w1_packed.view(torch.int8).to("xpu")
     w2_packed_xpu = w2_packed.view(torch.int8).to("xpu")
 

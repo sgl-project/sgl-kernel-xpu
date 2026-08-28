@@ -47,32 +47,56 @@ class xe_gemm_policy_base {
   using GmemTiledCopyD = void;
 };
 
-// avg_m > 128
-class w4a16_policy : public xe_gemm_policy_base {
- public:
-  using WGTile = Shape<_128, _256, _32>;
-  using SGLayout = Layout<Shape<_4, _8, _1>, Stride<_8, _1, _0>>;
-};
+// Policy menu. Every policy keeps the *per-subgroup* tile at 32x32: the 4-bit
+// mainloop needs its dequantised B fragment live alongside the accumulators, and
+// a wider per-subgroup tile overruns the 256-GRF budget (a 256x256 / 8x4 variant
+// compiles with ~190 spilled registers and runs at a third of the speed). So the
+// work-group tile is scaled by adding or removing subgroups, not by widening
+// them. The subgroup count per dimension must be a power of two -- cute's tile
+// division rejects 3 and 6.
+//
+// Which one runs is decided per call by rows-per-expert; see
+// select_w4a16_tile_m() in GroupGemmW4A16Xe20.cpp.
 
 // avg_m <= 4
-class w4a16_policy_m_8 : public xe_gemm_policy_base {
+class w4a16_policy_m_8_n_64 : public xe_gemm_policy_base {
  public:
   using WGTile = Shape<_8, _64, _32>;
   using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
 };
 
 // avg_m <= 8
-class w4a16_policy_m_16 : public xe_gemm_policy_base {
+class w4a16_policy_m_16_n_64 : public xe_gemm_policy_base {
  public:
   using WGTile = Shape<_16, _64, _32>;
   using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
 };
 
-// avg_m <= 128
-class w4a16_policy_m_32 : public xe_gemm_policy_base {
+// Small avg_m: the 64-wide N tile beats a 256-wide one at this M (the wide-N
+// variant measures ~35 TFLOP/s against this one's ~49).
+class w4a16_policy_m_32_n_64 : public xe_gemm_policy_base {
  public:
   using WGTile = Shape<_32, _64, _32>;
   using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
+};
+
+// Mid range. Covers the rows-per-expert values where an M=128 tile would
+// compute up to twice the rows an expert actually has.
+class w4a16_policy_m_64_n_128 : public xe_gemm_policy_base {
+ public:
+  using WGTile = Shape<_64, _128, _32>;
+  using SGLayout = Layout<Shape<_2, _4, _1>, Stride<_4, _1, _0>>;
+};
+
+// Large avg_m. Replaces the previous <_128,_256,_32> / 4x8 policy: at equal M
+// the 128-wide N tile is never slower and is faster wherever N is not a
+// multiple of 256 (GPT-OSS N=5760 and 2880 both leave a half tile idle),
+// measuring 68.2 vs 66.5 TFLOP/s on GPT-OSS gemm1 at avg_m=512 and 68.3 vs
+// 68.1 on DeepSeek-V4 gemm1 at avg_m=256.
+class w4a16_policy_m_128_n_128 : public xe_gemm_policy_base {
+ public:
+  using WGTile = Shape<_128, _128, _32>;
+  using SGLayout = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;
 };
 
 }  // namespace moe_w4a16

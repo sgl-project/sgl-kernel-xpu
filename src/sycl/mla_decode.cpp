@@ -44,6 +44,9 @@
 #include "sgl_kernel_export.h"
 #include "sycl/kernels/mla/device/mla_decode_dispatch.hpp"
 #include "sycl/kernels/mla/device/mla_decode_types.hpp"
+#ifdef USE_MLA_JIT
+#include "jit/mla_jit.h"
+#endif
 
 namespace {
 
@@ -171,7 +174,29 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
     num_kv_splits = set_split_kv(q_nope.size(0), q_nope.size(1), max_seq_len, page_size);
   }
 
+#ifdef USE_MLA_JIT
+  {
+    std::string jit_err;
+    TORCH_CHECK(
+        sgl::mla_jit::mla_decode_launch(
+            in_dtype == at::ScalarType::Half,
+            page_size,
+            &out,
+            &q_nope,
+            &q_pe,
+            &kv_c_and_k_pe_cache,
+            &seq_lens,
+            &page_table,
+            &workspace,
+            sm_scale,
+            num_kv_splits,
+            jit_arch_code(),
+            &jit_err),
+        jit_err);
+  }
+#else
   DISPATCH_MLA_DTYPE();
+#endif
 }
 
 #undef DISPATCH_MLA_PAGE_SIZE

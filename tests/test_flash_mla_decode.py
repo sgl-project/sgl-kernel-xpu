@@ -46,15 +46,18 @@ def ref_mla(
     bs, num_heads, v_head_dim = out.shape
     head_dim = query.shape[2]
 
+    # Decode has a single query position, so attention reduces to two matmuls
+    # over all heads at once. Doing this instead of one SDPA call per head
+    # keeps the reference off a 128-iteration Python loop (the dominant cost of
+    # this file) without materializing any per-head expansion of the KV cache.
     for i in range(bs):
         kv = kv_cache[block_tables[i]]  # (max_num_blocks, block_size, head_dim)
-        kv = kv.view(1, -1, head_dim)[:, : seq_lens[i]]  # (1, seq_len, head_dim)
-        v = kv[:, :, :v_head_dim]
+        kv = kv.view(-1, head_dim)[: seq_lens[i]].float()  # (seq_len, head_dim)
+        v = kv[:, :v_head_dim]  # (seq_len, v_head_dim)
 
-        for h in range(num_heads):
-            q_h = query[i, h : h + 1, :].unsqueeze(0)  # (1, 1, head_dim)
-            o_h = F.scaled_dot_product_attention(q_h, kv, v, scale=scale)
-            out[i, h] = o_h.view(v_head_dim)
+        # (num_heads, head_dim) @ (head_dim, seq_len) -> (num_heads, seq_len)
+        probs = ((query[i].float() @ kv.transpose(0, 1)) * scale).softmax(dim=-1)
+        out[i] = (probs @ v).to(out.dtype)  # (num_heads, v_head_dim)
 
     return out
 

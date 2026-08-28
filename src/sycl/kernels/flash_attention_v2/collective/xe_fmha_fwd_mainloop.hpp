@@ -507,7 +507,10 @@ struct FMHAFwdMainloop<
 
       page_idx = next_page_idx;
       if constexpr (!ScoreBlock2D) {
-        next_page_idx = K + 1;
+        // The final iteration has no next K prefetch, but translating K + 1
+        // still dereferences the page table. Clamp it to the last valid tile
+        // so page_size=128 does not read one entry past the page table.
+        next_page_idx = cute::min(K + 1, k_end - 1);
         if constexpr (PagedKV) {
           next_page_idx = get_physical_k_tile(next_page_idx, l_coord, seq_len_kv_cache);
         }

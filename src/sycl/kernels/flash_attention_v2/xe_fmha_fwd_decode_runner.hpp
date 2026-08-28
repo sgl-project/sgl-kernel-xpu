@@ -131,6 +131,9 @@ struct Arguments {
   bool use_sink = false;
   bool is_causal = false;
   bool is_local = false;
+  // When false, the epilogue skips writing softmax_lse. Threaded as a template
+  // constexpr via DecodeConfig.
+  bool return_softmax_lse = false;
 
   // The O matrix (output).
   void* __restrict__ o_ptr;
@@ -373,6 +376,8 @@ struct DecodeRunner {
             static_cast<const bool*>(params.skip_batch_mask_ptr),
             params.k_scale_ptr,
             params.v_scale_ptr,
+            static_cast<float*>(params.softmax_lse_ptr),
+            static_cast<int64_t>(params.total_q),
         },
         {params.softmax_scale,
          params.page_table,
@@ -447,13 +452,16 @@ struct SplitDecodeKernelRunner {
       shape_init.seq_len_qo = params.total_q;
       shape_init.seq_len_kv = params.total_k;
 
-      shape.seq_len_qo = cutlass::fmha::collective::VariableLength{params.seqlen_q};
-      shape.seq_len_qo.cumulative_length = reinterpret_cast<int*>(params.cu_seqlens_q);
-      shape.seq_len_kv = cutlass::fmha::collective::VariableLength{params.seqlen_k};
-      shape.seq_len_kv.cumulative_length = reinterpret_cast<int*>(params.cu_seqlens_k);
+      shape.seq_len_qo = cutlass::fmha::collective::VariableLength{
+          params.seqlen_q, params.total_q, reinterpret_cast<int*>(params.cu_seqlens_q)};
+      shape.seq_len_kv = cutlass::fmha::collective::VariableLength{
+          params.seqlen_k, params.total_k, reinterpret_cast<int*>(params.cu_seqlens_k)};
+      shape.seq_len_kv_cache = cutlass::fmha::collective::VariableLength{
+          params.seqlen_k, params.total_k, reinterpret_cast<int*>(params.cu_seqlens_k)};
     } else {
       shape.seq_len_qo = shape_init.seq_len_qo = params.seqlen_q;
       shape.seq_len_kv = shape_init.seq_len_kv = params.seqlen_k;
+      shape.seq_len_kv_cache = shape_init.seq_len_kv_cache = params.seqlen_k;
     }
 
     auto seq_len_qo = shape_init.seq_len_qo;
@@ -540,6 +548,9 @@ struct SplitDecodeKernelRunner {
             static_cast<const bool*>(params.skip_batch_mask_ptr),
             params.k_scale_ptr,
             params.v_scale_ptr,
+            /*min_blocks_for_split=*/2,
+            static_cast<float*>(params.softmax_lse_ptr),
+            static_cast<int64_t>(params.total_q),
         },
         {params.softmax_scale,
          static_cast<int*>(params.page_table),
@@ -563,7 +574,9 @@ struct SplitDecodeKernelRunner {
          reinterpret_cast<ElementLSE*>(params.max_logits_ptr),
          stride_max_logits,
          params.window_size_left,
-         static_cast<const bool*>(params.skip_batch_mask_ptr)},
+         static_cast<const bool*>(params.skip_batch_mask_ptr),
+         static_cast<float*>(params.softmax_lse_ptr),
+         static_cast<int64_t>(params.total_q)},
         hw_info,
         params.num_kv_splits};
 
@@ -573,6 +586,16 @@ struct SplitDecodeKernelRunner {
     torch::Tensor workspace = torch::empty(
         {static_cast<int64_t>(workspace_size + reduce_workspace_size)}, torch::device(torch::kXPU).dtype(torch::kByte));
     uint8_t* workspace_ptr = static_cast<uint8_t*>(workspace.data_ptr());
+
+    TORCH_CHECK(
+        params.num_kv_splits <= FMHAKernel::max_num_kv_splits,
+        "num_splits (",
+        params.num_kv_splits,
+        ") exceeds the maximum the split-KV decode kernel supports for page_size ",
+        params.page_size,
+        " (",
+        int(FMHAKernel::max_num_kv_splits),
+        ")");
 
     if (!FMHAKernel::can_implement(arguments)) {
       // std::cout << "Invalid Problem Size: " << params.batch_size << 'x'
@@ -610,6 +633,7 @@ template <
     bool Causal,
     bool LocalMask,
     bool Sink,
+    bool LSE,
     typename TileShapeQK,
     typename TileShapePV,
     typename TileShapeOutput,
@@ -621,6 +645,7 @@ template <
     typename ElementK = bfloat16_t,
     typename ElementV = bfloat16_t,
     typename ElementO = bfloat16_t,
+    bool PackGQAEnabled = true,
     typename MMAOperation_ = void, /* void -> default */
     typename StrideQ = Stride<int, _1, int, int>,
     typename StrideK = Stride<int, _1, int, int>,
@@ -686,7 +711,7 @@ struct DecodeConfig {
 #ifdef SGL_DISABLE_PACKGQA
     constexpr bool PackGQA = false;
 #else
-    constexpr bool PackGQA = true;
+    constexpr bool PackGQA = PackGQAEnabled;
 #endif
 
     // Mainloop
@@ -714,7 +739,7 @@ struct DecodeConfig {
 
     // Epilogue
     using CollectiveEpilogue = cutlass::fmha::collective::
-        FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, Sink, PackGQA>;
+        FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, Sink, PackGQA, LSE>;
 
     static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
     using FMHADecodeKernel = conditional_t<
@@ -759,6 +784,7 @@ template <
     bool Causal,
     bool LocalMask,
     bool Sink,
+    bool LSE,
     typename TileShapeQK,
     typename TileShapePV,
     typename TileShapeOutput,
@@ -834,7 +860,7 @@ struct SplitDecodeConfig {
 
     // Epilogue
     using CollectiveEpilogue = cutlass::fmha::collective::
-        DecodeFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, TensorLSE, void, Sink>;
+        DecodeFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, TensorLSE, void, Sink, LSE>;
 
     using FMHAKernel = cutlass::fmha::kernel::
         XeFMHAFwdSplitKVKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>;

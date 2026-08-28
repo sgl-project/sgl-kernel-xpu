@@ -944,25 +944,25 @@ void top_p_sampling_from_probs(
     bool deterministic,
     std::optional<at::Generator> gen);
 
-void fast_topk_interface(
-    const at::Tensor& score, at::Tensor& indices, const at::Tensor& lengths, std::optional<at::Tensor> row_starts_opt);
+at::Tensor
+fast_topk(const at::Tensor& score, const at::Tensor& lengths, int64_t topk, std::optional<at::Tensor> row_starts_opt);
 
-void fast_topk_transform_interface(
+at::Tensor fast_topk_transform_fused(
     const at::Tensor& score,
     const at::Tensor& lengths,
-    at::Tensor& dst_page_table,
     const at::Tensor& src_page_table,
     const at::Tensor& cu_seqlens_q,
+    int64_t topk,
     std::optional<at::Tensor> row_starts_opt);
 
-void fast_topk_transform_ragged_interface(
+at::Tensor fast_topk_transform_ragged_fused(
     const at::Tensor& score,
     const at::Tensor& lengths,
-    at::Tensor& topk_indices_ragged,
     const at::Tensor& topk_indices_offset,
+    int64_t topk,
     std::optional<at::Tensor> row_starts_opt);
 
-void topk_transform_512_interface(
+void topk_transform(
     const at::Tensor& scores,
     const at::Tensor& seq_lens,
     const at::Tensor& page_tables,
@@ -970,14 +970,20 @@ void topk_transform_512_interface(
     int64_t page_size,
     std::optional<at::Tensor> out_raw_indices_opt);
 
-void topk_transform_512_v2_interface(
+void topk_transform_paged(
     const at::Tensor& scores,
     const at::Tensor& seq_lens,
-    const at::Tensor& page_tables,
+    std::optional<at::Tensor> page_tables_opt,
     at::Tensor& out_page_indices,
     int64_t page_size,
-    const at::Tensor& metadata,
-    std::optional<at::Tensor> out_raw_indices_opt);
+    const at::Tensor& metadata);
+
+void topk_transform_ragged(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    at::Tensor& out_indices,
+    const at::Tensor& out_offsets,
+    std::optional<at::Tensor> row_starts_opt);
 
 /*
  * Compress plan and execution kernels

@@ -14,7 +14,10 @@ from sgl_kernel.moe import _should_use_small_moe_prepare
 @pytest.mark.parametrize(
     "num_tokens,top_k,hidden_dim,num_experts,expected",
     [
+        (1, 0, 2048, 64, False),
         (10, 4, 2048, 64, True),
+        (1, 16, 2048, 64, True),
+        (1, 17, 2048, 64, False),
         (11, 4, 2048, 64, False),
         (16, 4, 1024, 64, True),
         (17, 4, 1024, 128, False),

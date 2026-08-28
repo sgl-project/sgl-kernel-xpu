@@ -371,6 +371,7 @@ def cutlass_fp4_group_mm(
 
 _MOE_WS_HEADROOM = 1.1
 _MOE_SMALL_PREPARE_MAX_ROUTES = 64
+_MOE_SMALL_PREPARE_MAX_TOPK = 16
 _MOE_SMALL_PREPARE_MAX_ELEMENTS = 81920
 _moe_ws_cache: Dict[Tuple[str, torch.device], torch.Tensor] = {}
 _moe_ws_view_cache: Dict[
@@ -416,7 +417,8 @@ def _should_use_small_moe_prepare(
 ) -> bool:
     routed_rows = num_tokens * topk
     return (
-        routed_rows <= min(num_experts, _MOE_SMALL_PREPARE_MAX_ROUTES)
+        1 <= topk <= _MOE_SMALL_PREPARE_MAX_TOPK
+        and routed_rows <= min(num_experts, _MOE_SMALL_PREPARE_MAX_ROUTES)
         and routed_rows * hidden_dims <= _MOE_SMALL_PREPARE_MAX_ELEMENTS
     )
 
@@ -770,8 +772,10 @@ def fused_experts(
         hidden_states.device,
     )
     if use_small_prepare:
+        # TODO: Support strided topk_ids in the prepare kernels and remove this copy.
+        topk_ids_small = topk_ids if topk_ids.is_contiguous() else topk_ids.contiguous()
         torch.ops.sgl_kernel.prepare_moe_input_small.default(
-            hidden_states, topk_ids, expert_offsets, c_map, input_A_shuffle
+            hidden_states, topk_ids_small, expert_offsets, c_map, input_A_shuffle
         )
     else:
         if topk_ids.dtype == torch.long:
@@ -858,30 +862,36 @@ def fused_experts(
             E,
         )
 
-        intermediate_cache2 = _get_moe_ws(
-            "intermediate_cache2",
-            (M * TopK, N),
-            hidden_states.dtype,
-            hidden_states.device,
-        )
-        if activation_type == 0:
-            torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
-        elif activation_type == 4:
-            torch.ops.sgl_kernel.silu_and_mul_clamp(
-                intermediate_cache2, intermediate_cache1, swiglu_limit
-            )
-        elif activation_type == 1:
-            torch.ops.sgl_kernel.gelu_tanh_and_mul(
-                intermediate_cache2, intermediate_cache1
-            )
-        elif activation_type == 2:
+        if activation_type == 2:
             intermediate_cache2 = torch.ops.sgl_kernel.swiglu_gpt_oss_sigmoid_alpha(
                 intermediate_cache1, gemm1_alpha, gemm1_limit
             )
-        elif activation_type == 3:
-            intermediate_cache2 = torch.square(torch.relu(intermediate_cache1))
         else:
-            raise AssertionError(f"unsupported FP8 activation type: {activation_type}")
+            intermediate_cache2 = _get_moe_ws(
+                "intermediate_cache2",
+                (M * TopK, N),
+                hidden_states.dtype,
+                hidden_states.device,
+            )
+            if activation_type == 0:
+                torch.ops.sgl_kernel.silu_and_mul(
+                    intermediate_cache2, intermediate_cache1
+                )
+            elif activation_type == 4:
+                torch.ops.sgl_kernel.silu_and_mul_clamp(
+                    intermediate_cache2, intermediate_cache1, swiglu_limit
+                )
+            elif activation_type == 1:
+                torch.ops.sgl_kernel.gelu_tanh_and_mul(
+                    intermediate_cache2, intermediate_cache1
+                )
+            elif activation_type == 3:
+                torch.clamp_min(intermediate_cache1, 0, out=intermediate_cache2)
+                torch.square(intermediate_cache2, out=intermediate_cache2)
+            else:
+                raise AssertionError(
+                    f"unsupported FP8 activation type: {activation_type}"
+                )
 
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
             intermediate_cache3,
@@ -956,12 +966,6 @@ def fused_experts(
             hidden_states.dtype,
             hidden_states.device,
         )
-        intermediate_cache2 = _get_moe_ws(
-            "intermediate_cache2",
-            (M * TopK, N),
-            hidden_states.dtype,
-            hidden_states.device,
-        )
         # GEMM1: B = w1 (gate+up).
         if use_4bit_w4a16:
             torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w4a16(
@@ -989,22 +993,32 @@ def fused_experts(
                 gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
                 gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
             )
-        if activation_type == 0:
-            torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
-        elif activation_type == 4:
-            torch.ops.sgl_kernel.silu_and_mul_clamp(
-                intermediate_cache2, intermediate_cache1, swiglu_limit
-            )
-        elif activation_type == 1:
-            torch.ops.sgl_kernel.gelu_tanh_and_mul(
-                intermediate_cache2, intermediate_cache1
-            )
-        elif activation_type == 2:
+        if activation_type == 2:
             intermediate_cache2 = torch.ops.sgl_kernel.swiglu_gpt_oss_sigmoid_alpha(
                 intermediate_cache1, gemm1_alpha, gemm1_limit
             )
-        elif activation_type == 3:
-            intermediate_cache2 = torch.square(torch.relu(intermediate_cache1))
+        else:
+            intermediate_cache2 = _get_moe_ws(
+                "intermediate_cache2",
+                (M * TopK, N),
+                hidden_states.dtype,
+                hidden_states.device,
+            )
+            if activation_type == 0:
+                torch.ops.sgl_kernel.silu_and_mul(
+                    intermediate_cache2, intermediate_cache1
+                )
+            elif activation_type == 4:
+                torch.ops.sgl_kernel.silu_and_mul_clamp(
+                    intermediate_cache2, intermediate_cache1, swiglu_limit
+                )
+            elif activation_type == 1:
+                torch.ops.sgl_kernel.gelu_tanh_and_mul(
+                    intermediate_cache2, intermediate_cache1
+                )
+            elif activation_type == 3:
+                torch.clamp_min(intermediate_cache1, 0, out=intermediate_cache2)
+                torch.square(intermediate_cache2, out=intermediate_cache2)
         if w2_g_idx_perm is not None:
             # GPTQ desc_act/g_idx: reorder each expert's activation slice to
             # match the K-dim sort applied to w2 at weight-load time.

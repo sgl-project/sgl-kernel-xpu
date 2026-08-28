@@ -1545,6 +1545,9 @@ def test_moe_gemm_fp8_w8a16(
     topk_weight, topk_ids = torch.topk(
         torch.softmax(score, dim=-1, dtype=torch.float32), topk
     )
+    if num_tokens == 1:
+        topk_ids = torch.cat((topk_ids, topk_ids), dim=1)[:, ::2]
+        assert not topk_ids.is_contiguous()
 
     s1 = (
         w1_bf16.float().abs().amax((1, 2), keepdim=True).clamp_min(1e-12) / FP8_E4M3_MAX

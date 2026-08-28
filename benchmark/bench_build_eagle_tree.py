@@ -218,6 +218,24 @@ def benchmark(bs, tree_shape, provider):
     # Mask bytes dominate the traffic: one bool per (draft token, tree column),
     # plus the prefix columns the FULL_MASK layout skips over.
     mask_bytes = bs * draft_token_num * draft_token_num
+    _, positions, r_index, r_next_token, r_next_sibling = bufs
+
+    # Memory traffic (int64 = 8B, bool = 1B): reads are the tree-shape inputs,
+    # writes are the mask plus the four per-node metadata outputs.
+    read_bytes = (parent_list.numel() + selected_index.numel() + seq_lens.numel()) * 8
+    write_bytes = (
+        mask_bytes
+        + (
+            positions.numel()
+            + r_index.numel()
+            + r_next_token.numel()
+            + r_next_sibling.numel()
+        )
+        * 8
+    )
+    total_bytes = read_bytes + write_bytes
+    bandwidth_gb_s = total_bytes / (ms / 1e3) / 1e9
+
     all_results.append(
         {
             "provider": provider,
@@ -228,6 +246,7 @@ def benchmark(bs, tree_shape, provider):
             "us": us,
             "nodes_per_sec_M": bs * draft_token_num / (ms / 1e3) / 1e6,
             "mask_cells_per_sec_M": mask_bytes / (ms / 1e3) / 1e6,
+            "bandwidth_gb_s": bandwidth_gb_s,
         }
     )
     return us
@@ -260,4 +279,13 @@ if __name__ == "__main__":
             f"\n  min: {pivot['speedup_x'].min():.2f}x"
             f"   max: {pivot['speedup_x'].max():.2f}x"
         )
+
+    print("\n" + "=" * 88)
+    print("BANDWIDTH SUMMARY")
+    print("=" * 88)
+    for provider in df["provider"].unique():
+        df_provider = df[df["provider"] == provider]
+        print(f"\n{provider}:")
+        print(f"  Mean bandwidth: {df_provider['bandwidth_gb_s'].mean():.2f} GB/s")
+        print(f"  Best bandwidth: {df_provider['bandwidth_gb_s'].max():.2f} GB/s")
     print("\n")

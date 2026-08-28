@@ -26,7 +26,8 @@
 #pragma once
 
 #include "sycl/kernels/mla_sparse/device/xe_mla_sparse_2stage_common.hpp"
-
+#define THR_ID -1
+#define BLK_ID -1
 namespace cutlass::flash_attention::collective {
 
 using cutlass::flash_attention::kernel::Epilogue2StageParams;

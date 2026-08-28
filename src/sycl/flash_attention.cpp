@@ -37,6 +37,9 @@
 
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_prefill_dispatch.hpp"
+#ifdef USE_FMHA_JIT
+#include "jit/fmha_jit.h"
+#endif
 #include "sgl_kernel_export.h"
 
 namespace {
@@ -262,7 +265,24 @@ void mha_fwd_nopage(
       "Unsupported head size for non-paged decode attention: ",
       params.d);
 
+#ifdef USE_FMHA_JIT
+  {
+    std::string jit_err;
+    TORCH_CHECK(
+        sgl::fmha_jit::decode_launch(
+            sgl::fmha_jit::DecodeOp::kDecodeNoPage,
+            qg_sz,
+            params.d,
+            /*page_size=*/0,
+            params.is_fp16,
+            &params,
+            jit_arch_code(),
+            &jit_err),
+        jit_err);
+  }
+#else
   DISPATCH_DECODE_NOPAGE(qg_sz);
+#endif
 }
 
 void mha_fwd(
@@ -670,7 +690,27 @@ void mha_fwd(
       "Unsupported page size for decode attention: ",
       params.page_size);
 
+#ifdef USE_FMHA_JIT
+  {
+    using sgl::fmha_jit::DecodeOp;
+    DecodeOp op;
+    bool is_fp16 = params.is_fp16;
+    if (params.is_e4m3 || params.is_e5m2) {
+      TORCH_CHECK(params.is_bf16, "fp8 KV cache decode only supports a bf16 query");
+      op = params.use_split_kv ? DecodeOp::kSplitDecodeFp8 : DecodeOp::kDecodeFp8;
+      is_fp16 = false;
+    } else {
+      op = params.use_split_kv ? DecodeOp::kSplitDecode : DecodeOp::kDecode;
+    }
+    std::string jit_err;
+    TORCH_CHECK(
+        sgl::fmha_jit::decode_launch(
+            op, qg_sz, params.d, params.page_size, is_fp16, &params, jit_arch_code(), &jit_err),
+        jit_err);
+  }
+#else
   DISPATCH_DECODE(qg_sz);
+#endif
 }
 
 }  // namespace decode
@@ -838,6 +878,15 @@ void mha_fwd_nopage(
       "Unsupported head size for non-paged prefill attention: ",
       params.d);
 
+#ifdef USE_FMHA_JIT
+  {
+    std::string jit_err;
+    TORCH_CHECK(
+        sgl::fmha_jit::prefill_launch(
+            sgl::fmha_jit::PrefillOp::kPrefillNoPage, params.d, params.is_fp16, &params, jit_arch_code(), &jit_err),
+        jit_err);
+  }
+#else
   switch (params.d) {
     case 64:
       DISPATCH_PREFILL_NOPAGE_KERNEL(64);
@@ -866,6 +915,7 @@ void mha_fwd_nopage(
     default:
       TORCH_CHECK(false, "Unsupported head size for non-paged prefill attention: ", params.d);
   }
+#endif
 
   // TODO: Support prefill softmax_lse, now is 0
 }
@@ -1186,6 +1236,22 @@ void mha_fwd(
       "Unsupported head size for paged prefill attention: ",
       params.d);
 
+#ifdef USE_FMHA_JIT
+  {
+    using sgl::fmha_jit::PrefillOp;
+    PrefillOp op;
+    bool is_fp16 = params.is_fp16;
+    if (params.is_e4m3 || params.is_e5m2) {
+      TORCH_CHECK(params.is_bf16, "fp8 KV cache prefill only supports a bf16 query");
+      op = PrefillOp::kPrefillFp8;
+      is_fp16 = false;
+    } else {
+      op = PrefillOp::kPrefill;
+    }
+    std::string jit_err;
+    TORCH_CHECK(sgl::fmha_jit::prefill_launch(op, params.d, is_fp16, &params, jit_arch_code(), &jit_err), jit_err);
+  }
+#else
   switch (params.d) {
     case 64:
       DISPATCH_PREFILL_KERNEL(64);
@@ -1208,6 +1274,7 @@ void mha_fwd(
     default:
       TORCH_CHECK(false, "Unsupported head size for paged prefill attention: ", params.d);
   }
+#endif
 
   // TODO: Support prefill softmax_lse, now is 0
 }

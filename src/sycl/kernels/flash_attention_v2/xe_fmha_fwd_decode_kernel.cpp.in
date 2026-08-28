@@ -133,3 +133,13 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
 template struct FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@, @ELEM_TYPE@>;
 
 }  // namespace decode
+
+#ifdef SGL_FMHA_JIT_ENTRY
+// Stable C ABI entry for the runtime-JIT path. Only emitted when this TU is
+// compiled as a standalone JIT module (one config per .so), so the fixed symbol
+// name never collides across the many AOT translation units.
+extern "C" __attribute__((visibility("default"))) void sgl_fmha_entry(const void* params) {
+  decode::FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@, @ELEM_TYPE@>{}(
+      *static_cast<const decode::Arguments*>(params));
+}
+#endif

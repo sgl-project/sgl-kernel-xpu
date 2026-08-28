@@ -30,6 +30,12 @@ variables (default is `ON` for all):
 | `USE_MLA` | `ON` | MLA decode/prefill/sparse-decode kernels |
 | `USE_MLA_SPARSE_FUSED` | `OFF` | Fused (single-pass) sparse MLA decode kernel (optimization track) |
 
+There is also an opt-in switch (default `OFF`):
+
+| Variable | Default | Set to `ON`/`1` to enable |
+| --- | --- | --- |
+| `USE_SYCL_JIT` | `OFF` | Runtime-JIT kernels (FMHA/MLA/MoE/GDN compiled on demand instead of AOT) |
+
 Notes:
 - `OFF` and `0` are both accepted.
 - Values are case-insensitive (`off`, `Off`, `OFF` all work).
@@ -46,6 +52,29 @@ USE_MOE=0 pip install -v .
 # Disable all three
 USE_MOE=0 USE_FMHA=OFF USE_MLA=off pip install -v .
 ```
+
+### Runtime-JIT Kernels (`USE_SYCL_JIT`)
+
+By default all kernels are compiled ahead-of-time (AOT). Setting the
+`USE_SYCL_JIT` environment variable (or CMake option) to `ON`/`1` opts into the
+runtime-JIT path: the FMHA, MLA, MoE grouped-GEMM and GDN kernels are **not**
+instantiated at build time. Instead their `*.cpp.in` templates are compiled on
+demand with `icpx` on first use and cached as `.so` files, which shortens the
+build and shrinks the wheel.
+
+```bash
+source /PATH/TO/ONEAPI/setvars.sh
+USE_SYCL_JIT=ON pip install -v .
+```
+
+Notes:
+- The **first** call into a JIT kernel triggers a synchronous `icpx` compile of
+  that configuration; it can take seconds to minutes and may look like a hang.
+  Subsequent calls hit the on-disk cache and start immediately.
+- Torch include/lib paths are exported automatically at import time. Optional
+  runtime overrides: `SGL_JIT_CACHE_DIR` (compiled-`.so` cache dir),
+  `SGL_JIT_CUTLASS_INCLUDE` (CUTLASS-SYCL include dirs, needed if the headers
+  were not packaged), `SGL_JIT_INCLUDE_ROOT` (override the package include root).
 
 
 ### Build with [ccache](https://github.com/ccache/ccache)

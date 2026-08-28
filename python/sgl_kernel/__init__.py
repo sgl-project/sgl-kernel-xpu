@@ -7,6 +7,26 @@ import torch
 
 SYSTEM_ARCH = platform.machine()
 
+
+def _export_jit_toolchain_env() -> None:
+    """Expose torch's include/lib dirs to the C++ runtime-JIT engine (src/jit).
+
+    Only Python knows torch's install location; the C++ engine reads these env
+    vars to build the icpx command line for on-demand FMHA kernel compilation.
+    """
+    try:
+        from torch.utils.cpp_extension import include_paths
+
+        os.environ.setdefault("SGL_JIT_TORCH_INCLUDE", os.pathsep.join(include_paths()))
+        os.environ.setdefault(
+            "SGL_JIT_TORCH_LIB", os.path.join(os.path.dirname(torch.__file__), "lib")
+        )
+    except Exception:
+        pass
+
+
+_export_jit_toolchain_env()
+
 cuda_path = f"/usr/local/cuda/targets/{SYSTEM_ARCH}-linux/lib/libcudart.so.12"
 if os.path.exists(cuda_path):
     ctypes.CDLL(cuda_path, mode=ctypes.RTLD_GLOBAL)
@@ -81,6 +101,11 @@ from sgl_kernel.gemm import (
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.hadamard import hadamard_transform
+from sgl_kernel.hisparse import (
+    load_cache_to_device_buffer_dsv4_mla,
+    load_cache_to_device_buffer_mla,
+    transfer_cache_dsv4_mla,
+)
 from sgl_kernel.inkling_attn_prologue import (
     compile_inkling_attn_prologue,
     inkling_attn_prologue_decode,
@@ -174,6 +199,9 @@ from sgl_kernel.top_k import (
     fast_topk_transform_fused,
     fast_topk_transform_ragged_fused,
     fast_topk_v2,
+    topk_transform,
+    topk_transform_paged,
+    topk_transform_ragged,
 )
 from sgl_kernel.utils import get_device_capability, is_xe2_arch
 from sgl_kernel.version import __version__

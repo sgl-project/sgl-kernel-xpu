@@ -37,3 +37,31 @@ __attribute__((visibility("default"))) void launch_mla_sparse_prefill_2stage_@EL
 }
 
 }  // namespace mla_sparse_prefill
+
+#ifdef SGL_MLA_JIT_ENTRY
+// Stable C ABI entry for the runtime-JIT path. One config
+// (@ELEM_TAG@,@D_QK@,@B_H@,@HAS_ATTN_SINK@) per .so.
+extern "C" __attribute__((visibility("default"))) void sgl_mla_sparse_prefill_entry(
+    void* out,
+    void* max_logits,
+    void* lse,
+    const void* q,
+    const void* kv,
+    const void* indices,
+    const void* attn_sink,
+    const void* topk_length,
+    double sm_scale,
+    int64_t head_dim_v) {
+  mla_sparse_prefill::launch_mla_sparse_prefill_2stage_@ELEM_TAG@_@D_QK@_@B_H@_@HAS_ATTN_SINK@(
+      *static_cast<at::Tensor*>(out),
+      *static_cast<at::Tensor*>(max_logits),
+      *static_cast<at::Tensor*>(lse),
+      *static_cast<const at::Tensor*>(q),
+      *static_cast<const at::Tensor*>(kv),
+      *static_cast<const at::Tensor*>(indices),
+      *static_cast<const std::optional<at::Tensor>*>(attn_sink),
+      *static_cast<const std::optional<at::Tensor>*>(topk_length),
+      sm_scale,
+      head_dim_v);
+}
+#endif

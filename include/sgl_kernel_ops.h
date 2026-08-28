@@ -952,22 +952,45 @@ void top_p_sampling_from_probs(
     bool deterministic,
     std::optional<at::Generator> gen);
 
-void fast_topk_interface(
-    const at::Tensor& score, at::Tensor& indices, const at::Tensor& lengths, std::optional<at::Tensor> row_starts_opt);
+at::Tensor
+fast_topk(const at::Tensor& score, const at::Tensor& lengths, int64_t topk, std::optional<at::Tensor> row_starts_opt);
 
-void fast_topk_transform_interface(
+at::Tensor fast_topk_transform_fused(
     const at::Tensor& score,
     const at::Tensor& lengths,
-    at::Tensor& dst_page_table,
     const at::Tensor& src_page_table,
     const at::Tensor& cu_seqlens_q,
+    int64_t topk,
     std::optional<at::Tensor> row_starts_opt);
 
-void fast_topk_transform_ragged_interface(
+at::Tensor fast_topk_transform_ragged_fused(
     const at::Tensor& score,
     const at::Tensor& lengths,
-    at::Tensor& topk_indices_ragged,
     const at::Tensor& topk_indices_offset,
+    int64_t topk,
+    std::optional<at::Tensor> row_starts_opt);
+
+void topk_transform(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    const at::Tensor& page_tables,
+    at::Tensor& out_page_indices,
+    int64_t page_size,
+    std::optional<at::Tensor> out_raw_indices_opt);
+
+void topk_transform_paged(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    std::optional<at::Tensor> page_tables_opt,
+    at::Tensor& out_page_indices,
+    int64_t page_size,
+    const at::Tensor& metadata);
+
+void topk_transform_ragged(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    at::Tensor& out_indices,
+    const at::Tensor& out_offsets,
     std::optional<at::Tensor> row_starts_opt);
 
 /*
@@ -1265,5 +1288,34 @@ void causal_conv1d_update(
     const std::optional<at::Tensor>& cache_seqlens_,
     const std::optional<at::Tensor>& conv_state_indices_,
     int64_t pad_slot_id);
+
+/*
+ * HiSparse hierarchical sparse KV cache (DeepSeek DSA / V4)
+ */
+void transfer_cache_dsv4_mla(
+    const at::Tensor& src_ptrs,
+    const at::Tensor& dst_ptrs,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t block_size);
+
+void load_cache_to_device_buffer_mla(
+    const at::Tensor& top_k_tokens,
+    const at::Tensor& device_buffer_tokens,
+    const at::Tensor& host_cache_locs,
+    const at::Tensor& device_buffer_locs,
+    const at::Tensor& host_cache,
+    const at::Tensor& device_buffer,
+    const at::Tensor& top_k_device_locs,
+    const at::Tensor& req_pool_indices,
+    const at::Tensor& seq_lens,
+    const at::Tensor& lru_slots,
+    const std::optional<at::Tensor>& num_real_reqs,
+    int64_t item_size_bytes,
+    int64_t num_top_k,
+    int64_t hot_buffer_size,
+    int64_t page_size,
+    int64_t block_size,
+    bool is_dsv4_layout);
 
 #pragma GCC visibility pop

@@ -15,21 +15,10 @@ set(FMHA_DECODE_PAGED_HEAD_DIMS 64 96 128 192 256 512)
 set(FMHA_DECODE_NP_HEAD_DIMS 64 72 80 96 128 192 256 512)
 set(FMHA_DECODE_PAGE_SIZES 64 128)
 
-# Per-HEAD_DIM KV-tile size for the NON-PAGED (contiguous ragged) decode path.
-# The paged decode kernel uses PAGE_SIZE as its KV tile; the non-paged path has
-# no natural page size, so it gets its own KV-tile constant that can be tuned
-# independently. Must be a multiple of 16. Only the head dims in
-# FMHA_DECODE_NP_HEAD_DIMS need an entry here.
-# Note: Larger head dimensions require smaller KV tiles to avoid running out of
-# registers/local memory on Level Zero backend (UR_RESULT_ERROR_OUT_OF_RESOURCES).
-set(FMHA_DECODE_TILED_KV_NP_64 512)
-set(FMHA_DECODE_TILED_KV_NP_72 512)
-set(FMHA_DECODE_TILED_KV_NP_80 512)
-set(FMHA_DECODE_TILED_KV_NP_96 512)
-set(FMHA_DECODE_TILED_KV_NP_128 512)
-set(FMHA_DECODE_TILED_KV_NP_192 512)
-set(FMHA_DECODE_TILED_KV_NP_256 128)
-set(FMHA_DECODE_TILED_KV_NP_512 128)
+# The non-paged decode KV-tile size now lives in the shared header
+# sycl/kernels/flash_attention_v2/fmha_tile_dispatch.h (decode_tiled_kv_np),
+# consumed both by the AOT template (compile-time lookup by HEAD_DIM) and the
+# runtime-JIT wrapper.
 
 # Paged decode (FmhaDecodeRunner) and non-paged decode (FmhaDecodeNpRunner).
 set(FMHA_DECODE_TEMPLATE
@@ -108,12 +97,10 @@ foreach(QG_SZ ${FMHA_DECODE_QG_SIZES})
     endforeach()
 
     # --- Non-paged (no_page) decode: np head dims only, no page size, no fp8. ---
-    # 16-bit KV only (KV==Q: *_bf16_bf16 / *_fp16_fp16), no split-KV.
+    # 16-bit KV only (KV==Q: *_bf16_bf16 / *_fp16_fp16), no split-KV. The KV-tile
+    # size comes from the shared header fmha_tile_dispatch.h (decode_tiled_kv_np),
+    # looked up in the template by HEAD_DIM at compile time.
     foreach(HEAD_DIM ${FMHA_DECODE_NP_HEAD_DIMS})
-        set(TILED_KV_NP ${FMHA_DECODE_TILED_KV_NP_${HEAD_DIM}})
-        if(NOT TILED_KV_NP)
-            message(FATAL_ERROR "Missing non-paged KV tile (FMHA_DECODE_TILED_KV_NP_${HEAD_DIM}) for decode HEAD_DIM=${HEAD_DIM}")
-        endif()
 
         foreach(ELEM_TAG ${FMHA_DECODE_ELEM_TAGS})
             if(ELEM_TAG STREQUAL "bf16")

@@ -5,6 +5,8 @@
 #include <stdexcept>
 #include <type_traits>
 
+#include "jit/jit_arch.h"  // sgl::jit::Arch, consumed by arch_profile()
+
 #define SYCL_MAX_SUB_GROUP_SIZE dpcppMaxSubGroupSize()
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_xpu(), #x " must be on XPU")
@@ -64,6 +66,30 @@ static inline syclex::architecture get_device_architecture(at::DeviceIndex devic
 static inline bool is_bmg(at::DeviceIndex device_index = -1) {
   return get_device_architecture(device_index) == syclex::architecture::intel_gpu_bmg_g21 ||
          get_device_architecture(device_index) == syclex::architecture::intel_gpu_bmg_g31;
+}
+
+// Runtime-JIT architecture code (== static_cast<int>(sgl::jit::Arch); the value
+// selects the arch_profile used when compiling a kernel). Classifies the real
+// SYCL device architecture, mirroring Device.cpp's query_device switch:
+// bmg_g21/g31 => BMG/Xe20. Returned as int so callers pass it straight into the
+// launch entry points.
+static inline int jit_arch_code(at::DeviceIndex device_index = -1) {
+  switch (get_device_architecture(device_index)) {
+    case syclex::architecture::intel_gpu_bmg_g21:
+    case syclex::architecture::intel_gpu_bmg_g31:
+      return static_cast<int>(sgl::jit::Arch::BMG);
+    // case syclex::architecture::intel_gpu_<xe35>:
+    //   return static_cast<int>(sgl::jit::Arch::XE3P);  // Xe35, when the enum lands
+    default:
+      // Unknown architecture: fail loudly instead of silently compiling BMG
+      // device code, which would produce wrong results at runtime.
+      TORCH_CHECK(
+          false,
+          "Runtime-JIT does not support this XPU architecture yet. "
+          "Set SGLANG_DISABLE_SYCL_JIT=1 or rebuild with USE_SYCL_JIT=OFF to "
+          "use the AOT kernels.");
+      return static_cast<int>(sgl::jit::Arch::BMG);  // unreachable
+  }
 }
 
 using DeviceId = at::DeviceIndex;

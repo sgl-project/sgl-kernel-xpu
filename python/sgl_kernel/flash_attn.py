@@ -419,8 +419,8 @@ def _flash_attn_with_kvcache_page_size_1(
 
     num_blocks, _, nheads_k, head_dim = k_cache.shape
     head_dim_v = v_cache.shape[-1]
-    k_flat = k_cache.view(num_blocks, nheads_k, head_dim)
-    v_flat = v_cache.view(num_blocks, nheads_k, head_dim_v)
+    k_flat = k_cache.reshape(num_blocks, nheads_k, head_dim)
+    v_flat = v_cache.reshape(num_blocks, nheads_k, head_dim_v)
 
     if cu_seqlens_q is None:  # !is_varlen_q
         cu_seqlens_q = torch.arange(

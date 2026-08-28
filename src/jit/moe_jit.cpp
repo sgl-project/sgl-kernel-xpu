@@ -156,19 +156,23 @@ using W4A16Fn = void (*)(
     int,
     int*);
 
-// Policy name selected from avg_m (mirrors GroupGemmW4A16Xe20.cpp).
-const char* w4a16_policy(int avg_m) {
-  if (avg_m <= 4) return "w4a16_policy_m_8";
-  if (avg_m <= 8) return "w4a16_policy_m_16";
-  if (avg_m <= 128) return "w4a16_policy_m_32";
-  return "w4a16_policy";
-}
-
-int w4a16_policy_id(int avg_m) {
-  if (avg_m <= 4) return 0;
-  if (avg_m <= 8) return 1;
-  if (avg_m <= 128) return 2;
-  return 3;
+// Policy id is selected by GroupGemmW4A16Xe20.cpp so AOT and JIT dispatch use
+// the same avg_m- and gemm_n-dependent decision.
+const char* w4a16_policy(int policy_id) {
+  switch (policy_id) {
+    case 0:
+      return "w4a16_policy_m_8_n_64";
+    case 1:
+      return "w4a16_policy_m_16_n_64";
+    case 2:
+      return "w4a16_policy_m_32_n_64";
+    case 3:
+      return "w4a16_policy_m_64_n_128";
+    case 4:
+      return "w4a16_policy_m_128_n_128";
+    default:
+      return nullptr;
+  }
 }
 
 uint64_t pack_w4a16_key(int policy_id, bool is_int4, bool is_fp16, int arch) {
@@ -181,8 +185,13 @@ uint64_t pack_w4a16_key(int policy_id, bool is_int4, bool is_fp16, int arch) {
 
 jit::JitFnCache<W4A16Fn> g_w4a16_fns("W4A16 grouped GEMM");
 
-W4A16Fn resolve_w4a16(int avg_m, bool is_int4, bool is_fp16, int arch, std::string* err) {
-  const int policy_id = w4a16_policy_id(avg_m);
+W4A16Fn resolve_w4a16(int policy_id, bool is_int4, bool is_fp16, int arch, std::string* err) {
+  const char* policy = w4a16_policy(policy_id);
+  if (policy == nullptr) {
+    if (err != nullptr) *err = "invalid W4A16 policy id";
+    return nullptr;
+  }
+
   const uint64_t key = pack_w4a16_key(policy_id, is_int4, is_fp16, arch);
   auto build = [&](std::string* berr) -> void* {
     const jit::JitConfig& cfg = jit::default_config();
@@ -199,7 +208,7 @@ W4A16Fn resolve_w4a16(int avg_m, bool is_int4, bool is_fp16, int arch, std::stri
 
     jit::CompileSpec spec;
     spec.template_path = cfg.src_root + "/sycl/GroupGemmW4A16Xe20LauncherInstance.cpp.in";
-    spec.subs["POLICY"] = w4a16_policy(avg_m);
+    spec.subs["POLICY"] = policy;
     spec.subs["ELEMENT_A"] = elem_a;
     spec.subs["ELEMENT_S"] = is_int4 ? elem_a : "uint8_t";
     const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_W4A16_JIT_ENTRY");
@@ -217,7 +226,7 @@ W4A16Fn resolve_w4a16(int avg_m, bool is_int4, bool is_fp16, int arch, std::stri
 }  // namespace
 
 bool w4a16_grouped_gemm_launch(
-    int avg_m,
+    int policy_id,
     bool is_int4,
     bool is_fp16,
     void* queue,
@@ -235,7 +244,7 @@ bool w4a16_grouped_gemm_launch(
     int* atomic_buffer,
     int arch,
     std::string* err) {
-  W4A16Fn fn = resolve_w4a16(avg_m, is_int4, is_fp16, arch, err);
+  W4A16Fn fn = resolve_w4a16(policy_id, is_int4, is_fp16, arch, err);
   if (!fn) return false;
   fn(queue,
      activations,

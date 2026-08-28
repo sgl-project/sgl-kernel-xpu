@@ -881,7 +881,7 @@ SGL_KERNEL_EXPORT void topk_transform_ragged(
     at::Tensor& out_indices,
     const at::Tensor& out_offsets,
     std::optional<at::Tensor> row_starts_opt) {
-  CHECK_INPUT(scores);
+  CHECK_DEVICE(scores);
   CHECK_DEVICE(seq_lens);
   CHECK_DEVICE(out_indices);
   CHECK_DEVICE(out_offsets);

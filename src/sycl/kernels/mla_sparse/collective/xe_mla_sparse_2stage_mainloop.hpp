@@ -30,8 +30,6 @@
 #pragma once
 
 #include "sycl/kernels/mla_sparse/device/xe_mla_sparse_2stage_common.hpp"
-#define THR_ID -1
-#define BLK_ID -1
 
 namespace cutlass::flash_attention::collective {
 
@@ -162,26 +160,6 @@ class XeMlaSparse2StageMainloop {
     auto tSrK = thr_mma_qk.partition_sg_fragment_B(gK(_, _, 0, 0));
     auto tSrS = thr_mma_qk.partition_sg_fragment_C(proxyP);
 
-    // if(cute::thread(THR_ID, BLK_ID)){
-    //     print("****************************\n");
-    //     #define PRINT(x) print(#x ": "); print(x); print("\n");
-    //     PRINT(gQ);
-    //     PRINT(gK);
-    //     PRINT(gV);
-    //     PRINT(gV_split);
-    //     PRINT(tQgQ);
-    //     PRINT(tKgK);
-    //     PRINT(tVgV);
-
-    //     PRINT(tSrQ);
-    //     PRINT(tQcQ);
-    //     PRINT(tQrQ);
-
-    //     PRINT(tKrK);
-    //     PRINT(tSrK);
-    //     PRINT(tSrS);
-    //   }
-
     auto qk_gemm_one_tile = [&](int block_idx, int tile_idx) {
       if constexpr (IS_FP8_QUERY) {
         CUTE_UNROLL
@@ -256,11 +234,6 @@ class XeMlaSparse2StageMainloop {
       }
       return rescale;
     };
-    // if(cute::thread(THR_ID, BLK_ID)){
-    //     #define PRINT(x) print(#x ": "); print(x); print("\n");
-    //     PRINT(tA_max);
-    //     PRINT(tA_sum);
-    // }
 
     auto tArP = thr_mma_pv.partition_sg_fragment_A(proxyP);
     auto tVrV = thr_copy_v.partition_sg_fragment_D(gV_split(_, _, 0, 0));
@@ -271,13 +244,7 @@ class XeMlaSparse2StageMainloop {
       reorder(tVrV, tArV);
       cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, local_v_tile_idx));
     };
-    // if(cute::thread(THR_ID, BLK_ID)){
-    //     #define PRINT(x) print(#x ": "); print(x); print("\n");
-    //     PRINT(tArA);
-    //     PRINT(tArP);
-    //     PRINT(tVrV)
-    //     PRINT(tArV);
-    // }
+
     // Fully-masked-block skip: resolve the per-batch valid lengths of the two
     // concatenated pools once, in registers, so we can cheaply prove an entire
     // 64-column block lies outside every valid range and skip its QK/softmax/PV

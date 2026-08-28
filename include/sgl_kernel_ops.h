@@ -736,6 +736,13 @@ void prepare_moe_input(
     const int64_t n,
     const int64_t k);
 
+void prepare_moe_input_small(
+    const torch::Tensor& input,
+    const torch::Tensor& topk_ids,
+    torch::Tensor& expert_counts,
+    torch::Tensor& output_permutation,
+    torch::Tensor& output);
+
 void ep_moe_pre_reorder(
     torch::Tensor input,
     torch::Tensor gateup_input,

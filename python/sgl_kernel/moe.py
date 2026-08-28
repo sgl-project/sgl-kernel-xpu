@@ -370,7 +370,12 @@ def cutlass_fp4_group_mm(
 
 
 _MOE_WS_HEADROOM = 1.1
+_MOE_SMALL_PREPARE_MAX_ROUTES = 64
+_MOE_SMALL_PREPARE_MAX_ELEMENTS = 81920
 _moe_ws_cache: Dict[Tuple[str, torch.device], torch.Tensor] = {}
+_moe_ws_view_cache: Dict[
+    Tuple[str, torch.device], Tuple[torch.Tensor, tuple, torch.Tensor]
+] = {}
 
 
 def _get_moe_ws(
@@ -397,7 +402,23 @@ def _get_moe_ws(
         new_numel = max(numel, int(numel * _MOE_WS_HEADROOM))
         cur = torch.empty(new_numel, dtype=dtype, device=device)
         _moe_ws_cache[key] = cur
-    return cur.narrow(0, 0, numel).view(shape)
+    cached_view = _moe_ws_view_cache.get(key)
+    shape = tuple(shape)
+    if cached_view is None or cached_view[0] is not cur or cached_view[1] != shape:
+        view = cur.narrow(0, 0, numel).view(shape)
+        _moe_ws_view_cache[key] = (cur, shape, view)
+        return view
+    return cached_view[2]
+
+
+def _should_use_small_moe_prepare(
+    num_tokens: int, topk: int, hidden_dims: int, num_experts: int
+) -> bool:
+    routed_rows = num_tokens * topk
+    return (
+        routed_rows <= min(num_experts, _MOE_SMALL_PREPARE_MAX_ROUTES)
+        and routed_rows * hidden_dims <= _MOE_SMALL_PREPARE_MAX_ELEMENTS
+    )
 
 
 def _validate_fp8_weight_scale(
@@ -603,7 +624,7 @@ def fused_experts(
         use_mxfp4_w4a16 and use_int4_w4a16
     ), "use_mxfp4_w4a16 and use_int4_w4a16 are mutually exclusive"
     assert not (
-        use_4bit_w4a16 and use_fp8_weight_only
+        use_4bit_w4a16 and use_fp8_weight
     ), "4-bit W4A16 and FP8 paths are mutually exclusive"
     if use_4bit_w4a16:
         assert (
@@ -637,7 +658,7 @@ def fused_experts(
                     w2_zp.dtype == w2_scale.dtype and w2_zp.shape == w2_scale.shape
                 ), "w2_zp must have the same dtype and shape as w2_scale"
     else:
-        if not use_fp8_weight_only:
+        if not use_fp8_weight:
             assert w1_scale is None, "w1_scale is only supported for 4-bit W4A16 MoE"
             assert w2_scale is None, "w2_scale is only supported for 4-bit W4A16 MoE"
         assert (
@@ -652,7 +673,7 @@ def fused_experts(
         assert (
             use_int4_w4a16
         ), "w1_g_idx_perm/w2_g_idx_perm only apply to use_int4_w4a16"
-    elif use_fp8_weight_only:
+    elif use_fp8_weight:
         assert (
             w1.dtype == torch.float8_e4m3fn
         ), "FP8 weight-only MoE requires w1 to be float8_e4m3fn"
@@ -735,42 +756,55 @@ def fused_experts(
     else:
         out_hidden_states = torch.empty_like(hidden_states)
 
-    topk_ids = topk_ids.int() if topk_ids.dtype == torch.long else topk_ids
     expert_offsets = _get_moe_ws(
         "expert_offsets", (E,), torch.int32, hidden_states.device
     )
-    problem_sizes1 = _get_moe_ws(
-        "problem_sizes1", (E, 3), torch.int32, hidden_states.device
+    use_small_prepare = (
+        _should_use_small_moe_prepare(M, TopK, hidden_dims, E) and use_fp8_weight
     )
-    problem_sizes2 = _get_moe_ws(
-        "problem_sizes2", (E, 3), torch.int32, hidden_states.device
-    )
-    a_map = _get_moe_ws("a_map", (topk_ids.numel(),), torch.int32, hidden_states.device)
     c_map = _get_moe_ws("c_map", (topk_ids.numel(),), torch.int32, hidden_states.device)
-    torch.ops.sgl_kernel.prepare_moe_input.default(
-        topk_ids,
-        expert_offsets,
-        None,
-        problem_sizes1,
-        problem_sizes2,
-        a_map,
-        c_map,
-        E,
-        hidden_dims,
-        TopK,
-    )
     input_A_shuffle = _get_moe_ws(
         "input_A_shuffle",
         (num_tokens * TopK, K),
         hidden_states.dtype,
         hidden_states.device,
     )
-    # Use scatter_tokens_to_experts (IPEX MoEScatter style):
-    # 1 WG per source token, reads sequentially, scatters to TopK destinations,
-    # with coalesced reads and data reuse.
-    torch.ops.sgl_kernel.scatter_tokens_to_experts.default(
-        hidden_states, c_map, input_A_shuffle
-    )
+    if use_small_prepare:
+        torch.ops.sgl_kernel.prepare_moe_input_small.default(
+            hidden_states, topk_ids, expert_offsets, c_map, input_A_shuffle
+        )
+    else:
+        if topk_ids.dtype == torch.long:
+            topk_ids_int = _get_moe_ws(
+                "topk_ids_int", topk_ids.shape, torch.int32, hidden_states.device
+            )
+            topk_ids_int.copy_(topk_ids)
+        else:
+            topk_ids_int = topk_ids
+        problem_sizes1 = _get_moe_ws(
+            "problem_sizes1", (E, 3), torch.int32, hidden_states.device
+        )
+        problem_sizes2 = _get_moe_ws(
+            "problem_sizes2", (E, 3), torch.int32, hidden_states.device
+        )
+        a_map = _get_moe_ws(
+            "a_map", (topk_ids.numel(),), torch.int32, hidden_states.device
+        )
+        torch.ops.sgl_kernel.prepare_moe_input.default(
+            topk_ids_int,
+            expert_offsets,
+            None,
+            problem_sizes1,
+            problem_sizes2,
+            a_map,
+            c_map,
+            E,
+            hidden_dims,
+            TopK,
+        )
+        torch.ops.sgl_kernel.scatter_tokens_to_experts.default(
+            hidden_states, c_map, input_A_shuffle
+        )
     if w1_g_idx_perm is not None:
         # GPTQ desc_act/g_idx: reorder each expert's activation slice to
         # match the K-dim sort applied to w1 at weight-load time.
@@ -785,7 +819,7 @@ def fused_experts(
         hidden_states.device,
     )
 
-    if use_fp8_weight_only:
+    if use_fp8_weight:
         if activation == "gelu":
             activation_type = 1
         elif activation == "relu2":

@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from mxfp4_utils import MXFP4_BLOCK_SIZE
 from mxfp4_utils import dequantize_mxfp4_2d as _dequantize_mxfp4_2d
 from mxfp4_utils import quantize_mxfp4_2d as _quantize_mxfp4_2d
+
 from sgl_kernel import fused_experts
 
 
@@ -1111,9 +1112,10 @@ def test_moe_gemm_fp8_w8a16_block_weights(
 
     The cases cover each block-scale tile tier and runtime-optional bias.
     """
-    from sgl_kernel.moe import _moe_ws_cache
+    from sgl_kernel.moe import _moe_ws_cache, _moe_ws_view_cache
 
     _moe_ws_cache.clear()
+    _moe_ws_view_cache.clear()
     torch.xpu.synchronize()
     torch.xpu.empty_cache()
     torch.manual_seed(0)
@@ -1177,6 +1179,7 @@ def test_moe_gemm_fp8_w8a16_block_weights(
         torch_output, sglang_output.to("cpu"), rtol=rtol, atol=atol
     )
     _moe_ws_cache.clear()
+    _moe_ws_view_cache.clear()
     torch.xpu.synchronize()
     torch.xpu.empty_cache()
 

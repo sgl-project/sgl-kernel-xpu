@@ -226,6 +226,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       " Tensor! problem_sizes2, Tensor! input_permutation, Tensor! output_permutation, int num_experts, int n, int k)"
       " -> ()");
   m.impl("prepare_moe_input", torch::kXPU, &prepare_moe_input);
+  m.def(
+      "prepare_moe_input_small(Tensor input, Tensor topk_ids, Tensor! expert_counts, Tensor! output_permutation, "
+      "Tensor! output) -> ()");
+  m.impl("prepare_moe_input_small", torch::kXPU, &prepare_moe_input_small);
   m.def("scatter_tokens_to_experts(Tensor input, Tensor src2dst_map, Tensor! output) -> ()");
   m.impl("scatter_tokens_to_experts", torch::kXPU, &scatter_tokens_to_experts);
   m.def(

@@ -1492,16 +1492,23 @@ SGL_KERNEL_EXPORT void mha_fwd(
        std::forward<decltype(tail)>(tail)...);
   };
 
+  bool const is_uniform_qlen = batch_size > 0 && q.size(0) == batch_size * static_cast<int64_t>(max_seqlen_q);
+
   if (max_seqlen_q == 1) {
     // Pure decode path
     dispatch(decode::mha_fwd, std::nullopt);
-  } else if (!page_table.has_value() || batch_size == 1) {
+  } else if (!page_table.has_value() || batch_size == 1 || is_uniform_qlen) {
     // Pure prefill path
     // Non-paged attn: assumption of all seqlen_q > 1;
     // Paged attn: Proving "all prefill" for batch_size > 1 would require
     // is_prefill.all() — a device reduction + D2H sync that costs more than it saves.
-    // But batch_size == 1 makes it provable from host scalars:
-    // a single sequence with max_seqlen_q > 1 is prefill
+    // Two cases are provable from host scalars alone:
+    //   batch_size == 1: a single sequence with max_seqlen_q > 1 is prefill;
+    //   sum(seqlen_q) == batch_size * max_seqlen_q: since every seqlen_q <= max_seqlen_q,
+    //     the sum reaches batch_size * max_seqlen_q only when all of them equal
+    //     max_seqlen_q, which is > 1 on this branch, so no row is a decode row.
+    // Sufficient, not necessary: a non-uniform all-prefill batch falls through to
+    // chunkprefill, which is still correct.
     dispatch(prefill::mha_fwd, std::nullopt);
   } else {
     // Chunk prefill path

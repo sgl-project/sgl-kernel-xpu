@@ -160,26 +160,6 @@ class XeMlaSparse2StageMainloop {
     auto tSrK = thr_mma_qk.partition_sg_fragment_B(gK(_, _, 0, 0));
     auto tSrS = thr_mma_qk.partition_sg_fragment_C(proxyP);
 
-    // if(cute::thread(THR_ID, BLK_ID)){
-    //     print("****************************\n");
-    //     #define PRINT(x) print(#x ": "); print(x); print("\n");
-    //     PRINT(gQ);
-    //     PRINT(gK);
-    //     PRINT(gV);
-    //     PRINT(gV_split);
-    //     PRINT(tQgQ);
-    //     PRINT(tKgK);
-    //     PRINT(tVgV);
-
-    //     PRINT(tSrQ);
-    //     PRINT(tQcQ);
-    //     PRINT(tQrQ);
-
-    //     PRINT(tKrK);
-    //     PRINT(tSrK);
-    //     PRINT(tSrS);
-    //   }
-
     auto qk_gemm_one_tile = [&](int block_idx, int tile_idx) {
       if constexpr (IS_FP8_QUERY) {
         CUTE_UNROLL
@@ -303,13 +283,6 @@ class XeMlaSparse2StageMainloop {
     const int blk_start = kv_split_idx * blocks_per_split;
     const int blk_end = cute::min(num_topk_blocks, blk_start + blocks_per_split);
 
-    // if(cute::thread(THR_ID, BLK_ID)){
-    //   print("num_topk_blocks: "); print(num_topk_blocks); print("\n");
-    //   print("main_len: "); print(main_len); print("\n");
-    //   print("extra_valid_end: "); print(extra_valid_end); print("\n");
-    //   print("blk_start: "); print(blk_start); print("\n");
-    //   print("blk_end: "); print(blk_end); print("\n");
-    // }
     CUTE_NO_UNROLL
     for (int topk_idx = blk_start; topk_idx < blk_end; ++topk_idx) {
       // Block covers gathered columns [c0, c1). It is fully invalid iff it misses

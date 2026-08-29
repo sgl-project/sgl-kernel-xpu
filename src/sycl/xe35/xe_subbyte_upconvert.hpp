@@ -120,9 +120,12 @@ convert_native_e2m1x8(
   using DstType = typename Dst::value_type;
 
 #ifdef __SYCL_DEVICE_ONLY__
-  // E2M1 and the BF16 multiplier have at most 2 and 8 significant bits,
-  // respectively. Their FP32 product therefore fits exactly in binary16 for
-  // every value that can survive E4M3 rounding.
+  // E2M1 and the prepared BF16 multiplier have at most 2 and 8 significant
+  // bits, respectively, and prep bounds the multiplier by 448 / 6. Both the
+  // multiplier and product therefore fit exactly in binary16. Values below
+  // binary16's range are also below E4M3's zero-rounding threshold after the
+  // largest E2M1 multiplier, so converting the scale before multiplication
+  // preserves the E4M3 result while avoiding FP32 promotion.
   CUTLASS_PRAGMA_UNROLL
   for (int pair = 0; pair < 4; ++pair) {
     sycl::detail::fp4_uint8_vec1 packed_pair{
@@ -137,8 +140,7 @@ convert_native_e2m1x8(
       const int p = local & 3;
       const int q = parity + 2 * c;
       const int dst_idx = p + 4 * q + 32 * r + 128 * s;
-      scaled[j] = static_cast<_Float16>(
-          static_cast<float>(decoded[j]) * scale(dst_idx));
+      scaled[j] = decoded[j] * static_cast<_Float16>(scale(dst_idx));
     }
 
     auto converted = __builtin_spirv_ClampConvertFP16ToE4M3INTEL(scaled);

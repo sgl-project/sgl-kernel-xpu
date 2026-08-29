@@ -22,6 +22,7 @@ using KernelFn = void (*)(
     int,
     const int*,
     int,
+    int,
     int*,
     float,
     float,
@@ -154,22 +155,29 @@ using W4A16Fn = void (*)(
     const int*,
     int,
     int,
+    int,
     int*);
 
 // Policy id is selected by GroupGemmW4A16Xe20.cpp so AOT and JIT dispatch use
-// the same avg_m- and gemm_n-dependent decision.
+// the same production-tile decision.
 const char* w4a16_policy(int policy_id) {
   switch (policy_id) {
     case 0:
-      return "w4a16_policy_m_8_n_64";
+      return "w4a16_launch_policy_m_8_n_64";
     case 1:
-      return "w4a16_policy_m_16_n_64";
+      return "w4a16_launch_policy_m_16_n_64";
     case 2:
-      return "w4a16_policy_m_32_n_64";
+      return "w4a16_launch_policy_m_32_n_64";
     case 3:
-      return "w4a16_policy_m_64_n_128";
+      return "w4a16_launch_policy_m_64_n_128";
     case 4:
-      return "w4a16_policy_m_128_n_128";
+      return "w4a16_launch_policy_m_64_n_128_skip";
+    case 5:
+      return "w4a16_launch_policy_m_64_n_256";
+    case 6:
+      return "w4a16_launch_policy_m_64_n_256_skip";
+    case 7:
+      return "w4a16_launch_policy_m_128_n_128";
     default:
       return nullptr;
   }
@@ -239,6 +247,7 @@ bool w4a16_grouped_gemm_launch(
     int gemm_n,
     int gemm_k,
     const int* rows_per_expert,
+    int total_rows,
     int num_experts,
     int group_size,
     int* atomic_buffer,
@@ -256,6 +265,7 @@ bool w4a16_grouped_gemm_launch(
      gemm_n,
      gemm_k,
      rows_per_expert,
+     total_rows,
      num_experts,
      group_size,
      atomic_buffer);

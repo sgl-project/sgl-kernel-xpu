@@ -35,11 +35,13 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include <cstdint>
 #include <sycl/sycl.hpp>
+#include <unordered_map>
 
 #include "sgl_kernel_export.h"
 #include "sycl/Utils.h"
-#include "sycl/kernels/moe/xe20/w4a16/gemm_xe2_policy.hpp"
+#include "sycl/kernels/moe/xe20/w4a16_launch_policy.hpp"
 #ifdef USE_MOE_JIT
 #include "jit/moe_jit.h"
 #endif
@@ -57,6 +59,7 @@ void w4a16_launch(
     const int gemm_n,
     const int gemm_k,
     const int* rows_per_expert,
+    const int total_rows,
     const int num_experts,
     const int group_size,
     int32_t* atomic_buffer);
@@ -76,6 +79,7 @@ void w4a16_launch(
       const int*,                                                                      \
       const int,                                                                       \
       const int,                                                                       \
+      const int,                                                                       \
       int32_t*);
 
 #define DECLARE_W4A16_POLICY(Policy)                                     \
@@ -84,64 +88,68 @@ void w4a16_launch(
   DECLARE_W4A16_EXTERN(Policy, uint8_t, cutlass::bfloat16_t)             \
   DECLARE_W4A16_EXTERN(Policy, uint8_t, cutlass::half_t)
 
-DECLARE_W4A16_POLICY(w4a16_policy_m_8_n_64)
-DECLARE_W4A16_POLICY(w4a16_policy_m_16_n_64)
-DECLARE_W4A16_POLICY(w4a16_policy_m_32_n_64)
-DECLARE_W4A16_POLICY(w4a16_policy_m_64_n_128)
-DECLARE_W4A16_POLICY(w4a16_policy_m_128_n_128)
+DECLARE_W4A16_POLICY(w4a16_launch_policy_m_8_n_64)
+DECLARE_W4A16_POLICY(w4a16_launch_policy_m_16_n_64)
+DECLARE_W4A16_POLICY(w4a16_launch_policy_m_32_n_64)
+DECLARE_W4A16_POLICY(w4a16_launch_policy_m_64_n_128)
+DECLARE_W4A16_POLICY(w4a16_launch_policy_m_64_n_128_skip)
+DECLARE_W4A16_POLICY(w4a16_launch_policy_m_64_n_256)
+DECLARE_W4A16_POLICY(w4a16_launch_policy_m_64_n_256_skip)
+DECLARE_W4A16_POLICY(w4a16_launch_policy_m_128_n_128)
 
 #undef DECLARE_W4A16_POLICY
 #undef DECLARE_W4A16_EXTERN
 
 namespace {
 
-// GEMM shape -> tile policy, weighted by how much of each tile the GEMM fills.
-//
-// The grouped GEMM tiles every expert's rows independently, so a policy with an
-// M tile of T computes ceil(avg_m / T) * T rows per expert whatever avg_m is.
-// Picking the widest tile unconditionally therefore falls off a cliff just past
-// a multiple of T: at avg_m = 129 an M=128 tile does 256 rows of work for 129
-// rows of data and loses half the machine. N tails have the same effect: a
-// policy computes ceil(gemm_n / tile_n) * tile_n columns. Scoring each candidate
-// by its peak throughput times both fill factors estimates which policy finishes
-// first.
-//
-// The peaks below are measured on Xe2 (Arc Pro B60, bf16 activations) at
-// avg_m values that fill each tile exactly, in TFLOP/s. They are only ever
-// compared against each other, so the absolute scale does not matter -- what
-// matters is that a wider tile is worth more per row but wastes more of a
-// partial tile. GPT-OSS gemm1 (N=5760, K=2880) and DeepSeek-V4 gemm1
-// (N=4096, K=4096) agree on this ordering.
-constexpr int kW4A16TileM[] = {32, 64, 128};
-constexpr int kW4A16TileN[] = {64, 128, 128};
-constexpr float kW4A16TilePeakTflops[] = {49.0f, 64.0f, 68.0f};
+// fmha-cri's production registry keeps one M subgroup in the large-M tiles, so
+// an irregular expert tail never leaves an entire subgroup doing masked work.
+// The 256-wide variant wins long-K GEMM1 except where N padding outweighs its
+// measured peak advantage; short-K GEMM2 uses the 128-wide variant.
+constexpr float kW4A16PeakN256 = 82.9f;
+constexpr float kW4A16PeakN128 = 75.6f;
+constexpr int kW4A16ShortK = 1024;
 
-int select_w4a16_tile_m(int avg_m, int gemm_n) {
-  int best_tile_m = kW4A16TileM[0];
-  float best_score = 0.0f;
-  for (size_t i = 0; i < sizeof(kW4A16TileM) / sizeof(kW4A16TileM[0]); ++i) {
-    const int tile_m = kW4A16TileM[i];
-    const int tile_n = kW4A16TileN[i];
-    const int rows_computed = ((avg_m + tile_m - 1) / tile_m) * tile_m;
-    const int columns_computed = ((gemm_n + tile_n - 1) / tile_n) * tile_n;
-    const float score = kW4A16TilePeakTflops[i] * static_cast<float>(avg_m) / static_cast<float>(rows_computed) *
-                        static_cast<float>(gemm_n) / static_cast<float>(columns_computed);
-    if (score > best_score) {
-      best_score = score;
-      best_tile_m = tile_m;
-    }
-  }
-  return best_tile_m;
+int round_up(int value, int multiple) {
+  return (value + multiple - 1) / multiple * multiple;
 }
 
-int select_w4a16_policy_id(int avg_m, int gemm_n) {
-  if (avg_m <= 4) return 0;
-  if (avg_m <= 8) return 1;
+bool want_nskip(int gemm_n, int tile_n) {
+  const int tail = gemm_n % tile_n;
+  return tail != 0 && tail <= tile_n / 2;
+}
 
-  const int tile_m = select_w4a16_tile_m(avg_m, gemm_n);
-  if (tile_m <= 32) return 2;
-  if (tile_m <= 64) return 3;
-  return 4;
+at::Tensor& w4a16_atomic_counter(const torch::TensorOptions& options, c10::xpu::XPUStream stream) {
+  // This counter is private to one host thread, XPU device, and PyTorch stream.
+  // Keeping it alive avoids an allocator round trip between the benchmark's
+  // device timing events on every launch, while distinct streams never race on
+  // the work-stealing state.
+  thread_local std::unordered_map<uint64_t, at::Tensor> counters;
+  const uint64_t device_key = static_cast<uint32_t>(stream.device_index());
+  const uint64_t stream_key = static_cast<uint32_t>(stream.id());
+  const uint64_t key = (device_key << 32) | stream_key;
+  auto [it, inserted] = counters.try_emplace(key);
+  if (inserted) {
+    it->second = at::empty({1}, options.dtype(at::kInt));
+  }
+  return it->second;
+}
+
+int select_w4a16_policy_id(int avg_m, int gemm_n, int gemm_k) {
+  if (avg_m <= 8) return 0;
+  if (avg_m <= 16) return 1;
+  if (avg_m <= 32) return 2;
+
+  if (gemm_k <= kW4A16ShortK) {
+    return want_nskip(gemm_n, 128) ? 4 : 3;
+  }
+
+  const float fill_n256 = static_cast<float>(gemm_n) / round_up(gemm_n, 256);
+  const float fill_n128 = static_cast<float>(gemm_n) / round_up(gemm_n, 128);
+  if (kW4A16PeakN256 * fill_n256 >= kW4A16PeakN128 * fill_n128) {
+    return want_nskip(gemm_n, 256) ? 6 : 5;
+  }
+  return want_nskip(gemm_n, 128) ? 4 : 3;
 }
 
 }  // namespace
@@ -247,10 +255,12 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
   c10::DeviceGuard device_guard(activations.device());
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
-  at::Tensor atomic_buffer = at::empty({static_cast<long>(1)}, activations.options().dtype(at::kInt));
+  at::Tensor& atomic_buffer = w4a16_atomic_counter(activations.options(), stream);
+  // The imported kernel resets this persistent work-stealing counter itself.
+  // Avoid a separate four-byte memset launch, which is material for decode.
 
   const int avg_m = total_m / static_cast<int>(n_experts);
-  const int policy_id = select_w4a16_policy_id(avg_m, gemm_n);
+  const int policy_id = select_w4a16_policy_id(avg_m, gemm_n, gemm_k);
   const bool is_fp16_act = activations.scalar_type() == at::ScalarType::Half;
 #define LAUNCH_W4A16(Policy)                                                                  \
   do {                                                                                        \
@@ -267,6 +277,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
             gemm_n,                                                                           \
             gemm_k,                                                                           \
             rows_per_expert.data_ptr<int>(),                                                  \
+            total_m,                                                                          \
             static_cast<int>(n_experts),                                                      \
             static_cast<int>(group_size),                                                     \
             atomic_buffer.data_ptr<int>());                                                   \
@@ -282,6 +293,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
             gemm_n,                                                                           \
             gemm_k,                                                                           \
             rows_per_expert.data_ptr<int>(),                                                  \
+            total_m,                                                                          \
             static_cast<int>(n_experts),                                                      \
             static_cast<int>(group_size),                                                     \
             atomic_buffer.data_ptr<int>());                                                   \
@@ -299,6 +311,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
             gemm_n,                                                                           \
             gemm_k,                                                                           \
             rows_per_expert.data_ptr<int>(),                                                  \
+            total_m,                                                                          \
             static_cast<int>(n_experts),                                                      \
             static_cast<int>(group_size),                                                     \
             atomic_buffer.data_ptr<int>());                                                   \
@@ -314,6 +327,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
             gemm_n,                                                                           \
             gemm_k,                                                                           \
             rows_per_expert.data_ptr<int>(),                                                  \
+            total_m,                                                                          \
             static_cast<int>(n_experts),                                                      \
             static_cast<int>(group_size),                                                     \
             atomic_buffer.data_ptr<int>());                                                   \
@@ -321,25 +335,34 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
     }                                                                                         \
   } while (0)
 
-#define DISPATCH_W4A16_POLICY()                 \
-  do {                                          \
-    switch (policy_id) {                        \
-      case 0:                                   \
-        LAUNCH_W4A16(w4a16_policy_m_8_n_64);    \
-        break;                                  \
-      case 1:                                   \
-        LAUNCH_W4A16(w4a16_policy_m_16_n_64);   \
-        break;                                  \
-      case 2:                                   \
-        LAUNCH_W4A16(w4a16_policy_m_32_n_64);   \
-        break;                                  \
-      case 3:                                   \
-        LAUNCH_W4A16(w4a16_policy_m_64_n_128);  \
-        break;                                  \
-      case 4:                                   \
-        LAUNCH_W4A16(w4a16_policy_m_128_n_128); \
-        break;                                  \
-    }                                           \
+#define DISPATCH_W4A16_POLICY()                            \
+  do {                                                     \
+    switch (policy_id) {                                   \
+      case 0:                                              \
+        LAUNCH_W4A16(w4a16_launch_policy_m_8_n_64);        \
+        break;                                             \
+      case 1:                                              \
+        LAUNCH_W4A16(w4a16_launch_policy_m_16_n_64);       \
+        break;                                             \
+      case 2:                                              \
+        LAUNCH_W4A16(w4a16_launch_policy_m_32_n_64);       \
+        break;                                             \
+      case 3:                                              \
+        LAUNCH_W4A16(w4a16_launch_policy_m_64_n_128);      \
+        break;                                             \
+      case 4:                                              \
+        LAUNCH_W4A16(w4a16_launch_policy_m_64_n_128_skip); \
+        break;                                             \
+      case 5:                                              \
+        LAUNCH_W4A16(w4a16_launch_policy_m_64_n_256);      \
+        break;                                             \
+      case 6:                                              \
+        LAUNCH_W4A16(w4a16_launch_policy_m_64_n_256_skip); \
+        break;                                             \
+      case 7:                                              \
+        LAUNCH_W4A16(w4a16_launch_policy_m_128_n_128);     \
+        break;                                             \
+    }                                                      \
   } while (0)
 
 #ifdef USE_MOE_JIT
@@ -360,6 +383,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
             gemm_n,
             gemm_k,
             rows_per_expert.data_ptr<int>(),
+            total_m,
             static_cast<int>(n_experts),
             static_cast<int>(group_size),
             atomic_buffer.data_ptr<int>(),

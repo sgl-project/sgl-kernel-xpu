@@ -62,8 +62,31 @@ def make_inputs(groups: int, m: int, n: int, k: int):
     }
 
 
-def run_case(ext, args, case: str, m: int):
-    x = make_inputs(args.groups, m, args.n, args.k)
+def run_case(ext, args, case: str, m: int, n: int, k: int):
+    x = make_inputs(args.groups, m, n, k)
+    if args.only_bf16:
+        woq_bf16 = ext.benchmark_nvfp4_bf16(
+            x["output"],
+            x["a_bf16"],
+            x["b_nvfp4"],
+            x["sfmx_b"],
+            x["c_b"],
+            x["problem_sizes"],
+            x["expert_offsets"],
+            x["workspace"],
+            args.warmup,
+            args.iterations,
+        )
+        flops = 2.0 * args.groups * m * n * k
+        tflops = flops / (woq_bf16["cute_ms"] * 1e-3) / 1e12
+        print(f"case={case} shape=E{args.groups} M{m} N{n} K{k}")
+        print("path             cute_ms  full_device_ms  cute_TFLOP/s")
+        print(
+            f"{'nvfp4_bf16':13s}  {woq_bf16['cute_ms']:8.4f}  "
+            f"{woq_bf16['device_span_ms']:14.4f}  {tflops:12.3f}"
+        )
+        return
+
     mx = ext.benchmark_mxfp8(
         x["output"],
         x["a_mxfp8"],
@@ -105,8 +128,8 @@ def run_case(ext, args, case: str, m: int):
         args.iterations,
     )
 
-    flops = 2.0 * args.groups * m * args.n * args.k
-    print(f"case={case} shape=E{args.groups} M{m} N{args.n} K{args.k}")
+    flops = 2.0 * args.groups * m * n * k
+    print(f"case={case} shape=E{args.groups} M{m} N{n} K{k}")
     print("path             cute_ms  full_device_ms  cute_TFLOP/s")
     results = (
         ("mxfp8", mx),
@@ -139,6 +162,15 @@ def main():
     parser.add_argument("--k", type=int, default=512)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iterations", type=int, default=3)
+    parser.add_argument(
+        "--shapes",
+        help="comma-separated M:N:K tuples; overrides the individual shape options",
+    )
+    parser.add_argument(
+        "--only-bf16",
+        action="store_true",
+        help="skip the unchanged MXFP8 reference paths",
+    )
     args = parser.parse_args()
 
     if not torch.xpu.is_available():
@@ -146,14 +178,22 @@ def main():
     ext = load_extension()
     print(f"device={torch.xpu.get_device_name()}")
     cases = []
-    if args.case in ("decode", "both"):
-        cases.append(("decode", args.decode_m))
-    if args.case in ("prefill", "both"):
-        cases.append(("prefill", args.prefill_m))
-    for index, (case, m) in enumerate(cases):
+    if args.shapes:
+        for value in args.shapes.split(","):
+            try:
+                m, n, k = (int(dim) for dim in value.split(":"))
+            except ValueError as exc:
+                raise ValueError(f"invalid shape {value!r}; expected M:N:K") from exc
+            cases.append(("sweep", m, n, k))
+    else:
+        if args.case in ("decode", "both"):
+            cases.append(("decode", args.decode_m, args.n, args.k))
+        if args.case in ("prefill", "both"):
+            cases.append(("prefill", args.prefill_m, args.n, args.k))
+    for index, (case, m, n, k) in enumerate(cases):
         if index:
             print()
-        run_case(ext, args, case, m)
+        run_case(ext, args, case, m, n, k)
 
 
 if __name__ == "__main__":

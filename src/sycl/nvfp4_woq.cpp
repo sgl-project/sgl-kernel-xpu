@@ -64,6 +64,23 @@ inline int ue8m0_exponent(float amax) {
   return sycl::clamp(k, -UE8M0_BIAS, 127);
 }
 
+/// Construct 2^exponent exactly for the full UE8M0 exponent range.
+inline float power_of_two(int exponent) {
+  // IEEE-754 encodes 2^-127 as a subnormal; all remaining values use a biased
+  // normal exponent. Callers pass only [-127, 127].
+  const uint32_t bits = exponent == -127
+      ? 0x00400000u
+      : static_cast<uint32_t>(exponent + 127) << 23;
+  return sycl::bit_cast<float>(bits);
+}
+
+/// Convert a finite float to BF16 bits using round-to-nearest, ties-to-even.
+inline uint16_t float_to_bf16_rne_bits(float value) {
+  const uint32_t bits = sycl::bit_cast<uint32_t>(value);
+  const uint32_t rounding_bias = 0x7fffu + ((bits >> 16) & 1u);
+  return static_cast<uint16_t>((bits + rounding_bias) >> 16);
+}
+
 struct NvFp4WoqPrepKernel;
 
 }  // namespace
@@ -83,6 +100,10 @@ void nvfp4_woq_prep(
     const torch::Tensor& w_s,
     const torch::Tensor& w_gs) {
   TORCH_CHECK(w_s.device().is_xpu(), "nvfp4_woq_prep: w_s must be on XPU");
+  const auto device = w_s.device();
+  TORCH_CHECK(w_gs.device() == device, "nvfp4_woq_prep: w_gs must be on the same XPU device as w_s");
+  TORCH_CHECK(out_c.device() == device, "nvfp4_woq_prep: out_c must be on the same XPU device as w_s");
+  TORCH_CHECK(out_sfmx.device() == device, "nvfp4_woq_prep: out_sfmx must be on the same XPU device as w_s");
   TORCH_CHECK(w_s.dim() == 3, "nvfp4_woq_prep: w_s must be (E, N, K/16), got ", w_s.dim(), "D");
   TORCH_CHECK(w_s.scalar_type() == torch::kFloat8_e4m3fn, "nvfp4_woq_prep: w_s must be float8_e4m3fn");
   TORCH_CHECK(w_gs.scalar_type() == torch::kFloat32, "nvfp4_woq_prep: w_gs must be float32");
@@ -113,10 +134,10 @@ void nvfp4_woq_prep(
 
   const uint8_t* src_s = reinterpret_cast<const uint8_t*>(w_s.data_ptr());
   const float* src_gs = w_gs.data_ptr<float>();
-  auto* dst_c = reinterpret_cast<sycl::ext::oneapi::bfloat16*>(out_c.data_ptr());
+  auto* dst_c = reinterpret_cast<uint16_t*>(out_c.data_ptr());
   uint8_t* dst_sfmx = reinterpret_cast<uint8_t*>(out_sfmx.data_ptr());
 
-  auto& q = at::xpu::getCurrentXPUStream(w_s.device().index()).queue();
+  auto& q = at::xpu::getCurrentXPUStream(device.index()).queue();
   const size_t wg = 256;
   const size_t global = ((static_cast<size_t>(total) + wg - 1) / wg) * wg;
 
@@ -140,12 +161,12 @@ void nvfp4_woq_prep(
           const float s1 = static_cast<float>(sf[sf_base + 1]) * gs;
 
           const int kexp = ue8m0_exponent(E2M1_MAX * sycl::fmax(s0, s1));
-          const float inv = sycl::exp2(static_cast<float>(-kexp));
+          const float inv = power_of_two(-kexp);
 
           dst_sfmx[(e * sk32 + g32) * N + n] = static_cast<uint8_t>(kexp + UE8M0_BIAS);
           auto* c_row = dst_c + (e * N + n) * sk16 + 2 * g32;
-          c_row[0] = static_cast<sycl::ext::oneapi::bfloat16>(s0 * inv);
-          c_row[1] = static_cast<sycl::ext::oneapi::bfloat16>(s1 * inv);
+          c_row[0] = float_to_bf16_rne_bits(s0 * inv);
+          c_row[1] = float_to_bf16_rne_bits(s1 * inv);
         });
   });
 }

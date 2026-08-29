@@ -24,6 +24,8 @@
 */
 
 // clang-format off
+#include <mutex>
+#include <unordered_map>
 #include <utility>
 
 #include <ATen/ATen.h>
@@ -56,10 +58,37 @@
 using namespace cute;
 using namespace cutlass::gemm;
 
+class NvFp4WoqMxFp8BuildMetadataAndTransposeScales;
+class NvFp4WoqBf16BuildMetadata;
+
 namespace at::native::xpu {
 
 using NvFp4GroupedProblemShape = cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>;
 using NvFp4UnderlyingProblemShapeType = typename NvFp4GroupedProblemShape::UnderlyingProblemShape;
+
+int cached_device_multiprocessor_count(int device_id) {
+  static std::mutex cache_mutex;
+  static std::unordered_map<int, int> cache;
+  thread_local bool thread_cache_valid = false;
+  thread_local int thread_device_id = 0;
+  thread_local int thread_count = 0;
+
+  if (thread_cache_valid && thread_device_id == device_id) {
+    return thread_count;
+  }
+  std::lock_guard<std::mutex> lock(cache_mutex);
+  auto it = cache.find(device_id);
+  if (it != cache.end()) {
+    thread_count = it->second;
+  } else {
+    thread_count =
+        cutlass::KernelHardwareInfo::query_device_multiprocessor_count(device_id);
+    cache.emplace(device_id, thread_count);
+  }
+  thread_device_id = device_id;
+  thread_cache_valid = true;
+  return thread_count;
+}
 
 // NVFP4-B x MXFP8-A: E2M1 payload for B, E4M3 for A, UE8M0 block scales for
 // both (B's are the requantization exponents produced by nvfp4_woq_prep).
@@ -244,31 +273,21 @@ cutlass::Status run_large_grf(
 void run_nvfp4_woq_gemm(
     int num_groups,
     const torch::Tensor& problem_sizes,
-    const torch::Tensor& ptr_table,   // {5, E} int64: a, b, out, sfa, sfb
-    const torch::Tensor& cb_ptrs,     // {E} int64
-    const torch::Tensor& cb_ld,       // {E} int64
-    int sfa_m_stride,
+    const torch::Tensor& ptr_table,
+    const torch::Tensor& cb_ptrs,
+    const torch::Tensor& cb_ld,
+    const torch::Tensor& stride_a,
+    const torch::Tensor& stride_b,
+    const torch::Tensor& stride_cd,
+    const torch::Tensor& stride_sfa,
+    const torch::Tensor& stride_sfb,
     const torch::Tensor& workspace,
     at::Device device) {
-  auto opts_i64 = torch::TensorOptions().dtype(torch::kInt64).device(device);
-
-  auto M_col = problem_sizes.select(1, 0);
-  auto N_col = problem_sizes.select(1, 1);
-  auto K_col = problem_sizes.select(1, 2);
-
-  torch::Tensor stride_A_dev = K_col.to(torch::kInt64).contiguous();
-  torch::Tensor stride_B_dev = K_col.to(torch::kInt64).contiguous();
-  torch::Tensor stride_CD_dev = N_col.to(torch::kInt64).contiguous();
-
-  auto zeros = torch::zeros({num_groups}, opts_i64);
-  // A scales: Stride<_1, padded_max_m, 0>; B scales: Stride<_1, N, 0>.
-  auto stride_SFA_dev = torch::stack(
-      {torch::full({num_groups}, static_cast<int64_t>(sfa_m_stride), opts_i64), zeros}, 1).contiguous();
-  auto stride_SFB_dev = torch::stack({N_col.to(torch::kInt64), zeros}, 1).contiguous();
+  auto row = [&](int i) { return ptr_table[i].data_ptr(); };
 
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = static_cast<int>(device.index());
-  hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+  hw_info.sm_count = cached_device_multiprocessor_count(hw_info.device_id);
 
   auto stream = at::xpu::getCurrentXPUStream(device.index());
   sycl::queue& queue = stream.queue();
@@ -293,8 +312,6 @@ void run_nvfp4_woq_gemm(
   using ElementMult = NvFp4WoqTypes::ElementMult;
   using ElementOutput = NvFp4WoqTypes::ElementOutput;
 
-  auto row = [&](int i) { return ptr_table[i].data_ptr(); };
-
   typename GemmKernel::Arguments gemm_args{
       cutlass::gemm::GemmUniversalMode::kGrouped,
       typename GemmKernel::ProblemShape{
@@ -303,21 +320,21 @@ void run_nvfp4_woq_gemm(
           nullptr},
       typename GemmKernel::MainloopArguments{
           reinterpret_cast<ElementInputA const**>(row(0)),
-          reinterpret_cast<NvFp4WoqTypes::StrideA*>(stride_A_dev.data_ptr<int64_t>()),
+          reinterpret_cast<NvFp4WoqTypes::StrideA*>(stride_a.data_ptr<int64_t>()),
           reinterpret_cast<ElementInputB const**>(row(1)),
-          reinterpret_cast<NvFp4WoqTypes::StrideB*>(stride_B_dev.data_ptr<int64_t>()),
+          reinterpret_cast<NvFp4WoqTypes::StrideB*>(stride_b.data_ptr<int64_t>()),
           reinterpret_cast<ElementScale const**>(row(3)),
-          reinterpret_cast<NvFp4WoqTypes::StrideScaleA*>(stride_SFA_dev.data_ptr<int64_t>()),
+          reinterpret_cast<NvFp4WoqTypes::StrideScaleA*>(stride_sfa.data_ptr<int64_t>()),
           reinterpret_cast<ElementScale const**>(row(4)),
-          reinterpret_cast<NvFp4WoqTypes::StrideScaleB*>(stride_SFB_dev.data_ptr<int64_t>()),
+          reinterpret_cast<NvFp4WoqTypes::StrideScaleB*>(stride_sfb.data_ptr<int64_t>()),
           reinterpret_cast<ElementMult const**>(cb_ptrs.data_ptr()),
           cb_ld.data_ptr<int64_t>()},
       typename GemmKernel::EpilogueArguments{
           fusion_args,
           reinterpret_cast<ElementOutput const**>(row(2)),
-          reinterpret_cast<NvFp4WoqTypes::StrideC*>(stride_CD_dev.data_ptr<int64_t>()),
+          reinterpret_cast<NvFp4WoqTypes::StrideC*>(stride_cd.data_ptr<int64_t>()),
           reinterpret_cast<ElementOutput**>(row(2)),
-          reinterpret_cast<NvFp4WoqTypes::StrideD*>(stride_CD_dev.data_ptr<int64_t>())},
+          reinterpret_cast<NvFp4WoqTypes::StrideD*>(stride_cd.data_ptr<int64_t>())},
       hw_info,
       typename GemmKernel::TileSchedulerArguments{1, RasterOrderOptions::AlongN}};
 
@@ -337,7 +354,8 @@ void run_nvfp4_woq_gemm(
 
 // NVFP4-B x BF16-A: B is converted and scaled to BF16 in registers, then a
 // regular BF16 DPAS performs the matrix multiply with FP32 accumulation.
-struct NvFp4WoqBf16Types {
+template <class TileShape_, class ThreadLayout_>
+struct NvFp4WoqBf16TypesBase {
   using ElementInputA = cutlass::bfloat16_t;
   using ElementInputB = cutlass::float_e2m1_t;
   using ElementScale = uint8_t;
@@ -351,21 +369,8 @@ struct NvFp4WoqBf16Types {
   using LayoutC = cutlass::layout::RowMajor;
   using LayoutD = cutlass::layout::RowMajor;
 
-  // K=32 holds two NVFP4 scale groups and keeps the wider BF16 B fragment
-  // within the same register footprint as the K=64 MXFP8 path.
-  //
-  // This path keeps SG_M=32 (8x4) even though the MXFP8 WoQ path above moved to
-  // SG_M=64. SG_M=64 was measured both ways here at 512 GRF and lost every time:
-  //   4x4 <256,256,32>  SG_M=64 : +36% (gemm1 M=1024 1225 -> 1667 us)
-  //   8x4 <512,256,32>  SG_M=64 : +47% (                  1225 -> 1802 us)
-  // Neither variant spills, so this is not register pressure. With BLK_K=32 this
-  // mainloop runs twice the k-iterations of the MXFP8 path for half the work
-  // each, which leaves it latency- rather than ALU-bound; halving the subgroups
-  // per workgroup (4x4) or doubling the tile (BLK_M=512) both cost more in
-  // latency hiding than the extra SG_M saves in B-conversion work.
-  using TileShape = Shape<_256, _256, _32>;
-  using ThreadLayout = cute::Layout<cute::Shape<cute::_8, cute::_4, cute::_1>,
-                                    cute::Stride<cute::_4, cute::_1, cute::_0>>;
+  using TileShape = TileShape_;
+  using ThreadLayout = ThreadLayout_;
   using TiledMma = typename cute::TiledMMAHelper<
       cute::MMA_Atom<cute::XE_DPAS_TT<8, float, ElementInputA>>,
       cute::Layout<TileShape>,
@@ -430,28 +435,71 @@ struct NvFp4WoqBf16Types {
   using StrideD = typename GemmKernel::InternalStrideD;
 };
 
+using NvFp4WoqBf16M8N128Types = NvFp4WoqBf16TypesBase<
+    Shape<_8, _128, _32>,
+    cute::Layout<cute::Shape<_1, _4, _1>,
+                 cute::Stride<_4, _1, _0>>>;
+using NvFp4WoqBf16M8N256Types = NvFp4WoqBf16TypesBase<
+    Shape<_8, _256, _32>,
+    cute::Layout<cute::Shape<_1, _8, _1>,
+                 cute::Stride<_8, _1, _0>>>;
+using NvFp4WoqBf16M32N256Types = NvFp4WoqBf16TypesBase<
+    Shape<_32, _256, _32>,
+    cute::Layout<cute::Shape<_1, _8, _1>,
+                 cute::Stride<_8, _1, _0>>>;
+using NvFp4WoqBf16M64N256Types = NvFp4WoqBf16TypesBase<
+    Shape<_64, _256, _32>,
+    cute::Layout<cute::Shape<_2, _8, _1>,
+                 cute::Stride<_8, _1, _0>>>;
+using NvFp4WoqBf16Types = NvFp4WoqBf16TypesBase<
+    Shape<_256, _256, _32>,
+    cute::Layout<cute::Shape<_8, _4, _1>,
+                 cute::Stride<_4, _1, _0>>>;
+
+enum class NvFp4WoqBf16Tile {
+  M8N128,
+  M8N256,
+  M32N256,
+  M64N256,
+  M256N256,
+};
+
+NvFp4WoqBf16Tile select_nvfp4_woq_bf16_tile(
+    int64_t total_rows, int num_groups, int n, int sm_count) {
+  const int64_t rows_per_group =
+      (total_rows + num_groups - 1) / num_groups;
+  if (rows_per_group <= 8) {
+    const int64_t m8n256_workgroups =
+        static_cast<int64_t>(num_groups) * cute::ceil_div(n, 256);
+    return m8n256_workgroups < sm_count ? NvFp4WoqBf16Tile::M8N128
+                                       : NvFp4WoqBf16Tile::M8N256;
+  }
+  if (rows_per_group <= 32) return NvFp4WoqBf16Tile::M32N256;
+  if (rows_per_group <= 64) return NvFp4WoqBf16Tile::M64N256;
+  return NvFp4WoqBf16Tile::M256N256;
+}
+
+template <class Types>
 void run_nvfp4_woq_bf16_gemm(
     int num_groups,
     const torch::Tensor& problem_sizes,
-    const torch::Tensor& ptr_table,  // {4, E}: a, b, out, sfmx
+    const torch::Tensor& ptr_table,
     const torch::Tensor& cb_ptrs,
     const torch::Tensor& cb_ld,
+    const torch::Tensor& stride_a,
+    const torch::Tensor& stride_b,
+    const torch::Tensor& stride_cd,
     const torch::Tensor& workspace,
+    int sm_count,
     at::Device device) {
-  using Types = NvFp4WoqBf16Types;
-  using Bf16Gemm = Types::Gemm;
-  using Bf16GemmKernel = Types::GemmKernel;
+  using Bf16Gemm = typename Types::Gemm;
+  using Bf16GemmKernel = typename Types::GemmKernel;
 
-  auto N_col = problem_sizes.select(1, 1);
-  auto K_col = problem_sizes.select(1, 2);
-  auto stride_A_dev = K_col.to(torch::kInt64).contiguous();
-  auto stride_B_dev = K_col.to(torch::kInt64).contiguous();
-  auto stride_CD_dev = N_col.to(torch::kInt64).contiguous();
+  auto row = [&](int i) { return ptr_table[i].data_ptr(); };
 
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = static_cast<int>(device.index());
-  hw_info.sm_count =
-      cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+  hw_info.sm_count = sm_count;
 
   auto stream = at::xpu::getCurrentXPUStream(device.index());
   sycl::queue& queue = stream.queue();
@@ -469,8 +517,6 @@ void run_nvfp4_woq_bf16_gemm(
 
   using RasterOrderOptions = typename cutlass::gemm::kernel::detail::
       PersistentTileSchedulerXeGroup<NvFp4GroupedProblemShape>::RasterOrderOptions;
-  auto row = [&](int i) { return ptr_table[i].data_ptr(); };
-
   typename Bf16GemmKernel::Arguments gemm_args{
       cutlass::gemm::GemmUniversalMode::kGrouped,
       typename Bf16GemmKernel::ProblemShape{
@@ -479,19 +525,19 @@ void run_nvfp4_woq_bf16_gemm(
               problem_sizes.data_ptr<int32_t>()),
           nullptr},
       typename Bf16GemmKernel::MainloopArguments{
-          reinterpret_cast<Types::ElementInputA const**>(row(0)),
-          reinterpret_cast<Types::StrideA*>(stride_A_dev.data_ptr<int64_t>()),
-          reinterpret_cast<Types::ElementInputB const**>(row(1)),
-          reinterpret_cast<Types::StrideB*>(stride_B_dev.data_ptr<int64_t>()),
-          reinterpret_cast<Types::ElementScale const**>(row(3)),
-          reinterpret_cast<Types::ElementMult const**>(cb_ptrs.data_ptr()),
+          reinterpret_cast<typename Types::ElementInputA const**>(row(0)),
+          reinterpret_cast<typename Types::StrideA*>(stride_a.data_ptr<int64_t>()),
+          reinterpret_cast<typename Types::ElementInputB const**>(row(1)),
+          reinterpret_cast<typename Types::StrideB*>(stride_b.data_ptr<int64_t>()),
+          reinterpret_cast<typename Types::ElementScale const**>(row(3)),
+          reinterpret_cast<typename Types::ElementMult const**>(cb_ptrs.data_ptr()),
           cb_ld.data_ptr<int64_t>()},
       typename Bf16GemmKernel::EpilogueArguments{
           fusion_args,
-          reinterpret_cast<Types::ElementOutput const**>(row(2)),
-          reinterpret_cast<Types::StrideC*>(stride_CD_dev.data_ptr<int64_t>()),
-          reinterpret_cast<Types::ElementOutput**>(row(2)),
-          reinterpret_cast<Types::StrideD*>(stride_CD_dev.data_ptr<int64_t>())},
+          reinterpret_cast<typename Types::ElementOutput const**>(row(2)),
+          reinterpret_cast<typename Types::StrideC*>(stride_cd.data_ptr<int64_t>()),
+          reinterpret_cast<typename Types::ElementOutput**>(row(2)),
+          reinterpret_cast<typename Types::StrideD*>(stride_cd.data_ptr<int64_t>())},
       hw_info,
       typename Bf16GemmKernel::TileSchedulerArguments{
           1, RasterOrderOptions::AlongN}};
@@ -537,9 +583,21 @@ void nvfp4_woq_mxfp8_scaled_grouped_mm(
   constexpr int BLK_K = cute::get<2>(Types::TileShape{});
 
   TORCH_CHECK(a.device().is_xpu(), "nvfp4_woq: A must be on XPU");
-  TORCH_CHECK(b.device().is_xpu(), "nvfp4_woq: B must be on XPU");
-  TORCH_CHECK(output.device().is_xpu(), "nvfp4_woq: output must be on XPU");
-  TORCH_CHECK(workspace.device().is_xpu(), "nvfp4_woq: workspace must be on XPU");
+  const auto device = a.device();
+  TORCH_CHECK(b.device() == device, "nvfp4_woq: B must be on the same XPU device as A");
+  TORCH_CHECK(output.device() == device, "nvfp4_woq: output must be on the same XPU device as A");
+  TORCH_CHECK(scales_a.device() == device, "nvfp4_woq: scales_a must be on the same XPU device as A");
+  TORCH_CHECK(sfmx_b.device() == device, "nvfp4_woq: sfmx_b must be on the same XPU device as A");
+  TORCH_CHECK(c_b.device() == device, "nvfp4_woq: c_b must be on the same XPU device as A");
+  TORCH_CHECK(
+      problem_sizes.device() == device,
+      "nvfp4_woq: problem_sizes must be on the same XPU device as A");
+  TORCH_CHECK(
+      expert_offsets.device() == device,
+      "nvfp4_woq: expert_offsets must be on the same XPU device as A");
+  TORCH_CHECK(
+      workspace.device() == device,
+      "nvfp4_woq: workspace must be on the same XPU device as A");
 
   TORCH_CHECK(a.scalar_type() == torch::kFloat8_e4m3fn, "nvfp4_woq: A must be float8_e4m3fn (MXFP8)");
   TORCH_CHECK(b.scalar_type() == torch::kUInt8, "nvfp4_woq: B must be uint8 (packed E2M1)");
@@ -587,7 +645,6 @@ void nvfp4_woq_mxfp8_scaled_grouped_mm(
               "64-byte aligned for the Xe block-2D load; got N=", N, " K=", K,
               " (per-expert stride ", sfmx_b.stride(0), " bytes)");
 
-  auto device = a.device();
   auto opts_i64 = torch::TensorOptions().dtype(torch::kInt64).device(device);
   auto opts_u8 = torch::TensorOptions().dtype(torch::kUInt8).device(device);
 
@@ -602,37 +659,103 @@ void nvfp4_woq_mxfp8_scaled_grouped_mm(
   const int padded_max_m = (max_m + scale_align - 1) & ~(scale_align - 1);
 
   auto ptr_table = torch::empty({5, E}, opts_i64);
-  auto scales_a_t = torch::zeros({E, scale_k, padded_max_m}, opts_u8);
+  auto cb_ptrs = torch::empty({E}, opts_i64);
+  auto cb_ld = torch::empty({E}, opts_i64);
+  auto stride_a = torch::empty({E}, opts_i64);
+  auto stride_b = torch::empty({E}, opts_i64);
+  auto stride_cd = torch::empty({E}, opts_i64);
+  auto stride_sfa = torch::empty({E, 2}, opts_i64);
+  auto stride_sfb = torch::empty({E, 2}, opts_i64);
+  auto scales_a_t = torch::empty({E, scale_k, padded_max_m}, opts_u8);
+
+  const int32_t* problem_sizes_ptr = problem_sizes.data_ptr<int32_t>();
+  const int32_t* expert_offsets_ptr = expert_offsets.data_ptr<int32_t>();
+  const uint8_t* scales_a_ptr = scales_a.data_ptr<uint8_t>();
+  uint8_t* scales_a_t_ptr = scales_a_t.data_ptr<uint8_t>();
+  int64_t* ptrs = ptr_table.data_ptr<int64_t>();
+  int64_t* cb_ptrs_ptr = cb_ptrs.data_ptr<int64_t>();
+  int64_t* cb_ld_ptr = cb_ld.data_ptr<int64_t>();
+  int64_t* stride_a_ptr = stride_a.data_ptr<int64_t>();
+  int64_t* stride_b_ptr = stride_b.data_ptr<int64_t>();
+  int64_t* stride_cd_ptr = stride_cd.data_ptr<int64_t>();
+  int64_t* stride_sfa_ptr = stride_sfa.data_ptr<int64_t>();
+  int64_t* stride_sfb_ptr = stride_sfb.data_ptr<int64_t>();
+  const int64_t a_base = reinterpret_cast<int64_t>(a.data_ptr());
+  const int64_t b_base = reinterpret_cast<int64_t>(b.data_ptr());
+  const int64_t out_base = reinterpret_cast<int64_t>(output.data_ptr());
+  const int64_t scale_a_base = reinterpret_cast<int64_t>(scales_a_t.data_ptr());
+  const int64_t scale_b_base = reinterpret_cast<int64_t>(sfmx_b.data_ptr());
+  const int64_t cb_base = reinterpret_cast<int64_t>(c_b.data_ptr());
+  const int64_t b_expert_bytes = b.stride(0) * b.element_size();
+  const int64_t scale_a_expert_bytes = scales_a_t.stride(0);
+  const int64_t scale_b_expert_bytes = sfmx_b.stride(0);
+  const int64_t cb_expert_bytes = c_b.stride(0) * c_b.element_size();
+  const int64_t scales_a_row_stride = scales_a.stride(0);
+  const int64_t scales_a_t_expert_stride = scales_a_t.stride(0);
+  const int64_t cb_ld_value = c_b.stride(1);
 
   auto& q = at::xpu::getCurrentXPUStream(device.index()).queue();
-  launch_u8_scale_build_pointers_and_transpose_scales_flat(
-      q, E, padded_max_m, scale_k, N,
-      /*a_row_stride_bytes=*/K, /*out_elem_bytes=*/static_cast<int>(sizeof(float)),
-      problem_sizes.data_ptr<int32_t>(),
-      expert_offsets.data_ptr<int32_t>(),
-      scales_a.data_ptr<uint8_t>(),
-      scales_a_t.data_ptr<uint8_t>(),
-      ptr_table.data_ptr<int64_t>(),
-      reinterpret_cast<int64_t>(a.data_ptr()),
-      reinterpret_cast<int64_t>(b.data_ptr()), b.stride(0) * static_cast<int64_t>(b.element_size()),
-      reinterpret_cast<int64_t>(output.data_ptr()),
-      reinterpret_cast<int64_t>(scales_a_t.data_ptr()), scales_a_t.stride(0),
-      reinterpret_cast<int64_t>(sfmx_b.data_ptr()), sfmx_b.stride(0),
-      scales_a.stride(0),
-      scales_a_t.stride(0));
+  q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<NvFp4WoqMxFp8BuildMetadataAndTransposeScales>(
+        sycl::range<2>(static_cast<size_t>(E), static_cast<size_t>(padded_max_m)),
+        [=](sycl::id<2> id) {
+          const int e = static_cast<int>(id[0]);
+          const int row = static_cast<int>(id[1]);
+          const int64_t ei = static_cast<int64_t>(e);
+          const int64_t row_offset = static_cast<int64_t>(expert_offsets_ptr[e]);
 
-  // Per-expert c pointers and row stride; plain arithmetic on device tensors
-  // keeps this out of the SYCL prep kernel.
-  auto cb_ptrs = torch::arange(E, opts_i64) * (c_b.stride(0) * c_b.element_size()) +
-                 reinterpret_cast<int64_t>(c_b.data_ptr());
-  auto cb_ld = torch::full({E}, static_cast<int64_t>(c_b.stride(1)), opts_i64);
+          if (row == 0) {
+            ptrs[0 * E + e] = a_base + row_offset * K;
+            ptrs[1 * E + e] = b_base + ei * b_expert_bytes;
+            ptrs[2 * E + e] =
+                out_base + row_offset * N * static_cast<int64_t>(sizeof(float));
+            ptrs[3 * E + e] =
+                scale_a_base + ei * scale_a_expert_bytes;
+            ptrs[4 * E + e] =
+                scale_b_base + ei * scale_b_expert_bytes;
+            cb_ptrs_ptr[e] = cb_base + ei * cb_expert_bytes;
+            cb_ld_ptr[e] = cb_ld_value;
+            stride_a_ptr[e] = K;
+            stride_b_ptr[e] = K;
+            stride_cd_ptr[e] = N;
+            stride_sfa_ptr[2 * e] = padded_max_m;
+            stride_sfa_ptr[2 * e + 1] = 0;
+            stride_sfb_ptr[2 * e] = N;
+            stride_sfb_ptr[2 * e + 1] = 0;
+          }
+
+          const int expert_m = problem_sizes_ptr[e * 3];
+          const int64_t dst = ei * scales_a_t_expert_stride;
+          if (row < expert_m) {
+            const int64_t src = (row_offset + row) * scales_a_row_stride;
+            for (int s = 0; s < scale_k; ++s) {
+              scales_a_t_ptr[dst + static_cast<int64_t>(s) * padded_max_m + row] =
+                  scales_a_ptr[src + s];
+            }
+          } else {
+            for (int s = 0; s < scale_k; ++s) {
+              scales_a_t_ptr[dst + static_cast<int64_t>(s) * padded_max_m + row] = 0;
+            }
+          }
+        });
+  });
+  // Order the preparation writes before the direct CUTLASS submission.
+  q.ext_oneapi_submit_barrier();
 
   at::native::xpu::run_nvfp4_woq_gemm(
-      E, problem_sizes, ptr_table, cb_ptrs.contiguous(), cb_ld,
-      static_cast<int>(scales_a_t.stride(1)), workspace, device);
+      E,
+      problem_sizes,
+      ptr_table,
+      cb_ptrs,
+      cb_ld,
+      stride_a,
+      stride_b,
+      stride_cd,
+      stride_sfa,
+      stride_sfb,
+      workspace,
+      device);
 }
-
-class NvFp4WoqBf16BuildPointers;
 
 void nvfp4_woq_bf16_grouped_mm(
     torch::Tensor& output,
@@ -647,9 +770,20 @@ void nvfp4_woq_bf16_grouped_mm(
   constexpr int BLK_K = cute::get<2>(Types::TileShape{});
 
   TORCH_CHECK(a.device().is_xpu(), "nvfp4_woq_bf16: A must be on XPU");
-  TORCH_CHECK(b.device().is_xpu(), "nvfp4_woq_bf16: B must be on XPU");
-  TORCH_CHECK(output.device().is_xpu(), "nvfp4_woq_bf16: output must be on XPU");
-  TORCH_CHECK(workspace.device().is_xpu(), "nvfp4_woq_bf16: workspace must be on XPU");
+  const auto device = a.device();
+  TORCH_CHECK(b.device() == device, "nvfp4_woq_bf16: B must be on the same XPU device as A");
+  TORCH_CHECK(output.device() == device, "nvfp4_woq_bf16: output must be on the same XPU device as A");
+  TORCH_CHECK(sfmx_b.device() == device, "nvfp4_woq_bf16: sfmx_b must be on the same XPU device as A");
+  TORCH_CHECK(c_b.device() == device, "nvfp4_woq_bf16: c_b must be on the same XPU device as A");
+  TORCH_CHECK(
+      problem_sizes.device() == device,
+      "nvfp4_woq_bf16: problem_sizes must be on the same XPU device as A");
+  TORCH_CHECK(
+      expert_offsets.device() == device,
+      "nvfp4_woq_bf16: expert_offsets must be on the same XPU device as A");
+  TORCH_CHECK(
+      workspace.device() == device,
+      "nvfp4_woq_bf16: workspace must be on the same XPU device as A");
   TORCH_CHECK(a.scalar_type() == torch::kBFloat16, "nvfp4_woq_bf16: A must be bfloat16");
   TORCH_CHECK(b.scalar_type() == torch::kUInt8, "nvfp4_woq_bf16: B must be uint8 (packed E2M1)");
   TORCH_CHECK(sfmx_b.scalar_type() == torch::kUInt8, "nvfp4_woq_bf16: sfmx_b must be uint8 (UE8M0)");
@@ -700,46 +834,90 @@ void nvfp4_woq_bf16_grouped_mm(
       c_b.size(0) == E && c_b.size(1) == N && c_b.size(2) == K / 16,
       "nvfp4_woq_bf16: c_b must be (E, N, K/16)");
 
-  auto device = a.device();
   auto opts_i64 = torch::TensorOptions().dtype(torch::kInt64).device(device);
   auto ptr_table = torch::empty({4, E}, opts_i64);
+  auto cb_ptrs = torch::empty({E}, opts_i64);
+  auto cb_ld = torch::empty({E}, opts_i64);
+  auto stride_a = torch::empty({E}, opts_i64);
+  auto stride_b = torch::empty({E}, opts_i64);
+  auto stride_cd = torch::empty({E}, opts_i64);
 
   const int32_t* offsets_ptr = expert_offsets.data_ptr<int32_t>();
   int64_t* ptrs = ptr_table.data_ptr<int64_t>();
+  int64_t* cb_ptrs_ptr = cb_ptrs.data_ptr<int64_t>();
+  int64_t* cb_ld_ptr = cb_ld.data_ptr<int64_t>();
+  int64_t* stride_a_ptr = stride_a.data_ptr<int64_t>();
+  int64_t* stride_b_ptr = stride_b.data_ptr<int64_t>();
+  int64_t* stride_cd_ptr = stride_cd.data_ptr<int64_t>();
   const int64_t a_base = reinterpret_cast<int64_t>(a.data_ptr());
   const int64_t b_base = reinterpret_cast<int64_t>(b.data_ptr());
   const int64_t out_base = reinterpret_cast<int64_t>(output.data_ptr());
   const int64_t sfmx_base = reinterpret_cast<int64_t>(sfmx_b.data_ptr());
+  const int64_t cb_base = reinterpret_cast<int64_t>(c_b.data_ptr());
   const int64_t a_row_bytes = static_cast<int64_t>(K) * a.element_size();
   const int64_t out_row_bytes = static_cast<int64_t>(N) * output.element_size();
   const int64_t b_expert_bytes = b.stride(0) * b.element_size();
   const int64_t sfmx_expert_bytes = sfmx_b.stride(0) * sfmx_b.element_size();
+  const int64_t cb_expert_bytes = c_b.stride(0) * c_b.element_size();
+  const int64_t cb_ld_value = c_b.stride(1);
 
   auto& queue = at::xpu::getCurrentXPUStream(device.index()).queue();
   queue.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for<NvFp4WoqBf16BuildPointers>(
+    cgh.parallel_for<NvFp4WoqBf16BuildMetadata>(
         sycl::range<1>(static_cast<size_t>(E)), [=](sycl::id<1> id) {
           const int e = static_cast<int>(id[0]);
+          const int64_t ei = static_cast<int64_t>(e);
           const int64_t row = static_cast<int64_t>(offsets_ptr[e]);
           ptrs[0 * E + e] = a_base + row * a_row_bytes;
-          ptrs[1 * E + e] = b_base + static_cast<int64_t>(e) * b_expert_bytes;
+          ptrs[1 * E + e] = b_base + ei * b_expert_bytes;
           ptrs[2 * E + e] = out_base + row * out_row_bytes;
-          ptrs[3 * E + e] =
-              sfmx_base + static_cast<int64_t>(e) * sfmx_expert_bytes;
+          ptrs[3 * E + e] = sfmx_base + ei * sfmx_expert_bytes;
+          cb_ptrs_ptr[e] = cb_base + ei * cb_expert_bytes;
+          cb_ld_ptr[e] = cb_ld_value;
+          stride_a_ptr[e] = K;
+          stride_b_ptr[e] = K;
+          stride_cd_ptr[e] = N;
         });
   });
+  // Order the preparation writes before the direct CUTLASS submission.
+  queue.ext_oneapi_submit_barrier();
 
-  auto cb_ptrs =
-      torch::arange(E, opts_i64) * (c_b.stride(0) * c_b.element_size()) +
-      reinterpret_cast<int64_t>(c_b.data_ptr());
-  auto cb_ld =
-      torch::full({E}, static_cast<int64_t>(c_b.stride(1)), opts_i64);
-  at::native::xpu::run_nvfp4_woq_bf16_gemm(
-      E,
-      problem_sizes,
-      ptr_table,
-      cb_ptrs.contiguous(),
-      cb_ld,
-      workspace,
-      device);
+  const int sm_count = at::native::xpu::cached_device_multiprocessor_count(
+      static_cast<int>(device.index()));
+  const auto tile = at::native::xpu::select_nvfp4_woq_bf16_tile(
+      a.size(0), E, N, sm_count);
+
+#define RUN_BF16_GEMM(TYPES)                                                \
+  at::native::xpu::run_nvfp4_woq_bf16_gemm<TYPES>(                         \
+      E,                                                                    \
+      problem_sizes,                                                        \
+      ptr_table,                                                            \
+      cb_ptrs,                                                              \
+      cb_ld,                                                                \
+      stride_a,                                                             \
+      stride_b,                                                             \
+      stride_cd,                                                            \
+      workspace,                                                            \
+      sm_count,                                                             \
+      device)
+
+  switch (tile) {
+    case at::native::xpu::NvFp4WoqBf16Tile::M8N128:
+      RUN_BF16_GEMM(at::native::xpu::NvFp4WoqBf16M8N128Types);
+      break;
+    case at::native::xpu::NvFp4WoqBf16Tile::M8N256:
+      RUN_BF16_GEMM(at::native::xpu::NvFp4WoqBf16M8N256Types);
+      break;
+    case at::native::xpu::NvFp4WoqBf16Tile::M32N256:
+      RUN_BF16_GEMM(at::native::xpu::NvFp4WoqBf16M32N256Types);
+      break;
+    case at::native::xpu::NvFp4WoqBf16Tile::M64N256:
+      RUN_BF16_GEMM(at::native::xpu::NvFp4WoqBf16M64N256Types);
+      break;
+    case at::native::xpu::NvFp4WoqBf16Tile::M256N256:
+      RUN_BF16_GEMM(at::native::xpu::NvFp4WoqBf16Types);
+      break;
+  }
+
+#undef RUN_BF16_GEMM
 }

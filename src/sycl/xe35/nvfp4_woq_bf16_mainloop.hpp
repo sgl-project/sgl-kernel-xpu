@@ -51,6 +51,41 @@ namespace cutlass::gemm::collective {
 
 using namespace cute;
 
+// CUTLASS 08168df2 exposes multi-payload loads, but its payload update helper
+// only advances block Y. Advance in tensor-coordinate space so this also
+// handles A, whose K dimension maps to block X.
+template <class TiledCopy, int N, class Coord>
+CUTLASS_DEVICE void advance_nvfp4_bf16_payloads(
+    TiledCopy const& tiled_copy,
+    Xe2DPreparedPayloads<N>& prepared,
+    Coord const& delta) {
+#ifdef __SYCL_DEVICE_ONLY__
+  auto const& base = cute::detail::as_xe2d_base(tiled_copy);
+  using Base = cute::remove_cvref_t<decltype(base)>;
+  using Op = typename Base::CopyOp;
+  using XMode = decltype(Base::get_x_mode());
+  using YMode = decltype(Base::get_y_mode());
+
+  const int32_t x_delta =
+      get<XMode::value>(delta) * Base::ValBits / Op::CopyBits;
+  const int32_t y_delta = get<YMode::value>(delta);
+  CUTLASS_PRAGMA_UNROLL
+  for (int i = 0; i < N; ++i) {
+    if (x_delta != 0) {
+      __builtin_IB_subgroup_addBlock2DAddressPayloadBlockX(
+          prepared.payloads[i], x_delta);
+    }
+    if (y_delta != 0) {
+      __builtin_IB_subgroup_addBlock2DAddressPayloadBlockY(
+          prepared.payloads[i], y_delta);
+    }
+  }
+#else
+  CUTE_INVALID_CONTROL_PATH(
+      "Xe 2D prepared payloads are only available on SYCL device.");
+#endif
+}
+
 template <
     int Stages,
     class KernelSchedule,
@@ -305,11 +340,29 @@ struct CollectiveMma<
     auto pBgB = prefetch_b.get_slice(thread_idx).partition_S(gB);
 
     const int k_start_idx = crd2idx((*k_tile_iter), make_shape(K_start));
+    auto k_tile_delta = make_coord(_0{}, Int<BLK_K>{});
+    auto prepared_a =
+        prepare_payloads(copy_a, tAgA(_, _, _, k_start_idx), tArA);
+    auto prepared_b =
+        prepare_payloads(copy_b, tBgB(_, _, _, k_start_idx), tBrB);
+    auto prepared_pa = prepare_payloads(
+        prefetch_a,
+        pAgA(_, _, _, k_start_idx),
+        pAgA(_, _, _, k_start_idx));
+    auto prepared_pb = prepare_payloads(
+        prefetch_b,
+        pBgB(_, _, _, k_start_idx),
+        pBgB(_, _, _, k_start_idx));
+
     int prefetch_k = k_start_idx;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < DispatchPolicy::Stages; ++i, ++prefetch_k) {
-      prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
-      prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
+      prefetch_with_payloads(
+          prefetch_a, prepared_pa, shape(pAgA(_, _, _, k_start_idx)));
+      prefetch_with_payloads(
+          prefetch_b, prepared_pb, shape(pBgB(_, _, _, k_start_idx)));
+      advance_nvfp4_bf16_payloads(prefetch_a, prepared_pa, k_tile_delta);
+      advance_nvfp4_bf16_payloads(prefetch_b, prepared_pb, k_tile_delta);
     }
 
     const int n_extent = size<0>(mainloop.mB_nkl.shape());
@@ -318,12 +371,18 @@ struct CollectiveMma<
          k_tile < k_tile_count + k_start_idx;
          ++k_tile, ++prefetch_k) {
       barrier_arrive(ScopeWorkgroup);
-      copy(copy_a, tAgA(_, _, _, k_tile), tArA);
-      copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
+      copy_with_multi_payloads(copy_a, prepared_a, tArA);
+      copy_with_multi_payloads(copy_b, prepared_b, tBrB);
+      advance_nvfp4_bf16_payloads(copy_a, prepared_a, k_tile_delta);
+      advance_nvfp4_bf16_payloads(copy_b, prepared_b, k_tile_delta);
 
       if (prefetch_k < k_tile_count + k_start_idx) {
-        prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
-        prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
+        prefetch_with_payloads(
+            prefetch_a, prepared_pa, shape(pAgA(_, _, _, k_start_idx)));
+        prefetch_with_payloads(
+            prefetch_b, prepared_pb, shape(pBgB(_, _, _, k_start_idx)));
+        advance_nvfp4_bf16_payloads(prefetch_a, prepared_pa, k_tile_delta);
+        advance_nvfp4_bf16_payloads(prefetch_b, prepared_pb, k_tile_delta);
       }
 
       reorder(tArA, tCrA);

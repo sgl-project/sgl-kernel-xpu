@@ -153,6 +153,18 @@ pybind11::dict benchmark_nvfp4_bf16(
   });
 }
 
+void run_nvfp4_bf16(
+    torch::Tensor output,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& sfmx_b,
+    const torch::Tensor& c_b,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& workspace) {
+  nvfp4_woq_bf16_grouped_mm(output, a, b, sfmx_b, c_b, problem_sizes, expert_offsets, workspace);
+}
+
 pybind11::dict benchmark_mxfp8(
     torch::Tensor output,
     const torch::Tensor& a,
@@ -198,5 +210,6 @@ pybind11::dict benchmark_mxfp8(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("benchmark_nvfp4", &benchmark_nvfp4);
   m.def("benchmark_nvfp4_bf16", &benchmark_nvfp4_bf16);
+  m.def("run_nvfp4_bf16", &run_nvfp4_bf16);
   m.def("benchmark_mxfp8", &benchmark_mxfp8);
 }

@@ -218,6 +218,19 @@ def test_prep_kernel_rejects_noncontiguous_global_scales():
         nvfp4_woq_prep(sf, strided_gs)
 
 
+def test_prep_kernel_rejects_cpu_global_scales():
+    skip_if_no_cri()
+    from sgl_kernel import nvfp4_woq_prep
+
+    e, n, k = 2, 64, 256
+    _, sf, gs_dq, _ = make_nvfp4_weights(e, n, k, "xpu", seed=2)
+
+    with pytest.raises(
+        RuntimeError, match="w_gs must be on the same XPU device as w_s"
+    ):
+        nvfp4_woq_prep(sf, gs_dq.cpu())
+
+
 @pytest.mark.parametrize(
     "ms,n,k",
     [
@@ -256,6 +269,7 @@ def test_fused_woq_matches_host_requantized_mxfp8(ms, n, k):
     ref = run_mxfp8_reference(
         a_q, a_s, b_mx.to(dev), b_smx.to(dev), problem_sizes, expert_offsets, workspace
     )
+    torch.xpu.synchronize()
 
     c_b, sfmx_b = nvfp4_woq_prep(sf, gs_dq)
     out = torch.zeros((m_total, n), dtype=torch.float32, device=dev)
@@ -263,9 +277,256 @@ def test_fused_woq_matches_host_requantized_mxfp8(ms, n, k):
         out, a_q, packed, a_s, sfmx_b, c_b, problem_sizes, expert_offsets, workspace
     )
     torch.xpu.synchronize()
-    assert torch.equal(out.cpu(), ref.cpu()), (
+    actual = out.cpu()
+    oracle = ref.cpu()
+    a_dq = dequantize_mxfp8(a_q.cpu(), a_s.cpu())
+    b_dq = dequantize_mxfp8(b_mx, b_smx)
+    direct = torch.empty_like(actual)
+    row = 0
+    for expert, expert_m in enumerate(ms):
+        direct[row : row + expert_m] = (
+            a_dq[row : row + expert_m].float() @ b_dq[expert].float().T
+        )
+        row += expert_m
+    mismatch_count = (actual != oracle).sum().item()
+    assert torch.equal(actual, oracle), (
         f"fused WoQ != host-requantized MXFP8; max diff "
-        f"{(out.cpu() - ref.cpu()).abs().max().item()}"
+        f"{(actual - oracle).abs().max().item()}, mismatches {mismatch_count}; "
+        f"fused/direct max diff {(actual - direct).abs().max().item()}, "
+        f"oracle/direct max diff {(oracle - direct).abs().max().item()}"
+    )
+
+
+def test_mxfp8_gemm_covers_all_e2m1_codes():
+    """Every nibble and packed-byte position must reach the right MXFP8 lane."""
+    skip_if_no_cri()
+    from sgl_kernel import nvfp4_woq_mxfp8_scaled_grouped_mm
+
+    dev = "xpu"
+    e, m, n, k = 1, 64, 128, 64
+    torch.manual_seed(11)
+    codes = torch.randint(0, 16, (n, k), dtype=torch.uint8)
+    assert torch.all(torch.bincount(codes.flatten().long(), minlength=16) > 0)
+    packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).unsqueeze(0).to(dev)
+    a = torch.eye(m, k, dtype=torch.float8_e4m3fn, device=dev)
+    scales_a = torch.full((m, k // 32), 127, dtype=torch.uint8, device=dev)
+    c_b = torch.ones((e, n, k // 16), dtype=torch.bfloat16, device=dev)
+    sfmx_b = torch.full((e, k // 32, n), 127, dtype=torch.uint8, device=dev)
+    problem_sizes, expert_offsets = make_grouped_layout([m], n, k, dev)
+    workspace = torch.empty((WORKSPACE_BYTES,), dtype=torch.uint8, device=dev)
+    out = torch.zeros((m, n), dtype=torch.float32, device=dev)
+
+    nvfp4_woq_mxfp8_scaled_grouped_mm(
+        out,
+        a,
+        packed,
+        scales_a,
+        sfmx_b,
+        c_b,
+        problem_sizes,
+        expert_offsets,
+        workspace,
+    )
+    torch.xpu.synchronize()
+    expected = e2m1_lut()[codes.long()].T.float()
+    actual = out.cpu()
+    mismatch = actual != expected
+    mismatch_indices = mismatch.nonzero()
+    assert torch.equal(actual, expected), (
+        f"MXFP8 E2M1 payload mismatch at {mismatch_indices.shape[0]} entries; "
+        f"first indices {mismatch_indices[:16].tolist()}, "
+        f"actual {actual[mismatch][:16].tolist()}, "
+        f"expected {expected[mismatch][:16].tolist()}"
+    )
+
+
+def test_mxfp8_gemm_scale_layouts():
+    """All scale axes and per-expert pointers use their declared coordinates."""
+    skip_if_no_cri()
+    from sgl_kernel import nvfp4_woq_mxfp8_scaled_grouped_mm
+
+    dev = "xpu"
+    e, expert_m, n, k = 2, 64, 128, 64
+    m_total = e * expert_m
+    base_codes = torch.arange(n * k, dtype=torch.uint8).reshape(n, k)
+    codes = torch.stack([(base_codes + 3 * i).remainder(16) for i in range(e)])
+    packed = (codes[:, :, 0::2] | (codes[:, :, 1::2] << 4)).to(dev)
+    a = torch.eye(expert_m, k).to(torch.float8_e4m3fn).repeat(e, 1).to(dev)
+
+    row = torch.arange(m_total).unsqueeze(1)
+    row_expert = row // expert_m
+    k32 = torch.arange(k // 32).unsqueeze(0)
+    a_exp = (row_expert + row + 2 * k32).remainder(4) - 10
+    scales_a = (a_exp + 127).to(torch.uint8).to(dev)
+
+    expert = torch.arange(e).view(e, 1, 1)
+    col = torch.arange(n).view(1, n, 1)
+    k32 = torch.arange(k // 32).view(1, 1, -1)
+    b_exp = (expert + col + 2 * k32).remainder(4) - 14
+    sfmx_b = (b_exp.permute(0, 2, 1) + 127).to(torch.uint8).contiguous().to(dev)
+
+    k16 = torch.arange(k // 16).view(1, 1, -1)
+    c_index = 17 * expert + 5 * col + 11 * k16
+    c_cpu = ((c_index.remainder(251) + 1).float() / 4).to(torch.bfloat16)
+    c_b = c_cpu.to(dev)
+
+    problem_sizes, expert_offsets = make_grouped_layout([expert_m] * e, n, k, dev)
+    workspace = torch.empty((WORKSPACE_BYTES,), dtype=torch.uint8, device=dev)
+    out = torch.zeros((m_total, n), dtype=torch.float32, device=dev)
+    nvfp4_woq_mxfp8_scaled_grouped_mm(
+        out,
+        a,
+        packed,
+        scales_a,
+        sfmx_b,
+        c_b,
+        problem_sizes,
+        expert_offsets,
+        workspace,
+    )
+    torch.xpu.synchronize()
+
+    expected = torch.empty((m_total, n), dtype=torch.float32)
+    local_rows = torch.arange(expert_m)
+    for expert_idx in range(e):
+        flat_rows = expert_idx * expert_m + local_rows
+        diag_codes = codes[expert_idx, :, local_rows].T.long()
+        diag_b_exp = b_exp[expert_idx, :, local_rows // 32].T
+        diag_a_exp = a_exp[flat_rows, local_rows // 32].unsqueeze(1)
+        requantized = (
+            e2m1_lut()[diag_codes] * c_cpu[expert_idx, :, local_rows // 16].T.float()
+        ).to(torch.float8_e4m3fn).float()
+        expected[flat_rows] = requantized * torch.exp2(
+            (diag_b_exp + diag_a_exp).float()
+        )
+    actual = out.cpu()
+    mismatch = actual != expected
+    mismatch_indices = mismatch.nonzero()
+    assert torch.equal(actual, expected), (
+        f"MXFP8 scale-layout mismatch at {mismatch_indices.shape[0]} entries; "
+        f"first indices {mismatch_indices[:16].tolist()}, "
+        f"actual {actual[mismatch][:16].tolist()}, "
+        f"expected {expected[mismatch][:16].tolist()}"
+    )
+
+
+def test_mxfp8_gemm_random_a_against_identity_b():
+    skip_if_no_cri()
+    from sgl_kernel import nvfp4_woq_mxfp8_scaled_grouped_mm
+
+    dev = "xpu"
+    e, m, n, k = 1, 64, 128, 64
+    codes = torch.zeros((n, k), dtype=torch.uint8)
+    codes[torch.arange(k), torch.arange(k)] = 2  # E2M1 value 1.0
+    packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).unsqueeze(0).to(dev)
+    torch.manual_seed(3)
+    a_q_cpu, a_s_cpu = quantize_mxfp8(torch.randn(m, k) * 0.5)
+    a_q, a_s = a_q_cpu.to(dev), a_s_cpu.to(dev)
+    c_b = torch.ones((e, n, k // 16), dtype=torch.bfloat16, device=dev)
+    sfmx_b = torch.full((e, k // 32, n), 127, dtype=torch.uint8, device=dev)
+    problem_sizes, expert_offsets = make_grouped_layout([m], n, k, dev)
+    workspace = torch.zeros((WORKSPACE_BYTES,), dtype=torch.uint8, device=dev)
+    out = torch.zeros((m, n), dtype=torch.float32, device=dev)
+
+    nvfp4_woq_mxfp8_scaled_grouped_mm(
+        out,
+        a_q,
+        packed,
+        a_s,
+        sfmx_b,
+        c_b,
+        problem_sizes,
+        expert_offsets,
+        workspace,
+    )
+    torch.xpu.synchronize()
+
+    actual = out.cpu()[:, :k]
+    expected = dequantize_mxfp8(a_q_cpu, a_s_cpu)
+    assert torch.equal(actual, expected), (
+        f"random A payload mismatch; max diff {(actual - expected).abs().max().item()}"
+    )
+
+
+def test_mxfp8_gemm_prepared_b_against_identity_a():
+    skip_if_no_cri()
+    from sgl_kernel import nvfp4_woq_mxfp8_scaled_grouped_mm, nvfp4_woq_prep
+
+    dev = "xpu"
+    e, m, n, k = 1, 64, 128, 64
+    packed, sf, gs_dq, _ = make_nvfp4_weights(e, n, k, dev, seed=2)
+    c_b, sfmx_b = nvfp4_woq_prep(sf, gs_dq)
+    a = torch.eye(m, k, dtype=torch.float8_e4m3fn, device=dev)
+    scales_a = torch.full((m, k // 32), 127, dtype=torch.uint8, device=dev)
+    problem_sizes, expert_offsets = make_grouped_layout([m], n, k, dev)
+    workspace = torch.zeros((WORKSPACE_BYTES,), dtype=torch.uint8, device=dev)
+    out = torch.zeros((m, n), dtype=torch.float32, device=dev)
+
+    nvfp4_woq_mxfp8_scaled_grouped_mm(
+        out,
+        a,
+        packed,
+        scales_a,
+        sfmx_b,
+        c_b,
+        problem_sizes,
+        expert_offsets,
+        workspace,
+    )
+    torch.xpu.synchronize()
+
+    b_mx, b_smx = nvfp4_to_mxfp8_ref(packed.cpu(), sf.cpu(), gs_dq.cpu())
+    expected = dequantize_mxfp8(b_mx, b_smx)[0].T
+    actual = out.cpu()
+    mismatch = actual != expected
+    mismatch_indices = mismatch.nonzero()
+    assert torch.equal(actual, expected), (
+        f"prepared B mismatch at {mismatch_indices.shape[0]} entries; "
+        f"first indices {mismatch_indices[:16].tolist()}"
+    )
+
+
+def test_mxfp8_dense_single_expert_matches_direct():
+    skip_if_no_cri()
+    from sgl_kernel import nvfp4_woq_mxfp8_scaled_grouped_mm, nvfp4_woq_prep
+
+    dev = "xpu"
+    e, m, n, k = 1, 64, 128, 64
+    packed, sf, gs_dq, _ = make_nvfp4_weights(e, n, k, dev, seed=2)
+    torch.manual_seed(3)
+    a_q_cpu, a_s_cpu = quantize_mxfp8(torch.randn(m, k) * 0.5)
+    a_q, a_s = a_q_cpu.to(dev), a_s_cpu.to(dev)
+    c_b, sfmx_b = nvfp4_woq_prep(sf, gs_dq)
+    problem_sizes, expert_offsets = make_grouped_layout([m], n, k, dev)
+    workspace = torch.zeros((WORKSPACE_BYTES,), dtype=torch.uint8, device=dev)
+    out = torch.zeros((m, n), dtype=torch.float32, device=dev)
+
+    nvfp4_woq_mxfp8_scaled_grouped_mm(
+        out,
+        a_q,
+        packed,
+        a_s,
+        sfmx_b,
+        c_b,
+        problem_sizes,
+        expert_offsets,
+        workspace,
+    )
+    torch.xpu.synchronize()
+
+    b_mx, b_smx = nvfp4_to_mxfp8_ref(packed.cpu(), sf.cpu(), gs_dq.cpu())
+    a_dq = dequantize_mxfp8(a_q_cpu, a_s_cpu)
+    b_dq = dequantize_mxfp8(b_mx, b_smx)[0]
+    expected = a_dq @ b_dq.T
+    actual = out.cpu()
+    no_a_scale = a_q_cpu.float() @ b_dq.T
+    no_b_scale = a_dq @ b_mx[0].float().T
+    assert torch.allclose(actual, expected, rtol=1e-5, atol=1e-6), (
+        f"dense fused/direct max diff {(actual - expected).abs().max().item()}; "
+        f"actual rms {actual.square().mean().sqrt().item()}, "
+        f"expected rms {expected.square().mean().sqrt().item()}, "
+        f"no-A-scale max diff {(actual - no_a_scale).abs().max().item()}, "
+        f"no-B-scale max diff {(actual - no_b_scale).abs().max().item()}"
     )
 
 
@@ -365,6 +626,50 @@ def test_unaligned_scale_stride_is_rejected():
         )
 
 
+def test_grouped_gemms_reject_cpu_problem_sizes():
+    skip_if_no_cri()
+    from sgl_kernel import (
+        nvfp4_woq_bf16_grouped_mm,
+        nvfp4_woq_mxfp8_scaled_grouped_mm,
+        nvfp4_woq_prep,
+    )
+
+    dev = "xpu"
+    e, m, n, k = 1, 32, 64, 64
+    packed, sf, gs_dq, _ = make_nvfp4_weights(e, n, k, dev, seed=5)
+    c_b, sfmx_b = nvfp4_woq_prep(sf, gs_dq)
+    problem_sizes, expert_offsets = make_grouped_layout([m], n, k, dev)
+    workspace = torch.empty((WORKSPACE_BYTES,), dtype=torch.uint8, device=dev)
+    out = torch.zeros((m, n), dtype=torch.float32, device=dev)
+
+    a_bf16 = torch.randn(m, k, dtype=torch.bfloat16, device=dev)
+    with pytest.raises(RuntimeError, match="problem_sizes must be on the same XPU"):
+        nvfp4_woq_bf16_grouped_mm(
+            out,
+            a_bf16,
+            packed,
+            sfmx_b,
+            c_b,
+            problem_sizes.cpu(),
+            expert_offsets,
+            workspace,
+        )
+
+    a_q, a_s = quantize_mxfp8(torch.randn(m, k))
+    with pytest.raises(RuntimeError, match="problem_sizes must be on the same XPU"):
+        nvfp4_woq_mxfp8_scaled_grouped_mm(
+            out,
+            a_q.to(dev),
+            packed,
+            a_s.to(dev),
+            sfmx_b,
+            c_b,
+            problem_sizes.cpu(),
+            expert_offsets,
+            workspace,
+        )
+
+
 # ---------------------------------------------------------------------------
 # End-to-end MoE
 # ---------------------------------------------------------------------------
@@ -422,14 +727,25 @@ def test_fused_experts_nvfp4_woq(mode, monkeypatch):
 
     torch.manual_seed(7)
     a = (torch.randn(m, k) * 0.5).to(dt)
-    w1_q, w1_sf, w1_gs, _ = make_nvfp4_weights(e, 2 * n_inter, k, dev, seed=11)
+    gate_q, gate_sf, gate_gs, _ = make_nvfp4_weights(e, n_inter, k, dev, seed=11)
+    up_q, up_sf, up_gs, _ = make_nvfp4_weights(e, n_inter, k, dev, seed=13)
+    w1_q = torch.cat((gate_q, up_q), dim=1)
+    w1_sf = torch.cat((gate_sf, up_sf), dim=1)
+    w1_gs = torch.stack((gate_gs, up_gs), dim=1)
     w2_q, w2_sf, w2_gs, _ = make_nvfp4_weights(e, k, n_inter, dev, seed=12)
-    topk_weights, topk_ids = torch.topk(torch.softmax(torch.randn(m, e), -1), topk, dim=-1)
+    topk_weights, topk_ids = torch.topk(
+        torch.softmax(torch.randn(m, e), -1), topk, dim=-1
+    )
+    assert topk_ids.dtype == torch.int64
 
     prepared = nvfp4_woq_prepare_weights(w1_sf, w1_gs, w2_sf, w2_gs)
     out = cutlass_fused_experts_nvfp4_woq(
-        a.to(dev), w1_q, w2_q, prepared,
-        topk_weights.to(dt).to(dev), topk_ids.int().to(dev),
+        a.to(dev),
+        w1_q,
+        w2_q,
+        prepared,
+        topk_weights.to(dt).to(dev),
+        topk_ids.to(dev),
     )
     torch.xpu.synchronize()
 
@@ -443,8 +759,16 @@ def test_fused_experts_nvfp4_woq(mode, monkeypatch):
     else:
         w1_eff = torch.stack(
             [
-                dequantize_nvfp4_via_mxfp8(
-                    w1_q[i].cpu(), w1_sf[i].cpu(), w1_gs[i].cpu()
+                torch.cat(
+                    (
+                        dequantize_nvfp4_via_mxfp8(
+                            gate_q[i].cpu(), gate_sf[i].cpu(), gate_gs[i].cpu()
+                        ),
+                        dequantize_nvfp4_via_mxfp8(
+                            up_q[i].cpu(), up_sf[i].cpu(), up_gs[i].cpu()
+                        ),
+                    ),
+                    dim=0,
                 )
                 for i in range(e)
             ]

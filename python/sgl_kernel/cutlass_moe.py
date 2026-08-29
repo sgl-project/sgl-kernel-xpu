@@ -452,11 +452,40 @@ def nvfp4_woq_prepare_weights(
     Call once when the checkpoint is loaded and keep the result; it replaces the
     NVFP4 E4M3 block scales and per-tensor global scales with the ``(c, sfmx)``
     pair the fused mainloop reads.  The 4-bit payloads are used as-is.
+    ``w1_gs`` accepts one shared scale per expert or separate ``(gate, up)``
+    scales in shape ``(E, 2)``. ``w2_gs`` accepts one scale per expert.
     """
     from sgl_kernel.nvfp4 import nvfp4_woq_prep
 
-    w1_c, w1_sfmx = nvfp4_woq_prep(w1_scale, w1_gs)
-    w2_c, w2_sfmx = nvfp4_woq_prep(w2_scale, w2_gs)
+    num_experts = w1_scale.size(0)
+    if w1_gs.dim() == 2 and w1_gs.shape == (num_experts, 2):
+        assert (
+            w1_scale.size(1) % 2 == 0
+        ), "w1_scale output dimension must be even for separate gate/up scales"
+        split_n = w1_scale.size(1) // 2
+        gate_c, gate_sfmx = nvfp4_woq_prep(
+            w1_scale[:, :split_n].contiguous(), w1_gs[:, 0].contiguous()
+        )
+        up_c, up_sfmx = nvfp4_woq_prep(
+            w1_scale[:, split_n:].contiguous(), w1_gs[:, 1].contiguous()
+        )
+        w1_c = torch.cat((gate_c, up_c), dim=1)
+        w1_sfmx = torch.cat((gate_sfmx, up_sfmx), dim=2)
+    else:
+        assert w1_gs.shape in (
+            (num_experts,),
+            (num_experts, 1),
+        ), f"w1_gs must be (E,), (E, 1), or (E, 2), got {tuple(w1_gs.shape)}"
+        w1_c, w1_sfmx = nvfp4_woq_prep(
+            w1_scale, w1_gs.reshape(num_experts).contiguous()
+        )
+
+    w2_num_experts = w2_scale.size(0)
+    assert w2_gs.shape in (
+        (w2_num_experts,),
+        (w2_num_experts, 1),
+    ), f"w2_gs must be (E,) or (E, 1), got {tuple(w2_gs.shape)}"
+    w2_c, w2_sfmx = nvfp4_woq_prep(w2_scale, w2_gs.reshape(w2_num_experts).contiguous())
     return {"w1_c": w1_c, "w1_sfmx": w1_sfmx, "w2_c": w2_c, "w2_sfmx": w2_sfmx}
 
 
@@ -512,6 +541,7 @@ def cutlass_fused_experts_nvfp4_woq(
     assert w2_q.size(1) == k, f"w2_q must have K={k} rows, got {w2_q.size(1)}"
     assert w1_q.size(1) == 2 * n, f"w1_q must have 2N={2 * n} rows, got {w1_q.size(1)}"
 
+    topk_ids = topk_ids.to(device=device, dtype=torch.int32).contiguous()
     a_map = torch.empty((topk_ids.numel(),), dtype=torch.int32, device=device)
     c_map = torch.empty((topk_ids.numel(),), dtype=torch.int32, device=device)
     expert_counts = torch.zeros(num_experts, dtype=torch.int32, device=device)

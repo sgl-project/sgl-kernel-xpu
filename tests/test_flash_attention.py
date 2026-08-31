@@ -2753,7 +2753,7 @@ def test_relative_attention(
         max_seqlen_q=max(seqlens_q),
         max_seqlen_k=max(seqlens_k),
         causal=causal,
-        rel_bias=table.to(dtype).to(device).unsqueeze(0).expand(sum(seqlens_q), -1, -1),
+        rel_bias=table.to(dtype).to(device).unsqueeze(0).repeat(sum(seqlens_q), 1, 1),
     )
     torch.xpu.synchronize()
     torch.testing.assert_close(

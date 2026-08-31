@@ -224,7 +224,7 @@ def flash_attn_with_kvcache(
         rel_bias [optional]: device-resident Inkling relative logits with shape
             ``(total_q, nheads, extent)``. The kernel shears this source on the
             current XPU stream for its fixed 256x32 relative-attention tiles. Its
-            dtype must match ``q``.
+            dtype must match ``q`` and it must be contiguous.
             Supported for paged KV attention with head dimension 128, and with
             head dimension 512 for single-token decode.
         rel_bias_is_sheared: decode-only fast path for a producer that already

@@ -425,7 +425,7 @@ void mha_fwd(
     TORCH_CHECK(
         rel_bias.size(0) == total_q && rel_bias.size(1) == num_heads,
         "relative bias must have shape [total_q, num_heads, extent]");
-    TORCH_CHECK(rel_bias.stride(-1) == 1, "relative bias must have a contiguous K dimension");
+    TORCH_CHECK(rel_bias.is_contiguous(), "relative bias must be contiguous");
     TORCH_CHECK(rel_bias.size(-1) > 0, "relative bias extent must be positive");
     if (rel_bias_is_sheared) {
       TORCH_CHECK(
@@ -1103,7 +1103,7 @@ void mha_fwd(
     TORCH_CHECK(
         rel_bias.size(0) == total_q && rel_bias.size(1) == num_heads,
         "relative bias must have shape [total_q, num_heads, extent]");
-    TORCH_CHECK(rel_bias.stride(-1) == 1, "relative bias must have a contiguous K dimension");
+    TORCH_CHECK(rel_bias.is_contiguous(), "relative bias must be contiguous");
     TORCH_CHECK(rel_bias.size(-1) > 0, "relative bias extent must be positive");
   }
 

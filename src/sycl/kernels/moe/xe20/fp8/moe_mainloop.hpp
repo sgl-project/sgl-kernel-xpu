@@ -123,7 +123,7 @@ struct MoEMainloopFp8Weight<
 
   MoEMainloopFp8Weight() {}
 
-  template <bool FullMTile, typename Coord>
+  template <typename Coord>
   CUTLASS_DEVICE void run_w8a16_block(
       ATensor& A,
       BPackedTensor& Bp,
@@ -134,8 +134,7 @@ struct MoEMainloopFp8Weight<
       TiledMMA mma,
       int thr_id,
       BiasTensor Bias,
-      int gemm_n,
-      int m_actual) {
+      int gemm_n) {
     auto wg_m = get<0>(blk_coord);
     auto wg_n = get<1>(blk_coord);
     auto wg_tile = mma.tile_mnk();
@@ -188,9 +187,6 @@ struct MoEMainloopFp8Weight<
     constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
     const int k_tile_count = ceil_div(shape<1>(A), BLK_K);
     const int full_group_count = k_tile_count / RELOAD_CADENCE;
-    constexpr int frag_a_size = cute::size_v<typename MmaAFragment::layout_type>;
-    constexpr int K_ATOMS_A = frag_a_size / SG_M;
-
     CUTE_UNROLL
     for (int prefetch_k = 0; prefetch_k < Stages; ++prefetch_k) {
       if (prefetch_k < k_tile_count) {
@@ -212,19 +208,6 @@ struct MoEMainloopFp8Weight<
       if (prefetch_idx < k_tile_count) {
         prefetch(prefetch_a, pAgA(_, _, _, prefetch_idx));
         prefetch(prefetch_b, pBgBp(_, _, _, prefetch_idx));
-      }
-      if constexpr (!FullMTile) {
-        if (m_actual < (wg_m + 1) * BLK_M) {
-          CUTE_UNROLL
-          for (int sm = 0; sm < SG_M; ++sm) {
-            if (wg_m * BLK_M + sm >= m_actual) {
-              CUTE_UNROLL
-              for (int ka = 0; ka < K_ATOMS_A; ++ka) {
-                tSrA(ka * SG_M + sm) = cutlass::bfloat16_t(0.0f);
-              }
-            }
-          }
-        }
       }
       reorder(tArA_packed, tSrA);
       reorder(tBrB_packed, tSrB);
@@ -266,8 +249,7 @@ struct MoEMainloopFp8Weight<
       TiledMMA mma,
       int thr_id,
       BiasTensor Bias,
-      int gemm_n,
-      int m_actual) {
+      int gemm_n) {
     auto wg_m = get<0>(blk_coord);
     auto wg_n = get<1>(blk_coord);
     auto wg_tile = mma.tile_mnk();
@@ -374,19 +356,11 @@ struct MoEMainloopFp8Weight<
       TiledMMA mma,
       int thr_id,
       BiasTensor Bias,
-      int gemm_n,
-      int m_actual) {
+      int gemm_n) {
     if constexpr (WeightScalePerExpert) {
-      run_w8a16_scalar(A, Bp, w_scale_gmem, w_scale_row_stride, D, blk_coord, mma, thr_id, Bias, gemm_n, m_actual);
+      run_w8a16_scalar(A, Bp, w_scale_gmem, w_scale_row_stride, D, blk_coord, mma, thr_id, Bias, gemm_n);
     } else {
-      constexpr int BLK_M = get<0>(decltype(mma.tile_mnk()){});
-      if (m_actual % BLK_M == 0) {
-        run_w8a16_block<true>(
-            A, Bp, w_scale_gmem, w_scale_row_stride, D, blk_coord, mma, thr_id, Bias, gemm_n, m_actual);
-      } else {
-        run_w8a16_block<false>(
-            A, Bp, w_scale_gmem, w_scale_row_stride, D, blk_coord, mma, thr_id, Bias, gemm_n, m_actual);
-      }
+      run_w8a16_block(A, Bp, w_scale_gmem, w_scale_row_stride, D, blk_coord, mma, thr_id, Bias, gemm_n);
     }
   }
 

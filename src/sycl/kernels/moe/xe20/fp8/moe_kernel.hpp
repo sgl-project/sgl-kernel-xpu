@@ -177,8 +177,7 @@ class MoEGEMMFp8Weight {
               mma,
               thr_id,
               Bias_tensor,
-              N,
-              M);
+              N);
         }
 
         if (params.static_scheduler) {

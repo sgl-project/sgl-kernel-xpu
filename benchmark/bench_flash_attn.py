@@ -354,6 +354,9 @@ def benchmark(
 
 
 if __name__ == "__main__":
+    torch.manual_seed(42)
+    if hasattr(torch.xpu, "manual_seed_all"):
+        torch.xpu.manual_seed_all(42)
     benchmark.run(print_data=False)
     print("Benchmark finished!")
 

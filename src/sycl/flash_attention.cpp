@@ -449,26 +449,23 @@ void mha_fwd(
         num_splits = std::ceil(parallel_2 / static_cast<float>(cur_parallel_d)) - 1;
       }
 
-      int const total_blocks = (max_seqlen_k + block_size - 1) / block_size;
       int const effective_seqlen_k =
           window_size_left >= 0 ? std::min(max_seqlen_k, window_size_left + 1) : max_seqlen_k;
       int const effective_blocks = (effective_seqlen_k + block_size - 1) / block_size;
-      int const effective_batch = batch_size * num_heads_kv;
       constexpr int kMinBlocksToSplit = 64;
-      constexpr int kMinWorkToSplitPerBatch = 512;
-      if (effective_blocks <= kMinBlocksToSplit ||
-          effective_blocks * head_size_v < kMinWorkToSplitPerBatch * effective_batch) {
+      constexpr int kAlwaysSplitHeadSizeV = 512;
+      if (effective_blocks <= kMinBlocksToSplit && head_size_v < kAlwaysSplitHeadSizeV) {
         return 1;
       }
 
       if (batch_size == 1 && num_heads_q == 8 && num_heads_kv == 1 && head_size_v == 512 && block_size == 64) {
         int const current_parallelism = 2;
         int const target_splits = (3 * num_xe_cores + current_parallelism - 1) / current_parallelism;
-        int const split_limit = std::min({target_splits, total_blocks, 64});
+        int const split_limit = std::min({target_splits, effective_blocks, 64});
         int best_splits = 1;
-        int best_iters = total_blocks;
+        int best_iters = effective_blocks;
         for (int splits = 1; splits <= split_limit; ++splits) {
-          int const iters = (total_blocks + splits - 1) / splits;
+          int const iters = (effective_blocks + splits - 1) / splits;
           if (iters < best_iters) {
             best_iters = iters;
             best_splits = splits;
@@ -477,7 +474,7 @@ void mha_fwd(
         return best_splits;
       }
 
-      int max_splits = std::min(total_blocks, parallel_);
+      int max_splits = std::min(effective_blocks, parallel_);
       return std::min(num_splits, max_splits);
     };
     num_kv_splits =

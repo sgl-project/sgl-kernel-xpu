@@ -45,6 +45,7 @@ limitations under the License.
 
 #include <sycl/sycl.hpp>
 
+#include "MemoryAccess.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -64,8 +65,37 @@ constexpr int32_t kParentNotFound = -1;
 // per-node scan below instead.
 constexpr int32_t kBitmaskFastPathMaxNodes = 64;
 
-template <typename seq_t>
+// The mask write packs several tree_mask columns into one store, which only
+// works if a bool is one byte and `true` is 0x01 (Itanium ABI / SPIR-V).
+static_assert(sizeof(bool) == 1, "tree_mask pack stores assume 1-byte bool");
+
+// Widest mask pack the host will instantiate, in 32-bit words: 4 words is 16
+// bytes, one Intel Xe LSC OWord message.
+constexpr int32_t kMaxMaskPackWords = 4;
+
+// Expand the low 4 bits of `bits` into 4 bool bytes -- byte j is bit j as 0x00
+// or 0x01, exactly what `static_cast<bool>` would have stored, so one 32-bit
+// word of a pack is one nibble of the ancestor mask.
+//
+// Multiplying by 0x00204081 (= sum_k 2^(7k), k = 0..3) puts bit j at bit 8j:
+// the copy of the constant shifted by j contributes 2^(j + 7j), and no two
+// contributions collide, so the product is a plain OR that the 0x01010101 mask
+// then trims down to the byte lanes. Kept per nibble so this stays a 32-bit
+// multiply -- Xe has no native 64-bit multiply.
+inline uint32_t expand_mask_nibble(uint32_t bits) {
+  return ((bits & 0xFu) * 0x00204081u) & 0x01010101u;
+}
+
+template <typename seq_t, int kPackWords>
 struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
+  // Same sycl::vec<uint32_t, N> + reinterpret_cast + store(offset, ptr) idiom as
+  // src/sycl/KVCache.cpp:44 -- a native sycl::vec<bool, N> is not a legal vector
+  // element type, and offset being in units of the whole pack is exactly the
+  // indexing the mask write wants. The width comes from the host (see
+  // can_vectorize_up_to at the launch site).
+  using MaskPack = sycl::vec<uint32_t, kPackWords>;
+  static constexpr int32_t kPackCols = static_cast<int32_t>(sizeof(MaskPack));
+
   BuildTreeKernel(
       const int64_t* parent_list,
       const int64_t* selected_index,
@@ -303,13 +333,64 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         positions_[out_base + i] = seq_len + node_depth;
       }
       sycl::group_barrier(item.get_group());
+      // Write kPackCols columns per store instead of one bool byte at a time:
+      // kPackCols consecutive cells of a row are just expanded nibbles of `m`.
+      // Two things have to line up for that to be a win.
+      //
+      //  * Lane count. lrange >= num_nodes always (see the host launch), so the
+      //    byte loop below already has every lane writing a different column of
+      //    the same row -- fully coalesced, nothing idle. Widening the store
+      //    without also handing each lane a *different row* would just idle
+      //    lanes: only num_nodes/kPackCols of them would have a pack to write.
+      //    So the packed path folds rows into the lane space -- lane tid owns
+      //    pack (tid % packs_per_row) of row (tid / packs_per_row) and strides
+      //    by lrange/packs_per_row rows.
+      //  * Alignment. A row starts col_offset (= seq_len under FULL_MASK) into
+      //    the row and vec::store needs natural alignment, so the pack path is
+      //    only legal when every row this group touches is pack-aligned.
+      //    mask_base + col_offset and row_stride are both group-uniform, so one
+      //    check covers all of them and the branch never diverges; when it
+      //    fails the byte loop writes the whole mask and correctness never
+      //    depends on alignment.
+      const int32_t packs_per_row = num_nodes / kPackCols;
+      const bool pack_aligned = packs_per_row > 0 && ((mask_base + col_offset) % kPackCols == 0) &&
+                                (row_stride % kPackCols == 0) &&
+                                (reinterpret_cast<uintptr_t>(tree_mask_) % static_cast<uintptr_t>(kPackCols) == 0);
+      const int32_t packed_cols = pack_aligned ? packs_per_row * kPackCols : 0;
+
+      if (pack_aligned) {
+        // packs_per_row <= num_nodes / 4 <= 16 < 32 <= lrange, so row_step >= 2
+        // and every pack of every row is covered; the max() is just a guard.
+        const int32_t row_step = sycl::max(lrange / packs_per_row, 1);
+        const int32_t lane_row = tid / packs_per_row;
+        const int32_t lane_pack = tid - lane_row * packs_per_row;
+        const int32_t lane_col = lane_pack * kPackCols;
+        if (lane_row < row_step) {
 #pragma unroll 2
-      for (int32_t row = row_start; row < row_end; ++row) {
-        bool* row_ptr = tree_mask_ + mask_base + row_stride * row + col_offset;
-        const uint64_t m = ancestor_mask[row];
+          for (int32_t row = row_start + lane_row; row < row_end; row += row_step) {
+            const uint64_t m = ancestor_mask[row];
+            auto* pack_ptr = reinterpret_cast<uint32_t*>(tree_mask_ + mask_base + row_stride * row + col_offset);
+            MaskPack pack;
+#pragma unroll
+            for (int32_t w = 0; w < kPackWords; ++w) {
+              pack[w] = expand_mask_nibble(static_cast<uint32_t>(m >> (lane_col + 4 * w)));
+            }
+            pack.store(static_cast<std::size_t>(lane_pack), pack_ptr);
+          }
+        }
+      }
+
+      // Columns the packs did not cover: all of them when the pack path is off,
+      // otherwise just the num_nodes % kPackCols tail.
+      if (packed_cols < num_nodes) {
 #pragma unroll 2
-        for (int32_t c = tid; c < num_nodes; c += lrange) {
-          row_ptr[c] = static_cast<bool>((m >> c) & 1ull);
+        for (int32_t row = row_start; row < row_end; ++row) {
+          bool* row_ptr = tree_mask_ + mask_base + row_stride * row + col_offset;
+          const uint64_t m = ancestor_mask[row];
+#pragma unroll 2
+          for (int32_t c = packed_cols + tid; c < num_nodes; c += lrange) {
+            row_ptr[c] = static_cast<bool>((m >> c) & 1ull);
+          }
         }
       }
     } else {
@@ -482,25 +563,51 @@ SGL_KERNEL_EXPORT void build_tree_kernel_efficient(
   const int64_t max_row_blocks = std::max<int64_t>((draft_token_num + 31) / 32, 1);
   const int64_t row_blocks = bs < num_subslices ? std::min<int64_t>(max_row_blocks, (num_subslices + bs - 1) / bs) : 1;
 
+  // How many 32-bit words the mask write packs per store. can_vectorize_up_to
+  // takes the device's preferred int vector width and caps it by what the
+  // tree_mask base pointer's alignment actually permits; the per-row offset is
+  // re-checked in the kernel, which falls back to byte stores when it does not
+  // line up. A pack also has to fit inside one row.
+  int pack_words = std::min<int>(
+      can_vectorize_up_to<int32_t>(
+          dpcppGetDeviceIdOfCurrentQueue(), reinterpret_cast<char*>(tree_mask.data_ptr<bool>())),
+      kMaxMaskPackWords);
+  while (pack_words > 1 && draft_token_num < 4 * pack_words) {
+    pack_words >>= 1;
+  }
+
   AT_DISPATCH_INDEX_TYPES(verified_seq_len.scalar_type(), "build_tree_kernel_efficient", [&] {
-    using Kernel = BuildTreeKernel<index_t>;
-    Kernel kernel(
-        parent_list.data_ptr<int64_t>(),
-        selected_index.data_ptr<int64_t>(),
-        verified_seq_len.data_ptr<index_t>(),
-        tree_mask.data_ptr<bool>(),
-        positions.data_ptr<int64_t>(),
-        retrive_index.data_ptr<int64_t>(),
-        retrive_next_token.data_ptr<int64_t>(),
-        retrive_next_sibling.data_ptr<int64_t>(),
-        static_cast<int32_t>(topk),
-        static_cast<int32_t>(depth),
-        static_cast<int32_t>(draft_token_num),
-        static_cast<int32_t>(parent_list_width),
-        parent_list_stride,
-        selected_index.stride(0),
-        full_mask,
-        static_cast<int32_t>(row_blocks));
-    sycl_kernel_submit(bs * row_blocks * local_range, local_range, queue, kernel);
+    auto launch = [&](auto pack_words_tag) {
+      using Kernel = BuildTreeKernel<index_t, decltype(pack_words_tag)::value>;
+      Kernel kernel(
+          parent_list.data_ptr<int64_t>(),
+          selected_index.data_ptr<int64_t>(),
+          verified_seq_len.data_ptr<index_t>(),
+          tree_mask.data_ptr<bool>(),
+          positions.data_ptr<int64_t>(),
+          retrive_index.data_ptr<int64_t>(),
+          retrive_next_token.data_ptr<int64_t>(),
+          retrive_next_sibling.data_ptr<int64_t>(),
+          static_cast<int32_t>(topk),
+          static_cast<int32_t>(depth),
+          static_cast<int32_t>(draft_token_num),
+          static_cast<int32_t>(parent_list_width),
+          parent_list_stride,
+          selected_index.stride(0),
+          full_mask,
+          static_cast<int32_t>(row_blocks));
+      sycl_kernel_submit(bs * row_blocks * local_range, local_range, queue, kernel);
+    };
+    switch (pack_words) {
+      case 4:
+        launch(std::integral_constant<int, 4>{});
+        break;
+      case 2:
+        launch(std::integral_constant<int, 2>{});
+        break;
+      default:
+        launch(std::integral_constant<int, 1>{});
+        break;
+    }
   });
 }

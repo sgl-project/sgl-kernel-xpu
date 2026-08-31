@@ -1510,8 +1510,7 @@ SGL_KERNEL_EXPORT void mha_fwd(
     // all-prefill batch falls through to chunkprefill, which is still correct.
     dispatch(prefill::mha_fwd, std::nullopt);
   } else {
-    // Chunk prefill path
-    // Paged attn with max_seqlen_q > 1 and batch_size > 1
+    // Non-uniform paged batches fall back to chunkprefill.
     dispatch(chunkprefill::mha_fwd);
   }
 }

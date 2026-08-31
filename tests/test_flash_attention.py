@@ -1920,6 +1920,142 @@ def test_flash_attn_fp8_kvcache(
         assert mean_diff <= 2e-2
 
 
+@pytest.mark.skipif(
+    not torch.xpu.is_available(),
+    reason="mxfp4 KV cache attention is an XPU (sgl-kernel-xpu) feature",
+)
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("q_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("nheads_q,nheads_kv", [(8, 8), (8, 2)])
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize("seqlen_q", [1, 32, 64])
+@pytest.mark.parametrize("seqlen_k", [256, 512])
+@pytest.mark.parametrize("batch_size", [3])
+def test_flash_attn_mxfp4_kvcache(
+    batch_size,
+    seqlen_k,
+    seqlen_q,
+    page_size,
+    d,
+    nheads_q,
+    nheads_kv,
+    q_dtype,
+    causal,
+    cache_seqlen=None,
+):
+    """Attention with a woq mxfp4 (E2M1 + E8M0 block scale) paged KV cache.
+
+    Completely mirrors ``test_flash_attn_fp8_kvcache`` except the K/V cache is
+    stored as packed MXFP4 (two E2M1 nibbles per byte, last dim = d // 2) with a
+    per-32-element E8M0 (UE8M0) block scale, dequantized inside the kernel. The
+    block scales are passed through the k_descale / v_descale arguments (uint8
+    E8M0 tensors); the kernel selects the mxfp4 path from the uint8 KV dtype.
+    seqlen_q == 1 exercises decode; seqlen_q > 1 exercises (chunk)prefill.
+    """
+    from mxfp4_utils import MXFP4_BLOCK_SIZE, dequantize_mxfp4_2d, quantize_mxfp4_2d
+
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    if seqlen_k % page_size != 0:
+        pytest.skip("page_size must divide seqlen_k")
+    if d % MXFP4_BLOCK_SIZE != 0:
+        pytest.skip("d must be a multiple of the mxfp4 block size (32)")
+    assert nheads_q % nheads_kv == 0
+
+    torch.manual_seed(0)
+    softmax_scale = d**-0.5
+    num_blocks_per_seq = seqlen_k // page_size
+    n_scale_blocks = d // MXFP4_BLOCK_SIZE
+
+    # Reference (fp32) K/V, then per-row (token, kv-head) quantize to mxfp4.
+    k_ref_f = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device)
+    v_ref_f = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device)
+
+    def _quantize_kv(x):
+        # x: (b, sk, h_kv, d) -> packed (b, sk, h_kv, d//2) uint8,
+        #    scales (b, sk, h_kv, d//block) uint8 (E8M0), and the dequantized
+        #    fp32 reference used by attention_ref.
+        rows = x.reshape(-1, d)
+        packed, scales = quantize_mxfp4_2d(rows.cpu(), block_size=MXFP4_BLOCK_SIZE)
+        deq = dequantize_mxfp4_2d(packed, scales, torch.float32, MXFP4_BLOCK_SIZE)
+        packed = packed.reshape(batch_size, seqlen_k, nheads_kv, d // 2).to(device)
+        scales = scales.reshape(batch_size, seqlen_k, nheads_kv, n_scale_blocks).to(
+            device
+        )
+        deq = deq.reshape(batch_size, seqlen_k, nheads_kv, d).to(device)
+        return packed, scales, deq
+
+    k_packed, k_scale, k_deq = _quantize_kv(k_ref_f)
+    v_packed, v_scale, v_deq = _quantize_kv(v_ref_f)
+
+    # Paged layout: one contiguous run of blocks per sequence.
+    k_cache_paged = k_packed.reshape(
+        batch_size * num_blocks_per_seq, page_size, nheads_kv, d // 2
+    )
+    v_cache_paged = v_packed.reshape(
+        batch_size * num_blocks_per_seq, page_size, nheads_kv, d // 2
+    )
+    k_scale_paged = k_scale.reshape(
+        batch_size * num_blocks_per_seq, page_size, nheads_kv, n_scale_blocks
+    )
+    v_scale_paged = v_scale.reshape(
+        batch_size * num_blocks_per_seq, page_size, nheads_kv, n_scale_blocks
+    )
+    page_table = torch.arange(
+        batch_size * num_blocks_per_seq, dtype=torch.int32, device=device
+    ).reshape(batch_size, num_blocks_per_seq)
+
+    if cache_seqlen is None:
+        cache_seqlen = seqlen_k
+    assert seqlen_q <= cache_seqlen <= seqlen_k
+    cache_seqlens = torch.full(
+        (batch_size,), cache_seqlen, dtype=torch.int32, device=device
+    )
+
+    q = torch.randn(batch_size, seqlen_q, nheads_q, d, device=device, dtype=q_dtype)
+
+    out, lse, *rest = flash_attn_with_kvcache(
+        q,
+        k_cache_paged,
+        v_cache_paged,
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        k_descale=k_scale_paged,
+        v_descale=v_scale_paged,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        return_softmax_lse=True,
+    )
+    _check_softmax_lse(lse, nheads_q, batch_size * seqlen_q)
+    out = out.reshape(batch_size, seqlen_q, nheads_q, d)
+    torch.xpu.synchronize()
+
+    # Reference uses the already-dequantized fp32 K/V (kernel dequant math).
+    out_ref, _ = attention_ref(
+        q,
+        k_deq,
+        v_deq,
+        softmax_scale,
+        key_padding_mask=(
+            rearrange(torch.arange(seqlen_k, device=device), "s -> 1 s")
+            < rearrange(cache_seqlens, "b -> b 1")
+        ),
+        causal=causal,
+        upcast=True,
+    )
+
+    out = out.float()
+    out_ref = out_ref.float()
+    max_diff = (out - out_ref).abs().max().item()
+    mean_diff = (out - out_ref).abs().mean().item()
+    print(f"mxfp4 kvcache (seqlen_q={seqlen_q}, d={d}) max diff: {max_diff}")
+    print(f"mxfp4 kvcache (seqlen_q={seqlen_q}, d={d}) mean diff: {mean_diff}")
+    # mxfp4 (E2M1, 1 mantissa bit) is coarser than fp8, so allow a larger error.
+    assert max_diff <= 6e-1
+    assert mean_diff <= 1e-1
+
+
 if EXTENDED_KVCACHE_TESTS:
 
     @pytest.mark.parametrize(

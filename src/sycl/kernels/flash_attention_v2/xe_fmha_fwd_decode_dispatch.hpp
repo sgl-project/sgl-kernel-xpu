@@ -145,6 +145,10 @@ EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG(512)
       } else {                                                                                       \
         FmhaDecodeFp8Runner<QG, HD, PS>{}(params);                                                   \
       }                                                                                              \
+    } else if (params.is_mxfp4) {                                                                    \
+      TORCH_CHECK(params.is_bf16, "mxfp4 KV cache decode only supports a bf16 query");               \
+      /* woq mxfp4 currently uses the non-split decode path only. */                                 \
+      FmhaDecodeMxfp4Runner<QG, HD, PS>{}(params);                                                    \
     } else if (params.is_fp16) {                                                                     \
       if (params.use_split_kv) {                                                                     \
         FmhaSplitDecodeRunner<QG, HD, PS, cutlass::half_t>{}(params);                                \

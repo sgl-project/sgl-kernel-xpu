@@ -101,6 +101,19 @@ struct Arguments {
   const float* k_scale_ptr = nullptr;
   const float* v_scale_ptr = nullptr;
 
+  // mxfp4 (woq) KV cache: E8M0 per-block dequant scales (uint8), one scale per
+  // mxfp4_block_size elements along head_dim. K/V data are packed E2M1
+  // (float_e2m1_t, 2 nibbles/byte). Scale strides mirror the K/V page/seq/head
+  // strides but index the [.., head_dim/block] scale tensor. Null => no mxfp4.
+  const uint8_t* k_block_scale_ptr = nullptr;
+  const uint8_t* v_block_scale_ptr = nullptr;
+  int64_t k_scale_stride_page = 0;
+  int64_t k_scale_stride_seq = 0;
+  int64_t k_scale_stride_heads = 0;
+  int64_t v_scale_stride_page = 0;
+  int64_t v_scale_stride_seq = 0;
+  int64_t v_scale_stride_heads = 0;
+  int mxfp4_block_size = 32;
   void* __restrict__ temp_out_ptr = nullptr;
   void* __restrict__ exp_sums_ptr = nullptr;
   void* __restrict__ max_logits_ptr = nullptr;
@@ -233,6 +246,7 @@ struct Arguments {
   bool is_fp32;
   bool is_e4m3 = false;
   bool is_e5m2 = false;
+  bool is_mxfp4 = false;
 
   bool is_rotary_interleaved;
 
@@ -376,6 +390,15 @@ struct DecodeRunner {
             static_cast<const bool*>(params.skip_batch_mask_ptr),
             params.k_scale_ptr,
             params.v_scale_ptr,
+            params.k_block_scale_ptr,
+            params.v_block_scale_ptr,
+            params.k_scale_stride_page,
+            params.k_scale_stride_seq,
+            params.k_scale_stride_heads,
+            params.v_scale_stride_page,
+            params.v_scale_stride_seq,
+            params.v_scale_stride_heads,
+            params.mxfp4_block_size,
             static_cast<float*>(params.softmax_lse_ptr),
             static_cast<int64_t>(params.total_q),
         },
@@ -384,7 +407,12 @@ struct DecodeRunner {
          params.page_size,
          params.max_num_pages_per_seq,
          params.window_size_left,
-         params.window_size_right},
+         params.window_size_right,
+         params.k_scale_stride_page,
+         params.k_scale_stride_seq,
+         params.v_scale_stride_page,
+         params.v_scale_stride_seq,
+         params.mxfp4_block_size},
         {},
         hw_info};
 
@@ -916,6 +944,19 @@ struct FmhaDecodeFp8Runner {
 
 template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE, class Element = cutlass::bfloat16_t>
 struct FmhaSplitDecodeFp8Runner {
+  void operator()(const Arguments& params) const;
+};
+
+// mxfp4 (woq) KV-cache decode paths: K/V are packed E2M1 (float_e2m1_t) with a
+// per-block E8M0 scale, dequantized to bf16 in the mainloop. Completely mirror
+// the fp8 runners except the scale is per-block; bf16 query only.
+template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE, class Element = cutlass::bfloat16_t>
+struct FmhaDecodeMxfp4Runner {
+  void operator()(const Arguments& params) const;
+};
+
+template <int QG_SZ, int HEAD_DIM, int PAGE_SIZE, class Element = cutlass::bfloat16_t>
+struct FmhaSplitDecodeMxfp4Runner {
   void operator()(const Arguments& params) const;
 };
 

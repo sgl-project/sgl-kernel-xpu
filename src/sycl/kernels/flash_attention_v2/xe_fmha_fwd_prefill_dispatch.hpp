@@ -85,6 +85,9 @@ EXTERN_FMHA_PREFILL_NP_RUNNER(512)
     if (params.is_e4m3 || params.is_e5m2) {                                                           \
       TORCH_CHECK(params.is_bf16, "fp8 KV cache prefill only supports a bf16 query");                 \
       FmhaPrefillFp8Runner<HD>{}(params);                                                             \
+    } else if (params.is_mxfp4) {                                                                     \
+      TORCH_CHECK(params.is_bf16, "mxfp4 KV cache prefill only supports a bf16 query");               \
+      FmhaPrefillMxfp4Runner<HD>{}(params);                                                           \
     } else if (params.is_fp16) {                                                                      \
       FmhaPrefillRunner<HD, cutlass::half_t>{}(params);                                               \
     } else {                                                                                          \

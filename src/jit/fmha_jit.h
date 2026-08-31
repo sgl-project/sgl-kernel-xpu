@@ -18,11 +18,13 @@ namespace fmha_jit {
 
 // Decode-family kernel variants (each backed by its own *.cpp.in template).
 enum class DecodeOp {
-  kDecode,          // paged, 16-bit KV
-  kSplitDecode,     // paged, 16-bit KV, split-KV
-  kDecodeFp8,       // paged, fp8 KV
-  kSplitDecodeFp8,  // paged, fp8 KV, split-KV
-  kDecodeNoPage,    // non-paged (contiguous ragged) KV, 16-bit
+  kDecode,            // paged, 16-bit KV
+  kSplitDecode,       // paged, 16-bit KV, split-KV
+  kDecodeFp8,         // paged, fp8 KV
+  kSplitDecodeFp8,    // paged, fp8 KV, split-KV
+  kDecodeMxfp4,       // paged, mxfp4 (E2M1 + E8M0 block scale) KV, woq
+  kSplitDecodeMxfp4,  // paged, mxfp4 KV, split-KV, woq
+  kDecodeNoPage,      // non-paged (contiguous ragged) KV, 16-bit
 };
 
 // Launch a decode kernel. `is_fp16` selects the query dtype (false => bf16).
@@ -48,6 +50,7 @@ bool decode_prewarm(
 enum class PrefillOp {
   kPrefill,        // paged, 16-bit KV
   kPrefillFp8,     // paged, fp8 KV (bf16 query only)
+  kPrefillMxfp4,   // paged, mxfp4 (E2M1 + E8M0 block scale) KV, woq (bf16 query only)
   kPrefillNoPage,  // non-paged (contiguous ragged) KV, 16-bit
 };
 

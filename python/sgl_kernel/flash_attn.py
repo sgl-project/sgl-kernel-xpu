@@ -272,6 +272,10 @@ def flash_attn_with_kvcache(
     total_q = q.size(0)
     num_heads = q.size(-2)
     head_size_v = v_cache.size(-1)
+    # woq mxfp4 stores the V cache as packed E2M1 (2 nibbles/byte), so the stored
+    # last dim is head_size_v // 2; the logical output head dim doubles it.
+    if v_cache.dtype == torch.uint8:
+        head_size_v = head_size_v * 2
     if out is None:
         out = q.new_empty(total_q, num_heads, head_size_v)
     softmax_lse = (

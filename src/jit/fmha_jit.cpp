@@ -24,6 +24,10 @@ const char* template_file(DecodeOp op) {
       return "xe_fmha_fwd_decode_fp8_kernel.cpp.in";
     case DecodeOp::kSplitDecodeFp8:
       return "xe_fmha_fwd_split_decode_fp8_kernel.cpp.in";
+    case DecodeOp::kDecodeMxfp4:
+      return "xe_fmha_fwd_decode_mxfp4_kernel.cpp.in";
+    case DecodeOp::kSplitDecodeMxfp4:
+      return "xe_fmha_fwd_split_decode_mxfp4_kernel.cpp.in";
     case DecodeOp::kDecodeNoPage:
       return "xe_fmha_fwd_decode_nopage_kernel.cpp.in";
   }
@@ -40,6 +44,10 @@ const char* op_tag(DecodeOp op) {
       return "decode_fp8";
     case DecodeOp::kSplitDecodeFp8:
       return "split_decode_fp8";
+    case DecodeOp::kDecodeMxfp4:
+      return "decode_mxfp4";
+    case DecodeOp::kSplitDecodeMxfp4:
+      return "split_decode_mxfp4";
     case DecodeOp::kDecodeNoPage:
       return "decode_nopage";
   }
@@ -116,6 +124,8 @@ const char* prefill_template_file(PrefillOp op) {
       return "xe_fmha_fwd_prefill_kernel.cpp.in";
     case PrefillOp::kPrefillFp8:
       return "xe_fmha_fwd_prefill_fp8_kernel.cpp.in";
+    case PrefillOp::kPrefillMxfp4:
+      return "xe_fmha_fwd_prefill_mxfp4_kernel.cpp.in";
     case PrefillOp::kPrefillNoPage:
       return "xe_fmha_fwd_prefill_nopage_kernel.cpp.in";
   }
@@ -128,6 +138,8 @@ const char* prefill_op_tag(PrefillOp op) {
       return "prefill";
     case PrefillOp::kPrefillFp8:
       return "prefill_fp8";
+    case PrefillOp::kPrefillMxfp4:
+      return "prefill_mxfp4";
     case PrefillOp::kPrefillNoPage:
       return "prefill_nopage";
   }
@@ -146,8 +158,8 @@ KernelFn resolve_prefill(PrefillOp op, int hd, bool is_fp16, int arch, std::stri
   const uint64_t key = pack_prefill_key(arch, op, hd, is_fp16);
   auto build = [&](std::string* berr) -> void* {
     const bool nopage = (op == PrefillOp::kPrefillNoPage);
-    // fp8 prefill is bf16-query only.
-    const bool fp16 = (op == PrefillOp::kPrefillFp8) ? false : is_fp16;
+    // fp8 / mxfp4 prefill are bf16-query only.
+    const bool fp16 = (op == PrefillOp::kPrefillFp8 || op == PrefillOp::kPrefillMxfp4) ? false : is_fp16;
 
     const sgl::fmha::PrefillTile tile = nopage ? sgl::fmha::prefill_nopage_tile(hd) : sgl::fmha::prefill_paged_tile(hd);
     if (!tile.ok) {

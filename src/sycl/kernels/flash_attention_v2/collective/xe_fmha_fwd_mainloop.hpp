@@ -217,6 +217,18 @@ struct FMHAFwdMainloop<
   // K/V are dequantized (cast to ElementQ and multiplied by the per-tensor
   // scale) inside the mainloop after the block-2D load.
   static constexpr bool Fp8KV = is_any_of_v<ElementK, float_e5m2_t, float_e4m3_t>;
+  // mxfp4 (woq) KV cache: enabled when the K element type is packed E2M1. This
+  // completely mirrors the fp8 path (block-2D load + reorder to bf16) except the
+  // dequant scale is per-block (E8M0) instead of per-tensor, so it is applied to
+  // the reordered bf16 K/V fragments here rather than folded into qk_scale.
+  static constexpr bool Mxfp4KV = is_any_of_v<ElementK, float_e2m1_t>;
+
+  // Decode E8M0 exponent byte to a float scale 2^(e-127) via the bit trick used
+  // by the w4a16 path (byte << 23 reinterpreted as float exponent).
+  CUTLASS_DEVICE static float mxfp4_scale_from_e8m0(uint8_t e8m0) {
+    uint32_t bits = uint32_t(e8m0) << 23;
+    return sycl::bit_cast<float>(bits);
+  }
 
   // User-facing arguments
   struct Arguments {
@@ -226,6 +238,14 @@ struct FMHAFwdMainloop<
     int max_num_pages_per_seq = 0;
     int window_size_left = -1;
     int window_size_right = -1;
+    // mxfp4 E8M0 per-block scale strides (indexing the [.., head_dim/block]
+    // scale tensor). The head/batch-relative base pointer is passed to
+    // operator() per invocation (mirroring how fp8 passes scale_k).
+    int64_t k_scale_stride_page = 0;
+    int64_t k_scale_stride_seq = 0;
+    int64_t v_scale_stride_page = 0;
+    int64_t v_scale_stride_seq = 0;
+    int mxfp4_block_size = 32;
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
     ElementScoreStore* ptr_score = nullptr;
 #endif
@@ -255,6 +275,11 @@ struct FMHAFwdMainloop<
         args.max_num_pages_per_seq,
         args.window_size_left,
         args.window_size_right,
+        args.k_scale_stride_page,
+        args.k_scale_stride_seq,
+        args.v_scale_stride_page,
+        args.v_scale_stride_seq,
+        args.mxfp4_block_size,
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
         ScoreBlock2D ? reinterpret_cast<ElementScoreStore*>(workspace) : nullptr};
 #else
@@ -301,7 +326,11 @@ struct FMHAFwdMainloop<
       int discard_seq_coord,
       TensorK_cache2D const& K_cache_2D = TensorK_cache2D{},
       TensorV_cache2D const& V_cache_2D = TensorV_cache2D{},
-      float scale_k = 1.0f  // FP8 K per-tensor dequant scale
+      float scale_k = 1.0f,  // FP8 K per-tensor dequant scale
+      // mxfp4 (woq) E8M0 per-block dequant scales for this (head,batch). K/V
+      // packed E2M1 are reordered to bf16 (as fp8) then scaled per-block here.
+      const uint8_t* k_scale_base = nullptr,
+      const uint8_t* v_scale_base = nullptr
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
       ,
       ElementScoreStore* score_head_ptr = nullptr,
@@ -533,6 +562,35 @@ struct FMHAFwdMainloop<
           copy(copy_k_cache, tKgK_cache(_, _, _, page_idx, D), tKrK);
           reorder(tQrQ, tSrQ);
           reorder(tKrK, tSrK);
+          if constexpr (Mxfp4KV) {
+            // Per-block E8M0 dequant of the reordered bf16 K fragment. Build the
+            // scale in the load-copy layout from each element's (k,d) identity
+            // coord, reorder into the MMA-B layout, then multiply. Physical KV
+            // token kk decomposes into (page,token) via page_size to index the
+            // [.., head_dim/block] scale tensor. Scale fragments use the MMA
+            // operand type (16-bit) so the reorder hits the optimized Xe path;
+            // E8M0 scales are powers of two and thus exact in bf16.
+            using ElementKMma = cute::remove_cvref_t<decltype(tSrK(0))>;
+            auto sK_load = make_fragment_like<ElementKMma>(tKrK.layout());
+            auto coordK = tKgK_cache(_, _, _, page_idx, D);
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < int(size(sK_load)); ++i) {
+              auto kd = coordK(i);
+              int kk = int(get<0>(kd));
+              int dd = int(get<1>(kd));
+              int64_t koff = (params.page_size > 0)
+                                 ? (int64_t(kk / params.page_size) * params.k_scale_stride_page +
+                                    int64_t(kk % params.page_size) * params.k_scale_stride_seq)
+                                 : int64_t(kk) * params.k_scale_stride_seq;
+              sK_load(i) = ElementKMma(mxfp4_scale_from_e8m0(k_scale_base[koff + dd / params.mxfp4_block_size]));
+            }
+            auto sK_mma = make_fragment_like<ElementKMma>(tSrK.layout());
+            reorder(sK_load, sK_mma, tKrK.tv_layout(), tSrK.tv_layout());
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < int(tSrK.size()); ++i) {
+              tSrK(i) = static_cast<ElementKMma>(ElementS(tSrK(i)) * ElementS(sK_mma(i)));
+            }
+          }
           cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
         }
       }
@@ -652,6 +710,32 @@ struct FMHAFwdMainloop<
       for (int VV = 0; VV < VTiles; VV++) {
         copy(copy_v_cache, tVgV_cache(_, _, _, VV, page_idx), tVrV);
         reorder(tVrV, tArV);
+        if constexpr (Mxfp4KV) {
+          // Per-block E8M0 dequant of the reordered bf16 V fragment. V identity
+          // coords are (v,k); the E8M0 block runs along v (output head dim).
+          // Scale fragments use the MMA operand type (16-bit) so the reorder
+          // hits the optimized Xe path; E8M0 scales are exact in bf16.
+          using ElementVMma = cute::remove_cvref_t<decltype(tArV(0))>;
+          auto sV_load = make_fragment_like<ElementVMma>(tVrV.layout());
+          auto coordV = tVgV_cache(_, _, _, VV, page_idx);
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < int(size(sV_load)); ++i) {
+            auto vk = coordV(i);
+            int vv = int(get<0>(vk));
+            int kk = int(get<1>(vk));
+            int64_t voff = (params.page_size > 0)
+                               ? (int64_t(kk / params.page_size) * params.v_scale_stride_page +
+                                  int64_t(kk % params.page_size) * params.v_scale_stride_seq)
+                               : int64_t(kk) * params.v_scale_stride_seq;
+            sV_load(i) = ElementVMma(mxfp4_scale_from_e8m0(v_scale_base[voff + vv / params.mxfp4_block_size]));
+          }
+          auto sV_mma = make_fragment_like<ElementVMma>(tArV.layout());
+          reorder(sV_load, sV_mma, tVrV.tv_layout(), tArV.tv_layout());
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < int(tArV.size()); ++i) {
+            tArV(i) = static_cast<ElementVMma>(ElementS(tArV(i)) * ElementS(sV_mma(i)));
+          }
+        }
         if (K != blk_k0) {
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < tArA.size() / VTiles; i++) {

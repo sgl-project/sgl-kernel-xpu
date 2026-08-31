@@ -32,6 +32,7 @@ limitations under the License.
 
 #include <ATen/ATen.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -936,3 +937,317 @@ SGL_KERNEL_EXPORT void transfer_kv_all_layer_mla_lf_pf(
       block_quota,
       sgs_per_wg);
 }
+
+// ===========================================================================
+// Mamba HiCache transfer (SYCL port of sgl-kernel csrc/kvcacheio/transfer_mamba.cuh,
+// i.e. TransferMambaKernel::run_pf_lf / ::run_lf_pf)
+//
+//   load  (pf→lf): dst[dst_idx[i]]        ← src[src_idx[i], layer_id]
+//   backup(lf→pf): dst[dst_idx[i], layer] ← src[layer, src_idx[i]]  (all layers)
+//
+// Layouts (all contiguous):
+//   page_first  : [pool, num_layers, item]  per-page stride = num_layers * item
+//   layer_first : [num_layers, pool, item]  per-layer stride = pool * item
+//   single-layer: [pool, item]              per-page stride = item
+//
+// Unlike the KV kernels above (which hard-require item_size % 8 == 0), the copy
+// unit is chosen at runtime from pointer and stride alignment, so odd Mamba
+// state sizes stay correct.
+//
+// backup takes the contiguous layer_first tensor plus its per-layer byte stride
+// where CUDA takes a uint64 array of per-layer pointers: dereferencing a
+// host-built pointer array is not portable across SYCL runtimes.
+// ===========================================================================
+
+static constexpr int64_t kMambaWgSize = 256;
+// Split an item across work-groups only while each still has enough to amortize
+// its launch: at least this many units per work-item.
+static constexpr int64_t kMambaMinUnitsPerThread = 8;
+// Measured on BMG (160 CUs): 1 leaves the large-item copies short of peak, 4 and
+// 8 are within noise, so 4 fills the device while keeping chunks as large (and
+// as streaming-friendly) as possible.
+static constexpr int64_t kMambaGroupsPerCu = 4;
+
+// Widest power-of-two copy unit (≤ 8B) dividing every address and byte stride,
+// so every access stays naturally aligned.  OR-ing the quantities makes the
+// lowest set bit the minimum over their individual lowest set bits, which is
+// exactly the shared 2-power.
+static inline int64_t mamba_copy_width(std::initializer_list<int64_t> byte_quantities) {
+  int64_t combined = 0;
+  for (int64_t q : byte_quantities)
+    combined |= q;
+  for (int64_t w : {8, 4, 2}) {
+    if ((combined & (w - 1)) == 0) return w;
+  }
+  return 1;
+}
+
+// One work-group per copy unit (item for load, item × layer for backup) leaves
+// most of the device idle when items are few and large -- 16 pages of 64Ki
+// elements is 16 work-groups on a 160-CU GPU, measurably slower than a plain
+// PyTorch indexed copy -- so each unit is split into `chunks` contiguous ranges
+// until the grid fills the device.  With enough units to fill it (the common
+// HiCache case) this returns chunks == 1.
+struct MambaChunking {
+  int64_t chunks;
+  int64_t units_per_chunk;
+};
+
+static MambaChunking mamba_plan_chunks(int64_t num_copy_units, int64_t item_units) {
+  const int64_t max_chunks = std::max<int64_t>(1, item_units / (kMambaWgSize * kMambaMinUnitsPerThread));
+  const int64_t target_wgs = kMambaGroupsPerCu * dpcppMaxComputeUnitSize();
+  const int64_t wanted = std::clamp<int64_t>(div_up(target_wgs, num_copy_units), 1, max_chunks);
+  if (wanted == 1) return {1, item_units};
+
+  // Round up to a whole work-group stride so every chunk boundary stays
+  // cache-line aligned, then recompute the count from the rounded size so no
+  // work-group is launched for an entirely empty range.
+  const int64_t units_per_chunk = div_up(div_up(item_units, wanted), kMambaWgSize) * kMambaWgSize;
+  return {div_up(item_units, units_per_chunk), units_per_chunk};
+}
+
+// Load: page_first → single-layer.  Grid = (num_items) × (chunks * kMambaWgSize).
+// 2-D rather than flat-and-divided so the hardware supplies both indices:
+// recovering (item, chunk) from a flat group id costs an int64 div+mod per
+// work-item, which measurably slowed the small-item shapes.
+template <typename CopyT>
+struct TransferMambaLoadKernel {
+  [[sycl::reqd_sub_group_size(XPU_SG_SIZE)]] void operator()(sycl::nd_item<2> item) const {
+    const int64_t begin = static_cast<int64_t>(item.get_group(1)) * units_per_chunk_;
+    if (begin >= item_units_) return;  // only reachable for a tail chunk
+    const int64_t end = sycl::min(begin + units_per_chunk_, item_units_);
+
+    const int64_t item_id = static_cast<int64_t>(item.get_group(0));
+    const CopyT* src = src_ + src_indices_[item_id] * src_page_stride_ + layer_id_ * item_units_;
+    CopyT* dst = dst_ + dst_indices_[item_id] * item_units_;
+
+    const int64_t stride = static_cast<int64_t>(item.get_local_range(1));
+    for (int64_t i = begin + static_cast<int64_t>(item.get_local_id(1)); i < end; i += stride) {
+      dst[i] = src[i];
+    }
+  }
+
+  const CopyT* src_;
+  CopyT* dst_;
+  const int64_t* src_indices_;
+  const int64_t* dst_indices_;
+  int64_t layer_id_;
+  int64_t item_units_;
+  int64_t src_page_stride_;
+  int64_t units_per_chunk_;
+};
+
+// Backup: layer_first → page_first, all layers.
+// Grid = (num_items) × (num_layers) × (chunks * kMambaWgSize), 3-D for the same
+// reason the load grid is 2-D.
+template <typename CopyT>
+struct TransferMambaBackupKernel {
+  [[sycl::reqd_sub_group_size(XPU_SG_SIZE)]] void operator()(sycl::nd_item<3> item) const {
+    const int64_t begin = static_cast<int64_t>(item.get_group(2)) * units_per_chunk_;
+    if (begin >= item_units_) return;  // only reachable for a tail chunk
+    const int64_t end = sycl::min(begin + units_per_chunk_, item_units_);
+
+    const int64_t item_id = static_cast<int64_t>(item.get_group(0));
+    const int64_t layer = static_cast<int64_t>(item.get_group(1));
+    const CopyT* src = src_ + layer * src_layer_stride_ + src_indices_[item_id] * item_units_;
+    CopyT* dst = dst_ + dst_indices_[item_id] * dst_page_stride_ + layer * item_units_;
+
+    const int64_t stride = static_cast<int64_t>(item.get_local_range(2));
+    for (int64_t i = begin + static_cast<int64_t>(item.get_local_id(2)); i < end; i += stride) {
+      dst[i] = src[i];
+    }
+  }
+
+  const CopyT* src_;
+  CopyT* dst_;
+  const int64_t* src_indices_;
+  const int64_t* dst_indices_;
+  int64_t item_units_;
+  int64_t src_layer_stride_;
+  int64_t dst_page_stride_;
+  int64_t units_per_chunk_;
+};
+
+template <typename CopyT>
+static void launch_mamba_load(
+    const void* src,
+    void* dst,
+    const int64_t* src_indices,
+    const int64_t* dst_indices,
+    int64_t layer_id,
+    int64_t item_bytes,
+    int64_t src_page_stride_bytes,
+    int64_t num_items) {
+  constexpr int64_t kUnit = static_cast<int64_t>(sizeof(CopyT));
+  const int64_t item_units = item_bytes / kUnit;
+  // Plain locals rather than a structured binding: the SYCL device pass compiles
+  // as C++17, where capturing one in the command-group lambda is an extension.
+  const MambaChunking plan = mamba_plan_chunks(num_items, item_units);
+  const int64_t chunks = plan.chunks;
+
+  TransferMambaLoadKernel<CopyT> kernel{
+      .src_ = static_cast<const CopyT*>(src),
+      .dst_ = static_cast<CopyT*>(dst),
+      .src_indices_ = src_indices,
+      .dst_indices_ = dst_indices,
+      .layer_id_ = layer_id,
+      .item_units_ = item_units,
+      .src_page_stride_ = src_page_stride_bytes / kUnit,
+      .units_per_chunk_ = plan.units_per_chunk,
+  };
+
+  auto cgf = DPCPP_Q_CGF(cgh) {
+    cgh.parallel_for<decltype(kernel)>(
+        sycl::nd_range<2>(
+            sycl::range<2>(static_cast<size_t>(num_items), static_cast<size_t>(chunks * kMambaWgSize)),
+            sycl::range<2>(1, static_cast<size_t>(kMambaWgSize))),
+        kernel);
+  };
+  dpcppGetCurrentQueue().submit(cgf);
+}
+
+template <typename CopyT>
+static void launch_mamba_backup(
+    const void* src,
+    void* dst,
+    const int64_t* src_indices,
+    const int64_t* dst_indices,
+    int64_t item_bytes,
+    int64_t src_layer_stride_bytes,
+    int64_t dst_page_stride_bytes,
+    int64_t num_items,
+    int64_t num_layers) {
+  constexpr int64_t kUnit = static_cast<int64_t>(sizeof(CopyT));
+  const int64_t item_units = item_bytes / kUnit;
+  const MambaChunking plan = mamba_plan_chunks(num_items * num_layers, item_units);
+  const int64_t chunks = plan.chunks;
+
+  TransferMambaBackupKernel<CopyT> kernel{
+      .src_ = static_cast<const CopyT*>(src),
+      .dst_ = static_cast<CopyT*>(dst),
+      .src_indices_ = src_indices,
+      .dst_indices_ = dst_indices,
+      .item_units_ = item_units,
+      .src_layer_stride_ = src_layer_stride_bytes / kUnit,
+      .dst_page_stride_ = dst_page_stride_bytes / kUnit,
+      .units_per_chunk_ = plan.units_per_chunk,
+  };
+
+  auto cgf = DPCPP_Q_CGF(cgh) {
+    cgh.parallel_for<decltype(kernel)>(
+        sycl::nd_range<3>(
+            sycl::range<3>(
+                static_cast<size_t>(num_items),
+                static_cast<size_t>(num_layers),
+                static_cast<size_t>(chunks * kMambaWgSize)),
+            sycl::range<3>(1, 1, static_cast<size_t>(kMambaWgSize))),
+        kernel);
+  };
+  dpcppGetCurrentQueue().submit(cgf);
+}
+
+// Dispatch on the runtime-chosen copy width.  The unit type carries no
+// semantics -- this is a byte copy, not a per-dtype instantiation.
+#define _MAMBA_DISPATCH_WIDTH(WIDTH, LAUNCH, ...) \
+  switch (WIDTH) {                                \
+    case 8:                                       \
+      LAUNCH<uint64_t>(__VA_ARGS__);              \
+      break;                                      \
+    case 4:                                       \
+      LAUNCH<uint32_t>(__VA_ARGS__);              \
+      break;                                      \
+    case 2:                                       \
+      LAUNCH<uint16_t>(__VA_ARGS__);              \
+      break;                                      \
+    default:                                      \
+      LAUNCH<uint8_t>(__VA_ARGS__);               \
+      break;                                      \
+  }
+
+// Shared argument validation for both directions; returns the item count.
+static int64_t check_mamba_transfer(
+    const at::Tensor& src,
+    const at::Tensor& dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t layout_dim) {
+  TORCH_CHECK(src_indices.scalar_type() == at::kLong, "src_indices must be int64");
+  TORCH_CHECK(dst_indices.scalar_type() == at::kLong, "dst_indices must be int64");
+  TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "index count mismatch");
+  TORCH_CHECK(src_indices.is_contiguous() && dst_indices.is_contiguous(), "indices must be contiguous");
+  // Flat byte addressing assumes both pools are contiguous.
+  TORCH_CHECK(src.is_contiguous() && dst.is_contiguous(), "src/dst must be contiguous");
+  TORCH_CHECK(item_size > 0, "item_size must be positive");
+  TORCH_CHECK(layout_dim >= item_size, "layout_dim must be at least item_size");
+  TORCH_CHECK(layout_dim % item_size == 0, "layout_dim must be a whole number of items");
+  return src_indices.numel();
+}
+
+// Load: page_first → single-layer, one layer slot.
+// item_size and src_layout_dim are BYTES (per item, and per page in src).
+SGL_KERNEL_EXPORT void transfer_kv_mamba_pf_lf(
+    const at::Tensor& src,
+    at::Tensor& dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim) {
+  const int64_t num_items = check_mamba_transfer(src, dst, src_indices, dst_indices, item_size, src_layout_dim);
+  if (num_items == 0) return;
+  TORCH_CHECK(layer_id >= 0 && layer_id < src_layout_dim / item_size, "layer_id out of range for src_layout_dim");
+
+  const auto src_addr = reinterpret_cast<int64_t>(src.const_data_ptr());
+  const auto dst_addr = reinterpret_cast<int64_t>(dst.data_ptr());
+  const int64_t width = mamba_copy_width({src_addr, dst_addr, item_size, src_layout_dim});
+
+  _MAMBA_DISPATCH_WIDTH(
+      width,
+      launch_mamba_load,
+      src.const_data_ptr(),
+      dst.data_ptr(),
+      src_indices.const_data_ptr<int64_t>(),
+      dst_indices.const_data_ptr<int64_t>(),
+      layer_id,
+      item_size,
+      src_layout_dim,
+      num_items);
+}
+
+// Backup: layer_first → page_first, all layers.
+// item_size and dst_layout_dim are BYTES (per item, and per page in dst).
+SGL_KERNEL_EXPORT void transfer_kv_mamba_lf_pf(
+    const at::Tensor& src_layers,
+    at::Tensor& dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers) {
+  const int64_t num_items = check_mamba_transfer(src_layers, dst, src_indices, dst_indices, item_size, dst_layout_dim);
+  TORCH_CHECK(num_layers > 0, "num_layers must be positive");
+  TORCH_CHECK(src_layers.dim() >= 1 && src_layers.size(0) == num_layers, "src_layers.size(0) must be num_layers");
+  TORCH_CHECK(dst_layout_dim / item_size >= num_layers, "dst_layout_dim must hold num_layers items");
+  if (num_items == 0) return;
+
+  const int64_t src_layer_stride = src_layers.stride(0) * src_layers.element_size();
+  const auto src_addr = reinterpret_cast<int64_t>(src_layers.const_data_ptr());
+  const auto dst_addr = reinterpret_cast<int64_t>(dst.data_ptr());
+  const int64_t width = mamba_copy_width({src_addr, dst_addr, item_size, dst_layout_dim, src_layer_stride});
+
+  _MAMBA_DISPATCH_WIDTH(
+      width,
+      launch_mamba_backup,
+      src_layers.const_data_ptr(),
+      dst.data_ptr(),
+      src_indices.const_data_ptr<int64_t>(),
+      dst_indices.const_data_ptr<int64_t>(),
+      item_size,
+      src_layer_stride,
+      dst_layout_dim,
+      num_items,
+      num_layers);
+}
+
+#undef _MAMBA_DISPATCH_WIDTH

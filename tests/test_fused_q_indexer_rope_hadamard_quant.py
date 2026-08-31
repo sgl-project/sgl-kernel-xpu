@@ -3,14 +3,11 @@ import math
 import pytest
 import torch
 from sgl_kernel import fused_q_indexer_rope_hadamard_quant
+from utils import FP8_E4M3_MAX, HEAD_DIM, NOPE_DIM, ROPE_DIM
 
 pytestmark = pytest.mark.skipif(
     not torch.xpu.is_available(), reason="XPU not available"
 )
-_FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
-_HEAD_DIM = 128  # kernel contracts q_input/q_fp8 as [B, H, 128]
-_ROPE_DIM = 64  # kernel contracts rope_cache as [max_pos, 64]
-_NOPE_DIM = _HEAD_DIM - _ROPE_DIM
 
 
 def _fwht128(x: torch.Tensor) -> torch.Tensor:
@@ -36,9 +33,9 @@ def _ref_torch_impl(
     positions: torch.Tensor,
 ) -> None:
     B, H, head_dim = q_input.shape
-    assert head_dim == _HEAD_DIM
-    assert freqs_cis.shape[-1] == _ROPE_DIM
-    assert q_fp8.shape == (B, H, _HEAD_DIM)
+    assert head_dim == HEAD_DIM
+    assert freqs_cis.shape[-1] == ROPE_DIM
+    assert q_fp8.shape == (B, H, HEAD_DIM)
     assert weight.shape == (B, H)
     assert weights_out.shape == (B, H, 1)
 
@@ -46,21 +43,19 @@ def _ref_torch_impl(
 
     freq = freqs_cis[positions].unsqueeze(1)  # (B, 1, 64)
     freq_re, freq_im = freq[..., 0::2], freq[..., 1::2]  # (B, 1, 32) each
-    x_nope = x[..., :_NOPE_DIM]
-    x_rope = x[..., _NOPE_DIM:]
+    x_nope = x[..., :NOPE_DIM]
+    x_rope = x[..., NOPE_DIM:]
     xr, xi = x_rope[..., 0::2], x_rope[..., 1::2]
     rotated = torch.stack(
         [xr * freq_re - xi * freq_im, xr * freq_im + xi * freq_re], dim=-1
     ).flatten(-2)
     x = torch.cat([x_nope, rotated], dim=-1)
 
-    x = _fwht128(x) * (1.0 / math.sqrt(_HEAD_DIM))
+    x = _fwht128(x) * (1.0 / math.sqrt(HEAD_DIM))
 
     abs_max = x.abs().amax(dim=-1, keepdim=True)  # (B, H, 1)
-    scale = abs_max.clamp(min=1e-4) / _FP8_E4M3_MAX
-    q_fp8.copy_(
-        (x / scale).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn)
-    )
+    scale = abs_max.clamp(min=1e-4) / FP8_E4M3_MAX
+    q_fp8.copy_((x / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn))
 
     weights_out.copy_(
         (weight.float() * float(weight_scale) * scale.squeeze(-1)).unsqueeze(-1)

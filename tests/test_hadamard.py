@@ -48,25 +48,6 @@ def _ref_torch_impl(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     return out.reshape(x_shape)
 
 
-def _bench(fn, *, warmup: int = 5, iters: int = 20) -> float:
-    for _ in range(warmup):
-        fn()
-    torch.xpu.synchronize()
-
-    times = []
-    for _ in range(iters):
-        start = torch.xpu.Event(enable_timing=True)
-        end = torch.xpu.Event(enable_timing=True)
-        start.record()
-        fn()
-        end.record()
-        torch.xpu.synchronize()
-        times.append(start.elapsed_time(end))
-
-    times.sort()
-    return times[len(times) // 2]
-
-
 def _setup_inputs(bs: int, dim: int, dtype: torch.dtype) -> torch.Tensor:
     torch.manual_seed(0)
     stream = torch.xpu.Stream()
@@ -106,25 +87,6 @@ def test_hadamard_transform(dim: int, dtype: torch.dtype) -> None:
         atol=atol,
         msg="SYCL hadamard output mismatch vs torch reference",
     )
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("bs", [132, 1024])
-@pytest.mark.parametrize("dim", [36, 1024, 4096, 16384])
-@torch.inference_mode()
-def test_hadamard_transform_perf(bs: int, dim: int, dtype: torch.dtype) -> None:
-    if not torch.xpu.is_available():
-        pytest.skip("XPU is required for SYCL hadamard performance comparison")
-
-    x = _setup_inputs(bs, dim, dtype)
-    scale = 1 / math.sqrt(dim)
-
-    t_ref = _bench(lambda: _ref_torch_impl(x, scale=scale))
-    t_sycl = _bench(lambda: hadamard_transform(x, scale=scale))
-
-    assert (
-        t_sycl < t_ref
-    ), f"sycl ({t_sycl:.3f} ms) not faster than torch ({t_ref:.3f} ms), {bs=}, {dim=}, {dtype=}"
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import itertools
+import os
 
 import pandas as pd
 import torch
@@ -22,7 +23,25 @@ NUM_KV_HEADS = 8  # page-table kernel is per kv head
 SCORE_BYTES = 4
 IDX_BYTES = 4
 
+# Both kernels are selection kernels: no multiply-accumulate work to count, so
+# achieved bandwidth against the device spec sheet is the only meaningful
+# efficiency figure. The driver cannot supply peak bandwidth -- it reports
+# memory_bus_width=64 per controller rather than the 192-bit aggregate, and
+# memory_clock_rate as the base clock rather than the GDDR6 data rate, so a
+# derived number would be several times too low.
+PEAK_BW_GB_S = {
+    "Intel(R) Arc(TM) Pro B60 Graphics": 456.0,
+}
+
 all_results = []
+
+
+def _peak_bw_gb_s():
+    """Device peak memory bandwidth in GB/s, or None if unknown."""
+    override = os.environ.get("SGL_PEAK_BW_GB_S")
+    if override:
+        return float(override)
+    return PEAK_BW_GB_S.get(torch.xpu.get_device_properties(0).name)
 
 
 def _release(*objs):
@@ -44,16 +63,39 @@ def _regime(num_blocks, topk):
     return "register-M"
 
 
-def _num_blocks_from(seq_lens, block_size, max_seqblock):
-    return ((seq_lens.to(torch.int64) + block_size - 1) // block_size).clamp(
-        max=max_seqblock
-    )
+def _bytes_block_id(num_blocks, batch, num_heads, topk):
+    """Bytes the block-id kernel actually touches for this shape.
+
+    The trivial regime (num_blocks <= topk) emits block ids straight from the
+    loop counter and never reads score, so counting the score row there would
+    inflate the reported bandwidth.
+    """
+    per_row = topk * IDX_BYTES
+    if num_blocks > topk:
+        per_row += num_blocks * SCORE_BYTES
+    return num_heads * batch * per_row + batch * SCORE_BYTES
+
+
+def _bytes_page_table(num_blocks, batch, num_heads, topk, block_size, page_size):
+    """Bytes the page-table kernel actually touches for this shape.
+
+    Every emitted page costs one req_to_token read plus one page_table write.
+    The trivial regime emits num_blocks * ppb pages instead of topk * ppb, and
+    skips the score row entirely.
+    """
+    ppb = block_size // page_size
+    pages = (num_blocks if num_blocks <= topk else topk) * ppb
+    per_row = 2 * pages * IDX_BYTES + IDX_BYTES
+    if num_blocks > topk:
+        per_row += num_blocks * SCORE_BYTES
+    return num_heads * batch * per_row + batch * SCORE_BYTES
 
 
 def _make_topk_state(num_blocks, batch, num_heads, topk, block_size, seed=0):
     torch.manual_seed(seed)
-    # Widened past num_blocks so the trivial regime still works: torch.topk in
-    # the eager reference needs k <= S, and seq_lens alone selects the regime.
+    # At least topk wide so the trivial regime still has a well-formed score
+    # row; the kernel clamps num_blocks to max_seqblock, and seq_lens alone
+    # selects the regime.
     max_seqblock = max(num_blocks, topk)
     score = torch.randn(
         (num_heads, batch, max_seqblock), dtype=torch.float32, device=DEVICE
@@ -71,24 +113,6 @@ def _make_topk_state(num_blocks, batch, num_heads, topk, block_size, seed=0):
         "topk": topk,
         "max_seqblock": max_seqblock,
     }
-
-
-def _torch_topk_block_ids(state):
-    score = state["score"]
-    topk = state["topk"]
-    num_heads, batch, max_seqblock = score.shape
-
-    num_blocks = _num_blocks_from(state["seq_lens"], state["block_size"], max_seqblock)
-    block_ids = torch.arange(max_seqblock, device=score.device)
-    valid = block_ids[None, :] < num_blocks[:, None]
-
-    masked = score.masked_fill(~valid[None], float("-inf"))
-    idx = masked.topk(topk, dim=-1).indices.to(torch.int32)
-
-    k_eff = num_blocks.clamp(max=topk)
-    keep = torch.arange(topk, device=score.device)[None, :] < k_eff[:, None]
-    state["out"].copy_(torch.where(keep[None], idx, torch.full_like(idx, -1)))
-    return state["out"]
 
 
 def _sglang_topk_block_ids(state):
@@ -133,56 +157,6 @@ def _make_page_table_state(
     }
 
 
-def _torch_page_table(state):
-    score = state["score"]
-    req_to_token = state["req_to_token"]
-    topk, block_size, page_size = (
-        state["topk"],
-        state["block_size"],
-        state["page_size"],
-    )
-    num_heads, batch, max_seqblock = score.shape
-    max_reqs, max_kv_len = req_to_token.shape
-    ppb = block_size // page_size
-
-    seq_lens = state["seq_lens"].to(torch.int64)
-    num_blocks = _num_blocks_from(seq_lens, block_size, max_seqblock)
-    block_ids = torch.arange(max_seqblock, device=score.device)
-    valid = block_ids[None, :] < num_blocks[:, None]
-
-    masked = score.masked_fill(~valid[None], float("-inf"))
-    idx = masked.topk(topk, dim=-1).indices
-
-    k_eff = num_blocks.clamp(max=topk)
-    keep = torch.arange(topk, device=score.device)[None, :] < k_eff[:, None]
-    # Fill invalid slots with an out-of-range id on purpose, so the sort below
-    # pushes them to the tail and the first k_eff entries come out ascending.
-    sel = torch.where(keep[None], idx, torch.full_like(idx, max_seqblock))
-    sel, _ = sel.sort(dim=-1)
-
-    bid = sel.clamp(max=max_seqblock - 1)
-    rem = (seq_lens[None, :, None] - bid * block_size).clamp(min=0, max=block_size)
-    real_seq_lens = (rem * keep[None]).sum(dim=-1).to(torch.int32)
-
-    offsets = torch.arange(ppb, device=score.device) * page_size
-    tok = (bid[..., None] * block_size + offsets).clamp(max=max_kv_len - 1)
-
-    rows = req_to_token[state["slot_ids"] % max_reqs]
-    pages = torch.gather(
-        rows[None].expand(num_heads, -1, -1), 2, tok.reshape(num_heads, batch, -1)
-    )
-    head_ids = torch.arange(num_heads, device=score.device).view(num_heads, 1, 1)
-    pages = pages // page_size * num_heads + head_ids
-
-    page_table = (
-        pages.reshape(num_heads, batch, topk * ppb)
-        .permute(1, 0, 2)
-        .reshape(batch * num_heads, topk * ppb)
-        .to(torch.int32)
-    )
-    return page_table, real_seq_lens.permute(1, 0).reshape(-1)
-
-
 def _sglang_page_table(state):
     return minimax_decode_topk_page_table(
         score=state["score"],
@@ -195,11 +169,28 @@ def _sglang_page_table(state):
     )
 
 
+def _record(kernel, num_blocks, batch, num_heads, topk, ms, moved):
+    gb_s = moved / (ms * 1e-3) / 1e9 if ms > 0 else float("nan")
+    peak = _peak_bw_gb_s()
+    all_results.append(
+        {
+            "kernel": kernel,
+            "case": _regime(num_blocks, topk),
+            "num_blocks": num_blocks,
+            "batch": batch,
+            "num_heads": num_heads,
+            "topk": topk,
+            "time_us": 1000 * ms,
+            "GB_s": gb_s,
+            "pct_peak": 100 * gb_s / peak if peak else float("nan"),
+        }
+    )
+
+
 NUM_BLOCKS = [8, SMALL_THRESHOLD, CTA_SIZE, MAX_NUM_BLOCKS]
 BATCH_SIZES = [1, 16, 64]
 
 blockid_configs = list(itertools.product(NUM_BLOCKS, BATCH_SIZES))
-PROVIDERS = ["sglang", "torch"]
 
 
 @triton.testing.perf_report(
@@ -207,9 +198,9 @@ PROVIDERS = ["sglang", "torch"]
         x_names=["num_blocks", "batch"],
         x_vals=blockid_configs,
         line_arg="provider",
-        line_vals=PROVIDERS,
-        line_names=["sglang (SYCL)", "torch eager"],
-        styles=[("blue", "-"), ("orange", "--")],
+        line_vals=["sglang"],
+        line_names=["sglang (SYCL)"],
+        styles=[("blue", "-")],
         ylabel="us",
         plot_name="minimax-decode-topk-block-id-performance",
         args={},
@@ -217,24 +208,17 @@ PROVIDERS = ["sglang", "torch"]
 )
 def benchmark_block_id(num_blocks, batch, provider):
     state = _make_topk_state(num_blocks, batch, NUM_QO_HEADS, TOPK, BLOCK_SIZE)
-    fn = _sglang_topk_block_ids if provider == "sglang" else _torch_topk_block_ids
     ms, min_ms, max_ms = triton.testing.do_bench(
-        lambda: fn(state), quantiles=[0.5, 0.2, 0.8]
+        lambda: _sglang_topk_block_ids(state), quantiles=[0.5, 0.2, 0.8]
     )
-
-    moved = NUM_QO_HEADS * batch * (num_blocks * SCORE_BYTES + TOPK * IDX_BYTES)
-    all_results.append(
-        {
-            "kernel": "minimax_decode_topk",
-            "provider": provider,
-            "case": _regime(num_blocks, TOPK),
-            "num_blocks": num_blocks,
-            "batch": batch,
-            "num_heads": NUM_QO_HEADS,
-            "topk": TOPK,
-            "time_us": 1000 * ms,
-            "GB_s": moved / (ms * 1e-3) / 1e9 if ms > 0 else float("nan"),
-        }
+    _record(
+        "minimax_decode_topk",
+        num_blocks,
+        batch,
+        NUM_QO_HEADS,
+        TOPK,
+        ms,
+        _bytes_block_id(num_blocks, batch, NUM_QO_HEADS, TOPK),
     )
     _release(state)
     return 1000 * ms, 1000 * min_ms, 1000 * max_ms
@@ -245,9 +229,9 @@ def benchmark_block_id(num_blocks, batch, provider):
         x_names=["num_blocks", "batch"],
         x_vals=blockid_configs,
         line_arg="provider",
-        line_vals=PROVIDERS,
-        line_names=["sglang (SYCL)", "torch eager"],
-        styles=[("green", "-"), ("orange", "--")],
+        line_vals=["sglang"],
+        line_names=["sglang (SYCL)"],
+        styles=[("green", "-")],
         ylabel="us",
         plot_name="minimax-decode-topk-page-table-performance",
         args={},
@@ -257,29 +241,17 @@ def benchmark_page_table(num_blocks, batch, provider):
     state = _make_page_table_state(
         num_blocks, batch, NUM_KV_HEADS, TOPK, BLOCK_SIZE, PAGE_SIZE
     )
-    fn = _sglang_page_table if provider == "sglang" else _torch_page_table
     ms, min_ms, max_ms = triton.testing.do_bench(
-        lambda: fn(state), quantiles=[0.5, 0.2, 0.8]
+        lambda: _sglang_page_table(state), quantiles=[0.5, 0.2, 0.8]
     )
-
-    ppb = BLOCK_SIZE // PAGE_SIZE
-    moved = (
-        NUM_KV_HEADS
-        * batch
-        * (num_blocks * SCORE_BYTES + 2 * TOPK * ppb * IDX_BYTES + IDX_BYTES)
-    )
-    all_results.append(
-        {
-            "kernel": "minimax_decode_topk_page_table",
-            "provider": provider,
-            "case": _regime(num_blocks, TOPK),
-            "num_blocks": num_blocks,
-            "batch": batch,
-            "num_heads": NUM_KV_HEADS,
-            "topk": TOPK,
-            "time_us": 1000 * ms,
-            "GB_s": moved / (ms * 1e-3) / 1e9 if ms > 0 else float("nan"),
-        }
+    _record(
+        "minimax_decode_topk_page_table",
+        num_blocks,
+        batch,
+        NUM_KV_HEADS,
+        TOPK,
+        ms,
+        _bytes_page_table(num_blocks, batch, NUM_KV_HEADS, TOPK, BLOCK_SIZE, PAGE_SIZE),
     )
     _release(state)
     return 1000 * ms, 1000 * min_ms, 1000 * max_ms
@@ -295,9 +267,9 @@ TOPK_VALUES = [1, 4, 16, 32]  # 32 == kMaxTopK
         x_names=["topk"],
         x_vals=TOPK_VALUES,
         line_arg="provider",
-        line_vals=PROVIDERS,
-        line_names=["sglang (SYCL)", "torch eager"],
-        styles=[("blue", "-"), ("orange", "--")],
+        line_vals=["sglang"],
+        line_names=["sglang (SYCL)"],
+        styles=[("blue", "-")],
         ylabel="us",
         plot_name="minimax-decode-topk-vs-topk-performance",
         args={},
@@ -307,59 +279,51 @@ def benchmark_topk_sweep(topk, provider):
     state = _make_topk_state(
         TOPK_SWEEP_NUM_BLOCKS, TOPK_SWEEP_BATCH, NUM_QO_HEADS, topk, BLOCK_SIZE
     )
-    fn = _sglang_topk_block_ids if provider == "sglang" else _torch_topk_block_ids
     ms, min_ms, max_ms = triton.testing.do_bench(
-        lambda: fn(state), quantiles=[0.5, 0.2, 0.8]
+        lambda: _sglang_topk_block_ids(state), quantiles=[0.5, 0.2, 0.8]
     )
-
-    moved = (
-        NUM_QO_HEADS
-        * TOPK_SWEEP_BATCH
-        * (TOPK_SWEEP_NUM_BLOCKS * SCORE_BYTES + topk * IDX_BYTES)
-    )
-    all_results.append(
-        {
-            "kernel": "minimax_decode_topk (topk sweep)",
-            "provider": provider,
-            "case": _regime(TOPK_SWEEP_NUM_BLOCKS, topk),
-            "num_blocks": TOPK_SWEEP_NUM_BLOCKS,
-            "batch": TOPK_SWEEP_BATCH,
-            "num_heads": NUM_QO_HEADS,
-            "topk": topk,
-            "time_us": 1000 * ms,
-            "GB_s": moved / (ms * 1e-3) / 1e9 if ms > 0 else float("nan"),
-        }
+    _record(
+        "minimax_decode_topk (topk sweep)",
+        TOPK_SWEEP_NUM_BLOCKS,
+        TOPK_SWEEP_BATCH,
+        NUM_QO_HEADS,
+        topk,
+        ms,
+        _bytes_block_id(TOPK_SWEEP_NUM_BLOCKS, TOPK_SWEEP_BATCH, NUM_QO_HEADS, topk),
     )
     _release(state)
     return 1000 * ms, 1000 * min_ms, 1000 * max_ms
 
 
-def _report_speedup(df, index_cols, case_label, title):
-    """Print the torch-vs-sglang speedup summary for one kernel."""
-    pivot = df.pivot_table(index=index_cols, columns="provider", values="time_us")
-    if "torch" not in pivot.columns or "sglang" not in pivot.columns:
+def _report_bandwidth(df, case_label, title):
+    """Print achieved bandwidth against device peak for one kernel."""
+    if df.empty:
         return
-    pivot = pivot.dropna(subset=["torch", "sglang"])
-    if pivot.empty:
-        return
-
-    pivot["speedup"] = pivot["torch"] / pivot["sglang"]
+    peak = _peak_bw_gb_s()
     print("\n" + "=" * 80)
-    print(f"Speedup Analysis (torch vs sglang) — {title}")
+    print(f"Achieved Bandwidth — {title}")
     print("=" * 80)
-    print(f"\nOverall average speedup: {pivot['speedup'].mean():.2f}x")
-    print(f"Overall max speedup:     {pivot['speedup'].max():.2f}x")
-    print(f"Overall min speedup:     {pivot['speedup'].min():.2f}x")
+    if peak:
+        print(f"\nDevice peak: {peak:.0f} GB/s")
+        print(
+            f"Best:    {df['GB_s'].max():.2f} GB/s ({df['pct_peak'].max():.1f}% peak)"
+        )
+        print(
+            f"Median:  {df['GB_s'].median():.2f} GB/s "
+            f"({df['pct_peak'].median():.1f}% peak)"
+        )
+    else:
+        print("\nDevice peak unknown; set SGL_PEAK_BW_GB_S to report % of peak.")
+        print(f"Best:    {df['GB_s'].max():.2f} GB/s")
+        print(f"Median:  {df['GB_s'].median():.2f} GB/s")
 
-    print(f"\nSpeedup by {case_label}:")
-    levels = pivot.index.get_level_values(case_label)
-    for value in dict.fromkeys(levels):
-        sp = pivot.loc[levels == value, "speedup"]
-        if not sp.empty:
-            print(
-                f"  {str(value):>14s}: avg={sp.mean():.2f}x  "
-                f"max={sp.max():.2f}x  min={sp.min():.2f}x"
-            )
+    print(f"\nBy {case_label}:")
+    for value in dict.fromkeys(df[case_label]):
+        rows = df[df[case_label] == value]
+        line = f"  {str(value):>14s}: {rows['GB_s'].median():8.2f} GB/s"
+        if peak:
+            line += f"  ({rows['pct_peak'].median():5.1f}% peak)"
+        print(line)
 
 
 if __name__ == "__main__":
@@ -367,8 +331,11 @@ if __name__ == "__main__":
         print("ERROR: no XPU device available.")
         raise SystemExit(1)
 
-    print("MiniMax decode block-top-k kernels (SYCL) vs torch eager")
+    peak = _peak_bw_gb_s()
+    print("MiniMax decode block-top-k kernels (SYCL)")
     print("Kernels are AOT-built into sgl_kernel; no compile step.")
+    print(f"device={torch.xpu.get_device_properties(0).name}")
+    print(f"peak bandwidth={f'{peak:.0f} GB/s' if peak else 'unknown'}")
     print(
         f"block_size={BLOCK_SIZE} page_size={PAGE_SIZE} topk={TOPK} "
         f"qo_heads={NUM_QO_HEADS} kv_heads={NUM_KV_HEADS}"
@@ -394,27 +361,25 @@ if __name__ == "__main__":
     df = pd.DataFrame(all_results)
     df["time_us"] = df["time_us"].round(2)
     df["GB_s"] = df["GB_s"].round(2)
+    df["pct_peak"] = df["pct_peak"].round(1)
 
     print("\n" + "=" * 80)
     print("Raw Results")
     print("=" * 80)
     print(df.to_markdown(index=False))
 
-    _report_speedup(
+    _report_bandwidth(
         df[df["kernel"] == "minimax_decode_topk"],
-        ["num_blocks", "batch", "case"],
         "case",
         "minimax_decode_topk",
     )
-    _report_speedup(
+    _report_bandwidth(
         df[df["kernel"] == "minimax_decode_topk_page_table"],
-        ["num_blocks", "batch", "case"],
         "case",
         "minimax_decode_topk_page_table",
     )
-    _report_speedup(
+    _report_bandwidth(
         df[df["kernel"] == "minimax_decode_topk (topk sweep)"],
-        ["topk", "case"],
         "topk",
         "minimax_decode_topk (topk sweep)",
     )

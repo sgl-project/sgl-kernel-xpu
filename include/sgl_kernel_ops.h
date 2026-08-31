@@ -1304,4 +1304,19 @@ void load_cache_to_device_buffer_mla(
     int64_t block_size,
     bool is_dsv4_layout);
 
+/*
+ * MiniMax decode block top-k (MiniMax M3 sparse decode indexer)
+ */
+void minimax_decode_topk(
+    const at::Tensor& score, const at::Tensor& seq_lens, const at::Tensor& out, int64_t block_size, int64_t topk);
+
+std::tuple<at::Tensor, at::Tensor> minimax_decode_topk_page_table(
+    const at::Tensor& score,
+    const at::Tensor& seq_lens,
+    const at::Tensor& req_to_token,
+    const at::Tensor& slot_ids,
+    int64_t block_size,
+    int64_t topk,
+    int64_t page_size);
+
 #pragma GCC visibility pop

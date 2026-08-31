@@ -1,73 +1,16 @@
-"""Benchmark the XPU/SYCL MiniMax decode block-top-k kernels vs torch eager.
-
-Covers the two JIT entry points added alongside
-``tests/test_minimax_decode_topk.py``:
-
-- ``minimax_decode_topk``            — block-id output ``[num_heads, batch, topk]``
-- ``minimax_decode_topk_page_table`` — fused top-k + paged page-table emission
-
-Each is compared against a pure-PyTorch (``torch`` provider) implementation of
-the same operation, so the reported speedup is kernel vs eager on the same
-device and the same inputs. The eager versions are written the way a user
-naturally would -- one masked ``torch.topk`` over the whole ``[H, B, S]`` score
-tensor, then vectorized gathers -- not as the per-``(batch, head)`` Python loop
-used as the accuracy oracle in ``tests/``. A loop reference would report a
-meaningless speedup.
-
-``block_size`` / ``topk`` / ``page_size`` are all *runtime* arguments rather
-than template parameters: one ``.so`` covers every shape, so the sweep is free
-to vary them without paying an ``icpx`` compile per point. Expect a single
-one-off compile pause on the first run; later runs hit the
-``~/.cache/sgl_kernel/jit_sycl`` ``.so`` cache.
-
-``num_blocks`` is the interesting axis, because the shared ``topk_forward``
-dispatcher picks one of four code paths from it (see the header's
-``kSmallThreshold`` / ``kCTASize`` / ``kMaxNumBlocks``):
-
-    num_blocks <= topk   trivial     identity block ids, no selection
-    num_blocks <= 128    small       O(n^2) rank-by-compare, no radix
-    num_blocks <= 512    register-1  4-pass 8-bit radix, 1 element/thread
-    num_blocks <= 4096   register-M  4-pass 8-bit radix, 8 elements/thread
-
-The sweep therefore places one config squarely inside each regime, and
-``seq_lens`` is kept uniform across the batch so a single row of the report
-measures a single regime rather than a blend of two.
-
-Usage (with oneAPI on PATH so JIT compilation can find ``icpx``)::
-
-    source /opt/intel/oneapi/2026.1/oneapi-vars.sh --force
-    ZE_AFFINITY_MASK=0 python benchmark/bench_minimax_decode_topk.py
-
-Pin the run to a *single* device. These kernels are per-rank, and exposing
-several devices to one process depresses the achieved bandwidth on the device
-actually used -- a runtime/driver effect rather than a property of these
-kernels, but it makes multi-device numbers understate them.
-"""
-
 import itertools
 
 import pandas as pd
 import torch
 import triton
-
-try:
-    from sgl_kernel.jit.minimax import (
-        minimax_decode_topk,
-        minimax_decode_topk_page_table,
-    )
-
-    HAS_SGL_JIT = True
-except ImportError:
-    HAS_SGL_JIT = False
-    print("Warning: sgl_kernel JIT MiniMax decode top-k not available")
+from sgl_kernel import minimax_decode_topk, minimax_decode_topk_page_table
 
 DEVICE = "xpu"
 
-# Regime boundaries from minimax_decode_topk.hpp. Mirrored here only to label
-# the report; the kernel dispatches on its own constants.
+
 SMALL_THRESHOLD = 128  # kSmallThreshold = 8 * kNumWarps
-CTA_SIZE = 512  # kCTASize
-MAX_NUM_BLOCKS = 4096  # kMaxNumBlocks
+CTA_SIZE = 512
+MAX_NUM_BLOCKS = 4096
 
 # MiniMax lightning-attention decode shape defaults.
 BLOCK_SIZE = 64
@@ -76,20 +19,13 @@ TOPK = 16
 NUM_QO_HEADS = 32  # block-id kernel is per query head
 NUM_KV_HEADS = 8  # page-table kernel is per kv head
 
-SCORE_BYTES = 4  # fp32
-IDX_BYTES = 4  # int32
+SCORE_BYTES = 4
+IDX_BYTES = 4
 
 all_results = []
 
 
 def _release(*objs):
-    """Drop device buffers and return the memory to the driver.
-
-    The largest page-table config allocates a ``req_to_token`` pool of
-    ``batch x num_blocks x block_size`` int32 (~67 MB at 64 x 4096 x 64), and
-    holding several configs' worth live at once pushes the card into allocator
-    thrash, which depresses the measured time. Free each state once timed.
-    """
     for o in objs:
         if isinstance(o, dict):
             o.clear()
@@ -98,7 +34,7 @@ def _release(*objs):
 
 
 def _regime(num_blocks, topk):
-    """Label the code path ``topk_forward`` will take for this shape."""
+    """Label the code path topk_forward will take for this shape."""
     if num_blocks <= topk:
         return "trivial"
     if num_blocks <= SMALL_THRESHOLD:
@@ -109,27 +45,15 @@ def _regime(num_blocks, topk):
 
 
 def _num_blocks_from(seq_lens, block_size, max_seqblock):
-    """Per-batch block count, exactly as the kernel derives it."""
     return ((seq_lens.to(torch.int64) + block_size - 1) // block_size).clamp(
         max=max_seqblock
     )
 
 
-# ---------------------------------------------------------------------------
-# block-id kernel: state + eager reference
-# ---------------------------------------------------------------------------
-
-
 def _make_topk_state(num_blocks, batch, num_heads, topk, block_size, seed=0):
-    """Build inputs for one block-id configuration.
-
-    ``max_seqblock`` is ``max(num_blocks, topk)`` rather than ``num_blocks``:
-    the trivial regime needs ``num_blocks < topk``, but ``torch.topk`` in the
-    eager reference requires ``k <= S``, so the score tensor is widened and
-    ``seq_lens`` alone selects the regime. The kernel reads only the first
-    ``num_blocks`` entries of each row either way.
-    """
     torch.manual_seed(seed)
+    # Widened past num_blocks so the trivial regime still works: torch.topk in
+    # the eager reference needs k <= S, and seq_lens alone selects the regime.
     max_seqblock = max(num_blocks, topk)
     score = torch.randn(
         (num_heads, batch, max_seqblock), dtype=torch.float32, device=DEVICE
@@ -150,28 +74,18 @@ def _make_topk_state(num_blocks, batch, num_heads, topk, block_size, seed=0):
 
 
 def _torch_topk_block_ids(state):
-    """Pure-PyTorch equivalent of ``minimax_decode_topk``.
-
-    Mask blocks past each request's ``num_blocks`` to ``-inf``, take one fused
-    ``topk`` over the whole score tensor, then ``-1``-pad the tail beyond
-    ``k_eff = min(topk, num_blocks)``.
-
-    This is a *timing* reference. It breaks ties by whatever order ``topk``
-    returns, which need not match the kernel's radix regimes (whose write
-    positions come from an atomic counter); accuracy is covered by tests/.
-    """
     score = state["score"]
     topk = state["topk"]
     num_heads, batch, max_seqblock = score.shape
 
     num_blocks = _num_blocks_from(state["seq_lens"], state["block_size"], max_seqblock)
     block_ids = torch.arange(max_seqblock, device=score.device)
-    valid = block_ids[None, :] < num_blocks[:, None]  # [B, S]
+    valid = block_ids[None, :] < num_blocks[:, None]
 
     masked = score.masked_fill(~valid[None], float("-inf"))
-    idx = masked.topk(topk, dim=-1).indices.to(torch.int32)  # [H, B, topk]
+    idx = masked.topk(topk, dim=-1).indices.to(torch.int32)
 
-    k_eff = num_blocks.clamp(max=topk)  # [B]
+    k_eff = num_blocks.clamp(max=topk)
     keep = torch.arange(topk, device=score.device)[None, :] < k_eff[:, None]
     state["out"].copy_(torch.where(keep[None], idx, torch.full_like(idx, -1)))
     return state["out"]
@@ -187,11 +101,6 @@ def _sglang_topk_block_ids(state):
     )
 
 
-# ---------------------------------------------------------------------------
-# page-table kernel: state + eager reference
-# ---------------------------------------------------------------------------
-
-
 def _make_page_table_state(
     num_blocks, batch, num_heads, topk, block_size, page_size, seed=0
 ):
@@ -203,8 +112,6 @@ def _make_page_table_state(
     seq_lens = torch.full(
         (batch,), num_blocks * block_size, dtype=torch.int32, device=DEVICE
     )
-    # Pool must cover the widened score tensor: the eager path can address up to
-    # max_seqblock * block_size before clamping.
     max_kv_len = max_seqblock * block_size
     req_to_token = (
         torch.arange(batch * max_kv_len, dtype=torch.int32, device=DEVICE)
@@ -227,17 +134,6 @@ def _make_page_table_state(
 
 
 def _torch_page_table(state):
-    """Pure-PyTorch equivalent of ``minimax_decode_topk_page_table``.
-
-    Same observable effect as the kernel: select the top-k blocks per
-    ``(batch, kv_head)``, sort them ascending, expand each to
-    ``ppb = block_size / page_size`` pages through ``req_to_token``, head-encode
-    the page indices for DP attention, and report the effective KV length.
-
-    Padding differs by contract, not by bug: both the kernel and this reference
-    leave ``page_table[row, k_eff * ppb:]`` undefined, so only the defined
-    prefix is comparable.
-    """
     score = state["score"]
     req_to_token = state["req_to_token"]
     topk, block_size, page_size = (
@@ -255,25 +151,23 @@ def _torch_page_table(state):
     valid = block_ids[None, :] < num_blocks[:, None]
 
     masked = score.masked_fill(~valid[None], float("-inf"))
-    idx = masked.topk(topk, dim=-1).indices  # [H, B, topk]
+    idx = masked.topk(topk, dim=-1).indices
 
-    k_eff = num_blocks.clamp(max=topk)  # [B]
+    k_eff = num_blocks.clamp(max=topk)
     keep = torch.arange(topk, device=score.device)[None, :] < k_eff[:, None]
-    # Sentinel max_seqblock sorts the invalid slots to the tail, so the first
-    # k_eff entries of each sorted row are the ascending selected block ids.
+    # Fill invalid slots with an out-of-range id on purpose, so the sort below
+    # pushes them to the tail and the first k_eff entries come out ascending.
     sel = torch.where(keep[None], idx, torch.full_like(idx, max_seqblock))
-    sel, _ = sel.sort(dim=-1)  # [H, B, topk]
+    sel, _ = sel.sort(dim=-1)
 
-    # Effective KV length: only the final selected block can be partial. The
-    # trivial regime falls out of the same sum (it covers every block).
     bid = sel.clamp(max=max_seqblock - 1)
     rem = (seq_lens[None, :, None] - bid * block_size).clamp(min=0, max=block_size)
-    real_seq_lens = (rem * keep[None]).sum(dim=-1).to(torch.int32)  # [H, B]
+    real_seq_lens = (rem * keep[None]).sum(dim=-1).to(torch.int32)
 
     offsets = torch.arange(ppb, device=score.device) * page_size
     tok = (bid[..., None] * block_size + offsets).clamp(max=max_kv_len - 1)
 
-    rows = req_to_token[state["slot_ids"] % max_reqs]  # [B, max_kv_len]
+    rows = req_to_token[state["slot_ids"] % max_reqs]
     pages = torch.gather(
         rows[None].expand(num_heads, -1, -1), 2, tok.reshape(num_heads, batch, -1)
     )
@@ -301,12 +195,6 @@ def _sglang_page_table(state):
     )
 
 
-# ---------------------------------------------------------------------------
-# sweeps
-# ---------------------------------------------------------------------------
-
-# One config per regime: 8 -> trivial (topk=16), 128 -> small,
-# 512 -> register-1, 4096 -> register-M.
 NUM_BLOCKS = [8, SMALL_THRESHOLD, CTA_SIZE, MAX_NUM_BLOCKS]
 BATCH_SIZES = [1, 16, 64]
 
@@ -320,7 +208,7 @@ PROVIDERS = ["sglang", "torch"]
         x_vals=blockid_configs,
         line_arg="provider",
         line_vals=PROVIDERS,
-        line_names=["sglang (SYCL JIT)", "torch eager"],
+        line_names=["sglang (SYCL)", "torch eager"],
         styles=[("blue", "-"), ("orange", "--")],
         ylabel="us",
         plot_name="minimax-decode-topk-block-id-performance",
@@ -334,7 +222,6 @@ def benchmark_block_id(num_blocks, batch, provider):
         lambda: fn(state), quantiles=[0.5, 0.2, 0.8]
     )
 
-    # The kernel reads only the live prefix of each score row and writes topk ids.
     moved = NUM_QO_HEADS * batch * (num_blocks * SCORE_BYTES + TOPK * IDX_BYTES)
     all_results.append(
         {
@@ -359,7 +246,7 @@ def benchmark_block_id(num_blocks, batch, provider):
         x_vals=blockid_configs,
         line_arg="provider",
         line_vals=PROVIDERS,
-        line_names=["sglang (SYCL JIT)", "torch eager"],
+        line_names=["sglang (SYCL)", "torch eager"],
         styles=[("green", "-"), ("orange", "--")],
         ylabel="us",
         plot_name="minimax-decode-topk-page-table-performance",
@@ -376,7 +263,6 @@ def benchmark_page_table(num_blocks, batch, provider):
     )
 
     ppb = BLOCK_SIZE // PAGE_SIZE
-    # score prefix + req_to_token gather + page table and seq-len writes.
     moved = (
         NUM_KV_HEADS
         * batch
@@ -399,8 +285,6 @@ def benchmark_page_table(num_blocks, batch, provider):
     return 1000 * ms, 1000 * min_ms, 1000 * max_ms
 
 
-# topk is a runtime argument, so this sweep costs no extra compiles. Held at
-# num_blocks = 1024 (register-M) where the radix passes dominate.
 TOPK_SWEEP_NUM_BLOCKS = 1024
 TOPK_SWEEP_BATCH = 16
 TOPK_VALUES = [1, 4, 16, 32]  # 32 == kMaxTopK
@@ -412,7 +296,7 @@ TOPK_VALUES = [1, 4, 16, 32]  # 32 == kMaxTopK
         x_vals=TOPK_VALUES,
         line_arg="provider",
         line_vals=PROVIDERS,
-        line_names=["sglang (SYCL JIT)", "torch eager"],
+        line_names=["sglang (SYCL)", "torch eager"],
         styles=[("blue", "-"), ("orange", "--")],
         ylabel="us",
         plot_name="minimax-decode-topk-vs-topk-performance",
@@ -450,11 +334,6 @@ def benchmark_topk_sweep(topk, provider):
     return 1000 * ms, 1000 * min_ms, 1000 * max_ms
 
 
-# ---------------------------------------------------------------------------
-# speedup analysis
-# ---------------------------------------------------------------------------
-
-
 def _report_speedup(df, index_cols, case_label, title):
     """Print the torch-vs-sglang speedup summary for one kernel."""
     pivot = df.pivot_table(index=index_cols, columns="provider", values="time_us")
@@ -484,15 +363,12 @@ def _report_speedup(df, index_cols, case_label, title):
 
 
 if __name__ == "__main__":
-    if not HAS_SGL_JIT:
-        print("ERROR: sgl_kernel JIT MiniMax decode top-k kernels unavailable.")
-        raise SystemExit(1)
     if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
         print("ERROR: no XPU device available.")
         raise SystemExit(1)
 
-    print("MiniMax decode block-top-k kernels (JIT SYCL) vs torch eager")
-    print("First run compiles the shared module with icpx; be patient.")
+    print("MiniMax decode block-top-k kernels (SYCL) vs torch eager")
+    print("Kernels are AOT-built into sgl_kernel; no compile step.")
     print(
         f"block_size={BLOCK_SIZE} page_size={PAGE_SIZE} topk={TOPK} "
         f"qo_heads={NUM_QO_HEADS} kv_heads={NUM_KV_HEADS}"

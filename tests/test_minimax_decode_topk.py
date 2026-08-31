@@ -9,18 +9,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from sgl_kernel import minimax_decode_topk, minimax_decode_topk_page_table
 
-HAS_XPU = hasattr(torch, "xpu") and torch.xpu.is_available()
-
-try:
-    from sgl_kernel.jit.minimax import (
-        minimax_decode_topk,
-        minimax_decode_topk_page_table,
-    )
-
-    HAS_SGL_JIT = True
-except ImportError:
-    HAS_SGL_JIT = False
+HAS_XPU = torch.xpu.is_available()
 
 DEVICE = "xpu"
 
@@ -31,9 +22,9 @@ def _ref_topk_block_ids(
     block_size: int,
     topk: int,
 ) -> torch.Tensor:
-    """Reference block-id output: front-packed, ``-1`` padded. Breaks ties by
-    lower block id winning; the kernel only matches that in the small regime,
-    so callers compare selections as sets (see ``_assert_topk_matches``)."""
+    """Reference block-id output: front-packed, -1 padded. Breaks ties by lower
+    block id winning; the kernel only matches that in the small regime, so callers
+    compare selections as sets (see _assert_topk_matches)."""
     num_heads, batch, max_seqblock = score.shape
     out = torch.full(
         (num_heads, batch, topk),
@@ -50,8 +41,7 @@ def _ref_topk_block_ids(
         for h in range(num_heads):
             row = score[h, b, :num_blocks]
             k = min(topk, num_blocks)
-            # Stable sort by -score preserves ascending block-id order among
-            # ties -> lower id wins, matching the CUDA is_greater comparator.
+            # Stable sort keeps ascending block-id order among ties, so lower id wins.
             order = torch.argsort(-row, stable=True)
             out[h, b, :k] = order[:k].to(torch.int32)
     return out
@@ -144,9 +134,9 @@ def _assert_topk_matches(
     topk: int,
     max_seqblock: int,
 ) -> None:
-    """Block-id top-k is compared as SETS per (head, batch) because the CUDA
-    tie-break vs the reference tie-break may differ under identical scores.
-    The invalid-position padding (``-1``) is checked element-wise."""
+    """Block-id top-k is compared as SETS per (head, batch) because the kernel and
+    reference tie-breaks may differ under identical scores. The invalid-position
+    padding (-1) is checked element-wise."""
     num_heads, batch, _ = kernel_out.shape
     seq_lens_l = seq_lens.to(torch.int64).tolist()
     for b in range(batch):
@@ -168,7 +158,6 @@ def _assert_topk_matches(
 
 
 @pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
-@pytest.mark.skipif(not HAS_SGL_JIT, reason="Requires sgl_kernel.jit.minimax")
 class TestMinimaxDecodeTopKBlockId:
     """Block-id output kernel across all three size regimes + edge cases."""
 
@@ -230,7 +219,7 @@ class TestMinimaxDecodeTopKBlockId:
         )
 
     def test_seqlens_i64(self) -> None:
-        """int64 seq_lens dispatches to the ``_i64`` exported symbol."""
+        """int64 seq_lens dispatches to the _i64 exported symbol."""
         num_heads, batch, max_seqblock = 2, 2, 256
         block_size, topk = 64, 16
         seq_lens_list = [64 * 200, 64 * 240]
@@ -263,7 +252,7 @@ class TestMinimaxDecodeTopKBlockId:
         )
 
     def test_out_param(self) -> None:
-        """Caller-supplied ``out`` tensor is written in-place and returned."""
+        """Caller-supplied out tensor is written in-place and returned."""
         num_heads, batch, max_seqblock = 2, 2, 256
         block_size, topk = 64, 16
         seq_lens_list = [64 * 200, 64 * 240]
@@ -315,7 +304,6 @@ def _build_page_table_inputs(
 
 
 @pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
-@pytest.mark.skipif(not HAS_SGL_JIT, reason="Requires sgl_kernel.jit.minimax")
 class TestMinimaxDecodeTopKPageTable:
     """Page-table output kernel: trivial + non-trivial + DP-attention cases."""
 
@@ -353,7 +341,7 @@ class TestMinimaxDecodeTopKPageTable:
             f"real_seq_lens mismatch: kernel={sl_kernel.tolist()} "
             f"ref={sl_ref.tolist()}"
         )
-        # Only the first ``num_blocks * ppb`` entries per row are written by
+        # Only the first num_blocks * ppb entries per row are written by
         # the kernel; compare only those.
         seq_lens_l = seq_lens.to(torch.int64).tolist()
         for b in range(batch):
@@ -502,7 +490,7 @@ class TestMinimaxDecodeTopKPageTable:
         assert torch.equal(pt_kernel, pt_ref)
 
     def test_seqlens_i64(self) -> None:
-        """int64 seq_lens dispatches to the ``_i64`` page-table symbol."""
+        """int64 seq_lens dispatches to the _i64 page-table symbol."""
         num_heads, batch = 2, 2
         block_size, topk, page_size = 64, 16, 1
         max_seqblock = 256

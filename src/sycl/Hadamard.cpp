@@ -2,6 +2,7 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <sycl/sycl.hpp>
 
@@ -12,6 +13,8 @@
 namespace at::native::xpu {
 
 namespace {
+
+constexpr int kMinLogN = 3;
 
 constexpr int hadamard_ceil_log2(int val) {
   int log = 0;
@@ -133,6 +136,17 @@ inline void hadamard_launch(
   });
 }
 
+#define _LAUNCH(LOGN) \
+  hadamard_launch<T, LOGN, hadamard_nthreads<T, LOGN>()>(q, x, out, batch, x_batch_stride, out_batch_stride, scale)
+
+// Threads per workgroup: enough to cover kN elements at kNElts per thread, capped at 256.
+template <typename T, int kLogN>
+constexpr int hadamard_nthreads() {
+  constexpr int kNElts = (sizeof(T) == 4) ? 4 : 8;
+  constexpr int kNThreads = (1 << kLogN) / kNElts;
+  return kNThreads < 256 ? kNThreads : 256;
+}
+
 template <typename T>
 inline void hadamard_dispatch(
     ::sycl::queue& q,
@@ -143,81 +157,45 @@ inline void hadamard_dispatch(
     int64_t out_batch_stride,
     int log_N,
     float scale) {
-  constexpr bool kIsFp32 = std::is_same_v<T, float>;
-
-#define _LAUNCH(LOGN, NT) hadamard_launch<T, LOGN, NT>(q, x, out, batch, x_batch_stride, out_batch_stride, scale)
-
   switch (log_N) {
     case 3:
-      if constexpr (kIsFp32) {
-        _LAUNCH(3, 2);
-      } else {
-        _LAUNCH(3, 1);
-      }
+      _LAUNCH(3);
       break;
     case 4:
-      if constexpr (kIsFp32) {
-        _LAUNCH(4, 4);
-      } else {
-        _LAUNCH(4, 2);
-      }
+      _LAUNCH(4);
       break;
     case 5:
-      if constexpr (kIsFp32) {
-        _LAUNCH(5, 8);
-      } else {
-        _LAUNCH(5, 4);
-      }
+      _LAUNCH(5);
       break;
     case 6:
-      if constexpr (kIsFp32) {
-        _LAUNCH(6, 16);
-      } else {
-        _LAUNCH(6, 8);
-      }
+      _LAUNCH(6);
       break;
     case 7:
-      if constexpr (kIsFp32) {
-        _LAUNCH(7, 32);
-      } else {
-        _LAUNCH(7, 16);
-      }
+      _LAUNCH(7);
       break;
     case 8:
-      if constexpr (kIsFp32) {
-        _LAUNCH(8, 64);
-      } else {
-        _LAUNCH(8, 32);
-      }
+      _LAUNCH(8);
       break;
     case 9:
-      if constexpr (kIsFp32) {
-        _LAUNCH(9, 128);
-      } else {
-        _LAUNCH(9, 64);
-      }
+      _LAUNCH(9);
       break;
     case 10:
-      if constexpr (kIsFp32) {
-        _LAUNCH(10, 256);
-      } else {
-        _LAUNCH(10, 128);
-      }
+      _LAUNCH(10);
       break;
     case 11:
-      _LAUNCH(11, 256);
+      _LAUNCH(11);
       break;
     case 12:
-      _LAUNCH(12, 256);
+      _LAUNCH(12);
       break;
     case 13:
-      _LAUNCH(13, 256);
+      _LAUNCH(13);
       break;
     case 14:
-      _LAUNCH(14, 256);
+      _LAUNCH(14);
       break;
     case 15:
-      _LAUNCH(15, 256);
+      _LAUNCH(15);
       break;
     default:
       TORCH_CHECK(false, "hadamard_transform: unsupported log_N=", log_N);
@@ -227,74 +205,57 @@ inline void hadamard_dispatch(
 
 }  // anonymous namespace
 
-SGL_KERNEL_EXPORT void hadamard_transform(at::Tensor& output, const at::Tensor& input, double scale) {
-  CHECK_INPUT(output);
+SGL_KERNEL_EXPORT at::Tensor hadamard_transform(const at::Tensor& input, double scale) {
   CHECK_INPUT(input);
-  TORCH_CHECK(input.is_xpu(), "hadamard_transform: input must be an XPU tensor");
-  TORCH_CHECK(output.is_xpu(), "hadamard_transform: output must be an XPU tensor");
-  TORCH_CHECK(input.dim() == 2, "hadamard_transform: input must be 2D (batch, dim)");
-  TORCH_CHECK(output.dim() == 2, "hadamard_transform: output must be 2D (batch, dim)");
   TORCH_CHECK(
-      input.sizes() == output.sizes(),
-      "hadamard_transform: input/output shape mismatch: ",
-      input.sizes(),
-      " vs ",
-      output.sizes());
-  TORCH_CHECK(input.scalar_type() == output.scalar_type(), "hadamard_transform: input/output dtype mismatch");
-  TORCH_CHECK(input.stride(-1) == 1, "hadamard_transform: input's last dim must be contiguous");
-  TORCH_CHECK(output.stride(-1) == 1, "hadamard_transform: output's last dim must be contiguous");
+      input.scalar_type() == at::ScalarType::Float || input.scalar_type() == at::ScalarType::Half ||
+          input.scalar_type() == at::ScalarType::BFloat16,
+      "hadamard_transform: unsupported dtype ",
+      input.scalar_type());
 
-  const int64_t batch = input.size(0);
-  const int64_t dim = input.size(1);
+  const int64_t dim_og = input.size(-1);
+  TORCH_CHECK(dim_og > 0 && dim_og <= 32768, "hadamard_transform: last dim must be in [1, 32768], got ", dim_og);
 
-  TORCH_CHECK(dim >= 8, "hadamard_transform: dim must be >= 8");
-  TORCH_CHECK(dim <= 32768, "hadamard_transform: dim must be <= 32768");
-  TORCH_CHECK((dim & (dim - 1)) == 0, "hadamard_transform: dim must be a power of two");
+  const auto shapes_og = input.sizes().vec();
+  at::Tensor x_flat = input.view({-1, dim_og});
 
-  if (batch == 0) return;
+  const int log_N = std::max(kMinLogN, hadamard_ceil_log2(static_cast<int>(dim_og)));
+  const int64_t padded_dim = int64_t{1} << log_N;
+  if (padded_dim != dim_og) {
+    x_flat = at::constant_pad_nd(x_flat, {0, padded_dim - dim_og}, 0);
+  }
 
-  const int log_N = hadamard_ceil_log2(static_cast<int>(dim));
-  const int64_t x_batch_stride = input.stride(0);
-  const int64_t out_batch_stride = output.stride(0);
-  const float scale_f = static_cast<float>(scale);
+  at::Tensor out_flat = at::empty_like(x_flat);
+  const int64_t batch = x_flat.size(0);
 
-  auto& q = dpcppGetCurrentQueue();
+  if (batch > 0) {
+    const int64_t x_batch_stride = x_flat.stride(0);
+    const int64_t out_batch_stride = out_flat.stride(0);
+    const float scale_f = static_cast<float>(scale);
 
-  AT_DISPATCH_SWITCH(
-      input.scalar_type(),
-      "hadamard_transform",
-      AT_DISPATCH_CASE(at::ScalarType::Float, ([&] {
-                         hadamard_dispatch<float>(
-                             q,
-                             input.data_ptr<float>(),
-                             output.data_ptr<float>(),
-                             batch,
-                             x_batch_stride,
-                             out_batch_stride,
-                             log_N,
-                             scale_f);
-                       })) AT_DISPATCH_CASE(at::ScalarType::Half, ([&] {
-                                              hadamard_dispatch<::sycl::half>(
-                                                  q,
-                                                  reinterpret_cast<const ::sycl::half*>(input.data_ptr<at::Half>()),
-                                                  reinterpret_cast<::sycl::half*>(output.data_ptr<at::Half>()),
-                                                  batch,
-                                                  x_batch_stride,
-                                                  out_batch_stride,
-                                                  log_N,
-                                                  scale_f);
-                                            }))
-          AT_DISPATCH_CASE(at::ScalarType::BFloat16, ([&] {
-                             hadamard_dispatch<::sycl::ext::oneapi::bfloat16>(
-                                 q,
-                                 reinterpret_cast<const ::sycl::ext::oneapi::bfloat16*>(input.data_ptr<at::BFloat16>()),
-                                 reinterpret_cast<::sycl::ext::oneapi::bfloat16*>(output.data_ptr<at::BFloat16>()),
-                                 batch,
-                                 x_batch_stride,
-                                 out_batch_stride,
-                                 log_N,
-                                 scale_f);
-                           })));
+    auto& q = dpcppGetCurrentQueue();
+
+    SYCL_DISPATCH_FLOATING_TYPES_AND3(
+        at::ScalarType::Float,
+        at::ScalarType::BFloat16,
+        at::ScalarType::Half,
+        x_flat.scalar_type(),
+        "hadamard_transform",
+        [&]() {
+          hadamard_dispatch<scalar_t>(
+              q,
+              reinterpret_cast<const scalar_t*>(x_flat.data_ptr()),
+              reinterpret_cast<scalar_t*>(out_flat.data_ptr()),
+              batch,
+              x_batch_stride,
+              out_batch_stride,
+              log_N,
+              scale_f);
+        });
+  }
+
+  at::Tensor out = padded_dim != dim_og ? out_flat.slice(1, 0, dim_og) : out_flat;
+  return out.reshape(shapes_og);
 }
 
 }  // namespace at::native::xpu

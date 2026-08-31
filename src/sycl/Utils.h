@@ -326,6 +326,19 @@ inline void check_shape(const at::Tensor& a, const at::Tensor& b, const char* a_
     }                                                                                   \
   }
 
+#define SYCL_DISPATCH_FLOATING_TYPES_AND3(SCALARTYPE1, SCALARTYPE2, SCALARTYPE3, TYPE, NAME, ...) \
+  {                                                                                               \
+    const auto& the_type = TYPE;                                                                  \
+    at::ScalarType _st = ::detail::scalar_type(the_type);                                         \
+    switch (_st) {                                                                                \
+      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE1, float, __VA_ARGS__)                                 \
+      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE2, sycl::ext::oneapi::bfloat16, __VA_ARGS__)           \
+      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE3, sycl::half, __VA_ARGS__)                            \
+      default:                                                                                    \
+        AT_ERROR(#NAME, " not implemented for '", toString(TYPE), "'");                           \
+    }                                                                                             \
+  }
+
 template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
 inline T div_up(T x, T y) {
   return (x + y - 1) / y;

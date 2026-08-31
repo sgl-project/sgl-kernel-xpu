@@ -254,3 +254,114 @@ def sgemm_lora_b_fwd(
     )
 
     return output
+
+
+def qkv_lora_b_fwd(
+    input_x: torch.Tensor,
+    qkv_lora_b: torch.Tensor,
+    output_offset: torch.Tensor,
+    max_qkv_out_dim: int,
+    seg_indptr: torch.Tensor,
+    weight_indices: torch.Tensor,
+    lora_ranks: torch.Tensor,
+    scalings: torch.Tensor,
+    seg_lens: Optional[torch.Tensor] = None,
+    base_output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Fused QKV LoRA B-matrix SGEMM forward pass.
+
+    This kernel performs the LoRA ``B`` projection for the packed ``q``, ``k`` and
+    ``v`` outputs in a single fused grouped (segmented) matrix multiplication. It
+    packs three SGEMMs (q / k / v) into one kernel: for each input segment it emits
+    three groups, one per projection, accumulating each product into its column band
+    of the output. When a segment's adapter rank is 0 the group is a genuine
+    all-zero LoRA term (empty reduction), following the PyTorch convention that the
+    product of matrices of shape ``(m, 0)`` and ``(0, n)`` is the zero matrix of
+    shape ``(m, n)``.
+
+    The input ``input_x`` is the result of the LoRA ``A`` projection, shape
+    ``(s, 3 * K)`` where ``s`` is the total number of tokens and ``K`` is the
+    maximum LoRA rank. Its second dimension is partitioned into three contiguous
+    ``K``-wide bands for q, k and v. The weight tensor ``qkv_lora_b`` has shape
+    ``(num_loras, N_Q + 2 * N_KV, K)``, and ``output_offset`` gives the boundaries
+    of the q/k/v bands along the output dimension:
+    ``[0, N_Q, N_Q + N_KV, N_Q + 2 * N_KV]``.
+
+    For each segment ``s`` (adapter ``l = weight_indices[s]``) and projection
+    ``p in {q, k, v}``:
+
+    .. math::
+
+        output[i, \, band_p] = scalings[l] \; \cdot \; \left( input\_x[i, \, band_p]
+                    \; @ \; qkv\_lora\_b[l, \, band_p]^{T} \right) \; + \; base\_output[i, \, band_p]
+
+    where the ``base_output`` term is only added when it is supplied.
+
+    Parameters
+    ----------
+    input_x : torch.Tensor
+        Input activation tensor (the LoRA-A projection), shape ``(num_tokens, 3 * max_rank)``.
+        The second dimension is partitioned into three ``max_rank``-wide q/k/v bands.
+    qkv_lora_b : torch.Tensor
+        Packed LoRA B-matrix weight tensor, shape ``(num_loras, N_Q + 2 * N_KV, max_rank)``.
+    output_offset : torch.Tensor
+        Output-column boundaries of the q/k/v bands, shape ``(4,)``:
+        ``[0, N_Q, N_Q + N_KV, N_Q + 2 * N_KV]``. Must start at 0, end at
+        ``qkv_lora_b.size(1)``, and be non-decreasing.
+    max_qkv_out_dim : int
+        ``max(output_q_dim, output_kv_dim)`` implied by ``output_offset``.
+    seg_indptr : torch.Tensor
+        Segment index pointer tensor, shape ``(num_segments + 1,)``. Must start at 0,
+        end at ``num_tokens``, and be non-decreasing.
+    weight_indices : torch.Tensor
+        Per-segment adapter indices into ``qkv_lora_b``, shape ``(num_segments,)``.
+        Values must be in ``[0, num_loras)``.
+    lora_ranks : torch.Tensor
+        LoRA ranks tensor, shape ``(num_loras,)``. Values must be in ``[0, max_rank]``.
+        Range-validated only; it does not shrink the per-segment GEMM, so the caller
+        is expected to have zero-padded the rank columns beyond each adapter's
+        ``R_l`` in ``qkv_lora_b``.
+    scalings : torch.Tensor
+        Per-adapter scaling factors (e.g. ``lora_alpha / rank``), shape ``(num_loras,)``.
+    seg_lens : Optional[torch.Tensor], optional
+        Optional segment lengths tensor, shape ``(num_segments,)``. Currently unused,
+        reserved for future per-segment optimizations.
+    base_output : Optional[torch.Tensor], optional
+        Optional base-model output added as a residual, shape ``(num_tokens, N_Q + 2 * N_KV)``.
+        When provided, the kernel computes the scaled LoRA projection plus this
+        residual in a single fused pass; otherwise only the scaled LoRA projection
+        is returned.
+
+    Returns
+    -------
+    output : torch.Tensor
+        Output tensor, shape ``(num_tokens, N_Q + 2 * N_KV)``.
+
+    Notes
+    -----
+    - The output tensor is created with ``torch.empty`` and populated by the C++ kernel.
+    - ``output`` and ``input_x`` must share the same dtype as ``qkv_lora_b``.
+    - Supported weight dtypes are FP16 and BF16.
+    """
+    # Create empty output tensor
+    output = torch.empty(
+        (input_x.size(0), qkv_lora_b.size(1)),
+        dtype=qkv_lora_b.dtype,
+        device=qkv_lora_b.device,
+    )
+    # Call the kernel
+    torch.ops.sgl_kernel.qkv_lora_b_fwd(
+        output,
+        input_x,
+        qkv_lora_b,
+        output_offset,
+        max_qkv_out_dim,
+        seg_indptr,
+        weight_indices,
+        lora_ranks,
+        scalings,
+        seg_lens,
+        base_output,
+    )
+
+    return output

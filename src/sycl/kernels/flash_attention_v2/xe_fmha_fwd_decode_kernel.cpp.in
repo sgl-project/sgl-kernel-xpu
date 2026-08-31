@@ -30,7 +30,7 @@
  *
  **************************************************************************************************/
 // Auto-generated from xe_fmha_fwd_decode_kernel.cpp.in
-// Template parameters: QG_SZ=@QG_SZ@, HEAD_DIM=@HEAD_DIM@, PAGE_SIZE=@PAGE_SIZE@
+// Template parameters: QG_SZ=@QG_SZ@, HEAD_DIM=@HEAD_DIM@, PAGE_SIZE=@PAGE_SIZE@, ELEM_TAG=@ELEM_TAG@
 #define SYCL_INTEL_TARGET 20
 
 #include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
@@ -38,7 +38,7 @@
 namespace decode {
 
 template <>
-__attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Arguments& params) const {
+__attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@, @ELEM_TYPE@>::operator()(const Arguments& params) const {
   using TileShapeQK = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@PAGE_SIZE@>, cute::_64>;
   using TileShapePV = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@PAGE_SIZE@>>;
   // Round the head-dim of the output tile up to a multiple of get<1>(TileShapePV) (32) so that
@@ -46,16 +46,51 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
   // HEAD_DIM is not a multiple of 32 (e.g. HEAD_DIM=72 -> 96, VTiles=3). The actual O surface is
   // bounded by head_size_vo, so HW clips the OOB tail writes in the epilogue.
   using TileShapeOutput = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;
-  using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<@PAGE_SIZE@ / 16>, cute::_1>>;
+  // Split the KV (page) tile across as many subgroups as fit the epilogue reduction
+  // SLM budget. For large head dims / GQA groups / page sizes the full split
+  // (PAGE_SIZE / 16) overflows shared local memory and hangs the device, so cap it.
+  static constexpr int kKvSubgroups = kv_subgroups_for_slm(
+      @PAGE_SIZE@ / 16, @QG_SZ@, ((@HEAD_DIM@ + 31) / 32) * 32);
+  using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<kKvSubgroups>, cute::_1>>;
+
+  // softmax_lse output is only threaded as a template constexpr for the base
+  // (non-local / non-sink) configuration, matching the paged cascade-attention
+  // decode use case. All other mask combinations keep the always-off LSE path
+  // (LSE is not written).
+  if (params.return_softmax_lse) {
+    TORCH_CHECK(
+        !params.is_local && !params.use_sink,
+        "return_softmax_lse is only supported without local/sink masking");
+    using Element = @ELEM_TYPE@;
+    DecodeConfig<
+        false,
+        false,
+        false,
+        /*LSE=*/true,
+        TileShapeQK,
+        TileShapePV,
+        TileShapeOutput,
+        SubgroupLayoutQK,
+        void,
+        1,
+        false,
+        Element,
+        Element,
+        Element,
+        Element,
+        /*PackGQAEnabled=*/false>::run_paged(params);
+    return;
+  }
 
 #if @HEAD_DIM@ == 64
     AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-          using Element = bfloat16_t;
+          using Element = @ELEM_TYPE@;
           DecodeConfig<
               false,
               LocalMask,
               Sink,
+              /*LSE=*/false,
               TileShapeQK,
               TileShapePV,
               TileShapeOutput,
@@ -74,11 +109,12 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
         !params.use_sink,
         "sink is only supported for head_size == 64, got @HEAD_DIM@");
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-        using Element = bfloat16_t;
+        using Element = @ELEM_TYPE@;
         DecodeConfig<
             false,
             LocalMask,
             false,
+            /*LSE=*/false,
             TileShapeQK,
             TileShapePV,
             TileShapeOutput,
@@ -94,6 +130,16 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
 #endif
 }
 
-template struct FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>;
+template struct FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@, @ELEM_TYPE@>;
 
 }  // namespace decode
+
+#ifdef SGL_FMHA_JIT_ENTRY
+// Stable C ABI entry for the runtime-JIT path. Only emitted when this TU is
+// compiled as a standalone JIT module (one config per .so), so the fixed symbol
+// name never collides across the many AOT translation units.
+extern "C" __attribute__((visibility("default"))) void sgl_fmha_entry(const void* params) {
+  decode::FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@, @ELEM_TYPE@>{}(
+      *static_cast<const decode::Arguments*>(params));
+}
+#endif

@@ -11,7 +11,9 @@
 #include "sgl_kernel_export.h"
 
 namespace {
-constexpr int kTopK = 2048;
+// Runtime topk values must be in (0, kMaxTopK]. Shared-memory staging buffers
+// are sized against kMaxTopK, so every supported runtime value is safe.
+constexpr int kMaxTopK = 2048;
 constexpr int kThreadsPerBlock = 1024;
 constexpr int kRadix = 256;
 constexpr int kHistPad = 128;  // padding so suffix-sum can read [tx + j] safely
@@ -82,7 +84,8 @@ inline void run_cumsum(sycl::nd_item<1>& item, int32_t* s_histogram_buf /* [2][k
   }
 }
 
-inline void fast_topk_radix(sycl::nd_item<1>& item, const float* input, int32_t* index, int row_start, int length) {
+inline void
+radix_topk(sycl::nd_item<1>& item, const float* input, int32_t* index, int row_start, int length, int topk = kMaxTopK) {
   auto g = item.get_group();
 
   int32_t* s_histogram_buf = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[2 * kHistStride]>(g);
@@ -100,7 +103,7 @@ inline void fast_topk_radix(sycl::nd_item<1>& item, const float* input, int32_t*
     s_histogram_buf[kHistStride + tx] = 0;
   }
   if (tx == 0) {
-    s_topk = kTopK;
+    s_topk = topk;
   }
   item.barrier(sycl::access::fence_space::local_space);
 
@@ -251,7 +254,7 @@ inline void fast_topk_radix(sycl::nd_item<1>& item, const float* input, int32_t*
         const int want_last = (valid && bin == threshold_bin) ? 1 : 0;
         const int last_pos = wg_reserve_dec(item, s_last_remain, want_last);
         if (want_last && last_pos > 0) {
-          index[kTopK - last_pos] = idx;
+          index[topk - last_pos] = idx;
         }
       } else {
         const int want_stash = (valid && bin == threshold_bin) ? 1 : 0;
@@ -268,26 +271,48 @@ inline void fast_topk_radix(sycl::nd_item<1>& item, const float* input, int32_t*
   }
 }
 
-inline void naive_topk(sycl::nd_item<1>& item, int32_t* indices, int length) {
+inline void trivial_topk(sycl::nd_item<1>& item, int32_t* indices, int length, int topk = kMaxTopK) {
   const int tx = static_cast<int>(item.get_local_id(0));
-  for (int i = tx; i < kTopK; i += kThreadsPerBlock) {
+  for (int i = tx; i < topk; i += kThreadsPerBlock) {
     indices[i] = (i < length) ? i : -1;
   }
 }
 
-inline void
-naive_topk_transform(sycl::nd_item<1>& item, int length, int32_t* dst_page_entry, const int32_t* src_page_entry) {
+inline void trivial_topk_transform(
+    sycl::nd_item<1>& item, int length, int32_t* dst_page_entry, const int32_t* src_page_entry, int topk = kMaxTopK) {
   const int tx = static_cast<int>(item.get_local_id(0));
-  for (int i = tx; i < kTopK; i += kThreadsPerBlock) {
+  for (int i = tx; i < topk; i += kThreadsPerBlock) {
     dst_page_entry[i] = (i < length) ? src_page_entry[i] : -1;
   }
 }
 
-inline void
-naive_topk_transform_ragged(sycl::nd_item<1>& item, int length, int32_t* dst_indices_entry, int32_t offset) {
+inline void trivial_topk_transform_ragged(
+    sycl::nd_item<1>& item, int length, int32_t* dst_indices_entry, int32_t offset, int topk = kMaxTopK) {
   const int tx = static_cast<int>(item.get_local_id(0));
-  for (int i = tx; i < kTopK; i += kThreadsPerBlock) {
+  for (int i = tx; i < topk; i += kThreadsPerBlock) {
     dst_indices_entry[i] = (i < length) ? (i + offset) : -1;
+  }
+}
+
+inline void trivial_topk_transform_paged(
+    sycl::nd_item<1>& item,
+    int length,
+    int topk,
+    int32_t* dst_page_entry,
+    const int32_t* src_page_entry,
+    int32_t* dst_raw_entry,
+    int page_bits) {
+  const int32_t page_mask = (1 << page_bits) - 1;
+  const int tx = static_cast<int>(item.get_local_id(0));
+  for (int i = tx; i < topk; i += kThreadsPerBlock) {
+    if (i < length) {
+      const int32_t page_id = src_page_entry[i >> page_bits];
+      dst_page_entry[i] = (page_id << page_bits) | (i & page_mask);
+      if (dst_raw_entry) dst_raw_entry[i] = i;
+    } else {
+      dst_page_entry[i] = -1;
+      if (dst_raw_entry) dst_raw_entry[i] = -1;
+    }
   }
 }
 
@@ -319,7 +344,8 @@ FastTopKParams get_params(
   if (indices_opt.has_value()) {
     const auto& indices = indices_opt.value();
     TORCH_CHECK(indices.dim() == 2 && indices.is_contiguous());
-    TORCH_CHECK(indices.size(0) == B && indices.size(1) == kTopK);
+    TORCH_CHECK(indices.size(0) == B, "indices.size(0) must equal score.size(0)");
+    TORCH_CHECK(indices.size(1) == kMaxTopK, "topk (indices.size(1)) must equal ", kMaxTopK);
     TORCH_CHECK(indices.scalar_type() == at::kInt, "indices must be int32");
     indices_ptr = indices.data_ptr<int32_t>();
   }
@@ -344,13 +370,13 @@ struct FastTopKKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const int64_t bid = static_cast<int64_t>(item.get_group(0));
     const int row_start = params.row_starts ? params.row_starts[bid] : 0;
     const int length = params.lengths[bid];
-    int32_t* indice = params.indices + bid * kTopK;
+    int32_t* indice = params.indices + bid * kMaxTopK;
     const float* score = params.input + bid * params.input_stride;
 
-    if (length <= kTopK) {
-      naive_topk(item, indice, length);
+    if (length <= kMaxTopK) {
+      trivial_topk(item, indice, length);
     } else {
-      fast_topk_radix(item, score, indice, row_start, length);
+      radix_topk(item, score, indice, row_start, length);
     }
   }
 };
@@ -367,7 +393,7 @@ struct FastTopKTransformFusedDecodeKernel : public __SYCL_KER_CONFIG_CONVENTION_
       : params(p), dst_page_table(dst), src_page_table(src), src_stride(stride) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
-    s_indices_ = sycl::local_accessor<int32_t, 1>(kTopK, cgh);
+    s_indices_ = sycl::local_accessor<int32_t, 1>(kMaxTopK, cgh);
   }
 
   [[sycl::reqd_sub_group_size(32)]] void operator()(sycl::nd_item<1> item) const {
@@ -375,19 +401,19 @@ struct FastTopKTransformFusedDecodeKernel : public __SYCL_KER_CONFIG_CONVENTION_
     const int tid = static_cast<int>(item.get_local_id(0));
     const int length = params.lengths[bid];
     const int32_t* src_entry = src_page_table + bid * src_stride;
-    int32_t* dst_entry = dst_page_table + bid * kTopK;
+    int32_t* dst_entry = dst_page_table + bid * kMaxTopK;
     const float* score = params.input + bid * params.input_stride;
 
-    if (length <= kTopK) {
-      naive_topk_transform(item, length, dst_entry, src_entry);
+    if (length <= kMaxTopK) {
+      trivial_topk_transform(item, length, dst_entry, src_entry);
       return;
     }
 
     int32_t* s_idx = s_indices_.get_multi_ptr<sycl::access::decorated::no>().get();
 
-    fast_topk_radix(item, score, s_idx, /*row_start=*/0, length);
+    radix_topk(item, score, s_idx, /*row_start=*/0, length);
 
-    static_assert(kTopK == 2 * kThreadsPerBlock, "kTopK must be 2 * kThreadsPerBlock");
+    static_assert(kMaxTopK == 2 * kThreadsPerBlock, "kMaxTopK must be 2 * kThreadsPerBlock");
     const int i0 = tid;
     const int i1 = tid + kThreadsPerBlock;
     const int p0 = s_idx[i0];
@@ -413,7 +439,7 @@ struct FastTopKTransformFusedPrefillKernel : public __SYCL_KER_CONFIG_CONVENTION
       : params(p), dst_page_table(dst), src_page_table(src), src_stride(stride), cu_seqlens_q(cu_q), prefill_bs(pbs) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
-    s_indices_ = sycl::local_accessor<int32_t, 1>(kTopK, cgh);
+    s_indices_ = sycl::local_accessor<int32_t, 1>(kMaxTopK, cgh);
     s_src_row_ = sycl::local_accessor<int32_t, 1>(1, cgh);
   }
 
@@ -422,7 +448,7 @@ struct FastTopKTransformFusedPrefillKernel : public __SYCL_KER_CONFIG_CONVENTION
     const int tid = static_cast<int>(item.get_local_id(0));
     const int length = params.lengths[bid];
     const int row_start = params.row_starts ? params.row_starts[bid] : 0;
-    int32_t* dst_entry = dst_page_table + bid * kTopK;
+    int32_t* dst_entry = dst_page_table + bid * kMaxTopK;
     const float* score = params.input + bid * params.input_stride;
 
     int32_t* s_src_row = s_src_row_.get_multi_ptr<sycl::access::decorated::no>().get();
@@ -449,16 +475,16 @@ struct FastTopKTransformFusedPrefillKernel : public __SYCL_KER_CONFIG_CONVENTION
 
     const int32_t* src_entry = src_page_table + s_src_row[0] * src_stride;
 
-    if (length <= kTopK) {
-      naive_topk_transform(item, length, dst_entry, src_entry);
+    if (length <= kMaxTopK) {
+      trivial_topk_transform(item, length, dst_entry, src_entry);
       return;
     }
 
     int32_t* s_idx = s_indices_.get_multi_ptr<sycl::access::decorated::no>().get();
 
-    fast_topk_radix(item, score, s_idx, row_start, length);
+    radix_topk(item, score, s_idx, row_start, length);
 
-    static_assert(kTopK == 2 * kThreadsPerBlock, "kTopK must be 2 * kThreadsPerBlock");
+    static_assert(kMaxTopK == 2 * kThreadsPerBlock, "kMaxTopK must be 2 * kThreadsPerBlock");
     const int i0 = tid;
     const int i1 = tid + kThreadsPerBlock;
     const int p0 = s_idx[i0];
@@ -479,7 +505,7 @@ struct FastTopKTransformRaggedFusedKernel : public __SYCL_KER_CONFIG_CONVENTION_
       : params(p), topk_indices_ragged(out), topk_indices_offset(off) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
-    s_indices_ = sycl::local_accessor<int32_t, 1>(kTopK, cgh);
+    s_indices_ = sycl::local_accessor<int32_t, 1>(kMaxTopK, cgh);
   }
 
   [[sycl::reqd_sub_group_size(32)]] void operator()(sycl::nd_item<1> item) const {
@@ -487,20 +513,20 @@ struct FastTopKTransformRaggedFusedKernel : public __SYCL_KER_CONFIG_CONVENTION_
     const int tid = static_cast<int>(item.get_local_id(0));
     const int row_start = params.row_starts ? params.row_starts[bid] : 0;
     const int length = params.lengths[bid];
-    int32_t* dst_entry = topk_indices_ragged + bid * kTopK;
+    int32_t* dst_entry = topk_indices_ragged + bid * kMaxTopK;
     const float* score = params.input + bid * params.input_stride;
     const int32_t offset = topk_indices_offset[bid];
 
-    if (length <= kTopK) {
-      naive_topk_transform_ragged(item, length, dst_entry, offset);
+    if (length <= kMaxTopK) {
+      trivial_topk_transform_ragged(item, length, dst_entry, offset);
       return;
     }
 
     int32_t* s_idx = s_indices_.get_multi_ptr<sycl::access::decorated::no>().get();
 
-    fast_topk_radix(item, score, s_idx, row_start, length);
+    radix_topk(item, score, s_idx, row_start, length);
 
-    static_assert(kTopK == 2 * kThreadsPerBlock, "kTopK must be 2 * kThreadsPerBlock");
+    static_assert(kMaxTopK == 2 * kThreadsPerBlock, "kMaxTopK must be 2 * kThreadsPerBlock");
     const int i0 = tid;
     const int i1 = tid + kThreadsPerBlock;
     dst_entry[i0] = s_idx[i0] + offset;
@@ -508,17 +534,146 @@ struct FastTopKTransformRaggedFusedKernel : public __SYCL_KER_CONFIG_CONVENTION_
   }
 };
 
+struct TopKTransformPagedKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
+  const float* score;
+  const int32_t* seq_lens;
+  const int32_t* page_tables;
+  int32_t* out_page_indices;
+  int32_t* out_raw_indices;
+  int64_t score_row_stride;
+  int64_t page_table_row_stride;
+  int page_bits;
+  int topk;
+
+  sycl::local_accessor<int32_t, 1> s_indices_;
+
+  TopKTransformPagedKernel(
+      const float* score,
+      const int32_t* seq_lens,
+      const int32_t* page_tables,
+      int32_t* out_page_indices,
+      int32_t* out_raw_indices,
+      int64_t score_row_stride,
+      int64_t page_table_row_stride,
+      int page_bits,
+      int topk)
+      : score(score),
+        seq_lens(seq_lens),
+        page_tables(page_tables),
+        out_page_indices(out_page_indices),
+        out_raw_indices(out_raw_indices),
+        score_row_stride(score_row_stride),
+        page_table_row_stride(page_table_row_stride),
+        page_bits(page_bits),
+        topk(topk) {}
+
+  void sycl_ker_config_convention(sycl::handler& cgh) {
+    s_indices_ = sycl::local_accessor<int32_t, 1>(kMaxTopK, cgh);
+  }
+
+  [[sycl::reqd_sub_group_size(32)]] void operator()(sycl::nd_item<1> item) const {
+    const int64_t bid = static_cast<int64_t>(item.get_group(0));
+    const int tid = static_cast<int>(item.get_local_id(0));
+    const int length = seq_lens[bid];
+    const int32_t* src_pt = page_tables ? (page_tables + bid * page_table_row_stride) : nullptr;
+    int32_t* dst_pi = out_page_indices + bid * static_cast<int64_t>(topk);
+    int32_t* dst_ri = out_raw_indices ? (out_raw_indices + bid * static_cast<int64_t>(topk)) : nullptr;
+    const float* row_score = score + bid * score_row_stride;
+
+    if (length <= topk) {
+      if (src_pt) {
+        trivial_topk_transform_paged(item, length, topk, dst_pi, src_pt, dst_ri, page_bits);
+      } else {
+        trivial_topk(item, dst_pi, length, topk);
+      }
+      return;
+    }
+
+    int32_t* s_idx = s_indices_.get_multi_ptr<sycl::access::decorated::no>().get();
+
+    radix_topk(item, row_score, s_idx, /*row_start=*/0, length, topk);
+
+    const int32_t page_mask = (1 << page_bits) - 1;
+    for (int i = tid; i < topk; i += kThreadsPerBlock) {
+      const int p = s_idx[i];
+      if (src_pt) {
+        const int32_t page_id = src_pt[p >> page_bits];
+        dst_pi[i] = (page_id << page_bits) | (p & page_mask);
+        if (dst_ri) dst_ri[i] = p;
+      } else {
+        dst_pi[i] = p;
+      }
+    }
+  }
+};
+
+struct TopKTransformRaggedKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
+  const float* score;
+  const int32_t* seq_lens;
+  const int32_t* row_starts;
+  const int32_t* out_offsets;
+  int32_t* topk_indices;
+  int64_t score_row_stride;
+  int topk;
+
+  sycl::local_accessor<int32_t, 1> s_indices_;
+
+  TopKTransformRaggedKernel(
+      const float* score,
+      const int32_t* seq_lens,
+      const int32_t* row_starts,
+      const int32_t* out_offsets,
+      int32_t* topk_indices,
+      int64_t score_row_stride,
+      int topk)
+      : score(score),
+        seq_lens(seq_lens),
+        row_starts(row_starts),
+        out_offsets(out_offsets),
+        topk_indices(topk_indices),
+        score_row_stride(score_row_stride),
+        topk(topk) {}
+
+  void sycl_ker_config_convention(sycl::handler& cgh) {
+    s_indices_ = sycl::local_accessor<int32_t, 1>(kMaxTopK, cgh);
+  }
+
+  [[sycl::reqd_sub_group_size(32)]] void operator()(sycl::nd_item<1> item) const {
+    const int64_t bid = static_cast<int64_t>(item.get_group(0));
+    const int row_start = row_starts ? row_starts[bid] : 0;
+    const int length = seq_lens[bid];
+    const int32_t offset = out_offsets[bid];
+    int32_t* dst_entry = topk_indices + bid * static_cast<int64_t>(topk);
+    const float* row_score = score + bid * score_row_stride;
+
+    if (length <= topk) {
+      trivial_topk_transform_ragged(item, length, dst_entry, offset, topk);
+      return;
+    }
+
+    int32_t* s_idx = s_indices_.get_multi_ptr<sycl::access::decorated::no>().get();
+
+    radix_topk(item, row_score, s_idx, row_start, length, topk);
+
+    const int tid = static_cast<int>(item.get_local_id(0));
+    for (int i = tid; i < topk; i += kThreadsPerBlock) {
+      dst_entry[i] = s_idx[i] + offset;
+    }
+  }
+};
+
 }  // namespace
 
-SGL_KERNEL_EXPORT void fast_topk_interface(
-    const at::Tensor& score, at::Tensor& indices, const at::Tensor& lengths, std::optional<at::Tensor> row_starts_opt) {
+SGL_KERNEL_EXPORT at::Tensor
+fast_topk(const at::Tensor& score, const at::Tensor& lengths, int64_t topk, std::optional<at::Tensor> row_starts_opt) {
   CHECK_INPUT(score);
-  CHECK_DEVICE(indices);
   CHECK_DEVICE(lengths);
   if (row_starts_opt.has_value()) {
     CHECK_DEVICE(row_starts_opt.value());
   }
+  TORCH_CHECK(topk == kMaxTopK, "fast_topk only supports topk=", kMaxTopK);
 
+  at::Tensor indices = at::empty({score.size(0), kMaxTopK}, score.options().dtype(at::kInt));
   const auto params = get_params(score, lengths, row_starts_opt, indices);
   const int64_t B = score.size(0);
 
@@ -528,39 +683,38 @@ SGL_KERNEL_EXPORT void fast_topk_interface(
   FastTopKKernel kernel(params);
   sycl_kernel_submit(
       sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock), queue, kernel);
+  return indices;
 }
 
-SGL_KERNEL_EXPORT void fast_topk_transform_interface(
+SGL_KERNEL_EXPORT at::Tensor fast_topk_transform_fused(
     const at::Tensor& score,
     const at::Tensor& lengths,
-    at::Tensor& dst_page_table,
     const at::Tensor& src_page_table,
     const at::Tensor& cu_seqlens_q,
+    int64_t topk,
     std::optional<at::Tensor> row_starts_opt) {
   CHECK_INPUT(score);
   CHECK_DEVICE(lengths);
-  CHECK_DEVICE(dst_page_table);
   CHECK_DEVICE(src_page_table);
   CHECK_DEVICE(cu_seqlens_q);
   if (row_starts_opt.has_value()) {
     CHECK_DEVICE(row_starts_opt.value());
   }
+  TORCH_CHECK(topk == kMaxTopK, "fast_topk_transform_fused only supports topk=", kMaxTopK);
 
   const auto params = get_params(score, lengths, row_starts_opt);
   const int64_t B = score.size(0);
 
-  TORCH_CHECK(dst_page_table.dim() == 2 && dst_page_table.is_contiguous());
   TORCH_CHECK(src_page_table.dim() == 2 && src_page_table.stride(1) == 1);
   TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_q.is_contiguous());
-  TORCH_CHECK(dst_page_table.scalar_type() == at::kInt);
   TORCH_CHECK(src_page_table.scalar_type() == at::kInt);
   TORCH_CHECK(cu_seqlens_q.scalar_type() == at::kInt);
 
   const int64_t prefill_bs = cu_seqlens_q.size(0) - 1;
-  TORCH_CHECK(dst_page_table.size(0) == B);
-  TORCH_CHECK(dst_page_table.size(1) == kTopK);
   TORCH_CHECK(src_page_table.size(0) == prefill_bs);
   TORCH_CHECK(prefill_bs <= B);
+
+  at::Tensor dst_page_table = at::empty({B, kMaxTopK}, score.options().dtype(at::kInt));
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto& queue = stream.queue();
@@ -583,37 +737,194 @@ SGL_KERNEL_EXPORT void fast_topk_transform_interface(
     sycl_kernel_submit(
         sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock), queue, kernel);
   }
+  return dst_page_table;
 }
 
-SGL_KERNEL_EXPORT void fast_topk_transform_ragged_interface(
+SGL_KERNEL_EXPORT at::Tensor fast_topk_transform_ragged_fused(
     const at::Tensor& score,
     const at::Tensor& lengths,
-    at::Tensor& topk_indices_ragged,
     const at::Tensor& topk_indices_offset,
+    int64_t topk,
     std::optional<at::Tensor> row_starts_opt) {
   CHECK_INPUT(score);
   CHECK_DEVICE(lengths);
-  CHECK_DEVICE(topk_indices_ragged);
   CHECK_DEVICE(topk_indices_offset);
   if (row_starts_opt.has_value()) {
     CHECK_DEVICE(row_starts_opt.value());
   }
+  TORCH_CHECK(topk == kMaxTopK, "fast_topk_transform_ragged_fused only supports topk=", kMaxTopK);
 
   const auto params = get_params(score, lengths, row_starts_opt);
   const int64_t B = score.size(0);
-  TORCH_CHECK(topk_indices_ragged.dim() == 2 && topk_indices_ragged.is_contiguous());
   TORCH_CHECK(topk_indices_offset.dim() == 1 && topk_indices_offset.is_contiguous());
-  TORCH_CHECK(topk_indices_ragged.size(0) == B);
-  TORCH_CHECK(topk_indices_ragged.size(1) == kTopK);
   TORCH_CHECK(topk_indices_offset.size(0) == B);
-  TORCH_CHECK(topk_indices_ragged.scalar_type() == at::kInt);
   TORCH_CHECK(topk_indices_offset.scalar_type() == at::kInt);
+
+  at::Tensor topk_indices_ragged = at::empty({B, kMaxTopK}, score.options().dtype(at::kInt));
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto& queue = stream.queue();
 
   FastTopKTransformRaggedFusedKernel kernel(
       params, topk_indices_ragged.data_ptr<int32_t>(), topk_indices_offset.data_ptr<int32_t>());
+  sycl_kernel_submit(
+      sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock), queue, kernel);
+  return topk_indices_ragged;
+}
+
+namespace {
+void topk_transform_paged_launch(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    std::optional<at::Tensor> page_tables_opt,
+    at::Tensor& out_page_indices,
+    int64_t page_size,
+    std::optional<at::Tensor> out_raw_indices_opt) {
+  CHECK_DEVICE(scores);
+  CHECK_DEVICE(seq_lens);
+  if (page_tables_opt.has_value()) {
+    CHECK_DEVICE(page_tables_opt.value());
+  }
+  CHECK_DEVICE(out_page_indices);
+  if (out_raw_indices_opt.has_value()) {
+    CHECK_DEVICE(out_raw_indices_opt.value());
+  }
+
+  TORCH_CHECK(scores.dim() == 2, "scores must be 2D");
+  TORCH_CHECK(scores.stride(1) == 1, "scores must have unit last-dim stride");
+  TORCH_CHECK(scores.scalar_type() == at::kFloat, "scores must be float32");
+
+  const int64_t B = scores.size(0);
+
+  at::Tensor seq_lens_flat = seq_lens;
+  if (seq_lens_flat.dim() == 2) {
+    TORCH_CHECK(seq_lens_flat.size(1) == 1, "2-D seq_lens must have size(1) == 1");
+    seq_lens_flat = seq_lens_flat.squeeze(-1);
+  }
+  TORCH_CHECK(seq_lens_flat.dim() == 1, "seq_lens must be 1-D or (B, 1)");
+  TORCH_CHECK(seq_lens_flat.size(0) == B, "seq_lens.size(0) must equal scores.size(0)");
+  TORCH_CHECK(seq_lens_flat.is_contiguous(), "seq_lens must be contiguous after squeeze");
+  TORCH_CHECK(seq_lens_flat.scalar_type() == at::kInt, "seq_lens must be int32");
+
+  if (page_tables_opt.has_value()) {
+    const auto& page_tables = page_tables_opt.value();
+    TORCH_CHECK(page_tables.dim() == 2, "page_tables must be 2D");
+    TORCH_CHECK(page_tables.size(0) == B, "page_tables.size(0) must equal scores.size(0)");
+    TORCH_CHECK(page_tables.stride(1) == 1, "page_tables must have unit last-dim stride");
+    TORCH_CHECK(page_tables.scalar_type() == at::kInt, "page_tables must be int32");
+  }
+
+  TORCH_CHECK(out_page_indices.dim() == 2, "out_page_indices must be 2D");
+  TORCH_CHECK(out_page_indices.is_contiguous(), "out_page_indices must be contiguous");
+  TORCH_CHECK(out_page_indices.size(0) == B, "out_page_indices.size(0) must equal scores.size(0)");
+  TORCH_CHECK(out_page_indices.scalar_type() == at::kInt, "out_page_indices must be int32");
+  const int64_t topk = out_page_indices.size(1);
+  TORCH_CHECK(0 < topk && topk <= kMaxTopK, "topk (out_page_indices.size(1)) must be in (0, ", kMaxTopK, "]");
+  TORCH_CHECK(page_size > 0, "page_size must be positive");
+  TORCH_CHECK((page_size & (page_size - 1)) == 0, "page_size must be a power of 2");
+  const int page_bits = __builtin_ctzll(static_cast<uint64_t>(page_size));
+
+  int32_t* out_raw_ptr = nullptr;
+  if (out_raw_indices_opt.has_value()) {
+    const auto& out_raw_indices = out_raw_indices_opt.value();
+    TORCH_CHECK(out_raw_indices.dim() == 2, "out_raw_indices must be 2D");
+    TORCH_CHECK(out_raw_indices.is_contiguous(), "out_raw_indices must be contiguous");
+    TORCH_CHECK(out_raw_indices.size(0) == B, "out_raw_indices.size(0) must equal scores.size(0)");
+    TORCH_CHECK(out_raw_indices.size(1) == topk, "out_raw_indices.size(1) must equal topk");
+    TORCH_CHECK(out_raw_indices.scalar_type() == at::kInt, "out_raw_indices must be int32");
+    out_raw_ptr = out_raw_indices.data_ptr<int32_t>();
+  }
+
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto& queue = stream.queue();
+
+  TopKTransformPagedKernel kernel(
+      scores.data_ptr<float>(),
+      seq_lens_flat.data_ptr<int32_t>(),
+      page_tables_opt.has_value() ? page_tables_opt->data_ptr<int32_t>() : nullptr,
+      out_page_indices.data_ptr<int32_t>(),
+      out_raw_ptr,
+      scores.stride(0),
+      page_tables_opt.has_value() ? page_tables_opt->stride(0) : 0,
+      page_bits,
+      static_cast<int>(topk));
+  sycl_kernel_submit(
+      sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock), queue, kernel);
+}
+
+}  // namespace
+
+SGL_KERNEL_EXPORT void topk_transform(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    const at::Tensor& page_tables,
+    at::Tensor& out_page_indices,
+    int64_t page_size,
+    std::optional<at::Tensor> out_raw_indices_opt) {
+  topk_transform_paged_launch(scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices_opt);
+}
+
+SGL_KERNEL_EXPORT void topk_transform_paged(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    std::optional<at::Tensor> page_tables_opt,
+    at::Tensor& out_page_indices,
+    int64_t page_size,
+    const at::Tensor& metadata) {
+  (void)metadata;
+  topk_transform_paged_launch(scores, seq_lens, page_tables_opt, out_page_indices, page_size, std::nullopt);
+}
+
+SGL_KERNEL_EXPORT void topk_transform_ragged(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    at::Tensor& out_indices,
+    const at::Tensor& out_offsets,
+    std::optional<at::Tensor> row_starts_opt) {
+  CHECK_DEVICE(scores);
+  CHECK_DEVICE(seq_lens);
+  CHECK_DEVICE(out_indices);
+  CHECK_DEVICE(out_offsets);
+  if (row_starts_opt.has_value()) {
+    CHECK_DEVICE(row_starts_opt.value());
+  }
+
+  TORCH_CHECK(scores.dim() == 2, "scores must be 2D");
+  TORCH_CHECK(scores.stride(1) == 1, "scores must have unit last-dim stride");
+  TORCH_CHECK(scores.scalar_type() == at::kFloat, "scores must be float32");
+
+  const int64_t B = scores.size(0);
+
+  TORCH_CHECK(seq_lens.dim() == 1 && seq_lens.is_contiguous() && seq_lens.size(0) == B);
+  TORCH_CHECK(seq_lens.scalar_type() == at::kInt, "seq_lens must be int32");
+
+  TORCH_CHECK(out_offsets.dim() == 1 && out_offsets.is_contiguous() && out_offsets.size(0) == B);
+  TORCH_CHECK(out_offsets.scalar_type() == at::kInt, "out_offsets must be int32");
+
+  if (row_starts_opt.has_value()) {
+    const auto& row_starts = row_starts_opt.value();
+    TORCH_CHECK(row_starts.dim() == 1 && row_starts.is_contiguous() && row_starts.size(0) == B);
+    TORCH_CHECK(row_starts.scalar_type() == at::kInt, "row_starts must be int32");
+  }
+
+  TORCH_CHECK(out_indices.dim() == 2, "out_indices must be 2D");
+  TORCH_CHECK(out_indices.is_contiguous(), "out_indices must be contiguous");
+  TORCH_CHECK(out_indices.size(0) == B, "out_indices.size(0) must equal scores.size(0)");
+  TORCH_CHECK(out_indices.scalar_type() == at::kInt, "out_indices must be int32");
+  const int64_t topk = out_indices.size(1);
+  TORCH_CHECK(0 < topk && topk <= kMaxTopK, "topk (out_indices.size(1)) must be in (0, ", kMaxTopK, "]");
+
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto& queue = stream.queue();
+
+  TopKTransformRaggedKernel kernel(
+      scores.data_ptr<float>(),
+      seq_lens.data_ptr<int32_t>(),
+      row_starts_opt.has_value() ? row_starts_opt->data_ptr<int32_t>() : nullptr,
+      out_offsets.data_ptr<int32_t>(),
+      out_indices.data_ptr<int32_t>(),
+      scores.stride(0),
+      static_cast<int>(topk));
   sycl_kernel_submit(
       sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock), queue, kernel);
 }

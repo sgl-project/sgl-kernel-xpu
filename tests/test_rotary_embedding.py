@@ -383,6 +383,47 @@ def test_rope(
     torch.testing.assert_close(key_ref_out, key_test_out, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("is_neox_style", [True, False])
+def test_rope_3d_input_shape_preserved(is_neox_style: bool):
+    """Regression test: rotary_embedding_3D_kernel_impl must not alter the
+    shape of its output tensors relative to the input (batch, num_heads,
+    head_size) tensors. A stray `reshape({1, batch, num_heads, head_size})`
+    for the is_neox_style branch used to prepend a spurious leading
+    dimension of size `1`, which corrupted downstream reshapes in callers
+    (e.g. sglang's rotary_embedding fallback for 2D q/k) whenever
+    is_neox_style=True and batch != 1."""
+    torch.manual_seed(0)
+    head_size = 64
+    batch_size = 7
+    num_q_heads = 32
+    num_kv_heads = 8
+    max_position_embeddings = 32
+
+    positions = torch.arange(batch_size, device=device)
+    query = torch.randn(
+        batch_size, num_q_heads, head_size, dtype=torch.bfloat16, device=device
+    )
+    key = torch.randn(
+        batch_size, num_kv_heads, head_size, dtype=torch.bfloat16, device=device
+    )
+    cos_sin_cache = torch.randn(
+        max_position_embeddings, head_size, dtype=torch.bfloat16, device=device
+    )
+
+    query_out, key_out = torch.ops.sgl_kernel.rotary_embedding(
+        positions, query.clone(), key.clone(), head_size, cos_sin_cache, is_neox_style
+    )
+
+    assert query_out.shape == query.shape, (
+        f"query_out shape {query_out.shape} does not match input shape "
+        f"{query.shape} for is_neox_style={is_neox_style}"
+    )
+    assert key_out.shape == key.shape, (
+        f"key_out shape {key_out.shape} does not match input shape "
+        f"{key.shape} for is_neox_style={is_neox_style}"
+    )
+
+
 def test_deepseek_v2_rope():
     torch.manual_seed(1024)
     num_head = 16

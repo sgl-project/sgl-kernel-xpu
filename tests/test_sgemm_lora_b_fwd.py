@@ -578,28 +578,81 @@ def _make_valid_kwargs():
 @pytest.mark.parametrize(
     "bad_case, expected_msg",
     [
-        ("input_x_dim", "input_x must be a 2D tensor"),
-        ("weights_dim", "weights must be a 3D tensor"),
-        ("seg_indptr_dim", "seg_indptr must be a 1D tensor"),
-        ("weight_indices_dim", "weight_indices must be a 1D tensor"),
-        ("lora_ranks_dim", "lora_ranks must be a 1D tensor"),
-        ("scalings_dim", "scalings must be a 1D tensor"),
-        ("input_x_rank_mismatch", "input_x.size\\(1\\) must equal max_rank"),
-        ("lora_ranks_size", "lora_ranks.numel\\(\\) must equal weights.size\\(0\\)"),
-        ("scalings_size", "scalings.numel\\(\\) must equal weights.size\\(0\\)"),
-        (
+        pytest.param("input_x_dim", "input_x must be a 2D tensor", id="input_x_dim"),
+        pytest.param("weights_dim", "weights must be a 3D tensor", id="weights_dim"),
+        pytest.param(
+            "seg_indptr_dim", "seg_indptr must be a 1D tensor", id="seg_indptr_dim"
+        ),
+        pytest.param(
+            "weight_indices_dim",
+            "weight_indices must be a 1D tensor",
+            id="weight_indices_dim",
+        ),
+        pytest.param(
+            "lora_ranks_dim", "lora_ranks must be a 1D tensor", id="lora_ranks_dim"
+        ),
+        pytest.param("scalings_dim", "scalings must be a 1D tensor", id="scalings_dim"),
+        pytest.param(
+            "input_x_rank_mismatch",
+            "input_x.size\\(1\\) must equal max_rank",
+            id="input_x_rank_mismatch",
+        ),
+        pytest.param(
+            "lora_ranks_size",
+            "lora_ranks.numel\\(\\) must equal weights.size\\(0\\)",
+            id="lora_ranks_size",
+        ),
+        pytest.param(
+            "scalings_size",
+            "scalings.numel\\(\\) must equal weights.size\\(0\\)",
+            id="scalings_size",
+        ),
+        pytest.param(
             "weight_indices_size",
             "weight_indices.numel\\(\\) must equal seg_indptr.numel\\(\\) - 1",
+            id="weight_indices_size",
         ),
-        ("weight_indices_out_of_range", "weight_indices values must be in"),
-        ("seg_indptr_start_nonzero", "seg_indptr\\[0\\] must be 0"),
-        ("seg_indptr_end_mismatch", "seg_indptr\\[-1\\] must equal num_tokens"),
-        ("seg_indptr_decreasing", "seg_indptr must be non-decreasing"),
-        ("lora_ranks_out_of_range", "lora_ranks must be within the range"),
-        ("dtype_mismatch", "Input tensor dtype must match weights dtype"),
-        ("base_output_dim", "base_output must be a 2D tensor"),
-        ("base_output_shape", "base_output must have shape"),
-        ("base_output_dtype", "base_output dtype must match weights dtype"),
+        pytest.param(
+            "weight_indices_out_of_range",
+            "weight_indices values must be in",
+            id="weight_indices_out_of_range",
+        ),
+        pytest.param(
+            "seg_indptr_start_nonzero",
+            "seg_indptr\\[0\\] must be 0",
+            id="seg_indptr_start_nonzero",
+        ),
+        pytest.param(
+            "seg_indptr_end_mismatch",
+            "seg_indptr\\[-1\\] must equal num_tokens",
+            id="seg_indptr_end_mismatch",
+        ),
+        pytest.param(
+            "seg_indptr_decreasing",
+            "seg_indptr must be non-decreasing",
+            id="seg_indptr_decreasing",
+        ),
+        pytest.param(
+            "lora_ranks_out_of_range",
+            "lora_ranks must be within the range",
+            id="lora_ranks_out_of_range",
+        ),
+        pytest.param(
+            "dtype_mismatch",
+            "Input tensor dtype must match weights dtype",
+            id="dtype_mismatch",
+        ),
+        pytest.param(
+            "base_output_dim", "base_output must be a 2D tensor", id="base_output_dim"
+        ),
+        pytest.param(
+            "base_output_shape", "base_output must have shape", id="base_output_shape"
+        ),
+        pytest.param(
+            "base_output_dtype",
+            "base_output dtype must match weights dtype",
+            id="base_output_dtype",
+        ),
     ],
 )
 def test_sgemm_lora_b_fwd_input_validation(bad_case, expected_msg):

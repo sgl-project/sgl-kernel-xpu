@@ -24,6 +24,7 @@ endfunction()
 
 # Support GCC on Linux.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  message(STATUS "sgl-kernel-xpu build type: ${CMAKE_BUILD_TYPE}")
   set(SYCL_HOST_FLAGS)
   set(SYCL_KERNEL_OPTIONS)
   set(SYCL_COMPILE_FLAGS ${SYCL_FLAGS})
@@ -76,6 +77,10 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -ftemplate-backtrace-limit=0)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -fno-sycl-unnamed-lambda)
+  # ATen/torch headers included in device-compiled FMHA runners require C++20.
+  # -sycl-std sets the SYCL spec version, not the C++ language standard, so the
+  # C++ standard must be set explicitly to match SYCL_HOST_FLAGS (-std=c++20).
+  set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -std=c++20)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -sycl-std=2020)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -fhonor-nans)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -fhonor-infinities)
@@ -88,7 +93,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   if(CMAKE_BUILD_TYPE MATCHES Debug)
     set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -g -O0 -Rno-debug-disables-optimization)
   elseif(CMAKE_BUILD_TYPE MATCHES RelWithDebInfo)
-    set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -gline-tables-only -O2)
+    set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -g -fdebug-info-for-profiling -O2)
   endif()
 
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -D__INTEL_LLVM_COMPILER_VERSION=${__INTEL_LLVM_COMPILER})
@@ -140,12 +145,16 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} ${SYCL_TARGETS_OPTION})
   set(SYCL_OFFLINE_COMPILER_AOT_OPTIONS "-device ${AOT_TARGETS}")
   message(STATUS "Compile Intel GPU AOT Targets for ${AOT_TARGETS}")
-  # SYCL compiler in basekit after 2025.2 needs more spirv arguments.
+  # SYCL compiler in basekit after 2025.2 needs more spirv arguments. Single
+  # source of truth for the spirv-translator extensions; reused by the AOT
+  # device link here and by the runtime-JIT compile flags in BuildOnLinux.cmake.
+  set(SGL_SYCL_SPIRV_EXTS +SPV_INTEL_split_barrier)
   if(SYCL_COMPILER_VERSION GREATER_EQUAL 20250806)
-    set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} -Xspirv-translator;-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate)
-  else()
-    set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} -Xspirv-translator;-spirv-ext=+SPV_INTEL_split_barrier)
+    list(APPEND SGL_SYCL_SPIRV_EXTS +SPV_INTEL_2d_block_io +SPV_INTEL_subgroup_matrix_multiply_accumulate)
   endif()
+  string(JOIN "," SGL_SYCL_SPIRV_EXT_LIST ${SGL_SYCL_SPIRV_EXTS})
+  set(SGL_SYCL_SPIRV_EXT_FLAGS -Xspirv-translator -spirv-ext=${SGL_SYCL_SPIRV_EXT_LIST})
+  set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} ${SGL_SYCL_SPIRV_EXT_FLAGS})
 
   set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} ${SYCL_KERNEL_OPTIONS})
 

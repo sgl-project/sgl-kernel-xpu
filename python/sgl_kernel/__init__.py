@@ -1,10 +1,31 @@
 import ctypes
 import os
 import platform
+from typing import Optional
 
 import torch
 
 SYSTEM_ARCH = platform.machine()
+
+
+def _export_jit_toolchain_env() -> None:
+    """Expose torch's include/lib dirs to the C++ runtime-JIT engine (src/jit).
+
+    Only Python knows torch's install location; the C++ engine reads these env
+    vars to build the icpx command line for on-demand FMHA kernel compilation.
+    """
+    try:
+        from torch.utils.cpp_extension import include_paths
+
+        os.environ.setdefault("SGL_JIT_TORCH_INCLUDE", os.pathsep.join(include_paths()))
+        os.environ.setdefault(
+            "SGL_JIT_TORCH_LIB", os.path.join(os.path.dirname(torch.__file__), "lib")
+        )
+    except Exception:
+        pass
+
+
+_export_jit_toolchain_env()
 
 cuda_path = f"/usr/local/cuda/targets/{SYSTEM_ARCH}-linux/lib/libcudart.so.12"
 if os.path.exists(cuda_path):
@@ -14,6 +35,7 @@ from sgl_kernel import common_ops
 from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
     flash_mla_decode,
+    flash_mla_decode_get_workspace_size,
     flash_mla_get_workspace_size,
     flash_mla_prefill,
     flash_mla_prefill_get_workspace_size,
@@ -54,11 +76,12 @@ from sgl_kernel.flash_compress_128 import (
     flash_compress128_prefill,
 )
 from sgl_kernel.fp8_paged_mqa_logits import fp8_paged_mqa_logits_triton
-from sgl_kernel.fused_norm_rope_v2_torch import compress_norm_rope_store
-from sgl_kernel.fused_q_indexer_rope_hadamard_quant_torch import (
-    fused_q_indexer_rope_hadamard_quant,
-)
+from sgl_kernel.fused_norm_rope_v2 import compress_norm_rope_store
 from sgl_kernel.gdn_attn import gdn_attention
+
+fused_q_indexer_rope_hadamard_quant = (
+    torch.ops.sgl_kernel.fused_q_indexer_rope_hadamard_quant
+)
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
@@ -79,6 +102,11 @@ from sgl_kernel.gemm import (
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.hadamard import hadamard_transform
+from sgl_kernel.hisparse import (
+    load_cache_to_device_buffer_dsv4_mla,
+    load_cache_to_device_buffer_mla,
+    transfer_cache_dsv4_mla,
+)
 from sgl_kernel.inkling_attn_prologue import (
     compile_inkling_attn_prologue,
     inkling_attn_prologue_decode,
@@ -113,7 +141,12 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer_pf_lf,
     transfer_kv_per_layer_ph_lf,
 )
-from sgl_kernel.lora import embedding_lora_a_fwd, sgemm_lora_a_fwd, sgemm_lora_b_fwd
+from sgl_kernel.lora import (
+    embedding_lora_a_fwd,
+    qkv_lora_b_fwd,
+    sgemm_lora_a_fwd,
+    sgemm_lora_b_fwd,
+)
 from sgl_kernel.mamba import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
 from sgl_kernel.memory import weak_ref_tensor
 from sgl_kernel.mhc import (
@@ -123,6 +156,9 @@ from sgl_kernel.mhc import (
     hc_split_sinkhorn,
     mhc_pre,
 )
+
+fused_hc_head = torch.ops.sgl_kernel.fused_hc_head.default
+mhc_fused_post_pre = torch.ops.sgl_kernel.mhc_fused_post_pre.default
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     biased_topk,
@@ -164,6 +200,9 @@ from sgl_kernel.top_k import (
     fast_topk_transform_fused,
     fast_topk_transform_ragged_fused,
     fast_topk_v2,
+    topk_transform,
+    topk_transform_paged,
+    topk_transform_ragged,
 )
 from sgl_kernel.utils import get_device_capability, is_xe2_arch
 from sgl_kernel.version import __version__

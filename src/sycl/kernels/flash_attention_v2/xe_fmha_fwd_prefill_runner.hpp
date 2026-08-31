@@ -35,6 +35,8 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <cute/tensor.hpp>
 #include <random>
 
@@ -169,11 +171,15 @@ struct Arguments {
   uint64_t* rng_state;
 
   bool is_bf16;
+  bool is_fp16 = false;
   bool is_fp32;
   bool is_e4m3 = false;
   bool is_e5m2 = false;
   bool is_causal;
   bool is_local;
+  // When false, the epilogue skips writing softmax_lse. Threaded as a template
+  // constexpr via FMHAConfig.
+  bool return_softmax_lse = false;
 
   bool is_rotary_interleaved;
 
@@ -194,6 +200,8 @@ using LayoutO = cutlass::layout::RowMajor;
 
 template <class FMHAPrefillKernel, bool isVarLen = false>
 struct PrefillRunner {
+  static constexpr int DefaultScoreWorkspaceCapMiB = 1024;
+
   using StrideQ = typename FMHAPrefillKernel::StrideQ;
   using StrideK = typename FMHAPrefillKernel::StrideK;
   using StrideV = typename FMHAPrefillKernel::StrideV;
@@ -290,6 +298,79 @@ struct PrefillRunner {
     return shape;
   }
 
+  // Rebase one kernel launch onto [batch_lo, batch_lo + batch_len). Paged
+  // prefill uses absolute offsets in its cumulative-length arrays, so the data
+  // pointers stay unchanged while the per-batch metadata advances.
+  template <class Kernel>
+  typename Kernel::Arguments slice_arguments(typename Kernel::Arguments args, int batch_lo, int batch_len) const {
+    args.kernel.shape.batch = batch_len;
+    if constexpr (isVarLen) {
+      if (args.kernel.shape.seq_len_qo.cumulative_length != nullptr) {
+        args.kernel.shape.seq_len_qo.cumulative_length += batch_lo;
+      }
+      if (args.kernel.shape.seq_len_kv.cumulative_length != nullptr) {
+        args.kernel.shape.seq_len_kv.cumulative_length += batch_lo;
+      }
+      if (args.kernel.shape.seq_len_kv_cache.cumulative_length != nullptr) {
+        args.kernel.shape.seq_len_kv_cache.cumulative_length += batch_lo;
+      }
+    }
+    if (args.mainloop.ptr_page_table != nullptr) {
+      args.mainloop.ptr_page_table += size_t(batch_lo) * size_t(args.mainloop.max_num_pages_per_seq);
+    }
+    if (args.kernel.skip_batch_mask != nullptr) {
+      args.kernel.skip_batch_mask += batch_lo;
+    }
+    return args;
+  }
+
+  // ScoreBlock2D slices contiguous query heads while preserving their mapping
+  // to KV heads. The original NHD strides remain in the arguments because the
+  // source tensors still contain all heads.
+  template <class Kernel>
+  typename Kernel::Arguments
+  slice_query_head_arguments(typename Kernel::Arguments args, int query_head, int query_head_count) const {
+    const int head_group_q = args.kernel.shape.num_heads_q / args.kernel.shape.num_heads_kv;
+    const int kv_head = query_head / head_group_q;
+    const int head_offset_in_group = query_head % head_group_q;
+    const int kv_head_count =
+        query_head_count <= head_group_q - head_offset_in_group ? 1 : query_head_count / head_group_q;
+    const int head_size_qk = args.kernel.shape.head_size_qk;
+    const int head_size_vo = args.kernel.shape.head_size_vo;
+
+    args.kernel.shape.num_heads_q = query_head_count;
+    args.kernel.shape.num_heads_kv = kv_head_count;
+    args.kernel.Q += size_t(query_head) * size_t(head_size_qk);
+    args.kernel.O += size_t(query_head) * size_t(head_size_vo);
+    args.kernel.K_cache += size_t(kv_head) * size_t(head_size_qk);
+    args.kernel.V_cache += size_t(kv_head) * size_t(head_size_vo);
+    if (args.kernel.softmax_lse != nullptr) {
+      args.kernel.softmax_lse += size_t(query_head) * size_t(args.kernel.lse_head_stride);
+    }
+    return args;
+  }
+
+  static int get_query_head_slice_size(int query_head, int query_heads, int head_group_q, int requested_heads) {
+    const int heads_remaining = query_heads - query_head;
+    const int head_offset_in_group = query_head % head_group_q;
+    if (head_offset_in_group != 0 || requested_heads < head_group_q) {
+      return cute::min(requested_heads, cute::min(heads_remaining, head_group_q - head_offset_in_group));
+    }
+    // A KV-head-group-aligned slice may include multiple complete GQA groups.
+    return cute::min(heads_remaining, (requested_heads / head_group_q) * head_group_q);
+  }
+
+  // ScoreBlock2D reuses the same workspace for each contiguous Q-tile chunk.
+  // The scheduler receives the chunk's absolute tile start while workspace
+  // indexing uses q_tile_count as its local tile extent.
+  template <class Kernel>
+  typename Kernel::Arguments
+  slice_query_tile_arguments(typename Kernel::Arguments args, int query_tile_start, int query_tile_count) const {
+    args.kernel.q_tile_start = query_tile_start;
+    args.kernel.q_tile_count = query_tile_count;
+    return args;
+  }
+
   cutlass::Status run(const Arguments& params, const cutlass::KernelHardwareInfo& hw_info) {
     ProblemShapeType shape = initialize(params);
 
@@ -312,6 +393,8 @@ struct PrefillRunner {
             static_cast<const bool*>(params.skip_batch_mask_ptr),
             params.k_scale_ptr,
             params.v_scale_ptr,
+            static_cast<float*>(params.softmax_lse_ptr),
+            static_cast<int64_t>(params.total_q),
         },
         {
             params.softmax_scale,
@@ -324,22 +407,155 @@ struct PrefillRunner {
         {},
         hw_info};
 
-    // Define device-global scratch memory
-    size_t workspace_size = FMHAPrefillKernel::get_workspace_size(arguments);
-    auto workspace = torch::empty(workspace_size, params.tensor_opts);
+    const int batch_total = params.b;
+    int batch_slice = batch_total;
+    int query_head_slice = params.h;
+    int query_tile_slice = -1;
+    int q_tiles = 0;
+    [[maybe_unused]] int score_workspace_cap_mb = 0;
+    if constexpr (CollectiveMainloop::ScoreBlock2D) {
+      TORCH_CHECK(
+          batch_total > 0 && params.h > 0 && params.seqlen_q > 0 && params.seqlen_k > 0,
+          "ScoreBlock2D requires positive batch, query heads, and Q/K sequence lengths");
+      q_tiles = cute::ceil_div(params.seqlen_q, int(get<0>(typename FMHAPrefillKernel::TileShapeQK{})));
+      query_tile_slice = q_tiles;
+      static const int cap_mb = [] {
+        if (const char* env = std::getenv("FMHA_SCORE_WS_CAP_MB")) {
+          return std::atoi(env);
+        }
+        return DefaultScoreWorkspaceCapMiB;
+      }();
+      score_workspace_cap_mb = cap_mb;
+      if (cap_mb > 0) {
+        const size_t cap_bytes = size_t(cap_mb) << 20;
+        const int head_group_q = params.h / params.h_k;
+        const auto score_workspace_size = [&](int batches, int query_heads, int query_tiles) {
+          auto batch_args = slice_arguments<FMHAPrefillKernel>(arguments, 0, batches);
+          auto head_args = slice_query_head_arguments<FMHAPrefillKernel>(batch_args, 0, query_heads);
+          auto tile_args = slice_query_tile_arguments<FMHAPrefillKernel>(head_args, 0, query_tiles);
+          return FMHAPrefillKernel::get_workspace_size(tile_args);
+        };
+        const size_t full_batch_workspace = score_workspace_size(1, params.h, q_tiles);
+        if (full_batch_workspace <= cap_bytes) {
+          // This is the PR342 launch shape: preserve every Q head and tile in
+          // one ScoreStore/ScoreLoad pair, reducing only the batch extent.
+          batch_slice = int(cute::max(size_t(1), cap_bytes / full_batch_workspace));
+          batch_slice = cute::min(batch_total, batch_slice);
+        } else {
+          // Preserve all Q heads where possible. A Q-tile slice keeps the
+          // large multi-head grid from PR342 and needs far fewer launches than
+          // slicing into individual GQA heads.
+          size_t one_q_tile_workspace = score_workspace_size(1, params.h, 1);
+          if (one_q_tile_workspace > cap_bytes) {
+            // An entire Q-head set cannot fit even for one Q tile. Reduce
+            // heads only as far as required by the workspace cap.
+            for (int requested_heads = params.h; requested_heads > 0;) {
+              const int candidate_heads = get_query_head_slice_size(0, params.h, head_group_q, requested_heads);
+              if (score_workspace_size(1, candidate_heads, 1) <= cap_bytes) {
+                query_head_slice = candidate_heads;
+                break;
+              }
+              requested_heads = candidate_heads - 1;
+            }
+            TORCH_CHECK(
+                query_head_slice > 0 && score_workspace_size(1, query_head_slice, 1) <= cap_bytes,
+                "ScoreBlock2D one-Q-tile workspace exceeds FMHA_SCORE_WS_CAP_MB=",
+                cap_mb,
+                "; increase the cap");
+            one_q_tile_workspace = score_workspace_size(1, query_head_slice, 1);
+          }
 
+          query_tile_slice = cute::min(q_tiles, int(cute::max(size_t(1), cap_bytes / one_q_tile_workspace)));
+          const size_t per_batch = score_workspace_size(1, query_head_slice, query_tile_slice);
+          batch_slice = int(cute::max(size_t(1), cap_bytes / per_batch));
+          batch_slice = cute::min(batch_total, batch_slice);
+        }
+      }
+    }
+    const int num_slices = cute::ceil_div(batch_total, batch_slice);
+
+    const int head_group_q = params.h / params.h_k;
+    const int first_head_slice = get_query_head_slice_size(0, params.h, head_group_q, query_head_slice);
     if (!FMHAPrefillKernel::can_implement(arguments)) {
       return cutlass::Status::kErrorInvalidProblem;
     }
 
-    // Initialize the workspace
-    FMHAPrefillKernel::initialize_workspace(arguments, workspace.data_ptr());
+    // Every batch/head slice reuses the score buffer.
+    const auto workspace_shape = [&] {
+      auto head_shape = slice_query_head_arguments<FMHAPrefillKernel>(
+          num_slices > 1 ? slice_arguments<FMHAPrefillKernel>(arguments, 0, batch_slice) : arguments,
+          0,
+          first_head_slice);
+      if constexpr (CollectiveMainloop::ScoreBlock2D) {
+        return slice_query_tile_arguments<FMHAPrefillKernel>(head_shape, 0, query_tile_slice);
+      }
+      return head_shape;
+    }();
+    const size_t workspace_size = FMHAPrefillKernel::get_workspace_size(workspace_shape);
+    if constexpr (CollectiveMainloop::ScoreBlock2D) {
+      if (std::getenv("FMHA_SCORE_WS_VERBOSE") != nullptr) {
+        std::fprintf(
+            stderr,
+            "[fmha] score workspace: batch=%d batch_slice=%d slices=%d query_head_slice=%d query_tile_slice=%d "
+            "q_tile_rows=%d bytes=%zu "
+            "(%.1f MiB)\n",
+            batch_total,
+            batch_slice,
+            num_slices,
+            query_head_slice,
+            query_tile_slice,
+            int(get<0>(typename FMHAPrefillKernel::TileShapeQK{})),
+            workspace_size,
+            double(workspace_size) / (1024.0 * 1024.0));
+      }
+    }
+    // Only the HD512 ScoreBlock2D specializations own a score workspace. Other
+    // head dimensions pass nullptr, so they never create even a zero-byte XPU
+    // allocation here. `workspace` remains alive through all asynchronous
+    // ScoreStore/ScoreLoad launches and is released when this runner returns.
+    torch::Tensor workspace;
+    void* workspace_ptr = nullptr;
+    if constexpr (CollectiveMainloop::ScoreBlock2D) {
+      TORCH_CHECK(
+          score_workspace_cap_mb <= 0 || workspace_size <= (size_t(score_workspace_cap_mb) << 20),
+          "ScoreBlock2D minimum workspace (",
+          workspace_size,
+          " bytes) exceeds FMHA_SCORE_WS_CAP_MB=",
+          score_workspace_cap_mb,
+          "; increase the cap or reduce sequence length");
+      // get_workspace_size() is expressed in bytes. Keep the score workspace
+      // byte-addressed so BF16/FP16 tensor options do not allocate two bytes
+      // for every requested byte.
+      workspace = torch::empty({static_cast<int64_t>(workspace_size)}, torch::device(torch::kXPU).dtype(torch::kByte));
+      workspace_ptr = workspace.data_ptr();
+    }
 
-    // Convert host-side arguments to device-side arguments to be passed to the kernel
-    auto kernel_params = FMHAPrefillKernel::to_underlying_arguments(arguments, workspace.data_ptr());
+    // Initialize the workspace
+    FMHAPrefillKernel::initialize_workspace(arguments, workspace_ptr);
 
     // Run
-    launch<FMHAPrefillKernel>(kernel_params);
+    if constexpr (CollectiveMainloop::ScoreBlock2D) {
+      using ScoreStoreKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<0>;
+      using ScoreLoadKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<1>;
+
+      for (int batch_lo = 0; batch_lo < batch_total; batch_lo += batch_slice) {
+        const int batch_len = cute::min(batch_slice, batch_total - batch_lo);
+        auto batch_args = slice_arguments<FMHAPrefillKernel>(arguments, batch_lo, batch_len);
+        for (int query_head = 0; query_head < params.h;) {
+          const int head_count = get_query_head_slice_size(query_head, params.h, head_group_q, query_head_slice);
+          auto head_args = slice_query_head_arguments<FMHAPrefillKernel>(batch_args, query_head, head_count);
+          for (int query_tile = 0; query_tile < q_tiles; query_tile += query_tile_slice) {
+            const int query_tile_count = cute::min(query_tile_slice, q_tiles - query_tile);
+            auto slice = slice_query_tile_arguments<FMHAPrefillKernel>(head_args, query_tile, query_tile_count);
+            launch<ScoreStoreKernel>(ScoreStoreKernel::to_underlying_arguments(slice, workspace_ptr));
+            launch<ScoreLoadKernel>(ScoreLoadKernel::to_underlying_arguments(slice, workspace_ptr));
+          }
+          query_head += head_count;
+        }
+      }
+    } else {
+      launch<FMHAPrefillKernel>(FMHAPrefillKernel::to_underlying_arguments(arguments, workspace_ptr));
+    }
     return cutlass::Status::kSuccess;
   }
 };
@@ -347,6 +563,7 @@ template <
     bool Causal,
     bool LocalMask,
     bool Sink,
+    bool LSE,
     typename TileShapeQK,
     typename TileShapePV,
     typename TileShapeOutput,
@@ -434,8 +651,8 @@ struct FMHAConfig {
         LocalMask>;
 
     // Epilogue
-    using CollectiveEpilogue =
-        cutlass::fmha::collective::FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, Sink>;
+    using CollectiveEpilogue = cutlass::fmha::collective::
+        FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, Sink, /*PackGQA*/ false, LSE>;
 
     static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
     using FMHAPrefillKernel = conditional_t<
@@ -480,7 +697,7 @@ struct FMHAConfig {
 // generated .cpp file (from xe_fmha_fwd_prefill_kernel.cpp.in) so the compiler
 // only emits code for the combinations that are actually needed.
 
-template <int HEAD_DIM>
+template <int HEAD_DIM, class Element = cutlass::bfloat16_t>
 struct FmhaPrefillRunner {
   void operator()(const Arguments& params) const;
 };
@@ -488,8 +705,8 @@ struct FmhaPrefillRunner {
 // Non-paged (no_page) prefill is split into its own runner type so its kernel
 // instantiations are compiled in translation units separate from the paged
 // prefill path, producing independent shared libraries and lowering peak
-// compiler memory. Non-paged prefill supports bf16 queries only (no fp8).
-template <int HEAD_DIM>
+// compiler memory. Non-paged prefill supports 16-bit (bf16/fp16) queries only (no fp8).
+template <int HEAD_DIM, class Element = cutlass::bfloat16_t>
 struct FmhaPrefillNpRunner {
   void operator()(const Arguments& params) const;
 };
@@ -497,10 +714,11 @@ struct FmhaPrefillNpRunner {
 // FP8 KV-cache prefill path is split into its own runner type so that the
 // (heavy) e4m3/e5m2 kernel instantiations — which also fan out over
 // is_local x is_causal — are compiled in a separate translation unit from the
-// bf16 paged prefill path. This keeps the peak compiler memory of any
+// 16-bit paged prefill path. This keeps the peak compiler memory of any
 // single prefill TU low (avoids OOM during AOT build). The dispatch forwards to
-// this when params.is_e4m3 || is_e5m2.
-template <int HEAD_DIM>
+// this when params.is_e4m3 || is_e5m2. The trailing Element is the QUERY dtype
+// (bf16 or fp16); K/V stay fp8.
+template <int HEAD_DIM, class Element = cutlass::bfloat16_t>
 struct FmhaPrefillFp8Runner {
   void operator()(const Arguments& params) const;
 };

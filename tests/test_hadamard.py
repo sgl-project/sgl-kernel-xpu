@@ -1,34 +1,51 @@
 import math
+from functools import lru_cache
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
+from scipy.linalg import hadamard
 from sgl_kernel import hadamard_transform
 
 
+# Cache the HOST-side int8 matrix only, never a device tensor. The cost being
+# avoided is scipy's build (~10s at dim=32768, and every case calls the
+# reference twice), which is host work; caching the device copy instead would
+# pin it for the whole session, and the conftest's empty_cache() fixture cannot
+# free memory that a cache still references. At dim=32768 an fp32 device matrix
+# is 4 GiB, which alone would not fit alongside the rest on an 11 GB card.
+#
+# int8 is safe here: Hadamard entries are +-1, so the cast below is
+# bit-identical to scipy's float64 matrix at 1/8th the host memory.
+@lru_cache(maxsize=2)
+def _hadamard_matrix_cpu(dim_padded):
+    """Host-side +-1 Hadamard matrix, cached per padded dim."""
+    return torch.from_numpy(hadamard(dim_padded, dtype=np.int8))
+
+
+def _hadamard_matrix(dim_padded, dtype, device):
+    """Hadamard matrix on *device* with *dtype*, freshly allocated each call.
+
+    Deliberately uncached so the caller's tensor is released between tests.
+    """
+    return _hadamard_matrix_cpu(dim_padded).to(device=device, dtype=dtype)
+
+
 def _ref_torch_impl(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    assert x.dim() == 2
-    bs, dim = x.shape
+    # min log_dim of 3 matches the kernel, which always pads up to dim >= 8.
+    x_shape = x.shape
+    dim = x.shape[-1]
+    x = x.reshape(-1, dim)
     log_dim = max(3, math.ceil(math.log2(max(dim, 1))))
     dim_padded = 1 << log_dim
-
-    if dim_padded != dim:
-        out = F.pad(x, (0, dim_padded - dim))
-    else:
-        out = x.clone()
-
-    h = 1
-    while h < dim_padded:
-        out = out.view(bs, dim_padded // (2 * h), 2, h)
-        a = out[:, :, 0, :]
-        b = out[:, :, 1, :]
-        out = torch.stack((a + b, a - b), dim=2).view(bs, dim_padded)
-        h *= 2
-
+    if dim != dim_padded:
+        x = F.pad(x, (0, dim_padded - dim))
+    out = F.linear(x, _hadamard_matrix(dim_padded, x.dtype, x.device))
     out = out * scale
     if dim_padded != dim:
         out = out[:, :dim]
-    return out
+    return out.reshape(x_shape)
 
 
 def _bench(fn, *, warmup: int = 5, iters: int = 20) -> float:

@@ -413,6 +413,7 @@ void mha_fwd(
   TORCH_CHECK(head_size <= max_headdim, "FlashAttention forward only supports head dimension at most ", max_headdim);
   TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
   if (rel_bias_.has_value()) {
+    TORCH_CHECK(!softmax_lse.has_value(), "relative attention does not support softmax LSE");
     const at::Tensor& rel_bias = rel_bias_.value();
     TORCH_CHECK(
         (head_size == 128 || head_size == 512) && head_size_v == head_size,
@@ -1092,6 +1093,7 @@ void mha_fwd(
   TORCH_CHECK(head_size <= max_headdim, "FlashAttention forward only supports head dimension at most ", max_headdim);
   TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
   if (rel_bias_.has_value()) {
+    TORCH_CHECK(!softmax_lse.has_value(), "relative attention does not support softmax LSE");
     const at::Tensor& rel_bias = rel_bias_.value();
     TORCH_CHECK(head_size == 128 && head_size_v == 128, "relative attention requires head_dim=head_dim_v=128");
     TORCH_CHECK(!is_fp8_kv, "relative attention does not support fp8 KV cache");
@@ -1533,46 +1535,6 @@ SGL_KERNEL_EXPORT void mha_fwd(
 
   int64_t batch_size = cu_seqlens_q.size(0) - 1;
 
-  if (rel_bias_.has_value() && max_seqlen_q != 1) {
-    TORCH_CHECK(!rel_bias_is_sheared, "pre-sheared relative bias is supported only for decode");
-    // Relative prefill shares the same public bias contract. Single-token rows
-    // use the decode-specific zero-drift surface below.
-    prefill::mha_fwd(
-        q,
-        k,
-        v,
-        q_v_,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        page_table,
-        kv_batch_idx_,
-        leftpad_k_,
-        rotary_cos_,
-        rotary_sin_,
-        seqlens_rotary_,
-        q_descale_,
-        k_descale_,
-        v_descale_,
-        softmax_scale_,
-        sinks_,
-        is_causal,
-        window_size_left,
-        window_size_right,
-        softcap,
-        is_rotary_interleaved,
-        scheduler_metadata_,
-        num_kv_splits,
-        pack_gqa_,
-        sm_margin,
-        out,
-        softmax_lse,
-        std::nullopt,
-        rel_bias_);
-    return;
-  }
-
   // decode / prefill / chunkprefill all take the same leading argument list;
   // only the trailing parameters differ. Bind the shared arguments once here so
   // each branch reduces to a single call. ``out`` and ``softmax_lse`` are
@@ -1617,8 +1579,15 @@ SGL_KERNEL_EXPORT void mha_fwd(
   bool const is_uniform_qlen = batch_size > 0 && q.size(0) == batch_size * static_cast<int64_t>(max_seqlen_q);
 
   if (max_seqlen_q == 1) {
-    // Pure decode path
+    // Pure decode path. Decode also supports the pre-sheared relative-bias fast
+    // path, so forward both relative-bias tail arguments.
     dispatch(decode::mha_fwd, std::nullopt, rel_bias_, rel_bias_is_sheared);
+  } else if (rel_bias_.has_value()) {
+    TORCH_CHECK(!rel_bias_is_sheared, "pre-sheared relative bias is supported only for decode");
+    // Relative bias currently bypasses chunkprefill. For any request with
+    // max_seqlen_q > 1, use the prefill sheared-bias layout for all rows,
+    // including q_len == 1 rows in a mixed batch.
+    dispatch(prefill::mha_fwd, std::nullopt, rel_bias_);
   } else if (!page_table.has_value() || is_uniform_qlen) {
     // Pure prefill path
     //

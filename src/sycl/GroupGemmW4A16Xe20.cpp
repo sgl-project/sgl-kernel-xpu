@@ -95,7 +95,6 @@ DECLARE_W4A16_POLICY(w4a16_launch_policy_m_64_n_128)
 DECLARE_W4A16_POLICY(w4a16_launch_policy_m_64_n_128_skip)
 DECLARE_W4A16_POLICY(w4a16_launch_policy_m_64_n_256)
 DECLARE_W4A16_POLICY(w4a16_launch_policy_m_64_n_256_skip)
-DECLARE_W4A16_POLICY(w4a16_launch_policy_m_128_n_128)
 
 #undef DECLARE_W4A16_POLICY
 #undef DECLARE_W4A16_EXTERN
@@ -358,9 +357,6 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
         break;                                             \
       case 6:                                              \
         LAUNCH_W4A16(w4a16_launch_policy_m_64_n_256_skip); \
-        break;                                             \
-      case 7:                                              \
-        LAUNCH_W4A16(w4a16_launch_policy_m_128_n_128);     \
         break;                                             \
     }                                                      \
   } while (0)

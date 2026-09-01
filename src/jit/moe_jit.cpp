@@ -176,8 +176,6 @@ const char* w4a16_policy(int policy_id) {
       return "w4a16_launch_policy_m_64_n_256";
     case 6:
       return "w4a16_launch_policy_m_64_n_256_skip";
-    case 7:
-      return "w4a16_launch_policy_m_128_n_128";
     default:
       return nullptr;
   }

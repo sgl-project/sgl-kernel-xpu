@@ -33,8 +33,4 @@ using w4a16_launch_policy_m_64_n_128_skip = w4a16_launch_policy<w4a16_tile<64, 1
 using w4a16_launch_policy_m_64_n_256 = w4a16_launch_policy<w4a16_tile<64, 256, 1, 16>, 1, 2, true, false>;
 using w4a16_launch_policy_m_64_n_256_skip = w4a16_launch_policy<w4a16_tile<64, 256, 1, 16>, 1, 2, true, true>;
 
-// Retained only as a measurement/reference option; production dispatch routes
-// all M > 32 through one of the 64-row tiles above.
-using w4a16_launch_policy_m_128_n_128 = w4a16_launch_policy<w4a16_policy_m_128_n_128, 1, 6, true, false>;
-
 }  // namespace moe_w4a16

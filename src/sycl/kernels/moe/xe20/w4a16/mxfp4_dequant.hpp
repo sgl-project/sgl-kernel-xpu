@@ -119,7 +119,7 @@ CUTE_DEVICE void mxfp4_unfold(CTensor& tCrC) {
 template <ReorderKind Kind>
 CUTE_DEVICE void
 mxfp4_reorder_folded(intel::uchar4 const& src0, intel::ushort8& dst0, intel::vector_t<float, 2> const& muls) {
-#if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
+#if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET) && SYCL_INTEL_TARGET == 20
   const uint32_t shifts = 0x0008000C;
   if constexpr (Kind == ReorderKind::UU) {
     asm("{\n"
@@ -145,6 +145,8 @@ mxfp4_reorder_folded(intel::uchar4 const& src0, intel::ushort8& dst0, intel::vec
         : "=rw"(dst0)
         : "rw"(src0), "rw.u"(shifts), "rw"(muls));
   }
+#elif defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
+#error "MXFP4 folded reorder is only supported on SYCL_INTEL_TARGET 20 (BMG/Xe20)"
 #endif
 }
 

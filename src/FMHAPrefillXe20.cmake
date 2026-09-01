@@ -27,6 +27,10 @@ set(FMHA_PREFILL_NOPAGE_TEMPLATE
 set(FMHA_PREFILL_FP8_TEMPLATE
     "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_fp8_kernel.cpp.in")
 
+# woq mxfp4 KV-cache prefill path (packed E2M1 + E8M0 block scale, bf16 query only).
+set(FMHA_PREFILL_MXFP4_TEMPLATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_mxfp4_kernel.cpp.in")
+
 # Per-HEAD_DIM prefill tile shapes (paged and non-paged) now live in the shared
 # header sycl/kernels/flash_attention_v2/fmha_tile_dispatch.h, consumed both by
 # the AOT kernel templates (compile-time lookup by HEAD_DIM) and the runtime-JIT
@@ -75,6 +79,12 @@ foreach(HEAD_DIM ${FMHA_PREFILL_PAGED_HEAD_DIMS})
                 "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_prefill_page_${HEAD_DIM}_${DTFP8}.cpp")
             configure_file(${FMHA_PREFILL_FP8_TEMPLATE} ${GENERATED_FP8_FILE} @ONLY)
             list(APPEND device_cpp_xe20 ${GENERATED_FP8_FILE})
+
+            # woq mxfp4 KV cache: bf16 query only.
+            set(GENERATED_MXFP4_FILE
+                "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_prefill_page_${HEAD_DIM}_${ELEM_TAG}_mxfp4.cpp")
+            configure_file(${FMHA_PREFILL_MXFP4_TEMPLATE} ${GENERATED_MXFP4_FILE} @ONLY)
+            list(APPEND device_cpp_xe20 ${GENERATED_MXFP4_FILE})
         endif()
     endforeach()
 endforeach()

@@ -103,7 +103,18 @@ struct Arguments {
   const float* k_scale_ptr = nullptr;
   const float* v_scale_ptr = nullptr;
 
-  // array of length b+1 holding starting offset of each sequence.
+  // mxfp4 (woq) KV cache: E8M0 per-block dequant scales (uint8), one scale per
+  // mxfp4_block_size elements along head_dim. K/V data are packed E2M1
+  // (float_e2m1_t, 2 nibbles/byte). Null => no mxfp4 dequant.
+  const uint8_t* k_block_scale_ptr = nullptr;
+  const uint8_t* v_block_scale_ptr = nullptr;
+  int64_t k_scale_stride_page = 0;
+  int64_t k_scale_stride_seq = 0;
+  int64_t k_scale_stride_heads = 0;
+  int64_t v_scale_stride_page = 0;
+  int64_t v_scale_stride_seq = 0;
+  int64_t v_scale_stride_heads = 0;
+  int mxfp4_block_size = 32;
   int* __restrict__ cu_seqlens_q;
   int* __restrict__ cu_seqlens_k;
   int* __restrict__ cu_seqlens_knew;
@@ -175,6 +186,7 @@ struct Arguments {
   bool is_fp32;
   bool is_e4m3 = false;
   bool is_e5m2 = false;
+  bool is_mxfp4 = false;
   bool is_causal;
   bool is_local;
   // When false, the epilogue skips writing softmax_lse. Threaded as a template
@@ -393,6 +405,15 @@ struct PrefillRunner {
             static_cast<const bool*>(params.skip_batch_mask_ptr),
             params.k_scale_ptr,
             params.v_scale_ptr,
+            params.k_block_scale_ptr,
+            params.v_block_scale_ptr,
+            params.k_scale_stride_page,
+            params.k_scale_stride_seq,
+            params.k_scale_stride_heads,
+            params.v_scale_stride_page,
+            params.v_scale_stride_seq,
+            params.v_scale_stride_heads,
+            params.mxfp4_block_size,
             static_cast<float*>(params.softmax_lse_ptr),
             static_cast<int64_t>(params.total_q),
         },
@@ -403,6 +424,11 @@ struct PrefillRunner {
             params.max_num_pages_per_seq,
             params.window_size_left,
             params.window_size_right,
+            params.k_scale_stride_page,
+            params.k_scale_stride_seq,
+            params.v_scale_stride_page,
+            params.v_scale_stride_seq,
+            params.mxfp4_block_size,
         },
         {},
         hw_info};
@@ -720,6 +746,13 @@ struct FmhaPrefillNpRunner {
 // (bf16 or fp16); K/V stay fp8.
 template <int HEAD_DIM, class Element = cutlass::bfloat16_t>
 struct FmhaPrefillFp8Runner {
+  void operator()(const Arguments& params) const;
+};
+
+// mxfp4 (woq) KV-cache prefill path: packed E2M1 K/V + per-block E8M0 scale,
+// dequantized to bf16 in the mainloop. Mirrors the fp8 runner; bf16 query only.
+template <int HEAD_DIM, class Element = cutlass::bfloat16_t>
+struct FmhaPrefillMxfp4Runner {
   void operator()(const Arguments& params) const;
 };
 

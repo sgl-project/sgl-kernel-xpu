@@ -337,10 +337,15 @@ void mha_fwd(
   bool const is_e4m3_kv = k.scalar_type() == at::ScalarType::Float8_e4m3fn;
   bool const is_e5m2_kv = k.scalar_type() == at::ScalarType::Float8_e5m2;
   bool const is_fp8_kv = is_e4m3_kv || is_e5m2_kv;
+  // woq mxfp4 KV cache: K/V are packed E2M1 stored as uint8 (2 nibbles/byte).
+  bool const is_mxfp4_kv = k.scalar_type() == at::ScalarType::Byte;
   if (is_fp8_kv) {
     TORCH_CHECK(
         v.scalar_type() == k.scalar_type(),
         "fp8 KV cache requires key and value to have the same fp8 dtype (both float8_e4m3fn or both float8_e5m2)");
+  } else if (is_mxfp4_kv) {
+    TORCH_CHECK(
+        v.scalar_type() == at::ScalarType::Byte, "mxfp4 KV cache requires key and value to be uint8 packed E2M1");
   } else {
     TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
     TORCH_CHECK(v.scalar_type() == q_type, "query and value must have the same dtype");
@@ -389,7 +394,7 @@ void mha_fwd(
   int total_q = q.size(0);
   int num_heads = q.size(-2);
   int const head_size = q.size(-1);
-  int const head_size_v = v.size(-1);
+  int const head_size_v = is_mxfp4_kv ? static_cast<int>(v.size(-1)) * 2 : static_cast<int>(v.size(-1));
   int const max_num_pages_per_seq = page_table.value().size(1);
   int const num_pages = k.size(0);
   int const page_size = k.size(1);
@@ -421,8 +426,13 @@ void mha_fwd(
     window_size_right = 0;
   }
 
-  CHECK_SHAPE(k, num_pages, page_size, num_heads_k, head_size);
-  CHECK_SHAPE(v, num_pages, page_size, num_heads_k, head_size_v);
+  if (is_mxfp4_kv) {
+    CHECK_SHAPE(k, num_pages, page_size, num_heads_k, head_size / 2);
+    CHECK_SHAPE(v, num_pages, page_size, num_heads_k, head_size_v / 2);
+  } else {
+    CHECK_SHAPE(k, num_pages, page_size, num_heads_k, head_size);
+    CHECK_SHAPE(v, num_pages, page_size, num_heads_k, head_size_v);
+  }
   CHECK_SHAPE(page_table.value(), batch_size_k, max_num_pages_per_seq);
 
   if (leftpad_k_.has_value()) {
@@ -502,6 +512,10 @@ void mha_fwd(
   }
   // Only split when the resolved count is > 1; -1 / 1 fall back to non-split.
   params.use_split_kv = num_kv_splits > 1;
+  // woq mxfp4 KV cache currently supports the non-split decode path only.
+  if (is_mxfp4_kv) {
+    params.use_split_kv = false;
+  }
   if (params.use_split_kv) {
     temp_out = torch::empty({total_q, num_kv_splits * num_heads, head_size_v}, q.options().device(q.device()));
 
@@ -593,6 +607,7 @@ void mha_fwd(
   // (k_descale/v_descale, float32).
   params.is_e4m3 = is_e4m3_kv;
   params.is_e5m2 = is_e5m2_kv;
+  params.is_mxfp4 = is_mxfp4_kv;
   if (is_fp8_kv) {
     TORCH_CHECK(
         k_descale_.has_value() && v_descale_.has_value(), "fp8 KV cache decode requires k_descale and v_descale");
@@ -600,6 +615,27 @@ void mha_fwd(
     // true scalar or a tensor whose elements are all the same repeated value.
     params.k_scale_ptr = get_per_tensor_descale_ptr(k_descale_.value(), k, "k_descale", "fp8 KV cache decode");
     params.v_scale_ptr = get_per_tensor_descale_ptr(v_descale_.value(), v, "v_descale", "fp8 KV cache decode");
+  } else if (is_mxfp4_kv) {
+    // woq mxfp4: k_descale/v_descale carry the E8M0 per-block scales
+    // ([num_pages, page_size, num_heads_k, head_dim/block] uint8).
+    TORCH_CHECK(
+        k_descale_.has_value() && v_descale_.has_value(),
+        "mxfp4 KV cache decode requires k_descale and v_descale (E8M0 block scales)");
+    auto kb = k_descale_.value();
+    auto vb = v_descale_.value();
+    TORCH_CHECK(
+        kb.scalar_type() == at::ScalarType::Byte && vb.scalar_type() == at::ScalarType::Byte,
+        "mxfp4 k_descale/v_descale must be uint8 E8M0 block scales");
+    TORCH_CHECK(kb.dim() == 4 && vb.dim() == 4, "mxfp4 k_descale/v_descale must be 4D [num_pages, page_size, h_kv, blocks]");
+    params.k_block_scale_ptr = reinterpret_cast<const uint8_t*>(kb.data_ptr());
+    params.v_block_scale_ptr = reinterpret_cast<const uint8_t*>(vb.data_ptr());
+    params.k_scale_stride_page = kb.stride(0);
+    params.k_scale_stride_seq = kb.stride(1);
+    params.k_scale_stride_heads = kb.stride(2);
+    params.v_scale_stride_page = vb.stride(0);
+    params.v_scale_stride_seq = vb.stride(1);
+    params.v_scale_stride_heads = vb.stride(2);
+    params.mxfp4_block_size = head_size / static_cast<int>(kb.size(3));
   }
 
   // Set this to probability of keeping an element to simplify things.
@@ -706,6 +742,10 @@ void mha_fwd(
     if (params.is_e4m3 || params.is_e5m2) {
       TORCH_CHECK(params.is_bf16, "fp8 KV cache decode only supports a bf16 query");
       op = params.use_split_kv ? DecodeOp::kSplitDecodeFp8 : DecodeOp::kDecodeFp8;
+      is_fp16 = false;
+    } else if (params.is_mxfp4) {
+      TORCH_CHECK(params.is_bf16, "mxfp4 KV cache decode only supports a bf16 query");
+      op = params.use_split_kv ? DecodeOp::kSplitDecodeMxfp4 : DecodeOp::kDecodeMxfp4;
       is_fp16 = false;
     } else {
       op = params.use_split_kv ? DecodeOp::kSplitDecode : DecodeOp::kDecode;
@@ -978,11 +1018,19 @@ void mha_fwd(
   bool const is_e4m3_kv = k.scalar_type() == at::ScalarType::Float8_e4m3fn;
   bool const is_e5m2_kv = k.scalar_type() == at::ScalarType::Float8_e5m2;
   bool const is_fp8_kv = is_e4m3_kv || is_e5m2_kv;
+  // woq mxfp4 KV cache: K/V are packed E2M1 stored as uint8 (2 nibbles/byte).
+  bool const is_mxfp4_kv = k.scalar_type() == at::ScalarType::Byte;
   if (is_fp8_kv) {
     TORCH_CHECK(
         v.scalar_type() == k.scalar_type(),
         "fp8 KV cache requires key and value to have the same fp8 dtype (both float8_e4m3fn or both float8_e5m2)");
     TORCH_CHECK(k_descale_.has_value() && v_descale_.has_value(), "fp8 KV cache requires k_descale and v_descale");
+  } else if (is_mxfp4_kv) {
+    TORCH_CHECK(
+        v.scalar_type() == at::ScalarType::Byte, "mxfp4 KV cache requires key and value to be uint8 packed E2M1");
+    TORCH_CHECK(
+        k_descale_.has_value() && v_descale_.has_value(),
+        "mxfp4 KV cache requires k_descale and v_descale (E8M0 block scales)");
   } else {
     TORCH_CHECK(k.scalar_type() == q_type, "query and key must have the same dtype");
     TORCH_CHECK(v.scalar_type() == q_type, "query and value must have the same dtype");
@@ -1029,7 +1077,7 @@ void mha_fwd(
   int total_q = q.size(0);
   int num_heads = q.size(-2);
   int const head_size = q.size(-1);
-  int const head_size_v = v.size(-1);
+  int const head_size_v = is_mxfp4_kv ? static_cast<int>(v.size(-1)) * 2 : static_cast<int>(v.size(-1));
   int const max_num_pages_per_seq = page_table.value().size(1);
   int const num_pages = k.size(0);
   int const page_size = k.size(1);
@@ -1061,8 +1109,13 @@ void mha_fwd(
     window_size_right = 0;
   }
 
-  CHECK_SHAPE(k, num_pages, page_size, num_heads_k, head_size);
-  CHECK_SHAPE(v, num_pages, page_size, num_heads_k, head_size_v);
+  if (is_mxfp4_kv) {
+    CHECK_SHAPE(k, num_pages, page_size, num_heads_k, head_size / 2);
+    CHECK_SHAPE(v, num_pages, page_size, num_heads_k, head_size_v / 2);
+  } else {
+    CHECK_SHAPE(k, num_pages, page_size, num_heads_k, head_size);
+    CHECK_SHAPE(v, num_pages, page_size, num_heads_k, head_size_v);
+  }
   CHECK_SHAPE(page_table.value(), batch_size_k, max_num_pages_per_seq);
 
   if (leftpad_k_.has_value()) {
@@ -1146,6 +1199,7 @@ void mha_fwd(
   // FP8 KV cache: flag the kernel dispatch so the fp8 mainloop is selected.
   params.is_e4m3 = is_e4m3_kv;
   params.is_e5m2 = is_e5m2_kv;
+  params.is_mxfp4 = is_mxfp4_kv;
   if (is_fp8_kv) {
     TORCH_CHECK(
         k_descale_.has_value() && v_descale_.has_value(), "fp8 KV cache prefill requires k_descale and v_descale");
@@ -1153,6 +1207,24 @@ void mha_fwd(
     // true scalar or a tensor whose elements are all the same repeated value.
     params.k_scale_ptr = get_per_tensor_descale_ptr(k_descale_.value(), k, "k_descale", "fp8 KV cache prefill");
     params.v_scale_ptr = get_per_tensor_descale_ptr(v_descale_.value(), v, "v_descale", "fp8 KV cache prefill");
+  } else if (is_mxfp4_kv) {
+    // woq mxfp4: k_descale/v_descale carry the E8M0 per-block scales
+    // ([num_pages, page_size, num_heads_k, head_dim/block] uint8).
+    auto kb = k_descale_.value();
+    auto vb = v_descale_.value();
+    TORCH_CHECK(
+        kb.scalar_type() == at::ScalarType::Byte && vb.scalar_type() == at::ScalarType::Byte,
+        "mxfp4 k_descale/v_descale must be uint8 E8M0 block scales");
+    TORCH_CHECK(kb.dim() == 4 && vb.dim() == 4, "mxfp4 k_descale/v_descale must be 4D [num_pages, page_size, h_kv, blocks]");
+    params.k_block_scale_ptr = reinterpret_cast<const uint8_t*>(kb.data_ptr());
+    params.v_block_scale_ptr = reinterpret_cast<const uint8_t*>(vb.data_ptr());
+    params.k_scale_stride_page = kb.stride(0);
+    params.k_scale_stride_seq = kb.stride(1);
+    params.k_scale_stride_heads = kb.stride(2);
+    params.v_scale_stride_page = vb.stride(0);
+    params.v_scale_stride_seq = vb.stride(1);
+    params.v_scale_stride_heads = vb.stride(2);
+    params.mxfp4_block_size = head_size / static_cast<int>(kb.size(3));
   }
 
   // Set this to probability of keeping an element to simplify things.
@@ -1252,6 +1324,10 @@ void mha_fwd(
     if (params.is_e4m3 || params.is_e5m2) {
       TORCH_CHECK(params.is_bf16, "fp8 KV cache prefill only supports a bf16 query");
       op = PrefillOp::kPrefillFp8;
+      is_fp16 = false;
+    } else if (params.is_mxfp4) {
+      TORCH_CHECK(params.is_bf16, "mxfp4 KV cache prefill only supports a bf16 query");
+      op = PrefillOp::kPrefillMxfp4;
       is_fp16 = false;
     } else {
       op = PrefillOp::kPrefill;
@@ -1440,8 +1516,12 @@ SGL_KERNEL_EXPORT void mha_fwd(
   // k and v may be 3D (total_k, h_k, d) for non-paged or 4D (num_pages, page_size, h_k, d)
   // for paged KV cache; sub-functions validate their own shapes.
   TORCH_CHECK(out.scalar_type() == q.scalar_type(), "out dtype must match q dtype");
+  // woq mxfp4 KV cache stores V as packed E2M1 (2 nibbles/byte), so its last dim
+  // is head_size_v / 2; unpack it here to validate against the output.
+  bool const is_mxfp4_kv = v.scalar_type() == at::ScalarType::Byte;
+  int64_t const head_size_v = is_mxfp4_kv ? v.size(-1) * 2 : v.size(-1);
   TORCH_CHECK(
-      out.dim() == 3 && out.size(0) == q.size(0) && out.size(1) == q.size(1) && out.size(2) == v.size(-1),
+      out.dim() == 3 && out.size(0) == q.size(0) && out.size(1) == q.size(1) && out.size(2) == head_size_v,
       "out shape must be [total_q, num_heads, head_size_v]");
   TORCH_CHECK(out.device() == q.device(), "out must be on the same device as q");
   TORCH_CHECK(out.stride(-1) == 1, "out must have a contiguous last dimension");

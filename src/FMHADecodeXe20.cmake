@@ -40,6 +40,11 @@ set(FMHA_DECODE_FP8_TEMPLATE
 set(FMHA_SPLIT_DECODE_FP8_TEMPLATE
     "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe_fmha_fwd_split_decode_fp8_kernel.cpp.in")
 
+# woq mxfp4 KV-cache decode path (packed E2M1 + E8M0 block scale, bf16 query
+# only). Non-split only; the split path forces non-split for mxfp4.
+set(FMHA_DECODE_MXFP4_TEMPLATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_mxfp4_kernel.cpp.in")
+
 # 16-bit query element tags. Each tag produces INDEPENDENT shared libraries for
 # the decode / split-decode / non-paged paths so bf16 and fp16 do not share a
 # translation unit. ELEM_TYPE selects the cutlass query/KV/out element type.
@@ -91,6 +96,12 @@ foreach(QG_SZ ${FMHA_DECODE_QG_SIZES})
                         "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_split_decode_page_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}_${DTFP8}.cpp")
                     configure_file(${FMHA_SPLIT_DECODE_FP8_TEMPLATE} ${GENERATED_SPLIT_FP8_FILE} @ONLY)
                     list(APPEND device_cpp_xe20 ${GENERATED_SPLIT_FP8_FILE})
+
+                    # woq mxfp4 KV cache: bf16 query only, non-split decode only.
+                    set(GENERATED_MXFP4_FILE
+                        "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_page_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}_${ELEM_TAG}_mxfp4.cpp")
+                    configure_file(${FMHA_DECODE_MXFP4_TEMPLATE} ${GENERATED_MXFP4_FILE} @ONLY)
+                    list(APPEND device_cpp_xe20 ${GENERATED_MXFP4_FILE})
                 endif()
             endforeach()
         endforeach()

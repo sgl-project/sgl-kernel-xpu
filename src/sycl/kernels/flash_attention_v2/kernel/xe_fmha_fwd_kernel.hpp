@@ -173,6 +173,19 @@ class XeFMHAFwdKernel {
     // a host-side D2H sync (tensor.item()). Null => non-fp8 KV (scale = 1.0f).
     const float* scale_k_ptr = nullptr;
     const float* scale_v_ptr = nullptr;
+    // mxfp4 (woq) KV: E8M0 per-block dequant scales (uint8). Head-relative base
+    // pointers; the kernel adds the per-(head,batch) offset before slicing. Per
+    // fragment element (k,d) the scale is at [.. , d / mxfp4_block_size]. Null =>
+    // non-mxfp4 KV (block dequant disabled).
+    const uint8_t* k_block_scale_ptr = nullptr;
+    const uint8_t* v_block_scale_ptr = nullptr;
+    int64_t k_scale_stride_page = 0;
+    int64_t k_scale_stride_seq = 0;
+    int64_t k_scale_stride_heads = 0;
+    int64_t v_scale_stride_page = 0;
+    int64_t v_scale_stride_seq = 0;
+    int64_t v_scale_stride_heads = 0;
+    int mxfp4_block_size = 32;
     // Optional softmax LSE output (natural-log log-sum-exp), row-major
     // (num_heads_q, total_q). Null => don't write.
     float* softmax_lse = nullptr;
@@ -227,6 +240,15 @@ class XeFMHAFwdKernel {
         args.kernel.skip_batch_mask,
         args.kernel.scale_k_ptr,
         args.kernel.scale_v_ptr,
+        args.kernel.k_block_scale_ptr,
+        args.kernel.v_block_scale_ptr,
+        args.kernel.k_scale_stride_page,
+        args.kernel.k_scale_stride_seq,
+        args.kernel.k_scale_stride_heads,
+        args.kernel.v_scale_stride_page,
+        args.kernel.v_scale_stride_seq,
+        args.kernel.v_scale_stride_heads,
+        args.kernel.mxfp4_block_size,
         args.kernel.softmax_lse,
         args.kernel.lse_head_stride,
         args.kernel.q_tile_start,
@@ -521,6 +543,15 @@ class XeFMHAFwdKernel {
       if constexpr (CollectiveMainloop::Fp8KV) {
         scale_k = *p.scale_k_ptr;
       }
+      // mxfp4 (woq): head-adjusted E8M0 block-scale bases. Paged KV shares one
+      // cache buffer (no batch dim), so only the KV-head offset is applied; the
+      // physical page/token addressing happens in the mainloop.
+      const uint8_t* k_scale_base = nullptr;
+      const uint8_t* v_scale_base = nullptr;
+      if constexpr (CollectiveMainloop::Mxfp4KV) {
+        k_scale_base = p.k_block_scale_ptr + head * p.k_scale_stride_heads;
+        v_scale_base = p.v_block_scale_ptr + head * p.v_scale_stride_heads;
+      }
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
       mainloop.template operator()<StaticScoreMode_>(
@@ -544,6 +575,8 @@ class XeFMHAFwdKernel {
           K_cache(_, _, head, l_coord),
           V_cache(_, _, head, l_coord),
           scale_k,
+          k_scale_base,
+          v_scale_base,
           score_head_ptr,
           score_region_cols,
           0,
@@ -569,7 +602,9 @@ class XeFMHAFwdKernel {
           discard_seq_coord,
           K_cache(_, _, head, l_coord),
           V_cache(_, _, head, l_coord),
-          scale_k);
+          scale_k,
+          k_scale_base,
+          v_scale_base);
 #endif
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
@@ -750,6 +785,17 @@ class XeFMHAFwdDynamicSplitKernel {
     // scale resolves to 1.0f); present for uniform aggregate initialization.
     const float* scale_k_ptr = nullptr;
     const float* scale_v_ptr = nullptr;
+    // mxfp4 (woq) split-decode: E8M0 block-scale pointers, present for uniform
+    // aggregate initialization (threaded through when the split path supports it).
+    const uint8_t* k_block_scale_ptr = nullptr;
+    const uint8_t* v_block_scale_ptr = nullptr;
+    int64_t k_scale_stride_page = 0;
+    int64_t k_scale_stride_seq = 0;
+    int64_t k_scale_stride_heads = 0;
+    int64_t v_scale_stride_page = 0;
+    int64_t v_scale_stride_seq = 0;
+    int64_t v_scale_stride_heads = 0;
+    int mxfp4_block_size = 32;
   };
   using KernelParams = KernelArguments;
 

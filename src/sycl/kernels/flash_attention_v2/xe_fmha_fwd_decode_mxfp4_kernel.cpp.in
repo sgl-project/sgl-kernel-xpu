@@ -1,0 +1,48 @@
+/***************************************************************************************************
+ * Copyright (C) 2025 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ **************************************************************************************************/
+// Auto-generated from xe_fmha_fwd_decode_mxfp4_kernel.cpp.in
+// Template parameters: QG_SZ=@QG_SZ@, HEAD_DIM=@HEAD_DIM@, PAGE_SIZE=@PAGE_SIZE@, ELEM_TAG=@ELEM_TAG@
+//
+// woq mxfp4 KV-cache decode path. Completely mirrors the fp8 decode kernel
+// (xe_fmha_fwd_decode_fp8_kernel.cpp.in) except the KV element type is packed
+// E2M1 (float_e2m1_t) and the dequant scale is per-block (E8M0) instead of
+// per-tensor; the mainloop applies the block scale after reordering K/V to bf16.
+#define SYCL_INTEL_TARGET 20
+
+#include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
+
+namespace decode {
+
+template <>
+__attribute__((visibility("default"))) void FmhaDecodeMxfp4Runner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@, @ELEM_TYPE@>::operator()(const Arguments& params) const {
+  using TileShapeQK = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@PAGE_SIZE@>, cute::_64>;
+  using TileShapePV = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@PAGE_SIZE@>>;
+  using TileShapeOutput = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;
+  static constexpr int kKvSubgroups = kv_subgroups_for_slm(
+      @PAGE_SIZE@ / 16, @QG_SZ@, ((@HEAD_DIM@ + 31) / 32) * 32);
+  using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<kKvSubgroups>, cute::_1>>;
+
+  // mxfp4 KV cache: Q is bf16 while K/V cache are packed E2M1 with a per-block
+  // E8M0 scale. Sink logits are not supported on the mxfp4 path.
+  TORCH_CHECK(params.is_mxfp4, "FmhaDecodeMxfp4Runner requires an mxfp4 KV cache");
+  TORCH_CHECK(!params.use_sink, "mxfp4 KV cache decode does not support sink logits");
+  AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+    using QElement = @ELEM_TYPE@;
+    DecodeConfig<
+        false, LocalMask, false, /*LSE=*/false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, 1, false,
+        QElement, cutlass::float_e2m1_t, cutlass::float_e2m1_t, QElement>::run_paged(params);
+  });
+}
+
+template struct FmhaDecodeMxfp4Runner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@, @ELEM_TYPE@>;
+
+}  // namespace decode
+
+#ifdef SGL_FMHA_JIT_ENTRY
+extern "C" __attribute__((visibility("default"))) void sgl_fmha_entry(const void* params) {
+  decode::FmhaDecodeMxfp4Runner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@, @ELEM_TYPE@>{}(
+      *static_cast<const decode::Arguments*>(params));
+}
+#endif

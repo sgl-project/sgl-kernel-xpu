@@ -151,6 +151,7 @@ configs = list(
             and (
                 cfg[10] == "bf16"
                 or (cfg[9] not in (0, 1) and not cfg[2] and not cfg[1])
+            )
             and (
                 cfg[11] == "standard"
                 or (

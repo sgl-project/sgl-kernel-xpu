@@ -3,6 +3,7 @@ name: PR Test (XPU)
 on:
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 
 concurrency:
@@ -11,7 +12,12 @@ concurrency:
 
 jobs:
   build-and-test:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    # Ignore labeled events for other labels (perf, etc.). Otherwise a PR that
+    # already has run-ci would restart BMG and cancel the in-flight run.
+    if: >
+      github.event_name != 'pull_request' ||
+      (contains(github.event.pull_request.labels.*.name, 'run-ci') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'run-ci'))
     permissions: write-all
     runs-on: sglang-bmg
     steps:

@@ -1,0 +1,96 @@
+name: Slash Command Handler
+
+on:
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  handle-command:
+    if: >
+      github.event.issue.pull_request &&
+      (startsWith(github.event.comment.body, '/run-ci') ||
+       startsWith(github.event.comment.body, '/rerun-ci'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Handle command
+        env:
+          ACTOR: ${{ github.event.comment.user.login }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          DID_WORK=0
+
+          rerun_latest() {
+            local failed_only="$1"
+            local head_sha run_id status
+            head_sha=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha)
+            IFS=$'\t' read -r run_id status < <(gh api --method GET \
+              "repos/$REPOSITORY/actions/workflows/pr-test-xpu.yml/runs" \
+              -f event=pull_request \
+              -f head_sha="$head_sha" \
+              -f per_page=1 \
+              --jq '[.workflow_runs[0].id, .workflow_runs[0].status] | @tsv')
+            [[ -n "${run_id:-}" && "$run_id" != "null" ]] || return 0
+            [[ "$status" == "completed" ]] || return 0
+            if [[ "$failed_only" == "1" ]]; then
+              gh run rerun "$run_id" --repo "$REPOSITORY" --failed
+            else
+              gh run rerun "$run_id" --repo "$REPOSITORY"
+            fi
+            DID_WORK=1
+          }
+
+          IFS= read -r first_line <<< "$COMMENT_BODY"
+          first_line="${first_line%$'\r'}"
+          first_line="${first_line#"${first_line%%[![:space:]]*}"}"
+          command="${first_line%%[[:space:]]*}"
+          case "$command" in
+            /run-ci|/rerun-ci) ;;
+            *) exit 0 ;;
+          esac
+
+          pr_meta=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" \
+            --jq '[.user.login, ((.head.repo.full_name // "") != .base.repo.full_name)] | @tsv')
+          IFS=$'\t' read -r pr_author is_fork <<< "$pr_meta"
+          same_repo_author=0
+          if [[ "$ACTOR" == "$pr_author" && "$is_fork" == "false" ]]; then
+            same_repo_author=1
+          fi
+          if [[ "$same_repo_author" != "1" ]]; then
+            permission=$(gh api "repos/$REPOSITORY/collaborators/$ACTOR/permission" --jq '.role_name // .permission' 2>/dev/null || true)
+            case "$permission" in
+              write|admin|maintain) ;;
+              *) exit 0 ;;
+            esac
+          fi
+
+          if [[ "$command" == "/run-ci" ]]; then
+            has_label=$(gh api "repos/$REPOSITORY/issues/$PR_NUMBER" \
+              --jq '[.labels[].name] | index("run-ci") != null')
+            if [[ "$has_label" == "true" ]]; then
+              # Label already present: no new labeled event. Rerun current SHA.
+              rerun_latest 0
+            else
+              gh issue edit "$PR_NUMBER" --repo "$REPOSITORY" --add-label run-ci
+              DID_WORK=1
+            fi
+          else
+            rerun_latest 1
+          fi
+
+          [[ "$DID_WORK" == "1" ]] || exit 0
+
+          gh api --method POST \
+            "repos/$REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
+            -f content='+1' >/dev/null

@@ -1,19 +1,3 @@
-"""Benchmark build_tree_kernel_efficient (EAGLE draft-tree metadata) on XPU.
-
-Compares the SYCL kernel against the upstream Triton kernel (sgl_kernel.eagle_utils,
-ported from sglang/kernels/ops/speculative/spec_tree.py) so the baseline is
-exactly what the XPU path runs today (eagle_utils dispatches _is_xpu ->
-sgl_build_tree_kernel_triton).
-
-The Triton baseline times its cumsum too: the Triton kernel takes
-seq_len_prefix_sum as an input, so that launch is part of its cost. The SYCL
-kernel folds the prefix sum into the kernel via a group reduction.
-
-Both providers are timed on identical inputs and their outputs are checked
-against each other once per config before timing, so a regression shows up as a
-correctness failure rather than a misleading speedup.
-"""
-
 import itertools
 
 import pandas as pd
@@ -77,9 +61,7 @@ def run_sycl(
     )
 
 
-# ---------------------------------------------------------------------------
 # Inputs
-# ---------------------------------------------------------------------------
 def gen_draft_tree(bs, topk, num_steps, draft_token_num, device):
     """Simulate the EAGLE draft loop to get a valid (parent_list, selected_index)."""
     scores = torch.rand(bs, topk, dtype=torch.float32, device=device)
@@ -117,16 +99,16 @@ def alloc_bufs(bs, draft_token_num, seq_lens_sum, mode, device):
     return (tree_mask, positions, *retrieve_buf)
 
 
-# Realistic EAGLE / MTP serving shapes: (topk, spec_steps, draft_token_num).
+# (topk, spec_steps, draft_token_num).
 TREE_SHAPES = [
-    (1, 3, 4),  # MTP chain
+    (1, 3, 4),
     (4, 3, 8),
     (4, 3, 16),
     (8, 4, 32),
     (8, 5, 64),
 ]
 BATCH_SIZES = [1, 8, 32, 64, 128, 256]
-SEQ_LEN = 2048  # committed context per request
+SEQ_LEN = 2048
 
 configs = list(itertools.product(BATCH_SIZES, TREE_SHAPES))
 all_results = []
@@ -171,7 +153,6 @@ def benchmark(bs, tree_shape, provider):
         mode,
     )
 
-    # Correctness gate: both providers must agree before we trust the timings.
     ref_bufs = alloc_bufs(bs, draft_token_num, seq_lens_sum, mode, device)
     run_sycl(
         parent_list,

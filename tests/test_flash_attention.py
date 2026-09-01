@@ -2616,5 +2616,349 @@ def test_flash_attn_with_kvcache_out_buffer():
     ), "out-buffer result differs from reference"
 
 
+@pytest.mark.skipif(
+    device.type != "xpu", reason="relative attention requires an XPU device"
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize(
+    "causal,seqlens_q,seqlens_k,extent,num_heads,num_heads_k",
+    [
+        (False, [1], [1], 1, 8, 8),
+        (True, [1], [31], 1, 8, 2),
+        (False, [31], [33], 8, 8, 2),
+        (False, [30], [62], 30, 8, 2),
+        (True, [31], [63], 31, 8, 2),
+        (False, [32], [64], 32, 8, 2),
+        (True, [33], [65], 33, 8, 2),
+        (True, [34], [66], 34, 8, 2),
+        (True, [32], [128], 31, 8, 2),
+        (False, [33], [129], 33, 8, 2),
+        (True, [63], [127], 63, 8, 2),
+        (False, [64], [128], 64, 8, 2),
+        (True, [65], [129], 65, 8, 2),
+        (False, [127], [191], 127, 8, 2),
+        (True, [128], [192], 128, 8, 2),
+        (False, [129], [193], 129, 8, 2),
+        (True, [126], [254], 126, 8, 2),
+        (False, [130], [258], 130, 8, 2),
+        (True, [254], [510], 254, 8, 2),
+        (True, [127], [255], 32, 8, 2),
+        (False, [128], [256], 255, 8, 8),
+        (True, [129], [257], 256, 8, 2),
+        (False, [258], [514], 258, 8, 2),
+        (False, [255], [511], 256, 16, 2),
+        (True, [256], [512], 257, 16, 1),
+        (False, [257], [513], 511, 8, 2),
+        (False, [35, 17], [129, 97], 33, 8, 2),
+        (True, [1, 33], [65, 191], 96, 8, 2),
+        (True, [31, 257], [127, 513], 257, 8, 2),
+        (False, [257, 513], [1025, 2049], 512, 8, 2),
+    ],
+)
+def test_relative_attention(
+    dtype, page_size, causal, seqlens_q, seqlens_k, extent, num_heads, num_heads_k
+):
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    torch.manual_seed(17)
+    head_dim = 128
+    q = torch.randn(sum(seqlens_q), num_heads, head_dim, dtype=torch.float32).to(dtype)
+    k = [
+        torch.randn(seqlen_k, num_heads_k, head_dim, dtype=torch.float32).to(dtype)
+        for seqlen_k in seqlens_k
+    ]
+    v = [torch.randn_like(k_seq) for k_seq in k]
+    pages_per_seq = [math.ceil(seqlen_k / page_size) for seqlen_k in seqlens_k]
+    page_table = torch.empty(
+        (len(k), max(pages_per_seq)), dtype=torch.int32, device=device
+    )
+    k_cache = torch.zeros(
+        (sum(pages_per_seq), page_size, num_heads_k, head_dim),
+        dtype=dtype,
+        device=device,
+    )
+    v_cache = torch.zeros_like(k_cache)
+    page = 0
+    for batch, (k_seq, v_seq, page_count) in enumerate(zip(k, v, pages_per_seq)):
+        page_table[batch, :page_count] = torch.arange(
+            page, page + page_count, dtype=torch.int32, device=device
+        )
+        k_cache[page : page + page_count].flatten(0, 1)[: k_seq.size(0)].copy_(
+            k_seq.to(device)
+        )
+        v_cache[page : page + page_count].flatten(0, 1)[: v_seq.size(0)].copy_(
+            v_seq.to(device)
+        )
+        page += page_count
+
+    dense_rel_bias = torch.zeros(
+        sum(seqlens_q),
+        num_heads,
+        max(pages_per_seq) * page_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    distance = torch.arange(extent, dtype=torch.float32)
+    table = (
+        0.02
+        * torch.arange(1, num_heads + 1, dtype=torch.float32).unsqueeze(1)
+        * torch.cos(distance.unsqueeze(0) / 7.0)
+    )
+    q_start = 0
+    for q_len, k_len in zip(seqlens_q, seqlens_k):
+        for q_idx in range(q_len):
+            row_kv = k_len - q_len + q_idx
+            columns = torch.arange(max(0, row_kv - extent + 1), row_kv + 1)
+            dense_rel_bias[q_start + q_idx, :, columns] = (
+                table[:, row_kv - columns].to(torch.bfloat16).to(device)
+            )
+        q_start += q_len
+
+    reference = torch.empty_like(q, device="cpu")
+    q_start = 0
+    for q_len, k_len, k_seq, v_seq in zip(seqlens_q, seqlens_k, k, v):
+        q_seq = q[q_start : q_start + q_len].float()
+        k_seq = repeat(k_seq.float(), "s h d -> s (h g) d", g=num_heads // num_heads_k)
+        v_seq = repeat(v_seq.float(), "s h d -> s (h g) d", g=num_heads // num_heads_k)
+        scores = torch.einsum("qhd,khd->hqk", q_seq, k_seq) * head_dim**-0.5
+        scores += (
+            dense_rel_bias[q_start : q_start + q_len, :, :k_len]
+            .float()
+            .permute(1, 0, 2)
+            .cpu()
+        )
+        if causal:
+            q_rows = torch.arange(q_len).unsqueeze(1) + k_len - q_len
+            scores.masked_fill_(
+                torch.arange(k_len).unsqueeze(0) > q_rows, float("-inf")
+            )
+        reference[q_start : q_start + q_len] = torch.einsum(
+            "hqk,khd->qhd", torch.softmax(scores, dim=-1), v_seq
+        ).to(dtype)
+        q_start += q_len
+
+    cu_seqlens_q = torch.tensor(
+        [0, *torch.tensor(seqlens_q).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device=device,
+    )
+    out = flash_attn_with_kvcache(
+        q.to(device),
+        k_cache,
+        v_cache,
+        cache_seqlens=torch.tensor(seqlens_k, dtype=torch.int32, device=device),
+        page_table=page_table,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max(seqlens_q),
+        max_seqlen_k=max(seqlens_k),
+        causal=causal,
+        rel_bias=table.to(dtype).to(device).unsqueeze(0).repeat(sum(seqlens_q), 1, 1),
+    )
+    torch.xpu.synchronize()
+    torch.testing.assert_close(
+        out.cpu().float(),
+        reference.float(),
+        rtol=0,
+        atol=1e-2 if dtype == torch.bfloat16 else 1e-3,
+    )
+
+
+@pytest.mark.skipif(
+    device.type != "xpu", reason="relative attention requires an XPU device"
+)
+def test_relative_attention_zero_bias_matches_prefill():
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    torch.manual_seed(23)
+    batch, seqlen_q, seqlen_k, num_heads, head_dim, page_size = 2, 129, 256, 8, 128, 128
+    q = torch.randn(
+        batch * seqlen_q, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k_cache = torch.randn(
+        batch * (seqlen_k // page_size),
+        page_size,
+        num_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    v_cache = torch.randn_like(k_cache)
+    common = dict(
+        cache_seqlens=torch.full((batch,), seqlen_k, dtype=torch.int32, device=device),
+        page_table=torch.arange(
+            batch * (seqlen_k // page_size), dtype=torch.int32, device=device
+        ).view(batch, -1),
+        cu_seqlens_q=torch.arange(
+            0, batch * seqlen_q + 1, seqlen_q, dtype=torch.int32, device=device
+        ),
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        causal=True,
+    )
+    baseline = flash_attn_with_kvcache(q, k_cache, v_cache, **common)
+    relative = flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        rel_bias=torch.zeros(
+            batch * seqlen_q, num_heads, 64, dtype=q.dtype, device=device
+        ),
+        **common,
+    )
+    torch.xpu.synchronize()
+    torch.testing.assert_close(relative.float(), baseline.float(), rtol=0, atol=5e-4)
+
+
+@pytest.mark.skipif(
+    device.type != "xpu", reason="relative attention requires an XPU device"
+)
+def test_relative_attention_decode_pre_sheared_matches_raw():
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    torch.manual_seed(29)
+    batch, seqlen_k, num_heads, num_heads_k, head_dim, page_size, extent = (
+        1,
+        65,
+        8,
+        1,
+        128,
+        64,
+        128,
+    )
+    pages = math.ceil(seqlen_k / page_size)
+    q = torch.randn(batch, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k_cache = torch.randn(
+        batch * pages,
+        page_size,
+        num_heads_k,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    v_cache = torch.randn_like(k_cache)
+    raw_bias = torch.randn(
+        batch, num_heads, extent, dtype=torch.bfloat16, device=device
+    )
+    cols = math.ceil(extent / page_size) * page_size + page_size
+    sheared_bias = torch.zeros(
+        batch, num_heads, cols, dtype=torch.bfloat16, device=device
+    )
+    row_kv = seqlen_k - 1
+    origin = (
+        (row_kv - math.ceil(extent / page_size) * page_size + 1) // page_size
+    ) * page_size
+    for col in range(cols):
+        rel = row_kv - (origin + col)
+        if 0 <= rel < extent:
+            sheared_bias[:, :, col] = raw_bias[:, :, rel]
+
+    common = dict(
+        cache_seqlens=torch.tensor([seqlen_k], dtype=torch.int32, device=device),
+        page_table=torch.arange(batch * pages, dtype=torch.int32, device=device).view(
+            batch, pages
+        ),
+        cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        max_seqlen_q=1,
+        max_seqlen_k=seqlen_k,
+        causal=False,
+    )
+    raw = flash_attn_with_kvcache(q, k_cache, v_cache, rel_bias=raw_bias, **common)
+    sheared = flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        rel_bias=sheared_bias,
+        rel_bias_is_sheared=True,
+        **common,
+    )
+    torch.xpu.synchronize()
+    torch.testing.assert_close(sheared.float(), raw.float(), rtol=0, atol=1e-3)
+
+
+@pytest.mark.skipif(
+    device.type != "xpu", reason="relative attention requires an XPU device"
+)
+@pytest.mark.parametrize(
+    "seqlen_k,extent",
+    [(1, 1), (63, 64), (64, 64), (65, 64), (4097, 128), (4097, 4097), (5120, 192)],
+)
+def test_relative_attention_decode_d512_bias_only_matches_reference_and_pre_sheared(
+    seqlen_k, extent
+):
+    """Cover the Gemma4 D=512 decode specialization from the reference commit."""
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    torch.manual_seed(43 + seqlen_k + extent)
+    batch, num_heads, num_heads_k, head_dim, page_size = 1, 8, 1, 512, 64
+    pages = math.ceil(seqlen_k / page_size)
+    q = torch.zeros(batch, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k_cache = torch.zeros(
+        batch * pages,
+        page_size,
+        num_heads_k,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    v_cache = torch.randn_like(k_cache)
+    table = (
+        torch.arange(1, num_heads + 1, dtype=torch.float32).unsqueeze(1)
+        * torch.linspace(-8.0, 8.0, extent, dtype=torch.float32).unsqueeze(0)
+        / num_heads
+    )
+    raw_bias = table.to(torch.bfloat16).to(device).unsqueeze(0)
+
+    cols = math.ceil(extent / page_size) * page_size + page_size
+    sheared_bias = torch.zeros(
+        batch, num_heads, cols, dtype=torch.bfloat16, device=device
+    )
+    row_kv = seqlen_k - 1
+    origin = (
+        (row_kv - math.ceil(extent / page_size) * page_size + 1) // page_size
+    ) * page_size
+    for col in range(cols):
+        rel = row_kv - (origin + col)
+        if 0 <= rel < extent:
+            sheared_bias[:, :, col] = raw_bias[:, :, rel]
+
+    common = dict(
+        cache_seqlens=torch.tensor([seqlen_k], dtype=torch.int32, device=device),
+        page_table=torch.arange(batch * pages, dtype=torch.int32, device=device).view(
+            batch, pages
+        ),
+        cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        max_seqlen_q=1,
+        max_seqlen_k=seqlen_k,
+        # Gemma4's production decode scale. Keep Q/K zero so the expected
+        # result is determined by relative bias without relying on the
+        # existing D=512 zero-scale edge case in the plain decode kernel.
+        softmax_scale=1.0,
+        causal=False,
+    )
+    raw = flash_attn_with_kvcache(q, k_cache, v_cache, rel_bias=raw_bias, **common)
+    sheared = flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        rel_bias=sheared_bias,
+        rel_bias_is_sheared=True,
+        **common,
+    )
+    v_logical = v_cache.flatten(0, 1)[:seqlen_k, 0].float().cpu()
+    rel = row_kv - torch.arange(seqlen_k)
+    logits = torch.zeros(num_heads, seqlen_k, dtype=torch.float32)
+    in_band = rel < extent
+    logits[:, in_band] = table[:, rel[in_band]]
+    weights = torch.softmax(logits, dim=-1)
+    reference = torch.einsum("hk,kd->hd", weights, v_logical).to(torch.bfloat16)
+
+    torch.xpu.synchronize()
+    torch.testing.assert_close(
+        raw.cpu().float()[0], reference.float(), rtol=0, atol=2e-2
+    )
+    torch.testing.assert_close(sheared.float(), raw.float(), rtol=0, atol=2e-2)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

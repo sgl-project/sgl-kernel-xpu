@@ -35,6 +35,7 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include "kernels/flash_attention_v2/relative_attention.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_prefill_dispatch.hpp"
 #ifdef USE_FMHA_JIT
@@ -322,7 +323,9 @@ void mha_fwd(
     // which batches this launch processes.
     at::Tensor& out,
     std::optional<at::Tensor>& softmax_lse,
-    std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt) {
+    std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt,
+    std::optional<const at::Tensor> rel_bias_ = std::nullopt,
+    bool rel_bias_is_sheared = false) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
       q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
@@ -353,6 +356,7 @@ void mha_fwd(
   // the decode-specific non-paged entry (decode::mha_fwd_nopage) so it can carry
   // its own parameter configuration independently of the prefill path.
   if (!page_table.has_value()) {
+    TORCH_CHECK(!rel_bias_.has_value(), "relative attention requires paged KV cache");
     mha_fwd_nopage(
         q,
         k,
@@ -408,6 +412,27 @@ void mha_fwd(
   static constexpr int max_headdim = 512;
   TORCH_CHECK(head_size <= max_headdim, "FlashAttention forward only supports head dimension at most ", max_headdim);
   TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+  if (rel_bias_.has_value()) {
+    TORCH_CHECK(!softmax_lse.has_value(), "relative attention does not support softmax LSE");
+    const at::Tensor& rel_bias = rel_bias_.value();
+    TORCH_CHECK(
+        (head_size == 128 || head_size == 512) && head_size_v == head_size,
+        "relative attention requires head_dim=head_dim_v of 128 or 512");
+    TORCH_CHECK(!is_fp8_kv, "relative attention does not support fp8 KV cache");
+    TORCH_CHECK(rel_bias.scalar_type() == q.scalar_type(), "relative bias must have the same dtype as query");
+    TORCH_CHECK(rel_bias.device() == q.device(), "relative bias must be on the same device as query");
+    TORCH_CHECK(rel_bias.dim() == 3, "relative bias must have shape [total_q, num_heads, extent]");
+    TORCH_CHECK(
+        rel_bias.size(0) == total_q && rel_bias.size(1) == num_heads,
+        "relative bias must have shape [total_q, num_heads, extent]");
+    TORCH_CHECK(rel_bias.is_contiguous(), "relative bias must be contiguous");
+    TORCH_CHECK(rel_bias.size(-1) > 0, "relative bias extent must be positive");
+    if (rel_bias_is_sheared) {
+      TORCH_CHECK(
+          rel_bias.size(-1) > page_size && rel_bias.size(-1) % page_size == 0,
+          "pre-sheared relative bias must have a page-size-aligned decode surface width");
+    }
+  }
 
   // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
   // TODO: check this
@@ -551,6 +576,23 @@ void mha_fwd(
   params.o_ptr = out.data_ptr();
   params.o_row_stride = out.stride(-3);
   params.o_head_stride = out.stride(-2);
+  at::Tensor sheared_rel_bias;
+  if (rel_bias_.has_value()) {
+    const at::Tensor& rel_bias = rel_bias_.value();
+    if (rel_bias_is_sheared) {
+      sheared_rel_bias = rel_bias;
+    } else if (q.scalar_type() == at::ScalarType::BFloat16) {
+      sheared_rel_bias = flash_attention_v2::relative_attention::prepare_decode_bias<at::BFloat16>(
+          rel_bias, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, page_size);
+    } else {
+      sheared_rel_bias = flash_attention_v2::relative_attention::prepare_decode_bias<at::Half>(
+          rel_bias, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, page_size);
+    }
+    params.rel_bias_ptr = sheared_rel_bias.data_ptr();
+    params.rel_bias_token_stride = sheared_rel_bias.stride(0);
+    params.rel_bias_head_stride = sheared_rel_bias.stride(1);
+    params.rel_bias_extent = rel_bias_is_sheared ? rel_bias.size(-1) - page_size : rel_bias.size(-1);
+  }
 
   // Per-batch skip mask for the chunkprefill two-launch path
   // (vllm-xpu-kernels#218). When provided, decode skips batches where
@@ -965,7 +1007,8 @@ void mha_fwd(
     // which batches this launch processes.
     at::Tensor& out,
     std::optional<at::Tensor>& softmax_lse,
-    std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt) {
+    std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt,
+    std::optional<const at::Tensor> rel_bias_ = std::nullopt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
       q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
@@ -993,6 +1036,7 @@ void mha_fwd(
 
   // Non-paged (page_table == nullopt) prefill: contiguous ragged KV cache.
   if (!page_table.has_value()) {
+    TORCH_CHECK(!rel_bias_.has_value(), "relative attention requires paged KV cache");
     mha_fwd_nopage(
         q,
         k,
@@ -1048,6 +1092,20 @@ void mha_fwd(
   static constexpr int max_headdim = 512;
   TORCH_CHECK(head_size <= max_headdim, "FlashAttention forward only supports head dimension at most ", max_headdim);
   TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+  if (rel_bias_.has_value()) {
+    TORCH_CHECK(!softmax_lse.has_value(), "relative attention does not support softmax LSE");
+    const at::Tensor& rel_bias = rel_bias_.value();
+    TORCH_CHECK(head_size == 128 && head_size_v == 128, "relative attention requires head_dim=head_dim_v=128");
+    TORCH_CHECK(!is_fp8_kv, "relative attention does not support fp8 KV cache");
+    TORCH_CHECK(rel_bias.scalar_type() == q.scalar_type(), "relative bias must have the same dtype as query");
+    TORCH_CHECK(rel_bias.device() == q.device(), "relative bias must be on the same device as query");
+    TORCH_CHECK(rel_bias.dim() == 3, "relative bias must have shape [total_q, num_heads, extent]");
+    TORCH_CHECK(
+        rel_bias.size(0) == total_q && rel_bias.size(1) == num_heads,
+        "relative bias must have shape [total_q, num_heads, extent]");
+    TORCH_CHECK(rel_bias.is_contiguous(), "relative bias must be contiguous");
+    TORCH_CHECK(rel_bias.size(-1) > 0, "relative bias extent must be positive");
+  }
 
   // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
   // TODO: check this
@@ -1111,6 +1169,21 @@ void mha_fwd(
   params.o_ptr = out.data_ptr();
   params.o_row_stride = out.stride(-3);
   params.o_head_stride = out.stride(-2);
+  at::Tensor sheared_rel_bias;
+  if (rel_bias_.has_value()) {
+    const at::Tensor& rel_bias = rel_bias_.value();
+    if (q.scalar_type() == at::ScalarType::BFloat16) {
+      sheared_rel_bias = flash_attention_v2::relative_attention::prepare_bias<at::BFloat16>(
+          rel_bias, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k);
+    } else {
+      sheared_rel_bias = flash_attention_v2::relative_attention::prepare_bias<at::Half>(
+          rel_bias, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k);
+    }
+    params.rel_bias_ptr = sheared_rel_bias.data_ptr();
+    params.rel_bias_token_stride = sheared_rel_bias.stride(0);
+    params.rel_bias_head_stride = sheared_rel_bias.stride(1);
+    params.rel_bias_extent = rel_bias.size(-1);
+  }
 
   // Per-batch skip mask for the chunkprefill two-launch dispatcher.
   params.skip_batch_mask_ptr = skip_batch_mask_opt.has_value() ? skip_batch_mask_opt->data_ptr() : nullptr;
@@ -1355,7 +1428,7 @@ void mha_fwd(
   // Forward every shared argument to a sub-kernel, overriding only the per-batch
   // skip mask. Both launches write into the same caller-provided ``out`` and
   // ``softmax_lse`` buffers.
-  auto launch = [&](auto&& fn, std::optional<at::Tensor> skip_mask) {
+  auto launch = [&](auto&& fn, std::optional<at::Tensor> skip_mask, auto&&... tail) {
     fn(q,
        k,
        v,
@@ -1386,17 +1459,18 @@ void mha_fwd(
        sm_margin,
        out,
        softmax_lse,
-       std::move(skip_mask));
+       std::move(skip_mask),
+       std::forward<decltype(tail)>(tail)...);
   };
 
   // Launch 1: decode writes the decode rows of ``out`` (and, when requested, of
   // ``softmax_lse``) and skips prefill batches, leaving their rows untouched.
-  launch(decode::mha_fwd, is_prefill);
+  launch(decode::mha_fwd, is_prefill, std::nullopt, false);
   // Launch 2: prefill writes the prefill rows into the same buffers and skips
   // decode batches. The two complementary skip masks partition every query token
   // across the launches, so the shared buffers end up fully written with no
   // stitching or extra copies needed.
-  launch(prefill::mha_fwd, is_prefill.logical_not());
+  launch(prefill::mha_fwd, is_prefill.logical_not(), std::nullopt);
 }
 
 }  // namespace chunkprefill
@@ -1435,7 +1509,9 @@ SGL_KERNEL_EXPORT void mha_fwd(
     // requests the logsumexp be computed and written; std::nullopt skips the
     // LSE computation entirely.
     at::Tensor& out,
-    std::optional<at::Tensor>& softmax_lse) {
+    std::optional<at::Tensor>& softmax_lse,
+    std::optional<const at::Tensor>& rel_bias_,
+    bool rel_bias_is_sheared) {
   TORCH_CHECK(q.dim() == 3, "query must be in ragged format (total_q, h, d)");
   // k and v may be 3D (total_k, h_k, d) for non-paged or 4D (num_pages, page_size, h_k, d)
   // for paged KV cache; sub-functions validate their own shapes.
@@ -1503,8 +1579,15 @@ SGL_KERNEL_EXPORT void mha_fwd(
   bool const is_uniform_qlen = batch_size > 0 && q.size(0) == batch_size * static_cast<int64_t>(max_seqlen_q);
 
   if (max_seqlen_q == 1) {
-    // Pure decode path
-    dispatch(decode::mha_fwd, std::nullopt);
+    // Pure decode path. Decode also supports the pre-sheared relative-bias fast
+    // path, so forward both relative-bias tail arguments.
+    dispatch(decode::mha_fwd, std::nullopt, rel_bias_, rel_bias_is_sheared);
+  } else if (rel_bias_.has_value()) {
+    TORCH_CHECK(!rel_bias_is_sheared, "pre-sheared relative bias is supported only for decode");
+    // Relative bias currently bypasses chunkprefill. For any request with
+    // max_seqlen_q > 1, use the prefill sheared-bias layout for all rows,
+    // including q_len == 1 rows in a mixed batch.
+    dispatch(prefill::mha_fwd, std::nullopt, rel_bias_);
   } else if (!page_table.has_value() || is_uniform_qlen) {
     // Pure prefill path
     //
@@ -1516,7 +1599,7 @@ SGL_KERNEL_EXPORT void mha_fwd(
     //
     // This condition is sufficient but not necessary: a non-uniform
     // all-prefill batch falls through to chunkprefill, which is still correct.
-    dispatch(prefill::mha_fwd, std::nullopt);
+    dispatch(prefill::mha_fwd, std::nullopt, std::nullopt);
   } else {
     // Non-uniform paged batches fall back to chunkprefill.
     dispatch(chunkprefill::mha_fwd);

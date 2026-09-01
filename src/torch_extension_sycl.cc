@@ -360,7 +360,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    bool?    pack_gqa,"
       "    int      sm_margin,"
       "    Tensor(a!)  out,"
-      "    Tensor(b!)?  softmax_lse) -> ()");
+      "    Tensor(b!)?  softmax_lse,"
+      "    Tensor?  rel_bias=None,"
+      "    bool     rel_bias_is_sheared=False) -> ()");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
 #endif  // USE_FMHA
 

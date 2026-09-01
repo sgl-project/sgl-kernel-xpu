@@ -1500,20 +1500,25 @@ SGL_KERNEL_EXPORT void mha_fwd(
        std::forward<decltype(tail)>(tail)...);
   };
 
+  bool const is_uniform_qlen = batch_size > 0 && q.size(0) == batch_size * static_cast<int64_t>(max_seqlen_q);
+
   if (max_seqlen_q == 1) {
     // Pure decode path
     dispatch(decode::mha_fwd, std::nullopt);
-  } else if (!page_table.has_value() || batch_size == 1) {
+  } else if (!page_table.has_value() || is_uniform_qlen) {
     // Pure prefill path
-    // Non-paged attn: assumption of all seqlen_q > 1;
-    // Paged attn: Proving "all prefill" for batch_size > 1 would require
-    // is_prefill.all() — a device reduction + D2H sync that costs more than it saves.
-    // But batch_size == 1 makes it provable from host scalars:
-    // a single sequence with max_seqlen_q > 1 is prefill
+    //
+    // For ragged Q, q.size(0) == sum(seqlen_q). Since every
+    // seqlen_q <= max_seqlen_q, equality with
+    // batch_size * max_seqlen_q implies that every query length
+    // equals max_seqlen_q. Since max_seqlen_q > 1 on this branch,
+    // every row is prefill.
+    //
+    // This condition is sufficient but not necessary: a non-uniform
+    // all-prefill batch falls through to chunkprefill, which is still correct.
     dispatch(prefill::mha_fwd, std::nullopt);
   } else {
-    // Chunk prefill path
-    // Paged attn with max_seqlen_q > 1 and batch_size > 1
+    // Non-uniform paged batches fall back to chunkprefill.
     dispatch(chunkprefill::mha_fwd);
   }
 }

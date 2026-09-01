@@ -2960,5 +2960,52 @@ def test_relative_attention_decode_d512_bias_only_matches_reference_and_pre_shea
     torch.testing.assert_close(sheared.float(), raw.float(), rtol=0, atol=2e-2)
 
 
+@pytest.mark.skipif(device.type != "xpu", reason="XPU not available")
+def test_flash_attn_with_kvcache_page_size_1():
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    torch.random.manual_seed(42)
+    batch_size, nheads_q, nheads_kv, d = 2, 4, 2, 64
+    dtype = torch.bfloat16
+    cache_seqlens = torch.tensor([3, 5], dtype=torch.int32, device=device)
+    page_table = torch.tensor(
+        [[7, 2, 9, 0, 0], [4, 1, 8, 3, 6]],
+        dtype=torch.int32,
+        device=device,
+    )
+    q = torch.randn(batch_size, 1, nheads_q, d, device=device, dtype=dtype)
+    k_cache = torch.randn(10, 1, nheads_kv, d, device=device, dtype=dtype)
+    v_cache = torch.randn(10, 1, nheads_kv, d, device=device, dtype=dtype)
+    out_buf = torch.empty(batch_size, nheads_q, d, device=device, dtype=dtype)
+
+    out, lse = flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        out=out_buf,
+        return_softmax_lse=True,
+    )
+
+    scale = d**-0.5
+    out_ref = torch.empty_like(out)
+    lse_ref = torch.empty(nheads_q, batch_size, device=device, dtype=torch.float32)
+    for batch_idx, seqlen_k in enumerate(cache_seqlens.tolist()):
+        slots = page_table[batch_idx, :seqlen_k].long()
+        k = k_cache[slots, 0].repeat_interleave(nheads_q // nheads_kv, dim=1)
+        v = v_cache[slots, 0].repeat_interleave(nheads_q // nheads_kv, dim=1)
+        scores = torch.einsum("hd,shd->hs", q[batch_idx, 0].float(), k.float()) * scale
+        out_ref[batch_idx] = torch.einsum(
+            "hs,shd->hd", torch.softmax(scores, dim=-1), v.float()
+        ).to(dtype)
+        lse_ref[:, batch_idx] = torch.logsumexp(scores, dim=-1)
+
+    torch.xpu.synchronize()
+    assert out.data_ptr() == out_buf.data_ptr()
+    torch.testing.assert_close(out, out_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(lse, lse_ref, atol=3e-2, rtol=3e-2)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

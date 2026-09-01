@@ -117,7 +117,10 @@ head_dim_paged = [64, 128, 256, 512]
 num_heads_q = [16]
 num_heads_kv = [4, 8]
 kv_seq_length_range = [4096]
-page_size_range = [0, 128]
+# page_size=0 -> non-paged varlen path; page_size=1 -> paged kernel has no
+# page_size==1 variant, so this exercises the gather-and-varlen workaround;
+# page_size=128 -> native paged kernel path.
+page_size_range = [0, 1, 128]
 # KV cache element type: "bf16" (default) or fp8. FP8 has two formats,
 # e5m2 and e4m3; both are exercised ("fp8_e4m3" / "fp8_e5m2"), dequantized
 # in-kernel via per-tensor k_descale / v_descale. fp8 only runs on the paged
@@ -135,14 +138,20 @@ configs = list(
             and (cfg[6] % cfg[7] == 0)
             # Condition 4: kv_seq_length >= page_size
             and (cfg[8] >= cfg[9])
-            # Condition 5: no_page mode (page_size=0) does not support sink logits
-            and (cfg[9] != 0 or not cfg[2])
+            # Condition 5: no_page mode (page_size=0) and the page_size=1
+            # workaround both dispatch to the non-paged kernel, which does
+            # not support sink logits
+            and (cfg[9] not in (0, 1) or not cfg[2])
             # Condition 6: sink is only supported for head_size == 64
             and (not cfg[2] or cfg[5] == 64)
-            # Condition 7: fp8 KV cache requires the paged path and is exercised
-            # without sinks / local masking (matches the supported fp8 path)
-            and (cfg[10] == "bf16" or (cfg[9] != 0 and not cfg[2] and not cfg[1]))
-            # Condition 8: relative attention is paged BF16 prefill at head_dim 128.
+            # Condition 7: fp8 KV cache requires the native paged kernel and is
+            # exercised without sinks / local masking (matches the supported
+            # fp8 path); page_size=1 falls back to the non-paged kernel so it
+            # is excluded like page_size=0
+            and (
+                cfg[10] == "bf16"
+                or (cfg[9] not in (0, 1) and not cfg[2] and not cfg[1])
+            )
             and (
                 cfg[11] == "standard"
                 or (

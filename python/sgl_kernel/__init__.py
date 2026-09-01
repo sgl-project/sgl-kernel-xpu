@@ -113,6 +113,7 @@ from sgl_kernel.inkling_attn_prologue import (
     inkling_attn_prologue_extend,
     inkling_attn_prologue_verify,
 )
+from sgl_kernel.inkling_rel_proj import rel_proj_small_t
 from sgl_kernel.inkling_sconv import (
     causal_conv1d,
     fused_causal_conv1d_update_decode,

@@ -13,32 +13,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-// EAGLE speculative-decoding tree builder (build_tree_kernel_efficient).
-//
-// Semantics are those of the upstream Triton kernel
-// (sglang/kernels/ops/speculative/spec_tree.py:sgl_build_tree_kernel_efficient_triton),
-// but the work is reorganized for XPU:
-//
-//   * Triton runs one *serial* program per batch item. Here a whole work-group
-//     owns one batch item and every draft token is a work-item, so the per-node
-//     work (ancestor walk, mask row, sibling links) runs in parallel.
-//   * The parent of each node is resolved once into `parent_pos` in shared local
-//     memory. Triton instead re-runs the O(draft_token_num) linear search over
-//     `selected_index` at every step of every ancestor walk, i.e. it does
-//     O(N^2 * depth) global loads per batch item where this does O(N^2) local
-//     ones (N = draft_token_num).
-//   * The sibling links are computed directly rather than by the serial
-//     head-insertion Triton uses. Head-inserting nodes N-1..1 leaves, for each
-//     parent p with ascending children i1<i2<...<ik:
-//         next_token[p] = i1,  next_sibling[i_j] = i_{j+1},  next_sibling[i_k] = -1
-//     which is a per-node scan and needs no cross-node ordering.
-//
-// Node numbering: 0 is the root (the bonus token); node i >= 1 corresponds to
-// slot i-1 of `selected_index`. `parent_pos[i]` is the *node* index of i's
-// parent, 0 when the parent is the root, and kParentNotFound when the parent
-// token is absent from `selected_index` (Triton reads out of bounds / stops the
-// walk in that case; we stop the walk and drop the link, which is well defined).
-
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
@@ -52,7 +26,6 @@ limitations under the License.
 
 namespace {
 
-// Mirrors sglang.srt.speculative.eagle_utils.TreeMaskMode.
 enum class TreeMaskMode : int64_t {
   FULL_MASK = 0,
   QLEN_ONLY = 1,
@@ -60,39 +33,22 @@ enum class TreeMaskMode : int64_t {
 };
 
 constexpr int32_t kParentNotFound = -1;
-// Above this, a node's ancestor/child set no longer fits one uint64_t bitmask;
-// the sibling/child lookup and the mask write both fall back to their O(N)
-// per-node scan below instead.
 constexpr int32_t kBitmaskFastPathMaxNodes = 64;
 
-// The mask write packs several tree_mask columns into one store, which only
-// works if a bool is one byte and `true` is 0x01 (Itanium ABI / SPIR-V).
 static_assert(sizeof(bool) == 1, "tree_mask pack stores assume 1-byte bool");
 
-// Widest mask pack the host will instantiate, in 32-bit words: 4 words is 16
-// bytes, one Intel Xe LSC OWord message.
+// 4 words = 16 bytes = one Intel Xe LSC OWord message.
 constexpr int32_t kMaxMaskPackWords = 4;
 
-// Expand the low 4 bits of `bits` into 4 bool bytes -- byte j is bit j as 0x00
-// or 0x01, exactly what `static_cast<bool>` would have stored, so one 32-bit
-// word of a pack is one nibble of the ancestor mask.
-//
-// Multiplying by 0x00204081 (= sum_k 2^(7k), k = 0..3) puts bit j at bit 8j:
-// the copy of the constant shifted by j contributes 2^(j + 7j), and no two
-// contributions collide, so the product is a plain OR that the 0x01010101 mask
-// then trims down to the byte lanes. Kept per nibble so this stays a 32-bit
-// multiply -- Xe has no native 64-bit multiply.
+// Expand the low 4 bits of `bits` into 4 bool bytes (byte j = bit j as 0x00/0x01).
+// Per nibble so this stays a 32-bit multiply -- Xe has no native 64-bit multiply.
 inline uint32_t expand_mask_nibble(uint32_t bits) {
   return ((bits & 0xFu) * 0x00204081u) & 0x01010101u;
 }
 
 template <typename seq_t, int kPackWords>
 struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
-  // Same sycl::vec<uint32_t, N> + reinterpret_cast + store(offset, ptr) idiom as
-  // src/sycl/KVCache.cpp:44 -- a native sycl::vec<bool, N> is not a legal vector
-  // element type, and offset being in units of the whole pack is exactly the
-  // indexing the mask write wants. The width comes from the host (see
-  // can_vectorize_up_to at the launch site).
+  // uint32 vec, not sycl::vec<bool, N>: bool is not a legal vector element type.
   using MaskPack = sycl::vec<uint32_t, kPackWords>;
   static constexpr int32_t kPackCols = static_cast<int32_t>(sizeof(MaskPack));
 
@@ -137,17 +93,13 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     child_ = sycl::local_accessor<uint64_t, 1>(sycl::range<1>(draft_token_num_), cgh);
   }
 
-  // Node index of `node`'s parent, or kParentNotFound. `sel_local` is this
-  // group's `selected_index` row staged in SLM (see operator()); every lane
-  // scans it, so keeping it local avoids an O(N^2) global-memory scan per
-  // group.
   inline int32_t resolve_parent(const int64_t* sel_local, int64_t bid, int32_t node) const {
     const int32_t parent_tb_idx = static_cast<int32_t>(sel_local[node - 1] / topk_);
     if (parent_tb_idx == 0) {
-      return 0;  // child of the root
+      return 0;
     }
-    // Triton indexes parent_list unconditionally; an out-of-range table index
-    // would read past the end, so treat it as "no parent" instead.
+    // Triton indexes parent_list unconditionally; treat out-of-range as "no
+    // parent" rather than reading past the end.
     if (parent_tb_idx < 0 || parent_tb_idx >= parent_list_width_) {
       return kParentNotFound;
     }
@@ -162,15 +114,7 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   }
 
   void operator()(sycl::nd_item<1> item) const {
-    // Splitting one request's row range across `row_blocks_` groups (see the
-    // host-side launch) keeps small batches from leaving most compute units
-    // idle: phases 1-3 are cheap enough to redo per block, and only the mask
-    // write -- the part actually worth parallelizing further -- is
-    // partitioned by row.
-    // Xe has no native integer divide, so skip it entirely for the common
-    // case (row_blocks_ == 1, i.e. every batch large enough to already fill
-    // the machine) rather than pay an emulated div/mod on every launch for a
-    // split that isn't happening.
+    // Xe has no native integer divide: skip it entirely for row_blocks_ == 1.
     const int64_t group_id = item.get_group(0);
     const int64_t bid = row_blocks_ == 1 ? group_id : group_id / row_blocks_;
     const int32_t blk = row_blocks_ == 1 ? 0 : static_cast<int32_t>(group_id % row_blocks_);
@@ -188,9 +132,6 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     uint64_t* ancestor_mask = ancestor_mask_.get_multi_ptr<sycl::access::decorated::no>().get();
     uint64_t* child = child_.get_multi_ptr<sycl::access::decorated::no>().get();
 
-    // Stage this request's selected_index row in SLM once; resolve_parent's
-    // O(N) scan then hits local memory from every lane instead of re-reading
-    // global memory O(N^2) times per group.
     const int64_t* sel_global = selected_index_ + bid * selected_index_stride_;
 #pragma unroll 2
     for (int32_t p = tid; p < num_nodes - 1; p += lrange) {
@@ -198,9 +139,8 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     }
 
     // FULL_MASK rows are (seq_len + draft_token_num) wide and packed per batch
-    // item, so the row base needs sum(seq_len[0:bid]). One work-group owns one
-    // batch item, so reduce the prefix across the group instead of paying for a
-    // separate cumsum launch.
+    // item, so the row base needs sum(seq_len[0:bid]). Reduce that prefix in the
+    // group rather than paying for a separate cumsum launch.
     int64_t mask_base = 0;
     int64_t row_stride = num_nodes;
     int64_t col_offset = 0;
@@ -219,7 +159,6 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     }
     sycl::group_barrier(item.get_group());
 
-    // Phase 1: resolve every node's parent into SLM.
 #pragma unroll 2
     for (int32_t i = tid; i < num_nodes; i += lrange) {
       parent_pos[i] = (i == 0) ? kParentNotFound : resolve_parent(sel_local, bid, i);
@@ -228,17 +167,14 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
     const int64_t out_base = bid * num_nodes;
 
-    // Phase 2: retrieve_index is the identity over the flattened draft tokens.
 #pragma unroll 2
     for (int32_t i = tid; i < num_nodes; i += lrange) {
       retrieve_index_[out_base + i] = out_base + i;
     }
 
-    // Phase 3: first child of node i, and i's next sibling.
     if (num_nodes <= kBitmaskFastPathMaxNodes) {
-      // Same trick as the mask write below: a node's children fit one
-      // uint64_t bitmask, so "first child" / "next sibling" become a masked
-      // ctz instead of an O(N) scan per node (O(N^2) per group total).
+      // Children fit one uint64_t, so first-child / next-sibling are a masked
+      // ctz instead of an O(N) scan per node.
 #pragma unroll 2
       for (int32_t i = tid; i < num_nodes; i += lrange) {
         child[i] = 0ull;
@@ -263,8 +199,6 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
         int64_t next_sibling = -1;
         if (i > 0 && parent_pos[i] != kParentNotFound) {
-          // Bits above i among i's siblings (i itself is always set); i == 63
-          // is the top of the bitmask, so it never has a sibling above it.
           const uint64_t above = (i >= 63) ? 0ull : (child[parent_pos[i]] & ~((1ull << (i + 1)) - 1));
           if (above) {
             next_sibling = static_cast<int64_t>(sycl::ctz(above));
@@ -299,21 +233,14 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       }
     }
 
-    // Phase 4: mask row for node i, plus its position (= depth in the tree).
     // Every tree cell is written here, so the caller's prefix fill (which only
-    // supplies the [0, seq_len) columns) never affects this block. The mask is
-    // `bs*N^2` bytes -- the single largest thing the kernel touches -- so its
-    // access pattern dominates the kernel's bandwidth.
+    // supplies the [0, seq_len) columns) never affects this block.
     if (num_nodes <= kBitmaskFastPathMaxNodes) {
-      // Each node's ancestor set fits one uint64_t: build it in a register,
-      // stash it to SLM, then sweep rows with consecutive lanes writing
-      // consecutive columns of the same row (coalesced), instead of each lane
-      // owning a whole row (row_stride apart -- the worst-case store pattern).
 #pragma unroll 2
       for (int32_t i = row_start + tid; i < row_end; i += lrange) {
         if (i == 0) {
           positions_[out_base] = seq_len;
-          ancestor_mask[0] = 1ull;  // every draft token attends the root
+          ancestor_mask[0] = 1ull;
           continue;
         }
         uint64_t m = 1ull;
@@ -325,7 +252,7 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
           m |= 1ull << cur;
           const int32_t parent = parent_pos[cur];
           if (parent <= 0) {
-            break;  // 0 -> reached the root (already marked); -1 -> unresolved
+            break;  // 0 -> root (already marked); -1 -> unresolved
           }
           cur = parent;
         }
@@ -333,25 +260,12 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         positions_[out_base + i] = seq_len + node_depth;
       }
       sycl::group_barrier(item.get_group());
-      // Write kPackCols columns per store instead of one bool byte at a time:
-      // kPackCols consecutive cells of a row are just expanded nibbles of `m`.
-      // Two things have to line up for that to be a win.
-      //
-      //  * Lane count. lrange >= num_nodes always (see the host launch), so the
-      //    byte loop below already has every lane writing a different column of
-      //    the same row -- fully coalesced, nothing idle. Widening the store
-      //    without also handing each lane a *different row* would just idle
-      //    lanes: only num_nodes/kPackCols of them would have a pack to write.
-      //    So the packed path folds rows into the lane space -- lane tid owns
-      //    pack (tid % packs_per_row) of row (tid / packs_per_row) and strides
-      //    by lrange/packs_per_row rows.
-      //  * Alignment. A row starts col_offset (= seq_len under FULL_MASK) into
-      //    the row and vec::store needs natural alignment, so the pack path is
-      //    only legal when every row this group touches is pack-aligned.
-      //    mask_base + col_offset and row_stride are both group-uniform, so one
-      //    check covers all of them and the branch never diverges; when it
-      //    fails the byte loop writes the whole mask and correctness never
-      //    depends on alignment.
+
+      // Packed path folds rows into the lane space -- lane tid owns pack
+      // (tid % packs_per_row) of row (tid / packs_per_row) -- so widening the
+      // store does not idle lanes. It needs every row this group touches to be
+      // pack-aligned; mask_base + col_offset and row_stride are group-uniform,
+      // so one non-diverging check covers all of them.
       const int32_t packs_per_row = num_nodes / kPackCols;
       const bool pack_aligned = packs_per_row > 0 && ((mask_base + col_offset) % kPackCols == 0) &&
                                 (row_stride % kPackCols == 0) &&
@@ -359,8 +273,6 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       const int32_t packed_cols = pack_aligned ? packs_per_row * kPackCols : 0;
 
       if (pack_aligned) {
-        // packs_per_row <= num_nodes / 4 <= 16 < 32 <= lrange, so row_step >= 2
-        // and every pack of every row is covered; the max() is just a guard.
         const int32_t row_step = sycl::max(lrange / packs_per_row, 1);
         const int32_t lane_row = tid / packs_per_row;
         const int32_t lane_pack = tid - lane_row * packs_per_row;
@@ -380,8 +292,7 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         }
       }
 
-      // Columns the packs did not cover: all of them when the pack path is off,
-      // otherwise just the num_nodes % kPackCols tail.
+      // All columns when the pack path is off, otherwise the num_nodes % kPackCols tail.
       if (packed_cols < num_nodes) {
 #pragma unroll 2
         for (int32_t row = row_start; row < row_end; ++row) {
@@ -401,7 +312,7 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         for (int32_t c = 0; c < num_nodes; ++c) {
           row[c] = false;
         }
-        row[0] = true;  // every draft token attends the root
+        row[0] = true;
 
         if (i == 0) {
           positions_[out_base] = seq_len;
@@ -416,7 +327,7 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
           row[cur] = true;
           const int32_t parent = parent_pos[cur];
           if (parent <= 0) {
-            break;  // 0 -> reached the root (already marked); -1 -> unresolved
+            break;  // 0 -> root (already marked); -1 -> unresolved
           }
           cur = parent;
         }
@@ -515,8 +426,8 @@ SGL_KERNEL_EXPORT void build_tree_kernel_efficient(
         out.numel());
   }
 
-  // parent_list is (bs, width); organize_draft_results emits (bs, 0) when there
-  // are no non-root parents (single-step MTP), which must stay legal.
+  // organize_draft_results emits (bs, 0) when there are no non-root parents
+  // (single-step MTP), which must stay legal.
   int64_t parent_list_stride = 0;
   int64_t parent_list_width = 0;
   if (parent_list.dim() > 1) {
@@ -545,29 +456,22 @@ SGL_KERNEL_EXPORT void build_tree_kernel_efficient(
   }
 
   auto& queue = dpcppGetCurrentQueue();
-  // One work-group per request; one work-item per draft token (nodes beyond the
-  // work-group size are handled by the strided loops in the kernel).
+  // One work-group per request, one work-item per draft token; nodes beyond the
+  // work-group size are covered by the kernel's strided loops.
   const int64_t max_wg = dpcppMaxWorkGroupSize();
   const int64_t local_range = std::min<int64_t>(std::max<int64_t>((draft_token_num + 31) / 32 * 32, 32), max_wg);
 
-  // A batch too small to fill the machine on its own leaves most subslices
-  // idle -- one work-group per request regardless of how much row work that
-  // request has. Split each request's rows across a few extra blocks so a
-  // small batch still spreads across multiple subslices; phases 1-3 get
-  // redone per block (cheap, O(draft_token_num)), only the mask write is
-  // actually partitioned. Subslice count, not EU count, bounds how many
-  // work-groups can genuinely run concurrently (a group can't span
-  // subslices), so using EU count here would over-split large batches too.
+  // Split each request's rows across extra blocks so a batch too small to fill
+  // the machine still spreads across subslices; only the mask write is
+  // partitioned, phases before it are redone per block. Bound by subslice count
+  // (a group cannot span subslices), not EU count, which would over-split.
   const int64_t num_subslices = queue.get_device().get_info<sycl::ext::intel::info::device::gpu_slices>() *
                                 queue.get_device().get_info<sycl::ext::intel::info::device::gpu_subslices_per_slice>();
   const int64_t max_row_blocks = std::max<int64_t>((draft_token_num + 31) / 32, 1);
   const int64_t row_blocks = bs < num_subslices ? std::min<int64_t>(max_row_blocks, (num_subslices + bs - 1) / bs) : 1;
 
-  // How many 32-bit words the mask write packs per store. can_vectorize_up_to
-  // takes the device's preferred int vector width and caps it by what the
-  // tree_mask base pointer's alignment actually permits; the per-row offset is
-  // re-checked in the kernel, which falls back to byte stores when it does not
-  // line up. A pack also has to fit inside one row.
+  // Mask-store width, capped by what the tree_mask base alignment permits and by
+  // one row; the per-row offset is re-checked in the kernel.
   int pack_words = std::min<int>(
       can_vectorize_up_to<int32_t>(
           dpcppGetDeviceIdOfCurrentQueue(), reinterpret_cast<char*>(tree_mask.data_ptr<bool>())),

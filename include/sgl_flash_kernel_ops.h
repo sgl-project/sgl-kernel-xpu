@@ -43,7 +43,10 @@ limitations under the License.
 /*
  * From flash-attention
  */
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
+// Defined in the FMHA/MLA SYCL shared libraries (built with -fvisibility=hidden)
+// and called from common_ops; keep them exported with default visibility.
+#pragma GCC visibility push(default)
+void mha_fwd(
     const at::Tensor& q,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     const at::Tensor& k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size,
                           // h_k, d) if there is page_table.
@@ -74,7 +77,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin,
-    std::optional<at::Tensor>& out_);
+    at::Tensor& out,
+    std::optional<at::Tensor>& softmax_lse);
 
 void flash_mla_decode(
     torch::Tensor& out,
@@ -87,7 +91,7 @@ void flash_mla_decode(
     double sm_scale,
     int64_t num_kv_splits = -1);
 
-int64_t flash_mla_get_workspace_size(
+int64_t flash_mla_decode_get_workspace_size(
     int64_t max_seq_len, int64_t num_batches, int64_t num_heads, int64_t page_size, int64_t num_kv_splits = -1);
 
 // DeepSeek V4 Sparse MLA decode (dual KV pools + attn_sink)
@@ -122,3 +126,16 @@ void flash_mla_prefill(
 
 int64_t flash_mla_prefill_get_workspace_size(
     int64_t max_seq_len, int64_t num_batches, int64_t num_heads = 0, int64_t page_size = 0, int64_t num_kv_splits = -1);
+
+void flash_mla_sparse_prefill(
+    torch::Tensor& out,
+    torch::Tensor& max_logits,
+    torch::Tensor& lse,
+    const torch::Tensor& q,
+    const torch::Tensor& kv,
+    const torch::Tensor& indices,
+    double sm_scale,
+    int64_t head_dim_v,
+    const std::optional<torch::Tensor>& attn_sink = std::nullopt,
+    const std::optional<torch::Tensor>& topk_length = std::nullopt);
+#pragma GCC visibility pop

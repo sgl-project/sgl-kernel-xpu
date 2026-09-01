@@ -6,6 +6,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 static constexpr int WG_SIZE = 256;
 static constexpr int D_BLOCK = 1024;  // Process D in 1024-element blocks
@@ -137,7 +138,7 @@ static void launch_hc_post_kernel(
   sycl_kernel_submit(sycl::range<2>(grid_x * WG_SIZE, grid_y), sycl::range<2>(WG_SIZE, 1), q, ker);
 }
 
-void hc_post(
+SGL_KERNEL_EXPORT void hc_post(
     const at::Tensor& x,
     const at::Tensor& residual,
     const at::Tensor& post_layer_mix,
@@ -163,9 +164,15 @@ void hc_post(
   TORCH_CHECK(residual.size(1) == 4, "residual must have 4 channels (HC=4)");
   TORCH_CHECK(residual.size(2) == D, "residual D mismatch");
 
-  TORCH_CHECK(post_layer_mix.dim() == 2, "post_layer_mix must be 2D [T, HC]");
-  TORCH_CHECK(post_layer_mix.size(0) == T, "post_layer_mix T mismatch");
-  TORCH_CHECK(post_layer_mix.size(1) == 4, "post_layer_mix must have 4 elements (HC=4)");
+  at::Tensor post_layer_mix_2d = post_layer_mix;
+  if (post_layer_mix_2d.dim() == 3) {
+    TORCH_CHECK(post_layer_mix_2d.size(2) == 1, "post_layer_mix last dim must be 1 when rank=3");
+    post_layer_mix_2d = post_layer_mix_2d.squeeze(-1);
+  }
+
+  TORCH_CHECK(post_layer_mix_2d.dim() == 2, "post_layer_mix must be [T, HC] or [T, HC, 1]");
+  TORCH_CHECK(post_layer_mix_2d.size(0) == T, "post_layer_mix T mismatch");
+  TORCH_CHECK(post_layer_mix_2d.size(1) == 4, "post_layer_mix must have 4 elements (HC=4)");
 
   TORCH_CHECK(comb_res_mix.dim() == 3, "comb_res_mix must be 3D [T, HC, HC]");
   TORCH_CHECK(comb_res_mix.size(0) == T, "comb_res_mix T mismatch");
@@ -181,5 +188,5 @@ void hc_post(
 
   constexpr int VEC_SIZE = 4;
   TORCH_CHECK(D % VEC_SIZE == 0, "D must be a multiple of VEC_SIZE (", VEC_SIZE, "), got D=", D);
-  launch_hc_post_kernel<VEC_SIZE>(q, x, residual, post_layer_mix, comb_res_mix, out, T, D);
+  launch_hc_post_kernel<VEC_SIZE>(q, x, residual, post_layer_mix_2d, comb_res_mix, out, T, D);
 }

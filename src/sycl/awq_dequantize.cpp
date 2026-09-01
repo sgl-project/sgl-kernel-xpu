@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "SYCLHelpers.h"
+#include "sgl_kernel_export.h"
 
 template <typename T_out, typename T_scale, int GroupK = 16, int GroupN = 16, int SgSize = 16>
 struct AWQDequantizeKernelFunctor : public __SYCL_KER_CONFIG_CONVENTION__ {
@@ -93,7 +94,7 @@ void dequantize_awq_sycl(
   return;
 }
 
-at::Tensor awq_dequantize(at::Tensor qweight, at::Tensor scales, at::Tensor qzeros) {
+SGL_KERNEL_EXPORT at::Tensor awq_dequantize(at::Tensor qweight, at::Tensor scales, at::Tensor qzeros) {
   size_t K = qweight.size(0);
   size_t N = qweight.size(1);
   size_t group_size = K / scales.size(0);

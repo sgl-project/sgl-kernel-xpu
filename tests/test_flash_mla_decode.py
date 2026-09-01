@@ -5,7 +5,7 @@ import sys
 import pytest
 import torch
 import torch.nn.functional as F
-from sgl_kernel import flash_mla_decode, flash_mla_get_workspace_size
+from sgl_kernel import flash_mla_decode, flash_mla_decode_get_workspace_size
 from torch import Tensor
 
 LONG_TESTS = os.getenv("LONG_TESTS") == "1"
@@ -46,15 +46,18 @@ def ref_mla(
     bs, num_heads, v_head_dim = out.shape
     head_dim = query.shape[2]
 
+    # Decode has a single query position, so attention reduces to two matmuls
+    # over all heads at once. Doing this instead of one SDPA call per head
+    # keeps the reference off a 128-iteration Python loop (the dominant cost of
+    # this file) without materializing any per-head expansion of the KV cache.
     for i in range(bs):
         kv = kv_cache[block_tables[i]]  # (max_num_blocks, block_size, head_dim)
-        kv = kv.view(1, -1, head_dim)[:, : seq_lens[i]]  # (1, seq_len, head_dim)
-        v = kv[:, :, :v_head_dim]
+        kv = kv.view(-1, head_dim)[: seq_lens[i]].float()  # (seq_len, head_dim)
+        v = kv[:, :v_head_dim]  # (seq_len, v_head_dim)
 
-        for h in range(num_heads):
-            q_h = query[i, h : h + 1, :].unsqueeze(0)  # (1, 1, head_dim)
-            o_h = F.scaled_dot_product_attention(q_h, kv, v, scale=scale)
-            out[i, h] = o_h.view(v_head_dim)
+        # (num_heads, head_dim) @ (head_dim, seq_len) -> (num_heads, seq_len)
+        probs = ((query[i].float() @ kv.transpose(0, 1)) * scale).softmax(dim=-1)
+        out[i] = (probs @ v).to(out.dtype)  # (num_heads, v_head_dim)
 
     return out
 
@@ -122,7 +125,7 @@ def test_flash_mla_decode(
     seq_lens_xpu = seq_lens_cpu.to(device=device)
     del q_cpu, kv_cache_cpu, block_table_cpu, seq_lens_cpu
 
-    workspace_size = flash_mla_get_workspace_size(
+    workspace_size = flash_mla_decode_get_workspace_size(
         block_num * block_size, bs, h_q, block_size, num_kv_splits=num_kv_splits
     )
     workspace = torch.empty(workspace_size, device=device, dtype=torch.uint8)

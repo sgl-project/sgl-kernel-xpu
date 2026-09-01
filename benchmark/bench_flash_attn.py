@@ -23,8 +23,11 @@ def flash_attn_baseline(
     v_descale=None,
 ):
     """Baseline Flash Attention implementation"""
+    # Kernel only supports LSE without causal/local/sink masking.
+    return_lse = not causal and window_size == (-1, -1) and sinks is None
+
     if page_table is not None:
-        out, lse, *rest = flash_attn_with_kvcache(
+        result = flash_attn_with_kvcache(
             q,
             k_cache,
             v_cache,
@@ -38,11 +41,10 @@ def flash_attn_baseline(
             max_seqlen_q=max_seqlen_q,
             k_descale=k_descale,
             v_descale=v_descale,
-            return_softmax_lse=True,
+            return_softmax_lse=return_lse,
         )
-        return out, lse
     else:
-        out, lse, *rest = flash_attn_varlen_func(
+        result = flash_attn_varlen_func(
             q,
             k_cache,
             v_cache,
@@ -54,9 +56,14 @@ def flash_attn_baseline(
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
-            return_softmax_lse=True,
+            return_softmax_lse=return_lse,
         )
-        return out, lse
+
+    if return_lse:
+        out, lse, *_ = result
+    else:
+        out, lse = result, None
+    return out, lse
 
 
 def get_effective_attention_pairs(
@@ -90,7 +97,7 @@ local = [True, False]
 use_sinks = [True, False]
 batch_size = [1, 8, 16]
 q_seq_length_range = [1, 128]
-head_dim_no_page = [72, 128, 192]
+head_dim_no_page = [72, 128, 192, 256, 512]
 head_dim_paged = [64, 128, 256, 512]
 num_heads_q = [16]
 num_heads_kv = [4, 8]

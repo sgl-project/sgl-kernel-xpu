@@ -41,7 +41,7 @@
 
 namespace sgemm_lora_a_fwd_impl {
 
-void launch_sgemm_lora_a_fwd_@ELEM_TAG@_@TILE_TAG@(
+__attribute__((visibility("default"))) void launch_sgemm_lora_a_fwd_@ELEM_TAG@_@TILE_TAG@(
     const torch::Tensor& input_x,
     const torch::Tensor& weights,
     const torch::Tensor& seg_indptr_i32,

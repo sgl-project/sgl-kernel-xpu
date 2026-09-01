@@ -6,6 +6,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 #define VEC_SIZE 4
 static constexpr int sub_group_size = 32;
@@ -309,7 +310,7 @@ struct MOEAlignBlockSizeSmallBatchExpertFunctor : public __SYCL_KER_CONFIG_CONVE
   sycl::local_accessor<int32_t> slm_;
 };
 
-void moe_align_block_size(
+SGL_KERNEL_EXPORT void moe_align_block_size(
     torch::Tensor topk_ids,
     int64_t num_experts,
     int64_t block_size,

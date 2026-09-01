@@ -9,15 +9,23 @@
 #include "Utils.h"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
+#include "kernels/moe/xe20/bf16/grouped_gemm_dispatch.h"
 #include "kernels/moe/xe20/bf16/moe_kernel.hpp"
+#ifdef USE_MOE_JIT
+#include "jit/moe_jit.h"
+#endif
+#include "sgl_kernel_export.h"
 
 using namespace cute;
 using namespace MoE;
 
 using ElementAccumulator = float;  // <- data type of accumulator
 
+// Defined (explicitly instantiated) in the GroupGemmXe20_inst_* libraries. The
+// dispatcher is built with -fvisibility=hidden, so mark the declaration default
+// so this cross-library reference stays dynamically resolvable.
 template <typename Tile, typename SGLayout, ActivationType ActType, bool FuseAct, bool WithBias>
-void Xe20MoEGEMMLauncher(
+__attribute__((visibility("default"))) void Xe20MoEGEMMLauncher(
     sycl::queue q,
     const void* activations,
     const void* weights,
@@ -123,39 +131,32 @@ DECLARE_XE20_MOE_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
     }                                                             \
   } while (0)
 
-#define DISPATCH_MOE_HELPER_FUSE_ACT(ActType, FuseAct, WithBias, ...)  \
-  do {                                                                 \
-    if (FuseAct) {                                                     \
-      DISPATCH_MOE_HELPER_BIAS(ActType, true, WithBias, __VA_ARGS__);  \
-    } else {                                                           \
-      DISPATCH_MOE_HELPER_BIAS(ActType, false, WithBias, __VA_ARGS__); \
-    }                                                                  \
+// Dispatch on activation type with a compile-time fuse literal. The caller picks
+// the fuse value -- pinned by the tile's fuse policy, or the runtime flag for
+// kEither tiles -- so only reachable (act, fuse, bias) launchers are
+// instantiated and the single-variant large tiles never emit a dead fuse branch
+// (which would reference an undefined Xe20MoEGEMMLauncher symbol).
+#define DISPATCH_MOE_ACT(ActType, FuseLit, WithBias, ...)                                         \
+  do {                                                                                            \
+    switch (ActType) {                                                                            \
+      case 0:                                                                                     \
+        DISPATCH_MOE_HELPER_BIAS(ActivationType::SILU, FuseLit, WithBias, __VA_ARGS__);           \
+        break;                                                                                    \
+      case 1:                                                                                     \
+        DISPATCH_MOE_HELPER_BIAS(ActivationType::GELU, FuseLit, WithBias, __VA_ARGS__);           \
+        break;                                                                                    \
+      case 2:                                                                                     \
+        DISPATCH_MOE_HELPER_BIAS(ActivationType::SWIGLU_GPT_OSS, FuseLit, WithBias, __VA_ARGS__); \
+        break;                                                                                    \
+      case 3:                                                                                     \
+        DISPATCH_MOE_HELPER_BIAS(ActivationType::RELU2, FuseLit, false, __VA_ARGS__);             \
+        break;                                                                                    \
+      default:                                                                                    \
+        TORCH_CHECK(false, "Unsupported activation type");                                        \
+    }                                                                                             \
   } while (0)
 
-#define DISPATCH_MOE_HELPER_ACT_TYPE(ActType, FuseAct, WithBias, ...)                                 \
-  do {                                                                                                \
-    switch (ActType) {                                                                                \
-      case 0:                                                                                         \
-        DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::SILU, FuseAct, WithBias, __VA_ARGS__);           \
-        break;                                                                                        \
-      case 1:                                                                                         \
-        DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::GELU, FuseAct, WithBias, __VA_ARGS__);           \
-        break;                                                                                        \
-      case 2:                                                                                         \
-        DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::SWIGLU_GPT_OSS, FuseAct, WithBias, __VA_ARGS__); \
-        break;                                                                                        \
-      case 3:                                                                                         \
-        DISPATCH_MOE_HELPER_FUSE_ACT(ActivationType::RELU2, FuseAct, false, __VA_ARGS__);             \
-        break;                                                                                        \
-      default:                                                                                        \
-        TORCH_CHECK(false, "Unsupported activation type");                                            \
-    }                                                                                                 \
-  } while (0)
-
-#define DISPATCH_MOE(ActType, FuseAct, WithBias, ...) \
-  DISPATCH_MOE_HELPER_ACT_TYPE(ActType, FuseAct, WithBias, __VA_ARGS__)
-
-void moe_grouped_mm_nt_xe20(
+SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
     torch::Tensor& output,
     const torch::Tensor& activations,
     const torch::Tensor& weights,
@@ -219,56 +220,73 @@ void moe_grouped_mm_nt_xe20(
   at::Tensor atomic_buffer = at::empty({static_cast<long>(1)}, activations.options().dtype(at::kInt));
   bool with_bias = bias.has_value();
   void* bias_ptr = with_bias ? bias->data_ptr() : nullptr;
-  bool small_weight = (int64_t)gemm_k * gemm_n <= MOE_GROUPED_GEMM_SMALL_WEIGHT_THRESHOLD;
   int ld_b = static_cast<int>(weights.stride(1));
 
-  bool narrow_k = gemm_k <= 256;
-  bool narrow_n_fused = fuse_act && (gemm_n <= 512);
-
-  if (avg_m <= 8) {
-    DISPATCH_MOE(
-        activation_type, fuse_act, with_bias, Shape<_8, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
-  } else if (avg_m <= 16 && small_weight) {
-    DISPATCH_MOE(
-        activation_type, fuse_act, with_bias, Shape<_16, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
-  } else if (avg_m <= 32 && small_weight) {
-    DISPATCH_MOE(
-        activation_type, fuse_act, with_bias, Shape<_32, _64, _32>, Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>);
-  } else if (avg_m <= 128 && small_weight) {
-    if (fuse_act) {
-      DISPATCH_MOE(
-          activation_type, true, with_bias, Shape<_128, _64, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
-    } else {
-      DISPATCH_MOE(
-          activation_type, false, with_bias, Shape<_128, _128, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
-    }
-  } else if (narrow_k) {
-    // Narrow-K (e.g. K=176 for MoE down-projection): few K-loop iterations
-    // starve the pipeline. Unfused: Tile_128_128 (Shape<_128, _128, _32>);
-    // fused: Tile_128_64 (Shape<_128, _64, _32>). Both use 8 SGs/WG and
-    // balance occupancy with good N-coverage (22 tiles for N=2816) and
-    // M-tail utilization.
-    if (fuse_act) {
-      DISPATCH_MOE(
-          activation_type, true, with_bias, Shape<_128, _64, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
-    } else {
-      DISPATCH_MOE(
-          activation_type, false, with_bias, Shape<_128, _128, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
-    }
-  } else if (narrow_n_fused) {
-    // Narrow-N fused (e.g. N=352 → effective N/2=176 for MoE up-projection):
-    // Use 128-tile for better M-tail utilization vs 256-tile.
-    DISPATCH_MOE(
-        activation_type, true, with_bias, Shape<_128, _64, _32>, Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>);
-  } else {
-    if (fuse_act) {
-      DISPATCH_MOE(
-          activation_type, true, with_bias, Shape<_256, _64, _32>, Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>);
-    } else {
-      DISPATCH_MOE(
-          activation_type, false, with_bias, Shape<_256, _256, _32>, Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>);
-    }
+#ifdef USE_MOE_JIT
+  {
+    std::string jit_err;
+    TORCH_CHECK(
+        sgl::moe_jit::grouped_gemm_launch(
+            avg_m,
+            static_cast<int>(activation_type),
+            fuse_act,
+            with_bias,
+            &queue,
+            activations.data_ptr(),
+            weights.data_ptr(),
+            /*scales=*/nullptr,
+            bias_ptr,
+            output.data_ptr(),
+            gemm_n,
+            gemm_k,
+            total_rows_for_experts.data_ptr<int>(),
+            static_cast<int>(n_experts),
+            atomic_buffer.data_ptr<int>(),
+            static_cast<float>(gemm1_alpha),
+            static_cast<float>(gemm1_limit),
+            ld_b,
+            jit_arch_code(),
+            &jit_err),
+        jit_err);
   }
+#else
+  // Tile selection AND the per-tile fuse reachability are shared with the
+  // runtime-JIT path via grouped_gemm_dispatch.h. A per-tile template lambda
+  // lets `if constexpr` genuinely discard the unreachable branch: tiles whose
+  // fuse_act is fixed by the selector (grouped_gemm_tile_fuse_policy != kEither)
+  // instantiate only that fuse variant, so the compiler never references the
+  // uninstantiated (undefined) opposite variant of the large tiles; kEither
+  // tiles keep the runtime split. (A non-template `if constexpr` would still
+  // compile the discarded branch and reintroduce the undefined symbol.)
+  auto dispatch_tile = [&]<int TileId, typename Tile, typename SGLayout>() {
+    constexpr auto kPolicy = sgl::moe::grouped_gemm_tile_fuse_policy(TileId);
+    if constexpr (kPolicy == sgl::moe::GroupedGemmFusePolicy::kFusedOnly) {
+      DISPATCH_MOE_ACT(activation_type, true, with_bias, Tile, SGLayout);
+    } else if constexpr (kPolicy == sgl::moe::GroupedGemmFusePolicy::kNonFusedOnly) {
+      DISPATCH_MOE_ACT(activation_type, false, with_bias, Tile, SGLayout);
+    } else if (fuse_act) {
+      DISPATCH_MOE_ACT(activation_type, true, with_bias, Tile, SGLayout);
+    } else {
+      DISPATCH_MOE_ACT(activation_type, false, with_bias, Tile, SGLayout);
+    }
+  };
+#define MOE_GG_CASE(id)                                                                     \
+  case id:                                                                                  \
+    dispatch_tile.template operator()<id, SGL_MOE_GG_SHAPE_##id, SGL_MOE_GG_LAYOUT_##id>(); \
+    break;
+  switch (sgl::moe::grouped_gemm_select_tile(avg_m, gemm_k, gemm_n, fuse_act)) {
+    MOE_GG_CASE(0)
+    MOE_GG_CASE(1)
+    MOE_GG_CASE(2)
+    MOE_GG_CASE(3)
+    MOE_GG_CASE(4)
+    MOE_GG_CASE(5)
+    MOE_GG_CASE(6)
+    default:
+      TORCH_CHECK(false, "MoE grouped GEMM: invalid tile id");
+  }
+#undef MOE_GG_CASE
+#endif
 }
 
 #undef SYCL_INTEL_TARGET

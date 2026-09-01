@@ -9,6 +9,14 @@
 #include "../../gdn_attn/gdn_attn_utils.h"
 #include "gemm_xe20.hpp"
 
+// When the chunk kernels run through the runtime-JIT path, the host dispatcher
+// (impl_xe20) forwards raw pointers to the JIT layer instead of instantiating
+// the heavy per-dtype kernel_launcher. The JIT instance TU (SGL_GDN_JIT_ENTRY)
+// itself must NOT pull this in -- it only instantiates one kernel_launcher.
+#if defined(USE_GDN_JIT) && !defined(SGL_GDN_JIT_ENTRY)
+#include "jit/gdn_jit.h"
+#endif
+
 namespace gdn {
 using namespace cute;
 static constexpr int MaxThreadsPerSM = 512;
@@ -123,6 +131,7 @@ CUTE_DEVICE void chunk_prepare_kernel(
   }
 }
 
+// Each workgroup is responsible for one (chunk, v_head) pair
 template <typename T, class TiledMMA>
 CUTE_DEVICE void chunk_compute_A_kernel(
     const sycl::local_accessor<float, 1>& slm_mem_const,
@@ -141,11 +150,22 @@ CUTE_DEVICE void chunk_compute_A_kernel(
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   int local_id = item.get_local_linear_id();
   int local_range = item.get_local_range(2);
-  int chunk_id = item.get_group(1);
-  const int global_chunk_range = item.get_group_range(1);
+  const int flat_chunk_id = item.get_group(0);
+  const int v_head_id = item.get_group(1);
 
   auto sg = item.get_sub_group();
   int sg_local_id = sg.get_local_linear_id();
+
+  // The grid is over-provisioned (see kernel_launcher), so out-of-range
+  // workgroups exit without touching any memory.
+  int total_chunks = 0;
+  for (int b = 0; b < batch_size; ++b) {
+    const int seq_len = query_start_loc[b + 1] - query_start_loc[b];
+    total_chunks += div_up(seq_len, chunk_size);
+  }
+  if (flat_chunk_id >= total_chunks) {
+    return;
+  }
 
   float* slm_mem = static_cast<float*>(slm_mem_const.template get_multi_ptr<sycl::access::decorated::no>().get());
   float* g_slm_ptr = slm_mem;
@@ -160,8 +180,8 @@ CUTE_DEVICE void chunk_compute_A_kernel(
   static constexpr auto ATOM_M = get<1>(typename TiledMMA::ThrLayoutVMNK{}.shape());
   static constexpr auto ATOM_N = get<2>(typename TiledMMA::ThrLayoutVMNK{}.shape());
 
-  static constexpr auto SG_M = tile_m / ATOM_M;  // BLK_M / ATOM_M;
-  static constexpr auto SG_N = tile_n / ATOM_N;  // BLK_N / ATOM_N;
+  static constexpr auto SG_M = tile_m / ATOM_M;
+  static constexpr auto SG_N = tile_n / ATOM_N;
 
   auto sg_local_m_coord = cutlass::get_sub_group_id() / ATOM_N;
   auto sg_local_n_coord = cutlass::get_sub_group_id() % ATOM_N;
@@ -170,87 +190,59 @@ CUTE_DEVICE void chunk_compute_A_kernel(
   int m_sg_start = sg_local_m_coord * SG_M;
   int n_sg_start = sg_local_n_coord * SG_N;
 
-  int pre_chunks = 0;
-
   const int kv_ratio = num_v_heads / num_k_heads;
+  const int chunk_start_offset = flat_chunk_id * chunk_size;
 
-  for (int batch_id = 0; batch_id < batch_size; ++batch_id) {
-    const int seq_start_offset = query_start_loc[batch_id];
-    const int seq_end_offset = query_start_loc[batch_id + 1];
-    const int seq_len = seq_end_offset - seq_start_offset;
-
-    const int current_chunks = (seq_len + chunk_size - 1) / chunk_size;
-    const int cumsum_chunks = pre_chunks + current_chunks;
-
-    if (chunk_id >= cumsum_chunks) {
-      pre_chunks = cumsum_chunks;
-      continue;
-    }
-
-    while (chunk_id < cumsum_chunks) {
-      const int chunk_start_offset = chunk_id * chunk_size;
-
-      for (int v_head_id = 0; v_head_id < num_v_heads; ++v_head_id) {
-        // WAR fence: sub-groups from the previous (chunk, v_head)
-        // iteration may still be reading g_slm_ptr in the exp()
-        // epilogue; all must arrive before any sub-group refills the
-        // SLM (g_slm_ptr) for this iteration.
-        item.barrier(sycl::access::fence_space::local_space);
-        CUTE_UNROLL
-        for (int e = local_id; e < chunk_size; e += local_range) {
-          g_slm_ptr[e] = a[(chunk_start_offset + e) + v_head_id * total_virtual_seqlen];
-        }
-
-        item.barrier(sycl::access::fence_space::local_space);
-
-        auto k_ptr = k + static_cast<int64_t>(chunk_start_offset) * num_k_heads * head_k_dim +
-                     (v_head_id / kv_ratio) * head_k_dim;
-        auto K_tensor_shape = make_shape(chunk_size, head_k_dim);
-        auto K_tensor =
-            make_tensor(make_gmem_ptr(k_ptr), make_layout(K_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
-
-        auto A_ptr =
-            A + static_cast<int64_t>(v_head_id) * total_virtual_seqlen * chunk_size + chunk_start_offset * chunk_size;
-        auto A_tensor_shape = make_shape(chunk_size, chunk_size);
-        auto A_tensor = make_tensor(make_gmem_ptr(A_ptr), make_layout(A_tensor_shape, make_stride(chunk_size, _1{})));
-
-        Tensor cA = make_identity_tensor(A_tensor.shape());
-        Tensor gA_C = local_tile(cA, wg_tile, make_coord(0, 0, 0), Step<_1, _1, X>{});
-
-        auto copy_A_c = get_block_2d_copy_D<void>(mma, A_tensor);
-        auto thr_copy_A_c = copy_A_c.get_slice(local_id);
-        auto tCrA_c = thr_copy_A_c.partition_sg_fragment_S(gA_C);
-        auto tCgA_c = thr_copy_A_c.partition_D(gA_C);
-        auto tSrA_c = thr_mma.partition_sg_fragment_C(gA_C);
-
-        clear(tSrA_c);
-        gemm_TTS(K_tensor, K_tensor, tSrA_c, 0, 0, mma);
-
-        CUTE_UNROLL
-        for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
-          int n_idx = n_tile_start + n_sg_start + sn * sub_group_size + sg_local_id;
-          CUTE_UNROLL
-          for (int sm = 0; sm < SG_M; ++sm) {
-            int m_idx = m_tile_start + m_sg_start + sm;
-            float beta_value = b[(chunk_start_offset + m_idx) + v_head_id * total_virtual_seqlen];
-
-            tSrA_c(sn * SG_M + sm) *= sycl::exp(g_slm_ptr[(m_idx)] - g_slm_ptr[n_idx]) * beta_value;
-            if (m_idx == n_idx) {
-              tSrA_c(sn * SG_M + sm) = 1.0f;
-            }
-            if (m_idx < n_idx) {
-              tSrA_c(sn * SG_M + sm) = 0.0f;
-            }
-          }
-        }
-
-        reorder(tSrA_c, tCrA_c);
-        copy(copy_A_c, tCrA_c, tCgA_c);
-      }
-      chunk_id += global_chunk_range;
-    }
-    pre_chunks = cumsum_chunks;
+  CUTE_UNROLL
+  for (int e = local_id; e < chunk_size; e += local_range) {
+    g_slm_ptr[e] = a[(chunk_start_offset + e) + v_head_id * total_virtual_seqlen];
   }
+
+  item.barrier(sycl::access::fence_space::local_space);
+
+  auto k_ptr =
+      k + static_cast<int64_t>(chunk_start_offset) * num_k_heads * head_k_dim + (v_head_id / kv_ratio) * head_k_dim;
+  auto K_tensor_shape = make_shape(chunk_size, head_k_dim);
+  auto K_tensor =
+      make_tensor(make_gmem_ptr(k_ptr), make_layout(K_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
+
+  auto A_ptr =
+      A + static_cast<int64_t>(v_head_id) * total_virtual_seqlen * chunk_size + chunk_start_offset * chunk_size;
+  auto A_tensor_shape = make_shape(chunk_size, chunk_size);
+  auto A_tensor = make_tensor(make_gmem_ptr(A_ptr), make_layout(A_tensor_shape, make_stride(chunk_size, _1{})));
+
+  Tensor cA = make_identity_tensor(A_tensor.shape());
+  Tensor gA_C = local_tile(cA, wg_tile, make_coord(0, 0, 0), Step<_1, _1, X>{});
+
+  auto copy_A_c = get_block_2d_copy_D<void>(mma, A_tensor);
+  auto thr_copy_A_c = copy_A_c.get_slice(local_id);
+  auto tCrA_c = thr_copy_A_c.partition_sg_fragment_S(gA_C);
+  auto tCgA_c = thr_copy_A_c.partition_D(gA_C);
+  auto tSrA_c = thr_mma.partition_sg_fragment_C(gA_C);
+
+  clear(tSrA_c);
+  gemm_TTS(K_tensor, K_tensor, tSrA_c, 0, 0, mma);
+
+  CUTE_UNROLL
+  for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
+    int n_idx = n_tile_start + n_sg_start + sn * sub_group_size + sg_local_id;
+    CUTE_UNROLL
+    for (int sm = 0; sm < SG_M; ++sm) {
+      int m_idx = m_tile_start + m_sg_start + sm;
+      float beta_value = b[(chunk_start_offset + m_idx) + v_head_id * total_virtual_seqlen];
+
+      tSrA_c(sn * SG_M + sm) *= sycl::exp(g_slm_ptr[(m_idx)] - g_slm_ptr[n_idx]) * beta_value;
+      if (m_idx == n_idx) {
+        tSrA_c(sn * SG_M + sm) = 1.0f;
+      }
+      if (m_idx < n_idx) {
+        tSrA_c(sn * SG_M + sm) = 0.0f;
+      }
+    }
+  }
+
+  reorder(tSrA_c, tCrA_c);
+  copy(copy_A_c, tCrA_c, tCgA_c);
 }
 
 template <typename T>
@@ -1170,8 +1162,13 @@ void kernel_launcher(
   auto mmaComputeA = MMAComputeA{};
   int MaxThreadsPerWorkgroupComputeA = size(mmaComputeA);
   sycl::range<3> local_compute_A(1, 1, MaxThreadsPerWorkgroupComputeA);
-  sycl::range<3> global_compute_A(1, sm_count * MaxThreadsPerSM / MaxThreadsPerWorkgroupComputeA, 1);
   int slm_size_compute_A = chunk_size;
+
+  // Grid is over-provisioned since the real chunk count depends on the
+  // ragged per-batch sequence lengths in query_start_loc, which is only
+  // known on device
+  const int total_chunks_upper_bound = div_up(total_virtual_seqlen, chunk_size);
+  sycl::range<3> global_compute_A(total_chunks_upper_bound, num_v_heads, 1);
 
   queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> local_mem(sycl::range<1>(slm_size_compute_A), cgh);
@@ -1289,6 +1286,9 @@ void kernel_launcher(
   });
 }
 
+// The host dispatcher does torch marshalling only; it is excluded from the JIT
+// instance TU (which just instantiates the selected kernel_launcher).
+#ifndef SGL_GDN_JIT_ENTRY
 void chunk_gated_delta_rule_impl_xe20(
     sycl::queue& queue,
     torch::Tensor& core_attn_out,                           // [total_seqlen, num_v_heads, head_v_dim]
@@ -1388,6 +1388,56 @@ void chunk_gated_delta_rule_impl_xe20(
     }                                                                                                            \
   } while (0)
 
+#ifdef USE_GDN_JIT
+  const bool is_half = core_attn_out.scalar_type() == at::kHalf;
+  TORCH_CHECK(
+      is_half || core_attn_out.scalar_type() == at::kBFloat16,
+      "core_attn_out dtype must be float16/bfloat16, but got ",
+      core_attn_out.scalar_type());
+  int state_code;
+  if (ssm_state.scalar_type() == at::kFloat) {
+    state_code = 0;
+  } else if (ssm_state.scalar_type() == at::kBFloat16) {
+    state_code = 1;
+  } else if (ssm_state.scalar_type() == at::kHalf) {
+    state_code = 2;
+  } else {
+    TORCH_CHECK(false, "ssm_state dtype must be float32/float16/bfloat16, but got ", ssm_state.scalar_type());
+  }
+  const bool* has_init_ptr =
+      has_initial_state.has_value() ? reinterpret_cast<const bool*>(has_initial_state->data_ptr()) : nullptr;
+  std::string jit_err;
+  const bool ok = sgl::gdn_jit::chunk_launch(
+      is_half,
+      state_code,
+      &queue,
+      core_attn_out.data_ptr(),
+      q.data_ptr(),
+      k.data_ptr(),
+      v.data_ptr(),
+      A.data_ptr(),
+      w.data_ptr(),
+      u.data_ptr(),
+      b.data_ptr(),
+      a.data_ptr(),
+      A_log.data_ptr(),
+      dt_bias.data_ptr(),
+      ssm_state.data_ptr(),
+      ssm_state_stride_0,
+      reinterpret_cast<const int*>(query_start_loc.data_ptr()),
+      reinterpret_cast<const int*>(cache_indices.data_ptr()),
+      has_init_ptr,
+      token_indx,
+      batch_size,
+      total_virtual_seqlen,
+      num_k_heads,
+      head_k_dim,
+      num_v_heads,
+      head_v_dim,
+      jit_arch_code(),
+      &jit_err);
+  TORCH_CHECK(ok, "GDN chunk JIT launch failed: ", jit_err);
+#else
   if (core_attn_out.scalar_type() == at::kBFloat16) {
     using scalar_t = bfloat16_t;
     DISPATCH_STATE_DTYPE(scalar_t);
@@ -1397,9 +1447,11 @@ void chunk_gated_delta_rule_impl_xe20(
   } else {
     TORCH_CHECK(false, "core_attn_out dtype must be float16/bfloat16, but got ", core_attn_out.scalar_type());
   }
+#endif
 
 #undef DISPATCH_STATE_DTYPE
 #undef KERNEL_LAUNCHER
 }
+#endif  // SGL_GDN_JIT_ENTRY
 
 }  // namespace gdn

@@ -36,7 +36,7 @@
 
 namespace mla_decode {
 
-void launch_mla_decode_@ELEM_TAG@_@PAGE_SIZE@(
+__attribute__((visibility("default"))) void launch_mla_decode_@ELEM_TAG@_@PAGE_SIZE@(
     at::Tensor& out,
     const at::Tensor& q_nope,
     const at::Tensor& q_pe,
@@ -52,3 +52,30 @@ void launch_mla_decode_@ELEM_TAG@_@PAGE_SIZE@(
 }
 
 }  // namespace mla_decode
+
+#ifdef SGL_MLA_JIT_ENTRY
+// Stable C ABI entry for the runtime-JIT path. Tensors cross the dlopen boundary
+// as at::Tensor* (both sides share <torch/all.h> -> identical layout). One config
+// per .so, so the fixed symbol name never collides across AOT translation units.
+extern "C" __attribute__((visibility("default"))) void sgl_mla_decode_entry(
+    void* out,
+    const void* q_nope,
+    const void* q_pe,
+    const void* kv_c_and_k_pe_cache,
+    const void* seq_lens,
+    const void* page_table,
+    void* workspace,
+    double sm_scale,
+    int64_t num_kv_splits) {
+  mla_decode::launch_mla_decode_@ELEM_TAG@_@PAGE_SIZE@(
+      *static_cast<at::Tensor*>(out),
+      *static_cast<const at::Tensor*>(q_nope),
+      *static_cast<const at::Tensor*>(q_pe),
+      *static_cast<const at::Tensor*>(kv_c_and_k_pe_cache),
+      *static_cast<const at::Tensor*>(seq_lens),
+      *static_cast<const at::Tensor*>(page_table),
+      *static_cast<at::Tensor*>(workspace),
+      sm_scale,
+      num_kv_splits);
+}
+#endif

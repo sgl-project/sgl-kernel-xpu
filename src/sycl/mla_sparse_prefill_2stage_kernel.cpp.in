@@ -1,0 +1,67 @@
+/***************************************************************************************************
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ **************************************************************************************************/
+// Auto-generated from mla_sparse_prefill_2stage_kernel.cpp.in
+// Template parameters: ELEM_TAG=@ELEM_TAG@, D_QK=@D_QK@, B_H=@B_H@, HAS_ATTN_SINK=@HAS_ATTN_SINK@
+//
+// One translation unit per (ELEM_TAG, D_QK, B_H, HAS_ATTN_SINK) combination, mirroring
+// the 2-stage sparse MLA decode path (mla_sparse_decode_2stage_kernel.cpp.in). D_QK is
+// the QK head dim (prefill supports {512, 576}) and B_H the sparse analog of page size:
+// together they key the Stage-2 config instantiation; HAS_ATTN_SINK selects the sink
+// epilogue variant. Instantiating runMlaSparsePrefill2Stage<Elem, D_QK, B_H,
+// HAS_ATTN_SINK> here confines the heavy CUTLASS kernel codegen for one variant to this
+// object file (bounds per-file compile memory / avoids the build OOM guard -- one sink
+// variant per file instead of both). The op (mla_sparse_prefill.cpp) dispatches dtype,
+// then D_QK, then B_H, then the runtime attn_sink flag, and calls the matching launcher
+// below.
+#define SYCL_INTEL_TARGET 20
+
+#include "sycl/kernels/mla_sparse/device/mla_sparse_prefill_2stage_types.hpp"
+
+namespace mla_sparse_prefill {
+
+__attribute__((visibility("default"))) void launch_mla_sparse_prefill_2stage_@ELEM_TAG@_@D_QK@_@B_H@_@HAS_ATTN_SINK@(
+    at::Tensor& out,
+    at::Tensor& max_logits,
+    at::Tensor& lse,
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    const std::optional<at::Tensor>& attn_sink,
+    const std::optional<at::Tensor>& topk_length,
+    double sm_scale,
+    int64_t head_dim_v) {
+  runMlaSparsePrefill2Stage<@ELEM_SYCL_TYPE@, @D_QK@, @B_H@, static_cast<bool>(@HAS_ATTN_SINK@)>(
+      out, max_logits, lse, q, kv, indices, attn_sink, topk_length, sm_scale, head_dim_v);
+}
+
+}  // namespace mla_sparse_prefill
+
+#ifdef SGL_MLA_JIT_ENTRY
+// Stable C ABI entry for the runtime-JIT path. One config
+// (@ELEM_TAG@,@D_QK@,@B_H@,@HAS_ATTN_SINK@) per .so.
+extern "C" __attribute__((visibility("default"))) void sgl_mla_sparse_prefill_entry(
+    void* out,
+    void* max_logits,
+    void* lse,
+    const void* q,
+    const void* kv,
+    const void* indices,
+    const void* attn_sink,
+    const void* topk_length,
+    double sm_scale,
+    int64_t head_dim_v) {
+  mla_sparse_prefill::launch_mla_sparse_prefill_2stage_@ELEM_TAG@_@D_QK@_@B_H@_@HAS_ATTN_SINK@(
+      *static_cast<at::Tensor*>(out),
+      *static_cast<at::Tensor*>(max_logits),
+      *static_cast<at::Tensor*>(lse),
+      *static_cast<const at::Tensor*>(q),
+      *static_cast<const at::Tensor*>(kv),
+      *static_cast<const at::Tensor*>(indices),
+      *static_cast<const std::optional<at::Tensor>*>(attn_sink),
+      *static_cast<const std::optional<at::Tensor>*>(topk_length),
+      sm_scale,
+      head_dim_v);
+}
+#endif

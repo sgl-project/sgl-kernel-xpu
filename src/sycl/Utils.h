@@ -5,11 +5,13 @@
 #include <stdexcept>
 #include <type_traits>
 
+#include "jit/jit_arch.h"  // sgl::jit::Arch, consumed by arch_profile()
+
 #define SYCL_MAX_SUB_GROUP_SIZE dpcppMaxSubGroupSize()
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_xpu(), #x " must be on XPU")
 #define CHECK_SHAPE(x, ...) \
-  TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
+  TORCH_CHECK(x.sizes() == c10::ArrayRef<int64_t>({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_LAST_DIM_CONTIGUOUS(x) \
   TORCH_CHECK(x.strides()[x.strides().size() - 1] == 1, #x "must be contiguous at last dimension")
@@ -43,13 +45,8 @@
     TORCH_CHECK(error == cutlass::Status::kSuccess, cutlassGetStatusString(error)); \
   }
 
-// Shared dispatch heuristic for the MoE grouped-GEMM kernels (bf16 and
-// MXFP4 W4A16). Weights with K*N at or below this threshold are
-// classified as "small" and dispatched to a tile shape tuned for that
-// regime; larger weights take the "big" branch. Used by both
-// GroupGemmXe20.cpp and GroupGemmMxfp4W4A16Xe20.cpp — keep them in sync.
-// Note: python/sgl_kernel/moe.py also references this number to decide
-// fused vs unfused activation; if you retune this, update Python too.
+// BF16 MoE grouped-GEMM tile-selection cutoff. Python mirrors this threshold
+// when choosing the BF16 fused-activation path; update both when retuning.
 constexpr int64_t MOE_GROUPED_GEMM_SMALL_WEIGHT_THRESHOLD = int64_t(4096) * 4096;
 
 static inline void barrier() {
@@ -69,6 +66,30 @@ static inline syclex::architecture get_device_architecture(at::DeviceIndex devic
 static inline bool is_bmg(at::DeviceIndex device_index = -1) {
   return get_device_architecture(device_index) == syclex::architecture::intel_gpu_bmg_g21 ||
          get_device_architecture(device_index) == syclex::architecture::intel_gpu_bmg_g31;
+}
+
+// Runtime-JIT architecture code (== static_cast<int>(sgl::jit::Arch); the value
+// selects the arch_profile used when compiling a kernel). Classifies the real
+// SYCL device architecture, mirroring Device.cpp's query_device switch:
+// bmg_g21/g31 => BMG/Xe20. Returned as int so callers pass it straight into the
+// launch entry points.
+static inline int jit_arch_code(at::DeviceIndex device_index = -1) {
+  switch (get_device_architecture(device_index)) {
+    case syclex::architecture::intel_gpu_bmg_g21:
+    case syclex::architecture::intel_gpu_bmg_g31:
+      return static_cast<int>(sgl::jit::Arch::BMG);
+    // case syclex::architecture::intel_gpu_<xe35>:
+    //   return static_cast<int>(sgl::jit::Arch::XE3P);  // Xe35, when the enum lands
+    default:
+      // Unknown architecture: fail loudly instead of silently compiling BMG
+      // device code, which would produce wrong results at runtime.
+      TORCH_CHECK(
+          false,
+          "Runtime-JIT does not support this XPU architecture yet. "
+          "Set SGLANG_DISABLE_SYCL_JIT=1 or rebuild with USE_SYCL_JIT=OFF to "
+          "use the AOT kernels.");
+      return static_cast<int>(sgl::jit::Arch::BMG);  // unreachable
+  }
 }
 
 using DeviceId = at::DeviceIndex;
@@ -345,11 +366,11 @@ inline T safe_recip(T x) {
   return sycl::select(T(0), inv, nz);
 }
 
-int nextPowerOf2(uint32_t a) {
+inline int nextPowerOf2(uint32_t a) {
   if (a <= 1) return 1;
   return 1 << (32 - __builtin_clz(a - 1));
 };
-int round_up_headdim(int head_size) {
+inline int round_up_headdim(int head_size) {
   if (head_size <= 64) return 64;
   if (head_size <= 96) return 96;
   if (head_size <= 128) return 128;

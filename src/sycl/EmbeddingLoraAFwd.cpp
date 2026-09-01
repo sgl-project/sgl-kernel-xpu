@@ -6,6 +6,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 // ============================================================
 // EmbeddingLoRAAFwd Kernel
@@ -215,7 +216,7 @@ void launch_embedding_lora_a_fwd(
 
 //----------------- Main API function --------------------//
 
-void embedding_lora_a_fwd(
+SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
     torch::Tensor& output,           // [num_tokens, max_rank]
     const torch::Tensor& input_ids,  // [num_tokens,]
     const torch::Tensor& weights,    // [num_loras, max_rank, vocab_size]

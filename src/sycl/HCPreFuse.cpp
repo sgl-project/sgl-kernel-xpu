@@ -6,6 +6,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 
 static constexpr int WG_SIZE = 96;  // 6 subgroups of 16 threads each
 static constexpr float LOG2E = 1.442695040888963f;
@@ -351,7 +352,7 @@ struct HCPreBigFuseWithNormKernel : public HCPreBigFuseKernelBase<scalar_t, VEC_
       }
 
       local_sqr_sum = sycl::reduce_over_group(sg, local_sqr_sum, sycl::plus<float>());
-      if (lane_id == 0) {
+      if (sg_id > 0 && lane_id == 0) {
         this->slm_[sg_id - 1] = local_sqr_sum;
       }
     }
@@ -491,7 +492,7 @@ static void launch_hc_pre_fuse_kernel(
   }
 }
 
-void hc_pre_big_fuse(
+SGL_KERNEL_EXPORT void hc_pre_big_fuse(
     const at::Tensor& gemm_out_mul,
     const at::Tensor& gemm_out_sqrsum,
     const at::Tensor& hc_scale,

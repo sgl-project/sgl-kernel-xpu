@@ -36,7 +36,7 @@
 
 namespace mla_prefill {
 
-void launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_small(
+__attribute__((visibility("default"))) void launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_small(
     at::Tensor& out,
     const at::Tensor& q_nope,
     const at::Tensor& q_pe,
@@ -55,7 +55,7 @@ void launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_small(
       workspace, sm_scale, causal, num_kv_splits);
 }
 
-void launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_medium(
+__attribute__((visibility("default"))) void launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_medium(
     at::Tensor& out,
     const at::Tensor& q_nope,
     const at::Tensor& q_pe,
@@ -74,7 +74,7 @@ void launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_medium(
       workspace, sm_scale, causal, num_kv_splits);
 }
 
-void launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_large(
+__attribute__((visibility("default"))) void launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_large(
     at::Tensor& out,
     const at::Tensor& q_nope,
     const at::Tensor& q_pe,
@@ -94,3 +94,43 @@ void launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_large(
 }
 
 }  // namespace mla_prefill
+
+#ifdef SGL_MLA_JIT_ENTRY
+// Stable C ABI entry for the runtime-JIT path. Tensors cross the dlopen boundary
+// as at::Tensor* (shared <torch/all.h> -> identical layout); the Q-tile bucket
+// (0=small, 1=medium, 2=large) is a runtime arg. One config (@ELEM_TAG@,
+// @PAGE_SIZE@) per .so, so the fixed symbol never collides across AOT TUs.
+extern "C" __attribute__((visibility("default"))) void sgl_mla_prefill_entry(
+    int bucket,
+    void* out,
+    const void* q_nope,
+    const void* q_pe,
+    const void* kv_c_and_k_pe_cache,
+    const void* cu_seqlens_q,
+    const void* seq_lens,
+    int64_t max_seqlen_q,
+    const void* page_table,
+    void* workspace,
+    double sm_scale,
+    bool causal,
+    int64_t num_kv_splits) {
+  at::Tensor& o = *static_cast<at::Tensor*>(out);
+  const at::Tensor& qn = *static_cast<const at::Tensor*>(q_nope);
+  const at::Tensor& qp = *static_cast<const at::Tensor*>(q_pe);
+  const at::Tensor& kv = *static_cast<const at::Tensor*>(kv_c_and_k_pe_cache);
+  const at::Tensor& cu = *static_cast<const at::Tensor*>(cu_seqlens_q);
+  const at::Tensor& sl = *static_cast<const at::Tensor*>(seq_lens);
+  const at::Tensor& pt = *static_cast<const at::Tensor*>(page_table);
+  at::Tensor& ws = *static_cast<at::Tensor*>(workspace);
+  if (bucket == 0) {
+    mla_prefill::launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_small(
+        o, qn, qp, kv, cu, sl, max_seqlen_q, pt, ws, sm_scale, causal, num_kv_splits);
+  } else if (bucket == 1) {
+    mla_prefill::launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_medium(
+        o, qn, qp, kv, cu, sl, max_seqlen_q, pt, ws, sm_scale, causal, num_kv_splits);
+  } else {
+    mla_prefill::launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_large(
+        o, qn, qp, kv, cu, sl, max_seqlen_q, pt, ws, sm_scale, causal, num_kv_splits);
+  }
+}
+#endif

@@ -104,7 +104,8 @@ void Xe20MoEGEMMLauncher(
   });
 }
 
-template void Xe20MoEGEMMLauncher<@TILE@, @SGLAYOUT@, static_cast<ActivationType>(@ACT_TYPE@), @FUSE_ACT@, @WITH_BIAS@>(
+template __attribute__((visibility("default")))
+void Xe20MoEGEMMLauncher<@TILE@, @SGLAYOUT@, static_cast<ActivationType>(@ACT_TYPE@), @FUSE_ACT@, @WITH_BIAS@>(
     sycl::queue,
     const void*,
     const void*,
@@ -119,5 +120,42 @@ template void Xe20MoEGEMMLauncher<@TILE@, @SGLAYOUT@, static_cast<ActivationType
     float,
     float,
     int);
+
+#ifdef SGL_MOE_JIT_ENTRY
+// Stable C ABI entry for the runtime-JIT path. Only emitted when this TU is
+// compiled as a standalone JIT module (one config per .so), so the fixed symbol
+// name never collides across the many AOT translation units.
+extern "C" __attribute__((visibility("default"))) void sgl_moe_gg_entry(
+    void* queue_ptr,
+    const void* activations,
+    const void* weights,
+    const void* scales,
+    const void* bias,
+    void* outputs,
+    int gemm_n,
+    int gemm_k,
+    const int* num_rows_per_expert,
+    int num_experts,
+    int* workspace,
+    float gemm1_alpha,
+    float gemm1_limit,
+    int ld_b) {
+  Xe20MoEGEMMLauncher<@TILE@, @SGLAYOUT@, static_cast<ActivationType>(@ACT_TYPE@), @FUSE_ACT@, @WITH_BIAS@>(
+      *static_cast<sycl::queue*>(queue_ptr),
+      activations,
+      weights,
+      scales,
+      bias,
+      outputs,
+      gemm_n,
+      gemm_k,
+      num_rows_per_expert,
+      num_experts,
+      workspace,
+      gemm1_alpha,
+      gemm1_limit,
+      ld_b);
+}
+#endif
 
 #undef SYCL_INTEL_TARGET

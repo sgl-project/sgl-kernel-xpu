@@ -36,6 +36,8 @@
 #include "cutlass/fast_math.h"
 #include "cutlass/kernel_hardware_info.h"
 
+constexpr int kReduceSplitKDimTile = 16;
+
 namespace cutlass::fmha::kernel {
 
 struct XeFHMAIndividualTileScheduler {
@@ -44,6 +46,7 @@ struct XeFHMAIndividualTileScheduler {
     FastDivmod divmod_num_heads;
     FastDivmod divmod_batch;
     int num_kv_splits_ = -1;
+    int q_tile_start = 0;
   };
 
   bool valid_ = true;
@@ -71,7 +74,7 @@ struct XeFHMAIndividualTileScheduler {
       grid.z *= num_kv_splits;
       num_head = shape.num_heads_kv;
     }
-    return Params{grid, {num_head}, {shape.batch * num_head}, num_kv_splits};
+    return Params{grid, {num_head}, {shape.batch * num_head}, num_kv_splits, 0};
   }
 
   template <int Num_SGs>
@@ -93,12 +96,12 @@ struct XeFHMAIndividualTileScheduler {
     if (params.num_kv_splits_ >= 1) {
       params.divmod_batch(idx_kv_split, idx_b, idx_kv_split);
       params.divmod_num_heads(idx_b, head, idx_b);
-      return make_coord(BlockIdxY(), BlockIdxX(), head, idx_b, idx_kv_split);
+      return make_coord(params.q_tile_start + BlockIdxY(), BlockIdxX(), head, idx_b, idx_kv_split);
     }
 
     idx_b = idx_kv_split;
     params.divmod_num_heads(idx_b, head, idx_b);
-    return make_coord(BlockIdxY(), BlockIdxX(), head, idx_b, (int)-1);
+    return make_coord(params.q_tile_start + BlockIdxY(), BlockIdxX(), head, idx_b, (int)-1);
   }
 
   CUTLASS_DEVICE
@@ -178,10 +181,13 @@ struct XeFHMAIndividualPersistentTileScheduler {
 };
 
 struct XeReduceSplitKTileScheduler {
+  static constexpr int kDimTile = kReduceSplitKDimTile;
+
   struct Params {
     dim3 grid;
     FastDivmod divmod_num_heads;
     int num_kv_splits = -1;
+    FastDivmod divmod_dim_tiles;
   };
 
   bool valid_ = true;
@@ -198,8 +204,9 @@ struct XeReduceSplitKTileScheduler {
       const int& num_kv_splits = -1) {
     using namespace cute;
 
-    dim3 grid(shape.seq_len_qo, shape.num_heads_q, shape.batch);
-    return Params{grid, {shape.num_heads_q}, num_kv_splits};
+    int const dim_tiles = ceil_div(shape.head_size_vo, kDimTile);
+    dim3 grid(shape.seq_len_qo * dim_tiles, shape.num_heads_q, shape.batch);
+    return Params{grid, {shape.num_heads_q}, num_kv_splits, {dim_tiles}};
   }
 
   template <int Num_SGs>
@@ -216,7 +223,9 @@ struct XeReduceSplitKTileScheduler {
   auto get_block_coord() {
     using namespace cute;
 
-    return make_coord(BlockIdxX(), BlockIdxY(), BlockIdxZ());
+    int seq_idx, dim_tile;
+    params.divmod_dim_tiles(seq_idx, dim_tile, int(BlockIdxX()));
+    return make_coord(seq_idx, BlockIdxY(), BlockIdxZ(), dim_tile);
   }
 
   CUTLASS_DEVICE

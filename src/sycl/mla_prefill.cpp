@@ -46,9 +46,13 @@
 #include <sycl/sycl.hpp>
 
 #include "Utils.h"
+#include "sgl_kernel_export.h"
 #include "sycl/kernels/mla/device/mla_decode_types.hpp"  // MlaXe workspace helper
 #include "sycl/kernels/mla/device/mla_prefill_dispatch.hpp"
 #include "sycl/kernels/mla/device/mla_prefill_types.hpp"
+#ifdef USE_MLA_JIT
+#include "jit/mla_jit.h"
+#endif
 
 namespace {
 
@@ -177,7 +181,7 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
 }  // namespace
 
 /// @brief Dispatch kernel for MLA prefill with varlen/ragged Q and causal mask.
-void flash_mla_prefill(
+SGL_KERNEL_EXPORT void flash_mla_prefill(
     at::Tensor& out,                        // (total_q, num_heads, latent_dim)
     const at::Tensor& q_nope,               // (total_q, num_heads, latent_dim)
     const at::Tensor& q_pe,                 // (total_q, num_heads, rope_dim)
@@ -245,6 +249,32 @@ void flash_mla_prefill(
   }
 #endif
 
+#ifdef USE_MLA_JIT
+  {
+    const int bucket_id = (bucket == Bucket::Small) ? 0 : (bucket == Bucket::Medium) ? 1 : 2;
+    std::string jit_err;
+    TORCH_CHECK(
+        sgl::mla_jit::mla_prefill_launch(
+            in_dtype == at::ScalarType::Half,
+            page_size,
+            bucket_id,
+            &out,
+            &q_nope,
+            &q_pe,
+            &kv_c_and_k_pe_cache,
+            &cu_seqlens_q,
+            &seq_lens,
+            max_seqlen_q,
+            &page_table,
+            &workspace,
+            sm_scale,
+            causal,
+            num_kv_splits,
+            jit_arch_code(),
+            &jit_err),
+        jit_err);
+  }
+#else
   switch (bucket) {
     case Bucket::Large:
       DISPATCH_MLA_PREFILL_DTYPE(large);
@@ -256,6 +286,7 @@ void flash_mla_prefill(
       DISPATCH_MLA_PREFILL_DTYPE(small);
       break;
   }
+#endif
 }
 
 #undef DISPATCH_MLA_PREFILL_PAGE_SIZE
@@ -264,7 +295,7 @@ void flash_mla_prefill(
 /// @brief Workspace size for MLA prefill (currently 0 – no split-K).
 /// Signature mirrors flash_mla_get_workspace_size for caller ergonomics; on XPU
 /// the device sm_count is queried internally, so callers don't pass it.
-int64_t flash_mla_prefill_get_workspace_size(
+SGL_KERNEL_EXPORT int64_t flash_mla_prefill_get_workspace_size(
     int64_t /*max_seq_len*/,
     int64_t /*num_batches*/,
     int64_t /*num_heads*/,

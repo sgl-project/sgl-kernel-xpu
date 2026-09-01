@@ -5,6 +5,7 @@
 
 #include "Utils.h"
 #include "comm/General.h"
+#include "sgl_kernel_export.h"
 
 namespace at::native::xpu {
 
@@ -421,10 +422,6 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_3D_kernel_impl(
   int64_t k_num_head = k_shape[1];
   int64_t k_num_head_d = k_stride[1];
   int64_t k_batch_d = k_stride[0];
-  if (is_neox_style) {
-    query_out = query_out.reshape({1, batch, q_num_head, head_size});
-    key_out = key_out.reshape({1, batch, k_num_head, head_size});
-  }
   TORCH_CHECK(cos_sin_cache.sizes()[1] == head_size, "Rotary dim doesn't match query head_size");
   TORCH_CHECK(cos_sin_cache.sizes()[1] == k_shape[2], "Rotary dim doesn't match key head_size");
   int64_t* offsets_ptr = nullptr;
@@ -453,7 +450,7 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_3D_kernel_impl(
   return {query_out, key_out};
 }
 
-std::tuple<at::Tensor, at::Tensor> rotary_embedding(
+SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor> rotary_embedding(
     at::Tensor& positions,
     at::Tensor& query,
     at::Tensor& key,

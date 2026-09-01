@@ -41,6 +41,7 @@
 #include "Utils.h"
 #include "comm/Numerics.h"
 #include "cutlass/float8.h"
+#include "sgl_kernel_export.h"
 
 // TODO: Remove this when sycl float8 is supported
 using cutlass::float_e4m3_t;
@@ -275,7 +276,7 @@ void launchFusedQKRopeImpl(
   sycl_kernel_submit(sycl::range<1>(gridSize * blockSize), sycl::range<1>(blockSize), q, kernel);
 }
 
-void fused_qk_rope(
+SGL_KERNEL_EXPORT void fused_qk_rope(
     torch::Tensor& qkv,
     int64_t num_heads_q,
     int64_t num_heads_k,
@@ -532,7 +533,7 @@ void launch_fused_rope_cache_kernel_scalar(
       sycl::range<1>(num_groups * kWorkGroupSize), sycl::range<1>(kWorkGroupSize), dpcppGetCurrentQueue(), kernel);
 }
 
-void fused_qk_rope_with_cos_sin_cache_inplace(
+SGL_KERNEL_EXPORT void fused_qk_rope_with_cos_sin_cache_inplace(
     at::Tensor& query,
     at::Tensor& key,
     at::Tensor& cos_sin_cache,

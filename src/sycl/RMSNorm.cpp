@@ -323,6 +323,14 @@ class RMSNormNoRstdForward : public NormNoRstdForward<scalar_t> {
     return NF::get_aligned_update_vec_size(Plane, vec_size, NF::X_data, NF::Y_data, gamma_data);
   }
 
+  // Per-element weight application, the single place the normalized value meets
+  // gamma.  Shared by the cached and non-cached update() loops and by the
+  // AddNoRstdForward mixin; GemmaRMSNormNoRstdForward hides it with the
+  // `1 + gamma` variant.
+  static inline scalar_t apply_weight(accscalar_t x, accscalar_t rstd, accscalar_t gamma) {
+    return static_cast<scalar_t>(x * rstd * gamma);
+  }
+
   template <int vec_size, int ITERS, bool cache_inputs, typename vec_t, typename index_t>
   void reduce_combine(
       sycl::nd_item<1> item_id,
@@ -386,8 +394,7 @@ class RMSNormNoRstdForward : public NormNoRstdForward<scalar_t> {
           vec_t y_val;
 #pragma unroll
           for (int v = 0; v < vec_size; ++v) {
-            y_val[v] = static_cast<scalar_t>(
-                static_cast<accscalar_t>(x_val[v]) * rstd * static_cast<accscalar_t>(gamma_val[v]));
+            y_val[v] = apply_weight(static_cast<accscalar_t>(x_val[v]), rstd, static_cast<accscalar_t>(gamma_val[v]));
           }
           *(reinterpret_cast<vec_t*>(NF::Y_data + y_group_offset + plane_offset)) = y_val;
         }
@@ -400,8 +407,7 @@ class RMSNormNoRstdForward : public NormNoRstdForward<scalar_t> {
         vec_t y_val;
 #pragma unroll
         for (int v = 0; v < vec_size; ++v) {
-          y_val[v] =
-              static_cast<scalar_t>(static_cast<accscalar_t>(x_val[v]) * rstd * static_cast<accscalar_t>(gamma_val[v]));
+          y_val[v] = apply_weight(static_cast<accscalar_t>(x_val[v]), rstd, static_cast<accscalar_t>(gamma_val[v]));
         }
         *(reinterpret_cast<vec_t*>(NF::Y_data + y_group_offset + plane_offset)) = y_val;
       }
@@ -412,69 +418,24 @@ class RMSNormNoRstdForward : public NormNoRstdForward<scalar_t> {
   weight_t* gamma_data;
 };
 
-template <typename scalar_t, typename weight_t>
-class GemmaRMSNormNoRstdForward : public RMSNormNoRstdForward<scalar_t, weight_t> {
+// Residual-add mixin for the register-cached no-rstd norms.  `BaseNorm` supplies
+// reduce_project() and the per-element weight application (apply_weight); this
+// only adds `x += add` in front of the reduction, so the llama-style and the
+// Gemma-style fused-add norms share one implementation.
+//
+// X_data is NEVER written here: the summed value lives in add_data (and in
+// reg[] when the inputs are cached), which is why the non-cached update() below
+// must re-read add_data and NOT X_data -- X_data still holds the original,
+// un-summed x.
+template <typename BaseNorm, typename scalar_t, typename weight_t>
+class AddNoRstdForward : public BaseNorm {
  public:
   using accscalar_t = acc_type<scalar_t>;
-  typedef RMSNormNoRstdForward<scalar_t, weight_t> RNF;
-  GemmaRMSNormNoRstdForward() = delete;
-  using RNF::RNF;
-
-  template <int vec_size, int ITERS, bool cache_inputs, typename vec_t, typename weight_vec_t, typename index_t>
-  void update(
-      sycl::nd_item<1> item_id,
-      const NormConfig& cfg,
-      index_t x_group_offset,
-      index_t y_group_offset,
-      accscalar_t rstd,
-      const vec_t (&reg)[cache_inputs ? ITERS : 1]) const {
-    const index_t lid = item_id.get_local_id(0);
-
-    if constexpr (cache_inputs) {
-#pragma unroll
-      for (int it = 0; it < ITERS; ++it) {
-        const index_t plane_offset = (static_cast<index_t>(it) * cfg.workgroup_size + lid) * vec_size;
-        if (plane_offset < cfg.Plane) {
-          vec_t x_val = reg[it];
-          weight_vec_t gamma_val = *(reinterpret_cast<weight_vec_t*>(RNF::gamma_data + plane_offset));
-          vec_t y_val;
-#pragma unroll
-          for (int v = 0; v < vec_size; ++v) {
-            y_val[v] = static_cast<scalar_t>(
-                static_cast<accscalar_t>(x_val[v]) * rstd *
-                (static_cast<accscalar_t>(1.0) + static_cast<accscalar_t>(gamma_val[v])));
-          }
-          *(reinterpret_cast<vec_t*>(RNF::Y_data + y_group_offset + plane_offset)) = y_val;
-        }
-      }
-    } else {
-      for (index_t plane_offset = lid * vec_size; plane_offset < cfg.Plane;
-           plane_offset += cfg.workgroup_size * vec_size) {
-        vec_t x_val = *(reinterpret_cast<vec_t*>(RNF::X_data + x_group_offset + plane_offset));
-        weight_vec_t gamma_val = *(reinterpret_cast<weight_vec_t*>(RNF::gamma_data + plane_offset));
-        vec_t y_val;
-#pragma unroll
-        for (int v = 0; v < vec_size; ++v) {
-          y_val[v] = static_cast<scalar_t>(
-              static_cast<accscalar_t>(x_val[v]) * rstd *
-              (static_cast<accscalar_t>(1.0) + static_cast<accscalar_t>(gamma_val[v])));
-        }
-        *(reinterpret_cast<vec_t*>(RNF::Y_data + y_group_offset + plane_offset)) = y_val;
-      }
-    }
-  }
-};
-
-template <typename scalar_t, typename weight_t>
-class GemmaAddRMSNormNoRstdForward : public GemmaRMSNormNoRstdForward<scalar_t, weight_t> {
- public:
-  using accscalar_t = acc_type<scalar_t>;
-  typedef GemmaRMSNormNoRstdForward<scalar_t, weight_t> Base;
+  typedef BaseNorm Base;
   typedef NormNoRstdForward<scalar_t> NF;
-  GemmaAddRMSNormNoRstdForward() = delete;
-  GemmaAddRMSNormNoRstdForward(
-      scalar_t* X_data, scalar_t* Y_data, weight_t* gamma_data, accscalar_t eps, scalar_t* add_data)
-      : GemmaRMSNormNoRstdForward<scalar_t, weight_t>(X_data, Y_data, gamma_data, eps), add_data(add_data) {}
+  AddNoRstdForward() = delete;
+  AddNoRstdForward(scalar_t* X_data, scalar_t* Y_data, weight_t* gamma_data, accscalar_t eps, scalar_t* add_data)
+      : BaseNorm(X_data, Y_data, gamma_data, eps), add_data(add_data) {}
 
   int get_update_vec_size(int Plane, int vec_size) const {
     return NF::get_aligned_update_vec_size(Plane, vec_size, NF::X_data, NF::Y_data, Base::gamma_data, add_data);
@@ -543,14 +504,15 @@ class GemmaAddRMSNormNoRstdForward : public GemmaRMSNormNoRstdForward<scalar_t, 
       const index_t lid = item_id.get_local_id(0);
       for (index_t plane_offset = lid * vec_size; plane_offset < cfg.Plane;
            plane_offset += cfg.workgroup_size * vec_size) {
+        // add_data, not X_data: the residual sum was stored there by
+        // reduce_combine, while X_data still holds the un-summed x.
         vec_t x_val = *(reinterpret_cast<vec_t*>(add_data + x_group_offset + plane_offset));
         weight_vec_t gamma_val = *(reinterpret_cast<weight_vec_t*>(Base::gamma_data + plane_offset));
         vec_t y_val;
 #pragma unroll
         for (int v = 0; v < vec_size; ++v) {
-          y_val[v] = static_cast<scalar_t>(
-              static_cast<accscalar_t>(x_val[v]) * rstd *
-              (static_cast<accscalar_t>(1.0) + static_cast<accscalar_t>(gamma_val[v])));
+          y_val[v] =
+              Base::apply_weight(static_cast<accscalar_t>(x_val[v]), rstd, static_cast<accscalar_t>(gamma_val[v]));
         }
         *(reinterpret_cast<vec_t*>(NF::Y_data + y_group_offset + plane_offset)) = y_val;
       }
@@ -560,6 +522,67 @@ class GemmaAddRMSNormNoRstdForward : public GemmaRMSNormNoRstdForward<scalar_t, 
  public:
   scalar_t* add_data;
 };
+
+template <typename scalar_t, typename weight_t>
+using AddRMSNormNoRstdForward = AddNoRstdForward<RMSNormNoRstdForward<scalar_t, weight_t>, scalar_t, weight_t>;
+
+template <typename scalar_t, typename weight_t>
+class GemmaRMSNormNoRstdForward : public RMSNormNoRstdForward<scalar_t, weight_t> {
+ public:
+  using accscalar_t = acc_type<scalar_t>;
+  typedef RMSNormNoRstdForward<scalar_t, weight_t> RNF;
+  GemmaRMSNormNoRstdForward() = delete;
+  using RNF::RNF;
+
+  // Hides RMSNormNoRstdForward::apply_weight: Gemma stores gamma - 1.
+  static inline scalar_t apply_weight(accscalar_t x, accscalar_t rstd, accscalar_t gamma) {
+    return static_cast<scalar_t>(x * rstd * (static_cast<accscalar_t>(1.0) + gamma));
+  }
+
+  template <int vec_size, int ITERS, bool cache_inputs, typename vec_t, typename weight_vec_t, typename index_t>
+  void update(
+      sycl::nd_item<1> item_id,
+      const NormConfig& cfg,
+      index_t x_group_offset,
+      index_t y_group_offset,
+      accscalar_t rstd,
+      const vec_t (&reg)[cache_inputs ? ITERS : 1]) const {
+    const index_t lid = item_id.get_local_id(0);
+
+    if constexpr (cache_inputs) {
+#pragma unroll
+      for (int it = 0; it < ITERS; ++it) {
+        const index_t plane_offset = (static_cast<index_t>(it) * cfg.workgroup_size + lid) * vec_size;
+        if (plane_offset < cfg.Plane) {
+          vec_t x_val = reg[it];
+          weight_vec_t gamma_val = *(reinterpret_cast<weight_vec_t*>(RNF::gamma_data + plane_offset));
+          vec_t y_val;
+#pragma unroll
+          for (int v = 0; v < vec_size; ++v) {
+            y_val[v] = apply_weight(static_cast<accscalar_t>(x_val[v]), rstd, static_cast<accscalar_t>(gamma_val[v]));
+          }
+          *(reinterpret_cast<vec_t*>(RNF::Y_data + y_group_offset + plane_offset)) = y_val;
+        }
+      }
+    } else {
+      for (index_t plane_offset = lid * vec_size; plane_offset < cfg.Plane;
+           plane_offset += cfg.workgroup_size * vec_size) {
+        vec_t x_val = *(reinterpret_cast<vec_t*>(RNF::X_data + x_group_offset + plane_offset));
+        weight_vec_t gamma_val = *(reinterpret_cast<weight_vec_t*>(RNF::gamma_data + plane_offset));
+        vec_t y_val;
+#pragma unroll
+        for (int v = 0; v < vec_size; ++v) {
+          y_val[v] = apply_weight(static_cast<accscalar_t>(x_val[v]), rstd, static_cast<accscalar_t>(gamma_val[v]));
+        }
+        *(reinterpret_cast<vec_t*>(RNF::Y_data + y_group_offset + plane_offset)) = y_val;
+      }
+    }
+  }
+};
+
+template <typename scalar_t, typename weight_t>
+using GemmaAddRMSNormNoRstdForward =
+    AddNoRstdForward<GemmaRMSNormNoRstdForward<scalar_t, weight_t>, scalar_t, weight_t>;
 
 template <
     typename scalar_t,
@@ -666,7 +689,7 @@ void launch_vectorized_rmsnorm_no_rstd_kernel(Norm& norm, const NormConfig& conf
 #undef DISPATCH_RMSNORM_NO_RSTD_VEC
 }
 
-template <typename scalar_t, typename weight_t, typename mean_t = float>
+template <typename scalar_t, typename weight_t>
 void RMSNormKernelImplInternal(
     const Tensor& X,
     const Tensor& gemma,
@@ -674,7 +697,6 @@ void RMSNormKernelImplInternal(
     int64_t N,
     acc_type<scalar_t> eps,
     Tensor& Y,
-    Tensor& rstd,
     int64_t input_batch_stride,
     int64_t output_batch_stride,
     int64_t input_inner_size,
@@ -683,8 +705,8 @@ void RMSNormKernelImplInternal(
     int64_t output_inner_stride) {
   scalar_t* X_data = X.data_ptr<scalar_t>();
   scalar_t* Y_data = Y.data_ptr<scalar_t>();
-  mean_t* var_data = rstd.data_ptr<mean_t>();
-  weight_t* gemma_data = gemma.defined() ? gemma.data_ptr<weight_t>() : nullptr;
+  weight_t* gemma_data = gemma.data_ptr<weight_t>();
+  RMSNormNoRstdForward<scalar_t, weight_t> rms_norm_no_rstd_forward(X_data, Y_data, gemma_data, eps);
 
   auto config = NormConfig(
       M,
@@ -693,38 +715,39 @@ void RMSNormKernelImplInternal(
       sizeof(scalar_t),
       input_batch_stride,
       output_batch_stride,
+      [&](int plane, int max_vec_size) { return rms_norm_no_rstd_forward.get_update_vec_size(plane, max_vec_size); },
       input_inner_size,
       input_inner_stride,
       output_inner_size,
       output_inner_stride);
-  RMSNormForward<scalar_t, weight_t> rms_norm_forward(X_data, Y_data, var_data, gemma_data, eps, M, N);
-  config.workgroup_num_foreach = 1;
-  config.WGPlane = config.Plane;
-
-  launch_vectorized_fused_norm_kernel<scalar_t, weight_t, RMSNormForward, true>(rms_norm_forward, config);
+  launch_vectorized_rmsnorm_no_rstd_kernel<scalar_t, weight_t>(rms_norm_no_rstd_forward, config);
 }
 
-template <typename scalar_t, typename weight_t, typename mean_t = float>
+template <typename scalar_t, typename weight_t>
 void FusedAddRMSNormKernelImplInternal(
-    const Tensor& X,
-    const Tensor& gemma,
-    int64_t M,
-    int64_t N,
-    acc_type<scalar_t> eps,
-    Tensor& rstd,
-    Tensor& residual) {
+    const Tensor& X, const Tensor& gemma, int64_t M, int64_t N, acc_type<scalar_t> eps, Tensor& residual) {
   scalar_t* X_data = X.data_ptr<scalar_t>();
-  mean_t* var_data = rstd.data_ptr<mean_t>();
-  weight_t* gemma_data = gemma.defined() ? gemma.data_ptr<weight_t>() : nullptr;
+  weight_t* gemma_data = gemma.data_ptr<weight_t>();
   scalar_t* residual_data = residual.data_ptr<scalar_t>();
+  AddRMSNormNoRstdForward<scalar_t, weight_t> add_rms_norm_no_rstd_forward(
+      X_data, X_data, gemma_data, eps, residual_data);
 
-  auto config = NormConfig(M, N, 1, sizeof(scalar_t), N, N);
-  AddRMSNormForward<scalar_t, weight_t> add_rms_norm_forward(
-      X_data, X_data, var_data, gemma_data, eps, residual_data, M, N);
-  config.workgroup_num_foreach = 1;
-  config.WGPlane = config.Plane;
+  auto config = NormConfig(
+      M,
+      N,
+      1,
+      sizeof(scalar_t),
+      N,
+      N,
+      [&](int plane, int max_vec_size) {
+        return add_rms_norm_no_rstd_forward.get_update_vec_size(plane, max_vec_size);
+      },
+      1,
+      0,
+      1,
+      0);
 
-  launch_vectorized_fused_norm_kernel<scalar_t, weight_t, AddRMSNormForward, true>(add_rms_norm_forward, config);
+  launch_vectorized_rmsnorm_no_rstd_kernel<scalar_t, weight_t>(add_rms_norm_no_rstd_forward, config);
 }
 
 template <typename scalar_t, typename weight_t>
@@ -800,7 +823,6 @@ SGL_KERNEL_EXPORT void rmsnorm(torch::Tensor& output, torch::Tensor& input, torc
   RowStrides in_strides = get_row_strides(input);
   RowStrides out_strides = get_row_strides(output);
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
-  Tensor rstd = at::empty({M}, input.options().dtype(kFloat));
 
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "RMSNormKernelImpl", [&]() {
@@ -813,7 +835,6 @@ SGL_KERNEL_EXPORT void rmsnorm(torch::Tensor& output, torch::Tensor& input, torc
                   N,
                   static_cast<acc_type<scalar_t>>(eps),
                   output,
-                  rstd,
                   in_strides.batch_stride,
                   out_strides.batch_stride,
                   in_strides.inner_size,
@@ -835,14 +856,13 @@ fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor wei
   // Flatten leading dimensions to 2D for the kernel
   Tensor input_ = flatten_to_2d(input, M, N);
   Tensor residual_ = flatten_to_2d(residual, M, N);
-  Tensor rstd = at::empty({M}, input_.options().dtype(kFloat));
 
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
         SYCL_DISPATCH_WEIGHT_TYPES(
             at::ScalarType::Half, at::ScalarType::BFloat16, weight.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
               FusedAddRMSNormKernelImplInternal<scalar_t, weight_t>(
-                  input_, weight, M, N, static_cast<acc_type<scalar_t>>(eps), rstd, residual_);
+                  input_, weight, M, N, static_cast<acc_type<scalar_t>>(eps), residual_);
             });
       });
 }

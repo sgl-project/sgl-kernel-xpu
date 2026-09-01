@@ -62,9 +62,19 @@ def fused_add_rms_norm(x, residual, weight, eps):
     return x, residual
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
-@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize(
+    "batch_size, hidden_size, dtype",
+    [
+        *[
+            (batch_size, hidden_size, dtype)
+            for batch_size in [1, 19, 99, 989]
+            for hidden_size in [111, 500, 1024, 2880, 3072, 3584, 4096, 8192, 16384]
+            for dtype in [torch.float16, torch.bfloat16]
+        ],
+        # gpt-oss: bf16 input + bf16 weight, H = 2880, prefill batch.
+        (4096, 2880, torch.bfloat16),
+    ],
+)
 @pytest.mark.parametrize("specify_out", [True, False])
 def test_norm(batch_size, hidden_size, dtype, specify_out):
     x = torch.randn(batch_size, hidden_size).to(device).to(dtype)
@@ -77,12 +87,22 @@ def test_norm(batch_size, hidden_size, dtype, specify_out):
     else:
         y = sgl_kernel.rmsnorm(x, w)
 
-    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(y_ref, y, **norm_tolerances(dtype))
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize(
+    "batch_size, hidden_size, dtype",
+    [
+        *[
+            (batch_size, hidden_size, dtype)
+            for batch_size in [1, 19, 99, 989]
+            for hidden_size in [111, 500, 1024, 2880, 3072, 3584, 4096, 8192, 16384]
+            for dtype in [torch.float16, torch.bfloat16, torch.float32]
+        ],
+        # gpt-oss: bf16 input + bf16 weight, H = 2880, prefill batch.
+        (4096, 2880, torch.bfloat16),
+    ],
+)
 def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     eps = 1e-6
 
@@ -98,8 +118,10 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     residual_fused = residual.clone()
     sgl_kernel.fused_add_rmsnorm(x_fused, residual_fused, weight, eps)
 
-    torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(x_fused, x_native, **norm_tolerances(dtype))
+    torch.testing.assert_close(
+        residual_fused, residual_native, **norm_tolerances(dtype)
+    )
 
 
 @pytest.mark.parametrize(

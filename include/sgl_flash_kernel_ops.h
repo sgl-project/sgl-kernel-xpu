@@ -78,7 +78,11 @@ void mha_fwd(
     std::optional<bool> pack_gqa_,
     int const sm_margin,
     at::Tensor& out,
-    std::optional<at::Tensor>& softmax_lse);
+    std::optional<at::Tensor>& softmax_lse,
+    // Device-resident Inkling logits [total_q, num_heads, extent], matching Q's dtype.
+    // The XPU FMHA path shears this source on the current stream.
+    std::optional<const at::Tensor>& rel_bias_,
+    bool rel_bias_is_sheared);
 
 void flash_mla_decode(
     torch::Tensor& out,
@@ -91,7 +95,7 @@ void flash_mla_decode(
     double sm_scale,
     int64_t num_kv_splits = -1);
 
-int64_t flash_mla_get_workspace_size(
+int64_t flash_mla_decode_get_workspace_size(
     int64_t max_seq_len, int64_t num_batches, int64_t num_heads, int64_t page_size, int64_t num_kv_splits = -1);
 
 // DeepSeek V4 Sparse MLA decode (dual KV pools + attn_sink)

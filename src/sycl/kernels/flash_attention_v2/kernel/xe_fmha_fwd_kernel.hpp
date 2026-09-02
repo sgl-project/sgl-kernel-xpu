@@ -446,19 +446,19 @@ class XeFMHAFwdKernel {
       auto dcO = const_cast<ElementO*>(p.O + offset_o);
       // NHD layout for GQA
       auto layout_q = [&] {
-        if constexpr (is_var_len && !CollectiveMainloop::ScoreBlock2D) {
+        if constexpr (is_var_len && (!CollectiveMainloop::ScoreBlock2D || PackGQA_)) {
           return make_ordered_layout(shape_Q, VarLenQLayoutStep_{});
         }
         return make_layout(shape_Q, p.dQ);
       }();
       auto layout_k = [&] {
-        if constexpr (is_var_len && !CollectiveMainloop::ScoreBlock2D) {
+        if constexpr (is_var_len && (!CollectiveMainloop::ScoreBlock2D || PackGQA_)) {
           return make_ordered_layout(shape_K, VarLenKLayoutStep_{});
         }
         return make_layout(shape_K, p.dK);
       }();
       auto layout_v = [&] {
-        if constexpr (is_var_len && !CollectiveMainloop::ScoreBlock2D) {
+        if constexpr (is_var_len && (!CollectiveMainloop::ScoreBlock2D || PackGQA_)) {
           return make_ordered_layout(shape_V, VarLenVLayoutStep_{});
         }
         return make_layout(shape_V, p.dV);
@@ -466,7 +466,7 @@ class XeFMHAFwdKernel {
 
       // NHD layout for GQA
       auto layout_o = [&] {
-        if constexpr (is_var_len && !CollectiveMainloop::ScoreBlock2D) {
+        if constexpr (is_var_len && (!CollectiveMainloop::ScoreBlock2D || PackGQA_)) {
           return make_ordered_layout(shape_O, VarLenOLayoutStep_{});
         }
         return make_layout(shape_O, p.dO);

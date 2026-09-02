@@ -3005,7 +3005,83 @@ def test_flash_attn_with_kvcache_page_size_1():
     assert out.data_ptr() == out_buf.data_ptr()
     torch.testing.assert_close(out, out_ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(lse, lse_ref, atol=3e-2, rtol=3e-2)
+@pytest.mark.skipif(device.type != "xpu", reason="XPU not available")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("d", [72, 128])
+def test_flash_attn_varlen_output_noncontiguous(d, causal, dtype):
+    """q/k/v sliced out of a fused qkv-projection-like buffer (last dim
+    contiguous, but row_stride > num_heads * head_size) must produce the same
+    output as the .contiguous() copy of the same data, without the caller
+    having to pay for that copy."""
+    from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+    torch.random.manual_seed(d + int(causal))
+    batch_size, seqlen_q, seqlen_k, nheads = 4, 96, 128, 8
+
+    def sliced_qkv(total, nheads):
+        # Emulates a fused qkv_proj output of width 2 * nheads * d, split along
+        # the last dim into two (nheads, d) chunks: last dim stays contiguous,
+        # but row_stride == 2 * nheads * d != nheads * d.
+        fused = torch.randn(
+            total, 2 * nheads * d, device=device, dtype=dtype
+        )
+        a, b = fused.split(nheads * d, dim=-1)
+        return a.view(total, nheads, d), b.view(total, nheads, d)
+
+    q, _ = sliced_qkv(batch_size * seqlen_q, nheads)
+    k, v = sliced_qkv(batch_size * seqlen_k, nheads)
+    for t in (q, k, v):
+        assert t.stride(-1) == 1 and t.stride(-3) != nheads * d
+
+    cu_seqlens_q = torch.arange(
+        0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32, device=device
+    )
+    cu_seqlens_k = torch.arange(
+        0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=torch.int32, device=device
+    )
+    softmax_scale = 1.0 / math.sqrt(d)
+
+    kwargs = dict(
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        causal=causal,
+        softmax_scale=softmax_scale,
+    )
+
+    out = flash_attn_varlen_func(q.contiguous(), k.contiguous(), v.contiguous(), **kwargs)
+    # attention_ref expects batched (batch, seqlen, nheads, d) tensors, not the
+    # ragged (total, nheads, d) layout flash_attn_varlen_func takes. Every batch
+    # here has the same seqlen (evenly-spaced cu_seqlens), so splitting the
+    # leading "total" dim into (batch, seqlen) is a pure view (single uniform
+    # stride), which works even though q/k/v are non-contiguous.
+    out_ref, _ = attention_ref(
+        q.view(batch_size, seqlen_q, nheads, d),
+        k.view(batch_size, seqlen_k, nheads, d),
+        v.view(batch_size, seqlen_k, nheads, d),
+        softmax_scale,
+        causal=causal,
+    )
+    out_pt, _ = attention_ref(
+        q.view(batch_size, seqlen_q, nheads, d),
+        k.view(batch_size, seqlen_k, nheads, d),
+        v.view(batch_size, seqlen_k, nheads, d),
+        softmax_scale,
+        causal=causal,
+        upcast=False,
+        reorder_ops=True,
+    )
+    out_ref = out_ref.reshape(batch_size * seqlen_q, nheads, d)
+    out_pt = out_pt.reshape(batch_size * seqlen_q, nheads, d)
+    torch.xpu.synchronize()
+    # Numerical error if we just do any arithmetic on out_ref
+    fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+    assert (out - out_ref).abs().max().item() <= 2 * (
+        out_pt - out_ref
+    ).abs().max().item() + fwd_atol, "non-contiguous q/k/v must match golden result"
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    sys.exit(pytest.main([f"{__file__}::test_flash_attn_varlen_output_noncontiguous"]))

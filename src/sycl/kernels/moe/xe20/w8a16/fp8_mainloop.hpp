@@ -29,7 +29,7 @@
 #pragma clang diagnostic ignored "-Wpass-failed"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
-namespace MoE_FP8 {
+namespace moe_w8a16 {
 
 using namespace cute;
 
@@ -67,7 +67,7 @@ CUTE_DEVICE Element apply_bf16_weight_scale(Element value, float scale) {
 }
 
 template <int Stages>
-class XeDefault {};
+class W8A16MainloopPolicy {};
 
 template <
     class DispatchPolicy_,
@@ -80,7 +80,7 @@ template <
     class TiledMMA_,
     bool WeightScalePerExpert = false,
     bool WeightScaleBlocked = false>
-struct MoEMainloopFp8Weight {
+struct Fp8W8A16Mainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
 
@@ -95,8 +95,8 @@ template <
     class TiledMMA_,
     bool WeightScalePerExpert,
     bool WeightScaleBlocked>
-struct MoEMainloopFp8Weight<
-    XeDefault<Stages>,
+struct Fp8W8A16Mainloop<
+    W8A16MainloopPolicy<Stages>,
     TiledCopyA_,
     TiledCopyBPacked_,
     TiledCopyD_,
@@ -114,7 +114,7 @@ struct MoEMainloopFp8Weight<
   using BPackedTensor = BPackedTensor_;
   using DTensor = DTensor_;
 
-  MoEMainloopFp8Weight() {}
+  Fp8W8A16Mainloop() {}
 
   template <typename Coord>
   CUTLASS_DEVICE void run_w8a16_block(
@@ -376,4 +376,4 @@ struct MoEMainloopFp8Weight<
   }
 };
 
-}  // namespace MoE_FP8
+}  // namespace moe_w8a16

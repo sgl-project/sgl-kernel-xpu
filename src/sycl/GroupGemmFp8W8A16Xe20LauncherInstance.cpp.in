@@ -9,7 +9,7 @@
 #include "sycl/Utils.h"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
-#include "sycl/kernels/moe/xe20/fp8/moe_kernel.hpp"
+#include "sycl/kernels/moe/xe20/w8a16/fp8_kernel.hpp"
 
 using namespace cute;
 
@@ -54,7 +54,7 @@ void Xe20MoEGEMMFp8W8A16Launcher(
   namespace syclex = sycl::ext::oneapi::experimental;
   namespace intelex = sycl::ext::intel::experimental;
   syclex::properties kernel_props{syclex::sub_group_size<16>, intelex::grf_size<256>};
-  using Kernel = MoE_FP8::MoEGEMMFp8Weight<
+  using Kernel = moe_w8a16::Fp8W8A16Kernel<
       Tile,
       SGLayout,
       TensorA,

@@ -19,12 +19,12 @@
 #include "cutlass/kernel_hardware_info.hpp"
 #include "cutlass/platform/platform.h"
 #include "cutlass/util/packed_stride.hpp"
-#include "moe_mainloop.hpp"
+#include "fp8_mainloop.hpp"
 
 #pragma clang diagnostic ignored "-Wpass-failed"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
-namespace MoE_FP8 {
+namespace moe_w8a16 {
 using namespace cute;
 
 template <
@@ -36,7 +36,7 @@ template <
     typename TiledMMA,
     bool WeightScalePerExpert = false,
     bool WeightScaleBlocked = false>
-class MoEGEMMFp8Weight {
+class Fp8W8A16Kernel {
  public:
   using ElementA = cutlass::bfloat16_t;
   using ElementD = cutlass::bfloat16_t;
@@ -46,8 +46,8 @@ class MoEGEMMFp8Weight {
   using SGPerWG = decltype(product(take<1, 4>(shape(typename TiledMMA::ThrLayoutVMNK{}))));
 
   constexpr static int Stages = 3;
-  using MainloopDispatchPolicy = MoE_FP8::XeDefault<Stages>;
-  using CollectiveMainloop = MoEMainloopFp8Weight<
+  using MainloopDispatchPolicy = moe_w8a16::W8A16MainloopPolicy<Stages>;
+  using CollectiveMainloop = Fp8W8A16Mainloop<
       MainloopDispatchPolicy,
       TiledCopyA,
       TiledCopyBPacked,
@@ -189,4 +189,4 @@ class MoEGEMMFp8Weight {
     }
   };
 };
-}  // namespace MoE_FP8
+}  // namespace moe_w8a16

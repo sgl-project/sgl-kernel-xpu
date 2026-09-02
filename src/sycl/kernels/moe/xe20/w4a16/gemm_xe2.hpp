@@ -38,6 +38,7 @@
 #include <sycl/sycl.hpp>
 
 #include "../common/block_2d_copy_d.hpp"
+#include "../common/scale.hpp"
 #include "cutlass/kernel_hardware_info.h"
 #include "cutlass/platform/platform.h"
 #include "cutlass/tensor_ref.h"
@@ -48,32 +49,6 @@
 namespace moe_w4a16 {
 
 using namespace cute;
-
-template <typename TB>
-CUTE_DEVICE TB apply_scale(TB& x, float& y) {
-  static_assert(is_any_of_v<TB, bfloat16_t, half_t>, "Only BF16 & FP16 are supported");
-  uint16_t z = sycl::bit_cast<uint16_t>(x);
-#if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
-  if constexpr (is_same_v<TB, half_t>) {
-    asm("{\n"
-        ".decl Z_FP16 v_type=G type=HF num_elts=16 alias=<%0,0>\n"
-        ".decl Y_FP32 v_type=G type=F num_elts=16 alias=<%1,0>\n"
-        "mul (M1, 16) Z_FP16(0,0)<1> Z_FP16(0,0)<1;1,0> Y_FP32(0,0)<1;1,0>\n"
-        "}\n"
-        : "+rw"(z)
-        : "rw"(y));
-  } else {
-    asm("{\n"
-        ".decl Z_BF16 v_type=G type=BF num_elts=16 alias=<%0,0>\n"
-        ".decl Y_FP32 v_type=G type=F num_elts=16 alias=<%1,0>\n"
-        "mul (M1, 16) Z_BF16(0,0)<1> Z_BF16(0,0)<1;1,0> Y_FP32(0,0)<1;1,0>\n"
-        "}\n"
-        : "+rw"(z)
-        : "rw"(y));
-  }
-#endif
-  return sycl::bit_cast<TB>(z);
-}
 
 template <
     class GmemTiledCopyA,
@@ -412,14 +387,14 @@ CUTE_DEVICE void xe_gemm_4bits(
             if constexpr (std::is_same_v<TA, half_t>) {
               tCrB(cute::tuple(c, _), n, _)[i] = value * scales[n * channel_num + c];
             } else {
-              tCrB(cute::tuple(c, _), n, _)[i] = apply_scale(value, scales[n * channel_num + c]);
+              tCrB(cute::tuple(c, _), n, _)[i] = moe_xe20::apply_bf16_or_fp16_scale(value, scales[n * channel_num + c]);
             }
           } else {
             if constexpr (std::is_same_v<TA, half_t>) {
               tCrB(cute::tuple(c, _), n, _)[i] *= scales[n * channel_num + c];
             } else {
               tCrB(cute::tuple(c, _), n, _)[i] =
-                  apply_scale(tCrB(cute::tuple(c, _), n, _)[i], scales[n * channel_num + c]);
+                  moe_xe20::apply_bf16_or_fp16_scale(tCrB(cute::tuple(c, _), n, _)[i], scales[n * channel_num + c]);
             }
           }
         }

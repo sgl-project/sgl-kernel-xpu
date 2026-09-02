@@ -14,6 +14,7 @@
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <sycl/sycl.hpp>
 
+#include "../common/scale.hpp"
 #include "cutlass/float8.h"
 #include "cutlass/half.h"
 #include "cutlass/kernel_hardware_info.h"
@@ -37,34 +38,6 @@ static constexpr int FP8_GROUP_SIZE_K = 128;
 
 // Number of work-items per subgroup on Xe (SIMD lane count).
 static constexpr int SUBGROUP_SIZE = 16;
-
-template <typename Element>
-CUTE_DEVICE Element apply_bf16_weight_scale(Element value, float scale) {
-  static_assert(cute::is_same_v<Element, cutlass::bfloat16_t> || cute::is_same_v<Element, cutlass::half_t>);
-  uint16_t bits = sycl::bit_cast<uint16_t>(value);
-#if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
-  if constexpr (cute::is_same_v<Element, cutlass::bfloat16_t>) {
-    asm("{\n"
-        ".decl Z_BF16 v_type=G type=BF num_elts=16 alias=<%0,0>\n"
-        ".decl Y_FP32 v_type=G type=F num_elts=16 alias=<%1,0>\n"
-        "mul (M1, 16) Z_BF16(0,0)<1> Z_BF16(0,0)<1;1,0> Y_FP32(0,0)<1;1,0>\n"
-        "}\n"
-        : "+rw"(bits)
-        : "rw"(scale));
-  } else {
-    asm("{\n"
-        ".decl Z_FP16 v_type=G type=HF num_elts=16 alias=<%0,0>\n"
-        ".decl Y_FP32 v_type=G type=F num_elts=16 alias=<%1,0>\n"
-        "mul (M1, 16) Z_FP16(0,0)<1> Z_FP16(0,0)<1;1,0> Y_FP32(0,0)<1;1,0>\n"
-        "}\n"
-        : "+rw"(bits)
-        : "rw"(scale));
-  }
-#else
-  return Element(static_cast<float>(value) * scale);
-#endif
-  return sycl::bit_cast<Element>(bits);
-}
 
 template <int Stages>
 class W8A16MainloopPolicy {};
@@ -206,7 +179,7 @@ struct Fp8W8A16Mainloop<
       reorder(tBrB_packed, tSrB);
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < tSrB.size(); ++i) {
-        tSrB(i) = apply_bf16_weight_scale(tSrB(i), w_scale);
+        tSrB(i) = moe_xe20::apply_bf16_or_fp16_scale(tSrB(i), w_scale);
       }
       cute::gemm(mma, tSrA, tSrB, tCrC);
       barrier_wait(barrier_scope);

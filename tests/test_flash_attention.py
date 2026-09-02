@@ -3005,6 +3005,8 @@ def test_flash_attn_with_kvcache_page_size_1():
     assert out.data_ptr() == out_buf.data_ptr()
     torch.testing.assert_close(out, out_ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(lse, lse_ref, atol=3e-2, rtol=3e-2)
+
+
 @pytest.mark.skipif(device.type != "xpu", reason="XPU not available")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("causal", [False, True])
@@ -3023,9 +3025,7 @@ def test_flash_attn_varlen_output_noncontiguous(d, causal, dtype):
         # Emulates a fused qkv_proj output of width 2 * nheads * d, split along
         # the last dim into two (nheads, d) chunks: last dim stays contiguous,
         # but row_stride == 2 * nheads * d != nheads * d.
-        fused = torch.randn(
-            total, 2 * nheads * d, device=device, dtype=dtype
-        )
+        fused = torch.randn(total, 2 * nheads * d, device=device, dtype=dtype)
         a, b = fused.split(nheads * d, dim=-1)
         return a.view(total, nheads, d), b.view(total, nheads, d)
 
@@ -3051,7 +3051,9 @@ def test_flash_attn_varlen_output_noncontiguous(d, causal, dtype):
         softmax_scale=softmax_scale,
     )
 
-    out = flash_attn_varlen_func(q.contiguous(), k.contiguous(), v.contiguous(), **kwargs)
+    out = flash_attn_varlen_func(
+        q.contiguous(), k.contiguous(), v.contiguous(), **kwargs
+    )
     # attention_ref expects batched (batch, seqlen, nheads, d) tensors, not the
     # ragged (total, nheads, d) layout flash_attn_varlen_func takes. Every batch
     # here has the same seqlen (evenly-spaced cu_seqlens), so splitting the

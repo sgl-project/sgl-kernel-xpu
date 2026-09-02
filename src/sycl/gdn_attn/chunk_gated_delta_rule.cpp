@@ -6,6 +6,7 @@
 #include <sycl/sycl.hpp>
 
 #include "../Utils.h"
+#include "../kernels/gdn_attn/chunk_compute_A_inverse_fused_xe20.hpp"
 #include "../kernels/gdn_attn/chunk_gated_delta_rule_kernels_xe20.hpp"
 #include "sgl_kernel_export.h"
 

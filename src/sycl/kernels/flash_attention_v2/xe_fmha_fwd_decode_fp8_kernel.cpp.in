@@ -16,6 +16,7 @@ namespace decode {
 
 template <>
 __attribute__((visibility("default"))) void FmhaDecodeFp8Runner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@, @ELEM_TYPE@>::operator()(const Arguments& params) const {
+  TORCH_CHECK(params.rel_bias_ptr == nullptr, "relative attention does not support fp8 KV cache");
   using TileShapeQK = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@PAGE_SIZE@>, cute::_64>;
   using TileShapePV = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@PAGE_SIZE@>>;
   using TileShapeOutput = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;

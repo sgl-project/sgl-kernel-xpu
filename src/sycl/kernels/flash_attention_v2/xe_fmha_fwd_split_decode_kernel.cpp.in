@@ -77,6 +77,51 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
         return;
     }
 
+#if @HEAD_DIM@ == 128 || @HEAD_DIM@ == 512
+  if (params.rel_bias_ptr != nullptr) {
+    TORCH_CHECK(params.dv == @HEAD_DIM@, "relative attention requires head_dim_v == @HEAD_DIM@");
+    TORCH_CHECK(!params.is_e4m3 && !params.is_e5m2, "relative attention does not support fp8 KV cache");
+    TORCH_CHECK(
+        params.rel_bias_head_stride ==
+            flash_attention_v2::relative_attention::decode_padded_cols(params.rel_bias_extent, @PAGE_SIZE@),
+        "relative attention expects a decode-sheared bias with ",
+        flash_attention_v2::relative_attention::decode_padded_cols(params.rel_bias_extent, @PAGE_SIZE@),
+        " columns");
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      using Element = @ELEM_TYPE@;
+      SplitDecodeConfig<
+          false,
+          LocalMask,
+          false,
+          /*LSE=*/false,
+          TileShapeQK,
+          TileShapePV,
+          TileShapeOutput,
+          SubgroupLayoutQK,
+          void,
+          1,
+          Element,
+          Element,
+          Element,
+          Element,
+          void,
+          cute::Stride<int, cute::_1, int, int>,
+          cute::Stride<int, cute::_1, int, int>,
+          cute::Stride<cute::_1, int, int, int>,
+          cute::Stride<int, cute::_1, int, int>,
+          cute::Stride<int, cute::_1, int, int>,
+          void,
+          void,
+          void,
+          void,
+          true>::run(params);
+    });
+    return;
+  }
+#else
+  TORCH_CHECK(params.rel_bias_ptr == nullptr, "relative attention is only compiled for head_dim == 128 or 512");
+#endif
+
 #if @HEAD_DIM@ == 64
     AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {

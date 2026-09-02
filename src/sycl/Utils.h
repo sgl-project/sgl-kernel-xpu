@@ -11,7 +11,7 @@
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_xpu(), #x " must be on XPU")
 #define CHECK_SHAPE(x, ...) \
-  TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
+  TORCH_CHECK(x.sizes() == c10::ArrayRef<int64_t>({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_LAST_DIM_CONTIGUOUS(x) \
   TORCH_CHECK(x.strides()[x.strides().size() - 1] == 1, #x "must be contiguous at last dimension")
@@ -350,6 +350,19 @@ inline void check_shape(const at::Tensor& a, const at::Tensor& b, const char* a_
       default:                                                                          \
         AT_ERROR(#NAME, " not implemented for '", toString(TYPE), "'");                 \
     }                                                                                   \
+  }
+
+#define SYCL_DISPATCH_FLOATING_TYPES_AND3(SCALARTYPE1, SCALARTYPE2, SCALARTYPE3, TYPE, NAME, ...) \
+  {                                                                                               \
+    const auto& the_type = TYPE;                                                                  \
+    at::ScalarType _st = ::detail::scalar_type(the_type);                                         \
+    switch (_st) {                                                                                \
+      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE1, float, __VA_ARGS__)                                 \
+      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE2, sycl::ext::oneapi::bfloat16, __VA_ARGS__)           \
+      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE3, sycl::half, __VA_ARGS__)                            \
+      default:                                                                                    \
+        AT_ERROR(#NAME, " not implemented for '", toString(TYPE), "'");                           \
+    }                                                                                             \
   }
 
 template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>

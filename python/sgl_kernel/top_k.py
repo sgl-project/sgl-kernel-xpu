@@ -23,13 +23,7 @@ def fast_topk_v2(
     Returns:
         The topk indices tensor of shape (B, topk)
     """
-    if topk != 2048:
-        raise ValueError("fast_topk_v2 only supports topk=2048")
-    if score.dim() != 2:
-        raise ValueError("score must be a 2D tensor")
-    topk_indices = score.new_empty((score.size(0), topk), dtype=torch.int32)
-    torch.ops.sgl_kernel.fast_topk.default(score, topk_indices, lengths, row_starts)
-    return topk_indices
+    return torch.ops.sgl_kernel.fast_topk(score, lengths, topk, row_starts)
 
 
 def fast_topk_transform_fused(
@@ -58,15 +52,9 @@ def fast_topk_transform_fused(
     Returns:
         The topk indices tensor of shape (B, topk)
     """
-    if topk != 2048:
-        raise ValueError("fast_topk_transform_fused only supports topk=2048")
-    if score.dim() != 2:
-        raise ValueError("score must be a 2D tensor")
-    dst_page_table = score.new_empty((score.shape[0], topk), dtype=torch.int32)
-    torch.ops.sgl_kernel.fast_topk_transform_fused.default(
-        score, lengths, dst_page_table, page_table_size_1, cu_seqlens_q, row_starts
+    return torch.ops.sgl_kernel.fast_topk_transform_fused(
+        score, lengths, page_table_size_1, cu_seqlens_q, topk, row_starts
     )
-    return dst_page_table
 
 
 def fast_topk_transform_ragged_fused(
@@ -95,18 +83,12 @@ def fast_topk_transform_ragged_fused(
     Returns:
         The topk indices tensor of shape (B, topk)
     """
-    if topk != 2048:
-        raise ValueError("fast_topk_transform_ragged_fused only supports topk=2048")
-    if score.dim() != 2:
-        raise ValueError("score must be a 2D tensor")
-    topk_indices_ragged = score.new_empty((score.shape[0], topk), dtype=torch.int32)
-    torch.ops.sgl_kernel.fast_topk_transform_ragged_fused.default(
-        score, lengths, topk_indices_ragged, topk_indices_offset, row_starts
+    return torch.ops.sgl_kernel.fast_topk_transform_ragged_fused(
+        score, lengths, topk_indices_offset, topk, row_starts
     )
-    return topk_indices_ragged
 
 
-def topk_transform_512(
+def topk_transform(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
     page_tables: torch.Tensor,
@@ -114,26 +96,43 @@ def topk_transform_512(
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
-    torch.ops.sgl_kernel.topk_transform_512.default(
+    torch.ops.sgl_kernel.topk_transform(
         scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
     )
 
 
-def topk_transform_512_v2(
+def topk_transform_paged(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
-    page_tables: torch.Tensor,
+    page_tables: Optional[torch.Tensor],
     out_page_indices: torch.Tensor,
     page_size: int,
     metadata: torch.Tensor,
-    out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
-    torch.ops.sgl_kernel.topk_transform_512_v2.default(
-        scores,
-        seq_lens,
-        page_tables,
-        out_page_indices,
-        page_size,
-        metadata,
-        out_raw_indices,
+    torch.ops.sgl_kernel.topk_transform_paged(
+        scores, seq_lens, page_tables, out_page_indices, page_size, metadata
+    )
+
+
+def topk_transform_ragged(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out_indices: torch.Tensor,
+    out_offsets: torch.Tensor,
+    row_starts: Optional[torch.Tensor] = None,
+) -> None:
+    """
+    Ragged (prefill) top-k: select inside a per-row window and rebase the
+    selected positions onto the flattened KV.
+    Args:
+        scores: The score tensor of shape (B, L).
+        seq_lens: The per-row window length of shape (B,).
+        out_indices: The output tensor of shape (B, topk). topk is inferred
+            from out_indices.size(1).
+        out_offsets: Added to every selected position of shape (B,).
+        row_starts: The start column of each row's window of shape (B).
+            Defaults to 0 for every row when omitted.
+    """
+    torch.ops.sgl_kernel.topk_transform_ragged(
+        scores, seq_lens, out_indices, out_offsets, row_starts
     )

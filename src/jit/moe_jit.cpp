@@ -326,7 +326,7 @@ Fp8W8A16Fn resolve_fp8_w8a16(int tile_id, bool block_scale, int arch, std::strin
     }
 
     jit::CompileSpec spec;
-    spec.template_path = cfg.src_root + "/sycl/GroupGemmFp8W8A16Xe20LauncherInstance.cpp.in";
+    spec.template_path = cfg.src_root + "/sycl/GroupGemmW8A16Xe20LauncherInstance.cpp.in";
     spec.subs["TILE"] = kFp8Tiles[tile_id].tile;
     spec.subs["SGLAYOUT"] = kFp8Tiles[tile_id].sglayout;
     spec.subs["WEIGHT_SCALE_BLOCKED"] = block_scale ? "true" : "false";

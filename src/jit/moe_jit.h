@@ -65,7 +65,7 @@ bool w4a16_grouped_gemm_launch(
 
 // Launch the FP8-weight/BF16-activation grouped GEMM. The tile is selected
 // from the routed M, GEMM shape, and scalar/block scale layout exactly as in
-// GroupGemmFp8W8A16Xe20.cpp.
+// GroupGemmW8A16Xe20.cpp.
 bool fp8_w8a16_grouped_gemm_launch(
     int avg_m,
     int scale_count,

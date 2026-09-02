@@ -19,7 +19,7 @@
 #include "cutlass/kernel_hardware_info.hpp"
 #include "cutlass/platform/platform.h"
 #include "cutlass/util/packed_stride.hpp"
-#include "fp8_mainloop.hpp"
+#include "moe_mainloop.hpp"
 
 #pragma clang diagnostic ignored "-Wpass-failed"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"

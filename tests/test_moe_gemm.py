@@ -928,7 +928,7 @@ def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_input_dtypes(weight_dtype, scale_dty
 # quantization error.
 
 FP8_E4M3_MAX = 448.0
-FP8_BLOCK_SIZE = 128  # matches FP8_GROUP_SIZE_K in w8a16/fp8_mainloop.hpp
+FP8_BLOCK_SIZE = 128  # matches FP8_GROUP_SIZE_K in w8a16/moe_mainloop.hpp
 
 
 def _make_fp8_api_validation_inputs(hidden_dtype=torch.bfloat16):

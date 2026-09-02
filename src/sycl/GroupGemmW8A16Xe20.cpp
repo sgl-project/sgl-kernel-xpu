@@ -10,7 +10,7 @@
 #include "Utils.h"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
-#include "kernels/moe/xe20/w8a16/fp8_kernel.hpp"
+#include "kernels/moe/xe20/w8a16/moe_kernel.hpp"
 #include "sgl_kernel_export.h"
 #ifdef USE_MOE_JIT
 #include "jit/moe_jit.h"

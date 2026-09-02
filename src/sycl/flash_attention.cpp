@@ -841,8 +841,10 @@ void mha_fwd_nopage(
   TORCH_CHECK(head_size % alignment == 0, "head_size should be a multiple of " + std::to_string(alignment));
   TORCH_CHECK(head_size_v % alignment == 0, "head_size_v should be a multiple of " + std::to_string(alignment));
 
-  // ``out`` is caller-provided and written in place. Non-paged prefill does not
-  // currently compute the softmax logsumexp (``softmax_lse`` is left untouched).
+  // ``out`` is caller-provided and written in place. Whether to compute the
+  // softmax logsumexp is derived from the caller-provided ``softmax_lse``
+  // optional (a present tensor requests it; std::nullopt skips it).
+  bool const return_softmax_lse = softmax_lse.has_value();
 
   int const head_size_rounded = round_up_headdim(head_size);
 
@@ -872,8 +874,8 @@ void mha_fwd_nopage(
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
 
-  params.softmax_lse_ptr = softmax_lse.has_value() ? softmax_lse->data_ptr() : nullptr;
-  params.return_softmax_lse = softmax_lse.has_value();
+  params.softmax_lse_ptr = return_softmax_lse ? softmax_lse->data_ptr() : nullptr;
+  params.return_softmax_lse = return_softmax_lse;
 
   params.b = batch_size;
   params.h = num_heads;
@@ -966,8 +968,6 @@ void mha_fwd_nopage(
       TORCH_CHECK(false, "Unsupported head size for non-paged prefill attention: ", params.d);
   }
 #endif
-
-  // TODO: Support prefill softmax_lse, now is 0
 }
 
 void mha_fwd(
@@ -1356,8 +1356,6 @@ void mha_fwd(
       TORCH_CHECK(false, "Unsupported head size for paged prefill attention: ", params.d);
   }
 #endif
-
-  // TODO: Support prefill softmax_lse, now is 0
 }
 
 }  // namespace prefill

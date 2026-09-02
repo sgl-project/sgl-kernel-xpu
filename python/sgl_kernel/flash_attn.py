@@ -214,6 +214,10 @@ def flash_attn_with_kvcache(
            to automatically determine the number of splits.
            Don't change this unless you know what you are doing.
         return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
+            Supported alongside causal and local (sliding-window) masking. Not supported
+            with sink logits (``sinks``), an fp8 KV cache, or relative attention
+            (``rel_bias``) -- no LSE kernel instantiation exists for those; requesting
+            it there raises a ``RuntimeError``.
         out [optional]: preallocated output buffer of shape (total_q, nheads, headdim_v),
             dtype matching q, on the same XPU device as q, with a contiguous last dimension
             (stride(-1) == 1). When provided, the kernel writes results directly into this

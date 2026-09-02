@@ -53,32 +53,59 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
   using SubgroupLayoutQK =
       cute::Layout<cute::Shape<cute::Int<kTile.num_sg>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
 
-  // softmax_lse output is only threaded as a template constexpr for the base
-  // (non-causal / non-local / non-sink) configuration, matching the paged
-  // cascade-attention use case. All other mask combinations keep the always-off
-  // LSE path (LSE is not written).
+  // softmax_lse output is threaded as a template constexpr, so every mask
+  // combination that can emit it needs its own kernel instantiation. LSE is
+  // instantiated for no mask, causal and local; the sink path keeps the
+  // always-off LSE instantiations only (sink + LSE is not compiled).
+  // is_causal and is_local are mutually exclusive on the host, so the
+  // (Causal && LocalMask) corner is skipped rather than compiled dead.
   if (params.return_softmax_lse) {
+    TORCH_CHECK(!use_sink, "return_softmax_lse is not supported with sink masking");
+    // The relative-attention (rel_bias) kernels are only instantiated with
+    // /*LSE=*/false, and they use their own tile shapes; fall through here would
+    // silently drop the bias, so reject the combination instead.
     TORCH_CHECK(
-        !params.is_causal && !params.is_local && !use_sink,
-        "return_softmax_lse is only supported without causal/local/sink masking");
+        params.rel_bias_ptr == nullptr, "return_softmax_lse is not supported with relative attention");
     using Element = @ELEM_TYPE@;
-    FMHAConfig<
-        false,
-        false,
-        false,
-        /*LSE=*/true,
-        TileShapeQK,
-        TileShapePV,
-        TileShapeOutput,
-        SubgroupLayoutQK,
-        void,
-        false,
-        2,
-        false,
-        Element,
-        Element,
-        Element,
-        Element>::run_paged(params);
+    if (params.is_causal) {
+      FMHAConfig<
+          /*Causal=*/true,
+          /*LocalMask=*/false,
+          false,
+          /*LSE=*/true,
+          TileShapeQK,
+          TileShapePV,
+          TileShapeOutput,
+          SubgroupLayoutQK,
+          void,
+          /*HasRelBias=*/false,
+          2,
+          false,
+          Element,
+          Element,
+          Element,
+          Element>::run_paged(params);
+    } else {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+        FMHAConfig<
+            /*Causal=*/false,
+            LocalMask,
+            false,
+            /*LSE=*/true,
+            TileShapeQK,
+            TileShapePV,
+            TileShapeOutput,
+            SubgroupLayoutQK,
+            void,
+            /*HasRelBias=*/false,
+            2,
+            false,
+            Element,
+            Element,
+            Element,
+            Element>::run_paged(params);
+      });
+    }
     return;
   }
 

@@ -77,9 +77,7 @@ template <
     class ATensor_,
     class BPackedTensor_,
     class DTensor_,
-    class BiasTensor_,
     class TiledMMA_,
-    bool WithBias,
     bool WeightScalePerExpert = false,
     bool WeightScaleBlocked = false>
 struct MoEMainloopFp8Weight {
@@ -94,9 +92,7 @@ template <
     class ATensor_,
     class BPackedTensor_,
     class DTensor_,
-    class BiasTensor_,
     class TiledMMA_,
-    bool WithBias,
     bool WeightScalePerExpert,
     bool WeightScaleBlocked>
 struct MoEMainloopFp8Weight<
@@ -107,9 +103,7 @@ struct MoEMainloopFp8Weight<
     ATensor_,
     BPackedTensor_,
     DTensor_,
-    BiasTensor_,
     TiledMMA_,
-    WithBias,
     WeightScalePerExpert,
     WeightScaleBlocked> {
   using TiledMMA = TiledMMA_;
@@ -119,7 +113,6 @@ struct MoEMainloopFp8Weight<
   using ATensor = ATensor_;
   using BPackedTensor = BPackedTensor_;
   using DTensor = DTensor_;
-  using BiasTensor = BiasTensor_;
 
   MoEMainloopFp8Weight() {}
 
@@ -133,7 +126,7 @@ struct MoEMainloopFp8Weight<
       Coord blk_coord,
       TiledMMA mma,
       int thr_id,
-      BiasTensor Bias,
+      const float* Bias,
       int gemm_n) {
     auto wg_m = get<0>(blk_coord);
     auto wg_n = get<1>(blk_coord);
@@ -229,7 +222,7 @@ struct MoEMainloopFp8Weight<
       }
     }
 
-    if constexpr (WithBias) {
+    if (Bias != nullptr) {
       add_bias<SG_M, SG_N, BLK_N>(Bias, tCrC, wg_n, thr_id, gemm_n);
     }
     SubgroupTensor tCrD = thr_copy_d.partition_sg_fragment_S(gD);
@@ -248,7 +241,7 @@ struct MoEMainloopFp8Weight<
       Coord blk_coord,
       TiledMMA mma,
       int thr_id,
-      BiasTensor Bias,
+      const float* Bias,
       int gemm_n) {
     auto wg_m = get<0>(blk_coord);
     auto wg_n = get<1>(blk_coord);
@@ -334,7 +327,7 @@ struct MoEMainloopFp8Weight<
         tCrC(sn * SG_M + sm) *= weight_scale;
       }
     }
-    if constexpr (WithBias) {
+    if (Bias != nullptr) {
       add_bias<SG_M, SG_N, BLK_N>(Bias, tCrC, wg_n, thr_id, gemm_n);
     }
     TiledCopyD tiled_copy_d{D};
@@ -355,7 +348,7 @@ struct MoEMainloopFp8Weight<
       Coord blk_coord,
       TiledMMA mma,
       int thr_id,
-      BiasTensor Bias,
+      const float* Bias,
       int gemm_n) {
     if constexpr (WeightScalePerExpert) {
       run_w8a16_scalar(A, Bp, w_scale_gmem, w_scale_row_stride, D, blk_coord, mma, thr_id, Bias, gemm_n);
@@ -365,7 +358,7 @@ struct MoEMainloopFp8Weight<
   }
 
   template <int SG_M, int SG_N, int BLK_N, typename tCrC_t>
-  void add_bias(const BiasTensor& Bias, tCrC_t& tCrC, int wg_n, int thr_id, int gemm_n) {
+  void add_bias(const float* Bias, tCrC_t& tCrC, int wg_n, int thr_id, int gemm_n) {
     static constexpr auto ATOM_N = get<2>(typename TiledMMA::ThrLayoutVMNK{}.shape());
     constexpr int N_ATOMS = SG_N / SUBGROUP_SIZE;
     int sg_local_n_coord = (thr_id / SUBGROUP_SIZE) % ATOM_N;
@@ -374,7 +367,7 @@ struct MoEMainloopFp8Weight<
     CUTLASS_PRAGMA_UNROLL
     for (int na = 0; na < N_ATOMS; ++na) {
       int n = wg_n * BLK_N + sg_local_n_coord * SG_N + na * SUBGROUP_SIZE + lane;
-      float bias = (n < gemm_n) ? static_cast<float>(Bias(n)) : 0.0f;
+      float bias = (n < gemm_n) ? Bias[n] : 0.0f;
       CUTLASS_PRAGMA_UNROLL
       for (int sm = 0; sm < SG_M; ++sm) {
         tCrC(na * SG_M + sm) += bias;

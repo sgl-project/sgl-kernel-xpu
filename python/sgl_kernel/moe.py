@@ -372,7 +372,7 @@ def cutlass_fp4_group_mm(
 _MOE_WS_HEADROOM = 1.1
 _MOE_SMALL_PREPARE_MAX_ROUTES = 64
 _MOE_SMALL_PREPARE_MAX_TOPK = 16
-_MOE_SMALL_PREPARE_MAX_ELEMENTS = 81920
+_MOE_SMALL_PREPARE_MAX_ELEMENTS = 163840
 _moe_ws_cache: Dict[Tuple[str, torch.device], torch.Tensor] = {}
 _moe_ws_view_cache: Dict[
     Tuple[str, torch.device], Tuple[torch.Tensor, tuple, torch.Tensor]
@@ -418,7 +418,7 @@ def _should_use_small_moe_prepare(
     routed_rows = num_tokens * topk
     return (
         1 <= topk <= _MOE_SMALL_PREPARE_MAX_TOPK
-        and routed_rows <= min(num_experts, _MOE_SMALL_PREPARE_MAX_ROUTES)
+        and routed_rows <= _MOE_SMALL_PREPARE_MAX_ROUTES
         and routed_rows * hidden_dims <= _MOE_SMALL_PREPARE_MAX_ELEMENTS
     )
 

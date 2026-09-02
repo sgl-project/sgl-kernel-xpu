@@ -260,7 +260,7 @@ bool w4a16_grouped_gemm_launch(
 namespace {
 
 using Fp8W8A16Fn = void (*)(
-    void*, const void*, const void*, const void*, const void*, void*, int, int, const int*, int, int*, int, bool, bool);
+    void*, const void*, const void*, const void*, const void*, void*, int, int, const int*, int, int*, int, int, bool);
 
 struct Fp8TileCfg {
   const char* tile;
@@ -286,18 +286,17 @@ int fp8_tile_id(int avg_m, int gemm_k, int gemm_n, int scale_count) {
   return 3;
 }
 
-uint64_t pack_fp8_w8a16_key(int tile_id, int scale_count, bool with_bias, int arch) {
+uint64_t pack_fp8_w8a16_key(int tile_id, bool block_scale, int arch) {
   uint64_t key = static_cast<uint64_t>(arch) & 0xFF;
   key = (key << 8) | (static_cast<uint64_t>(tile_id) & 0xFF);
-  key = (key << 8) | (static_cast<uint64_t>(scale_count) & 0xFF);
-  key = (key << 1) | (with_bias ? 1u : 0u);
+  key = (key << 1) | (block_scale ? 1u : 0u);
   return key;
 }
 
 jit::JitFnCache<Fp8W8A16Fn> g_fp8_w8a16_fns("FP8 W8A16 grouped GEMM");
 
-Fp8W8A16Fn resolve_fp8_w8a16(int tile_id, int scale_count, bool with_bias, int arch, std::string* err) {
-  const uint64_t key = pack_fp8_w8a16_key(tile_id, scale_count, with_bias, arch);
+Fp8W8A16Fn resolve_fp8_w8a16(int tile_id, bool block_scale, int arch, std::string* err) {
+  const uint64_t key = pack_fp8_w8a16_key(tile_id, block_scale, arch);
   auto build = [&](std::string* build_err) -> void* {
     const jit::JitConfig& cfg = jit::default_config();
     if (!cfg.valid) {
@@ -313,14 +312,13 @@ Fp8W8A16Fn resolve_fp8_w8a16(int tile_id, int scale_count, bool with_bias, int a
     spec.template_path = cfg.src_root + "/sycl/GroupGemmFp8W8A16Xe20LauncherInstance.cpp.in";
     spec.subs["TILE"] = kFp8Tiles[tile_id].tile;
     spec.subs["SGLAYOUT"] = kFp8Tiles[tile_id].sglayout;
-    spec.subs["WITH_BIAS"] = with_bias ? "true" : "false";
-    spec.subs["SCALE_COUNT"] = std::to_string(scale_count);
+    spec.subs["WEIGHT_SCALE_BLOCKED"] = block_scale ? "true" : "false";
     const jit::ArchSpec arch_spec = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_FP8_W8A16_JIT_ENTRY");
     spec.extra_flags = arch_spec.extra_flags;
     spec.target = arch_spec.target;
     spec.entry_symbol = "sgl_moe_fp8_w8a16_entry";
-    spec.name = std::string("group_gemm_fp8_w8a16_t") + std::to_string(tile_id) + "_s" + std::to_string(scale_count) +
-                "_b" + (with_bias ? "1" : "0") + "_" + arch_spec.suffix;
+    spec.name = std::string("group_gemm_fp8_w8a16_t") + std::to_string(tile_id) +
+                (block_scale ? "_block_" : "_scalar_") + arch_spec.suffix;
     return jit::get_or_compile(spec, cfg, build_err);
   };
   return g_fp8_w8a16_fns.get(key, build, err);
@@ -331,7 +329,6 @@ Fp8W8A16Fn resolve_fp8_w8a16(int tile_id, int scale_count, bool with_bias, int a
 bool fp8_w8a16_grouped_gemm_launch(
     int avg_m,
     int scale_count,
-    bool with_bias,
     void* queue,
     const void* activations,
     const void* weights,
@@ -344,12 +341,11 @@ bool fp8_w8a16_grouped_gemm_launch(
     int num_experts,
     int* workspace,
     int ld_b,
-    bool weight_scale_blocked,
     bool static_scheduler,
     int arch,
     std::string* err) {
   const int tile_id = fp8_tile_id(avg_m, gemm_k, gemm_n, scale_count);
-  Fp8W8A16Fn fn = resolve_fp8_w8a16(tile_id, scale_count, with_bias, arch, err);
+  Fp8W8A16Fn fn = resolve_fp8_w8a16(tile_id, scale_count == 3, arch, err);
   if (!fn) return false;
   fn(queue,
      activations,
@@ -363,7 +359,7 @@ bool fp8_w8a16_grouped_gemm_launch(
      num_experts,
      workspace,
      ld_b,
-     weight_scale_blocked,
+     scale_count,
      static_scheduler);
   return true;
 }

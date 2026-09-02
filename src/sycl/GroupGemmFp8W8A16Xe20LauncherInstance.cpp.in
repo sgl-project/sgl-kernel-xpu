@@ -13,10 +13,10 @@
 
 using namespace cute;
 
-template <typename, typename, typename, typename, typename, typename, bool, int>
+template <typename, typename, typename, typename, typename, typename, bool>
 class GemmXe20Fp8W8A16Name;
 
-template <typename Tile, typename SGLayout, bool WithBias, int WeightScaleCount>
+template <typename Tile, typename SGLayout, bool WeightScaleBlocked>
 void Xe20MoEGEMMFp8W8A16Launcher(
     sycl::queue q,
     const void* activations,
@@ -30,20 +30,16 @@ void Xe20MoEGEMMFp8W8A16Launcher(
     const int num_experts,
     int* workspace,
     int ld_b_param,
-    bool weight_scale_blocked,
+    int weight_scale_count,
     bool static_scheduler) {
   using ElementA = cutlass::bfloat16_t;
   using ElementD = cutlass::bfloat16_t;
   auto make_dummy_tensor = [&](auto val, auto stride) {
     return make_tensor(make_gmem_ptr(&val), make_layout(repeat<rank_v<decltype(stride)>>(1), stride));
   };
-  auto make_dummy_bias = [&](auto val) {
-    return make_tensor(make_gmem_ptr(&val), make_layout(Shape<int>{}, Stride<_1>{}));
-  };
   using TensorA = decltype(make_dummy_tensor(ElementA{}, Stride<int, _1>{}));
   using TensorBPacked = decltype(make_dummy_tensor(cutlass::float_e4m3_t{}, Stride<int, _1>{}));
   using TensorD = decltype(make_dummy_tensor(ElementD{}, Stride<int, _1>{}));
-  using TensorBias = decltype(make_dummy_bias(float{}));
   using MMA = typename TiledMMAHelper<
       MMA_Atom<XE_DPAS_TT<8, float, cutlass::bfloat16_t>>, Layout<Tile>, SGLayout>::TiledMMA;
   auto mma = MMA{};
@@ -64,12 +60,9 @@ void Xe20MoEGEMMFp8W8A16Launcher(
       TensorA,
       TensorBPacked,
       TensorD,
-      TensorBias,
       MMA,
-      WithBias,
-      WeightScaleCount != 3,
-      WeightScaleCount == 3,
-      WeightScaleCount == 1>;
+      !WeightScaleBlocked,
+      WeightScaleBlocked>;
   typename Kernel::Params params{
       static_cast<const uint8_t*>(activations),
       static_cast<const uint8_t*>(weights),
@@ -83,12 +76,12 @@ void Xe20MoEGEMMFp8W8A16Launcher(
       workspace,
       mma,
       static_cast<int32_t>(ld_b_param),
-      weight_scale_blocked,
+      weight_scale_count,
       static_scheduler};
   q.submit([&](sycl::handler& h) {
     sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), h);
     h.parallel_for<GemmXe20Fp8W8A16Name<
-        Tile, SGLayout, TensorA, TensorBPacked, TensorD, ElementD, WithBias, WeightScaleCount>>(
+      Tile, SGLayout, TensorA, TensorBPacked, TensorD, ElementD, WeightScaleBlocked>>(
         sycl::nd_range<3>(global * local, local), kernel_props, [=](sycl::nd_item<3> item) {
           int32_t* slm_mem =
               static_cast<int32_t*>(local_mem.template get_multi_ptr<sycl::access::decorated::no>().get());
@@ -98,9 +91,9 @@ void Xe20MoEGEMMFp8W8A16Launcher(
 }
 
 template __attribute__((visibility("default"))) void Xe20MoEGEMMFp8W8A16Launcher<
-    @TILE@, @SGLAYOUT@, @WITH_BIAS@, @SCALE_COUNT@>(
+  @TILE@, @SGLAYOUT@, @WEIGHT_SCALE_BLOCKED@>(
     sycl::queue, const void*, const void*, const void*, const void*, void*, const int, const int,
-    const int*, const int, int*, int, bool, bool);
+    const int*, const int, int*, int, int, bool);
 
   #ifdef SGL_FP8_W8A16_JIT_ENTRY
   extern "C" __attribute__((visibility("default"))) void sgl_moe_fp8_w8a16_entry(
@@ -116,9 +109,9 @@ template __attribute__((visibility("default"))) void Xe20MoEGEMMFp8W8A16Launcher
     int num_experts,
     int* workspace,
     int ld_b,
-    bool weight_scale_blocked,
+    int weight_scale_count,
     bool static_scheduler) {
-    Xe20MoEGEMMFp8W8A16Launcher<@TILE@, @SGLAYOUT@, @WITH_BIAS@, @SCALE_COUNT@>(
+    Xe20MoEGEMMFp8W8A16Launcher<@TILE@, @SGLAYOUT@, @WEIGHT_SCALE_BLOCKED@>(
       *static_cast<sycl::queue*>(queue_ptr),
       activations,
       weights,
@@ -131,7 +124,7 @@ template __attribute__((visibility("default"))) void Xe20MoEGEMMFp8W8A16Launcher
       num_experts,
       workspace,
       ld_b,
-      weight_scale_blocked,
+      weight_scale_count,
       static_scheduler);
   }
   #endif

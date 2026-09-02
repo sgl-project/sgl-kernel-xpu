@@ -67,7 +67,6 @@ bool w4a16_grouped_gemm_launch(
 bool fp8_w8a16_grouped_gemm_launch(
     int avg_m,
     int scale_count,
-    bool with_bias,
     void* queue,
     const void* activations,
     const void* weights,
@@ -80,7 +79,6 @@ bool fp8_w8a16_grouped_gemm_launch(
     int num_experts,
     int* workspace,
     int ld_b,
-    bool weight_scale_blocked,
     bool static_scheduler,
     int arch = 0,
     std::string* err = nullptr);

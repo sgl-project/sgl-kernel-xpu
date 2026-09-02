@@ -33,12 +33,9 @@ template <
     typename TensorA,
     typename TensorBPacked,
     typename TensorD,
-    typename TensorBias,
     typename TiledMMA,
-    bool WithBias,
     bool WeightScalePerExpert = false,
-    bool WeightScaleBlocked = false,
-    bool SingleWeightScale = false>
+    bool WeightScaleBlocked = false>
 class MoEGEMMFp8Weight {
  public:
   using ElementA = cutlass::bfloat16_t;
@@ -58,9 +55,7 @@ class MoEGEMMFp8Weight {
       TensorA,
       TensorBPacked,
       TensorD,
-      TensorBias,
       TiledMMA,
-      WithBias,
       WeightScalePerExpert,
       WeightScaleBlocked>;
 
@@ -77,7 +72,7 @@ class MoEGEMMFp8Weight {
     int32_t* workspace;
     TiledMMA mma;
     int32_t ld_b;
-    bool weight_scale_blocked = false;
+    int32_t weight_scale_count;
     bool static_scheduler = false;
   };
 
@@ -95,10 +90,6 @@ class MoEGEMMFp8Weight {
   // Per-expert weight-scale pointers + row stride. Mirrors MXFP4's
   // make_scale_ptrs exactly (same gate/up split conventions), just with
   // K_scale = K / FP8_GROUP_SIZE_K instead of K / MXFP4_GROUP_SIZE.
-  auto make_Bias_tensors(float* ptr_Bias, int N) {
-    return make_tensor(make_gmem_ptr<float>(ptr_Bias), make_layout(make_shape(N), make_stride(_1{})));
-  }
-
   auto make_D_tensors(ElementD* ptr_D, int pre_rows, int M, int N) {
     return make_tensor(
         make_gmem_ptr<ElementD>(ptr_D + pre_rows * N), make_layout(make_shape(M, N), make_stride(N, _1{})));
@@ -123,8 +114,7 @@ class MoEGEMMFp8Weight {
     int32_t thr_id = int32_t(item.get_local_linear_id());
 
     const int64_t K_scale = K / FP8_GROUP_SIZE_K;
-    int64_t scale_n =
-        WeightScalePerExpert ? (SingleWeightScale ? 1 : 2) : (params.weight_scale_blocked ? (N + 127) / 128 : N);
+    int64_t scale_n = WeightScalePerExpert ? params.weight_scale_count : (N + 127) / 128;
 
     int pre_rows = 0;
     int pre_tiles = 0;
@@ -147,37 +137,40 @@ class MoEGEMMFp8Weight {
       uint8_t* ptr_A_curr_batch = const_cast<uint8_t*>(params.Activations) + pre_rows * K * sizeof(ElementA);
       uint8_t* ptr_B_curr_batch = const_cast<uint8_t*>(params.PackedWeights) + B_offset;
       float* ptr_S_curr_batch = const_cast<float*>(params.WeightScales) + S_offset;
-      float* ptr_Bias_curr_batch = nullptr;
-      if constexpr (WithBias) {
-        ptr_Bias_curr_batch = const_cast<float*>(params.Bias) + expert_id * N;
-      }
+      const float* ptr_Bias_curr_batch =
+          params.Bias == nullptr ? nullptr : params.Bias + static_cast<int64_t>(expert_id) * N;
 
       auto A_tensor = make_A_tensor(ptr_A_curr_batch, M, K);
       auto B_tensor = make_B_tensors(ptr_B_curr_batch, N, K, ld_b);
       auto D_tensor = make_D_tensors(params.Outputs, pre_rows, M, N);
-      auto Bias_tensor = make_Bias_tensors(ptr_Bias_curr_batch, N);
 
       while (group_m_id < cumsum_tiles_for_experts) {
         int n_coord = (group_id * wg_tile_n) % N_pad / wg_tile_n;
         int m_coord = (group_m_id - pre_tiles);
 
         auto tile_coord = make_coord(m_coord, n_coord, _, 0);
-        if constexpr (SingleWeightScale) {
-          moe_w4a16::xe_gemm<void, void, void>(
-              A_tensor, B_tensor, ptr_S_curr_batch, ptr_Bias_curr_batch, D_tensor, tile_coord, mma);
+        if constexpr (WeightScalePerExpert) {
+          if (params.weight_scale_count == 1) {
+            moe_w4a16::xe_gemm<void, void, void>(
+                A_tensor, B_tensor, ptr_S_curr_batch, ptr_Bias_curr_batch, D_tensor, tile_coord, mma);
+          } else {
+            CollectiveMainloop mainloop;
+            mainloop(
+                A_tensor,
+                B_tensor,
+                ptr_S_curr_batch,
+                scale_n,
+                D_tensor,
+                tile_coord,
+                mma,
+                thr_id,
+                ptr_Bias_curr_batch,
+                N);
+          }
         } else {
           CollectiveMainloop mainloop;
           mainloop(
-              A_tensor,
-              B_tensor,
-              ptr_S_curr_batch,
-              WeightScalePerExpert ? scale_n : K_scale,
-              D_tensor,
-              tile_coord,
-              mma,
-              thr_id,
-              Bias_tensor,
-              N);
+              A_tensor, B_tensor, ptr_S_curr_batch, K_scale, D_tensor, tile_coord, mma, thr_id, ptr_Bias_curr_batch, N);
         }
 
         if (params.static_scheduler) {

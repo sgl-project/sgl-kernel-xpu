@@ -5,7 +5,15 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
-#include "sycl/kernels/moe/xe20/w4a16/gemm_xe2_policy.hpp"
+#include "sycl/kernels/moe/xe20/w4a16_launch_policy.hpp"
+
+// Keep the imported fmha-cri kernel source byte-identical while making its
+// unqualified detail:: lookup robust in translation units that include
+// PyTorch's global ::detail namespace.
+namespace moe_w4a16 {
+namespace detail = cute::detail;
+}
+
 #include "sycl/kernels/moe/xe20/w4a16/grouped_gemm_xe2.hpp"
 
 namespace moe_w4a16 {
@@ -35,7 +43,6 @@ void MoEGEMMLauncher(
         const int gemm_n,
         const int gemm_k,
         const int* rows_per_expert,
-        const int* row_offsets,
         const int total_rows,
         const int num_experts,
         const int group_size,
@@ -66,14 +73,6 @@ void MoEGEMMLauncher(
     using GmemTiledCopyA = typename policy::GmemTiledCopyA;
     using GmemTiledCopyB = typename policy::GmemTiledCopyB;
     using GmemTiledCopyD = typename policy::GmemTiledCopyD;
-    // The GPT-OSS prefill tile keeps the shorter prefetch pipeline it was measured
-    // with in a5bcd5c; every other policy keeps the default distance of 3. The
-    // work-stealing chunk of 4 that a5bcd5c used for its <64,128>/1x8 GEMM2 tile
-    // has no owner post-merge -- that tile was dropped in favour of upstream's
-    // <64,128>/2x4 w4a16_policy_m_64_n_128, so the chunk is 1 everywhere.
-    static constexpr bool kWidePrefillTile = std::is_same_v<policy, w4a16_policy_m_64_n_256>;
-    static constexpr int kStealChunk = 1;
-    static constexpr int kPrefetchDist = kWidePrefillTile ? 2 : 3;
 
     stream.submit([&](sycl::handler& cgh) {
         sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), cgh);
@@ -87,9 +86,11 @@ void MoEGEMMLauncher(
                     layoutB,
                     'R',
                     HasZero,
-                    kDiagNone,
-                    kStealChunk,
-                    kPrefetchDist>(
+                    policy::StealChunk,
+                    policy::PrefetchDist,
+                    policy::MainloopBarrier,
+                    policy::RowExtend,
+                    policy::SkipPaddedN>(
                     activations,
                     weights,
                     scales,
@@ -98,7 +99,6 @@ void MoEGEMMLauncher(
                     outputs,
                     mma,
                     rows_per_expert,
-                    row_offsets,
                     total_rows,
                     num_experts,
                     group_size,
@@ -122,7 +122,6 @@ void w4a16_launch(
         const int gemm_n,
         const int gemm_k,
         const int* rows_per_expert,
-        const int* row_offsets,
         const int total_rows,
         const int num_experts,
         const int group_size,
@@ -140,7 +139,6 @@ void w4a16_launch(
                 gemm_n,
                 gemm_k,
                 rows_per_expert,
-                row_offsets,
                 total_rows,
                 num_experts,
                 group_size,
@@ -170,7 +168,6 @@ void moe_w4a16::w4a16_launch<moe_w4a16::@POLICY@, @ELEMENT_S@, @ELEMENT_A@>(
     const int,
     const int,
     const int*,
-    const int*,
     const int,
     const int,
     const int,
@@ -190,14 +187,10 @@ extern "C" __attribute__((visibility("default"))) void sgl_moe_w4a16_entry(
     int gemm_n,
     int gemm_k,
     const int* rows_per_expert,
+    int total_rows,
     int num_experts,
     int group_size,
     int* atomic_buffer) {
-  // row_offsets / total_rows are not part of this C ABI, so the JIT path keeps the
-  // unpadded A extent (total_rows == 0 => a_rows == gemm_m, grouped_gemm_xe2.hpp:154).
-  // AOT passes total_rows and gets a5bcd5c's widened A load; threading it through
-  // moe_jit.h without breaking already-cached .so files is a follow-up. USE_MOE_JIT
-  // needs USE_SYCL_JIT, which is OFF by default (src/CMakeLists.txt:31,72).
   moe_w4a16::w4a16_launch<moe_w4a16::@POLICY@, @ELEMENT_S@, @ELEMENT_A@>(
       *static_cast<sycl::queue*>(queue_ptr),
       activations,
@@ -209,8 +202,7 @@ extern "C" __attribute__((visibility("default"))) void sgl_moe_w4a16_entry(
       gemm_n,
       gemm_k,
       rows_per_expert,
-      /*row_offsets=*/nullptr,
-      /*total_rows=*/0,
+      total_rows,
       num_experts,
       group_size,
       atomic_buffer);

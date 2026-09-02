@@ -14,25 +14,20 @@ function(add_group_gemm_w4a16_xe20_inst POLICY ELEMENT_S ELEMENT_A SANITIZED)
     set(GROUP_GEMM_W4A16_XE20_INST_SRCS ${GROUP_GEMM_W4A16_XE20_INST_SRCS} PARENT_SCOPE)
 endfunction()
 
-# Policy menu. select_w4a16_policy_id() in GroupGemmW4A16Xe20.cpp picks one per
-# call from the average rows-per-expert and gemm_n. The list order must match the
-# policy_id switch there and the w4a16_policy() table in src/jit/moe_jit.cpp.
-#   id 0  w4a16_policy_m_8_n_64    <_8,  _64,  _32>  — avg_m <= 4
-#   id 1  w4a16_policy_m_16_n_64   <_16, _64,  _32>  — avg_m <= 8
-#   id 2  w4a16_policy_m_32_n_64   <_32, _64,  _32>  — small avg_m
-#   id 3  w4a16_policy_m_64_n_128  <_64, _128, _32>  — mid avg_m
-#   id 4  w4a16_policy_m_128_n_128 <_128,_128, _32>  — large avg_m
-#   id 5  w4a16_policy_m_64_n_256  <_64, _256, _32>  — GPT-OSS prefill GEMM1
-# id 5 is the tile a5bcd5c ("Optimize W4A16 MoE GEMM for GPT-OSS prefill")
-# measured its win with; it is the only tile above avg_m = 32 with ATOM_M == 1,
-# so it is the only one whose sub-groups do not re-dequantise the same B rows.
-# The rows-per-expert fill model in #446 cannot express that term, so the policy
-# is kept as an explicit sixth entry rather than folded into the score table.
+# fmha-cri production registry. The 64-row policies use single-M-subgroup
+# layouts and have separate N-tail-skip instantiations, because that bit changes
+# device code. select_w4a16_policy_id() chooses from this table per call.
 # group_size (32/64/128/256) is compiled into every unit as a runtime branch,
-# so it does not multiply the instance count. Total: 6 policies x 2 (int4/mxfp4)
-# x 2 (bf16/fp16 activation) = 24 units.
-foreach(policy w4a16_policy_m_8_n_64 w4a16_policy_m_16_n_64 w4a16_policy_m_32_n_64
-               w4a16_policy_m_64_n_128 w4a16_policy_m_128_n_128 w4a16_policy_m_64_n_256)
+# so it does not multiply the instance count. Total: 7 policies x 2
+# (int4/mxfp4) x 2 (bf16/fp16 activation) = 28 units.
+foreach(policy
+        w4a16_launch_policy_m_8_n_64
+        w4a16_launch_policy_m_16_n_64
+        w4a16_launch_policy_m_32_n_64
+        w4a16_launch_policy_m_64_n_128
+        w4a16_launch_policy_m_64_n_128_skip
+        w4a16_launch_policy_m_64_n_256
+        w4a16_launch_policy_m_64_n_256_skip)
     foreach(act_tag bf16 fp16)
         if(act_tag STREQUAL "bf16")
             set(element_a "cutlass::bfloat16_t")

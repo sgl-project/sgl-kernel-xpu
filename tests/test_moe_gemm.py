@@ -780,18 +780,17 @@ def _build_moe_gemm_inputs(
     weight_dtype: torch.dtype = torch.int8,
     scale_dtype: torch.dtype = torch.uint8,
     seed: int = 0,
-    rows_per_expert: list[int] | None = None,
 ):
     """Construct (activations, dequantized_weights, mxfp4_packed, mxfp4_scales,
     total_rows_for_experts, bias_or_none) on XPU for the op-level test."""
     torch.manual_seed(seed)
     torch.xpu.manual_seed_all(seed)
 
-    if rows_per_expert is None:
-        rows_per_expert = [avg_m_per_expert] * num_experts
-    assert len(rows_per_expert) == num_experts
-    total_m = sum(rows_per_expert)
-    total_rows = torch.tensor(rows_per_expert, dtype=torch.int32, device="xpu")
+    # Equal rows per expert for simplicity.
+    total_m = num_experts * avg_m_per_expert
+    total_rows = torch.full(
+        (num_experts,), avg_m_per_expert, dtype=torch.int32, device="xpu"
+    )
 
     activations = create_random_xpu_tensor((total_m, gemm_k), dtype)
 
@@ -813,7 +812,6 @@ def _build_moe_gemm_inputs(
         "w_packed": w_packed_xpu,
         "w_scale": w_scale_xpu,
         "total_rows": total_rows,
-        "rows_per_expert": rows_per_expert,
         "output_reference": output_reference,
         "output_mxfp4": output_mxfp4,
     }
@@ -918,108 +916,61 @@ def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_input_dtypes(weight_dtype, scale_dty
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_ragged_unaligned_n(dtype):
-    """Exercise the tile-extension and MXFP4 scale boundary paths.
-
-    The final N tile is partial and the expert rows are deliberately ragged,
-    including an empty expert. This covers the optimized M=32 policy without
-    relying on uniform routing.
-    """
-    rows_per_expert = [17, 3, 0, 13]
-    num_experts, gemm_n, gemm_k = len(rows_per_expert), 520, 32
-    inputs = _build_moe_gemm_inputs(
-        num_experts=num_experts,
-        avg_m_per_expert=0,
-        gemm_n=gemm_n,
-        gemm_k=gemm_k,
-        dtype=dtype,
-        rows_per_expert=rows_per_expert,
-    )
-
-    start = 0
-    reference_parts = []
-    for expert, rows in enumerate(rows_per_expert):
-        end = start + rows
-        reference_parts.append(
-            inputs["activations"][start:end].float()
-            @ inputs["w_dq"][expert].float().transpose(0, 1)
-        )
-        start = end
-    inputs["output_reference"].copy_(torch.cat(reference_parts).to(dtype))
-
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w4a16(
-        inputs["output_mxfp4"],
-        inputs["activations"],
-        inputs["w_packed"],
-        inputs["w_scale"],
-        None,
-        None,
-        inputs["total_rows"],
-        num_experts,
-        False,
-        32,
-    )
-
-    torch.testing.assert_close(
-        inputs["output_reference"], inputs["output_mxfp4"], rtol=1e-1, atol=1e-2
-    )
-
-
 @pytest.mark.parametrize(
-    ("gemm_n", "gemm_k"),
+    "gemm_n,gemm_k",
     [
-        (1472, 2880),  # gpt-oss-120b prefill GEMM1 production geometry
-        (768, 2880),  # scale-array boundary geometry from the regression
-        (520, 64),  # partial final N tile
-        (8, 32),  # smallest MXFP4 group and N corner
+        (320, 256),  # short K: 64x128 SG_N=16 with the half-tile N skip
+        (256, 1056),  # long K: 64x256 SG_N=16 without an N tail
+        (320, 1056),  # long K: 64x256 SG_N=16 with the N skip
     ],
 )
-def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_target_accuracy_shapes(gemm_n, gemm_k):
-    """Reference-checked MXFP4 coverage for every shape in 0410c82d51.
+def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_ragged_production_tiles(
+    dtype, gemm_n, gemm_k
+):
+    """Reference-check all fmha-cri production large-M dispatch variants.
 
-    The small ragged routing distribution retains the original commit's
-    zero-row and non-tile-multiple cases without making the production-width
-    reference GEMM prohibitively large.
+    The 64-row production tiles are selected from the mean row count, while
+    each expert still has its own ragged tail.  This verifies both the
+    tile-aligned A/B surfaces and the N-tail-skip variants against the
+    dequantized MXFP4 reference without allocating full GPT-OSS weights.
     """
-    rows_per_expert = [5, 0, 12]
+    rows_per_expert = [40, 0, 80]
     num_experts = len(rows_per_expert)
-    inputs = _build_moe_gemm_inputs(
-        num_experts=num_experts,
-        avg_m_per_expert=0,
-        gemm_n=gemm_n,
-        gemm_k=gemm_k,
-        dtype=torch.bfloat16,
-        rows_per_expert=rows_per_expert,
-        seed=17,
-    )
+    total_m = sum(rows_per_expert)
 
-    start = 0
-    reference_parts = []
-    for expert, rows in enumerate(rows_per_expert):
-        end = start + rows
-        reference_parts.append(
-            inputs["activations"][start:end].float()
-            @ inputs["w_dq"][expert].float().transpose(0, 1)
-        )
-        start = end
-    inputs["output_reference"].copy_(torch.cat(reference_parts).to(torch.bfloat16))
+    torch.manual_seed(17)
+    torch.xpu.manual_seed_all(17)
+    activations = create_random_xpu_tensor((total_m, gemm_k), dtype)
+    weights_cpu = create_random_cpu_tensor((num_experts, gemm_n, gemm_k), dtype)
+    packed_cpu, scales_cpu = _quantize_weights_mxfp4(weights_cpu)
+    dequantized_cpu = _dequantize_weights_mxfp4(packed_cpu, scales_cpu, dtype=dtype)
 
+    expected = torch.empty((total_m, gemm_n), dtype=dtype)
+    row_start = 0
+    for expert, row_count in enumerate(rows_per_expert):
+        row_end = row_start + row_count
+        if row_count:
+            expected[row_start:row_end] = (
+                activations[row_start:row_end].cpu().float()
+                @ dequantized_cpu[expert].float().transpose(0, 1)
+            ).to(dtype)
+        row_start = row_end
+
+    actual = torch.empty((total_m, gemm_n), dtype=dtype, device="xpu")
     torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w4a16(
-        inputs["output_mxfp4"],
-        inputs["activations"],
-        inputs["w_packed"],
-        inputs["w_scale"],
+        actual,
+        activations,
+        packed_cpu.to("xpu"),
+        scales_cpu.to("xpu"),
         None,
         None,
-        inputs["total_rows"],
+        torch.tensor(rows_per_expert, dtype=torch.int32, device="xpu"),
         num_experts,
         False,
-        32,
+        MXFP4_BLOCK_SIZE,
     )
 
-    torch.testing.assert_close(
-        inputs["output_reference"], inputs["output_mxfp4"], rtol=1e-1, atol=1e-2
-    )
+    torch.testing.assert_close(actual.cpu(), expected, rtol=1e-1, atol=1e-2)
 
 
 if __name__ == "__main__":

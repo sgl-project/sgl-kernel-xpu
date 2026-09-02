@@ -45,6 +45,48 @@ class xe_gemm_policy_base {
   using GmemTiledCopyA = void;
   using GmemTiledCopyB = void;
   using GmemTiledCopyD = void;
+
+  // Whether the mainloop takes a split barrier per k-tile. The mainloop shares
+  // nothing through SLM, so the barrier is not a correctness requirement: it is a
+  // scheduling device, holding the work-group's subgroups together so their loads
+  // stay in the same k window and hit in L1 instead of drifting apart. Upstream
+  // takes it unconditionally; whether it pays is per tile
+  // (w4a16_tile_wants_barrier).
+  static constexpr bool MainloopBarrier = true;
+};
+
+// Which tiles want the mainloop barrier. A tile whose work-group spans several M
+// subgroups needs it -- its subgroups sit on different rows and drift apart without
+// it. A one-subgroup-deep tile does not, except at 32x64.
+constexpr bool w4a16_tile_wants_barrier(int BlkM, int BlkN, int SgCountM) {
+  if (SgCountM > 1) return true;
+  return BlkM == 32 && BlkN == 64;
+}
+
+// Generic (work-group tile, subgroup layout) pair, so a caller can pick the tile
+// that fits an expert's row count instead of padding up to the nearest policy in
+// the hand-written menu below. Every policy in that menu is expressible as one of
+// these; the tile registry in 16_bmg_moe_gemm.cpp instantiates them by name.
+//
+// BlkK is a parameter because it is the only knob that trades the A fragment's
+// register footprint against loop overhead. A subgroup holds SG_M*BlkK bf16 of A
+// (SG_M*BlkK/32 registers) and SG_M*SG_N/16 floats of C. It cannot go below 16,
+// the bf16 DPAS K, and it cannot go above the quantization group, because the
+// mainloop gathers one scale per B column per k-tile.
+template <
+    int BlkM,
+    int BlkN,
+    int SgCountM,
+    int SgCountN,
+    int BlkK = 32,
+    bool Barrier = w4a16_tile_wants_barrier(BlkM, BlkN, SgCountM)>
+class w4a16_tile : public xe_gemm_policy_base {
+ public:
+  static_assert(BlkK == 32 || BlkK == 16, "BLK_K must be one MXFP4 group (32) or one bf16 DPAS K (16)");
+  using WGTile = Shape<Int<BlkM>, Int<BlkN>, Int<BlkK>>;
+  using SGLayout = Layout<Shape<Int<SgCountM>, Int<SgCountN>, _1>, Stride<Int<SgCountN>, _1, _0>>;
+
+  static constexpr bool MainloopBarrier = Barrier;
 };
 
 // Policy menu. Every policy keeps the *per-subgroup* tile at 32x32: the 4-bit
@@ -55,18 +97,8 @@ class xe_gemm_policy_base {
 // them. The subgroup count per dimension must be a power of two -- cute's tile
 // division rejects 3 and 6.
 //
-// Which one runs is decided per call by rows-per-expert and gemm_n; see
-// select_w4a16_policy_id() in GroupGemmW4A16Xe20.cpp.
-
-// Shorthand for a policy given as (work-group tile M, tile N, sub-groups in M,
-// sub-groups in N). SGLayout's shape is the sub-group count per dimension, so
-// ATOM_M = SgCountM and SG_M = BlkM / SgCountM (gemm_xe2.hpp:342).
-template <int BlkM, int BlkN, int SgCountM, int SgCountN>
-class w4a16_tile : public xe_gemm_policy_base {
- public:
-  using WGTile = Shape<Int<BlkM>, Int<BlkN>, _32>;
-  using SGLayout = Layout<Shape<Int<SgCountM>, Int<SgCountN>, _1>, Stride<Int<SgCountN>, _1, _0>>;
-};
+// Which one runs is decided per call by rows-per-expert; see
+// select_w4a16_tile_m() in GroupGemmW4A16Xe20.cpp.
 
 // avg_m <= 4
 class w4a16_policy_m_8_n_64 : public xe_gemm_policy_base {
@@ -108,17 +140,5 @@ class w4a16_policy_m_128_n_128 : public xe_gemm_policy_base {
   using WGTile = Shape<_128, _128, _32>;
   using SGLayout = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;
 };
-
-// GPT-OSS prefill GEMM1. Carried forward from a5bcd5c ("Optimize W4A16 MoE GEMM
-// for GPT-OSS prefill"), which measured its 1.73x with this tile at avg_m = 128,
-// gemm_n = 1440, gemm_k = 2880. It is not a widening of the per-subgroup tile:
-// 64x16 is the same 1024 accumulators as the 32x32 policies above, laid out one
-// N column per lane. What is different is ATOM_M == 1 -- no M sub-group split, so
-// each B row is loaded and dequantised once per work-group per k-tile, against 2x
-// for w4a16_policy_m_64_n_128 (2 sub-groups in M) and 4x for
-// w4a16_policy_m_128_n_128 (4). The fill model in select_w4a16_policy_id() scores
-// only tile fill, not dequant duplication, which is why this policy needs an
-// explicit dispatch rule there rather than a row in the score table.
-using w4a16_policy_m_64_n_256 = w4a16_tile<64, 256, 1, 16>;
 
 }  // namespace moe_w4a16

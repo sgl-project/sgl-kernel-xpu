@@ -39,7 +39,7 @@ bool grouped_gemm_launch(
     std::string* err = nullptr);
 
 // Launch the W4A16 (int4 / mxfp4) grouped GEMM. policy_id is selected by
-// GroupGemmW4A16Xe20.cpp so JIT uses the exact same avg_m- and gemm_n-dependent
+// GroupGemmW4A16Xe20.cpp so JIT uses the exact same avg_m-, gemm_n-, and gemm_k-dependent
 // policy as AOT. (ElementS, ElementA) comes from (is_int4, is_fp16), and
 // group_size is a runtime arg (not a template param).
 bool w4a16_grouped_gemm_launch(
@@ -56,6 +56,7 @@ bool w4a16_grouped_gemm_launch(
     int gemm_n,
     int gemm_k,
     const int* rows_per_expert,
+    int total_rows,
     int num_experts,
     int group_size,
     int* atomic_buffer,

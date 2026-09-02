@@ -20,13 +20,13 @@
         its params alone. Its Params slice is the *base* Gather2StageParams, so the
         one scheduler serves both the decode and prefill param children.
 
-      - XeMlaSparse2StageIndividualTileScheduler<B_H> (Stage 2, dense flash).
-        Grid is (ceil_div(h_q, B_H) * s_q * b, V_SPLIT, 1) (see
-        launch_sparse_mla_decode_fp8_fwd_kernel_policy): BlockIdxX enumerates the
-        (batch, seq, head-block) tuples row-major and BlockIdxY the V-split, decoded
-        into a (batch_idx, seq_idx, head_bid, v_split_idx) coordinate — the exact
-        index math the Stage-2 kernel carried before it was decomposed into
-        collectives + scheduler, factored out here.
+      - XeMlaSparse2StageIndividualTileScheduler<B_H, V_SPLIT> (Stage 2, dense flash).
+        Grid is (ceil_div(h_q, B_H) * s_q * b * V_SPLIT, 1, num_kv_splits): BlockIdxX
+        enumerates the (batch, seq, head-block, v-split) tuples with the V-split
+        FASTEST-varying, decoded into a (batch_idx, seq_idx, head_bid, v_split_idx)
+        coordinate — the same index math the Stage-2 kernel carried before it was
+        decomposed into collectives + scheduler, factored out here, with V_SPLIT folded
+        into x instead of occupying grid.y (see the L2-locality note on the decode below).
 
     Neither name carries "Decode": both stages' schedulers, like the Stage-2 kernel and
     its collectives, are shared verbatim by the decode and prefill paths.
@@ -111,10 +111,12 @@ struct Sparse2StageWorkTile {
   int kv_split_idx;
 };
 
-template <int B_H_>
+template <int B_H_, int V_SPLIT_>
 class XeMlaSparse2StageIndividualTileScheduler {
  public:
   static constexpr int B_H = B_H_;
+  static constexpr int V_SPLIT = V_SPLIT_;
+  static_assert(V_SPLIT >= 1, "V_SPLIT must be >= 1");
 
   // The scheduler's own param slice: the two dims needed to enumerate head-blocks
   // per query tile. Built by the host adapter as the composite's `scheduler` member
@@ -125,12 +127,13 @@ class XeMlaSparse2StageIndividualTileScheduler {
   XeMlaSparse2StageIndividualTileScheduler(Params const& params) : valid_(true) {
     const int num_head_blocks = ceil_div(params.h_q, B_H);
     const int wg_id = int(BlockIdxX());
-    const int q_tile_idx = wg_id / num_head_blocks;
+    const int tile_idx = wg_id / V_SPLIT;
+    const int q_tile_idx = tile_idx / num_head_blocks;
 
     tile_.batch_idx = q_tile_idx / params.s_q;
     tile_.seq_idx = q_tile_idx - tile_.batch_idx * params.s_q;
-    tile_.head_bid = wg_id % num_head_blocks;
-    tile_.v_split_idx = int(BlockIdxY());
+    tile_.head_bid = tile_idx % num_head_blocks;
+    tile_.v_split_idx = wg_id % V_SPLIT;
     tile_.kv_split_idx = int(BlockIdxZ());
   }
 

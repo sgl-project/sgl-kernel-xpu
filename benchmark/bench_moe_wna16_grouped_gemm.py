@@ -130,10 +130,6 @@ W8_BENCH_SHAPES = [
     (256, 8, 256, 2048, "block"),
     (256, 1, 2048, 128, "block"),
     (256, 256, 2048, 128, "block"),
-    # Qwen3-Next-80B-A3B-Instruct-FP8 TP4: E=512, topk=10, H=2048,
-    # I_shard=128.
-    (512, 1, 256, 2048, "block"),
-    (512, 40, 2048, 128, "block"),
 ]
 
 

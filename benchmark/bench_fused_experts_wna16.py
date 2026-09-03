@@ -19,7 +19,6 @@
 # geometry. The W8 provider below is a separate SGL-only TP4 shape set using
 # official FP8 MoE model geometries and 128x128 block weight scales:
 #   qwen3.5-35b-tp4: E=256, topk=8, hidden=2048, I_shard=128
-#   qwen3-next-80b-tp4: E=512, topk=10, hidden=2048, I_shard=128
 #
 # Existing W4 profiles:
 #   gpt-oss      : experts=32,  topk=4, hidden=2880, intermediate=2880
@@ -118,7 +117,6 @@ FP8_MAX = 448.0
 FP8_BLOCK_SIZE = 128
 W8_PROFILES = {
     "qwen3.5-35b-tp4": (2048, 128, 256, 8, True),
-    "qwen3-next-80b-tp4": (2048, 128, 512, 10, True),
 }
 W8_TOKENS = [1, 32, 2048]
 
@@ -219,43 +217,23 @@ def _run_w8_fused(inputs):
     )
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["profile_name", "tokens"],
-        x_vals=[(profile, tokens) for profile in W8_PROFILES for tokens in W8_TOKENS],
-        line_arg="provider",
-        line_vals=["w8a16_fused"],
-        line_names=["w8a16_fused (sgl_kernel)"],
-        styles=[("purple", "-")],
-        ylabel="Time (ms)",
-        plot_name="moe-w8a16-fused-experts",
-        args={},
-    )
-)
-def benchmark_w8(profile_name, tokens, provider):
-    inputs = _prepare_w8_fused(profile_name, tokens)
-    for _ in range(5):
-        _run_w8_fused(inputs)
-    torch.xpu.synchronize()
-    ms, ms_min, ms_max = triton.testing.do_bench(
-        lambda: _run_w8_fused(inputs),
-        warmup=50,
-        rep=200,
-        quantiles=[0.5, 0.2, 0.8],
-    )
-    W8_RESULTS.append(
-        {
-            "provider": provider,
-            "profile": profile_name,
-            "tokens": tokens,
-            "ms": round(ms, 4),
-            "ms_min": round(ms_min, 4),
-            "ms_max": round(ms_max, 4),
-        }
-    )
-    del inputs
-    torch.xpu.empty_cache()
-    return ms
+def benchmark_w8():
+    for profile_name in W8_PROFILES:
+        for tokens in W8_TOKENS:
+            inputs = _prepare_w8_fused(profile_name, tokens)
+            ms = _time_median(
+                lambda: _run_w8_fused(inputs), warmup=5, repetitions=20, inner=1
+            )
+            W8_RESULTS.append(
+                {
+                    "provider": "w8a16_fused",
+                    "profile": profile_name,
+                    "tokens": tokens,
+                    "ms": round(ms, 4),
+                }
+            )
+            del inputs
+            torch.xpu.empty_cache()
 
 
 def _recipe_for_provider(provider):
@@ -888,6 +866,6 @@ if __name__ == "__main__":
         ).round(2)
     print(pv.to_markdown())
 
-    benchmark_w8.run(print_data=False)
+    benchmark_w8()
     print("\nWNA16 W8A16 fused-experts benchmark finished!\n")
     print(pd.DataFrame(W8_RESULTS).to_markdown(index=False))

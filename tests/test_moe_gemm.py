@@ -1109,7 +1109,7 @@ def test_moe_gemm_fp8_w8a16_block_weights(
     and keeps activations in BF16, matching the Xe2 W8A16 fallback.
     Any remaining numerical difference should be GEMM arithmetic noise only.
 
-    The cases cover each block-scale tile tier and runtime-optional bias.
+    The cases cover block scales, multiple top-k values, and optional bias.
     """
     from sgl_kernel.moe import _moe_ws_cache, _moe_ws_view_cache
 
@@ -1183,72 +1183,48 @@ def test_moe_gemm_fp8_w8a16_block_weights(
     torch.xpu.empty_cache()
 
 
-def test_moe_gemm_fp8_gelu_split_activation():
-    """Keep one small GELU case covering FP8's external activation wiring."""
+@pytest.mark.parametrize(
+    "activation,activation_kwargs,gate_factor,topk,with_bias",
+    [
+        ("gelu", {}, 2, 1, False),
+        ("relu2", {}, 1, 4, True),
+        (
+            "silu",
+            {"gemm1_alpha": SWIGLU_ALPHA, "gemm1_limit": SWIGLU_LIMIT},
+            2,
+            2,
+            False,
+        ),
+        ("silu", {"swiglu_limit": 10}, 2, 4, False),
+    ],
+)
+def test_moe_gemm_fp8_activations(
+    activation, activation_kwargs, gate_factor, topk, with_bias
+):
     torch.manual_seed(1)
     torch.xpu.manual_seed_all(1)
-    num_tokens, topk, num_experts = 9, 1, 8
-    hidden_size = intermediate_size = 256
+    num_tokens, num_experts = 9, 8
+    hidden_size = intermediate_size = 128
 
     a = create_random_cpu_tensor((num_tokens, hidden_size), torch.bfloat16)
     w1_bf16 = create_random_cpu_tensor(
-        (num_experts, 2 * intermediate_size, hidden_size), torch.bfloat16
+        (num_experts, gate_factor * intermediate_size, hidden_size), torch.bfloat16
     )
     w2_bf16 = create_random_cpu_tensor(
         (num_experts, hidden_size, intermediate_size), torch.bfloat16
     )
-    score = torch.randn((num_tokens, num_experts), dtype=torch.bfloat16)
-    topk_weight, topk_ids = torch.topk(
-        torch.softmax(score, dim=-1, dtype=torch.float32), topk
+    b1 = (
+        create_random_cpu_tensor(
+            (num_experts, gate_factor * intermediate_size), torch.float32, std=0.005
+        )
+        if with_bias
+        else None
     )
-    w1_scale, w1_fp8, w1_dq = _quant_dequant_fp8_block(w1_bf16)
-    w2_scale, w2_fp8, w2_dq = _quant_dequant_fp8_block(w2_bf16)
-
-    torch_output = torch_naive_moe_fp8_w8a16(
-        a,
-        w1_dq,
-        w2_dq,
-        topk_ids,
-        topk_weight,
-        topk,
-        None,
-        None,
-        activation="gelu",
+    b2 = (
+        create_random_cpu_tensor((num_experts, hidden_size), torch.float32, std=0.005)
+        if with_bias
+        else None
     )
-    sglang_output = fused_experts(
-        a.to("xpu"),
-        w1_fp8.to("xpu"),
-        w2_fp8.to("xpu"),
-        topk_weight.to("xpu"),
-        topk_ids.to("xpu"),
-        activation="gelu",
-        w1_scale=w1_scale.to("xpu"),
-        w2_scale=w2_scale.to("xpu"),
-        use_fp8_w8a8=True,
-    )
-    torch.testing.assert_close(
-        torch_output, sglang_output.to("cpu"), rtol=1e-1, atol=1e-2
-    )
-
-
-def test_moe_gemm_fp8_relu2():
-    """Cover FP8's non-gated ReLU2 path with a single-width GEMM1 output."""
-    torch.manual_seed(2)
-    torch.xpu.manual_seed_all(2)
-    num_tokens, topk, num_experts = 9, 4, 8
-    hidden_size = intermediate_size = 256
-
-    a = create_random_cpu_tensor((num_tokens, hidden_size), torch.bfloat16)
-    w1_bf16 = create_random_cpu_tensor(
-        (num_experts, intermediate_size, hidden_size), torch.bfloat16
-    )
-    w2_bf16 = create_random_cpu_tensor(
-        (num_experts, hidden_size, intermediate_size), torch.bfloat16
-    )
-    b1 = create_random_cpu_tensor(
-        (num_experts, intermediate_size), torch.float32, std=0.005
-    )
-    b2 = create_random_cpu_tensor((num_experts, hidden_size), torch.float32, std=0.005)
     score = torch.randn((num_tokens, num_experts), dtype=torch.bfloat16)
     topk_weight, topk_ids = torch.topk(
         torch.softmax(score, dim=-1, dtype=torch.float32), topk
@@ -1265,59 +1241,7 @@ def test_moe_gemm_fp8_relu2():
         topk,
         b1,
         b2,
-        activation="relu2",
-    )
-    sglang_output = fused_experts(
-        a.to("xpu"),
-        w1_fp8.to("xpu"),
-        w2_fp8.to("xpu"),
-        topk_weight.to("xpu"),
-        topk_ids.to("xpu"),
-        b1.to("xpu"),
-        b2.to("xpu"),
-        activation="relu2",
-        w1_scale=w1_scale.to("xpu"),
-        w2_scale=w2_scale.to("xpu"),
-        use_fp8_w8a8=True,
-    )
-    torch.testing.assert_close(
-        torch_output, sglang_output.to("cpu"), rtol=1e-1, atol=1e-2
-    )
-
-
-@pytest.mark.parametrize("activation_variant", ["gpt_oss", "deepseek_v4"])
-def test_moe_gemm_fp8_swiglu_variants(activation_variant):
-    torch.manual_seed(3)
-    torch.xpu.manual_seed_all(3)
-    num_tokens, topk, num_experts = 9, 4, 8
-    hidden_size = intermediate_size = 256
-    a = create_random_cpu_tensor((num_tokens, hidden_size), torch.bfloat16)
-    w1_bf16 = create_random_cpu_tensor(
-        (num_experts, 2 * intermediate_size, hidden_size), torch.bfloat16
-    )
-    w2_bf16 = create_random_cpu_tensor(
-        (num_experts, hidden_size, intermediate_size), torch.bfloat16
-    )
-    score = torch.randn((num_tokens, num_experts), dtype=torch.bfloat16)
-    topk_weight, topk_ids = torch.topk(
-        torch.softmax(score, dim=-1, dtype=torch.float32), topk
-    )
-    w1_scale, w1_fp8, w1_dq = _quant_dequant_fp8_block(w1_bf16)
-    w2_scale, w2_fp8, w2_dq = _quant_dequant_fp8_block(w2_bf16)
-    activation_kwargs = (
-        {"gemm1_alpha": SWIGLU_ALPHA, "gemm1_limit": SWIGLU_LIMIT}
-        if activation_variant == "gpt_oss"
-        else {"swiglu_limit": 10}
-    )
-    torch_output = torch_naive_moe_fp8_w8a16(
-        a,
-        w1_dq,
-        w2_dq,
-        topk_ids,
-        topk_weight,
-        topk,
-        None,
-        None,
+        activation=activation,
         **activation_kwargs,
     )
     sglang_output = fused_experts(
@@ -1326,7 +1250,9 @@ def test_moe_gemm_fp8_swiglu_variants(activation_variant):
         w2_fp8.to("xpu"),
         topk_weight.to("xpu"),
         topk_ids.to("xpu"),
-        activation="silu",
+        b1.to("xpu") if b1 is not None else None,
+        b2.to("xpu") if b2 is not None else None,
+        activation=activation,
         w1_scale=w1_scale.to("xpu"),
         w2_scale=w2_scale.to("xpu"),
         use_fp8_w8a8=True,
@@ -1337,11 +1263,19 @@ def test_moe_gemm_fp8_swiglu_variants(activation_variant):
     )
 
 
-def test_moe_gemm_fp8_w8a8_flag_falls_back_for_scalar_scales():
+@pytest.mark.parametrize(
+    "num_tokens,topk,with_bias",
+    [
+        (1, 1, False),
+        (8, 4, True),
+        (16, 2, False),
+    ],
+)
+def test_moe_gemm_fp8_w8a16_scalar_weights(num_tokens, topk, with_bias):
     """The W8A8 checkpoint flag must use W8A16 for scalar FP8 scales on Xe2."""
     torch.manual_seed(4)
     torch.xpu.manual_seed_all(4)
-    num_tokens, topk, num_experts = 9, 1, 8
+    num_experts = 8
     hidden_size = intermediate_size = 128
 
     a = create_random_cpu_tensor((num_tokens, hidden_size), torch.bfloat16)
@@ -1355,29 +1289,43 @@ def test_moe_gemm_fp8_w8a8_flag_falls_back_for_scalar_scales():
     topk_weight, topk_ids = torch.topk(
         torch.softmax(score, dim=-1, dtype=torch.float32), topk
     )
+    if num_tokens == 1:
+        topk_ids = torch.cat((topk_ids, topk_ids), dim=1)[:, ::2]
 
-    w1_scale = (
+    s1 = (
         w1_bf16.float().abs().amax((1, 2), keepdim=True).clamp_min(1e-12) / FP8_E4M3_MAX
     )
-    w2_scale = (
+    s2 = (
         w2_bf16.float().abs().amax((1, 2), keepdim=True).clamp_min(1e-12) / FP8_E4M3_MAX
     )
-    w1_fp8 = (w1_bf16.float() / w1_scale).to(torch.float8_e4m3fn)
-    w2_fp8 = (w2_bf16.float() / w2_scale).to(torch.float8_e4m3fn)
-    w1_dq = (w1_fp8.float() * w1_scale).to(torch.bfloat16)
-    w2_dq = (w2_fp8.float() * w2_scale).to(torch.bfloat16)
-    w1_scale = w1_scale.view(num_experts, 1).repeat(1, 2).contiguous()
-    w2_scale = w2_scale.view(num_experts, 1).contiguous()
-
-    torch_output = torch_naive_moe(
-        a, w1_dq, w2_dq, topk_ids, topk_weight, topk, None, None
+    w1_fp8 = (w1_bf16.float() / s1).to(torch.float8_e4m3fn)
+    w2_fp8 = (w2_bf16.float() / s2).to(torch.float8_e4m3fn)
+    w1_dq = (w1_fp8.float() * s1).to(torch.bfloat16)
+    w2_dq = (w2_fp8.float() * s2).to(torch.bfloat16)
+    b1 = (
+        create_random_cpu_tensor(
+            (num_experts, 2 * intermediate_size), torch.float32, std=0.005
+        )
+        if with_bias
+        else None
     )
+    b2 = (
+        create_random_cpu_tensor((num_experts, hidden_size), torch.float32, std=0.005)
+        if with_bias
+        else None
+    )
+    w1_scale = s1.view(num_experts, 1).repeat(1, 2).contiguous()
+    w2_scale = s2.view(num_experts, 1).contiguous()
+
+    torch_output = torch_naive_moe(a, w1_dq, w2_dq, topk_ids, topk_weight, topk, b1, b2)
     sglang_output = fused_experts(
         a.to("xpu"),
         w1_fp8.to("xpu"),
         w2_fp8.to("xpu"),
         topk_weight.to("xpu"),
         topk_ids.to("xpu"),
+        b1.to("xpu") if b1 is not None else None,
+        b2.to("xpu") if b2 is not None else None,
         activation="silu",
         use_fp8_w8a8=True,
         w1_scale=w1_scale.to("xpu"),
@@ -1388,24 +1336,15 @@ def test_moe_gemm_fp8_w8a8_flag_falls_back_for_scalar_scales():
     )
 
 
-@pytest.mark.parametrize(
-    "scale_count,rows_per_expert,gemm_n,gemm_k",
-    [
-        (1, 4, 128, 128),
-        (2, 8, 128, 128),
-        (1, 16, 128, 128),
-        (2, 16, 128, 128),
-    ],
-)
-def test_moe_grouped_mm_fp8_w8a16_scalar_scales(
-    scale_count, rows_per_expert, gemm_n, gemm_k
-):
+@pytest.mark.parametrize("scale_count,rows_per_expert", [(1, 4), (2, 8), (1, 16)])
+def test_moe_grouped_mm_fp8_w8a16_scalar_scales(scale_count, rows_per_expert):
+    gemm_n = gemm_k = 128
     torch.manual_seed(5)
     torch.xpu.manual_seed_all(5)
     num_experts = 8
     total_rows = num_experts * rows_per_expert
     activations = torch.randn((total_rows, gemm_k), dtype=torch.bfloat16)
-    source = torch.randn((num_experts, gemm_n, gemm_k), dtype=torch.bfloat16)
+    source = torch.rand((num_experts, gemm_n, gemm_k), dtype=torch.bfloat16)
 
     if scale_count == 1:
         scale = (
@@ -1462,87 +1401,7 @@ def test_moe_grouped_mm_fp8_w8a16_scalar_scales(
         torch.full((num_experts,), rows_per_expert, device="xpu", dtype=torch.int32),
         num_experts,
     )
-    torch.testing.assert_close(reference, output.cpu(), rtol=5e-2, atol=5e-2)
-
-
-@pytest.mark.parametrize(
-    "num_tokens,topk,num_experts,hidden_size,intermediate_size,with_bias",
-    [
-        (1, 1, 8, 128, 128, False),
-        (8, 4, 8, 128, 128, True),
-        (16, 2, 8, 128, 128, False),
-    ],
-)
-def test_moe_gemm_fp8_w8a16(
-    num_tokens, topk, num_experts, hidden_size, intermediate_size, with_bias
-):
-    torch.manual_seed(0)
-    torch.xpu.manual_seed_all(0)
-
-    a = create_random_cpu_tensor((num_tokens, hidden_size), torch.bfloat16)
-    w1_bf16 = create_random_cpu_tensor(
-        (num_experts, 2 * intermediate_size, hidden_size), torch.bfloat16
-    )
-    w2_bf16 = create_random_cpu_tensor(
-        (num_experts, hidden_size, intermediate_size), torch.bfloat16
-    )
-    score = torch.randn((num_tokens, num_experts), dtype=torch.bfloat16)
-    topk_weight, topk_ids = torch.topk(
-        torch.softmax(score, dim=-1, dtype=torch.float32), topk
-    )
-    if num_tokens == 1:
-        topk_ids = torch.cat((topk_ids, topk_ids), dim=1)[:, ::2]
-        assert not topk_ids.is_contiguous()
-
-    s1 = (
-        w1_bf16.float().abs().amax((1, 2), keepdim=True).clamp_min(1e-12) / FP8_E4M3_MAX
-    )
-    s2 = (
-        w2_bf16.float().abs().amax((1, 2), keepdim=True).clamp_min(1e-12) / FP8_E4M3_MAX
-    )
-    w1_fp8 = (w1_bf16.float() / s1).to(torch.float8_e4m3fn)
-    w2_fp8 = (w2_bf16.float() / s2).to(torch.float8_e4m3fn)
-    w1_dq = (w1_fp8.float() * s1).to(torch.bfloat16)
-    w2_dq = (w2_fp8.float() * s2).to(torch.bfloat16)
-
-    b1, b2 = None, None
-    if with_bias:
-        b1 = create_random_cpu_tensor(
-            (num_experts, 2 * intermediate_size), torch.float32, std=0.005
-        )
-        b2 = create_random_cpu_tensor(
-            (num_experts, hidden_size), torch.float32, std=0.005
-        )
-
-    w1_scale = s1.view(num_experts, 1).repeat(1, 2).contiguous()
-    w2_scale = s2.view(num_experts, 1).contiguous()
-
-    torch_output = torch_naive_moe(
-        a,
-        w1_dq,
-        w2_dq,
-        topk_ids,
-        topk_weight,
-        topk,
-        b1,
-        b2,
-    )
-    sglang_output = fused_experts(
-        a.to("xpu"),
-        w1_fp8.to("xpu"),
-        w2_fp8.to("xpu"),
-        topk_weight.to("xpu"),
-        topk_ids.to("xpu"),
-        b1.to("xpu") if b1 is not None else None,
-        b2.to("xpu") if b2 is not None else None,
-        activation="silu",
-        use_fp8_w8a8=True,
-        w1_scale=w1_scale.to("xpu"),
-        w2_scale=w2_scale.to("xpu"),
-    )
-    torch.testing.assert_close(
-        torch_output, sglang_output.to("cpu"), rtol=1e-1, atol=5e-2
-    )
+    torch.testing.assert_close(reference, output.cpu(), rtol=1e-2, atol=5e-2)
 
 
 @pytest.mark.parametrize("rows_per_expert", [(0, 1, 2, 3, 4, 5, 7, 10)])

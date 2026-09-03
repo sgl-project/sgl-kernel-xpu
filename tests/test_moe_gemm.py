@@ -915,5 +915,63 @@ def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_input_dtypes(weight_dtype, scale_dty
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "gemm_n,gemm_k",
+    [
+        (320, 256),  # short K: 64x128 SG_N=16 with the half-tile N skip
+        (256, 1056),  # long K: 64x256 SG_N=16 without an N tail
+        (320, 1056),  # long K: 64x256 SG_N=16 with the N skip
+    ],
+)
+def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_ragged_production_tiles(
+    dtype, gemm_n, gemm_k
+):
+    """Reference-check all fmha-cri production large-M dispatch variants.
+
+    The 64-row production tiles are selected from the mean row count, while
+    each expert still has its own ragged tail.  This verifies both the
+    tile-aligned A/B surfaces and the N-tail-skip variants against the
+    dequantized MXFP4 reference without allocating full GPT-OSS weights.
+    """
+    rows_per_expert = [40, 0, 80]
+    num_experts = len(rows_per_expert)
+    total_m = sum(rows_per_expert)
+
+    torch.manual_seed(17)
+    torch.xpu.manual_seed_all(17)
+    activations = create_random_xpu_tensor((total_m, gemm_k), dtype)
+    weights_cpu = create_random_cpu_tensor((num_experts, gemm_n, gemm_k), dtype)
+    packed_cpu, scales_cpu = _quantize_weights_mxfp4(weights_cpu)
+    dequantized_cpu = _dequantize_weights_mxfp4(packed_cpu, scales_cpu, dtype=dtype)
+
+    expected = torch.empty((total_m, gemm_n), dtype=dtype)
+    row_start = 0
+    for expert, row_count in enumerate(rows_per_expert):
+        row_end = row_start + row_count
+        if row_count:
+            expected[row_start:row_end] = (
+                activations[row_start:row_end].cpu().float()
+                @ dequantized_cpu[expert].float().transpose(0, 1)
+            ).to(dtype)
+        row_start = row_end
+
+    actual = torch.empty((total_m, gemm_n), dtype=dtype, device="xpu")
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w4a16(
+        actual,
+        activations,
+        packed_cpu.to("xpu"),
+        scales_cpu.to("xpu"),
+        None,
+        None,
+        torch.tensor(rows_per_expert, dtype=torch.int32, device="xpu"),
+        num_experts,
+        False,
+        MXFP4_BLOCK_SIZE,
+    )
+
+    torch.testing.assert_close(actual.cpu(), expected, rtol=1e-1, atol=1e-2)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

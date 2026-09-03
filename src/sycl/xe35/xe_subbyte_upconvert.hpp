@@ -107,6 +107,26 @@ pack_selected_nibbles(uint64_t bytes, int nibble_shift) {
   return static_cast<uint32_t>(x | (x >> 16));
 }
 
+#ifdef __SYCL_DEVICE_ONLY__
+CUTLASS_DEVICE sycl::detail::float16_vec2
+mul_fp16x2_visa(
+    sycl::detail::float16_vec2 values,
+    sycl::detail::float16_vec2 scales) {
+  uint32_t value_bits = sycl::bit_cast<uint32_t>(values);
+  uint32_t scale_bits = sycl::bit_cast<uint32_t>(scales);
+  asm volatile(
+      "{\n"
+      ".decl VALUE_HF v_type=G type=HF num_elts=32 alias=<%0,0>\n"
+      ".decl SCALE_HF v_type=G type=HF num_elts=32 alias=<%1,0>\n"
+      "mul (M1_NM, 32) VALUE_HF(0,0)<1> "
+      "VALUE_HF(0,0)<1;1,0> SCALE_HF(0,0)<1;1,0>\n"
+      "}\n"
+      : "+rw"(value_bits)
+      : "rw"(scale_bits));
+  return sycl::bit_cast<sycl::detail::float16_vec2>(value_bits);
+}
+#endif
+
 template <class Dst, class Scale>
 CUTLASS_DEVICE void
 convert_native_e2m1x8(
@@ -132,7 +152,7 @@ convert_native_e2m1x8(
         static_cast<uint8_t>(packed >> (8 * pair))};
     auto decoded =
         __builtin_spirv_ConvertE2M1ToFP16INTEL(packed_pair);
-    sycl::detail::float16_vec2 scaled;
+    sycl::detail::float16_vec2 scales;
     CUTLASS_PRAGMA_UNROLL
     for (int j = 0; j < 2; ++j) {
       const int local = 2 * pair + j;
@@ -140,8 +160,9 @@ convert_native_e2m1x8(
       const int p = local & 3;
       const int q = parity + 2 * c;
       const int dst_idx = p + 4 * q + 32 * r + 128 * s;
-      scaled[j] = decoded[j] * static_cast<_Float16>(scale(dst_idx));
+      scales[j] = static_cast<_Float16>(scale(dst_idx));
     }
+    auto scaled = detail::mul_fp16x2_visa(decoded, scales);
 
     auto converted = __builtin_spirv_ClampConvertFP16ToE4M3INTEL(scaled);
     CUTLASS_PRAGMA_UNROLL

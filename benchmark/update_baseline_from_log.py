@@ -42,9 +42,7 @@ def parse_fused_moe_log(log_text: str) -> dict:
         with_bias = cols[column_index["with_bias"]]
         act_type = cols[column_index["act_type"]]
         quant_mode = (
-            cols[column_index.get("quant_mode", -1)]
-            if "quant_mode" in column_index
-            else "bf16"
+            cols[column_index["quant_mode"]] if "quant_mode" in column_index else "bf16"
         )
         ms = float(cols[column_index["ms"]])
 

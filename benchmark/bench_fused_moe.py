@@ -1,5 +1,4 @@
 # python3 benchmark/bench_fused_moe.py
-import os
 from itertools import product
 
 import torch
@@ -204,8 +203,6 @@ configs += [
     for k, v, b in product(bs, shape_values_swiglu_gpt_oss, with_bias)
 ]
 
-# One scalar-scale and one 128x128 block-scale model geometry are enough to
-# cover W8A16's two dispatch contracts without duplicating the full BF16 sweep.
 fp8_shape_configs = [
     {
         "num_experts": 8,
@@ -226,14 +223,11 @@ fp8_shape_configs = [
         "quant_mode": "fp8_block",
     },
 ]
-fp8_configs = [
+configs += [
     (tokens, *_cfg_vals(config), False, "silu")
     for tokens, config in product([1, 32, 2048], fp8_shape_configs)
 ]
-if os.environ.get("SGL_MOE_BENCH_QUANT_MODE") == "fp8":
-    configs = fp8_configs
-else:
-    configs += fp8_configs
+
 all_results = []
 
 
@@ -615,10 +609,9 @@ def benchmark(
             "hidden_size": hidden_size,
             "shard_intermediate_size": shard_intermediate_size,
             "dtype": dtype,
-            # "block_shape": block_shape,  # Always None now. disabled to reduce the number of columns
+            "quant_mode": quant_mode,
             "with_bias": with_bias,
             "act_type": act_type,
-            "quant_mode": quant_mode,
             "provider": provider,
             "tflops": tflops,
             "bandwidth": bandwidth,

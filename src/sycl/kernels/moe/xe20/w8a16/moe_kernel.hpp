@@ -9,7 +9,7 @@
 #pragma once
 
 #include "../common/block_2d_copy_d.hpp"
-#include "../w4a16/gemm_xe2.hpp"
+#include "../common/xe_gemm.hpp"
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/float8.h"
@@ -151,7 +151,7 @@ class Fp8W8A16Kernel {
         auto tile_coord = make_coord(m_coord, n_coord, _, 0);
         if constexpr (WeightScalePerExpert) {
           if (params.weight_scale_count == 1) {
-            moe_w4a16::xe_gemm<void, void, void>(
+            moe_xe20::xe_gemm<void, void, void>(
                 A_tensor, B_tensor, ptr_S_curr_batch, ptr_Bias_curr_batch, D_tensor, tile_coord, mma);
           } else {
             CollectiveMainloop mainloop;

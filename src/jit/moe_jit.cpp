@@ -298,8 +298,10 @@ int fp8_tile_id(int avg_m, int gemm_k, int gemm_n, int scale_count) {
     return 1;
   }
   if (avg_m <= 8) return 0;
-  if (scale_count == 2 && avg_m > 32 && avg_m <= 128 && gemm_k >= 2048) return 2;
-  if (avg_m <= 32 || (scale_count == 2 && gemm_k >= 4096 && avg_m <= 512)) return 1;
+  if (avg_m <= 32) return 1;
+  if (scale_count == 2 && avg_m <= 64 && gemm_k >= 2048) return 2;
+  if (scale_count == 1 && gemm_n <= 2048 && gemm_k >= 1024 && avg_m <= 128) return 1;
+  if (scale_count == 1 && gemm_n <= 2048 && gemm_k >= 1024 && avg_m <= 512) return 2;
   return 3;
 }
 

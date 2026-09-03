@@ -101,17 +101,21 @@ DECLARE_XE20_MOE_FP8_W8A16_ALL_SCALE_VARIANTS(Tile_128_128_16, SG_4_2_1)
     }                                                                              \
   } while (0)
 
-#define DISPATCH_MOE_FP8_W8A16_SCALAR_TILES()                                         \
-  do {                                                                                \
-    if (avg_m <= 8) {                                                                 \
-      LAUNCH_MOE_FP8_W8A16(false, Tile_16_64_32, SG_1_4_1);                           \
-    } else if (scale_count == 2 && avg_m > 32 && avg_m <= 128 && gemm_k >= 2048) {    \
-      LAUNCH_MOE_FP8_W8A16(false, Tile_64_64_32, SG_2_4_1);                           \
-    } else if (avg_m <= 32 || (scale_count == 2 && gemm_k >= 4096 && avg_m <= 512)) { \
-      LAUNCH_MOE_FP8_W8A16(false, Tile_32_64_32, SG_1_4_1);                           \
-    } else {                                                                          \
-      LAUNCH_MOE_FP8_W8A16(false, Tile_128_128_16, SG_4_2_1);                         \
-    }                                                                                 \
+#define DISPATCH_MOE_FP8_W8A16_SCALAR_TILES()                                          \
+  do {                                                                                 \
+    if (avg_m <= 8) {                                                                  \
+      LAUNCH_MOE_FP8_W8A16(false, Tile_16_64_32, SG_1_4_1);                            \
+    } else if (avg_m <= 32) {                                                          \
+      LAUNCH_MOE_FP8_W8A16(false, Tile_32_64_32, SG_1_4_1);                            \
+    } else if (scale_count == 2 && avg_m <= 64 && gemm_k >= 2048) {                    \
+      LAUNCH_MOE_FP8_W8A16(false, Tile_64_64_32, SG_2_4_1);                            \
+    } else if (scale_count == 1 && gemm_n <= 2048 && gemm_k >= 1024 && avg_m <= 128) { \
+      LAUNCH_MOE_FP8_W8A16(false, Tile_32_64_32, SG_1_4_1);                            \
+    } else if (scale_count == 1 && gemm_n <= 2048 && gemm_k >= 1024 && avg_m <= 512) { \
+      LAUNCH_MOE_FP8_W8A16(false, Tile_64_64_32, SG_2_4_1);                            \
+    } else {                                                                           \
+      LAUNCH_MOE_FP8_W8A16(false, Tile_128_128_16, SG_4_2_1);                          \
+    }                                                                                  \
   } while (0)
 
 SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_fp8_w8a16(

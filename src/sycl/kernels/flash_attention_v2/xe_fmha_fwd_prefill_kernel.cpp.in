@@ -36,6 +36,7 @@
 #define FMHA_PREFILL_ENABLE_SCORE_BLOCK2D 1
 #endif
 
+#include "sycl/kernels/flash_attention_v2/fmha_tile_dispatch.h"
 #include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_runner.hpp"
 
 namespace prefill {
@@ -44,14 +45,13 @@ template <>
 __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_TYPE@>::operator()(const Arguments& params) const {
   bool use_sink = (params.softmax_sink_ptr != nullptr);
 
-  using TileShapeQK = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_KV@>, cute::_32>;
-  using TileShapePV = cute::Shape<cute::Int<@TILED_Q@>, cute::_32, cute::Int<@TILED_KV@>>;
-  // Use the configured output tile head extent. CMake sets @TILED_OUT@ to a
-  // default rounded head size, and may override specific head dims (e.g. 512)
-  // to improve occupancy by splitting the output tile across V.
-  using TileShapeOutput = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_OUT@>>;
+  constexpr auto kTile = sgl::fmha::prefill_paged_tile(@HEAD_DIM@);
+  using TileShapeQK = cute::Shape<cute::Int<kTile.tiled_q>, cute::Int<kTile.tiled_kv>, cute::_32>;
+  using TileShapePV = cute::Shape<cute::Int<kTile.tiled_q>, cute::_32, cute::Int<kTile.tiled_kv>>;
+  // Output-tile head extent from the shared tile table (512 chunks the head).
+  using TileShapeOutput = cute::Shape<cute::Int<kTile.tiled_q>, cute::Int<sgl::fmha::prefill_tiled_out(@HEAD_DIM@)>>;
   using SubgroupLayoutQK =
-      cute::Layout<cute::Shape<cute::Int<@NUM_SG@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+      cute::Layout<cute::Shape<cute::Int<kTile.num_sg>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
 
   // softmax_lse output is only threaded as a template constexpr for the base
   // (non-causal / non-local / non-sink) configuration, matching the paged
@@ -72,6 +72,7 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
         TileShapeOutput,
         SubgroupLayoutQK,
         void,
+        false,
         2,
         false,
         Element,
@@ -97,6 +98,7 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
               TileShapeOutput,
               SubgroupLayoutQK,
               void,
+              false,
               2,
               false,
               Element,
@@ -110,6 +112,47 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
   TORCH_CHECK(
       !use_sink,
       "sink is only supported for head_size == 64, got @HEAD_DIM@");
+#if @HEAD_DIM@ == 128
+  if (params.rel_bias_ptr != nullptr) {
+    TORCH_CHECK(params.dv == 128, "relative attention requires head_dim_v == 128");
+    TORCH_CHECK(!params.is_e4m3 && !params.is_e5m2, "relative attention does not support fp8 KV cache");
+    TORCH_CHECK(
+        params.rel_bias_head_stride == prefill::rel_bias_padded_cols(params.rel_bias_extent),
+        "relative attention expects a sheared bias with ",
+        prefill::rel_bias_padded_cols(params.rel_bias_extent),
+        " columns");
+    using RelTileShapeQK = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::Int<prefill::kRelBiasKTile>, cute::_32>;
+    using RelTileShapePV = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::_32, cute::Int<32>>;
+    using RelTileShapeOutput = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::Int<128>>;
+    using RelSubgroupLayoutQK =
+        cute::Layout<cute::Shape<cute::Int<16>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+        using Element = @ELEM_TYPE@;
+        FMHAConfig<
+            Causal,
+            LocalMask,
+            false,
+            /*LSE=*/false,
+            RelTileShapeQK,
+            RelTileShapePV,
+            RelTileShapeOutput,
+            RelSubgroupLayoutQK,
+            void,
+            true,
+            2,
+            false,
+            Element,
+            Element,
+            Element,
+            Element>::run_paged(params);
+      });
+    });
+    return;
+  }
+#else
+  TORCH_CHECK(params.rel_bias_ptr == nullptr, "relative attention is only compiled for head_dim == 128");
+#endif
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
 
@@ -124,6 +167,7 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
             TileShapeOutput,
             SubgroupLayoutQK,
             void,
+            false,
             2,
             false,
             Element,
@@ -138,3 +182,10 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
 template struct FmhaPrefillRunner<@HEAD_DIM@, @ELEM_TYPE@>;
 
 }  // namespace prefill
+
+#ifdef SGL_FMHA_JIT_ENTRY
+extern "C" __attribute__((visibility("default"))) void sgl_fmha_entry(const void* params) {
+  prefill::FmhaPrefillRunner<@HEAD_DIM@, @ELEM_TYPE@>{}(
+      *static_cast<const prefill::Arguments*>(params));
+}
+#endif

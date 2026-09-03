@@ -1,5 +1,6 @@
 import itertools
 import sys
+from functools import lru_cache
 from typing import Callable
 
 import pytest
@@ -288,6 +289,28 @@ def _dequantize_weights_mxfp4(
         flat_packed, flat_scales, dtype=dtype, block_size=block_size
     )
     return flat_dq.reshape(E, rows, cols)
+
+
+@lru_cache(maxsize=None)
+def _mxfp4_expert_weights(num_experts: int, rows: int, cols: int):
+    """Random expert weights quantised to MXFP4, plus their dequantised BF16.
+
+    Returns ``(packed, scales, dequantised)``.
+
+    Cached on the shape: the CPU-side quantise/dequantise pair dominates the
+    MXFP4 cases in this file, and the two MXFP4 tests below sweep only a
+    handful of distinct (E, rows, cols) shapes across hundreds of cases. Uses
+    a private generator so the cached values do not depend on the ambient RNG
+    stream (i.e. on which case populated the entry).
+
+    Callers must treat the returned tensors as read-only.
+    """
+    gen = torch.Generator(device="cpu").manual_seed(0)
+    w_bf16 = torch.empty((num_experts, rows, cols), dtype=torch.bfloat16).normal_(
+        0, 0.01, generator=gen
+    )
+    packed, scales = _quantize_weights_mxfp4(w_bf16)
+    return packed, scales, _dequantize_weights_mxfp4(packed, scales)
 
 
 def _pack_int4_codes(codes: torch.Tensor) -> torch.Tensor:
@@ -581,13 +604,6 @@ def test_moe_gemm_mxfp4_weights(
     rtol, atol = 1e-1, 1e-2
 
     a = create_random_cpu_tensor((num_tokens, hidden_size), torch.bfloat16)
-    # w1: gate+up projection  [E, 2*I, H];  w2: down projection  [E, H, I]
-    w1_bf16 = create_random_cpu_tensor(
-        (num_experts, 2 * intermediate_size, hidden_size), torch.bfloat16
-    )
-    w2_bf16 = create_random_cpu_tensor(
-        (num_experts, hidden_size, intermediate_size), torch.bfloat16
-    )
 
     score = torch.randn([num_tokens, num_experts], dtype=torch.bfloat16)
     score = torch.softmax(score, dim=-1, dtype=torch.float32)
@@ -596,10 +612,13 @@ def test_moe_gemm_mxfp4_weights(
     # ---- Reference: quantise w1/w2 → dequantise to get MXFP4-rounded BF16 ----
     # Both the kernel and the reference operate on these rounded weights, so any
     # discrepancy is purely arithmetic (not quantisation error).
-    w1_packed, w1_scale = _quantize_weights_mxfp4(w1_bf16)
-    w2_packed, w2_scale = _quantize_weights_mxfp4(w2_bf16)
-    w1_dq = _dequantize_weights_mxfp4(w1_packed, w1_scale)
-    w2_dq = _dequantize_weights_mxfp4(w2_packed, w2_scale)
+    # w1: gate+up projection  [E, 2*I, H];  w2: down projection  [E, H, I]
+    w1_packed, w1_scale, w1_dq = _mxfp4_expert_weights(
+        num_experts, 2 * intermediate_size, hidden_size
+    )
+    w2_packed, w2_scale, w2_dq = _mxfp4_expert_weights(
+        num_experts, hidden_size, intermediate_size
+    )
 
     torch_output = torch_naive_moe(
         a,
@@ -681,14 +700,6 @@ def test_moe_gemm_mxfp4_weights_gpt_oss(
     rtol, atol = 1e-1, 1e-2
 
     a = create_random_cpu_tensor((num_tokens, hidden_size), torch.bfloat16)
-    # w1: gate+up projection [E, 2*I, H] (interleaved g0,u0,g1,u1,... for gpt-oss);
-    # w2: down projection [E, H, I].
-    w1_bf16 = create_random_cpu_tensor(
-        (num_experts, 2 * intermediate_size, hidden_size), torch.bfloat16
-    )
-    w2_bf16 = create_random_cpu_tensor(
-        (num_experts, hidden_size, intermediate_size), torch.bfloat16
-    )
 
     # Per-channel biases (float32, matching the kernel's fp32 bias accumulate).
     b1, b2 = None, None
@@ -705,10 +716,14 @@ def test_moe_gemm_mxfp4_weights_gpt_oss(
     topk_weight, topk_ids = torch.topk(score, topk)
 
     # ---- quantise → dequantise so kernel + reference see the same weights ----
-    w1_packed, w1_scale = _quantize_weights_mxfp4(w1_bf16)
-    w2_packed, w2_scale = _quantize_weights_mxfp4(w2_bf16)
-    w1_dq = _dequantize_weights_mxfp4(w1_packed, w1_scale)
-    w2_dq = _dequantize_weights_mxfp4(w2_packed, w2_scale)
+    # w1: gate+up projection [E, 2*I, H] (interleaved g0,u0,g1,u1,... for gpt-oss);
+    # w2: down projection [E, H, I].
+    w1_packed, w1_scale, w1_dq = _mxfp4_expert_weights(
+        num_experts, 2 * intermediate_size, hidden_size
+    )
+    w2_packed, w2_scale, w2_dq = _mxfp4_expert_weights(
+        num_experts, hidden_size, intermediate_size
+    )
 
     torch_output = torch_naive_moe(
         a,
@@ -898,6 +913,64 @@ def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_input_dtypes(weight_dtype, scale_dty
         weight_dtype=weight_dtype,
         scale_dtype=scale_dtype,
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "gemm_n,gemm_k",
+    [
+        (320, 256),  # short K: 64x128 SG_N=16 with the half-tile N skip
+        (256, 1056),  # long K: 64x256 SG_N=16 without an N tail
+        (320, 1056),  # long K: 64x256 SG_N=16 with the N skip
+    ],
+)
+def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_ragged_production_tiles(
+    dtype, gemm_n, gemm_k
+):
+    """Reference-check all fmha-cri production large-M dispatch variants.
+
+    The 64-row production tiles are selected from the mean row count, while
+    each expert still has its own ragged tail.  This verifies both the
+    tile-aligned A/B surfaces and the N-tail-skip variants against the
+    dequantized MXFP4 reference without allocating full GPT-OSS weights.
+    """
+    rows_per_expert = [40, 0, 80]
+    num_experts = len(rows_per_expert)
+    total_m = sum(rows_per_expert)
+
+    torch.manual_seed(17)
+    torch.xpu.manual_seed_all(17)
+    activations = create_random_xpu_tensor((total_m, gemm_k), dtype)
+    weights_cpu = create_random_cpu_tensor((num_experts, gemm_n, gemm_k), dtype)
+    packed_cpu, scales_cpu = _quantize_weights_mxfp4(weights_cpu)
+    dequantized_cpu = _dequantize_weights_mxfp4(packed_cpu, scales_cpu, dtype=dtype)
+
+    expected = torch.empty((total_m, gemm_n), dtype=dtype)
+    row_start = 0
+    for expert, row_count in enumerate(rows_per_expert):
+        row_end = row_start + row_count
+        if row_count:
+            expected[row_start:row_end] = (
+                activations[row_start:row_end].cpu().float()
+                @ dequantized_cpu[expert].float().transpose(0, 1)
+            ).to(dtype)
+        row_start = row_end
+
+    actual = torch.empty((total_m, gemm_n), dtype=dtype, device="xpu")
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w4a16(
+        actual,
+        activations,
+        packed_cpu.to("xpu"),
+        scales_cpu.to("xpu"),
+        None,
+        None,
+        torch.tensor(rows_per_expert, dtype=torch.int32, device="xpu"),
+        num_experts,
+        False,
+        MXFP4_BLOCK_SIZE,
+    )
+
+    torch.testing.assert_close(actual.cpu(), expected, rtol=1e-1, atol=1e-2)
 
 
 if __name__ == "__main__":

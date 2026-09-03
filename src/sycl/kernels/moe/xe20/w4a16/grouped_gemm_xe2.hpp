@@ -64,6 +64,11 @@ template <
     char LayoutKindB,
     char LayoutKindD,
     bool HasZero,
+    int StealChunk,
+    int PrefetchDist,
+    bool MainloopBarrier,
+    bool RowExtend,
+    bool SkipPaddedN,
     class TiledMMA,
     typename ElementA,
     typename ElementB,
@@ -79,6 +84,9 @@ CUTE_DEVICE void MoEGEMM(
     ElementD* Outputs,
     TiledMMA const& mma,
     const int* rows_per_expert,
+    // Total rows in Activations/Outputs, i.e. the bound past which the A surface
+    // must not be extended. Pass 0 to disable the extension entirely.
+    const int32_t total_rows,
     const int32_t num_experts,
     const int32_t group_size,
     const int32_t gemm_n,
@@ -86,6 +94,9 @@ CUTE_DEVICE void MoEGEMM(
     int32_t* atomic_buffer,
     const sycl::local_accessor<int32_t, 1>& slm_mem_const) {
   constexpr char actual_layout_of_B = LayoutKindB ^ ('R' ^ 'C');
+  // The surface extensions below only keep the addressing intact for row-major
+  // slices, whose stride does not carry the row count.
+  static_assert(LayoutKindA == 'R' && actual_layout_of_B == 'R', "surface extension needs row-major A and B");
   static constexpr bool is_B_int4 = (std::is_same_v<ElementB, uint8_t>) && (!std::is_same_v<ElementS, uint8_t>);
   static constexpr bool is_B_mxfp4 = (std::is_same_v<ElementB, uint8_t>) && (std::is_same_v<ElementS, uint8_t>);
   static constexpr bool is_B_4bits = std::is_same_v<ElementB, uint8_t>;
@@ -112,6 +123,10 @@ CUTE_DEVICE void MoEGEMM(
 
   int pre_rows = 0;
   int pre_tiles = 0;
+  // Tiles of the current steal still to run before the next atomic. StealChunk == 1
+  // is upstream: one atomic per tile, and this counter folds away.
+  static_assert(StealChunk >= 1, "work-stealing chunk must be positive");
+  int steal_tiles_left = 0;
 
   int32_t* slm_mem = static_cast<int32_t*>(slm_mem_const.template get_multi_ptr<sycl::access::decorated::no>().get());
 
@@ -147,21 +162,41 @@ CUTE_DEVICE void MoEGEMM(
       ptr_Bias_curr_batch = const_cast<ElementBI*>(Bias) + expert_id * gemm_n;
     }
 
-    auto A_tensor = make_moe_tensor<ElementA, LayoutKindA>(ptr_A_curr_batch, gemm_m, gemm_k);
+    // A 2D-block load whose block crosses the surface's last row costs far more
+    // than the rows it discards, so a tile whose block is not filled by the
+    // surface pays that on every k-tile. Both surfaces are slices of a larger
+    // buffer -- the rows past an expert's A are the next expert's rows, the rows
+    // past its B are the next expert's weights -- so the rows are real memory:
+    // give each surface a tile-aligned height and let the edge tiles read them.
+    // Nothing extra is computed (the tile spans those rows either way) and no
+    // extra result is written, because D keeps the true row and column counts.
+    // The last expert has nothing after it, so it keeps its true height.
+    int a_rows = gemm_m;
+    int b_rows = gemm_n;
+    if constexpr (RowExtend)
+      if (total_rows > 0) {
+        const int padded_m = (gemm_m + wg_tile_m - 1) / wg_tile_m * wg_tile_m;
+        a_rows = cute::max(gemm_m, cute::min(padded_m, total_rows - pre_rows));
+        if (expert_id + 1 < num_experts) {
+          b_rows = (gemm_n + wg_tile_n - 1) / wg_tile_n * wg_tile_n;
+        }
+      }
+
+    auto A_tensor = make_moe_tensor<ElementA, LayoutKindA>(ptr_A_curr_batch, a_rows, gemm_k);
     auto B_tensor = [&]() {
       if constexpr (is_B_int4) {
         if constexpr (HasZero) {
           return make_moe_tensor<uint4_t, actual_layout_of_B>(
-              reinterpret_cast<uint4_t*>(ptr_B_curr_batch), gemm_n, gemm_k);
+              reinterpret_cast<uint4_t*>(ptr_B_curr_batch), b_rows, gemm_k);
         } else {
           return make_moe_tensor<int4_t, actual_layout_of_B>(
-              reinterpret_cast<int4_t*>(ptr_B_curr_batch), gemm_n, gemm_k);
+              reinterpret_cast<int4_t*>(ptr_B_curr_batch), b_rows, gemm_k);
         }
       } else if constexpr (is_B_mxfp4) {
         return make_moe_tensor<float_e2m1_t, actual_layout_of_B>(
-            reinterpret_cast<float_e2m1_t*>(ptr_B_curr_batch), gemm_n, gemm_k);
+            reinterpret_cast<float_e2m1_t*>(ptr_B_curr_batch), b_rows, gemm_k);
       } else {
-        return make_moe_tensor<ElementB, actual_layout_of_B>(ptr_B_curr_batch, gemm_n, gemm_k);
+        return make_moe_tensor<ElementB, actual_layout_of_B>(ptr_B_curr_batch, b_rows, gemm_k);
       }
     }();
     auto D_tensor = make_moe_tensor<ElementD, LayoutKindD>(ptr_D_curr_batch, gemm_m, gemm_n);
@@ -172,15 +207,23 @@ CUTE_DEVICE void MoEGEMM(
       auto tile_coord = make_coord(m_coord, n_coord, _, 0);
 
       if constexpr (is_B_4bits) {
-#define XE_GEMM_4BITS_CALLER(GroupSize)                                              \
-  xe_gemm_4bits<GmemTiledCopyA, GmemTiledCopyB, GmemTiledCopyD, GroupSize, HasZero>( \
-      A_tensor,                                                                      \
-      B_tensor,                                                                      \
-      ptr_Scales_curr_batch,                                                         \
-      ptr_Zeros_curr_batch,                                                          \
-      ptr_Bias_curr_batch,                                                           \
-      D_tensor,                                                                      \
-      tile_coord,                                                                    \
+#define XE_GEMM_4BITS_CALLER(GroupSize) \
+  xe_gemm_4bits<                        \
+      GmemTiledCopyA,                   \
+      GmemTiledCopyB,                   \
+      GmemTiledCopyD,                   \
+      GroupSize,                        \
+      HasZero,                          \
+      PrefetchDist,                     \
+      MainloopBarrier,                  \
+      SkipPaddedN>(                     \
+      A_tensor,                         \
+      B_tensor,                         \
+      ptr_Scales_curr_batch,            \
+      ptr_Zeros_curr_batch,             \
+      ptr_Bias_curr_batch,              \
+      D_tensor,                         \
+      tile_coord,                       \
       mma);
         if (group_size == 32) {
           XE_GEMM_4BITS_CALLER(32)
@@ -197,11 +240,20 @@ CUTE_DEVICE void MoEGEMM(
             A_tensor, B_tensor, ptr_Scales_curr_batch, ptr_Bias_curr_batch, D_tensor, tile_coord, mma);
       }
 
-      if (local_id == 0) {
-        slm_mem[0] = cutlass::atomicAdd(atomic_buffer, 1);
+      // Work stealing in chunks of StealChunk tiles: one atomic per chunk instead
+      // of one per tile, and a chunk's tiles are consecutive in the tile order, so
+      // they share their A rows. At StealChunk == 1 this is upstream's loop.
+      if (steal_tiles_left > 0) {
+        ++group_id;
+        --steal_tiles_left;
+      } else {
+        if (local_id == 0) {
+          slm_mem[0] = cutlass::atomicAdd(atomic_buffer, StealChunk);
+        }
+        item.barrier(sycl::access::fence_space::local_space);
+        group_id = group_range + slm_mem[0];
+        steal_tiles_left = StealChunk - 1;
       }
-      item.barrier(sycl::access::fence_space::local_space);
-      group_id = group_range + slm_mem[0];
       group_m_id = (group_id * wg_tile_n) / gemm_n_pad;
     }
     pre_rows = cumsum_rows_for_experts;

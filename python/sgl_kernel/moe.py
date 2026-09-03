@@ -369,7 +369,7 @@ def cutlass_fp4_group_mm(
     return c.to(dtype=out_dtype)
 
 
-_MOE_WS_HEADROOM = 1.1
+_MOE_WS_HEADROOM = 1
 _moe_ws_cache: Dict[Tuple[str, torch.device], torch.Tensor] = {}
 
 

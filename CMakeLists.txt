@@ -99,7 +99,7 @@ endif()
 # cutlass — repo and commit depend on the target architecture
 if(DPCPP_SYCL_TARGET MATCHES "bmg")
   set(CUTLASS_SYCL_REPO "https://github.com/intel/sycl-tla.git")
-  set(CUTLASS_SYCL_TAG  "d54352dffe8daab532abd88fc6ab0e9c9fbc6d62")
+  set(CUTLASS_SYCL_TAG  "87f6850680a580654b9ea2c80dbc01aeb36ad231")
 elseif(DPCPP_SYCL_TARGET MATCHES "cri")
   set(CUTLASS_SYCL_REPO "https://github.com/intel/sycl-tla.git")
   set(CUTLASS_SYCL_TAG  "d54352dffe8daab532abd88fc6ab0e9c9fbc6d62")

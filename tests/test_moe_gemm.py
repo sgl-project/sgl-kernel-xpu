@@ -1088,9 +1088,10 @@ def torch_naive_moe_fp8_w8a16(
 @pytest.mark.parametrize(
     "num_tokens,topk,num_experts,hidden_size,intermediate_size,with_bias",
     [
-        (1, 1, 8, 256, 256, False),  # avg_m <= 4: Tile16
-        (32, 2, 8, 256, 256, True),  # avg_m <= 128: Tile32, with bias
-        (1024, 2, 8, 512, 512, False),  # avg_m > 128: Tile128
+        # Qwen3.5-35B-A3B-FP8 TP4: E=256, topk=8, H=2048, I_shard=128.
+        (1, 8, 256, 2048, 128, False),
+        (256, 8, 256, 2048, 128, True),
+        (8192, 8, 256, 2048, 128, False),
     ],
 )
 def test_moe_gemm_fp8_w8a16_block_weights(

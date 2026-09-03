@@ -9,8 +9,6 @@ from torch.nn import functional as F
 # GPT-OSS SwiGLU parameters
 SWIGLU_GPT_OSS_ALPHA = 1.702
 SWIGLU_GPT_OSS_LIMIT = 7.0
-FP8_E4M3_MAX = 448.0
-FP8_BLOCK_SIZE = 128
 
 shape_configs = [
     # # Qwen/Qwen2-57B-A14B-Instruct, tp = 1
@@ -187,7 +185,6 @@ def _cfg_vals(d):
         d["block_shape"],
         d.get("gemm1_alpha"),
         d.get("gemm1_limit"),
-        d.get("quant_mode", "bf16"),
     ]
 
 
@@ -203,68 +200,7 @@ configs += [
     for k, v, b in product(bs, shape_values_swiglu_gpt_oss, with_bias)
 ]
 
-fp8_shape_configs = [
-    {
-        "num_experts": 8,
-        "topk": 8,
-        "hidden_size": 3584,
-        "shard_intermediate_size": 2560,
-        "dtype": torch.bfloat16,
-        "block_shape": None,
-        "quant_mode": "fp8_scalar",
-    },
-    {
-        "num_experts": 8,
-        "topk": 8,
-        "hidden_size": 7168,
-        "shard_intermediate_size": 1024,
-        "dtype": torch.bfloat16,
-        "block_shape": [FP8_BLOCK_SIZE, FP8_BLOCK_SIZE],
-        "quant_mode": "fp8_block",
-    },
-]
-configs += [
-    (tokens, *_cfg_vals(config), False, "silu")
-    for tokens, config in product([1, 32, 2048], fp8_shape_configs)
-]
-
 all_results = []
-
-
-def _quantize_fp8_weight(weight, scale_count, block_shape):
-    if block_shape is not None:
-        experts, rows, columns = weight.shape
-        blocked = weight.float().reshape(
-            experts,
-            rows // FP8_BLOCK_SIZE,
-            FP8_BLOCK_SIZE,
-            columns // FP8_BLOCK_SIZE,
-            FP8_BLOCK_SIZE,
-        )
-        scales = (
-            blocked.abs().amax((2, 4), keepdim=True).clamp_min(1e-12) / FP8_E4M3_MAX
-        )
-        quantized = (
-            (blocked / scales)
-            .clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
-            .to(torch.float8_e4m3fn)
-        )
-        return quantized.reshape_as(weight), scales.reshape(
-            experts, rows // FP8_BLOCK_SIZE, columns // FP8_BLOCK_SIZE
-        )
-
-    chunks = weight.float().chunk(scale_count, dim=1)
-    scales = [
-        chunk.abs().amax((1, 2), keepdim=True).clamp_min(1e-12) / FP8_E4M3_MAX
-        for chunk in chunks
-    ]
-    quantized = [
-        (chunk / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
-        for chunk, scale in zip(chunks, scales)
-    ]
-    return torch.cat(quantized, dim=1), torch.cat(scales, dim=1).reshape(
-        weight.shape[0], scale_count
-    )
 
 
 @torch.compile
@@ -455,7 +391,6 @@ def fused_moe_sglang_api(
             "block_shape",
             "gemm1_alpha",
             "gemm1_limit",
-            "quant_mode",
             "with_bias",
             "act_type",
         ],
@@ -488,12 +423,11 @@ def benchmark(
     provider,
     gemm1_alpha,
     gemm1_limit,
-    quant_mode,
 ):
     routed_scaling_factor = 1.0
 
     print(
-        f"benchmark {provider} with {num_tokens=} {hidden_size=} {shard_intermediate_size=} {with_bias=} {act_type=} {quant_mode=}"
+        f"benchmark {provider} with {num_tokens=} {hidden_size=} {shard_intermediate_size=} {with_bias=} {act_type=}"
     )
     torch.set_default_device("xpu")
     torch.xpu.manual_seed_all(0)
@@ -521,10 +455,6 @@ def benchmark(
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
     w1 = _make_weight(num_experts, shard_intermediate_size, hidden_size, dtype)
     w2 = _make_weight(num_experts, hidden_size, shard_intermediate_size // 2, dtype)
-    w1_scale, w2_scale = None, None
-    if quant_mode.startswith("fp8"):
-        w1, w1_scale = _quantize_fp8_weight(w1, 2, block_shape)
-        w2, w2_scale = _quantize_fp8_weight(w2, 1, block_shape)
     b1, b2 = None, None
     if with_bias:
         b1 = torch.randn(w1.shape[:2], dtype=dtype)
@@ -549,10 +479,6 @@ def benchmark(
         "gemm1_alpha": gemm1_alpha,
         "gemm1_limit": gemm1_limit,
         "routed_scaling_factor": routed_scaling_factor,
-        "use_fp8_w8a8": quant_mode.startswith("fp8"),
-        "w1_scale": w1_scale,
-        "w2_scale": w2_scale,
-        "block_shape": block_shape,
     }
 
     # Warmup
@@ -589,7 +515,7 @@ def benchmark(
             hidden_size * shard_intermediate_size
             + hidden_size * shard_intermediate_size // 2
         )
-        * (1 if quant_mode.startswith("fp8") else torch.finfo(dtype).bits // 8)
+        * (torch.finfo(dtype).bits // 8)
     )
     if with_bias:
         memory += (
@@ -609,7 +535,6 @@ def benchmark(
             "hidden_size": hidden_size,
             "shard_intermediate_size": shard_intermediate_size,
             "dtype": dtype,
-            "quant_mode": quant_mode,
             "with_bias": with_bias,
             "act_type": act_type,
             "provider": provider,

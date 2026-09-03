@@ -41,14 +41,9 @@ def parse_fused_moe_log(log_text: str) -> dict:
         dtype = cols[column_index["dtype"]]
         with_bias = cols[column_index["with_bias"]]
         act_type = cols[column_index["act_type"]]
-        quant_mode = (
-            cols[column_index["quant_mode"]] if "quant_mode" in column_index else "bf16"
-        )
         ms = float(cols[column_index["ms"]])
 
         key = f"fused_moe:{num_tokens}-{num_experts}-{topk}-{hidden_size}-{shard_intermediate_size}-{dtype}-{with_bias}-{act_type}"
-        if quant_mode != "bf16":
-            key += f"-{quant_mode}"
         result[key] = ms
 
     return result

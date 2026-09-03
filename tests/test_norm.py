@@ -73,7 +73,8 @@ def fused_add_rms_norm(x, residual, weight, eps):
         ],
         # gpt-oss: bf16 input + bf16 weight, H = 2880, prefill batch.
         (4096, 2880, torch.bfloat16),
-    ],
+        # fp32 correctness smoke test for rmsnorm
+        (19, 1024, torch.float32),
 )
 @pytest.mark.parametrize("specify_out", [True, False])
 def test_norm(batch_size, hidden_size, dtype, specify_out):

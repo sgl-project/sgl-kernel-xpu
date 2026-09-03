@@ -61,8 +61,6 @@ def verify_tree_greedy(
 
 
 class TreeMaskMode(IntEnum):
-    """Mirrors sglang.srt.speculative.eagle_utils.TreeMaskMode."""
-
     FULL_MASK = 0
     QLEN_ONLY = 1
     QLEN_ONLY_BITPACKING = 2
@@ -82,16 +80,6 @@ def build_tree_kernel_efficient(
     draft_token_num: int,
     tree_mask_mode: int = TreeMaskMode.FULL_MASK,
 ) -> None:
-    """Build the EAGLE draft-tree metadata in place.
-
-    ``tree_mask`` layout depends on ``tree_mask_mode``:
-      * ``FULL_MASK``  -- rows of ``seq_len + draft_token_num`` per request, packed
-        back to back; only the trailing ``draft_token_num`` tree columns are
-        written here, so the caller owns the ``[0, seq_len)`` prefix fill.
-      * ``QLEN_ONLY``  -- a dense ``draft_token_num x draft_token_num`` block per
-        request.
-    ``QLEN_ONLY_BITPACKING`` is not implemented on XPU.
-    """
     if tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
         raise NotImplementedError("QLEN_ONLY_BITPACKING is not implemented on XPU")
 

@@ -1,6 +1,5 @@
 import unittest
 
-import pytest
 import torch
 import utils
 from sgl_kernel.eagle_utils import build_tree_kernel_efficient, organize_draft_results

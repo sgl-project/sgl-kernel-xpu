@@ -24,7 +24,6 @@ from typing import Callable, List, Tuple
 
 import pytest
 import torch
-
 from sgl_kernel import TreeMaskMode
 from sgl_kernel.eagle_utils import sgl_build_tree_kernel_triton
 
@@ -36,7 +35,9 @@ def is_xpu() -> bool:
 
 
 def is_cuda() -> bool:
-    return getattr(torch.version, "cuda", None) is not None and torch.cuda.is_available()
+    return (
+        getattr(torch.version, "cuda", None) is not None and torch.cuda.is_available()
+    )
 
 
 def is_hip() -> bool:
@@ -49,6 +50,7 @@ def is_musa() -> bool:
 
 def is_cpu() -> bool:
     return not (is_cuda() or is_hip() or is_musa() or is_xpu())
+
 
 # The native tree-build op is registered per device family. Mirror the same
 # conditional import eagle_utils uses so this test picks up whatever shipped.
@@ -243,8 +245,7 @@ def generate_test_inputs(
     # tree_mask size matches the FULL_MASK layout used by the kernels.
     seq_lens_sum = sum(verified_seq_len)
     tree_mask_size = (
-        seq_lens_sum * draft_token_num
-        + batch_size * draft_token_num * draft_token_num
+        seq_lens_sum * draft_token_num + batch_size * draft_token_num * draft_token_num
     )
     tree_mask = torch.full((tree_mask_size,), True, device=device, dtype=torch.bool)
 
@@ -491,7 +492,9 @@ def print_comparison_table(results: List[dict]):
         (16, 4, 3),  # Very large batch
     ],
 )
-@pytest.mark.parametrize("tree_mask_mode", [TreeMaskMode.FULL_MASK, TreeMaskMode.QLEN_ONLY])
+@pytest.mark.parametrize(
+    "tree_mask_mode", [TreeMaskMode.FULL_MASK, TreeMaskMode.QLEN_ONLY]
+)
 def test_tree_kernel_performance(
     batch_size: int, topk: int, depth: int, tree_mask_mode: TreeMaskMode
 ):
@@ -582,9 +585,7 @@ def test_comprehensive_performance_suite():
         draft_token_num = sum(topk**i for i in range(depth))
         verified_seq_len = [10] * batch_size
 
-        inputs = generate_test_inputs(
-            batch_size, topk, depth, verified_seq_len, DEVICE
-        )
+        inputs = generate_test_inputs(batch_size, topk, depth, verified_seq_len, DEVICE)
 
         for name, runner in impls:
             try:

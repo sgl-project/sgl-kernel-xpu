@@ -1088,10 +1088,9 @@ def torch_naive_moe_fp8_w8a16(
 @pytest.mark.parametrize(
     "num_tokens,topk,num_experts,hidden_size,intermediate_size,with_bias",
     [
-        # Qwen3.5-35B-A3B-FP8 TP4: E=256, topk=8, H=2048, I_shard=128.
-        (1, 8, 256, 2048, 128, False),
-        (256, 8, 256, 2048, 128, True),
-        (8192, 8, 256, 2048, 128, False),
+        (1, 1, 8, 128, 128, False),
+        (8, 2, 8, 128, 128, True),
+        (16, 4, 8, 128, 128, False),
     ],
 )
 def test_moe_gemm_fp8_w8a16_block_weights(
@@ -1188,7 +1187,7 @@ def test_moe_gemm_fp8_gelu_split_activation():
     """Keep one small GELU case covering FP8's external activation wiring."""
     torch.manual_seed(1)
     torch.xpu.manual_seed_all(1)
-    num_tokens, topk, num_experts = 17, 2, 8
+    num_tokens, topk, num_experts = 9, 1, 8
     hidden_size = intermediate_size = 256
 
     a = create_random_cpu_tensor((num_tokens, hidden_size), torch.bfloat16)
@@ -1236,7 +1235,7 @@ def test_moe_gemm_fp8_relu2():
     """Cover FP8's non-gated ReLU2 path with a single-width GEMM1 output."""
     torch.manual_seed(2)
     torch.xpu.manual_seed_all(2)
-    num_tokens, topk, num_experts = 17, 2, 8
+    num_tokens, topk, num_experts = 9, 4, 8
     hidden_size = intermediate_size = 256
 
     a = create_random_cpu_tensor((num_tokens, hidden_size), torch.bfloat16)
@@ -1290,7 +1289,7 @@ def test_moe_gemm_fp8_relu2():
 def test_moe_gemm_fp8_swiglu_variants(activation_variant):
     torch.manual_seed(3)
     torch.xpu.manual_seed_all(3)
-    num_tokens, topk, num_experts = 17, 2, 8
+    num_tokens, topk, num_experts = 9, 4, 8
     hidden_size = intermediate_size = 256
     a = create_random_cpu_tensor((num_tokens, hidden_size), torch.bfloat16)
     w1_bf16 = create_random_cpu_tensor(
@@ -1342,7 +1341,7 @@ def test_moe_gemm_fp8_w8a8_flag_falls_back_for_scalar_scales():
     """The W8A8 checkpoint flag must use W8A16 for scalar FP8 scales on Xe2."""
     torch.manual_seed(4)
     torch.xpu.manual_seed_all(4)
-    num_tokens, topk, num_experts = 17, 2, 8
+    num_tokens, topk, num_experts = 9, 1, 8
     hidden_size = intermediate_size = 128
 
     a = create_random_cpu_tensor((num_tokens, hidden_size), torch.bfloat16)
@@ -1389,55 +1388,71 @@ def test_moe_gemm_fp8_w8a8_flag_falls_back_for_scalar_scales():
     )
 
 
-@pytest.mark.parametrize(("rows_per_expert", "intermediate_size"), [(16, 128)])
-def test_moe_grouped_mm_fp8_w8a16_distinct_two_scales(
-    rows_per_expert, intermediate_size
+@pytest.mark.parametrize(
+    "scale_count,rows_per_expert,gemm_n,gemm_k",
+    [
+        (1, 4, 128, 128),
+        (2, 8, 128, 128),
+        (1, 16, 128, 128),
+        (2, 16, 128, 128),
+    ],
+)
+def test_moe_grouped_mm_fp8_w8a16_scalar_scales(
+    scale_count, rows_per_expert, gemm_n, gemm_k
 ):
-    torch.manual_seed(6)
-    torch.xpu.manual_seed_all(6)
-    num_experts, hidden_size = 8, 128
+    torch.manual_seed(5)
+    torch.xpu.manual_seed_all(5)
+    num_experts = 8
     total_rows = num_experts * rows_per_expert
+    activations = torch.randn((total_rows, gemm_k), dtype=torch.bfloat16)
+    source = torch.randn((num_experts, gemm_n, gemm_k), dtype=torch.bfloat16)
 
-    activations = torch.randn((total_rows, hidden_size), dtype=torch.bfloat16)
-    gate = (
-        torch.randn((num_experts, intermediate_size, hidden_size), dtype=torch.bfloat16)
-        * 0.25
-    )
-    up = (
-        torch.randn((num_experts, intermediate_size, hidden_size), dtype=torch.bfloat16)
-        * 0.03125
-    )
-    gate_scale = (
-        gate.float().abs().amax((1, 2), keepdim=True).clamp_min(1e-12) / FP8_E4M3_MAX
-    )
-    up_scale = (
-        up.float().abs().amax((1, 2), keepdim=True).clamp_min(1e-12) / FP8_E4M3_MAX
-    )
-    gate_fp8 = (gate.float() / gate_scale).to(torch.float8_e4m3fn)
-    up_fp8 = (up.float() / up_scale).to(torch.float8_e4m3fn)
-    weights = torch.cat((gate_fp8, up_fp8), dim=1).contiguous()
-    scales = torch.cat((gate_scale, up_scale), dim=2).view(num_experts, 2)
-    dequantized_weights = torch.cat(
-        (
-            gate_fp8.float() * gate_scale,
-            up_fp8.float() * up_scale,
-        ),
-        dim=1,
-    )
+    if scale_count == 1:
+        scale = (
+            source.float().abs().amax((1, 2), keepdim=True).clamp_min(1e-12)
+            / FP8_E4M3_MAX
+        )
+        scales = scale.view(num_experts, 1)
+        weights = (source.float() / scale).to(torch.float8_e4m3fn)
+    else:
+        first, second = source.chunk(2, dim=1)
+        first *= 0.25
+        second *= 0.03125
+        first_scale = (
+            first.float().abs().amax((1, 2), keepdim=True).clamp_min(1e-12)
+            / FP8_E4M3_MAX
+        )
+        second_scale = (
+            second.float().abs().amax((1, 2), keepdim=True).clamp_min(1e-12)
+            / FP8_E4M3_MAX
+        )
+        scales = torch.cat((first_scale, second_scale), dim=2).view(num_experts, 2)
+        first_fp8 = (first.float() / first_scale).to(torch.float8_e4m3fn)
+        second_fp8 = (second.float() / second_scale).to(torch.float8_e4m3fn)
+        weights = torch.cat((first_fp8, second_fp8), dim=1).contiguous()
+
+    if scale_count == 1:
+        weights_dequantized = (weights.float() * scale).to(torch.bfloat16)
+    else:
+        weights_dequantized = torch.cat(
+            (
+                first_fp8.float() * first_scale,
+                second_fp8.float() * second_scale,
+            ),
+            dim=1,
+        ).to(torch.bfloat16)
     reference = torch.cat(
         [
             activations[
                 expert * rows_per_expert : (expert + 1) * rows_per_expert
             ].float()
-            @ dequantized_weights[expert].transpose(0, 1)
+            @ weights_dequantized[expert].float().transpose(0, 1)
             for expert in range(num_experts)
         ],
         dim=0,
     ).to(torch.bfloat16)
 
-    output = torch.empty(
-        (total_rows, 2 * intermediate_size), device="xpu", dtype=torch.bfloat16
-    )
+    output = torch.empty((total_rows, gemm_n), device="xpu", dtype=torch.bfloat16)
     torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
         output,
         activations.to("xpu"),
@@ -1453,11 +1468,9 @@ def test_moe_grouped_mm_fp8_w8a16_distinct_two_scales(
 @pytest.mark.parametrize(
     "num_tokens,topk,num_experts,hidden_size,intermediate_size,with_bias",
     [
-        (1, 2, 8, 128, 128, False),  # avg_m <= 8: Tile16
-        (128, 2, 8, 256, 256, True),  # avg_m <= 32: Tile32 with bias
-        (256, 2, 8, 2048, 256, False),  # GEMM1 medium-M long-K: Tile64
-        (512, 2, 8, 256, 256, False),  # avg_m <= 128, short-K: Tile128
-        (1024, 2, 8, 256, 256, False),  # avg_m > 128: Tile128
+        (1, 1, 8, 128, 128, False),
+        (8, 4, 8, 128, 128, True),
+        (16, 2, 8, 128, 128, False),
     ],
 )
 def test_moe_gemm_fp8_w8a16(

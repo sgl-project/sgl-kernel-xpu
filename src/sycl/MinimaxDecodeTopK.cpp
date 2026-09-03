@@ -4,6 +4,7 @@
 #include <limits>
 #include <sycl/sycl.hpp>
 
+#include "SYCLHelpers.h"
 #include "Utils.h"
 #include "comm/General.h"
 #include "sgl_kernel_export.h"
@@ -332,7 +333,7 @@ inline void topk_forward(
 }
 
 template <typename SeqLenT>
-class MinimaxDecodeTopKBlockKernel {
+class MinimaxDecodeTopKBlockKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
  public:
   MinimaxDecodeTopKBlockKernel(
       const float* score,
@@ -342,8 +343,7 @@ class MinimaxDecodeTopKBlockKernel {
       int32_t num_heads,
       int32_t max_seqblock,
       int32_t block_size,
-      int32_t topk,
-      ::sycl::local_accessor<TopKSmem, 1> smem)
+      int32_t topk)
       : score_(score),
         seq_lens_(seq_lens),
         topk_idx_(topk_idx),
@@ -351,8 +351,11 @@ class MinimaxDecodeTopKBlockKernel {
         num_heads_(num_heads),
         max_seqblock_(max_seqblock),
         block_size_(block_size),
-        topk_(topk),
-        smem_(smem) {}
+        topk_(topk) {}
+
+  void sycl_ker_config_convention(::sycl::handler& cgh) {
+    smem_ = ::sycl::local_accessor<TopKSmem, 1>(::sycl::range<1>(1), cgh);
+  }
 
   [[sycl::reqd_sub_group_size(kWarpSize)]] void operator()(::sycl::nd_item<1> item) const {
     const int group = static_cast<int>(item.get_group(0));
@@ -424,26 +427,23 @@ void minimax_decode_topk_launcher(
   if (batch == 0 || num_heads == 0) return;
 
   const size_t num_groups = static_cast<size_t>(batch) * num_heads;
-  queue.submit([&](::sycl::handler& cgh) {
-    ::sycl::local_accessor<TopKSmem, 1> smem(::sycl::range<1>(1), cgh);
-    cgh.parallel_for(
-        ::sycl::nd_range<1>(::sycl::range<1>(num_groups * kCTASize), ::sycl::range<1>(kCTASize)),
-        MinimaxDecodeTopKBlockKernel<SeqLenT>(
-            static_cast<const float*>(score),
-            static_cast<const SeqLenT*>(seq_lens),
-            static_cast<int32_t*>(topk_idx),
-            batch,
-            num_heads,
-            max_seqblock,
-            block_size,
-            topk,
-            smem));
-  });
-  // Do NOT .wait(): this runs on the current XPU stream and PyTorch owns synchronization.
+  sycl_kernel_submit(
+      static_cast<int64_t>(num_groups * kCTASize),
+      static_cast<int64_t>(kCTASize),
+      queue,
+      MinimaxDecodeTopKBlockKernel<SeqLenT>(
+          static_cast<const float*>(score),
+          static_cast<const SeqLenT*>(seq_lens),
+          static_cast<int32_t*>(topk_idx),
+          batch,
+          num_heads,
+          max_seqblock,
+          block_size,
+          topk));
 }
 
 template <typename SeqLenT>
-class MinimaxDecodeTopKPageTableKernel {
+class MinimaxDecodeTopKPageTableKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
  public:
   MinimaxDecodeTopKPageTableKernel(
       const float* score,
@@ -461,8 +461,7 @@ class MinimaxDecodeTopKPageTableKernel {
       int32_t r2t_stride,
       int32_t max_kv_len,
       int32_t max_reqs,
-      int32_t max_sparse_pages,
-      ::sycl::local_accessor<PageTableSmem, 1> smem)
+      int32_t max_sparse_pages)
       : score_(score),
         seq_lens_(seq_lens),
         req_to_token_(req_to_token),
@@ -478,8 +477,11 @@ class MinimaxDecodeTopKPageTableKernel {
         r2t_stride_(r2t_stride),
         max_kv_len_(max_kv_len),
         max_reqs_(max_reqs),
-        max_sparse_pages_(max_sparse_pages),
-        smem_(smem) {}
+        max_sparse_pages_(max_sparse_pages) {}
+
+  void sycl_ker_config_convention(::sycl::handler& cgh) {
+    smem_ = ::sycl::local_accessor<PageTableSmem, 1>(::sycl::range<1>(1), cgh);
+  }
 
   [[sycl::reqd_sub_group_size(kWarpSize)]] void operator()(::sycl::nd_item<1> item) const {
     const int group = static_cast<int>(item.get_group(0));
@@ -613,30 +615,27 @@ void minimax_decode_topk_page_table_launcher(
   if (batch == 0 || num_heads == 0 || max_reqs == 0) return;
 
   const size_t num_groups = static_cast<size_t>(batch) * num_heads;
-  queue.submit([&](::sycl::handler& cgh) {
-    ::sycl::local_accessor<PageTableSmem, 1> smem(::sycl::range<1>(1), cgh);
-    cgh.parallel_for(
-        ::sycl::nd_range<1>(::sycl::range<1>(num_groups * kCTASize), ::sycl::range<1>(kCTASize)),
-        MinimaxDecodeTopKPageTableKernel<SeqLenT>(
-            static_cast<const float*>(score),
-            static_cast<const SeqLenT*>(seq_lens),
-            static_cast<const int32_t*>(req_to_token),
-            static_cast<const int64_t*>(slot_ids),
-            static_cast<int32_t*>(page_table),
-            static_cast<int32_t*>(seq_lens_out),
-            batch,
-            num_heads,
-            max_seqblock,
-            block_size,
-            topk,
-            page_size,
-            r2t_stride,
-            max_kv_len,
-            max_reqs,
-            max_sparse_pages,
-            smem));
-  });
-  // Do NOT .wait(): this runs on the current XPU stream and PyTorch owns synchronization.
+  sycl_kernel_submit(
+      static_cast<int64_t>(num_groups * kCTASize),
+      static_cast<int64_t>(kCTASize),
+      queue,
+      MinimaxDecodeTopKPageTableKernel<SeqLenT>(
+          static_cast<const float*>(score),
+          static_cast<const SeqLenT*>(seq_lens),
+          static_cast<const int32_t*>(req_to_token),
+          static_cast<const int64_t*>(slot_ids),
+          static_cast<int32_t*>(page_table),
+          static_cast<int32_t*>(seq_lens_out),
+          batch,
+          num_heads,
+          max_seqblock,
+          block_size,
+          topk,
+          page_size,
+          r2t_stride,
+          max_kv_len,
+          max_reqs,
+          max_sparse_pages));
 }
 
 }  // namespace sycl_kernel

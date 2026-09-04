@@ -15,6 +15,7 @@ def parse_fused_moe_log(log_text: str) -> dict:
         raise ValueError("Benchmark finished! not found in fused_moe log")
 
     result = {}
+    column_index = None
 
     for line in lines[start_idx + 1 :]:
         line = line.strip()
@@ -24,19 +25,23 @@ def parse_fused_moe_log(log_text: str) -> dict:
         if re.match(r"\|\s*-+", line):
             continue
         if "num_tokens" in line:
+            header = [c.strip() for c in line.strip("|").split("|")]
+            column_index = {name: index for index, name in enumerate(header)}
             continue
 
         cols = [c.strip() for c in line.strip("|").split("|")]
+        if column_index is None:
+            continue
 
-        num_tokens = cols[1]
-        num_experts = cols[2]
-        topk = cols[3]
-        hidden_size = cols[4]
-        shard_intermediate_size = cols[5]
-        dtype = cols[6]
-        with_bias = cols[7]
-        act_type = cols[8]
-        ms = float(cols[-1])
+        num_tokens = cols[column_index["num_tokens"]]
+        num_experts = cols[column_index["num_experts"]]
+        topk = cols[column_index["topk"]]
+        hidden_size = cols[column_index["hidden_size"]]
+        shard_intermediate_size = cols[column_index["shard_intermediate_size"]]
+        dtype = cols[column_index["dtype"]]
+        with_bias = cols[column_index["with_bias"]]
+        act_type = cols[column_index["act_type"]]
+        ms = float(cols[column_index["ms"]])
 
         key = f"fused_moe:{num_tokens}-{num_experts}-{topk}-{hidden_size}-{shard_intermediate_size}-{dtype}-{with_bias}-{act_type}"
         result[key] = ms

@@ -35,6 +35,7 @@ from sgl_kernel import common_ops
 from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
     flash_mla_decode,
+    flash_mla_decode_get_workspace_size,
     flash_mla_get_workspace_size,
     flash_mla_prefill,
     flash_mla_prefill_get_workspace_size,
@@ -74,12 +75,20 @@ from sgl_kernel.flash_compress_128 import (
     flash_compress128_decode,
     flash_compress128_prefill,
 )
-from sgl_kernel.fp8_paged_mqa_logits import fp8_paged_mqa_logits_triton
+
+try:
+    from sgl_kernel.fp8_paged_mqa_logits import fp8_paged_mqa_logits_triton
+except ImportError:
+    # Triton (or its Intel backend) not importable in this environment.
+    # fp8_paged_mqa_logits_triton will simply be unavailable.
+    fp8_paged_mqa_logits_triton = None
 from sgl_kernel.fused_norm_rope_v2 import compress_norm_rope_store
-from sgl_kernel.fused_q_indexer_rope_hadamard_quant_torch import (
-    fused_q_indexer_rope_hadamard_quant,
-)
 from sgl_kernel.gdn_attn import gdn_attention
+
+hadamard_transform = torch.ops.sgl_kernel.hadamard_transform
+fused_q_indexer_rope_hadamard_quant = (
+    torch.ops.sgl_kernel.fused_q_indexer_rope_hadamard_quant
+)
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
@@ -99,7 +108,6 @@ from sgl_kernel.gemm import (
     sgl_per_token_quant_fp8,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
-from sgl_kernel.hadamard import hadamard_transform
 from sgl_kernel.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
@@ -199,8 +207,9 @@ from sgl_kernel.top_k import (
     fast_topk_transform_fused,
     fast_topk_transform_ragged_fused,
     fast_topk_v2,
-    topk_transform_512,
-    topk_transform_512_v2,
+    topk_transform,
+    topk_transform_paged,
+    topk_transform_ragged,
 )
 from sgl_kernel.utils import get_device_capability, is_xe2_arch
 from sgl_kernel.version import __version__

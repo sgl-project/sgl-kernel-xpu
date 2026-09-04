@@ -12,7 +12,10 @@ concurrency:
 jobs:
   build-and-test:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
-    permissions: write-all
+    # Least privilege: every write op below (git push, gh pr create/comment)
+    # authenticates with secrets.PAT, not the workflow GITHUB_TOKEN.
+    permissions:
+      contents: read
     runs-on: sglang-bmg
     steps:
       - name: Checkout code

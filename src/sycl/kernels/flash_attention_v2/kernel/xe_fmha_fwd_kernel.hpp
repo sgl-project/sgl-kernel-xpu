@@ -485,6 +485,12 @@ class XeFMHAFwdKernel {
       // With PackGQA the Q/O head dimension is indexed by the KV head; otherwise
       // by the (un-grouped) query head.
       int q_head_idx = PackGQA_ ? head : head_q;
+      int q_token_offset = 0;
+      if constexpr (is_var_len) {
+        q_token_offset = s.seq_len_qo.cumulative_length[idx_b];
+      } else {
+        q_token_offset = idx_b * int(s.seq_len_qo);
+      }
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
       typename CollectiveMainloop::ElementScoreStore* score_head_ptr = nullptr;
       int score_region_cols = 0;
@@ -539,6 +545,9 @@ class XeFMHAFwdKernel {
           seq_len,
           seq_len_kv_cache,
           idx_b,
+          q_head_idx,
+          PackGQA_ ? head * head_group_q : head_q,
+          q_token_offset,
           full_tile_offset,
           discard_seq_coord,
           K_cache(_, _, head, l_coord),
@@ -565,6 +574,9 @@ class XeFMHAFwdKernel {
           seq_len,
           seq_len_kv_cache,
           idx_b,
+          q_head_idx,
+          PackGQA_ ? head * head_group_q : head_q,
+          q_token_offset,
           full_tile_offset,
           discard_seq_coord,
           K_cache(_, _, head, l_coord),
@@ -1012,6 +1024,9 @@ class XeFMHAFwdDynamicSplitKernel {
             0,
             0,
             0,
+            0,
+            0,
+            0,
             0);
 
         // partition id of start batch head id in current wg
@@ -1456,6 +1471,11 @@ class XeFMHAFwdSplitKVKernel {
         scale_v = *p.scale_v_ptr;
       }
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
+      int bias_row_base = 0;
+      if constexpr (CollectiveMainloop::HasRelBias) {
+        int const q_token = is_var_len ? s.seq_len_qo.cumulative_length[idx_b] : idx_b * seq_len_qo;
+        bias_row_base = q_token * s.num_heads_q + head_q_start;
+      }
 
       mainloop(
           Q(_, _, head, l_coord),
@@ -1473,7 +1493,8 @@ class XeFMHAFwdSplitKVKernel {
           seq_len,
           full_tile_offset,
           discard_seq_coord,
-          scale_k);
+          scale_k,
+          bias_row_base);
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());

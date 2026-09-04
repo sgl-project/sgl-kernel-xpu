@@ -182,10 +182,6 @@ inline typename T::Fmla::Arguments args_from_options_prefill_2stage(
   const int s_kv = kv.size(0);
   const int topk = indices.size(2);
 
-  cutlass::KernelHardwareInfo hw_info;
-  hw_info.device_id = q.device().index();
-  hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
-
   auto to_int_stride = [](int64_t s) {
     TORCH_CHECK(s <= std::numeric_limits<int>::max(), "Stride exceeds int32 limit: ", s);
     return static_cast<int>(s);
@@ -297,24 +293,9 @@ inline typename T::Fmla::Arguments args_from_options_prefill_2stage(
   params.scheduler.h_q = h_q;
   params.scheduler.s_q = 1;
 
-  (void)hw_info;
   return args;
 }
 
-// ---------------------------------------------------------------------------
-// runMlaSparsePrefill2StageImpl: allocates the dense gathered-KV + valid-mask HBM
-// workspaces (chunked along the mapped batch = query rows), builds the launcher
-// arguments, and runs the chunked launch loop against
-// MlaSparsePrefill2StageXeType::Fmla. Analog of runMlaSparse2StageImpl (decode),
-// but chunking is over query rows.
-//
-// The Stage-2 config is resolved here from the compile-time template params:
-// MlaSparsePrefill2StageXeType == MlaSparsePrefill2StageXe<Element, D_QK, HAS_ATTN_SINK, B_H>.
-// Instantiating this function pulls in the heavy CUTLASS kernel for that single
-// (D_QK, B_H), so the generated per-(dtype, B_H) TU keeps its codegen confined
-// (build OOM guard). Element is the query element type used only for the
-// host-side arg adaptation (the kernel is bf16-internal).
-// ---------------------------------------------------------------------------
 template <typename Element, int D_QK, int B_H, bool HAS_ATTN_SINK>
 inline void runMlaSparsePrefill2StageImpl(
     at::Tensor& out,
@@ -347,7 +328,18 @@ inline void runMlaSparsePrefill2StageImpl(
   // workspace; without a cap it grows linearly with s_q*topk and can OOM at long
   // prefill (e.g. s_q=128, topk=512 -> ~64 MiB, fine; large s_q*topk gets split).
   constexpr int64_t PREFILL_GATHERED_K_MAX_BYTES = 256LL * 1024 * 1024;
-  const int64_t per_row_gathered_bytes = static_cast<int64_t>(topk) * d_qk * 2;  // bf16 = 2 bytes
+  // Per-row workspace footprint comes from the runner (which sums its stages'
+  // get_workspace_size) rather than being recomputed here: the gathered-KV tile +
+  // valid mask are Stage 1's outputs, so their layout is the gather kernel's
+  // business. Probe one mapped batch (b == 1, s_q == 1 -- each query row is one
+  // decode "batch") with the real topk to get the per-row bytes the cap above is
+  // divided by. Same shape as the decode side's probe.
+  typename MlaSparsePrefill2StageXeType::Fmla::Arguments probe_args{};
+  probe_args.gather.b = 1;
+  probe_args.gather.s_q = 1;
+  probe_args.gather.gathered_topk = topk;
+  const int64_t per_row_gathered_bytes =
+      static_cast<int64_t>(MlaSparsePrefill2StageXeType::Fmla::get_workspace_size(probe_args));
   int chunk_rows = per_row_gathered_bytes > 0
                        ? static_cast<int>(std::max<int64_t>(1, PREFILL_GATHERED_K_MAX_BYTES / per_row_gathered_bytes))
                        : s_q;
@@ -386,33 +378,39 @@ inline void runMlaSparsePrefill2StageImpl(
       "gathered_topk must equal topk + extra_topk");
 
   // Process the query rows in chunks of chunk_rows so the gather workspace stays
-  // bounded. Per chunk we re-base the row-indexed input/output pointers (slicing
-  // preserves strides) and reuse the same gathered_k/gathered_valid_mask workspace.
+  // bounded. Per chunk we re-base the row-indexed input/output pointers and reuse the
+  // same gathered_k/gathered_valid_mask workspace.
   //
   // Both stages run through one Fmla::run call: the runner holds one Params per stage
   // and issues gather-then-dense on the in-order XPU queue (Stage 1 fills gathered_k /
   // gathered_valid_mask, Stage 2 consumes them), the same way device::MLA runs the
   // dense path's split-KV attention + reduction pair. to_underlying_arguments fans the
-  // dense arguments out per collective; the workspace is empty.
+  // dense arguments out per collective; the opaque workspace blob stays null because
+  // Stage 1's workspace (the gathered-KV tile + valid mask, sized above via
+  // Fmla::get_workspace_size) is passed through the params pointers instead.
   //
   // Per row-chunk we re-base the row-indexed slices: the mapped batch count feeds
   // kernel.shape.b + gather_args.b; q feeds kernel + mainloop; out -> kernel; lse /
   // max_logits -> epilogue; indices -> gather; topk_length -> mainloop + gather.
+  auto row_base = [](const at::Tensor& t, int r0) -> void* {
+    return static_cast<char*>(t.data_ptr()) + static_cast<int64_t>(r0) * t.stride(0) * t.element_size();
+  };
+
   typename MlaSparsePrefill2StageXeType::Fmla fmla;
   for (int r0 = 0; r0 < s_q; r0 += chunk_rows) {
     const int cr = std::min(chunk_rows, s_q - r0);
     params.kernel.shape.b = cr;
     gather_args.b = cr;
 
-    void* q_ptr = q.slice(0, r0, r0 + cr).data_ptr();
+    void* q_ptr = row_base(q, r0);
     params.kernel.q = q_ptr;
     params.mainloop.q = q_ptr;
-    params.kernel.out = reinterpret_cast<cutlass::bfloat16_t*>(out.slice(0, r0, r0 + cr).data_ptr());
-    params.epilogue.lse = reinterpret_cast<float*>(lse.slice(0, r0, r0 + cr).data_ptr());
-    params.epilogue.max_logits = reinterpret_cast<float*>(max_logits.slice(0, r0, r0 + cr).data_ptr());
-    gather_args.indices = reinterpret_cast<int*>(indices.slice(0, r0, r0 + cr).data_ptr());
+    params.kernel.out = reinterpret_cast<cutlass::bfloat16_t*>(row_base(out, r0));
+    params.epilogue.lse = reinterpret_cast<float*>(row_base(lse, r0));
+    params.epilogue.max_logits = reinterpret_cast<float*>(row_base(max_logits, r0));
+    gather_args.indices = reinterpret_cast<int*>(row_base(indices, r0));
     if (topk_length.has_value()) {
-      int* tl = reinterpret_cast<int*>(topk_length.value().slice(0, r0, r0 + cr).data_ptr());
+      int* tl = reinterpret_cast<int*>(row_base(topk_length.value(), r0));
       params.mainloop.topk_length = tl;
       gather_args.topk_length = tl;
     }
@@ -422,16 +420,6 @@ inline void runMlaSparsePrefill2StageImpl(
   }
 }
 
-// ---------------------------------------------------------------------------
-// runMlaSparsePrefill2Stage: op-facing entry point. Validates inputs and forwards the
-// dispatched head dim (D_QK), head-block size (B_H), and attn_sink flag
-// (HAS_ATTN_SINK) to the Impl, which resolves the Stage-2 Config from them. The op
-// (mla_sparse_prefill.cpp) picks Element (dtype), D_QK {512,576}, B_H, and the
-// attn_sink flag, mirroring decode's dtype-then-D_QK-then-B_H-then-sink dispatch, and
-// each generated launcher launch_mla_sparse_prefill_2stage_<ELEM>_<D_QK>_<B_H>_<SINK>
-// instantiates a single (D_QK, B_H, HAS_ATTN_SINK) in its own TU (build OOM guard
-// preserved). Only bf16 query/kv is supported; d_v is 512.
-// ---------------------------------------------------------------------------
 template <typename Element, int D_QK, int B_H, bool HAS_ATTN_SINK>
 inline void runMlaSparsePrefill2Stage(
     at::Tensor& out,                               // [s_q, h_q, d_v]

@@ -370,7 +370,13 @@ def cutlass_fp4_group_mm(
 
 
 _MOE_WS_HEADROOM = 1.1
+_MOE_SMALL_PREPARE_MAX_ROUTES = 64
+_MOE_SMALL_PREPARE_MAX_TOPK = 16
+_MOE_SMALL_PREPARE_MAX_ELEMENTS = 163840
 _moe_ws_cache: Dict[Tuple[str, torch.device], torch.Tensor] = {}
+_moe_ws_view_cache: Dict[
+    Tuple[str, torch.device], Tuple[torch.Tensor, tuple, torch.Tensor]
+] = {}
 
 
 def _get_moe_ws(
@@ -397,7 +403,62 @@ def _get_moe_ws(
         new_numel = max(numel, int(numel * _MOE_WS_HEADROOM))
         cur = torch.empty(new_numel, dtype=dtype, device=device)
         _moe_ws_cache[key] = cur
-    return cur.narrow(0, 0, numel).view(shape)
+    cached_view = _moe_ws_view_cache.get(key)
+    shape = tuple(shape)
+    if cached_view is None or cached_view[0] is not cur or cached_view[1] != shape:
+        view = cur.narrow(0, 0, numel).view(shape)
+        _moe_ws_view_cache[key] = (cur, shape, view)
+        return view
+    return cached_view[2]
+
+
+def _should_use_small_moe_prepare(
+    num_tokens: int, topk: int, hidden_dims: int, num_experts: int
+) -> bool:
+    routed_rows = num_tokens * topk
+    return (
+        1 <= topk <= _MOE_SMALL_PREPARE_MAX_TOPK
+        and routed_rows <= _MOE_SMALL_PREPARE_MAX_ROUTES
+        and routed_rows * hidden_dims <= _MOE_SMALL_PREPARE_MAX_ELEMENTS
+    )
+
+
+def _validate_fp8_weight_scale(
+    scale: torch.Tensor,
+    weights: torch.Tensor,
+    name: str,
+    allow_scalar: bool,
+) -> None:
+    """Validate an FP8 expert scale tensor against its physical weight shape."""
+    assert scale.dtype == torch.float32, f"{name} must be float32"
+    assert scale.ndim in (
+        (2, 3) if allow_scalar else (3,)
+    ), f"{name} must be 3D block scales or 2D scalar scales"
+    assert scale.shape[0] == weights.shape[0], (
+        f"{name} expert dimension {scale.shape[0]} must match weights "
+        f"expert dimension {weights.shape[0]}"
+    )
+    if scale.ndim == 2:
+        assert allow_scalar, f"{name} scalar scales are not supported for this FP8 path"
+        expected_columns = 2 if name == "w1_scale" else 1
+        assert scale.shape[1] in (1, expected_columns), (
+            f"{name} scalar scale shape must be [E, 1] or "
+            f"[E, {expected_columns}], got {tuple(scale.shape)}"
+        )
+        return
+
+    expected_shape = (
+        weights.shape[0],
+        (weights.shape[1] + 127) // 128,
+        (weights.shape[2] + 127) // 128,
+    )
+    assert tuple(scale.shape) == expected_shape, (
+        f"{name} block scales must have shape [E, ceil(N/128), ceil(K/128)] "
+        f"={expected_shape}, got {tuple(scale.shape)}"
+    )
+    assert (
+        weights.shape[2] % 128 == 0
+    ), f"{name} block scales require K divisible by 128, got K={weights.shape[2]}"
 
 
 def fused_experts(
@@ -442,8 +503,10 @@ def fused_experts(
     - b2 (Optional[torch.Tensor]): Optional bias for w2.
     - inplace (bool): If True, perform operations in-place to save memory. Defaults to False.
     - activation (str): The activation function to use ('silu' or 'gelu'). Defaults to 'silu'.
-    - use_fp8_w8a8 (bool): If True, use fp8 arithmetic to compute the inner
-        products for w1 and w2. Defaults to False.
+    - use_fp8_w8a8 (bool): If True, use FP8 E4M3 expert weights from a W8A8
+        checkpoint. Xe2 currently has no native FP8-A MoE kernel, so this
+        path falls back to BF16 activations and the W8A16 operator. Defaults
+        to False.
     - use_mxfp4_w4a16 (bool): If True, w1 and w2 are in MXFP4 packed format
         (int8 or uint8, two E2M1 nibbles per byte) with corresponding E8M0 block
         scales supplied via w1_scale and w2_scale. Scales may be represented
@@ -483,12 +546,14 @@ def fused_experts(
         support, applied to the intermediate activation before GEMM2 to
         match the K-dim sort applied to w2 at weight-load time. Only valid
         with use_int4_w4a16=True.
-    - a1_scale (Optional[torch.Tensor]): Optional scale to be used for
-        a1.
-    - a2_scale (Optional[torch.Tensor]): Optional scale to be used for
-        a2.
-    - block_shape: (Optional[List[int]]): Optional block size for block-wise
-        quantization.
+    - a1_scale (Optional[torch.Tensor]): Reserved for a future prequantized
+        FP8 activation input. It is currently rejected because the Xe2
+        fallback consumes BF16 activations.
+    - a2_scale (Optional[torch.Tensor]): Reserved for a future prequantized
+        FP8 activation input. It is currently rejected because the Xe2
+        fallback consumes BF16 activations.
+    - block_shape: (Optional[List[int]]): Weight block size metadata. FP8
+        block scales must use [128, 128]; the value is validated when supplied.
     - no_combine (bool): If True, skip the combine step. Defaults to False.
     - routed_scaling_factor (Optional[float]): Optional scaling factor for routed tokens, used by Llama4 only.
     - gemm1_alpha (Optional[float]): Optional gemm1_alpha for the activation
@@ -502,15 +567,52 @@ def fused_experts(
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
 
-    assert use_fp8_w8a8 is False, "current MoE does not support use_fp8_w8a8"
-    assert a1_scale is None, "current MoE does not support a1_scale"
-    assert a2_scale is None, "current MoE does not support a2_scale"
-    assert block_shape is None, "current MoE does not support block_shape"
-    assert activation in (
-        "silu",
-        "gelu",
-        "relu2",
-    ), f"Only silu, gelu and relu2 are supported but got {activation}"
+    assert is_xe2_arch(), "Current MoE is only supported on BMG"
+
+    use_fp8_weight = use_fp8_w8a8
+    assert a1_scale is None, (
+        "prequantized FP8 activation input is not supported: " "a1_scale must be None"
+    )
+    assert a2_scale is None, (
+        "prequantized FP8 activation input is not supported: " "a2_scale must be None"
+    )
+    if block_shape is not None:
+        assert use_fp8_weight, "block_shape is only supported for FP8 MoE paths"
+        assert list(block_shape) == [
+            128,
+            128,
+        ], "FP8 MoE currently supports only block_shape=[128, 128]"
+    if use_fp8_weight:
+        assert activation in ("silu", "gelu", "relu2"), (
+            "FP8 MoE supports silu, gelu, relu2, GPT-OSS SwiGLU, and "
+            "DeepSeek-V4 clamped SwiGLU only"
+        )
+        assert (
+            w1_g_idx_perm is None and w2_g_idx_perm is None
+        ), "w1_g_idx_perm/w2_g_idx_perm are only supported by the INT4 W4A16 path"
+        if activation == "gelu" or activation == "relu2":
+            assert (
+                gemm1_alpha is None and gemm1_limit is None and swiglu_limit is None
+            ), f"{activation} cannot be combined with a SwiGLU alpha or clamp"
+        elif gemm1_alpha is not None:
+            assert gemm1_limit is not None and swiglu_limit is None, (
+                "GPT-OSS SwiGLU requires gemm1_alpha and gemm1_limit, "
+                "and cannot use swiglu_limit"
+            )
+        elif swiglu_limit is not None:
+            assert (
+                swiglu_limit == 10 and gemm1_limit is None and gemm1_alpha is None
+            ), "FP8 DeepSeek-V4 SwiGLU currently requires swiglu_limit=10"
+        else:
+            assert (
+                gemm1_limit is None
+            ), "gemm1_limit requires gemm1_alpha for GPT-OSS SwiGLU"
+    else:
+        assert activation in (
+            "silu",
+            "gelu",
+            "relu2",
+        ), f"Only silu, gelu and relu2 are supported but got {activation}"
 
     # Unified 4-bit W4A16 MoE (mxfp4 or int4). Weights are packed int8/uint8
     # [E, N, K/2]; scales are [E, N, K/group_size] N-outer. For mxfp4 the
@@ -525,6 +627,9 @@ def fused_experts(
     assert not (
         use_mxfp4_w4a16 and use_int4_w4a16
     ), "use_mxfp4_w4a16 and use_int4_w4a16 are mutually exclusive"
+    assert not (
+        use_4bit_w4a16 and use_fp8_weight
+    ), "4-bit W4A16 and FP8 paths are mutually exclusive"
     if use_4bit_w4a16:
         assert (
             w1.dtype == torch.int8 or w1.dtype == torch.uint8
@@ -557,8 +662,9 @@ def fused_experts(
                     w2_zp.dtype == w2_scale.dtype and w2_zp.shape == w2_scale.shape
                 ), "w2_zp must have the same dtype and shape as w2_scale"
     else:
-        assert w1_scale is None, "w1_scale is only supported for 4-bit W4A16 MoE"
-        assert w2_scale is None, "w2_scale is only supported for 4-bit W4A16 MoE"
+        if not use_fp8_weight:
+            assert w1_scale is None, "w1_scale is only supported for 4-bit W4A16 MoE"
+            assert w2_scale is None, "w2_scale is only supported for 4-bit W4A16 MoE"
         assert (
             w1_zp is None and w2_zp is None
         ), "w1_zp/w2_zp are only supported for 4-bit W4A16 MoE"
@@ -571,6 +677,25 @@ def fused_experts(
         assert (
             use_int4_w4a16
         ), "w1_g_idx_perm/w2_g_idx_perm only apply to use_int4_w4a16"
+    elif use_fp8_weight:
+        assert (
+            w1.dtype == torch.float8_e4m3fn
+        ), "FP8 weight-only MoE requires w1 to be float8_e4m3fn"
+        assert (
+            w2.dtype == torch.float8_e4m3fn
+        ), "FP8 weight-only MoE requires w2 to be float8_e4m3fn"
+        assert (
+            w1_scale is not None and w2_scale is not None
+        ), "w1_scale/w2_scale must be provided for FP8 weight-only MoE"
+        assert (
+            w1.is_contiguous() and w2.is_contiguous()
+        ), "FP8 weight-only MoE requires contiguous expert weights"
+        _validate_fp8_weight_scale(w1_scale, w1, "w1_scale", allow_scalar=True)
+        _validate_fp8_weight_scale(w2_scale, w2, "w2_scale", allow_scalar=True)
+        assert (
+            w1_scale.ndim == w2_scale.ndim
+        ), "w1_scale and w2_scale must use the same scalar or block layout"
+        assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
     if b1 is not None:
         assert (
             b1.dtype == torch.bfloat16 or b1.dtype == torch.float32
@@ -635,42 +760,57 @@ def fused_experts(
     else:
         out_hidden_states = torch.empty_like(hidden_states)
 
-    topk_ids = topk_ids.int() if topk_ids.dtype == torch.long else topk_ids
     expert_offsets = _get_moe_ws(
         "expert_offsets", (E,), torch.int32, hidden_states.device
     )
-    problem_sizes1 = _get_moe_ws(
-        "problem_sizes1", (E, 3), torch.int32, hidden_states.device
+    use_small_prepare = (
+        _should_use_small_moe_prepare(M, TopK, hidden_dims, E) and use_fp8_weight
     )
-    problem_sizes2 = _get_moe_ws(
-        "problem_sizes2", (E, 3), torch.int32, hidden_states.device
-    )
-    a_map = _get_moe_ws("a_map", (topk_ids.numel(),), torch.int32, hidden_states.device)
     c_map = _get_moe_ws("c_map", (topk_ids.numel(),), torch.int32, hidden_states.device)
-    torch.ops.sgl_kernel.prepare_moe_input.default(
-        topk_ids,
-        expert_offsets,
-        None,
-        problem_sizes1,
-        problem_sizes2,
-        a_map,
-        c_map,
-        E,
-        hidden_dims,
-        TopK,
-    )
     input_A_shuffle = _get_moe_ws(
         "input_A_shuffle",
         (num_tokens * TopK, K),
         hidden_states.dtype,
         hidden_states.device,
     )
-    # Use scatter_tokens_to_experts (IPEX MoEScatter style):
-    # 1 WG per source token, reads sequentially, scatters to TopK destinations,
-    # with coalesced reads and data reuse.
-    torch.ops.sgl_kernel.scatter_tokens_to_experts.default(
-        hidden_states, c_map, input_A_shuffle
-    )
+    if use_small_prepare:
+        # TODO: Support strided topk_ids in the prepare kernels and remove this copy.
+        topk_ids_small = topk_ids if topk_ids.is_contiguous() else topk_ids.contiguous()
+        torch.ops.sgl_kernel.prepare_moe_input_small.default(
+            hidden_states, topk_ids_small, expert_offsets, c_map, input_A_shuffle
+        )
+    else:
+        if topk_ids.dtype == torch.long:
+            topk_ids_int = _get_moe_ws(
+                "topk_ids_int", topk_ids.shape, torch.int32, hidden_states.device
+            )
+            topk_ids_int.copy_(topk_ids)
+        else:
+            topk_ids_int = topk_ids
+        problem_sizes1 = _get_moe_ws(
+            "problem_sizes1", (E, 3), torch.int32, hidden_states.device
+        )
+        problem_sizes2 = _get_moe_ws(
+            "problem_sizes2", (E, 3), torch.int32, hidden_states.device
+        )
+        a_map = _get_moe_ws(
+            "a_map", (topk_ids.numel(),), torch.int32, hidden_states.device
+        )
+        torch.ops.sgl_kernel.prepare_moe_input.default(
+            topk_ids_int,
+            expert_offsets,
+            None,
+            problem_sizes1,
+            problem_sizes2,
+            a_map,
+            c_map,
+            E,
+            hidden_dims,
+            TopK,
+        )
+        torch.ops.sgl_kernel.scatter_tokens_to_experts.default(
+            hidden_states, c_map, input_A_shuffle
+        )
     if w1_g_idx_perm is not None:
         # GPTQ desc_act/g_idx: reorder each expert's activation slice to
         # match the K-dim sort applied to w1 at weight-load time.
@@ -684,6 +824,94 @@ def fused_experts(
         hidden_states.dtype,
         hidden_states.device,
     )
+
+    if use_fp8_weight:
+        if activation == "gelu":
+            activation_type = 1
+        elif activation == "relu2":
+            activation_type = 3
+        elif activation != "silu":
+            raise ValueError(
+                f"FP8 W8A16 Xe2 path does not support activation={activation!r}; "
+                "supported activations are 'silu', 'gelu', and 'relu2'"
+            )
+        elif gemm1_alpha is not None:
+            if gemm1_limit is None:
+                raise AssertionError(
+                    "gemm1_limit must be provided when gemm1_alpha is set for swiglu for GPT-OSS"
+                )
+            activation_type = 2
+        elif swiglu_limit is not None:
+            activation_type = 4
+            gemm1_limit = float(swiglu_limit)
+        else:
+            activation_type = 0
+
+        gemm1_output_width = N if activation_type == 3 else 2 * N
+        intermediate_cache1 = _get_moe_ws(
+            "intermediate_cache1",
+            (M * TopK, gemm1_output_width),
+            hidden_states.dtype,
+            hidden_states.device,
+        )
+        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
+            intermediate_cache1,
+            input_A_shuffle,
+            w1,
+            w1_scale,
+            b1,
+            expert_offsets,
+            E,
+        )
+
+        if activation_type == 2:
+            intermediate_cache2 = torch.ops.sgl_kernel.swiglu_gpt_oss_sigmoid_alpha(
+                intermediate_cache1, gemm1_alpha, gemm1_limit
+            )
+        else:
+            intermediate_cache2 = _get_moe_ws(
+                "intermediate_cache2",
+                (M * TopK, N),
+                hidden_states.dtype,
+                hidden_states.device,
+            )
+            if activation_type == 0:
+                torch.ops.sgl_kernel.silu_and_mul(
+                    intermediate_cache2, intermediate_cache1
+                )
+            elif activation_type == 4:
+                torch.ops.sgl_kernel.silu_and_mul_clamp(
+                    intermediate_cache2, intermediate_cache1, swiglu_limit
+                )
+            elif activation_type == 1:
+                torch.ops.sgl_kernel.gelu_tanh_and_mul(
+                    intermediate_cache2, intermediate_cache1
+                )
+            elif activation_type == 3:
+                torch.clamp_min(intermediate_cache1, 0, out=intermediate_cache2)
+                torch.square(intermediate_cache2, out=intermediate_cache2)
+            else:
+                raise AssertionError(
+                    f"unsupported FP8 activation type: {activation_type}"
+                )
+
+        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
+            intermediate_cache3,
+            intermediate_cache2,
+            w2,
+            w2_scale,
+            b2,
+            expert_offsets,
+            E,
+        )
+
+        rsf = 1.0
+        if routed_scaling_factor is not None:
+            rsf = routed_scaling_factor
+        torch.ops.sgl_kernel.apply_shuffle_mul_sum.default(
+            intermediate_cache3, out_hidden_states, c_map, rsf, topk_weights
+        )
+        return out_hidden_states
 
     # 0=silu, 1=gelu, 2=swiglu (silu with alpha/limit clamping for gpt-oss),
     # 3=relu2, 4=swiglu_deepseek_v4 (clamp gate/up then plain silu * up).
@@ -714,8 +942,6 @@ def fused_experts(
     else:
         raise ValueError(f"Unsupported activation {activation}")
 
-    assert is_xe2_arch(), f"Current MoE is only supported on BMG"
-
     # Gated activations (silu/gelu/swiglu) split w1's output into gate+up, so
     # w1.shape[1] == 2*N; non-gated relu2 has w1.shape[1] == N. Compare against
     # the recovered (unpacked) N — w2.shape[2] is the packed I/2 under MXFP4,
@@ -737,12 +963,6 @@ def fused_experts(
         intermediate_cache1 = _get_moe_ws(
             "intermediate_cache1_unfused",
             (M * TopK, gate_factor * N),
-            hidden_states.dtype,
-            hidden_states.device,
-        )
-        intermediate_cache2 = _get_moe_ws(
-            "intermediate_cache2",
-            (M * TopK, N),
             hidden_states.dtype,
             hidden_states.device,
         )
@@ -773,22 +993,32 @@ def fused_experts(
                 gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
                 gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
             )
-        if activation_type == 0:
-            torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
-        elif activation_type == 4:
-            torch.ops.sgl_kernel.silu_and_mul_clamp(
-                intermediate_cache2, intermediate_cache1, swiglu_limit
-            )
-        elif activation_type == 1:
-            torch.ops.sgl_kernel.gelu_tanh_and_mul(
-                intermediate_cache2, intermediate_cache1
-            )
-        elif activation_type == 2:
+        if activation_type == 2:
             intermediate_cache2 = torch.ops.sgl_kernel.swiglu_gpt_oss_sigmoid_alpha(
                 intermediate_cache1, gemm1_alpha, gemm1_limit
             )
-        elif activation_type == 3:
-            intermediate_cache2 = torch.square(torch.relu(intermediate_cache1))
+        else:
+            intermediate_cache2 = _get_moe_ws(
+                "intermediate_cache2",
+                (M * TopK, N),
+                hidden_states.dtype,
+                hidden_states.device,
+            )
+            if activation_type == 0:
+                torch.ops.sgl_kernel.silu_and_mul(
+                    intermediate_cache2, intermediate_cache1
+                )
+            elif activation_type == 4:
+                torch.ops.sgl_kernel.silu_and_mul_clamp(
+                    intermediate_cache2, intermediate_cache1, swiglu_limit
+                )
+            elif activation_type == 1:
+                torch.ops.sgl_kernel.gelu_tanh_and_mul(
+                    intermediate_cache2, intermediate_cache1
+                )
+            elif activation_type == 3:
+                torch.clamp_min(intermediate_cache1, 0, out=intermediate_cache2)
+                torch.square(intermediate_cache2, out=intermediate_cache2)
         if w2_g_idx_perm is not None:
             # GPTQ desc_act/g_idx: reorder each expert's activation slice to
             # match the K-dim sort applied to w2 at weight-load time.

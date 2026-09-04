@@ -122,6 +122,7 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
+at::Tensor hadamard_transform(const at::Tensor& input, double scale);
 void fused_q_norm_rope(
     torch::Tensor& q_input, torch::Tensor& q_output, torch::Tensor& freqs_cis, torch::Tensor& positions, double eps);
 void fused_k_norm_rope_flashmla(
@@ -588,6 +589,14 @@ void scaled_fp4_quant(
     torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_scale, torch::Tensor const& input_scale);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
+void fused_q_indexer_rope_hadamard_quant(
+    const at::Tensor& q_input,
+    at::Tensor& q_fp8,
+    const at::Tensor& weight,
+    at::Tensor& weights_out,
+    double weight_scale,
+    const at::Tensor& rope_cache,
+    const at::Tensor& positions);
 void bmm_fp8(
     at::Tensor A,
     at::Tensor B,
@@ -712,6 +721,18 @@ void moe_grouped_mm_nt_xe20_w4a16(
     bool is_int4,
     const int64_t group_size);
 
+// FP8 weight-only MoE grouped GEMM. Activations are BF16, weights are FP8
+// E4M3, and weight_scales is [E, 1]/[E, 2] for per-expert scalar scales or
+// [E, ceil(N/128), K/128] for 128x128 block scales.
+void moe_grouped_mm_nt_xe20_fp8_w8a16(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& weights,
+    const torch::Tensor& weight_scales,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts);
+
 void prepare_moe_input(
     const torch::Tensor& topk_ids,
     torch::Tensor& expert_offsets,
@@ -723,6 +744,13 @@ void prepare_moe_input(
     const int64_t num_experts,
     const int64_t n,
     const int64_t k);
+
+void prepare_moe_input_small(
+    const torch::Tensor& input,
+    const torch::Tensor& topk_ids,
+    torch::Tensor& expert_counts,
+    torch::Tensor& output_permutation,
+    torch::Tensor& output);
 
 void ep_moe_pre_reorder(
     torch::Tensor input,
@@ -945,25 +973,25 @@ void top_p_sampling_from_probs(
     bool deterministic,
     std::optional<at::Generator> gen);
 
-void fast_topk_interface(
-    const at::Tensor& score, at::Tensor& indices, const at::Tensor& lengths, std::optional<at::Tensor> row_starts_opt);
+at::Tensor
+fast_topk(const at::Tensor& score, const at::Tensor& lengths, int64_t topk, std::optional<at::Tensor> row_starts_opt);
 
-void fast_topk_transform_interface(
+at::Tensor fast_topk_transform_fused(
     const at::Tensor& score,
     const at::Tensor& lengths,
-    at::Tensor& dst_page_table,
     const at::Tensor& src_page_table,
     const at::Tensor& cu_seqlens_q,
+    int64_t topk,
     std::optional<at::Tensor> row_starts_opt);
 
-void fast_topk_transform_ragged_interface(
+at::Tensor fast_topk_transform_ragged_fused(
     const at::Tensor& score,
     const at::Tensor& lengths,
-    at::Tensor& topk_indices_ragged,
     const at::Tensor& topk_indices_offset,
+    int64_t topk,
     std::optional<at::Tensor> row_starts_opt);
 
-void topk_transform_512_interface(
+void topk_transform(
     const at::Tensor& scores,
     const at::Tensor& seq_lens,
     const at::Tensor& page_tables,
@@ -971,14 +999,20 @@ void topk_transform_512_interface(
     int64_t page_size,
     std::optional<at::Tensor> out_raw_indices_opt);
 
-void topk_transform_512_v2_interface(
+void topk_transform_paged(
     const at::Tensor& scores,
     const at::Tensor& seq_lens,
-    const at::Tensor& page_tables,
+    std::optional<at::Tensor> page_tables_opt,
     at::Tensor& out_page_indices,
     int64_t page_size,
-    const at::Tensor& metadata,
-    std::optional<at::Tensor> out_raw_indices_opt);
+    const at::Tensor& metadata);
+
+void topk_transform_ragged(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    at::Tensor& out_indices,
+    const at::Tensor& out_offsets,
+    std::optional<at::Tensor> row_starts_opt);
 
 /*
  * Compress plan and execution kernels

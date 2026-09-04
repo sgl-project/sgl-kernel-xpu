@@ -81,6 +81,9 @@ class XeMlaSparse2StageDenseKernel {
 
   static constexpr bool IS_FP8_QUERY = CollectiveMainloop::IS_FP8_QUERY;
   static constexpr bool HAS_ATTN_SINK = CollectiveEpilogue::HAS_ATTN_SINK;
+  static constexpr bool HAS_MAX_LOGITS = CollectiveEpilogue::HAS_MAX_LOGITS;
+  static constexpr bool is_split_kv = CollectiveEpilogue::IS_SPLIT_KV;
+  static constexpr int kvMaxSplits = 16;
 
   // Per-layer Params/Arguments slices from the collectives + scheduler.
   using MainloopArguments = typename CollectiveMainloop::Arguments;
@@ -127,11 +130,34 @@ class XeMlaSparse2StageDenseKernel {
   }
 
   static bool can_implement(Arguments const& args) {
+    if constexpr (is_split_kv) {
+      if (args.scheduler.num_kv_splits < 1 || args.scheduler.num_kv_splits > kvMaxSplits) return false;
+      // The split epilogue publishes only partials, so without this scratch the result
+      // would silently be garbage: require it rather than fall back.
+      if (args.kernel.o_accum == nullptr) return false;
+      if (args.epilogue.split_exp_sums == nullptr || args.epilogue.split_max_logits == nullptr) return false;
+    } else {
+      // A non-split epilogue writes the final row from one work-group, so a split factor
+      // > 1 would have every split overwrite the others with a partial result.
+      if (args.scheduler.num_kv_splits > 1) return false;
+    }
     return CollectiveMainloop::can_implement(args.mainloop) && CollectiveEpilogue::can_implement(args.epilogue);
   }
 
-  static int get_workspace_size(Arguments const& /* args */) {
-    return 0;
+  // Split-K HBM scratch (o_accum + the two per-split stat arrays). Reported here so the
+  // host's workspace accounting -- which is what bounds the batch-chunk size -- covers
+  // Stage 2 as well as Stage 1's gathered-KV tile; as on the gather side, the buffers are
+  // allocated by the host orchestrator and reach the kernel through the params pointers
+  // rather than through the opaque workspace blob. Zero without split-K.
+  static size_t get_workspace_size(Arguments const& args) {
+    if constexpr (is_split_kv) {
+      auto const& s = args.kernel.shape;
+      SparseSplitKV2StageWorkspaceLayout layout(
+          s.b, s.s_q, s.h_q, args.scheduler.num_kv_splits, Traits::D_V, sizeof(ElementO));
+      return layout.total_bytes;
+    } else {
+      return 0;
+    }
   }
 
   static cutlass::Status initialize_workspace(Arguments const& /* args */, void* /* workspace */ = nullptr) {
@@ -140,7 +166,8 @@ class XeMlaSparse2StageDenseKernel {
 
   static dim3 get_grid_shape(Params const& params) {
     auto const& s = params.kernel.shape;
-    return dim3(ceil_div(s.h_q, Traits::B_H) * s.s_q * s.b, Traits::V_SPLIT, 1);
+    return dim3(
+        ceil_div(s.h_q, Traits::B_H) * s.s_q * s.b * Traits::V_SPLIT, 1, cute::max(1, params.scheduler.num_kv_splits));
   }
 
   static dim3 get_block_shape() {
@@ -163,6 +190,9 @@ class XeMlaSparse2StageDenseKernel {
     const int sg_id = thr_id / Traits::SUBGROUP_SIZE;
     const int tid_in_sg = thr_id % Traits::SUBGROUP_SIZE;
 
+    // Grid-uniform. The mainloop divides the topk range by it to get this split's slice.
+    const int num_kv_splits = cute::max(1, params.scheduler.num_kv_splits);
+
     TileScheduler tile_scheduler{params.scheduler};
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
@@ -179,10 +209,23 @@ class XeMlaSparse2StageDenseKernel {
       auto q_layout = make_layout(make_shape(s.h_q, D_QK), make_stride(kp.stride_q_h_q, _1{}));
       Tensor Q = make_tensor(make_gmem_ptr(q_ptr), q_layout);
 
-      // O [h_q, D_V] gmem view, offset to (batch, seq).
-      auto* out_ptr = out + batch_idx * kp.stride_o_b + seq_idx * kp.stride_o_s_q;
-      auto o_layout = make_layout(make_shape(s.h_q, Traits::D_V), make_stride(kp.stride_o_h_q, _1{}));
-      Tensor O = make_tensor(make_gmem_ptr(out_ptr), o_layout);
+      // O [h_q, D_V] gmem view, offset to (batch, seq). Under split-K this is instead the
+      // o_accum slice for (batch, seq, kv-split): same shape, so the epilogue's store path
+      // is untouched and only the base pointer / row stride change. The final `out` is
+      // then written by the reduction companion.
+      auto o_layout_for = [&](ElementO* base, int stride_h_q) {
+        auto layout = make_layout(make_shape(s.h_q, Traits::D_V), make_stride(stride_h_q, _1{}));
+        return make_tensor(make_gmem_ptr(base), layout);
+      };
+      auto O = [&] {
+        if constexpr (is_split_kv) {
+          ElementO* base = kp.o_accum + batch_idx * kp.stride_o_accum_b + seq_idx * kp.stride_o_accum_s_q +
+                           tile.kv_split_idx * kp.stride_o_accum_split;
+          return o_layout_for(base, kp.stride_o_accum_h_q);
+        } else {
+          return o_layout_for(out + batch_idx * kp.stride_o_b + seq_idx * kp.stride_o_s_q, kp.stride_o_h_q);
+        }
+      }();
 
       // K == V == the Stage 1 gathered latent (MLA aliasing). K is the full
       // [gathered_topk, D_QK] view (D_QK is 512 or 576); V is the transposed
@@ -202,7 +245,7 @@ class XeMlaSparse2StageDenseKernel {
       FragARow tA_max, tA_sum;
 
       CollectiveMainloop mainloop{params.mainloop, shared_storage.mainloop};
-      mainloop(Q, K, V, tArA, tA_max, tA_sum, thr_id, batch_idx, seq_idx, head_bid);
+      mainloop(Q, K, V, tArA, tA_max, tA_sum, thr_id, batch_idx, seq_idx, head_bid, tile.kv_split_idx, num_kv_splits);
 
       // Both collectives use the same SLM union; the epilogue's ReduceK reduction
       // reads/writes it via workgroup barriers internally. The mainloop uses no SLM,
@@ -220,7 +263,8 @@ class XeMlaSparse2StageDenseKernel {
           head_bid,
           cur_head_start_idx,
           batch_idx,
-          seq_idx);
+          seq_idx,
+          tile.kv_split_idx);
     }
   }
 };

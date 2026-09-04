@@ -9,9 +9,8 @@
 //      scaling to obtain the masked A tile in registers, then write it to global-memory.
 //   2) Invert the four 16x16 diagonal blocks directly against global
 //      memory, using a forward-substitution/register-broadcast algorithm.
-//   3) Off-diagonal blocks are computed redundantly by all 4 subgroups,
-//      (only subgroup 0 actually writes results out -- see the comment above Phase 3 below
-//      for why all 4 subgroups must redundantly compute it). TODO: Improve this.
+//   3) Subgroup 0 computes all off-diagonal blocks sequentially with
+//      subgroup-scoped GEMM barriers.
 
 #include "chunk_gated_delta_rule_kernels_xe20.hpp"
 
@@ -192,11 +191,11 @@ CUTE_DEVICE void chunk_compute_A_inverse_fused_kernel(
   item.barrier(sycl::access::fence_space::global_and_local);
 
   // ---------------------------------------------------------------------
-  // Phase 3: off-diagonal blocks via GEMM, using the same forward-
-  // substitution algorithm.
-  // TODO: improve this by reducing redundant work
+  // Phase 3: subgroup 0 computes the off-diagonal blocks sequentially.
+  // Subgroup-scoped barriers allow the other subgroups to leave the
+  // workgroup-barrier sequence after completing their diagonal blocks.
   // ---------------------------------------------------------------------
-  {
+  if (sg_id == 0) {
     int local_id = sg_local_id;
     using TiledMMA = TiledMMAInverse;
     TiledMMA mma{};
@@ -274,121 +273,109 @@ CUTE_DEVICE void chunk_compute_A_inverse_fused_kernel(
     auto tCrD_21 = thr_copy_D_21.partition_sg_fragment_S(gC);
     auto tCgD_21 = thr_copy_D_21.partition_D(gC);
     clear(tCrC);
-    gemm_TTS(A_22_tensor, A_21_tensor_T, tCrC, 0, 0, mma);
+    gemm_TTS<ScopeSubgroup>(A_22_tensor, A_21_tensor_T, tCrC, 0, 0, mma);
     reorder(tCrC, tCrA);
     clear(tCrC);
-    gemm_STS(tCrA, A_11_tensor_T, tCrC, 0, 0, mma);
+    gemm_STS<ScopeSubgroup>(tCrA, A_11_tensor_T, tCrC, 0, 0, mma);
     CUTE_UNROLL
     for (int i = 0; i < tCrC.size(); ++i) {
       tCrC(i) *= -1.0f;
     }
     reorder(tCrC, tCrD_21);
-    if (sg_id == 0) {
-      copy(copy_D_21, tCrD_21, tCgD_21);
-    }
+    copy(copy_D_21, tCrD_21, tCgD_21);
+    sycl::group_barrier(sg, sycl::memory_scope::device);
 
     auto copy_D_31 = get_block_2d_copy_D<void>(mma, A_31_tensor);
     auto thr_copy_D_31 = copy_D_31.get_slice(local_id);
     auto tCrD_31 = thr_copy_D_31.partition_sg_fragment_S(gC);
     auto tCgD_31 = thr_copy_D_31.partition_D(gC);
     clear(tCrC);
-    gemm_TTS(A_31_tensor, A_11_tensor_T, tCrC, 0, 0, mma);
-    gemm_TTS(A_32_tensor, A_21_tensor_T, tCrC, 0, 0, mma);
+    gemm_TTS<ScopeSubgroup>(A_31_tensor, A_11_tensor_T, tCrC, 0, 0, mma);
+    gemm_TTS<ScopeSubgroup>(A_32_tensor, A_21_tensor_T, tCrC, 0, 0, mma);
     reorder(tCrC, tCrD_31);
-    if (sg_id == 0) {
-      copy(copy_D_31, tCrD_31, tCgD_31);
-    }
+    copy(copy_D_31, tCrD_31, tCgD_31);
+    sycl::group_barrier(sg, sycl::memory_scope::device);
     clear(tCrC);
-    gemm_TTS(A_33_tensor, A_31_tensor_T, tCrC, 0, 0, mma);
+    gemm_TTS<ScopeSubgroup>(A_33_tensor, A_31_tensor_T, tCrC, 0, 0, mma);
     CUTE_UNROLL
     for (int i = 0; i < tCrC.size(); ++i) {
       tCrC(i) *= -1.0f;
     }
     reorder(tCrC, tCrD_31);
-    if (sg_id == 0) {
-      copy(copy_D_31, tCrD_31, tCgD_31);
-    }
+    copy(copy_D_31, tCrD_31, tCgD_31);
+    sycl::group_barrier(sg, sycl::memory_scope::device);
 
     auto copy_D_41 = get_block_2d_copy_D<void>(mma, A_41_tensor);
     auto thr_copy_D_41 = copy_D_41.get_slice(local_id);
     auto tCrD_41 = thr_copy_D_41.partition_sg_fragment_S(gC);
     auto tCgD_41 = thr_copy_D_41.partition_D(gC);
     clear(tCrC);
-    gemm_TTS(A_41_tensor, A_11_tensor_T, tCrC, 0, 0, mma);
-    gemm_TTS(A_42_tensor, A_21_tensor_T, tCrC, 0, 0, mma);
-    gemm_TTS(A_43_tensor, A_31_tensor_T, tCrC, 0, 0, mma);
+    gemm_TTS<ScopeSubgroup>(A_41_tensor, A_11_tensor_T, tCrC, 0, 0, mma);
+    gemm_TTS<ScopeSubgroup>(A_42_tensor, A_21_tensor_T, tCrC, 0, 0, mma);
+    gemm_TTS<ScopeSubgroup>(A_43_tensor, A_31_tensor_T, tCrC, 0, 0, mma);
     reorder(tCrC, tCrD_41);
-    if (sg_id == 0) {
-      copy(copy_D_41, tCrD_41, tCgD_41);
-    }
+    copy(copy_D_41, tCrD_41, tCgD_41);
+    sycl::group_barrier(sg, sycl::memory_scope::device);
     clear(tCrC);
-    gemm_TTS(A_44_tensor, A_41_tensor_T, tCrC, 0, 0, mma);
+    gemm_TTS<ScopeSubgroup>(A_44_tensor, A_41_tensor_T, tCrC, 0, 0, mma);
     CUTE_UNROLL
     for (int i = 0; i < tCrC.size(); ++i) {
       tCrC(i) *= -1.0f;
     }
     reorder(tCrC, tCrD_41);
-    if (sg_id == 0) {
-      copy(copy_D_41, tCrD_41, tCgD_41);
-    }
+    copy(copy_D_41, tCrD_41, tCgD_41);
 
     auto copy_D_32 = get_block_2d_copy_D<void>(mma, A_32_tensor);
     auto thr_copy_D_32 = copy_D_32.get_slice(local_id);
     auto tCrD_32 = thr_copy_D_32.partition_sg_fragment_S(gC);
     auto tCgD_32 = thr_copy_D_32.partition_D(gC);
     clear(tCrC);
-    gemm_TTS(A_33_tensor, A_32_tensor_T, tCrC, 0, 0, mma);
+    gemm_TTS<ScopeSubgroup>(A_33_tensor, A_32_tensor_T, tCrC, 0, 0, mma);
     reorder(tCrC, tCrA);
     clear(tCrC);
-    gemm_STS(tCrA, A_22_tensor_T, tCrC, 0, 0, mma);
+    gemm_STS<ScopeSubgroup>(tCrA, A_22_tensor_T, tCrC, 0, 0, mma);
     CUTE_UNROLL
     for (int i = 0; i < tCrC.size(); ++i) {
       tCrC(i) *= -1.0f;
     }
     reorder(tCrC, tCrD_32);
-    if (sg_id == 0) {
-      copy(copy_D_32, tCrD_32, tCgD_32);
-    }
+    copy(copy_D_32, tCrD_32, tCgD_32);
+    sycl::group_barrier(sg, sycl::memory_scope::device);
 
     auto copy_D_42 = get_block_2d_copy_D<void>(mma, A_42_tensor);
     auto thr_copy_D_42 = copy_D_42.get_slice(local_id);
     auto tCrD_42 = thr_copy_D_42.partition_sg_fragment_S(gC);
     auto tCgD_42 = thr_copy_D_42.partition_D(gC);
     clear(tCrC);
-    gemm_TTS(A_42_tensor, A_22_tensor_T, tCrC, 0, 0, mma);
-    gemm_TTS(A_43_tensor, A_32_tensor_T, tCrC, 0, 0, mma);
+    gemm_TTS<ScopeSubgroup>(A_42_tensor, A_22_tensor_T, tCrC, 0, 0, mma);
+    gemm_TTS<ScopeSubgroup>(A_43_tensor, A_32_tensor_T, tCrC, 0, 0, mma);
     reorder(tCrC, tCrD_42);
-    if (sg_id == 0) {
-      copy(copy_D_42, tCrD_42, tCgD_42);
-    }
+    copy(copy_D_42, tCrD_42, tCgD_42);
+    sycl::group_barrier(sg, sycl::memory_scope::device);
     clear(tCrC);
-    gemm_TTS(A_44_tensor, A_42_tensor_T, tCrC, 0, 0, mma);
+    gemm_TTS<ScopeSubgroup>(A_44_tensor, A_42_tensor_T, tCrC, 0, 0, mma);
     CUTE_UNROLL
     for (int i = 0; i < tCrC.size(); ++i) {
       tCrC(i) *= -1.0f;
     }
     reorder(tCrC, tCrD_42);
-    if (sg_id == 0) {
-      copy(copy_D_42, tCrD_42, tCgD_42);
-    }
+    copy(copy_D_42, tCrD_42, tCgD_42);
 
     auto copy_D_43 = get_block_2d_copy_D<void>(mma, A_43_tensor);
     auto thr_copy_D_43 = copy_D_43.get_slice(local_id);
     auto tCrD_43 = thr_copy_D_43.partition_sg_fragment_S(gC);
     auto tCgD_43 = thr_copy_D_43.partition_D(gC);
     clear(tCrC);
-    gemm_TTS(A_44_tensor, A_43_tensor_T, tCrC, 0, 0, mma);
+    gemm_TTS<ScopeSubgroup>(A_44_tensor, A_43_tensor_T, tCrC, 0, 0, mma);
     reorder(tCrC, tCrA);
     clear(tCrC);
-    gemm_STS(tCrA, A_33_tensor_T, tCrC, 0, 0, mma);
+    gemm_STS<ScopeSubgroup>(tCrA, A_33_tensor_T, tCrC, 0, 0, mma);
     CUTE_UNROLL
     for (int i = 0; i < tCrC.size(); ++i) {
       tCrC(i) *= -1.0f;
     }
     reorder(tCrC, tCrD_43);
-    if (sg_id == 0) {
-      copy(copy_D_43, tCrD_43, tCgD_43);
-    }
+    copy(copy_D_43, tCrD_43, tCgD_43);
   }
 }
 

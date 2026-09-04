@@ -55,6 +55,7 @@ namespace gdn {
 using namespace cute;
 
 template <
+    SPIRVScope BarrierScope = ScopeWorkgroup,
     class ATensor,
     class BTensor,
     class SGCTensor,
@@ -105,7 +106,7 @@ CUTE_DEVICE void gemm_TTS(
 
   const int prefetch_dist = 3;
 
-  constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
+  constexpr SPIRVScope barrier_scope = BarrierScope;
 
   int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
   int k_tile_prefetch = 0;
@@ -117,7 +118,11 @@ CUTE_DEVICE void gemm_TTS(
   }
 
   for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
-    barrier_arrive(barrier_scope);
+    if constexpr (BarrierScope == ScopeSubgroup) {
+      sycl::group_barrier(item.get_sub_group());
+    } else {
+      barrier_arrive(barrier_scope);
+    }
 
     copy(copy_a, tAgA(_, _, _, k_tile), tArA);
     copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
@@ -132,11 +137,16 @@ CUTE_DEVICE void gemm_TTS(
 
     cute::gemm(mma, tCrA, tCrB, tCrC);
 
-    barrier_wait(barrier_scope);
+    if constexpr (BarrierScope == ScopeSubgroup) {
+      sycl::group_barrier(item.get_sub_group());
+    } else {
+      barrier_wait(barrier_scope);
+    }
   }
 }
 
 template <
+    SPIRVScope BarrierScope = ScopeWorkgroup,
     class ASGCTensor,
     class BTensor,
     class CSGCTensor,
@@ -177,7 +187,7 @@ CUTE_DEVICE void gemm_STS(
 
   const int prefetch_dist = 3;
 
-  constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
+  constexpr SPIRVScope barrier_scope = BarrierScope;
 
   int k_tile_count = ceil_div(shape<1>(B), get<2>(wg_tile));
   int k_tile_prefetch = 0;
@@ -188,7 +198,11 @@ CUTE_DEVICE void gemm_STS(
   }
 
   for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
-    barrier_arrive(barrier_scope);
+    if constexpr (BarrierScope == ScopeSubgroup) {
+      sycl::group_barrier(item.get_sub_group());
+    } else {
+      barrier_arrive(barrier_scope);
+    }
 
     copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
 
@@ -200,7 +214,11 @@ CUTE_DEVICE void gemm_STS(
 
     cute::gemm(mma, tCrA, tCrB, tCrC);
 
-    barrier_wait(barrier_scope);
+    if constexpr (BarrierScope == ScopeSubgroup) {
+      sycl::group_barrier(item.get_sub_group());
+    } else {
+      barrier_wait(barrier_scope);
+    }
   }
 }
 

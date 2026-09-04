@@ -409,6 +409,51 @@ def print_comparison_table(results: List[dict]):
     print("=" * 110)
 
 
+def print_markdown_table(results: List[dict]):
+    """Print a markdown table (one row per config) suitable for pasting into a PR description."""
+    configs = {}
+    for r in results:
+        key = (r["batch_size"], r["topk"], r["depth"])
+        configs.setdefault(key, {})[r["name"]] = r
+
+    names = sorted({r["name"] for r in results})
+    header = (
+        ["Config", "draft_tokens"] + [f"{n} (dev mean, ms)" for n in names] + ["Result"]
+    )
+    print("\n| " + " | ".join(header) + " |")
+    print("|" + "|".join(["---"] * len(header)) + "|")
+
+    for (bs, topk, depth), impls in sorted(configs.items()):
+        draft_tokens = next(iter(impls.values()))["draft_tokens"]
+        dev_cells = [
+            (
+                f"{impls[n]['dev_mean_ms']:.4f}"
+                if n in impls and "dev_mean_ms" in impls[n]
+                else "n/a"
+            )
+            for n in names
+        ]
+
+        result = "n/a"
+        if len(names) >= 2 and all(n in impls for n in names):
+            base, other = names[0], names[1]
+            # Same wall-clock ratio as print_comparison_table's pairwise summary.
+            speedup = impls[base]["mean_ms"] / impls[other]["mean_ms"]
+            if speedup > 1.05:
+                result = f"**{other} {speedup:.2f}x faster**"
+            elif speedup < 0.95:
+                result = f"**{base} {1 / speedup:.2f}x faster**"
+            else:
+                result = "equivalent (within 5%)"
+
+        row = (
+            [f"bs={bs}, topk={topk}, depth={depth}", str(draft_tokens)]
+            + dev_cells
+            + [result]
+        )
+        print("| " + " | ".join(row) + " |")
+
+
 @pytest.mark.parametrize(
     "batch_size,topk,depth",
     [
@@ -543,7 +588,7 @@ def test_comprehensive_performance_suite():
 
         print(f"Completed: batch_size={batch_size}, topk={topk}, depth={depth}")
 
-    print_comparison_table(results)
+    print_markdown_table(results)
 
 
 if __name__ == "__main__":

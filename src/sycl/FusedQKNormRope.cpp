@@ -120,6 +120,9 @@ inline void dispatchFusedQKNormRopeHeadDim(int64_t head_dim, const char* kernel_
     case 64:
       fn(std::integral_constant<int64_t, 64>{});
       break;
+    case 96:
+      fn(std::integral_constant<int64_t, 96>{});
+      break;
     case 128:
       fn(std::integral_constant<int64_t, 128>{});
       break;
@@ -795,6 +798,151 @@ void launchFusedQKNormRopeCacheVecImpl(
 }
 
 template <int64_t kHeadDim, bool kIsNeox, typename scalar_t, typename IdType>
+struct FusedQKNormRopeCacheCTAKernel {
+  scalar_t* q_ptr;
+  scalar_t* k_ptr;
+  const scalar_t* q_weight_ptr;
+  const scalar_t* k_weight_ptr;
+  const float* cos_sin_cache_ptr;
+  const IdType* positions;
+  int64_t rope_dim;
+  int64_t q_token_stride;
+  int64_t k_token_stride;
+  int64_t q_head_stride;
+  int64_t k_head_stride;
+  uint32_t num_qo_heads;
+  uint32_t num_kv_heads;
+  uint32_t num_tokens;
+  float eps;
+  sycl::local_accessor<float, 1> stage;
+
+  [[sycl::reqd_sub_group_size(NUM_REDUCE_STAGES)]] void operator()(sycl::nd_item<1> item) const {
+    const int64_t local_id = static_cast<int64_t>(item.get_local_id(0));
+    const int64_t workgroup_size = static_cast<int64_t>(item.get_local_range(0));
+    const int64_t workgroup_id = static_cast<int64_t>(item.get_group(0));
+    const int64_t num_workgroups = static_cast<int64_t>(item.get_group_range(0));
+    const int64_t num_qk_heads = static_cast<int64_t>(num_qo_heads) + static_cast<int64_t>(num_kv_heads);
+    const int64_t num_works = static_cast<int64_t>(num_tokens) * num_qk_heads;
+
+    for (int64_t work_id = workgroup_id; work_id < num_works; work_id += num_workgroups) {
+      const int64_t token_id = work_id / num_qk_heads;
+      const int64_t head_id = work_id % num_qk_heads;
+      const bool load_q = head_id < static_cast<int64_t>(num_qo_heads);
+
+      scalar_t* row_ptr;
+      const scalar_t* weight_ptr;
+      if (load_q) {
+        row_ptr = rowPtr(q_ptr, token_id, head_id, q_token_stride, q_head_stride);
+        weight_ptr = q_weight_ptr;
+      } else {
+        row_ptr = rowPtr(k_ptr, token_id, head_id - static_cast<int64_t>(num_qo_heads), k_token_stride, k_head_stride);
+        weight_ptr = k_weight_ptr;
+      }
+
+      float sum_of_squares = 0.0f;
+      for (int64_t dim = local_id; dim < kHeadDim; dim += workgroup_size) {
+        const float x = static_cast<float>(row_ptr[dim]);
+        stage[dim] = x;
+        sum_of_squares += x * x;
+      }
+
+      sum_of_squares = sycl::reduce_over_group(item.get_group(), sum_of_squares, sycl::plus<float>());
+      const float norm_factor = sycl::rsqrt(sum_of_squares / static_cast<float>(kHeadDim) + eps);
+
+      item.barrier(sycl::access::fence_space::local_space);
+
+      for (int64_t dim = local_id; dim < kHeadDim; dim += workgroup_size) {
+        stage[dim] = stage[dim] * norm_factor * static_cast<float>(weight_ptr[dim]);
+      }
+
+      item.barrier(sycl::access::fence_space::local_space);
+
+      const int64_t pos = static_cast<int64_t>(positions[token_id]);
+      const float* cos_ptr = cos_sin_cache_ptr + pos * rope_dim;
+      const float* sin_ptr = cos_ptr + rope_dim / 2;
+      const int64_t half_rope_dim = rope_dim / 2;
+
+      for (int64_t dim = local_id; dim < kHeadDim; dim += workgroup_size) {
+        float out = stage[dim];
+        if (dim < rope_dim) {
+          if constexpr (kIsNeox) {
+            const bool first_half = dim < half_rope_dim;
+            const int64_t partner_dim = first_half ? dim + half_rope_dim : dim - half_rope_dim;
+            const float partner = stage[partner_dim];
+            const int64_t half_idx = first_half ? dim : dim - half_rope_dim;
+            out = out * cos_ptr[half_idx] + (first_half ? -partner : partner) * sin_ptr[half_idx];
+          } else {
+            const bool even_dim = (dim & 1) == 0;
+            const int64_t partner_dim = even_dim ? dim + 1 : dim - 1;
+            const float partner = stage[partner_dim];
+            const int64_t half_idx = dim / 2;
+            out = even_dim ? out * cos_ptr[half_idx] - partner * sin_ptr[half_idx]
+                           : out * cos_ptr[half_idx] + partner * sin_ptr[half_idx];
+          }
+        }
+        row_ptr[dim] = static_cast<scalar_t>(out);
+      }
+
+      item.barrier(sycl::access::fence_space::local_space);
+    }
+  }
+};
+
+template <int64_t kHeadDim, bool kIsNeox, typename scalar_t, typename IdType>
+void launchFusedQKNormRopeCacheCTAImpl(
+    scalar_t* q_ptr,
+    scalar_t* k_ptr,
+    const scalar_t* q_weight_ptr,
+    const scalar_t* k_weight_ptr,
+    const float* cos_sin_cache_ptr,
+    const IdType* positions_ptr,
+    int64_t q_token_stride,
+    int64_t k_token_stride,
+    int64_t q_head_stride,
+    int64_t k_head_stride,
+    int64_t num_tokens,
+    int64_t num_qo_heads,
+    int64_t num_kv_heads,
+    int64_t rope_dim,
+    float eps,
+    sycl::queue& queue) {
+  const int64_t num_works = num_tokens * (num_qo_heads + num_kv_heads);
+  const int64_t max_wg_size =
+      capWorkgroupSize(dpcppMaxWorkGroupSize(dpcppGetDeviceIdOfCurrentQueue()), NUM_REDUCE_STAGES);
+  const int64_t workgroup_size = std::max<int64_t>(
+      NUM_REDUCE_STAGES, std::min<int64_t>(max_wg_size, divUp<int64_t>(kHeadDim, NUM_REDUCE_STAGES) * NUM_REDUCE_STAGES));
+  const int64_t max_resident_wgs =
+      std::max<int64_t>(1, dpcppMaxWorkItemsPerTile(dpcppGetDeviceIdOfCurrentQueue()) / workgroup_size);
+  const int64_t num_wgs = std::max<int64_t>(1, std::min<int64_t>(num_works, max_resident_wgs));
+
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> stage(sycl::range<1>(static_cast<size_t>(kHeadDim)), cgh);
+    FusedQKNormRopeCacheCTAKernel<kHeadDim, kIsNeox, scalar_t, IdType> kernel{
+        q_ptr,
+        k_ptr,
+        q_weight_ptr,
+        k_weight_ptr,
+        cos_sin_cache_ptr,
+        positions_ptr,
+        rope_dim,
+        q_token_stride,
+        k_token_stride,
+        q_head_stride,
+        k_head_stride,
+        static_cast<uint32_t>(num_qo_heads),
+        static_cast<uint32_t>(num_kv_heads),
+        static_cast<uint32_t>(num_tokens),
+        eps,
+        stage};
+    cgh.parallel_for(
+        sycl::nd_range<1>(
+            sycl::range<1>(static_cast<size_t>(num_wgs * workgroup_size)),
+            sycl::range<1>(static_cast<size_t>(workgroup_size))),
+        kernel);
+  });
+}
+
+template <int64_t kHeadDim, bool kIsNeox, typename scalar_t, typename IdType>
 void launchFusedQKNormRopeCacheImpl(
     scalar_t* q_ptr,
     scalar_t* k_ptr,
@@ -821,10 +969,26 @@ void launchFusedQKNormRopeCacheImpl(
   const int64_t rotary_lanes = rope_dim / kElemsPerThread;
   const int64_t half_rotary_lanes = rotary_lanes / 2;
   if constexpr (kIsNeox) {
-    TORCH_CHECK(
-        rotary_lanes >= 2 && (rotary_lanes & (rotary_lanes - 1)) == 0,
-        "NeoX fused qknorm+rope requires rotary lane count to be a power of 2, got ",
-        rotary_lanes);
+    if (rotary_lanes < 2 || (rotary_lanes & (rotary_lanes - 1)) != 0) {
+      launchFusedQKNormRopeCacheCTAImpl<kHeadDim, kIsNeox, scalar_t, IdType>(
+          q_ptr,
+          k_ptr,
+          q_weight_ptr,
+          k_weight_ptr,
+          cos_sin_cache_ptr,
+          positions_ptr,
+          q_token_stride,
+          k_token_stride,
+          q_head_stride,
+          k_head_stride,
+          num_tokens,
+          num_qo_heads,
+          num_kv_heads,
+          rope_dim,
+          eps,
+          queue);
+      return;
+    }
   }
   // q/k rows may be non-contiguous beyond the last dimension (e.g. sliced
   // out of a larger packed buffer), so the chosen vector width must also

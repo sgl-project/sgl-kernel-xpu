@@ -255,6 +255,26 @@ def silu_and_mul_clamp(
     torch.ops.sgl_kernel.silu_and_mul_clamp(out, input, swiglu_limit)
 
 
+def indexed_scale_shift_bf16_(
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    torch.ops.sgl_kernel.indexed_scale_shift_bf16_(x, shift, scale, indices)
+    return x
+
+
+def indexed_gate_bf16_(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    other: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    torch.ops.sgl_kernel.indexed_gate_bf16_(x, gate, other, indices)
+    return x
+
+
 def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")

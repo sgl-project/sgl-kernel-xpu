@@ -391,9 +391,11 @@ class NormForward {
     return vec_size;
   }
 
-  int get_update_vec_size(int Plane, int vec_size) {
-    vec_size = get_min_vec_size(vec_size, X_data, Y_data, gamma_data, beta_data);
-
+  // Aligns vec_size against an arbitrary set of pointers (e.g. X/Y/gamma/add_data),
+  // unlike get_update_vec_size above which is fixed to X/Y/gamma/beta.
+  template <typename... Args>
+  int get_aligned_update_vec_size(int Plane, int vec_size, Args*... args) const {
+    vec_size = get_min_vec_size(vec_size, args...);
     while (Plane % vec_size != 0) {
       vec_size = vec_size >> 1;
     }

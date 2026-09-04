@@ -567,6 +567,8 @@ def fused_experts(
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
 
+    assert is_xe2_arch(), "Current MoE is only supported on BMG"
+
     use_fp8_weight = use_fp8_w8a8
     assert a1_scale is None, (
         "prequantized FP8 activation input is not supported: " "a1_scale must be None"
@@ -939,8 +941,6 @@ def fused_experts(
         activation_type = 3
     else:
         raise ValueError(f"Unsupported activation {activation}")
-
-    assert is_xe2_arch(), f"Current MoE is only supported on BMG"
 
     # Gated activations (silu/gelu/swiglu) split w1's output into gate+up, so
     # w1.shape[1] == 2*N; non-gated relu2 has w1.shape[1] == N. Compare against

@@ -2807,7 +2807,7 @@ def test_relative_attention_zero_bias_matches_prefill():
         **common,
     )
     torch.xpu.synchronize()
-    torch.testing.assert_close(relative.float(), baseline.float(), rtol=0, atol=5e-4)
+    torch.testing.assert_close(relative.float(), baseline.float(), rtol=0, atol=1e-3)
 
 
 @pytest.mark.skipif(

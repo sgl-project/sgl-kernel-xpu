@@ -652,6 +652,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int num_top_k, int hot_buffer_size, int page_size, int block_size, "
       "bool is_dsv4_layout) -> ()");
   m.impl("load_cache_to_device_buffer_mla", torch::kXPU, &load_cache_to_device_buffer_mla);
+
+  /*
+   * MiniMax decode block top-k kernels
+   */
+  m.def(
+      "minimax_decode_topk(Tensor score, Tensor seq_lens, Tensor(a!) out, "
+      "int block_size, int topk) -> ()");
+  m.impl("minimax_decode_topk", torch::kXPU, &minimax_decode_topk);
+
+  m.def(
+      "minimax_decode_topk_page_table(Tensor score, Tensor seq_lens, Tensor req_to_token, "
+      "Tensor slot_ids, int block_size, int topk, int page_size) -> (Tensor, Tensor)");
+  m.impl("minimax_decode_topk_page_table", torch::kXPU, &minimax_decode_topk_page_table);
 }
 
 REGISTER_EXTENSION(common_ops)

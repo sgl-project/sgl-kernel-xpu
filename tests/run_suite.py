@@ -74,6 +74,7 @@ suites = {
         TestFile("test_sconv_gather_scatter_and_draft_extend.py"),
         TestFile("test_sconv_metadata_and_windows.py"),
         TestFile("test_sconv_update_sconv_cache.py"),
+        TestFile("test_inkling_rel_proj.py"),
         TestFile("test_inkling_attn_prologue.py"),
         TestFile("test_hisparse.py"),
     ],

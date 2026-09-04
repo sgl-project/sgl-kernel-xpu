@@ -1,22 +1,14 @@
 """
 Performance comparison test for EAGLE tree building kernels.
 
-Compares the native kernel (sgl_kernel: CUDA/HIP/MUSA, or the CPU op) against
+Compares the native kernel (sgl_kernel: XPU op) against
 the Triton implementation across different configurations. The set of
 implementations exercised is chosen from whatever ships for the current device:
 
-    - CUDA / HIP / MUSA: sgl_kernel native op + Triton
-    - Intel XPU:          Triton only
-    - CPU:                sgl_kernel CPU op only
-
-The pure-PyTorch reference (sgl_build_tree_kernel_efficient_pytorch) was removed
-upstream, so it is no longer part of the comparison.
+    - Intel XPU:          sgl_kernel and Triton
 
 Usage:
-    python -m pytest test/manual/spec/eagle/test_tree_kernel_perf_v2.py -v -s
-
-    # Run comprehensive suite directly:
-    python test/manual/spec/eagle/test_tree_kernel_perf_v2.py
+    python3 benchmark/bench_build_eagle_tree.py
 """
 
 import time
@@ -24,81 +16,22 @@ from typing import Callable, List, Tuple
 
 import pytest
 import torch
-from sgl_kernel import TreeMaskMode
+from sgl_kernel import TreeMaskMode, build_tree_kernel_efficient
 from sgl_kernel.eagle_utils import sgl_build_tree_kernel_triton
 
+DEVICE = "xpu"
 
-# sglang is not a dependency of sgl-kernel-xpu, so its device probes are inlined
-# here (same semantics) to keep this benchmark runnable standalone.
-def is_xpu() -> bool:
-    return hasattr(torch, "xpu") and torch.xpu.is_available()
-
-
-def is_cuda() -> bool:
-    return (
-        getattr(torch.version, "cuda", None) is not None and torch.cuda.is_available()
-    )
-
-
-def is_hip() -> bool:
-    return getattr(torch.version, "hip", None) is not None
-
-
-def is_musa() -> bool:
-    return hasattr(torch, "musa") and torch.musa.is_available()
-
-
-def is_cpu() -> bool:
-    return not (is_cuda() or is_hip() or is_musa() or is_xpu())
-
-
-# The native tree-build op is registered per device family. Mirror the same
-# conditional import eagle_utils uses so this test picks up whatever shipped.
-_native_build_tree = None
-_NATIVE_NAME = None
-try:
-    if is_cuda() or is_hip() or is_musa():
-        from sgl_kernel import build_tree_kernel_efficient as _native_build_tree
-
-        _NATIVE_NAME = "sgl_kernel"
-    elif is_xpu():
-        # AOT SYCL op from this repo (src/sycl/SpecBuildTree.cpp); same in-place
-        # signature as the CUDA op, so _run_native drives it unchanged.
-        from sgl_kernel import build_tree_kernel_efficient as _native_build_tree
-
-        _NATIVE_NAME = "sgl_kernel_sycl"
-    elif is_cpu():
-        from sgl_kernel import build_tree_kernel_efficient_cpu as _native_build_tree
-
-        _NATIVE_NAME = "sgl_kernel_cpu"
-except ImportError:
-    _native_build_tree = None
-
-
-def _detect_device() -> str:
-    if is_xpu() and torch.xpu.is_available():
-        return "xpu"
-    if torch.cuda.is_available():
-        return "cuda"
-    return "cpu"
-
-
-DEVICE = _detect_device()
-
-# Triton ships for the GPU backends; there is no Triton path for the CPU op.
-_TRITON_AVAILABLE = DEVICE in ("cuda", "xpu")
+# AOT SYCL op from this repo (src/sycl/SpecBuildTree.cpp).
+_native_build_tree = build_tree_kernel_efficient
+_NATIVE_NAME = "sgl_kernel_sycl"
 
 
 def _sync():
-    if DEVICE == "cuda":
-        torch.cuda.synchronize()
-    elif DEVICE == "xpu":
-        torch.xpu.synchronize()
+    torch.xpu.synchronize()
 
 
-# Device timing events isolate on-device kernel time (excludes host/launch
-# overhead). Only the GPU backends expose timing events; the CPU op has none.
-_DEVICE_EVENTS = {"cuda": torch.cuda, "xpu": torch.xpu}.get(DEVICE)
+# Device timing events isolate on-device kernel time (excludes host/launch overhead).
+_DEVICE_EVENTS = torch.xpu
 
 
 def _make_timing_events():
@@ -166,13 +99,8 @@ def _run_triton(inputs, topk, depth, draft_token_num, tree_mask_mode):
 
 
 def get_implementations() -> List[Tuple[str, Callable]]:
-    """Return (name, runner) pairs available on the current device."""
-    impls: List[Tuple[str, Callable]] = []
-    if _native_build_tree is not None:
-        impls.append((_NATIVE_NAME, _run_native))
-    if _TRITON_AVAILABLE:
-        impls.append(("triton", _run_triton))
-    return impls
+    """Return (name, runner) pairs to compare."""
+    return [(_NATIVE_NAME, _run_native), ("triton", _run_triton)]
 
 
 def _latency_stats(latencies_s: List[float]) -> dict:

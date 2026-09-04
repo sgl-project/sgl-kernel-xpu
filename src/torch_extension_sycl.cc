@@ -213,6 +213,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("moe_sum(Tensor input, Tensor! output) -> ()");
   m.impl("moe_sum", torch::kXPU, &moe_sum);
 
+// Xe20 only kernels
+#if SYCL_INTEL_TARGET == 20
   m.def(
       "moe_grouped_mm_nt_xe20(Tensor! output, Tensor activations, Tensor weights, Tensor? bias, Tensor "
       "total_rows_for_experts, int n_experts, int activation_type, bool fuse_act, float gemm1_alpha=1.702, float "
@@ -223,12 +225,22 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "moe_grouped_mm_nt_xe20_w4a16(Tensor! output, Tensor activations, Tensor packed_weights, Tensor scales, "
       "Tensor? zeros, Tensor? bias, Tensor rows_per_expert, int n_experts, bool is_int4, int group_size) -> ()");
   m.impl("moe_grouped_mm_nt_xe20_w4a16", torch::kXPU, &moe_grouped_mm_nt_xe20_w4a16);
+#endif  // Xe20 only kernels
+
+  m.def(
+      "moe_grouped_mm_nt_xe20_fp8_w8a16(Tensor! output, Tensor activations, Tensor weights, "
+      "Tensor weight_scales, Tensor? bias, Tensor total_rows_for_experts, int n_experts) -> ()");
+  m.impl("moe_grouped_mm_nt_xe20_fp8_w8a16", torch::kXPU, &moe_grouped_mm_nt_xe20_fp8_w8a16);
 
   m.def(
       "prepare_moe_input(Tensor topk_ids, Tensor! expert_offsets, Tensor? blockscale_offsets, Tensor! problem_sizes1,"
       " Tensor! problem_sizes2, Tensor! input_permutation, Tensor! output_permutation, int num_experts, int n, int k)"
       " -> ()");
   m.impl("prepare_moe_input", torch::kXPU, &prepare_moe_input);
+  m.def(
+      "prepare_moe_input_small(Tensor input, Tensor topk_ids, Tensor! expert_counts, Tensor! output_permutation, "
+      "Tensor! output) -> ()");
+  m.impl("prepare_moe_input_small", torch::kXPU, &prepare_moe_input_small);
   m.def("scatter_tokens_to_experts(Tensor input, Tensor src2dst_map, Tensor! output) -> ()");
   m.impl("scatter_tokens_to_experts", torch::kXPU, &scatter_tokens_to_experts);
   m.def(
@@ -537,6 +549,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   /* NSA (Native Sparse Attention) indexer scoring */
   // fp8_mqa_logits (prefill) is implemented in pure Python via sgl_kernel.nsa.
+#if SYCL_INTEL_TARGET == 20
   m.def(
       "fp8_paged_mqa_logits(Tensor q_fp8, Tensor kv_cache, Tensor weights, "
       "Tensor seq_lens, Tensor block_tables, Tensor? schedule_metadata, "
@@ -565,6 +578,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl(
       "gdn_attention_workspace_bytes_needed", c10::DispatchKey::BackendSelect, &gdn_attention_workspace_bytes_needed);
 #endif  // USE_GDN
+#endif  // SYCL_INTEL_TARGET == 20
 
   /*
    * Mamba causal conv1d (XPU)

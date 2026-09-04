@@ -8,6 +8,104 @@ from sgl_kernel import (
     prepare_moe_input,
     scatter_tokens_to_experts,
 )
+from sgl_kernel.moe import _should_use_small_moe_prepare
+
+
+@pytest.mark.parametrize(
+    "num_tokens,top_k,hidden_dim,num_experts,expected",
+    [
+        (1, 0, 2048, 64, False),
+        (10, 4, 2048, 64, True),
+        (1, 16, 2048, 64, True),
+        (1, 17, 2048, 64, False),
+        (11, 4, 2048, 64, True),
+        (16, 4, 1024, 64, True),
+        (17, 4, 1024, 128, False),
+        (8, 8, 1024, 32, True),
+        (8, 8, 2560, 32, True),
+        (8, 8, 2561, 32, False),
+    ],
+)
+def test_should_use_small_moe_prepare(
+    num_tokens, top_k, hidden_dim, num_experts, expected
+):
+    assert (
+        _should_use_small_moe_prepare(num_tokens, top_k, hidden_dim, num_experts)
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    "num_tokens,top_k,hidden_dim,index_dtype,routing",
+    [
+        (1, 16, 15, torch.int32, "random"),
+        (1, 8, 16, torch.int64, "all_same"),
+        (3, 3, 33, torch.int64, "random"),
+        (5, 7, 16, torch.int32, "skewed"),
+        (8, 8, 33, torch.int32, "all_same"),
+    ],
+)
+def test_prepare_moe_input_small(num_tokens, top_k, hidden_dim, index_dtype, routing):
+    num_experts = 32
+    torch.manual_seed(41)
+    input_tensor = torch.randn(
+        num_tokens, hidden_dim, dtype=torch.bfloat16, device="xpu"
+    )
+    if routing == "random":
+        topk_ids = torch.stack(
+            [torch.randperm(num_experts)[:top_k] for _ in range(num_tokens)]
+        )
+    elif routing == "skewed":
+        topk_ids = torch.arange(top_k).repeat(num_tokens, 1)
+    else:
+        topk_ids = torch.zeros((num_tokens, top_k), dtype=torch.int64)
+    topk_ids = topk_ids.to(device="xpu", dtype=index_dtype)
+    expert_counts = torch.full((num_experts,), 123, dtype=torch.int32, device="xpu")
+    output_permutation = torch.empty(
+        num_tokens * top_k, dtype=torch.int32, device="xpu"
+    )
+    output = torch.empty(
+        num_tokens * top_k, hidden_dim, dtype=torch.bfloat16, device="xpu"
+    )
+
+    torch.ops.sgl_kernel.prepare_moe_input_small.default(
+        input_tensor, topk_ids, expert_counts, output_permutation, output
+    )
+
+    flat_ids = topk_ids.cpu().flatten()
+    sorted_routes = torch.argsort(flat_ids, stable=True)
+    expected_permutation = torch.empty_like(sorted_routes, dtype=torch.int32)
+    expected_permutation[sorted_routes] = torch.arange(
+        sorted_routes.numel(), dtype=torch.int32
+    )
+    expected_output = input_tensor.cpu()[sorted_routes // top_k]
+    expected_counts = torch.bincount(flat_ids, minlength=num_experts).to(torch.int32)
+
+    torch.testing.assert_close(expert_counts.cpu(), expected_counts)
+    torch.testing.assert_close(output_permutation.cpu(), expected_permutation)
+    torch.testing.assert_close(output.cpu(), expected_output)
+
+
+@pytest.mark.parametrize(
+    "num_tokens,top_k,error",
+    [(1, 17, "topk must be in"), (13, 5, "routed rows must be")],
+)
+def test_prepare_moe_input_small_rejects_capacity_overflow(num_tokens, top_k, error):
+    hidden_dim = 16
+    input_tensor = torch.empty(
+        (num_tokens, hidden_dim), dtype=torch.bfloat16, device="xpu"
+    )
+    topk_ids = torch.zeros((num_tokens, top_k), dtype=torch.int32, device="xpu")
+    route_count = topk_ids.numel()
+
+    with pytest.raises(RuntimeError, match=error):
+        torch.ops.sgl_kernel.prepare_moe_input_small.default(
+            input_tensor,
+            topk_ids,
+            torch.empty(32, dtype=torch.int32, device="xpu"),
+            torch.empty(route_count, dtype=torch.int32, device="xpu"),
+            torch.empty((route_count, hidden_dim), dtype=torch.bfloat16, device="xpu"),
+        )
 
 
 @pytest.mark.parametrize("num_tokens", [1, 2, 5, 16, 64, 128, 224, 1024])

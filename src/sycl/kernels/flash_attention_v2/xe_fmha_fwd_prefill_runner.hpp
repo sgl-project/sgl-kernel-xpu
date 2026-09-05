@@ -288,21 +288,55 @@ struct PrefillRunner {
       shape = problem_shape_in;
     }
 
-    auto [batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, head_size_qk, head_size_vo] =
-        problem_size;
-    // NHD format
-    stride_Q = cutlass::make_stride(
-        num_heads_q * head_size_qk, Int<1>{}, head_size_qk, head_size_qk * num_heads_q * seq_len_qo);
-    stride_K = cutlass::make_stride(
-        num_heads_kv * head_size_qk, Int<1>{}, head_size_qk, head_size_qk * num_heads_kv * seq_len_kv);
-    stride_V = cutlass::make_stride(
-        Int<1>{}, num_heads_kv * head_size_vo, head_size_vo, head_size_vo * num_heads_kv * seq_len_kv);
-    stride_K_cache = cutlass::make_stride(
-        num_heads_kv * head_size_qk, Int<1>{}, head_size_qk, head_size_qk * num_heads_kv * seq_len_kv_cache);
-    stride_V_cache = cutlass::make_stride(
-        Int<1>{}, num_heads_kv * head_size_vo, head_size_vo, head_size_vo * num_heads_kv * seq_len_kv_cache);
-    stride_O = cutlass::make_stride(
-        num_heads_q * head_size_vo, Int<1>{}, head_size_vo, head_size_vo * num_heads_q * seq_len_qo);
+    auto
+        [batch,
+         num_heads_q,
+         num_heads_kv,
+         seq_len_qo,
+         seq_len_kv,
+         seq_len_kv_cache,
+         head_size_qk,
+         head_size_vo,
+         q_row_stride,
+         k_row_stride,
+         v_row_stride,
+         q_head_stride,
+         k_head_stride,
+         v_head_stride,
+         o_row_stride,
+         o_head_stride] =
+            cute::tuple_cat(
+                problem_size,
+                cute::make_tuple(
+                    params.q_row_stride,
+                    params.k_row_stride,
+                    params.v_row_stride,
+                    params.q_head_stride,
+                    params.k_head_stride,
+                    params.v_head_stride,
+                    params.o_row_stride,
+                    params.o_head_stride));
+    // Row/head strides come straight from the caller's tensors instead of
+    // being derived from head_size * num_heads, so q/k/v may be
+    // non-contiguous views (e.g. sliced out of a fused qkv projection)
+    // without an extra `.contiguous()` copy; only the last (head_size) dim
+    // must be contiguous, which is enforced by CHECK_LAST_DIM_CONTIGUOUS_INPUT.
+    // StrideQ/K/V/O use plain `int` elements, but Arguments stores strides as
+    // int64_t, so narrow explicitly before handing them to make_stride.
+    int const q_row_stride_i = static_cast<int>(q_row_stride);
+    int const k_row_stride_i = static_cast<int>(k_row_stride);
+    int const v_row_stride_i = static_cast<int>(v_row_stride);
+    int const q_head_stride_i = static_cast<int>(q_head_stride);
+    int const k_head_stride_i = static_cast<int>(k_head_stride);
+    int const v_head_stride_i = static_cast<int>(v_head_stride);
+    int const o_row_stride_i = static_cast<int>(o_row_stride);
+    int const o_head_stride_i = static_cast<int>(o_head_stride);
+    stride_Q = cutlass::make_stride(q_row_stride_i, Int<1>{}, q_head_stride_i, q_row_stride_i * seq_len_qo);
+    stride_K = cutlass::make_stride(k_row_stride_i, Int<1>{}, k_head_stride_i, k_row_stride_i * seq_len_kv);
+    stride_V = cutlass::make_stride(Int<1>{}, v_row_stride_i, v_head_stride_i, v_row_stride_i * seq_len_kv);
+    stride_K_cache = cutlass::make_stride(k_row_stride_i, Int<1>{}, k_head_stride_i, k_row_stride_i * seq_len_kv_cache);
+    stride_V_cache = cutlass::make_stride(Int<1>{}, v_row_stride_i, v_head_stride_i, v_row_stride_i * seq_len_kv_cache);
+    stride_O = cutlass::make_stride(o_row_stride_i, Int<1>{}, o_head_stride_i, o_row_stride_i * seq_len_qo);
 
     if constexpr (isVarLen) {
       shape.seq_len_qo.cumulative_length = params.cu_seqlens_q;

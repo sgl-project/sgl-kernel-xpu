@@ -375,6 +375,8 @@ inline typename T::Fmla::Arguments args_from_options_2stage(
   g.extra_num_blocks = extra_num_blocks;
   g.extra_page_block_size = extra_page_block_size;
   g.extra_topk = extra_topk;
+  g.page_block_divmod = cutlass::FastDivmod(std::max(1, page_block_size));
+  g.extra_page_block_divmod = cutlass::FastDivmod(std::max(1, extra_page_block_size));
   g.kv = reinterpret_cast<uint8_t*>(k_cache.data_ptr());
   g.stride_kv_block = to_int_stride(k_cache.stride(0));
   g.extra_kv = has_extra ? reinterpret_cast<uint8_t*>(extra_k_cache.value().data_ptr()) : nullptr;

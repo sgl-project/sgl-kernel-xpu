@@ -48,6 +48,7 @@
 
 #include "cutlass/bfloat16.h"
 #include "cutlass/device_kernel.h"
+#include "cutlass/fast_math.h"
 #include "cutlass/float8.h"
 #include "cutlass/half.h"
 
@@ -266,6 +267,12 @@ struct Gather2StageParams {
 struct DecodeGather2StageParams : Gather2StageParams {
   int num_blocks = 0, page_block_size = 0;
   int extra_num_blocks = 0, extra_page_block_size = 0, extra_topk = 0;
+
+  // Precomputed magic-number reciprocals for the two page sizes, so locate_token's
+  // token_idx -> (block_idx, rel_idx) split costs a multiply-high plus two shifts instead
+  // of an divide.
+  cutlass::FastDivmod page_block_divmod;
+  cutlass::FastDivmod extra_page_block_divmod;
 
   uint8_t* __restrict__ kv = nullptr;  // packed fp8 KV cache
   int stride_kv_block = 0;

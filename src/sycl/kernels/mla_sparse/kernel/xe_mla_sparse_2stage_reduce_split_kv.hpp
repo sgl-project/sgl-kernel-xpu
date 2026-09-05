@@ -202,7 +202,7 @@ class XeMlaSparse2StageReduceSplitKV {
         total_exp_sum += sycl::native::exp2(static_cast<ElementAcc>(ep.attn_sink[head_idx] * LOG_2_E) - global_max);
       }
     }
-    const ElementAcc inv_exp_sum = total_exp_sum != ElementAcc(0) ? ElementAcc(1) / total_exp_sum : ElementAcc(0);
+    const ElementAcc inv_exp_sum = total_exp_sum != ElementAcc(0) ? sycl::native::recip(total_exp_sum) : ElementAcc(0);
 
     // Pass 2: combine the partial O columns this thread owns. k-outer / v-inner so the
     // per-split exp2 rescale is hoisted out of the D_V walk and acc[] stays in registers.

@@ -15,10 +15,12 @@
       - XeMlaSparseGather2StageTileScheduler<B_TOPK> (Stage 1, gather). Grid is
         (b * s_q, ceil_div(gathered_topk, B_TOPK), 1): BlockIdxX enumerates the
         (batch, seq) pairs row-major and BlockIdxY the topk-block, decoded into a
-        (batch_idx, seq_idx, topk_block_idx) coordinate. Unlike the Stage-2 scheduler
-        it also owns get_grid_shape, since the gather kernel's grid is derivable from
-        its params alone. Its Params slice is the *base* Gather2StageParams, so the
-        one scheduler serves both the decode and prefill param children.
+        (batch_idx, seq_idx, topk_block_idx) coordinate. (Swapping those two axes was
+        measured and did not pay -- see the note on get_grid_shape.) Unlike the
+        Stage-2 scheduler it also owns get_grid_shape, since the gather kernel's grid
+        is derivable from its params alone. Its Params slice is the *base*
+        Gather2StageParams, so the one scheduler serves both the decode and prefill
+        param children.
 
       - XeMlaSparse2StageIndividualTileScheduler<B_H, V_SPLIT> (Stage 2, dense flash).
         Grid is (ceil_div(h_q, B_H) * s_q * b * V_SPLIT, 1, num_kv_splits): BlockIdxX

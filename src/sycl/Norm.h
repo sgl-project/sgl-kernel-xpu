@@ -21,7 +21,7 @@ inline std::tuple<int64_t, int64_t> _check_layer_norm_inputs(
     std::optional<torch::Tensor>& weight /* optional */,
     std::optional<torch::Tensor>& bias /* optional */) {
   CHECK_LAST_DIM_CONTIGUOUS(input);
-  TORCH_CHECK(input.dim() == 2 || input.dim() == 3, "input must be a 2D or 3D tensor");
+  TORCH_CHECK(input.dim() == 2 || input.dim() == 3 || input.dim() == 4, "input must be a 2D, 3D, or 4D tensor");
 #define TENSOR_CHECK(T)                          \
   if (T.has_value()) {                           \
     CHECK_LAST_DIM_CONTIGUOUS(T.value());        \
@@ -113,20 +113,28 @@ class NormConfig {
       int element_size_bytes,
       int input_batch_stride,
       int output_batch_stride,
-      int input_inner_size = 1,
-      int input_inner_stride = 0,
-      int output_inner_size = 1,
-      int output_inner_stride = 0)
+      int input_inner0_size = 1,
+      int input_inner0_stride = 0,
+      int output_inner0_size = 1,
+      int output_inner0_stride = 0,
+      int input_inner1_size = 1,
+      int input_inner1_stride = 0,
+      int output_inner1_size = 1,
+      int output_inner1_stride = 0)
       : Batch(Batch),
         Plane(Plane),
         problem_dim(problem_dim),
         element_size_bytes(element_size_bytes),
         input_batch_stride(input_batch_stride),
         output_batch_stride(output_batch_stride),
-        input_inner_size(input_inner_size),
-        input_inner_stride(input_inner_stride),
-        output_inner_size(output_inner_size),
-        output_inner_stride(output_inner_stride) {
+        input_inner0_size(input_inner0_size),
+        input_inner0_stride(input_inner0_stride),
+        output_inner0_size(output_inner0_size),
+        output_inner0_stride(output_inner0_stride),
+        input_inner1_size(input_inner1_size),
+        input_inner1_stride(input_inner1_stride),
+        output_inner1_size(output_inner1_size),
+        output_inner1_stride(output_inner1_stride) {
     semaphores_ptr = nullptr;
     scratchpad_ptr = nullptr;
     sub_group_num_global = 1;
@@ -152,10 +160,14 @@ class NormConfig {
       int input_batch_stride,
       int output_batch_stride,
       GetUpdateVecSizeFn get_update_vec_size,
-      int input_inner_size = 1,
-      int input_inner_stride = 0,
-      int output_inner_size = 1,
-      int output_inner_stride = 0)
+      int input_inner0_size = 1,
+      int input_inner0_stride = 0,
+      int output_inner0_size = 1,
+      int output_inner0_stride = 0,
+      int input_inner1_size = 1,
+      int input_inner1_stride = 0,
+      int output_inner1_size = 1,
+      int output_inner1_stride = 0)
       : NormConfig(
             Batch,
             Plane,
@@ -163,10 +175,14 @@ class NormConfig {
             element_size_bytes,
             input_batch_stride,
             output_batch_stride,
-            input_inner_size,
-            input_inner_stride,
-            output_inner_size,
-            output_inner_stride) {
+            input_inner0_size,
+            input_inner0_stride,
+            output_inner0_size,
+            output_inner0_stride,
+            input_inner1_size,
+            input_inner1_stride,
+            output_inner1_size,
+            output_inner1_stride) {
     workgroup_num = Batch;
     workgroup_num_foreach = 1;
     WGPlane = Plane;
@@ -189,15 +205,23 @@ class NormConfig {
 
   int input_batch_stride;
   int output_batch_stride;
-  // Inner-stride support for non-flattenable 3D tensors.  For a tensor viewed
-  // as (outer, inner, plane), the flattened row index r is split as
-  // (r / inner_size) for the outer index and (r % inner_size) for the inner
-  // index.  For 2D or flattenable 3D tensors, inner_size is 1 so the inner
-  // term collapses to zero.
-  int input_inner_size;
-  int input_inner_stride;
-  int output_inner_size;
-  int output_inner_stride;
+  // Inner-stride support for non-flattenable 3D/4D tensors.  A tensor viewed
+  // as (outer, inner0, inner1, plane) has its flattened row index r split as
+  //   outer  = r / (inner0_size * inner1_size)
+  //   inner0 = (r % (inner0_size * inner1_size)) / inner1_size
+  //   inner1 = r % inner1_size
+  // For 2D, flattenable 3D, or 4D tensors whose leading dim folds away,
+  // inner1_size is 1 so the inner1 term collapses to zero (and inner0_size is
+  // 1 too when fully flattenable).  inner1 is only non-trivial for 4D tensors
+  // whose leading dim is independent of the rest (e.g. a batched QKV slice).
+  int input_inner0_size;
+  int input_inner0_stride;
+  int output_inner0_size;
+  int output_inner0_stride;
+  int input_inner1_size;
+  int input_inner1_stride;
+  int output_inner1_size;
+  int output_inner1_stride;
   int* semaphores_ptr;
   void* scratchpad_ptr;
   int sub_group_num_global;
@@ -229,7 +253,8 @@ class NormConfig {
 
   int get_stride_aligned_vec_size(int vec_size) const {
     while (vec_size > 1 && (input_batch_stride % vec_size != 0 || output_batch_stride % vec_size != 0 ||
-                            input_inner_stride % vec_size != 0 || output_inner_stride % vec_size != 0)) {
+                            input_inner0_stride % vec_size != 0 || output_inner0_stride % vec_size != 0 ||
+                            input_inner1_stride % vec_size != 0 || output_inner1_stride % vec_size != 0)) {
       vec_size = vec_size >> 1;
     }
     return vec_size;

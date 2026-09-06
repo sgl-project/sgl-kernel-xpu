@@ -97,9 +97,12 @@ function(get_device_ip_version VARIABLE_NAME)
     endif()
     message(WARNING "Failed to compile or run the get_device_ip_version C++ program.")
     set(BUILD_TARGET_DEVICE $ENV{BUILD_TARGET_DEVICE})
-    # no default device
     if(NOT BUILD_TARGET_DEVICE)
-      message(FATAL_ERROR "BUILD_TARGET_DEVICE environment variable is not set")
+      set(BUILD_TARGET_DEVICE "bmg")
+      message(WARNING
+        "Device auto-detection failed and BUILD_TARGET_DEVICE is not set; "
+        "falling back to '${BUILD_TARGET_DEVICE}'. Override with "
+        "-DDPCPP_SYCL_TARGET=<bmg|cri|...> or BUILD_TARGET_DEVICE=<...>.")
     endif()
     string(TOLOWER "${BUILD_TARGET_DEVICE}" BUILD_TARGET_DEVICE)
     set(${VARIABLE_NAME} ${BUILD_TARGET_DEVICE} PARENT_SCOPE)

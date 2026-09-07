@@ -10,7 +10,7 @@
 //   2) Invert the four 16x16 diagonal blocks directly against global
 //      memory, using a forward-substitution/register-broadcast algorithm.
 //   3) Subgroup 0 computes all off-diagonal blocks sequentially with
-//      subgroup-scoped GEMM barriers.
+//      intermediate dependencies in registers and no barriers.
 
 #include "chunk_gated_delta_rule_kernels_xe20.hpp"
 
@@ -191,9 +191,11 @@ CUTE_DEVICE void chunk_compute_A_inverse_fused_kernel(
   item.barrier(sycl::access::fence_space::global_and_local);
 
   // ---------------------------------------------------------------------
-  // Phase 3: subgroup 0 computes the off-diagonal blocks sequentially.
-  // Subgroup-scoped barriers allow the other subgroups to leave the
-  // workgroup-barrier sequence after completing their diagonal blocks.
+  // Phase 3: subgroup 0 computes the off-diagonal blocks sequentially,
+  // keeping each dependency chain's intermediate results resident in
+  // registers. Only subgroup 0 enters this scope, so the other three
+  // subgroups leave the workgroup-barrier sequence once their diagonal
+  // block (Phase 2) is done, without deadlocking the workgroup.
   // ---------------------------------------------------------------------
   if (sg_id == 0) {
     int local_id = sg_local_id;
@@ -265,59 +267,92 @@ CUTE_DEVICE void chunk_compute_A_inverse_fused_kernel(
     Tensor gB = local_tile(cB, select<1, 2>(wg_tile), make_coord(0, _));
     Tensor gC = local_tile(cC, wg_tile, make_coord(0, 0, 0), Step<_1, _1, X>{});
     auto tCrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
-    auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
     auto tCrC = thr_mma.partition_sg_fragment_C(gC);
 
+    // Every off-diagonal GEMM below has exactly one K-tile (K=16, matching
+    // TiledMMAInverse's own K), so the GEMM helpers' mainloop barrier --
+    // whose only purpose is keeping subgroups aligned across successive
+    // K-tile iterations -- is a provable no-op here and is skipped
+    // entirely (gemm_T*S's `NoBarrier` template argument).
+    auto phase3_gemm_tts = [&](auto const& lhs, auto const& rhs, auto& accum) {
+      gemm_TTS<ScopeSubgroup, true>(lhs, rhs, accum, 0, 0, mma);
+    };
+    auto phase3_gemm_sts = [&](auto const& lhs_reg, auto const& rhs, auto& accum) {
+      gemm_STS<ScopeSubgroup, true>(lhs_reg, rhs, accum, 0, 0, mma);
+    };
+    // `gemm_TSS` reads its A operand from global memory (a diagonal
+    // inverse) and its B operand from an already-computed register
+    // fragment (an off-diagonal inverse kept resident via make_transposed_b_fragment).
+    auto phase3_gemm_tss = [&](auto const& lhs, auto const& rhs_reg, auto& accum) {
+      gemm_TSS<ScopeSubgroup, true>(lhs, rhs_reg, accum, 0, 0, mma);
+    };
+
+    // Column 1: inv21 -> inv31 -> inv41. Each finished (or partial) result
+    // is reordered directly into a register B fragment and fed to the next
+    // GEMM via phase3_gemm_tss, instead of round-tripping through global
+    // memory and a transposed reload.
     auto copy_D_21 = get_block_2d_copy_D<void>(mma, A_21_tensor);
     auto thr_copy_D_21 = copy_D_21.get_slice(local_id);
     auto tCrD_21 = thr_copy_D_21.partition_sg_fragment_S(gC);
     auto tCgD_21 = thr_copy_D_21.partition_D(gC);
+    auto inv21_b = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
     clear(tCrC);
-    gemm_TTS<ScopeSubgroup>(A_22_tensor, A_21_tensor_T, tCrC, 0, 0, mma);
+    phase3_gemm_tts(A_22_tensor, A_21_tensor_T, tCrC);
     reorder(tCrC, tCrA);
     clear(tCrC);
-    gemm_STS<ScopeSubgroup>(tCrA, A_11_tensor_T, tCrC, 0, 0, mma);
+    phase3_gemm_sts(tCrA, A_11_tensor_T, tCrC);
     CUTE_UNROLL
     for (int i = 0; i < tCrC.size(); ++i) {
       tCrC(i) *= -1.0f;
     }
     reorder(tCrC, tCrD_21);
     copy(copy_D_21, tCrD_21, tCgD_21);
-    sycl::group_barrier(sg, sycl::memory_scope::device);
+    {
+      auto inv21_b_view = make_transposed_b_fragment(mma, inv21_b);
+      reorder(tCrC, inv21_b_view);
+    }
 
     auto copy_D_31 = get_block_2d_copy_D<void>(mma, A_31_tensor);
     auto thr_copy_D_31 = copy_D_31.get_slice(local_id);
     auto tCrD_31 = thr_copy_D_31.partition_sg_fragment_S(gC);
     auto tCgD_31 = thr_copy_D_31.partition_D(gC);
+    auto inv31_b = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
     clear(tCrC);
-    gemm_TTS<ScopeSubgroup>(A_31_tensor, A_11_tensor_T, tCrC, 0, 0, mma);
-    gemm_TTS<ScopeSubgroup>(A_32_tensor, A_21_tensor_T, tCrC, 0, 0, mma);
-    reorder(tCrC, tCrD_31);
-    copy(copy_D_31, tCrD_31, tCgD_31);
-    sycl::group_barrier(sg, sycl::memory_scope::device);
-    clear(tCrC);
-    gemm_TTS<ScopeSubgroup>(A_33_tensor, A_31_tensor_T, tCrC, 0, 0, mma);
+    phase3_gemm_tts(A_31_tensor, A_11_tensor_T, tCrC);
+    phase3_gemm_tss(A_32_tensor, inv21_b, tCrC);
+    {
+      auto partial31_b = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
+      auto partial31_b_view = make_transposed_b_fragment(mma, partial31_b);
+      reorder(tCrC, partial31_b_view);
+      clear(tCrC);
+      phase3_gemm_tss(A_33_tensor, partial31_b, tCrC);
+    }
     CUTE_UNROLL
     for (int i = 0; i < tCrC.size(); ++i) {
       tCrC(i) *= -1.0f;
     }
     reorder(tCrC, tCrD_31);
     copy(copy_D_31, tCrD_31, tCgD_31);
-    sycl::group_barrier(sg, sycl::memory_scope::device);
+    {
+      auto inv31_b_view = make_transposed_b_fragment(mma, inv31_b);
+      reorder(tCrC, inv31_b_view);
+    }
 
     auto copy_D_41 = get_block_2d_copy_D<void>(mma, A_41_tensor);
     auto thr_copy_D_41 = copy_D_41.get_slice(local_id);
     auto tCrD_41 = thr_copy_D_41.partition_sg_fragment_S(gC);
     auto tCgD_41 = thr_copy_D_41.partition_D(gC);
     clear(tCrC);
-    gemm_TTS<ScopeSubgroup>(A_41_tensor, A_11_tensor_T, tCrC, 0, 0, mma);
-    gemm_TTS<ScopeSubgroup>(A_42_tensor, A_21_tensor_T, tCrC, 0, 0, mma);
-    gemm_TTS<ScopeSubgroup>(A_43_tensor, A_31_tensor_T, tCrC, 0, 0, mma);
-    reorder(tCrC, tCrD_41);
-    copy(copy_D_41, tCrD_41, tCgD_41);
-    sycl::group_barrier(sg, sycl::memory_scope::device);
-    clear(tCrC);
-    gemm_TTS<ScopeSubgroup>(A_44_tensor, A_41_tensor_T, tCrC, 0, 0, mma);
+    phase3_gemm_tts(A_41_tensor, A_11_tensor_T, tCrC);
+    phase3_gemm_tss(A_42_tensor, inv21_b, tCrC);
+    phase3_gemm_tss(A_43_tensor, inv31_b, tCrC);
+    {
+      auto partial41_b = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
+      auto partial41_b_view = make_transposed_b_fragment(mma, partial41_b);
+      reorder(tCrC, partial41_b_view);
+      clear(tCrC);
+      phase3_gemm_tss(A_44_tensor, partial41_b, tCrC);
+    }
     CUTE_UNROLL
     for (int i = 0; i < tCrC.size(); ++i) {
       tCrC(i) *= -1.0f;
@@ -325,35 +360,42 @@ CUTE_DEVICE void chunk_compute_A_inverse_fused_kernel(
     reorder(tCrC, tCrD_41);
     copy(copy_D_41, tCrD_41, tCgD_41);
 
+    // Column 2: inv32 -> inv42. Same register-resident pattern as column 1.
     auto copy_D_32 = get_block_2d_copy_D<void>(mma, A_32_tensor);
     auto thr_copy_D_32 = copy_D_32.get_slice(local_id);
     auto tCrD_32 = thr_copy_D_32.partition_sg_fragment_S(gC);
     auto tCgD_32 = thr_copy_D_32.partition_D(gC);
+    auto inv32_b = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
     clear(tCrC);
-    gemm_TTS<ScopeSubgroup>(A_33_tensor, A_32_tensor_T, tCrC, 0, 0, mma);
+    phase3_gemm_tts(A_33_tensor, A_32_tensor_T, tCrC);
     reorder(tCrC, tCrA);
     clear(tCrC);
-    gemm_STS<ScopeSubgroup>(tCrA, A_22_tensor_T, tCrC, 0, 0, mma);
+    phase3_gemm_sts(tCrA, A_22_tensor_T, tCrC);
     CUTE_UNROLL
     for (int i = 0; i < tCrC.size(); ++i) {
       tCrC(i) *= -1.0f;
     }
     reorder(tCrC, tCrD_32);
     copy(copy_D_32, tCrD_32, tCgD_32);
-    sycl::group_barrier(sg, sycl::memory_scope::device);
+    {
+      auto inv32_b_view = make_transposed_b_fragment(mma, inv32_b);
+      reorder(tCrC, inv32_b_view);
+    }
 
     auto copy_D_42 = get_block_2d_copy_D<void>(mma, A_42_tensor);
     auto thr_copy_D_42 = copy_D_42.get_slice(local_id);
     auto tCrD_42 = thr_copy_D_42.partition_sg_fragment_S(gC);
     auto tCgD_42 = thr_copy_D_42.partition_D(gC);
     clear(tCrC);
-    gemm_TTS<ScopeSubgroup>(A_42_tensor, A_22_tensor_T, tCrC, 0, 0, mma);
-    gemm_TTS<ScopeSubgroup>(A_43_tensor, A_32_tensor_T, tCrC, 0, 0, mma);
-    reorder(tCrC, tCrD_42);
-    copy(copy_D_42, tCrD_42, tCgD_42);
-    sycl::group_barrier(sg, sycl::memory_scope::device);
-    clear(tCrC);
-    gemm_TTS<ScopeSubgroup>(A_44_tensor, A_42_tensor_T, tCrC, 0, 0, mma);
+    phase3_gemm_tts(A_42_tensor, A_22_tensor_T, tCrC);
+    phase3_gemm_tss(A_43_tensor, inv32_b, tCrC);
+    {
+      auto partial42_b = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
+      auto partial42_b_view = make_transposed_b_fragment(mma, partial42_b);
+      reorder(tCrC, partial42_b_view);
+      clear(tCrC);
+      phase3_gemm_tss(A_44_tensor, partial42_b, tCrC);
+    }
     CUTE_UNROLL
     for (int i = 0; i < tCrC.size(); ++i) {
       tCrC(i) *= -1.0f;
@@ -361,15 +403,16 @@ CUTE_DEVICE void chunk_compute_A_inverse_fused_kernel(
     reorder(tCrC, tCrD_42);
     copy(copy_D_42, tCrD_42, tCgD_42);
 
+    // Column 3: inv43. No downstream chain, so nothing to keep resident.
     auto copy_D_43 = get_block_2d_copy_D<void>(mma, A_43_tensor);
     auto thr_copy_D_43 = copy_D_43.get_slice(local_id);
     auto tCrD_43 = thr_copy_D_43.partition_sg_fragment_S(gC);
     auto tCgD_43 = thr_copy_D_43.partition_D(gC);
     clear(tCrC);
-    gemm_TTS<ScopeSubgroup>(A_44_tensor, A_43_tensor_T, tCrC, 0, 0, mma);
+    phase3_gemm_tts(A_44_tensor, A_43_tensor_T, tCrC);
     reorder(tCrC, tCrA);
     clear(tCrC);
-    gemm_STS<ScopeSubgroup>(tCrA, A_33_tensor_T, tCrC, 0, 0, mma);
+    phase3_gemm_sts(tCrA, A_33_tensor_T, tCrC);
     CUTE_UNROLL
     for (int i = 0; i < tCrC.size(); ++i) {
       tCrC(i) *= -1.0f;

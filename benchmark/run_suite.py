@@ -77,6 +77,7 @@ suites = {
             tee_log="mla_sparse_fwd.log",
             estimated_time=20,
         ),
+        BenchFile("bench_minimax_decode_topk.py", tee_log="minimax_decode_topk.log"),
         # --- MoE ---
         BenchFile("bench_moe_topk_sigmoid.py", tee_log="moe_topk_sigmoid.log"),
         BenchFile("bench_moe_topk_softmax.py", tee_log="moe.log"),

@@ -145,6 +145,7 @@ NIGHTLY_BENCHMARKS: List[Entry] = [
     Entry("bench_jit_activation.py", tee_log="bench_jit_activation.py.log"),
     Entry("bench_hc_post.py", tee_log="bench_hc_post.py.log"),
     Entry("bench_sgemm_lora_a_fwd.py", tee_log="bench_sgemm_lora_a_fwd.py.log"),
+    Entry("bench_minimax_decode_topk.py", tee_log="bench_minimax_decode_topk.py.log"),
 ]
 
 

@@ -31,36 +31,85 @@ static inline Tensor flatten_to_2d(const Tensor& t, int64_t M, int64_t N) {
 }
 
 // Describes how a flattened row index (0 .. M-1) maps to a byte offset on a
-// 2D or 3D tensor without requiring a contiguous copy.  For 2D and
-// flattenable 3D tensors, (inner_size == 1, inner_stride == 0) reduces the
-// kernel's per-row offset formula
+// 2D/3D/4D tensor without requiring a contiguous copy.  A row is decomposed
+// into up to 3 nested indices (outer, inner0, inner1), from outermost to
+// innermost:
 //
-//   offset(r) = (r / inner_size) * batch_stride + (r % inner_size) * inner_stride
+//   outer  = r / (inner0_size * inner1_size)
+//   inner0 = (r % (inner0_size * inner1_size)) / inner1_size
+//   inner1 = r % inner1_size
+//   offset(r) = outer * batch_stride + inner0 * inner0_stride + inner1 * inner1_stride
 //
-// to the existing behaviour `offset(r) = r * batch_stride`.  For
-// non-flattenable 3D tensors (e.g. a per-head slice of a packed QKV buffer
-// reshaped to (tokens, heads, head_dim)) we fall back to the general formula
-// by setting inner_size = size(1) and inner_stride = stride(1).
+// For 2D and flattenable 3D tensors, inner0_size == inner1_size == 1 so the
+// formula collapses to `offset(r) = r * batch_stride`.  For non-flattenable
+// 3D tensors (e.g. a per-head slice of a packed QKV buffer reshaped to
+// (tokens, heads, head_dim)) inner0_size/inner0_stride describe the second
+// dim, with inner1_size == 1.  4D tensors additionally use inner1 when the
+// leading dim (dim 0) is independent of dim 1 (e.g. a batched QKV slice),
+// otherwise dim 0 folds away and only the 2-level form is needed.
 struct RowStrides {
   int64_t batch_stride;
-  int64_t inner_size;
-  int64_t inner_stride;
+  int64_t inner0_size;
+  int64_t inner0_stride;
+  int64_t inner1_size;
+  int64_t inner1_stride;
 };
 
 static inline RowStrides get_row_strides(const Tensor& t) {
-  TORCH_CHECK(t.dim() == 2 || t.dim() == 3, "get_row_strides: expected a 2D or 3D tensor, got ", t.dim(), "D");
+  TORCH_CHECK(
+      t.dim() == 2 || t.dim() == 3 || t.dim() == 4, "get_row_strides: expected a 2D/3D/4D tensor, got ", t.dim(), "D");
   if (t.dim() == 2) {
-    return {t.stride(0), 1, 0};
+    return {t.stride(0), 1, 0, 1, 0};
   }
-  // 3D
-  int64_t outer_stride = t.stride(0);
-  int64_t inner_size = t.size(1);
-  int64_t inner_stride = t.stride(1);
-  if (t.size(0) == 1 || outer_stride == inner_size * inner_stride) {
-    // Flattenable: a single stride describes all rows.
-    return {inner_stride, 1, 0};
+
+  // dim0/dim1 always participate in both the 3D and 4D shapes, so the fold
+  // check between them is shared; dim2 only exists for 4D.
+  int64_t d0_size = t.size(0);
+  int64_t d0_stride = t.stride(0);
+  int64_t d1_size = t.size(1);
+  int64_t d1_stride = t.stride(1);
+  bool d0_folds_into_d1 = (d0_size == 1) || (d0_stride == d1_size * d1_stride);
+
+  if (t.dim() == 3) {
+    if (d0_folds_into_d1) {
+      return {d1_stride, 1, 0, 1, 0};
+    }
+    return {d0_stride, d1_size, d1_stride, 1, 0};
   }
-  return {outer_stride, inner_size, inner_stride};
+
+  // t.dim() == 4: shape (d0, d1, d2, plane); row = d0*d1*d2.
+  int64_t d2_size = t.size(2);
+  int64_t d2_stride = t.stride(2);
+  bool d1_folds_into_d2 = (d1_size == 1) || (d1_stride == d2_size * d2_stride);
+
+  if (d0_folds_into_d1 && d1_folds_into_d2) {
+    // Everything collapses into a single stride.
+    return {d2_stride, 1, 0, 1, 0};
+  }
+  if (d0_folds_into_d1) {
+    // dim0 contributes nothing; (d1, d2) alone need the 2-level form.
+    return {d1_stride, d2_size, d2_stride, 1, 0};
+  }
+  // Fully independent: need the full 3-level (d0, d1, d2) decomposition.
+  return {d0_stride, d1_size, d1_stride, d2_size, d2_stride};
+}
+
+// Shared 3-level row-offset computation used by every kernel site below; see
+// the RowStrides comment for the (outer, inner0, inner1) decomposition.
+template <typename index_t>
+static inline index_t compute_row_offset(
+    index_t row,
+    index_t batch_stride,
+    index_t inner0_size,
+    index_t inner0_stride,
+    index_t inner1_size,
+    index_t inner1_stride) {
+  index_t combined_inner = inner0_size * inner1_size;
+  index_t outer_idx = row / combined_inner;
+  index_t rem = row % combined_inner;
+  index_t inner0_idx = rem / inner1_size;
+  index_t inner1_idx = rem % inner1_size;
+  return outer_idx * batch_stride + inner0_idx * inner0_stride + inner1_idx * inner1_stride;
 }
 
 template <typename scalar_t, typename weight_t, typename mean_t = float>
@@ -80,8 +129,13 @@ class RMSNormForward : public NormForward<scalar_t, weight_t, true> {
     auto group_id = item_id.get_group(0);
     auto group_id_foreach = item_id.get_group(1);
     auto local_id = item_id.get_local_id(2);
-    index_t group_offset = (group_id / cfg.input_inner_size) * cfg.input_batch_stride +
-                           (group_id % cfg.input_inner_size) * cfg.input_inner_stride;
+    index_t group_offset = compute_row_offset<index_t>(
+        group_id,
+        cfg.input_batch_stride,
+        cfg.input_inner0_size,
+        cfg.input_inner0_stride,
+        cfg.input_inner1_size,
+        cfg.input_inner1_stride);
 
     for (index_t j = local_id * vec_size; j < cfg.WGPlane; j += cfg.workgroup_size * vec_size) {
       index_t plane_offset = group_id_foreach * cfg.WGPlane + j;
@@ -108,10 +162,20 @@ class RMSNormForward : public NormForward<scalar_t, weight_t, true> {
     auto group_id_foreach = item_id.get_group(1);
     auto local_id = item_id.get_local_id(2);
 
-    index_t x_group_offset = (group_id / cfg.input_inner_size) * cfg.input_batch_stride +
-                             (group_id % cfg.input_inner_size) * cfg.input_inner_stride;
-    index_t y_group_offset = (group_id / cfg.output_inner_size) * cfg.output_batch_stride +
-                             (group_id % cfg.output_inner_size) * cfg.output_inner_stride;
+    index_t x_group_offset = compute_row_offset<index_t>(
+        group_id,
+        cfg.input_batch_stride,
+        cfg.input_inner0_size,
+        cfg.input_inner0_stride,
+        cfg.input_inner1_size,
+        cfg.input_inner1_stride);
+    index_t y_group_offset = compute_row_offset<index_t>(
+        group_id,
+        cfg.output_batch_stride,
+        cfg.output_inner0_size,
+        cfg.output_inner0_stride,
+        cfg.output_inner1_size,
+        cfg.output_inner1_stride);
     if (cfg.workgroup_num_foreach == 1) {
       if (local_id == 0) {
         reduce_project(item_id, sum_value, sum_tmp, cfg);
@@ -161,8 +225,13 @@ class AddRMSNormForward : public RMSNormForward<scalar_t, weight_t> {
     auto group_id = item_id.get_group(0);
     auto group_id_foreach = item_id.get_group(1);
     auto local_id = item_id.get_local_id(2);
-    index_t group_offset = (group_id / cfg.input_inner_size) * cfg.input_batch_stride +
-                           (group_id % cfg.input_inner_size) * cfg.input_inner_stride;
+    index_t group_offset = compute_row_offset<index_t>(
+        group_id,
+        cfg.input_batch_stride,
+        cfg.input_inner0_size,
+        cfg.input_inner0_stride,
+        cfg.input_inner1_size,
+        cfg.input_inner1_stride);
 
     for (index_t j = local_id * vec_size; j < cfg.WGPlane; j += cfg.workgroup_size * vec_size) {
       index_t plane_offset = group_id_foreach * cfg.WGPlane + j;
@@ -576,10 +645,20 @@ struct RMSNormNoRstdKernelFunctor {
 
   [[sycl::reqd_sub_group_size(NUM_REDUCE_STAGES)]] void operator()(sycl::nd_item<1> item_id) const {
     const index_t row = item_id.get_group(0);
-    const index_t x_group_offset =
-        (row / cfg.input_inner_size) * cfg.input_batch_stride + (row % cfg.input_inner_size) * cfg.input_inner_stride;
-    const index_t y_group_offset = (row / cfg.output_inner_size) * cfg.output_batch_stride +
-                                   (row % cfg.output_inner_size) * cfg.output_inner_stride;
+    const index_t x_group_offset = compute_row_offset<index_t>(
+        row,
+        cfg.input_batch_stride,
+        cfg.input_inner0_size,
+        cfg.input_inner0_stride,
+        cfg.input_inner1_size,
+        cfg.input_inner1_stride);
+    const index_t y_group_offset = compute_row_offset<index_t>(
+        row,
+        cfg.output_batch_stride,
+        cfg.output_inner0_size,
+        cfg.output_inner0_stride,
+        cfg.output_inner1_size,
+        cfg.output_inner1_stride);
 
     accscalar_t sum_value = 0;
     vec_t reg[cache_inputs ? ITERS : 1];
@@ -677,10 +756,14 @@ void RMSNormKernelImplInternal(
     Tensor& rstd,
     int64_t input_batch_stride,
     int64_t output_batch_stride,
-    int64_t input_inner_size,
-    int64_t input_inner_stride,
-    int64_t output_inner_size,
-    int64_t output_inner_stride) {
+    int64_t input_inner0_size,
+    int64_t input_inner0_stride,
+    int64_t output_inner0_size,
+    int64_t output_inner0_stride,
+    int64_t input_inner1_size,
+    int64_t input_inner1_stride,
+    int64_t output_inner1_size,
+    int64_t output_inner1_stride) {
   scalar_t* X_data = X.data_ptr<scalar_t>();
   scalar_t* Y_data = Y.data_ptr<scalar_t>();
   mean_t* var_data = rstd.data_ptr<mean_t>();
@@ -693,10 +776,14 @@ void RMSNormKernelImplInternal(
       sizeof(scalar_t),
       input_batch_stride,
       output_batch_stride,
-      input_inner_size,
-      input_inner_stride,
-      output_inner_size,
-      output_inner_stride);
+      input_inner0_size,
+      input_inner0_stride,
+      output_inner0_size,
+      output_inner0_stride,
+      input_inner1_size,
+      input_inner1_stride,
+      output_inner1_size,
+      output_inner1_stride);
   RMSNormForward<scalar_t, weight_t> rms_norm_forward(X_data, Y_data, var_data, gemma_data, eps, M, N);
   config.workgroup_num_foreach = 1;
   config.WGPlane = config.Plane;
@@ -737,10 +824,14 @@ void GemmaRMSNormKernelImplInternal(
     Tensor& Y,
     int64_t input_batch_stride,
     int64_t output_batch_stride,
-    int64_t input_inner_size,
-    int64_t input_inner_stride,
-    int64_t output_inner_size,
-    int64_t output_inner_stride) {
+    int64_t input_inner0_size,
+    int64_t input_inner0_stride,
+    int64_t output_inner0_size,
+    int64_t output_inner0_stride,
+    int64_t input_inner1_size,
+    int64_t input_inner1_stride,
+    int64_t output_inner1_size,
+    int64_t output_inner1_stride) {
   scalar_t* X_data = X.data_ptr<scalar_t>();
   scalar_t* Y_data = Y.data_ptr<scalar_t>();
   weight_t* gemma_data = gemma.data_ptr<weight_t>();
@@ -756,10 +847,14 @@ void GemmaRMSNormKernelImplInternal(
       [&](int plane, int max_vec_size) {
         return gemma_rms_norm_no_rstd_forward.get_update_vec_size(plane, max_vec_size);
       },
-      input_inner_size,
-      input_inner_stride,
-      output_inner_size,
-      output_inner_stride);
+      input_inner0_size,
+      input_inner0_stride,
+      output_inner0_size,
+      output_inner0_stride,
+      input_inner1_size,
+      input_inner1_stride,
+      output_inner1_size,
+      output_inner1_stride);
   launch_vectorized_rmsnorm_no_rstd_kernel<scalar_t, weight_t>(gemma_rms_norm_no_rstd_forward, config);
 }
 
@@ -816,10 +911,14 @@ SGL_KERNEL_EXPORT void rmsnorm(torch::Tensor& output, torch::Tensor& input, torc
                   rstd,
                   in_strides.batch_stride,
                   out_strides.batch_stride,
-                  in_strides.inner_size,
-                  in_strides.inner_stride,
-                  out_strides.inner_size,
-                  out_strides.inner_stride);
+                  in_strides.inner0_size,
+                  in_strides.inner0_stride,
+                  out_strides.inner0_size,
+                  out_strides.inner0_stride,
+                  in_strides.inner1_size,
+                  in_strides.inner1_stride,
+                  out_strides.inner1_size,
+                  out_strides.inner1_stride);
             });
       });
 }
@@ -869,10 +968,14 @@ SGL_KERNEL_EXPORT void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input
                   output,
                   in_strides.batch_stride,
                   out_strides.batch_stride,
-                  in_strides.inner_size,
-                  in_strides.inner_stride,
-                  out_strides.inner_size,
-                  out_strides.inner_stride);
+                  in_strides.inner0_size,
+                  in_strides.inner0_stride,
+                  out_strides.inner0_size,
+                  out_strides.inner0_stride,
+                  in_strides.inner1_size,
+                  in_strides.inner1_stride,
+                  out_strides.inner1_size,
+                  out_strides.inner1_stride);
             });
       });
 }

@@ -254,7 +254,10 @@ def test_fused_add_rmsnorm_3d(batch_size, seq_len, hidden_size, dtype):
 
 @pytest.mark.parametrize("batch_size", [1, 4, 19])
 @pytest.mark.parametrize("seq_len", [1, 7, 32])
-@pytest.mark.parametrize("hidden_size", [111, 1024, 4096])
+# hidden_size=1 exercises the "other dim == 1" shape (excluding the leading
+# batch dim) that bypasses the flattenable fast-path check but still yields
+# a correct result.
+@pytest.mark.parametrize("hidden_size", [1, 111, 1024, 4096])
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("specify_out", [True, False])
 def test_gemma_norm_3d(batch_size, seq_len, hidden_size, dtype, specify_out):
@@ -438,6 +441,171 @@ def test_gemma_norm_3d_non_flattenable(
         y = sgl_kernel.gemma_rmsnorm(x, w)
 
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
+###############################################################################
+# 4D tensor tests for gemma_rmsnorm
+###############################################################################
+
+
+def _make_non_flattenable_4d(
+    batch_size,
+    num_tokens,
+    num_heads,
+    head_dim,
+    dtype,
+    break_d0_d1,
+    extra_tokens=3,
+    extra_heads=4,
+):
+    """Build a 4D tensor [batch, tokens, heads, head_dim] that is not flattenable:
+
+      break_d0_d1=False  -> dim0 can be flattened
+      break_d0_d1=True  -> fully independent; needs the full 3-level form
+
+    break_d0_d1 allocates extra token rows and slices down to num_tokens, so
+    stride(0) != size(1)*stride(1) (requires batch_size > 1, since dim0 of
+    size 1 always folds regardless of stride).
+    """
+    if break_d0_d1:
+        assert batch_size > 1, "batch_size must be > 1 to exercise an independent dim0"
+        tokens_alloc = num_tokens + extra_tokens
+    else:
+        tokens_alloc = num_tokens
+
+    full = torch.randn(
+        batch_size,
+        tokens_alloc,
+        (num_heads + extra_heads) * head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    x = full[:, :num_tokens, : num_heads * head_dim].unflatten(
+        -1, (num_heads, head_dim)
+    )
+
+    if break_d0_d1:
+        assert x.stride(0) != x.size(1) * x.stride(1)
+    else:
+        assert x.stride(0) == x.size(1) * x.stride(1)
+
+    return x
+
+
+@pytest.mark.parametrize("batch_size", [1, 3])
+@pytest.mark.parametrize("num_tokens", [1, 7])
+# num_heads=1 and head_dim=1 exercise the "other dim == 1" shapes (excluding
+# the leading batch/token dims) that bypass the flattenable fast-path check
+# but still yield a correct result.
+@pytest.mark.parametrize("num_heads", [1, 4, 8])
+@pytest.mark.parametrize("head_dim", [1, 64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("specify_out", [True, False])
+def test_gemma_norm_4d(batch_size, num_tokens, num_heads, head_dim, dtype, specify_out):
+    x = torch.randn(
+        batch_size, num_tokens, num_heads, head_dim, device=device, dtype=dtype
+    )
+    w = torch.randn(head_dim, device=device, dtype=dtype)
+
+    y_ref = gemma_rms_norm(x, w)
+    if specify_out:
+        y = torch.empty_like(x)
+        sgl_kernel.gemma_rmsnorm(x, w, out=y)
+    else:
+        y = sgl_kernel.gemma_rmsnorm(x, w)
+
+    torch.testing.assert_close(y_ref, y, **norm_tolerances(dtype))
+
+
+###############################################################################
+# Non-contiguous 4D tensor tests (sliced last-dim, flattenable leading dims)
+###############################################################################
+
+
+def _make_non_contiguous_4d(
+    batch_size, num_tokens, num_heads, head_dim, dtype, extra=64
+):
+    """Create a last-dim-non-contiguous 4D tensor [batch_size, tokens, heads, head_dim]
+    by slicing a larger tensor along the last dimension."""
+    full = torch.randn(
+        batch_size, num_tokens, num_heads, head_dim + extra, device=device, dtype=dtype
+    )
+    view = full[..., :head_dim]
+    assert view.stride(-1) == 1
+    assert view.stride(-2) == head_dim + extra
+    return view
+
+
+@pytest.mark.parametrize("batch_size", [1, 3])
+@pytest.mark.parametrize("num_tokens", [1, 7])
+@pytest.mark.parametrize("num_heads", [4, 8])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_gemma_norm_4d_non_contiguous(
+    batch_size, num_tokens, num_heads, head_dim, dtype
+):
+    x_nc = _make_non_contiguous_4d(batch_size, num_tokens, num_heads, head_dim, dtype)
+    w = torch.randn(head_dim, device=device, dtype=dtype)
+
+    y_ref = gemma_rms_norm(x_nc.clone(), w)
+    y = sgl_kernel.gemma_rmsnorm(x_nc, w)
+
+    torch.testing.assert_close(y_ref, y, **norm_tolerances(dtype))
+
+
+def test_gemma_norm_4d_non_flattenable_unaligned_row_strides():
+    full = torch.randn(1, 7, 8, 130, device=device, dtype=torch.float16)
+    x = full[:, :, :4, :128]
+    w = torch.randn(x.size(-1), device=device, dtype=x.dtype)
+
+    assert x.stride(-3) != x.size(-2) * x.stride(-2)
+    assert x.size(-1) % 8 == 0
+    assert x.stride(-2) % 8 != 0
+
+    y = torch.empty_strided(x.shape, x.stride(), device=device, dtype=x.dtype)
+    y_ref = gemma_rms_norm(x.clone(), w)
+    sgl_kernel.gemma_rmsnorm(x, w, out=y)
+
+    torch.testing.assert_close(y_ref, y, **norm_tolerances(x.dtype))
+
+
+@pytest.mark.parametrize("break_d0_d1", [False, True])
+@pytest.mark.parametrize("batch_size", [1, 3])
+@pytest.mark.parametrize("num_tokens", [7, 32])
+@pytest.mark.parametrize("num_heads", [4, 8])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("specify_out", [True, False])
+def test_gemma_norm_4d_non_flattenable(
+    break_d0_d1,
+    batch_size,
+    num_tokens,
+    num_heads,
+    head_dim,
+    dtype,
+    specify_out,
+):
+    if break_d0_d1 and batch_size == 1:
+        pytest.skip("break_d0_d1 requires batch_size > 1")
+
+    x = _make_non_flattenable_4d(
+        batch_size,
+        num_tokens,
+        num_heads,
+        head_dim,
+        dtype,
+        break_d0_d1=break_d0_d1,
+    )
+    w = torch.randn(head_dim, device=device, dtype=dtype)
+
+    y_ref = gemma_rms_norm(x.clone(), w)
+    if specify_out:
+        y = torch.empty_strided(x.shape, x.stride(), device=device, dtype=x.dtype)
+        sgl_kernel.gemma_rmsnorm(x, w, out=y)
+    else:
+        y = sgl_kernel.gemma_rmsnorm(x, w)
+
+    torch.testing.assert_close(y_ref, y, **norm_tolerances(dtype))
 
 
 ###############################################################################

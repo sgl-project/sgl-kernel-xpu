@@ -1,11 +1,17 @@
-# Device IP version detection via Level Zero API.
+# Target-device detection via Level Zero API.
 #
 # Provides:
 #   get_device_ip_version(<variable>)
 #     Compiles and runs a small Level Zero program that queries the GPU
-#     device IP version, extracts the architecture bits, and stores the
-#     result in <variable>.  Falls back to the BUILD_TARGET_DEVICE
-#     environment variable when compilation or execution fails.
+#     device IP version, extracts the architecture bits, maps them to
+#     the canonical device-name vocabulary ('bmg' | 'cri'), and stores
+#     the result in <variable>.  Falls back to the BUILD_TARGET_DEVICE
+#     environment variable (defaulting to 'bmg') when compilation or
+#     execution fails.
+#
+# The returned value is always a device name string — same vocabulary
+# as DPCPP_SYCL_TARGET, BUILD_TARGET_DEVICE and AOT_TARGETS — so callers
+# can dispatch uniformly with MATCHES/STREQUAL.
 
 function(get_device_ip_version VARIABLE_NAME)
   # Define a C++ source file to be compiled and run
@@ -87,7 +93,20 @@ function(get_device_ip_version VARIABLE_NAME)
     string(REGEX REPLACE "\n" ";" OUTPUT_LINES "${OUTPUT_STRIPPED}")
     list(GET OUTPUT_LINES -1 LAST_LINE)
     string(STRIP "${LAST_LINE}" LAST_LINE)
-    set(${VARIABLE_NAME} "${LAST_LINE}" PARENT_SCOPE)
+    # Canonicalize the numeric arch code to the device-name vocabulary
+    # used by DPCPP_SYCL_TARGET / BUILD_TARGET_DEVICE / AOT_TARGETS.
+    #   Xe2  (BMG) = 20
+    #   Xe3P (CRI) = 35
+    if(LAST_LINE STREQUAL "20")
+      set(${VARIABLE_NAME} "bmg" PARENT_SCOPE)
+    elseif(LAST_LINE STREQUAL "35")
+      set(${VARIABLE_NAME} "cri" PARENT_SCOPE)
+    else()
+      message(WARNING
+        "Unrecognized device IP arch '${LAST_LINE}'. "
+        "Set -DDPCPP_SYCL_TARGET=<bmg|cri> or BUILD_TARGET_DEVICE=<bmg|cri> to override.")
+      set(${VARIABLE_NAME} "${LAST_LINE}" PARENT_SCOPE)
+    endif()
   else()
     if(NOT COMPILE_RESULT_VAR)
         message(WARNING "Compilation failed.")

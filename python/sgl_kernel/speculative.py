@@ -38,8 +38,8 @@ def tree_speculative_sampling_target_only(
 
 
 def verify_tree_greedy(
-    predicts: torch.Tensor,  # mutable
-    accept_index: torch.Tensor,  # mutable
+    predicts: torch.Tensor,  # mutable, pre-filled with -1
+    accept_index: torch.Tensor,  # mutable, pre-filled with -1
     accept_token_num: torch.Tensor,  # mutable
     candidates: torch.Tensor,
     retrive_index: torch.Tensor,
@@ -56,7 +56,6 @@ def verify_tree_greedy(
         retrive_next_token,
         retrive_next_sibling,
         target_predict,
-        get_xpu_stream(),
     )
 
 

@@ -902,15 +902,14 @@ void tree_speculative_sampling_target_only(
     int64_t sycl_stream = 0);
 
 void verify_tree_greedy(
-    at::Tensor predicts,          // mutable
-    at::Tensor accept_index,      // mutable
+    at::Tensor predicts,          // mutable, pre-filled with -1
+    at::Tensor accept_index,      // mutable, pre-filled with -1
     at::Tensor accept_token_num,  // mutable
     at::Tensor candidates,
     at::Tensor retrive_index,
     at::Tensor retrive_next_token,
     at::Tensor retrive_next_sibling,
-    at::Tensor target_predict,
-    int64_t sycl_stream = 0);
+    at::Tensor target_predict);
 
 void build_tree_kernel_efficient(
     const at::Tensor& parent_list,

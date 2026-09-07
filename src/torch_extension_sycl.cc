@@ -91,6 +91,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor! retrive_next_sibling, int topk, int depth, int draft_token_num, int tree_mask_mode=0) -> ()");
   m.impl("build_tree_kernel_efficient", torch::kXPU, &build_tree_kernel_efficient);
 
+  m.def(
+      "verify_tree_greedy(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
+      "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, "
+      "Tensor retrive_next_sibling, Tensor target_predict) -> ()");
+  m.impl("verify_tree_greedy", torch::kXPU, &verify_tree_greedy);
+
   /*
    * Fast radix top-k (DeepSeek V3.2 indexer)
    */

@@ -339,3 +339,144 @@ def sgl_build_tree_kernel_triton(
         ),
         selected_index_stride=selected_index.stride(0),
     )
+
+
+@triton.jit
+def verify_tree_greedy_kernel_triton(
+    predicts_ptr,
+    accept_index_ptr,
+    accept_token_num_ptr,
+    candidates_ptr,
+    retrieve_index_ptr,
+    retrieve_next_token_ptr,
+    retrieve_next_sibling_ptr,
+    target_predict_ptr,
+    batch_size: tl.constexpr,
+    num_speculative_tokens: tl.constexpr,
+    num_draft_tokens: tl.constexpr,
+):
+    """
+    Triton kernel for verifying EAGLE tree in greedy mode.
+    Each program handles one batch item.
+    """
+    bx = tl.program_id(0)
+
+    # Initialize
+    last_accept_retrieve_idx = tl.load(retrieve_index_ptr + bx * num_draft_tokens)
+    tl.store(accept_index_ptr + bx * num_speculative_tokens, last_accept_retrieve_idx)
+    # Cast to match dtype of loaded tensors to avoid type inconsistency
+    num_accept_tokens = tl.cast(0, last_accept_retrieve_idx.dtype)
+    cur_index = tl.cast(0, last_accept_retrieve_idx.dtype)
+
+    # Tree traversal loop
+    should_continue = 1
+    for j in range(1, num_speculative_tokens):
+        if should_continue:  # Early exit guard
+            cur_index = tl.load(
+                retrieve_next_token_ptr + bx * num_draft_tokens + cur_index
+            )
+
+            # Load target token once per level (before sibling search)
+            # last_accept_retrieve_idx is constant during sibling traversal
+            target_row = last_accept_retrieve_idx // num_draft_tokens
+            target_col = last_accept_retrieve_idx % num_draft_tokens
+            target_token = tl.load(
+                target_predict_ptr + target_row * num_draft_tokens + target_col
+            )
+
+            # Traverse siblings
+            found_match = 0
+            for _ in range(num_draft_tokens):  # Max iterations = num_draft_tokens
+                if found_match == 0:  # Early exit guard
+                    # Check if we've reached end of sibling list
+                    is_valid = cur_index != -1
+
+                    # Use masked loads with safe address (0 when invalid)
+                    safe_cur_index = (
+                        cur_index * is_valid
+                    )  # 0 if invalid, cur_index if valid
+                    safe_index = bx * num_draft_tokens + safe_cur_index
+
+                    # Load draft token info (loads from index 0 when invalid, but we won't use it)
+                    draft_index = tl.load(retrieve_index_ptr + safe_index)
+                    draft_token = tl.load(candidates_ptr + safe_index)
+
+                    # Check for token match (only valid when is_valid is True)
+                    token_match = is_valid & (draft_token == target_token)
+
+                    # Accept token using predicated stores (only write if matched)
+                    tl.store(
+                        predicts_ptr + last_accept_retrieve_idx,
+                        target_token,
+                        mask=token_match,
+                    )
+                    next_num_accept_tokens = num_accept_tokens + 1
+                    tl.store(
+                        accept_index_ptr
+                        + bx * num_speculative_tokens
+                        + next_num_accept_tokens,
+                        draft_index,
+                        mask=token_match,
+                    )
+
+                    num_accept_tokens = num_accept_tokens + token_match
+                    last_accept_retrieve_idx = (
+                        token_match * draft_index
+                        + (~token_match) * last_accept_retrieve_idx
+                    )
+                    found_match = token_match * 1 + (~is_valid) * (-1)
+
+                    # Masked load: only load next sibling when no match (hardware predication)
+                    # When matched: returns cur_index (other); when not matched: loads sibling
+                    cur_index = tl.load(
+                        retrieve_next_sibling_ptr + safe_index,
+                        mask=~token_match
+                        & is_valid,  # Only load when valid and NOT matched
+                        other=cur_index,  # Keep cur_index when matched or invalid
+                    )
+
+            if found_match != 1:
+                should_continue = 0
+
+    # Store final results
+    tl.store(accept_token_num_ptr + bx, num_accept_tokens)
+
+    target_row = last_accept_retrieve_idx // num_draft_tokens
+    target_col = last_accept_retrieve_idx % num_draft_tokens
+    final_target = tl.load(
+        target_predict_ptr + target_row * num_draft_tokens + target_col
+    )
+    tl.store(predicts_ptr + last_accept_retrieve_idx, final_target)
+
+
+def verify_tree_greedy_triton(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    target_predict: torch.Tensor,
+):
+    """Triton-based implementation."""
+    batch_size = candidates.shape[0]
+    num_speculative_tokens = accept_index.shape[1]
+    num_draft_tokens = candidates.shape[1]
+
+    # Launch kernel with one program per batch item
+    grid = (batch_size,)
+
+    verify_tree_greedy_kernel_triton[grid](
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        target_predict,
+        batch_size=batch_size,
+        num_speculative_tokens=num_speculative_tokens,
+        num_draft_tokens=num_draft_tokens,
+    )

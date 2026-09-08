@@ -170,14 +170,14 @@ struct VerifyTreeGreedyKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 }  // namespace
 
 SGL_KERNEL_EXPORT void verify_tree_greedy(
-    at::Tensor predicts,          // mutable, pre-filled with -1
-    at::Tensor accept_index,      // mutable, pre-filled with -1
-    at::Tensor accept_token_num,  // mutable
-    at::Tensor candidates,
-    at::Tensor retrive_index,
-    at::Tensor retrive_next_token,
-    at::Tensor retrive_next_sibling,
-    at::Tensor target_predict) {
+    at::Tensor& predicts,          // mutable, pre-filled with -1
+    at::Tensor& accept_index,      // mutable, pre-filled with -1
+    at::Tensor& accept_token_num,  // mutable
+    const at::Tensor& candidates,
+    const at::Tensor& retrive_index,
+    const at::Tensor& retrive_next_token,
+    const at::Tensor& retrive_next_sibling,
+    const at::Tensor& target_predict) {
   CHECK_INPUT(predicts);
   CHECK_INPUT(accept_index);
   CHECK_INPUT(accept_token_num);
@@ -269,8 +269,12 @@ SGL_KERNEL_EXPORT void verify_tree_greedy(
   auto& queue = dpcppGetCurrentQueue();
   const int64_t max_wg = dpcppMaxWorkGroupSize();
   // One work-group per request.  Sizing the group to num_draft_tokens (rounded
-  // to a sub-group) only widens the staging phase; the walk itself is lane 0.
-  const int64_t local_range = std::min<int64_t>(std::max<int64_t>((num_draft_tokens + 15) / 16 * 16, 16), max_wg);
+  // up to a whole sub-group) only widens the staging phase; the walk itself is
+  // work-item 0.  The staging loop is grid-strided, so clamping below
+  // num_draft_tokens stays correct -- each work-item just makes more passes.
+  constexpr int64_t kSubGroupSize = 32;
+  const int64_t local_range = std::min<int64_t>(
+      std::max<int64_t>((num_draft_tokens + kSubGroupSize - 1) / kSubGroupSize * kSubGroupSize, kSubGroupSize), max_wg);
 
   auto launch = [&](auto in_tag, auto out_tag) {
     using in_t = decltype(in_tag);

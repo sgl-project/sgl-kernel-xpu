@@ -418,20 +418,17 @@ def print_markdown_table(results: List[dict]):
 
     names = sorted({r["name"] for r in results})
     header = (
-        ["Config", "draft_tokens"] + [f"{n} (dev mean, ms)" for n in names] + ["Result"]
+        ["Config", "draft_tokens"]
+        + [f"{n} (wall mean, ms)" for n in names]
+        + ["Result"]
     )
     print("\n| " + " | ".join(header) + " |")
     print("|" + "|".join(["---"] * len(header)) + "|")
 
     for (bs, topk, depth), impls in sorted(configs.items()):
         draft_tokens = next(iter(impls.values()))["draft_tokens"]
-        dev_cells = [
-            (
-                f"{impls[n]['dev_mean_ms']:.4f}"
-                if n in impls and "dev_mean_ms" in impls[n]
-                else "n/a"
-            )
-            for n in names
+        wall_cells = [
+            f"{impls[n]['mean_ms']:.4f}" if n in impls else "n/a" for n in names
         ]
 
         result = "n/a"
@@ -448,7 +445,7 @@ def print_markdown_table(results: List[dict]):
 
         row = (
             [f"bs={bs}, topk={topk}, depth={depth}", str(draft_tokens)]
-            + dev_cells
+            + wall_cells
             + [result]
         )
         print("| " + " | ".join(row) + " |")

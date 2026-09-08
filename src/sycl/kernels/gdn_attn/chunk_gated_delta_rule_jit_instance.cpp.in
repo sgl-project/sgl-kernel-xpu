@@ -50,6 +50,7 @@ extern "C" __attribute__((visibility("default"))) void sgl_gdn_chunk_entry(
       static_cast<@SCALAR_T@*>(A),
       static_cast<@SCALAR_T@*>(w),
       static_cast<@SCALAR_T@*>(u),
+      static_cast<int*> total_chunks,
       static_cast<const float*>(b),
       static_cast<const float*>(a),
       static_cast<const float*>(A_log),

@@ -130,7 +130,9 @@ CUTE_DEVICE void chunk_prepare_kernel(
     }
     pre_chunks = cumsum_chunks;
   }
-  *total_chunks = pre_chunks;
+  if (group_id == 0 && sg_id == 0 && sg_local_id == 0) {
+    *total_chunks = pre_chunks;
+  }
 }
 
 template <typename T, class TiledMMA>

@@ -27,36 +27,9 @@ import argparse
 import gc
 import math
 import random
-import warnings
 
-# ── SYCL op (required) ──────────────────────────────────────────────────────
 import sgl_kernel  # noqa: F401  registers torch.ops.sgl_kernel.gdn_attention
 import torch
-
-# ── SGLang Triton pipeline (optional) ───────────────────────────────────────
-_SGLANG_AVAILABLE = False
-_SGLANG_MISS_REASON = ""
-
-try:
-    from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
-    from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
-    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
-        causal_conv1d_fn,
-        causal_conv1d_update,
-    )
-
-    try:
-        from sglang.srt.hardware_backend.xpu.kernels.fla.fused_sigmoid_gating_recurrent import (
-            fused_sigmoid_gating_delta_rule_update,
-        )
-    except Exception:
-        from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
-            fused_sigmoid_gating_delta_rule_update,
-        )
-
-    _SGLANG_AVAILABLE = True
-except ImportError as _e:
-    _SGLANG_MISS_REASON = str(_e)
 
 # ── Model shape (Qwen3.5-9B, TP=1) ──────────────────────────────────────────
 # From text_config in the HF config:
@@ -335,7 +308,7 @@ def estimate_bytes(
 # ── Timing helper ────────────────────────────────────────────────────────────
 
 
-def time_ms(fn, warmup: int = 10, iters: int = 50) -> float:
+def time_ms(fn, warmup: int = 10, iters: int = 200) -> float:
     """Return median wall time in milliseconds using XPU events."""
     for _ in range(warmup):
         fn()
@@ -503,7 +476,7 @@ def main():
         description="Benchmark sgl_kernel.gdn_attention (SYCL) vs SGLang Triton"
     )
     ap.add_argument(
-        "--iters", type=int, default=50, help="Timing iterations (default: 50)"
+        "--iters", type=int, default=200, help="Timing iterations (default: 200)"
     )
     ap.add_argument(
         "--warmup", type=int, default=10, help="Warmup iterations (default: 10)"
@@ -514,18 +487,11 @@ def main():
         choices=["bf16", "fp16"],
         help="Data type (default: bf16)",
     )
-    ap.add_argument(
-        "--no-triton",
-        action="store_true",
-        help="Skip SGLang Triton comparison even if available",
-    )
     args = ap.parse_args()
 
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     bpe = dtype.itemsize
     bpe_ssm = 4  # SSM state is always float32
-
-    compare = _SGLANG_AVAILABLE and not args.no_triton
 
     # ── Header ───────────────────────────────────────────────────────────────
     print("=" * 78)
@@ -533,15 +499,6 @@ def main():
     print("=" * 78)
     print(f"  Model    : Qwen3.5-9B (TP=1) — {NK}×{HK}K + {NV}×{HV}V, conv_w={W}")
     print(f"  dtype    : {args.dtype}  |  warmup={args.warmup}  iters={args.iters}")
-    print(
-        f"  SGLang   : {'✓ found — comparison enabled' if compare else '✗ not available — SYCL only'}"
-    )
-    if not _SGLANG_AVAILABLE and not args.no_triton:
-        warnings.warn(
-            f"SGLang Triton kernels not found ({_SGLANG_MISS_REASON}). "
-            "Only SYCL numbers will be shown. Pass --no-triton to suppress this warning.",
-            stacklevel=2,
-        )
     print()
 
     # ── Workloads ─────────────────────────────────────────────────────────────
@@ -576,13 +533,6 @@ def main():
             f"{'BW(GB/s)':>{C2}}"
             f"{'TFLOPS':>{C3}}"
         )
-        if compare:
-            h += (
-                f"{'Tri(µs)':>{C4}}"
-                f"{'BW(GB/s)':>{C5}}"
-                f"{'TFLOPS':>{C6}}"
-                f"{'speedup':>8}"
-            )
         return h
 
     print(hdr_line())
@@ -618,65 +568,10 @@ def main():
             f"{tf_sycl:>{C3}.3f}"
         )
 
-        # ── Triton timing ─────────────────────────────────────────────────────
-        if compare:
-            kwargs["conv_state"].copy_(conv0)
-            kwargs["ssm_state"].copy_(ssm0)
-            conv_s = conv0.clone()
-            ssm_s = ssm0.clone()
-
-            # warm-up Triton pipeline (compiles Triton kernels on first call)
-            for _ in range(args.warmup):
-                sglang_pipeline(kwargs, meta, conv_s.clone(), ssm_s.clone())
-            torch.xpu.synchronize()
-
-            def tri_fn():
-                sglang_pipeline(kwargs, meta, conv_s, ssm_s)
-
-            t_tri_ms = time_ms(tri_fn, warmup=0, iters=args.iters)
-            t_tri_us = t_tri_ms * 1e3
-            bw_tri = nbytes / 1e9 / (t_tri_ms / 1e3)
-            tf_tri = flops / 1e12 / (t_tri_ms / 1e3)
-            speedup = t_tri_us / t_sycl_us
-
-            row += (
-                f"{t_tri_us:>{C4}.1f}"
-                f"{bw_tri:>{C5}.1f}"
-                f"{tf_tri:>{C6}.3f}"
-                f"{speedup:>7.2f}x"
-            )
-
-            # collect stage timings for breakdown table
-            _, stages = sglang_pipeline(kwargs, meta, conv_s.clone(), ssm_s.clone())
-            t_conv = time_ms(stages["conv"], warmup=3, iters=args.iters)
-            t_gate = (
-                time_ms(stages["gating"], warmup=3, iters=args.iters)
-                if "gating" in stages
-                else 0.0
-            )
-            t_delta = time_ms(stages["delta"], warmup=3, iters=args.iters)
-            stage_rows.append((name, t_conv * 1e3, t_gate * 1e3, t_delta * 1e3))
-
         print(row)
         del kwargs, meta
         torch.xpu.empty_cache()
         gc.collect()
-
-    # ── Per-stage Triton breakdown ────────────────────────────────────────────
-    if compare and stage_rows:
-        print()
-        print("SGLang Triton per-stage breakdown (µs):")
-        hdr2 = (
-            f"{'workload':<{C0}}"
-            f"{'conv1d':>10}"
-            f"{'gating':>10}"
-            f"{'delta':>10}"
-            f"{'sum':>10}"
-        )
-        print(hdr2)
-        print("-" * len(hdr2))
-        for name, tc, tg, td in stage_rows:
-            print(f"{name:<{C0}}{tc:>10.1f}{tg:>10.1f}{td:>10.1f}{tc+tg+td:>10.1f}")
 
     # ── Notes ─────────────────────────────────────────────────────────────────
     print()
@@ -694,17 +589,6 @@ def main():
     print(
         f"    decode is the single-step recurrent update. Same denominator for SYCL and Triton."
     )
-    if compare:
-        print(f"  speedup = Triton_time / SYCL_time  (>1 means SYCL is faster).")
-        print()
-        print("  Apple-to-apple mapping (SYCL fuses multiple Triton stages):")
-        print("    SYCL kernel           ↔  Triton stages")
-        print("    chunk_causal_conv1d   ↔  fused_qkvzba_split + causal_conv1d_fn")
-        print("                              + l2norm + fused_gdn_gating  (prefill)")
-        print("    causal_conv1d_kernel  ↔  fused_qkvzba_split + causal_conv1d_update")
-        print("                                                              (decode)")
-        print("    ChunkFwdOKernel+…     ↔  chunk_gated_delta_rule          (prefill)")
-        print("    gated_delta_rule      ↔  fused_recurrent_gated_delta_rule (decode)")
 
 
 if __name__ == "__main__":

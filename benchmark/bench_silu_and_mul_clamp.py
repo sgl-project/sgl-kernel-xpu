@@ -14,6 +14,7 @@ Optional flags:
 
 import argparse
 import itertools
+import os
 
 import pandas as pd
 import torch
@@ -73,6 +74,38 @@ def calculate_diff(M: int, H: int, swiglu_limit: float, dtype: torch.dtype) -> N
         print(f"    ❌ SYCL and reference DIFFER")
 
 
+def calculate_boundary_case(dtype: torch.dtype, swiglu_limit: float) -> None:
+    """Mirror the boundary-value test from tests/test_silu_and_mul_clamp.py."""
+    device = torch.device("xpu")
+    H = 8
+    gate = torch.full((1, H), swiglu_limit, dtype=dtype, device=device)
+    up = torch.tensor(
+        [swiglu_limit if i % 2 == 0 else -swiglu_limit for i in range(H)],
+        dtype=dtype,
+        device=device,
+    ).unsqueeze(0)
+    inp = torch.cat([gate, up], dim=-1)
+    out_sycl = torch.zeros((1, H), dtype=dtype, device=device)
+    out_ref = torch.zeros_like(out_sycl)
+
+    silu_and_mul_clamp(inp, out_sycl, swiglu_limit)
+    silu_and_mul_clamp_torch(inp, out_ref, swiglu_limit)
+    torch.xpu.synchronize()
+
+    diff = torch.abs(out_sycl - out_ref).mean().item()
+    cos_sim = torch.nn.functional.cosine_similarity(
+        out_sycl.reshape(-1).float(), out_ref.reshape(-1).float(), dim=0
+    ).item()
+
+    tag = f"boundary, dtype={dtype}, limit={swiglu_limit}"
+    print(f"  {tag}")
+    print(f"    mean |diff|={diff:.6f}  cos_sim={cos_sim:.6f}")
+    if cos_sim > 0.99:
+        print(f"    ✅ boundary values match")
+    else:
+        print(f"    ❌ boundary values DIFFER")
+
+
 # ---------------------------------------------------------------------------
 # Bandwidth / FLOPS helper
 # ---------------------------------------------------------------------------
@@ -98,7 +131,8 @@ def _bw_metrics(M: int, H: int, dtype: torch.dtype, time_ms: float) -> dict:
 # ---------------------------------------------------------------------------
 # Realistic DeepSeek-V4 MoE token counts and intermediate hidden dims
 M_range = [1, 16, 64, 128, 256, 512, 1024, 2048, 4096]
-H_range = [512, 1024, 2048, 4096, 7168]
+H_range = [32, 48, 64, 80, 512, 1024, 2048, 4096, 7168]
+limit_range = [2.0, 7.0, 10.0]
 
 all_results = []
 
@@ -111,7 +145,7 @@ def _make_benchmark(dtype: torch.dtype, swiglu_limit: float):
             x_names=["M", "H"],
             x_vals=configs,
             line_arg="provider",
-            line_vals=["torch", "sycl"],
+            line_vals=["torch", "sglang"],
             line_names=["PyTorch Reference", "SYCL Kernel"],
             styles=[("blue", "-"), ("green", "-")],
             ylabel="us",
@@ -127,7 +161,7 @@ def _make_benchmark(dtype: torch.dtype, swiglu_limit: float):
 
         if provider == "torch":
             fn = lambda: silu_and_mul_clamp_torch(inp, out, swiglu_limit)
-        else:
+        elif provider == "sglang":
             fn = lambda: silu_and_mul_clamp(inp, out, swiglu_limit)
 
         ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
@@ -152,7 +186,10 @@ def _make_benchmark(dtype: torch.dtype, swiglu_limit: float):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark silu_and_mul_clamp")
     parser.add_argument(
-        "--limit", type=float, default=10.0, help="swiglu clamping bound"
+        "--limit",
+        type=float,
+        default=None,
+        help="swiglu clamping bound (defaults to the unit-test values: 2.0, 7.0, 10.0)",
     )
     parser.add_argument("--bf16-only", action="store_true")
     parser.add_argument("--fp16-only", action="store_true")
@@ -166,29 +203,40 @@ if __name__ == "__main__":
     else:
         dtypes = [torch.bfloat16, torch.float16]
 
+    limits = [args.limit] if args.limit is not None else limit_range
+
     # --- correctness spot checks ---
     print("=" * 70)
     print("Correctness check (SYCL vs PyTorch reference)")
     print("=" * 70)
     for dtype in dtypes:
-        for M, H in [(16, 1024), (128, 4096), (1024, 7168)]:
-            calculate_diff(M, H, args.limit, dtype)
+        for swiglu_limit in limits:
+            for M, H in [(16, 32), (16, 80), (128, 64), (128, 1024), (1024, 7168)]:
+                calculate_diff(M, H, swiglu_limit, dtype)
+            calculate_boundary_case(dtype, swiglu_limit)
     print()
 
     # --- performance benchmark ---
     for dtype in dtypes:
-        print("=" * 70)
-        print(f"Benchmarking dtype={dtype}, swiglu_limit={args.limit}")
-        print("=" * 70)
-        bench_fn = _make_benchmark(dtype, args.limit)
-        bench_fn.run(print_data=True)
+        for swiglu_limit in limits:
+            print("=" * 70)
+            print(f"Benchmarking dtype={dtype}, swiglu_limit={swiglu_limit}")
+            print("=" * 70)
+            bench_fn = _make_benchmark(dtype, swiglu_limit)
+            bench_fn.run(print_data=True)
 
     # --- summary table ---
     if all_results:
+        df = pd.DataFrame(all_results)
+
+        os.makedirs("benchmark/results", exist_ok=True)
+        out_csv = os.path.join("benchmark/results", "silu_and_mul_clamp.csv")
+        df.to_csv(out_csv, index=False)
+        print(f"Wrote results CSV: {out_csv}")
+
         print("\n" + "=" * 70)
         print("Full results (all shapes & dtypes)")
         print("=" * 70)
-        df = pd.DataFrame(all_results)
         print(df.to_markdown(index=False))
 
         print("\n" + "=" * 70)
@@ -206,3 +254,14 @@ if __name__ == "__main__":
             .round(2)
         )
         print(summary.to_markdown())
+
+        pivot = df.pivot_table(
+            index=["M", "H", "dtype"],
+            columns="provider",
+            values="time_us",
+        )
+        if "torch" in pivot.columns and "sglang" in pivot.columns:
+            pivot["speedup"] = pivot["torch"] / pivot["sglang"]
+            print(f"\nsilu_and_mul_clamp avg speedup: {pivot['speedup'].mean():.2f}x")
+            print(f"silu_and_mul_clamp max speedup: {pivot['speedup'].max():.2f}x")
+            print(f"silu_and_mul_clamp min speedup: {pivot['speedup'].min():.2f}x")

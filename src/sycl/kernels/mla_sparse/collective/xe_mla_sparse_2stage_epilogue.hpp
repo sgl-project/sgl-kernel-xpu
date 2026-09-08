@@ -26,8 +26,7 @@
 #pragma once
 
 #include "sycl/kernels/mla_sparse/device/xe_mla_sparse_2stage_common.hpp"
-#define THR_ID -1
-#define BLK_ID -1
+
 namespace cutlass::flash_attention::collective {
 
 using cutlass::flash_attention::kernel::Epilogue2StageParams;
@@ -171,16 +170,6 @@ class XeMlaSparse2StageEpilogue {
     auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
     auto tOgO = thr_copy_o.partition_D(gO);
 
-    // if(cute::thread(THR_ID, BLK_ID)){
-    //     #define PRINT(x) print(#x ": "); print(x); print("\n");
-    //     PRINT(tArA);
-    //     PRINT(tA_max);
-    //     PRINT(tA_sum);
-    //     PRINT(gO);
-    //     PRINT(tOrO);
-    //     PRINT(tOgO);
-    //     PRINT(ReduceK{});
-    // }
     auto reduce_L = [&]() {
       if constexpr (ReduceK{} == _1{}) {
         return std::make_tuple(tArA, tA_max, tA_sum, true);
@@ -203,15 +192,6 @@ class XeMlaSparse2StageEpilogue {
         auto sA = make_tensor(make_smem_ptr<ElementA>(&shared_storage.a_data), sA_layout);
         auto sA_max = make_tensor(make_smem_ptr<ElementA>(&shared_storage.a_max_data), sA_row_layout);
         auto sA_sum = make_tensor(make_smem_ptr<ElementA>(&shared_storage.a_sum_data), sA_row_layout);
-        // if(cute::thread(THR_ID, BLK_ID)){
-        //   #define PRINT(x) print(#x ": "); print(x); print("\n");
-        //   PRINT(tArA);
-        //   PRINT(tA_max);
-        //   PRINT(tA_sum);
-        //   PRINT(sA);
-        //   PRINT(sA_max);
-        //   PRINT(sA_sum);
-        // }
 
         copy_block_r2s(tA_max, sA_max(_, _, k_blk, a_tile));
         barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
@@ -241,13 +221,6 @@ class XeMlaSparse2StageEpilogue {
                 rA_max, rA_kmax[kr], rA_kmax[kr], [](auto gmax, auto kmax) { return sycl::native::exp2(kmax - gmax); });
           }
         }
-        // if(cute::thread(THR_ID, BLK_ID)){
-        //   #define PRINT(x) print(#x ": "); print(x); print("\n");
-        //   PRINT(rA);
-        //   PRINT(rA_max);
-        //   PRINT(rA_sum);
-        //   PRINT(rA_kmax);
-        // }
 
         barrier_wait(ScopeWorkgroup, SemanticsAcquire | SemanticsWGMemory);
 

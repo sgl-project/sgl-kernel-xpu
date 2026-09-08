@@ -166,20 +166,11 @@ class XeMlaSparse2StageDenseKernel {
 
   static dim3 get_grid_shape(Params const& params) {
     auto const& s = params.kernel.shape;
-    // cute::print("grid: ");
-    // cute::print(ceil_div(s.h_q, Traits::B_H) * s.s_q * s.b * Traits::V_SPLIT);
-    // cute::print("\n");
-    // cute::print("num_kv_splits: ");
-    // cute::print(cute::max(1, params.scheduler.num_kv_splits));
-    // cute::print("\n");
     return dim3(
         ceil_div(s.h_q, Traits::B_H) * s.s_q * s.b * Traits::V_SPLIT, 1, cute::max(1, params.scheduler.num_kv_splits));
   }
 
   static dim3 get_block_shape() {
-    // cute::print("block: ");
-    // cute::print(Traits::NUM_THREADS);
-    // cute::print("\n");
     return dim3(Traits::NUM_THREADS, 1, 1);
   }
 

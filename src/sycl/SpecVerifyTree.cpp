@@ -17,7 +17,9 @@ limitations under the License.
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include <cstdlib>
 #include <sycl/sycl.hpp>
+#include <type_traits>
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
@@ -41,17 +43,195 @@ namespace {
 // at most once across the whole traversal.
 //
 // The walk is a chain of dependent loads and cannot be parallelized, so the
-// parallelism here is: one work-group per request (rows are independent), with
-// the group cooperatively staging the request's four node-indexed arrays into
-// SLM before lane 0 runs the walk.  Those staging loads are mutually
-// independent, so they pipeline; the walk's loads are not, and would otherwise
-// stall on every hop.
+// parallelism here is: one group per request (rows are independent), with the
+// group cooperatively loading the request's four node-indexed arrays before a
+// single lane runs the walk.  Those loads are mutually independent, so they
+// pipeline; the walk's loads are not, and would otherwise stall on every hop.
+//
+// Two variants implement that staging.  VerifyTreeGreedySubGroupKernel keeps
+// the tree in registers and looks nodes up with sub-group shuffles; it needs
+// num_draft_tokens <= kSubGroupSize * kMaxNodesPerLane.  Larger trees fall back
+// to VerifyTreeGreedySlmKernel, which stages into SLM.
 //
 // target_predict and predicts are indexed by the *flat* retrieve index rather
 // than by node, so they are read/written directly from global memory.
+
+constexpr int kSubGroupSize = 32;
+constexpr int kSubGroupShift = 5;  // log2(kSubGroupSize)
+// Registers per lane in the shuffle path, so the largest tree it can hold is
+// kSubGroupSize * kMaxNodesPerLane nodes.  Four covers every production tree
+// shape up to topk=4/depth=4.
+constexpr int kMaxNodesPerLane = 4;
+constexpr int64_t kMaxShuffleNodes = kSubGroupSize * kMaxNodesPerLane;
+
+// Benchmarking override: set SGL_VERIFY_TREE_SLM=1 to force the SLM path even
+// when the tree would fit in registers, so the two staging strategies can be
+// A/B'd from one build.
+bool verify_tree_force_slm() {
+  static const bool force = [] {
+    const char* env = std::getenv("SGL_VERIFY_TREE_SLM");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+  }();
+  return force;
+}
+
+// Register/shuffle staging.  One sub-group per request; lane l holds nodes
+// l, l + 32, ... so the four loads stay independent and coalesced, but node
+// lookups during the walk become register shuffles rather than an SLM
+// round-trip -- which also removes the work-group barrier and the SLM
+// allocation that caps residency.
+//
+// All kSubGroupSize lanes run the *same* walk redundantly.  That is what makes
+// the shuffles legal: `cur` is always produced by a shuffle (or is the
+// constant root), so it is uniform, every lane evaluates the loop and branch
+// conditions identically, and the sub-group stays converged.  The redundancy is
+// free on SIMD hardware -- the lanes would otherwise be idle, as they are in
+// the SLM variant.  Only the leader stores.
+template <typename in_t, typename out_t, int kNodesPerLane>
+struct VerifyTreeGreedySubGroupKernel {
+  VerifyTreeGreedySubGroupKernel(
+      out_t* predicts,
+      out_t* accept_index,
+      out_t* accept_token_num,
+      const in_t* candidates,
+      const in_t* retrive_index,
+      const in_t* retrive_next_token,
+      const in_t* retrive_next_sibling,
+      const in_t* target_predict,
+      int32_t num_draft_tokens,
+      int32_t num_spec_steps)
+      : predicts_(predicts),
+        accept_index_(accept_index),
+        accept_token_num_(accept_token_num),
+        candidates_(candidates),
+        retrive_index_(retrive_index),
+        retrive_next_token_(retrive_next_token),
+        retrive_next_sibling_(retrive_next_sibling),
+        target_predict_(target_predict),
+        num_draft_tokens_(num_draft_tokens),
+        num_spec_steps_(num_spec_steps) {}
+
+  // Reads node `node`'s value out of the sub-group's registers.  `node` must be
+  // uniform across the sub-group; see the class comment for why it always is.
+  template <typename T>
+  static inline T fetch(const sycl::sub_group& sg, const T (&reg)[kNodesPerLane], int32_t node) {
+    const sycl::id<1> lane(node & (kSubGroupSize - 1));
+    T value = sycl::select_from_group(sg, reg[0], lane);
+    if constexpr (kNodesPerLane > 1) {
+      const int32_t chunk = node >> kSubGroupShift;
+      // Every lane runs every shuffle and the register is chosen afterwards;
+      // indexing reg[] by `chunk` first would either spill it to scratch or
+      // put a shuffle under a branch.
+#pragma unroll
+      for (int c = 1; c < kNodesPerLane; ++c) {
+        const T other = sycl::select_from_group(sg, reg[c], lane);
+        if (c == chunk) {
+          value = other;
+        }
+      }
+    }
+    return value;
+  }
+
+  [[sycl::reqd_sub_group_size(kSubGroupSize)]] void operator()(sycl::nd_item<1> item) const {
+    const sycl::sub_group sg = item.get_sub_group();
+    const int64_t bid = item.get_group(0);
+    const int32_t lane = static_cast<int32_t>(sg.get_local_linear_id());
+    const int32_t num_nodes = num_draft_tokens_;
+    const int64_t row_base = bid * num_nodes;
+
+    in_t cand[kNodesPerLane];
+    in_t retr[kNodesPerLane];
+    // Node indices, so they narrow to 32 bits regardless of the tree dtype.
+    int32_t next_token[kNodesPerLane];
+    int32_t next_sibling[kNodesPerLane];
+
+    // Lanes past the end of the tree read node 0 instead of running off the
+    // row: the offset is clamped rather than the load masked, so every load is
+    // unconditionally in bounds.  Their values are never selected, because
+    // fetch() is only ever called with a node the walk has already
+    // bounds-checked.
+#pragma unroll
+    for (int c = 0; c < kNodesPerLane; ++c) {
+      const int32_t node = lane + c * kSubGroupSize;
+      const int64_t off = row_base + (node < num_nodes ? node : 0);
+      cand[c] = candidates_[off];
+      retr[c] = retrive_index_[off];
+      next_token[c] = static_cast<int32_t>(retrive_next_token_[off]);
+      next_sibling[c] = static_cast<int32_t>(retrive_next_sibling_[off]);
+    }
+
+    // The root is always accepted; accept_index is a compacted path list whose
+    // unused tail keeps the caller's -1 fill.
+    int32_t num_accepted = 0;
+    int64_t last_accept_flat = static_cast<int64_t>(fetch(sg, retr, 0));
+    if (lane == 0) {
+      accept_index_[bid * num_spec_steps_] = static_cast<out_t>(last_accept_flat);
+    }
+
+    int32_t cur = 0;
+    for (int32_t level = 1; level < num_spec_steps_; ++level) {
+      cur = fetch(sg, next_token, cur);
+      // Invariant during the sibling scan: the target is the prediction for the
+      // last accepted node, so it is loaded once per level, not per sibling.
+      // Every lane loads the same address, which coalesces to one request.
+      const in_t target = target_predict_[last_accept_flat];
+
+      bool matched = false;
+      // Bounds are part of the loop condition so a malformed chain terminates
+      // instead of shuffling in a lane outside the tree.
+      while (cur >= 0 && cur < num_nodes) {
+        // All three shuffles are issued before the branch: each must be reached
+        // by every lane, and they are register moves, so fetching retr/sibling
+        // that one of the two paths discards is cheaper than guarding them.
+        const in_t cand_cur = fetch(sg, cand, cur);
+        const in_t retr_cur = fetch(sg, retr, cur);
+        const int32_t sibling_cur = fetch(sg, next_sibling, cur);
+        if (cand_cur == target) {
+          if (lane == 0) {
+            // target == cand[cur], so this store confirms the accepted draft
+            // token without needing a second load.
+            predicts_[last_accept_flat] = static_cast<out_t>(target);
+          }
+          last_accept_flat = static_cast<int64_t>(retr_cur);
+          ++num_accepted;
+          if (lane == 0) {
+            accept_index_[bid * num_spec_steps_ + num_accepted] = static_cast<out_t>(last_accept_flat);
+          }
+          matched = true;
+          break;
+        }
+        cur = sibling_cur;
+      }
+      if (!matched) {
+        break;
+      }
+    }
+
+    if (lane == 0) {
+      accept_token_num_[bid] = static_cast<out_t>(num_accepted);
+      // The path tip has no accepted child, so its prediction was never stored
+      // above; it is the free target-generated token that ends every step.
+      predicts_[last_accept_flat] = static_cast<out_t>(target_predict_[last_accept_flat]);
+    }
+  }
+
+  out_t* predicts_;
+  out_t* accept_index_;
+  out_t* accept_token_num_;
+  const in_t* candidates_;
+  const in_t* retrive_index_;
+  const in_t* retrive_next_token_;
+  const in_t* retrive_next_sibling_;
+  const in_t* target_predict_;
+  int32_t num_draft_tokens_;
+  int32_t num_spec_steps_;
+};
+
+// SLM staging, for trees too large for the register path.
 template <typename in_t, typename out_t>
-struct VerifyTreeGreedyKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
-  VerifyTreeGreedyKernel(
+struct VerifyTreeGreedySlmKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
+  VerifyTreeGreedySlmKernel(
       out_t* predicts,
       out_t* accept_index,
       out_t* accept_token_num,
@@ -77,8 +257,9 @@ struct VerifyTreeGreedyKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const auto nodes = sycl::range<1>(num_draft_tokens_);
     cand_ = sycl::local_accessor<in_t, 1>(nodes, cgh);
     retr_ = sycl::local_accessor<in_t, 1>(nodes, cgh);
-    next_token_ = sycl::local_accessor<in_t, 1>(nodes, cgh);
-    next_sibling_ = sycl::local_accessor<in_t, 1>(nodes, cgh);
+    // Node indices, so they narrow to 32 bits regardless of the tree dtype.
+    next_token_ = sycl::local_accessor<int32_t, 1>(nodes, cgh);
+    next_sibling_ = sycl::local_accessor<int32_t, 1>(nodes, cgh);
   }
 
   void operator()(sycl::nd_item<1> item) const {
@@ -92,8 +273,8 @@ struct VerifyTreeGreedyKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     // get_multi_ptr is a dependent template name.
     in_t* cand = cand_.template get_multi_ptr<sycl::access::decorated::no>().get();
     in_t* retr = retr_.template get_multi_ptr<sycl::access::decorated::no>().get();
-    in_t* next_token = next_token_.template get_multi_ptr<sycl::access::decorated::no>().get();
-    in_t* next_sibling = next_sibling_.template get_multi_ptr<sycl::access::decorated::no>().get();
+    int32_t* next_token = next_token_.get_multi_ptr<sycl::access::decorated::no>().get();
+    int32_t* next_sibling = next_sibling_.get_multi_ptr<sycl::access::decorated::no>().get();
 
     // Stage the request's node-indexed arrays; these loads are independent and
     // coalesced, unlike the dependent chain the walk below would issue.
@@ -101,8 +282,8 @@ struct VerifyTreeGreedyKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     for (int32_t i = tid; i < num_nodes; i += lrange) {
       cand[i] = candidates_[row_base + i];
       retr[i] = retrive_index_[row_base + i];
-      next_token[i] = retrive_next_token_[row_base + i];
-      next_sibling[i] = retrive_next_sibling_[row_base + i];
+      next_token[i] = static_cast<int32_t>(retrive_next_token_[row_base + i]);
+      next_sibling[i] = static_cast<int32_t>(retrive_next_sibling_[row_base + i]);
     }
     sycl::group_barrier(item.get_group());
 
@@ -118,7 +299,7 @@ struct VerifyTreeGreedyKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
     int32_t cur = 0;
     for (int32_t level = 1; level < num_spec_steps_; ++level) {
-      cur = static_cast<int32_t>(next_token[cur]);
+      cur = next_token[cur];
       // Invariant during the sibling scan: the target is the prediction for the
       // last accepted node, so it is loaded once per level, not per sibling.
       const in_t target = target_predict_[last_accept_flat];
@@ -137,7 +318,7 @@ struct VerifyTreeGreedyKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
           matched = true;
           break;
         }
-        cur = static_cast<int32_t>(next_sibling[cur]);
+        cur = next_sibling[cur];
       }
       if (!matched) {
         break;
@@ -163,9 +344,76 @@ struct VerifyTreeGreedyKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
   sycl::local_accessor<in_t, 1> cand_;
   sycl::local_accessor<in_t, 1> retr_;
-  sycl::local_accessor<in_t, 1> next_token_;
-  sycl::local_accessor<in_t, 1> next_sibling_;
+  sycl::local_accessor<int32_t, 1> next_token_;
+  sycl::local_accessor<int32_t, 1> next_sibling_;
 };
+
+template <typename in_t, typename out_t>
+void launch_verify_tree_greedy(
+    out_t* predicts,
+    out_t* accept_index,
+    out_t* accept_token_num,
+    const in_t* candidates,
+    const in_t* retrive_index,
+    const in_t* retrive_next_token,
+    const in_t* retrive_next_sibling,
+    const in_t* target_predict,
+    int64_t bs,
+    int64_t num_draft_tokens,
+    int64_t num_spec_steps) {
+  auto& queue = dpcppGetCurrentQueue();
+  const int32_t nodes = static_cast<int32_t>(num_draft_tokens);
+  const int32_t steps = static_cast<int32_t>(num_spec_steps);
+
+  if (num_draft_tokens <= kMaxShuffleNodes && !verify_tree_force_slm()) {
+    // One sub-group per request, so the group is exactly one sub-group wide and
+    // needs no barrier.
+    auto submit = [&](auto nodes_per_lane_tag) {
+      constexpr int kNodesPerLane = decltype(nodes_per_lane_tag)::value;
+      VerifyTreeGreedySubGroupKernel<in_t, out_t, kNodesPerLane> kernel(
+          predicts,
+          accept_index,
+          accept_token_num,
+          candidates,
+          retrive_index,
+          retrive_next_token,
+          retrive_next_sibling,
+          target_predict,
+          nodes,
+          steps);
+      sycl_kernel_submit(bs * kSubGroupSize, static_cast<int64_t>(kSubGroupSize), queue, kernel);
+    };
+    if (num_draft_tokens <= kSubGroupSize) {
+      submit(std::integral_constant<int, 1>{});
+    } else if (num_draft_tokens <= 2 * kSubGroupSize) {
+      submit(std::integral_constant<int, 2>{});
+    } else {
+      submit(std::integral_constant<int, 4>{});
+    }
+    return;
+  }
+
+  const int64_t max_wg = dpcppMaxWorkGroupSize();
+  // One work-group per request.  Sizing the group to num_draft_tokens (rounded
+  // up to a whole sub-group) only widens the staging phase; the walk itself is
+  // work-item 0.  The staging loop is grid-strided, so clamping below
+  // num_draft_tokens stays correct -- each work-item just makes more passes.
+  const int64_t local_range = std::min<int64_t>(
+      std::max<int64_t>((num_draft_tokens + kSubGroupSize - 1) / kSubGroupSize * kSubGroupSize, kSubGroupSize), max_wg);
+
+  VerifyTreeGreedySlmKernel<in_t, out_t> kernel(
+      predicts,
+      accept_index,
+      accept_token_num,
+      candidates,
+      retrive_index,
+      retrive_next_token,
+      retrive_next_sibling,
+      target_predict,
+      nodes,
+      steps);
+  sycl_kernel_submit(bs * local_range, local_range, queue, kernel);
+}
 
 }  // namespace
 
@@ -266,20 +514,10 @@ SGL_KERNEL_EXPORT void verify_tree_greedy(
     return;
   }
 
-  auto& queue = dpcppGetCurrentQueue();
-  const int64_t max_wg = dpcppMaxWorkGroupSize();
-  // One work-group per request.  Sizing the group to num_draft_tokens (rounded
-  // up to a whole sub-group) only widens the staging phase; the walk itself is
-  // work-item 0.  The staging loop is grid-strided, so clamping below
-  // num_draft_tokens stays correct -- each work-item just makes more passes.
-  constexpr int64_t kSubGroupSize = 32;
-  const int64_t local_range = std::min<int64_t>(
-      std::max<int64_t>((num_draft_tokens + kSubGroupSize - 1) / kSubGroupSize * kSubGroupSize, kSubGroupSize), max_wg);
-
   auto launch = [&](auto in_tag, auto out_tag) {
     using in_t = decltype(in_tag);
     using out_t = decltype(out_tag);
-    VerifyTreeGreedyKernel<in_t, out_t> kernel(
+    launch_verify_tree_greedy<in_t, out_t>(
         predicts.data_ptr<out_t>(),
         accept_index.data_ptr<out_t>(),
         accept_token_num.data_ptr<out_t>(),
@@ -288,9 +526,9 @@ SGL_KERNEL_EXPORT void verify_tree_greedy(
         retrive_next_token.data_ptr<in_t>(),
         retrive_next_sibling.data_ptr<in_t>(),
         target_predict.data_ptr<in_t>(),
-        static_cast<int32_t>(num_draft_tokens),
-        static_cast<int32_t>(num_spec_steps));
-    sycl_kernel_submit(bs * local_range, local_range, queue, kernel);
+        bs,
+        num_draft_tokens,
+        num_spec_steps);
   };
 
   if (in_type == at::kLong) {

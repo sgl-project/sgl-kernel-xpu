@@ -115,6 +115,19 @@ CUTE_DEVICE void mxfp4_unfold(CTensor& tCrC) {
   "mul (M1_NM, 32) OUT_BF(2,0)<1> OUT_BF(2,0)<1;1,0> MULS_F(0,0)<1;1,0>\n" \
   "mul (M1_NM, 32) OUT_BF(3,0)<1> OUT_BF(3,0)<1;1,0> MULS_F(0,0)<1;1,0>\n"
 
+// The folded reorder is hand-written Xe20 vISA; anything else must take the
+// separate scaling pass (kFuseDequant in gemm_xe2.hpp). cutlass.h re-derives
+// SYCL_INTEL_TARGET from __SYCL_TARGET_INTEL_GPU_CRI__, overriding the
+// `#define SYCL_INTEL_TARGET 20` in the instantiating TU, so this is 35 on a cri build.
+#if defined(SYCL_INTEL_TARGET) && SYCL_INTEL_TARGET == 20
+inline constexpr bool kMxfp4FoldedSupported = true;
+#else
+inline constexpr bool kMxfp4FoldedSupported = false;
+#endif
+
+template <ReorderKind>
+inline constexpr bool mxfp4_folded_unsupported = false;
+
 // E2M1 -> BF16 reorder with the group scale folded into the conversion.
 template <ReorderKind Kind>
 CUTE_DEVICE void
@@ -146,7 +159,8 @@ mxfp4_reorder_folded(intel::uchar4 const& src0, intel::ushort8& dst0, intel::vec
         : "rw"(src0), "rw.u"(shifts), "rw"(muls));
   }
 #elif defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
-#error "MXFP4 folded reorder is only supported on SYCL_INTEL_TARGET 20 (BMG/Xe20)"
+  static_assert(
+      mxfp4_folded_unsupported<Kind>, "MXFP4 folded reorder is only supported on SYCL_INTEL_TARGET 20 (BMG/Xe20)");
 #endif
 }
 

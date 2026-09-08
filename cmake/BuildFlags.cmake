@@ -131,18 +131,20 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 
   set(AOT_TARGETS)
 
-  # Resolve DPCPP_SYCL_TARGET: user-provided takes priority, otherwise auto-detect
+  # Resolve DPCPP_SYCL_TARGET: user-provided takes priority, otherwise auto-detect.
+  # get_device_ip_version returns a device-name string ('bmg' | 'cri') — the same
+  # vocabulary consumed by every MATCHES site downstream.
   if(DPCPP_SYCL_TARGET)
     message(STATUS "Using user-provided DPCPP_SYCL_TARGET: ${DPCPP_SYCL_TARGET}")
   else()
-    get_device_ip_version(DEVICE_IP_VERSION)
-    message(STATUS "Detected device IP version: ${DEVICE_IP_VERSION}")
-    if(DEVICE_IP_VERSION EQUAL 20)
-      set(DPCPP_SYCL_TARGET "bmg")
-    elseif(DEVICE_IP_VERSION EQUAL 35)
-      set(DPCPP_SYCL_TARGET "intel_gpu_cri")
+    get_device_ip_version(DETECTED_TARGET)
+    message(STATUS "Detected device target: ${DETECTED_TARGET}")
+    if(DETECTED_TARGET MATCHES "^(bmg|cri)$")
+      set(DPCPP_SYCL_TARGET "${DETECTED_TARGET}")
     else()
-      message(WARNING "Unknown device IP version: ${DEVICE_IP_VERSION}. Cannot auto-detect target.")
+      message(WARNING
+        "Unrecognized detected target '${DETECTED_TARGET}'. "
+        "Cannot auto-detect DPCPP_SYCL_TARGET; must be one of: bmg, cri.")
     endif()
   endif()
 

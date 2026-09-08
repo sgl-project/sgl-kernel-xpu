@@ -369,7 +369,7 @@ def cutlass_fp4_group_mm(
     return c.to(dtype=out_dtype)
 
 
-_MOE_WS_HEADROOM = 1.1
+_MOE_WS_HEADROOM = 1
 _MOE_SMALL_PREPARE_MAX_ROUTES = 64
 _MOE_SMALL_PREPARE_MAX_TOPK = 16
 _MOE_SMALL_PREPARE_MAX_ELEMENTS = 163840

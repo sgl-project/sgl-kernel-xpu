@@ -73,8 +73,11 @@ def fused_add_rms_norm(x, residual, weight, eps):
         ],
         # gpt-oss: bf16 input + bf16 weight, H = 2880, prefill batch.
         (4096, 2880, torch.bfloat16),
-        # fp32 correctness smoke test for rmsnorm
+        # fp32 correctness smoke test for rmsnorm. `SYCL_DISPATCH_FLOATING_TYPES`
+        # instantiates the kernel for Float, so fp32 is a distinct instantiation
+        # that the fp16/bf16 sweep above never covers.
         (19, 1024, torch.float32),
+    ],
 )
 @pytest.mark.parametrize("specify_out", [True, False])
 def test_norm(batch_size, hidden_size, dtype, specify_out):

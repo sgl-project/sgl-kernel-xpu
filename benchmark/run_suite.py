@@ -77,14 +77,15 @@ suites = {
             tee_log="mla_sparse_fwd.log",
             estimated_time=20,
         ),
+        BenchFile("bench_minimax_decode_topk.py", tee_log="minimax_decode_topk.log"),
         # --- MoE ---
         BenchFile("bench_moe_topk_sigmoid.py", tee_log="moe_topk_sigmoid.log"),
         BenchFile("bench_moe_topk_softmax.py", tee_log="moe.log"),
         BenchFile("bench_moe_sum_reduce.py", tee_log="moe_sum_reduce.log"),
         BenchFile("bench_moe_fused_gate.py", tee_log="moe_fused_gate.py.log"),
-        BenchFile("bench_moe_w4a16_grouped_gemm.py"),
+        BenchFile("bench_moe_wna16_grouped_gemm.py"),
         BenchFile(
-            "bench_fused_experts_w4a16.py",
+            "bench_fused_experts_wna16.py",
             # Drop the mid token count and two of three route seeds: the seeds
             # only average routing noise, and 1/2048 bracket the shape range.
             args=["--tokens", "1", "2048", "--route-seeds", "0"],

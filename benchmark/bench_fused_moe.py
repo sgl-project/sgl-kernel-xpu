@@ -199,6 +199,7 @@ configs += [
     (k, *v, b, "silu")
     for k, v, b in product(bs, shape_values_swiglu_gpt_oss, with_bias)
 ]
+
 all_results = []
 
 
@@ -341,6 +342,10 @@ def fused_moe_sglang_api(
     gemm1_alpha=None,
     gemm1_limit=None,
     routed_scaling_factor=None,
+    use_fp8_w8a8=False,
+    w1_scale=None,
+    w2_scale=None,
+    block_shape=None,
 ):
     num_tokens = x.shape[0]
     topk_weights = torch.empty(num_tokens, topk, dtype=torch.float32, device=x.device)
@@ -365,6 +370,10 @@ def fused_moe_sglang_api(
             gemm1_alpha=gemm1_alpha,
             gemm1_limit=gemm1_limit,
             routed_scaling_factor=routed_scaling_factor,
+            use_fp8_w8a8=use_fp8_w8a8,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            block_shape=block_shape,
         ),
         topk_indices,
     )
@@ -506,8 +515,7 @@ def benchmark(
             hidden_size * shard_intermediate_size
             + hidden_size * shard_intermediate_size // 2
         )
-        * torch.finfo(dtype).bits
-        // 8
+        * (torch.finfo(dtype).bits // 8)
     )
     if with_bias:
         memory += (
@@ -527,7 +535,6 @@ def benchmark(
             "hidden_size": hidden_size,
             "shard_intermediate_size": shard_intermediate_size,
             "dtype": dtype,
-            # "block_shape": block_shape,  # Always None now. disabled to reduce the number of columns
             "with_bias": with_bias,
             "act_type": act_type,
             "provider": provider,

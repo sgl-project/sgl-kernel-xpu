@@ -37,5 +37,5 @@ build-dir = "build"
 minimum-version = "build-system.requires"
 
 wheel.py-api = "cp310"
-wheel.license-files = []
+wheel.license-files = ["LICENSE", "THIRDPARTYNOTICES.txt"]
 wheel.packages = ["python/sgl_kernel"]

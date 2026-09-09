@@ -166,10 +166,8 @@ class XeMlaSparse2StageDenseKernel {
 
   static dim3 get_grid_shape(Params const& params) {
     auto const& s = params.kernel.shape;
-    // z carries the split-K factor over the gathered topk dim (1 = disabled). Unlike
-    // the paged MLA scheduler it needs no divmod packing, since z is otherwise unused.
     return dim3(
-        ceil_div(s.h_q, Traits::B_H) * s.s_q * s.b, Traits::V_SPLIT, cute::max(1, params.scheduler.num_kv_splits));
+        ceil_div(s.h_q, Traits::B_H) * s.s_q * s.b * Traits::V_SPLIT, 1, cute::max(1, params.scheduler.num_kv_splits));
   }
 
   static dim3 get_block_shape() {

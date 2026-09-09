@@ -3,7 +3,10 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include <algorithm>
+#include <limits>
 #include <sycl/sycl.hpp>
+#include <unordered_map>
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
@@ -494,6 +497,250 @@ SGL_KERNEL_EXPORT void prepare_moe_input(
     compute_arg_sorts_sycl_impl<index_t>(topk_ids, input_permutation, output_permutation, atomic_buffer, num_experts);
   });
   return;
+}
+
+template <typename IndexType, typename ScalarT>
+struct PrepareMoeInputSmall : public __SYCL_KER_CONFIG_CONVENTION__ {
+  // TODO: Add benchmarked WG/max-route specializations when this path is
+  // enabled beyond BMG; select among static variants using device capabilities.
+  static constexpr int WGSize = 256;
+  static constexpr int MaxRoutes = 64;
+  static constexpr int ElementsPerVector = 8;
+  static constexpr int RequiredSubGroupSize = 16;
+
+  static_assert(WGSize % RequiredSubGroupSize == 0);
+  static_assert(MaxRoutes <= WGSize);
+  static_assert(ElementsPerVector * sizeof(ScalarT) == 16);
+
+  PrepareMoeInputSmall(
+      const ScalarT* input,
+      const IndexType* topk_ids,
+      int32_t* expert_counts,
+      int32_t* output_permutation,
+      ScalarT* output,
+      int32_t num_experts,
+      int32_t input_rows,
+      int32_t topk,
+      int32_t hidden_dim)
+      : input_(input),
+        topk_ids_(topk_ids),
+        expert_counts_(expert_counts),
+        output_permutation_(output_permutation),
+        output_(output),
+        num_experts_(num_experts),
+        input_rows_(input_rows),
+        topk_(topk),
+        hidden_dim_(hidden_dim) {}
+
+  void sycl_ker_config_convention(sycl::handler& cgh) {
+    route_positions_ = sycl::local_accessor<int32_t, 1>(MaxRoutes, cgh);
+    local_counts_ = sycl::local_accessor<int32_t, 1>(num_experts_, cgh);
+  }
+
+  [[sycl::reqd_sub_group_size(RequiredSubGroupSize)]] void operator()(sycl::nd_item<1> item) const {
+    int local_id = item.get_local_linear_id();
+    for (int expert = local_id; expert < num_experts_; expert += WGSize) {
+      expert_counts_[expert] = 0;
+      local_counts_[expert] = 0;
+    }
+    sycl::group_barrier(item.get_group());
+
+    if (input_rows_ == 1) {
+      if (local_id == 0) {
+        int32_t order[16];
+        for (int rank = 0; rank < topk_; ++rank) {
+          order[rank] = rank;
+        }
+        for (int rank = 1; rank < topk_; ++rank) {
+          int32_t current = order[rank];
+          int insert_at = rank;
+          while (insert_at > 0 && topk_ids_[order[insert_at - 1]] > topk_ids_[current]) {
+            order[insert_at] = order[insert_at - 1];
+            --insert_at;
+          }
+          order[insert_at] = current;
+        }
+        for (int destination = 0; destination < topk_; ++destination) {
+          int32_t route = order[destination];
+          ++expert_counts_[static_cast<int32_t>(topk_ids_[route])];
+          route_positions_[route] = destination;
+          output_permutation_[route] = destination;
+        }
+      }
+      sycl::group_barrier(item.get_group());
+
+      using Vector = sycl::vec<uint16_t, ElementsPerVector>;
+      auto input_vectors = reinterpret_cast<const Vector*>(input_);
+      auto output_vectors = reinterpret_cast<Vector*>(output_);
+      int vector_count = hidden_dim_ % ElementsPerVector == 0 ? hidden_dim_ / ElementsPerVector : 0;
+      for (int vector_id = local_id; vector_id < vector_count; vector_id += WGSize) {
+        Vector value = input_vectors[vector_id];
+        for (int route = 0; route < topk_; ++route) {
+          output_vectors[route_positions_[route] * vector_count + vector_id] = value;
+        }
+      }
+      for (int column = vector_count * ElementsPerVector + local_id; column < hidden_dim_; column += WGSize) {
+        ScalarT value = input_[column];
+        for (int route = 0; route < topk_; ++route) {
+          output_[route_positions_[route] * hidden_dim_ + column] = value;
+        }
+      }
+      return;
+    }
+
+    int route_count = topk_ * input_rows_;
+    if (local_id < route_count) {
+      int32_t expert = static_cast<int32_t>(topk_ids_[local_id]);
+      sycl::atomic_ref<
+          int32_t,
+          sycl::memory_order::relaxed,
+          sycl::memory_scope::work_group,
+          sycl::access::address_space::local_space>
+          count(local_counts_[expert]);
+      count.fetch_add(1);
+    }
+    sycl::group_barrier(item.get_group());
+
+    if (local_id == 0) {
+      int32_t offset = 0;
+      for (int expert = 0; expert < num_experts_; ++expert) {
+        int32_t count = local_counts_[expert];
+        expert_counts_[expert] = count;
+        local_counts_[expert] = offset;
+        offset += count;
+      }
+    }
+    sycl::group_barrier(item.get_group());
+
+    if (local_id < route_count) {
+      int32_t expert = static_cast<int32_t>(topk_ids_[local_id]);
+      int32_t destination = local_counts_[expert];
+      for (int route = 0; route < local_id; ++route) {
+        destination += static_cast<int32_t>(topk_ids_[route]) == expert;
+      }
+      route_positions_[local_id] = destination;
+      output_permutation_[local_id] = destination;
+    }
+    sycl::group_barrier(item.get_group());
+
+    using Vector = sycl::vec<uint16_t, ElementsPerVector>;
+    auto input_vectors = reinterpret_cast<const Vector*>(input_);
+    auto output_vectors = reinterpret_cast<Vector*>(output_);
+    int vector_count = hidden_dim_ % ElementsPerVector == 0 ? hidden_dim_ / ElementsPerVector : 0;
+    int vector_tasks = route_count * vector_count;
+    for (int task = local_id; task < vector_tasks; task += WGSize) {
+      int route = task / vector_count;
+      int vector_id = task % vector_count;
+      int source_row = route / topk_;
+      output_vectors[route_positions_[route] * vector_count + vector_id] =
+          input_vectors[source_row * vector_count + vector_id];
+    }
+    int tail_start = vector_count * ElementsPerVector;
+    int tail_size = hidden_dim_ - tail_start;
+    int tail_tasks = route_count * tail_size;
+    for (int task = local_id; task < tail_tasks; task += WGSize) {
+      int route = task / tail_size;
+      int column = tail_start + task % tail_size;
+      int source_row = route / topk_;
+      output_[route_positions_[route] * hidden_dim_ + column] = input_[source_row * hidden_dim_ + column];
+    }
+  }
+
+  const ScalarT* input_;
+  const IndexType* topk_ids_;
+  int32_t* expert_counts_;
+  int32_t* output_permutation_;
+  ScalarT* output_;
+  int32_t num_experts_;
+  int32_t input_rows_;
+  int32_t topk_;
+  int32_t hidden_dim_;
+  mutable sycl::local_accessor<int32_t, 1> route_positions_;
+  mutable sycl::local_accessor<int32_t, 1> local_counts_;
+};
+
+template <typename Kernel>
+size_t prepare_moe_input_small_local_memory_capacity(at::DeviceIndex device_index) {
+  static thread_local std::unordered_map<at::DeviceIndex, size_t> capacity_by_device;
+  auto cached = capacity_by_device.find(device_index);
+  if (cached != capacity_by_device.end()) {
+    return cached->second;
+  }
+
+  auto* properties = at::xpu::getDeviceProperties(device_index);
+  TORCH_CHECK(
+      std::find(properties->sub_group_sizes.begin(), properties->sub_group_sizes.end(), Kernel::RequiredSubGroupSize) !=
+          properties->sub_group_sizes.end(),
+      "prepare_moe_input_small requires subgroup size ",
+      Kernel::RequiredSubGroupSize);
+  TORCH_CHECK(
+      dpcppMaxWorkGroupSize<Kernel>(device_index) >= Kernel::WGSize,
+      "prepare_moe_input_small requires work-group size ",
+      Kernel::WGSize);
+  return capacity_by_device.emplace(device_index, properties->local_mem_size).first->second;
+}
+
+SGL_KERNEL_EXPORT void prepare_moe_input_small(
+    const torch::Tensor& input,
+    const torch::Tensor& topk_ids,
+    torch::Tensor& expert_counts,
+    torch::Tensor& output_permutation,
+    torch::Tensor& output) {
+  TORCH_CHECK(
+      input.is_xpu() && input.dim() == 2 && input.is_contiguous(), "input must be contiguous XPU [rows, hidden_dim]");
+  TORCH_CHECK(
+      topk_ids.is_xpu() && topk_ids.dim() == 2 && topk_ids.is_contiguous() && topk_ids.size(0) == input.size(0),
+      "topk_ids must be contiguous XPU [rows, topk] with rows matching input");
+  TORCH_CHECK(topk_ids.size(1) > 0 && topk_ids.size(1) <= 16, "topk must be in [1, 16]");
+  TORCH_CHECK(
+      topk_ids.numel() <= (PrepareMoeInputSmall<int32_t, c10::BFloat16>::MaxRoutes), "routed rows must be <= 64");
+  TORCH_CHECK(input.scalar_type() == at::kBFloat16, "input must be bfloat16");
+  TORCH_CHECK(
+      expert_counts.is_xpu() && expert_counts.dim() == 1 && expert_counts.numel() > 0 && expert_counts.is_contiguous(),
+      "expert_counts must be a non-empty contiguous XPU vector");
+  TORCH_CHECK(
+      output_permutation.is_xpu() && output_permutation.dim() == 1 && output_permutation.is_contiguous(),
+      "output_permutation must be a contiguous XPU vector");
+  TORCH_CHECK(
+      output.is_xpu() && output.dim() == 2 && output.is_contiguous(),
+      "output must be contiguous XPU [routes, hidden_dim]");
+  TORCH_CHECK(
+      input.device() == topk_ids.device() && input.device() == expert_counts.device() &&
+          input.device() == output_permutation.device() && input.device() == output.device(),
+      "all tensors must be on the same device");
+  TORCH_CHECK(expert_counts.scalar_type() == at::kInt, "expert_counts must be int32");
+  TORCH_CHECK(output_permutation.scalar_type() == at::kInt, "output_permutation must be int32");
+  TORCH_CHECK(output.scalar_type() == input.scalar_type(), "output dtype must match input");
+  TORCH_CHECK(output.size(0) == topk_ids.numel() && output.size(1) == input.size(1), "output shape mismatch");
+  TORCH_CHECK(output_permutation.numel() == topk_ids.numel(), "output_permutation shape mismatch");
+  TORCH_CHECK(
+      expert_counts.numel() <= std::numeric_limits<int32_t>::max() &&
+          input.size(0) <= std::numeric_limits<int32_t>::max() && input.size(1) <= std::numeric_limits<int32_t>::max(),
+      "expert count and input dimensions must fit in int32");
+
+  auto queue = at::xpu::getCurrentXPUStream().queue();
+  AT_DISPATCH_INDEX_TYPES(topk_ids.scalar_type(), "prepare_moe_input_small", [&] {
+    using Kernel = PrepareMoeInputSmall<index_t, c10::BFloat16>;
+    const size_t local_memory_capacity = prepare_moe_input_small_local_memory_capacity<Kernel>(input.device().index());
+    const size_t required_local_memory =
+        (static_cast<size_t>(Kernel::MaxRoutes) + static_cast<size_t>(expert_counts.numel())) * sizeof(int32_t);
+    TORCH_CHECK(
+        required_local_memory <= local_memory_capacity,
+        "prepare_moe_input_small requires ",
+        required_local_memory,
+        " bytes of local memory");
+    Kernel task(
+        input.const_data_ptr<c10::BFloat16>(),
+        topk_ids.const_data_ptr<index_t>(),
+        expert_counts.mutable_data_ptr<int32_t>(),
+        output_permutation.mutable_data_ptr<int32_t>(),
+        output.mutable_data_ptr<c10::BFloat16>(),
+        static_cast<int32_t>(expert_counts.numel()),
+        static_cast<int32_t>(input.size(0)),
+        static_cast<int32_t>(topk_ids.size(1)),
+        static_cast<int32_t>(input.size(1)));
+    sycl_kernel_submit(Kernel::WGSize, Kernel::WGSize, queue, task);
+  });
 }
 
 // Scatter kernel: 1 WG per source token, reads token once, scatters to topk destinations.

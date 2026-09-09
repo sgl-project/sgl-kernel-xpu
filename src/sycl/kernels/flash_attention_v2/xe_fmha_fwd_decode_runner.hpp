@@ -46,6 +46,7 @@
 #include "sycl/kernels/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp"
 #include "sycl/kernels/flash_attention_v2/kernel/xe_reduce_split_k.hpp"
 #include "sycl/kernels/flash_attention_v2/kernel/xe_tile_scheduler.hpp"
+#include "sycl/kernels/flash_attention_v2/relative_attention.hpp"
 using namespace cute;
 namespace decode {
 
@@ -225,6 +226,13 @@ struct Arguments {
   int window_size_left = -1;
   int window_size_right = -1;
 
+  // Sheared relative-attention bias. The decode producer uses a zero M-drift
+  // surface [total_q, h, rel_bias_head_stride], unlike prefill's Q-tile drift.
+  void* __restrict__ rel_bias_ptr = nullptr;
+  int64_t rel_bias_token_stride = 0;
+  int64_t rel_bias_head_stride = 0;
+  int rel_bias_extent = 0;
+
   // Pointer to the RNG seed (idx 0) and offset (idx 1).
   uint64_t* rng_state;
 
@@ -384,7 +392,11 @@ struct DecodeRunner {
          params.page_size,
          params.max_num_pages_per_seq,
          params.window_size_left,
-         params.window_size_right},
+         params.window_size_right,
+         static_cast<const ElementQ*>(params.rel_bias_ptr),
+         params.rel_bias_token_stride,
+         params.rel_bias_head_stride,
+         params.rel_bias_extent},
         {},
         hw_info};
 
@@ -558,7 +570,10 @@ struct SplitDecodeKernelRunner {
          params.max_num_pages_per_seq,
          params.total_k,
          params.window_size_left,
-         params.window_size_right},
+         params.window_size_right,
+         static_cast<const ElementQ*>(params.rel_bias_ptr),
+         params.rel_bias_head_stride,
+         params.rel_bias_extent},
         {},
         hw_info,
         params.num_kv_splits};
@@ -654,7 +669,8 @@ template <
     typename GmemTiledCopyQ = void, /* void -> default block 2D */
     typename GmemTiledCopyK = void,
     typename GmemTiledCopyV = void,
-    typename GmemTiledCopyO = void>
+    typename GmemTiledCopyO = void,
+    bool HasRelBias = false>
 struct DecodeConfig {
   static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
   using MMAOperation = cute::conditional_t<
@@ -735,7 +751,8 @@ struct DecodeConfig {
         GmemTiledCopyK_cache,
         GmemTiledCopyV_cache,
         LocalMask,
-        PackGQA>;
+        PackGQA,
+        HasRelBias>;
 
     // Epilogue
     using CollectiveEpilogue = cutlass::fmha::collective::
@@ -804,7 +821,8 @@ template <
     typename GmemTiledCopyQ = void, /* void -> default block 2D */
     typename GmemTiledCopyK = void,
     typename GmemTiledCopyV = void,
-    typename GmemTiledCopyO = void>
+    typename GmemTiledCopyO = void,
+    bool HasRelBias = false>
 struct SplitDecodeConfig {
   static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
   using MMAOperation =
@@ -856,7 +874,8 @@ struct SplitDecodeConfig {
         GmemTiledCopyQ,
         GmemTiledCopyK,
         GmemTiledCopyV,
-        LocalMask>;
+        LocalMask,
+        HasRelBias>;
 
     // Epilogue
     using CollectiveEpilogue = cutlass::fmha::collective::

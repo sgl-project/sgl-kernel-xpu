@@ -108,7 +108,10 @@ if(USE_MLA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-mla_sparse_prefill)
 endif()
 
 # xe20 kernels
-set(XE20_OFFLINE_COMPILER_AOT_OPTIONS "-device bmg")
+# The AOT device must match the arch these sources were *compiled* for: CMakeLists.txt
+# applies SYCL_INTEL_TARGET globally, so on a cri build these TUs emit Xe3p vISA and
+# ocloc -device bmg rejects it ("platform requires 2 (l1-l3) caching options").
+set(XE20_OFFLINE_COMPILER_AOT_OPTIONS "${SYCL_OFFLINE_COMPILER_AOT_OPTIONS}")
 set(XE20_OFFLINE_COMPILER_FLAGS "${XE20_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
 
 # Instance families that are bundled into a single shared library each.
@@ -127,6 +130,7 @@ set(XE20_OFFLINE_COMPILER_FLAGS "${XE20_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFL
 set(SGL_XE20_BUNDLE_PREFIXES
   "GroupGemmXe20_inst_"
   "GroupGemmW4A16Xe20_inst_"
+  "GroupGemmW8A16Xe20_inst_"
   "xe_fmha_fwd_decode_page_"
   "xe_fmha_fwd_decode_nopage_"
   "xe_fmha_fwd_split_decode_page_"
@@ -228,9 +232,47 @@ endif()
 if(USE_MOE AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-GroupGemmW4A16Xe20)
   target_link_libraries(sgl-ops-sycl-GroupGemmW4A16Xe20 PRIVATE sgl_jit)
 endif()
+# The FP8 W8A16 grouped GEMM dispatcher follows the same JIT path.
+if(USE_MOE AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-GroupGemmW8A16Xe20)
+  target_link_libraries(sgl-ops-sycl-GroupGemmW8A16Xe20 PRIVATE sgl_jit)
+endif()
+# In AOT builds, keep the bundled FP8 instances as an explicit dependency of
+# their dispatcher so --as-needed does not drop them from the runtime graph.
+if(USE_MOE AND NOT USE_SYCL_JIT
+  AND TARGET sgl-ops-sycl-GroupGemmW8A16Xe20
+  AND TARGET sgl-ops-sycl-GroupGemmW8A16Xe20_inst)
+  target_link_libraries(
+   sgl-ops-sycl-GroupGemmW8A16Xe20
+   PUBLIC sgl-ops-sycl-GroupGemmW8A16Xe20_inst)
+endif()
 # The GDN chunk delta-rule dispatch (chunk_gated_delta_rule.cpp) calls the JIT engine.
 if(USE_FMHA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-chunk_gated_delta_rule)
   target_link_libraries(sgl-ops-sycl-chunk_gated_delta_rule PRIVATE sgl_jit)
+endif()
+
+# xe35 kernels (CRI only)
+if(DPCPP_SYCL_TARGET MATCHES "cri")
+  set(XE35_OFFLINE_COMPILER_AOT_OPTIONS "-device cri")
+  set(XE35_OFFLINE_COMPILER_FLAGS "${XE35_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
+  foreach(sycl_src ${ATen_XPU_SYCL_XE35})
+    get_filename_component(name ${sycl_src} NAME_WLE REALPATH)
+    set(sycl_lib sgl-ops-sycl-${name})
+    sycl_add_library(
+      ${sycl_lib}
+      ${XE35_OFFLINE_COMPILER_FLAGS}
+      ${COMMON_DEVICE_LINK_FLAGS}
+      SHARED
+      SYCL_SOURCES ${sycl_src})
+    target_link_libraries(common_ops PUBLIC ${sycl_lib})
+    list(APPEND SGL_OPS_LIBRARIES ${sycl_lib})
+
+    # Decouple with PyTorch cmake definition.
+    install(TARGETS ${sycl_lib} LIBRARY DESTINATION sgl_kernel)
+    set_target_properties(${sycl_lib} PROPERTIES
+      INSTALL_RPATH "$ORIGIN"
+      BUILD_WITH_INSTALL_RPATH TRUE
+    )
+  endforeach()
 endif()
 
 set(SYCL_LINK_LIBRARIES_KEYWORD)
@@ -245,7 +287,6 @@ foreach(lib ${SGL_OPS_LIBRARIES})
   target_include_directories(${lib} PUBLIC ${ATen_XPU_INCLUDE_DIRS})
   target_include_directories(${lib} PUBLIC ${SYCL_INCLUDE_DIR})
   target_include_directories(${lib} PRIVATE ${Python3_INCLUDE_DIRS})
-  target_include_directories(${lib} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(${lib} PRIVATE ${Python3_LIBRARIES})
 
   target_include_directories(${lib} PRIVATE ${TORCH_INCLUDE_DIRS})

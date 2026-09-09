@@ -52,6 +52,7 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
   TORCH_CHECK(
       params.softmax_sink_ptr == nullptr,
       "No-page attention does not support sink logits (softmax_sink_ptr must be null)");
+  TORCH_CHECK(params.rel_bias_ptr == nullptr, "relative attention requires paged KV cache");
   using TileShapeQK_NP = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<sgl::fmha::decode_tiled_kv_np(@HEAD_DIM@)>, cute::_64>;
   using TileShapePV_NP = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<sgl::fmha::decode_tiled_kv_np(@HEAD_DIM@)>>;
   using TileShapeOutput_NP = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;

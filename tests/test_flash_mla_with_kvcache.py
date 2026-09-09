@@ -469,7 +469,7 @@ def make_attn_sink(h_q=H_Q):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("bs", [7, 384, 512])
-@pytest.mark.parametrize("num_heads", [64])
+@pytest.mark.parametrize("num_heads", [16, 32, 64])
 @pytest.mark.parametrize("have_extra", [False, True])
 @pytest.mark.parametrize("have_attn_sink", [False, True])
 @pytest.mark.parametrize("have_topk_length", [False, True])

@@ -33,6 +33,7 @@ suites = {
         TestFile("test_per_token_group_quant_8bit.py"),
         TestFile("test_per_token_group_quant_mxfp4.py"),
         TestFile("test_moe_fused_gate.py"),
+        TestFile("test_minimax_decode_topk.py"),
         TestFile("test_mrope.py"),
         TestFile("test_per_tensor_quant_fp8.py"),
         TestFile("test_per_token_quant_fp8.py"),

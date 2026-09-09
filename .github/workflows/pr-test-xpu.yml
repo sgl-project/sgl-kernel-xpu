@@ -5,6 +5,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+  pull-requests: write
+
 concurrency:
   group: pr-test-xpu-${{ github.ref }}
   cancel-in-progress: true
@@ -12,10 +16,9 @@ concurrency:
 jobs:
   build-and-test:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
-    # Least privilege: every write op below (git push, gh pr create/comment)
-    # authenticates with secrets.PAT, not the workflow GITHUB_TOKEN.
     permissions:
-      contents: read
+      contents: write
+      pull-requests: write
     runs-on: sglang-bmg
     steps:
       - name: Checkout code
@@ -154,9 +157,9 @@ jobs:
           git commit -m "CI intermediate baseline update" || echo "No changes to commit"
           echo "Detected changes in baseline.json: $(git diff --cached --stat)"
 
-          git remote set-url origin https://x-access-token:${{ secrets.PAT }}@github.com/sgl-project/sgl-kernel-xpu.git
+          git remote set-url origin https://x-access-token:${{ github.token }}@github.com/sgl-project/sgl-kernel-xpu.git
           git push -f origin "$BRANCH"
-          export GITHUB_TOKEN="${{ secrets.PAT }}"
+          export GITHUB_TOKEN="${{ github.token }}"
 
           PR_NUMBER=$(gh pr list \
             --repo sgl-project/sgl-kernel-xpu \

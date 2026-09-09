@@ -497,7 +497,7 @@ void mha_fwd(
       int const effective_seqlen_k =
           window_size_left >= 0 ? std::min(max_seqlen_k, window_size_left + 1) : max_seqlen_k;
       int const effective_blocks = (effective_seqlen_k + block_size - 1) / block_size;
-      constexpr int kMinBlocksToSplit = 64;
+      constexpr int kMinBlocksToSplit = 32;
       constexpr int kAlwaysSplitHeadSizeV = 512;
       if (effective_blocks <= kMinBlocksToSplit && head_size_v < kAlwaysSplitHeadSizeV) {
         return 1;

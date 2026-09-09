@@ -236,7 +236,7 @@ CUTE_DEVICE void MoEGEMM(
         }
 #undef XE_GEMM_4BITS_CALLER
       } else {
-        xe_gemm<GmemTiledCopyA, GmemTiledCopyB, GmemTiledCopyD>(
+        moe_xe20::xe_gemm<GmemTiledCopyA, GmemTiledCopyB, GmemTiledCopyD>(
             A_tensor, B_tensor, ptr_Scales_curr_batch, ptr_Bias_curr_batch, D_tensor, tile_coord, mma);
       }
 

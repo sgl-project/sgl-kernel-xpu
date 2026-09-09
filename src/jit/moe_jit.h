@@ -63,5 +63,27 @@ bool w4a16_grouped_gemm_launch(
     int arch = 0,  // sgl::jit::Arch code (0=BMG/Xe20, 1=XE3P/Xe35)
     std::string* err = nullptr);
 
+// Launch the FP8-weight/BF16-activation grouped GEMM. The tile is selected
+// from the routed M, GEMM shape, and scalar/block scale layout exactly as in
+// GroupGemmW8A16Xe20.cpp.
+bool fp8_w8a16_grouped_gemm_launch(
+    int avg_m,
+    int scale_count,
+    void* queue,
+    const void* activations,
+    const void* weights,
+    const void* weight_scales,
+    const void* bias,
+    void* outputs,
+    int gemm_n,
+    int gemm_k,
+    const int* rows_per_expert,
+    int num_experts,
+    int* workspace,
+    int ld_b,
+    bool static_scheduler,
+    int arch = 0,
+    std::string* err = nullptr);
+
 }  // namespace moe_jit
 }  // namespace sgl

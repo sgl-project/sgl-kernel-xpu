@@ -1,4 +1,4 @@
-# End-to-end routed-expert MoE benchmark: both routed-expert GEMMs + scatter +
+# End-to-end routed-expert WNA16 benchmark: both routed-expert GEMMs + scatter +
 # activation + combine. Compares SGLang's sgl_kernel fused_experts against
 # vLLM's XPU XpuFusedMoe (vllm_xpu_kernels) on identical shapes and logical
 # weights. Providers:
@@ -15,7 +15,12 @@
 # CUTLASS/CuTe-style kernel family. This benchmark compares the resulting
 # end-to-end routed-expert integrations.
 #
-# Shapes are TP=1 / EP=1 routed-expert model geometry:
+# The existing W4 provider profiles remain TP=1 / EP=1 routed-expert model
+# geometry. The W8 provider below is a separate SGL-only TP4 shape set using
+# official FP8 MoE model geometries and 128x128 block weight scales:
+#   qwen3.5-35b-tp4: E=256, topk=8, hidden=2048, I_shard=128
+#
+# Existing W4 profiles:
 #   gpt-oss      : experts=32,  topk=4, hidden=2880, intermediate=2880
 #   deepseek-v4  : experts=256, topk=6, hidden=4096, intermediate=2048
 #
@@ -33,11 +38,11 @@
 # must be importable in one env (vllm_xpu_kernels alongside sgl_kernel).
 #
 # Run:
-#   python benchmark/bench_fused_experts_w4a16.py                  # GPT-OSS
-#   SGL_MOE_BENCH_FULL_SHAPES=1 python benchmark/bench_fused_experts_w4a16.py
-#   SGL_MOE_BENCH_FULL_SHAPES=1 python benchmark/bench_fused_experts_w4a16.py --profile deepseek-v4
-#   python benchmark/bench_fused_experts_w4a16.py --sgl-only --tokens 1 32
-#   python benchmark/bench_fused_experts_w4a16.py --json-out out.json
+#   python benchmark/bench_fused_experts_wna16.py                  # GPT-OSS
+#   SGL_MOE_BENCH_FULL_SHAPES=1 python benchmark/bench_fused_experts_wna16.py
+#   SGL_MOE_BENCH_FULL_SHAPES=1 python benchmark/bench_fused_experts_wna16.py --profile deepseek-v4
+#   python benchmark/bench_fused_experts_wna16.py --sgl-only --tokens 1 32
+#   python benchmark/bench_fused_experts_wna16.py --json-out out.json
 
 import gc
 import math
@@ -106,6 +111,129 @@ RUN_FULL_SHAPES = os.environ.get("SGL_MOE_BENCH_FULL_SHAPES") == "1"
 ENABLED_PROFILES = list(MODEL_PROFILES) if RUN_FULL_SHAPES else ["gpt-oss"]
 
 ALL_RESULTS = []
+W8_RESULTS = []
+
+FP8_MAX = 448.0
+FP8_BLOCK_SIZE = 128
+W8_PROFILES = {
+    "qwen3.5-35b-tp4": (2048, 128, 256, 8, True),
+}
+W8_TOKENS = [1, 32, 2048]
+
+
+def _quantize_w8_weights(weights, block_scale, parts):
+    experts, rows, columns = weights.shape
+    if block_scale:
+        blocked = weights.float().reshape(
+            experts,
+            rows // FP8_BLOCK_SIZE,
+            FP8_BLOCK_SIZE,
+            columns // FP8_BLOCK_SIZE,
+            FP8_BLOCK_SIZE,
+        )
+        scales = blocked.abs().amax((2, 4), keepdim=True).clamp_min(1e-12) / FP8_MAX
+        quantized = (blocked / scales).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+        return (
+            quantized.reshape_as(weights).contiguous(),
+            scales.reshape(
+                experts, rows // FP8_BLOCK_SIZE, columns // FP8_BLOCK_SIZE
+            ).contiguous(),
+        )
+
+    chunks = weights.chunk(parts, dim=1)
+    scales = [
+        chunk.float().abs().amax((1, 2), keepdim=True).clamp_min(1e-12) / FP8_MAX
+        for chunk in chunks
+    ]
+    quantized = torch.cat(
+        [
+            (chunk.float() / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+            for chunk, scale in zip(chunks, scales)
+        ],
+        dim=1,
+    )
+    return (
+        quantized.contiguous(),
+        torch.cat(scales, dim=2).view(experts, parts).contiguous(),
+    )
+
+
+def _build_w8_weights(experts, rows, columns, block_scale, parts):
+    weights = torch.empty(
+        (experts, rows, columns), device="xpu", dtype=torch.float8_e4m3fn
+    )
+    if block_scale:
+        scales = torch.empty(
+            (
+                experts,
+                (rows + FP8_BLOCK_SIZE - 1) // FP8_BLOCK_SIZE,
+                (columns + FP8_BLOCK_SIZE - 1) // FP8_BLOCK_SIZE,
+            ),
+            device="xpu",
+            dtype=torch.float32,
+        )
+    else:
+        scales = torch.empty((experts, parts), device="xpu", dtype=torch.float32)
+    for expert in range(experts):
+        source = torch.randn((1, rows, columns), device="xpu", dtype=torch.bfloat16)
+        quantized, expert_scales = _quantize_w8_weights(source, block_scale, parts)
+        weights[expert].copy_(quantized[0])
+        scales[expert].copy_(expert_scales[0])
+    return weights, scales
+
+
+def _prepare_w8_fused(profile_name, tokens):
+    hidden, intermediate, experts, topk, block_scale = W8_PROFILES[profile_name]
+    hidden_states = torch.randn((tokens, hidden), dtype=torch.bfloat16, device="xpu")
+    w1, w1_scale = _build_w8_weights(experts, 2 * intermediate, hidden, block_scale, 2)
+    w2, w2_scale = _build_w8_weights(experts, hidden, intermediate, block_scale, 1)
+    topk_ids = (
+        torch.arange(tokens * topk, device="xpu", dtype=torch.int32).reshape(
+            tokens, topk
+        )
+        % experts
+    )
+    topk_weights = torch.full(
+        (tokens, topk), 1.0 / topk, dtype=torch.float32, device="xpu"
+    )
+    return (
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        w1_scale,
+        w2_scale,
+    )
+
+
+def _run_w8_fused(inputs):
+    return fused_experts(
+        *inputs[:5],
+        activation="silu",
+        use_fp8_w8a8=True,
+        w1_scale=inputs[5],
+        w2_scale=inputs[6],
+    )
+
+
+def benchmark_w8():
+    for profile_name in W8_PROFILES:
+        for tokens in W8_TOKENS:
+            inputs = _prepare_w8_fused(profile_name, tokens)
+            ms = _time_median(
+                lambda: _run_w8_fused(inputs), warmup=5, repetitions=20, inner=1
+            )
+            W8_RESULTS.append(
+                {
+                    "provider": "w8a16_fused",
+                    "profile": profile_name,
+                    "tokens": tokens,
+                    "ms": round(ms, 4),
+                }
+            )
+            del inputs
+            torch.xpu.empty_cache()
 
 
 def _recipe_for_provider(provider):
@@ -737,3 +865,7 @@ if __name__ == "__main__":
             pv[("ms", "mxfp4_fused")] / pv[("ms", "int4_fused")]
         ).round(2)
     print(pv.to_markdown())
+
+    benchmark_w8()
+    print("\nWNA16 W8A16 fused-experts benchmark finished!\n")
+    print(pd.DataFrame(W8_RESULTS).to_markdown(index=False))

@@ -721,6 +721,18 @@ void moe_grouped_mm_nt_xe20_w4a16(
     bool is_int4,
     const int64_t group_size);
 
+// FP8 weight-only MoE grouped GEMM. Activations are BF16, weights are FP8
+// E4M3, and weight_scales is [E, 1]/[E, 2] for per-expert scalar scales or
+// [E, ceil(N/128), K/128] for 128x128 block scales.
+void moe_grouped_mm_nt_xe20_fp8_w8a16(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& weights,
+    const torch::Tensor& weight_scales,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts);
+
 void prepare_moe_input(
     const torch::Tensor& topk_ids,
     torch::Tensor& expert_offsets,
@@ -732,6 +744,13 @@ void prepare_moe_input(
     const int64_t num_experts,
     const int64_t n,
     const int64_t k);
+
+void prepare_moe_input_small(
+    const torch::Tensor& input,
+    const torch::Tensor& topk_ids,
+    torch::Tensor& expert_counts,
+    torch::Tensor& output_permutation,
+    torch::Tensor& output);
 
 void ep_moe_pre_reorder(
     torch::Tensor input,
@@ -1318,5 +1337,20 @@ void load_cache_to_device_buffer_mla(
     int64_t page_size,
     int64_t block_size,
     bool is_dsv4_layout);
+
+/*
+ * MiniMax decode block top-k (MiniMax M3 sparse decode indexer)
+ */
+void minimax_decode_topk(
+    const at::Tensor& score, const at::Tensor& seq_lens, const at::Tensor& out, int64_t block_size, int64_t topk);
+
+std::tuple<at::Tensor, at::Tensor> minimax_decode_topk_page_table(
+    const at::Tensor& score,
+    const at::Tensor& seq_lens,
+    const at::Tensor& req_to_token,
+    const at::Tensor& slot_ids,
+    int64_t block_size,
+    int64_t topk,
+    int64_t page_size);
 
 #pragma GCC visibility pop

@@ -39,11 +39,6 @@
 #include "cutlass/kernel_hardware_info.h"
 #include "cutlass/platform/platform.h"
 #include "cutlass/tensor_ref.h"
-#include "cutlass/util/GPU_Clock.hpp"
-#include "cutlass/util/reference/device/gemm_complex.h"
-#include "cutlass/util/reference/device/tensor_compare.h"
-#include "cutlass/util/reference/host/tensor_fill.h"
-#include "cutlass/util/sycl_event_manager.hpp"
 
 #pragma clang diagnostic ignored "-Wpass-failed"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"

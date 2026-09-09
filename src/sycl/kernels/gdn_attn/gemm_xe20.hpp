@@ -54,7 +54,53 @@ namespace gdn {
 
 using namespace cute;
 
+// Swaps the logical coordinate axis (0 <-> 1) encoded in a subgroup
+// fragment's TV layout. TV-layout strides are built out of `ScaledBasis`
+// elements, where `ScaledBasis<T, N>` means "this stride contributes to
+// logical coordinate axis N"; swapping N=0 and N=1 everywhere reinterprets
+// the same physical register layout as belonging to the transposed logical
+// tensor, without moving any data. Used by `make_transposed_b_fragment`
+// below.
+template <class X>
+CUTE_HOST_DEVICE constexpr auto swap_tv_basis01(X const& x) {
+  return x;
+}
+
+template <class T, int N>
+CUTE_HOST_DEVICE constexpr auto swap_tv_basis01(ScaledBasis<T, N> const& x) {
+  static_assert(N == 0 || N == 1, "swap_tv_basis01 expects a 2D (row,col) TV layout");
+  return ScaledBasis<T, (N == 0 ? 1 : 0)>(x.value());
+}
+
+// Reinterprets `storage` (a plain register tensor already shaped like
+// `mma`'s canonical 16x16 B-operand fragment) as the *transposed* B
+// operand: reordering a C-fragment into the returned view produces, purely
+// in registers, the same values a transposed block-2D global store
+// followed by a transposed reload would have produced. This lets an
+// off-diagonal inverse result be consumed directly as the (transposed) B
+// operand of a later GEMM without a global-memory round trip. Only valid
+// for the 16x16 single-subgroup off-diagonal blocks used by the fused
+// compute-A/inverse kernel's Phase 3.
+template <class TiledMMA, class Engine, class Layout>
+CUTE_DEVICE auto make_transposed_b_fragment(TiledMMA const& mma, Tensor<Engine, Layout>& storage) {
+  auto thr_mma = mma.get_slice(0);
+  auto tile_nk = make_shape(size<1>(mma.tile_mnk()), size<2>(mma.tile_mnk()));
+  auto identity = make_identity_tensor(tile_nk);
+  auto ref = thr_mma.partition_sg_fragment_B(identity);
+  auto transposed_tv = make_layout(shape(ref.tv_layout()), transform_leaf(stride(ref.tv_layout()), [](auto const& s) {
+                                     return swap_tv_basis01(s);
+                                   }));
+  return make_subgroup_tensor(storage, transposed_tv);
+}
+
+// `NoBarrier` skips the mainloop barrier entirely. This is only safe when
+// the caller knows the GEMM has a single K-tile (k_tile_count == 1, e.g.
+// the 16x16x16 off-diagonal-block inverse GEMMs), since the barrier's only
+// purpose is keeping subgroups aligned between successive K-tile
+// iterations -- with one iteration there is nothing to align.
 template <
+    SPIRVScope BarrierScope = ScopeWorkgroup,
+    bool NoBarrier = false,
     class ATensor,
     class BTensor,
     class SGCTensor,
@@ -105,7 +151,7 @@ CUTE_DEVICE void gemm_TTS(
 
   const int prefetch_dist = 3;
 
-  constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
+  constexpr SPIRVScope barrier_scope = BarrierScope;
 
   int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
   int k_tile_prefetch = 0;
@@ -117,7 +163,13 @@ CUTE_DEVICE void gemm_TTS(
   }
 
   for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
-    barrier_arrive(barrier_scope);
+    if constexpr (!NoBarrier) {
+      if constexpr (BarrierScope == ScopeSubgroup) {
+        sycl::group_barrier(item.get_sub_group());
+      } else {
+        barrier_arrive(barrier_scope);
+      }
+    }
 
     copy(copy_a, tAgA(_, _, _, k_tile), tArA);
     copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
@@ -132,11 +184,21 @@ CUTE_DEVICE void gemm_TTS(
 
     cute::gemm(mma, tCrA, tCrB, tCrC);
 
-    barrier_wait(barrier_scope);
+    if constexpr (!NoBarrier) {
+      if constexpr (BarrierScope == ScopeSubgroup) {
+        sycl::group_barrier(item.get_sub_group());
+      } else {
+        barrier_wait(barrier_scope);
+      }
+    }
   }
 }
 
+// `NoBarrier` skips the mainloop barrier entirely (see gemm_TTS above for
+// when this is safe).
 template <
+    SPIRVScope BarrierScope = ScopeWorkgroup,
+    bool NoBarrier = false,
     class ASGCTensor,
     class BTensor,
     class CSGCTensor,
@@ -177,7 +239,7 @@ CUTE_DEVICE void gemm_STS(
 
   const int prefetch_dist = 3;
 
-  constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
+  constexpr SPIRVScope barrier_scope = BarrierScope;
 
   int k_tile_count = ceil_div(shape<1>(B), get<2>(wg_tile));
   int k_tile_prefetch = 0;
@@ -188,7 +250,13 @@ CUTE_DEVICE void gemm_STS(
   }
 
   for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
-    barrier_arrive(barrier_scope);
+    if constexpr (!NoBarrier) {
+      if constexpr (BarrierScope == ScopeSubgroup) {
+        sycl::group_barrier(item.get_sub_group());
+      } else {
+        barrier_arrive(barrier_scope);
+      }
+    }
 
     copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
 
@@ -200,11 +268,19 @@ CUTE_DEVICE void gemm_STS(
 
     cute::gemm(mma, tCrA, tCrB, tCrC);
 
-    barrier_wait(barrier_scope);
+    if constexpr (!NoBarrier) {
+      if constexpr (BarrierScope == ScopeSubgroup) {
+        sycl::group_barrier(item.get_sub_group());
+      } else {
+        barrier_wait(barrier_scope);
+      }
+    }
   }
 }
 
 template <
+    SPIRVScope BarrierScope = ScopeWorkgroup,
+    bool NoBarrier = false,
     class ATensor,
     class BSGCTensor,
     class CSGCTensor,
@@ -245,7 +321,7 @@ CUTE_DEVICE void gemm_TSS(
 
   const int prefetch_dist = 3;
 
-  constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
+  constexpr SPIRVScope barrier_scope = BarrierScope;
 
   int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
   int k_tile_prefetch = 0;
@@ -256,7 +332,13 @@ CUTE_DEVICE void gemm_TSS(
   }
 
   for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
-    barrier_arrive(barrier_scope);
+    if constexpr (!NoBarrier) {
+      if constexpr (BarrierScope == ScopeSubgroup) {
+        sycl::group_barrier(item.get_sub_group());
+      } else {
+        barrier_arrive(barrier_scope);
+      }
+    }
 
     copy(copy_a, tAgA(_, _, _, k_tile), tArA);
 
@@ -268,7 +350,13 @@ CUTE_DEVICE void gemm_TSS(
 
     cute::gemm(mma, tCrA, tCrB, tCrC);
 
-    barrier_wait(barrier_scope);
+    if constexpr (!NoBarrier) {
+      if constexpr (BarrierScope == ScopeSubgroup) {
+        sycl::group_barrier(item.get_sub_group());
+      } else {
+        barrier_wait(barrier_scope);
+      }
+    }
   }
 }
 

@@ -20,7 +20,12 @@ import sys
 import pytest
 import torch
 from sgl_kernel import fused_experts
-from sgl_kernel.moe import _MOE_WS_HEADROOM, _get_moe_ws, _moe_ws_cache
+from sgl_kernel.moe import (
+    _MOE_WS_HEADROOM,
+    _get_moe_ws,
+    _moe_ws_cache,
+    _moe_ws_view_cache,
+)
 from test_moe_gemm import create_random_xpu_tensor, torch_naive_moe
 
 pytestmark = pytest.mark.skipif(
@@ -41,8 +46,10 @@ def _xpu_device() -> torch.device:
 @pytest.fixture(autouse=True)
 def clear_moe_workspace_cache():
     _moe_ws_cache.clear()
+    _moe_ws_view_cache.clear()
     yield
     _moe_ws_cache.clear()
+    _moe_ws_view_cache.clear()
 
 
 def _cache_key(name: str):
@@ -65,13 +72,14 @@ def test_get_moe_ws_first_call_allocates_with_headroom():
 
 
 def test_get_moe_ws_reuses_same_storage_for_equal_or_smaller_shape():
-    _get_moe_ws("foo", (100,), torch.float32, _xpu_device())
+    first_view = _get_moe_ws("foo", (100,), torch.float32, _xpu_device())
     key = _cache_key("foo")
     ptr1 = _moe_ws_cache[key].data_ptr()
     numel1 = _moe_ws_cache[key].numel()
 
     # Same shape: must reuse the exact same underlying buffer.
-    _get_moe_ws("foo", (100,), torch.float32, _xpu_device())
+    second_view = _get_moe_ws("foo", (100,), torch.float32, _xpu_device())
+    assert second_view is first_view
     assert _moe_ws_cache[key].data_ptr() == ptr1
     assert _moe_ws_cache[key].numel() == numel1
 
@@ -79,6 +87,7 @@ def test_get_moe_ws_reuses_same_storage_for_equal_or_smaller_shape():
     t3 = _get_moe_ws("foo", (10,), torch.float32, _xpu_device())
     assert _moe_ws_cache[key].data_ptr() == ptr1
     assert t3.shape == (10,)
+    assert _get_moe_ws("foo", (10,), torch.float32, _xpu_device()) is t3
 
 
 def test_get_moe_ws_grows_for_larger_shape():

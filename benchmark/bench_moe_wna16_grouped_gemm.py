@@ -1,7 +1,7 @@
-# Op-level benchmark for the 4-bit W4A16 MoE grouped GEMM. Compares SGLang's
+# Op-level benchmark for WNA16 MoE grouped GEMM (W4A16 and FP8 W8A16). Compares
+# SGLang's
 # sgl_kernel and vLLM's XPU grouped-GEMM integrations on identical shapes and
-# identical logical weights. Both use the Xe2 tiled CUTLASS/CuTe-style W4A16
-# kernel family; the sgl_kernel path extends its quantized-weight conventions.
+# identical logical weights. Both use Xe2 tiled CUTLASS/CuTe-style kernels.
 # Providers:
 #
 #   mxfp4_fused     sgl_kernel moe_grouped_mm_nt_xe20_w4a16 on MXFP4 packed
@@ -21,15 +21,17 @@
 # Both packages must be importable in one env (vllm_xpu_kernels alongside
 # sgl_kernel); see the repo setup notes.
 #
-# Model shapes represent one rank of an 8-device SGLang deployment with
-# tp_size=8 and ep_size=8. In this mode moe_tp_size=1, so each rank keeps the
-# full intermediate width and stores one eighth of the experts. The quick set
-# includes GPT-OSS geometry (4 local experts, hidden=2880, intermediate=2880).
+# The W4 benchmark shapes below are the existing TP8/EP8 production harness.
+# The W8 benchmark shapes are separate and use TP4 model geometry from the
+# repository's existing MoE benchmark configurations.
 # Set SGL_MOE_BENCH_FULL_SHAPES=1 to also include DeepSeek-V4 geometry (32 local
 # experts, hidden=4096, intermediate=2048) and higher-load model points.
+# Set SGL_MOE_BENCH_MODEL=gpt-oss-120b to run the dedicated GPT-OSS-120B
+# profile: all 16 TP4/TP8 prefill/decode production workloads and no generic
+# shape sweep.
 #
 # Run:
-#   python benchmark/bench_moe_w4a16_grouped_gemm.py
+#   python benchmark/bench_moe_wna16_grouped_gemm.py
 
 import gc
 import math
@@ -99,16 +101,342 @@ FULL_BENCH_SHAPES = QUICK_BENCH_SHAPES + [
 ]
 
 RUN_FULL_SHAPES = os.environ.get("SGL_MOE_BENCH_FULL_SHAPES") == "1"
+BENCH_MODEL = os.environ.get("SGL_MOE_BENCH_MODEL", "").lower()
+RUN_GPT_OSS_120B = BENCH_MODEL == "gpt-oss-120b" or (
+    os.environ.get("SGL_MOE_BENCH_GPT_OSS_TP4_L0") == "1"
+)
 BENCH_SHAPES = FULL_BENCH_SHAPES if RUN_FULL_SHAPES else QUICK_BENCH_SHAPES
 print(
-    f"[config] grouped-GEMM shape set: "
-    f"{'full' if RUN_FULL_SHAPES else 'quick'} ({len(BENCH_SHAPES)} shapes)",
+    "[config] grouped-GEMM shape set: "
+    + (
+        "gpt-oss-120b (16 production workloads)"
+        if RUN_GPT_OSS_120B
+        else f"{'full' if RUN_FULL_SHAPES else 'quick'} ({len(BENCH_SHAPES)} shapes)"
+    ),
     flush=True,
 )
 
 
 ALL_RESULTS = []
+W8_RESULTS = []
+
+FP8_MAX = 448.0
+FP8_BLOCK_SIZE = 128
+W8_BENCH_SHAPES = [
+    # Qwen3.5-35B-A3B-FP8 TP4: E=256, topk=8, H=2048, I_shard=128.
+    # The official checkpoint uses dynamic activation scales and 128x128
+    # block weight scales.
+    (256, 1, 256, 2048, "block"),
+    (256, 8, 256, 2048, "block"),
+    (256, 1, 2048, 128, "block"),
+    (256, 256, 2048, 128, "block"),
+]
+
+
+def _quantize_w8_weights(weights, scale_layout):
+    if scale_layout == "block":
+        experts, rows, columns = weights.shape
+        blocked = weights.float().reshape(
+            experts,
+            rows // FP8_BLOCK_SIZE,
+            FP8_BLOCK_SIZE,
+            columns // FP8_BLOCK_SIZE,
+            FP8_BLOCK_SIZE,
+        )
+        scales = blocked.abs().amax((2, 4), keepdim=True).clamp_min(1e-12) / FP8_MAX
+        quantized = (blocked / scales).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+        return (
+            quantized.reshape_as(weights).contiguous(),
+            scales.reshape(
+                experts, rows // FP8_BLOCK_SIZE, columns // FP8_BLOCK_SIZE
+            ).contiguous(),
+        )
+
+    parts = 2 if scale_layout == "scalar_gemm1" else 1
+    chunks = weights.chunk(parts, dim=1)
+    scales = [
+        chunk.float().abs().amax((1, 2), keepdim=True).clamp_min(1e-12) / FP8_MAX
+        for chunk in chunks
+    ]
+    quantized = [
+        (chunk.float() / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+        for chunk, scale in zip(chunks, scales)
+    ]
+    return (
+        torch.cat(quantized, dim=1).contiguous(),
+        torch.cat(scales, dim=2).view(weights.shape[0], parts).contiguous(),
+    )
+
+
+def _build_w8_weights(num_experts, gemm_n, gemm_k, scale_layout):
+    weights = torch.empty(
+        (num_experts, gemm_n, gemm_k), device="xpu", dtype=torch.float8_e4m3fn
+    )
+    if scale_layout == "block":
+        scales = torch.empty(
+            (
+                num_experts,
+                (gemm_n + FP8_BLOCK_SIZE - 1) // FP8_BLOCK_SIZE,
+                (gemm_k + FP8_BLOCK_SIZE - 1) // FP8_BLOCK_SIZE,
+            ),
+            device="xpu",
+            dtype=torch.float32,
+        )
+    else:
+        parts = 2 if scale_layout == "scalar_gemm1" else 1
+        scales = torch.empty((num_experts, parts), device="xpu", dtype=torch.float32)
+    for expert in range(num_experts):
+        source = torch.randn((1, gemm_n, gemm_k), device="xpu", dtype=torch.bfloat16)
+        quantized, expert_scales = _quantize_w8_weights(source, scale_layout)
+        weights[expert].copy_(quantized[0])
+        scales[expert].copy_(expert_scales[0])
+    return weights, scales
+
+
+def _prepare_w8_inputs(num_experts, avg_m, gemm_n, gemm_k, scale_layout):
+    total_m = num_experts * avg_m
+    activations = torch.randn((total_m, gemm_k), device="xpu", dtype=torch.bfloat16)
+    weights, scales = _build_w8_weights(num_experts, gemm_n, gemm_k, scale_layout)
+    return {
+        "activations": activations,
+        "weights": weights,
+        "scales": scales,
+        "output": torch.empty((total_m, gemm_n), device="xpu", dtype=torch.bfloat16),
+        "rows": torch.full((num_experts,), avg_m, device="xpu", dtype=torch.int32),
+        "num_experts": num_experts,
+        "gemm_n": gemm_n,
+    }
+
+
+def _run_w8(inputs):
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
+        inputs["output"],
+        inputs["activations"],
+        inputs["weights"],
+        inputs["scales"],
+        None,
+        inputs["rows"],
+        inputs["num_experts"],
+    )
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["num_experts", "avg_m", "gemm_n", "gemm_k", "scale_layout"],
+        x_vals=W8_BENCH_SHAPES,
+        line_arg="provider",
+        line_vals=["w8a16_fused"],
+        line_names=["w8a16_fused (sgl_kernel Xe2 grouped GEMM)"],
+        styles=[("purple", "-")],
+        ylabel="Time (ms)",
+        plot_name="moe-w8a16-gemm-op-level",
+        args={},
+    )
+)
+def benchmark_w8(num_experts, avg_m, gemm_n, gemm_k, scale_layout, provider):
+    inputs = _prepare_w8_inputs(num_experts, avg_m, gemm_n, gemm_k, scale_layout)
+    for _ in range(5):
+        _run_w8(inputs)
+    torch.xpu.synchronize()
+    ms, ms_min, ms_max = triton.testing.do_bench(
+        lambda: _run_w8(inputs), warmup=50, rep=200, quantiles=[0.5, 0.2, 0.8]
+    )
+    total_m = inputs["activations"].shape[0]
+    flop = 2 * total_m * gemm_n * gemm_k
+    tflops = flop / (ms / 1e3) / 1e12
+    W8_RESULTS.append(
+        {
+            "provider": provider,
+            "num_experts": num_experts,
+            "avg_m": avg_m,
+            "gemm_n": gemm_n,
+            "gemm_k": gemm_k,
+            "scale_layout": scale_layout,
+            "ms": round(ms, 4),
+            "ms_min": round(ms_min, 4),
+            "ms_max": round(ms_max, 4),
+            "tflops": round(tflops, 2),
+        }
+    )
+    del inputs
+    torch.xpu.empty_cache()
+    return ms
+
+
 _MXFP4_CPU_WEIGHT_CACHE = {}
+
+# GPT-OSS-120B TP=4, layer 0. This is the real 128-expert routing vector from
+# fmha-cri's examples/16_bmg_moe_gemm/gpt_oss_120b_workloads.hpp. The total is
+# 16,384 routed rows; its long tails are why the 64-row production tile matters.
+GPT_OSS_120B_TP4_L0_ROWS = (
+    50,
+    32,
+    48,
+    37,
+    60,
+    54,
+    32,
+    267,
+    100,
+    33,
+    72,
+    12,
+    1422,
+    47,
+    70,
+    176,
+    474,
+    21,
+    76,
+    35,
+    47,
+    72,
+    45,
+    37,
+    41,
+    101,
+    27,
+    102,
+    699,
+    48,
+    65,
+    80,
+    43,
+    46,
+    62,
+    59,
+    114,
+    12,
+    33,
+    4,
+    56,
+    74,
+    86,
+    56,
+    74,
+    78,
+    199,
+    3,
+    138,
+    36,
+    98,
+    81,
+    42,
+    228,
+    58,
+    205,
+    117,
+    82,
+    88,
+    47,
+    107,
+    58,
+    56,
+    78,
+    69,
+    128,
+    51,
+    88,
+    110,
+    55,
+    83,
+    349,
+    51,
+    67,
+    67,
+    30,
+    1028,
+    58,
+    46,
+    55,
+    39,
+    39,
+    52,
+    538,
+    398,
+    112,
+    72,
+    190,
+    196,
+    21,
+    61,
+    33,
+    35,
+    23,
+    208,
+    43,
+    39,
+    18,
+    46,
+    137,
+    53,
+    42,
+    57,
+    682,
+    48,
+    124,
+    32,
+    32,
+    151,
+    29,
+    56,
+    82,
+    53,
+    59,
+    98,
+    88,
+    39,
+    151,
+    51,
+    124,
+    39,
+    45,
+    49,
+    80,
+    85,
+    40,
+    20,
+    2340,
+)
+
+
+# Remaining production vectors, copied verbatim from gpt_oss_120b_workloads.hpp.
+def _rows(csv):
+    values = tuple(map(int, csv.split(",")))
+    assert len(values) == 128
+    return values
+
+
+GPT_OSS_120B_TP4_L14_ROWS = _rows(
+    "283,2509,0,1,0,0,210,0,0,0,6,30,6,2,13,0,0,0,0,5,0,1,79,0,0,0,0,70,0,0,3487,0,"
+    "3,0,0,131,32,1229,0,0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,177,0,43,0,0,0,0,17,0,0,0,"
+    "0,237,4,48,0,0,98,0,2,0,0,3,0,123,11,0,208,0,0,9,0,0,0,0,155,139,1,0,0,3,"
+    "0,0,4,0,0,2,156,1,0,0,1617,404,0,13,0,69,0,1,4096,0,0,51,0,0,581,10,0,0,0,0,0,0,0"
+)
+GPT_OSS_120B_TP4_L35_ROWS = _rows(
+    "0,0,0,76,22,32,0,1,0,0,0,3573,0,0,0,1,0,0,0,0,0,0,0,0,2,0,396,0,0,0,1,0,"
+    "0,0,64,0,478,0,0,0,0,0,3,0,49,0,22,0,0,0,0,0,92,0,0,0,0,0,0,0,0,100,2,0,"
+    "0,0,75,1,0,0,0,199,0,0,0,0,0,0,7,0,4,35,0,0,0,0,2,0,298,4,0,0,0,0,0,2736,"
+    "0,0,5,0,12,0,541,12,23,40,0,0,0,0,0,26,0,398,0,0,4080,0,0,0,48,0,16,0,2,0,0,2906"
+)
+GPT_OSS_120B_TP8_L0_ROWS = _rows(
+    "73,29,29,45,53,43,27,208,122,29,72,16,1461,53,47,173,502,18,60,41,48,54,39,24,42,113,28,104,733,64,104,60,"
+    "45,53,80,57,120,9,32,4,46,61,94,59,72,75,245,5,172,38,75,72,48,223,45,177,126,78,90,43,68,44,65,59,"
+    "64,145,70,84,85,60,68,322,55,65,64,28,1101,55,46,63,35,45,43,542,350,122,75,186,176,16,64,35,17,25,"
+    "186,57,26,18,52,134,52,51,38,651,52,156,49,30,148,19,46,91,52,67,115,86,39,146,54,136,35,49,37,49,81,39,25,2418"
+)
+GPT_OSS_120B_TP8_L14_ROWS = _rows(
+    "329,2489,0,1,0,0,213,0,0,0,4,30,7,0,8,0,0,0,0,10,0,0,97,0,0,0,0,68,0,0,3510,0,"
+    "6,0,0,98,27,1461,0,0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,139,0,49,0,0,0,0,39,0,0,0,"
+    "0,265,3,45,0,0,107,0,5,0,0,1,0,115,12,0,164,0,0,13,0,0,0,0,112,138,3,0,0,5,"
+    "0,1,2,0,0,0,120,0,0,0,1549,336,0,7,0,74,0,4,4094,0,0,52,0,0,557,11,0,0,0,0,0,0,0"
+)
+GPT_OSS_120B_TP8_L35_ROWS = _rows(
+    "0,0,0,107,13,34,0,1,0,0,0,3501,0,0,1,2,0,0,0,1,0,0,0,0,0,0,368,0,0,0,2,0,"
+    "0,0,57,0,650,0,0,0,0,0,2,0,90,0,14,0,0,0,0,0,83,1,0,0,0,0,0,0,0,133,3,0,"
+    "0,0,40,3,0,0,0,179,0,0,0,0,1,0,4,0,4,66,0,0,0,0,2,0,299,4,0,0,0,0,0,2713,"
+    "2,0,11,0,14,0,585,12,29,24,0,0,0,0,0,15,0,377,0,0,4076,0,0,0,33,0,29,0,1,0,0,2798"
+)
 
 
 def _quantize_bf16_weights_mxfp4(num_experts: int, N: int, K: int):
@@ -255,6 +583,7 @@ def _prepare_inputs(
     gemm_k: int,
     recipe: str = "mxfp4",
     backend: str = "sgl",
+    rows_per_expert=None,
 ):
     """Build the XPU tensors for one provider.
 
@@ -278,8 +607,14 @@ def _prepare_inputs(
     torch.manual_seed(0)
     torch.xpu.manual_seed_all(0)
 
-    total_m = num_experts * avg_m
-    total_rows = torch.full((num_experts,), avg_m, dtype=torch.int32, device="xpu")
+    if rows_per_expert is None:
+        total_m = num_experts * avg_m
+        total_rows = torch.full((num_experts,), avg_m, dtype=torch.int32, device="xpu")
+    else:
+        if len(rows_per_expert) != num_experts:
+            raise ValueError("rows_per_expert must have one value per expert")
+        total_m = sum(rows_per_expert)
+        total_rows = torch.tensor(rows_per_expert, dtype=torch.int32, device="xpu")
 
     a = torch.empty((total_m, gemm_k), dtype=torch.bfloat16, device="xpu").normal_(
         0, 0.01
@@ -511,6 +846,77 @@ def benchmark(num_experts, avg_m, gemm_n, gemm_k, provider):
     return ms
 
 
+def _run_gpt_oss_120b_benchmark():
+    """Time all 16 real ragged GPT-OSS-120B production calls.
+
+    This uses the same registered op as the model path.  The warmup is expressed
+    in device-time iterations rather than host time, so it reaches the stable
+    GPU clock before the median is collected.
+    """
+    decode_tp4 = tuple(int(i in (14, 49, 79, 118)) for i in range(128))
+    decode_tp8 = tuple(int(i in (22, 36, 73, 115)) for i in range(128))
+    workloads = (
+        ("gpt-oss-120b-prefill-l0", GPT_OSS_120B_TP4_L0_ROWS, 1472, 2880, 2880, 736),
+        ("gpt-oss-120b-prefill-l14", GPT_OSS_120B_TP4_L14_ROWS, 1472, 2880, 2880, 736),
+        ("gpt-oss-120b-prefill-l35", GPT_OSS_120B_TP4_L35_ROWS, 1472, 2880, 2880, 736),
+        ("gpt-oss-120b-decode", decode_tp4, 1472, 2880, 2880, 736),
+        ("gpt-oss-120b-tp8-prefill-l0", GPT_OSS_120B_TP8_L0_ROWS, 768, 2880, 2880, 384),
+        (
+            "gpt-oss-120b-tp8-prefill-l14",
+            GPT_OSS_120B_TP8_L14_ROWS,
+            768,
+            2880,
+            2880,
+            384,
+        ),
+        (
+            "gpt-oss-120b-tp8-prefill-l35",
+            GPT_OSS_120B_TP8_L35_ROWS,
+            768,
+            2880,
+            2880,
+            384,
+        ),
+        ("gpt-oss-120b-tp8-decode", decode_tp8, 768, 2880, 2880, 384),
+    )
+    shapes = tuple(
+        (f"{name}-gemm{gemm}", rows, n, k)
+        for name, rows, n1, k1, n2, k2 in workloads
+        for gemm, n, k in ((1, n1, k1), (2, n2, k2))
+    )
+    print("\n[GPT-OSS-120B production routing: 16 workloads]", flush=True)
+    for name, rows, gemm_n, gemm_k in shapes:
+        inputs = _prepare_inputs(
+            len(rows),
+            sum(rows) // len(rows),
+            gemm_n,
+            gemm_k,
+            recipe="mxfp4",
+            backend="sgl",
+            rows_per_expert=rows,
+        )
+        for _ in range(20):
+            _run_mxfp4_fused(inputs)
+        torch.xpu.synchronize()
+        ms, ms_min, ms_max = triton.testing.do_bench(
+            lambda: _run_mxfp4_fused(inputs),
+            warmup=6000,
+            rep=1000,
+            quantiles=[0.5, 0.2, 0.8],
+        )
+        total_m = inputs["total_m"]
+        tflops = 2 * total_m * gemm_n * gemm_k / (ms / 1e3) / 1e12
+        print(
+            f"{name}: rows={total_m}, N={gemm_n}, K={gemm_k}, "
+            f"median={ms:.4f} ms, p20={ms_min:.4f} ms, p80={ms_max:.4f} ms, "
+            f"{tflops:.2f} TFLOP/s",
+            flush=True,
+        )
+        del inputs
+        gc.collect()
+        torch.xpu.empty_cache()
+
+
 def _correctness_check(rel_tol=CORRECTNESS_REL_TOL):
     """Cross-check sgl_kernel vs vLLM outputs on the same logical weights.
 
@@ -571,6 +977,11 @@ def _correctness_check(rel_tol=CORRECTNESS_REL_TOL):
 
 
 if __name__ == "__main__":
+    if RUN_GPT_OSS_120B:
+        _run_gpt_oss_120b_benchmark()
+        print("\nGPT-OSS-120B benchmark finished!\n")
+        raise SystemExit(0)
+
     _correctness_check()
     benchmark.run(print_data=False)
     print("\nBenchmark finished!\n")
@@ -612,3 +1023,7 @@ if __name__ == "__main__":
             pv[("ms", "mxfp4_fused")] / pv[("ms", "int4_fused")]
         ).round(2)
     print(pv.to_markdown())
+
+    benchmark_w8.run(print_data=False)
+    print("\nWNA16 W8A16 benchmark finished!\n")
+    print(pd.DataFrame(W8_RESULTS).to_markdown(index=False))

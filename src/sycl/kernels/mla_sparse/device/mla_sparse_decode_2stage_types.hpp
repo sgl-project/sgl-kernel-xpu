@@ -81,13 +81,13 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <sycl/sycl.hpp>
 
 #include "../../../Utils.h"  // CUTLASS_CHECK (used by mla_sparse_runner.hpp)
 #include "cutlass/bfloat16.h"
 #include "cutlass/float8.h"
-#include "cutlass/kernel_hardware_info.hpp"
 // The collective headers pull in the full cute/cutlass sycl-tla stack (defining
 // cute::intel, etc.) that mla_sparse_runner.hpp -> comm/common.h references. They
 // sort under collective/ (before device/), so the runner always sees cute::intel
@@ -103,6 +103,8 @@
 // collectives; the gather kernel is independent of it.
 #include "sycl/kernels/mla_sparse/kernel/xe_mla_sparse_2stage_dense_kernel.hpp"
 #include "sycl/kernels/mla_sparse/kernel/xe_mla_sparse_2stage_gather_kernel.hpp"
+// Optional third stage, instantiated only when the config's IS_SPLIT_KV is true.
+#include "sycl/kernels/mla_sparse/kernel/xe_mla_sparse_2stage_reduce_split_kv.hpp"
 
 namespace cutlass::flash_attention::kernel {
 
@@ -142,7 +144,8 @@ template <
     int B_H_,
     template <int> class GatherKernelTmpl_ = SparseDecodeGatherDequantKernel,
     int V_SPLIT_ = FLASH_MLA_PREFILL_V_SPLIT,
-    bool HAS_MAX_LOGITS_ = false>
+    bool HAS_MAX_LOGITS_ = false,
+    bool IS_SPLIT_KV_ = false>
 struct MlaSparseDecode2StageXe {
   // Stage-2 DPAS / tile geometry. Complete at this point, so it can be handed to the
   // collectives below without the former self-reference.
@@ -153,6 +156,9 @@ struct MlaSparseDecode2StageXe {
   // Prefill returns the pre-sink row max (max_logits) alongside lse; decode does not.
   // Threaded into the epilogue so the extra store is compiled out for decode.
   static constexpr bool HAS_MAX_LOGITS = HAS_MAX_LOGITS_;
+  // Re-exported for the host side: the Impl only allocates the split-K scratch and
+  // resolves num_kv_splits when this is true.
+  static constexpr bool IS_SPLIT_KV = IS_SPLIT_KV_;
 
   // Re-exported for the host side: the run* Impls TORCH_CHECK the op's d_qk / d_v
   // against these, and D_QK also keys the gather kernel below.
@@ -164,11 +170,22 @@ struct MlaSparseDecode2StageXe {
   using CollectiveMainloop =
       cutlass::flash_attention::collective::XeMlaSparse2StageMainloop<D_QK, IS_FP8_QUERY, TileTraits>;
   using CollectiveEpilogue = cutlass::flash_attention::collective::
-      XeMlaSparse2StageEpilogue<CollectiveMainloop, HAS_ATTN_SINK, HAS_MAX_LOGITS>;
-  using TileScheduler = cutlass::flash_attention::kernel::XeMlaSparse2StageIndividualTileScheduler<B_H_>;
+      XeMlaSparse2StageEpilogue<CollectiveMainloop, HAS_ATTN_SINK, HAS_MAX_LOGITS, IS_SPLIT_KV>;
+  using TileScheduler = cutlass::flash_attention::kernel::XeMlaSparse2StageIndividualTileScheduler<B_H_, V_SPLIT_>;
 
   using DenseKernel = cutlass::flash_attention::kernel::
       XeMlaSparse2StageDenseKernel<CollectiveMainloop, CollectiveEpilogue, TileScheduler>;
+
+  // Stage-3 split-K reduction companion, present only under IS_SPLIT_KV. It derives
+  // everything (geometry, element type, HAS_ATTN_SINK / HAS_MAX_LOGITS, kvMaxSplits) from
+  // DenseKernel and shares its Params type, so there is nothing to keep in sync here.
+  using ReduceKernel = cute::conditional_t<
+      IS_SPLIT_KV,
+      cutlass::flash_attention::kernel::XeMlaSparse2StageReduceSplitKV<DenseKernel>,
+      cutlass::flash_attention::device::detail::DummyReduceKernel>;
+
+  // Largest split factor the host heuristic may pick, re-exported from the kernel.
+  static constexpr int kvMaxSplits = DenseKernel::kvMaxSplits;
 
   // Stage-1 gather kernel: an independent kernel with its own Arguments/Params,
   // selected here (decode dequant vs prefill dense copy). This config struct is the
@@ -183,36 +200,44 @@ struct MlaSparseDecode2StageXe {
   // Dense GrfSize is 256 (see note above); XE3P's 512-GRF mode from the prior manual
   // launch is capped to 256 by the shared launch<> helper's {128,256} constraint. The
   // gather's GRF mode is picked by the runner (MLASparse::kGatherGrfSize).
-  using Fmla = cutlass::flash_attention::device::MLASparse<DenseKernel, 256, GatherKernel>;
+  // The reduction companion is a no-op placeholder unless IS_SPLIT_KV, in which case
+  // Fmla::run issues gather -> dense -> reduce on the in-order queue.
+  using Fmla = cutlass::flash_attention::device::MLASparse<DenseKernel, 256, GatherKernel, ReduceKernel>;
 };
+
+// ---------------------------------------------------------------------------
+// Split-K build switch.
+// ---------------------------------------------------------------------------
+#ifndef FLASH_MLA_SPARSE_2STAGE_SPLIT_K
+#define FLASH_MLA_SPARSE_2STAGE_SPLIT_K 1
+#endif
+
+// ---------------------------------------------------------------------------
+// Resolves the split-K factor for one call.
+// ---------------------------------------------------------------------------
+static inline int resolve_sparse_2stage_num_kv_splits(
+    int b, int s_q, int h_q, int B_H, int V_SPLIT, int gathered_topk, int B_TOPK, int kv_max_splits) {
+  // will remove the case for b == 8 and gathered_topk >= 512 in the future.
+  if (b == 8 && gathered_topk >= 512) {
+    return 1;
+  }
+  const int num_topk_blocks = std::max(1, (gathered_topk + B_TOPK - 1) / B_TOPK);
+  constexpr int WGS_PER_CORE = 8;
+  constexpr int MIN_BLOCKS_PER_SPLIT = 2;
+
+  const int64_t base_wgs = int64_t((h_q + B_H - 1) / B_H) * s_q * b * V_SPLIT;
+  if (base_wgs <= 0) return 1;
+  const int64_t target_wgs = int64_t(WGS_PER_CORE) * dpcppMaxComputeUnitSize();
+
+  int splits = static_cast<int>(std::max<int64_t>(1, target_wgs / base_wgs));
+  splits = std::min(splits, kv_max_splits);
+  splits = std::min(splits, std::max(1, num_topk_blocks / MIN_BLOCKS_PER_SPLIT));
+
+  return std::max(1, splits);
+}
 
 }  // namespace cutlass::flash_attention::kernel
 
-// ---------------------------------------------------------------------------
-// args_from_options_2stage: adapts our op's tensor arguments into the runner's
-// two-stage Arguments ({dense, gather}), fanning each field out into the layer that
-// reads it (dense: kernel / mainloop / epilogue / scheduler; gather: its own
-// standalone params). Analog of args_from_options() in the dense MLA path, which
-// likewise fills one Arguments object covering both the attention kernel and its
-// split-KV reduction companion.
-//
-// Structural analog of args_from_options_sparse() in the fused
-// mla_sparse_decode_types.hpp: it derives problem shapes/strides from the
-// tensors and populates the launcher argument struct, but performs no
-// allocation and no launch. The gather workspaces (gathered_k /
-// gathered_valid_mask) are allocated by the caller (runMlaSparse2StageImpl) and
-// passed in so their strides can be recorded here. The batch (shape.b + the per-slice
-// b copies) is set to the full batch; the chunk loop in the Impl re-bases the batched
-// pointers per chunk via rebase_decode_chunk().
-//
-// T is the resolved config struct (MlaSparseDecode2StageXe<...>), so the return type
-// is its runner's Arguments -- same convention as args_from_options<T> in the dense
-// MLA path (mla/device/mla_decode_types.hpp). The PR decode kernels are bf16-query
-// (KernelTraits::ElementQ = cutlass::bfloat16_t); the FP8-query path
-// (is_fp8_query) is not wired through this op yet, so bf16 query is required
-// (checked in runMlaSparse2Stage). The gathered-KV / out casts are fixed to
-// cutlass::bfloat16_t by the params field types.
-// ---------------------------------------------------------------------------
 template <typename T>
 inline typename T::Fmla::Arguments args_from_options_2stage(
     at::Tensor& out,                                     // [B, 1, H, head_dim_v]
@@ -228,7 +253,11 @@ inline typename T::Fmla::Arguments args_from_options_2stage(
     const at::Tensor& gathered_k,                        // [chunk_b, 1, gathered_topk, 512] bf16 workspace
     const at::Tensor& gathered_valid_mask,               // [chunk_b, 1, gathered_topk] int workspace
     double sm_scale,
-    int64_t head_dim_v) {
+    int64_t head_dim_v,
+    const std::optional<at::Tensor>& o_accum = std::nullopt,           // [chunk_b, 1, splits, H, D_V] bf16
+    const std::optional<at::Tensor>& split_exp_sums = std::nullopt,    // [chunk_b, 1, splits, H] fp32
+    const std::optional<at::Tensor>& split_max_logits = std::nullopt,  // [chunk_b, 1, splits, H] fp32
+    int num_kv_splits = 1) {
   namespace F = cutlass::flash_attention::kernel;
 
   const int b = q.size(0);
@@ -246,10 +275,6 @@ inline typename T::Fmla::Arguments args_from_options_2stage(
   const int extra_page_block_size = has_extra ? static_cast<int>(extra_k_cache.value().size(1)) : 0;
   const int extra_topk = has_extra ? static_cast<int>(extra_indices.value().size(2)) : 0;
   const int gathered_topk = topk + extra_topk;
-
-  cutlass::KernelHardwareInfo hw_info;
-  hw_info.device_id = q.device().index();
-  hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
   auto to_int_stride = [](int64_t s) {
     TORCH_CHECK(s <= std::numeric_limits<int>::max(), "Stride exceeds int32 limit: ", s);
@@ -363,27 +388,32 @@ inline typename T::Fmla::Arguments args_from_options_2stage(
   // --- Tile scheduler slice. ---
   params.scheduler.h_q = h_q;
   params.scheduler.s_q = s_q;
+  params.scheduler.num_kv_splits = num_kv_splits;
 
-  (void)hw_info;
+  if constexpr (T::IS_SPLIT_KV) {
+    TORCH_CHECK(num_kv_splits >= 1, "num_kv_splits must be >= 1, got ", num_kv_splits);
+    TORCH_CHECK(
+        o_accum.has_value() && split_exp_sums.has_value() && split_max_logits.has_value(),
+        "2-stage sparse MLA split-K requires the o_accum / split_exp_sums / split_max_logits workspaces");
+
+    const F::SparseSplitKV2StageWorkspaceLayout layout(b, s_q, h_q, num_kv_splits, T::D_V, sizeof(cutlass::bfloat16_t));
+
+    k.o_accum = reinterpret_cast<cutlass::bfloat16_t*>(o_accum.value().data_ptr());
+    k.stride_o_accum_b = layout.stride_o_accum_b;
+    k.stride_o_accum_s_q = layout.stride_o_accum_s_q;
+    k.stride_o_accum_split = layout.stride_o_accum_split;
+    k.stride_o_accum_h_q = layout.stride_o_accum_h_q;
+
+    ep.split_exp_sums = reinterpret_cast<float*>(split_exp_sums.value().data_ptr());
+    ep.split_max_logits = reinterpret_cast<float*>(split_max_logits.value().data_ptr());
+    ep.stride_split_stats_b = layout.stride_split_stats_b;
+    ep.stride_split_stats_s_q = layout.stride_split_stats_s_q;
+    ep.stride_split_stats_split = layout.stride_split_stats_split;
+  }
+
   return args;
 }
 
-// ---------------------------------------------------------------------------
-// runMlaSparse2StageImpl: allocates the dense gathered-KV + valid-mask HBM
-// workspaces, builds the launcher arguments, and runs the batch-chunked launch
-// loop against MlaSparseDecode2StageXeType::Fmla. Structural analog of
-// runMlaSparseImpl() in the fused path (which allocates the CUTLASS workspace,
-// calls args_from_options_sparse(), and runs the device op) — here the "device op"
-// is that config's Fmla, the device::MLASparse runner assembled by the resolved
-// Stage-2 config struct.
-//
-// The Stage-2 config is resolved here from the compile-time template params:
-// MlaSparseDecode2StageXeType == MlaSparseDecode2StageXe<Element, D_QK, HAS_ATTN_SINK, B_H>.
-// Instantiating this function pulls in the heavy CUTLASS kernel for that single
-// B_H, so the generated per-(dtype,B_H) TU keeps its codegen confined to one
-// head-block (build OOM guard). Element is the query element type used only
-// for the host-side arg adaptation (the kernel is bf16-internal).
-// ---------------------------------------------------------------------------
 template <typename Element, int D_QK, int B_H, bool HAS_ATTN_SINK>
 inline void runMlaSparse2StageImpl(
     at::Tensor& out,
@@ -400,14 +430,21 @@ inline void runMlaSparse2StageImpl(
     int64_t head_dim_v) {
   namespace F = cutlass::flash_attention::kernel;
 
-  // The Stage-2 config for this D_QK + B_H + attn_sink flag. All three are compile-time
-  // template params dispatched by the op (mla_sparse_decode.cpp), so no runtime dispatch
-  // is needed here. The 2-stage codegen only emits bf16 (MlaSparseDecodeXe20.cmake), so
-  // Element is always bf16 and no per-dtype guard is required.
-  using MlaSparseDecode2StageXeType = F::MlaSparseDecode2StageXe<Element, D_QK, HAS_ATTN_SINK, B_H>;
+  using MlaSparseDecode2StageXeType = F::MlaSparseDecode2StageXe<
+      Element,
+      D_QK,
+      HAS_ATTN_SINK,
+      B_H,
+      F::SparseDecodeGatherDequantKernel,
+      FLASH_MLA_PREFILL_V_SPLIT,
+      /* HAS_MAX_LOGITS */ false,
+      /* IS_SPLIT_KV */ FLASH_MLA_SPARSE_2STAGE_SPLIT_K != 0>;
+  using TileTraits = typename MlaSparseDecode2StageXeType::TileTraits;
+  static constexpr bool kSplitK = MlaSparseDecode2StageXeType::IS_SPLIT_KV;
 
   const int b = q.size(0);
   const int s_q = q.size(1);
+  const int h_q = q.size(2);
   const int d_qk = q.size(3);
   const int topk = indices.size(2);
   const bool has_extra = extra_k_cache.has_value() && extra_indices.has_value();
@@ -424,7 +461,29 @@ inline void runMlaSparse2StageImpl(
   // Use a loose cap so typical decode shapes stay a single launch and only
   // pathologically large batch*topk get split across launches.
   constexpr int64_t DECODE_GATHERED_K_MAX_BYTES = 512LL * 1024 * 1024;
-  const int64_t per_batch_gathered_bytes = static_cast<int64_t>(s_q) * gathered_topk * d_qk * 2;  // bf16 = 2 bytes
+
+  const int num_kv_splits = kSplitK ? F::resolve_sparse_2stage_num_kv_splits(
+                                          b,
+                                          s_q,
+                                          h_q,
+                                          B_H,
+                                          TileTraits::V_SPLIT,
+                                          gathered_topk,
+                                          TileTraits::B_TOPK,
+                                          MlaSparseDecode2StageXeType::kvMaxSplits)
+                                    : 1;
+
+  typename MlaSparseDecode2StageXeType::Fmla::Arguments probe_args{};
+  probe_args.gather.b = 1;
+  probe_args.gather.s_q = s_q;
+  probe_args.gather.gathered_topk = gathered_topk;
+
+  probe_args.dense.kernel.shape.b = 1;
+  probe_args.dense.kernel.shape.s_q = s_q;
+  probe_args.dense.kernel.shape.h_q = h_q;
+  probe_args.dense.scheduler.num_kv_splits = num_kv_splits;
+  const int64_t per_batch_gathered_bytes =
+      static_cast<int64_t>(MlaSparseDecode2StageXeType::Fmla::get_workspace_size(probe_args));
   int chunk_b = per_batch_gathered_bytes > 0
                     ? static_cast<int>(std::max<int64_t>(1, DECODE_GATHERED_K_MAX_BYTES / per_batch_gathered_bytes))
                     : b;
@@ -436,6 +495,21 @@ inline void runMlaSparse2StageImpl(
   auto i32_opts = at::TensorOptions().dtype(at::kInt).device(device);
   at::Tensor gathered_k = at::empty({chunk_b, s_q, gathered_topk, d_qk}, bf16_opts);
   at::Tensor gathered_valid_mask = at::empty({chunk_b, s_q, gathered_topk}, i32_opts);
+
+  // Split-K scratch: per-split unnormalized partial O + the two row-stat arrays. Chunk-
+  // sized and reused across chunks like the gathered-KV tile above, and left
+  // uninitialized: every (chunk-batch, seq, split, head) entry is written by exactly one
+  // Stage-2 work-group before the reduction reads it (same coverage argument as the LSE
+  // store, which already writes an uninitialized output). Empty when split-K is off, so
+  // the non-split path allocates nothing new.
+  auto f32_opts = at::TensorOptions().dtype(at::kFloat).device(device);
+  std::optional<at::Tensor> o_accum, split_exp_sums, split_max_logits;
+  if constexpr (kSplitK) {
+    constexpr int D_V = MlaSparseDecode2StageXeType::D_V;
+    o_accum = at::empty({chunk_b, s_q, num_kv_splits, h_q, D_V}, bf16_opts);
+    split_exp_sums = at::empty({chunk_b, s_q, num_kv_splits, h_q}, f32_opts);
+    split_max_logits = at::empty({chunk_b, s_q, num_kv_splits, h_q}, f32_opts);
+  }
 
   auto args = args_from_options_2stage<MlaSparseDecode2StageXeType>(
       out,
@@ -451,57 +525,50 @@ inline void runMlaSparse2StageImpl(
       gathered_k,
       gathered_valid_mask,
       sm_scale,
-      head_dim_v);
+      head_dim_v,
+      o_accum,
+      split_exp_sums,
+      split_max_logits,
+      num_kv_splits);
   auto& params = args.dense;
   auto& gather_args = args.gather;
 
-  // Config-level invariants (formerly checked in the deleted launch_..._policy):
-  // the resolved config fixes D_QK / D_V, and the gathered tile width must equal
-  // topk + extra_topk.
-  TORCH_CHECK(
-      params.kernel.shape.d_qk == MlaSparseDecode2StageXeType::D_QK, "Invalid d_qk for this kernel instantiation");
-  TORCH_CHECK(
-      params.kernel.shape.d_v == MlaSparseDecode2StageXeType::D_V, "d_v must match MlaSparseDecode2StageXe::D_V");
-  TORCH_CHECK(
-      params.kernel.shape.gathered_topk == params.kernel.shape.topk + params.kernel.shape.extra_topk,
-      "gathered_topk must equal topk + extra_topk");
-
   // Process the batch in chunks of chunk_b so the gather workspace stays bounded.
-  // Per chunk we re-base the batched input/output pointers (slicing preserves
-  // strides) into every slice that reads them and reuse the same
-  // gathered_k/gathered_valid_mask workspace, whose batch stride was sized for
-  // chunk_b. Re-basing is centralized here so no slice's copy of a batched pointer
-  // is ever missed (q feeds kernel + mainloop; topk_length / extra_topk_length feed
-  // mainloop + gather; the batch count feeds kernel.shape + gather_args).
   //
   // Both stages run through one Fmla::run call, the same way the dense MLA path runs
   // its split-KV attention + reduction pair through device::MLA::run: the runner holds
   // one Params per stage and issues gather-then-dense on the in-order XPU queue, so the
   // gathered-KV tile is complete before the dense kernel reads it. Its
-  // to_underlying_arguments fans out per collective and the workspace is empty
-  // (get_workspace_size == 0 -> nullptr).
+  // to_underlying_arguments fans out per collective; the opaque workspace blob stays
+  // null because Stage 1's workspace (the gathered-KV tile + valid mask, sized above
+  // via Fmla::get_workspace_size) is passed through the params pointers instead.
+  // Base pointer of batch row b0: data_ptr() + b0 * stride(0), in bytes.
+  auto batch_base = [](const at::Tensor& t, int b0) -> void* {
+    return static_cast<char*>(t.data_ptr()) + static_cast<int64_t>(b0) * t.stride(0) * t.element_size();
+  };
+
   typename MlaSparseDecode2StageXeType::Fmla fmla;
   for (int b0 = 0; b0 < b; b0 += chunk_b) {
     const int cb = std::min(chunk_b, b - b0);
     params.kernel.shape.b = cb;
     gather_args.b = cb;
 
-    void* q_ptr = q.slice(0, b0, b0 + cb).data_ptr();
+    void* q_ptr = batch_base(q, b0);
     params.kernel.q = q_ptr;
     params.mainloop.q = q_ptr;
-    params.kernel.out = reinterpret_cast<cutlass::bfloat16_t*>(out.slice(0, b0, b0 + cb).data_ptr());
-    params.epilogue.lse = reinterpret_cast<float*>(lse_out.slice(0, b0, b0 + cb).data_ptr());
-    gather_args.indices = reinterpret_cast<int*>(indices.slice(0, b0, b0 + cb).data_ptr());
+    params.kernel.out = reinterpret_cast<cutlass::bfloat16_t*>(batch_base(out, b0));
+    params.epilogue.lse = reinterpret_cast<float*>(batch_base(lse_out, b0));
+    gather_args.indices = reinterpret_cast<int*>(batch_base(indices, b0));
     if (topk_length.has_value()) {
-      int* tl = reinterpret_cast<int*>(topk_length.value().slice(0, b0, b0 + cb).data_ptr());
+      int* tl = reinterpret_cast<int*>(batch_base(topk_length.value(), b0));
       params.mainloop.topk_length = tl;
       gather_args.topk_length = tl;
     }
     if (has_extra) {
-      gather_args.extra_indices = reinterpret_cast<int*>(extra_indices.value().slice(0, b0, b0 + cb).data_ptr());
+      gather_args.extra_indices = reinterpret_cast<int*>(batch_base(extra_indices.value(), b0));
     }
     if (extra_topk_length.has_value()) {
-      int* etl = reinterpret_cast<int*>(extra_topk_length.value().slice(0, b0, b0 + cb).data_ptr());
+      int* etl = reinterpret_cast<int*>(batch_base(extra_topk_length.value(), b0));
       params.mainloop.extra_topk_length = etl;
       gather_args.extra_topk_length = etl;
     }
@@ -511,24 +578,6 @@ inline void runMlaSparse2StageImpl(
   }
 }
 
-// ---------------------------------------------------------------------------
-// runMlaSparse2Stage: op-facing entry point. Structural analog of runMlaSparse()
-// in the fused path — it validates the inputs and forwards the dispatched head dim
-// (D_QK), head-block size (B_H), and attn_sink flag (HAS_ATTN_SINK) to the Impl,
-// which resolves the Stage-2 Config from them. The op (mla_sparse_decode.cpp) picks
-// Element (dtype), D_QK, B_H, and the attn_sink flag, mirroring the fused path's
-// dtype-then-page-size dispatch, and each generated launcher
-// launch_mla_sparse_decode_2stage_<ELEM>_<D_QK>_<B_H>_<SINK> instantiates a single
-// (D_QK, B_H, HAS_ATTN_SINK) in its own TU (build OOM guard preserved -- one variant
-// per file). Decode is always D_QK == 512 (the packed FP8 latent); the dimension is
-// still threaded so the codegen shape matches prefill.
-//
-// The Stage-2 kernel is bf16-internal (K/V are the gathered bf16 latent, the QK DPAS
-// is bf16). Element is the query element type, forwarded to the config as its T
-// so the config resolves ElementQ from it (mirroring the fused MlaSparseXe) --
-// IS_FP8_QUERY is deduced there and is false for the bf16 the codegen emits. Only
-// bf16 query is dispatched (see mla_sparse_decode.cpp) and only bf16 is generated.
-// ---------------------------------------------------------------------------
 template <typename Element, int D_QK, int B_H, bool HAS_ATTN_SINK>
 inline void runMlaSparse2Stage(
     at::Tensor& out,                                     // [B, 1, H, head_dim_v]
@@ -545,8 +594,6 @@ inline void runMlaSparse2Stage(
     int64_t head_dim_v,
     bool is_fp8_kvcache) {
   TORCH_CHECK(is_fp8_kvcache, "2-stage sparse MLA decode requires the FP8 packed KV cache");
-  TORCH_CHECK(head_dim_v == 512, "head_dim_v must be 512 for DeepSeek V4 MLA");
-  TORCH_CHECK(q.scalar_type() == at::kBFloat16, "2-stage sparse MLA decode query must be bfloat16");
   TORCH_CHECK(q.size(3) == D_QK, "2-stage sparse MLA decode q head dim must match the dispatched D_QK");
   TORCH_CHECK(attn_sink.has_value() == HAS_ATTN_SINK, "attn_sink presence must match the dispatched HAS_ATTN_SINK");
 

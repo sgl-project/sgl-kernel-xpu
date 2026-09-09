@@ -72,21 +72,21 @@ jobs:
       - name: Install runner extras + HF login
         timeout-minutes: 20
         run: |
-          docker exec sgl_kernel_nightly /miniforge3/envs/py3.10/bin/python3 -m pip install --upgrade pip
-          docker exec sgl_kernel_nightly /miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub scipy tabulate
-          docker exec sgl_kernel_nightly /bin/bash -c '/miniforge3/envs/py3.10/bin/hf auth login --token ${HF_TOKEN}'
-          docker exec sgl_kernel_nightly /bin/bash -c "ln -sf /miniforge3/envs/py3.10/bin/python3 /usr/bin/python3"
+          docker exec sgl_kernel_nightly /miniforge3/envs/py3.12/bin/python3 -m pip install --upgrade pip
+          docker exec sgl_kernel_nightly /miniforge3/envs/py3.12/bin/python3 -m pip install pytest expecttest ray huggingface_hub scipy tabulate
+          docker exec sgl_kernel_nightly /bin/bash -c '/miniforge3/envs/py3.12/bin/hf auth login --token ${HF_TOKEN}'
+          docker exec sgl_kernel_nightly /bin/bash -c "ln -sf /miniforge3/envs/py3.12/bin/python3 /usr/bin/python3"
 
       - name: Verify pre-installed sgl-kernel wheel
         run: |
-          docker exec sgl_kernel_nightly /miniforge3/envs/py3.10/bin/python3 -c \
+          docker exec sgl_kernel_nightly /miniforge3/envs/py3.12/bin/python3 -c \
             "import sgl_kernel; print('sgl_kernel loaded from', sgl_kernel.__file__)"
 
       - name: sgl-kernel-test (nightly kernel suite)
         timeout-minutes: 240
         run: |
           docker exec -w /root/sglang/sgl-kernel-xpu/tests sgl_kernel_nightly \
-            /miniforge3/envs/py3.10/bin/python3 run_nightly_suite.py \
+            /miniforge3/envs/py3.12/bin/python3 run_nightly_suite.py \
               --suite sgl-kernel-test \
               --timeout-per-file 7200 \
             || TEST_EXIT_CODE=$?
@@ -97,7 +97,7 @@ jobs:
         timeout-minutes: 60
         run: |
           docker exec -w /root/sglang/sgl-kernel-xpu/tests sgl_kernel_nightly \
-            /miniforge3/envs/py3.10/bin/python3 run_nightly_suite.py \
+            /miniforge3/envs/py3.12/bin/python3 run_nightly_suite.py \
               --suite sgl-kernel-benchmark \
               --timeout-per-file 1800 \
             || BENCH_EXIT_CODE=$?

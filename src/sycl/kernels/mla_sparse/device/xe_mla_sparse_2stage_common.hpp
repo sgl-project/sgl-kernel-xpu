@@ -144,6 +144,12 @@ struct SparseDecode2StageProblemShape {
 struct TileScheduler2StageParams {
   int h_q = 0;
   int s_q = 0;
+  // Split-K factor over the gathered topk dim, mapped onto grid.z. 1 disables split-K
+  // (grid.z == 1, kv_split_idx == 0) and is the non-split path unchanged. Runtime
+  // rather than compile-time because the useful factor depends on gathered_topk, which
+  // is only known per call -- same reason the paged path carries num_kv_splits in its
+  // scheduler params (kernel/mla_tile_scheduler.hpp:52).
+  int num_kv_splits = 1;
 };
 
 // Stage-2 dense kernel wrapper: builds the per-tile Q / O / gathered-K/V gmem
@@ -161,6 +167,23 @@ struct Kernel2StageParams {
 
   cutlass::bfloat16_t* __restrict__ out = nullptr;  // [b, s_q, h_q, d_v]
   int stride_o_b = 0, stride_o_s_q = 0, stride_o_h_q = 0;
+
+  // --- Split-K over the gathered topk dim (num_kv_splits > 1 only) ---
+  //
+  // Per-split UNNORMALIZED partial O, written by the split-KV epilogue and consumed by
+  // the reduction kernel (kernel/xe_mla_sparse_2stage_reduce_split_kv.hpp), which
+  // combines the splits and writes `out` / `epilogue.lse`. Laid out
+  // [b, s_q, num_kv_splits, h_q, d_v] so that for a fixed (b, s_q, kv_split) it is a
+  // [h_q, d_v] 2D view -- structurally identical to the `out` view above, which lets the
+  // split epilogue reuse the non-split block-2D store path verbatim (only the base
+  // pointer and the skipped normalization differ).
+  //
+  // Element type is ElementO (bf16), matching the paged MLA split-KV path
+  // (mla/kernel/xe_mla_reduce_split_kv.hpp), so the existing TiledCopyO applies
+  // unchanged. The partials are unnormalized, so this does cost precision relative to
+  // an fp32 accumulator buffer; the reduction accumulates in fp32.
+  cutlass::bfloat16_t* __restrict__ o_accum = nullptr;
+  int stride_o_accum_b = 0, stride_o_accum_s_q = 0, stride_o_accum_split = 0, stride_o_accum_h_q = 0;
 };
 
 // Stage-2 mainloop collective: QK/PV GEMM + online softmax over the gathered tile.
@@ -197,6 +220,24 @@ struct Epilogue2StageParams {
 
   float* __restrict__ max_logits = nullptr;  // [b, s_q, h_q], prefill only
   int stride_max_logits_b = 0, stride_max_logits_s_q = 0;
+
+  // --- Split-K over the gathered topk dim (num_kv_splits > 1 only) ---
+  //
+  // Per-split softmax row stats published by the split-KV epilogue alongside the
+  // unnormalized partial O in Kernel2StageParams::o_accum, and consumed by the
+  // reduction kernel. Both are [b, s_q, num_kv_splits, h_q]; split_max_logits is in the
+  // *log2* domain and already scaled by sm_scale_div_log2 (it is the mainloop's tA_max
+  // verbatim), matching what the paged MLA reduction expects of its max_logits.
+  //
+  // An empty trailing split (blk_start >= num_topk_blocks) publishes
+  // split_exp_sums == 0, which is the reduction's "skip this split" signal -- the same
+  // contract as the paged path (mla/kernel/xe_mla_kernel.hpp:557).
+  //
+  // These are *not* epilogue.lse / epilogue.max_logits: those stay the final per-row
+  // outputs and, under split-K, are written by the reduction kernel instead of here.
+  float* __restrict__ split_exp_sums = nullptr;
+  float* __restrict__ split_max_logits = nullptr;
+  int stride_split_stats_b = 0, stride_split_stats_s_q = 0, stride_split_stats_split = 0;
 };
 
 // Stage-1 gather common params (base). This is the standalone Stage-1 kernel's own
@@ -263,6 +304,55 @@ struct SparseAttn2StageParams {
   Mainloop2StageParams mainloop;
   Epilogue2StageParams epilogue;
   TileScheduler2StageParams scheduler;
+};
+
+// ---------------------------------------------------------------------------
+// Split-K (over the gathered topk dim) HBM scratch sizing + strides.
+//
+// Host-only helper, the sparse analog of the paged path's SplitKVWorkspaceLayout
+// (mla/kernel/xe_mla_kernel.hpp:47). Two differences, both from the fact that Stage 2
+// is decode-*shaped* rather than decode-only: it carries an s_q dim (paged MLA decode
+// has seq_len_qo == 1 and omits it), and it reports the per-tensor strides directly so
+// the caller can drop them straight into Kernel2StageParams / Epilogue2StageParams
+// instead of building CuTe strides.
+//
+// Layouts (all tightly packed, row-major in the listed order):
+//   o_accum          [b, s_q, num_kv_splits, h_q, d_v]  ElementO (bf16)
+//   split_exp_sums   [b, s_q, num_kv_splits, h_q]       float
+//   split_max_logits [b, s_q, num_kv_splits, h_q]       float
+//
+// Offsets are 256B-aligned like the paged layout so a single blob can back all three,
+// but the sparse host path allocates them as separate tensors (the way it already
+// allocates Stage 1's gathered_k / gathered_valid_mask) and only uses the byte totals
+// for the workspace accounting that bounds the batch-chunk size.
+struct SparseSplitKV2StageWorkspaceLayout {
+  size_t o_accum_bytes = 0;
+  size_t stats_bytes = 0;  // per stats tensor (exp_sums and max_logits are the same size)
+  size_t total_bytes = 0;
+
+  // o_accum strides, in elements.
+  int stride_o_accum_b = 0, stride_o_accum_s_q = 0, stride_o_accum_split = 0, stride_o_accum_h_q = 0;
+  // Shared by split_exp_sums and split_max_logits, in elements.
+  int stride_split_stats_b = 0, stride_split_stats_s_q = 0, stride_split_stats_split = 0;
+
+  SparseSplitKV2StageWorkspaceLayout() = default;
+
+  SparseSplitKV2StageWorkspaceLayout(int b, int s_q, int h_q, int num_kv_splits, int d_v, size_t elem_o_size) {
+    const size_t rows = size_t(b) * s_q * num_kv_splits * h_q;
+    o_accum_bytes = rows * d_v * elem_o_size;
+    stats_bytes = rows * sizeof(float);
+    auto align256 = [](size_t n) { return (n + 255) & ~size_t(255); };
+    total_bytes = align256(o_accum_bytes) + 2 * align256(stats_bytes);
+
+    stride_o_accum_h_q = d_v;
+    stride_o_accum_split = h_q * d_v;
+    stride_o_accum_s_q = num_kv_splits * h_q * d_v;
+    stride_o_accum_b = s_q * num_kv_splits * h_q * d_v;
+
+    stride_split_stats_split = h_q;
+    stride_split_stats_s_q = num_kv_splits * h_q;
+    stride_split_stats_b = s_q * num_kv_splits * h_q;
+  }
 };
 
 // ===========================================================================
@@ -395,9 +485,6 @@ struct MlaSparseDecode2StageTileTraits {
 
   // D_V / 64 = 8 tiles for v_dim
   using TileShapeOut = Shape<Int<B_H>, Int<D_V_PER_SPLIT>>;
-
-  using SmemTileLayoutK = Layout<Shape<Int<B_TOPK>, Int<HEAD_DIM_TILE_SIZE>>, Stride<Int<HEAD_DIM_TILE_SIZE>, _1>>;
-  using SmemTileLayoutV = Layout<Shape<Int<HEAD_DIM_TILE_SIZE>, Int<B_TOPK>>, Stride<Int<B_TOPK>, _1>>;
 
   constexpr static int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
   // bf16 dpas m8n16k16

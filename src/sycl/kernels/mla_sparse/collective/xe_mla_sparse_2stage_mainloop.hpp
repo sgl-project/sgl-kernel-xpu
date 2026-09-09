@@ -96,8 +96,11 @@ class XeMlaSparse2StageMainloop {
     return true;
   }
 
-  // Runs the topk-block QK/softmax/PV loop for one (batch, seq, head-block, v-split)
-  // tile, accumulating into tArA and the softmax row stats tA_max / tA_sum.
+  // Runs the topk-block QK/softmax/PV loop for one (batch, seq, head-block, v-split,
+  // kv-split) tile, accumulating into tArA and the softmax row stats tA_max / tA_sum.
+  // With num_kv_splits > 1 the accumulators hold a *partial* result over this split's
+  // slice of the gathered topk dim, and the caller is responsible for publishing them
+  // to the split-KV workspace for the reduction kernel to combine.
   template <class TensorQ, class TensorK, class TensorV>
   CUTLASS_DEVICE void operator()(
       TensorQ const& Q,  // [h_q, D_QK] gmem, offset to (batch, seq)
@@ -109,7 +112,11 @@ class XeMlaSparse2StageMainloop {
       int thr_id,
       int batch_idx,
       int seq_idx,
-      int head_bid) {
+      int head_bid,
+      // Split-K over the gathered topk dim. Defaults give the whole range in one
+      // work-group, so non-split callers need no change.
+      int kv_split_idx = 0,
+      int num_kv_splits = 1) {
     const cutlass::float_e4m3_t* q_fp8 = reinterpret_cast<const cutlass::float_e4m3_t*>(params.q);
     const int* gathered_valid_mask = params.gathered_valid_mask;
     const int cur_head_start_idx = head_bid * Traits::B_H;
@@ -260,8 +267,24 @@ class XeMlaSparse2StageMainloop {
         (has_extra ? resolve_len(params.extra_topk_length, params.extra_topk, params.stride_extra_topk_length_b) : 0);
 
     const int num_topk_blocks = ceil_div(params.gathered_topk, Traits::B_TOPK);
+
+    /* Split-K over the gathered topk dim: this work-group owns topk blocks
+       [blk_start, blk_end). The contiguous-chunk split mirrors the paged MLA
+       split-KV kernel (kernel/xe_mla_kernel.hpp:548 num_blocks_per_split /
+       start_blk). At num_kv_splits == 1 this collapses to [0, num_topk_blocks)
+       and the loop is bit-identical to the non-split path.
+
+       A trailing split can be entirely empty (blk_start >= num_topk_blocks) when
+       num_topk_blocks is not a multiple of num_kv_splits; the loop then runs zero
+       times, leaving tArA cleared and tA_sum at 0. The split-KV epilogue must
+       therefore publish exp_sums = 0 for such a split so the reduction skips it,
+       exactly as the paged path does at xe_mla_kernel.hpp:557. */
+    const int blocks_per_split = ceil_div(num_topk_blocks, num_kv_splits);
+    const int blk_start = kv_split_idx * blocks_per_split;
+    const int blk_end = cute::min(num_topk_blocks, blk_start + blocks_per_split);
+
     CUTE_NO_UNROLL
-    for (int topk_idx = 0; topk_idx < num_topk_blocks; ++topk_idx) {
+    for (int topk_idx = blk_start; topk_idx < blk_end; ++topk_idx) {
       // Block covers gathered columns [c0, c1). It is fully invalid iff it misses
       // the main valid range [0, main_len) AND the extra valid range
       // [topk, extra_valid_end). Missing main: c0 >= main_len. Missing extra:
@@ -284,7 +307,10 @@ class XeMlaSparse2StageMainloop {
       auto rescale = online_softmax_and_rescale_o(topk_idx);
       reorder(tSrS, tArP);
 
-      if (topk_idx > 0) {
+      // First block this work-group processes leaves tArA untouched (it is still
+      // cleared); every later one rescales it by the online-softmax correction.
+      // Keyed off blk_start, not 0, so each split's first block is treated as first.
+      if (topk_idx > blk_start) {
         CUTE_UNROLL
         for (int i = 0; i < tArA.size(); i++) {
           tArA(i) *= broadcast<0>(rescale, tArA, i);

@@ -46,6 +46,7 @@ struct XeFHMAIndividualTileScheduler {
     FastDivmod divmod_num_heads;
     FastDivmod divmod_batch;
     int num_kv_splits_ = -1;
+    int q_tile_start = 0;
   };
 
   bool valid_ = true;
@@ -73,7 +74,7 @@ struct XeFHMAIndividualTileScheduler {
       grid.z *= num_kv_splits;
       num_head = shape.num_heads_kv;
     }
-    return Params{grid, {num_head}, {shape.batch * num_head}, num_kv_splits};
+    return Params{grid, {num_head}, {shape.batch * num_head}, num_kv_splits, 0};
   }
 
   template <int Num_SGs>
@@ -95,12 +96,12 @@ struct XeFHMAIndividualTileScheduler {
     if (params.num_kv_splits_ >= 1) {
       params.divmod_batch(idx_kv_split, idx_b, idx_kv_split);
       params.divmod_num_heads(idx_b, head, idx_b);
-      return make_coord(BlockIdxY(), BlockIdxX(), head, idx_b, idx_kv_split);
+      return make_coord(params.q_tile_start + BlockIdxY(), BlockIdxX(), head, idx_b, idx_kv_split);
     }
 
     idx_b = idx_kv_split;
     params.divmod_num_heads(idx_b, head, idx_b);
-    return make_coord(BlockIdxY(), BlockIdxX(), head, idx_b, (int)-1);
+    return make_coord(params.q_tile_start + BlockIdxY(), BlockIdxX(), head, idx_b, (int)-1);
   }
 
   CUTLASS_DEVICE

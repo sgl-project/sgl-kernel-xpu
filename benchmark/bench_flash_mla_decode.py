@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import torch
 import triton
-from sgl_kernel import flash_mla_decode, flash_mla_get_workspace_size
+from sgl_kernel import flash_mla_decode, flash_mla_decode_get_workspace_size
 
 bs_range = [1, 4, 16]
 kv_len_range = [1024, 2048, 4096, 8192, 16384, 32768]
@@ -85,7 +85,7 @@ def benchmark(batch_size, seq_len, provider, block_size, num_kv_splits):
     q_nope.copy_(q[:, :, :dv])
     q_pe = q[:, :, dv:].clone()
 
-    workspace_size = flash_mla_get_workspace_size(
+    workspace_size = flash_mla_decode_get_workspace_size(
         block_num * block_size, batch_size, h_q, block_size, num_kv_splits=num_kv_splits
     )
     workspace = torch.empty(workspace_size, device="xpu", dtype=torch.uint8)

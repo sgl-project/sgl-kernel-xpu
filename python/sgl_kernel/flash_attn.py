@@ -133,6 +133,8 @@ def flash_attn_with_kvcache(
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     out=None,
+    rel_bias=None,
+    rel_bias_is_sheared=False,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -219,6 +221,16 @@ def flash_attn_with_kvcache(
             capture to avoid allocating a new output tensor each step. Requires
             ``page_table`` to be provided (paged KV cache); passing ``out`` without a
             page table raises a ``RuntimeError``.
+        rel_bias [optional]: device-resident Inkling relative logits with shape
+            ``(total_q, nheads, extent)``. The kernel shears this source on the
+            current XPU stream for its fixed 256x32 relative-attention tiles. Its
+            dtype must match ``q`` and it must be contiguous.
+            Supported for paged KV attention with head dimension 128, and with
+            head dimension 512 for single-token decode.
+        rel_bias_is_sheared: decode-only fast path for a producer that already
+            emits the sheared relative-bias surface. The surface's final
+            dimension must be the decode padded width (a multiple of page size);
+            this avoids the compatibility shear dispatch.
 
     Return:
         out: (total_q, nheads, headdim_v), where total_q = batch_size * seqlen (non-varlen)
@@ -239,6 +251,41 @@ def flash_attn_with_kvcache(
             (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )
         cache_seqlens = maybe_contiguous(cache_seqlens)
+
+    # The paged decode kernel has no page_size == 1 variant (only 64/128), so
+    # gather the scattered per-token cache slots into a dense ragged buffer and
+    # dispatch to the non-paged varlen kernel instead.
+    if page_table is not None and k_cache.shape[1] == 1:
+        return _flash_attn_with_kvcache_page_size_1(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k=k,
+            v=v,
+            qv=qv,
+            rotary_cos=rotary_cos,
+            rotary_sin=rotary_sin,
+            cache_seqlens=cache_seqlens,
+            cache_batch_idx=cache_batch_idx,
+            cache_leftpad=cache_leftpad,
+            page_table=page_table,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k_new=cu_seqlens_k_new,
+            max_seqlen_q=max_seqlen_q,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            softmax_scale=softmax_scale,
+            sinks=sinks,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            sm_margin=sm_margin,
+            return_softmax_lse=return_softmax_lse,
+            out=out,
+        )
 
     q, k_cache, k, v = [maybe_contiguous(x) for x in (q, k_cache, k, v)]
     v_cache = (
@@ -310,8 +357,121 @@ def flash_attn_with_kvcache(
         sm_margin,
         out,
         softmax_lse,
+        rel_bias,
+        rel_bias_is_sheared,
     )
     return (out, softmax_lse) if return_softmax_lse else out
+
+
+def _flash_attn_with_kvcache_page_size_1(
+    q,
+    k_cache,
+    v_cache,
+    k,
+    v,
+    qv,
+    rotary_cos,
+    rotary_sin,
+    cache_seqlens,
+    cache_batch_idx,
+    cache_leftpad,
+    page_table,
+    cu_seqlens_q,
+    cu_seqlens_k_new,
+    max_seqlen_q,
+    q_descale,
+    k_descale,
+    v_descale,
+    softmax_scale,
+    sinks,
+    causal,
+    window_size,
+    softcap,
+    num_splits,
+    pack_gqa,
+    sm_margin,
+    return_softmax_lse,
+    out,
+):
+    """page_size == 1 workaround: gather per-token cache slots into a dense
+    ragged buffer (in ``cu_seqlens_k`` order) and run the non-paged varlen
+    kernel, since the paged kernel only supports page_size in {64, 128}.
+    """
+    assert k is None and v is None, (
+        "flash_attn_with_kvcache page_size=1 workaround does not support "
+        "appending new k/v to the cache"
+    )
+    assert (
+        rotary_cos is None and rotary_sin is None
+    ), "flash_attn_with_kvcache page_size=1 workaround does not support rotary embedding"
+    assert (
+        cache_leftpad is None
+    ), "flash_attn_with_kvcache page_size=1 workaround does not support cache_leftpad"
+    assert (
+        cu_seqlens_k_new is None
+    ), "flash_attn_with_kvcache page_size=1 workaround does not support cu_seqlens_k_new"
+    assert (
+        cache_seqlens is not None
+    ), "cache_seqlens is required for page_size=1 workaround"
+
+    if cache_batch_idx is not None:
+        page_table = page_table.index_select(0, cache_batch_idx.long())
+
+    num_blocks, _, nheads_k, head_dim = k_cache.shape
+    head_dim_v = v_cache.shape[-1]
+    k_flat = k_cache.reshape(num_blocks, nheads_k, head_dim)
+    v_flat = v_cache.reshape(num_blocks, nheads_k, head_dim_v)
+
+    if cu_seqlens_q is None:  # !is_varlen_q
+        cu_seqlens_q = torch.arange(
+            0, q.size(0) + 1, dtype=torch.int32, device=q.device
+        ) * q.size(1)
+        max_seqlen_q = q.size(1)
+        q = q.reshape(-1, q.size(-2), q.size(-1)).contiguous()
+
+    seqlens = cache_seqlens.long()
+    num_slots = page_table.shape[1]
+    # page_table packs the valid (occupied) slots first per row, so masking
+    # by cache_seqlens and flattening yields slots in cu_seqlens_k order.
+    valid = torch.arange(num_slots, device=page_table.device).unsqueeze(
+        0
+    ) < seqlens.unsqueeze(1)
+    flat_slots = page_table.long()[valid]
+    k_ragged = k_flat.index_select(0, flat_slots).contiguous()
+    v_ragged = v_flat.index_select(0, flat_slots).contiguous()
+
+    cu_seqlens_k = torch.nn.functional.pad(
+        torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
+    )
+    max_seqlen_k = int(seqlens.max().item()) if seqlens.numel() > 0 else 0
+
+    result = flash_attn_varlen_func(
+        q,
+        k_ragged,
+        v_ragged,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale=softmax_scale,
+        sinks=sinks,
+        causal=causal,
+        qv=qv,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        window_size=window_size,
+        softcap=softcap,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        sm_margin=sm_margin,
+        return_softmax_lse=return_softmax_lse,
+    )
+    result_out, softmax_lse = result if return_softmax_lse else (result, None)
+    if out is not None:
+        out.copy_(result_out)
+        result_out = out
+    return (result_out, softmax_lse) if return_softmax_lse else result_out
 
 
 def flash_attn_varlen_func(

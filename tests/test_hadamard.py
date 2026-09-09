@@ -1,43 +1,69 @@
 import math
+from functools import lru_cache
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
-from einops import rearrange, repeat
 from scipy.linalg import hadamard
 from sgl_kernel import hadamard_transform
-from utils import get_device
 
 
-def hadamard_transform_ref(x, scale=1.0):
+# Cache the HOST-side int8 matrix only, never a device tensor. The cost being
+# avoided is scipy's build (~10s at dim=32768, and every case calls the
+# reference twice), which is host work; caching the device copy instead would
+# pin it for the whole session, and the conftest's empty_cache() fixture cannot
+# free memory that a cache still references. At dim=32768 an fp32 device matrix
+# is 4 GiB, which alone would not fit alongside the rest on an 11 GB card.
+#
+# int8 is safe here: Hadamard entries are +-1, so the cast below is
+# bit-identical to scipy's float64 matrix at 1/8th the host memory.
+@lru_cache(maxsize=2)
+def _hadamard_matrix_cpu(dim_padded):
+    """Host-side +-1 Hadamard matrix, cached per padded dim."""
+    return torch.from_numpy(hadamard(dim_padded, dtype=np.int8))
+
+
+def _hadamard_matrix(dim_padded, dtype, device):
+    """Hadamard matrix on *device* with *dtype*, freshly allocated each call.
+
+    Deliberately uncached so the caller's tensor is released between tests.
     """
-    x: (..., dim)
-    out: (..., dim)
-    """
-    if hadamard is None:
-        raise ImportError("Please install scipy")
+    return _hadamard_matrix_cpu(dim_padded).to(device=device, dtype=dtype)
+
+
+def _ref_torch_impl(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    # min log_dim of 3 matches the kernel, which always pads up to dim >= 8.
     x_shape = x.shape
     dim = x.shape[-1]
     x = x.reshape(-1, dim)
-    log_dim = math.ceil(math.log2(dim))
-    dim_padded = 2**log_dim
+    log_dim = max(3, math.ceil(math.log2(max(dim, 1))))
+    dim_padded = 1 << log_dim
     if dim != dim_padded:
         x = F.pad(x, (0, dim_padded - dim))
-    out = F.linear(
-        x,
-        torch.tensor(hadamard(dim_padded, dtype=float), dtype=x.dtype, device=x.device),
-    )
+    out = F.linear(x, _hadamard_matrix(dim_padded, x.dtype, x.device))
     out = out * scale
-    return out[..., :dim].reshape(*x_shape)
+    if dim_padded != dim:
+        out = out[:, :dim]
+    return out.reshape(x_shape)
+
+
+def _setup_inputs(bs: int, dim: int, dtype: torch.dtype) -> torch.Tensor:
+    torch.manual_seed(0)
+    stream = torch.xpu.Stream()
+    torch.xpu.set_stream(stream)
+    return torch.randn(bs, dim, device="xpu", dtype=dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     "dim",
-    [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
+    [1, 2, 4, 8, 16, 32, 36, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
 )
-def test_fast_hadamard_transform(dim, dtype):
-    device = get_device()
+@torch.inference_mode()
+def test_hadamard_transform(dim: int, dtype: torch.dtype) -> None:
+    if not torch.xpu.is_available():
+        pytest.skip("XPU is required for SYCL hadamard accuracy comparison")
 
     if dtype == torch.float32:
         rtol, atol = 3e-4, 3e-3
@@ -46,32 +72,20 @@ def test_fast_hadamard_transform(dim, dtype):
     else:  # float16
         rtol, atol = 3e-3, 5e-3
 
-    torch.random.manual_seed(0)
     batch_size = 15
-
-    x = torch.randn(batch_size, dim, device=device, dtype=dtype)
-    x_ref = x.detach().clone().to(torch.float32)
-    x_pt = x.detach().clone()
+    x = _setup_inputs(batch_size, dim, dtype)
 
     scale = 1 / math.sqrt(dim)
 
-    out = hadamard_transform(x, scale=scale)
-    out_ref = hadamard_transform_ref(x_ref, scale=scale)
-    out_pt = hadamard_transform_ref(x_pt, scale=scale)
+    out_sycl = hadamard_transform(x, scale=scale)
+    out_ref = _ref_torch_impl(x, scale=scale)
 
     torch.testing.assert_close(
-        out_pt.float(),
-        out_ref,
+        out_sycl.float(),
+        out_ref.float(),
         rtol=rtol,
         atol=atol,
-        msg="Reference implementations mismatch",
-    )
-    torch.testing.assert_close(
-        out.float(),
-        out_ref,
-        rtol=rtol,
-        atol=atol,
-        msg="fast_hadamard_transform output mismatch",
+        msg="SYCL hadamard output mismatch vs torch reference",
     )
 
 

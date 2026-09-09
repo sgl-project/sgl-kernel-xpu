@@ -48,3 +48,6 @@ build
 
 # vscode
 .vscode/
+
+# benchmark run logs (benchmark/run_suite.py writes one per benchmark)
+benchmark/*.log

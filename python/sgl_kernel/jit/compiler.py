@@ -160,7 +160,9 @@ def _compute_cache_key(cache_inputs: List[Any]) -> str:
 def _get_cache_dir() -> pathlib.Path:
     """Get or create cache directory for compiled SYCL kernels."""
     cache_dir = pathlib.Path.home() / ".cache" / "sgl_kernel" / "jit_sycl"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    # 0o700: the cache holds .so files that are dlopen'd, so a group/world
+    # writable dir would let another local user swap in arbitrary code.
+    cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     return cache_dir
 
 

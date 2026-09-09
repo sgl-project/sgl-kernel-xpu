@@ -21,10 +21,14 @@ def flash_attn_baseline(
     max_seqlen_k,
     k_descale=None,
     v_descale=None,
+    rel_bias=None,
 ):
     """Baseline Flash Attention implementation"""
-    # Kernel only supports LSE without causal/local/sink masking.
-    return_lse = not causal and window_size == (-1, -1) and sinks is None
+    # Kernel only supports LSE without causal/local/sink masking, and the
+    # relative-attention path does not currently produce LSE.
+    return_lse = (
+        not causal and window_size == (-1, -1) and sinks is None and rel_bias is None
+    )
 
     if page_table is not None:
         result = flash_attn_with_kvcache(
@@ -41,6 +45,7 @@ def flash_attn_baseline(
             max_seqlen_q=max_seqlen_q,
             k_descale=k_descale,
             v_descale=v_descale,
+            rel_bias=rel_bias,
             return_softmax_lse=return_lse,
         )
     else:
@@ -91,6 +96,16 @@ def get_effective_attention_pairs(
     return effective_pairs
 
 
+def make_relative_bias(batch_size, q_seq_length, kv_seq_length, num_heads, extent):
+    return torch.randn(
+        batch_size * q_seq_length,
+        num_heads,
+        extent,
+        device="xpu",
+        dtype=torch.bfloat16,
+    )
+
+
 # Benchmark configurations
 causal = [True, False]
 local = [True, False]
@@ -102,12 +117,16 @@ head_dim_paged = [64, 128, 256, 512]
 num_heads_q = [16]
 num_heads_kv = [4, 8]
 kv_seq_length_range = [4096]
-page_size_range = [0, 128]
+# page_size=0 -> non-paged varlen path; page_size=1 -> paged kernel has no
+# page_size==1 variant, so this exercises the gather-and-varlen workaround;
+# page_size=128 -> native paged kernel path.
+page_size_range = [0, 1, 128]
 # KV cache element type: "bf16" (default) or fp8. FP8 has two formats,
 # e5m2 and e4m3; both are exercised ("fp8_e4m3" / "fp8_e5m2"), dequantized
 # in-kernel via per-tensor k_descale / v_descale. fp8 only runs on the paged
 # path.
 kv_dtype_range = ["bf16", "fp8_e4m3", "fp8_e5m2"]
+attention_mode_range = ["standard", "relative"]
 configs = list(
     filter(
         lambda cfg: (
@@ -119,13 +138,31 @@ configs = list(
             and (cfg[6] % cfg[7] == 0)
             # Condition 4: kv_seq_length >= page_size
             and (cfg[8] >= cfg[9])
-            # Condition 5: no_page mode (page_size=0) does not support sink logits
-            and (cfg[9] != 0 or not cfg[2])
+            # Condition 5: no_page mode (page_size=0) and the page_size=1
+            # workaround both dispatch to the non-paged kernel, which does
+            # not support sink logits
+            and (cfg[9] not in (0, 1) or not cfg[2])
             # Condition 6: sink is only supported for head_size == 64
             and (not cfg[2] or cfg[5] == 64)
-            # Condition 7: fp8 KV cache requires the paged path and is exercised
-            # without sinks / local masking (matches the supported fp8 path)
-            and (cfg[10] == "bf16" or (cfg[9] != 0 and not cfg[2] and not cfg[1]))
+            # Condition 7: fp8 KV cache requires the native paged kernel and is
+            # exercised without sinks / local masking (matches the supported
+            # fp8 path); page_size=1 falls back to the non-paged kernel so it
+            # is excluded like page_size=0
+            and (
+                cfg[10] == "bf16"
+                or (cfg[9] not in (0, 1) and not cfg[2] and not cfg[1])
+            )
+            and (
+                cfg[11] == "standard"
+                or (
+                    cfg[9] != 0
+                    and cfg[10] == "bf16"
+                    and cfg[5] == 128
+                    and cfg[4] > 1
+                    and not cfg[1]
+                    and not cfg[2]
+                )
+            )
         ),
         [
             cfg
@@ -142,6 +179,7 @@ configs = list(
                 kv_seq_length_range,
                 [page_size],
                 kv_dtype_range,
+                attention_mode_range,
             )
         ],
     )
@@ -163,6 +201,7 @@ all_results = []
             "kv_seq_length",
             "page_size",
             "kv_dtype",
+            "attention_mode",
         ],
         x_vals=[list(c) for c in configs],
         line_arg="provider",
@@ -186,6 +225,7 @@ def benchmark(
     kv_seq_length,
     page_size,
     kv_dtype,
+    attention_mode,
     provider,
 ):
     dtype = torch.bfloat16
@@ -269,6 +309,11 @@ def benchmark(
     sinks = torch.randn(num_heads_q, device=device, dtype=dtype) if use_sinks else None
 
     softmax_scale = 1.0 / (head_dim**0.5)
+    rel_bias = (
+        make_relative_bias(batch_size, q_seq_length, kv_seq_length, num_heads_q, 1024)
+        if attention_mode == "relative"
+        else None
+    )
 
     quantiles = [0.5, 0.2, 0.8]
 
@@ -290,6 +335,7 @@ def benchmark(
                 max_seqlen_k=max_seqlen_k,
                 k_descale=k_descale,
                 v_descale=v_descale,
+                rel_bias=rel_bias,
             ),
             quantiles=quantiles,
         )
@@ -344,6 +390,7 @@ def benchmark(
             "use_sinks": use_sinks,
             "page_size": page_size,
             "kv_dtype": kv_dtype,
+            "attention_mode": attention_mode,
             "provider": provider,
             "tflops": tflops,
             "bandwidth": bandwidth,
@@ -354,6 +401,9 @@ def benchmark(
 
 
 if __name__ == "__main__":
+    torch.manual_seed(42)
+    if hasattr(torch.xpu, "manual_seed_all"):
+        torch.xpu.manual_seed_all(42)
     benchmark.run(print_data=False)
     print("Benchmark finished!")
 

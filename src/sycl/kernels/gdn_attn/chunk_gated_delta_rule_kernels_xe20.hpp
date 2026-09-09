@@ -9,6 +9,14 @@
 #include "../../gdn_attn/gdn_attn_utils.h"
 #include "gemm_xe20.hpp"
 
+// When the chunk kernels run through the runtime-JIT path, the host dispatcher
+// (impl_xe20) forwards raw pointers to the JIT layer instead of instantiating
+// the heavy per-dtype kernel_launcher. The JIT instance TU (SGL_GDN_JIT_ENTRY)
+// itself must NOT pull this in -- it only instantiates one kernel_launcher.
+#if defined(USE_GDN_JIT) && !defined(SGL_GDN_JIT_ENTRY)
+#include "jit/gdn_jit.h"
+#endif
+
 namespace gdn {
 using namespace cute;
 static constexpr int MaxThreadsPerSM = 512;
@@ -1278,6 +1286,9 @@ void kernel_launcher(
   });
 }
 
+// The host dispatcher does torch marshalling only; it is excluded from the JIT
+// instance TU (which just instantiates the selected kernel_launcher).
+#ifndef SGL_GDN_JIT_ENTRY
 void chunk_gated_delta_rule_impl_xe20(
     sycl::queue& queue,
     torch::Tensor& core_attn_out,                           // [total_seqlen, num_v_heads, head_v_dim]
@@ -1377,6 +1388,56 @@ void chunk_gated_delta_rule_impl_xe20(
     }                                                                                                            \
   } while (0)
 
+#ifdef USE_GDN_JIT
+  const bool is_half = core_attn_out.scalar_type() == at::kHalf;
+  TORCH_CHECK(
+      is_half || core_attn_out.scalar_type() == at::kBFloat16,
+      "core_attn_out dtype must be float16/bfloat16, but got ",
+      core_attn_out.scalar_type());
+  int state_code;
+  if (ssm_state.scalar_type() == at::kFloat) {
+    state_code = 0;
+  } else if (ssm_state.scalar_type() == at::kBFloat16) {
+    state_code = 1;
+  } else if (ssm_state.scalar_type() == at::kHalf) {
+    state_code = 2;
+  } else {
+    TORCH_CHECK(false, "ssm_state dtype must be float32/float16/bfloat16, but got ", ssm_state.scalar_type());
+  }
+  const bool* has_init_ptr =
+      has_initial_state.has_value() ? reinterpret_cast<const bool*>(has_initial_state->data_ptr()) : nullptr;
+  std::string jit_err;
+  const bool ok = sgl::gdn_jit::chunk_launch(
+      is_half,
+      state_code,
+      &queue,
+      core_attn_out.data_ptr(),
+      q.data_ptr(),
+      k.data_ptr(),
+      v.data_ptr(),
+      A.data_ptr(),
+      w.data_ptr(),
+      u.data_ptr(),
+      b.data_ptr(),
+      a.data_ptr(),
+      A_log.data_ptr(),
+      dt_bias.data_ptr(),
+      ssm_state.data_ptr(),
+      ssm_state_stride_0,
+      reinterpret_cast<const int*>(query_start_loc.data_ptr()),
+      reinterpret_cast<const int*>(cache_indices.data_ptr()),
+      has_init_ptr,
+      token_indx,
+      batch_size,
+      total_virtual_seqlen,
+      num_k_heads,
+      head_k_dim,
+      num_v_heads,
+      head_v_dim,
+      jit_arch_code(),
+      &jit_err);
+  TORCH_CHECK(ok, "GDN chunk JIT launch failed: ", jit_err);
+#else
   if (core_attn_out.scalar_type() == at::kBFloat16) {
     using scalar_t = bfloat16_t;
     DISPATCH_STATE_DTYPE(scalar_t);
@@ -1386,9 +1447,11 @@ void chunk_gated_delta_rule_impl_xe20(
   } else {
     TORCH_CHECK(false, "core_attn_out dtype must be float16/bfloat16, but got ", core_attn_out.scalar_type());
   }
+#endif
 
 #undef DISPATCH_STATE_DTYPE
 #undef KERNEL_LAUNCHER
 }
+#endif  // SGL_GDN_JIT_ENTRY
 
 }  // namespace gdn

@@ -8,8 +8,9 @@ from sgl_kernel import (
     fast_topk_transform_fused,
     fast_topk_transform_ragged_fused,
     fast_topk_v2,
-    topk_transform_512,
-    topk_transform_512_v2,
+    topk_transform,
+    topk_transform_paged,
+    topk_transform_ragged,
 )
 
 
@@ -302,10 +303,10 @@ def test_fast_topk_transform_ragged(
 _arange_cache: Dict[str, torch.Tensor] = {}
 
 
-def _topk_transform_512_vectorized(
+def _topk_transform_vectorized(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
-    page_tables: torch.Tensor,
+    page_tables: Optional[torch.Tensor],
     out_page_indices: torch.Tensor,
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
@@ -375,6 +376,14 @@ def _topk_transform_512_vectorized(
     raw_indices = torch.where(needs_seq_mask, seq_indices_or_neg1, raw_indices)
     valid_topk = torch.where(needs_seq_mask, sequential_valid, valid_topk)
 
+    if page_tables is None:
+        raw_indices = raw_indices.clone()
+        raw_indices.masked_fill_(~valid_topk, -1)
+        out_page_indices.copy_(raw_indices)
+        if out_raw_indices is not None:
+            out_raw_indices.copy_(raw_indices)
+        return
+
     page_idx = raw_indices >> page_bits
     offset_in_page = raw_indices & page_mask
 
@@ -393,16 +402,16 @@ def _topk_transform_512_vectorized(
         out_raw_indices.copy_(raw_indices)
 
 
-def _ref_torch_topk_transform_512_impl(
+def _ref_torch_topk_transform_impl(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
-    page_tables: torch.Tensor,
+    page_tables: Optional[torch.Tensor],
     out_page_indices: torch.Tensor,
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
     """Verbatim copy of sglang's vectorised PyTorch fallback."""
-    _topk_transform_512_vectorized(
+    _topk_transform_vectorized(
         scores,
         seq_lens,
         page_tables,
@@ -414,7 +423,7 @@ def _ref_torch_topk_transform_512_impl(
     )
 
 
-def _setup_topk_transform_512(
+def _setup_topk_transform(
     bs: int,
     seq_len: int,
     page_size: int,
@@ -439,10 +448,35 @@ def _setup_topk_transform_512(
     return score, lengths, page_table
 
 
-def _ref_topk_transform_512(
+def _setup_topk_transform_paged(
+    bs: int,
+    seq_len: int,
+    page_size: int,
+    length_override: Optional[int] = None,
+):
+    torch.manual_seed(42)
+    stream = torch.xpu.Stream()
+    torch.xpu.set_stream(stream)
+
+    score = torch.randn(bs, seq_len, dtype=torch.float32, device="xpu")
+
+    length_val = seq_len if length_override is None else length_override
+    lengths = torch.full((bs,), length_val, dtype=torch.int32, device="xpu")
+
+    num_pages = (seq_len + page_size - 1) // page_size
+    page_table = (
+        torch.arange(0, num_pages, dtype=torch.int32, device="xpu")
+        .unsqueeze(0)
+        .expand(bs, -1)
+        .contiguous()
+    )
+    return score, lengths, page_table
+
+
+def _ref_topk_transform(
     score: torch.Tensor,
     lengths: torch.Tensor,
-    page_table: torch.Tensor,
+    page_table: Optional[torch.Tensor],
     page_size: int,
     topk: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -453,14 +487,69 @@ def _ref_topk_transform_512(
     # The upstream ref reads ``seq_lens`` as an int32 tensor sized like the
     # batch; our callers already pass such a tensor for ``lengths`` so no
     # reshape/dtype coercion is needed.
-    _ref_torch_topk_transform_512_impl(
+    _ref_torch_topk_transform_impl(
         score, lengths, page_table, out_pi, page_size, out_ri
     )
     return out_pi, out_ri
 
 
-def _empty_v2_metadata(bs: int) -> torch.Tensor:
-    return torch.empty((bs + 1, 2), dtype=torch.int32, device="xpu")
+def _setup_topk_transform_ragged(
+    bs: int,
+    seq_len: int,
+    has_row_starts: bool,
+    length_override: Optional[int] = None,
+):
+    torch.manual_seed(42)
+    stream = torch.xpu.Stream()
+    torch.xpu.set_stream(stream)
+
+    score = torch.randn(
+        bs,
+        seq_len + (2048 if has_row_starts else 0),
+        dtype=torch.float32,
+        device="xpu",
+    )
+    if has_row_starts:
+        row_starts = torch.randint(0, 2048, (bs,), dtype=torch.int32, device="xpu")
+    else:
+        row_starts = None
+    length_val = seq_len if length_override is None else length_override
+    lengths = torch.full((bs,), length_val, dtype=torch.int32, device="xpu")
+    out_offsets = torch.randint(0, 1024, (bs,), dtype=torch.int32, device="xpu")
+
+    return score, lengths, row_starts, out_offsets
+
+
+def _ref_topk_transform_ragged(
+    score: torch.Tensor,
+    lengths: torch.Tensor,
+    out_offsets: torch.Tensor,
+    topk: int,
+    row_starts: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Per-row window top-k, ``-1`` padded, rebased by ``out_offsets``.
+
+    Row ``i`` selects (up to) ``topk`` indices from
+    ``score[i, start : start + lengths[i]]`` (``start = row_starts[i]``, 0 when
+    omitted). When ``lengths[i] <= topk`` every window position is selected
+    (order doesn't matter -- callers compare as sets).
+    """
+    bs = score.shape[0]
+    device = score.device
+    out = torch.full((bs, topk), -1, dtype=torch.int32, device=device)
+    lengths_cpu = lengths.cpu().tolist()
+    starts_cpu = row_starts.cpu().tolist() if row_starts is not None else [0] * bs
+    offsets_cpu = out_offsets.cpu().tolist()
+    for i in range(bs):
+        length = lengths_cpu[i]
+        start = starts_cpu[i]
+        offset = offsets_cpu[i]
+        k = min(topk, length)
+        if k > 0:
+            window = score[i, start : start + length]
+            idx = torch.topk(window, k, dim=-1, sorted=False).indices.to(torch.int32)
+            out[i, :k] = idx + offset
+    return out
 
 
 @pytest.mark.parametrize("bs", [1, 132, 256, 4096])
@@ -469,10 +558,10 @@ def _empty_v2_metadata(bs: int) -> torch.Tensor:
 @pytest.mark.parametrize("page_size", [1, 64, 256])
 @pytest.mark.parametrize("with_raw", [False, True])
 @torch.inference_mode()
-def test_topk_transform_512(
+def test_topk_transform(
     bs: int, topk: int, seq_len: int, page_size: int, with_raw: bool
 ) -> None:
-    score, lengths, page_table = _setup_topk_transform_512(bs, seq_len, page_size)
+    score, lengths, page_table = _setup_topk_transform(bs, seq_len, page_size)
 
     out_page = torch.full((bs, topk), -1, dtype=torch.int32, device="xpu")
     out_raw = (
@@ -480,11 +569,9 @@ def test_topk_transform_512(
         if with_raw
         else None
     )
-    topk_transform_512(score, lengths, page_table, out_page, page_size, out_raw)
+    topk_transform(score, lengths, page_table, out_page, page_size, out_raw)
 
-    ref_page, ref_raw = _ref_topk_transform_512(
-        score, lengths, page_table, page_size, topk
-    )
+    ref_page, ref_raw = _ref_topk_transform(score, lengths, page_table, page_size, topk)
 
     assert_equal(
         score,
@@ -541,12 +628,12 @@ def _ragged_lengths(bs: int, topk: int, max_len: int) -> torch.Tensor:
 @pytest.mark.parametrize("page_size", [1, 64, 256])
 @pytest.mark.parametrize("with_raw", [False, True])
 @torch.inference_mode()
-def test_topk_transform_512_trivial(
+def test_topk_transform_length_trivial(
     bs: int, length: int, topk: int, page_size: int, with_raw: bool
 ) -> None:
     """All rows have ``length <= topk`` -- exercises the naive page-map path."""
     seq_len = 4096
-    score, lengths, page_table = _setup_topk_transform_512(
+    score, lengths, page_table = _setup_topk_transform(
         bs, seq_len, page_size, length_override=length
     )
 
@@ -556,11 +643,9 @@ def test_topk_transform_512_trivial(
         if with_raw
         else None
     )
-    topk_transform_512(score, lengths, page_table, out_page, page_size, out_raw)
+    topk_transform(score, lengths, page_table, out_page, page_size, out_raw)
 
-    ref_page, ref_raw = _ref_topk_transform_512(
-        score, lengths, page_table, page_size, topk
-    )
+    ref_page, ref_raw = _ref_topk_transform(score, lengths, page_table, page_size, topk)
 
     assert_equal(
         score,
@@ -589,12 +674,12 @@ def test_topk_transform_512_trivial(
 @pytest.mark.parametrize("page_size", [1, 64, 256])
 @pytest.mark.parametrize("with_raw", [False, True])
 @torch.inference_mode()
-def test_topk_transform_512_ragged(
+def test_topk_transform_length_ragged(
     bs: int, topk: int, page_size: int, with_raw: bool
 ) -> None:
     """Ragged mix of ``length <= topk`` and ``length > topk`` rows in one launch."""
     seq_len = _RAGGED_ALLOC_SEQ_LEN
-    score, _, page_table = _setup_topk_transform_512(bs, seq_len, page_size)
+    score, _, page_table = _setup_topk_transform(bs, seq_len, page_size)
     lengths = _ragged_lengths(bs, topk, max_len=seq_len)
 
     out_page = torch.full((bs, topk), -1, dtype=torch.int32, device="xpu")
@@ -603,11 +688,9 @@ def test_topk_transform_512_ragged(
         if with_raw
         else None
     )
-    topk_transform_512(score, lengths, page_table, out_page, page_size, out_raw)
+    topk_transform(score, lengths, page_table, out_page, page_size, out_raw)
 
-    ref_page, ref_raw = _ref_topk_transform_512(
-        score, lengths, page_table, page_size, topk
-    )
+    ref_page, ref_raw = _ref_topk_transform(score, lengths, page_table, page_size, topk)
 
     assert_equal(
         score,
@@ -635,27 +718,15 @@ def test_topk_transform_512_ragged(
 @pytest.mark.parametrize("topk", [512, 1024, 2048])
 @pytest.mark.parametrize("seq_len", [4096, 16384, 65536])
 @pytest.mark.parametrize("page_size", [1, 64, 256])
-@pytest.mark.parametrize("with_raw", [False, True])
 @torch.inference_mode()
-def test_topk_transform_512_v2(
-    bs: int, topk: int, seq_len: int, page_size: int, with_raw: bool
-) -> None:
-    score, lengths, page_table = _setup_topk_transform_512(bs, seq_len, page_size)
-    metadata = _empty_v2_metadata(bs)
+def test_topk_transform_paged(bs: int, topk: int, seq_len: int, page_size: int) -> None:
+    score, lengths, page_table = _setup_topk_transform_paged(bs, seq_len, page_size)
 
     out_page = torch.full((bs, topk), -1, dtype=torch.int32, device="xpu")
-    out_raw = (
-        torch.full((bs, topk), -1, dtype=torch.int32, device="xpu")
-        if with_raw
-        else None
-    )
-    topk_transform_512_v2(
-        score, lengths, page_table, out_page, page_size, metadata, out_raw
-    )
+    metadata = torch.empty((0,), dtype=torch.int32, device="cpu")
+    topk_transform_paged(score, lengths, page_table, out_page, page_size, metadata)
 
-    ref_page, ref_raw = _ref_topk_transform_512(
-        score, lengths, page_table, page_size, topk
-    )
+    ref_page, ref_raw = _ref_topk_transform(score, lengths, page_table, page_size, topk)
 
     assert_equal(
         score,
@@ -666,47 +737,26 @@ def test_topk_transform_512_v2(
         seq_len,
         max_permit_error=5,
     )
-
-    if with_raw:
-        assert_equal(
-            score,
-            torch.sort(ref_raw, dim=-1).values,
-            torch.sort(out_raw, dim=-1).values,
-            bs,
-            topk,
-            seq_len,
-            max_permit_error=5,
-        )
 
 
 @pytest.mark.parametrize("bs,length", _TRIVIAL_CONFIGS)
 @pytest.mark.parametrize("topk", [512, 1024, 2048])
 @pytest.mark.parametrize("page_size", [1, 64, 256])
-@pytest.mark.parametrize("with_raw", [False, True])
 @torch.inference_mode()
-def test_topk_transform_512_v2_trivial(
-    bs: int, length: int, topk: int, page_size: int, with_raw: bool
+def test_topk_transform_paged_length_trivial(
+    bs: int, length: int, topk: int, page_size: int
 ) -> None:
     """All rows have ``length <= topk`` -- exercises the naive page-map path."""
     seq_len = 4096
-    score, lengths, page_table = _setup_topk_transform_512(
+    score, lengths, page_table = _setup_topk_transform_paged(
         bs, seq_len, page_size, length_override=length
     )
-    metadata = _empty_v2_metadata(bs)
 
     out_page = torch.full((bs, topk), -1, dtype=torch.int32, device="xpu")
-    out_raw = (
-        torch.full((bs, topk), -1, dtype=torch.int32, device="xpu")
-        if with_raw
-        else None
-    )
-    topk_transform_512_v2(
-        score, lengths, page_table, out_page, page_size, metadata, out_raw
-    )
+    metadata = torch.empty((0,), dtype=torch.int32, device="cpu")
+    topk_transform_paged(score, lengths, page_table, out_page, page_size, metadata)
 
-    ref_page, ref_raw = _ref_topk_transform_512(
-        score, lengths, page_table, page_size, topk
-    )
+    ref_page, ref_raw = _ref_topk_transform(score, lengths, page_table, page_size, topk)
 
     assert_equal(
         score,
@@ -717,46 +767,23 @@ def test_topk_transform_512_v2_trivial(
         seq_len,
         max_permit_error=5,
     )
-
-    if with_raw:
-        assert_equal(
-            score,
-            torch.sort(ref_raw, dim=-1).values,
-            torch.sort(out_raw, dim=-1).values,
-            bs,
-            topk,
-            seq_len,
-            max_permit_error=5,
-        )
 
 
 @pytest.mark.parametrize("bs", [8, 132])
 @pytest.mark.parametrize("topk", [512, 1024, 2048])
 @pytest.mark.parametrize("page_size", [1, 64, 256])
-@pytest.mark.parametrize("with_raw", [False, True])
 @torch.inference_mode()
-def test_topk_transform_512_v2_ragged(
-    bs: int, topk: int, page_size: int, with_raw: bool
-) -> None:
+def test_topk_transform_paged_length_ragged(bs: int, topk: int, page_size: int) -> None:
     """Ragged mix of ``length <= topk`` and ``length > topk`` rows in one launch."""
     seq_len = _RAGGED_ALLOC_SEQ_LEN
-    score, _, page_table = _setup_topk_transform_512(bs, seq_len, page_size)
+    score, _, page_table = _setup_topk_transform_paged(bs, seq_len, page_size)
     lengths = _ragged_lengths(bs, topk, max_len=seq_len)
-    metadata = _empty_v2_metadata(bs)
 
     out_page = torch.full((bs, topk), -1, dtype=torch.int32, device="xpu")
-    out_raw = (
-        torch.full((bs, topk), -1, dtype=torch.int32, device="xpu")
-        if with_raw
-        else None
-    )
-    topk_transform_512_v2(
-        score, lengths, page_table, out_page, page_size, metadata, out_raw
-    )
+    metadata = torch.empty((0,), dtype=torch.int32, device="cpu")
+    topk_transform_paged(score, lengths, page_table, out_page, page_size, metadata)
 
-    ref_page, ref_raw = _ref_topk_transform_512(
-        score, lengths, page_table, page_size, topk
-    )
+    ref_page, ref_raw = _ref_topk_transform(score, lengths, page_table, page_size, topk)
 
     assert_equal(
         score,
@@ -768,16 +795,132 @@ def test_topk_transform_512_v2_ragged(
         max_permit_error=5,
     )
 
-    if with_raw:
-        assert_equal(
-            score,
-            torch.sort(ref_raw, dim=-1).values,
-            torch.sort(out_raw, dim=-1).values,
-            bs,
-            topk,
-            seq_len,
-            max_permit_error=5,
-        )
+
+@pytest.mark.parametrize("bs", [1, 132, 256, 4096])
+@pytest.mark.parametrize("topk", [512, 1024, 2048])
+@pytest.mark.parametrize("seq_len", [4096, 16384, 65536])
+@pytest.mark.parametrize("page_size", [1, 64, 256])
+@torch.inference_mode()
+def test_topk_transform_paged_page_table_none(
+    bs: int, topk: int, seq_len: int, page_size: int
+) -> None:
+    """page_tables=None -- out_page_indices should hold raw indices directly."""
+    score, lengths, _ = _setup_topk_transform_paged(bs, seq_len, page_size)
+
+    out_page = torch.full((bs, topk), -1, dtype=torch.int32, device="xpu")
+    metadata = torch.empty((0,), dtype=torch.int32, device="cpu")
+    topk_transform_paged(score, lengths, None, out_page, page_size, metadata)
+
+    ref_page, ref_raw = _ref_topk_transform(score, lengths, None, page_size, topk)
+
+    assert_equal(
+        score,
+        torch.sort(ref_page, dim=-1).values,
+        torch.sort(out_page, dim=-1).values,
+        bs,
+        topk,
+        seq_len,
+        max_permit_error=5,
+    )
+
+
+@pytest.mark.parametrize("bs", [1, 132, 256, 4096])
+@pytest.mark.parametrize("topk", [512, 1024, 2048])
+@pytest.mark.parametrize("seq_len", [2048, 4096, 16384, 65536])
+@pytest.mark.parametrize("has_row_starts", [True, False])
+@torch.inference_mode()
+def test_topk_transform_ragged(
+    bs: int, topk: int, seq_len: int, has_row_starts: bool
+) -> None:
+    score, lengths, row_starts, out_offsets = _setup_topk_transform_ragged(
+        bs, seq_len, has_row_starts
+    )
+
+    out_indices = torch.full((bs, topk), -1, dtype=torch.int32, device="xpu")
+    topk_transform_ragged(score, lengths, out_indices, out_offsets, row_starts)
+
+    ref_indices = _ref_topk_transform_ragged(
+        score, lengths, out_offsets, topk, row_starts=row_starts
+    )
+
+    assert_equal(
+        score,
+        torch.sort(ref_indices, dim=-1).values,
+        torch.sort(out_indices, dim=-1).values,
+        bs,
+        topk,
+        seq_len,
+        out_offsets,
+        row_starts=row_starts,
+        max_permit_error=5,
+    )
+
+
+@pytest.mark.parametrize("bs,length", _TRIVIAL_CONFIGS)
+@pytest.mark.parametrize("topk", [512, 1024, 2048])
+@pytest.mark.parametrize("has_row_starts", [True, False])
+@torch.inference_mode()
+def test_topk_transform_ragged_length_trivial(
+    bs: int, length: int, topk: int, has_row_starts: bool
+) -> None:
+    """All rows have ``length <= topk`` -- exercises the naive path."""
+    seq_len = 4096
+    score, lengths, row_starts, out_offsets = _setup_topk_transform_ragged(
+        bs, seq_len, has_row_starts, length_override=length
+    )
+
+    out_indices = torch.full((bs, topk), -1, dtype=torch.int32, device="xpu")
+    topk_transform_ragged(score, lengths, out_indices, out_offsets, row_starts)
+
+    ref_indices = _ref_topk_transform_ragged(
+        score, lengths, out_offsets, topk, row_starts=row_starts
+    )
+
+    assert_equal(
+        score,
+        torch.sort(ref_indices, dim=-1).values,
+        torch.sort(out_indices, dim=-1).values,
+        bs,
+        topk,
+        seq_len,
+        out_offsets,
+        row_starts=row_starts,
+        max_permit_error=5,
+    )
+
+
+@pytest.mark.parametrize("bs", [8, 132])
+@pytest.mark.parametrize("topk", [512, 1024, 2048])
+@pytest.mark.parametrize("has_row_starts", [True, False])
+@torch.inference_mode()
+def test_topk_transform_ragged_length_ragged(
+    bs: int, topk: int, has_row_starts: bool
+) -> None:
+    """Ragged mix of ``length <= topk`` and ``length > topk`` rows in one launch."""
+    seq_len = _RAGGED_ALLOC_SEQ_LEN
+    score, _, row_starts, out_offsets = _setup_topk_transform_ragged(
+        bs, seq_len, has_row_starts
+    )
+    lengths = _ragged_lengths(bs, topk, max_len=seq_len)
+
+    out_indices = torch.full((bs, topk), -1, dtype=torch.int32, device="xpu")
+    topk_transform_ragged(score, lengths, out_indices, out_offsets, row_starts)
+
+    ref_indices = _ref_topk_transform_ragged(
+        score, lengths, out_offsets, topk, row_starts=row_starts
+    )
+
+    assert_equal(
+        score,
+        torch.sort(ref_indices, dim=-1).values,
+        torch.sort(out_indices, dim=-1).values,
+        bs,
+        topk,
+        seq_len,
+        out_offsets,
+        row_starts=row_starts,
+        max_permit_error=5,
+    )
 
 
 if __name__ == "__main__":

@@ -68,6 +68,29 @@ struct DummyGatherKernel {
   }
 };
 
+// Placeholder split-K reduction companion for kernels that have none (the fused path and
+// the non-split two-stage path): has_reduce is false, so it is never launched and only its
+// empty Arguments / Params types are ever instantiated. Kept here rather than in
+// kernel/xe_mla_sparse_2stage_reduce_split_kv.hpp so this runner -- which the fused path
+// also uses -- does not have to include the 2-stage split-K header just to name "no
+// companion". Same role as MLA's DummyReductionKernel.
+struct DummyReduceKernel {
+  struct Arguments {};
+  struct Params {};
+  static bool can_implement(Arguments const&) {
+    return true;
+  }
+  static int get_workspace_size(Arguments const&) {
+    return 0;
+  }
+  static Params to_underlying_arguments(Arguments const&, void*) {
+    return {};
+  }
+  static cutlass::Status initialize_workspace(Arguments const&, void* = nullptr) {
+    return cutlass::Status::kSuccess;
+  }
+};
+
 // User-facing Arguments for a main kernel that HAS a Stage-1 gather companion. The
 // two stages are independent kernels with independent Params (neither type derives
 // from the other), so the runner carries one argument object per stage.
@@ -104,7 +127,22 @@ struct TwoStageArguments {
 //     two kernels are fully independent and the config struct names both).
 // Left at the default, has_gather is false and this launches only the main kernel,
 // which is what the fused path (XeMlaSparseFwdKernel) needs.
-template <class Kernel_, int GrfSize = 128, class GatherKernel_ = detail::DummyGatherKernel>
+//
+// ReduceKernel_ is the optional split-K reduction companion, wired the same way as the
+// gather but on the *other* side of the main kernel: the launch order becomes
+// gather -> dense -> reduce. It is only meaningful for a Stage-2 kernel built with the
+// split-K epilogue, which publishes per-split partials instead of the finished row (see
+// kernel/xe_mla_sparse_2stage_reduce_split_kv.hpp). Unlike MLA -- whose reduction
+// arguments are a strict subset of the main kernel's and are copied field by field in
+// MLA::initialize -- the sparse reduction's Arguments simply *are* the dense kernel's
+// (every tensor it needs is already in SparseAttn2StageParams), so it is derived from
+// dense_args() and adds nothing to this runner's Arguments type. Left at the default,
+// has_reduce is false and nothing about the existing paths changes.
+template <
+    class Kernel_,
+    int GrfSize = 128,
+    class GatherKernel_ = detail::DummyGatherKernel,
+    class ReduceKernel_ = detail::DummyReduceKernel>
 class MLASparse {
  public:
   //
@@ -119,6 +157,10 @@ class MLASparse {
   static constexpr bool has_gather = !cute::is_same_v<GatherKernel, detail::DummyGatherKernel>;
   using GatherArguments = typename GatherKernel::Arguments;
   using GatherParams = typename GatherKernel::Params;
+
+  using ReduceKernel = ReduceKernel_;
+  static constexpr bool has_reduce = !cute::is_same_v<ReduceKernel, detail::DummyReduceKernel>;
+  using ReduceParams = typename ReduceKernel::Params;
 
   // Fused path: Arguments are just the main kernel's, unchanged. 2-stage path: the
   // two stages' independent argument objects side by side.
@@ -138,10 +180,11 @@ class MLASparse {
   struct Params {
     KernelParams fmla_params;
     GatherParams gather_params;
+    ReduceParams reduce_params;
   };
 
-  // Argument accessors that collapse the conditional Arguments type above, so the
-  // methods below read the same in both paths.
+  static constexpr int kReduceGrfSize = 128;
+
   static DenseArguments const& dense_args(Arguments const& args) {
     if constexpr (has_gather) {
       return args.dense;
@@ -185,6 +228,9 @@ class MLASparse {
     if constexpr (has_gather) {
       if (!GatherKernel::can_implement(args.gather)) return cutlass::Status::kErrorInvalidProblem;
     }
+    if constexpr (has_reduce) {
+      if (!ReduceKernel::can_implement(dense_args(args))) return cutlass::Status::kErrorInvalidProblem;
+    }
     return cutlass::Status::kSuccess;
   }
 
@@ -193,6 +239,9 @@ class MLASparse {
     workspace_bytes += Kernel::get_workspace_size(dense_args(args));
     if constexpr (has_gather) {
       workspace_bytes += GatherKernel::get_workspace_size(args.gather);
+    }
+    if constexpr (has_reduce) {
+      workspace_bytes += ReduceKernel::get_workspace_size(dense_args(args));
     }
     return workspace_bytes;
   }
@@ -208,10 +257,12 @@ class MLASparse {
 
     params_.fmla_params = Kernel::to_underlying_arguments(dense_args(args), workspace);
     if constexpr (has_gather) {
-      // Stage 1's params are its own (they are its Arguments type); no field is
-      // derived from the dense stage. Cf. MLA::initialize, which has to copy the
-      // O/O_accum/exp_sums/max_logits handles out of the main kernel's arguments.
       params_.gather_params = GatherKernel::to_underlying_arguments(args.gather, workspace);
+      CUTLASS_CHECK(GatherKernel::initialize_workspace(args.gather, workspace));
+    }
+    if constexpr (has_reduce) {
+      params_.reduce_params = ReduceKernel::to_underlying_arguments(dense_args(args), workspace);
+      CUTLASS_CHECK(ReduceKernel::initialize_workspace(dense_args(args), workspace));
     }
 
     if (is_initialized()) return Status::kSuccess;
@@ -236,17 +287,14 @@ class MLASparse {
 
   static cutlass::Status run(Params& params, sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
     if constexpr (!has_gather) {
-      // Fused path: main kernel only.
       launch<Kernel, GrfSize>(params.fmla_params);
     } else {
-      // 2-stage path: gather companion + dense attention kernel, each with its own
-      // params. Companion first so its gathered-KV HBM tile is materialized before
-      // the dense kernel reads it; the in-order XPU queue serializes the launches.
-      // Mirrors MLA::run's split-attention + reduction dual launch
-      // (mla/device/mla_runner.hpp), with the order inverted because the gather
-      // produces the dense kernel's input instead of consuming its output.
       launch<GatherKernel, kGatherGrfSize>(params.gather_params);
       launch<Kernel, GrfSize>(params.fmla_params);
+    }
+
+    if constexpr (has_reduce) {
+      launch<ReduceKernel, kReduceGrfSize>(params.reduce_params);
     }
 
     return cutlass::Status::kSuccess;

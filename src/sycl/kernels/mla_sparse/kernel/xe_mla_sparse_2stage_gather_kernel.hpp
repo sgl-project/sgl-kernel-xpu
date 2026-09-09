@@ -431,7 +431,10 @@ class SparseGatherKernel {
 
   // Host-side contract for the device::MLASparse runner, mirroring what the split-KV
   // reduction companion provides to device::MLA (kernel/xe_mla_reduce_split_kv.hpp):
-  // Arguments == Params (nothing to transform), no workspace of its own.
+  // Arguments == Params (nothing to transform). Unlike that companion, this stage does
+  // own a workspace -- the gathered-KV tile + valid mask it writes -- but it receives
+  // those buffers through its params pointers, not the opaque blob, so
+  // initialize_workspace stays a no-op; see get_workspace_size below.
   static Params to_underlying_arguments(Arguments const& args, void* /* workspace */) {
     return args;
   }
@@ -441,8 +444,18 @@ class SparseGatherKernel {
            args.gathered_valid_mask != nullptr;
   }
 
-  static int get_workspace_size(Arguments const& /* args */) {
-    return 0;
+  // Stage 1 is NOT workspace-free: its outputs are the dense gathered-KV tile
+  // ([b, s_q, gathered_topk, D_QK] bf16) plus the int32 valid mask
+  // ([b, s_q, gathered_topk]), and those buffers are exactly this kernel's
+  // workspace. The buffers are handed in through the params pointers
+  // (gathered_k / gathered_valid_mask) rather than the opaque blob, but their size
+  // is this kernel's business, so the host asks for it here (via the runner's
+  // MLASparse::get_workspace_size) instead of recomputing the layout -- see the
+  // batch chunking against DECODE_GATHERED_K_MAX_BYTES in
+  // device/mla_sparse_decode_2stage_types.hpp.
+  static size_t get_workspace_size(Arguments const& args) {
+    const size_t rows = size_t(args.b) * size_t(args.s_q) * size_t(args.gathered_topk);
+    return rows * (size_t(D_QK) * sizeof(cutlass::bfloat16_t) + sizeof(int));
   }
 
   static cutlass::Status initialize_workspace(Arguments const& /* args */, void* /* workspace */ = nullptr) {

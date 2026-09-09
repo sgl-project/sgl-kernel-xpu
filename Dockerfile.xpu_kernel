@@ -1,6 +1,6 @@
 # If the device is Battlemage, we need to set UBUNTU_VERSION to 24.10
 
-# Usage: docker build --build-arg UBUNTU_VERSION=24.04 --build-arg PYTHON_VERSION=3.10 -t sglang:xpu_kernel -f  Dockerfile.xpu --no-cache .
+# Usage: docker build --build-arg UBUNTU_VERSION=24.04 --build-arg PYTHON_VERSION=3.12 -t sglang:xpu_kernel -f  Dockerfile.xpu --no-cache .
 
 
 # Set default Ubuntu version to 24.04
@@ -9,7 +9,7 @@ FROM intel/deep-learning-essentials:2026.0.0-devel-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Define build arguments
-ARG PYTHON_VERSION=3.10
+ARG PYTHON_VERSION=3.12
 
 # Set environment variables
 
@@ -69,7 +69,7 @@ RUN --mount=type=secret,id=github_token \
     conda activate py${PYTHON_VERSION} && \
     # . /opt/intel/oneapi/setvars.sh --force && \
     # Install Torch
-    pip install torch==2.13.0 torchvision triton-xpu --index-url https://download.pytorch.org/whl/xpu
+    pip install --timeout 300 --retries 10 torch==2.13.0 torchvision triton-xpu --index-url https://download.pytorch.org/whl/xpu
 
 # Install SGlang from source
 RUN --mount=type=secret,id=github_token \

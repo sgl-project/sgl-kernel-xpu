@@ -323,6 +323,13 @@ struct PrefillRunner {
     // must be contiguous, which is enforced by CHECK_LAST_DIM_CONTIGUOUS_INPUT.
     // StrideQ/K/V/O use plain `int` elements, but Arguments stores strides as
     // int64_t, so narrow explicitly before handing them to make_stride.
+    constexpr int64_t kIntMax = 2147483647LL;
+    TORCH_CHECK(
+      q_row_stride <= kIntMax && k_row_stride <= kIntMax && v_row_stride <= kIntMax && q_head_stride <= kIntMax &&
+          k_head_stride <= kIntMax && v_head_stride <= kIntMax && o_row_stride <= kIntMax && o_head_stride <= kIntMax,
+      "Q/K/V/O stride exceeds int32 max (",
+      kIntMax,
+    ")");
     int const q_row_stride_i = static_cast<int>(q_row_stride);
     int const k_row_stride_i = static_cast<int>(k_row_stride);
     int const v_row_stride_i = static_cast<int>(v_row_stride);
@@ -337,7 +344,6 @@ struct PrefillRunner {
     stride_K_cache = cutlass::make_stride(k_row_stride_i, Int<1>{}, k_head_stride_i, k_row_stride_i * seq_len_kv_cache);
     stride_V_cache = cutlass::make_stride(Int<1>{}, v_row_stride_i, v_head_stride_i, v_row_stride_i * seq_len_kv_cache);
     stride_O = cutlass::make_stride(o_row_stride_i, Int<1>{}, o_head_stride_i, o_row_stride_i * seq_len_qo);
-
     if constexpr (isVarLen) {
       shape.seq_len_qo.cumulative_length = params.cu_seqlens_q;
       shape.seq_len_kv.cumulative_length = params.cu_seqlens_knew;

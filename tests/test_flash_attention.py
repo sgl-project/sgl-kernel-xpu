@@ -3050,9 +3050,10 @@ def test_flash_attn_varlen_output_noncontiguous(d, causal, dtype):
         causal=causal,
         softmax_scale=softmax_scale,
     )
-
+    for name, t in (("q", q), ("k", k), ("v", v)):
+        print(f"{name}: shape={tuple(t.shape)} stride={t.stride()}")
     out = flash_attn_varlen_func(
-        q.contiguous(), k.contiguous(), v.contiguous(), **kwargs
+        q, k, v, **kwargs
     )
     # attention_ref expects batched (batch, seqlen, nheads, d) tensors, not the
     # ragged (total, nheads, d) layout flash_attn_varlen_func takes. Every batch
@@ -3086,4 +3087,4 @@ def test_flash_attn_varlen_output_noncontiguous(d, causal, dtype):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([f"{__file__}::test_flash_attn_varlen_output_noncontiguous"]))
+    sys.exit(pytest.main([__file__]))

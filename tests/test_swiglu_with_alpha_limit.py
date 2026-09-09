@@ -21,14 +21,28 @@ def swiglu_gpt_oss_sigmoid_alpha_ref_fp32(x, gemm1_alpha, gemm1_limit):
     )
 
 
-# One output ULP. The kernel computes in fp32 and narrows once, so it should
-# land on the fp32-then-narrow reference to within the rounding of that single
-# cast; the 2-byte paths additionally use sycl::native::exp (~1e-6 relative,
-# well inside one ULP of a bf16/fp16 output).
+# One output ULP. The kernel computes in fp32 and narrows once, so it should land
+# on the fp32-then-narrow reference to within the rounding of that single cast;
+# the 2-byte paths additionally use sycl::native::exp (~1e-6 relative, well
+# inside one ULP of a bf16/fp16 output).
+#
+# These are *relative* ULPs at the unfavourable end of a binade. For a p-bit
+# mantissa and v in [2^e, 2^(e+1)), one ULP is 2^(e-p), so ulp/v lies in
+# (2^-(p+1), 2^-p]: 2^-10 for fp16 (p=10) and 2^-7 for bf16 (p=7). Using the
+# favourable end (2^-11 / 2^-8) makes these tests fail on roughly 1 element in
+# 32k, whenever the kernel's fp32 intermediate and torch's land either side of
+# an output rounding boundary -- a genuine 1-ULP disagreement, not a kernel bug.
+# That is a half-ULP tolerance masquerading as a one-ULP one, so it is set to a
+# true ULP here.
+#
+# This is still far tighter than the 1e-1 of the sweep above and retains the
+# power the tight-tolerance tests were added for: a tail that computed the wrong
+# element, or a de-interleave that swapped gate and up, is off by O(1), not by
+# one ULP.
 TIGHT_TOL = {
     torch.float32: (1e-6, 1e-6),
-    torch.bfloat16: (2**-8, 2**-8),
-    torch.float16: (2**-11, 2**-11),
+    torch.bfloat16: (2**-7, 2**-7),
+    torch.float16: (2**-10, 2**-10),
 }
 
 
@@ -102,6 +116,10 @@ def test_swiglu_vector_tail(batch_size, hidden, dtype):
     inputs.
     """
     alpha, limit = 1.702, 7.0
+    # Seeded: at a one-ULP tolerance an unseeded draw makes this test
+    # intermittent rather than wrong, and an intermittent failure in CI is
+    # indistinguishable from an unrelated flake.
+    torch.manual_seed(0)
     x = torch.randn((batch_size, hidden * 2), dtype=dtype, device="xpu")
 
     output = swiglu_gpt_oss_sigmoid_alpha(x, alpha, limit)
@@ -122,6 +140,7 @@ def test_swiglu_unaligned_input_view(dtype):
     """
     alpha, limit = 1.702, 7.0
     hidden = 61  # odd, so B*H also lands on the tail
+    torch.manual_seed(0)  # see the note on seeding in test_swiglu_vector_tail
     big = torch.randn((1, hidden * 2 + 8), dtype=dtype, device="xpu")
     x = big[:, 1 : 1 + hidden * 2]
     assert x.is_contiguous()
@@ -151,6 +170,7 @@ def test_swiglu_no_write_past_output(dtype):
     total_pairs = 253  # % 4 == 1: largest overrun, smallest allocator padding
 
     torch.xpu.empty_cache()
+    torch.manual_seed(0)  # see the note on seeding in test_swiglu_vector_tail
     x = torch.randn((1, total_pairs * 2), dtype=dtype, device="xpu")
     first = swiglu_gpt_oss_sigmoid_alpha(x, alpha, limit)
     first_ptr = first.data_ptr()
@@ -201,6 +221,7 @@ def test_swiglu_clamp_asymmetry(dtype):
     """
     alpha, limit = 1.702, 0.1  # small limit vs input scale
     hidden = 128
+    torch.manual_seed(0)
     x = (
         torch.randn((256, hidden * 2), dtype=dtype, device="xpu") * 5.0
     )  # scale up so |x| >> limit
@@ -245,6 +266,7 @@ def test_swiglu_clamp_partially_binding(dtype):
     test.
     """
     alpha, limit = 1.702, 0.7
+    torch.manual_seed(0)
     x = torch.randn((256, 256), dtype=dtype, device="xpu")
     _assert_clamps_bind(x, limit)
 

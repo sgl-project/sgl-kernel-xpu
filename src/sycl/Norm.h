@@ -11,10 +11,6 @@ namespace at::native::xpu {
 
 constexpr int NUM_REDUCE_STAGES = 16;
 
-#define DECLARE_SYCL_LOCAL_FENCE sycl::access::fence_space::local_space
-#define DECLARE_SYCL_GLOBAL_FENCE sycl::access::fence_space::global_space
-#define DECLARE_SYCL_GLOBAL_AND_LOCAL_FENCE dpcpp_global_and_local_fence = sycl::access::fence_space::global_and_local
-
 inline std::tuple<int64_t, int64_t> _check_layer_norm_inputs(
     const torch::Tensor& input,
     IntArrayRef normalized_shape,
@@ -44,64 +40,6 @@ inline std::tuple<int64_t, int64_t> _check_layer_norm_inputs(
   int64_t batch_size = input.numel() / hidden_size;
 
   return std::make_tuple(batch_size, hidden_size);
-}
-
-template <typename accscalar_t, typename reduce_op, typename nd_item_id, typename local_shared>
-static inline void norm_group_reduce(
-    nd_item_id item_id,
-    int sub_group_num,
-    accscalar_t& mean,
-    accscalar_t& rstd,
-    const local_shared& local_mean,
-    const local_shared& local_rstd,
-    reduce_op bin_op) {
-  auto sg = item_id.get_sub_group();
-#pragma unroll
-  for (int i = 1; i < NUM_REDUCE_STAGES; i <<= 1) {
-    mean = bin_op(mean, static_cast<accscalar_t>(sycl::shift_group_left(sg, mean, i)));
-    rstd = bin_op(rstd, static_cast<accscalar_t>(sycl::shift_group_left(sg, rstd, i)));
-  }
-  if (sub_group_num == 1) {
-    mean = sycl::group_broadcast(sg, mean, 0);
-    rstd = sycl::group_broadcast(sg, rstd, 0);
-    return;
-  }
-  uint32_t sg_local_id = sg.get_local_linear_id();
-  uint32_t sg_id = sg.get_group_linear_id();
-
-  int idx = sg_id;
-  if (sg_local_id == 0) {
-    local_mean[sg_id] = mean;
-    local_rstd[sg_id] = rstd;
-  }
-  item_id.barrier(DECLARE_SYCL_LOCAL_FENCE);
-
-  if (idx == 0) {
-    mean = 0;
-    rstd = 0;
-    if (sg_local_id < sub_group_num) {
-      mean = accscalar_t(local_mean[sg_local_id]);
-      rstd = accscalar_t(local_rstd[sg_local_id]);
-    }
-    for (int i = sg_local_id + NUM_REDUCE_STAGES; i < sub_group_num; i += NUM_REDUCE_STAGES) {
-      mean = bin_op(mean, static_cast<accscalar_t>(local_mean[i]));
-      rstd = bin_op(rstd, static_cast<accscalar_t>(local_rstd[i]));
-    }
-#pragma unroll
-    for (int i = 1; i < NUM_REDUCE_STAGES; i <<= 1) {
-      mean = bin_op(mean, static_cast<accscalar_t>(sycl::shift_group_left(sg, mean, i)));
-      rstd = bin_op(rstd, static_cast<accscalar_t>(sycl::shift_group_left(sg, rstd, i)));
-      if (i >= ((sub_group_num + 1) >> 1)) break;
-    }
-
-    if (sg_local_id == 0) {
-      local_mean[0] = mean;
-      local_rstd[0] = rstd;
-    }
-  }
-  item_id.barrier(DECLARE_SYCL_LOCAL_FENCE);
-  mean = local_mean[0];
-  rstd = local_rstd[0];
 }
 
 class NormConfig {
@@ -383,94 +321,6 @@ class NormConfig {
     workgroup_size = std::max(workgroup_size, NUM_REDUCE_STAGES);
     sub_group_num = workgroup_size / NUM_REDUCE_STAGES;
   }
-};
-
-template <typename scalar_t, typename weight_t, bool one_moment = false, typename mean_t = float>
-class NormForward {
- public:
-  using accscalar_t = acc_type<scalar_t>;
-  NormForward() = delete;
-  NormForward(
-      scalar_t* X_data,
-      scalar_t* Y_data,
-      mean_t* mean_data,
-      mean_t* var_data,
-      weight_t* gamma_data,
-      weight_t* beta_data,
-      accscalar_t eps)
-      : X_data(X_data),
-        Y_data(Y_data),
-        mean_data(mean_data),
-        var_data(var_data),
-        gamma_data(gamma_data),
-        beta_data(beta_data),
-        eps(eps) {}
-
-  int get_rowwise_reduce_vec_size(int Plane, int vec_size) {
-    vec_size = std::min(
-        vec_size, can_vectorize_up_to<scalar_t>(dpcppGetDeviceIdOfCurrentQueue(), reinterpret_cast<char*>(X_data)));
-
-    while (Plane % vec_size != 0) {
-      vec_size = vec_size >> 1;
-    }
-    return vec_size;
-  }
-
-  int get_update_vec_size(int Plane, int vec_size) {
-    vec_size = get_min_vec_size(vec_size, X_data, Y_data, gamma_data, beta_data);
-
-    while (Plane % vec_size != 0) {
-      vec_size = vec_size >> 1;
-    }
-    return vec_size;
-  }
-
-  int get_eltwise_update_vec_size(int vec_size) {
-    vec_size = std::min(
-        vec_size, can_vectorize_up_to<scalar_t>(dpcppGetDeviceIdOfCurrentQueue(), reinterpret_cast<char*>(X_data)));
-    vec_size = std::min(
-        vec_size, can_vectorize_up_to<scalar_t>(dpcppGetDeviceIdOfCurrentQueue(), reinterpret_cast<char*>(Y_data)));
-    return vec_size;
-  }
-
-  template <int vec_size, typename vec_t, typename weight_vec_t, typename index_t, typename nd_item_id>
-  void reduce_combine(nd_item_id item_id, const NormConfig& cfg, accscalar_t& sum1, accscalar_t& sum2) const {
-    auto group_id = item_id.get_group(0);
-    auto group_id_foreach = item_id.get_group(1);
-    auto local_id = item_id.get_local_id(2);
-    index_t group_offset = group_id * cfg.Plane;
-
-    for (index_t j = local_id * vec_size; j < cfg.WGPlane; j += cfg.workgroup_size * vec_size) {
-      index_t plane_offset = group_id_foreach * cfg.WGPlane + j;
-      if (plane_offset < cfg.Plane) {
-        vec_t value = *(reinterpret_cast<vec_t*>(X_data + group_offset + plane_offset));
-        for (int v = 0; v < vec_size; ++v) {
-          sum1 += static_cast<accscalar_t>(value[v]);
-          sum2 += static_cast<accscalar_t>(value[v]) * static_cast<accscalar_t>(value[v]);
-        }
-      }
-    }
-  }
-
-  template <typename nd_item_id>
-  void reduce_project(nd_item_id item_id, accscalar_t sum1, accscalar_t sum2, const NormConfig& cfg) const {
-    auto group_id = item_id.get_group(0);
-    accscalar_t scale = static_cast<accscalar_t>(cfg.Plane);
-    sum2 = (sum2 - sum1 * sum1 / scale) / scale;
-    sum1 = sum1 / scale;
-    mean_data[group_id] = static_cast<mean_t>(sum1);
-    var_data[group_id] =
-        static_cast<mean_t>(Numerics<accscalar_t>::rsqrt(sum2 < 0 ? 0 : sum2 + static_cast<accscalar_t>(eps)));
-  }
-
- public:
-  scalar_t* X_data;
-  scalar_t* Y_data;
-  mean_t* mean_data;
-  mean_t* var_data;
-  weight_t* gamma_data;
-  weight_t* beta_data;
-  accscalar_t eps;
 };
 
 bool canUse32BitIndexMath(const at::Tensor& t, int64_t max_elem) {

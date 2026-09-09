@@ -175,5 +175,85 @@ def test_swiglu_no_write_past_output(dtype):
     )
 
 
+def _assert_clamps_bind(x, limit):
+    """Check the premise of the clamp tests: that the clamps actually engage.
+
+    Without this the tests below silently stop testing anything if the input
+    scale or `limit` is ever changed -- which is exactly how `limit = 7.0`
+    against unscaled `randn` came to look like clamp coverage.
+    """
+    gate, up = x[..., ::2].float(), x[..., 1::2].float()
+    assert (gate > limit).any(), "gate's upper clamp never binds"
+    assert (gate < -limit).any(), "no gate values below -limit: asymmetry untested"
+    assert (up > limit).any(), "up's upper clamp never binds"
+    assert (up < -limit).any(), "up's lower clamp never binds"
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_swiglu_clamp_asymmetry(dtype):
+    """limit small relative to input scale: forces gate's upper-only clamp
+    and up's symmetric clamp to both bind, on both positive and negative
+    inputs, so a clamp-shape bug (e.g. accidentally symmetric gate clamp)
+    is caught at ULP precision.
+
+    Every other tight-tolerance test in this file uses limit = 7.0 against
+    unscaled randn (|x| <~ 4), so the clamps never engage in any of them.
+    """
+    alpha, limit = 1.702, 0.1  # small limit vs input scale
+    hidden = 128
+    x = (
+        torch.randn((256, hidden * 2), dtype=dtype, device="xpu") * 5.0
+    )  # scale up so |x| >> limit
+    _assert_clamps_bind(x, limit)
+
+    output = swiglu_gpt_oss_sigmoid_alpha(x, alpha, limit)
+    output_ref = swiglu_gpt_oss_sigmoid_alpha_ref_fp32(x, alpha, limit)
+
+    rtol, atol = TIGHT_TOL[dtype]
+    torch.testing.assert_close(output, output_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("batch_size, hidden", TAIL_SHAPES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_swiglu_clamp_with_vector_tail(batch_size, hidden, dtype):
+    """Clamp crossed with the scalar tail.
+
+    test_swiglu_clamp_asymmetry uses B*H = 32768, a multiple of both vector
+    widths, so it only ever exercises the clamp on the vector path. These
+    shapes put a binding clamp in the tail work-item as well.
+    """
+    alpha, limit = 1.702, 0.1
+    torch.manual_seed(0)  # B*H = 1 needs a draw where the clamp actually binds
+    x = torch.randn((batch_size, hidden * 2), dtype=dtype, device="xpu") * 5.0
+
+    output = swiglu_gpt_oss_sigmoid_alpha(x, alpha, limit)
+    output_ref = swiglu_gpt_oss_sigmoid_alpha_ref_fp32(x, alpha, limit)
+
+    assert output.shape == (batch_size, hidden)
+    rtol, atol = TIGHT_TOL[dtype]
+    torch.testing.assert_close(output, output_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_swiglu_clamp_partially_binding(dtype):
+    """A limit that binds on only part of the data, with O(1) outputs.
+
+    In test_swiglu_clamp_asymmetry every unclamped-negative gate produces an
+    output near 1e-10, so those elements pass on `atol` alone. Here the clamp
+    binds on roughly half the elements while outputs stay O(0.1-1), making the
+    comparison rtol-dominated and the clamp boundary itself the thing under
+    test.
+    """
+    alpha, limit = 1.702, 0.7
+    x = torch.randn((256, 256), dtype=dtype, device="xpu")
+    _assert_clamps_bind(x, limit)
+
+    output = swiglu_gpt_oss_sigmoid_alpha(x, alpha, limit)
+    output_ref = swiglu_gpt_oss_sigmoid_alpha_ref_fp32(x, alpha, limit)
+
+    rtol, atol = TIGHT_TOL[dtype]
+    torch.testing.assert_close(output, output_ref, rtol=rtol, atol=atol)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

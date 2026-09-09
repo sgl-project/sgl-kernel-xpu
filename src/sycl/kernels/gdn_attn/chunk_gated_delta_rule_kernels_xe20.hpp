@@ -24,6 +24,7 @@ static constexpr int elem_per_item = 2;
 static constexpr int sub_group_size = 16;
 static constexpr float eps = 0.000001f;
 static constexpr int chunk_size = gdn::chunk_size_xe2;
+static constexpr int A_block_size = gdn::A_block_size_xe2;
 
 struct chunk_gemm_policy_64x64x32_2x1 {
   using WGTile = Shape<_64, _64, _32>;

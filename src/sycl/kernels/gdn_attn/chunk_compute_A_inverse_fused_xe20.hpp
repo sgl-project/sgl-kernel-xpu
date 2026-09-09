@@ -137,24 +137,24 @@ CUTE_DEVICE void chunk_compute_A_inverse_fused_kernel(
   // ---------------------------------------------------------------------
   {
     int i = sg_id;  // requires sg_range == 4 (chunk_gemm_policy_compute_A)
-    int offset = i * 16;
+    int offset = i * A_block_size;
     T* A_ptr_xx = A_ptr + offset * chunk_size + offset;
-    float A_local[16];
-    float A_other[16];
+    float A_local[A_block_size];
+    float A_other[A_block_size];
     float A_sum;
     CUTE_UNROLL
     for (int e = 0; e < sg_local_id + 1; ++e) {
       A_local[e] = 0.0f;
     }
 
-    T A_load[16];
+    T A_load[A_block_size];
     CUTE_UNROLL
     for (int e = 0; e < sg_local_id; ++e) {
       A_load[e] = A_ptr_xx[sg_local_id * chunk_size + e];
     }
 
     CUTE_UNROLL
-    for (int mm_idx = 1; mm_idx < 16; ++mm_idx) {
+    for (int mm_idx = 1; mm_idx < A_block_size; ++mm_idx) {
       CUTE_UNROLL
       for (int nn_idx = 0; nn_idx < mm_idx; ++nn_idx) {
         float send_value = static_cast<float>(A_load[nn_idx]);
@@ -166,7 +166,7 @@ CUTE_DEVICE void chunk_compute_A_inverse_fused_kernel(
     }
 
     CUTE_UNROLL
-    for (int mm_idx = 1; mm_idx < 16; ++mm_idx) {
+    for (int mm_idx = 1; mm_idx < A_block_size; ++mm_idx) {
       A_sum = 0.0f;
       CUTE_UNROLL
       for (int e = 1; e < mm_idx + 1; ++e) {
@@ -182,7 +182,7 @@ CUTE_DEVICE void chunk_compute_A_inverse_fused_kernel(
     }
 
     CUTE_UNROLL
-    for (int e = sg_local_id + 1; e < 16; ++e) {
+    for (int e = sg_local_id + 1; e < A_block_size; ++e) {
       A_ptr_xx[e * chunk_size + sg_local_id] = static_cast<T>(A_local[e]);
     }
   }
@@ -206,19 +206,19 @@ CUTE_DEVICE void chunk_compute_A_inverse_fused_kernel(
 
     auto A_ptr_11 = A_ptr;
 
-    auto A_ptr_21 = A_ptr + 16 * chunk_size;
-    auto A_ptr_22 = A_ptr + 16 * chunk_size + 16;
+    auto A_ptr_21 = A_ptr + A_block_size * chunk_size;
+    auto A_ptr_22 = A_ptr + A_block_size * chunk_size + A_block_size;
 
-    auto A_ptr_31 = A_ptr + 32 * chunk_size;
-    auto A_ptr_32 = A_ptr + 32 * chunk_size + 16;
-    auto A_ptr_33 = A_ptr + 32 * chunk_size + 32;
+    auto A_ptr_31 = A_ptr + 2 * A_block_size * chunk_size;
+    auto A_ptr_32 = A_ptr + 2 * A_block_size * chunk_size + A_block_size;
+    auto A_ptr_33 = A_ptr + 2 * A_block_size * chunk_size + 2 * A_block_size;
 
-    auto A_ptr_41 = A_ptr + 48 * chunk_size;
-    auto A_ptr_42 = A_ptr + 48 * chunk_size + 16;
-    auto A_ptr_43 = A_ptr + 48 * chunk_size + 32;
-    auto A_ptr_44 = A_ptr + 48 * chunk_size + 48;
+    auto A_ptr_41 = A_ptr + 3 * A_block_size * chunk_size;
+    auto A_ptr_42 = A_ptr + 3 * A_block_size * chunk_size + A_block_size;
+    auto A_ptr_43 = A_ptr + 3 * A_block_size * chunk_size + 2 * A_block_size;
+    auto A_ptr_44 = A_ptr + 3 * A_block_size * chunk_size + 3 * A_block_size;
 
-    auto A_XX_tensor_shape = make_shape(16, 16);
+    auto A_XX_tensor_shape = make_shape(A_block_size, A_block_size);
 
     auto A_11_tensor_T =
         make_tensor(make_gmem_ptr(A_ptr_11), make_layout(A_XX_tensor_shape, make_stride(_1{}, chunk_size)));
@@ -269,7 +269,7 @@ CUTE_DEVICE void chunk_compute_A_inverse_fused_kernel(
     auto tCrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
     auto tCrC = thr_mma.partition_sg_fragment_C(gC);
 
-    // Every off-diagonal GEMM below has exactly one K-tile (K=16, matching
+    // Every off-diagonal GEMM below has exactly one K-tile (K=A_block_size=16, matching
     // TiledMMAInverse's own K), so the GEMM helpers' mainloop barrier --
     // whose only purpose is keeping subgroups aligned across successive
     // K-tile iterations -- is a provable no-op here and is skipped

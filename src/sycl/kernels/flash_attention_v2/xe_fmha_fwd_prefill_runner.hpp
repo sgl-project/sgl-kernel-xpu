@@ -325,11 +325,11 @@ struct PrefillRunner {
     // int64_t, so narrow explicitly before handing them to make_stride.
     constexpr int64_t kIntMax = 2147483647LL;
     TORCH_CHECK(
-      q_row_stride <= kIntMax && k_row_stride <= kIntMax && v_row_stride <= kIntMax && q_head_stride <= kIntMax &&
-          k_head_stride <= kIntMax && v_head_stride <= kIntMax && o_row_stride <= kIntMax && o_head_stride <= kIntMax,
-      "Q/K/V/O stride exceeds int32 max (",
-      kIntMax,
-    ")");
+        q_row_stride <= kIntMax && k_row_stride <= kIntMax && v_row_stride <= kIntMax && q_head_stride <= kIntMax &&
+            k_head_stride <= kIntMax && v_head_stride <= kIntMax && o_row_stride <= kIntMax && o_head_stride <= kIntMax,
+        "Q/K/V/O stride exceeds int32 max (",
+        kIntMax,
+        ")");
     int const q_row_stride_i = static_cast<int>(q_row_stride);
     int const k_row_stride_i = static_cast<int>(k_row_stride);
     int const v_row_stride_i = static_cast<int>(v_row_stride);

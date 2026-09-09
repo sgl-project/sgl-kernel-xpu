@@ -3052,9 +3052,7 @@ def test_flash_attn_varlen_output_noncontiguous(d, causal, dtype):
     )
     for name, t in (("q", q), ("k", k), ("v", v)):
         print(f"{name}: shape={tuple(t.shape)} stride={t.stride()}")
-    out = flash_attn_varlen_func(
-        q, k, v, **kwargs
-    )
+    out = flash_attn_varlen_func(q, k, v, **kwargs)
     # attention_ref expects batched (batch, seqlen, nheads, d) tensors, not the
     # ragged (total, nheads, d) layout flash_attn_varlen_func takes. Every batch
     # here has the same seqlen (evenly-spaced cu_seqlens), so splitting the

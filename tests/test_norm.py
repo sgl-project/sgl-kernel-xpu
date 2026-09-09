@@ -190,6 +190,109 @@ def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     )
 
 
+# Hidden sizes that reach the *non-cached* `update()` fallback.
+#
+# `dispatch_rmsnorm_no_rstd_iters` keeps the row in registers only while
+#
+#     iters = ceil(N / (workgroup_size * update_vec_size)) <= 8
+#
+# `workgroup_size` saturates at 512, and `update_vec_size` is halved until it
+# divides N, so it collapses to 1 on odd N. That gives two ways past the bound:
+#
+#   * odd N > 4096            -> vec 1, iters > 8
+#   * N % 8 == 0, N > 32768   -> vec 8 (bf16/fp16) or vec 4 (fp32), iters > 8
+#
+# Nothing else in this file reaches it: the largest swept hidden size is 16384,
+# and the (2, 32768) gemma cases land on iters == 8 exactly -- still cached.
+#
+# The fallback matters because it is the only path where `AddNoRstdForward`
+# re-reads the residual sum from `add_data`; `reduce_combine` writes the sum
+# there and leaves `X_data` holding the un-summed x, so sourcing from `X_data`
+# would be wrong here and invisible everywhere else.
+NON_CACHED_SHAPES = [
+    (2, 4097),  # vec 1, iters = 9   -- first shape past the bound
+    (2, 6143),  # vec 1, iters = 12
+    (2, 40960),  # vec 8 / vec 4, iters = 10 / 20 -- full-width vector fallback
+]
+
+# Controls: same code shape, but iters <= 8, so these stay on the cached path.
+# They also cover the vec-1 cached instantiations (ITERS >= 2), which the
+# power-of-two sweeps above can never reach.
+CACHED_CONTROL_SHAPES = [
+    (2, 4095),  # vec 1, iters = 8 -- immediately below the bound
+    (2, 2881),  # vec 1, iters = 6 -- odd, production-shaped (gpt-oss 2880 + 1)
+]
+
+
+@pytest.mark.parametrize("batch_size, hidden_size", NON_CACHED_SHAPES)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("gemma", [False, True])
+def test_fused_add_rmsnorm_non_cached_fallback(batch_size, hidden_size, dtype, gemma):
+    """Residual-add norm on shapes that bypass the register cache.
+
+    Both entry points share `AddNoRstdForward`, so both are checked: a wrong
+    residual source in the shared fallback would otherwise show up in only one.
+    """
+    eps = 1e-6
+
+    x = torch.randn(batch_size, hidden_size, dtype=dtype, device=device)
+    residual = torch.randn_like(x)
+    weight = torch.randn(hidden_size, dtype=dtype, device=device)
+
+    ref = gemma_fused_add_rms_norm if gemma else fused_add_rms_norm
+    kernel = (
+        sgl_kernel.gemma_fused_add_rmsnorm if gemma else sgl_kernel.fused_add_rmsnorm
+    )
+
+    x_native, residual_native = ref(x.clone(), residual.clone(), weight, eps)
+
+    x_fused = x.clone()
+    residual_fused = residual.clone()
+    kernel(x_fused, residual_fused, weight, eps)
+
+    torch.testing.assert_close(x_fused, x_native, **norm_tolerances(dtype))
+    torch.testing.assert_close(
+        residual_fused, residual_native, **norm_tolerances(dtype)
+    )
+
+
+@pytest.mark.parametrize("batch_size, hidden_size", CACHED_CONTROL_SHAPES)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_fused_add_rmsnorm_odd_hidden_cached(batch_size, hidden_size, dtype):
+    """Control for the test above: odd N that still fits the register cache."""
+    eps = 1e-6
+
+    x = torch.randn(batch_size, hidden_size, dtype=dtype, device=device)
+    residual = torch.randn_like(x)
+    weight = torch.randn(hidden_size, dtype=dtype, device=device)
+
+    x_native, residual_native = fused_add_rms_norm(
+        x.clone(), residual.clone(), weight, eps
+    )
+
+    x_fused = x.clone()
+    residual_fused = residual.clone()
+    sgl_kernel.fused_add_rmsnorm(x_fused, residual_fused, weight, eps)
+
+    torch.testing.assert_close(x_fused, x_native, **norm_tolerances(dtype))
+    torch.testing.assert_close(
+        residual_fused, residual_native, **norm_tolerances(dtype)
+    )
+
+
+@pytest.mark.parametrize("hidden_size", [4097, 40960])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_rmsnorm_non_cached_fallback(hidden_size, dtype):
+    """Plain rmsnorm on the same fallback shapes (no residual source to get
+    wrong, but it is a distinct `update()` instantiation)."""
+    x = torch.randn(2, hidden_size).to(device).to(dtype)
+    w = torch.randn(hidden_size).to(device).to(dtype)
+
+    torch.testing.assert_close(
+        sgl_kernel.rmsnorm(x, w), llama_rms_norm(x, w), **norm_tolerances(dtype)
+    )
+
+
 ###############################################################################
 # Non-contiguous input tests (DeepSeek split pattern: stride[0] != hidden_size)
 ###############################################################################

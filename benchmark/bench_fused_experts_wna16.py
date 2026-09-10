@@ -53,7 +53,7 @@ from pathlib import Path
 
 import sgl_kernel  # noqa: F401 — registers torch.ops.sgl_kernel
 import torch
-from sgl_kernel import fused_experts
+from sgl_kernel import convert_weights_to_col_major, fused_experts, is_xe2_arch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests"))
 from mxfp4_utils import MXFP4_BLOCK_SIZE  # noqa: E402
@@ -187,6 +187,8 @@ def _prepare_w8_fused(profile_name, tokens):
     hidden_states = torch.randn((tokens, hidden), dtype=torch.bfloat16, device="xpu")
     w1, w1_scale = _build_w8_weights(experts, 2 * intermediate, hidden, block_scale, 2)
     w2, w2_scale = _build_w8_weights(experts, hidden, intermediate, block_scale, 1)
+    if is_xe2_arch():
+        w1, w2 = convert_weights_to_col_major(w1, w2)
     topk_ids = (
         torch.arange(tokens * topk, device="xpu", dtype=torch.int32).reshape(
             tokens, topk

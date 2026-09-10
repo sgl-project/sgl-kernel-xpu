@@ -730,7 +730,8 @@ void moe_grouped_mm_nt_xe20(
     const int64_t activation_type = 0,  // 0=silu, 1=gelu, 2=swiglu
     bool fuse_act = false,
     double gemm1_alpha = 1.702,
-    double gemm1_limit = 7.0);
+    double gemm1_limit = 7.0,
+    bool gate_up_interleaved = true);
 
 // Unified int4/mxfp4 W4A16 MoE grouped GEMM.
 // `packed_weights` is int8 or uint8 [E, N, K/2] with two 4-bit values per byte.

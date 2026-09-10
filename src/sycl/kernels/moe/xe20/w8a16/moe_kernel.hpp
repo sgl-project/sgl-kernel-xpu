@@ -83,7 +83,7 @@ class Fp8W8A16Kernel {
 
   auto make_B_tensors(uint8_t* ptr_B, int N, int K, int ld_b) {
     auto* e4m3_ptr = reinterpret_cast<cutlass::float_e4m3_t*>(ptr_B);
-    auto B = make_tensor(make_gmem_ptr(e4m3_ptr), make_layout(make_shape(N, K), make_stride(ld_b, _1{})));
+    auto B = make_tensor(make_gmem_ptr(e4m3_ptr), make_layout(make_shape(N, K), make_stride(_1{}, ld_b)));
     return B;
   }
 
@@ -131,7 +131,7 @@ class Fp8W8A16Kernel {
 
       int expert_id = i;
       int ld_b = params.ld_b;
-      int64_t B_offset = static_cast<int64_t>(expert_id) * static_cast<int64_t>(N) * static_cast<int64_t>(ld_b);
+      int64_t B_offset = static_cast<int64_t>(expert_id) * static_cast<int64_t>(K) * static_cast<int64_t>(ld_b);
       int64_t S_offset = static_cast<int64_t>(expert_id) * scale_n * (WeightScalePerExpert ? 1 : K_scale);
 
       uint8_t* ptr_A_curr_batch = const_cast<uint8_t*>(params.Activations) + pre_rows * K * sizeof(ElementA);

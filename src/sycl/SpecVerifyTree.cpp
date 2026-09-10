@@ -165,34 +165,39 @@ struct VerifyTreeGreedySubGroupKernel {
       // Every lane loads the same address, which coalesces to one request.
       const in_t target = target_predict_[last_accept_flat];
 
-      bool matched = false;
+      // At most one sibling per level can match, and only the matching sibling's
+      // retrieve index is ever used, so retr is fetched once after the scan
+      // instead of on every step.  That is the dominant term in the scan: a
+      // sibling step costs 3 * kNodesPerLane shuffles and a worst-case chain is
+      // topk long, so dropping to two lookups per step takes a third off it.
+      int32_t matched_node = -1;
       // Bounds are part of the loop condition so a malformed chain terminates
       // instead of shuffling in a lane outside the tree.
       while (cur >= 0 && cur < num_nodes) {
-        // All three shuffles are issued before the branch: each must be reached
-        // by every lane, and they are register moves, so fetching retr/sibling
-        // that one of the two paths discards is cheaper than guarding them.
-        const in_t cand_cur = fetch(sg, cand, cur);
-        const in_t retr_cur = fetch(sg, retr, cur);
-        const int32_t sibling_cur = fetch(sg, next_sibling, cur);
-        if (cand_cur == target) {
-          if (lane == 0) {
-            // target == cand[cur], so this store confirms the accepted draft
-            // token without needing a second load.
-            predicts_[last_accept_flat] = static_cast<out_t>(target);
-          }
-          last_accept_flat = static_cast<int64_t>(retr_cur);
-          ++num_accepted;
-          if (lane == 0) {
-            accept_index_[bid * num_spec_steps_ + num_accepted] = static_cast<out_t>(last_accept_flat);
-          }
-          matched = true;
+        // Both shuffles are still reached by every lane: target is a
+        // broadcast-uniform load and fetch() returns a sub-group broadcast, so
+        // the comparison is uniform and the sub-group breaks together or not at
+        // all.  That is the same uniformity that lets fetch() appear in the loop
+        // condition; without it these collectives would deadlock.
+        if (fetch(sg, cand, cur) == target) {
+          matched_node = cur;
           break;
         }
-        cur = sibling_cur;
+        cur = fetch(sg, next_sibling, cur);
       }
-      if (!matched) {
+      if (matched_node < 0) {
         break;
+      }
+
+      if (lane == 0) {
+        // target == cand[matched_node], so this store confirms the accepted
+        // draft token without needing a second load.
+        predicts_[last_accept_flat] = static_cast<out_t>(target);
+      }
+      last_accept_flat = static_cast<int64_t>(fetch(sg, retr, matched_node));
+      ++num_accepted;
+      if (lane == 0) {
+        accept_index_[bid * num_spec_steps_ + num_accepted] = static_cast<out_t>(last_accept_flat);
       }
     }
 

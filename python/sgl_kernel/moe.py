@@ -420,6 +420,10 @@ def _should_use_small_moe_prepare(
         1 <= topk <= _MOE_SMALL_PREPARE_MAX_TOPK
         and routed_rows <= _MOE_SMALL_PREPARE_MAX_ROUTES
         and routed_rows * hidden_dims <= _MOE_SMALL_PREPARE_MAX_ELEMENTS
+        # Single-token decode uses private register sorting independent of expert count E.
+        # Multi-token batches use SLM histogram + prefix-sum scaling with E; restrict to E <= 64
+        # to avoid thread-0 serial loop overhead.
+        and (num_tokens == 1 or num_experts <= 64)
     )
 
 

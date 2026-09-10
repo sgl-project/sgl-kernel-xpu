@@ -4,6 +4,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include "../SYCLHelpers.h"
 #include "gdn_attn_utils.h"
 
 namespace gdn {
@@ -854,38 +855,36 @@ void kernel_launcher(
     auto range_spec = KERNEL_SPEC::get_nd_range(num_spec_decodes, qkvz_elems);
     assert(head_k_dim % KERNEL_SPEC::elems_per_item == 0);
     assert(num_v_heads % KERNEL_SPEC::elems_per_item == 0);
-    queue.submit([&](sycl::handler& cgh) {
-      KERNEL_SPEC task(
-          q_out,
-          k_out,
-          v_out,
-          z_out,
-          b_out,
-          a_out,
-          mixed_qkvz,
-          mixed_ba,
-          conv_weights,
-          conv_bias,
-          conv_states,
-          conv_states_stride_0,
-          conv_w_stride,
-          conv_d_stride,
-          token_indx,
-          cache_indices,
-          cache_indices_stride_0,
-          num_accepted_tokens,
-          act_mode,
-          pad_slot_id,
-          num_spec_decodes,
-          num_spec_tokens,
-          num_k_heads,
-          head_k_dim,
-          num_v_heads,
-          head_v_dim,
-          qkvz_elems,
-          conv_elems);
-      cgh.parallel_for(range_spec, task);
-    });
+    KERNEL_SPEC task(
+        q_out,
+        k_out,
+        v_out,
+        z_out,
+        b_out,
+        a_out,
+        mixed_qkvz,
+        mixed_ba,
+        conv_weights,
+        conv_bias,
+        conv_states,
+        conv_states_stride_0,
+        conv_w_stride,
+        conv_d_stride,
+        token_indx,
+        cache_indices,
+        cache_indices_stride_0,
+        num_accepted_tokens,
+        act_mode,
+        pad_slot_id,
+        num_spec_decodes,
+        num_spec_tokens,
+        num_k_heads,
+        head_k_dim,
+        num_v_heads,
+        head_v_dim,
+        qkvz_elems,
+        conv_elems);
+    sycl_kernel_submit(range_spec.get_global_range(), range_spec.get_local_range(), queue, task);
     return;
   }
 
@@ -896,47 +895,45 @@ void kernel_launcher(
   // token-parallelism is already high (large batch / prefill). We pick the fine
   // split only when the default (ElemsPerItem=4) grid would underfill the
   // device. This is purely a scheduling choice: results are bit-identical.
-#define LAUNCH_MAIN(EPI)                                                         \
-  do {                                                                           \
-    using KERNEL_MAIN = causal_conv1d_kernel<T, Width, ReorderInput, EPI>;       \
-    auto range_main = KERNEL_MAIN::get_nd_range(num_virtual_tokens, qkvz_elems); \
-    assert(head_k_dim % KERNEL_MAIN::elems_per_item == 0);                       \
-    assert(num_v_heads % KERNEL_MAIN::elems_per_item == 0);                      \
-    queue.submit([&](sycl::handler& cgh) {                                       \
-      KERNEL_MAIN task(                                                          \
-          q_out,                                                                 \
-          k_out,                                                                 \
-          v_out,                                                                 \
-          z_out,                                                                 \
-          b_out,                                                                 \
-          a_out,                                                                 \
-          mixed_qkvz,                                                            \
-          mixed_ba,                                                              \
-          conv_weights,                                                          \
-          conv_bias,                                                             \
-          conv_states,                                                           \
-          conv_states_stride_0,                                                  \
-          conv_w_stride,                                                         \
-          conv_d_stride,                                                         \
-          conv_states_tmp,                                                       \
-          query_start_loc,                                                       \
-          token_indx,                                                            \
-          cache_indices,                                                         \
-          has_initial_state,                                                     \
-          num_accepted_tokens,                                                   \
-          act_mode,                                                              \
-          pad_slot_id,                                                           \
-          batch_size,                                                            \
-          num_virtual_tokens,                                                    \
-          num_actual_tokens,                                                     \
-          num_k_heads,                                                           \
-          head_k_dim,                                                            \
-          num_v_heads,                                                           \
-          head_v_dim,                                                            \
-          qkvz_elems,                                                            \
-          conv_elems);                                                           \
-      cgh.parallel_for(range_main, task);                                        \
-    });                                                                          \
+#define LAUNCH_MAIN(EPI)                                                                          \
+  do {                                                                                            \
+    using KERNEL_MAIN = causal_conv1d_kernel<T, Width, ReorderInput, EPI>;                        \
+    auto range_main = KERNEL_MAIN::get_nd_range(num_virtual_tokens, qkvz_elems);                  \
+    assert(head_k_dim % KERNEL_MAIN::elems_per_item == 0);                                        \
+    assert(num_v_heads % KERNEL_MAIN::elems_per_item == 0);                                       \
+    KERNEL_MAIN task(                                                                             \
+        q_out,                                                                                    \
+        k_out,                                                                                    \
+        v_out,                                                                                    \
+        z_out,                                                                                    \
+        b_out,                                                                                    \
+        a_out,                                                                                    \
+        mixed_qkvz,                                                                               \
+        mixed_ba,                                                                                 \
+        conv_weights,                                                                             \
+        conv_bias,                                                                                \
+        conv_states,                                                                              \
+        conv_states_stride_0,                                                                     \
+        conv_w_stride,                                                                            \
+        conv_d_stride,                                                                            \
+        conv_states_tmp,                                                                          \
+        query_start_loc,                                                                          \
+        token_indx,                                                                               \
+        cache_indices,                                                                            \
+        has_initial_state,                                                                        \
+        num_accepted_tokens,                                                                      \
+        act_mode,                                                                                 \
+        pad_slot_id,                                                                              \
+        batch_size,                                                                               \
+        num_virtual_tokens,                                                                       \
+        num_actual_tokens,                                                                        \
+        num_k_heads,                                                                              \
+        head_k_dim,                                                                               \
+        num_v_heads,                                                                              \
+        head_v_dim,                                                                               \
+        qkvz_elems,                                                                               \
+        conv_elems);                                                                              \
+    sycl_kernel_submit(range_main.get_global_range(), range_main.get_local_range(), queue, task); \
   } while (0)
 
   constexpr int elems_per_group_epi4 = causal_conv1d_kernel<T, Width, ReorderInput, 4>::group_size * 4;
@@ -953,21 +950,19 @@ void kernel_launcher(
   if (num_prefills > 0) {
     using KERNEL_UPDATE = update_states_kernel<T>;
     auto range_update = KERNEL_UPDATE::get_nd_range(batch_size, Width, conv_elems);
-    queue.submit([&](sycl::handler& cgh) {
-      KERNEL_UPDATE task(
-          conv_states,
-          conv_states_stride_0,
-          conv_w_stride,
-          conv_d_stride,
-          conv_states_tmp,
-          cache_indices,
-          Width,
-          conv_elems,
-          query_start_loc,
-          token_indx,
-          batch_size);
-      cgh.parallel_for(range_update, task);
-    });
+    KERNEL_UPDATE task(
+        conv_states,
+        conv_states_stride_0,
+        conv_w_stride,
+        conv_d_stride,
+        conv_states_tmp,
+        cache_indices,
+        Width,
+        conv_elems,
+        query_start_loc,
+        token_indx,
+        batch_size);
+    sycl_kernel_submit(range_update.get_global_range(), range_update.get_local_range(), queue, task);
   }
 }
 

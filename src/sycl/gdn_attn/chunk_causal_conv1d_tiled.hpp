@@ -4,6 +4,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include "../SYCLHelpers.h"
 #include "chunk_causal_conv1d.hpp"  // for chunk_update_states_kernel (prefill writeback)
 #include "gdn_attn_utils.h"
 
@@ -39,7 +40,7 @@ static constexpr int conv1d_tile_size = 8;
 //           straight from the register history (no SLM read-back needed).
 
 template <typename T, int Width, int TileT, bool ReorderInput>
-struct chunk_causal_conv1d_tiled_kernel {
+struct chunk_causal_conv1d_tiled_kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
  public:
   static constexpr int sub_group_size = 16;
   static constexpr int elems_per_item = 4;
@@ -75,7 +76,6 @@ struct chunk_causal_conv1d_tiled_kernel {
       const int& qkvz_elems,
       const int& conv_elems,
       const int& num_virtual_tokens,
-      char* slm_data,
       const bool fuse_l2norm)
       : q_out(q_out),
         k_out(k_out),
@@ -106,7 +106,6 @@ struct chunk_causal_conv1d_tiled_kernel {
         qkvz_elems(qkvz_elems),
         conv_elems(conv_elems),
         num_virtual_tokens(num_virtual_tokens),
-        slm_data(slm_data),
         fuse_l2norm(fuse_l2norm) {}
 
   inline int lookup(int t) const {
@@ -137,6 +136,10 @@ struct chunk_causal_conv1d_tiled_kernel {
 
   static inline constexpr int get_slm_bytes() {
     return norm_slm_bytes;
+  }
+
+  void sycl_ker_config_convention(sycl::handler& cgh) {
+    slm_acc_ = sycl::local_accessor<char, 1>(sycl::range<1>(get_slm_bytes()), cgh);
   }
 
   static inline void act_swish(float& x, float beta = 1.0f) {
@@ -367,9 +370,10 @@ struct chunk_causal_conv1d_tiled_kernel {
 
       // ---- Fused L2 norm for Q and K (only in feat_chunk 0) ----
       if (fuse_l2norm && feat_chunk_id == 0) {
-        // l2norm_eps is defined in gdn_attn_utils.h. slm_data now holds only
+        // l2norm_eps is defined in gdn_attn_utils.h. slm_acc_ now holds only
         // the norm partial-sum scratch (no more input-tile staging).
-        float* norm_slm = reinterpret_cast<float*>(slm_data);
+        float* norm_slm =
+            reinterpret_cast<float*>(slm_acc_.template get_multi_ptr<sycl::access::decorated::no>().get_raw());
 
         float q_local_sq = 0.0f;
         float k_local_sq = 0.0f;
@@ -570,7 +574,7 @@ struct chunk_causal_conv1d_tiled_kernel {
   const int qkvz_elems;
   const int conv_elems;
   const int num_virtual_tokens;
-  char* slm_data;
+  sycl::local_accessor<char, 1> slm_acc_;
   const bool fuse_l2norm;
 };
 
@@ -617,67 +621,55 @@ void tiled_kernel_launcher(
 
   auto range_main = KERNEL_MAIN::get_nd_range(num_tiles, num_k_heads, head_k_dim, num_v_heads, head_v_dim);
 
-  constexpr int slm_bytes = KERNEL_MAIN::get_slm_bytes();
-
-  queue.submit([&](sycl::handler& cgh) {
-    auto slm = sycl::local_accessor<char, 1>(sycl::range<1>(slm_bytes), cgh);
-    cgh.parallel_for<KERNEL_MAIN>(range_main, [=](sycl::nd_item<2> item) {
-      char* slm_ptr = slm.template get_multi_ptr<sycl::access::decorated::no>().get_raw();
-
-      KERNEL_MAIN task(
-          q_out,
-          k_out,
-          v_out,
-          z_out,
-          b_out,
-          a_out,
-          mixed_qkvz,
-          mixed_ba,
-          conv_weights,
-          conv_bias,
-          conv_states,
-          conv_states_stride_0,
-          conv_w_stride,
-          conv_d_stride,
-          conv_states_tmp,
-          query_start_loc,
-          cache_indices,
-          has_initial_state,
-          token_indx,
-          act_mode,
-          pad_slot_id,
-          batch_size,
-          num_k_heads,
-          head_k_dim,
-          num_v_heads,
-          head_v_dim,
-          qkvz_elems,
-          conv_elems,
-          num_virtual_tokens,
-          slm_ptr,
-          fuse_l2norm);
-      task(item);
-    });
-  });
+  KERNEL_MAIN task_main(
+      q_out,
+      k_out,
+      v_out,
+      z_out,
+      b_out,
+      a_out,
+      mixed_qkvz,
+      mixed_ba,
+      conv_weights,
+      conv_bias,
+      conv_states,
+      conv_states_stride_0,
+      conv_w_stride,
+      conv_d_stride,
+      conv_states_tmp,
+      query_start_loc,
+      cache_indices,
+      has_initial_state,
+      token_indx,
+      act_mode,
+      pad_slot_id,
+      batch_size,
+      num_k_heads,
+      head_k_dim,
+      num_v_heads,
+      head_v_dim,
+      qkvz_elems,
+      conv_elems,
+      num_virtual_tokens,
+      fuse_l2norm);
+  sycl_kernel_submit(range_main.get_global_range(), range_main.get_local_range(), queue, task_main);
 
   // Update conv states from tmp buffer
   if (num_prefills > 0) {
     using KERNEL_UPDATE = chunk_update_states_kernel<T>;
     auto range_update = KERNEL_UPDATE::get_nd_range(batch_size, Width, conv_elems);
-    queue.submit([&](sycl::handler& cgh) {
-      KERNEL_UPDATE task(
-          conv_states,
-          conv_states_stride_0,
-          conv_w_stride,
-          conv_d_stride,
-          conv_states_tmp,
-          cache_indices,
-          Width,
-          conv_elems,
-          query_start_loc,
-          batch_size);
-      cgh.parallel_for(range_update, task);
-    });
+    KERNEL_UPDATE task_update(
+        conv_states,
+        conv_states_stride_0,
+        conv_w_stride,
+        conv_d_stride,
+        conv_states_tmp,
+        cache_indices,
+        Width,
+        conv_elems,
+        query_start_loc,
+        batch_size);
+    sycl_kernel_submit(range_update.get_global_range(), range_update.get_local_range(), queue, task_update);
   }
 }
 

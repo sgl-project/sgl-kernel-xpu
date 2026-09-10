@@ -6,8 +6,8 @@
 #include <sycl/sycl.hpp>
 
 #include "../Utils.h"
-#include "../kernels/gdn_attn/chunk_compute_A_inverse_fused_xe20.hpp"
-#include "../kernels/gdn_attn/chunk_gated_delta_rule_kernels_xe20.hpp"
+#include "../kernels/gdn_attn/chunk_compute_A_inverse_fused.hpp"
+#include "../kernels/gdn_attn/chunk_gated_delta_rule_kernels.hpp"
 #include "sgl_kernel_export.h"
 
 SGL_KERNEL_EXPORT void chunk_gated_delta_rule(
@@ -27,8 +27,7 @@ SGL_KERNEL_EXPORT void chunk_gated_delta_rule(
     const int num_prefills,
     const int num_decodes,
     const int* token_indx) {
-  TORCH_CHECK(is_bmg(), "chunk_gated_delta_rule is only supported on BMG for now.");
-  gdn::chunk_gated_delta_rule_impl_xe20(
+  gdn::chunk_gated_delta_rule_impl(
       queue,
       core_attn_out,
       q,

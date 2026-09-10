@@ -110,6 +110,7 @@ def gdn_attention(
         tp_size,
         projected_states_qkvz.dtype,
     )
+    workspace: Optional[torch.Tensor] = None
     if nbytes > 0:
         workspace = _get_gdn_workspace(nbytes, projected_states_qkvz.device)
     torch.ops.sgl_kernel.gdn_attention.default(

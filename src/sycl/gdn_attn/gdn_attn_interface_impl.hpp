@@ -220,7 +220,8 @@ SGL_KERNEL_EXPORT void gdn_attention(
   // (which can grow across calls; too-small or wrong-dtype buffers gracefully
   // fall back to fresh per-call allocations).
   bool ws_active = workspace.has_value() && workspace->defined() && workspace->dim() == 1 &&
-                   workspace->scalar_type() == torch::kUInt8 && workspace->is_contiguous();
+                   workspace->scalar_type() == torch::kUInt8 && workspace->is_contiguous() &&
+                   workspace->device() == device;
   uint8_t* ws_base = ws_active ? reinterpret_cast<uint8_t*>(workspace->data_ptr()) : nullptr;
   int64_t ws_capacity_bytes = ws_active ? workspace->numel() : 0;
   int64_t ws_cursor_bytes = 0;

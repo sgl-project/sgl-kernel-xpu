@@ -189,7 +189,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
   } else {
     TORCH_CHECK(output.sizes()[1] == gemm_n, "output must have the same number of columns as activations");
   }
-  TORCH_CHECK(n_experts % 8 == 0, "n_experts must be a multiple of 8 for the current implementation");
+  TORCH_CHECK(n_experts > 0, "n_experts must be positive");
   if (bias.has_value()) {
     TORCH_CHECK(
         bias->scalar_type() == at::kFloat,

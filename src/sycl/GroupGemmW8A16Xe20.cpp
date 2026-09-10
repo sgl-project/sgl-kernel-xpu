@@ -155,7 +155,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_fp8_w8a16(
   if (weight_scales.dim() == 2) {
     TORCH_CHECK(weight_scales.size(1) == 1 || weight_scales.size(1) == 2, "W8A16 scale count must be 1 or 2");
   }
-  TORCH_CHECK(n_experts > 0 && n_experts % 8 == 0, "n_experts must be a positive multiple of 8");
+  TORCH_CHECK(n_experts > 0, "n_experts must be positive");
   TORCH_CHECK(activations.dim() == 2, "W8A16 activations must be 2D [M_total, K]");
   TORCH_CHECK(weights.dim() == 3, "W8A16 weights must be 3D [E, N, K]");
   TORCH_CHECK(output.dim() == 2, "W8A16 output must be 2D [M_total, N]");

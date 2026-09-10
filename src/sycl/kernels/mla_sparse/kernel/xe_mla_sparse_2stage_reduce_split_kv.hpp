@@ -184,10 +184,10 @@ class XeMlaSparse2StageReduceSplitKV {
       if (thr_id == 0) {
         const float row_max = row_has_mass ? global_max * LOG_E_2 : -INFINITY;
         const float row_lse = row_has_mass ? row_max + sycl::native::log2(total_exp_sum) * LOG_E_2 : INFINITY;
-        Tensor rLse = make_tensor(
+        Tensor r_Lse = make_tensor(
             make_gmem_ptr(ep.lse),
             make_layout(make_shape(s.b, s.s_q, s.h_q), make_stride(ep.stride_lse_b, ep.stride_lse_s_q, _1{})));
-        rLse(batch_idx, seq_idx, head_idx) = row_lse;
+        r_Lse(batch_idx, seq_idx, head_idx) = row_lse;
         if constexpr (HAS_MAX_LOGITS) {
           Tensor rMaxLogits = make_tensor(
               make_gmem_ptr(ep.max_logits),

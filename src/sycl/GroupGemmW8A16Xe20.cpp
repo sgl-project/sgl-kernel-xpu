@@ -167,24 +167,34 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
     }
   }
   TORCH_CHECK(output.scalar_type() == at::ScalarType::BFloat16, "W8A16 output must be bfloat16");
-  TORCH_CHECK(n_experts > 0 && n_experts % 8 == 0, "n_experts must be a positive multiple of 8");
+  TORCH_CHECK(n_experts > 0, "n_experts must be positive");
   TORCH_CHECK(activations.dim() == 2, "W8A16 activations must be 2D [M_total, K]");
-  TORCH_CHECK(weights.dim() == 3, "W8A16 weights must be 3D [E, N, K]");
+  TORCH_CHECK(weights.dim() == 3, "W8A16 weights must be 3D [E, K, N]");
   TORCH_CHECK(output.dim() == 2, "W8A16 output must be 2D [M_total, N]");
+
+  int total_m = static_cast<int>(activations.size(0));
+  int gemm_k = static_cast<int>(activations.size(1));
+  int gemm_n = static_cast<int>(output.size(1));
+
+  TORCH_CHECK(
+      weights.size(1) == gemm_k && weights.size(2) == gemm_n,
+      "W8A16 weights must be column-major [E, K, N] with K=",
+      gemm_k,
+      " and N=",
+      gemm_n,
+      ", got weights shape: ",
+      weights.sizes());
+
   TORCH_CHECK(weights.size(0) == n_experts, "weights expert dimension mismatch");
   TORCH_CHECK(weight_scales.size(0) == n_experts, "weight scales expert dimension mismatch");
   TORCH_CHECK(
       total_rows_for_experts.dim() == 1 && total_rows_for_experts.size(0) == n_experts, "rows_for_experts must be [E]");
   TORCH_CHECK(total_rows_for_experts.scalar_type() == at::ScalarType::Int, "rows_for_experts must be int32");
-  TORCH_CHECK(weights.size(2) == activations.size(1), "W8A16 K dimension mismatch");
   TORCH_CHECK(
       activations.is_contiguous() && weights.is_contiguous() && weight_scales.is_contiguous(),
-      "W8A16 tensors must be contiguous");
-  TORCH_CHECK(weights.size(1) % 64 == 0 && weights.size(2) % 32 == 0, "W8A16 N must be divisible by 64 and K by 32");
+      "W8A16 activations, weights, and weight_scales must be contiguous");
+  TORCH_CHECK(gemm_n % 64 == 0 && gemm_k % 32 == 0, "W8A16 N must be divisible by 64 and K by 32");
 
-  int total_m = static_cast<int>(activations.size(0));
-  int gemm_k = static_cast<int>(activations.size(1));
-  int gemm_n = static_cast<int>(weights.size(1));
   int avg_m = total_m / static_cast<int>(n_experts);
   int ld_b = static_cast<int>(weights.stride(1));
   int scale_mode =
@@ -203,7 +213,9 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
         gemm_k % 128 == 0 && weight_scales.size(2) == gemm_k / 128, "W8A16 block scale K dimension must be K/128");
   }
   TORCH_CHECK(output.size(0) == total_m, "output rows must equal M_total");
-  TORCH_CHECK(output.size(1) == gemm_n, "output must have the same columns as weights");
+  if (bias.has_value()) {
+    TORCH_CHECK(bias->size(0) == n_experts && bias->size(1) == gemm_n, "bias shape must be [E, N]");
+  }
   if (bias.has_value()) {
     TORCH_CHECK(bias->size(0) == n_experts && bias->size(1) == gemm_n, "bias shape must be [E, N]");
   }

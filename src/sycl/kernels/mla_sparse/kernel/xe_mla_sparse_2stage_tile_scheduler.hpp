@@ -160,4 +160,63 @@ class XeMlaSparse2StageIndividualTileScheduler {
   bool valid_;
 };
 
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// Stage 2 (split-K reduction).
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+// A decoded reduction work-tile coordinate: one output row.
+struct Sparse2StageReduceWorkTile {
+  int batch_idx;
+  int seq_idx;
+  int head_idx;
+};
+
+// Reduction scheduler: one work-group per (batch, seq, head) output row. Enumerated over a
+// natural 3D grid with head on grid.x (fastest-varying) so neighbouring work-groups walk
+// contiguous o_accum / out rows -- both are [..., h_q, D_V] with the head stride == D_V, so
+// adjacent heads are adjacent rows. This is the paged reduction's scheme
+// (XeMlaReduceSplitKScheduler, mla/kernel/mla_tile_scheduler.hpp): because the grid is the
+// coordinate, get_block_coord reads it straight off BlockIdx with no divmod, and the kernel
+// body never touches BlockIdx -- matching the gather + dense Stage-2 schedulers above. Like
+// them it is a stateless single-tile decoder.
+class XeMlaSparse2StageReduceTileScheduler {
+ public:
+  // Reads only the three dims that size the grid. The reduction's Params is the whole dense
+  // SparseAttn2StageParams, so it forwards params.kernel.shape here.
+  using Params = SparseDecode2StageProblemShape;
+
+  // head -> grid.x (fastest), seq -> grid.y, batch -> grid.z. The reduction's can_implement
+  // guarantees all three are >= 1 before launch.
+  static dim3 get_grid_shape(Params const& shape) {
+    return dim3(shape.h_q, shape.s_q, shape.b);
+  }
+
+  CUTLASS_DEVICE
+  XeMlaSparse2StageReduceTileScheduler(Params const& /* shape */) : valid_(true) {
+    tile_.head_idx = int(BlockIdxX());
+    tile_.seq_idx = int(BlockIdxY());
+    tile_.batch_idx = int(BlockIdxZ());
+  }
+
+  CUTLASS_DEVICE
+  bool is_valid() const {
+    return valid_;
+  }
+
+  CUTLASS_DEVICE
+  Sparse2StageReduceWorkTile get_block_coord() const {
+    return tile_;
+  }
+
+  CUTLASS_DEVICE
+  XeMlaSparse2StageReduceTileScheduler& operator++() {
+    valid_ = false;
+    return *this;
+  }
+
+ private:
+  Sparse2StageReduceWorkTile tile_;
+  bool valid_;
+};
+
 }  // namespace cutlass::flash_attention::kernel

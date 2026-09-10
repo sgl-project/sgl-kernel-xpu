@@ -212,6 +212,12 @@ struct Mainloop2StageParams {
 // write out (leaving these fields null/0).
 struct Epilogue2StageParams {
   int h_q = 0;
+  // Batch / query-seqlen (and, for split-K, the split count) the stat tensors are sliced
+  // from: lse / max_logits are [b, s_q, h_q]; the split stats are [b, s_q, num_kv_splits,
+  // h_q]. The epilogue builds those CuTe views and indexes by (batch, seq, [kv-split,] head)
+  // instead of a flattened base + idx*stride. num_kv_splits is read only by the split-K
+  // publish path (IS_SPLIT_KV); non-split leaves it 1.
+  int b = 0, s_q = 0, num_kv_splits = 1;
   float sm_scale_div_log2 = 0.f;
 
   float* __restrict__ lse = nullptr;  // [b, s_q, h_q]

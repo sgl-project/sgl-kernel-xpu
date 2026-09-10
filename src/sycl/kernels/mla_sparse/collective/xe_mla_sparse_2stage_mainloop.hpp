@@ -3,28 +3,12 @@
  * SPDX-License-Identifier: BSD-3-Clause
  **************************************************************************************************/
 /*! \file
-    \brief Two-stage sparse MLA Stage 2 mainloop collective for DeepSeek V4
-           (decode + prefill).
+    \brief Two-stage sparse MLA Stage 2 mainloop collective
 
     QK/PV DPAS GEMM engine + online (log2) softmax over the Stage 1 gathered tile.
     Consumes the per-(batch, seq, v-split) gmem Q/K/V tiles built by the kernel
     wrapper and produces the O accumulator + softmax max/sum row stats, which the
     epilogue collective then reduces, normalizes, and writes out.
-
-    Path-agnostic: both two-stage paths use this collective unchanged (see the Stage-2
-    kernel wrapper, kernel/xe_mla_sparse_2stage_dense_kernel.hpp).
-
-    Structural analog of collective/xe_mla_sparse_mainloop.hpp (the fused path): a
-    compute collective owning the MMA/tile/fragment type aliases, its Params, its
-    SharedStorage, ctor (Params const&, SharedStorage&), and operator(). Shared
-    declarations (SparseAttnDecodeParams, LOG_* constants, the copy_block_*
-    helpers) come from the kernel/ common header; the DPAS/tile geometry it reads
-    off its Traits template param is MlaSparseDecode2StageTileTraits, declared in that
-    same common header. Traits carries geometry only -- element types, MMA atoms, tile
-    shapes, sizes -- never the assembly (which collectives / kernels / runner), which
-    is the config struct's business.
-
-    Correctness reference: tests/test_flash_mla_with_kvcache.py _sm120_sparse_decode_fwd.
 */
 
 #pragma once

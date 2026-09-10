@@ -36,8 +36,7 @@ using cutlass::flash_attention::kernel::LOG_E_2;
 /////////////////////////////////////////////////////////////////////////////////////////////////
 // HAS_MAX_LOGITS_ gates the prefill-only pre-sink row-max (max_logits) write: the
 // decode epilogue is instantiated with false so that store is compiled out; the
-// prefill config passes true. Kept a template param (rather than the old runtime
-// null-guard) so decode never emits the extra store path.
+// prefill config passes true.
 //
 // IS_SPLIT_KV_ turns this into the split-K *publishing* epilogue: instead of finishing
 // the row (attn_sink merge, softmax normalization, LSE) and writing `out`, it stores the
@@ -158,8 +157,6 @@ class XeMlaSparse2StageEpilogue {
       // Which split of the gathered topk dim produced tArA / tA_max / tA_sum. Read only
       // under IS_SPLIT_KV; the non-split instantiation ignores it.
       int kv_split_idx = 0) {
-    float* lse = params.lse;
-
     TiledMMAPV mma_pv{};
 
     Tensor proxyO = make_identity_tensor(O.shape());
@@ -271,12 +268,15 @@ class XeMlaSparse2StageEpilogue {
         int local_head_idx = sg_id * valid_tid_per_sg + tid_in_sg;
         int head_idx = cur_head_start_idx + local_head_idx;
         if (head_idx < params.h_q) {
-          int stat_idx = batch_idx * params.stride_split_stats_b + seq_idx * params.stride_split_stats_s_q +
-                         kv_split_idx * params.stride_split_stats_split + head_idx;
-          // An empty / fully-masked split lands here with tA_sum still 0 (the mainloop's
-          // topk loop ran zero times), which is exactly the reduction's skip signal.
-          params.split_exp_sums[stat_idx] = rA_sum(0);
-          params.split_max_logits[stat_idx] = rA_max(0);
+          // [b, s_q, num_kv_splits, h_q] stat tensors (h_q contiguous).
+          auto stat_layout = make_layout(
+              make_shape(params.b, params.s_q, params.num_kv_splits, params.h_q),
+              make_stride(
+                  params.stride_split_stats_b, params.stride_split_stats_s_q, params.stride_split_stats_split, _1{}));
+          Tensor mSplitExpSums = make_tensor(make_gmem_ptr(params.split_exp_sums), stat_layout);
+          Tensor mSplitMaxLogits = make_tensor(make_gmem_ptr(params.split_max_logits), stat_layout);
+          mSplitExpSums(batch_idx, seq_idx, kv_split_idx, head_idx) = rA_sum(0);
+          mSplitMaxLogits(batch_idx, seq_idx, kv_split_idx, head_idx) = rA_max(0);
         }
       }
 
@@ -293,8 +293,6 @@ class XeMlaSparse2StageEpilogue {
       int local_head_idx = sg_id * valid_tid_per_sg + tid_in_sg;
       int head_idx = cur_head_start_idx + local_head_idx;
       if (head_idx < params.h_q) {
-        int lse_idx = batch_idx * params.stride_lse_b + seq_idx * params.stride_lse_s_q + head_idx;
-
         float row_max = -INFINITY;
         if (rA_max(0) != params.sm_scale_div_log2 * cutlass::platform::numeric_limits<ElementA>::lowest()) {
           row_max = rA_max(0) * LOG_E_2;
@@ -304,14 +302,22 @@ class XeMlaSparse2StageEpilogue {
         if (rA_sum(0) > 0.f) {
           row_lse = row_max + sycl::native::log2(rA_sum(0)) * LOG_E_2;
         }
-        lse[lse_idx] = row_lse;
-        // Prefill also returns the pre-sink row max (max_logits); decode is
-        // instantiated HAS_MAX_LOGITS=false so this store is compiled out. Uses the
-        // same [b, s_q, h_q] indexing as lse.
+        // [b, s_q, h_q] lse tensor (h_q contiguous).
+        Tensor mLse = make_tensor(
+            make_gmem_ptr(params.lse),
+            make_layout(
+                make_shape(params.b, params.s_q, params.h_q),
+                make_stride(params.stride_lse_b, params.stride_lse_s_q, _1{})));
+        mLse(batch_idx, seq_idx, head_idx) = row_lse;
+        // Prefill also returns the pre-sink row max (max_logits); decode is instantiated
+        // HAS_MAX_LOGITS=false so this store is compiled out. Same [b, s_q, h_q] indexing as lse.
         if constexpr (HAS_MAX_LOGITS) {
-          int max_logits_idx =
-              batch_idx * params.stride_max_logits_b + seq_idx * params.stride_max_logits_s_q + head_idx;
-          params.max_logits[max_logits_idx] = row_max;
+          Tensor mMaxLogits = make_tensor(
+              make_gmem_ptr(params.max_logits),
+              make_layout(
+                  make_shape(params.b, params.s_q, params.h_q),
+                  make_stride(params.stride_max_logits_b, params.stride_max_logits_s_q, _1{})));
+          mMaxLogits(batch_idx, seq_idx, head_idx) = row_max;
         }
       }
     }

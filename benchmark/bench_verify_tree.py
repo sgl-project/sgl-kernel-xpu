@@ -2,6 +2,7 @@ import pandas as pd
 import torch
 import triton
 from sgl_kernel import verify_tree_greedy
+from sgl_kernel.eagle_utils import verify_tree_greedy_triton
 from typing import List, Tuple
 
 configs = [
@@ -106,9 +107,9 @@ def generate_test_inputs(
         x_names=["b_s", "num_draft_tokens"],
         x_vals=configs,
         line_arg="provider",
-        line_vals=["sycl"],
-        line_names=["SYCL"],
-        styles=[("green", "-")],
+        line_vals=["sycl", "triton"],
+        line_names=["SYCL", "Triton"],
+        styles=[("green", "-"), ("blue", "-")],
         ylabel="Time (ms)",
         plot_name="verify-tree-performance",
         args={},
@@ -143,9 +144,8 @@ def benchmark(b_s, num_draft_tokens, provider):
     accept_token_num_sycl = accept_token_num_template.clone()
 
 
-    # Warmup
-    for _ in range(10):
-        verify_tree_greedy(
+    if provider == "sycl":
+        bench_lambda = lambda: verify_tree_greedy(
             predicts=predicts_sycl,
             accept_index=accept_index_sycl,
             accept_token_num=accept_token_num_sycl,
@@ -155,21 +155,25 @@ def benchmark(b_s, num_draft_tokens, provider):
             retrive_next_sibling=retrive_next_sibling,
             target_predict=target_predict,
         )
+    else:
+        bench_lambda = lambda: verify_tree_greedy_triton(
+            predicts=predicts_sycl,
+            accept_index=accept_index_sycl,
+            accept_token_num=accept_token_num_sycl,
+            candidates=candidates,
+            retrieve_index=retrive_index,
+            retrieve_next_token=retrive_next_token,
+            retrieve_next_sibling=retrive_next_sibling,
+            target_predict=target_predict,
+        )
+
+    # Warmup
+    for _ in range(10):
+        bench_lambda()
 
     torch.xpu.synchronize()
 
     total_accepted = int(accept_token_num_sycl.sum().item())
-
-    bench_lambda = lambda: verify_tree_greedy(
-        predicts=predicts_sycl,
-        accept_index=accept_index_sycl,
-        accept_token_num=accept_token_num_sycl,
-        candidates=candidates,
-        retrive_index=retrive_index,
-        retrive_next_token=retrive_next_token,
-        retrive_next_sibling=retrive_next_sibling,
-        target_predict=target_predict,
-    )
 
     quantiles = [0.5, 0.25, 0.75]
     ms, _, _ = triton.testing.do_bench(
@@ -178,34 +182,9 @@ def benchmark(b_s, num_draft_tokens, provider):
 
     torch.xpu.empty_cache()
 
-    # Calculate memory bandwidth
-    # Inputs: candidates, retrive_index, retrive_next_token, retrive_next_sibling,
-    #         target_predict
-    # Outputs: predicts, accept_index, accept_token_num
-    in_sz = candidates.element_size()
-    out_sz = predicts_sycl.element_size()
-
-    # Traversal levels that touch memory: one per accepted token, plus one per
-    # request for the root / path tip.
-    steps = total_accepted + b_s
-
-    read_bytes = (
-        # candidates, retrive_index, retrive_next_token, retrive_next_sibling:
-        # the full row is staged every launch, whatever the walk accepts.
-        4 * b_s * num_draft_tokens * in_sz
-        + steps * in_sz  # target_predict, one scalar per level
-    )
-
-    write_bytes = (
-        steps * out_sz  # predicts, one per accepted token plus the tip
-        + steps * out_sz  # accept_index, root plus one per accepted token
-        + b_s * out_sz  # accept_token_num
-    )
-    total_bytes = read_bytes + write_bytes
-    bandwidth_gb_s = total_bytes / (ms / 1e3) / 1e9
-
     all_results.append(
         {
+            "provider": provider,
             "b_s": b_s,
             "num_draft_tokens": num_draft_tokens,
             "num_spec_steps": num_speculative_tokens,
@@ -214,8 +193,6 @@ def benchmark(b_s, num_draft_tokens, provider):
             "us": ms * 1e3,
             "draft_Mtok_per_sec": (b_s * num_draft_tokens) / (ms / 1e3) / 1e6,
             "req_per_sec": b_s / (ms / 1e3),
-            "bytes_KiB": total_bytes / 1024,
-            "bandwidth_gb_s": bandwidth_gb_s,
         }
     )
     return ms
@@ -232,9 +209,20 @@ if __name__ == "__main__":
     print(df.to_markdown(index=False))
     print("\n")
 
-    print("Summary Statistics:")
-    print(f"  Min latency: {df['us'].min():.2f} us")
-    print(f"  Median latency: {df['us'].median():.2f} us")
-    print(f"  Max latency: {df['us'].max():.2f} us")
-    print(f"  Best throughput: {df['draft_Mtok_per_sec'].max():.2f} draft Mtok/s")
-    print(f"  Best bandwidth: {df['bandwidth_gb_s'].max():.2f} GB/s")
+    keys = ["b_s", "num_draft_tokens"]
+    cmp = df.pivot_table(index=keys, columns="provider", values="us").reset_index()
+    cmp = cmp.rename(columns={"sycl": "sycl_us", "triton": "triton_us"})
+    cmp["speedup"] = cmp["triton_us"] / cmp["sycl_us"]
+    cmp["faster"] = cmp["speedup"].map(lambda s: "SYCL" if s > 1 else "Triton")
+    print("SYCL vs Triton:")
+    print(cmp.to_markdown(index=False))
+    print("\n")
+
+    sycl = df[df["provider"] == "sycl"]
+    print("Summary Statistics (SYCL):")
+    print(f"  Min latency: {sycl['us'].min():.2f} us")
+    print(f"  Median latency: {sycl['us'].median():.2f} us")
+    print(f"  Max latency: {sycl['us'].max():.2f} us")
+    print(f"  Best throughput: {sycl['draft_Mtok_per_sec'].max():.2f} draft Mtok/s")
+    print(f"  Best speedup vs Triton: {cmp['speedup'].max():.2f}x")
+    print(f"  Worst speedup vs Triton: {cmp['speedup'].min():.2f}x")

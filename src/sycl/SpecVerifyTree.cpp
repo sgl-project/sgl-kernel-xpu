@@ -17,7 +17,6 @@ limitations under the License.
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
-#include <cstdlib>
 #include <sycl/sycl.hpp>
 #include <type_traits>
 
@@ -63,17 +62,6 @@ constexpr int kSubGroupShift = 5;  // log2(kSubGroupSize)
 // shape up to topk=4/depth=4.
 constexpr int kMaxNodesPerLane = 4;
 constexpr int64_t kMaxShuffleNodes = kSubGroupSize * kMaxNodesPerLane;
-
-// Benchmarking override: set SGL_VERIFY_TREE_SLM=1 to force the SLM path even
-// when the tree would fit in registers, so the two staging strategies can be
-// A/B'd from one build.
-bool verify_tree_force_slm() {
-  static const bool force = [] {
-    const char* env = std::getenv("SGL_VERIFY_TREE_SLM");
-    return env != nullptr && env[0] != '\0' && env[0] != '0';
-  }();
-  return force;
-}
 
 // Register/shuffle staging.  One sub-group per request; lane l holds nodes
 // l, l + 32, ... so the four loads stay independent and coalesced, but node
@@ -365,7 +353,7 @@ void launch_verify_tree_greedy(
   const int32_t nodes = static_cast<int32_t>(num_draft_tokens);
   const int32_t steps = static_cast<int32_t>(num_spec_steps);
 
-  if (num_draft_tokens <= kMaxShuffleNodes && !verify_tree_force_slm()) {
+  if (num_draft_tokens <= kMaxShuffleNodes) {
     // One sub-group per request, so the group is exactly one sub-group wide and
     // needs no barrier.
     auto submit = [&](auto nodes_per_lane_tag) {
@@ -383,12 +371,24 @@ void launch_verify_tree_greedy(
           steps);
       sycl_kernel_submit(bs * kSubGroupSize, static_cast<int64_t>(kSubGroupSize), queue, kernel);
     };
-    if (num_draft_tokens <= kSubGroupSize) {
-      submit(std::integral_constant<int, 1>{});
-    } else if (num_draft_tokens <= 2 * kSubGroupSize) {
-      submit(std::integral_constant<int, 2>{});
-    } else {
-      submit(std::integral_constant<int, 4>{});
+    // Exactly ceil(num_draft_tokens / kSubGroupSize) chunks.  Rounding up to 4
+    // would make every lane load and shuffle node slots the tree does not have:
+    // an 85-node tree wastes 43 of 128 slots, a 73-node tree 55 of 128.  Since
+    // fetch() issues one shuffle per chunk, an exact count removes those from
+    // the walk as well as from the staging loads.
+    switch (static_cast<int>((num_draft_tokens + kSubGroupSize - 1) / kSubGroupSize)) {
+      case 1:
+        submit(std::integral_constant<int, 1>{});
+        break;
+      case 2:
+        submit(std::integral_constant<int, 2>{});
+        break;
+      case 3:
+        submit(std::integral_constant<int, 3>{});
+        break;
+      default:
+        submit(std::integral_constant<int, 4>{});
+        break;
     }
     return;
   }

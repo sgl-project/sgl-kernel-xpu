@@ -190,7 +190,7 @@ struct DecodeFp8PagedSource {
 
   // NoPE conversion and store, from already-loaded registers.
   template <class TensorGOut>
-  CUTLASS_DEVICE static void convert_and_store_nope(
+  CUTLASS_DEVICE static void dequantize_and_store_nope(
       TensorGOut&& gOut, PackedElement const (&packed_fp8)[NOPE_ITERS], PackedElement scale_word, int lane_id) {
     CUTE_UNROLL
     for (int u = 0; u < NOPE_ITERS; ++u) {
@@ -222,11 +222,11 @@ struct DecodeFp8PagedSource {
     const PackedElement scale_word =
         valid_token ? *reinterpret_cast<const PackedElement*>(token.scales) : PackedElement(0);
 
-    PackedElement packed_fp8[NOPE_ITERS];
+    PackedElement packed_nope[NOPE_ITERS];
     CUTE_UNROLL
     for (int u = 0; u < NOPE_ITERS; ++u) {
       const int i = lane_id + u * SUBGROUP_SIZE;
-      packed_fp8[u] = (valid_token && i < NOPE_PACKS) ? sNope(i) : PackedElement(0);
+      packed_nope[u] = (valid_token && i < NOPE_PACKS) ? sNope(i) : PackedElement(0);
     }
     PackedElement packed_rope[ROPE_ITERS];
     CUTE_UNROLL
@@ -235,11 +235,11 @@ struct DecodeFp8PagedSource {
       packed_rope[u] = (valid_token && j < ROPE_PACKS) ? sRope(j) : PackedElement(0);
     }
 
-    convert_and_store_nope(gOut, packed_fp8, scale_word, lane_id);
+    // Dequantize and store the NoPE portion of the token.
+    dequantize_and_store_nope(gOut, packed_nope, scale_word, lane_id);
 
     // RoPE: already bf16 -- a straight packed copy into the tail of the row, from the
-    // registers staged above. 16 packs over 16 lanes is a single iteration, so 8 B/lane
-    // already covers it in one request.
+    // registers staged above.
     CUTE_UNROLL
     for (int u = 0; u < ROPE_ITERS; ++u) {
       const int j = lane_id + u * SUBGROUP_SIZE;

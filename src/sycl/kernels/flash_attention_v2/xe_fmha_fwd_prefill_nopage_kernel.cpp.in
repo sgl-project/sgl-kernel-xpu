@@ -60,30 +60,56 @@ __attribute__((visibility("default"))) void FmhaPrefillNpRunner<@HEAD_DIM@, @ELE
   using TileShapeOutput = cute::Shape<cute::Int<kTile.tiled_q>, cute::Int<sgl::fmha::prefill_tiled_out(@HEAD_DIM@)>>;
   using SubgroupLayoutQK = cute::
       Layout<cute::Shape<cute::Int<kTile.num_sg>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+
+  // softmax_lse output is threaded as a template constexpr, so the mask
+  // combinations that can emit it need their own kernel instantiations: no mask,
+  // causal and local. This path has no sink support, so Sink is always false
+  // here. is_causal and is_local are mutually exclusive on the host, so the
+  // (Causal && LocalMask) corner is skipped rather than compiled dead.
   if (params.return_softmax_lse) {
-    TORCH_CHECK(
-        !params.is_causal && !params.is_local,
-        "return_softmax_lse is only supported without causal/local masking");
     using Element = @ELEM_TYPE@;
-    FMHAConfig<
-        false,
-        false,
-        false,
-        /*LSE=*/true,
-        TileShapeQK,
-        TileShapePV,
-        TileShapeOutput,
-        SubgroupLayoutQK,
-        void,
-        false,
-        2,
-        false,
-        Element,
-        Element,
-        Element,
-        Element>::run_nopaged(params);
+    if (params.is_causal) {
+      FMHAConfig<
+          /*Causal=*/true,
+          /*LocalMask=*/false,
+          false,
+          /*LSE=*/true,
+          TileShapeQK,
+          TileShapePV,
+          TileShapeOutput,
+          SubgroupLayoutQK,
+          void,
+          /*HasRelBias=*/false,
+          2,
+          false,
+          Element,
+          Element,
+          Element,
+          Element>::run_nopaged(params);
+    } else {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+        FMHAConfig<
+            /*Causal=*/false,
+            LocalMask,
+            false,
+            /*LSE=*/true,
+            TileShapeQK,
+            TileShapePV,
+            TileShapeOutput,
+            SubgroupLayoutQK,
+            void,
+            /*HasRelBias=*/false,
+            2,
+            false,
+            Element,
+            Element,
+            Element,
+            Element>::run_nopaged(params);
+      });
+    }
     return;
   }
+
   // No sink support for no_page path; always use Sink=false
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {

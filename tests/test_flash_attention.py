@@ -492,8 +492,9 @@ def _check_softmax_lse(lse, nheads_q, total_q, ref_lse_hq=None, atol=1e-1, rtol=
 
     Guards against the regression where the XPU chunkprefill path returned an
     empty / mis-shaped placeholder instead of a real (nheads, total_q) LSE.
-    When ``ref_lse_hq`` (shape (nheads_q, total_q)) is given, the values on the
-    finite rows are also compared (fully-masked rows are -inf and skipped).
+    When ``ref_lse_hq`` (shape (nheads_q, total_q)) is given, the values are also
+    compared: finite rows numerically, and fully-masked rows (causal / local
+    masking can leave a row with no visible key) must come back as -inf.
     """
     assert lse is not None, "softmax_lse must not be None when return_softmax_lse=True"
     assert isinstance(
@@ -511,6 +512,10 @@ def _check_softmax_lse(lse, nheads_q, total_q, ref_lse_hq=None, atol=1e-1, rtol=
     assert not torch.isnan(lse_f).any(), "softmax_lse contains NaN"
     assert not torch.isposinf(lse_f).any(), "softmax_lse contains +inf"
     if ref_lse_hq is not None:
+        expected_neginf = torch.isneginf(ref_lse_hq)
+        assert torch.isneginf(
+            lse_f[expected_neginf]
+        ).all(), "softmax_lse must be -inf on rows whose mask hides every key"
         finite = torch.isfinite(ref_lse_hq)
         if finite.any():
             diff = (lse_f[finite] - ref_lse_hq[finite].to(lse_f.dtype)).abs()
@@ -1064,9 +1069,10 @@ def test_flash_attn_kvcache(
                 else:
                     k_cache_paged.copy_(k_cache_saved)
                     v_cache_paged.copy_(v_cache_saved)
-                # The kernel only supports returning softmax_lse without
-                # causal/local/sink masking; request it only in that case.
-                return_lse = not causal and not local and not use_sinks
+                # softmax_lse is supported alongside causal / local masking; it
+                # is only unavailable with sink logits (no LSE kernel
+                # instantiation exists for the sink path).
+                return_lse = not use_sinks
                 result = flash_attn_with_kvcache(
                     q if not varlen_q else q_unpad,
                     k_cache if page_size is None else k_cache_paged,
@@ -1103,12 +1109,11 @@ def test_flash_attn_kvcache(
                 # reference is sink-inclusive, so numeric LSE is only validated
                 # for non-sink cases. lse_ref is reused from the out_ref call. ---
                 if return_lse:
-                    ref_lse_hq = (
-                        rearrange(lse_ref, "b h s -> (b s) h")[indices_q]
-                        .transpose(0, 1)
-                        .contiguous()
-                    )
-                    _check_softmax_lse(lse, nheads_q, q_unpad.shape[0], ref_lse_hq)
+                    ref_lse_flat = rearrange(lse_ref, "b h s -> (b s) h")
+                    if varlen_q:
+                        ref_lse_flat = ref_lse_flat[indices_q]
+                    ref_lse_hq = ref_lse_flat.transpose(0, 1).contiguous()
+                    _check_softmax_lse(lse, nheads_q, ref_lse_hq.shape[1], ref_lse_hq)
                 if varlen_q:
                     out = output_pad_fn(out)
                 torch.xpu.synchronize()
@@ -1650,9 +1655,10 @@ def test_flash_attn_decode_kvcache(
                 else:
                     k_cache_paged.copy_(k_cache_saved)
                     v_cache_paged.copy_(v_cache_saved)
-                # The kernel only supports returning softmax_lse without
-                # causal/local/sink masking; request it only in that case.
-                return_lse = not causal and not local and not use_sinks
+                # softmax_lse is supported alongside causal / local masking; it
+                # is only unavailable with sink logits (no LSE kernel
+                # instantiation exists for the sink path).
+                return_lse = not use_sinks
                 result = flash_attn_with_kvcache(
                     q if not varlen_q else q_unpad,
                     k_cache if page_size is None else k_cache_paged,
@@ -1690,12 +1696,11 @@ def test_flash_attn_decode_kvcache(
                 # reference is sink-inclusive, so numeric LSE is only validated
                 # for non-sink cases. lse_ref is reused from the out_ref call. ---
                 if return_lse:
-                    ref_lse_hq = (
-                        rearrange(lse_ref, "b h s -> (b s) h")[indices_q]
-                        .transpose(0, 1)
-                        .contiguous()
-                    )
-                    _check_softmax_lse(lse, nheads_q, q_unpad.shape[0], ref_lse_hq)
+                    ref_lse_flat = rearrange(lse_ref, "b h s -> (b s) h")
+                    if varlen_q:
+                        ref_lse_flat = ref_lse_flat[indices_q]
+                    ref_lse_hq = ref_lse_flat.transpose(0, 1).contiguous()
+                    _check_softmax_lse(lse, nheads_q, ref_lse_hq.shape[1], ref_lse_hq)
                 if varlen_q:
                     out = output_pad_fn(out)
                 torch.xpu.synchronize()
@@ -1866,7 +1871,9 @@ def test_flash_attn_fp8_kvcache(
 
     q = torch.randn(batch_size, seqlen_q, nheads_q, d, device=device, dtype=q_dtype)
 
-    out, lse, *rest = flash_attn_with_kvcache(
+    # The fp8 KV-cache kernels have no LSE instantiation, so softmax_lse cannot
+    # be requested here (the kernel rejects it rather than returning garbage).
+    out = flash_attn_with_kvcache(
         q,
         k_cache_paged,
         v_cache_paged,
@@ -1876,11 +1883,7 @@ def test_flash_attn_fp8_kvcache(
         v_descale=v_descale,
         softmax_scale=softmax_scale,
         causal=causal,
-        return_softmax_lse=True,
     )
-    # --- softmax_lse validation (structural: the fp8 lse numeric convention is
-    # kernel-specific, so only shape / finiteness are checked here) ---
-    _check_softmax_lse(lse, nheads_q, batch_size * seqlen_q)
     out = out.reshape(batch_size, seqlen_q, nheads_q, d)
     torch.xpu.synchronize()
 
@@ -2166,7 +2169,7 @@ def test_flash_attn_varlen_output(
         q_unpad, k_unpad, v_unpad = [
             x.detach().to(dtype).requires_grad_() for x in (q_unpad, k_unpad, v_unpad)
         ]
-        out_ref, _ = attention_ref(
+        out_ref, _, lse_ref = attention_ref(
             q_ref,
             k_ref,
             v_ref,
@@ -2181,6 +2184,7 @@ def test_flash_attn_varlen_output(
             v_descale=v_descale,
             window_size=window_size,
             softcap=softcap,
+            return_lse=True,
         )
         out_pt, _ = attention_ref(
             q_ref,
@@ -2212,10 +2216,28 @@ def test_flash_attn_varlen_output(
         fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
         rtol = 2 if softcap == 0.0 else 3
 
+        # softmax_lse is supported alongside causal / local masking on the
+        # non-paged prefill path; it is only unavailable with sink logits (none
+        # here) or an fp8 KV cache.
+        return_lse = dtype != torch.float8_e4m3fn
+        # Reference LSE in the unpadded (nheads, total_q) layout the kernel
+        # writes. unpad_input selects the used (+ unused) query rows in flattened
+        # (b s) order, so mirror that indexing here.
+        ref_lse_hq = None
+        if return_lse and query_unused_mask is None:
+            indices_q = torch.nonzero(
+                query_padding_mask.flatten(), as_tuple=False
+            ).flatten()
+            ref_lse_hq = (
+                rearrange(lse_ref, "b h s -> (b s) h")[indices_q]
+                .transpose(0, 1)
+                .contiguous()
+            )
+
         pack_gqa_vals = [False, True] if not DISABLE_PACKGQA else [False]
         num_splits_vals = [1, 3] if not DISABLE_SPLIT else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
-            out_unpad = flash_attn_varlen_func(
+            result = flash_attn_varlen_func(
                 q_unpad,
                 k_unpad,
                 v_unpad,
@@ -2234,8 +2256,13 @@ def test_flash_attn_varlen_output(
                 softmax_scale=softmax_scale,
                 sinks=sinks,
                 softcap=softcap,
-                return_softmax_lse=False,
+                return_softmax_lse=return_lse,
             )
+            if return_lse:
+                out_unpad, lse = result
+                _check_softmax_lse(lse, nheads_q, q_unpad.shape[0], ref_lse_hq)
+            else:
+                out_unpad = result
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:
                 out.masked_fill_(q_zero_masking, 0.0)

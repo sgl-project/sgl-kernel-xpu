@@ -78,6 +78,7 @@ suites = {
         TestFile("test_inkling_attn_prologue.py"),
         TestFile("test_hisparse.py"),
         TestFile("speculative/test_build_eagle_tree.py"),
+        TestFile("speculative/test_eagle_utils.py"),
     ],
     # Nightly suite: exercises the wheel installed in the intel/sgl-kernel-xpu-dev
     # nightly image. Populate with longer-running or full-shape tests that are

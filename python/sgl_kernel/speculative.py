@@ -38,8 +38,8 @@ def tree_speculative_sampling_target_only(
 
 
 def verify_tree_greedy(
-    predicts: torch.Tensor,  # mutable, pre-filled with -1
-    accept_index: torch.Tensor,  # mutable, pre-filled with -1
+    predicts: torch.Tensor,  # mutable
+    accept_index: torch.Tensor,  # mutable
     accept_token_num: torch.Tensor,  # mutable
     candidates: torch.Tensor,
     retrive_index: torch.Tensor,

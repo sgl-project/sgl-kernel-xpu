@@ -902,9 +902,9 @@ void tree_speculative_sampling_target_only(
     int64_t sycl_stream = 0);
 
 void verify_tree_greedy(
-    at::Tensor& predicts,          // mutable, pre-filled with -1
-    at::Tensor& accept_index,      // mutable, pre-filled with -1
-    at::Tensor& accept_token_num,  // mutable
+    at::Tensor& predicts,
+    at::Tensor& accept_index,
+    at::Tensor& accept_token_num,
     const at::Tensor& candidates,
     const at::Tensor& retrive_index,
     const at::Tensor& retrive_next_token,

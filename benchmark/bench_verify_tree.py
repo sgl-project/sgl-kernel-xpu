@@ -1,9 +1,10 @@
+from typing import Tuple
+
 import pandas as pd
 import torch
 import triton
 from sgl_kernel import verify_tree_greedy
 from sgl_kernel.eagle_utils import verify_tree_greedy_triton
-from typing import List, Tuple
 
 configs = [
     # (b_s,  num_draft_tokens)
@@ -19,6 +20,7 @@ configs = [
 
 all_results = []
 
+
 def generate_test_inputs(
     batch_size: int,
     num_draft_tokens: int,
@@ -33,7 +35,9 @@ def generate_test_inputs(
         num_speculative_tokens: Max speculative tokens to verify (typically num_draft_tokens)
         device: Device to create tensors on
     """
-    print(f"   Generating inputs: batch_size={batch_size}, num_draft_tokens={num_draft_tokens}")
+    print(
+        f"   Generating inputs: batch_size={batch_size}, num_draft_tokens={num_draft_tokens}"
+    )
 
     # Generate random but valid inputs
     # Note: CUDA kernel has mixed dtype requirements:
@@ -60,9 +64,12 @@ def generate_test_inputs(
     )
 
     # retrive_index: indices in the tree structure (int64 for CUDA)
-    retrive_index = torch.arange(
-        num_draft_tokens, device=device, dtype=torch.int64
-    ).unsqueeze(0).expand(batch_size, -1).contiguous()
+    retrive_index = (
+        torch.arange(num_draft_tokens, device=device, dtype=torch.int64)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+        .contiguous()
+    )
 
     # retrive_next_token: next token in traversal (int64 for CUDA)
     # Use a simple linear chain structure to avoid potential infinite loops
@@ -102,6 +109,7 @@ def generate_test_inputs(
         target_predict,
     )
 
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["b_s", "num_draft_tokens"],
@@ -116,17 +124,13 @@ def generate_test_inputs(
     )
 )
 def benchmark(b_s, num_draft_tokens, provider):
-    print(
-        f"benchmark {provider} with b_s={b_s} num_draft_tokens={num_draft_tokens} "
-    )
+    print(f"benchmark {provider} with b_s={b_s} num_draft_tokens={num_draft_tokens} ")
     torch.set_default_device("xpu")
     torch.xpu.manual_seed_all(42)
 
     num_speculative_tokens = num_draft_tokens
 
-    inputs = generate_test_inputs(
-        b_s, num_draft_tokens, num_speculative_tokens, "xpu"
-    )
+    inputs = generate_test_inputs(b_s, num_draft_tokens, num_speculative_tokens, "xpu")
 
     (
         predicts_template,
@@ -142,7 +146,6 @@ def benchmark(b_s, num_draft_tokens, provider):
     predicts_sycl = predicts_template.clone()
     accept_index_sycl = accept_index_template.clone()
     accept_token_num_sycl = accept_token_num_template.clone()
-
 
     if provider == "sycl":
         bench_lambda = lambda: verify_tree_greedy(

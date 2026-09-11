@@ -83,6 +83,21 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("min_p_sampling_from_probs", torch::kXPU, &min_p_sampling_from_probs);
 
   /*
+   * Speculative decoding (EAGLE)
+   */
+  m.def(
+      "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
+      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, "
+      "Tensor! retrive_next_sibling, int topk, int depth, int draft_token_num, int tree_mask_mode=0) -> ()");
+  m.impl("build_tree_kernel_efficient", torch::kXPU, &build_tree_kernel_efficient);
+
+  m.def(
+      "verify_tree_greedy(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
+      "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, "
+      "Tensor retrive_next_sibling, Tensor target_predict) -> ()");
+  m.impl("verify_tree_greedy", torch::kXPU, &verify_tree_greedy);
+
+  /*
    * Fast radix top-k (DeepSeek V3.2 indexer)
    */
   m.def("fast_topk(Tensor score, Tensor lengths, int topk, Tensor? row_starts) -> Tensor");

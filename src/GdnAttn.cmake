@@ -45,16 +45,28 @@ target_compile_definitions(common_ops PRIVATE
     CUTLASS_ENABLE_HEADERS_ONLY
     CUTLASS_VERSIONS_GENERATED)
 
+# Build a device-link flag bundle that includes -fvisibility=default so the
+# device-link step (icx -fsycl-link) emits GLOBAL symbols, not LOCAL. The flag
+# must reach sycl_add_library() BEFORE the macro generates its CUSTOM_COMMAND,
+# not via target_compile_options() afterward.
+set(GDN_DEVICE_LINK_FLAGS ${COMMON_DEVICE_LINK_FLAGS} -fvisibility=default)
+
 # Compile the non-Xe20 host SYCL sources with the upstream common flag set.
 foreach(sycl_src ${GDN_ATTN_COMMON_SRCS})
   get_filename_component(name ${sycl_src} NAME_WLE REALPATH)
   set(sycl_lib sgl-ops-sycl-${name})
+  # Save and override SYCL_HOST_FLAGS (FindSYCL.cmake reads this by name at macro-call time)
+  set(_gdn_saved_host_flags ${SYCL_HOST_FLAGS})
+  list(REMOVE_ITEM SYCL_HOST_FLAGS -fvisibility=hidden -fvisibility-inlines-hidden)
+  list(APPEND SYCL_HOST_FLAGS -fvisibility=default)
   sycl_add_library(
     ${sycl_lib}
     ${SYCL_OFFLINE_COMPILER_FLAGS}
-    ${COMMON_DEVICE_LINK_FLAGS}
+    ${GDN_DEVICE_LINK_FLAGS}
     SHARED
     SYCL_SOURCES ${sycl_src})
+  # Restore SYCL_HOST_FLAGS so override doesn't leak
+  set(SYCL_HOST_FLAGS ${_gdn_saved_host_flags})
   target_include_directories(${sycl_lib} PRIVATE
     ${GDN_ATTN_DIR}
     ${GDN_ATTN_DIR}/xe_2
@@ -69,6 +81,7 @@ foreach(sycl_src ${GDN_ATTN_COMMON_SRCS})
       CUTLASS_VERSIONS_GENERATED)
   torch_compile_options(${sycl_lib})
   target_compile_options(${sycl_lib} PRIVATE ${TORCH_XPU_OPS_FLAGS})
+  target_compile_options(${sycl_lib} PRIVATE -fvisibility=default)
   # NOTE: sycl_add_library() calls target_link_libraries in plain mode, so we
   # must stay in plain mode here too (CMake forbids mixing plain + keyword).
   target_link_libraries(${sycl_lib}
@@ -84,12 +97,18 @@ endforeach()
 foreach(sycl_src ${GDN_ATTN_XE20_SRCS})
   get_filename_component(name ${sycl_src} NAME_WLE REALPATH)
   set(sycl_lib sgl-ops-sycl-${name})
+  # Save and override SYCL_HOST_FLAGS (FindSYCL.cmake reads this by name at macro-call time)
+  set(_gdn_saved_host_flags ${SYCL_HOST_FLAGS})
+  list(REMOVE_ITEM SYCL_HOST_FLAGS -fvisibility=hidden -fvisibility-inlines-hidden)
+  list(APPEND SYCL_HOST_FLAGS -fvisibility=default)
   sycl_add_library(
     ${sycl_lib}
     ${XE20_OFFLINE_COMPILER_FLAGS}
-    ${COMMON_DEVICE_LINK_FLAGS}
+    ${GDN_DEVICE_LINK_FLAGS}
     SHARED
     SYCL_SOURCES ${sycl_src})
+  # Restore SYCL_HOST_FLAGS so override doesn't leak
+  set(SYCL_HOST_FLAGS ${_gdn_saved_host_flags})
   target_include_directories(${sycl_lib} PRIVATE
     ${GDN_ATTN_DIR}
     ${GDN_ATTN_DIR}/xe_2
@@ -104,6 +123,7 @@ foreach(sycl_src ${GDN_ATTN_XE20_SRCS})
       CUTLASS_VERSIONS_GENERATED)
   torch_compile_options(${sycl_lib})
   target_compile_options(${sycl_lib} PRIVATE ${TORCH_XPU_OPS_FLAGS})
+  target_compile_options(${sycl_lib} PRIVATE -fvisibility=default)
   # NOTE: sycl_add_library() calls target_link_libraries in plain mode, so we
   # must stay in plain mode here too (CMake forbids mixing plain + keyword).
   target_link_libraries(${sycl_lib}

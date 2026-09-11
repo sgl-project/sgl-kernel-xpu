@@ -420,6 +420,10 @@ def _should_use_small_moe_prepare(
         1 <= topk <= _MOE_SMALL_PREPARE_MAX_TOPK
         and routed_rows <= _MOE_SMALL_PREPARE_MAX_ROUTES
         and routed_rows * hidden_dims <= _MOE_SMALL_PREPARE_MAX_ELEMENTS
+        # Single-token decode uses private register sorting independent of expert count E.
+        # Multi-token batches use SLM histogram + prefix-sum scaling with E; restrict to E <= 64
+        # to avoid thread-0 serial loop overhead.
+        and (num_tokens == 1 or num_experts <= 64)
     )
 
 
@@ -432,12 +436,15 @@ def _validate_fp8_weight_scale(
     """Validate an FP8 expert scale tensor against its physical weight shape."""
     assert scale.dtype == torch.float32, f"{name} must be float32"
     assert scale.ndim in (
-        (2, 3) if allow_scalar else (3,)
-    ), f"{name} must be 3D block scales or 2D scalar scales"
+        (1, 2, 3) if allow_scalar else (3,)
+    ), f"{name} must be 3D block scales or 1D/2D scalar scales"
     assert scale.shape[0] == weights.shape[0], (
         f"{name} expert dimension {scale.shape[0]} must match weights "
         f"expert dimension {weights.shape[0]}"
     )
+    if scale.ndim == 1:
+        assert allow_scalar, f"{name} scalar scales are not supported for this FP8 path"
+        return
     if scale.ndim == 2:
         assert allow_scalar, f"{name} scalar scales are not supported for this FP8 path"
         expected_columns = 2 if name == "w1_scale" else 1
@@ -695,6 +702,10 @@ def fused_experts(
         assert (
             w1_scale.ndim == w2_scale.ndim
         ), "w1_scale and w2_scale must use the same scalar or block layout"
+        if w1_scale.ndim == 1:
+            w1_scale = w1_scale.view(-1, 1)
+        if w2_scale.ndim == 1:
+            w2_scale = w2_scale.view(-1, 1)
         assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
     if b1 is not None:
         assert (
@@ -764,7 +775,8 @@ def fused_experts(
         "expert_offsets", (E,), torch.int32, hidden_states.device
     )
     use_small_prepare = (
-        _should_use_small_moe_prepare(M, TopK, hidden_dims, E) and use_fp8_weight
+        _should_use_small_moe_prepare(M, TopK, hidden_dims, E)
+        and hidden_states.dtype == torch.bfloat16
     )
     c_map = _get_moe_ws("c_map", (topk_ids.numel(),), torch.int32, hidden_states.device)
     input_A_shuffle = _get_moe_ws(

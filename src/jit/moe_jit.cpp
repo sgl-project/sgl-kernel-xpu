@@ -22,7 +22,6 @@ using KernelFn = void (*)(
     int,
     const int*,
     int,
-    int,
     int*,
     float,
     float,

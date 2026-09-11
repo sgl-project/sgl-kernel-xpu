@@ -1175,6 +1175,9 @@ static int64_t check_mamba_transfer(
   TORCH_CHECK(src_indices.scalar_type() == at::kLong, "src_indices must be int64");
   TORCH_CHECK(dst_indices.scalar_type() == at::kLong, "dst_indices must be int64");
   TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "index count mismatch");
+  TORCH_CHECK(
+      src_indices.device().is_xpu() && dst_indices.device().is_xpu(),
+      "src_indices and dst_indices must be on XPU");
   TORCH_CHECK(src_indices.is_contiguous() && dst_indices.is_contiguous(), "indices must be contiguous");
   // Flat byte addressing assumes both pools are contiguous.
   TORCH_CHECK(src.is_contiguous() && dst.is_contiguous(), "src/dst must be contiguous");

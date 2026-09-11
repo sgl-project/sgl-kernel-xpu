@@ -25,7 +25,7 @@ def generate_test_inputs(
     batch_size: int,
     num_draft_tokens: int,
     num_speculative_tokens: int,
-    device: str = "cuda",
+    device: str = "xpu",
 ) -> Tuple[torch.Tensor, ...]:
     """Generate test inputs for verify tree greedy kernels.
 
@@ -35,10 +35,6 @@ def generate_test_inputs(
         num_speculative_tokens: Max speculative tokens to verify (typically num_draft_tokens)
         device: Device to create tensors on
     """
-    print(
-        f"   Generating inputs: batch_size={batch_size}, num_draft_tokens={num_draft_tokens}"
-    )
-
     # Generate random but valid inputs
     # Note: CUDA kernel has mixed dtype requirements:
     # - Output tensors (predicts, accept_index, accept_token_num): int32

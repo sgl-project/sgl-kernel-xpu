@@ -444,21 +444,24 @@ class XeFMHAFwdKernel {
       auto dcK_cache = const_cast<ElementK*>(p.K_cache + offset_k_cache);
       auto dcV_cache = const_cast<ElementV*>(p.V_cache + offset_v_cache);
       auto dcO = const_cast<ElementO*>(p.O + offset_o);
-      // NHD layout for GQA
+      // Under standard NHD layout for GQA, non-contiguous stride layouts are currently disabled for PackedGQA_ = 1.
+      // When PackedGQA is enabled, the head dimension packs multiple query heads sharing the same KV group,
+      // causing standard stride calculations to mismatch the underlying memory layout.
+      // Supporting strided layouts for PackedGQA would require introducing a dedicated `head_stride`.
       auto layout_q = [&] {
-        if constexpr (is_var_len && !CollectiveMainloop::ScoreBlock2D) {
+        if constexpr (is_var_len && (PackGQA_)) {
           return make_ordered_layout(shape_Q, VarLenQLayoutStep_{});
         }
         return make_layout(shape_Q, p.dQ);
       }();
       auto layout_k = [&] {
-        if constexpr (is_var_len && !CollectiveMainloop::ScoreBlock2D) {
+        if constexpr (is_var_len && (PackGQA_)) {
           return make_ordered_layout(shape_K, VarLenKLayoutStep_{});
         }
         return make_layout(shape_K, p.dK);
       }();
       auto layout_v = [&] {
-        if constexpr (is_var_len && !CollectiveMainloop::ScoreBlock2D) {
+        if constexpr (is_var_len && (PackGQA_)) {
           return make_ordered_layout(shape_V, VarLenVLayoutStep_{});
         }
         return make_layout(shape_V, p.dV);
@@ -466,7 +469,7 @@ class XeFMHAFwdKernel {
 
       // NHD layout for GQA
       auto layout_o = [&] {
-        if constexpr (is_var_len && !CollectiveMainloop::ScoreBlock2D) {
+        if constexpr (is_var_len && (PackGQA_)) {
           return make_ordered_layout(shape_O, VarLenOLayoutStep_{});
         }
         return make_layout(shape_O, p.dO);

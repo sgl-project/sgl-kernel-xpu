@@ -472,6 +472,13 @@ void inkling_save_intermediate_conv_windows(
     at::Tensor& intermediate_out,
     int64_t batch_size,
     int64_t draft_token_num);
+
+/*
+ * Inkling relative-attention projection.
+ */
+at::Tensor
+inkling_rel_proj_small_t(const at::Tensor& r, const at::Tensor& proj, const at::Tensor& tau, const at::Tensor& out);
+
 /*
  * Inkling fused attention prologue family.
  */

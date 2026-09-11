@@ -44,7 +44,7 @@ struct chunk_causal_conv1d_tiled_kernel : public __SYCL_KER_CONFIG_CONVENTION__ 
  public:
   static constexpr int sub_group_size = 32;
   static constexpr int elems_per_item = 4;
-  static constexpr int wg_size = 64;  // 4 subgroups per WG
+  static constexpr int wg_size = 64;  // 2 subgroups per WG
 
   chunk_causal_conv1d_tiled_kernel(
       T* q_out,

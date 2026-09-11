@@ -12,7 +12,7 @@ namespace gdn {
 
 static constexpr int conv1d_tile_size = 8;
 
-// Tiled conv1d kernel for XE2 prefill path.
+// Tiled conv1d kernel for prefill path.
 //
 // Tiles TileT=8 consecutive tokens per workgroup. The qkv feature dimension is
 // split across num_feat_chunks workgroups, each handling

@@ -42,7 +42,7 @@ static constexpr int conv1d_tile_size = 8;
 template <typename T, int Width, int TileT, bool ReorderInput>
 struct chunk_causal_conv1d_tiled_kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
  public:
-  static constexpr int sub_group_size = 16;
+  static constexpr int sub_group_size = 32;
   static constexpr int elems_per_item = 4;
   static constexpr int wg_size = 64;  // 4 subgroups per WG
 

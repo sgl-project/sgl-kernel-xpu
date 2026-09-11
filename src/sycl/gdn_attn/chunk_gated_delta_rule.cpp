@@ -1,4 +1,3 @@
-#define SYCL_INTEL_TARGET 20
 #include "chunk_gated_delta_rule.h"
 
 #include <torch/all.h>

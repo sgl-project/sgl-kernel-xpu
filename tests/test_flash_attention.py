@@ -3050,9 +3050,12 @@ def test_flash_attn_varlen_output_noncontiguous(d, causal, dtype):
         causal=causal,
         softmax_scale=softmax_scale,
     )
-    for name, t in (("q", q), ("k", k), ("v", v)):
-        print(f"{name}: shape={tuple(t.shape)} stride={t.stride()}")
+
     out = flash_attn_varlen_func(q, k, v, **kwargs)
+    out_contig = flash_attn_varlen_func(
+        q.contiguous(), k.contiguous(), v.contiguous(), **kwargs
+    )
+    torch.testing.assert_close(out, out_contig, atol=3e-2, rtol=3e-2)
     # attention_ref expects batched (batch, seqlen, nheads, d) tensors, not the
     # ragged (total, nheads, d) layout flash_attn_varlen_func takes. Every batch
     # here has the same seqlen (evenly-spaced cu_seqlens), so splitting the

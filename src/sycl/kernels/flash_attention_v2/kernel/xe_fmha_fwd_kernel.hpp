@@ -445,6 +445,10 @@ class XeFMHAFwdKernel {
       auto dcV_cache = const_cast<ElementV*>(p.V_cache + offset_v_cache);
       auto dcO = const_cast<ElementO*>(p.O + offset_o);
       // NHD layout for GQA
+      // Non-contiguous stride layouts are currently unappliable with PackedGQA_ = 1.
+      // When PackedGQA is enabled, the head dimension packs multiple query heads sharing the same KV group,
+      // causing standard stride calculations to mismatch the underlying memory layout.
+      // Supporting strided layouts for PackedGQA would require introducing a dedicated `head_stride`.
       auto layout_q = [&] {
         if constexpr (is_var_len && (PackGQA_)) {
           return make_ordered_layout(shape_Q, VarLenQLayoutStep_{});

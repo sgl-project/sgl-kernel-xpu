@@ -444,7 +444,6 @@ void launch_chunk_compute_A_inverse_fused(
     const int head_k_dim,
     const int num_v_heads,
     const int head_v_dim) {
-  TORCH_CHECK(is_bmg(), "chunk_gdn: only BMG is supported for now");
   using Element_non_CV = cutlass::platform::remove_cv_t<T>;
   auto op = XE_DPAS_TT<8, float, Element_non_CV>{};
 

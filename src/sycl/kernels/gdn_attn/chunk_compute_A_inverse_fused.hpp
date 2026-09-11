@@ -12,7 +12,7 @@
 //   3) Subgroup 0 computes all off-diagonal blocks sequentially with
 //      intermediate dependencies in registers and no barriers.
 
-#include "chunk_gated_delta_rule_kernels_xe20.hpp"
+#include "chunk_gated_delta_rule_kernels.hpp"
 
 namespace gdn {
 using namespace cute;
@@ -427,12 +427,12 @@ class ChunkComputeAInverseFusedKernel;
 
 // Launcher: submits a single kernel that replaces the ChunkComputeAKernel +
 // ChunkInverseOptKernel pair from the earlier two-kernel design (see
-// kernel_launcher in chunk_gated_delta_rule_kernels_xe20.hpp, which now
+// kernel_launcher in chunk_gated_delta_rule_kernels.hpp, which now
 // calls this instead). `total_chunks` and the cumulative-sum decay values
 // in `a` must already have been produced by chunk_prepare_kernel before
 // this is launched.
 template <typename T, typename StateT>
-void launch_chunk_compute_A_inverse_fused_xe20(
+void launch_chunk_compute_A_inverse_fused(
     sycl::queue& queue,
     T* A,
     const T* k,
@@ -444,7 +444,6 @@ void launch_chunk_compute_A_inverse_fused_xe20(
     const int head_k_dim,
     const int num_v_heads,
     const int head_v_dim) {
-  TORCH_CHECK(is_bmg(), "chunk_gdn: only BMG is supported for now");
   using Element_non_CV = cutlass::platform::remove_cv_t<T>;
   auto op = XE_DPAS_TT<8, float, Element_non_CV>{};
 

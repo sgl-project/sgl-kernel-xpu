@@ -555,6 +555,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor seq_lens, Tensor block_tables, Tensor? schedule_metadata, "
       "int max_seq_len, bool clean_logits) -> Tensor");
   m.impl("fp8_paged_mqa_logits", torch::kXPU, &fp8_paged_mqa_logits);
+#endif  // SYCL_INTEL_TARGET == 20
 
   /*
    * From GDN (Gated DeltaNet) attention (Intel Xe2)
@@ -578,7 +579,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl(
       "gdn_attention_workspace_bytes_needed", c10::DispatchKey::BackendSelect, &gdn_attention_workspace_bytes_needed);
 #endif  // USE_GDN
-#endif  // SYCL_INTEL_TARGET == 20
 
   /*
    * Mamba causal conv1d (XPU)

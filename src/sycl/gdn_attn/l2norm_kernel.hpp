@@ -4,6 +4,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include "../SYCLHelpers.h"
 #include "../Utils.h"
 #include "gdn_attn_utils.h"
 
@@ -15,7 +16,7 @@ static constexpr int L2NormVecSize = 8;
 
 template <typename T>
 SYCL_EXTERNAL void
-l2norm_kernel(const T* q, const T* k, const int total_virtual_seqlen, const int num_k_heads, const int head_k_dim) {
+l2norm_kernel(T* q, T* k, const int total_virtual_seqlen, const int num_k_heads, const int head_k_dim) {
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 
   int group_id = item.get_group(1);
@@ -31,8 +32,8 @@ l2norm_kernel(const T* q, const T* k, const int total_virtual_seqlen, const int 
   }
   float q_scale = sycl::rsqrt(static_cast<float>(head_k_dim));
 
-  auto q_ptr = const_cast<T*>(q) + total_sg_id * head_k_dim;
-  auto k_ptr = const_cast<T*>(k) + total_sg_id * head_k_dim;
+  auto q_ptr = q + total_sg_id * head_k_dim;
+  auto k_ptr = k + total_sg_id * head_k_dim;
   float q_sum = 0.0f;
   float k_sum = 0.0f;
   for (int k_dim_idx = sg_local_id * l2norm_elem_per_item; k_dim_idx < head_k_dim;
@@ -58,8 +59,8 @@ l2norm_kernel(const T* q, const T* k, const int total_virtual_seqlen, const int 
 }
 
 template <typename T, int VEC_SIZE>
-SYCL_EXTERNAL void l2norm_vectorized_kernel(
-    const T* q, const T* k, const int total_virtual_seqlen, const int num_k_heads, const int head_k_dim) {
+SYCL_EXTERNAL void
+l2norm_vectorized_kernel(T* q, T* k, const int total_virtual_seqlen, const int num_k_heads, const int head_k_dim) {
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 
   using vec_t = aligned_vec<T, VEC_SIZE>;
@@ -77,8 +78,8 @@ SYCL_EXTERNAL void l2norm_vectorized_kernel(
   }
 
   float q_scale = sycl::rsqrt(static_cast<float>(head_k_dim));
-  auto q_ptr = const_cast<T*>(q) + total_sg_id * head_k_dim;
-  auto k_ptr = const_cast<T*>(k) + total_sg_id * head_k_dim;
+  auto q_ptr = q + total_sg_id * head_k_dim;
+  auto k_ptr = k + total_sg_id * head_k_dim;
 
   auto q_vec_ptr = reinterpret_cast<vec_t*>(q_ptr);
   auto k_vec_ptr = reinterpret_cast<vec_t*>(k_ptr);
@@ -115,10 +116,30 @@ SYCL_EXTERNAL void l2norm_vectorized_kernel(
 }
 
 template <typename T>
-class L2NormKernelTag;
+struct L2NormKernel {
+  T* q_ptr;
+  T* k_ptr;
+  int total_virtual_seqlen;
+  int num_k_heads;
+  int head_k_dim;
 
-template <typename T>
-class L2NormVecKernelTag;
+  [[sycl::reqd_sub_group_size(l2norm_sub_group_size)]] void operator()(sycl::nd_item<3>) const {
+    l2norm_kernel<T>(q_ptr, k_ptr, total_virtual_seqlen, num_k_heads, head_k_dim);
+  }
+};
+
+template <typename T, int VEC_SIZE>
+struct L2NormVecKernel {
+  T* q_ptr;
+  T* k_ptr;
+  int total_virtual_seqlen;
+  int num_k_heads;
+  int head_k_dim;
+
+  [[sycl::reqd_sub_group_size(l2norm_sub_group_size)]] void operator()(sycl::nd_item<3>) const {
+    l2norm_vectorized_kernel<T, VEC_SIZE>(q_ptr, k_ptr, total_virtual_seqlen, num_k_heads, head_k_dim);
+  }
+};
 
 template <typename T>
 void l2norm_launch(
@@ -143,19 +164,13 @@ void l2norm_launch(
   const bool vec_enabled = ((reinterpret_cast<uintptr_t>(q.data_ptr()) & (l2norm_vec_width - 1)) == 0) &&
                            ((reinterpret_cast<uintptr_t>(k.data_ptr()) & (l2norm_vec_width - 1)) == 0) &&
                            ((head_k_dim & (L2NormVecSize - 1)) == 0);
-  queue.submit([&](sycl::handler& cgh) {
-    if (vec_enabled) {
-      cgh.parallel_for<L2NormVecKernelTag<T>>(
-          sycl::nd_range<3>{global * local, local}, [=](auto) [[sycl::reqd_sub_group_size(l2norm_sub_group_size)]] {
-            l2norm_vectorized_kernel<T, L2NormVecSize>(q_ptr, k_ptr, total_virtual_seqlen, num_k_heads, head_k_dim);
-          });
-    } else {
-      cgh.parallel_for<L2NormKernelTag<T>>(
-          sycl::nd_range<3>{global * local, local}, [=](auto) [[sycl::reqd_sub_group_size(l2norm_sub_group_size)]] {
-            l2norm_kernel<T>(q_ptr, k_ptr, total_virtual_seqlen, num_k_heads, head_k_dim);
-          });
-    }
-  });
+  if (vec_enabled) {
+    L2NormVecKernel<T, L2NormVecSize> kernel{q_ptr, k_ptr, total_virtual_seqlen, num_k_heads, head_k_dim};
+    sycl_kernel_submit(global * local, local, queue, kernel);
+  } else {
+    L2NormKernel<T> kernel{q_ptr, k_ptr, total_virtual_seqlen, num_k_heads, head_k_dim};
+    sycl_kernel_submit(global * local, local, queue, kernel);
+  }
 }
 
 void l2norm_impl(sycl::queue& queue, const torch::Tensor& q, const torch::Tensor& k) {

@@ -15,44 +15,10 @@
 
     - DecodeFp8PagedSource  : reads a *packed fp8 paged* KV cache and dequantizes
         (per-64 e8m0 scales; nope fp8 + rope bf16 -> 512-dim bf16), concatenating a
-        primary + extra pool. Reference: tests/test_flash_mla_with_kvcache.py
-        _gather_and_dequant.
+        primary + extra pool.
     - PrefillDenseBf16Source: reads a dense *bf16 unpaged* KV source and does a plain
         D_QK-wide copy (D_QK is 512 or 576): no fp8 decode, no scale section, no extra
-        pool, no paging. Reference: tests/test_flash_mla_sparse_fwd.py
-        reference_mla_sparse_prefill (Stage 1).
-
-  Structure follows the dense MLA path's companion kernel, XeMlaReduceSplitKV
-  (kernel/xe_mla_reduce_split_kv.hpp), which is the in-repo model for a non-MMA
-  helper kernel written the sycl-tla way: gmem is addressed through cute tensor
-  views (make_tensor / make_gmem_ptr / make_layout) and coordinate indexing rather
-  than hand-rolled pointer arithmetic, and the launch grid is decoded into a
-  work-tile by a TileScheduler that also owns get_grid_shape. Like that kernel, and
-  unlike the Stage-2 mainloop, there is no MMA here and therefore no TiledCopy /
-  block-2d copy atom: each subgroup streams one topk row, so the copies are plain
-  lane-strided tensor accesses, vectorized via cute::recast to a wider element.
-
-  Shared declarations (the Gather2StageParams blocks, constants) come from
-  xe_mla_sparse_2stage_common.hpp, and its grid-to-work-tile scheduler
-  (XeMlaSparseGather2StageTileScheduler) from xe_mla_sparse_2stage_tile_scheduler.hpp
-  alongside the Stage-2 one. Stage 1 owns its own tile constants and does not use the
-  Stage-2 config struct (MlaSparseDecode2StageXe).
-
-  Stage 1 is a fully standalone kernel: its Params ARE the gather params (the source
-  policy's decode / prefill child), with no reference to the Stage-2 dense params. It is
-  the Stage-2 runner's companion kernel, wired in exactly like the dense MLA path's
-  split-KV reduction companion: it exposes the same host-side contract
-  (Arguments/Params, to_underlying_arguments, can_implement, get_workspace_size,
-  get_grid_shape, get_block_shape) and device::MLASparse launches it before the dense
-  kernel on the in-order XPU queue. The two stages communicate only through the
-  gathered_k / gathered_valid_mask HBM buffers, which each stage's params name
-  independently.
-
-  The two aliases below give each path a `template <int> class` entry point keyed on
-  D_QK, which is how the Stage-2 config struct (MlaSparseDecode2StageXe's
-  GatherKernelTmpl parameter) selects the decode vs prefill gather:
-    - SparseDecodeGatherDequantKernel<D_QK> == SparseGatherKernel<D_QK, DecodeFp8PagedSource>
-    - SparsePrefillGatherKernel<D_QK>       == SparseGatherKernel<D_QK, PrefillDenseBf16Source>
+        pool, no paging.
 */
 
 #pragma once
@@ -69,6 +35,11 @@ namespace cutlass::flash_attention::kernel {
 // checking the two row pointers subsumes every base / stride / index contribution --
 // no separate per-stride divisibility test is needed.
 /////////////////////////////////////////////////////////////////////////////////////////////////
+template <class PackedElement>
+CUTLASS_DEVICE bool is_aligned_for(const void* p) {
+  return (reinterpret_cast<uintptr_t>(p) & (sizeof(PackedElement) - 1)) == 0;
+}
+
 template <class PackedElement>
 CUTLASS_DEVICE bool is_packed_aligned(const void* src, const void* dst) {
   constexpr uintptr_t kMask = sizeof(PackedElement) - 1;
@@ -89,6 +60,7 @@ struct DecodeFp8PagedSource {
   static constexpr int FP8_VALUES_PER_PACK = 8;
   static constexpr int BF16_VALUES_PER_PACK = 4;
   using PackedElement = uint64_t;
+  using PackedOut = intel::ushort8;
 
   static_assert(D_QK == 512, "packed fp8 sparse decode currently supports logical D_QK=512");
   static_assert(D_QK % SUBGROUP_SIZE == 0, "D_QK must be divisible by SUBGROUP_SIZE");
@@ -107,12 +79,27 @@ struct DecodeFp8PagedSource {
   static_assert(
       sizeof(PackedElement) == sizeof(cutlass::bfloat16_t) * BF16_VALUES_PER_PACK,
       "PackedElement must cover one bf16 lane chunk");
+  static_assert(
+      sizeof(PackedOut) == sizeof(cutlass::bfloat16_t) * FP8_VALUES_PER_PACK,
+      "PackedOut must hold every bf16 one fp8 pack dequantizes to");
+  static_assert(
+      SPARSE_MLA_FP8_SCALE_BYTES_PER_TOKEN == sizeof(PackedElement),
+      "the e8m0 scale section must be exactly one packed load");
+  static_assert(
+      SPARSE_MLA_FP8_DATA_BYTES_PER_TOKEN % sizeof(PackedElement) == 0 &&
+          SPARSE_MLA_FP8_NOPE_BYTES % sizeof(PackedElement) == 0,
+      "scales inherit nope's alignment only if both section offsets are packed multiples");
   static constexpr int NUM_VALS_PER_THREAD = D_QK / SUBGROUP_SIZE;
   // Chunk counts once each section is viewed as PackedElements, and where the RoPE
   // section starts in the destination row's PackedElement view.
   static constexpr int NOPE_PACKS = SPARSE_MLA_FP8_NOPE_BYTES / FP8_VALUES_PER_PACK;
   static constexpr int ROPE_PACKS = SPARSE_MLA_FP8_ROPE_DIM / BF16_VALUES_PER_PACK;
   static constexpr int ROPE_PACK_BASE = SPARSE_MLA_FP8_NOPE_BYTES / BF16_VALUES_PER_PACK;
+  static constexpr int NOPE_ITERS = cute::ceil_div(NOPE_PACKS, SUBGROUP_SIZE);
+  static constexpr int ROPE_ITERS = cute::ceil_div(ROPE_PACKS, SUBGROUP_SIZE);
+  static_assert(
+      NOPE_PACKS * sizeof(PackedOut) == SPARSE_MLA_FP8_NOPE_BYTES * sizeof(cutlass::bfloat16_t),
+      "the NoPE PackedOut chunks must tile the destination row's NoPE region exactly");
 
   // Per-(batch, seq) invariants hoisted out of the topk-column loop: the two pools'
   // index pointers and (optional) topk-length caps. The index arrays are 1-D and
@@ -158,8 +145,6 @@ struct DecodeFp8PagedSource {
     return ctx;
   }
 
-  // Section views over one token's record. Shapes are static, strides unit: both
-  // recast cleanly to PackedElement for the vectorized paths.
   CUTLASS_DEVICE
   static auto make_nope_view(const uint8_t* nope) {
     return make_tensor(make_gmem_ptr(nope), make_layout(Shape<Int<SPARSE_MLA_FP8_NOPE_BYTES>>{}, Stride<_1>{}));
@@ -176,8 +161,7 @@ struct DecodeFp8PagedSource {
   }
 
   CUTLASS_DEVICE
-  static uint16_t fp8_e4m3_scaled_to_bf16_bits(uint8_t fp8_byte, uint8_t scale_byte) {
-    const float scale = e8m0_to_float(scale_byte);
+  static uint16_t fp8_e4m3_scaled_to_bf16_bits(uint8_t fp8_byte, float scale) {
     const auto fp8_val = cutlass::float_e4m3_t::bitcast(fp8_byte);
     return cutlass::bfloat16_t(static_cast<float>(fp8_val) * scale).storage;
   }
@@ -204,54 +188,76 @@ struct DecodeFp8PagedSource {
     }
   }
 
-  // Vectorized path: recast both sides to PackedElement so each lane handles 8 fp8
-  // (-> two 4-wide bf16 stores) or 4 bf16 per step.
+  // NoPE conversion and store, from already-loaded registers.
+  template <class TensorGOut>
+  CUTLASS_DEVICE static void dequantize_and_store_nope(
+      TensorGOut&& gOut, PackedElement const (&packed_fp8)[NOPE_ITERS], PackedElement scale_word, int lane_id) {
+    CUTE_UNROLL
+    for (int u = 0; u < NOPE_ITERS; ++u) {
+      const int i = lane_id + u * SUBGROUP_SIZE;
+      if (i >= NOPE_PACKS) {
+        continue;
+      }
+      const float scale = e8m0_to_float(uint8_t(scale_word >> (8 * ((i * FP8_VALUES_PER_PACK) / 64))));
+      PackedOut out;
+      CUTE_UNROLL
+      for (int vec_offset = 0; vec_offset < FP8_VALUES_PER_PACK; ++vec_offset) {
+        const uint8_t fp8_byte = static_cast<uint8_t>(packed_fp8[u] >> (8 * vec_offset));
+        out[vec_offset] = fp8_e4m3_scaled_to_bf16_bits(fp8_byte, scale);
+      }
+      gOut(i) = out;
+    }
+  }
+
+  // Vectorized path: each lane converts 8 fp8 into one 16-byte bf16 store (NoPE) or
+  // moves 4 bf16 (RoPE). An invalid token arrives with zeroed inputs and so writes zeros.
   template <class TensorGRow>
   CUTLASS_DEVICE static void
   store_dequantized_token_packed(TensorGRow&& gRow, TokenRecord const& token, bool valid_token, int lane_id) {
     auto gPacked = recast<PackedElement>(gRow);                      // (D_QK / BF16_VALUES_PER_PACK)
+    auto gOut = recast<PackedOut>(gRow);                             // (D_QK / FP8_VALUES_PER_PACK)
     auto sNope = recast<PackedElement>(make_nope_view(token.nope));  // (NOPE_BYTES / FP8_VALUES_PER_PACK)
     auto sRope = recast<PackedElement>(make_rope_view(token.rope));  // (ROPE_DIM / BF16_VALUES_PER_PACK)
 
-    // NoPE: each source chunk of 8 fp8 dequantizes into two destination chunks of
-    // 4 bf16. All 8 values share one e8m0 scale byte (scales are per 64 values).
-    CUTE_NO_UNROLL
-    for (int i = lane_id; i < NOPE_PACKS; i += SUBGROUP_SIZE) {
-      PackedElement packed_lo = 0;
-      PackedElement packed_hi = 0;
-      if (valid_token) {
-        const PackedElement packed_fp8 = sNope(i);
-        const uint8_t scale_byte = token.scales[(i * FP8_VALUES_PER_PACK) / 64];
-        CUTE_UNROLL
-        for (int vec_offset = 0; vec_offset < FP8_VALUES_PER_PACK; ++vec_offset) {
-          const uint8_t fp8_byte = static_cast<uint8_t>(packed_fp8 >> (8 * vec_offset));
-          const uint16_t bf16_bits = fp8_e4m3_scaled_to_bf16_bits(fp8_byte, scale_byte);
-          if (vec_offset < BF16_VALUES_PER_PACK) {
-            packed_lo |= PackedElement(bf16_bits) << (16 * vec_offset);
-          } else {
-            packed_hi |= PackedElement(bf16_bits) << (16 * (vec_offset - BF16_VALUES_PER_PACK));
-          }
-        }
-      }
-      gPacked(2 * i) = packed_lo;
-      gPacked(2 * i + 1) = packed_hi;
+    const PackedElement scale_word =
+        valid_token ? *reinterpret_cast<const PackedElement*>(token.scales) : PackedElement(0);
+
+    PackedElement packed_nope[NOPE_ITERS];
+    CUTE_UNROLL
+    for (int u = 0; u < NOPE_ITERS; ++u) {
+      const int i = lane_id + u * SUBGROUP_SIZE;
+      packed_nope[u] = (valid_token && i < NOPE_PACKS) ? sNope(i) : PackedElement(0);
+    }
+    PackedElement packed_rope[ROPE_ITERS];
+    CUTE_UNROLL
+    for (int u = 0; u < ROPE_ITERS; ++u) {
+      const int j = lane_id + u * SUBGROUP_SIZE;
+      packed_rope[u] = (valid_token && j < ROPE_PACKS) ? sRope(j) : PackedElement(0);
     }
 
-    // RoPE: already bf16 -- a straight packed copy into the tail of the row.
-    CUTE_NO_UNROLL
-    for (int j = lane_id; j < ROPE_PACKS; j += SUBGROUP_SIZE) {
-      gPacked(ROPE_PACK_BASE + j) = valid_token ? sRope(j) : PackedElement(0);
+    // Dequantize and store the NoPE portion of the token.
+    dequantize_and_store_nope(gOut, packed_nope, scale_word, lane_id);
+
+    // RoPE: already bf16 -- a straight packed copy into the tail of the row, from the
+    // registers staged above.
+    CUTE_UNROLL
+    for (int u = 0; u < ROPE_ITERS; ++u) {
+      const int j = lane_id + u * SUBGROUP_SIZE;
+      if (j < ROPE_PACKS) {
+        gPacked(ROPE_PACK_BASE + j) = packed_rope[u];
+      }
     }
   }
 
-  // Locate one token inside the paged pool: page block, then the block's data
-  // section (page_block_size records of SPARSE_MLA_FP8_DATA_BYTES_PER_TOKEN) followed
-  // by its scale section (page_block_size records of SPARSE_MLA_FP8_SCALE_BYTES_PER_TOKEN).
   CUTLASS_DEVICE
-  static TokenRecord
-  locate_token(const uint8_t* active_kv, int token_idx, int active_page_block_size, int active_stride_kv_block) {
-    const int block_idx = token_idx / active_page_block_size;
-    const int rel_idx = token_idx - block_idx * active_page_block_size;
+  static TokenRecord locate_token(
+      const uint8_t* active_kv,
+      int token_idx,
+      cutlass::FastDivmod const& active_page_block_divmod,
+      int active_stride_kv_block) {
+    const int active_page_block_size = active_page_block_divmod.divisor;
+    int block_idx, rel_idx;
+    active_page_block_divmod(block_idx, rel_idx, token_idx);
     const uint8_t* block = active_kv + block_idx * active_stride_kv_block;
     const uint8_t* record = block + rel_idx * SPARSE_MLA_FP8_DATA_BYTES_PER_TOKEN;
 
@@ -277,6 +283,8 @@ struct DecodeFp8PagedSource {
     const int active_num_blocks = is_extra ? params.extra_num_blocks : params.num_blocks;
     const int active_page_block_size = is_extra ? params.extra_page_block_size : params.page_block_size;
     const int active_stride_kv_block = is_extra ? params.stride_extra_kv_block : params.stride_kv_block;
+    cutlass::FastDivmod const& active_page_block_divmod =
+        is_extra ? params.extra_page_block_divmod : params.page_block_divmod;
 
     bool valid_token = false;
     int token_idx = -1;
@@ -286,11 +294,9 @@ struct DecodeFp8PagedSource {
       valid_token = token_idx >= 0 && token_idx < active_num_blocks * active_page_block_size;
     }
 
-    // Invalid tokens keep null section pointers: the stores below zero-fill the row
-    // without ever reading the source, so 0 * NaN can never pollute Stage 2.
     TokenRecord token{nullptr, nullptr, nullptr};
     if (valid_token) {
-      token = locate_token(active_kv, token_idx, active_page_block_size, active_stride_kv_block);
+      token = locate_token(active_kv, token_idx, active_page_block_divmod, active_stride_kv_block);
     }
 
     if (is_packed_aligned<PackedElement>(token.nope, raw_pointer_cast(gRow.data()))) {
@@ -312,20 +318,16 @@ struct PrefillDenseBf16Source {
   using GatherParams = PrefillGather2StageParams;
 
   static constexpr int SUBGROUP_SIZE = intel::sg_size;
-  // Coalesced packed copy: 4 bf16 (== 8 bytes) per lane per step.
-  static constexpr int BF16_VALUES_PER_PACK = 4;
-  using PackedElement = uint64_t;
-  // Dense bf16 KV: D_QK is 512 (latent) or 576 (nope-512 + rope-64). Both tile
-  // evenly over one subgroup's packed span (16 lanes x 4 bf16 = 64): 512/64=8,
-  // 576/64=9. The whole D_QK row is copied verbatim (V uses its first-512 sub-view
-  // downstream), so no nope/rope split is needed here.
+  static constexpr int BF16_VALUES_PER_PACK = 8;
+  using PackedElement = intel::ushort8;
   static_assert(D_QK == 512 || D_QK == 576, "sparse prefill supports dense bf16 D_QK in {512, 576}");
-  static_assert(D_QK % (SUBGROUP_SIZE * BF16_VALUES_PER_PACK) == 0, "D_QK must tile evenly over packed lanes");
+  static_assert(D_QK % BF16_VALUES_PER_PACK == 0, "D_QK must tile evenly over one lane's packed chunk");
   static_assert(
       sizeof(PackedElement) == sizeof(cutlass::bfloat16_t) * BF16_VALUES_PER_PACK,
       "PackedElement must cover one bf16 lane chunk");
-  // Chunk count once a row is viewed as PackedElements.
+
   static constexpr int ROW_PACKS = D_QK / BF16_VALUES_PER_PACK;
+  static constexpr int ROW_ITERS = cute::ceil_div(ROW_PACKS, SUBGROUP_SIZE);
 
   // Per-(batch, seq) invariants hoisted out of the topk-column loop: the index
   // pointer and (optional) topk-length cap for the single dense pool.
@@ -349,15 +351,22 @@ struct PrefillDenseBf16Source {
     return make_tensor(make_gmem_ptr(row), make_layout(Shape<Int<D_QK>>{}, Stride<_1>{}));
   }
 
-  // Copy one dense bf16 KV row (D_QK wide) into the gathered tile, 4 bf16 per lane
-  // per step. Zero-fills invalid tokens so 0 * NaN can never pollute Stage 2.
   template <class TensorGRow, class TensorSRow>
   CUTLASS_DEVICE static void copy_token_packed(TensorGRow&& gRow, TensorSRow&& sRow, bool valid_token, int lane_id) {
     auto gPacked = recast<PackedElement>(gRow);
     auto sPacked = recast<PackedElement>(sRow);
-    CUTE_NO_UNROLL
-    for (int i = lane_id; i < ROW_PACKS; i += SUBGROUP_SIZE) {
-      gPacked(i) = valid_token ? sPacked(i) : PackedElement(0);
+    PackedElement staged[ROW_ITERS];
+    CUTE_UNROLL
+    for (int u = 0; u < ROW_ITERS; ++u) {
+      const int i = lane_id + u * SUBGROUP_SIZE;
+      staged[u] = (valid_token && i < ROW_PACKS) ? sPacked(i) : PackedElement(0);
+    }
+    CUTE_UNROLL
+    for (int u = 0; u < ROW_ITERS; ++u) {
+      const int i = lane_id + u * SUBGROUP_SIZE;
+      if (i < ROW_PACKS) {
+        gPacked(i) = staged[u];
+      }
     }
   }
 
@@ -408,9 +417,6 @@ class SparseGatherKernel {
  public:
   using Source = SourcePolicyTmpl<D_QK>;
 
-  // Stage 1 is a standalone kernel with its own Params: the source policy's gather
-  // params (decode or prefill child). It has no dependency on the Stage-2 dense
-  // kernel's params -- the two stages meet only at the gathered-KV HBM buffers.
   using GatherParams = typename Source::GatherParams;
   using Arguments = GatherParams;
   using KernelArguments = GatherParams;
@@ -423,18 +429,9 @@ class SparseGatherKernel {
 
   using TileScheduler = XeMlaSparseGather2StageTileScheduler<B_TOPK>;
 
-  // Gather uses no SLM: each subgroup owns a whole topk row, so there is nothing to
-  // exchange. The empty SharedStorage is kept to match the collective/kernel
-  // convention; SharedStorageSize stays 0 so the launcher requests no SLM.
   struct SharedStorage {};
   static constexpr int SharedStorageSize = 0;
 
-  // Host-side contract for the device::MLASparse runner, mirroring what the split-KV
-  // reduction companion provides to device::MLA (kernel/xe_mla_reduce_split_kv.hpp):
-  // Arguments == Params (nothing to transform). Unlike that companion, this stage does
-  // own a workspace -- the gathered-KV tile + valid mask it writes -- but it receives
-  // those buffers through its params pointers, not the opaque blob, so
-  // initialize_workspace stays a no-op; see get_workspace_size below.
   static Params to_underlying_arguments(Arguments const& args, void* /* workspace */) {
     return args;
   }
@@ -447,12 +444,7 @@ class SparseGatherKernel {
   // Stage 1 is NOT workspace-free: its outputs are the dense gathered-KV tile
   // ([b, s_q, gathered_topk, D_QK] bf16) plus the int32 valid mask
   // ([b, s_q, gathered_topk]), and those buffers are exactly this kernel's
-  // workspace. The buffers are handed in through the params pointers
-  // (gathered_k / gathered_valid_mask) rather than the opaque blob, but their size
-  // is this kernel's business, so the host asks for it here (via the runner's
-  // MLASparse::get_workspace_size) instead of recomputing the layout -- see the
-  // batch chunking against DECODE_GATHERED_K_MAX_BYTES in
-  // device/mla_sparse_decode_2stage_types.hpp.
+  // workspace.
   static size_t get_workspace_size(Arguments const& args) {
     const size_t rows = size_t(args.b) * size_t(args.s_q) * size_t(args.gathered_topk);
     return rows * (size_t(D_QK) * sizeof(cutlass::bfloat16_t) + sizeof(int));
@@ -462,7 +454,6 @@ class SparseGatherKernel {
     return cutlass::Status::kSuccess;
   }
 
-  // launch<> contract. The scheduler owns the grid, as in XeMlaReduceSplitKV.
   static dim3 get_grid_shape(Params const& params) {
     return TileScheduler::get_grid_shape(params);
   }
@@ -477,10 +468,9 @@ class SparseGatherKernel {
     const int sg_id = thr_id / SUBGROUP_SIZE;
     const int lane_id = thr_id % SUBGROUP_SIZE;
 
-    // Stage-1 outputs as cute tensors. The gathered tile is laid out d-major (mode 0
-    // is the static D_QK with unit stride) so one topk column is a contiguous D_QK
-    // span -- that is what the policies' packed copies walk, and what lets them
-    // recast the row to a wider element.
+    // The gathered tile is laid out d-major (mode 0 is the static D_QK with unit stride)
+    // so one topk column is a contiguous D_QK span -- that is what the policies'
+    // packed copies walk, and what lets them recast the row to a wider element.
     Tensor mK = make_tensor(
         make_gmem_ptr(params.gathered_k),
         make_layout(
@@ -497,10 +487,6 @@ class SparseGatherKernel {
     for (TileScheduler tile_scheduler{params}; tile_scheduler.is_valid(); ++tile_scheduler) {
       auto [batch_idx, seq_idx, topk_block_idx] = tile_scheduler.get_block_coord();
 
-      // This work-group's (batch, seq) slice of the gathered tile: (D_QK, gathered_topk).
-      // Sliced by coordinate rather than local_tile'd into B_TOPK blocks, because
-      // gathered_topk is dynamic and need not be a multiple of B_TOPK -- the loop below
-      // bounds-checks the last, partial block instead.
       Tensor gK = mK(_, _, seq_idx, batch_idx);
       const int topk_base = topk_block_idx * B_TOPK;
 
@@ -522,10 +508,6 @@ class SparseGatherKernel {
   }
 };
 
-// Per-path entry points with the `template <int> class` (D_QK-keyed) interface the
-// Stage-2 config struct's GatherKernelTmpl param selects on. The config resolves one of
-// these as MlaSparseDecode2StageXe::GatherKernel and passes it to device::MLASparse as
-// the companion kernel.
 template <int D_QK>
 using SparseDecodeGatherDequantKernel = SparseGatherKernel<D_QK, DecodeFp8PagedSource>;
 

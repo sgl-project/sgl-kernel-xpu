@@ -344,6 +344,9 @@ inline typename T::Fmla::Arguments args_from_options_2stage(
   // --- Epilogue slice: reduce / normalize / LSE / attn_sink (no max_logits for decode). ---
   auto& ep = params.epilogue;
   ep.h_q = h_q;
+  ep.b = b;
+  ep.s_q = s_q;
+  ep.num_kv_splits = num_kv_splits;
   ep.sm_scale_div_log2 = sm_scale_div_log2;
   ep.lse = reinterpret_cast<float*>(lse_out.data_ptr());
   ep.stride_lse_b = to_int_stride(lse_out.stride(0));
@@ -375,6 +378,8 @@ inline typename T::Fmla::Arguments args_from_options_2stage(
   g.extra_num_blocks = extra_num_blocks;
   g.extra_page_block_size = extra_page_block_size;
   g.extra_topk = extra_topk;
+  g.page_block_divmod = cutlass::FastDivmod(std::max(1, page_block_size));
+  g.extra_page_block_divmod = cutlass::FastDivmod(std::max(1, extra_page_block_size));
   g.kv = reinterpret_cast<uint8_t*>(k_cache.data_ptr());
   g.stride_kv_block = to_int_stride(k_cache.stride(0));
   g.extra_kv = has_extra ? reinterpret_cast<uint8_t*>(extra_k_cache.value().data_ptr()) : nullptr;
@@ -551,6 +556,7 @@ inline void runMlaSparse2StageImpl(
   for (int b0 = 0; b0 < b; b0 += chunk_b) {
     const int cb = std::min(chunk_b, b - b0);
     params.kernel.shape.b = cb;
+    params.epilogue.b = cb;  // keep the epilogue's lse / stat layout extent in step with the chunk
     gather_args.b = cb;
 
     void* q_ptr = batch_base(q, b0);

@@ -256,6 +256,10 @@ inline typename T::Fmla::Arguments args_from_options_prefill_2stage(
   //     max_logits are [s_q, h_q]; the row is the mapped batch, s_q stride is 0. ---
   auto& ep = params.epilogue;
   ep.h_q = h_q;
+  ep.b = shape.b;
+  ep.s_q = shape.s_q;
+  // Prefill is never split-K (no o_accum), so num_kv_splits stays 1 and the split-stat
+  // path is compiled out; b / s_q feed the lse / max_logits [b, s_q, h_q] views.
   ep.sm_scale_div_log2 = sm_scale_div_log2;
   ep.lse = reinterpret_cast<float*>(lse.data_ptr());
   ep.stride_lse_b = to_int_stride(lse.stride(0));
@@ -400,6 +404,7 @@ inline void runMlaSparsePrefill2StageImpl(
   for (int r0 = 0; r0 < s_q; r0 += chunk_rows) {
     const int cr = std::min(chunk_rows, s_q - r0);
     params.kernel.shape.b = cr;
+    params.epilogue.b = cr;  // keep the epilogue's lse / max_logits layout extent in step with the chunk
     gather_args.b = cr;
 
     void* q_ptr = row_base(q, r0);

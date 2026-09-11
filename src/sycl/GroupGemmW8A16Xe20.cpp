@@ -77,7 +77,7 @@ DECLARE_XE20_MOE_FP8_W8A16_ALL_SCALE_VARIANTS(Tile_128_128_16, SG_4_2_1)
   Xe20MoEGEMMFp8W8A16Launcher<__VA_ARGS__, WeightScaleBlocked>( \
       queue,                                                    \
       activations.data_ptr(),                                   \
-      weights.data_ptr(),                                       \
+      weights_col.data_ptr(),                                   \
       weight_scales.data_ptr(),                                 \
       bias_ptr,                                                 \
       output.data_ptr(),                                        \
@@ -155,26 +155,43 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_fp8_w8a16(
   if (weight_scales.dim() == 2) {
     TORCH_CHECK(weight_scales.size(1) == 1 || weight_scales.size(1) == 2, "W8A16 scale count must be 1 or 2");
   }
-  TORCH_CHECK(n_experts > 0 && n_experts % 8 == 0, "n_experts must be a positive multiple of 8");
+  TORCH_CHECK(n_experts > 0, "n_experts must be positive");
   TORCH_CHECK(activations.dim() == 2, "W8A16 activations must be 2D [M_total, K]");
-  TORCH_CHECK(weights.dim() == 3, "W8A16 weights must be 3D [E, N, K]");
+  TORCH_CHECK(weights.dim() == 3, "W8A16 weights must be 3D [E, K, N]");
   TORCH_CHECK(output.dim() == 2, "W8A16 output must be 2D [M_total, N]");
-  TORCH_CHECK(weights.size(0) == n_experts, "weights expert dimension mismatch");
+
+  int total_m = static_cast<int>(activations.size(0));
+  int gemm_k = static_cast<int>(activations.size(1));
+  int gemm_n = static_cast<int>(output.size(1));
+
+  at::Tensor weights_col;
+  if (weights.size(1) == gemm_k && weights.size(2) == gemm_n) {
+    weights_col = weights.is_contiguous() ? weights : weights.contiguous();
+  } else if (weights.size(1) == gemm_n && weights.size(2) == gemm_k) {
+    weights_col = weights.transpose(1, 2).contiguous();
+  } else {
+    TORCH_CHECK(
+        false,
+        "W8A16 weights shape mismatch with activations K=",
+        gemm_k,
+        " and output N=",
+        gemm_n,
+        ", got weights shape: ",
+        weights.sizes());
+  }
+
+  TORCH_CHECK(weights_col.size(0) == n_experts, "weights expert dimension mismatch");
   TORCH_CHECK(weight_scales.size(0) == n_experts, "weight scales expert dimension mismatch");
   TORCH_CHECK(
       total_rows_for_experts.dim() == 1 && total_rows_for_experts.size(0) == n_experts, "rows_for_experts must be [E]");
   TORCH_CHECK(total_rows_for_experts.scalar_type() == at::ScalarType::Int, "rows_for_experts must be int32");
-  TORCH_CHECK(weights.size(2) == activations.size(1), "W8A16 K dimension mismatch");
   TORCH_CHECK(
-      activations.is_contiguous() && weights.is_contiguous() && weight_scales.is_contiguous(),
-      "W8A16 tensors must be contiguous");
-  TORCH_CHECK(weights.size(1) % 64 == 0 && weights.size(2) % 32 == 0, "W8A16 N must be divisible by 64 and K by 32");
+      activations.is_contiguous() && weights_col.is_contiguous() && weight_scales.is_contiguous(),
+      "W8A16 activations, weights, and weight_scales must be contiguous");
+  TORCH_CHECK(gemm_n % 64 == 0 && gemm_k % 32 == 0, "W8A16 N must be divisible by 64 and K by 32");
 
-  int total_m = static_cast<int>(activations.size(0));
-  int gemm_k = static_cast<int>(activations.size(1));
-  int gemm_n = static_cast<int>(weights.size(1));
   int avg_m = total_m / static_cast<int>(n_experts);
-  int ld_b = static_cast<int>(weights.stride(1));
+  int ld_b = static_cast<int>(weights_col.stride(1));
   int scale_count = weight_scales.dim() == 2 ? static_cast<int>(weight_scales.size(1)) : 3;
   bool weight_scale_blocked = weight_scales.dim() == 3;
   bool static_scheduler = total_m <= n_experts || (!weight_scale_blocked && gemm_k <= 128);
@@ -184,7 +201,9 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_fp8_w8a16(
         gemm_k % 128 == 0 && weight_scales.size(2) == gemm_k / 128, "W8A16 block scale K dimension must be K/128");
   }
   TORCH_CHECK(output.size(0) == total_m, "output rows must equal M_total");
-  TORCH_CHECK(output.size(1) == gemm_n, "output must have the same columns as weights");
+  if (bias.has_value()) {
+    TORCH_CHECK(bias->size(0) == n_experts && bias->size(1) == gemm_n, "bias shape must be [E, N]");
+  }
   if (bias.has_value()) {
     TORCH_CHECK(bias->size(0) == n_experts && bias->size(1) == gemm_n, "bias shape must be [E, N]");
   }

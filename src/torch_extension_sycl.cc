@@ -195,6 +195,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int num_layers, int block_quota, int sgs_per_wg) -> ()");
   m.impl("transfer_kv_all_layer_mla_lf_pf", torch::kXPU, &transfer_kv_all_layer_mla_lf_pf);
 
+  // Mamba HiCache state transfer (single fused copy per page; no K/V split)
+  m.def(
+      "transfer_kv_mamba_pf_lf(Tensor src, Tensor(a!) dst, "
+      "Tensor src_indices, Tensor dst_indices, int layer_id, int item_size, int src_layout_dim) -> ()");
+  m.impl("transfer_kv_mamba_pf_lf", torch::kXPU, &transfer_kv_mamba_pf_lf);
+
+  m.def(
+      "transfer_kv_mamba_lf_pf(Tensor src_layers, Tensor(a!) dst, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, int num_layers) -> ()");
+  m.impl("transfer_kv_mamba_lf_pf", torch::kXPU, &transfer_kv_mamba_lf_pf);
+
 #ifdef USE_MOE
   m.def(
       "moe_fused_gate(Tensor input, Tensor? bias, int num_expert_group, int topk_group, int topk, int "

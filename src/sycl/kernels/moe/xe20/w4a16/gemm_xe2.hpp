@@ -222,7 +222,8 @@ CUTE_DEVICE void xe_gemm_4bits(
   // MXFP4 without zero points is dequantized inside the E2M1 -> BF16 reorder,
   // which ends in a multiply anyway; see mxfp4_dequant.hpp. Everything else needs
   // the separate pass over the B fragment further down.
-  static constexpr bool kFuseDequant = std::is_same_v<TB, float_e2m1_t> && std::is_same_v<TA, bfloat16_t> && !HasZero;
+  static constexpr bool kFuseDequant =
+      std::is_same_v<TB, float_e2m1_t> && std::is_same_v<TA, bfloat16_t> && !HasZero && kMxfp4FoldedSupported;
 
   // The multipliers a reorder chunk needs, from the chunk's first value index:
   // the fragment's innermost mode alternates between the two columns a work-item

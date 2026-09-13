@@ -195,6 +195,28 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int num_layers, int block_quota, int sgs_per_wg) -> ()");
   m.impl("transfer_kv_all_layer_mla_lf_pf", torch::kXPU, &transfer_kv_all_layer_mla_lf_pf);
 
+  // Mamba state transfer ops (Tier 2: 64 KB - 16 MB per token)
+  m.def(
+      "transfer_mamba_state(Tensor src, Tensor(a!) dst, "
+      "Tensor src_indices, Tensor dst_indices, int item_size) -> ()");
+  m.impl("transfer_mamba_state", torch::kXPU, &transfer_mamba_state);
+
+  m.def(
+      "transfer_mamba_state_all_layer(Tensor src_layers, Tensor(a!) dst_layers, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int num_layers) -> ()");
+  m.impl("transfer_mamba_state_all_layer", torch::kXPU, &transfer_mamba_state_all_layer);
+
+  m.def(
+      "transfer_mamba_state_all_layer_lf_pf(Tensor src_layers, Tensor(a!) dst, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, "
+      "int num_layers) -> ()");
+  m.impl("transfer_mamba_state_all_layer_lf_pf", torch::kXPU, &transfer_mamba_state_all_layer_lf_pf);
+
+  m.def(
+      "transfer_mamba_state_per_layer_pf_lf(Tensor src, Tensor(a!) dst, "
+      "Tensor src_indices, Tensor dst_indices, int layer_id, int item_size, int src_layout_dim) -> ()");
+  m.impl("transfer_mamba_state_per_layer_pf_lf", torch::kXPU, &transfer_mamba_state_per_layer_pf_lf);
+
 #ifdef USE_MOE
   m.def(
       "moe_fused_gate(Tensor input, Tensor? bias, int num_expert_group, int topk_group, int topk, int "

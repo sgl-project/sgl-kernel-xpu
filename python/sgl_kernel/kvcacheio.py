@@ -314,6 +314,91 @@ def transfer_kv_all_layer_mla_lf_pf(
 
 
 # ---------------------------------------------------------------------------
+# Group A2: Mamba state transfer ops (Tier 2: 64 KB - 16 MB items)
+# ---------------------------------------------------------------------------
+# These use work-group cooperative copy instead of sub-group parallelism,
+# designed for large Mamba temporal states (~1-8 MB per token).
+
+
+def transfer_mamba_state(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+) -> None:
+    """Single-layer lf→lf transfer for Mamba state (large item_size)."""
+    torch.ops.sgl_kernel.transfer_mamba_state.default(
+        src,
+        dst,
+        src_indices,
+        dst_indices,
+        item_size,
+    )
+
+
+def transfer_mamba_state_all_layer(
+    src_layers: torch.Tensor,
+    dst_layers: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    num_layers: int,
+) -> None:
+    """All-layer lf_tbl→lf_tbl transfer for Mamba state."""
+    torch.ops.sgl_kernel.transfer_mamba_state_all_layer.default(
+        src_layers,
+        dst_layers,
+        src_indices,
+        dst_indices,
+        item_size,
+        num_layers,
+    )
+
+
+def transfer_mamba_state_all_layer_lf_pf(
+    src_layers: torch.Tensor,
+    dst: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    dst_layout_dim: int,
+    num_layers: int,
+) -> None:
+    """All-layers lf_tbl → page-first transfer for Mamba state."""
+    torch.ops.sgl_kernel.transfer_mamba_state_all_layer_lf_pf.default(
+        src_layers,
+        dst,
+        src_indices,
+        dst_indices,
+        item_size,
+        dst_layout_dim,
+        num_layers,
+    )
+
+
+def transfer_mamba_state_per_layer_pf_lf(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    layer_id: int,
+    item_size: int,
+    src_layout_dim: int,
+) -> None:
+    """Single-layer page-first → lf transfer for Mamba state."""
+    torch.ops.sgl_kernel.transfer_mamba_state_per_layer_pf_lf.default(
+        src,
+        dst,
+        src_indices,
+        dst_indices,
+        layer_id,
+        item_size,
+        src_layout_dim,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Group B: Python/PyTorch fallbacks (host↔device; no equivalent of
 # cudaMemcpyBatchAsync on XPU — use PyTorch copy_ page-by-page).
 # ---------------------------------------------------------------------------

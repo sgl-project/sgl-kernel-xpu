@@ -14,6 +14,10 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer_mla,
     transfer_kv_per_layer_mla_pf_lf,
     transfer_kv_per_layer_pf_lf,
+    transfer_mamba_state,
+    transfer_mamba_state_all_layer,
+    transfer_mamba_state_all_layer_lf_pf,
+    transfer_mamba_state_per_layer_pf_lf,
 )
 
 from sglang.srt.utils import is_hip
@@ -956,6 +960,298 @@ def test_transfer_kv_page_head_rejects_unaligned_heads():
             page_size=1,
             head_num=2,
         )
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("item_size_bytes", [
+    512,     # Typical KV cache (256 elements × 2 bytes)
+    1024,    # Larger attention head
+    8192,    # Upper bound of typical KV
+    65536,   # 64 KB boundary - kernel design limit
+    # 1048576,  # 1 MB - would timeout (commented out)
+    # 3145728,  # Mamba temporal state (~3 MB) - would timeout (commented out)
+])
+@pytest.mark.parametrize("num_items", [1, 16])
+def test_transfer_kv_large_item_size(dtype: torch.dtype, item_size_bytes: int, num_items: int):
+    """Test kernel behavior with varying item_size values.
+
+    Regression test for Mamba + HiCache DEVICE_LOST bug. The kernel was originally
+    designed for KV cache (item_size ~512 bytes) but was called with Mamba states
+    (item_size ~3 MB), causing the kernel's inner loop to run 24,576+ iterations
+    per lane and triggering a GPU watchdog timeout.
+
+    Known limits:
+    - item_size <= 64 KB: Kernel completes in ~1 ms, safe
+    - item_size = 1 MB: Kernel runs ~50+ ms, may timeout on strict TDR
+    - item_size = 3 MB: Kernel runs 200+ ms, guaranteed DEVICE_LOST on XPU
+
+    For item_size > 64 KB, callers should use PyTorch copy_ fallback or a
+    chunked transfer approach instead of this kernel.
+
+    See: docs/mamba-hicache-device-lost-root-cause.md
+    """
+    original_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+
+    torch.manual_seed(42)
+
+    # item_size in elements (kernel takes bytes, we compute from dtype)
+    item_size_elements = item_size_bytes // dtype.itemsize
+    total_pool_size = 256
+
+    # Create pools
+    src_pool = torch.randn(total_pool_size, item_size_elements).pin_memory()
+    dst_pool_ref = torch.zeros(total_pool_size, item_size_elements, device=device)
+    dst_pool_kernel = torch.zeros_like(dst_pool_ref)
+
+    # Select random indices
+    indices = torch.randperm(total_pool_size, dtype=torch.int64)[:num_items]
+    src_indices = indices.to(device)
+    dst_indices = indices.to(device)
+
+    # Reference implementation
+    for si, di in zip(indices.tolist(), indices.tolist()):
+        dst_pool_ref[di] = src_pool[si].to(device)
+
+    # Kernel implementation
+    transfer_kv_per_layer_mla(
+        src=src_pool,
+        dst=dst_pool_kernel,
+        src_indices=src_indices,
+        dst_indices=dst_indices,
+        item_size=item_size_bytes,
+    )
+    torch.accelerator.synchronize()
+
+    # Verify
+    torch.testing.assert_close(dst_pool_kernel, dst_pool_ref)
+
+    torch.set_default_dtype(original_dtype)
+
+
+# =============================================================================
+# Mamba State Transfer Kernel Tests (Tier 2: 64 KB - 16 MB)
+# =============================================================================
+# HiCache uses three transfer directions for Mamba states:
+#   - Device→Host (backup/write from L1 device to L2 host pinned)
+#   - Host→Device (restore/read from L2 host pinned to L1 device)
+#   - Device→Device (for L1 internal operations, less common)
+
+
+@pytest.mark.skipif(is_hip(), reason="HIP is not supported for this test")
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("num_items", [1, 8, 32])
+@pytest.mark.parametrize("item_size_bytes", [524288, 1048576])  # 512 KB, 1 MB
+def test_transfer_mamba_state_device_to_device(
+    dtype: torch.dtype,
+    num_items: int,
+    item_size_bytes: int,
+):
+    """Test Mamba state transfer: Device → Device (L1 internal)."""
+    torch.manual_seed(42)
+    item_size_elements = item_size_bytes // dtype.itemsize
+    pool_size = 128
+
+    src = torch.randn(pool_size, item_size_elements, dtype=dtype, device=device)
+    dst = torch.zeros_like(src)
+
+    indices = torch.randperm(pool_size, dtype=torch.int64, device=device)[:num_items]
+
+    # Reference
+    dst_ref = dst.clone()
+    for i in indices.tolist():
+        dst_ref[i] = src[i]
+
+    transfer_mamba_state(src, dst, indices, indices, item_size=item_size_bytes)
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(dst, dst_ref)
+
+
+@pytest.mark.skipif(is_hip(), reason="HIP is not supported for this test")
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("num_items", [1, 8, 32])
+@pytest.mark.parametrize("item_size_bytes", [524288, 1048576])  # 512 KB, 1 MB
+def test_transfer_mamba_state_device_to_host(
+    dtype: torch.dtype,
+    num_items: int,
+    item_size_bytes: int,
+):
+    """Test Mamba state transfer: Device → Host (HiCache backup/write L1→L2)."""
+    torch.manual_seed(42)
+    item_size_elements = item_size_bytes // dtype.itemsize
+    pool_size = 128
+
+    src_dev = torch.randn(pool_size, item_size_elements, dtype=dtype, device=device)
+    dst_host = torch.zeros(pool_size, item_size_elements, dtype=dtype).pin_memory()
+
+    indices = torch.randperm(pool_size, dtype=torch.int64, device=device)[:num_items]
+
+    # Reference
+    dst_ref = dst_host.clone()
+    for i in indices.tolist():
+        dst_ref[i] = src_dev[i].cpu()
+
+    transfer_mamba_state(src_dev, dst_host, indices, indices, item_size=item_size_bytes)
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(dst_host, dst_ref)
+
+
+@pytest.mark.skipif(is_hip(), reason="HIP is not supported for this test")
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("num_items", [1, 8, 32])
+@pytest.mark.parametrize("item_size_bytes", [524288, 1048576])  # 512 KB, 1 MB
+def test_transfer_mamba_state_host_to_device(
+    dtype: torch.dtype,
+    num_items: int,
+    item_size_bytes: int,
+):
+    """Test Mamba state transfer: Host → Device (HiCache restore/read L2→L1)."""
+    torch.manual_seed(42)
+    item_size_elements = item_size_bytes // dtype.itemsize
+    pool_size = 128
+
+    src_host = torch.randn(pool_size, item_size_elements, dtype=dtype).pin_memory()
+    dst_dev = torch.zeros(pool_size, item_size_elements, dtype=dtype, device=device)
+
+    indices = torch.randperm(pool_size, dtype=torch.int64, device=device)[:num_items]
+
+    # Reference
+    dst_ref = dst_dev.clone()
+    for i in indices.tolist():
+        dst_ref[i] = src_host[i].to(device)
+
+    transfer_mamba_state(src_host, dst_dev, indices, indices, item_size=item_size_bytes)
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(dst_dev, dst_ref)
+
+
+@pytest.mark.skipif(is_hip(), reason="HIP is not supported for this test")
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("num_items", [1, 16, 64])
+@pytest.mark.parametrize(
+    "item_size_bytes",
+    [
+        131072,   # 128 KB — small Mamba (mamba-1.4b)
+        1048576,  # 1 MB — Qwen3.6-35B Mamba (d_inner=2048, d_state=256)
+        1572864,  # 1.5 MB — Falcon-H1-1.5B Mamba (d_inner=3072, d_state=256)
+        3145728,  # 3 MB — Falcon-H1-7B equivalent
+    ],
+)
+def test_transfer_mamba_state(
+    dtype: torch.dtype,
+    num_items: int,
+    item_size_bytes: int,
+):
+    """
+    Test the new Mamba state transfer kernel designed for large item sizes.
+
+    This kernel uses work-group cooperative copy (256 work-items per token)
+    instead of sub-group parallelism (16 lanes per token) to handle
+    Mamba's large temporal state (~1-3 MB per token).
+
+    Model-derived shapes:
+    - Qwen3.6-35B: d_inner=2048, d_state=256, dtype=bf16 → 1 MB/token
+    - Falcon-H1-1.5B: d_inner=3072, d_state=256, dtype=bf16 → 1.5 MB/token
+    """
+    original_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+
+    torch.manual_seed(42)
+
+    item_size_elements = item_size_bytes // dtype.itemsize
+    total_pool_size = 256
+
+    src_pool = torch.randn(total_pool_size, item_size_elements).pin_memory()
+    dst_pool_ref = torch.zeros(total_pool_size, item_size_elements, device=device)
+    dst_pool_kernel = torch.zeros_like(dst_pool_ref)
+
+    indices = torch.randperm(total_pool_size, dtype=torch.int64)[:num_items]
+    src_indices = indices.to(device)
+    dst_indices = indices.to(device)
+
+    for si, di in zip(indices.tolist(), indices.tolist()):
+        dst_pool_ref[di] = src_pool[si].to(device)
+
+    transfer_mamba_state(
+        src=src_pool,
+        dst=dst_pool_kernel,
+        src_indices=src_indices,
+        dst_indices=dst_indices,
+        item_size=item_size_bytes,
+    )
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(dst_pool_kernel, dst_pool_ref)
+
+    torch.set_default_dtype(original_dtype)
+
+
+@pytest.mark.skipif(is_hip(), reason="HIP is not supported for this test")
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("num_items", [16])
+@pytest.mark.parametrize("num_layers", [4, 8])
+@pytest.mark.parametrize("item_size_bytes", [1048576])  # 1 MB — Qwen3.6-35B
+def test_transfer_mamba_state_all_layer(
+    dtype: torch.dtype,
+    num_items: int,
+    num_layers: int,
+    item_size_bytes: int,
+):
+    """Test multi-layer Mamba state transfer via layer pointer table."""
+    original_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+
+    torch.manual_seed(42)
+
+    item_size_elements = item_size_bytes // dtype.itemsize
+    total_pool_size = 256
+
+    src_pools = [
+        torch.randn(total_pool_size, item_size_elements).pin_memory()
+        for _ in range(num_layers)
+    ]
+    dst_pools = [
+        torch.zeros(total_pool_size, item_size_elements, device=device)
+        for _ in range(num_layers)
+    ]
+    dst_ref = [
+        torch.zeros(total_pool_size, item_size_elements, device=device)
+        for _ in range(num_layers)
+    ]
+
+    # Create pointer tensors on CPU first to avoid overflow when converting
+    # large unsigned device addresses. Kernel expects uint64.
+    src_ptrs = torch.tensor(
+        [p.data_ptr() for p in src_pools], dtype=torch.uint64
+    ).to(device)
+    dst_ptrs = torch.tensor(
+        [p.data_ptr() for p in dst_pools], dtype=torch.uint64
+    ).to(device)
+
+    indices = torch.randperm(total_pool_size, dtype=torch.int64)[:num_items]
+    src_indices = indices.to(device)
+    dst_indices = indices.to(device)
+
+    for layer in range(num_layers):
+        for si, di in zip(indices.tolist(), indices.tolist()):
+            dst_ref[layer][di] = src_pools[layer][si].to(device)
+
+    transfer_mamba_state_all_layer(
+        src_layers=src_ptrs,
+        dst_layers=dst_ptrs,
+        src_indices=src_indices,
+        dst_indices=dst_indices,
+        item_size=item_size_bytes,
+        num_layers=num_layers,
+    )
+    torch.accelerator.synchronize()
+
+    for layer in range(num_layers):
+        torch.testing.assert_close(dst_pools[layer], dst_ref[layer])
+
+    torch.set_default_dtype(original_dtype)
 
 
 if __name__ == "__main__":

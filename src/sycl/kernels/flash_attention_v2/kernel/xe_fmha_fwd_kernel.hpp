@@ -402,7 +402,14 @@ class XeFMHAFwdKernel {
         const int hi_kv_plus_one = q_tile_max_row_kv + params.mainloop.window_size_right + 1;
         blk_k0 = lo_kv / tile_k;
         blk_k1 = cute::min(k_blocks, cute::ceil_div(hi_kv_plus_one, tile_k));
-        if (blk_k0 >= blk_k1) continue;
+        if (blk_k0 >= blk_k1) {
+          if constexpr (LSE) {
+            blk_k0 = 0;
+            blk_k1 = 0;
+          } else {
+            continue;
+          }
+        }
       }
 
       int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;

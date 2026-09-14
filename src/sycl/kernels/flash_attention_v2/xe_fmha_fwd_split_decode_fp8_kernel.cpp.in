@@ -34,6 +34,11 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeFp8Runner<@QG_SZ@, @H
   // logits are not supported on the fp8 path.
   TORCH_CHECK(params.is_e4m3 || params.is_e5m2, "FmhaSplitDecodeFp8Runner requires an fp8 KV cache");
   TORCH_CHECK(!params.use_sink, "fp8 KV cache decode does not support sink logits");
+  // No /*LSE=*/true instantiation is compiled for the fp8 KV path (it would
+  // double this already heavy translation unit), so reject the request instead
+  // of leaving the caller's softmax_lse buffer unwritten.
+  TORCH_CHECK(
+      !params.return_softmax_lse, "return_softmax_lse is not supported with an fp8 KV cache (split decode)");
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     using QElement = @ELEM_TYPE@;
     if (params.is_e4m3) {

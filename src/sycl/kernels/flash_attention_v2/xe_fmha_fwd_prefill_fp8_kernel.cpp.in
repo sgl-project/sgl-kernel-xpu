@@ -30,6 +30,11 @@ __attribute__((visibility("default"))) void FmhaPrefillFp8Runner<@HEAD_DIM@, @EL
   TORCH_CHECK(params.is_e4m3 || params.is_e5m2, "FmhaPrefillFp8Runner requires an fp8 KV cache");
   TORCH_CHECK(
       params.softmax_sink_ptr == nullptr, "fp8 KV cache prefill does not support sink logits");
+  // No /*LSE=*/true instantiation is compiled for the fp8 KV path (it would
+  // double this already heavy translation unit), so reject the request instead
+  // of leaving the caller's softmax_lse buffer unwritten.
+  TORCH_CHECK(
+      !params.return_softmax_lse, "return_softmax_lse is not supported with an fp8 KV cache (prefill)");
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
       using QElement = @ELEM_TYPE@;

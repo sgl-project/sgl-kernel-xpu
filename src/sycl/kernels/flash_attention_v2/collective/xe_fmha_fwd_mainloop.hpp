@@ -518,7 +518,12 @@ struct FMHAFwdMainloop<
     int page_idx = blk_k0;
     int next_page_idx = blk_k0;
     if constexpr (PagedKV) {
-      next_page_idx = get_physical_k_tile(blk_k0, l_coord, seq_len_kv_cache);
+      // Only translate when a K block actually runs: for an empty range (a Q
+      // tile whose sliding window contains no K block, or an empty KV cache)
+      // the page table has no entry for blk_k0 to read.
+      if (blk_k0 < k_end) {
+        next_page_idx = get_physical_k_tile(blk_k0, l_coord, seq_len_kv_cache);
+      }
     }
     if constexpr (!(ScoreBlock2D && StaticScoreMode == 1)) {
       const int nQpf = InitPfDepth > 0 ? cute::min(int(size<3>(pQgQ)), InitPfDepth) : int(size<3>(pQgQ));

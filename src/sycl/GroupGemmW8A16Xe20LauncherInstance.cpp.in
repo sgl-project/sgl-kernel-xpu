@@ -30,7 +30,7 @@ void Xe20MoEGEMMFp8W8A16Launcher(
     const int num_experts,
     int* workspace,
     int ld_b_param,
-    int weight_scale_count,
+    int scale_mode,
     bool static_scheduler) {
   using ElementA = cutlass::bfloat16_t;
   using ElementD = cutlass::bfloat16_t;
@@ -66,7 +66,7 @@ void Xe20MoEGEMMFp8W8A16Launcher(
   typename Kernel::Params params{
       static_cast<const uint8_t*>(activations),
       static_cast<const uint8_t*>(weights),
-      static_cast<const float*>(weight_scales),
+      weight_scales,
       static_cast<const float*>(bias),
       static_cast<ElementD*>(outputs),
       num_rows_per_expert_device,
@@ -76,7 +76,7 @@ void Xe20MoEGEMMFp8W8A16Launcher(
       workspace,
       mma,
       static_cast<int32_t>(ld_b_param),
-      weight_scale_count,
+      scale_mode,
       static_scheduler};
   q.submit([&](sycl::handler& h) {
     sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), h);
@@ -109,7 +109,7 @@ template __attribute__((visibility("default"))) void Xe20MoEGEMMFp8W8A16Launcher
     int num_experts,
     int* workspace,
     int ld_b,
-    int weight_scale_count,
+    int scale_mode,
     bool static_scheduler) {
     Xe20MoEGEMMFp8W8A16Launcher<@TILE@, @SGLAYOUT@, @WEIGHT_SCALE_BLOCKED@>(
       *static_cast<sycl::queue*>(queue_ptr),
@@ -124,7 +124,7 @@ template __attribute__((visibility("default"))) void Xe20MoEGEMMFp8W8A16Launcher
       num_experts,
       workspace,
       ld_b,
-      weight_scale_count,
+      scale_mode,
       static_scheduler);
   }
   #endif

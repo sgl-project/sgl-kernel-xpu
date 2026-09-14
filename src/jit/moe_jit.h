@@ -68,7 +68,7 @@ bool w4a16_grouped_gemm_launch(
 // GroupGemmW8A16Xe20.cpp.
 bool fp8_w8a16_grouped_gemm_launch(
     int avg_m,
-    int scale_count,
+    int scale_mode,
     void* queue,
     const void* activations,
     const void* weights,

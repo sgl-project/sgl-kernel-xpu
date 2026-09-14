@@ -5,6 +5,7 @@
 #include "jit/jit_arch.h"
 #include "jit/sycl_template_jit.h"
 #include "sycl/kernels/moe/xe20/bf16/grouped_gemm_dispatch.h"
+#include "sycl/kernels/moe/xe20/w8a16/scale_mode.h"
 
 namespace sgl {
 namespace moe_jit {
@@ -291,17 +292,20 @@ constexpr Fp8TileCfg kFp8Tiles[] = {
     {"Shape<_128, _128, _16>", "Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>"},
 };
 
-int fp8_tile_id(int avg_m, int gemm_k, int gemm_n, int scale_count) {
-  if (scale_count == 3) {
+int fp8_tile_id(int avg_m, int gemm_k, int gemm_n, int scale_mode) {
+  using moe_w8a16::ScaleMode;
+  if (moe_w8a16::is_block_scale_mode(scale_mode)) {
     if (avg_m <= 4) return 0;
     if (avg_m >= 1024 || (avg_m > 128 && gemm_k >= 512 && gemm_n >= 512)) return 3;
     return 1;
   }
   if (avg_m <= 8) return 0;
   if (avg_m <= 32) return 1;
-  if (scale_count == 2 && avg_m <= 64 && gemm_k >= 2048) return 2;
-  if (scale_count == 1 && gemm_n <= 2048 && gemm_k >= 1024 && avg_m <= 128) return 1;
-  if (scale_count == 1 && gemm_n <= 2048 && gemm_k >= 1024 && avg_m <= 512) return 2;
+  if (scale_mode == static_cast<int>(ScaleMode::ScalarGateUp) && avg_m <= 64 && gemm_k >= 2048) return 2;
+  if (scale_mode == static_cast<int>(ScaleMode::ScalarSingle) && gemm_n <= 2048 && gemm_k >= 1024 && avg_m <= 128)
+    return 1;
+  if (scale_mode == static_cast<int>(ScaleMode::ScalarSingle) && gemm_n <= 2048 && gemm_k >= 1024 && avg_m <= 512)
+    return 2;
   return 3;
 }
 
@@ -347,7 +351,7 @@ Fp8W8A16Fn resolve_fp8_w8a16(int tile_id, bool block_scale, int arch, std::strin
 
 bool fp8_w8a16_grouped_gemm_launch(
     int avg_m,
-    int scale_count,
+    int scale_mode,
     void* queue,
     const void* activations,
     const void* weights,
@@ -363,8 +367,8 @@ bool fp8_w8a16_grouped_gemm_launch(
     bool static_scheduler,
     int arch,
     std::string* err) {
-  const int tile_id = fp8_tile_id(avg_m, gemm_k, gemm_n, scale_count);
-  Fp8W8A16Fn fn = resolve_fp8_w8a16(tile_id, scale_count == 3, arch, err);
+  const int tile_id = fp8_tile_id(avg_m, gemm_k, gemm_n, scale_mode);
+  Fp8W8A16Fn fn = resolve_fp8_w8a16(tile_id, moe_w8a16::is_block_scale_mode(scale_mode), arch, err);
   if (!fn) return false;
   fn(queue,
      activations,
@@ -378,7 +382,7 @@ bool fp8_w8a16_grouped_gemm_launch(
      num_experts,
      workspace,
      ld_b,
-     scale_count,
+     scale_mode,
      static_scheduler);
   return true;
 }

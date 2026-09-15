@@ -235,6 +235,7 @@ struct FMHAFwdMainloop<
   // User-facing arguments
   struct Arguments {
     ElementS const scale;
+    ElementS softcap = 0;  // logit soft-cap (0 = off); applied on natural-scale logits in softmax()
     int const* ptr_page_table = nullptr;
     int page_size = 0;
     int max_num_pages_per_seq = 0;
@@ -268,6 +269,7 @@ struct FMHAFwdMainloop<
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
     return Params{
         val,
+        args.softcap,
         args.ptr_page_table,
         args.page_size,
         args.max_num_pages_per_seq,
@@ -803,6 +805,19 @@ struct FMHAFwdMainloop<
       FragSRow& tS_sum,     // Softmax row-wise sum accumulator
       ElementS qk_scale) {  // Q*K scale (folds in fp8 K per-tensor scale_k)
 
+    // Logit soft-cap (Gemma2 attn_logit_softcapping): cap on the natural-scale logit.
+    // qk_scale folds in log2(e) for the exp2 softmax, so undo it, tanh-cap, re-fold.
+    // softcap == 0 -> identity, so the fused fast path is unchanged for non-softcap models.
+    const ElementS softcap = params.softcap;
+    const auto cap = [softcap](ElementS v) -> ElementS {
+      if (softcap > ElementS(0)) {
+        constexpr ElementS kLog2e = ElementS(1.4426950408889634074);
+        ElementS l = v / kLog2e;
+        return softcap * sycl::tanh(l / softcap) * kLog2e;
+      }
+      return v;
+    };
+
     /* Compute row-wise maxima for this block */
     auto tS_bmax = reduce<1>(tS, sycl::maximum{});
 
@@ -810,7 +825,7 @@ struct FMHAFwdMainloop<
     FragSRow rescale;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS_max.size(); i++) {
-      ElementS new_max = sycl::max(tS_max(i), qk_scale * tS_bmax(i));
+      ElementS new_max = sycl::max(tS_max(i), cap(qk_scale * tS_bmax(i)));
       rescale(i) = sycl::native::exp2(tS_max(i) - new_max);
       tS_max(i) = new_max;
     }
@@ -818,7 +833,7 @@ struct FMHAFwdMainloop<
     /* Scale S and subtract maxima, then exponentiate */
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS.size(); i++)
-      tS(i) = sycl::native::exp2(qk_scale * tS(i) - broadcast<0>(tS_max, tS, i));
+      tS(i) = sycl::native::exp2(cap(qk_scale * tS(i)) - broadcast<0>(tS_max, tS, i));
 
     /* Rescale existing S sums */
     if (!first_block) {
@@ -955,6 +970,7 @@ struct DecodeFwdMainloop<
   // User-facing arguments
   struct Arguments {
     ElementS const scale;
+    ElementS softcap = 0;  // logit soft-cap (0 = off); applied on natural-scale logits in softmax()
     // Paged KV Cache
     int const* ptr_page_table;
     int page_size;
@@ -987,6 +1003,7 @@ struct DecodeFwdMainloop<
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
     return Params{
         val,
+        args.softcap,
         args.ptr_page_table,
         args.page_size,
         args.max_pages_per_seq,
@@ -1301,6 +1318,19 @@ struct DecodeFwdMainloop<
       FragA& tA,            // O accumulator (for rescaling)
       ElementS qk_scale) {  // Q*K scale (folds in fp8 K per-tensor scale_k)
 
+    // Logit soft-cap (Gemma2 attn_logit_softcapping): cap on the natural-scale logit.
+    // qk_scale folds in log2(e) for the exp2 softmax, so undo it, tanh-cap, re-fold.
+    // softcap == 0 -> identity, so the fused fast path is unchanged for non-softcap models.
+    const ElementS softcap = params.softcap;
+    const auto cap = [softcap](ElementS v) -> ElementS {
+      if (softcap > ElementS(0)) {
+        constexpr ElementS kLog2e = ElementS(1.4426950408889634074);
+        ElementS l = v / kLog2e;
+        return softcap * sycl::tanh(l / softcap) * kLog2e;
+      }
+      return v;
+    };
+
     /* Compute row-wise maxima for this block */
     auto tS_bmax = reduce<1>(tS, sycl::maximum{});
 
@@ -1308,13 +1338,13 @@ struct DecodeFwdMainloop<
     auto tS_prev_max = tS_max;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS_max.size(); i++) {
-      tS_max(i) = sycl::max(tS_max(i), qk_scale * tS_bmax(i));
+      tS_max(i) = sycl::max(tS_max(i), cap(qk_scale * tS_bmax(i)));
     }
 
     /* Scale S and subtract maxima, then exponentiate */
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS.size(); i++)
-      tS(i) = sycl::native::exp2(qk_scale * tS(i) - broadcast<0>(tS_max, tS, i));
+      tS(i) = sycl::native::exp2(cap(qk_scale * tS(i)) - broadcast<0>(tS_max, tS, i));
 
     /* Rescale existing S sums and O accumulator */
     if (!first_block) {

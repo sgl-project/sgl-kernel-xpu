@@ -453,6 +453,7 @@ struct PrefillRunner {
         },
         {
             params.softmax_scale,
+            params.softcap,
             params.page_table,
             params.page_size,
             params.max_num_pages_per_seq,

@@ -1,4 +1,4 @@
-/* Copyright 2025 SGLang Team. All Rights Reserved.
+/* Copyright 2026 SGLang Team. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,6 +12,37 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+
+/*
+Build Tree kernel derives the tree topology metadata (positions, first-child/next-sibling links, attention mask)
+from the EAGLE draft model's output.
+
+Index space: the draft runs `depth` steps, each expanding every survivor into
+`topk` children, all concatenated into one flat "candidate table" of
+topk + (depth - 1) * topk^2 entries (eg. 52 for topk=4, depth=4).
+Every group of `topk` consecutive table entries (block) shares one parent.
+For topk=4: block 0 = table 0..3, the children of the root.
+
+Inputs:
+
+  selected_index[b][i] =  2-D int64 list, (bs, draft_token_num - 1): table index of each survivor
+  parent_list[b][j]    =  2-D int64 list, (bs, table_size / topk), or one flat list shared by every
+                          request: table index of the parent of a block of topk siblings
+
+Outputs:
+
+  positions             = flat int64 list, bs * draft_token_num long: seq_len + the node's level in the
+                          tree, so all siblings share one value
+  retrieve_next_token   = 2-D int64 list, (bs, draft_token_num): each node's lowest-numbered child as a
+                          node number (-1 if it has no children)
+  retrieve_next_sibling = 2-D int64 list, (bs, draft_token_num): the next node sharing this node's parent
+                          (-1 if it is the last of its siblings)
+
+  tree_mask             = flat bool list; row i holds the nodes node i may attend to: itself and its
+                          ancestors up to the root, all else false.
+                          QLEN_ONLY rows are draft_token_num wide (bs * draft_token_num^2 total);
+                          FULL_MASK rows are seq_len wider : sum(seq_len) * draft_token_num + bs * draft_token_num^2.
+*/
 
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
@@ -27,12 +58,16 @@ limitations under the License.
 namespace {
 
 enum class TreeMaskMode : int64_t {
+  // Rows span the whole KV window: [0, seq_len) prefix columns
   FULL_MASK = 0,
+  // Rows are just the qlen x qlen tree block.
   QLEN_ONLY = 1,
   QLEN_ONLY_BITPACKING = 2,
 };
 
 constexpr int32_t kParentNotFound = -1;
+
+// Above this, a node set no longer fits a uint64 bitmask -> scan fallback path.
 constexpr int32_t kBitmaskFastPathMaxNodes = 64;
 
 static_assert(sizeof(bool) == 1, "tree_mask pack stores assume 1-byte bool");
@@ -91,9 +126,10 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   }
 
   inline int32_t resolve_parent(const int64_t* sel_local, int64_t bid, int32_t node) const {
+    // Which topk-block of the candidate table this node came from.
     const int32_t parent_tb_idx = static_cast<int32_t>(sel_local[node - 1] / topk_);
     if (parent_tb_idx == 0) {
-      return 0;
+      return 0;  // block 0 is the first draft step: parent is the root
     }
     if (parent_tb_idx < 0 || parent_tb_idx >= parent_list_width_) {
       return kParentNotFound;
@@ -109,6 +145,8 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   }
 
   void operator()(sycl::nd_item<1> item) const {
+    // Grid is bs * row_blocks_ groups, request-major: groups
+    // [b*row_blocks_, (b+1)*row_blocks_) all serve request b and split its rows.
     const int64_t group_id = item.get_group(0);
     const int64_t bid = row_blocks_ == 1 ? group_id : group_id / row_blocks_;
     const int32_t blk = row_blocks_ == 1 ? 0 : static_cast<int32_t>(group_id % row_blocks_);
@@ -117,6 +155,7 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const int32_t num_nodes = draft_token_num_;
     const int64_t seq_len = static_cast<int64_t>(verified_seq_len_[bid]);
 
+    // Mask rows / positions this group owns; [0, num_nodes) when row_blocks_ == 1.
     const int32_t rows_per_block = row_blocks_ == 1 ? num_nodes : (num_nodes + row_blocks_ - 1) / row_blocks_;
     const int32_t row_start = blk * rows_per_block;
     const int32_t row_end = sycl::min(row_start + rows_per_block, num_nodes);
@@ -132,11 +171,11 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       sel_local[p] = sel_global[p];
     }
 
-    // FULL_MASK rows are (seq_len + draft_token_num) wide.
     int64_t mask_base = 0;
     int64_t row_stride = num_nodes;
     int64_t col_offset = 0;
     if (full_mask_) {
+      // FULL_MASK rows are (seq_len + num_nodes) wide and seq_len varies per request
       int64_t partial = 0;
 #pragma unroll 2
       for (int64_t b = tid; b < bid; b += lrange) {
@@ -147,6 +186,7 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       row_stride = seq_len + num_nodes;
       col_offset = seq_len;
     } else {
+      // QLEN_ONLY rows are a fixed num_nodes wide, so the offset is a multiply.
       mask_base = static_cast<int64_t>(num_nodes) * num_nodes * bid;
     }
     sycl::group_barrier(item.get_group());
@@ -164,13 +204,16 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
     const int64_t out_base = bid * num_nodes;
 
+    // Node i sits at flat slot out_base + i, so this is the identity map.
 #pragma unroll 2
     for (int32_t i = tid; i < num_nodes; i += lrange) {
       retrieve_index_[out_base + i] = out_base + i;
     }
 
     if (fast_path) {
-      // Children fit one uint64_t.  e.g. child[0]=0b110 (children {1,2})
+      // Build the reverse, parent -> children from parent_pos[]
+      // Children fit one uint64_t, e.g. child[0]=0b110 (children {1,2}).
+      // Several lanes can share a parent, hence using atomic fetch_or
 #pragma unroll 2
       for (int32_t i = tid; i < num_nodes; i += lrange) {
         if (i > 0 && parent_pos[i] != kParentNotFound) {
@@ -183,6 +226,9 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         }
       }
       sycl::group_barrier(item.get_group());
+      // Read the links straight off the bitmasks:
+      //   next_token[i]   = lowest set bit of child[i] -> lowest child
+      //   next_sibling[i] = lowest bit of the parent's child set above bit i
 #pragma unroll 2
       for (int32_t i = tid; i < num_nodes; i += lrange) {
         const uint64_t kids = child[i];
@@ -198,6 +244,9 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         retrieve_next_sibling_[out_base + i] = next_sibling;
       }
 
+      // positions[i] = seq_len + node's level in the tree (root = level 0).
+      // Nodes on the same level share a position id
+      // count it by hopping up parent_pos[] until the root.
 #pragma unroll 2
       for (int32_t i = row_start + tid; i < row_end; i += lrange) {
         if (i == 0) {
@@ -223,6 +272,9 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       }
       sycl::group_barrier(item.get_group());
 
+      // bits-to-bytes write-out:
+      // ancestor_mask[] holds each row as bits (each row squeezed into one uint64_t),
+      // but tree_mask stores one bool *byte* per column. (num_nodes num of separate bytes).
       const int32_t packs_per_row = num_nodes / kPackCols;
       const bool pack_aligned = packs_per_row > 0 && ((mask_base + col_offset) % kPackCols == 0) &&
                                 (row_stride % kPackCols == 0) &&
@@ -230,6 +282,7 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       const int32_t packed_cols = pack_aligned ? packs_per_row * kPackCols : 0;
 
       if (pack_aligned) {
+        // vector-store
         const int32_t row_step = sycl::max(lrange / packs_per_row, 1);
         const int32_t lane_row = tid / packs_per_row;
         const int32_t lane_pack = tid - lane_row * packs_per_row;
@@ -249,6 +302,7 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         }
       }
 
+      // Write any columns the vector stores above did not cover
       if (packed_cols < num_nodes) {
 #pragma unroll 2
         for (int32_t row = row_start; row < row_end; ++row) {
@@ -261,6 +315,7 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         }
       }
     } else {
+      // More than 64 nodes, so no bitmask fits.
 #pragma unroll 2
       for (int32_t i = tid; i < num_nodes; i += lrange) {
         int64_t next_token = -1;
@@ -286,6 +341,8 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         retrieve_next_sibling_[out_base + i] = next_sibling;
       }
 
+      // One thread per row: clear the row, then mark each node on the way up to
+      // the root.  Counting those hops gives the node's level, i.e. its position.
 #pragma unroll 2
       for (int32_t i = row_start + tid; i < row_end; i += lrange) {
         bool* row = tree_mask_ + mask_base + row_stride * i + col_offset;
@@ -293,7 +350,7 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         for (int32_t c = 0; c < num_nodes; ++c) {
           row[c] = false;
         }
-        row[0] = true;
+        row[0] = true;  // the root, seen by every node
 
         if (i == 0) {
           positions_[out_base] = seq_len;
@@ -436,10 +493,12 @@ SGL_KERNEL_EXPORT void build_tree_kernel_efficient(
 
   auto& queue = dpcppGetCurrentQueue();
   const int64_t max_wg = dpcppMaxWorkGroupSize();
+  // One thread per node, rounded up to a whole 32-lane group.
   const int64_t local_range = std::min<int64_t>(std::max<int64_t>((draft_token_num + 31) / 32 * 32, 32), max_wg);
 
   const int64_t num_subslices = queue.get_device().get_info<sycl::ext::intel::info::device::gpu_slices>() *
                                 queue.get_device().get_info<sycl::ext::intel::info::device::gpu_subslices_per_slice>();
+  // Small batch: give a request several groups that split its mask rows.
   const int64_t max_row_blocks = std::max<int64_t>((draft_token_num + 31) / 32, 1);
   const int64_t row_blocks = bs < num_subslices ? std::min<int64_t>(max_row_blocks, (num_subslices + bs - 1) / bs) : 1;
 

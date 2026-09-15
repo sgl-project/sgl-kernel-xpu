@@ -1,4 +1,4 @@
-/* Copyright 2025 SGLang Team. All Rights Reserved.
+/* Copyright 2026 SGLang Team. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,6 +12,36 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+
+/*
+Verify Tree (greedy) kernel picks the accepted chain out of the EAGLE draft tree, given the target
+model's own greedy predictions. It consumes the topology that build_tree_kernel_efficient produced.
+
+The walk, from the root (node 0, always accepted), repeated up to num_spec_steps times:
+
+  1. target = what the target model predicted after the current node.
+  2. Scan the current node's children (first child, then along its sibling chain) for the one whose
+     draft token == target.
+  3. No match -> the chain ends here.  A match -> accept it, descend into it, repeat.
+
+Inputs (all 2-D, (bs, num_draft_tokens):
+
+  candidates[b][i]            = the draft token proposed at node i
+  retrive_index[b][i]         = node i's slot
+  retrive_next_token[b][i]    = node i's lowest-numbered child (-1 if it is a leaf)
+  retrive_next_sibling[b][i]  = node i's next sibling (-1 if i is the last sibling)
+  target_predict[b][i]        = the target model's greedy next token at node i's slot
+
+Outputs:
+
+  predicts          = flat list of the selected tokens, each written at its parent's slot
+  accept_index      = the slot of the node accepted at each level
+  accept_token_num  = length of the accepted chain, excluding the root
+
+Two paths, same walk.
+One request per sub-group, tree staged in registers and read back with shuffles;
+If above kMaxShuffleNodes, one request per work-group with the tree staged in SLM.
+*/
 
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
@@ -28,9 +58,12 @@ namespace {
 
 constexpr int kSubGroupSize = 32;
 constexpr int kSubGroupShift = 5;
+// Nodes each lane holds, one per register.
 constexpr int kMaxNodesPerLane = 4;
+// Above this a node has no register left to live in -> SLM path.
 constexpr int64_t kMaxShuffleNodes = kSubGroupSize * kMaxNodesPerLane;
 
+// Register path
 template <typename in_t, typename out_t, int kNodesPerLane>
 struct VerifyTreeGreedySubGroupKernel {
   VerifyTreeGreedySubGroupKernel(
@@ -55,6 +88,7 @@ struct VerifyTreeGreedySubGroupKernel {
         num_draft_tokens_(num_draft_tokens),
         num_spec_steps_(num_spec_steps) {}
 
+  // Returns node's staged value, from whichever lane holds it.
   template <typename T>
   static inline T fetch(const sycl::sub_group& sg, const T (&reg)[kNodesPerLane], int32_t node) {
     const sycl::id<1> lane(node & (kSubGroupSize - 1));
@@ -84,6 +118,7 @@ struct VerifyTreeGreedySubGroupKernel {
     int32_t next_token[kNodesPerLane];
     int32_t next_sibling[kNodesPerLane];
 
+    // Stage this request's whole tree into registers.
 #pragma unroll
     for (int c = 0; c < kNodesPerLane; ++c) {
       const int32_t node = lane + c * kSubGroupSize;
@@ -102,9 +137,10 @@ struct VerifyTreeGreedySubGroupKernel {
 
     int32_t cur = 0;
     for (int32_t level = 1; level < num_spec_steps_; ++level) {
-      cur = fetch(sg, next_token, cur);
+      cur = fetch(sg, next_token, cur);  // drop to the first child
       const in_t target = target_predict_[last_accept_flat];
 
+      // Walk the sibling chain for the draft token the target model wants.
       int32_t matched_node = -1;
       while (cur >= 0 && cur < num_nodes) {
         if (fetch(sg, cand, cur) == target) {
@@ -114,7 +150,7 @@ struct VerifyTreeGreedySubGroupKernel {
         cur = fetch(sg, next_sibling, cur);
       }
       if (matched_node < 0) {
-        break;
+        break;  // no sibling matched, the chain ends here
       }
 
       if (lane == 0) {
@@ -127,6 +163,8 @@ struct VerifyTreeGreedySubGroupKernel {
       }
     }
 
+    // Tail of the chain, whether it broke early or ran out of steps: the target's own
+    // next token, which no draft node offered.
     if (lane == 0) {
       accept_token_num_[bid] = static_cast<out_t>(num_accepted);
       predicts_[last_accept_flat] = static_cast<out_t>(target_predict_[last_accept_flat]);

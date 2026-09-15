@@ -77,6 +77,89 @@ def generate_test_inputs(
     )
 
 
+def verify_correctness(
+    batch_size: int,
+    topk: int,
+    depth: int,
+    verified_seq_len: List[int],
+    device: str = "xpu",
+    tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK,
+) -> Tuple[bool, str]:
+    """Run SYCL and Triton on identical inputs and compare their outputs."""
+    draft_token_num = sum(topk**i for i in range(depth))
+
+    outputs = {}
+    for provider in ("sycl", "triton"):
+        # generate_test_inputs() is deterministic, so calling it per provider
+        # gives each one identical inputs and its own output buffers.
+        (
+            parent_list,
+            selected_index,
+            verified_seq_len_tensor,
+            tree_mask,
+            positions,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+        ) = generate_test_inputs(batch_size, topk, depth, verified_seq_len, device)
+
+        if provider == "sycl":
+            build_tree_kernel_efficient(
+                parent_list,
+                selected_index,
+                verified_seq_len_tensor,
+                tree_mask,
+                positions,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                topk,
+                depth,
+                draft_token_num,
+                int(tree_mask_mode),
+            )
+        else:
+            sgl_build_tree_kernel_triton(
+                parent_list,
+                selected_index,
+                verified_seq_len_tensor,
+                tree_mask,
+                positions,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                topk,
+                depth,
+                draft_token_num,
+                tree_mask_mode,
+            )
+        torch.xpu.synchronize()
+
+        outputs[provider] = {
+            "positions": positions,
+            "retrive_index": retrive_index,
+            "retrive_next_token": retrive_next_token,
+            "retrive_next_sibling": retrive_next_sibling,
+            "tree_mask": tree_mask,
+        }
+
+    mismatches = []
+    for field in (
+        "positions",
+        "retrive_index",
+        "retrive_next_token",
+        "retrive_next_sibling",
+        "tree_mask",
+    ):
+        ref = outputs["sycl"][field]
+        got = outputs["triton"][field]
+        if not torch.equal(ref, got):
+            diff = int((ref != got).sum().item())
+            mismatches.append(f"{field} {diff}/{ref.numel()} differ")
+
+    return not mismatches, ", ".join(mismatches)
+
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["b_s", "topk", "depth"],
@@ -164,7 +247,6 @@ def benchmark(b_s, topk, depth, provider):
             "topk": topk,
             "depth": depth,
             "draft_token_num": draft_token_num,
-            "ms": ms,
             "us": ms * 1e3,
             "draft_Mtok_per_sec": (b_s * draft_token_num) / (ms / 1e3) / 1e6,
             "req_per_sec": b_s / (ms / 1e3),
@@ -174,6 +256,30 @@ def benchmark(b_s, topk, depth, provider):
 
 
 if __name__ == "__main__":
+    torch.set_default_device("xpu")
+
+    print("=" * 80)
+    print("CORRECTNESS CHECK: SYCL vs Triton")
+    print("=" * 80)
+    correctness = {}
+    for b_s, topk, depth in configs:
+        ok, detail = verify_correctness(b_s, topk, depth, [10] * b_s)
+        correctness[(b_s, topk, depth)] = ok
+        status = "PASS" if ok else f"FAIL ({detail})"
+        print(f"  b_s={b_s:<4} topk={topk:<3} depth={depth:<3} {status}")
+
+    num_ok = sum(correctness.values())
+    if num_ok == len(configs):
+        print(
+            f"\nCORRECTNESS VERIFIED: SYCL matches Triton on all "
+            f"{len(configs)} configs\n"
+        )
+    else:
+        print(
+            f"\nCORRECTNESS FAILED: {len(configs) - num_ok}/{len(configs)} "
+            f"configs mismatch\n"
+        )
+
     benchmark.run(print_data=False)
     print("Benchmark finished!")
 
@@ -189,6 +295,14 @@ if __name__ == "__main__":
     cmp = cmp.rename(columns={"sycl": "sycl_us", "triton": "triton_us"})
     cmp["speedup"] = cmp["triton_us"] / cmp["sycl_us"]
     cmp["faster"] = cmp["speedup"].map(lambda s: "SYCL" if s > 1 else "Triton")
+    # pivot_table sorts its index; restore the declared `configs` order so this
+    # table lines up row-for-row with the one above.
+    order = {cfg: i for i, cfg in enumerate(configs)}
+    cmp = (
+        cmp.assign(_order=[order[(r.b_s, r.topk, r.depth)] for r in cmp.itertuples()])
+        .sort_values("_order")
+        .drop(columns="_order")
+    )
     print("SYCL vs Triton:")
     print(cmp.to_markdown(index=False))
     print("\n")

@@ -63,32 +63,33 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
       sgl::fmha::decode_tiled_kv_np(@HEAD_DIM@) / 16, @QG_SZ@, ((@HEAD_DIM@ + 31) / 32) * 32);
   using SubgroupLayoutQK_NP = cute::Layout<cute::Shape<cute::_1, cute::Int<kKvSubgroups_NP>, cute::_1>>;
 
-  // softmax_lse output is only threaded as a template constexpr for the base
-  // (non-local / non-sink) configuration, mirroring the paged decode path. It is
-  // used by the cascade tree-verify "expand" pass, which runs the non-paged
-  // decode kernel over a dense ragged branch-KV buffer and needs the LSE to
-  // merge with the paged prefix pass.
+  // softmax_lse output is threaded as a template constexpr, so every mask
+  // combination that can emit it needs its own kernel instantiation, mirroring
+  // the paged decode path. It is used by the cascade tree-verify "expand" pass,
+  // which runs the non-paged decode kernel over a dense ragged branch-KV buffer
+  // and needs the LSE to merge with the paged prefix pass. Decode is always
+  // non-causal, so only the local axis fans out here (this path has no sink
+  // support at all -- checked above).
   if (params.return_softmax_lse) {
-    TORCH_CHECK(
-        !params.is_local && !params.use_sink,
-        "return_softmax_lse is only supported without local/sink masking");
-    using Element = @ELEM_TYPE@;
-    DecodeConfig<
-        false,
-        false,
-        false,
-        /*LSE=*/true,
-        TileShapeQK_NP,
-        TileShapePV_NP,
-        TileShapeOutput_NP,
-        SubgroupLayoutQK_NP,
-        void,
-        1,
-        false,
-        Element,
-        Element,
-        Element,
-        Element>::run_nopaged(params);
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      using Element = @ELEM_TYPE@;
+      DecodeConfig<
+          false,
+          LocalMask,
+          false,
+          /*LSE=*/true,
+          TileShapeQK_NP,
+          TileShapePV_NP,
+          TileShapeOutput_NP,
+          SubgroupLayoutQK_NP,
+          void,
+          1,
+          false,
+          Element,
+          Element,
+          Element,
+          Element>::run_nopaged(params);
+    });
     return;
   }
   // No sink support for no_page path; always use Sink=false

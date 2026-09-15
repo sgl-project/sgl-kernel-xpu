@@ -202,44 +202,59 @@ class XeMlaSparse2StageDenseKernel {
       const int head_bid = tile.head_bid;
       const int v_split_idx = tile.v_split_idx;
       const int cur_head_start_idx = head_bid * Traits::B_H;
-      const int cur_v_start_idx = v_split_idx * Traits::D_V_PER_SPLIT;
 
-      // Q [h_q, D_QK] gmem view, offset to (batch, seq).
-      auto* q_ptr = q + batch_idx * kp.stride_q_b + seq_idx * kp.stride_q_s_q;
-      auto q_layout = make_layout(make_shape(s.h_q, D_QK), make_stride(kp.stride_q_h_q, _1{}));
-      Tensor Q = make_tensor(make_gmem_ptr(q_ptr), q_layout);
+      // Q [h_q, D_QK], sliced to (batch, seq).
+      auto mQ = make_tensor(
+          make_gmem_ptr(q),
+          make_layout(
+              make_shape(s.b, s.s_q, s.h_q, D_QK), make_stride(kp.stride_q_b, kp.stride_q_s_q, kp.stride_q_h_q, _1{})));
+      Tensor Q = mQ(batch_idx, seq_idx, _, _);
 
-      // O [h_q, D_V] gmem view, offset to (batch, seq). Under split-K this is instead the
-      // o_accum slice for (batch, seq, kv-split): same shape, so the epilogue's store path
-      // is untouched and only the base pointer / row stride change. The final `out` is
-      // then written by the reduction companion.
-      auto o_layout_for = [&](ElementO* base, int stride_h_q) {
-        auto layout = make_layout(make_shape(s.h_q, Traits::D_V), make_stride(stride_h_q, _1{}));
-        return make_tensor(make_gmem_ptr(base), layout);
-      };
+      // O [h_q, D_V], sliced to (batch, seq). Under split-K this is instead the o_accum
+      // partial sliced to (batch, seq, kv-split): the slice has the same [h_q, D_V] shape
       auto O = [&] {
         if constexpr (is_split_kv) {
-          ElementO* base = kp.o_accum + batch_idx * kp.stride_o_accum_b + seq_idx * kp.stride_o_accum_s_q +
-                           tile.kv_split_idx * kp.stride_o_accum_split;
-          return o_layout_for(base, kp.stride_o_accum_h_q);
+          auto mO = make_tensor(
+              make_gmem_ptr(kp.o_accum),
+              make_layout(
+                  make_shape(s.b, s.s_q, num_kv_splits, s.h_q, Traits::D_V),
+                  make_stride(
+                      kp.stride_o_accum_b,
+                      kp.stride_o_accum_s_q,
+                      kp.stride_o_accum_split,
+                      kp.stride_o_accum_h_q,
+                      _1{})));
+          return mO(batch_idx, seq_idx, tile.kv_split_idx, _, _);
         } else {
-          return o_layout_for(out + batch_idx * kp.stride_o_b + seq_idx * kp.stride_o_s_q, kp.stride_o_h_q);
+          auto mO = make_tensor(
+              make_gmem_ptr(out),
+              make_layout(
+                  make_shape(s.b, s.s_q, s.h_q, Traits::D_V),
+                  make_stride(kp.stride_o_b, kp.stride_o_s_q, kp.stride_o_h_q, _1{})));
+          return mO(batch_idx, seq_idx, _, _);
         }
       }();
 
-      // K == V == the Stage 1 gathered latent (MLA aliasing). K is the full
-      // [gathered_topk, D_QK] view (D_QK is 512 or 576); V is the transposed
-      // [D_V_PER_SPLIT, gathered_topk] first-D_V sub-view of the same buffer offset
-      // to this V-split (V width stays D_V == 512 even when D_QK == 576).
-      const auto* gathered_k_ptr =
-          kp.gathered_k + batch_idx * kp.stride_gathered_k_b + seq_idx * kp.stride_gathered_k_s_q;
-      const auto* gathered_v_ptr = gathered_k_ptr + cur_v_start_idx;
-      auto gathered_k_layout =
-          make_layout(make_shape(s.gathered_topk, D_QK), make_stride(kp.stride_gathered_k_topk, _1{}));
-      auto gathered_v_layout =
-          make_layout(make_shape(Traits::D_V_PER_SPLIT, s.gathered_topk), make_stride(_1{}, kp.stride_gathered_k_topk));
-      Tensor K = make_tensor(make_gmem_ptr(const_cast<ElementKV*>(gathered_k_ptr)), gathered_k_layout);
-      Tensor V = make_tensor(make_gmem_ptr(const_cast<ElementKV*>(gathered_v_ptr)), gathered_v_layout);
+      // K is the full [gathered_topk, D_QK] view (D_QK is 512 or 576).
+      // V is the transposed [D_V_PER_SPLIT, gathered_topk] first-D_V
+      auto* gathered_k_base = const_cast<ElementKV*>(kp.gathered_k);
+      auto mK = make_tensor(
+          make_gmem_ptr(gathered_k_base),
+          make_layout(
+              make_shape(s.b, s.s_q, s.gathered_topk, D_QK),
+              make_stride(kp.stride_gathered_k_b, kp.stride_gathered_k_s_q, kp.stride_gathered_k_topk, _1{})));
+      auto mV = make_tensor(
+          make_gmem_ptr(gathered_k_base),
+          make_layout(
+              make_shape(s.b, s.s_q, Traits::V_SPLIT, Traits::D_V_PER_SPLIT, s.gathered_topk),
+              make_stride(
+                  kp.stride_gathered_k_b,
+                  kp.stride_gathered_k_s_q,
+                  Traits::D_V_PER_SPLIT,
+                  _1{},
+                  kp.stride_gathered_k_topk)));
+      Tensor K = mK(batch_idx, seq_idx, _, _);
+      Tensor V = mV(batch_idx, seq_idx, v_split_idx, _, _);
 
       FragA tArA;
       FragARow tA_max, tA_sum;
@@ -248,8 +263,7 @@ class XeMlaSparse2StageDenseKernel {
       mainloop(Q, K, V, tArA, tA_max, tA_sum, thr_id, batch_idx, seq_idx, head_bid, tile.kv_split_idx, num_kv_splits);
 
       // Both collectives use the same SLM union; the epilogue's ReduceK reduction
-      // reads/writes it via workgroup barriers internally. The mainloop uses no SLM,
-      // so no extra barrier is needed between phases here.
+      // reads/writes it via workgroup barriers internally.
       CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
       epilogue(
           O,

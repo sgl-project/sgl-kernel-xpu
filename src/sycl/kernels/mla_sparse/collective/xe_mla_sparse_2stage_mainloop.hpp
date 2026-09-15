@@ -3,28 +3,12 @@
  * SPDX-License-Identifier: BSD-3-Clause
  **************************************************************************************************/
 /*! \file
-    \brief Two-stage sparse MLA Stage 2 mainloop collective for DeepSeek V4
-           (decode + prefill).
+    \brief Two-stage sparse MLA Stage 2 mainloop collective
 
     QK/PV DPAS GEMM engine + online (log2) softmax over the Stage 1 gathered tile.
     Consumes the per-(batch, seq, v-split) gmem Q/K/V tiles built by the kernel
     wrapper and produces the O accumulator + softmax max/sum row stats, which the
     epilogue collective then reduces, normalizes, and writes out.
-
-    Path-agnostic: both two-stage paths use this collective unchanged (see the Stage-2
-    kernel wrapper, kernel/xe_mla_sparse_2stage_dense_kernel.hpp).
-
-    Structural analog of collective/xe_mla_sparse_mainloop.hpp (the fused path): a
-    compute collective owning the MMA/tile/fragment type aliases, its Params, its
-    SharedStorage, ctor (Params const&, SharedStorage&), and operator(). Shared
-    declarations (SparseAttnDecodeParams, LOG_* constants, the copy_block_*
-    helpers) come from the kernel/ common header; the DPAS/tile geometry it reads
-    off its Traits template param is MlaSparseDecode2StageTileTraits, declared in that
-    same common header. Traits carries geometry only -- element types, MMA atoms, tile
-    shapes, sizes -- never the assembly (which collectives / kernels / runner), which
-    is the config struct's business.
-
-    Correctness reference: tests/test_flash_mla_with_kvcache.py _sm120_sparse_decode_fwd.
 */
 
 #pragma once
@@ -190,11 +174,16 @@ class XeMlaSparse2StageMainloop {
     auto mask_rS = [&](int block_idx) {
       Tensor coord_S = make_identity_tensor(select<0, 1>(TileShapeQK{}));
       Tensor tCgC = thr_mma_qk.partition_C(coord_S);
+      int prev_col_idx = -1;
+      bool is_valid = true;
       CUTE_UNROLL
       for (int i = 0; i < tSrS.size(); ++i) {
-        int col_idx = get<1>(tCgC(i));
-        int topk_idx = block_idx * Traits::B_TOPK + col_idx;
-        bool is_valid = topk_idx < params.gathered_topk && gathered_valid_mask_ptr[topk_idx];
+        const int col_idx = get<1>(tCgC(i));
+        if (col_idx != prev_col_idx) {
+          const int topk_idx = block_idx * Traits::B_TOPK + col_idx;
+          is_valid = topk_idx < params.gathered_topk && gathered_valid_mask_ptr[topk_idx];
+          prev_col_idx = col_idx;
+        }
         if (!is_valid) {
           tSrS(i) = cutlass::platform::numeric_limits<ElementS>::lowest();
         }
@@ -244,7 +233,6 @@ class XeMlaSparse2StageMainloop {
       reorder(tVrV, tArV);
       cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, local_v_tile_idx));
     };
-
     // Fully-masked-block skip: resolve the per-batch valid lengths of the two
     // concatenated pools once, in registers, so we can cheaply prove an entire
     // 64-column block lies outside every valid range and skip its QK/softmax/PV

@@ -1236,7 +1236,7 @@ void qkv_lora_b_fwd(
 );
 
 /*
- * From GDN (Gated DeltaNet) attention (Intel Xe2)
+ * From GDN (Gated DeltaNet) attention
  */
 void gdn_attention(
     torch::Tensor& core_attn_out,

@@ -90,6 +90,15 @@ foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
   )
 endforeach()
 
+# Keep the chunk delta-rule provider retained even if the common source order changes.
+if(USE_GDN
+  AND TARGET sgl-ops-sycl-gdn_attention
+  AND TARGET sgl-ops-sycl-chunk_gated_delta_rule)
+  target_link_libraries(
+    sgl-ops-sycl-gdn_attention
+    PRIVATE sgl-ops-sycl-chunk_gated_delta_rule)
+endif()
+
 # Dispatchers that call the runtime-JIT engine link the static JIT library.
 if(USE_FMHA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-flash_attention)
   target_link_libraries(sgl-ops-sycl-flash_attention PRIVATE sgl_jit)

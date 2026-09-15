@@ -810,7 +810,10 @@ struct FMHAFwdMainloop<
     // softcap == 0 -> identity, so the fused fast path is unchanged for non-softcap models.
     const ElementS softcap = params.softcap;
     const auto cap = [softcap](ElementS v) -> ElementS {
-      if (softcap > ElementS(0)) {
+      // Leave masked lanes untouched: causal/window/remainder masks set -INFINITY
+      // before softmax, and tanh(-inf/softcap) would fold them to the finite
+      // -softcap, letting masked positions (and all-masked rows) leak into the sum.
+      if (softcap > ElementS(0) && sycl::isfinite(v)) {
         constexpr ElementS kLog2e = ElementS(1.4426950408889634074);
         ElementS l = v / kLog2e;
         return softcap * sycl::tanh(l / softcap) * kLog2e;
@@ -1323,7 +1326,10 @@ struct DecodeFwdMainloop<
     // softcap == 0 -> identity, so the fused fast path is unchanged for non-softcap models.
     const ElementS softcap = params.softcap;
     const auto cap = [softcap](ElementS v) -> ElementS {
-      if (softcap > ElementS(0)) {
+      // Leave masked lanes untouched: causal/window/remainder masks set -INFINITY
+      // before softmax, and tanh(-inf/softcap) would fold them to the finite
+      // -softcap, letting masked positions (and all-masked rows) leak into the sum.
+      if (softcap > ElementS(0) && sycl::isfinite(v)) {
         constexpr ElementS kLog2e = ElementS(1.4426950408889634074);
         ElementS l = v / kLog2e;
         return softcap * sycl::tanh(l / softcap) * kLog2e;

@@ -86,6 +86,7 @@ void mha_fwd(
 
 void flash_mla_decode(
     torch::Tensor& out,
+    torch::Tensor& lse,
     const torch::Tensor& q_nope,
     const torch::Tensor& q_pe,
     const torch::Tensor& kv_c_and_k_pe_cache,
@@ -93,7 +94,8 @@ void flash_mla_decode(
     const torch::Tensor& page_table,
     torch::Tensor& workspace,
     double sm_scale,
-    int64_t num_kv_splits = -1);
+    int64_t num_kv_splits = -1,
+    bool return_lse = true);
 
 int64_t flash_mla_decode_get_workspace_size(
     int64_t max_seq_len, int64_t num_batches, int64_t num_heads, int64_t page_size, int64_t num_kv_splits = -1);
@@ -116,6 +118,7 @@ void flash_mla_sparse_decode(
 
 void flash_mla_prefill(
     torch::Tensor& out,
+    torch::Tensor& lse,
     const torch::Tensor& q_nope,
     const torch::Tensor& q_pe,
     const torch::Tensor& kv_c_and_k_pe_cache,
@@ -126,7 +129,8 @@ void flash_mla_prefill(
     torch::Tensor& workspace,
     double sm_scale,
     bool causal,
-    int64_t num_kv_splits = -1);
+    int64_t num_kv_splits = -1,
+    bool return_lse = true);
 
 int64_t flash_mla_prefill_get_workspace_size(
     int64_t max_seq_len, int64_t num_batches, int64_t num_heads = 0, int64_t page_size = 0, int64_t num_kv_splits = -1);

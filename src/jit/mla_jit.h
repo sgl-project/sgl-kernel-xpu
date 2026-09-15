@@ -19,6 +19,7 @@ bool mla_decode_launch(
     bool is_fp16,
     int page_size,
     void* out,
+    void* lse,
     const void* q_nope,
     const void* q_pe,
     const void* kv_c_and_k_pe_cache,
@@ -27,6 +28,7 @@ bool mla_decode_launch(
     void* workspace,
     double sm_scale,
     int64_t num_kv_splits,
+    bool return_lse,
     int arch = 0,
     std::string* err = nullptr);
 
@@ -37,6 +39,7 @@ bool mla_prefill_launch(
     int page_size,
     int bucket,
     void* out,
+    void* lse,
     const void* q_nope,
     const void* q_pe,
     const void* kv_c_and_k_pe_cache,
@@ -48,6 +51,7 @@ bool mla_prefill_launch(
     double sm_scale,
     bool causal,
     int64_t num_kv_splits,
+    bool return_lse,
     int arch = 0,
     std::string* err = nullptr);
 

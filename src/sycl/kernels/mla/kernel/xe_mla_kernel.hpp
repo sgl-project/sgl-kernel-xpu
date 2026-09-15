@@ -102,6 +102,12 @@ class XeMlaFwdKernel {
   using ElementO = typename CollectiveEpilogue::TensorO::element_type;
   using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
 
+  // Softmax LSE output, laid out like O with the head-size mode dropped:
+  // (seq_q, num_heads_q, batch).
+  using TensorLSE = typename CollectiveEpilogue::TensorLSE;
+  using ElementLSE = typename TensorLSE::element_type;
+  using StrideLSE = decltype(stride(TensorLSE{}));
+
   // Tile scheduler derived types
   using TileScheduler = TileScheduler_;
   using TileSchedulerParams = typename TileScheduler::Params;
@@ -142,6 +148,12 @@ class XeMlaFwdKernel {
     // output tensor
     ElementO* O = nullptr;
     StrideO dO{};
+
+    // Softmax log-sum-exp output (log2 domain), (seq_q, num_heads_q, batch).
+    // Null when the caller does not want LSE: the softmax statistics are
+    // computed regardless, only the store is skipped.
+    ElementLSE* LSE = nullptr;
+    StrideLSE dLSE_out{};
 
     // Sequence lengths per batch (for computing total_blk)
     const int* seq_lens = nullptr;
@@ -268,10 +280,12 @@ class XeMlaFwdKernel {
       auto shape_Q_nope = make_shape(seqlen_q_i, s.head_size_q_nope, s.num_heads_q, batch_dim_size);
       auto shape_Q_pe = make_shape(seqlen_q_i, s.head_size_q_pe, s.num_heads_q, batch_dim_size);
       auto shape_O = make_shape(seqlen_q_i, s.head_size_o, s.num_heads_q, batch_dim_size);
+      auto shape_LSE = make_shape(seqlen_q_i, s.num_heads_q, batch_dim_size);
 
       auto dcQ_nope = const_cast<ElementQ*>(p.Q_nope);
       auto dcQ_pe = const_cast<ElementQ*>(p.Q_pe);
       auto dO_ptr = p.O;
+      auto dLSE_ptr = p.LSE;
 
       if constexpr (CollectiveMainloop::IsPrefill) {
         // int64 to avoid overflow on large total_q
@@ -281,11 +295,15 @@ class XeMlaFwdKernel {
         dcQ_nope += q_nope_offset;
         dcQ_pe += q_pe_offset;
         dO_ptr += o_offset;
+        if (dLSE_ptr != nullptr) {
+          dLSE_ptr += static_cast<int64_t>(q_start) * static_cast<int64_t>(get<0>(p.dLSE_out));
+        }
       }
 
       Tensor Q_nope = make_tensor(make_gmem_ptr(dcQ_nope), make_layout(shape_Q_nope, p.dQ_nope));
       Tensor Q_pe = make_tensor(make_gmem_ptr(dcQ_pe), make_layout(shape_Q_pe, p.dQ_pe));
       Tensor O = make_tensor(make_gmem_ptr(dO_ptr), make_layout(shape_O, p.dO));
+      Tensor mLSE = make_tensor(make_gmem_ptr(dLSE_ptr), make_layout(shape_LSE, p.dLSE_out));
 
       // O accumulator types
       FragA tArA;
@@ -356,7 +374,14 @@ class XeMlaFwdKernel {
       }
 
       CollectiveEpilogue epilogue(params.epilogue, shared_storage.epilogue);
-      epilogue(O(_, _, head_coord, batch_slice_idx), tArA, tA_max, tA_sum, blk_qv, thr_id);
+      epilogue(
+          O(_, _, head_coord, batch_slice_idx),
+          tArA,
+          tA_max,
+          tA_sum,
+          blk_qv,
+          thr_id,
+          mLSE(_, head_coord, batch_slice_idx));
     }
   }
 };
@@ -398,6 +423,12 @@ class XeMlaSplitKVKernel {
   using TileShapeO = typename CollectiveEpilogue::TileShapeO;
   using ElementO = typename CollectiveEpilogue::TensorO::element_type;
   using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
+
+  // Softmax LSE output, (seq_q, num_heads_q, batch). Written by the reduction
+  // kernel, which merges this kernel's per-split exp_sums/max_logits.
+  using TensorLSE = typename CollectiveEpilogue::TensorLSE;
+  using ElementLSE = typename TensorLSE::element_type;
+  using StrideLSE = decltype(stride(TensorLSE{}));
 
   // Tile scheduler derived types
   using TileScheduler = TileScheduler_;
@@ -452,6 +483,11 @@ class XeMlaSplitKVKernel {
     // Final output
     ElementO* O = nullptr;
     StrideO dO{};
+
+    // Final softmax log-sum-exp output (log2 domain), forwarded to the
+    // reduction kernel. Null when the caller does not want LSE.
+    ElementLSE* LSE = nullptr;
+    StrideLSE dLSE_out{};
 
     // Sequence lengths per batch (for computing total_blk)
     const int* seq_lens = nullptr;

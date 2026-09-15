@@ -46,7 +46,12 @@
 
 namespace cutlass::flash_attention::collective {
 /////////////////////////////////////////////////////////////////////////////////////////////////
-template <class CollectiveMainloop, class TileShapeO_, class TensorO_, class TiledCopyO_ = void>
+template <
+    class CollectiveMainloop,
+    class TileShapeO_,
+    class TensorO_,
+    class TiledCopyO_,  // Optional TiledCopy for storing O (void => default)
+    class TensorLSE_>   // Global softmax-LSE tensor: (q, head, batch)
 class XeMlaEpilogue {
  public:
   //
@@ -60,6 +65,12 @@ class XeMlaEpilogue {
   using TensorO = TensorO_;
   using TensorO2D = decltype(TensorO_{}(append<rank_v<TensorO_>>(make_coord(_, _), 0)));
   using ElementO = typename TensorO_::value_type;
+
+  // LSE is sliced down to the (q) mode for one (head, batch) pair, exactly like
+  // O is sliced down to (q,v) -- see TensorO2D.
+  using TensorLSE = TensorLSE_;
+  using TensorLSE1D = decltype(TensorLSE_{}(make_coord(_, 0, 0)));
+  using ElementLSE = typename TensorLSE_::value_type;
 
   using FragA = typename CollectiveMainloop::FragA;
   using FragARow = typename CollectiveMainloop::FragARow;
@@ -141,21 +152,36 @@ class XeMlaEpilogue {
 
   template <typename QVCoord>
   CUTLASS_DEVICE void operator()(
-      TensorO2D const& O,  // Global O tensor: (q,v)
-      FragA& tArA,         // O accumulator:   (q,v)
-      FragARow& tA_max,    // Softmax row-wise max accumulator
-      FragARow& tA_sum,    // Softmax row-wise sum accumulator
-      QVCoord blk_qv,      // WG tile indices: (Q,V)
-      int thr_id) {        // Work-item ID
+      TensorO2D const& O,       // Global O tensor:   (q,v)
+      FragA& tArA,              // O accumulator:     (q,v)
+      FragARow& tA_max,         // Softmax row-wise max accumulator
+      FragARow& tA_sum,         // Softmax row-wise sum accumulator
+      QVCoord blk_qv,           // WG tile indices: (Q,V)
+      int thr_id,               // Work-item ID
+      TensorLSE1D const& LSE) {  // Global LSE tensor for this (head,batch): (q)
     using namespace cute;
     using ElementA = typename FragA::element_type;
 
     // Reduce k-blocks of A and A_sum across WG, if needed.
-    auto [rA, rA_sum, rA_max_unused, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
-    (void)rA_max_unused;
+    auto [rA, rA_sum, rA_max, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
 
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
+
+    /* Tile output. cO/gO are identity tensors, so tOgO exposes the (q,v)
+       coordinate of each output fragment element. */
+    Tensor cO = make_identity_tensor(O.shape());       // (q,v)
+    Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);  // (q,v)
+
+    /* Prepare slices */
+    TiledCopyO copy_o{O};
+    auto thr_copy_o = copy_o.get_slice(thr_id);
+
+    auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
+    auto tOgO = thr_copy_o.partition_D(gO);
+
+    /* Emit LSE while the softmax sums are still the raw denominators. */
+    write_lse(rA, rA_sum, rA_max, tOrO, tOgO, blk_qv, LSE);
 
     /* Complete softmax, dividing out sums. */
     CUTLASS_PRAGMA_UNROLL
@@ -168,20 +194,74 @@ class XeMlaEpilogue {
       rA(i) *= val;
     }
 
-    /* Tile output */
-    Tensor cO = make_identity_tensor(O.shape());       // (q,v)
-    Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);  // (q,v)
-
-    /* Prepare slices */
-    TiledCopyO copy_o{O};
-    auto thr_copy_o = copy_o.get_slice(thr_id);
-
-    auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
-    auto tOgO = thr_copy_o.partition_D(gO);
-
     /* Reorder tile and write out */
     reorder(rA, tOrO);
     copy(copy_o, tOrO, tOgO);
+  }
+
+  /// Write the per-row log2-domain log-sum-exp of the attention scores.
+  ///
+  /// The mainloop keeps softmax state in the log2 domain with sm_scale already
+  /// folded into the logits, so rA_max is log2(e) * (scaled row max) and
+  /// rA_sum(row) = sum_j exp2(logit_j - rA_max(row)). The LSE is emitted in that
+  /// same log2 domain, so no base conversion is applied:
+  ///     lse = log2(sum_j exp2(logit_j)) = rA_max + log2(rA_sum)
+  /// (Multiply by ln(2) to get the natural-log log-sum-exp.)
+  /// Rows attending to no unmasked key have rA_sum == 0 and emit -INFINITY.
+  ///
+  /// The store happens in output-element space at the v == 0 column so each
+  /// query row is written exactly once. Rows past the tensor's Q extent (the
+  /// padding rows of a partial Q tile) are skipped: unlike the 2D block store
+  /// used for O, these scalar stores are not bounds-clamped, and in the ragged
+  /// prefill layout they would land on the next request's rows.
+  ///
+  /// A null LSE data pointer (caller does not want LSE) turns this into a no-op;
+  /// the softmax statistics are computed by the mainloop either way.
+  template <class RedFragA, class RedFragARow, class FragO, class CoordO, class QVCoord>
+  CUTLASS_DEVICE void write_lse(
+      RedFragA const& rA,         // Reduced O accumulator: (q,v)
+      RedFragARow const& rA_sum,  // Reduced softmax row-wise sum
+      RedFragARow const& rA_max,  // Reduced softmax row-wise max (log2 domain)
+      FragO const& tOrO,          // Output fragment (layout donor)
+      CoordO const& tOgO,         // Output coordinates: (q,v) per element
+      QVCoord blk_qv,             // WG tile indices: (Q,V)
+      TensorLSE1D const& LSE) {   // Global LSE tensor for this (head,batch): (q)
+    using namespace cute;
+
+    if (raw_pointer_cast(LSE.data()) == nullptr) return;
+    /* Only the first V tile owns the LSE row (V is not split for MLA, but keep
+       the guard so a future V-split cannot double-write). */
+    if (int(get<1>(blk_qv)) != 0) return;
+
+    /* Broadcast the row-wise statistics to every element of the A fragment,
+       then reorder them into the output fragment layout, where tOgO gives each
+       element its (q,v) coordinate. Keep them in ElementA (float): tOrO may be
+       a narrower output type. */
+    auto sum_e = rA;
+    auto max_e = rA;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < rA.size(); i++) {
+      sum_e(i) = broadcast<0>(rA_sum, rA, i);
+      max_e(i) = broadcast<0>(rA_max, rA, i);
+    }
+
+    auto tv = tOrO.tv_layout();
+    auto tO_sum = make_subgroup_tensor(make_fragment_like<ElementA>(tOrO.layout()), tv);
+    auto tO_max = make_subgroup_tensor(make_fragment_like<ElementA>(tOrO.layout()), tv);
+    reorder(sum_e, tO_sum);
+    reorder(max_e, tO_max);
+
+    int num_rows = int(size<0>(LSE));
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int j = 0; j < int(tO_sum.size()); j++) {
+      if (int(get<1>(tOgO(j))) != 0) continue;
+      int row = int(get<0>(tOgO(j)));
+      if (row >= num_rows) continue;
+      float d = float(tO_sum(j));
+      float lse = (d > 0.f) ? (float(tO_max(j)) + sycl::log2(d)) : -INFINITY;
+      LSE(row) = static_cast<ElementLSE>(lse);
+    }
   }
 
   /// Split-KV epilogue operator.

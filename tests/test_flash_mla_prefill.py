@@ -1,4 +1,5 @@
 import gc
+import math
 import sys
 
 import pytest
@@ -38,6 +39,7 @@ def ref_mla_prefill_varlen(
     cu_seqlens_q: Tensor,  # (B+1,) int32
     seq_lens_k: Tensor,  # (B,) int32
     causal: bool = True,
+    lse: Tensor = None,  # (total_q, H) fp32, log2-domain log-sum-exp
 ) -> Tensor:
     """Pure-PyTorch reference for varlen MLA prefill with causal mask."""
     batch_size = seq_lens_k.shape[0]
@@ -92,6 +94,25 @@ def ref_mla_prefill_varlen(
         )
 
         out[q_start:q_end] = o.permute(1, 0, 2)
+
+        if lse is not None:
+            # log2-domain logsumexp of the masked, scaled scores, i.e.
+            # log2(sum_j exp2(score_j)) = logsumexp / ln(2), matching the
+            # kernel. Materialize the scores in head chunks so the largest
+            # shapes here don't allocate an (H, seqlen_q, seqlen_k) fp32
+            # tensor all at once.
+            H_CHUNK = 32
+            for h0 in range(0, H, H_CHUNK):
+                h1 = min(h0 + H_CHUNK, H)
+                scores = (
+                    q_full[h0:h1].float() @ k_full.float().transpose(0, 1)
+                ) * scale
+                if attn_mask is not None:
+                    scores = scores + attn_mask
+                # (h, seqlen_q) -> (seqlen_q, h)
+                lse[q_start:q_end, h0:h1] = (
+                    torch.logsumexp(scores, dim=-1) / math.log(2)
+                ).transpose(0, 1)
 
     return out
 
@@ -202,6 +223,7 @@ def test_mla_prefill(dtype, block_size, num_heads, seqlens_q, seqlens_k):
         block_table_cpu.max().item() + 1, block_size, D_ckv, dtype=dtype
     )
 
+    lse_ref = torch.zeros(total_q, num_heads, dtype=torch.float32)
     out_ref = ref_mla_prefill_varlen(
         q_nope_cpu,
         q_pe_cpu,
@@ -211,6 +233,7 @@ def test_mla_prefill(dtype, block_size, num_heads, seqlens_q, seqlens_k):
         cu_seqlens_q,
         seq_lens_k,
         causal=True,
+        lse=lse_ref,
     )
 
     q_nope_xpu = q_nope_cpu.to(device).contiguous()
@@ -223,7 +246,7 @@ def test_mla_prefill(dtype, block_size, num_heads, seqlens_q, seqlens_k):
     ws_size = flash_mla_prefill_get_workspace_size(block_num * block_size, bs)
     workspace = torch.empty(ws_size, device=device, dtype=torch.uint8)
 
-    out = flash_mla_prefill(
+    out, lse = flash_mla_prefill(
         q_nope_xpu,
         q_pe_xpu,
         kv_cache_xpu,
@@ -240,6 +263,11 @@ def test_mla_prefill(dtype, block_size, num_heads, seqlens_q, seqlens_k):
 
     atol, rtol = (1e-2, 1e-2) if dtype == torch.bfloat16 else (1e-3, 1e-3)
     torch.testing.assert_close(out_ref.float(), out.cpu().float(), atol=atol, rtol=rtol)
+
+    assert lse.shape == (total_q, num_heads)
+    assert lse.dtype == torch.float32
+    lse_atol, lse_rtol = (2e-2, 2e-2) if dtype == torch.bfloat16 else (5e-3, 5e-3)
+    torch.testing.assert_close(lse_ref, lse.cpu(), atol=lse_atol, rtol=lse_rtol)
 
 
 if __name__ == "__main__":

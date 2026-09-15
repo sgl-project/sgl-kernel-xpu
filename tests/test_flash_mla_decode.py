@@ -1,4 +1,5 @@
 import gc
+import math
 import os
 import sys
 
@@ -42,6 +43,7 @@ def ref_mla(
     scale: float,
     block_tables: Tensor,  # (bs, max_num_blocks)
     seq_lens: Tensor,  # (bs,)
+    lse: Tensor = None,  # (bs, num_heads) fp32, log2-domain log-sum-exp
 ):
     bs, num_heads, v_head_dim = out.shape
     head_dim = query.shape[2]
@@ -56,8 +58,12 @@ def ref_mla(
         v = kv[:, :v_head_dim]  # (seq_len, v_head_dim)
 
         # (num_heads, head_dim) @ (head_dim, seq_len) -> (num_heads, seq_len)
-        probs = ((query[i].float() @ kv.transpose(0, 1)) * scale).softmax(dim=-1)
+        scores = (query[i].float() @ kv.transpose(0, 1)) * scale
+        probs = scores.softmax(dim=-1)
         out[i] = (probs @ v).to(out.dtype)  # (num_heads, v_head_dim)
+        if lse is not None:
+            # The kernel emits log2(sum_j exp2(score_j)) = logsumexp / ln(2).
+            lse[i] = torch.logsumexp(scores, dim=-1) / math.log(2)
 
     return out
 
@@ -120,7 +126,10 @@ def test_flash_mla_decode(
 
     # --- Reference: run on CPU ---
     out_ref = torch.zeros(bs, h_q, dv, dtype=dtype, device="cpu")
-    ref_mla(out_ref, q_cpu, kv_cache_cpu, scale, block_table_cpu, seq_lens_cpu)
+    lse_ref = torch.zeros(bs, h_q, dtype=torch.float32, device="cpu")
+    ref_mla(
+        out_ref, q_cpu, kv_cache_cpu, scale, block_table_cpu, seq_lens_cpu, lse_ref
+    )
 
     # --- Kernel under test: run on XPU ---
     q_xpu = q_cpu.to(device=device)
@@ -138,7 +147,7 @@ def test_flash_mla_decode(
     q_nope.copy_(q_xpu[:, :, :dv])
     q_pe = q_xpu[:, :, dv:].clone()
     del q_xpu
-    out = flash_mla_decode(
+    out, lse = flash_mla_decode(
         q_nope,
         q_pe,
         kv_cache_xpu,
@@ -152,7 +161,12 @@ def test_flash_mla_decode(
     atol, rtol = (1e-2, 1e-2) if dtype == torch.bfloat16 else (1e-3, 1e-3)
     torch.testing.assert_close(out_ref.float(), out.cpu().float(), atol=atol, rtol=rtol)
 
-    del out, out_ref, q_nope, q_pe, kv_cache_xpu, block_table_xpu
+    assert lse.shape == (bs, h_q)
+    assert lse.dtype == torch.float32
+    lse_atol, lse_rtol = (2e-2, 2e-2) if dtype == torch.bfloat16 else (5e-3, 5e-3)
+    torch.testing.assert_close(lse_ref, lse.cpu(), atol=lse_atol, rtol=lse_rtol)
+
+    del out, lse, out_ref, lse_ref, q_nope, q_pe, kv_cache_xpu, block_table_xpu
     del workspace, seq_lens_xpu
 
 

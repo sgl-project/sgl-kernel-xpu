@@ -218,9 +218,14 @@ struct chunk_causal_conv1d_tiled_kernel : public __SYCL_KER_CONFIG_CONVENTION__ 
     int local_feat = local_id * elems_per_item;
     int feat = feat_base + local_feat;
 
-    // Guard: last chunk may have items beyond qkv_dim if not evenly divisible
+    // Guard: last chunk may have items beyond qkv_dim if not evenly divisible.
+    // To avoid divergent early return before a barrier (undefined behavior), clamp
+    // out-of-range lanes onto a safe, in-bounds feature index (their work becomes
+    // redundant but harmless) and skip their output writes explicitly via feat_valid further down.
     bool feat_valid = (feat < qkv_dim);
-    if (!feat_valid) return;
+    if (!feat_valid) {
+      feat = qkv_dim - elems_per_item;
+    }
 
     int global_feat_offset = 0;
     int reordered_feat = 0;
@@ -377,12 +382,12 @@ struct chunk_causal_conv1d_tiled_kernel : public __SYCL_KER_CONFIG_CONVENTION__ 
 
         float q_local_sq = 0.0f;
         float k_local_sq = 0.0f;
-        if (is_q) {
+        if (feat_valid && is_q) {
 #pragma unroll
           for (int e = 0; e < elems_per_item; ++e)
             q_local_sq += res[e] * res[e];
         }
-        if (is_k) {
+        if (feat_valid && is_k) {
 #pragma unroll
           for (int e = 0; e < elems_per_item; ++e)
             k_local_sq += res[e] * res[e];
@@ -425,24 +430,26 @@ struct chunk_causal_conv1d_tiled_kernel : public __SYCL_KER_CONFIG_CONVENTION__ 
         }
       }
 
-      // Write output
+      // Write output (skip for lanes clamped above -- feat_valid == false)
       int token_in_seq = tile_start_in_seq + t;
       int out_token_id = pre_chunks * chunk_size_xe2 + token_in_seq;
 
-      if (is_q) {
+      if (feat_valid) {
+        if (is_q) {
 #pragma unroll
-        for (int e = 0; e < elems_per_item; ++e) {
-          q_out[out_token_id * num_k_heads * q_dim + k_head_id * q_dim + feat + e] = res[e];
-        }
-      } else if (is_k) {
+          for (int e = 0; e < elems_per_item; ++e) {
+            q_out[out_token_id * num_k_heads * q_dim + k_head_id * q_dim + feat + e] = res[e];
+          }
+        } else if (is_k) {
 #pragma unroll
-        for (int e = 0; e < elems_per_item; ++e) {
-          k_out[out_token_id * num_k_heads * k_dim + k_head_id * k_dim + feat - q_dim + e] = res[e];
-        }
-      } else {
+          for (int e = 0; e < elems_per_item; ++e) {
+            k_out[out_token_id * num_k_heads * k_dim + k_head_id * k_dim + feat - q_dim + e] = res[e];
+          }
+        } else {
 #pragma unroll
-        for (int e = 0; e < elems_per_item; ++e) {
-          v_out[out_token_id * num_k_heads * v_dim + k_head_id * v_dim + feat - (q_dim + k_dim) + e] = res[e];
+          for (int e = 0; e < elems_per_item; ++e) {
+            v_out[out_token_id * num_k_heads * v_dim + k_head_id * v_dim + feat - (q_dim + k_dim) + e] = res[e];
+          }
         }
       }
 
@@ -524,21 +531,23 @@ struct chunk_causal_conv1d_tiled_kernel : public __SYCL_KER_CONFIG_CONVENTION__ 
     // After the loop's final register shift, taps[0..Width-2] already holds
     // exactly the trailing (Width-1)-token window -- no SLM read-back needed.
     // ========================================================================
-    if (tile_start_in_seq + TileT >= seq_len && seq_len > 1) {
+    if (feat_valid) {
+      if (tile_start_in_seq + TileT >= seq_len && seq_len > 1) {
 #pragma unroll
-      for (int i = 0; i < Width - 1; ++i) {
+        for (int i = 0; i < Width - 1; ++i) {
 #pragma unroll
-        for (int e = 0; e < elems_per_item; ++e) {
-          conv_states_tmp[batch_id * (Width - 1) * conv_elems + i * conv_elems + reordered_feat + e] = taps[i][e];
+          for (int e = 0; e < elems_per_item; ++e) {
+            conv_states_tmp[batch_id * (Width - 1) * conv_elems + i * conv_elems + reordered_feat + e] = taps[i][e];
+          }
         }
-      }
-    } else if (seq_len == 1) {
-      T* st = conv_states + states_id * conv_states_stride_0;
+      } else if (seq_len == 1) {
+        T* st = conv_states + states_id * conv_states_stride_0;
 #pragma unroll
-      for (int i = 0; i < Width - 1; ++i) {
+        for (int i = 0; i < Width - 1; ++i) {
 #pragma unroll
-        for (int e = 0; e < elems_per_item; ++e) {
-          st[i * conv_w_stride + (reordered_feat + e) * conv_d_stride] = taps[i][e];
+          for (int e = 0; e < elems_per_item; ++e) {
+            st[i * conv_w_stride + (reordered_feat + e) * conv_d_stride] = taps[i][e];
+          }
         }
       }
     }

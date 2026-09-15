@@ -2,6 +2,7 @@
 
 #include <torch/all.h>
 
+#include <cassert>
 #include <cstdint>
 #include <sycl/sycl.hpp>
 
@@ -204,7 +205,7 @@ CUTE_DEVICE void chunk_compute_wu_kernel(
   const int kv_ratio = num_v_heads / num_k_heads;
 
   for (int batch_id = 0; batch_id < batch_size; ++batch_id) {
-    const bool initial_state = has_initial_state[batch_id];
+    const bool initial_state = has_initial_state == nullptr || has_initial_state[batch_id];
     const int seq_start_offset = query_start_loc[batch_id];
     const int seq_end_offset = query_start_loc[batch_id + 1];
     const int seq_len = seq_end_offset - seq_start_offset;
@@ -312,7 +313,8 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
     const int* query_start_loc,
     const int* cache_indices,
     const bool* has_initial_state,
-    const int* token_indx,
+    const int* token_indx,  // [total_virtual_seqlen] or nullptr; must be contiguous per
+                            // chunk (see TODO at its use below) -- not an arbitrary gather map
     const int batch_size,
     const int total_virtual_seqlen,
     const int num_k_heads,
@@ -381,6 +383,20 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
       int current_chunk_size = chunk_size;
       if ((chunk_id + 1) * chunk_size > seq_len) {
         current_chunk_size = seq_len - chunk_id * chunk_size;
+      }
+
+      // The core_attn_out store below (O_ptr/O_tensor) assumes token_indx is
+      // contiguous across this chunk, i.e. token_indx[out_chunk_offset + r] ==
+      // token_indx[out_chunk_offset] + r for all r in [0, current_chunk_size). It
+      // derives a single affine base pointer from token_indx[out_chunk_offset] and
+      // reuses the block-2D copy's fixed row stride instead of a per-row gather, to
+      // avoid the cost of scattering every output row individually.
+      // TODO Revisit with a per-row scatter (or reject non-contiguous maps at the interface)
+      // if this assumption is ever violated (e.g. by interleaved mixed/spec batches).
+      if (token_indx != nullptr && local_id == 0) {
+        for (int r = 1; r < current_chunk_size; ++r) {
+          assert(token_indx[out_chunk_offset + r] == token_indx[out_chunk_offset] + r);
+        }
       }
 
       float g_last_value = a[(chunk_offset + current_chunk_size - 1) + v_head_id * total_virtual_seqlen];

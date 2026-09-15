@@ -189,8 +189,10 @@ def test_wrapper_workspace_is_grow_only_and_cached_per_device():
         small["state_idx"],
         False,
     )
-    assert device in gdn_attn_mod._gdn_ws_cache
-    buf_after_small = gdn_attn_mod._gdn_ws_cache[device]
+    queue = torch.xpu.current_stream(device).sycl_queue
+    key = (device, queue)
+    assert key in gdn_attn_mod._gdn_ws_cache
+    buf_after_small = gdn_attn_mod._gdn_ws_cache[key]
     small_numel = buf_after_small.numel()
 
     large = _make_inputs("prefill", 2, 128, dtype, device)
@@ -201,7 +203,7 @@ def test_wrapper_workspace_is_grow_only_and_cached_per_device():
         large["state_idx"],
         False,
     )
-    buf_after_large = gdn_attn_mod._gdn_ws_cache[device]
+    buf_after_large = gdn_attn_mod._gdn_ws_cache[key]
     assert buf_after_large.numel() >= small_numel
     assert buf_after_large.numel() > small_numel  # the prefill call is much larger
 
@@ -215,7 +217,7 @@ def test_wrapper_workspace_is_grow_only_and_cached_per_device():
         tiny["state_idx"],
         False,
     )
-    buf_after_tiny = gdn_attn_mod._gdn_ws_cache[device]
+    buf_after_tiny = gdn_attn_mod._gdn_ws_cache[key]
     assert buf_after_tiny.data_ptr() == buf_after_large.data_ptr()
     assert buf_after_tiny.numel() == buf_after_large.numel()
 

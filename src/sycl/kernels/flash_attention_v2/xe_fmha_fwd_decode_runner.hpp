@@ -718,7 +718,8 @@ template <
     typename GmemTiledCopyK = void,
     typename GmemTiledCopyV = void,
     typename GmemTiledCopyO = void,
-    bool HasRelBias = false>
+    bool HasRelBias = false,
+    bool Softcap = false>
 struct DecodeConfig {
   static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
   using MMAOperation = cute::conditional_t<
@@ -800,7 +801,8 @@ struct DecodeConfig {
         GmemTiledCopyV_cache,
         LocalMask,
         PackGQA,
-        HasRelBias>;
+        HasRelBias,
+        Softcap>;
 
     // Epilogue
     using CollectiveEpilogue = cutlass::fmha::collective::
@@ -870,7 +872,8 @@ template <
     typename GmemTiledCopyK = void,
     typename GmemTiledCopyV = void,
     typename GmemTiledCopyO = void,
-    bool HasRelBias = false>
+    bool HasRelBias = false,
+    bool Softcap = false>
 struct SplitDecodeConfig {
   static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
   using MMAOperation =
@@ -923,7 +926,8 @@ struct SplitDecodeConfig {
         GmemTiledCopyK,
         GmemTiledCopyV,
         LocalMask,
-        HasRelBias>;
+        HasRelBias,
+        Softcap>;
 
     // Epilogue
     using CollectiveEpilogue = cutlass::fmha::collective::

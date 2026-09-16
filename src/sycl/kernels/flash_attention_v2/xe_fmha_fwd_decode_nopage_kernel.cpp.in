@@ -72,6 +72,7 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
   // support at all -- checked above).
   if (params.return_softmax_lse) {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
       using Element = @ELEM_TYPE@;
       DecodeConfig<
           false,
@@ -88,12 +89,26 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
           Element,
           Element,
           Element,
-          Element>::run_nopaged(params);
+          Element,
+          /*PackGQAEnabled=*/true,
+          void,
+          cute::Stride<int, cute::_1, int, int>,
+          cute::Stride<int, cute::_1, int, int>,
+          cute::Stride<cute::_1, int, int, int>,
+          cute::Stride<int, cute::_1, int, int>,
+          void,
+          void,
+          void,
+          void,
+          /*HasRelBias=*/false,
+          Softcap>::run_nopaged(params);
+      });
     });
     return;
   }
   // No sink support for no_page path; always use Sink=false
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+    AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
     using Element = @ELEM_TYPE@;
     DecodeConfig<
         false,
@@ -110,7 +125,20 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
         Element,
         Element,
         Element,
-        Element>::run_nopaged(params);
+        Element,
+        /*PackGQAEnabled=*/true,
+        void,
+        cute::Stride<int, cute::_1, int, int>,
+        cute::Stride<int, cute::_1, int, int>,
+        cute::Stride<cute::_1, int, int, int>,
+        cute::Stride<int, cute::_1, int, int>,
+        void,
+        void,
+        void,
+        void,
+        /*HasRelBias=*/false,
+        Softcap>::run_nopaged(params);
+    });
   });
 }
 

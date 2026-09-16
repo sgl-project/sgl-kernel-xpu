@@ -635,6 +635,7 @@ template <
     typename SubgroupLayoutQK,
     typename SubgroupLayoutPV_ = void, /* void -> default */
     bool HasRelBias = false,
+    bool Softcap = false,
     int PipelineStages = 2,  // TODO: This is hard-coded as 1 in kernel.
     bool persistent = false,
     typename ElementQ = bfloat16_t,
@@ -716,7 +717,8 @@ struct FMHAConfig {
         GmemTiledCopyV_cache,
         LocalMask,
         false,  // PackGQA is decode-only; relative attention always uses prefill.
-        HasRelBias>;
+        HasRelBias,
+        Softcap>;
 
     // Epilogue
     using CollectiveEpilogue = cutlass::fmha::collective::

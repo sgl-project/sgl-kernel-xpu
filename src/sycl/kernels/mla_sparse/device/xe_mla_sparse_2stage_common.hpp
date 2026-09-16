@@ -48,6 +48,7 @@
 
 #include "cutlass/bfloat16.h"
 #include "cutlass/device_kernel.h"
+#include "cutlass/fast_math.h"
 #include "cutlass/float8.h"
 #include "cutlass/half.h"
 
@@ -211,6 +212,12 @@ struct Mainloop2StageParams {
 // write out (leaving these fields null/0).
 struct Epilogue2StageParams {
   int h_q = 0;
+  // Batch / query-seqlen (and, for split-K, the split count) the stat tensors are sliced
+  // from: lse / max_logits are [b, s_q, h_q]; the split stats are [b, s_q, num_kv_splits,
+  // h_q]. The epilogue builds those CuTe views and indexes by (batch, seq, [kv-split,] head)
+  // instead of a flattened base + idx*stride. num_kv_splits is read only by the split-K
+  // publish path (IS_SPLIT_KV); non-split leaves it 1.
+  int b = 0, s_q = 0, num_kv_splits = 1;
   float sm_scale_div_log2 = 0.f;
 
   float* __restrict__ lse = nullptr;  // [b, s_q, h_q]
@@ -266,6 +273,12 @@ struct Gather2StageParams {
 struct DecodeGather2StageParams : Gather2StageParams {
   int num_blocks = 0, page_block_size = 0;
   int extra_num_blocks = 0, extra_page_block_size = 0, extra_topk = 0;
+
+  // Precomputed magic-number reciprocals for the two page sizes, so locate_token's
+  // token_idx -> (block_idx, rel_idx) split costs a multiply-high plus two shifts instead
+  // of an divide.
+  cutlass::FastDivmod page_block_divmod;
+  cutlass::FastDivmod extra_page_block_divmod;
 
   uint8_t* __restrict__ kv = nullptr;  // packed fp8 KV cache
   int stride_kv_block = 0;

@@ -74,11 +74,11 @@ def flash_mla_decode(
 
     _, PAGE_SIZE, D_ckv = kv_c_and_k_pe_cache.shape
 
-    D_latent = 512
-    D_rope = 64
-    assert D_q_nope == D_latent
-    assert D_q_pe == D_rope
-    assert D_ckv == D_latent + D_rope
+    D_latent = D_q_nope
+    D_rope = D_q_pe
+    assert (
+        D_ckv == D_latent + D_rope
+    ), f"kv dim {D_ckv} must equal D_latent({D_latent}) + D_rope({D_rope})"
 
     MAX_HEADS = 128
     assert H <= MAX_HEADS, f"H must be <= {MAX_HEADS}, but got {H}"

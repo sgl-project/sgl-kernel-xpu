@@ -72,6 +72,11 @@ def ref_mla(
 @pytest.mark.parametrize("block_size", [16, 32, 64, 128])
 @pytest.mark.parametrize("num_heads", [16, 32, 64, 128])
 @pytest.mark.parametrize("num_kv_splits", [-1, 1])
+@pytest.mark.parametrize(
+    "dv, q_pe_dim, q_nope_dim",
+    [(512, 64, 128), (256, 32, 64)],
+    ids=["deepseek", "minicpm3"],
+)
 def test_flash_mla_decode(
     dtype: torch.dtype,
     mean_seq_len: int,
@@ -80,16 +85,15 @@ def test_flash_mla_decode(
     block_size: int,
     num_heads: int,
     num_kv_splits: int,
+    dv: int,
+    q_pe_dim: int,
+    q_nope_dim: int,
 ):
 
     torch.random.manual_seed(42)
 
-    d = 576
+    d = dv + q_pe_dim
     h_q = num_heads
-    dv = 512
-
-    q_nope_dim = 128
-    q_pe_dim = 64
     scale = (q_nope_dim + q_pe_dim) ** (-0.5)
     if varlen:
         seq_lens_cpu = torch.empty(bs, dtype=dtype).normal_(

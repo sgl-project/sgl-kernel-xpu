@@ -89,6 +89,7 @@ hadamard_transform = torch.ops.sgl_kernel.hadamard_transform
 fused_q_indexer_rope_hadamard_quant = (
     torch.ops.sgl_kernel.fused_q_indexer_rope_hadamard_quant
 )
+from sgl_kernel.gdn_attn import gdn_attention
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,

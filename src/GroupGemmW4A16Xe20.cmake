@@ -18,8 +18,12 @@ endfunction()
 # layouts and have separate N-tail-skip instantiations, because that bit changes
 # device code. select_w4a16_policy_id() chooses from this table per call.
 # group_size (32/64/128/256) is compiled into every unit as a runtime branch,
-# so it does not multiply the instance count. Total: 7 policies x 2
-# (int4/mxfp4) x 2 (bf16/fp16 activation) = 28 units.
+# so it does not multiply the instance count. Total: 14 policies x 2
+# (int4/mxfp4) x 2 (bf16/fp16 activation) = 56 units.
+#
+# This list is in policy-id order: new policies go on the end, so the ids of the
+# existing ones do not move. The last seven are the small-m N-width sweep, which
+# only SGL_W4A16_POLICY_ID reaches (see w4a16_launch_policy.hpp).
 foreach(policy
         w4a16_launch_policy_m_8_n_64
         w4a16_launch_policy_m_16_n_64
@@ -27,7 +31,14 @@ foreach(policy
         w4a16_launch_policy_m_64_n_128
         w4a16_launch_policy_m_64_n_128_skip
         w4a16_launch_policy_m_64_n_256
-        w4a16_launch_policy_m_64_n_256_skip)
+        w4a16_launch_policy_m_64_n_256_skip
+        w4a16_launch_policy_m_8_n_128
+        w4a16_launch_policy_m_8_n_128_skip
+        w4a16_launch_policy_m_8_n_256
+        w4a16_launch_policy_m_8_n_256_skip
+        w4a16_launch_policy_m_8_n_32
+        w4a16_launch_policy_m_8_n_16
+        w4a16_launch_policy_m_8_n_64_nobar)
     foreach(act_tag bf16 fp16)
         if(act_tag STREQUAL "bf16")
             set(element_a "cutlass::bfloat16_t")

@@ -334,9 +334,10 @@ def sgl_build_tree_kernel_triton(
         draft_token_num=draft_token_num,
         tree_mask_mode=int(tree_mask_mode),
         batch_size=batch_size,
-        parent_list_stride=(
-            parent_list.stride(0) if parent_list.dim() > 1 else parent_list.shape[0]
-        ),
+        # A 1-D parent_list is one flat list shared by every request, so the
+        # per-request offset must vanish: batch_idx * 0 keeps all programs
+        # reading the same entries instead of walking past the end.
+        parent_list_stride=(parent_list.stride(0) if parent_list.dim() > 1 else 0),
         selected_index_stride=selected_index.stride(0),
     )
 

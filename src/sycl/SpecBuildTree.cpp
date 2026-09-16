@@ -472,7 +472,7 @@ SGL_KERNEL_EXPORT void build_tree_kernel_efficient(
     parent_list_stride = parent_list.stride(0);
     parent_list_width = parent_list.size(1);
   } else {
-    parent_list_stride = parent_list.numel();
+    parent_list_stride = 0;
     parent_list_width = parent_list.numel();
   }
 

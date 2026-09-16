@@ -2,7 +2,11 @@ import unittest
 
 import torch
 import utils
-from sgl_kernel.eagle_utils import build_tree_kernel_efficient, organize_draft_results
+from sgl_kernel.eagle_utils import (
+    TreeMaskMode,
+    build_tree_kernel_efficient,
+    organize_draft_results,
+)
 
 device = utils.get_device()
 
@@ -391,6 +395,80 @@ class TestBuildEagleTree(unittest.TestCase):
             self.assertTrue(
                 torch.equal(filled[idx], skipped[idx]),
                 f"{name} diverged between filled and skipped runs",
+            )
+
+    def test_shared_1d_parent_list(self):
+        """A 1-D parent_list is shared by every request, so it must match the tiled 2-D form."""
+        bs, topk, depth, num_draft_token = 2, 1, 3, 4
+        mode = TreeMaskMode.FULL_MASK
+        seq_lens = torch.tensor([5, 10], dtype=torch.int64, device=device)
+        seq_lens_sum = int(seq_lens.sum().item())
+        # topk=1 chain: token i descends from i-1; index 0 is the root. Nodes 2 and
+        # 3 resolve through a real parent_list read (node 1 hits the root
+        # short-circuit), so this input does exercise the shared-list load.
+        shared = [0, 0, 1]
+        selected_index = torch.tensor(
+            [[0, 1, 2]] * bs, dtype=torch.int64, device=device
+        )
+
+        POISON = 1 << 40  # never a valid table index
+        # Long enough that a bid * len(shared) stride stays inside the allocation
+        # for every request, so the stray read lands in poison rather than off-heap.
+        buf = torch.full(
+            (len(shared) * (bs + 2),), POISON, dtype=torch.int64, device=device
+        )
+        buf[: len(shared)] = torch.tensor(shared, dtype=torch.int64, device=device)
+        parent_list_1d = buf[: len(shared)]
+        parent_list_2d = torch.tensor([shared] * bs, dtype=torch.int64, device=device)
+        self.assertEqual(parent_list_1d.dim(), 1)
+        self.assertEqual(parent_list_2d.shape, (bs, len(shared)))
+
+        draft_tokens = torch.arange(
+            bs * (num_draft_token - 1), dtype=torch.int64, device=device
+        ).view(bs, -1)
+        bonus_tokens = torch.tensor([101, 102], dtype=torch.int32, device=device)
+
+        def build(parent_list):
+            return build_tree_kernel_efficient(
+                bonus_tokens=bonus_tokens,
+                parent_list=parent_list,
+                top_scores_index=selected_index,
+                draft_tokens=draft_tokens,
+                seq_lens=seq_lens,
+                seq_lens_sum=seq_lens_sum,
+                topk=topk,
+                spec_steps=depth,
+                num_verify_tokens=num_draft_token,
+                tree_mask_mode=mode,
+            )
+
+        tiled = build(parent_list_2d)
+        shared_out = build(parent_list_1d)
+
+        # Anti-vacuous: pin the reference to the known chain so the comparison
+        # below cannot pass by both runs being equally degenerate.
+        self.assertEqual(
+            tiled[3].tolist(),
+            [[1, 2, 3, -1]] * bs,
+            "2-D reference did not build the expected chain; the shared-list "
+            "comparison would be vacuous",
+        )
+
+        names = (
+            "tree_mask",
+            "positions",
+            "retrieve_index",
+            "retrieve_next_token",
+            "retrieve_next_sibling",
+            "draft_tokens",
+        )
+        for idx, name in enumerate(names):
+            self.assertTrue(
+                torch.equal(shared_out[idx], tiled[idx]),
+                f"{name} diverged between the 1-D shared parent_list and the "
+                f"same list tiled {bs} times\n"
+                f"  1-D: {shared_out[idx].tolist()}\n"
+                f"  2-D: {tiled[idx].tolist()}",
             )
 
 

@@ -243,8 +243,13 @@ def _estimate_bytes(
     lora_ranks: torch.Tensor,
     band_dims: List[int],
     elem_size: int,
+    has_residual: bool,
 ) -> float:
-    """Memory traffic estimate: read x band + weight band, write output band, per gate/up."""
+    """Memory traffic estimate: read x band + weight band, write output band, per gate/up.
+
+    With a residual (base_output), the kernel also reads base_output as C
+    (D = scalings * (x @ W^T) + C), one full output-sized read per projection.
+    """
     seg_lens_cpu = seg_lens.to("cpu")
     weight_indices_cpu = weight_indices.to("cpu")
     lora_ranks_cpu = lora_ranks.to("cpu")
@@ -259,6 +264,8 @@ def _estimate_bytes(
             bytes_w = n_p * rank * elem_size
             bytes_out = seg_len * n_p * elem_size
             total += bytes_x + bytes_w + bytes_out
+            if has_residual:
+                total += bytes_out  # read base_output as C
     return total
 
 
@@ -462,6 +469,7 @@ def benchmark(case_id, provider):
         inputs["lora_ranks"],
         band_dims,
         elem_size,
+        has_residual=inputs["base_output"] is not None,
     )
 
     quantiles = [0.5, 0.2, 0.8]

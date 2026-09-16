@@ -2,7 +2,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from .utils import is_xe2_arch
+from .utils import is_xe2_arch, is_xe3_arch
 
 _MOE_SCORING_FUNC_MAP = {
     "sigmoid": 0,
@@ -269,6 +269,41 @@ def fp8_blockwise_scaled_grouped_mm(
         stride_c,
         layout_sfa,
         layout_sfb,
+        problem_sizes,
+        expert_offsets,
+        workspace,
+    )
+
+
+def mxfp4_blockwise_scaled_grouped_mm(
+    output,
+    a_ptrs,
+    b_ptrs,
+    out_ptrs,
+    a_scales_ptrs,
+    b_scales_ptrs,
+    a,
+    b,
+    scales_a,
+    scales_b,
+    problem_sizes,
+    expert_offsets,
+    workspace,
+):
+    assert (
+        is_xe3_arch()
+    ), "mxfp4_blockwise_scaled_grouped_mm is only supported on CRI (Xe3P) devices"
+    torch.ops.sgl_kernel.mxfp4_blockwise_scaled_grouped_mm.default(
+        output,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        a,
+        b,
+        scales_a,
+        scales_b,
         problem_sizes,
         expert_offsets,
         workspace,
@@ -567,9 +602,14 @@ def fused_experts(
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
 
-    assert is_xe2_arch(), "Current MoE is only supported on BMG"
+    assert (
+        is_xe2_arch() or is_xe3_arch()
+    ), "Current MoE is only supported on BMG (Xe2) or CRI (Xe3)"
 
     use_fp8_weight = use_fp8_w8a8
+    assert not (
+        use_fp8_weight and is_xe3_arch()
+    ), "the FP8 W8A16 grouped GEMM (moe_grouped_mm_nt_xe20_fp8_w8a16) is not yet ported to CRI (Xe3)"
     assert a1_scale is None, (
         "prequantized FP8 activation input is not supported: " "a1_scale must be None"
     )
@@ -630,6 +670,9 @@ def fused_experts(
     assert not (
         use_4bit_w4a16 and use_fp8_weight
     ), "4-bit W4A16 and FP8 paths are mutually exclusive"
+    assert not (
+        use_4bit_w4a16 and is_xe3_arch()
+    ), "the unified int4/mxfp4 W4A16 grouped GEMM (moe_grouped_mm_nt_xe20_w4a16) is not yet ported to CRI (Xe3)"
     if use_4bit_w4a16:
         assert (
             w1.dtype == torch.int8 or w1.dtype == torch.uint8
@@ -700,14 +743,14 @@ def fused_experts(
         assert (
             b1.dtype == torch.bfloat16 or b1.dtype == torch.float32
         ), "b1 must be bfloat16 or float32"
-        if is_xe2_arch() and b1.dtype == torch.bfloat16:
+        if (is_xe2_arch() or is_xe3_arch()) and b1.dtype == torch.bfloat16:
             # cast b1 to float32, since bias is accumulated in float32 in the kernel
             b1 = b1.float()
     if b2 is not None:
         assert (
             b2.dtype == torch.bfloat16 or b2.dtype == torch.float32
         ), "b2 must be bfloat16 or float32"
-        if is_xe2_arch() and b2.dtype == torch.bfloat16:
+        if (is_xe2_arch() or is_xe3_arch()) and b2.dtype == torch.bfloat16:
             # cast b2 to float32, since bias is accumulated in float32 in the kernel
             b2 = b2.float()
     # Shape check
@@ -959,6 +1002,14 @@ def fused_experts(
     # and apply the gated activation with its dedicated elementwise kernel.
     # This preserves GEMM N-dimension parallelism.
     use_unfused_act = use_4bit_w4a16 or (avg_m <= 128 and big_weight)
+    # Plain bf16 grouped GEMM: dispatch to the Xe3 (CRI) op when running on
+    # Xe3, otherwise the Xe2 (BMG) op. use_4bit_w4a16/use_fp8_weight are
+    # asserted unsupported on Xe3 above, so this only guards the bf16 path.
+    moe_grouped_mm_nt = (
+        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe35
+        if is_xe3_arch()
+        else torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20
+    )
     if use_unfused_act:
         intermediate_cache1 = _get_moe_ws(
             "intermediate_cache1_unfused",
@@ -981,7 +1032,7 @@ def fused_experts(
                 w1_group_size,
             )
         else:
-            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+            moe_grouped_mm_nt(
                 intermediate_cache1,
                 input_A_shuffle,
                 w1,
@@ -1040,7 +1091,7 @@ def fused_experts(
                 w2_group_size,
             )
         else:
-            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+            moe_grouped_mm_nt(
                 intermediate_cache3,
                 intermediate_cache2,
                 w2,
@@ -1062,7 +1113,7 @@ def fused_experts(
         # GEMM1 (fused act): B = w1 (gate+up). The 4-bit W4A16 paths always use the
         # separate GEMM1 -> activation -> GEMM2 sequence above, so this branch is
         # only for the non-4-bit grouped-GEMM path.
-        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+        moe_grouped_mm_nt(
             intermediate_cache1,
             input_A_shuffle,
             w1,
@@ -1075,7 +1126,7 @@ def fused_experts(
             gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
         )
         # GEMM2: B = w2 (down). Always fuse_act=False on the second GEMM.
-        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+        moe_grouped_mm_nt(
             intermediate_cache3,
             intermediate_cache1,
             w2,

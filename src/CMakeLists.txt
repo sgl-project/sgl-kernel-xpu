@@ -116,6 +116,7 @@ if(NOT USE_MLA)
 endif()
 if(NOT USE_MOE)
     list(FILTER device_cpp EXCLUDE REGEX "/(GroupGemm(Xe20|W4A16Xe20|W8A16Xe20)|MoE(Align|PrepareInputs|Sum|_fused_gate|_sum_reduce))\\.cpp$")
+    list(FILTER device_cpp EXCLUDE REGEX "/xe35/(GroupGemm|GroupGemmMxfp4W4A16|blockwise_moe_mxfp4|blockwise_moe_mxfp8)\\.cpp$")
 endif()
 
 # BMG only
@@ -163,6 +164,10 @@ if(USE_MOE)
         include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmW4A16Xe20.cmake)
         include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmW8A16Xe20.cmake)
     endif()
+    # Xe3 (CRI) does not participate in the runtime-JIT path (Xe3 AOT
+    # instances are always built when USE_MOE is on).
+    include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmXe35.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmMxfp4W4A16Xe35.cmake)
 endif()
 
 

@@ -206,7 +206,7 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
     // Node i sits at flat slot out_base + i, so this is the identity map.
 #pragma unroll 2
-    for (int32_t i = tid; i < num_nodes; i += lrange) {
+    for (int32_t i = row_start + tid; i < row_end; i += lrange) {
       retrieve_index_[out_base + i] = out_base + i;
     }
 
@@ -230,7 +230,7 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       //   next_token[i]   = lowest set bit of child[i] -> lowest child
       //   next_sibling[i] = lowest bit of the parent's child set above bit i
 #pragma unroll 2
-      for (int32_t i = tid; i < num_nodes; i += lrange) {
+      for (int32_t i = row_start + tid; i < row_end; i += lrange) {
         const uint64_t kids = child[i];
         retrieve_next_token_[out_base + i] = kids ? static_cast<int64_t>(sycl::ctz(kids)) : -1;
 
@@ -317,7 +317,7 @@ struct BuildTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     } else {
       // More than 64 nodes, so no bitmask fits.
 #pragma unroll 2
-      for (int32_t i = tid; i < num_nodes; i += lrange) {
+      for (int32_t i = row_start + tid; i < row_end; i += lrange) {
         int64_t next_token = -1;
 #pragma unroll 2
         for (int32_t j = 1; j < num_nodes; ++j) {

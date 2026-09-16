@@ -839,8 +839,56 @@ def fused_experts(
     expert_offsets = _get_moe_ws(
         "expert_offsets", (E,), torch.int32, hidden_states.device
     )
-    use_small_prepare = (
-        _should_use_small_moe_prepare(M, TopK, hidden_dims, E) and use_fp8_weight
+    # prepare_moe_input_small does in one kernel what prepare_moe_input +
+    # scatter_tokens_to_experts do in four (per-expert histogram, exclusive
+    # scan, arg-sort, then the token scatter). It also drops
+    # prepare_moe_input's per-call `torch::empty(E + 1)` atomic buffer
+    # (MoEPrepareInputs.cpp:485) and the int64->int32 topk_ids narrowing, since
+    # it dispatches on the index type directly.
+    #
+    # problem_sizes1/problem_sizes2/a_map are the only outputs it does not
+    # produce, and nothing downstream of this branch reads them: the grouped
+    # GEMMs take `expert_offsets` (per-expert row counts) plus the shuffled
+    # activations, and the combine takes `c_map`. That is why the FP8 W8A16
+    # path could already use it, and it is equally true for 4-bit W4A16.
+    #
+    # Enabled here only for a single token, which is decode at concurrency 1.
+    # The kernel is a *one work-group* launch (MoEPrepareInputs.cpp:742), so its
+    # scatter cost grows with num_tokens * TopK * hidden_dims while its grid does
+    # not, and the four-kernel path -- whose scatter uses one work-group per
+    # token -- overtakes it immediately. Measured on one B60 at the GPT-OSS-120b
+    # tp=4 decode shapes (H=2880, I=736, E=128, TopK=4), bookkeeping device
+    # self-time per fused_experts call, four kernels vs one:
+    #
+    #   num_tokens    1      2      4      8     14
+    #   4-kernel  11.77  13.20  12.70  14.42  12.35 us
+    #   fused      6.80  20.63  29.67  28.91  40.72 us
+    #
+    # num_tokens == 1 takes the kernel's own `input_rows_ == 1` fast path, where
+    # the permutation is a sort of TopK elements and the scatter is a broadcast
+    # of one row. Raising this bound needs a multi-work-group prepare kernel,
+    # which cannot be one kernel without a cross-work-group barrier.
+    #
+    # The kernel is bf16-only and needs a contiguous 2-D input
+    # (MoEPrepareInputs.cpp:690-697), so both are gated here rather than left to
+    # its TORCH_CHECKs. The non-4-bit, non-FP8 bf16 grouped GEMM would also
+    # qualify structurally but is not enabled here because it was not measured.
+    #
+    # topk_ids strides are deliberately NOT gated on. The branch below copies a
+    # strided topk_ids contiguous, whereas prepare_moe_input indexes it linearly
+    # over numel and so reads the stride holes -- a strided [1, 4] view of a
+    # [1, 8] buffer makes it count storage elements 0..3 as the routes, and an
+    # out-of-range value in a hole faults the device. Adding an
+    # `is_contiguous()` term here would route those cases back into that, so
+    # don't.
+    use_small_prepare = _should_use_small_moe_prepare(M, TopK, hidden_dims, E) and (
+        use_fp8_weight
+        or (
+            use_4bit_w4a16
+            and M == 1
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+        )
     )
     c_map = _get_moe_ws("c_map", (topk_ids.numel(),), torch.int32, hidden_states.device)
     input_A_shuffle = _get_moe_ws(

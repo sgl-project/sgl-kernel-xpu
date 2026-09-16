@@ -2,15 +2,16 @@
 
 #include <torch/all.h>
 
+#include <cassert>
 #include <cstdint>
 #include <sycl/sycl.hpp>
 
 #include "../../Utils.h"
 #include "../../gdn_attn/gdn_attn_utils.h"
-#include "gemm_xe20.hpp"
+#include "gemm.hpp"
 
 // When the chunk kernels run through the runtime-JIT path, the host dispatcher
-// (impl_xe20) forwards raw pointers to the JIT layer instead of instantiating
+// (impl) forwards raw pointers to the JIT layer instead of instantiating
 // the heavy per-dtype kernel_launcher. The JIT instance TU (SGL_GDN_JIT_ENTRY)
 // itself must NOT pull this in -- it only instantiates one kernel_launcher.
 #if defined(USE_GDN_JIT) && !defined(SGL_GDN_JIT_ENTRY)
@@ -204,7 +205,7 @@ CUTE_DEVICE void chunk_compute_wu_kernel(
   const int kv_ratio = num_v_heads / num_k_heads;
 
   for (int batch_id = 0; batch_id < batch_size; ++batch_id) {
-    const bool initial_state = has_initial_state[batch_id];
+    const bool initial_state = has_initial_state == nullptr || has_initial_state[batch_id];
     const int seq_start_offset = query_start_loc[batch_id];
     const int seq_end_offset = query_start_loc[batch_id + 1];
     const int seq_len = seq_end_offset - seq_start_offset;
@@ -312,7 +313,8 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
     const int* query_start_loc,
     const int* cache_indices,
     const bool* has_initial_state,
-    const int* token_indx,
+    const int* token_indx,  // [total_virtual_seqlen] or nullptr; must be contiguous per
+                            // chunk (see TODO at its use below) -- not an arbitrary gather map
     const int batch_size,
     const int total_virtual_seqlen,
     const int num_k_heads,
@@ -381,6 +383,20 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
       int current_chunk_size = chunk_size;
       if ((chunk_id + 1) * chunk_size > seq_len) {
         current_chunk_size = seq_len - chunk_id * chunk_size;
+      }
+
+      // The core_attn_out store below (O_ptr/O_tensor) assumes token_indx is
+      // contiguous across this chunk, i.e. token_indx[out_chunk_offset + r] ==
+      // token_indx[out_chunk_offset] + r for all r in [0, current_chunk_size). It
+      // derives a single affine base pointer from token_indx[out_chunk_offset] and
+      // reuses the block-2D copy's fixed row stride instead of a per-row gather, to
+      // avoid the cost of scattering every output row individually.
+      // TODO Revisit with a per-row scatter (or reject non-contiguous maps at the interface)
+      // if this assumption is ever violated (e.g. by interleaved mixed/spec batches).
+      if (token_indx != nullptr && local_id == 0) {
+        for (int r = 1; r < current_chunk_size; ++r) {
+          assert(token_indx[out_chunk_offset + r] == token_indx[out_chunk_offset] + r);
+        }
       }
 
       float g_last_value = a[(chunk_offset + current_chunk_size - 1) + v_head_id * total_virtual_seqlen];
@@ -610,13 +626,13 @@ class ChunkComputeWUKernel;
 template <typename T, typename StateT>
 class ChunkFwdOKernel;
 
-// Forward declaration only: defined in chunk_compute_A_inverse_fused_xe20.hpp,
+// Forward declaration only: defined in chunk_compute_A_inverse_fused.hpp,
 // included (after this header) by chunk_gated_delta_rule.cpp. Fuses the
 // compute-A step with the matrix-inverse step into a single kernel launch,
 // replacing the previous separate chunk_compute_A_kernel +
 // chunk_inverse_opt_kernel launches.
 template <typename T, typename StateT>
-void launch_chunk_compute_A_inverse_fused_xe20(
+void launch_chunk_compute_A_inverse_fused(
     sycl::queue& queue,
     T* A,
     const T* k,
@@ -656,7 +672,6 @@ void kernel_launcher(
     const int head_k_dim,
     const int num_v_heads,
     const int head_v_dim) {
-  TORCH_CHECK(is_bmg(), "chunk_gdn: only BMG is supported for now");
   using Element_non_CV = cutlass::platform::remove_cv_t<T>;
   auto op = XE_DPAS_TT<8, float, Element_non_CV>{};
 
@@ -689,8 +704,8 @@ void kernel_launcher(
         });
   });
 
-  // compute A + invert: single fused kernel launch (see chunk_compute_A_inverse_fused_xe20.hpp).
-  launch_chunk_compute_A_inverse_fused_xe20<T, StateT>(
+  // compute A + invert: single fused kernel launch (see chunk_compute_A_inverse_fused.hpp).
+  launch_chunk_compute_A_inverse_fused<T, StateT>(
       queue, A, k, b, a, total_chunks, total_virtual_seqlen, num_k_heads, head_k_dim, num_v_heads, head_v_dim);
 
   // compute W U
@@ -773,7 +788,7 @@ void kernel_launcher(
 // The host dispatcher does torch marshalling only; it is excluded from the JIT
 // instance TU (which just instantiates the selected kernel_launcher).
 #ifndef SGL_GDN_JIT_ENTRY
-void chunk_gated_delta_rule_impl_xe20(
+void chunk_gated_delta_rule_impl(
     sycl::queue& queue,
     torch::Tensor& core_attn_out,                           // [total_seqlen, num_v_heads, head_v_dim]
     const torch::Tensor& q,                                 // [total_virtual_seqlen, num_k_heads, head_k_dim]

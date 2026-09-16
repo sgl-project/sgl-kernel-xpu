@@ -114,42 +114,51 @@ def test_rmsnorm_jit_vs_aot():
 
 @pytest.mark.skipif(not HAS_SGLANG_JIT, reason="Requires SGLang for JIT compilation")
 @pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
-def test_qknorm_jit_vs_reference():
-    """Test QKNorm JIT accuracy vs PyTorch reference for hidden_size=128, dtype=float16."""
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("packed_qkv", [False, True])
+def test_qknorm_jit_vs_reference(dtype, packed_qkv):
+    """Test QKNorm JIT accuracy vs PyTorch reference for head_dim=128.
+
+    With ``packed_qkv`` the q/k inputs are slices of a fused QKV projection, so
+    they are not contiguous: only the per-token row stride differs, which the
+    kernel takes as a parameter. V must then stay untouched.
+    """
     device = "xpu"
-    dtype = torch.float16
-    batch_size = 32
-    seq_len = 64
-    num_heads = 8
-    head_dim = 128
+    num_tokens = 2048
+    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
     eps = 1e-6
 
-    # Create input tensors (3D: batch_size, num_heads, head_dim)
-    # Note: fused_inplace_qknorm expects 3D tensors
-    q = torch.randn(
-        batch_size * seq_len, num_heads, head_dim, dtype=dtype, device=device
+    qkv = torch.randn(
+        num_tokens,
+        (num_qo_heads + 2 * num_kv_heads) * head_dim,
+        dtype=dtype,
+        device=device,
     )
-    k = torch.randn(
-        batch_size * seq_len, num_heads, head_dim, dtype=dtype, device=device
-    )
+    q_size, kv_size = num_qo_heads * head_dim, num_kv_heads * head_dim
+    q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+    q = q.view(num_tokens, num_qo_heads, head_dim)
+    k = k.view(num_tokens, num_kv_heads, head_dim)
+    if not packed_qkv:
+        q, k = q.contiguous(), k.contiguous()
+    assert q.is_contiguous() is not packed_qkv
+
     q_weight = torch.randn(head_dim, dtype=dtype, device=device)
     k_weight = torch.randn(head_dim, dtype=dtype, device=device)
 
-    # PyTorch reference (on 4D reshaped)
-    q_4d = q.view(batch_size, seq_len, num_heads, head_dim)
-    k_4d = k.view(batch_size, seq_len, num_heads, head_dim)
-    q_ref, k_ref = reference_qknorm(q_4d, k_4d, q_weight, k_weight, eps)
-    q_ref = q_ref.reshape(-1, num_heads, head_dim)
-    k_ref = k_ref.reshape(-1, num_heads, head_dim)
+    # The kernel accumulates in fp32 and rounds once on write-back, so fp32 is the
+    # ground truth; a dtype-native reference is a coarser approximation than the kernel.
+    q_ref, k_ref = reference_qknorm(
+        q.float(), k.float(), q_weight.float(), k_weight.float(), eps
+    )
+    v_ref = v.clone()
 
     # JIT kernel (in-place operation)
-    q_jit = q.clone().contiguous()
-    k_jit = k.clone().contiguous()
-    jit_qknorm(q_jit, k_jit, q_weight, k_weight, eps, head_dim=head_dim)
+    jit_qknorm(q, k, q_weight, k_weight, eps, head_dim=head_dim)
 
     # Compare accuracy
-    torch.testing.assert_close(q_jit, q_ref, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(k_jit, k_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(q.float(), q_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(k.float(), k_ref, rtol=1e-2, atol=1e-2)
+    assert torch.equal(v, v_ref)
 
 
 def reference_rope(q, k, cos_sin_cache, positions, is_neox, rope_dim):

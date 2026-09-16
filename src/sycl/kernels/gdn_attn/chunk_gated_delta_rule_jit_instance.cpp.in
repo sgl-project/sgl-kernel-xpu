@@ -2,16 +2,15 @@
 //
 // Rendered by src/jit/gdn_jit.cpp with @SCALAR_T@ / @STATE_T@ substituted, then
 // icpx-compiled into a standalone .so on first use. Compiling with
-// SGL_GDN_JIT_ENTRY defined excludes chunk_gated_delta_rule_impl_xe20 (torch
+// SGL_GDN_JIT_ENTRY defined excludes chunk_gated_delta_rule_impl_ (torch
 // marshalling stays in the AOT dispatcher) so this TU only instantiates the one
 // selected kernel_launcher<@SCALAR_T@, @STATE_T@> config.
-#define SYCL_INTEL_TARGET 20
 
 #include <torch/all.h>
 
 #include <sycl/sycl.hpp>
 
-#include "sycl/kernels/gdn_attn/chunk_gated_delta_rule_kernels_xe20.hpp"
+#include "sycl/kernels/gdn_attn/chunk_gated_delta_rule_kernels.hpp"
 
 #ifdef SGL_GDN_JIT_ENTRY
 // Stable C ABI entry for the runtime-JIT path. The fixed symbol name never
@@ -69,5 +68,3 @@ extern "C" __attribute__((visibility("default"))) void sgl_gdn_chunk_entry(
       head_v_dim);
 }
 #endif
-
-#undef SYCL_INTEL_TARGET

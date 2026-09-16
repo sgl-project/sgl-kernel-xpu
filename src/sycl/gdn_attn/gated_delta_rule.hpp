@@ -4,6 +4,8 @@
 
 #include <sycl/sycl.hpp>
 
+#include "../SYCLHelpers.h"
+
 namespace gdn {
 static constexpr int sub_group_size = 32;
 template <typename T, typename StateT, int k_bucket_size>
@@ -552,31 +554,29 @@ void kernel_launcher(
   using KERNEL = gated_delta_rule_kernel<T, StateT, k_bucket_size>;
   auto range = KERNEL::get_nd_range(batch_size, num_v_heads, head_v_dim);
   assert(head_v_dim % KERNEL::v_dim_per_group == 0);
-  queue.submit([&](sycl::handler& cgh) {
-    KERNEL task(
-        core_attn_out,
-        q,
-        k,
-        v,
-        b,
-        a,
-        A_log,
-        dt_bias,
-        ssm_state,
-        ssm_state_stride_0,
-        query_start_loc,
-        token_indx,
-        cache_indices,
-        has_initial_state,
-        num_accepted_tokens,
-        batch_size,
-        total_seqlen,
-        num_k_heads,
-        head_k_dim,
-        num_v_heads,
-        head_v_dim);
-    cgh.parallel_for(range, task);
-  });
+  KERNEL task(
+      core_attn_out,
+      q,
+      k,
+      v,
+      b,
+      a,
+      A_log,
+      dt_bias,
+      ssm_state,
+      ssm_state_stride_0,
+      query_start_loc,
+      token_indx,
+      cache_indices,
+      has_initial_state,
+      num_accepted_tokens,
+      batch_size,
+      total_seqlen,
+      num_k_heads,
+      head_k_dim,
+      num_v_heads,
+      head_v_dim);
+  sycl_kernel_submit(range.get_global_range(), range.get_local_range(), queue, task);
 }
 
 template <typename T, typename StateT, int k_bucket_size>
@@ -605,30 +605,28 @@ void kernel_launcher_spec(
   using KERNEL = gated_delta_rule_spec_kernel<T, StateT, k_bucket_size>;
   auto range = KERNEL::get_nd_range(num_spec_decodes, num_v_heads, head_v_dim);
   assert(head_v_dim % KERNEL::v_dim_per_group == 0);
-  queue.submit([&](sycl::handler& cgh) {
-    KERNEL task(
-        core_attn_out,
-        q,
-        k,
-        v,
-        b,
-        a,
-        A_log,
-        dt_bias,
-        ssm_state,
-        ssm_state_stride_0,
-        token_indx,
-        cache_indices,
-        cache_indices_stride_0,
-        num_accepted_tokens,
-        num_spec_decodes,
-        num_spec_tokens,
-        num_k_heads,
-        head_k_dim,
-        num_v_heads,
-        head_v_dim);
-    cgh.parallel_for(range, task);
-  });
+  KERNEL task(
+      core_attn_out,
+      q,
+      k,
+      v,
+      b,
+      a,
+      A_log,
+      dt_bias,
+      ssm_state,
+      ssm_state_stride_0,
+      token_indx,
+      cache_indices,
+      cache_indices_stride_0,
+      num_accepted_tokens,
+      num_spec_decodes,
+      num_spec_tokens,
+      num_k_heads,
+      head_k_dim,
+      num_v_heads,
+      head_v_dim);
+  sycl_kernel_submit(range.get_global_range(), range.get_local_range(), queue, task);
 }
 
 void gated_delta_rule(

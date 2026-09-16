@@ -13,6 +13,11 @@ _GDN_WS_HEADROOM = 1.25
 _gdn_ws_cache: Dict[torch.device, torch.Tensor] = {}
 
 
+def _stream_key(device: torch.device) -> tuple[torch.device, int]:
+    stream = torch.xpu.current_stream(device)
+    return device, stream.sycl_queue
+
+
 def _gdn_workspace_bytes_needed(
     num_prefills: int,
     num_decodes: int,
@@ -44,11 +49,12 @@ def _gdn_workspace_bytes_needed(
 def _get_gdn_workspace(nbytes: int, device: torch.device) -> torch.Tensor:
     """Return a flat 1-D `torch.uint8` buffer with >= `nbytes` capacity on
     `device`, cached/grown (grow-only, with headroom) across calls."""
-    cur = _gdn_ws_cache.get(device)
+    key = _stream_key(device)
+    cur = _gdn_ws_cache.get(key)
     if cur is None or cur.numel() < nbytes:
         new_numel = max(nbytes, int(nbytes * _GDN_WS_HEADROOM))
         cur = torch.empty(new_numel, dtype=torch.uint8, device=device)
-        _gdn_ws_cache[device] = cur
+        _gdn_ws_cache[key] = cur
     return cur
 
 
@@ -110,6 +116,7 @@ def gdn_attention(
         tp_size,
         projected_states_qkvz.dtype,
     )
+    workspace: Optional[torch.Tensor] = None
     if nbytes > 0:
         workspace = _get_gdn_workspace(nbytes, projected_states_qkvz.device)
     torch.ops.sgl_kernel.gdn_attention.default(

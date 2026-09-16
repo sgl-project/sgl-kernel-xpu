@@ -29,8 +29,9 @@ using w4a16_launch_policy_m_32_n_64 = w4a16_launch_policy<w4a16_policy_m_32_n_64
 // N-width sweep around the 8-row decode tile, for the small-m band. All of them
 // keep SG_N = BlkN/SgCountN = 16 and the StealChunk/PrefetchDist of
 // w4a16_launch_policy_m_8_n_64, so the only variable is how many subgroups are
-// bundled into one work-group: the per-subgroup tile, and therefore the number of
-// 16-wide subgroup tiles the problem decomposes into, is the same in every one.
+// bundled into one work-group: the per-subgroup tile stays 8x16 in every one.
+// The *number* of those tiles is not invariant, though -- it moves with how much
+// the work-group width has to pad N. See the sweep result below.
 // Barrier is forced to true to match w4a16_policy_m_8_n_64, which inherits
 // MainloopBarrier=true from xe_gemm_policy_base while w4a16_tile would default it
 // to false here (w4a16_tile_wants_barrier(8, BlkN, 1) == false); leaving that to
@@ -48,10 +49,14 @@ using w4a16_launch_policy_m_32_n_64 = w4a16_launch_policy<w4a16_policy_m_32_n_64
 // benchmark/bench_moe_w4a16_policy_sweep.py measures on one B60, at the GPT-OSS
 // 120b tp=4 decode shapes (gemm1 N=1472 K=2880, gemm2 N=2880 K=736) with 4
 // routed experts and 1..8 rows each, is that N width is a ~4% knob at these
-// sizes and not the ~2x the grid geometry might suggest: every one of these
-// tiles decomposes the problem into the same number of 16-wide subgroup tiles
-// (368 for gemm1, 720 for gemm2) and therefore fills the same 0.57/1.12 waves
-// of the 640-subgroup persistent grid. Widening N while keeping the mainloop
+// sizes and not the ~2x the grid geometry might suggest. What holds constant is
+// the per-subgroup tile (SG_N = 16), not the number of subgroup tiles: that count
+// is 368 (gemm1) / 720 (gemm2) for the 16-, 32- and 64-wide work-group tiles,
+// which divide N = 1472 and 2880 exactly, and rises to 384/736 at BlkN=128 and
+// 384/768 at BlkN=256, where N does not divide and the tail tile is padded. So
+// the fill of the 640-subgroup persistent grid varies a little too -- 0.57-0.60
+// waves on gemm1 and 1.12-1.20 on gemm2 -- but by percent, not by the factor a
+// 16x width change might suggest. Widening N while keeping the mainloop
 // split barrier is a small regression (m_8_n_128 0.97x, m_8_n_256 0.97x on
 // gemm1 at m=4); the variants that skip the barrier gain a little
 // (m_8_n_128_skip 1.05x/1.06x on gemm1/gemm2, m_8_n_16 1.04x, m_8_n_64_nobar

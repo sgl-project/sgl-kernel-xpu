@@ -116,11 +116,9 @@ if(USE_MLA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-mla_sparse_prefill)
   target_link_libraries(sgl-ops-sycl-mla_sparse_prefill PRIVATE sgl_jit)
 endif()
 
-# xe20 kernels
-# The AOT device must match the arch these sources were *compiled* for: CMakeLists.txt
-# applies SYCL_INTEL_TARGET globally, so on a cri build these TUs emit Xe3p vISA and
-# ocloc -device bmg rejects it ("platform requires 2 (l1-l3) caching options").
-set(XE20_OFFLINE_COMPILER_AOT_OPTIONS "${SYCL_OFFLINE_COMPILER_AOT_OPTIONS}")
+# xe20 kernels (BMG only).
+if(DPCPP_SYCL_TARGET MATCHES "bmg")
+set(XE20_OFFLINE_COMPILER_AOT_OPTIONS "-device bmg")
 set(XE20_OFFLINE_COMPILER_FLAGS "${XE20_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
 
 # Instance families that are bundled into a single shared library each.
@@ -254,6 +252,10 @@ if(USE_MOE AND NOT USE_SYCL_JIT
    sgl-ops-sycl-GroupGemmW8A16Xe20
    PUBLIC sgl-ops-sycl-GroupGemmW8A16Xe20_inst)
 endif()
+endif() # DPCPP_SYCL_TARGET MATCHES "bmg" (xe20 kernels)
+
+# chunk_gated_delta_rule.cpp lives in the common (non-arch-specific) bucket, so
+# its JIT link is unconditional here, outside the xe20/xe35 gates above/below.
 # The GDN chunk delta-rule dispatch (chunk_gated_delta_rule.cpp) calls the JIT engine.
 if(USE_FMHA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-chunk_gated_delta_rule)
   target_link_libraries(sgl-ops-sycl-chunk_gated_delta_rule PRIVATE sgl_jit)

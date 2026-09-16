@@ -687,6 +687,7 @@ def generate_qkv(
 @pytest.mark.parametrize("nheads_q,nheads_kv", KVCACHE_HEAD_CONFIGS)
 @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("causal,local", [(False, True), (False, False), (True, False)])
+@pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
 @pytest.mark.parametrize("use_sinks", [True, False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 @pytest.mark.parametrize("has_rotary_seqlens", [False])
@@ -721,6 +722,7 @@ def test_flash_attn_kvcache(
     seqlen_new_eq_seqlen_q,
     causal,
     local,
+    softcap,
     use_sinks,
     new_kv,
     batch_size,
@@ -1020,6 +1022,7 @@ def test_flash_attn_kvcache(
             causal=causal,
             qv=qv,
             window_size=window_size,
+            softcap=softcap,
             key_leftpad=cache_leftpad,
             return_lse=True,
         )
@@ -1034,6 +1037,7 @@ def test_flash_attn_kvcache(
             causal=causal,
             qv=qv,
             window_size=window_size,
+            softcap=softcap,
             upcast=False,
             reorder_ops=True,
             key_leftpad=cache_leftpad,
@@ -1092,6 +1096,7 @@ def test_flash_attn_kvcache(
                     rotary_seqlens=rotary_seqlens,
                     causal=causal,
                     window_size=window_size,
+                    softcap=softcap,
                     softmax_scale=softmax_scale,
                     sinks=sinks if use_sinks else None,
                     rotary_interleaved=rotary_interleaved,
@@ -1231,6 +1236,7 @@ if EXTENDED_KVCACHE_TESTS:
             seqlen_new_eq_seqlen_q=True,
             causal=causal,
             local=local,
+            softcap=0.0,
             use_sinks=False,
             new_kv=False,
             batch_size=batch_size,
@@ -1254,6 +1260,7 @@ if EXTENDED_KVCACHE_TESTS:
 @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("local", [True, False])
+@pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
 @pytest.mark.parametrize("use_sinks", [True, False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 @pytest.mark.parametrize("has_rotary_seqlens", [False])
@@ -1308,6 +1315,7 @@ def test_flash_attn_decode_kvcache(
     seqlen_new_eq_seqlen_q,
     causal,
     local,
+    softcap,
     use_sinks,
     new_kv,
     nheads_q,
@@ -1598,6 +1606,7 @@ def test_flash_attn_decode_kvcache(
             causal=causal,
             qv=qv,
             window_size=window_size,
+            softcap=softcap,
             key_leftpad=cache_leftpad,
             return_lse=True,
         )
@@ -1612,6 +1621,7 @@ def test_flash_attn_decode_kvcache(
             causal=causal,
             qv=qv,
             window_size=window_size,
+            softcap=softcap,
             upcast=False,
             reorder_ops=True,
             key_leftpad=cache_leftpad,
@@ -1679,6 +1689,7 @@ def test_flash_attn_decode_kvcache(
                     rotary_seqlens=rotary_seqlens,
                     causal=causal,
                     window_size=window_size,
+                    softcap=softcap,
                     softmax_scale=softmax_scale,
                     sinks=sinks if use_sinks else None,
                     rotary_interleaved=rotary_interleaved,
@@ -1784,6 +1795,7 @@ def test_flash_attn_decode_kvcache(
     reason="fp8 KV cache attention is an XPU (sgl-kernel-xpu) feature",
 )
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
 @pytest.mark.parametrize("q_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("nheads_q,nheads_kv", [(8, 8), (8, 2)])
@@ -1804,6 +1816,7 @@ def test_flash_attn_fp8_kvcache(
     fp8_dtype,
     q_dtype,
     causal,
+    softcap,
     descale_layout,
     cache_seqlen=None,
 ):
@@ -1883,6 +1896,7 @@ def test_flash_attn_fp8_kvcache(
         v_descale=v_descale,
         softmax_scale=softmax_scale,
         causal=causal,
+        softcap=softcap,
     )
     out = out.reshape(batch_size, seqlen_q, nheads_q, d)
     torch.xpu.synchronize()
@@ -1899,6 +1913,7 @@ def test_flash_attn_fp8_kvcache(
             < rearrange(cache_seqlens, "b -> b 1")
         ),
         causal=causal,
+        softcap=softcap,
         k_descale=k_descale_ref,
         v_descale=v_descale_ref,
         upcast=True,
@@ -1961,6 +1976,7 @@ if EXTENDED_KVCACHE_TESTS:
             fp8_dtype=fp8_dtype,
             q_dtype=torch.bfloat16,
             causal=causal,
+            softcap=0.0,
             descale_layout=descale_layout,
             cache_seqlen=cache_seqlen,
         )

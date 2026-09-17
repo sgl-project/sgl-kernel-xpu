@@ -95,7 +95,8 @@ template <
     // KV position, so per-row masking must use a fixed decode row. Default
     // false keeps prefill (and non-packed decode) unaffected.
     bool PackGQA_ = false,
-    bool HasRelBias_ = false>
+    bool HasRelBias_ = false,
+    bool HasBidirectionalBlock_ = false>
 struct FMHAFwdMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -122,7 +123,8 @@ template <
     class TiledCopyV_cache_,
     bool LocalMask_,
     bool PackGQA_,
-    bool HasRelBias_>
+    bool HasRelBias_,
+    bool HasBidirectionalBlock_>
 struct FMHAFwdMainloop<
     XeDefault<Stages>,
     CausalMask_,
@@ -143,7 +145,8 @@ struct FMHAFwdMainloop<
     TiledCopyV_cache_,
     LocalMask_,
     PackGQA_,
-    HasRelBias_> {
+    HasRelBias_,
+    HasBidirectionalBlock_> {
   //
   // Type Aliases
   //
@@ -218,6 +221,7 @@ struct FMHAFwdMainloop<
   static constexpr bool LocalMask = LocalMask_;
   static constexpr bool PackGQA = PackGQA_;
   static constexpr bool HasRelBias = HasRelBias_;
+  static constexpr bool HasBidirectionalBlock = HasBidirectionalBlock_;
   static_assert(!HasRelBias || get<1>(TileShapeQK{}) % 8 == 0, "relative bias requires a 16B surface pitch");
   static_assert(
       !HasRelBias || get<0>(TileShapeQK{}) + get<1>(TileShapeQK{}) >= 32,
@@ -244,6 +248,9 @@ struct FMHAFwdMainloop<
     int64_t rel_bias_token_stride = 0;
     int64_t rel_bias_head_stride = 0;
     int rel_bias_extent = 0;
+    // Optional per-token block id. Non-null enables the bidirectional-block
+    // mask below: tokens sharing a non-negative id attend both ways; -1 = none.
+    int const* ptr_block_id = nullptr;
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
     ElementScoreStore* ptr_score = nullptr;
 #endif
@@ -277,6 +284,7 @@ struct FMHAFwdMainloop<
         args.rel_bias_token_stride,
         args.rel_bias_head_stride,
         args.rel_bias_extent,
+        args.ptr_block_id,
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
         ScoreBlock2D ? reinterpret_cast<ElementScoreStore*>(workspace) : nullptr};
 #else
@@ -704,6 +712,37 @@ struct FMHAFwdMainloop<
           bool right_mask = col_idx > row_kv_idx + params.window_size_right;
           if (left_mask || right_mask) {
             tSrS(i) = ElementS(-INFINITY);
+          }
+        }
+      }
+
+      /* Bidirectional-block masking. ptr_block_id holds a per-token block id
+       * (-1 = none). The caller runs this non-causal (CausalMask=false) so
+       * forward columns survive; here attention is re-masked to causal EXCEPT
+       * keys sharing the query's non-negative block id, which are attended both
+       * directions. Block ids cover the extend tokens, so this path requires
+       * full prefill (full_tile_offset == 0). */
+      if constexpr (HasBidirectionalBlock) {
+        Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
+        Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
+        auto cS_thread = thr_mma_qk.partition_C(gP);
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tSrS.size(); ++i) {
+          int row_idx = get<0>(cS_thread(i));
+          int col_idx = get<1>(cS_thread(i));
+          // Skip padding lanes (handled by the remainder-k mask) to avoid an
+          // out-of-range ptr_block_id read.
+          if (row_idx >= seq_len || col_idx >= seq_len) {
+            continue;
+          }
+          int row_kv_idx = row_idx + full_tile_offset;
+          if (col_idx > row_kv_idx) {  // above the causal diagonal
+            int qb = params.ptr_block_id[q_token_offset + row_idx];
+            int kb = params.ptr_block_id[q_token_offset + col_idx];
+            bool same_block = (qb >= 0) && (qb == kb);
+            if (!same_block) {
+              tSrS(i) = ElementS(-INFINITY);
+            }
           }
         }
       }

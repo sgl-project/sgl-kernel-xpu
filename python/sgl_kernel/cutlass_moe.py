@@ -504,6 +504,9 @@ def cutlass_fused_experts_nvfp4_woq(
     The weights stay 4-bit in memory. ``SGLANG_NVFP4_WOQ_COMPUTE`` selects
     ``mxfp8`` (default, in-register weight requantization) or ``bf16``
     (in-register weight dequantization with BF16 activations and MMA).
+    For MXFP8, setting ``SGLANG_NVFP4_WOQ_QUANTIZE_IN_K_LOOP=1`` converts each
+    32-wide MMA-K slice immediately before BDPAS; the default ``0`` converts the
+    complete 64-wide K tile first.
 
     Args:
         a: (M, K) activations, fp16 or bf16.

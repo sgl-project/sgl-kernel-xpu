@@ -67,12 +67,24 @@
 namespace sgl_xpu {
 
 /// Single-GEMM dispatch policy for the NVFP4 -> MXFP8 WoQ mainloop.
-template <int Stages_, class KernelSchedule = cutlass::gemm::KernelXe>
-struct MainloopXeNvFp4WoqMxFp8 : cutlass::gemm::MainloopIntelXeXMX16<Stages_, KernelSchedule> {};
+template <
+    int Stages_,
+    bool QuantizeInKLoop_ = false,
+    class KernelSchedule = cutlass::gemm::KernelXe>
+struct MainloopXeNvFp4WoqMxFp8
+    : cutlass::gemm::MainloopIntelXeXMX16<Stages_, KernelSchedule> {
+  static constexpr bool QuantizeInKLoop = QuantizeInKLoop_;
+};
 
 /// Grouped (ptr-array) dispatch policy; `Base` above does the work.
-template <int Stages_, class KernelSchedule = cutlass::gemm::KernelXePtrArrayCooperative>
-struct MainloopXeNvFp4WoqMxFp8Group : cutlass::gemm::MainloopIntelXeXMX16<Stages_, KernelSchedule> {};
+template <
+    int Stages_,
+    bool QuantizeInKLoop_ = false,
+    class KernelSchedule = cutlass::gemm::KernelXePtrArrayCooperative>
+struct MainloopXeNvFp4WoqMxFp8Group
+    : cutlass::gemm::MainloopIntelXeXMX16<Stages_, KernelSchedule> {
+  static constexpr bool QuantizeInKLoop = QuantizeInKLoop_;
+};
 
 /// Extract the warp (subgroup) layout from an already-built TiledMMA so the
 /// shadow E2M1 TiledMMA can be tiled identically.
@@ -95,6 +107,7 @@ using namespace cute;
 
 template <
   int Stages,
+  bool QuantizeInKLoop,
   class KernelSchedule,
   class TileShape_,
   class ElementPairA_,
@@ -111,7 +124,7 @@ template <
   class SmemCopyAtomB_,
   class TransformB_>
 struct CollectiveMma<
-    sgl_xpu::MainloopXeNvFp4WoqMxFp8<Stages, KernelSchedule>,
+    sgl_xpu::MainloopXeNvFp4WoqMxFp8<Stages, QuantizeInKLoop, KernelSchedule>,
     TileShape_,
     ElementPairA_,
     StridePairA_,
@@ -128,7 +141,8 @@ struct CollectiveMma<
     TransformB_>
 {
  public:
-  using DispatchPolicy = sgl_xpu::MainloopXeNvFp4WoqMxFp8<Stages, KernelSchedule>;
+  using DispatchPolicy =
+      sgl_xpu::MainloopXeNvFp4WoqMxFp8<Stages, QuantizeInKLoop, KernelSchedule>;
   using WorkgroupTileShape = TileShape_;
 
   using TiledMma = TiledMma_;
@@ -303,6 +317,18 @@ struct CollectiveMma<
     }
   };
 
+  /// Scale lookup for one 32-wide MMA-K slice (two NVFP4 scale blocks).
+  template <int NSlots, int N_ITER>
+  struct PerMmaScale {
+    float const (*cvals)[2];
+
+    CUTLASS_DEVICE float operator()(int i) const {
+      const int v = i % 32;
+      const int n_it = (i / 32) % N_ITER;
+      return cvals[4 * n_it + (v & 3)][v >> 4];
+    }
+  };
+
   /// Fail loudly if a tile or atom change invalidates PerBlockScale's decode.
   template <class Frag>
   CUTLASS_DEVICE static void assert_b_fragment_layout(Frag const&) {
@@ -368,8 +394,11 @@ struct CollectiveMma<
     using GemmIterK = Int<decltype(size<2>(tCrB.shape()))::value>;
     static constexpr int N_ITER = GemmIterN::value;
     static constexpr int N_SLOTS = 4 * N_ITER;
-    using BScale = PerBlockScale<N_SLOTS, KG_PER_TILE, N_ITER>;
+    using TileBScale = PerBlockScale<N_SLOTS, KG_PER_TILE, N_ITER>;
+    using MmaBScale = PerMmaScale<N_SLOTS, N_ITER>;
     assert_b_fragment_layout(tCrB);
+    static_assert(KG_PER_TILE == 2 * GemmIterK::value,
+                  "Each E4M3 MMA-K step must consume two NVFP4 scale blocks");
 
     auto [m_idx, n_idx, k_idx, l_idx] = blk_coord;
     const int m_coord = m_idx * BLK_M + (get_sub_group_id() / SG_NUMS_N) * SG_M;
@@ -439,34 +468,65 @@ struct CollectiveMma<
       prefetch(tiled_prefetch_scaleA, prefetch_iter_scaleA(_, _, _, prefetch_k / k_reload_factor));
       prefetch(tiled_prefetch_scaleB, prefetch_iter_scaleB(_, _, _, prefetch_k / k_reload_factor));
 
-      // Per-16 multipliers for this k-tile.
-      const int64_t kg_base = static_cast<int64_t>(k_tile) * KG_PER_TILE;
-      float cvals[N_SLOTS][KG_PER_TILE];
-      CUTLASS_PRAGMA_UNROLL
-      for (int s = 0; s < N_SLOTS; ++s) {
-        ElementMult const* row = cb_ptr + c_row_base[s] + kg_base;
-        CUTLASS_PRAGMA_UNROLL
-        for (int j = 0; j < KG_PER_TILE; ++j) {
-          cvals[s][j] = c_row_oob[s] ? 0.0f : static_cast<float>(row[j]);
-        }
-      }
-
       reorder(tArA, tCrA);
-      // Dequantize the NVFP4 payload and requantize it to MXFP8, all in
-      // registers: E2M1 -> FP32 is exact, the per-16 multiplier folds in, and
-      // the only lossy step is the final E4M3 rounding. `c` carries 8 mantissa
-      // bits and an E2M1 value 2, so the product is exact in FP32.
-      sgl_xpu::reorder_upconvert(tBrB, tCrB, BScale{&cvals[0]});
 
       Tensor scaleA = make_tensor(recast<scaleA_vec_t>(fragment_scaleA).data(),
                                   make_layout(Shape<_1, GemmIterM, _1>{}, Stride<_1, _0, _0>{}));
       Tensor scaleB = make_tensor(recast<scaleB_vec_t>(fragment_scaleB).data(),
                                   make_layout(Shape<_1, GemmIterN, _1>{}, Stride<_1, _0, _0>{}));
 
-      cute::gemm(tiled_mma,
-                 make_zip_tensor(tCrA, scaleA, scale_m_offsets, scale_ak_offsets),
-                 make_zip_tensor(tCrB, scaleB, scale_n_offsets, scale_bk_offsets),
-                 accum);
+      if constexpr (DispatchPolicy::QuantizeInKLoop) {
+        auto mma_a =
+            make_zip_tensor(tCrA, scaleA, scale_m_offsets, scale_ak_offsets);
+        auto mma_b =
+            make_zip_tensor(tCrB, scaleB, scale_n_offsets, scale_bk_offsets);
+
+        // Convert one 32-wide MMA-K slice immediately before its BDPAS. This
+        // avoids keeping the whole converted B tile and all four per-16
+        // multipliers live together across the inner K loop.
+        CUTLASS_PRAGMA_UNROLL
+        for (int mma_k = 0; mma_k < GemmIterK::value; ++mma_k) {
+          const int64_t kg_base =
+              static_cast<int64_t>(k_tile) * KG_PER_TILE + 2 * mma_k;
+          float cvals[N_SLOTS][2];
+          CUTLASS_PRAGMA_UNROLL
+          for (int s = 0; s < N_SLOTS; ++s) {
+            ElementMult const* row = cb_ptr + c_row_base[s] + kg_base;
+            CUTLASS_PRAGMA_UNROLL
+            for (int j = 0; j < 2; ++j) {
+              cvals[s][j] =
+                  c_row_oob[s] ? 0.0f : static_cast<float>(row[j]);
+            }
+          }
+
+          sgl_xpu::reorder_upconvert_mma_b_k(
+              tBrB, tCrB, mma_k, MmaBScale{&cvals[0]});
+          cute::gemm(
+              tiled_mma, mma_a(_, _, mma_k), mma_b(_, _, mma_k), accum);
+        }
+      } else {
+        // Convert the complete K tile before entering the MMA K loop.
+        const int64_t kg_base =
+            static_cast<int64_t>(k_tile) * KG_PER_TILE;
+        float cvals[N_SLOTS][KG_PER_TILE];
+        CUTLASS_PRAGMA_UNROLL
+        for (int s = 0; s < N_SLOTS; ++s) {
+          ElementMult const* row = cb_ptr + c_row_base[s] + kg_base;
+          CUTLASS_PRAGMA_UNROLL
+          for (int j = 0; j < KG_PER_TILE; ++j) {
+            cvals[s][j] =
+                c_row_oob[s] ? 0.0f : static_cast<float>(row[j]);
+          }
+        }
+
+        sgl_xpu::reorder_upconvert(
+            tBrB, tCrB, TileBScale{&cvals[0]});
+        cute::gemm(
+            tiled_mma,
+            make_zip_tensor(tCrA, scaleA, scale_m_offsets, scale_ak_offsets),
+            make_zip_tensor(tCrB, scaleB, scale_n_offsets, scale_bk_offsets),
+            accum);
+      }
     }
   }
 };
@@ -477,6 +537,7 @@ struct CollectiveMma<
 
 template <
   int Stages,
+  bool QuantizeInKLoop,
   class Schedule,
   class TileShape_,
   class ElementPairA_,
@@ -493,7 +554,7 @@ template <
   class SmemCopyAtomB_,
   class TransformB_>
 struct CollectiveMma<
-    sgl_xpu::MainloopXeNvFp4WoqMxFp8Group<Stages, Schedule>,
+    sgl_xpu::MainloopXeNvFp4WoqMxFp8Group<Stages, QuantizeInKLoop, Schedule>,
     TileShape_,
     ElementPairA_,
     StridePairA_,
@@ -509,19 +570,22 @@ struct CollectiveMma<
     SmemCopyAtomB_,
     TransformB_>
   : public CollectiveMma<
-        sgl_xpu::MainloopXeNvFp4WoqMxFp8<Stages, cutlass::gemm::KernelXe>,
+        sgl_xpu::MainloopXeNvFp4WoqMxFp8<
+            Stages, QuantizeInKLoop, cutlass::gemm::KernelXe>,
         TileShape_, ElementPairA_, StridePairA_, ElementPairB_, StridePairB_, TiledMma_,
         GmemTiledCopyPairA_, SmemLayoutAtomA_, SmemCopyAtomA_, TransformA_,
         GmemTiledCopyPairB_, SmemLayoutAtomB_, SmemCopyAtomB_, TransformB_>
 {
  public:
   using Base = CollectiveMma<
-      sgl_xpu::MainloopXeNvFp4WoqMxFp8<Stages, cutlass::gemm::KernelXe>,
+      sgl_xpu::MainloopXeNvFp4WoqMxFp8<
+          Stages, QuantizeInKLoop, cutlass::gemm::KernelXe>,
       TileShape_, ElementPairA_, StridePairA_, ElementPairB_, StridePairB_, TiledMma_,
       GmemTiledCopyPairA_, SmemLayoutAtomA_, SmemCopyAtomA_, TransformA_,
       GmemTiledCopyPairB_, SmemLayoutAtomB_, SmemCopyAtomB_, TransformB_>;
 
-  using DispatchPolicy = sgl_xpu::MainloopXeNvFp4WoqMxFp8Group<Stages, Schedule>;
+  using DispatchPolicy = sgl_xpu::MainloopXeNvFp4WoqMxFp8Group<
+      Stages, QuantizeInKLoop, Schedule>;
   using BaseArguments = typename Base::Arguments;
 
   using ElementA = typename Base::ElementA;

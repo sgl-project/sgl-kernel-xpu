@@ -232,20 +232,24 @@ def test_prep_kernel_rejects_cpu_global_scales():
 
 
 @pytest.mark.parametrize(
-    "ms,n,k",
+    "ms,n,k,quantize_in_k_loop",
     [
-        ([64, 64], 128, 256),
-        ([64, 64], 128, 64),      # single K tile
-        ([32, 96], 128, 256),     # ragged M
-        ([33, 95], 128, 256),     # M not 4-aligned (scale buffer is padded)
-        ([64, 64], 192, 256),     # N not a multiple of the workgroup N tile
-        pytest.param([256, 256], 512, 512, marks=pytest.mark.skipif(
+        ([64, 64], 128, 256, False),
+        ([64, 64], 128, 64, False),      # single K tile
+        ([64, 64], 128, 64, True),       # quantize inside each MMA-K step
+        ([32, 96], 128, 256, False),     # ragged M
+        ([33, 95], 128, 256, False),     # M not 4-aligned (scale buffer is padded)
+        ([0, 1, 7, 0, 33], 128, 64, False),  # empty experts and compact-scale offsets
+        ([64, 64], 192, 256, False),     # N not a multiple of the workgroup N tile
+        pytest.param([256, 256], 512, 512, False, marks=pytest.mark.skipif(
             not LONG_TESTS, reason="set LONG_TESTS=1")),
-        pytest.param([64, 64], 128, 1024, marks=pytest.mark.skipif(
+        pytest.param([64, 64], 128, 1024, False, marks=pytest.mark.skipif(
             not LONG_TESTS, reason="set LONG_TESTS=1")),
     ],
 )
-def test_fused_woq_matches_host_requantized_mxfp8(ms, n, k):
+def test_fused_woq_matches_host_requantized_mxfp8(
+    ms, n, k, quantize_in_k_loop, monkeypatch
+):
     """The fused WoQ GEMM must reproduce host-side requantization exactly.
 
     Both paths multiply the same E4M3 values by the same UE8M0 scales, so any
@@ -253,6 +257,11 @@ def test_fused_woq_matches_host_requantized_mxfp8(ms, n, k):
     """
     skip_if_no_cri()
     from sgl_kernel import nvfp4_woq_mxfp8_scaled_grouped_mm, nvfp4_woq_prep
+
+    monkeypatch.setenv(
+        "SGLANG_NVFP4_WOQ_QUANTIZE_IN_K_LOOP",
+        "1" if quantize_in_k_loop else "0",
+    )
 
     dev = "xpu"
     m_total = sum(ms)

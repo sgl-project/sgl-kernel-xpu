@@ -262,6 +262,67 @@ convert_relayout_mma_b(Src const& src, Dst& dst, Scale const& scale) {
   }
 }
 
+/// Convert one 32-wide MMA-K slice of the Xe3P NVFP4 MMA-B tile.
+///
+/// Keeping conversion adjacent to the consuming BDPAS shortens the live range
+/// of both the converted E4M3 values and their per-16 multipliers. `dst` keeps
+/// the full fragment layout so the mapping remains identical to
+/// convert_relayout_mma_b; only the selected 128-value K slice is written.
+template <class Src, class Dst, class Scale>
+CUTLASS_DEVICE void
+convert_relayout_mma_b_k(
+    Src const& src, Dst& dst, Scale const& scale, int k_step) {
+  using SrcTv = remove_cvref_t<decltype(src.tv_layout())>;
+  using DstTv = remove_cvref_t<decltype(dst.tv_layout())>;
+
+  using ExpectedSrcTv = decltype(make_layout(
+      make_shape(make_shape(_4{}, _4{}),
+                 make_shape(make_shape(_2{}, _4{}, _8{}), _4{}),
+                 make_shape(_1{}, _1{})),
+      make_stride(make_stride(_2{} * E<1>{}, E<0>{}),
+                  make_stride(make_stride(E<1>{}, _4{} * E<0>{}, _8{} * E<1>{}),
+                              _16{} * E<0>{}),
+                  make_stride(_0{}, _0{}))));
+  using ExpectedDstTv = decltype(make_layout(
+      make_shape(make_shape(_4{}, _4{}),
+                 make_shape(make_shape(_4{}, _8{}), make_shape(_4{}, _2{}))),
+      make_stride(make_stride(E<1>{}, E<0>{}),
+                  make_stride(make_stride(_4{} * E<0>{}, _4{} * E<1>{}),
+                              make_stride(_16{} * E<0>{}, _32{} * E<1>{})))));
+
+  static_assert(cute::is_same_v<decltype(project_strides(SrcTv{})),
+                                decltype(project_strides(ExpectedSrcTv{}))>);
+  static_assert(cute::is_same_v<decltype(project_strides(DstTv{})),
+                                decltype(project_strides(ExpectedDstTv{}))>);
+  static_assert(cute::size_v<typename Src::layout_type> == 256 &&
+                cute::size_v<typename Dst::layout_type> == 256);
+
+  auto const* packed =
+      reinterpret_cast<intel::uchar16 const*>(raw_pointer_cast(src.data()));
+  auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+  const int lane = static_cast<int>(sg.get_local_linear_id());
+  const int lane_n = lane >> 2;
+  const int lane_k = lane & 3;
+  const int nibble_shift = (lane_k & 1) * 4;
+
+  CUTLASS_PRAGMA_UNROLL
+  for (int r = 0; r < 4; ++r) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int parity = 0; parity < 2; ++parity) {
+      const int src_lane = 4 * lane_n + 2 * parity + (lane_k >> 1);
+      intel::uchar16 remote =
+          sycl::select_from_group(sg, packed[2 * r + k_step], src_lane);
+      intel::ulong2 words = sycl::bit_cast<intel::ulong2>(remote);
+      detail::convert_native_e2m1x8(
+          detail::pack_selected_nibbles(words[0], nibble_shift),
+          dst, scale, r, k_step, parity, 0);
+      detail::convert_native_e2m1x8(
+          detail::pack_selected_nibbles(words[1], nibble_shift),
+          dst, scale, r, k_step, parity, 2);
+    }
+  }
+}
+
 }  // namespace detail
 
 /// True when two subgroup fragments already agree on (thread, value) -> coord,
@@ -291,6 +352,18 @@ reorder_upconvert(Src const& src, Dst& dst, Scale const& scale = {}) {
   } else {
     detail::convert_relayout_mma_b(src, dst, scale);
   }
+}
+
+/// Fused relayout/upconvert for one MMA-K step of the NVFP4 Xe MMA-B layout.
+template <class Src, class Dst, class Scale = NoScale>
+CUTLASS_DEVICE void
+reorder_upconvert_mma_b_k(
+    Src const& src, Dst& dst, int k_step, Scale const& scale = {}) {
+  using SrcType = typename Src::value_type;
+  using DstType = typename Dst::value_type;
+  static_assert(sizeof_bits_v<SrcType> < 8, "Source must be a sub-byte type");
+  static_assert(sizeof_bits_v<DstType> >= 8, "Destination must be at least a byte wide");
+  detail::convert_relayout_mma_b_k(src, dst, scale, k_step);
 }
 
 }  // namespace sgl_xpu

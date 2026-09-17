@@ -24,6 +24,8 @@
 */
 
 // clang-format off
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -92,7 +94,8 @@ int cached_device_multiprocessor_count(int device_id) {
 
 // NVFP4-B x MXFP8-A: E2M1 payload for B, E4M3 for A, UE8M0 block scales for
 // both (B's are the requantization exponents produced by nvfp4_woq_prep).
-struct NvFp4WoqTypes {
+template <bool QuantizeInKLoop>
+struct NvFp4WoqTypesBase {
   using ElementInputA = cutlass::float_e4m3_t;
   using ElementInputB = cutlass::float_e2m1_t;
   using ElementScale  = typename cutlass::mx_float8_t<cutlass::float_e4m3_t>::ScaleFactorType;
@@ -185,7 +188,8 @@ struct NvFp4WoqTypes {
       ThreadLayout>::TiledMMA;
 
   static constexpr int PipelineStages = 2;
-  using GEMMDispatchPolicy     = sgl_xpu::MainloopXeNvFp4WoqMxFp8Group<PipelineStages>;
+  using GEMMDispatchPolicy = sgl_xpu::MainloopXeNvFp4WoqMxFp8Group<
+      PipelineStages, QuantizeInKLoop>;
   using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeXMX16Group;
 
   using EpilogueOp = cutlass::epilogue::fusion::LinearCombination<
@@ -233,8 +237,32 @@ struct NvFp4WoqTypes {
   using StrideD = typename Gemm::GemmKernel::InternalStrideD;
 };
 
-using Gemm = NvFp4WoqTypes::Gemm;
-using GemmKernel = Gemm::GemmKernel;
+using NvFp4WoqTypes = NvFp4WoqTypesBase<false>;
+using NvFp4WoqKLoopTypes = NvFp4WoqTypesBase<true>;
+
+constexpr char NvFp4WoqQuantizeInKLoopEnv[] =
+    "SGLANG_NVFP4_WOQ_QUANTIZE_IN_K_LOOP";
+
+bool nvfp4_woq_quantize_in_k_loop_enabled() {
+  const char* value = std::getenv(NvFp4WoqQuantizeInKLoopEnv);
+  if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0 ||
+      std::strcmp(value, "false") == 0 || std::strcmp(value, "FALSE") == 0 ||
+      std::strcmp(value, "off") == 0 || std::strcmp(value, "OFF") == 0) {
+    return false;
+  }
+  if (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
+      std::strcmp(value, "TRUE") == 0 || std::strcmp(value, "on") == 0 ||
+      std::strcmp(value, "ON") == 0) {
+    return true;
+  }
+  TORCH_CHECK(
+      false,
+      NvFp4WoqQuantizeInKLoopEnv,
+      " must be one of 0/1, false/true, or off/on; got '",
+      value,
+      "'");
+  return false;
+}
 
 template <class GemmAdapter>
 cutlass::Status run_large_grf(
@@ -270,6 +298,7 @@ cutlass::Status run_large_grf(
 }
 
 /// Launch the grouped GEMM. All pointer arrays are device-resident.
+template <class Types>
 void run_nvfp4_woq_gemm(
     int num_groups,
     const torch::Tensor& problem_sizes,
@@ -283,6 +312,8 @@ void run_nvfp4_woq_gemm(
     const torch::Tensor& stride_sfb,
     const torch::Tensor& workspace,
     at::Device device) {
+  using Gemm = typename Types::Gemm;
+  using GemmKernel = typename Types::GemmKernel;
   auto row = [&](int i) { return ptr_table[i].data_ptr(); };
 
   cutlass::KernelHardwareInfo hw_info;
@@ -306,11 +337,11 @@ void run_nvfp4_woq_gemm(
   using RasterOrderOptions = typename cutlass::gemm::kernel::detail::
       PersistentTileSchedulerXeGroup<NvFp4GroupedProblemShape>::RasterOrderOptions;
 
-  using ElementInputA = NvFp4WoqTypes::ElementInputA;
-  using ElementInputB = NvFp4WoqTypes::ElementInputB;
-  using ElementScale = NvFp4WoqTypes::ElementScale;
-  using ElementMult = NvFp4WoqTypes::ElementMult;
-  using ElementOutput = NvFp4WoqTypes::ElementOutput;
+  using ElementInputA = typename Types::ElementInputA;
+  using ElementInputB = typename Types::ElementInputB;
+  using ElementScale = typename Types::ElementScale;
+  using ElementMult = typename Types::ElementMult;
+  using ElementOutput = typename Types::ElementOutput;
 
   typename GemmKernel::Arguments gemm_args{
       cutlass::gemm::GemmUniversalMode::kGrouped,
@@ -320,21 +351,21 @@ void run_nvfp4_woq_gemm(
           nullptr},
       typename GemmKernel::MainloopArguments{
           reinterpret_cast<ElementInputA const**>(row(0)),
-          reinterpret_cast<NvFp4WoqTypes::StrideA*>(stride_a.data_ptr<int64_t>()),
+          reinterpret_cast<typename Types::StrideA*>(stride_a.data_ptr<int64_t>()),
           reinterpret_cast<ElementInputB const**>(row(1)),
-          reinterpret_cast<NvFp4WoqTypes::StrideB*>(stride_b.data_ptr<int64_t>()),
+          reinterpret_cast<typename Types::StrideB*>(stride_b.data_ptr<int64_t>()),
           reinterpret_cast<ElementScale const**>(row(3)),
-          reinterpret_cast<NvFp4WoqTypes::StrideScaleA*>(stride_sfa.data_ptr<int64_t>()),
+          reinterpret_cast<typename Types::StrideScaleA*>(stride_sfa.data_ptr<int64_t>()),
           reinterpret_cast<ElementScale const**>(row(4)),
-          reinterpret_cast<NvFp4WoqTypes::StrideScaleB*>(stride_sfb.data_ptr<int64_t>()),
+          reinterpret_cast<typename Types::StrideScaleB*>(stride_sfb.data_ptr<int64_t>()),
           reinterpret_cast<ElementMult const**>(cb_ptrs.data_ptr()),
           cb_ld.data_ptr<int64_t>()},
       typename GemmKernel::EpilogueArguments{
           fusion_args,
           reinterpret_cast<ElementOutput const**>(row(2)),
-          reinterpret_cast<NvFp4WoqTypes::StrideC*>(stride_cd.data_ptr<int64_t>()),
+          reinterpret_cast<typename Types::StrideC*>(stride_cd.data_ptr<int64_t>()),
           reinterpret_cast<ElementOutput**>(row(2)),
-          reinterpret_cast<NvFp4WoqTypes::StrideD*>(stride_cd.data_ptr<int64_t>())},
+          reinterpret_cast<typename Types::StrideD*>(stride_cd.data_ptr<int64_t>())},
       hw_info,
       typename GemmKernel::TileSchedulerArguments{1, RasterOrderOptions::AlongN}};
 
@@ -648,15 +679,18 @@ void nvfp4_woq_mxfp8_scaled_grouped_mm(
   auto opts_i64 = torch::TensorOptions().dtype(torch::kInt64).device(device);
   auto opts_u8 = torch::TensorOptions().dtype(torch::kUInt8).device(device);
 
-  // Bound the padded ragged-M A-scale scratch by the total flat row count so
-  // dispatch stays async (no D->H reduction over problem_sizes).
-  const int max_m = static_cast<int>(a.size(0));
-  TORCH_CHECK(max_m > 0, "nvfp4_woq: flat A must have at least one row");
-  // Pad the M extent to 64 rather than the 4 the surface width alone needs, so
-  // that scale_k * padded_max_m — the per-expert stride, and therefore every
-  // per-expert A-scale base address — is 64-byte aligned for any scale_k.
+  // Keep one scale-major scratch surface for all routed rows. Each expert gets
+  // an aligned row offset within that surface; the extra 64 rows per expert
+  // make those offsets non-overlapping without a D->H scan of problem_sizes.
+  // This bounds scratch by O((sum_m + E) * K/32), rather than O(E * sum_m *
+  // K/32), while keeping dispatch asynchronous.
+  const int64_t total_m = a.size(0);
+  TORCH_CHECK(total_m > 0, "nvfp4_woq: flat A must have at least one row");
   constexpr int scale_align = 64;
-  const int padded_max_m = (max_m + scale_align - 1) & ~(scale_align - 1);
+  const int64_t padded_total_m =
+      (total_m + static_cast<int64_t>(E + 1) * scale_align +
+       scale_align - 1) &
+      ~static_cast<int64_t>(scale_align - 1);
 
   auto ptr_table = torch::empty({5, E}, opts_i64);
   auto cb_ptrs = torch::empty({E}, opts_i64);
@@ -666,7 +700,7 @@ void nvfp4_woq_mxfp8_scaled_grouped_mm(
   auto stride_cd = torch::empty({E}, opts_i64);
   auto stride_sfa = torch::empty({E, 2}, opts_i64);
   auto stride_sfb = torch::empty({E, 2}, opts_i64);
-  auto scales_a_t = torch::empty({E, scale_k, padded_max_m}, opts_u8);
+  auto scales_a_t = torch::empty({scale_k, padded_total_m}, opts_u8);
 
   const int32_t* problem_sizes_ptr = problem_sizes.data_ptr<int32_t>();
   const int32_t* expert_offsets_ptr = expert_offsets.data_ptr<int32_t>();
@@ -687,30 +721,34 @@ void nvfp4_woq_mxfp8_scaled_grouped_mm(
   const int64_t scale_b_base = reinterpret_cast<int64_t>(sfmx_b.data_ptr());
   const int64_t cb_base = reinterpret_cast<int64_t>(c_b.data_ptr());
   const int64_t b_expert_bytes = b.stride(0) * b.element_size();
-  const int64_t scale_a_expert_bytes = scales_a_t.stride(0);
   const int64_t scale_b_expert_bytes = sfmx_b.stride(0);
   const int64_t cb_expert_bytes = c_b.stride(0) * c_b.element_size();
   const int64_t scales_a_row_stride = scales_a.stride(0);
-  const int64_t scales_a_t_expert_stride = scales_a_t.stride(0);
   const int64_t cb_ld_value = c_b.stride(1);
 
   auto& q = at::xpu::getCurrentXPUStream(device.index()).queue();
   q.submit([&](sycl::handler& cgh) {
     cgh.parallel_for<NvFp4WoqMxFp8BuildMetadataAndTransposeScales>(
-        sycl::range<2>(static_cast<size_t>(E), static_cast<size_t>(padded_max_m)),
+        sycl::range<2>(
+            static_cast<size_t>(E), static_cast<size_t>(64)),
         [=](sycl::id<2> id) {
           const int e = static_cast<int>(id[0]);
-          const int row = static_cast<int>(id[1]);
+          const int lane = static_cast<int>(id[1]);
           const int64_t ei = static_cast<int64_t>(e);
           const int64_t row_offset = static_cast<int64_t>(expert_offsets_ptr[e]);
+          // align_up(row_offset, 64) + e*64 leaves enough room for the
+          // preceding expert's rounded-up tail and keeps every block-2D scale
+          // surface base 64-byte aligned.
+          const int64_t scale_row_offset =
+              ((row_offset + 63) & ~static_cast<int64_t>(63)) + ei * 64;
 
-          if (row == 0) {
+          if (lane == 0) {
             ptrs[0 * E + e] = a_base + row_offset * K;
             ptrs[1 * E + e] = b_base + ei * b_expert_bytes;
             ptrs[2 * E + e] =
                 out_base + row_offset * N * static_cast<int64_t>(sizeof(float));
             ptrs[3 * E + e] =
-                scale_a_base + ei * scale_a_expert_bytes;
+                scale_a_base + scale_row_offset;
             ptrs[4 * E + e] =
                 scale_b_base + ei * scale_b_expert_bytes;
             cb_ptrs_ptr[e] = cb_base + ei * cb_expert_bytes;
@@ -718,23 +756,23 @@ void nvfp4_woq_mxfp8_scaled_grouped_mm(
             stride_a_ptr[e] = K;
             stride_b_ptr[e] = K;
             stride_cd_ptr[e] = N;
-            stride_sfa_ptr[2 * e] = padded_max_m;
+            stride_sfa_ptr[2 * e] = padded_total_m;
             stride_sfa_ptr[2 * e + 1] = 0;
             stride_sfb_ptr[2 * e] = N;
             stride_sfb_ptr[2 * e + 1] = 0;
           }
 
           const int expert_m = problem_sizes_ptr[e * 3];
-          const int64_t dst = ei * scales_a_t_expert_stride;
-          if (row < expert_m) {
-            const int64_t src = (row_offset + row) * scales_a_row_stride;
+          const int padded_expert_m = (expert_m + 63) & ~63;
+          for (int row = lane; row < padded_expert_m; row += 64) {
+            const bool live_row = row < expert_m;
+            const int64_t src =
+                (row_offset + row) * scales_a_row_stride;
             for (int s = 0; s < scale_k; ++s) {
-              scales_a_t_ptr[dst + static_cast<int64_t>(s) * padded_max_m + row] =
-                  scales_a_ptr[src + s];
-            }
-          } else {
-            for (int s = 0; s < scale_k; ++s) {
-              scales_a_t_ptr[dst + static_cast<int64_t>(s) * padded_max_m + row] = 0;
+              scales_a_t_ptr[
+                  scale_row_offset +
+                  static_cast<int64_t>(s) * padded_total_m + row] =
+                  live_row ? scales_a_ptr[src + s] : 0;
             }
           }
         });
@@ -742,19 +780,37 @@ void nvfp4_woq_mxfp8_scaled_grouped_mm(
   // Order the preparation writes before the direct CUTLASS submission.
   q.ext_oneapi_submit_barrier();
 
-  at::native::xpu::run_nvfp4_woq_gemm(
-      E,
-      problem_sizes,
-      ptr_table,
-      cb_ptrs,
-      cb_ld,
-      stride_a,
-      stride_b,
-      stride_cd,
-      stride_sfa,
-      stride_sfb,
-      workspace,
-      device);
+  if (at::native::xpu::nvfp4_woq_quantize_in_k_loop_enabled()) {
+    at::native::xpu::run_nvfp4_woq_gemm<
+        at::native::xpu::NvFp4WoqKLoopTypes>(
+        E,
+        problem_sizes,
+        ptr_table,
+        cb_ptrs,
+        cb_ld,
+        stride_a,
+        stride_b,
+        stride_cd,
+        stride_sfa,
+        stride_sfb,
+        workspace,
+        device);
+  } else {
+    at::native::xpu::run_nvfp4_woq_gemm<
+        at::native::xpu::NvFp4WoqTypes>(
+        E,
+        problem_sizes,
+        ptr_table,
+        cb_ptrs,
+        cb_ld,
+        stride_a,
+        stride_b,
+        stride_cd,
+        stride_sfa,
+        stride_sfb,
+        workspace,
+        device);
+  }
 }
 
 void nvfp4_woq_bf16_grouped_mm(

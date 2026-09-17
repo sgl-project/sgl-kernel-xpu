@@ -445,7 +445,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    Tensor(a!)  out,"
       "    Tensor(b!)?  softmax_lse,"
       "    Tensor?  rel_bias=None,"
-      "    bool     rel_bias_is_sheared=False) -> ()");
+      "    bool     rel_bias_is_sheared=False,"
+      "    Tensor?  bidirectional_block_ids=None) -> ()");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
 #endif  // USE_FMHA
 

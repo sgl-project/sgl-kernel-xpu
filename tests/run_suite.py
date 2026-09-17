@@ -20,6 +20,7 @@ suites = {
         TestFile("test_topk_softmax.py"),
         TestFile("test_hash_topk.py"),
         TestFile("test_flash_attention.py"),
+        TestFile("test_flash_attn_bidirectional.py"),
         TestFile("test_flash_attn_sparse.py"),
         TestFile("test_flash_mla_decode.py"),
         TestFile("test_flash_mla_prefill.py"),

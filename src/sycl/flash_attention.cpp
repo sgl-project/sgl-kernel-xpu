@@ -1009,7 +1009,8 @@ void mha_fwd(
     at::Tensor& out,
     std::optional<at::Tensor>& softmax_lse,
     std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt,
-    std::optional<const at::Tensor> rel_bias_ = std::nullopt) {
+    std::optional<const at::Tensor> rel_bias_ = std::nullopt,
+    std::optional<const at::Tensor> block_id_ = std::nullopt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
       q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
@@ -1038,6 +1039,7 @@ void mha_fwd(
   // Non-paged (page_table == nullopt) prefill: contiguous ragged KV cache.
   if (!page_table.has_value()) {
     TORCH_CHECK(!rel_bias_.has_value(), "relative attention requires paged KV cache");
+    TORCH_CHECK(!block_id_.has_value(), "bidirectional_block_ids requires paged KV cache");
     mha_fwd_nopage(
         q,
         k,
@@ -1186,6 +1188,31 @@ void mha_fwd(
     params.rel_bias_extent = rel_bias.size(-1);
   }
 
+  // A per-token block id (-1 = none) enables the bidirectional-block mask in the
+  // prefill mainloop: keys sharing a query's non-negative id are attended
+  // bidirectionally, causal otherwise. The mask re-imposes causal for
+  // block-less tokens, so the caller must run non-causal; ids cover the extend
+  // tokens (total_q), i.e. the full-prefill path.
+  if (block_id_.has_value()) {
+    const at::Tensor& block_id = block_id_.value();
+    TORCH_CHECK(block_id.scalar_type() == at::kInt, "bidirectional_block_ids must be int32");
+    TORCH_CHECK(block_id.device() == q.device(), "bidirectional_block_ids must be on q's device");
+    TORCH_CHECK(block_id.is_contiguous(), "bidirectional_block_ids must be contiguous");
+    TORCH_CHECK(block_id.numel() == q.size(0), "bidirectional_block_ids must have total_q entries");
+    // Block ids cover the extend (query) tokens only; the mainloop indexes them
+    // up to the KV length, so require full prefill (per-sequence KV length ==
+    // query length, no cached prefix) to avoid out-of-range reads.
+    const int64_t bsz = cu_seqlens_q.size(0) - 1;
+    const at::Tensor q_seqlens = cu_seqlens_q.slice(0, 1, bsz + 1) - cu_seqlens_q.slice(0, 0, bsz);
+    TORCH_CHECK(
+        cu_seqlens_k.numel() == bsz && at::equal(q_seqlens, cu_seqlens_k),
+        "bidirectional_block_ids requires full prefill: each query length must equal the corresponding KV cache "
+        "length");
+    TORCH_CHECK(!is_causal, "bidirectional_block_ids (bidirectional-block mask) requires is_causal=false");
+    TORCH_CHECK(params.rel_bias_ptr == nullptr, "bidirectional_block_ids and rel_bias are mutually exclusive");
+    params.block_id_ptr = block_id.data_ptr<int>();
+  }
+
   // Per-batch skip mask for the chunkprefill two-launch dispatcher.
   params.skip_batch_mask_ptr = skip_batch_mask_opt.has_value() ? skip_batch_mask_opt->data_ptr() : nullptr;
 
@@ -1236,6 +1263,12 @@ void mha_fwd(
   // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
   params.is_causal = window_size_left < 0 && window_size_right == 0;
   params.is_local = (window_size_left >= 0 || window_size_right >= 0) && !params.is_causal;
+  // The prefill kernel only instantiates the bidirectional-block mask on the
+  // non-causal, non-local path, so reject a sliding window here rather than
+  // silently dropping the mask.
+  TORCH_CHECK(
+      params.block_id_ptr == nullptr || !params.is_local,
+      "bidirectional_block_ids does not support sliding-window (local) attention");
 
   // TODO: check this
   if (window_size_left < 0) {
@@ -1402,7 +1435,8 @@ void mha_fwd(
     std::optional<bool> pack_gqa_,
     int const sm_margin,
     at::Tensor& out,
-    std::optional<at::Tensor>& softmax_lse) {
+    std::optional<at::Tensor>& softmax_lse,
+    std::optional<const at::Tensor> block_id_ = std::nullopt) {
   // Supports both paged (page_table != None) and non-paged (contiguous ragged
   // KV, page_table == None) layouts.
   // ``seqlens_rotary_`` is intentionally not checked here: callers pass it
@@ -1469,7 +1503,7 @@ void mha_fwd(
   // decode batches. The two complementary skip masks partition every query token
   // across the launches, so the shared buffers end up fully written with no
   // stitching or extra copies needed.
-  launch(prefill::mha_fwd, is_prefill.logical_not(), std::nullopt);
+  launch(prefill::mha_fwd, is_prefill.logical_not(), std::nullopt, block_id_);
 }
 
 }  // namespace chunkprefill
@@ -1510,7 +1544,8 @@ SGL_KERNEL_EXPORT void mha_fwd(
     at::Tensor& out,
     std::optional<at::Tensor>& softmax_lse,
     std::optional<const at::Tensor>& rel_bias_,
-    bool rel_bias_is_sheared) {
+    bool rel_bias_is_sheared,
+    std::optional<const at::Tensor>& bidirectional_block_ids_) {
   TORCH_CHECK(q.dim() == 3, "query must be in ragged format (total_q, h, d)");
   // k and v may be 3D (total_k, h_k, d) for non-paged or 4D (num_pages, page_size, h_k, d)
   // for paged KV cache; sub-functions validate their own shapes.
@@ -1613,7 +1648,7 @@ SGL_KERNEL_EXPORT void mha_fwd(
     // Relative bias currently bypasses chunkprefill. For any request with
     // max_seqlen_q > 1, use the prefill sheared-bias layout for all rows,
     // including q_len == 1 rows in a mixed batch.
-    dispatch(prefill::mha_fwd, std::nullopt, rel_bias_);
+    dispatch(prefill::mha_fwd, std::nullopt, rel_bias_, std::nullopt);
   } else if (!page_table.has_value() || is_uniform_qlen) {
     // Pure prefill path
     //
@@ -1625,10 +1660,10 @@ SGL_KERNEL_EXPORT void mha_fwd(
     //
     // This condition is sufficient but not necessary: a non-uniform
     // all-prefill batch falls through to chunkprefill, which is still correct.
-    dispatch(prefill::mha_fwd, std::nullopt, std::nullopt);
+    dispatch(prefill::mha_fwd, std::nullopt, std::nullopt, bidirectional_block_ids_);
   } else {
     // Non-uniform paged batches fall back to chunkprefill.
-    dispatch(chunkprefill::mha_fwd);
+    dispatch(chunkprefill::mha_fwd, bidirectional_block_ids_);
   }
 }
 #undef SYCL_INTEL_TARGET

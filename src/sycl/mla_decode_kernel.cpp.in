@@ -36,6 +36,14 @@
 
 namespace mla_decode {
 
+// The softmax-LSE output is threaded as a template constexpr (see MlaXe), so
+// wanting the LSE and not wanting it are separate kernels and both have to be
+// instantiated here. Crossed with the split-KV dispatch inside runMla() that is
+// four kernels in this translation unit; the LSE-off pair carries none of the
+// epilogue's LSE registers or stores. An absent lse tensor is the request to
+// skip it -- the host op (flash_mla_decode) has already validated it when
+// present.
+
 __attribute__((visibility("default"))) void launch_mla_decode_@ELEM_TAG@_@PAGE_SIZE@(
     at::Tensor& out,
     const std::optional<at::Tensor>& lse,
@@ -47,7 +55,13 @@ __attribute__((visibility("default"))) void launch_mla_decode_@ELEM_TAG@_@PAGE_S
     at::Tensor& workspace,
     double sm_scale,
     int64_t num_kv_splits) {
-  runMla<@ELEM_SYCL_TYPE@, PageSizeOption<@PAGE_SIZE@>>(
+  if (lse.has_value()) {
+    runMla<@ELEM_SYCL_TYPE@, PageSizeOption<@PAGE_SIZE@>, /*LSE=*/true>(
+        out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table,
+        workspace, sm_scale, num_kv_splits);
+    return;
+  }
+  runMla<@ELEM_SYCL_TYPE@, PageSizeOption<@PAGE_SIZE@>, /*LSE=*/false>(
       out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table,
       workspace, sm_scale, num_kv_splits);
 }

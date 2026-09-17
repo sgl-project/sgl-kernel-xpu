@@ -277,8 +277,10 @@ def test_mla_prefill(return_lse, dtype, block_size, num_heads, seqlens_q, seqlen
 
 
 def test_mla_prefill_lse_optional():
-    """return_lse=False (the default) allocates and writes no LSE, and O is
-    unchanged by whether the LSE is emitted."""
+    """return_lse=False (the default) returns a bare output tensor.
+
+    Also checks that skipping the LSE does not perturb O, i.e. the LSE-off
+    kernel instantiation is numerically identical on O."""
     torch.random.manual_seed(42)
 
     dtype = torch.bfloat16
@@ -335,7 +337,7 @@ def test_mla_prefill_lse_optional():
     )
     kwargs = dict(causal=True, num_kv_splits=1)
 
-    # Default and explicit False: a bare output tensor, no LSE.
+    # Default and explicit False: a bare output tensor, no LSE computed.
     out_default = flash_mla_prefill(*args, **kwargs)
     out_false = flash_mla_prefill(*args, **kwargs, return_lse=False)
     out, lse = flash_mla_prefill(*args, **kwargs, return_lse=True)
@@ -348,7 +350,7 @@ def test_mla_prefill_lse_optional():
     torch.testing.assert_close(
         out_ref.float(), out_default.cpu().float(), atol=atol, rtol=rtol
     )
-    # Skipping the LSE store must not perturb O.
+    # The LSE-off kernel must produce bit-identical O.
     torch.testing.assert_close(out_default.cpu(), out.cpu(), atol=0, rtol=0)
     torch.testing.assert_close(out_default.cpu(), out_false.cpu(), atol=0, rtol=0)
 

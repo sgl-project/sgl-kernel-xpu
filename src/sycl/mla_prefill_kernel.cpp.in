@@ -1,4 +1,4 @@
-/***************************************************************************************************
+now mla is doing similar gating for /***************************************************************************************************
  * Copyright (C) 2026 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -36,6 +36,13 @@
 
 namespace mla_prefill {
 
+// The softmax-LSE output is threaded as a template constexpr (see MlaXePrefill),
+// so wanting the LSE and not wanting it are separate kernels and both have to be
+// instantiated for every Q-tile bucket -- six kernels in this translation unit.
+// The LSE-off variants carry none of the epilogue's LSE registers or stores. An
+// absent lse tensor is the request to skip it; the host op (flash_mla_prefill)
+// has already validated it when present.
+
 __attribute__((visibility("default"))) void launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_small(
     at::Tensor& out,
     const std::optional<at::Tensor>& lse,
@@ -50,7 +57,14 @@ __attribute__((visibility("default"))) void launch_mla_prefill_@ELEM_TAG@_@PAGE_
     double sm_scale,
     bool causal,
     int64_t num_kv_splits) {
-  runMlaPrefill<@ELEM_SYCL_TYPE@, PageSizeOption<@PAGE_SIZE@>, MlaPrefillQTileSmall>(
+  if (lse.has_value()) {
+    runMlaPrefill<@ELEM_SYCL_TYPE@, PageSizeOption<@PAGE_SIZE@>, MlaPrefillQTileSmall, /*LSE=*/true>(
+        out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, cu_seqlens_q, seq_lens,
+        max_seqlen_q, page_table,
+        workspace, sm_scale, causal, num_kv_splits);
+    return;
+  }
+  runMlaPrefill<@ELEM_SYCL_TYPE@, PageSizeOption<@PAGE_SIZE@>, MlaPrefillQTileSmall, /*LSE=*/false>(
       out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, cu_seqlens_q, seq_lens,
       max_seqlen_q, page_table,
       workspace, sm_scale, causal, num_kv_splits);
@@ -70,7 +84,14 @@ __attribute__((visibility("default"))) void launch_mla_prefill_@ELEM_TAG@_@PAGE_
     double sm_scale,
     bool causal,
     int64_t num_kv_splits) {
-  runMlaPrefill<@ELEM_SYCL_TYPE@, PageSizeOption<@PAGE_SIZE@>, MlaPrefillQTileMedium>(
+  if (lse.has_value()) {
+    runMlaPrefill<@ELEM_SYCL_TYPE@, PageSizeOption<@PAGE_SIZE@>, MlaPrefillQTileMedium, /*LSE=*/true>(
+        out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, cu_seqlens_q, seq_lens,
+        max_seqlen_q, page_table,
+        workspace, sm_scale, causal, num_kv_splits);
+    return;
+  }
+  runMlaPrefill<@ELEM_SYCL_TYPE@, PageSizeOption<@PAGE_SIZE@>, MlaPrefillQTileMedium, /*LSE=*/false>(
       out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, cu_seqlens_q, seq_lens,
       max_seqlen_q, page_table,
       workspace, sm_scale, causal, num_kv_splits);
@@ -90,7 +111,14 @@ __attribute__((visibility("default"))) void launch_mla_prefill_@ELEM_TAG@_@PAGE_
     double sm_scale,
     bool causal,
     int64_t num_kv_splits) {
-  runMlaPrefill<@ELEM_SYCL_TYPE@, PageSizeOption<@PAGE_SIZE@>, MlaPrefillQTileLarge>(
+  if (lse.has_value()) {
+    runMlaPrefill<@ELEM_SYCL_TYPE@, PageSizeOption<@PAGE_SIZE@>, MlaPrefillQTileLarge, /*LSE=*/true>(
+        out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, cu_seqlens_q, seq_lens,
+        max_seqlen_q, page_table,
+        workspace, sm_scale, causal, num_kv_splits);
+    return;
+  }
+  runMlaPrefill<@ELEM_SYCL_TYPE@, PageSizeOption<@PAGE_SIZE@>, MlaPrefillQTileLarge, /*LSE=*/false>(
       out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, cu_seqlens_q, seq_lens,
       max_seqlen_q, page_table,
       workspace, sm_scale, causal, num_kv_splits);

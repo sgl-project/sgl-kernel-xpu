@@ -83,7 +83,14 @@ struct MlaPrefillQTileLarge {
 };
 
 //----------------- define MLA Xe Prefill configuration --------------------//
-template <typename T, typename PageSizeOpt = PageSizeOption<64>, typename QTileCfg = MlaPrefillQTileLarge>
+// LSE selects whether the kernel emits the softmax log-sum-exp. It is a
+// template constant rather than a runtime null-pointer check, so the two answers
+// are two different kernels; mla_prefill_kernel.cpp.in does the dispatch.
+template <
+    typename T,
+    typename PageSizeOpt = PageSizeOption<64>,
+    typename QTileCfg = MlaPrefillQTileLarge,
+    bool LSE = false>
 struct MlaXePrefill {
   // TODO: add persistence option support in tile scheduler
   using TileScheduler = typename cutlass::flash_attention::kernel::XeMlaIndividualTileScheduler;
@@ -177,7 +184,7 @@ struct MlaXePrefill {
 
   // Collective Epilogue
   using CollectiveEpilogue = cutlass::flash_attention::collective::
-      XeMlaEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, TensorLSE>;
+      XeMlaEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, TensorLSE, LSE>;
 
   // Kernel instantiation
   using FmlaKernel = cutlass::flash_attention::kernel::
@@ -201,7 +208,7 @@ struct MlaXePrefill {
 // ---------------------------------------------------------------------------
 template <typename T>
 inline typename T::Fmla::Arguments args_from_options_prefill(
-    at::Tensor const& out,
+    at::Tensor& out,
     std::optional<at::Tensor> const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
@@ -297,9 +304,15 @@ inline typename T::Fmla::Arguments args_from_options_prefill(
   kernel_args.dV = stride_V;
   kernel_args.O = static_cast<ElementO*>(out.data_ptr());
   kernel_args.dO = stride_O;
-  // Softmax statistics are computed either way; a null pointer just skips the
-  // LSE store in the epilogue.
-  kernel_args.LSE = lse.has_value() ? static_cast<ElementLSE*>(lse->data_ptr()) : nullptr;
+  // Only the LSE-emitting instantiation reads these; the LSE-off kernel has no
+  // store to feed, so leave the pointer null (and the stride zero, above).
+  // `lse` is the one output still taken by const reference (unlike out/workspace)
+  // because the registered op signature has to be -- see flash_mla_prefill() in
+  // mla_prefill.cpp. at::Tensor constness is shallow, so the store still lands.
+  if constexpr (T::CollectiveEpilogue::LSE) {
+    TORCH_CHECK(lse.has_value(), "MLA prefill was instantiated for LSE output but no lse tensor was provided");
+    kernel_args.LSE = static_cast<ElementLSE*>(lse->data_ptr());
+  }
   kernel_args.dLSE_out = stride_LSE;
   kernel_args.seq_lens = static_cast<const int*>(seq_lens.data_ptr());
   kernel_args.cu_seqlens_q = static_cast<const int*>(cu_seqlens_q.data_ptr());
@@ -315,9 +328,13 @@ inline typename T::Fmla::Arguments args_from_options_prefill(
   return arguments;
 }
 
-template <typename Element, typename PageSizeOpt, typename QTileCfg>
+// LSE is a template constant, not a runtime flag: the caller (the generated
+// launch functions in mla_prefill_kernel.cpp.in) picks the instantiation, so
+// there are two kernels per Q-tile bucket per (dtype, page size) translation
+// unit. The LSE-off variant carries no LSE registers and no LSE stores.
+template <typename Element, typename PageSizeOpt, typename QTileCfg, bool LSE>
 inline void runMlaPrefill(
-    at::Tensor const& out,
+    at::Tensor& out,
     std::optional<at::Tensor> const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
@@ -326,11 +343,11 @@ inline void runMlaPrefill(
     at::Tensor const& seq_lens,
     int64_t max_seqlen_q,
     at::Tensor const& page_table,
-    at::Tensor const& workspace,
+    at::Tensor& workspace,
     double sm_scale,
     bool causal,
     int64_t num_kv_splits) {
-  using MlaXePrefillType = MlaXePrefill<Element, PageSizeOpt, QTileCfg>;
+  using MlaXePrefillType = MlaXePrefill<Element, PageSizeOpt, QTileCfg, LSE>;
   typename MlaXePrefillType::Fmla fmla;
   auto arguments = args_from_options_prefill<MlaXePrefillType>(
       out,

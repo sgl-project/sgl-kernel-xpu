@@ -65,9 +65,9 @@ def flash_mla_decode(
     """MLA decode.
 
     Args:
-        return_lse: return the softmax log-sum-exp alongside the output. The
-            softmax statistics are computed either way; this only controls
-            whether they are allocated and written out. Default False.
+        return_lse: also return the softmax log-sum-exp. Selects a separate
+            kernel instantiation that emits it; when False no LSE buffer is
+            allocated and the kernel carries no LSE stores. Default False.
 
     Returns:
         (out, lse) when return_lse, else out.
@@ -131,7 +131,7 @@ def flash_mla_decode(
         else q_nope.new_empty((B_q, MAX_HEADS, D_latent))
     )
     # LSE follows the (possibly head-padded) q_nope layout, like `out` does.
-    # Passing None is what tells the kernel to skip the LSE store.
+    # None selects the kernel variant that does not compute or store it.
     lse = (
         torch.empty((B_q, q_nope.shape[1]), dtype=torch.float32, device=q_nope.device)
         if return_lse
@@ -216,10 +216,10 @@ def flash_mla_prefill(
         causal:       apply causal masking (default True)
         num_kv_splits: KV split count. -1 = auto-select. Split-KV is not yet
                        implemented for MLA prefill; reserved for future use.
-        return_lse:   return the softmax log-sum-exp alongside the output. The
-                      softmax statistics are computed either way; this only
-                      controls whether they are allocated and written out.
-                      Default False.
+        return_lse:   also return the softmax log-sum-exp. Selects a separate
+                      kernel instantiation that emits it; when False no LSE
+                      buffer is allocated and the kernel carries no LSE
+                      stores. Default False.
 
     Returns:
         (out, lse) when return_lse, else out.
@@ -260,8 +260,8 @@ def flash_mla_prefill(
     total_q_padded = (total_q + _Q_TILE_MAX - 1) // _Q_TILE_MAX * _Q_TILE_MAX
     out = q_nope.new_empty((total_q_padded, H, D_latent))
     # LSE needs no Q-tile padding: the epilogue bounds its scalar stores by the
-    # per-request Q length, so rows past total_q are never touched. Passing None
-    # is what tells the kernel to skip the LSE store.
+    # per-request Q length, so rows past total_q are never touched. None selects
+    # the kernel variant that does not compute or store it.
     lse = (
         torch.empty((total_q, H), dtype=torch.float32, device=q_nope.device)
         if return_lse

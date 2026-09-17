@@ -108,6 +108,10 @@ class XeMlaFwdKernel {
   using ElementLSE = typename TensorLSE::element_type;
   using StrideLSE = decltype(stride(TensorLSE{}));
 
+  // Whether this kernel emits the LSE. Compile-time, so the LSE-off variant
+  // carries no LSE pointer arithmetic and no epilogue store.
+  static constexpr bool LSE = CollectiveEpilogue::LSE;
+
   // Tile scheduler derived types
   using TileScheduler = TileScheduler_;
   using TileSchedulerParams = typename TileScheduler::Params;
@@ -150,8 +154,7 @@ class XeMlaFwdKernel {
     StrideO dO{};
 
     // Softmax log-sum-exp output (log2 domain), (seq_q, num_heads_q, batch).
-    // Null when the caller does not want LSE: the softmax statistics are
-    // computed regardless, only the store is skipped.
+    // Only read when the LSE template parameter is true; left null otherwise.
     ElementLSE* LSE = nullptr;
     StrideLSE dLSE_out{};
 
@@ -295,7 +298,7 @@ class XeMlaFwdKernel {
         dcQ_nope += q_nope_offset;
         dcQ_pe += q_pe_offset;
         dO_ptr += o_offset;
-        if (dLSE_ptr != nullptr) {
+        if constexpr (LSE) {
           dLSE_ptr += static_cast<int64_t>(q_start) * static_cast<int64_t>(get<0>(p.dLSE_out));
         }
       }
@@ -430,6 +433,10 @@ class XeMlaSplitKVKernel {
   using ElementLSE = typename TensorLSE::element_type;
   using StrideLSE = decltype(stride(TensorLSE{}));
 
+  // Whether the LSE is emitted. This kernel never stores it itself (the
+  // reduction kernel does), but XeMlaReduceSplitKV reads the flag from here.
+  static constexpr bool LSE = CollectiveEpilogue::LSE;
+
   // Tile scheduler derived types
   using TileScheduler = TileScheduler_;
   using TileSchedulerParams = typename TileScheduler::Params;
@@ -485,7 +492,7 @@ class XeMlaSplitKVKernel {
     StrideO dO{};
 
     // Final softmax log-sum-exp output (log2 domain), forwarded to the
-    // reduction kernel. Null when the caller does not want LSE.
+    // reduction kernel. Only read when the LSE template parameter is true.
     ElementLSE* LSE = nullptr;
     StrideLSE dLSE_out{};
 

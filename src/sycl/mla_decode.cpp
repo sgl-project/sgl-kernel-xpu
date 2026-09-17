@@ -139,6 +139,16 @@ int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int
 }  // namespace
 
 /// @brief Dispatch kernel implementation for MLA decode.
+///
+/// `lse` is an output (schema: `Tensor(b!)? lse`) yet is taken by const
+/// reference, because the PyTorch library bindings cannot box a non-const
+/// `std::optional<T>&` -- see the note in sgl_kernel_torch_shim.h. That is fine:
+/// `at::Tensor` constness is shallow (`data_ptr()` is a const member returning a
+/// mutable pointer), so the epilogue still writes through it. This is the repo
+/// convention for a mutable optional tensor argument -- see the six `Tensor(x!)?`
+/// outputs of inkling_fused_decode_sconv_metadata(). FMHA's `fwd` is the lone
+/// exception among 108 registered ops, and only because make_pytorch_shim()
+/// const_casts the argument back so its signature can track upstream flash-attn.
 SGL_KERNEL_EXPORT void flash_mla_decode(
     at::Tensor& out,                        // (batch, num_heads, latent_dim)
     const std::optional<at::Tensor>& lse,   // (batch, num_heads) fp32, softmax LSE (log2 domain); nullopt = skip

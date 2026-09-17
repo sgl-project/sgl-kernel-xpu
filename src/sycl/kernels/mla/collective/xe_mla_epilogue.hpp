@@ -51,7 +51,11 @@ template <
     class TileShapeO_,
     class TensorO_,
     class TiledCopyO_,  // Optional TiledCopy for storing O (void => default)
-    class TensorLSE_>   // Global softmax-LSE tensor: (q, head, batch)
+    class TensorLSE_,   // Global softmax-LSE tensor: (q, head, batch)
+    // LSE: when false, the epilogue skips the LSE combine and store entirely.
+    // Threaded as a template constexpr rather than a runtime null-pointer check
+    // so the LSE-off kernel carries none of write_lse()'s registers or stores.
+    bool LSE_ = false>
 class XeMlaEpilogue {
  public:
   //
@@ -71,6 +75,11 @@ class XeMlaEpilogue {
   using TensorLSE = TensorLSE_;
   using TensorLSE1D = decltype(TensorLSE_{}(make_coord(_, 0, 0)));
   using ElementLSE = typename TensorLSE_::value_type;
+
+  // Exposed for the kernel layer (see XeMlaFwdKernel::LSE). Note the epilogue's
+  // own entry points take a tensor parameter named LSE that shadows this, so
+  // internal `if constexpr` conditions spell the template parameter LSE_.
+  static constexpr bool LSE = LSE_;
 
   using FragA = typename CollectiveMainloop::FragA;
   using FragARow = typename CollectiveMainloop::FragARow;
@@ -181,7 +190,9 @@ class XeMlaEpilogue {
     auto tOgO = thr_copy_o.partition_D(gO);
 
     /* Emit LSE while the softmax sums are still the raw denominators. */
-    write_lse(rA, rA_sum, rA_max, tOrO, tOgO, blk_qv, LSE);
+    if constexpr (LSE_) {
+      write_lse(rA, rA_sum, rA_max, tOrO, tOgO, blk_qv, LSE);
+    }
 
     /* Complete softmax, dividing out sums. */
     CUTLASS_PRAGMA_UNROLL
@@ -215,8 +226,10 @@ class XeMlaEpilogue {
   /// used for O, these scalar stores are not bounds-clamped, and in the ragged
   /// prefill layout they would land on the next request's rows.
   ///
-  /// A null LSE data pointer (caller does not want LSE) turns this into a no-op;
-  /// the softmax statistics are computed by the mainloop either way.
+  /// Only instantiated when the LSE_ template parameter is true; the caller
+  /// (operator() above) gates the call with `if constexpr`. The softmax
+  /// statistics themselves are computed by the mainloop either way -- they are
+  /// what normalizes O -- so the LSE-off kernel differs only in this store.
   template <class RedFragA, class RedFragARow, class FragO, class CoordO, class QVCoord>
   CUTLASS_DEVICE void write_lse(
       RedFragA const& rA,         // Reduced O accumulator: (q,v)
@@ -228,7 +241,6 @@ class XeMlaEpilogue {
       TensorLSE1D const& LSE) {   // Global LSE tensor for this (head,batch): (q)
     using namespace cute;
 
-    if (raw_pointer_cast(LSE.data()) == nullptr) return;
     /* Only the first V tile owns the LSE row (V is not split for MLA, but keep
        the guard so a future V-split cannot double-write). */
     if (int(get<1>(blk_qv)) != 0) return;

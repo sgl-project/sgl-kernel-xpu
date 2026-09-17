@@ -185,6 +185,9 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
 }  // namespace
 
 /// @brief Dispatch kernel for MLA prefill with varlen/ragged Q and causal mask.
+///
+/// `lse` is an output (schema: `Tensor(b!)? lse`) yet is taken by const
+/// reference; see the explanation on flash_mla_decode() in mla_decode.cpp.
 SGL_KERNEL_EXPORT void flash_mla_prefill(
     at::Tensor& out,                        // (total_q, num_heads, latent_dim)
     const std::optional<at::Tensor>& lse,   // (total_q, num_heads) fp32, softmax LSE (log2 domain); nullopt = skip

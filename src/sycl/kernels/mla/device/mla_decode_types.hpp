@@ -100,7 +100,14 @@ struct FMlAProblemShape {
 };
 
 //----------------- define MLA Xe configuration --------------------//
-template <typename T, typename PageSizeOpt = PageSizeOption<64>, typename SplitKVOption = EnabledSplitKV<false>>
+// LSE selects whether the kernel emits the softmax log-sum-exp. It is a
+// template constant rather than a runtime null-pointer check, so the two answers
+// are two different kernels; mla_decode_kernel.cpp.in does the dispatch.
+template <
+    typename T,
+    typename PageSizeOpt = PageSizeOption<64>,
+    typename SplitKVOption = EnabledSplitKV<false>,
+    bool LSE = false>
 struct MlaXe {
   // TODO: add persistence option support in tile scheduler
   using TileScheduler = typename cutlass::flash_attention::kernel::XeMlaIndividualTileScheduler;
@@ -183,7 +190,7 @@ struct MlaXe {
 
   // Collective Epilogue
   using CollectiveEpilogue = cutlass::flash_attention::collective::
-      XeMlaEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, TensorLSE>;
+      XeMlaEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, TensorLSE, LSE>;
 
   // Kernel instantiation
   static constexpr bool is_split_kv = SplitKVOption::value;
@@ -199,14 +206,14 @@ struct MlaXe {
 
 template <typename T>
 inline typename T::Fmla::Arguments args_from_options(
-    at::Tensor const& out,
+    at::Tensor& out,
     std::optional<at::Tensor> const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
     at::Tensor const& seq_lens,
     at::Tensor const& page_table,
-    at::Tensor const& workspace,
+    at::Tensor& workspace,
     double sm_scale,
     int64_t num_kv_splits) {
   cutlass::KernelHardwareInfo hw_info;
@@ -299,9 +306,15 @@ inline typename T::Fmla::Arguments args_from_options(
   kernel_args.dV = stride_V;
   kernel_args.O = static_cast<ElementO*>(out.data_ptr());
   kernel_args.dO = stride_O;
-  // Softmax statistics are computed either way; a null pointer just skips the
-  // LSE store (split-KV: the reduction kernel's store).
-  kernel_args.LSE = lse.has_value() ? static_cast<ElementLSE*>(lse->data_ptr()) : nullptr;
+  // Only the LSE-emitting instantiation reads these; the LSE-off kernel has no
+  // store to feed, so leave the pointer null (and the stride zero, above).
+  // `lse` is the one output still taken by const reference (unlike out/workspace)
+  // because the registered op signature has to be -- see flash_mla_decode() in
+  // mla_decode.cpp. at::Tensor constness is shallow, so the store still lands.
+  if constexpr (T::CollectiveEpilogue::LSE) {
+    TORCH_CHECK(lse.has_value(), "MLA decode was instantiated for LSE output but no lse tensor was provided");
+    kernel_args.LSE = static_cast<ElementLSE*>(lse->data_ptr());
+  }
   kernel_args.dLSE_out = stride_LSE;
   kernel_args.seq_lens = static_cast<const int*>(seq_lens.data_ptr());
 
@@ -343,19 +356,19 @@ inline typename T::Fmla::Arguments args_from_options(
   return arguments;
 }
 
-template <typename Element, typename PageSizeOpt, typename SplitKVOpt>
+template <typename Element, typename PageSizeOpt, typename SplitKVOpt, bool LSE>
 inline void runMlaImpl(
-    at::Tensor const& out,
+    at::Tensor& out,
     std::optional<at::Tensor> const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
     at::Tensor const& seq_lens,
     at::Tensor const& page_table,
-    at::Tensor const& workspace,
+    at::Tensor& workspace,
     double sm_scale,
     int64_t num_kv_splits) {
-  using MlaXeType = MlaXe<Element, PageSizeOpt, SplitKVOpt>;
+  using MlaXeType = MlaXe<Element, PageSizeOpt, SplitKVOpt, LSE>;
   typename MlaXeType::Fmla fmla;
   auto arguments = args_from_options<MlaXeType>(
       out,
@@ -374,16 +387,20 @@ inline void runMlaImpl(
   CUTLASS_CHECK(fmla.run(arguments, workspace.data_ptr()));
 }
 
-template <typename Element, typename PageSizeOpt>
+// LSE is a template constant, not a runtime flag: the caller (the generated
+// launch function in mla_decode_kernel.cpp.in) picks the instantiation. Crossed
+// with the split-KV dispatch below that is four kernels per (dtype, page size)
+// translation unit; the LSE-off pair carries no LSE registers and no LSE stores.
+template <typename Element, typename PageSizeOpt, bool LSE>
 inline void runMla(
-    at::Tensor const& out,
+    at::Tensor& out,
     std::optional<at::Tensor> const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
     at::Tensor const& seq_lens,
     at::Tensor const& page_table,
-    at::Tensor const& workspace,
+    at::Tensor& workspace,
     double sm_scale,
     int64_t num_kv_splits) {
   TORCH_CHECK(num_kv_splits >= 1, "num_kv_splits must be resolved before calling runMla, got ", num_kv_splits);
@@ -407,7 +424,7 @@ inline void runMla(
   }
 
   if (num_kv_splits == 1) {
-    runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<false>>(
+    runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<false>, LSE>(
         out,
         lse,
         q_nope,
@@ -419,7 +436,7 @@ inline void runMla(
         sm_scale,
         num_kv_splits);
   } else {
-    runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<true>>(
+    runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<true>, LSE>(
         out,
         lse,
         q_nope,

@@ -177,11 +177,12 @@ def test_flash_mla_decode(
 
 @pytest.mark.parametrize("num_kv_splits", [-1, 1])
 def test_flash_mla_decode_lse_optional(num_kv_splits: int):
-    """return_lse=False (the default) allocates and writes no LSE.
+    """return_lse=False (the default) returns a bare output tensor.
 
-    Both KV-split modes are covered: 1 split writes the LSE from the fused
-    epilogue, auto (-1) may pick more and write it from the split-KV reduction
-    kernel, and each has its own null-LSE guard.
+    Also checks that skipping the LSE does not perturb O, i.e. the LSE-off
+    kernel instantiation is numerically identical on O. Both KV-split modes are
+    covered: 1 split writes the LSE from the fused epilogue, auto (-1) may pick
+    more and write it from the split-KV reduction kernel.
     """
     torch.random.manual_seed(42)
 
@@ -226,7 +227,7 @@ def test_flash_mla_decode_lse_optional(num_kv_splits: int):
         num_kv_splits,
     )
 
-    # Default and explicit False: a bare output tensor, no LSE.
+    # Default and explicit False: a bare output tensor, no LSE computed.
     out_default = flash_mla_decode(*args)
     out_false = flash_mla_decode(*args, return_lse=False)
     out, lse = flash_mla_decode(*args, return_lse=True)
@@ -239,7 +240,7 @@ def test_flash_mla_decode_lse_optional(num_kv_splits: int):
     torch.testing.assert_close(
         out_ref.float(), out_default.cpu().float(), atol=atol, rtol=rtol
     )
-    # Skipping the LSE store must not perturb O.
+    # The LSE-off kernel must produce bit-identical O.
     torch.testing.assert_close(out_default.cpu(), out.cpu(), atol=0, rtol=0)
     torch.testing.assert_close(out_default.cpu(), out_false.cpu(), atol=0, rtol=0)
     torch.testing.assert_close(lse_ref, lse.cpu(), atol=2e-2, rtol=2e-2)

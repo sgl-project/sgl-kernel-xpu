@@ -233,34 +233,39 @@ class XeMlaEpilogue {
        the guard so a future V-split cannot double-write). */
     if (int(get<1>(blk_qv)) != 0) return;
 
-    /* Broadcast the row-wise statistics to every element of the A fragment,
-       then reorder them into the output fragment layout, where tOgO gives each
-       element its (q,v) coordinate. Keep them in ElementA (float): tOrO may be
-       a narrower output type. */
-    auto sum_e = rA;
-    auto max_e = rA;
+    /* Combine the row-wise statistics into the LSE while still in row space, so
+       only one value per query row is computed (and only one fragment is
+       reordered below). */
+    auto row_lse = rA_sum;
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA.size(); i++) {
-      sum_e(i) = broadcast<0>(rA_sum, rA, i);
-      max_e(i) = broadcast<0>(rA_max, rA, i);
+    for (int i = 0; i < rA_sum.size(); i++) {
+      float d = float(rA_sum(i));
+      row_lse(i) = ElementA((d > 0.f) ? (float(rA_max(i)) + sycl::log2(d)) : -INFINITY);
     }
 
-    auto tv = tOrO.tv_layout();
-    auto tO_sum = make_subgroup_tensor(make_fragment_like<ElementA>(tOrO.layout()), tv);
-    auto tO_max = make_subgroup_tensor(make_fragment_like<ElementA>(tOrO.layout()), tv);
-    reorder(sum_e, tO_sum);
-    reorder(max_e, tO_max);
+    /* Broadcast the per-row LSE to every element of the A fragment, then reorder
+       it into the output fragment layout, where tOgO gives each element its
+       (q,v) coordinate -- the only place the global row index is available here.
+       Keep the values in ElementA (float): tOrO may be a narrower output type.
+       reorder() requires SubgroupTensor operands, so wrap the float fragment
+       with tOrO's TV layout. */
+    auto lse_e = rA;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < rA.size(); i++) {
+      lse_e(i) = broadcast<0>(row_lse, rA, i);
+    }
+
+    auto tO_lse = make_subgroup_tensor(make_fragment_like<ElementA>(tOrO.layout()), tOrO.tv_layout());
+    reorder(lse_e, tO_lse);
 
     int num_rows = int(size<0>(LSE));
 
     CUTLASS_PRAGMA_UNROLL
-    for (int j = 0; j < int(tO_sum.size()); j++) {
+    for (int j = 0; j < int(tO_lse.size()); j++) {
       if (int(get<1>(tOgO(j))) != 0) continue;
       int row = int(get<0>(tOgO(j)));
       if (row >= num_rows) continue;
-      float d = float(tO_sum(j));
-      float lse = (d > 0.f) ? (float(tO_max(j)) + sycl::log2(d)) : -INFINITY;
-      LSE(row) = static_cast<ElementLSE>(lse);
+      LSE(row) = static_cast<ElementLSE>(tO_lse(j));
     }
   }
 

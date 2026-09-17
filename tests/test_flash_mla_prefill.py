@@ -122,6 +122,7 @@ def ref_mla_prefill_varlen(
 # Primarily exercises incremental prefill (seqlen_q < seqlen_k); a handful
 # of full-prefill cases (seqlen_q == seqlen_k) are included for coverage.
 # ============================================================================
+@pytest.mark.parametrize("return_lse", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("block_size", [16, 32, 64, 128])
 @pytest.mark.parametrize("num_heads", [16, 128])
@@ -190,7 +191,7 @@ def ref_mla_prefill_varlen(
         "medium_q511_k2048",
     ],
 )
-def test_mla_prefill(dtype, block_size, num_heads, seqlens_q, seqlens_k):
+def test_mla_prefill(return_lse, dtype, block_size, num_heads, seqlens_q, seqlens_k):
     """MLA prefill: mostly incremental (seqlen_q < seqlen_k), some full prefill."""
     for sq, sk in zip(seqlens_q, seqlens_k):
         if sq > sk:
@@ -201,6 +202,90 @@ def test_mla_prefill(dtype, block_size, num_heads, seqlens_q, seqlens_k):
     D_latent = 512
     D_rope = 64
     D_ckv = D_latent + D_rope
+    scale = (128 + D_rope) ** (-0.5)
+
+    bs = len(seqlens_q)
+    total_q = sum(seqlens_q)
+    cu_seqlens_q = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(seqlens_q), 0).tolist()), dtype=torch.int32
+    )
+    seq_lens_k = torch.tensor(seqlens_k, dtype=torch.int32)
+
+    block_num = (max(seqlens_k) + block_size - 1) // block_size
+    pack_factor = 128 // block_size
+    block_num = ((block_num + pack_factor - 1) // pack_factor) * pack_factor
+
+    q_nope_cpu = torch.randn(total_q, num_heads, D_latent, dtype=dtype)
+    q_pe_cpu = torch.randn(total_q, num_heads, D_rope, dtype=dtype)
+    block_table_cpu = torch.randint(
+        0, bs * block_num, (bs, block_num), dtype=torch.int32
+    )
+    kv_cache_cpu = torch.randn(
+        block_table_cpu.max().item() + 1, block_size, D_ckv, dtype=dtype
+    )
+
+    lse_ref = (
+        torch.zeros(total_q, num_heads, dtype=torch.float32) if return_lse else None
+    )
+    out_ref = ref_mla_prefill_varlen(
+        q_nope_cpu,
+        q_pe_cpu,
+        kv_cache_cpu,
+        scale,
+        block_table_cpu,
+        cu_seqlens_q,
+        seq_lens_k,
+        causal=True,
+        lse=lse_ref,
+    )
+
+    q_nope_xpu = q_nope_cpu.to(device).contiguous()
+    q_pe_xpu = q_pe_cpu.to(device).contiguous()
+    kv_cache_xpu = kv_cache_cpu.to(device)
+    block_table_xpu = block_table_cpu.to(device)
+    cu_seqlens_q_xpu = cu_seqlens_q.to(device)
+    seq_lens_k_xpu = seq_lens_k.to(device)
+
+    ws_size = flash_mla_prefill_get_workspace_size(block_num * block_size, bs)
+    workspace = torch.empty(ws_size, device=device, dtype=torch.uint8)
+
+    ret = flash_mla_prefill(
+        q_nope_xpu,
+        q_pe_xpu,
+        kv_cache_xpu,
+        cu_seqlens_q_xpu,
+        seq_lens_k_xpu,
+        max(seqlens_q),
+        block_table_xpu,
+        workspace,
+        scale,
+        causal=True,
+        num_kv_splits=1,
+        return_lse=return_lse,
+    )
+    out, lse = ret if return_lse else (ret, None)
+    torch.xpu.synchronize()
+
+    atol, rtol = (1e-2, 1e-2) if dtype == torch.bfloat16 else (1e-3, 1e-3)
+    torch.testing.assert_close(out_ref.float(), out.cpu().float(), atol=atol, rtol=rtol)
+
+    if return_lse:
+        assert lse.shape == (total_q, num_heads)
+        assert lse.dtype == torch.float32
+        lse_atol, lse_rtol = (2e-2, 2e-2) if dtype == torch.bfloat16 else (5e-3, 5e-3)
+        torch.testing.assert_close(lse_ref, lse.cpu(), atol=lse_atol, rtol=lse_rtol)
+
+
+def test_mla_prefill_lse_optional():
+    """return_lse=False (the default) allocates and writes no LSE, and O is
+    unchanged by whether the LSE is emitted."""
+    torch.random.manual_seed(42)
+
+    dtype = torch.bfloat16
+    D_latent, D_rope = 512, 64
+    D_ckv = D_latent + D_rope
+    num_heads, block_size = 16, 64
+    seqlens_q, seqlens_k = [33, 17], [256, 128]
     scale = (128 + D_rope) ** (-0.5)
 
     bs = len(seqlens_q)
@@ -236,38 +321,40 @@ def test_mla_prefill(dtype, block_size, num_heads, seqlens_q, seqlens_k):
         lse=lse_ref,
     )
 
-    q_nope_xpu = q_nope_cpu.to(device).contiguous()
-    q_pe_xpu = q_pe_cpu.to(device).contiguous()
-    kv_cache_xpu = kv_cache_cpu.to(device)
-    block_table_xpu = block_table_cpu.to(device)
-    cu_seqlens_q_xpu = cu_seqlens_q.to(device)
-    seq_lens_k_xpu = seq_lens_k.to(device)
-
     ws_size = flash_mla_prefill_get_workspace_size(block_num * block_size, bs)
-    workspace = torch.empty(ws_size, device=device, dtype=torch.uint8)
-
-    out, lse = flash_mla_prefill(
-        q_nope_xpu,
-        q_pe_xpu,
-        kv_cache_xpu,
-        cu_seqlens_q_xpu,
-        seq_lens_k_xpu,
+    args = (
+        q_nope_cpu.to(device).contiguous(),
+        q_pe_cpu.to(device).contiguous(),
+        kv_cache_cpu.to(device),
+        cu_seqlens_q.to(device),
+        seq_lens_k.to(device),
         max(seqlens_q),
-        block_table_xpu,
-        workspace,
+        block_table_cpu.to(device),
+        torch.empty(ws_size, device=device, dtype=torch.uint8),
         scale,
-        causal=True,
-        num_kv_splits=1,
     )
+    kwargs = dict(causal=True, num_kv_splits=1)
+
+    # Default and explicit False: a bare output tensor, no LSE.
+    out_default = flash_mla_prefill(*args, **kwargs)
+    out_false = flash_mla_prefill(*args, **kwargs, return_lse=False)
+    out, lse = flash_mla_prefill(*args, **kwargs, return_lse=True)
     torch.xpu.synchronize()
 
-    atol, rtol = (1e-2, 1e-2) if dtype == torch.bfloat16 else (1e-3, 1e-3)
-    torch.testing.assert_close(out_ref.float(), out.cpu().float(), atol=atol, rtol=rtol)
+    assert isinstance(out_default, torch.Tensor)
+    assert isinstance(out_false, torch.Tensor)
+
+    atol, rtol = 1e-2, 1e-2
+    torch.testing.assert_close(
+        out_ref.float(), out_default.cpu().float(), atol=atol, rtol=rtol
+    )
+    # Skipping the LSE store must not perturb O.
+    torch.testing.assert_close(out_default.cpu(), out.cpu(), atol=0, rtol=0)
+    torch.testing.assert_close(out_default.cpu(), out_false.cpu(), atol=0, rtol=0)
 
     assert lse.shape == (total_q, num_heads)
     assert lse.dtype == torch.float32
-    lse_atol, lse_rtol = (2e-2, 2e-2) if dtype == torch.bfloat16 else (5e-3, 5e-3)
-    torch.testing.assert_close(lse_ref, lse.cpu(), atol=lse_atol, rtol=lse_rtol)
+    torch.testing.assert_close(lse_ref, lse.cpu(), atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":

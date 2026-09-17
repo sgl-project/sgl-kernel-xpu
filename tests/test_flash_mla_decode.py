@@ -68,6 +68,7 @@ def ref_mla(
     return out
 
 
+@pytest.mark.parametrize("return_lse", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "mean_seq_len", [128, 1024, 4096] + ([8192, 16384, 32768] if LONG_TESTS else [])
@@ -84,6 +85,7 @@ def ref_mla(
     ids=["deepseek", "minicpm3"],
 )
 def test_flash_mla_decode(
+    return_lse: bool,
     dtype: torch.dtype,
     mean_seq_len: int,
     bs: int,
@@ -126,10 +128,10 @@ def test_flash_mla_decode(
 
     # --- Reference: run on CPU ---
     out_ref = torch.zeros(bs, h_q, dv, dtype=dtype, device="cpu")
-    lse_ref = torch.zeros(bs, h_q, dtype=torch.float32, device="cpu")
-    ref_mla(
-        out_ref, q_cpu, kv_cache_cpu, scale, block_table_cpu, seq_lens_cpu, lse_ref
+    lse_ref = (
+        torch.zeros(bs, h_q, dtype=torch.float32, device="cpu") if return_lse else None
     )
+    ref_mla(out_ref, q_cpu, kv_cache_cpu, scale, block_table_cpu, seq_lens_cpu, lse_ref)
 
     # --- Kernel under test: run on XPU ---
     q_xpu = q_cpu.to(device=device)
@@ -147,7 +149,7 @@ def test_flash_mla_decode(
     q_nope.copy_(q_xpu[:, :, :dv])
     q_pe = q_xpu[:, :, dv:].clone()
     del q_xpu
-    out, lse = flash_mla_decode(
+    ret = flash_mla_decode(
         q_nope,
         q_pe,
         kv_cache_xpu,
@@ -156,18 +158,91 @@ def test_flash_mla_decode(
         workspace,
         scale,
         num_kv_splits,
+        return_lse=return_lse,
     )
+    out, lse = ret if return_lse else (ret, None)
     torch.xpu.synchronize()
     atol, rtol = (1e-2, 1e-2) if dtype == torch.bfloat16 else (1e-3, 1e-3)
     torch.testing.assert_close(out_ref.float(), out.cpu().float(), atol=atol, rtol=rtol)
 
-    assert lse.shape == (bs, h_q)
-    assert lse.dtype == torch.float32
-    lse_atol, lse_rtol = (2e-2, 2e-2) if dtype == torch.bfloat16 else (5e-3, 5e-3)
-    torch.testing.assert_close(lse_ref, lse.cpu(), atol=lse_atol, rtol=lse_rtol)
+    if return_lse:
+        assert lse.shape == (bs, h_q)
+        assert lse.dtype == torch.float32
+        lse_atol, lse_rtol = (2e-2, 2e-2) if dtype == torch.bfloat16 else (5e-3, 5e-3)
+        torch.testing.assert_close(lse_ref, lse.cpu(), atol=lse_atol, rtol=lse_rtol)
 
-    del out, lse, out_ref, lse_ref, q_nope, q_pe, kv_cache_xpu, block_table_xpu
+    del ret, out, lse, out_ref, lse_ref, q_nope, q_pe, kv_cache_xpu, block_table_xpu
     del workspace, seq_lens_xpu
+
+
+@pytest.mark.parametrize("num_kv_splits", [-1, 1])
+def test_flash_mla_decode_lse_optional(num_kv_splits: int):
+    """return_lse=False (the default) allocates and writes no LSE.
+
+    Both KV-split modes are covered: 1 split writes the LSE from the fused
+    epilogue, auto (-1) may pick more and write it from the split-KV reduction
+    kernel, and each has its own null-LSE guard.
+    """
+    torch.random.manual_seed(42)
+
+    dtype = torch.bfloat16
+    bs, h_q, dv, q_pe_dim = 2, 16, 512, 64
+    d = dv + q_pe_dim
+    block_size, seq_len = 64, 256
+    scale = (128 + q_pe_dim) ** (-0.5)
+
+    seq_lens_cpu = torch.full((bs,), seq_len, dtype=torch.int32)
+    block_num = seq_len // block_size
+    pack_factor = 128 // block_size
+    block_num = ((block_num + pack_factor - 1) // pack_factor) * pack_factor
+
+    q_cpu = torch.randn(bs, h_q, d, dtype=dtype, device="cpu")
+    block_table_cpu = torch.randint(
+        0, bs * block_num, (bs, block_num), dtype=torch.int32, device="cpu"
+    )
+    kv_cache_cpu = torch.randn(
+        block_table_cpu.numel(), block_size, d, dtype=dtype, device="cpu"
+    )
+
+    out_ref = torch.zeros(bs, h_q, dv, dtype=dtype, device="cpu")
+    lse_ref = torch.zeros(bs, h_q, dtype=torch.float32, device="cpu")
+    ref_mla(out_ref, q_cpu, kv_cache_cpu, scale, block_table_cpu, seq_lens_cpu, lse_ref)
+
+    workspace = torch.empty(
+        flash_mla_decode_get_workspace_size(
+            block_num * block_size, bs, h_q, block_size, num_kv_splits=num_kv_splits
+        ),
+        device=device,
+        dtype=torch.uint8,
+    )
+    args = (
+        q_cpu[:, :, :dv].to(device).contiguous(),
+        q_cpu[:, :, dv:].to(device).contiguous(),
+        kv_cache_cpu.to(device),
+        seq_lens_cpu.to(device),
+        block_table_cpu.to(device),
+        workspace,
+        scale,
+        num_kv_splits,
+    )
+
+    # Default and explicit False: a bare output tensor, no LSE.
+    out_default = flash_mla_decode(*args)
+    out_false = flash_mla_decode(*args, return_lse=False)
+    out, lse = flash_mla_decode(*args, return_lse=True)
+    torch.xpu.synchronize()
+
+    assert isinstance(out_default, torch.Tensor)
+    assert isinstance(out_false, torch.Tensor)
+
+    atol, rtol = 1e-2, 1e-2
+    torch.testing.assert_close(
+        out_ref.float(), out_default.cpu().float(), atol=atol, rtol=rtol
+    )
+    # Skipping the LSE store must not perturb O.
+    torch.testing.assert_close(out_default.cpu(), out.cpu(), atol=0, rtol=0)
+    torch.testing.assert_close(out_default.cpu(), out_false.cpu(), atol=0, rtol=0)
+    torch.testing.assert_close(lse_ref, lse.cpu(), atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":

@@ -37,6 +37,7 @@
 
 #include <ATen/ATen.h>
 
+#include <optional>
 #include <sycl/sycl.hpp>
 
 namespace mla_prefill {
@@ -56,7 +57,7 @@ namespace mla_prefill {
 #define DECLARE_MLA_PREFILL_LAUNCH(ELEM, PS, BUCKET) \
   void launch_mla_prefill_##ELEM##_##PS##_##BUCKET(  \
       at::Tensor& out,                               \
-      at::Tensor& lse,                               \
+      const std::optional<at::Tensor>& lse,          \
       const at::Tensor& q_nope,                      \
       const at::Tensor& q_pe,                        \
       const at::Tensor& kv_c_and_k_pe_cache,         \
@@ -67,8 +68,7 @@ namespace mla_prefill {
       at::Tensor& workspace,                         \
       double sm_scale,                               \
       bool causal,                                   \
-      int64_t num_kv_splits,                         \
-      bool return_lse);
+      int64_t num_kv_splits);
 
 #define DECLARE_MLA_PREFILL_ALL_PAGE_SIZES(ELEM) \
   DECLARE_MLA_PREFILL_LAUNCH(ELEM, 16, small)    \

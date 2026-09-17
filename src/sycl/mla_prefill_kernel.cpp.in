@@ -38,7 +38,7 @@ namespace mla_prefill {
 
 __attribute__((visibility("default"))) void launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_small(
     at::Tensor& out,
-    at::Tensor& lse,
+    const std::optional<at::Tensor>& lse,
     const at::Tensor& q_nope,
     const at::Tensor& q_pe,
     const at::Tensor& kv_c_and_k_pe_cache,
@@ -49,17 +49,16 @@ __attribute__((visibility("default"))) void launch_mla_prefill_@ELEM_TAG@_@PAGE_
     at::Tensor& workspace,
     double sm_scale,
     bool causal,
-    int64_t num_kv_splits,
-    bool return_lse) {
+    int64_t num_kv_splits) {
   runMlaPrefill<@ELEM_SYCL_TYPE@, PageSizeOption<@PAGE_SIZE@>, MlaPrefillQTileSmall>(
       out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, cu_seqlens_q, seq_lens,
       max_seqlen_q, page_table,
-      workspace, sm_scale, causal, num_kv_splits, return_lse);
+      workspace, sm_scale, causal, num_kv_splits);
 }
 
 __attribute__((visibility("default"))) void launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_medium(
     at::Tensor& out,
-    at::Tensor& lse,
+    const std::optional<at::Tensor>& lse,
     const at::Tensor& q_nope,
     const at::Tensor& q_pe,
     const at::Tensor& kv_c_and_k_pe_cache,
@@ -70,17 +69,16 @@ __attribute__((visibility("default"))) void launch_mla_prefill_@ELEM_TAG@_@PAGE_
     at::Tensor& workspace,
     double sm_scale,
     bool causal,
-    int64_t num_kv_splits,
-    bool return_lse) {
+    int64_t num_kv_splits) {
   runMlaPrefill<@ELEM_SYCL_TYPE@, PageSizeOption<@PAGE_SIZE@>, MlaPrefillQTileMedium>(
       out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, cu_seqlens_q, seq_lens,
       max_seqlen_q, page_table,
-      workspace, sm_scale, causal, num_kv_splits, return_lse);
+      workspace, sm_scale, causal, num_kv_splits);
 }
 
 __attribute__((visibility("default"))) void launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_large(
     at::Tensor& out,
-    at::Tensor& lse,
+    const std::optional<at::Tensor>& lse,
     const at::Tensor& q_nope,
     const at::Tensor& q_pe,
     const at::Tensor& kv_c_and_k_pe_cache,
@@ -91,12 +89,11 @@ __attribute__((visibility("default"))) void launch_mla_prefill_@ELEM_TAG@_@PAGE_
     at::Tensor& workspace,
     double sm_scale,
     bool causal,
-    int64_t num_kv_splits,
-    bool return_lse) {
+    int64_t num_kv_splits) {
   runMlaPrefill<@ELEM_SYCL_TYPE@, PageSizeOption<@PAGE_SIZE@>, MlaPrefillQTileLarge>(
       out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, cu_seqlens_q, seq_lens,
       max_seqlen_q, page_table,
-      workspace, sm_scale, causal, num_kv_splits, return_lse);
+      workspace, sm_scale, causal, num_kv_splits);
 }
 
 }  // namespace mla_prefill
@@ -109,7 +106,7 @@ __attribute__((visibility("default"))) void launch_mla_prefill_@ELEM_TAG@_@PAGE_
 extern "C" __attribute__((visibility("default"))) void sgl_mla_prefill_entry(
     int bucket,
     void* out,
-    void* lse,
+    const void* lse,  // const std::optional<at::Tensor>*
     const void* q_nope,
     const void* q_pe,
     const void* kv_c_and_k_pe_cache,
@@ -120,10 +117,9 @@ extern "C" __attribute__((visibility("default"))) void sgl_mla_prefill_entry(
     void* workspace,
     double sm_scale,
     bool causal,
-    int64_t num_kv_splits,
-    bool return_lse) {
+    int64_t num_kv_splits) {
   at::Tensor& o = *static_cast<at::Tensor*>(out);
-  at::Tensor& ls = *static_cast<at::Tensor*>(lse);
+  const std::optional<at::Tensor>& ls = *static_cast<const std::optional<at::Tensor>*>(lse);
   const at::Tensor& qn = *static_cast<const at::Tensor*>(q_nope);
   const at::Tensor& qp = *static_cast<const at::Tensor*>(q_pe);
   const at::Tensor& kv = *static_cast<const at::Tensor*>(kv_c_and_k_pe_cache);
@@ -133,13 +129,13 @@ extern "C" __attribute__((visibility("default"))) void sgl_mla_prefill_entry(
   at::Tensor& ws = *static_cast<at::Tensor*>(workspace);
   if (bucket == 0) {
     mla_prefill::launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_small(
-        o, ls, qn, qp, kv, cu, sl, max_seqlen_q, pt, ws, sm_scale, causal, num_kv_splits, return_lse);
+        o, ls, qn, qp, kv, cu, sl, max_seqlen_q, pt, ws, sm_scale, causal, num_kv_splits);
   } else if (bucket == 1) {
     mla_prefill::launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_medium(
-        o, ls, qn, qp, kv, cu, sl, max_seqlen_q, pt, ws, sm_scale, causal, num_kv_splits, return_lse);
+        o, ls, qn, qp, kv, cu, sl, max_seqlen_q, pt, ws, sm_scale, causal, num_kv_splits);
   } else {
     mla_prefill::launch_mla_prefill_@ELEM_TAG@_@PAGE_SIZE@_large(
-        o, ls, qn, qp, kv, cu, sl, max_seqlen_q, pt, ws, sm_scale, causal, num_kv_splits, return_lse);
+        o, ls, qn, qp, kv, cu, sl, max_seqlen_q, pt, ws, sm_scale, causal, num_kv_splits);
   }
 }
 #endif

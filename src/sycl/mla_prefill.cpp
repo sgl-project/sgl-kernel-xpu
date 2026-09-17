@@ -113,8 +113,7 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
             workspace,                                                            \
             sm_scale,                                                             \
             causal,                                                               \
-            num_kv_splits,                                                        \
-            return_lse);                                                          \
+            num_kv_splits);                                                       \
         break;                                                                    \
       case 32:                                                                    \
         mla_prefill::launch_mla_prefill_##ELEM##_32_##BUCKET(                     \
@@ -130,8 +129,7 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
             workspace,                                                            \
             sm_scale,                                                             \
             causal,                                                               \
-            num_kv_splits,                                                        \
-            return_lse);                                                          \
+            num_kv_splits);                                                       \
         break;                                                                    \
       case 64:                                                                    \
         mla_prefill::launch_mla_prefill_##ELEM##_64_##BUCKET(                     \
@@ -147,8 +145,7 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
             workspace,                                                            \
             sm_scale,                                                             \
             causal,                                                               \
-            num_kv_splits,                                                        \
-            return_lse);                                                          \
+            num_kv_splits);                                                       \
         break;                                                                    \
       case 128:                                                                   \
         mla_prefill::launch_mla_prefill_##ELEM##_128_##BUCKET(                    \
@@ -164,8 +161,7 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
             workspace,                                                            \
             sm_scale,                                                             \
             causal,                                                               \
-            num_kv_splits,                                                        \
-            return_lse);                                                          \
+            num_kv_splits);                                                       \
         break;                                                                    \
       default:                                                                    \
         TORCH_CHECK(false, "Unsupported page size for MLA prefill: ", page_size); \
@@ -191,7 +187,7 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
 /// @brief Dispatch kernel for MLA prefill with varlen/ragged Q and causal mask.
 SGL_KERNEL_EXPORT void flash_mla_prefill(
     at::Tensor& out,                        // (total_q, num_heads, latent_dim)
-    at::Tensor& lse,                        // (total_q, num_heads) fp32, softmax LSE (log2 domain)
+    const std::optional<at::Tensor>& lse,   // (total_q, num_heads) fp32, softmax LSE (log2 domain); nullopt = skip
     const at::Tensor& q_nope,               // (total_q, num_heads, latent_dim)
     const at::Tensor& q_pe,                 // (total_q, num_heads, rope_dim)
     const at::Tensor& kv_c_and_k_pe_cache,  // (total_pages, page_size, latent_dim + rope_dim)
@@ -202,10 +198,8 @@ SGL_KERNEL_EXPORT void flash_mla_prefill(
     at::Tensor& workspace,
     double sm_scale,
     bool causal,
-    int64_t num_kv_splits,
-    bool return_lse) {
+    int64_t num_kv_splits) {
   CHECK_INPUT(out);
-  CHECK_INPUT(lse);
   CHECK_INPUT(q_nope);
   CHECK_INPUT(q_pe);
   CHECK_INPUT(kv_c_and_k_pe_cache);
@@ -232,24 +226,27 @@ SGL_KERNEL_EXPORT void flash_mla_prefill(
       ". Supported: 16, 32, 64, 128");
   TORCH_CHECK(q_nope.dim() == 3, "q_nope must be 3D (total_q, num_heads, dim), got ", q_nope.dim());
   TORCH_CHECK(q_pe.dim() == 3, "q_pe must be 3D (total_q, num_heads, dim), got ", q_pe.dim());
-  // LSE is always allocated by the caller (the softmax statistics are computed
-  // regardless); return_lse only decides whether it gets written. Unlike `out`,
-  // it needs no Q-tile padding: the epilogue's scalar LSE stores are bounded by
-  // the per-request Q length.
-  TORCH_CHECK(lse.scalar_type() == at::ScalarType::Float, "lse must be float32, got ", lse.scalar_type());
-  TORCH_CHECK(lse.dim() == 2, "lse must be 2D (total_q, num_heads), got ", lse.dim());
-  TORCH_CHECK(
-      lse.size(0) >= q_nope.size(0) && lse.size(1) == q_nope.size(1),
-      "lse must be (>= total_q, num_heads) = (>= ",
-      q_nope.size(0),
-      ", ",
-      q_nope.size(1),
-      "), got (",
-      lse.size(0),
-      ", ",
-      lse.size(1),
-      ")");
-  TORCH_CHECK(lse.stride(1) == 1, "lse must be contiguous along num_heads");
+  // The softmax statistics are computed either way; passing an LSE tensor is
+  // what asks for them to be written out. Unlike `out`, it needs no Q-tile
+  // padding: the epilogue's scalar LSE stores are bounded by the per-request Q
+  // length.
+  if (lse.has_value()) {
+    CHECK_INPUT(lse.value());
+    TORCH_CHECK(lse->scalar_type() == at::ScalarType::Float, "lse must be float32, got ", lse->scalar_type());
+    TORCH_CHECK(lse->dim() == 2, "lse must be 2D (total_q, num_heads), got ", lse->dim());
+    TORCH_CHECK(
+        lse->size(0) >= q_nope.size(0) && lse->size(1) == q_nope.size(1),
+        "lse must be (>= total_q, num_heads) = (>= ",
+        q_nope.size(0),
+        ", ",
+        q_nope.size(1),
+        "), got (",
+        lse->size(0),
+        ", ",
+        lse->size(1),
+        ")");
+    TORCH_CHECK(lse->stride(1) == 1, "lse must be contiguous along num_heads");
+  }
 
   const int64_t max_kv_len_estimate = page_table.size(1) * page_size;
 
@@ -300,7 +297,6 @@ SGL_KERNEL_EXPORT void flash_mla_prefill(
             sm_scale,
             causal,
             num_kv_splits,
-            return_lse,
             jit_arch_code(),
             &jit_err),
         jit_err);

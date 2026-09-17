@@ -43,6 +43,7 @@
 #include <torch/all.h>
 
 #include <cute/tensor.hpp>
+#include <optional>
 #include <sycl/sycl.hpp>
 
 #include "../../../Utils.h"
@@ -201,7 +202,7 @@ struct MlaXePrefill {
 template <typename T>
 inline typename T::Fmla::Arguments args_from_options_prefill(
     at::Tensor const& out,
-    at::Tensor const& lse,
+    std::optional<at::Tensor> const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
@@ -211,8 +212,7 @@ inline typename T::Fmla::Arguments args_from_options_prefill(
     at::Tensor const& page_table,
     double sm_scale,
     bool causal,
-    int64_t num_kv_splits,
-    bool return_lse) {
+    int64_t num_kv_splits) {
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = q_nope.device().index();
   hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
@@ -281,7 +281,8 @@ inline typename T::Fmla::Arguments args_from_options_prefill(
       static_cast<int>(out.stride(0)), cute::_1{}, static_cast<int>(out.stride(1)), static_cast<int>(0));
 
   // Ragged 2D LSE strides: (seq, head, batch) — batch handled by pointer offset
-  StrideLSE stride_LSE = cute::make_stride(static_cast<int>(lse.stride(0)), cute::_1{}, static_cast<int>(0));
+  StrideLSE stride_LSE =
+      cute::make_stride(static_cast<int>(lse.has_value() ? lse->stride(0) : 0), cute::_1{}, static_cast<int>(0));
 
   typename T::Fmla::KernelArguments kernel_args{};
   kernel_args.shape = problem_shape;
@@ -298,7 +299,7 @@ inline typename T::Fmla::Arguments args_from_options_prefill(
   kernel_args.dO = stride_O;
   // Softmax statistics are computed either way; a null pointer just skips the
   // LSE store in the epilogue.
-  kernel_args.LSE = return_lse ? static_cast<ElementLSE*>(lse.data_ptr()) : nullptr;
+  kernel_args.LSE = lse.has_value() ? static_cast<ElementLSE*>(lse->data_ptr()) : nullptr;
   kernel_args.dLSE_out = stride_LSE;
   kernel_args.seq_lens = static_cast<const int*>(seq_lens.data_ptr());
   kernel_args.cu_seqlens_q = static_cast<const int*>(cu_seqlens_q.data_ptr());
@@ -317,7 +318,7 @@ inline typename T::Fmla::Arguments args_from_options_prefill(
 template <typename Element, typename PageSizeOpt, typename QTileCfg>
 inline void runMlaPrefill(
     at::Tensor const& out,
-    at::Tensor const& lse,
+    std::optional<at::Tensor> const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
@@ -328,8 +329,7 @@ inline void runMlaPrefill(
     at::Tensor const& workspace,
     double sm_scale,
     bool causal,
-    int64_t num_kv_splits,
-    bool return_lse) {
+    int64_t num_kv_splits) {
   using MlaXePrefillType = MlaXePrefill<Element, PageSizeOpt, QTileCfg>;
   typename MlaXePrefillType::Fmla fmla;
   auto arguments = args_from_options_prefill<MlaXePrefillType>(
@@ -344,8 +344,7 @@ inline void runMlaPrefill(
       page_table,
       sm_scale,
       causal,
-      num_kv_splits,
-      return_lse);
+      num_kv_splits);
 
   CUTLASS_CHECK(fmla.can_implement(arguments));
   CUTLASS_CHECK(fmla.run(arguments, workspace.data_ptr()));

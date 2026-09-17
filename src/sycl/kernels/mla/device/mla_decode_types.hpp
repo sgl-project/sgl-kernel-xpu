@@ -41,6 +41,7 @@
 
 #include <cmath>
 #include <cute/tensor.hpp>
+#include <optional>
 #include <sycl/sycl.hpp>
 
 #include "../../../Utils.h"
@@ -199,7 +200,7 @@ struct MlaXe {
 template <typename T>
 inline typename T::Fmla::Arguments args_from_options(
     at::Tensor const& out,
-    at::Tensor const& lse,
+    std::optional<at::Tensor> const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
@@ -207,8 +208,7 @@ inline typename T::Fmla::Arguments args_from_options(
     at::Tensor const& page_table,
     at::Tensor const& workspace,
     double sm_scale,
-    int64_t num_kv_splits,
-    bool return_lse) {
+    int64_t num_kv_splits) {
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = q_nope.device().index();
   hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
@@ -283,8 +283,8 @@ inline typename T::Fmla::Arguments args_from_options(
       static_cast<int>(out.stride(0)));
 
   // lse: (batch, num_heads) -> kernel layout (seq_len_qo == 1, num_heads, batch)
-  StrideLSE stride_LSE =
-      cute::make_stride(static_cast<int>(batch * num_heads), cute::_1{}, static_cast<int>(lse.stride(0)));
+  StrideLSE stride_LSE = cute::make_stride(
+      static_cast<int>(batch * num_heads), cute::_1{}, static_cast<int>(lse.has_value() ? lse->stride(0) : 0));
 
   typename T::Fmla::KernelArguments kernel_args{};
   kernel_args.shape = problem_shape;
@@ -301,7 +301,7 @@ inline typename T::Fmla::Arguments args_from_options(
   kernel_args.dO = stride_O;
   // Softmax statistics are computed either way; a null pointer just skips the
   // LSE store (split-KV: the reduction kernel's store).
-  kernel_args.LSE = return_lse ? static_cast<ElementLSE*>(lse.data_ptr()) : nullptr;
+  kernel_args.LSE = lse.has_value() ? static_cast<ElementLSE*>(lse->data_ptr()) : nullptr;
   kernel_args.dLSE_out = stride_LSE;
   kernel_args.seq_lens = static_cast<const int*>(seq_lens.data_ptr());
 
@@ -346,7 +346,7 @@ inline typename T::Fmla::Arguments args_from_options(
 template <typename Element, typename PageSizeOpt, typename SplitKVOpt>
 inline void runMlaImpl(
     at::Tensor const& out,
-    at::Tensor const& lse,
+    std::optional<at::Tensor> const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
@@ -354,8 +354,7 @@ inline void runMlaImpl(
     at::Tensor const& page_table,
     at::Tensor const& workspace,
     double sm_scale,
-    int64_t num_kv_splits,
-    bool return_lse) {
+    int64_t num_kv_splits) {
   using MlaXeType = MlaXe<Element, PageSizeOpt, SplitKVOpt>;
   typename MlaXeType::Fmla fmla;
   auto arguments = args_from_options<MlaXeType>(
@@ -368,8 +367,7 @@ inline void runMlaImpl(
       page_table,
       workspace,
       sm_scale,
-      num_kv_splits,
-      return_lse);
+      num_kv_splits);
 
   CUTLASS_CHECK(fmla.can_implement(arguments));
 
@@ -379,7 +377,7 @@ inline void runMlaImpl(
 template <typename Element, typename PageSizeOpt>
 inline void runMla(
     at::Tensor const& out,
-    at::Tensor const& lse,
+    std::optional<at::Tensor> const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
@@ -387,8 +385,7 @@ inline void runMla(
     at::Tensor const& page_table,
     at::Tensor const& workspace,
     double sm_scale,
-    int64_t num_kv_splits,
-    bool return_lse) {
+    int64_t num_kv_splits) {
   TORCH_CHECK(num_kv_splits >= 1, "num_kv_splits must be resolved before calling runMla, got ", num_kv_splits);
 
   if (num_kv_splits > 1) {
@@ -420,8 +417,7 @@ inline void runMla(
         page_table,
         workspace,
         sm_scale,
-        num_kv_splits,
-        return_lse);
+        num_kv_splits);
   } else {
     runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<true>>(
         out,
@@ -433,7 +429,6 @@ inline void runMla(
         page_table,
         workspace,
         sm_scale,
-        num_kv_splits,
-        return_lse);
+        num_kv_splits);
   }
 }

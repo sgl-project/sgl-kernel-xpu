@@ -60,14 +60,14 @@ def flash_mla_decode(
     workspace: torch.Tensor,
     sm_scale: float,
     num_kv_splits: int = 1,
-    return_lse: bool = True,
+    return_lse: bool = False,
 ) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     """MLA decode.
 
     Args:
         return_lse: return the softmax log-sum-exp alongside the output. The
             softmax statistics are computed either way; this only controls
-            whether they are written out. Default True.
+            whether they are allocated and written out. Default False.
 
     Returns:
         (out, lse) when return_lse, else out.
@@ -131,8 +131,11 @@ def flash_mla_decode(
         else q_nope.new_empty((B_q, MAX_HEADS, D_latent))
     )
     # LSE follows the (possibly head-padded) q_nope layout, like `out` does.
-    lse = torch.empty(
-        (B_q, q_nope.shape[1]), dtype=torch.float32, device=q_nope.device
+    # Passing None is what tells the kernel to skip the LSE store.
+    lse = (
+        torch.empty((B_q, q_nope.shape[1]), dtype=torch.float32, device=q_nope.device)
+        if return_lse
+        else None
     )
 
     torch.ops.sgl_kernel.flash_mla_decode.default(
@@ -146,11 +149,11 @@ def flash_mla_decode(
         workspace,
         sm_scale,
         num_kv_splits,
-        return_lse,
     )
     if device_type != "xpu":
         out = out[:, :H].contiguous()
-        lse = lse[:, :H].contiguous()
+        if return_lse:
+            lse = lse[:, :H].contiguous()
     return (out, lse) if return_lse else out
 
 
@@ -192,7 +195,7 @@ def flash_mla_prefill(
     sm_scale: float,
     causal: bool = True,
     num_kv_splits: int = -1,
-    return_lse: bool = True,
+    return_lse: bool = False,
 ) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     """MLA prefill with varlen/ragged Q and causal masking.
 
@@ -215,7 +218,8 @@ def flash_mla_prefill(
                        implemented for MLA prefill; reserved for future use.
         return_lse:   return the softmax log-sum-exp alongside the output. The
                       softmax statistics are computed either way; this only
-                      controls whether they are written out. Default True.
+                      controls whether they are allocated and written out.
+                      Default False.
 
     Returns:
         (out, lse) when return_lse, else out.
@@ -256,8 +260,13 @@ def flash_mla_prefill(
     total_q_padded = (total_q + _Q_TILE_MAX - 1) // _Q_TILE_MAX * _Q_TILE_MAX
     out = q_nope.new_empty((total_q_padded, H, D_latent))
     # LSE needs no Q-tile padding: the epilogue bounds its scalar stores by the
-    # per-request Q length, so rows past total_q are never touched.
-    lse = torch.empty((total_q, H), dtype=torch.float32, device=q_nope.device)
+    # per-request Q length, so rows past total_q are never touched. Passing None
+    # is what tells the kernel to skip the LSE store.
+    lse = (
+        torch.empty((total_q, H), dtype=torch.float32, device=q_nope.device)
+        if return_lse
+        else None
+    )
 
     torch.ops.sgl_kernel.flash_mla_prefill.default(
         out,
@@ -273,7 +282,6 @@ def flash_mla_prefill(
         sm_scale,
         causal,
         num_kv_splits,
-        return_lse,
     )
     return (out[:total_q], lse) if return_lse else out[:total_q]
 

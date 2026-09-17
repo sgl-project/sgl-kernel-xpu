@@ -67,12 +67,13 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
     TORCH_CHECK(
         params.rel_bias_ptr == nullptr, "return_softmax_lse is not supported with relative attention");
     using Element = @ELEM_TYPE@;
-    AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
     if (params.is_causal) {
+      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
       FMHAConfig<
           /*Causal=*/true,
           /*LocalMask=*/false,
           false,
+          Softcap,
           /*LSE=*/true,
           TileShapeQK,
           TileShapePV,
@@ -80,19 +81,21 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
           SubgroupLayoutQK,
           void,
           /*HasRelBias=*/false,
-          Softcap,
           2,
           false,
           Element,
           Element,
           Element,
           Element>::run_paged(params);
+      });
     } else {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+        AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
         FMHAConfig<
             /*Causal=*/false,
             LocalMask,
             false,
+            Softcap,
             /*LSE=*/true,
             TileShapeQK,
             TileShapePV,
@@ -100,16 +103,15 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
             SubgroupLayoutQK,
             void,
             /*HasRelBias=*/false,
-            Softcap,
             2,
             false,
             Element,
             Element,
             Element,
             Element>::run_paged(params);
+        });
       });
     }
-    });
     return;
   }
 
@@ -117,13 +119,14 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
   AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
-        AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
 
           using Element = @ELEM_TYPE@;
+          AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
           FMHAConfig<
               Causal,
               LocalMask,
               Sink,
+              Softcap,
               /*LSE=*/false,
               TileShapeQK,
               TileShapePV,
@@ -131,14 +134,13 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
               SubgroupLayoutQK,
               void,
               false,
-              Softcap,
               2,
               false,
               Element,
               Element,
               Element,
                 Element>::run_paged(params);
-        });
+          });
       });
     });
   });
@@ -162,12 +164,13 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
         cute::Layout<cute::Shape<cute::Int<16>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
-        AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
         using Element = @ELEM_TYPE@;
+        AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
         FMHAConfig<
             Causal,
             LocalMask,
             false,
+            Softcap,
             /*LSE=*/false,
             RelTileShapeQK,
             RelTileShapePV,
@@ -175,7 +178,6 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
             RelSubgroupLayoutQK,
             void,
             true,
-            Softcap,
             2,
             false,
             Element,
@@ -192,13 +194,14 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
 #endif
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
-      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
 
           using Element = @ELEM_TYPE@;
+        AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
         FMHAConfig<
             Causal,
             LocalMask,
             false,
+            Softcap,
             /*LSE=*/false,
             TileShapeQK,
             TileShapePV,
@@ -206,14 +209,13 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
             SubgroupLayoutQK,
             void,
             false,
-            Softcap,
             2,
             false,
             Element,
             Element,
             Element,
               Element>::run_paged(params);
-      });
+        });
     });
   });
 #endif

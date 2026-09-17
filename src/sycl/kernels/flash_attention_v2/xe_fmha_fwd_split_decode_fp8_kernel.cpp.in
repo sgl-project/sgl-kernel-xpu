@@ -44,22 +44,12 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeFp8Runner<@QG_SZ@, @H
     AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
     if (params.is_e4m3) {
       SplitDecodeConfig<
-          false, LocalMask, false, /*LSE=*/false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, 1,
-          QElement, cutlass::float_e4m3_t, cutlass::float_e4m3_t, QElement,
-          void,
-          cute::Stride<int, cute::_1, int, int>, cute::Stride<int, cute::_1, int, int>,
-          cute::Stride<cute::_1, int, int, int>, cute::Stride<int, cute::_1, int, int>,
-          cute::Stride<int, cute::_1, int, int>,
-          void, void, void, void, /*HasRelBias=*/false, Softcap>::run(params);
+          false, LocalMask, false, Softcap, /*LSE=*/false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, 1,
+          QElement, cutlass::float_e4m3_t, cutlass::float_e4m3_t, QElement>::run(params);
     } else {
       SplitDecodeConfig<
-          false, LocalMask, false, /*LSE=*/false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, 1,
-          QElement, cutlass::float_e5m2_t, cutlass::float_e5m2_t, QElement,
-          void,
-          cute::Stride<int, cute::_1, int, int>, cute::Stride<int, cute::_1, int, int>,
-          cute::Stride<cute::_1, int, int, int>, cute::Stride<int, cute::_1, int, int>,
-          cute::Stride<int, cute::_1, int, int>,
-          void, void, void, void, /*HasRelBias=*/false, Softcap>::run(params);
+          false, LocalMask, false, Softcap, /*LSE=*/false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, 1,
+          QElement, cutlass::float_e5m2_t, cutlass::float_e5m2_t, QElement>::run(params);
     }
     });
   });

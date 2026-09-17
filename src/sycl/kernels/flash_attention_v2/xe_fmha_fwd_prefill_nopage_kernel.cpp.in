@@ -68,12 +68,13 @@ __attribute__((visibility("default"))) void FmhaPrefillNpRunner<@HEAD_DIM@, @ELE
   // (Causal && LocalMask) corner is skipped rather than compiled dead.
   if (params.return_softmax_lse) {
     using Element = @ELEM_TYPE@;
-    AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
     if (params.is_causal) {
+      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
       FMHAConfig<
           /*Causal=*/true,
           /*LocalMask=*/false,
           false,
+          Softcap,
           /*LSE=*/true,
           TileShapeQK,
           TileShapePV,
@@ -81,19 +82,21 @@ __attribute__((visibility("default"))) void FmhaPrefillNpRunner<@HEAD_DIM@, @ELE
           SubgroupLayoutQK,
           void,
           /*HasRelBias=*/false,
-          Softcap,
           2,
           false,
           Element,
           Element,
           Element,
           Element>::run_nopaged(params);
+      });
     } else {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+        AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
         FMHAConfig<
             /*Causal=*/false,
             LocalMask,
             false,
+            Softcap,
             /*LSE=*/true,
             TileShapeQK,
             TileShapePV,
@@ -101,28 +104,28 @@ __attribute__((visibility("default"))) void FmhaPrefillNpRunner<@HEAD_DIM@, @ELE
             SubgroupLayoutQK,
             void,
             /*HasRelBias=*/false,
-            Softcap,
             2,
             false,
             Element,
             Element,
             Element,
             Element>::run_nopaged(params);
+        });
       });
     }
-    });
     return;
   }
 
   // No sink support for no_page path; always use Sink=false
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
-      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
       using Element = @ELEM_TYPE@;
+      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
       FMHAConfig<
           Causal,
           LocalMask,
           false,
+          Softcap,
           /*LSE=*/false,
           TileShapeQK,
           TileShapePV,
@@ -130,7 +133,6 @@ __attribute__((visibility("default"))) void FmhaPrefillNpRunner<@HEAD_DIM@, @ELE
           SubgroupLayoutQK,
           void,
           false,
-          Softcap,
           2,
           false,
           Element,

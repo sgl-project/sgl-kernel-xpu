@@ -696,6 +696,7 @@ template <
     bool Causal,
     bool LocalMask,
     bool Sink,
+    bool Softcap,
     bool LSE,
     typename TileShapeQK,
     typename TileShapePV,
@@ -718,8 +719,7 @@ template <
     typename GmemTiledCopyK = void,
     typename GmemTiledCopyV = void,
     typename GmemTiledCopyO = void,
-    bool HasRelBias = false,
-    bool Softcap = false>
+    bool HasRelBias = false>
 struct DecodeConfig {
   static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
   using MMAOperation = cute::conditional_t<
@@ -851,6 +851,7 @@ template <
     bool Causal,
     bool LocalMask,
     bool Sink,
+    bool Softcap,
     bool LSE,
     typename TileShapeQK,
     typename TileShapePV,
@@ -872,8 +873,7 @@ template <
     typename GmemTiledCopyK = void,
     typename GmemTiledCopyV = void,
     typename GmemTiledCopyO = void,
-    bool HasRelBias = false,
-    bool Softcap = false>
+    bool HasRelBias = false>
 struct SplitDecodeConfig {
   static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
   using MMAOperation =

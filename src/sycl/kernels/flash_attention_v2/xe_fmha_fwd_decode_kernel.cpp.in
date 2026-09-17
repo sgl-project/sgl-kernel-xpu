@@ -61,12 +61,13 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
   if (params.return_softmax_lse) {
     TORCH_CHECK(!params.use_sink, "return_softmax_lse is not supported with sink masking");
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
       using Element = @ELEM_TYPE@;
+      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
       DecodeConfig<
           false,
           LocalMask,
           false,
+          Softcap,
           /*LSE=*/true,
           TileShapeQK,
           TileShapePV,
@@ -79,18 +80,7 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
           Element,
           Element,
           Element,
-          /*PackGQAEnabled=*/false,
-          void,
-          cute::Stride<int, cute::_1, int, int>,
-          cute::Stride<int, cute::_1, int, int>,
-          cute::Stride<cute::_1, int, int, int>,
-          cute::Stride<int, cute::_1, int, int>,
-          void,
-          void,
-          void,
-          void,
-          /*HasRelBias=*/false,
-          Softcap>::run_paged(params);
+          /*PackGQAEnabled=*/false>::run_paged(params);
       });
     });
     return;
@@ -107,12 +97,13 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
         flash_attention_v2::relative_attention::decode_padded_cols(params.rel_bias_extent, @PAGE_SIZE@),
         " columns");
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
       using Element = @ELEM_TYPE@;
+      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
       DecodeConfig<
           false,
           LocalMask,
           false,
+          Softcap,
           /*LSE=*/false,
           TileShapeQK,
           TileShapePV,
@@ -135,8 +126,7 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
           void,
           void,
           void,
-          true,
-          Softcap>::run_paged(params);
+          true>::run_paged(params);
       });
     });
     return;
@@ -148,12 +138,13 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
 #if @HEAD_DIM@ == 64
     AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-        AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
           using Element = @ELEM_TYPE@;
+          AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
           DecodeConfig<
               false,
               LocalMask,
               Sink,
+              Softcap,
               /*LSE=*/false,
               TileShapeQK,
               TileShapePV,
@@ -165,20 +156,8 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
               Element,
               Element,
               Element,
-              Element,
-              /*PackGQAEnabled=*/true,
-              void,
-              cute::Stride<int, cute::_1, int, int>,
-              cute::Stride<int, cute::_1, int, int>,
-              cute::Stride<cute::_1, int, int, int>,
-              cute::Stride<int, cute::_1, int, int>,
-              void,
-              void,
-              void,
-              void,
-              /*HasRelBias=*/false,
-              Softcap>::run_paged(params);
-        });
+              Element>::run_paged(params);
+          });
       });
     });
 #else
@@ -186,12 +165,13 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
         !params.use_sink,
         "sink is only supported for head_size == 64, got @HEAD_DIM@");
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
         using Element = @ELEM_TYPE@;
+        AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
         DecodeConfig<
             false,
             LocalMask,
             false,
+            Softcap,
             /*LSE=*/false,
             TileShapeQK,
             TileShapePV,
@@ -203,20 +183,8 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
             Element,
             Element,
             Element,
-              Element,
-            /*PackGQAEnabled=*/true,
-            void,
-            cute::Stride<int, cute::_1, int, int>,
-            cute::Stride<int, cute::_1, int, int>,
-            cute::Stride<cute::_1, int, int, int>,
-            cute::Stride<int, cute::_1, int, int>,
-            void,
-            void,
-            void,
-            void,
-            /*HasRelBias=*/false,
-            Softcap>::run_paged(params);
-      });
+              Element>::run_paged(params);
+        });
     });
 #endif
 }

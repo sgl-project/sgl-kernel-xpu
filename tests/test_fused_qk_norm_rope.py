@@ -556,6 +556,7 @@ def test_fused_qk_norm_rope_fp8_e4m3(
     "use_4d,batch_size,seq_len,num_qo_heads,num_kv_heads,head_dim,rope_dim,is_neox,dtype,position_dtype",
     [
         (False, 3, None, 4, 2, 64, 32, False, torch.bfloat16, torch.int32),
+        (False, 4, None, 6, 2, 96, 96, True, torch.bfloat16, torch.int32),
         (False, 5, None, 8, 4, 128, 64, True, torch.float16, torch.int64),
         (True, 2, 4, 16, 4, 128, 128, False, torch.bfloat16, torch.int32),
         (True, 1, 8, 32, 8, 256, 128, True, torch.float16, torch.int64),
@@ -631,6 +632,7 @@ def test_fused_qk_norm_rope_with_cache(
     "use_4d,batch_size,seq_len,num_qo_heads,num_kv_heads,head_dim,rope_dim,is_neox,dtype,position_dtype,last_dim_padding",
     [
         (False, 3, None, 4, 2, 64, 32, False, torch.bfloat16, torch.int32, 16),
+        (False, 4, None, 6, 2, 96, 96, True, torch.bfloat16, torch.int32, 16),
         (True, 2, 4, 16, 4, 128, 128, True, torch.float16, torch.int64, 32),
     ],
 )

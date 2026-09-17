@@ -24,6 +24,7 @@
 #include <cute/tensor.hpp>
 #include <cute/arch/mma_xe.hpp>
 
+#include "cutlass/bfloat16.h"
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/epilogue/collective/xe_epilogue.hpp"
@@ -42,6 +43,16 @@ namespace at::native::xpu {
 
 using GroupedProblemShape = cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>;
 using UnderlyingProblemShapeType = typename GroupedProblemShape::UnderlyingProblemShape;
+
+// The epilogue writes ElementOutput, so the caller's tensor has to match it
+// exactly; a mismatch would reinterpret the store, not convert it.
+template <typename T> struct TorchScalarTypeOf;
+template <> struct TorchScalarTypeOf<float> {
+  static constexpr torch::ScalarType value = torch::kFloat32;
+};
+template <> struct TorchScalarTypeOf<cutlass::bfloat16_t> {
+  static constexpr torch::ScalarType value = torch::kBFloat16;
+};
 
 template <typename Types>
 class BlockScaledGroupedGemmRunner {
@@ -89,8 +100,9 @@ class BlockScaledGroupedGemmRunner {
     TORCH_CHECK(problem_sizes.scalar_type() == torch::kInt32 &&
                 expert_offsets.scalar_type() == torch::kInt32,
                 "Indices must be int32");
-    TORCH_CHECK(output.scalar_type() == torch::kFloat32,
-                "Output must be float32");
+    TORCH_CHECK(output.scalar_type() == TorchScalarTypeOf<ElementOutput>::value,
+                "Output dtype must match the instantiated ElementOutput, expected ",
+                TorchScalarTypeOf<ElementOutput>::value, " got ", output.scalar_type());
 
     int num_groups = static_cast<int>(expert_offsets.size(0));
     TORCH_CHECK(num_groups > 0,
@@ -265,13 +277,9 @@ class BlockScaledGroupedGemmRunner {
   }
 
  private:
-  // We pass out_ptrs as the source pointer array on both paths. For MXFP8 with
-  // ElementC=void the source load is elided (is_source_supported=false), but
-  // the generic-group epilogue's to_base_arguments still dereferences
-  // args.ptr_C[idx] to build per-group sub-arguments, so the array itself must
-  // be a valid device pointer — nullptr hangs on some XPU targets. For MXFP4
-  // (ElementC=float) the read is mathematically inert because alpha=1, beta=0
-  // applied to the zero-initialized output has no effect.
+  // out_ptrs serves as both the C and the D pointer array. No format reads C
+  // (ElementC=void everywhere), but to_base_arguments still dereferences
+  // args.ptr_C[idx], and nullptr hangs on some XPU targets.
   using EpilogueArguments = typename GemmKernel::EpilogueArguments;
   using PtrCType = decltype(std::declval<EpilogueArguments>().ptr_C);
 

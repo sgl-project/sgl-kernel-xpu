@@ -27,7 +27,7 @@ using namespace cutlass::gemm;
 namespace at::native::xpu {
 
 // MXFP4: E2M1 + UE8M0 scales, block=32, A=RowMajor, B=ColumnMajor, symmetric MN-major scale strides.
-template <class TileShape_>
+template <class TileShape_, class ElementOutput_>
 struct MXFP4TypesT {
 
   using ElementType     = cutlass::mx_float4_t<float_e2m1_t>;
@@ -38,7 +38,7 @@ struct MXFP4TypesT {
 
   using ElementAccumulator       = float;
   using ElementComputeEpilogue   = float;
-  using ElementOutput            = float;
+  using ElementOutput            = ElementOutput_;
 
 
   using LayoutA = cutlass::layout::RowMajor;
@@ -73,7 +73,10 @@ struct MXFP4TypesT {
   // Mainloop dispatch (integer GroupSize → MXFP specialization)
   static constexpr int PipelineStages = 2;
   using GEMMDispatchPolicy    = cutlass::gemm::MainloopIntelXeXMX16BlockScaledGroup<PipelineStages>;
-  using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeXMX16Group;
+  // Same generic group epilogue as MXFP8. The legacy XMX16 one builds its C
+  // tensor from a raw ElementC, so it cannot take a void C, and it pins the
+  // fusion op's output type to the accumulator, so it cannot store bf16.
+  using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeGenericGroup;
 
 
   using EpilogueOp = cutlass::epilogue::fusion::LinearCombination<
@@ -82,21 +85,18 @@ struct MXFP4TypesT {
   using FusionCallBacks = cutlass::epilogue::fusion::FusionCallbacks<
       EpilogueDispatchPolicy, EpilogueOp, TileShape, decltype(tile_shape(TiledMma()))>;
 
-  // Collective epilogue (legacy path, explicit copy atoms)
+  // ElementC=void disables the C load, so the caller no longer has to zero the
+  // output buffer. Void copy atoms let CUTLASS size the D store from ElementOutput.
   using CollectiveEpilogue = cutlass::epilogue::collective::CollectiveEpilogue<
       EpilogueDispatchPolicy,
       TileShape,
-      ElementAccumulator,
+      void,   // EpilogueTile = void (auto)
+      void,   // ElementC = void (disables C load)
       cutlass::gemm::TagToStrideC_t<LayoutC*>,
       ElementOutput,
       cutlass::gemm::TagToStrideC_t<LayoutD*>,
       FusionCallBacks,
-      XE_2D_U32x8x16_LD_N,
-      void,
-      void,
-      XE_2D_U32x8x16_ST_N,
-      void,
-      void>;
+      void, void>;
 
 
   using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
@@ -127,10 +127,14 @@ struct MXFP4TypesT {
 
 // N_TILE=512 works here because 4-bit A/B packing halves per-stage L1 pressure
 // vs MXFP8. K_TILE=64 fixed (SG_K>=32, mainloop needs 2 K-slices).
+//
+// Templated on the output element so the dtype fan-out is one branch at the entry
+// point and the bucket shapes stay written once.
+template <typename ElementOutput_>
 struct MXFP4TilePolicy {
-  using Decode  = MXFP4TypesT<Shape<_128, _512, _64>>;
-  using Step    = MXFP4TypesT<Shape<_256, _512, _64>>;
-  using Prefill = MXFP4TypesT<Shape<_512, _512, _64>>;
+  using Decode  = MXFP4TypesT<Shape<_128, _512, _64>, ElementOutput_>;
+  using Step    = MXFP4TypesT<Shape<_256, _512, _64>, ElementOutput_>;
+  using Prefill = MXFP4TypesT<Shape<_512, _512, _64>, ElementOutput_>;
 
   // Bucket-independent, so any member answers for it.
   static constexpr int BlockSize = Step::BlockSize;
@@ -158,6 +162,11 @@ SGL_KERNEL_EXPORT void mxfp4_blockwise_scaled_grouped_mm(
   TORCH_CHECK(scales_a.device().is_xpu(), "Scales tensor A must be on XPU device");
   TORCH_CHECK(scales_b.device().is_xpu(), "Scales tensor B must be on XPU device");
   TORCH_CHECK(output.device().is_xpu(), "Output tensor must be on XPU device");
+  // bf16 halves the D store and lets the caller skip a separate fp32->bf16 pass;
+  // fp32 stays for callers that want the accumulator verbatim.
+  TORCH_CHECK(output.scalar_type() == torch::kFloat32 ||
+                  output.scalar_type() == torch::kBFloat16,
+              "Output must be float32 or bfloat16, got ", output.scalar_type());
   TORCH_CHECK(workspace.device().is_xpu(), "Workspace tensor must be on XPU device");
 
   TORCH_CHECK(
@@ -205,7 +214,8 @@ SGL_KERNEL_EXPORT void mxfp4_blockwise_scaled_grouped_mm(
                     a_scales_ptrs.numel() == 0 && b_scales_ptrs.numel() == 0,
                 "On-device prep requires all ptr-array tensors to be empty");
 
-    constexpr int BS = at::native::xpu::MXFP4TilePolicy::BlockSize;
+    // BlockSize is output-independent; float just picks an arbitrary instantiation.
+    constexpr int BS = at::native::xpu::MXFP4TilePolicy<float>::BlockSize;
     TORCH_CHECK(expert_offsets.size(0) == E,
                 "expert_offsets and problem_sizes disagree on num_experts");
     const int packed_K = static_cast<int>(a.size(1));   // K/2
@@ -273,12 +283,20 @@ SGL_KERNEL_EXPORT void mxfp4_blockwise_scaled_grouped_mm(
 
   TORCH_CHECK(max_m > 0, "problem_sizes[:, 0] must contain at least one positive M");
 
-  at::native::xpu::moe_run_bucketed<at::native::xpu::MXFP4TilePolicy>(
-      at::native::xpu::moe_tile_bucket(max_m),
-      output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
-      a, b,
-      need_prep ? scales_a_t_keep_alive : scales_a,
-      need_prep ? scales_b_t_keep_alive : scales_b,
-      problem_sizes, expert_offsets, workspace,
-      sa_m_stride_override, &problem_sizes_host);
+  const torch::Tensor& scales_a_eff = need_prep ? scales_a_t_keep_alive : scales_a;
+  const torch::Tensor& scales_b_eff = need_prep ? scales_b_t_keep_alive : scales_b;
+  const auto bucket = at::native::xpu::moe_tile_bucket(max_m);
+
+#define SGL_RUN_MXFP4(ELEMENT_OUTPUT)                                          \
+  at::native::xpu::moe_run_bucketed<at::native::xpu::MXFP4TilePolicy<ELEMENT_OUTPUT>>( \
+      bucket, output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,  \
+      a, b, scales_a_eff, scales_b_eff, problem_sizes, expert_offsets,         \
+      workspace, sa_m_stride_override, &problem_sizes_host)
+
+  if (output.scalar_type() == torch::kFloat32) {
+    SGL_RUN_MXFP4(float);
+  } else {
+    SGL_RUN_MXFP4(cutlass::bfloat16_t);
+  }
+#undef SGL_RUN_MXFP4
 }

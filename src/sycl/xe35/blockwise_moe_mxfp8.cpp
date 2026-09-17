@@ -23,14 +23,16 @@ namespace at::native::xpu {
 
 // Shared type traits for the two blockwise MoE grouped-GEMM configs below.
 // Fixed: E4M3 A/B, row-major A/C/D, column-major B, XE_BDPAS_TT, ElementC=void.
-// Variants provide (ElementScale, StrideScaleB, GroupSize, TileShape, BlockSize);
-// GroupSize as cute::tuple → SW-scaled mainloop, cute::Int → HW-scaled mainloop.
+// Variants provide (ElementScale, StrideScaleB, GroupSize, TileShape, BlockSize,
+// ElementOutput); GroupSize as cute::tuple → SW-scaled mainloop, cute::Int →
+// HW-scaled mainloop.
 template <
     typename ElementScale_,
     typename StrideScaleB_,
     typename GroupSize_,
     typename TileShape_,
-    int BlockSize_>
+    int BlockSize_,
+    typename ElementOutput_>
 struct BlockScaledMoETypes {
   using ElementInputA = cutlass::float_e4m3_t;
   using ElementInputB = cutlass::float_e4m3_t;
@@ -38,7 +40,7 @@ struct BlockScaledMoETypes {
 
   using ElementAccumulator     = float;
   using ElementComputeEpilogue = float;
-  using ElementOutput          = float;
+  using ElementOutput          = ElementOutput_;
 
   using LayoutA = cutlass::layout::RowMajor;
   // B is (N, K) K-contiguous (PyTorch); ColumnMajor gives the same physical
@@ -126,18 +128,22 @@ struct BlockScaledMoETypes {
 // FP8: fp32 scales, row-major B-scales, tuple GroupSize → SW-scaled mainloop.
 // K_TILE stays at 32 (GroupSize.K=128 → 4 K-tiles per scale group amortizes the
 // fp32 scale multiply); K_TILE=64 not perf-swept for FP8 yet.
-template <class TileShape_>
+template <class TileShape_, typename ElementOutput_>
 using FP8TypesT = BlockScaledMoETypes<
     /* ElementScale = */ float,
     /* StrideScaleB = */ cute::Stride<int64_t, cute::_1, int64_t>,
     /* GroupSize    = */ cute::tuple<cute::_1, cute::Int<128>, cute::Int<128>>,
     /* TileShape    = */ TileShape_,
-    /* BlockSize    = */ 128>;
+    /* BlockSize    = */ 128,
+    ElementOutput_>;
 
+// Templated on the output element so the dtype fan-out is one branch at the entry
+// point and the bucket shapes stay written once.
+template <typename ElementOutput_>
 struct FP8TilePolicy {
-  using Decode  = FP8TypesT<Shape<_128, _256, _32>>;
-  using Step    = FP8TypesT<Shape<_256, _256, _32>>;
-  using Prefill = FP8TypesT<Shape<_512, _512, _32>>;
+  using Decode  = FP8TypesT<Shape<_128, _256, _32>, ElementOutput_>;
+  using Step    = FP8TypesT<Shape<_256, _256, _32>, ElementOutput_>;
+  using Prefill = FP8TypesT<Shape<_512, _512, _32>, ElementOutput_>;
 
   // Bucket-independent, so any member answers for it.
   static constexpr int BlockSize = Step::BlockSize;
@@ -147,18 +153,20 @@ struct FP8TilePolicy {
 // K_TILE=64 is fixed: SG_K>=32 and 2 K-slices per iteration are required by the
 // mainloop. K_TILE=128 aborted mid-kernel on the CRI simulator (suspected untested
 // SG_K=128 corner in CUTLASS-Xe), so it stays at 64.
-template <class TileShape_>
+template <class TileShape_, typename ElementOutput_>
 using MXFP8TypesT = BlockScaledMoETypes<
     typename cutlass::mx_float8_t<cutlass::float_e4m3_t>::ScaleFactorType,
     cute::Stride<cute::_1, int64_t, int64_t>,
     cute::Int<32>,
     TileShape_,
-    32>;
+    32,
+    ElementOutput_>;
 
+template <typename ElementOutput_>
 struct MXFP8TilePolicy {
-  using Decode  = MXFP8TypesT<Shape<_128, _256, _64>>;
-  using Step    = MXFP8TypesT<Shape<_256, _256, _64>>;
-  using Prefill = MXFP8TypesT<Shape<_512, _512, _64>>;
+  using Decode  = MXFP8TypesT<Shape<_128, _256, _64>, ElementOutput_>;
+  using Step    = MXFP8TypesT<Shape<_256, _256, _64>, ElementOutput_>;
+  using Prefill = MXFP8TypesT<Shape<_512, _512, _64>, ElementOutput_>;
 
   static constexpr int BlockSize = Step::BlockSize;
 };
@@ -199,6 +207,12 @@ SGL_KERNEL_EXPORT void fp8_blockwise_scaled_grouped_mm(
   TORCH_CHECK(scales_b.device().is_xpu(), "Scales tensor B must be on XPU device");
   TORCH_CHECK(output.device().is_xpu(), "Output tensor must be on XPU device");
   TORCH_CHECK(workspace.device().is_xpu(), "Workspace tensor must be on XPU device");
+
+  // bf16 halves the D store and lets the caller skip a separate fp32->bf16 pass;
+  // fp32 stays for callers that want the accumulator verbatim.
+  TORCH_CHECK(output.scalar_type() == torch::kFloat32 ||
+                  output.scalar_type() == torch::kBFloat16,
+              "Output must be float32 or bfloat16, got ", output.scalar_type());
 
   // Both FP8 and MXFP8 require float8_e4m3fn inputs — check once here.
   TORCH_CHECK(
@@ -268,8 +282,9 @@ SGL_KERNEL_EXPORT void fp8_blockwise_scaled_grouped_mm(
                     a_scales_ptrs.numel() == 0 && b_scales_ptrs.numel() == 0,
                 "On-device prep requires all ptr-array tensors to be empty");
 
-    const int BS = is_mxfp8 ? at::native::xpu::MXFP8TilePolicy::BlockSize
-                            : at::native::xpu::FP8TilePolicy::BlockSize;
+    // BlockSize is output-independent; float just picks an arbitrary instantiation.
+    const int BS = is_mxfp8 ? at::native::xpu::MXFP8TilePolicy<float>::BlockSize
+                            : at::native::xpu::FP8TilePolicy<float>::BlockSize;
     const int E = static_cast<int>(expert_offsets.size(0));
     TORCH_CHECK(E == E_, "expert_offsets and problem_sizes disagree on num_experts");
     const int K = static_cast<int>(a.size(1));
@@ -291,12 +306,11 @@ SGL_KERNEL_EXPORT void fp8_blockwise_scaled_grouped_mm(
 
     auto& q = at::xpu::getCurrentXPUStream(a.device().index()).queue();
 
-    // Element sizes are compile-time known: A/B are always fp8_e4m3 (1 B),
-    // output is always fp32 (4 B; enforced in BlockScaledGroupedGemmRunner),
-    // A/B scales are uint8 for MXFP8 or fp32 for FP8.
+    // A/B are always fp8_e4m3 (1 B); scales are uint8 for MXFP8 or fp32 for FP8.
+    // Output is fp32 or bf16, so its stride has to come from the tensor.
     constexpr int64_t a_elem  = sizeof(cutlass::float_e4m3_t);   // 1
     constexpr int64_t b_elem  = sizeof(cutlass::float_e4m3_t);   // 1
-    constexpr int64_t o_elem  = sizeof(float);                   // 4
+    const int64_t o_elem  = output.element_size();
     const int64_t sa_elem = is_mxfp8 ? sizeof(uint8_t) : sizeof(float);
     const int64_t sb_elem = sa_elem;
 
@@ -374,24 +388,29 @@ SGL_KERNEL_EXPORT void fp8_blockwise_scaled_grouped_mm(
       need_prep ? static_cast<int>(scales_a_t_keep_alive.stride(1)) : 0;
 
   const auto bucket = at::native::xpu::moe_tile_bucket(max_m);
+  const torch::Tensor& scales_a_eff = need_prep ? scales_a_t_keep_alive : scales_a;
+  // FP8 keeps B-scales row-major, so only MXFP8 takes the transposed copy.
+  const torch::Tensor& scales_b_eff =
+      (is_mxfp8 && need_prep) ? scales_b_t_keep_alive : scales_b;
 
-  // FP8 keeps B-scales row-major, so only MXFP8 passes the transposed copy.
-  if (is_mxfp8) {
-    at::native::xpu::moe_run_bucketed<at::native::xpu::MXFP8TilePolicy>(
-        bucket,
-        output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
-        a, b,
-        need_prep ? scales_a_t_keep_alive : scales_a,
-        need_prep ? scales_b_t_keep_alive : scales_b,
-        problem_sizes, expert_offsets, workspace,
-        sa_m_stride_override, &problem_sizes_host);
+#define SGL_RUN_MOE(POLICY, ELEMENT_OUTPUT)                                    \
+  at::native::xpu::moe_run_bucketed<at::native::xpu::POLICY<ELEMENT_OUTPUT>>(   \
+      bucket, output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,   \
+      a, b, scales_a_eff, scales_b_eff, problem_sizes, expert_offsets,          \
+      workspace, sa_m_stride_override, &problem_sizes_host)
+
+  if (output.scalar_type() == torch::kFloat32) {
+    if (is_mxfp8) {
+      SGL_RUN_MOE(MXFP8TilePolicy, float);
+    } else {
+      SGL_RUN_MOE(FP8TilePolicy, float);
+    }
   } else {
-    at::native::xpu::moe_run_bucketed<at::native::xpu::FP8TilePolicy>(
-        bucket,
-        output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
-        a, b,
-        need_prep ? scales_a_t_keep_alive : scales_a,
-        scales_b, problem_sizes, expert_offsets, workspace,
-        sa_m_stride_override, &problem_sizes_host);
+    if (is_mxfp8) {
+      SGL_RUN_MOE(MXFP8TilePolicy, cutlass::bfloat16_t);
+    } else {
+      SGL_RUN_MOE(FP8TilePolicy, cutlass::bfloat16_t);
+    }
   }
+#undef SGL_RUN_MOE
 }

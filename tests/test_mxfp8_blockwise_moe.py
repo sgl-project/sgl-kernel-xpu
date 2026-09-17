@@ -212,6 +212,7 @@ def prepare_kernel_inputs(
     scales_a_list: list,
     scales_b_list: list,
     device: str,
+    out_dtype: torch.dtype = torch.float32,
 ):
     """Build flat-2D inputs for fp8_blockwise_scaled_grouped_mm with on-device
     prep. A and A-scales are concatenated into (sum_m_i, ...) tensors;
@@ -239,7 +240,7 @@ def prepare_kernel_inputs(
     b_stack = torch.stack([ensure_contiguous(b) for b in b_list]).contiguous()
     sb_stack = torch.stack([ensure_contiguous(s) for s in scales_b_list]).contiguous()
 
-    output = torch.zeros((total_m, n), dtype=torch.float32, device=device)
+    output = torch.zeros((total_m, n), dtype=out_dtype, device=device)
 
     # Cumulative per-expert start offsets (in rows). For uniform m, this is
     # [0, m, 2m, 3m, ...].
@@ -415,6 +416,37 @@ class TestFP8BlockwiseScaledGroupedMM:
             dequantize_matrix_blockwise_2d(b_q, sb).t(),
         )
         torch.testing.assert_close(kernel_out, ref_out, atol=1.0, rtol=0.15)
+
+    @torch.inference_mode()
+    def test_bf16_output(self):
+        """A bf16 output tensor selects the bf16 epilogue instantiation. Only the
+        store conversion differs from fp32, so the two must agree to bf16 precision."""
+        device = "xpu"
+        m, n, k = 256, 256, 256
+        num_experts = 2
+
+        a_list, b_list, sa_list, sb_list = [], [], [], []
+        for i in range(num_experts):
+            a_q, sa, _ = create_random_fp8_data(m, k, "cpu", seed=42 + i)
+            b_q, sb = _create_b_quantized(n, k, seed=100 + i)
+            a_list.append(ensure_contiguous(a_q).to(device))
+            b_list.append(ensure_contiguous(b_q).to(device))
+            sa_list.append(ensure_contiguous(sa).to(device))
+            sb_list.append(ensure_contiguous(sb).to(device))
+
+        outs = {}
+        for dtype in (torch.float32, torch.bfloat16):
+            inputs = prepare_kernel_inputs(
+                a_list, b_list, sa_list, sb_list, device, out_dtype=dtype
+            )
+            _call_kernel(inputs)
+            assert inputs["output"].dtype == dtype
+            outs[dtype] = inputs["output"].cpu()
+
+        assert not torch.isnan(outs[torch.bfloat16]).any()
+        torch.testing.assert_close(
+            outs[torch.bfloat16].float(), outs[torch.float32], rtol=2**-8, atol=1e-2
+        )
 
     @torch.inference_mode()
     def test_identity_like_pattern(self):
@@ -793,7 +825,12 @@ def _reference_grouped_gemm_mxfp8(
 
 
 def _prepare_kernel_inputs_mxfp8(
-    a_list: list, b_list: list, sa_list: list, sb_list: list, device: str
+    a_list: list,
+    b_list: list,
+    sa_list: list,
+    sb_list: list,
+    device: str,
+    out_dtype: torch.dtype = torch.float32,
 ) -> dict:
     """Flat-2D inputs for the MXFP8 path: uint8 A-scales + uint8 B-scales
     (un-transposed row-major); B-scales are transposed on device."""
@@ -814,7 +851,7 @@ def _prepare_kernel_inputs_mxfp8(
     assert sb_stack.dtype == torch.uint8
     assert sb_stack.shape == (num_experts, n, scale_cols)
 
-    output = torch.zeros((total_m, n), dtype=torch.float32, device=device)
+    output = torch.zeros((total_m, n), dtype=out_dtype, device=device)
     expert_offsets = torch.arange(0, total_m, m, dtype=torch.int32, device=device)
 
     empty_ptrs = torch.empty((0,), dtype=torch.int64, device=device)
@@ -947,6 +984,37 @@ class TestMXFP8BlockwiseScaledGroupedMM:
         ref = torch.matmul(_dequantize_mxfp8(a_q, sa), _dequantize_mxfp8(b_q, sb).t())
         assert not torch.isnan(kernel_out).any()
         torch.testing.assert_close(kernel_out, ref, atol=2.0, rtol=0.2)
+
+    @torch.inference_mode()
+    def test_bf16_output(self):
+        """A bf16 output tensor selects the bf16 epilogue instantiation. Only the
+        store conversion differs from fp32, so the two must agree to bf16 precision."""
+        device = "xpu"
+        m, n, k = 256, 256, 256
+        num_experts = 2
+
+        a_list, b_list, sa_list, sb_list = [], [], [], []
+        for i in range(num_experts):
+            a_q, sa = _quantize_a_mxfp8(torch.randn(m, k, dtype=torch.float32) * 2.0)
+            b_q, sb = _quantize_b_mxfp8(torch.randn(n, k, dtype=torch.float32) * 2.0)
+            a_list.append(ensure_contiguous(a_q).to(device))
+            b_list.append(ensure_contiguous(b_q).to(device))
+            sa_list.append(ensure_contiguous(sa).to(device))
+            sb_list.append(ensure_contiguous(sb).to(device))
+
+        outs = {}
+        for dtype in (torch.float32, torch.bfloat16):
+            inputs = _prepare_kernel_inputs_mxfp8(
+                a_list, b_list, sa_list, sb_list, device, out_dtype=dtype
+            )
+            _call_kernel(inputs)
+            assert inputs["output"].dtype == dtype
+            outs[dtype] = inputs["output"].cpu()
+
+        assert not torch.isnan(outs[torch.bfloat16]).any()
+        torch.testing.assert_close(
+            outs[torch.bfloat16].float(), outs[torch.float32], rtol=2**-8, atol=1e-2
+        )
 
     @torch.inference_mode()
     def test_legacy_ptrs_rejected(self):

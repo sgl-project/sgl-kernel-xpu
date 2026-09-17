@@ -92,6 +92,12 @@ suites = {
             estimated_time=30,
         ),
         BenchFile("bench_scatter_tokens_to_experts.py"),
+        # --- KV cache / HiCache transfer ---
+        BenchFile(
+            "bench_transfer_mamba.py",
+            tee_log="transfer_mamba.log",
+            estimated_time=15,
+        ),
         # --- norm / rope / quant ---
         BenchFile("bench_merge_states_v2.py", tee_log="merge_states.py.log"),
         BenchFile("bench_mrope.py", tee_log="mrope.py.log"),

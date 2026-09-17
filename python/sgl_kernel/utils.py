@@ -64,6 +64,15 @@ def is_xe3_arch() -> bool:
     return major == 3 and minor == 5
 
 
+def is_op_kernel_built(op_name: str, dispatch_key: str = "XPU") -> bool:
+    """Whether `torch.ops.sgl_kernel.<op_name>` has an actual kernel compiled
+    in for `dispatch_key`, as opposed to only having its schema registered.
+    """
+    return torch._C._dispatch_has_kernel_for_dispatch_key(
+        f"sgl_kernel::{op_name}", dispatch_key
+    )
+
+
 def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 

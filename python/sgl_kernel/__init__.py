@@ -171,6 +171,8 @@ from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     biased_topk,
     cutlass_fp4_group_mm,
+    cutlass_fused_experts_fp8,
+    cutlass_fused_experts_mxfp4,
     fp8_blockwise_scaled_grouped_mm,
     fused_experts,
     hash_topk,

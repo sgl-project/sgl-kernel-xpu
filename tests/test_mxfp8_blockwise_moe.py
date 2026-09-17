@@ -47,6 +47,17 @@ def skip_if_no_xpu():
         pytest.skip("Intel XPU not available")
 
 
+def skip_if_kernel_unavailable():
+    """The Python wrapper always imports; the XPU kernel is only compiled
+    in when the required cutlass-sycl dependency is available (see
+    src/torch_extension_sycl.cc). Skip rather than fail if it isn't."""
+    try:
+        torch.ops.sgl_kernel.fp8_blockwise_scaled_grouped_mm.default
+    except AttributeError:
+        pytest.skip("fp8_blockwise_scaled_grouped_mm kernel not available")
+        return
+
+
 # ---------------------------------------------------------------------------
 # Quantization / dequantization helpers
 # ---------------------------------------------------------------------------
@@ -320,6 +331,7 @@ class TestFP8BlockwiseScaledGroupedMM:
             pytest.skip(
                 "FP8 blockwise scaled grouped GEMM requires a CRI (Xe3P) device"
             )
+        skip_if_kernel_unavailable()
 
     # ------------------------------------------------------------------
     # Accuracy tests
@@ -616,6 +628,7 @@ class TestFP8RaggedM:
             pytest.skip(
                 "FP8 blockwise scaled grouped GEMM requires a CRI (Xe3P) device"
             )
+        skip_if_kernel_unavailable()
 
     @torch.inference_mode()
     def test_flat_2d_ragged_distribution(self):
@@ -842,6 +855,7 @@ class TestMXFP8BlockwiseScaledGroupedMM:
         skip_if_no_xpu()
         if not is_cri_device():
             pytest.skip("MXFP8 requires a CRI (Xe3P) device")
+        skip_if_kernel_unavailable()
 
     @pytest.mark.parametrize("m,n,k", MXFP8_MNK_FACTORS)
     @pytest.mark.parametrize("num_experts", [2, 4, 8])
@@ -990,6 +1004,7 @@ class TestCutlassFusedExpertsMXFP8:
         skip_if_no_xpu()
         if not is_cri_device():
             pytest.skip("MXFP8 requires a CRI (Xe3P) device")
+        skip_if_kernel_unavailable()
 
     @pytest.mark.parametrize(
         "num_tokens,num_experts,topk,hidden,n",
@@ -1015,7 +1030,7 @@ class TestCutlassFusedExpertsMXFP8:
     )
     @torch.inference_mode()
     def test_use_mxfp8_end_to_end(self, num_tokens, num_experts, topk, hidden, n):
-        from sgl_kernel.cutlass_moe import cutlass_fused_experts_fp8
+        from sgl_kernel.moe import cutlass_fused_experts_fp8
 
         device = "xpu"
         torch.manual_seed(0)

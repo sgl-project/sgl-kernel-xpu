@@ -17,6 +17,11 @@ def is_xpu_available() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
+def is_op_built(op_name: str) -> bool:
+    """Whether torch.ops.sgl_kernel.<op_name> has an XPU kernel compiled in."""
+    return hasattr(torch.ops.sgl_kernel, op_name)
+
+
 def is_cri_device() -> bool:
     if not is_xpu_available():
         return False
@@ -167,6 +172,13 @@ def _build_fp8_moe_inputs(
 @pytest.mark.skipif(
     is_xpu_available() and not is_cri_device(),
     reason="cutlass_fused_experts_fp8 requires CRI (Xe3P) on XPU",
+)
+@pytest.mark.skipif(
+    is_xpu_available()
+    and is_cri_device()
+    and not is_op_built("fp8_blockwise_scaled_grouped_mm"),
+    reason="fp8_blockwise_scaled_grouped_mm kernel not built (missing cutlass-sycl "
+    "dependency); see src/torch_extension_sycl.cc",
 )
 class TestCutlassFusedExpertsFp8:
     """E2E accuracy for the sglang-compatible wrapper on XPU."""
@@ -416,6 +428,13 @@ def _reference_moe_mxfp4(
 @pytest.mark.skipif(
     is_xpu_available() and not is_cri_device(),
     reason="cutlass_fused_experts_mxfp4 requires CRI (Xe3P) on XPU",
+)
+@pytest.mark.skipif(
+    is_xpu_available()
+    and is_cri_device()
+    and not is_op_built("mxfp4_blockwise_scaled_grouped_mm"),
+    reason="mxfp4_blockwise_scaled_grouped_mm kernel not built (missing cutlass-sycl "
+    "dependency); see src/torch_extension_sycl.cc",
 )
 class TestCutlassFusedExpertsMxfp4:
     """E2E accuracy for the MXFP4 wrapper."""

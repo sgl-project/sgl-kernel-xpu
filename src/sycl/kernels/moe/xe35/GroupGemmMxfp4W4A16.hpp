@@ -168,11 +168,10 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe35_mxfp4_w4a16(
   int total_m = activations.sizes()[0];
   int gemm_k = activations.sizes()[1];
   auto pw_shape = packed_weights.sizes().vec();
-  int gemm_n = pw_shape[1];
 
   TORCH_CHECK(pw_shape.size() == 3, "packed_weights must be 3D [E, N, K/2]");
+  int gemm_n = pw_shape[1];
   TORCH_CHECK(pw_shape[0] == n_experts, "packed_weights first dim must equal n_experts");
-  TORCH_CHECK(pw_shape[1] == gemm_n, "packed_weights second dim must equal N");
   TORCH_CHECK(pw_shape[2] == gemm_k / 2, "packed_weights last dim must equal K/2 (two E2M1 per byte)");
   TORCH_CHECK(packed_weights.scalar_type() == at::ScalarType::Char, "packed_weights must be int8");
 

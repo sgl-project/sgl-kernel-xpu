@@ -212,12 +212,17 @@ SGL_KERNEL_EXPORT void mxfp4_blockwise_scaled_grouped_mm(
       if (psz[e * 3] > max_m) max_m = psz[e * 3];
     }
     TORCH_CHECK(max_m > 0, "max_m must be positive across experts");
+    // Xe block-2D scale loads require 4-byte aligned width/pitch: pad the
+    // per-column M stride up to ScaleAlignElems = ceil_div(4, sizeof(scale)).
+    // For u8 UE8M0 that's 4. Also zero-init so the extra rows don't feed garbage into the accumulator.
+    constexpr int scale_align = 4;
+    const int padded_max_m = (max_m + scale_align - 1) & ~(scale_align - 1);
 
-    scales_a_t_keep_alive = torch::empty({E, scale_cols, max_m}, opts_u8);
+    scales_a_t_keep_alive = torch::zeros({E, scale_cols, padded_max_m}, opts_u8);
     scales_b_t_keep_alive = torch::empty({E, scale_cols, N}, opts_u8);
 
     launch_u8_scale_build_pointers_and_transpose_scales_flat(
-        q, E, max_m, scale_cols, N, /*a_row_stride_bytes=*/packed_K, static_cast<int>(o_elem),
+        q, E, padded_max_m, scale_cols, N, /*a_row_stride_bytes=*/packed_K, static_cast<int>(o_elem),
         problem_sizes.data_ptr<int32_t>(),
         expert_offsets.data_ptr<int32_t>(),
         scales_a.data_ptr<uint8_t>(),

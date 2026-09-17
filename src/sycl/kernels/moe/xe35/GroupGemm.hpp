@@ -192,6 +192,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe35(
   int gemm_k = activations.sizes()[1];
   auto weights_shape = weights.sizes().vec();
   int gemm_n = weights.sizes()[1];
+  TORCH_CHECK(n_experts > 0, "n_experts must be positive");
   int avg_m = total_m / n_experts;
 
   TORCH_CHECK(weights_shape.size() == 3, "weights must be 3D");

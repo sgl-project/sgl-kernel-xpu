@@ -230,7 +230,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 // Xe35 (CRI) only kernels
 #if SYCL_INTEL_TARGET == 35
   m.def(
-      "moe_grouped_mm_nt_xe35(Tensor output, Tensor activations, Tensor weights, Tensor? bias, Tensor "
+      "moe_grouped_mm_nt_xe35(Tensor! output, Tensor activations, Tensor weights, Tensor? bias, Tensor "
       "total_rows_for_experts, int n_experts, int activation_type, bool fuse_act, "
       "float gemm1_alpha=1.702, float gemm1_limit=7.0) -> ()");
   m.impl("moe_grouped_mm_nt_xe35", torch::kXPU, &moe_grouped_mm_nt_xe35);
@@ -241,24 +241,22 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "float gemm1_alpha=1.702, float gemm1_limit=7.0) -> ()");
   m.impl("moe_grouped_mm_nt_xe35_mxfp4_w4a16", torch::kXPU, &moe_grouped_mm_nt_xe35_mxfp4_w4a16);
 
-  // TEMPORARY: mxfp4_blockwise_scaled_grouped_mm / fp8_blockwise_scaled_grouped_mm
-  // (src/sycl/xe35/blockwise_moe_mxfp{4,8}.cpp) are excluded from the CRI build
-  // (see src/CMakeLists.txt) because they require a cutlass kernel-level
-  // specialization not yet available in the publicly pinned sycl-tla commit.
-  // Registration is disabled here to match; define SGL_MOE_XE35_BLOCKWISE_SCALED
-  // (and re-enable the .cpp files in CMake) once the dependency is updated.
+  // TEMPORARY: the mxfp4_blockwise_scaled_grouped_mm / fp8_blockwise_scaled_grouped_mm
+  // *kernels* (src/sycl/xe35/blockwise_moe_mxfp{4,8}.cpp) are excluded from the
+  // CRI build (see src/CMakeLists.txt) because they require a cutlass
+  // kernel-level specialization not yet available in the publicly pinned
+  // sycl-tla commit.
 #ifdef SGL_MOE_XE35_BLOCKWISE_SCALED
   m.def(
       "mxfp4_blockwise_scaled_grouped_mm(Tensor! output, Tensor! a_ptrs, Tensor! b_ptrs, Tensor! out_ptrs, "
       "Tensor! a_scales_ptrs, Tensor! b_scales_ptrs, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, "
       "Tensor problem_sizes, Tensor expert_offsets, Tensor workspace) -> ()");
-  m.impl("mxfp4_blockwise_scaled_grouped_mm", torch::kXPU, &mxfp4_blockwise_scaled_grouped_mm);
-
   m.def(
       "fp8_blockwise_scaled_grouped_mm(Tensor! output, Tensor! a_ptrs, Tensor! b_ptrs, Tensor! out_ptrs, "
       "Tensor! a_scales_ptrs, Tensor! b_scales_ptrs, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, "
       "Tensor stride_a, Tensor stride_b, Tensor stride_c, Tensor layout_sfa, Tensor layout_sfb, "
       "Tensor problem_sizes, Tensor expert_offsets, Tensor workspace) -> ()");
+  m.impl("mxfp4_blockwise_scaled_grouped_mm", torch::kXPU, &mxfp4_blockwise_scaled_grouped_mm);
   m.impl("fp8_blockwise_scaled_grouped_mm", torch::kXPU, &fp8_blockwise_scaled_grouped_mm);
 #endif  // SGL_MOE_XE35_BLOCKWISE_SCALED
 #endif  // Xe35 only kernels

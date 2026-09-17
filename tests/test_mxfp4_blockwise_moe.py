@@ -58,9 +58,10 @@ def skip_if_no_xpu():
 
 def skip_if_kernel_unavailable():
     try:
-        from sgl_kernel import mxfp4_blockwise_scaled_grouped_mm
-    except ImportError:
+        torch.ops.sgl_kernel.mxfp4_blockwise_scaled_grouped_mm.default
+    except AttributeError:
         pytest.skip("mxfp4_blockwise_scaled_grouped_mm kernel not available")
+        return
 
 
 def quantize_to_e2m1(tensor: torch.Tensor) -> torch.Tensor:
@@ -275,6 +276,7 @@ class TestMXFP4BlockwiseScaledGroupedMM:
             pytest.skip(
                 "MXFP4 blockwise scaled grouped GEMM requires a CRI (Xe3P) device"
             )
+        skip_if_kernel_unavailable()
 
     @pytest.mark.parametrize("m,n,k", MNK_FACTORS)
     @pytest.mark.parametrize("num_experts", [2, 4, 8])
@@ -422,6 +424,7 @@ class TestMXFP4RaggedM:
             pytest.skip(
                 "MXFP4 blockwise scaled grouped GEMM requires a CRI (Xe3P) device"
             )
+        skip_if_kernel_unavailable()
 
     @torch.inference_mode()
     def test_flat_2d_ragged_distribution(self):

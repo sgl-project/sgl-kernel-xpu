@@ -2,6 +2,8 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+from .elementwise import silu_and_mul
+from .gemm import sgl_per_token_group_quant_8bit, sgl_per_token_group_quant_fp4
 from .utils import is_xe2_arch, is_xe3_arch
 
 _MOE_SCORING_FUNC_MAP = {
@@ -13,6 +15,27 @@ _MOE_BIASED_TOPK_SCORING_MAP = {
     "sigmoid": 0,
     "sqrtsoftplus": 1,
 }
+
+
+def _mxfp4_e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
+    """Decode E8M0 exponent-byte MXFP4 block scales into fp32 direct
+    multipliers: value = 2^(byte - 127) (OCP MX spec bias 127; byte 0xFF is
+    reserved/NaN and is not special-cased here).
+
+    moe_grouped_mm_nt_xe35_mxfp4_w4a16 (Xe3/CRI) requires pre-decoded fp32
+    scales -- unlike moe_grouped_mm_nt_xe20_w4a16 (Xe2/BMG), which decodes
+    E8M0 bytes on-device as part of a fused dequant trick. This helper
+    bridges that gap so callers can keep passing raw E8M0 bytes/
+    torch.float8_e8m0fnu regardless of target architecture.
+
+    Uses exp2 rather than a (byte << 23) bit-cast: the bit-cast trick maps
+    byte=0 (true value 2^-127, representable as an fp32 subnormal) to a hard
+    zero, because an all-zero IEEE-754 exponent field means subnormal/zero,
+    not "unbiased exponent -127". exp2 rounds to the correct subnormal
+    instead.
+    """
+    byte = scale.view(torch.uint8) if scale.dtype == torch.float8_e8m0fnu else scale
+    return torch.exp2(byte.to(torch.float32) - 127.0)
 
 
 def _apply_per_expert_channel_gather(
@@ -546,10 +569,18 @@ def fused_experts(
         (int8 or uint8, two E2M1 nibbles per byte) with corresponding E8M0 block
         scales supplied via w1_scale and w2_scale. Scales may be represented
         as uint8 exponent bytes or torch.float8_e8m0fnu.
-        Routes through moe_grouped_mm_nt_xe20_w4a16, which dequantizes B
-        per-tile in registers and feeds W4A16 DPAS with BF16 or FP16
-        activations — no dequantized weight tensor is materialized on device.
-        Defaults to False.
+        On Xe2 (BMG), routes through moe_grouped_mm_nt_xe20_w4a16, which
+        dequantizes B per-tile in registers and feeds W4A16 DPAS with BF16
+        or FP16 activations -- no dequantized weight tensor is materialized
+        on device. On Xe3 (CRI), routes through
+        moe_grouped_mm_nt_xe35_mxfp4_w4a16 instead (mxfp4-only, no
+        zero-point/g_idx support, group_size fixed at 32, activation
+        limited to silu/swiglu_deepseek_v4, and bias unsupported -- see
+        that op's AOT instantiation matrix in
+        src/GroupGemmMxfp4W4A16Xe35.cmake); the E8M0 scale bytes are
+        decoded to fp32 direct multipliers on the host before the call,
+        since unlike the Xe2 kernel this one expects pre-decoded scales.
+        use_int4_w4a16 is not supported on Xe3. Defaults to False.
     - use_int4_w4a16 (bool): If True, w1 and w2 are in INT4 packed format
         (int8 or uint8, two 4-bit values per byte) with BF16 or FP16 block scales
         (direct multiplier) matching hidden_states.dtype, supplied via
@@ -671,8 +702,8 @@ def fused_experts(
         use_4bit_w4a16 and use_fp8_weight
     ), "4-bit W4A16 and FP8 paths are mutually exclusive"
     assert not (
-        use_4bit_w4a16 and is_xe3_arch()
-    ), "the unified int4/mxfp4 W4A16 grouped GEMM (moe_grouped_mm_nt_xe20_w4a16) is not yet ported to CRI (Xe3)"
+        use_int4_w4a16 and is_xe3_arch()
+    ), "the int4 W4A16 grouped GEMM (moe_grouped_mm_nt_xe20_w4a16) is not ported to CRI (Xe3); only use_mxfp4_w4a16 is supported on Xe3"
     if use_4bit_w4a16:
         assert (
             w1.dtype == torch.int8 or w1.dtype == torch.uint8
@@ -775,6 +806,9 @@ def fused_experts(
     E, OutK, N = w2.shape
     w1_group_size = 0
     w2_group_size = 0
+    use_mxfp4_xe3 = use_mxfp4_w4a16 and is_xe3_arch()
+    w1_scale_xe35 = None
+    w2_scale_xe35 = None
     if use_4bit_w4a16:
         # w1/w2 last dims are packed (H//2, I//2); recover actual dims
         K = K * 2
@@ -783,6 +817,17 @@ def fused_experts(
         # (GEMM1 contracts over K=H, GEMM2 over N=I).
         w1_group_size = K // w1_scale.shape[2]
         w2_group_size = N // w2_scale.shape[2]
+        if use_mxfp4_xe3:
+            assert w1_group_size == 32 and w2_group_size == 32, (
+                "moe_grouped_mm_nt_xe35_mxfp4_w4a16 hardcodes MXFP4_GROUP_SIZE=32; "
+                f"got w1_group_size={w1_group_size}, w2_group_size={w2_group_size}"
+            )
+            # moe_grouped_mm_nt_xe35_mxfp4_w4a16 expects pre-decoded fp32
+            # direct-multiplier scales (unlike moe_grouped_mm_nt_xe20_w4a16,
+            # which decodes E8M0 bytes on-device); decode once here.
+            # TODO: Decodes E8M0 bytes on-device on Xe3, and remove this host-side decode.
+            w1_scale_xe35 = _mxfp4_e8m0_to_fp32(w1_scale)
+            w2_scale_xe35 = _mxfp4_e8m0_to_fp32(w2_scale)
     if b1 is not None:
         assert b1.shape == w1.shape[:2], "b1 shape must match w1 shape[:2]"
     if b2 is not None:
@@ -991,6 +1036,21 @@ def fused_experts(
     # which would mis-detect the gated case as non-gated (gate_factor=1).
     gate_factor = 2 if (2 * N == w1.shape[1]) else 1
 
+    if use_mxfp4_xe3:
+        # moe_grouped_mm_nt_xe35_mxfp4_w4a16's AOT instantiation matrix is
+        # pruned to activation_type in {0 silu, 4 swiglu_deepseek_v4} and
+        # WithBias=false (see src/GroupGemmMxfp4W4A16Xe35.cmake); fail fast
+        # with a clear message instead of letting the op's own TORCH_CHECK
+        # fire deeper in the call stack.
+        assert activation_type in (0, 4), (
+            "moe_grouped_mm_nt_xe35_mxfp4_w4a16 only supports activation_type "
+            f"0 (silu) or 4 (swiglu_deepseek_v4); got {activation_type} "
+            f"(activation={activation!r})"
+        )
+        assert (
+            b1 is None and b2 is None
+        ), "moe_grouped_mm_nt_xe35_mxfp4_w4a16 does not support bias (b1/b2 must be None)"
+
     # Heuristic for choosing fused vs unfused activation. The K*N threshold
     # mirrors the small-weight cutoff in the C++ grouped-GEMM dispatchers
     # (MOE_GROUPED_GEMM_SMALL_WEIGHT_THRESHOLD in src/sycl/Utils.h). Keep
@@ -1003,8 +1063,10 @@ def fused_experts(
     # This preserves GEMM N-dimension parallelism.
     use_unfused_act = use_4bit_w4a16 or (avg_m <= 128 and big_weight)
     # Plain bf16 grouped GEMM: dispatch to the Xe3 (CRI) op when running on
-    # Xe3, otherwise the Xe2 (BMG) op. use_4bit_w4a16/use_fp8_weight are
-    # asserted unsupported on Xe3 above, so this only guards the bf16 path.
+    # Xe3, otherwise the Xe2 (BMG) op. use_fp8_weight and
+    # use_int4_w4a16 are asserted unsupported on Xe3 above; use_mxfp4_w4a16
+    # on Xe3 is handled separately below via use_mxfp4_xe3, so this only
+    # guards the plain bf16 path.
     moe_grouped_mm_nt = (
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe35
         if is_xe3_arch()
@@ -1018,7 +1080,21 @@ def fused_experts(
             hidden_states.device,
         )
         # GEMM1: B = w1 (gate+up).
-        if use_4bit_w4a16:
+        if use_mxfp4_xe3:
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe35_mxfp4_w4a16(
+                intermediate_cache1,
+                input_A_shuffle,
+                w1,
+                w1_scale_xe35,
+                b1,
+                expert_offsets,
+                E,
+                activation_type,
+                False,  # fuse_act
+                float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                float(gemm1_limit) if gemm1_limit is not None else 7.0,
+            )
+        elif use_4bit_w4a16:
             torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w4a16(
                 intermediate_cache1,
                 input_A_shuffle,
@@ -1077,7 +1153,21 @@ def fused_experts(
                 intermediate_cache2, w2_g_idx_perm, expert_offsets, E
             )
         # GEMM2: B = w2 (down).
-        if use_4bit_w4a16:
+        if use_mxfp4_xe3:
+            torch.ops.sgl_kernel.moe_grouped_mm_nt_xe35_mxfp4_w4a16(
+                intermediate_cache3,
+                intermediate_cache2,
+                w2,
+                w2_scale_xe35,
+                b2,
+                expert_offsets,
+                E,
+                activation_type,
+                False,  # fuse_act
+                float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
+                float(gemm1_limit) if gemm1_limit is not None else 7.0,
+            )
+        elif use_4bit_w4a16:
             torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w4a16(
                 intermediate_cache3,
                 intermediate_cache2,
@@ -1149,3 +1239,417 @@ def fused_experts(
     )
 
     return out_hidden_states
+
+
+# ---------------------------------------------------------------------------
+# CUTLASS-based fused MoE wrapper (sglang-compatible), merged from the
+# formerly-separate cutlass_moe.py. Signature-compatible with sglang's CUDA
+# cutlass_fused_experts_fp8. CUDA-only args (*_strides, *_ptrs, enable_es) are
+# unused on XPU. `use_mxfp8` selects between DSV3-style FP8 (BS=128, fp32
+# scales) and OCP MXFP8 (BS=32, UE8M0 uint8 scales); C++ dispatches on
+# scales_a dtype.
+# ---------------------------------------------------------------------------
+
+
+_FP8_E4M3_MIN = -448.0
+_FP8_E4M3_MAX = 448.0
+
+_MXFP8_BLOCK_SIZE = 32
+
+
+def _per_token_group_quant_fp8(x: torch.Tensor, group_size: int = 128):
+    """Per-token group quant along last dim. Returns (x_q fp8_e4m3, x_s fp32)."""
+    assert x.shape[-1] % group_size == 0
+    out_q = torch.empty(x.shape, device=x.device, dtype=torch.float8_e4m3fn)
+    out_s_shape = (*x.shape[:-1], x.shape[-1] // group_size)
+    out_s = torch.empty(out_s_shape, device=x.device, dtype=torch.float32)
+    sgl_per_token_group_quant_8bit(
+        x,
+        out_q,
+        out_s,
+        group_size,
+        1e-10,
+        _FP8_E4M3_MIN,
+        _FP8_E4M3_MAX,
+        False,
+        False,
+        None,
+        False,
+    )
+    return out_q, out_s
+
+
+def _per_token_group_quant_mxfp8(x: torch.Tensor, group_size: int = _MXFP8_BLOCK_SIZE):
+    """MXFP8 per-token group quant. Returns (x_q float8_e4m3fn, x_s uint8 UE8M0).
+
+    Uses v1 (enable_v2=False): v2 does not support row-major UE8M0 output.
+    """
+    assert x.shape[-1] % group_size == 0
+    out_q = torch.empty(x.shape, device=x.device, dtype=torch.float8_e4m3fn)
+    out_s_shape = (*x.shape[:-1], x.shape[-1] // group_size)
+    out_s = torch.empty(out_s_shape, device=x.device, dtype=torch.uint8)
+    sgl_per_token_group_quant_8bit(
+        x,
+        out_q,
+        out_s,
+        group_size,
+        1e-10,
+        _FP8_E4M3_MIN,
+        _FP8_E4M3_MAX,
+        True,  # scale_ue8m0
+        False,
+        None,
+        False,  # enable_v2 (v1 supports row-major UE8M0; v2 does not)
+    )
+    return out_q, out_s
+
+
+def cutlass_fused_experts_fp8(
+    a: torch.Tensor,
+    w1_q: torch.Tensor,
+    w2_q: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    a1_strides: torch.Tensor,
+    c1_strides: torch.Tensor,
+    a2_strides: torch.Tensor,
+    c2_strides: torch.Tensor,
+    workspace: torch.Tensor,
+    a_ptrs: torch.Tensor,
+    b_ptrs: torch.Tensor,
+    out_ptrs: torch.Tensor,
+    a_scales_ptrs: torch.Tensor,
+    b_scales_ptrs: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    problem_sizes1: torch.Tensor,
+    problem_sizes2: torch.Tensor,
+    use_fp8_blockscale: bool = True,
+    use_mxfp8: bool = False,
+    output: Optional[torch.Tensor] = None,
+    enable_es: Tuple[bool, bool] = (False, False),
+) -> torch.Tensor:
+    """Fused MoE on Intel XPU.
+
+    Mirrors sglang's CUDA cutlass_fused_experts_fp8 signature; CUDA-only args
+    (*_strides, *_ptrs, enable_es) are unused on XPU.
+
+    Weights expected in (E, N, K) row-major: w1=(E, n*2, k), w2=(E, k, n).
+    MXFP8 scales are (E, n*2, k/32) and (E, k, n/32) un-transposed row-major;
+    the kernel transposes B-scales on device. Sglang's dispatcher applies
+    .transpose(1, 2) before calling; auto-detected and undone below.
+    """
+    assert use_fp8_blockscale, "Only support fp8 blockscale on XPU"
+    assert enable_es == (False, False), "enable_es is CUDA-only"
+    assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
+    assert w1_q.dtype == torch.float8_e4m3fn
+    assert w2_q.dtype == torch.float8_e4m3fn
+    assert w1_q.dim() == 3 and w2_q.dim() == 3, "Weights must be 3D"
+    assert w1_q.shape[0] == w2_q.shape[0], "Expert count mismatch w1/w2"
+    assert a.dtype in (torch.half, torch.bfloat16), "Invalid input dtype"
+    if use_mxfp8:
+        assert (
+            w1_scale.dtype == torch.uint8 and w2_scale.dtype == torch.uint8
+        ), "use_mxfp8=True requires uint8 UE8M0 weight scales"
+    else:
+        assert (
+            w1_scale.dtype == torch.float32 and w2_scale.dtype == torch.float32
+        ), "use_mxfp8=False requires fp32 weight scales"
+
+    # Detect on w1 only — w2 is ambiguous when intermediate == k_hidden.
+    # Sglang transposes both weights+scales together or not at all.
+    hidden_size = a.shape[1]
+    if w1_q.shape[2] == hidden_size:
+        sglang_transposed = False
+    elif w1_q.shape[1] == hidden_size:
+        sglang_transposed = True
+    else:
+        raise AssertionError(
+            f"w1_q shape {tuple(w1_q.shape)} incompatible with a.shape[1]={hidden_size}"
+        )
+
+    if sglang_transposed:
+        w1_q = w1_q.transpose(1, 2).contiguous()
+        w2_q = w2_q.transpose(1, 2).contiguous()
+        w1_scale = w1_scale.transpose(1, 2).contiguous()
+        w2_scale = w2_scale.transpose(1, 2).contiguous()
+
+    assert w1_q.shape[2] == hidden_size
+    assert w2_q.shape[1] == hidden_size
+    assert w1_q.shape[1] == 2 * w2_q.shape[2]
+
+    del a1_strides, c1_strides, a2_strides, c2_strides
+    del a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs
+
+    out_dtype = a.dtype
+    num_experts = w1_q.size(0)
+    m = a.size(0)
+    k = a.size(1)
+    n = w2_q.size(2)
+    topk = topk_ids.size(1)
+    device = a.device
+
+    if use_mxfp8:
+        # MXFP8 gating (mirrors CUDA use_mxfp8 checks).
+        from sgl_kernel import is_xe3_arch
+
+        assert is_xe3_arch(), "MXFP8 requires an Xe3P (CRI) XPU"
+        assert (
+            k % _MXFP8_BLOCK_SIZE == 0
+        ), f"MXFP8 requires hidden size divisible by {_MXFP8_BLOCK_SIZE}, got k={k}"
+        assert (
+            n % _MXFP8_BLOCK_SIZE == 0
+        ), f"MXFP8 requires intermediate size divisible by {_MXFP8_BLOCK_SIZE}, got n={n}"
+        expected_w1_scale_shape = (
+            num_experts,
+            w1_q.shape[1],
+            w1_q.shape[2] // _MXFP8_BLOCK_SIZE,
+        )
+        expected_w2_scale_shape = (
+            num_experts,
+            w2_q.shape[1],
+            w2_q.shape[2] // _MXFP8_BLOCK_SIZE,
+        )
+        assert (
+            w1_scale.shape == expected_w1_scale_shape
+        ), f"MXFP8 w1_scale must be {expected_w1_scale_shape}, got {tuple(w1_scale.shape)}"
+        assert (
+            w2_scale.shape == expected_w2_scale_shape
+        ), f"MXFP8 w2_scale must be {expected_w2_scale_shape}, got {tuple(w2_scale.shape)}"
+
+    a_map = torch.empty((topk_ids.numel(),), dtype=torch.int32, device=device)
+    c_map = torch.empty((topk_ids.numel(),), dtype=torch.int32, device=device)
+
+    # sglang allocates expert_offsets as (E+1,) and slices [:-1]; XPU's
+    # prepare_moe_input takes size E. Accept either.
+    eo = (
+        expert_offsets[:num_experts]
+        if expert_offsets.numel() > num_experts
+        else expert_offsets
+    )
+
+    # prepare_moe_input fills eo with per-expert M counts (not cumulative).
+    prepare_moe_input(
+        topk_ids,
+        eo,
+        problem_sizes1,
+        problem_sizes2,
+        a_map,
+        c_map,
+        num_experts,
+        n,
+        k,
+    )
+
+    # Flat-2D kernel wants cumulative start offsets; exclusive-scan eo.
+    expert_starts = torch.zeros(num_experts, dtype=torch.int32, device=device)
+    if num_experts > 1:
+        expert_starts[1:] = torch.cumsum(eo[:-1], dim=0).to(torch.int32)
+
+    # Pass all experts (including zero-M) directly. The Xe group tile
+    # scheduler skips zero-M groups at runtime via ceil_div(0, BLK_M) = 0
+    # (xe_tile_scheduler_group.hpp), so the mainloop never runs for them.
+    # The driver bypasses sycl-tla's spurious M==0 reject in
+    # can_implement — see blockwise_moe_runner.hpp for details.
+
+    # Scatter then quantize. scatter_tokens_to_experts uses c_map (the
+    # src->dst permutation) to gather per-expert rows.
+    rep_a = torch.empty((m * topk, k), dtype=a.dtype, device=device)
+    scatter_tokens_to_experts(a, c_map, rep_a)
+    if use_mxfp8:
+        rep_a_q, rep_a1_scales = _per_token_group_quant_mxfp8(
+            rep_a, group_size=_MXFP8_BLOCK_SIZE
+        )
+    else:
+        rep_a_q, rep_a1_scales = _per_token_group_quant_fp8(rep_a, group_size=128)
+
+    c1 = torch.zeros((m * topk, n * 2), dtype=torch.float32, device=device)
+
+    # Empty int64 sentinels select on-device pointer-table + scale-transpose.
+    empty_ptrs = torch.empty((0,), dtype=torch.int64, device=device)
+    zeros_stride = torch.zeros((num_experts,), dtype=torch.int64, device=device)
+    zeros_layout = torch.zeros((num_experts, 5), dtype=torch.int32, device=device)
+
+    fp8_blockwise_scaled_grouped_mm(
+        c1,
+        empty_ptrs,
+        empty_ptrs,
+        empty_ptrs,
+        empty_ptrs,
+        empty_ptrs,
+        rep_a_q,
+        w1_q,
+        rep_a1_scales,
+        w1_scale,
+        zeros_stride,
+        zeros_stride,
+        zeros_stride,
+        zeros_layout,
+        zeros_layout,
+        problem_sizes1,
+        expert_starts,
+        workspace,
+    )
+
+    intermediate = torch.empty((m * topk, n), dtype=out_dtype, device=device)
+    silu_and_mul(c1.to(out_dtype), intermediate)
+
+    if use_mxfp8:
+        intermediate_q, a2_scale = _per_token_group_quant_mxfp8(
+            intermediate, group_size=_MXFP8_BLOCK_SIZE
+        )
+    else:
+        intermediate_q, a2_scale = _per_token_group_quant_fp8(
+            intermediate, group_size=128
+        )
+
+    c2 = torch.zeros((m * topk, k), dtype=torch.float32, device=device)
+    fp8_blockwise_scaled_grouped_mm(
+        c2,
+        empty_ptrs,
+        empty_ptrs,
+        empty_ptrs,
+        empty_ptrs,
+        empty_ptrs,
+        intermediate_q,
+        w2_q,
+        a2_scale,
+        w2_scale,
+        zeros_stride,
+        zeros_stride,
+        zeros_stride,
+        zeros_layout,
+        zeros_layout,
+        problem_sizes2,
+        expert_starts,
+        workspace,
+    )
+
+    if output is None:
+        output = torch.empty((m, k), dtype=out_dtype, device=device)
+    apply_shuffle_mul_sum(c2.to(out_dtype), output, c_map, topk_weights.to(out_dtype))
+    return output
+
+
+_MXFP4_BLOCK_SIZE = 32
+
+
+def cutlass_fused_experts_mxfp4(
+    a: torch.Tensor,
+    w1_q: torch.Tensor,
+    w2_q: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fused MoE on XPU using mxfp4_blockwise_scaled_grouped_mm. Slim signature
+    mirrors sglang's NVFP4 cutlass_moe_fp4 (no CUDA-only placeholders).
+    Weights in (E, N, K/2) uint8 packed E2M1 with UE8M0 block-32 scales:
+      w1_q (E, n*2, k/2), w2_q (E, k, n/2),
+      w1_scale (E, n*2, k/32), w2_scale (E, k, n/32) (un-transposed).
+    """
+    assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
+    assert w1_q.dtype == torch.uint8, "w1_q must be uint8 (packed MXFP4)"
+    assert w2_q.dtype == torch.uint8, "w2_q must be uint8 (packed MXFP4)"
+    assert w1_scale.dtype == torch.uint8, "w1_scale must be uint8 (UE8M0)"
+    assert w2_scale.dtype == torch.uint8, "w2_scale must be uint8 (UE8M0)"
+    assert w1_q.dim() == 3 and w2_q.dim() == 3, "Weights must be 3D (E, N, K/2)"
+    assert w1_q.shape[0] == w2_q.shape[0], "Expert count mismatch w1/w2"
+    assert a.dtype in (torch.half, torch.bfloat16), "Invalid input dtype"
+
+    out_dtype = a.dtype
+    num_experts = w1_q.size(0)
+    m = a.size(0)
+    k = a.size(1)
+    n = w2_q.size(2) * 2  # w2_q is (E, k, n/2)
+    topk = topk_ids.size(1)
+    device = a.device
+
+    assert w1_q.size(2) * 2 == k
+    assert w2_q.size(1) == k
+    assert w1_q.size(1) == 2 * n
+
+    a_map = torch.empty((topk_ids.numel(),), dtype=torch.int32, device=device)
+    c_map = torch.empty((topk_ids.numel(),), dtype=torch.int32, device=device)
+
+    # prepare_moe_input writes per-expert M counts (not cumulative starts).
+    expert_offsets = torch.zeros(num_experts, dtype=torch.int32, device=device)
+    problem_sizes1 = torch.zeros((num_experts, 3), dtype=torch.int32, device=device)
+    problem_sizes2 = torch.zeros((num_experts, 3), dtype=torch.int32, device=device)
+
+    prepare_moe_input(
+        topk_ids,
+        expert_offsets,
+        problem_sizes1,
+        problem_sizes2,
+        a_map,
+        c_map,
+        num_experts,
+        n,
+        k,
+    )
+
+    # Flat-2D kernel needs cumulative start offsets.
+    expert_starts = torch.zeros(num_experts, dtype=torch.int32, device=device)
+    if num_experts > 1:
+        expert_starts[1:] = torch.cumsum(expert_offsets[:-1], dim=0).to(torch.int32)
+
+    # XPU scatter doesn't support uint8/fp4; scatter bf16 then quantize.
+    rep_a = torch.empty((m * topk, k), dtype=a.dtype, device=device)
+    scatter_tokens_to_experts(a, c_map, rep_a)
+    rep_a_q, rep_a1_scales = sgl_per_token_group_quant_fp4(
+        rep_a, group_size=_MXFP4_BLOCK_SIZE
+    )
+
+    c1 = torch.zeros((m * topk, n * 2), dtype=torch.float32, device=device)
+    # Empty sentinels -> on-device ptr-table + scale-transpose.
+    empty_ptrs = torch.empty((0,), dtype=torch.int64, device=device)
+    workspace = torch.zeros((64 * 1024 * 1024,), dtype=torch.uint8, device=device)
+
+    mxfp4_blockwise_scaled_grouped_mm(
+        c1,
+        empty_ptrs,
+        empty_ptrs,
+        empty_ptrs,
+        empty_ptrs,
+        empty_ptrs,
+        rep_a_q,
+        w1_q,
+        rep_a1_scales,
+        w1_scale,
+        problem_sizes1,
+        expert_starts,
+        workspace,
+    )
+
+    intermediate = torch.empty((m * topk, n), dtype=out_dtype, device=device)
+    silu_and_mul(c1.to(out_dtype), intermediate)
+
+    intermediate_q, a2_scale = sgl_per_token_group_quant_fp4(
+        intermediate, group_size=_MXFP4_BLOCK_SIZE
+    )
+
+    c2 = torch.zeros((m * topk, k), dtype=torch.float32, device=device)
+    mxfp4_blockwise_scaled_grouped_mm(
+        c2,
+        empty_ptrs,
+        empty_ptrs,
+        empty_ptrs,
+        empty_ptrs,
+        empty_ptrs,
+        intermediate_q,
+        w2_q,
+        a2_scale,
+        w2_scale,
+        problem_sizes2,
+        expert_starts,
+        workspace,
+    )
+
+    if output is None:
+        output = torch.empty((m, k), dtype=out_dtype, device=device)
+    apply_shuffle_mul_sum(c2.to(out_dtype), output, c_map, topk_weights.to(out_dtype))
+    return output

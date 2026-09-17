@@ -43,3 +43,4 @@ foreach(_ei RANGE ${_num_elems})
 endforeach()
 
 list(APPEND ATen_XPU_SYCL_XE20 ${QKV_LORA_B_FWD_INST_SRCS})
+list(APPEND ATen_XPU_SYCL_XE35 ${QKV_LORA_B_FWD_INST_SRCS})

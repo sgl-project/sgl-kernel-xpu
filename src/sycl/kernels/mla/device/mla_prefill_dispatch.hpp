@@ -45,7 +45,7 @@ namespace mla_prefill {
 // Each function is defined in a separate generated .cpp file from
 // mla_prefill_kernel.cpp.in, compiled as its own library.
 //
-// Naming: launch_mla_prefill_<ELEM_TAG>_<PAGE_SIZE>_<BUCKET>
+// Naming: launch_mla_prefill_<ELEM_TAG>_<PAGE_SIZE>_<BUCKET>_<HAS_LSE>
 // Parameters:
 //   ELEM_TAG  in {half, bf16}
 //   PAGE_SIZE in {16, 32, 64, 128}
@@ -53,41 +53,50 @@ namespace mla_prefill {
 //     small:  Q_TILE_M=32/NumSGM=4   -- short prompts (Q < ~192)
 //     medium: Q_TILE_M=128/NumSGM=16 -- mid prompts (force-only for now)
 //     large:  Q_TILE_M=256/NumSGM=32 -- long prompts (Q >= 512)
+//   HAS_LSE   in {0, 1} -- 1 emits the softmax log-sum-exp into `lse`, 0 skips
+//             it entirely (no LSE registers, no LSE stores, `lse` unread)
+//
+// The 48 symbols below are exactly the set MlaPrefillXe20.cmake generates and
+// flash_mla_prefill()'s dispatch ladder calls; the three must stay in lockstep or
+// the TU fails to link. All four axes are pasted into the name by the ladder, so
+// each is a distinct compile-time instantiation.
 
-#define DECLARE_MLA_PREFILL_LAUNCH(ELEM, PS, BUCKET) \
-  void launch_mla_prefill_##ELEM##_##PS##_##BUCKET(  \
-      at::Tensor& out,                               \
-      const std::optional<at::Tensor>& lse,          \
-      const at::Tensor& q_nope,                      \
-      const at::Tensor& q_pe,                        \
-      const at::Tensor& kv_c_and_k_pe_cache,         \
-      const at::Tensor& cu_seqlens_q,                \
-      const at::Tensor& seq_lens,                    \
-      int64_t max_seqlen_q,                          \
-      const at::Tensor& page_table,                  \
-      at::Tensor& workspace,                         \
-      double sm_scale,                               \
-      bool causal,                                   \
+#define DECLARE_MLA_PREFILL_LAUNCH(ELEM, PS, BUCKET, HAS_LSE)   \
+  void launch_mla_prefill_##ELEM##_##PS##_##BUCKET##_##HAS_LSE( \
+      at::Tensor& out,                                          \
+      const std::optional<at::Tensor>& lse,                     \
+      const at::Tensor& q_nope,                                 \
+      const at::Tensor& q_pe,                                   \
+      const at::Tensor& kv_c_and_k_pe_cache,                    \
+      const at::Tensor& cu_seqlens_q,                           \
+      const at::Tensor& seq_lens,                               \
+      int64_t max_seqlen_q,                                     \
+      const at::Tensor& page_table,                             \
+      at::Tensor& workspace,                                    \
+      double sm_scale,                                          \
+      bool causal,                                              \
       int64_t num_kv_splits);
 
+// All three Q-tile buckets, both LSE variants, for one (ELEM, PAGE_SIZE).
+#define DECLARE_MLA_PREFILL_ALL_BUCKETS(ELEM, PS) \
+  DECLARE_MLA_PREFILL_LAUNCH(ELEM, PS, small, 0)  \
+  DECLARE_MLA_PREFILL_LAUNCH(ELEM, PS, small, 1)  \
+  DECLARE_MLA_PREFILL_LAUNCH(ELEM, PS, medium, 0) \
+  DECLARE_MLA_PREFILL_LAUNCH(ELEM, PS, medium, 1) \
+  DECLARE_MLA_PREFILL_LAUNCH(ELEM, PS, large, 0)  \
+  DECLARE_MLA_PREFILL_LAUNCH(ELEM, PS, large, 1)
+
 #define DECLARE_MLA_PREFILL_ALL_PAGE_SIZES(ELEM) \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 16, small)    \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 16, medium)   \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 16, large)    \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 32, small)    \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 32, medium)   \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 32, large)    \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 64, small)    \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 64, medium)   \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 64, large)    \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 128, small)   \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 128, medium)  \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 128, large)
+  DECLARE_MLA_PREFILL_ALL_BUCKETS(ELEM, 16)      \
+  DECLARE_MLA_PREFILL_ALL_BUCKETS(ELEM, 32)      \
+  DECLARE_MLA_PREFILL_ALL_BUCKETS(ELEM, 64)      \
+  DECLARE_MLA_PREFILL_ALL_BUCKETS(ELEM, 128)
 
 DECLARE_MLA_PREFILL_ALL_PAGE_SIZES(half)
 DECLARE_MLA_PREFILL_ALL_PAGE_SIZES(bf16)
 
 #undef DECLARE_MLA_PREFILL_LAUNCH
+#undef DECLARE_MLA_PREFILL_ALL_BUCKETS
 #undef DECLARE_MLA_PREFILL_ALL_PAGE_SIZES
 
 }  // namespace mla_prefill

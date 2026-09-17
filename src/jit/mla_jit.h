@@ -13,11 +13,14 @@
 namespace sgl {
 namespace mla_jit {
 
-// Launch MLA decode for (query dtype, page size). Tensor args are at::Tensor*
-// passed as void*. Returns true on success; fills *err on failure.
+// Launch MLA decode for (query dtype, page size, has_lse). Tensor args are
+// at::Tensor* passed as void*. `has_lse` must equal lse->has_value(): it selects
+// the compile-time LSE variant of the kernel, the same way has_attn_sink does for
+// the sparse kernels below. Returns true on success; fills *err on failure.
 bool mla_decode_launch(
     bool is_fp16,
     int page_size,
+    bool has_lse,
     void* out,
     const void* lse,  // const std::optional<at::Tensor>*; nullopt = skip the LSE
     const void* q_nope,
@@ -31,12 +34,15 @@ bool mla_decode_launch(
     int arch = 0,
     std::string* err = nullptr);
 
-// Launch MLA prefill for (query dtype, page size). `bucket` selects the Q-tile
-// variant (0=small, 1=medium, 2=large). Tensor args are at::Tensor* as void*.
+// Launch MLA prefill for (query dtype, page size, has_lse). `bucket` selects the
+// Q-tile variant (0=small, 1=medium, 2=large) at runtime; `has_lse` must equal
+// lse->has_value() and selects the compile-time LSE variant of the kernel. Tensor
+// args are at::Tensor* as void*.
 bool mla_prefill_launch(
     bool is_fp16,
     int page_size,
     int bucket,
+    bool has_lse,
     void* out,
     const void* lse,  // const std::optional<at::Tensor>*; nullopt = skip the LSE
     const void* q_nope,

@@ -177,12 +177,16 @@ def test_flash_mla_decode(
 
 @pytest.mark.parametrize("num_kv_splits", [-1, 1])
 def test_flash_mla_decode_lse_optional(num_kv_splits: int):
-    """return_lse=False (the default) returns a bare output tensor.
+    """The LSE-off kernel must be bit-identical on O, and return_lse defaults to False.
 
-    Also checks that skipping the LSE does not perturb O, i.e. the LSE-off
-    kernel instantiation is numerically identical on O. Both KV-split modes are
-    covered: 1 split writes the LSE from the fused epilogue, auto (-1) may pick
-    more and write it from the split-KV reduction kernel.
+    Correctness of O and of the LSE values is already covered per-mode by
+    test_flash_mla_decode's return_lse parametrization; what that cannot check is
+    agreement *between* the two instantiations, since it compares each against the
+    CPU reference at 1e-2 in separate invocations. HAS_LSE=0 is a separately
+    compiled kernel (see the dispatch ladder in src/sycl/mla_decode.cpp), so this
+    pins O to be unperturbed by gating the LSE out. Both KV-split modes are covered:
+    1 split writes the LSE from the fused epilogue, auto (-1) may pick more and
+    write it from the split-KV reduction kernel.
     """
     torch.random.manual_seed(42)
 
@@ -205,10 +209,6 @@ def test_flash_mla_decode_lse_optional(num_kv_splits: int):
         block_table_cpu.numel(), block_size, d, dtype=dtype, device="cpu"
     )
 
-    out_ref = torch.zeros(bs, h_q, dv, dtype=dtype, device="cpu")
-    lse_ref = torch.zeros(bs, h_q, dtype=torch.float32, device="cpu")
-    ref_mla(out_ref, q_cpu, kv_cache_cpu, scale, block_table_cpu, seq_lens_cpu, lse_ref)
-
     workspace = torch.empty(
         flash_mla_decode_get_workspace_size(
             block_num * block_size, bs, h_q, block_size, num_kv_splits=num_kv_splits
@@ -227,23 +227,14 @@ def test_flash_mla_decode_lse_optional(num_kv_splits: int):
         num_kv_splits,
     )
 
-    # Default and explicit False: a bare output tensor, no LSE computed.
+    # out_default omits return_lse, so it takes the default (False) path and the
+    # HAS_LSE=0 kernel; out_lse runs the HAS_LSE=1 kernel on identical inputs.
     out_default = flash_mla_decode(*args)
-    out_false = flash_mla_decode(*args, return_lse=False)
-    out, lse = flash_mla_decode(*args, return_lse=True)
+    out_lse, _ = flash_mla_decode(*args, return_lse=True)
     torch.xpu.synchronize()
 
     assert isinstance(out_default, torch.Tensor)
-    assert isinstance(out_false, torch.Tensor)
-
-    atol, rtol = 1e-2, 1e-2
-    torch.testing.assert_close(
-        out_ref.float(), out_default.cpu().float(), atol=atol, rtol=rtol
-    )
-    # The LSE-off kernel must produce bit-identical O.
-    torch.testing.assert_close(out_default.cpu(), out.cpu(), atol=0, rtol=0)
-    torch.testing.assert_close(out_default.cpu(), out_false.cpu(), atol=0, rtol=0)
-    torch.testing.assert_close(lse_ref, lse.cpu(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(out_default.cpu(), out_lse.cpu(), atol=0, rtol=0)
 
 
 if __name__ == "__main__":

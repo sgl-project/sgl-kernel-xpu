@@ -29,7 +29,7 @@
  *
  **************************************************************************************************/
 // Auto-generated from mla_decode_kernel.cpp.in
-// Template parameters: ELEM_TAG=@ELEM_TAG@, PAGE_SIZE=@PAGE_SIZE@
+// Template parameters: ELEM_TAG=@ELEM_TAG@, PAGE_SIZE=@PAGE_SIZE@, HAS_LSE=@HAS_LSE@
 #define SYCL_INTEL_TARGET 20
 
 #include "sycl/kernels/mla/device/mla_decode_types.hpp"
@@ -37,14 +37,15 @@
 namespace mla_decode {
 
 // The softmax-LSE output is threaded as a template constexpr (see MlaXe), so
-// wanting the LSE and not wanting it are separate kernels and both have to be
-// instantiated here. Crossed with the split-KV dispatch inside runMla() that is
-// four kernels in this translation unit; the LSE-off pair carries none of the
-// epilogue's LSE registers or stores. An absent lse tensor is the request to
-// skip it -- the host op (flash_mla_decode) has already validated it when
-// present.
+// wanting the LSE and not wanting it are separate kernels. HAS_LSE is a template
+// parameter of this file rather than a branch in the body: the host op resolves
+// lse.has_value() to a 0/1 token and calls the matching symbol, exactly like the
+// sparse decode kernels do for HAS_ATTN_SINK. One variant per object file bounds
+// per-file compilation memory -- crossed with the split-KV dispatch inside
+// runMla() this TU holds two kernels instead of four. The HAS_LSE=0 build carries
+// none of the epilogue's LSE registers or stores and never reads `lse`.
 
-__attribute__((visibility("default"))) void launch_mla_decode_@ELEM_TAG@_@PAGE_SIZE@(
+__attribute__((visibility("default"))) void launch_mla_decode_@ELEM_TAG@_@PAGE_SIZE@_@HAS_LSE@(
     at::Tensor& out,
     const std::optional<at::Tensor>& lse,
     const at::Tensor& q_nope,
@@ -55,13 +56,7 @@ __attribute__((visibility("default"))) void launch_mla_decode_@ELEM_TAG@_@PAGE_S
     at::Tensor& workspace,
     double sm_scale,
     int64_t num_kv_splits) {
-  if (lse.has_value()) {
-    runMla<@ELEM_SYCL_TYPE@, PageSizeOption<@PAGE_SIZE@>, /*LSE=*/true>(
-        out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table,
-        workspace, sm_scale, num_kv_splits);
-    return;
-  }
-  runMla<@ELEM_SYCL_TYPE@, PageSizeOption<@PAGE_SIZE@>, /*LSE=*/false>(
+  runMla<@ELEM_SYCL_TYPE@, PageSizeOption<@PAGE_SIZE@>, static_cast<bool>(@HAS_LSE@)>(
       out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table,
       workspace, sm_scale, num_kv_splits);
 }
@@ -71,7 +66,9 @@ __attribute__((visibility("default"))) void launch_mla_decode_@ELEM_TAG@_@PAGE_S
 #ifdef SGL_MLA_JIT_ENTRY
 // Stable C ABI entry for the runtime-JIT path. Tensors cross the dlopen boundary
 // as at::Tensor* (both sides share <torch/all.h> -> identical layout). One config
-// per .so, so the fixed symbol name never collides across AOT translation units.
+// (@ELEM_TAG@,@PAGE_SIZE@,@HAS_LSE@) per .so, so the fixed symbol name never
+// collides across AOT translation units; the caller picks the .so, so HAS_LSE is
+// already fixed by the time we get here.
 extern "C" __attribute__((visibility("default"))) void sgl_mla_decode_entry(
     void* out,
     const void* lse,  // const std::optional<at::Tensor>*
@@ -83,7 +80,7 @@ extern "C" __attribute__((visibility("default"))) void sgl_mla_decode_entry(
     void* workspace,
     double sm_scale,
     int64_t num_kv_splits) {
-  mla_decode::launch_mla_decode_@ELEM_TAG@_@PAGE_SIZE@(
+  mla_decode::launch_mla_decode_@ELEM_TAG@_@PAGE_SIZE@_@HAS_LSE@(
       *static_cast<at::Tensor*>(out),
       *static_cast<const std::optional<at::Tensor>*>(lse),
       *static_cast<const at::Tensor*>(q_nope),

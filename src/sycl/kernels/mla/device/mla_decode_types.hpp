@@ -102,7 +102,8 @@ struct FMlAProblemShape {
 //----------------- define MLA Xe configuration --------------------//
 // LSE selects whether the kernel emits the softmax log-sum-exp. It is a
 // template constant rather than a runtime null-pointer check, so the two answers
-// are two different kernels; mla_decode_kernel.cpp.in does the dispatch.
+// are two different kernels, each in its own translation unit (HAS_LSE in
+// MlaDecodeXe20.cmake); flash_mla_decode() picks one by name.
 template <
     typename T,
     typename PageSizeOpt = PageSizeOption<64>,
@@ -387,10 +388,11 @@ inline void runMlaImpl(
   CUTLASS_CHECK(fmla.run(arguments, workspace.data_ptr()));
 }
 
-// LSE is a template constant, not a runtime flag: the caller (the generated
-// launch function in mla_decode_kernel.cpp.in) picks the instantiation. Crossed
-// with the split-KV dispatch below that is four kernels per (dtype, page size)
-// translation unit; the LSE-off pair carries no LSE registers and no LSE stores.
+// LSE is a template constant, not a runtime flag: flash_mla_decode()'s dispatch
+// ladder resolves lse.has_value() to a 0/1 token and calls the generated launcher
+// of that name, so LSE is already fixed here. Crossed with the split-KV dispatch
+// below that is two kernels per (dtype, page size, LSE) translation unit; the
+// LSE-off one carries no LSE registers and no LSE stores.
 template <typename Element, typename PageSizeOpt, bool LSE>
 inline void runMla(
     at::Tensor& out,

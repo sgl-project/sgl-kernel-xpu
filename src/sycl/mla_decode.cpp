@@ -95,32 +95,53 @@ int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int
   return std::clamp(num_splits, 1, 128);
 }
 
-#define DISPATCH_MLA_PAGE_SIZE(ELEM)                                                                           \
-  do {                                                                                                         \
-    switch (page_size) {                                                                                       \
-      case 16:                                                                                                 \
-        mla_decode::launch_mla_decode_##ELEM##_16(                                                             \
-            out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale,            \
-            num_kv_splits);                                                                                    \
-        break;                                                                                                 \
-      case 32:                                                                                                 \
-        mla_decode::launch_mla_decode_##ELEM##_32(                                                             \
-            out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale,            \
-            num_kv_splits);                                                                                    \
-        break;                                                                                                 \
-      case 64:                                                                                                 \
-        mla_decode::launch_mla_decode_##ELEM##_64(                                                             \
-            out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale,            \
-            num_kv_splits);                                                                                    \
-        break;                                                                                                 \
-      case 128:                                                                                                \
-        mla_decode::launch_mla_decode_##ELEM##_128(                                                            \
-            out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale,            \
-            num_kv_splits);                                                                                    \
-        break;                                                                                                 \
-      default:                                                                                                 \
-        TORCH_CHECK(false, "Unsupported page size for MLA decode: ", page_size);                               \
-    }                                                                                                          \
+// Three-stage dispatch ladder. Each rung resolves ONE runtime value to a compile-time
+// token and is named for the value it switches on (like DISPATCH_MLA_SPARSE_SINK):
+//
+//   DISPATCH_MLA_DTYPE     -> ELEM     (in_dtype; half/bf16)
+//     DISPATCH_MLA_PAGE_SIZE -> PS     (kv_c_and_k_pe_cache.size(1); 16/32/64/128)
+//       DISPATCH_MLA_LSE     -> HAS_LSE (lse.has_value(); 0/1)
+//         DISPATCH_MLA_LAUNCH -> the generated launcher call
+//
+// The switches are load-bearing, not stylistic: the leaf pastes these three tokens into
+// the launcher's name, so each value must be a literal before it is reached. Full
+// expansion is 2 ELEM x 4 PS x 2 HAS_LSE = 16 call sites, which is exactly the symbol
+// set MlaDecodeXe20.cmake generates and mla_decode_dispatch.hpp declares -- the three
+// must stay in lockstep or the TU fails to link.
+#define DISPATCH_MLA_LAUNCH(ELEM, PS, HAS_LSE)                                                               \
+  mla_decode::launch_mla_decode_##ELEM##_##PS##_##HAS_LSE(                                                   \
+      out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits)
+
+// Resolve the runtime lse tensor to the compile-time 0/1 launcher variant. An absent
+// lse tensor is the request to skip the LSE; the host op has already validated it when
+// present.
+#define DISPATCH_MLA_LSE(ELEM, PS)      \
+  do {                                  \
+    if (lse.has_value()) {              \
+      DISPATCH_MLA_LAUNCH(ELEM, PS, 1); \
+    } else {                            \
+      DISPATCH_MLA_LAUNCH(ELEM, PS, 0); \
+    }                                   \
+  } while (0)
+
+#define DISPATCH_MLA_PAGE_SIZE(ELEM)                                             \
+  do {                                                                           \
+    switch (page_size) {                                                         \
+      case 16:                                                                   \
+        DISPATCH_MLA_LSE(ELEM, 16);                                              \
+        break;                                                                   \
+      case 32:                                                                   \
+        DISPATCH_MLA_LSE(ELEM, 32);                                              \
+        break;                                                                   \
+      case 64:                                                                   \
+        DISPATCH_MLA_LSE(ELEM, 64);                                              \
+        break;                                                                   \
+      case 128:                                                                  \
+        DISPATCH_MLA_LSE(ELEM, 128);                                             \
+        break;                                                                   \
+      default:                                                                   \
+        TORCH_CHECK(false, "Unsupported page size for MLA decode: ", page_size); \
+    }                                                                            \
   } while (0)
 
 #define DISPATCH_MLA_DTYPE()                                              \
@@ -215,6 +236,7 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
         sgl::mla_jit::mla_decode_launch(
             in_dtype == at::ScalarType::Half,
             page_size,
+            lse.has_value(),
             &out,
             &lse,
             &q_nope,
@@ -234,6 +256,8 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
 #endif
 }
 
+#undef DISPATCH_MLA_LAUNCH
+#undef DISPATCH_MLA_LSE
 #undef DISPATCH_MLA_PAGE_SIZE
 #undef DISPATCH_MLA_DTYPE
 

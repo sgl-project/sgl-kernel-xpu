@@ -85,7 +85,8 @@ struct MlaPrefillQTileLarge {
 //----------------- define MLA Xe Prefill configuration --------------------//
 // LSE selects whether the kernel emits the softmax log-sum-exp. It is a
 // template constant rather than a runtime null-pointer check, so the two answers
-// are two different kernels; mla_prefill_kernel.cpp.in does the dispatch.
+// are two different kernels, each in its own translation unit (HAS_LSE in
+// MlaPrefillXe20.cmake); flash_mla_prefill() picks one by name.
 template <
     typename T,
     typename PageSizeOpt = PageSizeOption<64>,
@@ -328,10 +329,11 @@ inline typename T::Fmla::Arguments args_from_options_prefill(
   return arguments;
 }
 
-// LSE is a template constant, not a runtime flag: the caller (the generated
-// launch functions in mla_prefill_kernel.cpp.in) picks the instantiation, so
-// there are two kernels per Q-tile bucket per (dtype, page size) translation
-// unit. The LSE-off variant carries no LSE registers and no LSE stores.
+// LSE is a template constant, not a runtime flag: flash_mla_prefill()'s dispatch
+// ladder resolves lse.has_value() to a 0/1 token and calls the generated launcher
+// of that name, so LSE is already fixed here -- one kernel per Q-tile bucket per
+// (dtype, page size, LSE) translation unit. The LSE-off variant carries no LSE
+// registers and no LSE stores.
 template <typename Element, typename PageSizeOpt, typename QTileCfg, bool LSE>
 inline void runMlaPrefill(
     at::Tensor& out,

@@ -277,10 +277,15 @@ def test_mla_prefill(return_lse, dtype, block_size, num_heads, seqlens_q, seqlen
 
 
 def test_mla_prefill_lse_optional():
-    """return_lse=False (the default) returns a bare output tensor.
+    """The LSE-off kernel must be bit-identical on O, and return_lse defaults to False.
 
-    Also checks that skipping the LSE does not perturb O, i.e. the LSE-off
-    kernel instantiation is numerically identical on O."""
+    Correctness of O and of the LSE values is already covered per-mode by
+    test_mla_prefill's return_lse parametrization; what that cannot check is
+    agreement *between* the two instantiations, since it compares each against the
+    CPU reference at 1e-2 in separate invocations. HAS_LSE=0 is a separately
+    compiled kernel (see the dispatch ladder in src/sycl/mla_prefill.cpp), so this
+    pins O to be unperturbed by gating the LSE out.
+    """
     torch.random.manual_seed(42)
 
     dtype = torch.bfloat16
@@ -310,19 +315,6 @@ def test_mla_prefill_lse_optional():
         block_table_cpu.max().item() + 1, block_size, D_ckv, dtype=dtype
     )
 
-    lse_ref = torch.zeros(total_q, num_heads, dtype=torch.float32)
-    out_ref = ref_mla_prefill_varlen(
-        q_nope_cpu,
-        q_pe_cpu,
-        kv_cache_cpu,
-        scale,
-        block_table_cpu,
-        cu_seqlens_q,
-        seq_lens_k,
-        causal=True,
-        lse=lse_ref,
-    )
-
     ws_size = flash_mla_prefill_get_workspace_size(block_num * block_size, bs)
     args = (
         q_nope_cpu.to(device).contiguous(),
@@ -337,26 +329,14 @@ def test_mla_prefill_lse_optional():
     )
     kwargs = dict(causal=True, num_kv_splits=1)
 
-    # Default and explicit False: a bare output tensor, no LSE computed.
+    # out_default omits return_lse, so it takes the default (False) path and the
+    # HAS_LSE=0 kernel; out_lse runs the HAS_LSE=1 kernel on identical inputs.
     out_default = flash_mla_prefill(*args, **kwargs)
-    out_false = flash_mla_prefill(*args, **kwargs, return_lse=False)
-    out, lse = flash_mla_prefill(*args, **kwargs, return_lse=True)
+    out_lse, _ = flash_mla_prefill(*args, **kwargs, return_lse=True)
     torch.xpu.synchronize()
 
     assert isinstance(out_default, torch.Tensor)
-    assert isinstance(out_false, torch.Tensor)
-
-    atol, rtol = 1e-2, 1e-2
-    torch.testing.assert_close(
-        out_ref.float(), out_default.cpu().float(), atol=atol, rtol=rtol
-    )
-    # The LSE-off kernel must produce bit-identical O.
-    torch.testing.assert_close(out_default.cpu(), out.cpu(), atol=0, rtol=0)
-    torch.testing.assert_close(out_default.cpu(), out_false.cpu(), atol=0, rtol=0)
-
-    assert lse.shape == (total_q, num_heads)
-    assert lse.dtype == torch.float32
-    torch.testing.assert_close(lse_ref, lse.cpu(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(out_default.cpu(), out_lse.cpu(), atol=0, rtol=0)
 
 
 if __name__ == "__main__":

@@ -32,17 +32,21 @@ bool check_config(const char* op_label, std::string* err) {
 using DecodeFn =
     void (*)(void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, double, int64_t);
 
-uint64_t pack_decode_key(int arch, bool is_fp16, int page_size) {
+// HAS_LSE is part of the config, not a runtime argument -- one LSE variant per
+// rendered module -- so it has to key the in-process cache and the module name,
+// exactly like `sink` does in pack_sparse_key() below.
+uint64_t pack_decode_key(int arch, bool is_fp16, int page_size, bool has_lse) {
   uint64_t k = static_cast<uint64_t>(arch) & 0xFF;
   k = (k << 16) | (static_cast<uint64_t>(page_size) & 0xFFFF);
   k = (k << 1) | (is_fp16 ? 1u : 0u);
+  k = (k << 1) | (has_lse ? 1u : 0u);
   return k;
 }
 
 jit::JitFnCache<DecodeFn> g_decode_fns("MLA decode");
 
-DecodeFn resolve_decode(bool is_fp16, int page_size, int arch, std::string* err) {
-  const uint64_t key = pack_decode_key(arch, is_fp16, page_size);
+DecodeFn resolve_decode(bool is_fp16, int page_size, bool has_lse, int arch, std::string* err) {
+  const uint64_t key = pack_decode_key(arch, is_fp16, page_size, has_lse);
   auto build = [&](std::string* berr) -> void* {
     if (!check_config("MLA decode", berr)) return nullptr;
 
@@ -51,11 +55,13 @@ DecodeFn resolve_decode(bool is_fp16, int page_size, int arch, std::string* err)
     spec.subs["ELEM_TAG"] = elem_tag(is_fp16);
     spec.subs["ELEM_SYCL_TYPE"] = elem_sycl_type(is_fp16);
     spec.subs["PAGE_SIZE"] = std::to_string(page_size);
+    spec.subs["HAS_LSE"] = has_lse ? "1" : "0";
     const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_MLA_JIT_ENTRY");
     spec.extra_flags = as.extra_flags;
     spec.target = as.target;
     spec.entry_symbol = "sgl_mla_decode_entry";
-    spec.name = std::string("mla_decode_") + elem_tag(is_fp16) + "_" + std::to_string(page_size) + "_" + as.suffix;
+    spec.name = std::string("mla_decode_") + elem_tag(is_fp16) + "_" + std::to_string(page_size) + "_" +
+                (has_lse ? "1" : "0") + "_" + as.suffix;
 
     return jit::get_or_compile(spec, jit::default_config(), berr);
   };
@@ -67,6 +73,7 @@ DecodeFn resolve_decode(bool is_fp16, int page_size, int arch, std::string* err)
 bool mla_decode_launch(
     bool is_fp16,
     int page_size,
+    bool has_lse,
     void* out,
     const void* lse,
     const void* q_nope,
@@ -79,7 +86,7 @@ bool mla_decode_launch(
     int64_t num_kv_splits,
     int arch,
     std::string* err) {
-  DecodeFn fn = resolve_decode(is_fp16, page_size, arch, err);
+  DecodeFn fn = resolve_decode(is_fp16, page_size, has_lse, arch, err);
   if (!fn) return false;
   fn(out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
   return true;
@@ -109,8 +116,8 @@ using PrefillFn = void (*)(
 
 jit::JitFnCache<PrefillFn> g_prefill_fns("MLA prefill");
 
-PrefillFn resolve_prefill(bool is_fp16, int page_size, int arch, std::string* err) {
-  const uint64_t key = pack_decode_key(arch, is_fp16, page_size);
+PrefillFn resolve_prefill(bool is_fp16, int page_size, bool has_lse, int arch, std::string* err) {
+  const uint64_t key = pack_decode_key(arch, is_fp16, page_size, has_lse);
   auto build = [&](std::string* berr) -> void* {
     if (!check_config("MLA prefill", berr)) return nullptr;
 
@@ -119,11 +126,13 @@ PrefillFn resolve_prefill(bool is_fp16, int page_size, int arch, std::string* er
     spec.subs["ELEM_TAG"] = elem_tag(is_fp16);
     spec.subs["ELEM_SYCL_TYPE"] = elem_sycl_type(is_fp16);
     spec.subs["PAGE_SIZE"] = std::to_string(page_size);
+    spec.subs["HAS_LSE"] = has_lse ? "1" : "0";
     const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_MLA_JIT_ENTRY");
     spec.extra_flags = as.extra_flags;
     spec.target = as.target;
     spec.entry_symbol = "sgl_mla_prefill_entry";
-    spec.name = std::string("mla_prefill_") + elem_tag(is_fp16) + "_" + std::to_string(page_size) + "_" + as.suffix;
+    spec.name = std::string("mla_prefill_") + elem_tag(is_fp16) + "_" + std::to_string(page_size) + "_" +
+                (has_lse ? "1" : "0") + "_" + as.suffix;
 
     return jit::get_or_compile(spec, jit::default_config(), berr);
   };
@@ -136,6 +145,7 @@ bool mla_prefill_launch(
     bool is_fp16,
     int page_size,
     int bucket,
+    bool has_lse,
     void* out,
     const void* lse,
     const void* q_nope,
@@ -151,7 +161,7 @@ bool mla_prefill_launch(
     int64_t num_kv_splits,
     int arch,
     std::string* err) {
-  PrefillFn fn = resolve_prefill(is_fp16, page_size, arch, err);
+  PrefillFn fn = resolve_prefill(is_fp16, page_size, has_lse, arch, err);
   if (!fn) return false;
   fn(bucket,
      out,

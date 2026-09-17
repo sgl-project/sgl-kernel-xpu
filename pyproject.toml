@@ -10,13 +10,20 @@ name = "sglang-kernel-xpu"
 version = "0.2.0"
 description = "XPU Kernel Library for SGLang"
 readme = "README.md"
-requires-python = ">=3.10"
+# 3.12 is the only interpreter this package is built and validated against:
+# Dockerfile.xpu_kernel (ARG PYTHON_VERSION) and both CI workflows all use it.
+# The previous ">=3.10" floor was inherited from the CUDA sgl-kernel package at
+# repo init and never backed by a 3.10/3.11 test run, so it advertised support
+# nobody verified. Keep this in lockstep with the build image and with
+# `wheel.py-api` below.
+requires-python = ">=3.12"
 license-files = [
     "LICENSE",
     "THIRDPARTYNOTICES.txt"
 ]
 classifiers = [
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
   "License :: OSI Approved :: Apache Software License",
 ]
 dependencies = []
@@ -36,5 +43,11 @@ cmake.build-type = "Release"
 build-dir = "build"
 minimum-version = "build-system.requires"
 
-wheel.py-api = "cp310"
+# Build against the CPython 3.12 stable ABI (drives USE_SABI in
+# src/BuildOnLinux.cmake), matching `requires-python` and the 3.12 build image.
+# Staying on the stable ABI still buys us a single binary for 3.12/3.13+ and
+# keeps the constraint the kernels are written to -- see the `torch/all.h` over
+# `torch/extension.h` rule in README.md -- so do not drop this to widen or
+# narrow support; move it together with `requires-python`.
+wheel.py-api = "cp312"
 wheel.packages = ["python/sgl_kernel"]

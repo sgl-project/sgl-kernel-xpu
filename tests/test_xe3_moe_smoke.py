@@ -6,26 +6,10 @@ exercises the two Xe3-specific grouped-GEMM dispatch paths
 (``moe_grouped_mm_nt_xe35`` and ``moe_grouped_mm_nt_xe35_mxfp4_w4a16``) with
 the smallest shapes known to satisfy the kernels' own tiling constraints.
 
-Coverage of the remaining, arch-independent MOE ops (``moe_fused_gate``,
-``moe_align_block_size``, ``moe_sum``, ``prepare_moe_input[_small]``,
-``scatter_tokens_to_experts``, ``apply_shuffle_mul_sum``, ``topk_softmax``,
-``topk_sigmoid``, ``hash_topk``, ``biased_topk``) is intentionally NOT
-duplicated here: their existing test files already contain small-shape
-parametrize cases suitable for a slow simulator. See the curated list of
-minimal pytest node IDs in
-``~/frameworks.ai.pytorch.sgl-kernel-xpu/MOE_XE3_SIMULATOR_TEST_PLAN.md``.
-
 Explicitly out of scope (kernels not compiled in for Xe3, already handled by
-``is_op_kernel_built``-gated skips in their own test files):
+``hasattr(torch.ops.sgl_kernel, ...)``-gated skips in their own test files):
   - mxfp4_blockwise_scaled_grouped_mm  (test_mxfp4_blockwise_moe.py)
   - fp8_blockwise_scaled_grouped_mm    (test_mxfp8_blockwise_moe.py / test_cutlass_moe.py)
-
-Also out of scope: ``moe_grouped_mm_nt_xe20_fp8_w8a16``. Despite its
-unconditional torch-op registration and lack of arch-gating in its CMake
-inclusion, its .cpp source hardcodes ``#define SYCL_INTEL_TARGET 20`` and the
-Python-level ``fused_experts`` still blocks ``use_fp8_w8a8`` on Xe3
-(see moe.py). It has not been validated/ported for Xe3 and is treated as
-Xe2-only pending a real port.
 """
 
 import pytest

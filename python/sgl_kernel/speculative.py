@@ -1,3 +1,5 @@
+from enum import IntEnum
+
 import torch
 from sgl_kernel.utils import get_xpu_stream
 
@@ -54,8 +56,13 @@ def verify_tree_greedy(
         retrive_next_token,
         retrive_next_sibling,
         target_predict,
-        get_xpu_stream(),
     )
+
+
+class TreeMaskMode(IntEnum):
+    FULL_MASK = 0
+    QLEN_ONLY = 1
+    QLEN_ONLY_BITPACKING = 2
 
 
 def build_tree_kernel_efficient(
@@ -70,7 +77,11 @@ def build_tree_kernel_efficient(
     topk: int,
     depth: int,
     draft_token_num: int,
+    tree_mask_mode: int = TreeMaskMode.FULL_MASK,
 ) -> None:
+    if tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
+        raise NotImplementedError("QLEN_ONLY_BITPACKING is not implemented on XPU")
+
     torch.ops.sgl_kernel.build_tree_kernel_efficient.default(
         parent_list,
         selected_index,
@@ -83,6 +94,7 @@ def build_tree_kernel_efficient(
         topk,
         depth,
         draft_token_num,
+        int(tree_mask_mode),
     )
 
 

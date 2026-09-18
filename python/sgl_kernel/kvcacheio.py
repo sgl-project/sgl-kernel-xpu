@@ -313,6 +313,63 @@ def transfer_kv_all_layer_mla_lf_pf(
     )
 
 
+def transfer_kv_mamba_pf_lf(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    layer_id: int,
+    item_size: int,
+    src_layout_dim: int,
+) -> None:
+    """Mamba HiCache load: dst[dst_idx[i]] ← src[src_idx[i], layer_id].
+
+    ``item_size`` and ``src_layout_dim`` are BYTES (per item, and per page in
+    ``src``), matching the CUDA ``transfer_kv_mamba_pf_lf``. The Mamba state is
+    one fused block per page, so there is no K/V split and no tuning knobs: the
+    kernel picks its copy width and grid from the alignment and the device size.
+    """
+    torch.ops.sgl_kernel.transfer_kv_mamba_pf_lf.default(
+        src,
+        dst,
+        src_indices,
+        dst_indices,
+        layer_id,
+        item_size,
+        src_layout_dim,
+    )
+
+
+def transfer_kv_mamba_lf_pf(
+    src_layers: torch.Tensor,
+    dst: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    dst_layout_dim: int,
+    num_layers: int,
+) -> None:
+    """Mamba HiCache backup: dst[dst_idx[i], layer] ← src[layer, src_idx[i]], all layers.
+
+    NOTE (API): unlike the CUDA kernel — which takes a uint64 pointer array of
+    the per-layer device buffers — this takes the actual contiguous layer-first
+    source TENSOR of shape ``(num_layers, pool, ...)``. The scheduler already
+    holds it, and dereferencing a host-built pointer array is neither safe nor
+    portable across SYCL runtimes. Numerically identical.
+
+    ``item_size`` and ``dst_layout_dim`` are BYTES (per item, and per page in dst).
+    """
+    torch.ops.sgl_kernel.transfer_kv_mamba_lf_pf.default(
+        src_layers,
+        dst,
+        src_indices,
+        dst_indices,
+        item_size,
+        dst_layout_dim,
+        num_layers,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Group B: Python/PyTorch fallbacks (host↔device; no equivalent of
 # cudaMemcpyBatchAsync on XPU — use PyTorch copy_ page-by-page).

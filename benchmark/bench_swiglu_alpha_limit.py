@@ -39,8 +39,19 @@ def calculate_diff(batch_size, hidden_dim, alpha, limit, dtype):
 
 batch_size_range = [1, 4, 8, 16, 32]
 hidden_dim_range = [512, 1024, 2048, 4096]
-configs = list(itertools.product(batch_size_range, hidden_dim_range))
+
+# The cross product above tops out at ~1.5 MB of traffic, well inside BMG's
+# ~18 MB L2, so its GB/s column measures cache bandwidth and cannot see a
+# DRAM-bandwidth change. These are the gpt-oss MoE intermediate shapes
+# (H = 720 at 120B TP=4, H = 2880 at 20B TP=1) and are 35 MB - 566 MB, i.e.
+# genuinely DRAM-resident.
+large_configs = [(4096, 720), (16384, 720), (16384, 2880)]
+
+configs = list(itertools.product(batch_size_range, hidden_dim_range)) + large_configs
 all_results = []
+
+# Vendor spec for Intel Arc Pro B60.
+L2_BYTES = 18 * 1024 * 1024
 
 
 def calculate_flops(batch_size, hidden_dim):
@@ -54,8 +65,11 @@ def calculate_effective_bandwidth(
     dtype: torch.dtype,
     time_ms: float,
 ) -> dict:
-    input_bytes = batch_size * hidden_dim * 2 * 4  # [B, 2H] float32
-    output_bytes = batch_size * hidden_dim * 4  # [B, H] float32
+    # Byte counts must follow the tensor dtype. Hardcoding 4 B/element reported
+    # bandwidth 2x too high for every fp16/bf16 run.
+    itemsize = torch.empty((), dtype=dtype).element_size()
+    input_bytes = batch_size * hidden_dim * 2 * itemsize  # [B, 2H]
+    output_bytes = batch_size * hidden_dim * itemsize  # [B, H]
     total_bytes = input_bytes + output_bytes
     time_s = time_ms / 1000.0
     bandwidth_gbs = (total_bytes / 1e9) / time_s if time_s > 0 else 0
@@ -64,9 +78,13 @@ def calculate_effective_bandwidth(
     return {
         "batch_size": batch_size,
         "hidden_dim": hidden_dim,
+        "itemsize": itemsize,
         "input_bytes": input_bytes,
         "output_bytes": output_bytes,
         "total_bytes": total_bytes,
+        # Below this size the working set fits in L2 and bandwidth_gbs is a
+        # cache figure, not a DRAM figure.
+        "l2_resident": total_bytes <= L2_BYTES,
         "bandwidth_gbs": bandwidth_gbs,
         "total_flops": total_flops,
         "gflops": gflops,
@@ -110,6 +128,7 @@ def benchmark_swiglu_alpha_limit(batch_size, hidden_dim, alpha, limit, dtype, pr
             "provider": provider,
             "time_us": 1000 * ms,
             "bandwidth_gbs": bw_metrics["bandwidth_gbs"],
+            "l2_resident": bw_metrics["l2_resident"],
             "total_bytes_mb": bw_metrics["total_bytes"] / 1e6,
             "total_flops_m": bw_metrics["total_flops"] / 1e6,
             "gflops": bw_metrics["gflops"],
@@ -155,9 +174,10 @@ if __name__ == "__main__":
 
     # Print summary statistics per provider
     print("\n" + "=" * 80)
-    print("Summary Statistics by Provider")
+    print("Summary Statistics by Provider (split on L2 residency)")
+    print(f"L2 = {L2_BYTES / 1e6:.0f} MB; l2_resident=True rows are cache bandwidth")
     print("=" * 80)
-    summary = df.groupby("provider").agg(
+    summary = df.groupby(["provider", "l2_resident"]).agg(
         {
             "bandwidth_gbs": ["mean", "min", "max"],
             "time_us": ["mean", "min", "max"],

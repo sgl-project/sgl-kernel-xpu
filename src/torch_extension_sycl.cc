@@ -83,6 +83,21 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("min_p_sampling_from_probs", torch::kXPU, &min_p_sampling_from_probs);
 
   /*
+   * Speculative decoding (EAGLE)
+   */
+  m.def(
+      "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
+      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, "
+      "Tensor! retrive_next_sibling, int topk, int depth, int draft_token_num, int tree_mask_mode=0) -> ()");
+  m.impl("build_tree_kernel_efficient", torch::kXPU, &build_tree_kernel_efficient);
+
+  m.def(
+      "verify_tree_greedy(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
+      "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, "
+      "Tensor retrive_next_sibling, Tensor target_predict) -> ()");
+  m.impl("verify_tree_greedy", torch::kXPU, &verify_tree_greedy);
+
+  /*
    * Fast radix top-k (DeepSeek V3.2 indexer)
    */
   m.def("fast_topk(Tensor score, Tensor lengths, int topk, Tensor? row_starts) -> Tensor");
@@ -194,6 +209,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, "
       "int num_layers, int block_quota, int sgs_per_wg) -> ()");
   m.impl("transfer_kv_all_layer_mla_lf_pf", torch::kXPU, &transfer_kv_all_layer_mla_lf_pf);
+
+  // Mamba HiCache state transfer (single fused copy per page; no K/V split)
+  m.def(
+      "transfer_kv_mamba_pf_lf(Tensor src, Tensor(a!) dst, "
+      "Tensor src_indices, Tensor dst_indices, int layer_id, int item_size, int src_layout_dim) -> ()");
+  m.impl("transfer_kv_mamba_pf_lf", torch::kXPU, &transfer_kv_mamba_pf_lf);
+
+  m.def(
+      "transfer_kv_mamba_lf_pf(Tensor src_layers, Tensor(a!) dst, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, int num_layers) -> ()");
+  m.impl("transfer_kv_mamba_lf_pf", torch::kXPU, &transfer_kv_mamba_lf_pf);
 
 #ifdef USE_MOE
   m.def(

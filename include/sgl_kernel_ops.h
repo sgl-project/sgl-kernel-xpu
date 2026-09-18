@@ -375,6 +375,22 @@ void transfer_kv_all_layer_mla_lf_pf(
     int64_t num_layers,
     int64_t block_quota,
     int64_t sgs_per_wg);
+void transfer_kv_mamba_pf_lf(
+    const at::Tensor& src,
+    at::Tensor& dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim);
+void transfer_kv_mamba_lf_pf(
+    const at::Tensor& src_layers,
+    at::Tensor& dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers);
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void silu_and_mul_clamp(torch::Tensor& out, torch::Tensor& input, double swiglu_limit);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
@@ -945,28 +961,28 @@ void tree_speculative_sampling_target_only(
     int64_t sycl_stream = 0);
 
 void verify_tree_greedy(
-    at::Tensor predicts,          // mutable
-    at::Tensor accept_index,      // mutable
-    at::Tensor accept_token_num,  // mutable
-    at::Tensor candidates,
-    at::Tensor retrive_index,
-    at::Tensor retrive_next_token,
-    at::Tensor retrive_next_sibling,
-    at::Tensor target_predict,
-    int64_t sycl_stream = 0);
+    at::Tensor& predicts,
+    at::Tensor& accept_index,
+    at::Tensor& accept_token_num,
+    const at::Tensor& candidates,
+    const at::Tensor& retrive_index,
+    const at::Tensor& retrive_next_token,
+    const at::Tensor& retrive_next_sibling,
+    const at::Tensor& target_predict);
 
 void build_tree_kernel_efficient(
-    at::Tensor parent_list,
-    at::Tensor selected_index,
-    at::Tensor verified_seq_len,
-    at::Tensor tree_mask,
-    at::Tensor positions,
-    at::Tensor retrive_index,
-    at::Tensor retrive_next_token,
-    at::Tensor retrive_next_sibling,
+    const at::Tensor& parent_list,
+    const at::Tensor& selected_index,
+    const at::Tensor& verified_seq_len,
+    at::Tensor& tree_mask,
+    at::Tensor& positions,
+    at::Tensor& retrive_index,
+    at::Tensor& retrive_next_token,
+    at::Tensor& retrive_next_sibling,
     int64_t topk,
     int64_t depth,
-    int64_t draft_token_num);
+    int64_t draft_token_num,
+    int64_t tree_mask_mode = 0);
 
 void segment_packbits(
     at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr, at::Tensor y, int64_t sycl_stream);

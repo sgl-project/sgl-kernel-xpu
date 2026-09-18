@@ -141,6 +141,8 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer_mla,
     transfer_kv_all_layer_mla_lf_pf,
     transfer_kv_direct,
+    transfer_kv_mamba_lf_pf,
+    transfer_kv_mamba_pf_lf,
     transfer_kv_per_layer,
     transfer_kv_per_layer_direct_pf_lf,
     transfer_kv_per_layer_mla,
@@ -202,6 +204,7 @@ from sgl_kernel.sparse_flash_attn import (
     sparse_attn_varlen_func,
 )
 from sgl_kernel.speculative import (
+    TreeMaskMode,
     build_tree_kernel_efficient,
     segment_packbits,
     tree_speculative_sampling_target_only,

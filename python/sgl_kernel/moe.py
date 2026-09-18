@@ -412,6 +412,79 @@ def _get_moe_ws(
     return cached_view[2]
 
 
+_MOE_BIAS_F32_CACHE_MAX = 256
+_moe_bias_f32_cache: Dict[int, Tuple[torch.Tensor, Optional[int], torch.Tensor]] = {}
+
+
+def _version_or_none(t: torch.Tensor) -> Optional[int]:
+    """`t._version`, or None for tensors that do not have one.
+
+    Tensors created inside `torch.inference_mode()` do not track a version
+    counter and *raise* on `_version` access; sglang loads weights under
+    exactly that (`sglang/srt/utils/common.py` DynamicGradMode,
+    `scheduler_components/weight_updater.py`), so reading `_version`
+    unconditionally would turn this cache into a hard failure on the serving
+    path. Falling back to None leaves object identity as the only guard, which
+    is still correct for the static weights this cache is for."""
+    if t.is_inference():
+        return None
+    return t._version
+
+
+def _bias_as_float32(bias: torch.Tensor) -> torch.Tensor:
+    """Return `bias` promoted to float32, memoized on the source tensor.
+
+    The Xe2 grouped GEMMs accumulate the bias in float32 and take it as a
+    `const std::optional<at::Tensor>& bias  // [E, N] float32` operand
+    (`src/sycl/GroupGemmW4A16Xe20.cpp:191`), so a bf16 bias has to be promoted
+    before the launch. Doing that inline made it a *per-forward* elementwise
+    copy: at gpt-oss-120b decode (tp=4, E=128, I_p=736) the pair of casts is
+    ~21 us of device time per `fused_experts` call — ~11% of the call's entire
+    179 us device time, and second only to the two grouped GEMMs themselves
+    (`benchmark/bench_moe_dispatch_casts.py`). At 36 layers those two casts are
+    72 of the 73 launches/step of
+    `UnrolledElementwiseKernel<CopyScalarFunc<c10::BFloat16>, ..., LoadWithCast<1>,
+    StoreWithCast<1>>` seen in the gpt-oss-120b decode traces; the 73rd is the
+    lm_head logits promotion in
+    `sglang/srt/layers/logits_processor.py` and is not ours to remove.
+
+    Caching is safe because the biases are *static weights*. They arrive here as
+    the MoE layer's `w13_weight_bias` / `w2_weight_bias` parameters
+    (`sglang/srt/layers/quantization/mxfp4.py`, XPU branch), allocated bf16 at
+    `create_weights` and never rewritten by `process_weights_after_loading` on
+    XPU — so every forward promotes byte-identical input to a byte-identical
+    result. Returning the memoized tensor is therefore bit-exact, not merely
+    close. The kernel takes the bias by const reference and never writes it, so
+    handing the same buffer to every call introduces no aliasing.
+
+    Keyed by `id(bias)`, with the entry holding a *strong* reference to the
+    source tensor. That reference is what makes `id()` sound: an id can only be
+    recycled once the object dies, and the cache pins it alive. `data_ptr()`
+    alone would not be safe — the XPU caching allocator recycles addresses, so a
+    freed-then-reallocated tensor could collide with a stale entry.
+
+    The `_version` guard is kept even though these weights are frozen after
+    load. It is a single attribute read guarding against a failure mode that
+    would otherwise be silent (wrong numerics, no error): any in-place mutation
+    of a bias — a weight reload, an in-place quantization rewrite, a test that
+    reuses a tensor — would otherwise be served a stale promotion. Rebinding
+    `layer.w13_weight_bias.data = ...` instead produces a new tensor object and
+    misses the cache outright, which is also correct. The cache is bounded so a
+    caller that churns short-lived bias tensors cannot grow it without limit.
+    """
+    key = id(bias)
+    version = _version_or_none(bias)
+    hit = _moe_bias_f32_cache.get(key)
+    if hit is not None and hit[0] is bias and hit[1] == version:
+        return hit[2]
+    promoted = bias.float()
+    if len(_moe_bias_f32_cache) >= _MOE_BIAS_F32_CACHE_MAX:
+        # Insertion-ordered dict: drop the oldest entry.
+        _moe_bias_f32_cache.pop(next(iter(_moe_bias_f32_cache)))
+    _moe_bias_f32_cache[key] = (bias, version, promoted)
+    return promoted
+
+
 def _should_use_small_moe_prepare(
     num_tokens: int, topk: int, hidden_dims: int, num_experts: int
 ) -> bool:
@@ -701,15 +774,18 @@ def fused_experts(
             b1.dtype == torch.bfloat16 or b1.dtype == torch.float32
         ), "b1 must be bfloat16 or float32"
         if is_xe2_arch() and b1.dtype == torch.bfloat16:
-            # cast b1 to float32, since bias is accumulated in float32 in the kernel
-            b1 = b1.float()
+            # cast b1 to float32, since bias is accumulated in float32 in the
+            # kernel. Memoized on the source tensor: b1 is a static weight, so
+            # this must not be a per-forward copy. See _bias_as_float32.
+            b1 = _bias_as_float32(b1)
     if b2 is not None:
         assert (
             b2.dtype == torch.bfloat16 or b2.dtype == torch.float32
         ), "b2 must be bfloat16 or float32"
         if is_xe2_arch() and b2.dtype == torch.bfloat16:
-            # cast b2 to float32, since bias is accumulated in float32 in the kernel
-            b2 = b2.float()
+            # cast b2 to float32, since bias is accumulated in float32 in the
+            # kernel. Memoized for the same reason as b1 above.
+            b2 = _bias_as_float32(b2)
     # Shape check
     # For packed 4-bit weights the last dim of w1/w2 is halved (2 values per
     # byte), so compute the actual (unpacked) inner dimensions for validation.
@@ -763,8 +839,56 @@ def fused_experts(
     expert_offsets = _get_moe_ws(
         "expert_offsets", (E,), torch.int32, hidden_states.device
     )
-    use_small_prepare = (
-        _should_use_small_moe_prepare(M, TopK, hidden_dims, E) and use_fp8_weight
+    # prepare_moe_input_small does in one kernel what prepare_moe_input +
+    # scatter_tokens_to_experts do in four (per-expert histogram, exclusive
+    # scan, arg-sort, then the token scatter). It also drops
+    # prepare_moe_input's per-call `torch::empty(E + 1)` atomic buffer
+    # (MoEPrepareInputs.cpp:485) and the int64->int32 topk_ids narrowing, since
+    # it dispatches on the index type directly.
+    #
+    # problem_sizes1/problem_sizes2/a_map are the only outputs it does not
+    # produce, and nothing downstream of this branch reads them: the grouped
+    # GEMMs take `expert_offsets` (per-expert row counts) plus the shuffled
+    # activations, and the combine takes `c_map`. That is why the FP8 W8A16
+    # path could already use it, and it is equally true for 4-bit W4A16.
+    #
+    # Enabled here only for a single token, which is decode at concurrency 1.
+    # The kernel is a *one work-group* launch (MoEPrepareInputs.cpp:742), so its
+    # scatter cost grows with num_tokens * TopK * hidden_dims while its grid does
+    # not, and the four-kernel path -- whose scatter uses one work-group per
+    # token -- overtakes it immediately. Measured on one B60 at the GPT-OSS-120b
+    # tp=4 decode shapes (H=2880, I=736, E=128, TopK=4), bookkeeping device
+    # self-time per fused_experts call, four kernels vs one:
+    #
+    #   num_tokens    1      2      4      8     14
+    #   4-kernel  11.77  13.20  12.70  14.42  12.35 us
+    #   fused      6.80  20.63  29.67  28.91  40.72 us
+    #
+    # num_tokens == 1 takes the kernel's own `input_rows_ == 1` fast path, where
+    # the permutation is a sort of TopK elements and the scatter is a broadcast
+    # of one row. Raising this bound needs a multi-work-group prepare kernel,
+    # which cannot be one kernel without a cross-work-group barrier.
+    #
+    # The kernel is bf16-only and needs a contiguous 2-D input
+    # (MoEPrepareInputs.cpp:690-697), so both are gated here rather than left to
+    # its TORCH_CHECKs. The non-4-bit, non-FP8 bf16 grouped GEMM would also
+    # qualify structurally but is not enabled here because it was not measured.
+    #
+    # topk_ids strides are deliberately NOT gated on. The branch below copies a
+    # strided topk_ids contiguous, whereas prepare_moe_input indexes it linearly
+    # over numel and so reads the stride holes -- a strided [1, 4] view of a
+    # [1, 8] buffer makes it count storage elements 0..3 as the routes, and an
+    # out-of-range value in a hole faults the device. Adding an
+    # `is_contiguous()` term here would route those cases back into that, so
+    # don't.
+    use_small_prepare = _should_use_small_moe_prepare(M, TopK, hidden_dims, E) and (
+        use_fp8_weight
+        or (
+            use_4bit_w4a16
+            and M == 1
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+        )
     )
     c_map = _get_moe_ws("c_map", (topk_ids.numel(),), torch.int32, hidden_states.device)
     input_A_shuffle = _get_moe_ws(
@@ -780,6 +904,14 @@ def fused_experts(
             hidden_states, topk_ids_small, expert_offsets, c_map, input_A_shuffle
         )
     else:
+        # int64 -> int32 narrowing. Unlike the bias promotion above this one is
+        # NOT memoizable: topk_ids is routing output and changes every forward.
+        # It is also immaterial. Every topk implementation in
+        # sglang/srt/layers/moe/topk.py already returns int32 ids, so this
+        # branch is normally skipped; when it does fire it costs 2.2 us (decode,
+        # M=1) of device time, i.e. the launch floor rather than traffic. The
+        # only way to remove it would be to teach prepare_moe_input to accept
+        # int64.
         if topk_ids.dtype == torch.long:
             topk_ids_int = _get_moe_ws(
                 "topk_ids_int", topk_ids.shape, torch.int32, hidden_states.device

@@ -36,6 +36,7 @@
 #include <torch/all.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <sycl/sycl.hpp>
 #include <unordered_map>
 
@@ -95,6 +96,13 @@ DECLARE_W4A16_POLICY(w4a16_launch_policy_m_64_n_128)
 DECLARE_W4A16_POLICY(w4a16_launch_policy_m_64_n_128_skip)
 DECLARE_W4A16_POLICY(w4a16_launch_policy_m_64_n_256)
 DECLARE_W4A16_POLICY(w4a16_launch_policy_m_64_n_256_skip)
+DECLARE_W4A16_POLICY(w4a16_launch_policy_m_8_n_128)
+DECLARE_W4A16_POLICY(w4a16_launch_policy_m_8_n_128_skip)
+DECLARE_W4A16_POLICY(w4a16_launch_policy_m_8_n_256)
+DECLARE_W4A16_POLICY(w4a16_launch_policy_m_8_n_256_skip)
+DECLARE_W4A16_POLICY(w4a16_launch_policy_m_8_n_32)
+DECLARE_W4A16_POLICY(w4a16_launch_policy_m_8_n_16)
+DECLARE_W4A16_POLICY(w4a16_launch_policy_m_8_n_64_nobar)
 
 #undef DECLARE_W4A16_POLICY
 #undef DECLARE_W4A16_EXTERN
@@ -134,7 +142,32 @@ at::Tensor& w4a16_atomic_counter(const torch::TensorOptions& options, c10::xpu::
   return it->second;
 }
 
+// Number of entries in DISPATCH_W4A16_POLICY() below, and in the cmake foreach
+// that instantiates them.
+constexpr int kW4A16PolicyCount = 14;
+
+// Debug tile override for the policy A/B in
+// benchmark/bench_moe_w4a16_policy_sweep.py: SGL_W4A16_POLICY_ID=<id> forces one
+// compiled policy for every call, which is the only way to time a tile that
+// select_w4a16_policy_id() would never choose. Read once per process; unset or
+// out of range means no override. Not a production knob -- an m=512 expert on the
+// 8-row tile is correct but very slow.
+int w4a16_policy_override() {
+  static const int forced = [] {
+    const char* env = std::getenv("SGL_W4A16_POLICY_ID");
+    if (env == nullptr || *env == '\0') return -1;
+    char* end = nullptr;
+    const long value = std::strtol(env, &end, 10);
+    if (*end != '\0' || value < 0 || value >= kW4A16PolicyCount) return -1;
+    return static_cast<int>(value);
+  }();
+  return forced;
+}
+
 int select_w4a16_policy_id(int avg_m, int gemm_n, int gemm_k) {
+  const int forced = w4a16_policy_override();
+  if (forced >= 0) return forced;
+
   if (avg_m <= 8) return 0;
   if (avg_m <= 16) return 1;
   if (avg_m <= 32) return 2;
@@ -258,7 +291,11 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
   // The imported kernel resets this persistent work-stealing counter itself.
   // Avoid a separate four-byte memset launch, which is material for decode.
 
-  const int avg_m = total_m / static_cast<int>(n_experts);
+  // Round up: a truncating division reports 0 rows per expert whenever
+  // total_m < n_experts, which is every decode step (4 routed rows over 128
+  // experts). It selects the same tile as a correct 1 -- both take the avg_m <= 8
+  // branch -- so this is a latent bug, not a decode regression.
+  const int avg_m = (total_m + static_cast<int>(n_experts) - 1) / static_cast<int>(n_experts);
   const int policy_id = select_w4a16_policy_id(avg_m, gemm_n, gemm_k);
   const bool is_fp16_act = activations.scalar_type() == at::ScalarType::Half;
 #define LAUNCH_W4A16(Policy)                                                                  \
@@ -357,6 +394,27 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
         break;                                             \
       case 6:                                              \
         LAUNCH_W4A16(w4a16_launch_policy_m_64_n_256_skip); \
+        break;                                             \
+      case 7:                                              \
+        LAUNCH_W4A16(w4a16_launch_policy_m_8_n_128);       \
+        break;                                             \
+      case 8:                                              \
+        LAUNCH_W4A16(w4a16_launch_policy_m_8_n_128_skip);  \
+        break;                                             \
+      case 9:                                              \
+        LAUNCH_W4A16(w4a16_launch_policy_m_8_n_256);       \
+        break;                                             \
+      case 10:                                             \
+        LAUNCH_W4A16(w4a16_launch_policy_m_8_n_256_skip);  \
+        break;                                             \
+      case 11:                                             \
+        LAUNCH_W4A16(w4a16_launch_policy_m_8_n_32);        \
+        break;                                             \
+      case 12:                                             \
+        LAUNCH_W4A16(w4a16_launch_policy_m_8_n_16);        \
+        break;                                             \
+      case 13:                                             \
+        LAUNCH_W4A16(w4a16_launch_policy_m_8_n_64_nobar);  \
         break;                                             \
     }                                                      \
   } while (0)

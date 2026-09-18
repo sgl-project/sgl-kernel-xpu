@@ -19,8 +19,11 @@ SGL_KERNEL_EXPORT std::tuple<int64_t, int64_t> query_device(int64_t device_index
     case syclex::architecture::intel_gpu_bmg_g21:
     case syclex::architecture::intel_gpu_bmg_g31:
       return std::make_tuple(2, 0);
+// Need oneAPI 2026.2 (SYCL version 20260717) or later to support `architecture::intel_gpu_cri`.
+#if defined(__SYCL_COMPILER_VERSION) && __SYCL_COMPILER_VERSION >= 20260717
     case syclex::architecture::intel_gpu_cri:
       return std::make_tuple(3, 5);
+#endif
     // more arch is coming soon
     default:
       throw std::runtime_error("Unsupported XPU architecture.");

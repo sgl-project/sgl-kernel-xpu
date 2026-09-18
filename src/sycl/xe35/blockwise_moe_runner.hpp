@@ -44,6 +44,47 @@ namespace at::native::xpu {
 using GroupedProblemShape = cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>;
 using UnderlyingProblemShapeType = typename GroupedProblemShape::UnderlyingProblemShape;
 
+// Subgroup grid for a workgroup tile: 32 subgroups either way, M taking
+// min(8, BLK_M / atom_M) of them and N the rest.
+//
+// The cap reproduces the 8x4 split the large tiles were tuned with; the divide is
+// what lets BLK_M go below 8 atoms at all. A fixed 8x4 forces BLK_M >= 64, so a
+// decode expert with one routed row pads its MMA 64x. It also cuts the dominant
+// redundancy: B is reloaded once per row of subgroups, so 2x16 fetches each B
+// slice twice instead of eight times, and only tiny A pays the reverse.
+template <class TileShape, class MmaAtom>
+struct MoeSubgroupLayout {
+  using AtomShape = typename MmaAtom::Shape_MNK;
+  static constexpr int kAtomM = cute::size<0>(AtomShape{});
+  static constexpr int kAtomN = cute::size<1>(AtomShape{});
+
+  static constexpr int kBlkM = cute::size<0>(TileShape{});
+  static constexpr int kBlkN = cute::size<1>(TileShape{});
+
+  static constexpr int kSubgroups = 32;
+  static constexpr int kMaxAlongM = 8;
+
+  static constexpr int M = kBlkM / kAtomM < kMaxAlongM ? kBlkM / kAtomM : kMaxAlongM;
+  static constexpr int N = kSubgroups / M;
+
+  static_assert(M >= 1, "BLK_M must be at least the MMA atom's M");
+  static_assert(kBlkM % (kAtomM * M) == 0, "BLK_M must tile evenly over the M subgroups");
+  static_assert(kBlkN % (kAtomN * N) == 0, "BLK_N must tile evenly over the N subgroups");
+  // Accumulators are fp32 whatever the input format, and live across the whole
+  // K-loop, so they set the tile ceiling: one GRF per subgroup lane per float,
+  // 256 GRF per thread. IGC spill sizes measured on CRI track this exactly —
+  // 128 GRF of accumulator costs 1.3-8.6 KB of spill, 256 costs ~12 KB and 512
+  // costs 27-61 KB. 128 is the last usable step, which caps a 32-subgroup
+  // workgroup tile at 65,536 elements however it is shaped.
+  static constexpr int kAccumGrf = (kBlkM / M) * (kBlkN / N) / 16;
+  static_assert(kAccumGrf <= 128,
+                "Workgroup tile's fp32 accumulator exceeds half the GRF budget");
+
+  // N-major, the warp-layout convention for CuTe's Xe MMA atoms.
+  using type = cute::Layout<cute::Shape<cute::Int<M>, cute::Int<N>, cute::_1>,
+                            cute::Stride<cute::Int<N>, cute::_1, cute::_0>>;
+};
+
 // The epilogue writes ElementOutput, so the caller's tensor has to match it
 // exactly; a mismatch would reinterpret the store, not convert it.
 template <typename T> struct TorchScalarTypeOf;

@@ -61,14 +61,13 @@ struct BlockScaledMoETypes {
   using GmemTiledCopyScaleA = void;
   using GmemTiledCopyScaleB = void;
 
-  using TileShape    = TileShape_;
-  using ThreadLayout = cute::Layout<cute::Shape<cute::_8, cute::_4, cute::_1>,
-                                    cute::Stride<cute::_4, cute::_1, cute::_0>>;
+  using TileShape = TileShape_;
+  using MmaAtom   = cute::MMA_Atom<cute::XE_BDPAS_TT<8, float, ElementInputA>>;
 
   using TiledMma = typename cute::TiledMMAHelper<
-      cute::MMA_Atom<cute::XE_BDPAS_TT<8, float, ElementInputA>>,
+      MmaAtom,
       cute::Layout<TileShape>,
-      ThreadLayout>::TiledMMA;
+      typename MoeSubgroupLayout<TileShape, MmaAtom>::type>::TiledMMA;
 
   // Stages>2 exceeds L1 residency for these tile sizes on Xe3P CRI; a simulator
   // sweep showed +47% LSC bytes and +22% runtime at Stages=3.
@@ -137,13 +136,18 @@ using FP8TypesT = BlockScaledMoETypes<
     /* BlockSize    = */ 128,
     ElementOutput_>;
 
+// Decode's BLK_M=16 is as low as it goes: one DPAS atom of M=8, two subgroups deep.
+// 32 subgroups times 128 fp32 accumulator GRF caps a workgroup tile at 65,536
+// elements, so 256x256 is the largest shape that fits and prefill has no bigger tile
+// to reach for — 512x512 spilled 60 KB.
+//
 // Templated on the output element so the dtype fan-out is one branch at the entry
 // point and the bucket shapes stay written once.
 template <typename ElementOutput_>
 struct FP8TilePolicy {
-  using Decode  = FP8TypesT<Shape<_128, _256, _32>, ElementOutput_>;
+  using Decode  = FP8TypesT<Shape<_16, _256, _32>, ElementOutput_>;
   using Step    = FP8TypesT<Shape<_256, _256, _32>, ElementOutput_>;
-  using Prefill = FP8TypesT<Shape<_512, _512, _32>, ElementOutput_>;
+  using Prefill = Step;
 
   // Bucket-independent, so any member answers for it.
   static constexpr int BlockSize = Step::BlockSize;
@@ -162,11 +166,12 @@ using MXFP8TypesT = BlockScaledMoETypes<
     32,
     ElementOutput_>;
 
+// Same GRF ceiling as FP8 above; 512x512 spilled 33 KB.
 template <typename ElementOutput_>
 struct MXFP8TilePolicy {
-  using Decode  = MXFP8TypesT<Shape<_128, _256, _64>, ElementOutput_>;
+  using Decode  = MXFP8TypesT<Shape<_16, _256, _64>, ElementOutput_>;
   using Step    = MXFP8TypesT<Shape<_256, _256, _64>, ElementOutput_>;
-  using Prefill = MXFP8TypesT<Shape<_512, _512, _64>, ElementOutput_>;
+  using Prefill = Step;
 
   static constexpr int BlockSize = Step::BlockSize;
 };

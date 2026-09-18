@@ -60,15 +60,12 @@ struct MXFP4TypesT {
   using GmemTiledCopyScaleB = void;
 
   using TileShape = TileShape_;
-
-  // Thread layout (8×4 SG tiling, n-major)
-  using ThreadLayout = cute::Layout<Shape<_8, _4, _1>, cute::Stride<_4, _1, _0>>;
-
+  using MmaAtom   = MMA_Atom<XE_BDPAS_TT<8, float, ElementInputA>>;
 
   using TiledMma = typename TiledMMAHelper<
-      MMA_Atom<XE_BDPAS_TT<8, float, ElementInputA>>,
+      MmaAtom,
       cute::Layout<TileShape>,
-      ThreadLayout>::TiledMMA;
+      typename MoeSubgroupLayout<TileShape, MmaAtom>::type>::TiledMMA;
 
   // Mainloop dispatch (integer GroupSize → MXFP specialization)
   static constexpr int PipelineStages = 2;
@@ -125,16 +122,19 @@ struct MXFP4TypesT {
   using StrideD = typename Gemm::GemmKernel::InternalStrideD;
 };
 
-// N_TILE=512 works here because 4-bit A/B packing halves per-stage L1 pressure
-// vs MXFP8. K_TILE=64 fixed (SG_K>=32, mainloop needs 2 K-slices).
+// Shapes mirror MXFP8, including the 256x256 ceiling from the accumulator GRF
+// budget — 4-bit packing halves the operand footprint but the accumulator is fp32
+// either way, so the wider N_TILE=512 this used to run at step spilled 12 KB.
+// Prefill has no bigger tile left to reach for. K_TILE=64 fixed (SG_K>=32,
+// mainloop needs 2 K-slices).
 //
 // Templated on the output element so the dtype fan-out is one branch at the entry
 // point and the bucket shapes stay written once.
 template <typename ElementOutput_>
 struct MXFP4TilePolicy {
-  using Decode  = MXFP4TypesT<Shape<_128, _512, _64>, ElementOutput_>;
-  using Step    = MXFP4TypesT<Shape<_256, _512, _64>, ElementOutput_>;
-  using Prefill = MXFP4TypesT<Shape<_512, _512, _64>, ElementOutput_>;
+  using Decode  = MXFP4TypesT<Shape<_16, _512, _64>, ElementOutput_>;
+  using Step    = MXFP4TypesT<Shape<_256, _256, _64>, ElementOutput_>;
+  using Prefill = Step;
 
   // Bucket-independent, so any member answers for it.
   static constexpr int BlockSize = Step::BlockSize;

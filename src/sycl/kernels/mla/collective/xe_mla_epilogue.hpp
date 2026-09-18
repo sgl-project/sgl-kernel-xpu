@@ -50,7 +50,7 @@ template <
     class CollectiveMainloop,
     class TileShapeO_,
     class TensorO_,
-    class TiledCopyO_,  // Optional TiledCopy for storing O (void => default)
+    class TiledCopyO_,  // TiledCopy for storing O (void => default)
     class TensorLSE_>  // Global softmax-LSE tensor: (q, head, batch)
 class XeMlaEpilogue {
  public:
@@ -66,8 +66,6 @@ class XeMlaEpilogue {
   using TensorO2D = decltype(TensorO_{}(append<rank_v<TensorO_>>(make_coord(_, _), 0)));
   using ElementO = typename TensorO_::value_type;
 
-  // LSE is sliced down to the (q) mode for one (head, batch) pair, exactly like
-  // O is sliced down to (q,v) -- see TensorO2D.
   using TensorLSE = TensorLSE_;
   using TensorLSE1D = decltype(TensorLSE_{}(make_coord(_, 0, 0)));
   using ElementLSE = typename TensorLSE_::value_type;
@@ -158,7 +156,7 @@ class XeMlaEpilogue {
       FragARow& tA_sum,           // Softmax row-wise sum accumulator
       QVCoord blk_qv,             // WG tile indices: (Q,V)
       int thr_id,                 // Work-item ID
-      TensorLSE1D const& gLSE) {  // Global LSE tensor for this (head,batch): (q)
+      TensorLSE1D const& gLSE) {  // Global LSE: (q)
     using namespace cute;
     using ElementA = typename FragA::element_type;
 
@@ -168,8 +166,7 @@ class XeMlaEpilogue {
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
 
-    /* Tile output. cO/gO are identity tensors, so tOgO exposes the (q,v)
-       coordinate of each output fragment element. */
+    /* Tile output */
     Tensor cO = make_identity_tensor(O.shape());       // (q,v)
     Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);  // (q,v)
 
@@ -180,10 +177,7 @@ class XeMlaEpilogue {
     auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
     auto tOgO = thr_copy_o.partition_D(gO);
 
-    /* Emit LSE while the softmax sums are still the raw denominators. A null gLSE
-       pointer is the caller's request to skip it; the kernel layer keeps the
-       pointer exactly null in that case (it never offsets a null base), so this
-       test is the whole gate. */
+    /* Emit LSE while rA_sum is still the raw denominator. */
     if (raw_pointer_cast(gLSE.data()) != nullptr) {
       write_lse(rA, rA_sum, rA_max, tOrO, tOgO, cO, blk_qv, thr_id, gLSE);
     }
@@ -204,52 +198,25 @@ class XeMlaEpilogue {
     copy(copy_o, tOrO, tOgO);
   }
 
-  /// Write the per-row log2-domain log-sum-exp of the attention scores.
-  ///
-  /// The mainloop keeps softmax state in the log2 domain with sm_scale already
-  /// folded into the logits, so rA_max is log2(e) * (scaled row max) and
-  /// rA_sum(row) = sum_j exp2(logit_j - rA_max(row)). The LSE is emitted in that
-  /// same log2 domain, so no base conversion is applied:
-  ///     lse = log2(sum_j exp2(logit_j)) = rA_max + log2(rA_sum)
-  /// (Multiply by ln(2) to get the natural-log log-sum-exp.)
-  /// Rows attending to no unmasked key have rA_sum == 0 and emit -INFINITY.
-  ///
-  /// Either way the store lands at the v == 0 column so each query row is
-  /// written exactly once, but the coordinate source depends on ReduceK:
-  ///
-  ///   ReduceK == 1 (prefill): rA is the raw PV accumulator, so coordinates come
-  ///     from TiledMMAPV's partition_C of the identity tile and the LSE is stored
-  ///     directly out of row space.
-  ///   ReduceK > 1 (decode): rA is the cross-subgroup reduced fragment, whose
-  ///     mapping partition_C does not describe, so the coordinates come from the
-  ///     output copy's tOgO, which indexes elements in rA's own order.
-  ///
-  /// The two paths write identical values; the first just scans one V sub-tile of
-  /// rA instead of all VTiles.
-  ///
-  /// Reached only when gLSE holds a non-null pointer; the caller (operator()
-  /// above) gates the call on that. The softmax statistics themselves are
-  /// computed by the mainloop either way -- they are what normalizes O -- so
-  /// skipping the LSE skips only this store and the row-wise log2 above it.
+  /// Write the per-row log-sum-exp, in the log2 domain the softmax state already
+  /// uses: lse = rA_max + log2(rA_sum). No unmasked keys (rA_sum == 0) => -INFINITY.
+  /// Only the v == 0 column stores, so each query row is written once.
   template <class RedFragA, class RedFragARow, class FragO, class CoordO, class CoordFull, class QVCoord>
   CUTLASS_DEVICE void write_lse(
       RedFragA const& rA,         // Reduced O accumulator: (q,v)
       RedFragARow const& rA_sum,  // Reduced softmax row-wise sum
       RedFragARow const& rA_max,  // Reduced softmax row-wise max (log2 domain)
-      FragO const& tOrO,          // Output fragment (TV-layout witness only, ReduceK > 1)
-      CoordO const& tOgO,         // Output coordinates: (q,v) per element (ReduceK > 1 only)
+      FragO const& tOrO,          // Output fragment (TV-layout witness, ReduceK > 1)
+      CoordO const& tOgO,         // Output coordinates: (q,v), ReduceK > 1
       CoordFull const& cO,        // Identity tensor over the whole O: (q,v)
       QVCoord blk_qv,             // WG tile indices: (Q,V)
       int thr_id,                 // Work-item ID
-      TensorLSE1D const& gLSE) {  // Global LSE tensor for this (head,batch): (q)
+      TensorLSE1D const& gLSE) {  // Global LSE: (q)
     using namespace cute;
 
-    /* Only the first V tile owns the LSE row (V is not split for MLA, but keep
-       the guard so a future V-split cannot double-write). */
+    /* V is not split for MLA; guard against a future V-split double-writing. */
     if (int(get<1>(blk_qv)) != 0) return;
 
-    /* Combine the row-wise statistics into the LSE while still in row space, so
-       only one value per query row is computed. */
     auto row_lse = rA_sum;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < rA_sum.size(); i++) {
@@ -257,28 +224,16 @@ class XeMlaEpilogue {
       row_lse(i) = ElementA((d > 0.f) ? (float(rA_max(i)) + sycl::log2(d)) : -INFINITY);
     }
 
-    /* Rows past the tensor's Q extent (the padding rows of a partial Q tile) are
-       skipped: unlike the 2D block store used for O, these scalar stores are not
-       bounds-clamped, and in the ragged prefill layout they would land on the
-       next request's rows. */
+    /* Unlike O's block store these are not bounds-clamped, so a partial Q tile's
+       padding rows are skipped. */
     int num_rows = int(size<0>(gLSE));
 
     if constexpr (ReduceK{} == _1{}) {
-      /* reduce_A() was a no-op, so rA is the raw PV accumulator and the MMA's own
-         partitioning of the identity tile gives each accumulator element its
-         global (q,v) coordinate -- the same idiom the mainloop uses to locate
-         fragment elements for causal masking. The LSE is then stored straight out
-         of row space: no per-element broadcast fragment, no second O-sized
-         fragment, and no reorder into output-element space.
-
-         Only the first V sub-tile can hold column v == 0, so the scan covers
-         rA(_,_,_,0) rather than all VTiles of rA. Flat index i into that sub-tile
-         pairs with broadcast<0>(row_lse, rA, i) against the full fragment, which
-         is the convention the mainloop's per-VTile rescale uses. */
+      /* rA is the raw PV accumulator; the MMA's partitioning of the identity tile
+         gives each element its (q,v). Only the first V sub-tile holds v == 0. */
       static_assert(
           get<0>(TileShapeO{}) == get<0>(TileShapePV{}),
-          "blk_qv's Q index is in TileShapeO units, but the identity tile below is cut to TileShapePV's Q extent; "
-          "the two must agree or the LSE rows are offset");
+          "blk_qv is in TileShapeO units but the identity tile below is cut to TileShapePV's Q extent");
       TiledMMAPV mma_pv{};
       Tensor gPV = local_tile(cO, take<0, 2>(TileShapePV{}), make_coord(get<0>(blk_qv), _0{}));
       auto cArA = mma_pv.get_slice(thr_id).partition_C(gPV);
@@ -292,20 +247,13 @@ class XeMlaEpilogue {
         gLSE(row) = static_cast<ElementLSE>(broadcast<0>(row_lse, rA, i));
       }
     } else {
-      /* rA is the SLM-reduced fragment (ReduceFragA), whose element -> (q,v)
-         mapping is the sA_coords remap in reduce_A(), not the MMA's partition_C.
-         tOgO carries that mapping: TiledCopyO is built from ReduceFragA's own TV
-         layout (see default_tiled_copy_O_helper()), so the output fragment holds
-         rA's elements in rA's order -- operator()'s reorder(rA, tOrO) is there for
-         the output type conversion, not for a permutation. The assert below pins
-         that down, and with it the LSE is broadcast straight out of row space at
-         the same flat index: no reorder, and no O-sized LSE fragments. */
+      /* rA is the SLM-reduced fragment, remapped by reduce_A(); tOgO carries that
+         mapping, so one flat index serves both. */
       static_assert(
           is_same_v<
               remove_cvref_t<decltype(coalesce(tOrO.tv_layout()))>,
               remove_cvref_t<decltype(coalesce(rA.tv_layout()))>>,
-          "tOgO's element order is rA's only while the output fragment walks the tile the way rA does; if the two "
-          "diverge, the LSE has to be broadcast across an rA-shaped fragment and reorder()ed into output space again");
+          "tOgO indexes elements in rA's order only while the output fragment walks the tile the way rA does");
 
       CUTLASS_PRAGMA_UNROLL
       for (int j = 0; j < int(rA.size()); j++) {

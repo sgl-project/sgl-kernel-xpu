@@ -36,11 +36,6 @@
 
 namespace mla_decode {
 
-// The softmax-LSE output is not part of the instantiation: an absent `lse` leaves
-// KernelArguments::LSE null and the epilogue tests that pointer, so one kernel
-// serves both callers. Only (dtype, page size) select a translation unit, which --
-// crossed with the split-KV dispatch inside runMla() -- puts two kernels here.
-
 __attribute__((visibility("default"))) void launch_mla_decode_@ELEM_TAG@_@PAGE_SIZE@(
     at::Tensor& out,
     const std::optional<at::Tensor>& lse,
@@ -62,8 +57,7 @@ __attribute__((visibility("default"))) void launch_mla_decode_@ELEM_TAG@_@PAGE_S
 #ifdef SGL_MLA_JIT_ENTRY
 // Stable C ABI entry for the runtime-JIT path. Tensors cross the dlopen boundary
 // as at::Tensor* (both sides share <torch/all.h> -> identical layout). One config
-// (@ELEM_TAG@,@PAGE_SIZE@) per .so, so the fixed symbol name never collides across
-// AOT translation units.
+// per .so, so the fixed symbol name never collides across AOT TUs.
 extern "C" __attribute__((visibility("default"))) void sgl_mla_decode_entry(
     void* out,
     const void* lse,  // const std::optional<at::Tensor>*

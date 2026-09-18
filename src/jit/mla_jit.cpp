@@ -32,8 +32,7 @@ bool check_config(const char* op_label, std::string* err) {
 using DecodeFn =
     void (*)(void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, double, int64_t);
 
-// The LSE is a runtime argument, not part of the config, so unlike `sink` in
-// pack_sparse_key() below it does not key the in-process cache or the module name.
+// `lse` is a runtime argument, so it does not key the cache or the module name.
 uint64_t pack_decode_key(int arch, bool is_fp16, int page_size) {
   uint64_t k = static_cast<uint64_t>(arch) & 0xFF;
   k = (k << 16) | (static_cast<uint64_t>(page_size) & 0xFFFF);

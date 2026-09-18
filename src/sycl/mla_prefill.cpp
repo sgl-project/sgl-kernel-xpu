@@ -96,22 +96,8 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
 // MUST be 0 for any shippable build.
 #define MLA_FORCE_DISPATCH 0
 
-// Four-stage dispatch ladder. Each rung resolves ONE runtime value to a compile-time
-// token and is named for the value it switches on (like DISPATCH_MLA_SPARSE_SINK):
-//
-//   DISPATCH_MLA_PREFILL_BUCKET   -> BUCKET  (Q-tile bucket; small/medium/large)
-//     DISPATCH_MLA_PREFILL_DTYPE    -> ELEM    (in_dtype; half/bf16)
-//       DISPATCH_MLA_PREFILL_PAGE_SIZE -> PS   (kv_c_and_k_pe_cache.size(1))
-//         DISPATCH_MLA_PREFILL_LAUNCH -> the generated launcher call
-//
-// The rungs are defined bottom-up below, so DISPATCH_MLA_PREFILL_BUCKET is last.
-//
-// The switches are load-bearing, not stylistic: the leaf pastes these three tokens into
-// the launcher's name, so each value must be a literal before it is reached. `lse` is
-// not a rung -- it is forwarded as-is and an absent one makes the epilogue skip the
-// store at runtime. Full expansion is 3 BUCKET x 2 ELEM x 4 PS = 24 call sites, which is
-// exactly the symbol set MlaPrefillXe20.cmake generates and mla_prefill_dispatch.hpp
-// declares -- the three must stay in lockstep or the TU fails to link.
+// Dispatch ladder, bottom-up: BUCKET, then DTYPE, then PAGE_SIZE. The leaf pastes
+// all three tokens into the launcher's name, so each must be a literal there.
 #define DISPATCH_MLA_PREFILL_LAUNCH(ELEM, PS, BUCKET)          \
   mla_prefill::launch_mla_prefill_##ELEM##_##PS##_##BUCKET(    \
       out,                                                     \
@@ -162,10 +148,6 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
     }                                                                      \
   } while (0)
 
-// Outermost rung: resolve the Q-tile bucket enum to its compile-time token. `bucket` is
-// a local of flash_mla_prefill() (chosen by the (Q,K) predicate or MLA_FORCE_DISPATCH),
-// so this macro is only expandable inside that function -- as with every rung below it,
-// which likewise read the caller's locals.
 #define DISPATCH_MLA_PREFILL_BUCKET()       \
   do {                                      \
     switch (bucket) {                       \
@@ -185,11 +167,10 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
 
 /// @brief Dispatch kernel for MLA prefill with varlen/ragged Q and causal mask.
 ///
-/// `lse` is an output (schema: `Tensor(b!)? lse`) yet is taken by const
-/// reference; see the explanation on flash_mla_decode() in mla_decode.cpp.
+/// `lse` is an output taken by const ref; see flash_mla_decode() in mla_decode.cpp.
 SGL_KERNEL_EXPORT void flash_mla_prefill(
     at::Tensor& out,                        // (total_q, num_heads, latent_dim)
-    const std::optional<at::Tensor>& lse,   // (total_q, num_heads) fp32, softmax LSE (log2 domain); nullopt = skip
+    const std::optional<at::Tensor>& lse,   // (total_q, num_heads) fp32, log2 domain; nullopt = skip
     const at::Tensor& q_nope,               // (total_q, num_heads, latent_dim)
     const at::Tensor& q_pe,                 // (total_q, num_heads, rope_dim)
     const at::Tensor& kv_c_and_k_pe_cache,  // (total_pages, page_size, latent_dim + rope_dim)
@@ -228,10 +209,8 @@ SGL_KERNEL_EXPORT void flash_mla_prefill(
       ". Supported: 16, 32, 64, 128");
   TORCH_CHECK(q_nope.dim() == 3, "q_nope must be 3D (total_q, num_heads, dim), got ", q_nope.dim());
   TORCH_CHECK(q_pe.dim() == 3, "q_pe must be 3D (total_q, num_heads, dim), got ", q_pe.dim());
-  // The softmax statistics are computed either way; passing an LSE tensor is
-  // what asks for them to be written out. Unlike `out`, it needs no Q-tile
-  // padding: the epilogue's scalar LSE stores are bounded by the per-request Q
-  // length.
+  // Unlike `out`, the LSE needs no Q-tile padding: its stores are bounded by
+  // the per-request Q length.
   if (lse.has_value()) {
     CHECK_INPUT(lse.value());
     TORCH_CHECK(lse->scalar_type() == at::ScalarType::Float, "lse must be float32, got ", lse->scalar_type());

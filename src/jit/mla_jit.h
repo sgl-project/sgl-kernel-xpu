@@ -14,14 +14,12 @@ namespace sgl {
 namespace mla_jit {
 
 // Launch MLA decode for (query dtype, page size). Tensor args are at::Tensor*
-// passed as void*. Whether the LSE is emitted is not part of the config: a nullopt
-// `lse` makes the epilogue skip the store at runtime, unlike has_attn_sink for the
-// sparse kernels below. Returns true on success; fills *err on failure.
+// passed as void*. Returns true on success; fills *err on failure.
 bool mla_decode_launch(
     bool is_fp16,
     int page_size,
     void* out,
-    const void* lse,  // const std::optional<at::Tensor>*; nullopt = skip the LSE
+    const void* lse,  // const std::optional<at::Tensor>*; nullopt = skip
     const void* q_nope,
     const void* q_pe,
     const void* kv_c_and_k_pe_cache,
@@ -34,14 +32,14 @@ bool mla_decode_launch(
     std::string* err = nullptr);
 
 // Launch MLA prefill for (query dtype, page size). `bucket` selects the Q-tile
-// variant (0=small, 1=medium, 2=large) at runtime, and so does the LSE: a nullopt
-// `lse` makes the epilogue skip the store. Tensor args are at::Tensor* as void*.
+// variant (0=small, 1=medium, 2=large) at runtime. Tensor args are at::Tensor* as
+// void*.
 bool mla_prefill_launch(
     bool is_fp16,
     int page_size,
     int bucket,
     void* out,
-    const void* lse,  // const std::optional<at::Tensor>*; nullopt = skip the LSE
+    const void* lse,  // const std::optional<at::Tensor>*; nullopt = skip
     const void* q_nope,
     const void* q_pe,
     const void* kv_c_and_k_pe_cache,

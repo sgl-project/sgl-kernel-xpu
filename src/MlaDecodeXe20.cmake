@@ -1,6 +1,6 @@
 # Generate MLA decode kernel instantiation files.
-# Each (ELEM_TAG, PAGE_SIZE) combination is compiled as a separate library to
-# parallelize and speed up compilation.
+# Each (ELEM_TAG, PAGE_SIZE) combination is compiled as a separate
+# library to parallelize and speed up compilation.
 
 set(MLA_DECODE_ELEM_TAGS half bf16)
 set(MLA_DECODE_ELEM_SYCL_TYPES "sycl::half" "sycl::ext::oneapi::bfloat16")

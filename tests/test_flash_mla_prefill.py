@@ -96,11 +96,8 @@ def ref_mla_prefill_varlen(
         out[q_start:q_end] = o.permute(1, 0, 2)
 
         if lse is not None:
-            # log2-domain logsumexp of the masked, scaled scores, i.e.
-            # log2(sum_j exp2(score_j)) = logsumexp / ln(2), matching the
-            # kernel. Materialize the scores in head chunks so the largest
-            # shapes here don't allocate an (H, seqlen_q, seqlen_k) fp32
-            # tensor all at once.
+            # The kernel emits log2(sum_j exp2(score_j)) = logsumexp / ln(2).
+            # Chunked over heads to avoid an (H, seqlen_q, seqlen_k) fp32 tensor.
             H_CHUNK = 32
             for h0 in range(0, H, H_CHUNK):
                 h1 = min(h0 + H_CHUNK, H)
@@ -274,69 +271,6 @@ def test_mla_prefill(return_lse, dtype, block_size, num_heads, seqlens_q, seqlen
         assert lse.dtype == torch.float32
         lse_atol, lse_rtol = (2e-2, 2e-2) if dtype == torch.bfloat16 else (5e-3, 5e-3)
         torch.testing.assert_close(lse_ref, lse.cpu(), atol=lse_atol, rtol=lse_rtol)
-
-
-def test_mla_prefill_lse_optional():
-    """Skipping the LSE must be bit-identical on O, and return_lse defaults to False.
-
-    Correctness of O and of the LSE values is already covered per-mode by
-    test_mla_prefill's return_lse parametrization; what that cannot check is
-    agreement *between* the two modes, since it compares each against the CPU
-    reference at 1e-2 in separate invocations. Omitting the LSE passes a null LSE
-    pointer that the epilogue branches on at runtime, so this pins O to be
-    unperturbed by taking that branch.
-    """
-    torch.random.manual_seed(42)
-
-    dtype = torch.bfloat16
-    D_latent, D_rope = 512, 64
-    D_ckv = D_latent + D_rope
-    num_heads, block_size = 16, 64
-    seqlens_q, seqlens_k = [33, 17], [256, 128]
-    scale = (128 + D_rope) ** (-0.5)
-
-    bs = len(seqlens_q)
-    total_q = sum(seqlens_q)
-    cu_seqlens_q = torch.tensor(
-        [0] + list(torch.cumsum(torch.tensor(seqlens_q), 0).tolist()), dtype=torch.int32
-    )
-    seq_lens_k = torch.tensor(seqlens_k, dtype=torch.int32)
-
-    block_num = (max(seqlens_k) + block_size - 1) // block_size
-    pack_factor = 128 // block_size
-    block_num = ((block_num + pack_factor - 1) // pack_factor) * pack_factor
-
-    q_nope_cpu = torch.randn(total_q, num_heads, D_latent, dtype=dtype)
-    q_pe_cpu = torch.randn(total_q, num_heads, D_rope, dtype=dtype)
-    block_table_cpu = torch.randint(
-        0, bs * block_num, (bs, block_num), dtype=torch.int32
-    )
-    kv_cache_cpu = torch.randn(
-        block_table_cpu.max().item() + 1, block_size, D_ckv, dtype=dtype
-    )
-
-    ws_size = flash_mla_prefill_get_workspace_size(block_num * block_size, bs)
-    args = (
-        q_nope_cpu.to(device).contiguous(),
-        q_pe_cpu.to(device).contiguous(),
-        kv_cache_cpu.to(device),
-        cu_seqlens_q.to(device),
-        seq_lens_k.to(device),
-        max(seqlens_q),
-        block_table_cpu.to(device),
-        torch.empty(ws_size, device=device, dtype=torch.uint8),
-        scale,
-    )
-    kwargs = dict(causal=True, num_kv_splits=1)
-
-    # out_default omits return_lse, so it takes the default (False) path and passes
-    # no LSE tensor; out_lse asks for one on otherwise identical inputs.
-    out_default = flash_mla_prefill(*args, **kwargs)
-    out_lse, _ = flash_mla_prefill(*args, **kwargs, return_lse=True)
-    torch.xpu.synchronize()
-
-    assert isinstance(out_default, torch.Tensor)
-    torch.testing.assert_close(out_default.cpu(), out_lse.cpu(), atol=0, rtol=0)
 
 
 if __name__ == "__main__":

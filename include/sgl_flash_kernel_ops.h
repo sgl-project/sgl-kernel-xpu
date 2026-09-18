@@ -86,7 +86,7 @@ void mha_fwd(
 
 void flash_mla_decode(
     torch::Tensor& out,
-    const std::optional<torch::Tensor>& lse,  // (batch, num_heads) fp32, or nullopt to skip the LSE
+    const std::optional<torch::Tensor>& lse,  // (batch, num_heads) fp32; nullopt = skip
     const torch::Tensor& q_nope,
     const torch::Tensor& q_pe,
     const torch::Tensor& kv_c_and_k_pe_cache,
@@ -117,7 +117,7 @@ void flash_mla_sparse_decode(
 
 void flash_mla_prefill(
     torch::Tensor& out,
-    const std::optional<torch::Tensor>& lse,  // (total_q, num_heads) fp32, or nullopt to skip the LSE
+    const std::optional<torch::Tensor>& lse,  // (total_q, num_heads) fp32; nullopt = skip
     const torch::Tensor& q_nope,
     const torch::Tensor& q_pe,
     const torch::Tensor& kv_c_and_k_pe_cache,

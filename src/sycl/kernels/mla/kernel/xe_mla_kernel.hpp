@@ -102,8 +102,6 @@ class XeMlaFwdKernel {
   using ElementO = typename CollectiveEpilogue::TensorO::element_type;
   using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
 
-  // Softmax LSE output, laid out like O with the head-size mode dropped:
-  // (seq_q, num_heads_q, batch).
   using TensorLSE = typename CollectiveEpilogue::TensorLSE;
   using ElementLSE = typename TensorLSE::element_type;
   using StrideLSE = decltype(stride(TensorLSE{}));
@@ -149,9 +147,7 @@ class XeMlaFwdKernel {
     ElementO* O = nullptr;
     StrideO dO{};
 
-    // Softmax log-sum-exp output (log2 domain), (seq_q, num_heads_q, batch).
-    // Null means the caller did not ask for the LSE, and the epilogue skips the
-    // store; nothing below ever offsets a null base pointer.
+    // Softmax LSE (log2 domain), (seq_q, num_heads_q, batch). Null => skip.
     ElementLSE* LSE = nullptr;
     StrideLSE dLSE_out{};
 
@@ -295,12 +291,7 @@ class XeMlaFwdKernel {
         dO_ptr += o_offset;
       }
 
-      // LSE base pointer for this (head, batch) -- and for prefill, this request's
-      // Q rows. A null p.LSE is the caller's request to skip the LSE: leave the
-      // pointer exactly null (never offset it) so the epilogue's null check is a
-      // reliable gate, then hand the epilogue a 1D (q) view either way. Unlike O,
-      // whose (head, batch) modes are sliced off inside the epilogue, the slice is
-      // folded into the pointer here so no arithmetic is applied to the null case.
+      // Sliced into the pointer, not in the epilogue, so a null base stays null.
       auto dLSE_ptr = p.LSE;
       if (dLSE_ptr != nullptr) {
         int64_t lse_offset = static_cast<int64_t>(head_coord) * static_cast<int64_t>(get<1>(p.dLSE_out)) +
@@ -436,8 +427,6 @@ class XeMlaSplitKVKernel {
   using ElementO = typename CollectiveEpilogue::TensorO::element_type;
   using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
 
-  // Softmax LSE output, (seq_q, num_heads_q, batch). Written by the reduction
-  // kernel, which merges this kernel's per-split exp_sums/max_logits.
   using TensorLSE = typename CollectiveEpilogue::TensorLSE;
   using ElementLSE = typename TensorLSE::element_type;
   using StrideLSE = decltype(stride(TensorLSE{}));
@@ -496,8 +485,7 @@ class XeMlaSplitKVKernel {
     ElementO* O = nullptr;
     StrideO dO{};
 
-    // Final softmax log-sum-exp output (log2 domain), forwarded to the
-    // reduction kernel. Null means the caller did not ask for the LSE.
+    // Written by the reduction kernel. Null => skip.
     ElementLSE* LSE = nullptr;
     StrideLSE dLSE_out{};
 

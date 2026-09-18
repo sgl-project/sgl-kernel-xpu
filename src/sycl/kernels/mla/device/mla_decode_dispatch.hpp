@@ -49,13 +49,6 @@ namespace mla_decode {
 // Parameters:
 //   ELEM_TAG  in {half, bf16}
 //   PAGE_SIZE in {16, 32, 64, 128}
-//
-// Whether the softmax log-sum-exp is emitted is not an axis here: `lse` is passed
-// through and an absent one makes the epilogue skip the store at runtime.
-//
-// The 8 symbols below are exactly the set MlaDecodeXe20.cmake generates and
-// flash_mla_decode()'s dispatch ladder calls; the three must stay in lockstep or
-// the TU fails to link.
 
 #define DECLARE_MLA_DECODE_LAUNCH(ELEM, PS)   \
   void launch_mla_decode_##ELEM##_##PS(       \

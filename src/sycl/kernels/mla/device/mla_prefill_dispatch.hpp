@@ -53,14 +53,6 @@ namespace mla_prefill {
 //     small:  Q_TILE_M=32/NumSGM=4   -- short prompts (Q < ~192)
 //     medium: Q_TILE_M=128/NumSGM=16 -- mid prompts (force-only for now)
 //     large:  Q_TILE_M=256/NumSGM=32 -- long prompts (Q >= 512)
-//
-// Whether the softmax log-sum-exp is emitted is not an axis here: `lse` is passed
-// through and an absent one makes the epilogue skip the store at runtime.
-//
-// The 24 symbols below are exactly the set MlaPrefillXe20.cmake generates and
-// flash_mla_prefill()'s dispatch ladder calls; the three must stay in lockstep or
-// the TU fails to link. All three axes are pasted into the name by the ladder, so
-// each is a distinct compile-time instantiation.
 
 #define DECLARE_MLA_PREFILL_LAUNCH(ELEM, PS, BUCKET)            \
   void launch_mla_prefill_##ELEM##_##PS##_##BUCKET(             \

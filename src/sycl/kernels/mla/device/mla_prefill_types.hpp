@@ -83,13 +83,7 @@ struct MlaPrefillQTileLarge {
 };
 
 //----------------- define MLA Xe Prefill configuration --------------------//
-// Whether the kernel emits the softmax log-sum-exp is a runtime property of the
-// arguments, not a template constant: a null KernelArguments::LSE means "skip
-// it" and the epilogue tests the pointer. One kernel covers both answers.
-template <
-    typename T,
-    typename PageSizeOpt = PageSizeOption<64>,
-    typename QTileCfg = MlaPrefillQTileLarge>
+template <typename T, typename PageSizeOpt = PageSizeOption<64>, typename QTileCfg = MlaPrefillQTileLarge>
 struct MlaXePrefill {
   // TODO: add persistence option support in tile scheduler
   using TileScheduler = typename cutlass::flash_attention::kernel::XeMlaIndividualTileScheduler;
@@ -129,9 +123,7 @@ struct MlaXePrefill {
   static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
   using MMAOperation = XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, ElementQ>;
 
-  // Softmax LSE output: log2 domain, (seq_q, num_heads_q, batch) — O's layout
-  // with the head-size mode dropped. Ragged like Q/O (batch stride unused).
-  using ElementLSE = float;
+  using ElementLSE = float;  // Softmax LSE, log2 domain
 
   using StrideQ = Stride<int, _1, int, int>;
   using StrideK = Stride<int, _1, int, int>;
@@ -286,7 +278,7 @@ inline typename T::Fmla::Arguments args_from_options_prefill(
   StrideO stride_O = cute::make_stride(
       static_cast<int>(out.stride(0)), cute::_1{}, static_cast<int>(out.stride(1)), static_cast<int>(0));
 
-  // Ragged 2D LSE strides: (seq, head, batch) — batch handled by pointer offset
+  // Ragged: batch handled by pointer offset
   StrideLSE stride_LSE =
       cute::make_stride(static_cast<int>(lse.has_value() ? lse->stride(0) : 0), cute::_1{}, static_cast<int>(0));
 
@@ -303,11 +295,6 @@ inline typename T::Fmla::Arguments args_from_options_prefill(
   kernel_args.dV = stride_V;
   kernel_args.O = static_cast<ElementO*>(out.data_ptr());
   kernel_args.dO = stride_O;
-  // An absent `lse` leaves this pointer null, which is what tells the epilogue to
-  // skip the LSE store (the stride is zero too, above).
-  // `lse` is the one output still taken by const reference (unlike out/workspace)
-  // because the registered op signature has to be -- see flash_mla_prefill() in
-  // mla_prefill.cpp. at::Tensor constness is shallow, so the store still lands.
   if (lse.has_value()) {
     kernel_args.LSE = static_cast<ElementLSE*>(lse->data_ptr());
   }
@@ -326,9 +313,6 @@ inline typename T::Fmla::Arguments args_from_options_prefill(
   return arguments;
 }
 
-// Whether the LSE is emitted is decided at runtime from `lse` (a null LSE pointer
-// tells the epilogue to skip the store), so it is not part of the instantiation:
-// one kernel per Q-tile bucket per (dtype, page size) translation unit.
 template <typename Element, typename PageSizeOpt, typename QTileCfg>
 inline void runMlaPrefill(
     at::Tensor& out,

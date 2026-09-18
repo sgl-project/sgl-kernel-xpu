@@ -95,19 +95,7 @@ int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int
   return std::clamp(num_splits, 1, 128);
 }
 
-// Two-stage dispatch ladder. Each rung resolves ONE runtime value to a compile-time
-// token and is named for the value it switches on (like DISPATCH_MLA_SPARSE_SINK):
-//
-//   DISPATCH_MLA_DTYPE     -> ELEM     (in_dtype; half/bf16)
-//     DISPATCH_MLA_PAGE_SIZE -> PS     (kv_c_and_k_pe_cache.size(1); 16/32/64/128)
-//       DISPATCH_MLA_LAUNCH -> the generated launcher call
-//
-// The switches are load-bearing, not stylistic: the leaf pastes these two tokens into
-// the launcher's name, so each value must be a literal before it is reached. `lse` is
-// not a rung -- it is forwarded as-is and an absent one makes the epilogue skip the
-// store at runtime. Full expansion is 2 ELEM x 4 PS = 8 call sites, which is exactly
-// the symbol set MlaDecodeXe20.cmake generates and mla_decode_dispatch.hpp declares --
-// the three must stay in lockstep or the TU fails to link.
+// Leaf of the dispatch ladder: ELEM and PS must be literals when pasted.
 #define DISPATCH_MLA_LAUNCH(ELEM, PS)                                                                        \
   mla_decode::launch_mla_decode_##ELEM##_##PS(                                                               \
       out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits)
@@ -149,18 +137,11 @@ int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int
 
 /// @brief Dispatch kernel implementation for MLA decode.
 ///
-/// `lse` is an output (schema: `Tensor(b!)? lse`) yet is taken by const
-/// reference, because the PyTorch library bindings cannot box a non-const
-/// `std::optional<T>&` -- see the note in sgl_kernel_torch_shim.h. That is fine:
-/// `at::Tensor` constness is shallow (`data_ptr()` is a const member returning a
-/// mutable pointer), so the epilogue still writes through it. This is the repo
-/// convention for a mutable optional tensor argument -- see the six `Tensor(x!)?`
-/// outputs of inkling_fused_decode_sconv_metadata(). FMHA's `fwd` is the lone
-/// exception among 108 registered ops, and only because make_pytorch_shim()
-/// const_casts the argument back so its signature can track upstream flash-attn.
+/// `lse` is an output taken by const ref: the bindings cannot box a non-const
+/// optional, and at::Tensor constness is shallow.
 SGL_KERNEL_EXPORT void flash_mla_decode(
     at::Tensor& out,                        // (batch, num_heads, latent_dim)
-    const std::optional<at::Tensor>& lse,   // (batch, num_heads) fp32, softmax LSE (log2 domain); nullopt = skip
+    const std::optional<at::Tensor>& lse,   // (batch, num_heads) fp32, log2 domain; nullopt = skip
     const at::Tensor& q_nope,               // (batch, num_heads, latent_dim)
     const at::Tensor& q_pe,                 // (batch, num_heads, rope_dim)
     const at::Tensor& kv_c_and_k_pe_cache,  // (total_no_of_pages, page_size, (latent_dim + rope_dim))
@@ -191,8 +172,6 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
       "Unsupported page size for MLA decode: ",
       page_size,
       ". Supported: 16, 32, 64, 128");
-  // The softmax statistics are computed either way; passing an LSE tensor is
-  // what asks for them to be written out.
   if (lse.has_value()) {
     CHECK_INPUT(lse.value());
     TORCH_CHECK(lse->scalar_type() == at::ScalarType::Float, "lse must be float32, got ", lse->scalar_type());

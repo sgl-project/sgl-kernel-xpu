@@ -100,13 +100,7 @@ struct FMlAProblemShape {
 };
 
 //----------------- define MLA Xe configuration --------------------//
-// Whether the kernel emits the softmax log-sum-exp is a runtime property of the
-// arguments, not a template constant: a null KernelArguments::LSE means "skip
-// it" and the epilogue tests the pointer. One kernel covers both answers.
-template <
-    typename T,
-    typename PageSizeOpt = PageSizeOption<64>,
-    typename SplitKVOption = EnabledSplitKV<false>>
+template <typename T, typename PageSizeOpt = PageSizeOption<64>, typename SplitKVOption = EnabledSplitKV<false>>
 struct MlaXe {
   // TODO: add persistence option support in tile scheduler
   using TileScheduler = typename cutlass::flash_attention::kernel::XeMlaIndividualTileScheduler;
@@ -132,9 +126,7 @@ struct MlaXe {
   // TODO: handle special float8 types float_e5m2_t, float_e4m3_t for MMA operation
   using MMAOperation = XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, ElementQ>;
 
-  // Softmax LSE output: log2 domain, (seq_q, num_heads_q, batch) — O's layout
-  // with the head-size mode dropped.
-  using ElementLSE = float;
+  using ElementLSE = float;  // Softmax LSE, log2 domain
 
   using StrideQ = Stride<int, _1, int, int>;
   using StrideK = Stride<int, _1, int, int>;
@@ -305,11 +297,6 @@ inline typename T::Fmla::Arguments args_from_options(
   kernel_args.dV = stride_V;
   kernel_args.O = static_cast<ElementO*>(out.data_ptr());
   kernel_args.dO = stride_O;
-  // An absent `lse` leaves this pointer null, which is what tells the epilogue to
-  // skip the LSE store (the stride is zero too, above).
-  // `lse` is the one output still taken by const reference (unlike out/workspace)
-  // because the registered op signature has to be -- see flash_mla_decode() in
-  // mla_decode.cpp. at::Tensor constness is shallow, so the store still lands.
   if (lse.has_value()) {
     kernel_args.LSE = static_cast<ElementLSE*>(lse->data_ptr());
   }
@@ -385,10 +372,6 @@ inline void runMlaImpl(
   CUTLASS_CHECK(fmla.run(arguments, workspace.data_ptr()));
 }
 
-// Whether the LSE is emitted is decided at runtime from `lse` (a null LSE pointer
-// tells the epilogue to skip the store), so it is not part of the instantiation.
-// Only the split-KV dispatch below multiplies the kernel count: two kernels per
-// (dtype, page size) translation unit.
 template <typename Element, typename PageSizeOpt>
 inline void runMla(
     at::Tensor& out,

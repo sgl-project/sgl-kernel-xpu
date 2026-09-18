@@ -80,7 +80,6 @@ class XeMlaReduceSplitKV {
 
   using ElementLSE = float;  // exp_sums/max_logits accumulator type
 
-  // Final (merged) softmax LSE output: (seq_q, num_heads_q, batch)
   using TensorLSEOut = typename MlaKernel_::TensorLSE;
   using ElementLSEOut = typename MlaKernel_::ElementLSE;
   using StrideLSEOut = typename MlaKernel_::StrideLSE;
@@ -103,8 +102,7 @@ class XeMlaReduceSplitKV {
     const ElementLSE* exp_sums = nullptr;
     const ElementLSE* max_logits = nullptr;
     StrideO dLSE{};
-    // Merged softmax log-sum-exp output (log2 domain). Null means the caller did
-    // not ask for the LSE and the merge below is skipped.
+    // Merged LSE (log2 domain). Null => skip.
     ElementLSEOut* LSE = nullptr;
     StrideLSEOut dLSE_out{};
   };
@@ -221,15 +219,7 @@ class XeMlaReduceSplitKV {
       global_max = reduce_over_group(get_work_group<1>(), global_max, sycl::maximum<>());
       global_max = sycl::group_broadcast(get_work_group<1>(), global_max, 0);
 
-      // Step 3: Emit the merged log2-domain LSE for this (row, head, batch).
-      // The per-split statistics are in the log2 domain with sm_scale folded in
-      // (see the mainloop), so with
-      //   total = sum_s exp_sum_s * exp2(max_s - global_max)
-      // the log-sum-exp of the full KV range, in that same log2 domain, is
-      //   lse = log2(sum_j exp2(logit_j)) = global_max + log2(total).
-      // One lane does it: the merge is a handful of FLOPs and every thread in
-      // the O loop below would otherwise recompute the same value.
-      // A null p.LSE is the caller's request to skip it.
+      // Step 3: Merge the per-split statistics into the LSE, one lane per row.
       if (p.LSE != nullptr) {
         if (thr_id == 0) {
           auto shape_LSE_out = make_shape(seq_len_qo, num_heads_q, batch);
@@ -241,8 +231,6 @@ class XeMlaReduceSplitKV {
             if (local_exp_sum <= ElementLSE(0)) continue;
             total += local_exp_sum * sycl::native::exp2(shared_storage.max_logits_slm[k] - global_max);
           }
-          // No unmasked keys at all (e.g. zero KV length) => -inf, matching the
-          // non-split epilogue.
           ElementLSE lse = (total > ElementLSE(0)) ? (global_max + sycl::log2(total)) : -INFINITY;
           LSEout(seq_idx, head_q, idx_b) = static_cast<ElementLSEOut>(lse);
         }

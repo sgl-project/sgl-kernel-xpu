@@ -168,8 +168,6 @@ class MLA {
       reduce_kernel_args.exp_sums = args.kernel.exp_sums;
       reduce_kernel_args.max_logits = args.kernel.max_logits;
       reduce_kernel_args.dLSE = args.kernel.dLSE;
-      // Final LSE is produced by the reduction kernel, which merges the
-      // per-split statistics above.
       reduce_kernel_args.LSE = args.kernel.LSE;
       reduce_kernel_args.dLSE_out = args.kernel.dLSE_out;
 

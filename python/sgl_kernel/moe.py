@@ -432,12 +432,15 @@ def _validate_fp8_weight_scale(
     """Validate an FP8 expert scale tensor against its physical weight shape."""
     assert scale.dtype == torch.float32, f"{name} must be float32"
     assert scale.ndim in (
-        (2, 3) if allow_scalar else (3,)
-    ), f"{name} must be 3D block scales or 2D scalar scales"
+        (1, 2, 3) if allow_scalar else (3,)
+    ), f"{name} must be 3D block scales or 1D/2D scalar scales"
     assert scale.shape[0] == weights.shape[0], (
         f"{name} expert dimension {scale.shape[0]} must match weights "
         f"expert dimension {weights.shape[0]}"
     )
+    if scale.ndim == 1:
+        assert allow_scalar, f"{name} scalar scales are not supported for this FP8 path"
+        return
     if scale.ndim == 2:
         assert allow_scalar, f"{name} scalar scales are not supported for this FP8 path"
         expected_columns = 2 if name == "w1_scale" else 1
@@ -447,18 +450,28 @@ def _validate_fp8_weight_scale(
         )
         return
 
-    expected_shape = (
+    expected_shape_row = (
         weights.shape[0],
         (weights.shape[1] + 127) // 128,
         (weights.shape[2] + 127) // 128,
     )
-    assert tuple(scale.shape) == expected_shape, (
-        f"{name} block scales must have shape [E, ceil(N/128), ceil(K/128)] "
-        f"={expected_shape}, got {tuple(scale.shape)}"
+    expected_shape_col = (
+        weights.shape[0],
+        (weights.shape[2] + 127) // 128,
+        (weights.shape[1] + 127) // 128,
+    )
+    assert tuple(scale.shape) in (expected_shape_row, expected_shape_col), (
+        f"{name} block scales must have shape [E, ceil(N/128), ceil(K/128)], "
+        f"got {tuple(scale.shape)}"
+    )
+    k_dim = (
+        weights.shape[1]
+        if tuple(scale.shape) == expected_shape_col
+        else weights.shape[2]
     )
     assert (
-        weights.shape[2] % 128 == 0
-    ), f"{name} block scales require K divisible by 128, got K={weights.shape[2]}"
+        k_dim % 128 == 0
+    ), f"{name} block scales require K divisible by 128, got K={k_dim}"
 
 
 def fused_experts(
@@ -695,6 +708,10 @@ def fused_experts(
         assert (
             w1_scale.ndim == w2_scale.ndim
         ), "w1_scale and w2_scale must use the same scalar or block layout"
+        if w1_scale.ndim == 1:
+            w1_scale = w1_scale.view(-1, 1)
+        if w2_scale.ndim == 1:
+            w2_scale = w2_scale.view(-1, 1)
         assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
     if b1 is not None:
         assert (
@@ -710,29 +727,59 @@ def fused_experts(
         if is_xe2_arch() and b2.dtype == torch.bfloat16:
             # cast b2 to float32, since bias is accumulated in float32 in the kernel
             b2 = b2.float()
-    # Shape check
-    # For packed 4-bit weights the last dim of w1/w2 is halved (2 values per
-    # byte), so compute the actual (unpacked) inner dimensions for validation.
-    _w1_inner = w1.shape[-1] * 2 if use_4bit_w4a16 else w1.shape[-1]
-    _w2_inner = w2.shape[-1] * 2 if use_4bit_w4a16 else w2.shape[-1]
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
-    assert (
-        hidden_states.shape[-1] == _w1_inner
-    ), f"hidden_states shape[-1] {hidden_states.shape} must equal w1 inner dim {_w1_inner} (w1.shape={w1.shape})"
-    assert (2 * _w2_inner == w1.shape[1]) or (
-        (_w2_inner == w1.shape[1]) and (activation == "relu2")
-    ), f"w2 inner dim {_w2_inner} must be half of w1 shape[1] {w1.shape[1]} except non-gate"
-    assert (topk_ids.shape == topk_weights.shape) and (
-        topk_ids.shape[0] == hidden_states.shape[0]
-    ), f"topk_ids shape {topk_ids.shape} and topk_weights shape {topk_weights.shape} must be equal and match hidden_states shape[0] {hidden_states.shape[0]}"
-
     num_tokens, hidden_dims = hidden_states.shape
 
-    E, _, K = w1.shape
-    E, OutK, N = w2.shape
-    w1_group_size = 0
-    w2_group_size = 0
-    if use_4bit_w4a16:
+    # Shape check
+    # FP8 and BF16 unquantized weights: prefer column-major [E, K, N] (zero overhead),
+    # while adaptively supporting legacy row-major [E, N, K] for backward compatibility.
+    if use_fp8_weight or not use_4bit_w4a16:
+        if w1.shape[1] == hidden_dims:
+            # Column-major [E, K, 2*I] and [E, I, OutK]
+            E, K, w1_out = w1.shape
+            E, w2_in_dim, OutK = w2.shape
+            N = w2_in_dim
+            w1_in = w1
+            w2_in = w2
+        elif w1.shape[-1] == hidden_dims:
+            # Legacy row-major [E, 2*I, K] and [E, OutK, I] -> adaptively transpose for backward compatibility
+            E, w1_out, K = w1.shape
+            E, OutK, w2_in_dim = w2.shape
+            N = w2_in_dim
+            w1_in = w1.transpose(1, 2).contiguous()
+            w2_in = w2.transpose(1, 2).contiguous()
+        else:
+            raise AssertionError(
+                f"w1 shape {tuple(w1.shape)} mismatch with hidden_dims {hidden_dims}: "
+                f"expected column-major [E, K, N] or row-major [E, N, K]"
+            )
+        assert (2 * w2_in_dim == w1_out) or (
+            (w2_in_dim == w1_out) and (activation == "relu2")
+        ), f"w2 inner dim {w2_in_dim} must be half of w1 out dim {w1_out} except non-gate"
+        if b1 is not None:
+            assert b1.shape == (E, w1_out), f"b1 shape must match (E={E}, {w1_out})"
+        if b2 is not None:
+            assert b2.shape == (E, OutK), f"b2 shape must match (E={E}, {OutK})"
+        w1_group_size = 0
+        w2_group_size = 0
+    else:
+        _w1_inner = w1.shape[-1] * 2
+        _w2_inner = w2.shape[-1] * 2
+        assert (
+            hidden_states.shape[-1] == _w1_inner
+        ), f"hidden_states shape[-1] {hidden_states.shape} must equal w1 inner dim {_w1_inner} (w1.shape={w1.shape})"
+        assert (2 * _w2_inner == w1.shape[1]) or (
+            (_w2_inner == w1.shape[1]) and (activation == "relu2")
+        ), f"w2 inner dim {_w2_inner} must be half of w1 shape[1] {w1.shape[1]} except non-gate"
+
+        E, _, K = w1.shape
+        E, OutK, N = w2.shape
+        w1_in = w1
+        w2_in = w2
+        if b1 is not None:
+            assert b1.shape == w1.shape[:2], "b1 shape must match w1 shape[:2]"
+        if b2 is not None:
+            assert b2.shape == w2.shape[:2], "b2 shape must match w2 shape[:2]"
         # w1/w2 last dims are packed (H//2, I//2); recover actual dims
         K = K * 2
         N = N * 2
@@ -740,10 +787,10 @@ def fused_experts(
         # (GEMM1 contracts over K=H, GEMM2 over N=I).
         w1_group_size = K // w1_scale.shape[2]
         w2_group_size = N // w2_scale.shape[2]
-    if b1 is not None:
-        assert b1.shape == w1.shape[:2], "b1 shape must match w1 shape[:2]"
-    if b2 is not None:
-        assert b2.shape == w2.shape[:2], "b2 shape must match w2 shape[:2]"
+
+    assert (topk_ids.shape == topk_weights.shape) and (
+        topk_ids.shape[0] == hidden_states.shape[0]
+    ), f"topk_ids shape {topk_ids.shape} and topk_weights shape {topk_weights.shape} must be equal and match hidden_states shape[0] {hidden_states.shape[0]}"
 
     M = num_tokens
     TopK = topk_ids.shape[1]
@@ -854,10 +901,13 @@ def fused_experts(
             hidden_states.dtype,
             hidden_states.device,
         )
+        assert (
+            w1_in.shape[1] == input_A_shuffle.shape[1]
+        ), f"w1 must be in column-major [E, K, N] format with K={input_A_shuffle.shape[1]}, got {tuple(w1_in.shape)}"
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
             intermediate_cache1,
             input_A_shuffle,
-            w1,
+            w1_in,
             w1_scale,
             b1,
             expert_offsets,
@@ -895,10 +945,13 @@ def fused_experts(
                     f"unsupported FP8 activation type: {activation_type}"
                 )
 
+        assert (
+            w2_in.shape[1] == intermediate_cache2.shape[1]
+        ), f"w2 must be in column-major [E, K, N] format with K={intermediate_cache2.shape[1]}, got {tuple(w2_in.shape)}"
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
             intermediate_cache3,
             intermediate_cache2,
-            w2,
+            w2_in,
             w2_scale,
             b2,
             expert_offsets,
@@ -943,10 +996,9 @@ def fused_experts(
         raise ValueError(f"Unsupported activation {activation}")
 
     # Gated activations (silu/gelu/swiglu) split w1's output into gate+up, so
-    # w1.shape[1] == 2*N; non-gated relu2 has w1.shape[1] == N. Compare against
-    # the recovered (unpacked) N — w2.shape[2] is the packed I/2 under MXFP4,
-    # which would mis-detect the gated case as non-gated (gate_factor=1).
-    gate_factor = 2 if (2 * N == w1.shape[1]) else 1
+    # w1's output dimension == 2*N; non-gated relu2 has w1's output dimension == N.
+    w1_out_dim = w1_in.shape[1] if use_4bit_w4a16 else w1_in.shape[2]
+    gate_factor = 2 if (2 * N == w1_out_dim) else 1
 
     # Heuristic for choosing fused vs unfused activation. The K*N threshold
     # mirrors the small-weight cutoff in the C++ grouped-GEMM dispatchers
@@ -984,7 +1036,7 @@ def fused_experts(
             torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
                 intermediate_cache1,
                 input_A_shuffle,
-                w1,
+                w1_in,
                 b1,
                 expert_offsets,
                 E,
@@ -1043,7 +1095,7 @@ def fused_experts(
             torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
                 intermediate_cache3,
                 intermediate_cache2,
-                w2,
+                w2_in,
                 b2,
                 expert_offsets,
                 E,
@@ -1065,7 +1117,7 @@ def fused_experts(
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
             intermediate_cache1,
             input_A_shuffle,
-            w1,
+            w1_in,
             b1,
             expert_offsets,
             E,
@@ -1078,7 +1130,7 @@ def fused_experts(
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
             intermediate_cache3,
             intermediate_cache1,
-            w2,
+            w2_in,
             b2,
             expert_offsets,
             E,

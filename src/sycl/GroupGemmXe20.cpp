@@ -109,7 +109,7 @@ DECLARE_XE20_MOE_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
   Xe20MoEGEMMLauncher<__VA_ARGS__>(           \
       queue,                                  \
       activations.data_ptr(),                 \
-      weights.data_ptr(),                     \
+      weights_col.data_ptr(),                 \
       nullptr,                                \
       bias_ptr,                               \
       output.data_ptr(),                      \
@@ -170,12 +170,24 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
   int total_m = activations.sizes()[0];
   int gemm_k = activations.sizes()[1];
   auto weights_shape = weights.sizes().vec();
-  int gemm_n = weights.sizes()[1];
-  int avg_m = total_m / n_experts;
-
   TORCH_CHECK(weights_shape.size() == 3, "weights must be 3D");
   TORCH_CHECK(weights_shape[0] == n_experts, "weights must have n_experts as the first dimension");
-  TORCH_CHECK(weights_shape[1] == gemm_n, "weights must be gemm_n * gemm_k");
+
+  at::Tensor weights_col;
+  int gemm_n;
+  if (weights_shape[1] == gemm_k) {
+    weights_col = weights.is_contiguous() ? weights : weights.contiguous();
+    gemm_n = weights.sizes()[2];
+  } else if (weights_shape[2] == gemm_k) {
+    weights_col = weights.transpose(1, 2).contiguous();
+    gemm_n = weights.sizes()[1];
+  } else {
+    TORCH_CHECK(
+        false, "weights K dimension mismatch with activations K=", gemm_k, ", got weights shape: ", weights.sizes());
+  }
+
+  int avg_m = total_m / n_experts;
+  int ld_b = static_cast<int>(weights_col.stride(1));
   TORCH_CHECK(
       weights_shape[0] == total_rows_for_experts.size(0),
       "rows_for_experts must have the same size as the first dimension of weights");
@@ -189,7 +201,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
   } else {
     TORCH_CHECK(output.sizes()[1] == gemm_n, "output must have the same number of columns as activations");
   }
-  TORCH_CHECK(n_experts % 8 == 0, "n_experts must be a multiple of 8 for the current implementation");
+  TORCH_CHECK(n_experts > 0, "n_experts must be positive");
   if (bias.has_value()) {
     TORCH_CHECK(
         bias->scalar_type() == at::kFloat,
@@ -220,7 +232,6 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
   at::Tensor atomic_buffer = at::empty({static_cast<long>(1)}, activations.options().dtype(at::kInt));
   bool with_bias = bias.has_value();
   void* bias_ptr = with_bias ? bias->data_ptr() : nullptr;
-  int ld_b = static_cast<int>(weights.stride(1));
 
 #ifdef USE_MOE_JIT
   {

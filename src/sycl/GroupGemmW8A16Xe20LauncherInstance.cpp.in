@@ -38,7 +38,7 @@ void Xe20MoEGEMMFp8W8A16Launcher(
     return make_tensor(make_gmem_ptr(&val), make_layout(repeat<rank_v<decltype(stride)>>(1), stride));
   };
   using TensorA = decltype(make_dummy_tensor(ElementA{}, Stride<int, _1>{}));
-  using TensorBPacked = decltype(make_dummy_tensor(cutlass::float_e4m3_t{}, Stride<int, _1>{}));
+  using TensorBPacked = decltype(make_dummy_tensor(cutlass::float_e4m3_t{}, Stride<_1, int>{}));
   using TensorD = decltype(make_dummy_tensor(ElementD{}, Stride<int, _1>{}));
   using MMA = typename TiledMMAHelper<
       MMA_Atom<XE_DPAS_TT<8, float, cutlass::bfloat16_t>>, Layout<Tile>, SGLayout>::TiledMMA;

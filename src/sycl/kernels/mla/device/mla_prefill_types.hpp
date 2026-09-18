@@ -83,15 +83,13 @@ struct MlaPrefillQTileLarge {
 };
 
 //----------------- define MLA Xe Prefill configuration --------------------//
-// LSE selects whether the kernel emits the softmax log-sum-exp. It is a
-// template constant rather than a runtime null-pointer check, so the two answers
-// are two different kernels, each in its own translation unit (HAS_LSE in
-// MlaPrefillXe20.cmake); flash_mla_prefill() picks one by name.
+// Whether the kernel emits the softmax log-sum-exp is a runtime property of the
+// arguments, not a template constant: a null KernelArguments::LSE means "skip
+// it" and the epilogue tests the pointer. One kernel covers both answers.
 template <
     typename T,
     typename PageSizeOpt = PageSizeOption<64>,
-    typename QTileCfg = MlaPrefillQTileLarge,
-    bool LSE = false>
+    typename QTileCfg = MlaPrefillQTileLarge>
 struct MlaXePrefill {
   // TODO: add persistence option support in tile scheduler
   using TileScheduler = typename cutlass::flash_attention::kernel::XeMlaIndividualTileScheduler;
@@ -185,7 +183,7 @@ struct MlaXePrefill {
 
   // Collective Epilogue
   using CollectiveEpilogue = cutlass::flash_attention::collective::
-      XeMlaEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, TensorLSE, LSE>;
+      XeMlaEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, TensorLSE>;
 
   // Kernel instantiation
   using FmlaKernel = cutlass::flash_attention::kernel::
@@ -305,13 +303,12 @@ inline typename T::Fmla::Arguments args_from_options_prefill(
   kernel_args.dV = stride_V;
   kernel_args.O = static_cast<ElementO*>(out.data_ptr());
   kernel_args.dO = stride_O;
-  // Only the LSE-emitting instantiation reads these; the LSE-off kernel has no
-  // store to feed, so leave the pointer null (and the stride zero, above).
+  // An absent `lse` leaves this pointer null, which is what tells the epilogue to
+  // skip the LSE store (the stride is zero too, above).
   // `lse` is the one output still taken by const reference (unlike out/workspace)
   // because the registered op signature has to be -- see flash_mla_prefill() in
   // mla_prefill.cpp. at::Tensor constness is shallow, so the store still lands.
-  if constexpr (T::CollectiveEpilogue::LSE) {
-    TORCH_CHECK(lse.has_value(), "MLA prefill was instantiated for LSE output but no lse tensor was provided");
+  if (lse.has_value()) {
     kernel_args.LSE = static_cast<ElementLSE*>(lse->data_ptr());
   }
   kernel_args.dLSE_out = stride_LSE;
@@ -329,12 +326,10 @@ inline typename T::Fmla::Arguments args_from_options_prefill(
   return arguments;
 }
 
-// LSE is a template constant, not a runtime flag: flash_mla_prefill()'s dispatch
-// ladder resolves lse.has_value() to a 0/1 token and calls the generated launcher
-// of that name, so LSE is already fixed here -- one kernel per Q-tile bucket per
-// (dtype, page size, LSE) translation unit. The LSE-off variant carries no LSE
-// registers and no LSE stores.
-template <typename Element, typename PageSizeOpt, typename QTileCfg, bool LSE>
+// Whether the LSE is emitted is decided at runtime from `lse` (a null LSE pointer
+// tells the epilogue to skip the store), so it is not part of the instantiation:
+// one kernel per Q-tile bucket per (dtype, page size) translation unit.
+template <typename Element, typename PageSizeOpt, typename QTileCfg>
 inline void runMlaPrefill(
     at::Tensor& out,
     std::optional<at::Tensor> const& lse,
@@ -349,7 +344,7 @@ inline void runMlaPrefill(
     double sm_scale,
     bool causal,
     int64_t num_kv_splits) {
-  using MlaXePrefillType = MlaXePrefill<Element, PageSizeOpt, QTileCfg, LSE>;
+  using MlaXePrefillType = MlaXePrefill<Element, PageSizeOpt, QTileCfg>;
   typename MlaXePrefillType::Fmla fmla;
   auto arguments = args_from_options_prefill<MlaXePrefillType>(
       out,

@@ -51,11 +51,7 @@ template <
     class TileShapeO_,
     class TensorO_,
     class TiledCopyO_,  // Optional TiledCopy for storing O (void => default)
-    class TensorLSE_,   // Global softmax-LSE tensor: (q, head, batch)
-    // LSE: when false, the epilogue skips the LSE combine and store entirely.
-    // Threaded as a template constexpr rather than a runtime null-pointer check
-    // so the LSE-off kernel carries none of write_lse()'s registers or stores.
-    bool LSE_ = false>
+    class TensorLSE_>  // Global softmax-LSE tensor: (q, head, batch)
 class XeMlaEpilogue {
  public:
   //
@@ -75,11 +71,6 @@ class XeMlaEpilogue {
   using TensorLSE = TensorLSE_;
   using TensorLSE1D = decltype(TensorLSE_{}(make_coord(_, 0, 0)));
   using ElementLSE = typename TensorLSE_::value_type;
-
-  // Exposed for the kernel layer (see XeMlaFwdKernel::LSE). The tensor arguments
-  // are named gLSE, not LSE, so that this flag is never shadowed inside the
-  // epilogue's own entry points; internal conditions still spell LSE_.
-  static constexpr bool LSE = LSE_;
 
   using FragA = typename CollectiveMainloop::FragA;
   using FragARow = typename CollectiveMainloop::FragARow;
@@ -189,8 +180,11 @@ class XeMlaEpilogue {
     auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
     auto tOgO = thr_copy_o.partition_D(gO);
 
-    /* Emit LSE while the softmax sums are still the raw denominators. */
-    if constexpr (LSE_) {
+    /* Emit LSE while the softmax sums are still the raw denominators. A null gLSE
+       pointer is the caller's request to skip it; the kernel layer keeps the
+       pointer exactly null in that case (it never offsets a null base), so this
+       test is the whole gate. */
+    if (raw_pointer_cast(gLSE.data()) != nullptr) {
       write_lse(rA, rA_sum, rA_max, tOrO, tOgO, cO, blk_qv, thr_id, gLSE);
     }
 
@@ -227,22 +221,22 @@ class XeMlaEpilogue {
   ///     from TiledMMAPV's partition_C of the identity tile and the LSE is stored
   ///     directly out of row space.
   ///   ReduceK > 1 (decode): rA is the cross-subgroup reduced fragment, whose
-  ///     mapping partition_C does not describe, so the LSE is broadcast and
-  ///     reordered into output-element space where tOgO carries the coordinates.
+  ///     mapping partition_C does not describe, so the coordinates come from the
+  ///     output copy's tOgO, which indexes elements in rA's own order.
   ///
-  /// The two paths write identical values; the first just avoids two fragments,
-  /// a reorder, and VTiles-1 out of VTiles of the scan.
+  /// The two paths write identical values; the first just scans one V sub-tile of
+  /// rA instead of all VTiles.
   ///
-  /// Only instantiated when the LSE_ template parameter is true; the caller
-  /// (operator() above) gates the call with `if constexpr`. The softmax
-  /// statistics themselves are computed by the mainloop either way -- they are
-  /// what normalizes O -- so the LSE-off kernel differs only in this store.
+  /// Reached only when gLSE holds a non-null pointer; the caller (operator()
+  /// above) gates the call on that. The softmax statistics themselves are
+  /// computed by the mainloop either way -- they are what normalizes O -- so
+  /// skipping the LSE skips only this store and the row-wise log2 above it.
   template <class RedFragA, class RedFragARow, class FragO, class CoordO, class CoordFull, class QVCoord>
   CUTLASS_DEVICE void write_lse(
       RedFragA const& rA,         // Reduced O accumulator: (q,v)
       RedFragARow const& rA_sum,  // Reduced softmax row-wise sum
       RedFragARow const& rA_max,  // Reduced softmax row-wise max (log2 domain)
-      FragO const& tOrO,          // Output fragment (layout donor, ReduceK > 1 only)
+      FragO const& tOrO,          // Output fragment (TV-layout witness only, ReduceK > 1)
       CoordO const& tOgO,         // Output coordinates: (q,v) per element (ReduceK > 1 only)
       CoordFull const& cO,        // Identity tensor over the whole O: (q,v)
       QVCoord blk_qv,             // WG tile indices: (Q,V)
@@ -300,27 +294,25 @@ class XeMlaEpilogue {
     } else {
       /* rA is the SLM-reduced fragment (ReduceFragA), whose element -> (q,v)
          mapping is the sA_coords remap in reduce_A(), not the MMA's partition_C.
-         Broadcast the per-row LSE across the A fragment and reorder it into the
-         output fragment layout, where tOgO carries the coordinates.
-
-         Keep the values in ElementA (float): tOrO may be a narrower output type.
-         reorder() requires SubgroupTensor operands, so wrap the float fragment
-         with tOrO's TV layout. */
-      auto lse_e = rA;
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < rA.size(); i++) {
-        lse_e(i) = broadcast<0>(row_lse, rA, i);
-      }
-
-      auto tO_lse = make_subgroup_tensor(make_fragment_like<ElementA>(tOrO.layout()), tOrO.tv_layout());
-      reorder(lse_e, tO_lse);
+         tOgO carries that mapping: TiledCopyO is built from ReduceFragA's own TV
+         layout (see default_tiled_copy_O_helper()), so the output fragment holds
+         rA's elements in rA's order -- operator()'s reorder(rA, tOrO) is there for
+         the output type conversion, not for a permutation. The assert below pins
+         that down, and with it the LSE is broadcast straight out of row space at
+         the same flat index: no reorder, and no O-sized LSE fragments. */
+      static_assert(
+          is_same_v<
+              remove_cvref_t<decltype(coalesce(tOrO.tv_layout()))>,
+              remove_cvref_t<decltype(coalesce(rA.tv_layout()))>>,
+          "tOgO's element order is rA's only while the output fragment walks the tile the way rA does; if the two "
+          "diverge, the LSE has to be broadcast across an rA-shaped fragment and reorder()ed into output space again");
 
       CUTLASS_PRAGMA_UNROLL
-      for (int j = 0; j < int(tO_lse.size()); j++) {
+      for (int j = 0; j < int(rA.size()); j++) {
         if (int(get<1>(tOgO(j))) != 0) continue;
         int row = int(get<0>(tOgO(j)));
         if (row >= num_rows) continue;
-        gLSE(row) = static_cast<ElementLSE>(tO_lse(j));
+        gLSE(row) = static_cast<ElementLSE>(broadcast<0>(row_lse, rA, j));
       }
     }
   }

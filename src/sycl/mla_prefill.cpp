@@ -102,58 +102,46 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
 //   DISPATCH_MLA_PREFILL_BUCKET   -> BUCKET  (Q-tile bucket; small/medium/large)
 //     DISPATCH_MLA_PREFILL_DTYPE    -> ELEM    (in_dtype; half/bf16)
 //       DISPATCH_MLA_PREFILL_PAGE_SIZE -> PS   (kv_c_and_k_pe_cache.size(1))
-//         DISPATCH_MLA_PREFILL_LSE     -> HAS_LSE (lse.has_value(); 0/1)
-//           DISPATCH_MLA_PREFILL_LAUNCH -> the generated launcher call
+//         DISPATCH_MLA_PREFILL_LAUNCH -> the generated launcher call
 //
 // The rungs are defined bottom-up below, so DISPATCH_MLA_PREFILL_BUCKET is last.
 //
-// The switches are load-bearing, not stylistic: the leaf pastes these four tokens into
-// the launcher's name, so each value must be a literal before it is reached. Full
-// expansion is 3 BUCKET x 2 ELEM x 4 PS x 2 HAS_LSE = 48 call sites, which is exactly
-// the symbol set MlaPrefillXe20.cmake generates and mla_prefill_dispatch.hpp declares --
-// the three must stay in lockstep or the TU fails to link.
-#define DISPATCH_MLA_PREFILL_LAUNCH(ELEM, PS, BUCKET, HAS_LSE)          \
-  mla_prefill::launch_mla_prefill_##ELEM##_##PS##_##BUCKET##_##HAS_LSE( \
-      out,                                                              \
-      lse,                                                              \
-      q_nope,                                                           \
-      q_pe,                                                             \
-      kv_c_and_k_pe_cache,                                              \
-      cu_seqlens_q,                                                     \
-      seq_lens,                                                         \
-      max_seqlen_q,                                                     \
-      page_table,                                                       \
-      workspace,                                                        \
-      sm_scale,                                                         \
-      causal,                                                           \
+// The switches are load-bearing, not stylistic: the leaf pastes these three tokens into
+// the launcher's name, so each value must be a literal before it is reached. `lse` is
+// not a rung -- it is forwarded as-is and an absent one makes the epilogue skip the
+// store at runtime. Full expansion is 3 BUCKET x 2 ELEM x 4 PS = 24 call sites, which is
+// exactly the symbol set MlaPrefillXe20.cmake generates and mla_prefill_dispatch.hpp
+// declares -- the three must stay in lockstep or the TU fails to link.
+#define DISPATCH_MLA_PREFILL_LAUNCH(ELEM, PS, BUCKET)          \
+  mla_prefill::launch_mla_prefill_##ELEM##_##PS##_##BUCKET(    \
+      out,                                                     \
+      lse,                                                     \
+      q_nope,                                                  \
+      q_pe,                                                    \
+      kv_c_and_k_pe_cache,                                     \
+      cu_seqlens_q,                                            \
+      seq_lens,                                                \
+      max_seqlen_q,                                            \
+      page_table,                                              \
+      workspace,                                               \
+      sm_scale,                                                \
+      causal,                                                  \
       num_kv_splits)
-
-// Resolve the runtime lse tensor to the compile-time 0/1 launcher variant. An absent
-// lse tensor is the request to skip the LSE; the host op has already validated it when
-// present.
-#define DISPATCH_MLA_PREFILL_LSE(ELEM, PS, BUCKET)      \
-  do {                                                  \
-    if (lse.has_value()) {                              \
-      DISPATCH_MLA_PREFILL_LAUNCH(ELEM, PS, BUCKET, 1); \
-    } else {                                            \
-      DISPATCH_MLA_PREFILL_LAUNCH(ELEM, PS, BUCKET, 0); \
-    }                                                   \
-  } while (0)
 
 #define DISPATCH_MLA_PREFILL_PAGE_SIZE(ELEM, BUCKET)                              \
   do {                                                                            \
     switch (page_size) {                                                          \
       case 16:                                                                    \
-        DISPATCH_MLA_PREFILL_LSE(ELEM, 16, BUCKET);                               \
+        DISPATCH_MLA_PREFILL_LAUNCH(ELEM, 16, BUCKET);                            \
         break;                                                                    \
       case 32:                                                                    \
-        DISPATCH_MLA_PREFILL_LSE(ELEM, 32, BUCKET);                               \
+        DISPATCH_MLA_PREFILL_LAUNCH(ELEM, 32, BUCKET);                            \
         break;                                                                    \
       case 64:                                                                    \
-        DISPATCH_MLA_PREFILL_LSE(ELEM, 64, BUCKET);                               \
+        DISPATCH_MLA_PREFILL_LAUNCH(ELEM, 64, BUCKET);                            \
         break;                                                                    \
       case 128:                                                                   \
-        DISPATCH_MLA_PREFILL_LSE(ELEM, 128, BUCKET);                              \
+        DISPATCH_MLA_PREFILL_LAUNCH(ELEM, 128, BUCKET);                           \
         break;                                                                    \
       default:                                                                    \
         TORCH_CHECK(false, "Unsupported page size for MLA prefill: ", page_size); \
@@ -298,7 +286,6 @@ SGL_KERNEL_EXPORT void flash_mla_prefill(
             in_dtype == at::ScalarType::Half,
             page_size,
             bucket_id,
-            lse.has_value(),
             &out,
             &lse,
             &q_nope,
@@ -322,7 +309,6 @@ SGL_KERNEL_EXPORT void flash_mla_prefill(
 }
 
 #undef DISPATCH_MLA_PREFILL_LAUNCH
-#undef DISPATCH_MLA_PREFILL_LSE
 #undef DISPATCH_MLA_PREFILL_PAGE_SIZE
 #undef DISPATCH_MLA_PREFILL_DTYPE
 #undef DISPATCH_MLA_PREFILL_BUCKET

@@ -108,10 +108,6 @@ class XeMlaFwdKernel {
   using ElementLSE = typename TensorLSE::element_type;
   using StrideLSE = decltype(stride(TensorLSE{}));
 
-  // Whether this kernel emits the LSE. Compile-time, so the LSE-off variant
-  // carries no LSE pointer arithmetic and no epilogue store.
-  static constexpr bool LSE = CollectiveEpilogue::LSE;
-
   // Tile scheduler derived types
   using TileScheduler = TileScheduler_;
   using TileSchedulerParams = typename TileScheduler::Params;
@@ -154,7 +150,8 @@ class XeMlaFwdKernel {
     StrideO dO{};
 
     // Softmax log-sum-exp output (log2 domain), (seq_q, num_heads_q, batch).
-    // Only read when the LSE template parameter is true; left null otherwise.
+    // Null means the caller did not ask for the LSE, and the epilogue skips the
+    // store; nothing below ever offsets a null base pointer.
     ElementLSE* LSE = nullptr;
     StrideLSE dLSE_out{};
 
@@ -283,12 +280,10 @@ class XeMlaFwdKernel {
       auto shape_Q_nope = make_shape(seqlen_q_i, s.head_size_q_nope, s.num_heads_q, batch_dim_size);
       auto shape_Q_pe = make_shape(seqlen_q_i, s.head_size_q_pe, s.num_heads_q, batch_dim_size);
       auto shape_O = make_shape(seqlen_q_i, s.head_size_o, s.num_heads_q, batch_dim_size);
-      auto shape_LSE = make_shape(seqlen_q_i, s.num_heads_q, batch_dim_size);
 
       auto dcQ_nope = const_cast<ElementQ*>(p.Q_nope);
       auto dcQ_pe = const_cast<ElementQ*>(p.Q_pe);
       auto dO_ptr = p.O;
-      auto dLSE_ptr = p.LSE;
 
       if constexpr (CollectiveMainloop::IsPrefill) {
         // int64 to avoid overflow on large total_q
@@ -298,15 +293,29 @@ class XeMlaFwdKernel {
         dcQ_nope += q_nope_offset;
         dcQ_pe += q_pe_offset;
         dO_ptr += o_offset;
-        if constexpr (LSE) {
-          dLSE_ptr += static_cast<int64_t>(q_start) * static_cast<int64_t>(get<0>(p.dLSE_out));
+      }
+
+      // LSE base pointer for this (head, batch) -- and for prefill, this request's
+      // Q rows. A null p.LSE is the caller's request to skip the LSE: leave the
+      // pointer exactly null (never offset it) so the epilogue's null check is a
+      // reliable gate, then hand the epilogue a 1D (q) view either way. Unlike O,
+      // whose (head, batch) modes are sliced off inside the epilogue, the slice is
+      // folded into the pointer here so no arithmetic is applied to the null case.
+      auto dLSE_ptr = p.LSE;
+      if (dLSE_ptr != nullptr) {
+        int64_t lse_offset = static_cast<int64_t>(head_coord) * static_cast<int64_t>(get<1>(p.dLSE_out)) +
+                             static_cast<int64_t>(batch_slice_idx) * static_cast<int64_t>(get<2>(p.dLSE_out));
+        if constexpr (CollectiveMainloop::IsPrefill) {
+          lse_offset += static_cast<int64_t>(q_start) * static_cast<int64_t>(get<0>(p.dLSE_out));
         }
+        dLSE_ptr += lse_offset;
       }
 
       Tensor Q_nope = make_tensor(make_gmem_ptr(dcQ_nope), make_layout(shape_Q_nope, p.dQ_nope));
       Tensor Q_pe = make_tensor(make_gmem_ptr(dcQ_pe), make_layout(shape_Q_pe, p.dQ_pe));
       Tensor O = make_tensor(make_gmem_ptr(dO_ptr), make_layout(shape_O, p.dO));
-      Tensor mLSE = make_tensor(make_gmem_ptr(dLSE_ptr), make_layout(shape_LSE, p.dLSE_out));
+      Tensor gLSE =
+          make_tensor(make_gmem_ptr(dLSE_ptr), make_layout(make_shape(seqlen_q_i), make_stride(get<0>(p.dLSE_out))));
 
       // O accumulator types
       FragA tArA;
@@ -384,7 +393,7 @@ class XeMlaFwdKernel {
           tA_sum,
           blk_qv,
           thr_id,
-          mLSE(_, head_coord, batch_slice_idx));
+          gLSE);
     }
   }
 };
@@ -432,10 +441,6 @@ class XeMlaSplitKVKernel {
   using TensorLSE = typename CollectiveEpilogue::TensorLSE;
   using ElementLSE = typename TensorLSE::element_type;
   using StrideLSE = decltype(stride(TensorLSE{}));
-
-  // Whether the LSE is emitted. This kernel never stores it itself (the
-  // reduction kernel does), but XeMlaReduceSplitKV reads the flag from here.
-  static constexpr bool LSE = CollectiveEpilogue::LSE;
 
   // Tile scheduler derived types
   using TileScheduler = TileScheduler_;
@@ -492,7 +497,7 @@ class XeMlaSplitKVKernel {
     StrideO dO{};
 
     // Final softmax log-sum-exp output (log2 domain), forwarded to the
-    // reduction kernel. Only read when the LSE template parameter is true.
+    // reduction kernel. Null means the caller did not ask for the LSE.
     ElementLSE* LSE = nullptr;
     StrideLSE dLSE_out{};
 

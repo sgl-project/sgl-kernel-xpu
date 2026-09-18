@@ -177,16 +177,16 @@ def test_flash_mla_decode(
 
 @pytest.mark.parametrize("num_kv_splits", [-1, 1])
 def test_flash_mla_decode_lse_optional(num_kv_splits: int):
-    """The LSE-off kernel must be bit-identical on O, and return_lse defaults to False.
+    """Skipping the LSE must be bit-identical on O, and return_lse defaults to False.
 
     Correctness of O and of the LSE values is already covered per-mode by
     test_flash_mla_decode's return_lse parametrization; what that cannot check is
-    agreement *between* the two instantiations, since it compares each against the
-    CPU reference at 1e-2 in separate invocations. HAS_LSE=0 is a separately
-    compiled kernel (see the dispatch ladder in src/sycl/mla_decode.cpp), so this
-    pins O to be unperturbed by gating the LSE out. Both KV-split modes are covered:
-    1 split writes the LSE from the fused epilogue, auto (-1) may pick more and
-    write it from the split-KV reduction kernel.
+    agreement *between* the two modes, since it compares each against the CPU
+    reference at 1e-2 in separate invocations. Omitting the LSE passes a null LSE
+    pointer that the epilogue branches on at runtime, so this pins O to be
+    unperturbed by taking that branch. Both KV-split modes are covered: 1 split
+    writes the LSE from the fused epilogue, auto (-1) may pick more and write it
+    from the split-KV reduction kernel.
     """
     torch.random.manual_seed(42)
 
@@ -227,8 +227,8 @@ def test_flash_mla_decode_lse_optional(num_kv_splits: int):
         num_kv_splits,
     )
 
-    # out_default omits return_lse, so it takes the default (False) path and the
-    # HAS_LSE=0 kernel; out_lse runs the HAS_LSE=1 kernel on identical inputs.
+    # out_default omits return_lse, so it takes the default (False) path and passes
+    # no LSE tensor; out_lse asks for one on otherwise identical inputs.
     out_default = flash_mla_decode(*args)
     out_lse, _ = flash_mla_decode(*args, return_lse=True)
     torch.xpu.synchronize()

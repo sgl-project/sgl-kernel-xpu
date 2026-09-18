@@ -85,11 +85,6 @@ class XeMlaReduceSplitKV {
   using ElementLSEOut = typename MlaKernel_::ElementLSE;
   using StrideLSEOut = typename MlaKernel_::StrideLSE;
 
-  // Whether the merged LSE is emitted, inherited from the MLA kernel this
-  // reduction pairs with. Compile-time, so the LSE-off variant of the reduction
-  // carries neither the merge arithmetic nor the store.
-  static constexpr bool LSE = MlaKernel_::LSE;
-
   // Number of output values processed by each thread
   static constexpr int num_vals_per_thread = int(get<1>(TileShapeO{}) / (SGPerWG::value * intel::sg_size));
 
@@ -108,8 +103,8 @@ class XeMlaReduceSplitKV {
     const ElementLSE* exp_sums = nullptr;
     const ElementLSE* max_logits = nullptr;
     StrideO dLSE{};
-    // Merged softmax log-sum-exp output (log2 domain). Only read when the LSE
-    // template constant is true; left null otherwise.
+    // Merged softmax log-sum-exp output (log2 domain). Null means the caller did
+    // not ask for the LSE and the merge below is skipped.
     ElementLSEOut* LSE = nullptr;
     StrideLSEOut dLSE_out{};
   };
@@ -234,7 +229,8 @@ class XeMlaReduceSplitKV {
       //   lse = log2(sum_j exp2(logit_j)) = global_max + log2(total).
       // One lane does it: the merge is a handful of FLOPs and every thread in
       // the O loop below would otherwise recompute the same value.
-      if constexpr (LSE) {
+      // A null p.LSE is the caller's request to skip it.
+      if (p.LSE != nullptr) {
         if (thr_id == 0) {
           auto shape_LSE_out = make_shape(seq_len_qo, num_heads_q, batch);
           Tensor LSEout = make_tensor(make_gmem_ptr(p.LSE), make_layout(shape_LSE_out, p.dLSE_out));

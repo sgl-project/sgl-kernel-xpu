@@ -225,3 +225,339 @@ jobs:
         if: always()
         run: |
           docker rm -f ci_sglkernel_xpu || true
+
+  build-cri:
+    # Build-only gate for CRI (Xe3P): proves the tree still compiles for Xe3P.
+    # CRI is pre-silicon, so no kernel runs and nothing is packaged or installed.
+    #
+    # Separate job, not a step in build-and-test: CRI pins a different sycl-tla
+    # revision so it needs its own build tree, and build-and-test's container
+    # holds the BMG wheel its tests import. Same 'run-ci' gate, so the existing
+    # BMG flow runs untouched alongside this.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    permissions:
+      contents: read
+    runs-on: sglang-cri
+    env:
+      # Keep in step with the FROM in Dockerfile.xpu_kernel so CRI and BMG
+      # compile with the same oneAPI.
+      DLE_IMAGE: intel/deep-learning-essentials:2026.0.0-devel-ubuntu24.04
+    steps:
+      - name: Reclaim workspace from any previous run
+        # Must precede actions/checkout. The build container writes to the
+        # bind-mounted workspace as root, leaving build-cri/ root-owned; the
+        # runner user then cannot remove it (rm -rf and git clean fail EPERM).
+        # Cleanup at the end of the job normally chowns it back -- this is the
+        # backstop for when that never ran (cancelled job, dead runner).
+        run: |
+          set -uxo pipefail
+          if [ -d "${GITHUB_WORKSPACE}" ]; then
+            docker run --rm \
+              --entrypoint chown \
+              -v "${GITHUB_WORKSPACE}:/ws" \
+              "${DLE_IMAGE}" \
+              -R "$(id -u):$(id -g)" /ws || true
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check out the PR merged into current main
+        # refs/pull/N/merge is the same ref the BMG job builds, so a PR that only
+        # breaks Xe3P is caught against what main is right now. workflow_dispatch
+        # has no PR, so fall back to the dispatched ref.
+        run: |
+          set -euxo pipefail
+          MERGE_REF="${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}"
+          git fetch --no-tags --depth=1 origin "${MERGE_REF}"
+          git checkout --detach FETCH_HEAD
+          git --no-pager log -1 --oneline
+          # No previous PR may leak into an Xe3P configure. FETCHCONTENT_BASE_DIR
+          # is unset, so the sycl-tla clone lives in build-cri/ and goes with it.
+          # dist-cri/ is no longer produced, but an older run may have left one.
+          rm -rf build build-cri dist-cri
+          git clean -xdf
+          # A from-scratch configure is this job's premise, so assert it rather
+          # than trusting the exit codes above.
+          for leftover in build build-cri dist-cri; do
+            if [ -e "${leftover}" ]; then
+              echo "::error::${leftover}/ survived cleanup (likely root-owned from a previous run); cannot guarantee a from-scratch Xe3P build"
+              exit 1
+            fi
+          done
+
+      - name: Pull the Deep Learning Essentials image
+        # Not intel/sgl-kernel-xpu-dev:latest -- that is the BMG nightly, so
+        # pulling it on a CRI runner reads as a mistake, and everything it
+        # pre-builds is a BMG `pip install .` this job would ignore anyway.
+        #
+        # This is the image Dockerfile.xpu_kernel itself FROMs, so oneAPI/icpx is
+        # the same Deep Learning Essentials 2026.0.0 BMG compiles with -- the
+        # toolchain part, without the sglang clone, media drivers or BMG build.
+        run: |
+          docker pull "${DLE_IMAGE}"
+
+      - name: Run container
+        # No --device /dev/dri on purpose: this is a pure AOT cross-compile, and
+        # `docker run --device` fails outright when the path is absent, so
+        # mounting it would kill the job on a GPU-less runner. A host /dev/dri
+        # would be a BMG card anyway. Workspace is mounted at /src so the build
+        # compiles the checkout above.
+        run: |
+          docker run -dt \
+            --name ci_sglkernel_xpu_cri \
+            -v "${GITHUB_WORKSPACE}:/src" \
+            -w /src \
+            "${DLE_IMAGE}"
+
+      - name: Install the build toolchain
+        # Deep Learning Essentials ships icpx but not ocloc, which the Xe3P AOT
+        # device link needs (BuildFlags.cmake:169 calls it with -device cri).
+        # Versions are the pins from Dockerfile.xpu_kernel, so CRI links with the
+        # same ocloc/IGC as BMG.
+        #
+        # Only 4 debs: ocloc plus the IGC/GMM it depends on. The Dockerfile's
+        # libze1 / opencl-icd / media drivers are for running kernels, and
+        # nothing runs here (CRI is pre-silicon). Device auto-detection would
+        # need Level Zero, but DPCPP_SYCL_TARGET=cri is explicit below and
+        # BuildFlags.cmake:137 skips detection when it is set.
+        timeout-minutes: 30
+        run: |
+          docker exec ci_sglkernel_xpu_cri /bin/bash -c '\
+            set -euxo pipefail && \
+            CR=26.18.38308.1 && IGC=2.34.4+21428 && GMM=22.10.0 && \
+            export DEBIAN_FRONTEND=noninteractive && \
+            apt-get update && \
+            apt-get install -y --no-install-recommends curl ca-certificates python3-venv && \
+            cd /tmp && \
+            igc_url="https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC%%+*}" && \
+            cr_url="https://github.com/intel/compute-runtime/releases/download/${CR}" && \
+            curl -fsSL -O "${igc_url}/intel-igc-core-2_${IGC}_amd64.deb" && \
+            curl -fsSL -O "${igc_url}/intel-igc-opencl-2_${IGC}_amd64.deb" && \
+            curl -fsSL -O "${cr_url}/libigdgmm12_${GMM}_amd64.deb" && \
+            curl -fsSL -O "${cr_url}/intel-ocloc_${CR}-0_amd64.deb" && \
+            apt-get install -y --allow-downgrades \
+              ./intel-igc-core-2_${IGC}_amd64.deb \
+              ./intel-igc-opencl-2_${IGC}_amd64.deb \
+              ./libigdgmm12_${GMM}_amd64.deb \
+              ./intel-ocloc_${CR}-0_amd64.deb && \
+            rm -f /tmp/*.deb'
+
+      - name: Install torch
+        # torch supplies the CMake package the configure below consumes. Same
+        # version and index as Dockerfile.xpu_kernel; the venv is this image
+        # substituting for its miniforge py3.12 env (Ubuntu 24.04 is python3.12
+        # too, so the ABI matches BMG -- asserted below).
+        #
+        # torchvision and triton-xpu are omitted: BMG installs them for its
+        # tests, and this job compiles only.
+        timeout-minutes: 30
+        run: |
+          docker exec ci_sglkernel_xpu_cri /bin/bash -c '\
+            set -euxo pipefail && \
+            python3 -m venv /opt/cri-venv && \
+            . /opt/cri-venv/bin/activate && \
+            python3 -V && \
+            python3 -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version" && \
+            pip install -q --upgrade pip && \
+            pip install -q --timeout 300 --retries 10 torch==2.13.0 \
+              --index-url https://download.pytorch.org/whl/xpu && \
+            python3 -c "import torch; print(torch.__version__)"'
+
+      - name: Probe ocloc for the cri device (diagnostic)
+        # Non-fatal. If the pinned ocloc does not know 'cri', the device-link
+        # below fails deep in a Ninja log; this surfaces it up front.
+        continue-on-error: true
+        run: |
+          docker exec ci_sglkernel_xpu_cri /bin/bash -c '\
+            ocloc query OCL_DRIVER_VERSION || true; \
+            ocloc ids cri || echo "ocloc does not report a cri product id"'
+
+      - name: Build sgl-kernel for CRI from scratch
+        # 2408 device TUs. Measured 21 TU/min at 32 jobs, so the ceiling must sit
+        # above that; the memory-derived cap below is what brings it down.
+        timeout-minutes: 180
+        run: |
+          docker exec ci_sglkernel_xpu_cri \
+            /bin/bash -c '\
+              set -exo pipefail && \
+              . /opt/cri-venv/bin/activate && \
+              # PATH, not setvars.sh: docker exec skips the image entrypoint, so
+              # icpx is not on PATH. setvars.sh would also prepend oneAPI lib dirs
+              # to LD_LIBRARY_PATH, shadowing the libsycl torch bundles and
+              # breaking `import torch` with an undefined ur* symbol. icpx finds
+              # its own libraries by rpath, so PATH alone is enough (verified:
+              # a -fsycl compile succeeds with nothing but PATH set).
+              #
+              # Resolved, not hardcoded: the debs install into a versioned dir
+              # (compiler/2026.0/bin) and `latest` is only a symlink their postinst
+              # adds, so neither path can be assumed. Prefer `latest` -- that is
+              # the toolkit own choice of default -- else the highest version. Do
+              # not just sort the glob: `latest` sorts after every number, so it
+              # would win even when it points at an older compiler.
+              oneapi_root=/opt/intel/oneapi/compiler && \
+              if [ -x "${oneapi_root}/latest/bin/icpx" ]; then \
+                icpx_bin="${oneapi_root}/latest/bin"; \
+              else \
+                icpx_bin=$(find "${oneapi_root}" -mindepth 2 -maxdepth 2 -type d -name bin 2>/dev/null | grep -v "/latest/" | sort -V | tail -n1); \
+              fi && \
+              if [ -z "${icpx_bin}" ] || [ ! -x "${icpx_bin}/icpx" ]; then \
+                echo "::error::no icpx under /opt/intel/oneapi/compiler/*/bin in the toolchain image"; exit 1; \
+              fi && \
+              export PATH="${icpx_bin}:${PATH}" && \
+              cd /src && \
+              icpx --version && \
+              # The image installs neither cmake nor ninja, and driving CMake
+              # directly means scikit-build-core is no longer there to fetch them
+              # into an isolated build env. Same venv as torch above, so the
+              # cmake that runs is the one resolved here.
+              python3 -m pip install -q "cmake>=3.19.2" ninja && \
+              cmake --version && ninja --version && \
+              # Cap parallelism by MEMORY, not cores: unbounded ninja runs one
+              # SYCL compile per core and tools/memory/compiler_launcher.py kills
+              # the build on OOM. Measured on 384 cores / 467GiB, the default
+              # fan-out hit 99.2% and every TU in the first batch died. Budget
+              # 4GiB/job (the launcher own --file-limit-gib) over 80% of RAM,
+              # clamped to core count, so this is right on any runner size.
+              jobs=$(python3 -c "import os,re; m=dict(re.findall(r\"(\w+):\s+(\d+)\",open(\"/proc/meminfo\").read())); print(max(1,min(os.cpu_count() or 1,int(int(m[\"MemTotal\"])/1048576*0.8//4))))") && \
+              echo "build parallelism: ${jobs} jobs" && \
+              export MAX_JOBS="${jobs}" CMAKE_BUILD_PARALLEL_LEVEL="${jobs}" && \
+              # Direct CMake, not pip: this gate must produce no artifact, and
+              # `pip wheel` would package one while `pip install` would install a
+              # pre-silicon build over the image. Nothing can execute either
+              # (every op registers on torch::kXPU only).
+              #
+              # DPCPP_SYCL_TARGET must be explicit -- BUILD_TARGET_DEVICE is only
+              # read when Level Zero detection fails (cmake/DeviceDetection.cmake),
+              # so auto-detect would silently emit Xe2 on a BMG-equipped runner.
+              #
+              # The defines below replace what scikit-build-core and the toolkit
+              # probe would supply, making this configure flag-for-flag identical
+              # to a packaged build:
+              #   * SKBUILD_SABI_* feed CMakeLists.txt:12 and BuildOnLinux.cmake:60;
+              #     read back from pyproject wheel.py-api so they track that pin.
+              #   * __INTEL_LLVM_COMPILER normally comes from a probe
+              #     (FindSYCLToolkit.cmake:226), but torch ships its own and caches
+              #     it empty, silently dropping -D__INTEL_LLVM_COMPILER_VERSION
+              #     from the kernel flags (BuildFlags.cmake:102).
+              #
+              # Do NOT set CC/CXX. BuildFlags.cmake:29 gates the whole flag block
+              # on CMAKE_CXX_COMPILER_ID STREQUAL "GNU"; pointing the host compiler
+              # at icpx empties SYCL_compile_flags and every device compile dies on
+              # "-fsycl-host-compiler must be used in conjunction with -fsycl".
+              sabi=$(python3 -c "import tomllib,re; a=tomllib.load(open(\"pyproject.toml\",\"rb\"))[\"tool\"][\"scikit-build\"][\"wheel\"][\"py-api\"]; m=re.match(r\"cp3(\d+)\",a); print(\"3.\"+m.group(1) if m else \"\")") && \
+              icc_ver=$(printf "__INTEL_LLVM_COMPILER" | icpx -E -x c++ - 2>/dev/null | tail -1 | tr -dc "0-9") && \
+              echo "SKBUILD_SABI_VERSION=${sabi} __INTEL_LLVM_COMPILER=${icc_ver}" && \
+              cmake -GNinja -S . -B build-cri \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DDPCPP_SYCL_TARGET=cri \
+                -DSKBUILD_SABI_COMPONENT=Development.SABIModule \
+                -DSKBUILD_SABI_VERSION="${sabi}" \
+                -D__INTEL_LLVM_COMPILER="${icc_ver}" \
+                -DPython3_EXECUTABLE="$(which python3)" \
+                -DCMAKE_PREFIX_PATH="$(python3 -c "import torch,os;print(os.path.dirname(torch.__file__)+\"/share/cmake\")")" \
+                2>&1 | tee cri_build.log && \
+              cmake --build build-cri --parallel "${jobs}" 2>&1 | tee -a cri_build.log \
+            '
+
+      - name: Verify the build really targeted Xe3P
+        # Without this the job would pass on a silently-bmg build: if the target
+        # stopped being threaded through, CMake would auto-detect and compile Xe2.
+        run: |
+          docker exec -w /src ci_sglkernel_xpu_cri /bin/bash -c '\
+            set -uo pipefail
+            fail=0
+            check() {
+              if grep -qF "$1" cri_build.log; then
+                echo "ok: $1"
+              else
+                echo "::error::CRI build log is missing the marker: $1"
+                fail=1
+              fi
+            }
+            check "DPCPP_SYCL_TARGET set to: cri"
+            check "Compile Intel GPU AOT Targets for cri"
+            if grep -qF "DPCPP_SYCL_TARGET set to: bmg" cri_build.log; then
+              echo "::error::CRI build resolved DPCPP_SYCL_TARGET to bmg"
+              fail=1
+            fi
+            # Assert on the cache too, and pin the value EXACTLY. Every dispatch
+            # site uses MATCHES "cri", an unanchored substring match, so a
+            # superset like "intel_gpu_cri" would satisfy them all yet fail the
+            # anchored ^(bmg|cri)$ check in cmake/BuildFlags.cmake:142. "cri" is
+            # the right vocabulary: it is forwarded to ocloc as -device
+            # (BuildFlags.cmake:169), whereas intel_gpu_* belongs to
+            # -fsycl-targets.
+            cache=build-cri/CMakeCache.txt
+            if [ -f "${cache}" ]; then
+              cached=$(sed -n "s/^DPCPP_SYCL_TARGET:[A-Z]*=//p" "${cache}" | head -n1)
+              if [ "${cached}" = "cri" ]; then
+                echo "ok: CMakeCache DPCPP_SYCL_TARGET=cri"
+              else
+                echo "::error::CMakeCache has DPCPP_SYCL_TARGET=${cached:-<unset>}, expected exactly cri"
+                fail=1
+              fi
+            else
+              echo "::error::no CMakeCache.txt at ${cache}; cannot confirm the configured target"
+              fail=1
+            fi
+            # Real evidence that device code compiled and linked: a configure-only
+            # run leaves the cache above in place but produces no .so.
+            so_count=$(find build-cri -name "*.so" -type f 2>/dev/null | wc -l)
+            if [ "${so_count}" -gt 0 ]; then
+              echo "ok: ${so_count} SYCL kernel libraries compiled and linked for Xe3P"
+            else
+              echo "::error::no .so produced under build-cri; the Xe3P compile did not complete"
+              fail=1
+            fi
+            # Build-only by design, so assert the converse: an edit that brings
+            # back pip would otherwise pass while producing an unusable artifact.
+            whl=$(find . -name "*.whl" -type f 2>/dev/null | head -n5)
+            if [ -n "${whl}" ]; then
+              echo "::error::this gate must not build a wheel, but found: ${whl}"
+              fail=1
+            else
+              echo "ok: no wheel produced (build-only gate)"
+            fi
+            if [ "${fail}" -eq 0 ]; then
+              echo "CRI BUILD VERDICT: PASS (Xe3P AOT compile succeeded)"
+            else
+              echo "CRI BUILD VERDICT: FAIL"
+            fi
+            exit ${fail}'
+
+      - name: Upload CRI build log
+        # Log only -- this is a pass/fail gate and the log is what a CRI-only
+        # break gets triaged from.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cri-build-log-${{ github.event.pull_request.number || github.sha }}
+          path: cri_build.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: CRI build verdict summary
+        if: always()
+        run: |
+          {
+            echo "### CRI (Xe3P) build"
+            echo ""
+            echo "- Verdict: **${{ job.status }}**"
+            echo "- Target: \`DPCPP_SYCL_TARGET=cri\` (AOT cross-compile, \`ocloc -device cri\`)"
+            echo "- Source: PR merged into current \`main\`"
+            echo "- Build only: no kernels executed, no wheel produced (CRI is pre-silicon)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          set -uxo pipefail
+          # Hand the workspace back while the container still exists: it runs as
+          # root on a bind mount, so build-cri/ would otherwise be left
+          # root-owned and block the next PR's checkout.
+          docker exec ci_sglkernel_xpu_cri \
+            chown -R "$(id -u):$(id -g)" /src || true
+          docker rm -f ci_sglkernel_xpu_cri || true

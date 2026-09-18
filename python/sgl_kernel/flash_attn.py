@@ -1,7 +1,34 @@
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
+
+
+def build_bidirectional_block_ids(
+    seq_lens: Sequence[int],
+    block_spans: Sequence[Sequence[Tuple[int, int]]],
+    device,
+) -> Optional[torch.Tensor]:
+    """Build the per-token ``mm_block_id`` for ``flash_attn_with_kvcache``.
+
+    Tokens inside a span share a unique block id (attended bidirectionally in
+    prefill); every other token is ``-1`` (causal). Ids are concatenated over the
+    sequences in token order (matching a ragged ``total_q`` layout).
+
+    seq_lens: per-sequence token counts.
+    block_spans: per-sequence list of ``(begin, end)`` inclusive, sequence-relative.
+    Returns an int32 tensor of length ``sum(seq_lens)``, or ``None`` when there
+    are no spans (so callers can skip the mask entirely).
+    """
+    per_seq = []
+    next_id = 0
+    for length, spans in zip(seq_lens, block_spans):
+        ids = torch.full((length,), -1, dtype=torch.int32, device=device)
+        for begin, end in spans:
+            ids[begin : end + 1] = next_id
+            next_id += 1
+        per_seq.append(ids)
+    return torch.cat(per_seq) if next_id > 0 else None
 
 
 def is_fa3_supported(device=None) -> bool:
@@ -135,6 +162,9 @@ def flash_attn_with_kvcache(
     out=None,
     rel_bias=None,
     rel_bias_is_sheared=False,
+    mm_block_id=None,  # Optional per-token block id (-1 = none): keys sharing a
+    # query's non-negative id attend bidirectionally, causal otherwise. Prefill
+    # only; pair with causal=False.
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -289,6 +319,7 @@ def flash_attn_with_kvcache(
             sm_margin=sm_margin,
             return_softmax_lse=return_softmax_lse,
             out=out,
+            mm_block_id=mm_block_id,
         )
 
     q, k_cache, k, v = [maybe_contiguous(x) for x in (q, k_cache, k, v)]
@@ -363,6 +394,7 @@ def flash_attn_with_kvcache(
         softmax_lse,
         rel_bias,
         rel_bias_is_sheared,
+        mm_block_id,
     )
     return (out, softmax_lse) if return_softmax_lse else out
 
@@ -396,7 +428,15 @@ def _flash_attn_with_kvcache_page_size_1(
     sm_margin,
     return_softmax_lse,
     out,
+    mm_block_id=None,
 ):
+    # The page_size==1 path dispatches to the non-paged varlen kernel, which does
+    # not carry the block mask. Raise (not assert, which -O strips) rather than
+    # silently drop it; the bidirectional-block mask needs page_size > 1.
+    if mm_block_id is not None:
+        raise NotImplementedError(
+            "mm_block_id (bidirectional-block mask) requires page_size > 1"
+        )
     """page_size == 1 workaround: gather per-token cache slots into a dense
     ragged buffer (in ``cu_seqlens_k`` order) and run the non-paged varlen
     kernel, since the paged kernel only supports page_size in {64, 128}.

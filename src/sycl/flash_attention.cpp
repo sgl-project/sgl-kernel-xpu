@@ -1008,7 +1008,8 @@ void mha_fwd(
     at::Tensor& out,
     std::optional<at::Tensor>& softmax_lse,
     std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt,
-    std::optional<const at::Tensor> rel_bias_ = std::nullopt) {
+    std::optional<const at::Tensor> rel_bias_ = std::nullopt,
+    std::optional<const at::Tensor> block_id_ = std::nullopt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
       q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
@@ -1183,6 +1184,28 @@ void mha_fwd(
     params.rel_bias_token_stride = sheared_rel_bias.stride(0);
     params.rel_bias_head_stride = sheared_rel_bias.stride(1);
     params.rel_bias_extent = rel_bias.size(-1);
+  }
+
+  // A per-token block id (-1 = none) enables the bidirectional-block mask in the
+  // prefill mainloop: keys sharing a query's non-negative id are attended
+  // bidirectionally, causal otherwise. The mask re-imposes causal for
+  // block-less tokens, so the caller must run non-causal; ids cover the extend
+  // tokens (total_q), i.e. the full-prefill path.
+  if (block_id_.has_value()) {
+    const at::Tensor& block_id = block_id_.value();
+    TORCH_CHECK(block_id.scalar_type() == at::kInt, "mm_block_id must be int32");
+    TORCH_CHECK(block_id.device() == q.device(), "mm_block_id must be on q's device");
+    TORCH_CHECK(block_id.is_contiguous(), "mm_block_id must be contiguous");
+    TORCH_CHECK(block_id.numel() == q.size(0), "mm_block_id must have total_q entries");
+    // Block ids cover the extend (query) tokens only; the mainloop indexes them
+    // up to the KV length, so require full prefill (KV length == query length,
+    // no cached prefix) to avoid out-of-range reads.
+    TORCH_CHECK(
+        max_seqlen_k == max_seqlen_q,
+        "mm_block_id requires full prefill: KV length must equal query length (no cached prefix)");
+    TORCH_CHECK(!is_causal, "mm_block_id (bidirectional-block mask) requires is_causal=false");
+    TORCH_CHECK(params.rel_bias_ptr == nullptr, "mm_block_id and rel_bias are mutually exclusive");
+    params.block_id_ptr = block_id.data_ptr<int>();
   }
 
   // Per-batch skip mask for the chunkprefill two-launch dispatcher.
@@ -1401,7 +1424,8 @@ void mha_fwd(
     std::optional<bool> pack_gqa_,
     int const sm_margin,
     at::Tensor& out,
-    std::optional<at::Tensor>& softmax_lse) {
+    std::optional<at::Tensor>& softmax_lse,
+    std::optional<const at::Tensor> block_id_ = std::nullopt) {
   // Supports both paged (page_table != None) and non-paged (contiguous ragged
   // KV, page_table == None) layouts.
   // ``seqlens_rotary_`` is intentionally not checked here: callers pass it
@@ -1468,7 +1492,7 @@ void mha_fwd(
   // decode batches. The two complementary skip masks partition every query token
   // across the launches, so the shared buffers end up fully written with no
   // stitching or extra copies needed.
-  launch(prefill::mha_fwd, is_prefill.logical_not(), std::nullopt);
+  launch(prefill::mha_fwd, is_prefill.logical_not(), std::nullopt, block_id_);
 }
 
 }  // namespace chunkprefill
@@ -1509,7 +1533,8 @@ SGL_KERNEL_EXPORT void mha_fwd(
     at::Tensor& out,
     std::optional<at::Tensor>& softmax_lse,
     std::optional<const at::Tensor>& rel_bias_,
-    bool rel_bias_is_sheared) {
+    bool rel_bias_is_sheared,
+    std::optional<const at::Tensor>& mm_block_id_) {
   TORCH_CHECK(q.dim() == 3, "query must be in ragged format (total_q, h, d)");
   // k and v may be 3D (total_k, h_k, d) for non-paged or 4D (num_pages, page_size, h_k, d)
   // for paged KV cache; sub-functions validate their own shapes.
@@ -1585,7 +1610,7 @@ SGL_KERNEL_EXPORT void mha_fwd(
     // Relative bias currently bypasses chunkprefill. For any request with
     // max_seqlen_q > 1, use the prefill sheared-bias layout for all rows,
     // including q_len == 1 rows in a mixed batch.
-    dispatch(prefill::mha_fwd, std::nullopt, rel_bias_);
+    dispatch(prefill::mha_fwd, std::nullopt, rel_bias_, std::nullopt);
   } else if (!page_table.has_value() || is_uniform_qlen) {
     // Pure prefill path
     //
@@ -1597,10 +1622,10 @@ SGL_KERNEL_EXPORT void mha_fwd(
     //
     // This condition is sufficient but not necessary: a non-uniform
     // all-prefill batch falls through to chunkprefill, which is still correct.
-    dispatch(prefill::mha_fwd, std::nullopt, std::nullopt);
+    dispatch(prefill::mha_fwd, std::nullopt, std::nullopt, mm_block_id_);
   } else {
     // Non-uniform paged batches fall back to chunkprefill.
-    dispatch(chunkprefill::mha_fwd);
+    dispatch(chunkprefill::mha_fwd, mm_block_id_);
   }
 }
 #undef SYCL_INTEL_TARGET

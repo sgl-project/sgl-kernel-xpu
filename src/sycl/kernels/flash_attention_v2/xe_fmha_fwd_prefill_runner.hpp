@@ -91,6 +91,10 @@ struct Arguments {
   int64_t rel_bias_head_stride = 0;
   int rel_bias_extent = 0;
 
+  // Optional per-token block id; non-null enables the bidirectional-block mask
+  // (tokens sharing a non-negative id attend bidirectionally, causal otherwise).
+  const int* __restrict__ block_id_ptr = nullptr;
+
   // The stride between rows of O.
   int64_t o_batch_stride;
   int64_t o_row_stride;
@@ -468,6 +472,7 @@ struct PrefillRunner {
             params.rel_bias_token_stride,
             params.rel_bias_head_stride,
             params.rel_bias_extent,
+            params.block_id_ptr,
         },
         {},
         hw_info};

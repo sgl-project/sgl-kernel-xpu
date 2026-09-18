@@ -1404,6 +1404,47 @@ def test_moe_grouped_mm_fp8_w8a16_scalar_scales(scale_count, rows_per_expert):
     torch.testing.assert_close(reference, output.cpu(), rtol=1e-2, atol=5e-2)
 
 
+@pytest.mark.parametrize("num_experts", [1, 3, 5, 7, 9, 33])
+def test_moe_grouped_mm_fp8_w8a16_non_multiple_of_8_experts(num_experts):
+    gemm_n = gemm_k = 128
+    rows_per_expert = 4
+    torch.manual_seed(9)
+    torch.xpu.manual_seed_all(9)
+    total_rows = num_experts * rows_per_expert
+    activations = torch.randn((total_rows, gemm_k), dtype=torch.bfloat16)
+    source = torch.rand((num_experts, gemm_n, gemm_k), dtype=torch.bfloat16)
+
+    scale = (
+        source.float().abs().amax((1, 2), keepdim=True).clamp_min(1e-12) / FP8_E4M3_MAX
+    )
+    scales = scale.view(num_experts, 1)
+    weights = (source.float() / scale).to(torch.float8_e4m3fn)
+    weights_dequantized = (weights.float() * scale).to(torch.bfloat16)
+
+    reference = torch.cat(
+        [
+            activations[
+                expert * rows_per_expert : (expert + 1) * rows_per_expert
+            ].float()
+            @ weights_dequantized[expert].float().transpose(0, 1)
+            for expert in range(num_experts)
+        ],
+        dim=0,
+    ).to(torch.bfloat16)
+
+    output = torch.empty((total_rows, gemm_n), device="xpu", dtype=torch.bfloat16)
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
+        output,
+        activations.to("xpu"),
+        weights.to("xpu"),
+        scales.to("xpu"),
+        None,
+        torch.full((num_experts,), rows_per_expert, device="xpu", dtype=torch.int32),
+        num_experts,
+    )
+    torch.testing.assert_close(reference, output.cpu(), rtol=1e-2, atol=5e-2)
+
+
 @pytest.mark.parametrize("rows_per_expert", [(0, 1, 2, 3, 4, 5, 7, 10)])
 def test_moe_grouped_mm_fp8_w8a16_heterogeneous_block_scales(rows_per_expert):
     torch.manual_seed(7)

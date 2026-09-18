@@ -50,7 +50,7 @@ def test_xe35_bf16_grouped_gemm_smoke():
     torch.manual_seed(0)
     torch.xpu.manual_seed_all(0)
 
-    num_tokens, topk, num_experts, hidden_size, intermediate_size = 2, 1, 2, 64, 32
+    num_tokens, topk, num_experts, hidden_size, intermediate_size = 2, 1, 8, 64, 32
 
     a = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16)
     w1 = (
@@ -128,8 +128,10 @@ def test_xe35_mxfp4_w4a16_grouped_gemm_smoke():
     device = "xpu"
     kernel_output = fused_experts(
         a.to(device),
-        w1_packed.to(device),
-        w2_packed.to(device),
+        # moe_grouped_mm_nt_xe35_mxfp4_w4a16 requires packed_weights to be
+        # int8 (see src/sycl/kernels/moe/xe35/GroupGemmMxfp4W4A16.hpp).
+        w1_packed.view(torch.int8).to(device),
+        w2_packed.view(torch.int8).to(device),
         topk_weight.to(device),
         topk_ids.to(device),
         None,

@@ -116,7 +116,19 @@ if(NOT USE_MLA)
 endif()
 if(NOT USE_MOE)
     list(FILTER device_cpp EXCLUDE REGEX "/(GroupGemm(Xe20|W4A16Xe20|W8A16Xe20)|MoE(Align|PrepareInputs|Sum|_fused_gate|_sum_reduce))\\.cpp$")
+    list(FILTER device_cpp EXCLUDE REGEX "/xe35/(GroupGemm|GroupGemmMxfp4W4A16|blockwise_moe_mxfp4|blockwise_moe_mxfp8)\\.cpp$")
 endif()
+
+# TEMPORARY: the MXFP8/MXFP4 blockwise-scaled grouped GEMM kernels
+# (src/sycl/xe35/blockwise_moe_mxfp{4,8}.cpp) require a
+# cutlass::gemm::kernel::GemmUniversal<GroupProblemShape, ..., IntelXeGenericGroup
+# epilogue, ..., GroupScheduler> kernel-level specialization that is not present
+# in the public intel/sycl-tla commit currently pinned for DPCPP_SYCL_TARGET=cri
+# (only available in Intel's internal cutlass fork). Exclude them from the build
+# until the public sycl-tla dependency is updated to a commit that provides this
+# specialization. The kernel sources remain in the tree so they can be
+# re-enabled by simply removing this filter once the dependency is updated.
+list(FILTER device_cpp EXCLUDE REGEX "/xe35/blockwise_moe_mxfp[48]\\.cpp$")
 
 # BMG only
 set(device_cpp_xe20)
@@ -163,6 +175,10 @@ if(USE_MOE)
         include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmW4A16Xe20.cmake)
         include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmW8A16Xe20.cmake)
     endif()
+    # Xe3 (CRI) does not participate in the runtime-JIT path (Xe3 AOT
+    # instances are always built when USE_MOE is on).
+    include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmXe35.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmMxfp4W4A16Xe35.cmake)
 endif()
 
 

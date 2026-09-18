@@ -37,6 +37,7 @@
 
 #include <ATen/ATen.h>
 
+#include <optional>
 #include <sycl/sycl.hpp>
 
 namespace mla_prefill {
@@ -56,6 +57,7 @@ namespace mla_prefill {
 #define DECLARE_MLA_PREFILL_LAUNCH(ELEM, PS, BUCKET) \
   void launch_mla_prefill_##ELEM##_##PS##_##BUCKET(  \
       at::Tensor& out,                               \
+      const std::optional<at::Tensor>& lse,          \
       const at::Tensor& q_nope,                      \
       const at::Tensor& q_pe,                        \
       const at::Tensor& kv_c_and_k_pe_cache,         \
@@ -68,24 +70,23 @@ namespace mla_prefill {
       bool causal,                                   \
       int64_t num_kv_splits);
 
+// All three Q-tile buckets for one (ELEM, PAGE_SIZE).
+#define DECLARE_MLA_PREFILL_ALL_BUCKETS(ELEM, PS) \
+  DECLARE_MLA_PREFILL_LAUNCH(ELEM, PS, small)     \
+  DECLARE_MLA_PREFILL_LAUNCH(ELEM, PS, medium)    \
+  DECLARE_MLA_PREFILL_LAUNCH(ELEM, PS, large)
+
 #define DECLARE_MLA_PREFILL_ALL_PAGE_SIZES(ELEM) \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 16, small)    \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 16, medium)   \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 16, large)    \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 32, small)    \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 32, medium)   \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 32, large)    \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 64, small)    \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 64, medium)   \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 64, large)    \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 128, small)   \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 128, medium)  \
-  DECLARE_MLA_PREFILL_LAUNCH(ELEM, 128, large)
+  DECLARE_MLA_PREFILL_ALL_BUCKETS(ELEM, 16)      \
+  DECLARE_MLA_PREFILL_ALL_BUCKETS(ELEM, 32)      \
+  DECLARE_MLA_PREFILL_ALL_BUCKETS(ELEM, 64)      \
+  DECLARE_MLA_PREFILL_ALL_BUCKETS(ELEM, 128)
 
 DECLARE_MLA_PREFILL_ALL_PAGE_SIZES(half)
 DECLARE_MLA_PREFILL_ALL_PAGE_SIZES(bf16)
 
 #undef DECLARE_MLA_PREFILL_LAUNCH
+#undef DECLARE_MLA_PREFILL_ALL_BUCKETS
 #undef DECLARE_MLA_PREFILL_ALL_PAGE_SIZES
 
 }  // namespace mla_prefill

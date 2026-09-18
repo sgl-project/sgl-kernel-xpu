@@ -95,28 +95,29 @@ int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int
   return std::clamp(num_splits, 1, 128);
 }
 
-#define DISPATCH_MLA_PAGE_SIZE(ELEM)                                                                           \
-  do {                                                                                                         \
-    switch (page_size) {                                                                                       \
-      case 16:                                                                                                 \
-        mla_decode::launch_mla_decode_##ELEM##_16(                                                             \
-            out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
-        break;                                                                                                 \
-      case 32:                                                                                                 \
-        mla_decode::launch_mla_decode_##ELEM##_32(                                                             \
-            out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
-        break;                                                                                                 \
-      case 64:                                                                                                 \
-        mla_decode::launch_mla_decode_##ELEM##_64(                                                             \
-            out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
-        break;                                                                                                 \
-      case 128:                                                                                                \
-        mla_decode::launch_mla_decode_##ELEM##_128(                                                            \
-            out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits); \
-        break;                                                                                                 \
-      default:                                                                                                 \
-        TORCH_CHECK(false, "Unsupported page size for MLA decode: ", page_size);                               \
-    }                                                                                                          \
+// Leaf of the dispatch ladder: ELEM and PS must be literals when pasted.
+#define DISPATCH_MLA_LAUNCH(ELEM, PS)          \
+  mla_decode::launch_mla_decode_##ELEM##_##PS( \
+      out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits)
+
+#define DISPATCH_MLA_PAGE_SIZE(ELEM)                                             \
+  do {                                                                           \
+    switch (page_size) {                                                         \
+      case 16:                                                                   \
+        DISPATCH_MLA_LAUNCH(ELEM, 16);                                           \
+        break;                                                                   \
+      case 32:                                                                   \
+        DISPATCH_MLA_LAUNCH(ELEM, 32);                                           \
+        break;                                                                   \
+      case 64:                                                                   \
+        DISPATCH_MLA_LAUNCH(ELEM, 64);                                           \
+        break;                                                                   \
+      case 128:                                                                  \
+        DISPATCH_MLA_LAUNCH(ELEM, 128);                                          \
+        break;                                                                   \
+      default:                                                                   \
+        TORCH_CHECK(false, "Unsupported page size for MLA decode: ", page_size); \
+    }                                                                            \
   } while (0)
 
 #define DISPATCH_MLA_DTYPE()                                              \
@@ -135,8 +136,12 @@ int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int
 }  // namespace
 
 /// @brief Dispatch kernel implementation for MLA decode.
+///
+/// `lse` is an output taken by const ref: the bindings cannot box a non-const
+/// optional, and at::Tensor constness is shallow.
 SGL_KERNEL_EXPORT void flash_mla_decode(
     at::Tensor& out,                        // (batch, num_heads, latent_dim)
+    const std::optional<at::Tensor>& lse,   // (batch, num_heads) fp32, log2 domain; nullopt = skip
     const at::Tensor& q_nope,               // (batch, num_heads, latent_dim)
     const at::Tensor& q_pe,                 // (batch, num_heads, rope_dim)
     const at::Tensor& kv_c_and_k_pe_cache,  // (total_no_of_pages, page_size, (latent_dim + rope_dim))
@@ -167,6 +172,23 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
       "Unsupported page size for MLA decode: ",
       page_size,
       ". Supported: 16, 32, 64, 128");
+  if (lse.has_value()) {
+    CHECK_INPUT(lse.value());
+    TORCH_CHECK(lse->scalar_type() == at::ScalarType::Float, "lse must be float32, got ", lse->scalar_type());
+    TORCH_CHECK(lse->dim() == 2, "lse must be 2D (batch, num_heads), got ", lse->dim());
+    TORCH_CHECK(
+        lse->size(0) == q_nope.size(0) && lse->size(1) == q_nope.size(1),
+        "lse must be (batch, num_heads) = (",
+        q_nope.size(0),
+        ", ",
+        q_nope.size(1),
+        "), got (",
+        lse->size(0),
+        ", ",
+        lse->size(1),
+        ")");
+    TORCH_CHECK(lse->stride(1) == 1, "lse must be contiguous along num_heads");
+  }
 
   if (num_kv_splits < 1) {
     int page_count_per_seq = page_table.size(1);
@@ -182,6 +204,7 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
             in_dtype == at::ScalarType::Half,
             page_size,
             &out,
+            &lse,
             &q_nope,
             &q_pe,
             &kv_c_and_k_pe_cache,
@@ -199,6 +222,7 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
 #endif
 }
 
+#undef DISPATCH_MLA_LAUNCH
 #undef DISPATCH_MLA_PAGE_SIZE
 #undef DISPATCH_MLA_DTYPE
 

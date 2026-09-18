@@ -168,6 +168,8 @@ class MLA {
       reduce_kernel_args.exp_sums = args.kernel.exp_sums;
       reduce_kernel_args.max_logits = args.kernel.max_logits;
       reduce_kernel_args.dLSE = args.kernel.dLSE;
+      reduce_kernel_args.LSE = args.kernel.LSE;
+      reduce_kernel_args.dLSE_out = args.kernel.dLSE_out;
 
       ReductionArguments reduce_args{reduce_kernel_args, args.hw_info, split_kv};
       params_.reduction_params = ReductionKernel::to_underlying_arguments(reduce_args, workspace);

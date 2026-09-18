@@ -51,7 +51,7 @@ template <
     class TileShapeO_,
     class TensorO_,
     class TiledCopyO_,  // TiledCopy for storing O (void => default)
-    class TensorLSE_>  // Global softmax-LSE tensor: (q, head, batch)
+    class TensorLSE_>   // Global softmax-LSE tensor: (q, head, batch)
 class XeMlaEpilogue {
  public:
   //

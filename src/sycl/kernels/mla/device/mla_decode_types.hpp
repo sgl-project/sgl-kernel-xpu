@@ -356,16 +356,7 @@ inline void runMlaImpl(
   using MlaXeType = MlaXe<Element, PageSizeOpt, SplitKVOpt>;
   typename MlaXeType::Fmla fmla;
   auto arguments = args_from_options<MlaXeType>(
-      out,
-      lse,
-      q_nope,
-      q_pe,
-      kv_c_and_k_pe_cache,
-      seq_lens,
-      page_table,
-      workspace,
-      sm_scale,
-      num_kv_splits);
+      out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
 
   CUTLASS_CHECK(fmla.can_implement(arguments));
 
@@ -406,27 +397,9 @@ inline void runMla(
 
   if (num_kv_splits == 1) {
     runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<false>>(
-        out,
-        lse,
-        q_nope,
-        q_pe,
-        kv_c_and_k_pe_cache,
-        seq_lens,
-        page_table,
-        workspace,
-        sm_scale,
-        num_kv_splits);
+        out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
   } else {
     runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<true>>(
-        out,
-        lse,
-        q_nope,
-        q_pe,
-        kv_c_and_k_pe_cache,
-        seq_lens,
-        page_table,
-        workspace,
-        sm_scale,
-        num_kv_splits);
+        out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
   }
 }

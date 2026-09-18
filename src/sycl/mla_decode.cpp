@@ -96,8 +96,8 @@ int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int
 }
 
 // Leaf of the dispatch ladder: ELEM and PS must be literals when pasted.
-#define DISPATCH_MLA_LAUNCH(ELEM, PS)                                                                        \
-  mla_decode::launch_mla_decode_##ELEM##_##PS(                                                               \
+#define DISPATCH_MLA_LAUNCH(ELEM, PS)          \
+  mla_decode::launch_mla_decode_##ELEM##_##PS( \
       out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits)
 
 #define DISPATCH_MLA_PAGE_SIZE(ELEM)                                             \

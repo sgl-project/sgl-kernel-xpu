@@ -98,20 +98,20 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
 
 // Dispatch ladder, bottom-up: BUCKET, then DTYPE, then PAGE_SIZE. The leaf pastes
 // all three tokens into the launcher's name, so each must be a literal there.
-#define DISPATCH_MLA_PREFILL_LAUNCH(ELEM, PS, BUCKET)          \
-  mla_prefill::launch_mla_prefill_##ELEM##_##PS##_##BUCKET(    \
-      out,                                                     \
-      lse,                                                     \
-      q_nope,                                                  \
-      q_pe,                                                    \
-      kv_c_and_k_pe_cache,                                     \
-      cu_seqlens_q,                                            \
-      seq_lens,                                                \
-      max_seqlen_q,                                            \
-      page_table,                                              \
-      workspace,                                               \
-      sm_scale,                                                \
-      causal,                                                  \
+#define DISPATCH_MLA_PREFILL_LAUNCH(ELEM, PS, BUCKET)       \
+  mla_prefill::launch_mla_prefill_##ELEM##_##PS##_##BUCKET( \
+      out,                                                  \
+      lse,                                                  \
+      q_nope,                                               \
+      q_pe,                                                 \
+      kv_c_and_k_pe_cache,                                  \
+      cu_seqlens_q,                                         \
+      seq_lens,                                             \
+      max_seqlen_q,                                         \
+      page_table,                                           \
+      workspace,                                            \
+      sm_scale,                                             \
+      causal,                                               \
       num_kv_splits)
 
 #define DISPATCH_MLA_PREFILL_PAGE_SIZE(ELEM, BUCKET)                              \

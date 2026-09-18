@@ -377,14 +377,7 @@ class XeMlaFwdKernel {
       }
 
       CollectiveEpilogue epilogue(params.epilogue, shared_storage.epilogue);
-      epilogue(
-          O(_, _, head_coord, batch_slice_idx),
-          tArA,
-          tA_max,
-          tA_sum,
-          blk_qv,
-          thr_id,
-          gLSE);
+      epilogue(O(_, _, head_coord, batch_slice_idx), tArA, tA_max, tA_sum, blk_qv, thr_id, gLSE);
     }
   }
 };

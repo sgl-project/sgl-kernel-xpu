@@ -54,20 +54,20 @@ namespace mla_prefill {
 //     medium: Q_TILE_M=128/NumSGM=16 -- mid prompts (force-only for now)
 //     large:  Q_TILE_M=256/NumSGM=32 -- long prompts (Q >= 512)
 
-#define DECLARE_MLA_PREFILL_LAUNCH(ELEM, PS, BUCKET)            \
-  void launch_mla_prefill_##ELEM##_##PS##_##BUCKET(             \
-      at::Tensor& out,                                          \
-      const std::optional<at::Tensor>& lse,                     \
-      const at::Tensor& q_nope,                                 \
-      const at::Tensor& q_pe,                                   \
-      const at::Tensor& kv_c_and_k_pe_cache,                    \
-      const at::Tensor& cu_seqlens_q,                           \
-      const at::Tensor& seq_lens,                               \
-      int64_t max_seqlen_q,                                     \
-      const at::Tensor& page_table,                             \
-      at::Tensor& workspace,                                    \
-      double sm_scale,                                          \
-      bool causal,                                              \
+#define DECLARE_MLA_PREFILL_LAUNCH(ELEM, PS, BUCKET) \
+  void launch_mla_prefill_##ELEM##_##PS##_##BUCKET(  \
+      at::Tensor& out,                               \
+      const std::optional<at::Tensor>& lse,          \
+      const at::Tensor& q_nope,                      \
+      const at::Tensor& q_pe,                        \
+      const at::Tensor& kv_c_and_k_pe_cache,         \
+      const at::Tensor& cu_seqlens_q,                \
+      const at::Tensor& seq_lens,                    \
+      int64_t max_seqlen_q,                          \
+      const at::Tensor& page_table,                  \
+      at::Tensor& workspace,                         \
+      double sm_scale,                               \
+      bool causal,                                   \
       int64_t num_kv_splits);
 
 // All three Q-tile buckets for one (ELEM, PAGE_SIZE).

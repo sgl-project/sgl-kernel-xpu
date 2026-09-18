@@ -50,17 +50,17 @@ namespace mla_decode {
 //   ELEM_TAG  in {half, bf16}
 //   PAGE_SIZE in {16, 32, 64, 128}
 
-#define DECLARE_MLA_DECODE_LAUNCH(ELEM, PS)   \
-  void launch_mla_decode_##ELEM##_##PS(       \
-      at::Tensor& out,                        \
-      const std::optional<at::Tensor>& lse,   \
-      const at::Tensor& q_nope,               \
-      const at::Tensor& q_pe,                 \
-      const at::Tensor& kv_c_and_k_pe_cache,  \
-      const at::Tensor& seq_lens,             \
-      const at::Tensor& page_table,           \
-      at::Tensor& workspace,                  \
-      double sm_scale,                        \
+#define DECLARE_MLA_DECODE_LAUNCH(ELEM, PS)  \
+  void launch_mla_decode_##ELEM##_##PS(      \
+      at::Tensor& out,                       \
+      const std::optional<at::Tensor>& lse,  \
+      const at::Tensor& q_nope,              \
+      const at::Tensor& q_pe,                \
+      const at::Tensor& kv_c_and_k_pe_cache, \
+      const at::Tensor& seq_lens,            \
+      const at::Tensor& page_table,          \
+      at::Tensor& workspace,                 \
+      double sm_scale,                       \
       int64_t num_kv_splits);
 
 #define DECLARE_MLA_DECODE_ALL_PAGE_SIZES(ELEM) \

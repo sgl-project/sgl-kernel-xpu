@@ -29,8 +29,8 @@ bool check_config(const char* op_label, std::string* err) {
   return true;
 }
 
-using DecodeFn =
-    void (*)(void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, double, int64_t);
+using DecodeFn = void (*)(
+    void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, double, int64_t);
 
 // `lse` is a runtime argument, so it does not key the cache or the module name.
 uint64_t pack_decode_key(int arch, bool is_fp16, int page_size) {

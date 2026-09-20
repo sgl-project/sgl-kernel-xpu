@@ -197,8 +197,12 @@ def fp4_paged_mqa_logits(
 ) -> torch.Tensor:
     """FP4 E2M1/UE8M0 paged MQA logits on XPU."""
     q_fp4, q_scale = q_fp4
+    if q_scale.dtype != torch.uint8:
+        heads = q_scale.shape[-1]
+        q_scale = q_scale.view(torch.uint8).reshape(*q_scale.shape[:-1], heads, -1)
     if q_fp4.dim() == 4:
         q_fp4 = q_fp4.squeeze(1)
+    if q_scale.dim() == 4:
         q_scale = q_scale.squeeze(1)
     return torch.ops.sgl_kernel.fp4_paged_mqa_logits.default(
         q_fp4,

@@ -615,6 +615,15 @@ void fused_q_indexer_rope_hadamard_quant(
     double weight_scale,
     const at::Tensor& rope_cache,
     const at::Tensor& positions);
+void fused_q_indexer_rope_hadamard_fp4_quant(
+    const at::Tensor& q_input,
+    at::Tensor& q_fp4,
+    at::Tensor& q_scale,
+    const at::Tensor& weight,
+    at::Tensor& weights_out,
+    double weight_scale,
+    const at::Tensor& rope_cache,
+    const at::Tensor& positions);
 void bmm_fp8(
     at::Tensor A,
     at::Tensor B,

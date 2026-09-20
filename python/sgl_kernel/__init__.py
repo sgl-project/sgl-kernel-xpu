@@ -211,7 +211,7 @@ from sgl_kernel.moe import (
     topk_sigmoid,
     topk_softmax,
 )
-from sgl_kernel.nsa import fp8_mqa_logits, fp8_paged_mqa_logits
+from sgl_kernel.nsa import fp4_paged_mqa_logits, fp8_mqa_logits, fp8_paged_mqa_logits
 from sgl_kernel.qsa_sparse_attention import qsa_sparse_attention
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,

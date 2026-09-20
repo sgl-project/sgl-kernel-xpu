@@ -668,6 +668,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor seq_lens, Tensor block_tables, Tensor? schedule_metadata, "
       "int max_seq_len, bool clean_logits) -> Tensor");
   m.impl("fp8_paged_mqa_logits", torch::kXPU, &fp8_paged_mqa_logits);
+  m.def(
+      "fp4_paged_mqa_logits(Tensor q_fp4, Tensor q_scale, Tensor kv_cache, Tensor weights, "
+      "Tensor seq_lens, Tensor block_tables, Tensor? schedule_metadata, int max_seq_len, "
+      "bool clean_logits) -> Tensor");
+  m.impl("fp4_paged_mqa_logits", torch::kXPU, &fp4_paged_mqa_logits);
 #endif  // SYCL_INTEL_TARGET == 20
 
   /*

@@ -624,8 +624,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("lora_scatter_rows(Tensor! output, Tensor input, Tensor permutation) -> ()");
   m.impl("lora_scatter_rows", torch::kXPU, &lora_scatter_rows);
   m.def(
-      "chunked_sgmv_lora_shrink_forward(Tensor x, Tensor weights, int num_slices, int num_segments, "
-      "Tensor seg_indptr, Tensor weight_indices, Tensor lora_ranks, Tensor? permutation) -> Tensor");
+      "chunked_sgmv_lora_shrink_forward(Tensor! output, Tensor x, Tensor weights, int num_slices, int num_segments, "
+      "Tensor seg_indptr, Tensor weight_indices, Tensor lora_ranks, Tensor? permutation) -> ()");
   m.impl("chunked_sgmv_lora_shrink_forward", torch::kXPU, &chunked_sgmv_lora_shrink_forward);
 
   /* NSA (Native Sparse Attention) indexer scoring */

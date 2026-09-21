@@ -34,22 +34,7 @@
 
   This is a dedicated, small-N grouped-GEMM tile for the LoRA-A "shrink"
   projection. It reuses the shared grouped-GEMM core (GroupGemmTypes<> +
-  group_gemm_lora_launcher.hpp), differing from the merged sgemm_lora_a_fwd
-  kernel ONLY in the tile shape -- so the merged A-fwd kernel is left untouched.
-
-  Why a separate small tile: the LoRA-A shrink output is skinny in N
-  (N = num_slices * rank, typically 16..48) and per-segment short in M (decode
-  chunk sizes 16..128). The canonical 256 x 256 x 32 tile that sgemm_lora_a_fwd
-  uses computes a 256-wide N block for a 16-wide output -- wasting >90% of the N
-  dimension -- and a 256-row M block for a <=128-row segment. Across the many
-  small segments of a decode batch that waste dominates, and the Triton chunked
-  shrink (which sizes BLOCK_N = next_pow2(N)) beats it badly.
-
-  The tile below cuts the CTA tile to 128 x 64 x 32 while keeping the *validated*
-  8 x 4 x 1 subgroup layout used by every merged BMG grouped GEMM (so it is a
-  guaranteed-legal TiledMMA: 128/(8*8)=2 M-iters, 64/(16*4)=1 N-iter). Relative
-  to 256 x 256 that is 4x less wasted N compute and 2x less wasted M compute for
-  the shrink shape space, without touching the subgroup geometry.
+  group_gemm_lora_launcher.hpp).
 
   Adding another tile is a two-step change (mirrors the A-fwd convention):
     1) Define a new option tag here.

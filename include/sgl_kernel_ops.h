@@ -1314,18 +1314,14 @@ void lora_scatter_rows(
     const torch::Tensor& permutation  // [num_rows,]
 );
 
-// Chunked-SGMV LoRA "shrink" (A-matrix) forward: gather -> small-N grouped GEMM
-// -> scatter, fused into one op. permutation (logical -> physical) is optional;
-// when absent the batch is contiguous by adapter (prefill) and the GEMM runs in
-// place. Returns the LoRA-A projection in physical token order.
 torch::Tensor chunked_sgmv_lora_shrink_forward(
-    const torch::Tensor& x,               // [num_tokens, input_dim]
-    const torch::Tensor& weights,         // [num_loras, num_slices*max_rank, input_dim]
-    const int64_t num_slices,             // stacked projections (qkv=3, gate_up=2, else 1)
-    const int64_t num_segments,           // number of segments (== batch size)
-    const torch::Tensor& seg_indptr,      // [num_segments + 1,]
-    const torch::Tensor& weight_indices,  // [num_segments,]
-    const torch::Tensor& lora_ranks,      // [num_loras,]
+    const torch::Tensor& x,        // [num_tokens, input_dim]
+    const torch::Tensor& weights,  // [num_loras, num_slices*max_rank, input_dim]
+    const int64_t num_slices,      // stacked projections (qkv=3, gate_up=2, else 1)
+    const int64_t num_segments,
+    const torch::Tensor& seg_indptr,                 // [num_segments + 1,]
+    const torch::Tensor& weight_indices,             // [num_segments,]
+    const torch::Tensor& lora_ranks,                 // [num_loras,]
     const std::optional<torch::Tensor>& permutation  // [num_tokens,] logical -> physical (optional)
 );
 

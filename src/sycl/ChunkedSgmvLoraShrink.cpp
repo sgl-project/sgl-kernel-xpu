@@ -45,11 +45,8 @@
     permutation (logical -> physical, a bijection over the token rows) maps that
     to the physical token order of x / output. When permutation is absent the
     batch is already contiguous by adapter (prefill), so gather/scatter are
-    skipped and the GEMM runs in place.
-
-    The GEMM uses a dedicated small-N tile (chunked_sgmv_lora_shrink_types.hpp)
-    suited to the skinny shrink output; the merged sgemm_lora_a_fwd kernel is
-    left untouched.
+    skipped and the GEMM runs in place and seg_indptr / weight_indices are
+    assumed to be in *physical* layout.
 */
 
 #define SYCL_INTEL_TARGET 20
@@ -74,38 +71,39 @@ namespace {
 // DISPATCH_CHUNKED_SGMV_LORA_SHRINK_TILE (and to ChunkedSgmvLoraShrinkXe20.cmake
 // + chunked_sgmv_lora_shrink_dispatch.hpp + chunked_sgmv_lora_shrink_types.hpp)
 // with a runtime heuristic (e.g. average M per segment) picking the tag.
-#define DISPATCH_CHUNKED_SGMV_LORA_SHRINK_TILE(ELEM, ...)                                 \
-  do {                                                                                    \
+#define DISPATCH_CHUNKED_SGMV_LORA_SHRINK_TILE(ELEM, ...)                                       \
+  do {                                                                                          \
     chunked_sgmv_lora_shrink_impl::launch_chunked_sgmv_lora_shrink_##ELEM##_small(__VA_ARGS__); \
   } while (0)
 
-#define DISPATCH_CHUNKED_SGMV_LORA_SHRINK_DTYPE(...)                                                              \
-  do {                                                                                                           \
-    switch (weights.scalar_type()) {                                                                             \
-      case torch::kHalf:                                                                                         \
-        DISPATCH_CHUNKED_SGMV_LORA_SHRINK_TILE(half, __VA_ARGS__);                                               \
-        break;                                                                                                   \
-      case torch::kBFloat16:                                                                                     \
-        DISPATCH_CHUNKED_SGMV_LORA_SHRINK_TILE(bf16, __VA_ARGS__);                                               \
-        break;                                                                                                   \
-      default:                                                                                                   \
-        TORCH_CHECK(false, "Unsupported data type for chunked_sgmv_lora_shrink_forward weights: ",               \
-                    weights.scalar_type());                                                                      \
-    }                                                                                                            \
+#define DISPATCH_CHUNKED_SGMV_LORA_SHRINK_DTYPE(...)                                                               \
+  do {                                                                                                             \
+    switch (weights.scalar_type()) {                                                                               \
+      case torch::kHalf:                                                                                           \
+        DISPATCH_CHUNKED_SGMV_LORA_SHRINK_TILE(half, __VA_ARGS__);                                                 \
+        break;                                                                                                     \
+      case torch::kBFloat16:                                                                                       \
+        DISPATCH_CHUNKED_SGMV_LORA_SHRINK_TILE(bf16, __VA_ARGS__);                                                 \
+        break;                                                                                                     \
+      default:                                                                                                     \
+        TORCH_CHECK(                                                                                               \
+            false, "Unsupported data type for chunked_sgmv_lora_shrink_forward weights: ", weights.scalar_type()); \
+    }                                                                                                              \
   } while (0)
 
 }  // namespace
 
 //----------------- Main API function --------------------//
 
-SGL_KERNEL_EXPORT torch::Tensor chunked_sgmv_lora_shrink_forward(
-    const torch::Tensor& x,               // [num_tokens, input_dim]  (physical token order)
-    const torch::Tensor& weights,         // [num_loras, num_slices*max_rank, input_dim]
-    const int64_t num_slices,             // stacked projections (qkv=3, gate_up=2, else 1)
-    const int64_t num_segments,           // number of segments (== batch size)
-    const torch::Tensor& seg_indptr,      // [num_segments + 1,]   over the logical row order
-    const torch::Tensor& weight_indices,  // [num_segments,]
-    const torch::Tensor& lora_ranks,      // [num_loras,]
+SGL_KERNEL_EXPORT void chunked_sgmv_lora_shrink_forward(
+    torch::Tensor& output,                           // [num_tokens, num_slices*max_rank]  (physical token order)
+    const torch::Tensor& x,                          // [num_tokens, input_dim]  (physical token order)
+    const torch::Tensor& weights,                    // [num_loras, num_slices*max_rank, input_dim]
+    const int64_t num_slices,                        // stacked projections (qkv=3, gate_up=2, else 1)
+    const int64_t num_segments,                      // currently the code does not rely on it.
+    const torch::Tensor& seg_indptr,                 // [num_segments + 1,]   over the logical row order
+    const torch::Tensor& weight_indices,             // [num_segments,]
+    const torch::Tensor& lora_ranks,                 // [num_loras,]
     const std::optional<torch::Tensor>& permutation  // [num_tokens,] logical -> physical (optional)
 ) {
   CHECK_INPUT(x);
@@ -113,12 +111,14 @@ SGL_KERNEL_EXPORT torch::Tensor chunked_sgmv_lora_shrink_forward(
   CHECK_INPUT(seg_indptr);
   CHECK_INPUT(weight_indices);
   CHECK_INPUT(lora_ranks);
+  CHECK_INPUT(output);
 
   TORCH_CHECK(x.dim() == 2, "x must be a 2D tensor");
   TORCH_CHECK(weights.dim() == 3, "weights must be a 3D tensor");
   TORCH_CHECK(seg_indptr.dim() == 1, "seg_indptr must be a 1D tensor");
   TORCH_CHECK(weight_indices.dim() == 1, "weight_indices must be a 1D tensor");
   TORCH_CHECK(lora_ranks.dim() == 1, "lora_ranks must be a 1D tensor");
+  TORCH_CHECK(output.dim() == 2, "output must be a 2D tensor");
 
   TORCH_CHECK(num_slices > 0, "num_slices must be > 0");
   TORCH_CHECK(weights.size(1) % num_slices == 0, "weights.size(1) must be divisible by num_slices");
@@ -131,32 +131,34 @@ SGL_KERNEL_EXPORT torch::Tensor chunked_sgmv_lora_shrink_forward(
 
   TORCH_CHECK(num_loras_i64 > 0, "weights.size(0) must be greater than 0");
   TORCH_CHECK(lora_ranks.numel() == num_loras_i64, "lora_ranks.numel() must equal weights.size(0)");
-  TORCH_CHECK(num_segments >= 0, "num_segments must be non-negative");
+
   TORCH_CHECK(
-      weight_indices.numel() == num_segments, "weight_indices.numel() must equal num_segments");
-  TORCH_CHECK(
-      seg_indptr.numel() == num_segments + 1, "seg_indptr.numel() must equal num_segments + 1");
-
-  // Allocate the output in physical token order.
-  auto out_opts = torch::TensorOptions().dtype(weights.dtype()).device(weights.device());
-  auto output = torch::empty({num_tokens_i64, total_n_i64}, out_opts);
-
-  if (num_tokens_i64 == 0 || num_segments == 0) {
-    return output;
-  }
-  // K == 0 (input_dim == 0) is a degenerate GEMM: every output element is an
-  // empty sum, so the result is the (num_tokens, N) zero matrix.
-  if (x.size(1) == 0) {
-    output.zero_();
-    return output;
-  }
-
-  if (num_segments > 0) {
+      num_tokens_i64 == 0 || seg_indptr.numel() >= 2, "seg_indptr must have at least 2 elements when num_tokens > 0");
+  const int64_t num_segments_i64 = seg_indptr.numel() - 1;
+  TORCH_CHECK(weight_indices.numel() == num_segments_i64, "weight_indices.numel() must equal seg_indptr.numel() - 1");
+  if (num_segments_i64 > 0) {
     auto [min_wi, max_wi] = torch::aminmax(weight_indices);
     TORCH_CHECK(
         min_wi.item<int64_t>() >= 0 && max_wi.item<int64_t>() < num_loras_i64,
         "weight_indices values must be in [0, weights.size(0))");
   }
+
+  // Validate the caller-allocated output tensor (physical token order).
+  TORCH_CHECK(
+      output.size(0) == num_tokens_i64 && output.size(1) == total_n_i64,
+      "output must have shape (num_tokens, num_slices * max_rank)");
+  TORCH_CHECK(output.scalar_type() == weights.scalar_type(), "output dtype must match weights dtype");
+
+  if (num_tokens_i64 == 0) {
+    return;
+  }
+  // K == 0 (input_dim == 0) is a degenerate GEMM: every output element is an
+  // empty sum, so the result is the (num_tokens, N) zero matrix.
+  if (x.size(1) == 0) {
+    output.zero_();
+    return;
+  }
+
   TORCH_CHECK(seg_indptr[0].item<int64_t>() == 0, "seg_indptr[0] must be 0");
   TORCH_CHECK(
       seg_indptr[seg_indptr.numel() - 1].item<int64_t>() == num_tokens_i64, "seg_indptr[-1] must equal num_tokens");
@@ -183,14 +185,14 @@ SGL_KERNEL_EXPORT torch::Tensor chunked_sgmv_lora_shrink_forward(
   auto queue = stream.queue();
 
   const int max_rank = static_cast<int>(max_rank_i64);
-  const int num_segments_ = static_cast<int>(num_segments);
+  const int num_segments_ = static_cast<int>(num_segments_i64);
   const int num_slices_ = static_cast<int>(num_slices);
 
   if (!permutation.has_value()) {
     // Prefill fast path: rows already contiguous by adapter, GEMM in place.
     DISPATCH_CHUNKED_SGMV_LORA_SHRINK_DTYPE(
         x, weights, seg_indptr_i32, weight_indices_i32, output, num_slices_, max_rank, num_segments_, queue);
-    return output;
+    return;
   }
 
   // Decode path: gather physical -> logical, GEMM, scatter logical -> physical.
@@ -209,12 +211,11 @@ SGL_KERNEL_EXPORT torch::Tensor chunked_sgmv_lora_shrink_forward(
   auto x_sorted = torch::empty({num_tokens_i64, x.size(1)}, x.options());
   lora_permute_rows_impl::permute_rows_dispatch</*GATHER=*/true>(x, x_sorted, perm_i64, queue);
 
-  auto out_sorted = torch::empty({num_tokens_i64, total_n_i64}, out_opts);
+  auto out_sorted = torch::empty({num_tokens_i64, total_n_i64}, output.options());
   DISPATCH_CHUNKED_SGMV_LORA_SHRINK_DTYPE(
       x_sorted, weights, seg_indptr_i32, weight_indices_i32, out_sorted, num_slices_, max_rank, num_segments_, queue);
 
   lora_permute_rows_impl::permute_rows_dispatch</*GATHER=*/false>(out_sorted, output, perm_i64, queue);
-  return output;
 }
 
 #undef DISPATCH_CHUNKED_SGMV_LORA_SHRINK_TILE

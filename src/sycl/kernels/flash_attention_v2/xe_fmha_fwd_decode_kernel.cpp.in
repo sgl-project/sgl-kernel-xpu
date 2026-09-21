@@ -96,15 +96,14 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
         "relative attention expects a decode-sheared bias with ",
         flash_attention_v2::relative_attention::decode_padded_cols(params.rel_bias_extent, @PAGE_SIZE@),
         " columns");
-    // xe_fmha_fwd_decode_runner.hpp already rejects softcap != 0 with a rel bias, so a
-    // Softcap=true kernel here is unreachable -- don't pay AOT compile time for it.
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       using Element = @ELEM_TYPE@;
+      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
       DecodeConfig<
           false,
           LocalMask,
           false,
-          /*Softcap=*/false,
+          Softcap,
           /*LSE=*/false,
           TileShapeQK,
           TileShapePV,
@@ -128,6 +127,7 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
           void,
           void,
           true>::run_paged(params);
+      });
     });
     return;
   }

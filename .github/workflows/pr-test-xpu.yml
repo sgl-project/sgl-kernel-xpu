@@ -39,7 +39,7 @@ jobs:
             intel/sgl-kernel-xpu-dev:latest
 
       - name: Rebuild sgl-kernel from latest main + PR
-        timeout-minutes: 50
+        timeout-minutes: 60
         env:
           # refs/pull/N/merge is GitHub's pre-computed merge commit:
           # current base (main) merged with this PR. Testing that ref

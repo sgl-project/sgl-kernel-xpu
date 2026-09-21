@@ -326,7 +326,7 @@ struct PrefillRunner {
     // softcap folds through apply_relative_bias as softcap(QK+bias); the reference
     // ordering is softcap(QK)+bias, so reject the unsupported combination.
     TORCH_CHECK(
-        !(params.softcap > 0.f && params.rel_bias_ptr != nullptr),
+        !(params.softcap != 0.f && params.rel_bias_ptr != nullptr),
         "softcap combined with relative attention bias is not supported on XPU");
     constexpr int64_t kIntMax = 2147483647LL;
     TORCH_CHECK(

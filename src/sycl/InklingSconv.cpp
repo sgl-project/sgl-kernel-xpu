@@ -22,6 +22,12 @@
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+#include <cutlass/util/GPU_Clock.hpp>
+
+#include "SGLKernelPerf.h"
+#endif
+
 namespace {
 
 constexpr int kPadSlotId = -1;
@@ -1680,6 +1686,12 @@ SGL_KERNEL_EXPORT at::Tensor inkling_sconv_forward(
   at::Tensor y = at::empty_strided({x.size(0), x.size(1)}, {x.size(1), 1}, x.options());
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = x.scalar_type();
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_sconv_forward", [&]() -> at::Tensor {
         SconvForwardParams<scalar_t> params{
@@ -1713,6 +1725,20 @@ SGL_KERNEL_EXPORT at::Tensor inkling_sconv_forward(
         }
         return y;
       });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Short conv 1d: 2*T*D*W mult-adds.
+  const int64_t T_ = x.size(0);
+  const int64_t D_ = x.size(1);
+  const int64_t W_ = sconv_cache.size(1) + 1;
+  const double flops = 2.0 * static_cast<double>(T_) * static_cast<double>(D_) * static_cast<double>(W_);
+  const double bytes = static_cast<double>(x.numel()) * static_cast<double>(x.element_size()) +
+                       static_cast<double>(weight.numel()) * static_cast<double>(weight.element_size()) +
+                       static_cast<double>(sconv_cache.numel()) * static_cast<double>(sconv_cache.element_size()) +
+                       static_cast<double>(y.numel()) * static_cast<double>(y.element_size());
+  ::sglkernel::report_kernel_perf("inkling_sconv_forward", queue, timer, bytes, flops);
+#endif
+
   return y;
 }
 

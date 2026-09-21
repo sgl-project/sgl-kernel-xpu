@@ -15,6 +15,12 @@
 #include "comm/Sampling.h"
 #include "sgl_kernel_export.h"
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+#include <cutlass/util/GPU_Clock.hpp>
+
+#include "SGLKernelPerf.h"
+#endif
+
 template <typename T>
 struct ToSyclElementType {
   using type = T;
@@ -278,6 +284,11 @@ SGL_KERNEL_EXPORT void min_p_sampling_from_probs(
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   launch_min_p_sampling<float>(
       probs,
       output.data_ptr<int32_t>(),
@@ -290,4 +301,11 @@ SGL_KERNEL_EXPORT void min_p_sampling_from_probs(
       philox_offset,
       deterministic,
       queue);
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = 0.0;
+  const double bytes = static_cast<double>(probs.numel()) * static_cast<double>(probs.element_size()) +
+                       static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
+  ::sglkernel::report_kernel_perf("min_p_sampling", queue, timer, bytes, flops);
+#endif
 }

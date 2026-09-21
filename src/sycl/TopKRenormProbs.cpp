@@ -11,6 +11,12 @@
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+#include <cutlass/util/GPU_Clock.hpp>
+
+#include "SGLKernelPerf.h"
+#endif
+
 //----------------- set element type options --------------------//
 
 template <typename T>
@@ -331,6 +337,11 @@ SGL_KERNEL_EXPORT void top_k_renorm_probs(
 
   auto dtype = probs.scalar_type();
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   if (dtype == torch::kFloat32) {
     launch_single_cta_kernel<float>(
         probs, renorm_probs, maybe_top_k_ptr, static_cast<int>(top_k_val), batch_size, vocab_size, queue);
@@ -341,4 +352,11 @@ SGL_KERNEL_EXPORT void top_k_renorm_probs(
     launch_single_cta_kernel<at::BFloat16>(
         probs, renorm_probs, maybe_top_k_ptr, static_cast<int>(top_k_val), batch_size, vocab_size, queue);
   }
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = 0.0;
+  const double bytes = static_cast<double>(probs.numel()) * static_cast<double>(probs.element_size()) +
+                       static_cast<double>(renorm_probs.numel()) * static_cast<double>(renorm_probs.element_size());
+  ::sglkernel::report_kernel_perf("top_k_renorm_probs", queue, timer, bytes, flops);
+#endif
 }

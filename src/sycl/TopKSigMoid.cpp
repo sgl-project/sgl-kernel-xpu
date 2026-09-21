@@ -9,6 +9,12 @@
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+#include <cutlass/util/GPU_Clock.hpp>
+
+#include "SGLKernelPerf.h"
+#endif
+
 namespace at::native::xpu {
 
 namespace TopKSigmoidImpl {
@@ -643,6 +649,12 @@ SGL_KERNEL_EXPORT void topk_sigmoid(
     bias_ptr = bias.data_ptr<float>();
   }
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   // Cover Float in addition to the reduced float types (Half, BFloat16): some
   // models (e.g. Nemotron-3-Nano MoE) emit fp32 router gating logits. The kernel
   // already upcasts each element to float internally, so the fp32 path is a
@@ -660,5 +672,14 @@ SGL_KERNEL_EXPORT void topk_sigmoid(
         n_experts,
         n_topk);
   });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = 0.0;
+  const double bytes =
+      static_cast<double>(gating_output.numel()) * static_cast<double>(gating_output.element_size()) +
+      static_cast<double>(topk_weights.numel()) * static_cast<double>(topk_weights.element_size()) +
+      static_cast<double>(topk_indices.numel()) * static_cast<double>(topk_indices.element_size());
+  ::sglkernel::report_kernel_perf("topk_sigmoid", profiling_queue, timer, bytes, flops);
+#endif
 }
 }  // namespace at::native::xpu

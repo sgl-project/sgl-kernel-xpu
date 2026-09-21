@@ -16,6 +16,12 @@
 #endif
 #include "sgl_kernel_export.h"
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+#include <cutlass/util/GPU_Clock.hpp>
+
+#include "SGLKernelPerf.h"
+#endif
+
 using namespace cute;
 using namespace MoE;
 
@@ -222,6 +228,11 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
   void* bias_ptr = with_bias ? bias->data_ptr() : nullptr;
   int ld_b = static_cast<int>(weights.stride(1));
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
+
 #ifdef USE_MOE_JIT
   {
     std::string jit_err;
@@ -286,6 +297,19 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
       TORCH_CHECK(false, "MoE grouped GEMM: invalid tile id");
   }
 #undef MOE_GG_CASE
+#endif
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Grouped GEMM: sum over experts of (m_e, K) @ (K, N). Total M rows summed as total_m.
+  const double M = static_cast<double>(total_m);
+  const double N = static_cast<double>(gemm_n);
+  const double K = static_cast<double>(gemm_k);
+  const double flops = 2.0 * M * N * K;
+  const double bytes =
+      static_cast<double>(activations.numel()) * static_cast<double>(activations.element_size()) +
+      static_cast<double>(weights.numel()) * static_cast<double>(weights.element_size()) +
+      static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
+  ::sglkernel::report_kernel_perf("moe_grouped_mm_nt_xe20", queue, timer, bytes, flops);
 #endif
 }
 

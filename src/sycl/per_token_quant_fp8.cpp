@@ -47,6 +47,13 @@
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+#include <c10/xpu/XPUStream.h>
+#include <cutlass/util/GPU_Clock.hpp>
+
+#include "SGLKernelPerf.h"
+#endif
+
 // TODO: Remove CUTLASS emulation and use native SYCL FP8 when available.
 using cutlass::float_e4m3_t;
 
@@ -236,6 +243,12 @@ SGL_KERNEL_EXPORT void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor outp
   const int64_t xe_cores = dpcppMaxComputeUnitSize(dev_id);
   const bool use_warp_kernel = num_tokens >= xe_cores * 2 * TOKENS_PER_WG;
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
 #define LAUNCH_WARP(T, DST_DTYPE, VEC)                                        \
   do {                                                                        \
     const int wg_size = TOKENS_PER_WG * SUB_GROUP_SIZE;                       \
@@ -303,4 +316,13 @@ SGL_KERNEL_EXPORT void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor outp
 #undef LAUNCH_SWITCH
 #undef LAUNCH_BLOCK
 #undef LAUNCH_WARP
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Per-token FP8 quant: one scale/mul per input element. Memory-bound.
+  const double flops = static_cast<double>(input.numel());
+  const double bytes = static_cast<double>(input.numel()) * static_cast<double>(input.element_size()) +
+                       static_cast<double>(output_q.numel()) * static_cast<double>(output_q.element_size()) +
+                       static_cast<double>(output_s.numel()) * static_cast<double>(output_s.element_size());
+  ::sglkernel::report_kernel_perf("per_token_quant_fp8", profiling_queue, timer, bytes, flops);
+#endif
 }

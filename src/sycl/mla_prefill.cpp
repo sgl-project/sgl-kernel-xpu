@@ -54,6 +54,12 @@
 #include "jit/mla_jit.h"
 #endif
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+#include <cutlass/util/GPU_Clock.hpp>
+
+#include "SGLKernelPerf.h"
+#endif
+
 namespace {
 
 // Host-side 2D (Q, K) tile-bucket dispatch. Selects the small-tile kernel
@@ -256,6 +262,12 @@ SGL_KERNEL_EXPORT void flash_mla_prefill(
   }
 #endif
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
 #ifdef USE_MLA_JIT
   {
     const int bucket_id = (bucket == Bucket::Small) ? 0 : (bucket == Bucket::Medium) ? 1 : 2;
@@ -284,6 +296,25 @@ SGL_KERNEL_EXPORT void flash_mla_prefill(
   }
 #else
   DISPATCH_MLA_PREFILL_BUCKET();
+#endif
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Prefill: total_q ragged tokens over cumulative KV. QK + PV.
+  const int64_t total_q = q_nope.size(0);
+  const int64_t H = q_nope.size(1);
+  const int64_t D_nope = q_nope.size(2);
+  const int64_t D_pe = q_pe.size(2);
+  const int64_t D_qk = D_nope + D_pe;
+  const double S_kv = static_cast<double>(max_kv_len_estimate);
+  const double flops =
+      2.0 * static_cast<double>(total_q) * static_cast<double>(H) * S_kv * static_cast<double>(D_qk) +
+      2.0 * static_cast<double>(total_q) * static_cast<double>(H) * S_kv * static_cast<double>(D_nope);
+  const double bytes =
+      static_cast<double>(q_nope.numel()) * static_cast<double>(q_nope.element_size()) +
+      static_cast<double>(q_pe.numel()) * static_cast<double>(q_pe.element_size()) +
+      static_cast<double>(kv_c_and_k_pe_cache.numel()) * static_cast<double>(kv_c_and_k_pe_cache.element_size()) +
+      static_cast<double>(out.numel()) * static_cast<double>(out.element_size());
+  ::sglkernel::report_kernel_perf("flash_mla_prefill", profiling_queue, timer, bytes, flops);
 #endif
 }
 

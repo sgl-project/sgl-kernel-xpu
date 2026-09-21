@@ -55,6 +55,12 @@ Outputs:
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+#include <cutlass/util/GPU_Clock.hpp>
+
+#include "SGLKernelPerf.h"
+#endif
+
 namespace {
 
 enum class TreeMaskMode : int64_t {
@@ -510,6 +516,12 @@ SGL_KERNEL_EXPORT void build_tree_kernel_efficient(
     pack_words >>= 1;
   }
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   AT_DISPATCH_INDEX_TYPES(verified_seq_len.scalar_type(), "build_tree_kernel_efficient", [&] {
     auto launch = [&](auto pack_words_tag) {
       using Kernel = BuildTreeKernel<index_t, decltype(pack_words_tag)::value>;
@@ -544,4 +556,18 @@ SGL_KERNEL_EXPORT void build_tree_kernel_efficient(
         break;
     }
   });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = 0.0;
+  const double bytes =
+      static_cast<double>(parent_list.numel()) * static_cast<double>(parent_list.element_size()) +
+      static_cast<double>(selected_index.numel()) * static_cast<double>(selected_index.element_size()) +
+      static_cast<double>(verified_seq_len.numel()) * static_cast<double>(verified_seq_len.element_size()) +
+      static_cast<double>(tree_mask.numel()) * static_cast<double>(tree_mask.element_size()) +
+      static_cast<double>(positions.numel()) * static_cast<double>(positions.element_size()) +
+      static_cast<double>(retrive_index.numel()) * static_cast<double>(retrive_index.element_size()) +
+      static_cast<double>(retrive_next_token.numel()) * static_cast<double>(retrive_next_token.element_size()) +
+      static_cast<double>(retrive_next_sibling.numel()) * static_cast<double>(retrive_next_sibling.element_size());
+  ::sglkernel::report_kernel_perf("build_tree_kernel_efficient", profiling_queue, timer, bytes, flops);
+#endif
 }

@@ -8,6 +8,12 @@
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+#include <cutlass/util/GPU_Clock.hpp>
+
+#include "SGLKernelPerf.h"
+#endif
+
 // ============================================================
 // EmbeddingLoRAAFwd Kernel
 // ------------------------------------------------------------
@@ -308,6 +314,12 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
   const int num_segments = num_segments_i64;
   const int num_extra_tokens = extra_embeddings.has_value() ? extra_embeddings->size(1) : 0;
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   // Dispatch kernel based on data type
   if (weights.scalar_type() == torch::kFloat32) {
     launch_embedding_lora_a_fwd<float>(
@@ -360,4 +372,14 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
   } else {
     TORCH_CHECK(false, "Unsupported data type for weights");
   }
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Embedding LoRA A fwd: one gather write per (token, rank) valid pair. Treat as memory-bound.
+  const double bytes =
+      static_cast<double>(input_ids.numel()) * static_cast<double>(input_ids.element_size()) +
+      static_cast<double>(weights.numel()) * static_cast<double>(weights.element_size()) +
+      static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
+  const double flops = 0.0;
+  ::sglkernel::report_kernel_perf("embedding_lora_a_fwd", profiling_queue, timer, bytes, flops);
+#endif
 }

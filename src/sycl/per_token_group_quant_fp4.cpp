@@ -34,6 +34,12 @@
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+#include <cutlass/util/GPU_Clock.hpp>
+
+#include "SGLKernelPerf.h"
+#endif
+
 namespace at::native::xpu {
 
 constexpr float FLOAT4_E2M1_MAX = 6.0f;
@@ -395,6 +401,12 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_fp4(
   sycl::range<1> global_range(num_blocks * num_threads);
   sycl::range<1> local_range(num_threads);
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
 #define LAUNCH_FP4_KERNEL_WITH_GROUP_SIZE(T, GS, FUSE, COL_MAJOR)                                        \
   do {                                                                                                   \
     const T* input_sec_ptr = FUSE ? static_cast<const T*>(input_secondary.value().data_ptr()) : nullptr; \
@@ -435,6 +447,14 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_fp4(
 
 #undef LAUNCH_FP4_KERNEL
 #undef LAUNCH_FP4_KERNEL_WITH_GROUP_SIZE
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = static_cast<double>(input.numel());
+  const double bytes = static_cast<double>(input.numel()) * static_cast<double>(input.element_size()) +
+                       static_cast<double>(output_q.numel()) * static_cast<double>(output_q.element_size()) +
+                       static_cast<double>(output_s.numel()) * static_cast<double>(output_s.element_size());
+  ::sglkernel::report_kernel_perf("per_token_group_quant_fp4", profiling_queue, timer, bytes, flops);
+#endif
 }
 
 }  // namespace at::native::xpu

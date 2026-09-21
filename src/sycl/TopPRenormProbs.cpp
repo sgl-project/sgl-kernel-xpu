@@ -13,6 +13,12 @@
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+#include <cutlass/util/GPU_Clock.hpp>
+
+#include "SGLKernelPerf.h"
+#endif
+
 namespace {
 
 // SLM/WG constants
@@ -377,6 +383,18 @@ SGL_KERNEL_EXPORT void top_p_renorm_probs(
 
   const float* maybe_top_p_ptr = maybe_top_p_arr.has_value() ? maybe_top_p_arr->data_ptr<float>() : nullptr;
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   launch_top_p_renorm_kernel(
       renorm_probs, probs, maybe_top_p_ptr, static_cast<float>(top_p_val), batch_size, vocab_size, queue);
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = 0.0;
+  const double bytes = static_cast<double>(probs.numel()) * static_cast<double>(probs.element_size()) +
+                       static_cast<double>(renorm_probs.numel()) * static_cast<double>(renorm_probs.element_size());
+  ::sglkernel::report_kernel_perf("top_p_renorm_probs", queue, timer, bytes, flops);
+#endif
 }

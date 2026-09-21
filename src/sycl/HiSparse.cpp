@@ -8,6 +8,13 @@
 #include "sgl_kernel/hisparse/transfer_cache_dsv4_mla.hpp"
 #include "sgl_kernel_export.h"
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+#include <c10/xpu/XPUStream.h>
+#include <cutlass/util/GPU_Clock.hpp>
+
+#include "SGLKernelPerf.h"
+#endif
+
 using namespace sgl::sycl_kernel::hisparse;
 
 namespace {
@@ -175,6 +182,12 @@ SGL_KERNEL_EXPORT void transfer_cache_dsv4_mla(
   const auto items = static_cast<uint32_t>(num_items);
   const auto layers = static_cast<uint32_t>(num_layers);
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   // block_size is a template parameter; 1024 is the default, the rest are
   // escape hatches (all three measure within noise on Xe2).
   switch (block_size) {
@@ -190,6 +203,14 @@ SGL_KERNEL_EXPORT void transfer_cache_dsv4_mla(
     default:
       TORCH_CHECK(false, "block_size must be one of 256, 512, 1024, got ", block_size);
   }
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Cache transfer op: memory-bound, no compute. Bytes unknown at this level; use index tensors as a proxy.
+  const double flops = 0.0;
+  const double bytes = static_cast<double>(src_indices.numel()) * static_cast<double>(src_indices.element_size()) +
+                       static_cast<double>(dst_indices.numel()) * static_cast<double>(dst_indices.element_size());
+  ::sglkernel::report_kernel_perf("transfer_cache_dsv4_mla", profiling_queue, timer, bytes, flops);
+#endif
 }
 
 SGL_KERNEL_EXPORT void load_cache_to_device_buffer_mla(
@@ -306,9 +327,27 @@ SGL_KERNEL_EXPORT void load_cache_to_device_buffer_mla(
   };
   (void)page_size;
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   if (is_dsv4_layout) {
     launch_load_cache_to_device_buffer</*IsMLA=*/true, /*IsDsv4Layout=*/true>(args, layout);
   } else {
     launch_load_cache_to_device_buffer</*IsMLA=*/true, /*IsDsv4Layout=*/false>(args, layout);
   }
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = 0.0;
+  const double bytes =
+      static_cast<double>(top_k_tokens.numel()) * static_cast<double>(top_k_tokens.element_size()) +
+      static_cast<double>(device_buffer_tokens.numel()) * static_cast<double>(device_buffer_tokens.element_size()) +
+      static_cast<double>(host_cache_locs.numel()) * static_cast<double>(host_cache_locs.element_size()) +
+      static_cast<double>(device_buffer_locs.numel()) * static_cast<double>(device_buffer_locs.element_size()) +
+      static_cast<double>(host_cache.numel()) * static_cast<double>(host_cache.element_size()) +
+      static_cast<double>(device_buffer.numel()) * static_cast<double>(device_buffer.element_size());
+  ::sglkernel::report_kernel_perf("load_cache_to_device_buffer_mla", profiling_queue, timer, bytes, flops);
+#endif
 }

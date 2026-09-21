@@ -10,6 +10,12 @@
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+#include <cutlass/util/GPU_Clock.hpp>
+
+#include "SGLKernelPerf.h"
+#endif
+
 namespace at::native::xpu {
 
 namespace {
@@ -228,6 +234,12 @@ SGL_KERNEL_EXPORT at::Tensor hadamard_transform(const at::Tensor& input, double 
   at::Tensor out_flat = at::empty_like(x_flat);
   const int64_t batch = x_flat.size(0);
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   if (batch > 0) {
     const int64_t x_batch_stride = x_flat.stride(0);
     const int64_t out_batch_stride = out_flat.stride(0);
@@ -255,6 +267,15 @@ SGL_KERNEL_EXPORT at::Tensor hadamard_transform(const at::Tensor& input, double 
   }
 
   at::Tensor out = padded_dim != dim_og ? out_flat.slice(1, 0, dim_og) : out_flat;
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Hadamard transform: memory-bound; N log N butterfly work per row.
+  const double flops = 0.0;
+  const double bytes = static_cast<double>(input.numel()) * static_cast<double>(input.element_size()) +
+                       static_cast<double>(out.numel()) * static_cast<double>(out.element_size());
+  ::sglkernel::report_kernel_perf("hadamard", profiling_queue, timer, bytes, flops);
+#endif
+
   return out.reshape(shapes_og);
 }
 

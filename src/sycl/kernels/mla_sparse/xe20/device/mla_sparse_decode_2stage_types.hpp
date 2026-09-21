@@ -85,7 +85,7 @@
 #include <limits>
 #include <sycl/sycl.hpp>
 
-#include "../../../Utils.h"  // CUTLASS_CHECK (used by mla_sparse_runner.hpp)
+#include "../../../../Utils.h"  // CUTLASS_CHECK (used by mla_sparse_runner.hpp)
 #include "cutlass/bfloat16.h"
 #include "cutlass/float8.h"
 // The collective headers pull in the full cute/cutlass sycl-tla stack (defining
@@ -93,18 +93,18 @@
 // sort under collective/ (before device/), so the runner always sees cute::intel
 // even after include re-alphabetization. (Matches the fused path, which likewise
 // includes its collectives before the runner.)
-#include "sycl/kernels/mla_sparse/collective/xe_mla_sparse_2stage_epilogue.hpp"
-#include "sycl/kernels/mla_sparse/collective/xe_mla_sparse_2stage_mainloop.hpp"
-#include "sycl/kernels/mla_sparse/device/mla_sparse_runner.hpp"
+#include "sycl/kernels/mla_sparse/xe20/collective/xe_mla_sparse_2stage_epilogue.hpp"
+#include "sycl/kernels/mla_sparse/xe20/collective/xe_mla_sparse_2stage_mainloop.hpp"
+#include "sycl/kernels/mla_sparse/xe20/device/mla_sparse_runner.hpp"
 // The two stages' kernels, included as peers: the config struct below resolves one of
 // each (GatherKernel / DenseKernel) and hands both to the runner, which launches them
 // in order. The dense kernel transitively includes the common prologue (the per-layer params blocks /
 // LOG_2_E / the V-split knobs / DISPATCH_BOOLEAN_FLAG), the tile scheduler, and both
 // collectives; the gather kernel is independent of it.
-#include "sycl/kernels/mla_sparse/kernel/xe_mla_sparse_2stage_dense_kernel.hpp"
-#include "sycl/kernels/mla_sparse/kernel/xe_mla_sparse_2stage_gather_kernel.hpp"
+#include "sycl/kernels/mla_sparse/xe20/kernel/xe_mla_sparse_2stage_dense_kernel.hpp"
+#include "sycl/kernels/mla_sparse/xe20/kernel/xe_mla_sparse_2stage_gather_kernel.hpp"
 // Optional third stage, instantiated only when the config's IS_SPLIT_KV is true.
-#include "sycl/kernels/mla_sparse/kernel/xe_mla_sparse_2stage_reduce_split_kv.hpp"
+#include "sycl/kernels/mla_sparse/xe20/kernel/xe_mla_sparse_2stage_reduce_split_kv.hpp"
 
 namespace cutlass::flash_attention::kernel {
 

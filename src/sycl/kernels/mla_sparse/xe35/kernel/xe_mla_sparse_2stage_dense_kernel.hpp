@@ -54,10 +54,10 @@
 
 #pragma once
 
-#include "sycl/kernels/mla_sparse/collective/xe_mla_sparse_2stage_epilogue.hpp"
-#include "sycl/kernels/mla_sparse/collective/xe_mla_sparse_2stage_mainloop.hpp"
-#include "sycl/kernels/mla_sparse/device/xe_mla_sparse_2stage_common.hpp"
-#include "sycl/kernels/mla_sparse/kernel/xe_mla_sparse_2stage_tile_scheduler.hpp"
+#include "sycl/kernels/mla_sparse/xe35/collective/xe_mla_sparse_2stage_epilogue.hpp"
+#include "sycl/kernels/mla_sparse/xe35/collective/xe_mla_sparse_2stage_mainloop.hpp"
+#include "sycl/kernels/mla_sparse/xe35/device/xe_mla_sparse_2stage_common.hpp"
+#include "sycl/kernels/mla_sparse/xe35/kernel/xe_mla_sparse_2stage_tile_scheduler.hpp"
 
 namespace cutlass::flash_attention::kernel {
 

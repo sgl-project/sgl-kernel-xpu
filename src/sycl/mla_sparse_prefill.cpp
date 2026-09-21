@@ -11,7 +11,10 @@
     lse. Each query row is mapped to a decode "batch" (see
     device/mla_sparse_prefill_2stage_types.hpp).
 */
-#define SYCL_INTEL_TARGET 20
+// SYCL_INTEL_TARGET is defined build-wide by the top-level CMakeLists (20 for
+// bmg/xe20, 35 for cri/xe35). Select the host dispatch header from the matching arch
+// bucket so a future xe20/xe35 divergence in the (declarations-only) dispatch contract
+// compiles the correct one.
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
@@ -20,7 +23,11 @@
 
 #include "Utils.h"
 #include "sgl_kernel_export.h"
-#include "sycl/kernels/mla_sparse/device/mla_sparse_prefill_dispatch.hpp"
+#if SYCL_INTEL_TARGET == 35
+#include "sycl/kernels/mla_sparse/xe35/device/mla_sparse_prefill_dispatch.hpp"
+#else
+#include "sycl/kernels/mla_sparse/xe20/device/mla_sparse_prefill_dispatch.hpp"
+#endif
 #ifdef USE_MLA_JIT
 #include "jit/mla_jit.h"
 #endif
@@ -176,4 +183,3 @@ SGL_KERNEL_EXPORT void flash_mla_sparse_prefill(
 #undef DISPATCH_MLA_SPARSE_PREFILL_B_H
 #undef DISPATCH_MLA_SPARSE_PREFILL_SINK
 #undef DISPATCH_MLA_SPARSE_PREFILL_LAUNCH_2STAGE
-#undef SYCL_INTEL_TARGET

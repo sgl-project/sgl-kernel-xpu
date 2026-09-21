@@ -14,8 +14,8 @@
 
 #pragma once
 
-#include "sycl/kernels/mla_sparse/device/xe_mla_sparse_2stage_common.hpp"
-#include "sycl/kernels/mla_sparse/kernel/xe_mla_sparse_2stage_tile_scheduler.hpp"
+#include "sycl/kernels/mla_sparse/xe20/device/xe_mla_sparse_2stage_common.hpp"
+#include "sycl/kernels/mla_sparse/xe20/kernel/xe_mla_sparse_2stage_tile_scheduler.hpp"
 
 namespace cutlass::flash_attention::kernel {
 

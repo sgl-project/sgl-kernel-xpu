@@ -46,7 +46,12 @@
 
 namespace cutlass::flash_attention::collective {
 /////////////////////////////////////////////////////////////////////////////////////////////////
-template <class CollectiveMainloop, class TileShapeO_, class TensorO_, class TiledCopyO_ = void>
+template <
+    class CollectiveMainloop,
+    class TileShapeO_,
+    class TensorO_,
+    class TiledCopyO_,  // TiledCopy for storing O (void => default)
+    class TensorLSE_>   // Global softmax-LSE tensor: (q, head, batch)
 class XeMlaEpilogue {
  public:
   //
@@ -60,6 +65,10 @@ class XeMlaEpilogue {
   using TensorO = TensorO_;
   using TensorO2D = decltype(TensorO_{}(append<rank_v<TensorO_>>(make_coord(_, _), 0)));
   using ElementO = typename TensorO_::value_type;
+
+  using TensorLSE = TensorLSE_;
+  using TensorLSE1D = decltype(TensorLSE_{}(make_coord(_, 0, 0)));
+  using ElementLSE = typename TensorLSE_::value_type;
 
   using FragA = typename CollectiveMainloop::FragA;
   using FragARow = typename CollectiveMainloop::FragARow;
@@ -141,32 +150,21 @@ class XeMlaEpilogue {
 
   template <typename QVCoord>
   CUTLASS_DEVICE void operator()(
-      TensorO2D const& O,  // Global O tensor: (q,v)
-      FragA& tArA,         // O accumulator:   (q,v)
-      FragARow& tA_max,    // Softmax row-wise max accumulator
-      FragARow& tA_sum,    // Softmax row-wise sum accumulator
-      QVCoord blk_qv,      // WG tile indices: (Q,V)
-      int thr_id) {        // Work-item ID
+      TensorO2D const& O,         // Global O tensor:   (q,v)
+      FragA& tArA,                // O accumulator:     (q,v)
+      FragARow& tA_max,           // Softmax row-wise max accumulator
+      FragARow& tA_sum,           // Softmax row-wise sum accumulator
+      QVCoord blk_qv,             // WG tile indices: (Q,V)
+      int thr_id,                 // Work-item ID
+      TensorLSE1D const& gLSE) {  // Global LSE: (q)
     using namespace cute;
     using ElementA = typename FragA::element_type;
 
     // Reduce k-blocks of A and A_sum across WG, if needed.
-    auto [rA, rA_sum, rA_max_unused, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
-    (void)rA_max_unused;
+    auto [rA, rA_sum, rA_max, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
 
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
-
-    /* Complete softmax, dividing out sums. */
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA_sum.size(); i++)
-      rA_sum(i) = ElementA(1) / rA_sum(i);
-
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA.size(); i++) {
-      auto val = broadcast<0>(rA_sum, rA, i);
-      rA(i) *= val;
-    }
 
     /* Tile output */
     Tensor cO = make_identity_tensor(O.shape());       // (q,v)
@@ -179,9 +177,92 @@ class XeMlaEpilogue {
     auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
     auto tOgO = thr_copy_o.partition_D(gO);
 
+    /* Emit LSE while rA_sum is still the raw denominator. */
+    if (raw_pointer_cast(gLSE.data()) != nullptr) {
+      write_lse(rA, rA_sum, rA_max, tOrO, tOgO, cO, blk_qv, thr_id, gLSE);
+    }
+
+    /* Complete softmax, dividing out sums. */
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < rA_sum.size(); i++)
+      rA_sum(i) = ElementA(1) / rA_sum(i);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < rA.size(); i++) {
+      auto val = broadcast<0>(rA_sum, rA, i);
+      rA(i) *= val;
+    }
+
     /* Reorder tile and write out */
     reorder(rA, tOrO);
     copy(copy_o, tOrO, tOgO);
+  }
+
+  /// Write the per-row log-sum-exp, in the log2 domain the softmax state already
+  /// uses: lse = rA_max + log2(rA_sum). No unmasked keys (rA_sum == 0) => -INFINITY.
+  /// Only the v == 0 column stores, so each query row is written once.
+  template <class RedFragA, class RedFragARow, class FragO, class CoordO, class CoordFull, class QVCoord>
+  CUTLASS_DEVICE void write_lse(
+      RedFragA const& rA,         // Reduced O accumulator: (q,v)
+      RedFragARow const& rA_sum,  // Reduced softmax row-wise sum
+      RedFragARow const& rA_max,  // Reduced softmax row-wise max (log2 domain)
+      FragO const& tOrO,          // Output fragment (TV-layout witness, ReduceK > 1)
+      CoordO const& tOgO,         // Output coordinates: (q,v), ReduceK > 1
+      CoordFull const& cO,        // Identity tensor over the whole O: (q,v)
+      QVCoord blk_qv,             // WG tile indices: (Q,V)
+      int thr_id,                 // Work-item ID
+      TensorLSE1D const& gLSE) {  // Global LSE: (q)
+    using namespace cute;
+
+    /* V is not split for MLA; guard against a future V-split double-writing. */
+    if (int(get<1>(blk_qv)) != 0) return;
+
+    auto row_lse = rA_sum;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < rA_sum.size(); i++) {
+      float d = float(rA_sum(i));
+      row_lse(i) = ElementA((d > 0.f) ? (float(rA_max(i)) + sycl::log2(d)) : -INFINITY);
+    }
+
+    /* Unlike O's block store these are not bounds-clamped, so a partial Q tile's
+       padding rows are skipped. */
+    int num_rows = int(size<0>(gLSE));
+
+    if constexpr (ReduceK{} == _1{}) {
+      /* rA is the raw PV accumulator; the MMA's partitioning of the identity tile
+         gives each element its (q,v). Only the first V sub-tile holds v == 0. */
+      static_assert(
+          get<0>(TileShapeO{}) == get<0>(TileShapePV{}),
+          "blk_qv is in TileShapeO units but the identity tile below is cut to TileShapePV's Q extent");
+      TiledMMAPV mma_pv{};
+      Tensor gPV = local_tile(cO, take<0, 2>(TileShapePV{}), make_coord(get<0>(blk_qv), _0{}));
+      auto cArA = mma_pv.get_slice(thr_id).partition_C(gPV);
+      auto rA_v0 = rA(_, _, _, _0{});
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < int(rA_v0.size()); i++) {
+        if (int(get<1>(cArA(i))) != 0) continue;
+        int row = int(get<0>(cArA(i)));
+        if (row >= num_rows) continue;
+        gLSE(row) = static_cast<ElementLSE>(broadcast<0>(row_lse, rA, i));
+      }
+    } else {
+      /* rA is the SLM-reduced fragment, remapped by reduce_A(); tOgO carries that
+         mapping, so one flat index serves both. */
+      static_assert(
+          is_same_v<
+              remove_cvref_t<decltype(coalesce(tOrO.tv_layout()))>,
+              remove_cvref_t<decltype(coalesce(rA.tv_layout()))>>,
+          "tOgO indexes elements in rA's order only while the output fragment walks the tile the way rA does");
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int j = 0; j < int(rA.size()); j++) {
+        if (int(get<1>(tOgO(j))) != 0) continue;
+        int row = int(get<0>(tOgO(j)));
+        if (row >= num_rows) continue;
+        gLSE(row) = static_cast<ElementLSE>(broadcast<0>(row_lse, rA, j));
+      }
+    }
   }
 
   /// Split-KV epilogue operator.

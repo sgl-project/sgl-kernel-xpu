@@ -41,6 +41,7 @@
 
 #include <cmath>
 #include <cute/tensor.hpp>
+#include <optional>
 #include <sycl/sycl.hpp>
 
 #include "../../../Utils.h"
@@ -125,10 +126,13 @@ struct MlaXe {
   // TODO: handle special float8 types float_e5m2_t, float_e4m3_t for MMA operation
   using MMAOperation = XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, ElementQ>;
 
+  using ElementLSE = float;  // Softmax LSE, log2 domain
+
   using StrideQ = Stride<int, _1, int, int>;
   using StrideK = Stride<int, _1, int, int>;
   using StrideV = Stride<_1, int, int, int>;
   using StrideO = Stride<int, _1, int, int>;
+  using StrideLSE = Stride<int, _1, int>;
   using GmemTiledCopyQ = void;
   using GmemTiledCopyK = void;
   using GmemTiledCopyV = void;
@@ -154,6 +158,7 @@ struct MlaXe {
   using TensorK = decltype(make_dummy_tensor_type(ElementK{}, StrideK{}));
   using TensorV = decltype(make_dummy_tensor_type(ElementV{}, StrideV{}));
   using TensorO = decltype(make_dummy_tensor_type(ElementO{}, StrideO{}));
+  using TensorLSE = decltype(make_dummy_tensor_type(ElementLSE{}, StrideLSE{}));
 
   // Collective Mainloop
   static constexpr int PipelineStages = 1;
@@ -175,8 +180,8 @@ struct MlaXe {
                // decode). Prefill defaults to true → 256 GRF.
 
   // Collective Epilogue
-  using CollectiveEpilogue =
-      cutlass::flash_attention::collective::XeMlaEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO>;
+  using CollectiveEpilogue = cutlass::flash_attention::collective::
+      XeMlaEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, TensorLSE>;
 
   // Kernel instantiation
   static constexpr bool is_split_kv = SplitKVOption::value;
@@ -192,13 +197,14 @@ struct MlaXe {
 
 template <typename T>
 inline typename T::Fmla::Arguments args_from_options(
-    at::Tensor const& out,
+    at::Tensor& out,
+    std::optional<at::Tensor> const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
     at::Tensor const& seq_lens,
     at::Tensor const& page_table,
-    at::Tensor const& workspace,
+    at::Tensor& workspace,
     double sm_scale,
     int64_t num_kv_splits) {
   cutlass::KernelHardwareInfo hw_info;
@@ -238,9 +244,11 @@ inline typename T::Fmla::Arguments args_from_options(
   using StrideK = typename T::StrideK;
   using StrideV = typename T::StrideV;
   using StrideO = typename T::StrideO;
+  using StrideLSE = typename T::StrideLSE;
   using ElementQ = typename T::ElementQ;
   using ElementK = typename T::ElementK;
   using ElementO = typename T::ElementO;
+  using ElementLSE = typename T::ElementLSE;
 
   StrideQ stride_Q_nope = cute::make_stride(
       static_cast<int>(batch * num_heads * v_head_dim),
@@ -272,6 +280,10 @@ inline typename T::Fmla::Arguments args_from_options(
       static_cast<int>(out.stride(1)),
       static_cast<int>(out.stride(0)));
 
+  // lse: (batch, num_heads) -> kernel layout (seq_len_qo == 1, num_heads, batch)
+  StrideLSE stride_LSE = cute::make_stride(
+      static_cast<int>(batch * num_heads), cute::_1{}, static_cast<int>(lse.has_value() ? lse->stride(0) : 0));
+
   typename T::Fmla::KernelArguments kernel_args{};
   kernel_args.shape = problem_shape;
   kernel_args.Q_nope = static_cast<const ElementQ*>(q_nope.data_ptr());
@@ -285,6 +297,10 @@ inline typename T::Fmla::Arguments args_from_options(
   kernel_args.dV = stride_V;
   kernel_args.O = static_cast<ElementO*>(out.data_ptr());
   kernel_args.dO = stride_O;
+  if (lse.has_value()) {
+    kernel_args.LSE = static_cast<ElementLSE*>(lse->data_ptr());
+  }
+  kernel_args.dLSE_out = stride_LSE;
   kernel_args.seq_lens = static_cast<const int*>(seq_lens.data_ptr());
 
   if constexpr (T::is_split_kv) {
@@ -327,19 +343,20 @@ inline typename T::Fmla::Arguments args_from_options(
 
 template <typename Element, typename PageSizeOpt, typename SplitKVOpt>
 inline void runMlaImpl(
-    at::Tensor const& out,
+    at::Tensor& out,
+    std::optional<at::Tensor> const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
     at::Tensor const& seq_lens,
     at::Tensor const& page_table,
-    at::Tensor const& workspace,
+    at::Tensor& workspace,
     double sm_scale,
     int64_t num_kv_splits) {
   using MlaXeType = MlaXe<Element, PageSizeOpt, SplitKVOpt>;
   typename MlaXeType::Fmla fmla;
   auto arguments = args_from_options<MlaXeType>(
-      out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+      out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
 
   CUTLASS_CHECK(fmla.can_implement(arguments));
 
@@ -348,13 +365,14 @@ inline void runMlaImpl(
 
 template <typename Element, typename PageSizeOpt>
 inline void runMla(
-    at::Tensor const& out,
+    at::Tensor& out,
+    std::optional<at::Tensor> const& lse,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
     at::Tensor const& kv_c_and_k_pe_cache,
     at::Tensor const& seq_lens,
     at::Tensor const& page_table,
-    at::Tensor const& workspace,
+    at::Tensor& workspace,
     double sm_scale,
     int64_t num_kv_splits) {
   TORCH_CHECK(num_kv_splits >= 1, "num_kv_splits must be resolved before calling runMla, got ", num_kv_splits);
@@ -379,9 +397,9 @@ inline void runMla(
 
   if (num_kv_splits == 1) {
     runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<false>>(
-        out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+        out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
   } else {
     runMlaImpl<Element, PageSizeOpt, EnabledSplitKV<true>>(
-        out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
+        out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits);
   }
 }

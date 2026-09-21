@@ -323,6 +323,11 @@ struct PrefillRunner {
     // must be contiguous, which is enforced by CHECK_LAST_DIM_CONTIGUOUS_INPUT.
     // StrideQ/K/V/O use plain `int` elements, but Arguments stores strides as
     // int64_t, so narrow explicitly before handing them to make_stride.
+    // softcap folds through apply_relative_bias as softcap(QK+bias); the reference
+    // ordering is softcap(QK)+bias, so reject the unsupported combination.
+    TORCH_CHECK(
+        !(params.softcap > 0.f && params.rel_bias_ptr != nullptr),
+        "softcap combined with relative attention bias is not supported on XPU");
     constexpr int64_t kIntMax = 2147483647LL;
     TORCH_CHECK(
         q_row_stride <= kIntMax && k_row_stride <= kIntMax && v_row_stride <= kIntMax && q_head_stride <= kIntMax &&
@@ -453,6 +458,7 @@ struct PrefillRunner {
         },
         {
             params.softmax_scale,
+            params.softcap,
             params.page_table,
             params.page_size,
             params.max_num_pages_per_seq,
@@ -622,6 +628,7 @@ template <
     bool Causal,
     bool LocalMask,
     bool Sink,
+    bool Softcap,
     bool LSE,
     typename TileShapeQK,
     typename TileShapePV,
@@ -710,7 +717,8 @@ struct FMHAConfig {
         GmemTiledCopyV_cache,
         LocalMask,
         false,  // PackGQA is decode-only; relative attention always uses prefill.
-        HasRelBias>;
+        HasRelBias,
+        Softcap>;
 
     // Epilogue
     using CollectiveEpilogue = cutlass::fmha::collective::

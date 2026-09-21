@@ -68,10 +68,12 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
         params.rel_bias_ptr == nullptr, "return_softmax_lse is not supported with relative attention");
     using Element = @ELEM_TYPE@;
     if (params.is_causal) {
+      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
       FMHAConfig<
           /*Causal=*/true,
           /*LocalMask=*/false,
           false,
+          Softcap,
           /*LSE=*/true,
           TileShapeQK,
           TileShapePV,
@@ -85,12 +87,15 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
           Element,
           Element,
           Element>::run_paged(params);
+      });
     } else {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+        AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
         FMHAConfig<
             /*Causal=*/false,
             LocalMask,
             false,
+            Softcap,
             /*LSE=*/true,
             TileShapeQK,
             TileShapePV,
@@ -104,6 +109,7 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
             Element,
             Element,
             Element>::run_paged(params);
+        });
       });
     }
     return;
@@ -115,10 +121,12 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
       AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
 
           using Element = @ELEM_TYPE@;
+          AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
           FMHAConfig<
               Causal,
               LocalMask,
               Sink,
+              Softcap,
               /*LSE=*/false,
               TileShapeQK,
               TileShapePV,
@@ -132,6 +140,7 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
               Element,
               Element,
                 Element>::run_paged(params);
+          });
       });
     });
   });
@@ -156,10 +165,12 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
         using Element = @ELEM_TYPE@;
+        AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
         FMHAConfig<
             Causal,
             LocalMask,
             false,
+            Softcap,
             /*LSE=*/false,
             RelTileShapeQK,
             RelTileShapePV,
@@ -173,6 +184,7 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
             Element,
             Element,
             Element>::run_paged(params);
+        });
       });
     });
     return;
@@ -184,10 +196,12 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
     AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
 
           using Element = @ELEM_TYPE@;
+        AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
         FMHAConfig<
             Causal,
             LocalMask,
             false,
+            Softcap,
             /*LSE=*/false,
             TileShapeQK,
             TileShapePV,
@@ -201,6 +215,7 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
             Element,
             Element,
               Element>::run_paged(params);
+        });
     });
   });
 #endif

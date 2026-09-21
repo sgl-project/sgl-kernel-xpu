@@ -6,12 +6,16 @@ from typing import Callable
 import pytest
 import torch
 import torch.nn.functional as F
+import utils
 
 # Shared MXFP4 helpers live in a dedicated module next to this file.
 from mxfp4_utils import MXFP4_BLOCK_SIZE
 from mxfp4_utils import dequantize_mxfp4_2d as _dequantize_mxfp4_2d
 from mxfp4_utils import quantize_mxfp4_2d as _quantize_mxfp4_2d
 from sgl_kernel import fused_experts
+
+device = utils.get_device()
+ref_device = utils.get_reference_device()
 
 
 def apply_act_and_mul(
@@ -22,11 +26,26 @@ def apply_act_and_mul(
 
 
 def create_random_xpu_tensor(shape, dtype, mean=0, std=0.01):
+    """Create a random xpu tensor
+
+    Args:
+        shape: Tensor shape
+        dtype: Data type
+        mean: Mean value
+        std: Standard deviation
+
+    Returns:
+        torch.Tensor: Randomly initialized xpu tensor
+    """
     return torch.empty(shape, dtype=dtype, device="xpu").normal_(mean, std)
 
 
 def create_random_cpu_tensor(shape, dtype, mean=0, std=0.01):
     return torch.empty(shape, dtype=dtype, device="cpu").normal_(mean, std)
+
+
+def create_random_ref_tensor(shape, dtype, mean=0, std=0.01):
+    return torch.empty(shape, dtype=dtype, device=ref_device).normal_(mean, std)
 
 
 # GPT-OSS SwiGLU parameters (matches kernel defaults)
@@ -189,24 +208,27 @@ def test_moe_gemm(
     gating_factor = 1 if act_type == "relu2" else 2
 
     rtol, atol = 1e-4, 1e-3
-    a = create_random_xpu_tensor((num_tokens, hidden_size), torch.bfloat16)
-    w1 = create_random_xpu_tensor(
+    a = create_random_ref_tensor((num_tokens, hidden_size), torch.bfloat16)
+    w1 = create_random_ref_tensor(
         (num_experts, gating_factor * intermediate_size, hidden_size), torch.bfloat16
     )
-    w2 = create_random_xpu_tensor(
+    w2 = create_random_ref_tensor(
         (num_experts, hidden_size, intermediate_size), torch.bfloat16
     )
     b1, b2 = None, None
     if bias_dtype:
         dtype = torch.bfloat16 if bias_dtype == "bfloat16" else torch.float32
-        b1 = create_random_xpu_tensor(
+        b1 = create_random_ref_tensor(
             (num_experts, gating_factor * intermediate_size), dtype, std=0.005
         )
-        b2 = create_random_xpu_tensor((num_experts, hidden_size), dtype, std=0.005)
-    score = torch.randn([num_tokens, num_experts], dtype=torch.bfloat16).to("xpu")
+        b2 = create_random_ref_tensor((num_experts, hidden_size), dtype, std=0.005)
+    score = torch.randn(
+        [num_tokens, num_experts], dtype=torch.bfloat16, device=ref_device
+    )
 
     score = torch.softmax(score, dim=-1, dtype=torch.float32)
     topk_weight, topk_ids = torch.topk(score, topk)
+
     torch_output = torch_naive_moe(
         a,
         w1,
@@ -222,20 +244,22 @@ def test_moe_gemm(
         routed_scaling_factor=routed_scaling_factor,
     )
     kernel_output = fused_experts(
-        a,
-        w1,
-        w2,
-        topk_weight,
-        topk_ids,
-        b1,
-        b2,
+        a.to(device),
+        w1.to(device),
+        w2.to(device),
+        topk_weight.to(device),
+        topk_ids.to(device),
+        b1.to(device) if b1 is not None else None,
+        b2.to(device) if b2 is not None else None,
         activation=act_type,
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
         routed_scaling_factor=routed_scaling_factor,
     )
 
-    torch.testing.assert_close(torch_output, kernel_output, rtol=rtol, atol=atol)
+    torch.testing.assert_close(
+        torch_output.cpu(), kernel_output.cpu(), rtol=rtol, atol=atol
+    )
 
 
 # ---------------------------------------------------------------------------

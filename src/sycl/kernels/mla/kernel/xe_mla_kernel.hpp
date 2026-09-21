@@ -102,6 +102,10 @@ class XeMlaFwdKernel {
   using ElementO = typename CollectiveEpilogue::TensorO::element_type;
   using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
 
+  using TensorLSE = typename CollectiveEpilogue::TensorLSE;
+  using ElementLSE = typename TensorLSE::element_type;
+  using StrideLSE = decltype(stride(TensorLSE{}));
+
   // Tile scheduler derived types
   using TileScheduler = TileScheduler_;
   using TileSchedulerParams = typename TileScheduler::Params;
@@ -142,6 +146,10 @@ class XeMlaFwdKernel {
     // output tensor
     ElementO* O = nullptr;
     StrideO dO{};
+
+    // Softmax LSE (log2 domain), (seq_q, num_heads_q, batch). Null => skip.
+    ElementLSE* LSE = nullptr;
+    StrideLSE dLSE_out{};
 
     // Sequence lengths per batch (for computing total_blk)
     const int* seq_lens = nullptr;
@@ -283,9 +291,22 @@ class XeMlaFwdKernel {
         dO_ptr += o_offset;
       }
 
+      // Sliced into the pointer, not in the epilogue, so a null base stays null.
+      auto dLSE_ptr = p.LSE;
+      if (dLSE_ptr != nullptr) {
+        int64_t lse_offset = static_cast<int64_t>(head_coord) * static_cast<int64_t>(get<1>(p.dLSE_out)) +
+                             static_cast<int64_t>(batch_slice_idx) * static_cast<int64_t>(get<2>(p.dLSE_out));
+        if constexpr (CollectiveMainloop::IsPrefill) {
+          lse_offset += static_cast<int64_t>(q_start) * static_cast<int64_t>(get<0>(p.dLSE_out));
+        }
+        dLSE_ptr += lse_offset;
+      }
+
       Tensor Q_nope = make_tensor(make_gmem_ptr(dcQ_nope), make_layout(shape_Q_nope, p.dQ_nope));
       Tensor Q_pe = make_tensor(make_gmem_ptr(dcQ_pe), make_layout(shape_Q_pe, p.dQ_pe));
       Tensor O = make_tensor(make_gmem_ptr(dO_ptr), make_layout(shape_O, p.dO));
+      Tensor gLSE =
+          make_tensor(make_gmem_ptr(dLSE_ptr), make_layout(make_shape(seqlen_q_i), make_stride(get<0>(p.dLSE_out))));
 
       // O accumulator types
       FragA tArA;
@@ -356,7 +377,7 @@ class XeMlaFwdKernel {
       }
 
       CollectiveEpilogue epilogue(params.epilogue, shared_storage.epilogue);
-      epilogue(O(_, _, head_coord, batch_slice_idx), tArA, tA_max, tA_sum, blk_qv, thr_id);
+      epilogue(O(_, _, head_coord, batch_slice_idx), tArA, tA_max, tA_sum, blk_qv, thr_id, gLSE);
     }
   }
 };
@@ -398,6 +419,10 @@ class XeMlaSplitKVKernel {
   using TileShapeO = typename CollectiveEpilogue::TileShapeO;
   using ElementO = typename CollectiveEpilogue::TensorO::element_type;
   using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
+
+  using TensorLSE = typename CollectiveEpilogue::TensorLSE;
+  using ElementLSE = typename TensorLSE::element_type;
+  using StrideLSE = decltype(stride(TensorLSE{}));
 
   // Tile scheduler derived types
   using TileScheduler = TileScheduler_;
@@ -452,6 +477,10 @@ class XeMlaSplitKVKernel {
     // Final output
     ElementO* O = nullptr;
     StrideO dO{};
+
+    // Written by the reduction kernel. Null => skip.
+    ElementLSE* LSE = nullptr;
+    StrideLSE dLSE_out{};
 
     // Sequence lengths per batch (for computing total_blk)
     const int* seq_lens = nullptr;

@@ -141,6 +141,8 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer_mla,
     transfer_kv_all_layer_mla_lf_pf,
     transfer_kv_direct,
+    transfer_kv_mamba_lf_pf,
+    transfer_kv_mamba_pf_lf,
     transfer_kv_per_layer,
     transfer_kv_per_layer_direct_pf_lf,
     transfer_kv_per_layer_mla,
@@ -171,6 +173,8 @@ from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     biased_topk,
     cutlass_fp4_group_mm,
+    cutlass_fused_experts_fp8,
+    cutlass_fused_experts_mxfp4,
     fp8_blockwise_scaled_grouped_mm,
     fused_experts,
     hash_topk,
@@ -178,6 +182,7 @@ from sgl_kernel.moe import (
     moe_fused_gate,
     moe_sum,
     moe_sum_reduce,
+    mxfp4_blockwise_scaled_grouped_mm,
     prepare_moe_input,
     scatter_tokens_to_experts,
     swiglu_gpt_oss_sigmoid_alpha,
@@ -199,6 +204,7 @@ from sgl_kernel.sparse_flash_attn import (
     sparse_attn_varlen_func,
 )
 from sgl_kernel.speculative import (
+    TreeMaskMode,
     build_tree_kernel_efficient,
     segment_packbits,
     tree_speculative_sampling_target_only,
@@ -212,7 +218,7 @@ from sgl_kernel.top_k import (
     topk_transform_paged,
     topk_transform_ragged,
 )
-from sgl_kernel.utils import get_device_capability, is_xe2_arch
+from sgl_kernel.utils import get_device_capability, is_xe2_arch, is_xe3_arch
 from sgl_kernel.version import __version__
 
 build_tree_kernel = (

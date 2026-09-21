@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -60,7 +60,18 @@ def flash_mla_decode(
     workspace: torch.Tensor,
     sm_scale: float,
     num_kv_splits: int = 1,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """MLA decode.
+
+    Args:
+        return_lse: also return the softmax log-sum-exp. Default False.
+
+    Returns:
+        (out, lse) when return_lse, else out.
+        out: (batch, num_heads, latent_dim)  same dtype as q_nope
+        lse: (batch, num_heads)              fp32, log2-domain log-sum-exp
+    """
     assert q_nope.ndim == 3, f"q_nope must be a 3D tensor, but got {q_nope.ndim}"
     assert q_pe.ndim == 3, f"q_pe must be a 3D tensor, but got {q_pe.ndim}"
     assert (
@@ -117,9 +128,15 @@ def flash_mla_decode(
         if device_type == "xpu"
         else q_nope.new_empty((B_q, MAX_HEADS, D_latent))
     )
+    lse = (
+        torch.empty((B_q, q_nope.shape[1]), dtype=torch.float32, device=q_nope.device)
+        if return_lse
+        else None
+    )
 
     torch.ops.sgl_kernel.flash_mla_decode.default(
         out,
+        lse,
         q_nope,
         q_pe,
         kv_c_and_k_pe_cache,
@@ -129,7 +146,11 @@ def flash_mla_decode(
         sm_scale,
         num_kv_splits,
     )
-    return out if device_type == "xpu" else out[:, :H].contiguous()
+    if device_type != "xpu":
+        out = out[:, :H].contiguous()
+        if return_lse:
+            lse = lse[:, :H].contiguous()
+    return (out, lse) if return_lse else out
 
 
 def flash_mla_get_workspace_size(
@@ -170,7 +191,8 @@ def flash_mla_prefill(
     sm_scale: float,
     causal: bool = True,
     num_kv_splits: int = -1,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     """MLA prefill with varlen/ragged Q and causal masking.
 
     Supports full prefill (seqlen_q == seqlen_k) and incremental prefill
@@ -190,9 +212,12 @@ def flash_mla_prefill(
         causal:       apply causal masking (default True)
         num_kv_splits: KV split count. -1 = auto-select. Split-KV is not yet
                        implemented for MLA prefill; reserved for future use.
+        return_lse:   also return the softmax log-sum-exp. Default False.
 
     Returns:
+        (out, lse) when return_lse, else out.
         out: (total_q, num_heads, latent_dim)  ragged, same layout as q_nope
+        lse: (total_q, num_heads)              fp32, log2-domain log-sum-exp
     """
     assert (
         q_nope.ndim == 3
@@ -227,9 +252,15 @@ def flash_mla_prefill(
     _Q_TILE_MAX = 256
     total_q_padded = (total_q + _Q_TILE_MAX - 1) // _Q_TILE_MAX * _Q_TILE_MAX
     out = q_nope.new_empty((total_q_padded, H, D_latent))
+    lse = (
+        torch.empty((total_q, H), dtype=torch.float32, device=q_nope.device)
+        if return_lse
+        else None
+    )
 
     torch.ops.sgl_kernel.flash_mla_prefill.default(
         out,
+        lse,
         q_nope.contiguous(),
         q_pe.contiguous(),
         kv_c_and_k_pe_cache,
@@ -242,7 +273,7 @@ def flash_mla_prefill(
         causal,
         num_kv_splits,
     )
-    return out[:total_q]
+    return (out[:total_q], lse) if return_lse else out[:total_q]
 
 
 def flash_mla_prefill_get_workspace_size(

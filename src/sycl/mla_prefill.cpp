@@ -96,68 +96,38 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
 // MUST be 0 for any shippable build.
 #define MLA_FORCE_DISPATCH 0
 
+// Dispatch ladder, bottom-up: BUCKET, then DTYPE, then PAGE_SIZE. The leaf pastes
+// all three tokens into the launcher's name, so each must be a literal there.
+#define DISPATCH_MLA_PREFILL_LAUNCH(ELEM, PS, BUCKET)       \
+  mla_prefill::launch_mla_prefill_##ELEM##_##PS##_##BUCKET( \
+      out,                                                  \
+      lse,                                                  \
+      q_nope,                                               \
+      q_pe,                                                 \
+      kv_c_and_k_pe_cache,                                  \
+      cu_seqlens_q,                                         \
+      seq_lens,                                             \
+      max_seqlen_q,                                         \
+      page_table,                                           \
+      workspace,                                            \
+      sm_scale,                                             \
+      causal,                                               \
+      num_kv_splits)
+
 #define DISPATCH_MLA_PREFILL_PAGE_SIZE(ELEM, BUCKET)                              \
   do {                                                                            \
     switch (page_size) {                                                          \
       case 16:                                                                    \
-        mla_prefill::launch_mla_prefill_##ELEM##_16_##BUCKET(                     \
-            out,                                                                  \
-            q_nope,                                                               \
-            q_pe,                                                                 \
-            kv_c_and_k_pe_cache,                                                  \
-            cu_seqlens_q,                                                         \
-            seq_lens,                                                             \
-            max_seqlen_q,                                                         \
-            page_table,                                                           \
-            workspace,                                                            \
-            sm_scale,                                                             \
-            causal,                                                               \
-            num_kv_splits);                                                       \
+        DISPATCH_MLA_PREFILL_LAUNCH(ELEM, 16, BUCKET);                            \
         break;                                                                    \
       case 32:                                                                    \
-        mla_prefill::launch_mla_prefill_##ELEM##_32_##BUCKET(                     \
-            out,                                                                  \
-            q_nope,                                                               \
-            q_pe,                                                                 \
-            kv_c_and_k_pe_cache,                                                  \
-            cu_seqlens_q,                                                         \
-            seq_lens,                                                             \
-            max_seqlen_q,                                                         \
-            page_table,                                                           \
-            workspace,                                                            \
-            sm_scale,                                                             \
-            causal,                                                               \
-            num_kv_splits);                                                       \
+        DISPATCH_MLA_PREFILL_LAUNCH(ELEM, 32, BUCKET);                            \
         break;                                                                    \
       case 64:                                                                    \
-        mla_prefill::launch_mla_prefill_##ELEM##_64_##BUCKET(                     \
-            out,                                                                  \
-            q_nope,                                                               \
-            q_pe,                                                                 \
-            kv_c_and_k_pe_cache,                                                  \
-            cu_seqlens_q,                                                         \
-            seq_lens,                                                             \
-            max_seqlen_q,                                                         \
-            page_table,                                                           \
-            workspace,                                                            \
-            sm_scale,                                                             \
-            causal,                                                               \
-            num_kv_splits);                                                       \
+        DISPATCH_MLA_PREFILL_LAUNCH(ELEM, 64, BUCKET);                            \
         break;                                                                    \
       case 128:                                                                   \
-        mla_prefill::launch_mla_prefill_##ELEM##_128_##BUCKET(                    \
-            out,                                                                  \
-            q_nope,                                                               \
-            q_pe,                                                                 \
-            kv_c_and_k_pe_cache,                                                  \
-            cu_seqlens_q,                                                         \
-            seq_lens,                                                             \
-            max_seqlen_q,                                                         \
-            page_table,                                                           \
-            workspace,                                                            \
-            sm_scale,                                                             \
-            causal,                                                               \
-            num_kv_splits);                                                       \
+        DISPATCH_MLA_PREFILL_LAUNCH(ELEM, 128, BUCKET);                           \
         break;                                                                    \
       default:                                                                    \
         TORCH_CHECK(false, "Unsupported page size for MLA prefill: ", page_size); \
@@ -178,11 +148,29 @@ constexpr int kKThresholdForLarge = 1024;  // K split point: medium vs large for
     }                                                                      \
   } while (0)
 
+#define DISPATCH_MLA_PREFILL_BUCKET()       \
+  do {                                      \
+    switch (bucket) {                       \
+      case Bucket::Large:                   \
+        DISPATCH_MLA_PREFILL_DTYPE(large);  \
+        break;                              \
+      case Bucket::Medium:                  \
+        DISPATCH_MLA_PREFILL_DTYPE(medium); \
+        break;                              \
+      case Bucket::Small:                   \
+        DISPATCH_MLA_PREFILL_DTYPE(small);  \
+        break;                              \
+    }                                       \
+  } while (0)
+
 }  // namespace
 
 /// @brief Dispatch kernel for MLA prefill with varlen/ragged Q and causal mask.
+///
+/// `lse` is an output taken by const ref; see flash_mla_decode() in mla_decode.cpp.
 SGL_KERNEL_EXPORT void flash_mla_prefill(
     at::Tensor& out,                        // (total_q, num_heads, latent_dim)
+    const std::optional<at::Tensor>& lse,   // (total_q, num_heads) fp32, log2 domain; nullopt = skip
     const at::Tensor& q_nope,               // (total_q, num_heads, latent_dim)
     const at::Tensor& q_pe,                 // (total_q, num_heads, rope_dim)
     const at::Tensor& kv_c_and_k_pe_cache,  // (total_pages, page_size, latent_dim + rope_dim)
@@ -221,6 +209,25 @@ SGL_KERNEL_EXPORT void flash_mla_prefill(
       ". Supported: 16, 32, 64, 128");
   TORCH_CHECK(q_nope.dim() == 3, "q_nope must be 3D (total_q, num_heads, dim), got ", q_nope.dim());
   TORCH_CHECK(q_pe.dim() == 3, "q_pe must be 3D (total_q, num_heads, dim), got ", q_pe.dim());
+  // Unlike `out`, the LSE needs no Q-tile padding: its stores are bounded by
+  // the per-request Q length.
+  if (lse.has_value()) {
+    CHECK_INPUT(lse.value());
+    TORCH_CHECK(lse->scalar_type() == at::ScalarType::Float, "lse must be float32, got ", lse->scalar_type());
+    TORCH_CHECK(lse->dim() == 2, "lse must be 2D (total_q, num_heads), got ", lse->dim());
+    TORCH_CHECK(
+        lse->size(0) >= q_nope.size(0) && lse->size(1) == q_nope.size(1),
+        "lse must be (>= total_q, num_heads) = (>= ",
+        q_nope.size(0),
+        ", ",
+        q_nope.size(1),
+        "), got (",
+        lse->size(0),
+        ", ",
+        lse->size(1),
+        ")");
+    TORCH_CHECK(lse->stride(1) == 1, "lse must be contiguous along num_heads");
+  }
 
   const int64_t max_kv_len_estimate = page_table.size(1) * page_size;
 
@@ -259,6 +266,7 @@ SGL_KERNEL_EXPORT void flash_mla_prefill(
             page_size,
             bucket_id,
             &out,
+            &lse,
             &q_nope,
             &q_pe,
             &kv_c_and_k_pe_cache,
@@ -275,22 +283,14 @@ SGL_KERNEL_EXPORT void flash_mla_prefill(
         jit_err);
   }
 #else
-  switch (bucket) {
-    case Bucket::Large:
-      DISPATCH_MLA_PREFILL_DTYPE(large);
-      break;
-    case Bucket::Medium:
-      DISPATCH_MLA_PREFILL_DTYPE(medium);
-      break;
-    case Bucket::Small:
-      DISPATCH_MLA_PREFILL_DTYPE(small);
-      break;
-  }
+  DISPATCH_MLA_PREFILL_BUCKET();
 #endif
 }
 
+#undef DISPATCH_MLA_PREFILL_LAUNCH
 #undef DISPATCH_MLA_PREFILL_PAGE_SIZE
 #undef DISPATCH_MLA_PREFILL_DTYPE
+#undef DISPATCH_MLA_PREFILL_BUCKET
 
 /// @brief Workspace size for MLA prefill (currently 0 – no split-K).
 /// Signature mirrors flash_mla_get_workspace_size for caller ergonomics; on XPU

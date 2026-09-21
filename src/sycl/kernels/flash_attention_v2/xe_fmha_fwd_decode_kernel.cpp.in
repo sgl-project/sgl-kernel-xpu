@@ -62,10 +62,12 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
     TORCH_CHECK(!params.use_sink, "return_softmax_lse is not supported with sink masking");
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       using Element = @ELEM_TYPE@;
+      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
       DecodeConfig<
           false,
           LocalMask,
           false,
+          Softcap,
           /*LSE=*/true,
           TileShapeQK,
           TileShapePV,
@@ -79,6 +81,7 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
           Element,
           Element,
           /*PackGQAEnabled=*/false>::run_paged(params);
+      });
     });
     return;
   }
@@ -95,10 +98,12 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
         " columns");
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       using Element = @ELEM_TYPE@;
+      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
       DecodeConfig<
           false,
           LocalMask,
           false,
+          Softcap,
           /*LSE=*/false,
           TileShapeQK,
           TileShapePV,
@@ -122,6 +127,7 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
           void,
           void,
           true>::run_paged(params);
+      });
     });
     return;
   }
@@ -133,10 +139,12 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
     AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
           using Element = @ELEM_TYPE@;
+          AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
           DecodeConfig<
               false,
               LocalMask,
               Sink,
+              Softcap,
               /*LSE=*/false,
               TileShapeQK,
               TileShapePV,
@@ -149,6 +157,7 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
               Element,
               Element,
               Element>::run_paged(params);
+          });
       });
     });
 #else
@@ -157,10 +166,12 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
         "sink is only supported for head_size == 64, got @HEAD_DIM@");
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
         using Element = @ELEM_TYPE@;
+        AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
         DecodeConfig<
             false,
             LocalMask,
             false,
+            Softcap,
             /*LSE=*/false,
             TileShapeQK,
             TileShapePV,
@@ -173,6 +184,7 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
             Element,
             Element,
               Element>::run_paged(params);
+        });
     });
 #endif
 }

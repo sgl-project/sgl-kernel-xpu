@@ -375,6 +375,22 @@ void transfer_kv_all_layer_mla_lf_pf(
     int64_t num_layers,
     int64_t block_quota,
     int64_t sgs_per_wg);
+void transfer_kv_mamba_pf_lf(
+    const at::Tensor& src,
+    at::Tensor& dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim);
+void transfer_kv_mamba_lf_pf(
+    const at::Tensor& src_layers,
+    at::Tensor& dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers);
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void silu_and_mul_clamp(torch::Tensor& out, torch::Tensor& input, double swiglu_limit);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
@@ -686,6 +702,22 @@ void fp8_blockwise_scaled_grouped_mm(
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace);
 
+// Xe3 (CRI) blockwise-scaled MXFP4 grouped GEMM for MoE.
+void mxfp4_blockwise_scaled_grouped_mm(
+    torch::Tensor& output,
+    torch::Tensor& a_ptrs,
+    torch::Tensor& b_ptrs,
+    torch::Tensor& out_ptrs,
+    torch::Tensor& a_scales_ptrs,
+    torch::Tensor& b_scales_ptrs,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& workspace);
+
 void moe_grouped_mm_nt_xe20(
     torch::Tensor& output,
     const torch::Tensor& activations,
@@ -732,6 +764,33 @@ void moe_grouped_mm_nt_xe20_fp8_w8a16(
     const std::optional<at::Tensor>& bias,
     const torch::Tensor& total_rows_for_experts,
     const int64_t n_experts);
+
+// Xe3 (CRI) plain bf16 grouped GEMM, tile heuristics tuned for Xe3.
+void moe_grouped_mm_nt_xe35(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& weights,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts,
+    const int64_t activation_type = 0,  // 0=silu, 1=gelu, 2=swiglu
+    bool fuse_act = false,
+    double gemm1_alpha = 1.702,
+    double gemm1_limit = 7.0);
+
+// Xe3 (CRI) tile-fused MXFP4-B x BF16-A W4A16 grouped GEMM.
+void moe_grouped_mm_nt_xe35_mxfp4_w4a16(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& packed_weights,
+    const torch::Tensor& scales,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts,
+    const int64_t activation_type = 0,
+    bool fuse_act = false,
+    double gemm1_alpha = 1.702,
+    double gemm1_limit = 7.0);
 
 void prepare_moe_input(
     const torch::Tensor& topk_ids,
@@ -902,28 +961,28 @@ void tree_speculative_sampling_target_only(
     int64_t sycl_stream = 0);
 
 void verify_tree_greedy(
-    at::Tensor predicts,          // mutable
-    at::Tensor accept_index,      // mutable
-    at::Tensor accept_token_num,  // mutable
-    at::Tensor candidates,
-    at::Tensor retrive_index,
-    at::Tensor retrive_next_token,
-    at::Tensor retrive_next_sibling,
-    at::Tensor target_predict,
-    int64_t sycl_stream = 0);
+    at::Tensor& predicts,
+    at::Tensor& accept_index,
+    at::Tensor& accept_token_num,
+    const at::Tensor& candidates,
+    const at::Tensor& retrive_index,
+    const at::Tensor& retrive_next_token,
+    const at::Tensor& retrive_next_sibling,
+    const at::Tensor& target_predict);
 
 void build_tree_kernel_efficient(
-    at::Tensor parent_list,
-    at::Tensor selected_index,
-    at::Tensor verified_seq_len,
-    at::Tensor tree_mask,
-    at::Tensor positions,
-    at::Tensor retrive_index,
-    at::Tensor retrive_next_token,
-    at::Tensor retrive_next_sibling,
+    const at::Tensor& parent_list,
+    const at::Tensor& selected_index,
+    const at::Tensor& verified_seq_len,
+    at::Tensor& tree_mask,
+    at::Tensor& positions,
+    at::Tensor& retrive_index,
+    at::Tensor& retrive_next_token,
+    at::Tensor& retrive_next_sibling,
     int64_t topk,
     int64_t depth,
-    int64_t draft_token_num);
+    int64_t draft_token_num,
+    int64_t tree_mask_mode = 0);
 
 void segment_packbits(
     at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr, at::Tensor y, int64_t sycl_stream);

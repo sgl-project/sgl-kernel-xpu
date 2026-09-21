@@ -50,7 +50,7 @@ report_kernel_perf(const char* op_name, ::sycl::queue& queue, GPU_Clock& timer, 
 
   ::printf(
       "%s perf(%s): time=%.9f ms (%.3f us), bandwidth=%.6f GB/s, "
-      "compute=%.6f TFLOPS (%.3f GFLOPS)\n",
+      "compute=%.6f TFLOPS (%.6f GFLOPS)\n",
       op_name,
       used_sycl ? "gpu_clock" : "host_wall",
       elapsed_s * 1000.0,

@@ -472,3 +472,138 @@ def gate_up_lora_b_fwd(
     )
 
     return output
+
+
+def lora_gather_rows(
+    input: torch.Tensor,
+    permutation: torch.Tensor,
+) -> torch.Tensor:
+    r"""Gather (row-permute) rows of ``input`` into logical order.
+
+    Computes ``output[i, :] = input[permutation[i], :]`` for every row ``i``.
+
+    ``permutation`` maps a logical (adapter-grouped) row index to the physical
+    (original token) row index and must be a bijection over ``[0, num_rows)``.
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Source tensor, shape ``(num_rows, width)``. FP16 / BF16 / FP32.
+    permutation : torch.Tensor
+        1D ``logical -> physical`` index tensor, shape ``(num_rows,)``. Int32 or
+        int64 (cast to int64 internally).
+
+    Returns
+    -------
+    output : torch.Tensor
+        Gathered tensor, shape ``(num_rows, width)``, same dtype as ``input``.
+    """
+    output = torch.empty_like(input)
+    torch.ops.sgl_kernel.lora_gather_rows(output, input, permutation)
+    return output
+
+
+def lora_scatter_rows(
+    input: torch.Tensor,
+    permutation: torch.Tensor,
+) -> torch.Tensor:
+    r"""Scatter (row-permute) logical-order rows of ``input`` back to physical order.
+
+    Computes ``output[permutation[i], :] = input[i, :]`` for every row ``i``.
+    This is the inverse use of the same ``permutation`` as :func:`lora_gather_rows`;
+    because ``permutation`` is a bijection every output row is written exactly once.
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Source tensor in logical order, shape ``(num_rows, width)``. FP16 / BF16 / FP32.
+    permutation : torch.Tensor
+        1D ``logical -> physical`` index tensor, shape ``(num_rows,)``. Int32 or
+        int64 (cast to int64 internally).
+
+    Returns
+    -------
+    output : torch.Tensor
+        Scattered tensor in physical order, shape ``(num_rows, width)``, same dtype as ``input``.
+    """
+    output = torch.empty_like(input)
+    torch.ops.sgl_kernel.lora_scatter_rows(output, input, permutation)
+    return output
+
+
+def chunked_sgmv_lora_shrink_forward(
+    input_x: torch.Tensor,
+    weights: torch.Tensor,
+    stack_num: int,
+    seg_indptr: torch.Tensor,
+    weight_indices: torch.Tensor,
+    lora_ranks: torch.Tensor,
+    permutation: Optional[torch.Tensor] = None,
+    seg_lens: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Chunked-SGMV LoRA "shrink" (A-matrix) forward pass.
+
+    Computes the LoRA ``A`` projection ``output = input_x @ weights[l]^T`` as a
+    segmented grouped GEMM, where each segment ``s`` uses the adapter
+    ``l = weight_indices[s]``. Used in the decode phase, where batching
+    interleaves adapters ("zigzag") so tokens must be reordered to group rows by
+    adapter before the GEMM and reordered back afterwards.
+
+    This is the three-kernel decomposition (Option A), fused into a single C++ op:
+
+    1. **gather** ``x_sorted[i] = input_x[permutation[i]]`` — physical -> logical,
+    2. a dedicated small-N grouped GEMM on ``x_sorted`` -> ``out_sorted`` (logical order),
+    3. **scatter** ``output[permutation[i]] = out_sorted[i]`` — logical -> physical.
+
+    The GEMM uses a small-N tile suited to the skinny shrink output (rather than
+    the canonical 256×256 tile of :func:`sgemm_lora_a_fwd`), which is the merged
+    A-fwd kernel and is left untouched.
+
+    ``seg_indptr`` / ``weight_indices`` describe the *logical* (adapter-grouped)
+    layout; ``permutation`` (``logical -> physical``, a bijection over the token
+    rows) converts that into the physical token order of ``input_x`` / ``output``.
+
+    When ``permutation`` is ``None`` the batch is already contiguous by adapter
+    (prefill), so the gather/scatter are skipped and the GEMM runs in place.
+
+    Parameters
+    ----------
+    input_x : torch.Tensor
+        Input activation tensor in physical token order, shape ``(num_tokens, input_dim)``.
+    weights : torch.Tensor
+        LoRA A-matrix weights, shape ``(num_loras, stack_num * max_rank, input_dim)``.
+        The caller must pre-zero weight rows beyond each adapter's rank so the
+        output columns beyond the rank come out zero-padded (see
+        :func:`sgemm_lora_a_fwd`).
+    stack_num : int
+        Number of stacked projections packed along the weight rank dimension
+        (``num_slices``: 3 for QKV, 2 for gate_up, 1 otherwise).
+    seg_indptr : torch.Tensor
+        Segment index pointer over the *logical* row order, shape ``(num_segments + 1,)``.
+    weight_indices : torch.Tensor
+        Per-segment adapter indices into ``weights``, shape ``(num_segments,)``.
+    lora_ranks : torch.Tensor
+        LoRA ranks tensor, shape ``(num_loras,)``.
+    permutation : Optional[torch.Tensor], optional
+        1D ``logical -> physical`` token index tensor, shape ``(num_tokens,)``.
+        ``None`` selects the contiguous (prefill) fast path.
+    seg_lens : Optional[torch.Tensor], optional
+        Accepted for API compatibility with :func:`sgemm_lora_a_fwd`; unused.
+
+    Returns
+    -------
+    output : torch.Tensor
+        LoRA A projection in physical token order, shape ``(num_tokens, stack_num * max_rank)``.
+    """
+    del seg_lens  # unused; accepted for API compatibility.
+    num_segments = weight_indices.numel()
+    return torch.ops.sgl_kernel.chunked_sgmv_lora_shrink_forward(
+        input_x,
+        weights,
+        stack_num,
+        num_segments,
+        seg_indptr,
+        weight_indices,
+        lora_ranks,
+        permutation,
+    )

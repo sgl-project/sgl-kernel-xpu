@@ -162,8 +162,11 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer_ph_lf,
 )
 from sgl_kernel.lora import (
+    chunked_sgmv_lora_shrink_forward,
     embedding_lora_a_fwd,
     gate_up_lora_b_fwd,
+    lora_gather_rows,
+    lora_scatter_rows,
     qkv_lora_b_fwd,
     sgemm_lora_a_fwd,
     sgemm_lora_b_fwd,

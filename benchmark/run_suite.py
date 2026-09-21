@@ -124,6 +124,8 @@ suites = {
         BenchFile("bench_embedding_lora_a_fwd.py", estimated_time=40),
         BenchFile("bench_sgemm_lora_a_fwd.py", estimated_time=25),
         BenchFile("bench_sgemm_lora_b_fwd.py"),
+        BenchFile("bench_qkv_lora_b_fwd.py"),
+        BenchFile("bench_gate_up_lora_b_fwd.py"),
         # disabled temporialy due to env issue
         # --- JIT kernels (need icpx from the oneAPI toolchain) ---
         # BenchFile("bench_jit_rmsnorm.py"),

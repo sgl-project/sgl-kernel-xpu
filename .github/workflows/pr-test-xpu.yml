@@ -39,15 +39,7 @@ jobs:
             intel/sgl-kernel-xpu-dev:latest
 
       - name: Rebuild sgl-kernel from latest main + PR
-        # Every run recompiles all ~700 FMHA translation units from scratch
-        # (see `rm -rf build` below), so this budget tracks the size of the AOT
-        # instantiation matrix, not the size of the PR. The matrix has grown
-        # steadily -- 27m in Aug, ~31m by mid-Sep, then ~40m once the logit
-        # soft-cap template axis landed (#491) -- which left no headroom under
-        # the previous 40m budget and started killing PRs during wheel
-        # packaging after a fully successful compile. 75m restores margin for
-        # the next few quarters of matrix growth.
-        timeout-minutes: 75
+        timeout-minutes: 50
         env:
           # refs/pull/N/merge is GitHub's pre-computed merge commit:
           # current base (main) merged with this PR. Testing that ref

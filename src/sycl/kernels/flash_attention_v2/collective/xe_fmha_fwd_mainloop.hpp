@@ -66,8 +66,9 @@ using namespace cute;
 
 // Gemma-style logit soft-cap, applied on the natural-scale logit. qk_scale folds
 // in log2(e) for the exp2 softmax, so undo it, tanh-cap, then re-fold. Non-finite
-// (masked -INFINITY) lanes pass through untouched so masks don't leak. Callers gate
-// with `if constexpr (Softcap)` so the non-softcap path is fully elided.
+// (masked -INFINITY) lanes pass through untouched so masks don't leak. Callers keep
+// this out of the uncapped loop body entirely: softmax() duplicates its inner loops
+// and picks between them with one uniform branch on the kernel-wide cap value.
 template <typename Element>
 CUTLASS_DEVICE Element apply_logit_softcap(Element value, Element softcap) {
   if (!sycl::isfinite(value)) {
@@ -822,34 +823,55 @@ struct FMHAFwdMainloop<
       FragSRow& tS_sum,     // Softmax row-wise sum accumulator
       ElementS qk_scale) {  // Q*K scale (folds in fp8 K per-tensor scale_k)
 
-    // Logit soft-cap: gated by if constexpr (Softcap), caps the natural-scale logit
-    // via apply_logit_softcap (masked -INFINITY lanes pass through untouched).
+    // Logit soft-cap. Softcap=false instantiations elide the cap entirely, so
+    // `capped` folds to false and only the uncapped loops below are emitted.
+    // The Softcap=true instantiation serves *both* capped and uncapped launches:
+    // params.softcap is a kernel-wide scalar, so the two loop bodies are
+    // duplicated and selected by one uniform branch per softmax block rather
+    // than by a template parameter. That keeps the uncapped inner loop free of
+    // any per-element test while letting a single kernel cover both cases --
+    // dispatching Softcap as a template bool instead doubles the AOT
+    // instantiation matrix on every FMHA path. Masked (-INFINITY) lanes pass
+    // through apply_logit_softcap untouched.
     const ElementS softcap = ElementS(params.softcap);
+    const bool capped = Softcap && softcap != ElementS(0);
 
     /* Compute row-wise maxima for this block */
     auto tS_bmax = reduce<1>(tS, sycl::maximum{});
 
     /* Update (scaled) maxima and compute rescale factor */
     FragSRow rescale;
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < tS_max.size(); i++) {
-      ElementS s = qk_scale * tS_bmax(i);
-      if constexpr (Softcap) {
-        s = apply_logit_softcap(s, softcap);
+    if (capped) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tS_max.size(); i++) {
+        ElementS s = apply_logit_softcap(ElementS(qk_scale * tS_bmax(i)), softcap);
+        ElementS new_max = sycl::max(tS_max(i), s);
+        rescale(i) = sycl::native::exp2(tS_max(i) - new_max);
+        tS_max(i) = new_max;
       }
-      ElementS new_max = sycl::max(tS_max(i), s);
-      rescale(i) = sycl::native::exp2(tS_max(i) - new_max);
-      tS_max(i) = new_max;
+    } else {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tS_max.size(); i++) {
+        ElementS s = qk_scale * tS_bmax(i);
+        ElementS new_max = sycl::max(tS_max(i), s);
+        rescale(i) = sycl::native::exp2(tS_max(i) - new_max);
+        tS_max(i) = new_max;
+      }
     }
 
     /* Scale S and subtract maxima, then exponentiate */
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < tS.size(); i++) {
-      ElementS s = qk_scale * tS(i);
-      if constexpr (Softcap) {
-        s = apply_logit_softcap(s, softcap);
+    if (capped) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tS.size(); i++) {
+        ElementS s = apply_logit_softcap(ElementS(qk_scale * tS(i)), softcap);
+        tS(i) = sycl::native::exp2(s - broadcast<0>(tS_max, tS, i));
       }
-      tS(i) = sycl::native::exp2(s - broadcast<0>(tS_max, tS, i));
+    } else {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tS.size(); i++) {
+        ElementS s = qk_scale * tS(i);
+        tS(i) = sycl::native::exp2(s - broadcast<0>(tS_max, tS, i));
+      }
     }
 
     /* Rescale existing S sums */
@@ -1339,32 +1361,45 @@ struct DecodeFwdMainloop<
       FragA& tA,            // O accumulator (for rescaling)
       ElementS qk_scale) {  // Q*K scale (folds in fp8 K per-tensor scale_k)
 
-    // Logit soft-cap: gated by if constexpr (Softcap), caps the natural-scale logit
-    // via apply_logit_softcap (masked -INFINITY lanes pass through untouched).
+    // Logit soft-cap. See the matching comment in the decode-side softmax():
+    // Softcap=false folds `capped` away, and the Softcap=true instantiation
+    // covers capped and uncapped launches via one uniform branch per block so
+    // the cap does not become an AOT template axis.
     const ElementS softcap = ElementS(params.softcap);
+    const bool capped = Softcap && softcap != ElementS(0);
 
     /* Compute row-wise maxima for this block */
     auto tS_bmax = reduce<1>(tS, sycl::maximum{});
 
     /* Update (scaled) maxima */
     auto tS_prev_max = tS_max;
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < tS_max.size(); i++) {
-      ElementS s = qk_scale * tS_bmax(i);
-      if constexpr (Softcap) {
-        s = apply_logit_softcap(s, softcap);
+    if (capped) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tS_max.size(); i++) {
+        ElementS s = apply_logit_softcap(ElementS(qk_scale * tS_bmax(i)), softcap);
+        tS_max(i) = sycl::max(tS_max(i), s);
       }
-      tS_max(i) = sycl::max(tS_max(i), s);
+    } else {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tS_max.size(); i++) {
+        ElementS s = qk_scale * tS_bmax(i);
+        tS_max(i) = sycl::max(tS_max(i), s);
+      }
     }
 
     /* Scale S and subtract maxima, then exponentiate */
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < tS.size(); i++) {
-      ElementS s = qk_scale * tS(i);
-      if constexpr (Softcap) {
-        s = apply_logit_softcap(s, softcap);
+    if (capped) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tS.size(); i++) {
+        ElementS s = apply_logit_softcap(ElementS(qk_scale * tS(i)), softcap);
+        tS(i) = sycl::native::exp2(s - broadcast<0>(tS_max, tS, i));
       }
-      tS(i) = sycl::native::exp2(s - broadcast<0>(tS_max, tS, i));
+    } else {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tS.size(); i++) {
+        ElementS s = qk_scale * tS(i);
+        tS(i) = sycl::native::exp2(s - broadcast<0>(tS_max, tS, i));
+      }
     }
 
     /* Rescale existing S sums and O accumulator */

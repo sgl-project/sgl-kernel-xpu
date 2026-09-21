@@ -68,12 +68,11 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
         params.rel_bias_ptr == nullptr, "return_softmax_lse is not supported with relative attention");
     using Element = @ELEM_TYPE@;
     if (params.is_causal) {
-      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
       FMHAConfig<
           /*Causal=*/true,
           /*LocalMask=*/false,
           false,
-          Softcap,
+          /*Softcap=*/true,
           /*LSE=*/true,
           TileShapeQK,
           TileShapePV,
@@ -87,15 +86,13 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
           Element,
           Element,
           Element>::run_paged(params);
-      });
     } else {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-        AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
         FMHAConfig<
             /*Causal=*/false,
             LocalMask,
             false,
-            Softcap,
+            /*Softcap=*/true,
             /*LSE=*/true,
             TileShapeQK,
             TileShapePV,
@@ -109,7 +106,6 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
             Element,
             Element,
             Element>::run_paged(params);
-        });
       });
     }
     return;
@@ -121,12 +117,11 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
       AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
 
           using Element = @ELEM_TYPE@;
-          AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
           FMHAConfig<
               Causal,
               LocalMask,
               Sink,
-              Softcap,
+              /*Softcap=*/true,
               /*LSE=*/false,
               TileShapeQK,
               TileShapePV,
@@ -140,7 +135,6 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
               Element,
               Element,
                 Element>::run_paged(params);
-          });
       });
     });
   });
@@ -162,15 +156,22 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
     using RelTileShapeOutput = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::Int<128>>;
     using RelSubgroupLayoutQK =
         cute::Layout<cute::Shape<cute::Int<16>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+    // apply_relative_bias would fold the cap as softcap(QK+bias) while the
+    // reference ordering is softcap(QK)+bias, so the runner rejects the
+    // combination outright (see the matching TORCH_CHECK in
+    // xe_fmha_fwd_prefill_runner.hpp). Reject it here too instead of dispatching
+    // a Softcap=true kernel that can only ever throw: the instantiation is
+    // unreachable, and AOT-compiling it doubles this branch's kernel count.
+    TORCH_CHECK(
+        params.softcap == 0.f, "softcap combined with relative attention bias is not supported on XPU");
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
         using Element = @ELEM_TYPE@;
-        AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
         FMHAConfig<
             Causal,
             LocalMask,
             false,
-            Softcap,
+            /*Softcap=*/false,
             /*LSE=*/false,
             RelTileShapeQK,
             RelTileShapePV,
@@ -184,7 +185,6 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
             Element,
             Element,
             Element>::run_paged(params);
-        });
       });
     });
     return;
@@ -196,12 +196,11 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
     AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
 
           using Element = @ELEM_TYPE@;
-        AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
         FMHAConfig<
             Causal,
             LocalMask,
             false,
-            Softcap,
+            /*Softcap=*/true,
             /*LSE=*/false,
             TileShapeQK,
             TileShapePV,
@@ -215,7 +214,6 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
             Element,
             Element,
               Element>::run_paged(params);
-        });
     });
   });
 #endif

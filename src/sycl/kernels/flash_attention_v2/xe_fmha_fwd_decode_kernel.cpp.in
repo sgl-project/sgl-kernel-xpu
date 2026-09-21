@@ -62,12 +62,11 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
     TORCH_CHECK(!params.use_sink, "return_softmax_lse is not supported with sink masking");
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       using Element = @ELEM_TYPE@;
-      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
       DecodeConfig<
           false,
           LocalMask,
           false,
-          Softcap,
+          /*Softcap=*/true,
           /*LSE=*/true,
           TileShapeQK,
           TileShapePV,
@@ -81,7 +80,6 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
           Element,
           Element,
           /*PackGQAEnabled=*/false>::run_paged(params);
-      });
     });
     return;
   }
@@ -96,14 +94,21 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
         "relative attention expects a decode-sheared bias with ",
         flash_attention_v2::relative_attention::decode_padded_cols(params.rel_bias_extent, @PAGE_SIZE@),
         " columns");
+    // apply_relative_bias would fold the cap as softcap(QK+bias) while the
+    // reference ordering is softcap(QK)+bias, so the runner rejects the
+    // combination outright (see the matching TORCH_CHECK in
+    // xe_fmha_fwd_decode_runner.hpp). Reject it here too instead of dispatching
+    // a Softcap=true kernel that can only ever throw: the instantiation is
+    // unreachable, and AOT-compiling it doubles this branch's kernel count.
+    TORCH_CHECK(
+        params.softcap == 0.f, "softcap combined with relative attention bias is not supported on XPU");
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       using Element = @ELEM_TYPE@;
-      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
       DecodeConfig<
           false,
           LocalMask,
           false,
-          Softcap,
+          /*Softcap=*/false,
           /*LSE=*/false,
           TileShapeQK,
           TileShapePV,
@@ -127,7 +132,6 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
           void,
           void,
           true>::run_paged(params);
-      });
     });
     return;
   }
@@ -139,12 +143,11 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
     AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
           using Element = @ELEM_TYPE@;
-          AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
           DecodeConfig<
               false,
               LocalMask,
               Sink,
-              Softcap,
+              /*Softcap=*/true,
               /*LSE=*/false,
               TileShapeQK,
               TileShapePV,
@@ -157,7 +160,6 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
               Element,
               Element,
               Element>::run_paged(params);
-          });
       });
     });
 #else
@@ -166,12 +168,11 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
         "sink is only supported for head_size == 64, got @HEAD_DIM@");
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
         using Element = @ELEM_TYPE@;
-        AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
         DecodeConfig<
             false,
             LocalMask,
             false,
-            Softcap,
+            /*Softcap=*/true,
             /*LSE=*/false,
             TileShapeQK,
             TileShapePV,
@@ -184,7 +185,6 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
             Element,
             Element,
               Element>::run_paged(params);
-        });
     });
 #endif
 }

@@ -73,12 +73,11 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
   if (params.return_softmax_lse) {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       using Element = @ELEM_TYPE@;
-      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
       DecodeConfig<
           false,
           LocalMask,
           false,
-          Softcap,
+          /*Softcap=*/true,
           /*LSE=*/true,
           TileShapeQK_NP,
           TileShapePV_NP,
@@ -91,19 +90,17 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
           Element,
           Element,
           Element>::run_nopaged(params);
-      });
     });
     return;
   }
   // No sink support for no_page path; always use Sink=false
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     using Element = @ELEM_TYPE@;
-    AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
     DecodeConfig<
         false,
         LocalMask,
         false,
-        Softcap,
+        /*Softcap=*/true,
         /*LSE=*/false,
         TileShapeQK_NP,
         TileShapePV_NP,
@@ -116,7 +113,6 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
         Element,
         Element,
         Element>::run_nopaged(params);
-    });
   });
 }
 

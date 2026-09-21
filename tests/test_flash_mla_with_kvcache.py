@@ -467,6 +467,7 @@ def make_attn_sink(h_q=H_Q):
 # ===========================================================================
 
 
+@pytest.mark.arch("xe20", "xe35")
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("bs", [7, 384, 512])
 @pytest.mark.parametrize("num_heads", [16, 32, 64])
@@ -562,6 +563,7 @@ def test_dsv4_sparse_decode_correctness(
     torch.testing.assert_close(out.float(), ref_out.float(), atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.arch("xe20", "xe35")
 @pytest.mark.parametrize("bs", [7, 384])
 @pytest.mark.parametrize("extra_topk_valid", [0, 50, 512])
 def test_dsv4_variable_extra_topk(bs, extra_topk_valid):
@@ -601,6 +603,7 @@ def test_dsv4_variable_extra_topk(bs, extra_topk_valid):
     torch.testing.assert_close(out.float(), ref_out.float(), atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.arch("xe20", "xe35")
 def test_dsv4_attn_sink_dampens_output():
     """Large positive attn_sink should scale output toward zero."""
     torch.manual_seed(42)

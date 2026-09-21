@@ -15,17 +15,27 @@ Usage:
   python benchmark/bench_flash_mla_sparse_fwd.py
 """
 
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
+from _bench import BenchSpec, ProblemShape, format_tables, make_row
 from sgl_kernel import flash_mla_sparse_fwd
 
 # ── constants ──
 D_V = 512
 H_KV = 1
 S_KV = 16384
+
+SPEC = BenchSpec(
+    kernel="flash_mla_sparse_prefill",
+    shape=ProblemShape(
+        ("s_q", "h_q", "topk", "d_qk", "s_kv"),
+        description="2-stage sparse MLA prefill; dense bf16 KV, d_qk ∈ {512, 576}, d_v=512",
+    ),
+    metrics=("time_us", "bandwidth_gbs"),
+)
 
 
 # ============================================================================
@@ -134,6 +144,9 @@ def _compute_attention(
     return out.to(torch.bfloat16), orig_lse
 
 
+_REF_CHUNK_SQ = 256
+
+
 def flash_mla_sparse_prefill_triton(
     q: torch.Tensor,  # [s_q, h_q, d_qk]
     kv: torch.Tensor,  # [s_kv, h_kv, d_qk]
@@ -155,26 +168,53 @@ def flash_mla_sparse_prefill_triton(
 
     invalid_mask = (flat_indices < 0) | (flat_indices >= s_kv)
 
-    gathered_kv = _gather_dense(kv, flat_indices, d_qk)
-    out, lse = _compute_attention(
-        q, gathered_kv, invalid_mask, sm_scale, d_v, attn_sink
-    )
+    outs, lses = [], []
+    for start in range(0, s_q, _REF_CHUNK_SQ):
+        end = min(start + _REF_CHUNK_SQ, s_q)
+        gathered_kv = _gather_dense(kv, flat_indices[start:end], d_qk)
+        out_chunk, lse_chunk = _compute_attention(
+            q[start:end], gathered_kv, invalid_mask[start:end], sm_scale, d_v, attn_sink
+        )
+        outs.append(out_chunk)
+        lses.append(lse_chunk)
+
+    out = outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
+    lse = lses[0] if len(lses) == 1 else torch.cat(lses, dim=0)
     return out, lse
 
 
 # ============================================================================
 # Input construction
 # ============================================================================
-def build_inputs(s_q, h_q, topk, d_qk, device="xpu", dtype=torch.bfloat16, seed=0):
+def build_inputs(
+    s_q,
+    h_q,
+    topk,
+    d_qk,
+    s_kv,
+    use_topk_length=False,
+    device="xpu",
+    dtype=torch.bfloat16,
+    seed=0,
+):
     torch.manual_seed(seed)
     q = torch.randn((s_q, h_q, d_qk), device=device, dtype=dtype)
-    kv = torch.randn((S_KV, H_KV, d_qk), device=device, dtype=dtype)
-    indices = torch.full((s_q, H_KV, topk), S_KV, dtype=torch.int32, device=device)
-    for t in range(s_q):
-        n = min(topk, max(1, S_KV))
-        i_i = torch.randperm(S_KV, device=device)[:n].to(torch.int32)
-        indices[t, 0, : len(i_i)] = i_i
-    return q, kv, indices
+    kv = torch.randn((s_kv, H_KV, d_qk), device=device, dtype=dtype)
+
+    n = min(topk, max(1, s_kv))
+    # per-row random permutation via argsort of random keys (vectorized -- avoids
+    # an s_q-iteration Python loop, needed since chunked-prefill s_q can be 8192+)
+    perm = torch.argsort(torch.rand((s_q, s_kv), device=device), dim=-1)[:, :n]
+    indices = torch.full((s_q, H_KV, topk), s_kv, dtype=torch.int32, device=device)
+    indices[:, 0, :n] = perm.to(torch.int32)
+
+    topk_length = None
+    if use_topk_length:
+        topk_length = torch.randint(
+            1, topk + 1, (s_q,), device=device, dtype=torch.int32
+        )
+
+    return q, kv, indices, topk_length
 
 
 # ============================================================================
@@ -191,18 +231,45 @@ def effective_bytes(s_q, h_q, topk, d_qk):
 # ============================================================================
 # Benchmark configuration
 # ============================================================================
-# (s_q, h_q, topk, d_qk); d_qk in {512, 576}
+class PrefillConfig(NamedTuple):
+    s_q: int
+    h_q: int
+    topk: int
+    d_qk: int
+    s_kv: int
+    use_topk_length: bool = False
+
+
+# ---- PREFILL-stage on synthetic data ----
 configs = [
-    (512, 16, 2048, 512),
-    (512, 32, 2048, 512),
-    (512, 128, 2048, 512),
-    (2048, 16, 512, 512),
-    (2048, 128, 512, 512),
-    (512, 16, 2048, 576),
-    (512, 32, 2048, 576),
-    (512, 128, 2048, 576),
-    (2048, 16, 512, 576),
-    (2048, 128, 512, 576),
+    PrefillConfig(512, 16, 2048, 512, S_KV),
+    PrefillConfig(512, 32, 2048, 512, S_KV),
+    PrefillConfig(512, 128, 2048, 512, S_KV),
+    PrefillConfig(2048, 16, 512, 512, S_KV),
+    PrefillConfig(2048, 128, 512, 512, S_KV),
+    PrefillConfig(512, 16, 2048, 576, S_KV),
+    PrefillConfig(512, 32, 2048, 576, S_KV),
+    PrefillConfig(512, 128, 2048, 576, S_KV),
+    PrefillConfig(2048, 16, 512, 576, S_KV),
+    PrefillConfig(2048, 128, 512, 576, S_KV),
+]
+
+# ---- PREFILL-stage for DEEPSEEK V4 flash ----
+configs += [
+    PrefillConfig(8192, 64, 128, 512, 8192, use_topk_length=True),  # conc=2/32/128
+    PrefillConfig(8192, 64, 256, 512, 8256, use_topk_length=True),  # conc=2/32/128
+    PrefillConfig(8192, 64, 640, 512, 10240, use_topk_length=True),  # conc=2/32/128
+    PrefillConfig(8192, 64, 128, 512, 8113, use_topk_length=True),  # conc=32
+    PrefillConfig(8192, 64, 256, 512, 8113, use_topk_length=True),  # conc=8
+    PrefillConfig(8192, 64, 256, 512, 8176, use_topk_length=True),  # conc=32
+    PrefillConfig(8192, 64, 640, 512, 10141, use_topk_length=True),  # conc=32
+]
+
+# ---- PREFILL-stage for DEEPSEEK V4 Pro ----
+configs += [
+    PrefillConfig(1024, 32, 1024, 512, 1024),
+    PrefillConfig(8192, 32, 1024, 512, 8192),
+    PrefillConfig(10240, 32, 1024, 512, 10240),
 ]
 
 
@@ -218,47 +285,46 @@ if __name__ == "__main__":
 
     results = []
 
-    for s_q, h_q, topk, d_qk in configs:
-        q, kv, indices = build_inputs(s_q, h_q, topk, d_qk, device=device)
-        sm_scale = d_qk**-0.5
-        total_bytes = effective_bytes(s_q, h_q, topk, d_qk)
+    for cfg in configs:
+        q, kv, indices, topk_length = build_inputs(
+            cfg.s_q,
+            cfg.h_q,
+            cfg.topk,
+            cfg.d_qk,
+            cfg.s_kv,
+            use_topk_length=cfg.use_topk_length,
+            device=device,
+        )
+        sm_scale = cfg.d_qk**-0.5
+        total_bytes = effective_bytes(cfg.s_q, cfg.h_q, cfg.topk, cfg.d_qk)
 
         # Triton reference (Triton gather -> PyTorch attention)
         fn_triton = lambda: flash_mla_sparse_prefill_triton(
-            q, kv, indices, sm_scale, D_V
+            q, kv, indices, sm_scale, D_V, topk_length=topk_length
         )
         ms_triton, _, _ = triton.testing.do_bench(fn_triton, quantiles=[0.5, 0.2, 0.8])
-        bw_triton = total_bytes / (ms_triton / 1e3) / 1e9
         torch.xpu.synchronize()
 
         # SGL Kernel
         fn_sgl = lambda: flash_mla_sparse_fwd(
-            q, kv, indices, sm_scale=sm_scale, d_v=D_V
+            q, kv, indices, sm_scale=sm_scale, d_v=D_V, topk_length=topk_length
         )
         ms_sgl, _, _ = triton.testing.do_bench(fn_sgl, quantiles=[0.5, 0.2, 0.8])
         bw_sgl = total_bytes / (ms_sgl / 1e3) / 1e9
         torch.xpu.synchronize()
-        results.append((s_q, h_q, topk, d_qk, ms_triton, ms_sgl, bw_triton, bw_sgl))
-
-    # Print table with borders
-    hdr = (
-        "| s_q  | head_q | topk | d_qk | Triton Ref (ms) | SGL Kernel (ms) "
-        "| Triton Ref BW (GB/s) | SGL Kernel BW (GB/s) |"
-    )
-    sep = (
-        "|------|--------|------|------|-----------------|-----------------|"
-        "----------------------|----------------------|"
-    )
+        results.append(
+            make_row(
+                SPEC,
+                dtype=torch.bfloat16,
+                size=(cfg.s_q, cfg.h_q, cfg.topk, cfg.d_qk, cfg.s_kv),
+                time_us=ms_sgl * 1e3,
+                bandwidth_gbs=bw_sgl,
+                provider="sglang",
+                reference_provider="triton",
+                reference_time_us=ms_triton * 1e3,
+            )
+        )
 
     print()
-    print(sep)
-    print(hdr)
-    print(sep)
-    for s_q, h_q, topk, d_qk, ms_t, ms_s, bw_t, bw_s in results:
-        print(
-            f"| {s_q:>4} | {h_q:>6} | {topk:>4} | {d_qk:>4} "
-            f"| {ms_t:>15.4f} | {ms_s:>15.4f} "
-            f"| {bw_t:>20.2f} | {bw_s:>20.2f} |"
-        )
-    print(sep)
+    print(format_tables(results))
     print()

@@ -9,11 +9,12 @@ Usage:
 
 import math
 from itertools import product
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
+from _bench import BenchSpec, ProblemShape, format_tables, make_row
 from sgl_kernel import flash_mla_with_kvcache
 
 # ── DeepSeek V4 constants ──
@@ -29,6 +30,24 @@ _SCALE_STRIDE = tl.constexpr(SCALE_STRIDE_VAL)
 H_PER_RANK = 16
 SM_SCALE = 1.0 / math.sqrt(D_VAL)
 PAGE_SIZE = 256
+
+SPEC = BenchSpec(
+    kernel="flash_mla_sparse_decode",
+    shape=ProblemShape(
+        (
+            "b",
+            "h_q",
+            "topk",
+            "extra_topk",
+            "num_pages",
+            "page_size",
+            "extra_num_pages",
+            "extra_page_size",
+        ),
+        description="fp8 paged sparse MLA decode; extra_* is the optional second KV pool",
+    ),
+    metrics=("time_us", "bandwidth_gbs"),
+)
 
 
 # ============================================================================
@@ -339,7 +358,17 @@ def make_indices(B, topk, num_pages, page_size, device):
     )
 
 
-def build_inputs(B, topk, extra_topk, num_pages, page_size, H, device):
+def build_inputs(
+    B,
+    topk,
+    extra_topk,
+    num_pages,
+    page_size,
+    H,
+    device,
+    extra_num_pages=0,
+    extra_page_size=64,
+):
     k_cache = make_fp8_kv_cache(num_pages, page_size, device)
     indices = make_indices(B, topk, num_pages, page_size, device)
     q = torch.randn(B, 1, H, D_VAL, dtype=torch.bfloat16, device=device)
@@ -357,8 +386,12 @@ def build_inputs(B, topk, extra_topk, num_pages, page_size, H, device):
     }
 
     if extra_topk > 0:
-        extra_cache = make_fp8_kv_cache(num_pages, 64, device)
-        extra_indices = make_indices(B, extra_topk, num_pages, 64, device)
+        # extra pool defaults to the main pool's sizing unless overridden.
+        extra_pages = extra_num_pages or num_pages
+        extra_cache = make_fp8_kv_cache(extra_pages, extra_page_size, device)
+        extra_indices = make_indices(
+            B, extra_topk, extra_pages, extra_page_size, device
+        )
         extra_topk_length = torch.full(
             (B,), extra_topk, dtype=torch.int32, device=device
         )
@@ -389,26 +422,158 @@ def _compute_total_bytes(B, topk, extra_topk, H):
 # ============================================================================
 # Benchmark configuration
 # ============================================================================
+class DecodeConfig(NamedTuple):
+    b: int
+    h_q: int
+    topk: int
+    extra_topk: int
+    num_pages: int
+    page_size: int = PAGE_SIZE
+    extra_num_pages: int = 0
+    extra_page_size: int = 0
+
+
 batch_size_range = [1, 8, 42, 128, 256]
 topk_range = [64, 128, 512]
 extra_topk_range = [0, 512]
 
-MAX_TOKENS = 256 * 640
-
+# ---- DECODE-stage on synthetic data ----
 configs = [
-    (b, topk, extra)
-    for b, topk, extra in product(batch_size_range, topk_range, extra_topk_range)
-    if b * (topk + extra) <= MAX_TOKENS
+    DecodeConfig(
+        b,
+        H_PER_RANK,
+        topk,
+        extra_topk,
+        num_pages=512,
+        page_size=PAGE_SIZE,
+        extra_num_pages=512,
+        extra_page_size=64,
+    )
+    for b, topk, extra_topk in product(batch_size_range, topk_range, extra_topk_range)
 ]
 
+# ---- DECODE-stage for DEEPSEEK V4 flash ----
+configs += [
+    # conc=2
+    DecodeConfig(
+        2,
+        64,
+        128,
+        128,
+        num_pages=103,
+        page_size=PAGE_SIZE,
+        extra_num_pages=1025,
+        extra_page_size=256,
+    ),
+    DecodeConfig(
+        2,
+        64,
+        128,
+        512,
+        num_pages=103,
+        page_size=PAGE_SIZE,
+        extra_num_pages=1025,
+        extra_page_size=256,
+    ),
+    # conc=8, steady-state, no extra pool
+    DecodeConfig(8, 64, 128, 0, num_pages=103, page_size=PAGE_SIZE),
+    # conc=32
+    DecodeConfig(
+        32,
+        64,
+        128,
+        128,
+        num_pages=129,
+        page_size=PAGE_SIZE,
+        extra_num_pages=1281,
+        extra_page_size=256,
+    ),
+    DecodeConfig(
+        32,
+        64,
+        128,
+        128,
+        num_pages=129,
+        page_size=PAGE_SIZE,
+        extra_num_pages=1281,
+        extra_page_size=64,
+    ),
+    DecodeConfig(
+        32,
+        64,
+        128,
+        128,
+        num_pages=129,
+        page_size=PAGE_SIZE,
+        extra_num_pages=1281,
+        extra_page_size=2,
+    ),
+    DecodeConfig(
+        32,
+        64,
+        128,
+        512,
+        num_pages=129,
+        page_size=PAGE_SIZE,
+        extra_num_pages=1281,
+        extra_page_size=256,
+    ),
+    # conc=128
+    DecodeConfig(
+        128,
+        64,
+        128,
+        128,
+        num_pages=513,
+        page_size=PAGE_SIZE,
+        extra_num_pages=5121,
+        extra_page_size=256,
+    ),
+    DecodeConfig(
+        128,
+        64,
+        128,
+        128,
+        num_pages=513,
+        page_size=PAGE_SIZE,
+        extra_num_pages=5121,
+        extra_page_size=64,
+    ),
+    DecodeConfig(
+        128,
+        64,
+        128,
+        128,
+        num_pages=513,
+        page_size=PAGE_SIZE,
+        extra_num_pages=5121,
+        extra_page_size=2,
+    ),
+    DecodeConfig(
+        128,
+        64,
+        128,
+        512,
+        num_pages=513,
+        page_size=PAGE_SIZE,
+        extra_num_pages=5121,
+        extra_page_size=256,
+    ),
+]
+# ---- DECODE-stage for DEEPSEEK V4 pro ----
+configs += [
+    DecodeConfig(1, 64, 128, 0, num_pages=513, page_size=PAGE_SIZE),
+    DecodeConfig(2, 64, 128, 0, num_pages=513, page_size=PAGE_SIZE),
+    DecodeConfig(8, 64, 128, 0, num_pages=513, page_size=PAGE_SIZE),
+    DecodeConfig(16, 64, 128, 0, num_pages=513, page_size=PAGE_SIZE),
+    DecodeConfig(32, 64, 128, 0, num_pages=513, page_size=PAGE_SIZE),
+]
 
 # ============================================================================
 # Main
 # ============================================================================
 if __name__ == "__main__":
     device = torch.device("xpu")
-    H = H_PER_RANK
-    num_pages = 512
 
     torch.manual_seed(42)
     if hasattr(torch.xpu, "manual_seed_all"):
@@ -416,14 +581,23 @@ if __name__ == "__main__":
 
     results = []
 
-    for b, topk, extra_topk in configs:
-        inputs = build_inputs(b, topk, extra_topk, num_pages, PAGE_SIZE, H, device)
-        total_bytes = _compute_total_bytes(b, topk, extra_topk, H)
+    for cfg in configs:
+        inputs = build_inputs(
+            cfg.b,
+            cfg.topk,
+            cfg.extra_topk,
+            cfg.num_pages,
+            cfg.page_size,
+            cfg.h_q,
+            device,
+            extra_num_pages=cfg.extra_num_pages,
+            extra_page_size=cfg.extra_page_size,
+        )
+        total_bytes = _compute_total_bytes(cfg.b, cfg.topk, cfg.extra_topk, cfg.h_q)
 
         # Triton V4
         fn_triton = lambda: flash_mla_sparse_decode_triton(**inputs)
         ms_triton, _, _ = triton.testing.do_bench(fn_triton, quantiles=[0.5, 0.2, 0.8])
-        bw_triton = total_bytes / (ms_triton / 1e3) / 1e9
         torch.xpu.synchronize()
         # SGL Kernel
         fn_sgl = lambda: flash_mla_with_kvcache(
@@ -448,27 +622,28 @@ if __name__ == "__main__":
         bw_sgl = total_bytes / (ms_sgl / 1e3) / 1e9
         torch.xpu.synchronize()
 
-        results.append((b, topk, extra_topk, ms_triton, ms_sgl, bw_triton, bw_sgl))
-
-    # Print table with borders
-    hdr = (
-        "| batch_size | topk | extra_topk | Triton V4 (ms) | SGL Kernel (ms) "
-        "| Triton BW (GB/s) | SGL Kernel BW (GB/s) |"
-    )
-    sep = (
-        "|------------|------|------------|----------------|-----------------|"
-        "------------------|----------------------|"
-    )
+        results.append(
+            make_row(
+                SPEC,
+                dtype=torch.bfloat16,
+                size=(
+                    cfg.b,
+                    cfg.h_q,
+                    cfg.topk,
+                    cfg.extra_topk,
+                    cfg.num_pages,
+                    cfg.page_size,
+                    cfg.extra_num_pages,
+                    cfg.extra_page_size,
+                ),
+                time_us=ms_sgl * 1e3,
+                bandwidth_gbs=bw_sgl,
+                provider="sglang",
+                reference_provider="triton",
+                reference_time_us=ms_triton * 1e3,
+            )
+        )
 
     print()
-    print(sep)
-    print(hdr)
-    print(sep)
-    for b, topk, extra_topk, ms_t, ms_s, bw_t, bw_s in results:
-        print(
-            f"| {b:>10} | {topk:>4} | {extra_topk:>10} "
-            f"| {ms_t:>14.4f} | {ms_s:>15.4f} "
-            f"| {bw_t:>16.2f} | {bw_s:>20.2f} |"
-        )
-    print(sep)
+    print(format_tables(results))
     print()

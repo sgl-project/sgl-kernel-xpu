@@ -145,17 +145,25 @@ struct PagedKGatherKernel {
   int B, D, page_size, max_num_blocks, max_seq_len;
   int head_dim_with_sf;
 
+  // 16 bytes (4x uint32) per transaction instead of 4 bytes.
+  using Vec4 = sycl::vec<uint32_t, 4>;
+
   void operator()(sycl::nd_item<2> item) const {
     int b = item.get_global_id(0);
     int kj = item.get_global_id(1);
     if (b >= B || kj >= max_seq_len) return;
 
     int out_idx = b * max_seq_len + kj;
+    int n_vec4 = D / 16;
+    int rem_words = (D - n_vec4 * 16) / 4;  // leftover 4-byte words if D isn't a multiple of 16
     if (kj >= seq_lens_ptr[b]) {
       // Zero padding for out-of-range tokens
-      auto* dst = reinterpret_cast<uint32_t*>(k_out_ptr + out_idx * D);
-      for (int i = 0; i < D / 4; ++i)
-        dst[i] = 0;
+      auto* dst = reinterpret_cast<Vec4*>(k_out_ptr + out_idx * D);
+      for (int i = 0; i < n_vec4; ++i)
+        dst[i] = Vec4(0u);
+      auto* dst_rem = reinterpret_cast<uint32_t*>(k_out_ptr + out_idx * D) + n_vec4 * 4;
+      for (int i = 0; i < rem_words; ++i)
+        dst_rem[i] = 0;
       k_scale_out_ptr[out_idx] = 0.0f;
       return;
     }
@@ -166,11 +174,15 @@ struct PagedKGatherKernel {
 
     const uint8_t* src = kv_cache_ptr + page_id * page_size * head_dim_with_sf + token_in_page * head_dim_with_sf;
 
-    // Vectorized copy: 4 bytes at a time (D is always a multiple of 4)
-    auto* dst = reinterpret_cast<uint32_t*>(k_out_ptr + out_idx * D);
-    auto* src32 = reinterpret_cast<const uint32_t*>(src);
-    for (int i = 0; i < D / 4; ++i)
-      dst[i] = src32[i];
+    auto* dst = reinterpret_cast<Vec4*>(k_out_ptr + out_idx * D);
+    auto* src_v = reinterpret_cast<const Vec4*>(src);
+    for (int i = 0; i < n_vec4; ++i)
+      dst[i] = src_v[i];
+    // Leftover 4-byte words if D isn't a multiple of 16.
+    auto* dst_rem = reinterpret_cast<uint32_t*>(k_out_ptr + out_idx * D) + n_vec4 * 4;
+    auto* src_rem = reinterpret_cast<const uint32_t*>(src) + n_vec4 * 4;
+    for (int i = 0; i < rem_words; ++i)
+      dst_rem[i] = src_rem[i];
 
     k_scale_out_ptr[out_idx] = load_le_f32(src + D);
   }
@@ -182,11 +194,19 @@ struct PagedKGatherKernel {
 //   score[b,j] = k_scale[b,j] * Σ_h ReLU(dots[b,h,j]) * weights[b,h]
 // where j < seq_lens[b].
 //
-// dots: (B, H, max_seq_len) float32
+// dots: (B, H, max_seq_len) float32, max_seq_len contiguous.
 // weights: (B, H) float32
 // k_scale: (B, max_seq_len) float32
 // seq_lens: (B,) int32
 // out: (B, max_seq_len) float32 — must be pre-zeroed for out-of-range positions
+//
+// Each (batch, position) output is computed by `heads_per_group` cooperating
+// work-items instead of a single thread looping over all H heads. Each lane
+// strides over a H/heads_per_group slice of the head loop, stashes its
+// partial sum into SLM, then lane 0 of each (bi,kj) sums the
+// `heads_per_group` partials manually. A plain barrier + manual SLM
+// reduction is used. At heads_per_group=1 this reduces to the single-thread-per-output
+// behavior.
 struct Fp8PagedMqaLogitsReduceKernel {
   const float* dots_ptr;
   const float* weights_ptr;
@@ -194,22 +214,51 @@ struct Fp8PagedMqaLogitsReduceKernel {
   const int32_t* seq_lens_ptr;
   float* out_ptr;
   int B, H, max_seq_len;
+  int heads_per_group;
+  sycl::local_accessor<float, 1> partials_slm;
 
-  void operator()(sycl::nd_item<2> item) const {
+  void operator()(sycl::nd_item<3> item) const {
     int bi = item.get_global_id(0);
     int kj = item.get_global_id(1);
-    if (bi >= B || kj >= max_seq_len) return;
+    int local_pos = static_cast<int>(item.get_local_id(1));
+    int lane = static_cast<int>(item.get_local_id(2));
+    int group_size = static_cast<int>(item.get_local_range(2));
+    int slm_idx = local_pos * group_size + lane;
 
-    if (kj >= seq_lens_ptr[bi]) return;  // rely on pre-zeroed output
-
-    float score = 0.0f;
-    for (int h = 0; h < H; ++h) {
-      float dot = dots_ptr[(bi * H + h) * max_seq_len + kj];
-      dot = dot > 0.0f ? dot : 0.0f;
-      score += dot * weights_ptr[bi * H + h];
+    bool valid = bi < B && kj < max_seq_len && kj < seq_lens_ptr[bi < B ? bi : 0];
+    float partial = 0.0f;
+    if (valid) {
+      const float* dots_base = dots_ptr + (static_cast<int64_t>(bi) * H) * max_seq_len + kj;
+      const float* weights_base = weights_ptr + bi * H;
+      for (int h = lane; h < H; h += group_size) {
+        float dot = dots_base[static_cast<int64_t>(h) * max_seq_len];
+        dot = dot > 0.0f ? dot : 0.0f;
+        partial += dot * weights_base[h];
+      }
     }
-    score *= k_scale_ptr[bi * max_seq_len + kj];
-    out_ptr[bi * max_seq_len + kj] = score;
+    // Fast path: when heads_per_group==1 there is nothing to combine across
+    // lanes (each lane already owns the full head-reduction for its own
+    // output), so skip the SLM round-trip + barrier entirely.
+    // The return here is safe because `group_size` is the same for all work-items
+    // in the group, so all lanes will either take this branch or not.
+    if (group_size == 1) {
+      if (valid) {
+        float score = partial * k_scale_ptr[bi * max_seq_len + kj];
+        out_ptr[bi * max_seq_len + kj] = score;
+      }
+      return;
+    }
+    // All work-items in the group must reach this barrier uniformly
+    // (no divergent control flow above it), regardless of `valid`.
+    partials_slm[slm_idx] = partial;
+    item.barrier(sycl::access::fence_space::local_space);
+    if (lane == 0 && valid) {
+      float score = 0.0f;
+      for (int l = 0; l < group_size; ++l)
+        score += partials_slm[local_pos * group_size + l];
+      score *= k_scale_ptr[bi * max_seq_len + kj];
+      out_ptr[bi * max_seq_len + kj] = score;
+    }
   }
 };
 

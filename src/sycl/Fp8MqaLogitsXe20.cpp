@@ -26,7 +26,10 @@ limitations under the License.
 #include <torch/all.h>
 
 #include <cstdlib>
+#include <utility>
 
+#include "SYCLHelpers.h"
+#include "Utils.h"
 #include "kernels/nsa/fp8_mqa_gemm_xe20.hpp"
 #include "kernels/nsa/fp8_mqa_logits_kernel.hpp"
 #include "sgl_kernel_export.h"
@@ -34,25 +37,111 @@ limitations under the License.
 namespace {
 
 constexpr int WG_SIZE = 256;
-// SYCL-TLA tile: 32x128x32. M must be ≥32, N must be ≥128.
+// GEMM path requires H (M) and msl (N) at least as large as the largest tile
+// variant (32x128); smaller shapes use the naive fallback kernel instead.
 constexpr int MIN_M_GEMM = 32;
 constexpr int MIN_N_GEMM = 128;
 
-inline int cdiv(int a, int b) {
-  return (a + b - 1) / b;
+constexpr int kMinWorkgroupsPerSubslice = 4;
+
+// Picks (global_range, local_range) for a 2D kernel (the paged-K
+// gather and naive fallback kernels below, both indexed as (batch, kv
+// position)).
+std::pair<sycl::range<2>, sycl::range<2>> compute_2d_launch_ranges(int dim0, int dim1) {
+  int64_t sub_group_size = std::max<int64_t>(1, dpcppMaxSubGroupSize());
+  int64_t target_workgroups = dpcppGpuSubsliceCount() * kMinWorkgroupsPerSubslice;
+
+  int local1 = std::min(dim1, WG_SIZE);
+  while (local1 > sub_group_size) {
+    int64_t workgroups = static_cast<int64_t>(dim0) * div_up(dim1, local1);
+    if (workgroups >= target_workgroups) break;
+    local1 = std::max<int>(static_cast<int>(sub_group_size), local1 / 2);
+  }
+
+  sycl::range<2> local_range(1, local1);
+  int global_1 = div_up(dim1, local1) * local1;
+  sycl::range<2> global_range(dim0, global_1);
+  return {global_range, local_range};
 }
 
-template <typename Kernel>
-void launch_2d_kernel(sycl::queue& queue, Kernel& kernel, int dim0, int dim1) {
-  sycl::range<2> local_range(1, std::min(dim1, WG_SIZE));
-  int global_1 = cdiv(dim1, (int)local_range[1]) * local_range[1];
-  sycl::range<2> adjusted_global(dim0, global_1);
-  queue.submit([&](sycl::handler& cgh) { cgh.parallel_for(sycl::nd_range<2>(adjusted_global, local_range), kernel); });
+// Total (batch, position) pairs below which the Reduce kernel's per-thread
+// H-head serial load chain leaves too few work-items to fill the device's
+// subslices. Below this, split the head loop across multiple cooperating work-items
+// instead of running with a single lane per output element. Tuned empirically.
+constexpr int64_t kMinReduceElemsForNoSplit = 4096;
+
+// Pick how many work-items cooperate on each output element's head-reduction:
+// 1 (no split) once B*msl alone gives the device enough independent work,
+// otherwise the largest divisor of H in {8,4,2} to shorten the per-lane
+// serial load chain without leaving remainder heads unhandled.
+inline int select_reduce_heads_per_group(int64_t total_elems, int H) {
+  if (total_elems > kMinReduceElemsForNoSplit) return 1;
+  for (int cand : {8, 4, 2}) {
+    if (H % cand == 0) return cand;
+  }
+  return 1;
+}
+
+// Launches Fp8PagedMqaLogitsReduceKernel. Each work-group covers
+// `positions_per_group` (batch,position) outputs, each reduced by
+// `heads_per_group` cooperating work-items, so the *total* work-group size
+// stays ~WG_SIZE regardless of heads_per_group.
+void launch_reduce_kernel(
+    sycl::queue& queue,
+    const float* dots_ptr,
+    const float* weights_ptr,
+    const float* k_scale_ptr,
+    const int32_t* seq_lens_ptr,
+    float* out_ptr,
+    int B,
+    int H,
+    int max_seq_len,
+    int heads_per_group) {
+  int positions_per_group = std::max(1, WG_SIZE / heads_per_group);
+  positions_per_group = std::min(positions_per_group, max_seq_len);
+  sycl::range<3> local_range(1, positions_per_group, heads_per_group);
+  int global_1 = div_up(max_seq_len, positions_per_group) * positions_per_group;
+  sycl::range<3> global_range(B, global_1, heads_per_group);
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> partials_slm(sycl::range<1>(positions_per_group * heads_per_group), cgh);
+    nsa::Fp8PagedMqaLogitsReduceKernel kernel{
+        dots_ptr, weights_ptr, k_scale_ptr, seq_lens_ptr, out_ptr, B, H, max_seq_len, heads_per_group, partials_slm};
+    cgh.parallel_for(sycl::nd_range<3>(global_range, local_range), kernel);
+  });
+}
+
+// GEMM tile-shape variants (M, N, K), ordered from largest (best per-tile
+// arithmetic intensity/reuse) to smallest (most workgroups). All are valid
+// CTA tile shapes for MMA_Atom<XE_8x16x16_F32F16F16F32_TT> with subgroup
+// layout (1,4,1): M must be a multiple of 8, N a multiple of 64, K a
+// multiple of 16 (see cute::TiledMMAHelper's CanonicalBlockShape).
+using GemmTileShapeLarge = cute::Shape<cute::_32, cute::_128, cute::_32>;
+using GemmTileShapeMedium = cute::Shape<cute::_16, cute::_64, cute::_32>;
+using GemmTileShapeSmall = cute::Shape<cute::_8, cute::_64, cute::_32>;
+
+// Subgroup (WarpLayout) partitioning of each CTA tile
+using GemmSGLayoutWide =
+    cute::Layout<cute::Shape<cute::_1, cute::_4, cute::_1>, cute::Stride<cute::_4, cute::_1, cute::_0>>;
+using GemmSGLayoutNarrow =
+    cute::Layout<cute::Shape<cute::_1, cute::_2, cute::_1>, cute::Stride<cute::_2, cute::_1, cute::_0>>;
+
+// Tuned for the GEMM part.
+constexpr int64_t kMinOccupancyTiles = 64;
+
+template <typename GemmTileShape>
+inline bool is_tile_aligned(int M, int N, int K) {
+  using namespace cute;
+  return M % get<0>(GemmTileShape{}) == 0 && N % get<1>(GemmTileShape{}) == 0 && K % get<2>(GemmTileShape{}) == 0;
+}
+
+template <typename GemmTileShape>
+inline int64_t total_tiles(int batch, int M, int N) {
+  using namespace cute;
+  return static_cast<int64_t>(batch) * (M / get<0>(GemmTileShape{})) * (N / get<1>(GemmTileShape{}));
 }
 
 // Batched FP8 GEMM via SYCL-TLA: for each b, D_b(M,N) = A_b(M,K) @ B_b(N,K)^T.
-// Base pointers advance by the per-batch element strides. Writes directly into
-// the pre-allocated output buffer. Falls back to torch::bmm if not tile-aligned.
+// Falls back to torch::bmm if not tile-aligned.
 void fp8_gemm_xe20_batched_inplace(
     sycl::queue& queue,
     const torch::Tensor& a_fp8,  // (batch, M, K) fp8
@@ -66,20 +155,43 @@ void fp8_gemm_xe20_batched_inplace(
     int64_t b_batch_stride,
     int64_t d_batch_stride,
     at::Device device) {
-  using namespace cute;
-  using GemmTileShape = Shape<_32, _128, _32>;
-
   auto a_ptr = a_fp8.data_ptr<uint8_t>();
   auto b_ptr = b_fp8.data_ptr<uint8_t>();
   auto d_ptr = d_f32.data_ptr<float>();
 
-  if (M % get<0>(GemmTileShape{}) == 0 && N % get<1>(GemmTileShape{}) == 0 && K % get<2>(GemmTileShape{}) == 0) {
-    nsa::fp8_mqa_gemm_batched_launch<GemmTileShape>(
+  // Pick the largest tile that still clears the minimum-occupancy target;
+  // fall back to progressively smaller (but still aligned) tiles if the
+  // large one would under-fill the device, and to the smallest aligned tile
+  // if none reach the target (maximize occupancy as a last resort).
+  if (is_tile_aligned<GemmTileShapeLarge>(M, N, K) &&
+      total_tiles<GemmTileShapeLarge>(batch, M, N) >= kMinOccupancyTiles) {
+    nsa::fp8_mqa_gemm_batched_launch<GemmTileShapeLarge, GemmSGLayoutWide>(
+        &queue, a_ptr, b_ptr, d_ptr, batch, M, N, K, a_batch_stride, b_batch_stride, d_batch_stride);
+    return;
+  }
+  if (is_tile_aligned<GemmTileShapeMedium>(M, N, K) &&
+      total_tiles<GemmTileShapeMedium>(batch, M, N) >= kMinOccupancyTiles) {
+    nsa::fp8_mqa_gemm_batched_launch<GemmTileShapeMedium, GemmSGLayoutNarrow>(
+        &queue, a_ptr, b_ptr, d_ptr, batch, M, N, K, a_batch_stride, b_batch_stride, d_batch_stride);
+    return;
+  }
+  if (is_tile_aligned<GemmTileShapeSmall>(M, N, K)) {
+    nsa::fp8_mqa_gemm_batched_launch<GemmTileShapeSmall, GemmSGLayoutNarrow>(
+        &queue, a_ptr, b_ptr, d_ptr, batch, M, N, K, a_batch_stride, b_batch_stride, d_batch_stride);
+    return;
+  }
+  if (is_tile_aligned<GemmTileShapeMedium>(M, N, K)) {
+    nsa::fp8_mqa_gemm_batched_launch<GemmTileShapeMedium, GemmSGLayoutNarrow>(
+        &queue, a_ptr, b_ptr, d_ptr, batch, M, N, K, a_batch_stride, b_batch_stride, d_batch_stride);
+    return;
+  }
+  if (is_tile_aligned<GemmTileShapeLarge>(M, N, K)) {
+    nsa::fp8_mqa_gemm_batched_launch<GemmTileShapeLarge, GemmSGLayoutWide>(
         &queue, a_ptr, b_ptr, d_ptr, batch, M, N, K, a_batch_stride, b_batch_stride, d_batch_stride);
     return;
   }
 
-  // Fallback to torch::bmm if dimensions are not tile-aligned.
+  // Fallback to torch::bmm if dimensions are not tile-aligned by any variant.
   // a_fp8 and b_fp8 may have arbitrary leading dims from the call site;
   // reshape to 3D (batch, M/N, K) for bmm compatibility.
   auto a_bf16 = a_fp8.reshape({batch, M, K}).to(at::ScalarType::BFloat16);
@@ -119,12 +231,15 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_paged_mqa_logits(
     TORCH_WARN_ONCE("fp8_paged_mqa_logits: schedule_metadata is ignored on XPU");
   }
 
-  int B_next = q_fp8.size(0);
+  int B = q_fp8.size(0);
   int H = q_fp8.size(2);
   int D = q_fp8.size(3);
   int page_size = kv_cache.size(1);
   int head_dim_with_sf = kv_cache.size(3);
   int max_num_blocks = block_tables.size(1);
+  TORCH_CHECK(
+      max_seq_len >= 0 && max_seq_len <= std::numeric_limits<int>::max(),
+      "max_seq_len exceeds int32 range for XPU kernel");
   int msl = static_cast<int>(max_seq_len);
 
   TORCH_CHECK(
@@ -141,21 +256,21 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_paged_mqa_logits(
       ") must cover max_seq_len (",
       msl,
       ")");
-  TORCH_CHECK(weights.dim() == 2 && weights.size(0) == B_next && weights.size(1) == H, "weights must be (B, H)");
+  TORCH_CHECK(weights.dim() == 2 && weights.size(0) == B && weights.size(1) == H, "weights must be (B, H)");
 
   // clean_logits is accepted for API compatibility but output is always
   // zero-initialized — the cost is negligible relative to GEMM.
   (void)clean_logits;
-  auto logits = torch::zeros({B_next, msl}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
-  if (B_next == 0 || msl == 0) return logits;
+  auto logits = torch::zeros({B, msl}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
+  if (B == 0 || msl == 0) return logits;
 
   auto seq_lens_flat = seq_lens.dim() == 2 ? seq_lens.contiguous().view({-1}) : seq_lens.contiguous();
   TORCH_CHECK(
-      seq_lens_flat.size(0) == B_next,
+      seq_lens_flat.size(0) == B,
       "seq_lens must have B elements after flattening, got ",
       seq_lens_flat.size(0),
       " vs B=",
-      B_next);
+      B);
 
   // Ensure contiguity
   auto q_contig = q_fp8.contiguous();
@@ -170,7 +285,7 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_paged_mqa_logits(
 
   if (use_gemm) {
     // Stage 1/2 temporaries (k_gathered: B*msl*D bytes, dots: B*H*msl*4 bytes)
-    // scale with the *full* decode batch B_next.
+    // scale with the *full* decode batch B.
     // Chunk over the batch dimension so peak temporary memory is bounded by a
     // fixed budget, mirroring the batch-slicing done for the FMHA prefill score workspace.
     constexpr int64_t kDefaultChunkBudgetBytes = 512LL * 1024 * 1024;  // 512 MiB
@@ -181,16 +296,16 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_paged_mqa_logits(
       }
       return kDefaultChunkBudgetBytes;
     }();
-    // Per-row bytes for the two chunked temporaries: k_gathered (msl*D uint8) + dots (H*msl*4 float32) +
+    // Per-batch bytes for the two chunked temporaries: k_gathered (msl*D uint8) + dots (H*msl*4 float32) +
     // k_scale_gathered (msl*4 float32).
-    int64_t per_row_bytes = static_cast<int64_t>(H) * msl * sizeof(float) + static_cast<int64_t>(msl) * D +
-                            static_cast<int64_t>(msl) * sizeof(float);
-    int chunk_b = static_cast<int>(std::max<int64_t>(1, chunk_budget_bytes / std::max<int64_t>(per_row_bytes, 1)));
-    chunk_b = std::min(chunk_b, B_next);
+    int64_t per_batch_bytes = static_cast<int64_t>(H) * msl * sizeof(float) + static_cast<int64_t>(msl) * D +
+                              static_cast<int64_t>(msl) * sizeof(float);
+    int chunk_b = static_cast<int>(std::max<int64_t>(1, chunk_budget_bytes / std::max<int64_t>(per_batch_bytes, 1)));
+    chunk_b = std::min(chunk_b, B);
     if (std::getenv("SGL_KERNEL_FP8_PAGED_MQA_VERBOSE") != nullptr) {
-      TORCH_WARN(
+      TORCH_WARN_ONCE(
           "fp8_paged_mqa_logits: B=",
-          B_next,
+          B,
           " H=",
           H,
           " msl=",
@@ -198,14 +313,15 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_paged_mqa_logits(
           " -> chunk_b=",
           chunk_b,
           " (",
-          cdiv(B_next, chunk_b),
+          div_up(B, chunk_b),
           " chunks)");
     }
 
-    // TODO: use a fused kernel to reduce launch overhead for large number of B chunks.
-    // For now, the overhead is negligible (~2%) in the cases we tested.
-    for (int start = 0; start < B_next; start += chunk_b) {
-      int cur_b = std::min(chunk_b, B_next - start);
+    // To avoid OOM, slice the batch dimension into chunks of size chunk_b and process each chunk independently.
+    // Hard to fuse the gather + GEMM + reduction into a single kernel because the kernels have different launch
+    // configs.
+    for (int start = 0; start < B; start += chunk_b) {
+      int cur_b = std::min(chunk_b, B - start);
 
       auto q_chunk = q_contig.narrow(0, start, cur_b);
       auto seq_lens_chunk = seq_lens_flat.narrow(0, start, cur_b);
@@ -214,9 +330,10 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_paged_mqa_logits(
       auto logits_chunk = logits.narrow(0, start, cur_b);
 
       // Stage 1: Gather K from pages into contiguous buffer (sized for this chunk only)
+      // Out of bound positions are filled with zeros in the kernel.
       auto k_gathered =
           torch::empty({static_cast<int64_t>(cur_b) * msl, D}, torch::dtype(torch::kUInt8).device(q_fp8.device()));
-      auto k_scale_gathered = torch::zeros({cur_b, msl}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
+      auto k_scale_gathered = torch::empty({cur_b, msl}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
 
       nsa::PagedKGatherKernel gather_kernel{
           kv_contig.data_ptr<uint8_t>(),
@@ -230,14 +347,11 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_paged_mqa_logits(
           max_num_blocks,
           msl,
           head_dim_with_sf};
-      launch_2d_kernel(queue, gather_kernel, cur_b, msl);
+      auto [gather_global_range, gather_local_range] = compute_2d_launch_ranges(cur_b, msl);
+      sycl_kernel_submit(gather_global_range, gather_local_range, queue, gather_kernel);
 
       // Stage 2: Batched SYCL-TLA FP8 GEMM — all cur_b GEMMs in this chunk in one launch.
-      // TODO: switch to torch._scaled_grouped_mm once it is implemented on XPU
-      // (currently aten::_scaled_grouped_mm_v2 is unimplemented and 3D batched
-      // _scaled_mm is unsupported, so the only torch option is a per-batch
-      // _scaled_mm loop that does not scale with B). The custom batched SYCL-TLA
-      // kernel is 4-15x faster than that loop for B>=4, so we keep it for decode.
+      // TODO: switch to torch._scaled_grouped_mm once it is implemented on XPU.
       auto dots = torch::empty({cur_b, H, msl}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
 
       fp8_gemm_xe20_batched_inplace(
@@ -254,8 +368,12 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_paged_mqa_logits(
           static_cast<int64_t>(H) * msl,
           q_fp8.device());
 
-      // Stage 3: Reduction
-      nsa::Fp8PagedMqaLogitsReduceKernel reduce_kernel{
+      // Stage 3: Reduction. Split the head loop across multiple cooperating
+      // work-items per output element when B*msl alone is too small to fill
+      // the device (see select_reduce_heads_per_group).
+      int heads_per_group = select_reduce_heads_per_group(static_cast<int64_t>(cur_b) * msl, H);
+      launch_reduce_kernel(
+          queue,
           dots.data_ptr<float>(),
           weights_chunk.data_ptr<float>(),
           k_scale_gathered.data_ptr<float>(),
@@ -263,8 +381,8 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_paged_mqa_logits(
           logits_chunk.data_ptr<float>(),
           cur_b,
           H,
-          msl};
-      launch_2d_kernel(queue, reduce_kernel, cur_b, msl);
+          msl,
+          heads_per_group);
     }
     return logits;
   }
@@ -277,13 +395,14 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_paged_mqa_logits(
       seq_lens_flat.data_ptr<int32_t>(),
       block_tables_contig.data_ptr<int32_t>(),
       logits.data_ptr<float>(),
-      B_next,
+      B,
       H,
       D,
       page_size,
       max_num_blocks,
       msl};
-  launch_2d_kernel(queue, paged_kernel, B_next, msl);
+  auto [paged_global_range, paged_local_range] = compute_2d_launch_ranges(B, msl);
+  sycl_kernel_submit(paged_global_range, paged_local_range, queue, paged_kernel);
   return logits;
 }
 

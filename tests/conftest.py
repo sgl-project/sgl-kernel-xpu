@@ -13,7 +13,7 @@ from _xpu import KNOWN_ARCHS, current_arch
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
-        "arch(*names): XPU arches this op supports (xe20, xe35, xe40). The test "
+        "arch(*names): XPU arches this op supports (xe20, xe35). The test "
         "is skipped unless the live device is one of them. No mark = "
         "arch-agnostic (runs on any device).",
     )

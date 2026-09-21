@@ -44,7 +44,7 @@ def current_arch():
 
 def supports(*archs):
     """True if the live device is one of ``archs`` (arch tags or ``Arch``)."""
-    return current_arch() in {str(a) for a in archs}
+    return current_arch() in {a.value if isinstance(a, Arch) else a for a in archs}
 
 
 def require_arch(*archs):

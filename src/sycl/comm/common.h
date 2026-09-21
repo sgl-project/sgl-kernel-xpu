@@ -4,6 +4,9 @@
 #include <sycl/sycl.hpp>
 
 #include "cutlass/device_kernel.h"
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+#include "cutlass/util/sycl_event_manager.hpp"
+#endif
 namespace {
 
 // dispatch bool
@@ -57,7 +60,16 @@ static void launch(typename Kernel::Params params) {
   compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
   auto stream = at::xpu::getCurrentXPUStream();
   auto q = stream.queue();
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Capture the SYCL event and register it with EventManager so the
+  // GPU_Clock timer in report_kernel_perf() has a live event window to
+  // compute elapsed time from. Mirrors CUTLASS's GemmUniversalAdapter
+  // pattern (cutlass/gemm/device/gemm_universal_adapter.h).
+  auto event = compat::experimental::launch<cutlass::device_kernel<Kernel>, KernelCur<Kernel>>(policy, q, params);
+  EventManager::getInstance().addEvent(event);
+#else
   compat::experimental::launch<cutlass::device_kernel<Kernel>, KernelCur<Kernel>>(policy, q, params);
+#endif
 }
 
 }  // namespace

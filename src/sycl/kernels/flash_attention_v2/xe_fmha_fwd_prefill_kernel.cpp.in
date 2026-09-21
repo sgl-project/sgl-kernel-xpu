@@ -156,12 +156,9 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
     using RelTileShapeOutput = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::Int<128>>;
     using RelSubgroupLayoutQK =
         cute::Layout<cute::Shape<cute::Int<16>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
-    // apply_relative_bias would fold the cap as softcap(QK+bias) while the
-    // reference ordering is softcap(QK)+bias, so the runner rejects the
-    // combination outright (see the matching TORCH_CHECK in
-    // xe_fmha_fwd_prefill_runner.hpp). Reject it here too instead of dispatching
-    // a Softcap=true kernel that can only ever throw: the instantiation is
-    // unreachable, and AOT-compiling it doubles this branch's kernel count.
+    // apply_relative_bias would cap as softcap(QK+bias), not the reference softcap(QK)+bias,
+    // so reject the pair here (mirrors xe_fmha_fwd_prefill_runner.hpp) and keep Softcap=false:
+    // a Softcap=true build for this branch is unreachable but still costs AOT kernels.
     TORCH_CHECK(
         params.softcap == 0.f, "softcap combined with relative attention bias is not supported on XPU");
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {

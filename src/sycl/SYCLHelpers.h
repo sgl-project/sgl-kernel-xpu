@@ -3,8 +3,8 @@
 #include <sycl/sycl.hpp>
 
 template <typename ker_t, int dim>
-static inline void sycl_kernel_submit(::sycl::range<dim> range, ::sycl::queue q, ker_t ker) {
-  q.parallel_for<ker_t>(range, ker);
+static inline ::sycl::event sycl_kernel_submit(::sycl::range<dim> range, ::sycl::queue q, ker_t ker) {
+  return q.parallel_for<ker_t>(range, ker);
 }
 
 // Additional convention of SYCL kernel configuration. Besides construct kernel
@@ -24,41 +24,41 @@ static inline void sycl_kernel_submit(::sycl::range<dim> range, ::sycl::queue q,
 struct __SYCL_KER_CONFIG_CONVENTION__ {};
 
 template <typename ker_t, int dim>
-static inline typename std::enable_if<std::is_base_of_v<__SYCL_KER_CONFIG_CONVENTION__, ker_t>, void>::type
+static inline typename std::enable_if<std::is_base_of_v<__SYCL_KER_CONFIG_CONVENTION__, ker_t>, ::sycl::event>::type
 sycl_kernel_submit(::sycl::range<dim> global_range, ::sycl::range<dim> local_range, ::sycl::queue q, ker_t ker) {
   auto cgf = [&](::sycl::handler& cgh) {
     ker.sycl_ker_config_convention(cgh);
     cgh.parallel_for<ker_t>(::sycl::nd_range<dim>(global_range, local_range), ker);
   };
-  q.submit(cgf);
+  return q.submit(cgf);
 }
 
 template <typename ker_t, int dim>
-static inline typename std::enable_if<!std::is_base_of_v<__SYCL_KER_CONFIG_CONVENTION__, ker_t>, void>::type
+static inline typename std::enable_if<!std::is_base_of_v<__SYCL_KER_CONFIG_CONVENTION__, ker_t>, ::sycl::event>::type
 sycl_kernel_submit(::sycl::range<dim> global_range, ::sycl::range<dim> local_range, ::sycl::queue q, ker_t ker) {
   auto cgf = [&](::sycl::handler& cgh) {
     cgh.parallel_for<ker_t>(::sycl::nd_range<dim>(global_range, local_range), ker);
   };
-  q.submit(cgf);
+  return q.submit(cgf);
 }
 
 template <typename ker_t>
-static inline typename std::enable_if<std::is_base_of_v<__SYCL_KER_CONFIG_CONVENTION__, ker_t>, void>::type
+static inline typename std::enable_if<std::is_base_of_v<__SYCL_KER_CONFIG_CONVENTION__, ker_t>, ::sycl::event>::type
 sycl_kernel_submit(int64_t global_range, int64_t local_range, ::sycl::queue q, ker_t ker) {
   auto cgf = [&](::sycl::handler& cgh) {
     ker.sycl_ker_config_convention(cgh);
     cgh.parallel_for<ker_t>(::sycl::nd_range<1>(::sycl::range<1>(global_range), ::sycl::range<1>(local_range)), ker);
   };
-  q.submit(cgf);
+  return q.submit(cgf);
 }
 
 template <typename ker_t>
-static inline typename std::enable_if<!std::is_base_of_v<__SYCL_KER_CONFIG_CONVENTION__, ker_t>, void>::type
+static inline typename std::enable_if<!std::is_base_of_v<__SYCL_KER_CONFIG_CONVENTION__, ker_t>, ::sycl::event>::type
 sycl_kernel_submit(int64_t global_range, int64_t local_range, ::sycl::queue q, ker_t ker) {
   auto cgf = [&](::sycl::handler& cgh) {
     cgh.parallel_for<ker_t>(::sycl::nd_range<1>(::sycl::range<1>(global_range), ::sycl::range<1>(local_range)), ker);
   };
-  q.submit(cgf);
+  return q.submit(cgf);
 }
 
 #define SYCL_KERNEL_STRING(var, str) static const __attribute__((opencl_constant)) char var[] = str;

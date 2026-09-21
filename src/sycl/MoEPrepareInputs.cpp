@@ -8,6 +8,7 @@
 #include <sycl/sycl.hpp>
 #include <unordered_map>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -478,6 +479,12 @@ SGL_KERNEL_EXPORT void prepare_moe_input(
   TORCH_CHECK(
       topk_ids.scalar_type() == output_permutation.scalar_type(), "output_permutation must have same type as topk_ids");
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   AT_DISPATCH_INDEX_TYPES(topk_ids.scalar_type(), "prepare_moe_input", [&] {
     using index_t = index_t;
 
@@ -496,6 +503,15 @@ SGL_KERNEL_EXPORT void prepare_moe_input(
 
     compute_arg_sorts_sycl_impl<index_t>(topk_ids, input_permutation, output_permutation, atomic_buffer, num_experts);
   });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Memory-bound: 3 passes over topk_ids for counting, offsets, and sort.
+  const double numel = static_cast<double>(topk_ids.numel());
+  const double flops = 3.0 * numel;
+  const double bytes =
+      3.0 * numel * static_cast<double>(topk_ids.element_size()) + static_cast<double>(num_experts) * 4.0;
+  ::sglkernel::report_kernel_perf("prepare_moe_input", profiling_queue, timer, bytes, flops);
+#endif
   return;
 }
 
@@ -719,6 +735,12 @@ SGL_KERNEL_EXPORT void prepare_moe_input_small(
       "expert count and input dimensions must fit in int32");
 
   auto queue = at::xpu::getCurrentXPUStream().queue();
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   AT_DISPATCH_INDEX_TYPES(topk_ids.scalar_type(), "prepare_moe_input_small", [&] {
     using Kernel = PrepareMoeInputSmall<index_t, c10::BFloat16>;
     const size_t local_memory_capacity = prepare_moe_input_small_local_memory_capacity<Kernel>(input.device().index());
@@ -741,6 +763,17 @@ SGL_KERNEL_EXPORT void prepare_moe_input_small(
         static_cast<int32_t>(input.size(1)));
     sycl_kernel_submit(Kernel::WGSize, Kernel::WGSize, queue, task);
   });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Compact-and-scatter over topk_ids; treat as memory-bound over input+output.
+  const double numel_input = static_cast<double>(input.numel());
+  const double numel_output = static_cast<double>(output.numel());
+  const double flops = 2.0 * static_cast<double>(topk_ids.numel());
+  const double bytes = numel_input * static_cast<double>(input.element_size()) +
+                       numel_output * static_cast<double>(output.element_size()) +
+                       static_cast<double>(topk_ids.numel()) * static_cast<double>(topk_ids.element_size());
+  ::sglkernel::report_kernel_perf("prepare_moe_input_small", queue, timer, bytes, flops);
+#endif
 }
 
 // Scatter kernel: 1 WG per source token, reads token once, scatters to topk destinations.
@@ -821,18 +854,34 @@ SGL_KERNEL_EXPORT void scatter_tokens_to_experts(
       input_tensor.scalar_type() == output_tensor.scalar_type(),
       "Input and output tensors must have the same data type");
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   // Handle FP8 type separately
   if (input_tensor.scalar_type() == at::ScalarType::Float8_e4m3fn) {
     scatter_tokens_to_experts_impl<c10::Float8_e4m3fn>(input_tensor, src2dst_map, output_tensor);
-    return;
+  } else {
+    SYCL_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::BFloat16,
+        at::ScalarType::Half,
+        input_tensor.scalar_type(),
+        "scatter_tokens_to_experts_impl",
+        [&]() { scatter_tokens_to_experts_impl<scalar_t>(input_tensor, src2dst_map, output_tensor); });
   }
 
-  SYCL_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::BFloat16,
-      at::ScalarType::Half,
-      input_tensor.scalar_type(),
-      "scatter_tokens_to_experts_impl",
-      [&]() { scatter_tokens_to_experts_impl<scalar_t>(input_tensor, src2dst_map, output_tensor); });
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Pure permutation: no flops, memory-bound on input + output.
+  const double numel_in = static_cast<double>(input_tensor.numel());
+  const double numel_out = static_cast<double>(output_tensor.numel());
+  const double flops = 0.0;
+  const double bytes = numel_in * static_cast<double>(input_tensor.element_size()) +
+                       numel_out * static_cast<double>(output_tensor.element_size()) +
+                       static_cast<double>(src2dst_map.numel()) * static_cast<double>(src2dst_map.element_size());
+  ::sglkernel::report_kernel_perf("scatter_tokens_to_experts", profiling_queue, timer, bytes, flops);
+#endif
 }
 
 template <typename T, typename T1, bool APPLY_ROUTED_SCALING>
@@ -945,6 +994,12 @@ SGL_KERNEL_EXPORT void apply_shuffle_mul_sum(
   int topk = int(permutation.size(0) / m);
   bool use_routed_scaling = routed_scaling_factor != 1.0f;
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   SYCL_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::BFloat16, at::ScalarType::Half, input.scalar_type(), "apply_shuffle_mul_sum", [&]() {
         using input_t = scalar_t;
@@ -998,5 +1053,19 @@ SGL_KERNEL_EXPORT void apply_shuffle_mul_sum(
           }
         }
       });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // apply_shuffle_mul_sum: for each output row, weighted sum of topk source rows into hidden_dim.
+  const int hidden_dim = output.size(1);
+  const double flops = 3.0 * static_cast<double>(m) * static_cast<double>(hidden_dim) * static_cast<double>(topk) +
+                       static_cast<double>(m) * static_cast<double>(hidden_dim);
+  const double bytes =
+      static_cast<double>(input.numel()) * static_cast<double>(input.element_size()) +
+      static_cast<double>(output.numel()) * static_cast<double>(output.element_size()) +
+      static_cast<double>(permutation.numel()) * static_cast<double>(permutation.element_size()) +
+      (factors.has_value() ? static_cast<double>(factors->numel()) * static_cast<double>(factors->element_size())
+                           : 0.0);
+  ::sglkernel::report_kernel_perf("apply_shuffle_mul_sum", profiling_queue, timer, bytes, flops);
+#endif
   return;
 }

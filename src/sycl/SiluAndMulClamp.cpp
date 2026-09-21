@@ -30,6 +30,7 @@
 #include <sycl/sycl.hpp>
 
 #include "MemoryAccess.h"
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -179,6 +180,11 @@ SGL_KERNEL_EXPORT void silu_and_mul_clamp(torch::Tensor& output, torch::Tensor& 
   auto queue = stream.queue();
   float limit = static_cast<float>(swiglu_limit);
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   if (input.scalar_type() == at::ScalarType::Half) {
     silu_and_mul_clamp_sycl<at::Half>(queue, input, output, limit);
   } else if (input.scalar_type() == at::ScalarType::BFloat16) {
@@ -189,4 +195,13 @@ SGL_KERNEL_EXPORT void silu_and_mul_clamp(torch::Tensor& output, torch::Tensor& 
         "silu_and_mul_clamp: only bf16 and fp16 are supported, got ",
         input.dtype());
   }
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // silu(gate)*value with clamp: ~6 sigmoid+mul flops + 2 clamp flops = ~8 per output.
+  const double out_elems = static_cast<double>(output.numel());
+  const double flops = 8.0 * out_elems;
+  const double bytes = 2.0 * out_elems * static_cast<double>(input.element_size()) +
+                       out_elems * static_cast<double>(output.element_size());
+  ::sglkernel::report_kernel_perf("silu_and_mul_clamp", queue, timer, bytes, flops);
+#endif
 }

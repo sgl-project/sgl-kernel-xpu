@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -243,6 +244,12 @@ SGL_KERNEL_EXPORT void fused_q_indexer_rope_hadamard_quant(
   TORCH_CHECK(
       q_fp8.stride(0) == expected_q_stride0, "q_fp8 must be contiguous (B,H,128); got stride[0]=", q_fp8.stride(0));
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   SYCL_DISPATCH_FLOATING_TYPES_AND2(
       at::kBFloat16, at::kHalf, q_input.scalar_type(), "fused_q_indexer_rope_hadamard_quant", [&]() {
         AT_DISPATCH_INDEX_TYPES(positions.scalar_type(), "fused_q_indexer_rope_hadamard_quant", [&]() {
@@ -250,4 +257,23 @@ SGL_KERNEL_EXPORT void fused_q_indexer_rope_hadamard_quant(
               q_input, q_fp8, weight, weights_out, weight_scale, rope_cache, positions);
         });
       });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const int64_t B = q_input.size(0);
+  const int64_t H = q_input.size(1);
+  // rope (~4*rope_dim per B*H) + hadamard (~2*head_dim*log2(head_dim)/head_dim*head_dim ≈ 2*head_dim*log2 flops)
+  // + fp8 quant (~2 per element). Simplify: hadamard = 2*log2(128) = 14 flops/elem => 14*head_dim per B*H.
+  const double flops = static_cast<double>(B) * static_cast<double>(H) *
+                       (4.0 * static_cast<double>(kRopeDim) + 14.0 * static_cast<double>(kHeadDim) +
+                        2.0 * static_cast<double>(kHeadDim));
+  const double q_elem = static_cast<double>(q_input.element_size());
+  // Read q_input, read weight, read rope_cache, write q_fp8 (1 byte/elem), write weights_out (fp32).
+  const double bytes =
+      static_cast<double>(B) * static_cast<double>(H) * static_cast<double>(kHeadDim) * q_elem +
+      static_cast<double>(B) * static_cast<double>(H) * static_cast<double>(weight.element_size()) +
+      static_cast<double>(B) * static_cast<double>(kRopeDim) * static_cast<double>(rope_cache.element_size()) +
+      static_cast<double>(B) * static_cast<double>(H) * static_cast<double>(kHeadDim) * 1.0 +
+      static_cast<double>(B) * static_cast<double>(H) * 4.0;
+  ::sglkernel::report_kernel_perf("fused_q_indexer_rope_hadamard_quant", profiling_queue, timer, bytes, flops);
+#endif
 }

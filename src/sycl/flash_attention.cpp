@@ -41,6 +41,7 @@
 #ifdef USE_FMHA_JIT
 #include "jit/fmha_jit.h"
 #endif
+#include "SGLKernelPerf.h"
 #include "sgl_kernel_export.h"
 
 namespace {
@@ -1533,6 +1534,12 @@ SGL_KERNEL_EXPORT void mha_fwd(
 
   int64_t batch_size = cu_seqlens_q.size(0) - 1;
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   // decode / prefill / chunkprefill all take the same leading argument list;
   // only the trailing parameters differ. Bind the shared arguments once here so
   // each branch reduces to a single call. ``out`` and ``softmax_lse`` are
@@ -1602,5 +1609,31 @@ SGL_KERNEL_EXPORT void mha_fwd(
     // Non-uniform paged batches fall back to chunkprefill.
     dispatch(chunkprefill::mha_fwd);
   }
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Mirrors PR#269 flash_attentionXe35_common.hpp accounting:
+  //   QK: 2 * H_q * B * S_q * S_kv * D
+  //   PV: 2 * H_q * B * S_q * S_kv * D
+  // and bytes count Q read + K read + V read + O write on the effective seq lengths.
+  const int64_t num_heads_q = q.size(1);
+  const int64_t num_heads_kv = k.size(-2);
+  const int64_t head_dim = q.size(-1);
+  const int64_t head_dim_v = v.size(-1);
+  const double batched_qk_pairs =
+      static_cast<double>(batch_size) * static_cast<double>(max_seqlen_q) * static_cast<double>(max_seqlen_k);
+  const double flops_qk = 2.0 * static_cast<double>(num_heads_q) * batched_qk_pairs * static_cast<double>(head_dim);
+  const double flops_pv = 2.0 * static_cast<double>(num_heads_q) * batched_qk_pairs * static_cast<double>(head_dim_v);
+  const double flops = flops_qk + flops_pv;
+  const double elem_sz = static_cast<double>(q.element_size());
+  const double batched_eff_seq_q = static_cast<double>(batch_size) * static_cast<double>(max_seqlen_q);
+  const double batched_seq_kv = static_cast<double>(batch_size) * static_cast<double>(max_seqlen_k);
+  const double bytes_qk =
+      static_cast<double>(num_heads_q) * batched_eff_seq_q * static_cast<double>(head_dim) * elem_sz +
+      static_cast<double>(num_heads_kv) * batched_seq_kv * static_cast<double>(head_dim) * elem_sz;
+  const double bytes_pv =
+      static_cast<double>(num_heads_kv) * batched_seq_kv * static_cast<double>(head_dim_v) * elem_sz +
+      static_cast<double>(num_heads_q) * batched_eff_seq_q * static_cast<double>(head_dim_v) * elem_sz;
+  ::sglkernel::report_kernel_perf("mha_fwd", profiling_queue, timer, bytes_qk + bytes_pv, flops);
+#endif
 }
 #undef SYCL_INTEL_TARGET

@@ -16,6 +16,10 @@
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+#include <cutlass/util/GPU_Clock.hpp>
+#endif
+
 namespace at::native::xpu {
 // Flatten tensor to 2D (M, N) for the kernel.  If the tensor is already 2D it
 // is returned unchanged; 3D tensors are viewed as 2D.  Uses view() so that the
@@ -677,6 +681,16 @@ SGL_KERNEL_EXPORT void rmsnorm(torch::Tensor& output, torch::Tensor& input, torc
   RowStrides out_strides = get_row_strides(output);
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Follows the PR#269 flash_attentionXe35_common.hpp GPU_Clock pattern. The
+  // sycl_kernel_submit helper returns void so we cannot forward the event to
+  // EventManager here -- host-side timing + queue.wait() is the meaningful
+  // subset for this launcher.
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "RMSNormKernelImpl", [&]() {
         SYCL_DISPATCH_WEIGHT_TYPES(
@@ -700,6 +714,42 @@ SGL_KERNEL_EXPORT void rmsnorm(torch::Tensor& output, torch::Tensor& input, torc
                   out_strides.inner1_stride);
             });
       });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  profiling_queue.wait();
+  const double elapsed_s = timer.seconds();
+
+  // RMSNorm per-row work: N muls + N adds for sum-of-squares, one rsqrt, then
+  // N muls (scale) + N muls (weight). ~= 4 * M * N flops end-to-end.
+  const double flops = 4.0 * static_cast<double>(M) * static_cast<double>(N);
+  const double tflops = elapsed_s > 0.0 ? (flops * 1e-12) / elapsed_s : 0.0;
+
+  const double in_elem = static_cast<double>(input.element_size());
+  const double w_elem = static_cast<double>(weight_.element_size());
+  const double out_elem = static_cast<double>(output.element_size());
+  const double bytes = static_cast<double>(M) * static_cast<double>(N) * in_elem + static_cast<double>(N) * w_elem +
+                       static_cast<double>(M) * static_cast<double>(N) * out_elem;
+  const double gbps = elapsed_s > 0.0 ? (bytes * 1e-9) / elapsed_s : 0.0;
+
+  const double elapsed_ms = elapsed_s * 1000.0;
+  const double elapsed_us = elapsed_s * 1e6;
+  const double gflops = tflops * 1e3;
+
+  ::printf(
+      "rmsnorm perf(gpu_clock): time=%.9f ms (%.3f us), bandwidth=%.6f GB/s, "
+      "compute=%.6f TFLOPS (%.3f GFLOPS)\n",
+      elapsed_ms,
+      elapsed_us,
+      gbps,
+      tflops,
+      gflops);
+
+  if (elapsed_s <= 0.0) {
+    ::printf(
+        "rmsnorm perf(gpu_clock): unavailable (reported 0). Check SYCL profiling event path and "
+        "CUTLASS_SYCL_PROFILING_ENABLED build flag.\n");
+  }
+#endif
 }
 
 SGL_KERNEL_EXPORT void
@@ -714,6 +764,12 @@ fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor wei
   Tensor input_ = flatten_to_2d(input, M, N);
   Tensor residual_ = flatten_to_2d(residual, M, N);
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
         SYCL_DISPATCH_WEIGHT_TYPES(
@@ -722,6 +778,43 @@ fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor wei
                   input_, weight, M, N, static_cast<acc_type<scalar_t>>(eps), residual_);
             });
       });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  profiling_queue.wait();
+  const double elapsed_s = timer.seconds();
+
+  // Residual add (1 flop/elem) + RMSNorm (4 flop/elem) = 5 * M * N.
+  const double flops = 5.0 * static_cast<double>(M) * static_cast<double>(N);
+  const double tflops = elapsed_s > 0.0 ? (flops * 1e-12) / elapsed_s : 0.0;
+
+  const double in_elem = static_cast<double>(input_.element_size());
+  const double res_elem = static_cast<double>(residual_.element_size());
+  const double w_elem = static_cast<double>(weight.element_size());
+  // read input, read+write residual, write normalized output back to input, read weight.
+  const double bytes = 2.0 * static_cast<double>(M) * static_cast<double>(N) * in_elem +
+                       2.0 * static_cast<double>(M) * static_cast<double>(N) * res_elem +
+                       static_cast<double>(N) * w_elem;
+  const double gbps = elapsed_s > 0.0 ? (bytes * 1e-9) / elapsed_s : 0.0;
+
+  const double elapsed_ms = elapsed_s * 1000.0;
+  const double elapsed_us = elapsed_s * 1e6;
+  const double gflops = tflops * 1e3;
+
+  ::printf(
+      "fused_add_rmsnorm perf(gpu_clock): time=%.9f ms (%.3f us), bandwidth=%.6f GB/s, "
+      "compute=%.6f TFLOPS (%.3f GFLOPS)\n",
+      elapsed_ms,
+      elapsed_us,
+      gbps,
+      tflops,
+      gflops);
+
+  if (elapsed_s <= 0.0) {
+    ::printf(
+        "fused_add_rmsnorm perf(gpu_clock): unavailable (reported 0). Check SYCL profiling event path and "
+        "CUTLASS_SYCL_PROFILING_ENABLED build flag.\n");
+  }
+#endif
 }
 
 SGL_KERNEL_EXPORT void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
@@ -732,6 +825,12 @@ SGL_KERNEL_EXPORT void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input
   RowStrides in_strides = get_row_strides(input);
   RowStrides out_strides = get_row_strides(output);
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
 
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
@@ -756,6 +855,41 @@ SGL_KERNEL_EXPORT void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input
                   out_strides.inner1_stride);
             });
       });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  profiling_queue.wait();
+  const double elapsed_s = timer.seconds();
+
+  // Gemma RMSNorm: sum-of-squares (2N) + rsqrt/scale + (1+weight) mul (~3N) = ~5 * M * N.
+  const double flops = 5.0 * static_cast<double>(M) * static_cast<double>(N);
+  const double tflops = elapsed_s > 0.0 ? (flops * 1e-12) / elapsed_s : 0.0;
+
+  const double in_elem = static_cast<double>(input.element_size());
+  const double w_elem = static_cast<double>(weight_.element_size());
+  const double out_elem = static_cast<double>(output.element_size());
+  const double bytes = static_cast<double>(M) * static_cast<double>(N) * in_elem + static_cast<double>(N) * w_elem +
+                       static_cast<double>(M) * static_cast<double>(N) * out_elem;
+  const double gbps = elapsed_s > 0.0 ? (bytes * 1e-9) / elapsed_s : 0.0;
+
+  const double elapsed_ms = elapsed_s * 1000.0;
+  const double elapsed_us = elapsed_s * 1e6;
+  const double gflops = tflops * 1e3;
+
+  ::printf(
+      "gemma_rmsnorm perf(gpu_clock): time=%.9f ms (%.3f us), bandwidth=%.6f GB/s, "
+      "compute=%.6f TFLOPS (%.3f GFLOPS)\n",
+      elapsed_ms,
+      elapsed_us,
+      gbps,
+      tflops,
+      gflops);
+
+  if (elapsed_s <= 0.0) {
+    ::printf(
+        "gemma_rmsnorm perf(gpu_clock): unavailable (reported 0). Check SYCL profiling event path and "
+        "CUTLASS_SYCL_PROFILING_ENABLED build flag.\n");
+  }
+#endif
 }
 
 SGL_KERNEL_EXPORT void
@@ -771,6 +905,12 @@ gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Te
   Tensor residual_ = flatten_to_2d(residual, M, N);
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "GemmaFusedAddRMSNormKernelImpl", [&]() {
         SYCL_DISPATCH_WEIGHT_TYPES(
@@ -783,6 +923,42 @@ gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Te
                   input_, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), residual_);
             });
       });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  profiling_queue.wait();
+  const double elapsed_s = timer.seconds();
+
+  // Residual add (1N) + Gemma RMSNorm (~5N with (1+weight) mul) = ~6 * M * N.
+  const double flops = 6.0 * static_cast<double>(M) * static_cast<double>(N);
+  const double tflops = elapsed_s > 0.0 ? (flops * 1e-12) / elapsed_s : 0.0;
+
+  const double in_elem = static_cast<double>(input_.element_size());
+  const double res_elem = static_cast<double>(residual_.element_size());
+  const double w_elem = static_cast<double>(weight_.element_size());
+  const double bytes = 2.0 * static_cast<double>(M) * static_cast<double>(N) * in_elem +
+                       2.0 * static_cast<double>(M) * static_cast<double>(N) * res_elem +
+                       static_cast<double>(N) * w_elem;
+  const double gbps = elapsed_s > 0.0 ? (bytes * 1e-9) / elapsed_s : 0.0;
+
+  const double elapsed_ms = elapsed_s * 1000.0;
+  const double elapsed_us = elapsed_s * 1e6;
+  const double gflops = tflops * 1e3;
+
+  ::printf(
+      "gemma_fused_add_rmsnorm perf(gpu_clock): time=%.9f ms (%.3f us), bandwidth=%.6f GB/s, "
+      "compute=%.6f TFLOPS (%.3f GFLOPS)\n",
+      elapsed_ms,
+      elapsed_us,
+      gbps,
+      tflops,
+      gflops);
+
+  if (elapsed_s <= 0.0) {
+    ::printf(
+        "gemma_fused_add_rmsnorm perf(gpu_clock): unavailable (reported 0). Check SYCL profiling event path and "
+        "CUTLASS_SYCL_PROFILING_ENABLED build flag.\n");
+  }
+#endif
 }
 
 }  // namespace at::native::xpu

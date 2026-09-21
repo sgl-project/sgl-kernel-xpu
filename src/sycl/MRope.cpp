@@ -5,6 +5,7 @@
 #include <sycl/sycl.hpp>
 #include <vector>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "comm/Numerics.h"
@@ -202,6 +203,12 @@ SGL_KERNEL_EXPORT void multimodal_rotary_embedding(
   const int64_t num_q_heads = query.size(1) / head_size;
   const int64_t num_k_heads = key.size(1) / head_size;
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
 #define LAUNCH_MROPE_KERNEL(IS_NEOX, IS_INTERLEAVED)                                                                 \
   SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, query.scalar_type(), "multimodal_rotary_embedding", [&]() { \
     launch_mrope<scalar_t, IS_NEOX, IS_INTERLEAVED>(                                                                 \
@@ -232,6 +239,24 @@ SGL_KERNEL_EXPORT void multimodal_rotary_embedding(
     }
   }
 #undef LAUNCH_MROPE_KERNEL
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Rope rotation: ~4 flops per (token, head, element in rotary_dim) covering both q and k heads.
+  const double rotated_elems = static_cast<double>(num_tokens) *
+                               (static_cast<double>(num_q_heads) + static_cast<double>(num_k_heads)) *
+                               static_cast<double>(rotary_dim);
+  const double flops = 4.0 * rotated_elems;
+  const double q_elem = static_cast<double>(query.element_size());
+  const double k_elem = static_cast<double>(key.element_size());
+  const double cs_elem = static_cast<double>(cos_sin_cache.element_size());
+  // Read+write query and key on the rotary lanes; read cos/sin table.
+  const double bytes = 2.0 * static_cast<double>(num_tokens) * static_cast<double>(num_q_heads) *
+                           static_cast<double>(rotary_dim) * q_elem +
+                       2.0 * static_cast<double>(num_tokens) * static_cast<double>(num_k_heads) *
+                           static_cast<double>(rotary_dim) * k_elem +
+                       static_cast<double>(num_tokens) * static_cast<double>(rotary_dim) * cs_elem;
+  ::sglkernel::report_kernel_perf("multimodal_rotary_embedding", profiling_queue, timer, bytes, flops);
+#endif
 }
 
 }  // namespace at::native::xpu

@@ -4,6 +4,7 @@
 #include <limits>
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -209,10 +210,29 @@ at::Tensor SGL_KERNEL_EXPORT fused_hc_head(
 
   auto q = dpcppGetCurrentQueue();
   at::Tensor y;
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   SYCL_DISPATCH_ONLY_FLOATING16_TYPES(
       at::ScalarType::BFloat16, at::ScalarType::Half, x.scalar_type(), "fused_hc_head", [&]() {
         y = launch_fused_hc_head<scalar_t>(
             q, x, hc_fn, hc_scale, hc_base, T, D, static_cast<float>(norm_eps), static_cast<float>(hc_eps));
       });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Head computation: hc_fn matmul (2 * T * hc_mult * (hc_mult * D)) + norm/scale/base (~4 * T * hc_mult * D).
+  const double matmul_flops = 2.0 * static_cast<double>(T) * static_cast<double>(hc_mult) *
+                              static_cast<double>(hc_mult) * static_cast<double>(D);
+  const double norm_flops = 4.0 * static_cast<double>(T) * static_cast<double>(hc_mult) * static_cast<double>(D);
+  const double flops = matmul_flops + norm_flops;
+  const double x_bytes = static_cast<double>(x.numel()) * static_cast<double>(x.element_size());
+  const double fn_bytes = static_cast<double>(hc_fn.numel()) * static_cast<double>(hc_fn.element_size());
+  const double y_bytes = static_cast<double>(y.numel()) * static_cast<double>(y.element_size());
+  ::sglkernel::report_kernel_perf("fused_hc_head", q, timer, x_bytes + fn_bytes + y_bytes, flops);
+#endif
+
   return y;
 }

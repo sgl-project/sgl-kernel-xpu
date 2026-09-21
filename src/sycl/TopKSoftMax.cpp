@@ -2,8 +2,10 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include <cmath>
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -630,6 +632,12 @@ topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gat
       " and n_experts=",
       n_experts);
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   DISPATCH_FLOAT_TYPES(gating_output.scalar_type(), "fused_topk_softmax_kernel", [&]() {
     TopKSoftmaxImpl::fused_topk_softmax<scalar_t>(
         gating_output.data_ptr<scalar_t>(),
@@ -640,5 +648,17 @@ topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gat
         n_experts,
         n_topk);
   });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Softmax ~5 flops/expert + topk selection ~log2(experts) flops/expert.
+  const double softmax_flops = 5.0 * static_cast<double>(n_tokens) * static_cast<double>(n_experts);
+  const double topk_flops =
+      static_cast<double>(n_tokens) * static_cast<double>(n_topk) * (1.0 + std::log2(static_cast<double>(n_experts)));
+  const double flops = softmax_flops + topk_flops;
+  const double bytes = static_cast<double>(n_tokens) * static_cast<double>(n_experts) *
+                           static_cast<double>(gating_output.element_size()) +
+                       static_cast<double>(n_tokens) * static_cast<double>(n_topk) * (4.0 + 4.0);
+  ::sglkernel::report_kernel_perf("topk_softmax", profiling_queue, timer, bytes, flops);
+#endif
 }
 }  // namespace at::native::xpu

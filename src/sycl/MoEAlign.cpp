@@ -4,6 +4,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -324,6 +325,12 @@ SGL_KERNEL_EXPORT void moe_align_block_size(
   int threads = 1024;
   threads = ((threads + sub_group_size - 1) / sub_group_size) * sub_group_size;
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
     auto stream = at::xpu::getCurrentXPUStream();
     auto queue = stream.queue();
@@ -380,4 +387,13 @@ SGL_KERNEL_EXPORT void moe_align_block_size(
       sycl_kernel_submit(sort_range.get_global_range(), sort_range.get_local_range(), queue, count_and_sort_kernel);
     }
   });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Purely memory-bound sort/count over topk_ids; ~4 flops per element for counting/scan.
+  const double numel = static_cast<double>(topk_ids.numel());
+  const double flops = 4.0 * numel;
+  const double bytes =
+      2.0 * numel * static_cast<double>(topk_ids.element_size()) + static_cast<double>(num_experts) * 4.0;
+  ::sglkernel::report_kernel_perf("moe_align_block_size", profiling_queue, timer, bytes, flops);
+#endif
 }

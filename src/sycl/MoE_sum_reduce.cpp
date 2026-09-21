@@ -5,6 +5,7 @@
 #include <sycl/sycl.hpp>
 
 #include "MemoryAccess.h"
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -113,8 +114,26 @@ SGL_KERNEL_EXPORT void moe_sum_reduce(at::Tensor& input, at::Tensor& output, dou
   TORCH_CHECK(input.is_contiguous(), "expect input to be contiguous");
   TORCH_CHECK(output.is_contiguous(), "expect output to be contiguous");
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   SYCL_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::BFloat16, at::ScalarType::Half, input.scalar_type(), "moe_sum_reduce_impl", [&]() {
         moe_sum_reduce_impl<scalar_t>(input, output, routed_scaling_factor);
       });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const int64_t token_num = input.size(0);
+  const int64_t topk_num = input.size(1);
+  const int64_t hidden_dim = input.size(2);
+  // Sum-reduce: (topk-1) adds + 1 mul per output element.
+  const double flops =
+      static_cast<double>(token_num) * static_cast<double>(hidden_dim) * (static_cast<double>(topk_num) - 1.0 + 1.0);
+  const double bytes = static_cast<double>(input.numel()) * static_cast<double>(input.element_size()) +
+                       static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
+  ::sglkernel::report_kernel_perf("moe_sum_reduce", profiling_queue, timer, bytes, flops);
+#endif
 }

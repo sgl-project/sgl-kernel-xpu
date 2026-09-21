@@ -616,7 +616,8 @@ SGL_KERNEL_EXPORT void hc_pre_big_fuse(
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   // Fused HC pre-processing: RMSNorm-like reduce + Sinkhorn iters + mix compute.
   // FLOPS ~ SINKHORN_ITERS*(HC^3 per token) + RMS reduce (~4*T*hidden_size) + mix (~T*HC^3).
-  const int64_t HC = hc_mult;
+  // Uses the enclosing-scope `constexpr int HC = 4;` from the entry checks above
+  // (TORCH_CHECK already verified hc_mult == HC).
   const double sinkhorn_flops = static_cast<double>(sinkhorn_iters) * static_cast<double>(T) * static_cast<double>(HC) *
                                 static_cast<double>(HC) * static_cast<double>(HC);
   const double norm_flops = 4.0 * static_cast<double>(T) * static_cast<double>(hidden_size);

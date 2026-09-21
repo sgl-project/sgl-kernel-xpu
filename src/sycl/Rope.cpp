@@ -9,6 +9,7 @@
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
 #include <c10/xpu/XPUStream.h>
+
 #include <cutlass/util/GPU_Clock.hpp>
 
 #include "SGLKernelPerf.h"
@@ -487,13 +488,12 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor> rotary_embedding(
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   // RoPE is memory-bound: rotate each element pair, sin/cos read per position.
   const double flops = 0.0;
-  const double bytes = static_cast<double>(query.numel()) * static_cast<double>(query.element_size()) +
-                       static_cast<double>(key.numel()) * static_cast<double>(key.element_size()) +
-                       static_cast<double>(cos_sin_cache.numel()) * static_cast<double>(cos_sin_cache.element_size()) +
-                       static_cast<double>(std::get<0>(result).numel()) *
-                           static_cast<double>(std::get<0>(result).element_size()) +
-                       static_cast<double>(std::get<1>(result).numel()) *
-                           static_cast<double>(std::get<1>(result).element_size());
+  const double bytes =
+      static_cast<double>(query.numel()) * static_cast<double>(query.element_size()) +
+      static_cast<double>(key.numel()) * static_cast<double>(key.element_size()) +
+      static_cast<double>(cos_sin_cache.numel()) * static_cast<double>(cos_sin_cache.element_size()) +
+      static_cast<double>(std::get<0>(result).numel()) * static_cast<double>(std::get<0>(result).element_size()) +
+      static_cast<double>(std::get<1>(result).numel()) * static_cast<double>(std::get<1>(result).element_size());
   ::sglkernel::report_kernel_perf("rope", profiling_queue, timer, bytes, flops);
 #endif
 

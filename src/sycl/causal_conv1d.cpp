@@ -517,8 +517,8 @@ SGL_KERNEL_EXPORT void causal_conv1d_fwd(
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   // causal_conv1d: 2 * batch * seq_len * channels * kernel_size mult-adds.
-  const double flops = 2.0 * static_cast<double>(batch_size) * static_cast<double>(seqlen) *
-                       static_cast<double>(dim) * static_cast<double>(width);
+  const double flops = 2.0 * static_cast<double>(batch_size) * static_cast<double>(seqlen) * static_cast<double>(dim) *
+                       static_cast<double>(width);
   const double bytes = static_cast<double>(x.numel()) * static_cast<double>(x.element_size()) +
                        static_cast<double>(weight.numel()) * static_cast<double>(weight.element_size()) +
                        static_cast<double>(out.numel()) * static_cast<double>(out.element_size());
@@ -616,8 +616,8 @@ SGL_KERNEL_EXPORT void causal_conv1d_update(
       });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  const double flops = 2.0 * static_cast<double>(batch_size) * static_cast<double>(seqlen) *
-                       static_cast<double>(dim) * static_cast<double>(width);
+  const double flops = 2.0 * static_cast<double>(batch_size) * static_cast<double>(seqlen) * static_cast<double>(dim) *
+                       static_cast<double>(width);
   const double bytes = static_cast<double>(x.numel()) * static_cast<double>(x.element_size()) +
                        static_cast<double>(weight.numel()) * static_cast<double>(weight.element_size()) +
                        static_cast<double>(conv_state.numel()) * static_cast<double>(conv_state.element_size()) +

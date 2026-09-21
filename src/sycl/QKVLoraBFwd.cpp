@@ -246,10 +246,9 @@ SGL_KERNEL_EXPORT void qkv_lora_b_fwd(
   const double N = static_cast<double>(n_total_i64);
   const double K = static_cast<double>(max_rank_i64);
   const double flops = 2.0 * M * N * K;
-  const double bytes =
-      static_cast<double>(input_x.numel()) * static_cast<double>(input_x.element_size()) +
-      static_cast<double>(qkv_lora_b.numel()) * static_cast<double>(qkv_lora_b.element_size()) +
-      static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
+  const double bytes = static_cast<double>(input_x.numel()) * static_cast<double>(input_x.element_size()) +
+                       static_cast<double>(qkv_lora_b.numel()) * static_cast<double>(qkv_lora_b.element_size()) +
+                       static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
   ::sglkernel::report_kernel_perf("qkv_lora_b_fwd", queue, timer, bytes, flops);
 #endif
 }

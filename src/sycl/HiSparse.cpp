@@ -10,6 +10,7 @@
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
 #include <c10/xpu/XPUStream.h>
+
 #include <cutlass/util/GPU_Clock.hpp>
 
 #include "SGLKernelPerf.h"

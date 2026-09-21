@@ -186,10 +186,9 @@ SGL_KERNEL_EXPORT void sgemm_lora_a_fwd(
   const double K = static_cast<double>(input_x.size(1));
   const double N = static_cast<double>(max_rank_i64) * static_cast<double>(stack_num);
   const double flops = 2.0 * M * N * K;
-  const double bytes =
-      static_cast<double>(input_x.numel()) * static_cast<double>(input_x.element_size()) +
-      static_cast<double>(weights.numel()) * static_cast<double>(weights.element_size()) +
-      static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
+  const double bytes = static_cast<double>(input_x.numel()) * static_cast<double>(input_x.element_size()) +
+                       static_cast<double>(weights.numel()) * static_cast<double>(weights.element_size()) +
+                       static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
   ::sglkernel::report_kernel_perf("sgemm_lora_a_fwd", queue, timer, bytes, flops);
 #endif
 }

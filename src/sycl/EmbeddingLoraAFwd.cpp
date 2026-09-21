@@ -375,10 +375,9 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   // Embedding LoRA A fwd: one gather write per (token, rank) valid pair. Treat as memory-bound.
-  const double bytes =
-      static_cast<double>(input_ids.numel()) * static_cast<double>(input_ids.element_size()) +
-      static_cast<double>(weights.numel()) * static_cast<double>(weights.element_size()) +
-      static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
+  const double bytes = static_cast<double>(input_ids.numel()) * static_cast<double>(input_ids.element_size()) +
+                       static_cast<double>(weights.numel()) * static_cast<double>(weights.element_size()) +
+                       static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
   const double flops = 0.0;
   ::sglkernel::report_kernel_perf("embedding_lora_a_fwd", profiling_queue, timer, bytes, flops);
 #endif

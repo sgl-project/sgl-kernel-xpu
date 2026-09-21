@@ -305,10 +305,9 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
   const double N = static_cast<double>(gemm_n);
   const double K = static_cast<double>(gemm_k);
   const double flops = 2.0 * M * N * K;
-  const double bytes =
-      static_cast<double>(activations.numel()) * static_cast<double>(activations.element_size()) +
-      static_cast<double>(weights.numel()) * static_cast<double>(weights.element_size()) +
-      static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
+  const double bytes = static_cast<double>(activations.numel()) * static_cast<double>(activations.element_size()) +
+                       static_cast<double>(weights.numel()) * static_cast<double>(weights.element_size()) +
+                       static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
   ::sglkernel::report_kernel_perf("moe_grouped_mm_nt_xe20", queue, timer, bytes, flops);
 #endif
 }

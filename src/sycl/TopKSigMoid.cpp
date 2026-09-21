@@ -675,10 +675,9 @@ SGL_KERNEL_EXPORT void topk_sigmoid(
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   const double flops = 0.0;
-  const double bytes =
-      static_cast<double>(gating_output.numel()) * static_cast<double>(gating_output.element_size()) +
-      static_cast<double>(topk_weights.numel()) * static_cast<double>(topk_weights.element_size()) +
-      static_cast<double>(topk_indices.numel()) * static_cast<double>(topk_indices.element_size());
+  const double bytes = static_cast<double>(gating_output.numel()) * static_cast<double>(gating_output.element_size()) +
+                       static_cast<double>(topk_weights.numel()) * static_cast<double>(topk_weights.element_size()) +
+                       static_cast<double>(topk_indices.numel()) * static_cast<double>(topk_indices.element_size());
   ::sglkernel::report_kernel_perf("topk_sigmoid", profiling_queue, timer, bytes, flops);
 #endif
 }

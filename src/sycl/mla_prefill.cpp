@@ -306,9 +306,8 @@ SGL_KERNEL_EXPORT void flash_mla_prefill(
   const int64_t D_pe = q_pe.size(2);
   const int64_t D_qk = D_nope + D_pe;
   const double S_kv = static_cast<double>(max_kv_len_estimate);
-  const double flops =
-      2.0 * static_cast<double>(total_q) * static_cast<double>(H) * S_kv * static_cast<double>(D_qk) +
-      2.0 * static_cast<double>(total_q) * static_cast<double>(H) * S_kv * static_cast<double>(D_nope);
+  const double flops = 2.0 * static_cast<double>(total_q) * static_cast<double>(H) * S_kv * static_cast<double>(D_qk) +
+                       2.0 * static_cast<double>(total_q) * static_cast<double>(H) * S_kv * static_cast<double>(D_nope);
   const double bytes =
       static_cast<double>(q_nope.numel()) * static_cast<double>(q_nope.element_size()) +
       static_cast<double>(q_pe.numel()) * static_cast<double>(q_pe.element_size()) +

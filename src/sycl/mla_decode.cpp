@@ -242,10 +242,10 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
   const int64_t D_qk = D_nope + D_pe;
   const int64_t page_count_per_seq = page_table.size(1);
   const int64_t max_seq_len = static_cast<int64_t>(page_size) * page_count_per_seq;
-  const double flops = 2.0 * static_cast<double>(B) * static_cast<double>(H) *
-                           static_cast<double>(max_seq_len) * static_cast<double>(D_qk) +
-                       2.0 * static_cast<double>(B) * static_cast<double>(H) *
-                           static_cast<double>(max_seq_len) * static_cast<double>(D_nope);
+  const double flops = 2.0 * static_cast<double>(B) * static_cast<double>(H) * static_cast<double>(max_seq_len) *
+                           static_cast<double>(D_qk) +
+                       2.0 * static_cast<double>(B) * static_cast<double>(H) * static_cast<double>(max_seq_len) *
+                           static_cast<double>(D_nope);
   const double bytes =
       static_cast<double>(q_nope.numel()) * static_cast<double>(q_nope.element_size()) +
       static_cast<double>(q_pe.numel()) * static_cast<double>(q_pe.element_size()) +

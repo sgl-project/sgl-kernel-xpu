@@ -501,18 +501,15 @@ SGL_KERNEL_EXPORT void verify_tree_greedy(
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   const double flops = 0.0;
-  const double bytes = static_cast<double>(candidates.numel()) * static_cast<double>(candidates.element_size()) +
-                       static_cast<double>(retrive_index.numel()) * static_cast<double>(retrive_index.element_size()) +
-                       static_cast<double>(retrive_next_token.numel()) *
-                           static_cast<double>(retrive_next_token.element_size()) +
-                       static_cast<double>(retrive_next_sibling.numel()) *
-                           static_cast<double>(retrive_next_sibling.element_size()) +
-                       static_cast<double>(target_predict.numel()) *
-                           static_cast<double>(target_predict.element_size()) +
-                       static_cast<double>(predicts.numel()) * static_cast<double>(predicts.element_size()) +
-                       static_cast<double>(accept_index.numel()) * static_cast<double>(accept_index.element_size()) +
-                       static_cast<double>(accept_token_num.numel()) *
-                           static_cast<double>(accept_token_num.element_size());
+  const double bytes =
+      static_cast<double>(candidates.numel()) * static_cast<double>(candidates.element_size()) +
+      static_cast<double>(retrive_index.numel()) * static_cast<double>(retrive_index.element_size()) +
+      static_cast<double>(retrive_next_token.numel()) * static_cast<double>(retrive_next_token.element_size()) +
+      static_cast<double>(retrive_next_sibling.numel()) * static_cast<double>(retrive_next_sibling.element_size()) +
+      static_cast<double>(target_predict.numel()) * static_cast<double>(target_predict.element_size()) +
+      static_cast<double>(predicts.numel()) * static_cast<double>(predicts.element_size()) +
+      static_cast<double>(accept_index.numel()) * static_cast<double>(accept_index.element_size()) +
+      static_cast<double>(accept_token_num.numel()) * static_cast<double>(accept_token_num.element_size());
   ::sglkernel::report_kernel_perf("verify_tree_greedy", profiling_queue, timer, bytes, flops);
 #endif
 }

@@ -33,12 +33,8 @@
   \brief The runChunkedSgmvLoraShrink<T, TileOpt>() one-shot entry.
 
   This runner drives the LoRA-A "shrink" grouped GEMM (D = A @ B^T, alpha=1,
-  beta=0) end to end for the chunked-SGMV decode path. It is identical in
-  structure to sgemm_lora_a_fwd's runner but lives in its own namespace and is
-  instantiated on the small-N tile in chunked_sgmv_lora_shrink_types.hpp, so the
-  merged sgemm_lora_a_fwd kernel is not touched.
-
-  The heavy CUTLASS type assembly + lifecycle (can_implement / get_workspace_size
+  beta=0) end to end for the chunked-SGMV decode path.The heavy CUTLASS
+  type assembly + lifecycle (can_implement / get_workspace_size
   / initialize / run) and the device-side metadata build live in the shared,
   reusable core (group_gemm_types.hpp + grouped_gemm_meta.hpp +
   group_gemm_lora_launcher.hpp). Only the tile axis
@@ -136,8 +132,8 @@ inline void runChunkedSgmvLoraShrink(
   const int64_t elem_bytes = static_cast<int64_t>(sizeof(T));
   const auto device = input_x.device();
 
-  auto meta = core::build_grouped_gemm_meta(
-      seg_indptr_i32, weight_indices_i32, N, K, num_segments, elem_bytes, device, queue);
+  auto meta =
+      core::build_grouped_gemm_meta(seg_indptr_i32, weight_indices_i32, N, K, num_segments, elem_bytes, device, queue);
   launchGroupedShrinkGemm<Types>(meta, input_x, weights, output, num_segments, queue);
 }
 

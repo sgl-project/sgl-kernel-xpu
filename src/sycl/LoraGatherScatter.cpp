@@ -39,8 +39,7 @@ void permute_rows_impl(torch::Tensor& output, const torch::Tensor& input, const 
   TORCH_CHECK(permutation.dim() == 1, "permutation must be a 1D tensor");
   TORCH_CHECK(output.scalar_type() == input.scalar_type(), "output dtype must match input dtype");
   TORCH_CHECK(
-      output.size(0) == input.size(0) && output.size(1) == input.size(1),
-      "output must have the same shape as input");
+      output.size(0) == input.size(0) && output.size(1) == input.size(1), "output must have the same shape as input");
 
   const int64_t num_rows = input.size(0);
   const int64_t width = input.size(1);

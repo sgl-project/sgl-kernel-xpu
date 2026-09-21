@@ -52,15 +52,16 @@ def _reference_sgemm(
     seg_indptr: torch.Tensor,
     weight_indices: torch.Tensor,
 ) -> torch.Tensor:
-    """Segmented grouped GEMM on CPU in fp32, narrowed to weight dtype (logical order)."""
-    x_cpu = input_x.cpu()
-    w_cpu = weights.cpu()
+    """Segmented grouped GEMM computed on-device (XPU) in fp32"""
+    device = input_x.device
+    num_tokens = input_x.size(0)
+    total_n = weights.size(1)
+    out = torch.zeros((num_tokens, total_n), dtype=torch.float32, device=device)
+
+    # seg_indptr / weight_indices are tiny; read them on the host to bound the
+    # loop (the heavy matmuls stay on device).
     seg_cpu = seg_indptr.cpu()
     wi_cpu = weight_indices.cpu()
-
-    num_tokens = x_cpu.size(0)
-    total_n = w_cpu.size(1)
-    out = torch.zeros((num_tokens, total_n), dtype=w_cpu.dtype)
 
     for s in range(seg_cpu.numel() - 1):
         start = int(seg_cpu[s].item())
@@ -68,10 +69,10 @@ def _reference_sgemm(
         if end == start:
             continue
         lora = int(wi_cpu[s].item())
-        x = x_cpu[start:end].float()
-        w = w_cpu[lora].float()
-        out[start:end] = (x @ w.T).to(w_cpu.dtype)
-    return out
+        x = input_x[start:end].float()
+        w = weights[lora].float()
+        out[start:end] = x @ w.T
+    return out.to(weights.dtype)
 
 
 def _reference_chunked_shrink(
@@ -81,9 +82,9 @@ def _reference_chunked_shrink(
     weight_indices: torch.Tensor,
     permutation: torch.Tensor,
 ) -> torch.Tensor:
-    """gather (physical->logical) -> sgemm -> scatter (logical->physical)."""
-    perm = permutation.cpu().to(torch.int64)
-    x_sorted = input_x.cpu()[perm]  # x_sorted[i] = x[perm[i]]
+    """gather (physical->logical) -> sgemm -> scatter (logical->physical), on-device (XPU)."""
+    perm = permutation.to(torch.int64)
+    x_sorted = input_x[perm]  # x_sorted[i] = x[perm[i]]
     out_sorted = _reference_sgemm(x_sorted, weights, seg_indptr, weight_indices)
     out = torch.empty_like(out_sorted)
     out[perm] = out_sorted  # out[perm[i]] = out_sorted[i]
@@ -228,11 +229,12 @@ def _run_and_compare_chunked(
         input_x, weights, seg_indptr, weight_indices, permutation
     )
 
-    out_cpu = out.cpu()
-    assert out_cpu.shape == (num_tokens, total_n)
-    assert out_cpu.dtype == dtype
+    assert out.shape == (num_tokens, total_n)
+    assert out.dtype == dtype
+    # Compare on device: both `out` and `ref` live on XPU, so torch.testing
+    # validates them without a host round-trip.
     rtol, atol = _tolerances(dtype)
-    torch.testing.assert_close(out_cpu, ref, rtol=rtol, atol=atol)
+    torch.testing.assert_close(out, ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -264,7 +266,9 @@ def test_chunked_shrink_stack_num(dtype, stack_num):
     num_loras = 2
     max_rank = 8
     row_adapters = [0, 1, 0, 1, 0, 1, 0, 1]
-    lora_ranks = torch.tensor([max_rank, max_rank // 2], dtype=torch.int32, device="xpu")
+    lora_ranks = torch.tensor(
+        [max_rank, max_rank // 2], dtype=torch.int32, device="xpu"
+    )
     _run_and_compare_chunked(
         dtype=dtype,
         row_adapters=row_adapters,

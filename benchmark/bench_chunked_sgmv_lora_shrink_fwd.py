@@ -8,67 +8,52 @@ import triton.language as tl
 from sgl_kernel import chunked_sgmv_lora_shrink_forward
 
 all_results = []
-
-# ---------------------------------------------------------------------------
-# Decode-phase chunked-SGMV LoRA shrink benchmark.
-#
-# In decode every request contributes a single token, so batching interleaves
-# LoRA adapters ("zigzag"). The tokens are sorted by adapter (a permutation:
-# logical -> physical) before a segmented grouped GEMM, then scattered back to
-# physical token order. This benchmark therefore ALWAYS drives the permutation
-# path.
-#
-#   x:       (num_tokens, input_dim)                physical token order
-#   weights: (num_loras, stack_num * max_rank, input_dim)
-#   output:  (num_tokens, stack_num * max_rank)     physical token order
-#
-# KEY: each backend segments the *same* permutation the way it actually wants:
-#
-#   Triton (reference): the fused single kernel from
-#     python/sglang/kernels/ops/gemm/chunked_sgmv_shrink.py (inlined so the
-#     benchmark is self-contained). One Triton program handles one segment of at
-#     most BLOCK_M rows, so it needs the small fixed-size chunking from
-#     ChunkedSgmvLoRABackend._determine_chunk_size (16/32/128, capped by
-#     max_chunk_size). We reproduce that heuristic exactly.
-#
-#   CUTLASS (this repo): the fused chunked_sgmv_lora_shrink_forward op tiles over
-#     M internally, so it does NOT need chunking. We feed it one segment per
-#     active adapter (seg_indptr size == num_active_adapters + 1) — the coalesced
-#     large-chunk layout its grouped GEMM is fastest on. max_chunk_size does not
-#     affect the CUTLASS rows.
-#
-# Both segmentations describe the same math (output = x @ A^T grouped by
-# adapter), so the two backends' outputs are bitwise-comparable; only the
-# grouping differs.
-# ---------------------------------------------------------------------------
-
-# Triton's production chunk-size cap (server_args.max_lora_chunk_size). The
-# default is 16, and _determine_chunk_size short-circuits to MIN_CHUNK_SIZE when
-# the cap is <= 16 -> Triton runs with chunk=16. On XPU this small-chunk regime
-# is Triton's FASTEST (many programs => high parallelism); larger caps (up to
-# 128) make the Triton kernel much slower here, so 16 is both the production
-# default and Triton's best config, i.e. the fairest baseline. CUTLASS ignores
-# this entirely (it uses one coalesced segment per adapter).
 MIN_CHUNK_SIZE = 16
 TRITON_MAX_CHUNK_SIZE = 16
 
-# num_tokens == tokens in the batch (one row per token). In pure decode each
-# running sequence contributes a single token/step, so num_tokens is the count of
-# concurrent sequences; larger num_tokens also models (chunked) prefill / mixed
-# batches where num_tokens is the summed token count across requests. stack_num:
-# 1 (o_proj), 2 (gate_up), 3 (qkv).
-#
-# Range is tok=256..8192 -- the realistic decode / chunked-prefill batch span.
-# Batches <256 are dropped: they are launch/overhead-bound (too little weight
-# traffic to be bandwidth-bound -- ~2MB touched vs ~100us+ fixed launch cost), so
-# they only depress the mean and tell us nothing about the kernel's roofline.
 DEFAULT_CASES: List[Dict[str, int]] = [
-    {"num_tokens": 256, "num_loras": 8, "max_rank": 16, "input_dim": 4096, "stack_num": 3},
-    {"num_tokens": 512, "num_loras": 8, "max_rank": 64, "input_dim": 4096, "stack_num": 1},
-    {"num_tokens": 1024, "num_loras": 8, "max_rank": 32, "input_dim": 4096, "stack_num": 2},
-    {"num_tokens": 2048, "num_loras": 16, "max_rank": 64, "input_dim": 4096, "stack_num": 1},
-    {"num_tokens": 4096, "num_loras": 8, "max_rank": 32, "input_dim": 4096, "stack_num": 1},
-    {"num_tokens": 8192, "num_loras": 16, "max_rank": 64, "input_dim": 4096, "stack_num": 1},
+    {
+        "num_tokens": 256,
+        "num_loras": 8,
+        "max_rank": 16,
+        "input_dim": 4096,
+        "stack_num": 3,
+    },
+    {
+        "num_tokens": 512,
+        "num_loras": 8,
+        "max_rank": 64,
+        "input_dim": 4096,
+        "stack_num": 1,
+    },
+    {
+        "num_tokens": 1024,
+        "num_loras": 8,
+        "max_rank": 32,
+        "input_dim": 4096,
+        "stack_num": 2,
+    },
+    {
+        "num_tokens": 2048,
+        "num_loras": 16,
+        "max_rank": 64,
+        "input_dim": 4096,
+        "stack_num": 1,
+    },
+    {
+        "num_tokens": 4096,
+        "num_loras": 8,
+        "max_rank": 32,
+        "input_dim": 4096,
+        "stack_num": 1,
+    },
+    {
+        "num_tokens": 8192,
+        "num_loras": 16,
+        "max_rank": 64,
+        "input_dim": 4096,
+        "stack_num": 1,
+    },
 ]
 
 
@@ -77,8 +62,7 @@ def _derive_triton_chunk_size(num_tokens: int) -> int:
 
     Mirrors ChunkedSgmvLoRABackend._determine_chunk_size_for_tokens: the chunk
     grows with the batch size, capped by TRITON_MAX_CHUNK_SIZE. This is the
-    chunking Triton needs (one program per <= BLOCK_M-row segment); CUTLASS does
-    NOT use it.
+    chunking Triton needs (one program per <= BLOCK_M-row segment)
     """
     if TRITON_MAX_CHUNK_SIZE <= MIN_CHUNK_SIZE:
         return MIN_CHUNK_SIZE
@@ -94,7 +78,6 @@ def _derive_triton_chunk_size(num_tokens: int) -> int:
 # ---------------------------------------------------------------------------
 # Triton reference kernel (inlined so the benchmark is self-contained).
 # Copied verbatim from python/sglang/kernels/ops/gemm/chunked_sgmv_shrink.py
-# (the @cached_triton_kernel wrapper is dropped; the maths are unchanged).
 # ---------------------------------------------------------------------------
 @triton.jit
 def _chunked_lora_shrink_kernel(
@@ -220,7 +203,7 @@ def _coalesced_segments(
 
     seg_indptr size == num_active_adapters + 1. The CUTLASS grouped GEMM tiles
     over M internally, so each adapter's whole (sorted) token run is a single
-    segment; this is the large-chunk regime the kernel is fastest on.
+    segment.
     """
     uniq, counts = torch.unique_consecutive(reordered, return_counts=True)
     seg_indptr = torch.zeros(uniq.numel() + 1, dtype=torch.int32)
@@ -323,21 +306,6 @@ def _estimate_bytes(
     seg_lens_cpu = seg_lens.to("cpu")
     weight_indices_cpu = weight_indices.to("cpu")
     lora_ranks_cpu = lora_ranks.to("cpu")
-
-    # Each token's input row is read once and its output row written once, no
-    # matter how the tokens are segmented, so bytes_x / bytes_out already sum
-    # to a segmentation-invariant total. A LoRA weight, however, is re-fetched
-    # from HBM only when the adapter *changes* between consecutive segments: if
-    # the immediately-previous segment used the same adapter, its weight is
-    # still resident (cache/regs) and is reused, not re-read. But if the same
-    # adapter recurs after other adapters intervene, it has been evicted and
-    # must be re-read -- so dedup is by consecutive run, not by distinct set.
-    # Without this, backends that split an adapter into many small consecutive
-    # chunks (Triton@chunk16: tens-to-hundreds of segments) get bytes_w counted
-    # per chunk, inflating their byte total (and thus GB/s) relative to the
-    # coalesced one-segment-per-adapter CUTLASS path. Counting a weight once
-    # per consecutive run makes the byte total reflect true HBM traffic and be
-    # comparable across backends.
     total = 0.0
     prev_lora = -1
     for seg_idx in range(weight_indices_cpu.numel()):
@@ -346,8 +314,11 @@ def _estimate_bytes(
         n = int(lora_ranks_cpu[lora].item()) * stack_num
         total += seg_len * K * elem_size  # bytes_x: input rows (once each)
         total += seg_len * n * elem_size  # bytes_out: output rows (once each)
+        # lora == prev_lora happens only in Triton kernel
         if lora != prev_lora:
-            total += n * K * elem_size  # bytes_w: adapter weight (re-read on adapter change)
+            total += (
+                n * K * elem_size
+            )  # bytes_w: adapter weight (re-read on adapter change)
         prev_lora = lora
     return total
 
@@ -480,9 +451,6 @@ def benchmark(case_id, provider):
     stack_num = case["stack_num"]
     elem_size = torch.tensor([], dtype=dtype).element_size()
 
-    # Per-backend segmentation drives its own flop/byte accounting. Total flops
-    # is invariant to how tokens are grouped, so tflops stays a fair comparison;
-    # byte counts differ (Triton re-reads weights once per chunk).
     seg = inputs[backend]
     total_flops = _compute_flops_by_segment(
         seg["seg_lens"], seg["weight_indices"], inputs["lora_ranks"], stack_num, K
@@ -564,8 +532,6 @@ def _sanity_check() -> None:
             f"Unexpected Triton output shape: got {tuple(out_triton.shape)}, expected {expected}"
         )
 
-    # Full rank => cur_n == N, so every column of every (physical) row is written
-    # by both backends and the full tensors are directly comparable.
     diff = (out.float() - out_triton.float()).abs()
     max_abs = diff.max().item()
     print(
@@ -623,7 +589,9 @@ def print_summary(title: str = "Chunked SGMV LoRA Shrink Forward Benchmark Resul
         # for ratios; the arithmetic mean is inflated by a few large-chunk wins)
         # and the median, alongside the raw min/max range.
         print("\n" + "=" * 120)
-        print("CUTLASS vs Triton per-case speedup = triton_ms / cutlass_ms (>1 => CUTLASS faster)")
+        print(
+            "CUTLASS vs Triton per-case speedup = triton_ms / cutlass_ms (>1 => CUTLASS faster)"
+        )
         print("=" * 120)
         pivot = df.pivot_table(
             index="case_id", columns="provider", values="time_ms", aggfunc="mean"

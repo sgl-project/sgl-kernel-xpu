@@ -82,10 +82,10 @@ struct ToSyclElementType<at::BFloat16> {
 
 // GATHER == true : output[row]       = input[perm[row]]
 // GATHER == false: output[perm[row]] = input[row]
-template <typename ElemT, bool GATHER>
+template <typename ElemType, bool GATHER>
 struct LoraPermuteRows : public __SYCL_KER_CONFIG_CONVENTION__ {
-  const ElemT* src;
-  ElemT* dst;
+  const ElemType* src;
+  ElemType* dst;
   const int64_t* perm;
   int64_t num_rows;
   int64_t width;
@@ -93,7 +93,7 @@ struct LoraPermuteRows : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr int WG = 256;
   static constexpr int sub_group_size = 16;
 
-  LoraPermuteRows(const ElemT* src, ElemT* dst, const int64_t* perm, int64_t num_rows, int64_t width)
+  LoraPermuteRows(const ElemType* src, ElemType* dst, const int64_t* perm, int64_t num_rows, int64_t width)
       : src(src), dst(dst), perm(perm), num_rows(num_rows), width(width) {}
 
   [[sycl::reqd_sub_group_size(sub_group_size)]]
@@ -109,8 +109,8 @@ struct LoraPermuteRows : public __SYCL_KER_CONFIG_CONVENTION__ {
     const int64_t src_row = GATHER ? p : row;
     const int64_t dst_row = GATHER ? row : p;
 
-    const ElemT* s = src + src_row * width;
-    ElemT* d = dst + dst_row * width;
+    const ElemType* s = src + src_row * width;
+    ElemType* d = dst + dst_row * width;
 
     for (int64_t c = static_cast<int64_t>(item.get_local_id(2)); c < width; c += WG) {
       d[c] = s[c];
@@ -130,15 +130,15 @@ void launch_permute_rows(
     const int64_t num_rows,
     const int64_t width,
     sycl::queue& queue) {
-  using ElemT = typename ToSyclElementType<TensorDType>::type;
-  constexpr int WG = LoraPermuteRows<ElemT, GATHER>::WG;
+  using ElemType = typename ToSyclElementType<TensorDType>::type;
+  constexpr int WG = LoraPermuteRows<ElemType, GATHER>::WG;
 
   sycl::range<3> local(1, 1, WG);
   sycl::range<3> global(static_cast<size_t>(num_rows), 1, static_cast<size_t>(WG));
 
-  auto kernel = LoraPermuteRows<ElemT, GATHER>(
-      reinterpret_cast<const ElemT*>(src.data_ptr<TensorDType>()),
-      reinterpret_cast<ElemT*>(dst.data_ptr<TensorDType>()),
+  auto kernel = LoraPermuteRows<ElemType, GATHER>(
+      reinterpret_cast<const ElemType*>(src.data_ptr<TensorDType>()),
+      reinterpret_cast<ElemType*>(dst.data_ptr<TensorDType>()),
       perm_i64.data_ptr<int64_t>(),
       num_rows,
       width);
@@ -150,10 +150,7 @@ void launch_permute_rows(
 // is 0. Supports fp32 / fp16 / bf16.
 template <bool GATHER>
 void permute_rows_dispatch(
-    const torch::Tensor& src,
-    torch::Tensor& dst,
-    const torch::Tensor& perm_i64,
-    sycl::queue& queue) {
+    const torch::Tensor& src, torch::Tensor& dst, const torch::Tensor& perm_i64, sycl::queue& queue) {
   const int64_t num_rows = src.size(0);
   const int64_t width = src.size(1);
   if (num_rows == 0 || width == 0) {

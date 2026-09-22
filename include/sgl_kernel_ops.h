@@ -1300,7 +1300,6 @@ void gate_up_lora_b_fwd(
     const std::optional<torch::Tensor>& base_output  // [num_tokens, 2*N]
 );
 
-
 void lora_gather_rows(
     torch::Tensor& output,            // [num_rows, width]  output[i] = input[permutation[i]]
     const torch::Tensor& input,       // [num_rows, width]

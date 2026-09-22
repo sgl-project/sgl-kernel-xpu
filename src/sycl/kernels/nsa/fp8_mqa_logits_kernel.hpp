@@ -147,6 +147,7 @@ struct PagedKGatherKernel {
 
   // 16 bytes (4x uint32) per transaction instead of 4 bytes.
   using Vec4 = sycl::vec<uint32_t, 4>;
+  static constexpr int vec_len = 16;  // size of Vec4 in bytes
 
   void operator()(sycl::nd_item<2> item) const {
     int b = item.get_global_id(0);
@@ -154,8 +155,8 @@ struct PagedKGatherKernel {
     if (b >= B || kj >= max_seq_len) return;
 
     int out_idx = b * max_seq_len + kj;
-    int n_vec4 = D / 16;
-    int rem_words = (D - n_vec4 * 16) / 4;  // leftover 4-byte words if D isn't a multiple of 16
+    int n_vec4 = D / vec_len;
+    int rem_words = (D - n_vec4 * vec_len) / 4;  // leftover 4-byte words if D isn't a multiple of 16
     if (kj >= seq_lens_ptr[b]) {
       // Zero padding for out-of-range tokens
       auto* dst = reinterpret_cast<Vec4*>(k_out_ptr + out_idx * D);

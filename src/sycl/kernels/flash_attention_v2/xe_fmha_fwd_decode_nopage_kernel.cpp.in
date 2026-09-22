@@ -42,6 +42,14 @@
 #include "sycl/kernels/flash_attention_v2/fmha_tile_dispatch.h"
 #include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
 
+// Soft-cap variant is compiled only for head_dim 128/256 (Gemma-2); see common.h.
+#if @HEAD_DIM@ == 128 || @HEAD_DIM@ == 256
+#define FMHA_DISPATCH_SOFTCAP(...) FMHA_DISPATCH_SOFTCAP_ENABLED(__VA_ARGS__)
+#else
+#define FMHA_DISPATCH_SOFTCAP(...) \
+  FMHA_DISPATCH_SOFTCAP_DISABLED("logit soft-cap is only compiled for head_dim 128 and 256", __VA_ARGS__)
+#endif
+
 namespace decode {
 
 template <>
@@ -73,7 +81,7 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
   if (params.return_softmax_lse) {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       using Element = @ELEM_TYPE@;
-      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
+      FMHA_DISPATCH_SOFTCAP({
       DecodeConfig<
           false,
           LocalMask,
@@ -98,7 +106,7 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
   // No sink support for no_page path; always use Sink=false
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     using Element = @ELEM_TYPE@;
-    AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
+    FMHA_DISPATCH_SOFTCAP({
     DecodeConfig<
         false,
         LocalMask,

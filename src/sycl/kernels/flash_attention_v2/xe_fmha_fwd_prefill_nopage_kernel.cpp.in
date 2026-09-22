@@ -45,6 +45,14 @@
 #include "sycl/kernels/flash_attention_v2/fmha_tile_dispatch.h"
 #include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_runner.hpp"
 
+// Soft-cap variant is compiled only for head_dim 128/256 (Gemma-2); see common.h.
+#if @HEAD_DIM@ == 128 || @HEAD_DIM@ == 256
+#define FMHA_DISPATCH_SOFTCAP(...) FMHA_DISPATCH_SOFTCAP_ENABLED(__VA_ARGS__)
+#else
+#define FMHA_DISPATCH_SOFTCAP(...) \
+  FMHA_DISPATCH_SOFTCAP_DISABLED("logit soft-cap is only compiled for head_dim 128 and 256", __VA_ARGS__)
+#endif
+
 namespace prefill {
 
 template <>
@@ -69,7 +77,7 @@ __attribute__((visibility("default"))) void FmhaPrefillNpRunner<@HEAD_DIM@, @ELE
   if (params.return_softmax_lse) {
     using Element = @ELEM_TYPE@;
     if (params.is_causal) {
-      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
+      FMHA_DISPATCH_SOFTCAP({
       FMHAConfig<
           /*Causal=*/true,
           /*LocalMask=*/false,
@@ -91,7 +99,7 @@ __attribute__((visibility("default"))) void FmhaPrefillNpRunner<@HEAD_DIM@, @ELE
       });
     } else {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-        AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
+        FMHA_DISPATCH_SOFTCAP({
         FMHAConfig<
             /*Causal=*/false,
             LocalMask,
@@ -120,7 +128,7 @@ __attribute__((visibility("default"))) void FmhaPrefillNpRunner<@HEAD_DIM@, @ELE
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
       using Element = @ELEM_TYPE@;
-      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
+      FMHA_DISPATCH_SOFTCAP({
       FMHAConfig<
           Causal,
           LocalMask,

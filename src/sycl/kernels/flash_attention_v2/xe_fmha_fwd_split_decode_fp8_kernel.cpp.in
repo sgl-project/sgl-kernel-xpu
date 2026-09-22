@@ -13,6 +13,10 @@
 
 #include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
 
+// No fp8 soft-cap model exists; skip the Softcap=true variant (see common.h).
+#define FMHA_DISPATCH_SOFTCAP(...) \
+  FMHA_DISPATCH_SOFTCAP_DISABLED("logit soft-cap is not supported with an fp8 KV cache", __VA_ARGS__)
+
 namespace decode {
 
 template <>
@@ -41,7 +45,7 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeFp8Runner<@QG_SZ@, @H
       !params.return_softmax_lse, "return_softmax_lse is not supported with an fp8 KV cache (split decode)");
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     using QElement = @ELEM_TYPE@;
-    AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
+    FMHA_DISPATCH_SOFTCAP({
     if (params.is_e4m3) {
       SplitDecodeConfig<
           false, LocalMask, false, Softcap, /*LSE=*/false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, 1,

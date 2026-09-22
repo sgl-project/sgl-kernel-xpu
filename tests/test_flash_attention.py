@@ -746,6 +746,9 @@ def test_flash_attn_kvcache(
     # sink is only supported for head_size == 64
     if use_sinks and d != 64:
         pytest.skip("use_sinks is only supported when d == 64")
+    # softcap is only compiled on the non-fp8 path at head_dim 128/256
+    if softcap > 0.0 and (d not in (128, 256) or dtype == torch.float8_e4m3fn):
+        pytest.skip("softcap is only compiled for head_dim 128/256 on the non-fp8 path")
     # set seed
     torch.random.manual_seed(0)
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
@@ -1339,6 +1342,9 @@ def test_flash_attn_decode_kvcache(
     # sink is only supported for head_size == 64
     if use_sinks and d != 64:
         pytest.skip("use_sinks is only supported when d == 64")
+    # softcap is only compiled on the non-fp8 path at head_dim 128/256
+    if softcap > 0.0 and (d not in (128, 256) or dtype == torch.float8_e4m3fn):
+        pytest.skip("softcap is only compiled for head_dim 128/256 on the non-fp8 path")
     # set seed
     torch.random.manual_seed(0)
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
@@ -1833,6 +1839,9 @@ def test_flash_attn_fp8_kvcache(
     if seqlen_k % page_size != 0:
         pytest.skip("page_size must divide seqlen_k")
     assert nheads_q % nheads_kv == 0
+    # fp8 KV path compiles no softcap variant
+    if softcap > 0.0:
+        pytest.skip("logit soft-cap is not supported with an fp8 KV cache")
 
     torch.manual_seed(0)
     softmax_scale = d**-0.5
@@ -2077,6 +2086,9 @@ def test_flash_attn_varlen_output(
     if nheads_kv > nheads_q:
         pytest.skip("Require nheads_kv <= nheads_q")
     assert nheads_q % nheads_kv == 0
+    # softcap is only compiled on the non-fp8 path at head_dim 128/256
+    if softcap > 0.0 and (d not in (128, 256) or dtype == torch.float8_e4m3fn):
+        pytest.skip("softcap is only compiled for head_dim 128/256 on the non-fp8 path")
 
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])

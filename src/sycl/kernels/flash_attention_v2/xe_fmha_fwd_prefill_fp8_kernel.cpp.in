@@ -14,6 +14,10 @@
 #include "sycl/kernels/flash_attention_v2/fmha_tile_dispatch.h"
 #include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_runner.hpp"
 
+// No fp8 soft-cap model exists; skip the Softcap=true variant (see common.h).
+#define FMHA_DISPATCH_SOFTCAP(...) \
+  FMHA_DISPATCH_SOFTCAP_DISABLED("logit soft-cap is not supported with an fp8 KV cache", __VA_ARGS__)
+
 namespace prefill {
 
 template <>
@@ -38,7 +42,7 @@ __attribute__((visibility("default"))) void FmhaPrefillFp8Runner<@HEAD_DIM@, @EL
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
       using QElement = @ELEM_TYPE@;
-      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
+      FMHA_DISPATCH_SOFTCAP({
       if (params.is_e4m3) {
         FMHAConfig<
              Causal, LocalMask, false, Softcap, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, false, 2, false,

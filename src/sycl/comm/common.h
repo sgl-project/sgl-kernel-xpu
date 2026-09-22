@@ -28,6 +28,18 @@ namespace {
     __VA_ARGS__;                                           \
   }
 
+// Soft-cap (attn_logit_softcapping) is Gemma-2-only (head_dim 128/256). FMHA TUs
+// for those head dims dispatch the Softcap=true variant with _ENABLED; the rest
+// use _DISABLED, which forces Softcap=false and rejects softcap>0 so the extra
+// variant is never instantiated. Each .cpp.in picks one via a per-HEAD_DIM #if.
+#define FMHA_DISPATCH_SOFTCAP_ENABLED(...) AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, __VA_ARGS__)
+#define FMHA_DISPATCH_SOFTCAP_DISABLED(REJECT_MSG, ...) \
+  do {                                                  \
+    TORCH_CHECK(params.softcap == 0.f, REJECT_MSG);     \
+    constexpr bool Softcap = false;                     \
+    __VA_ARGS__;                                        \
+  } while (0)
+
 template <typename Kernel>
 class KernelCur {};
 

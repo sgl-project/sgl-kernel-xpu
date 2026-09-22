@@ -252,6 +252,17 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
 #endif
 }
 
+SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_fp8_w8a16(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& weights,
+    const torch::Tensor& weight_scales,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts) {
+  moe_grouped_mm_nt_xe20_w8a16(output, activations, weights, weight_scales, bias, total_rows_for_experts, n_experts);
+}
+
 #undef DISPATCH_MOE_W8A16_BLOCK_TILES
 #undef DISPATCH_MOE_W8A16_SCALAR_TILES
 #undef LAUNCH_MOE_W8A16

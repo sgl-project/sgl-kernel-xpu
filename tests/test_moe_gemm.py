@@ -1198,6 +1198,7 @@ def test_moe_gemm_fp8_w8a16_block_weights(
 
     The cases cover block scales, multiple top-k values, and optional bias.
     """
+
     from sgl_kernel.moe import _moe_ws_cache, _moe_ws_view_cache
 
     _moe_ws_cache.clear()

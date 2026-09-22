@@ -16,13 +16,6 @@ _MOE_BIASED_TOPK_SCORING_MAP = {
     "sqrtsoftplus": 1,
 }
 
-if not hasattr(torch.ops.sgl_kernel, "moe_grouped_mm_nt_xe20_w8a16") and hasattr(
-    torch.ops.sgl_kernel, "moe_grouped_mm_nt_xe20_fp8_w8a16"
-):
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16 = (
-        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16
-    )
-
 
 def _mxfp4_e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
     """Decode E8M0 exponent-byte MXFP4 block scales into fp32 direct

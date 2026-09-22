@@ -1,20 +1,14 @@
 #include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
 
 #include <cstdint>
 
+#include "SGLKernelPerf.h"
 #include "Utils.h"
 #include "comm/General.h"
 #include "sgl_kernel/hisparse/load_cache_to_device_buffer.hpp"
 #include "sgl_kernel/hisparse/transfer_cache_dsv4_mla.hpp"
 #include "sgl_kernel_export.h"
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-#include <c10/xpu/XPUStream.h>
-
-#include <cutlass/util/GPU_Clock.hpp>
-
-#include "SGLKernelPerf.h"
-#endif
 
 using namespace sgl::sycl_kernel::hisparse;
 

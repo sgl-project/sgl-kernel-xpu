@@ -1,20 +1,14 @@
 #include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
 #include <limits>
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-#include <c10/xpu/XPUStream.h>
-
-#include <cutlass/util/GPU_Clock.hpp>
-
-#include "SGLKernelPerf.h"
-#endif
 
 static constexpr int WG_SIZE = 256;  // threads per WG; tokens_per_wg = WG_SIZE / (HC*HC)
 static constexpr int HC = 4;
@@ -152,9 +146,16 @@ SGL_KERNEL_EXPORT void hc_split_sinkhorn(
   auto q = dpcppGetCurrentQueue();
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // HC split sinkhorn: iterative row/col normalization. Memory-bound; skip flops.
+  const double flops = 0.0;
+  const double bytes = static_cast<double>(mixes.numel()) * static_cast<double>(mixes.element_size()) +
+                       static_cast<double>(hc_scale.numel()) * static_cast<double>(hc_scale.element_size()) +
+                       static_cast<double>(hc_base.numel()) * static_cast<double>(hc_base.element_size()) +
+                       static_cast<double>(pre.numel()) * static_cast<double>(pre.element_size()) +
+                       static_cast<double>(post.numel()) * static_cast<double>(post.element_size()) +
+                       static_cast<double>(comb.numel()) * static_cast<double>(comb.element_size());
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_SCOPE("hc_split_sinkhorn", profiling_queue, bytes, flops);
 #endif
 
   constexpr int tokens_per_wg = WG_SIZE / (HC * HC);
@@ -170,16 +171,4 @@ SGL_KERNEL_EXPORT void hc_split_sinkhorn(
       static_cast<float>(eps),
   };
   sycl_kernel_submit(num_wg * WG_SIZE, static_cast<int64_t>(WG_SIZE), q, ker);
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  // HC split sinkhorn: iterative row/col normalization. Memory-bound; skip flops.
-  const double flops = 0.0;
-  const double bytes = static_cast<double>(mixes.numel()) * static_cast<double>(mixes.element_size()) +
-                       static_cast<double>(hc_scale.numel()) * static_cast<double>(hc_scale.element_size()) +
-                       static_cast<double>(hc_base.numel()) * static_cast<double>(hc_base.element_size()) +
-                       static_cast<double>(pre.numel()) * static_cast<double>(pre.element_size()) +
-                       static_cast<double>(post.numel()) * static_cast<double>(post.element_size()) +
-                       static_cast<double>(comb.numel()) * static_cast<double>(comb.element_size());
-  ::sglkernel::report_kernel_perf("hc_split_sinkhorn", profiling_queue, timer, bytes, flops);
-#endif
 }

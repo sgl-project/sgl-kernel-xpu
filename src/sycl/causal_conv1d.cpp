@@ -24,14 +24,9 @@ limitations under the License.
 #include <optional>
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-#include <cutlass/util/GPU_Clock.hpp>
-
-#include "SGLKernelPerf.h"
-#endif
 
 struct ConvParamsBase {
   using index_t = uint32_t;

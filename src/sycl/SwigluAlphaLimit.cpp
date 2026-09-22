@@ -222,21 +222,16 @@ SGL_KERNEL_EXPORT torch::Tensor swiglu_gpt_oss_sigmoid_alpha(
   void* y_ptr = y.data_ptr();
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
-  GPU_Clock timer;
-  timer.start();
-#endif
-
-  SYCL_DISPATCH_BY_SCALAR_DTYPE(x.scalar_type(), CALL_SWIGLU_LAUNCHER_SYCL);
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   // GPT-OSS SwiGLU: sigmoid+alpha scaling+clamp+mul ~= 10 flops per output element.
   const double out_elems = static_cast<double>(B) * static_cast<double>(H);
   const double flops = 10.0 * out_elems;
   const double bytes =
       2.0 * out_elems * static_cast<double>(x.element_size()) + out_elems * static_cast<double>(y.element_size());
-  ::sglkernel::report_kernel_perf("swiglu_gpt_oss_sigmoid_alpha", profiling_queue, timer, bytes, flops);
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  SGL_KERNEL_PERF_SCOPE("swiglu_gpt_oss_sigmoid_alpha", profiling_queue, bytes, flops);
 #endif
+
+  SYCL_DISPATCH_BY_SCALAR_DTYPE(x.scalar_type(), CALL_SWIGLU_LAUNCHER_SYCL);
 
   return y;
 }

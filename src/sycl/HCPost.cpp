@@ -191,13 +191,6 @@ SGL_KERNEL_EXPORT void hc_post(
   TORCH_CHECK(D % VEC_SIZE == 0, "D must be a multiple of VEC_SIZE (", VEC_SIZE, "), got D=", D);
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  GPU_Clock timer;
-  timer.start();
-#endif
-
-  launch_hc_post_kernel<VEC_SIZE>(q, x, residual, post_layer_mix_2d, comb_res_mix, out, T, D);
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   // Combine 4 residual channels via [4x4] mix + post_layer_mix: ~ (4*4 + 4) * T * D flops.
   const int HC = 4;
   const double flops = static_cast<double>(T) * static_cast<double>(D) *
@@ -208,6 +201,8 @@ SGL_KERNEL_EXPORT void hc_post(
       static_cast<double>(post_layer_mix_2d.numel()) * static_cast<double>(post_layer_mix_2d.element_size()) +
       static_cast<double>(comb_res_mix.numel()) * static_cast<double>(comb_res_mix.element_size()) +
       static_cast<double>(out.numel()) * static_cast<double>(out.element_size());
-  ::sglkernel::report_kernel_perf("hc_post", q, timer, bytes, flops);
+  SGL_KERNEL_PERF_SCOPE("hc_post", q, bytes, flops);
 #endif
+
+  launch_hc_post_kernel<VEC_SIZE>(q, x, residual, post_layer_mix_2d, comb_res_mix, out, T, D);
 }

@@ -181,8 +181,12 @@ SGL_KERNEL_EXPORT void silu_and_mul_clamp(torch::Tensor& output, torch::Tensor& 
   float limit = static_cast<float>(swiglu_limit);
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  GPU_Clock timer;
-  timer.start();
+  // silu(gate)*value with clamp: ~6 sigmoid+mul flops + 2 clamp flops = ~8 per output.
+  const double out_elems = static_cast<double>(output.numel());
+  const double flops = 8.0 * out_elems;
+  const double bytes = 2.0 * out_elems * static_cast<double>(input.element_size()) +
+                       out_elems * static_cast<double>(output.element_size());
+  SGL_KERNEL_PERF_SCOPE("silu_and_mul_clamp", queue, bytes, flops);
 #endif
 
   if (input.scalar_type() == at::ScalarType::Half) {
@@ -195,13 +199,4 @@ SGL_KERNEL_EXPORT void silu_and_mul_clamp(torch::Tensor& output, torch::Tensor& 
         "silu_and_mul_clamp: only bf16 and fp16 are supported, got ",
         input.dtype());
   }
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  // silu(gate)*value with clamp: ~6 sigmoid+mul flops + 2 clamp flops = ~8 per output.
-  const double out_elems = static_cast<double>(output.numel());
-  const double flops = 8.0 * out_elems;
-  const double bytes = 2.0 * out_elems * static_cast<double>(input.element_size()) +
-                       out_elems * static_cast<double>(output.element_size());
-  ::sglkernel::report_kernel_perf("silu_and_mul_clamp", queue, timer, bytes, flops);
-#endif
 }

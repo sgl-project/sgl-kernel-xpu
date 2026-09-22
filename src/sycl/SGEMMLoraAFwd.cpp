@@ -40,16 +40,11 @@
 
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "kernels/lora/device/sgemm_lora_a_fwd_dispatch.hpp"
 #include "sgl_kernel_export.h"
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-#include <cutlass/util/GPU_Clock.hpp>
-
-#include "SGLKernelPerf.h"
-#endif
 
 namespace {
 
@@ -171,16 +166,6 @@ SGL_KERNEL_EXPORT void sgemm_lora_a_fwd(
   const int stack_num_ = static_cast<int>(stack_num);
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  GPU_Clock timer;
-  timer.start();
-#endif
-
-  // Dispatch on (dtype, tile). Each launch symbol is defined in a separate
-  // generated translation unit (see SGEMMLoraAFwdXe20.cmake).
-  DISPATCH_SGEMM_LORA_A_FWD_DTYPE(
-      input_x, weights, seg_indptr_i32, weight_indices_i32, output, stack_num_, max_rank, num_segments, queue);
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   // Grouped GEMM (LoRA-A): (num_tokens, K) @ (K, stack_num*max_rank) -> (num_tokens, stack_num*max_rank).
   const double M = static_cast<double>(num_tokens_i64);
   const double K = static_cast<double>(input_x.size(1));
@@ -189,8 +174,13 @@ SGL_KERNEL_EXPORT void sgemm_lora_a_fwd(
   const double bytes = static_cast<double>(input_x.numel()) * static_cast<double>(input_x.element_size()) +
                        static_cast<double>(weights.numel()) * static_cast<double>(weights.element_size()) +
                        static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
-  ::sglkernel::report_kernel_perf("sgemm_lora_a_fwd", queue, timer, bytes, flops);
+  SGL_KERNEL_PERF_SCOPE("sgemm_lora_a_fwd", queue, bytes, flops);
 #endif
+
+  // Dispatch on (dtype, tile). Each launch symbol is defined in a separate
+  // generated translation unit (see SGEMMLoraAFwdXe20.cmake).
+  DISPATCH_SGEMM_LORA_A_FWD_DTYPE(
+      input_x, weights, seg_indptr_i32, weight_indices_i32, output, stack_num_, max_rank, num_segments, queue);
 }
 
 #undef DISPATCH_SGEMM_LORA_A_FWD_TILE

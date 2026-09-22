@@ -2,18 +2,12 @@
 #include <ATen/OpMathType.h>
 #include <ATen/Parallel.h>
 #include <ATen/core/Array.h>
+#include <c10/xpu/XPUStream.h>
 
+#include "SGLKernelPerf.h"
 #include "Utils.h"
 #include "comm/General.h"
 #include "sgl_kernel_export.h"
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-#include <c10/xpu/XPUStream.h>
-
-#include <cutlass/util/GPU_Clock.hpp>
-
-#include "SGLKernelPerf.h"
-#endif
 
 namespace at::native::xpu {
 
@@ -472,9 +466,17 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor> rotary_embedding(
       " Query/Key must be 2D [num_tokens, num_heads*head_size] or 3D [num_tokens, num_heads, head_size] tensor");
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // RoPE is memory-bound: rotate each element pair, sin/cos read per position.
+  // Result tensors are either the query/key aliases (2D) or empty_like(query)/empty_like(key)
+  // returns from rotary_embedding_3D_kernel_impl, so their numel/element_size match query/key.
+  const double flops = 0.0;
+  const double bytes = static_cast<double>(query.numel()) * static_cast<double>(query.element_size()) +
+                       static_cast<double>(key.numel()) * static_cast<double>(key.element_size()) +
+                       static_cast<double>(cos_sin_cache.numel()) * static_cast<double>(cos_sin_cache.element_size()) +
+                       static_cast<double>(query.numel()) * static_cast<double>(query.element_size()) +
+                       static_cast<double>(key.numel()) * static_cast<double>(key.element_size());
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_SCOPE("rope", profiling_queue, bytes, flops);
 #endif
 
   std::tuple<at::Tensor, at::Tensor> result;
@@ -484,18 +486,6 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor> rotary_embedding(
   } else {
     result = rotary_embedding_3D_kernel_impl(positions, query, key, cos_sin_cache, rotary_dim, is_neox);
   }
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  // RoPE is memory-bound: rotate each element pair, sin/cos read per position.
-  const double flops = 0.0;
-  const double bytes =
-      static_cast<double>(query.numel()) * static_cast<double>(query.element_size()) +
-      static_cast<double>(key.numel()) * static_cast<double>(key.element_size()) +
-      static_cast<double>(cos_sin_cache.numel()) * static_cast<double>(cos_sin_cache.element_size()) +
-      static_cast<double>(std::get<0>(result).numel()) * static_cast<double>(std::get<0>(result).element_size()) +
-      static_cast<double>(std::get<1>(result).numel()) * static_cast<double>(std::get<1>(result).element_size());
-  ::sglkernel::report_kernel_perf("rope", profiling_queue, timer, bytes, flops);
-#endif
 
   return result;
 }

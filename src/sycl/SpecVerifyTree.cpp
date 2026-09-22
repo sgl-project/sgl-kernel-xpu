@@ -50,15 +50,10 @@ If above kMaxShuffleNodes, one request per work-group with the tree staged in SL
 #include <sycl/sycl.hpp>
 #include <type_traits>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-#include <cutlass/util/GPU_Clock.hpp>
-
-#include "SGLKernelPerf.h"
-#endif
 
 namespace {
 
@@ -463,9 +458,18 @@ SGL_KERNEL_EXPORT void verify_tree_greedy(
   }
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = 0.0;
+  const double bytes =
+      static_cast<double>(candidates.numel()) * static_cast<double>(candidates.element_size()) +
+      static_cast<double>(retrive_index.numel()) * static_cast<double>(retrive_index.element_size()) +
+      static_cast<double>(retrive_next_token.numel()) * static_cast<double>(retrive_next_token.element_size()) +
+      static_cast<double>(retrive_next_sibling.numel()) * static_cast<double>(retrive_next_sibling.element_size()) +
+      static_cast<double>(target_predict.numel()) * static_cast<double>(target_predict.element_size()) +
+      static_cast<double>(predicts.numel()) * static_cast<double>(predicts.element_size()) +
+      static_cast<double>(accept_index.numel()) * static_cast<double>(accept_index.element_size()) +
+      static_cast<double>(accept_token_num.numel()) * static_cast<double>(accept_token_num.element_size());
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_SCOPE("verify_tree_greedy", profiling_queue, bytes, flops);
 #endif
 
   auto launch = [&](auto in_tag, auto out_tag) {
@@ -498,18 +502,4 @@ SGL_KERNEL_EXPORT void verify_tree_greedy(
       launch(int32_t{}, int32_t{});
     }
   }
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  const double flops = 0.0;
-  const double bytes =
-      static_cast<double>(candidates.numel()) * static_cast<double>(candidates.element_size()) +
-      static_cast<double>(retrive_index.numel()) * static_cast<double>(retrive_index.element_size()) +
-      static_cast<double>(retrive_next_token.numel()) * static_cast<double>(retrive_next_token.element_size()) +
-      static_cast<double>(retrive_next_sibling.numel()) * static_cast<double>(retrive_next_sibling.element_size()) +
-      static_cast<double>(target_predict.numel()) * static_cast<double>(target_predict.element_size()) +
-      static_cast<double>(predicts.numel()) * static_cast<double>(predicts.element_size()) +
-      static_cast<double>(accept_index.numel()) * static_cast<double>(accept_index.element_size()) +
-      static_cast<double>(accept_token_num.numel()) * static_cast<double>(accept_token_num.element_size());
-  ::sglkernel::report_kernel_perf("verify_tree_greedy", profiling_queue, timer, bytes, flops);
-#endif
 }

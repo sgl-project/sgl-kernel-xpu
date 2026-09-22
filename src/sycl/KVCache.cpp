@@ -120,9 +120,13 @@ store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cac
   int64_t group_size = std::min<int64_t>(std::min<int64_t>(row_dim, 512), max_wg_size);
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Pure copy: no flops, memory-bound on 2 reads (k/v) + 2 writes (k_cache/v_cache).
+  const double elem = static_cast<double>(k.element_size());
+  const double bytes = 4.0 * static_cast<double>(num_tokens) * static_cast<double>(row_dim) * elem +
+                       static_cast<double>(num_tokens) * 8.0;
+  const double flops = 0.0;
   auto profiling_queue = dpcppGetCurrentQueue();
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_SCOPE("store_cache", profiling_queue, bytes, flops);
 #endif
 
   SYCL_DISPATCH_FLOATING_TYPES(at::ScalarType::Half, at::ScalarType::BFloat16, k.scalar_type(), "store_cache", [&]() {
@@ -157,15 +161,6 @@ store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cac
     };
     dpcppGetCurrentQueue().submit(cgf);
   });
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  // Pure copy: no flops, memory-bound on 2 reads (k/v) + 2 writes (k_cache/v_cache).
-  const double elem = static_cast<double>(k.element_size());
-  const double bytes = 4.0 * static_cast<double>(num_tokens) * static_cast<double>(row_dim) * elem +
-                       static_cast<double>(num_tokens) * 8.0;
-  const double flops = 0.0;
-  ::sglkernel::report_kernel_perf("store_cache", profiling_queue, timer, bytes, flops);
-#endif
 }
 
 }  // namespace at::native::xpu

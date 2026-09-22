@@ -264,9 +264,18 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
   const bool is_fp16_act = activations.scalar_type() == at::ScalarType::Half;
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  GPU_Clock timer;
-  timer.start();
+  const double flops = 2.0 * static_cast<double>(total_m) * static_cast<double>(gemm_n) * static_cast<double>(gemm_k);
+  // Packed weights are 4-bit (K/2 bytes per row), dequant contributes bandwidth via scales/zeros.
+  const double a_bytes =
+      static_cast<double>(total_m) * static_cast<double>(gemm_k) * static_cast<double>(activations.element_size());
+  const double w_bytes =
+      static_cast<double>(n_experts) * static_cast<double>(gemm_n) * static_cast<double>(gemm_k) * 0.5;
+  const double s_bytes = static_cast<double>(scales.numel()) * static_cast<double>(scales.element_size());
+  const double out_bytes =
+      static_cast<double>(total_m) * static_cast<double>(gemm_n) * static_cast<double>(output.element_size());
+  SGL_KERNEL_PERF_SCOPE("moe_grouped_mm_nt_xe20_w4a16", queue, a_bytes + w_bytes + s_bytes + out_bytes, flops);
 #endif
+
 #define LAUNCH_W4A16(Policy)                                                                  \
   do {                                                                                        \
     if (is_int4) {                                                                            \
@@ -399,20 +408,6 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
 
 #undef DISPATCH_W4A16_POLICY
 #undef LAUNCH_W4A16
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  const double flops = 2.0 * static_cast<double>(total_m) * static_cast<double>(gemm_n) * static_cast<double>(gemm_k);
-  // Packed weights are 4-bit (K/2 bytes per row), dequant contributes bandwidth via scales/zeros.
-  const double a_bytes =
-      static_cast<double>(total_m) * static_cast<double>(gemm_k) * static_cast<double>(activations.element_size());
-  const double w_bytes =
-      static_cast<double>(n_experts) * static_cast<double>(gemm_n) * static_cast<double>(gemm_k) * 0.5;
-  const double s_bytes = static_cast<double>(scales.numel()) * static_cast<double>(scales.element_size());
-  const double out_bytes =
-      static_cast<double>(total_m) * static_cast<double>(gemm_n) * static_cast<double>(output.element_size());
-  ::sglkernel::report_kernel_perf(
-      "moe_grouped_mm_nt_xe20_w4a16", queue, timer, a_bytes + w_bytes + s_bytes + out_bytes, flops);
-#endif
 }
 
 #undef SYCL_INTEL_TARGET

@@ -48,16 +48,11 @@
 #include <algorithm>
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "kernels/lora/device/qkv_lora_b_fwd_dispatch.hpp"
 #include "sgl_kernel_export.h"
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-#include <cutlass/util/GPU_Clock.hpp>
-
-#include "SGLKernelPerf.h"
-#endif
 
 namespace {
 
@@ -221,8 +216,15 @@ SGL_KERNEL_EXPORT void qkv_lora_b_fwd(
   (void)max_qkv_out_dim;  // validated above; per-group N comes from output_offset
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  GPU_Clock timer;
-  timer.start();
+  // Grouped GEMM: (num_tokens, K) @ (K, N_total) -> (num_tokens, N_total). K == max_rank per group.
+  const double M = static_cast<double>(num_tokens_i64);
+  const double N = static_cast<double>(n_total_i64);
+  const double K = static_cast<double>(max_rank_i64);
+  const double flops = 2.0 * M * N * K;
+  const double bytes = static_cast<double>(input_x.numel()) * static_cast<double>(input_x.element_size()) +
+                       static_cast<double>(qkv_lora_b.numel()) * static_cast<double>(qkv_lora_b.element_size()) +
+                       static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
+  SGL_KERNEL_PERF_SCOPE("qkv_lora_b_fwd", queue, bytes, flops);
 #endif
 
   // Dispatch on dtype. Each launch symbol is defined in a separate generated
@@ -239,18 +241,6 @@ SGL_KERNEL_EXPORT void qkv_lora_b_fwd(
       n_total,
       num_segments,
       queue);
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  // Grouped GEMM: (num_tokens, K) @ (K, N_total) -> (num_tokens, N_total). K == max_rank per group.
-  const double M = static_cast<double>(num_tokens_i64);
-  const double N = static_cast<double>(n_total_i64);
-  const double K = static_cast<double>(max_rank_i64);
-  const double flops = 2.0 * M * N * K;
-  const double bytes = static_cast<double>(input_x.numel()) * static_cast<double>(input_x.element_size()) +
-                       static_cast<double>(qkv_lora_b.numel()) * static_cast<double>(qkv_lora_b.element_size()) +
-                       static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
-  ::sglkernel::report_kernel_perf("qkv_lora_b_fwd", queue, timer, bytes, flops);
-#endif
 }
 
 #undef DISPATCH_QKV_LORA_B_FWD_DTYPE

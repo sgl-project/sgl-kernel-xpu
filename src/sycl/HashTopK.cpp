@@ -175,8 +175,13 @@ SGL_KERNEL_EXPORT void hash_topk(
   auto& queue = dpcppGetCurrentQueue();
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  GPU_Clock timer;
-  timer.start();
+  // Hash-based topk fuses routed selection + weight scaling: ~3 flops per (token, expert).
+  const double flops = 3.0 * static_cast<double>(num_tokens) * static_cast<double>(num_routed_experts);
+  const double logits_elem = static_cast<double>(router_logits.element_size());
+  const double bytes = static_cast<double>(num_tokens) * static_cast<double>(num_routed_experts) * logits_elem +
+                       static_cast<double>(num_tokens) * 8.0 +
+                       static_cast<double>(num_tokens) * static_cast<double>(topk_fused) * (4.0 + 4.0);
+  SGL_KERNEL_PERF_SCOPE("hash_topk", queue, bytes, flops);
 #endif
 
   DISPATCH_FLOAT_TYPES(router_logits.scalar_type(), "hash_topk_xpu", [&] {
@@ -194,16 +199,6 @@ SGL_KERNEL_EXPORT void hash_topk(
         static_cast<uint32_t>(topk_fused),
         static_cast<float>(routed_scaling_factor));
   });
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  // Hash-based topk fuses routed selection + weight scaling: ~3 flops per (token, expert).
-  const double flops = 3.0 * static_cast<double>(num_tokens) * static_cast<double>(num_routed_experts);
-  const double logits_elem = static_cast<double>(router_logits.element_size());
-  const double bytes = static_cast<double>(num_tokens) * static_cast<double>(num_routed_experts) * logits_elem +
-                       static_cast<double>(num_tokens) * 8.0 +
-                       static_cast<double>(num_tokens) * static_cast<double>(topk_fused) * (4.0 + 4.0);
-  ::sglkernel::report_kernel_perf("hash_topk", queue, timer, bytes, flops);
-#endif
 }
 
 }  // namespace at::native::xpu

@@ -492,8 +492,14 @@ SGL_KERNEL_EXPORT void biased_topk(
   auto queue = stream.queue();
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  GPU_Clock timer;
-  timer.start();
+  const int64_t N = input.size(0);
+  const int64_t E = input.size(1);
+  const double flops = 5.0 * static_cast<double>(N) * static_cast<double>(E) +
+                       static_cast<double>(N) * static_cast<double>(topk) *
+                           (1.0 + std::log2(std::max<double>(1.0, static_cast<double>(E))));
+  const double bytes = static_cast<double>(N) * static_cast<double>(E) * static_cast<double>(input.element_size()) +
+                       static_cast<double>(E) * 4.0 + static_cast<double>(N) * static_cast<double>(topk) * (4.0 + 4.0);
+  SGL_KERNEL_PERF_SCOPE("biased_topk", queue, bytes, flops);
 #endif
 
   if (scoring_func == static_cast<int64_t>(ScoringFunc::kSigmoid)) {
@@ -525,17 +531,6 @@ SGL_KERNEL_EXPORT void biased_topk(
           queue);
     });
   }
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  const int64_t N = input.size(0);
-  const int64_t E = input.size(1);
-  const double flops = 5.0 * static_cast<double>(N) * static_cast<double>(E) +
-                       static_cast<double>(N) * static_cast<double>(topk) *
-                           (1.0 + std::log2(std::max<double>(1.0, static_cast<double>(E))));
-  const double bytes = static_cast<double>(N) * static_cast<double>(E) * static_cast<double>(input.element_size()) +
-                       static_cast<double>(E) * 4.0 + static_cast<double>(N) * static_cast<double>(topk) * (4.0 + 4.0);
-  ::sglkernel::report_kernel_perf("biased_topk", queue, timer, bytes, flops);
-#endif
 }
 
 }  // namespace at::native::xpu

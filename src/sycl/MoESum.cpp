@@ -4,15 +4,10 @@
 
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-#include <cutlass/util/GPU_Clock.hpp>
-
-#include "SGLKernelPerf.h"
-#endif
 
 template <typename scalar_t, int TOPK>
 struct MoeSumKernel {
@@ -52,8 +47,11 @@ SGL_KERNEL_EXPORT void moe_sum(
   auto range = sycl::nd_range<1>(global * local, local);
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  GPU_Clock timer;
-  timer.start();
+  // MoE sum: reduce topk copies per output. Memory-bound.
+  const double flops = 0.0;
+  const double bytes = static_cast<double>(input.numel()) * static_cast<double>(input.element_size()) +
+                       static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
+  SGL_KERNEL_PERF_SCOPE("moe_sum", queue, bytes, flops);
 #endif
 
   switch (topk) {
@@ -85,12 +83,4 @@ SGL_KERNEL_EXPORT void moe_sum(
       at::sum_out(output, input, 1);
       break;
   }
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  // MoE sum: reduce topk copies per output. Memory-bound.
-  const double flops = 0.0;
-  const double bytes = static_cast<double>(input.numel()) * static_cast<double>(input.element_size()) +
-                       static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
-  ::sglkernel::report_kernel_perf("moe_sum", queue, timer, bytes, flops);
-#endif
 }

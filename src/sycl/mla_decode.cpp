@@ -48,11 +48,7 @@
 #include "jit/mla_jit.h"
 #endif
 
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-#include <cutlass/util/GPU_Clock.hpp>
-
 #include "SGLKernelPerf.h"
-#endif
 
 namespace {
 
@@ -203,9 +199,25 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
   }
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Decode: batch B, 1 query per row over the full kv_len; QK + PV.
+  const int64_t B = q_nope.size(0);
+  const int64_t H = q_nope.size(1);
+  const int64_t D_nope = q_nope.size(2);
+  const int64_t D_pe = q_pe.size(2);
+  const int64_t D_qk = D_nope + D_pe;
+  const int64_t page_count_per_seq = page_table.size(1);
+  const int64_t max_seq_len = static_cast<int64_t>(page_size) * page_count_per_seq;
+  const double flops = 2.0 * static_cast<double>(B) * static_cast<double>(H) * static_cast<double>(max_seq_len) *
+                           static_cast<double>(D_qk) +
+                       2.0 * static_cast<double>(B) * static_cast<double>(H) * static_cast<double>(max_seq_len) *
+                           static_cast<double>(D_nope);
+  const double bytes =
+      static_cast<double>(q_nope.numel()) * static_cast<double>(q_nope.element_size()) +
+      static_cast<double>(q_pe.numel()) * static_cast<double>(q_pe.element_size()) +
+      static_cast<double>(kv_c_and_k_pe_cache.numel()) * static_cast<double>(kv_c_and_k_pe_cache.element_size()) +
+      static_cast<double>(out.numel()) * static_cast<double>(out.element_size());
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_SCOPE("flash_mla_decode", profiling_queue, bytes, flops);
 #endif
 
 #ifdef USE_MLA_JIT
@@ -231,27 +243,6 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
   }
 #else
   DISPATCH_MLA_DTYPE();
-#endif
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  // Decode: batch B, 1 query per row over the full kv_len; QK + PV.
-  const int64_t B = q_nope.size(0);
-  const int64_t H = q_nope.size(1);
-  const int64_t D_nope = q_nope.size(2);
-  const int64_t D_pe = q_pe.size(2);
-  const int64_t D_qk = D_nope + D_pe;
-  const int64_t page_count_per_seq = page_table.size(1);
-  const int64_t max_seq_len = static_cast<int64_t>(page_size) * page_count_per_seq;
-  const double flops = 2.0 * static_cast<double>(B) * static_cast<double>(H) * static_cast<double>(max_seq_len) *
-                           static_cast<double>(D_qk) +
-                       2.0 * static_cast<double>(B) * static_cast<double>(H) * static_cast<double>(max_seq_len) *
-                           static_cast<double>(D_nope);
-  const double bytes =
-      static_cast<double>(q_nope.numel()) * static_cast<double>(q_nope.element_size()) +
-      static_cast<double>(q_pe.numel()) * static_cast<double>(q_pe.element_size()) +
-      static_cast<double>(kv_c_and_k_pe_cache.numel()) * static_cast<double>(kv_c_and_k_pe_cache.element_size()) +
-      static_cast<double>(out.numel()) * static_cast<double>(out.element_size());
-  ::sglkernel::report_kernel_perf("flash_mla_decode", profiling_queue, timer, bytes, flops);
 #endif
 }
 

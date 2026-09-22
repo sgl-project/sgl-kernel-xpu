@@ -5,16 +5,11 @@
 #include <cmath>
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "cutlass/float8.h"
 #include "sgl_kernel_export.h"
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-#include <cutlass/util/GPU_Clock.hpp>
-
-#include "SGLKernelPerf.h"
-#endif
 
 // TODO: improve performance when FP8 native support is added
 
@@ -283,9 +278,12 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_8bit(
   sycl::range<1> local_range(num_threads);
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = static_cast<double>(input.numel());
+  const double bytes = static_cast<double>(input.numel()) * static_cast<double>(input.element_size()) +
+                       static_cast<double>(output_q.numel()) * static_cast<double>(output_q.element_size()) +
+                       static_cast<double>(output_s.numel()) * static_cast<double>(output_s.element_size());
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_SCOPE("per_token_group_quant_8bit", profiling_queue, bytes, flops);
 #endif
 
 #define LAUNCH_KERNEL_WITH_GROUP_SIZE(T, DST_DTYPE, GS)                                   \
@@ -395,14 +393,6 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_8bit(
 
 #undef LAUNCH_KERNEL
 #undef LAUNCH_KERNEL_WITH_GROUP_SIZE
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  const double flops = static_cast<double>(input.numel());
-  const double bytes = static_cast<double>(input.numel()) * static_cast<double>(input.element_size()) +
-                       static_cast<double>(output_q.numel()) * static_cast<double>(output_q.element_size()) +
-                       static_cast<double>(output_s.numel()) * static_cast<double>(output_s.element_size());
-  ::sglkernel::report_kernel_perf("per_token_group_quant_8bit", profiling_queue, timer, bytes, flops);
-#endif
 }
 
 }  // namespace at::native::xpu

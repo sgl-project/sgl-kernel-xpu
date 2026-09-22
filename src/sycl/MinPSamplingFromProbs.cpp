@@ -9,17 +9,12 @@
 #include <sycl/sycl.hpp>
 
 #include "MemoryAccess.h"
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "comm/Random.h"
 #include "comm/Sampling.h"
 #include "sgl_kernel_export.h"
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-#include <cutlass/util/GPU_Clock.hpp>
-
-#include "SGLKernelPerf.h"
-#endif
 
 template <typename T>
 struct ToSyclElementType {
@@ -285,8 +280,10 @@ SGL_KERNEL_EXPORT void min_p_sampling_from_probs(
   auto queue = stream.queue();
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  GPU_Clock timer;
-  timer.start();
+  const double flops = 0.0;
+  const double bytes = static_cast<double>(probs.numel()) * static_cast<double>(probs.element_size()) +
+                       static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
+  SGL_KERNEL_PERF_SCOPE("min_p_sampling", queue, bytes, flops);
 #endif
 
   launch_min_p_sampling<float>(
@@ -301,11 +298,4 @@ SGL_KERNEL_EXPORT void min_p_sampling_from_probs(
       philox_offset,
       deterministic,
       queue);
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  const double flops = 0.0;
-  const double bytes = static_cast<double>(probs.numel()) * static_cast<double>(probs.element_size()) +
-                       static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
-  ::sglkernel::report_kernel_perf("min_p_sampling", queue, timer, bytes, flops);
-#endif
 }

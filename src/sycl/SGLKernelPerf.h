@@ -6,16 +6,49 @@
 // helper so each instrumented kernel entry-point stays focused on its op-specific
 // FLOPS/BYTES formulas.
 //
-// Usage pattern (mirrors the PR#269 wrap):
+// The header is self-guarding (its own body is under `#if
+// CUTLASS_SYCL_PROFILING_ENABLED` with a no-op `#else`), so callers include it
+// unconditionally.
+//
+// Call-site pattern: wrap the profiling-only prologue (bytes/flops locals,
+// queue lookup, scope macro) in a single `#if defined(CUTLASS_SYCL_PROFILING_ENABLED)`
+// block so non-profiling builds pay zero cost -- no arithmetic, no queue
+// lookup. Kernel-launch code stays outside the block and runs in both builds.
+//
+//   #include "SGLKernelPerf.h"
+//   ...
+//   #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+//     const double bytes = ...;
+//     const double flops = ...;
+//     auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+//     SGL_KERNEL_PERF_SCOPE("my_op", profiling_queue, bytes, flops);
+//   #endif
+//     <existing kernel-launch code>
+//
+// The scope object starts a GPU_Clock at construction and calls
+// report_kernel_perf() at destruction. It measures correctly only when the
+// target submit is the last queue operation in its scope (GPU_Clock::stop() ---
+// invoked inside seconds() --- records the queue's last event at destruction).
+//
+// For entry points that submit multiple kernels or do post-submit queue work,
+// keep the explicit report_kernel_perf() call right after the relevant submit
+// so the timing bracket stays tight. Those sites use per-submit `#if` blocks:
 //
 //   #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
 //     auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
 //     GPU_Clock timer;
 //     timer.start();
 //   #endif
-//     <existing kernel-launch code>
+//     <first submit>
 //   #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-//     ::sglkernel::report_kernel_perf("my_op", profiling_queue, timer, bytes, flops);
+//     ::sglkernel::report_kernel_perf("first_op", profiling_queue, timer,
+//                                     bytes_a, flops_a);
+//     timer.start();
+//   #endif
+//     <second submit>
+//   #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+//     ::sglkernel::report_kernel_perf("second_op", profiling_queue, timer,
+//                                     bytes_b, flops_b);
 //   #endif
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
@@ -67,6 +100,44 @@ report_kernel_perf(const char* op_name, ::sycl::queue& queue, GPU_Clock& timer, 
   }
 }
 
+// RAII scope: start a GPU_Clock at construction, call report_kernel_perf() at
+// destruction. The captured queue reference must outlive the scope. See the
+// header comment for when to prefer this over the explicit two-call pattern.
+struct KernelPerfScope {
+  const char* op_name;
+  ::sycl::queue& queue;
+  double bytes;
+  double flops;
+  GPU_Clock timer;
+
+  KernelPerfScope(const char* op, ::sycl::queue& q, double b, double f) : op_name(op), queue(q), bytes(b), flops(f) {
+    timer.start();
+  }
+
+  ~KernelPerfScope() {
+    report_kernel_perf(op_name, queue, timer, bytes, flops);
+  }
+
+  KernelPerfScope(const KernelPerfScope&) = delete;
+  KernelPerfScope& operator=(const KernelPerfScope&) = delete;
+};
+
 }  // namespace sglkernel
+
+// Two-level concat: `foo##__LINE__` doesn't expand __LINE__ (and identifiers
+// containing `__` are reserved to the implementation, hence the non-reserved
+// `sgl_perf_scope_` prefix).
+#define SGL_PERF_CAT_(a, b) a##b
+#define SGL_PERF_CAT(a, b) SGL_PERF_CAT_(a, b)
+#define SGL_KERNEL_PERF_SCOPE(op, queue, bytes, flops) \
+  ::sglkernel::KernelPerfScope SGL_PERF_CAT(sgl_perf_scope_, __LINE__)((op), (queue), (bytes), (flops))
+
+#else  // !CUTLASS_SYCL_PROFILING_ENABLED
+
+// Consume each argument so call-site locals used only to compute bytes/flops
+// don't trip -Wunused-variable in non-profiling builds. The comma expression
+// evaluates each cast then discards the result; the compiler drops the whole
+// thing.
+#define SGL_KERNEL_PERF_SCOPE(op, queue, bytes, flops) ((void)(op), (void)&(queue), (void)(bytes), (void)(flops))
 
 #endif  // CUTLASS_SYCL_PROFILING_ENABLED

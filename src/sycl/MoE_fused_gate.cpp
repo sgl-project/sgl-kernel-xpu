@@ -546,9 +546,16 @@ SGL_KERNEL_EXPORT std::vector<at::Tensor> moe_fused_gate(
   bool dispatched = false;
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Fused gate: sigmoid/softmax (~5 flops/expert) + group top-k selection (~log2 flops per topk pick).
+  const double flops = 5.0 * static_cast<double>(num_rows) * static_cast<double>(num_experts) +
+                       static_cast<double>(num_rows) * static_cast<double>(topk) *
+                           (1.0 + std::log2(std::max<double>(1.0, static_cast<double>(num_experts))));
+  const double bytes =
+      static_cast<double>(num_rows) * static_cast<double>(num_experts) * static_cast<double>(input.element_size()) +
+      (bias.has_value() ? static_cast<double>(num_experts) * static_cast<double>(bias->element_size()) : 0.0) +
+      static_cast<double>(num_rows) * static_cast<double>(topk) * (4.0 + 4.0);
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_SCOPE("moe_fused_gate", profiling_queue, bytes, flops);
 #endif
 
   SYCL_DISPATCH_FLOATING_TYPES_AND2(
@@ -597,18 +604,6 @@ SGL_KERNEL_EXPORT std::vector<at::Tensor> moe_fused_gate(
               apply_routed_scaling_factor_on_output);
         }
       });
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  // Fused gate: sigmoid/softmax (~5 flops/expert) + group top-k selection (~log2 flops per topk pick).
-  const double flops = 5.0 * static_cast<double>(num_rows) * static_cast<double>(num_experts) +
-                       static_cast<double>(num_rows) * static_cast<double>(topk) *
-                           (1.0 + std::log2(std::max<double>(1.0, static_cast<double>(num_experts))));
-  const double bytes =
-      static_cast<double>(num_rows) * static_cast<double>(num_experts) * static_cast<double>(input.element_size()) +
-      (bias.has_value() ? static_cast<double>(num_experts) * static_cast<double>(bias->element_size()) : 0.0) +
-      static_cast<double>(num_rows) * static_cast<double>(topk) * (4.0 + 4.0);
-  ::sglkernel::report_kernel_perf("moe_fused_gate", profiling_queue, timer, bytes, flops);
-#endif
 
   return {output, indices};
 }

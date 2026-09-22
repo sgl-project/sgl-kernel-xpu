@@ -245,20 +245,6 @@ SGL_KERNEL_EXPORT void fused_q_indexer_rope_hadamard_quant(
       q_fp8.stride(0) == expected_q_stride0, "q_fp8 must be contiguous (B,H,128); got stride[0]=", q_fp8.stride(0));
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
-  GPU_Clock timer;
-  timer.start();
-#endif
-
-  SYCL_DISPATCH_FLOATING_TYPES_AND2(
-      at::kBFloat16, at::kHalf, q_input.scalar_type(), "fused_q_indexer_rope_hadamard_quant", [&]() {
-        AT_DISPATCH_INDEX_TYPES(positions.scalar_type(), "fused_q_indexer_rope_hadamard_quant", [&]() {
-          launch_fused_q_indexer_rope_hadamard_quant<scalar_t, index_t>(
-              q_input, q_fp8, weight, weights_out, weight_scale, rope_cache, positions);
-        });
-      });
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   const int64_t B = q_input.size(0);
   const int64_t H = q_input.size(1);
   // rope (~4*rope_dim per B*H) + hadamard (~2*head_dim*log2(head_dim)/head_dim*head_dim ≈ 2*head_dim*log2 flops)
@@ -274,6 +260,15 @@ SGL_KERNEL_EXPORT void fused_q_indexer_rope_hadamard_quant(
       static_cast<double>(B) * static_cast<double>(kRopeDim) * static_cast<double>(rope_cache.element_size()) +
       static_cast<double>(B) * static_cast<double>(H) * static_cast<double>(kHeadDim) * 1.0 +
       static_cast<double>(B) * static_cast<double>(H) * 4.0;
-  ::sglkernel::report_kernel_perf("fused_q_indexer_rope_hadamard_quant", profiling_queue, timer, bytes, flops);
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  SGL_KERNEL_PERF_SCOPE("fused_q_indexer_rope_hadamard_quant", profiling_queue, bytes, flops);
 #endif
+
+  SYCL_DISPATCH_FLOATING_TYPES_AND2(
+      at::kBFloat16, at::kHalf, q_input.scalar_type(), "fused_q_indexer_rope_hadamard_quant", [&]() {
+        AT_DISPATCH_INDEX_TYPES(positions.scalar_type(), "fused_q_indexer_rope_hadamard_quant", [&]() {
+          launch_fused_q_indexer_rope_hadamard_quant<scalar_t, index_t>(
+              q_input, q_fp8, weight, weights_out, weight_scale, rope_cache, positions);
+        });
+      });
 }

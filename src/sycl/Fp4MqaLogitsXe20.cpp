@@ -59,10 +59,13 @@ struct Fp4PagedMqaLogitsKernel {
     const int page_block = token / page_size;
     const int token_in_page = token % page_size;
     const int page_id = block_tables[b * max_blocks + page_block];
-    const uint8_t* k_token = kv_cache +
-        (static_cast<int64_t>(page_id) * page_size + token_in_page) * kCacheBytesPerToken;
-    const uint8_t* k_payload = k_token;
-    const uint8_t* k_scales = k_token + kPackedDim;
+    // Page layout written by FusedNormRopeStore: packed nibbles for all tokens of
+    // the page first, then the per-token UE8M0 group scales.
+    const uint8_t* page_base =
+        kv_cache + static_cast<int64_t>(page_id) * page_size * kCacheBytesPerToken;
+    const uint8_t* k_payload = page_base + static_cast<int64_t>(token_in_page) * kPackedDim;
+    const uint8_t* k_scales = page_base + static_cast<int64_t>(page_size) * kPackedDim +
+        static_cast<int64_t>(token_in_page) * kNumGroups;
     const uint8_t* q_row = q_fp4 + static_cast<int64_t>(b) * heads * kPackedDim;
     const uint8_t* q_scale_row = q_scale + static_cast<int64_t>(b) * heads * kNumGroups;
 

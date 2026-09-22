@@ -32,13 +32,15 @@ def _decode_scale(scale: torch.Tensor) -> torch.Tensor:
 def _reference(q, q_scale, cache, weights, seq_lens, block_tables, max_seq_len, weight_scale):
     batch, heads = q.shape[:2]
     output = torch.zeros((batch, max_seq_len), device=q.device, dtype=torch.float32)
+    page_bytes = cache[0].numel()
     for b in range(batch):
         for token in range(int(seq_lens[b].item())):
             page = int(block_tables[b, token // PAGE_SIZE].item())
             offset = token % PAGE_SIZE
-            k_token = cache[page, offset, 0]
-            k_payload = k_token[:PACKED_DIM]
-            k_scales = _decode_scale(k_token[PACKED_DIM : PACKED_DIM + GROUPS])
+            flat = cache[page].reshape(page_bytes)
+            k_payload = flat[offset * PACKED_DIM : (offset + 1) * PACKED_DIM]
+            scale_base = PAGE_SIZE * PACKED_DIM + offset * GROUPS
+            k_scales = _decode_scale(flat[scale_base : scale_base + GROUPS])
             score = 0.0
             for head in range(heads):
                 q_code = torch.stack(
@@ -65,9 +67,10 @@ def test_fp4_paged_mqa_logits(batch, heads):
     cache = torch.randint(
         0, 128, (4, PAGE_SIZE, 1, PACKED_DIM + GROUPS), device=device, dtype=torch.uint8
     )
-    cache[..., PACKED_DIM:] = torch.tensor(
+    # Real layout: [payload for every token of the page][UE8M0 scales for every token].
+    cache.view(4, -1)[:, PAGE_SIZE * PACKED_DIM :] = torch.tensor(
         [127, 128, 126, 127], device=device, dtype=torch.uint8
-    )
+    ).repeat(PAGE_SIZE)
     weight_scale = 0.75
     weights = torch.randn(batch, heads, device=device, dtype=torch.float32) * weight_scale
     seq_lens = torch.tensor([5, 3][:batch], device=device, dtype=torch.int32)

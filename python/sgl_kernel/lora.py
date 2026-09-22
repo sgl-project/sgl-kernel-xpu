@@ -592,8 +592,8 @@ def chunked_sgmv_lora_shrink_forward(
     output = torch.empty(
         (input_x.size(0), weights.size(1)), dtype=weights.dtype, device=weights.device
     )
-    # Call the kernel
-    return torch.ops.sgl_kernel.chunked_sgmv_lora_shrink_forward(
+    # Call the kernel (void op: writes into `output` in place)
+    torch.ops.sgl_kernel.chunked_sgmv_lora_shrink_forward(
         output,
         input_x,
         weights,
@@ -604,3 +604,5 @@ def chunked_sgmv_lora_shrink_forward(
         lora_ranks,
         permutation,
     )
+
+    return output

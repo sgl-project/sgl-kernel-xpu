@@ -766,16 +766,6 @@ void moe_grouped_mm_nt_xe20_w8a16(
     const torch::Tensor& total_rows_for_experts,
     const int64_t n_experts);
 
-// Backward compatibility alias for moe_grouped_mm_nt_xe20_w8a16
-void moe_grouped_mm_nt_xe20_fp8_w8a16(
-    torch::Tensor& output,
-    const torch::Tensor& activations,
-    const torch::Tensor& weights,
-    const torch::Tensor& weight_scales,
-    const std::optional<at::Tensor>& bias,
-    const torch::Tensor& total_rows_for_experts,
-    const int64_t n_experts);
-
 // Xe3 (CRI) plain bf16 grouped GEMM, tile heuristics tuned for Xe3.
 void moe_grouped_mm_nt_xe35(
     torch::Tensor& output,

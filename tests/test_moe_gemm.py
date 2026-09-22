@@ -1861,10 +1861,8 @@ def test_moe_grouped_mm_mxfp8_w8a16_subnormal_scale_byte0():
     assert error.max() <= expected.abs().max() * 2e-2
 
 
-def test_moe_grouped_mm_w8a16_corner_values_and_alias():
-    """Verify numerical behavior for boundary/corner values across FP8 and MXFP8,
-    and verify that moe_grouped_mm_nt_xe20_fp8_w8a16 is a faithful alias of
-    moe_grouped_mm_nt_xe20_w8a16:
+def test_moe_grouped_mm_w8a16_corner_values():
+    """Verify numerical behavior for boundary/corner values across FP8 and MXFP8:
     1. MXFP8 scale 255 (0xff) decodes to NaN and propagates cleanly.
     2. MXFP8 scale 255 on one expert isolates to that expert without corrupting others.
     3. MXFP8 scale 254 (0xfe = 2^127) computes accurately without overflow/underflow.
@@ -1873,7 +1871,6 @@ def test_moe_grouped_mm_w8a16_corner_values_and_alias():
     6. FP8 weight subnormal (2^-9) computes accurately without being flushed to 0.
     7. FP8 weight NaN (0x7f) propagates to NaN in output.
     8. Standard FP8 scalar / block scale 0.0f and NaN produce exact 0.0 and NaN.
-    9. The alias moe_grouped_mm_nt_xe20_fp8_w8a16 produces identical outputs.
     """
     torch.manual_seed(42)
     torch.xpu.manual_seed_all(42)
@@ -2017,17 +2014,6 @@ def test_moe_grouped_mm_w8a16_corner_values_and_alias():
         out128, act128, w128, scales_block_nan, None, rows, num_experts
     )
     assert torch.isnan(out128).all(), "Standard FP8 block scale NaN must produce NaN"
-
-    # 6. Verify alias moe_grouped_mm_nt_xe20_fp8_w8a16 produces identical result
-    out_ref = torch.empty((num_experts, gemm_n), device="xpu", dtype=torch.bfloat16)
-    out_alias = torch.empty((num_experts, gemm_n), device="xpu", dtype=torch.bfloat16)
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
-        out_ref, act128, w128, scales_block_zero, None, rows, num_experts
-    )
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
-        out_alias, act128, w128, scales_block_zero, None, rows, num_experts
-    )
-    torch.testing.assert_close(out_alias, out_ref)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

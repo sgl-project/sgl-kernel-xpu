@@ -16,19 +16,6 @@ _MOE_BIASED_TOPK_SCORING_MAP = {
     "sqrtsoftplus": 1,
 }
 
-if not hasattr(torch.ops.sgl_kernel, "moe_grouped_mm_nt_xe20_w8a16") and hasattr(
-    torch.ops.sgl_kernel, "moe_grouped_mm_nt_xe20_fp8_w8a16"
-):
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16 = (
-        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16
-    )
-elif not hasattr(torch.ops.sgl_kernel, "moe_grouped_mm_nt_xe20_fp8_w8a16") and hasattr(
-    torch.ops.sgl_kernel, "moe_grouped_mm_nt_xe20_w8a16"
-):
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16 = (
-        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16
-    )
-
 
 def _mxfp4_e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
     """Decode E8M0 exponent-byte MXFP4 block scales into fp32 direct
@@ -1011,12 +998,7 @@ def fused_experts(
             hidden_states.dtype,
             hidden_states.device,
         )
-        w8a16_gemm = getattr(
-            torch.ops.sgl_kernel,
-            "moe_grouped_mm_nt_xe20_w8a16",
-            getattr(torch.ops.sgl_kernel, "moe_grouped_mm_nt_xe20_fp8_w8a16", None),
-        )
-        w8a16_gemm(
+        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
             intermediate_cache1,
             input_A_shuffle,
             w1,
@@ -1057,7 +1039,7 @@ def fused_experts(
                     f"unsupported FP8 activation type: {activation_type}"
                 )
 
-        w8a16_gemm(
+        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
             intermediate_cache3,
             intermediate_cache2,
             w2,

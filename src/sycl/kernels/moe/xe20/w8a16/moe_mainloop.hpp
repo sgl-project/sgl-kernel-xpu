@@ -501,27 +501,4 @@ struct W8A16Mainloop<
   }
 };
 
-template <
-    class DispatchPolicy_,
-    class TiledCopyA_,
-    class TiledCopyBPacked_,
-    class TiledCopyD_,
-    class ATensor_,
-    class BPackedTensor_,
-    class DTensor_,
-    class TiledMMA_,
-    bool WeightScalePerExpert = false,
-    bool WeightScaleBlocked = false>
-using Fp8W8A16Mainloop = W8A16Mainloop<
-    DispatchPolicy_,
-    TiledCopyA_,
-    TiledCopyBPacked_,
-    TiledCopyD_,
-    ATensor_,
-    BPackedTensor_,
-    DTensor_,
-    TiledMMA_,
-    WeightScalePerExpert,
-    WeightScaleBlocked>;
-
 }  // namespace moe_w8a16

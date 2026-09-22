@@ -210,16 +210,4 @@ class W8A16Kernel {
   };
 };
 
-template <
-    typename Tile,
-    typename SGLayout,
-    typename TensorA,
-    typename TensorBPacked,
-    typename TensorD,
-    typename TiledMMA,
-    bool WeightScalePerExpert = false,
-    bool WeightScaleBlocked = false>
-using Fp8W8A16Kernel =
-    W8A16Kernel<Tile, SGLayout, TensorA, TensorBPacked, TensorD, TiledMMA, WeightScalePerExpert, WeightScaleBlocked>;
-
 }  // namespace moe_w8a16

@@ -347,11 +347,11 @@ def _run_cutlass_once(args: Dict[str, Any]):
         input_x=args["input_x"],
         weights=args["weights"],
         stack_num=int(args["stack_num"]),
+        num_segments=int(seg["num_segments"]),
         seg_indptr=seg["seg_indptr"],
         weight_indices=seg["weight_indices"],
         lora_ranks=args["lora_ranks"],
         permutation=args["permutation"],
-        seg_lens=seg["seg_lens"],
     )
 
 

@@ -44,6 +44,7 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
+#include "sgl_kernel_export.h"
 
 using namespace cute;
 
@@ -259,7 +260,7 @@ static cutlass::Status run_gemm(
 }
 
 // dsv3_fused_a_gemm with hardcoded specialization (K=7168, N in {2048, 2112}, 1<=M<=16)
-void dsv3_fused_a_gemm_xpu(at::Tensor& output, const at::Tensor& mat_a, const at::Tensor& mat_b) {
+SGL_KERNEL_EXPORT void dsv3_fused_a_gemm_xpu(at::Tensor& output, const at::Tensor& mat_a, const at::Tensor& mat_b) {
   const int M = mat_a.size(0);   // num_tokens
   const int K = mat_a.size(1);   // in_features
   const int Kb = mat_b.size(0);  // rows of B (K)

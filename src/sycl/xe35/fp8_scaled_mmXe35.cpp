@@ -46,6 +46,7 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
+#include "sgl_kernel_export.h"
 
 #define CUTLASS_CHECK(status)              \
   {                                        \
@@ -319,7 +320,7 @@ cutlass::Status run_fp8_scaled_gemm_dispatch(
 // out_dtype: float32, bfloat16, or float16
 // bias: optional [M] in out_dtype per-row bias
 // Returns: [M, N] tensor in out_dtype = diag(scale_a) @ (A @ B^T) @ diag(scale_b) + bias
-torch::Tensor fp8_scaled_mm_xpu(
+SGL_KERNEL_EXPORT torch::Tensor fp8_scaled_mm_xpu(
     const torch::Tensor& mat_a,
     const torch::Tensor& mat_b,
     const torch::Tensor& scale_a,

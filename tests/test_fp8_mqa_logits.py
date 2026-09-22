@@ -379,68 +379,64 @@ def test_fp8_paged_mqa_logits_3d_input():
     torch.testing.assert_close(out_3d, out_4d)
 
 
-def test_fp8_paged_mqa_logits_multi_chunk_batch():
-    """Batch-chunking loop (chunk_b < B, multiple gather/GEMM/reduce launches
-    per call) is numerically correct, including at the chunk boundary.
-
-    Forces a tiny per-call chunk budget via the env var, in a fresh
-    subprocess: the C++ side caches the budget in a function-local
-    `static const` on first use, so setting the env var in-process would
-    have no effect once any earlier test in this file has already invoked
-    the op (as several do, with the default budget). With the chosen shape
-    (B=8, H=256, D=128, page_size=max_seq_len=128) and a 1MiB budget,
-    per_batch_bytes=144128 so chunk_b=7, i.e. two unequal chunks (7 + 1).
+def _run_multi_chunk_case():
+    """Subprocess entrypoint: build inputs, run the op, check vs reference.
+    Called in test_multi_chunk_batch() below.
     """
-    tests_dir = os.path.dirname(os.path.abspath(__file__))
-    script = f"""
-import sys
-sys.path.insert(0, {tests_dir!r})
-import torch
-import sgl_kernel  # noqa: F401 -- triggers op registration
-from test_fp8_mqa_logits import (
-    make_fp8_tensor,
-    make_kv_cache,
-    reference_fp8_paged_mqa_logits,
-)
+    device = "xpu"
+    B, H, D, page_size = 8, 256, 128, 128
+    max_num_blocks = 1
+    max_seq_len = max_num_blocks * page_size
+    num_pages = 2
 
-device = "xpu"
-B, H, D, page_size = 8, 256, 128, 128
-max_num_blocks = 1
-max_seq_len = max_num_blocks * page_size  # 128
-num_pages = 2
+    kv_cache = make_kv_cache(num_pages, page_size, D, device)
+    q = make_fp8_tensor((B, 1, H, D), device)
+    weights = torch.rand(B, H, dtype=torch.float32, device=device)
+    seq_lens = torch.tensor(
+        [32, 64, 96, 128, 32, 64, 96, 128][:B], dtype=torch.int32, device=device
+    )
+    block_tables = torch.zeros(B, max_num_blocks, dtype=torch.int32, device=device)
 
-kv_cache = make_kv_cache(num_pages, page_size, D, device)
-q = make_fp8_tensor((B, 1, H, D), device)
-weights = torch.rand(B, H, dtype=torch.float32, device=device)
-# Varied per-batch seq_lens so the chunk boundary (batch 7) also crosses a
-# change in per-batch masking.
-seq_lens = torch.tensor(
-    [32, 64, 96, 128, 32, 64, 96, 128][:B], dtype=torch.int32, device=device
-)
-block_tables = torch.zeros(B, max_num_blocks, dtype=torch.int32, device=device)
+    logits = torch.ops.sgl_kernel.fp8_paged_mqa_logits.default(
+        q.view(torch.uint8),
+        kv_cache,
+        weights,
+        seq_lens,
+        block_tables,
+        None,
+        max_seq_len,
+        True,
+    )
+    ref = reference_fp8_paged_mqa_logits(
+        q, kv_cache, weights, seq_lens, block_tables, max_seq_len, page_size, D
+    )
+    torch.testing.assert_close(logits.cpu(), ref, rtol=2e-3, atol=0.1)
+    print("MULTI_CHUNK_OK")
 
-logits = torch.ops.sgl_kernel.fp8_paged_mqa_logits.default(
-    q.view(torch.uint8), kv_cache, weights, seq_lens, block_tables, None, max_seq_len, True,
-)
-ref = reference_fp8_paged_mqa_logits(
-    q, kv_cache, weights, seq_lens, block_tables, max_seq_len, page_size, D,
-)
-torch.testing.assert_close(logits.cpu(), ref, rtol=2e-3, atol=0.1)
-print("MULTI_CHUNK_OK")
-"""
-    env = dict(os.environ)
-    env["SGL_KERNEL_FP8_PAGED_MQA_CHUNK_MB"] = "1"
+
+def test_multi_chunk_batch():
+    """Covers the batch-chunking loop (chunk_b < B), untested elsewhere.
+
+    Runs in a subprocess: the chunk budget is a C++ static set on first
+    use, so an in-process env var change may not take effect. Shape
+    (B=8, H=256, msl=128) with a 1MiB budget yields chunk_b=7 (2 chunks).
+    """
+    env = dict(os.environ, SGL_KERNEL_FP8_PAGED_MQA_CHUNK_MB="1")
     result = subprocess.run(
-        [sys.executable, "-c", script],
+        [
+            sys.executable,
+            "-c",
+            "from test_fp8_mqa_logits import _run_multi_chunk_case; "
+            "_run_multi_chunk_case()",
+        ],
         env=env,
+        cwd=os.path.dirname(os.path.abspath(__file__)),
         capture_output=True,
         text=True,
         timeout=120,
     )
-    assert result.returncode == 0 and "MULTI_CHUNK_OK" in result.stdout, (
-        "multi-chunk batch subprocess failed:\n"
-        f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
-    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert "MULTI_CHUNK_OK" in result.stdout
 
 
 if __name__ == "__main__":

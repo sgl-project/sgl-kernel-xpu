@@ -36,7 +36,7 @@ template <
     typename TiledMMA,
     bool WeightScalePerExpert = false,
     bool WeightScaleBlocked = false>
-class Fp8W8A16Kernel {
+class W8A16Kernel {
  public:
   using ElementA = cutlass::bfloat16_t;
   using ElementD = cutlass::bfloat16_t;
@@ -47,7 +47,7 @@ class Fp8W8A16Kernel {
 
   constexpr static int Stages = 3;
   using MainloopDispatchPolicy = moe_w8a16::W8A16MainloopPolicy<Stages>;
-  using CollectiveMainloop = Fp8W8A16Mainloop<
+  using CollectiveMainloop = W8A16Mainloop<
       MainloopDispatchPolicy,
       TiledCopyA,
       TiledCopyBPacked,
@@ -209,4 +209,17 @@ class Fp8W8A16Kernel {
     }
   };
 };
+
+template <
+    typename Tile,
+    typename SGLayout,
+    typename TensorA,
+    typename TensorBPacked,
+    typename TensorD,
+    typename TiledMMA,
+    bool WeightScalePerExpert = false,
+    bool WeightScaleBlocked = false>
+using Fp8W8A16Kernel =
+    W8A16Kernel<Tile, SGLayout, TensorA, TensorBPacked, TensorD, TiledMMA, WeightScalePerExpert, WeightScaleBlocked>;
+
 }  // namespace moe_w8a16

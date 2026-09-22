@@ -1500,7 +1500,7 @@ def test_moe_grouped_mm_fp8_w8a16_scalar_scales(
     ).to(torch.bfloat16)
 
     output = torch.empty((total_rows, gemm_n), device="xpu", dtype=torch.bfloat16)
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
         output,
         activations.to("xpu"),
         weights.to("xpu"),
@@ -1546,7 +1546,7 @@ def test_moe_grouped_mm_fp8_w8a16_heterogeneous_block_scales(rows_per_expert):
     reference = torch.cat(reference_parts, dim=0).to(torch.bfloat16)
 
     output = torch.empty((total_rows, gemm_n), device="xpu", dtype=torch.bfloat16)
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
         output,
         activations.to("xpu"),
         weights_fp8.to("xpu"),
@@ -1750,7 +1750,7 @@ def test_moe_grouped_mm_mxfp8_w8a16_heterogeneous_block_scales(
     reference = torch.cat(reference_parts, dim=0).to(torch.bfloat16)
 
     output = torch.empty((total_rows, gemm_n), device="xpu", dtype=torch.bfloat16)
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
         output,
         activations.to("xpu"),
         weights_fp8.to("xpu"),
@@ -1794,7 +1794,7 @@ def test_moe_grouped_mm_mxfp8_w8a16_subnormal_scale_byte0():
         (num_experts, gemm_n), device="xpu", dtype=torch.bfloat16
     )
 
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
         out_isolated,
         act_ones,
         w_ones,
@@ -1845,7 +1845,7 @@ def test_moe_grouped_mm_mxfp8_w8a16_subnormal_scale_byte0():
     ).to(torch.bfloat16)
 
     output = torch.empty((num_experts, gemm_n), device="xpu", dtype=torch.bfloat16)
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
         output,
         act.to("xpu"),
         weights_fp8.to("xpu"),
@@ -1859,6 +1859,175 @@ def test_moe_grouped_mm_mxfp8_w8a16_subnormal_scale_byte0():
     error = (actual - expected).abs()
     assert error.mean() <= expected.abs().mean() * 1e-2
     assert error.max() <= expected.abs().max() * 2e-2
+
+
+def test_moe_grouped_mm_w8a16_corner_values_and_alias():
+    """Verify numerical behavior for boundary/corner values across FP8 and MXFP8,
+    and verify that moe_grouped_mm_nt_xe20_fp8_w8a16 is a faithful alias of
+    moe_grouped_mm_nt_xe20_w8a16:
+    1. MXFP8 scale 255 (0xff) decodes to NaN and propagates cleanly.
+    2. MXFP8 scale 255 on one expert isolates to that expert without corrupting others.
+    3. MXFP8 scale 254 (0xfe = 2^127) computes accurately without overflow/underflow.
+    4. FP8 weight +/-0.0 both produce exact 0.0.
+    5. FP8 weight max magnitude 448.0 computes accurately.
+    6. FP8 weight subnormal (2^-9) computes accurately without being flushed to 0.
+    7. FP8 weight NaN (0x7f) propagates to NaN in output.
+    8. Standard FP8 scalar / block scale 0.0f and NaN produce exact 0.0 and NaN.
+    9. The alias moe_grouped_mm_nt_xe20_fp8_w8a16 produces identical outputs.
+    """
+    torch.manual_seed(42)
+    torch.xpu.manual_seed_all(42)
+    num_experts = 8
+    gemm_n = 128
+    gemm_k = 64
+    rows = torch.full((num_experts,), 1, device="xpu", dtype=torch.int32)
+    act_ones = torch.ones((num_experts, gemm_k), device="xpu", dtype=torch.bfloat16)
+    w_ones = torch.ones((num_experts, gemm_n, gemm_k), device="xpu").to(
+        torch.float8_e4m3fn
+    )
+
+    # 1. MXFP8 scale 255 (0xff -> NaN)
+    scales_nan = torch.full(
+        (num_experts, gemm_n, 2), 255, device="xpu", dtype=torch.uint8
+    )
+    out_nan = torch.empty((num_experts, gemm_n), device="xpu", dtype=torch.bfloat16)
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
+        out_nan, act_ones, w_ones, scales_nan, None, rows, num_experts
+    )
+    assert torch.isnan(out_nan).all(), "MXFP8 scale 255 (0xff) must produce NaN"
+
+    # 2. MXFP8 isolated NaN
+    scales_iso = torch.full(
+        (num_experts, gemm_n, 2), 127, device="xpu", dtype=torch.uint8
+    )
+    scales_iso[2, :, :] = 255
+    out_iso = torch.empty((num_experts, gemm_n), device="xpu", dtype=torch.bfloat16)
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
+        out_iso, act_ones, w_ones, scales_iso, None, rows, num_experts
+    )
+    assert torch.isnan(out_iso[2]).all(), "Expert 2 output must be NaN"
+    assert (
+        torch.isfinite(out_iso[:2]).all() and torch.isfinite(out_iso[3:]).all()
+    ), "Other experts must remain finite and uncontaminated"
+
+    # 3. MXFP8 scale 254 (0xfe = 2^127)
+    act_small = torch.full(
+        (num_experts, gemm_k), 2.0**-60, device="xpu", dtype=torch.bfloat16
+    )
+    w_small = torch.full((num_experts, gemm_n, gemm_k), 0.015625, device="xpu").to(
+        torch.float8_e4m3fn
+    )
+    scales_254 = torch.full(
+        (num_experts, gemm_n, 2), 254, device="xpu", dtype=torch.uint8
+    )
+    out_254 = torch.empty((num_experts, gemm_n), device="xpu", dtype=torch.bfloat16)
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
+        out_254, act_small, w_small, scales_254, None, rows, num_experts
+    )
+    expected_254 = gemm_k * (2.0**-60) * 0.015625 * (2.0**127)  # 2^67
+    assert torch.allclose(out_254, torch.full_like(out_254, expected_254), rtol=1e-2)
+
+    # 4. FP8 weight +/-0.0, max magnitude 448.0, subnormal, NaN
+    scales_127 = torch.full(
+        (num_experts, gemm_n, 2), 127, device="xpu", dtype=torch.uint8
+    )
+    w_pos_zero = torch.zeros((num_experts, gemm_n, gemm_k), device="xpu").to(
+        torch.float8_e4m3fn
+    )
+    w_neg_zero = torch.full(
+        (num_experts, gemm_n, gemm_k), 0x80, device="xpu", dtype=torch.uint8
+    ).view(torch.float8_e4m3fn)
+    out_zero = torch.empty((num_experts, gemm_n), device="xpu", dtype=torch.bfloat16)
+
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
+        out_zero, act_ones, w_pos_zero, scales_127, None, rows, num_experts
+    )
+    assert (out_zero == 0.0).all(), "+0.0 weight must yield exact 0.0"
+
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
+        out_zero, act_ones, w_neg_zero, scales_127, None, rows, num_experts
+    )
+    assert (out_zero == 0.0).all(), "-0.0 weight must yield exact 0.0"
+
+    w_max = torch.full((num_experts, gemm_n, gemm_k), 448.0, device="xpu").to(
+        torch.float8_e4m3fn
+    )
+    out_test = torch.empty((num_experts, gemm_n), device="xpu", dtype=torch.bfloat16)
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
+        out_test, act_ones, w_max, scales_127, None, rows, num_experts
+    )
+    assert torch.allclose(
+        out_test, torch.full_like(out_test, 448.0 * gemm_k), rtol=1e-2
+    )
+
+    w_sub = torch.full((num_experts, gemm_n, gemm_k), 0.001953125, device="xpu").to(
+        torch.float8_e4m3fn
+    )
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
+        out_test, act_ones, w_sub, scales_127, None, rows, num_experts
+    )
+    assert torch.allclose(
+        out_test, torch.full_like(out_test, 0.001953125 * gemm_k), rtol=1e-2
+    )
+
+    w_nan = torch.full(
+        (num_experts, gemm_n, gemm_k), 0x7F, device="xpu", dtype=torch.uint8
+    ).view(torch.float8_e4m3fn)
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
+        out_test, act_ones, w_nan, scales_127, None, rows, num_experts
+    )
+    assert torch.isnan(out_test).all(), "FP8 weight NaN must propagate to NaN"
+
+    # 5. Standard FP8 (FP32 scalar and 128x128 block scales: 0.0f and NaN)
+    scales_scalar_zero = torch.zeros(
+        (num_experts, 1), device="xpu", dtype=torch.float32
+    )
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
+        out_test, act_ones, w_ones, scales_scalar_zero, None, rows, num_experts
+    )
+    assert (out_test == 0.0).all(), "Standard FP8 scalar scale 0.0f must produce 0.0"
+
+    scales_scalar_nan = torch.full(
+        (num_experts, 1), float("nan"), device="xpu", dtype=torch.float32
+    )
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
+        out_test, act_ones, w_ones, scales_scalar_nan, None, rows, num_experts
+    )
+    assert torch.isnan(out_test).all(), "Standard FP8 scalar scale NaN must produce NaN"
+
+    # 128x128 block scales require gemm_k >= 128 and K % 128 == 0
+    act128 = torch.ones((num_experts, 128), device="xpu", dtype=torch.bfloat16)
+    w128 = torch.ones((num_experts, gemm_n, 128), device="xpu").to(torch.float8_e4m3fn)
+    scales_block_zero = torch.zeros(
+        (num_experts, (gemm_n + 127) // 128, 1), device="xpu", dtype=torch.float32
+    )
+    out128 = torch.empty((num_experts, gemm_n), device="xpu", dtype=torch.bfloat16)
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
+        out128, act128, w128, scales_block_zero, None, rows, num_experts
+    )
+    assert (out128 == 0.0).all(), "Standard FP8 block scale 0.0f must produce 0.0"
+
+    scales_block_nan = torch.full(
+        (num_experts, (gemm_n + 127) // 128, 1),
+        float("nan"),
+        device="xpu",
+        dtype=torch.float32,
+    )
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
+        out128, act128, w128, scales_block_nan, None, rows, num_experts
+    )
+    assert torch.isnan(out128).all(), "Standard FP8 block scale NaN must produce NaN"
+
+    # 6. Verify alias moe_grouped_mm_nt_xe20_fp8_w8a16 produces identical result
+    out_ref = torch.empty((num_experts, gemm_n), device="xpu", dtype=torch.bfloat16)
+    out_alias = torch.empty((num_experts, gemm_n), device="xpu", dtype=torch.bfloat16)
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
+        out_ref, act128, w128, scales_block_zero, None, rows, num_experts
+    )
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
+        out_alias, act128, w128, scales_block_zero, None, rows, num_experts
+    )
+    torch.testing.assert_close(out_alias, out_ref)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

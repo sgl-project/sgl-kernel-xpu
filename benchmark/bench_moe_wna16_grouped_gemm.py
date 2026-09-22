@@ -235,7 +235,7 @@ def _prepare_w8_inputs(num_experts, avg_m, gemm_n, gemm_k, scale_layout):
 
 
 def _run_w8(inputs):
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
         inputs["output"],
         inputs["activations"],
         inputs["weights"],

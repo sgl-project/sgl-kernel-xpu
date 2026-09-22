@@ -272,27 +272,27 @@ bool w4a16_grouped_gemm_launch(
 }
 
 // ---------------------------------------------------------------------------
-// FP8 W8A16 grouped GEMM.
+// W8A16 grouped GEMM.
 // ---------------------------------------------------------------------------
 
 namespace {
 
-using Fp8W8A16Fn = void (*)(
+using W8A16Fn = void (*)(
     void*, const void*, const void*, const void*, const void*, void*, int, int, const int*, int, int*, int, int, bool);
 
-struct Fp8TileCfg {
+struct W8A16TileCfg {
   const char* tile;
   const char* sglayout;
 };
 
-constexpr Fp8TileCfg kFp8Tiles[] = {
+constexpr W8A16TileCfg kW8A16Tiles[] = {
     {"Shape<_16, _64, _32>", "Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>"},
     {"Shape<_32, _64, _32>", "Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>"},
     {"Shape<_64, _64, _32>", "Layout<Shape<_2, _4, _1>, Stride<_4, _1, _0>>"},
     {"Shape<_128, _128, _16>", "Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>"},
 };
 
-int fp8_tile_id(int avg_m, int gemm_k, int gemm_n, int scale_mode) {
+int w8a16_tile_id(int avg_m, int gemm_k, int gemm_n, int scale_mode) {
   using moe_w8a16::ScaleMode;
   if (moe_w8a16::is_block_scale_mode(scale_mode)) {
     if (avg_m <= 4) return 0;
@@ -309,17 +309,17 @@ int fp8_tile_id(int avg_m, int gemm_k, int gemm_n, int scale_mode) {
   return 3;
 }
 
-uint64_t pack_fp8_w8a16_key(int tile_id, bool block_scale, int arch) {
+uint64_t pack_w8a16_key(int tile_id, bool block_scale, int arch) {
   uint64_t key = static_cast<uint64_t>(arch) & 0xFF;
   key = (key << 8) | (static_cast<uint64_t>(tile_id) & 0xFF);
   key = (key << 1) | (block_scale ? 1u : 0u);
   return key;
 }
 
-jit::JitFnCache<Fp8W8A16Fn> g_fp8_w8a16_fns("FP8 W8A16 grouped GEMM");
+jit::JitFnCache<W8A16Fn> g_w8a16_fns("W8A16 grouped GEMM");
 
-Fp8W8A16Fn resolve_fp8_w8a16(int tile_id, bool block_scale, int arch, std::string* err) {
-  const uint64_t key = pack_fp8_w8a16_key(tile_id, block_scale, arch);
+W8A16Fn resolve_w8a16(int tile_id, bool block_scale, int arch, std::string* err) {
+  const uint64_t key = pack_w8a16_key(tile_id, block_scale, arch);
   auto build = [&](std::string* build_err) -> void* {
     const jit::JitConfig& cfg = jit::default_config();
     if (!cfg.valid) {
@@ -333,23 +333,23 @@ Fp8W8A16Fn resolve_fp8_w8a16(int tile_id, bool block_scale, int arch, std::strin
 
     jit::CompileSpec spec;
     spec.template_path = cfg.src_root + "/sycl/GroupGemmW8A16Xe20LauncherInstance.cpp.in";
-    spec.subs["TILE"] = kFp8Tiles[tile_id].tile;
-    spec.subs["SGLAYOUT"] = kFp8Tiles[tile_id].sglayout;
+    spec.subs["TILE"] = kW8A16Tiles[tile_id].tile;
+    spec.subs["SGLAYOUT"] = kW8A16Tiles[tile_id].sglayout;
     spec.subs["WEIGHT_SCALE_BLOCKED"] = block_scale ? "true" : "false";
-    const jit::ArchSpec arch_spec = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_FP8_W8A16_JIT_ENTRY");
+    const jit::ArchSpec arch_spec = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_W8A16_JIT_ENTRY");
     spec.extra_flags = arch_spec.extra_flags;
     spec.target = arch_spec.target;
-    spec.entry_symbol = "sgl_moe_fp8_w8a16_entry";
-    spec.name = std::string("group_gemm_fp8_w8a16_t") + std::to_string(tile_id) +
-                (block_scale ? "_block_" : "_scalar_") + arch_spec.suffix;
+    spec.entry_symbol = "sgl_moe_w8a16_entry";
+    spec.name = std::string("group_gemm_w8a16_t") + std::to_string(tile_id) + (block_scale ? "_block_" : "_scalar_") +
+                arch_spec.suffix;
     return jit::get_or_compile(spec, cfg, build_err);
   };
-  return g_fp8_w8a16_fns.get(key, build, err);
+  return g_w8a16_fns.get(key, build, err);
 }
 
 }  // namespace
 
-bool fp8_w8a16_grouped_gemm_launch(
+bool w8a16_grouped_gemm_launch(
     int avg_m,
     int scale_mode,
     void* queue,
@@ -367,8 +367,8 @@ bool fp8_w8a16_grouped_gemm_launch(
     bool static_scheduler,
     int arch,
     std::string* err) {
-  const int tile_id = fp8_tile_id(avg_m, gemm_k, gemm_n, scale_mode);
-  Fp8W8A16Fn fn = resolve_fp8_w8a16(tile_id, moe_w8a16::is_block_scale_mode(scale_mode), arch, err);
+  const int tile_id = w8a16_tile_id(avg_m, gemm_k, gemm_n, scale_mode);
+  W8A16Fn fn = resolve_w8a16(tile_id, moe_w8a16::is_block_scale_mode(scale_mode), arch, err);
   if (!fn) return false;
   fn(queue,
      activations,

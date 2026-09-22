@@ -14,10 +14,10 @@
 using namespace cute;
 
 template <typename, typename, typename, typename, typename, typename, bool>
-class GemmXe20Fp8W8A16Name;
+class GemmXe20W8A16Name;
 
 template <typename Tile, typename SGLayout, bool WeightScaleBlocked>
-void Xe20MoEGEMMFp8W8A16Launcher(
+void Xe20MoEGEMMW8A16Launcher(
     sycl::queue q,
     const void* activations,
     const void* weights,
@@ -54,7 +54,7 @@ void Xe20MoEGEMMFp8W8A16Launcher(
   namespace syclex = sycl::ext::oneapi::experimental;
   namespace intelex = sycl::ext::intel::experimental;
   syclex::properties kernel_props{syclex::sub_group_size<16>, intelex::grf_size<256>};
-  using Kernel = moe_w8a16::Fp8W8A16Kernel<
+  using Kernel = moe_w8a16::W8A16Kernel<
       Tile,
       SGLayout,
       TensorA,
@@ -80,7 +80,7 @@ void Xe20MoEGEMMFp8W8A16Launcher(
       static_scheduler};
   q.submit([&](sycl::handler& h) {
     sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), h);
-    h.parallel_for<GemmXe20Fp8W8A16Name<
+    h.parallel_for<GemmXe20W8A16Name<
       Tile, SGLayout, TensorA, TensorBPacked, TensorD, ElementD, WeightScaleBlocked>>(
         sycl::nd_range<3>(global * local, local), kernel_props, [=](sycl::nd_item<3> item) {
           int32_t* slm_mem =
@@ -90,13 +90,13 @@ void Xe20MoEGEMMFp8W8A16Launcher(
   });
 }
 
-template __attribute__((visibility("default"))) void Xe20MoEGEMMFp8W8A16Launcher<
+template __attribute__((visibility("default"))) void Xe20MoEGEMMW8A16Launcher<
   @TILE@, @SGLAYOUT@, @WEIGHT_SCALE_BLOCKED@>(
     sycl::queue, const void*, const void*, const void*, const void*, void*, const int, const int,
     const int*, const int, int*, int, int, bool);
 
-  #ifdef SGL_FP8_W8A16_JIT_ENTRY
-  extern "C" __attribute__((visibility("default"))) void sgl_moe_fp8_w8a16_entry(
+#ifdef SGL_W8A16_JIT_ENTRY
+extern "C" __attribute__((visibility("default"))) void sgl_moe_w8a16_entry(
     void* queue_ptr,
     const void* activations,
     const void* weights,
@@ -111,7 +111,7 @@ template __attribute__((visibility("default"))) void Xe20MoEGEMMFp8W8A16Launcher
     int ld_b,
     int scale_mode,
     bool static_scheduler) {
-    Xe20MoEGEMMFp8W8A16Launcher<@TILE@, @SGLAYOUT@, @WEIGHT_SCALE_BLOCKED@>(
+  Xe20MoEGEMMW8A16Launcher<@TILE@, @SGLAYOUT@, @WEIGHT_SCALE_BLOCKED@>(
       *static_cast<sycl::queue*>(queue_ptr),
       activations,
       weights,
@@ -126,7 +126,7 @@ template __attribute__((visibility("default"))) void Xe20MoEGEMMFp8W8A16Launcher
       ld_b,
       scale_mode,
       static_scheduler);
-  }
-  #endif
+}
+#endif
 
 #undef SYCL_INTEL_TARGET

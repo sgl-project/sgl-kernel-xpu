@@ -59,7 +59,7 @@ template <
     class TiledMMA_,
     bool WeightScalePerExpert = false,
     bool WeightScaleBlocked = false>
-struct Fp8W8A16Mainloop {
+struct W8A16Mainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
 
@@ -74,7 +74,7 @@ template <
     class TiledMMA_,
     bool WeightScalePerExpert,
     bool WeightScaleBlocked>
-struct Fp8W8A16Mainloop<
+struct W8A16Mainloop<
     W8A16MainloopPolicy<Stages>,
     TiledCopyA_,
     TiledCopyBPacked_,
@@ -93,7 +93,7 @@ struct Fp8W8A16Mainloop<
   using BPackedTensor = BPackedTensor_;
   using DTensor = DTensor_;
 
-  Fp8W8A16Mainloop() {}
+  W8A16Mainloop() {}
 
   template <typename Coord>
   CUTLASS_DEVICE void run_w8a16_block(
@@ -500,5 +500,28 @@ struct Fp8W8A16Mainloop<
     }
   }
 };
+
+template <
+    class DispatchPolicy_,
+    class TiledCopyA_,
+    class TiledCopyBPacked_,
+    class TiledCopyD_,
+    class ATensor_,
+    class BPackedTensor_,
+    class DTensor_,
+    class TiledMMA_,
+    bool WeightScalePerExpert = false,
+    bool WeightScaleBlocked = false>
+using Fp8W8A16Mainloop = W8A16Mainloop<
+    DispatchPolicy_,
+    TiledCopyA_,
+    TiledCopyBPacked_,
+    TiledCopyD_,
+    ATensor_,
+    BPackedTensor_,
+    DTensor_,
+    TiledMMA_,
+    WeightScalePerExpert,
+    WeightScaleBlocked>;
 
 }  // namespace moe_w8a16

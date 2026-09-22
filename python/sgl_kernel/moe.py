@@ -16,6 +16,19 @@ _MOE_BIASED_TOPK_SCORING_MAP = {
     "sqrtsoftplus": 1,
 }
 
+if not hasattr(torch.ops.sgl_kernel, "moe_grouped_mm_nt_xe20_w8a16") and hasattr(
+    torch.ops.sgl_kernel, "moe_grouped_mm_nt_xe20_fp8_w8a16"
+):
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16 = (
+        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16
+    )
+elif not hasattr(torch.ops.sgl_kernel, "moe_grouped_mm_nt_xe20_fp8_w8a16") and hasattr(
+    torch.ops.sgl_kernel, "moe_grouped_mm_nt_xe20_w8a16"
+):
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16 = (
+        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16
+    )
+
 
 def _mxfp4_e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
     """Decode E8M0 exponent-byte MXFP4 block scales into fp32 direct
@@ -666,7 +679,7 @@ def fused_experts(
     use_fp8_weight = use_fp8_w8a8 or (w1.dtype == torch.float8_e4m3fn)
     assert not (
         use_fp8_weight and is_xe3_arch()
-    ), "the FP8 W8A16 grouped GEMM (moe_grouped_mm_nt_xe20_fp8_w8a16) is not yet ported to CRI (Xe3)"
+    ), "the W8A16 grouped GEMM (moe_grouped_mm_nt_xe20_w8a16) is not yet ported to CRI (Xe3)"
     assert a1_scale is None, (
         "prequantized FP8 activation input is not supported: " "a1_scale must be None"
     )
@@ -998,7 +1011,12 @@ def fused_experts(
             hidden_states.dtype,
             hidden_states.device,
         )
-        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
+        w8a16_gemm = getattr(
+            torch.ops.sgl_kernel,
+            "moe_grouped_mm_nt_xe20_w8a16",
+            getattr(torch.ops.sgl_kernel, "moe_grouped_mm_nt_xe20_fp8_w8a16", None),
+        )
+        w8a16_gemm(
             intermediate_cache1,
             input_A_shuffle,
             w1,
@@ -1039,7 +1057,7 @@ def fused_experts(
                     f"unsupported FP8 activation type: {activation_type}"
                 )
 
-        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
+        w8a16_gemm(
             intermediate_cache3,
             intermediate_cache2,
             w2,

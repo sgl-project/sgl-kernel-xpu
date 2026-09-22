@@ -19,7 +19,7 @@
 using namespace cute;
 
 template <typename Tile, typename SGLayout, bool WeightScaleBlocked>
-__attribute__((visibility("default"))) void Xe20MoEGEMMFp8W8A16Launcher(
+__attribute__((visibility("default"))) void Xe20MoEGEMMW8A16Launcher(
     sycl::queue q,
     const void* activations,
     const void* weights,
@@ -46,83 +46,83 @@ using SG_1_4_1 = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
 using SG_2_4_1 = Layout<Shape<_2, _4, _1>, Stride<_4, _1, _0>>;
 using SG_4_2_1 = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
 
-#define DECLARE_XE20_MOE_FP8_W8A16_EXTERN(Tile, SGLayout, WeightScaleBlocked)           \
-  extern template void Xe20MoEGEMMFp8W8A16Launcher<Tile, SGLayout, WeightScaleBlocked>( \
-      sycl::queue,                                                                      \
-      const void*,                                                                      \
-      const void*,                                                                      \
-      const void*,                                                                      \
-      const void*,                                                                      \
-      void*,                                                                            \
-      const int,                                                                        \
-      const int,                                                                        \
-      const int*,                                                                       \
-      const int,                                                                        \
-      int*,                                                                             \
-      int,                                                                              \
-      int,                                                                              \
+#define DECLARE_XE20_MOE_W8A16_EXTERN(Tile, SGLayout, WeightScaleBlocked)            \
+  extern template void Xe20MoEGEMMW8A16Launcher<Tile, SGLayout, WeightScaleBlocked>( \
+      sycl::queue,                                                                   \
+      const void*,                                                                   \
+      const void*,                                                                   \
+      const void*,                                                                   \
+      const void*,                                                                   \
+      void*,                                                                         \
+      const int,                                                                     \
+      const int,                                                                     \
+      const int*,                                                                    \
+      const int,                                                                     \
+      int*,                                                                          \
+      int,                                                                           \
+      int,                                                                           \
       bool);
 
-#define DECLARE_XE20_MOE_FP8_W8A16_ALL_SCALE_VARIANTS(Tile, SGLayout) \
-  DECLARE_XE20_MOE_FP8_W8A16_EXTERN(Tile, SGLayout, false)            \
-  DECLARE_XE20_MOE_FP8_W8A16_EXTERN(Tile, SGLayout, true)
+#define DECLARE_XE20_MOE_W8A16_ALL_SCALE_VARIANTS(Tile, SGLayout) \
+  DECLARE_XE20_MOE_W8A16_EXTERN(Tile, SGLayout, false)            \
+  DECLARE_XE20_MOE_W8A16_EXTERN(Tile, SGLayout, true)
 
-DECLARE_XE20_MOE_FP8_W8A16_ALL_SCALE_VARIANTS(Tile_16_64_32, SG_1_4_1)
-DECLARE_XE20_MOE_FP8_W8A16_ALL_SCALE_VARIANTS(Tile_32_64_32, SG_1_4_1)
-DECLARE_XE20_MOE_FP8_W8A16_EXTERN(Tile_64_64_32, SG_2_4_1, false)
-DECLARE_XE20_MOE_FP8_W8A16_ALL_SCALE_VARIANTS(Tile_128_128_16, SG_4_2_1)
+DECLARE_XE20_MOE_W8A16_ALL_SCALE_VARIANTS(Tile_16_64_32, SG_1_4_1)
+DECLARE_XE20_MOE_W8A16_ALL_SCALE_VARIANTS(Tile_32_64_32, SG_1_4_1)
+DECLARE_XE20_MOE_W8A16_EXTERN(Tile_64_64_32, SG_2_4_1, false)
+DECLARE_XE20_MOE_W8A16_ALL_SCALE_VARIANTS(Tile_128_128_16, SG_4_2_1)
 
-#undef DECLARE_XE20_MOE_FP8_W8A16_ALL_SCALE_VARIANTS
-#undef DECLARE_XE20_MOE_FP8_W8A16_EXTERN
+#undef DECLARE_XE20_MOE_W8A16_ALL_SCALE_VARIANTS
+#undef DECLARE_XE20_MOE_W8A16_EXTERN
 
-#define LAUNCH_MOE_FP8_W8A16(WeightScaleBlocked, ...)           \
-  Xe20MoEGEMMFp8W8A16Launcher<__VA_ARGS__, WeightScaleBlocked>( \
-      queue,                                                    \
-      activations.data_ptr(),                                   \
-      weights.data_ptr(),                                       \
-      weight_scales.data_ptr(),                                 \
-      bias_ptr,                                                 \
-      output.data_ptr(),                                        \
-      gemm_n,                                                   \
-      gemm_k,                                                   \
-      total_rows_for_experts.data_ptr<int>(),                   \
-      n_experts,                                                \
-      atomic_buffer.data_ptr<int>(),                            \
-      ld_b,                                                     \
-      scale_mode,                                               \
+#define LAUNCH_MOE_W8A16(WeightScaleBlocked, ...)            \
+  Xe20MoEGEMMW8A16Launcher<__VA_ARGS__, WeightScaleBlocked>( \
+      queue,                                                 \
+      activations.data_ptr(),                                \
+      weights.data_ptr(),                                    \
+      weight_scales.data_ptr(),                              \
+      bias_ptr,                                              \
+      output.data_ptr(),                                     \
+      gemm_n,                                                \
+      gemm_k,                                                \
+      total_rows_for_experts.data_ptr<int>(),                \
+      n_experts,                                             \
+      atomic_buffer.data_ptr<int>(),                         \
+      ld_b,                                                  \
+      scale_mode,                                            \
       static_scheduler)
 
-#define DISPATCH_MOE_FP8_W8A16_BLOCK_TILES()                                       \
+#define DISPATCH_MOE_W8A16_BLOCK_TILES()                                           \
   do {                                                                             \
     if (avg_m <= 4) {                                                              \
-      LAUNCH_MOE_FP8_W8A16(true, Tile_16_64_32, SG_1_4_1);                         \
+      LAUNCH_MOE_W8A16(true, Tile_16_64_32, SG_1_4_1);                             \
     } else if (avg_m >= 1024 || (avg_m > 128 && gemm_k >= 512 && gemm_n >= 512)) { \
-      LAUNCH_MOE_FP8_W8A16(true, Tile_128_128_16, SG_4_2_1);                       \
+      LAUNCH_MOE_W8A16(true, Tile_128_128_16, SG_4_2_1);                           \
     } else {                                                                       \
-      LAUNCH_MOE_FP8_W8A16(true, Tile_32_64_32, SG_1_4_1);                         \
+      LAUNCH_MOE_W8A16(true, Tile_32_64_32, SG_1_4_1);                             \
     }                                                                              \
   } while (0)
 
-#define DISPATCH_MOE_FP8_W8A16_SCALAR_TILES()                                                                          \
+#define DISPATCH_MOE_W8A16_SCALAR_TILES()                                                                              \
   do {                                                                                                                 \
     if (avg_m <= 8) {                                                                                                  \
-      LAUNCH_MOE_FP8_W8A16(false, Tile_16_64_32, SG_1_4_1);                                                            \
+      LAUNCH_MOE_W8A16(false, Tile_16_64_32, SG_1_4_1);                                                                \
     } else if (avg_m <= 32) {                                                                                          \
-      LAUNCH_MOE_FP8_W8A16(false, Tile_32_64_32, SG_1_4_1);                                                            \
+      LAUNCH_MOE_W8A16(false, Tile_32_64_32, SG_1_4_1);                                                                \
     } else if (scale_mode == static_cast<int>(ScaleMode::ScalarGateUp) && avg_m <= 64 && gemm_k >= 2048) {             \
-      LAUNCH_MOE_FP8_W8A16(false, Tile_64_64_32, SG_2_4_1);                                                            \
+      LAUNCH_MOE_W8A16(false, Tile_64_64_32, SG_2_4_1);                                                                \
     } else if (                                                                                                        \
         scale_mode == static_cast<int>(ScaleMode::ScalarSingle) && gemm_n <= 2048 && gemm_k >= 1024 && avg_m <= 128) { \
-      LAUNCH_MOE_FP8_W8A16(false, Tile_32_64_32, SG_1_4_1);                                                            \
+      LAUNCH_MOE_W8A16(false, Tile_32_64_32, SG_1_4_1);                                                                \
     } else if (                                                                                                        \
         scale_mode == static_cast<int>(ScaleMode::ScalarSingle) && gemm_n <= 2048 && gemm_k >= 1024 && avg_m <= 512) { \
-      LAUNCH_MOE_FP8_W8A16(false, Tile_64_64_32, SG_2_4_1);                                                            \
+      LAUNCH_MOE_W8A16(false, Tile_64_64_32, SG_2_4_1);                                                                \
     } else {                                                                                                           \
-      LAUNCH_MOE_FP8_W8A16(false, Tile_128_128_16, SG_4_2_1);                                                          \
+      LAUNCH_MOE_W8A16(false, Tile_128_128_16, SG_4_2_1);                                                              \
     }                                                                                                                  \
   } while (0)
 
-SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_fp8_w8a16(
+SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
     torch::Tensor& output,
     const torch::Tensor& activations,
     const torch::Tensor& weights,
@@ -224,7 +224,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_fp8_w8a16(
 #ifdef USE_MOE_JIT
   std::string jit_err;
   TORCH_CHECK(
-      sgl::moe_jit::fp8_w8a16_grouped_gemm_launch(
+      sgl::moe_jit::w8a16_grouped_gemm_launch(
           avg_m,
           scale_mode,
           &queue,
@@ -245,15 +245,26 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_fp8_w8a16(
       jit_err);
 #else
   if (weight_scale_blocked) {
-    DISPATCH_MOE_FP8_W8A16_BLOCK_TILES();
+    DISPATCH_MOE_W8A16_BLOCK_TILES();
   } else {
-    DISPATCH_MOE_FP8_W8A16_SCALAR_TILES();
+    DISPATCH_MOE_W8A16_SCALAR_TILES();
   }
 #endif
 }
 
-#undef DISPATCH_MOE_FP8_W8A16_BLOCK_TILES
-#undef DISPATCH_MOE_FP8_W8A16_SCALAR_TILES
-#undef LAUNCH_MOE_FP8_W8A16
+SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_fp8_w8a16(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& weights,
+    const torch::Tensor& weight_scales,
+    const std::optional<at::Tensor>& bias,
+    const torch::Tensor& total_rows_for_experts,
+    const int64_t n_experts) {
+  moe_grouped_mm_nt_xe20_w8a16(output, activations, weights, weight_scales, bias, total_rows_for_experts, n_experts);
+}
+
+#undef DISPATCH_MOE_W8A16_BLOCK_TILES
+#undef DISPATCH_MOE_W8A16_SCALAR_TILES
+#undef LAUNCH_MOE_W8A16
 
 #undef SYCL_INTEL_TARGET

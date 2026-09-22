@@ -1314,7 +1314,8 @@ void lora_scatter_rows(
     const torch::Tensor& permutation  // [num_rows,]
 );
 
-torch::Tensor chunked_sgmv_lora_shrink_forward(
+void chunked_sgmv_lora_shrink_forward(
+    torch::Tensor& output,         // [num_tokens, num_slices*max_rank]
     const torch::Tensor& x,        // [num_tokens, input_dim]
     const torch::Tensor& weights,  // [num_loras, num_slices*max_rank, input_dim]
     const int64_t num_slices,      // stacked projections (qkv=3, gate_up=2, else 1)

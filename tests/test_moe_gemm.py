@@ -1207,7 +1207,7 @@ def test_moe_gemm_fp8_w8a16_block_weights(
     torch.manual_seed(0)
     torch.xpu.manual_seed_all(0)
 
-    rtol, atol = 1e-1, 5e-2
+    rtol, atol = 5e-2, 2e-2
 
     a = create_random_cpu_tensor((num_tokens, hidden_size), torch.bfloat16)
     # w1: gate+up projection [E, 2*I, H]; w2: down projection [E, H, I].
@@ -1346,7 +1346,7 @@ def test_moe_gemm_fp8_activations(
         **activation_kwargs,
     )
     torch.testing.assert_close(
-        torch_output, sglang_output.to("cpu"), rtol=1e-1, atol=1e-2
+        torch_output, sglang_output.to("cpu"), rtol=5e-2, atol=1e-2
     )
 
 
@@ -1425,7 +1425,7 @@ def test_moe_gemm_fp8_w8a16_scalar_weights(
         w2_scale=w2_scale.to("xpu"),
     )
     torch.testing.assert_close(
-        torch_output, sglang_output.to("cpu"), rtol=1e-1, atol=5e-2
+        torch_output, sglang_output.to("cpu"), rtol=5e-2, atol=2e-2
     )
 
 
@@ -1688,7 +1688,7 @@ def test_moe_gemm_mxfp8_w8a16_block_weights(
         **extra_kwargs,
     )
     torch.testing.assert_close(
-        torch_output, sglang_output.to("cpu"), rtol=1e-1, atol=5e-2
+        torch_output, sglang_output.to("cpu"), rtol=5e-2, atol=2e-2
     )
 
 

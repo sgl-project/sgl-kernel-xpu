@@ -38,7 +38,8 @@ __attribute__((visibility("default"))) void FmhaPrefillFp8Runner<@HEAD_DIM@, @EL
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
       using QElement = @ELEM_TYPE@;
-      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
+      dispatch_softcap<@HEAD_DIM@, true>(params.softcap, [&](auto softcap_tag) {
+      constexpr bool Softcap = decltype(softcap_tag)::value;
       if (params.is_e4m3) {
         FMHAConfig<
              Causal, LocalMask, false, Softcap, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, false, 2, false,

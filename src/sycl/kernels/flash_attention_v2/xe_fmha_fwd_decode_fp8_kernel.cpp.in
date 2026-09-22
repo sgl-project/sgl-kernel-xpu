@@ -39,7 +39,8 @@ __attribute__((visibility("default"))) void FmhaDecodeFp8Runner<@QG_SZ@, @HEAD_D
       !params.return_softmax_lse, "return_softmax_lse is not supported with an fp8 KV cache (decode)");
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     using QElement = @ELEM_TYPE@;
-    AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
+    dispatch_softcap<@HEAD_DIM@, true>(params.softcap, [&](auto softcap_tag) {
+      constexpr bool Softcap = decltype(softcap_tag)::value;
     if (params.is_e4m3) {
       DecodeConfig<
           false, LocalMask, false, Softcap, /*LSE=*/false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, void, 1, false,

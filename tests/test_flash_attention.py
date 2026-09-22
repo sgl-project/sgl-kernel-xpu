@@ -1947,6 +1947,54 @@ def test_flash_attn_fp8_kvcache(
         assert mean_diff <= 2e-2
 
 
+@pytest.mark.skipif(
+    not torch.xpu.is_available(),
+    reason="fp8 KV cache attention is an XPU (sgl-kernel-xpu) feature",
+)
+@pytest.mark.parametrize("seqlen_q", [1, 32])
+def test_flash_attn_fp8_kvcache_rejects_softcap(seqlen_q):
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    batch_size = 1
+    seqlen_k = 256
+    page_size = 64
+    d = 128
+    nheads = 8
+    num_blocks_per_seq = seqlen_k // page_size
+
+    q = torch.randn(
+        batch_size, seqlen_q, nheads, d, device=device, dtype=torch.bfloat16
+    )
+    k_cache = torch.randn(
+        batch_size * num_blocks_per_seq, page_size, nheads, d, device=device
+    ).to(torch.float8_e4m3fn)
+    v_cache = torch.randn(
+        batch_size * num_blocks_per_seq, page_size, nheads, d, device=device
+    ).to(torch.float8_e4m3fn)
+    cache_seqlens = torch.full(
+        (batch_size,), seqlen_k, dtype=torch.int32, device=device
+    )
+    page_table = torch.arange(
+        batch_size * num_blocks_per_seq, dtype=torch.int32, device=device
+    ).reshape(batch_size, num_blocks_per_seq)
+    descale = torch.ones(1, dtype=torch.float32, device=device)
+
+    with pytest.raises(
+        RuntimeError, match="logit soft-cap is not supported with an fp8 KV cache"
+    ):
+        flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=cache_seqlens,
+            page_table=page_table,
+            k_descale=descale,
+            v_descale=descale,
+            softmax_scale=d**-0.5,
+            softcap=15.0,
+        )
+
+
 if EXTENDED_KVCACHE_TESTS:
 
     @pytest.mark.parametrize(

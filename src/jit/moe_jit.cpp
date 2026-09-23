@@ -12,21 +12,20 @@ namespace moe_jit {
 namespace {
 
 using KernelFn = void (*)(
-    void*,
-    const void*,
-    const void*,
-    const void*,
-    const void*,
-    void*,
-    int,
-    int,
-    const int*,
-    int,
-    int,
-    int*,
-    float,
-    float,
-    int);
+    void*,        // queue_ptr
+    const void*,  // activations
+    const void*,  // weights
+    const void*,  // scales
+    const void*,  // bias
+    void*,        // outputs
+    int,          // gemm_n
+    int,          // gemm_k
+    const int*,   // num_rows_per_expert
+    int,          // num_experts
+    int*,         // workspace
+    float,        // gemm1_alpha
+    float,        // gemm1_limit
+    int);         // ld_b
 
 struct TileCfg {
   const char* tile;

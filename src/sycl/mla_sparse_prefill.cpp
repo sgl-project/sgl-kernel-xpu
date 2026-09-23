@@ -18,6 +18,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 #include "sycl/kernels/mla_sparse/device/mla_sparse_prefill_dispatch.hpp"
@@ -140,6 +141,26 @@ SGL_KERNEL_EXPORT void flash_mla_sparse_prefill(
       in_dtype == at::ScalarType::Half || in_dtype == at::ScalarType::BFloat16,
       "Unsupported input data type for Sparse MLA prefill");
   TORCH_CHECK(head_dim_v == 512, "head_dim_v must be 512 for DeepSeek V4 MLA");
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Sparse MLA prefill: QK (2 * s_q * h_q * topk * d_qk) + PV (2 * s_q * h_q * topk * d_v) over selected keys.
+  const int64_t s_q = q.size(0);
+  const int64_t h_q = q.size(1);
+  const int64_t d_qk = q.size(2);
+  const int64_t topk = indices.size(2);
+  const double flops_qk =
+      2.0 * static_cast<double>(s_q) * static_cast<double>(h_q) * static_cast<double>(topk) * static_cast<double>(d_qk);
+  const double flops_pv = 2.0 * static_cast<double>(s_q) * static_cast<double>(h_q) * static_cast<double>(topk) *
+                          static_cast<double>(head_dim_v);
+  const double flops = flops_qk + flops_pv;
+  const double q_elem = static_cast<double>(q.element_size());
+  const double kv_elem = static_cast<double>(kv.element_size());
+  const double bytes = static_cast<double>(q.numel()) * q_elem +
+                       static_cast<double>(s_q) * static_cast<double>(topk) * static_cast<double>(d_qk) * kv_elem +
+                       static_cast<double>(out.numel()) * static_cast<double>(out.element_size());
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  SGL_KERNEL_PERF_SCOPE("flash_mla_sparse_prefill", profiling_queue, bytes, flops);
+#endif
 
 #ifdef USE_MLA_JIT
   {

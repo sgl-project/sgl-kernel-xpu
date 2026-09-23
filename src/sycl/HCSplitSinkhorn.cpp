@@ -1,9 +1,11 @@
 #include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
 #include <limits>
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -142,6 +144,19 @@ SGL_KERNEL_EXPORT void hc_split_sinkhorn(
   TORCH_CHECK(comb.numel() == T * HC * HC, "comb must have T*HC*HC=", T * HC * HC, " elements, got ", comb.numel());
 
   auto q = dpcppGetCurrentQueue();
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // HC split sinkhorn: iterative row/col normalization. Memory-bound; skip flops.
+  const double flops = 0.0;
+  const double bytes = static_cast<double>(mixes.numel()) * static_cast<double>(mixes.element_size()) +
+                       static_cast<double>(hc_scale.numel()) * static_cast<double>(hc_scale.element_size()) +
+                       static_cast<double>(hc_base.numel()) * static_cast<double>(hc_base.element_size()) +
+                       static_cast<double>(pre.numel()) * static_cast<double>(pre.element_size()) +
+                       static_cast<double>(post.numel()) * static_cast<double>(post.element_size()) +
+                       static_cast<double>(comb.numel()) * static_cast<double>(comb.element_size());
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  SGL_KERNEL_PERF_SCOPE("hc_split_sinkhorn", profiling_queue, bytes, flops);
+#endif
 
   constexpr int tokens_per_wg = WG_SIZE / (HC * HC);
   const int64_t num_wg = (T + tokens_per_wg - 1) / tokens_per_wg;

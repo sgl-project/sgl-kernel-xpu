@@ -24,6 +24,7 @@ limitations under the License.
 #include <optional>
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 
@@ -499,9 +500,25 @@ SGL_KERNEL_EXPORT void causal_conv1d_fwd(
     params.conv_states_ptr = nullptr;
   }
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   SYCL_DISPATCH_FLOATING_TYPES(at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "causal_conv1d_fwd", [&]() {
     launch_causal_conv1d_fwd<scalar_t>(params);
   });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // causal_conv1d: 2 * batch * seq_len * channels * kernel_size mult-adds.
+  const double flops = 2.0 * static_cast<double>(batch_size) * static_cast<double>(seqlen) * static_cast<double>(dim) *
+                       static_cast<double>(width);
+  const double bytes = static_cast<double>(x.numel()) * static_cast<double>(x.element_size()) +
+                       static_cast<double>(weight.numel()) * static_cast<double>(weight.element_size()) +
+                       static_cast<double>(out.numel()) * static_cast<double>(out.element_size());
+  ::sglkernel::report_kernel_perf("causal_conv1d_fwd", profiling_queue, timer, bytes, flops);
+#endif
 }
 
 SGL_KERNEL_EXPORT void causal_conv1d_update(
@@ -582,8 +599,24 @@ SGL_KERNEL_EXPORT void causal_conv1d_update(
       conv_state_indices_.has_value() ? conv_state_indices_.value().data_ptr<int>() : nullptr;
   params.cache_seqlens = cache_seqlens_.has_value() ? cache_seqlens_.value().data_ptr<int>() : nullptr;
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "causal_conv1d_update", [&]() {
         launch_causal_conv1d_update<scalar_t>(params);
       });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = 2.0 * static_cast<double>(batch_size) * static_cast<double>(seqlen) * static_cast<double>(dim) *
+                       static_cast<double>(width);
+  const double bytes = static_cast<double>(x.numel()) * static_cast<double>(x.element_size()) +
+                       static_cast<double>(weight.numel()) * static_cast<double>(weight.element_size()) +
+                       static_cast<double>(conv_state.numel()) * static_cast<double>(conv_state.element_size()) +
+                       static_cast<double>(out.numel()) * static_cast<double>(out.element_size());
+  ::sglkernel::report_kernel_perf("causal_conv1d_update", profiling_queue, timer, bytes, flops);
+#endif
 }

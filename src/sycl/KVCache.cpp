@@ -2,6 +2,7 @@
 
 #include <cstdint>
 
+#include "SGLKernelPerf.h"
 #include "Utils.h"
 #include "comm/General.h"
 #include "sgl_kernel_export.h"
@@ -117,6 +118,16 @@ store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cac
   auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
   int64_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
   int64_t group_size = std::min<int64_t>(std::min<int64_t>(row_dim, 512), max_wg_size);
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Pure copy: no flops, memory-bound on 2 reads (k/v) + 2 writes (k_cache/v_cache).
+  const double elem = static_cast<double>(k.element_size());
+  const double bytes = 4.0 * static_cast<double>(num_tokens) * static_cast<double>(row_dim) * elem +
+                       static_cast<double>(num_tokens) * 8.0;
+  const double flops = 0.0;
+  auto profiling_queue = dpcppGetCurrentQueue();
+  SGL_KERNEL_PERF_SCOPE("store_cache", profiling_queue, bytes, flops);
+#endif
 
   SYCL_DISPATCH_FLOATING_TYPES(at::ScalarType::Half, at::ScalarType::BFloat16, k.scalar_type(), "store_cache", [&]() {
     // The 16-byte OWord load/store is only legal when every row base is

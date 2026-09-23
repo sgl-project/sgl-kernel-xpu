@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -228,31 +229,45 @@ SGL_KERNEL_EXPORT at::Tensor hadamard_transform(const at::Tensor& input, double 
   at::Tensor out_flat = at::empty_like(x_flat);
   const int64_t batch = x_flat.size(0);
 
-  if (batch > 0) {
-    const int64_t x_batch_stride = x_flat.stride(0);
-    const int64_t out_batch_stride = out_flat.stride(0);
-    const float scale_f = static_cast<float>(scale);
+  {
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+    // Hadamard transform: memory-bound; N log N butterfly work per row.
+    // Output shape mirrors the input's outer shape (same batch * dim_og elements, same dtype),
+    // so out.numel() * out.element_size() equals input.numel() * input.element_size() and the
+    // read+write byte count is expressible up front — lets the scope macro bracket only the
+    // kernel launch and destruct before the trailing reshape (which may submit a contiguous copy).
+    const double flops = 0.0;
+    const double bytes = 2.0 * static_cast<double>(input.numel()) * static_cast<double>(input.element_size());
+    auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+    SGL_KERNEL_PERF_SCOPE("hadamard", profiling_queue, bytes, flops);
+#endif
 
-    auto& q = dpcppGetCurrentQueue();
+    if (batch > 0) {
+      const int64_t x_batch_stride = x_flat.stride(0);
+      const int64_t out_batch_stride = out_flat.stride(0);
+      const float scale_f = static_cast<float>(scale);
 
-    SYCL_DISPATCH_FLOATING_TYPES_AND3(
-        at::ScalarType::Float,
-        at::ScalarType::BFloat16,
-        at::ScalarType::Half,
-        x_flat.scalar_type(),
-        "hadamard_transform",
-        [&]() {
-          hadamard_dispatch<scalar_t>(
-              q,
-              reinterpret_cast<const scalar_t*>(x_flat.data_ptr()),
-              reinterpret_cast<scalar_t*>(out_flat.data_ptr()),
-              batch,
-              x_batch_stride,
-              out_batch_stride,
-              log_N,
-              scale_f);
-        });
-  }
+      auto& q = dpcppGetCurrentQueue();
+
+      SYCL_DISPATCH_FLOATING_TYPES_AND3(
+          at::ScalarType::Float,
+          at::ScalarType::BFloat16,
+          at::ScalarType::Half,
+          x_flat.scalar_type(),
+          "hadamard_transform",
+          [&]() {
+            hadamard_dispatch<scalar_t>(
+                q,
+                reinterpret_cast<const scalar_t*>(x_flat.data_ptr()),
+                reinterpret_cast<scalar_t*>(out_flat.data_ptr()),
+                batch,
+                x_batch_stride,
+                out_batch_stride,
+                log_N,
+                scale_f);
+          });
+    }
+  }  // scope destructs here — timing bracket closes before the reshape below
 
   at::Tensor out = padded_dim != dim_og ? out_flat.slice(1, 0, dim_og) : out_flat;
   return out.reshape(shapes_og);

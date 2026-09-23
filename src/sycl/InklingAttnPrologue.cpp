@@ -18,6 +18,7 @@
 #include <sycl/sycl.hpp>
 #include <tuple>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -763,6 +764,12 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_pr
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = qkvr.scalar_type();
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half,
       at::ScalarType::BFloat16,
@@ -812,6 +819,18 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_pr
         launch_verify<scalar_t>(queue, params);
         return {q_out, k_out, v_out};
       });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = 0.0;
+  const double bytes = static_cast<double>(qkvr.numel()) * static_cast<double>(qkvr.element_size()) +
+                       static_cast<double>(k_weight.numel()) * static_cast<double>(k_weight.element_size()) +
+                       static_cast<double>(v_weight.numel()) * static_cast<double>(v_weight.element_size()) +
+                       static_cast<double>(q_out.numel()) * static_cast<double>(q_out.element_size()) +
+                       static_cast<double>(k_out.numel()) * static_cast<double>(k_out.element_size()) +
+                       static_cast<double>(v_out.numel()) * static_cast<double>(v_out.element_size());
+  ::sglkernel::report_kernel_perf("inkling_attn_prologue_verify", queue, timer, bytes, flops);
+#endif
+
   return {q_out, k_out, v_out};
 }
 
@@ -869,6 +888,12 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_pr
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = qkvr.scalar_type();
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half,
       at::ScalarType::BFloat16,
@@ -915,6 +940,18 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_pr
         launch_decode<scalar_t>(queue, params);
         return {q_out, k_out, v_out};
       });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = 0.0;
+  const double bytes = static_cast<double>(qkvr.numel()) * static_cast<double>(qkvr.element_size()) +
+                       static_cast<double>(k_weight.numel()) * static_cast<double>(k_weight.element_size()) +
+                       static_cast<double>(v_weight.numel()) * static_cast<double>(v_weight.element_size()) +
+                       static_cast<double>(q_out.numel()) * static_cast<double>(q_out.element_size()) +
+                       static_cast<double>(k_out.numel()) * static_cast<double>(k_out.element_size()) +
+                       static_cast<double>(v_out.numel()) * static_cast<double>(v_out.element_size());
+  ::sglkernel::report_kernel_perf("inkling_attn_prologue_decode", queue, timer, bytes, flops);
+#endif
+
   return {q_out, k_out, v_out};
 }
 
@@ -994,6 +1031,12 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_pr
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = qkvr.scalar_type();
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   SYCL_DISPATCH_FLOATING_TYPES(
       at::ScalarType::Half,
       at::ScalarType::BFloat16,
@@ -1048,5 +1091,17 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_pr
         launch_extend<scalar_t>(queue, params);
         return {q_out, k_out, v_out};
       });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = 0.0;
+  const double bytes = static_cast<double>(qkvr.numel()) * static_cast<double>(qkvr.element_size()) +
+                       static_cast<double>(k_weight.numel()) * static_cast<double>(k_weight.element_size()) +
+                       static_cast<double>(v_weight.numel()) * static_cast<double>(v_weight.element_size()) +
+                       static_cast<double>(q_out.numel()) * static_cast<double>(q_out.element_size()) +
+                       static_cast<double>(k_out.numel()) * static_cast<double>(k_out.element_size()) +
+                       static_cast<double>(v_out.numel()) * static_cast<double>(v_out.element_size());
+  ::sglkernel::report_kernel_perf("inkling_attn_prologue_extend", queue, timer, bytes, flops);
+#endif
+
   return {q_out, k_out, v_out};
 }

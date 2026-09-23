@@ -1,9 +1,11 @@
 #include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
 
 #include <cstdint>
 #include <limits>
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "comm/General.h"
@@ -720,6 +722,12 @@ SGL_KERNEL_EXPORT void minimax_decode_topk(
   const auto bs = static_cast<int32_t>(block_size);
   const auto k = static_cast<int32_t>(topk);
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   switch (seq_len_kind(seq_lens_c)) {
     case SeqLenKind::kI32:
       mmtopk::minimax_decode_topk_launcher<int32_t>(
@@ -730,6 +738,14 @@ SGL_KERNEL_EXPORT void minimax_decode_topk(
           queue, score_c.const_data_ptr(), seq_lens_c.const_data_ptr(), out.data_ptr(), b, h, s, bs, k);
       break;
   }
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = 0.0;
+  const double bytes = static_cast<double>(score.numel()) * static_cast<double>(score.element_size()) +
+                       static_cast<double>(seq_lens.numel()) * static_cast<double>(seq_lens.element_size()) +
+                       static_cast<double>(out.numel()) * static_cast<double>(out.element_size());
+  ::sglkernel::report_kernel_perf("minimax_decode_topk", profiling_queue, timer, bytes, flops);
+#endif
 }
 
 SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor> minimax_decode_topk_page_table(
@@ -784,6 +800,12 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor> minimax_decode_topk_page_ta
   const auto bs = static_cast<int32_t>(block_size);
   const auto k = static_cast<int32_t>(topk);
   const auto ps = static_cast<int32_t>(page_size);
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
   const auto stride = static_cast<int32_t>(r2t_stride);
   const auto kv_len = static_cast<int32_t>(max_kv_len);
   const auto reqs = static_cast<int32_t>(max_reqs);
@@ -831,5 +853,17 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor> minimax_decode_topk_page_ta
           pages);
       break;
   }
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = 0.0;
+  const double bytes = static_cast<double>(score.numel()) * static_cast<double>(score.element_size()) +
+                       static_cast<double>(seq_lens.numel()) * static_cast<double>(seq_lens.element_size()) +
+                       static_cast<double>(req_to_token.numel()) * static_cast<double>(req_to_token.element_size()) +
+                       static_cast<double>(slot_ids.numel()) * static_cast<double>(slot_ids.element_size()) +
+                       static_cast<double>(page_table.numel()) * static_cast<double>(page_table.element_size()) +
+                       static_cast<double>(real_seq_lens.numel()) * static_cast<double>(real_seq_lens.element_size());
+  ::sglkernel::report_kernel_perf("minimax_decode_topk_page_table", profiling_queue, timer, bytes, flops);
+#endif
+
   return {page_table, real_seq_lens};
 }

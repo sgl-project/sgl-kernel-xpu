@@ -13,6 +13,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 #include "sycl/kernels/mla_sparse/device/mla_sparse_decode_dispatch.hpp"
@@ -191,6 +192,25 @@ SGL_KERNEL_EXPORT void flash_mla_sparse_decode(
       "extra_k_cache and extra_indices must be provided together");
   TORCH_CHECK(in_dtype == at::ScalarType::BFloat16, "Unsupported input data type for Sparse MLA decode");
   TORCH_CHECK(head_dim_v == 512, "head_dim_v must be 512 for DeepSeek V4 MLA");
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Decode: batch B, 1 query per row, topk selected KV rows. QK + PV over topk keys.
+  const int64_t B = q.size(0);
+  const int64_t H = q.size(2);
+  const int64_t d_qk = q.size(3);
+  const int64_t topk = indices.size(2);
+  const int64_t extra_topk = extra_indices.has_value() ? extra_indices->size(2) : 0;
+  const double total_topk = static_cast<double>(topk) + static_cast<double>(extra_topk);
+  const double flops =
+      2.0 * static_cast<double>(B) * static_cast<double>(H) * total_topk * static_cast<double>(d_qk) +
+      2.0 * static_cast<double>(B) * static_cast<double>(H) * total_topk * static_cast<double>(head_dim_v);
+  // KV cache is packed fp8 (1 byte/elem + 4 bytes/row scale) — approximate with 1 byte/elem.
+  const double bytes = static_cast<double>(q.numel()) * static_cast<double>(q.element_size()) +
+                       static_cast<double>(B) * total_topk * static_cast<double>(d_qk) * 1.0 +
+                       static_cast<double>(out.numel()) * static_cast<double>(out.element_size());
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  SGL_KERNEL_PERF_SCOPE("flash_mla_sparse_decode", profiling_queue, bytes, flops);
+#endif
 
 // The JIT path only covers the 2-stage template (the fused template has no
 // SGL_MLA_JIT_ENTRY). When the fused path is selected

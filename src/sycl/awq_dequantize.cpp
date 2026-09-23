@@ -9,6 +9,7 @@
 #include <sycl/sycl.hpp>
 #include <vector>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "sgl_kernel_export.h"
 
@@ -107,6 +108,16 @@ SGL_KERNEL_EXPORT at::Tensor awq_dequantize(at::Tensor qweight, at::Tensor scale
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // AWQ dequantize: one shift/AND/multiply per output element. Memory-bound.
+  const double flops = static_cast<double>(output.numel());
+  const double bytes = static_cast<double>(qweight.numel()) * static_cast<double>(qweight.element_size()) +
+                       static_cast<double>(scales.numel()) * static_cast<double>(scales.element_size()) +
+                       static_cast<double>(qzeros.numel()) * static_cast<double>(qzeros.element_size()) +
+                       static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
+  SGL_KERNEL_PERF_SCOPE("awq_dequant", queue, bytes, flops);
+#endif
 
   if (scales.scalar_type() == at::ScalarType::Half) {
     auto _scales = reinterpret_cast<sycl::half*>(scales.data_ptr<at::Half>());

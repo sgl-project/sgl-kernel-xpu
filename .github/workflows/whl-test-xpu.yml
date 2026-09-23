@@ -1,0 +1,168 @@
+name: Wheel Test (XPU)
+
+# Run the per-commit kernel tests + benchmarks of a given ref against a prebuilt
+# wheel, in a fresh conda env of the requested Python. Nothing is built from source.
+
+on:
+  workflow_dispatch:
+    inputs:
+      wheel:
+        description: 'Wheel URL (http/https) or absolute path on the runner'
+        required: true
+        type: string
+      ref:
+        description: 'Branch/tag/SHA whose tests/ and benchmark/ are used (e.g. release/v0.2.0)'
+        required: true
+        type: string
+        default: 'release/v0.2.0'
+      python_version:
+        description: 'Python version for the test env'
+        required: true
+        type: choice
+        options: ['3.10', '3.11', '3.12']
+        default: '3.10'
+      torch_version:
+        description: 'torch version the wheel was built against'
+        required: true
+        type: string
+        default: '2.13.0'
+      image:
+        description: 'Base image (provides driver, oneAPI, conda)'
+        required: false
+        type: string
+        default: 'intel/sgl-kernel-xpu-dev:latest'
+      run_tests:
+        type: boolean
+        default: true
+      run_benchmarks:
+        type: boolean
+        default: true
+
+concurrency:
+  group: whl-test-xpu-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  CONTAINER: whl_test_xpu_${{ github.run_id }}
+  PY_ENV: whl-py${{ inputs.python_version }}
+  KERNEL_DIR: /root/sglang/sgl-kernel-xpu
+
+jobs:
+  whl-test:
+    runs-on: sglang-bmg
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout ${{ inputs.ref }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - name: Fetch wheel
+        env:
+          WHEEL: ${{ inputs.wheel }}
+        run: |
+          set -euo pipefail
+          mkdir -p whl
+          FNAME=$(basename "${WHEEL%%\?*}")
+          case "$FNAME" in *.whl) ;; *) echo "::error::Not a .whl: $WHEEL"; exit 1 ;; esac
+          case "$WHEEL" in
+            http://*|https://*) curl -fSL --retry 5 --retry-delay 10 -o "whl/$FNAME" "$WHEEL" ;;
+            *) cp "$WHEEL" "whl/$FNAME" ;;
+          esac
+          python3 -c "import zipfile; zipfile.ZipFile('whl/$FNAME').testzip() or print('wheel OK')"
+          echo "WHEEL_FILE=$FNAME" >> "$GITHUB_ENV"
+
+      - name: Start container
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          docker pull "$IMAGE"
+          docker run -dt --device /dev/dri/ --name "$CONTAINER" \
+            -e HF_TOKEN="$(cat ~/huggingface_token.txt)" "$IMAGE"
+
+      - name: Overlay tests/ and benchmark/ from ${{ inputs.ref }}
+        # Replace the image-baked copies so the suite lists match the requested ref.
+        run: |
+          docker exec "$CONTAINER" rm -rf "$KERNEL_DIR/tests" "$KERNEL_DIR/benchmark"
+          docker cp ./tests "$CONTAINER:$KERNEL_DIR/tests"
+          docker cp ./benchmark "$CONTAINER:$KERNEL_DIR/benchmark"
+          docker cp ./whl "$CONTAINER:/tmp/whl"
+
+      - name: Create Python ${{ inputs.python_version }} env and install wheel
+        timeout-minutes: 30
+        env:
+          PY: ${{ inputs.python_version }}
+          TORCH: ${{ inputs.torch_version }}
+        run: |
+          docker exec -e PY -e TORCH -e PY_ENV -e WHEEL_FILE "$CONTAINER" /bin/bash -c '
+            set -exo pipefail
+            . /miniforge3/bin/activate
+            conda create -y -n "$PY_ENV" python="$PY"
+            conda activate "$PY_ENV"
+            pip install --upgrade pip
+            pip install --timeout 300 --retries 10 "torch==$TORCH" torchvision triton-xpu \
+              --index-url https://download.pytorch.org/whl/xpu
+            pip install "/tmp/whl/$WHEEL_FILE"
+            pip install pytest expecttest ray huggingface_hub scipy tabulate pandas matplotlib
+            hf auth login --token "$HF_TOKEN"
+            # tests/test_utils.py spawns bare "python3".
+            ln -sf "/miniforge3/envs/$PY_ENV/bin/python3" /usr/bin/python3
+            cd /tmp
+            python3 -c "import sys, torch, sgl_kernel; print(sys.version); print(torch.__version__, torch.xpu.is_available()); print(sgl_kernel.__version__, sgl_kernel.__file__)"
+            pip show sglang-kernel-xpu
+          '
+
+      - name: Kernel tests (per-commit suite)
+        if: inputs.run_tests
+        timeout-minutes: 90
+        run: |
+          docker exec -w "$KERNEL_DIR/tests" "$CONTAINER" \
+            /bin/bash -c ". /miniforge3/bin/activate $PY_ENV && python3 run_suite.py --suite per-commit"
+
+      - name: Kernel benchmarks (per-commit suite)
+        if: ${{ inputs.run_benchmarks && !cancelled() }}
+        timeout-minutes: 60
+        run: |
+          docker exec -w "$KERNEL_DIR/benchmark" "$CONTAINER" \
+            /bin/bash -c ". /miniforge3/bin/activate $PY_ENV && python3 run_suite.py --suite per-commit"
+
+      - name: Compare against ${{ inputs.ref }} baseline.json
+        if: ${{ inputs.run_benchmarks && !cancelled() }}
+        run: |
+          mkdir -p bench_logs
+          docker cp "$CONTAINER:$KERNEL_DIR/benchmark/." bench_logs/ || true
+          cp bench_logs/fused_moe.log bench_logs/flash.log . 2>/dev/null || true
+          python3 benchmark/update_baseline_from_log.py || true
+          [ -f ci_pr_body.md ] && cat ci_pr_body.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: whl-test-py${{ inputs.python_version }}-${{ github.run_id }}
+          path: |
+            bench_logs/*.log
+            ci_pr_body.md
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Summary
+        if: always()
+        env:
+          WHEEL: ${{ inputs.wheel }}
+          REF: ${{ inputs.ref }}
+          PY: ${{ inputs.python_version }}
+          TORCH: ${{ inputs.torch_version }}
+        run: |
+          {
+            echo "### Wheel test"
+            echo "- Wheel: \`$WHEEL\`"
+            echo "- Ref: \`$REF\` ($(git rev-parse --short HEAD))"
+            echo "- Python: $PY, torch: $TORCH"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup container
+        if: always()
+        run: docker rm -f "$CONTAINER" || true

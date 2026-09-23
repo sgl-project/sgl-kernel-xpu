@@ -157,32 +157,50 @@ struct DecodeFp8PagedSource {
 
   CUTLASS_DEVICE
   static float e8m0_to_float(uint8_t scale_byte) {
-    return sycl::native::exp2(static_cast<float>(static_cast<int>(scale_byte) - 127));
+    // UE8M0 scale byte is the biased f32 exponent: value = 2^(scale_byte - 127).
+    // TODO: verify correctness and potential optimizations for the CRI.
+    return __builtin_bit_cast(float, static_cast<uint32_t>(scale_byte) << 23);
+  }
+
+  // TODO: check cutlass conversion / cute tensor views for correctness / optimizations like BMG.
+  CUTLASS_DEVICE
+  static float fp8_e4m3fn_to_float(uint8_t b) {
+    const uint32_t s = static_cast<uint32_t>(b) >> 7;
+    const uint32_t e = (static_cast<uint32_t>(b) >> 3) & 0xF;
+    const uint32_t m = static_cast<uint32_t>(b) & 0x7;
+    float val;
+    if (e == 0) {
+      val = static_cast<float>(m) * (1.0f / 512.0f);  // 2^-6 * (m/8) = m * 2^-9
+    } else if (e == 0xF && m == 0x7) {
+      val = __builtin_bit_cast(float, 0x7fc00000u);  // NaN
+    } else {
+      const float mant = 1.0f + static_cast<float>(m) * 0.125f;
+      const int32_t exp_field = static_cast<int32_t>(e) - 7 + 127;  // e4m3 bias 7 -> f32 bias 127
+      const float pw = __builtin_bit_cast(float, static_cast<uint32_t>(exp_field) << 23);
+      val = mant * pw;
+    }
+    return s ? -val : val;
   }
 
   CUTLASS_DEVICE
   static uint16_t fp8_e4m3_scaled_to_bf16_bits(uint8_t fp8_byte, float scale) {
-    const auto fp8_val = cutlass::float_e4m3_t::bitcast(fp8_byte);
-    return cutlass::bfloat16_t(static_cast<float>(fp8_val) * scale).storage;
+    return cutlass::bfloat16_t(fp8_e4m3fn_to_float(fp8_byte) * scale).storage;
   }
 
   // Scalar fallback: one bf16 per lane per step, NoPE dequantized and RoPE copied.
+  // TODO: check cutlass conversion / cute tensor views for correctness like BMG.
   template <class TensorGRow>
   CUTLASS_DEVICE static void
   store_dequantized_token_scalar(TensorGRow&& gRow, TokenRecord const& token, bool valid_token, int lane_id) {
-    auto sNope = make_nope_view(token.nope);
-    auto sRope = make_rope_view(token.rope);
-
     CUTE_UNROLL
     for (int n = 0; n < NUM_VALS_PER_THREAD; ++n) {
       const int dim_idx = n * SUBGROUP_SIZE + lane_id;
       cutlass::bfloat16_t kv_val = cutlass::bfloat16_t(0.0f);
       if (valid_token && dim_idx < SPARSE_MLA_FP8_NOPE_BYTES) {
         const float scale = e8m0_to_float(token.scales[dim_idx / 64]);
-        const auto fp8_val = cutlass::float_e4m3_t::bitcast(sNope(dim_idx));
-        kv_val = cutlass::bfloat16_t(static_cast<float>(fp8_val) * scale);
+        kv_val = cutlass::bfloat16_t(fp8_e4m3fn_to_float(token.nope[dim_idx]) * scale);
       } else if (valid_token) {
-        kv_val = sRope(dim_idx - SPARSE_MLA_FP8_NOPE_BYTES);
+        kv_val = token.rope[dim_idx - SPARSE_MLA_FP8_NOPE_BYTES];
       }
       gRow(dim_idx) = kv_val;
     }

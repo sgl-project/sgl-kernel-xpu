@@ -20,7 +20,7 @@ from typing import NamedTuple, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from _bench import BenchSpec, ProblemShape, format_tables, make_row
+from _bench import BenchSpec, ProblemShape, format_tables, make_row, require_arch
 from sgl_kernel import flash_mla_sparse_fwd
 
 # ── constants ──
@@ -277,6 +277,7 @@ configs += [
 # Main
 # ============================================================================
 if __name__ == "__main__":
+    require_arch("xe20", "xe35")
     device = torch.device("xpu")
 
     torch.manual_seed(42)

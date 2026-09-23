@@ -43,6 +43,23 @@ def current_arch() -> Optional[str]:
     return None
 
 
+def supports(*archs: str) -> bool:
+    """True if the live device is one of ``archs`` (arch tags)."""
+    return current_arch() in set(archs)
+
+
+def require_arch(*archs: str) -> None:
+    # Standalone-script twin of the tests' @pytest.mark.arch gate: an
+    # arch-specific benchmark calls this at the top of main so running it on an
+    # unsupported device prints why and exits 0 instead of faulting in the launch.
+    if supports(*archs):
+        return
+    print(
+        f"[skip] benchmark supports {sorted(archs)}; running device is {current_arch()}"
+    )
+    raise SystemExit(0)
+
+
 # ── schema ───────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class ProblemShape:

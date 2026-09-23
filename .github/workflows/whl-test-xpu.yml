@@ -123,7 +123,7 @@ jobs:
       - name: Verify sgl_kernel comes from the given wheel
         run: |
           docker exec -i -w /root/sglang/sgl-kernel-xpu/tests -e PY_ENV -e WHEEL_FILE "$CONTAINER" \
-            "/miniforge3/envs/$PY_ENV/bin/python3" - <<'EOF'
+            "/miniforge3/envs/$PY_ENV/bin/python3" - <<'EOF' | tee kernel_info.txt
           import os, sys, importlib.metadata as md
           import torch, sgl_kernel
           env_prefix = f"/miniforge3/envs/{os.environ['PY_ENV']}/"
@@ -138,19 +138,44 @@ jobs:
           assert torch.xpu.is_available(), "XPU not visible"
           EOF
 
+      - name: Write per-file runner
+        # The suite runners stop at the first failing file; run one entry at a
+        # time so every file gets a status and duration.
+        run: |
+          cat > "$RUNNER_TEMP/run_per_file.sh" <<'EOF'
+          #!/usr/bin/env bash
+          # Usage: run_per_file.sh <tests|benchmark> <suite label>
+          set -uo pipefail
+          dir=$1; label=$2
+          mapfile -t names < <(docker exec -w "$KERNEL_DIR/$dir" "$CONTAINER" \
+            "/miniforge3/envs/$PY_ENV/bin/python3" -c \
+            'import run_suite as r; print("\n".join(f.name for f in r.suites["per-commit"]))')
+          if [ ${#names[@]} -eq 0 ]; then echo "::error::no $label files found"; exit 1; fi
+          failed=0
+          for i in "${!names[@]}"; do
+            start=$(date +%s)
+            if docker exec -w "$KERNEL_DIR/$dir" "$CONTAINER" /bin/bash -c \
+                ". /miniforge3/bin/activate $PY_ENV && python3 run_suite.py --suite per-commit --range-begin $i --range-end $((i + 1))" </dev/null; then
+              status=pass
+            else
+              status=fail; failed=$((failed + 1))
+            fi
+            echo "${names[$i]},$label,$status,$(( $(date +%s) - start ))" >> "$GITHUB_WORKSPACE/results.csv"
+          done
+          echo "$label: $failed of ${#names[@]} file(s) failed"
+          [ "$failed" -eq 0 ]
+          EOF
+          chmod +x "$RUNNER_TEMP/run_per_file.sh"
+
       - name: Kernel tests (per-commit suite)
         if: inputs.run_tests
-        timeout-minutes: 90
-        run: |
-          docker exec -w "$KERNEL_DIR/tests" "$CONTAINER" \
-            /bin/bash -c ". /miniforge3/bin/activate $PY_ENV && python3 run_suite.py --suite per-commit"
+        timeout-minutes: 120
+        run: $RUNNER_TEMP/run_per_file.sh tests test
 
       - name: Kernel benchmarks (per-commit suite)
         if: ${{ inputs.run_benchmarks && !cancelled() }}
-        timeout-minutes: 60
-        run: |
-          docker exec -w "$KERNEL_DIR/benchmark" "$CONTAINER" \
-            /bin/bash -c ". /miniforge3/bin/activate $PY_ENV && python3 run_suite.py --suite per-commit"
+        timeout-minutes: 90
+        run: $RUNNER_TEMP/run_per_file.sh benchmark benchmark
 
       - name: Compare against ${{ inputs.ref }} baseline.json
         if: ${{ inputs.run_benchmarks && !cancelled() }}
@@ -159,18 +184,6 @@ jobs:
           docker cp "$CONTAINER:$KERNEL_DIR/benchmark/." bench_logs/ || true
           cp bench_logs/fused_moe.log bench_logs/flash.log . 2>/dev/null || true
           python3 benchmark/update_baseline_from_log.py || true
-          [ -f ci_pr_body.md ] && cat ci_pr_body.md >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: whl-test-py${{ inputs.python_version }}-${{ github.run_id }}
-          path: |
-            bench_logs/*.log
-            ci_pr_body.md
-          if-no-files-found: warn
-          retention-days: 14
 
       - name: Summary
         if: always()
@@ -180,12 +193,56 @@ jobs:
           PY: ${{ inputs.python_version }}
           TORCH: ${{ inputs.torch_version }}
         run: |
-          {
-            echo "### Wheel test"
-            echo "- Wheel: \`$WHEEL\`"
-            echo "- Ref: \`$REF\` ($(git rev-parse --short HEAD))"
-            echo "- Python: $PY, torch: $TORCH"
-          } >> "$GITHUB_STEP_SUMMARY"
+          export SHA=$(git rev-parse --short HEAD)
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import csv, os
+          env = os.environ
+          rows = list(csv.reader(open("results.csv"))) if os.path.exists("results.csv") else []
+          with open(f"results_py{env['PY']}.csv", "w", newline="") as f:
+              w = csv.writer(f)
+              w.writerow(["File Name", "Suite", "Status", "Duration(Sec.)"])
+              w.writerows(rows)
+
+          print(f"### Wheel test: Python {env['PY']}\n")
+          print(f"- Wheel: `{env['WHEEL']}`")
+          print(f"- Ref: `{env['REF']}` ({env['SHA']})")
+          print(f"- torch: {env['TORCH']}\n")
+          if os.path.exists("kernel_info.txt"):
+              print("```\n" + open("kernel_info.txt").read().strip() + "\n```\n")
+
+          print("| Suite | Total | Pass | Fail | Duration(Sec.) |")
+          print("|---|---:|---:|---:|---:|")
+          for suite in ("test", "benchmark"):
+              sel = [r for r in rows if r[1] == suite]
+              npass = sum(r[2] == "pass" for r in sel)
+              total_s = sum(int(r[3]) for r in sel)
+              print(f"| {suite} | {len(sel)} | {npass} | {len(sel) - npass} | {total_s} |")
+          print()
+
+          if os.path.exists("ci_pr_body.md"):
+              print("<details><summary>Benchmark vs baseline.json (flash_attn, fused_moe)</summary>\n")
+              print(open("ci_pr_body.md").read())
+              print("\n</details>\n")
+
+          print("| File Name | Suite | Status | Duration(Sec.) |")
+          print("|---|---|---|---:|")
+          for name, suite, status, dur in rows:
+              shown = status if status == "pass" else f"**{status.upper()}**"
+              print(f"| {name} | {suite} | {shown} | {dur} |")
+          EOF
+
+      - name: Upload logs and results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: whl-test-py${{ inputs.python_version }}-${{ github.run_id }}
+          path: |
+            results_py*.csv
+            kernel_info.txt
+            bench_logs/*.log
+            ci_pr_body.md
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Cleanup container
         if: always()

@@ -2,6 +2,7 @@
 
 #include <ATen/xpu/XPUContext.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <type_traits>
 
@@ -153,6 +154,17 @@ static inline int64_t dpcppMaxComputeUnitSize(DeviceId dev_id = dpcppGetDeviceId
 static inline int64_t dpcppGpuEuCount(DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue()) {
   auto* dev_prop = at::xpu::getDeviceProperties(dev_id);
   return dev_prop->gpu_eu_count;
+}
+
+static inline int64_t dpcppGpuEuCountPerSubslice(DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue()) {
+  auto* dev_prop = at::xpu::getDeviceProperties(dev_id);
+  return dev_prop->gpu_eu_count_per_subslice;
+}
+
+static inline int64_t dpcppGpuSubsliceCount(DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue()) {
+  int64_t eu_count_per_subslice = dpcppGpuEuCountPerSubslice(dev_id);
+  if (eu_count_per_subslice <= 0) return 1;
+  return std::max<int64_t>(1, dpcppGpuEuCount(dev_id) / eu_count_per_subslice);
 }
 
 static inline int64_t dpcppGpuEuSimdWidth(DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue()) {

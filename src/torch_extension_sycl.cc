@@ -651,6 +651,37 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "ScalarType dtype) -> int");
   m.impl(
       "gdn_attention_workspace_bytes_needed", c10::DispatchKey::BackendSelect, &gdn_attention_workspace_bytes_needed);
+
+  m.def(
+      "gated_delta_rule(Tensor! core_attn_out, Tensor q, Tensor k, Tensor v, Tensor b, Tensor a, "
+      "Tensor A_log, Tensor dt_bias, Tensor! ssm_state, Tensor query_start_loc, Tensor? token_indx, "
+      "Tensor cache_indices, Tensor? has_initial_state, int num_prefills, int num_decodes) -> ()");
+  m.impl("gated_delta_rule", torch::kXPU, &gated_delta_rule);
+
+  m.def(
+      "gated_delta_rule_verify(Tensor! core_attn_out, Tensor q, Tensor k, Tensor v, Tensor b, Tensor a, "
+      "Tensor A_log, Tensor dt_bias, Tensor ssm_state, Tensor cache_indices, "
+      "Tensor! intermediate_states_buffer, Tensor intermediate_state_indices, int cache_steps, "
+      "Tensor? token_indx, Tensor? retrieve_parent_token) -> ()");
+  m.impl("gated_delta_rule_verify", torch::kXPU, &gated_delta_rule_verify);
+
+  // BENCHMARK-ONLY ops; see causal_conv1d_only_bench.hpp. To be removed once
+  // B.1b's conv1d-verify design is decided.
+  m.def(
+      "bench_gdn_style_causal_conv1d_prefill(Tensor! out, Tensor x_in, Tensor conv_weights, Tensor? conv_bias, "
+      "Tensor! conv_states, Tensor query_start_loc, Tensor cache_indices, Tensor? has_initial_state, "
+      "bool silu_activation, int pad_slot_id) -> ()");
+  m.impl("bench_gdn_style_causal_conv1d_prefill", torch::kXPU, &bench_gdn_style_causal_conv1d_prefill);
+  m.def(
+      "bench_gdn_style_causal_conv1d_decode(Tensor! out, Tensor x_in, Tensor conv_weights, Tensor? conv_bias, "
+      "Tensor! conv_states, Tensor query_start_loc, Tensor cache_indices, Tensor? has_initial_state, "
+      "bool silu_activation, int pad_slot_id) -> ()");
+  m.impl("bench_gdn_style_causal_conv1d_decode", torch::kXPU, &bench_gdn_style_causal_conv1d_decode);
+  m.def(
+      "bench_gdn_style_causal_conv1d_decode_fast(Tensor! out, Tensor x_in, Tensor conv_weights, Tensor? conv_bias, "
+      "Tensor! conv_states, Tensor query_start_loc, Tensor cache_indices, Tensor? has_initial_state, "
+      "bool silu_activation, int pad_slot_id) -> ()");
+  m.impl("bench_gdn_style_causal_conv1d_decode_fast", torch::kXPU, &bench_gdn_style_causal_conv1d_decode_fast);
 #endif  // USE_GDN
 
   /*

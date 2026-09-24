@@ -5,6 +5,7 @@
 #include "../SGLKernelPerf.h"
 #include "../Utils.h"
 #include "causal_conv1d.hpp"
+#include "causal_conv1d_only_bench.hpp"
 #include "chunk_causal_conv1d.hpp"
 #include "chunk_causal_conv1d_tiled.hpp"
 #include "chunk_gated_delta_rule.h"
@@ -509,4 +510,266 @@ SGL_KERNEL_EXPORT void gdn_attention(
     }
 #undef NATIVE_LAUNCHER
   }
+}
+
+// Standalone GDN recurrent op for plain (non-spec) prefill/decode, i.e. the
+// SSM-only half of what the fused `gdn_attention` op does internally for
+// its own non-spec path (see `NATIVE_LAUNCHER`'s `gdn::gated_delta_rule`
+// call above) -- minus conv1d. Exposed separately so SGLang can drive
+// prefill/decode through `causal_conv1d_fwd`/`causal_conv1d_update` +
+// this op, matching the same two-call convention CUDA/Triton/NPU/CPU
+// already use, instead of the fused monolithic op. `ssm_state` is the
+// committed recurrent-state pool, updated in place (mirrors CUDA/Triton's
+// `chunk_gated_delta_rule`/decode kernels; unlike `gated_delta_rule_verify`,
+// there is no separate scratch pool here since acceptance isn't a concern
+// outside of speculative decoding).
+SGL_KERNEL_EXPORT void gated_delta_rule(
+    torch::Tensor& core_attn_out,                           // [total_seqlen, num_v_heads, head_v_dim]
+    const torch::Tensor& q,                                 // [total_seqlen, num_k_heads, head_k_dim]
+    const torch::Tensor& k,                                 // [total_seqlen, num_k_heads, head_k_dim]
+    const torch::Tensor& v,                                 // [total_seqlen, num_v_heads, head_v_dim]
+    const torch::Tensor& b,                                 // [total_seqlen, num_v_heads]
+    const torch::Tensor& a,                                 // [total_seqlen, num_v_heads]
+    const torch::Tensor& A_log,                             // [num_v_heads]
+    const torch::Tensor& dt_bias,                           // [num_v_heads]
+    torch::Tensor& ssm_state,                               // [cache_batch_size, num_v_heads, head_v_dim, head_k_dim]
+    const torch::Tensor& query_start_loc,                   // [num_prefills + num_decodes + 1]
+    const std::optional<torch::Tensor>& token_indx,         // [total_seqlen] or None
+    const torch::Tensor& cache_indices,                     // [num_prefills + num_decodes]
+    const std::optional<torch::Tensor>& has_initial_state,  // [num_prefills + num_decodes] or None
+    const int64_t num_prefills,
+    const int64_t num_decodes) {
+  auto& queue = dpcppGetCurrentQueue();
+  std::optional<torch::Tensor> no_num_accepted_tokens{std::nullopt};
+  gdn::gated_delta_rule(
+      queue,
+      core_attn_out,
+      q,
+      k,
+      v,
+      b,
+      a,
+      A_log,
+      dt_bias,
+      ssm_state,
+      query_start_loc,
+      token_indx,
+      cache_indices,
+      has_initial_state,
+      no_num_accepted_tokens,
+      static_cast<int>(num_prefills),
+      static_cast<int>(num_decodes),
+      /*num_spec_decodes=*/0);
+}
+
+// Standalone GDN target_verify op (see `gdn::gated_delta_rule_verify` in
+// gated_delta_rule.hpp for the full contract). Exposed separately from the
+// fused `gdn_attention` op above so SGLang can drive spec-decode verify
+// through the SYCL kernel using its native scratch-pool convention without
+// requiring `causal_conv1d`'s spec branch to change in lockstep.
+SGL_KERNEL_EXPORT void gated_delta_rule_verify(
+    torch::Tensor& core_attn_out,
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& b,
+    const torch::Tensor& a,
+    const torch::Tensor& A_log,
+    const torch::Tensor& dt_bias,
+    const torch::Tensor& ssm_state,
+    const torch::Tensor& cache_indices,
+    torch::Tensor& intermediate_states_buffer,
+    const torch::Tensor& intermediate_state_indices,
+    const int64_t cache_steps,
+    const std::optional<torch::Tensor>& token_indx,
+    const std::optional<torch::Tensor>& retrieve_parent_token) {
+  auto& queue = dpcppGetCurrentQueue();
+  gdn::gated_delta_rule_verify(
+      queue,
+      core_attn_out,
+      q,
+      k,
+      v,
+      b,
+      a,
+      A_log,
+      dt_bias,
+      ssm_state,
+      cache_indices,
+      intermediate_states_buffer,
+      intermediate_state_indices,
+      cache_steps,
+      token_indx,
+      retrieve_parent_token);
+}
+
+// -----------------------------------------------------------------------------
+// BENCHMARK-ONLY entry points (not a production API, not part of B.1b).
+//
+// Isolate the conv1d-only cost of the GDN-specific (token-parallel, no
+// serial time-loop) causal-conv1d design -- stripped of the q/k/v/z/b/a
+// split it's normally fused with -- so it can be compared against the
+// general-purpose (channel-parallel, serial time-loop) design used by the
+// standalone `causal_conv1d_fwd`/`causal_conv1d_update` ops. See
+// causal_conv1d_only_bench.hpp and benchmark/bench_conv1d_split_compare.py.
+// Intended to be removed once B.1b's conv1d-verify design is decided.
+// -----------------------------------------------------------------------------
+SGL_KERNEL_EXPORT void bench_gdn_style_causal_conv1d_prefill(
+    torch::Tensor& out,
+    const torch::Tensor& x_in,
+    const torch::Tensor& conv_weights,
+    const std::optional<torch::Tensor>& conv_bias,
+    torch::Tensor& conv_states,
+    const torch::Tensor& query_start_loc,
+    const torch::Tensor& cache_indices,
+    const std::optional<torch::Tensor>& has_initial_state,
+    bool silu_activation,
+    int64_t pad_slot_id) {
+  auto& queue = dpcppGetCurrentQueue();
+  const int width = conv_weights.size(1);
+  const gdn::ActMode act_mode = silu_activation ? gdn::ActMode::silu : gdn::ActMode::swish;
+#define BENCH_PREFILL(scalar_t, W)                    \
+  gdn_bench::causal_conv1d_only_prefill<scalar_t, W>( \
+      queue,                                          \
+      out,                                            \
+      x_in,                                           \
+      conv_weights,                                   \
+      conv_bias,                                      \
+      conv_states,                                    \
+      query_start_loc,                                \
+      cache_indices,                                  \
+      has_initial_state,                              \
+      act_mode,                                       \
+      static_cast<int>(pad_slot_id));
+#define BENCH_PREFILL_DTYPE_DISPATCH(W)           \
+  if (x_in.scalar_type() == at::kBFloat16) {      \
+    BENCH_PREFILL(sycl::ext::oneapi::bfloat16, W) \
+  } else if (x_in.scalar_type() == at::kHalf) {   \
+    BENCH_PREFILL(sycl::half, W)                  \
+  } else {                                        \
+    BENCH_PREFILL(float, W)                       \
+  }
+  switch (width) {
+    case 2:
+      BENCH_PREFILL_DTYPE_DISPATCH(2)
+      break;
+    case 3:
+      BENCH_PREFILL_DTYPE_DISPATCH(3)
+      break;
+    case 4:
+      BENCH_PREFILL_DTYPE_DISPATCH(4)
+      break;
+    default:
+      TORCH_CHECK(false, "bench_gdn_style_causal_conv1d_prefill only supports width 2..4");
+  }
+#undef BENCH_PREFILL_DTYPE_DISPATCH
+#undef BENCH_PREFILL
+}
+
+SGL_KERNEL_EXPORT void bench_gdn_style_causal_conv1d_decode(
+    torch::Tensor& out,
+    const torch::Tensor& x_in,
+    const torch::Tensor& conv_weights,
+    const std::optional<torch::Tensor>& conv_bias,
+    torch::Tensor& conv_states,
+    const torch::Tensor& query_start_loc,
+    const torch::Tensor& cache_indices,
+    const std::optional<torch::Tensor>& has_initial_state,
+    bool silu_activation,
+    int64_t pad_slot_id) {
+  auto& queue = dpcppGetCurrentQueue();
+  const int width = conv_weights.size(1);
+  const gdn::ActMode act_mode = silu_activation ? gdn::ActMode::silu : gdn::ActMode::swish;
+#define BENCH_DECODE(scalar_t, W)                    \
+  gdn_bench::causal_conv1d_only_decode<scalar_t, W>( \
+      queue,                                         \
+      out,                                           \
+      x_in,                                          \
+      conv_weights,                                  \
+      conv_bias,                                     \
+      conv_states,                                   \
+      query_start_loc,                               \
+      cache_indices,                                 \
+      has_initial_state,                             \
+      act_mode,                                      \
+      static_cast<int>(pad_slot_id));
+#define BENCH_DECODE_DTYPE_DISPATCH(W)           \
+  if (x_in.scalar_type() == at::kBFloat16) {     \
+    BENCH_DECODE(sycl::ext::oneapi::bfloat16, W) \
+  } else if (x_in.scalar_type() == at::kHalf) {  \
+    BENCH_DECODE(sycl::half, W)                  \
+  } else {                                       \
+    BENCH_DECODE(float, W)                       \
+  }
+  switch (width) {
+    case 2:
+      BENCH_DECODE_DTYPE_DISPATCH(2)
+      break;
+    case 3:
+      BENCH_DECODE_DTYPE_DISPATCH(3)
+      break;
+    case 4:
+      BENCH_DECODE_DTYPE_DISPATCH(4)
+      break;
+    default:
+      TORCH_CHECK(false, "bench_gdn_style_causal_conv1d_decode only supports width 2..4");
+  }
+#undef BENCH_DECODE_DTYPE_DISPATCH
+#undef BENCH_DECODE
+}
+
+// Decode fast-path: same as bench_gdn_style_causal_conv1d_decode but skips
+// the O(batch_size) per-thread linear scan (batch_id == token_id trivially
+// for decode). Isolates whether that scan is the cause of GDN-style's
+// slowdown vs. general-purpose at large decode batch sizes.
+SGL_KERNEL_EXPORT void bench_gdn_style_causal_conv1d_decode_fast(
+    torch::Tensor& out,
+    const torch::Tensor& x_in,
+    const torch::Tensor& conv_weights,
+    const std::optional<torch::Tensor>& conv_bias,
+    torch::Tensor& conv_states,
+    const torch::Tensor& query_start_loc,
+    const torch::Tensor& cache_indices,
+    const std::optional<torch::Tensor>& has_initial_state,
+    bool silu_activation,
+    int64_t pad_slot_id) {
+  auto& queue = dpcppGetCurrentQueue();
+  const int width = conv_weights.size(1);
+  const gdn::ActMode act_mode = silu_activation ? gdn::ActMode::silu : gdn::ActMode::swish;
+#define BENCH_DECODE_FAST(scalar_t, W)                    \
+  gdn_bench::causal_conv1d_only_decode_fast<scalar_t, W>( \
+      queue,                                              \
+      out,                                                \
+      x_in,                                               \
+      conv_weights,                                       \
+      conv_bias,                                          \
+      conv_states,                                        \
+      query_start_loc,                                    \
+      cache_indices,                                      \
+      has_initial_state,                                  \
+      act_mode,                                           \
+      static_cast<int>(pad_slot_id));
+#define BENCH_DECODE_FAST_DTYPE_DISPATCH(W)           \
+  if (x_in.scalar_type() == at::kBFloat16) {          \
+    BENCH_DECODE_FAST(sycl::ext::oneapi::bfloat16, W) \
+  } else if (x_in.scalar_type() == at::kHalf) {       \
+    BENCH_DECODE_FAST(sycl::half, W)                  \
+  } else {                                            \
+    BENCH_DECODE_FAST(float, W)                       \
+  }
+  switch (width) {
+    case 2:
+      BENCH_DECODE_FAST_DTYPE_DISPATCH(2)
+      break;
+    case 3:
+      BENCH_DECODE_FAST_DTYPE_DISPATCH(3)
+      break;
+    case 4:
+      BENCH_DECODE_FAST_DTYPE_DISPATCH(4)
+      break;
+    default:
+      TORCH_CHECK(false, "bench_gdn_style_causal_conv1d_decode_fast only supports width 2..4");
+  }
+#undef BENCH_DECODE_FAST_DTYPE_DISPATCH
+#undef BENCH_DECODE_FAST
 }

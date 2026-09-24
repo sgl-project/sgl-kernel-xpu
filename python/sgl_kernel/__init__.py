@@ -92,7 +92,7 @@ except ImportError:
     # fp8_paged_mqa_logits_triton will simply be unavailable.
     fp8_paged_mqa_logits_triton = None
 from sgl_kernel.fused_norm_rope_v2 import compress_norm_rope_store
-from sgl_kernel.gdn_attn import gdn_attention
+from sgl_kernel.gdn_attn import gated_delta_rule, gated_delta_rule_verify, gdn_attention
 
 hadamard_transform = torch.ops.sgl_kernel.hadamard_transform
 fused_q_indexer_rope_hadamard_quant = (

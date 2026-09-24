@@ -279,12 +279,17 @@ def test_causal_conv1d(
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
 
 
+# width in {2,3} and dim % 4 != 0 specifically exercise the token-parallel
+# kernel (seqlen == 1, no cache_seqlens) that now backs this op -- see
+# causal_conv1d_token_parallel.hpp. Real models always use width=4 and
+# dim % 4 == 0, but the op's public API has historically supported (and is
+# tested for) width in {2,3,4} and arbitrary dim, so keep that coverage.
 @pytest.mark.parametrize("itype", [torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [False, True])
 @pytest.mark.parametrize("has_bias", [False, True])
 @pytest.mark.parametrize("seqlen", [1])
-@pytest.mark.parametrize("width", [4])
-@pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
+@pytest.mark.parametrize("width", [2, 3, 4])
+@pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096, 2050, 63])
 def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, itype):
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
@@ -370,14 +375,17 @@ def test_causal_conv1d_update_with_batch_gather(
     )
 
 
+# width in {2,3} and a dim % 4 != 0 case specifically exercise the
+# token-parallel kernel that now backs varlen prefill -- see
+# causal_conv1d_token_parallel.hpp.
 @pytest.mark.parametrize("itype", [torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [True])
 @pytest.mark.parametrize("has_bias", [True])
-@pytest.mark.parametrize("width", [4])
+@pytest.mark.parametrize("width", [2, 3, 4])
 @pytest.mark.parametrize(
     "seqlen", [8, 16, 32, 64, 128, 256, 512, 784, 1024, 2048, 2049, 4096]
 )
-@pytest.mark.parametrize("dim", [64, 4096])
+@pytest.mark.parametrize("dim", [64, 4096, 63])
 # tests correctness in case subset of the sequences are padded
 @pytest.mark.parametrize("with_padding", [True, False])
 def test_causal_conv1d_varlen(

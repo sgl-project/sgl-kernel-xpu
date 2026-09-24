@@ -420,3 +420,37 @@ def scaled_fp4_experts_quant(
     )
     output_scales = output_scales.view(torch.float8_e4m3fn)
     return output, output_scales
+
+
+def dsv3_router_gemm(
+    hidden_states: torch.Tensor,
+    router_weights: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    output = torch.empty(
+        hidden_states.shape[0],
+        router_weights.shape[0],
+        device=hidden_states.device,
+        dtype=out_dtype,
+    )
+    torch.ops.sgl_kernel.dsv3_router_gemm.default(
+        output,
+        hidden_states,
+        router_weights,
+    )
+    return output
+
+
+def dsv3_fused_a_gemm(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if output is None:
+        output = torch.empty(
+            (mat_a.shape[0], mat_b.shape[1]),
+            device=mat_a.device,
+            dtype=mat_a.dtype,
+        )
+    torch.ops.sgl_kernel.dsv3_fused_a_gemm.default(output, mat_a, mat_b)
+    return output

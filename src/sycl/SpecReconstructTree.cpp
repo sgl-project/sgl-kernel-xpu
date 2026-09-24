@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <atomic>
 #include <sycl/sycl.hpp>
+#include <type_traits>
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
@@ -96,6 +97,41 @@ inline uint64_t pack_mask_row(const bool* src, int32_t count, bool wide) {
     bits |= compress_mask_byte8(words[c >> 3]) << c;
   }
   return bits;
+}
+
+// Compile-time node count: the width branch resolves at compile time and the
+// qword loop unrolls fully (1, 2 or 4 trips for the shapes that matter).
+template <int32_t N>
+inline uint64_t pack_mask_row_static(const bool* src) {
+  if constexpr ((N & 7) != 0) {
+    return pack_mask_bytes(src, N);
+  } else {
+    const uint64_t* words = reinterpret_cast<const uint64_t*>(src);
+    uint64_t bits = 0;
+#pragma unroll
+    for (int32_t w = 0; w < N / 8; ++w) {
+      bits |= compress_mask_byte8(words[w]) << (w << 3);
+    }
+    return bits;
+  }
+}
+
+constexpr bool is_pow2(int32_t v) {
+  return v > 0 && (v & (v - 1)) == 0;
+}
+
+constexpr int32_t ilog2_exact(int32_t v) {
+  int32_t s = 0;
+  while ((int32_t{1} << s) < v) {
+    ++s;
+  }
+  return s;
+}
+
+inline void
+accumulate_byte_matches(uint64_t v, int32_t w, uint64_t want_kids, uint64_t want_sibs, uint64_t& kids, uint64_t& sibs) {
+  kids |= byte_eq_mask(v, want_kids) << (w << 3);
+  sibs |= byte_eq_mask(v, want_sibs) << (w << 3);
 }
 
 template <typename seq_t>
@@ -253,16 +289,34 @@ inline bool request_in_one_sub_group(int32_t n, int32_t lrange, int32_t max_widt
   return lrange <= max_width || max_width % n == 0;
 }
 
+// N_CONST == 0 means "take the node count from `n`"; a positive N_CONST turns the
+// divisibility test into a mask, since every specialized width is a power of two.
+//
+// Deciding this at compile time instead was tried and reverted: it requires
+// pinning the SIMD width with [[sycl::reqd_sub_group_size(32)]], and forcing
+// SIMD32 onto the 8- and 16-lane work-groups the small batches launch cost more
+// than the predicate it removed. Reading max_width at runtime lets the compiler
+// keep choosing the width per shape, which is what the small shapes want.
+template <int32_t N_CONST>
 inline void sync_request_scope(sycl::nd_item<1> item, int32_t n, int32_t lrange, int32_t max_width) {
-  if (request_in_one_sub_group(n, lrange, max_width)) {
+  if (request_in_one_sub_group(N_CONST > 0 ? N_CONST : n, lrange, max_width)) {
     sycl::group_barrier(item.get_sub_group());
   } else {
     sycl::group_barrier(item.get_group());
   }
 }
 
-template <typename seq_t>
+// N_CONST == 0 keeps the runtime-`num_nodes` path, which the long tail of node
+// counts in tests/speculative/test_ngram_utils.py still needs. A positive N_CONST
+// is a compile-time node count: the slot split becomes a shift and a mask instead
+// of a division and a multiply-subtract, the row packer and the SWAR readback
+// unroll fully, and the row-width branch and the tail clip constant-fold away.
+// Every specialized width is a power of two, so the shift split is exact.
+template <typename seq_t, int32_t N_CONST>
 struct ReconstructTreeSmallKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
+  static constexpr bool kStaticN = N_CONST > 0;
+  static constexpr int32_t kStaticWords = kStaticN ? (N_CONST + 7) >> 3 : 0;
+
   ReconstructTreeSmallKernel(
       const bool* tree_mask,
       const seq_t* verified_seq_len,
@@ -284,28 +338,41 @@ struct ReconstructTreeSmallKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         requests_per_group_(requests_per_group) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
-    const size_t words_per_request = static_cast<size_t>((num_nodes_ + 7) / 8);
+    const size_t words_per_request = static_cast<size_t>(kStaticN ? kStaticWords : (num_nodes_ + 7) / 8);
     parents_ = sycl::local_accessor<uint64_t, 1>(
         sycl::range<1>(static_cast<size_t>(requests_per_group_) * words_per_request), cgh);
   }
 
   void operator()(sycl::nd_item<1> item) const {
-    const int32_t n = num_nodes_;
+    const int32_t n = kStaticN ? N_CONST : num_nodes_;
     const int32_t max_width = static_cast<int32_t>(item.get_sub_group().get_max_local_range()[0]);
     const int32_t lrange = static_cast<int32_t>(item.get_local_range(0));
     const int32_t local_id = static_cast<int32_t>(item.get_local_id(0));
-    const int32_t slot = local_id / n;
-    const int32_t i = local_id - slot * n;
+
+    int32_t slot;
+    int32_t i;
+    if constexpr (is_pow2(N_CONST)) {
+      slot = local_id >> ilog2_exact(N_CONST);
+      i = local_id & (N_CONST - 1);
+    } else {
+      slot = local_id / n;
+      i = local_id - slot * n;
+    }
     const int64_t bid = static_cast<int64_t>(item.get_group(0)) * requests_per_group_ + slot;
     const bool active = bid < batch_size_;
 
-    const bool wide = (n & 7) == 0;
     const int64_t out = bid * n + i;
 
     int32_t parent = kNoNode;
     if (active) {
       const int64_t seq_base = static_cast<int64_t>(verified_seq_len_[bid]);
-      const uint64_t row = pack_mask_row(tree_mask_ + out * static_cast<int64_t>(n), n, wide);
+      const bool* src = tree_mask_ + out * static_cast<int64_t>(n);
+      uint64_t row;
+      if constexpr (kStaticN) {
+        row = pack_mask_row_static<N_CONST>(src);
+      } else {
+        row = pack_mask_row(src, n, (n & 7) == 0);
+      }
       const uint64_t strict = row & ((uint64_t{1} << i) - 1);
 
       positions_[out] = seq_base + static_cast<int64_t>(sycl::popcount(strict));
@@ -316,22 +383,27 @@ struct ReconstructTreeSmallKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       }
     }
 
-    const int32_t words_per_request = (n + 7) >> 3;
+    const int32_t words_per_request = kStaticN ? kStaticWords : (n + 7) >> 3;
     uint64_t* slot_words = parents_.template get_multi_ptr<sycl::access::decorated::no>().get() +
                            static_cast<int64_t>(slot) * words_per_request;
 
     reinterpret_cast<uint8_t*>(slot_words)[i] = static_cast<uint8_t>(parent);
-    sync_request_scope(item, n, lrange, max_width);
+    sync_request_scope<N_CONST>(item, n, lrange, max_width);
 
     const uint64_t want_kids = splat_byte(i);
     const uint64_t want_sibs = splat_byte(parent);
     uint64_t kids = 0;
     uint64_t sibs = 0;
+    if constexpr (kStaticN) {
+#pragma unroll
+      for (int32_t w = 0; w < kStaticWords; ++w) {
+        accumulate_byte_matches(slot_words[w], w, want_kids, want_sibs, kids, sibs);
+      }
+    } else {
 #pragma unroll 2
-    for (int32_t w = 0; w < words_per_request; ++w) {
-      const uint64_t v = slot_words[w];
-      kids |= byte_eq_mask(v, want_kids) << (w << 3);
-      sibs |= byte_eq_mask(v, want_sibs) << (w << 3);
+      for (int32_t w = 0; w < words_per_request; ++w) {
+        accumulate_byte_matches(slot_words[w], w, want_kids, want_sibs, kids, sibs);
+      }
     }
     if (n < 64) {
       const uint64_t valid = (uint64_t{1} << n) - 1;
@@ -365,6 +437,33 @@ struct ReconstructTreeSmallKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
   sycl::local_accessor<uint64_t, 1> parents_;
 };
+
+template <typename seq_t, int32_t N_CONST>
+inline void submit_small_kernel(
+    sycl::queue& queue,
+    const at::Tensor& tree_mask,
+    const at::Tensor& verified_seq_len,
+    at::Tensor& positions,
+    at::Tensor& retrive_index,
+    at::Tensor& retrive_next_token,
+    at::Tensor& retrive_next_sibling,
+    int32_t bs,
+    int32_t n,
+    int32_t requests_per_group,
+    int64_t global_range,
+    int64_t local_range) {
+  ReconstructTreeSmallKernel<seq_t, N_CONST> kernel(
+      tree_mask.data_ptr<bool>(),
+      verified_seq_len.data_ptr<seq_t>(),
+      positions.data_ptr<int64_t>(),
+      retrive_index.data_ptr<int64_t>(),
+      retrive_next_token.data_ptr<int64_t>(),
+      retrive_next_sibling.data_ptr<int64_t>(),
+      bs,
+      n,
+      requests_per_group);
+  sycl_kernel_submit(global_range, local_range, queue, kernel);
+}
 
 }  // namespace
 
@@ -452,17 +551,38 @@ SGL_KERNEL_EXPORT void reconstruct_indices_from_tree_mask(
 
   AT_DISPATCH_INDEX_TYPES(verified_seq_len.scalar_type(), "reconstruct_indices_from_tree_mask", [&] {
     if (use_fast_path) {
-      ReconstructTreeSmallKernel<index_t> kernel(
-          tree_mask.data_ptr<bool>(),
-          verified_seq_len.data_ptr<index_t>(),
-          positions.data_ptr<int64_t>(),
-          retrive_index.data_ptr<int64_t>(),
-          retrive_next_token.data_ptr<int64_t>(),
-          retrive_next_sibling.data_ptr<int64_t>(),
-          static_cast<int32_t>(bs),
-          static_cast<int32_t>(n),
-          static_cast<int32_t>(requests_per_group));
-      sycl_kernel_submit(groups * local_range, local_range, queue, kernel);
+      auto submit_small = [&](auto n_const) {
+        submit_small_kernel<index_t, decltype(n_const)::value>(
+            queue,
+            tree_mask,
+            verified_seq_len,
+            positions,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            static_cast<int32_t>(bs),
+            static_cast<int32_t>(n),
+            static_cast<int32_t>(requests_per_group),
+            groups * local_range,
+            local_range);
+      };
+      // Specialize the node counts speculative decoding actually runs at; every
+      // other count falls through to the runtime-n instantiation. Adding a width
+      // is one more case, at the cost of one more AOT-compiled kernel.
+      switch (n) {
+        case 8:
+          submit_small(std::integral_constant<int32_t, 8>{});
+          break;
+        case 16:
+          submit_small(std::integral_constant<int32_t, 16>{});
+          break;
+        case 32:
+          submit_small(std::integral_constant<int32_t, 32>{});
+          break;
+        default:
+          submit_small(std::integral_constant<int32_t, 0>{});
+          break;
+      }
       return;
     }
     ReconstructTreeKernel<index_t> kernel(

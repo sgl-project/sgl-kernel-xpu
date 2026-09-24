@@ -214,7 +214,14 @@ def build_inputs(
             1, topk + 1, (s_q,), device=device, dtype=torch.int32
         )
 
-    return q, kv, indices, topk_length
+    inputs = {
+        "q": q,
+        "kv": kv,
+        "indices": indices,
+        "topk_length": topk_length,
+        "d_v": D_V,
+    }
+    return inputs
 
 
 # ============================================================================
@@ -238,6 +245,7 @@ class PrefillConfig(NamedTuple):
     d_qk: int
     s_kv: int
     use_topk_length: bool = False
+    sm_scale: float | None = None
 
 
 # ---- PREFILL-stage on synthetic data ----
@@ -287,7 +295,7 @@ if __name__ == "__main__":
     results = []
 
     for cfg in configs:
-        q, kv, indices, topk_length = build_inputs(
+        inputs = build_inputs(
             cfg.s_q,
             cfg.h_q,
             cfg.topk,
@@ -296,20 +304,16 @@ if __name__ == "__main__":
             use_topk_length=cfg.use_topk_length,
             device=device,
         )
-        sm_scale = cfg.d_qk**-0.5
+        sm_scale = cfg.sm_scale if cfg.sm_scale is not None else cfg.d_qk**-0.5
         total_bytes = effective_bytes(cfg.s_q, cfg.h_q, cfg.topk, cfg.d_qk)
 
         # Triton reference (Triton gather -> PyTorch attention)
-        fn_triton = lambda: flash_mla_sparse_prefill_triton(
-            q, kv, indices, sm_scale, D_V, topk_length=topk_length
-        )
+        fn_triton = lambda: flash_mla_sparse_prefill_triton(**inputs, sm_scale=sm_scale)
         ms_triton, _, _ = triton.testing.do_bench(fn_triton, quantiles=[0.5, 0.2, 0.8])
         torch.xpu.synchronize()
 
         # SGL Kernel
-        fn_sgl = lambda: flash_mla_sparse_fwd(
-            q, kv, indices, sm_scale=sm_scale, d_v=D_V, topk_length=topk_length
-        )
+        fn_sgl = lambda: flash_mla_sparse_fwd(**inputs, sm_scale=sm_scale)
         ms_sgl, _, _ = triton.testing.do_bench(fn_sgl, quantiles=[0.5, 0.2, 0.8])
         bw_sgl = total_bytes / (ms_sgl / 1e3) / 1e9
         torch.xpu.synchronize()

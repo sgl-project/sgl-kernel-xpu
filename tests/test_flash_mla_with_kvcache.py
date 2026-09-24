@@ -474,6 +474,7 @@ def make_attn_sink(h_q=H_Q):
 @pytest.mark.parametrize("have_extra", [False, True])
 @pytest.mark.parametrize("have_attn_sink", [False, True])
 @pytest.mark.parametrize("have_topk_length", [False, True])
+@pytest.mark.parametrize("variable_topk", [False, True])
 @pytest.mark.parametrize(
     "page_size,extra_page_size,extra_topk",
     [
@@ -489,6 +490,7 @@ def test_dsv4_sparse_decode_correctness(
     have_extra,
     have_attn_sink,
     have_topk_length,
+    variable_topk,
     page_size,
     extra_page_size,
     extra_topk,
@@ -500,6 +502,8 @@ def test_dsv4_sparse_decode_correctness(
     num_ext_pages = 640
 
     q = torch.randn(bs, 1, num_heads, D_QK, dtype=dtype, device=device)
+    if variable_topk:
+        q = q.clamp(-1, 1)
     k_cache = make_fp8_kv_cache(num_swa_pages, page_size=page_size)
     indices = make_indices(
         bs, SWA_WINDOW, [SWA_WINDOW] * bs, num_swa_pages, page_size=page_size
@@ -510,11 +514,16 @@ def test_dsv4_sparse_decode_correctness(
         if have_extra
         else None
     )
+    if variable_topk:
+        max_valid = min(extra_topk, num_ext_pages * extra_page_size)
+        extra_valid_list = [min(b * 10, max_valid) for b in range(bs)]
+    else:
+        extra_valid_list = [min(256, extra_topk)] * bs
     extra_indices = (
         make_indices(
             bs,
             extra_topk,
-            [min(256, extra_topk)] * bs,
+            extra_valid_list,
             num_ext_pages,
             page_size=extra_page_size,
         )
@@ -561,46 +570,7 @@ def test_dsv4_sparse_decode_correctness(
     )
 
     torch.testing.assert_close(out.float(), ref_out.float(), atol=2e-2, rtol=2e-2)
-
-
-@pytest.mark.arch("xe20", "xe35")
-@pytest.mark.parametrize("bs", [7, 384])
-@pytest.mark.parametrize("extra_topk_valid", [0, 50, 512])
-def test_dsv4_variable_extra_topk(bs, extra_topk_valid):
-    """Variable number of valid extra tokens per batch."""
-    torch.manual_seed(42)
-
-    num_swa_pages = 64
-    num_ext_pages = 640
-    extra_topk = 512
-
-    q = torch.randn(bs, 1, H_Q, D_QK, dtype=torch.bfloat16, device=device).clamp(-1, 1)
-    k_cache = make_fp8_kv_cache(num_swa_pages, page_size=PAGE_SIZE)
-    indices = make_indices(
-        bs, SWA_WINDOW, [SWA_WINDOW] * bs, num_swa_pages, page_size=PAGE_SIZE
-    )
-
-    extra_k_cache = make_fp8_kv_cache(num_ext_pages, page_size=64)
-    valid_per_batch = [min(extra_topk_valid + b * 10, extra_topk) for b in range(bs)]
-    extra_indices = make_indices(
-        bs, extra_topk, valid_per_batch, num_ext_pages, page_size=64
-    )
-
-    out, lse = call_kernel(q, k_cache, indices, None, extra_k_cache, extra_indices)
-    ref_out, ref_lse = _sm120_sparse_decode_fwd(
-        q,
-        k_cache,
-        indices,
-        topk_length=None,
-        attn_sink=None,
-        head_dim_v=D_V,
-        softmax_scale=SM_SCALE,
-        extra_k_cache=extra_k_cache,
-        extra_indices=extra_indices,
-        extra_topk_length=None,
-    )
-
-    torch.testing.assert_close(out.float(), ref_out.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.arch("xe20", "xe35")

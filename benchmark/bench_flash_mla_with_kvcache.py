@@ -358,6 +358,9 @@ def make_indices(B, topk, num_pages, page_size, device):
     )
 
 
+# ============================================================================
+# Input construction
+# ============================================================================
 def build_inputs(
     B,
     topk,
@@ -382,7 +385,6 @@ def build_inputs(
         "topk_length": topk_length,
         "attn_sink": attn_sink,
         "head_dim_v": D_VAL,
-        "softmax_scale": SM_SCALE,
     }
 
     if extra_topk > 0:
@@ -431,6 +433,7 @@ class DecodeConfig(NamedTuple):
     page_size: int = PAGE_SIZE
     extra_num_pages: int = 0
     extra_page_size: int = 0
+    sm_scale: float | None = None
 
 
 batch_size_range = [1, 8, 42, 128, 256]
@@ -594,12 +597,16 @@ if __name__ == "__main__":
             extra_num_pages=cfg.extra_num_pages,
             extra_page_size=cfg.extra_page_size,
         )
+        sm_scale = cfg.sm_scale if cfg.sm_scale is not None else SM_SCALE
         total_bytes = _compute_total_bytes(cfg.b, cfg.topk, cfg.extra_topk, cfg.h_q)
 
-        # Triton V4
-        fn_triton = lambda: flash_mla_sparse_decode_triton(**inputs)
+        # Triton reference (Triton gather+dequant -> PyTorch attention)
+        fn_triton = lambda: flash_mla_sparse_decode_triton(
+            **inputs, softmax_scale=sm_scale
+        )
         ms_triton, _, _ = triton.testing.do_bench(fn_triton, quantiles=[0.5, 0.2, 0.8])
         torch.xpu.synchronize()
+
         # SGL Kernel
         fn_sgl = lambda: flash_mla_with_kvcache(
             q=inputs["q"],
@@ -609,7 +616,7 @@ if __name__ == "__main__":
             head_dim_v=inputs["head_dim_v"],
             tile_scheduler_metadata=None,
             num_splits=None,
-            softmax_scale=inputs["softmax_scale"],
+            softmax_scale=sm_scale,
             causal=False,
             is_fp8_kvcache=True,
             indices=inputs["indices"],

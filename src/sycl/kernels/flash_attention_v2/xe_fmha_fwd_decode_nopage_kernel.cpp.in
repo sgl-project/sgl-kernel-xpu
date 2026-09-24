@@ -73,7 +73,8 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
   if (params.return_softmax_lse) {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       using Element = @ELEM_TYPE@;
-      AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
+      dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
+      constexpr bool Softcap = decltype(softcap_tag)::value;
       DecodeConfig<
           false,
           LocalMask,
@@ -98,7 +99,8 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
   // No sink support for no_page path; always use Sink=false
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     using Element = @ELEM_TYPE@;
-    AT_DISPATCH_BOOL_NO_RETURN(params.softcap != 0.f, Softcap, {
+    dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
+      constexpr bool Softcap = decltype(softcap_tag)::value;
     DecodeConfig<
         false,
         LocalMask,

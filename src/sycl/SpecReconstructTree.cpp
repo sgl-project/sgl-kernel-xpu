@@ -17,7 +17,6 @@ limitations under the License.
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
-#include <atomic>
 #include <sycl/sycl.hpp>
 #include <type_traits>
 
@@ -28,23 +27,6 @@ limitations under the License.
 namespace {
 
 constexpr int32_t kNoNode = -1;
-
-constexpr int64_t kLaneTarget = 128;
-
-constexpr int32_t kSubGroupWidth = 16;
-
-inline int64_t xe_core_count(const sycl::device& dev) {
-  static std::atomic<int64_t> cached{0};
-  int64_t cores = cached.load(std::memory_order_relaxed);
-  if (cores == 0) {
-    cores = std::max<int64_t>(
-        static_cast<int64_t>(dev.get_info<sycl::ext::intel::info::device::gpu_slices>()) *
-            dev.get_info<sycl::ext::intel::info::device::gpu_subslices_per_slice>(),
-        1);
-    cached.store(cores, std::memory_order_relaxed);
-  }
-  return cores;
-}
 
 static_assert(sizeof(bool) == 1, "tree_mask packing assumes 1-byte bool");
 
@@ -99,8 +81,6 @@ inline uint64_t pack_mask_row(const bool* src, int32_t count, bool wide) {
   return bits;
 }
 
-// Compile-time node count: the width branch resolves at compile time and the
-// qword loop unrolls fully (1, 2 or 4 trips for the shapes that matter).
 template <int32_t N>
 inline uint64_t pack_mask_row_static(const bool* src) {
   if constexpr ((N & 7) != 0) {
@@ -114,18 +94,6 @@ inline uint64_t pack_mask_row_static(const bool* src) {
     }
     return bits;
   }
-}
-
-constexpr bool is_pow2(int32_t v) {
-  return v > 0 && (v & (v - 1)) == 0;
-}
-
-constexpr int32_t ilog2_exact(int32_t v) {
-  int32_t s = 0;
-  while ((int32_t{1} << s) < v) {
-    ++s;
-  }
-  return s;
 }
 
 inline void
@@ -146,27 +114,22 @@ struct ReconstructTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       int64_t* retrive_index,
       int64_t* retrive_next_token,
       int64_t* retrive_next_sibling,
-      int32_t batch_size,
       int32_t num_nodes,
       int32_t words_per_row,
-      int32_t lanes_per_request,
-      int32_t requests_per_group)
+      int32_t lanes_per_request)
       : tree_mask_(tree_mask),
         verified_seq_len_(verified_seq_len),
         positions_(positions),
         retrive_index_(retrive_index),
         retrive_next_token_(retrive_next_token),
         retrive_next_sibling_(retrive_next_sibling),
-        batch_size_(batch_size),
         num_nodes_(num_nodes),
         words_per_row_(words_per_row),
-        lanes_per_request_(lanes_per_request),
-        requests_per_group_(requests_per_group) {}
+        lanes_per_request_(lanes_per_request) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
-    const size_t slots = static_cast<size_t>(requests_per_group_);
-    rows_ = sycl::local_accessor<word_t, 1>(sycl::range<1>(slots * num_nodes_ * words_per_row_), cgh);
-    parent_ = sycl::local_accessor<int32_t, 1>(sycl::range<1>(slots * num_nodes_), cgh);
+    rows_ = sycl::local_accessor<word_t, 1>(sycl::range<1>(static_cast<size_t>(num_nodes_) * words_per_row_), cgh);
+    parent_ = sycl::local_accessor<int32_t, 1>(sycl::range<1>(static_cast<size_t>(num_nodes_)), cgh);
   }
 
   inline word_t strict_word(const word_t* row, int32_t i, int32_t w) const {
@@ -194,76 +157,72 @@ struct ReconstructTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const int32_t n = num_nodes_;
     const int32_t nw = words_per_row_;
     const int32_t lpr = lanes_per_request_;
-    const int32_t local_id = static_cast<int32_t>(item.get_local_id(0));
-    const int32_t slot = local_id / lpr;
-    const int32_t lane = local_id - slot * lpr;
-    const int64_t bid = static_cast<int64_t>(item.get_group(0)) * requests_per_group_ + slot;
-    const bool active = bid < batch_size_;
+    const int32_t lane = static_cast<int32_t>(item.get_local_id(0));
+    const int64_t bid = static_cast<int64_t>(item.get_group(0));
 
-    word_t* rows =
-        rows_.template get_multi_ptr<sycl::access::decorated::no>().get() + static_cast<int64_t>(slot) * n * nw;
-    int32_t* parent = parent_.template get_multi_ptr<sycl::access::decorated::no>().get() + slot * n;
+    word_t* rows = rows_.template get_multi_ptr<sycl::access::decorated::no>().get();
+    int32_t* parent = parent_.template get_multi_ptr<sycl::access::decorated::no>().get();
 
-    if (active) {
-      const bool* block = tree_mask_ + bid * static_cast<int64_t>(n) * n;
+    // Phase 1: bit-pack this request's [n, n] byte mask into SLM, one qword per 64
+    // nodes, so the two link phases below read 8x fewer bytes.
+    const bool* block = tree_mask_ + bid * static_cast<int64_t>(n) * n;
 #pragma unroll 2
-      for (int32_t i = lane; i < n; i += lpr) {
-        const bool* src = block + static_cast<int64_t>(i) * n;
+    for (int32_t i = lane; i < n; i += lpr) {
+      const bool* src = block + static_cast<int64_t>(i) * n;
 #pragma unroll 2
-        for (int32_t w = 0; w < nw; ++w) {
-          const int32_t lo = w * kWordBits;
-          rows[static_cast<int64_t>(i) * nw + w] = pack_mask_bytes(src + lo, sycl::min(kWordBits, n - lo));
-        }
+      for (int32_t w = 0; w < nw; ++w) {
+        const int32_t lo = w * kWordBits;
+        rows[static_cast<int64_t>(i) * nw + w] = pack_mask_bytes(src + lo, sycl::min(kWordBits, n - lo));
       }
     }
     sycl::group_barrier(item.get_group());
 
+    // Phase 2: depth is the population count of row i below the diagonal, and the
+    // immediate parent is that row's highest set bit below the diagonal.
     const int64_t out_base = bid * n;
-    if (active) {
-      const int64_t seq_len = static_cast<int64_t>(verified_seq_len_[bid]);
+    const int64_t seq_len = static_cast<int64_t>(verified_seq_len_[bid]);
 #pragma unroll 2
-      for (int32_t i = lane; i < n; i += lpr) {
-        const word_t* row = rows + static_cast<int64_t>(i) * nw;
-        int32_t depth = 0;
+    for (int32_t i = lane; i < n; i += lpr) {
+      const word_t* row = rows + static_cast<int64_t>(i) * nw;
+      int32_t depth = 0;
 #pragma unroll 2
-        for (int32_t w = 0; w < nw; ++w) {
-          depth += static_cast<int32_t>(sycl::popcount(strict_word(row, i, w)));
-        }
-        positions_[out_base + i] = seq_len + depth;
-        retrive_index_[out_base + i] = out_base + i;
-        parent[i] = immediate_parent(row, i);
+      for (int32_t w = 0; w < nw; ++w) {
+        depth += static_cast<int32_t>(sycl::popcount(strict_word(row, i, w)));
       }
+      positions_[out_base + i] = seq_len + depth;
+      retrive_index_[out_base + i] = out_base + i;
+      parent[i] = immediate_parent(row, i);
     }
     sycl::group_barrier(item.get_group());
 
-    if (active) {
+    // Phase 3: invert. First child is the lowest k > i whose row has bit i set;
+    // next sibling is the lowest k > i sharing i's parent.
 #pragma unroll 2
-      for (int32_t i = lane; i < n; i += lpr) {
-        const int32_t word = i / kWordBits;
-        const word_t bit = word_t{1} << (i % kWordBits);
+    for (int32_t i = lane; i < n; i += lpr) {
+      const int32_t word = i / kWordBits;
+      const word_t bit = word_t{1} << (i % kWordBits);
 
-        int32_t next_token = kNoNode;
+      int32_t next_token = kNoNode;
+#pragma unroll 2
+      for (int32_t k = i + 1; k < n; ++k) {
+        if (rows[static_cast<int64_t>(k) * nw + word] & bit) {
+          next_token = k;
+          break;
+        }
+      }
+      retrive_next_token_[out_base + i] = next_token;
+
+      int32_t next_sibling = kNoNode;
+      if (parent[i] != kNoNode) {
 #pragma unroll 2
         for (int32_t k = i + 1; k < n; ++k) {
-          if (rows[static_cast<int64_t>(k) * nw + word] & bit) {
-            next_token = k;
+          if (parent[k] == parent[i]) {
+            next_sibling = k;
             break;
           }
         }
-        retrive_next_token_[out_base + i] = next_token;
-
-        int32_t next_sibling = kNoNode;
-        if (parent[i] != kNoNode) {
-#pragma unroll 2
-          for (int32_t k = i + 1; k < n; ++k) {
-            if (parent[k] == parent[i]) {
-              next_sibling = k;
-              break;
-            }
-          }
-        }
-        retrive_next_sibling_[out_base + i] = next_sibling;
       }
+      retrive_next_sibling_[out_base + i] = next_sibling;
     }
   }
 
@@ -273,11 +232,9 @@ struct ReconstructTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   int64_t* retrive_index_;
   int64_t* retrive_next_token_;
   int64_t* retrive_next_sibling_;
-  int32_t batch_size_;
   int32_t num_nodes_;
   int32_t words_per_row_;
   int32_t lanes_per_request_;
-  int32_t requests_per_group_;
 
   sycl::local_accessor<word_t, 1> rows_;
   sycl::local_accessor<int32_t, 1> parent_;
@@ -285,33 +242,14 @@ struct ReconstructTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
 constexpr int64_t kFastPathMaxNodes = 64;
 
-inline bool request_in_one_sub_group(int32_t n, int32_t lrange, int32_t max_width) {
-  return lrange <= max_width || max_width % n == 0;
-}
-
-// N_CONST == 0 means "take the node count from `n`"; a positive N_CONST turns the
-// divisibility test into a mask, since every specialized width is a power of two.
-//
-// Deciding this at compile time instead was tried and reverted: it requires
-// pinning the SIMD width with [[sycl::reqd_sub_group_size(32)]], and forcing
-// SIMD32 onto the 8- and 16-lane work-groups the small batches launch cost more
-// than the predicate it removed. Reading max_width at runtime lets the compiler
-// keep choosing the width per shape, which is what the small shapes want.
-template <int32_t N_CONST>
-inline void sync_request_scope(sycl::nd_item<1> item, int32_t n, int32_t lrange, int32_t max_width) {
-  if (request_in_one_sub_group(N_CONST > 0 ? N_CONST : n, lrange, max_width)) {
+inline void sync_request_scope(sycl::nd_item<1> item, int32_t n, int32_t max_width) {
+  if (n <= max_width) {
     sycl::group_barrier(item.get_sub_group());
   } else {
     sycl::group_barrier(item.get_group());
   }
 }
 
-// N_CONST == 0 keeps the runtime-`num_nodes` path, which the long tail of node
-// counts in tests/speculative/test_ngram_utils.py still needs. A positive N_CONST
-// is a compile-time node count: the slot split becomes a shift and a mask instead
-// of a division and a multiply-subtract, the row packer and the SWAR readback
-// unroll fully, and the row-width branch and the tail clip constant-fold away.
-// Every specialized width is a power of two, so the shift split is exact.
 template <typename seq_t, int32_t N_CONST>
 struct ReconstructTreeSmallKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr bool kStaticN = N_CONST > 0;
@@ -324,71 +262,50 @@ struct ReconstructTreeSmallKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       int64_t* retrive_index,
       int64_t* retrive_next_token,
       int64_t* retrive_next_sibling,
-      int32_t batch_size,
-      int32_t num_nodes,
-      int32_t requests_per_group)
+      int32_t num_nodes)
       : tree_mask_(tree_mask),
         verified_seq_len_(verified_seq_len),
         positions_(positions),
         retrive_index_(retrive_index),
         retrive_next_token_(retrive_next_token),
         retrive_next_sibling_(retrive_next_sibling),
-        batch_size_(batch_size),
-        num_nodes_(num_nodes),
-        requests_per_group_(requests_per_group) {}
+        num_nodes_(num_nodes) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
-    const size_t words_per_request = static_cast<size_t>(kStaticN ? kStaticWords : (num_nodes_ + 7) / 8);
-    parents_ = sycl::local_accessor<uint64_t, 1>(
-        sycl::range<1>(static_cast<size_t>(requests_per_group_) * words_per_request), cgh);
+    const size_t words = static_cast<size_t>(kStaticN ? kStaticWords : (num_nodes_ + 7) / 8);
+    parents_ = sycl::local_accessor<uint64_t, 1>(sycl::range<1>(words), cgh);
   }
 
   void operator()(sycl::nd_item<1> item) const {
     const int32_t n = kStaticN ? N_CONST : num_nodes_;
     const int32_t max_width = static_cast<int32_t>(item.get_sub_group().get_max_local_range()[0]);
-    const int32_t lrange = static_cast<int32_t>(item.get_local_range(0));
-    const int32_t local_id = static_cast<int32_t>(item.get_local_id(0));
-
-    int32_t slot;
-    int32_t i;
-    if constexpr (is_pow2(N_CONST)) {
-      slot = local_id >> ilog2_exact(N_CONST);
-      i = local_id & (N_CONST - 1);
-    } else {
-      slot = local_id / n;
-      i = local_id - slot * n;
-    }
-    const int64_t bid = static_cast<int64_t>(item.get_group(0)) * requests_per_group_ + slot;
-    const bool active = bid < batch_size_;
-
+    const int32_t i = static_cast<int32_t>(item.get_local_id(0));
+    const int64_t bid = static_cast<int64_t>(item.get_group(0));
     const int64_t out = bid * n + i;
 
+    const int64_t seq_base = static_cast<int64_t>(verified_seq_len_[bid]);
+    const bool* src = tree_mask_ + out * static_cast<int64_t>(n);
+    uint64_t row;
+    if constexpr (kStaticN) {
+      row = pack_mask_row_static<N_CONST>(src);
+    } else {
+      row = pack_mask_row(src, n, (n & 7) == 0);
+    }
+    const uint64_t strict = row & ((uint64_t{1} << i) - 1);
+
+    positions_[out] = seq_base + static_cast<int64_t>(sycl::popcount(strict));
+    retrive_index_[out] = out;
+
     int32_t parent = kNoNode;
-    if (active) {
-      const int64_t seq_base = static_cast<int64_t>(verified_seq_len_[bid]);
-      const bool* src = tree_mask_ + out * static_cast<int64_t>(n);
-      uint64_t row;
-      if constexpr (kStaticN) {
-        row = pack_mask_row_static<N_CONST>(src);
-      } else {
-        row = pack_mask_row(src, n, (n & 7) == 0);
-      }
-      const uint64_t strict = row & ((uint64_t{1} << i) - 1);
-
-      positions_[out] = seq_base + static_cast<int64_t>(sycl::popcount(strict));
-      retrive_index_[out] = out;
-
-      if (strict != 0) {
-        parent = 63 - static_cast<int32_t>(sycl::clz(strict));
-      }
+    if (strict != 0) {
+      parent = 63 - static_cast<int32_t>(sycl::clz(strict));
     }
 
-    const int32_t words_per_request = kStaticN ? kStaticWords : (n + 7) >> 3;
-    uint64_t* slot_words = parents_.template get_multi_ptr<sycl::access::decorated::no>().get() +
-                           static_cast<int64_t>(slot) * words_per_request;
+    const int32_t words = kStaticN ? kStaticWords : (n + 7) >> 3;
+    uint64_t* parent_words = parents_.template get_multi_ptr<sycl::access::decorated::no>().get();
 
-    reinterpret_cast<uint8_t*>(slot_words)[i] = static_cast<uint8_t>(parent);
-    sync_request_scope<N_CONST>(item, n, lrange, max_width);
+    reinterpret_cast<uint8_t*>(parent_words)[i] = static_cast<uint8_t>(parent);
+    sync_request_scope(item, n, max_width);
 
     const uint64_t want_kids = splat_byte(i);
     const uint64_t want_sibs = splat_byte(parent);
@@ -397,32 +314,31 @@ struct ReconstructTreeSmallKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     if constexpr (kStaticN) {
 #pragma unroll
       for (int32_t w = 0; w < kStaticWords; ++w) {
-        accumulate_byte_matches(slot_words[w], w, want_kids, want_sibs, kids, sibs);
+        accumulate_byte_matches(parent_words[w], w, want_kids, want_sibs, kids, sibs);
       }
     } else {
 #pragma unroll 2
-      for (int32_t w = 0; w < words_per_request; ++w) {
-        accumulate_byte_matches(slot_words[w], w, want_kids, want_sibs, kids, sibs);
+      for (int32_t w = 0; w < words; ++w) {
+        accumulate_byte_matches(parent_words[w], w, want_kids, want_sibs, kids, sibs);
       }
     }
+
     if (n < 64) {
       const uint64_t valid = (uint64_t{1} << n) - 1;
       kids &= valid;
       sibs &= valid;
     }
 
-    if (active) {
-      retrive_next_token_[out] = kids ? static_cast<int64_t>(sycl::ctz(kids)) : kNoNode;
+    retrive_next_token_[out] = kids ? static_cast<int64_t>(sycl::ctz(kids)) : kNoNode;
 
-      int64_t next_sibling = kNoNode;
-      if (parent != kNoNode) {
-        const uint64_t above = (i >= 63) ? 0ull : (sibs & ~((uint64_t{1} << (i + 1)) - 1));
-        if (above) {
-          next_sibling = static_cast<int64_t>(sycl::ctz(above));
-        }
+    int64_t next_sibling = kNoNode;
+    if (parent != kNoNode) {
+      const uint64_t above = (i >= 63) ? 0ull : (sibs & ~((uint64_t{1} << (i + 1)) - 1));
+      if (above) {
+        next_sibling = static_cast<int64_t>(sycl::ctz(above));
       }
-      retrive_next_sibling_[out] = next_sibling;
     }
+    retrive_next_sibling_[out] = next_sibling;
   }
 
   const bool* tree_mask_;
@@ -431,9 +347,7 @@ struct ReconstructTreeSmallKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   int64_t* retrive_index_;
   int64_t* retrive_next_token_;
   int64_t* retrive_next_sibling_;
-  int32_t batch_size_;
   int32_t num_nodes_;
-  int32_t requests_per_group_;
 
   sycl::local_accessor<uint64_t, 1> parents_;
 };
@@ -447,9 +361,7 @@ inline void submit_small_kernel(
     at::Tensor& retrive_index,
     at::Tensor& retrive_next_token,
     at::Tensor& retrive_next_sibling,
-    int32_t bs,
     int32_t n,
-    int32_t requests_per_group,
     int64_t global_range,
     int64_t local_range) {
   ReconstructTreeSmallKernel<seq_t, N_CONST> kernel(
@@ -459,9 +371,7 @@ inline void submit_small_kernel(
       retrive_index.data_ptr<int64_t>(),
       retrive_next_token.data_ptr<int64_t>(),
       retrive_next_sibling.data_ptr<int64_t>(),
-      bs,
-      n,
-      requests_per_group);
+      n);
   sycl_kernel_submit(global_range, local_range, queue, kernel);
 }
 
@@ -505,6 +415,7 @@ SGL_KERNEL_EXPORT void reconstruct_indices_from_tree_mask(
         " elements, got ",
         out->numel());
   }
+
   TORCH_CHECK(
       verified_seq_len.numel() >= batch_size,
       "reconstruct_indices_from_tree_mask: verified_seq_len must hold at least ",
@@ -527,26 +438,11 @@ SGL_KERNEL_EXPORT void reconstruct_indices_from_tree_mask(
   const int64_t n = draft_token_num;
   const int64_t max_wg = dpcppMaxWorkGroupSize();
 
-  const int64_t lanes_per_request = std::min<int64_t>(n, max_wg);
-
-  const int64_t num_subslices = xe_core_count(queue.get_device());
-  int64_t requests_per_group = std::max<int64_t>(bs / num_subslices, 1);
-  requests_per_group = std::min(requests_per_group, std::max<int64_t>(kLaneTarget / lanes_per_request, 1));
-  requests_per_group = std::min(requests_per_group, std::max<int64_t>(max_wg / lanes_per_request, 1));
-
-  const bool use_fast_path = n <= kFastPathMaxNodes && lanes_per_request == n;
-
-  if (use_fast_path && n < kSubGroupWidth && kSubGroupWidth % n == 0) {
-    const int64_t per_sub_group = kSubGroupWidth / n;
-    if (requests_per_group >= per_sub_group) {
-      requests_per_group -= requests_per_group % per_sub_group;
-    } else {
-      requests_per_group = std::min<int64_t>(per_sub_group, bs);
-    }
-  }
-
-  const int64_t local_range = requests_per_group * lanes_per_request;
-  const int64_t groups = (bs + requests_per_group - 1) / requests_per_group;
+  // One work-group per request, one work-item per draft token (strided when the
+  // token count exceeds the device work-group limit).
+  const int64_t local_range = std::min<int64_t>(n, max_wg);
+  const int64_t global_range = bs * local_range;
+  const bool use_fast_path = n <= kFastPathMaxNodes && local_range == n;
   const int64_t words_per_row = (n + 63) / 64;
 
   AT_DISPATCH_INDEX_TYPES(verified_seq_len.scalar_type(), "reconstruct_indices_from_tree_mask", [&] {
@@ -560,10 +456,8 @@ SGL_KERNEL_EXPORT void reconstruct_indices_from_tree_mask(
             retrive_index,
             retrive_next_token,
             retrive_next_sibling,
-            static_cast<int32_t>(bs),
             static_cast<int32_t>(n),
-            static_cast<int32_t>(requests_per_group),
-            groups * local_range,
+            global_range,
             local_range);
       };
       // Specialize the node counts speculative decoding actually runs at; every
@@ -592,11 +486,9 @@ SGL_KERNEL_EXPORT void reconstruct_indices_from_tree_mask(
         retrive_index.data_ptr<int64_t>(),
         retrive_next_token.data_ptr<int64_t>(),
         retrive_next_sibling.data_ptr<int64_t>(),
-        static_cast<int32_t>(bs),
         static_cast<int32_t>(n),
         static_cast<int32_t>(words_per_row),
-        static_cast<int32_t>(lanes_per_request),
-        static_cast<int32_t>(requests_per_group));
-    sycl_kernel_submit(groups * local_range, local_range, queue, kernel);
+        static_cast<int32_t>(local_range));
+    sycl_kernel_submit(global_range, local_range, queue, kernel);
   });
 }

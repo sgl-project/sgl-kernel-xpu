@@ -51,6 +51,7 @@ Outputs:
 #include <sycl/sycl.hpp>
 
 #include "MemoryAccess.h"
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -509,6 +510,21 @@ SGL_KERNEL_EXPORT void build_tree_kernel_efficient(
   while (pack_words > 1 && draft_token_num < 4 * pack_words) {
     pack_words >>= 1;
   }
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = 0.0;
+  const double bytes =
+      static_cast<double>(parent_list.numel()) * static_cast<double>(parent_list.element_size()) +
+      static_cast<double>(selected_index.numel()) * static_cast<double>(selected_index.element_size()) +
+      static_cast<double>(verified_seq_len.numel()) * static_cast<double>(verified_seq_len.element_size()) +
+      static_cast<double>(tree_mask.numel()) * static_cast<double>(tree_mask.element_size()) +
+      static_cast<double>(positions.numel()) * static_cast<double>(positions.element_size()) +
+      static_cast<double>(retrive_index.numel()) * static_cast<double>(retrive_index.element_size()) +
+      static_cast<double>(retrive_next_token.numel()) * static_cast<double>(retrive_next_token.element_size()) +
+      static_cast<double>(retrive_next_sibling.numel()) * static_cast<double>(retrive_next_sibling.element_size());
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  SGL_KERNEL_PERF_SCOPE("build_tree_kernel_efficient", profiling_queue, bytes, flops);
+#endif
 
   AT_DISPATCH_INDEX_TYPES(verified_seq_len.scalar_type(), "build_tree_kernel_efficient", [&] {
     auto launch = [&](auto pack_words_tag) {

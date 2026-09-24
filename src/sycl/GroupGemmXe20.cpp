@@ -14,6 +14,7 @@
 #ifdef USE_MOE_JIT
 #include "jit/moe_jit.h"
 #endif
+#include "SGLKernelPerf.h"
 #include "sgl_kernel_export.h"
 
 using namespace cute;
@@ -221,6 +222,18 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
   bool with_bias = bias.has_value();
   void* bias_ptr = with_bias ? bias->data_ptr() : nullptr;
   int ld_b = static_cast<int>(weights.stride(1));
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Grouped GEMM: sum over experts of (m_e, K) @ (K, N). Total M rows summed as total_m.
+  const double M = static_cast<double>(total_m);
+  const double N = static_cast<double>(gemm_n);
+  const double K = static_cast<double>(gemm_k);
+  const double flops = 2.0 * M * N * K;
+  const double bytes = static_cast<double>(activations.numel()) * static_cast<double>(activations.element_size()) +
+                       static_cast<double>(weights.numel()) * static_cast<double>(weights.element_size()) +
+                       static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
+  SGL_KERNEL_PERF_SCOPE("moe_grouped_mm_nt_xe20", queue, bytes, flops);
+#endif
 
 #ifdef USE_MOE_JIT
   {

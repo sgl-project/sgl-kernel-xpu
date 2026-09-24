@@ -28,6 +28,7 @@ limitations under the License.
 #include <cstdlib>
 #include <utility>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "kernels/nsa/fp8_mqa_gemm_xe20.hpp"
@@ -281,6 +282,11 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_paged_mqa_logits(
   auto stream = c10::xpu::getCurrentXPUStream();
   auto& queue = stream.queue();
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   bool use_gemm = (H >= MIN_M_GEMM && msl >= MIN_N_GEMM);
 
   if (use_gemm) {
@@ -384,6 +390,18 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_paged_mqa_logits(
           msl,
           heads_per_group);
     }
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+    // Q @ K^T over paged fp8 KV: 2 * B * H * msl * D flops for the matmul + reduce (~B*H*msl).
+    const double flops =
+        2.0 * static_cast<double>(B_next) * static_cast<double>(H) * static_cast<double>(msl) * static_cast<double>(D);
+    const double bytes = static_cast<double>(q_fp8.numel()) * 1.0 +
+                         static_cast<double>(B_next) * static_cast<double>(msl) * (static_cast<double>(D) + 4.0) +
+                         static_cast<double>(B_next) * static_cast<double>(H) * 4.0 +
+                         static_cast<double>(logits.numel()) * 4.0;
+    ::sglkernel::report_kernel_perf("fp8_paged_mqa_logits", queue, timer, bytes, flops);
+#endif
+
     return logits;
   }
 
@@ -403,6 +421,18 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_paged_mqa_logits(
       msl};
   auto [paged_global_range, paged_local_range] = compute_2d_launch_ranges(B, msl);
   sycl_kernel_submit(paged_global_range, paged_local_range, queue, paged_kernel);
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Q @ K^T over paged fp8 KV: 2 * B * H * msl * D flops for the matmul + reduce (~B*H*msl).
+  const double flops =
+      2.0 * static_cast<double>(B_next) * static_cast<double>(H) * static_cast<double>(msl) * static_cast<double>(D);
+  const double bytes = static_cast<double>(q_fp8.numel()) * 1.0 +
+                       static_cast<double>(B_next) * static_cast<double>(msl) * (static_cast<double>(D) + 4.0) +
+                       static_cast<double>(B_next) * static_cast<double>(H) * 4.0 +
+                       static_cast<double>(logits.numel()) * 4.0;
+  ::sglkernel::report_kernel_perf("fp8_paged_mqa_logits", queue, timer, bytes, flops);
+#endif
+
   return logits;
 }
 

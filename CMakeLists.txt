@@ -78,6 +78,13 @@ include(FetchContent)
 
 # SYCL support in cutlass
 add_compile_definitions(CUTLASS_ENABLE_SYCL)
+# Propagate CUTLASS SYCL profiling flag so that any sgl-kernel-xpu kernel guarded
+# by `#if defined(CUTLASS_SYCL_PROFILING_ENABLED)` compiles in its GPU_Clock timer
+# and report_kernel_perf() call. This is the compile-time switch that enables the
+# time / bandwidth / TFLOPS printout in every instrumented kernel entry point.
+if(CUTLASS_SYCL_PROFILING_ENABLED)
+  add_compile_definitions(CUTLASS_SYCL_PROFILING_ENABLED)
+endif()
 set(CUTLASS_ENABLE_SYCL ON CACHE BOOL "Enable SYCL in the cutlass" FORCE)
 set(CUTLASS_ENABLE_BENCHMARKS  OFF CACHE BOOL "Remove benchmark to avoid cmake version issue in google benchmark" FORCE)
 set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable headers only mode in cutlass" FORCE)

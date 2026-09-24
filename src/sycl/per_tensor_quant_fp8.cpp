@@ -29,12 +29,14 @@
  *
  **************************************************************************************************/
 #include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
 #include <cutlass/float8.h>
 
 #include <algorithm>
 #include <sycl/sycl.hpp>
 
 #include "MemoryAccess.h"
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -177,6 +179,16 @@ sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor outpu
   auto& Q = dpcppGetCurrentQueue();
   sycl::range<1> global_range(num_blocks * block_size);
   sycl::range<1> local_range(block_size);
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Per-tensor FP8 quant: one scale/mul per input element. Memory-bound.
+  const double flops = static_cast<double>(input.numel());
+  const double bytes = static_cast<double>(input.numel()) * static_cast<double>(input.element_size()) +
+                       static_cast<double>(output_q.numel()) * static_cast<double>(output_q.element_size()) +
+                       static_cast<double>(output_s.numel()) * static_cast<double>(output_s.element_size());
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  SGL_KERNEL_PERF_SCOPE("per_tensor_quant_fp8", profiling_queue, bytes, flops);
+#endif
 
 #define LAUNCH_KERNEL(T, DST_DTYPE, VEC_SIZE)                                           \
   do {                                                                                  \

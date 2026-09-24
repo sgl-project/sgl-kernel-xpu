@@ -7,6 +7,7 @@
 #include <cute/tensor.hpp>
 #include <map>
 
+#include "SGLKernelPerf.h"
 #include "Utils.h"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
@@ -202,6 +203,19 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_fp8_w8a16(
   }
   bool with_bias = bias.has_value();
   void* bias_ptr = with_bias ? bias->data_ptr() : nullptr;
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Grouped GEMM: 2*M*N*K flops (main matmul) + dequant/scale (~2*M*N) + bias add.
+  const double flops = 2.0 * static_cast<double>(total_m) * static_cast<double>(gemm_n) * static_cast<double>(gemm_k);
+  const double a_bytes =
+      static_cast<double>(total_m) * static_cast<double>(gemm_k) * static_cast<double>(activations.element_size());
+  const double w_bytes = static_cast<double>(n_experts) * static_cast<double>(gemm_n) * static_cast<double>(gemm_k) *
+                         static_cast<double>(weights.element_size());
+  const double out_bytes =
+      static_cast<double>(total_m) * static_cast<double>(gemm_n) * static_cast<double>(output.element_size());
+  const double bytes = a_bytes + w_bytes + out_bytes;
+  SGL_KERNEL_PERF_SCOPE("moe_grouped_mm_nt_xe20_fp8_w8a16", queue, bytes, flops);
+#endif
 
 #ifdef USE_MOE_JIT
   std::string jit_err;

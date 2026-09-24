@@ -27,6 +27,15 @@ def _export_jit_toolchain_env() -> None:
 
 _export_jit_toolchain_env()
 
+# Opt-in H2D transfer profiler. Set SGL_H2D_PROFILE=1 to print one perf line
+# per cpu->xpu `.to()` call, using the same "op perf(source): time=... ms,
+# bandwidth=... GB/s" shape as the C++ SGL_KERNEL_PERF_SCOPE output. See
+# python/sgl_kernel/_h2d_profile.py.
+if os.environ.get("SGL_H2D_PROFILE") == "1":
+    from sgl_kernel._h2d_profile import install as _install_h2d_profile
+
+    _install_h2d_profile()
+
 cuda_path = f"/usr/local/cuda/targets/{SYSTEM_ARCH}-linux/lib/libcudart.so.12"
 if os.path.exists(cuda_path):
     ctypes.CDLL(cuda_path, mode=ctypes.RTLD_GLOBAL)

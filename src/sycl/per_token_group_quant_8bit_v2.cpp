@@ -35,6 +35,7 @@
 #include <cmath>
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "cutlass/float8.h"
@@ -746,6 +747,15 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_8bit_v2(
   const int num_tokens_per_expert = static_cast<int>(output_q.size(-2));
   const int scale_expert_stride = masked_layout ? static_cast<int>(output_s.stride(0)) : 0;
   const int scale_hidden_stride = static_cast<int>(output_s.stride(-1));
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = static_cast<double>(input.numel());
+  const double bytes = static_cast<double>(input.numel()) * static_cast<double>(input.element_size()) +
+                       static_cast<double>(output_q.numel()) * static_cast<double>(output_q.element_size()) +
+                       static_cast<double>(output_s.numel()) * static_cast<double>(output_s.element_size());
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  SGL_KERNEL_PERF_SCOPE("per_token_group_quant_8bit_v2", profiling_queue, bytes, flops);
+#endif
 
 #define LAUNCH_KERNEL_INNER(SCHEDULER, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, output_s_dtype, ...)           \
   do {                                                                                                               \

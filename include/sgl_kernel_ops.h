@@ -177,7 +177,8 @@ void sgl_per_token_group_quant_8bit(
     double eps,
     double fp8_min,
     double fp8_max,
-    bool scale_ue8m0);
+    bool scale_ue8m0,
+    int64_t round_mode = 0);
 void sgl_per_token_group_quant_8bit_v2(
     at::Tensor input,
     at::Tensor output_q,
@@ -247,7 +248,8 @@ void sgl_per_token_group_quant_fp4(
     at::Tensor output_s,
     int64_t group_size,
     double eps,
-    std::optional<at::Tensor> input_secondary = std::nullopt);
+    std::optional<at::Tensor> input_secondary = std::nullopt,
+    int64_t round_mode = 2);
 void store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices);
 void biased_topk(
     const at::Tensor& input,

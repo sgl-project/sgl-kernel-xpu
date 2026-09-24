@@ -416,6 +416,64 @@ class TestPerTokenGroupQuantXPU:
         ).item()
         assert cos >= 0.99, f"dequant cosine too low: {cos}"
 
+    @pytest.mark.parametrize(
+        "num_tokens,hidden_dim", [(128, 1024), (64, 512), (5, 2048), (256, 4096)]
+    )
+    @pytest.mark.parametrize("round_mode", [0, 1])  # RCEIL, EVEN (FLOOR is MXFP4-only)
+    def test_mxfp8_row_major_ue8m0(self, num_tokens, hidden_dim, round_mode):
+        """MXFP8: row-major UE8M0 scale output with the OCP MX fixed block_size=32.
+
+        Unlike `test_plain_row_major_ue8m0` (which exercises the generic
+        UE8M0-scaled path for arbitrary group_size), this test fixes
+        group_size=32 to match the actual MXFP8 spec, and covers the
+        round_mode values that are valid for E4M3 (RCEIL, EVEN).
+        """
+        group_size = 32
+        torch.manual_seed(0)
+        x_cpu = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16)
+        x_xpu = x_cpu.to(self.device)
+
+        num_groups = hidden_dim // group_size
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+
+        x_s = torch.empty(
+            (num_tokens, num_groups), device=self.device, dtype=torch.uint8
+        )
+        x_q = torch.empty(
+            (num_tokens, hidden_dim), device=self.device, dtype=torch.float8_e4m3fn
+        )
+        torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit.default(
+            x_xpu, x_q, x_s, group_size, self.eps, -fp8_max, fp8_max, True, round_mode
+        )
+
+        assert x_s.shape == (num_tokens, num_groups)
+        assert x_s.dtype == torch.uint8
+
+        # Reference UE8M0 byte per (token, group): byte = exp + 127, where
+        #   RCEIL: exp = ceil(log2(max(amax / 448, 1e-10)))
+        #   EVEN:  exp = round_half_to_even(log2(max(amax / 448, 1e-10)))
+        xv = x_cpu.view(num_tokens, num_groups, group_size).float()
+        amax = xv.abs().amax(dim=2).clamp(min=self.eps)
+        y_s = (amax / fp8_max).clamp(min=1e-10)
+        if round_mode == 0:
+            exp_s = torch.ceil(torch.log2(y_s))
+        else:
+            exp_s = torch.round(torch.log2(y_s))
+        byte_ref = (exp_s.to(torch.int32) + 127).to(torch.uint8)
+        torch.testing.assert_close(x_s.cpu(), byte_ref, rtol=0, atol=0)
+
+        # Round-trip: dequantize with the emitted UE8M0 scales and confirm the
+        # quantization preserved the signal (high cosine similarity).
+        scale = torch.pow(2.0, (x_s.cpu().to(torch.int32) - 127).float())
+        x_dq = (
+            x_q.cpu().view(num_tokens, num_groups, group_size).float()
+            * scale.unsqueeze(2)
+        ).view(num_tokens, hidden_dim)
+        cos = torch.nn.functional.cosine_similarity(
+            x_dq.flatten(), x_cpu.float().flatten(), dim=0
+        ).item()
+        assert cos >= 0.99, f"dequant cosine too low: {cos}"
+
 
 @triton.jit
 def _per_token_group_quant_fp8(

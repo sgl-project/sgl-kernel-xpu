@@ -15,6 +15,16 @@
 
 namespace at::native::xpu {
 
+// UE8M0 scale round modes for different requirements in low-precision models.
+// Runtime (not template) values, so this doesn't multiply out the kernel's already large
+// template instantiation set (T x DST_DTYPE x GROUP_SIZE x IS_COLUMN_MAJOR x
+// SCALE_UE8M0).
+//   RCEIL: exp = ceil(log2(y_s)) -- never overflows.
+//   EVEN:  exp = round_half_to_even(log2(y_s)) -- nearest.
+//   FLOOR: exp = floor(log2(local_absmax)) - E2M1_EMAX (OCP MX / MXFP4 default).
+//          E2M1_EMAX is hardcoded to 2.
+enum RoundMode : int64_t { RCEIL = 0, EVEN = 1, FLOOR = 2 };
+
 // SYCL helper for group reduce max using sub-groups
 // Works with 32-wide sub-groups but reduces within 16-thread quantization groups
 // Each 32-wide sub-group contains two 16-thread quantization groups
@@ -69,6 +79,7 @@ struct PerTokenGroupQuant8bitKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       float eps,
       float min_8bit,
       float max_8bit,
+      int64_t round_mode = RoundMode::RCEIL,
       int num_groups_per_row = 0,
       int scale_stride = 0)
       : input(input),
@@ -79,6 +90,7 @@ struct PerTokenGroupQuant8bitKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         eps(eps),
         min_8bit(min_8bit),
         max_8bit(max_8bit),
+        round_mode(round_mode),
         num_groups_per_row(num_groups_per_row),
         scale_stride(scale_stride) {}
 
@@ -160,7 +172,21 @@ struct PerTokenGroupQuant8bitKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
     // Quantize the scale factor for UE8M0 format if needed
     if constexpr (SCALE_UE8M0) {
-      float exp_s = sycl::ceil(sycl::log2(sycl::fmax(y_s, 1e-10f)));
+      float exp_s;
+      switch (round_mode) {
+        case RoundMode::EVEN:
+          // sycl::rint is round-to-nearest, ties-to-even (IEEE 754 default),
+          exp_s = sycl::rint(sycl::log2(sycl::fmax(y_s, 1e-10f)));
+          break;
+        case RoundMode::FLOOR:
+          // Disabled when MXFP8 is used
+          exp_s = sycl::floor(sycl::log2(sycl::fmax(local_absmax, 1e-10f))) - 2.0f;
+          break;
+        case RoundMode::RCEIL:
+        default:
+          exp_s = sycl::ceil(sycl::log2(sycl::fmax(y_s, 1e-10f)));  // for FP8, INT8 and MXFP8 with round mode RCEIL
+          break;
+      }
       y_s = sycl::exp2(exp_s);
       // represent quantized scale as power of 2 exponent + 127 bias
       y_s_quant = static_cast<scale_element_t>(static_cast<int>(exp_s) + 127);
@@ -216,6 +242,7 @@ struct PerTokenGroupQuant8bitKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   float eps;
   float min_8bit;
   float max_8bit;
+  int64_t round_mode;
   int num_groups_per_row;
   int scale_stride;
 };
@@ -228,7 +255,8 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_8bit(
     double eps,
     double min_8bit,
     double max_8bit,
-    bool scale_ue8m0) {
+    bool scale_ue8m0,
+    int64_t round_mode = RoundMode::RCEIL) {
   CHECK_CONTIGUOUS(input);
   CHECK_CONTIGUOUS(output_q);
 
@@ -273,6 +301,17 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_8bit(
       dst_type == at::ScalarType::Char || dst_type == at::ScalarType::Float8_e4m3fn,
       "sgl_per_token_group_quant_8bit: output_q dtype must be Int8 or Float8_e4m3fn, got ",
       dst_type);
+  TORCH_CHECK(
+      round_mode == RoundMode::RCEIL || round_mode == RoundMode::EVEN || round_mode == RoundMode::FLOOR,
+      "sgl_per_token_group_quant_8bit: round_mode must be 0 (RCEIL), 1 (EVEN), or 2 (FLOOR), got ",
+      round_mode);
+  if (scale_ue8m0) {
+    TORCH_CHECK(
+        round_mode != RoundMode::FLOOR,
+        "sgl_per_token_group_quant_8bit: round_mode FLOOR (2) is not supported when scale_ue8m0 is True (for MXFP8), "
+        "got ",
+        round_mode);
+  }
 
   sycl::range<1> global_range(num_blocks * num_threads);
   sycl::range<1> local_range(num_threads);
@@ -299,6 +338,7 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_8bit(
             static_cast<float>(eps),                                                      \
             static_cast<float>(min_8bit),                                                 \
             static_cast<float>(max_8bit),                                                 \
+            round_mode,                                                                   \
             num_groups_per_row,                                                           \
             scale_stride);                                                                \
         sycl_kernel_submit(global_range, local_range, queue, kernel);                     \
@@ -312,6 +352,7 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_8bit(
             static_cast<float>(eps),                                                      \
             static_cast<float>(min_8bit),                                                 \
             static_cast<float>(max_8bit),                                                 \
+            RoundMode::RCEIL,                                                             \
             num_groups_per_row,                                                           \
             scale_stride);                                                                \
         sycl_kernel_submit(global_range, local_range, queue, kernel);                     \
@@ -327,6 +368,7 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_8bit(
           static_cast<float>(eps),                                                        \
           static_cast<float>(min_8bit),                                                   \
           static_cast<float>(max_8bit),                                                   \
+          round_mode,                                                                     \
           num_groups_per_row,                                                             \
           scale_stride);                                                                  \
       sycl_kernel_submit(global_range, local_range, queue, kernel);                       \

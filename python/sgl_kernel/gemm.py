@@ -94,13 +94,28 @@ def sgl_per_token_group_quant_8bit(
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
     enable_v2: Optional[bool] = None,
+    round_mode: int = 0,
 ) -> None:
+    assert round_mode in (
+        0,
+        1,
+        2,
+    ), f"Invalid round_mode {round_mode}, must be 0 (RCEIL), 1 (EVEN), or 2 (FLOOR)"
     if enable_v2 is None:
-        from sglang.srt.utils import get_bool_env_var
+        try:
+            from sglang.srt.utils import get_bool_env_var
+        except ImportError:
+            # sglang is not a hard dependency of sgl_kernel; fall back to a
+            # local equivalent so this module works standalone.
+            import os
+
+            def get_bool_env_var(name: str, default: str = "false") -> bool:
+                return os.environ.get(name, default).lower() in ("true", "1")
 
         enable_v2 = get_bool_env_var("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
 
     if enable_v2:
+        assert round_mode == 0, "only non-v2 supports custom round_mode"
         return torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit_v2.default(
             input,
             output_q,
@@ -114,10 +129,29 @@ def sgl_per_token_group_quant_8bit(
             masked_m,
         )
 
+    if scale_ue8m0:
+        assert (
+            round_mode != 2
+        ), "round_mode 2 (FLOOR) is not supported when scale_ue8m0 is True (for MXFP8)"
+        assert (
+            output_s.dtype == torch.uint8
+        ), "scale tensor must be uint8 when scale_ue8m0 is True (for MXFP8)"
+        assert (
+            group_size == 32
+        ), "group_size must be 32 when scale_ue8m0 is True (for MXFP8)"
+
     assert not fuse_silu_and_mul, "only v2 support fuse_silu_and_mul"
     assert masked_m is None, "only v2 support masked_m"
     torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit.default(
-        input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+        input,
+        output_q,
+        output_s,
+        group_size,
+        eps,
+        fp8_min,
+        fp8_max,
+        scale_ue8m0,
+        round_mode,
     )
 
 
@@ -143,6 +177,7 @@ def sgl_per_token_group_quant_fp4(
     eps: float = 1e-10,
     x_secondary: Optional[torch.Tensor] = None,
     column_major_scales: bool = False,
+    round_mode: int = 2,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize input tensor to MXFP4 (E2M1) format with per-token group scaling.
@@ -163,6 +198,7 @@ def sgl_per_token_group_quant_fp4(
                      Must have same shape, dtype, and device as x.
         column_major_scales: If True, store scales in column-major interleaved layout
                              for better cache locality in MoE workloads. Default is False.
+        round_mode: Rounding mode for quantization. Must be 0 (RCEIL), 1 (EVEN), or 2 (FLOOR). Default is 2.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -177,6 +213,11 @@ def sgl_per_token_group_quant_fp4(
     ), f"the last dimension of `x` ({x.shape[-1]}) must be divisible by `group_size` ({group_size})"
     assert x.is_contiguous(), "`x` is not contiguous"
     assert group_size == 32, f"group_size must be 32 for MXFP4, got {group_size}"
+    assert round_mode in (
+        0,
+        1,
+        2,
+    ), f"Invalid round_mode {round_mode}, must be 0 (RCEIL), 1 (EVEN), or 2 (FLOOR)"
 
     # Validate x_secondary if provided
     if x_secondary is not None:
@@ -223,7 +264,13 @@ def sgl_per_token_group_quant_fp4(
 
     if x.shape[0] > 0:
         torch.ops.sgl_kernel.sgl_per_token_group_quant_fp4.default(
-            x, output_q, output_s, group_size, eps, x_secondary
+            x,
+            output_q,
+            output_s,
+            group_size,
+            eps,
+            x_secondary,
+            round_mode,
         )
 
     # Reshape output to match input shape

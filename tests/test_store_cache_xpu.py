@@ -16,18 +16,24 @@ def reference_store_cache(k, v, k_cache, v_cache, indices):
     v_cache[indices] = v
 
 
+def make_kv_tensor(num_tokens, row_dim, dtype):
+    if dtype == torch.uint8:
+        return torch.randint(0, 256, (num_tokens, row_dim), dtype=dtype, device="xpu")
+    return torch.randn(num_tokens, row_dim, dtype=dtype, device="xpu")
+
+
 class TestStoreCacheXPU:
     @pytest.mark.parametrize("num_tokens", [1, 4, 32, 128])
     @pytest.mark.parametrize("row_dim", [128, 256, 512, 1024])
-    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.uint8])
     def test_parity(self, num_tokens, row_dim, dtype):
         from sgl_kernel import store_cache_xpu
 
         torch.manual_seed(42)
         cache_size = 2048
 
-        k = torch.randn(num_tokens, row_dim, dtype=dtype, device="xpu")
-        v = torch.randn(num_tokens, row_dim, dtype=dtype, device="xpu")
+        k = make_kv_tensor(num_tokens, row_dim, dtype)
+        v = make_kv_tensor(num_tokens, row_dim, dtype)
         indices = torch.randperm(cache_size, device="xpu")[:num_tokens].to(torch.int64)
 
         k_cache_ref = torch.zeros(cache_size, row_dim, dtype=dtype, device="xpu")
@@ -103,7 +109,7 @@ class TestStoreCacheXPU:
 
     @pytest.mark.parametrize("num_heads", [2, 10])
     @pytest.mark.parametrize("head", [0, 1])
-    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.uint8])
     def test_strided_head_slice(self, num_heads, head, dtype):
         """Non-contiguous K/V: a per-head slice of a [tokens, heads, dim]
         tensor has row stride heads*dim (not dim). The kernel must address
@@ -117,8 +123,12 @@ class TestStoreCacheXPU:
         torch.manual_seed(123)
         num_tokens, row_dim, cache_size = 271, 256, 2048
 
-        kw = torch.randn(num_tokens, num_heads, row_dim, dtype=dtype, device="xpu")
-        vw = torch.randn(num_tokens, num_heads, row_dim, dtype=dtype, device="xpu")
+        kw = make_kv_tensor(num_tokens, num_heads * row_dim, dtype).view(
+            num_tokens, num_heads, row_dim
+        )
+        vw = make_kv_tensor(num_tokens, num_heads * row_dim, dtype).view(
+            num_tokens, num_heads, row_dim
+        )
         k = kw[:, head, :]  # shape (num_tokens, row_dim), stride (num_heads*row_dim, 1)
         v = vw[:, head, :]
         assert not k.is_contiguous()

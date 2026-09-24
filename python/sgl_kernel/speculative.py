@@ -101,10 +101,10 @@ def build_tree_kernel_efficient(
 def reconstruct_indices_from_tree_mask(
     tree_mask: torch.Tensor,
     verified_seq_len: torch.Tensor,
-    positions: torch.Tensor,  # mutable
-    retrive_index: torch.Tensor,  # mutable
-    retrive_next_token: torch.Tensor,  # mutable
-    retrive_next_sibling: torch.Tensor,  # mutable
+    positions: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
     batch_size: int,
     draft_token_num: int,
 ) -> None:

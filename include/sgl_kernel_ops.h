@@ -1300,19 +1300,7 @@ void gate_up_lora_b_fwd(
     const std::optional<torch::Tensor>& base_output  // [num_tokens, 2*N]
 );
 
-void lora_gather_rows(
-    torch::Tensor& output,            // [num_rows, width]  output[i] = input[permutation[i]]
-    const torch::Tensor& input,       // [num_rows, width]
-    const torch::Tensor& permutation  // [num_rows,]
-);
-
-void lora_scatter_rows(
-    torch::Tensor& output,            // [num_rows, width]  output[permutation[i]] = input[i]
-    const torch::Tensor& input,       // [num_rows, width]
-    const torch::Tensor& permutation  // [num_rows,]
-);
-
-void chunked_sgmv_lora_shrink_forward(
+void chunked_sgmv_lora_shrink_fwd(
     torch::Tensor& output,         // [num_tokens, num_slices*max_rank]
     const torch::Tensor& x,        // [num_tokens, input_dim]
     const torch::Tensor& weights,  // [num_loras, num_slices*max_rank, input_dim]

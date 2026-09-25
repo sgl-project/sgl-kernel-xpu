@@ -3,16 +3,11 @@ from typing import List
 
 import pytest
 import torch
-from sgl_kernel import (
-    chunked_sgmv_lora_shrink_forward,
-    lora_gather_rows,
-    lora_scatter_rows,
-    sgemm_lora_a_fwd,
-)
+from sgl_kernel import chunked_sgmv_lora_shrink_fwd
 
 if not torch.xpu.is_available():
     pytest.skip(
-        reason="chunked_sgmv_lora_shrink_forward requires XPU device.",
+        reason="chunked_sgmv_lora_shrink_fwd requires XPU device.",
         allow_module_level=True,
     )
 
@@ -91,16 +86,40 @@ def _reference_chunked_shrink(
     return out
 
 
-def _build_logical_segments(row_adapters: List[int]):
-    """Build (permutation, seg_indptr, weight_indices) from a physical-order adapter list.
+def _build_logical_segments(row_adapters: List[int], permutation_mode: str = "sorted"):
+    """Build (permutation, seg_indptr, weight_indices) for a chunked-shrink call.
 
-    Mirrors ChunkedLoraBackend._get_permutation / _get_segments_info: sort rows by
-    adapter (stable argsort => logical order), then run-length encode into segments.
+    ``permutation_mode`` selects one of the op's three permutation regimes; the
+    seg_indptr / weight_indices always run-length encode the adapter of each
+    *logical* row.
+
+    - ``"sorted"`` (decode): physical rows interleave adapters ("zigzag"). The
+      permutation is the stable argsort (logical -> physical) that groups rows
+      by adapter -- mirrors ChunkedLoraBackend._get_permutation /
+      _get_segments_info. Segments describe the sorted (logical) layout.
+    - ``"identity"``: rows are already grouped by adapter (physical == logical),
+      but the op is still driven through gather/scatter with an identity
+      permutation (``arange``) -- a no-op remap.
+    - ``"none"`` (prefill fast path): rows already grouped; ``permutation`` is
+      ``None`` so the op skips gather/scatter and runs the GEMM in place.
+
+    For ``"identity"`` / ``"none"`` the run-length encoding just follows the
+    given order, so any ``row_adapters`` is valid
     """
     ra = torch.tensor(row_adapters, dtype=torch.int32)
-    permutation = torch.argsort(ra, stable=True).to(torch.int32)  # logical -> physical
-    reordered = ra[permutation.to(torch.int64)]
-    uniq, counts = torch.unique_consecutive(reordered, return_counts=True)
+    if permutation_mode == "sorted":
+        permutation = torch.argsort(ra, stable=True).to(torch.int32)  # logical -> physical
+        logical = ra[permutation.to(torch.int64)]
+    elif permutation_mode == "identity":
+        permutation = torch.arange(ra.numel(), dtype=torch.int32)  # no-op remap
+        logical = ra
+    elif permutation_mode == "none":
+        permutation = None  # prefill fast path: GEMM in place, no gather/scatter
+        logical = ra
+    else:
+        raise ValueError(f"unknown permutation_mode: {permutation_mode!r}")
+
+    uniq, counts = torch.unique_consecutive(logical, return_counts=True)
     seg_indptr = torch.zeros(uniq.numel() + 1, dtype=torch.int32)
     seg_indptr[1:] = torch.cumsum(counts, dim=0).to(torch.int32)
     weight_indices = uniq.to(torch.int32)
@@ -108,87 +127,7 @@ def _build_logical_segments(row_adapters: List[int]):
 
 
 # ----------------------------------------------------------------------------
-# gather / scatter primitives
-# ----------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("width", [1, 8, 4096])
-def test_gather_matches_indexing(dtype, width):
-    torch.manual_seed(0)
-    num_rows = 37
-    x = torch.randn(num_rows, width, dtype=dtype, device="xpu")
-    perm = torch.randperm(num_rows, device="xpu").to(torch.int32)
-
-    out = lora_gather_rows(x, perm)
-
-    ref = x.cpu()[perm.cpu().to(torch.int64)]
-    torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("width", [1, 8, 4096])
-def test_scatter_matches_indexing(dtype, width):
-    torch.manual_seed(1)
-    num_rows = 37
-    x = torch.randn(num_rows, width, dtype=dtype, device="xpu")
-    perm = torch.randperm(num_rows, device="xpu").to(torch.int32)
-
-    out = lora_scatter_rows(x, perm)
-
-    ref = torch.empty_like(x.cpu())
-    ref[perm.cpu().to(torch.int64)] = x.cpu()
-    torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_gather_scatter_round_trip(dtype):
-    """scatter(gather(x, p), p) == x for any permutation p."""
-    torch.manual_seed(2)
-    num_rows, width = 64, 128
-    x = torch.randn(num_rows, width, dtype=dtype, device="xpu")
-    perm = torch.randperm(num_rows, device="xpu").to(torch.int64)
-
-    round_trip = lora_scatter_rows(lora_gather_rows(x, perm), perm)
-    torch.testing.assert_close(round_trip.cpu(), x.cpu(), rtol=0, atol=0)
-
-
-def test_gather_int64_permutation_accepted():
-    x = torch.randn(8, 16, dtype=torch.float16, device="xpu")
-    perm = torch.randperm(8, device="xpu").to(torch.int64)
-    out = lora_gather_rows(x, perm)
-    torch.testing.assert_close(out.cpu(), x.cpu()[perm.cpu()], rtol=0, atol=0)
-
-
-@pytest.mark.parametrize(
-    "bad_case, expected_msg",
-    [
-        ("input_dim", "input must be a 2D tensor"),
-        ("perm_dim", "permutation must be a 1D tensor"),
-        ("perm_size", "permutation.numel\\(\\) must equal input.size\\(0\\)"),
-        ("perm_out_of_range", "permutation values must be in"),
-    ],
-)
-def test_gather_input_validation(bad_case, expected_msg):
-    x = torch.randn(8, 16, dtype=torch.float16, device="xpu")
-    perm = torch.randperm(8, device="xpu").to(torch.int32)
-
-    if bad_case == "input_dim":
-        x = x.view(-1)
-    elif bad_case == "perm_dim":
-        perm = perm.view(1, -1)
-    elif bad_case == "perm_size":
-        perm = perm[:4]
-    elif bad_case == "perm_out_of_range":
-        perm = perm.clone()
-        perm[0] = 8
-
-    with pytest.raises(RuntimeError, match=expected_msg):
-        lora_gather_rows(x, perm)
-
-
-# ----------------------------------------------------------------------------
-# chunked_sgmv_lora_shrink_forward (three-kernel orchestration)
+# chunked_sgmv_lora_shrink_fwd (three-kernel orchestration)
 # ----------------------------------------------------------------------------
 
 
@@ -201,13 +140,17 @@ def _run_and_compare_chunked(
     stack_num: int,
     num_loras: int,
     lora_ranks: torch.Tensor,
+    permutation_mode: str = "sorted",
 ) -> None:
     torch.manual_seed(0)
     num_tokens = len(row_adapters)
     total_n = stack_num * max_rank
 
-    permutation, seg_indptr, weight_indices = _build_logical_segments(row_adapters)
-    permutation = permutation.to("xpu")
+    permutation, seg_indptr, weight_indices = _build_logical_segments(
+        row_adapters, permutation_mode
+    )
+    if permutation is not None:
+        permutation = permutation.to("xpu")
     seg_indptr = seg_indptr.to("xpu")
     weight_indices = weight_indices.to("xpu")
 
@@ -215,7 +158,7 @@ def _run_and_compare_chunked(
     weights = torch.randn(num_loras, total_n, input_dim, dtype=dtype, device="xpu")
     weights = _zero_weight_rank_tail(weights, lora_ranks, stack_num)
 
-    out = chunked_sgmv_lora_shrink_forward(
+    out = chunked_sgmv_lora_shrink_fwd(
         input_x=input_x,
         weights=weights,
         stack_num=stack_num,
@@ -226,9 +169,14 @@ def _run_and_compare_chunked(
         permutation=permutation,
     )
 
-    ref = _reference_chunked_shrink(
-        input_x, weights, seg_indptr, weight_indices, permutation
-    )
+    if permutation is None:
+        # Prefill fast path: rows are already logical, so the reference is a
+        # plain segmented grouped GEMM (no gather/scatter).
+        ref = _reference_sgemm(input_x, weights, seg_indptr, weight_indices)
+    else:
+        ref = _reference_chunked_shrink(
+            input_x, weights, seg_indptr, weight_indices, permutation
+        )
 
     assert out.shape == (num_tokens, total_n)
     assert out.dtype == dtype
@@ -238,171 +186,96 @@ def _run_and_compare_chunked(
     torch.testing.assert_close(out, ref, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("input_dim", [64, 4096])
-@pytest.mark.parametrize("max_rank", [8, 64])
-def test_chunked_shrink_zigzag_decode(dtype, input_dim, max_rank):
-    """Interleaved (zigzag) adapters across single-token decode rows."""
-    num_loras = 3
-    row_adapters = [0, 1, 2, 0, 1, 2, 0, 1, 2, 0]  # zigzag
-    lora_ranks = torch.tensor(
-        [max_rank, max(1, max_rank // 2), max(1, max_rank // 4)],
-        dtype=torch.int32,
-        device="xpu",
-    )
+# One data-driven test over named scenarios. Each scenario overrides only the
+# params it exercises; everything else falls back to _DEFAULT_SCENARIO.
+# ``lora_ranks=None`` means "full rank for every adapter" ([max_rank]*num_loras).
+_DEFAULT_SCENARIO = {
+    "input_dim": 256,
+    "max_rank": 8,
+    "stack_num": 1,
+    "num_loras": 2,
+    "row_adapters": [0, 1, 0, 1, 0, 1, 0, 1],
+    "lora_ranks": None,
+    "permutation_mode": "sorted",
+}
+
+# Deterministic 512-token random adapter assignment (isolated from global RNG).
+_MANY_ADAPTERS = torch.randint(
+    0, 4, (512,), generator=torch.Generator().manual_seed(7)
+).tolist()
+
+_ZIGZAG = [0, 1, 2, 0, 1, 2, 0, 1, 2, 0]
+
+_SCENARIOS = [
+    # Interleaved (zigzag) decode adapters, swept over input_dim x max_rank.
+    pytest.param(
+        {"num_loras": 3, "row_adapters": _ZIGZAG, "input_dim": 64, "max_rank": 8,
+         "lora_ranks": [8, 4, 2]},
+        id="zigzag-K64-r8",
+    ),
+    pytest.param(
+        {"num_loras": 3, "row_adapters": _ZIGZAG, "input_dim": 64, "max_rank": 64,
+         "lora_ranks": [64, 32, 16]},
+        id="zigzag-K64-r64",
+    ),
+    pytest.param(
+        {"num_loras": 3, "row_adapters": _ZIGZAG, "input_dim": 4096, "max_rank": 8,
+         "lora_ranks": [8, 4, 2]},
+        id="zigzag-K4096-r8",
+    ),
+    pytest.param(
+        {"num_loras": 3, "row_adapters": _ZIGZAG, "input_dim": 4096, "max_rank": 64,
+         "lora_ranks": [64, 32, 16]},
+        id="zigzag-K4096-r64",
+    ),
+    # Stacked projections: o_proj=1, gate_up=2, qkv=3.
+    pytest.param({"stack_num": 1, "lora_ranks": [8, 4]}, id="stack1"),
+    pytest.param({"stack_num": 2, "lora_ranks": [8, 4]}, id="stack2"),
+    pytest.param({"stack_num": 3, "lora_ranks": [8, 4]}, id="stack3"),
+    # A rank-0 adapter must yield an all-zero output for its rows.
+    pytest.param(
+        {"row_adapters": [0, 1, 0, 1, 0, 1], "input_dim": 128, "lora_ranks": [0, 8]},
+        id="zero-rank-adapter",
+    ),
+    # Many tokens across many adapters.
+    pytest.param(
+        {"num_loras": 4, "max_rank": 16, "input_dim": 512,
+         "row_adapters": _MANY_ADAPTERS, "lora_ranks": [1, 4, 8, 16]},
+        id="many-adapters",
+    ),
+    # permutation=None prefill fast path (rows pre-grouped, GEMM in place).
+    pytest.param(
+        {"num_loras": 3, "row_adapters": [0] * 16 + [2] * 32 + [1] * 16,
+         "lora_ranks": [8, 4, 2], "permutation_mode": "none"},
+        id="permutation-none",
+    ),
+    # Identity permutation drives the gather/scatter path as a no-op remap.
+    pytest.param(
+        {"row_adapters": [0] * 16 + [1] * 16, "input_dim": 128,
+         "lora_ranks": [8, 4], "permutation_mode": "identity"},
+        id="identity-permutation",
+    ),
+]
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("scenario", _SCENARIOS)
+def test_chunked_shrink(dtype, scenario):
+    cfg = {**_DEFAULT_SCENARIO, **scenario}
+    num_loras = cfg["num_loras"]
+    max_rank = cfg["max_rank"]
+    ranks = cfg["lora_ranks"] if cfg["lora_ranks"] is not None else [max_rank] * num_loras
+    lora_ranks = torch.tensor(ranks, dtype=torch.int32, device="xpu")
     _run_and_compare_chunked(
         dtype=dtype,
-        row_adapters=row_adapters,
-        input_dim=input_dim,
+        row_adapters=cfg["row_adapters"],
+        input_dim=cfg["input_dim"],
         max_rank=max_rank,
-        stack_num=1,
+        stack_num=cfg["stack_num"],
         num_loras=num_loras,
         lora_ranks=lora_ranks,
+        permutation_mode=cfg["permutation_mode"],
     )
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("stack_num", [1, 2, 3])
-def test_chunked_shrink_stack_num(dtype, stack_num):
-    num_loras = 2
-    max_rank = 8
-    row_adapters = [0, 1, 0, 1, 0, 1, 0, 1]
-    lora_ranks = torch.tensor(
-        [max_rank, max_rank // 2], dtype=torch.int32, device="xpu"
-    )
-    _run_and_compare_chunked(
-        dtype=dtype,
-        row_adapters=row_adapters,
-        input_dim=256,
-        max_rank=max_rank,
-        stack_num=stack_num,
-        num_loras=num_loras,
-        lora_ranks=lora_ranks,
-    )
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_chunked_shrink_zero_rank_adapter(dtype):
-    """An adapter with rank 0 must contribute an all-zero output for its rows."""
-    num_loras = 2
-    max_rank = 8
-    row_adapters = [0, 1, 0, 1, 0, 1]
-    lora_ranks = torch.tensor([0, max_rank], dtype=torch.int32, device="xpu")
-    _run_and_compare_chunked(
-        dtype=dtype,
-        row_adapters=row_adapters,
-        input_dim=128,
-        max_rank=max_rank,
-        stack_num=1,
-        num_loras=num_loras,
-        lora_ranks=lora_ranks,
-    )
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_chunked_shrink_large_many_adapters(dtype):
-    torch.manual_seed(7)
-    num_loras = 4
-    max_rank = 16
-    num_tokens = 512
-    row_adapters = torch.randint(0, num_loras, (num_tokens,)).tolist()
-    lora_ranks = torch.tensor([1, 4, 8, 16], dtype=torch.int32, device="xpu")
-    _run_and_compare_chunked(
-        dtype=dtype,
-        row_adapters=row_adapters,
-        input_dim=512,
-        max_rank=max_rank,
-        stack_num=1,
-        num_loras=num_loras,
-        lora_ranks=lora_ranks,
-    )
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_chunked_shrink_permutation_none_matches_sgemm(dtype):
-    """permutation=None must reduce exactly to sgemm_lora_a_fwd (prefill fast path)."""
-    torch.manual_seed(3)
-    num_tokens = 64
-    input_dim = 256
-    max_rank = 8
-    num_loras = 3
-    stack_num = 1
-    total_n = stack_num * max_rank
-
-    seg_indptr = torch.tensor([0, 16, 48, 64], dtype=torch.int32, device="xpu")
-    weight_indices = torch.tensor([0, 2, 1], dtype=torch.int32, device="xpu")
-    lora_ranks = torch.tensor([max_rank, 4, 2], dtype=torch.int32, device="xpu")
-
-    input_x = torch.randn(num_tokens, input_dim, dtype=dtype, device="xpu")
-    weights = torch.randn(num_loras, total_n, input_dim, dtype=dtype, device="xpu")
-    weights = _zero_weight_rank_tail(weights, lora_ranks, stack_num)
-
-    out = chunked_sgmv_lora_shrink_forward(
-        input_x=input_x,
-        weights=weights,
-        stack_num=stack_num,
-        num_segments=weight_indices.numel(),
-        seg_indptr=seg_indptr,
-        weight_indices=weight_indices,
-        lora_ranks=lora_ranks,
-        permutation=None,
-    )
-    ref = sgemm_lora_a_fwd(
-        input_x=input_x,
-        weights=weights,
-        stack_num=stack_num,
-        seg_indptr=seg_indptr,
-        weight_indices=weight_indices,
-        lora_ranks=lora_ranks,
-    )
-    # Mathematically equivalent to a plain A-fwd, but the chunked shrink uses a
-    # different (small-N) GEMM tile, so compare within dtype tolerance.
-    rtol, atol = _tolerances(dtype)
-    torch.testing.assert_close(out.cpu(), ref.cpu(), rtol=rtol, atol=atol)
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_chunked_shrink_identity_permutation_matches_sgemm(dtype):
-    """An identity permutation must match a direct sgemm on the same rows."""
-    torch.manual_seed(5)
-    num_tokens = 32
-    input_dim = 128
-    max_rank = 8
-    num_loras = 2
-    stack_num = 1
-    total_n = stack_num * max_rank
-
-    seg_indptr = torch.tensor([0, 16, 32], dtype=torch.int32, device="xpu")
-    weight_indices = torch.tensor([0, 1], dtype=torch.int32, device="xpu")
-    lora_ranks = torch.tensor([max_rank, 4], dtype=torch.int32, device="xpu")
-    permutation = torch.arange(num_tokens, dtype=torch.int32, device="xpu")
-
-    input_x = torch.randn(num_tokens, input_dim, dtype=dtype, device="xpu")
-    weights = torch.randn(num_loras, total_n, input_dim, dtype=dtype, device="xpu")
-    weights = _zero_weight_rank_tail(weights, lora_ranks, stack_num)
-
-    out = chunked_sgmv_lora_shrink_forward(
-        input_x=input_x,
-        weights=weights,
-        stack_num=stack_num,
-        num_segments=weight_indices.numel(),
-        seg_indptr=seg_indptr,
-        weight_indices=weight_indices,
-        lora_ranks=lora_ranks,
-        permutation=permutation,
-    )
-    ref = sgemm_lora_a_fwd(
-        input_x=input_x,
-        weights=weights,
-        stack_num=stack_num,
-        seg_indptr=seg_indptr,
-        weight_indices=weight_indices,
-        lora_ranks=lora_ranks,
-    )
-    # Mathematically equivalent to a plain A-fwd, but the chunked shrink uses a
-    # different (small-N) GEMM tile, so compare within dtype tolerance.
-    rtol, atol = _tolerances(dtype)
-    torch.testing.assert_close(out.cpu(), ref.cpu(), rtol=rtol, atol=atol)
 
 
 if __name__ == "__main__":

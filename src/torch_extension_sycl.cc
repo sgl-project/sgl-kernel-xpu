@@ -619,14 +619,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor seg_indptr, Tensor weight_indices, Tensor lora_ranks, Tensor scalings, Tensor? seg_lens, "
       "Tensor? base_output) -> ()");
   m.impl("gate_up_lora_b_fwd", torch::kXPU, &gate_up_lora_b_fwd);
-  m.def("lora_gather_rows(Tensor! output, Tensor input, Tensor permutation) -> ()");
-  m.impl("lora_gather_rows", torch::kXPU, &lora_gather_rows);
-  m.def("lora_scatter_rows(Tensor! output, Tensor input, Tensor permutation) -> ()");
-  m.impl("lora_scatter_rows", torch::kXPU, &lora_scatter_rows);
   m.def(
-      "chunked_sgmv_lora_shrink_forward(Tensor! output, Tensor x, Tensor weights, int num_slices, int num_segments, "
+      "chunked_sgmv_lora_shrink_fwd(Tensor! output, Tensor x, Tensor weights, int num_slices, int num_segments, "
       "Tensor seg_indptr, Tensor weight_indices, Tensor lora_ranks, Tensor? permutation) -> ()");
-  m.impl("chunked_sgmv_lora_shrink_forward", torch::kXPU, &chunked_sgmv_lora_shrink_forward);
+  m.impl("chunked_sgmv_lora_shrink_fwd", torch::kXPU, &chunked_sgmv_lora_shrink_fwd);
 
   /* NSA (Native Sparse Attention) indexer scoring */
   // fp8_mqa_logits (prefill) is implemented in pure Python via sgl_kernel.nsa.

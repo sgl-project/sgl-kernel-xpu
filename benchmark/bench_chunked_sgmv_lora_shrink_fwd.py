@@ -5,7 +5,7 @@ import pandas as pd
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel import chunked_sgmv_lora_shrink_forward
+from sgl_kernel import chunked_sgmv_lora_shrink_fwd
 
 all_results = []
 MIN_CHUNK_SIZE = 16
@@ -343,7 +343,7 @@ def calc_metrics(
 
 def _run_cutlass_once(args: Dict[str, Any]):
     seg = args["cutlass"]
-    return chunked_sgmv_lora_shrink_forward(
+    return chunked_sgmv_lora_shrink_fwd(
         input_x=args["input_x"],
         weights=args["weights"],
         stack_num=int(args["stack_num"]),
@@ -615,7 +615,7 @@ def print_summary(title: str = "Chunked SGMV LoRA Shrink Forward Benchmark Resul
 
 def _parse_args():
     parser = argparse.ArgumentParser(
-        description="Benchmark chunked_sgmv_lora_shrink_forward (decode path) on XPU"
+        description="Benchmark chunked_sgmv_lora_shrink_fwd (decode path) on XPU"
     )
     parser.add_argument(
         "--seed",

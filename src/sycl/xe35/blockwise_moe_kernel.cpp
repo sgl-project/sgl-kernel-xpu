@@ -27,6 +27,8 @@
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
 
+#include "sgl_kernel_export.h"
+
 using namespace cute;
 using namespace cutlass::gemm;
 
@@ -90,7 +92,8 @@ class BlockScaledGroupedGemmKernel {
       cute::Layout<TileShape>,
       cute::Layout<Shape<_8, _4, _1>, cute::Stride<_4, _1, _0>>>::TiledMMA;
 
-  using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16BlockScaledGroup<PipelineStages>;
+  // BlockSize is a dispatch-policy template parameter, not a runtime mainloop argument.
+  using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16BlockScaledGroup<PipelineStages, BlockSize>;
   using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeXMX16Group;
 
   using EpilogueOp = cutlass::epilogue::fusion::LinearCombination<
@@ -304,8 +307,7 @@ class BlockScaledGroupedGemmKernel {
             reinterpret_cast<ElementScale const**>(a_scales_ptrs.data_ptr()),
             stride_SFA_device_ptr,
             reinterpret_cast<ElementScale const**>(b_scales_ptrs.data_ptr()),
-            stride_SFB_device_ptr,
-            BlockSize},
+            stride_SFB_device_ptr},
         typename Gemm::GemmKernel::EpilogueArguments{
             fusion_args,
             nullptr,
@@ -339,7 +341,7 @@ using MXFP4Kernel = BlockScaledGroupedGemmKernel<MXFP4Config>;
 
 }  // namespace at::native::xpu
 
-void mxfp4_blockwise_scaled_grouped_mm(
+SGL_KERNEL_EXPORT void mxfp4_blockwise_scaled_grouped_mm(
     torch::Tensor& output,
     torch::Tensor& a_ptrs,
     torch::Tensor& b_ptrs,

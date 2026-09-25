@@ -1300,6 +1300,18 @@ void gate_up_lora_b_fwd(
     const std::optional<torch::Tensor>& base_output  // [num_tokens, 2*N]
 );
 
+void chunked_sgmv_lora_shrink_fwd(
+    torch::Tensor& output,         // [num_tokens, num_slices*max_rank]
+    const torch::Tensor& x,        // [num_tokens, input_dim]
+    const torch::Tensor& weights,  // [num_loras, num_slices*max_rank, input_dim]
+    const int64_t num_slices,      // stacked projections (qkv=3, gate_up=2, else 1)
+    const int64_t num_segments,
+    const torch::Tensor& seg_indptr,                 // [num_segments + 1,]
+    const torch::Tensor& weight_indices,             // [num_segments,]
+    const torch::Tensor& lora_ranks,                 // [num_loras,]
+    const std::optional<torch::Tensor>& permutation  // [num_tokens,] logical -> physical (optional)
+);
+
 /*
  * From GDN (Gated DeltaNet) attention
  */

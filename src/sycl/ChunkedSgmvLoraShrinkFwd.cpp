@@ -71,24 +71,23 @@ namespace {
 // DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_TILE (and to ChunkedSgmvLoraShrinkFwdXe20.cmake
 // + chunked_sgmv_lora_shrink_fwd_dispatch.hpp + chunked_sgmv_lora_shrink_fwd_types.hpp)
 // with a runtime heuristic (e.g. average M per segment) picking the tag.
-#define DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_TILE(ELEM, ...)                                       \
-  do {                                                                                          \
+#define DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_TILE(ELEM, ...)                                           \
+  do {                                                                                                  \
     chunked_sgmv_lora_shrink_fwd_impl::launch_chunked_sgmv_lora_shrink_fwd_##ELEM##_small(__VA_ARGS__); \
   } while (0)
 
 #define DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_DTYPE(...)                                                               \
-  do {                                                                                                             \
-    switch (weights.scalar_type()) {                                                                               \
-      case torch::kHalf:                                                                                           \
+  do {                                                                                                                 \
+    switch (weights.scalar_type()) {                                                                                   \
+      case torch::kHalf:                                                                                               \
         DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_TILE(half, __VA_ARGS__);                                                 \
-        break;                                                                                                     \
-      case torch::kBFloat16:                                                                                       \
+        break;                                                                                                         \
+      case torch::kBFloat16:                                                                                           \
         DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_TILE(bf16, __VA_ARGS__);                                                 \
-        break;                                                                                                     \
-      default:                                                                                                     \
-        TORCH_CHECK(                                                                                               \
-            false, "Unsupported data type for chunked_sgmv_lora_shrink_fwd weights: ", weights.scalar_type()); \
-    }                                                                                                              \
+        break;                                                                                                         \
+      default:                                                                                                         \
+        TORCH_CHECK(false, "Unsupported data type for chunked_sgmv_lora_shrink_fwd weights: ", weights.scalar_type()); \
+    }                                                                                                                  \
   } while (0)
 
 }  // namespace

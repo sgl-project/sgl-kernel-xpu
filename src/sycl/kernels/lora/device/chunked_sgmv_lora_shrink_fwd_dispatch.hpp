@@ -57,14 +57,14 @@ namespace chunked_sgmv_lora_shrink_fwd_impl {
 // chunked_sgmv_lora_shrink_fwd_kernel.cpp.in, compiled as its own library.
 #define DECLARE_CHUNKED_SGMV_LORA_SHRINK_FWD_LAUNCH(ELEM, TILE) \
   void launch_chunked_sgmv_lora_shrink_fwd_##ELEM##_##TILE(     \
-      const torch::Tensor& input_x,                         \
-      const torch::Tensor& weights,                         \
-      const torch::Tensor& seg_indptr_i32,                  \
-      const torch::Tensor& weight_indices_i32,              \
-      torch::Tensor& output,                                \
-      const int stack_num,                                  \
-      const int max_rank,                                   \
-      const int num_segments,                               \
+      const torch::Tensor& input_x,                             \
+      const torch::Tensor& weights,                             \
+      const torch::Tensor& seg_indptr_i32,                      \
+      const torch::Tensor& weight_indices_i32,                  \
+      torch::Tensor& output,                                    \
+      const int stack_num,                                      \
+      const int max_rank,                                       \
+      const int num_segments,                                   \
       sycl::queue& queue);
 
 // One declaration per registered tile. Extend as tiles are added.

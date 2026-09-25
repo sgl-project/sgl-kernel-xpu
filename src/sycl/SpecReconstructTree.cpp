@@ -30,26 +30,35 @@ constexpr int32_t kNoNode = -1;
 
 static_assert(sizeof(bool) == 1, "tree_mask packing assumes 1-byte bool");
 
+// gather bit 0 of every input byte down to one bit each.
+// 4 bytes -> 4 bits.
 inline uint32_t compress_mask_nibble(uint32_t bytes) {
+  // multiply with 2^21 + 2^14 + 2^7 + 2^0, gathering the 4 bits into the top nibble
   return ((bytes * 0x00204081u) >> 21) & 0xFu;
 }
-
+// 8 bytes -> 8 bits.
 inline uint64_t compress_mask_byte8(uint64_t bytes) {
+  // Same trick, 8 copies: 2^56 + 2^49 + ... + 2^7, gathering the 8 bits into the top byte.
   return (bytes * 0x0102040810204080ull) >> 56;
 }
 
+// Copy one byte into all 8 slots of a word.
 inline uint64_t splat_byte(int32_t v) {
   return static_cast<uint64_t>(static_cast<uint8_t>(v)) * 0x0101010101010101ull;
 }
 
 inline uint64_t byte_eq_mask(uint64_t v, uint64_t splat) {
   constexpr uint64_t kLow7 = 0x7f7f7f7f7f7f7f7full;
+  // xor makes the matching bytes 0,
   const uint64_t x = v ^ splat;
+  // kLow7 arithmetic flags whichever bytes are 0 without branching.
   const uint64_t zero_bytes = ~((((x & kLow7) + kLow7) | x) | kLow7);
   return compress_mask_byte8(zero_bytes >> 7);
 }
 
-inline uint64_t pack_mask_bytes(const bool* src, int32_t count) {
+// A mask row is packed 64 nodes per word.
+// Reads a byte at a time, any count and any alignment works.
+inline uint64_t pack_mask_row_bytewise(const bool* src, int32_t count) {
   uint64_t bits = 0;
   int32_t c = 0;
 #pragma unroll 2
@@ -68,32 +77,18 @@ inline uint64_t pack_mask_bytes(const bool* src, int32_t count) {
   return bits;
 }
 
-inline uint64_t pack_mask_row(const bool* src, int32_t count, bool wide) {
-  if (!wide) {
-    return pack_mask_bytes(src, count);
+// Same packing, 8 bools per read.
+inline uint64_t pack_mask_row(const bool* src, int32_t count) {
+  if ((count & 7) != 0) {
+    return pack_mask_row_bytewise(src, count);
   }
   const uint64_t* words = reinterpret_cast<const uint64_t*>(src);
   uint64_t bits = 0;
-#pragma unroll 2
+#pragma unroll
   for (int32_t c = 0; c < count; c += 8) {
     bits |= compress_mask_byte8(words[c >> 3]) << c;
   }
   return bits;
-}
-
-template <int32_t N>
-inline uint64_t pack_mask_row_static(const bool* src) {
-  if constexpr ((N & 7) != 0) {
-    return pack_mask_bytes(src, N);
-  } else {
-    const uint64_t* words = reinterpret_cast<const uint64_t*>(src);
-    uint64_t bits = 0;
-#pragma unroll
-    for (int32_t w = 0; w < N / 8; ++w) {
-      bits |= compress_mask_byte8(words[w]) << (w << 3);
-    }
-    return bits;
-  }
 }
 
 inline void
@@ -102,12 +97,140 @@ accumulate_byte_matches(uint64_t v, int32_t w, uint64_t want_kids, uint64_t want
   sibs |= byte_eq_mask(v, want_sibs) << (w << 3);
 }
 
+// SingleWord (n <= 64): the row fits one uint64.
+constexpr int64_t kFastPathMaxNodes = 64;
+
+template <typename seq_t, int32_t N_CONST>
+struct ReconstructTreeSingleWordKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
+  static constexpr bool kStaticN = N_CONST > 0;
+  static constexpr int32_t kStaticWords = kStaticN ? (N_CONST + 7) >> 3 : 0;
+
+  ReconstructTreeSingleWordKernel(
+      const bool* tree_mask,
+      const seq_t* verified_seq_len,
+      int64_t* positions,
+      int64_t* retrive_index,
+      int64_t* retrive_next_token,
+      int64_t* retrive_next_sibling,
+      int32_t num_nodes)
+      : tree_mask_(tree_mask),
+        verified_seq_len_(verified_seq_len),
+        positions_(positions),
+        retrive_index_(retrive_index),
+        retrive_next_token_(retrive_next_token),
+        retrive_next_sibling_(retrive_next_sibling),
+        num_nodes_(num_nodes) {}
+
+  void sycl_ker_config_convention(sycl::handler& cgh) {
+    const size_t words = static_cast<size_t>(kStaticN ? kStaticWords : (num_nodes_ + 7) / 8);
+    parents_ = sycl::local_accessor<uint64_t, 1>(sycl::range<1>(words), cgh);
+  }
+
+  void operator()(sycl::nd_item<1> item) const {
+    const int32_t n = kStaticN ? N_CONST : num_nodes_;
+    const int32_t i = static_cast<int32_t>(item.get_local_id(0));
+    const int64_t bid = static_cast<int64_t>(item.get_group(0));
+    const int64_t out = bid * n + i;
+
+    const int64_t seq_base = static_cast<int64_t>(verified_seq_len_[bid]);
+    const bool* src = tree_mask_ + out * static_cast<int64_t>(n);
+    // n is a constant on the specialized path, so the count check and the loop fold away.
+    const uint64_t row = pack_mask_row(src, n);
+    // Keep only the bits below i, so node i is not counted as its own ancestor.
+    const uint64_t strict = row & ((uint64_t{1} << i) - 1);
+
+    // the total number of set bits in the row(1 word) = depth.
+    positions_[out] = seq_base + static_cast<int64_t>(sycl::popcount(strict));
+    retrive_index_[out] = out;
+
+    // highest set bit is the parent of the node.
+    int32_t parent = kNoNode;
+    if (strict != 0) {
+      parent = 63 - static_cast<int32_t>(sycl::clz(strict));
+    }
+
+    const int32_t words = kStaticN ? kStaticWords : (n + 7) >> 3;
+    uint64_t* parent_words = parents_.template get_multi_ptr<sycl::access::decorated::no>().get();
+
+    reinterpret_cast<uint8_t*>(parent_words)[i] = static_cast<uint8_t>(parent);
+    sycl::group_barrier(item.get_group());
+
+    const uint64_t want_kids = splat_byte(i);
+    const uint64_t want_sibs = splat_byte(parent);
+    uint64_t kids = 0;
+    uint64_t sibs = 0;
+    if constexpr (kStaticN) {
+#pragma unroll
+      for (int32_t w = 0; w < kStaticWords; ++w) {
+        accumulate_byte_matches(parent_words[w], w, want_kids, want_sibs, kids, sibs);
+      }
+    } else {
+#pragma unroll 2
+      for (int32_t w = 0; w < words; ++w) {
+        accumulate_byte_matches(parent_words[w], w, want_kids, want_sibs, kids, sibs);
+      }
+    }
+
+    if (n < 64) {
+      const uint64_t valid = (uint64_t{1} << n) - 1;
+      kids &= valid;
+      sibs &= valid;
+    }
+
+    // lowest set bit in kids is the first child of the node.
+    retrive_next_token_[out] = kids ? static_cast<int64_t>(sycl::ctz(kids)) : kNoNode;
+
+    // lowest sibling above i
+    int64_t next_sibling = kNoNode;
+    if (parent != kNoNode) {
+      const uint64_t above = (i >= 63) ? 0ull : (sibs & ~((uint64_t{1} << (i + 1)) - 1));
+      if (above) {
+        next_sibling = static_cast<int64_t>(sycl::ctz(above));
+      }
+    }
+    retrive_next_sibling_[out] = next_sibling;
+  }
+
+  const bool* tree_mask_;
+  const seq_t* verified_seq_len_;
+  int64_t* positions_;
+  int64_t* retrive_index_;
+  int64_t* retrive_next_token_;
+  int64_t* retrive_next_sibling_;
+  int32_t num_nodes_;
+
+  sycl::local_accessor<uint64_t, 1> parents_;
+};
+
+template <typename seq_t, int32_t N_CONST>
+inline void submit_single_word_kernel(
+    sycl::queue& queue,
+    const at::Tensor& tree_mask,
+    const at::Tensor& verified_seq_len,
+    at::Tensor& positions,
+    at::Tensor& retrive_index,
+    at::Tensor& retrive_next_token,
+    at::Tensor& retrive_next_sibling,
+    int32_t n,
+    int64_t global_range,
+    int64_t local_range) {
+  ReconstructTreeSingleWordKernel<seq_t, N_CONST> kernel(
+      tree_mask.data_ptr<bool>(),
+      verified_seq_len.data_ptr<seq_t>(),
+      positions.data_ptr<int64_t>(),
+      retrive_index.data_ptr<int64_t>(),
+      retrive_next_token.data_ptr<int64_t>(),
+      retrive_next_sibling.data_ptr<int64_t>(),
+      n);
+  sycl_kernel_submit(global_range, local_range, queue, kernel);
+}
+
 template <typename seq_t>
-struct ReconstructTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
+struct ReconstructTreeMultiWordKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   using word_t = uint64_t;
   static constexpr int32_t kWordBits = 64;
 
-  ReconstructTreeKernel(
+  ReconstructTreeMultiWordKernel(
       const bool* tree_mask,
       const seq_t* verified_seq_len,
       int64_t* positions,
@@ -132,6 +255,7 @@ struct ReconstructTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     parent_ = sycl::local_accessor<int32_t, 1>(sycl::range<1>(static_cast<size_t>(num_nodes_)), cgh);
   }
 
+  // Exclude the node itself from the packed 64 node word, so it is not counted as its own ancestor.
   inline word_t strict_word(const word_t* row, int32_t i, int32_t w) const {
     const int32_t lo = w * kWordBits;
     if (i <= lo) {
@@ -142,6 +266,7 @@ struct ReconstructTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     return row[w] & m;
   }
 
+  // return the nearest ancestor - the highest set bit in the row.
   inline int32_t immediate_parent(const word_t* row, int32_t i) const {
 #pragma unroll 2
     for (int32_t w = words_per_row_ - 1; w >= 0; --w) {
@@ -163,8 +288,8 @@ struct ReconstructTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     word_t* rows = rows_.template get_multi_ptr<sycl::access::decorated::no>().get();
     int32_t* parent = parent_.template get_multi_ptr<sycl::access::decorated::no>().get();
 
-    // Phase 1: bit-pack this request's [n, n] byte mask into SLM, one qword per 64
-    // nodes, so the two link phases below read 8x fewer bytes.
+    // Phase 1
+    // bit-pack this request's [n, n] byte mask into SLM, one qword per 64 nodes
     const bool* block = tree_mask_ + bid * static_cast<int64_t>(n) * n;
 #pragma unroll 2
     for (int32_t i = lane; i < n; i += lpr) {
@@ -172,13 +297,14 @@ struct ReconstructTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 #pragma unroll 2
       for (int32_t w = 0; w < nw; ++w) {
         const int32_t lo = w * kWordBits;
-        rows[static_cast<int64_t>(i) * nw + w] = pack_mask_bytes(src + lo, sycl::min(kWordBits, n - lo));
+        rows[static_cast<int64_t>(i) * nw + w] = pack_mask_row_bytewise(src + lo, sycl::min(kWordBits, n - lo));
       }
     }
     sycl::group_barrier(item.get_group());
 
-    // Phase 2: depth is the population count of row i below the diagonal, and the
-    // immediate parent is that row's highest set bit below the diagonal.
+    // Phase 2
+    // depth = total num of set bits & position = seq_len + depth.
+    // parent = the highest set bit in the row.
     const int64_t out_base = bid * n;
     const int64_t seq_len = static_cast<int64_t>(verified_seq_len_[bid]);
 #pragma unroll 2
@@ -195,16 +321,18 @@ struct ReconstructTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     }
     sycl::group_barrier(item.get_group());
 
-    // Phase 3: invert. First child is the lowest k > i whose row has bit i set;
-    // next sibling is the lowest k > i sharing i's parent.
+    // Phase 3
 #pragma unroll 2
     for (int32_t i = lane; i < n; i += lpr) {
       const int32_t word = i / kWordBits;
+      // Set only the current node i's position in a word, e.g. node 2 -> ...00100.
       const word_t bit = word_t{1} << (i % kWordBits);
 
       int32_t next_token = kNoNode;
+      // Check from the node after i, since children are always numbered higher.
 #pragma unroll 2
       for (int32_t k = i + 1; k < n; ++k) {
+        // First row that lists i as an ancestor.
         if (rows[static_cast<int64_t>(k) * nw + word] & bit) {
           next_token = k;
           break;
@@ -213,9 +341,12 @@ struct ReconstructTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       retrive_next_token_[out_base + i] = next_token;
 
       int32_t next_sibling = kNoNode;
+      // Roots have no parent, so they are never linked as siblings of each other.
       if (parent[i] != kNoNode) {
+        // Check from the node after i, since siblings are listed in index order.
 #pragma unroll 2
         for (int32_t k = i + 1; k < n; ++k) {
+          // i's next sibling is First later node with the same parent as i.
           if (parent[k] == parent[i]) {
             next_sibling = k;
             break;
@@ -239,141 +370,6 @@ struct ReconstructTreeKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   sycl::local_accessor<word_t, 1> rows_;
   sycl::local_accessor<int32_t, 1> parent_;
 };
-
-constexpr int64_t kFastPathMaxNodes = 64;
-
-inline void sync_request_scope(sycl::nd_item<1> item, int32_t n, int32_t max_width) {
-  if (n <= max_width) {
-    sycl::group_barrier(item.get_sub_group());
-  } else {
-    sycl::group_barrier(item.get_group());
-  }
-}
-
-template <typename seq_t, int32_t N_CONST>
-struct ReconstructTreeSmallKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
-  static constexpr bool kStaticN = N_CONST > 0;
-  static constexpr int32_t kStaticWords = kStaticN ? (N_CONST + 7) >> 3 : 0;
-
-  ReconstructTreeSmallKernel(
-      const bool* tree_mask,
-      const seq_t* verified_seq_len,
-      int64_t* positions,
-      int64_t* retrive_index,
-      int64_t* retrive_next_token,
-      int64_t* retrive_next_sibling,
-      int32_t num_nodes)
-      : tree_mask_(tree_mask),
-        verified_seq_len_(verified_seq_len),
-        positions_(positions),
-        retrive_index_(retrive_index),
-        retrive_next_token_(retrive_next_token),
-        retrive_next_sibling_(retrive_next_sibling),
-        num_nodes_(num_nodes) {}
-
-  void sycl_ker_config_convention(sycl::handler& cgh) {
-    const size_t words = static_cast<size_t>(kStaticN ? kStaticWords : (num_nodes_ + 7) / 8);
-    parents_ = sycl::local_accessor<uint64_t, 1>(sycl::range<1>(words), cgh);
-  }
-
-  void operator()(sycl::nd_item<1> item) const {
-    const int32_t n = kStaticN ? N_CONST : num_nodes_;
-    const int32_t max_width = static_cast<int32_t>(item.get_sub_group().get_max_local_range()[0]);
-    const int32_t i = static_cast<int32_t>(item.get_local_id(0));
-    const int64_t bid = static_cast<int64_t>(item.get_group(0));
-    const int64_t out = bid * n + i;
-
-    const int64_t seq_base = static_cast<int64_t>(verified_seq_len_[bid]);
-    const bool* src = tree_mask_ + out * static_cast<int64_t>(n);
-    uint64_t row;
-    if constexpr (kStaticN) {
-      row = pack_mask_row_static<N_CONST>(src);
-    } else {
-      row = pack_mask_row(src, n, (n & 7) == 0);
-    }
-    const uint64_t strict = row & ((uint64_t{1} << i) - 1);
-
-    positions_[out] = seq_base + static_cast<int64_t>(sycl::popcount(strict));
-    retrive_index_[out] = out;
-
-    int32_t parent = kNoNode;
-    if (strict != 0) {
-      parent = 63 - static_cast<int32_t>(sycl::clz(strict));
-    }
-
-    const int32_t words = kStaticN ? kStaticWords : (n + 7) >> 3;
-    uint64_t* parent_words = parents_.template get_multi_ptr<sycl::access::decorated::no>().get();
-
-    reinterpret_cast<uint8_t*>(parent_words)[i] = static_cast<uint8_t>(parent);
-    sync_request_scope(item, n, max_width);
-
-    const uint64_t want_kids = splat_byte(i);
-    const uint64_t want_sibs = splat_byte(parent);
-    uint64_t kids = 0;
-    uint64_t sibs = 0;
-    if constexpr (kStaticN) {
-#pragma unroll
-      for (int32_t w = 0; w < kStaticWords; ++w) {
-        accumulate_byte_matches(parent_words[w], w, want_kids, want_sibs, kids, sibs);
-      }
-    } else {
-#pragma unroll 2
-      for (int32_t w = 0; w < words; ++w) {
-        accumulate_byte_matches(parent_words[w], w, want_kids, want_sibs, kids, sibs);
-      }
-    }
-
-    if (n < 64) {
-      const uint64_t valid = (uint64_t{1} << n) - 1;
-      kids &= valid;
-      sibs &= valid;
-    }
-
-    retrive_next_token_[out] = kids ? static_cast<int64_t>(sycl::ctz(kids)) : kNoNode;
-
-    int64_t next_sibling = kNoNode;
-    if (parent != kNoNode) {
-      const uint64_t above = (i >= 63) ? 0ull : (sibs & ~((uint64_t{1} << (i + 1)) - 1));
-      if (above) {
-        next_sibling = static_cast<int64_t>(sycl::ctz(above));
-      }
-    }
-    retrive_next_sibling_[out] = next_sibling;
-  }
-
-  const bool* tree_mask_;
-  const seq_t* verified_seq_len_;
-  int64_t* positions_;
-  int64_t* retrive_index_;
-  int64_t* retrive_next_token_;
-  int64_t* retrive_next_sibling_;
-  int32_t num_nodes_;
-
-  sycl::local_accessor<uint64_t, 1> parents_;
-};
-
-template <typename seq_t, int32_t N_CONST>
-inline void submit_small_kernel(
-    sycl::queue& queue,
-    const at::Tensor& tree_mask,
-    const at::Tensor& verified_seq_len,
-    at::Tensor& positions,
-    at::Tensor& retrive_index,
-    at::Tensor& retrive_next_token,
-    at::Tensor& retrive_next_sibling,
-    int32_t n,
-    int64_t global_range,
-    int64_t local_range) {
-  ReconstructTreeSmallKernel<seq_t, N_CONST> kernel(
-      tree_mask.data_ptr<bool>(),
-      verified_seq_len.data_ptr<seq_t>(),
-      positions.data_ptr<int64_t>(),
-      retrive_index.data_ptr<int64_t>(),
-      retrive_next_token.data_ptr<int64_t>(),
-      retrive_next_sibling.data_ptr<int64_t>(),
-      n);
-  sycl_kernel_submit(global_range, local_range, queue, kernel);
-}
 
 }  // namespace
 
@@ -438,8 +434,7 @@ SGL_KERNEL_EXPORT void reconstruct_indices_from_tree_mask(
   const int64_t n = draft_token_num;
   const int64_t max_wg = dpcppMaxWorkGroupSize();
 
-  // One work-group per request, one work-item per draft token (strided when the
-  // token count exceeds the device work-group limit).
+  // One work-group per request, one work-item per draft token
   const int64_t local_range = std::min<int64_t>(n, max_wg);
   const int64_t global_range = bs * local_range;
   const bool use_fast_path = n <= kFastPathMaxNodes && local_range == n;
@@ -447,8 +442,8 @@ SGL_KERNEL_EXPORT void reconstruct_indices_from_tree_mask(
 
   AT_DISPATCH_INDEX_TYPES(verified_seq_len.scalar_type(), "reconstruct_indices_from_tree_mask", [&] {
     if (use_fast_path) {
-      auto submit_small = [&](auto n_const) {
-        submit_small_kernel<index_t, decltype(n_const)::value>(
+      auto submit_single_word = [&](auto n_const) {
+        submit_single_word_kernel<index_t, decltype(n_const)::value>(
             queue,
             tree_mask,
             verified_seq_len,
@@ -460,26 +455,24 @@ SGL_KERNEL_EXPORT void reconstruct_indices_from_tree_mask(
             global_range,
             local_range);
       };
-      // Specialize the node counts speculative decoding actually runs at; every
-      // other count falls through to the runtime-n instantiation. Adding a width
-      // is one more case, at the cost of one more AOT-compiled kernel.
+      // Specialize the node counts speculative decoding actually runs at.
       switch (n) {
         case 8:
-          submit_small(std::integral_constant<int32_t, 8>{});
+          submit_single_word(std::integral_constant<int32_t, 8>{});
           break;
         case 16:
-          submit_small(std::integral_constant<int32_t, 16>{});
+          submit_single_word(std::integral_constant<int32_t, 16>{});
           break;
         case 32:
-          submit_small(std::integral_constant<int32_t, 32>{});
+          submit_single_word(std::integral_constant<int32_t, 32>{});
           break;
         default:
-          submit_small(std::integral_constant<int32_t, 0>{});
+          submit_single_word(std::integral_constant<int32_t, 0>{});
           break;
       }
       return;
     }
-    ReconstructTreeKernel<index_t> kernel(
+    ReconstructTreeMultiWordKernel<index_t> kernel(
         tree_mask.data_ptr<bool>(),
         verified_seq_len.data_ptr<index_t>(),
         positions.data_ptr<int64_t>(),

@@ -23,7 +23,7 @@ source /PATH/TO/ONEAPI/setvars.sh
 - Default build command should follow repository guidance:
 
 ```bash
-pip install -v .
+uv pip install -v --reinstall --no-build-isolation .
 ```
 
 - For wheel builds, use the documented path (uv/scikit-build) and keep `build/` as build dir.

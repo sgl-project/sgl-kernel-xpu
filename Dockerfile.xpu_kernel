@@ -54,29 +54,28 @@ RUN apt-get install -y software-properties-common && \
     apt-mark hold libze-intel-gpu1 intel-opencl-icd intel-ocloc libigdgmm12 \
         intel-igc-core-2 intel-igc-opencl-2
 
-# Install Miniforge & PyTorch/Triton
-RUN curl -fsSL -v -o miniforge.sh -O https://github.com/conda-forge/miniforge/releases/download/25.1.1-0/Miniforge3-Linux-x86_64.sh && \
-    bash miniforge.sh -b -p ./miniforge3 && \
-    rm miniforge.sh && \
-    . ./miniforge3/bin/activate && \
-    conda create -y -n py${PYTHON_VERSION} python=${PYTHON_VERSION} && conda activate py${PYTHON_VERSION} && \
-    conda install pip && \
-    echo ". /miniforge3/bin/activate; conda activate py${PYTHON_VERSION}; . /opt/intel/oneapi/setvars.sh; cd /root/" >> /root/.bashrc;
+# Install uv and create the Python environment
+ARG UV_VERSION=0.12.18
+RUN curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | UV_NO_MODIFY_PATH=1 sh
+ENV PATH="/root/.local/bin:$PATH"
+ENV VIRTUAL_ENV=/opt/venv
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+ENV UV_PYTHON_PREFERENCE=only-managed
+ENV UV_LINK_MODE=copy
+# Large wheel downloads (torch, triton-xpu) - allow slow, flaky fetches
+ENV UV_HTTP_TIMEOUT=300
+ENV UV_HTTP_RETRIES=10
+RUN uv venv --python ${PYTHON_VERSION} --seed ${VIRTUAL_ENV} && \
+    echo ". ${VIRTUAL_ENV}/bin/activate; . /opt/intel/oneapi/setvars.sh; cd /root/" >> /root/.bashrc
+ENV PATH="${VIRTUAL_ENV}/bin:$PATH"
 
-RUN --mount=type=secret,id=github_token \
-    cd /root && \
-    . /miniforge3/bin/activate && \
-    conda activate py${PYTHON_VERSION} && \
-    # . /opt/intel/oneapi/setvars.sh --force && \
-    # Install Torch
-    pip install --timeout 300 --retries 10 torch==2.13.0 torchvision triton-xpu --index-url https://download.pytorch.org/whl/xpu
+# Install Torch
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install torch==2.13.0 torchvision triton-xpu --index-url https://download.pytorch.org/whl/xpu
 
 # Install SGlang from source
-RUN --mount=type=secret,id=github_token \
-    # Install vllm from source
+RUN --mount=type=cache,target=/root/.cache/uv \
     cd /root && \
-    . /miniforge3/bin/activate && \
-    conda activate py${PYTHON_VERSION} && \
     echo "cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} && \
     cd sglang && \
@@ -84,11 +83,10 @@ RUN --mount=type=secret,id=github_token \
     echo "cloning ${SG_LANG_KERNEL_REPO} from ${SG_LANG_KERNEL_BRANCH}" && \
     git clone --branch ${SG_LANG_KERNEL_BRANCH} --single-branch ${SG_LANG_KERNEL_REPO} && \
     cd sgl-kernel-xpu && \
-    pip install -v . &&\
+    uv pip install "scikit-build-core>=0.10" cmake ninja wheel && \
+    uv pip install -v --no-build-isolation . && \
     # Install required packages for sglang workloads
-    pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops matplotlib pandas --root-user-action=ignore aiohttp && \
-    conda install libsqlite=3.48.0 -y && \
-    echo ". /miniforge3/bin/activate; conda activate py${PYTHON_VERSION}; cd /root/" >> /root/.bashrc;
+    uv pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops matplotlib pandas aiohttp
 
 # Set the default shell to bash
 SHELL ["bash", "-c"]

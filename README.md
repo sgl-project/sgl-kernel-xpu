@@ -10,12 +10,21 @@ Currently we only support building from source. To use on Intel GPUs, you need t
 
 ## Build from source
 
-Development build:
+Development build, with [uv](https://docs.astral.sh/uv/) managing the Python
+environment (skip the `uv venv` and torch lines if you already have an environment
+with PyTorch for XPU):
 
 ```bash
 source /PATH/TO/ONEAPI/setvars.sh
-pip install -v .
+uv venv --python 3.12 --seed && source .venv/bin/activate
+uv pip install torch==2.13.0 torchvision triton-xpu --index-url https://download.pytorch.org/whl/xpu
+uv pip install "scikit-build-core>=0.10" cmake ninja wheel
+uv pip install -v --reinstall --no-build-isolation .
 ```
+
+`--reinstall` matters on every run after the first: uv only rebuilds a local package
+when its metadata files change, so without it kernel edits and build toggles are
+silently ignored.
 
 ### Optional Build Toggles
 
@@ -44,13 +53,13 @@ Examples:
 
 ```bash
 # Disable MoE only
-USE_MOE=OFF pip install -v .
+USE_MOE=OFF uv pip install -v --reinstall --no-build-isolation .
 
 # Same as above
-USE_MOE=0 pip install -v .
+USE_MOE=0 uv pip install -v --reinstall --no-build-isolation .
 
 # Disable all three
-USE_MOE=0 USE_FMHA=OFF USE_MLA=off pip install -v .
+USE_MOE=0 USE_FMHA=OFF USE_MLA=off uv pip install -v --reinstall --no-build-isolation .
 ```
 
 ### Runtime-JIT Kernels (`USE_SYCL_JIT`)
@@ -64,7 +73,7 @@ build and shrinks the wheel.
 
 ```bash
 source /PATH/TO/ONEAPI/setvars.sh
-USE_SYCL_JIT=ON pip install -v .
+USE_SYCL_JIT=ON uv pip install -v --reinstall --no-build-isolation .
 ```
 
 Notes:
@@ -86,7 +95,7 @@ export CCACHE_DIR=/path/to/your/ccache/dir
 export CCACHE_BACKEND=""
 export CCACHE_KEEP_LOCAL_STORAGE="TRUE"
 unset CCACHE_READONLY
-python -m uv build --wheel -Cbuild-dir=build --color=always .
+uv build --wheel -Cbuild-dir=build --no-build-isolation --color=always .
 ```
 
 ### Parallel Build
@@ -95,7 +104,7 @@ We highly recommend you build sgl-kernel-xpu with Ninja. Ninja can automatically
 And if you build the sgl-kernel-xpu with cmake, you need to add `CMAKE_BUILD_PARALLEL_LEVEL` for parallel build like:
 
 ```bash
-CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) python -m uv build --wheel -Cbuild-dir=build --color=always .
+CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) uv build --wheel -Cbuild-dir=build --no-build-isolation --color=always .
 ```
 
 ### Kernel Development

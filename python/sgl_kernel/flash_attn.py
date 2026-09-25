@@ -1,7 +1,40 @@
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
+
+
+def build_bidirectional_block_ids(
+    seq_lens: Sequence[int],
+    block_spans: Sequence[Sequence[Tuple[int, int]]],
+    device,
+) -> Optional[torch.Tensor]:
+    """Build the per-token ``bidirectional_block_ids`` for ``flash_attn_with_kvcache``.
+
+    Tokens inside a span share a unique block id (attended bidirectionally in
+    prefill); every other token is ``-1`` (causal). Ids are concatenated over the
+    sequences in token order (matching a ragged ``total_q`` layout).
+
+    seq_lens: per-sequence token counts.
+    block_spans: per-sequence list of ``(begin, end)`` inclusive, sequence-relative.
+    Returns an int32 tensor of length ``sum(seq_lens)``, or ``None`` when there
+    are no spans (so callers can skip the mask entirely).
+    """
+    if len(seq_lens) != len(block_spans):
+        raise ValueError("seq_lens and block_spans must have the same length")
+    per_seq = []
+    next_id = 0
+    for length, spans in zip(seq_lens, block_spans):
+        ids = torch.full((length,), -1, dtype=torch.int32, device=device)
+        for begin, end in spans:
+            if not (0 <= begin <= end < length):
+                raise ValueError(
+                    f"block span ({begin}, {end}) out of range for sequence length {length}"
+                )
+            ids[begin : end + 1] = next_id
+            next_id += 1
+        per_seq.append(ids)
+    return torch.cat(per_seq) if next_id > 0 else None
 
 
 def is_fa3_supported(device=None) -> bool:
@@ -135,6 +168,9 @@ def flash_attn_with_kvcache(
     out=None,
     rel_bias=None,
     rel_bias_is_sheared=False,
+    bidirectional_block_ids=None,  # Optional per-token block id (-1 = none): keys sharing a
+    # query's non-negative id attend bidirectionally, causal otherwise. Prefill
+    # only; pair with causal=False.
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -260,6 +296,12 @@ def flash_attn_with_kvcache(
     # gather the scattered per-token cache slots into a dense ragged buffer and
     # dispatch to the non-paged varlen kernel instead.
     if page_table is not None and k_cache.shape[1] == 1:
+        # The non-paged varlen kernel this dispatches to does not carry the block
+        # mask; reject here rather than silently drop it (needs page_size > 1).
+        if bidirectional_block_ids is not None:
+            raise NotImplementedError(
+                "bidirectional_block_ids (bidirectional-block mask) requires page_size > 1"
+            )
         return _flash_attn_with_kvcache_page_size_1(
             q=q,
             k_cache=k_cache,
@@ -363,6 +405,7 @@ def flash_attn_with_kvcache(
         softmax_lse,
         rel_bias,
         rel_bias_is_sheared,
+        bidirectional_block_ids,
     )
     return (out, softmax_lse) if return_softmax_lse else out
 

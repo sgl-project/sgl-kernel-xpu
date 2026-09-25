@@ -977,6 +977,16 @@ void build_tree_kernel_efficient(
     int64_t draft_token_num,
     int64_t tree_mask_mode = 0);
 
+void reconstruct_indices_from_tree_mask(
+    const at::Tensor& tree_mask,
+    const at::Tensor& verified_seq_len,
+    at::Tensor& positions,
+    at::Tensor& retrive_index,
+    at::Tensor& retrive_next_token,
+    at::Tensor& retrive_next_sibling,
+    int64_t batch_size,
+    int64_t draft_token_num);
+
 void segment_packbits(
     at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr, at::Tensor y, int64_t sycl_stream);
 

@@ -218,6 +218,7 @@ from sgl_kernel.sparse_flash_attn import (
 from sgl_kernel.speculative import (
     TreeMaskMode,
     build_tree_kernel_efficient,
+    reconstruct_indices_from_tree_mask,
     segment_packbits,
     tree_speculative_sampling_target_only,
     verify_tree_greedy,

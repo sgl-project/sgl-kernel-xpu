@@ -38,9 +38,9 @@
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/kernel_hardware_info.hpp"
-#include "sycl/kernels/mla_sparse/collective/xe_mla_sparse_epilogue.hpp"
-#include "sycl/kernels/mla_sparse/collective/xe_mla_sparse_mainloop.hpp"
-#include "sycl/kernels/mla_sparse/kernel/mla_sparse_tile_scheduler.hpp"
+#include "sycl/kernels/mla_sparse/xe20/collective/xe_mla_sparse_epilogue.hpp"
+#include "sycl/kernels/mla_sparse/xe20/collective/xe_mla_sparse_mainloop.hpp"
+#include "sycl/kernels/mla_sparse/xe20/kernel/mla_sparse_tile_scheduler.hpp"
 
 namespace cutlass::flash_attention::kernel {
 using namespace cute;

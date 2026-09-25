@@ -1,9 +1,11 @@
-# Generate Sparse MLA prefill kernel instantiation files for DeepSeek V4.
-# Each (ELEM_TAG, B_H) is compiled as a separate library to parallelize compilation.
-# Mirrors MlaSparseDecodeXe20.cmake; the prefill 2-stage path reuses the decode
-# 2-stage device stack (only the Stage-1 gather companion differs).
+# Generate Sparse MLA prefill kernel instantiation files for DeepSeek V4 (Xe35/CRI).
+# Mirrors MlaSparsePrefillXe20.cmake but targets the xe35 arch bucket: each TU
+# includes the xe35 device stack and pins SYCL_INTEL_TARGET=35. These land in
+# device_cpp_xe35 and are compiled only when DPCPP_SYCL_TARGET matches "cri".
+# The prefill 2-stage path reuses the decode 2-stage device stack (only the
+# Stage-1 gather companion differs).
 
-# Single authoritative dtype list (see MlaSparseDecodeXe20.cmake): the C++ query type
+# Single authoritative dtype list (see MlaSparseDecodeXe35.cmake): the C++ query type
 # is derived from ELEM_TAG in the loop, so there is no second list to keep index-aligned.
 set(MLA_SPARSE_PREFILL_ELEM_TAGS bf16)
 
@@ -35,12 +37,12 @@ foreach(ELEM_TAG ${MLA_SPARSE_PREFILL_ELEM_TAGS})
     foreach(D_QK ${MLA_SPARSE_PREFILL_2STAGE_D_QK})
         foreach(B_H ${MLA_SPARSE_PREFILL_2STAGE_B_H})
             foreach(HAS_ATTN_SINK ${MLA_SPARSE_PREFILL_2STAGE_HAS_ATTN_SINK})
-                set(ARCH_TAG xe20)
-                set(SYCL_TARGET 20)
+                set(ARCH_TAG xe35)
+                set(SYCL_TARGET 35)
                 set(GENERATED_FILE_2STAGE
                     "${CMAKE_CURRENT_BINARY_DIR}/sycl/mla_sparse_prefill_2stage_kernel_${ELEM_TAG}_${D_QK}_${B_H}_${HAS_ATTN_SINK}_${ARCH_TAG}.cpp")
                 configure_file(${MLA_SPARSE_PREFILL_2STAGE_TEMPLATE} ${GENERATED_FILE_2STAGE} @ONLY)
-                list(APPEND device_cpp_xe20 ${GENERATED_FILE_2STAGE})
+                list(APPEND device_cpp_xe35 ${GENERATED_FILE_2STAGE})
             endforeach()
         endforeach()
     endforeach()

@@ -6,7 +6,6 @@
     \brief Sparse MLA decode dispatch interface for DeepSeek V4.
     Token-level scattered gather with dual KV cache pools + attn_sink.
 */
-#define SYCL_INTEL_TARGET 20
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
@@ -16,16 +15,19 @@
 #include "SGLKernelPerf.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
-#include "sycl/kernels/mla_sparse/device/mla_sparse_decode_dispatch.hpp"
-#include "sycl/kernels/mla_sparse/device/mla_sparse_decode_types.hpp"
+#if SYCL_INTEL_TARGET == 35
+#include "sycl/kernels/mla_sparse/xe35/device/mla_sparse_decode_dispatch.hpp"
+#else
+#include "sycl/kernels/mla_sparse/xe20/device/mla_sparse_decode_dispatch.hpp"
+#endif
 #ifdef USE_MLA_JIT
 #include "jit/mla_jit.h"
 #endif
 
 // Compile-time toggle for the two-stage sparse MLA decode path (gather+dequant to
 // HBM, then dense flash-decode). The selector macro
-// SGLANG_USE_SPARSE_MLA_2STAGE is defined (default 1) in mla_sparse_decode_types.hpp
-// below; set it to 0 there for the fused path, or override at build time with
+// SGLANG_USE_SPARSE_MLA_2STAGE is defined (default 1) in mla_sparse_decode_dispatch.hpp
+// (included above); set it to 0 there for the fused path, or override at build time with
 // -DSGLANG_USE_SPARSE_MLA_2STAGE=<0|1>. Compile-time A/B toggle in the
 // SGL_DISABLE_PACKGQA style. The name follows the env-var-conventions naming rule
 // (SGLANG_ prefix + USE_ verb for an implementation selector).
@@ -263,4 +265,3 @@ SGL_KERNEL_EXPORT void flash_mla_sparse_decode(
 #undef DISPATCH_MLA_SPARSE_B_H
 #undef DISPATCH_MLA_SPARSE_SINK
 #undef DISPATCH_MLA_SPARSE_LAUNCH_2STAGE
-#undef SYCL_INTEL_TARGET

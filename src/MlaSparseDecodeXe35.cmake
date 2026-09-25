@@ -1,5 +1,7 @@
-# Generate Sparse MLA decode kernel instantiation files for DeepSeek V4.
-# Each ELEM_TAG is compiled as a separate library to parallelize compilation.
+# Generate Sparse MLA decode kernel instantiation files for DeepSeek V4 (Xe35/CRI).
+# Mirrors MlaSparseDecodeXe20.cmake but targets the xe35 arch bucket: each TU
+# includes the xe35 device stack and pins SYCL_INTEL_TARGET=35. These land in
+# device_cpp_xe35 and are compiled only when DPCPP_SYCL_TARGET matches "cri".
 
 # Single authoritative dtype list. The filename/symbol-safe ELEM_TAG is what's
 # enumerated here; the C++ query type (ELEM_SYCL_TYPE) is derived from it inside the
@@ -37,24 +39,24 @@ foreach(ELEM_TAG ${MLA_SPARSE_DECODE_ELEM_TAGS})
     # Fused (single-pass) variant -- optimization track, opt-in via USE_MLA_SPARSE_FUSED
     # (default OFF). The 2-stage variant below is always built (shipping default).
     if(USE_MLA_SPARSE_FUSED)
-        set(ARCH_TAG xe20)
-        set(SYCL_TARGET 20)
+        set(ARCH_TAG xe35)
+        set(SYCL_TARGET 35)
         set(GENERATED_FILE
             "${CMAKE_CURRENT_BINARY_DIR}/sycl/mla_sparse_decode_kernel_${ELEM_TAG}_128_${ARCH_TAG}.cpp")
         configure_file(${MLA_SPARSE_DECODE_TEMPLATE} ${GENERATED_FILE} @ONLY)
-        list(APPEND device_cpp_xe20 ${GENERATED_FILE})
+        list(APPEND device_cpp_xe35 ${GENERATED_FILE})
     endif()
 
     # Two-stage: one TU per (ELEM_TAG, D_QK, B_H, HAS_ATTN_SINK).
     foreach(D_QK ${MLA_SPARSE_DECODE_2STAGE_D_QK})
         foreach(B_H ${MLA_SPARSE_DECODE_2STAGE_B_H})
             foreach(HAS_ATTN_SINK ${MLA_SPARSE_DECODE_2STAGE_HAS_ATTN_SINK})
-                set(ARCH_TAG xe20)
-                set(SYCL_TARGET 20)
+                set(ARCH_TAG xe35)
+                set(SYCL_TARGET 35)
                 set(GENERATED_FILE_2STAGE
                     "${CMAKE_CURRENT_BINARY_DIR}/sycl/mla_sparse_decode_2stage_kernel_${ELEM_TAG}_${D_QK}_${B_H}_${HAS_ATTN_SINK}_${ARCH_TAG}.cpp")
                 configure_file(${MLA_SPARSE_DECODE_2STAGE_TEMPLATE} ${GENERATED_FILE_2STAGE} @ONLY)
-                list(APPEND device_cpp_xe20 ${GENERATED_FILE_2STAGE})
+                list(APPEND device_cpp_xe35 ${GENERATED_FILE_2STAGE})
             endforeach()
         endforeach()
     endforeach()

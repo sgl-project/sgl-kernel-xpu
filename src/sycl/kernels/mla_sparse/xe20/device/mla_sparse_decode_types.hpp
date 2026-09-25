@@ -46,12 +46,12 @@
 #include <optional>
 #include <sycl/sycl.hpp>
 
-#include "../../../Utils.h"
-#include "sycl/kernels/mla_sparse/collective/xe_mla_sparse_epilogue.hpp"
-#include "sycl/kernels/mla_sparse/collective/xe_mla_sparse_mainloop.hpp"
-#include "sycl/kernels/mla_sparse/device/mla_sparse_runner.hpp"
-#include "sycl/kernels/mla_sparse/kernel/mla_sparse_tile_scheduler.hpp"
-#include "sycl/kernels/mla_sparse/kernel/xe_mla_sparse_kernel.hpp"
+#include "../../../../Utils.h"
+#include "sycl/kernels/mla_sparse/xe20/collective/xe_mla_sparse_epilogue.hpp"
+#include "sycl/kernels/mla_sparse/xe20/collective/xe_mla_sparse_mainloop.hpp"
+#include "sycl/kernels/mla_sparse/xe20/device/mla_sparse_runner.hpp"
+#include "sycl/kernels/mla_sparse/xe20/kernel/mla_sparse_tile_scheduler.hpp"
+#include "sycl/kernels/mla_sparse/xe20/kernel/xe_mla_sparse_kernel.hpp"
 
 using namespace cute;
 

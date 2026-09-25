@@ -1,5 +1,41 @@
 import pytest
 import torch
+from _xpu import KNOWN_ARCHS, current_arch
+
+
+# Arch gate (arch-aware tests). An op author declares which
+# arches it supports with one marker:
+#
+#     @pytest.mark.arch("xe20", "xe35")     # skipped on any other device
+#     def test_per_tensor_quant_fp8(...):
+#         ...
+#
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "arch(*names): XPU arches this op supports (xe20, xe35). The test "
+        "is skipped unless the live device is one of them. No mark = "
+        "arch-agnostic (runs on any device).",
+    )
+
+
+def pytest_runtest_setup(item):
+    marker = item.get_closest_marker("arch")
+    if marker is None:
+        return  # arch-agnostic — runs everywhere
+
+    supported = set(marker.args)
+    unknown = supported - KNOWN_ARCHS
+    if unknown:
+        raise pytest.UsageError(
+            f"{item.nodeid}: unknown arch(s) {sorted(unknown)} in "
+            f"@pytest.mark.arch; valid tags are {sorted(KNOWN_ARCHS)}."
+        )
+
+    running = current_arch()
+    if running not in supported:
+        pytest.skip(f"op supports {sorted(supported)}; running device is {running}")
+
 
 # Disable tensor content sampling in reprs. pytest's saferepr calls
 # `torch/_tensor_str.py:get_summarized_data` when formatting a failed assertion,

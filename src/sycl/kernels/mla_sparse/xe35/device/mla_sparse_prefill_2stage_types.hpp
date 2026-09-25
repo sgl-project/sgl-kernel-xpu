@@ -100,8 +100,8 @@
 // device::MLASparse runner, plus the shared XPUSparseDecodeAttnFwdParams /
 // SparseAttnDecodeParams params, the FLASH_MLA_*_V_SPLIT constants, and the
 // DISPATCH_BOOLEAN_FLAG macro. We only add the prefill gather companion here.
-#include "sycl/kernels/mla_sparse/device/mla_sparse_decode_2stage_types.hpp"
-#include "sycl/kernels/mla_sparse/kernel/xe_mla_sparse_2stage_gather_kernel.hpp"
+#include "sycl/kernels/mla_sparse/xe35/device/mla_sparse_decode_2stage_types.hpp"
+#include "sycl/kernels/mla_sparse/xe35/kernel/xe_mla_sparse_2stage_gather_kernel.hpp"
 
 namespace cutlass::flash_attention::kernel {
 

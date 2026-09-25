@@ -122,6 +122,15 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
+std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_norm_scale_shift(
+    torch::Tensor residual,
+    torch::Tensor x,
+    std::optional<torch::Tensor> gate,
+    std::optional<torch::Tensor> weight,
+    std::optional<torch::Tensor> bias,
+    torch::Tensor scale,
+    torch::Tensor shift,
+    double eps);
 at::Tensor hadamard_transform(const at::Tensor& input, double scale);
 void fused_q_norm_rope(
     torch::Tensor& q_input, torch::Tensor& q_output, torch::Tensor& freqs_cis, torch::Tensor& positions, double eps);

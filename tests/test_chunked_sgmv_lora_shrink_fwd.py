@@ -108,7 +108,9 @@ def _build_logical_segments(row_adapters: List[int], permutation_mode: str = "so
     """
     ra = torch.tensor(row_adapters, dtype=torch.int32)
     if permutation_mode == "sorted":
-        permutation = torch.argsort(ra, stable=True).to(torch.int32)  # logical -> physical
+        permutation = torch.argsort(ra, stable=True).to(
+            torch.int32
+        )  # logical -> physical
         logical = ra[permutation.to(torch.int64)]
     elif permutation_mode == "identity":
         permutation = torch.arange(ra.numel(), dtype=torch.int32)  # no-op remap
@@ -209,23 +211,43 @@ _ZIGZAG = [0, 1, 2, 0, 1, 2, 0, 1, 2, 0]
 _SCENARIOS = [
     # Interleaved (zigzag) decode adapters, swept over input_dim x max_rank.
     pytest.param(
-        {"num_loras": 3, "row_adapters": _ZIGZAG, "input_dim": 64, "max_rank": 8,
-         "lora_ranks": [8, 4, 2]},
+        {
+            "num_loras": 3,
+            "row_adapters": _ZIGZAG,
+            "input_dim": 64,
+            "max_rank": 8,
+            "lora_ranks": [8, 4, 2],
+        },
         id="zigzag-K64-r8",
     ),
     pytest.param(
-        {"num_loras": 3, "row_adapters": _ZIGZAG, "input_dim": 64, "max_rank": 64,
-         "lora_ranks": [64, 32, 16]},
+        {
+            "num_loras": 3,
+            "row_adapters": _ZIGZAG,
+            "input_dim": 64,
+            "max_rank": 64,
+            "lora_ranks": [64, 32, 16],
+        },
         id="zigzag-K64-r64",
     ),
     pytest.param(
-        {"num_loras": 3, "row_adapters": _ZIGZAG, "input_dim": 4096, "max_rank": 8,
-         "lora_ranks": [8, 4, 2]},
+        {
+            "num_loras": 3,
+            "row_adapters": _ZIGZAG,
+            "input_dim": 4096,
+            "max_rank": 8,
+            "lora_ranks": [8, 4, 2],
+        },
         id="zigzag-K4096-r8",
     ),
     pytest.param(
-        {"num_loras": 3, "row_adapters": _ZIGZAG, "input_dim": 4096, "max_rank": 64,
-         "lora_ranks": [64, 32, 16]},
+        {
+            "num_loras": 3,
+            "row_adapters": _ZIGZAG,
+            "input_dim": 4096,
+            "max_rank": 64,
+            "lora_ranks": [64, 32, 16],
+        },
         id="zigzag-K4096-r64",
     ),
     # Stacked projections: o_proj=1, gate_up=2, qkv=3.
@@ -239,20 +261,33 @@ _SCENARIOS = [
     ),
     # Many tokens across many adapters.
     pytest.param(
-        {"num_loras": 4, "max_rank": 16, "input_dim": 512,
-         "row_adapters": _MANY_ADAPTERS, "lora_ranks": [1, 4, 8, 16]},
+        {
+            "num_loras": 4,
+            "max_rank": 16,
+            "input_dim": 512,
+            "row_adapters": _MANY_ADAPTERS,
+            "lora_ranks": [1, 4, 8, 16],
+        },
         id="many-adapters",
     ),
     # permutation=None prefill fast path (rows pre-grouped, GEMM in place).
     pytest.param(
-        {"num_loras": 3, "row_adapters": [0] * 16 + [2] * 32 + [1] * 16,
-         "lora_ranks": [8, 4, 2], "permutation_mode": "none"},
+        {
+            "num_loras": 3,
+            "row_adapters": [0] * 16 + [2] * 32 + [1] * 16,
+            "lora_ranks": [8, 4, 2],
+            "permutation_mode": "none",
+        },
         id="permutation-none",
     ),
     # Identity permutation drives the gather/scatter path as a no-op remap.
     pytest.param(
-        {"row_adapters": [0] * 16 + [1] * 16, "input_dim": 128,
-         "lora_ranks": [8, 4], "permutation_mode": "identity"},
+        {
+            "row_adapters": [0] * 16 + [1] * 16,
+            "input_dim": 128,
+            "lora_ranks": [8, 4],
+            "permutation_mode": "identity",
+        },
         id="identity-permutation",
     ),
 ]
@@ -264,7 +299,9 @@ def test_chunked_shrink(dtype, scenario):
     cfg = {**_DEFAULT_SCENARIO, **scenario}
     num_loras = cfg["num_loras"]
     max_rank = cfg["max_rank"]
-    ranks = cfg["lora_ranks"] if cfg["lora_ranks"] is not None else [max_rank] * num_loras
+    ranks = (
+        cfg["lora_ranks"] if cfg["lora_ranks"] is not None else [max_rank] * num_loras
+    )
     lora_ranks = torch.tensor(ranks, dtype=torch.int32, device="xpu")
     _run_and_compare_chunked(
         dtype=dtype,

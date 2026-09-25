@@ -91,6 +91,11 @@ except ImportError:
     # Triton (or its Intel backend) not importable in this environment.
     # fp8_paged_mqa_logits_triton will simply be unavailable.
     fp8_paged_mqa_logits_triton = None
+try:
+    from sgl_kernel.inkling_gate import inkling_gate_topk_renorm
+except ImportError:
+    # Triton (or its Intel backend) not importable in this environment.
+    inkling_gate_topk_renorm = None
 from sgl_kernel.fused_norm_rope_v2 import compress_norm_rope_store
 from sgl_kernel.gdn_attn import gdn_attention
 

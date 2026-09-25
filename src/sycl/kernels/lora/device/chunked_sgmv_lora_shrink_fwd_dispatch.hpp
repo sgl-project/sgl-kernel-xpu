@@ -32,16 +32,16 @@
   \file
   \brief Forward declarations of the generated per-(dtype, tile) launch
          functions for the chunked-SGMV LoRA shrink grouped GEMM. The definitions
-         are produced by chunked_sgmv_lora_shrink_kernel.cpp.in via
-         ChunkedSgmvLoraShrinkXe20.cmake, each in its own translation unit for
+         are produced by chunked_sgmv_lora_shrink_fwd_kernel.cpp.in via
+         ChunkedSgmvLoraShrinkFwdXe20.cmake, each in its own translation unit for
          parallel compilation of the heavy CUTLASS template instantiation.
 
-         Naming: launch_chunked_sgmv_lora_shrink_<ELEM_TAG>_<TILE_TAG>
+         Naming: launch_chunked_sgmv_lora_shrink_fwd_<ELEM_TAG>_<TILE_TAG>
          Parameters:
            ELEM_TAG in {half, bf16}       -- fp16/bf16.
-           TILE_TAG in {small}            -- extend via ChunkedSgmvLoraShrinkXe20.cmake
+           TILE_TAG in {small}            -- extend via ChunkedSgmvLoraShrinkFwdXe20.cmake
                                              + a new option tag/type in
-                                             chunked_sgmv_lora_shrink_types.hpp.
+                                             chunked_sgmv_lora_shrink_fwd_types.hpp.
 */
 
 #pragma once
@@ -51,12 +51,12 @@
 
 #include <sycl/sycl.hpp>
 
-namespace chunked_sgmv_lora_shrink_impl {
+namespace chunked_sgmv_lora_shrink_fwd_impl {
 
 // Each function is defined in a separate generated .cpp file from
-// chunked_sgmv_lora_shrink_kernel.cpp.in, compiled as its own library.
-#define DECLARE_CHUNKED_SGMV_LORA_SHRINK_LAUNCH(ELEM, TILE) \
-  void launch_chunked_sgmv_lora_shrink_##ELEM##_##TILE(     \
+// chunked_sgmv_lora_shrink_fwd_kernel.cpp.in, compiled as its own library.
+#define DECLARE_CHUNKED_SGMV_LORA_SHRINK_FWD_LAUNCH(ELEM, TILE) \
+  void launch_chunked_sgmv_lora_shrink_fwd_##ELEM##_##TILE(     \
       const torch::Tensor& input_x,                         \
       const torch::Tensor& weights,                         \
       const torch::Tensor& seg_indptr_i32,                  \
@@ -68,12 +68,12 @@ namespace chunked_sgmv_lora_shrink_impl {
       sycl::queue& queue);
 
 // One declaration per registered tile. Extend as tiles are added.
-#define DECLARE_CHUNKED_SGMV_LORA_SHRINK_ALL_TILES(ELEM) DECLARE_CHUNKED_SGMV_LORA_SHRINK_LAUNCH(ELEM, small)
+#define DECLARE_CHUNKED_SGMV_LORA_SHRINK_FWD_ALL_TILES(ELEM) DECLARE_CHUNKED_SGMV_LORA_SHRINK_FWD_LAUNCH(ELEM, small)
 
-DECLARE_CHUNKED_SGMV_LORA_SHRINK_ALL_TILES(half)
-DECLARE_CHUNKED_SGMV_LORA_SHRINK_ALL_TILES(bf16)
+DECLARE_CHUNKED_SGMV_LORA_SHRINK_FWD_ALL_TILES(half)
+DECLARE_CHUNKED_SGMV_LORA_SHRINK_FWD_ALL_TILES(bf16)
 
-#undef DECLARE_CHUNKED_SGMV_LORA_SHRINK_LAUNCH
-#undef DECLARE_CHUNKED_SGMV_LORA_SHRINK_ALL_TILES
+#undef DECLARE_CHUNKED_SGMV_LORA_SHRINK_FWD_LAUNCH
+#undef DECLARE_CHUNKED_SGMV_LORA_SHRINK_FWD_ALL_TILES
 
-}  // namespace chunked_sgmv_lora_shrink_impl
+}  // namespace chunked_sgmv_lora_shrink_fwd_impl

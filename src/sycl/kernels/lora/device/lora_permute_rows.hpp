@@ -44,10 +44,10 @@
     gather : output[i, :]              = input[permutation[i], :]
     scatter: output[permutation[i], :] = input[i, :]
 
-  Reused by both the standalone lora_gather_rows / lora_scatter_rows ops
-  (LoraGatherScatter.cpp) and the fused chunked_sgmv_lora_shrink_forward
-  entrypoint (ChunkedSgmvLoraShrink.cpp), so the copy kernel lives in exactly
-  one place. Callers own validation + the int64 cast of `permutation`.
+  Used by the fused chunked_sgmv_lora_shrink_fwd entrypoint
+  (ChunkedSgmvLoraShrinkFwd.cpp) for its internal gather (physical -> logical)
+  before the grouped GEMM and scatter (logical -> physical) afterwards.
+  Callers own validation + the int64 cast of `permutation`.
 */
 
 #pragma once

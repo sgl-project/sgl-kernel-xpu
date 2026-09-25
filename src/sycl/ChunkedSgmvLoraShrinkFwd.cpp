@@ -60,7 +60,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
-#include "kernels/lora/device/chunked_sgmv_lora_shrink_dispatch.hpp"
+#include "kernels/lora/device/chunked_sgmv_lora_shrink_fwd_dispatch.hpp"
 #include "kernels/lora/device/lora_permute_rows.hpp"
 #include "sgl_kernel_export.h"
 
@@ -68,26 +68,26 @@ namespace {
 
 //----------------- Per-(dtype, tile) dispatch macros --------------------//
 // Tile selection currently has a single small-N option. Add tiles to
-// DISPATCH_CHUNKED_SGMV_LORA_SHRINK_TILE (and to ChunkedSgmvLoraShrinkXe20.cmake
-// + chunked_sgmv_lora_shrink_dispatch.hpp + chunked_sgmv_lora_shrink_types.hpp)
+// DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_TILE (and to ChunkedSgmvLoraShrinkFwdXe20.cmake
+// + chunked_sgmv_lora_shrink_fwd_dispatch.hpp + chunked_sgmv_lora_shrink_fwd_types.hpp)
 // with a runtime heuristic (e.g. average M per segment) picking the tag.
-#define DISPATCH_CHUNKED_SGMV_LORA_SHRINK_TILE(ELEM, ...)                                       \
+#define DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_TILE(ELEM, ...)                                       \
   do {                                                                                          \
-    chunked_sgmv_lora_shrink_impl::launch_chunked_sgmv_lora_shrink_##ELEM##_small(__VA_ARGS__); \
+    chunked_sgmv_lora_shrink_fwd_impl::launch_chunked_sgmv_lora_shrink_fwd_##ELEM##_small(__VA_ARGS__); \
   } while (0)
 
-#define DISPATCH_CHUNKED_SGMV_LORA_SHRINK_DTYPE(...)                                                               \
+#define DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_DTYPE(...)                                                               \
   do {                                                                                                             \
     switch (weights.scalar_type()) {                                                                               \
       case torch::kHalf:                                                                                           \
-        DISPATCH_CHUNKED_SGMV_LORA_SHRINK_TILE(half, __VA_ARGS__);                                                 \
+        DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_TILE(half, __VA_ARGS__);                                                 \
         break;                                                                                                     \
       case torch::kBFloat16:                                                                                       \
-        DISPATCH_CHUNKED_SGMV_LORA_SHRINK_TILE(bf16, __VA_ARGS__);                                                 \
+        DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_TILE(bf16, __VA_ARGS__);                                                 \
         break;                                                                                                     \
       default:                                                                                                     \
         TORCH_CHECK(                                                                                               \
-            false, "Unsupported data type for chunked_sgmv_lora_shrink_forward weights: ", weights.scalar_type()); \
+            false, "Unsupported data type for chunked_sgmv_lora_shrink_fwd weights: ", weights.scalar_type()); \
     }                                                                                                              \
   } while (0)
 
@@ -95,7 +95,7 @@ namespace {
 
 //----------------- Main API function --------------------//
 
-SGL_KERNEL_EXPORT void chunked_sgmv_lora_shrink_forward(
+SGL_KERNEL_EXPORT void chunked_sgmv_lora_shrink_fwd(
     torch::Tensor& output,                           // [num_tokens, num_slices*max_rank]  (physical token order)
     const torch::Tensor& x,                          // [num_tokens, input_dim]  (physical token order)
     const torch::Tensor& weights,                    // [num_loras, num_slices*max_rank, input_dim]
@@ -190,7 +190,7 @@ SGL_KERNEL_EXPORT void chunked_sgmv_lora_shrink_forward(
 
   if (!permutation.has_value()) {
     // Prefill fast path: rows already contiguous by adapter, GEMM in place.
-    DISPATCH_CHUNKED_SGMV_LORA_SHRINK_DTYPE(
+    DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_DTYPE(
         x, weights, seg_indptr_i32, weight_indices_i32, output, num_slices_, max_rank, num_segments_, queue);
     return;
   }
@@ -212,12 +212,12 @@ SGL_KERNEL_EXPORT void chunked_sgmv_lora_shrink_forward(
   lora_permute_rows_impl::permute_rows_dispatch</*GATHER=*/true>(x, x_sorted, perm_i64, queue);
 
   auto out_sorted = torch::empty({num_tokens_i64, total_n_i64}, output.options());
-  DISPATCH_CHUNKED_SGMV_LORA_SHRINK_DTYPE(
+  DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_DTYPE(
       x_sorted, weights, seg_indptr_i32, weight_indices_i32, out_sorted, num_slices_, max_rank, num_segments_, queue);
 
   lora_permute_rows_impl::permute_rows_dispatch</*GATHER=*/false>(out_sorted, output, perm_i64, queue);
 }
 
-#undef DISPATCH_CHUNKED_SGMV_LORA_SHRINK_TILE
-#undef DISPATCH_CHUNKED_SGMV_LORA_SHRINK_DTYPE
+#undef DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_TILE
+#undef DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_DTYPE
 #undef SYCL_INTEL_TARGET

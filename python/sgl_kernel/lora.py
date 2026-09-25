@@ -474,64 +474,7 @@ def gate_up_lora_b_fwd(
     return output
 
 
-def lora_gather_rows(
-    input: torch.Tensor,
-    permutation: torch.Tensor,
-) -> torch.Tensor:
-    r"""Gather (row-permute) rows of ``input`` into logical order.
-
-    Computes ``output[i, :] = input[permutation[i], :]`` for every row ``i``.
-
-    ``permutation`` maps a logical (adapter-grouped) row index to the physical
-    (original token) row index and must be a bijection over ``[0, num_rows)``.
-
-    Parameters
-    ----------
-    input : torch.Tensor
-        Source tensor, shape ``(num_rows, width)``. FP16 / BF16 / FP32.
-    permutation : torch.Tensor
-        1D ``logical -> physical`` index tensor, shape ``(num_rows,)``. Int32 or
-        int64 (cast to int64 internally).
-
-    Returns
-    -------
-    output : torch.Tensor
-        Gathered tensor, shape ``(num_rows, width)``, same dtype as ``input``.
-    """
-    output = torch.empty_like(input)
-    torch.ops.sgl_kernel.lora_gather_rows(output, input, permutation)
-    return output
-
-
-def lora_scatter_rows(
-    input: torch.Tensor,
-    permutation: torch.Tensor,
-) -> torch.Tensor:
-    r"""Scatter (row-permute) logical-order rows of ``input`` back to physical order.
-
-    Computes ``output[permutation[i], :] = input[i, :]`` for every row ``i``.
-    This is the inverse use of the same ``permutation`` as :func:`lora_gather_rows`;
-    because ``permutation`` is a bijection every output row is written exactly once.
-
-    Parameters
-    ----------
-    input : torch.Tensor
-        Source tensor in logical order, shape ``(num_rows, width)``. FP16 / BF16 / FP32.
-    permutation : torch.Tensor
-        1D ``logical -> physical`` index tensor, shape ``(num_rows,)``. Int32 or
-        int64 (cast to int64 internally).
-
-    Returns
-    -------
-    output : torch.Tensor
-        Scattered tensor in physical order, shape ``(num_rows, width)``, same dtype as ``input``.
-    """
-    output = torch.empty_like(input)
-    torch.ops.sgl_kernel.lora_scatter_rows(output, input, permutation)
-    return output
-
-
-def chunked_sgmv_lora_shrink_forward(
+def chunked_sgmv_lora_shrink_fwd(
     input_x: torch.Tensor,
     weights: torch.Tensor,
     stack_num: int,
@@ -593,7 +536,7 @@ def chunked_sgmv_lora_shrink_forward(
         (input_x.size(0), weights.size(1)), dtype=weights.dtype, device=weights.device
     )
     # Call the kernel (void op: writes into `output` in place)
-    torch.ops.sgl_kernel.chunked_sgmv_lora_shrink_forward(
+    torch.ops.sgl_kernel.chunked_sgmv_lora_shrink_fwd(
         output,
         input_x,
         weights,

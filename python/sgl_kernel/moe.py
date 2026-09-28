@@ -488,14 +488,39 @@ def _validate_fp8_weight_scale(
     allow_scalar: bool,
 ) -> None:
     """Validate an FP8 expert scale tensor against its physical weight shape."""
-    assert scale.dtype == torch.float32, f"{name} must be float32"
+    is_mxfp8 = scale.dtype in (torch.uint8, torch.float8_e8m0fnu)
+    if is_mxfp8:
+        assert scale.ndim == 3, f"{name} MXFP8 scales must be 3D [E, N, K/32]"
+        assert scale.shape[0] == weights.shape[0], (
+            f"{name} expert dimension {scale.shape[0]} must match weights "
+            f"expert dimension {weights.shape[0]}"
+        )
+        assert scale.shape[1] == weights.shape[1], (
+            f"{name} MXFP8 scale N dimension {scale.shape[1]} must match weights "
+            f"N dimension {weights.shape[1]}"
+        )
+        assert (
+            weights.shape[2] % 32 == 0
+        ), f"{name} MXFP8 scale requires K divisible by 32, got K={weights.shape[2]}"
+        assert scale.shape[2] == weights.shape[2] // 32, (
+            f"{name} MXFP8 scale K dimension {scale.shape[2]} must equal K/32 "
+            f"({weights.shape[2] // 32})"
+        )
+        return
+
+    assert (
+        scale.dtype == torch.float32
+    ), f"{name} must be float32 for scalar or 128x128 block scales"
     assert scale.ndim in (
-        (2, 3) if allow_scalar else (3,)
-    ), f"{name} must be 3D block scales or 2D scalar scales"
+        (1, 2, 3) if allow_scalar else (3,)
+    ), f"{name} must be 3D block scales, 2D scalar scales, or 1D per-expert scales"
     assert scale.shape[0] == weights.shape[0], (
         f"{name} expert dimension {scale.shape[0]} must match weights "
         f"expert dimension {weights.shape[0]}"
     )
+    if scale.ndim == 1:
+        assert allow_scalar, f"{name} scalar scales are not supported for this FP8 path"
+        return
     if scale.ndim == 2:
         assert allow_scalar, f"{name} scalar scales are not supported for this FP8 path"
         expected_columns = 2 if name == "w1_scale" else 1
@@ -618,8 +643,8 @@ def fused_experts(
     - a2_scale (Optional[torch.Tensor]): Reserved for a future prequantized
         FP8 activation input. It is currently rejected because the Xe2
         fallback consumes BF16 activations.
-    - block_shape: (Optional[List[int]]): Weight block size metadata. FP8
-        block scales must use [128, 128]; the value is validated when supplied.
+    - block_shape: (Optional[List[int]]): Weight block size metadata. Standard FP8
+        block scales use [128, 128]; MXFP8 uses [1, 32] or [32]. The value is validated when supplied.
     - no_combine (bool): If True, skip the combine step. Defaults to False.
     - routed_scaling_factor (Optional[float]): Optional scaling factor for routed tokens, used by Llama4 only.
     - gemm1_alpha (Optional[float]): Optional gemm1_alpha for the activation
@@ -637,10 +662,11 @@ def fused_experts(
         is_xe2_arch() or is_xe3_arch()
     ), "Current MoE is only supported on BMG (Xe2) or CRI (Xe3)"
 
-    use_fp8_weight = use_fp8_w8a8
+    # Automatically detect FP8 expert weights from flag or tensor dtype.
+    use_fp8_weight = use_fp8_w8a8 or (w1.dtype == torch.float8_e4m3fn)
     assert not (
         use_fp8_weight and is_xe3_arch()
-    ), "the FP8 W8A16 grouped GEMM (moe_grouped_mm_nt_xe20_fp8_w8a16) is not yet ported to CRI (Xe3)"
+    ), "the W8A16 grouped GEMM (moe_grouped_mm_nt_xe20_w8a16) is not yet ported to CRI (Xe3)"
     assert a1_scale is None, (
         "prequantized FP8 activation input is not supported: " "a1_scale must be None"
     )
@@ -649,10 +675,11 @@ def fused_experts(
     )
     if block_shape is not None:
         assert use_fp8_weight, "block_shape is only supported for FP8 MoE paths"
-        assert list(block_shape) == [
-            128,
-            128,
-        ], "FP8 MoE currently supports only block_shape=[128, 128]"
+        assert list(block_shape) in (
+            [128, 128],
+            [1, 32],
+            [32],
+        ), "FP8 MoE currently supports block_shape=[128, 128], [1, 32], or [32] (MXFP8)"
     if use_fp8_weight:
         assert activation in ("silu", "gelu", "relu2"), (
             "FP8 MoE supports silu, gelu, relu2, GPT-OSS SwiGLU, and "
@@ -766,9 +793,38 @@ def fused_experts(
         ), "FP8 weight-only MoE requires contiguous expert weights"
         _validate_fp8_weight_scale(w1_scale, w1, "w1_scale", allow_scalar=True)
         _validate_fp8_weight_scale(w2_scale, w2, "w2_scale", allow_scalar=True)
+        if w1_scale.ndim == 1:
+            w1_scale = w1_scale.unsqueeze(1)
+        if w2_scale.ndim == 1:
+            w2_scale = w2_scale.unsqueeze(1)
+        w1_scale_is_mxfp8 = w1_scale.ndim == 3 and w1_scale.dtype in (
+            torch.uint8,
+            torch.float8_e8m0fnu,
+        )
+        w2_scale_is_mxfp8 = w2_scale.ndim == 3 and w2_scale.dtype in (
+            torch.uint8,
+            torch.float8_e8m0fnu,
+        )
         assert (
-            w1_scale.ndim == w2_scale.ndim
-        ), "w1_scale and w2_scale must use the same scalar or block layout"
+            w1_scale.ndim == w2_scale.ndim and w1_scale_is_mxfp8 == w2_scale_is_mxfp8
+        ), "w1_scale and w2_scale must use the same scalar, MXFP8, or 128x128 block layout"
+        if block_shape is not None:
+            norm_block_shape = list(block_shape)
+            if w1_scale_is_mxfp8:
+                assert norm_block_shape in (
+                    [1, 32],
+                    [32],
+                ), f"MXFP8 scales require block_shape=[1, 32] or [32], got {block_shape}"
+            elif w1_scale.ndim == 3:
+                assert norm_block_shape == [
+                    128,
+                    128,
+                ], f"Standard FP8 block scales require block_shape=[128, 128], got {block_shape}"
+            else:
+                assert False, (
+                    f"block_shape is only valid for 3D block scales, got {block_shape} "
+                    f"with scalar scales (w1_scale.shape={w1_scale.shape})"
+                )
         assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
     if b1 is not None:
         assert (
@@ -942,7 +998,7 @@ def fused_experts(
             hidden_states.dtype,
             hidden_states.device,
         )
-        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
+        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
             intermediate_cache1,
             input_A_shuffle,
             w1,
@@ -983,7 +1039,7 @@ def fused_experts(
                     f"unsupported FP8 activation type: {activation_type}"
                 )
 
-        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
+        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
             intermediate_cache3,
             intermediate_cache2,
             w2,

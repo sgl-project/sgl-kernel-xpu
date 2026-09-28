@@ -39,6 +39,13 @@ namespace at::native::xpu {
 
 constexpr float FLOAT4_E2M1_MAX = 6.0f;
 
+// UE8M0 scale round modes for different requirements in low-precision models.
+//   RCEIL: exp = ceil(log2(y_s)) -- never overflows.
+//   EVEN:  exp = round_half_to_even(log2(y_s)) -- nearest.
+//   FLOOR: exp = floor(log2(local_absmax)) - E2M1_EMAX (OCP MX / MXFP4 default).
+//          E2M1_EMAX is hardcoded to 2.
+enum RoundMode : int64_t { RCEIL = 0, EVEN = 1, FLOOR = 2 };
+
 template <typename T>
 inline T QuantGroupReduceMaxFP4(T val, sycl::nd_item<1> item) {
   auto sg = item.get_sub_group();
@@ -141,7 +148,8 @@ struct PerTokenGroupQuantFP4Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       int groups_per_block,
       float eps,
       int num_tokens_per_expert,
-      int hidden_dim_num_groups)
+      int hidden_dim_num_groups,
+      int64_t round_mode = RoundMode::FLOOR)
       : input(input),
         output_q(output_q),
         output_s(output_s),
@@ -150,7 +158,8 @@ struct PerTokenGroupQuantFP4Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         groups_per_block(groups_per_block),
         eps(eps),
         num_tokens_per_expert(num_tokens_per_expert),
-        hidden_dim_num_groups(hidden_dim_num_groups) {}
+        hidden_dim_num_groups(hidden_dim_num_groups),
+        round_mode(round_mode) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {}
 
@@ -242,12 +251,27 @@ struct PerTokenGroupQuantFP4Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     // Reduce across the threads in the quantization group to find the maximum
     local_absmax = QuantGroupReduceMaxFP4(local_absmax, item);
 
-    // Shared exponent per OCP MX spec / Microsoft micro-scaling:
-    //   shared_exp = floor(log2(absmax)) - E2M1_EMAX
-    // where E2M1_EMAX = 2.  eps already lower-limits local_absmax so
-    // log2 is well-defined.
-    float log2_scale = sycl::floor(sycl::log2(local_absmax)) - 2.0f;
-    int clamped_exponent = sycl::clamp(static_cast<int>(log2_scale), -127, 127);
+    // Shared exponent, dispatched by round_mode (see RoundMode above). eps
+    // already lower-limits local_absmax so log2 is well-defined.
+    float exp_s;
+    switch (round_mode) {
+      case RoundMode::EVEN: {
+        float y_s = local_absmax / FLOAT4_E2M1_MAX;
+        // sycl::rint is round-to-nearest, ties-to-even (IEEE 754 default).
+        exp_s = sycl::rint(sycl::log2(sycl::fmax(y_s, 1e-10f)));
+        break;
+      }
+      case RoundMode::RCEIL: {
+        float y_s = local_absmax / FLOAT4_E2M1_MAX;
+        exp_s = sycl::ceil(sycl::log2(sycl::fmax(y_s, 1e-10f)));
+        break;
+      }
+      case RoundMode::FLOOR:
+      default:
+        exp_s = sycl::floor(sycl::log2(local_absmax)) - 2.0f;  // for FP4, and MXFP4 with round mode RCEIL
+        break;
+    }
+    int clamped_exponent = sycl::clamp(static_cast<int>(exp_s), -127, 127);
     float scale_value = sycl::exp2(static_cast<float>(clamped_exponent));
 
     if (lane_id == 0) {
@@ -302,6 +326,7 @@ struct PerTokenGroupQuantFP4Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   float eps;
   int num_tokens_per_expert;  // For column-major interleaving
   int hidden_dim_num_groups;  // For column-major interleaving
+  int64_t round_mode;
 };
 
 SGL_KERNEL_EXPORT void sgl_per_token_group_quant_fp4(
@@ -310,7 +335,8 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_fp4(
     torch::Tensor output_s,
     int64_t group_size,
     double eps,
-    std::optional<torch::Tensor> input_secondary) {
+    std::optional<torch::Tensor> input_secondary,
+    int64_t round_mode = RoundMode::FLOOR) {
   CHECK_CONTIGUOUS(input);
   CHECK_CONTIGUOUS(output_q);
 
@@ -330,6 +356,10 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_fp4(
       output_s.scalar_type() == at::ScalarType::Byte,
       "output_s must be uint8 (UE8M0 scales), got ",
       output_s.scalar_type());
+  TORCH_CHECK(
+      round_mode == RoundMode::RCEIL || round_mode == RoundMode::EVEN || round_mode == RoundMode::FLOOR,
+      "sgl_per_token_group_quant_fp4: round_mode must be 0 (RCEIL), 1 (EVEN), or 2 (FLOOR), got ",
+      round_mode);
 
   TORCH_CHECK(input.dim() >= 1, "input must have at least 1 dimension");
   TORCH_CHECK(
@@ -417,7 +447,8 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_fp4(
         groups_per_block,                                                                                \
         eps_f,                                                                                           \
         num_tokens_per_expert,                                                                           \
-        hidden_dim_num_groups);                                                                          \
+        hidden_dim_num_groups,                                                                           \
+        round_mode);                                                                                     \
     sycl_kernel_submit(global_range, local_range, queue, kernel);                                        \
   } while (0)
 

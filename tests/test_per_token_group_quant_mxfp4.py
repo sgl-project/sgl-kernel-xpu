@@ -190,9 +190,11 @@ def dequantize_e2m1(
     return result.to(dtype)
 
 
-def _shared_exponents(A: torch.Tensor, axis: int) -> torch.Tensor:
-    """Compute shared exponents per block using Microsoft microxcaling's
-    _shared_exponents algorithm with method="max".
+def _shared_exponents(A: torch.Tensor, axis: int, round_mode: int = 2) -> torch.Tensor:
+    """Compute shared exponents per block.
+    round_mode matches the kernel's RoundMode enum (0=RCEIL, 1=EVEN, 2=FLOOR).
+    Default (FLOOR) is Microsoft microxcaling's _shared_exponents algorithm
+    with method="max":
 
     Algorithm:
       1. shared_exp = max(|A|) along axis (per block)
@@ -204,27 +206,38 @@ def _shared_exponents(A: torch.Tensor, axis: int) -> torch.Tensor:
     """
     shared_exp = torch.max(torch.abs(A), dim=axis, keepdim=True).values
 
-    # floor(log2(...)) with zero-guard from microxcaling
-    shared_exp = torch.floor(
-        torch.log2(
-            shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
+    if round_mode == 2:
+        # floor(log2(...)) with zero-guard from microxcaling
+        shared_exp = torch.floor(
+            torch.log2(
+                shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
+            )
         )
-    )
-
-    # Offset by the largest representable exponent in E2M1
-    shared_exp = shared_exp - E2M1_EMAX
+        # Offset by the largest representable exponent in E2M1
+        shared_exp = shared_exp - E2M1_EMAX
+    else:
+        y_s = (shared_exp / FLOAT4_E2M1_MAX).clamp(min=1e-10)
+        shared_exp = (
+            torch.ceil(torch.log2(y_s))
+            if round_mode == 0
+            else torch.round(torch.log2(y_s))
+        )
 
     return shared_exp
 
 
 def quantize_to_mxfp4(
-    tensor: torch.Tensor, block_size: int = MXFP4_BLOCK_SIZE, eps: float = 1e-10
+    tensor: torch.Tensor,
+    block_size: int = MXFP4_BLOCK_SIZE,
+    eps: float = 1e-10,
+    round_mode: int = 2,
 ) -> tuple:
     """Quantize to MXFP4 using Microsoft microxcaling's _quantize_mx algorithm.
 
     Algorithm (from mx_ops.py _quantize_mx):
       1. Reshape into blocks
-      2. Compute shared exponent per block via _shared_exponents
+      2. Compute shared exponent per block via _shared_exponents (round_mode
+        selects RCEIL/EVEN/FLOOR, matching the kernel's RoundMode enum)
       3. Clamp shared_exp to scale_emax range [-127, 127]
       4. Scale elements: A = A / 2^shared_exp
       5. Quantize element-wise with _quantize_elemwise_core (saturate_normals=True)
@@ -242,7 +255,7 @@ def quantize_to_mxfp4(
     tensor_blocks = tensor_fp32.reshape(m, num_blocks, block_size)
 
     # Compute shared exponents (microxcaling _shared_exponents + offset by emax)
-    shared_exp = _shared_exponents(tensor_blocks, axis=-1)
+    shared_exp = _shared_exponents(tensor_blocks, axis=-1, round_mode=round_mode)
 
     # Clamp to UE8M0 scale range: scale_bits=8, scale_emax = 2^(8-1)-1 = 127
     scale_emax = 127
@@ -404,6 +417,7 @@ class TestPerTokenGroupQuantFP4XPU:
         hidden_dim: int,
         src_dtype: torch.dtype = torch.bfloat16,
         seed: int = 42,
+        round_mode: int = 2,
     ):
         sgl_per_token_group_quant_fp4 = self._import_kernel()
         group_size = MXFP4_BLOCK_SIZE
@@ -411,13 +425,16 @@ class TestPerTokenGroupQuantFP4XPU:
         torch.manual_seed(seed)
 
         x_cpu = torch.randn(num_tokens, hidden_dim, dtype=src_dtype, device="cpu")
-        x_q_ref, scales_ref = quantize_to_mxfp4(x_cpu.float(), group_size, eps=self.eps)
+        x_q_ref, scales_ref = quantize_to_mxfp4(
+            x_cpu.float(), group_size, eps=self.eps, round_mode=round_mode
+        )
 
         x_xpu = x_cpu.to(self.device)
         x_q_xpu, scales_xpu = sgl_per_token_group_quant_fp4(
             x=x_xpu,
             group_size=group_size,
             eps=self.eps,
+            round_mode=round_mode,
         )
 
         x_q_xpu_cpu = x_q_xpu.cpu()
@@ -469,8 +486,13 @@ class TestPerTokenGroupQuantFP4XPU:
             (256, 2048, torch.bfloat16),
         ],
     )
-    def test_quantization_vs_reference(self, num_tokens, hidden_dim, src_dtype):
-        self._test_against_reference(num_tokens, hidden_dim, src_dtype)
+    @pytest.mark.parametrize("round_mode", [0, 1, 2])  # RCEIL, EVEN, FLOOR
+    def test_quantization_vs_reference(
+        self, num_tokens, hidden_dim, src_dtype, round_mode
+    ):
+        self._test_against_reference(
+            num_tokens, hidden_dim, src_dtype, round_mode=round_mode
+        )
 
     def test_quantize_dequantize_roundtrip(self):
         sgl_per_token_group_quant_fp4 = self._import_kernel()

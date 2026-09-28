@@ -101,6 +101,7 @@ fused_q_indexer_rope_hadamard_quant = (
 from sgl_kernel.gdn_attn import gdn_attention
 from sgl_kernel.gemm import (
     awq_dequantize,
+    bmm_bf16,
     bmm_fp8,
     cutlass_scaled_fp4_mm,
     dsv3_fused_a_gemm,

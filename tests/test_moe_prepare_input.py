@@ -24,6 +24,9 @@ from sgl_kernel.moe import _should_use_small_moe_prepare
         (8, 8, 1024, 32, True),
         (8, 8, 2560, 32, True),
         (8, 8, 2561, 32, False),
+        (1, 8, 2048, 256, True),
+        (2, 8, 2048, 256, False),
+        (2, 4, 2048, 128, False),
     ],
 )
 def test_should_use_small_moe_prepare(

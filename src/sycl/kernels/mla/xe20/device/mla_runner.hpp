@@ -45,8 +45,8 @@
 #include "cutlass/device_kernel.h"
 #include "cutlass/util/sycl_event_manager.hpp"
 #include "sycl/comm/common.h"
-#include "sycl/kernels/mla/kernel/xe_mla_kernel.hpp"
-#include "sycl/kernels/mla/kernel/xe_mla_reduce_split_kv.hpp"
+#include "sycl/kernels/mla/xe20/kernel/xe_mla_kernel.hpp"
+#include "sycl/kernels/mla/xe20/kernel/xe_mla_reduce_split_kv.hpp"
 
 namespace cutlass::flash_attention::device {
 using namespace cute;

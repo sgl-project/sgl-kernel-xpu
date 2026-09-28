@@ -39,7 +39,7 @@
 
 #include "cutlass/cutlass.h"
 #include "cutlass/kernel_hardware_info.hpp"
-#include "sycl/kernels/mla/kernel/mla_tile_scheduler.hpp"
+#include "sycl/kernels/mla/xe35/kernel/mla_tile_scheduler.hpp"
 
 namespace cutlass::flash_attention::kernel {
 

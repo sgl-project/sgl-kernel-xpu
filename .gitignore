@@ -43,6 +43,9 @@
 # python build files
 *.pyc
 *.pyo
+*.egg-info/
+dist/
+.venv/
 
 build
 

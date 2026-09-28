@@ -2,7 +2,7 @@
 """Build a publishable sglang-kernel-xpu wheel (manylinux version).
 
 This automates the flow:
-  1. build a local wheel into dist/ with pip wheel -v . --wheel-dir dist
+  1. build a local wheel into dist/ with uv build --wheel --no-build-isolation
   2. run auditwheel once to discover vendored shared libraries
   3. parse <package>.libs entries into auditwheel --exclude names
   4. run auditwheel again with those dependencies excluded
@@ -10,10 +10,12 @@ This automates the flow:
   6. repack the final manylinux wheel into dist/
   7. remove intermediate files/directories, leaving the final wheel in dist/
 
-The script intentionally shells out to the active Python/pip/auditwheel so it uses
-whatever Intel/PyTorch/XPU environment is already configured by the caller. The
-project root is discovered by walking upward from this file until pyproject.toml
-is found; all dist/ and build commands are rooted there.
+The script intentionally shells out to the active Python, uv and auditwheel so it
+uses whatever Intel/PyTorch/XPU environment is already configured by the caller.
+The wheel is built without build isolation, so scikit-build-core, cmake and ninja
+must be installed in that environment. The project root is discovered by walking
+upward from this file until pyproject.toml is found; all dist/ and build commands
+are rooted there.
 """
 
 from __future__ import annotations
@@ -75,7 +77,8 @@ def run_capture(
 
 
 INSTALL_COMMANDS = {
-    "auditwheel": [sys.executable, "-m", "pip", "install", "auditwheel"],
+    "uv": [sys.executable, "-m", "pip", "install", "uv"],
+    "auditwheel": ["uv", "pip", "install", "--python", sys.executable, "auditwheel"],
     "patchelf": ["bash", "-lc", "apt-get update && apt-get install -y patchelf"],
 }
 
@@ -201,7 +204,19 @@ def build_wheel(args: argparse.Namespace) -> Path:
         run(args.build_command, env=os.environ.copy())
     else:
         run(
-            [sys.executable, "-m", "pip", "wheel", "-v", ".", "--wheel-dir", "dist"],
+            [
+                "uv",
+                "build",
+                "--wheel",
+                "--python",
+                sys.executable,
+                "--no-build-isolation",
+                "--no-create-gitignore",
+                "-Cbuild-dir=build",
+                "--out-dir",
+                "dist",
+                ".",
+            ],
             env=os.environ.copy(),
         )
 
@@ -496,6 +511,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
+        ensure_tool("uv")
         ensure_tool("auditwheel")
         ensure_tool("patchelf")
         clean_previous_outputs()

@@ -58,10 +58,9 @@ def skip_if_no_xpu():
 
 def skip_if_kernel_unavailable():
     try:
-        torch.ops.sgl_kernel.mxfp4_blockwise_scaled_grouped_mm.default
-    except AttributeError:
+        from sgl_kernel import mxfp4_blockwise_scaled_grouped_mm
+    except ImportError:
         pytest.skip("mxfp4_blockwise_scaled_grouped_mm kernel not available")
-        return
 
 
 def quantize_to_e2m1(tensor: torch.Tensor) -> torch.Tensor:

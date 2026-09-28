@@ -31,6 +31,10 @@
 
 #define SYCL_INTEL_TARGET 35
 
+// Must precede any CUTE header: turns silent invalid block-2D surface
+// descriptors into named asserts instead of a simulator wedge.
+#define CUTE_ENABLE_XE_BLOCK_2D_ASSERT
+
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
@@ -217,9 +221,11 @@ struct Fp8ScaledGemmRunner {
 
     // Per-row scaling: one scale group covers the entire K dimension.
     // scale_k = ceil_div(K, K) = 1, so shape is (M_or_N, 1, L).
+    // Extents come from the scale buffers rather than M/N: the caller pads them
+    // so the block-2D surface width/pitch stay DWord multiples.
     const int scale_k = 1;
-    auto shape_scaleA = cute::make_shape(int(M), scale_k, int(L));
-    auto shape_scaleB = cute::make_shape(int(N), scale_k, int(L));
+    auto shape_scaleA = cute::make_shape(int(scale_a.size(0)), scale_k, int(L));
+    auto shape_scaleB = cute::make_shape(int(scale_b.size(0)), scale_k, int(L));
     StrideScaleA stride_SA = cutlass::make_cute_packed_stride(StrideScaleA{}, shape_scaleA);
     StrideScaleB stride_SB = cutlass::make_cute_packed_stride(StrideScaleB{}, shape_scaleB);
 
@@ -367,7 +373,16 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_scaled_mm_xpu(
   const int64_t M = mat_a.size(0);
   const int64_t N = mat_b.size(0);
 
+  // The fp16 scale surfaces are block-2D loaded with width = M*2 / N*2 bytes,
+  // and Xe requires a DWord multiple. An odd extent yields width 2 and wedges
+  // the EUs, so round M up and drop the padding row from the result.
+  TORCH_CHECK(N % 2 == 0, "N must be even (fp16 scale surface must be DWord-aligned). Got N=", N);
+  const int64_t M_pad = M + (M & 1);
+
   at::Tensor A = mat_a.contiguous();
+  if (M_pad != M) {
+    A = at::constant_pad_nd(A, {0, 0, 0, M_pad - M});
+  }
 
   // The CUTLASS FP8 mainloop with XE_2D_U8x32x32_LD_V expects B as a [K, N]
   // row-major buffer. Our input mat_b is [N, K] contiguous, so we transpose
@@ -375,16 +390,22 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_scaled_mm_xpu(
   at::Tensor B_t = mat_b.t().contiguous();  // [K, N] contiguous
 
   // Per-row scales converted to FP16 (matches kernel ElementScale = half_t)
-  at::Tensor SA = scale_a.to(at::kHalf).contiguous();  // [M]
-  at::Tensor SB = scale_b.to(at::kHalf).contiguous();  // [N]
+  at::Tensor SA = scale_a.to(at::kHalf).contiguous();
+  at::Tensor SB = scale_b.to(at::kHalf).contiguous();
+  if (M_pad != M) {
+    SA = at::constant_pad_nd(SA, {0, M_pad - M});
+  }
 
   c10::optional<at::Tensor> Bias;
   if (bias_opt.has_value()) {
     Bias = bias_opt->contiguous();
+    if (M_pad != M) {
+      Bias = at::constant_pad_nd(*Bias, {0, M_pad - M});
+    }
   }
 
   auto out_options = A.options().dtype(out_dtype);
-  at::Tensor out = at::empty({M, N}, out_options);
+  at::Tensor out = at::empty({M_pad, N}, out_options);
 
   c10::DeviceGuard guard(mat_a.device());
   auto stream = at::xpu::getCurrentXPUStream(mat_a.device().index());
@@ -409,7 +430,7 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_scaled_mm_xpu(
       status == cutlass::Status::kSuccess,
       "fp8_scaled_mm_xpu failed with status: " + std::string(cutlassGetStatusString(status)));
 
-  return out;
+  return (M_pad != M) ? out.narrow(0, 0, M).contiguous() : out;
 }
 
 #undef SYCL_INTEL_TARGET

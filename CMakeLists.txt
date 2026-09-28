@@ -106,10 +106,10 @@ endif()
 # cutlass — repo and commit depend on the target architecture
 if(DPCPP_SYCL_TARGET MATCHES "bmg")
   set(CUTLASS_SYCL_REPO "https://github.com/intel/sycl-tla.git")
-  set(CUTLASS_SYCL_TAG  "87f6850680a580654b9ea2c80dbc01aeb36ad231")
+  set(CUTLASS_SYCL_TAG  "7b56b936b87f799f80dde60c2fd8d11c1128cebb")
 elseif(DPCPP_SYCL_TARGET MATCHES "cri")
   set(CUTLASS_SYCL_REPO "https://github.com/intel/sycl-tla.git")
-  set(CUTLASS_SYCL_TAG  "87f6850680a580654b9ea2c80dbc01aeb36ad231")
+  set(CUTLASS_SYCL_TAG  "7b56b936b87f799f80dde60c2fd8d11c1128cebb")
 else()
   message(FATAL_ERROR
       "Unsupported DPCPP_SYCL_TARGET: ${DPCPP_SYCL_TARGET}. "

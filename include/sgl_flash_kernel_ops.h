@@ -82,7 +82,11 @@ void mha_fwd(
     // Device-resident Inkling logits [total_q, num_heads, extent], matching Q's dtype.
     // The XPU FMHA path shears this source on the current stream.
     std::optional<const at::Tensor>& rel_bias_,
-    bool rel_bias_is_sheared);
+    bool rel_bias_is_sheared,
+    // Optional per-token block id (-1 = none) enabling the bidirectional-block
+    // mask in the prefill path: keys sharing a query's non-negative id are
+    // attended bidirectionally, causal otherwise.
+    std::optional<const at::Tensor>& bidirectional_block_ids_);
 
 void flash_mla_decode(
     torch::Tensor& out,

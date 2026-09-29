@@ -62,7 +62,7 @@ DISABLE_SPLIT = True
 DISABLE_PAGEDKV = False
 DISABLE_APPENDKV = True
 DISABLE_LOCAL = True
-DISABLE_SOFTCAP = True
+DISABLE_SOFTCAP = False  # XPU flash-attn now applies softcap; exercise it (incl. causal/local masked cases)
 DISABLE_PACKGQA = True
 DISABLE_FP16 = True
 DISABLE_FP8 = True
@@ -687,6 +687,7 @@ def generate_qkv(
 @pytest.mark.parametrize("nheads_q,nheads_kv", KVCACHE_HEAD_CONFIGS)
 @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("causal,local", [(False, True), (False, False), (True, False)])
+@pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
 @pytest.mark.parametrize("use_sinks", [True, False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 @pytest.mark.parametrize("has_rotary_seqlens", [False])
@@ -721,6 +722,7 @@ def test_flash_attn_kvcache(
     seqlen_new_eq_seqlen_q,
     causal,
     local,
+    softcap,
     use_sinks,
     new_kv,
     batch_size,
@@ -744,6 +746,9 @@ def test_flash_attn_kvcache(
     # sink is only supported for head_size == 64
     if use_sinks and d != 64:
         pytest.skip("use_sinks is only supported when d == 64")
+    # softcap is only compiled on the non-fp8 path at head_dim 128/256
+    if softcap > 0.0 and (d not in (128, 256) or dtype == torch.float8_e4m3fn):
+        pytest.skip("softcap is only compiled for head_dim 128/256 on the non-fp8 path")
     # set seed
     torch.random.manual_seed(0)
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
@@ -1020,6 +1025,7 @@ def test_flash_attn_kvcache(
             causal=causal,
             qv=qv,
             window_size=window_size,
+            softcap=softcap,
             key_leftpad=cache_leftpad,
             return_lse=True,
         )
@@ -1034,6 +1040,7 @@ def test_flash_attn_kvcache(
             causal=causal,
             qv=qv,
             window_size=window_size,
+            softcap=softcap,
             upcast=False,
             reorder_ops=True,
             key_leftpad=cache_leftpad,
@@ -1092,6 +1099,7 @@ def test_flash_attn_kvcache(
                     rotary_seqlens=rotary_seqlens,
                     causal=causal,
                     window_size=window_size,
+                    softcap=softcap,
                     softmax_scale=softmax_scale,
                     sinks=sinks if use_sinks else None,
                     rotary_interleaved=rotary_interleaved,
@@ -1231,6 +1239,7 @@ if EXTENDED_KVCACHE_TESTS:
             seqlen_new_eq_seqlen_q=True,
             causal=causal,
             local=local,
+            softcap=0.0,
             use_sinks=False,
             new_kv=False,
             batch_size=batch_size,
@@ -1254,6 +1263,7 @@ if EXTENDED_KVCACHE_TESTS:
 @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("local", [True, False])
+@pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
 @pytest.mark.parametrize("use_sinks", [True, False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 @pytest.mark.parametrize("has_rotary_seqlens", [False])
@@ -1308,6 +1318,7 @@ def test_flash_attn_decode_kvcache(
     seqlen_new_eq_seqlen_q,
     causal,
     local,
+    softcap,
     use_sinks,
     new_kv,
     nheads_q,
@@ -1331,6 +1342,9 @@ def test_flash_attn_decode_kvcache(
     # sink is only supported for head_size == 64
     if use_sinks and d != 64:
         pytest.skip("use_sinks is only supported when d == 64")
+    # softcap is only compiled on the non-fp8 path at head_dim 128/256
+    if softcap > 0.0 and (d not in (128, 256) or dtype == torch.float8_e4m3fn):
+        pytest.skip("softcap is only compiled for head_dim 128/256 on the non-fp8 path")
     # set seed
     torch.random.manual_seed(0)
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
@@ -1598,6 +1612,7 @@ def test_flash_attn_decode_kvcache(
             causal=causal,
             qv=qv,
             window_size=window_size,
+            softcap=softcap,
             key_leftpad=cache_leftpad,
             return_lse=True,
         )
@@ -1612,6 +1627,7 @@ def test_flash_attn_decode_kvcache(
             causal=causal,
             qv=qv,
             window_size=window_size,
+            softcap=softcap,
             upcast=False,
             reorder_ops=True,
             key_leftpad=cache_leftpad,
@@ -1679,6 +1695,7 @@ def test_flash_attn_decode_kvcache(
                     rotary_seqlens=rotary_seqlens,
                     causal=causal,
                     window_size=window_size,
+                    softcap=softcap,
                     softmax_scale=softmax_scale,
                     sinks=sinks if use_sinks else None,
                     rotary_interleaved=rotary_interleaved,
@@ -1781,9 +1798,34 @@ def test_flash_attn_decode_kvcache(
 
 @pytest.mark.skipif(
     not torch.xpu.is_available(),
+    reason="soft-cap head-dim gating is an XPU (sgl-kernel-xpu) feature",
+)
+@pytest.mark.skipif(DISABLE_SOFTCAP, reason="soft-cap disabled")
+def test_softcap_unsupported_head_dim_rejected():
+    """Soft-cap is only compiled for head_dim 128/256; other head dims must reject
+    softcap>0 with a clear error instead of silently dropping the cap."""
+    from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+    torch.manual_seed(0)
+    d = 64  # outside the compiled soft-cap set {128, 256}
+    seqlen, nheads = 64, 8
+    q = torch.randn(seqlen, nheads, d, device=device, dtype=torch.bfloat16)
+    k = torch.randn(seqlen, nheads, d, device=device, dtype=torch.bfloat16)
+    v = torch.randn(seqlen, nheads, d, device=device, dtype=torch.bfloat16)
+    cu_seqlens = torch.tensor([0, seqlen], device=device, dtype=torch.int32)
+    with pytest.raises(Exception, match="head_dim 128 and 256"):
+        flash_attn_varlen_func(
+            q, k, v, cu_seqlens, cu_seqlens, seqlen, seqlen, causal=True, softcap=50.0
+        )
+        torch.xpu.synchronize()
+
+
+@pytest.mark.skipif(
+    not torch.xpu.is_available(),
     reason="fp8 KV cache attention is an XPU (sgl-kernel-xpu) feature",
 )
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
 @pytest.mark.parametrize("q_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("nheads_q,nheads_kv", [(8, 8), (8, 2)])
@@ -1804,6 +1846,7 @@ def test_flash_attn_fp8_kvcache(
     fp8_dtype,
     q_dtype,
     causal,
+    softcap,
     descale_layout,
     cache_seqlen=None,
 ):
@@ -1873,6 +1916,25 @@ def test_flash_attn_fp8_kvcache(
 
     # The fp8 KV-cache kernels have no LSE instantiation, so softmax_lse cannot
     # be requested here (the kernel rejects it rather than returning garbage).
+    # fp8 KV path compiles no softcap variant; softcap>0 must be rejected, not
+    # silently dropped.
+    if softcap > 0.0:
+        with pytest.raises(Exception, match="fp8 KV cache"):
+            flash_attn_with_kvcache(
+                q,
+                k_cache_paged,
+                v_cache_paged,
+                cache_seqlens=cache_seqlens,
+                page_table=page_table,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                softcap=softcap,
+            )
+            torch.xpu.synchronize()
+        return
+
     out = flash_attn_with_kvcache(
         q,
         k_cache_paged,
@@ -1883,6 +1945,7 @@ def test_flash_attn_fp8_kvcache(
         v_descale=v_descale,
         softmax_scale=softmax_scale,
         causal=causal,
+        softcap=softcap,
     )
     out = out.reshape(batch_size, seqlen_q, nheads_q, d)
     torch.xpu.synchronize()
@@ -1899,6 +1962,7 @@ def test_flash_attn_fp8_kvcache(
             < rearrange(cache_seqlens, "b -> b 1")
         ),
         causal=causal,
+        softcap=softcap,
         k_descale=k_descale_ref,
         v_descale=v_descale_ref,
         upcast=True,
@@ -1961,6 +2025,7 @@ if EXTENDED_KVCACHE_TESTS:
             fp8_dtype=fp8_dtype,
             q_dtype=torch.bfloat16,
             causal=causal,
+            softcap=0.0,
             descale_layout=descale_layout,
             cache_seqlen=cache_seqlen,
         )
@@ -2061,6 +2126,9 @@ def test_flash_attn_varlen_output(
     if nheads_kv > nheads_q:
         pytest.skip("Require nheads_kv <= nheads_q")
     assert nheads_q % nheads_kv == 0
+    # softcap is only compiled on the non-fp8 path at head_dim 128/256
+    if softcap > 0.0 and (d not in (128, 256) or dtype == torch.float8_e4m3fn):
+        pytest.skip("softcap is only compiled for head_dim 128/256 on the non-fp8 path")
 
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])

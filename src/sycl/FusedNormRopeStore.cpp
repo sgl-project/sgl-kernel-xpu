@@ -7,6 +7,7 @@
 
 #include "Compress.h"
 #include "QuantUtils.h"
+#include "SGLKernelPerf.h"
 #include "Utils.h"
 #include "cutlass/float8.h"
 #include "sgl_kernel_export.h"
@@ -613,6 +614,20 @@ SGL_KERNEL_EXPORT void fused_norm_rope_store(
 
   const int64_t page_bits = log2_i64(page_size);
   auto queue = c10::xpu::getCurrentXPUStream().queue();
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Norm (~4*head_dim) + Rope (~4*rope_dim on rope lanes) + optional quant store (~2*head_dim).
+  const double flops =
+      static_cast<double>(num_tokens) *
+      (4.0 * static_cast<double>(head_dim) + 4.0 * static_cast<double>(kRopeDim) + 2.0 * static_cast<double>(head_dim));
+  const double in_elem = static_cast<double>(input.element_size());
+  const double bytes =
+      static_cast<double>(num_tokens) * static_cast<double>(head_dim) * in_elem +
+      static_cast<double>(head_dim) * in_elem +
+      static_cast<double>(num_tokens) * static_cast<double>(kRopeDim) * static_cast<double>(freq_cis.element_size()) +
+      static_cast<double>(num_tokens) * static_cast<double>(kvcache.size(1));
+  SGL_KERNEL_PERF_SCOPE("fused_norm_rope_store", queue, bytes, flops);
+#endif
 
   SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, input.scalar_type(), "fused_norm_rope_store", [&]() {
     using input_t = scalar_t;

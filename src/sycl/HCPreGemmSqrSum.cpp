@@ -39,6 +39,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 #include "sycl/kernels/hc_pre_gemm_sqr_sum/device/hc_pre_gemm_sqr_sum_types.hpp"
@@ -70,6 +71,20 @@ hc_pre_gemm_sqr_sum(at::Tensor& C, at::Tensor& sqr_sum, const at::Tensor& A, con
       "Output sqr_sum must be [n_splits, ",
       M,
       "] matching C's leading dim");
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // GEMM (2*M*N*K) + squared-sum reduction (~2*M*N) per split.
+  const int64_t n_splits = C.size(0);
+  const double flops =
+      2.0 * static_cast<double>(n_splits) * static_cast<double>(M) * static_cast<double>(N) * static_cast<double>(K) +
+      2.0 * static_cast<double>(n_splits) * static_cast<double>(M) * static_cast<double>(N);
+  const double bytes = static_cast<double>(M) * static_cast<double>(K) * static_cast<double>(A.element_size()) +
+                       static_cast<double>(N) * static_cast<double>(K) * static_cast<double>(B.element_size()) +
+                       static_cast<double>(C.numel()) * static_cast<double>(C.element_size()) +
+                       static_cast<double>(sqr_sum.numel()) * static_cast<double>(sqr_sum.element_size());
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  SGL_KERNEL_PERF_SCOPE("hc_pre_gemm_sqr_sum", profiling_queue, bytes, flops);
+#endif
 
   runHcPreGemmSqrSum(C, sqr_sum, A, B);
 }

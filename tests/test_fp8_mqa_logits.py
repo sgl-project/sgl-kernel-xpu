@@ -1,6 +1,8 @@
 """Unit tests for FP8 MQA logits kernels."""
 
+import os
 import struct
+import subprocess
 import sys
 
 import pytest
@@ -162,6 +164,7 @@ def test_fp8_mqa_logits_masking():
         (1, 4, 128, 4),  # small H, page_size=4
         (1, 4, 128, 8),  # small H, page_size=8
         (1, 64, 128, 64),  # large H / SYCL-TLA (xe20) path
+        (4, 128, 128, 64),  # large H / SYCL-TLA (xe20) path
     ],
 )
 def test_fp8_paged_mqa_logits(B, H, D, page_size):
@@ -174,8 +177,10 @@ def test_fp8_paged_mqa_logits(B, H, D, page_size):
     kv_cache = make_kv_cache(num_pages, page_size, D, device)
     q = make_fp8_tensor((B, 1, H, D), device)
     weights = torch.rand(B, H, dtype=torch.float32, device=device)
-    seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
-    block_tables = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([seq_len] * B, dtype=torch.int32, device=device)
+    block_tables = torch.tensor(
+        [[0, 1, 2, 3] for _ in range(B)], dtype=torch.int32, device=device
+    )
 
     logits = torch.ops.sgl_kernel.fp8_paged_mqa_logits.default(
         q.view(torch.uint8),
@@ -200,7 +205,7 @@ def test_fp8_paged_mqa_logits(B, H, D, page_size):
 
     logits_cpu = logits.cpu()
     torch.testing.assert_close(logits_cpu, ref, rtol=2e-3, atol=0.1)
-    assert logits_cpu[0, seq_len:].abs().max().item() == 0.0
+    assert logits_cpu[:, seq_len:].abs().max().item() == 0.0
 
 
 def test_fp8_paged_mqa_logits_noncontiguous_pages():
@@ -372,6 +377,66 @@ def test_fp8_paged_mqa_logits_3d_input():
 
     assert out_3d.shape == (B, seq_len)
     torch.testing.assert_close(out_3d, out_4d)
+
+
+def _run_multi_chunk_case():
+    """Subprocess entrypoint: build inputs, run the op, check vs reference.
+    Called in test_multi_chunk_batch() below.
+    """
+    device = "xpu"
+    B, H, D, page_size = 8, 256, 128, 128
+    max_num_blocks = 1
+    max_seq_len = max_num_blocks * page_size
+    num_pages = 2
+
+    kv_cache = make_kv_cache(num_pages, page_size, D, device)
+    q = make_fp8_tensor((B, 1, H, D), device)
+    weights = torch.rand(B, H, dtype=torch.float32, device=device)
+    seq_lens = torch.tensor(
+        [32, 64, 96, 128, 32, 64, 96, 128][:B], dtype=torch.int32, device=device
+    )
+    block_tables = torch.zeros(B, max_num_blocks, dtype=torch.int32, device=device)
+
+    logits = torch.ops.sgl_kernel.fp8_paged_mqa_logits.default(
+        q.view(torch.uint8),
+        kv_cache,
+        weights,
+        seq_lens,
+        block_tables,
+        None,
+        max_seq_len,
+        True,
+    )
+    ref = reference_fp8_paged_mqa_logits(
+        q, kv_cache, weights, seq_lens, block_tables, max_seq_len, page_size, D
+    )
+    torch.testing.assert_close(logits.cpu(), ref, rtol=2e-3, atol=0.1)
+    print("MULTI_CHUNK_OK")
+
+
+def test_multi_chunk_batch():
+    """Covers the batch-chunking loop (chunk_b < B), untested elsewhere.
+
+    Runs in a subprocess: the chunk budget is a C++ static set on first
+    use, so an in-process env var change may not take effect. Shape
+    (B=8, H=256, msl=128) with a 1MiB budget yields chunk_b=7 (2 chunks).
+    """
+    env = dict(os.environ, SGL_KERNEL_FP8_PAGED_MQA_CHUNK_MB="1")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from test_fp8_mqa_logits import _run_multi_chunk_case; "
+            "_run_multi_chunk_case()",
+        ],
+        env=env,
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert "MULTI_CHUNK_OK" in result.stdout
 
 
 if __name__ == "__main__":

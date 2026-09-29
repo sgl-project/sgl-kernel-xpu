@@ -8,6 +8,7 @@
 #include <optional>
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "comm/Random.h"
@@ -329,6 +330,16 @@ SGL_KERNEL_EXPORT void top_k_top_p_sampling_from_probs(
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Sampling is memory-bound: rejection-sampling loop touches probs multiple times.
+  // Count each pass through the vocab as ~3 flops (compare, accumulate, select).
+  const double flops = 3.0 * static_cast<double>(batch_size) * static_cast<double>(vocab_size);
+  const double bytes =
+      static_cast<double>(batch_size) * static_cast<double>(vocab_size) * static_cast<double>(probs.element_size()) +
+      static_cast<double>(batch_size) * 4.0;
+  SGL_KERNEL_PERF_SCOPE("top_k_top_p_sampling_from_probs", queue, bytes, flops);
+#endif
 
   launch_top_k_top_p_sampling(
       probs.data_ptr<float>(),

@@ -40,6 +40,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "kernels/lora/device/sgemm_lora_a_fwd_dispatch.hpp"
@@ -163,6 +164,18 @@ SGL_KERNEL_EXPORT void sgemm_lora_a_fwd(
   const int max_rank = static_cast<int>(max_rank_i64);
   const int num_segments = static_cast<int>(num_segments_i64);
   const int stack_num_ = static_cast<int>(stack_num);
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Grouped GEMM (LoRA-A): (num_tokens, K) @ (K, stack_num*max_rank) -> (num_tokens, stack_num*max_rank).
+  const double M = static_cast<double>(num_tokens_i64);
+  const double K = static_cast<double>(input_x.size(1));
+  const double N = static_cast<double>(max_rank_i64) * static_cast<double>(stack_num);
+  const double flops = 2.0 * M * N * K;
+  const double bytes = static_cast<double>(input_x.numel()) * static_cast<double>(input_x.element_size()) +
+                       static_cast<double>(weights.numel()) * static_cast<double>(weights.element_size()) +
+                       static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
+  SGL_KERNEL_PERF_SCOPE("sgemm_lora_a_fwd", queue, bytes, flops);
+#endif
 
   // Dispatch on (dtype, tile). Each launch symbol is defined in a separate
   // generated translation unit (see SGEMMLoraAFwdXe20.cmake).

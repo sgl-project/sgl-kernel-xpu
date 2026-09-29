@@ -37,6 +37,7 @@
 
 #include <ATen/ATen.h>
 
+#include <optional>
 #include <sycl/sycl.hpp>
 
 namespace mla_decode {
@@ -52,6 +53,7 @@ namespace mla_decode {
 #define DECLARE_MLA_DECODE_LAUNCH(ELEM, PS)  \
   void launch_mla_decode_##ELEM##_##PS(      \
       at::Tensor& out,                       \
+      const std::optional<at::Tensor>& lse,  \
       const at::Tensor& q_nope,              \
       const at::Tensor& q_pe,                \
       const at::Tensor& kv_c_and_k_pe_cache, \

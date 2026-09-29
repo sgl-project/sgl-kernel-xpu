@@ -219,6 +219,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int num_layers, int block_quota, int sgs_per_wg) -> ()");
   m.impl("transfer_kv_all_layer_mla_lf_pf", torch::kXPU, &transfer_kv_all_layer_mla_lf_pf);
 
+  // Mamba HiCache state transfer (single fused copy per page; no K/V split)
+  m.def(
+      "transfer_kv_mamba_pf_lf(Tensor src, Tensor(a!) dst, "
+      "Tensor src_indices, Tensor dst_indices, int layer_id, int item_size, int src_layout_dim) -> ()");
+  m.impl("transfer_kv_mamba_pf_lf", torch::kXPU, &transfer_kv_mamba_pf_lf);
+
+  m.def(
+      "transfer_kv_mamba_lf_pf(Tensor src_layers, Tensor(a!) dst, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, int num_layers) -> ()");
+  m.impl("transfer_kv_mamba_lf_pf", torch::kXPU, &transfer_kv_mamba_lf_pf);
+
 #ifdef USE_MOE
   m.def(
       "moe_fused_gate(Tensor input, Tensor? bias, int num_expert_group, int topk_group, int topk, int "
@@ -249,12 +260,47 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "moe_grouped_mm_nt_xe20_w4a16(Tensor! output, Tensor activations, Tensor packed_weights, Tensor scales, "
       "Tensor? zeros, Tensor? bias, Tensor rows_per_expert, int n_experts, bool is_int4, int group_size) -> ()");
   m.impl("moe_grouped_mm_nt_xe20_w4a16", torch::kXPU, &moe_grouped_mm_nt_xe20_w4a16);
-#endif  // Xe20 only kernels
 
   m.def(
-      "moe_grouped_mm_nt_xe20_fp8_w8a16(Tensor! output, Tensor activations, Tensor weights, "
+      "moe_grouped_mm_nt_xe20_w8a16(Tensor! output, Tensor activations, Tensor weights, "
       "Tensor weight_scales, Tensor? bias, Tensor total_rows_for_experts, int n_experts) -> ()");
-  m.impl("moe_grouped_mm_nt_xe20_fp8_w8a16", torch::kXPU, &moe_grouped_mm_nt_xe20_fp8_w8a16);
+  m.impl("moe_grouped_mm_nt_xe20_w8a16", torch::kXPU, &moe_grouped_mm_nt_xe20_w8a16);
+#endif  // Xe20 only kernels
+
+// Xe35 (CRI) only kernels
+#if SYCL_INTEL_TARGET == 35
+  m.def(
+      "moe_grouped_mm_nt_xe35(Tensor! output, Tensor activations, Tensor weights, Tensor? bias, Tensor "
+      "total_rows_for_experts, int n_experts, int activation_type, bool fuse_act, "
+      "float gemm1_alpha=1.702, float gemm1_limit=7.0) -> ()");
+  m.impl("moe_grouped_mm_nt_xe35", torch::kXPU, &moe_grouped_mm_nt_xe35);
+  m.def("dsv3_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
+  m.impl("dsv3_router_gemm", torch::kXPU, &dsv3_router_gemm_xpu);
+  m.def("dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
+  m.impl("dsv3_fused_a_gemm", torch::kXPU, &dsv3_fused_a_gemm_xpu);
+  m.def(
+      "fp8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? "
+      "bias) -> Tensor");
+  m.impl("fp8_scaled_mm", torch::kXPU, &fp8_scaled_mm_xpu);
+  m.def(
+      "mxfp4_blockwise_scaled_grouped_mm(Tensor! output, Tensor! a_ptrs, Tensor! b_ptrs, Tensor! out_ptrs, "
+      "Tensor! a_scales_ptrs, Tensor! b_scales_ptrs, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, "
+      "Tensor problem_sizes, Tensor expert_offsets, Tensor workspace) -> ()");
+  m.impl("mxfp4_blockwise_scaled_grouped_mm", torch::kXPU, &mxfp4_blockwise_scaled_grouped_mm);
+
+  m.def(
+      "moe_grouped_mm_nt_xe35_mxfp4_w4a16(Tensor! output, Tensor activations, Tensor packed_weights, Tensor scales, "
+      "Tensor? bias, Tensor total_rows_for_experts, int n_experts, int activation_type, bool fuse_act, "
+      "float gemm1_alpha=1.702, float gemm1_limit=7.0) -> ()");
+  m.impl("moe_grouped_mm_nt_xe35_mxfp4_w4a16", torch::kXPU, &moe_grouped_mm_nt_xe35_mxfp4_w4a16);
+
+  m.def(
+      "fp8_blockwise_scaled_grouped_mm(Tensor! output, Tensor! a_ptrs, Tensor! b_ptrs, Tensor! out_ptrs, "
+      "Tensor! a_scales_ptrs, Tensor! b_scales_ptrs, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, "
+      "Tensor stride_a, Tensor stride_b, Tensor stride_c, Tensor layout_sfa, Tensor layout_sfb, "
+      "Tensor problem_sizes, Tensor expert_offsets, Tensor workspace) -> ()");
+  m.impl("fp8_blockwise_scaled_grouped_mm", torch::kXPU, &fp8_blockwise_scaled_grouped_mm);
+#endif  // Xe35 only kernels
 
   m.def(
       "prepare_moe_input(Tensor topk_ids, Tensor! expert_offsets, Tensor? blockscale_offsets, Tensor! problem_sizes1,"
@@ -409,8 +455,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("flash_mla_decode_get_workspace_size", &flash_mla_decode_get_workspace_size);
 
   m.def(
-      "flash_mla_decode(Tensor! out, Tensor! q_nope, Tensor! q_pe, Tensor! kv_c_and_k_pe_cache, Tensor! seq_lens, "
-      "Tensor! "
+      "flash_mla_decode(Tensor(a!) out, Tensor(b!)? lse, Tensor! q_nope, Tensor! q_pe, Tensor! kv_c_and_k_pe_cache, "
+      "Tensor! seq_lens, Tensor! "
       "page_table, Tensor! workspace, float sm_scale, int num_kv_splits) -> ()");
   m.impl("flash_mla_decode", torch::kXPU, &flash_mla_decode);
 
@@ -424,7 +470,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("flash_mla_prefill_get_workspace_size", &flash_mla_prefill_get_workspace_size);
 
   m.def(
-      "flash_mla_prefill(Tensor! out, Tensor! q_nope, Tensor! q_pe, Tensor! kv_c_and_k_pe_cache, "
+      "flash_mla_prefill(Tensor(a!) out, Tensor(b!)? lse, Tensor! q_nope, Tensor! q_pe, Tensor! kv_c_and_k_pe_cache, "
       "Tensor! cu_seqlens_q, Tensor! seq_lens, int max_seqlen_q, "
       "Tensor! page_table, Tensor! workspace, float sm_scale, bool causal, int num_kv_splits) -> ()");
   m.impl("flash_mla_prefill", torch::kXPU, &flash_mla_prefill);
@@ -570,6 +616,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor seg_indptr, Tensor weight_indices, Tensor lora_ranks, Tensor scalings, Tensor? seg_lens, "
       "Tensor? base_output) -> ()");
   m.impl("qkv_lora_b_fwd", torch::kXPU, &qkv_lora_b_fwd);
+  m.def(
+      "gate_up_lora_b_fwd(Tensor! output, Tensor input_x, Tensor gate_up_lora_b, int output_dim, "
+      "Tensor seg_indptr, Tensor weight_indices, Tensor lora_ranks, Tensor scalings, Tensor? seg_lens, "
+      "Tensor? base_output) -> ()");
+  m.impl("gate_up_lora_b_fwd", torch::kXPU, &gate_up_lora_b_fwd);
 
   /* NSA (Native Sparse Attention) indexer scoring */
   // fp8_mqa_logits (prefill) is implemented in pure Python via sgl_kernel.nsa.

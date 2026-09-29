@@ -30,6 +30,7 @@
 #include <cmath>
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -394,6 +395,15 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_fp4(
 
   sycl::range<1> global_range(num_blocks * num_threads);
   sycl::range<1> local_range(num_threads);
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = static_cast<double>(input.numel());
+  const double bytes = static_cast<double>(input.numel()) * static_cast<double>(input.element_size()) +
+                       static_cast<double>(output_q.numel()) * static_cast<double>(output_q.element_size()) +
+                       static_cast<double>(output_s.numel()) * static_cast<double>(output_s.element_size());
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  SGL_KERNEL_PERF_SCOPE("per_token_group_quant_fp4", profiling_queue, bytes, flops);
+#endif
 
 #define LAUNCH_FP4_KERNEL_WITH_GROUP_SIZE(T, GS, FUSE, COL_MAJOR)                                        \
   do {                                                                                                   \

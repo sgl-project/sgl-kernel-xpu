@@ -64,6 +64,19 @@ namespace cutlass::fmha::collective {
 
 using namespace cute;
 
+// Gemma-style logit soft-cap, applied on the natural-scale logit. qk_scale folds
+// in log2(e) for the exp2 softmax, so undo it, tanh-cap, then re-fold. Non-finite
+// (masked -INFINITY) lanes pass through untouched so masks don't leak. Callers gate
+// with `if constexpr (Softcap)` so the non-softcap path is fully elided.
+template <typename Element>
+CUTLASS_DEVICE Element apply_logit_softcap(Element value, Element softcap) {
+  if (!sycl::isfinite(value)) {
+    return value;
+  }
+  constexpr Element kLog2e = Element(1.4426950408889634074);
+  return softcap * sycl::tanh(value / kLog2e / softcap) * kLog2e;
+}
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 // The sheared relative-bias surface (rel_bias_band_cols / rel_bias_padded_cols /
@@ -95,7 +108,8 @@ template <
     // KV position, so per-row masking must use a fixed decode row. Default
     // false keeps prefill (and non-packed decode) unaffected.
     bool PackGQA_ = false,
-    bool HasRelBias_ = false>
+    bool HasRelBias_ = false,
+    bool Softcap_ = false>
 struct FMHAFwdMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -122,7 +136,8 @@ template <
     class TiledCopyV_cache_,
     bool LocalMask_,
     bool PackGQA_,
-    bool HasRelBias_>
+    bool HasRelBias_,
+    bool Softcap_>
 struct FMHAFwdMainloop<
     XeDefault<Stages>,
     CausalMask_,
@@ -143,7 +158,8 @@ struct FMHAFwdMainloop<
     TiledCopyV_cache_,
     LocalMask_,
     PackGQA_,
-    HasRelBias_> {
+    HasRelBias_,
+    Softcap_> {
   //
   // Type Aliases
   //
@@ -218,6 +234,7 @@ struct FMHAFwdMainloop<
   static constexpr bool LocalMask = LocalMask_;
   static constexpr bool PackGQA = PackGQA_;
   static constexpr bool HasRelBias = HasRelBias_;
+  static constexpr bool Softcap = Softcap_;
   static_assert(!HasRelBias || get<1>(TileShapeQK{}) % 8 == 0, "relative bias requires a 16B surface pitch");
   static_assert(
       !HasRelBias || get<0>(TileShapeQK{}) + get<1>(TileShapeQK{}) >= 32,
@@ -235,6 +252,7 @@ struct FMHAFwdMainloop<
   // User-facing arguments
   struct Arguments {
     ElementS const scale;
+    ElementS softcap = 0;  // logit soft-cap (0 = off); applied on natural-scale logits in softmax()
     int const* ptr_page_table = nullptr;
     int page_size = 0;
     int max_num_pages_per_seq = 0;
@@ -268,6 +286,7 @@ struct FMHAFwdMainloop<
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
     return Params{
         val,
+        args.softcap,
         args.ptr_page_table,
         args.page_size,
         args.max_num_pages_per_seq,
@@ -803,6 +822,10 @@ struct FMHAFwdMainloop<
       FragSRow& tS_sum,     // Softmax row-wise sum accumulator
       ElementS qk_scale) {  // Q*K scale (folds in fp8 K per-tensor scale_k)
 
+    // Logit soft-cap: gated by if constexpr (Softcap), caps the natural-scale logit
+    // via apply_logit_softcap (masked -INFINITY lanes pass through untouched).
+    const ElementS softcap = ElementS(params.softcap);
+
     /* Compute row-wise maxima for this block */
     auto tS_bmax = reduce<1>(tS, sycl::maximum{});
 
@@ -810,15 +833,24 @@ struct FMHAFwdMainloop<
     FragSRow rescale;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS_max.size(); i++) {
-      ElementS new_max = sycl::max(tS_max(i), qk_scale * tS_bmax(i));
+      ElementS s = qk_scale * tS_bmax(i);
+      if constexpr (Softcap) {
+        s = apply_logit_softcap(s, softcap);
+      }
+      ElementS new_max = sycl::max(tS_max(i), s);
       rescale(i) = sycl::native::exp2(tS_max(i) - new_max);
       tS_max(i) = new_max;
     }
 
     /* Scale S and subtract maxima, then exponentiate */
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < tS.size(); i++)
-      tS(i) = sycl::native::exp2(qk_scale * tS(i) - broadcast<0>(tS_max, tS, i));
+    for (int i = 0; i < tS.size(); i++) {
+      ElementS s = qk_scale * tS(i);
+      if constexpr (Softcap) {
+        s = apply_logit_softcap(s, softcap);
+      }
+      tS(i) = sycl::native::exp2(s - broadcast<0>(tS_max, tS, i));
+    }
 
     /* Rescale existing S sums */
     if (!first_block) {
@@ -852,7 +884,8 @@ template <
     class TiledCopyK_ = void,  // Optional TiledCopy for loading K
     class TiledCopyV_ = void,  // Optional TiledCopy for loading V
     bool LocalMask_ = false,
-    bool HasRelBias_ = false>
+    bool HasRelBias_ = false,
+    bool Softcap_ = false>
 struct DecodeFwdMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -871,7 +904,8 @@ template <
     class TiledCopyK_,
     class TiledCopyV_,
     bool LocalMask_,
-    bool HasRelBias_>
+    bool HasRelBias_,
+    bool Softcap_>
 struct DecodeFwdMainloop<
     XeDefault<Stages>,
     PagedKV_,
@@ -886,7 +920,8 @@ struct DecodeFwdMainloop<
     TiledCopyK_,
     TiledCopyV_,
     LocalMask_,
-    HasRelBias_> {
+    HasRelBias_,
+    Softcap_> {
   //
   // Type Aliases
   //
@@ -949,12 +984,14 @@ struct DecodeFwdMainloop<
   static constexpr bool Fp8KV = is_any_of_v<ElementK, float_e5m2_t, float_e4m3_t>;
   static constexpr bool LocalMask = LocalMask_;
   static constexpr bool HasRelBias = HasRelBias_;
+  static constexpr bool Softcap = Softcap_;
   static_assert(!HasRelBias || get<1>(TileShapeQK{}) % 8 == 0, "relative bias requires a 16B surface pitch");
   static_assert(!HasRelBias || 2 * get<1>(TileShapeQK{}) >= 32, "relative bias requires a 64B minimum surface width");
 
   // User-facing arguments
   struct Arguments {
     ElementS const scale;
+    ElementS softcap = 0;  // logit soft-cap (0 = off); applied on natural-scale logits in softmax()
     // Paged KV Cache
     int const* ptr_page_table;
     int page_size;
@@ -987,6 +1024,7 @@ struct DecodeFwdMainloop<
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
     return Params{
         val,
+        args.softcap,
         args.ptr_page_table,
         args.page_size,
         args.max_pages_per_seq,
@@ -1301,6 +1339,10 @@ struct DecodeFwdMainloop<
       FragA& tA,            // O accumulator (for rescaling)
       ElementS qk_scale) {  // Q*K scale (folds in fp8 K per-tensor scale_k)
 
+    // Logit soft-cap: gated by if constexpr (Softcap), caps the natural-scale logit
+    // via apply_logit_softcap (masked -INFINITY lanes pass through untouched).
+    const ElementS softcap = ElementS(params.softcap);
+
     /* Compute row-wise maxima for this block */
     auto tS_bmax = reduce<1>(tS, sycl::maximum{});
 
@@ -1308,13 +1350,22 @@ struct DecodeFwdMainloop<
     auto tS_prev_max = tS_max;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS_max.size(); i++) {
-      tS_max(i) = sycl::max(tS_max(i), qk_scale * tS_bmax(i));
+      ElementS s = qk_scale * tS_bmax(i);
+      if constexpr (Softcap) {
+        s = apply_logit_softcap(s, softcap);
+      }
+      tS_max(i) = sycl::max(tS_max(i), s);
     }
 
     /* Scale S and subtract maxima, then exponentiate */
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < tS.size(); i++)
-      tS(i) = sycl::native::exp2(qk_scale * tS(i) - broadcast<0>(tS_max, tS, i));
+    for (int i = 0; i < tS.size(); i++) {
+      ElementS s = qk_scale * tS(i);
+      if constexpr (Softcap) {
+        s = apply_logit_softcap(s, softcap);
+      }
+      tS(i) = sycl::native::exp2(s - broadcast<0>(tS_max, tS, i));
+    }
 
     /* Rescale existing S sums and O accumulator */
     if (!first_block) {

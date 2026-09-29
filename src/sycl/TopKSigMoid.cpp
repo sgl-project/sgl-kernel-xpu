@@ -5,6 +5,7 @@
 #include <limits>
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -642,6 +643,15 @@ SGL_KERNEL_EXPORT void topk_sigmoid(
     TORCH_CHECK(bias.scalar_type() == at::kFloat, "correction_bias must be float32");
     bias_ptr = bias.data_ptr<float>();
   }
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = 0.0;
+  const double bytes = static_cast<double>(gating_output.numel()) * static_cast<double>(gating_output.element_size()) +
+                       static_cast<double>(topk_weights.numel()) * static_cast<double>(topk_weights.element_size()) +
+                       static_cast<double>(topk_indices.numel()) * static_cast<double>(topk_indices.element_size());
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  SGL_KERNEL_PERF_SCOPE("topk_sigmoid", profiling_queue, bytes, flops);
+#endif
 
   // Cover Float in addition to the reduced float types (Half, BFloat16): some
   // models (e.g. Nemotron-3-Nano MoE) emit fp32 router gating logits. The kernel

@@ -1,9 +1,15 @@
 #pragma once
+#include <c10/util/Exception.h>  // TORCH_CHECK
+
 #include <cute/util/compat.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <sycl/sycl.hpp>
+#include <type_traits>
 
 #include "cutlass/device_kernel.h"
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+#include "cutlass/util/sycl_event_manager.hpp"
+#endif
 namespace {
 
 // dispatch bool
@@ -27,6 +33,27 @@ namespace {
     constexpr bool BOOL_NAME = false;                      \
     __VA_ARGS__;                                           \
   }
+
+// Soft-cap (attn_logit_softcapping) is Gemma-2-only (head_dim 128/256), so the
+// Softcap=true kernel variant is only instantiated for those head dims on the
+// non-fp8 KV path; every other head dim and the fp8 path force Softcap=false and
+// reject softcap>0. `fn` is invoked with a std::bool_constant softcap tag.
+template <int HeadDim, bool IsFp8, typename Fn>
+void dispatch_softcap(float softcap, Fn&& fn) {
+  if constexpr (IsFp8) {
+    TORCH_CHECK(softcap == 0.0f, "logit soft-cap is not supported with an fp8 KV cache");
+    fn(std::false_type{});
+  } else if constexpr (HeadDim == 128 || HeadDim == 256) {
+    if (softcap != 0.0f) {
+      fn(std::true_type{});
+    } else {
+      fn(std::false_type{});
+    }
+  } else {
+    TORCH_CHECK(softcap == 0.0f, "logit soft-cap is only compiled for head_dim 128 and 256");
+    fn(std::false_type{});
+  }
+}
 
 template <typename Kernel>
 class KernelCur {};
@@ -57,7 +84,16 @@ static void launch(typename Kernel::Params params) {
   compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
   auto stream = at::xpu::getCurrentXPUStream();
   auto q = stream.queue();
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Capture the SYCL event and register it with EventManager so the
+  // GPU_Clock timer in report_kernel_perf() has a live event window to
+  // compute elapsed time from. Mirrors CUTLASS's GemmUniversalAdapter
+  // pattern (cutlass/gemm/device/gemm_universal_adapter.h).
+  auto event = compat::experimental::launch<cutlass::device_kernel<Kernel>, KernelCur<Kernel>>(policy, q, params);
+  EventManager::getInstance().addEvent(event);
+#else
   compat::experimental::launch<cutlass::device_kernel<Kernel>, KernelCur<Kernel>>(policy, q, params);
+#endif
 }
 
 }  // namespace

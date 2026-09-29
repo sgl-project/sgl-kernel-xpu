@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "Compress.h"
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -429,6 +430,12 @@ SGL_KERNEL_EXPORT torch::Tensor plan_compress_decode(
       req_pool_indices.options().dtype(torch::kUInt8));
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   queue.submit([&](sycl::handler& cgh) {
     constexpr uint32_t kLocalSize = 256;
     const uint32_t global_size = ((batch_size + kLocalSize - 1) / kLocalSize) * kLocalSize;
@@ -445,6 +452,14 @@ SGL_KERNEL_EXPORT torch::Tensor plan_compress_decode(
         batch_size};
     cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kLocalSize)), kernel);
   });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Planning: ~10 flops per batch entry for offset math.
+  const double flops = 10.0 * static_cast<double>(batch_size);
+  const double bytes = static_cast<double>(seq_lens.numel()) * 8.0 +
+                       static_cast<double>(req_pool_indices.numel()) * 8.0 + static_cast<double>(output.numel()) * 1.0;
+  ::sglkernel::report_kernel_perf("plan_compress_decode", queue, timer, bytes, flops);
+#endif
 
   return output;
 }
@@ -524,6 +539,11 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill
 
   auto plan_c = torch::empty({num_q_tokens_u32, static_cast<int64_t>(sizeof(CompressPlan))}, options_u8);
   auto plan_w = torch::empty({num_q_tokens_u32, static_cast<int64_t>(sizeof(WritePlan))}, options_u8);
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
   constexpr int32_t kMaxMTPDraftTokens = 4;
   const int32_t mtp_pad = std::min(ring_size_i32 - compress_ratio_i32, kMaxMTPDraftTokens);
 
@@ -587,6 +607,16 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill
       cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kLocalSize)), kernel);
     });
   }
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Prefill planning: 3 stages of prefix-sum + emit; ~10 flops per q_token.
+  const double flops = 10.0 * static_cast<double>(num_q_tokens_u32);
+  const double bytes = static_cast<double>(seq_lens_xpu.numel()) * 8.0 +
+                       static_cast<double>(extend_lens_xpu.numel()) * 8.0 + static_cast<double>(plan_c.numel()) * 1.0 +
+                       static_cast<double>(plan_w.numel()) * 1.0;
+  auto queue_end = c10::xpu::getCurrentXPUStream().queue();
+  ::sglkernel::report_kernel_perf("plan_compress_prefill", queue_end, timer, bytes, flops);
+#endif
 
   return {plan_c, plan_w};
 }

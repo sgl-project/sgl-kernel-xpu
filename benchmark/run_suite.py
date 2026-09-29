@@ -92,6 +92,12 @@ suites = {
             estimated_time=30,
         ),
         BenchFile("bench_scatter_tokens_to_experts.py"),
+        # --- KV cache / HiCache transfer ---
+        BenchFile(
+            "bench_transfer_mamba.py",
+            tee_log="transfer_mamba.log",
+            estimated_time=15,
+        ),
         # --- norm / rope / quant ---
         BenchFile("bench_merge_states_v2.py", tee_log="merge_states.py.log"),
         BenchFile("bench_mrope.py", tee_log="mrope.py.log"),
@@ -118,6 +124,8 @@ suites = {
         BenchFile("bench_embedding_lora_a_fwd.py", estimated_time=40),
         BenchFile("bench_sgemm_lora_a_fwd.py", estimated_time=25),
         BenchFile("bench_sgemm_lora_b_fwd.py"),
+        BenchFile("bench_qkv_lora_b_fwd.py"),
+        BenchFile("bench_gate_up_lora_b_fwd.py"),
         # disabled temporialy due to env issue
         # --- JIT kernels (need icpx from the oneAPI toolchain) ---
         # BenchFile("bench_jit_rmsnorm.py"),

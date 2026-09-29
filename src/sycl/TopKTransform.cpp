@@ -6,6 +6,7 @@
 #include <optional>
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -861,7 +862,19 @@ SGL_KERNEL_EXPORT void topk_transform(
     at::Tensor& out_page_indices,
     int64_t page_size,
     std::optional<at::Tensor> out_raw_indices_opt) {
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
   topk_transform_paged_launch(scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices_opt);
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = 2.0 * static_cast<double>(scores.numel());
+  const double bytes =
+      static_cast<double>(scores.numel()) * static_cast<double>(scores.element_size()) +
+      static_cast<double>(out_page_indices.numel()) * static_cast<double>(out_page_indices.element_size());
+  ::sglkernel::report_kernel_perf("topk_transform", profiling_queue, timer, bytes, flops);
+#endif
 }
 
 SGL_KERNEL_EXPORT void topk_transform_paged(
@@ -872,7 +885,19 @@ SGL_KERNEL_EXPORT void topk_transform_paged(
     int64_t page_size,
     const at::Tensor& metadata) {
   (void)metadata;
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
   topk_transform_paged_launch(scores, seq_lens, page_tables_opt, out_page_indices, page_size, std::nullopt);
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = 2.0 * static_cast<double>(scores.numel());
+  const double bytes =
+      static_cast<double>(scores.numel()) * static_cast<double>(scores.element_size()) +
+      static_cast<double>(out_page_indices.numel()) * static_cast<double>(out_page_indices.element_size());
+  ::sglkernel::report_kernel_perf("topk_transform_paged", profiling_queue, timer, bytes, flops);
+#endif
 }
 
 SGL_KERNEL_EXPORT void topk_transform_ragged(

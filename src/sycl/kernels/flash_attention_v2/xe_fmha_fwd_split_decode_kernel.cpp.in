@@ -62,10 +62,13 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
         TORCH_CHECK(!params.use_sink, "return_softmax_lse is not supported with sink masking");
         AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
             using Element = @ELEM_TYPE@;
+            dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
+      constexpr bool Softcap = decltype(softcap_tag)::value;
             SplitDecodeConfig<
                     false,
                     LocalMask,
                     false,
+                    Softcap,
                     /*LSE=*/true,
                     TileShapeQK,
                     TileShapePV,
@@ -77,6 +80,7 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
                     Element,
                     Element,
                     Element>::run(params);
+            });
         });
         return;
     }
@@ -93,10 +97,13 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
         " columns");
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       using Element = @ELEM_TYPE@;
+      // softcap+rel_bias is host-rejected (runner TORCH_CHECK); Softcap=false only.
+      constexpr bool Softcap = false;
       SplitDecodeConfig<
           false,
           LocalMask,
           false,
+          Softcap,
           /*LSE=*/false,
           TileShapeQK,
           TileShapePV,
@@ -130,10 +137,13 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
     AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
           using Element = @ELEM_TYPE@;
+          dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
+      constexpr bool Softcap = decltype(softcap_tag)::value;
           SplitDecodeConfig<
               false,
               LocalMask,
               Sink,
+              Softcap,
               /*LSE=*/false,
               TileShapeQK,
               TileShapePV,
@@ -145,6 +155,7 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
               Element,
               Element,
               Element>::run(params);
+          });
       });
     });
 #else
@@ -153,10 +164,13 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
         "sink is only supported for head_size == 64, got @HEAD_DIM@");
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
         using Element = @ELEM_TYPE@;
+        dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
+      constexpr bool Softcap = decltype(softcap_tag)::value;
         SplitDecodeConfig<
             false,
             LocalMask,
             false,
+            Softcap,
             /*LSE=*/false,
             TileShapeQK,
             TileShapePV,
@@ -168,6 +182,7 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
             Element,
             Element,
               Element>::run(params);
+        });
     });
 #endif
 }

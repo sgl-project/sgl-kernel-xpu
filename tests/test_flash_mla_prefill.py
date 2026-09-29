@@ -1,4 +1,5 @@
 import gc
+import math
 import sys
 
 import pytest
@@ -38,6 +39,7 @@ def ref_mla_prefill_varlen(
     cu_seqlens_q: Tensor,  # (B+1,) int32
     seq_lens_k: Tensor,  # (B,) int32
     causal: bool = True,
+    lse: Tensor = None,  # (total_q, H) fp32, log2-domain log-sum-exp
 ) -> Tensor:
     """Pure-PyTorch reference for varlen MLA prefill with causal mask."""
     batch_size = seq_lens_k.shape[0]
@@ -93,6 +95,22 @@ def ref_mla_prefill_varlen(
 
         out[q_start:q_end] = o.permute(1, 0, 2)
 
+        if lse is not None:
+            # The kernel emits log2(sum_j exp2(score_j)) = logsumexp / ln(2).
+            # Chunked over heads to avoid an (H, seqlen_q, seqlen_k) fp32 tensor.
+            H_CHUNK = 32
+            for h0 in range(0, H, H_CHUNK):
+                h1 = min(h0 + H_CHUNK, H)
+                scores = (
+                    q_full[h0:h1].float() @ k_full.float().transpose(0, 1)
+                ) * scale
+                if attn_mask is not None:
+                    scores = scores + attn_mask
+                # (h, seqlen_q) -> (seqlen_q, h)
+                lse[q_start:q_end, h0:h1] = (
+                    torch.logsumexp(scores, dim=-1) / math.log(2)
+                ).transpose(0, 1)
+
     return out
 
 
@@ -101,6 +119,7 @@ def ref_mla_prefill_varlen(
 # Primarily exercises incremental prefill (seqlen_q < seqlen_k); a handful
 # of full-prefill cases (seqlen_q == seqlen_k) are included for coverage.
 # ============================================================================
+@pytest.mark.parametrize("return_lse", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("block_size", [16, 32, 64, 128])
 @pytest.mark.parametrize("num_heads", [16, 128])
@@ -169,7 +188,7 @@ def ref_mla_prefill_varlen(
         "medium_q511_k2048",
     ],
 )
-def test_mla_prefill(dtype, block_size, num_heads, seqlens_q, seqlens_k):
+def test_mla_prefill(return_lse, dtype, block_size, num_heads, seqlens_q, seqlens_k):
     """MLA prefill: mostly incremental (seqlen_q < seqlen_k), some full prefill."""
     for sq, sk in zip(seqlens_q, seqlens_k):
         if sq > sk:
@@ -202,6 +221,9 @@ def test_mla_prefill(dtype, block_size, num_heads, seqlens_q, seqlens_k):
         block_table_cpu.max().item() + 1, block_size, D_ckv, dtype=dtype
     )
 
+    lse_ref = (
+        torch.zeros(total_q, num_heads, dtype=torch.float32) if return_lse else None
+    )
     out_ref = ref_mla_prefill_varlen(
         q_nope_cpu,
         q_pe_cpu,
@@ -211,6 +233,7 @@ def test_mla_prefill(dtype, block_size, num_heads, seqlens_q, seqlens_k):
         cu_seqlens_q,
         seq_lens_k,
         causal=True,
+        lse=lse_ref,
     )
 
     q_nope_xpu = q_nope_cpu.to(device).contiguous()
@@ -223,7 +246,7 @@ def test_mla_prefill(dtype, block_size, num_heads, seqlens_q, seqlens_k):
     ws_size = flash_mla_prefill_get_workspace_size(block_num * block_size, bs)
     workspace = torch.empty(ws_size, device=device, dtype=torch.uint8)
 
-    out = flash_mla_prefill(
+    ret = flash_mla_prefill(
         q_nope_xpu,
         q_pe_xpu,
         kv_cache_xpu,
@@ -235,11 +258,19 @@ def test_mla_prefill(dtype, block_size, num_heads, seqlens_q, seqlens_k):
         scale,
         causal=True,
         num_kv_splits=1,
+        return_lse=return_lse,
     )
+    out, lse = ret if return_lse else (ret, None)
     torch.xpu.synchronize()
 
     atol, rtol = (1e-2, 1e-2) if dtype == torch.bfloat16 else (1e-3, 1e-3)
     torch.testing.assert_close(out_ref.float(), out.cpu().float(), atol=atol, rtol=rtol)
+
+    if return_lse:
+        assert lse.shape == (total_q, num_heads)
+        assert lse.dtype == torch.float32
+        lse_atol, lse_rtol = (2e-2, 2e-2) if dtype == torch.bfloat16 else (5e-3, 5e-3)
+        torch.testing.assert_close(lse_ref, lse.cpu(), atol=lse_atol, rtol=lse_rtol)
 
 
 if __name__ == "__main__":

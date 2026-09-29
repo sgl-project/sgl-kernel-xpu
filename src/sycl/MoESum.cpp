@@ -4,6 +4,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -44,6 +45,14 @@ SGL_KERNEL_EXPORT void moe_sum(
   sycl::range<1> global(num_tokens);
   sycl::range<1> local(std::min(hidden_size, 1024));
   auto range = sycl::nd_range<1>(global * local, local);
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // MoE sum: reduce topk copies per output. Memory-bound.
+  const double flops = 0.0;
+  const double bytes = static_cast<double>(input.numel()) * static_cast<double>(input.element_size()) +
+                       static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
+  SGL_KERNEL_PERF_SCOPE("moe_sum", queue, bytes, flops);
+#endif
 
   switch (topk) {
     case 2: {

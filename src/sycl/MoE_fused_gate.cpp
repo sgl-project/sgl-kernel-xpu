@@ -2,9 +2,12 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include <algorithm>
+#include <cmath>
 #include <sycl/sycl.hpp>
 
 #include "MemoryAccess.h"
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -542,6 +545,19 @@ SGL_KERNEL_EXPORT std::vector<at::Tensor> moe_fused_gate(
 
   bool dispatched = false;
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Fused gate: sigmoid/softmax (~5 flops/expert) + group top-k selection (~log2 flops per topk pick).
+  const double flops = 5.0 * static_cast<double>(num_rows) * static_cast<double>(num_experts) +
+                       static_cast<double>(num_rows) * static_cast<double>(topk) *
+                           (1.0 + std::log2(std::max<double>(1.0, static_cast<double>(num_experts))));
+  const double bytes =
+      static_cast<double>(num_rows) * static_cast<double>(num_experts) * static_cast<double>(input.element_size()) +
+      (bias.has_value() ? static_cast<double>(num_experts) * static_cast<double>(bias->element_size()) : 0.0) +
+      static_cast<double>(num_rows) * static_cast<double>(topk) * (4.0 + 4.0);
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  SGL_KERNEL_PERF_SCOPE("moe_fused_gate", profiling_queue, bytes, flops);
+#endif
+
   SYCL_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::BFloat16, at::ScalarType::Half, input.scalar_type(), "moe_sum_reduce_impl", [&]() {
         auto bias_ptr = bias.has_value() ? reinterpret_cast<const scalar_t*>(bias->data_ptr())
@@ -588,5 +604,6 @@ SGL_KERNEL_EXPORT std::vector<at::Tensor> moe_fused_gate(
               apply_routed_scaling_factor_on_output);
         }
       });
+
   return {output, indices};
 }

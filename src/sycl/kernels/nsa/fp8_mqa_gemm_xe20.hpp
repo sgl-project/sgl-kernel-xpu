@@ -187,13 +187,17 @@ struct Fp8MqaGemmMainloop {
   }
 };
 
-// Layout & atom configuration
-using GemmSGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
+// Layout & atom configuration.
+// GemmSGLayout (subgroup layout / WarpLayout) is a template parameter of
+// fp8_mqa_gemm_batched_launch below (not fixed here) so callers can pick a
+// different subgroup partitioning per GemmTileShape — e.g. a wider (1,4,1)
+// split for large tiles vs a narrower (1,2,1) split for smaller tiles, to
+// trade off per-subgroup serial-iteration count against thread parallelism.
 using GemmMmaAtom = MMA_Atom<XE_8x16x16_F32F16F16F32_TT>;
 
 constexpr int GemmPipelineStages = 2;
 
-// Stride types: both A(M,K) and B(N,K) have K contiguous, D(M,N) has N contiguous
+// Stride types: both A(M,K) and B(N,K) have K contiguous, D(M,N) has N contiguous.
 using GemmStrideAB = Stride<int, _1>;
 using GemmStrideD = Stride<int, _1>;
 
@@ -212,7 +216,14 @@ struct Fp8MqaGemmParams {
   int64_t D_batch_stride;
 };
 
-// Kernel name
+// Kernel name, templated on tile shape AND subgroup layout so each distinct
+// instantiation of fp8_mqa_gemm_batched_launch (used to pick a tile size /
+// subgroup partitioning that fills the device for small problem sizes) gets
+// a distinct SYCL kernel name — SYCL requires unique kernel-name types per
+// distinct kernel, and both the tile shape and subgroup layout are baked
+// into the kernel body (TiledMMA/TiledCopy types), so reusing one
+// non-template name across instantiations is an ODR/name-mangling conflict.
+template <typename GemmTileShape, typename GemmSGLayout>
 class Fp8MqaGemmKernelName;
 
 // Launch the custom FP8 MQA GEMM, optionally batched.
@@ -225,7 +236,7 @@ class Fp8MqaGemmKernelName;
 // A: (M,K) uint8 fp8, K contiguous
 // B: (N,K) uint8 fp8, K contiguous
 // D: (M,N) float32, N contiguous
-template <typename GemmTileShape>
+template <typename GemmTileShape, typename GemmSGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>>
 inline void fp8_mqa_gemm_batched_launch(
     sycl::queue* queue_ptr,
     const void* A_fp8,
@@ -304,7 +315,7 @@ inline void fp8_mqa_gemm_batched_launch(
   syclex::properties kernel_props{syclex::sub_group_size<16>, intelex::grf_size<256>};
 
   queue_ptr->submit([&](sycl::handler& h) {
-    h.parallel_for<Fp8MqaGemmKernelName>(
+    h.parallel_for<Fp8MqaGemmKernelName<GemmTileShape, GemmSGLayout>>(
         sycl::nd_range<3>(global_range, local_range), kernel_props, [=](sycl::nd_item<3> item) {
           int batch_id = item.get_group(0);
           int group_id = item.get_group(1);

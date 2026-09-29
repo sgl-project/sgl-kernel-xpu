@@ -37,6 +37,7 @@
 #include <cmath>
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "comm/Numerics.h"
@@ -354,6 +355,11 @@ SGL_KERNEL_EXPORT void fused_qk_rope(
   auto queue = dpcppGetCurrentQueue();
   bool interleave = !is_neox;
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
+
 #define FUSED_QK_ROPE_LAUNCH_ARGS                                                                                  \
   qkv.data_ptr(), static_cast<int>(num_tokens), static_cast<int>(num_heads_q), static_cast<int>(num_heads_k),      \
       static_cast<int>(num_heads_v), q_weight.data_ptr(), k_weight.data_ptr(), static_cast<float>(base),           \
@@ -396,6 +402,22 @@ SGL_KERNEL_EXPORT void fused_qk_rope(
 
 #undef LAUNCH_QK_ROPE_KERNEL
 #undef FUSED_QK_ROPE_LAUNCH_ARGS
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Rope rotates only the q and k heads on their rotary_dim lanes: ~4 flops per lane.
+  const double rotated_elems = static_cast<double>(num_tokens) *
+                               (static_cast<double>(num_heads_q) + static_cast<double>(num_heads_k)) *
+                               static_cast<double>(rotary_dim);
+  const double flops = 4.0 * rotated_elems;
+  const double qkv_elem = static_cast<double>(qkv.element_size());
+  const double w_elem = static_cast<double>(q_weight.element_size());
+  // Read+write q,k rows (v skipped) + read q_weight/k_weight vectors.
+  const double bytes = 2.0 * static_cast<double>(num_tokens) *
+                           (static_cast<double>(num_heads_q) + static_cast<double>(num_heads_k)) *
+                           static_cast<double>(head_dim) * qkv_elem +
+                       2.0 * static_cast<double>(head_dim) * w_elem;
+  ::sglkernel::report_kernel_perf("fused_qk_rope", queue, timer, bytes, flops);
+#endif
 }
 
 template <bool is_neox, int64_t rope_dim, typename scalar_t, typename cache_t, typename pos_t>
@@ -546,6 +568,12 @@ SGL_KERNEL_EXPORT void fused_qk_rope_with_cos_sin_cache_inplace(
       input_dim == 3,
       "fused_qk_rope_with_cos_sin_cache_inplace only supports 3D input [num_tokens, num_heads, rope_dim]");
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = dpcppGetCurrentQueue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
 #define LAUNCH_ROPE_CACHE_KERNEL(IS_NEOX, CACHE_T, POS_T)                            \
   switch (rope_dim) {                                                                \
     case 64:                                                                         \
@@ -601,6 +629,25 @@ SGL_KERNEL_EXPORT void fused_qk_rope_with_cos_sin_cache_inplace(
 #undef DISPATCH_ROPE_CACHE_KERNEL_BY_LAYOUT
 #undef DISPATCH_ROPE_CACHE_BY_CACHE_DTYPE
 #undef LAUNCH_ROPE_CACHE_KERNEL
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const int64_t num_tokens = query.size(0);
+  const int64_t num_q_heads = query.size(1);
+  const int64_t num_k_heads = key.size(1);
+  const double rotated_elems = static_cast<double>(num_tokens) *
+                               (static_cast<double>(num_q_heads) + static_cast<double>(num_k_heads)) *
+                               static_cast<double>(rope_dim);
+  const double flops = 4.0 * rotated_elems;
+  const double q_elem = static_cast<double>(query.element_size());
+  const double k_elem = static_cast<double>(key.element_size());
+  const double cs_elem = static_cast<double>(cos_sin_cache.element_size());
+  const double bytes = 2.0 * static_cast<double>(num_tokens) * static_cast<double>(num_q_heads) *
+                           static_cast<double>(rope_dim) * q_elem +
+                       2.0 * static_cast<double>(num_tokens) * static_cast<double>(num_k_heads) *
+                           static_cast<double>(rope_dim) * k_elem +
+                       static_cast<double>(num_tokens) * static_cast<double>(rope_dim) * cs_elem;
+  ::sglkernel::report_kernel_perf("fused_qk_rope_with_cos_sin_cache_inplace", profiling_queue, timer, bytes, flops);
+#endif
 }
 
 }  // namespace at::native::xpu

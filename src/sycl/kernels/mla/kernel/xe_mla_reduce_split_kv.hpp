@@ -80,6 +80,10 @@ class XeMlaReduceSplitKV {
 
   using ElementLSE = float;  // exp_sums/max_logits accumulator type
 
+  using TensorLSEOut = typename MlaKernel_::TensorLSE;
+  using ElementLSEOut = typename MlaKernel_::ElementLSE;
+  using StrideLSEOut = typename MlaKernel_::StrideLSE;
+
   // Number of output values processed by each thread
   static constexpr int num_vals_per_thread = int(get<1>(TileShapeO{}) / (SGPerWG::value * intel::sg_size));
 
@@ -98,6 +102,9 @@ class XeMlaReduceSplitKV {
     const ElementLSE* exp_sums = nullptr;
     const ElementLSE* max_logits = nullptr;
     StrideO dLSE{};
+    // Merged LSE (log2 domain). Null => skip.
+    ElementLSEOut* LSE = nullptr;
+    StrideLSEOut dLSE_out{};
   };
   //
   // KernelParams
@@ -212,7 +219,24 @@ class XeMlaReduceSplitKV {
       global_max = reduce_over_group(get_work_group<1>(), global_max, sycl::maximum<>());
       global_max = sycl::group_broadcast(get_work_group<1>(), global_max, 0);
 
-      // Step 3: Cooperatively reduce output elements
+      // Step 3: Merge the per-split statistics into the LSE, one lane per row.
+      if (p.LSE != nullptr) {
+        if (thr_id == 0) {
+          auto shape_LSE_out = make_shape(seq_len_qo, num_heads_q, batch);
+          Tensor LSEout = make_tensor(make_gmem_ptr(p.LSE), make_layout(shape_LSE_out, p.dLSE_out));
+          ElementLSE total = ElementLSE(0);
+          for (int k = 0; k < num_kv_splits; k++) {
+            ElementLSE local_exp_sum = shared_storage.exp_sums_slm[k];
+            // Skip empty splits (exp_sums=0, max_logits=-inf sentinel)
+            if (local_exp_sum <= ElementLSE(0)) continue;
+            total += local_exp_sum * sycl::native::exp2(shared_storage.max_logits_slm[k] - global_max);
+          }
+          ElementLSE lse = (total > ElementLSE(0)) ? (global_max + sycl::log2(total)) : -INFINITY;
+          LSEout(seq_idx, head_q, idx_b) = static_cast<ElementLSEOut>(lse);
+        }
+      }
+
+      // Step 4: Cooperatively reduce output elements
       // O_accum is unnormalized (numerator only),
       // so acc += O_accum * rescale, and global_exp_sums += exp_sum * rescale.
       for (int j = thr_id; j < head_size_o; j += WG_SIZE) {

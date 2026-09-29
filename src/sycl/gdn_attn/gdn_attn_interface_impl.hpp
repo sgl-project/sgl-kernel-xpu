@@ -2,6 +2,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include "../SGLKernelPerf.h"
 #include "../Utils.h"
 #include "causal_conv1d.hpp"
 #include "chunk_causal_conv1d.hpp"
@@ -209,6 +210,19 @@ SGL_KERNEL_EXPORT void gdn_attention(
   auto& queue = dpcppGetCurrentQueue();
   auto dtype = projected_states_qkvz.dtype();
   auto device = projected_states_qkvz.device();
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // GDN attention combines causal conv1d, L2 norm, chunk gated delta rule, and recurrent decode.
+  // Coarse accounting: ~(2 * head_v_dim * head_k_dim) flops per (token * num_v_heads) as a
+  // reference matmul workload; memory covers projected states + workspace shuffles.
+  const double per_token_flops = 2.0 * static_cast<double>(head_v_dim) * static_cast<double>(head_k_dim);
+  const double flops = static_cast<double>(num_actual_tokens) * static_cast<double>(num_v_heads) * per_token_flops;
+  const double bytes =
+      static_cast<double>(projected_states_qkvz.numel()) * static_cast<double>(projected_states_qkvz.element_size()) +
+      static_cast<double>(projected_states_ba.numel()) * static_cast<double>(projected_states_ba.element_size()) +
+      static_cast<double>(core_attn_out.numel()) * static_cast<double>(core_attn_out.element_size());
+  SGL_KERNEL_PERF_SCOPE("gdn_attention", queue, bytes, flops);
+#endif
 
   // Details about `workspace` scratch buffer management:
   // Reuse a caller-provided persistent workspace buffer to reduce allocations.

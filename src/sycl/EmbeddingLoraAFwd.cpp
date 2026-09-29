@@ -4,6 +4,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -307,6 +308,16 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
   const int max_rank = max_rank_i64;
   const int num_segments = num_segments_i64;
   const int num_extra_tokens = extra_embeddings.has_value() ? extra_embeddings->size(1) : 0;
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Embedding LoRA A fwd: one gather write per (token, rank) valid pair. Treat as memory-bound.
+  const double bytes = static_cast<double>(input_ids.numel()) * static_cast<double>(input_ids.element_size()) +
+                       static_cast<double>(weights.numel()) * static_cast<double>(weights.element_size()) +
+                       static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
+  const double flops = 0.0;
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  SGL_KERNEL_PERF_SCOPE("embedding_lora_a_fwd", profiling_queue, bytes, flops);
+#endif
 
   // Dispatch kernel based on data type
   if (weights.scalar_type() == torch::kFloat32) {

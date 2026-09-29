@@ -27,6 +27,15 @@ def _export_jit_toolchain_env() -> None:
 
 _export_jit_toolchain_env()
 
+# Opt-in H2D transfer profiler. Set SGL_H2D_PROFILE=1 to print one perf line
+# per cpu->xpu `.to()` call, using the same "op perf(source): time=... ms,
+# bandwidth=... GB/s" shape as the C++ SGL_KERNEL_PERF_SCOPE output. See
+# python/sgl_kernel/_h2d_profile.py.
+if os.environ.get("SGL_H2D_PROFILE") == "1":
+    from sgl_kernel._h2d_profile import install as _install_h2d_profile
+
+    _install_h2d_profile()
+
 cuda_path = f"/usr/local/cuda/targets/{SYSTEM_ARCH}-linux/lib/libcudart.so.12"
 if os.path.exists(cuda_path):
     ctypes.CDLL(cuda_path, mode=ctypes.RTLD_GLOBAL)
@@ -94,6 +103,8 @@ from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
     cutlass_scaled_fp4_mm,
+    dsv3_fused_a_gemm,
+    dsv3_router_gemm,
     fp8_blockwise_scaled_mm,
     fp8_scaled_mm,
     int8_scaled_mm,
@@ -141,6 +152,8 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer_mla,
     transfer_kv_all_layer_mla_lf_pf,
     transfer_kv_direct,
+    transfer_kv_mamba_lf_pf,
+    transfer_kv_mamba_pf_lf,
     transfer_kv_per_layer,
     transfer_kv_per_layer_direct_pf_lf,
     transfer_kv_per_layer_mla,
@@ -150,6 +163,7 @@ from sgl_kernel.kvcacheio import (
 )
 from sgl_kernel.lora import (
     embedding_lora_a_fwd,
+    gate_up_lora_b_fwd,
     qkv_lora_b_fwd,
     sgemm_lora_a_fwd,
     sgemm_lora_b_fwd,
@@ -171,6 +185,8 @@ from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     biased_topk,
     cutlass_fp4_group_mm,
+    cutlass_fused_experts_fp8,
+    cutlass_fused_experts_mxfp4,
     fp8_blockwise_scaled_grouped_mm,
     fused_experts,
     hash_topk,
@@ -178,6 +194,7 @@ from sgl_kernel.moe import (
     moe_fused_gate,
     moe_sum,
     moe_sum_reduce,
+    mxfp4_blockwise_scaled_grouped_mm,
     prepare_moe_input,
     scatter_tokens_to_experts,
     swiglu_gpt_oss_sigmoid_alpha,
@@ -214,7 +231,7 @@ from sgl_kernel.top_k import (
     topk_transform_paged,
     topk_transform_ragged,
 )
-from sgl_kernel.utils import get_device_capability, is_xe2_arch
+from sgl_kernel.utils import get_device_capability, is_xe2_arch, is_xe3_arch
 from sgl_kernel.version import __version__
 
 build_tree_kernel = (

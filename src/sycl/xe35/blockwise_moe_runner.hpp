@@ -5,10 +5,10 @@
 /*! \file
     \brief Shared grouped-GEMM runner template for MXFP4/MXFP8 blockwise MoE on Intel XPU (xe35).
 
-    Header-only so that each including TU controls its own preprocessor state
-    (notably CUTE_ENABLE_XE_BLOCK_2D_ASSERT, which the MXFP4 path requires as a
-    compiler barrier and the MXFP8 path must NOT define because its D-store
-    triggers spurious x%4 asserts that the hardware silently handles).
+    Header-only so each including TU keeps its own preprocessor state. No TU defines
+    CUTE_ENABLE_XE_BLOCK_2D_ASSERT: its A-scale width assert rejects legal ragged-M
+    layouts, and these TUs build without -DNDEBUG so it would really fire. See
+    blockwise_moe_mxfp4.cpp.
 */
 
 #pragma once
@@ -326,16 +326,26 @@ class BlockScaledGroupedGemmRunner {
   }
 };
 
-// The scale loader asserts its per-expert base pointer is 64-byte aligned
-// (xe_mma_blockscaled_scale_traits.hpp), and those pointers are spaced
-// scale_cols * M * sizeof(scale) apart, so round M up until that spacing is a
-// multiple of 64. Decode is where this bites: max_m 1-32 over a couple of scale
-// columns leaves each expert far short of 64 bytes. Wide K needs no padding at
-// all (K=2048 MXFP8 gives scale_cols=64, already a multiple).
+// Two independent block-2D constraints on the transposed A-scales, both keyed on M:
+//
+//   base:  per-expert pointers are spaced scale_cols * M * sizeof(scale) apart and
+//          each must be 64-byte aligned. Decode is where this bites — max_m 1-32
+//          over a couple of scale columns leaves an expert far short of 64 bytes.
+//   pitch: scale columns are M * sizeof(scale) apart and that must be a multiple
+//          of 4. Wide K is where this bites — K=2048 MXFP8 gives scale_cols=64, so
+//          the base constraint alone asks for no padding and an odd max_m leaves a
+//          pitch like 33. CUTLASS rounds the pitch it programs up to 4 while the
+//          buffer keeps the unrounded spacing, so the loader reads wrong addresses and
+//          the assert that would catch it sits behind CUTE_ENABLE_XE_BLOCK_2D_ASSERT.
+//
+// Round M up to the lcm so one padding satisfies both.
 inline int moe_pad_scale_m(int max_m, int scale_cols, int scale_elem_bytes) {
   constexpr int kScaleBaseAlign = 64;
+  constexpr int kPitchAlign = 4;
   const int row_bytes = scale_cols * scale_elem_bytes;
-  const int align_m = kScaleBaseAlign / std::gcd(row_bytes, kScaleBaseAlign);
+  const int base_align = kScaleBaseAlign / std::gcd(row_bytes, kScaleBaseAlign);
+  const int pitch_align = (kPitchAlign + scale_elem_bytes - 1) / scale_elem_bytes;
+  const int align_m = std::lcm(base_align, pitch_align);
   return (max_m + align_m - 1) / align_m * align_m;
 }
 

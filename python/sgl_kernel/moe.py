@@ -1425,6 +1425,8 @@ def cutlass_fused_experts_fp8(
             f"w1_q shape {tuple(w1_q.shape)} incompatible with a.shape[1]={hidden_size}"
         )
 
+    # A no-op for sglang, whose weights are contiguous as (E, 2n, k): undoing its
+    # view lands back on the original layout and nothing is copied.
     if sglang_transposed:
         w1_q = w1_q.transpose(1, 2).contiguous()
         w2_q = w2_q.transpose(1, 2).contiguous()
@@ -1520,7 +1522,8 @@ def cutlass_fused_experts_fp8(
     else:
         rep_a_q, rep_a1_scales = _per_token_group_quant_fp8(rep_a, group_size=128)
 
-    c1 = torch.zeros((m * topk, n * 2), dtype=torch.float32, device=device)
+    # empty is safe: ElementC=void, so C is never read, and every row is fully written.
+    c1 = torch.empty((m * topk, n * 2), dtype=torch.float32, device=device)
 
     # Empty int64 sentinels select on-device pointer-table + scale-transpose.
     empty_ptrs = torch.empty((0,), dtype=torch.int64, device=device)
@@ -1560,7 +1563,7 @@ def cutlass_fused_experts_fp8(
             intermediate, group_size=128
         )
 
-    c2 = torch.zeros((m * topk, k), dtype=torch.float32, device=device)
+    c2 = torch.empty((m * topk, k), dtype=torch.float32, device=device)
     fp8_blockwise_scaled_grouped_mm(
         c2,
         empty_ptrs,
@@ -1660,6 +1663,8 @@ def cutlass_fused_experts_mxfp4(
         rep_a, group_size=_MXFP4_BLOCK_SIZE
     )
 
+    # Must be zeros, unlike the FP8 path: MXFP4 sets ElementC=float and CUTLASS reads C
+    # whenever the type is non-void, so uninitialized NaNs survive 0 * NaN.
     c1 = torch.zeros((m * topk, n * 2), dtype=torch.float32, device=device)
     # Empty sentinels -> on-device ptr-table + scale-transpose.
     empty_ptrs = torch.empty((0,), dtype=torch.int64, device=device)

@@ -238,6 +238,23 @@ SGL_KERNEL_EXPORT void fp8_blockwise_scaled_grouped_mm(
       "The legacy filled-ptrs path does not transpose B-scales to MN-major and "
       "would produce incorrect results.");
 
+  // Validate before the raw int32 reads below, which otherwise fault or throw
+  // an opaque dtype error rather than naming the offending argument.
+  TORCH_CHECK(problem_sizes.dim() == 2 && problem_sizes.size(1) == 3 &&
+                  problem_sizes.scalar_type() == torch::kInt32 &&
+                  problem_sizes.is_contiguous(),
+              "problem_sizes must be a contiguous int32 (num_experts, 3) tensor");
+
+  // Also threaded into the runner below so it skips its own D->H sync.
+  torch::Tensor problem_sizes_host = problem_sizes.to(torch::kCPU);
+  const int32_t* psz = problem_sizes_host.data_ptr<int32_t>();
+  const int E_ = static_cast<int>(problem_sizes_host.size(0));
+  int max_m = 0;
+  for (int e = 0; e < E_; ++e) {
+    const int m_e = psz[e * 3 + 0];
+    if (m_e > max_m) max_m = m_e;
+  }
+
   if (need_prep) {
     TORCH_CHECK(a.dim() == 2,
                 "On-device prep requires flat 2D A (sum_m_i, K), got ", a.dim(), " dimensions");
@@ -254,6 +271,7 @@ SGL_KERNEL_EXPORT void fp8_blockwise_scaled_grouped_mm(
     const int BS = is_mxfp8 ? at::native::xpu::MXFP8TilePolicy::BlockSize
                             : at::native::xpu::FP8TilePolicy::BlockSize;
     const int E = static_cast<int>(expert_offsets.size(0));
+    TORCH_CHECK(E == E_, "expert_offsets and problem_sizes disagree on num_experts");
     const int K = static_cast<int>(a.size(1));
     const int N = static_cast<int>(output.size(1));
     TORCH_CHECK(K % BS == 0, "K must be a multiple of ", BS);
@@ -282,19 +300,13 @@ SGL_KERNEL_EXPORT void fp8_blockwise_scaled_grouped_mm(
     const int64_t sa_elem = is_mxfp8 ? sizeof(uint8_t) : sizeof(float);
     const int64_t sb_elem = sa_elem;
 
-    // Upper-bound the padded ragged-M A-scales scratch by total flat A rows.
-    // sum(M_i) == a.size(0) by construction (on-device prep requires flat
-    // 2D A), so no single expert's M can exceed a.size(0). Using this bound
-    // instead of the exact max_m avoids a D->H reduction over problem_sizes
-    // and keeps dispatch fully async — matches vLLM's SM100 shape. Trades a
-    // small amount of scratch memory (up to E*scale_cols*(a.size(0) - true
-    // max_m) bytes) for one fewer host sync per fused-experts call.
-    const int max_m = static_cast<int>(a.size(0));
-    TORCH_CHECK(max_m > 0, "flat A must have at least one row");
+    // The exact max(M_i), not the sum(M_i) upper bound: the bucket dispatch above
+    // already pays the D->H sync, so scratch no longer has to be over-allocated to
+    // keep it off. Saves E * scale_cols * (sum_m - max_m) bytes.
+    TORCH_CHECK(max_m > 0, "every expert has M == 0; nothing to compute");
 
-    // Keep each expert's A-scale base 64-byte aligned for the scale loader.
-    // Buffers below are zero-init so the padded rows don't feed garbage into
-    // the accumulator.
+    // Zero-init so the rows past each expert's m_i don't feed garbage into the
+    // accumulator; moe_pad_scale_m covers the base and pitch alignment.
     const int padded_max_m =
         at::native::xpu::moe_pad_scale_m(max_m, scale_cols, static_cast<int>(sa_elem));
 
@@ -360,23 +372,6 @@ SGL_KERNEL_EXPORT void fp8_blockwise_scaled_grouped_mm(
   // Legacy filled-ptrs path uses per-expert m_i (override = 0).
   const int sa_m_stride_override =
       need_prep ? static_cast<int>(scales_a_t_keep_alive.stride(1)) : 0;
-
-  // Validate before the raw int32 reads below, which otherwise fault or throw
-  // an opaque dtype error rather than naming the offending argument.
-  TORCH_CHECK(problem_sizes.dim() == 2 && problem_sizes.size(1) == 3 &&
-                  problem_sizes.scalar_type() == torch::kInt32 &&
-                  problem_sizes.is_contiguous(),
-              "problem_sizes must be a contiguous int32 (num_experts, 3) tensor");
-
-  // Threaded into the runner so it skips its own D->H sync of problem_sizes.
-  torch::Tensor problem_sizes_host = problem_sizes.to(torch::kCPU);
-  const int32_t* psz = problem_sizes_host.data_ptr<int32_t>();
-  const int E_ = static_cast<int>(problem_sizes_host.size(0));
-  int max_m = 0;
-  for (int e = 0; e < E_; ++e) {
-    const int m_e = psz[e * 3 + 0];
-    if (m_e > max_m) max_m = m_e;
-  }
 
   const auto bucket = at::native::xpu::moe_tile_bucket(max_m);
 

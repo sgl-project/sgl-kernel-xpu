@@ -127,6 +127,7 @@ suites = {
         BenchFile("bench_qkv_lora_b_fwd.py"),
         BenchFile("bench_gate_up_lora_b_fwd.py"),
         BenchFile("bench_chunked_sgmv_lora_shrink_fwd.py"),
+        BenchFile("bench_chunked_sgmv_lora_expand_fwd.py"),
         # disabled temporialy due to env issue
         # --- JIT kernels (need icpx from the oneAPI toolchain) ---
         # BenchFile("bench_jit_rmsnorm.py"),

@@ -122,6 +122,7 @@ SGL_KERNEL_EXPORT void chunked_sgmv_lora_shrink_fwd(
   TORCH_CHECK(num_slices > 0, "num_slices must be > 0");
   TORCH_CHECK(weights.size(1) % num_slices == 0, "weights.size(1) must be divisible by num_slices");
   TORCH_CHECK(weights.scalar_type() == x.scalar_type(), "x dtype must match weights dtype");
+  TORCH_CHECK(weights.size(2) == x.size(1), "weights.size(2) must equal x.size(1)");
 
   const int64_t num_loras_i64 = weights.size(0);
   const int64_t max_rank_i64 = weights.size(1) / num_slices;

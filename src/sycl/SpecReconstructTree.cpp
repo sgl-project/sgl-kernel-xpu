@@ -79,7 +79,7 @@ inline uint64_t pack_mask_row_bytewise(const bool* src, int32_t count) {
 
 // Same packing, 8 bools per read.
 inline uint64_t pack_mask_row(const bool* src, int32_t count) {
-  if ((count & 7) != 0) {
+  if ((count & 7) != 0 || (reinterpret_cast<uintptr_t>(src) % alignof(uint64_t)) != 0) {
     return pack_mask_row_bytewise(src, count);
   }
   const uint64_t* words = reinterpret_cast<const uint64_t*>(src);
@@ -100,6 +100,8 @@ accumulate_byte_matches(uint64_t v, int32_t w, uint64_t want_kids, uint64_t want
 // SingleWord (n <= 64): the row fits one uint64.
 constexpr int64_t kFastPathMaxNodes = 64;
 
+// Fast path: one node per thread, its whole ancestor row packed into one uint64.
+// depth = popcount, parent = clz, child/sibling = byte compare over parents in SLM.
 template <typename seq_t, int32_t N_CONST>
 struct ReconstructTreeSingleWordKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr bool kStaticN = N_CONST > 0;
@@ -225,6 +227,7 @@ inline void submit_single_word_kernel(
   sycl_kernel_submit(global_range, local_range, queue, kernel);
 }
 
+// Slow path: n > 64, so a row spans several uint64 words and is staged in SLM.
 template <typename seq_t>
 struct ReconstructTreeMultiWordKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   using word_t = uint64_t;

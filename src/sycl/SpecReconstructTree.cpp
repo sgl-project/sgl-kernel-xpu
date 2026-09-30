@@ -28,8 +28,6 @@ namespace {
 
 constexpr int32_t kNoNode = -1;
 
-static_assert(sizeof(bool) == 1, "tree_mask packing assumes 1-byte bool");
-
 // gather bit 0 of every input byte down to one bit each.
 // 4 bytes -> 4 bits.
 inline uint32_t compress_mask_nibble(uint32_t bytes) {
@@ -392,7 +390,7 @@ SGL_KERNEL_EXPORT void reconstruct_indices_from_tree_mask(
   CHECK_INPUT(retrive_next_token);
   CHECK_INPUT(retrive_next_sibling);
 
-  TORCH_CHECK(batch_size >= 0, "reconstruct_indices_from_tree_mask: batch_size must be non-negative, got ", batch_size);
+  TORCH_CHECK(batch_size > 0, "reconstruct_indices_from_tree_mask: batch_size must be positive, got ", batch_size);
   TORCH_CHECK(
       draft_token_num > 0,
       "reconstruct_indices_from_tree_mask: draft_token_num must be positive, got ",
@@ -427,10 +425,6 @@ SGL_KERNEL_EXPORT void reconstruct_indices_from_tree_mask(
       batch_size * draft_token_num * draft_token_num,
       " elements, got ",
       tree_mask.numel());
-
-  if (batch_size == 0) {
-    return;
-  }
 
   auto& queue = dpcppGetCurrentQueue();
   const int64_t bs = batch_size;

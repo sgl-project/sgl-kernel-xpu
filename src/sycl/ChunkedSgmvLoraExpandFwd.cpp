@@ -77,7 +77,7 @@
 namespace {
 
 //----------------- Per-(dtype, tile) dispatch macros --------------------//
-// LoRA-B "expand" is a K-thin, memory-bandwidth-bound grouped GEMM. Tile 
+// LoRA-B "expand" is a K-thin, memory-bandwidth-bound grouped GEMM. Tile
 // selection currently has a single option (tall).
 // Add tiles to DISPATCH_CHUNKED_SGMV_LORA_EXPAND_FWD_TILE (and to
 // ChunkedSgmvLoraExpandFwdXe20.cmake + chunked_sgmv_lora_expand_fwd_dispatch.hpp
@@ -106,17 +106,17 @@ namespace {
 //----------------- Main API function --------------------//
 
 SGL_KERNEL_EXPORT void chunked_sgmv_lora_expand_fwd(
-    torch::Tensor& output,                // [num_tokens, N_total]  (physical token order)
-    const torch::Tensor& x,               // [num_tokens, num_slices*max_rank]  (physical token order)
-    const torch::Tensor& weights,         // [num_loras, N_total, max_rank]
-    const torch::Tensor& slice_offsets,   // [num_slices + 1,]  output-column boundaries
-    const int64_t max_slice_size,         // max per-slice output width implied by slice_offsets
-    const int64_t num_slices,             // stacked projections (qkv=3, gate_up=2, else 1)
-    const int64_t num_segments,           // currently the code does not rely on it.
-    const torch::Tensor& seg_indptr,      // [num_segments + 1,]   over the logical row order
-    const torch::Tensor& weight_indices,  // [num_segments,]
-    const torch::Tensor& lora_ranks,      // [num_loras,]
-    const torch::Tensor& scalings,        // [num_loras,]
+    torch::Tensor& output,                            // [num_tokens, N_total]  (physical token order)
+    const torch::Tensor& x,                           // [num_tokens, num_slices*max_rank]  (physical token order)
+    const torch::Tensor& weights,                     // [num_loras, N_total, max_rank]
+    const torch::Tensor& slice_offsets,               // [num_slices + 1,]  output-column boundaries
+    const int64_t max_slice_size,                     // max per-slice output width implied by slice_offsets
+    const int64_t num_slices,                         // stacked projections (qkv=3, gate_up=2, else 1)
+    const int64_t num_segments,                       // currently the code does not rely on it.
+    const torch::Tensor& seg_indptr,                  // [num_segments + 1,]   over the logical row order
+    const torch::Tensor& weight_indices,              // [num_segments,]
+    const torch::Tensor& lora_ranks,                  // [num_loras,]
+    const torch::Tensor& scalings,                    // [num_loras,]
     const std::optional<torch::Tensor>& permutation,  // [num_tokens,] logical -> physical (optional)
     const std::optional<torch::Tensor>&
         base_output  // [num_tokens, N_total] optional; the base model's output for a fused add

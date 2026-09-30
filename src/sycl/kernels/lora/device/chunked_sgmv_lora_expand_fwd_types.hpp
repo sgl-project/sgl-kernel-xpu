@@ -32,9 +32,9 @@
   \file
   \brief Tile-configuration option tag for the chunked-SGMV LoRA "expand" GEMM.
 
-  This is the wide-N grouped-GEMM tile for the LoRA-B "expand" projection. 
-  The generic n_slices + caller-supplied slice_offsets are just arguments to the 
-  shared sliced grouped-GEMM core (GroupGemmTypes<> + group_gemm_lora_launcher.hpp); 
+  This is the wide-N grouped-GEMM tile for the LoRA-B "expand" projection.
+  The generic n_slices + caller-supplied slice_offsets are just arguments to the
+  shared sliced grouped-GEMM core (GroupGemmTypes<> + group_gemm_lora_launcher.hpp);
   only the tile axis lives here.
 
   Adding another tile is a two-step change (mirrors the B-fwd convention):

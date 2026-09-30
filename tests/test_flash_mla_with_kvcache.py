@@ -534,7 +534,7 @@ def make_attn_sink(h_q=H_Q):
 @pytest.mark.arch("xe20", "xe35")
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("layout", ALL_LAYOUTS, ids=lambda lo: lo.name)
-@pytest.mark.parametrize("bs", [7, 384])
+@pytest.mark.parametrize("bs", [7, 384, 512])
 @pytest.mark.parametrize("num_heads", [16, 32, 64])
 @pytest.mark.parametrize("have_extra", [False, True])
 @pytest.mark.parametrize("have_attn_sink", [False, True])

@@ -97,11 +97,9 @@ struct DecodeFp8PagedSource {
     const uint8_t* scales;            // [Layout::SCALE_BYTES]: UE8M0 bytes or fp32, per Layout
   };
 
-  // One token's NoPE dequant scales, resolved to float and staged in registers. Both
-  // layouts funnel through this type so the dequant loops below stay layout-agnostic --
-  // they only index v[group]. An invalid token yields zeros, which zeroes its row.
   struct ScaleSet {
     float v[Layout::NUM_SCALES];
+    PackedElement word;
   };
 
   CUTLASS_DEVICE
@@ -161,15 +159,18 @@ struct DecodeFp8PagedSource {
         s.v[i] = valid_token ? scale_f32[i] : 0.0f;
       }
     } else {
-      // DSv4: the whole UE8M0 section is exactly one packed load (asserted above);
-      // scale i is byte i of that word, biased like an f32 exponent.
-      const PackedElement word = valid_token ? *reinterpret_cast<const PackedElement*>(scales) : PackedElement(0);
-      CUTE_UNROLL
-      for (int i = 0; i < Layout::NUM_SCALES; ++i) {
-        s.v[i] = valid_token ? e8m0_to_float(static_cast<uint8_t>(word >> (8 * i))) : 0.0f;
-      }
+      s.word = valid_token ? *reinterpret_cast<const PackedElement*>(scales) : PackedElement(0);
     }
     return s;
+  }
+
+  CUTLASS_DEVICE
+  static float scale_for_group(ScaleSet const& scales, int group) {
+    if constexpr (Layout::SCALES_ARE_FP32) {
+      return scales.v[group];
+    } else {
+      return e8m0_to_float(static_cast<uint8_t>(scales.word >> (8 * group)));
+    }
   }
 
   CUTLASS_DEVICE
@@ -191,7 +192,7 @@ struct DecodeFp8PagedSource {
       const int dim_idx = n * SUBGROUP_SIZE + lane_id;
       cutlass::bfloat16_t kv_val = cutlass::bfloat16_t(0.0f);
       if (valid_token && dim_idx < Layout::NOPE_DIM) {
-        const float scale = scales.v[dim_idx / Layout::QUANT_GROUP];
+        const float scale = scale_for_group(scales, dim_idx / Layout::QUANT_GROUP);
         const auto fp8_val = cutlass::float_e4m3_t::bitcast(sNope(dim_idx));
         kv_val = cutlass::bfloat16_t(static_cast<float>(fp8_val) * scale);
       } else if (valid_token) {
@@ -211,7 +212,7 @@ struct DecodeFp8PagedSource {
       if (i >= NOPE_PACKS) {
         continue;
       }
-      const float scale = scales.v[(i * FP8_VALUES_PER_PACK) / Layout::QUANT_GROUP];
+      const float scale = scale_for_group(scales, (i * FP8_VALUES_PER_PACK) / Layout::QUANT_GROUP);
       PackedOut out;
       CUTE_UNROLL
       for (int vec_offset = 0; vec_offset < FP8_VALUES_PER_PACK; ++vec_offset) {

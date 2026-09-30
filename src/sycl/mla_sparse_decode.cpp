@@ -211,7 +211,7 @@ SGL_KERNEL_EXPORT void flash_mla_sparse_decode(
   // Decode: batch B, 1 query per row, topk selected KV rows. QK + PV over topk keys.
   const int64_t B = q.size(0);
   const int64_t H = q.size(2);
-  const int64_t qk_dim = q.size(3);
+  const int64_t qk_dim = static_cast<int64_t>(d_qk);
   const int64_t topk = indices.size(2);
   const int64_t extra_topk = extra_indices.has_value() ? extra_indices->size(2) : 0;
   const double total_topk = static_cast<double>(topk) + static_cast<double>(extra_topk);
